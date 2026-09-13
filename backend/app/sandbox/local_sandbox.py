@@ -21,11 +21,11 @@ _LANG = {
 
 
 class LocalSandbox(Sandbox):
-    """子进程执行，Docker 不可用时的降级方案。
+    """裸子进程执行，所有隔离后端都不可用时的最后兜底。
 
-    有 rlimit（CPU / 内存 / 文件大小 / 进程数）和独立工作目录，但**没有内核级隔离**：
-    代码仍然跑在宿主机上，能读到你的文件系统。只适合本地自己玩，
-    别拿它跑不信任的代码 —— 需要真隔离就把 Docker 起起来。
+    只有 rlimit 和一个独立工作目录，**没有任何访问控制**：代码能读你的整个
+    文件系统、能联网。正常情况下不会走到这里 —— macOS 有 Seatbelt、
+    Linux 装个 bubblewrap 即可。真要用它跑不信任的代码，别。
     """
 
     name = "local"
@@ -39,7 +39,9 @@ class LocalSandbox(Sandbox):
             "backend": self.name,
             "available": True,
             "isolated": False,
-            "warning": "本地子进程执行，没有内核级隔离，不要跑不信任的代码",
+            "warning": "裸子进程执行，无访问控制，不要跑不信任的代码",
+            "enforced": {"timeout": True, "cpu": True,
+                         "memory": not sys.platform == "darwin", "network": False, "fsize": True},
             "root": str(self._root),
         }
 
@@ -53,6 +55,7 @@ class LocalSandbox(Sandbox):
     def _preexec(limits: SandboxLimits):  # pragma: no cover - 只在子进程里跑
         def _apply() -> None:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.timeout, limits.timeout + 2))
+            # 注意 macOS 不强制执行 RLIMIT_AS，这条在 Darwin 上是无效的
             nbytes = limits.memory_mb * 1024 * 1024
             for res_name in ("RLIMIT_AS", "RLIMIT_DATA"):
                 res_id = getattr(resource, res_name, None)
@@ -62,8 +65,9 @@ class LocalSandbox(Sandbox):
                     except (ValueError, OSError):
                         pass
             resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024,) * 2)
-            resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            # 不设 RLIMIT_NPROC：macOS 上它按 uid 全局计数，设小了会让沙箱里
+            # 任何 fork 都失败（bash 直接起不来），而不是只限制沙箱自己。
             os.setsid()  # 独立进程组，超时时能整组 kill
 
         return _apply

@@ -31,8 +31,7 @@ class Settings(BaseSettings):
     secret_key: str = ""
 
     # --- 沙箱 ---
-    sandbox_backend: str = "auto"  # auto | docker | local | off
-    sandbox_image: str = "python:3.12-slim"
+    sandbox_backend: str = "auto"  # auto | seatbelt | bubblewrap | local | off
     sandbox_timeout: int = 30
     sandbox_memory_mb: int = 512
     sandbox_cpus: float = 1.0
