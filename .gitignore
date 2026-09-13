@@ -1,0 +1,26 @@
+# 运行期数据：数据库、沙箱工作区、上传文件、自动生成的加密密钥
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 环境变量（含 API Key，绝不入库）
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
