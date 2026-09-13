@@ -20,7 +20,7 @@
 
 ## 快速开始
 
-需要 Python 3.12+（`uv` 会自动装）、Node 20+、pnpm；Docker 可选但强烈建议（代码沙箱靠它做隔离）。
+需要 Python 3.12+（`uv` 会自动装）、Node 20+、pnpm。**不需要 Docker** —— 代码沙箱用操作系统自带的隔离原语。
 
 ```bash
 ./scripts/dev.sh
@@ -44,7 +44,7 @@
 | **可视化编排** | 15 种节点拖拽连线；运行时节点实时高亮、边上数据流动画、卡片里直接看到流式 token |
 | **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama…）+ Mock |
 | **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入 |
-| **代码沙箱** | Docker 隔离：断网、只读根文件系统、非 root、内存/CPU/进程数限额、超时强杀 |
+| **代码沙箱** | macOS 用 Seatbelt、Linux 用 bubblewrap：断网、家目录不可读、只有工作区可写、超时强杀，冷启动 ~25ms |
 | **人工介入** | 图暂停并落盘，人在界面上批准/驳回/改稿，从断点继续——进程重启也不丢 |
 | **记忆与知识库** | 跨运行的长期记忆（自动去重）+ 文档知识库（向量 + BM25 混合检索，可调配比） |
 | **Skill 管理** | 把「怎么做事」抽成可复用的方法论，挂到节点上注入 system prompt |
@@ -85,7 +85,7 @@ backend/                  FastAPI + LangGraph
     expressions.py        模板插值 + AST 白名单表达式求值
     nodes/                各类节点的执行器
   app/providers/          多模型接入与成本估算
-  app/sandbox/            Docker / 本地子进程双后端
+  app/sandbox/            Seatbelt / bubblewrap / 裸子进程三后端
   app/tools/              工具注册表、内置工具、MCP、自定义工具
   app/memory/             记忆、知识库、混合检索
   app/api/                REST + WebSocket
@@ -111,11 +111,24 @@ LangGraph 的 `@task` 里，结果进 checkpoint，重放时直接取缓存。
 `RunEvent` 落库并广播。画布高亮、token 流、工具卡片、时间线全部由同一份事件驱动，
 所以刷新页面或中途接入都能拿到完整过程（WebSocket 先补历史再接实时）。
 
-**沙箱的隔离姿态。** 容器 `read_only` + tmpfs 工作区 + `cap_drop ALL` +
-`no-new-privileges` + 非 root + 默认断网 + 内存/CPU/pids 限额 + 超时整容器销毁。
-注意 Docker 的 `put_archive` 在只读容器上会被拒，所以代码是用 exec + base64 管道写进去的
-——为的是不牺牲只读根文件系统。Docker 不可用时降级到子进程 + rlimit，
-**那条路径没有内核级隔离**，界面上会明确标注。
+**沙箱不用容器。** 跑一段不可信代码不需要一整套容器运行时——操作系统自己就有
+内核级的强制访问控制。macOS 用 Seatbelt（`sandbox-exec`，系统自带），Linux 用
+bubblewrap（几百 KB 的二进制）。冷启动 ~25ms，对比容器方案的 ~250ms，且不用装任何东西。
+
+守住的是三件事：**默认断网**、**家目录不可读**、**只有工作区可写**。策略由内核强制且
+对子进程继承——沙箱里 `subprocess` 出来的 `cat` 读家目录一样是 `Operation not permitted`。
+解释器刻意用 `sys.base_prefix` 下那个干净的 Python，而不是后端自己的 venv，
+所以沙箱代码 import 不到 FastAPI、SQLAlchemy 和凭据处理相关的任何东西。
+
+**和容器比，少了什么要说清楚**：Seatbelt 做的是访问控制而非虚拟化——进程表是共享的
+（能看到宿主机进程列表），代码以当前用户身份运行（不像容器会降到 nobody），
+而且 **macOS 不强制 `RLIMIT_AS`，内存用量限不住**（实测设 256MB 仍能分配 900MB）。
+CPU 时间、单文件大小、墙钟超时这三项有效。bubblewrap 那边多隔离了 PID/IPC/挂载视图，
+内存限额也真实生效。要更强的隔离（内存配额、完整虚拟化），该上的是 gVisor 或 microVM，
+而不是回到容器。
+
+写 SBPL 策略有个坑：`(deny default)` 会让 Python 直接 SIGABRT 起不来——要枚举的路径和
+syscall 太多，漏一个就崩。所以用的是「默认允许 + 精确拒绝」，只把那三件事收紧。
 
 **检索为什么是混合的。** 默认 embedding 是本地特征哈希，不联网不下模型，零配置可用，
 但语义泛化弱；BM25 补上精确关键词匹配这一半。两者各自归一化后加权，权重在界面上可调，
@@ -127,8 +140,10 @@ LangGraph 的 `@task` 里，结果进 checkpoint，重放时直接取缓存。
 
 ## 常见问题
 
-**沙箱不可用？** 设置页「运行环境」会显示实际后端和原因。Docker 没启动时会自动降级到
-本地子进程，功能可用但没有隔离。首次执行会拉 `python:3.12-slim` 镜像，需要等一会儿。
+**沙箱用的是哪个后端？** 设置页「运行环境」会列出所有候选及其可用性，并标出当前选中的那个。
+macOS 上应该是 `seatbelt`；Linux 上装了 `bwrap`（`apt install bubblewrap`）就是 `bubblewrap`，
+没装则降级到 `local`——**那条路径没有任何访问控制**，界面上会明确标红。
+可以用 `AGENTLAB_SANDBOX_BACKEND` 强制指定。
 
 **模型返回空内容？** Claude 4.6 之后的模型默认开着 thinking，`max_tokens` 给小了会出现
 「思考完就没额度写正文」。节点里把 max_tokens 调大，或把思考模式设为关闭。时间线里会有提示。

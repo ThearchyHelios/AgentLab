@@ -61,6 +61,18 @@ async def resolve_provider(
         for p in enabled:
             if p.default_model == model:
                 return p
+        # 模型认得出来，但它所属的 provider 被停用了。这时候不能默默换一家 ——
+        # 拿着 A 家的模型名去调 B 家，必然 404，而且报错完全指不到真正的原因。
+        for p in providers:
+            if not p.enabled and (
+                any((m or {}).get("id") == model for m in (p.models or []))
+                or p.default_model == model
+            ):
+                raise ProviderNotConfigured(
+                    f"模型 {model!r} 属于 provider {p.name!r}，但它已被停用。"
+                    f"请在设置里启用它，或给节点换一个模型。"
+                )
+        # 认不出来的模型名就放行：用户可能手填了一个目录里还没有的新模型
 
     real = [p for p in enabled if p.kind != "mock"]
     return (real or enabled or [None])[0]

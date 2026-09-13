@@ -409,8 +409,22 @@ function SystemTab() {
             </span>
           } />
           <Row label="选择原因" value={sandbox.selected_because} />
-          {sandbox.image && <Row label="镜像" value={`${sandbox.image}${sandbox.image_pulled ? '' : '（未拉取，首次执行会自动拉）'}`} />}
-          {sandbox.docker_version && <Row label="Docker" value={sandbox.docker_version} />}
+          {sandbox.isolation && <Row label="隔离方式" value={sandbox.isolation} />}
+          {sandbox.limits_note && <Row label="限额说明" value={sandbox.limits_note} />}
+          {!!sandbox.candidates?.length && (
+            <Row label="可用后端" value={
+              <span className="flex flex-wrap gap-1.5">
+                {sandbox.candidates.map((c: any) => (
+                  <span key={c.name} className="chip"
+                        style={c.name === sandbox.backend
+                          ? { borderColor: 'var(--ok)', color: 'var(--ok)' }
+                          : c.available ? undefined : { opacity: 0.45 }}>
+                    {c.name}{c.available ? '' : ' · 不可用'}
+                  </span>
+                ))}
+              </span>
+            } />
+          )}
           {sandbox.warning && (
             <div className="mt-2 rounded border px-2 py-1.5 text-[10.5px]"
                  style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}>
@@ -419,7 +433,12 @@ function SystemTab() {
           )}
           {sandbox.defaults && (
             <Row label="默认限额" value={
-              `${sandbox.defaults.timeout}s · ${sandbox.defaults.memory_mb}MB · ${sandbox.defaults.cpus} CPU · ${sandbox.defaults.network ? '联网' : '断网'}`
+              <span className="flex flex-wrap items-center gap-2">
+                <Limit on={sandbox.enforced?.timeout !== false} text={`${sandbox.defaults.timeout}s 超时`} />
+                <Limit on={sandbox.enforced?.memory !== false} text={`${sandbox.defaults.memory_mb}MB 内存`} />
+                <Limit on={sandbox.enforced?.cpu !== false} text={`${sandbox.defaults.cpus} CPU`} />
+                <Limit on={sandbox.enforced?.network !== false} text={sandbox.defaults.network ? '联网' : '断网'} />
+              </span>
             } />
           )}
         </div>
@@ -436,6 +455,19 @@ function SystemTab() {
         </div>
       </div>
     </div>
+  )
+}
+
+/** 限额项：当前后端管不住的，划掉并注明，别给人虚假的安全感。 */
+function Limit({ on, text }: { on: boolean; text: string }) {
+  return on ? (
+    <span className="chip" style={{ color: 'var(--ok)', borderColor: 'color-mix(in srgb, var(--ok) 40%, transparent)' }}>
+      {text}
+    </span>
+  ) : (
+    <span className="chip line-through opacity-60" title="当前后端不支持这项限额">
+      {text} · 不生效
+    </span>
   )
 }
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any
 
 from app.core.config import settings
 from app.sandbox.base import ExecResult, Sandbox, SandboxLimits
-from app.sandbox.docker_sandbox import DockerSandbox
+from app.sandbox.bubblewrap_sandbox import BubblewrapSandbox
 from app.sandbox.local_sandbox import LocalSandbox
+from app.sandbox.seatbelt_sandbox import SeatbeltSandbox
 
 
 class DisabledSandbox(Sandbox):
@@ -20,11 +22,24 @@ class DisabledSandbox(Sandbox):
         )
 
     async def health(self) -> dict[str, Any]:
-        return {"backend": self.name, "available": False, "reason": "已关闭"}
+        return {"backend": self.name, "available": False, "isolated": False, "reason": "已关闭"}
+
+
+# 按隔离强度从高到低排，auto 模式挑第一个能用的
+_BACKENDS: list[tuple[str, type[Sandbox]]] = [
+    ("bubblewrap", BubblewrapSandbox),
+    ("seatbelt", SeatbeltSandbox),
+    ("local", LocalSandbox),
+]
 
 
 class SandboxManager:
-    """按配置挑一个可用后端。auto = 有 Docker 用 Docker，没有就降级到本地子进程。"""
+    """挑选并持有代码执行后端。
+
+    用操作系统自带的隔离原语，不依赖容器运行时：macOS 走 Seatbelt
+    （`sandbox-exec`，系统自带），Linux 走 bubblewrap。两者都是进程级启动，
+    没有虚拟机开销，冷启动在几十毫秒量级。
+    """
 
     def __init__(self) -> None:
         self._backend: Sandbox | None = None
@@ -37,28 +52,33 @@ class SandboxManager:
         async with self._lock:
             if self._backend is not None:
                 return self._backend
-            self._backend = await self._resolve()
+            self._backend = self._resolve()
             return self._backend
 
-    async def _resolve(self) -> Sandbox:
+    def _resolve(self) -> Sandbox:
         choice = (settings.sandbox_backend or "auto").lower()
-        if choice == "off":
-            self._resolved_from = "配置关闭"
-            return DisabledSandbox()
-        if choice == "local":
-            self._resolved_from = "配置指定"
-            return LocalSandbox()
-        if choice == "docker":
-            self._resolved_from = "配置指定"
-            return DockerSandbox()
 
-        docker = DockerSandbox()
-        health = await docker.health()
-        if health.get("available"):
-            self._resolved_from = "自动探测到 Docker"
-            await docker.reap_orphans()
-            return docker
-        self._resolved_from = f"Docker 不可用（{health.get('error', '未知原因')}），降级到本地"
+        if choice == "off":
+            self._resolved_from = "配置为关闭"
+            return DisabledSandbox()
+
+        named = dict(_BACKENDS)
+        if choice in named:
+            impl = named[choice]
+            backend = impl()
+            available = getattr(impl, "available", lambda: True)()
+            self._resolved_from = (
+                f"配置指定 {choice}" if available
+                else f"配置指定 {choice}，但当前环境不可用"
+            )
+            return backend
+
+        for name, impl in _BACKENDS:
+            if getattr(impl, "available", lambda: True)():
+                self._resolved_from = f"自动选择 {name}（{_why(name)}）"
+                return impl()
+
+        self._resolved_from = "没有可用的隔离后端，降级到本地子进程"
         return LocalSandbox()
 
     async def run(
@@ -87,6 +107,10 @@ class SandboxManager:
         info["selected_because"] = self._resolved_from
         info["configured"] = settings.sandbox_backend
         info["defaults"] = SandboxLimits().model_dump()
+        info["candidates"] = [
+            {"name": name, "available": getattr(impl, "available", lambda: True)()}
+            for name, impl in _BACKENDS
+        ]
         return info
 
     async def cleanup(self, session_id: str) -> None:
@@ -96,6 +120,14 @@ class SandboxManager:
     async def close(self) -> None:
         if self._backend:
             await self._backend.close()
+
+
+def _why(name: str) -> str:
+    return {
+        "seatbelt": "macOS 自带 sandbox-exec",
+        "bubblewrap": "检测到 bwrap",
+        "local": "无可用隔离原语",
+    }.get(name, "")
 
 
 sandbox_manager = SandboxManager()
