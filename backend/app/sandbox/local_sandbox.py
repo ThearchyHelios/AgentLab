@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import resource
+import shutil
+import sys
+import time
+from pathlib import Path
+
+from app.core.config import settings
+from app.sandbox.base import ExecResult, Sandbox, SandboxLimits, truncate
+
+_LANG = {
+    "python": ("main.py", [sys.executable, "-u", "main.py"]),
+    "bash": ("main.sh", ["bash", "main.sh"]),
+    "sh": ("main.sh", ["sh", "main.sh"]),
+    "node": ("main.js", ["node", "main.js"]),
+    "javascript": ("main.js", ["node", "main.js"]),
+}
+
+
+class LocalSandbox(Sandbox):
+    """子进程执行，Docker 不可用时的降级方案。
+
+    有 rlimit（CPU / 内存 / 文件大小 / 进程数）和独立工作目录，但**没有内核级隔离**：
+    代码仍然跑在宿主机上，能读到你的文件系统。只适合本地自己玩，
+    别拿它跑不信任的代码 —— 需要真隔离就把 Docker 起起来。
+    """
+
+    name = "local"
+
+    def __init__(self) -> None:
+        self._root = settings.workspace_dir / "local"
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    async def health(self) -> dict[str, object]:
+        return {
+            "backend": self.name,
+            "available": True,
+            "isolated": False,
+            "warning": "本地子进程执行，没有内核级隔离，不要跑不信任的代码",
+            "root": str(self._root),
+        }
+
+    def _session_dir(self, session_id: str) -> Path:
+        safe = "".join(c for c in session_id if c.isalnum() or c in "-_")[:64] or "default"
+        path = self._root / safe
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _preexec(limits: SandboxLimits):  # pragma: no cover - 只在子进程里跑
+        def _apply() -> None:
+            resource.setrlimit(resource.RLIMIT_CPU, (limits.timeout, limits.timeout + 2))
+            nbytes = limits.memory_mb * 1024 * 1024
+            for res_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+                res_id = getattr(resource, res_name, None)
+                if res_id is not None:
+                    try:
+                        resource.setrlimit(res_id, (nbytes, nbytes))
+                    except (ValueError, OSError):
+                        pass
+            resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024,) * 2)
+            resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            os.setsid()  # 独立进程组，超时时能整组 kill
+
+        return _apply
+
+    async def run(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        limits: SandboxLimits | None = None,
+        session_id: str | None = None,
+        env: dict[str, str] | None = None,
+        files: dict[str, str] | None = None,
+    ) -> ExecResult:
+        limits = limits or SandboxLimits()
+        language = (language or "python").lower()
+        if language not in _LANG:
+            return ExecResult(ok=False, backend=self.name, error=f"不支持的语言：{language}")
+
+        filename, argv = _LANG[language]
+        if shutil.which(argv[0]) is None and argv[0] != sys.executable:
+            return ExecResult(
+                ok=False, backend=self.name, error=f"宿主机上找不到 {argv[0]}"
+            )
+
+        workdir = self._session_dir(session_id or f"tmp-{int(time.time()*1000)}")
+        (workdir / filename).write_text(code)
+        for rel, content in (files or {}).items():
+            target = (workdir / rel).resolve()
+            if not str(target).startswith(str(workdir.resolve())):
+                return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+
+        # 只透传最小环境变量，避免把宿主机的 API key 泄漏给被执行的代码
+        child_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(workdir),
+            "LANG": "en_US.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **(env or {}),
+        }
+
+        started = time.perf_counter()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(workdir),
+                env=child_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=self._preexec(limits),
+            )
+        except Exception as e:  # noqa: BLE001
+            return ExecResult(ok=False, backend=self.name, error=f"{type(e).__name__}: {e}")
+
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            await proc.wait()
+            return ExecResult(
+                ok=False,
+                backend=self.name,
+                timed_out=True,
+                exit_code=124,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error=f"执行超过 {limits.timeout}s 被终止",
+            )
+
+        stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
+        stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
+        written = [
+            p.name
+            for p in workdir.iterdir()
+            if p.is_file() and p.name != filename
+        ][:50]
+        return ExecResult(
+            ok=proc.returncode == 0,
+            exit_code=proc.returncode or 0,
+            stdout=stdout,
+            stderr=stderr,
+            truncated=t1 or t2,
+            backend=self.name,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            files_written=written,
+        )
+
+    async def cleanup(self, session_id: str) -> None:
+        path = self._session_dir(session_id)
+        await asyncio.to_thread(shutil.rmtree, path, True)

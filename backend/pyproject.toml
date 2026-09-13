@@ -1,0 +1,35 @@
+[project]
+name = "agentlab-backend"
+version = "0.1.0"
+description = "AgentLab — 可视化 Agent 编排实验台后端"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20",
+    "greenlet>=3.1",
+    "httpx>=0.28",
+    "python-multipart>=0.0.17",
+    "langgraph",
+    "langgraph-checkpoint-sqlite",
+    "langchain-core",
+    "langchain-anthropic",
+    "langchain-openai",
+    "langchain-mcp-adapters",
+    "mcp",
+    "docker>=7.1",
+    "numpy>=2.0",
+    "jsonschema>=4.23",
+    "beautifulsoup4>=4.12",
+    "cryptography>=43.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
