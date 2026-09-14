@@ -9,7 +9,7 @@ import { Inspector } from '../canvas/Inspector'
 import { Palette } from '../canvas/Palette'
 import { RunPanel } from '../run/RunPanel'
 import { useStudio, toGraph } from '../store/studio'
-import { useCatalog } from '../store/catalog'
+import { useCatalog, modelOptions } from '../store/catalog'
 import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
 import type { Workflow } from '../types'
 
@@ -348,15 +348,37 @@ function PublishModal({ workflow, onClose, onDone }: {
 function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nodes = useStudio((s) => s.nodes)
   const runCopilot = useStudio((s) => s.runCopilot)
+  const providers = useCatalog((s) => s.providers)
   const [instruction, setInstruction] = useState('')
   const [useBase, setUseBase] = useState(true)
+  const [model, setModel] = useState<string>('')
+  const [effective, setEffective] = useState<string>('')
 
-  // 流式生成：发起后立刻关窗，图在画布上实时长出来，状态见左下角浮条
+  // Copilot 的模型是独立设置：它写的是编排本身，值得和工作流节点分开选
+  useEffect(() => {
+    if (!open) return
+    void api.copilot.getModel().then((m) => {
+      setModel(m.model ?? '')
+      setEffective(m.effective_model ?? '')
+    }).catch(() => undefined)
+  }, [open])
+
+  const pickModel = (value: string) => {
+    setModel(value)
+    // 选了就记住，下次打开还是它
+    void api.copilot.setModel({ model: value || null })
+      .then((m) => setEffective(m.effective_model ?? ''))
+      .catch(() => undefined)
+  }
+
   const generate = () => {
     if (!instruction.trim()) return
-    runCopilot(instruction, useBase && nodes.length > 0)
+    runCopilot(instruction, useBase && nodes.length > 0, model || undefined)
     onClose()
   }
+
+  const options = modelOptions(providers)
+  const groups = [...new Set(options.map((o) => o.group))]
 
   const examples = [
     '读取用户上传的问题，先查知识库，查到就基于资料回答并标注出处，查不到就联网搜索',
@@ -394,6 +416,24 @@ function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void })
             {ex.slice(0, 26)}…
           </button>
         ))}
+      </div>
+
+      <div className="mt-3">
+        <label className="label">Copilot 使用的模型</label>
+        <select className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
+          <option value="">跟随默认 provider{effective ? `（当前：${effective}）` : ''}</option>
+          {groups.map((g) => (
+            <optgroup key={g} label={g}>
+              {options.filter((o) => o.group === g).map((o) => (
+                <option key={g + o.value} value={o.value}>{o.label}</option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+        <div className="mt-1 text-[10px] leading-snug text-faint">
+          选择会被记住，只影响 Copilot 自己，不改工作流节点上的模型。
+          它要按协议逐行输出操作，指令遵循弱的模型（比如 Mock）生成不出东西。
+        </div>
       </div>
 
       {!!nodes.length && (
@@ -434,6 +474,7 @@ function CopilotStatusBar() {
           <Spinner size={13} />
           <span className="min-w-0 flex-1 truncate text-[11.5px]">
             <span className="mr-1.5 font-semibold" style={{ color: '#bc8cff' }}>Copilot</span>
+            {copilot.model && <span className="mr-1.5 text-faint">{copilot.model}</span>}
             {copilot.lastOp}
           </span>
           <button className="btn btn-sm" onClick={stopCopilot}>取消</button>

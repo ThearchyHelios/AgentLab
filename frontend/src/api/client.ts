@@ -199,6 +199,12 @@ export const api = {
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
     fromRun: (runId: string, name?: string) =>
       post<any>('/copilot/from-run', { run_id: runId, name }),
+    getModel: () => get<{
+      configured: boolean; provider: string | null; model: string | null
+      effective_provider: string | null; effective_model: string | null
+    }>('/copilot/model'),
+    setModel: (body: { provider?: string | null; model?: string | null }) =>
+      put<any>('/copilot/model', body),
   },
 }
 
@@ -207,7 +213,7 @@ export const api = {
  * 每个操作（add_node / add_edge / …）到达即回调，画布边收边长。
  */
 export function streamCopilot(
-  body: { instruction: string; base_graph?: GraphSpec | null },
+  body: { instruction: string; base_graph?: GraphSpec | null; provider?: string | null; model?: string | null },
   onOp: (op: any) => void,
   onEnd: (error?: string) => void,
 ): () => void {

@@ -78,7 +78,7 @@ interface StudioState {
   streaming: boolean
   unsubscribe: (() => void) | null
 
-  copilot: { active: boolean; lastOp: string; explanation: string; error: string }
+  copilot: { active: boolean; lastOp: string; explanation: string; error: string; model: string }
   copilotNew: string[]
   cancelCopilot: (() => void) | null
 
@@ -98,7 +98,7 @@ interface StudioState {
 
   startRun: (input: Record<string, any>) => Promise<Run | null>
   startFormalRun: (input: Record<string, any>) => Promise<Run | null>
-  runCopilot: (instruction: string, useBase: boolean) => void
+  runCopilot: (instruction: string, useBase: boolean, model?: string | null) => void
   stopCopilot: () => void
   attachRun: (runId: string) => Promise<void>
   stopRun: () => Promise<void>
@@ -121,7 +121,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   activeEdges: [],
   streaming: false,
   unsubscribe: null,
-  copilot: { active: false, lastOp: '', explanation: '', error: '' },
+  copilot: { active: false, lastOp: '', explanation: '', error: '', model: '' },
   copilotNew: [],
   cancelCopilot: null,
 
@@ -261,11 +261,11 @@ export const useStudio = create<StudioState>((set, get) => ({
     }
   },
 
-  runCopilot: (instruction, useBase) => {
+  runCopilot: (instruction, useBase, model) => {
     const state = get()
     state.cancelCopilot?.()
     set({
-      copilot: { active: true, lastOp: '正在起草…', explanation: '', error: '' },
+      copilot: { active: true, lastOp: '正在起草…', explanation: '', error: '', model: model ?? '' },
       copilotNew: [],
     })
     if (!useBase) set({ nodes: [], edges: [], dirty: true })
@@ -283,10 +283,18 @@ export const useStudio = create<StudioState>((set, get) => ({
     }
 
     const stop = streamCopilot(
-      { instruction, base_graph: useBase && state.nodes.length ? toGraph(state.nodes, state.edges) : null },
+      {
+        instruction,
+        base_graph: useBase && state.nodes.length ? toGraph(state.nodes, state.edges) : null,
+        model: model ?? undefined,
+      },
       (op) => {
         const s = get()
         switch (op.op) {
+          case 'model':
+            // 后端首帧告知实际用的模型，浮条上直接显示，不用猜
+            set({ copilot: { ...s.copilot, model: op.model ?? '' } })
+            break
           case 'plan':
             set({ copilot: { ...s.copilot, lastOp: op.summary ?? '规划中' } })
             break
@@ -359,14 +367,15 @@ export const useStudio = create<StudioState>((set, get) => ({
             // 后端排版+校验后的最终图整体落位；高亮集合保留几秒供辨认
             const { nodes, edges } = toFlow(op.graph)
             set({ nodes, edges, dirty: true,
-                  copilot: { active: false, lastOp: '',
+                  copilot: { active: false, lastOp: '', model: get().copilot.model,
                              explanation: op.explanation ?? get().copilot.explanation, error: '' } })
             void get().validate()
             setTimeout(() => set({ copilotNew: [] }), 6000)
             break
           }
           case 'error':
-            set({ copilot: { active: false, lastOp: '', explanation: '', error: op.message ?? '生成失败' } })
+            set({ copilot: { active: false, lastOp: '', explanation: '',
+                             model: get().copilot.model, error: op.message ?? '生成失败' } })
             break
         }
       },
