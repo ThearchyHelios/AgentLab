@@ -197,6 +197,16 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'memory_mb', label: '内存上限 MB', type: 'number', min: 64, max: 4096, advanced: true },
       { key: 'network', label: '允许联网', type: 'switch', help: '默认断网' },
       {
+        key: 'isolation', label: '隔离档位', type: 'select',
+        options: [
+          { value: '', label: '跟随整机默认' },
+          { value: 'strict', label: 'strict：microVM（独立内核，内存真限得住）' },
+          { value: 'fast', label: 'fast：系统沙箱（低延迟，内存限不住）' },
+        ],
+        help: '不可信代码用 strict；自己写的、已审核的用 fast。两档都拦不住 DNS 出网，'
+          + '真要防数据外泄得靠网络层。要的档位不可用时会退回默认并在时间线上告警',
+      },
+      {
         key: 'approval', label: '执行前确认', type: 'select', advanced: true,
         options: [{ value: 'never', label: '不确认' }, { value: 'always', label: '总是确认（可改代码）' }],
       },

@@ -450,10 +450,11 @@ function SystemTab() {
           {sandbox.defaults && (
             <Row label="默认限额" value={
               <span className="flex flex-wrap items-center gap-2">
-                <Limit on={sandbox.enforced?.timeout !== false} text={`${sandbox.defaults.timeout}s 超时`} />
-                <Limit on={sandbox.enforced?.memory !== false} text={`${sandbox.defaults.memory_mb}MB 内存`} />
-                <Limit on={sandbox.enforced?.cpu !== false} text={`${sandbox.defaults.cpus} CPU`} />
-                <Limit on={sandbox.enforced?.network !== false} text={sandbox.defaults.network ? '联网' : '断网'} />
+                <Limit on={enforced(sandbox, 'timeout')} text={`${sandbox.defaults.timeout}s 超时`} />
+                <Limit on={enforced(sandbox, 'memory')} text={`${sandbox.defaults.memory_mb}MB 内存`} />
+                <Limit on={enforced(sandbox, 'cpu')} text={`${sandbox.defaults.cpus} CPU`} />
+                <Limit on={enforced(sandbox, 'network')} text={sandbox.defaults.network ? '联网' : '断网'}
+                       note="HTTP/HTTPS 与域名解析可断，但 UDP/53 拦不住" />
               </span>
             } />
           )}
@@ -474,8 +475,26 @@ function SystemTab() {
   )
 }
 
-/** 限额项：当前后端管不住的，划掉并注明，别给人虚假的安全感。 */
-function Limit({ on, text }: { on: boolean; text: string }) {
+/** 后端对某项限额的执行力度。后端没说就按"生效"处理（老后端没有这个字段）。 */
+function enforced(sandbox: any, key: string): boolean | 'partial' {
+  const v = sandbox.enforced?.[key]
+  return v === 'partial' ? 'partial' : v !== false
+}
+
+/** 限额项：当前后端管不住的，划掉并注明，别给人虚假的安全感。
+ *
+ * 三态而不是两态——microVM 的网络就卡在中间：HTTP/HTTPS 断得掉，
+ * UDP/53 断不掉。这种"拦了一半"要是显示成绿色，比显示成红色更危险。
+ */
+function Limit({ on, text, note }: { on: boolean | 'partial'; text: string; note?: string }) {
+  if (on === 'partial') {
+    return (
+      <span className="chip" title={note || '这项限额只部分生效'}
+            style={{ color: 'var(--warn)', borderColor: 'color-mix(in srgb, var(--warn) 40%, transparent)' }}>
+        {text} · 部分生效
+      </span>
+    )
+  }
   return on ? (
     <span className="chip" style={{ color: 'var(--ok)', borderColor: 'color-mix(in srgb, var(--ok) 40%, transparent)' }}>
       {text}
