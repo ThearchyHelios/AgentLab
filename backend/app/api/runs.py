@@ -4,15 +4,20 @@ import asyncio
 import contextlib
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select as _select
+
 from app.core.bus import bus
+from app.core import artifact_store
 from app.db.base import SessionLocal, get_session
-from app.db.models import Approval, Run, RunEvent, Workflow
+from app.db.models import Approval, Artifact, Run, RunEvent, Workflow, WorkflowVersion
+from app.engine.governance import unresolved_caliber_upgrades
 from app.engine.runner import run_manager
+from app.engine.schema import GraphSpec
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -23,6 +28,9 @@ class StartRunIn(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     memory_scope: str = "default"
     collection: str = "default"
+    # formal：从已发布的不可变版本发起，可复现可出具；exploratory：随便玩
+    run_class: str = "exploratory"
+    version: int | None = None  # formal 时可指定版本，默认用已发布版本
 
 
 class RunOut(BaseModel):
@@ -34,6 +42,11 @@ class RunOut(BaseModel):
     output: dict[str, Any]
     error: str | None
     usage: dict[str, Any]
+    run_class: str | None = "exploratory"
+    version: int | None = None
+    version_hash: str | None = None
+    manifest_hash: str | None = None
+    started_by: str | None = None
     created_at: Any = None
     started_at: Any = None
     finished_at: Any = None
@@ -42,29 +55,82 @@ class RunOut(BaseModel):
 
 
 @router.post("", response_model=RunOut, status_code=201)
-async def start_run(payload: StartRunIn, session: AsyncSession = Depends(get_session)) -> Run:
-    graph = payload.graph
+async def start_run(
+    payload: StartRunIn,
+    session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
+) -> Run:
+    actor = (x_actor or "").strip() or None
     name = "临时图"
-    if payload.workflow_id:
+    version: int | None = None
+    version_hash: str | None = None
+
+    if payload.run_class == "formal":
+        # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
+        # 传裸 graph、或工作流还没发布过，都进不了 formal。
+        if not payload.workflow_id:
+            raise HTTPException(400, "正式运行必须指定 workflow_id")
+        if payload.graph is not None:
+            raise HTTPException(400, "正式运行不接受临时 graph——先保存并发布版本")
         workflow = await session.get(Workflow, payload.workflow_id)
         if not workflow:
             raise HTTPException(404, "工作流不存在")
-        graph = graph or workflow.graph
+        if workflow.status not in ("published", "governed") or not workflow.published_version:
+            raise HTTPException(409, f"「{workflow.name}」还没有发布版本，先在编排页发布")
+        version = payload.version or workflow.published_version
+        snapshot = (
+            await session.execute(
+                _select(WorkflowVersion).where(
+                    WorkflowVersion.workflow_id == workflow.id,
+                    WorkflowVersion.version == version,
+                )
+            )
+        ).scalar_one_or_none()
+        if not snapshot:
+            raise HTTPException(404, f"版本 v{version} 不存在")
+        graph = snapshot.graph
+        version_hash = snapshot.graph_hash or artifact_store.graph_hash(graph)
         name = workflow.name
+
+        # 口径升版是被迫处置的事件：钉住的方法卡有新版本而未声明策略，拒绝启动
+        spec = GraphSpec.model_validate(graph)
+        errors, upgrade_events = await unresolved_caliber_upgrades(session, spec)
+        if errors:
+            raise HTTPException(409, "；".join(errors))
+    else:
+        graph = payload.graph
+        upgrade_events = []
+        if payload.workflow_id:
+            workflow = await session.get(Workflow, payload.workflow_id)
+            if not workflow:
+                raise HTTPException(404, "工作流不存在")
+            graph = graph or workflow.graph
+            name = workflow.name
     if not graph:
         raise HTTPException(400, "需要提供 workflow_id 或 graph")
 
     try:
-        return await run_manager.start(
+        run = await run_manager.start(
             graph=graph,
             input_payload=payload.input,
             workflow_id=payload.workflow_id,
             workflow_name=name,
             memory_scope=payload.memory_scope,
             collection=payload.collection,
+            run_class="formal" if payload.run_class == "formal" else "exploratory",
+            version=version,
+            version_hash=version_hash,
+            started_by=actor,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+
+    # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
+    for ev in upgrade_events:
+        payload_ev = dict(ev)
+        node = payload_ev.pop("node_id", None)
+        await run_manager.note(run.id, "caliber.upgrade", node_id=node, **payload_ev)
+    return run
 
 
 @router.get("", response_model=list[RunOut])
@@ -113,6 +179,27 @@ async def get_events(
             "data": e.data,
         }
         for e in rows.scalars()
+    ]
+
+
+@router.get("/{run_id}/artifacts")
+async def list_artifacts(
+    run_id: str, session: AsyncSession = Depends(get_session)
+) -> list[dict[str, Any]]:
+    """这次运行产出的全部工件引用。审阅出具物时从这里下钻到完整证据。"""
+    rows = await session.execute(
+        select(Artifact).where(Artifact.run_id == run_id).order_by(Artifact.created_at)
+    )
+    return [
+        {
+            "id": a.id,
+            "kind": a.kind,
+            "node_id": a.node_id,
+            "size": a.size,
+            "meta": a.meta,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        }
+        for a in rows.scalars()
     ]
 
 

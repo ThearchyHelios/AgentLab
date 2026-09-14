@@ -80,6 +80,8 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                     from app.core.artifact_store import put_json
 
                     try:
+                        # 只记录、不回写：payload 和 run.output 可能是同一个对象，
+                        # 往里塞 __artifact__ 会污染最终成果。事件里携带 id 就够了。
                         artifact_id = await put_json(
                             payload,
                             kind="node_output",
@@ -87,8 +89,6 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                             node_id=node.id,
                             meta={"type": str(node.type), "attempt": attempt + 1},
                         )
-                        if isinstance(payload, dict):
-                            payload["__artifact__"] = artifact_id
                     except Exception:  # noqa: BLE001 - 工件写失败不该毁掉运行本身
                         artifact_id = None
 

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.artifact_store import graph_hash
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
+from app.engine.governance import lint_for_publish
 from app.engine.schema import GraphSpec, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
@@ -37,6 +39,8 @@ class WorkflowOut(BaseModel):
     tags: list[str]
     version: int
     is_template: bool
+    status: str = "draft"
+    published_version: int | None = None
     created_at: Any = None
     updated_at: Any = None
     run_count: int = 0
@@ -73,7 +77,8 @@ async def create_workflow(
     session.add(workflow)
     await session.flush()
     session.add(
-        WorkflowVersion(workflow_id=workflow.id, version=1, graph=payload.graph, note="初始版本")
+        WorkflowVersion(workflow_id=workflow.id, version=1, graph=payload.graph,
+                        graph_hash=graph_hash(payload.graph), note="初始版本")
     )
     await session.commit()
     await session.refresh(workflow)
@@ -113,6 +118,7 @@ async def update_workflow(
                 workflow_id=workflow.id,
                 version=workflow.version,
                 graph=payload.graph,
+                graph_hash=graph_hash(payload.graph),
                 note=payload.note,
             )
         )
@@ -197,12 +203,75 @@ async def restore_version(
             workflow_id=workflow.id,
             version=workflow.version,
             graph=snapshot.graph,
+            graph_hash=graph_hash(snapshot.graph),
             note=f"回滚到 v{version}",
         )
     )
     await session.commit()
     await session.refresh(workflow)
     return workflow
+
+
+class PublishIn(BaseModel):
+    level: str = "published"  # published | governed
+    version: int | None = None  # 默认发布当前最新版本
+
+
+@router.post("/{workflow_id}/publish")
+async def publish_workflow(
+    workflow_id: str,
+    payload: PublishIn,
+    session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """把某个版本立为正式版本。
+
+    formal 运行只能从这里发布过的版本发起。governed 级别额外过治理 lint：
+    错误会挡住发布——这就是"必经检查点"落地的地方。
+    返回 200 + ok/issues 而不是抛错，让前端能把问题列表渲染出来。
+    """
+    if payload.level not in ("published", "governed"):
+        raise HTTPException(400, "level 只能是 published 或 governed")
+    workflow = await session.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(404, "工作流不存在")
+
+    version = payload.version or workflow.version
+    snapshot = (
+        await session.execute(
+            select(WorkflowVersion).where(
+                WorkflowVersion.workflow_id == workflow_id,
+                WorkflowVersion.version == version,
+            )
+        )
+    ).scalar_one_or_none()
+    if not snapshot:
+        raise HTTPException(404, f"版本 v{version} 不存在，先保存一次")
+
+    try:
+        spec = GraphSpec.model_validate(snapshot.graph)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "issues": [{"level": "error", "message": f"图结构非法：{e}"}]}
+
+    issues = [i.model_dump() for i in validate_graph(spec).issues]
+    issues += [i.model_dump() for i in lint_for_publish(spec, level=payload.level).issues]
+    if any(i["level"] == "error" for i in issues):
+        return {"ok": False, "level": payload.level, "version": version, "issues": issues}
+
+    if not snapshot.graph_hash:
+        snapshot.graph_hash = graph_hash(snapshot.graph)
+    workflow.status = payload.level
+    workflow.published_version = version
+    workflow.published_by = (x_actor or "").strip() or None
+    await session.commit()
+    return {
+        "ok": True,
+        "level": payload.level,
+        "version": version,
+        "graph_hash": snapshot.graph_hash,
+        "published_by": workflow.published_by,
+        "issues": issues,  # 剩下的都是警告
+    }
 
 
 class ValidateIn(BaseModel):

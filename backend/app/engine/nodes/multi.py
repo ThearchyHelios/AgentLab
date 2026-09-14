@@ -225,16 +225,42 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not workflow_id:
         raise NodeError(ctx.node.id, "子图节点没有选择工作流")
 
+    # 版本钉死：这就是"方法卡"的机制核心。钉了 workflow_version 就永远
+    # 执行那个不可变快照，上游改了方法卡也不会让这里的口径悄悄漂移；
+    # 没钉则跟随最新（画布试跑方便，但治理 lint 会在受管模板里拦下它）。
+    pinned = ctx.cfg("workflow_version")
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, workflow_id)
-    if not workflow:
-        raise NodeError(ctx.node.id, f"找不到工作流 {workflow_id}")
+        if not workflow:
+            raise NodeError(ctx.node.id, f"找不到工作流 {workflow_id}")
+        if pinned:
+            from sqlalchemy import select
+
+            from app.db.models import WorkflowVersion
+
+            snapshot = (
+                await session.execute(
+                    select(WorkflowVersion).where(
+                        WorkflowVersion.workflow_id == workflow_id,
+                        WorkflowVersion.version == int(pinned),
+                    )
+                )
+            ).scalar_one_or_none()
+            if not snapshot:
+                raise NodeError(
+                    ctx.node.id, f"工作流「{workflow.name}」没有 v{pinned} 这个版本"
+                )
+            sub_graph = snapshot.graph
+            used_version = int(pinned)
+        else:
+            sub_graph = workflow.graph
+            used_version = workflow.version
 
     sub_input = ctx.render(ctx.cfg("input", {}) or {}, state)
     if not isinstance(sub_input, dict):
         sub_input = {"input": sub_input}
 
-    sub_spec = GraphSpec.model_validate(workflow.graph)
+    sub_spec = GraphSpec.model_validate(sub_graph)
     sub_run = type(ctx.run)(
         run_id=ctx.run.run_id,
         thread_id=f"{ctx.run.thread_id}:{ctx.node.id}",
@@ -270,6 +296,9 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     result = {
         "output": output,
         "workflow": workflow.name,
+        # 溯源信息：这次到底跑的是哪个版本、是不是钉死的
+        "workflow_version": used_version,
+        "pinned": bool(pinned),
         "text": json.dumps(output, ensure_ascii=False) if output else "",
     }
     ctx.emit(EventType.LOG, level="info", message=f"子图「{workflow.name}」完成")
