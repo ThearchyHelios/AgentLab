@@ -84,6 +84,11 @@ class Workflow(Base, TimestampMixin):
     tags: Mapped[list[Any]] = mapped_column(default=list)
     version: Mapped[int] = mapped_column(Integer, default=1)
     is_template: Mapped[bool] = mapped_column(default=False)
+    # 治理状态机：draft（随便改）→ published（有正式版本可跑）→ governed（发布需过治理 lint）
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    # 正式运行默认解析到这个版本；为空表示还没发布过
+    published_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    published_by: Mapped[str | None] = mapped_column(String(100), default=None)
 
     versions: Mapped[list["WorkflowVersion"]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan", lazy="selectin"
@@ -101,6 +106,8 @@ class WorkflowVersion(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer)
     graph: Mapped[dict[str, Any]] = mapped_column(default=dict)
     note: Mapped[str] = mapped_column(Text, default="")
+    # 图内容的 sha256 指纹（剔除 viewport）。formal run 钉住的就是它。
+    graph_hash: Mapped[str | None] = mapped_column(String(64), default=None)
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 
@@ -130,6 +137,14 @@ class Run(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(default=None)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
     last_seq: Mapped[int] = mapped_column(Integer, default=0)
+    # formal：从不可变的 WorkflowVersion 发起，可复现、可出具
+    # exploratory：画布试跑 / 裸 graph / 追问，结果只标探索性
+    run_class: Mapped[str] = mapped_column(String(20), default="exploratory")
+    version: Mapped[int | None] = mapped_column(Integer, default=None)
+    version_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 结束时对全部事件计算的清单哈希，事后改动事件流会被它戳穿
+    manifest_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    started_by: Mapped[str | None] = mapped_column(String(100), default=None)
 
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -169,6 +184,27 @@ class Approval(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     response: Mapped[dict[str, Any]] = mapped_column(default=dict)
     resolved_at: Mapped[datetime | None] = mapped_column(default=None)
+    # 责任归属：谁批的。没有 actor 的治理是空转。
+    resolved_by: Mapped[str | None] = mapped_column(String(100), default=None)
+
+
+class Artifact(Base, TimestampMixin):
+    """工件引用表。
+
+    文件本体按内容哈希存在 data/artifacts/ 下（同内容只一份）；
+    这张表记录"哪个 run 的哪个节点产出了它"——溯源需要的正是这层归属。
+    复合主键：同一工件被多个 run 产出时各记一行引用。
+    """
+
+    __tablename__ = "artifacts"
+    __table_args__ = (Index("ix_artifacts_run", "run_id"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), primary_key=True, default="")
+    kind: Mapped[str] = mapped_column(String(32), default="node_output")  # node_output | tool_snapshot | metric_set
+    node_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
 
 # --------------------------------------------------------------------------

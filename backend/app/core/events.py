@@ -47,6 +47,10 @@ class EventType(StrEnum):
     HUMAN_REQUESTED = "human.requested"
     HUMAN_RESOLVED = "human.resolved"
 
+    # 出具与口径治理
+    ISSUANCE = "issuance"  # 出具契约的判定结果（档位 / 缺数据 / 未回指数字）
+    CALIBER_UPGRADE = "caliber.upgrade"  # 钉住的方法卡有新版本，按声明的策略处置
+
     # 其他
     LOG = "log"
     USAGE = "usage"  # token / 成本累计

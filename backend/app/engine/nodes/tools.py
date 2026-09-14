@@ -67,8 +67,19 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         result = {"error": f"{type(e).__name__}: {e}"}
 
     elapsed = int((time.perf_counter() - started) * 1000)
+    # 取数快照：query（args）和结果集一起进工件库，正式出具时数字回指的就是它
+    from app.core.artifact_store import put_json
+
+    try:
+        snapshot_id = await put_json(
+            {"tool": name, "args": args, "result": result},
+            kind="tool_snapshot", run_id=ctx.run.run_id, node_id=ctx.node.id,
+        )
+    except Exception:  # noqa: BLE001
+        snapshot_id = None
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
-             preview=json.dumps(result, ensure_ascii=False, default=str)[:2000])
+             preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
+             artifact=snapshot_id)
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     var_name = ctx.cfg("assign_to", "")
