@@ -174,6 +174,58 @@ TEMPLATES: list[dict[str, Any]] = [
         "edges": [_e("start", "team"), _e("team", "done")],
     },
     {
+        "name": "⑧ 周报（口径卡 + 三档出具）",
+        "description": "模板定骨架、agent 填关节的完整示范：取数固定、口径卡算数、"
+        "叙述只许引用清单里的数、出具时逐数回指——现编的数字会被点名并降档。",
+        "tags": ["出具", "口径卡", "周报"],
+        "nodes": [
+            _n("start", "input", "周期", fields=[
+                {"name": "week", "default": "2026-W37", "description": "报告周期"}]),
+            _n("fetch", "code", "取数（数据底座）", language="python", network=False,
+               assign_to="agg",
+               code=(
+                   "# 固定层：取数与汇总。真实场景换成对数据库/API 的查询，\n"
+                   "# 结果会作为快照落工件库，出具溯源指回这里。\n"
+                   "import json\n"
+                   "print(json.dumps({'orders': 1234, 'amount': 45678.5,\n"
+                   "                  'amount_prev': 42010.0, 'returns': 29}))"
+               )),
+            _n("caliber", "metrics", "周报口径卡",
+               caliber="周报口径", caliber_version="v1", assign_to="m",
+               metrics=[
+                   {"id": "orders", "name": "订单数", "unit": "单",
+                    "expression": "vars.agg.orders"},
+                   {"id": "amount", "name": "销售额", "unit": "元",
+                    "expression": "vars.agg.amount"},
+                   {"id": "wow", "name": "环比增幅", "unit": "%",
+                    "expression": "round((vars.agg.amount - vars.agg.amount_prev) / vars.agg.amount_prev * 100, 1)"},
+                   {"id": "return_rate", "name": "退货率", "unit": "%",
+                    "expression": "round(vars.agg.returns / vars.agg.orders * 100, 2)"},
+               ]),
+            _n("narrate", "llm", "叙述（关节层）",
+               system="你是周报撰写人。只允许引用下面指标清单里出现的数值，"
+                      "一个清单外的数字都不要写；重点是挑哪些变化值得说、怎么归因。",
+               prompt="{{ nodes.caliber.text }}\n\n请为 {{ input.week }} 写一段 120 字以内的周报正文。",
+               assign_to="report"),
+            _n("done", "output", "出具",
+               fields=[
+                   {"name": "周报", "value": "{{ vars.report }}"},
+                   {"name": "指标清单", "value": "{{ nodes.caliber.text }}"}],
+               contract={
+                   "metrics_from": ["caliber"],
+                   "narrative": "{{ vars.report }}",
+                   "required": ["amount", "orders"],
+                   "expected": ["wow", "return_rate"],
+                   "allow_numbers": ["37", "120"],
+                   "strict": False,
+               }),
+        ],
+        "edges": [
+            _e("start", "fetch"), _e("fetch", "caliber"),
+            _e("caliber", "narrate"), _e("narrate", "done"),
+        ],
+    },
+    {
         "name": "⑦ 批量处理（循环）",
         "description": "对列表逐项处理再汇总。演示 loop 节点的 body / done 两个出口怎么接。",
         "tags": ["循环"],

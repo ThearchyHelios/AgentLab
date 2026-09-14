@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
-from app.engine.nodes import control, human, io, knowledge, llm, multi, tools
+from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, tools
 from app.engine.schema import GraphNode, GraphSpec, NodeType
 from app.engine.state import GraphState
 
@@ -31,6 +31,7 @@ RUNNERS: dict[NodeType, NodeRunner] = {
     NodeType.HUMAN: human.run_human,
     NodeType.VALIDATE: human.run_validate,
     NodeType.MEMORY: knowledge.run_memory,
+    NodeType.METRICS: metrics.run_metrics,
     NodeType.RETRIEVE: knowledge.run_retrieve,
 }
 

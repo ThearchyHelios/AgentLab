@@ -29,6 +29,7 @@ class NodeType(StrEnum):
 
     HUMAN = "human"  # 人工介入
     VALIDATE = "validate"  # 结构化校验 + 自动重试
+    METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
 
 
 class Position(BaseModel):
@@ -195,6 +196,19 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.VALIDATE:
             if not cfg.get("schema"):
                 result.add("校验节点需要一个 JSON Schema", node_id=node.id)
+        elif node.type == NodeType.METRICS:
+            defs = cfg.get("metrics") or []
+            if not defs:
+                result.add("口径卡还没有定义指标", node_id=node.id)
+            for d in defs:
+                if not d.get("id") or not d.get("expression"):
+                    result.add(f"指标定义缺 id 或 expression：{d.get('id') or '(空)'}",
+                               node_id=node.id)
+        elif node.type == NodeType.OUTPUT:
+            contract = cfg.get("contract")
+            if contract and not contract.get("metrics_from"):
+                result.add("出具契约缺 metrics_from（指标来自哪个口径卡节点）",
+                           node_id=node.id)
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("循环节点没有循环体", node_id=node.id)
