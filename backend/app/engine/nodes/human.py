@@ -44,12 +44,20 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         }
         if not approved and ctx.cfg("stop_on_reject", False):
             raise NodeError(ctx.node.id, f"人工拒绝：{result['note'] or '未说明原因'}")
-    elif mode == "edit":
+    else:  # edit / input
+        # 驳回在这两种模式下以前是个摆设：__decision__ 硬编码成 approved，
+        # approved 字段看都不看。界面上按钮在、toast 说"已驳回"，运行却照常
+        # 往下走——比没有这个按钮更糟。
+        #
+        # 这两种模式在图上只有一个 out 出口（没有 rejected 那条边），所以驳回
+        # 的正确语义是终止运行，而不是当作通过继续。缺省仍是通过：只传 value
+        # 不带 approved 的老调用方行为不变。
+        rejected = isinstance(response, dict) and response.get("approved") is False
+        if rejected:
+            note = _note_of(response)
+            raise NodeError(ctx.node.id, f"人工驳回：{note or '未说明原因'}")
         value = response.get("value") if isinstance(response, dict) else response
         result = {"value": value, "note": _note_of(response), "__decision__": "approved"}
-    else:  # input
-        value = response.get("value") if isinstance(response, dict) else response
-        result = {"value": value, "__decision__": "approved"}
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     var_name = ctx.cfg("assign_to", "")

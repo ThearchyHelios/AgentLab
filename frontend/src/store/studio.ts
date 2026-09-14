@@ -4,7 +4,7 @@ import {
   type Connection, type Edge, type EdgeChange, type Node, type NodeChange,
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
-import { NODE_DEFS } from '../canvas/nodeDefs'
+import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import type {
   GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue, Workflow,
 } from '../types'
@@ -175,6 +175,37 @@ export const useStudio = create<StudioState>((set, get) => ({
   },
 
   updateNode: (id, patch) => {
+    const target = get().nodes.find((n) => n.id === id)
+    // 出口 handle 是从 config 算出来的（分支的 case key、human 的 mode），
+    // 改 config 就可能让已连好的边指向一个不存在的出口。React Flow 对这种边
+    // 只在 console 打一条 008 警告然后不渲染——它看不见、点不到、删不掉，
+    // 却照样被 toGraph 序列化存盘。所以这里同步把边跟过去。
+    const before = target ? sourceHandles(target.data.nodeType, target.data.config ?? {}) : []
+    const after =
+      target && patch.config !== undefined
+        ? sourceHandles(target.data.nodeType, patch.config)
+        : before
+
+    let edges = get().edges
+    if (target && before.length && after !== before) {
+      const alive = new Set(after.map((h) => h.id))
+      // 改名场景（出口数量没变）按位置重映射，这样连好的线不会白连
+      const byPosition = new Map<string, string>()
+      if (before.length === after.length) {
+        before.forEach((h, i) => {
+          if (h.id !== after[i].id) byPosition.set(h.id, after[i].id)
+        })
+      }
+      edges = edges.flatMap((e) => {
+        if (e.source !== id || !e.sourceHandle) return [e]
+        if (alive.has(e.sourceHandle)) return [e]
+        const moved = byPosition.get(e.sourceHandle)
+        // 出口真的没了（删了一个 case、换了 human 模式）就把边一起去掉，
+        // 留着只会变成一条谁也看不见的脏边
+        return moved ? [{ ...e, sourceHandle: moved }] : []
+      })
+    }
+
     set({
       nodes: get().nodes.map((n) =>
         n.id === id
@@ -188,6 +219,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             }
           : n,
       ),
+      edges,
       dirty: true,
     })
     void get().validate()

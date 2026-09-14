@@ -172,7 +172,7 @@ function RunLauncher() {
 
 // -------------------------------------------------------------------------
 
-function ApprovalCard({ approval }: { approval: any }) {
+export function ApprovalCard({ approval }: { approval: any }) {
   const toast = useToast()
   const refreshApprovals = useCatalog((s) => s.refreshApprovals)
   const attachRun = useStudio((s) => s.attachRun)
@@ -193,7 +193,16 @@ function ApprovalCard({ approval }: { approval: any }) {
       })
       await refreshApprovals()
       await attachRun(approval.run_id) // 恢复后重新接上事件流
-      toast(approved ? '已放行，运行继续' : '已驳回', 'ok')
+      // 驳回在"补充输入/编辑草稿"模式下会终止整个运行（图上没有 rejected 那条
+      // 出口边），说清楚比笼统一句"已驳回"诚实
+      toast(
+        approved
+          ? '已放行，运行继续'
+          : approval.mode === 'approve'
+            ? '已驳回'
+            : '已驳回，本次运行终止',
+        'ok',
+      )
     } catch (e: any) {
       toast(e.message ?? '操作失败', 'error')
     } finally {
@@ -251,8 +260,13 @@ function ApprovalCard({ approval }: { approval: any }) {
         <button className="btn btn-primary flex-1 justify-center" disabled={busy} onClick={() => decide(true)}>
           <Check size={12} /> {approval.mode === 'approve' ? '通过' : '提交'}
         </button>
-        <button className="btn btn-danger flex-1 justify-center" disabled={busy} onClick={() => decide(false)}>
-          <Ban size={12} /> 驳回
+        <button
+          className="btn btn-danger flex-1 justify-center"
+          disabled={busy}
+          onClick={() => decide(false)}
+          title={approval.mode === 'approve' ? '不放行，走 rejected 分支' : '驳回并终止这次运行'}
+        >
+          <Ban size={12} /> {approval.mode === 'approve' ? '驳回' : '驳回并终止'}
         </button>
       </div>
     </div>

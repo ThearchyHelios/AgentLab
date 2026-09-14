@@ -4,6 +4,8 @@ import clsx from 'clsx'
 import { api } from '../api/client'
 import { formatMs } from '../canvas/NodeCard'
 import { Empty, Spinner, StatusDot, useToast } from '../components/ui'
+import { ApprovalCard } from '../run/RunPanel'
+import { useCatalog } from '../store/catalog'
 import type { Run, RunEvent } from '../types'
 
 /** 运行历史。每次运行的完整事件流都落了库，所以这里能完整回放。 */
@@ -14,6 +16,11 @@ export function RunsPage() {
   const [events, setEvents] = useState<RunEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('')
+  // 导航上的待办徽标指向这一页，所以这页必须能处理待办
+  const approvals = useCatalog((s) => s.approvals)
+  const pendingHere = approvals.filter(
+    (a) => a.run_id === selected?.id && a.status === 'pending',
+  )
 
   const load = async () => {
     setLoading(true)
@@ -119,6 +126,15 @@ export function RunsPage() {
                 <Trash2 size={11} className="text-[var(--err)]" />
               </button>
             </div>
+
+            {/* 等待人工的运行要能就地处理。导航上的待办徽标指向这一页，
+                而这里以前只有只读的事件列表——刷新页面后那些卡在审批上的
+                运行在整个界面里没有任何入口可以推进。 */}
+            {pendingHere.length > 0 && (
+              <div className="mb-3 overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
+                {pendingHere.map((a) => <ApprovalCard key={a.id} approval={a} />)}
+              </div>
+            )}
 
             {selected.error && (
               <pre className="mono mb-3 whitespace-pre-wrap rounded border p-2 text-[11px] text-[var(--err)]"
