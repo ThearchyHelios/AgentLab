@@ -61,8 +61,10 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
                     node_id=node.id,
                 )
         elif node.type == NodeType.OUTPUT:
-            if cfg.get("contract"):
+            contract = cfg.get("contract")
+            if contract:
                 has_contract_output = True
+                _lint_contract(contract, node_id=node.id, spec=spec, flag=flag, strict=strict)
         elif node.type == NodeType.CODE:
             if cfg.get("network"):
                 flag("代码节点开了网络，受管模板建议把取数收敛到工具节点（有快照）", node_id=node.id)
@@ -73,6 +75,50 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
             level="error",
         )
     return result
+
+
+def _lint_contract(
+    contract: Any, *, node_id: str, spec: GraphSpec, flag: Any, strict: bool
+) -> None:
+    """契约要查内容，不能只查这个 key 在不在。
+
+    只看 key 存不存在的话，contract={"metrics_from": "随便一个字符串"} 就满足
+    "受管模板必须声明出具契约"这条硬门禁了 —— 一个结构上保证每次都出 formal 的
+    空壳模板，能合法发布成受管模板。门禁写成这样，还不如没有：它给的是
+    "这张图过过闸"的错觉。
+    """
+    if not isinstance(contract, dict):
+        flag("contract 必须是对象", node_id=node_id, hard=True)
+        return
+
+    metric_nodes = {n.id for n in spec.nodes if n.type == NodeType.METRICS}
+    sources = contract.get("metrics_from") or []
+    if isinstance(sources, str):
+        sources = [sources]
+
+    if not sources:
+        flag("契约没有声明 metrics_from，叙述里的数字无从回指", node_id=node_id, hard=True)
+    for src in sources:
+        if src not in metric_nodes:
+            flag(
+                f"契约的 metrics_from 指向 {src!r}，但图里没有这个口径卡节点"
+                "（写错了，或者那个节点还没建）",
+                node_id=node_id, hard=True,
+            )
+
+    if not str(contract.get("narrative") or "").strip():
+        flag("契约没有声明 narrative，数字回指校验不会执行", node_id=node_id, hard=True)
+
+    if strict and not (contract.get("required") or []):
+        flag(
+            "受管模板的契约必须声明 required 指标，否则'必需指标缺失'这一档永远触发不了",
+            node_id=node_id, hard=True,
+        )
+    if strict and not contract.get("strict"):
+        flag(
+            "受管模板建议把契约设为 strict：非 strict 下未回指的数字只降档不拦截",
+            node_id=node_id,
+        )
 
 
 async def unresolved_caliber_upgrades(
