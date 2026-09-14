@@ -11,11 +11,21 @@ export class ApiError extends Error {
   }
 }
 
+function actorHeader(): Record<string, string> {
+  try {
+    const actor = localStorage.getItem('agentlab_actor')
+    return actor ? { 'X-Actor': actor } : {}
+  } catch {
+    return {}
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     ...init,
     headers: {
       ...(init?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...actorHeader(),
       ...init?.headers,
     },
   })
@@ -59,6 +69,9 @@ export const api = {
     duplicate: (id: string) => post<Workflow>(`/workflows/${id}/duplicate`),
     versions: (id: string) => get<any[]>(`/workflows/${id}/versions`),
     restore: (id: string, v: number) => post<Workflow>(`/workflows/${id}/versions/${v}/restore`),
+    publish: (id: string, level: 'published' | 'governed', version?: number) =>
+      post<{ ok: boolean; level?: string; version?: number; issues: any[] }>(
+        `/workflows/${id}/publish`, { level, version }),
     validate: (graph: GraphSpec) =>
       post<{ ok: boolean; issues: ValidationIssue[] }>('/workflows/validate', { graph }),
   },
@@ -75,7 +88,9 @@ export const api = {
     start: (body: {
       workflow_id?: string; graph?: GraphSpec; input?: Record<string, any>
       memory_scope?: string; collection?: string
+      run_class?: 'formal' | 'exploratory'; version?: number
     }) => post<Run>('/runs', body),
+    artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
     cancel: (id: string) => post<{ ok: boolean }>(`/runs/${id}/cancel`),
     resume: (id: string, response: any) => post<Run>(`/runs/${id}/resume`, { response }),
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),
@@ -167,6 +182,14 @@ export const api = {
     remove: (id: string) => del(`/skills/${id}`),
   },
 
+  // ---- 治理 ----
+  governance: {
+    toolUsage: (workflowId: string) =>
+      get<any>(`/governance/tool-usage?workflow_id=${workflowId}`),
+    clusters: () => get<any>('/governance/exploratory-clusters'),
+  },
+  artifact: (id: string) => get<{ id: string; content: any }>(`/artifacts/${id}`),
+
   // ---- Copilot ----
   copilot: {
     generate: (body: { instruction: string; base_graph?: GraphSpec | null }) =>
@@ -174,6 +197,8 @@ export const api = {
         '/copilot/generate', body),
     explain: (graph: GraphSpec) => post<{ explanation: string }>('/copilot/explain', { graph }),
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
+    fromRun: (runId: string, name?: string) =>
+      post<any>('/copilot/from-run', { run_id: runId, name }),
   },
 }
 

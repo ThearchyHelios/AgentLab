@@ -117,6 +117,7 @@ pre,
 .nt-retrieve { --nt: #0ea5e9; }
 .nt-transform { --nt: #8b949e; }
 .nt-subgraph { --nt: #bc8cff; }
+.nt-metrics  { --nt: #34d399; }
 
 /* --------------------------------------------------------------------------
    React Flow 覆盖

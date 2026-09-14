@@ -204,8 +204,10 @@ TEMPLATES: list[dict[str, Any]] = [
                ]),
             _n("narrate", "llm", "叙述（关节层）",
                system="你是周报撰写人。只允许引用下面指标清单里出现的数值，"
-                      "一个清单外的数字都不要写；重点是挑哪些变化值得说、怎么归因。",
-               prompt="{{ nodes.caliber.text }}\n\n请为 {{ input.week }} 写一段 120 字以内的周报正文。",
+                      "一个清单外的数字都不要写——包括字数统计、序号补充说明等元内容。"
+                      "只输出周报正文本身，不要任何撰写说明。"
+                      "你的自由度在于：挑哪些变化值得说、怎么归因。",
+               prompt="{{ nodes.caliber.text }}\n\n请为 {{ input.week }} 写一段简短的周报正文。",
                assign_to="report"),
             _n("done", "output", "出具",
                fields=[

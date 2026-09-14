@@ -13,7 +13,7 @@ const NODE_COLOR: Record<string, string> = {
   input: '#3fb950', output: '#a371f7', llm: '#4f8cff', agent: '#6366f1',
   supervisor: '#db61a2', tool: '#f0883e', code: '#2dd4bf', branch: '#d29922',
   loop: '#ec4899', human: '#f85149', validate: '#84cc16', memory: '#14b8a6',
-  retrieve: '#0ea5e9', transform: '#8b949e', subgraph: '#bc8cff',
+  retrieve: '#0ea5e9', transform: '#8b949e', subgraph: '#bc8cff', metrics: '#34d399',
 }
 
 function CanvasInner() {

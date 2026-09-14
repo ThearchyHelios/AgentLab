@@ -409,13 +409,20 @@ class DecideIn(BaseModel):
 
 @approvals_router.post("/{approval_id}/decide", response_model=RunOut)
 async def decide(
-    approval_id: str, payload: DecideIn, session: AsyncSession = Depends(get_session)
+    approval_id: str,
+    payload: DecideIn,
+    session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
 ) -> Run:
     approval = await session.get(Approval, approval_id)
     if not approval:
         raise HTTPException(404, "审批请求不存在")
     if approval.status != "pending":
         raise HTTPException(409, "该请求已经处理过了")
+
+    # 责任归属先落库再恢复执行——恢复失败也要留下"谁试图批的"
+    approval.resolved_by = (x_actor or "").strip() or None
+    await session.commit()
 
     response: dict[str, Any] = {"approved": payload.approved, "note": payload.note}
     if payload.value is not None:

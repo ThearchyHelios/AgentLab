@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertTriangle, Ban, Check, ChevronRight, CircleDot, Hand, Play, Square, Wrench,
+  AlertTriangle, Ban, Check, ChevronRight, CircleDot, Hand, Play, ShieldCheck, Square, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -41,6 +41,9 @@ export function RunPanel() {
       {run && (
         <div className="flex items-center justify-between gap-2 border-t px-3 py-1.5 text-[10.5px] text-faint">
           <span className="mono truncate" title={run.id}>#{run.id.slice(0, 8)}</span>
+          {run.run_class === 'formal'
+            ? <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>正式 v{run.version}</span>
+            : <span className="chip">探索</span>}
           <span className="flex items-center gap-2">
             {streaming && <span className="text-[var(--accent)]">● 实时</span>}
             {!!run.usage?.total_tokens && <span>{run.usage.total_tokens} tok</span>}
@@ -60,7 +63,11 @@ function RunLauncher() {
   const run = useStudio((s) => s.run)
   const streaming = useStudio((s) => s.streaming)
   const issues = useStudio((s) => s.issues)
-  const { startRun, stopRun } = useStudio()
+  const workflow = useStudio((s) => s.workflow)
+  const dirty = useStudio((s) => s.dirty)
+  const { startRun, startFormalRun, stopRun } = useStudio()
+  const canFormal = !!workflow && (workflow.status === 'published' || workflow.status === 'governed')
+    && !!workflow.published_version
   const toast = useToast()
   const [values, setValues] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
@@ -73,7 +80,7 @@ function RunLauncher() {
 
   const errors = issues.filter((i) => i.level === 'error')
 
-  const launch = async () => {
+  const launch = async (formal = false) => {
     setBusy(true)
     try {
       const payload: Record<string, any> = {}
@@ -87,7 +94,8 @@ function RunLauncher() {
           payload[field.name] = raw
         }
       }
-      await startRun(payload)
+      if (formal) await startFormalRun(payload)
+      else await startRun(payload)
     } catch (e: any) {
       toast(e.message ?? '启动失败', 'error')
     } finally {
@@ -132,15 +140,32 @@ function RunLauncher() {
             <Square size={12} /> 停止
           </button>
         ) : (
-          <button
-            className="btn btn-primary flex-1 justify-center"
-            onClick={launch}
-            disabled={busy || !!errors.length || !nodes.length}
-          >
-            <Play size={12} /> 运行
-          </button>
+          <>
+            <button
+              className="btn btn-primary flex-1 justify-center"
+              onClick={() => launch(false)}
+              disabled={busy || !!errors.length || !nodes.length}
+              title="用画布当前内容跑，结果标探索性"
+            >
+              <Play size={12} /> 试运行
+            </button>
+            {canFormal && (
+              <button
+                className="btn flex-1 justify-center"
+                style={{ borderColor: 'var(--ok)', color: 'var(--ok)' }}
+                onClick={() => launch(true)}
+                disabled={busy || dirty}
+                title={dirty ? '有未保存改动，正式运行只跑已发布版本' : `从已发布的 v${workflow?.published_version} 不可变版本发起`}
+              >
+                <ShieldCheck size={12} /> 正式运行 v{workflow?.published_version}
+              </button>
+            )}
+          </>
         )}
       </div>
+      {canFormal && dirty && (
+        <div className="mt-1.5 text-[10px] text-faint">画布有未保存改动；正式运行永远执行已发布的不可变版本</div>
+      )}
     </div>
   )
 }
@@ -345,6 +370,8 @@ const EVENT_META: Record<string, { text: string; tone: keyof typeof TONE }> = {
   'human.requested': { text: '请求人工', tone: 'warn' },
   'human.resolved': { text: '人工已回复', tone: 'ok' },
   'log': { text: '日志', tone: 'dim' },
+  'issuance': { text: '出具判定', tone: 'warn' },
+  'caliber.upgrade': { text: '口径升版', tone: 'warn' },
 }
 
 function describe(event: RunEvent): string {
@@ -372,6 +399,15 @@ function describe(event: RunEvent): string {
       return String(d.message ?? '')
     case 'human.requested':
       return String(d.title ?? d.tool ?? '')
+    case 'issuance': {
+      const tier = { formal: '正式出具', degraded: '降档出具', withheld: '不予出具' }[d.tier as string] ?? d.tier
+      const parts = [tier]
+      if (d.missing_required?.length) parts.push(`缺必需指标 ${d.missing_required.join(',')}`)
+      if (d.unmatched) parts.push(`${d.unmatched} 个数字无法回指`)
+      return parts.join(' · ')
+    }
+    case 'caliber.upgrade':
+      return `方法卡 v${d.pinned} → v${d.latest} 已有新版，处置：${d.policy_label ?? d.policy}`
     case 'node.finished': {
       if (!d.preview) return ''
       const text = typeof d.preview === 'string' ? d.preview : JSON.stringify(d.preview)
@@ -410,9 +446,11 @@ function OutputView() {
     return <Empty title="还没有成果" hint="运行完成后，output 节点收集的结构化结果会显示在这里。" />
   }
 
+  const issuance = (output as any)._issuance
   return (
     <div className="space-y-3 p-3">
-      {Object.entries(output).map(([key, value]) => (
+      {issuance && <IssuanceBanner issuance={issuance} runClass={run?.run_class} />}
+      {Object.entries(output).filter(([k]) => k !== '_issuance').map(([key, value]) => (
         <div key={key}>
           <div className="label">{key}</div>
           <div className="whitespace-pre-wrap break-words rounded border bg-bg p-2 text-[11.5px] leading-relaxed">
@@ -420,6 +458,52 @@ function OutputView() {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+const TIER_META: Record<string, { label: string; color: string; hint: string }> = {
+  formal: { label: '正式出具', color: 'var(--ok)', hint: '指标齐全，叙述中所有数字均可回指口径卡' },
+  degraded: { label: '降档出具', color: 'var(--warn)', hint: '存在缺口，结论请对照下方声明使用' },
+  withheld: { label: '不予出具', color: 'var(--err)', hint: '必需指标缺失或数字无法溯源，本期结论不作数' },
+}
+
+function IssuanceBanner({ issuance, runClass }: { issuance: any; runClass?: string }) {
+  const meta = TIER_META[issuance.tier] ?? TIER_META.degraded
+  return (
+    <div className="rounded-lg border p-2.5" style={{ borderColor: meta.color }}>
+      <div className="flex items-center gap-2">
+        <span className="text-[12px] font-semibold" style={{ color: meta.color }}>
+          ⚖ {meta.label}
+        </span>
+        {runClass === 'exploratory' && (
+          <span className="chip" style={{ color: 'var(--warn)' }}>探索性运行 · 不进正式归档</span>
+        )}
+        <span className="ml-auto text-[10px] text-faint">
+          回指 {issuance.matched_numbers ?? 0} 个数字 / 核对 {issuance.metrics_checked ?? 0} 个指标
+        </span>
+      </div>
+      <div className="mt-1 text-[10.5px] text-faint">{meta.hint}</div>
+      {(issuance.calibers ?? []).map((c: any) => (
+        <div key={c.node} className="mt-1 text-[10.5px] text-dim">
+          口径：{c.caliber} @ {c.version}
+        </div>
+      ))}
+      {!!issuance.missing_required?.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--err)' }}>
+          缺必需指标：{issuance.missing_required.join('、')}
+        </div>
+      )}
+      {!!issuance.missing_expected?.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--warn)' }}>
+          缺数据声明：{issuance.missing_expected.join('、')} 本期缺失
+        </div>
+      )}
+      {!!issuance.unmatched_numbers?.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--warn)' }}>
+          无法回指的数字：{issuance.unmatched_numbers.map((u: any) => u.token).join('、')}
+        </div>
+      )}
     </div>
   )
 }

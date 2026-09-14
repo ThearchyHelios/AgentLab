@@ -263,6 +263,9 @@ function FieldInput({ field, value, onChange }: {
     case 'cases':
       return <CaseList value={value ?? []} onChange={onChange} />
 
+    case 'metricsList':
+      return <MetricList value={value ?? []} onChange={onChange} />
+
     case 'agents':
       return <AgentList value={value ?? []} onChange={onChange} />
 
@@ -413,6 +416,39 @@ function CaseList({ value, onChange }: { value: any[]; onChange: (v: any[]) => v
       </button>
       <div className="mt-1.5 text-[10px] leading-snug text-faint">
         所有条件都不满足时走 default 出口，记得连一条
+      </div>
+    </div>
+  )
+}
+
+function MetricList({ value, onChange }: { value: any[]; onChange: (v: any[]) => void }) {
+  const update = (i: number, patch: any) =>
+    onChange(value.map((m, idx) => (idx === i ? { ...m, ...patch } : m)))
+  return (
+    <div>
+      {value.map((m, i) => (
+        <Row key={i} onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
+          <div className="flex gap-1.5">
+            <input className="field" placeholder="指标 id（英文）" value={m.id ?? ''}
+                   onChange={(e) => update(i, { id: e.target.value })} />
+            <input className="field" placeholder="名称" value={m.name ?? ''}
+                   onChange={(e) => update(i, { name: e.target.value })} />
+            <input className="field w-16 shrink-0" placeholder="单位" value={m.unit ?? ''}
+                   onChange={(e) => update(i, { unit: e.target.value })} />
+          </div>
+          <input className="field mono text-[11px]"
+                 placeholder="表达式，如 round(vars.agg.amount / vars.agg.orders, 2)"
+                 value={m.expression ?? ''}
+                 onChange={(e) => update(i, { expression: e.target.value })} />
+        </Row>
+      ))}
+      <button className="btn btn-sm w-full justify-center"
+              onClick={() => onChange([...value, { id: '', name: '', unit: '', expression: '' }])}>
+        <Plus size={11} /> 添加指标
+      </button>
+      <div className="mt-1.5 text-[10px] leading-snug text-faint">
+        所有算术都发生在这里（确定性、可复算）。叙述节点只许引用这份清单里的数，
+        出具时会逐个数字回指校验。
       </div>
     </div>
   )

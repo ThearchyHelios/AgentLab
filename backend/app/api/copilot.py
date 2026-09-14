@@ -223,6 +223,102 @@ async def generate(
     )
 
 
+class FromRunIn(BaseModel):
+    run_id: str
+    name: str = ""
+
+
+@router.post("/from-run")
+async def extract_template(
+    payload: FromRunIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """轨迹 → 模板：把一次探索性运行实际走过的路径提取成草稿工作流。
+
+    探索层的价值不在单次答案，而在"跑通的路径能沉淀为资产"。
+    提取是确定性的：只保留真正执行过的节点和它们之间的边，分支上
+    没走的岔路剪掉；输入值参数化成 input 字段默认值。产物落成 draft，
+    人审、改名、发布之后才成为正式模板——提取器是模板的作者，不是发布者。
+    """
+    from sqlalchemy import select as _sel
+
+    from app.api.copilot import auto_layout  # 自引用仅为显式
+    from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
+    from app.core.artifact_store import graph_hash
+
+    run = await session.get(Run, payload.run_id)
+    if not run:
+        raise HTTPException(404, "运行记录不存在")
+    if not run.graph.get("nodes"):
+        raise HTTPException(400, "这次运行没有保存图快照，无法提取")
+
+    events = list(
+        (
+            await session.execute(
+                _sel(RunEvent).where(RunEvent.run_id == run.id).order_by(RunEvent.seq)
+            )
+        ).scalars()
+    )
+    executed = {e.node_id for e in events if e.type == "node.started" and e.node_id}
+    taken = {
+        (e.node_id, str((e.data or {}).get("branch")))
+        for e in events
+        if e.type == "edge.taken" and e.node_id
+    }
+    if not executed:
+        raise HTTPException(400, "事件流里没有节点执行记录")
+
+    spec = GraphSpec.model_validate(run.graph)
+    kept_nodes = [n for n in spec.nodes if n.id in executed]
+    kept_ids = {n.id for n in kept_nodes}
+    kept_edges = []
+    for edge in spec.edges:
+        if edge.source not in kept_ids or edge.target not in kept_ids:
+            continue
+        # 分支/循环节点：只保留实际走过的出口，没走的岔路不进模板
+        source_node = spec.node_map().get(edge.source)
+        if source_node and source_node.type in (NodeType.BRANCH,) and edge.sourceHandle:
+            if (edge.source, edge.sourceHandle) not in taken:
+                continue
+        kept_edges.append(edge)
+
+    # 输入参数化：实际输入值变成字段默认值
+    for node in kept_nodes:
+        if node.type.value == "input":
+            node.data.config["fields"] = [
+                {"name": key, "default": value if isinstance(value, (str, int, float)) else json.dumps(value, ensure_ascii=False)}
+                for key, value in (run.input or {}).items()
+            ] or node.data.config.get("fields", [])
+
+    draft_spec = auto_layout(
+        GraphSpec(nodes=kept_nodes, edges=kept_edges, defaults=spec.defaults)
+    )
+    graph = draft_spec.model_dump(mode="json")
+    workflow = Workflow(
+        name=payload.name or f"{run.workflow_name or '探索'}·提取模板",
+        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{len(kept_nodes)} 节点），待人审后发布",
+        graph=graph,
+        tags=["extracted"],
+        status="draft",
+    )
+    session.add(workflow)
+    await session.flush()
+    session.add(
+        WorkflowVersion(
+            workflow_id=workflow.id, version=1, graph=graph,
+            graph_hash=graph_hash(graph), note=f"自运行 {run.id} 提取",
+        )
+    )
+    await session.commit()
+    return {
+        "workflow_id": workflow.id,
+        "name": workflow.name,
+        "nodes": len(kept_nodes),
+        "edges": len(kept_edges),
+        "dropped_nodes": len(spec.nodes) - len(kept_nodes),
+        "source_run": run.id,
+    }
+
+
 class ExplainIn(BaseModel):
     graph: dict[str, Any]
     provider: str | None = None

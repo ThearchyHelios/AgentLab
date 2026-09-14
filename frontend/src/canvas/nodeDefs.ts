@@ -1,13 +1,13 @@
 import {
   Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput,
-  GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
+  Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
 } from 'lucide-react'
 import type { NodeType } from '../types'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
-  | 'ioFields' | 'cases' | 'agents'
+  | 'ioFields' | 'cases' | 'agents' | 'metricsList'
 
 export interface FieldDef {
   key: string
@@ -92,10 +92,18 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: { fields: [{ name: 'question', required: true }] },
   },
   output: {
-    type: 'output', label: '成果', category: '起止', icon: FileOutput,
-    description: '收集最终结构化成果',
+    type: 'output', label: '成果 / 出具', category: '起止', icon: FileOutput,
+    description: '收集结构化成果；配出具契约后升级为三档出具',
     hasTarget: true, sources: [],
-    fields: [{ key: 'fields', label: '成果字段', type: 'ioFields' }],
+    fields: [
+      { key: 'fields', label: '成果字段', type: 'ioFields' },
+      {
+        key: 'contract', label: '出具契约', type: 'json', advanced: true,
+        help: '{"metrics_from":["口径卡节点id"],"narrative":"{{ vars.report }}",'
+          + '"required":[…],"expected":[…],"allow_numbers":[…],"strict":false}。'
+          + '配了之后叙述里的每个数字必须能回指指标集，否则降档或不予出具',
+      },
+    ],
     defaults: { fields: [{ name: '结果', value: '{{ last_message }}' }] },
   },
   llm: {
@@ -362,6 +370,24 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: {
       source: '{{ last_message }}', max_retries: 2, repair_with_llm: true, fail_fast: true,
       schema: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  metrics: {
+    type: 'metrics', label: '口径卡', category: '把关', icon: Gauge,
+    description: '受控指标集：所有算术在这里发生，叙述层只能引用',
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    fields: [
+      { key: 'caliber', label: '口径名称', type: 'text', placeholder: '周报口径' },
+      { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1' },
+      { key: 'metrics', label: '指标定义', type: 'metricsList' },
+      {
+        key: 'assign_to', label: '结果存为变量', type: 'text',
+        help: '叙述节点用 {{ nodes.节点id.text }} 引用指标清单',
+      },
+    ],
+    defaults: {
+      caliber: '', caliber_version: 'v1',
+      metrics: [{ id: 'total', name: '', unit: '', expression: '' }],
     },
   },
 }
