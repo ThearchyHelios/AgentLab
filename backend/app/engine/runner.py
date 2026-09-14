@@ -42,12 +42,20 @@ class RunManager:
         settings.ensure_dirs()
         self._cm = AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path))
         self._checkpointer = await self._cm.__aenter__()
-        # 上次进程被强杀时留下的 running 记录，标成中断态而不是永远转圈
+        # 上次进程被强杀时留下的记录。running 和 queued 要分开处理：
+        # running 至少跑过一步、有 checkpoint，可以续；queued 还在排队，
+        # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
+        # 还丢掉 run.input——那不是恢复，是伪造一份结果。
         async with SessionLocal() as session:
             await session.execute(
                 update(Run)
-                .where(Run.status.in_(["running", "queued"]))
+                .where(Run.status == "running")
                 .values(status="interrupted", error="服务重启，运行已挂起，可从断点恢复")
+            )
+            await session.execute(
+                update(Run)
+                .where(Run.status == "queued")
+                .values(status="failed", error="服务重启时这次运行还在排队，没有可恢复的进度，请重新发起")
             )
             await session.commit()
 
@@ -160,8 +168,23 @@ class RunManager:
         )
         return run
 
-    async def resume(self, run_id: str, response: Any) -> Run:
-        """从人工介入的断点继续。"""
+    async def resume(
+        self, run_id: str, response: Any, *, approval_id: str | None = None,
+        actor: str | None = None,
+    ) -> Run:
+        """从人工介入的断点继续。
+
+        两件事以前是错的：
+
+        一是不看有没有 checkpoint 就发 Command。重启扫描会把 queued（从没跑过、
+        没有任何 checkpoint）也标成 interrupted，对这种 run 发 Command，LangGraph
+        会拿一个空 state 从 START 重跑整张图——run.input 完全没被注入，最后还落成
+        succeeded。跑出来的是一份用默认值算的假结果。
+
+        二是同一 superstep 里有多个 interrupt 时，只发标量 Command 会让 LangGraph
+        直接抛 RuntimeError 打爆整个 run，而所有 pending 审批还都被写成同一个回复。
+        现在按 interrupt_id 逐条收集，凑齐了才继续，没凑齐就继续等下一个人回复。
+        """
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if not run:
@@ -169,29 +192,103 @@ class RunManager:
             if run.status not in ("interrupted",):
                 raise ValueError(f"当前状态是 {run.status}，无法恢复")
             spec = GraphSpec.model_validate(run.graph)
-            bus.set_seq(run_id, run.last_seq)
-            run.status = "running"
-            run.error = None
+            workflow_id = run.workflow_id
 
-            # 把这次恢复对应的待审批记录结掉，前端的待办列表才不会一直挂着
-            pending = (
+        # 先问引擎：这条线程到底停在哪、还等着哪些 interrupt
+        run_ctx = RunContext(run_id=run_id, thread_id=run_id, spec=spec, workflow_id=workflow_id)
+        app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
+        config = {"configurable": {"thread_id": run_id}}
+        snapshot = await app.aget_state(config)
+        waiting = list(getattr(snapshot, "interrupts", None) or [])
+
+        if not waiting and not getattr(snapshot, "next", None):
+            # 没有断点可续。多半是重启时被标成 interrupted 的 queued 运行。
+            raise ValueError(
+                "这次运行没有可恢复的断点（很可能重启前还没真正开始跑）。"
+                "请重新发起一次运行，而不是恢复——继续下去只会用默认值跑出一份假结果。"
+            )
+
+        answers: dict[str, Any] = {}
+        async with SessionLocal() as session:
+            pending = list((
                 await session.execute(
                     select(Approval).where(
                         Approval.run_id == run_id, Approval.status == "pending"
                     )
                 )
-            ).scalars()
-            for approval in pending:
-                approval.status = "resolved"
-                approval.response = _safe(response) if isinstance(response, dict) else {"value": _safe(response)}
-                approval.resolved_at = datetime.now(timezone.utc)
+            ).scalars())
 
+            # 定位这次回复的是哪一条：显式指定优先，否则只在唯一 pending 时才敢猜
+            target = None
+            if approval_id:
+                target = next((a for a in pending if a.id == approval_id), None)
+                if target is None:
+                    raise ValueError(f"审批 {approval_id} 不在待处理列表里")
+            elif len(pending) == 1:
+                target = pending[0]
+            elif len(pending) > 1:
+                raise ValueError(
+                    f"这次运行有 {len(pending)} 条待处理的人工介入，"
+                    "恢复时必须指定 approval_id 说明回复的是哪一条"
+                )
+
+            now = datetime.now(timezone.utc)
+            if target is not None:
+                target.status = "answered"  # 已回复，但还没提交给引擎
+                target.response = (
+                    _safe(response) if isinstance(response, dict) else {"value": _safe(response)}
+                )
+                target.resolved_at = now
+                if actor:
+                    target.resolved_by = actor
+                await session.commit()
+
+            # 凑齐没有？引擎还在等的每一个 interrupt 都得有答案
+            answered = list((
+                await session.execute(
+                    select(Approval).where(
+                        Approval.run_id == run_id,
+                        Approval.status.in_(["answered", "pending"]),
+                    )
+                )
+            ).scalars())
+            by_iid = {a.interrupt_id: a for a in answered if a.interrupt_id}
+            missing = []
+            for item in waiting:
+                iid = getattr(item, "id", None)
+                rec = by_iid.get(iid)
+                if rec is None or rec.status != "answered":
+                    missing.append(iid)
+                    continue
+                payload = rec.response or {}
+                answers[iid] = payload.get("value", payload) if isinstance(payload, dict) else payload
+
+            if missing:
+                # 还差人没回。保持 interrupted，把已回复的那条留在 answered 上等齐
+                await session.commit()
+                run = await session.get(Run, run_id)
+                return run
+
+            # 齐了：正式落 resolved，然后驱动引擎
+            for rec in answered:
+                if rec.status == "answered":
+                    rec.status = "resolved"
+            run = await session.get(Run, run_id)
+            bus.set_seq(run_id, run.last_seq)
+            run.status = "running"
+            run.error = None
             await session.commit()
             await session.refresh(run)
 
+        # 单个 interrupt 用标量（LangGraph 两种都认），多个必须用 {interrupt_id: value} 映射
+        command = (
+            Command(resume=response)
+            if len(waiting) <= 1
+            else Command(resume=answers)
+        )
         await self._emit(run_id, EventType.RUN_RESUMED, data={"response": _safe(response)})
         self._tasks[run_id] = asyncio.create_task(
-            self._drive(run_id, spec, Command(resume=response), workflow_id=run.workflow_id)
+            self._drive(run_id, spec, command, workflow_id=workflow_id)
         )
         return run
 
