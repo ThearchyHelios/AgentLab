@@ -62,8 +62,34 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
+# 轻量迁移：create_all 只建新表，不给已有表加列。SQLite 的 ADD COLUMN
+# 便宜且带默认值回填，够用；等真需要改列类型再考虑 alembic。
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("runs", "run_class", "TEXT DEFAULT 'exploratory'"),
+    ("runs", "version", "INTEGER"),
+    ("runs", "version_hash", "VARCHAR(64)"),
+    ("runs", "manifest_hash", "VARCHAR(64)"),
+    ("runs", "started_by", "VARCHAR(100)"),
+    ("workflows", "status", "TEXT DEFAULT 'draft'"),
+    ("workflows", "published_version", "INTEGER"),
+    ("workflows", "published_by", "VARCHAR(100)"),
+    ("workflow_versions", "graph_hash", "VARCHAR(64)"),
+    ("approvals", "resolved_by", "VARCHAR(100)"),
+]
+
+
+def _migrate(conn) -> None:  # pragma: no cover - 同步回调
+    from sqlalchemy import text
+
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        if cols and column not in cols:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
 async def init_db() -> None:
     from app.db import models  # noqa: F401  确保模型已注册到 metadata
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate)

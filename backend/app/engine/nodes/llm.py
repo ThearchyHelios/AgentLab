@@ -326,12 +326,24 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 content = f"工具执行失败：{type(e).__name__}: {e}"
                 ok = False
             elapsed = int((time.perf_counter() - started) * 1000)
+            snapshot_id: str | None = None
+            if ok:
+                from app.core.artifact_store import put_json
+
+                try:
+                    snapshot_id = await put_json(
+                        {"tool": name, "args": args, "result": content},
+                        kind="tool_snapshot", run_id=ctx.run.run_id, node_id=ctx.node.id,
+                    )
+                except Exception:  # noqa: BLE001
+                    snapshot_id = None
             ctx.emit(
                 EventType.TOOL_END if ok else EventType.TOOL_ERROR,
                 tool=name,
                 call_id=call_id,
                 duration_ms=elapsed,
                 preview=content[:2000],
+                artifact=snapshot_id,
             )
             transcript.append(
                 {"tool": name, "args": args, "ok": ok, "duration_ms": elapsed, "result": content[:4000]}

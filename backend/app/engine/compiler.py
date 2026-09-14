@@ -71,11 +71,33 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
             try:
                 updates = await runner(state, ctx)
                 elapsed = int((time.perf_counter() - started) * 1000)
+
+                # 完整输出落工件库。事件里只放截断预览是给画布看的；
+                # 出具溯源、周对比、轨迹提模板需要的是这份完整证据。
+                artifact_id: str | None = None
+                payload = (updates.get("nodes") or {}).get(node.id)
+                if payload is not None:
+                    from app.core.artifact_store import put_json
+
+                    try:
+                        artifact_id = await put_json(
+                            payload,
+                            kind="node_output",
+                            run_id=run_ctx.run_id,
+                            node_id=node.id,
+                            meta={"type": str(node.type), "attempt": attempt + 1},
+                        )
+                        if isinstance(payload, dict):
+                            payload["__artifact__"] = artifact_id
+                    except Exception:  # noqa: BLE001 - 工件写失败不该毁掉运行本身
+                        artifact_id = None
+
                 ctx.emit(
                     EventType.NODE_FINISHED,
                     duration_ms=elapsed,
                     attempt=attempt + 1,
                     preview=_preview(updates, node.id),
+                    artifact=artifact_id,
                 )
                 trail = {
                     "node_id": node.id,

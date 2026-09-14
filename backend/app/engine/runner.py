@@ -100,6 +100,13 @@ class RunManager:
                 )
                 await session.commit()
 
+    async def note(
+        self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
+        **data: Any,
+    ) -> None:
+        """给 API 层用的事件入口（比如 formal 启动时记录口径升版处置）。"""
+        await self._emit(run_id, event_type, node_id=node_id, data=data)
+
     # ---------------- 启动 ----------------
 
     async def start(
@@ -111,6 +118,10 @@ class RunManager:
         workflow_name: str = "",
         memory_scope: str = "default",
         collection: str = "default",
+        run_class: str = "exploratory",
+        version: int | None = None,
+        version_hash: str | None = None,
+        started_by: str | None = None,
     ) -> Run:
         spec = GraphSpec.model_validate(graph)
         report = validate_graph(spec)
@@ -126,6 +137,10 @@ class RunManager:
                 status="queued",
                 graph=graph,
                 input=input_payload,
+                run_class=run_class,
+                version=version,
+                version_hash=version_hash,
+                started_by=started_by,
             )
             run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
             session.add(run)
@@ -343,6 +358,16 @@ class RunManager:
                 run.usage = usage
                 if status != "interrupted":
                     run.finished_at = datetime.now(timezone.utc)
+                    # 终态时对全部已落库事件计算清单哈希：事后任何对事件流的
+                    # 增删改都会与这个值对不上。中断态不算——事件还会继续追加。
+                    from app.core.artifact_store import manifest_hash as _manifest
+
+                    rows = await session.execute(
+                        select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
+                        .where(RunEvent.run_id == run_id)
+                        .order_by(RunEvent.seq)
+                    )
+                    run.manifest_hash = _manifest([tuple(r) for r in rows])
                 await session.commit()
 
         if status == "succeeded":
