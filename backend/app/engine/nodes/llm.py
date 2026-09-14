@@ -116,6 +116,7 @@ async def _invoke_streaming(model: Any, messages: list[BaseMessage], ctx: NodeCo
     """
     ctx.emit(EventType.LLM_START, message_count=len(messages))
     chunks: list[Any] = []
+    response: AIMessage | None = None
     try:
         async for chunk in model.astream(messages):
             chunks.append(chunk)
@@ -124,19 +125,34 @@ async def _invoke_streaming(model: Any, messages: list[BaseMessage], ctx: NodeCo
                 ctx.emit(EventType.LLM_TOKEN, delta=text)
             reasoning = thinking_text(chunk)
             if reasoning:
-                ctx.emit(EventType.LLM_THINKING, delta=reasoning)
+                # 增量只服务画布的实时滚动，不进轨迹（runner 标记为 ephemeral）
+                ctx.emit(EventType.LLM_THINKING_DELTA, delta=reasoning)
     except NotImplementedError:
-        return await model.ainvoke(messages)
+        response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn", message=f"流式失败，回退非流式：{e}")
-        return await model.ainvoke(messages)
+        response = await model.ainvoke(messages)
 
-    if not chunks:
-        return await model.ainvoke(messages)
-    merged = chunks[0]
-    for chunk in chunks[1:]:
-        merged = merged + chunk
-    return merged
+    if response is None:
+        if not chunks:
+            response = await model.ainvoke(messages)
+        else:
+            merged = chunks[0]
+            for chunk in chunks[1:]:
+                merged = merged + chunk
+            response = merged
+
+    # 一次思考在轨迹里只占一条事件：调用收尾时落完整内容，
+    # 刷新页面回放时也靠它一次性恢复，而不是重放几十条增量
+    reasoning = thinking_text(response)
+    if reasoning:
+        ctx.emit(
+            EventType.LLM_THINKING,
+            text=reasoning[:6000],
+            chars=len(reasoning),
+            truncated=len(reasoning) > 6000,
+        )
+    return response
 
 
 # --------------------------------------------------------------------------

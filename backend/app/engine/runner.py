@@ -22,8 +22,9 @@ from app.engine.schema import GraphSpec, validate_graph
 
 logger = logging.getLogger(__name__)
 
-# token 事件量太大，只做实时推送不落库；回放时用节点的输出摘要重建时间线
-_EPHEMERAL = {EventType.LLM_TOKEN}
+# 流式增量（正文 token、思考 delta）量太大，只做实时推送不落库；
+# 轨迹里正文靠 node.finished 的 preview，思考靠调用结束时的单条 llm.thinking 汇总
+_EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
 
 
 class RunManager:

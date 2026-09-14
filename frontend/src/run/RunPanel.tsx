@@ -261,7 +261,7 @@ function ApprovalCard({ approval }: { approval: any }) {
 
 // -------------------------------------------------------------------------
 
-const HIDDEN_TYPES = new Set(['llm.token', 'llm.thinking'])
+const HIDDEN_TYPES = new Set(['llm.token', 'llm.thinking.delta'])
 
 function Timeline() {
   const events = useStudio((s) => s.events)
@@ -359,6 +359,7 @@ const EVENT_META: Record<string, { text: string; tone: keyof typeof TONE }> = {
   'node.skipped': { text: '跳过', tone: 'dim' },
   'edge.taken': { text: '分支', tone: 'warn' },
   'llm.start': { text: '调用模型', tone: 'dim' },
+  'llm.thinking': { text: '思考', tone: 'dim' },
   'llm.end': { text: '模型返回', tone: 'dim' },
   'tool.start': { text: '调用工具', tone: 'dim' },
   'tool.end': { text: '工具完成', tone: 'ok' },
@@ -384,6 +385,8 @@ function describe(event: RunEvent): string {
     case 'tool.end':
     case 'tool.error':
       return String(d.preview ?? '').slice(0, 300)
+    case 'llm.thinking':
+      return String(d.text ?? '').slice(0, 300)
     case 'llm.end':
       return `${d.model ?? ''} · ${d.input_tokens ?? 0}+${d.output_tokens ?? 0} tok${d.cost_usd ? ` · $${Number(d.cost_usd).toFixed(4)}` : ''}`
     case 'sandbox.end':
