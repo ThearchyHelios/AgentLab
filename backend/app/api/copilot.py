@@ -102,6 +102,7 @@ class GenerateOut(BaseModel):
 
 
 GRAPH_SCHEMA: dict[str, Any] = {
+    "title": "workflow_graph",  # langchain 靠 title 识别 JSON Schema dict
     "type": "object",
     "properties": {
         "explanation": {"type": "string", "description": "一两句话说明这张图怎么跑"},
@@ -220,6 +221,204 @@ async def generate(
         graph=spec.model_dump(mode="json"),
         explanation=str(raw.get("explanation", "")),
         issues=[i.model_dump() for i in report.issues],
+    )
+
+
+# --------------------------------------------------------------------------
+# 流式生成：模型输出逐行操作流（NDJSON），画布看着图长出来
+# --------------------------------------------------------------------------
+
+_STREAM_PROTOCOL = """\
+输出格式（严格遵守）：
+- 每行一个完整的 JSON 对象，除此之外不输出任何东西——不要 markdown 围栏、不要解释文字、不要空行注释
+- 可用操作：
+  {"op":"plan","summary":"一句话说明打算怎么搭"}          ← 第一行
+  {"op":"add_node","node":{"id":"...","type":"...","label":"中文标签","config":{...}}}
+  {"op":"update_node","id":"...","label":"...","config":{...}}   ← 修改现有节点（config 整体替换）
+  {"op":"remove_node","id":"..."}
+  {"op":"add_edge","edge":{"source":"...","target":"...","sourceHandle":"..."}}
+  {"op":"remove_edge","source":"...","target":"...","sourceHandle":"..."}
+  {"op":"done","explanation":"两三句话说明这张图怎么跑"}    ← 最后一行
+- 按执行顺序添加节点（先入口后出口）；每加一个节点，立刻把连向它的边（两端都已存在的）输出出来，让图连贯地生长
+- 修改现有图时只输出改动，没提到的节点不要动"""
+
+
+def _parse_op_line(line: str) -> dict[str, Any] | None:
+    """解析一行操作。围栏行、空行、解析失败、缺 op 的一律返回 None——
+    模型偶尔犯规不该毁掉整条流，跳过就是。"""
+    text = line.strip()
+    if not text or text.startswith("```"):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or "op" not in obj:
+        return None
+    return obj
+
+
+def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op: dict[str, Any]) -> bool:
+    """把一个操作应用到服务端维护的图状态。返回是否真的改了图。"""
+    kind = op.get("op")
+    if kind == "add_node":
+        node = op.get("node") or {}
+        if not node.get("id") or not node.get("type"):
+            return False
+        nodes[node["id"]] = {
+            "id": node["id"],
+            "type": node["type"],
+            "position": {"x": 0, "y": 0},
+            "data": {"label": node.get("label") or "", "config": node.get("config") or {}},
+        }
+        return True
+    if kind == "update_node":
+        node = nodes.get(op.get("id") or "")
+        if not node:
+            return False
+        if op.get("label") is not None:
+            node["data"]["label"] = op["label"]
+        if op.get("config") is not None:
+            node["data"]["config"] = op["config"]
+        return True
+    if kind == "remove_node":
+        node_id = op.get("id")
+        if node_id not in nodes:
+            return False
+        nodes.pop(node_id)
+        edges[:] = [e for e in edges if e["source"] != node_id and e["target"] != node_id]
+        return True
+    if kind == "add_edge":
+        edge = op.get("edge") or {}
+        if not edge.get("source") or not edge.get("target"):
+            return False
+        edges.append(
+            {
+                "source": edge["source"],
+                "target": edge["target"],
+                "sourceHandle": edge.get("sourceHandle"),
+            }
+        )
+        return True
+    if kind == "remove_edge":
+        before = len(edges)
+        edges[:] = [
+            e
+            for e in edges
+            if not (
+                e["source"] == op.get("source")
+                and e["target"] == op.get("target")
+                and (op.get("sourceHandle") is None or e.get("sourceHandle") == op.get("sourceHandle"))
+            )
+        ]
+        return len(edges) != before
+    return False
+
+
+async def _iter_ops(model: Any, messages: list[Any]):
+    """流式读模型输出，按行切出操作。done 之后即停——后面就算有闲话也不要了。"""
+    from app.engine.state import message_text as _text
+
+    buffer = ""
+    async for chunk in model.astream(messages):
+        buffer += _text(chunk)
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            op = _parse_op_line(line)
+            if op:
+                yield op
+                if op.get("op") == "done":
+                    return
+    op = _parse_op_line(buffer)
+    if op:
+        yield op
+
+
+@router.post("/generate-stream")
+async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(get_session)):
+    """流式版生成：SSE 逐操作推送，前端边收边把节点摆上画布。
+
+    结束时（done 或流断）发一条 final：服务端把累积的图排版、校验后整体给出——
+    过程可见性来自操作流，最终质量仍由和手工编排相同的 layout + validate 保证。
+    """
+    from fastapi.responses import StreamingResponse
+
+    tool_list = "\n".join(
+        f"- {name}（{spec.category}）：{spec.description}"
+        for name, spec in sorted(all_specs().items())
+    )
+    system = (
+        "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}\n\n"
+        "结构要求：\n"
+        "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
+        "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
+        "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
+        "4. 只能用上面列出的工具名\n"
+        "5. 能用 3 个节点解决就别堆 8 个\n\n"
+        f"{_STREAM_PROTOCOL}"
+    )
+
+    # 现有图状态：修改场景从 base_graph 起步，新建场景从空图起步
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    if payload.base_graph and payload.base_graph.get("nodes"):
+        for n in payload.base_graph["nodes"]:
+            nodes[n["id"]] = n
+        edges = [
+            {k: v for k, v in e.items() if k in ("source", "target", "sourceHandle")}
+            for e in payload.base_graph.get("edges") or []
+        ]
+        user = (
+            "这是当前的工作流：\n"
+            f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
+            f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
+        )
+    else:
+        user = f"请设计一个工作流：{payload.instruction}"
+
+    try:
+        model, _ = await get_chat_model(
+            session, ModelSpec(provider=payload.provider, model=payload.model, max_tokens=8192)
+        )
+    except ProviderNotConfigured as e:
+        raise HTTPException(400, str(e)) from e
+
+    messages = [("system", system), ("human", user)]
+
+    async def event_stream():
+        explanation = ""
+        try:
+            async for op in _iter_ops(model, messages):
+                if op.get("op") == "done":
+                    explanation = str(op.get("explanation", ""))
+                changed = _apply_op(nodes, edges, op)
+                if changed or op.get("op") in ("plan", "done"):
+                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'op': 'error', 'message': f'{type(e).__name__}: {e}'}, ensure_ascii=False)}\n\n"
+            return
+
+        # 收尾：排版 + 校验，把最终图整体交付
+        try:
+            spec = auto_layout(
+                GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
+            )
+            issues = [i.model_dump() for i in validate_graph(spec).issues]
+            final = {
+                "op": "final",
+                "graph": spec.model_dump(mode="json"),
+                "issues": issues,
+                "explanation": explanation,
+            }
+        except Exception as e:  # noqa: BLE001
+            final = {"op": "error", "message": f"生成的图结构非法：{e}"}
+        yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

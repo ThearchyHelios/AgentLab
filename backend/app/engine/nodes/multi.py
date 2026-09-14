@@ -59,6 +59,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         for n in names
     )
     route_schema = {
+        "title": "route",  # langchain 靠 title 识别 JSON Schema dict
         "type": "object",
         "properties": {
             "next": {"type": "string", "enum": names + ["FINISH"]},

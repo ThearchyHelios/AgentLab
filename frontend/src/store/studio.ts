@@ -3,7 +3,7 @@ import {
   addEdge, applyEdgeChanges, applyNodeChanges,
   type Connection, type Edge, type EdgeChange, type Node, type NodeChange,
 } from '@xyflow/react'
-import { api, streamRun } from '../api/client'
+import { api, streamCopilot, streamRun } from '../api/client'
 import { NODE_DEFS } from '../canvas/nodeDefs'
 import type {
   GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue, Workflow,
@@ -78,6 +78,10 @@ interface StudioState {
   streaming: boolean
   unsubscribe: (() => void) | null
 
+  copilot: { active: boolean; lastOp: string; explanation: string; error: string }
+  copilotNew: string[]
+  cancelCopilot: (() => void) | null
+
   // actions
   load: (workflow: Workflow) => void
   setGraph: (graph: GraphSpec) => void
@@ -94,6 +98,8 @@ interface StudioState {
 
   startRun: (input: Record<string, any>) => Promise<Run | null>
   startFormalRun: (input: Record<string, any>) => Promise<Run | null>
+  runCopilot: (instruction: string, useBase: boolean) => void
+  stopCopilot: () => void
   attachRun: (runId: string) => Promise<void>
   stopRun: () => Promise<void>
   clearRun: () => void
@@ -115,6 +121,9 @@ export const useStudio = create<StudioState>((set, get) => ({
   activeEdges: [],
   streaming: false,
   unsubscribe: null,
+  copilot: { active: false, lastOp: '', explanation: '', error: '' },
+  copilotNew: [],
+  cancelCopilot: null,
 
   load: (workflow) => {
     const { nodes, edges } = toFlow(workflow.graph)
@@ -250,6 +259,134 @@ export const useStudio = create<StudioState>((set, get) => ({
       set({ streaming: false })
       throw e
     }
+  },
+
+  runCopilot: (instruction, useBase) => {
+    const state = get()
+    state.cancelCopilot?.()
+    set({
+      copilot: { active: true, lastOp: '正在起草…', explanation: '', error: '' },
+      copilotNew: [],
+    })
+    if (!useBase) set({ nodes: [], edges: [], dirty: true })
+
+    // 流式期间的临时摆位：新节点放在其入边源的右侧；final 会用后端排版整体替换
+    const place = (nodeId: string): { x: number; y: number } => {
+      const { nodes, edges } = get()
+      const incoming = edges.find((e) => e.target === nodeId)
+      const source = incoming && get().nodes.find((n) => n.id === incoming.source)
+      if (source) {
+        const siblings = edges.filter((e) => e.source === source.id).length - 1
+        return { x: source.position.x + 290, y: source.position.y + siblings * 150 }
+      }
+      return { x: 120 + nodes.length * 290, y: 320 }
+    }
+
+    const stop = streamCopilot(
+      { instruction, base_graph: useBase && state.nodes.length ? toGraph(state.nodes, state.edges) : null },
+      (op) => {
+        const s = get()
+        switch (op.op) {
+          case 'plan':
+            set({ copilot: { ...s.copilot, lastOp: op.summary ?? '规划中' } })
+            break
+          case 'add_node': {
+            const n = op.node
+            if (!n?.id || !n?.type) break
+            const node: FlowNode = {
+              id: n.id, type: 'card', position: { x: 0, y: 0 },
+              data: { nodeType: n.type, label: n.label ?? '', config: n.config ?? {} },
+            }
+            set({
+              nodes: [...s.nodes.filter((x) => x.id !== n.id), node],
+              copilotNew: [...s.copilotNew, n.id],
+              copilot: { ...s.copilot, lastOp: `添加节点：${n.label || n.id}` },
+              dirty: true,
+            })
+            // 位置要等边可能已到齐后算——直接再取一次最新状态摆位
+            set({
+              nodes: get().nodes.map((x) => (x.id === n.id ? { ...x, position: place(n.id) } : x)),
+            })
+            break
+          }
+          case 'update_node':
+            set({
+              nodes: s.nodes.map((x) =>
+                x.id === op.id
+                  ? { ...x, data: { ...x.data,
+                      ...(op.label != null ? { label: op.label } : {}),
+                      ...(op.config != null ? { config: op.config } : {}) } }
+                  : x),
+              copilotNew: s.copilotNew.includes(op.id) ? s.copilotNew : [...s.copilotNew, op.id],
+              copilot: { ...s.copilot, lastOp: `修改节点：${op.id}` },
+              dirty: true,
+            })
+            break
+          case 'remove_node':
+            set({
+              nodes: s.nodes.filter((x) => x.id !== op.id),
+              edges: s.edges.filter((e) => e.source !== op.id && e.target !== op.id),
+              copilot: { ...s.copilot, lastOp: `移除节点：${op.id}` },
+              dirty: true,
+            })
+            break
+          case 'add_edge': {
+            const e = op.edge
+            if (!e?.source || !e?.target) break
+            set({
+              edges: [...s.edges, {
+                id: `cp_${e.source}_${e.sourceHandle ?? ''}_${e.target}`,
+                source: e.source, target: e.target,
+                sourceHandle: e.sourceHandle ?? null, type: 'smoothstep',
+              }],
+              copilot: { ...s.copilot, lastOp: `连线：${e.source} → ${e.target}` },
+              dirty: true,
+            })
+            break
+          }
+          case 'remove_edge':
+            set({
+              edges: s.edges.filter((e) =>
+                !(e.source === op.source && e.target === op.target
+                  && (op.sourceHandle == null || e.sourceHandle === op.sourceHandle))),
+              dirty: true,
+            })
+            break
+          case 'done':
+            set({ copilot: { ...s.copilot, lastOp: '排版整理中…', explanation: op.explanation ?? '' } })
+            break
+          case 'final': {
+            // 后端排版+校验后的最终图整体落位；高亮集合保留几秒供辨认
+            const { nodes, edges } = toFlow(op.graph)
+            set({ nodes, edges, dirty: true,
+                  copilot: { active: false, lastOp: '',
+                             explanation: op.explanation ?? get().copilot.explanation, error: '' } })
+            void get().validate()
+            setTimeout(() => set({ copilotNew: [] }), 6000)
+            break
+          }
+          case 'error':
+            set({ copilot: { active: false, lastOp: '', explanation: '', error: op.message ?? '生成失败' } })
+            break
+        }
+      },
+      (error) => {
+        const c = get().copilot
+        set({
+          copilot: { ...c, active: false, error: error ?? c.error },
+          cancelCopilot: null,
+        })
+      },
+    )
+    set({ cancelCopilot: stop })
+  },
+
+  stopCopilot: () => {
+    get().cancelCopilot?.()
+    set({
+      copilot: { ...get().copilot, active: false },
+      cancelCopilot: null,
+    })
   },
 
   startFormalRun: async (input) => {

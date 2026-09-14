@@ -203,6 +203,56 @@ export const api = {
 }
 
 /**
+ * 流式生成工作流：SSE 逐操作回调，返回取消函数。
+ * 每个操作（add_node / add_edge / …）到达即回调，画布边收边长。
+ */
+export function streamCopilot(
+  body: { instruction: string; base_graph?: GraphSpec | null },
+  onOp: (op: any) => void,
+  onEnd: (error?: string) => void,
+): () => void {
+  const controller = new AbortController()
+  void (async () => {
+    try {
+      const res = await fetch(`${BASE}/copilot/generate-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...actorHeader() },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      if (!res.ok || !res.body) {
+        let detail = `${res.status} ${res.statusText}`
+        try { detail = (await res.json()).detail ?? detail } catch { /* keep */ }
+        onEnd(String(detail))
+        return
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!frame.startsWith('data: ')) continue
+          try {
+            onOp(JSON.parse(frame.slice(6)))
+          } catch { /* 半截帧，忽略 */ }
+        }
+      }
+      onEnd()
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') onEnd(e?.message ?? '连接中断')
+      else onEnd()
+    }
+  })()
+  return () => controller.abort()
+}
+
+/**
  * 订阅一次运行的事件流。
  *
  * 先补历史再接实时由后端保证，这里只负责断线重连 —— 重连时带上已收到的最大

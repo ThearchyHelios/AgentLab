@@ -201,6 +201,18 @@ pre,
   border-color: var(--warn) !important;
 }
 
+/* Copilot 刚放上来的节点：紫色描边 + 出现动画，final 后几秒淡出 */
+@keyframes copilot-pop {
+  from { opacity: 0; transform: scale(0.85); }
+  to { opacity: 1; transform: scale(1); }
+}
+.node-copilot-new {
+  animation: copilot-pop 0.25s ease-out;
+  border-color: #bc8cff !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #bc8cff 25%, transparent);
+  transition: box-shadow 0.8s, border-color 0.8s;
+}
+
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }

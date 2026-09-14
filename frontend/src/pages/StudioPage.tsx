@@ -142,8 +142,9 @@ export function StudioPage() {
         <aside className="w-52 shrink-0 border-r bg-panel">
           <Palette />
         </aside>
-        <main className="min-w-0 flex-1">
+        <main className="relative min-w-0 flex-1">
           <FlowCanvas />
+          <CopilotStatusBar />
         </main>
         <aside className="flex w-[360px] shrink-0 flex-col border-l bg-panel">
           <Tabs
@@ -345,32 +346,16 @@ function PublishModal({ workflow, onClose, onDone }: {
 }
 
 function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const toast = useToast()
   const nodes = useStudio((s) => s.nodes)
-  const edges = useStudio((s) => s.edges)
-  const setGraph = useStudio((s) => s.setGraph)
+  const runCopilot = useStudio((s) => s.runCopilot)
   const [instruction, setInstruction] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [result, setResult] = useState<{ explanation: string; issues: any[] } | null>(null)
   const [useBase, setUseBase] = useState(true)
 
-  const generate = async () => {
+  // 流式生成：发起后立刻关窗，图在画布上实时长出来，状态见左下角浮条
+  const generate = () => {
     if (!instruction.trim()) return
-    setBusy(true)
-    setResult(null)
-    try {
-      const res = await api.copilot.generate({
-        instruction,
-        base_graph: useBase && nodes.length ? toGraph(nodes, edges) : null,
-      })
-      setGraph(res.graph)
-      setResult({ explanation: res.explanation, issues: res.issues })
-      toast('已生成，记得检查后保存', 'ok')
-    } catch (e: any) {
-      toast(e.message ?? '生成失败', 'error')
-    } finally {
-      setBusy(false)
-    }
+    runCopilot(instruction, useBase && nodes.length > 0)
+    onClose()
   }
 
   const examples = [
@@ -388,8 +373,8 @@ function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void })
       footer={
         <>
           <button className="btn" onClick={onClose}>关闭</button>
-          <button className="btn btn-primary" onClick={generate} disabled={busy || !instruction.trim()}>
-            {busy ? <Spinner /> : <Wand2 size={12} />} 生成到画布
+          <button className="btn btn-primary" onClick={generate} disabled={!instruction.trim()}>
+            <Wand2 size={12} /> 生成到画布
           </button>
         </>
       }
@@ -420,27 +405,58 @@ function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void })
       )}
 
       <div className="mt-2 text-[10.5px] leading-relaxed text-faint">
-        生成结果会直接铺到画布上并自动排版，但<b>不会自动保存</b>——先看一遍再决定。
+        点击生成后弹窗会关闭，节点会<b>实时长在画布上</b>（紫色描边是新改动）。
+        结果<b>不会自动保存</b>——看一遍再决定。
       </div>
+    </Modal>
+  )
+}
 
-      {result && (
-        <div className="mt-3 border-t pt-3">
-          <div className="label">Copilot 说明</div>
-          <div className="whitespace-pre-wrap rounded border bg-bg p-2 text-[11.5px] leading-relaxed">
-            {result.explanation || '（无）'}
-          </div>
-          {!!result.issues.length && (
-            <div className="mt-2 space-y-1">
-              {result.issues.map((issue, i) => (
-                <div key={i} className="text-[10.5px]"
-                     style={{ color: issue.level === 'error' ? 'var(--err)' : 'var(--warn)' }}>
-                  {issue.level === 'error' ? '✕' : '!'} {issue.message}
-                </div>
-              ))}
+/** Copilot 工作时的画布浮条：显示当前操作，可随时取消；结束后展示说明。 */
+function CopilotStatusBar() {
+  const copilot = useStudio((s) => s.copilot)
+  const stopCopilot = useStudio((s) => s.stopCopilot)
+  const [dismissed, setDismissed] = useState(false)
+
+  useEffect(() => {
+    // 新一轮生成开始时重新显示
+    if (copilot.active) setDismissed(false)
+  }, [copilot.active])
+
+  if (dismissed) return null
+  if (!copilot.active && !copilot.explanation && !copilot.error) return null
+
+  return (
+    <div className="fade-up pointer-events-auto absolute bottom-4 left-4 z-30 max-w-md rounded-lg border bg-panel px-3 py-2 shadow-xl"
+         style={{ borderColor: copilot.error ? 'var(--err)' : '#bc8cff' }}>
+      {copilot.active ? (
+        <div className="flex items-center gap-2">
+          <Spinner size={13} />
+          <span className="min-w-0 flex-1 truncate text-[11.5px]">
+            <span className="mr-1.5 font-semibold" style={{ color: '#bc8cff' }}>Copilot</span>
+            {copilot.lastOp}
+          </span>
+          <button className="btn btn-sm" onClick={stopCopilot}>取消</button>
+        </div>
+      ) : copilot.error ? (
+        <div className="flex items-start gap-2">
+          <span className="min-w-0 flex-1 text-[11.5px] text-[var(--err)]">{copilot.error}</span>
+          <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
+        </div>
+      ) : (
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="mb-0.5 text-[11px] font-semibold" style={{ color: '#bc8cff' }}>
+              Copilot 完成
             </div>
-          )}
+            <div className="whitespace-pre-wrap text-[11px] leading-relaxed text-dim">
+              {copilot.explanation}
+            </div>
+            <div className="mt-1 text-[10px] text-faint">检查无误后记得保存（⌘S）</div>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
         </div>
       )}
-    </Modal>
+    </div>
   )
 }

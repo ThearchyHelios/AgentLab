@@ -81,6 +81,7 @@ async def _classify_with_llm(
         )
 
     schema = {
+        "title": "classify",  # langchain 靠 title 识别 JSON Schema dict
         "type": "object",
         "properties": {
             "key": {"type": "string", "enum": keys},
