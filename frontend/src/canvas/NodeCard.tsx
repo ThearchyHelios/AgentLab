@@ -58,6 +58,7 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
   const runtime = useStudio((s) => s.runtime[id])
   // selector 必须返回稳定引用：filter() 每次都造新数组，会触发无限重渲染
   const hasError = useStudio((s) => s.issues.some((i) => i.node_id === id && i.level === 'error'))
+  const copilotNew = useStudio((s) => s.copilotNew.includes(id))
   const Icon = def?.icon ?? Sparkles
   const handles = sourceHandles(data.nodeType, data.config)
   const status = runtime?.status ?? 'idle'
@@ -73,6 +74,7 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
         status === 'done' && 'node-done',
         status === 'failed' && 'node-failed',
         status === 'waiting' && 'node-waiting',
+        copilotNew && 'node-copilot-new',
         selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
       )}
       style={{ width: 238, borderColor: selected ? 'var(--accent)' : undefined }}

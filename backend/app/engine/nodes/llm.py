@@ -176,6 +176,9 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 要结构化结果就走原生 structured output，这条路径拿不到 token 流
         ctx.emit(EventType.LLM_START, structured=True, message_count=len(messages))
         try:
+            # langchain 靠 "title" 识别裸 JSON Schema dict，缺了会抛 Unsupported function
+            if isinstance(schema, dict) and "title" not in schema:
+                schema = {"title": "output", **schema}
             structured = model.with_structured_output(schema)
             value = await structured.ainvoke(messages)
         except Exception as e:  # noqa: BLE001
