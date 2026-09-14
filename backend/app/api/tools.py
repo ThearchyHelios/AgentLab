@@ -58,7 +58,10 @@ async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[
 
 class RunToolIn(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
-    sandbox_session: str = "playground"
+    # 这个字段会被拼进工作目录路径。净化在 sanitize_session 里兜底，这里
+    # 再加一道模式校验做纵深防御——畸形的 session 直接 422 拒掉，
+    # 而不是悄悄被净化成 "default" 让调用方以为自己写对了。
+    sandbox_session: str = Field(default="playground", pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @router.post("/{tool_name:path}/run")

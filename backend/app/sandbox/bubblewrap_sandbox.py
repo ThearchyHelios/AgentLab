@@ -8,15 +8,18 @@ import sys
 import time
 from pathlib import Path
 
-from app.core.config import settings
-from app.sandbox.base import ExecResult, Sandbox, SandboxLimits, truncate
+from app.core.config import settings, sanitize_session
+from app.sandbox import interpreter
+from app.sandbox.base import ENTRY_PREFIX, ExecResult, Sandbox, SandboxLimits, entry_name, truncate
 
+# 入口脚本后缀 + 执行命令前缀（沙箱内路径在运行时拼）。文件名不能写死：
+# 同会话并发执行都写 main.py 会互相覆盖。
 _LANG = {
-    "python": ("main.py", ["python3", "-I", "-u", "/work/main.py"]),
-    "bash": ("main.sh", ["/bin/bash", "/work/main.sh"]),
-    "sh": ("main.sh", ["/bin/sh", "/work/main.sh"]),
-    "node": ("main.js", ["node", "/work/main.js"]),
-    "javascript": ("main.js", ["node", "/work/main.js"]),
+    "python": (".py", None),  # 运行时用 interpreter.python_argv()
+    "bash": (".sh", ["/bin/bash"]),
+    "sh": (".sh", ["/bin/sh"]),
+    "node": (".js", ["node"]),
+    "javascript": (".js", ["node"]),
 }
 
 # 只读挂进沙箱的系统目录，存在才挂
@@ -51,12 +54,14 @@ class BubblewrapSandbox(Sandbox):
             "limits_note": "内存与 CPU 由 rlimit 限制；如需 cgroups 级配额请配合 systemd-run",
             "enforced": {"timeout": True, "cpu": True, "memory": True, "network": True, "fsize": True},
             "root": str(self._root),
+            "interpreter": interpreter.describe(),
             **({} if ok else {"error": "未找到 bwrap，可执行 apt install bubblewrap 安装"}),
         }
 
     def _session_dir(self, session_id: str) -> Path:
-        safe = "".join(c for c in session_id if c.isalnum() or c in "-_")[:64] or "default"
-        path = self._root / safe
+        # 净化规则统一在 config.sanitize_session 里，四个后端和文件工具共用一份：
+        # 这段逻辑以前各抄各的，文件工具那份漏抄了，就成了越界读取的口子。
+        path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -112,9 +117,13 @@ class BubblewrapSandbox(Sandbox):
         if not self.available():
             return ExecResult(ok=False, backend=self.name, error="bwrap 不可用")
 
-        filename, cmd = _LANG[language]
+        ext, cmd_prefix = _LANG[language]
+        # python 的命令前缀运行时才定：要挑一个看不见后端依赖的解释器
+        cmd_prefix = cmd_prefix if cmd_prefix is not None else interpreter.python_argv()
+        entry = entry_name(ext)
+        cmd = [*cmd_prefix, f"/work/{entry}"]
         workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        (workdir / filename).write_text(code)
+        (workdir / entry).write_text(code)
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
@@ -161,7 +170,7 @@ class BubblewrapSandbox(Sandbox):
             timed_out=code_ in (-24, 152),
             backend=self.name,
             duration_ms=int((time.perf_counter() - started) * 1000),
-            files_written=[p.name for p in workdir.iterdir() if p.is_file() and p.name != filename][:50],
+            files_written=[p.name for p in workdir.iterdir() if p.is_file() and not p.name.startswith(ENTRY_PREFIX)][:50],
         )
 
     async def cleanup(self, session_id: str) -> None:

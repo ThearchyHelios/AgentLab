@@ -6,18 +6,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
-from app.sandbox.base import ExecResult, Sandbox, SandboxLimits, truncate
+from app.core.config import sanitize_session, settings
+from app.sandbox.base import (
+    ENTRY_PREFIX,
+    ExecResult,
+    Sandbox,
+    SandboxLimits,
+    entry_name,
+    truncate,
+)
 
 _WORKDIR = "/workspace"
 
-# 各语言在 VM 里的落地文件与执行命令
+# 各语言的入口脚本后缀与执行命令。文件名在运行时生成（见 entry_name），
+# 不能写死 —— 同会话并发执行会互相覆盖。
 _LANG = {
-    "python": ("main.py", ["python", "-u", "main.py"]),
-    "bash": ("main.sh", ["/bin/bash", "main.sh"]),
-    "sh": ("main.sh", ["/bin/sh", "main.sh"]),
-    "node": ("main.js", ["node", "main.js"]),
-    "javascript": ("main.js", ["node", "main.js"]),
+    "python": (".py", ["python", "-u"]),
+    "bash": (".sh", ["/bin/bash"]),
+    "sh": (".sh", ["/bin/sh"]),
+    "node": (".js", ["node"]),
+    "javascript": (".js", ["node"]),
 }
 
 _MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -141,9 +149,10 @@ class MicroVMSandbox(Sandbox):
     # ---------------- 会话（长驻 VM）----------------
 
     def _vm_name(self, session_id: str) -> str:
-        # SDK 要求：首字符必须是字母数字，其余只能是字母数字/点/横线/下划线
-        safe = "".join(c for c in session_id if c.isalnum() or c in "-_.")[:96]
-        return f"agentlab-{safe or 'default'}"
+        # SDK 要求首字符是字母数字，其余只能是字母数字/点/横线/下划线。
+        # 这里直接用共用的净化规则（比 SDK 的要求更严，不放行点号），
+        # 让 VM 名和别处的会话目录名保持一致。
+        return f"agentlab-{sanitize_session(session_id)}"
 
     async def _lease(self, session_id: str, limits: SandboxLimits) -> _Lease:
         """拿到该会话的 VM。限额变了就重建，否则复用（热复用约 7ms）。"""
@@ -223,7 +232,8 @@ class MicroVMSandbox(Sandbox):
                 error="microVM 运行时未就绪：pip install 'agentlab-backend[microvm]' 后执行一次 install",
             )
 
-        filename, argv = _LANG[language]
+        ext, cmd = _LANG[language]
+        entry = entry_name(ext)
         sid = session_id or f"tmp{int(time.time() * 1000)}"
         ephemeral = session_id is None
         started = time.perf_counter()
@@ -247,7 +257,7 @@ class MicroVMSandbox(Sandbox):
 
         try:
             payload = dict(files or {})
-            payload[filename] = code
+            payload[entry] = code
             for rel, content in payload.items():
                 rel = rel.lstrip("/")
                 if ".." in rel.split("/"):
@@ -265,7 +275,7 @@ class MicroVMSandbox(Sandbox):
 
             # cwd / env / timeout 都是 exec 的原生参数，不用再拿 shell 拼
             out = await lease.vm.exec(
-                argv[0], list(argv[1:]),
+                cmd[0], [*cmd[1:], entry],
                 cwd=_WORKDIR,
                 env=({k: str(v) for k, v in env.items()} if env else None),
                 timeout=limits.timeout,
@@ -287,6 +297,13 @@ class MicroVMSandbox(Sandbox):
         finally:
             if ephemeral:
                 await self._destroy(sid)
+            elif sid in self._leases:
+                # 入口脚本是这次执行的私有临时文件，跑完就收掉，
+                # 免得会话工作区被历年的 __entry_xxx 堆满
+                try:
+                    await lease.vm.fs.remove(f"{_WORKDIR}/{entry}")
+                except Exception:  # noqa: BLE001 - 删不掉不影响执行结果
+                    pass
 
         stdout, t1 = truncate(str(getattr(out, "stdout_text", "") or ""), limits.max_output)
         stderr, t2 = truncate(str(getattr(out, "stderr_text", "") or ""), limits.max_output)
@@ -304,10 +321,10 @@ class MicroVMSandbox(Sandbox):
         if not ephemeral:
             try:
                 entries = await lease.vm.fs.list(_WORKDIR)
-                written = [
-                    getattr(e, "name", str(e)) for e in entries
-                    if getattr(e, "name", "") != filename
-                ][:50]
+                # FsEntry 给的是 path（全路径），不是 name —— 取尾段当文件名。
+                # 早先按 name 取，结果 files_written 里塞的是对象 repr。
+                names = [str(getattr(e, "path", "") or "").rsplit("/", 1)[-1] for e in entries]
+                written = [n for n in names if n and not n.startswith(ENTRY_PREFIX)][:50]
             except Exception:  # noqa: BLE001 - 列目录失败不影响执行结果
                 written = []
 

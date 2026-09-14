@@ -8,8 +8,9 @@ import sys
 import time
 from pathlib import Path
 
-from app.core.config import settings
-from app.sandbox.base import ExecResult, Sandbox, SandboxLimits, truncate
+from app.core.config import sanitize_session, settings
+from app.sandbox import interpreter
+from app.sandbox.base import ENTRY_PREFIX, ExecResult, Sandbox, SandboxLimits, entry_name, truncate
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
@@ -22,30 +23,18 @@ def _real(path: str | Path) -> str:
 
 
 def sandbox_python() -> str:
-    """沙箱里用的 Python 解释器。
-
-    刻意用 `sys.base_prefix` 下的那个，而不是后端自己的 venv：venv 会把
-    FastAPI、SQLAlchemy、provider 的凭据处理代码等一整套依赖挂进 sys.path，
-    沙箱代码不该看得见它们。base_prefix 是一个干净的标准库环境。
-    """
-    base = Path(sys.base_prefix)
-    major, minor = sys.version_info.major, sys.version_info.minor
-    for candidate in (
-        base / "bin" / f"python{major}.{minor}",
-        base / "bin" / f"python{major}",
-        base / "bin" / "python",
-    ):
-        if candidate.exists():
-            return _real(candidate)
-    return _real(sys.executable)
+    """沙箱里用的 Python 解释器路径。挑选逻辑见 app.sandbox.interpreter。"""
+    return interpreter.resolve()[0]
 
 
+# 入口脚本后缀 + 执行命令前缀（解释器路径要延迟求值，所以是 lambda）。
+# 文件名运行时生成：同会话并发执行都写 main.py 会互相覆盖。
 _LANG = {
-    "python": ("main.py", lambda: [sandbox_python(), "-I", "-u", "main.py"]),
-    "bash": ("main.sh", lambda: ["/bin/bash", "main.sh"]),
-    "sh": ("main.sh", lambda: ["/bin/sh", "main.sh"]),
-    "node": ("main.js", lambda: [_real(shutil.which("node") or "node"), "main.js"]),
-    "javascript": ("main.js", lambda: [_real(shutil.which("node") or "node"), "main.js"]),
+    "python": (".py", interpreter.python_argv),
+    "bash": (".sh", lambda: ["/bin/bash"]),
+    "sh": (".sh", lambda: ["/bin/sh"]),
+    "node": (".js", lambda: [_real(shutil.which("node") or "node")]),
+    "javascript": (".js", lambda: [_real(shutil.which("node") or "node")]),
 }
 
 
@@ -61,7 +50,10 @@ def _interpreter_roots(language: str) -> list[str]:
         "/private/var/select", "/private/var/db",
     }
     if language == "python":
-        roots.add(_real(sys.base_prefix))
+        # 放行**实际选中**的那个解释器的安装根，而不是 sys.base_prefix ——
+        # conda 环境下 base_prefix 就是项目环境自己，挑出来的往往是别的解释器
+        exe = Path(interpreter.resolve()[0])
+        roots.add(_real(exe.parent.parent))
     elif language in ("node", "javascript"):
         node = shutil.which("node")
         if node:
@@ -152,12 +144,14 @@ class SeatbeltSandbox(Sandbox):
             # 如实申报：界面按这个把限不住的项划掉，避免给人虚假的安全感
             "enforced": {"timeout": True, "cpu": True, "memory": False, "network": True, "fsize": True},
             "root": str(self._root),
+            "interpreter": interpreter.describe(),
             **({} if ok else {"error": "当前系统不是 macOS 或缺少 /usr/bin/sandbox-exec"}),
         }
 
     def _session_dir(self, session_id: str) -> Path:
-        safe = "".join(c for c in session_id if c.isalnum() or c in "-_")[:64] or "default"
-        path = self._root / safe
+        # 净化规则统一在 config.sanitize_session 里，四个后端和文件工具共用一份：
+        # 这段逻辑以前各抄各的，文件工具那份漏抄了，就成了越界读取的口子。
+        path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -193,9 +187,10 @@ class SeatbeltSandbox(Sandbox):
         if not self.available():
             return ExecResult(ok=False, backend=self.name, error="sandbox-exec 不可用")
 
-        filename, argv_of = _LANG[language]
+        ext, cmd_of = _LANG[language]
+        entry = entry_name(ext)
         workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        (workdir / filename).write_text(code)
+        (workdir / entry).write_text(code)
 
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
@@ -208,7 +203,7 @@ class SeatbeltSandbox(Sandbox):
         policy_file = self._policies / f"{workdir.name}-{language}.sb"
         policy_file.write_text(build_policy(workdir, language=language, network=limits.network))
 
-        argv = [SANDBOX_EXEC, "-f", str(policy_file), *argv_of()]
+        argv = [SANDBOX_EXEC, "-f", str(policy_file), *cmd_of(), entry]
 
         # HOME 指向工作区：既挡住家目录，又让解释器的缓存有地方落
         child_env = {
@@ -254,7 +249,8 @@ class SeatbeltSandbox(Sandbox):
         # CPU 时间用尽是 SIGXCPU(24)，归到超时里更好理解
         timed_out = code_ in (-24, 152)
         written = [
-            p.name for p in workdir.iterdir() if p.is_file() and p.name != filename
+            p.name for p in workdir.iterdir()
+            if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
         ][:50]
 
         return ExecResult(

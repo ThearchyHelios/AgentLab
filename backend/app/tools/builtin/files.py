@@ -14,9 +14,11 @@ _MAX_READ = 200_000
 def _resolve(rel: str, ctx: ToolContext) -> Path:
     """把相对路径锁死在这次运行自己的工作目录里。
 
-    先 resolve 再比较，所以 `../../etc/passwd` 和软链接都逃不出去。
+    两道关都要过：session_dir() 先净化 session_id 再定根目录，然后 rel
+    先 resolve 再比对根。少了第一道，`../../etc/passwd` 里的越界检查就是
+    在一个被挪到 /etc 的"根"下面做的，检查照样通过——这正是之前的漏洞。
     """
-    root = (settings.workspace_dir / (ctx.sandbox_session or "default")).resolve()
+    root = settings.session_dir(ctx.sandbox_session)
     root.mkdir(parents=True, exist_ok=True)
     target = (root / rel.lstrip("/")).resolve()
     if target != root and root not in target.parents:
