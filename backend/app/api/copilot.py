@@ -95,6 +95,70 @@ class GenerateIn(BaseModel):
     model: str | None = None
 
 
+COPILOT_SETTING_KEY = "copilot"
+
+
+async def copilot_model_spec(
+    session: AsyncSession, payload: GenerateIn, *, max_tokens: int = 8192
+) -> ModelSpec:
+    """决定 Copilot 用哪个模型。
+
+    优先级：本次请求显式指定 > 设置里存的 Copilot 专用模型 > provider 兜底。
+    做成独立设置是因为 Copilot 是元任务——它写的是编排本身，对指令遵循的要求
+    和工作流里的节点不是一回事，值得单独选，而不是跟着"第一个启用的 provider"漂。
+    """
+    from app.db.models import Setting
+
+    provider, model = payload.provider, payload.model
+    if not provider and not model:
+        row = await session.get(Setting, COPILOT_SETTING_KEY)
+        saved = row.value if row else {}
+        provider = saved.get("provider") or None
+        model = saved.get("model") or None
+    return ModelSpec(provider=provider, model=model, max_tokens=max_tokens)
+
+
+@router.get("/model")
+async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。"""
+    from app.db.models import Setting
+    from app.providers.factory import resolve_provider
+
+    row = await session.get(Setting, COPILOT_SETTING_KEY)
+    saved = row.value if row else {}
+    configured = bool(saved.get("provider") or saved.get("model"))
+    resolved = await resolve_provider(session, saved.get("provider"), saved.get("model"))
+    return {
+        "configured": configured,
+        "provider": saved.get("provider") or None,
+        "model": saved.get("model") or None,
+        "effective_provider": resolved.name if resolved else None,
+        "effective_model": saved.get("model") or (resolved.default_model if resolved else None),
+    }
+
+
+class CopilotModelIn(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+
+
+@router.put("/model")
+async def set_copilot_model(
+    payload: CopilotModelIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """设定 Copilot 专用模型。两个字段都留空即恢复兜底。"""
+    from app.db.models import Setting
+
+    value = {"provider": payload.provider or "", "model": payload.model or ""}
+    row = await session.get(Setting, COPILOT_SETTING_KEY)
+    if row:
+        row.value = value
+    else:
+        session.add(Setting(key=COPILOT_SETTING_KEY, value=value))
+    await session.commit()
+    return await get_copilot_model(session)
+
+
 class GenerateOut(BaseModel):
     graph: dict[str, Any]
     explanation: str = ""
@@ -172,9 +236,7 @@ async def generate(
         user = f"请设计一个工作流：{payload.instruction}"
 
     try:
-        model, _ = await get_chat_model(
-            session, ModelSpec(provider=payload.provider, model=payload.model, max_tokens=8192)
-        )
+        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
     except ProviderNotConfigured as e:
         raise HTTPException(400, str(e)) from e
 
@@ -378,9 +440,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         user = f"请设计一个工作流：{payload.instruction}"
 
     try:
-        model, _ = await get_chat_model(
-            session, ModelSpec(provider=payload.provider, model=payload.model, max_tokens=8192)
-        )
+        spec_ = await copilot_model_spec(session, payload)
+        model, model_id = await get_chat_model(session, spec_)
     except ProviderNotConfigured as e:
         raise HTTPException(400, str(e)) from e
 
@@ -388,6 +449,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
 
     async def event_stream():
         explanation = ""
+        yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
         try:
             async for op in _iter_ops(model, messages):
                 if op.get("op") == "done":
@@ -531,7 +593,12 @@ async def explain(
     """用大白话讲清楚一张图在干什么。接手别人的编排时很有用。"""
     try:
         model, _ = await get_chat_model(
-            session, ModelSpec(provider=payload.provider, model=payload.model, max_tokens=2048)
+            session,
+            await copilot_model_spec(
+                session,
+                GenerateIn(instruction="_", provider=payload.provider, model=payload.model),
+                max_tokens=2048,
+            ),
         )
     except ProviderNotConfigured as e:
         raise HTTPException(400, str(e)) from e
