@@ -117,14 +117,24 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if not approved:
             raise NodeError(ctx.node.id, "用户拒绝执行代码")
 
-    ctx.emit(EventType.SANDBOX_START, language=language, limits=limits.model_dump())
+    # 隔离档位：strict 要硬件级（microVM），fast 要低延迟（Seatbelt/bwrap），
+    # 留空跟随整机默认。要的那档不可用时会安静退回默认，不阻断运行。
+    isolation = ctx.cfg("isolation", "") or None
+
+    ctx.emit(EventType.SANDBOX_START, language=language, limits=limits.model_dump(),
+             isolation=isolation or "auto")
     result = await sandbox_manager.run(
         code,
         language=language,
         limits=limits,
         session_id=ctx.run.thread_id,
         files=ctx.render(ctx.cfg("files", {}) or {}, state),
+        backend=isolation,
     )
+    if isolation == "strict" and result.backend != "microvm":
+        # 要了硬件隔离却没拿到，必须说出来——否则用户以为自己在 VM 里跑
+        ctx.emit(EventType.LOG, level="warn",
+                 message=f"节点要求 strict 隔离，但 microVM 未就绪，实际用了 {result.backend}")
     ctx.emit(
         EventType.SANDBOX_END,
         ok=result.ok,

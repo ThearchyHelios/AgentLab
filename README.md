@@ -20,11 +20,16 @@
 
 ## 快速开始
 
-需要 Python 3.12+（`uv` 会自动装）、Node 20+、pnpm。**不需要 Docker** —— 代码沙箱用操作系统自带的隔离原语。
+需要 conda（[miniforge](https://conda-forge.org/miniforge/) 即可）、Node 20+、pnpm。
+**不需要 Docker** —— 代码沙箱用操作系统自带的隔离原语，可选升级到 microVM。
 
 ```bash
-./scripts/dev.sh
+conda env create -f environment.yml   # 首次：建 agentlab 环境并装依赖
+./scripts/dev.sh                      # 之后：一条命令拉起前后端
 ```
+
+`dev.sh` 会自己找到 `agentlab` 这个 conda 环境；环境不存在时它会照
+`environment.yml` 建一个。想用别的环境名就设 `AGENTLAB_CONDA_ENV`。
 
 打开 http://localhost:5273 。
 
@@ -44,7 +49,7 @@
 | **可视化编排** | 15 种节点拖拽连线；运行时节点实时高亮、边上数据流动画、卡片里直接看到流式 token |
 | **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama…）+ Mock |
 | **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入 |
-| **代码沙箱** | macOS 用 Seatbelt、Linux 用 bubblewrap：断网、家目录不可读、只有工作区可写、超时强杀，冷启动 ~25ms |
+| **代码沙箱** | 两档：系统沙箱（Seatbelt / bubblewrap，冷启动 ~25ms）或 microVM（独立 Linux 内核，内存限额真生效）。断网、家目录不可读、只有工作区可写、超时强杀 |
 | **人工介入** | 图暂停并落盘，人在界面上批准/驳回/改稿，从断点继续——进程重启也不丢 |
 | **记忆与知识库** | 跨运行的长期记忆（自动去重）+ 文档知识库（向量 + BM25 混合检索，可调配比） |
 | **Skill 管理** | 把「怎么做事」抽成可复用的方法论，挂到节点上注入 system prompt |
@@ -117,13 +122,14 @@ backend/                  FastAPI + LangGraph
     expressions.py        模板插值 + AST 白名单表达式求值
     nodes/                各类节点的执行器
   app/providers/          多模型接入与成本估算
-  app/sandbox/            Seatbelt / bubblewrap / 裸子进程三后端
+  app/sandbox/            microVM / Seatbelt / bubblewrap / 裸子进程四后端
   app/tools/              工具注册表、内置工具、MCP、自定义工具
   app/memory/             记忆、知识库、混合检索
   app/api/                REST + WebSocket
 frontend/                 React 19 + React Flow + Zustand
   src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩全由它驱动
   src/store/studio.ts     画布状态 + 事件流到高亮的映射
+environment.yml           conda 环境定义
 scripts/dev.sh            一键启动
 scripts/e2e-check.mjs     浏览器冒烟测试
 ```
@@ -143,24 +149,37 @@ LangGraph 的 `@task` 里，结果进 checkpoint，重放时直接取缓存。
 `RunEvent` 落库并广播。画布高亮、token 流、工具卡片、时间线全部由同一份事件驱动，
 所以刷新页面或中途接入都能拿到完整过程（WebSocket 先补历史再接实时）。
 
-**沙箱不用容器。** 跑一段不可信代码不需要一整套容器运行时——操作系统自己就有
-内核级的强制访问控制。macOS 用 Seatbelt（`sandbox-exec`，系统自带），Linux 用
-bubblewrap（几百 KB 的二进制）。冷启动 ~25ms，对比容器方案的 ~250ms，且不用装任何东西。
+**沙箱不用容器，但分两档。** 轻的一档用操作系统自带的访问控制：macOS 的 Seatbelt
+（`sandbox-exec`）、Linux 的 bubblewrap，冷启动 ~25ms，不用装任何东西。重的一档是
+microVM（libkrun + Hypervisor.framework），起一台带独立内核的虚拟机。
 
-守住的是三件事：**默认断网**、**家目录不可读**、**只有工作区可写**。策略由内核强制且
-对子进程继承——沙箱里 `subprocess` 出来的 `cat` 读家目录一样是 `Operation not permitted`。
-解释器刻意用 `sys.base_prefix` 下那个干净的 Python，而不是后端自己的 venv，
-所以沙箱代码 import 不到 FastAPI、SQLAlchemy 和凭据处理相关的任何东西。
+两档守的都是那三件事：**默认断网**、**家目录不可读**、**只有工作区可写**。Seatbelt 侧策略
+由内核强制且对子进程继承——沙箱里 `subprocess` 出来的 `cat` 读家目录一样是
+`Operation not permitted`；解释器刻意用 `sys.base_prefix` 下那个干净的 Python 而不是
+项目环境，所以沙箱代码 import 不到 FastAPI、SQLAlchemy 和凭据处理相关的任何东西。
 
-**和容器比，少了什么要说清楚**：Seatbelt 做的是访问控制而非虚拟化——进程表是共享的
-（能看到宿主机进程列表），代码以当前用户身份运行（不像容器会降到 nobody），
-而且 **macOS 不强制 `RLIMIT_AS`，内存用量限不住**（实测设 256MB 仍能分配 900MB）。
-CPU 时间、单文件大小、墙钟超时这三项有效。bubblewrap 那边多隔离了 PID/IPC/挂载视图，
-内存限额也真实生效。要更强的隔离（内存配额、完整虚拟化），该上的是 gVisor 或 microVM，
-而不是回到容器。
+**Seatbelt 少了什么，要说清楚**：它做的是访问控制而非虚拟化——进程表共享（看得见宿主机
+进程列表），代码以当前用户身份运行（不像容器会降到 nobody），而且 **macOS 不强制
+`RLIMIT_AS`，内存用量根本限不住**（实测设 256MB 仍能分配 900MB）。CPU 时间、单文件
+大小、墙钟超时这三项有效。写 SBPL 还有个坑：`(deny default)` 会让 Python 直接 SIGABRT
+起不来，要枚举的路径和 syscall 太多、漏一个就崩，所以用的是「默认允许 + 精确拒绝」。
 
-写 SBPL 策略有个坑：`(deny default)` 会让 Python 直接 SIGABRT 起不来——要枚举的路径和
-syscall 太多，漏一个就崩。所以用的是「默认允许 + 精确拒绝」，只把那三件事收紧。
+**microVM 补上的正是内存那一刀。** 本机实测：宿主是 Darwin 27.0.0，VM 里是 Linux 6.12.99
+（libkrunfw 编译），PID 1 是 `init.krun`，`/Users` 在 VM 里根本不存在，`free` 只看得见
+512MB。申请 900MB 会被内核 OOM killer 杀掉而 VM 照常存活——`RLIMIT_AS` 在 macOS 上
+形同虚设的问题在这里不是被修好，是结构上不存在。两台 VM 之间也互不可见。
+
+代价照实说：运行时约 50MB，OCI 镜像**首次拉取实测 54.5s**；拉过之后热启动 0.19s、
+VM 内执行 7~30ms。所以贵的是第一次而不是每一次——也正因为只贵第一次，
+auto 模式在镜像没缓存时会先用 Seatbelt，不让人干等一分钟（显式选 strict 不受此限）。
+
+**但网络关不干净，这条必须写在前面。** `network=false` 时 HTTP/HTTPS 和域名解析都会断，
+可 **UDP/53 拦不住**——实测手写 DNS 包仍能拿到真实响应。`default_egress=DENY`、
+`Rule.deny_dns()`、显式 deny UDP、`max_connections=0` 全试过，UDP 那条都堵不上
+（deny_dns 生成的规则只针对宿主，DNS 出口在 microsandbox 的网络栈里是硬编码放行的）。
+也就是说 **DNS 隧道外泄通道始终开着**。防「代码意外联网装包」够用，防「恶意代码偷数据」
+不够。所以设置页把网络这项标成「部分生效」的黄色而不是绿色——拦了一半要是显示成全绿，
+比显示成全红更危险。真要防外泄，得在网络层做，不能指望沙箱。
 
 **检索为什么是混合的。** 默认 embedding 是本地特征哈希，不联网不下模型，零配置可用，
 但语义泛化弱；BM25 补上精确关键词匹配这一半。两者各自归一化后加权，权重在界面上可调，
@@ -173,9 +192,20 @@ syscall 太多，漏一个就崩。所以用的是「默认允许 + 精确拒绝
 ## 常见问题
 
 **沙箱用的是哪个后端？** 设置页「运行环境」会列出所有候选及其可用性，并标出当前选中的那个。
-macOS 上应该是 `seatbelt`；Linux 上装了 `bwrap`（`apt install bubblewrap`）就是 `bubblewrap`，
-没装则降级到 `local`——**那条路径没有任何访问控制**，界面上会明确标红。
-可以用 `AGENTLAB_SANDBOX_BACKEND` 强制指定。
+装了 microVM 依赖且镜像已缓存时 auto 会选 `microvm`；否则 macOS 走 `seatbelt`、Linux 上装了
+`bwrap`（`apt install bubblewrap`）走 `bubblewrap`，都没有则降级到 `local`——**那条路径没有
+任何访问控制**，界面上会明确标红。可以用 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
+也可以在代码节点上单独选「隔离档位」（strict = microVM，fast = 系统沙箱）。
+
+**怎么启用 microVM？** 装可选依赖后跑一次安装（约 50MB 运行时）：
+
+```bash
+conda run -n agentlab pip install 'microsandbox>=0.6'
+conda run -n agentlab python -c "import asyncio,microsandbox as m; asyncio.run(m.install())"
+```
+
+之后第一次执行代码会拉 OCI 镜像（实测 ~55s，只此一次），auto 就会自动升到 `microvm`。
+镜像可以用 `AGENTLAB_MICROVM_IMAGE` 换，闲置 VM 回收时间用 `AGENTLAB_MICROVM_IDLE_SECONDS`。
 
 **模型返回空内容？** Claude 4.6 之后的模型默认开着 thinking，`max_tokens` 给小了会出现
 「思考完就没额度写正文」。节点里把 max_tokens 调大，或把思考模式设为关闭。时间线里会有提示。

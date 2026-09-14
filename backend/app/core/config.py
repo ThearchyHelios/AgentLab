@@ -31,12 +31,21 @@ class Settings(BaseSettings):
     secret_key: str = ""
 
     # --- 沙箱 ---
-    sandbox_backend: str = "auto"  # auto | seatbelt | bubblewrap | local | off
+    sandbox_backend: str = "auto"  # auto | microvm | seatbelt | bubblewrap | local | off
     sandbox_timeout: int = 30
     sandbox_memory_mb: int = 512
     sandbox_cpus: float = 1.0
     sandbox_network: bool = False
     sandbox_max_output: int = 20_000
+
+    # --- microVM（硬件级隔离，独立内核）---
+    # 跑代码用的 OCI 镜像。首次使用会拉取并缓存到 ~/.microsandbox。
+    microvm_image: str = "python:3.12-slim"
+    # microVM 是长驻的：同一 session 的多次执行复用同一台，省掉重复冷启动。
+    # 空闲超过这个秒数就回收，避免闲置 VM 一直占着内存。
+    microvm_idle_seconds: int = 300
+    # 单次启动（含首次拉镜像）的等待上限
+    microvm_boot_timeout: int = 300
 
     # --- 执行引擎护栏 ---
     max_run_seconds: int = 600
