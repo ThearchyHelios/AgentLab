@@ -17,7 +17,7 @@ from app.core.events import EventType, RunEventModel
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.compiler import compile_graph, initial_state
-from app.engine.context import RunContext
+from app.engine.context import NodeError, RunContext
 from app.engine.schema import GraphSpec, validate_graph
 
 logger = logging.getLogger(__name__)
@@ -373,7 +373,9 @@ class RunManager:
                 raise
             except Exception as e:  # noqa: BLE001
                 status = "failed"
-                error = f"{type(e).__name__}: {e}"
+                # NodeError 的 message 本来就是写给人看的（"人工驳回：…"），
+                # 再套一层类型名只会让界面上的错误更难读
+                error = str(e) if isinstance(e, NodeError) else f"{type(e).__name__}: {e}"
                 logger.exception("run %s 失败", run_id)
                 await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             finally:

@@ -68,6 +68,17 @@ export function StudioPage() {
     return () => window.removeEventListener('keydown', onKey)
   }, [doSave])
 
+  // 有未保存改动时拦一下关标签页／刷新。画布没有撤销栈，关掉就真没了。
+  useEffect(() => {
+    if (!dirty) return
+    const guard = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', guard)
+    return () => window.removeEventListener('beforeunload', guard)
+  }, [dirty])
+
   const errorCount = issues.filter((i) => i.level === 'error').length
   const warnCount = issues.filter((i) => i.level === 'warning').length
 
@@ -236,7 +247,18 @@ function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void 
               'group flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 hover:bg-hover',
               current?.id === w.id && 'border-[var(--accent)]',
             )}
-            onClick={() => { load(w); onClose() }}
+            onClick={() => {
+              // 切换会把当前画布整个换掉。没存过的改动就这么没了，
+              // 而且全局没有撤销——至少问一句
+              if (
+                useStudio.getState().dirty &&
+                !confirm('当前画布有未保存的改动，切换后会丢失。确定要切换吗？')
+              ) {
+                return
+              }
+              load(w)
+              onClose()
+            }}
           >
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
