@@ -1,0 +1,18 @@
+# AgentLab 的 conda 环境。
+#
+#   conda env create -f environment.yml
+#   conda activate agentlab
+#
+# 依赖清单仍以 backend/pyproject.toml 为准 —— 这里只负责把解释器和那份
+# 依赖装进一个具名环境，避免同一份依赖在两个地方各写一遍、然后慢慢漂移。
+name: agentlab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # [microvm] 带上独立内核的沙箱后端（约 35MB wheel，首次运行还要下载
+      # 约 50MB 运行时，外加一次 OCI 镜像拉取）。不需要就把方括号去掉，
+      # 沙箱会退回 Seatbelt —— 代价是内存限额在 macOS 上限不住。
+      - -e ./backend[microvm]

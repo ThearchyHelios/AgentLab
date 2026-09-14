@@ -26,6 +26,12 @@ dependencies = [
     "cryptography>=43.0",
 ]
 
+[project.optional-dependencies]
+# microVM 沙箱（独立 Linux 内核）。约 35MB wheel + 首次约 50MB 运行时下载，
+# 再加一次 OCI 镜像拉取（实测约 55s），所以不进默认安装。
+# environment.yml 里已经带上了；单独装用 `pip install 'agentlab-backend[microvm]'`。
+microvm = ["microsandbox>=0.6"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
