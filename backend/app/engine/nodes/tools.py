@@ -135,6 +135,12 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 要了硬件隔离却没拿到，必须说出来——否则用户以为自己在 VM 里跑
         ctx.emit(EventType.LOG, level="warn",
                  message=f"节点要求 strict 隔离，但 microVM 未就绪，实际用了 {result.backend}")
+    if result.session_reset:
+        # 会话工作区被清空了。同一会话的下游节点会突然读不到自己写的文件，
+        # 不说一声的话那个 FileNotFoundError 根本无从追查
+        ctx.emit(EventType.LOG, level="warn",
+                 message="沙箱会话已重置，此前在该会话写入的文件已丢失"
+                         "（多为超时重建，或同会话中各节点的内存限额不一致）")
     ctx.emit(
         EventType.SANDBOX_END,
         ok=result.ok,

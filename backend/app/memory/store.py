@@ -7,7 +7,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import MemoryItem
-from app.memory.embeddings import embed_text, from_blob, hybrid_rank, to_blob
+from app.memory.embeddings import cosine, embed_text, from_blob, hybrid_rank, to_blob
+
+# 判重阈值：余弦相似度高于它才算同一件事。比排名分数严格得多，
+# 因为这里比的是真实语义距离，不是"谁排第一"。
+_DEDUPE_THRESHOLD = 0.92
 
 
 async def remember(
@@ -26,17 +30,33 @@ async def remember(
     反复记下来，不去重的话记忆库几轮就被同义句灌满了。
     """
     content = content.strip()
-    if dedupe:
-        existing = await recall(session, scope=scope, query=content, limit=1, min_score=0.0)
-        if existing and existing[0]["score"] > 0.92:
-            item = await session.get(MemoryItem, existing[0]["id"])
-            if item:
-                item.importance = max(item.importance, importance)
-                item.use_count += 1
-                await session.commit()
-                return item
-
     vec = await embed_text(content)
+
+    if dedupe:
+        # 判重必须看**真实相似度**，不能用 recall 的分数。recall 走 hybrid_rank，
+        # 那里的分数是 min-max 排名归一化的结果：排第一的那条在两路信号上都会
+        # 被归成 1.0，与它和查询像不像毫无关系。于是 scope 里只要已有两条记忆，
+        # 新内容随便撞上一个字排到第一，就会被判成"重复"而丢弃，接口还返回 201
+        # 并把那条不相关的旧记忆当成"刚保存的"交回去——静默丢数据。
+        stmt = select(MemoryItem).where(MemoryItem.scope == scope)
+        if kind:
+            stmt = stmt.where(MemoryItem.kind == kind)
+        candidates = list((await session.execute(stmt)).scalars())
+        best, best_score = None, 0.0
+        for row in candidates:
+            other = from_blob(row.embedding)
+            if other is None:
+                continue
+            score = cosine(vec, other)
+            if score > best_score:
+                best, best_score = row, score
+        if best is not None and best_score > _DEDUPE_THRESHOLD:
+            best.importance = max(best.importance, importance)
+            best.use_count += 1
+            await session.commit()
+            await session.refresh(best)
+            return best
+
     item = MemoryItem(
         scope=scope,
         kind=kind,

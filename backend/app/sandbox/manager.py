@@ -56,6 +56,7 @@ class SandboxManager:
         self._named: dict[str, Sandbox] = {}  # 按名字缓存，供节点级档位使用
         self._lock = asyncio.Lock()
         self._resolved_from: str = ""
+        self._reaper: asyncio.Task[None] | None = None
 
     async def get(self, prefer: str | None = None) -> Sandbox:
         """取后端。prefer 指定档位时给那一档，拿不到就退回默认那台。
@@ -153,6 +154,32 @@ class SandboxManager:
             files=files,
         )
 
+    async def start_reaper(self) -> None:
+        """起一个后台任务定期回收闲置会话。
+
+        以前回收只挂在 run() 里，也就是说"没人再跑代码"时闲置的 microVM
+        永远不会被收掉，microvm_idle_seconds 形同虚设——几百 MB 一台就这么
+        挂着。回收本来也不该占着请求路径的时间。
+        """
+        if self._reaper is not None:
+            return
+
+        async def _loop() -> None:
+            interval = max(30, settings.microvm_idle_seconds // 4)
+            while True:
+                try:
+                    await asyncio.sleep(interval)
+                    for impl in list(self._named.values()) + ([self._backend] if self._backend else []):
+                        reap = getattr(impl, "_reap_idle", None)
+                        if reap is not None:
+                            await reap()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - 回收失败不该让任务停掉
+                    continue
+
+        self._reaper = asyncio.create_task(_loop())
+
     async def health(self) -> dict[str, Any]:
         backend = await self.get()
         info = await backend.health()
@@ -178,6 +205,9 @@ class SandboxManager:
             await impl.cleanup(session_id)
 
     async def close(self) -> None:
+        if self._reaper is not None:
+            self._reaper.cancel()
+            self._reaper = None
         for impl in {id(b): b for b in [*self._named.values(), self._backend] if b}.values():
             await impl.close()
 
