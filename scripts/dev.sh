@@ -6,11 +6,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_PORT="${AGENTLAB_PORT:-8000}"
 WEB_PORT="${AGENTLAB_WEB_PORT:-5273}"
 
-command -v uv   >/dev/null || { echo "缺少 uv：brew install uv"; exit 1; }
-command -v pnpm >/dev/null || { echo "缺少 pnpm：npm i -g pnpm"; exit 1; }
+CONDA_ENV="${AGENTLAB_CONDA_ENV:-agentlab}"
 
-echo "==> 同步依赖"
-(cd "$ROOT/backend" && uv sync --quiet)
+command -v conda >/dev/null || { echo "缺少 conda：https://conda-forge.org/miniforge/"; exit 1; }
+command -v pnpm  >/dev/null || { echo "缺少 pnpm：npm i -g pnpm"; exit 1; }
+
+# 环境不存在就按 environment.yml 建一个
+if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+  echo "==> 创建 conda 环境 $CONDA_ENV"
+  conda env create -f "$ROOT/environment.yml"
+fi
+PY_BIN="$(conda run -n "$CONDA_ENV" python -c 'import sys; print(sys.executable)' 2>/dev/null)"
+[ -x "$PY_BIN" ] || { echo "conda 环境 $CONDA_ENV 不可用，试试：conda env create -f environment.yml"; exit 1; }
+
+echo "==> 后端解释器 $PY_BIN"
 [ -d "$ROOT/frontend/node_modules" ] || (cd "$ROOT/frontend" && pnpm install)
 
 cleanup() {
@@ -24,7 +33,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> 后端 http://127.0.0.1:$API_PORT"
-(cd "$ROOT/backend" && uv run uvicorn app.main:app --host 127.0.0.1 --port "$API_PORT" --reload) &
+(cd "$ROOT/backend" && "$PY_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port "$API_PORT" --reload) &
 API_PID=$!
 
 # 等后端起来再起前端，省得前端第一次请求就打空

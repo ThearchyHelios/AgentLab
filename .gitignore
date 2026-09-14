@@ -1,7 +1,7 @@
 # 运行期数据：数据库、沙箱工作区、上传文件、自动生成的加密密钥
 /data/
 
-# Python
+# Python（环境由 conda 管理，不入库）
 __pycache__/
 *.py[cod]
 .venv/
@@ -24,3 +24,6 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+# 已迁到 conda，不再用 uv
+uv.lock
