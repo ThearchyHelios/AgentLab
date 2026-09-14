@@ -107,6 +107,27 @@ def render_deep(value: Any, ctx: dict[str, Any]) -> Any:
 # 安全表达式求值（分支条件用）
 # --------------------------------------------------------------------------
 
+# 幂运算的上界。`9**9**9**9` 只有 11 个 AST 节点，轻松过掉节点数护栏，
+# 却会让 CPython 无限期地算一个天文数字的大整数 —— 而求值是在事件循环里
+# 同步执行的（分支条件、transform、口径卡、每个节点的 skip_if 都走这里），
+# 既没有线程池隔离也没有超时，asyncio 的 cancel 打断不了同步 CPU。
+# 一条画布上的分支条件就能把整个后端冻死。
+_MAX_POW_EXPONENT = 1024
+_MAX_POW_BASE = 1e15
+
+
+def _safe_pow(base: Any, exponent: Any) -> Any:
+    """带上界的幂运算：超界直接报错，而不是让进程算到天荒地老。"""
+    try:
+        if abs(exponent) > _MAX_POW_EXPONENT:
+            raise ExpressionError(f"指数超过上限 {_MAX_POW_EXPONENT}")
+        if abs(base) > _MAX_POW_BASE and exponent > 1:
+            raise ExpressionError(f"底数超过上限 {_MAX_POW_BASE:g}")
+    except TypeError as e:  # 非数值类型交给 operator.pow 自己报
+        raise ExpressionError(f"幂运算的操作数必须是数值：{e}") from e
+    return operator.pow(base, exponent)
+
+
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -114,7 +135,7 @@ _BIN_OPS = {
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
+    ast.Pow: _safe_pow,
 }
 _CMP_OPS = {
     ast.Eq: operator.eq,

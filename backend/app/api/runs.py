@@ -229,9 +229,17 @@ class ResumeIn(BaseModel):
 
 
 @router.post("/{run_id}/resume", response_model=RunOut)
-async def resume_run(run_id: str, payload: ResumeIn) -> Run:
+async def resume_run(
+    run_id: str, payload: ResumeIn, x_actor: str | None = Header(default=None)
+) -> Run:
     try:
-        return await run_manager.resume(run_id, payload.response)
+        # approval_id 以前定义了却从没传下去——一次运行里有多条待审批时，
+        # 引擎无从知道这次回复的是哪一条
+        return await run_manager.resume(
+            run_id, payload.response,
+            approval_id=payload.approval_id,
+            actor=(x_actor or "").strip() or None,
+        )
     except KeyError as e:
         raise HTTPException(404, str(e)) from e
     except ValueError as e:
@@ -443,7 +451,11 @@ async def decide(
         response["args"] = payload.args
 
     try:
-        return await run_manager.resume(approval.run_id, response)
+        return await run_manager.resume(
+            approval.run_id, response,
+            approval_id=approval.id,
+            actor=approval.resolved_by,
+        )
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
 

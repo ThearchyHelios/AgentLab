@@ -114,23 +114,26 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                 raise
             except asyncio.CancelledError:
                 raise
-            except NodeError:
-                raise
             except Exception as e:  # noqa: BLE001
+                # NodeError 以前在这里直接 raise，于是节点自己抛的错既不重试、
+                # 也不发 node.failed、更不被 on_error=continue 接住。而 NodeError
+                # 恰恰是所有执行器表达失败的标准方式（缺必填输入、模型没配、
+                # 口径卡算不出…），等于这两个配置对最常见的报错全都不生效。
                 last_error = e
                 if attempt < retries:
                     ctx.emit(
                         EventType.LOG,
                         level="warn",
-                        message=f"第 {attempt + 1} 次失败（{type(e).__name__}: {e}），准备重试",
+                        message=f"第 {attempt + 1} 次失败（{_describe(e)}），准备重试",
                     )
                     await asyncio.sleep(backoff * (2**attempt))
                     continue
                 break
 
         elapsed = int((time.perf_counter() - started) * 1000)
-        message = f"{type(last_error).__name__}: {last_error}"
-        ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed)
+        message = _describe(last_error)
+        # node_id 要带上：前端靠它把出错的节点从"转圈"收敛成"失败"
+        ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed, node_id=node.id)
 
         # 容错模式：记下错误继续往下走，而不是让整张图挂掉
         if node.config.get("on_error") == "continue":
@@ -138,12 +141,25 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                 "nodes": {node.id: {"error": message, "failed": True}},
                 "trail": [{"node_id": node.id, "error": message, "ts": time.time()}],
             }
+        # 已经是 NodeError 就别再套一层，否则消息会变成
+        # "NodeError: NodeError: 真正的原因"
+        if isinstance(last_error, NodeError):
+            raise last_error
         raise NodeError(node.id, message) from last_error
 
     async def _entry(state: GraphState) -> dict[str, Any]:
         return await _execute(state)
 
     return _entry
+
+
+def _describe(error: BaseException | None) -> str:
+    """错误消息。NodeError 的 message 本来就是写给人看的，不用再前缀类型名。"""
+    if error is None:
+        return "未知错误"
+    if isinstance(error, NodeError):
+        return str(error)
+    return f"{type(error).__name__}: {error}"
 
 
 def _preview(updates: dict[str, Any], node_id: str) -> Any:
