@@ -179,7 +179,11 @@ def hybrid_rank(
     def _norm(xs: list[float]) -> list[float]:
         lo, hi = min(xs), max(xs)
         if hi - lo < 1e-9:
-            return [0.0 for _ in xs]
+            # 全都一样分，说明这一路信号区分不出高下——那是"都一样好"，
+            # 不是"都一样差"。返回 0 会让候选只有一条时它的合并分恒为 0，
+            # 被 min_score 过滤掉，于是新建 scope 写入第一条后永远搜不到，
+            # 而"先写一条、下一轮再 recall"正是 agent 最常见的用法。
+            return [1.0 for _ in xs]
         return [(x - lo) / (hi - lo) for x in xs]
 
     kw_n, vec_n = _norm(kw_scores), _norm(vec_scores)

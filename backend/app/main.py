@@ -28,6 +28,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await init_db()
     await seed_defaults()
     await run_manager.setup()
+    from app.sandbox.manager import sandbox_manager as _sbm
+
+    await _sbm.start_reaper()
     logger.info("AgentLab 就绪 · 数据目录 %s", settings.data_dir)
     try:
         yield

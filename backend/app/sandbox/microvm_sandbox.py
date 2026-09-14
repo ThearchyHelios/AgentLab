@@ -45,6 +45,8 @@ class _Lease:
     memory_mb: int
     cpus: int
     last_used: float = field(default_factory=time.monotonic)
+    # 这台是因为限额变更重建出来的，也就是说上一次的会话文件已经没了
+    was_reset: bool = False
 
 
 class MicroVMSandbox(Sandbox):
@@ -160,6 +162,7 @@ class MicroVMSandbox(Sandbox):
 
         cpus = max(1, int(limits.cpus))
         async with self._lock:
+            reset = False
             lease = self._leases.get(session_id)
             if lease is not None:
                 if (lease.network == limits.network
@@ -167,8 +170,11 @@ class MicroVMSandbox(Sandbox):
                         and lease.cpus == cpus):
                     lease.last_used = time.monotonic()
                     return lease
-                # 限额变了：旧 VM 的边界已经不对，销毁重建
+                # 限额变了：VM 的内存/CPU 是启动时定死的，只能销毁重建。
+                # 但重建等于把会话工作区清空——同一个 run 里两个代码节点各填了
+                # 不同的 memory_mb 就会触发，而调用方对此毫无察觉。标记出来。
                 await self._destroy(session_id)
+                reset = True
 
             # network 必须是 Network 实例（传 bool 会被 SDK 拒掉）
             network = ms.Network.allow_all() if limits.network else ms.Network.none()
@@ -189,6 +195,7 @@ class MicroVMSandbox(Sandbox):
 
             lease = _Lease(vm=vm, network=limits.network,
                            memory_mb=limits.memory_mb, cpus=cpus)
+            lease.was_reset = reset
             self._leases[session_id] = lease
             return lease
 
@@ -200,6 +207,29 @@ class MicroVMSandbox(Sandbox):
             await lease.vm.destroy(force=True)
         except Exception:  # noqa: BLE001 - 已经没了就算
             pass
+
+    async def _kill_leftovers(self, session_id: str, entry: str) -> bool:
+        """超时后在 VM 内把跑飞的进程杀掉，保住会话工作区。
+
+        返回 True 表示 VM 还能用；False 表示没收拾干净，调用方该销毁重建。
+        """
+        lease = self._leases.get(session_id)
+        if lease is None:
+            return False
+        try:
+            # 只杀这次的入口脚本引出来的进程——入口名带唯一后缀，
+            # 不会误伤同会话里别的并发执行
+            await asyncio.wait_for(
+                lease.vm.shell(f"pkill -9 -f {entry} || true", timeout=10),
+                timeout=15,
+            )
+            # 确认 VM 还答应
+            out = await asyncio.wait_for(
+                lease.vm.exec("sh", ["-c", "echo alive"], timeout=10), timeout=15
+            )
+            return "alive" in str(getattr(out, "stdout_text", "") or "")
+        except Exception:  # noqa: BLE001 - 收拾不动就让调用方销毁
+            return False
 
     async def _reap_idle(self) -> None:
         """回收闲置 VM：它们各自占着几百 MB 内存，不能一直挂着。"""
@@ -281,12 +311,20 @@ class MicroVMSandbox(Sandbox):
                 timeout=limits.timeout,
             )
         except ms.ExecTimeoutError:
-            # 超时的 VM 里可能还有进程在烧 CPU，状态不可信，直接销毁
-            await self._destroy(sid)
+            # 超时的 VM 里多半还有进程在烧 CPU，得收拾掉。但**先别销毁整台 VM**：
+            # 会话契约说同 session 共享文件系统（上一步写的文件下一步要读回来），
+            # 销毁 VM 等于把工作区连同用户数据一起清空，而另外三个后端超时只
+            # killpg、工作目录照留。先试着在 VM 里把残留进程杀干净，
+            # 实在不行才销毁——并且如实告诉调用方会话被重置了。
+            killed = await self._kill_leftovers(sid, entry)
+            if not killed:
+                await self._destroy(sid)
             return ExecResult(
                 ok=False, backend=self.name, timed_out=True, exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout}s 被终止",
+                session_reset=not killed,
+                error=f"执行超过 {limits.timeout}s 被终止"
+                      + ("" if killed else "；VM 已重置，该会话之前写的文件已丢失"),
             )
         except Exception as e:  # noqa: BLE001
             return ExecResult(
@@ -337,6 +375,7 @@ class MicroVMSandbox(Sandbox):
             backend=self.name,
             duration_ms=int((time.perf_counter() - started) * 1000),
             files_written=written,
+            session_reset=lease.was_reset,
             error=error,
         )
 

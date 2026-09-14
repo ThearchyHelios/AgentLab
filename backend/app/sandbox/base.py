@@ -43,6 +43,11 @@ class ExecResult(BaseModel):
     backend: str = ""
     files_written: list[str] = Field(default_factory=list)
     error: str | None = None
+    # 这次执行导致会话工作区被重置了（比如 microVM 因超时或限额变更被销毁）。
+    # 会话契约说"同 session_id 共享文件系统，可以先写文件下一步再读回来"，
+    # 所以工作区没了必须说出来——否则下一个节点只会看到 FileNotFoundError，
+    # 完全不知道是谁把文件弄丢的。
+    session_reset: bool = False
 
     def summary(self) -> str:
         if self.timed_out:

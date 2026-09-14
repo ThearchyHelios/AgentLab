@@ -380,6 +380,15 @@ class RunManager:
                 elapsed = int((time.perf_counter() - started) * 1000)
                 await self._finalize(run_id, status, error, final_state, elapsed)
                 self._tasks.pop(run_id, None)
+                # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
+                # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
+                # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
+                # 代码"时才触发。interrupted 要留着，人回来还得接着跑。
+                if status in ("succeeded", "failed", "cancelled"):
+                    with contextlib.suppress(Exception):
+                        from app.sandbox.manager import sandbox_manager
+
+                        await sandbox_manager.cleanup(run_id)
 
     async def _handle_custom(self, run_id: str, chunk: Any) -> None:
         """节点通过 get_stream_writer 发来的事件。"""
