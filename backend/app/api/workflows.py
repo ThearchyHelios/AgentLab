@@ -122,6 +122,11 @@ async def update_workflow(
                 note=payload.note,
             )
         )
+        # status 说的是**当前画布**的状态，不是"这个工作流曾经发布过"。
+        # 改完图还挂着 governed，界面上就会显示一张从未过闸的图是受管模板——
+        # 已发布的那一版仍由 published_version 指着，formal 运行不受影响。
+        if workflow.status in ("published", "governed"):
+            workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
     return workflow

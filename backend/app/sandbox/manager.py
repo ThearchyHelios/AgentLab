@@ -78,8 +78,19 @@ class SandboxManager:
 
     def _resolve_named(self, prefer: str) -> Sandbox | None:
         """按档位名取一个**已就绪**的后端；不可用时返回 None 让调用方退回默认。"""
+        # 关掉就是关掉。这条必须在最前面：否则配置里 off 只挡得住默认路径，
+        # 图里任何一个 isolation=strict 的代码节点照样能跑代码，
+        # DisabledSandbox 那句"沙箱已在设置中关闭"根本到不了。
+        if (settings.sandbox_backend or "auto").lower() == "off":
+            return None
+
+        # 只认这两个档位。以前是 alias.get(prefer, prefer) 原样透传，而 isolation
+        # 是图 JSON 里的自由字符串，于是图里写 isolation="local" 就能点名那个
+        # 明说了"没有任何访问控制"的兜底后端——档位是用来提高隔离的，不该能降级。
         alias = {"strict": "microvm", "fast": "seatbelt" if sys.platform == "darwin" else "bubblewrap"}
-        name = alias.get(prefer, prefer)
+        name = alias.get(prefer)
+        if name is None:
+            return None
         if name in self._named:
             return self._named[name]
         impl = dict(_BACKENDS).get(name)

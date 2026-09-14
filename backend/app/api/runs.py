@@ -75,9 +75,21 @@ async def start_run(
         workflow = await session.get(Workflow, payload.workflow_id)
         if not workflow:
             raise HTTPException(404, "工作流不存在")
-        if workflow.status not in ("published", "governed") or not workflow.published_version:
+        # 只看 published_version：status 反映的是当前画布（改过图就退回 draft），
+        # 而 formal 跑的是已发布的那一版，两者本来就可以不一致
+        if not workflow.published_version:
             raise HTTPException(409, f"「{workflow.name}」还没有发布版本，先在编排页发布")
         version = payload.version or workflow.published_version
+        # "不可变"和"过过闸"是两件事。快照确实不可变，但 PATCH 保存出来的
+        # 草稿版本同样有快照——只认 version 存不存在的话，工作流只要发布过
+        # 任意一个版本，之后所有草稿都能以 formal 身份启动，发布期的
+        # validate_graph + lint_for_publish 全部绕过。
+        if version != workflow.published_version:
+            raise HTTPException(
+                409,
+                f"v{version} 不是当前发布版本（v{workflow.published_version}）。"
+                "正式运行只能引用发布过的版本——要跑这一版就先发布它。",
+            )
         snapshot = (
             await session.execute(
                 _select(WorkflowVersion).where(
