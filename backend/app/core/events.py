@@ -29,6 +29,9 @@ class EventType(StrEnum):
     # 模型级
     LLM_START = "llm.start"
     LLM_TOKEN = "llm.token"
+    # 思考的流式增量：只推给画布做实时显示，不落库
+    LLM_THINKING_DELTA = "llm.thinking.delta"
+    # 一次完整思考：调用结束时落一条，这才是进轨迹的事件
     LLM_THINKING = "llm.thinking"
     LLM_END = "llm.end"
 

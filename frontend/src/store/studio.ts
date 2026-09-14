@@ -325,8 +325,12 @@ export const useStudio = create<StudioState>((set, get) => ({
       case 'llm.token':
         patch({ tokens: (runtime[nodeId!]?.tokens ?? '') + (event.data.delta ?? '') })
         break
-      case 'llm.thinking':
+      case 'llm.thinking.delta':
         patch({ thinking: (runtime[nodeId!]?.thinking ?? '') + (event.data.delta ?? '') })
+        break
+      case 'llm.thinking':
+        // 汇总事件：直接覆盖为完整思考。回放（刷新页面）时靠这一条恢复。
+        patch({ thinking: event.data.text ?? runtime[nodeId!]?.thinking })
         break
       case 'tool.start':
         patch({
