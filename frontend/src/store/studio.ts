@@ -78,7 +78,19 @@ interface StudioState {
   streaming: boolean
   unsubscribe: (() => void) | null
 
-  copilot: { active: boolean; lastOp: string; explanation: string; error: string; model: string }
+  copilot: {
+    active: boolean
+    lastOp: string
+    explanation: string
+    error: string
+    model: string
+    // 从提交到第一个操作之间有 5~30 秒，得让用户看见这段在发生什么
+    phase: 'connecting' | 'planning' | 'building' | 'wiring' | 'finalizing' | ''
+    thinking: string        // 模型的思考原文（只有支持 thinking 的模型有）
+    elapsedMs: number
+    lastInstruction: string // 失败后"用同一需求重试"要用
+    lastUseBase: boolean
+  }
   copilotNew: string[]
   cancelCopilot: (() => void) | null
 
@@ -100,6 +112,7 @@ interface StudioState {
   startFormalRun: (input: Record<string, any>) => Promise<Run | null>
   runCopilot: (instruction: string, useBase: boolean, model?: string | null) => void
   stopCopilot: () => void
+  retryCopilot: () => void
   attachRun: (runId: string) => Promise<void>
   stopRun: () => Promise<void>
   clearRun: () => void
@@ -121,7 +134,8 @@ export const useStudio = create<StudioState>((set, get) => ({
   activeEdges: [],
   streaming: false,
   unsubscribe: null,
-  copilot: { active: false, lastOp: '', explanation: '', error: '', model: '' },
+  copilot: { active: false, lastOp: '', explanation: '', error: '', model: '',
+             phase: '', thinking: '', elapsedMs: 0, lastInstruction: '', lastUseBase: false },
   copilotNew: [],
   cancelCopilot: null,
 
@@ -297,7 +311,11 @@ export const useStudio = create<StudioState>((set, get) => ({
     const state = get()
     state.cancelCopilot?.()
     set({
-      copilot: { active: true, lastOp: '正在起草…', explanation: '', error: '', model: model ?? '' },
+      copilot: {
+        active: true, lastOp: '', explanation: '', error: '', model: model ?? '',
+        phase: 'connecting', thinking: '', elapsedMs: 0,
+        lastInstruction: instruction, lastUseBase: useBase,
+      },
       copilotNew: [],
     })
     if (!useBase) set({ nodes: [], edges: [], dirty: true })
@@ -327,8 +345,28 @@ export const useStudio = create<StudioState>((set, get) => ({
             // 后端首帧告知实际用的模型，浮条上直接显示，不用猜
             set({ copilot: { ...s.copilot, model: op.model ?? '' } })
             break
+          case 'thinking':
+            // 模型正在想什么，原样接上去。看着它想比盯着"正在起草…"强得多
+            set({
+              copilot: {
+                ...s.copilot,
+                phase: s.copilot.phase === 'connecting' ? 'planning' : s.copilot.phase,
+                thinking: (s.copilot.thinking + (op.delta ?? '')).slice(-4000),
+              },
+            })
+            break
+          case 'heartbeat':
+            // 模型沉默期间的补拍，用来刷新阶段和已用时长
+            set({
+              copilot: {
+                ...s.copilot,
+                phase: (op.phase as any) ?? s.copilot.phase,
+                elapsedMs: op.elapsed_ms ?? s.copilot.elapsedMs,
+              },
+            })
+            break
           case 'plan':
-            set({ copilot: { ...s.copilot, lastOp: op.summary ?? '规划中' } })
+            set({ copilot: { ...s.copilot, phase: 'planning', lastOp: op.summary ?? '规划中' } })
             break
           case 'add_node': {
             const n = op.node
@@ -393,21 +431,24 @@ export const useStudio = create<StudioState>((set, get) => ({
             })
             break
           case 'done':
-            set({ copilot: { ...s.copilot, lastOp: '排版整理中…', explanation: op.explanation ?? '' } })
+            set({ copilot: { ...s.copilot, phase: 'finalizing', lastOp: '排版整理中…',
+                             explanation: op.explanation ?? '' } })
             break
           case 'final': {
             // 后端排版+校验后的最终图整体落位；高亮集合保留几秒供辨认
             const { nodes, edges } = toFlow(op.graph)
             set({ nodes, edges, dirty: true,
-                  copilot: { active: false, lastOp: '', model: get().copilot.model,
-                             explanation: op.explanation ?? get().copilot.explanation, error: '' } })
+                  copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
+                             thinking: '', elapsedMs: 0, error: '',
+                             explanation: op.explanation ?? get().copilot.explanation } })
             void get().validate()
             setTimeout(() => set({ copilotNew: [] }), 6000)
             break
           }
           case 'error':
-            set({ copilot: { active: false, lastOp: '', explanation: '',
-                             model: get().copilot.model, error: op.message ?? '生成失败' } })
+            // 保留 lastInstruction：失败浮条上的"重试"要用它，不能让用户重填
+            set({ copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
+                             thinking: '', explanation: '', error: op.message ?? '生成失败' } })
             break
         }
       },
@@ -425,9 +466,17 @@ export const useStudio = create<StudioState>((set, get) => ({
   stopCopilot: () => {
     get().cancelCopilot?.()
     set({
-      copilot: { ...get().copilot, active: false },
+      copilot: { ...get().copilot, active: false, phase: '', thinking: '' },
       cancelCopilot: null,
     })
+  },
+
+  retryCopilot: () => {
+    // 失败后用同一条需求重来。以前只能重新打开 Modal 把需求再敲一遍，
+    // 而失败往往跟需求本身无关（模型抽风、协议跑偏、网络断了）
+    const { lastInstruction, lastUseBase, model } = get().copilot
+    if (!lastInstruction) return
+    get().runCopilot(lastInstruction, lastUseBase, model || null)
   },
 
   startFormalRun: async (input) => {

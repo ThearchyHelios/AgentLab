@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, ShieldCheck, Sparkles, Trash2, Wand2,
+  AlertTriangle, Check, ChevronDown, ChevronRight, Copy, LayoutGrid, Plus, Save, ShieldCheck,
+  Sparkles, Trash2, Wand2,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -475,36 +476,101 @@ function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void })
 }
 
 /** Copilot 工作时的画布浮条：显示当前操作，可随时取消；结束后展示说明。 */
+// 阶段文案。从提交到第一个节点落地中间有 5~30 秒，这段时间界面上只有
+// "正在起草…"三个字一动不动，用户分不清是在想还是已经卡死——阶段会变的
+// 本身就是"它还活着"的信号。
+const COPILOT_PHASES: Record<string, string> = {
+  connecting: '正在连接模型…',
+  planning: '正在理解需求、规划结构…',
+  building: '正在放置节点…',
+  wiring: '正在连接数据流…',
+  finalizing: '正在排版和校验…',
+}
+
 function CopilotStatusBar() {
   const copilot = useStudio((s) => s.copilot)
   const stopCopilot = useStudio((s) => s.stopCopilot)
+  const retryCopilot = useStudio((s) => s.retryCopilot)
   const [dismissed, setDismissed] = useState(false)
+  const [showThinking, setShowThinking] = useState(true)
+  const thinkingRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     // 新一轮生成开始时重新显示
     if (copilot.active) setDismissed(false)
   }, [copilot.active])
 
+  // 思考是流式追加的，跟着滚到底，否则用户只能看到最早那几行
+  useEffect(() => {
+    const el = thinkingRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [copilot.thinking])
+
   if (dismissed) return null
   if (!copilot.active && !copilot.explanation && !copilot.error) return null
+
+  const seconds = copilot.elapsedMs ? Math.round(copilot.elapsedMs / 1000) : 0
+  // 有具体操作就显示操作，还没开始动就显示阶段——不再是恒定的"正在起草…"
+  const headline = copilot.lastOp || COPILOT_PHASES[copilot.phase] || '正在起草…'
 
   return (
     <div className="fade-up pointer-events-auto absolute bottom-4 left-4 z-30 max-w-md rounded-lg border bg-panel px-3 py-2 shadow-xl"
          style={{ borderColor: copilot.error ? 'var(--err)' : '#bc8cff' }}>
       {copilot.active ? (
-        <div className="flex items-center gap-2">
-          <Spinner size={13} />
-          <span className="min-w-0 flex-1 truncate text-[11.5px]">
-            <span className="mr-1.5 font-semibold" style={{ color: '#bc8cff' }}>Copilot</span>
-            {copilot.model && <span className="mr-1.5 text-faint">{copilot.model}</span>}
-            {copilot.lastOp}
-          </span>
-          <button className="btn btn-sm" onClick={stopCopilot}>取消</button>
+        <div>
+          <div className="flex items-center gap-2">
+            <Spinner size={13} />
+            <span className="min-w-0 flex-1 truncate text-[11.5px]">
+              <span className="mr-1.5 font-semibold" style={{ color: '#bc8cff' }}>Copilot</span>
+              {copilot.model && <span className="mr-1.5 text-faint">{copilot.model}</span>}
+              {headline}
+            </span>
+            {seconds > 0 && <span className="mono text-[10px] text-faint">{seconds}s</span>}
+            <button className="btn btn-sm" onClick={stopCopilot}>取消</button>
+          </div>
+
+          {/* 支持 thinking 的模型（Claude 4.6+）才有内容；没有就只显示阶段 */}
+          {copilot.thinking && (
+            <div className="mt-1.5 border-t pt-1.5">
+              <button
+                className="mb-1 flex items-center gap-1 text-[10px] text-faint hover:text-dim"
+                onClick={() => setShowThinking((v) => !v)}
+              >
+                <ChevronRight
+                  size={10}
+                  style={{ transform: showThinking ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}
+                />
+                模型正在想什么
+              </button>
+              {showThinking && (
+                <div
+                  ref={thinkingRef}
+                  className="max-h-28 overflow-y-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-[10.5px] leading-relaxed text-dim"
+                >
+                  {copilot.thinking}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ) : copilot.error ? (
-        <div className="flex items-start gap-2">
-          <span className="min-w-0 flex-1 text-[11.5px] text-[var(--err)]">{copilot.error}</span>
-          <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
+        <div>
+          <div className="flex items-start gap-2">
+            <span className="min-w-0 flex-1 text-[11.5px] text-[var(--err)]">{copilot.error}</span>
+            <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
+          </div>
+          {/* 失败多半跟需求本身无关（模型抽风、协议跑偏、网断了），
+              不该逼用户重新打开 Modal 把需求再敲一遍 */}
+          {copilot.lastInstruction && (
+            <div className="mt-1.5 flex items-center gap-2 border-t pt-1.5">
+              <span className="min-w-0 flex-1 truncate text-[10px] text-faint" title={copilot.lastInstruction}>
+                {copilot.lastInstruction}
+              </span>
+              <button className="btn btn-sm" onClick={() => { setDismissed(false); retryCopilot() }}>
+                用同一需求重试
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex items-start gap-2">

@@ -31,6 +31,8 @@ dependencies = [
 # 再加一次 OCI 镜像拉取（实测约 55s），所以不进默认安装。
 # environment.yml 里已经带上了；单独装用 `pip install 'agentlab-backend[microvm]'`。
 microvm = ["microsandbox>=0.6"]
+# 测试：conda 环境默认不装，跑测试前 pip install 'agentlab-backend[dev]'
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [build-system]
 requires = ["hatchling"]
