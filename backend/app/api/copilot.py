@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -378,11 +380,25 @@ def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op:
 
 
 async def _iter_ops(model: Any, messages: list[Any]):
-    """流式读模型输出，按行切出操作。done 之后即停——后面就算有闲话也不要了。"""
+    """流式读模型输出，按行切出操作。done 之后即停——后面就算有闲话也不要了。
+
+    除了操作，还把模型的思考原样转出去。原先这里只取正文、丢掉其余一切，
+    于是从请求发出到第一个操作到达之间（实测 5~30 秒）前端一个字都收不到，
+    只能干挂着"正在起草…"——用户没法判断是在想、还是已经卡死了。
+
+    思考走 thinking_text()（Claude 4.6+ 的 thinking 块），不是"把非 JSON 行
+    当成思考"：后者会把模型的 markdown 注释、协议跑偏时的乱输出一并当作思考
+    展示出来，反而误导。不支持 thinking 的模型就只有心跳，不硬凑。
+    """
     from app.engine.state import message_text as _text
+    from app.engine.state import thinking_text
 
     buffer = ""
     async for chunk in model.astream(messages):
+        reasoning = thinking_text(chunk)
+        if reasoning:
+            yield {"op": "thinking", "delta": reasoning}
+
         buffer += _text(chunk)
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
@@ -394,6 +410,45 @@ async def _iter_ops(model: Any, messages: list[Any]):
     op = _parse_op_line(buffer)
     if op:
         yield op
+
+
+# 多久没动静就补一拍心跳。3 秒是"用户开始怀疑是不是卡了"的量级。
+_HEARTBEAT_SECONDS = 3.0
+
+
+async def _with_heartbeat(source: Any):
+    """模型沉默时按拍补心跳，让前端能显示阶段和已用时长。
+
+    必须在这一层做而不是在 _iter_ops 里判断时间差：模型不吐 chunk 时那个
+    async for 的循环体根本不执行，压根轮不到检查。
+    """
+    started = time.monotonic()
+    phase = "planning"
+    iterator = source.__aiter__()
+    while True:
+        pending = asyncio.ensure_future(iterator.__anext__())
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=_HEARTBEAT_SECONDS)
+            if pending in done:
+                try:
+                    op = pending.result()
+                except StopAsyncIteration:
+                    return
+                kind = op.get("op")
+                # 阶段跟着实际操作走，前端据此换文案
+                if kind == "add_node":
+                    phase = "building"
+                elif kind in ("add_edge", "connect"):
+                    phase = "wiring"
+                elif kind == "done":
+                    phase = "finalizing"
+                yield op
+                break
+            yield {
+                "op": "heartbeat",
+                "phase": phase,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            }
 
 
 @router.post("/generate-stream")
@@ -451,11 +506,16 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         explanation = ""
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
         try:
-            async for op in _iter_ops(model, messages):
-                if op.get("op") == "done":
+            async for op in _with_heartbeat(_iter_ops(model, messages)):
+                kind = op.get("op")
+                # 思考和心跳不是图操作，不进 _apply_op，直接转给前端
+                if kind in ("thinking", "heartbeat"):
+                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+                    continue
+                if kind == "done":
                     explanation = str(op.get("explanation", ""))
                 changed = _apply_op(nodes, edges, op)
-                if changed or op.get("op") in ("plan", "done"):
+                if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'op': 'error', 'message': f'{type(e).__name__}: {e}'}, ensure_ascii=False)}\n\n"
