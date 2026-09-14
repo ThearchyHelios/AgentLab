@@ -197,14 +197,20 @@ auto 模式在镜像没缓存时会先用 Seatbelt，不让人干等一分钟（
 任何访问控制**，界面上会明确标红。可以用 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
 也可以在代码节点上单独选「隔离档位」（strict = microVM，fast = 系统沙箱）。
 
-**怎么启用 microVM？** 装可选依赖后跑一次安装（约 50MB 运行时）：
+**怎么启用 microVM？** 三件事，**都是一次性的**——日常启动仍然只有 `./scripts/dev.sh`：
+
+1. Python 包：用 `environment.yml` 建过环境就已经装好了（里面带着 `[microvm]`）
+2. 运行时（约 50MB，落到 `~/.microsandbox`）：一台机器跑一次
+3. OCI 镜像（实测 ~55s）：第一次执行代码时自动拉，一个镜像一次
+
+只有第 2 步要手动跑：
 
 ```bash
-conda run -n agentlab pip install 'microsandbox>=0.6'
 conda run -n agentlab python -c "import asyncio,microsandbox as m; asyncio.run(m.install())"
 ```
 
-之后第一次执行代码会拉 OCI 镜像（实测 ~55s，只此一次），auto 就会自动升到 `microvm`。
+三样都落在磁盘上，重启机器、重开终端都不用再来。装没装好不用猜——设置页「运行环境」
+里 `microvm` 那条的 `warm` 为 true 就是三样齐了，auto 会自动升到 `microvm`。
 镜像可以用 `AGENTLAB_MICROVM_IMAGE` 换，闲置 VM 回收时间用 `AGENTLAB_MICROVM_IDLE_SECONDS`。
 
 **模型返回空内容？** Claude 4.6 之后的模型默认开着 thinking，`max_tokens` 给小了会出现
