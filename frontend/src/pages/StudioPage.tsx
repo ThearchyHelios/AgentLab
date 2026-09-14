@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, Sparkles, Trash2, Wand2,
+  AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, ShieldCheck, Sparkles, Trash2, Wand2,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -27,6 +27,7 @@ export function StudioPage() {
   const [picker, setPicker] = useState(false)
   const [copilot, setCopilot] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [publishing, setPublishing] = useState(false)
 
   // 首次进来自动打开第一张图
   useEffect(() => {
@@ -99,6 +100,15 @@ export function StudioPage() {
           <ChevronDown size={12} className="text-faint" />
         </button>
 
+        {workflow?.status === 'governed' && (
+          <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>
+            受管 v{workflow.published_version}
+          </span>
+        )}
+        {workflow?.status === 'published' && (
+          <span className="chip" style={{ color: 'var(--ok)' }}>已发布 v{workflow.published_version}</span>
+        )}
+        {(!workflow?.status || workflow.status === 'draft') && <span className="chip">草稿</span>}
         {dirty && <span className="chip" style={{ color: 'var(--warn)' }}>未保存</span>}
         {errorCount > 0 && (
           <span className="chip" style={{ color: 'var(--err)', borderColor: 'var(--err)' }}>
@@ -118,6 +128,10 @@ export function StudioPage() {
           <Wand2 size={12} /> Copilot
         </button>
         <button className="btn" onClick={relayout} title="自动排版"><LayoutGrid size={12} /></button>
+        <button className="btn" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
+                title={dirty ? '先保存再发布' : '把当前版本立为正式版本，正式运行只认它'}>
+          <ShieldCheck size={12} /> 发布
+        </button>
         <button className="btn btn-primary" onClick={doSave} disabled={saving || !dirty}>
           {saving ? <Spinner /> : <Save size={12} />} 保存
         </button>
@@ -145,6 +159,10 @@ export function StudioPage() {
 
       <WorkflowPicker open={picker} onClose={() => setPicker(false)} />
       <CopilotModal open={copilot} onClose={() => setCopilot(false)} />
+      {publishing && workflow && (
+        <PublishModal workflow={workflow} onClose={() => setPublishing(false)}
+                      onDone={() => { setPublishing(false); void refresh() }} />
+      )}
     </div>
   )
 }
@@ -258,6 +276,73 @@ function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void 
 }
 
 // -------------------------------------------------------------------------
+
+function PublishModal({ workflow, onClose, onDone }: {
+  workflow: Workflow; onClose: () => void; onDone: () => void
+}) {
+  const toast = useToast()
+  const load = useStudio((s) => s.load)
+  const [level, setLevel] = useState<'published' | 'governed'>('published')
+  const [busy, setBusy] = useState(false)
+  const [issues, setIssues] = useState<any[] | null>(null)
+
+  const publish = async () => {
+    setBusy(true)
+    setIssues(null)
+    try {
+      const res = await api.workflows.publish(workflow.id, level)
+      setIssues(res.issues ?? [])
+      if (res.ok) {
+        toast(`已发布 v${res.version}（${level === 'governed' ? '受管' : '正式'}）`, 'ok')
+        const fresh = await api.workflows.get(workflow.id)
+        load(fresh)
+        onDone()
+      } else {
+        toast('发布被门禁拦下，看问题列表', 'error')
+      }
+    } catch (e: any) {
+      toast(e.message ?? '发布失败', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title={`发布「${workflow.name}」v${workflow.version}`}
+           footer={<>
+             <button className="btn" onClick={onClose}>取消</button>
+             <button className="btn btn-primary" onClick={publish} disabled={busy}>
+               {busy ? <Spinner /> : <ShieldCheck size={12} />} 发布
+             </button>
+           </>}>
+      <div className="mb-3 grid grid-cols-2 gap-1.5">
+        <button onClick={() => setLevel('published')}
+                className={level === 'published' ? 'rounded-lg border border-[var(--accent)] px-3 py-2 text-left' : 'rounded-lg border px-3 py-2 text-left hover:bg-hover'}>
+          <div className="text-[12px] font-medium">正式（published）</div>
+          <div className="text-[10.5px] text-faint">基础校验通过即可；正式运行从此版本发起</div>
+        </button>
+        <button onClick={() => setLevel('governed')}
+                className={level === 'governed' ? 'rounded-lg border border-[var(--accent)] px-3 py-2 text-left' : 'rounded-lg border px-3 py-2 text-left hover:bg-hover'}>
+          <div className="text-[12px] font-medium">受管（governed）</div>
+          <div className="text-[10.5px] text-faint">出具级门禁：禁 supervisor、方法卡必须钉版、必须有出具契约</div>
+        </button>
+      </div>
+      <div className="text-[10.5px] leading-relaxed text-faint">
+        发布把当前版本立为不可变的正式版本。之后画布上继续改不影响它——正式运行永远执行发布时的快照。
+      </div>
+      {issues && !!issues.length && (
+        <div className="mt-3 space-y-1">
+          {issues.map((issue, i) => (
+            <div key={i} className="text-[10.5px]"
+                 style={{ color: issue.level === 'error' ? 'var(--err)' : 'var(--warn)' }}>
+              {issue.level === 'error' ? '✕' : '!'} {issue.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  )
+}
 
 function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useToast()

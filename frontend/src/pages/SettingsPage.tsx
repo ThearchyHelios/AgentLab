@@ -362,6 +362,22 @@ function PrefsTab() {
       </div>
 
       <div>
+        <div className="mb-2 text-sm font-semibold">操作者署名</div>
+        <label className="label">名字（发布、审批、发起正式运行会记到这个名下）</label>
+        <input
+          className="field max-w-60"
+          defaultValue={(() => { try { return localStorage.getItem('agentlab_actor') ?? '' } catch { return '' } })()}
+          placeholder="例如 yilun"
+          onChange={(e) => {
+            try { localStorage.setItem('agentlab_actor', e.target.value.trim()) } catch { /* noop */ }
+          }}
+        />
+        <div className="mt-1 text-[10px] text-faint">
+          本地署名，随请求头 X-Actor 发送。这是归属记录不是身份认证——多人环境需要真正的登录体系。
+        </div>
+      </div>
+
+      <div>
         <div className="mb-2 text-sm font-semibold">运行默认值</div>
         <label className="label">默认记忆作用域</label>
         <input className="field" value={values.run?.default_memory_scope ?? 'default'}

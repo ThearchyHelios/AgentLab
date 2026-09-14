@@ -1,7 +1,7 @@
 export type NodeType =
   | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
-  | 'human' | 'validate'
+  | 'human' | 'validate' | 'metrics'
 
 export interface GraphNode {
   id: string
@@ -34,6 +34,8 @@ export interface Workflow {
   tags: string[]
   version: number
   is_template: boolean
+  status?: 'draft' | 'published' | 'governed'
+  published_version?: number | null
   run_count?: number
   created_at?: string
   updated_at?: string
@@ -51,6 +53,11 @@ export interface Run {
   output: Record<string, any>
   error: string | null
   usage: Record<string, any>
+  run_class?: 'formal' | 'exploratory'
+  version?: number | null
+  version_hash?: string | null
+  manifest_hash?: string | null
+  started_by?: string | null
   created_at?: string
   started_at?: string
   finished_at?: string

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { History, RefreshCw, Trash2 } from 'lucide-react'
+import { GitFork, History, RefreshCw, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { formatMs } from '../canvas/NodeCard'
@@ -53,6 +53,12 @@ export function RunsPage() {
             >
               <div className="flex items-center gap-2">
                 <span className="min-w-0 flex-1 truncate text-[12px]">{run.workflow_name || '临时图'}</span>
+                {run.run_class === 'formal' && (
+                  <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>正式</span>
+                )}
+                {(run.output as any)?._issuance?.tier === 'withheld' && (
+                  <span className="chip" style={{ color: 'var(--err)' }}>不予出具</span>
+                )}
                 <StatusDot status={run.status} />
               </div>
               <div className="flex gap-2 text-[10px] text-faint">
@@ -72,10 +78,34 @@ export function RunsPage() {
           <div className="p-4">
             <div className="mb-3 flex items-start gap-3">
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold">{selected.workflow_name || '临时图'}</div>
-                <div className="mono text-[10.5px] text-faint">{selected.id}</div>
+                <div className="flex items-center gap-2 text-sm font-semibold">
+                  {selected.workflow_name || '临时图'}
+                  {selected.run_class === 'formal'
+                    ? <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>正式 v{selected.version}</span>
+                    : <span className="chip">探索性</span>}
+                </div>
+                <div className="mono text-[10.5px] text-faint">
+                  {selected.id}
+                  {selected.version_hash && ` · 版本 ${selected.version_hash.slice(0, 10)}`}
+                  {selected.manifest_hash && ` · 清单 ${selected.manifest_hash.slice(0, 10)}`}
+                  {selected.started_by && ` · by ${selected.started_by}`}
+                </div>
               </div>
               <StatusDot status={selected.status} />
+              {selected.run_class !== 'formal' && (
+                <button
+                  className="btn btn-sm"
+                  title="把这次实际走过的路径提取成草稿模板（探索层 → 模板层）"
+                  onClick={async () => {
+                    try {
+                      const res = await api.copilot.fromRun(selected.id)
+                      toast(`已提取为草稿「${res.name}」（${res.nodes} 节点，剪掉 ${res.dropped_nodes} 个未走节点）`, 'ok')
+                    } catch (e: any) { toast(e.message ?? '提取失败', 'error') }
+                  }}
+                >
+                  <GitFork size={11} /> 提取模板
+                </button>
+              )}
               <button
                 className="btn btn-sm btn-ghost"
                 onClick={async () => {

@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import artifacts, copilot, knowledge, runs, sandbox, settings as settings_api, tools, workflows
+from app.api import artifacts, copilot, governance, knowledge, runs, sandbox, settings as settings_api, tools, workflows
 from app.core.config import settings
 from app.db.base import init_db
 from app.engine.runner import run_manager
@@ -68,6 +68,7 @@ for router in (
     sandbox.router,
     copilot.router,
     artifacts.router,
+    governance.router,
 ):
     app.include_router(router)
 

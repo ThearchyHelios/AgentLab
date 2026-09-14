@@ -12,8 +12,10 @@ function summarize(type: NodeType, config: Record<string, any>): string {
   switch (type) {
     case 'input':
       return (config.fields ?? []).map((f: any) => f.name).filter(Boolean).join(' · ') || '未定义输入'
-    case 'output':
-      return (config.fields ?? []).map((f: any) => f.name).filter(Boolean).join(' · ') || '未定义成果'
+    case 'output': {
+      const names = (config.fields ?? []).map((f: any) => f.name).filter(Boolean).join(' · ')
+      return (config.contract ? '⚖ 出具契约 · ' : '') + (names || '未定义成果')
+    }
     case 'llm':
       return first(config.prompt, config.system) || '未填提示'
     case 'agent': {
@@ -40,6 +42,8 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return first(config.title) || '等待人工'
     case 'validate':
       return 'JSON Schema 校验' + (config.repair_with_llm ? ' · 失败自动返工' : '')
+    case 'metrics':
+      return `${config.caliber || '口径'}@${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
     case 'transform':
       return first(config.expression, config.template) || '未配置'
     case 'subgraph':

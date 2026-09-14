@@ -93,6 +93,7 @@ interface StudioState {
   validate: () => Promise<void>
 
   startRun: (input: Record<string, any>) => Promise<Run | null>
+  startFormalRun: (input: Record<string, any>) => Promise<Run | null>
   attachRun: (runId: string) => Promise<void>
   stopRun: () => Promise<void>
   clearRun: () => void
@@ -240,6 +241,27 @@ export const useStudio = create<StudioState>((set, get) => ({
       const run = await api.runs.start({
         workflow_id: workflow?.id,
         graph: toGraph(nodes, edges),
+        input,
+      })
+      set({ run, streaming: true })
+      await get().attachRun(run.id)
+      return run
+    } catch (e) {
+      set({ streaming: false })
+      throw e
+    }
+  },
+
+  startFormalRun: async (input) => {
+    const { workflow } = get()
+    if (!workflow) return null
+    get().unsubscribe?.()
+    set({ events: [], runtime: {}, activeEdges: [], run: null })
+    try {
+      // 正式运行不传 graph：后端只认已发布的不可变版本
+      const run = await api.runs.start({
+        workflow_id: workflow.id,
+        run_class: 'formal',
         input,
       })
       set({ run, streaming: true })
