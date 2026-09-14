@@ -74,6 +74,10 @@ def _apply_contract(
     sources = contract.get("metrics_from") or []
     if isinstance(sources, str):
         sources = [sources]
+    # gaps 记的是"校验本身哪里没跑起来"，和"校验跑了但没通过"是两回事。
+    # 没有它，一个写错的节点名会让所有列表都是空的，看起来和"全部通过"一模一样。
+    gaps: list[str] = []
+    unresolved: list[str] = []
     for source in sources:
         payload = nodes.get(source)
         if isinstance(payload, dict) and payload.get("kind") == "metric_set":
@@ -85,25 +89,44 @@ def _apply_contract(
                     "version": payload.get("caliber_version", ""),
                 }
             )
+        else:
+            # 节点不存在、还没跑到、或者根本不是口径卡——指标集就是缺的，
+            # 不能当作"这次没有指标要查"
+            unresolved.append(source)
+    if unresolved:
+        gaps.append(f"指标源未解析：{', '.join(unresolved[:5])}")
 
     present = {m["id"] for m in metrics}
     missing_required = [m for m in (contract.get("required") or []) if m not in present]
     missing_expected = [m for m in (contract.get("expected") or []) if m not in present]
 
     # 2) 叙述数字回指
-    narrative = ctx.render_str(str(contract.get("narrative", "")), state)
+    declared_narrative = str(contract.get("narrative", ""))
+    narrative = ctx.render_str(declared_narrative, state)
+    # 模板取不到路径时 render 出来是空串，所以"声明了叙述但渲染成空"必须单独识别：
+    # 节点改名、vars 写错都会让回指校验静默变成空操作
+    if declared_narrative.strip() and not narrative.strip():
+        gaps.append("叙述模板渲染为空（路径可能写错了）")
+    elif not declared_narrative.strip():
+        gaps.append("契约没有声明叙述，数字回指未执行")
+
     trace = (
         trace_numbers(narrative, metrics, allow=contract.get("allow_numbers"))
-        if narrative
+        if narrative.strip()
         else None
     )
     unmatched = trace.unmatched if trace else []
+
+    # 声明了 metrics_from 却一个指标都没收到，同样是"没查成"
+    if sources and not metrics:
+        gaps.append("指标集为空，叙述里的数字无从回指")
 
     tier = decide_tier(
         missing_required=missing_required,
         missing_expected=missing_expected,
         unmatched=unmatched,
         strict=bool(contract.get("strict")),
+        gaps=gaps,
     )
 
     issuance = {
@@ -114,6 +137,8 @@ def _apply_contract(
         "missing_expected": missing_expected,  # 缺数据声明照常印
         "unmatched_numbers": unmatched[:20],
         "matched_numbers": len(trace.matched) if trace else 0,
+        # 校验没跑全的原因照实印出来——读的人要能分辨"查过都对"和"根本没查"
+        "gaps": gaps,
         "declared_at": datetime.now(timezone.utc).isoformat(),
     }
     ctx.emit(
