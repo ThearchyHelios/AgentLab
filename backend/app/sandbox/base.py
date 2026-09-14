@@ -2,10 +2,26 @@ from __future__ import annotations
 
 import abc
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+
+# 入口脚本的前缀。列"这次执行产出了哪些文件"时要把它们排掉——
+# 它们是执行机制自己的临时文件，不是用户代码的产出。
+ENTRY_PREFIX = "__entry_"
+
+
+def entry_name(ext: str) -> str:
+    """给这一次执行生成独立的入口脚本名。
+
+    同一个会话共用一个工作区（跨节点传文件要靠它），所以入口脚本**不能**
+    用固定的 main.py：一张图里并排的两个代码节点会在同一 superstep 并发执行，
+    都写 main.py 就会互相覆盖——后写的赢，而每个节点都以为跑的是自己的代码，
+    还都返回 ok。这是静默的结果污染，比报错难查得多。
+    """
+    return f"{ENTRY_PREFIX}{uuid4().hex[:12]}{ext}"
 
 
 class SandboxLimits(BaseModel):

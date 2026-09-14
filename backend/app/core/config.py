@@ -8,6 +8,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = BACKEND_DIR.parent
 
+# session_id 拼进路径前必须过这一关。允许的字符刻意收得很窄：字母数字加
+# 连字符下划线——点号也不放行，免得出现 ".." 这种能往上走的名字。
+_SESSION_MAX = 64
+
+
+def sanitize_session(session_id: str | None) -> str:
+    """把任意字符串收敛成一个能安全当目录名的 token。
+
+    以前这段逻辑在四个沙箱后端里各抄了一遍，而文件工具那条路径漏抄了，
+    结果 sandbox_session 传 ".." 就能读到工作区外的文件（连加密主密钥都
+    读得到）。所以统一收到这里，只此一份。
+    """
+    safe = "".join(c for c in (session_id or "") if c.isalnum() or c in "-_")
+    return safe[:_SESSION_MAX] or "default"
+
 
 class Settings(BaseSettings):
     """全局配置。所有项都可以用 AGENTLAB_ 前缀的环境变量覆盖。"""
@@ -76,6 +91,21 @@ class Settings(BaseSettings):
     def workspace_dir(self) -> Path:
         """沙箱与文件工具的可写根目录，一切文件访问都被限制在这里面。"""
         return self.data_dir / "workspace"
+
+    def session_dir(self, session_id: str | None, *, sub: str = "") -> Path:
+        """会话工作目录。session_id 一律先净化再拼路径。
+
+        这个函数存在的理由：session_id 有些调用点是外部可控的（工具 API 的
+        请求体就能指定），拿它直接拼路径就等于把工作区根目录交给调用方摆布，
+        后面再怎么做越界检查都是在被挪走的根下面做的，形同虚设。
+        """
+        safe = sanitize_session(session_id)
+        root = (self.workspace_dir / (sub or "") / safe).resolve()
+        base = self.workspace_dir.resolve()
+        # 净化之后理应不可能跑出去，这里再断言一次：这条路径值得多一道保险
+        if root != base and base not in root.parents:
+            raise ValueError(f"非法的 session 目录：{session_id!r}")
+        return root
 
     @property
     def uploads_dir(self) -> Path:

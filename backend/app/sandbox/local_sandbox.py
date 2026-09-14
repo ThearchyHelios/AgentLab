@@ -8,15 +8,18 @@ import sys
 import time
 from pathlib import Path
 
-from app.core.config import settings
-from app.sandbox.base import ExecResult, Sandbox, SandboxLimits, truncate
+from app.core.config import settings, sanitize_session
+from app.sandbox import interpreter
+from app.sandbox.base import ENTRY_PREFIX, ExecResult, Sandbox, SandboxLimits, entry_name, truncate
 
+# 入口脚本后缀 + 执行命令。文件名运行时生成（entry_name），不能写死：
+# 同会话并发执行都写 main.py 会互相覆盖。
 _LANG = {
-    "python": ("main.py", [sys.executable, "-u", "main.py"]),
-    "bash": ("main.sh", ["bash", "main.sh"]),
-    "sh": ("main.sh", ["sh", "main.sh"]),
-    "node": ("main.js", ["node", "main.js"]),
-    "javascript": ("main.js", ["node", "main.js"]),
+    "python": (".py", None),  # 运行时用 interpreter.python_argv()
+    "bash": (".sh", ["bash"]),
+    "sh": (".sh", ["sh"]),
+    "node": (".js", ["node"]),
+    "javascript": (".js", ["node"]),
 }
 
 
@@ -43,11 +46,13 @@ class LocalSandbox(Sandbox):
             "enforced": {"timeout": True, "cpu": True,
                          "memory": not sys.platform == "darwin", "network": False, "fsize": True},
             "root": str(self._root),
+            "interpreter": interpreter.describe(),
         }
 
     def _session_dir(self, session_id: str) -> Path:
-        safe = "".join(c for c in session_id if c.isalnum() or c in "-_")[:64] or "default"
-        path = self._root / safe
+        # 净化规则统一在 config.sanitize_session 里，四个后端和文件工具共用一份：
+        # 这段逻辑以前各抄各的，文件工具那份漏抄了，就成了越界读取的口子。
+        path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -87,14 +92,18 @@ class LocalSandbox(Sandbox):
         if language not in _LANG:
             return ExecResult(ok=False, backend=self.name, error=f"不支持的语言：{language}")
 
-        filename, argv = _LANG[language]
+        ext, cmd = _LANG[language]
+        # python 的命令前缀运行时才定：要挑一个看不见后端依赖的解释器
+        cmd = cmd if cmd is not None else interpreter.python_argv()
+        entry = entry_name(ext)
+        argv = [*cmd, entry]
         if shutil.which(argv[0]) is None and argv[0] != sys.executable:
             return ExecResult(
                 ok=False, backend=self.name, error=f"宿主机上找不到 {argv[0]}"
             )
 
         workdir = self._session_dir(session_id or f"tmp-{int(time.time()*1000)}")
-        (workdir / filename).write_text(code)
+        (workdir / entry).write_text(code)
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
@@ -146,7 +155,7 @@ class LocalSandbox(Sandbox):
         written = [
             p.name
             for p in workdir.iterdir()
-            if p.is_file() and p.name != filename
+            if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
         ][:50]
         return ExecResult(
             ok=proc.returncode == 0,
