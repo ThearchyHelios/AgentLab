@@ -315,24 +315,34 @@ export function decodeRun(events: RunEvent[]): Step[] {
     return true
   }
 
+  /** 上一条就是恢复事件——用来认出紧随其后的那条重复的"继续执行" */
+  let justResumed = false
+
   for (const event of events) {
     const type = String(event.type)
     if (EPHEMERAL.has(type) || SILENT.has(type)) continue
     const d: any = event.data ?? {}
     const seq = event.seq ?? 0
     const nodeId = event.node_id ?? undefined
+    // 每条事件都会把"刚恢复过"清掉；只有恢复分支会重新点亮它，
+    // 所以这个标记只在紧挨着的下一条上为真
+    const wasJustResumed = justResumed
+    justResumed = false
 
     switch (type) {
       case 'run.started':
       case 'run.resumed': {
         const resumed = type === 'run.resumed' || !!d.resumed
-        // 恢复一次会同时来 run.resumed 和 run.started(resumed=true)，
-        // 说两遍"继续执行"只会让人以为恢复了两次
-        if (resumed && out.some((s) => s.kind === 'lifecycle' && s.title === '继续执行')
-            && !out.some((s) => s.status === 'waiting')) {
-          break
-        }
+        // 恢复一次会紧挨着发两条：run.resumed 和 run.started(resumed=true)。
+        // 说两遍"继续执行"会让人以为恢复了两次。
+        //
+        // 判据是"这两条是不是紧挨着的"，不是"界面上还有没有待办"——后者
+        // 曾经能用，但只要多一处会产生 waiting 状态的地方（比如把被中断的
+        // 节点也标成等待），它就失效了。相邻性是这两条事件的固有性质，
+        // 不会因为别处改了展示而变。
+        if (resumed && wasJustResumed) break
         if (resumed) {
+          justResumed = true
           // 人已经答过了，那条不该再是橙色的"等你确认"。但配对关系要留着：
           // 紧接着 LangGraph 会重放该节点，又发一条一模一样的
           // human.requested，配对还开着才能认出那是重放而不是新一轮。
@@ -349,6 +359,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
       }
 
       case 'node.started': {
+        // 恢复后节点重放，它从"等你"回到"在跑"（下面会复用同一条 Step）
         // data.label 是节点标题**随事件传递的唯一来源**。靠画布 nodes 反查的话，
         // 助手栏和运行页没加载画布，标题会退化成裸 node_id。
         // label 是节点标题随事件传递的唯一来源，但没起过名字的节点它等于
@@ -537,6 +548,10 @@ export function decodeRun(events: RunEvent[]): Step[] {
         }
         openInterrupts.set(key, step)
         push(step, nodeId)
+        // 承载它的那个节点也不是"在跑"——它停下来等人了。转着蓝圈说的是
+        // "在忙，你等着"，而实际情况正相反：它在等你
+        const host = nodeId ? nodeSteps.get(nodeId) : undefined
+        if (host && host.status === 'running') host.status = 'waiting'
         break
       }
 

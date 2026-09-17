@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Copy, Plus, Settings2, Trash2, X } from 'lucide-react'
+import { ChevronLeft, Copy, Plus, Settings2, Trash2, X } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, type FieldDef } from './nodeDefs'
 import { useStudio } from '../store/studio'
@@ -39,7 +39,18 @@ export function Inspector() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b px-3 py-2">
+      <div className="flex items-center gap-1.5 border-b px-2 py-2">
+        {/* 这块是盖在助手栏上的一层。不给一个明确的"回去"，用户就不知道
+            底下还有东西——只看到一个 ×，会以为关掉之后什么都没有了 */}
+        <button
+          className="flex items-center gap-0.5 rounded-md px-1 py-1 text-faint transition-colors hover:bg-hover hover:text-fg"
+          title="返回助手（Esc）"
+          onClick={() => select(null)}
+        >
+          <ChevronLeft size={14} />
+          <span className="text-[10px]">助手</span>
+        </button>
+        <span className="mx-0.5 h-3.5 w-px shrink-0" style={{ background: 'var(--border)' }} />
         <def.icon size={13} style={{ color: 'var(--nt)' }} className={`nt-${node.data.nodeType}`} />
         <span className="flex-1 truncate text-xs font-semibold">{def.label}</span>
         <button className="btn btn-ghost btn-sm" title="复制节点" onClick={() => duplicateNode(node.id)}>
@@ -47,9 +58,6 @@ export function Inspector() {
         </button>
         <button className="btn btn-ghost btn-sm" title="删除节点" onClick={() => removeNode(node.id)}>
           <Trash2 size={12} className="text-[var(--err)]" />
-        </button>
-        <button className="btn btn-ghost btn-sm" onClick={() => select(null)}>
-          <X size={12} />
         </button>
       </div>
 

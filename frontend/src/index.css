@@ -221,6 +221,92 @@ pre,
   animation: fade-up 0.16s ease-out;
 }
 
+/* --------------------------------------------------------------------------
+   助手栏的动效。
+   缓动统一用 cubic-bezier(.32,.72,0,1)：起步快、尾部长，是"被推出来"而不是
+   "匀速平移"的手感。时长都压在 240ms 以内——面板滑动超过这个数就开始像卡顿，
+   而不是像流畅。
+   -------------------------------------------------------------------------- */
+
+/* 属性面板：从右侧盖到助手栏上。它是临时造访者，助手才是常住的，所以用
+   "盖上去再拿走"而不是切 tab——切 tab 会把下面那层卸载掉，滚动位置、
+   输入草稿、展开状态全丢。 */
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
+.sheet-in {
+  animation: sheet-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* 例句卡片依次入场。--i 是序号，错开 40ms 就够读出"一条条出现"，
+   再多就开始等 */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.rise-in {
+  opacity: 0;
+  animation: rise-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  animation-delay: calc(var(--i, 0) * 40ms);
+}
+
+/* 正在流的那一步：一道光扫过文字。比转圈多说一件事——它在出字，不只是在等 */
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--text-faint) 0%, var(--text-faint) 35%,
+    var(--text) 50%,
+    var(--text-faint) 65%, var(--text-faint) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+
+/* 空态那枚标记的呼吸感。很轻——它是在暗示"可以开始了"，不是在要求注意力 */
+@keyframes breathe {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.06); }
+}
+.breathe {
+  animation: breathe 4s ease-in-out infinite;
+}
+
+/* 输入坞聚焦时的光晕。焦点是这一栏最重要的状态，值得比 1px 描边更明确 */
+.dock-focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+   前庭敏感的人看这些动效会难受，而这套界面里动的东西不少（边在流动、节点在
+   脉冲、面板在滑）。系统里关掉动效的，这里就全部停掉——不是调慢，是停掉。
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .rise-in { opacity: 1; }
+  .shimmer {
+    background: none;
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    color: var(--text-dim);
+  }
+}
+
 /* 表单控件统一外观 */
 .field {
   width: 100%;

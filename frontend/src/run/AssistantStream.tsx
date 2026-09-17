@@ -189,8 +189,11 @@ function StepRow({ step, dense, depth }: { step: Step; dense: boolean; depth: nu
   // 失败要压过 kind：一条 lifecycle 跑挂了还画成打勾的"完成"图标，
   // 是把失败说成了成功
   const failed = step.status === 'failed' || step.level === 'error'
-  const Glyph = failed ? XCircle : Icon
+  // "等你确认"不是"正在忙"。转圈说的是"你等着"，而这里正相反
+  const waiting = step.status === 'waiting'
+  const Glyph = failed ? XCircle : waiting ? Hand : Icon
   const color = failed ? 'var(--err)'
+    : waiting ? 'var(--warn)'
     : step.level === 'warn' ? 'var(--warn)'
     : step.kind === 'think' ? 'var(--text-faint)'
     : step.status === 'running' ? 'var(--accent)'
@@ -214,7 +217,9 @@ function StepRow({ step, dense, depth }: { step: Step; dense: boolean; depth: nu
         </span>
         <span className={clsx('min-w-0 flex-1 leading-relaxed',
           dense ? 'text-[11px]' : 'text-[11.5px]',
-          step.kind === 'think' && 'italic')}>
+          step.kind === 'think' && 'italic',
+          // 一道光扫过文字。比转圈多说一件事——它在出东西，不只是在等
+          step.status === 'running' && !step.children?.length && 'shimmer')}>
           {step.title}
         </span>
         {step.meta && (

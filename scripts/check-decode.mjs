@@ -92,6 +92,26 @@ console.log('\n=== 人工审批（含重放）===')
     !all.some((s) => s.status === 'done' && s.level === 'warn'))
 }
 
+console.log('\n=== 停在审批时的状态 ===')
+{
+  // 只喂到中断为止，模拟"运行正卡在人工介入上"这一刻
+  const upto = fixtures.human.slice(0, fixtures.human.findIndex((e) => e.type === 'run.interrupted') + 1)
+  const all = flatten(mod.decodeRun(upto))
+  const host = all.find((s) => s.kind === 'node' && s.nodeId === 'h')
+
+  // 转圈说的是"它在忙，你等着"，而实际情况正相反：它在等你。
+  // 两种状态的行动含义完全相反，不能共用一个图标
+  check('被中断的节点是"等你"而不是"在跑"', host?.status === 'waiting', host?.status)
+  check('那一刻没有任何东西在转圈',
+    !all.some((s) => s.kind === 'node' && s.status === 'running'),
+    all.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+
+  // 恢复之后它得回到"在跑"，否则整条流永远显示成在等人
+  const after = mod.decodeRun(fixtures.human)
+  const doneHost = flatten(after).find((s) => s.kind === 'node' && s.nodeId === 'h')
+  check('恢复后回到正常状态', doneHost?.status === 'done', doneHost?.status)
+}
+
 console.log('\n=== 循环里的多轮审批 ===')
 {
   // 真实运行：驳回 → 改写 → 再驳回（带备注）→ 改写 → 放行。三轮，每轮都有

@@ -42,25 +42,38 @@ console.log('=== 画布助手栏 ===')
   const { page, errors } = await visit('/studio')
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 
-  const tabs = await page.locator('nav, [role=tablist], button').allInnerTexts()
-  const flat = tabs.join(' ')
-  check('右栏是「助手 / 属性」两个 tab', flat.includes('助手') && flat.includes('属性'))
-  check('不再有「时间线 / 成果 / 事件」的第二层嵌套',
-    !flat.includes('时间线') && !flat.includes('原始事件'))
+  const body = await page.locator('body').innerText()
+  check('不再有两层 tab 嵌套',
+    !body.includes('时间线') && !body.includes('原始事件'))
 
-  // 改版最容易顺手删掉的两个东西
-  check('发起运行的入口还在', await page.getByText('试运行').count() > 0)
-  check('Copilot 输入框就在栏里（不再是弹窗）',
-    await page.locator('textarea[placeholder*="告诉它"], textarea[placeholder*="描述你要"]').count() > 0)
+  // 用户的原话："没有一个很好的地方引导用户写问题"。空态下输入区就该是主体
+  check('空态给出了明确的邀请', body.includes('想让它做什么'))
+  check('说清楚它能够到什么', /\d+ 个工具/.test(body), body.match(/\d+ 个工具/)?.[0])
+  const examples = await page.locator('aside button').filter({ hasText: /。|，/ }).count()
+  check('例句是完整句子而不是截断的 chip', examples >= 2, `${examples} 条`)
 
-  // 切到属性再切回来，输入框里的草稿不该没
-  const composer = page.locator('textarea[placeholder*="告诉它"], textarea[placeholder*="描述你要"]').first()
+  const composer = page.locator('aside textarea').first()
+  check('输入框自动聚焦，不用先点一下',
+    await composer.evaluate((el) => el === document.activeElement))
+
+  // 改版最容易顺手删掉的东西：唯一的运行入口
+  check('发起运行的入口还在（已搬到工具栏）',
+    await page.getByRole('button', { name: /^运行/ }).count() > 0)
+
+  // 这是这次重构的核心承诺：属性是盖在助手上的一层，不是把它换掉。
+  // 切 tab 会卸载组件，草稿、滚动位置、展开状态全丢——那正是要修的问题
   await composer.fill('测试草稿不要丢')
-  await page.getByRole('button', { name: '属性' }).click()
-  await page.waitForTimeout(200)
-  await page.getByRole('button', { name: '助手' }).click()
-  await page.waitForTimeout(200)
-  check('切走再切回来，输入的字还在', await composer.inputValue() === '测试草稿不要丢',
+  await page.locator('.react-flow__node').first().click()
+  await page.waitForTimeout(350)
+  const sheet = await page.locator('body').innerText()
+  check('选中节点滑出属性面板', sheet.includes('节点名称') || sheet.includes('ID:'))
+  check('面板上有明确的返回，让人知道底下还有东西',
+    await page.getByTitle('返回助手（Esc）').count() > 0)
+
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(350)
+  check('Esc 关得掉', await page.getByTitle('返回助手（Esc）').count() === 0)
+  check('回来之后输入的字还在', await composer.inputValue() === '测试草稿不要丢',
     await composer.inputValue())
   await composer.fill('')
 
@@ -68,6 +81,26 @@ console.log('=== 画布助手栏 ===')
     document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('页面不横向溢出', overflow <= 0, `${overflow}px`)
   await shot(page, 'studio')
+  await page.close()
+}
+
+console.log('\n=== 动效对前庭敏感者可关 ===')
+{
+  // 这套界面里动的东西不少（边在流动、节点在脉冲、面板在滑）。
+  // 系统里关了动效还照播，对前庭敏感的人是实打实的难受
+  const page = await ctx.newPage()
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto(`${WEB}/studio`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(500)
+  const durations = await page.evaluate(() => {
+    const probe = document.createElement('div')
+    probe.className = 'rise-in'
+    document.body.appendChild(probe)
+    const d = getComputedStyle(probe).animationDuration
+    probe.remove()
+    return d
+  })
+  check('关掉动效后动画确实停了', parseFloat(durations) < 0.01, durations)
   await page.close()
 }
 
