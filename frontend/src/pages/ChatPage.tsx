@@ -186,15 +186,12 @@ function Approvals({ turn }: { turn: ChatTurn }) {
   const reattach = useChat((s) => s.reattach)
   const pending = approvals.filter((a) => a.run_id === turn.run?.id && a.status === 'pending')
 
-  // 审批处理完后运行会继续，重新接上事件流才能看到后续
-  useEffect(() => {
-    if (turn.phase === 'waiting' && !pending.length) void reattach(turn.id)
-  }, [pending.length, turn.phase, turn.id, reattach])
-
   if (!pending.length) return null
   return (
     <div className="mt-2 overflow-hidden rounded border" style={{ borderColor: 'var(--warn)' }}>
-      {pending.map((a) => <ApprovalCard key={a.id} approval={a} />)}
+      {pending.map((a) => (
+        <ApprovalCard key={a.id} approval={a} onResolved={() => reattach(turn.id)} />
+      ))}
     </div>
   )
 }

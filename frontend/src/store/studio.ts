@@ -502,10 +502,17 @@ export const useStudio = create<StudioState>((set, get) => ({
 
   attachRun: async (runId) => {
     get().unsubscribe?.()
+    // 手上已有的事件不要再收一遍。审批恢复会走到这里，而 applyEvent 是无条件
+    // 追加——不传 after 的话后端把整条历史重推一遍，时间线上每条都出现两次。
+    const current = get()
+    const after = current.run?.id === runId
+      ? current.events.reduce((max, e) => Math.max(max, e.seq ?? 0), 0)
+      : 0
     const stop = streamRun(
       runId,
       (event) => get().applyEvent(event),
       () => set({ streaming: false }),
+      after,
     )
     set({ unsubscribe: stop, streaming: true })
   },

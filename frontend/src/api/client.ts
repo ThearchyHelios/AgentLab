@@ -274,17 +274,22 @@ export function streamCopilot(
 /**
  * 订阅一次运行的事件流。
  *
- * 先补历史再接实时由后端保证，这里只负责断线重连 —— 重连时带上已收到的最大
- * seq，所以不会重复也不会丢事件。
+ * 先补历史再接实时由后端保证，这里负责断线重连——重连时带上已收到的最大 seq。
+ *
+ * `after` 必须由调用方给：lastSeq 是这次调用的闭包局部量，跨调用会归零。
+ * 审批恢复时会重新 attachRun，不传 after 就是 after=0，后端按 `seq > after`
+ * 把整条历史再推一遍，而消费方多半是无条件追加——事件就这么重复累积了。
+ * 已经有事件在手的场景（重新接上一条运行）应当传当前最大 seq。
  */
 export function streamRun(
   runId: string,
   onEvent: (event: RunEvent) => void,
   onClose?: () => void,
+  after = 0,
 ): () => void {
   let socket: WebSocket | null = null
   let closed = false
-  let lastSeq = 0
+  let lastSeq = after
   let retry = 0
 
   const connect = () => {
