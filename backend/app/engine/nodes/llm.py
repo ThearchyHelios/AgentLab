@@ -109,12 +109,38 @@ def _usage_of(message: BaseMessage, model_id: str) -> dict[str, Any]:
     }
 
 
-async def _invoke_streaming(model: Any, messages: list[BaseMessage], ctx: NodeContext) -> AIMessage:
+def explain_model_error(exc: Exception, model_id: str) -> str:
+    """把供应商的原始报错翻成能照着做的一句话。
+
+    最典型的是 `401 invalid_model`：网关用"认证失败"的状态码报"模型不存在"，
+    原文长得像 key 过期，实际上 key 好好的、只是这个 model id 在这个端点上
+    不存在（供应商配置里列了几个它根本不提供的模型，就会这样）。照着原文去
+    换 key 是白费功夫，所以这里必须把话说对。
+    """
+    text = str(exc)
+    if "invalid_model" in text or "model does not exist" in text.lower():
+        return (
+            f"模型「{model_id}」在这个供应商上不存在，或者当前 key 没有它的权限。"
+            f"去「设置 → 供应商」把模型列表改成它真正提供的 id，"
+            f"或者在节点上换一个模型。"
+        )
+    if "insufficient" in text.lower() or "quota" in text.lower():
+        return f"模型「{model_id}」的额度用完了：{text[:200]}"
+    return f"调用模型「{model_id}」失败：{type(exc).__name__}: {text[:300]}"
+
+
+async def _invoke_streaming(
+    model: Any, messages: list[BaseMessage], ctx: NodeContext, model_id: str = ""
+) -> AIMessage:
     """流式调用并把 token 实时推给前端。
 
     失败时回退到非流式 —— 有些兼容网关不支持 SSE，不该因此让整个节点挂掉。
+    但回退也失败的话，两次都是同一个原因，不能只把原始异常往上抛：用户看到的
+    会是两段一模一样的供应商报错，而里面既没有模型名也没有下一步该干什么。
     """
-    ctx.emit(EventType.LLM_START, message_count=len(messages))
+    # 模型 id 要跟着 llm.start 走。以前这条事件只有 message_count，于是调用失败时
+    # 整条轨迹里**没有任何地方**记着试的是哪个模型——排查只能靠翻配置猜。
+    ctx.emit(EventType.LLM_START, model=model_id or None, message_count=len(messages))
     chunks: list[Any] = []
     response: AIMessage | None = None
     try:
@@ -130,8 +156,12 @@ async def _invoke_streaming(model: Any, messages: list[BaseMessage], ctx: NodeCo
     except NotImplementedError:
         response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
-        ctx.emit(EventType.LOG, level="warn", message=f"流式失败，回退非流式：{e}")
-        response = await model.ainvoke(messages)
+        ctx.emit(EventType.LOG, level="warn",
+                 message=f"流式失败，回退非流式：{explain_model_error(e, model_id)}")
+        try:
+            response = await model.ainvoke(messages)
+        except Exception as retry_error:  # noqa: BLE001
+            raise NodeError(ctx.node.id, explain_model_error(retry_error, model_id)) from retry_error
 
     if response is None:
         if not chunks:
@@ -174,7 +204,8 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     if schema:
         # 要结构化结果就走原生 structured output，这条路径拿不到 token 流
-        ctx.emit(EventType.LLM_START, structured=True, message_count=len(messages))
+        ctx.emit(EventType.LLM_START, model=model_id, structured=True,
+                 message_count=len(messages))
         try:
             # langchain 靠 "title" 识别裸 JSON Schema dict，缺了会抛 Unsupported function
             if isinstance(schema, dict) and "title" not in schema:
@@ -182,12 +213,15 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             structured = model.with_structured_output(schema)
             value = await structured.ainvoke(messages)
         except Exception as e:  # noqa: BLE001
+            # 模型压根不存在也会走到这里，那不是"结构化输出失败"
+            if "invalid_model" in str(e) or "model does not exist" in str(e).lower():
+                raise NodeError(ctx.node.id, explain_model_error(e, model_id)) from e
             raise NodeError(ctx.node.id, f"结构化输出失败：{type(e).__name__}: {e}") from e
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
         response: BaseMessage = AIMessage(content=output["text"])
     else:
-        response = await _invoke_streaming(model, messages, ctx)
+        response = await _invoke_streaming(model, messages, ctx, model_id)
         text = message_text(response)
         reasoning = thinking_text(response)
         if not text and reasoning:
@@ -272,7 +306,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 之前已经完成的模型调用和工具执行不会重跑，也就不会重复计费。
     @task
     async def llm_step(step: int, payload: list[BaseMessage]) -> BaseMessage:
-        return await _invoke_streaming(model, payload, ctx)
+        return await _invoke_streaming(model, payload, ctx, model_id)
 
     @task
     async def tool_step(step: int, name: str, args: dict[str, Any]) -> str:
