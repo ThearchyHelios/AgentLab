@@ -124,6 +124,12 @@ NODE_REFERENCE = """\
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
 
+模型字段（llm / agent / supervisor 的 config.model）：
+- **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
+- 你不知道这套部署里有哪些 model id——凭供应商名字猜（比如看到 DeepSeek 就写
+  "deepseek-chat"）会得到 401 invalid_model，整个节点跑不起来。
+- 只有用户在需求里明确点名了某个模型，才把他说的那个字符串原样填进去。
+
 模板语法（在任意字符串里用）：
 - {{ input.字段名 }}        入口输入
 - {{ vars.变量名 }}         某节点 assign_to 写入的变量
