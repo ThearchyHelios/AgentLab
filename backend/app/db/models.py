@@ -29,6 +29,36 @@ class Provider(Base, TimestampMixin):
     extra: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
 
+class DataSource(Base, TimestampMixin):
+    """一个数据库接入点。password 落库前经 app.core.crypto 加密，和 Provider 同一套。
+
+    readonly 默认为真，是刻意的安全基线：这里的 SQL 由模型生成，不是人写的。
+    要写库就另建一个显式关掉只读的源，并且写操作会走人工审批——把"能写"这件事
+    变成一个需要两次明确动作的决定，而不是默认状态。
+    """
+
+    __tablename__ = "data_sources"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    kind: Mapped[str] = mapped_column(String(32))  # mysql | postgres | oracle | sqlite
+    host: Mapped[str | None] = mapped_column(String(255), default=None)
+    port: Mapped[int | None] = mapped_column(Integer, default=None)
+    database: Mapped[str | None] = mapped_column(String(255), default=None)
+    username: Mapped[str | None] = mapped_column(String(128), default=None)
+    password: Mapped[str | None] = mapped_column(Text, default=None)  # 密文
+    # 驱动差异塞这里：Oracle 的 service_name/sid、MySQL 的 charset、SSL 参数…
+    # 不给每种数据库加一列，否则表会长成各家方言的并集
+    options: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    readonly: Mapped[bool] = mapped_column(default=True)
+    # 给 Copilot 看的一句话："销售库，含订单/客户/产品"。它据此判断该查哪个源
+    description: Mapped[str] = mapped_column(Text, default="")
+    # 探查到的表结构。缓存下来，否则每次建图都要连一次生产库
+    schema_cache: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    schema_synced_at: Mapped[datetime | None] = mapped_column(default=None)
+    enabled: Mapped[bool] = mapped_column(default=True)
+
+
 class Setting(Base, TimestampMixin):
     """键值形式的用户设置，前端 Settings 页直接读写。"""
 
