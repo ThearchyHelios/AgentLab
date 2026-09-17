@@ -49,6 +49,9 @@ export interface Step {
   nodeId?: string
   /** 工件 id，可下钻到完整证据 */
   artifact?: string
+  /** 工具/查询的返回。和 detail 分开：查询的 detail 是 SQL 原文，
+   *  两者要同时展示（问什么 + 查到什么），合成一个字段就只能二选一 */
+  result?: string
   children?: Step[]
 }
 
@@ -74,11 +77,30 @@ const SILENT = new Set(['usage', 'node.skipped'])
 const num = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? v : undefined
 
+/**
+ * 耗时，没有可显示内容时给 undefined 而不是空串。
+ *
+ * 差别不是洁癖：Step.meta 是可选字段，赋成 `''` 之后"没测到耗时"和
+ * "测到了但不值一提"就分不开了，任何想据此判断的地方都得先猜。
+ */
+const dur = (ms?: number): string | undefined => formatDuration(ms) || undefined
+
 export function formatDuration(ms?: number): string {
   if (ms == null) return ''
+  // 低于 10ms 不显示。一屏全是"0ms"看着像每步都被精确计时了，实际上只是
+  // 这些步骤（输入、成果这类纯赋值节点）根本没花时间——把没有信息量的数字
+  // 摆出来，反而把真正慢的那一步淹没了
+  if (ms < 10) return ''
   if (ms < 1000) return `${Math.round(ms)}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`
+}
+
+/** run 到终态时，所有还挂着"进行中"的生命周期行都要收尾。 */
+function closeLifecycles(out: Step[], status: StepStatus) {
+  out.forEach((s) => {
+    if (s.kind === 'lifecycle' && s.status === 'running') s.status = status
+  })
 }
 
 /** 从 db_query 的结果预览里抠出行数——用户关心的是"查到多少"，不是 JSON。 */
@@ -87,19 +109,95 @@ function rowCountOf(preview: string): number | undefined {
   return m ? Number(m[1]) : undefined
 }
 
-/** 把查询结果预览转成小表格能用的形状；解析不了就算了，原样展示。 */
-export function parseQueryResult(preview: string):
-  { columns: string[]; rows: unknown[][]; truncated: boolean } | null {
+export interface ResultTable {
+  columns: string[]
+  rows: unknown[][]
+  /** 查询本身撞了行数上限——数据库里还有更多，是 guard 没让它全取回来 */
+  truncated: boolean
+  /** 这份预览被按字符数切断了——取回来的行数比这里显示的多，只是没存下来 */
+  clipped?: boolean
+}
+
+/**
+ * 把查询结果预览转成小表格能用的形状；解析不了就算了，原样展示。
+ *
+ * 必须容忍**被截断的 JSON**。后端的预览是按字符数硬切的（成果字段 2000、
+ * 工具结果 4000），切点落在 JSON 中间是常态而不是例外——严格 JSON.parse
+ * 对这类值一律失败，于是最典型的一次取数运行，最终成果会以满屏
+ * `\"attribute01\", \"attribute02\"` 的形式呈现。那不是"降级展示"，那是
+ * 什么都没展示。所以解析失败时回退到"截到最后一条完整记录"再解析。
+ */
+export function parseQueryResult(preview: string): ResultTable | null {
+  const text = preview.trim()
+  if (!text) return null
+
+  // 值常常被 JSON 编码过一层（字符串里套字符串），截断后连外层引号都收不了口
+  const unwrapped = text.startsWith('"') ? unescapeJsonString(text) : text
+  if (!unwrapped.includes('"columns"')) return null
+
+  const direct = tryTable(unwrapped)
+  if (direct) return direct
+
+  const repaired = cutAtLastCompleteRow(unwrapped)
+  if (repaired) {
+    const table = tryTable(repaired)
+    if (table) return { ...table, clipped: true }
+  }
+  return null
+}
+
+function tryTable(text: string): ResultTable | null {
   try {
-    const raw = preview.trim().startsWith('"') ? JSON.parse(preview) : preview
-    const data = typeof raw === 'string' ? JSON.parse(raw) : raw
+    const data = JSON.parse(text)
     if (Array.isArray(data?.columns) && Array.isArray(data?.rows)) {
       return { columns: data.columns, rows: data.rows, truncated: !!data.truncated }
     }
   } catch {
-    /* 不是标准查询结果，当普通文本 */
+    /* 交给调用方决定要不要修 */
   }
   return null
+}
+
+/** 去掉外层 JSON 字符串的引号和转义。截断的串 JSON.parse 不了，只能手工拆。 */
+function unescapeJsonString(text: string): string {
+  const body = text.slice(1)
+  return body.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (_, c: string) => {
+    if (c[0] === 'u') return String.fromCharCode(parseInt(c.slice(1), 16))
+    return { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f' }[c] ?? c
+  })
+}
+
+/**
+ * 把截断的 `{"columns":[...],"rows":[[...],[...],[...`
+ * 砍到最后一条完整记录后补上收尾括号。
+ */
+function cutAtLastCompleteRow(text: string): string | null {
+  const start = text.indexOf('"rows"')
+  if (start < 0) return null
+  const open = text.indexOf('[', start)
+  if (open < 0) return null
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let lastRowEnd = -1
+
+  for (let i = open; i < text.length; i += 1) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\') { escaped = true; continue }
+    if (ch === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (ch === '[' || ch === '{') depth += 1
+    else if (ch === ']' || ch === '}') {
+      depth -= 1
+      // depth 回到 1 表示一条记录刚闭合（0 是 rows 数组本身）
+      if (depth === 1) lastRowEnd = i + 1
+      else if (depth === 0) return text.slice(0, i + 1) + '}'   // rows 其实是完整的
+    }
+  }
+  if (lastRowEnd < 0) return null
+  return text.slice(0, lastRowEnd) + ']}'
 }
 
 function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
@@ -162,11 +260,14 @@ export function decodeRun(events: RunEvent[]): Step[] {
           break
         }
         if (resumed) {
-          // 恢复意味着之前那条"等你确认"已经过去了
-          out.forEach((s) => { if (s.status === 'waiting') s.status = 'done' })
-          nodeSteps.forEach((s) => {
-            s.children?.forEach((c) => { if (c.status === 'waiting') c.status = 'done' })
-          })
+          // 恢复意味着之前那条"等你确认"已经过去了。level 也要一起清：
+          // 留着 warn 的话，那条已经处理完的审批会永远是橙色的，看上去
+          // 像还有什么没解决
+          const settle = (s: Step) => {
+            if (s.status === 'waiting') { s.status = 'done'; s.level = undefined }
+          }
+          out.forEach(settle)
+          nodeSteps.forEach((s) => s.children?.forEach(settle))
         }
         out.push({
           id: `s-${seq}`, seq, kind: 'lifecycle', status: 'running',
@@ -204,7 +305,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         if (step) {
           step.status = 'done'
-          step.meta = formatDuration(num(d.duration_ms))
+          step.meta = dur(num(d.duration_ms))
           step.artifact = d.artifact || step.artifact
           // 空对象/空串不是"详情"，显示出来只是噪音
           const raw = d.preview
@@ -224,7 +325,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
           step.status = 'failed'
           step.level = 'error'
           step.detail = String(d.error ?? '')
-          step.meta = formatDuration(num(d.duration_ms))
+          step.meta = dur(num(d.duration_ms))
         } else {
           push({ id: `e-${seq}`, seq, kind: 'error', level: 'error',
                  title: String(d.error ?? '这一步失败了'), nodeId }, nodeId)
@@ -245,7 +346,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
           step.status = 'done'
           // 不给 token 数和美元——那是账单视角，不是"它干了什么"。
           // 成本在运行详情的用量区单独看。
-          step.meta = formatDuration(num(d.duration_ms))
+          step.meta = dur(num(d.duration_ms))
           push(step, nodeId)
           pendingLlm.delete(nodeId ?? '_')
         }
@@ -291,12 +392,12 @@ export function decodeRun(events: RunEvent[]): Step[] {
             rows != null ? `${rows} 行` : '',
             formatDuration(num(d.duration_ms)),
           ].filter(Boolean)
-          step.meta = parts.join(' · ')
+          step.meta = parts.join(' · ') || undefined
           step.artifact = d.artifact
           if (step.kind === 'query' || step.kind === 'schema' || failed) {
             // 查询保留 SQL 作为 detail，结果另挂；失败时结果就是错误原因
             step.detail = failed ? `${step.detail ?? ''}\n\n${preview}`.trim() : step.detail
-            ;(step as any).result = preview
+            step.result = preview
           } else {
             step.detail = preview.slice(0, 4000)
           }
@@ -321,7 +422,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
         if (step) {
           step.status = d.ok ? 'done' : 'failed'
           if (!d.ok) step.level = 'error'
-          step.meta = formatDuration(num(d.duration_ms))
+          step.meta = dur(num(d.duration_ms))
           const body = [d.stdout, d.stderr].filter(Boolean).join('\n').slice(0, 4000)
           step.detail = body || (d.ok ? '（无输出）' : `退出码 ${d.exit_code}`)
           pendingTools.delete(`sandbox-${nodeId ?? seq}`)
@@ -403,7 +504,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
       case 'agent.step.end':
         push({
           id: `ae-${seq}`, seq, kind: 'note', nodeId, status: 'done',
-          title: `${d.agent} 回复`, meta: formatDuration(num(d.duration_ms)),
+          title: `${d.agent} 回复`, meta: dur(num(d.duration_ms)),
           detail: String(d.preview ?? '').slice(0, 2000),
         }, nodeId)
         break
@@ -426,7 +527,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
         // 更明白，只会让人以为出了两个错
         const dup = out.some((s) => s.status === 'failed' &&
           (s.detail === msg || s.title === msg))
-        out.forEach((s) => { if (s.kind === 'lifecycle' && s.status === 'running') s.status = 'failed' })
+        closeLifecycles(out, 'failed')
         if (!dup) {
           out.push({
             id: `rf-${seq}`, seq, kind: 'error', level: 'error', status: 'failed', title: msg,
@@ -436,16 +537,18 @@ export function decodeRun(events: RunEvent[]): Step[] {
       }
 
       case 'run.cancelled':
+        closeLifecycles(out, 'failed')
         out.push({ id: `rc-${seq}`, seq, kind: 'lifecycle', status: 'failed', title: '已取消' })
         break
 
       case 'run.finished': {
-        // 开头那条"开始执行"要收尾，否则跑完了还挂着一个转圈的图标
-        const opener = out.find((s) => s.kind === 'lifecycle' && s.status === 'running')
-        if (opener) opener.status = 'done'
+        // 开头那条"开始执行"要收尾，否则跑完了还挂着一个转圈的图标。
+        // 注意是全部而不是第一条：审批恢复过的运行有"开始执行"+"继续执行"
+        // 两条，只收第一条会让"继续执行"永远转圈——明明已经完成了。
+        closeLifecycles(out, 'done')
         out.push({
           id: `rd-${seq}`, seq, kind: 'lifecycle', status: 'done',
-          title: '完成', meta: formatDuration(num(d.duration_ms)),
+          title: '完成', meta: dur(num(d.duration_ms)),
         })
         break
       }
