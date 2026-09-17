@@ -187,19 +187,42 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
     return payload
 
 
-def summary(source: Any, *, max_tables: int = 40) -> str:
+def summary(source: Any, *, max_tables: int = 40, detail: bool = True) -> str:
+    """结构摘要。detail=False 只给对象名，不列字段——库多了要靠它压 token。
+
+    实测一个 53 对象的库：带字段 2715 token，只给名字 956 token（35%）。
+    接三五个库的差别就是 15k 和 4.5k，后者才塞得进 system prompt。
+    """
+    if not detail:
+        cache = source.schema_cache or {}
+        names = table_names(source)
+        if not names:
+            return _empty_summary(source, cache)
+        head = (
+            f"- {source.name}（{source.kind}，{'只读' if source.readonly else '可写'}）："
+            f"{source.description or '未填说明'}"
+        )
+        return head + "\n    对象：" + "、".join(names)
+    return _detailed_summary(source, max_tables=max_tables)
+
+
+def _empty_summary(source: Any, cache: dict[str, Any]) -> str:
+    hint = ""
+    candidates = cache.get("available_schemas") or []
+    if candidates:
+        hint = f"｜该账号名下没有对象，数据可能在这些 schema：{'、'.join(candidates[:8])}"
+    return (
+        f"- {source.name}（{source.kind}）：{source.description or '未填说明'}"
+        f"｜尚未探查结构{hint}"
+    )
+
+
+def _detailed_summary(source: Any, *, max_tables: int = 40) -> str:
     """给 Copilot 的紧凑摘要。没探查过就明说，别让它对着空气编表名。"""
     cache = source.schema_cache or {}
     tables = cache.get("tables") or {}
     if not tables:
-        hint = ""
-        candidates = cache.get("available_schemas") or []
-        if candidates:
-            hint = f"｜该账号名下没有对象，数据可能在这些 schema：{'、'.join(candidates[:8])}"
-        return (
-            f"- {source.name}（{source.kind}）：{source.description or '未填说明'}"
-            f"｜尚未探查结构{hint}"
-        )
+        return _empty_summary(source, cache)
 
     schema = cache.get("schema")
     lines = [

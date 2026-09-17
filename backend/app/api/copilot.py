@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session
@@ -17,6 +18,92 @@ from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_mod
 from app.tools.registry import all_specs
 
 router = APIRouter(prefix="/api/copilot", tags=["copilot"])
+
+
+async def _tool_catalog(session: AsyncSession) -> str:
+    """给 Copilot 看的工具清单。
+
+    all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
+    （db_query__<源>），不补进来 Copilot 就不知道它们存在，只会退回让用户
+    自己写 SQL 的代码节点——接了数据库等于白接。
+    """
+    lines = [
+        f"- {name}（{spec.category}）：{spec.description}"
+        for name, spec in sorted(all_specs().items())
+    ]
+
+    from app.data import introspect as _introspect
+    from app.db.models import DataSource
+    from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
+
+    rows = list((
+        await session.execute(
+            select(DataSource).where(DataSource.enabled.is_(True)).order_by(DataSource.name)
+        )
+    ).scalars())
+    for row in rows:
+        tables = _introspect.table_names(row)
+        listed = "、".join(tables[:12]) + (f" 等 {len(tables)} 个对象" if len(tables) > 12 else "")
+        lines.append(
+            f"- {QUERY_PREFIX}{row.name}（数据库）：在「{row.name}」上执行 SQL。"
+            f"{row.description or ''}"
+            + (f" 可查：{listed}" if tables else " ⚠ 结构未探查")
+        )
+        lines.append(
+            f"- {SCHEMA_PREFIX}{row.name}（数据库）：查看「{row.name}」的表结构"
+        )
+    return "\n".join(lines)
+
+
+# 数据源摘要的字符预算。超了就退成"只列对象名"，字段让 Copilot 用
+# db_schema 工具按需查。实测一个 53 对象的库带字段约 4000 字符，
+# 接三五个库就会把真正的需求淹掉——system prompt 里塞满 schema 而挤掉
+# 用户想要什么，是本末倒置。
+_DATASOURCE_BUDGET_CHARS = 6000
+# detail 模式下每个库最多列这么多对象（与 introspect.summary 的默认值一致）。
+# 超过就说明会截断，那还不如切紧凑模式把对象名列全。
+_DETAIL_TABLE_LIMIT = 40
+
+
+async def _datasource_section(session: AsyncSession) -> str:
+    """数据源与结构摘要。没有数据源时返回空串，不占 prompt。"""
+    from app.data import introspect as _introspect
+    from app.db.models import DataSource
+
+    rows = list((
+        await session.execute(
+            select(DataSource).where(DataSource.enabled.is_(True)).order_by(DataSource.name)
+        )
+    ).scalars())
+    if not rows:
+        return ""
+
+    # detail 模式每个库最多列 40 个对象，多出来的直接看不见。对象一多，
+    # "40 张表带字段"反而不如"全部表只给名字"——Copilot 找不到那张表，
+    # 字段写得再全也没用。所以超出截断阈值就整体切到紧凑模式。
+    detail = all(len(_introspect.table_names(row)) <= _DETAIL_TABLE_LIMIT for row in rows)
+    blocks = [_introspect.summary(row, detail=detail) for row in rows]
+    if detail and sum(len(b) for b in blocks) > _DATASOURCE_BUDGET_CHARS:
+        detail = False
+        blocks = [_introspect.summary(row, detail=False) for row in rows]
+    if not detail:
+        # Copilot 仍然知道有哪些对象可查，要字段时在图里放一个 db_schema 节点，
+        # 或者交给运行期的 agent 自己探
+        blocks.append(
+            "  （对象较多，上面只列了名字。写 SQL 前用 db_schema 工具确认字段，别猜）"
+        )
+    return (
+        "\n\n已接入的数据源（涉及取数时优先用它们，而不是让用户自己写 SQL 的代码节点）：\n"
+        + "\n".join(blocks)
+        + "\n\n写 SQL 的硬性要求：\n"
+        # 这三条都是真实踩过的：Oracle 上漏 schema 前缀直接 ORA-00942，
+        # 写惯 MySQL 的模型会顺手写 LIMIT，而一条没有行数限制的查询能拖垮生产库
+        "- 表名照抄上面的全名（含 schema 前缀），漏掉前缀在 Oracle 上会直接报 ORA-00942\n"
+        "- 认准方言：Oracle 用 FETCH FIRST n ROWS ONLY，不是 LIMIT\n"
+        "- 一次只写一条语句；分号拼接会被拒\n"
+        "- 字段拿不准就在图里先放一个 db_schema 工具节点，别猜字段名\n"
+        "- 取数结果要进口径卡（metrics 节点）才能被叙述引用，别让 llm 节点直接对数字做算术\n"
+    )
 
 
 NODE_REFERENCE = """\
@@ -180,9 +267,15 @@ GRAPH_SCHEMA: dict[str, Any] = {
                     "id": {"type": "string"},
                     "type": {"type": "string", "enum": [t.value for t in NodeType]},
                     "label": {"type": "string"},
-                    "config": {"type": "object"},
+                    # additionalProperties 必须显式写 true：config 的键随节点类型
+                    # 千变万化（tool 有 tool/args，code 有 language/code…），没法
+                    # 提前枚举成 properties。而不少 provider 的结构化输出实现在
+                    # 遇到没有 properties 的 object 时按"不允许额外字段"处理，
+                    # 于是模型填好的 config 被整个过滤成 {}——生成的图每个节点都
+                    # 是空壳，校验直接挂在"工具节点还没选工具"。
+                    "config": {"type": "object", "additionalProperties": True},
                 },
-                "required": ["id", "type"],
+                "required": ["id", "type", "config"],
             },
         },
         "edges": {
@@ -211,14 +304,12 @@ async def generate(
     产物会经过和手工编排完全相同的校验与排版，所以生成完就是可运行、可读的，
     而不是一段还要人去修的 JSON。
     """
-    tool_list = "\n".join(
-        f"- {name}（{spec.category}）：{spec.description}"
-        for name, spec in sorted(all_specs().items())
-    )
+    tool_list = await _tool_catalog(session)
+    datasources = await _datasource_section(session)
 
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求产出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
         "要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
         "2. 节点 id 用简短英文小写下划线，例如 fetch_data、summarize\n"
@@ -460,13 +551,11 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     """
     from fastapi.responses import StreamingResponse
 
-    tool_list = "\n".join(
-        f"- {name}（{spec.category}）：{spec.description}"
-        for name, spec in sorted(all_specs().items())
-    )
+    tool_list = await _tool_catalog(session)
+    datasources = await _datasource_section(session)
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
         "结构要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
         "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
