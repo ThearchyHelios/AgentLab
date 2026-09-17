@@ -239,6 +239,16 @@ export function summarizeRun(
   return pick(output) || pick(input)
 }
 
+/**
+ * agent 步骤的配对键。
+ *
+ * 光用 agent 名不够：supervisor 会在多轮里反复派给同一个 agent，第二轮的
+ * end 会错配到第一轮的 start 上。round 才是区分轮次的那一维。
+ */
+function agentKey(nodeId: string | undefined, d: any): string {
+  return [nodeId ?? '_', String(d?.agent ?? ''), String(d?.round ?? '')].join('|')
+}
+
 function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
   const base = { id: `tool-${seq}`, seq, status: 'running' as StepStatus }
   // 数据库工具单独认：它是这个产品最主要的取数方式，"调用 db_query__warehouse"
@@ -272,6 +282,8 @@ export function decodeRun(events: RunEvent[]): Step[] {
   const pendingTools = new Map<string, Step>()
   /** node_id → 待配对的模型调用 Step */
   const pendingLlm = new Map<string, Step>()
+  /** supervisor 里待配对的单个 agent 步骤 */
+  const pendingAgents = new Map<string, Step>()
   /**
    * node_id → 这个节点当前那条尚未闭合的审批步骤。
    *
@@ -565,24 +577,61 @@ export function decodeRun(events: RunEvent[]): Step[] {
         })
         break
 
-      case 'agent.step.start':
-        push({
+      case 'agent.step.start': {
+        // 和 tool.start/tool.end 一样是一件事的两个时刻。拆成两行的话，
+        // "派给 researcher 什么任务"和"它回了什么"会变成两条互不相干的记录，
+        // 而且 start 那条永远停在转圈——多 agent 节点跑完了它还在转。
+        const step: Step = {
           id: `as-${seq}`, seq, kind: 'note', nodeId, status: 'running',
           title: `${d.agent}：${String(d.instruction ?? '').slice(0, 80)}`,
-        }, nodeId)
+        }
+        pendingAgents.set(agentKey(nodeId, d), step)
+        push(step, nodeId)
         break
+      }
 
-      case 'agent.step.end':
-        push({
-          id: `ae-${seq}`, seq, kind: 'note', nodeId, status: 'done',
-          title: `${d.agent} 回复`, meta: dur(num(d.duration_ms)),
-          detail: String(d.preview ?? '').slice(0, 2000),
-        }, nodeId)
+      case 'agent.step.end': {
+        const key = agentKey(nodeId, d)
+        const step = pendingAgents.get(key)
+        const preview = String(d.preview ?? '').slice(0, 2000)
+        if (step) {
+          step.status = 'done'
+          step.meta = dur(num(d.duration_ms))
+          step.result = preview || undefined
+          pendingAgents.delete(key)
+        } else {
+          push({
+            id: `ae-${seq}`, seq, kind: 'note', nodeId, status: 'done',
+            title: `${d.agent} 回复`, meta: dur(num(d.duration_ms)),
+            detail: preview,
+          }, nodeId)
+        }
         break
+      }
 
       case 'log': {
         const level = String(d.level ?? 'info')
-        // info 级日志是给排查用的，不进主流程——但 warn/error 用户必须看到
+        // supervisor 的调度决策后端标成了 info，但它不是排查用的日志——
+        // "为什么派给 researcher"、"为什么只跑一轮就 FINISH"，不显示的话
+        // 多 agent 节点在界面上就是一个跑了 31 秒的黑盒。带 round 字段的
+        // 就是它，和普通 info 日志区分得开
+        if (level === 'info' && d.round != null) {
+          const text = String(d.message ?? '')
+          const m = text.match(/^调度\s*→\s*([^（(]+)[（(](.*)[）)]\s*$/)
+          // FINISH 是协议里的收尾标记，不是某个 agent。"交给 FINISH"
+          // 会让人以为还有个叫 FINISH 的成员
+          const target = m?.[1].trim() ?? ''
+          const round = Number(d.round) + 1
+          push({
+            id: `sv-${seq}`, seq, kind: 'branch', nodeId, status: 'done',
+            title: !m ? text
+              : target === 'FINISH' ? `第 ${round} 轮：结束协作`
+              : `第 ${round} 轮：交给 ${target}`,
+            detail: m ? m[2].trim() : undefined,
+          }, nodeId)
+          break
+        }
+        // 其余 info 是给排查用的，不进主流程——但 warn/error 用户必须看到
         if (level === 'info') break
         push({
           id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done',

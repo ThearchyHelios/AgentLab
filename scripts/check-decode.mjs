@@ -118,6 +118,38 @@ console.log('\n=== 循环里的多轮审批 ===')
   check('跑完了没有还在转的行', !all.some((s) => s.status === 'running'))
 }
 
+console.log('\n=== 多 agent 协作 ===')
+{
+  // 真实运行 #6038f5：supervisor 派给 researcher 一次就 FINISH 了。
+  // 界面上那个多智能体节点跑完 31.7s 之后，researcher 那行还在转圈。
+  const steps = mod.decodeRun(fixtures.supervisor)
+  const all = flatten(steps)
+
+  const agentRows = all.filter((s) => s.title.startsWith('researcher'))
+  check('一个 agent 步骤就是一行，不是"派任务"+"回复"两行',
+    agentRows.length === 1, `${agentRows.length} 行：${agentRows.map((s) => s.title.slice(0, 20)).join(' | ')}`)
+  check('回复挂在同一行里可展开', !!agentRows[0]?.result)
+  check('跑完了就不转圈了', agentRows[0]?.status === 'done', agentRows[0]?.status)
+
+  // supervisor 的调度理由被后端标成了 info 日志，整类丢掉的话，
+  // 多 agent 节点在界面上就是一个跑了 31 秒的黑盒
+  const routes = all.filter((s) => s.kind === 'branch')
+  check('调度决策要说出来', routes.length === 2, `${routes.length} 条`)
+  check('说清楚第几轮交给谁',
+    routes[0]?.title.includes('第 1 轮') && routes[0]?.title.includes('researcher'),
+    routes[0]?.title)
+  // FINISH 是协议里的收尾标记，不是某个 agent
+  check('为什么结束也要有交代，且不说"交给 FINISH"',
+    routes[1]?.title.includes('结束协作') && !routes[1]?.title.includes('FINISH')
+    && !!routes[1]?.detail,
+    `${routes[1]?.title} / ${routes[1]?.detail?.slice(0, 24)}`)
+  check('普通 info 日志仍然不进主流程',
+    !all.some((s) => s.title.includes('校验通过')))
+  check('warn 日志照常显示', all.some((s) => s.title.includes('校验失败')))
+  check('整条流跑完没有转圈的行', !all.some((s) => s.status === 'running'),
+    all.filter((s) => s.status === 'running').map((s) => s.title.slice(0, 24)).join(','))
+}
+
 console.log('\n=== 出具判定 ===')
 {
   const steps = mod.decodeRun(fixtures.issue)
