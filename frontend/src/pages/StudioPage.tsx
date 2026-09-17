@@ -6,12 +6,13 @@ import {
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { FlowCanvas } from '../canvas/FlowCanvas'
-import { Inspector } from '../canvas/Inspector'
 import { Palette } from '../canvas/Palette'
+import { InspectorSheet } from '../canvas/InspectorSheet'
 import { AssistantPanel } from '../run/AssistantPanel'
+import { RunControl } from '../run/RunControl'
 import { useStudio, toGraph } from '../store/studio'
 import { useCatalog } from '../store/catalog'
-import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
+import { Empty, Modal, Spinner, useToast } from '../components/ui'
 import type { Workflow } from '../types'
 
 export function StudioPage() {
@@ -20,11 +21,9 @@ export function StudioPage() {
   const workflow = useStudio((s) => s.workflow)
   const dirty = useStudio((s) => s.dirty)
   const issues = useStudio((s) => s.issues)
-  const selectedId = useStudio((s) => s.selectedId)
   const streaming = useStudio((s) => s.streaming)
-  const { load, save, setGraph } = useStudio()
+  const { load, save, setGraph, select } = useStudio()
 
-  const [tab, setTab] = useState<'inspect' | 'run'>('run')
   const [picker, setPicker] = useState(false)
   const [saving, setSaving] = useState(false)
   const [publishing, setPublishing] = useState(false)
@@ -35,14 +34,11 @@ export function StudioPage() {
     if (!workflow && workflows.length) load(workflows[0])
   }, [workflows, workflow, load])
 
-  // 选中节点时自动切到属性页，省一次点击
+  // 开始跑图或生成时，属性面板让开——不然进展发生在一块被盖住的地方。
+  // （选中节点即滑出属性面板，取消选中即收起，不再需要手动切 tab）
   useEffect(() => {
-    if (selectedId) setTab('inspect')
-  }, [selectedId])
-  // 开始跑图或开始生成时切回助手栏，否则进展发生在一个看不见的 tab 里
-  useEffect(() => {
-    if (streaming || copilotActive) setTab('run')
-  }, [streaming, copilotActive])
+    if (streaming || copilotActive) select(null)
+  }, [streaming, copilotActive, select])
 
   const doSave = useCallback(async () => {
     if (!workflow) return
@@ -137,14 +133,13 @@ export function StudioPage() {
 
         <div className="flex-1" />
 
-        {/* Copilot 不再是弹窗：它就在右栏里，这个按钮只负责把人送过去。
-            弹窗的问题是每改一次图都要重开一次，而且关掉之后需求文本就没了 */}
+        {/* Copilot 不再是弹窗：它就在右栏里，这个按钮只负责把焦点送过去。
+            弹窗的问题是每改一次图都要重开一次，关掉之后需求文本就没了 */}
         <button
           className="btn"
           title="用自然语言生成或修改工作流"
           onClick={() => {
-            setTab('run')
-            // 等这一帧渲染完输入框才在 DOM 里
+            select(null)   // 属性面板盖着的话先让开
             requestAnimationFrame(() =>
               window.dispatchEvent(new Event('agentlab:focus-copilot')))
           }}
@@ -156,9 +151,12 @@ export function StudioPage() {
                 title={dirty ? '先保存再发布' : '把当前版本立为正式版本，正式运行只认它'}>
           <ShieldCheck size={12} /> 发布
         </button>
-        <button className="btn btn-primary" onClick={doSave} disabled={saving || !dirty}>
+        <button className="btn" onClick={doSave} disabled={saving || !dirty}>
           {saving ? <Spinner /> : <Save size={12} />} 保存
         </button>
+        {/* 运行是对整张图的动作，和保存、发布同类，属于工具栏。放在助手栏里
+            会和 Copilot 输入框两个"主要动作"互相压着 */}
+        <RunControl />
       </div>
 
       {/* 三栏 */}
@@ -169,21 +167,12 @@ export function StudioPage() {
         <main className="relative min-w-0 flex-1">
           <FlowCanvas />
         </main>
-        <aside className="flex w-[360px] shrink-0 flex-col border-l bg-panel">
-          <Tabs
-            tabs={[{ key: 'run', label: '助手' }, { key: 'inspect', label: '属性' }]}
-            active={tab}
-            onChange={(k) => setTab(k as any)}
-          />
-          {/* 两个都挂着、用 hidden 切换，而不是三元卸载其中一个。
-              助手栏里有输入框草稿、展开状态、滚动位置——点一下"属性"看个
-              节点再切回来全没了，等于逼人别用属性页 */}
-          <div className={clsx('min-h-0 flex-1', tab !== 'run' && 'hidden')}>
-            <AssistantPanel />
-          </div>
-          <div className={clsx('min-h-0 flex-1 overflow-y-auto', tab !== 'inspect' && 'hidden')}>
-            <Inspector />
-          </div>
+        {/* 助手常驻，属性是盖在它上面的一层。做成两个 tab 的话它们就互斥了，
+            而这两件事在时间上并不互斥——跑图跑到一半点开节点看配置，整条
+            执行过程会从眼前消失，切回来滚动位置和输入草稿也没了 */}
+        <aside className="relative flex w-[360px] shrink-0 flex-col border-l bg-panel">
+          <AssistantPanel />
+          <InspectorSheet />
         </aside>
       </div>
 
