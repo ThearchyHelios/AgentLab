@@ -114,7 +114,9 @@ async def list_kinds() -> dict[str, Any]:
             {"value": "oracle", "label": "Oracle", "default_port": 1521,
              "needs": ["host", "username", "password"],
              "hint": "库名填 service_name，或在 options 里给 service_name / sid。"
-                     "驱动走 thin 模式，不需要装 Instant Client"},
+                     "驱动走 thin 模式，不需要装 Instant Client。"
+                     "只读账号名下通常没有对象——数据在别的 schema 里，"
+                     "用 options.schema 指定（如 ANALYTICS），否则探查结果是空的"},
             {"value": "sqlite", "label": "SQLite（文件）", "default_port": None,
              "needs": ["database"], "hint": "库名填数据库文件的绝对路径"},
         ],

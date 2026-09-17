@@ -75,10 +75,18 @@ async def test_summary_says_so_when_never_introspected(source):
     assert "尚未探查" in summary(source)
 
 
+async def test_describe_table_accepts_qualified_name(source):
+    """模型可能传 SCHEMA.TABLE 全名，也可能只传表名，两种都要认。"""
+    source.schema_cache = await introspect(source)
+    assert "amount" in describe_table(source, "orders")
+    assert "amount" in describe_table(source, "main.orders")
+    assert "amount" in describe_table(source, "ORDERS")   # Oracle 惯用大写
+
+
 async def test_describe_table_lists_unknown_table_options(source):
     source.schema_cache = await introspect(source)
     out = describe_table(source, "没有这张表")
-    assert "现有的表" in out and "orders" in out
+    assert "现有的对象" in out and "orders" in out
 
 
 async def test_query_returns_rows(source):
