@@ -172,7 +172,18 @@ function RunLauncher() {
 
 // -------------------------------------------------------------------------
 
-export function ApprovalCard({ approval }: { approval: any }) {
+/**
+ * 人工介入卡片。
+ *
+ * onResolved 是给非画布场景用的：这个组件被对话页和运行页复用，而默认的
+ * "恢复后重新接上事件流"走的是 studio store——在对话页里用就会同时开两条
+ * 订阅（一条 chat 的、一条 studio 的），两边各收一份事件。谁用谁负责重新
+ * 接流，是唯一不会打架的分工。
+ */
+export function ApprovalCard({ approval, onResolved }: {
+  approval: any
+  onResolved?: (runId: string) => void | Promise<void>
+}) {
   const toast = useToast()
   const refreshApprovals = useCatalog((s) => s.refreshApprovals)
   const attachRun = useStudio((s) => s.attachRun)
@@ -192,7 +203,9 @@ export function ApprovalCard({ approval }: { approval: any }) {
         ...(approval.mode !== 'approve' ? { value } : {}),
       })
       await refreshApprovals()
-      await attachRun(approval.run_id) // 恢复后重新接上事件流
+      // 恢复后重新接上事件流：调用方给了 onResolved 就听它的
+      if (onResolved) await onResolved(approval.run_id)
+      else await attachRun(approval.run_id)
       // 驳回在"补充输入/编辑草稿"模式下会终止整个运行（图上没有 rejected 那条
       // 出口边），说清楚比笼统一句"已驳回"诚实
       toast(

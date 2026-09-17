@@ -41,6 +41,11 @@ export interface ChatTurn {
   output: Record<string, any> | null
   error: string
   startedAt: number
+  /** 已收到的最大事件 seq。重新接流时要带上，否则后端把历史整条重推 */
+  lastSeq: number
+  /** 这一轮自己的取消句柄。放 turn 上而不是 store 上：store 单值会被
+   *  下一轮 ask 覆盖，上一轮的 WebSocket 就再也关不掉了 */
+  cancel: (() => void) | null
 }
 
 interface ChatState {
@@ -88,6 +93,7 @@ export const useChat = create<ChatState>((set, get) => ({
           id, question, phase: 'planning', status: PHASE_TEXT.planning,
           thinking: '', graph: null, explanation: '', run: null,
           steps: [], output: null, error: '', startedAt: Date.now(),
+          lastSeq: 0, cancel: null,
         },
       ],
     }))
@@ -148,22 +154,31 @@ export const useChat = create<ChatState>((set, get) => ({
         set({ busy: false, cancel: null })
       },
     )
+    patch(() => ({ cancel: cancelCopilot }))
     set({ cancel: cancelCopilot })
   },
 
   stop: () => {
+    // 只停最后一轮。把所有非终态 turn 一律标成"已取消"会误杀正等人工介入的
+    // 历史轮次——那些是等着用户回来处理的，不是卡住的。
+    const turns = get().turns
+    const last = turns[turns.length - 1]
+    last?.cancel?.()
     get().cancel?.()
     set((s) => ({
       busy: false,
       cancel: null,
       turns: s.turns.map((t) =>
-        t.phase === 'done' || t.phase === 'error' ? t : { ...t, phase: 'error', error: '已取消' },
+        t.id === last?.id && !['done', 'error', 'waiting'].includes(t.phase)
+          ? { ...t, phase: 'error', error: '已取消', cancel: null }
+          : t,
       ),
     }))
   },
 
   clear: () => {
     get().cancel?.()
+    get().turns.forEach((t) => t.cancel?.())   // 每轮各有各的订阅，逐个关
     set({ turns: [], busy: false, cancel: null })
   },
 
@@ -174,7 +189,7 @@ export const useChat = create<ChatState>((set, get) => ({
       set((s) => ({ turns: s.turns.map((t) => (t.id === turnId ? { ...t, ...fn(t) } : t)) }))
     patch(() => ({ phase: 'running', status: PHASE_TEXT.running }))
     set({ busy: true })
-    watch(turn.run.id, turnId, patch, set)
+    watch(turn.run.id, turnId, patch, set, turn.lastSeq)
   },
 }))
 
@@ -202,9 +217,12 @@ function watch(
   turnId: string,
   patch: (fn: (t: ChatTurn) => Partial<ChatTurn>) => void,
   set: any,
+  after = 0,
 ) {
   const stop = streamRun(runId, (event: RunEvent) => {
     const d: any = event.data ?? {}
+    // 记下进度：审批恢复要重新接流，带上它才不会把历史再收一遍
+    patch((t) => ({ lastSeq: Math.max(t.lastSeq ?? 0, event.seq ?? 0) }))
     switch (event.type) {
       case 'tool.start': {
         const tool = String(d.tool ?? '')
@@ -261,7 +279,10 @@ function watch(
         void finish(runId, turnId, patch, set)
         break
     }
-  })
+  }, undefined, after)
+  // 句柄同时挂在 turn 和 store 上：turn 上的用于精确关闭这一轮，
+  // store 上的是"当前活跃流"的快捷方式
+  patch(() => ({ cancel: stop }))
   set({ cancel: stop })
 }
 
