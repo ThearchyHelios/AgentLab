@@ -39,23 +39,71 @@ _SYSTEM_SCHEMAS = frozenset({
 })
 
 
+# 统计每个 schema 下有多少对象。两条路径覆盖全部支持的库：
+# information_schema 是 SQL 标准（MySQL / PostgreSQL / SQL Server 都有），
+# Oracle 不遵循这条标准，用它自己的 all_tables / all_views 数据字典。
+#
+# 不用"逐个 schema 调 get_table_names"的通用写法：这个库有 94 个 schema，
+# 那样是 94 次往返，几十秒起步。
+_SCHEMA_STATS_SQL = {
+    "oracle": """
+        SELECT owner AS s, COUNT(*) AS n FROM (
+            SELECT owner FROM all_tables
+            UNION ALL SELECT owner FROM all_views
+        ) GROUP BY owner ORDER BY COUNT(*) DESC
+    """,
+    "_standard": """
+        SELECT table_schema AS s, COUNT(*) AS n
+        FROM information_schema.tables
+        GROUP BY table_schema ORDER BY COUNT(*) DESC
+    """,
+}
+
+
+async def schema_stats(source: Any) -> list[tuple[str, int]]:
+    """每个 schema 有多少表/视图，多的在前。拿不到就返回空表让调用方降级。"""
+    from sqlalchemy import text as _text
+
+    kind = (source.kind or "").lower()
+    if kind == "sqlite":
+        return []  # SQLite 只有 main，没有可选项
+    sql = _SCHEMA_STATS_SQL.get(kind, _SCHEMA_STATS_SQL["_standard"])
+    engine = await engines.get(source)
+    try:
+        async with engine.connect() as conn:
+            rows = (await conn.execute(_text(sql))).fetchall()
+        return [(str(r[0]), int(r[1])) for r in rows if r[0]]
+    except Exception:  # noqa: BLE001 - 方言不认就算了，降级到纯名字列表
+        return []
+
+
 async def list_schemas(source: Any) -> list[str]:
-    """列出可访问的非系统 schema。
+    """列出**可能装着业务数据**的 schema，最有可能的排在最前。
 
     企业环境里只读账号名下往往一张表都没有——数据在别的 schema，靠跨库授权或
-    synonym 访问。直接返回"0 张表"等于把人晾在那儿，得告诉他数据可能在哪。
+    synonym 访问。直接返回"0 张表"等于把人晾在那儿。
+
+    但光列出名字也不够用：实测一个 Oracle 实例有 94 个用户，靠黑名单过滤完
+    还剩 75 个（anonymous、C##OGGADMIN、xs$null…），人在里面找不到那两个
+    业务 schema。所以主要依据不是"猜哪些是系统的"，而是"哪些里面真有东西"——
+    黑名单只用来排掉已知的系统 schema（它们对象数往往还很多，光靠排序压不下去）。
     """
     engine = await engines.get(source)
 
-    def _collect(sync_conn: Any) -> list[str]:
+    def _names(sync_conn: Any) -> list[str]:
         try:
-            names = sa_inspect(sync_conn).get_schema_names()
+            return list(sa_inspect(sync_conn).get_schema_names())
         except Exception:  # noqa: BLE001 - 有些方言不支持
             return []
-        return [n for n in names if n.lower() not in _SYSTEM_SCHEMAS]
+
+    stats = await schema_stats(source)
+    if stats:
+        # 有统计就只留真有对象的，并按对象数降序——业务库自然浮到前面
+        return [s for s, n in stats if n > 0 and s.lower() not in _SYSTEM_SCHEMAS]
 
     async with engine.connect() as conn:
-        return await conn.run_sync(_collect)
+        names = await conn.run_sync(_names)
+    return [n for n in names if n.lower() not in _SYSTEM_SCHEMAS]
 
 
 def _target_schema(source: Any, explicit: str | None) -> str | None:
@@ -116,8 +164,18 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
             }
         return {"tables": tables, "truncated": truncated, "total": len(names) + len(views)}
 
-    async with engine.connect() as conn:
-        payload = await conn.run_sync(_collect)
+    try:
+        async with engine.connect() as conn:
+            payload = await conn.run_sync(_collect)
+    except Exception as exc:  # noqa: BLE001
+        # schema 名填错是高频事故（大小写、拼写、或者根本不知道该填什么），
+        # 直接把驱动异常抛出去等于让人自己去猜。先看看连接本身好不好：
+        # 能列出候选说明只是 schema 不对，这种情况给出可选项比报错有用得多。
+        candidates = await list_schemas(source)
+        if not candidates:
+            raise
+        payload = {"tables": {}, "truncated": False, "total": 0,
+                   "error": f"{type(exc).__name__}: {exc}"}
 
     payload["synced_at"] = datetime.now(timezone.utc).isoformat()
     payload["schema"] = target
@@ -125,7 +183,7 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
     # 一张表都没探到时，别只回一个空壳——多半是数据在别的 schema 里，
     # 把候选列出来，用户才知道下一步该填什么
     if not payload["tables"]:
-        payload["available_schemas"] = await list_schemas(source)
+        payload.setdefault("available_schemas", await list_schemas(source))
     return payload
 
 
