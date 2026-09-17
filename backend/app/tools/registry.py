@@ -109,10 +109,18 @@ def build_tool(spec: ToolSpec, ctx: ToolContext) -> BaseTool:
 async def build_tools(
     names: list[str], ctx: ToolContext, *, session: Any = None
 ) -> list[BaseTool]:
-    """按名字列表组装工具。支持三种来源：内置、MCP（mcp:<server>/<tool>）、自定义。"""
+    """按名字列表组装工具。
+
+    四种来源：内置（静态注册）、MCP（mcp:<server>/<tool>）、数据源
+    （db_query__<源名> / db_schema__<源名>）、自定义（数据库里的 CustomTool）。
+    后两种都是运行时从库里读出来动态构造的，不在静态注册表里。
+    """
+    from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
+
     specs = all_specs()
     tools: list[BaseTool] = []
     mcp_names: list[str] = []
+    datasource_names: list[str] = []
     custom_names: list[str] = []
 
     for name in names:
@@ -120,8 +128,15 @@ async def build_tools(
             mcp_names.append(name)
         elif name in specs:
             tools.append(build_tool(specs[name], ctx))
+        elif name.startswith((QUERY_PREFIX, SCHEMA_PREFIX)):
+            datasource_names.append(name)
         else:
             custom_names.append(name)
+
+    if datasource_names and session is not None:
+        from app.tools.datasource import build_datasource_tools
+
+        tools.extend(await build_datasource_tools(datasource_names, ctx, session))
 
     if mcp_names:
         from app.tools.mcp_manager import mcp_manager
