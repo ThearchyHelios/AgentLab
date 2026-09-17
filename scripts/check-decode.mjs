@@ -37,8 +37,34 @@ console.log('=== 数据库查询 ===')
   check('查询步骤说人话，不是 db_query__warehouse(...)',
     !!q && q.title.includes('查询数据') && !q.title.includes('db_query__'), q?.title)
   check('SQL 原文留在详情里可展开', !!q?.detail?.includes('SELECT'))
+  check('查询结果和 SQL 分开存，不互相覆盖', !!q?.result && q.result !== q.detail)
   check('工具调用挂在节点下，不是平铺',
     steps.some((s) => s.kind === 'node' && s.children?.some((c) => c.kind === 'query')))
+}
+
+console.log('\n=== 被截断的结果集 ===')
+{
+  // 后端按字符数硬切预览，切点落在 JSON 中间是常态。严格 JSON.parse 一律失败，
+  // 于是最典型的一次取数运行，成果会变成满屏 \"attribute01\"。这几条守的就是它。
+  const fin = fixtures.db.find((e) => e.type === 'run.finished')
+  const raw = Object.values(fin.data.output).find((v) => typeof v === 'string')
+  check('样本确实是坏 JSON（不然这组断言等于没测）', (() => {
+    try { JSON.parse(raw); return false } catch { return true }
+  })(), `${raw.length} 字`)
+
+  const t = mod.parseQueryResult(raw)
+  check('截断的结果集仍能解析出表格', !!t)
+  check('列名完整', Array.isArray(t?.columns) && t.columns.length > 10, `${t?.columns?.length} 列`)
+  check('至少救回一条完整记录', (t?.rows?.length ?? 0) >= 1, `${t?.rows?.length} 行`)
+  check('每行长度和列数对得上', t?.rows?.every((r) => r.length === t.columns.length))
+  check('标出这是被切断的预览，而不是查询上限', t?.clipped === true && !t?.truncated)
+
+  // 完整的结果集不该被误判成截断
+  const whole = JSON.stringify({ columns: ['a', 'b'], rows: [[1, 2], [3, 4]] })
+  const w = mod.parseQueryResult(whole)
+  check('完整结果集不标截断', w?.rows.length === 2 && !w.clipped)
+  check('普通文本不会被硬认成表格', mod.parseQueryResult('查到 3 条记录') === null)
+  check('空串不报错', mod.parseQueryResult('') === null)
 }
 
 console.log('\n=== 人工审批（含重放）===')
@@ -57,6 +83,13 @@ console.log('\n=== 人工审批（含重放）===')
   check('节点不因重放而重复', new Set(nodeIds).size === nodeIds.length,
     nodeIds.join(','))
   check('审批结果有交代', all.some((s) => s.title.includes('放行') || s.title.includes('驳回')))
+  // 恢复过的运行有"开始执行"+"继续执行"两条生命周期。只收第一条的话，
+  // "继续执行"会永远转圈——明明整条已经跑完了
+  check('恢复过的运行不会留下转圈的行',
+    !all.some((s) => s.status === 'running'),
+    all.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+  check('处理完的审批不再是待办色',
+    !all.some((s) => s.status === 'done' && s.level === 'warn'))
 }
 
 console.log('\n=== 出具判定 ===')
@@ -89,6 +122,12 @@ console.log('\n=== 通用规则 ===')
     !all.some((s) => /^(node|run|llm|tool)\./.test(s.title)),
     all.filter((s) => /^(node|run|llm|tool)\./.test(s.title)).map(s=>s.title).join(','))
   check('耗时是人类单位', all.filter((s) => s.meta).every((s) => /(\d+ms|\d+\.\d+s|\d+m\d+s|\d+ 行)/.test(s.meta)))
+  // 一屏"0ms"看着像每步都被精确计时，实际只是这些步骤没花时间，
+  // 反而把真正慢的那一步淹了
+  // 用词边界，不然 "130ms" 里的 "0ms" 会误判
+  check('不显示 0ms 这种没信息量的耗时', !all.some((s) => /\b0ms\b/.test(s.meta ?? '')),
+    all.filter((s) => /\b0ms\b/.test(s.meta ?? '')).map((s) => s.title).join(','))
+  check('没有空 meta 占位', !all.some((s) => s.meta === ''))
 }
 
 console.log('\n=== Copilot 操作流 ===')
