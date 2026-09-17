@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { api, streamCopilot, streamRun } from '../api/client'
+import type { CopilotOp } from '../run/decode'
 import type { GraphSpec, Run, RunEvent } from '../types'
 
 /**
@@ -11,6 +12,10 @@ import type { GraphSpec, Run, RunEvent } from '../types'
  *
  * 一轮对话 = 一次「建图 → 跑图 → 出结果」。图对用户是隐藏的（想看可以展开），
  * 但它仍然是真实存在的工作流，跑完能存成模板、能在画布里继续改。
+ *
+ * 这里**只存原始流**（Copilot 的操作、运行的事件），不在 store 里翻译。
+ * 翻译归 run/decode.ts，全站一份；store 里再译一遍的结果是同一次运行在
+ * 对话页和画布上讲出两个不同的故事，而用户没法判断哪个是真的。
  */
 
 export type Phase =
@@ -30,13 +35,15 @@ export interface ChatTurn {
   status: string
   /** 模型的思考（支持 thinking 的模型才有） */
   thinking: string
+  /** Copilot 的原始操作流。thinking delta 在写入时已合并 */
+  ops: CopilotOp[]
+  /** 跑图的原始事件 */
+  events: RunEvent[]
   /** Copilot 建出来的图 */
   graph: GraphSpec | null
   /** Copilot 对这张图的说明 */
   explanation: string
   run: Run | null
-  /** 跑图过程中值得показ的事件（查了什么、拿到什么） */
-  steps: { icon: string; text: string; detail?: string }[]
   /** 最终成果 */
   output: Record<string, any> | null
   error: string
@@ -73,6 +80,8 @@ const PHASE_TEXT: Record<Phase, string> = {
   error: '出错了',
 }
 
+type Patch = (fn: (t: ChatTurn) => Partial<ChatTurn>) => void
+
 export const useChat = create<ChatState>((set, get) => ({
   turns: [],
   busy: false,
@@ -80,7 +89,7 @@ export const useChat = create<ChatState>((set, get) => ({
 
   ask: (question) => {
     const id = newId()
-    const patch = (fn: (t: ChatTurn) => Partial<ChatTurn>) =>
+    const patch: Patch = (fn) =>
       set((s) => ({
         turns: s.turns.map((t) => (t.id === id ? { ...t, ...fn(t) } : t)),
       }))
@@ -91,20 +100,27 @@ export const useChat = create<ChatState>((set, get) => ({
         ...s.turns,
         {
           id, question, phase: 'planning', status: PHASE_TEXT.planning,
-          thinking: '', graph: null, explanation: '', run: null,
-          steps: [], output: null, error: '', startedAt: Date.now(),
+          thinking: '', ops: [], events: [], graph: null, explanation: '',
+          run: null, output: null, error: '', startedAt: Date.now(),
           lastSeq: 0, cancel: null,
         },
       ],
     }))
 
-    // 建图阶段：Copilot 的操作流直接翻译成人话，不让用户看 add_node/add_edge
-    const nodes: any[] = []
-    const edges: any[] = []
-
     const cancelCopilot = streamCopilot(
       { instruction: question, base_graph: null },
       (op) => {
+        // 先原样收下，翻译交给 decodeCopilot。thinking 合并在写入时做：
+        // 一次生成几百上千条 delta，逐条存下来光数组就比图大一个量级
+        patch((t) => {
+          const last = t.ops[t.ops.length - 1]
+          if (op.op === 'thinking' && last?.op === 'thinking') {
+            const merged = { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }
+            return { ops: [...t.ops.slice(0, -1), merged] }
+          }
+          return { ops: [...t.ops, op] }
+        })
+
         switch (op.op) {
           case 'thinking':
             patch((t) => ({
@@ -119,15 +135,10 @@ export const useChat = create<ChatState>((set, get) => ({
             patch(() => ({ phase: 'building', status: op.summary || '正在搭建流程…' }))
             break
           case 'add_node':
-            if (op.node) nodes.push(op.node)
             patch((t) => ({
               phase: 'building',
-              status: `正在搭建流程…（${nodes.length} 步）`,
-              steps: [...t.steps],
+              status: `正在搭建流程…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
             }))
-            break
-          case 'add_edge':
-            if (op.edge) edges.push(op.edge)
             break
           case 'done':
             patch(() => ({ explanation: op.explanation ?? '' }))
@@ -139,7 +150,7 @@ export const useChat = create<ChatState>((set, get) => ({
               graph, phase: 'running', status: PHASE_TEXT.running,
               explanation: op.explanation ?? '',
             }))
-            void launch(id, graph, patch, set, get)
+            void launch(id, graph, patch, set)
             break
           }
           case 'error':
@@ -185,7 +196,7 @@ export const useChat = create<ChatState>((set, get) => ({
   reattach: async (turnId) => {
     const turn = get().turns.find((t) => t.id === turnId)
     if (!turn?.run) return
-    const patch = (fn: (t: ChatTurn) => Partial<ChatTurn>) =>
+    const patch: Patch = (fn) =>
       set((s) => ({ turns: s.turns.map((t) => (t.id === turnId ? { ...t, ...fn(t) } : t)) }))
     patch(() => ({ phase: 'running', status: PHASE_TEXT.running }))
     set({ busy: true })
@@ -194,13 +205,7 @@ export const useChat = create<ChatState>((set, get) => ({
 }))
 
 /** 图建好了就直接跑——用户要的是答案，不是一张图。 */
-async function launch(
-  turnId: string,
-  graph: GraphSpec,
-  patch: (fn: (t: ChatTurn) => Partial<ChatTurn>) => void,
-  set: any,
-  _get: any,
-) {
+async function launch(turnId: string, graph: GraphSpec, patch: Patch, set: any) {
   try {
     const run = await api.runs.start({ graph, input: {} })
     patch(() => ({ run }))
@@ -211,52 +216,28 @@ async function launch(
   }
 }
 
-/** 订阅运行事件，把关键动作翻译成人话。 */
-function watch(
-  runId: string,
-  turnId: string,
-  patch: (fn: (t: ChatTurn) => Partial<ChatTurn>) => void,
-  set: any,
-  after = 0,
-) {
+/**
+ * 订阅运行事件。
+ *
+ * 只做两件事：把事件原样存进这一轮，以及更新那几个驱动 UI 状态机的相位。
+ * "查了哪张表、跑了什么 SQL"不在这里翻译——decodeRun 会从同一批事件里读出来。
+ */
+function watch(runId: string, turnId: string, patch: Patch, set: any, after = 0) {
   const stop = streamRun(runId, (event: RunEvent) => {
     const d: any = event.data ?? {}
-    // 记下进度：审批恢复要重新接流，带上它才不会把历史再收一遍
-    patch((t) => ({ lastSeq: Math.max(t.lastSeq ?? 0, event.seq ?? 0) }))
+    patch((t) => ({
+      events: [...t.events, event],
+      // 记下进度：审批恢复要重新接流，带上它才不会把历史再收一遍
+      lastSeq: Math.max(t.lastSeq ?? 0, event.seq ?? 0),
+    }))
     switch (event.type) {
       case 'tool.start': {
         const tool = String(d.tool ?? '')
-        const sql = String(d.args?.sql ?? '')
-        if (tool.startsWith('db_query')) {
-          patch((t) => ({
-            status: '正在查询数据…',
-            steps: [...t.steps, { icon: 'db', text: '查询数据', detail: sql }],
-          }))
-        } else if (tool.startsWith('db_schema')) {
-          patch((t) => ({
-            status: '正在了解数据结构…',
-            steps: [...t.steps, { icon: 'schema', text: `查看表结构 ${d.args?.table ?? ''}` }],
-          }))
-        } else if (tool) {
-          patch((t) => ({
-            status: `正在调用 ${tool}…`,
-            steps: [...t.steps, { icon: 'tool', text: `调用 ${tool}` }],
-          }))
-        }
-        break
-      }
-      case 'tool.end': {
-        const preview = String(d.preview ?? '')
-        patch((t) => {
-          const steps = [...t.steps]
-          const last = steps[steps.length - 1]
-          if (last && !last.detail?.startsWith('→')) {
-            // 查询结果里最有用的是行数，塞进上一条步骤而不是新起一行
-            const m = preview.match(/"row_count":\s*(\d+)/)
-            if (m) last.text = `${last.text} · ${m[1]} 行`
-          }
-          return { steps }
-        })
+        patch(() => ({
+          status: tool.startsWith('db_query') ? '正在查询数据…'
+            : tool.startsWith('db_schema') ? '正在了解数据结构…'
+            : tool ? `正在调用 ${tool}…` : '正在执行…',
+        }))
         break
       }
       case 'llm.start':
@@ -266,17 +247,20 @@ function watch(
         patch(() => ({ phase: 'waiting', status: PHASE_TEXT.waiting }))
         set({ busy: false })
         break
-      case 'node.failed':
-        patch((t) => ({
-          steps: [...t.steps, { icon: 'error', text: String(d.error ?? '某一步失败了') }],
-        }))
-        break
       case 'run.failed':
         patch(() => ({ phase: 'error', error: String(d.error ?? '运行失败') }))
         set({ busy: false, cancel: null })
         break
       case 'run.finished':
-        void finish(runId, turnId, patch, set)
+        // 成果在事件里就有，不必再取一次 run；但 run 对象带着 usage 和
+        // run_class（出具横幅要用），所以还是拉一次，失败也不影响成果
+        patch(() => ({
+          phase: 'done', status: PHASE_TEXT.done, output: d.output ?? null,
+        }))
+        set({ busy: false, cancel: null })
+        void api.runs.get(runId)
+          .then((run) => patch(() => ({ run })))
+          .catch(() => undefined)
         break
     }
   }, undefined, after)
@@ -284,21 +268,4 @@ function watch(
   // store 上的是"当前活跃流"的快捷方式
   patch(() => ({ cancel: stop }))
   set({ cancel: stop })
-}
-
-async function finish(
-  runId: string,
-  _turnId: string,
-  patch: (fn: (t: ChatTurn) => Partial<ChatTurn>) => void,
-  set: any,
-) {
-  try {
-    const run = await api.runs.get(runId)
-    patch(() => ({
-      run, phase: 'done', status: PHASE_TEXT.done, output: run.output ?? null,
-    }))
-  } catch {
-    patch(() => ({ phase: 'done', status: PHASE_TEXT.done }))
-  }
-  set({ busy: false, cancel: null })
 }

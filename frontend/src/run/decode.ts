@@ -200,6 +200,45 @@ function cutAtLastCompleteRow(text: string): string | null {
   return text.slice(0, lastRowEnd) + ']}'
 }
 
+/**
+ * 一次运行的一句话摘要，给列表用。
+ *
+ * 运行列表原本每行只有"临时图 · 1.2s · 340 tok"——三条运行长得一模一样，
+ * 要分清哪条是哪条只能挨个点开。人记得住的是内容（问了什么、出了什么），
+ * 不是耗时。
+ *
+ * 优先成果：跑完了的话，"查到多少"比"问了什么"更能认出这一条。
+ */
+export function summarizeRun(
+  input?: Record<string, any> | null,
+  output?: Record<string, any> | null,
+): string {
+  const pick = (obj?: Record<string, any> | null) => {
+    if (!obj) return ''
+    for (const [k, v] of Object.entries(obj)) {
+      if (k.startsWith('_')) continue
+      if (v == null || v === '') continue
+      if (typeof v === 'string') {
+        const table = parseQueryResult(v)
+        if (table) {
+          return `${table.rows.length}${table.clipped ? '+' : ''} 行 × ${table.columns.length} 列`
+        }
+        return v.replace(/\s+/g, ' ').slice(0, 70)
+      }
+      if (typeof v === 'object') {
+        const table = parseQueryResult(JSON.stringify(v))
+        if (table) return `${table.rows.length} 行 × ${table.columns.length} 列`
+        const text = JSON.stringify(v)
+        if (text !== '{}' && text !== '[]') return text.slice(0, 70)
+        continue
+      }
+      return String(v).slice(0, 70)
+    }
+    return ''
+  }
+  return pick(output) || pick(input)
+}
+
 function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
   const base = { id: `tool-${seq}`, seq, status: 'running' as StepStatus }
   // 数据库工具单独认：它是这个产品最主要的取数方式，"调用 db_query__warehouse"
@@ -233,13 +272,35 @@ export function decodeRun(events: RunEvent[]): Step[] {
   const pendingTools = new Map<string, Step>()
   /** node_id → 待配对的模型调用 Step */
   const pendingLlm = new Map<string, Step>()
-  /** 已见过的 interrupt_id，避免 human.requested 与 run.interrupted 各出一行 */
-  const seenInterrupts = new Set<string>()
+  /**
+   * node_id → 这个节点当前那条尚未闭合的审批步骤。
+   *
+   * 审批是"开→闭"配对的，不能只靠内容去重。同一次中断会发三条事件
+   * （human.requested、run.interrupted，恢复后节点重放又来一条
+   * human.requested），三条内容完全一样；而一个循环里连续三轮审批
+   * （驳回 → 改写 → 再审）内容也完全一样。按内容去重的话，要么把重放
+   * 算成新的一轮，要么把真实的第二轮当成重放吞掉——两种都错。
+   *
+   * 开着就是同一次，闭了才是新一次。
+   */
+  const openInterrupts = new Map<string, Step>()
 
   const push = (step: Step, nodeId?: string) => {
     const parent = nodeId ? nodeSteps.get(nodeId) : undefined
     if (parent) (parent.children ??= []).push(step)
     else out.push(step)
+  }
+
+  /** 把决定折进那条审批行，而不是另起一行——"问了什么 → 你怎么答的"是一件事 */
+  const closeInterrupt = (key: string, approved: unknown, note: string): boolean => {
+    const step = openInterrupts.get(key)
+    if (!step) return false
+    step.status = 'done'
+    step.level = undefined
+    step.title = `${step.title} → ${approved === false ? '你驳回了' : '你放行了'}`
+    if (note) step.detail = [step.detail, `你的备注：${note}`].filter(Boolean).join('\n')
+    openInterrupts.delete(key)
+    return true
   }
 
   for (const event of events) {
@@ -260,14 +321,13 @@ export function decodeRun(events: RunEvent[]): Step[] {
           break
         }
         if (resumed) {
-          // 恢复意味着之前那条"等你确认"已经过去了。level 也要一起清：
-          // 留着 warn 的话，那条已经处理完的审批会永远是橙色的，看上去
-          // 像还有什么没解决
-          const settle = (s: Step) => {
+          // 人已经答过了，那条不该再是橙色的"等你确认"。但配对关系要留着：
+          // 紧接着 LangGraph 会重放该节点，又发一条一模一样的
+          // human.requested，配对还开着才能认出那是重放而不是新一轮。
+          // 真正的闭合（把决定折进标题）交给带 node_id 的 human.resolved。
+          openInterrupts.forEach((s) => {
             if (s.status === 'waiting') { s.status = 'done'; s.level = undefined }
-          }
-          out.forEach(settle)
-          nodeSteps.forEach((s) => s.children?.forEach(settle))
+          })
         }
         out.push({
           id: `s-${seq}`, seq, kind: 'lifecycle', status: 'running',
@@ -302,6 +362,16 @@ export function decodeRun(events: RunEvent[]): Step[] {
       }
 
       case 'node.finished': {
+        // 人工节点跑完就说明决定已经生效了。正常路径上 human.resolved 早就
+        // 闭合了配对，这里只是兜底：万一那条事件没发出来（旧运行、别的
+        // 审批来源），配对不能一直挂着——挂着的话这个节点下一轮真实审批
+        // 会被当成重放吞掉
+        if (nodeId && openInterrupts.has(nodeId)) {
+          const p = d.preview ?? {}
+          closeInterrupt(nodeId,
+            typeof p === 'object' ? p.approved : undefined,
+            typeof p === 'object' ? String(p.note ?? '') : '')
+        }
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         if (step) {
           step.status = 'done'
@@ -441,33 +511,34 @@ export function decodeRun(events: RunEvent[]): Step[] {
 
       case 'human.requested':
       case 'run.interrupted': {
-        // 同一次中断会来两条事件，而且审批恢复后节点重放还会再来一遍
-        // （LangGraph 的重放语义，不是 bug）。三条都指向同一次"等你确认"，
-        // 界面上只该有一个。
-        //
-        // 不能用 interrupt_id 做键：human.requested 压根没这个字段，
-        // run.interrupted 才有。两者共有的是 payload 里的 node_id + mode + title，
-        // 用它们才能让三条算出同一个键。
+        // 同一次中断发三条事件：human.requested、run.interrupted，恢复后
+        // 节点重放又来一条 human.requested（LangGraph 的重放语义，不是 bug）。
+        // 三条都指向同一次"等你确认"，界面上只该有一条。
         const payload = d.payload ?? d
-        const key = [payload.node_id ?? nodeId, payload.mode ?? '', payload.title ?? ''].join('|')
-        if (seenInterrupts.has(key)) break
-        seenInterrupts.add(key)
-        push({
+        const key = String(payload.node_id ?? nodeId ?? '_')
+        if (openInterrupts.has(key)) break   // 同一次中断的后续事件
+        const step: Step = {
           id: `hm-${seq}`, seq, kind: 'human', nodeId, status: 'waiting', level: 'warn',
           title: String(payload.title || d.title || '等你确认'),
           detail: [payload.message, payload.tool ? `工具：${payload.tool}` : '']
             .filter(Boolean).join('\n') || undefined,
-        }, nodeId)
+        }
+        openInterrupts.set(key, step)
+        push(step, nodeId)
         break
       }
 
       case 'human.resolved': {
         const r = d.response ?? {}
         const approved = typeof r === 'object' ? r.approved : undefined
+        const note = typeof r === 'object' ? String(r.note ?? '') : ''
+        if (closeInterrupt(String(nodeId ?? '_'), approved, note)) break
+        // 没有对应的待决审批（历史事件不全、或者审批发生在别处）——
+        // 还是要把决定说出来，只是没地方折进去
         push({
           id: `hr-${seq}`, seq, kind: 'human', nodeId, status: 'done',
           title: approved === false ? '你驳回了' : '你放行了',
-          detail: typeof r === 'object' && r.note ? String(r.note) : undefined,
+          detail: note || undefined,
         }, nodeId)
         break
       }
@@ -653,11 +724,27 @@ export function decodeCopilot(ops: CopilotOp[]): Step[] {
       case 'remove_edge':
         break
       case 'done':
+        // 心跳那条"正在理解需求…"要收尾，否则生成完了它还在转圈
+        closeLifecycles(out, 'done')
         out.push({ id: `cd-${i}`, seq: i, kind: 'lifecycle', status: 'done',
-                   title: `流程搭好了，共 ${nodeCount} 步`,
+                   title: `流程搭好了，加了 ${nodeCount} 步`,
                    detail: String(op.explanation ?? '') || undefined })
         break
+      case 'final': {
+        // 后端排版校验后的最终图才知道整张图有几步。nodeCount 只是这一轮
+        // 新增的数量——在"改图"场景下说"共 2 步"是错的，图上明明有四个节点
+        const total = op.graph?.nodes?.length
+        const last = out[out.length - 1]
+        if (total && last?.kind === 'lifecycle') {
+          last.title = nodeCount && nodeCount < total
+            ? `流程搭好了，加了 ${nodeCount} 步，整张图共 ${total} 步`
+            : `流程搭好了，共 ${total} 步`
+        }
+        closeLifecycles(out, 'done')
+        break
+      }
       case 'error':
+        closeLifecycles(out, 'failed')
         out.push({ id: `ce-${i}`, seq: i, kind: 'error', level: 'error', status: 'failed',
                    title: String(op.message ?? '生成失败') })
         break

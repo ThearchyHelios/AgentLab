@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  ChevronRight, Database, MessageSquare, Send, Square, Table2, Trash2, Wrench, XCircle,
-} from 'lucide-react'
-import clsx from 'clsx'
+import { useEffect, useMemo, useState } from 'react'
+import { Database, MessageSquare, Send, Square, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
+import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantStream'
+import { decodeCopilot, decodeRun } from '../run/decode'
 import { useCatalog } from '../store/catalog'
 import { useChat, type ChatTurn } from '../store/chat'
-import { useStudio, toFlow } from '../store/studio'
-import { Empty, Spinner, useToast } from '../components/ui'
+import { useStudio } from '../store/studio'
+import { useToast } from '../components/ui'
 
 /**
  * 对话式入口。
@@ -19,27 +18,29 @@ import { Empty, Spinner, useToast } from '../components/ui'
  *
  * 所以这一页把图藏起来：你问，它自己接数据源、建流程、跑完、给结论。图仍然
  * 真实存在（可以展开看，也能拿到画布里继续改），只是不再是必经之路。
+ *
+ * 这里和画布右栏用的是同一个 AssistantStream、同一个 decode.ts——差别只有
+ * dense 一个开关。两边各写一套的话，同一次运行在两个页面会讲出不同的故事。
  */
 export function ChatPage() {
   const { turns, busy, ask, stop, clear } = useChat()
   const [draft, setDraft] = useState('')
-  const bottomRef = useRef<HTMLDivElement>(null)
   const sources = useDataSources()
+  const setGraph = useStudio((s) => s.setGraph)
+  const toast = useToast()
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [turns.length, turns[turns.length - 1]?.phase])
-
-  const send = () => {
-    const q = draft.trim()
+  const send = (text?: string) => {
+    const q = (text ?? draft).trim()
     if (!q || busy) return
     ask(q)
     setDraft('')
   }
 
+  const streamTurns = useMemo(() => turns.map(toStreamTurn), [turns])
+
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center gap-2 border-b px-4 py-2">
+      <header className="flex shrink-0 items-center gap-2 border-b px-4 py-2">
         <MessageSquare size={14} style={{ color: 'var(--accent)' }} />
         <span className="text-[13px] font-semibold">问数据</span>
         <span className="text-[11px] text-faint">
@@ -53,216 +54,89 @@ export function ChatPage() {
         )}
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        {!turns.length ? (
-          <StarterHints sources={sources} onPick={(q) => { setDraft(q); }} />
-        ) : (
-          <div className="mx-auto max-w-3xl space-y-5">
-            {turns.map((turn) => <Turn key={turn.id} turn={turn} />)}
+      <AssistantStream
+        turns={streamTurns}
+        empty={<StarterHints sources={sources} onPick={send} />}
+        approvalsFor={(t) => <Approvals turnId={t.id} runId={t.runId} />}
+        onOpenGraph={(graph) => {
+          setGraph(graph)
+          toast('已放到画布，切到「编排」继续改', 'ok')
+        }}
+        footer={
+          <div className="shrink-0 border-t p-3">
+            <div className="mx-auto flex max-w-3xl items-end gap-2">
+              <textarea
+                className="field flex-1 resize-none"
+                rows={2}
+                value={draft}
+                placeholder={
+                  sources.length
+                    ? `问点什么，比如「${sources[0].description || sources[0].name} 里有多少数据」`
+                    : '还没有接入数据源，先去「设置 → 数据源」加一个'
+                }
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter 发送，Shift+Enter 换行——对话框的通用约定
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+                }}
+              />
+              {busy ? (
+                <button className="btn btn-danger h-9" onClick={stop}>
+                  <Square size={12} /> 停止
+                </button>
+              ) : (
+                <button className="btn btn-primary h-9" onClick={() => send()}
+                        disabled={!draft.trim()}>
+                  <Send size={12} /> 发送
+                </button>
+              )}
+            </div>
           </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
-
-      <div className="border-t p-3">
-        <div className="mx-auto flex max-w-3xl items-end gap-2">
-          <textarea
-            className="field flex-1 resize-none"
-            rows={2}
-            value={draft}
-            placeholder={
-              sources.length
-                ? `问点什么，比如「${sources[0].description || sources[0].name} 里有多少数据」`
-                : '还没有接入数据源，先去「设置 → 数据源」加一个'
-            }
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter 发送，Shift+Enter 换行——对话框的通用约定
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
-            }}
-          />
-          {busy ? (
-            <button className="btn btn-danger h-9" onClick={stop}>
-              <Square size={12} /> 停止
-            </button>
-          ) : (
-            <button className="btn btn-primary h-9" onClick={send} disabled={!draft.trim()}>
-              <Send size={12} /> 发送
-            </button>
-          )}
-        </div>
-      </div>
+        }
+      />
     </div>
   )
 }
 
-// -------------------------------------------------------------------------
-
-function Turn({ turn }: { turn: ChatTurn }) {
+/**
+ * 一轮对话 → 一条助手流。
+ *
+ * 建图和跑图是两套完全独立的协议（SSE 操作流 vs 事件 WebSocket，不共享
+ * seq 和 node_id），但对用户是同一件事的两半：先想清楚怎么做，再去做。
+ * 拼成一条步骤序列，看到的才是一个连续的过程。
+ */
+function toStreamTurn(turn: ChatTurn): StreamTurn {
   const running = ['planning', 'building', 'running'].includes(turn.phase)
-
-  return (
-    <div className="fade-up">
-      {/* 用户的问题 */}
-      <div className="mb-2 flex justify-end">
-        <div className="max-w-[80%] rounded-lg rounded-br-sm px-3 py-2 text-[12.5px]"
-             style={{ background: 'var(--accent)', color: '#fff' }}>
-          {turn.question}
-        </div>
-      </div>
-
-      {/* 回应 */}
-      <div className="rounded-lg border bg-panel p-3">
-        <div className="flex items-center gap-2 text-[11.5px]">
-          {running && <Spinner size={12} />}
-          {turn.phase === 'error' && <XCircle size={12} className="text-[var(--err)]" />}
-          <span className={clsx(turn.phase === 'error' && 'text-[var(--err)]')}>
-            {turn.phase === 'error' ? turn.error : turn.status}
-          </span>
-          {turn.run && (
-            <span className="mono text-[10px] text-faint">#{turn.run.id.slice(0, 8)}</span>
-          )}
-        </div>
-
-        {/* 模型在想什么——等待期间唯一能看的东西 */}
-        {running && turn.thinking && (
-          <div className="mt-2 max-h-24 overflow-y-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-[10.5px] leading-relaxed text-dim">
-            {turn.thinking}
-          </div>
-        )}
-
-        {/* 干了什么：查了哪张表、跑了什么 SQL */}
-        {!!turn.steps.length && (
-          <div className="mt-2 space-y-1">
-            {turn.steps.map((s, i) => <Step key={i} step={s} />)}
-          </div>
-        )}
-
-        {/* 停在人工介入：就地处理，不用切去别的页面 */}
-        {turn.phase === 'waiting' && turn.run && <Approvals turn={turn} />}
-
-        {/* 成果 */}
-        {turn.output && <Output output={turn.output} />}
-
-        {/* 生成的图：默认藏起来，想看再展开 */}
-        {turn.graph && <GraphPeek turn={turn} />}
-      </div>
-    </div>
-  )
+  return {
+    id: turn.id,
+    question: turn.question,
+    phase: turn.phase === 'waiting' ? 'waiting'
+      : turn.phase === 'error' ? 'error'
+      : running ? 'running' : 'done',
+    status: turn.status,
+    // 建图的步骤在前，跑图的在后——这正是发生的顺序
+    steps: [...decodeCopilot(turn.ops), ...decodeRun(turn.events)],
+    thinking: turn.thinking,
+    output: turn.output,
+    error: turn.error,
+    runId: turn.run?.id,
+    runClass: turn.run?.run_class,
+    graph: turn.graph,
+    graphNote: turn.explanation,
+  }
 }
 
-function Step({ step }: { step: { icon: string; text: string; detail?: string } }) {
-  const [open, setOpen] = useState(false)
-  const Icon = step.icon === 'db' ? Database
-    : step.icon === 'schema' ? Table2
-    : step.icon === 'error' ? XCircle : Wrench
-  const color = step.icon === 'error' ? 'var(--err)' : 'var(--text-faint)'
-
-  return (
-    <div className="text-[11px]">
-      <button
-        className="flex w-full items-start gap-1.5 text-left hover:text-dim"
-        style={{ color }}
-        onClick={() => step.detail && setOpen((v) => !v)}
-      >
-        <Icon size={11} className="mt-[2px] shrink-0" />
-        <span className="min-w-0 flex-1">{step.text}</span>
-        {step.detail && (
-          <ChevronRight size={10} className="mt-[2px] shrink-0"
-            style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
-        )}
-      </button>
-      {open && step.detail && (
-        <pre className="mono mt-1 max-h-32 overflow-auto rounded bg-bg px-2 py-1.5 text-[10px] leading-relaxed text-dim whitespace-pre-wrap">
-          {step.detail}
-        </pre>
-      )}
-    </div>
-  )
-}
-
-function Approvals({ turn }: { turn: ChatTurn }) {
+function Approvals({ turnId, runId }: { turnId: string; runId?: string }) {
   const approvals = useCatalog((s) => s.approvals)
   const reattach = useChat((s) => s.reattach)
-  const pending = approvals.filter((a) => a.run_id === turn.run?.id && a.status === 'pending')
+  const pending = approvals.filter((a) => a.run_id === runId && a.status === 'pending')
 
-  if (!pending.length) return null
+  if (!runId || !pending.length) return null
   return (
     <div className="mt-2 overflow-hidden rounded border" style={{ borderColor: 'var(--warn)' }}>
       {pending.map((a) => (
-        <ApprovalCard key={a.id} approval={a} onResolved={() => reattach(turn.id)} />
+        <ApprovalCard key={a.id} approval={a} onResolved={() => reattach(turnId)} />
       ))}
-    </div>
-  )
-}
-
-function Output({ output }: { output: Record<string, any> }) {
-  const entries = useMemo(
-    () => Object.entries(output).filter(([k]) => !k.startsWith('_')),
-    [output],
-  )
-  if (!entries.length) return null
-
-  return (
-    <div className="mt-2 space-y-2 border-t pt-2">
-      {entries.map(([key, value]) => (
-        <div key={key}>
-          {entries.length > 1 && (
-            <div className="mb-0.5 text-[10.5px] font-semibold text-faint">{key}</div>
-          )}
-          <div className="whitespace-pre-wrap text-[12.5px] leading-relaxed">
-            {typeof value === 'string' ? value : JSON.stringify(value, null, 2)}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function GraphPeek({ turn }: { turn: ChatTurn }) {
-  const [open, setOpen] = useState(false)
-  const setGraph = useStudio((s) => s.setGraph)
-  const toast = useToast()
-  const nodes = turn.graph?.nodes ?? []
-
-  return (
-    <div className="mt-2 border-t pt-2">
-      <div className="flex items-center gap-2">
-        <button className="flex items-center gap-1 text-[10.5px] text-faint hover:text-dim"
-                onClick={() => setOpen((v) => !v)}>
-          <ChevronRight size={10}
-            style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
-          它是怎么做的（{nodes.length} 步）
-        </button>
-        <span className="flex-1" />
-        <button
-          className="btn btn-sm btn-ghost text-[10.5px]"
-          title="把这张图放到画布上继续改"
-          onClick={() => {
-            if (!turn.graph) return
-            setGraph(turn.graph)
-            toast('已放到画布，切到「编排」继续改', 'ok')
-          }}
-        >
-          在画布里打开
-        </button>
-      </div>
-      {open && (
-        <div className="mt-1.5 space-y-1">
-          {turn.explanation && (
-            <div className="rounded bg-bg px-2 py-1.5 text-[11px] leading-relaxed text-dim">
-              {turn.explanation}
-            </div>
-          )}
-          {nodes.map((n: any, i: number) => (
-            <div key={n.id} className="flex items-center gap-2 text-[10.5px] text-faint">
-              <span className="mono w-4 text-right">{i + 1}</span>
-              <span className="chip">{n.type}</span>
-              <span className="truncate">{n.data?.label || n.id}</span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   )
 }
@@ -275,7 +149,7 @@ function StarterHints({ sources, onPick }: {
 }) {
   if (!sources.length) {
     return (
-      <Empty
+      <StreamEmpty
         icon={<Database size={22} />}
         title="还没有接入数据源"
         hint="去「设置 → 数据源」加一个数据库，然后就能直接问它问题了"
@@ -293,13 +167,12 @@ function StarterHints({ sources, onPick }: {
   }).slice(0, 4)
 
   return (
-    <div className="mx-auto max-w-3xl">
-      <Empty
-        icon={<MessageSquare size={22} />}
-        title="问点什么"
-        hint="它会自己接数据源、写查询、跑完给结论——你不用碰画布"
-      />
-      <div className="mt-3 space-y-1.5">
+    <StreamEmpty
+      icon={<MessageSquare size={22} />}
+      title="问点什么"
+      hint="它会自己接数据源、写查询、跑完给结论——你不用碰画布"
+    >
+      <div className="space-y-1.5">
         {suggestions.map((q) => (
           <button key={q}
             className="w-full rounded-lg border px-3 py-2 text-left text-[12px] hover:bg-hover"
@@ -308,7 +181,7 @@ function StarterHints({ sources, onPick }: {
           </button>
         ))}
       </div>
-    </div>
+    </StreamEmpty>
   )
 }
 

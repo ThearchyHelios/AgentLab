@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
-  AlertTriangle, Check, ChevronDown, ChevronRight, Copy, LayoutGrid, Plus, Save, ShieldCheck,
-  Sparkles, Trash2, Wand2,
+  AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, ShieldCheck,
+  Trash2, Wand2,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { FlowCanvas } from '../canvas/FlowCanvas'
 import { Inspector } from '../canvas/Inspector'
 import { Palette } from '../canvas/Palette'
-import { RunPanel } from '../run/RunPanel'
+import { AssistantPanel } from '../run/AssistantPanel'
 import { useStudio, toGraph } from '../store/studio'
-import { useCatalog, modelOptions } from '../store/catalog'
+import { useCatalog } from '../store/catalog'
 import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
 import type { Workflow } from '../types'
 
@@ -26,9 +26,9 @@ export function StudioPage() {
 
   const [tab, setTab] = useState<'inspect' | 'run'>('run')
   const [picker, setPicker] = useState(false)
-  const [copilot, setCopilot] = useState(false)
   const [saving, setSaving] = useState(false)
   const [publishing, setPublishing] = useState(false)
+  const copilotActive = useStudio((s) => s.copilot.active)
 
   // 首次进来自动打开第一张图
   useEffect(() => {
@@ -39,9 +39,10 @@ export function StudioPage() {
   useEffect(() => {
     if (selectedId) setTab('inspect')
   }, [selectedId])
+  // 开始跑图或开始生成时切回助手栏，否则进展发生在一个看不见的 tab 里
   useEffect(() => {
-    if (streaming) setTab('run')
-  }, [streaming])
+    if (streaming || copilotActive) setTab('run')
+  }, [streaming, copilotActive])
 
   const doSave = useCallback(async () => {
     if (!workflow) return
@@ -136,7 +137,18 @@ export function StudioPage() {
 
         <div className="flex-1" />
 
-        <button className="btn" onClick={() => setCopilot(true)} title="用自然语言生成或修改工作流">
+        {/* Copilot 不再是弹窗：它就在右栏里，这个按钮只负责把人送过去。
+            弹窗的问题是每改一次图都要重开一次，而且关掉之后需求文本就没了 */}
+        <button
+          className="btn"
+          title="用自然语言生成或修改工作流"
+          onClick={() => {
+            setTab('run')
+            // 等这一帧渲染完输入框才在 DOM 里
+            requestAnimationFrame(() =>
+              window.dispatchEvent(new Event('agentlab:focus-copilot')))
+          }}
+        >
           <Wand2 size={12} /> Copilot
         </button>
         <button className="btn" onClick={relayout} title="自动排版"><LayoutGrid size={12} /></button>
@@ -156,22 +168,26 @@ export function StudioPage() {
         </aside>
         <main className="relative min-w-0 flex-1">
           <FlowCanvas />
-          <CopilotStatusBar />
         </main>
         <aside className="flex w-[360px] shrink-0 flex-col border-l bg-panel">
           <Tabs
-            tabs={[{ key: 'run', label: '运行' }, { key: 'inspect', label: '属性' }]}
+            tabs={[{ key: 'run', label: '助手' }, { key: 'inspect', label: '属性' }]}
             active={tab}
             onChange={(k) => setTab(k as any)}
           />
-          <div className="min-h-0 flex-1">
-            {tab === 'inspect' ? <Inspector /> : <RunPanel />}
+          {/* 两个都挂着、用 hidden 切换，而不是三元卸载其中一个。
+              助手栏里有输入框草稿、展开状态、滚动位置——点一下"属性"看个
+              节点再切回来全没了，等于逼人别用属性页 */}
+          <div className={clsx('min-h-0 flex-1', tab !== 'run' && 'hidden')}>
+            <AssistantPanel />
+          </div>
+          <div className={clsx('min-h-0 flex-1 overflow-y-auto', tab !== 'inspect' && 'hidden')}>
+            <Inspector />
           </div>
         </aside>
       </div>
 
       <WorkflowPicker open={picker} onClose={() => setPicker(false)} />
-      <CopilotModal open={copilot} onClose={() => setCopilot(false)} />
       {publishing && workflow && (
         <PublishModal workflow={workflow} onClose={() => setPublishing(false)}
                       onDone={() => { setPublishing(false); void refresh() }} />
@@ -368,224 +384,7 @@ function PublishModal({ workflow, onClose, onDone }: {
   )
 }
 
-function CopilotModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const nodes = useStudio((s) => s.nodes)
-  const runCopilot = useStudio((s) => s.runCopilot)
-  const providers = useCatalog((s) => s.providers)
-  const [instruction, setInstruction] = useState('')
-  const [useBase, setUseBase] = useState(true)
-  const [model, setModel] = useState<string>('')
-  const [effective, setEffective] = useState<string>('')
-
-  // Copilot 的模型是独立设置：它写的是编排本身，值得和工作流节点分开选
-  useEffect(() => {
-    if (!open) return
-    void api.copilot.getModel().then((m) => {
-      setModel(m.model ?? '')
-      setEffective(m.effective_model ?? '')
-    }).catch(() => undefined)
-  }, [open])
-
-  const pickModel = (value: string) => {
-    setModel(value)
-    // 选了就记住，下次打开还是它
-    void api.copilot.setModel({ model: value || null })
-      .then((m) => setEffective(m.effective_model ?? ''))
-      .catch(() => undefined)
-  }
-
-  const generate = () => {
-    if (!instruction.trim()) return
-    runCopilot(instruction, useBase && nodes.length > 0, model || undefined)
-    onClose()
-  }
-
-  const options = modelOptions(providers)
-  const groups = [...new Set(options.map((o) => o.group))]
-
-  const examples = [
-    '读取用户上传的问题，先查知识库，查到就基于资料回答并标注出处，查不到就联网搜索',
-    '把一段长文本拆成要点，逐条用模型打分，低分的让模型重写一次，最后汇总成表格',
-    '写代码分析数据，在沙箱里跑，出错就把报错喂回去让模型修，最多修三次',
-  ]
-
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title={<span className="flex items-center gap-1.5"><Sparkles size={14} /> Copilot 生成工作流</span>}
-      width={620}
-      footer={
-        <>
-          <button className="btn" onClick={onClose}>关闭</button>
-          <button className="btn btn-primary" onClick={generate} disabled={!instruction.trim()}>
-            <Wand2 size={12} /> 生成到画布
-          </button>
-        </>
-      }
-    >
-      <label className="label">描述你想要的工作流</label>
-      <textarea
-        className="field"
-        rows={4}
-        value={instruction}
-        onChange={(e) => setInstruction(e.target.value)}
-        placeholder="用大白话说清楚：输入是什么、中间要做哪几步、遇到什么情况走不同分支、最后要什么结果"
-      />
-
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        {examples.map((ex) => (
-          <button key={ex} className="chip hover:border-[var(--accent)]" onClick={() => setInstruction(ex)}>
-            {ex.slice(0, 26)}…
-          </button>
-        ))}
-      </div>
-
-      <div className="mt-3">
-        <label className="label">Copilot 使用的模型</label>
-        <select className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
-          <option value="">跟随默认 provider{effective ? `（当前：${effective}）` : ''}</option>
-          {groups.map((g) => (
-            <optgroup key={g} label={g}>
-              {options.filter((o) => o.group === g).map((o) => (
-                <option key={g + o.value} value={o.value}>{o.label}</option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-        <div className="mt-1 text-[10px] leading-snug text-faint">
-          选择会被记住，只影响 Copilot 自己，不改工作流节点上的模型。
-          它要按协议逐行输出操作，指令遵循弱的模型（比如 Mock）生成不出东西。
-        </div>
-      </div>
-
-      {!!nodes.length && (
-        <label className="mt-3 flex items-center gap-2 text-[11.5px]">
-          <input type="checkbox" checked={useBase} onChange={(e) => setUseBase(e.target.checked)}
-                 className="accent-[var(--accent)]" />
-          在当前这张图的基础上修改（不勾则重新生成）
-        </label>
-      )}
-
-      <div className="mt-2 text-[10.5px] leading-relaxed text-faint">
-        点击生成后弹窗会关闭，节点会<b>实时长在画布上</b>（紫色描边是新改动）。
-        结果<b>不会自动保存</b>——看一遍再决定。
-      </div>
-    </Modal>
-  )
-}
-
-/** Copilot 工作时的画布浮条：显示当前操作，可随时取消；结束后展示说明。 */
-// 阶段文案。从提交到第一个节点落地中间有 5~30 秒，这段时间界面上只有
-// "正在起草…"三个字一动不动，用户分不清是在想还是已经卡死——阶段会变的
-// 本身就是"它还活着"的信号。
-const COPILOT_PHASES: Record<string, string> = {
-  connecting: '正在连接模型…',
-  planning: '正在理解需求、规划结构…',
-  building: '正在放置节点…',
-  wiring: '正在连接数据流…',
-  finalizing: '正在排版和校验…',
-}
-
-function CopilotStatusBar() {
-  const copilot = useStudio((s) => s.copilot)
-  const stopCopilot = useStudio((s) => s.stopCopilot)
-  const retryCopilot = useStudio((s) => s.retryCopilot)
-  const [dismissed, setDismissed] = useState(false)
-  const [showThinking, setShowThinking] = useState(true)
-  const thinkingRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    // 新一轮生成开始时重新显示
-    if (copilot.active) setDismissed(false)
-  }, [copilot.active])
-
-  // 思考是流式追加的，跟着滚到底，否则用户只能看到最早那几行
-  useEffect(() => {
-    const el = thinkingRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [copilot.thinking])
-
-  if (dismissed) return null
-  if (!copilot.active && !copilot.explanation && !copilot.error) return null
-
-  const seconds = copilot.elapsedMs ? Math.round(copilot.elapsedMs / 1000) : 0
-  // 有具体操作就显示操作，还没开始动就显示阶段——不再是恒定的"正在起草…"
-  const headline = copilot.lastOp || COPILOT_PHASES[copilot.phase] || '正在起草…'
-
-  return (
-    <div className="fade-up pointer-events-auto absolute bottom-4 left-4 z-30 max-w-md rounded-lg border bg-panel px-3 py-2 shadow-xl"
-         style={{ borderColor: copilot.error ? 'var(--err)' : '#bc8cff' }}>
-      {copilot.active ? (
-        <div>
-          <div className="flex items-center gap-2">
-            <Spinner size={13} />
-            <span className="min-w-0 flex-1 truncate text-[11.5px]">
-              <span className="mr-1.5 font-semibold" style={{ color: '#bc8cff' }}>Copilot</span>
-              {copilot.model && <span className="mr-1.5 text-faint">{copilot.model}</span>}
-              {headline}
-            </span>
-            {seconds > 0 && <span className="mono text-[10px] text-faint">{seconds}s</span>}
-            <button className="btn btn-sm" onClick={stopCopilot}>取消</button>
-          </div>
-
-          {/* 支持 thinking 的模型（Claude 4.6+）才有内容；没有就只显示阶段 */}
-          {copilot.thinking && (
-            <div className="mt-1.5 border-t pt-1.5">
-              <button
-                className="mb-1 flex items-center gap-1 text-[10px] text-faint hover:text-dim"
-                onClick={() => setShowThinking((v) => !v)}
-              >
-                <ChevronRight
-                  size={10}
-                  style={{ transform: showThinking ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}
-                />
-                模型正在想什么
-              </button>
-              {showThinking && (
-                <div
-                  ref={thinkingRef}
-                  className="max-h-28 overflow-y-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-[10.5px] leading-relaxed text-dim"
-                >
-                  {copilot.thinking}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      ) : copilot.error ? (
-        <div>
-          <div className="flex items-start gap-2">
-            <span className="min-w-0 flex-1 text-[11.5px] text-[var(--err)]">{copilot.error}</span>
-            <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
-          </div>
-          {/* 失败多半跟需求本身无关（模型抽风、协议跑偏、网断了），
-              不该逼用户重新打开 Modal 把需求再敲一遍 */}
-          {copilot.lastInstruction && (
-            <div className="mt-1.5 flex items-center gap-2 border-t pt-1.5">
-              <span className="min-w-0 flex-1 truncate text-[10px] text-faint" title={copilot.lastInstruction}>
-                {copilot.lastInstruction}
-              </span>
-              <button className="btn btn-sm" onClick={() => { setDismissed(false); retryCopilot() }}>
-                用同一需求重试
-              </button>
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="flex items-start gap-2">
-          <div className="min-w-0 flex-1">
-            <div className="mb-0.5 text-[11px] font-semibold" style={{ color: '#bc8cff' }}>
-              Copilot 完成
-            </div>
-            <div className="whitespace-pre-wrap text-[11px] leading-relaxed text-dim">
-              {copilot.explanation}
-            </div>
-            <div className="mt-1 text-[10px] text-faint">检查无误后记得保存（⌘S）</div>
-          </div>
-          <button className="btn btn-ghost btn-sm" onClick={() => setDismissed(true)}>✕</button>
-        </div>
-      )}
-    </div>
-  )
-}
+// CopilotModal 和 CopilotStatusBar 都去掉了，搬进 run/AssistantPanel.tsx 的
+// 右栏里。弹窗的问题不是样式：每改一次图都要重开一次，关掉之后需求文本就没了，
+// 想微调只能重打一遍；而浮条盖在画布左下角（z-30），和 Toast（z-100）、
+// Modal（z-50）三层各自为政，本身也是重复的一份 Copilot 状态渲染。

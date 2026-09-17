@@ -55,24 +55,70 @@ class EventBus:
             with contextlib.suppress(asyncio.QueueFull):
                 sub.queue.put_nowait(None)
 
-    async def subscribe(self, run_id: str) -> AsyncIterator[RunEventModel]:
+    def attach(self, run_id: str) -> "Subscription":
+        """立刻占一个位，之后再慢慢消费。
+
+        必须能在读历史**之前**占位。`subscribe()` 做不到这件事：它是异步
+        生成器，订阅者要等到第一次迭代才真正注册——而调用方通常先读完历史
+        才开始迭代。这中间发出的事件既不在历史里、也不在实时流里，就这么
+        没了。一次跑图从发起到订阅之间正好有几毫秒，丢掉的往往是开头那
+        两三条 node.started/node.finished，表现为"某个节点永远在转圈、
+        它的子步骤跑到了顶层"。
+        """
         sub = _Subscriber()
-        async with self._lock:
-            self._subs[run_id].add(sub)
-        try:
-            while True:
-                item = await sub.queue.get()
-                if item is None:
-                    break
-                yield item
-        finally:
-            async with self._lock:
-                self._subs[run_id].discard(sub)
-                if not self._subs[run_id]:
-                    self._subs.pop(run_id, None)
+        self._subs[run_id].add(sub)
+        return Subscription(self, run_id, sub)
+
+    def _detach(self, run_id: str, sub: _Subscriber) -> None:
+        self._subs.get(run_id, set()).discard(sub)
+        if run_id in self._subs and not self._subs[run_id]:
+            self._subs.pop(run_id, None)
+
+    async def subscribe(self, run_id: str) -> AsyncIterator[RunEventModel]:
+        """便捷入口：占位即消费。只适合不需要补历史的场景。"""
+        with self.attach(run_id) as sub:
+            async for event in sub.stream():
+                yield event
 
     def subscriber_count(self, run_id: str) -> int:
         return len(self._subs.get(run_id, ()))
+
+
+class Subscription:
+    """一个已经在收事件的订阅位。"""
+
+    def __init__(self, bus: EventBus, run_id: str, sub: _Subscriber) -> None:
+        self._bus = bus
+        self._run_id = run_id
+        self._sub = sub
+
+    @property
+    def dropped(self) -> int:
+        """因为消费太慢被丢掉的条数。不是 0 就说明这条时间线有洞。"""
+        return self._sub.dropped
+
+    async def stream(self, after: int = 0) -> AsyncIterator[RunEventModel]:
+        """吐出实时事件。
+
+        after 用来去重：占位到读完历史之间发出的事件，两边都有一份。
+        按 seq 过滤掉已经补过的，前端就不会看到同一步出现两次。
+        """
+        while True:
+            item = await self._sub.queue.get()
+            if item is None:
+                break
+            if after and (item.seq or 0) <= after:
+                continue
+            yield item
+
+    def close(self) -> None:
+        self._bus._detach(self._run_id, self._sub)
+
+    def __enter__(self) -> "Subscription":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 bus = EventBus()

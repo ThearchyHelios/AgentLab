@@ -12,7 +12,7 @@ const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 // 不用 playwright install：它既下不动也会动到已有缓存。系统 Chrome 就够了。
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-const CASES = ['db', 'think', 'human', 'issue', 'failed']
+const CASES = ['db', 'think', 'human', 'issue', 'failed', 'loop_approve']
 
 let failed = 0
 const check = (name, cond, detail = '') => {
