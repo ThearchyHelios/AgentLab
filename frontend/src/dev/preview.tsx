@@ -27,6 +27,7 @@ const CASES: { key: Bucket; question: string; phase: StreamTurn['phase']; status
   { key: 'issue', question: '出一份本月经营分析', phase: 'done', status: '完成' },
   { key: 'failed', question: '查一下不存在的那张表', phase: 'error', status: '' },
   { key: 'loop_approve', question: '写条上线公告，我过一眼再发', phase: 'done', status: '完成' },
+  { key: 'supervisor', question: '冬虫夏草是什么', phase: 'done', status: '完成' },
 ]
 
 function buildTurns(): StreamTurn[] {
