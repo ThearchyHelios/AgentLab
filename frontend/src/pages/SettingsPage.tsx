@@ -4,6 +4,7 @@ import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
 import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
+import { DataSourcesTab } from './DataSourcesTab'
 import type { Provider } from '../types'
 
 export function SettingsPage() {
@@ -13,6 +14,7 @@ export function SettingsPage() {
       <Tabs
         tabs={[
           { key: 'providers', label: '模型接入' },
+          { key: 'datasources', label: '数据源' },
           { key: 'prefs', label: '偏好设置' },
           { key: 'system', label: '运行环境' },
         ]}
@@ -21,6 +23,7 @@ export function SettingsPage() {
       />
       <div className="flex-1 overflow-y-auto p-4">
         {tab === 'providers' && <ProvidersTab />}
+        {tab === 'datasources' && <DataSourcesTab />}
         {tab === 'prefs' && <PrefsTab />}
         {tab === 'system' && <SystemTab />}
       </div>
