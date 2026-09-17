@@ -1,9 +1,10 @@
 import { useEffect } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
-import { BookOpen, FlaskConical, History, Settings, Wrench } from 'lucide-react'
+import { BookOpen, FlaskConical, History, MessageSquare, Settings, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from './api/client'
 import { useCatalog } from './store/catalog'
+import { ChatPage } from './pages/ChatPage'
 import { StudioPage } from './pages/StudioPage'
 import { RunsPage } from './pages/RunsPage'
 import { ToolsPage } from './pages/ToolsPage'
@@ -12,6 +13,7 @@ import { SettingsPage, applyTheme } from './pages/SettingsPage'
 import { Spinner } from './components/ui'
 
 const NAV = [
+  { to: '/chat', label: '问数据', icon: MessageSquare },
   { to: '/studio', label: '编排', icon: FlaskConical },
   { to: '/runs', label: '运行', icon: History },
   { to: '/tools', label: '工具', icon: Wrench },
@@ -73,7 +75,9 @@ export default function App() {
 
       <main className="min-w-0 flex-1">
         <Routes>
-          <Route path="/" element={<Navigate to="/studio" replace />} />
+          {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人 */}
+          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/chat" element={<ChatPage />} />
           <Route path="/studio" element={<StudioPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/tools" element={<ToolsPage />} />

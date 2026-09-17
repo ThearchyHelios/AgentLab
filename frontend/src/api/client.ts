@@ -77,6 +77,19 @@ export const api = {
   },
 
   // ---- 运行 ----
+  datasources: {
+    list: () => get<any[]>('/datasources'),
+    kinds: () => get<any>('/datasources/kinds'),
+    create: (body: any) => post<any>('/datasources', body),
+    update: (id: string, body: any) => patch<any>(`/datasources/${id}`, body),
+    remove: (id: string) => del(`/datasources/${id}`),
+    test: (id: string) => post<any>(`/datasources/${id}/test`, {}),
+    introspect: (id: string, schema?: string) =>
+      post<any>(`/datasources/${id}/introspect${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`, {}),
+    schema: (id: string, table?: string) =>
+      get<any>(`/datasources/${id}/schema${table ? `?table=${encodeURIComponent(table)}` : ''}`),
+  },
+
   runs: {
     list: (params?: { workflow_id?: string; status?: string; limit?: number }) => {
       const q = new URLSearchParams(
