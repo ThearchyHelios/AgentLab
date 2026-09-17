@@ -36,6 +36,10 @@ _DEFAULT_PORTS = {
 
 SUPPORTED_KINDS = tuple(sorted(set(_DRIVERS)))
 
+# options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
+# schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
+_NON_DRIVER_OPTIONS = frozenset({"schema"})
+
 
 @dataclass
 class QueryResult:
@@ -69,6 +73,11 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
         raise ValueError(f"不支持的数据库类型：{source.kind}（支持 {', '.join(SUPPORTED_KINDS)}）")
 
     options: dict[str, Any] = dict(source.options or {})
+    # options 混着两类东西：驱动参数（charset、service_name…）和我们自己的配置
+    # （schema 指探查哪个 schema）。后者不能拼进连接串，否则驱动会把它当成
+    # 未知的连接参数直接拒掉。
+    for key in _NON_DRIVER_OPTIONS:
+        options.pop(key, None)
 
     if kind == "sqlite":
         # SQLite 没有主机和账号，database 就是文件路径
