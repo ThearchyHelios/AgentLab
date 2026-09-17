@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { AlertTriangle, Check, Hand, Loader2, Sparkles, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, sourceHandles } from './nodeDefs'
+import { formatDuration } from '../run/decode'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
 
@@ -149,7 +150,7 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
       {(runtime?.durationMs != null || runtime?.error) && (
         <div className="flex items-center gap-2 border-t px-2.5 py-1">
           {runtime.durationMs != null && (
-            <span className="text-[10px] text-faint">{formatMs(runtime.durationMs)}</span>
+            <span className="text-[10px] text-faint">{formatDuration(runtime.durationMs)}</span>
           )}
           {runtime.error && (
             <span className="truncate text-[10px] text-[var(--err)]" title={runtime.error}>
@@ -185,10 +186,7 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
   )
 }
 
-export function formatMs(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`
-}
-
+// 耗时格式化原本在这里又写了一份（formatMs），和 decode.ts 的规则不一样：
+// 画布节点上显示"0ms"，右边助手栏里同一步什么都不显示。两块并排放着，
+// 用户看到的是两套说法。统一用 decode.ts 那份。
 export const NodeCard = memo(NodeCardImpl)

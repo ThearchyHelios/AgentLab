@@ -5,6 +5,7 @@ import {
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
+import type { CopilotOp } from '../run/decode'
 import type {
   GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue, Workflow,
 } from '../types'
@@ -63,6 +64,27 @@ export function toGraph(nodes: FlowNode[], edges: Edge[]): GraphSpec {
 
 // -------------------------------------------------------------------------
 
+/**
+ * 一轮 Copilot 对话。
+ *
+ * 以前操作流是用完即弃的——直接改画布，只在浮条上留一句 lastOp。那意味着
+ * 生成结束后，"它为什么这么建"这件事就没了：画布上是结果，过程不可回看。
+ * 侧栏要显示"它大致在想什么、动了哪些节点"，就得把操作流本身留下来。
+ */
+export interface CopilotTurn {
+  id: string
+  instruction: string
+  /** 原始操作流，交给 decodeCopilot 翻译。thinking 在写入时就已合并 */
+  ops: CopilotOp[]
+  phase: 'running' | 'done' | 'error'
+  explanation: string
+  error: string
+}
+
+// 只留最近几轮。画布只反映最后一次生成的结果，更早的轮次是参考而不是现状，
+// 无上限地攒着只会把内存和滚动条都撑坏。
+const COPILOT_TURN_LIMIT = 10
+
 interface StudioState {
   workflow: Workflow | null
   nodes: FlowNode[]
@@ -92,6 +114,7 @@ interface StudioState {
     lastUseBase: boolean
   }
   copilotNew: string[]
+  copilotTurns: CopilotTurn[]
   cancelCopilot: (() => void) | null
 
   // actions
@@ -113,6 +136,7 @@ interface StudioState {
   runCopilot: (instruction: string, useBase: boolean, model?: string | null) => void
   stopCopilot: () => void
   retryCopilot: () => void
+  clearCopilot: () => void
   attachRun: (runId: string) => Promise<void>
   stopRun: () => Promise<void>
   clearRun: () => void
@@ -137,6 +161,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   copilot: { active: false, lastOp: '', explanation: '', error: '', model: '',
              phase: '', thinking: '', elapsedMs: 0, lastInstruction: '', lastUseBase: false },
   copilotNew: [],
+  copilotTurns: [],
   cancelCopilot: null,
 
   load: (workflow) => {
@@ -145,6 +170,8 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({
       workflow, nodes, edges, selectedId: null, dirty: false, issues: [],
       run: null, events: [], runtime: {}, activeEdges: [], streaming: false, unsubscribe: null,
+      // 换了一张图，之前那些"我让它改成这样"就不再指向眼前这张图了
+      copilotTurns: [],
     })
     void get().validate()
   },
@@ -310,6 +337,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   runCopilot: (instruction, useBase, model) => {
     const state = get()
     state.cancelCopilot?.()
+    const turnId = `c${Date.now().toString(36)}${(idSeq++ % 1000).toString(36)}`
     set({
       copilot: {
         active: true, lastOp: '', explanation: '', error: '', model: model ?? '',
@@ -317,8 +345,37 @@ export const useStudio = create<StudioState>((set, get) => ({
         lastInstruction: instruction, lastUseBase: useBase,
       },
       copilotNew: [],
+      copilotTurns: [
+        ...state.copilotTurns.slice(-(COPILOT_TURN_LIMIT - 1)),
+        { id: turnId, instruction, ops: [], phase: 'running', explanation: '', error: '' },
+      ],
     })
     if (!useBase) set({ nodes: [], edges: [], dirty: true })
+
+    /**
+     * 记下这一条操作，供侧栏回看。
+     *
+     * thinking 在写入时就合并：一次生成的 delta 是几百上千条，逐条存下来
+     * 光是数组本身就比图大一个量级，而 decodeCopilot 反正也要把它们并成一条。
+     */
+    const record = (op: CopilotOp) => {
+      set((s: StudioState) => ({
+        copilotTurns: s.copilotTurns.map((t) => {
+          if (t.id !== turnId) return t
+          const last = t.ops[t.ops.length - 1]
+          if (op.op === 'thinking' && last?.op === 'thinking') {
+            const merged = { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }
+            return { ...t, ops: [...t.ops.slice(0, -1), merged] }
+          }
+          return { ...t, ops: [...t.ops, op] }
+        }),
+      }))
+    }
+    const settle = (patch: Partial<CopilotTurn>) => {
+      set((s: StudioState) => ({
+        copilotTurns: s.copilotTurns.map((t) => (t.id === turnId ? { ...t, ...patch } : t)),
+      }))
+    }
 
     // 流式期间的临时摆位：新节点放在其入边源的右侧；final 会用后端排版整体替换
     const place = (nodeId: string): { x: number; y: number } => {
@@ -340,6 +397,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       },
       (op) => {
         const s = get()
+        record(op)
         switch (op.op) {
           case 'model':
             // 后端首帧告知实际用的模型，浮条上直接显示，不用猜
@@ -441,14 +499,16 @@ export const useStudio = create<StudioState>((set, get) => ({
                   copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
                              thinking: '', elapsedMs: 0, error: '',
                              explanation: op.explanation ?? get().copilot.explanation } })
+            settle({ phase: 'done', explanation: op.explanation ?? get().copilot.explanation })
             void get().validate()
             setTimeout(() => set({ copilotNew: [] }), 6000)
             break
           }
           case 'error':
-            // 保留 lastInstruction：失败浮条上的"重试"要用它，不能让用户重填
+            // 保留 lastInstruction：失败后的"重试"要用它，不能让用户重填
             set({ copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
                              thinking: '', explanation: '', error: op.message ?? '生成失败' } })
+            settle({ phase: 'error', error: op.message ?? '生成失败' })
             break
         }
       },
@@ -458,6 +518,12 @@ export const useStudio = create<StudioState>((set, get) => ({
           copilot: { ...c, active: false, error: error ?? c.error },
           cancelCopilot: null,
         })
+        // 流断了但没收到 final/error：这一轮不能一直挂在"进行中"，
+        // 否则侧栏会永远转圈，而后台其实什么都不会再来了
+        const t = get().copilotTurns.find((x) => x.id === turnId)
+        if (t?.phase === 'running') {
+          settle(error ? { phase: 'error', error } : { phase: 'done' })
+        }
       },
     )
     set({ cancelCopilot: stop })
@@ -468,8 +534,12 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({
       copilot: { ...get().copilot, active: false, phase: '', thinking: '' },
       cancelCopilot: null,
+      copilotTurns: get().copilotTurns.map((t) =>
+        t.phase === 'running' ? { ...t, phase: 'error', error: '已取消' } : t),
     })
   },
+
+  clearCopilot: () => set({ copilotTurns: [] }),
 
   retryCopilot: () => {
     // 失败后用同一条需求重来。以前只能重新打开 Modal 把需求再敲一遍，

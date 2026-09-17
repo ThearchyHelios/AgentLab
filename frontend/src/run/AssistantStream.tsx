@@ -34,6 +34,8 @@ export interface StreamTurn {
   output?: Record<string, any> | null
   error?: string
   runId?: string
+  /** formal / exploratory。出具横幅要据此标注"不进正式归档" */
+  runClass?: string
   /** 这一轮建出来的图，可展开看、可放到画布 */
   graph?: any
   graphNote?: string
@@ -140,7 +142,9 @@ function TurnCard({ turn, dense, approvals, onOpenGraph }: {
 
         {approvals}
 
-        {turn.output && <Output output={turn.output} dense={dense} />}
+        {turn.output && (
+          <Output output={turn.output} dense={dense} runClass={turn.runClass} />
+        )}
 
         {turn.graph && (
           <GraphPeek graph={turn.graph} note={turn.graphNote}
@@ -295,7 +299,9 @@ function ResultTable({ table, dense }: { table: Table; dense: boolean }) {
   )
 }
 
-function Output({ output, dense }: { output: Record<string, any>; dense: boolean }) {
+function Output({ output, dense, runClass }: {
+  output: Record<string, any>; dense: boolean; runClass?: string
+}) {
   // _issuance 这类下划线开头的是内部字段，不是给人看的成果。
   // 空值也要滤掉：output 里留一个 {"result": ""} 很常见（图跑通了但出口
   // 没接上），它会渲染出一条什么都没有的分隔线——用户只会以为界面坏了
@@ -306,7 +312,7 @@ function Output({ output, dense }: { output: Record<string, any>; dense: boolean
 
   return (
     <div className="mt-2 space-y-2 border-t pt-2">
-      {issuance && <IssuanceTag issuance={issuance} />}
+      {issuance && <IssuanceBanner issuance={issuance} runClass={runClass} />}
       {entries.map(([key, value]) => (
         <div key={key}>
           {entries.length > 1 && (
@@ -367,37 +373,62 @@ function OutputValue({ value, dense }: { value: unknown; dense: boolean }) {
   )
 }
 
+const TIER_META: Record<string, { label: string; color: string; hint: string }> = {
+  formal: { label: '正式出具', color: 'var(--ok)', hint: '指标齐全，叙述中所有数字均可回指口径卡' },
+  degraded: { label: '降档出具', color: 'var(--warn)', hint: '存在缺口，结论请对照下方声明使用' },
+  withheld: { label: '不予出具', color: 'var(--err)', hint: '必需指标缺失或数字无法溯源，本期结论不作数' },
+}
+
 /**
- * 出具档位。
+ * 出具档位。全站唯一一份——画布助手栏、问数据页、运行详情都用它。
  *
- * 数据取自 output._issuance 而不是 issuance 事件——事件里只有 tier /
+ * 数据取自 output._issuance 而不是 issuance 事件：事件里只有 tier /
  * missing_* / unmatched(计数)，而 output 里那份还带着 matched_numbers、
- * metrics_checked、unmatched_numbers[].token。拿事件当数据源，横幅会静默
- * 退化成"核对 0 个指标"，比不显示更糟。
+ * metrics_checked、calibers、unmatched_numbers[].token。拿事件当数据源，
+ * 横幅会静默退化成"核对 0 个指标"，比不显示更糟。
  */
-function IssuanceTag({ issuance }: { issuance: any }) {
+export function IssuanceBanner({ issuance, runClass }: {
+  issuance: any; runClass?: string
+}) {
   const tier = String(issuance?.tier ?? '')
-  const label = { formal: '正式出具', degraded: '降档出具', withheld: '不予出具' }[tier] ?? tier
   if (!tier) return null
-  const color = tier === 'formal' ? 'var(--ok)' : tier === 'withheld' ? 'var(--err)' : 'var(--warn)'
+  const meta = TIER_META[tier] ?? { label: tier, color: 'var(--warn)', hint: '' }
   const unmatched: any[] = issuance?.unmatched_numbers ?? []
-  const gaps: string[] = issuance?.gaps ?? []
 
   return (
-    <div className="rounded border px-2 py-1.5 text-[10.5px] leading-relaxed"
-         style={{ borderColor: color, color }}>
-      <span className="font-semibold">{label}</span>
-      {issuance?.metrics_checked != null && (
-        <span className="ml-2 text-faint">
-          核对 {issuance.metrics_checked} 个指标 · 回指 {issuance.matched_numbers ?? 0} 个数字
+    <div className="rounded-lg border p-2" style={{ borderColor: meta.color }}>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-[11.5px] font-semibold" style={{ color: meta.color }}>
+          ⚖ {meta.label}
         </span>
-      )}
-      {!!unmatched.length && (
-        <div className="mt-1">
-          无法回指：{unmatched.slice(0, 6).map((u) => u.token ?? u).join('、')}
+        {runClass === 'exploratory' && (
+          <span className="chip" style={{ color: 'var(--warn)' }}>探索性 · 不进正式归档</span>
+        )}
+        <span className="ml-auto text-[10px] text-faint">
+          回指 {issuance.matched_numbers ?? 0} 个数字 / 核对 {issuance.metrics_checked ?? 0} 个指标
+        </span>
+      </div>
+      {meta.hint && <div className="mt-1 text-[10.5px] leading-relaxed text-faint">{meta.hint}</div>}
+      {(issuance.calibers ?? []).map((c: any) => (
+        <div key={c.node ?? c.caliber} className="mt-1 text-[10.5px] text-dim">
+          口径：{c.caliber} @ {c.version}
+        </div>
+      ))}
+      {!!issuance.missing_required?.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--err)' }}>
+          缺必需指标：{issuance.missing_required.join('、')}
         </div>
       )}
-      {!!gaps.length && <div className="mt-1">{gaps.join('；')}</div>}
+      {!!issuance.missing_expected?.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--warn)' }}>
+          缺数据声明：{issuance.missing_expected.join('、')} 本期缺失
+        </div>
+      )}
+      {!!unmatched.length && (
+        <div className="mt-1 text-[10.5px]" style={{ color: 'var(--warn)' }}>
+          无法回指的数字：{unmatched.map((u: any) => u.token ?? u).join('、')}
+        </div>
+      )}
     </div>
   )
 }

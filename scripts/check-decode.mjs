@@ -92,6 +92,32 @@ console.log('\n=== 人工审批（含重放）===')
     !all.some((s) => s.status === 'done' && s.level === 'warn'))
 }
 
+console.log('\n=== 循环里的多轮审批 ===')
+{
+  // 真实运行：驳回 → 改写 → 再驳回（带备注）→ 改写 → 放行。三轮，每轮都有
+  // 重放。按内容去重必然出错——三轮的 title 一模一样，和重放无法区分。
+  // 这条只有拿真实运行才测得出来：构造样本不会长成这样。
+  const steps = mod.decodeRun(fixtures.loop_approve)
+  const all = flatten(steps)
+  const asks = all.filter((s) => s.kind === 'human')
+  check('三轮审批就是三条，不多不少', asks.length === 3, `${asks.length} 条`)
+  check('每条都带着你的决定', asks.every((s) => /你(放行|驳回)了/.test(s.title)),
+    asks.map((s) => s.title).join(' | '))
+  check('两次驳回一次放行，顺序没错',
+    asks.filter((s) => s.title.includes('驳回')).length === 2
+    && asks[2]?.title.includes('放行'))
+  // detail 里是被审的草稿全文，打出来会刷屏——只报哪一轮带了备注
+  check('备注跟着那一轮走', asks.some((s) => s.detail?.includes('不高级')),
+    asks.map((s, i) => (s.detail?.includes('你的备注') ? `#${i + 1} 有备注` : '')).filter(Boolean).join(' '))
+  check('没有落单的"你放行了/你驳回了"孤行',
+    !all.some((s) => s.title === '你放行了' || s.title === '你驳回了'))
+  check('重放不制造重复节点', (() => {
+    const ids = steps.filter((s) => s.kind === 'node').map((s) => s.nodeId)
+    return new Set(ids).size === ids.length
+  })())
+  check('跑完了没有还在转的行', !all.some((s) => s.status === 'running'))
+}
+
 console.log('\n=== 出具判定 ===')
 {
   const steps = mod.decodeRun(fixtures.issue)
@@ -142,13 +168,37 @@ console.log('\n=== Copilot 操作流 ===')
     { op: 'add_edge', edge: { source: 'a', target: 'q' } },
     { op: 'done', explanation: '完成' },
   ]
+  const mid = mod.decodeCopilot(ops.slice(0, 2))
+  check('心跳不堆行', mid.filter((s) => s.kind === 'lifecycle' && s.status === 'running').length === 1)
+
   const steps = mod.decodeCopilot(ops)
-  check('心跳不堆行', steps.filter((s) => s.kind === 'lifecycle' && s.status === 'running').length === 1)
   check('连续思考并成一条', steps.filter((s) => s.kind === 'think').length === 1,
     `${steps.filter((s) => s.kind === 'think').length} 条`)
   check('思考全文保留在详情', steps.find((s) => s.kind === 'think')?.detail?.includes('先看表结构'))
   check('连线不单独成行', !steps.some((s) => s.title.includes('edge')))
   check('节点用标签不用 id', steps.some((s) => s.kind === 'node' && s.title === '取数'))
+  // 生成完了那条"正在理解需求…"还在转圈的话，看上去像卡住了
+  check('生成结束后没有还在转的行', !steps.some((s) => s.status === 'running'),
+    steps.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+
+  // 改图场景：这一轮加了 1 个节点，但整张图有 4 个。说"共 1 步"是错的
+  const edited = mod.decodeCopilot([
+    ...ops,
+    { op: 'final', graph: { nodes: [{ id: 'a' }, { id: 'q' }, { id: 'b' }, { id: 'c' }] } },
+  ])
+  const tail = edited[edited.length - 1]
+  check('改图时说清"加了几步"和"整张图几步"',
+    tail.title.includes('加了 1 步') && tail.title.includes('共 4 步'), tail.title)
+
+  const built = mod.decodeCopilot([
+    { op: 'add_node', node: { id: 'a', type: 'input' } },
+    { op: 'add_node', node: { id: 'b', type: 'output' } },
+    { op: 'done', explanation: '' },
+    { op: 'final', graph: { nodes: [{ id: 'a' }, { id: 'b' }] } },
+  ])
+  check('从零新建时不啰嗦，只说共几步',
+    built[built.length - 1].title === '流程搭好了，共 2 步',
+    built[built.length - 1].title)
 }
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')

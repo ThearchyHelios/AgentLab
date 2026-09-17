@@ -26,6 +26,7 @@ const CASES: { key: Bucket; question: string; phase: StreamTurn['phase']; status
   { key: 'human', question: '把这批客户的信用额度调高 10%', phase: 'waiting', status: '等待你的确认' },
   { key: 'issue', question: '出一份本月经营分析', phase: 'done', status: '完成' },
   { key: 'failed', question: '查一下不存在的那张表', phase: 'error', status: '' },
+  { key: 'loop_approve', question: '写条上线公告，我过一眼再发', phase: 'done', status: '完成' },
 ]
 
 function buildTurns(): StreamTurn[] {

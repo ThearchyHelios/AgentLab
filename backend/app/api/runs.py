@@ -332,7 +332,13 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
     await websocket.accept()
     after = int(websocket.query_params.get("after", 0) or 0)
 
+    # 先占订阅位，再读历史。反过来的话，两步之间图正好跑出来的事件既不在
+    # 历史里、也不在实时流里——永远丢了。实测就是这样：一次跑图的开头
+    # 两三条 node.started/node.finished 消失，界面上表现为某个节点永远
+    # 在转圈、它的子步骤跑到了顶层。
+    subscription = bus.attach(run_id)
     try:
+        last_seq = after
         async with SessionLocal() as session:
             rows = await session.execute(
                 select(RunEvent)
@@ -340,6 +346,7 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
                 .order_by(RunEvent.seq)
             )
             for event in rows.scalars():
+                last_seq = max(last_seq, event.seq or 0)
                 await websocket.send_json(
                     {
                         "seq": event.seq,
@@ -358,8 +365,8 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
             await websocket.close()
             return
 
-        stream = bus.subscribe(run_id)
-        pump = asyncio.create_task(_pump(websocket, stream))
+        # 占位期间攒下的那几条历史里也有，按 seq 滤掉，否则前端同一步收两遍
+        pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq)))
         try:
             # 客户端断开时读操作会抛异常，用它来结束这条连接
             while True:
@@ -375,6 +382,8 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
     except Exception:  # noqa: BLE001
         with contextlib.suppress(Exception):
             await websocket.close()
+    finally:
+        subscription.close()
 
 
 async def _pump(websocket: WebSocket, stream: Any) -> None:
