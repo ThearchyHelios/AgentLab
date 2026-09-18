@@ -167,6 +167,25 @@ _ADAPTIVE_THINKING_PREFIXES = _NO_SAMPLING_PREFIXES
 # 支持 output_config.effort
 _EFFORT_PREFIXES = _NO_SAMPLING_PREFIXES + ("claude-opus-4-5",)
 
+# 交错思考（工具结果回来之后再想一段，而不是一轮开头想完就只剩执行）。
+#
+# 4.6 及以后走 adaptive thinking，交错是自带的，不需要也不该再挂 beta header
+# ——在 Opus 4.6 上手动模式压根没有交错思考，只有 adaptive 有。上面那张
+# _ADAPTIVE_THINKING_PREFIXES 覆盖的都属于这一档。
+#
+# 需要显式开的是 Claude 4 / 4.5 这一代。目录里没有列它们，但模型名是放行的
+# （用户可以手填），所以这条路径要留着。Haiku 4.5 不支持，前缀也就不包含它。
+_INTERLEAVED_BETA_PREFIXES = ("claude-opus-4", "claude-sonnet-4")
+INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
+
+
+def needs_interleaved_beta(model: str) -> bool:
+    """这个模型要不要靠 beta header 才会在工具之间思考。"""
+    name = _norm(model)
+    if supports_adaptive_thinking(name):
+        return False   # adaptive 自带，多挂一个 header 只会是噪音
+    return name.startswith(_INTERLEAVED_BETA_PREFIXES)
+
 
 def _norm(model: str) -> str:
     """去掉 openrouter 之类的前缀，只看模型名本身。"""

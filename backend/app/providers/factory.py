@@ -138,17 +138,49 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         # 会出现"思考完就没额度写答案"，返回一条空正文。
         kwargs.setdefault("max_tokens", 8192)
 
+        # 交错思考 —— 工具结果回来之后模型还能再想一段，而不是一轮开头想完
+        # 就只剩埋头执行。串行跑工具时这一条最要紧：每一步之间本来就该重新
+        # 判断一次"看到这个结果之后下一步该干嘛"。
+        #
+        # 两代模型的开法完全不同，这也是为什么这里要分叉：
+        #   4.6 起  adaptive thinking **自带**交错，不需要 beta header。
+        #           （Opus 4.6 上手动模式压根没有交错，只有 adaptive 有，
+        #            所以这一档绝不能退回手动。）
+        #   4 / 4.5 手动开 thinking + 挂 interleaved-thinking beta header。
+        #           目录里没列这一代，但模型名是放行的，用户可以手填。
         model_kwargs: dict[str, Any] = {}
+        thinking_on = False
+        mode = spec.thinking or "summarized"
+
         if catalog.supports_adaptive_thinking(model):
-            mode = spec.thinking or "summarized"
             if mode in ("adaptive", "summarized"):
                 # summarized 会把思考摘要一起返回，画布上就能展示"它在想什么"
                 kwargs["thinking"] = {
                     "type": "adaptive",
                     "display": "summarized" if mode == "summarized" else "omitted",
                 }
+                thinking_on = True
             elif mode == "off":
                 kwargs["thinking"] = {"type": "disabled"}
+        elif mode != "off" and catalog.needs_interleaved_beta(model):
+            # 光挂 header 是不够的：这一代默认根本没开 thinking，
+            # 没有思考可交错，header 就是一条什么都不做的空设置
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": max(1024, int(kwargs["max_tokens"]) // 2),
+            }
+            thinking_on = True
+            # betas 会把调用改道 client.beta.messages。自建网关可能不认它，
+            # 而那是请求时才炸的，所以留一个关得掉的口子
+            if extra.get("interleaved_thinking") is not False:
+                kwargs["betas"] = [catalog.INTERLEAVED_BETA]
+
+        # 开了 thinking 就不能再传 temperature（要求是 1）。4.6 起的模型压根
+        # 不收采样参数，上面 supports_sampling 已经挡住了；漏的是 4/4.5 这一代
+        # ——它们本来收 temperature，一旦开了 thinking 再传就是 400
+        if thinking_on:
+            kwargs.pop("temperature", None)
+
         if spec.effort and catalog.supports_effort(model):
             model_kwargs["output_config"] = {"effort": spec.effort}
         if model_kwargs:
@@ -226,6 +258,30 @@ class _LazyReasoningChatOpenAI:
 
 
 _ReasoningAwareChatOpenAI = _LazyReasoningChatOpenAI()
+
+
+def bind_tools_safely(model: BaseChatModel, tools: list[Any], *, parallel: bool) -> Any:
+    """绑定工具，并在需要时让模型一次只发一个工具调用。
+
+    `parallel_tool_calls=False` 两家都认，只是落点不同：ChatAnthropic 把它翻成
+    `tool_choice={"type": "auto", "disable_parallel_tool_use": True}`（type 是 auto
+    而不是强制某个工具，所以和 thinking 并存没问题），ChatOpenAI 原样透传。
+
+    但 provider 可以是任意 OpenAI 兼容网关（Ollama、vLLM、OpenRouter…），个别
+    网关可能在**请求时**才拒绝这个字段——那种情况这里的 try 拦不住。真撞上了，
+    把节点上的"并行执行工具"打开即可，绑定就退回原样。
+
+    无论如何这都只是省 token 的优化：模型仍然多发了几个调用时，编排层一轮只执行
+    第一个，串行语义不依赖这里能不能传成功。
+    """
+    if not tools:
+        return model
+    if parallel:
+        return model.bind_tools(tools)
+    try:
+        return model.bind_tools(tools, parallel_tool_calls=False)
+    except (TypeError, ValueError, NotImplementedError):
+        return model.bind_tools(tools)
 
 
 async def get_chat_model(session: AsyncSession, spec: ModelSpec) -> tuple[BaseChatModel, str]:

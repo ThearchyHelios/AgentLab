@@ -17,8 +17,21 @@ from app.db.models import Skill
 from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState, message_text, template_context, thinking_text
 from app.providers import catalog
-from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
-from app.tools.registry import ToolContext, build_tools, get_spec
+from app.providers.factory import (
+    ModelSpec,
+    ProviderNotConfigured,
+    bind_tools_safely,
+    get_chat_model,
+)
+from app.tools.registry import (
+    ToolArgsError,
+    ToolContext,
+    args_model_of,
+    build_tools,
+    describe_args,
+    get_spec,
+    prepare_args,
+)
 
 # --------------------------------------------------------------------------
 # 公共部分
@@ -270,6 +283,33 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         return await build_tools(names, tool_ctx, session=session)
 
 
+SKIPPED_NOTE = (
+    "本轮只执行了第一个工具。看到它的结果之后，再决定这一个还要不要调、要用什么参数调。"
+)
+
+
+def split_tool_calls(
+    tool_calls: list[dict[str, Any]], *, parallel: bool
+) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], ToolMessage]]]:
+    """把一轮里的工具调用分成"这次跑"和"这次不跑"。
+
+    串行时只跑第一个。剩下的不能就这么丢掉：两家 API 都要求每个 tool_use 在
+    下一轮有一条配对的 tool_result，少一条下次调用直接 400。所以这里给每个
+    未执行的调用配一条说明性的 ToolMessage 一起交出去。
+
+    它们也**绝不能**发 tool.start —— 前端靠 call_id 配对 start/end
+    （frontend/src/run/decode.ts），发了一条没有结尾的 start，那个工具卡片就会
+    在界面上永远转圈。所以这个函数不碰事件，只产消息。
+    """
+    if parallel or len(tool_calls) <= 1:
+        return list(tool_calls), []
+    deferred = [
+        (call, ToolMessage(content=SKIPPED_NOTE, tool_call_id=call.get("id") or f"skipped-{i}"))
+        for i, call in enumerate(tool_calls[1:])
+    ]
+    return tool_calls[:1], deferred
+
+
 def _needs_approval(ctx: NodeContext, tool_name: str) -> bool:
     mode = ctx.cfg("approval", "dangerous")  # never | dangerous | always
     if mode == "always":
@@ -295,10 +335,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     tools = await _resolve_tools(ctx, state)
     tool_map = {t.name: t for t in tools}
-    model = base_model.bind_tools(tools) if tools else base_model
+    # 默认串行：一轮只调一个工具，拿到结果再想下一步。并行更快，但一批工具
+    # 中间没有任何新的思考——第二个调用是照着"还没看到第一个结果"时的判断发出来的
+    parallel_tools = bool(ctx.cfg("parallel_tools", False))
+    model = bind_tools_safely(base_model, tools, parallel=parallel_tools)
 
     messages = await _build_messages(state, ctx)
-    max_steps = min(int(ctx.cfg("max_steps", 8) or 8), settings.max_agent_steps)
+    max_steps = min(int(ctx.cfg("max_steps", 12) or 12), settings.max_agent_steps)
     total_usage: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
     transcript: list[dict[str, Any]] = []
 
@@ -328,7 +371,9 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             final_text = message_text(response)
             break
 
-        for call in tool_calls:
+        run_calls, deferred = split_tool_calls(tool_calls, parallel=parallel_tools)
+
+        for call in run_calls:
             name = call.get("name", "")
             args = call.get("args", {}) or {}
             call_id = call.get("id") or f"{ctx.node.id}-{step}-{name}"
@@ -338,6 +383,24 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     ToolMessage(content=f"错误：没有名为 {name} 的工具", tool_call_id=call_id)
                 )
                 continue
+
+            # 参数先过 schema 再决定要不要打扰人审批：参数就不对的调用没必要问人，
+            # 而纠正过的参数必须是人在审批框里看到的那一份
+            schema = args_model_of(tool_map[name])
+            if schema is not None:
+                try:
+                    args, fix_note = prepare_args(schema, args)
+                except ToolArgsError as e:
+                    # 不执行，把"它接受什么"原样喂回去。模型下一步照着改就行，
+                    # 这才是失败之后真正能自愈的重试——以前喂回去的是一句
+                    # TypeError，里面既没有正确参数名也没有字段说明
+                    ctx.emit(EventType.TOOL_ERROR, tool=name, call_id=call_id, error=str(e))
+                    messages.append(ToolMessage(content=str(e), tool_call_id=call_id))
+                    transcript.append({"tool": name, "args": args, "ok": False, "result": str(e)})
+                    continue
+                if fix_note:
+                    ctx.emit(EventType.LOG, level="warn",
+                             message=f"工具 {name}：{fix_note}")
 
             if _needs_approval(ctx, name):
                 ctx.emit(
@@ -377,6 +440,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 ok = True
             except Exception as e:  # noqa: BLE001 - 工具失败要喂回模型，让它自己纠错
                 content = f"工具执行失败：{type(e).__name__}: {e}"
+                if isinstance(e, TypeError) and schema is not None:
+                    # 签名对不上还能走到这儿，说明 schema 和函数本身不一致（工具的 bug）。
+                    # 模型改不了这个，但把参数表摊开至少让它别在同一个地方反复试
+                    content += f"\n{describe_args(schema, args)}"
                 ok = False
             elapsed = int((time.perf_counter() - started) * 1000)
             snapshot_id: str | None = None
@@ -402,13 +469,32 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 {"tool": name, "args": args, "ok": ok, "duration_ms": elapsed, "result": content[:4000]}
             )
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
+
+        # 没跑的那些排在执行过的后面，保持模型原本的调用顺序
+        for call, message in deferred:
+            messages.append(message)
+            transcript.append(
+                {"tool": call.get("name", ""), "args": call.get("args", {}) or {}, "skipped": True}
+            )
     else:
-        final_text = message_text(messages[-1]) if messages else ""
-        ctx.emit(
-            EventType.LOG,
-            level="warn",
-            message=f"agent 达到最大步数 {max_steps}，提前收尾",
+        # 步数用完了。成果只能取模型自己说过的话——messages[-1] 很可能是一条
+        # ToolMessage：工具的原始返回，或者串行模式下那句"本轮只执行了第一个
+        # 工具"。后者真的漏到用户面前当过答案（run dd9927e6），一句内部管道
+        # 文案冒充结论，比明说"没跑完"糟糕得多。
+        final_text = next(
+            (text for m in reversed(messages)
+             if isinstance(m, AIMessage) and (text := message_text(m).strip())),
+            "",
         )
+        hint = (
+            f"agent 用满了 {max_steps} 步还没给出结论。"
+            "把节点上的「最大步数」调大；如果它大部分步数花在逐张表查结构上，"
+            "也可以在提示词里点明该查哪几张表。"
+        )
+        # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
+        # 一个没头没尾的答案，而不知道是被步数掐断的
+        final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
+        ctx.emit(EventType.LOG, level="warn", message=hint)
 
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
