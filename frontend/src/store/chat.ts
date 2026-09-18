@@ -108,7 +108,7 @@ export const useChat = create<ChatState>((set, get) => ({
     }))
 
     const cancelCopilot = streamCopilot(
-      { instruction: question, base_graph: null },
+      { instruction: question, base_graph: null, intent: 'answer' },
       (op) => {
         // 先原样收下，翻译交给 decodeCopilot。thinking 合并在写入时做：
         // 一次生成几百上千条 delta，逐条存下来光数组就比图大一个量级
@@ -150,7 +150,7 @@ export const useChat = create<ChatState>((set, get) => ({
               graph, phase: 'running', status: PHASE_TEXT.running,
               explanation: op.explanation ?? '',
             }))
-            void launch(id, graph, patch, set)
+            void launch(id, graph, question, patch, set)
             break
           }
           case 'error':
@@ -204,10 +204,40 @@ export const useChat = create<ChatState>((set, get) => ({
   },
 }))
 
+/**
+ * 用户的问题填进这张图的入口字段。
+ *
+ * 在此之前这里是硬编码的 `input: {}`——问题根本没进图。Copilot 只要给入口
+ * 声明了一个必填字段（它有时候会，比如 `topic`），这次运行就在第一个节点
+ * 上立刻挂掉："缺少必填输入：topic"。用户看到的是自己刚问完就报错，而且
+ * 错误里提的那个字段名他从来没见过——那是生成的图里的东西。
+ *
+ * 之前"能跑"纯属运气：Copilot 那一次恰好没声明字段。
+ */
+function fillInput(graph: GraphSpec, question: string): Record<string, any> {
+  const entry = (graph.nodes ?? []).find((n: any) => n.type === 'input')
+  const fields: any[] = (entry?.data?.config?.fields ?? []) as any[]
+  if (!fields.length) return { question }   // 没声明字段也带上，下游可能用 input.question
+
+  const payload: Record<string, any> = {}
+  for (const f of fields) {
+    if (f?.name) payload[f.name] = f.default ?? ''
+  }
+  // 问题往哪个字段放：名字像"问题"的优先，其次第一个必填的，再不然第一个。
+  // 只有一个字段时不用挑——那必然就是它
+  const named = fields.find((f) =>
+    /question|query|topic|input|问题|需求|主题/i.test(String(f?.name ?? '')))
+  const target = named ?? fields.find((f) => f?.required) ?? fields[0]
+  if (target?.name) payload[target.name] = question
+  return payload
+}
+
 /** 图建好了就直接跑——用户要的是答案，不是一张图。 */
-async function launch(turnId: string, graph: GraphSpec, patch: Patch, set: any) {
+async function launch(
+  turnId: string, graph: GraphSpec, question: string, patch: Patch, set: any,
+) {
   try {
-    const run = await api.runs.start({ graph, input: {} })
+    const run = await api.runs.start({ graph, input: fillInput(graph, question) })
     patch(() => ({ run }))
     watch(run.id, turnId, patch, set)
   } catch (e: any) {

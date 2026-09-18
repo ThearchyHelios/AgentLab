@@ -229,7 +229,14 @@ export const api = {
  * 每个操作（add_node / add_edge / …）到达即回调，画布边收边长。
  */
 export function streamCopilot(
-  body: { instruction: string; base_graph?: GraphSpec | null; provider?: string | null; model?: string | null },
+  body: {
+    instruction: string
+    base_graph?: GraphSpec | null
+    provider?: string | null
+    model?: string | null
+    /** answer = 用户在问问题（问数据页），build = 用户在描述流程（画布）*/
+    intent?: 'build' | 'answer'
+  },
   onOp: (op: any) => void,
   onEnd: (error?: string) => void,
 ): () => void {

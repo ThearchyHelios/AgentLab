@@ -137,6 +137,14 @@ NODE_REFERENCE = """\
 - {{ last_message }}        最近一条消息文本
 - 过滤器：{{ vars.x | json }}
 
+**引用必须有来源**（这条会被校验，不满足整张图跑不起来）：
+- 写 {{ vars.X }} 之前，必须有某个节点的 config.assign_to 正好是 "X"
+- 写 {{ input.X }} 之前，X 必须在入口节点的 fields 里声明过
+- 写 {{ nodes.Y.* }} 之前，Y 必须是真实存在的节点 id
+- 引用的那个节点还必须排在**前面**——后面的节点产出的值，前面取不到
+模板取不到值时渲染成空字符串、不报错，所以这类错误在运行期完全静默：
+下游拿到一段空文本，然后一本正经地基于空内容编一段回答出来。
+
 连线规则：
 - edges 里每条边 {source, target, sourceHandle?}
 - branch 节点的出边必须带 sourceHandle，取值是 cases 里的 key，另外要有一条 sourceHandle="default" 兜底
@@ -188,6 +196,43 @@ class GenerateIn(BaseModel):
     base_graph: dict[str, Any] | None = Field(default=None, description="在现有图上修改时传入")
     provider: str | None = None
     model: str | None = None
+    #: build = 用户在描述一个流程（画布）；answer = 用户在问一个问题（问数据页）
+    intent: str = Field(default="build")
+
+
+def _user_message(payload: GenerateIn, *, patch: bool) -> str:
+    """把用户说的话包成给模型的请求。
+
+    两个入口的语义完全不同，包法必须跟着变：
+
+    - 画布上，用户**在描述一个流程**（"读用户的问题，先查知识库…"），
+      "请设计一个工作流：<原话>" 是对的。
+    - 问数据页，用户**在问一个问题**（"shop 里都有哪些数据？"）。同样
+      包成"请设计一个工作流：shop 里都有哪些数据？"，模型会老老实实设计
+      一个**关于这句话**的流程——实际见过它生成"给这段文字生成摘要"，
+      跑完把用户的问题原样复述一遍还回去。流程是手段，不是用户要的东西。
+    """
+    if patch:
+        return (
+            "这是当前的工作流：\n"
+            "请按下面的要求修改它（只输出改动操作）：\n" + payload.instruction
+        )
+    if payload.intent == "answer":
+        return (
+            "用户问了下面这个问题。请设计一个**能回答它**的工作流——"
+            "流程是手段，用户要的是答案。\n\n"
+            f"问题：{payload.instruction}\n\n"
+            "这条路径的硬性约定：\n"
+            # 问题由 ChatPage 注入到 input.question。不把键名说死，模型会自己
+            # 编一个（见过 input.text、input.topic），下游取到的就是空字符串——
+            # 而模板取不到值不报错，于是模型一本正经地基于空内容编一段回答
+            "- 问题已经由系统注入成 `{{ input.question }}`，要用就写这一个。"
+            "入口节点**不要声明任何字段**，也不会有人再填一次表单\n"
+            "- 涉及数据的问题必须用 db_query__* / db_schema__* 去真查，"
+            "不要只对问题本身做文字加工（改写、摘要、分类都不是回答）\n"
+            "- 出口节点给出的应当是这个问题的答案本身"
+        )
+    return f"请设计一个工作流：{payload.instruction}"
 
 
 COPILOT_SETTING_KEY = "copilot"
@@ -332,7 +377,7 @@ async def generate(
             f"请按下面的要求修改它，返回完整的新图（不是补丁）：\n{payload.instruction}"
         )
     else:
-        user = f"请设计一个工作流：{payload.instruction}"
+        user = _user_message(payload, patch=False)
 
     try:
         model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
@@ -587,7 +632,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
         )
     else:
-        user = f"请设计一个工作流：{payload.instruction}"
+        user = _user_message(payload, patch=False)
 
     try:
         spec_ = await copilot_model_spec(session, payload)
