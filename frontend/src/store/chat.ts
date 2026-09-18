@@ -30,6 +30,7 @@ export type Phase =
   | 'building'    // 图在长出来
   | 'running'     // 图在跑
   | 'waiting'     // 停在人工介入
+  | 'ready'       // 图建好了，等用户决定跑不跑
   | 'done'
   | 'error'
 
@@ -61,6 +62,10 @@ export interface ChatTurn {
   /** 这一轮自己的取消句柄。放 turn 上而不是 store 上：store 单值会被
    *  下一轮 ask 覆盖，上一轮的 WebSocket 就再也关不掉了 */
   cancel: (() => void) | null
+  /** 这一轮没有查库，答案是根据前几轮说的。界面上必须标出来 */
+  noQuery?: boolean
+  /** 图建好了但按模型的意思没有自动跑，等用户点「跑一下」 */
+  pendingRun?: boolean
   /** 从库里恢复的历史轮次。它没有事件流，步骤要点开才去取 */
   restored?: boolean
   /** 已经补取过事件（或正在取），别重复拉 */
@@ -82,6 +87,8 @@ interface ChatState {
   reattach: (conversationId: string, turnId: string) => Promise<void>
   /** 历史轮次点开"执行过程"时才去取事件 */
   loadSteps: (conversationId: string, turnId: string) => Promise<void>
+  /** 模型建了图但没自动跑时，用户点「跑一下」 */
+  runNow: (conversationId: string, turnId: string) => void
   /** 会话被删了，把内存里那一桶也丢掉 */
   forget: (conversationId: string) => void
 }
@@ -95,6 +102,7 @@ const PHASE_TEXT: Record<Phase, string> = {
   building: '正在搭建流程…',
   running: '正在执行…',
   waiting: '等待你的确认',
+  ready: '流程搭好了，没有自动执行',
   done: '完成',
   error: '出错了',
 }
@@ -272,14 +280,37 @@ export const useChat = create<ChatState>((set, get) => ({
           case 'done':
             patch(() => ({ explanation: op.explanation ?? '' }))
             break
+          case 'reply': {
+            // 这句话不需要工作流——问的是前几轮已经查出来的东西，或者是
+            // 对过程说的话（「重试」「换个说法」）。以前这些也各自重建一整张
+            // 图、跑一遍 153 张表的库，纯属白花钱
+            const text = String(op.text ?? '')
+            patch(() => ({
+              phase: 'done', status: PHASE_TEXT.done,
+              output: { answer: text }, noQuery: true,
+            }))
+            set({ busy: false, cancel: null })
+            void save({ status: 'done', answer: text })
+            break
+          }
           case 'final': {
-            // 后端排版校验后的最终图。拿到它就可以直接跑了
             const graph = op.graph as GraphSpec
+            void save({ graph, explanation: op.explanation ?? '' })
+            // 用户要的是流程本身时（「设计一个每天跑的工作流」），建完就跑
+            // 等于替他多花一次钱，而他要的是那张图
+            if (op.autorun === false) {
+              patch(() => ({
+                graph, phase: 'ready', status: PHASE_TEXT.ready,
+                explanation: op.explanation ?? '', pendingRun: true,
+              }))
+              set({ busy: false, cancel: null })
+              void save({ status: 'done' })
+              break
+            }
             patch(() => ({
               graph, phase: 'running', status: PHASE_TEXT.running,
               explanation: op.explanation ?? '',
             }))
-            void save({ graph, explanation: op.explanation ?? '' })
             void launch(conversationId, id, graph, question, patch, set, save)
             break
           }
@@ -325,6 +356,21 @@ export const useChat = create<ChatState>((set, get) => ({
         ),
       },
     }))
+  },
+
+  runNow: (conversationId, turnId) => {
+    const turn = get().byConversation[conversationId]?.find((t) => t.id === turnId)
+    if (!turn?.graph || get().busy) return
+    const patch = patcher(set, conversationId, turnId)
+    const save = async (body: Record<string, any>) => {
+      if (!turn.serverId) return
+      try {
+        await api.conversations.patchTurn(conversationId, turn.serverId, body)
+      } catch { /* 存不下不该影响这次运行 */ }
+    }
+    patch(() => ({ phase: 'running', status: PHASE_TEXT.running, pendingRun: false }))
+    set({ busy: true })
+    void launch(conversationId, turnId, turn.graph, turn.question, patch, set, save)
   },
 
   reattach: async (conversationId, turnId) => {

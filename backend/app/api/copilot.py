@@ -248,7 +248,21 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "- 但**每个节点都要用 add_node 完整输出一遍**，包括没有改动的。"
             "这一轮是从空图开始搭的，只发改动操作会得到一张空图\n"
             "- 之前几轮的问答由系统注入成 `{{ input.history }}`。用户用「它们」「这些」"
-            "这类指代时，要让回答的节点引用它，否则模型不知道指的是上一轮那批数据"
+            "这类指代时，要让回答的节点引用它，否则模型不知道指的是上一轮那批数据\n"
+            "\n"
+            "先判断这句话该走哪条路径（三选一）：\n"
+            # 以前这里没有分叉：每一句话都建一张图、跑一遍库。于是「重试」
+            # 「继续找找」这种对过程说的话，也各自重建了一整张图去查 153 张表
+            "1. **直接回答**（输出 reply）：这句话不需要新数据就能答——问的是"
+            "前面几轮已经查出来的东西（口径、怎么算的、哪张表）、是对过程说的话"
+            "（「重试」「换个说法」），或者你需要先反问清楚才能动手。\n"
+            "   硬性约束：reply 里**只能复述或解释前面几轮已有的结果**，"
+            "不得新断言任何数据事实——不许凭印象给数字、给名单、给结论。"
+            "凡是要动到库才知道的，哪怕你觉得上一轮见过，也走第 2 条重新查。\n"
+            "2. **建图并执行**（done 的 run 为 true，默认）：要新数据才能答的问题。\n"
+            "3. **建图但不执行**（done 的 run 为 false）：用户要的是**流程本身**"
+            "——「设计一个工作流」「做一个每天能跑的」这类。他要的是这张图，"
+            "不是这一次的结果，跑一遍只是替他多花一次钱。\n"
         )
     return f"请设计一个工作流：{payload.instruction}"
 
@@ -516,9 +530,14 @@ _STREAM_PROTOCOL = """\
   {"op":"remove_node","id":"..."}
   {"op":"add_edge","edge":{"source":"...","target":"...","sourceHandle":"..."}}
   {"op":"remove_edge","source":"...","target":"...","sourceHandle":"..."}
-  {"op":"done","explanation":"两三句话说明这张图怎么跑"}    ← 最后一行
+  {"op":"done","explanation":"两三句话说明这张图怎么跑","run":true}    ← 最后一行
 - 按执行顺序添加节点（先入口后出口）；每加一个节点，立刻把连向它的边（两端都已存在的）输出出来，让图连贯地生长
-- 修改现有图时只输出改动，没提到的节点不要动"""
+- 修改现有图时只输出改动，没提到的节点不要动
+- done 里的 run：这张图建完要不要立刻执行。默认 true；用户要的是**流程本身**
+  （"设计一个每天跑的工作流"）时给 false —— 他要的是这张图，不是这一次的结果
+- 如果这句话根本不需要工作流（见下面的路径约定），**第一行也是最后一行**就输出：
+  {"op":"reply","text":"直接回答的内容"}
+  这时不要输出任何别的操作"""
 
 
 def _parse_op_line(line: str) -> dict[str, Any] | None:
@@ -720,6 +739,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     async def event_stream():
         explanation = ""
         seen_ops: list[dict[str, Any]] = []
+        # 建完要不要跑，由模型在 done.run 里表态
+        autorun = True
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
         try:
             async for op in _with_heartbeat(_iter_ops(model, messages)):
@@ -728,8 +749,16 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 if kind in ("thinking", "heartbeat"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
                     continue
+                if kind == "reply":
+                    # 这句话不需要工作流。原样转给前端，然后收流——后面那套
+                    # 排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
+                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+                    return
                 if kind == "done":
                     explanation = str(op.get("explanation", ""))
+                    # 用户要的是流程本身时（"设计一个每天跑的工作流"），
+                    # 建完就跑等于替他多花一次钱，而他要的是那张图
+                    autorun = op.get("run") is not False
                 seen_ops.append(op)
                 changed = _apply_op(nodes, edges, op)
                 if changed or kind in ("plan", "done"):
@@ -770,6 +799,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 "graph": spec.model_dump(mode="json"),
                 "issues": issues,
                 "explanation": explanation,
+                "autorun": autorun,
             }
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"生成的图结构非法：{e}"}

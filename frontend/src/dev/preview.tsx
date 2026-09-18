@@ -95,6 +95,13 @@ function longReport(): string {
   ].join("\n")
 }
 
+/** 直接回答的那一轮：没查库，界面上必须说破 */
+const NO_QUERY_TURN: StreamTurn = {
+  id: "noquery", question: "刚才那 6 个管理员是怎么算的？", phase: "done", status: "完成",
+  steps: [], noQuery: true,
+  output: { answer: "第 1 轮走的是 `role.level IN (platform, regional)` 这个口径。要换口径我重新查一遍。" },
+}
+
 const LONG_TURN: StreamTurn = {
   id: "long", question: "需要能够显示总结内容", phase: "done", status: "完成",
   steps: [], output: { result: longReport() },
@@ -137,6 +144,9 @@ function Preview() {
   if (md) return <div className="h-full overflow-y-auto"><MarkdownCases /></div>
   if (params.get('long') === '1') {
     return <AssistantStream turns={[LONG_TURN]} />
+  }
+  if (params.get('noquery') === '1') {
+    return <AssistantStream turns={[NO_QUERY_TURN]} />
   }
 
   return (

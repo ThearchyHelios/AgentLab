@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Brain, ChevronRight, CircleCheck, CircleDot, Database,
-  FileCode, GitBranch, Hand, Sparkles, Table2, Terminal, Wrench, XCircle,
+  FileCode, GitBranch, Hand, Info, Sparkles, Table2, Terminal, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { Spinner } from '../components/ui'
@@ -40,6 +40,8 @@ export interface StreamTurn {
   /** 这一轮建出来的图，可展开看、可放到画布 */
   graph?: any
   graphNote?: string
+  /** 这一条没有查库，答案是根据前几轮说的 */
+  noQuery?: boolean
 }
 
 const ICONS: Record<StepKind, typeof Wrench> = {
@@ -142,6 +144,17 @@ function TurnCard({ turn, dense, approvals, onOpenGraph }: {
         )}
 
         {approvals}
+
+        {/* 没查库这件事必须说在结论前面。「涉及数据必须真查」是这条路径上
+            最硬的一条约定，放开它之后，用户得能一眼分清哪些结论背后真的
+            动了库、哪些只是在复述前面几轮 */}
+        {turn.noQuery && (
+          <div className="mt-2 flex items-start gap-1.5 rounded border px-2 py-1.5 text-[10.5px] leading-relaxed"
+               style={{ borderColor: 'var(--border)', color: 'var(--text-dim)' }}>
+            <Info size={11} className="mt-[2px] shrink-0" />
+            <span>这一条没有查库，是根据前面几轮的结果说的</span>
+          </div>
+        )}
 
         {turn.output && (
           <Output output={turn.output} dense={dense} runClass={turn.runClass} />

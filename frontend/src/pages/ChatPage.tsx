@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Database, ListTree, MessageSquare, Send, Square } from 'lucide-react'
+import { Database, ListTree, MessageSquare, Play, Send, Square } from 'lucide-react'
 import { api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantStream'
@@ -25,7 +25,7 @@ import { useToast } from '../components/ui'
  * dense 一个开关。两边各写一套的话，同一次运行在两个页面会讲出不同的故事。
  */
 export function ChatPage() {
-  const { busy, ask, stop, load, loadSteps, turnsOf } = useChat()
+  const { busy, ask, stop, load, loadSteps, runNow, turnsOf } = useChat()
   const currentId = useConversations((s) => s.currentId)
   const create = useConversations((s) => s.create)
   const turns = useChat((s) => (currentId ? s.byConversation[currentId] : undefined))
@@ -71,6 +71,11 @@ export function ChatPage() {
             onShowSteps={
               currentId && turnsOf(currentId).find((x) => x.id === t.id)?.restored
                 ? () => void loadSteps(currentId, t.id)
+                : undefined
+            }
+            onRun={
+              currentId && turnsOf(currentId).find((x) => x.id === t.id)?.pendingRun
+                ? () => runNow(currentId, t.id)
                 : undefined
             }
           />
@@ -132,6 +137,7 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     phase: turn.phase === 'waiting' ? 'waiting'
       : turn.phase === 'error' ? 'error'
       : running ? 'running' : 'done',
+    // ready（建好了没跑）在流里按"完成"画，差别体现在下面那个「跑一下」上
     status: turn.status,
     // 建图的步骤在前，跑图的在后——这正是发生的顺序
     steps: [...decodeCopilot(turn.ops), ...decodeRun(turn.events)],
@@ -142,6 +148,7 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     runClass: turn.run?.run_class,
     graph: turn.graph,
     graphNote: turn.explanation,
+    noQuery: turn.noQuery,
   }
 }
 
@@ -151,19 +158,25 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
  * 从库里恢复的轮次没有事件流——一次会话几十轮，把每轮的事件都预加载回来
  * 是几十个请求换一堆没人看的步骤。所以默认只显示问题和答案，想看过程再取。
  */
-function Approvals({ turnId, runId, onShowSteps }: {
+function Approvals({ turnId, runId, onShowSteps, onRun }: {
   turnId: string
   runId?: string
   onShowSteps?: () => void
+  onRun?: () => void
 }) {
   const conversationId = useConversations((s) => s.currentId)
   const approvals = useCatalog((s) => s.approvals)
   const reattach = useChat((s) => s.reattach)
   const pending = approvals.filter((a) => a.run_id === runId && a.status === 'pending')
 
-  if (!runId) return null
+  if (!runId && !onRun) return null
   return (
     <>
+      {onRun && (
+        <button className="btn btn-xs btn-primary mt-2 gap-1 text-[11px]" onClick={onRun}>
+          <Play size={11} /> 跑一下
+        </button>
+      )}
       {onShowSteps && (
         <button className="btn btn-xs btn-ghost mt-2 gap-1 text-[11px]" onClick={onShowSteps}>
           <ListTree size={11} /> 看执行过程

@@ -139,6 +139,22 @@ console.log('\n=== 长报告的折叠 ===')
   await page.close()
 }
 
+console.log('\n=== 没查库的那一轮 ===')
+{
+  // 「涉及数据必须真查」是这条路径上最硬的约定，放开直接回答之后，用户得能
+  // 一眼分清哪些结论背后真的动了库
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
+  await page.goto(`${WEB}/preview.html?noquery=1`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+  const body = await page.locator('body').innerText()
+  check('说破了这一条没有查库', body.includes('没有查库'))
+  check('声明排在结论前面',
+        body.indexOf('没有查库') < body.indexOf('role.level'),
+        `声明@${body.indexOf('没有查库')} 结论@${body.indexOf('role.level')}`)
+  check('答案本身照常渲染', body.includes('口径'))
+  await page.close()
+}
+
 console.log('\n=== 空态 ===')
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
