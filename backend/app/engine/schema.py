@@ -228,4 +228,15 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         if not spec.incoming(node.id) and not spec.outgoing(node.id):
             result.add("节点没有任何连线，不会被执行", level="warning", node_id=node.id)
 
+    # 变量问题也进校验结果：模板取不到值只会渲染成空字符串，不报错，
+    # 所以拼错一个变量名在运行时是完全静默的——只能在这里说破。
+    # 放在最后导入，避免 variables 反过来 import schema 形成环。
+    from app.engine.variables import analyze as _analyze_vars
+
+    for issue in _analyze_vars(spec).issues:
+        # info 级是"产出没人用"这类提示，不进校验（它不影响能不能跑）
+        if issue.level == "info":
+            continue
+        result.add(issue.message, level=issue.level, node_id=issue.node_id)
+
     return result
