@@ -5,6 +5,7 @@ import { NODE_DEFS, type FieldDef } from './nodeDefs'
 import { useStudio } from '../store/studio'
 import { useCatalog, modelOptions } from '../store/catalog'
 import { JsonInput } from '../components/ui'
+import { TemplateText } from './TemplateText'
 
 /** 属性面板。所有字段都由 nodeDefs 的声明驱动渲染，加节点类型不用改这里。 */
 export function Inspector() {
@@ -165,23 +166,27 @@ function FieldInput({ field, value, onChange }: {
         />
       )
 
+    // 这三种默认都过模板渲染，所以带 {{ }} 补全。
+    // 注意 field.template === false 是显式关闭——supervisor 的 agents[].system
+    // 长得和 llm.system 一模一样，但后端是 cfg.get("system") 直接取值，不渲染，
+    // 在那儿弹补全会是个谎
     case 'textarea':
     case 'prompt':
       return (
-        <textarea
-          className={clsx('field', field.type === 'prompt' && 'mono text-[11.5px]')}
+        <TemplateText
+          className={clsx(field.type === 'prompt' && 'mono text-[11.5px]')}
           rows={field.type === 'prompt' ? 4 : 3}
           value={value ?? ''} placeholder={field.placeholder}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={onChange}
         />
       )
 
     case 'code':
       return (
-        <textarea
-          className="field mono text-[11px]" rows={10} spellCheck={false}
+        <TemplateText
+          className="mono text-[11px]" rows={10} spellCheck={false}
           value={value ?? ''} placeholder={field.placeholder}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={onChange}
         />
       )
 

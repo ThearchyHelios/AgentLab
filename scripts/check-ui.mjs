@@ -84,6 +84,51 @@ console.log('=== 画布助手栏 ===')
   await page.close()
 }
 
+console.log('\n=== 变量表与模板补全 ===')
+{
+  const { page, errors } = await visit('/studio')
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+
+  await page.getByRole('button', { name: /^变量/ }).click()
+  await page.waitForTimeout(700)
+  const rows = await page.locator('table tbody tr').count()
+  check('变量表列出了变量', rows > 0, `${rows} 行`)
+  const body = await page.locator('body').innerText()
+  check('列出的是可直接粘的写法', body.includes('{{ input.'), '')
+
+  // 抽屉是挤压式的：画布不能被压没，React Flow 容器高度归零会直接报错
+  const canvasH = await page.locator('.react-flow').first()
+    .evaluate((el) => el.getBoundingClientRect().height)
+  check('画布没有被压没', canvasH > 120, `${Math.round(canvasH)}px`)
+  await page.getByRole('button', { name: /^变量/ }).click()
+  await page.waitForTimeout(400)
+
+  // 补全：模板取不到值会静默渲染成空字符串，补全是从源头消灭这类错误。
+  // 默认那张图只有 输入→成果，没有带模板的字段，先从面板拖一个模型调用出来
+  await page.locator('text=模型调用').first().click()
+  await page.waitForTimeout(700)
+  // 必须限定在属性面板里：底下助手栏的 Copilot 输入框也是 aside textarea，
+  // 而它被这一层盖着，点它会一直超时
+  const field = page.locator('.sheet-in textarea').first()
+  await field.click()
+  await page.keyboard.type('{{')
+  await page.waitForTimeout(400)
+  const hasPanel = (await page.locator('body').innerText()).includes('⏎ 插入')
+  check('打 {{ 弹出候选', hasPanel)
+  if (hasPanel) {
+    await page.keyboard.press('Enter')
+    await page.waitForTimeout(350)
+    const v = await field.inputValue()
+    check('选中后插入成完整写法', /\{\{ \S+ \}\}/.test(v), v.slice(0, 40))
+    // 完全受控组件，插入后光标会被重置到末尾，必须自己放回去
+    await page.keyboard.type('X')
+    check('光标停在插入内容之后', (await field.inputValue()).endsWith('X'),
+      (await field.inputValue()).slice(-20))
+  }
+  await shot(page, 'variables')
+  await page.close()
+}
+
 console.log('\n=== 动效对前庭敏感者可关 ===')
 {
   // 这套界面里动的东西不少（边在流动、节点在脉冲、面板在滑）。
