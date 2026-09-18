@@ -372,3 +372,67 @@ async def test_the_first_turn_has_nothing_to_fall_back_on(client, monkeypatch) -
     assert final["op"] == "final"
     assert final["graph"]["nodes"] == []
     assert any("空" in str(i.get("message", "")) for i in final["issues"]), final["issues"]
+
+
+# --------------------------------------------------------------------------
+# 不是每句话都值得跑一遍库
+# --------------------------------------------------------------------------
+#
+# 以前必执行：final 一到就无条件 launch。于是「重试」「继续找找」这种对过程
+# 说的话，也各自重建了一整张图、跑一遍 153 张表的库；而一句明确要「设计一个
+# 工作流」的，建完也直接跑了——用户要的是那张图，不是这一次的结果。
+
+
+async def test_a_question_about_earlier_turns_needs_no_workflow(client, monkeypatch) -> None:
+    """reply 这条路径：不建图、不跑、也不该走到那套排版校验上。
+
+    走到了的话，空图会撞出"图校验未通过：图是空的，先拖一个节点进来"。
+    """
+    conv_id = await _seeded(client)
+    final = await _stream_graph(client, monkeypatch, conv_id, [
+        '{"op":"reply","text":"第 1 轮走的是 role.level IN (platform, regional) 这个口径。"}',
+    ])
+    assert final["op"] == "reply"
+    assert "口径" in final["text"]
+    assert "graph" not in final
+
+
+async def test_asking_for_a_workflow_builds_it_but_does_not_run_it(client, monkeypatch) -> None:
+    """用户要的是流程本身，跑一遍只是替他多花一次钱。"""
+    conv_id = await _seeded(client)
+    final = await _stream_graph(client, monkeypatch, conv_id, [
+        '{"op":"plan","summary":"搭一个每天能跑的"}',
+        '{"op":"add_node","node":{"id":"in","type":"input","label":"入口","config":{}}}',
+        '{"op":"add_node","node":{"id":"out","type":"output","label":"成果","config":{}}}',
+        '{"op":"add_edge","edge":{"source":"in","target":"out"}}',
+        '{"op":"done","explanation":"每天跑一次","run":false}',
+    ])
+    assert final["op"] == "final"
+    assert final["autorun"] is False
+    assert [n["id"] for n in final["graph"]["nodes"]] == ["in", "out"]
+
+
+async def test_a_normal_data_question_still_runs(client, monkeypatch) -> None:
+    """默认不变：问数据就是建图 + 跑。没写 run 就当 true。"""
+    conv_id = await _seeded(client)
+    final = await _stream_graph(client, monkeypatch, conv_id, [
+        '{"op":"plan","summary":"查一下"}',
+        '{"op":"add_node","node":{"id":"in","type":"input","label":"入口","config":{}}}',
+        '{"op":"add_node","node":{"id":"out","type":"output","label":"成果","config":{}}}',
+        '{"op":"add_edge","edge":{"source":"in","target":"out"}}',
+        '{"op":"done","explanation":"跑完给结论"}',
+    ])
+    assert final["op"] == "final"
+    assert final["autorun"] is True
+
+
+def test_the_three_paths_are_spelled_out_for_the_model() -> None:
+    """路径选择全靠这段约定，尤其是那条不许凭印象给数字的硬约束。"""
+    from app.api.copilot import GenerateIn, _STREAM_PROTOCOL, _user_message
+
+    text = _user_message(GenerateIn(instruction="随便问问", intent="answer"), patch=False)
+    assert "直接回答" in text and "建图并执行" in text and "建图但不执行" in text
+    assert "不得新断言任何数据事实" in text
+    # 协议里要给得出这两个出口，否则模型没法表达
+    assert '"op":"reply"' in _STREAM_PROTOCOL
+    assert '"run":true' in _STREAM_PROTOCOL
