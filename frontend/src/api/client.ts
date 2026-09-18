@@ -1,6 +1,6 @@
 import type {
   Approval, GraphSpec, KbDocument, MemoryItem, Provider, Run, RunEvent,
-  Skill, ToolInfo, ValidationIssue, Workflow,
+  Skill, ToolInfo, ValidationIssue, VarIssue, Variable, Workflow,
 } from '../types'
 
 const BASE = '/api'
@@ -74,6 +74,9 @@ export const api = {
         `/workflows/${id}/publish`, { level, version }),
     validate: (graph: GraphSpec) =>
       post<{ ok: boolean; issues: ValidationIssue[] }>('/workflows/validate', { graph }),
+    /** 这张图里有哪些变量、谁产出、谁引用。纯静态分析，不需要跑过 */
+    variables: (graph: GraphSpec) =>
+      post<{ variables: Variable[]; issues: VarIssue[] }>('/workflows/variables', { graph }),
   },
 
   // ---- 运行 ----

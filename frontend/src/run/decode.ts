@@ -517,6 +517,13 @@ export function decodeRun(events: RunEvent[]): Step[] {
           const step: Step = {
             id: `sb-${seq}`, seq, kind: 'code', nodeId, status: 'running',
             title: `运行${d.language === 'python' ? ' Python' : d.language ? ` ${d.language}` : ''}代码`,
+            // 渲染后的代码。编辑器里那份带着 {{ }}，送进沙箱的是替换完的——
+            // 值里有引号或换行就会把程序写坏，而报错说的是渲染后的行号。
+            // 只有插过值的才值得摆出来，没插值的两份一模一样，显示等于噪音
+            detail: d.interpolated && d.code
+              ? `# 实际执行的代码（模板已展开）\n${String(d.code)}`
+                + (d.code_truncated ? '\n\n（已截断）' : '')
+              : undefined,
           }
           push(step, nodeId)
           return step
@@ -530,7 +537,11 @@ export function decodeRun(events: RunEvent[]): Step[] {
           if (!d.ok) step.level = 'error'
           step.meta = dur(num(d.duration_ms))
           const body = [d.stdout, d.stderr].filter(Boolean).join('\n').slice(0, 4000)
-          step.detail = body || (d.ok ? '（无输出）' : `退出码 ${d.exit_code}`)
+          // 和查询步骤同一个分工：detail 是"跑的是什么"（渲染后的代码），
+          // result 是"跑出了什么"。塞进同一个字段的话，报错时最需要的两样
+          // 东西——实际代码和 traceback——只能看见一样
+          step.result = body || (d.ok ? '（无输出）' : `退出码 ${d.exit_code}`)
+          if (!step.detail) step.detail = step.result
           pendingTools.delete(`sandbox-${nodeId ?? seq}`)
         }
         break

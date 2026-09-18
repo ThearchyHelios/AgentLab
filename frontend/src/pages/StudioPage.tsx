@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, ShieldCheck,
-  Trash2, Wand2,
+  Trash2, Variable, Wand2,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { FlowCanvas } from '../canvas/FlowCanvas'
 import { Palette } from '../canvas/Palette'
 import { InspectorSheet } from '../canvas/InspectorSheet'
+import { VariablesDrawer } from '../canvas/VariablesDrawer'
 import { AssistantPanel } from '../run/AssistantPanel'
 import { RunControl } from '../run/RunControl'
 import { useStudio, toGraph } from '../store/studio'
@@ -27,6 +28,7 @@ export function StudioPage() {
   const [picker, setPicker] = useState(false)
   const [saving, setSaving] = useState(false)
   const [publishing, setPublishing] = useState(false)
+  const [vars, setVars] = useState(false)
   const copilotActive = useStudio((s) => s.copilot.active)
 
   // 首次进来自动打开第一张图
@@ -146,6 +148,13 @@ export function StudioPage() {
         >
           <Wand2 size={12} /> Copilot
         </button>
+        <button
+          className={clsx('btn', vars && 'text-[var(--accent)]')}
+          title="看这张图里有哪些变量、谁产出、谁引用（⌥V）"
+          onClick={() => setVars((v) => !v)}
+        >
+          <Variable size={12} /> 变量
+        </button>
         <button className="btn" onClick={relayout} title="自动排版"><LayoutGrid size={12} /></button>
         <button className="btn" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
                 title={dirty ? '先保存再发布' : '把当前版本立为正式版本，正式运行只认它'}>
@@ -164,8 +173,13 @@ export function StudioPage() {
         <aside className="w-52 shrink-0 border-r bg-panel">
           <Palette />
         </aside>
-        <main className="relative min-w-0 flex-1">
-          <FlowCanvas />
+        {/* 变量抽屉做成挤压式而不是浮层：React Flow 的 Controls 和 MiniMap
+            是绝对定位在画布容器里的，浮层会把它俩埋掉，挤压会把它俩顶上去 */}
+        <main className="relative flex min-w-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1">
+            <FlowCanvas />
+          </div>
+          <VariablesDrawer open={vars} onClose={() => setVars(false)} />
         </main>
         {/* 助手常驻，属性是盖在它上面的一层。做成两个 tab 的话它们就互斥了，
             而这两件事在时间上并不互斥——跑图跑到一半点开节点看配置，整条

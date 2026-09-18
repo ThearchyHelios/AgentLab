@@ -121,8 +121,14 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 留空跟随整机默认。要的那档不可用时会安静退回默认，不阻断运行。
     isolation = ctx.cfg("isolation", "") or None
 
+    # 把真正要跑的那份代码发出来。用户在编辑器里写的是带 {{ }} 的模板，
+    # 送进沙箱的是渲染后的字符串——两者可能差很远：一个带引号或换行的值
+    # 插进字符串字面量里就会把程序写坏，而报错指的是渲染后的行号，用户对着
+    # 自己那份数怎么也对不上。这条事件是他们唯一能看到"实际跑了什么"的地方。
     ctx.emit(EventType.SANDBOX_START, language=language, limits=limits.model_dump(),
-             isolation=isolation or "auto")
+             isolation=isolation or "auto", code=code[:8000],
+             code_truncated=len(code) > 8000,
+             interpolated="{{" in str(ctx.cfg("code", "")))
     result = await sandbox_manager.run(
         code,
         language=language,

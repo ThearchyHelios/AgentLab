@@ -7,7 +7,8 @@ import { api, streamCopilot, streamRun } from '../api/client'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import type { CopilotOp } from '../run/decode'
 import type {
-  GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue, Workflow,
+  GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue,
+  VarIssue, Variable, Workflow,
 } from '../types'
 
 export type FlowNode = Node<{ nodeType: NodeType; label: string; config: Record<string, any> }>
@@ -92,6 +93,10 @@ interface StudioState {
   selectedId: string | null
   dirty: boolean
   issues: ValidationIssue[]
+  /** 这张图里有哪些变量：谁产出、谁引用。结构不变就不重新请求 */
+  variables: Variable[]
+  /** 变量层面的提示（含"产出了没人用"这类 info，不进 issues） */
+  varIssues: VarIssue[]
 
   run: Run | null
   events: RunEvent[]
@@ -130,6 +135,7 @@ interface StudioState {
   select: (id: string | null) => void
   save: () => Promise<void>
   validate: () => Promise<void>
+  analyzeNow: () => Promise<void>
 
   startRun: (input: Record<string, any>) => Promise<Run | null>
   startFormalRun: (input: Record<string, any>) => Promise<Run | null>
@@ -145,6 +151,60 @@ interface StudioState {
 
 const EMPTY_RUNTIME: NodeRuntime = { status: 'idle' }
 
+// 300ms：比连续打字的间隔长，比"停下来看结果"的感知阈值短
+const ANALYZE_DEBOUNCE_MS = 300
+let analyzeTimer: ReturnType<typeof setTimeout> | null = null
+/** 每次发起分析自增。回来时对不上就说明图又改过了，这个结果已经过期 */
+let analyzeEpoch = 0
+/** 上一次算变量表时的结构签名，没变就不重复请求 */
+let lastVarSignature = ''
+
+/**
+ * "有哪些变量"只取决于图的结构，不取决于文案。
+ *
+ * 节点 id、类型、assign_to、入口字段名——只有这些变了，变量集合才会变。
+ * 改 prompt 里的一个字不该触发一次变量分析。
+ */
+function varSignature(nodes: FlowNode[]): string {
+  return nodes
+    .map((n) => {
+      const cfg = n.data.config ?? {}
+      const fields = (cfg.fields ?? []).map((f: any) => f?.name ?? '').join(',')
+      return `${n.id}:${n.data.nodeType}:${cfg.assign_to ?? ''}:${fields}`
+    })
+    .sort()
+    .join('|')
+}
+
+async function runAnalysis(set: any, get: any, force = false): Promise<void> {
+  const { nodes, edges } = get()
+  if (!nodes.length) {
+    set({ issues: [], variables: [], varIssues: [] })
+    return
+  }
+  const epoch = ++analyzeEpoch
+  const graph = toGraph(nodes, edges)
+  const signature = varSignature(nodes)
+  const needVars = force || signature !== lastVarSignature
+
+  try {
+    const [validation, vars] = await Promise.all([
+      api.workflows.validate(graph),
+      needVars ? api.workflows.variables(graph) : Promise.resolve(null),
+    ])
+    // 图在请求飞行期间又改了，这份结果已经不对应眼前的图——丢掉，
+    // 别用旧答案覆盖新答案（校验结果闪回是最难查的那种 UI bug）
+    if (epoch !== analyzeEpoch) return
+    set({ issues: validation.issues ?? [] })
+    if (vars) {
+      lastVarSignature = signature
+      set({ variables: vars.variables ?? [], varIssues: vars.issues ?? [] })
+    }
+  } catch {
+    /* 分析失败不影响编辑 */
+  }
+}
+
 export const useStudio = create<StudioState>((set, get) => ({
   workflow: null,
   nodes: [],
@@ -152,6 +212,8 @@ export const useStudio = create<StudioState>((set, get) => ({
   selectedId: null,
   dirty: false,
   issues: [],
+  variables: [],
+  varIssues: [],
   run: null,
   events: [],
   runtime: {},
@@ -299,18 +361,32 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({ workflow: updated, dirty: false })
   },
 
+  /**
+   * 校验 + 变量分析。名字保留 validate，因为图一变就该重算的地方有八处，
+   * 都在调它。
+   *
+   * 防抖是必须的，不是优化：在此之前它是**零防抖**的——Inspector 里每敲
+   * 一个键都会 updateNode → validate()，实测敲 15 个字发 15 次全图 POST，
+   * 每次都把整张图序列化上传。再挂一个变量分析就是翻倍。
+   *
+   * 变量表另外按结构签名跳过：改 prompt 文本不会改变"有哪些变量"，只有
+   * 增删节点、改 assign_to、改入口字段才会。签名不变就不重复请求。
+   */
   validate: async () => {
-    const { nodes, edges } = get()
+    const { nodes } = get()
     if (!nodes.length) {
-      set({ issues: [] })
+      set({ issues: [], variables: [], varIssues: [] })
       return
     }
-    try {
-      const result = await api.workflows.validate(toGraph(nodes, edges))
-      set({ issues: result.issues ?? [] })
-    } catch {
-      /* 校验失败不影响编辑 */
-    }
+    if (analyzeTimer !== null) clearTimeout(analyzeTimer)
+    analyzeTimer = setTimeout(() => void runAnalysis(set, get), ANALYZE_DEBOUNCE_MS)
+  },
+
+  /** 不等防抖，立刻算一次。抽屉打开、切换工作流这类明确动作用它。 */
+  analyzeNow: async () => {
+    if (analyzeTimer !== null) clearTimeout(analyzeTimer)
+    analyzeTimer = null
+    await runAnalysis(set, get, true)
   },
 
   // ---- 运行 ----
