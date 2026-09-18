@@ -96,6 +96,19 @@ export function formatDuration(ms?: number): string {
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`
 }
 
+/**
+ * 这次运行是不是正停在人工介入上。
+ *
+ * 从步骤推，不要去查审批列表——那是 4 秒轮询一次的，而 run.interrupted
+ * 事件是即时到的。用列表的话，中断后会有几秒钟界面说"这次运行已结束"，
+ * 而实际上它正等着你点通过。
+ */
+export function isAwaitingHuman(steps: Step[]): boolean {
+  return steps.some(function walk(s): boolean {
+    return s.status === 'waiting' || (s.children?.some(walk) ?? false)
+  })
+}
+
 /** run 到终态时，所有还挂着"进行中"的生命周期行都要收尾。 */
 function closeLifecycles(out: Step[], status: StepStatus) {
   out.forEach((s) => {

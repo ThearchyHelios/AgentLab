@@ -3,8 +3,9 @@ import { ChevronLeft, Hand } from 'lucide-react'
 import clsx from 'clsx'
 import { useCatalog } from '../store/catalog'
 import { useStudio } from '../store/studio'
-import { decodeRun, type Step } from '../run/decode'
+import { decodeRun } from '../run/decode'
 import { Spinner } from '../components/ui'
+import { lastMeaningful } from '../run/AssistantPanel'
 import { Inspector } from './Inspector'
 
 /**
@@ -70,8 +71,7 @@ function LiveStrip() {
   if (!streaming && !waiting) return null
 
   // 只取最后一步说给人听，不在这里重演整条流——这是一条提示，不是第二个时间线
-  const steps = decodeRun(events)
-  const last = flattenLast(steps)
+  const last = lastMeaningful(decodeRun(events))
 
   return (
     <button
@@ -89,12 +89,4 @@ function LiveStrip() {
       <ChevronLeft size={11} className="shrink-0 rotate-180 text-faint" />
     </button>
   )
-}
-
-/** 最后一条有意义的步骤：优先取最深的子步骤，那才是"此刻在干什么"。 */
-function flattenLast(steps: Step[]): Step | undefined {
-  const flat: Step[] = []
-  const walk = (list: Step[]) => list.forEach((s) => { flat.push(s); if (s.children) walk(s.children) })
-  walk(steps)
-  return [...flat].reverse().find((s) => s.kind !== 'lifecycle') ?? flat[flat.length - 1]
 }

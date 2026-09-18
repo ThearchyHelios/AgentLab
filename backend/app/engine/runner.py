@@ -91,7 +91,16 @@ class RunManager:
             node_id=node_id,
             data=data or {},
         )
-        await bus.publish(event)
+        # 先落库，再广播。顺序反过来会漏事件，而且是结构性的漏：
+        #
+        # 订阅者的完整性靠"读历史 + 接实时"两段拼起来。它先订阅、再读历史，
+        # 于是需要这条保证——**提交早于我这次 SELECT 的，在历史里；提交晚于
+        # 我这次 SELECT 的，广播也晚于我订阅，在实时流里**。这条保证只有在
+        # "提交先于广播"时才成立。
+        #
+        # 先广播的话，一条在订阅建立之前广播、却在读历史之后才提交的事件，
+        # 两边都拿不到。实测跑一次 25ms 的图，六条事件里的 run.started 有
+        # 一半几率就这么没了——界面表现为某个节点永远在转圈。
         if persist and event.type not in _EPHEMERAL:
             async with SessionLocal() as session:
                 session.add(
@@ -108,6 +117,7 @@ class RunManager:
                     update(Run).where(Run.id == run_id).values(last_seq=event.seq)
                 )
                 await session.commit()
+        await bus.publish(event)
 
     async def note(
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,

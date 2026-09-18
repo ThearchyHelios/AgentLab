@@ -110,6 +110,13 @@ console.log('\n=== 停在审批时的状态 ===')
   const after = mod.decodeRun(fixtures.human)
   const doneHost = flatten(after).find((s) => s.kind === 'node' && s.nodeId === 'h')
   check('恢复后回到正常状态', doneHost?.status === 'done', doneHost?.status)
+
+  // "在不在等人"必须从事件推。查审批列表的话要等 4 秒轮询，中断后那几秒
+  // 界面会说"这次运行已结束"，而它其实正等着你点通过
+  check('从事件就能判断正在等人', mod.isAwaitingHuman(mod.decodeRun(upto)) === true)
+  check('跑完了就不再说在等人', mod.isAwaitingHuman(after) === false)
+  check('压根没有人工节点的运行也不误报',
+    mod.isAwaitingHuman(mod.decodeRun(fixtures.db)) === false)
 }
 
 console.log('\n=== 循环里的多轮审批 ===')
