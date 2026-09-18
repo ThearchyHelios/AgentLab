@@ -156,3 +156,30 @@ export interface NodeRuntime {
   thinking?: string
   toolCalls?: { tool: string; args?: any; result?: string; ok?: boolean }[]
 }
+
+/** 一处 {{ }} 引用 */
+export interface VarRef {
+  node_id: string
+  node_label: string
+  field: string
+  expr: string
+}
+
+/** 一个可以被 {{ }} 引用的东西。由后端静态分析整张图得出 */
+export interface Variable {
+  path: string
+  kind: 'input' | 'var' | 'node' | 'builtin' | 'loop'
+  label: string
+  produced_by?: string | null
+  produced_by_label?: string | null
+  order: number
+  refs: VarRef[]
+  description: string
+}
+
+export interface VarIssue {
+  level: 'error' | 'warning' | 'info'
+  message: string
+  node_id?: string | null
+  path: string
+}
