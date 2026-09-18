@@ -35,7 +35,12 @@ class _QueryArgs(BaseModel):
 
 
 class _SchemaArgs(BaseModel):
-    table: str | None = Field(default=None, description="表名；留空则列出所有表")
+    # 一次能问好几张。串行跑工具时一次调用就是一步，逐张问 6 张表就是 6 步——
+    # 实测一次 8 步的运行里 7 步花在这上面，最后只剩一步来真查数据（run dd9927e6）
+    table: str | list[str] | None = Field(
+        default=None,
+        description='表名。可以一次给多张："user" 或 ["user","roles"]；留空则列出所有表',
+    )
 
 
 def tool_names(source: DataSource) -> list[str]:
@@ -125,9 +130,13 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
 
 
 def _make_schema_tool(source: DataSource) -> StructuredTool:
-    async def _run(table: str | None = None) -> str:
-        if table:
-            return introspect.describe_table(source, table)
+    async def _run(table: str | list[str] | None = None) -> str:
+        wanted = [table] if isinstance(table, str) else list(table or [])
+        # 逗号分隔也认："user, roles" 和 ["user","roles"] 是同一个意思，
+        # 而模型两种都会写。为此拒绝一次调用，纯属浪费一步
+        wanted = [t.strip() for one in wanted for t in str(one).split(",") if t.strip()]
+        if wanted:
+            return "\n\n".join(introspect.describe_table(source, t) for t in wanted)
         tables = introspect.table_names(source)
         if not tables:
             return (
@@ -142,7 +151,8 @@ def _make_schema_tool(source: DataSource) -> StructuredTool:
         name=f"{SCHEMA_PREFIX}{source.name}",
         description=(
             f"查看数据源「{source.name}」的表结构。"
-            "传 table 看某张表的字段；不传则列出所有表。写 SQL 前先用它确认字段名。"
+            "写 SQL 前先用它确认字段名。不传 table 则列出所有表；"
+            "**要看多张表就一次全传进来**（table 可以是数组），不要一张一张问。"
         ),
         args_schema=_SchemaArgs,
         coroutine=_run,

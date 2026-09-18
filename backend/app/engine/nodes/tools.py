@@ -12,7 +12,7 @@ from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
-from app.tools.registry import ToolContext, call_tool, get_spec
+from app.tools.registry import ToolArgsError, ToolContext, call_tool, get_spec
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
@@ -55,11 +55,25 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     ctx.emit(EventType.TOOL_START, tool=name, args=args)
     started = time.perf_counter()
+
+    def _fixed(note: str) -> None:
+        # 替它跑通了这一次，但节点配置里那个错的参数名原封不动，下次还会踩。
+        # 所以纠正必须留一条看得见的痕迹，而不是安静地把事办了
+        ctx.emit(EventType.LOG, level="warn",
+                 message=f"工具 {name}：{note}。请到节点里改正。")
+
     try:
         async with SessionLocal() as session:
-            result = await call_tool(name, args, _tool_ctx(ctx), session=session)
+            result = await call_tool(name, args, _tool_ctx(ctx), session=session, on_fix=_fixed)
     except KeyError as e:
         raise NodeError(ctx.node.id, str(e)) from e
+    except ToolArgsError as e:
+        # 参数对不上且没有唯一候选可纠。报错里已经写清楚该填什么，
+        # 不要再套一层 "执行失败：" 把它推远
+        ctx.emit(EventType.TOOL_ERROR, tool=name, error=str(e))
+        if ctx.cfg("fail_fast", True):
+            raise NodeError(ctx.node.id, f"工具 {name}：{e}") from e
+        result = {"error": str(e)}
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.TOOL_ERROR, tool=name, error=f"{type(e).__name__}: {e}")
         if ctx.cfg("fail_fast", True):

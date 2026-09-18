@@ -14,8 +14,14 @@ from app.db.models import Workflow
 from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState, message_text, template_context
 from app.providers import catalog
-from app.providers.factory import ModelSpec, get_chat_model
-from app.tools.registry import ToolContext, build_tools
+from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
+from app.tools.registry import (
+    ToolArgsError,
+    ToolContext,
+    args_model_of,
+    build_tools,
+    prepare_args,
+)
 
 _MAX_DEPTH = 3
 
@@ -122,7 +128,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             )
             tools = await build_tools(cfg.get("tools", []) or [], tool_ctx, session=session)
 
-        bound = model.bind_tools(tools) if tools else model
+        bound = bind_tools_safely(model, tools, parallel=False)
         tool_map = {t.name: t for t in tools}
         messages: list[Any] = [
             SystemMessage(content=cfg.get("system") or f"你是 {name}。"),
@@ -140,15 +146,32 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 tname = call.get("name", "")
                 targs = call.get("args", {}) or {}
                 cid = call.get("id") or f"{name}-{tname}"
-                ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
                 if tname not in tool_map:
+                    ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
                     content = f"错误：没有名为 {tname} 的工具"
                 else:
-                    try:
-                        raw = await tool_map[tname].ainvoke(targs)
-                        content = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
-                    except Exception as e:  # noqa: BLE001
-                        content = f"工具失败：{type(e).__name__}: {e}"
+                    schema = args_model_of(tool_map[tname])
+                    fix_note = None
+                    args_error = None
+                    if schema is not None:
+                        try:
+                            targs, fix_note = prepare_args(schema, targs)
+                        except ToolArgsError as e:
+                            args_error = str(e)
+                    # 纠正后的参数才是真正要执行的那份，tool.start 要发它
+                    ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
+                    if fix_note:
+                        ctx.emit(EventType.LOG, level="warn",
+                                 message=f"工具 {tname}：{fix_note}")
+                    if args_error:
+                        # 参数就不对，没必要真调一次。把"它接受什么"喂回去让它改
+                        content = args_error
+                    else:
+                        try:
+                            raw = await tool_map[tname].ainvoke(targs)
+                            content = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
+                        except Exception as e:  # noqa: BLE001
+                            content = f"工具失败：{type(e).__name__}: {e}"
                 ctx.emit(EventType.TOOL_END, tool=tname, agent=name, call_id=cid, preview=content[:1500])
                 calls.append({"tool": tname, "args": targs, "result": content[:2000]})
                 messages.append(ToolMessage(content=content, tool_call_id=cid))

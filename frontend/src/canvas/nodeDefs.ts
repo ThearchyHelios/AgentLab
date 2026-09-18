@@ -143,10 +143,15 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         ],
         help: '需要确认时运行会暂停，等你在审批面板放行',
       },
+      {
+        key: 'parallel_tools', label: '并行执行工具', type: 'switch', advanced: true,
+        help: '默认关闭：一轮只调一个工具，看到结果再想下一步。开启后一轮可发多个，更快，'
+          + '但这一批中间没有新的思考',
+      },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_steps: 8, approval: 'dangerous', tools: [] },
+    defaults: { max_steps: 12, approval: 'dangerous', tools: [], parallel_tools: false },
   },
   supervisor: {
     type: 'supervisor', label: '多 Agent 协作', category: '模型', icon: Users,
