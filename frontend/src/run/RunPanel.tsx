@@ -5,6 +5,7 @@ import { useStudio } from '../store/studio'
 import { useCatalog } from '../store/catalog'
 import { NODE_DEFS } from '../canvas/nodeDefs'
 import { StatusDot, useToast } from '../components/ui'
+import { Markdown } from './Markdown'
 
 // 发起运行的表单搬去了 run/RunControl.tsx 的工具栏控件里。它原先常驻在
 // 助手栏顶部，和 Copilot 输入框两个"主要动作"互相压着——而它们是两种不同的
@@ -69,8 +70,10 @@ export function ApprovalCard({ approval, onResolved }: {
       </div>
 
       {payload.message && (
-        <div className="mb-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded border bg-bg p-2 text-[11px] leading-relaxed">
-          {payload.message}
+        // 待审的往往是一整段模型写的文案，同样是 Markdown。要人家判断"能不能
+        // 发"，却让他对着一堆星号看，是在给审批这件事添难度
+        <div className="mb-2 max-h-40 overflow-y-auto rounded border bg-bg p-2">
+          <Markdown text={String(payload.message)} dense />
         </div>
       )}
 

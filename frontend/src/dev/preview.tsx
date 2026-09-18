@@ -2,9 +2,11 @@ import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Database, MessageSquare } from 'lucide-react'
 import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantStream'
+import { Markdown } from '../run/Markdown'
 import { decodeRun } from '../run/decode'
 import { ToastHost } from '../components/ui'
 import fixtures from '../run/__tests__/fixtures.json'
+import mdSamples from '../run/__tests__/markdown-samples.json'
 import '../index.css'
 
 /**
@@ -52,11 +54,41 @@ function buildTurns(): StreamTurn[] {
   })
 }
 
+/**
+ * 一段恶意输入。这类测例必须是构造的——真实输出不会自带攻击，但模型输出
+ * 是不可信内容，渲染层要么天生免疫，要么就是个 XSS 口子。
+ */
+const HOSTILE = [
+  '正常文本 **加粗**。',
+  '',
+  '<script>window.__pwned = 1</script>',
+  '<img src=x onerror="window.__pwned=1">',
+  '[点我](javascript:window.__pwned=1)',
+  '[正常链接](https://example.com)',
+  '<iframe src="https://evil.example"></iframe>',
+  '`<script>alert(1)</script>`',
+].join('\n')
+
+/** Markdown 渲染用真实输出验，不用编的样本 */
+function MarkdownCases() {
+  return (
+    <div className="mx-auto max-w-3xl space-y-4 p-4">
+      {[...(mdSamples as string[]), HOSTILE].map((t, i) => (
+        <div key={i} className="rounded-lg border bg-panel p-3">
+          <div className="mb-2 text-[10px] text-faint">真实输出 #{i + 1}</div>
+          <Markdown text={t} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function Preview() {
   // ?case=db 只看一个用例，?theme=light 直接出浅色——都是为了截图可复现，
   // 不用靠点按钮
   const params = new URLSearchParams(location.search)
   const only = params.get('case')
+  const md = params.get('md') === '1'
   if (params.get('theme') === 'light') document.documentElement.dataset.theme = 'light'
   const [all] = useState(buildTurns)
   const turns = only ? all.filter((t) => t.id === only) : all
@@ -70,6 +102,8 @@ function Preview() {
       hint="它会自己接数据源、写查询、跑完给结论——你不用碰画布"
     />
   )
+
+  if (md) return <div className="h-full overflow-y-auto"><MarkdownCases /></div>
 
   return (
     <div className="flex h-full flex-col">
