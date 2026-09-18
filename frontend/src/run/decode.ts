@@ -724,6 +724,28 @@ export interface CopilotOp {
   [k: string]: any
 }
 
+/**
+ * 一段思考在列表里显示哪一句。
+ *
+ * 还在想的时候取**最后一句**：思考是流式的，第一句往往是"用户想要一个……"
+ * 这种复述，之后几十秒里它其实一直在推进（"先看看现有的节点"、"这里需要
+ * 一个分支"）。固定显示开头，等于把一段活的叙述冻在起点上，看着就像卡住了。
+ *
+ * 想完了取**开头**：这时它是一条历史记录，开头那句最接近"这段在想什么"。
+ */
+function thinkingHeadline(text: string, live: boolean): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (!flat) return '正在思考…'
+  if (!live) return flat.slice(0, 60) + (flat.length > 60 ? '…' : '')
+  // 按中英文句末切；最后一段往往还没说完，取它前面那句更完整
+  const parts = flat.split(/(?<=[。！？；.!?;])\s*/).filter(Boolean)
+  const tail = parts.length > 1 && parts[parts.length - 1].length < 6
+    ? parts[parts.length - 2]
+    : parts[parts.length - 1]
+  const line = tail ?? flat
+  return line.length > 60 ? '…' + line.slice(-60) : line
+}
+
 const PHASE_LABEL: Record<string, string> = {
   connecting: '正在连接模型',
   planning: '正在理解需求、规划步骤',
@@ -743,22 +765,33 @@ export function decodeCopilot(ops: CopilotOp[]): Step[] {
   const out: Step[] = []
   let i = 0
   let nodeCount = 0
+
+  /** 一段思考结束了：不再显示"最新一句"，换成开头那句，收掉转圈 */
+  const settleThinking = () => {
+    const last = out[out.length - 1]
+    if (last?.kind === 'think' && last.status === 'running') {
+      last.status = 'done'
+      last.title = thinkingHeadline(last.detail ?? '', false)
+    }
+  }
+
   for (const op of ops) {
     i += 1
+    // 除了继续思考和心跳，任何一条操作都说明它已经想完、开始动手了
+    if (op.op !== 'thinking' && op.op !== 'heartbeat') settleThinking()
     switch (op.op) {
       case 'thinking': {
         const text = String(op.delta ?? '')
         if (!text.trim()) break
         const last = out[out.length - 1]
         // 思考是连续流，一片 delta 一行会碎成几十条。同一段连续思考并成一条，
-        // 标题取开头、详情是全文——这才是"一次思考是一个节点"。
-        if (last?.kind === 'think') {
+        // 详情是全文——这才是"一次思考是一个节点"。
+        if (last?.kind === 'think' && last.status === 'running') {
           last.detail = (last.detail ?? '') + text
-          last.title = last.detail.replace(/\s+/g, ' ').slice(0, 60)
-            + (last.detail.length > 60 ? '…' : '')
+          last.title = thinkingHeadline(last.detail, true)
         } else {
-          out.push({ id: `ct-${i}`, seq: i, kind: 'think', status: 'done',
-                     title: text.replace(/\s+/g, ' ').slice(0, 60), detail: text })
+          out.push({ id: `ct-${i}`, seq: i, kind: 'think', status: 'running',
+                     title: thinkingHeadline(text, true), detail: text })
         }
         break
       }

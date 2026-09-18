@@ -234,6 +234,30 @@ console.log('\n=== Copilot 操作流 ===')
   check('连续思考并成一条', steps.filter((s) => s.kind === 'think').length === 1,
     `${steps.filter((s) => s.kind === 'think').length} 条`)
   check('思考全文保留在详情', steps.find((s) => s.kind === 'think')?.detail?.includes('先看表结构'))
+
+  // 编排期那 50 秒里，界面上只有一行不动的"正在理解需求"。思考是流式的，
+  // 固定显示开头那句等于把一段活的叙述冻在起点上，看着就像卡住了
+  const thinkingNow = mod.decodeCopilot([
+    { op: 'thinking', delta: '用户想要一个能查销量的流程。' },
+    { op: 'thinking', delta: '先看看画布上现有的节点有哪些。' },
+    { op: 'thinking', delta: '这里需要一个分支' },
+  ])
+  const live = thinkingNow[thinkingNow.length - 1]
+  check('还在想的时候显示最新一句', live.title.includes('这里需要一个分支'), live.title)
+  check('还在想的时候是进行中状态', live.status === 'running', live.status)
+  check('全文一句不丢', live.detail?.includes('用户想要') && live.detail?.includes('现有的节点'))
+
+  // 想完了它就是条历史记录，开头那句最接近"这段在想什么"
+  const settled = mod.decodeCopilot([
+    ...thinkingNow.length ? [
+      { op: 'thinking', delta: '用户想要一个能查销量的流程。' },
+      { op: 'thinking', delta: '先看看画布上现有的节点有哪些。' },
+    ] : [],
+    { op: 'plan', summary: '三步走' },
+  ])
+  const done = settled.find((s) => s.kind === 'think')
+  check('想完了换成开头那句', done?.title.startsWith('用户想要'), done?.title)
+  check('想完了不再转圈', done?.status === 'done', done?.status)
   check('连线不单独成行', !steps.some((s) => s.title.includes('edge')))
   check('节点用标签不用 id', steps.some((s) => s.kind === 'node' && s.title === '取数'))
   // 生成完了那条"正在理解需求…"还在转圈的话，看上去像卡住了

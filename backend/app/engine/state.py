@@ -88,11 +88,22 @@ def message_text(message: Any) -> str:
 
 
 def thinking_text(message: Any) -> str:
-    """抽出思考块的内容。
+    """抽出思考内容。
 
-    开了 adaptive thinking 的模型（Claude 4.6+）返回的 content 里混着 thinking 块，
-    正文提取必须跳过它们，但它本身对"看清楚模型怎么想的"很有价值，所以单独取出来。
+    两种形态都要认，因为两边的模型都会产出思考，而界面上"它大致在想什么"
+    只有这一个来源：
+
+    - Anthropic 系：content 是块列表，思考混在里面（type == "thinking"）。
+      正文提取必须跳过它们，但它本身很有价值，所以单独取出来。
+    - OpenAI 兼容系（DeepSeek / Qianfan / vLLM 等）：思考走 delta 里的
+      reasoning_content。langchain 的 ChatOpenAI 明确不保留这个字段，
+      我们在 providers/factory.py 里子类化捞回了 additional_kwargs。
     """
+    extra = getattr(message, "additional_kwargs", None) or {}
+    reasoning = extra.get("reasoning_content") or extra.get("reasoning")
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+
     content = getattr(message, "content", message)
     if not isinstance(content, list):
         return ""

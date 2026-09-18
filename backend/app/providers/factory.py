@@ -168,8 +168,6 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         return chat
 
     # openai 与 openai 兼容走同一个类，区别只在 base_url
-    from langchain_openai import ChatOpenAI
-
     if provider.kind == "openai_compatible" and not base_url:
         raise ProviderNotConfigured(f"provider {provider.name!r} 需要填 base_url")
     # 很多本地服务（Ollama、vLLM）不校验 key，但 SDK 要求非空
@@ -178,7 +176,56 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         kwargs["base_url"] = base_url
     if extra.get("headers"):
         kwargs["default_headers"] = extra["headers"]
-    return ChatOpenAI(**kwargs)
+    return _ReasoningAwareChatOpenAI(**kwargs)
+
+
+def _reasoning_aware_openai() -> type:
+    """ChatOpenAI 的子类，保留供应商的思考内容。
+
+    langchain 的 ChatOpenAI 只认官方 OpenAI 规范，第三方加的 reasoning_content
+    是**明确丢弃**的（它的文档原话："Non-standard response fields added by
+    third-party providers are not extracted or preserved"），建议换用
+    ChatDeepSeek 之类的专用包。
+
+    但"用哪个供应商"在这个产品里是用户在设置页配的，可能是 DeepSeek、
+    Qianfan、vLLM、OpenRouter 里任何一个——为每种装一个专用包不现实。而这
+    段内容正是界面上"它大致在想什么"的唯一真实来源：实测 deepseek-v4-pro
+    一次调用花 160 个 token 在推理上，全被丢掉了，于是编排期那 50 秒里
+    界面上只有一行不动的"正在理解需求"。
+
+    所以在这里把它捞回 additional_kwargs，thinking_text 再统一读出来。
+    只加字段，不改 langchain 对正文的任何处理。
+    """
+    from langchain_openai import ChatOpenAI
+
+    class ReasoningAwareChatOpenAI(ChatOpenAI):  # type: ignore[misc]
+        def _convert_chunk_to_generation_chunk(
+            self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
+        ):
+            gen = super()._convert_chunk_to_generation_chunk(
+                chunk, default_chunk_class, base_generation_info
+            )
+            if gen is None:
+                return gen
+            choices = chunk.get("choices") or chunk.get("chunk", {}).get("choices") or []
+            delta = (choices[0] or {}).get("delta") or {} if choices else {}
+            # 不同网关的叫法不统一，见到哪个用哪个
+            text = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(text, str) and text:
+                gen.message.additional_kwargs["reasoning_content"] = text
+            return gen
+
+    return ReasoningAwareChatOpenAI
+
+
+class _LazyReasoningChatOpenAI:
+    """延迟导入 langchain_openai：它加载得慢，而 mock/anthropic 路径用不上。"""
+
+    def __call__(self, **kwargs: Any) -> Any:
+        return _reasoning_aware_openai()(**kwargs)
+
+
+_ReasoningAwareChatOpenAI = _LazyReasoningChatOpenAI()
 
 
 async def get_chat_model(session: AsyncSession, spec: ModelSpec) -> tuple[BaseChatModel, str]:
