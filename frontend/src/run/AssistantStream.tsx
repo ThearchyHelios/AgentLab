@@ -333,6 +333,31 @@ function Output({ output, dense, runClass }: {
 
 const TEXT_CAP = 3000
 
+/**
+ * 折叠长文本的切点。
+ *
+ * 不能按字符硬切：模型的报告几乎总是 Markdown，切点一旦落在表格中间，
+ * 前面的行渲染成表格、最后半行留成原始的 `| 1 | ThearchyHelios | …`，
+ * 看上去就是一份被咬掉一口的报告——而它其实是完整的，只是被折叠了。
+ *
+ * 所以只在行边界切；而且切点落进表格里时整块表格都不要，宁可少显示一段，
+ * 也不要显示一张半截的表。
+ */
+function cutForPreview(text: string, cap: number): string {
+  const head = text.slice(0, cap)
+  const atLine = head.lastIndexOf('\n')
+  let cut = atLine > cap * 0.5 ? head.slice(0, atLine) : head
+
+  // 收尾的连续表格行（含分隔行）一起去掉——只剩表头的表格比没有更难读
+  const lines = cut.split('\n')
+  while (lines.length && /^\s*\|/.test(lines[lines.length - 1])) lines.pop()
+  const withoutTable = lines.join('\n')
+  // 整段都是表格时别把内容清空，那还不如原样折叠
+  if (withoutTable.trim()) cut = withoutTable
+
+  return cut.trimEnd()
+}
+
 function isBlank(v: unknown): boolean {
   if (v == null) return true
   if (typeof v === 'string') return !v.trim()
@@ -365,7 +390,7 @@ function OutputValue({ value, dense }: { value: unknown; dense: boolean }) {
   // 不设上限的话，一次没走查询工具、直接把几千行塞进 output 的运行会
   // 把整条流卡住——列表本来就没做虚拟化
   const long = text.length > TEXT_CAP
-  const shown = long && !full ? text.slice(0, TEXT_CAP) : text
+  const shown = long && !full ? cutForPreview(text, TEXT_CAP) : text
 
   return (
     <div>
@@ -379,10 +404,17 @@ function OutputValue({ value, dense }: { value: unknown; dense: boolean }) {
             dense ? 'text-[10.5px]' : 'text-[11px]')}>{shown}</pre>
         )}
       {long && (
-        <button className="mt-1 text-[10.5px] text-[var(--accent)] hover:underline"
-                onClick={() => setFull((v) => !v)}>
-          {full ? '收起' : `展开全部（${text.length} 字）`}
-        </button>
+        <div className="mt-1 flex items-center gap-2 text-[10.5px]">
+          {!full && (
+            // 光有一个"展开"按钮不够：用户看到的是一份读起来完整的报告，
+            // 不会想到它下面还有。得先说"这里断了"
+            <span className="text-faint">…后面还有，这里先折叠了</span>
+          )}
+          <button className="text-[var(--accent)] hover:underline"
+                  onClick={() => setFull((v) => !v)}>
+            {full ? '收起' : `展开全部（${text.length} 字）`}
+          </button>
+        </div>
       )}
     </div>
   )

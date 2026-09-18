@@ -115,6 +115,30 @@ console.log('\n=== Markdown 渲染 ===')
   await page.close()
 }
 
+console.log('\n=== 长报告的折叠 ===')
+{
+  // 折叠以前是按字符硬切的，切点落进表格中间：前面几行渲染成表格、最后半行
+  // 留成原始的 `| 1 | ThearchyHelios | …`。用户看到的是一份被咬掉一口的报告。
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
+  await page.goto(`${WEB}/preview.html?long=1`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+
+  const folded = await page.locator('body').innerText()
+  check('折叠时说破了"后面还有"', folded.includes('后面还有'))
+  check('给得出展开入口', folded.includes('展开全部'))
+  // 关键一条：折叠后不能留下没渲染成表格的原始 markdown 行
+  const rawRow = folded.split('\n').find((l) => /^\s*\|.*\|/.test(l))
+  check('没有半截的原始表格行', !rawRow, rawRow ? `残留：${rawRow.slice(0, 48)}` : '')
+  check('开头的正文还在', folded.includes('总结'))
+
+  await page.locator('button', { hasText: '展开全部' }).first().click()
+  await page.waitForTimeout(250)
+  const full = await page.locator('body').innerText()
+  check('展开后拿得到结尾', full.includes('身兼管理员与商家双重身份'))
+  check('展开后表格渲染完整', full.includes('user_39'))
+  await page.close()
+}
+
 console.log('\n=== 空态 ===')
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })

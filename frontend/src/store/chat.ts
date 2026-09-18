@@ -101,6 +101,9 @@ const PHASE_TEXT: Record<Phase, string> = {
 
 const EMPTY: ChatTurn[] = []
 
+/** 落库成果的上限。只是防跑飞，不是显示上限 */
+const ANSWER_CAP = 20_000
+
 type Patch = (fn: (t: ChatTurn) => Partial<ChatTurn>) => void
 
 /**
@@ -117,7 +120,13 @@ function answerText(output: Record<string, any> | null): string {
     if (key.startsWith('_') || value == null || value === '') continue
     parts.push(typeof value === 'string' ? value : JSON.stringify(value))
   }
-  return parts.join('\n').slice(0, 4000)
+  // 落库的是完整报告。之前在 4000 字处无声切断，刷新页面后那份就永久少一截，
+  // 而且断点常常落在表格中间。上限只是防跑飞的护栏，真切到了必须说出来——
+  // 喂给下一轮的那份另有更狠的截断（HISTORY_ANSWER_CHARS），两回事
+  const text = parts.join('\n')
+  return text.length > ANSWER_CAP
+    ? text.slice(0, ANSWER_CAP) + `\n\n…（成果过长，已截断，完整内容见运行记录）`
+    : text
 }
 
 export const useChat = create<ChatState>((set, get) => ({
