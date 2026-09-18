@@ -86,6 +86,44 @@ export interface CopilotTurn {
 // 无上限地攒着只会把内存和滚动条都撑坏。
 const COPILOT_TURN_LIMIT = 10
 
+/**
+ * 找出（或建出）这张图的 Copilot 会话。
+ *
+ * 画布的对话依附工作流：打开这张图就接着上次聊。之前连说两次"再加一个节点"，
+ * 第二次并不知道第一次说了什么——base_graph 带的是图的**结果**，带不出
+ * "你刚才要我干什么"，所以模型经常把上一条的意图又做一遍或者做反。
+ *
+ * 不进左侧列表：那边列的是"问题"，这里是"改图指令"，两种东西混在一个列表里
+ * 只会让两种都更难找。
+ *
+ * 没保存过的草稿（workflow 为空）没有会话——它还没有一个能挂历史的身份。
+ */
+async function ensureCanvasConversation(
+  workflowId: string, set: (partial: Partial<StudioState>) => void,
+): Promise<string | null> {
+  try {
+    const existing = await api.conversations.list('canvas', workflowId)
+    const id = existing[0]?.id
+      ?? (await api.conversations.create({ kind: 'canvas', workflow_id: workflowId })).id
+    set({ copilotConversationId: id })
+    return id
+  } catch {
+    return null   // 记不下来也不该挡着人改图
+  }
+}
+
+/** 把画布上这一轮记进会话，下一条指令才接得上 */
+function recordCanvasTurn(
+  conversationId: string | null,
+  instruction: string,
+  patch: { graph?: any; explanation?: string; status?: 'done' | 'error'; error?: string },
+): void {
+  if (!conversationId) return
+  void api.conversations.startTurn(conversationId, instruction)
+    .then((turn) => api.conversations.patchTurn(conversationId, turn.id, patch))
+    .catch(() => undefined)
+}
+
 interface StudioState {
   workflow: Workflow | null
   nodes: FlowNode[]
@@ -104,6 +142,9 @@ interface StudioState {
   activeEdges: string[]
   streaming: boolean
   unsubscribe: (() => void) | null
+
+  /** 这张图的 Copilot 会话 id。一张图一条，用来让连续几条改图指令互相知情 */
+  copilotConversationId: string | null
 
   copilot: {
     active: boolean
@@ -220,6 +261,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   activeEdges: [],
   streaming: false,
   unsubscribe: null,
+  copilotConversationId: null,
   copilot: { active: false, lastOp: '', explanation: '', error: '', model: '',
              phase: '', thinking: '', elapsedMs: 0, lastInstruction: '', lastUseBase: false },
   copilotNew: [],
@@ -234,7 +276,11 @@ export const useStudio = create<StudioState>((set, get) => ({
       run: null, events: [], runtime: {}, activeEdges: [], streaming: false, unsubscribe: null,
       // 换了一张图，之前那些"我让它改成这样"就不再指向眼前这张图了
       copilotTurns: [],
+      // 先清空再去解析：留着上一张图的会话 id，这中间的任何一条指令
+      // 都会带着别的图的上下文发出去
+      copilotConversationId: null,
     })
+    void ensureCanvasConversation(workflow.id, set)
     void get().validate()
   },
 
@@ -470,6 +516,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         instruction,
         base_graph: useBase && state.nodes.length ? toGraph(state.nodes, state.edges) : null,
         model: model ?? undefined,
+        conversation_id: state.copilotConversationId,
       },
       (op) => {
         const s = get()
@@ -576,6 +623,9 @@ export const useStudio = create<StudioState>((set, get) => ({
                              thinking: '', elapsedMs: 0, error: '',
                              explanation: op.explanation ?? get().copilot.explanation } })
             settle({ phase: 'done', explanation: op.explanation ?? get().copilot.explanation })
+            recordCanvasTurn(get().copilotConversationId, instruction, {
+              graph: op.graph, explanation: op.explanation ?? '', status: 'done',
+            })
             void get().validate()
             setTimeout(() => set({ copilotNew: [] }), 6000)
             break
@@ -585,6 +635,9 @@ export const useStudio = create<StudioState>((set, get) => ({
             set({ copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
                              thinking: '', explanation: '', error: op.message ?? '生成失败' } })
             settle({ phase: 'error', error: op.message ?? '生成失败' })
+            recordCanvasTurn(get().copilotConversationId, instruction, {
+              status: 'error', error: op.message ?? '生成失败',
+            })
             break
         }
       },

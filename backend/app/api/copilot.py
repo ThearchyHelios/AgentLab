@@ -200,6 +200,8 @@ class GenerateIn(BaseModel):
     model: str | None = None
     #: build = 用户在描述一个流程（画布）；answer = 用户在问一个问题（问数据页）
     intent: str = Field(default="build")
+    #: 属于哪次对话。带上它，这一轮才知道前面聊过什么
+    conversation_id: str | None = None
 
 
 def _user_message(payload: GenerateIn, *, patch: bool) -> str:
@@ -232,9 +234,76 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "入口节点**不要声明任何字段**，也不会有人再填一次表单\n"
             "- 涉及数据的问题必须用 db_query__* / db_schema__* 去真查，"
             "不要只对问题本身做文字加工（改写、摘要、分类都不是回答）\n"
-            "- 出口节点给出的应当是这个问题的答案本身"
+            "- 出口节点给出的应当是这个问题的答案本身\n"
+            # 只把历史放进 prompt 是不够的：模型拿到上一轮的图，默认仍然会
+            # 重新设计一张"更完整"的。而用户说"再按月份拆一下"时要的是上一张
+            # 图改个 SQL——重建出来的那张经常接到另一张表上，答案对不上前一轮。
+            #
+            # "完整输出"这半句是必须的。只说"在它基础上改"，模型会照着改图的
+            # 协议只发 update_node——而这条路径的累加器是从空图起步的，那些
+            # 操作全都落在不存在的节点上，最后得到一张空图，用户看到的是
+            # "图校验未通过：图是空的，先拖一个节点进来"。真踩过。
+            "- 如果上面给了上一轮的工作流，就沿用它的节点 id 和 config（数据源、"
+            "工具、表都已经对好了），只改需要改的地方（通常是 SQL 或提示词）\n"
+            "- 但**每个节点都要用 add_node 完整输出一遍**，包括没有改动的。"
+            "这一轮是从空图开始搭的，只发改动操作会得到一张空图\n"
+            "- 之前几轮的问答由系统注入成 `{{ input.history }}`。用户用「它们」「这些」"
+            "这类指代时，要让回答的节点引用它，否则模型不知道指的是上一轮那批数据"
         )
     return f"请设计一个工作流：{payload.instruction}"
+
+
+async def _previous_graph(
+    session: AsyncSession, conversation_id: str | None
+) -> dict[str, Any] | None:
+    """这次对话上一轮建出来的图。没有就是 None。"""
+    from app.api.conversations import recent_turns
+
+    if not conversation_id:
+        return None
+    turns = await recent_turns(session, conversation_id)
+    return next((t.graph for t in reversed(turns) if t.graph), None)
+
+
+async def _history_section(session: AsyncSession, conversation_id: str | None) -> str:
+    """把之前几轮拼成给模型的上下文。没有会话或没有历史时返回空串。
+
+    带上一轮的图是关键的那一半。只给问答文字的话，"再按月份拆一下"会让模型
+    重新设计一张图——它得从头猜该接哪个数据源、哪张表，而这些上一轮已经对好了。
+    实测这种重建经常接到另一张表上，答案对不上前一轮，用户完全无从判断。
+
+    图走 _slim 去掉坐标噪音，和 base_graph 那条路径用的是同一份。
+    """
+    from app.api.conversations import _answer_of, recent_turns
+
+    if not conversation_id:
+        return ""
+    turns = await recent_turns(session, conversation_id)
+    if not turns:
+        return ""
+
+    lines = [
+        f"第 {i} 轮\n  问：{t.question}\n  答：{_answer_of(t) or '（没有结果）'}"
+        for i, t in enumerate(turns, 1)
+        if t.question
+    ]
+    if not lines:
+        return ""
+
+    block = "# 这次对话之前聊过的\n" + "\n".join(lines)
+
+    last_graph = next((t.graph for t in reversed(turns) if t.graph), None)
+    if last_graph:  # 和 _previous_graph 取的是同一张，兜底重放靠的就是它
+        block += (
+            "\n\n上一轮用的工作流（数据源和表都已经对好了）：\n"
+            f"{json.dumps(_slim(last_graph), ensure_ascii=False, indent=2)}"
+        )
+    return block
+
+
+def _with_history(user: str, history: str) -> str:
+    """历史垫在请求前面。空历史时原样返回，不留一个空标题。"""
+    return f"{history}\n\n---\n\n{user}" if history else user
 
 
 COPILOT_SETTING_KEY = "copilot"
@@ -386,7 +455,8 @@ async def generate(
     except ProviderNotConfigured as e:
         raise HTTPException(400, str(e)) from e
 
-    messages = [("system", system), ("human", user)]
+    messages = [("system", system),
+                ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
     try:
         raw = await model.with_structured_output(GRAPH_SCHEMA).ainvoke(messages)
         if not isinstance(raw, dict):
@@ -642,10 +712,14 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     except ProviderNotConfigured as e:
         raise HTTPException(400, str(e)) from e
 
-    messages = [("system", system), ("human", user)]
+    messages = [("system", system),
+                ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
+    # 兜底用：模型只发了改动操作时，把它们重放到这张图上
+    prev_graph = await _previous_graph(session, payload.conversation_id)
 
     async def event_stream():
         explanation = ""
+        seen_ops: list[dict[str, Any]] = []
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
         try:
             async for op in _with_heartbeat(_iter_ops(model, messages)):
@@ -656,12 +730,34 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                     continue
                 if kind == "done":
                     explanation = str(op.get("explanation", ""))
+                seen_ops.append(op)
                 changed = _apply_op(nodes, edges, op)
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'op': 'error', 'message': f'{type(e).__name__}: {e}'}, ensure_ascii=False)}\n\n"
             return
+
+        # 兜底：一个操作都没落地，而上一轮有图。
+        #
+        # 这说明模型把这一轮当成"改上一张图"，只发了 update_node/add_edge，
+        # 而累加器是从空图起步的，那些操作全落在不存在的节点上。上面的 prompt
+        # 已经要求它完整重发，但那是约定，不是保证——约定落空的代价是用户收到
+        # 一句"图是空的，先拖一个节点进来"，而他只是问了句追问。
+        #
+        # 与其报错，不如按它本来的意思做：把这些操作重放到上一轮那张图上。
+        if not nodes and prev_graph and seen_ops:
+            for n in prev_graph.get("nodes") or []:
+                if n.get("id"):
+                    nodes[n["id"]] = n
+            # 原地改，不能重新绑定：给 edges 赋值会让它变成 event_stream 的局部
+            # 变量，而它在上面 _apply_op 那一路已经被读过了 —— UnboundLocalError
+            edges[:] = [
+                {k: v for k, v in e.items() if k in ("source", "target", "sourceHandle") and v}
+                for e in prev_graph.get("edges") or []
+            ]
+            for op in seen_ops:
+                _apply_op(nodes, edges, op)
 
         # 收尾：排版 + 校验，把最终图整体交付
         try:
