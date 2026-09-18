@@ -38,6 +38,19 @@ def test_lists_what_each_node_produces() -> None:
     assert "nodes.start" in paths and "nodes.q" in paths
 
 
+def test_input_fields_are_also_available_as_vars() -> None:
+    """入口节点把每个字段同时写进 vars（run_input 里 input 和 vars 是同一份）。
+
+    不认这一条，{{ vars.topic }} 这种完全合法的写法会被报成"未定义"——
+    误报是 linter 最坏的失败模式，它会让人把整个校验一起无视掉。
+    """
+    g = _graph([
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "topic"}]}},
+        {"id": "a", "type": "llm", "config": {"prompt": "{{ vars.topic }}"}},
+    ], [("start", "a")])
+    assert [i for i in analyze(g).issues if i.level != "info"] == []
+
+
 def test_typo_is_reported_with_a_suggestion() -> None:
     """拼错是这里最常见的错误。只说"不存在"没用，能猜就直说。"""
     g = _graph([

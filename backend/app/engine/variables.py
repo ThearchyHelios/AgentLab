@@ -154,10 +154,20 @@ def analyze(spec: GraphSpec) -> VariableReport:
                 name = str((field or {}).get("name") or "").strip()
                 if not name:
                     continue
+                desc = str((field or {}).get("description") or "")
                 ensure(
                     f"input.{name}", kind="input", label=f"入口输入「{name}」",
                     produced_by=node.id, produced_by_label=label, order=order,
-                    description=str((field or {}).get("description") or ""),
+                    description=desc,
+                )
+                # 入口节点同时把每个字段写进 vars（run_input 的返回里
+                # input 和 vars 是同一份）。不认这一条的话，{{ vars.topic }}
+                # 这种完全合法的写法会被报成"未定义"——误报是 linter 最坏的
+                # 失败模式，它会让人把整个校验一起无视掉
+                ensure(
+                    f"vars.{name}", kind="input", label=f"入口输入「{name}」（同名变量）",
+                    produced_by=node.id, produced_by_label=label, order=order,
+                    description=desc,
                 )
 
         var_name = str(cfg.get("assign_to") or "").strip()
