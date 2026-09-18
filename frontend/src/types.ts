@@ -183,3 +183,40 @@ export interface VarIssue {
   node_id?: string | null
   path: string
 }
+
+/**
+ * 一次对话。
+ *
+ * kind 分两种：chat 是问数据页（一轮 = 建图 → 跑图 → 出答案，进左侧列表），
+ * canvas 是画布右栏的 Copilot（依附某张图，一轮 = 一次改图，不进列表）。
+ */
+export interface Conversation {
+  id: string
+  title: string
+  kind: 'chat' | 'canvas'
+  workflow_id?: string | null
+  archived: boolean
+  created_at?: string
+  last_active_at?: string
+  turn_count: number
+  /** 列表里的副标题，让人一眼认出是哪次聊天 */
+  last_question: string
+}
+
+export interface ConversationDetail extends Conversation {
+  turns: ConversationTurn[]
+}
+
+export interface ConversationTurn {
+  id: string
+  seq: number
+  question: string
+  answer: string
+  explanation: string
+  graph?: GraphSpec | null
+  /** 可能为空：建图阶段就失败时压根没有 run，但这一轮仍然发生过 */
+  run_id?: string | null
+  status: 'running' | 'done' | 'error'
+  error: string
+  created_at?: string
+}

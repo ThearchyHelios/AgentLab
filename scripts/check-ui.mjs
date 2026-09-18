@@ -8,6 +8,7 @@
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
+const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const SHOTS = process.env.SHOT_DIR ?? ''
@@ -196,6 +197,38 @@ console.log('\n=== 问数据 ===')
     document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('页面不横向溢出', overflow <= 0, `${overflow}px`)
   await shot(page, 'chat')
+  await page.close()
+}
+
+console.log('\n=== 会话 ===')
+{
+  // 对话以前只活在内存里，刷新就没了。这一组守的是它真的落了库：
+  // 列表能列出来、切过去内容跟着变、刷新还在。
+  //
+  // 最后一项守的是一个真踩过的坑：进页面时自动建一条空会话，而 create 是
+  // 异步的、StrictMode 又把 effect 跑两遍，于是每次访问都留下两三条"新对话"。
+  const before = await (await fetch(`${API}/conversations`)).json()
+
+  const { page, errors } = await visit('/chat')
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  check('有"新对话"按钮', await page.getByRole('button', { name: /新对话/ }).first().isVisible())
+
+  const seeded = before.find((c) => c.turn_count > 0)
+  if (seeded) {
+    await page.locator('aside button[title]').filter({ hasText: seeded.title }).first().click()
+    await page.waitForTimeout(700)
+    check('切过去能看到那次问的话', (await page.locator('main').innerText()).includes(seeded.title))
+    await page.reload({ waitUntil: 'networkidle' })
+    await page.waitForTimeout(900)
+    check('刷新后还在', (await page.locator('main').innerText()).includes(seeded.title))
+  } else {
+    check('（跳过：库里还没有带轮次的会话）', true)
+  }
+
+  const after = await (await fetch(`${API}/conversations`)).json()
+  check('逛一圈没有凭空多出空会话', after.length <= before.length,
+        `${before.length} → ${after.length}`)
+  await shot(page, 'conversations')
   await page.close()
 }
 

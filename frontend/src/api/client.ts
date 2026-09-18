@@ -1,6 +1,7 @@
 import type {
-  Approval, GraphSpec, KbDocument, MemoryItem, Provider, Run, RunEvent,
-  Skill, ToolInfo, ValidationIssue, VarIssue, Variable, Workflow,
+  Approval, Conversation, ConversationDetail, ConversationTurn, GraphSpec,
+  KbDocument, MemoryItem, Provider, Run, RunEvent, Skill, ToolInfo,
+  ValidationIssue, VarIssue, Variable, Workflow,
 } from '../types'
 
 const BASE = '/api'
@@ -206,9 +207,29 @@ export const api = {
   },
   artifact: (id: string) => get<{ id: string; content: any }>(`/artifacts/${id}`),
 
+  // ---- 会话 ----
+  conversations: {
+    list: (kind: 'chat' | 'canvas' = 'chat', workflowId?: string) =>
+      get<Conversation[]>(
+        `/conversations?kind=${kind}` + (workflowId ? `&workflow_id=${workflowId}` : '')),
+    create: (body: { kind?: 'chat' | 'canvas'; workflow_id?: string; title?: string }) =>
+      post<ConversationDetail>('/conversations', body),
+    get: (id: string) => get<ConversationDetail>(`/conversations/${id}`),
+    update: (id: string, body: { title?: string; archived?: boolean }) =>
+      patch<Conversation>(`/conversations/${id}`, body),
+    remove: (id: string) => del(`/conversations/${id}`),
+    startTurn: (id: string, question: string) =>
+      post<ConversationTurn>(`/conversations/${id}/turns`, { question }),
+    patchTurn: (id: string, turnId: string, body: Partial<ConversationTurn>) =>
+      patch<ConversationTurn>(`/conversations/${id}/turns/${turnId}`, body),
+  },
+
   // ---- Copilot ----
   copilot: {
-    generate: (body: { instruction: string; base_graph?: GraphSpec | null }) =>
+    generate: (body: {
+      instruction: string; base_graph?: GraphSpec | null
+      conversation_id?: string | null
+    }) =>
       post<{ graph: GraphSpec; explanation: string; issues: ValidationIssue[] }>(
         '/copilot/generate', body),
     explain: (graph: GraphSpec) => post<{ explanation: string }>('/copilot/explain', { graph }),
@@ -236,6 +257,8 @@ export function streamCopilot(
     model?: string | null
     /** answer = 用户在问问题（问数据页），build = 用户在描述流程（画布）*/
     intent?: 'build' | 'answer'
+    /** 属于哪次对话。带上它，这一轮才知道前面聊过什么 */
+    conversation_id?: string | null
   },
   onOp: (op: any) => void,
   onEnd: (error?: string) => void,

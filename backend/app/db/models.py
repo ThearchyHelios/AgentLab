@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.base import Base, TimestampMixin, new_id
+from app.db.base import Base, TimestampMixin, new_id, utcnow
 
 # --------------------------------------------------------------------------
 # 设置：模型供应商 / 用户偏好 / MCP / 自定义工具
@@ -310,3 +312,75 @@ class Skill(Base, TimestampMixin):
     suggested_tools: Mapped[list[Any]] = mapped_column(default=list)
     tags: Mapped[list[Any]] = mapped_column(default=list)
     enabled: Mapped[bool] = mapped_column(default=True)
+
+
+# --------------------------------------------------------------------------
+# 会话：把一串问答串成一次对话
+# --------------------------------------------------------------------------
+
+
+class Conversation(Base, TimestampMixin):
+    """一次对话。
+
+    在此之前"对话"只是前端内存里的一个数组：刷新页面就没了，而每一轮又各自
+    从零建图、各起一条 checkpoint 线程，所以"上一轮问过什么"在系统里根本
+    无处可查。追问「再按月份拆一下」会重新找一遍数据源，可能接到别的表。
+
+    落成一张表之后，它同时承担两件事：给用户看的历史列表，和给模型看的上下文。
+
+    kind 分两种，因为这两件事像但不是一回事：
+      chat   —— 问数据页，一轮 = 一次「建图 → 跑图 → 出答案」，进左侧列表
+      canvas —— 画布右栏的 Copilot，依附某张图，一轮 = 一次改图，不进列表
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    kind: Mapped[str] = mapped_column(String(20), default="chat", index=True)
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), default=None, index=True
+    )
+    archived: Mapped[bool] = mapped_column(default=False)
+    # 列表按活跃度排。不能用 updated_at —— 改个标题就会把这条顶到最前面，
+    # 而用户对"最近聊过的"的预期是按说话时间排，不是按编辑时间
+    last_active_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+    turns: Mapped[list["ConversationTurn"]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="ConversationTurn.seq",
+    )
+
+
+class ConversationTurn(Base, TimestampMixin):
+    """一轮问答。
+
+    run_id 可以为空：建图阶段就失败时压根没有 run，但这一轮仍然发生过，
+    用户也该在历史里看到它失败了——只记成功的轮次，历史就成了一份美化过的
+    记录，而人再回来时最想搞清楚的恰恰是上次卡在哪。
+    """
+
+    __tablename__ = "conversation_turns"
+    __table_args__ = (Index("ix_conversation_turns_conv_seq", "conversation_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    question: Mapped[str] = mapped_column(Text, default="")
+    answer: Mapped[str] = mapped_column(Text, default="")
+    # Copilot 对这张图的说明。画布那条路径上只有它，没有 answer
+    explanation: Mapped[str] = mapped_column(Text, default="")
+    graph: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), default=None
+    )
+    # running | done | error
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+    conversation: Mapped[Conversation] = relationship(back_populates="turns")
