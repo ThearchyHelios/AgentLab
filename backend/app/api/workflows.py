@@ -292,3 +292,19 @@ async def validate(payload: ValidateIn) -> dict[str, Any]:
         return {"ok": False, "issues": [{"level": "error", "message": f"图结构非法：{e}"}]}
     result = validate_graph(spec)
     return result.model_dump()
+
+
+@router.post("/variables")
+async def variables(payload: ValidateIn) -> dict[str, Any]:
+    """这张图里有哪些变量、谁产出、谁引用。
+
+    纯静态分析，不用跑图也不用有运行记录——用户在编排到一半时最需要它，
+    而那时候还没有任何一次运行可看。运行期的实际取值由前端从事件里补上。
+    """
+    from app.engine.variables import analyze
+
+    try:
+        spec = GraphSpec.model_validate(payload.graph)
+    except Exception as e:  # noqa: BLE001
+        return {"variables": [], "issues": [{"level": "error", "message": f"图结构非法：{e}"}]}
+    return analyze(spec).model_dump()
