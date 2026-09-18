@@ -65,6 +65,56 @@ console.log('\n=== 展开交互 ===')
   await page.close()
 }
 
+console.log('\n=== Markdown 渲染 ===')
+{
+  // 用库里导出的**真实输出**，不是编的样本：模型写什么才是要渲染的，
+  // 按 CommonMark 规范挑测例只会测到用不上的角落
+  const page = await browser.newPage({ viewport: { width: 1100, height: 900 } })
+  const errors = []
+  page.on('pageerror', (e) => errors.push(e.message))
+  await page.goto(`${WEB}/preview.html?md=1`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(600)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+
+  const text = await page.locator('body').innerText()
+  // 「1+1 等于 **2**」原样带着星号显示——这就是改之前的样子
+  const stray = [...text.matchAll(/\*\*[^*\n]{1,40}\*\*|(?<!\w)`[^`\n]{1,40}`/g)].map((m) => m[0])
+  check('没有残留的 markdown 标记', stray.length === 0, stray.slice(0, 4).join(' '))
+
+  const el = await page.evaluate(() => ({
+    strong: document.querySelectorAll('strong').length,
+    code: document.querySelectorAll('code').length,
+    li: document.querySelectorAll('li').length,
+    table: document.querySelectorAll('table').length,
+    quote: document.querySelectorAll('blockquote').length,
+    // 模型很爱写 **`table_name`**。粗体在扫描顺序上先命中，强调内部不再
+    // 解析的话，那对反引号会原样显示出来
+    codeInStrong: document.querySelectorAll('strong code').length,
+    // 模型输出不可信，链接必须挡住 javascript:
+    badHref: [...document.querySelectorAll('a')]
+      .filter((a) => !/^(https?:|mailto:)/i.test(a.getAttribute('href') || '')).length,
+    // 只数 markdown 渲染出来的，不数整页——dev server 自己就注入 HMR 脚本
+    rawHtml: [...document.querySelectorAll('main, .space-y-2')]
+      .reduce((n, el) => n + el.querySelectorAll('script,iframe,object,embed,img').length, 0),
+    goodHref: [...document.querySelectorAll('a')]
+      .filter((a) => /^https?:/i.test(a.getAttribute('href') || '')).length,
+    pwned: window.__pwned === 1,
+  }))
+  check('粗体渲染出来了', el.strong > 0, `${el.strong} 处`)
+  check('行内代码渲染出来了', el.code > 0, `${el.code} 处`)
+  check('列表渲染出来了', el.li > 0, `${el.li} 条`)
+  check('表格渲染出来了', el.table > 0, `${el.table} 张`)
+  check('粗体里的代码也解析', el.codeInStrong > 0, `${el.codeInStrong} 处`)
+  // 样本里混了一段构造的恶意输入（真实输出不会自带攻击，但模型输出是不可信
+  // 内容，渲染层要么天生免疫，要么就是个 XSS 口子）
+  check('javascript: 链接没被渲染成可点的', el.badHref === 0, `${el.badHref} 个`)
+  check('正常链接照常可点', el.goodHref > 0, `${el.goodHref} 个`)
+  check('原始 HTML 没有变成真标签', el.rawHtml === 0, `${el.rawHtml} 个`)
+  check('注入的脚本没有执行', el.pwned === false)
+  check('原始 HTML 当文本显示出来了', text.includes('<script>'))
+  await page.close()
+}
+
 console.log('\n=== 空态 ===')
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })

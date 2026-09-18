@@ -8,6 +8,7 @@ import { Spinner } from '../components/ui'
 import {
   parseQueryResult, type ResultTable as Table, type Step, type StepKind,
 } from './decode'
+import { Markdown } from './Markdown'
 
 /**
  * 助手流：一轮轮「你问什么 → 它做了什么 → 结果」。
@@ -364,14 +365,23 @@ function OutputValue({ value, dense }: { value: unknown; dense: boolean }) {
   // 不设上限的话，一次没走查询工具、直接把几千行塞进 output 的运行会
   // 把整条流卡住——列表本来就没做虚拟化
   const long = text.length > TEXT_CAP
+  const shown = long && !full ? text.slice(0, TEXT_CAP) : text
+
   return (
-    <div className={clsx('whitespace-pre-wrap leading-relaxed',
-      dense ? 'text-[11.5px]' : 'text-[12.5px]')}>
-      {long && !full ? text.slice(0, TEXT_CAP) : text}
+    <div>
+      {/* 模型几乎总是用 Markdown 组织回答。当纯文本显示的话，「1+1 等于 **2**」
+          就原样带着星号——它的结构全丢了。只有字符串才渲染：JSON.stringify
+          出来的东西按 Markdown 解会被 * 和 _ 搅乱 */}
+      {typeof value === 'string'
+        ? <Markdown text={shown} dense={dense} />
+        : (
+          <pre className={clsx('mono overflow-x-auto whitespace-pre-wrap leading-relaxed',
+            dense ? 'text-[10.5px]' : 'text-[11px]')}>{shown}</pre>
+        )}
       {long && (
-        <button className="ml-1 text-[10.5px] text-[var(--accent)] hover:underline"
+        <button className="mt-1 text-[10.5px] text-[var(--accent)] hover:underline"
                 onClick={() => setFull((v) => !v)}>
-          {full ? '收起' : `…展开全部（${text.length} 字）`}
+          {full ? '收起' : `展开全部（${text.length} 字）`}
         </button>
       )}
     </div>
