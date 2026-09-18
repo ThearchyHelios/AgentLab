@@ -98,6 +98,12 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                     duration_ms=elapsed,
                     attempt=attempt + 1,
                     preview=_preview(updates, node.id),
+                    # assign_to 写进 vars 的值原先不在任何落库事件里，界面上
+                    # 的"变量当前值"只能从 preview 反推（data ?? text ?? 整个
+                    # output）。那个推断大多数时候对——而一个"大多数时候对"
+                    # 的调试工具比没有更糟：它会在你最需要它的那次骗你。
+                    # 如实发出来，只多一个已截断的值，且只有真的赋了值的节点才有。
+                    vars=_vars_preview(updates),
                     artifact=artifact_id,
                 )
                 trail = {
@@ -160,6 +166,30 @@ def _describe(error: BaseException | None) -> str:
     if isinstance(error, NodeError):
         return str(error)
     return f"{type(error).__name__}: {error}"
+
+
+def _vars_preview(updates: dict[str, Any]) -> dict[str, Any] | None:
+    """这一步往 vars 里写了什么。没写就不带这个字段。
+
+    截断比 preview 更狠：这是给变量表当"当前值"用的，看个大概就够，
+    要全文有工件库。事件是审计凭证，能省则省。
+    """
+    written = updates.get("vars")
+    if not isinstance(written, dict) or not written:
+        return None
+    out: dict[str, Any] = {}
+    for key, value in list(written.items())[:20]:
+        if isinstance(value, str):
+            out[key] = value[:600]
+        elif isinstance(value, (int, float, bool, type(None))):
+            out[key] = value
+        elif isinstance(value, list):
+            out[key] = f"[{len(value)} 项]"
+        elif isinstance(value, dict):
+            out[key] = {k: str(v)[:120] for k, v in list(value.items())[:12]}
+        else:
+            out[key] = str(value)[:300]
+    return out
 
 
 def _preview(updates: dict[str, Any], node_id: str) -> Any:
