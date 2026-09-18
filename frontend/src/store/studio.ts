@@ -675,3 +675,9 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({ events, runtime, activeEdges })
   },
 }))
+
+// 开发期把 store 挂到 window 上，好让 playwright 直接读状态做断言——
+// 界面上看不出"事件收全了没有"，只能问 store。生产构建里去掉。
+if (import.meta.env.DEV) {
+  ;(window as any).__studio = useStudio
+}
