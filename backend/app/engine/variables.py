@@ -132,6 +132,43 @@ def _label_of(node: GraphNode) -> str:
     return node.data.label or node.id
 
 
+def _resolve_fallback(
+    path: str, index: dict[str, "Variable"], *, input_is_closed: bool = True
+) -> "Variable | None":
+    """精确路径没命中时，看看能不能退一层认下来。
+
+    分寸全在这里：退得太松，`{{ input.quesiton }}` 会退到 `input` 被当成合法，
+    拼写检查整个失效；退得太紧，`{{ loops.item }}` 会被误报——而 loops 的成员
+    是运行期才有的，我根本枚举不了。
+
+    所以按命名空间分开对待：**成员可枚举的不许退，不可枚举的退到根**。
+    """
+    parts = [p for p in path.split(".") if p]
+    if not parts:
+        return None
+    root = parts[0]
+
+    # 裸根本身就是合法引用：{{ input }} 取整个输入 dict
+    if len(parts) == 1:
+        return index.get(root)
+
+    # 入口不声明字段时，input.* 是开放的：运行时传什么键都行（问数据页就是
+    # 这样——问题由系统注入成 input.question，入口节点里一个字段都没有）。
+    # 声明了字段才是闭集，那时候拼错才叫拼错。
+    if root == "input" and not input_is_closed:
+        return index.get("input")
+
+    # 这三个的第二段可枚举（入口字段名、assign_to、节点 id），必须存在。
+    # 再往下就是在往那个值**内部**钻了（vars.rows[0].name、nodes.a.text），
+    # 值的结构是运行期才有的，枚举不了，所以只校验到第二段
+    if root in ("input", "vars", "nodes"):
+        return index.get(f"{root}.{parts[1]}")
+
+    # loops.item / usage.total_tokens / messages[0].content 这类，
+    # 成员是运行期的状态，枚举不了，根存在就算数
+    return index.get(root)
+
+
 def analyze(spec: GraphSpec) -> VariableReport:
     """静态分析一张图的变量。不需要跑，也不需要有运行记录。"""
     depth = _depths(spec)
@@ -183,10 +220,18 @@ def analyze(spec: GraphSpec) -> VariableReport:
             produced_by=node.id, produced_by_label=label, order=order,
         )
 
+    # 每个根命名空间本身也是合法引用：{{ input }} 取整个输入 dict，
+    # {{ vars }} 取整个变量池——template_context 里它们就是顶层的键。
+    # 上一版把 input/nodes/vars 跳过了（想着"具体成员已经列过"），结果
+    # {{ input }} 被报成"没有任何节点产出"，而那是完全正确的写法。
+    # 误报会把整张图卡住：runs 启动前要过校验，一条假错误就意味着什么都跑不了。
     for root, desc in _BUILTIN_ROOTS.items():
-        if root in ("input", "nodes", "vars"):
-            continue   # 这三个的具体成员上面已经列过了
         ensure(root, kind="builtin", label=desc)
+
+    # 入口声明了字段，input.* 才是闭集；一个字段都没声明时运行时传什么键都行
+    input_is_closed = any(
+        n.type == "input" and (n.data.config or {}).get("fields") for n in spec.nodes
+    )
 
     # ---- 引用侧 ----
     for node in spec.nodes:
@@ -203,12 +248,9 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     continue
                 ref = VarRef(node_id=node.id, node_label=label, field=field, expr=expr)
 
-                # 精确命中（input.x / vars.x / nodes.x）或者根命中（last_message）
                 target = index.get(path)
-                if target is None and root in _BUILTIN_ROOTS:
-                    # nodes.foo.text 这种，退到 nodes.foo 这一层
-                    parent = ".".join(path.split(".")[:2])
-                    target = index.get(parent) or index.get(root)
+                if target is None:
+                    target = _resolve_fallback(path, index, input_is_closed=input_is_closed)
                 if target is not None:
                     target.refs.append(ref)
                     # 变量存在，但产出它的节点排在引用者之后——跑到这儿时它还是空的
@@ -226,9 +268,18 @@ def analyze(spec: GraphSpec) -> VariableReport:
 
                 # 谁都不认识它。模板取不到值会渲染成空字符串，不报错——
                 # 所以这条必须在跑之前说出来
+                # 严重度看"我有多确信"。这条会拦住整次运行（runs 启动前要过
+                # 校验），所以只在真的能穷举时才报 error：
+                #
+                # - vars.X / input.X / nodes.X —— 这三个命名空间的成员全是
+                #   我从图里扫出来的，没扫到就是真没有，多半是拼错
+                # - 根本不认识的根 —— 可能只是我没建模的东西，降成 warning。
+                #   假错误比漏报贵得多：漏报只是少提醒一次，假错误让整张图跑不了
+                known_root = root in _BUILTIN_ROOTS
                 hint = _did_you_mean(path, index)
                 report.issues.append(VarIssue(
-                    level="error", node_id=node.id, path=path,
+                    level="error" if known_root else "warning",
+                    node_id=node.id, path=path,
                     message=(
                         f"{{{{ {path} }}}} 没有任何节点产出，"
                         f"是不是想写 {{{{ {hint} }}}}？取不到值会渲染成空字符串，不报错"
