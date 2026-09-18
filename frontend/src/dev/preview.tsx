@@ -69,6 +69,37 @@ const HOSTILE = [
   '`<script>alert(1)</script>`',
 ].join('\n')
 
+/**
+ * 一份会超出折叠上限的报告，表格正好横跨切点。
+ *
+ * 之前折叠是按字符硬切的，切点落进表格中间——前面几行渲染成表格、最后半行
+ * 留成原始的 `| 1 | ThearchyHelios | …`。用户看到的是一份被咬掉一口的报告，
+ * 而它其实是完整的，只是被折叠了。
+ */
+function longReport(): string {
+  const head = [
+    "## 总结", "",
+    "- **管理员（平台级/区域级角色）**：共 9 人", "- **商家账户**：共 5 个", "",
+    "口径说明：".padEnd(400, "口"), "",
+    "## 一、管理员名单", "",
+  ].join("\n")
+  const rows = Array.from({ length: 40 }, (_, i) =>
+    `| ${i + 1} | user_${i} | user${i}@cobook.org | 昵称${i} | ` +
+    `85e11976-6a7b-4167-b561-deec4fd${String(i).padStart(4, "0")} | 商家 ${i} | c${i}@cobook.org |`)
+  return [
+    head,
+    "| userID | 用户名 | 邮箱 | 昵称 | providerID | 商家名称 | 联系人邮箱 |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    ...rows,
+    "", "> 说明：部分账户身兼管理员与商家双重身份。",
+  ].join("\n")
+}
+
+const LONG_TURN: StreamTurn = {
+  id: "long", question: "需要能够显示总结内容", phase: "done", status: "完成",
+  steps: [], output: { result: longReport() },
+}
+
 /** Markdown 渲染用真实输出验，不用编的样本 */
 function MarkdownCases() {
   return (
@@ -104,6 +135,9 @@ function Preview() {
   )
 
   if (md) return <div className="h-full overflow-y-auto"><MarkdownCases /></div>
+  if (params.get('long') === '1') {
+    return <AssistantStream turns={[LONG_TURN]} />
+  }
 
   return (
     <div className="flex h-full flex-col">
