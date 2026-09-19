@@ -245,3 +245,109 @@ def test_a_scanned_pdf_is_called_out_rather_than_ingested_empty() -> None:
     with pytest.raises(UnsupportedDocument) as e:
         extract(buf.getvalue(), "scan.pdf")
     assert "扫描件" in str(e.value)
+
+
+# --------------------------------------------------------------------------
+# 长期记忆：和知识库同一个坑，以前只有知识库有恢复手段
+# --------------------------------------------------------------------------
+
+
+async def _memory(scope: str, content: str):
+    from app.memory import store
+
+    async with SessionLocal() as session:
+        return await store.remember(session, scope=scope, content=content, dedupe=False)
+
+
+async def test_memory_records_who_built_the_vector() -> None:
+    from app.db.models import MemoryItem
+
+    item = await _memory("memtest_mark", "后端跑在 8001 端口。")
+    async with SessionLocal() as session:
+        row = await session.get(MemoryItem, item.id)
+    assert row.embed_model == emb.embedder_id() and row.embed_dim == emb.embedder_dim()
+
+
+async def test_memory_recall_degrades_out_loud() -> None:
+    """以前退得悄无声息。知识库那边至少会发一条 warn，记忆这边只是"最近想不起
+    事"，而人根本不会想到要去重建索引。"""
+    from sqlalchemy import select
+
+    from app.db.models import MemoryItem
+    from app.memory import store
+
+    await _memory("memtest_stale", "公司年会定在十二月二十号。")
+    async with SessionLocal() as session:
+        row = (await session.execute(select(MemoryItem).where(
+            MemoryItem.scope == "memtest_stale"))).scalars().first()
+        row.embed_model, row.embed_dim = "openai:text-embedding-3-small", 1536
+        row.embedding = to_blob(np.ones(1536, dtype=np.float32))
+        await session.commit()
+
+    notes: list[str] = []
+    async with SessionLocal() as session:
+        hits = await store.recall(session, scope="memtest_stale", query="年会",
+                                  on_degrade=notes.append)
+    assert hits, "退回关键词也要能召回，而不是空手"
+    assert notes and "重建索引" in notes[0], notes
+
+
+async def test_memory_reindex_restores_it() -> None:
+    from sqlalchemy import select
+
+    from app.db.models import MemoryItem
+    from app.memory import store
+
+    await _memory("memtest_fix", "张三的邮箱是 zhangsan@example.com。")
+    async with SessionLocal() as session:
+        row = (await session.execute(select(MemoryItem).where(
+            MemoryItem.scope == "memtest_fix"))).scalars().first()
+        row.embed_model, row.embed_dim = "别的模型", 99
+        await session.commit()
+
+        assert await store.stale_count(session, "memtest_fix") == 1
+        assert await store.reindex(session, "memtest_fix") == 1
+        assert await store.stale_count(session, "memtest_fix") == 0
+
+    notes: list[str] = []
+    async with SessionLocal() as session:
+        hits = await store.recall(session, scope="memtest_fix", query="邮箱",
+                                  on_degrade=notes.append)
+    assert hits and not notes, "重建之后不该再降级"
+
+
+async def test_one_rebuild_covers_both_stores() -> None:
+    """知识库和记忆共用一个 embedder，换模型时一起失效。
+
+    分成两个按钮的结果是点了一个、以为好了，另一个还在悄悄退回关键词。
+    """
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy import select
+
+    from app.db.models import Chunk, MemoryItem
+    from app.main import app
+    from app.memory import store
+
+    await _seed("both_fix", ["平台管理员有六个。"])
+    await _memory("both_mem", "商家账户共五个。")
+
+    async with SessionLocal() as session:
+        for model_cls, scope_col, scope_val in (
+            (Chunk, Chunk.collection, "both_fix"), (MemoryItem, MemoryItem.scope, "both_mem")
+        ):
+            for row in (await session.execute(
+                    select(model_cls).where(scope_col == scope_val))).scalars():
+                row.embed_model, row.embed_dim = "旧模型", 7
+        await session.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        status = (await c.get("/api/kb/embedding")).json()
+        assert status["stale_chunks"] >= 1 and status["stale_memories"] >= 1
+
+        out = (await c.post("/api/kb/reindex")).json()
+        assert out["reindexed"] >= 1
+        assert out["memories_reindexed"] >= 1, "重建只管了知识库，记忆还留在旧模型上"
+
+        after = (await c.get("/api/kb/embedding")).json()
+    assert after["stale_chunks"] == 0 and after["stale_memories"] == 0

@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import MemoryItem
 from app.memory.embeddings import (
-    cosine, embed_text, embedder_dim, embedder_id, from_blob, hybrid_rank, to_blob, usable,
+    cosine, embed_text, embed_texts, embedder_dim, embedder_id, from_blob, hybrid_rank,
+    to_blob, usable,
 )
 
 # 判重阈值：余弦相似度高于它才算同一件事。比排名分数严格得多，
@@ -88,8 +89,14 @@ async def recall(
     limit: int = 5,
     kind: str | None = None,
     min_score: float = 0.05,
+    on_degrade: Any = None,
 ) -> list[dict[str, Any]]:
-    """按混合相关度取回记忆，并按重要性和使用次数做轻微加权。"""
+    """按混合相关度取回记忆，并按重要性和使用次数做轻微加权。
+
+    存量向量和当前 embedder 对不上时整体退回纯关键词。以前这里退得悄无声息
+    ——知识库那边至少会发一条 warn，记忆这边只是"最近想不起事"，而人根本
+    不会想到要去重建索引。
+    """
     stmt = select(MemoryItem).where(MemoryItem.scope == scope)
     if kind:
         stmt = stmt.where(MemoryItem.kind == kind)
@@ -99,7 +106,15 @@ async def recall(
 
     query_vec = await embed_text(query)
     # 和 kb.search 同一个道理：有对不上的就整体退回关键词，而不是让它们静默沉底
-    if any(not usable(r.embed_model, r.embed_dim) for r in rows):
+    stale = [r for r in rows if not usable(r.embed_model, r.embed_dim)]
+    if stale:
+        if on_degrade:
+            names = sorted({r.embed_model or "未知模型" for r in stale})
+            on_degrade(
+                f"记忆域「{scope}」里有 {len(stale)}/{len(rows)} 条向量由"
+                f"「{'、'.join(names)}」建立，和当前的「{embedder_id()}」对不上，"
+                f"本次已退回纯关键词召回。重建索引后恢复。"
+            )
         vectors: list[Any] = [None] * len(rows)
         alpha = 0.0
     else:
@@ -168,6 +183,43 @@ async def list_memories(
     if scope:
         stmt = stmt.where(MemoryItem.scope == scope)
     return list((await session.execute(stmt)).scalars())
+
+
+async def stale_count(session: AsyncSession, scope: str | None = None) -> int:
+    """有多少条记忆的向量和当前 embedder 对不上。"""
+    from sqlalchemy import or_
+
+    stmt = select(func.count(MemoryItem.id)).where(
+        or_(MemoryItem.embed_model != embedder_id(), MemoryItem.embed_dim != embedder_dim()))
+    if scope:
+        stmt = stmt.where(MemoryItem.scope == scope)
+    return int((await session.execute(stmt)).scalar_one() or 0)
+
+
+async def reindex(session: AsyncSession, scope: str | None = None) -> int:
+    """用当前 embedder 重算记忆的向量，返回重算了多少条。
+
+    换 embedding 模型之后记忆和知识库一起失效，但在此之前只有知识库有重建
+    路径——记忆这边悄悄退回关键词，而且没有任何恢复手段。
+    """
+    stmt = select(MemoryItem)
+    if scope:
+        stmt = stmt.where(MemoryItem.scope == scope)
+    rows = list((await session.execute(stmt)).scalars())
+    if not rows:
+        return 0
+
+    model_id, dim = embedder_id(), embedder_dim()
+    batch = 64   # 和 kb.reindex 一样按批：一次几千条全发给远端接口必被限流
+    for i in range(0, len(rows), batch):
+        part = rows[i:i + batch]
+        vectors = await embed_texts([r.content for r in part])
+        for row, vec in zip(part, vectors):
+            row.embedding = to_blob(vec)
+            row.embed_model = model_id
+            row.embed_dim = dim
+        await session.commit()
+    return len(rows)
 
 
 async def list_scopes(session: AsyncSession) -> list[dict[str, Any]]:

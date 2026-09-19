@@ -120,7 +120,10 @@ NODE_REFERENCE = """\
 - branch：条件分支。config: {mode: expression|llm, cases:[{key, condition, label}]}
 - loop：循环。config: {mode: foreach|while, items, item_var, condition, max_iterations}
 - retrieve：知识库检索。config: {query, collection, limit, assign_to}
-- memory：长期记忆读写。config: {action: recall|write, query, content, scope, assign_to}
+- memory：长期记忆读写。config: {action: recall|write, query, content, assign_to}
+  **不要写 scope**。记忆域由平台给（当前统一是 default）。自己起一个域的后果是
+  写进去再也读不回来——真发生过：一轮写进 scope"user"，下一轮没写 scope 落回
+  default，于是「我叫蒋逸伦」存下来了，问「我是谁」却答不上来
 - human：人工介入。config: {mode: approve|input|edit, title, message}
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
