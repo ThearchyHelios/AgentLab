@@ -351,3 +351,95 @@ async def test_one_rebuild_covers_both_stores() -> None:
 
         after = (await c.get("/api/kb/embedding")).json()
     assert after["stale_chunks"] == 0 and after["stale_memories"] == 0
+
+
+# --------------------------------------------------------------------------
+# 表格横跨多块时还读不读得懂
+# --------------------------------------------------------------------------
+
+
+def _table_doc(rows: int = 60) -> str:
+    """一份表格长到必然被切开的文档。"""
+    body = ["门店 | 城市 | 销售额 | 同比"]
+    body += [f"门店{i:02d} | 上海 | {100000 + i * 3137} | {i - 10}%" for i in range(rows)]
+    return "季度报告\n\n" + "\n\n".join(body)
+
+
+def test_a_split_table_keeps_its_header_in_every_chunk() -> None:
+    """一张几十行的表会横跨好几块，除了第一块其余都只有数据行。
+
+    「上海 | 172151 | 13%」这样的片段召回出来，模型没法知道这几个数是什么。
+    表头才几十个字，每块带一份换来的是这块单独拿出来也读得懂。
+    """
+    chunks = kb.chunk_text(_table_doc())
+    assert len(chunks) > 1, "语料不够长，没切开就测不到这件事"
+    for i, c in enumerate(chunks[1:], 1):
+        assert "门店 | 城市 | 销售额 | 同比" in c, f"块{i} 丢了表头"
+
+
+def test_the_header_leads_the_chunk_not_buried_in_it() -> None:
+    """表头要在最前面。
+
+    第一版写成 tail+header+block，表头被夹在重叠的那几行后面成了中间一行，
+    块的开头仍然是一串没有主语的数——查 has_header 是 True，看起来修好了，
+    实际没有。
+    """
+    chunks = kb.chunk_text(_table_doc())
+    for i, c in enumerate(chunks[1:], 1):
+        assert c.splitlines()[0].startswith("门店 | 城市"), (
+            f"块{i} 的第一行是「{c.splitlines()[0][:30]}」，表头没领头")
+
+
+def test_overlap_never_severs_a_row() -> None:
+    """重叠原来按字符切（buf[-120:]），会从行中间断开。
+
+    实测切出来的块开头是「| 上海 | 172151 | 13%」——门店名被切没了，
+    剩一列没有主语的数字。
+    """
+    for c in kb.chunk_text(_table_doc()):
+        first = c.splitlines()[0].lstrip()
+        assert not first.startswith("|"), f"首行被腰斩：{first[:40]}"
+
+
+def test_plain_prose_is_unaffected_by_the_table_handling() -> None:
+    """表格那套不能把普通文档搞坏。"""
+    text = "\n\n".join(f"第{i}段。" + "内容" * 60 for i in range(8))
+    chunks = kb.chunk_text(text)
+    assert len(chunks) > 1
+    assert not any(c.startswith("门店") for c in chunks)
+    # 正文一个字都不能少
+    assert all(f"第{i}段。" in "".join(chunks) for i in range(8))
+
+
+async def test_a_word_document_with_a_table_survives_the_whole_pipeline() -> None:
+    """解析 → 切块 → 检索，端到端拿回来的片段要能读懂。"""
+    docx = pytest.importorskip("docx")
+
+    import io
+
+    from app.memory.parsing import extract
+
+    d = docx.Document()
+    d.add_heading("门店运营手册", 0)
+    d.add_paragraph("平台管理员拥有 platform 级别角色。")
+    t = d.add_table(rows=1, cols=4)
+    for i, h in enumerate(("门店", "城市", "销售额", "同比")):
+        t.cell(0, i).text = h
+    for i in range(60):
+        row = t.add_row()
+        for j, v in enumerate((f"门店{i:02d}", "上海", str(100000 + i * 3137), f"{i - 10}%")):
+            row.cells[j].text = v
+    buf = io.BytesIO()
+    d.save(buf)
+
+    text = extract(buf.getvalue(), "手册.docx")
+    assert "平台管理员" in text and "门店00 | 上海" in text
+
+    async with SessionLocal() as session:
+        await kb.ingest_document(session, collection="docx_e2e", title="手册", content=text)
+        hits = await kb.search(session, collection="docx_e2e", query="门店 销售额", limit=3)
+
+    assert hits
+    # 命中的片段里必须能看出这些数是什么
+    assert any("门店 | 城市 | 销售额" in h["content"] for h in hits), (
+        "召回的片段全都没有表头，拿回去也读不懂")

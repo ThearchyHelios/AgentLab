@@ -185,7 +185,11 @@ function KbTab() {
         <button className="btn" onClick={() => fileRef.current?.click()}>
           <Upload size={12} /> 上传文件
         </button>
-        <input ref={fileRef} type="file" multiple hidden accept=".txt,.md,.json,.csv,.log,.yaml,.yml,.py,.ts,.js"
+        {/* 后端认得的格式这里就要放行，否则解析做了也白做——选文件时压根
+            选不中 PDF 和 Word。表格类（xlsx）故意不放：它进知识库会被切成
+            文本，聚合算不了、数字也无法回指，那条路要走数据源 */}
+        <input ref={fileRef} type="file" multiple hidden
+               accept=".pdf,.docx,.html,.htm,.txt,.md,.json,.csv,.log,.yaml,.yml,.py,.ts,.js"
                onChange={(e) => upload(e.target.files)} />
         <button className="btn btn-primary" onClick={() => setAdding(true)}>
           <Plus size={12} /> 粘贴文本

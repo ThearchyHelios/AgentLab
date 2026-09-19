@@ -50,23 +50,64 @@ def chunk_text(text: str, target: int = _TARGET, overlap: int = _OVERLAP) -> lis
         if current:
             blocks.append(current)
 
-    # 把相邻小块合并到接近目标长度，并留一点重叠保住上下文
+    # 把相邻小块合并到接近目标长度，并留一点重叠保住上下文。
+    #
+    # 表格要特殊照顾：一张几十行的表会横跨好几块，而除了第一块，其余都只有
+    # 数据行没有列名——「上海 | 172151 | 13%」这样的片段召回出来，模型没法
+    # 知道这几个数是什么。所以开新块时把表头补在前面。
     merged: list[str] = []
     buf = ""
+    header = ""          # 当前这张表的表头
+    prev_is_row = False
+
     for block in blocks:
+        is_row = bool(_TABLE_ROW.match(block))
+        if is_row and not prev_is_row:
+            header = block.strip()      # 一段表格的第一行就是表头
+        elif not is_row:
+            header = ""                 # 离开表格了
+        prev_is_row = is_row
+
         if len(buf) + len(block) + 1 <= target:
             buf = f"{buf}\n{block}" if buf else block
+            continue
+
+        if buf:
+            merged.append(buf)
+            tail = _overlap_tail(buf, overlap) if overlap else ""
+            # 新块要从表格中间开始，就先补一份表头。它才几十个字，
+            # 换来的是这块单独拿出来也读得懂
+            lead = ""
+            if is_row and header and header not in tail:
+                lead = f"{header}\n"
+            # 表头必须在最前面。写成 tail+lead 的话它会夹在重叠的那几行后面，
+            # 变成表格中间的一行——块的开头仍然是一串没有主语的数
+            buf = f"{lead}{tail}{block}"
         else:
-            if buf:
-                merged.append(buf)
-                tail = buf[-overlap:] if overlap else ""
-                buf = f"{tail}\n{block}" if tail else block
-            else:
-                merged.append(block)
-                buf = ""
+            merged.append(block)
+            buf = ""
     if buf:
         merged.append(buf)
     return [m.strip() for m in merged if m.strip()]
+
+
+def _overlap_tail(buf: str, overlap: int) -> str:
+    """取重叠部分，但只在行边界上取。
+
+    原来是 buf[-overlap:] 按字符切，于是表格会从行中间断开——实测一份 Word
+    文档切出来的第二块开头是「| 上海 | 172151 | 13%」，门店名被切没了。
+    一列没有主语的数字，召回到了也读不懂。
+    """
+    if not buf or overlap <= 0:
+        return ""
+    tail = buf[-overlap:]
+    cut = tail.find("\n")
+    # 整段都没换行就整个丢掉：宁可不要重叠，也不要半行
+    return tail[cut + 1:] + "\n" if cut >= 0 else ""
+
+
+#: 看起来像表格行：含有单元格分隔符。docx 抽出来用 " | " 拼，Markdown 表格同形
+_TABLE_ROW = re.compile(r"^\s*\|?[^|\n]*\|")
 
 
 async def ingest_document(

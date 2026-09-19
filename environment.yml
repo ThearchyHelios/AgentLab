@@ -15,4 +15,6 @@ dependencies:
       # [microvm] 带上独立内核的沙箱后端（约 35MB wheel，首次运行还要下载
       # 约 50MB 运行时，外加一次 OCI 镜像拉取）。不需要就把方括号去掉，
       # 沙箱会退回 Seatbelt —— 代价是内存限额在 macOS 上限不住。
-      - -e ./backend[microvm,dev,db]
+      # [docs] 让 PDF / Word 传得进知识库。约十几兆，但少了它上传这类文件
+      # 只会得到一句"要先装解析库"——而界面上并不会拦着你去传
+      - -e ./backend[microvm,dev,db,docs]
