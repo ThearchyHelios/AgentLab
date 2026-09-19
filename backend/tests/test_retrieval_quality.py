@@ -293,3 +293,93 @@ async def _measure_default(k: int = 5) -> dict[str, float]:
             rr.append(1.0 / rank if rank else 0.0)
     n = len(hit1)
     return {"all_top1": sum(hit1) / n, "all_hit": sum(hit) / n, "all_rr": sum(rr) / n}
+
+
+# --------------------------------------------------------------------------
+# 倒排索引：必须和全表扫给出同一个名次
+# --------------------------------------------------------------------------
+#
+# 这是换索引最要紧的一条。一个更快但排序不同的检索，等于悄悄改了所有人的
+# 检索结果——而且因为"看起来还是有结果"，没人会发现。
+
+
+async def _brute_force(query: str, k: int) -> list[str]:
+    """绕开倒排，按原来的方式全表扫 + 现建 BM25。"""
+    from sqlalchemy import select
+
+    from app.db.models import Chunk
+    from app.memory.embeddings import embed_text, from_blob, hybrid_rank
+
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(Chunk).where(Chunk.collection == COLLECTION))).scalars())
+        # 和 kb.search 一样按 id 定序：分数并列时排序是稳定的，输入顺序不同
+        # 就会给出不同的名次。参照实现也得是确定的，否则这条比对时灵时不灵
+        rows.sort(key=lambda r: r.id)
+        qv = await embed_text(query)
+        ranked = hybrid_rank(query, [r.content for r in rows],
+                             [from_blob(r.embedding, emb.embedder_dim()) for r in rows],
+                             qv, alpha=emb.default_alpha())
+    return [rows[i].meta.get("title", "") for i, _s, _p in ranked[:k]]
+
+
+async def test_the_index_ranks_the_same_as_a_full_scan() -> None:
+    """快是次要的，一致才是前提。"""
+    async with SessionLocal() as session:
+        for question, _want, _kind in QUESTIONS:
+            fast = [h["title"] for h in await kb.search(
+                session, collection=COLLECTION, query=question, limit=5)]
+            slow = await _brute_force(question, 5)
+            assert fast == slow, f"「{question}」倒排给的是 {fast}，全表扫给的是 {slow}"
+
+
+async def test_the_index_actually_narrows_the_candidates() -> None:
+    """不收窄的话这一整套就白做了——查询词只该捞出含有它们的那些片段。"""
+    from app.memory import inverted
+
+    async with SessionLocal() as session:
+        picked = await inverted.candidates(
+            session, collection=COLLECTION, query="会话多久过期", limit=100)
+        assert picked, "倒排一条都没捞到"
+        assert len(picked) < len(DOCS), (
+            f"捞了 {len(picked)} 条，语料才 {len(DOCS)} 篇——等于没收窄")
+
+
+async def test_chunks_without_an_index_fall_back_to_the_full_scan() -> None:
+    """存量数据升级上来时倒排是空的。宁可慢，也不要因为索引没建好就说"没搜到"。"""
+    from sqlalchemy import select
+
+    from app.db.models import Chunk
+    from app.memory import inverted
+
+    async with SessionLocal() as session:
+        ids = list((await session.execute(
+            select(Chunk.id).where(Chunk.collection == COLLECTION))).scalars())
+        await inverted.drop_chunk_terms(session, ids)
+        await session.commit()
+
+        hits = await kb.search(session, collection=COLLECTION, query="会话多久过期", limit=3)
+        assert hits, "倒排被清空后不该搜不到东西"
+        assert hits[0]["title"] == "登录与会话"
+
+        # 重建回来，别影响后面的用例
+        assert await inverted.rebuild(session, COLLECTION) == len(DOCS)
+
+
+async def test_deleting_a_document_takes_its_index_rows() -> None:
+    """倒排不跟着删的话，它会一直把已经不存在的片段捞出来。"""
+    from sqlalchemy import func, select
+
+    from app.db.models import ChunkTerm, Document
+
+    async with SessionLocal() as session:
+        doc = await kb.ingest_document(
+            session, collection="idx_del", title="临时", content="一段会被删掉的内容。")
+        before = int((await session.execute(select(func.count(ChunkTerm.id)).where(
+            ChunkTerm.collection == "idx_del"))).scalar_one())
+        assert before > 0
+
+        await kb.delete_document(session, doc.id)
+        after = int((await session.execute(select(func.count(ChunkTerm.id)).where(
+            ChunkTerm.collection == "idx_del"))).scalar_one())
+    assert after == 0, f"文档删了但倒排还留着 {after} 行"

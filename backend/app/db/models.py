@@ -300,9 +300,35 @@ class Chunk(Base):
     # 而在此之前代码里没有任何地方能看出"这条是旧模型建的"
     embed_model: Mapped[str] = mapped_column(String(100), default="")
     embed_dim: Mapped[int] = mapped_column(Integer, default=0)
+    #: 分词后的 token 数。BM25 要按文档长度归一，存下来省得为算 avg_len 再扫一遍
+    token_len: Mapped[int] = mapped_column(Integer, default=0)
     meta: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
     document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class ChunkTerm(Base):
+    """倒排表：词 → 包含它的片段。
+
+    在此之前每次检索都 `select(Chunk)` 全量载入，再在 Python 里**重建**一遍
+    BM25 倒排——几百段无感，上万段就是秒级，而那正是知识库开始有用的规模。
+
+    没用 SQLite 的 FTS5：它的 trigram 分词器要求查询至少三个字符，中文里
+    「商家」「订单」「权限」这些两字词一个都召不回（实测）。而现有的分词器
+    本来就做中文单字 + 二元组，自己存一张倒排表既保住召回，也不把知识库
+    锁死在 SQLite 上。
+    """
+
+    __tablename__ = "chunk_terms"
+    __table_args__ = (Index("ix_chunk_terms_lookup", "collection", "term"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("chunks.id", ondelete="CASCADE"), index=True
+    )
+    collection: Mapped[str] = mapped_column(String(100), default="default")
+    term: Mapped[str] = mapped_column(String(64))
+    tf: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class Skill(Base, TimestampMixin):

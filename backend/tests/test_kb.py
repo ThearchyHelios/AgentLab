@@ -131,7 +131,7 @@ async def test_search_degrades_instead_of_crashing_after_a_model_switch() -> Non
 
     assert hits, "退回关键词也要能搜到东西，而不是空手而归"
     assert notes, "少了一半能力却不吭声，用户只会觉得最近搜得不准"
-    assert "重建索引" in notes[0] and "2/2" in notes[0]
+    assert "重建索引" in notes[0] and "2 条" in notes[0], notes[0]
 
 
 async def test_reindex_restores_hybrid_search() -> None:
@@ -172,3 +172,76 @@ def test_choosing_a_remote_embedder_that_cannot_be_built_says_so(monkeypatch) ->
 def test_the_local_embedder_is_always_available() -> None:
     emb.configure("local")
     assert emb.embedder_id() == "local-hashing" and emb.embedder_dim() == 512
+
+
+# --------------------------------------------------------------------------
+# 文档解析
+# --------------------------------------------------------------------------
+#
+# 以前 upload 只接受 UTF-8，PDF 传上去直接 415；而 mime 字段记了却从不参与
+# 任何判断。知识库里最常见的恰恰是 PDF 和 Word。
+
+
+def test_plain_text_still_goes_straight_through() -> None:
+    from app.memory.parsing import extract
+
+    assert extract("就是一段文本".encode(), "note.txt") == "就是一段文本"
+    assert extract("# 标题".encode(), "readme.md") == "# 标题"
+
+
+def test_html_is_stripped_to_text() -> None:
+    from app.memory.parsing import extract
+
+    html = """<html><head><style>p{color:red}</style></head>
+    <body><nav>导航</nav><h1>权限说明</h1><p>只有管理员能改角色。</p>
+    <script>alert(1)</script><footer>版权</footer></body></html>""".encode()
+    out = extract(html, "doc.html")
+    assert "权限说明" in out and "只有管理员能改角色" in out
+    # 脚本样式导航页脚都不是正文，留着只会污染检索
+    assert "alert" not in out and "color:red" not in out
+    assert "导航" not in out and "版权" not in out
+
+
+def test_an_unreadable_binary_says_what_to_do() -> None:
+    """报错要能照着做，不是一句 UnicodeDecodeError。"""
+    from app.memory.parsing import UnsupportedDocument, extract
+
+    with pytest.raises(UnsupportedDocument) as e:
+        extract(b"\x00\x01\x02\xff\xfe", "mystery.bin")
+    assert "UTF-8" in str(e.value) and "PDF" in str(e.value)
+
+
+def test_a_missing_parser_tells_you_which_package(monkeypatch) -> None:
+    """没装可选依赖时给的必须是"装哪个包"，而不是 ImportError。"""
+    import builtins
+
+    from app.memory.parsing import UnsupportedDocument, extract
+
+    real_import = builtins.__import__
+
+    def _no_pypdf(name, *a, **kw):
+        if name == "pypdf":
+            raise ImportError("no pypdf")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_pypdf)
+    with pytest.raises(UnsupportedDocument) as e:
+        extract(b"%PDF-1.4 fake", "doc.pdf")
+    assert "agentlab-backend[docs]" in str(e.value)
+
+
+def test_a_scanned_pdf_is_called_out_rather_than_ingested_empty() -> None:
+    """扫描件提不出文字。悄悄存一份空文档，用户会以为传成功了、却永远搜不到。"""
+    pytest.importorskip("pypdf")
+    import pypdf
+
+    from app.memory.parsing import UnsupportedDocument, extract
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buf = __import__("io").BytesIO()
+    writer.write(buf)
+
+    with pytest.raises(UnsupportedDocument) as e:
+        extract(buf.getvalue(), "scan.pdf")
+    assert "扫描件" in str(e.value)

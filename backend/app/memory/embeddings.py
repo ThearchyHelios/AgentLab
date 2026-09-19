@@ -260,16 +260,21 @@ def hybrid_rank(
     query_vec: np.ndarray,
     *,
     alpha: float = 0.5,
+    keyword_scores: Sequence[float] | None = None,
 ) -> list[tuple[int, float, dict[str, float]]]:
     """向量相似度和 BM25 各归一化后加权合并。
 
     纯向量会漏掉精确的专有名词，纯 BM25 又抓不住同义表达，
     混合排序在本地小知识库上稳定优于任何一个单独使用。
+
+    keyword_scores 传进来就不再自己算 BM25。倒排索引那条路必须传：它按**全集**
+    统计（N、avg_len、df）算好了分，而这里只拿到候选子集——在子集上重算，
+    df 和平均长度全是另一套数，排出来的名次和全表扫不一样。真踩过，
+    test_the_index_ranks_the_same_as_a_full_scan 就是为此写的。
     """
     if not texts:
         return []
-    bm = BM25(texts)
-    kw_scores = bm.score(query)
+    kw_scores = list(keyword_scores) if keyword_scores is not None else BM25(texts).score(query)
     vec_scores = [cosine(query_vec, v) if v is not None else 0.0 for v in vectors]
 
     def _norm(xs: list[float]) -> list[float]:
