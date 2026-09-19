@@ -7,7 +7,9 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import MemoryItem
-from app.memory.embeddings import cosine, embed_text, from_blob, hybrid_rank, to_blob
+from app.memory.embeddings import (
+    cosine, embed_text, embedder_dim, embedder_id, from_blob, hybrid_rank, to_blob, usable,
+)
 
 # 判重阈值：余弦相似度高于它才算同一件事。比排名分数严格得多，
 # 因为这里比的是真实语义距离，不是"谁排第一"。
@@ -44,7 +46,12 @@ async def remember(
         candidates = list((await session.execute(stmt)).scalars())
         best, best_score = None, 0.0
         for row in candidates:
-            other = from_blob(row.embedding)
+            # 对不上当前 embedder 的直接跳过：维度不同 cosine 会抛，维度碰巧
+            # 相同但模型不同则更糟——两个空间之间的相似度是个随机数，
+            # 拿它判重会把不相关的旧记忆认成"重复"然后丢掉新内容
+            if not usable(row.embed_model, row.embed_dim):
+                continue
+            other = from_blob(row.embedding, embedder_dim())
             if other is None:
                 continue
             score = cosine(vec, other)
@@ -64,6 +71,8 @@ async def remember(
         meta=meta or {},
         importance=importance,
         embedding=to_blob(vec),
+        embed_model=embedder_id(),
+        embed_dim=embedder_dim(),
     )
     session.add(item)
     await session.commit()
@@ -89,11 +98,19 @@ async def recall(
         return []
 
     query_vec = await embed_text(query)
+    # 和 kb.search 同一个道理：有对不上的就整体退回关键词，而不是让它们静默沉底
+    if any(not usable(r.embed_model, r.embed_dim) for r in rows):
+        vectors: list[Any] = [None] * len(rows)
+        alpha = 0.0
+    else:
+        vectors = [from_blob(r.embedding, embedder_dim()) for r in rows]
+        alpha = 0.5
     ranked = hybrid_rank(
         query,
         [r.content for r in rows],
-        [from_blob(r.embedding) for r in rows],
+        vectors,
         query_vec,
+        alpha=alpha,
     )
 
     results: list[dict[str, Any]] = []

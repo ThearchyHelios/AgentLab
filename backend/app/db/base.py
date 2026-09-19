@@ -75,6 +75,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("workflows", "published_by", "VARCHAR(100)"),
     ("workflow_versions", "graph_hash", "VARCHAR(64)"),
     ("approvals", "resolved_by", "VARCHAR(100)"),
+    # 存量向量没有这两列，回填成空串 / 0 —— 正好表示"不知道是谁建的"，
+    # 检索侧会把它们当成对不上当前 embedder 处理
+    ("chunks", "embed_model", "VARCHAR(100) DEFAULT ''"),
+    ("chunks", "embed_dim", "INTEGER DEFAULT 0"),
+    ("memories", "embed_model", "VARCHAR(100) DEFAULT ''"),
+    ("memories", "embed_dim", "INTEGER DEFAULT 0"),
 ]
 
 

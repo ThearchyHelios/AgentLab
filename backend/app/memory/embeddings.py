@@ -61,7 +61,9 @@ class OpenAIEmbedder:
                  base_url: str | None = None) -> None:
         from langchain_openai import OpenAIEmbeddings
 
-        self.dim = 1536
+        self.model = model
+        # text-embedding-3-large 是 3072，别写死
+        self.dim = 3072 if "3-large" in model else 1536
         self._impl = OpenAIEmbeddings(
             model=model,
             api_key=api_key or os.environ.get("OPENAI_API_KEY"),
@@ -79,15 +81,90 @@ class OpenAIEmbedder:
 
 _local = LocalEmbedder()
 
+#: 设置表里存 embedding 配置的键。和 Copilot 模型同一套路子
+EMBEDDING_SETTING_KEY = "embedding"
 
-def get_embedder() -> LocalEmbedder | OpenAIEmbedder:
-    """默认走本地；显式打开 AGENTLAB_USE_OPENAI_EMBEDDINGS 且有 key 时才用远端。"""
+#: 进程内缓存。get_embedder 在检索热路径上被反复调用，不该每次都去读库
+_cached: tuple[str, Any] | None = None
+
+
+class EmbedderUnavailable(RuntimeError):
+    """配了远端 embedder 但建不起来。message 直接给用户看。"""
+
+
+def _make(kind: str, model: str, *, strict: bool) -> "LocalEmbedder | OpenAIEmbedder":
+    if kind != "openai":
+        return _local
+    try:
+        return OpenAIEmbedder(model=model or "text-embedding-3-small")
+    except Exception as e:  # noqa: BLE001
+        if strict:
+            # 人明确选了远端就不能偷偷退回本地：他会以为自己在用语义检索，
+            # 而实际拿到的是哈希词袋——搜不出同义表达时完全无从怀疑到这里
+            raise EmbedderUnavailable(
+                f"用不了 embedding 模型 {model or 'text-embedding-3-small'}："
+                f"{type(e).__name__}: {e}。检查 OPENAI_API_KEY 是否配了。"
+            ) from e
+        return _local
+
+
+def configure(kind: str, model: str = "") -> None:
+    """切换当前 embedder。设置页保存后调用，也用于测试。建不起来会抛。"""
+    global _cached
+    _cached = (f"{kind}:{model}", _make(kind, model, strict=True))
+
+
+def get_embedder() -> "LocalEmbedder | OpenAIEmbedder":
+    """当前 embedder。
+
+    优先级：进程内已配置 > 环境变量兜底 > 本地。设置页写库后会调 configure，
+    所以这里不再每次读库——检索热路径上一次查询要走几百次。
+
+    以前这里只认 AGENTLAB_USE_OPENAI_EMBEDDINGS 一个环境变量：没有界面、
+    没人会发现，于是所有人都在用那个没有语义能力的哈希向量，而 alpha 默认
+    0.5 还给了它一半权重。
+    """
+    if _cached is not None:
+        return _cached[1]
     if os.environ.get("AGENTLAB_USE_OPENAI_EMBEDDINGS") and os.environ.get("OPENAI_API_KEY"):
-        try:
-            return OpenAIEmbedder()
-        except Exception:  # noqa: BLE001
-            return _local
+        return _make("openai", "", strict=False)
     return _local
+
+
+def embedder_id() -> str:
+    """当前 embedder 的身份。存进 chunk 那一列，检索时拿它判断存量向量还能不能用。"""
+    emb = get_embedder()
+    name = getattr(emb, "name", "unknown")
+    model = getattr(emb, "model", "")
+    return f"{name}:{model}" if model else name
+
+
+def embedder_dim() -> int:
+    return int(getattr(get_embedder(), "dim", _DIM))
+
+
+def usable(embed_model: str | None, embed_dim: int | None) -> bool:
+    """这条存量向量还能不能和当前查询比对。
+
+    维度对不上 cosine 会直接抛 ValueError（shapes (1536,) and (512,) not
+    aligned），所以这不是"质量差一点"，是会 500。模型名也要比：同维度不同
+    模型的向量空间没有可比性，算出来的相似度是随机数。
+
+    存量数据这两列是空的（迁移回填的默认值），一律当成不可用——保守，
+    但总比拿旧模型的向量冒充当前空间里的坐标强。
+    """
+    return bool(embed_model) and embed_model == embedder_id() and embed_dim == embedder_dim()
+
+
+async def load_setting(session: Any) -> None:
+    """从库里读 embedding 配置并生效。应用启动时调一次。"""
+    from app.db.models import Setting
+
+    row = await session.get(Setting, EMBEDDING_SETTING_KEY)
+    saved = (row.value if row else {}) or {}
+    kind = saved.get("kind")
+    if kind:
+        configure(kind, saved.get("model", ""))
 
 
 async def embed_text(text: str) -> np.ndarray:

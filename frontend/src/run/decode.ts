@@ -712,6 +712,30 @@ export function decodeRun(events: RunEvent[]): Step[] {
         break
       }
 
+      case 'retrieve.end': {
+        // 知识检索。以前只发一条 info 日志，于是"这句结论依据的是哪份文档的
+        // 哪一段"在轨迹里查不到——而 SQL 取数那条路早就能下钻到工件
+        const count = num(d.count) ?? 0
+        const collection = String(d.collection ?? '')
+        const top = num(d.top_score)
+        push({
+          id: `rt-${seq}`, seq, kind: 'schema', nodeId,
+          status: count ? 'done' : 'failed',
+          level: d.degraded ? 'warn' : count ? undefined : 'warn',
+          title: count
+            ? `在「${collection}」里检索到 ${count} 段`
+            : `在「${collection}」里没检索到内容`,
+          detail: String(d.query ?? ''),
+          meta: [
+            top != null ? `最高分 ${top}` : '',
+            // 退回关键词是"少了一半能力"，不标出来用户只会觉得最近搜得不准
+            d.degraded ? '已退回关键词' : '',
+          ].filter(Boolean).join(' · ') || undefined,
+          artifact: d.artifact,
+        }, nodeId)
+        break
+      }
+
       default:
         // 新增事件类型时不要静默吞掉——宁可显示一条原始的，也比让人觉得
         // "什么都没发生"好。加了新事件记得回来补一条映射。
