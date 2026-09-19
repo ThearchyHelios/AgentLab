@@ -29,6 +29,94 @@ export function KnowledgePage() {
 
 // -------------------------------------------------------------------------
 
+/**
+ * 当前用哪个 embedder，以及有多少条向量已经对不上。
+ *
+ * 在此之前切换 embedding 模型的唯一开关是 AGENTLAB_USE_OPENAI_EMBEDDINGS——
+ * 一个没有界面、没人会发现的环境变量。于是所有人都在用那个没有语义能力的
+ * 哈希向量（同义改写一条都召不回），而 alpha 默认还给了它一半权重。
+ *
+ * 换模型之后存量向量就和查询对不上了，检索会整体退回纯关键词。这一条必须
+ * 显眼：少了一半能力却不说，用户只会觉得"最近搜得不准"。
+ */
+function EmbedderBar({ collection, onChanged }: {
+  collection: string
+  onChanged: () => void | Promise<void>
+}) {
+  const toast = useToast()
+  const [info, setInfo] = useState<any>(null)
+  const [busy, setBusy] = useState(false)
+
+  const refresh = async () => setInfo(await api.kb.embedding(collection).catch(() => null))
+  useEffect(() => { void refresh() }, [collection])
+
+  if (!info) return null
+  const stale = info.stale_chunks ?? 0
+
+  const pick = async (kind: string, model: string) => {
+    setBusy(true)
+    try {
+      const out = await api.kb.setEmbedding({ kind, model })
+      toast(`已切到 ${out.embedder}`, 'ok')
+      await refresh()
+    } catch (e: any) {
+      // 400 里是"缺 OPENAI_API_KEY"这类能照着做的原因，原样交给用户
+      toast(e?.message ?? '切换失败', 'error')
+    } finally { setBusy(false) }
+  }
+
+  const rebuild = async () => {
+    setBusy(true)
+    try {
+      const out = await api.kb.reindex(collection)
+      toast(`已用 ${out.embedder} 重建 ${out.reindexed} 段`, 'ok')
+      await refresh()
+      await onChanged()
+    } catch (e: any) {
+      toast(e?.message ?? '重建失败', 'error')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="mb-3 rounded-lg border bg-panel p-3 text-[12px]">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-faint">向量模型</span>
+        <select className="field h-7 w-auto" disabled={busy}
+                value={info.kind === 'openai' ? `openai:${info.model}` : 'local'}
+                onChange={(e) => {
+                  const [kind, ...rest] = e.target.value.split(':')
+                  void pick(kind, rest.join(':'))
+                }}>
+          <option value="local">本地哈希（零配置，但没有语义能力）</option>
+          <option value="openai:text-embedding-3-small">OpenAI 3-small</option>
+          <option value="openai:text-embedding-3-large">OpenAI 3-large</option>
+        </select>
+        <span className="mono text-[11px] text-faint">{info.embedder} · {info.dim} 维</span>
+        <span className="flex-1" />
+        {stale > 0 && (
+          <button className="btn btn-sm btn-primary" disabled={busy} onClick={rebuild}>
+            重建索引（{stale} 段）
+          </button>
+        )}
+      </div>
+      {stale > 0 && (
+        <p className="mt-2 text-[11px]" style={{ color: 'var(--warn)' }}>
+          有 {stale} 段的向量是用别的模型建的，和当前模型对不上——检索这些内容时
+          会退回纯关键词（搜不出同义表达）。重建索引后恢复。
+        </p>
+      )}
+      {info.kind !== 'openai' && stale === 0 && (
+        <p className="mt-2 text-[11px] text-faint">
+          本地向量不联网、零配置，但它是词频哈希、没有语义泛化——
+          「管理员」搜不到「平台角色」。认真用知识库的话换成上面的真模型。
+        </p>
+      )}
+    </div>
+  )
+}
+
+// -------------------------------------------------------------------------
+
 function KbTab() {
   const toast = useToast()
   const refreshCatalog = useCatalog((s) => s.refresh)
@@ -94,6 +182,8 @@ function KbTab() {
           </button>
         ))}
       </div>
+
+      <EmbedderBar collection={collection} onChanged={load} />
 
       {/* 检索调试：能直观看到混合检索里语义和关键词各占多少 */}
       <div className="mb-4 rounded-lg border bg-panel p-3">

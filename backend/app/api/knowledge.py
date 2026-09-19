@@ -175,8 +175,76 @@ async def search_kb(
     alpha: float = Query(default=0.5, ge=0, le=1, description="1=纯向量, 0=纯关键词"),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    hits = await kb.search(session, collection=collection, query=q, limit=limit, alpha=alpha)
-    return {"query": q, "collection": collection, "results": hits}
+    notes: list[str] = []
+    hits = await kb.search(session, collection=collection, query=q, limit=limit,
+                           alpha=alpha, on_degrade=notes.append)
+    # 退回关键词这件事要跟着结果一起交出去，而不是只写进服务端日志——
+    # 调用方（设置页的"试一下"、外部脚本）看到的是结果变差，得知道为什么
+    return {"query": q, "collection": collection, "results": hits, "degraded": notes}
+
+
+@kb_router.get("/embedding")
+async def embedding_status(
+    collection: str | None = None, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """当前用的是哪个 embedder，以及有多少条向量已经对不上了。"""
+    from app.memory.embeddings import EMBEDDING_SETTING_KEY, embedder_dim, embedder_id
+    from app.db.models import Setting
+
+    row = await session.get(Setting, EMBEDDING_SETTING_KEY)
+    saved = (row.value if row else {}) or {}
+    return {
+        "embedder": embedder_id(),
+        "dim": embedder_dim(),
+        "configured": bool(saved.get("kind")),
+        "kind": saved.get("kind", "local"),
+        "model": saved.get("model", ""),
+        "stale_chunks": await kb.stale_count(session, collection),
+    }
+
+
+class EmbeddingIn(BaseModel):
+    kind: str = Field(default="local", pattern="^(local|openai)$")
+    model: str = ""
+
+
+@kb_router.put("/embedding")
+async def set_embedding(
+    payload: EmbeddingIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """换 embedding 模型。
+
+    建不起来就 400 原样交回原因——选了远端却静默退回本地哈希向量，
+    用户会以为自己在用语义检索，而搜不出同义表达时完全无从怀疑到这里。
+    """
+    from app.memory import embeddings as emb
+    from app.db.models import Setting
+
+    try:
+        emb.configure(payload.kind, payload.model)
+    except emb.EmbedderUnavailable as e:
+        raise HTTPException(400, str(e)) from e
+
+    row = await session.get(Setting, emb.EMBEDDING_SETTING_KEY)
+    value = {"kind": payload.kind, "model": payload.model}
+    if row:
+        row.value = value
+    else:
+        session.add(Setting(key=emb.EMBEDDING_SETTING_KEY, value=value))
+    await session.commit()
+    return {
+        "embedder": emb.embedder_id(),
+        "dim": emb.embedder_dim(),
+        "stale_chunks": await kb.stale_count(session),
+    }
+
+
+@kb_router.post("/reindex")
+async def reindex(
+    collection: str | None = None, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """用当前 embedder 重算向量。换了模型之后唯一的恢复手段。"""
+    return await kb.reindex(session, collection)
 
 
 @kb_router.delete("/documents/{doc_id}", status_code=204)

@@ -72,10 +72,15 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     limit = int(ctx.cfg("limit", 5) or 5)
     alpha = float(ctx.cfg("alpha", 0.5) or 0.5)  # 1=纯向量，0=纯关键词
 
+    degraded: list[str] = []
     async with SessionLocal() as session:
         hits = await kb.search(
-            session, collection=collection, query=query, limit=limit, alpha=alpha
+            session, collection=collection, query=query, limit=limit, alpha=alpha,
+            on_degrade=degraded.append,
         )
+    for note in degraded:
+        # 检索悄悄少了一半能力，不说的话用户只会觉得"最近搜得不准"
+        ctx.emit(EventType.LOG, level="warn", message=note)
 
     min_score = float(ctx.cfg("min_score", 0.0) or 0.0)
     hits = [h for h in hits if h["score"] >= min_score]
@@ -85,15 +90,44 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         f"[{i + 1}] {h['title']}（片段 {h['ordinal']}）\n{h['content']}"
         for i, h in enumerate(hits)
     )
+    # 命中落工件库。SQL 取数、工具调用、agent 工具调用都有快照，检索一直没有，
+    # 于是结论只要来自知识库，"这个数是哪来的"这条链就断在这儿
+    from app.core.artifact_store import put_json
+    from app.memory.embeddings import embedder_id
+
+    snapshot: str | None = None
+    try:
+        snapshot = await put_json(
+            {
+                "query": query, "collection": collection,
+                "alpha": alpha, "min_score": min_score,
+                "embedder": embedder_id(), "degraded": degraded,
+                "hits": hits,
+            },
+            kind="retrieval_snapshot",
+            run_id=ctx.run.run_id, node_id=ctx.node.id,
+        )
+    except Exception:  # noqa: BLE001 - 存不下不影响这次检索本身
+        snapshot = None
+
+    ctx.emit(
+        EventType.RETRIEVE_END,
+        collection=collection,
+        query=query[:200],
+        count=len(hits),
+        top_score=hits[0]["score"] if hits else 0,
+        degraded=bool(degraded),
+        artifact=snapshot,
+    )
+
     result = {
         "hits": hits,
         "count": len(hits),
         "text": context_text,
         "query": query,
         "collection": collection,
+        "artifact": snapshot,
     }
-    ctx.emit(EventType.LOG, level="info",
-             message=f"检索 {collection}：命中 {len(hits)} 条，最高分 {hits[0]['score'] if hits else 0}")
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     var_name = ctx.cfg("assign_to", "")

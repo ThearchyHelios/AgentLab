@@ -256,6 +256,11 @@ class MemoryItem(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text)
     meta: Mapped[dict[str, Any]] = mapped_column(default=dict)
     embedding: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    # 这条向量是谁产出的。没有它就无法判断存量向量还能不能和当前查询比对——
+    # 换 embedder 之后维度对不上，cosine 直接 ValueError（512 vs 1536），
+    # 而在此之前代码里没有任何地方能看出"这条是旧模型建的"
+    embed_model: Mapped[str] = mapped_column(String(100), default="")
+    embed_dim: Mapped[int] = mapped_column(Integer, default=0)
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     last_used_at: Mapped[datetime | None] = mapped_column(default=None)
     use_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -290,6 +295,11 @@ class Chunk(Base):
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    # 这条向量是谁产出的。没有它就无法判断存量向量还能不能和当前查询比对——
+    # 换 embedder 之后维度对不上，cosine 直接 ValueError（512 vs 1536），
+    # 而在此之前代码里没有任何地方能看出"这条是旧模型建的"
+    embed_model: Mapped[str] = mapped_column(String(100), default="")
+    embed_dim: Mapped[int] = mapped_column(Integer, default=0)
     meta: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
     document: Mapped[Document] = relationship(back_populates="chunks")

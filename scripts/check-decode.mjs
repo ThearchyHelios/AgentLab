@@ -42,6 +42,35 @@ console.log('=== 数据库查询 ===')
     steps.some((s) => s.kind === 'node' && s.children?.some((c) => c.kind === 'query')))
 }
 
+console.log('\n=== 知识检索 ===')
+{
+  // 以前检索只发一条 info 日志，轨迹里查不到"这句结论依据的是哪一段"。
+  // 现在它是一条正经事件，而且带工件 id 可以下钻。
+  const ev = (data) => [{ seq: 1, type: 'retrieve.end', node_id: 'kb', data }]
+
+  const hit = mod.decodeRun(ev({
+    collection: '手册', query: '管理员怎么定义', count: 3,
+    top_score: 0.82, artifact: 'abc123', degraded: false,
+  }))
+  const s1 = flatten(hit).find((x) => x.kind === 'schema')
+  check('检索步骤说人话', !!s1 && s1.title.includes('手册') && s1.title.includes('3 段'), s1?.title)
+  check('问的是什么留在详情里', s1?.detail === '管理员怎么定义')
+  check('带得出工件 id，能下钻', s1?.artifact === 'abc123')
+  check('最高分露出来', !!s1?.meta?.includes('0.82'))
+
+  const none = flatten(mod.decodeRun(ev({ collection: '手册', count: 0 })))
+    .find((x) => x.kind === 'schema')
+  check('没检索到要标成失败，不是静悄悄地过去', none?.status === 'failed')
+
+  const bad = flatten(mod.decodeRun(ev({ collection: '手册', count: 2, degraded: true })))
+    .find((x) => x.kind === 'schema')
+  check('退回关键词这件事标出来了', bad?.level === 'warn' && !!bad?.meta?.includes('关键词'))
+
+  // 兜底那条也要还在：新事件没补映射时宁可显示原始的
+  const unknown = mod.decodeRun([{ seq: 1, type: 'brand.new', node_id: 'x', data: { a: 1 } }])
+  check('未知事件不被静默吞掉', flatten(unknown).some((x) => x.title === 'brand.new'))
+}
+
 console.log('\n=== 被截断的结果集 ===')
 {
   // 后端按字符数硬切预览，切点落在 JSON 中间是常态。严格 JSON.parse 一律失败，

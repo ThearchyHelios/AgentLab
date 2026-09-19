@@ -191,6 +191,15 @@ export const api = {
     search: (q: string, collection?: string, alpha = 0.5) =>
       get<any>(`/kb/search?q=${encodeURIComponent(q)}&alpha=${alpha}${collection ? `&collection=${collection}` : ''}`),
     remove: (id: string) => del(`/kb/documents/${id}`),
+    embedding: (collection?: string) => get<{
+      embedder: string; dim: number; configured: boolean
+      kind: string; model: string; stale_chunks: number
+    }>(`/kb/embedding${collection ? `?collection=${collection}` : ''}`),
+    setEmbedding: (body: { kind: string; model?: string }) =>
+      put<{ embedder: string; dim: number; stale_chunks: number }>('/kb/embedding', body),
+    reindex: (collection?: string) =>
+      post<{ reindexed: number; embedder: string }>(
+        `/kb/reindex${collection ? `?collection=${collection}` : ''}`),
   },
   skills: {
     list: () => get<Skill[]>('/skills'),

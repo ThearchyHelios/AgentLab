@@ -7,7 +7,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Chunk, Document
-from app.memory.embeddings import embed_text, embed_texts, from_blob, hybrid_rank, to_blob
+from app.memory.embeddings import (
+    embed_text, embed_texts, embedder_dim, embedder_id, from_blob, hybrid_rank, to_blob, usable,
+)
 
 _TARGET = 800
 _OVERLAP = 120
@@ -97,6 +99,8 @@ async def ingest_document(
                     ordinal=i,
                     content=piece,
                     embedding=to_blob(vec),
+                    embed_model=embedder_id(),
+                    embed_dim=embedder_dim(),
                     meta={"title": doc.title},
                 )
             )
@@ -113,7 +117,17 @@ async def search(
     query: str,
     limit: int = 5,
     alpha: float = 0.5,
+    on_degrade: Any = None,
 ) -> list[dict[str, Any]]:
+    """混合检索。
+
+    存量向量和当前 embedder 对不上时**整个查询退回纯关键词**，并通过
+    on_degrade 把原因交出去。不把对不上的那些当 0 分：那会让它们静默沉底，
+    用户看到的是结果莫名其妙变差，而不是"这里有一批索引该重建了"。
+
+    在此之前这里连维度都不查，换个 embedder 直接 ValueError
+    （shapes (1536,) and (512,) not aligned），整个检索 500。
+    """
     stmt = select(Chunk)
     if collection:
         stmt = stmt.where(Chunk.collection == collection)
@@ -121,11 +135,26 @@ async def search(
     if not rows:
         return []
 
-    query_vec = await embed_text(query)
+    stale = [r for r in rows if not usable(r.embed_model, r.embed_dim)]
+    if stale:
+        if on_degrade:
+            names = sorted({r.embed_model or "未知模型" for r in stale})
+            on_degrade(
+                f"{collection or '全部集合'}里有 {len(stale)}/{len(rows)} 条向量由"
+                f"「{'、'.join(names)}」建立，和当前的「{embedder_id()}」对不上，"
+                f"本次已退回纯关键词检索。重建索引后恢复。"
+            )
+        alpha = 0.0   # 纯关键词
+        vectors: list[Any] = [None] * len(rows)
+        query_vec = await embed_text(query)
+    else:
+        query_vec = await embed_text(query)
+        vectors = [from_blob(r.embedding, embedder_dim()) for r in rows]
+
     ranked = hybrid_rank(
         query,
         [r.content for r in rows],
-        [from_blob(r.embedding) for r in rows],
+        vectors,
         query_vec,
         alpha=alpha,
     )
@@ -144,6 +173,41 @@ async def search(
             }
         )
     return out
+
+
+async def reindex(session: AsyncSession, collection: str | None = None) -> dict[str, Any]:
+    """用当前 embedder 重算向量。
+
+    换了 embedding 模型之后唯一的恢复手段。按批做：一次几千条 chunk 全塞给
+    远端 embedding 接口，要么超时要么被限流，而中途失败又没有断点。
+    """
+    stmt = select(Chunk)
+    if collection:
+        stmt = stmt.where(Chunk.collection == collection)
+    rows = list((await session.execute(stmt)).scalars())
+    if not rows:
+        return {"collection": collection, "reindexed": 0, "embedder": embedder_id()}
+
+    model_id, dim = embedder_id(), embedder_dim()
+    batch = 64
+    for i in range(0, len(rows), batch):
+        part = rows[i:i + batch]
+        vectors = await embed_texts([r.content for r in part])
+        for row, vec in zip(part, vectors):
+            row.embedding = to_blob(vec)
+            row.embed_model = model_id
+            row.embed_dim = dim
+        await session.commit()
+    return {"collection": collection, "reindexed": len(rows), "embedder": model_id}
+
+
+async def stale_count(session: AsyncSession, collection: str | None = None) -> int:
+    """有多少条向量和当前 embedder 对不上。知识库页据此提示要不要重建。"""
+    stmt = select(Chunk)
+    if collection:
+        stmt = stmt.where(Chunk.collection == collection)
+    rows = list((await session.execute(stmt)).scalars())
+    return sum(1 for r in rows if not usable(r.embed_model, r.embed_dim))
 
 
 async def delete_document(session: AsyncSession, doc_id: str) -> bool:

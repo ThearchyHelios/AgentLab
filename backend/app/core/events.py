@@ -39,6 +39,9 @@ class EventType(StrEnum):
     TOOL_START = "tool.start"
     TOOL_END = "tool.end"
     TOOL_ERROR = "tool.error"
+    # 知识检索。以前只发一条 info 日志，于是"这句结论依据的是哪份文档的哪一段"
+    # 在轨迹里查不到——而 SQL 取数那条路早就有工件快照可以下钻
+    RETRIEVE_END = "retrieve.end"
     SANDBOX_START = "sandbox.start"
     SANDBOX_END = "sandbox.end"
 
