@@ -436,3 +436,19 @@ def test_the_three_paths_are_spelled_out_for_the_model() -> None:
     # 协议里要给得出这两个出口，否则模型没法表达
     assert '"op":"reply"' in _STREAM_PROTOCOL
     assert '"run":true' in _STREAM_PROTOCOL
+
+
+async def test_copilot_is_told_not_to_invent_a_memory_scope() -> None:
+    """记忆域由平台给。图里自己起一个，写进去就再也读不回来。
+
+    真发生过（会话 cbe09f4b 的第 2~3 轮）：一轮的 memory 节点写了
+    scope="user"，下一轮没写 scope、落回 default，于是「我叫张三」存下来了，
+    问「我是谁」却答不上来——记忆在库里好好的，只是读错了地方。
+    """
+    from app.api.copilot import NODE_REFERENCE
+
+    memory_line = next(
+        (l for l in NODE_REFERENCE.splitlines() if l.strip().startswith("- memory：")), "")
+    assert memory_line, "节点参考里找不到 memory 这一行"
+    assert "scope" not in memory_line, "scope 还列在可填字段里，模型就会去填它"
+    assert "不要写 scope" in NODE_REFERENCE

@@ -51,7 +51,14 @@ function EmbedderBar({ collection, onChanged }: {
   useEffect(() => { void refresh() }, [collection])
 
   if (!info) return null
-  const stale = info.stale_chunks ?? 0
+  // 记忆和知识库共用一个 embedder，换模型时一起失效。只报一个的话，
+  // 用户点完重建还是想不起事，而且不知道为什么
+  const staleChunks = info.stale_chunks ?? 0
+  const staleMemories = info.stale_memories ?? 0
+  // 没建倒排的片段也归这个按钮管：它们走全表扫，结果对但慢，而重建正好
+  // 把倒排一起建了。按钮只认"向量对不上"的话，这些片段永远等不到人来点
+  const unindexed = info.unindexed_chunks ?? 0
+  const stale = staleChunks + staleMemories + unindexed
 
   const pick = async (kind: string, model: string) => {
     setBusy(true)
@@ -69,7 +76,9 @@ function EmbedderBar({ collection, onChanged }: {
     setBusy(true)
     try {
       const out = await api.kb.reindex(collection)
-      toast(`已用 ${out.embedder} 重建 ${out.reindexed} 段`, 'ok')
+      const mem = out.memories_reindexed ?? 0
+      toast(`已用 ${out.embedder} 重建 ${out.reindexed} 段知识`
+            + (mem ? ` 和 ${mem} 条记忆` : ''), 'ok')
       await refresh()
       await onChanged()
     } catch (e: any) {
@@ -99,10 +108,19 @@ function EmbedderBar({ collection, onChanged }: {
           </button>
         )}
       </div>
-      {stale > 0 && (
+      {staleChunks + staleMemories > 0 && (
         <p className="mt-2 text-[11px]" style={{ color: 'var(--warn)' }}>
-          有 {stale} 段的向量是用别的模型建的，和当前模型对不上——检索这些内容时
+          有{staleChunks ? ` ${staleChunks} 段知识` : ''}
+          {staleChunks && staleMemories ? '、' : ''}
+          {staleMemories ? ` ${staleMemories} 条记忆` : ''}
+          的向量是用别的模型建的，和当前模型对不上——检索/召回这些内容时
           会退回纯关键词（搜不出同义表达）。重建索引后恢复。
+        </p>
+      )}
+      {unindexed > 0 && staleChunks + staleMemories === 0 && (
+        <p className="mt-2 text-[11px] text-faint">
+          有 {unindexed} 段还没建倒排索引，检索它们会退回全表扫——结果是对的，
+          只是慢。重建一次就好。
         </p>
       )}
       {info.kind !== 'openai' && stale === 0 && (

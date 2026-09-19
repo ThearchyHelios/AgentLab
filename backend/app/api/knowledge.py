@@ -207,6 +207,9 @@ async def embedding_status(
         "kind": saved.get("kind", "local"),
         "model": saved.get("model", ""),
         "stale_chunks": await kb.stale_count(session, collection),
+        # 记忆和知识库共用一个 embedder，换模型时一起失效——报一个漏一个
+        # 的话，用户点完重建还是想不起事，而且不知道为什么
+        "stale_memories": await store.stale_count(session),
         "has_semantics": has_semantics(),
         "default_alpha": default_alpha(),
         # 没建倒排的片段会走全表扫——结果对，但慢
@@ -247,6 +250,7 @@ async def set_embedding(
         "embedder": emb.embedder_id(),
         "dim": emb.embedder_dim(),
         "stale_chunks": await kb.stale_count(session),
+        "stale_memories": await store.stale_count(session),
     }
 
 
@@ -254,8 +258,16 @@ async def set_embedding(
 async def reindex(
     collection: str | None = None, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    """用当前 embedder 重算向量。换了模型之后唯一的恢复手段。"""
-    return await kb.reindex(session, collection)
+    """用当前 embedder 重算向量。换了模型之后唯一的恢复手段。
+
+    知识库和长期记忆一起重建：它们共用一个 embedder，换模型时一起失效。
+    分成两个按钮的结果是点了一个、以为好了，另一个还在悄悄退回关键词——
+    真踩过，记忆那边连个提示都没有。
+    """
+    out = await kb.reindex(session, collection)
+    # 记忆不按 collection 分，重建就是全量
+    out["memories_reindexed"] = await store.reindex(session)
+    return out
 
 
 @kb_router.delete("/documents/{doc_id}", status_code=204)
