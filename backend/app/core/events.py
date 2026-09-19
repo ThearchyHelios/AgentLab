@@ -42,6 +42,9 @@ class EventType(StrEnum):
     # 知识检索。以前只发一条 info 日志，于是"这句结论依据的是哪份文档的哪一段"
     # 在轨迹里查不到——而 SQL 取数那条路早就有工件快照可以下钻
     RETRIEVE_END = "retrieve.end"
+    # 记忆读写。以前发的是 info 日志，而解码器丢弃所有 info——于是往长期记忆里
+    # 写东西这件事在界面上是隐形的。让 Copilot 主动记之后，这条不可接受
+    MEMORY_END = "memory.end"
     SANDBOX_START = "sandbox.start"
     SANDBOX_END = "sandbox.end"
 

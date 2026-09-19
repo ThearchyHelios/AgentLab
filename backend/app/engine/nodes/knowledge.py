@@ -52,8 +52,16 @@ async def run_memory(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         else:
             raise NodeError(ctx.node.id, f"未知的记忆操作：{action}")
 
-    ctx.emit(EventType.LOG, level="info",
-             message=f"记忆 {action} @ {scope}：{result.get('count', result.get('cleared', 1))} 条")
+    # 写入必须看得见：这是往长期记忆里存东西，会影响以后每一次对话。
+    # 以前发的是 info 日志，而解码层丢弃所有 info，等于系统背着用户记了东西
+    ctx.emit(
+        EventType.MEMORY_END,
+        action=action,
+        scope=scope,
+        count=result.get("count", result.get("cleared", 1 if action == "write" else 0)),
+        # 记了什么要原样说出来，只报"写了 1 条"等于没说
+        content=result.get("content", "")[:300],
+    )
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     var_name = ctx.cfg("assign_to", "")

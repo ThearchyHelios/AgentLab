@@ -452,3 +452,46 @@ async def test_copilot_is_told_not_to_invent_a_memory_scope() -> None:
     assert memory_line, "节点参考里找不到 memory 这一行"
     assert "scope" not in memory_line, "scope 还列在可填字段里，模型就会去填它"
     assert "不要写 scope" in NODE_REFERENCE
+
+
+# --------------------------------------------------------------------------
+# 主动记忆
+# --------------------------------------------------------------------------
+
+
+def test_copilot_is_told_when_to_record_a_memory() -> None:
+    """以前只有用户明说「记住」才会写：17 轮里只有 4 轮带记忆节点，全在用户
+    主动谈记忆的那个会话里。于是他说过一次「我叫蒋逸伦」，换个话题再问就
+    谁也不知道了。
+
+    但边界比指令本身更要紧——记错了会污染以后每一次对话。
+    """
+    from app.api.copilot import GenerateIn, _user_message
+
+    text = _user_message(GenerateIn(instruction="随便问问", intent="answer"), patch=False)
+    assert "该记" in text and "不该记" in text
+    # 最容易被记进去的垃圾：这一轮的问题、查出来的数、一次性指令、以及推测
+    for junk in ("这一轮的问题本身", "查出来的数", "一次性的指令", "推测出来的东西"):
+        assert junk in text, f"没有拦住「{junk}」这类"
+    assert "拿不准就不记" in text
+
+
+async def test_writing_a_memory_is_visible_in_the_trace(client, monkeypatch) -> None:
+    """自动记忆的前提是看得见。
+
+    以前 memory 节点发的是 info 日志，而解码层丢弃所有 info——等于系统背着
+    用户往长期记忆里存东西。让 Copilot 主动记之后这条不可接受。
+    """
+    from app.core.events import EventType
+
+    assert EventType.MEMORY_END == "memory.end"
+
+    # 节点确实发这条事件，而且带上了记了什么
+    import inspect
+
+    from app.engine.nodes import knowledge as node
+
+    src = inspect.getsource(node.run_memory)
+    assert "MEMORY_END" in src
+    assert "LOG, level=\"info\"" not in src, "又退回 info 日志了，界面上会看不见"
+    assert 'result.get("content"' in src, "没把记了什么带出去，只报条数等于没说"
