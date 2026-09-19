@@ -383,3 +383,35 @@ async def test_deleting_a_document_takes_its_index_rows() -> None:
         after = int((await session.execute(select(func.count(ChunkTerm.id)).where(
             ChunkTerm.collection == "idx_del"))).scalar_one())
     assert after == 0, f"文档删了但倒排还留着 {after} 行"
+
+
+async def test_an_empty_reply_is_not_called_a_parse_error() -> None:
+    """推理型模型把输出预算花光时正文是空的——实测 deepseek-v4-pro 失败那次
+    out_tokens 正好等于 max_tokens。
+
+    报"解析不出来"会把人引去查 JSON 格式，而该调的是最大输出 token。
+    llm.py 里对同一个现象也是这么说的。
+    """
+    from app.memory.rerank import rerank
+
+    notes: list[str] = []
+    out = await rerank(_Scorer(""), "问题", _hits(3), top_n=3, on_note=notes.append)
+    assert [h["chunk_id"] for h in out] == ["c0", "c1", "c2"]
+    assert "token" in notes[0] and "调大" in notes[0], notes[0]
+    assert "解析" not in notes[0]
+
+
+async def test_each_kind_of_bad_reply_says_which_kind() -> None:
+    """四种坏法要分得开，否则排查时只知道"重排没用上"。"""
+    from app.memory.rerank import rerank
+
+    cases = {
+        '': 'token',                                   # 空回复
+        '随便说点什么': 'scores',                        # 找不到 scores
+        '{"scores": [1, 2]}': '对不上',                  # 个数不符
+        '{"scores": ["高", "低", "中"]}': '非数字',       # 类型不对
+    }
+    for reply, want in cases.items():
+        notes: list[str] = []
+        await rerank(_Scorer(reply), "问题", _hits(3), top_n=3, on_note=notes.append)
+        assert want in notes[0], f"回复 {reply!r} 给的提示是「{notes[0]}」，认不出是哪种坏法"

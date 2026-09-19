@@ -28,26 +28,36 @@ _PROMPT = """给下面每个片段打分：它对回答这个问题有多大帮�
 0 表示完全无关，10 表示直接回答了问题。"""
 
 
-def _parse_scores(text: str, n: int) -> list[float] | None:
-    """从模型回复里抠出分数数组。
+class Unusable(ValueError):
+    """回复用不了。message 就是要交给用户的那句话。"""
+
+
+def _parse_scores(text: str, n: int) -> list[float]:
+    """从模型回复里抠出分数数组。用不了就抛 Unusable，message 说清楚是哪种用不了。
 
     模型偶尔会加围栏或者说两句废话，所以不直接 json.loads 整段；
     但也不做过度容错——解析不出来就退回原顺序，比按半截数据重排安全。
     """
+    if not text.strip():
+        # 实测 deepseek-v4-pro：失败那次 out_tokens 正好等于 max_tokens，
+        # 输出预算被耗光后正文什么都不剩。报"解析不出来"会把人引去查 JSON 格式，
+        # 而该调的是 max_tokens——llm.py 里对同一个现象也是这么说的
+        raise Unusable("模型没有输出正文，多半是输出 token 预算用完了。把节点上的最大输出 token 调大")
     match = re.search(r"\{[^{}]*\"scores\"\s*:\s*\[[^\]]*\][^{}]*\}", text, re.S)
     if not match:
-        return None
+        raise Unusable(f"模型回复里找不到 scores：{text.strip()[:80]}")
     try:
         scores = json.loads(match.group(0)).get("scores")
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as e:
+        raise Unusable(f"scores 不是合法 JSON：{e}") from e
     if not isinstance(scores, list) or len(scores) != n:
         # 个数对不上就没法一一对应，硬凑只会把顺序搅乱
-        return None
+        raise Unusable(f"给了 {len(scores) if isinstance(scores, list) else '?'} 个分数，"
+                       f"候选有 {n} 个，对不上")
     out: list[float] = []
     for s in scores:
         if not isinstance(s, (int, float)):
-            return None
+            raise Unusable(f"分数里混了非数字：{s!r}")
         out.append(float(s))
     return out
 
@@ -80,14 +90,13 @@ async def rerank(
         if isinstance(text, list):  # Anthropic 的块状 content
             text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
         scores = _parse_scores(str(text), len(hits))
+    except Unusable as e:
+        if on_note:
+            on_note(f"重排没用上，按初筛顺序返回：{e}")
+        return hits[:top_n]
     except Exception as e:  # noqa: BLE001
         if on_note:
             on_note(f"重排失败，按初筛顺序返回：{type(e).__name__}: {e}")
-        return hits[:top_n]
-
-    if scores is None:
-        if on_note:
-            on_note("重排结果解析不出来，按初筛顺序返回")
         return hits[:top_n]
 
     ranked = sorted(zip(hits, scores), key=lambda t: t[1], reverse=True)
