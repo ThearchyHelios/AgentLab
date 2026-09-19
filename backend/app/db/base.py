@@ -81,6 +81,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("chunks", "embed_dim", "INTEGER DEFAULT 0"),
     ("memories", "embed_model", "VARCHAR(100) DEFAULT ''"),
     ("memories", "embed_dim", "INTEGER DEFAULT 0"),
+    ("chunks", "token_len", "INTEGER DEFAULT 0"),
 ]
 
 

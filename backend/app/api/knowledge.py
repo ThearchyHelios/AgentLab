@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session
 from app.db.models import Document, MemoryItem, Skill
-from app.memory import kb, store
+from app.memory import inverted, kb, store
 
 # --------------------------------------------------------------------------
 # 长期记忆
@@ -153,10 +153,14 @@ async def upload(
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件超过 10MB")
+
+    from app.memory.parsing import UnsupportedDocument, extract
+
     try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(415, "目前只支持 UTF-8 文本文件（txt / md / json / csv 等）") from None
+        content = extract(raw, file.filename or "", file.content_type or "")
+    except UnsupportedDocument as e:
+        # 原样交回：里面写的是"装哪个包"或"这是扫描件"，都能照着做
+        raise HTTPException(415, str(e)) from None
     return await kb.ingest_document(
         session,
         collection=collection,
@@ -205,6 +209,8 @@ async def embedding_status(
         "stale_chunks": await kb.stale_count(session, collection),
         "has_semantics": has_semantics(),
         "default_alpha": default_alpha(),
+        # 没建倒排的片段会走全表扫——结果对，但慢
+        "unindexed_chunks": await inverted.missing_count(session, collection),
     }
 
 
