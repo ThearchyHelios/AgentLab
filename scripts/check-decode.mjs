@@ -71,6 +71,30 @@ console.log('\n=== 知识检索 ===')
   check('未知事件不被静默吞掉', flatten(unknown).some((x) => x.title === 'brand.new'))
 }
 
+console.log('\n=== 长期记忆 ===')
+{
+  // 写记忆以前只发 info 日志，而 info 在这一层是被丢弃的——系统往长期记忆里
+  // 存东西，界面上一点痕迹都没有。Copilot 会主动记之后，这条不可接受。
+  const ev = (data) => [{ seq: 1, type: 'memory.end', node_id: 'mem', data }]
+
+  const w = flatten(mod.decodeRun(ev({
+    action: 'write', scope: 'default', count: 1,
+    content: '用户姓名：张三；工作单位：示例科技',
+  })))[0]
+  check('写记忆看得见', !!w)
+  check('把记了什么说出来，不是只报条数',
+    !!w?.title?.includes('张三'), w?.title)
+  check('全文留在详情里', !!w?.detail?.includes('示例科技'))
+
+  const r = flatten(mod.decodeRun(ev({ action: 'recall', scope: 'default', count: 3 })))[0]
+  check('召回说人话', !!r?.title?.includes('想起 3 条'), r?.title)
+  const none = flatten(mod.decodeRun(ev({ action: 'recall', scope: 'default', count: 0 })))[0]
+  check('没想起来要标出来，不是静悄悄地过去', none?.status === 'failed')
+
+  const c = flatten(mod.decodeRun(ev({ action: 'clear', scope: 'default', count: 7 })))[0]
+  check('清空是破坏性的，标成警告', c?.level === 'warn' && c.title.includes('7'))
+}
+
 console.log('\n=== 被截断的结果集 ===')
 {
   // 后端按字符数硬切预览，切点落在 JSON 中间是常态。严格 JSON.parse 一律失败，

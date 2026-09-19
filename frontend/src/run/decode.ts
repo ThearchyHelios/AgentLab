@@ -712,6 +712,37 @@ export function decodeRun(events: RunEvent[]): Step[] {
         break
       }
 
+      case 'memory.end': {
+        // 写入要把**记了什么**原样显示出来。只说"写入 1 条"等于没说——
+        // 用户没法判断系统记的是不是他想让它记的，而这东西会影响以后每次对话
+        const action = String(d.action ?? '')
+        const count = num(d.count) ?? 0
+        const content = String(d.content ?? '')
+        if (action === 'write') {
+          push({
+            id: `mw-${seq}`, seq, kind: 'note', nodeId, status: 'done',
+            title: content ? `记住了：${content.slice(0, 40)}${content.length > 40 ? '…' : ''}`
+                           : '写入了一条记忆',
+            detail: content || undefined,
+          }, nodeId)
+          break
+        }
+        if (action === 'clear') {
+          push({
+            id: `mc-${seq}`, seq, kind: 'note', nodeId, status: 'done', level: 'warn',
+            title: `清空了记忆域「${String(d.scope ?? '')}」的 ${count} 条`,
+          }, nodeId)
+          break
+        }
+        push({
+          id: `mr-${seq}`, seq, kind: 'schema', nodeId,
+          status: count ? 'done' : 'failed',
+          level: count ? undefined : 'warn',
+          title: count ? `想起 ${count} 条相关记忆` : '没有想起相关的记忆',
+        }, nodeId)
+        break
+      }
+
       case 'retrieve.end': {
         // 知识检索。以前只发一条 info 日志，于是"这句结论依据的是哪份文档的
         // 哪一段"在轨迹里查不到——而 SQL 取数那条路早就能下钻到工件
