@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Chunk, Document
 from app.memory.embeddings import (
-    embed_text, embed_texts, embedder_dim, embedder_id, from_blob, hybrid_rank, to_blob, usable,
+    default_alpha, embed_text, embed_texts, embedder_dim, embedder_id, from_blob,
+    hybrid_rank, to_blob, usable,
 )
 
 _TARGET = 800
@@ -116,7 +117,7 @@ async def search(
     collection: str | None,
     query: str,
     limit: int = 5,
-    alpha: float = 0.5,
+    alpha: float | None = None,
     on_degrade: Any = None,
 ) -> list[dict[str, Any]]:
     """混合检索。
@@ -128,6 +129,11 @@ async def search(
     在此之前这里连维度都不查，换个 embedder 直接 ValueError
     （shapes (1536,) and (512,) not aligned），整个检索 500。
     """
+    # 没显式指定就跟着 embedder 走——写死 0.5 是在给一个没有语义能力的信号
+    # 一半权重，实测会把 hit@1 从 88% 拉到 81%
+    if alpha is None:
+        alpha = default_alpha()
+
     stmt = select(Chunk)
     if collection:
         stmt = stmt.where(Chunk.collection == collection)

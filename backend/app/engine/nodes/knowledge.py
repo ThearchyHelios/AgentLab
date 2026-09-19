@@ -70,14 +70,36 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     collection = ctx.render_str(ctx.cfg("collection", "") or ctx.run.collection, state)
     limit = int(ctx.cfg("limit", 5) or 5)
-    alpha = float(ctx.cfg("alpha", 0.5) or 0.5)  # 1=纯向量，0=纯关键词
+    # 不写死 0.5：没配置就跟着 embedder 的能力走（见 embeddings.default_alpha）
+    raw_alpha = ctx.cfg("alpha")
+    alpha = float(raw_alpha) if raw_alpha not in (None, "") else None
+
+    # 要重排就先多捞一些：重排只能在初筛给出的候选里挑，初筛只给 5 条的话
+    # 它最多把这 5 条换个顺序，第 6 条是对的也救不回来
+    mode = ctx.cfg("rerank", "off") or "off"
+    fetch = max(limit, 20) if mode == "model" else limit
 
     degraded: list[str] = []
     async with SessionLocal() as session:
         hits = await kb.search(
-            session, collection=collection, query=query, limit=limit, alpha=alpha,
+            session, collection=collection, query=query, limit=fetch, alpha=alpha,
             on_degrade=degraded.append,
         )
+
+    if mode == "model" and hits:
+        from app.engine.nodes.llm import _model_spec
+        from app.memory.rerank import rerank
+        from app.providers.factory import ProviderNotConfigured, get_chat_model
+
+        try:
+            async with SessionLocal() as session:
+                model, _ = await get_chat_model(session, _model_spec(ctx))
+        except ProviderNotConfigured as e:
+            degraded.append(f"重排用不了：{e}")
+            model = None
+        hits = await rerank(model, query, hits, top_n=limit, on_note=degraded.append)
+    else:
+        hits = hits[:limit]
     for note in degraded:
         # 检索悄悄少了一半能力，不说的话用户只会觉得"最近搜得不准"
         ctx.emit(EventType.LOG, level="warn", message=note)
@@ -93,15 +115,16 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 命中落工件库。SQL 取数、工具调用、agent 工具调用都有快照，检索一直没有，
     # 于是结论只要来自知识库，"这个数是哪来的"这条链就断在这儿
     from app.core.artifact_store import put_json
-    from app.memory.embeddings import embedder_id
+    from app.memory.embeddings import default_alpha, embedder_id
 
     snapshot: str | None = None
     try:
         snapshot = await put_json(
             {
                 "query": query, "collection": collection,
-                "alpha": alpha, "min_score": min_score,
-                "embedder": embedder_id(), "degraded": degraded,
+                "alpha": alpha if alpha is not None else default_alpha(),
+                "min_score": min_score,
+                "embedder": embedder_id(), "rerank": mode, "degraded": degraded,
                 "hits": hits,
             },
             kind="retrieval_snapshot",
@@ -116,6 +139,7 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         query=query[:200],
         count=len(hits),
         top_score=hits[0]["score"] if hits else 0,
+        reranked=mode == "model",
         degraded=bool(degraded),
         artifact=snapshot,
     )

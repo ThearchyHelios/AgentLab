@@ -172,7 +172,8 @@ async def search_kb(
     q: str,
     collection: str | None = None,
     limit: int = 5,
-    alpha: float = Query(default=0.5, ge=0, le=1, description="1=纯向量, 0=纯关键词"),
+    alpha: float | None = Query(default=None, ge=0, le=1,
+                                description="1=纯向量, 0=纯关键词；不传则按 embedder 能力取默认"),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     notes: list[str] = []
@@ -188,7 +189,9 @@ async def embedding_status(
     collection: str | None = None, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     """当前用的是哪个 embedder，以及有多少条向量已经对不上了。"""
-    from app.memory.embeddings import EMBEDDING_SETTING_KEY, embedder_dim, embedder_id
+    from app.memory.embeddings import (
+        EMBEDDING_SETTING_KEY, default_alpha, embedder_dim, embedder_id, has_semantics,
+    )
     from app.db.models import Setting
 
     row = await session.get(Setting, EMBEDDING_SETTING_KEY)
@@ -200,6 +203,8 @@ async def embedding_status(
         "kind": saved.get("kind", "local"),
         "model": saved.get("model", ""),
         "stale_chunks": await kb.stale_count(session, collection),
+        "has_semantics": has_semantics(),
+        "default_alpha": default_alpha(),
     }
 
 
