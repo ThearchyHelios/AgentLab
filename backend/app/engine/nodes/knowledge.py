@@ -91,9 +91,22 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         from app.memory.rerank import rerank
         from app.providers.factory import ProviderNotConfigured, get_chat_model
 
+        # 重排有自己的预算，不跟节点上那个走：
+        #
+        # 它的输出只有一行几十字的 JSON，但模型为了读完 20 条候选会花掉上千个
+        # 输出 token——实测 deepseek-v4-pro 单次用 800~1600 个，一旦顶到上限，
+        # 正文就什么都不剩（失败那次 out_tokens 正好等于 max_tokens）。
+        #
+        # thinking=off 对 Anthropic 有效；openai_compatible 那条路径不读这个字段
+        # （factory.py 只在 anthropic 分支里设 thinking），所以真正兜住的是
+        # 上面那个预算。打分任务本来也不需要思考模式。
+        spec = _model_spec(ctx).model_copy(update={
+            "max_tokens": max(int(ctx.cfg("max_tokens") or 0), 4096),
+            "thinking": "off",
+        })
         try:
             async with SessionLocal() as session:
-                model, _ = await get_chat_model(session, _model_spec(ctx))
+                model, _ = await get_chat_model(session, spec)
         except ProviderNotConfigured as e:
             degraded.append(f"重排用不了：{e}")
             model = None
