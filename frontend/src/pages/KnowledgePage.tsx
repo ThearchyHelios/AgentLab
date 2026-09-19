@@ -125,7 +125,8 @@ function KbTab() {
   const [docs, setDocs] = useState<KbDocument[]>([])
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<any[] | null>(null)
-  const [alpha, setAlpha] = useState(0.5)
+  // 初值跟着 embedder 能力走：本地哈希向量下给向量权重会让命中率下降
+  const [alpha, setAlpha] = useState(0)
   const [adding, setAdding] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 

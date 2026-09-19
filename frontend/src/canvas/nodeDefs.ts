@@ -319,13 +319,24 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'collection', label: '知识库', type: 'collection' },
       { key: 'limit', label: '返回片段数', type: 'number', min: 1, max: 20 },
       {
+        key: 'rerank', label: '重排', type: 'select', advanced: true,
+        options: [
+          { value: 'off', label: '不重排' },
+          { value: 'model', label: '让模型重排（更准，多一次调用）' },
+        ],
+        help: '开了会先多捞一些候选，再让模型按"对回答这个问题有多大帮助"重新排序',
+      },
+      {
         key: 'alpha', label: '向量 vs 关键词', type: 'number', min: 0, max: 1, step: 0.1,
-        help: '1 = 纯语义相似，0 = 纯关键词匹配',
+        help: '1 = 纯语义相似，0 = 纯关键词匹配。留空则跟着向量模型的能力走'
+          + '——本地哈希向量没有语义泛化，给它权重反而会让命中率下降',
       },
       { key: 'min_score', label: '最低分数', type: 'number', min: 0, max: 1, step: 0.05, advanced: true },
       ...COMMON_TAIL,
     ],
-    defaults: { query: '{{ last_message }}', collection: 'default', limit: 5, alpha: 0.5 },
+    // alpha 不写死：写死 0.5 等于给一个没有语义能力的信号一半权重，
+    // 实测会把 hit@1 从 88% 拉到 81%（backend/tests/test_retrieval_quality.py）
+    defaults: { query: '{{ last_message }}', collection: 'default', limit: 5, rerank: 'off' },
   },
   transform: {
     type: 'transform', label: '数据整形', category: '上下文', icon: Shuffle,

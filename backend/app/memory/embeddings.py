@@ -143,6 +143,25 @@ def embedder_dim() -> int:
     return int(getattr(get_embedder(), "dim", _DIM))
 
 
+def has_semantics() -> bool:
+    """当前 embedder 有没有语义泛化能力。
+
+    LocalEmbedder 是词频哈希：它和 BM25 吃同一批词，给它权重等于把关键词
+    信号打个折再加回自己身上，同义改写一条都召不回。
+    """
+    return getattr(get_embedder(), "name", "") != "local-hashing"
+
+
+def default_alpha() -> float:
+    """向量那一路默认占多少权重。
+
+    实测（backend/tests/test_retrieval_quality.py，24 篇语料 / 16 问）：
+    本地哈希向量下 alpha=0 的 hit@1 是 88%，alpha 一旦大于 0 就掉到 81%
+    ——那一路不是"弱一点"，是纯噪音。所以没有语义能力时默认给 0。
+    """
+    return 0.5 if has_semantics() else 0.0
+
+
 def usable(embed_model: str | None, embed_dim: int | None) -> bool:
     """这条存量向量还能不能和当前查询比对。
 
