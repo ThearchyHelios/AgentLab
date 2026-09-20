@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   AlertTriangle, Brain, ChevronRight, CircleCheck, CircleDot, Database,
-  FileCode, GitBranch, Hand, Info, Sparkles, Table2, Terminal, Wrench, XCircle,
+  FileCode, GitBranch, Hand, Info, Sparkles, Table2, Terminal, Users, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { Spinner } from '../components/ui'
 import {
   parseQueryResult, type ResultTable as Table, type Step, type StepKind,
+  type TeamRun,
 } from './decode'
 import { Markdown } from './Markdown'
 import type { ReviewResult } from '../types'
@@ -317,11 +318,139 @@ function StepRow({ step, dense, depth }: { step: Step; dense: boolean; depth: nu
         </div>
       )}
 
+      {/* 泳道排在子步骤**前面**：先给一眼看清的形状（谁做了哪几轮、哪些是
+          同时进行的、各花多久），再往下是每一步的内容。反过来的话，得把
+          十几行步骤读完才知道这个团队是怎么分工的 */}
+      {step.team && <TeamLanes team={step.team} dense={dense} />}
+
       {!!step.children?.length && (
         <StepList steps={step.children} dense={dense} depth={depth + 1} />
       )}
     </div>
   )
+}
+
+
+/**
+ * 协作团队的泳道：每个成员一行，每一轮一格。
+ *
+ * 这个节点以前在界面上是一条扁平的步骤序列——能看出"谁回了什么"，看不出
+ * "谁和谁是同时干的"。而一轮同时派几个人正是它相对单 agent 的全部优势，
+ * 不画出来等于没有。
+ *
+ * 条形的宽度按耗时归一化，所以一眼能看出谁是这一轮的瓶颈。
+ */
+function TeamLanes({ team, dense }: { team: TeamRun; dense: boolean }) {
+  const [openKey, setOpenKey] = useState<string | null>(null)
+  if (!team.rounds.length) return null
+
+  // 所有格子共用一个时间标尺，否则"快的那格"和"慢的那格"画得一样长，
+  // 瓶颈就看不出来了
+  const slowest = Math.max(1, ...team.rounds.flatMap((r) => r.members.map((m) => m.ms)))
+  const parallelRounds = team.rounds.filter((r) => r.parallel > 1).length
+
+  return (
+    <div className="mt-2 rounded-lg border bg-bg p-2">
+      <div className="mb-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[10.5px] text-faint">
+        <span className="flex items-center gap-1 text-dim">
+          <Users size={11} /> {team.members.length} 名成员 · {team.rounds.length} 轮
+        </span>
+        {parallelRounds > 0 && (
+          <span style={{ color: 'var(--ok)' }}>
+            {parallelRounds} 轮并行，省下 {fmtMs(team.savedMs)}
+          </span>
+        )}
+        {parallelRounds === 0 && team.rounds.length > 1 && (
+          // 全程串行不是故障，但值得说一句——任务本来就互相依赖时它就该是串行的
+          <span>本次任务互相依赖，逐轮进行</span>
+        )}
+      </div>
+
+      <div className="space-y-1">
+        {team.members.map((name) => (
+          <div key={name} className="flex items-center gap-1.5">
+            <div className={clsx('shrink-0 truncate text-[10.5px] text-dim',
+                                 dense ? 'w-14' : 'w-20')}
+                 title={name}>
+              {name}
+            </div>
+            <div className="flex min-w-0 flex-1 gap-1">
+              {team.rounds.map((r) => {
+                const m = r.members.find((x) => x.agent === name)
+                const key = `${r.round}:${name}`
+                return (
+                  <div key={r.round} className="min-w-0 flex-1">
+                    {m ? (
+                      <button
+                        className="h-4 w-full rounded-sm text-left transition-opacity hover:opacity-80"
+                        title={`第 ${r.round + 1} 轮 · ${m.instruction || '(无指令)'}`}
+                        onClick={() => setOpenKey(openKey === key ? null : key)}
+                        style={{
+                          background: m.status === 'running'
+                            ? 'color-mix(in srgb, var(--accent) 45%, transparent)'
+                            : 'var(--accent)',
+                          // 宽度按耗时占比，但留一个下限，否则快的那格细到看不见
+                          width: `${Math.max(18, (m.ms / slowest) * 100)}%`,
+                        }}
+                      />
+                    ) : (
+                      <div className="h-4 w-full rounded-sm"
+                           style={{ background: 'var(--hover)' }} />
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        ))}
+
+        <div className="flex items-center gap-1.5 pt-0.5">
+          <div className={clsx('shrink-0', dense ? 'w-14' : 'w-20')} />
+          <div className="flex min-w-0 flex-1 gap-1">
+            {team.rounds.map((r) => (
+              <div key={r.round}
+                   className="min-w-0 flex-1 truncate text-center text-[9.5px] text-faint"
+                   title={r.reason || ''}>
+                {/* 窄栏放不下完整措辞，但"并2"这种缩写没人看得懂，
+                    宁可只留轮次和耗时，并行与否看上面那行条形本来就一目了然 */}
+                {`第${r.round + 1}轮`}
+                {r.parallel > 1 && !dense ? ` · ${r.parallel} 人同时` : ''}
+                {' · '}{fmtMs(r.wallMs)}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {openKey && (() => {
+        const [rd, name] = openKey.split(':')
+        const m = team.rounds.find((r) => String(r.round) === rd)
+          ?.members.find((x) => x.agent === name)
+        if (!m) return null
+        return (
+          <div className="mt-2 rounded border bg-panel p-2 text-[10.5px] leading-relaxed">
+            <div className="mb-1 text-dim">
+              {name} · 第 {Number(rd) + 1} 轮 · {fmtMs(m.ms)}
+            </div>
+            {m.instruction && (
+              <div className="mb-1.5 text-faint">任务：{m.instruction}</div>
+            )}
+            {m.result && (
+              <pre className="mono max-h-36 overflow-auto whitespace-pre-wrap text-dim">
+                {m.result.slice(0, 1200)}
+              </pre>
+            )}
+          </div>
+        )
+      })()}
+    </div>
+  )
+}
+
+/** 毫秒 → 人读的单位。和 decode 里的 dur 同一套规则 */
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  return ms < 60_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 60_000)}min`
 }
 
 /** 查询结果画成表格。一屏 JSON 谁也看不出名堂，表格能一眼看到形状。 */

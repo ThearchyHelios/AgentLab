@@ -161,10 +161,16 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'goal', label: '团队目标', type: 'prompt' },
       { key: 'agents', label: '团队成员', type: 'agents' },
       { key: 'max_rounds', label: '最大轮次', type: 'number', min: 1, max: 25 },
+      {
+        key: 'max_parallel', label: '每轮最多同时派几人', type: 'number', min: 1, max: 6,
+        help: '互不依赖的任务调度者可以放在同一轮同时执行，总耗时按最慢的那个算。'
+          + '设为 1 即退回严格串行——并发的成员看到的是同一份进展快照，'
+          + '任务其实有依赖却被同时派出去，两个人会基于一样的旧信息重复劳动',
+      },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_rounds: 6, agents: [] },
+    defaults: { max_rounds: 6, max_parallel: 3, agents: [] },
   },
   tool: {
     type: 'tool', label: '调用工具', category: '执行', icon: Wrench,

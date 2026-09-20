@@ -136,6 +136,50 @@ const REVIEW_DEGRADED_TURN: StreamTurn = {
   rawOutput: { answer: "平台管理员可以修改他人权限。" },
 }
 
+/** 协作团队的泳道：前两轮并行、第三轮汇总 */
+const TEAM_TURN: StreamTurn = {
+  id: "team", question: "比较三种向量数据库在中文检索上的取舍", phase: "done", status: "完成",
+  steps: [{
+    id: "n-team", seq: 1, kind: "node", status: "done", title: "调研团队", meta: "24.1s",
+    team: {
+      members: ["researcher", "analyst", "writer"],
+      savedMs: 11800,
+      finished: true,
+      rounds: [
+        {
+          round: 0, parallel: 2, wallMs: 9600, sumMs: 16400,
+          reason: "两边资料互不相干，可以同时查",
+          members: [
+            { agent: "researcher", instruction: "查 Milvus 与 Qdrant 的中文分词支持", ms: 9600,
+              status: "done", result: "Milvus 2.4 起内置 jieba…" },
+            { agent: "analyst", instruction: "查 pgvector 的中文检索方案", ms: 6800,
+              status: "done", result: "pgvector 本身不分词，需配 zhparser…" },
+          ],
+        },
+        {
+          round: 1, parallel: 2, wallMs: 7400, sumMs: 12400,
+          reason: "两组基准测试互不依赖",
+          members: [
+            { agent: "researcher", instruction: "跑召回率基准", ms: 7400, status: "done",
+              result: "hit@1：Milvus 0.91 / Qdrant 0.89 / pgvector 0.84" },
+            { agent: "analyst", instruction: "跑写入吞吐基准", ms: 5000, status: "done",
+              result: "10 万条：Milvus 42s / Qdrant 51s / pgvector 88s" },
+          ],
+        },
+        {
+          round: 2, parallel: 1, wallMs: 7100, sumMs: 7100,
+          reason: "两份基准都出来了，可以汇总",
+          members: [
+            { agent: "writer", instruction: "根据前面的结论写选型建议", ms: 7100,
+              status: "done", result: "## 结论\n中文为主且要开箱即用 → Milvus…" },
+          ],
+        },
+      ],
+    },
+  }],
+  output: { 建议: "中文为主且要开箱即用选 Milvus；已有 Postgres 且数据量在百万以内，pgvector + zhparser 的运维成本最低。" },
+}
+
 const LONG_TURN: StreamTurn = {
   id: "long", question: "需要能够显示总结内容", phase: "done", status: "完成",
   steps: [], output: { result: longReport() },
@@ -184,6 +228,9 @@ function Preview() {
   }
   if (params.get('review') === '1') {
     return <AssistantStream turns={[REVIEW_BROKEN_TURN, REVIEW_DEGRADED_TURN]} />
+  }
+  if (params.get('team') === '1') {
+    return <AssistantStream turns={[TEAM_TURN]} dense={params.get('dense') === '1'} />
   }
 
   return (

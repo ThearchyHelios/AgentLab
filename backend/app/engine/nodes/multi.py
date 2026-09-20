@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -64,16 +65,38 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         f"- {n}：{agent_map[n].get('description') or agent_map[n].get('system', '')[:100]}"
         for n in names
     )
+    # 一轮可以派给多个专家。协议用 assignments 数组而不是单个 next：
+    # 后者把"一次只能派一个"编进了协议本身，模型再想并行也表达不出来。
+    #
+    # 但并行只在任务**互不依赖**时才成立——并发的几个专家看到的是同一份进展
+    # 快照，谁也看不见谁。派错了不会报错，只会让两个人基于同样的旧信息
+    # 重复劳动，而这件事在结果里很难看出来。所以判断责任明确压在调度者身上，
+    # 提示词里把反例写出来。
     route_schema = {
         "title": "route",  # langchain 靠 title 识别 JSON Schema dict
         "type": "object",
         "properties": {
-            "next": {"type": "string", "enum": names + ["FINISH"]},
-            "instruction": {"type": "string"},
+            "assignments": {
+                "type": "array",
+                "description": "这一轮要派出去的任务。互不依赖时可以给多个，它们会同时执行",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string", "enum": names},
+                        "instruction": {"type": "string"},
+                    },
+                    "required": ["agent", "instruction"],
+                },
+            },
+            "done": {"type": "boolean", "description": "目标已达成，结束协作"},
             "reason": {"type": "string"},
         },
-        "required": ["next"],
+        "required": ["assignments"],
     }
+
+    #: 一轮最多同时派几个。再多的话调度者多半只是在把任务拆碎，
+    #: 而每多一路就多一份"基于陈旧进展"的风险
+    max_parallel = max(1, min(int(ctx.cfg("max_parallel", 3) or 3), len(names)))
 
     transcript: list[dict[str, Any]] = []
     usage_total = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
@@ -94,17 +117,27 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             f"你是团队调度者。目标：\n{goal}\n\n"
             f"可用成员：\n{roster}\n\n"
             f"当前进展：\n{progress or '(还没有任何进展)'}\n\n"
-            "决定下一步交给谁处理，并给出一句明确的指令。"
-            "如果目标已经达成，next 返回 FINISH。"
+            "决定这一轮把什么任务交给谁，每个任务给一句明确的指令。\n\n"
+            f"**互不依赖的任务可以放在同一轮**（最多 {max_parallel} 个），它们会同时执行，"
+            "总耗时按最慢的那个算。判断依据只有一条：**后一个任务需不需要看到前一个的结果**。\n"
+            "  可以同时派：「查 A 产品的资料」和「查 B 产品的资料」——两边互不相干\n"
+            "  不能同时派：「查资料」和「根据资料写报告」——后者要等前者\n"
+            "  不能同时派：「写初稿」和「校对初稿」——同上\n\n"
+            "同时派出去的成员看到的是**同一份进展快照**，谁也看不见谁这一轮干了什么。"
+            "拿不准是否独立时就分两轮派，代价只是慢一点；派错了则是两个人基于同样的"
+            "旧信息重复劳动，而这在结果里很难看出来。\n\n"
+            "目标已经达成时，done 填 true、assignments 给空数组。"
         )
         try:
             value = await supervisor_model.with_structured_output(route_schema).ainvoke(prompt)
             if not isinstance(value, dict):
                 value = json.loads(message_text(value))
         except Exception:  # noqa: BLE001
+            # 不支持结构化输出的模型退回文本：从回复里认出一个成员名，按单人派
             raw = message_text(await supervisor_model.ainvoke(prompt))
-            picked = next((n for n in names if n in raw), "FINISH")
-            value = {"next": picked, "instruction": raw[:500], "reason": ""}
+            picked = next((n for n in names if n in raw), None)
+            value = ({"assignments": [{"agent": picked, "instruction": raw[:500]}]}
+                     if picked else {"assignments": [], "done": True, "reason": raw[:200]})
         return value
 
     @task
@@ -179,42 +212,99 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     progress_lines: list[str] = []
     final_text = ""
+    rounds_meta: list[dict[str, Any]] = []
     for round_no in range(max_rounds):
         progress = "\n\n".join(progress_lines)
         decision = await route(round_no, progress)
         _accumulate(AIMessage(content=""), sup_model_id)  # route 用了一次调用
-        nxt = str(decision.get("next") or "FINISH")
         reason = str(decision.get("reason", ""))
-        ctx.emit(
-            EventType.LOG, level="info", round=round_no,
-            message=f"调度 → {nxt}" + (f"（{reason}）" if reason else ""),
-        )
-        if nxt == "FINISH" or nxt not in agent_map:
-            final_text = progress_lines[-1].split("：", 1)[-1] if progress_lines else ""
+
+        # 只留认得出的成员，并按上限截断。模型偶尔会重复派同一个人或者编一个
+        # 不存在的名字——这两种在并发里都是纯浪费
+        batch: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in decision.get("assignments") or []:
+            name = str((item or {}).get("agent") or "")
+            if name in agent_map and name not in seen:
+                seen.add(name)
+                batch.append((name, str(item.get("instruction") or goal)))
+            if len(batch) >= max_parallel:
+                break
+
+        if decision.get("done") or not batch:
+            # agents / done 是结构化字段，界面照着它渲染。以前只有一句中文
+            # 消息串，解码层得拿正则去拆「调度 → X（理由）」——文案一改就散架
+            ctx.emit(EventType.LOG, level="info", round=round_no,
+                     agents=[], done=True,
+                     message="调度 → 结束协作" + (f"（{reason}）" if reason else ""))
+            final_text = progress_lines[-1].split("】", 1)[-1] if progress_lines else ""
             break
 
-        instruction = str(decision.get("instruction") or goal)
-        ctx.emit(EventType.AGENT_STEP_START, agent=nxt, instruction=instruction[:300],
-                 round=round_no)
-        started = time.perf_counter()
-        outcome = await work(round_no, nxt, instruction, progress)
-        elapsed = int((time.perf_counter() - started) * 1000)
-        ctx.emit(EventType.AGENT_STEP_END, agent=nxt, duration_ms=elapsed,
-                 round=round_no, preview=outcome["text"][:500])
-
-        progress_lines.append(f"【{nxt}】{outcome['text']}")
-        transcript.append(
-            {"round": round_no, "agent": nxt, "instruction": instruction, **outcome,
-             "duration_ms": elapsed}
+        who = "、".join(n for n, _ in batch)
+        ctx.emit(
+            EventType.LOG, level="info", round=round_no, parallel=len(batch),
+            agents=[n for n, _ in batch], done=False, reason=reason,
+            message=(f"调度 → {who}" + (f"（{reason}）" if reason else "")
+                     + (f" · {len(batch)} 人同时进行" if len(batch) > 1 else "")),
         )
-        final_text = outcome["text"]
+
+        for name, instruction in batch:
+            ctx.emit(EventType.AGENT_STEP_START, agent=name, instruction=instruction[:300],
+                     round=round_no, parallel=len(batch))
+
+        # 并发执行。它们拿到的是**同一份** progress 快照——这正是"任务必须
+        # 互不依赖"的技术含义，也是上面提示词里那几条反例的由来。
+        #
+        # 每个人单独计时，而不是事后拿整轮墙钟去摊：界面要显示"并行省了多少
+        # 时间"，那个数必须是量出来的。按 N×墙钟 推算等于假设每个人都跑满了
+        # 最慢那条，而实际上快的那个可能只花了三分之一
+        async def _timed(name: str, instruction: str) -> tuple[str, Any, int]:
+            t0 = time.perf_counter()
+            try:
+                out: Any = await work(round_no, name, instruction, progress)
+            except BaseException as exc:  # noqa: BLE001 - 交给下面统一处置
+                out = exc
+            return name, out, int((time.perf_counter() - t0) * 1000)
+
+        started = time.perf_counter()
+        results = await asyncio.gather(*(_timed(n, i) for n, i in batch))
+        wall_ms = int((time.perf_counter() - started) * 1000)
+
+        sum_ms = 0
+        for (name, instruction), (_, outcome, each_ms) in zip(batch, results):
+            if isinstance(outcome, BaseException):
+                # 一个专家挂了不该拖垮整轮：把失败当成它的产出交回调度者，
+                # 让它决定改派还是收工
+                text = f"（{name} 执行失败：{type(outcome).__name__}: {outcome}）"
+                outcome = {"text": text, "tool_calls": []}
+                ctx.emit(EventType.LOG, level="warn", round=round_no,
+                         message=f"{name} 这一轮失败了：{text}")
+            sum_ms += each_ms
+            ctx.emit(EventType.AGENT_STEP_END, agent=name, duration_ms=each_ms,
+                     round=round_no, parallel=len(batch), preview=outcome["text"][:500])
+            progress_lines.append(f"【{name}】{outcome['text']}")
+            transcript.append(
+                {"round": round_no, "agent": name, "instruction": instruction, **outcome,
+                 "duration_ms": each_ms}
+            )
+            final_text = outcome["text"]
+
+        rounds_meta.append({
+            "round": round_no, "agents": [n for n, _ in batch],
+            "parallel": len(batch), "wall_ms": wall_ms, "sum_ms": sum_ms,
+        })
 
     usage_total["total_tokens"] = usage_total["input_tokens"] + usage_total["output_tokens"]
+    # 并行省下的时间：各轮"串行本该花的"减去"实际花的"。只有并发过才有差值
+    saved_ms = sum(r["sum_ms"] - r["wall_ms"] for r in rounds_meta)
     result = {
         "text": final_text,
-        "rounds": len(transcript),
+        "rounds": len(rounds_meta),
+        "steps": len(transcript),
         "transcript": transcript,
         "agents": names,
+        "schedule": rounds_meta,
+        "parallel_saved_ms": saved_ms,
     }
     updates: dict[str, Any] = {
         "nodes": {ctx.node.id: result},

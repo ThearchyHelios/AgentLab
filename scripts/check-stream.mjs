@@ -191,6 +191,47 @@ console.log('\n=== 复核说明 ===')
   await page.close()
 }
 
+console.log('\n=== 协作团队的泳道 ===')
+{
+  // 这个节点以前在界面上是一条扁平的步骤序列：看得出"谁回了什么"，
+  // 看不出"谁和谁是同时干的"——而一轮同时派几个人正是它相对单 agent 的
+  // 全部优势，不画出来等于没有
+  for (const [w, dense, label] of [[1000, '0', '宽栏'], [380, '1', '窄栏']]) {
+    const page = await browser.newPage({ viewport: { width: w, height: 700 } })
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    await page.goto(`${WEB}/preview.html?team=1&dense=${dense}`, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(400)
+    const body = await page.locator('body').innerText()
+
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    check(`${label}：三个人各占一行`,
+          ['researcher', 'analyst', 'writer'].every((n) => body.includes(n)))
+    check(`${label}：说清楚并行省了多少`, /2 轮并行，省下 11\.8s/.test(body),
+          body.slice(0, 90).replace(/\n/g, ' '))
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
+
+    if (dense === '0') {
+      // 条形宽度按耗时归一化，一眼看得出谁是这一轮的瓶颈。
+      // 都画一样长的话，"并行"就只剩一句口号
+      const widths = await page.evaluate(() =>
+        [...document.querySelectorAll('button[title*="第 1 轮"]')]
+          .map((b) => b.getBoundingClientRect().width))
+      check('同一轮里慢的那个条更长', widths.length === 2 && widths[0] > widths[1] * 1.2,
+            widths.map((x) => Math.round(x)).join(' vs '))
+
+      await page.locator('button[title*="第 1 轮"]').first().click()
+      await page.waitForTimeout(300)
+      const opened = await page.locator('body').innerText()
+      check('点开看得到这个人的任务和回复',
+            opened.includes('查 Milvus 与 Qdrant') && opened.includes('内置 jieba'))
+    }
+    await page.close()
+  }
+}
+
 console.log('\n=== 空态 ===')
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })

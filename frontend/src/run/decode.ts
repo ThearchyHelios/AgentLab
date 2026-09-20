@@ -53,6 +53,44 @@ export interface Step {
    *  两者要同时展示（问什么 + 查到什么），合成一个字段就只能二选一 */
   result?: string
   children?: Step[]
+  /** 协作团队的泳道数据。只有 supervisor 节点的顶层 Step 会有 */
+  team?: TeamRun
+}
+
+/**
+ * 协作团队一轮里的一个人。
+ *
+ * ms 是**各自量出来**的耗时，不是拿整轮墙钟摊的——界面要显示"并行省了多少"，
+ * 那个数按 N×墙钟 推算会把快的那个也记成最慢那条，省下的时间就被夸大了。
+ */
+export interface TeamMember {
+  agent: string
+  instruction: string
+  ms: number
+  status: StepStatus
+  result?: string
+}
+
+export interface TeamRound {
+  round: number
+  /** 这一轮同时派了几个人。1 就是串行的一步 */
+  parallel: number
+  /** 这一轮实际花的时间：并发时是最慢那个 */
+  wallMs: number
+  /** 各人耗时之和：并发时它大于 wallMs，差值就是省下的 */
+  sumMs: number
+  reason?: string
+  members: TeamMember[]
+}
+
+export interface TeamRun {
+  /** 花名册，按第一次出现的顺序——泳道的行顺序 */
+  members: string[]
+  rounds: TeamRound[]
+  /** 并行一共省下多少毫秒。全程串行则为 0 */
+  savedMs: number
+  /** 协作是不是已经收尾了 */
+  finished: boolean
 }
 
 // 这两个是流式增量，后端根本不落库（_EPHEMERAL）。单次运行的 delta 量级会
@@ -297,6 +335,28 @@ export function decodeRun(events: RunEvent[]): Step[] {
   const pendingLlm = new Map<string, Step>()
   /** supervisor 里待配对的单个 agent 步骤 */
   const pendingAgents = new Map<string, Step>()
+  /** node_id → 协作团队的泳道数据。边解码边攒，最后挂到该节点的顶层 Step 上 */
+  const teams = new Map<string, TeamRun>()
+
+  const teamOf = (nodeId: string | undefined): TeamRun | null => {
+    if (!nodeId) return null
+    let t = teams.get(nodeId)
+    if (!t) {
+      t = { members: [], rounds: [], savedMs: 0, finished: false }
+      teams.set(nodeId, t)
+    }
+    return t
+  }
+
+  const roundOf = (team: TeamRun, round: number): TeamRound => {
+    let r = team.rounds.find((x) => x.round === round)
+    if (!r) {
+      r = { round, parallel: 1, wallMs: 0, sumMs: 0, members: [] }
+      team.rounds.push(r)
+      team.rounds.sort((a, b) => a.round - b.round)
+    }
+    return r
+  }
   /**
    * node_id → 这个节点当前那条尚未闭合的审批步骤。
    *
@@ -626,6 +686,18 @@ export function decodeRun(events: RunEvent[]): Step[] {
         }
         pendingAgents.set(agentKey(nodeId, d), step)
         push(step, nodeId)
+
+        const team = teamOf(nodeId)
+        if (team) {
+          const name = String(d.agent ?? '')
+          if (name && !team.members.includes(name)) team.members.push(name)
+          const r = roundOf(team, num(d.round) ?? 0)
+          r.parallel = Math.max(r.parallel, num(d.parallel) ?? 1)
+          r.members.push({
+            agent: name, instruction: String(d.instruction ?? ''),
+            ms: 0, status: 'running',
+          })
+        }
         break
       }
 
@@ -645,6 +717,23 @@ export function decodeRun(events: RunEvent[]): Step[] {
             detail: preview,
           }, nodeId)
         }
+
+        const team = teamOf(nodeId)
+        if (team) {
+          const r = roundOf(team, num(d.round) ?? 0)
+          const name = String(d.agent ?? '')
+          const ms = num(d.duration_ms) ?? 0
+          const m = r.members.find((x) => x.agent === name && x.status === 'running')
+            ?? (r.members.push({ agent: name, instruction: '', ms: 0, status: 'running' }),
+                r.members[r.members.length - 1])
+          m.ms = ms
+          m.status = 'done'
+          m.result = preview || undefined
+          // 这一轮实际花的是最慢那个，各人之和减去它就是省下的
+          r.wallMs = Math.max(...r.members.map((x) => x.ms))
+          r.sumMs = r.members.reduce((acc, x) => acc + x.ms, 0)
+          team.savedMs = team.rounds.reduce((acc, x) => acc + Math.max(0, x.sumMs - x.wallMs), 0)
+        }
         break
       }
 
@@ -656,17 +745,33 @@ export function decodeRun(events: RunEvent[]): Step[] {
         // 就是它，和普通 info 日志区分得开
         if (level === 'info' && d.round != null) {
           const text = String(d.message ?? '')
+          const round = (num(d.round) ?? 0) + 1
+          // 优先读结构化字段。以前只有一句中文消息串，这里得拿正则去拆
+          // 「调度 → X（理由）」——后端文案一改就散架，而文案是会改的。
+          // 老运行的事件没有这些字段，正则那条路留着兜底
+          const structured = Array.isArray(d.agents)
           const m = text.match(/^调度\s*→\s*([^（(]+)[（(](.*)[）)]\s*$/)
+          const legacyTarget = m?.[1].trim() ?? ''
+          const agents: string[] = structured
+            ? (d.agents as unknown[]).map(String)
+            : (legacyTarget && legacyTarget !== 'FINISH' ? [legacyTarget] : [])
+          const done = structured ? !!d.done : legacyTarget === 'FINISH'
+          const reason = structured ? String(d.reason ?? '') : (m?.[2].trim() ?? '')
+          const team = teamOf(nodeId)
+          if (team) {
+            if (done) team.finished = true
+            else if (reason) roundOf(team, num(d.round) ?? 0).reason = reason
+          }
+
           // FINISH 是协议里的收尾标记，不是某个 agent。"交给 FINISH"
           // 会让人以为还有个叫 FINISH 的成员
-          const target = m?.[1].trim() ?? ''
-          const round = Number(d.round) + 1
+          const title = done ? `第 ${round} 轮：结束协作`
+            : agents.length > 1 ? `第 ${round} 轮：${agents.join('、')} 同时进行`
+            : agents.length === 1 ? `第 ${round} 轮：交给 ${agents[0]}`
+            : text
           push({
             id: `sv-${seq}`, seq, kind: 'branch', nodeId, status: 'done',
-            title: !m ? text
-              : target === 'FINISH' ? `第 ${round} 轮：结束协作`
-              : `第 ${round} 轮：交给 ${target}`,
-            detail: m ? m[2].trim() : undefined,
+            title, detail: reason || undefined,
           }, nodeId)
           break
         }
@@ -778,6 +883,14 @@ export function decodeRun(events: RunEvent[]): Step[] {
   }
 
   // 还没收到 end 的工具/模型调用保持 running——它们正在进行，不是丢了
+  // 泳道挂到 supervisor 节点的顶层 Step 上。节点内部那些"第N轮交给谁""X：指令"
+  // 仍然留着——泳道给的是一眼看清的形状，那些步骤给的是内容，两者不重复
+  for (const [nodeId, team] of teams) {
+    if (!team.rounds.length) continue
+    const step = nodeSteps.get(nodeId)
+    if (step) step.team = team
+  }
+
   return out
 }
 
