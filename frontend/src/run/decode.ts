@@ -319,6 +319,84 @@ function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
   return { ...base, kind: 'tool', title: `调用 ${tool}`, detail: argText }
 }
 
+/** 低于这个毫秒数的节点不参与并行分组：瞬时节点谁跟谁都"重叠"，是噪音不是信息 */
+const CONCURRENT_MIN_MS = 30
+/** 开始时刻相差在这个数以内算"同一批出发"。实测 fan-out 的几路相差不到 1ms */
+const SAME_WAVE_MS = 250
+
+/**
+ * 认出哪几个节点是**同时**跑的，把它们收进一个分组里。
+ *
+ * 图上一个节点连出多条边就是 fan-out，LangGraph 会在同一个 superstep 里并发
+ * 执行它们——这是真并发（实测 3 个各 sleep 2 秒的节点，全部 +0.00s 开始、
+ * +2.37s 结束，墙钟 2.6 秒）。但在时间线上它们只是穿插出现的几行，
+ * "这三路是同时跑的、因此省下了 3.6 秒"这件事一个字都没说。
+ *
+ * 判定用时间跨度重叠，而不是看事件顺序——顺序只说明"先后发出"，
+ * 说明不了"同时在跑"。
+ *
+ * 判据是"同一批出发"：fan-out 的几路由 LangGraph 在同一个 superstep 里启动，
+ * 开始时刻相差以毫秒计。**不能只看跨度重叠**——三路同时开始但先后结束时，
+ * 长的那条在时间上确实"包含"短的，按包含关系去排会把先跑完的那路漏掉
+ * （实测 leg0 [0.05,2.21] / leg1 [0.05,3.01] / leg2 [0.05,1.51]，
+ * 漏的就是 leg2）。
+ *
+ * 子工作流那种真嵌套则是父节点明显更早开始、更晚结束，出发时刻对不上。
+ */
+function groupConcurrent(
+  out: Step[], spans: Map<string, { start: number; end: number; ms: number }>,
+): void {
+  const idx = new Map<Step, number>()
+  out.forEach((s, i) => idx.set(s, i))
+
+  const candidates = out.filter((s) => {
+    const sp = s.nodeId ? spans.get(s.nodeId) : undefined
+    return !!sp && sp.ms >= CONCURRENT_MIN_MS
+  })
+  if (candidates.length < 2) return
+
+  const together = (a: Step, b: Step): boolean => {
+    const x = spans.get(a.nodeId!)!
+    const y = spans.get(b.nodeId!)!
+    if (x.start >= y.end || y.start >= x.end) return false      // 压根没重叠
+    return Math.abs(x.start - y.start) * 1000 <= SAME_WAVE_MS   // 同一批出发
+  }
+
+  const used = new Set<Step>()
+  const groups: Step[][] = []
+  for (const a of candidates) {
+    if (used.has(a)) continue
+    const g = [a]
+    for (const b of candidates) {
+      if (b === a || used.has(b)) continue
+      // 和组里每一个都重叠才算同一批，否则 A|B 重叠、B|C 重叠但 A|C 不重叠
+      // 也会被串成一组，而那三个并不是同时在跑
+      if (g.every((m) => together(m, b))) g.push(b)
+    }
+    if (g.length > 1) { g.forEach((m) => used.add(m)); groups.push(g) }
+  }
+
+  for (const g of groups) {
+    g.sort((a, b) => (idx.get(a) ?? 0) - (idx.get(b) ?? 0))
+    const sp = g.map((m) => spans.get(m.nodeId!)!)
+    const wallMs = Math.round(
+      (Math.max(...sp.map((x) => x.end)) - Math.min(...sp.map((x) => x.start))) * 1000)
+    const sumMs = sp.reduce((acc, x) => acc + x.ms, 0)
+    const at = Math.min(...g.map((m) => out.indexOf(m)))
+    const first = g[0]
+    for (const m of g) out.splice(out.indexOf(m), 1)
+    out.splice(at, 0, {
+      id: `par-${first.id}`, seq: first.seq, kind: 'branch', status: 'done',
+      title: `${g.length} 路并行`,
+      // 省下多少是这一组存在的理由，放 meta 里一眼看得到
+      meta: sumMs > wallMs
+        ? `合计 ${dur(sumMs)}，实际 ${dur(wallMs)}`
+        : dur(wallMs),
+      children: g,
+    })
+  }
+}
+
 /**
  * 把一次运行的事件解码成步骤树。
  *
@@ -337,6 +415,8 @@ export function decodeRun(events: RunEvent[]): Step[] {
   const pendingAgents = new Map<string, Step>()
   /** node_id → 协作团队的泳道数据。边解码边攒，最后挂到该节点的顶层 Step 上 */
   const teams = new Map<string, TeamRun>()
+  /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
+  const spans = new Map<string, { start: number; end: number; ms: number }>()
 
   const teamOf = (nodeId: string | undefined): TeamRun | null => {
     if (!nodeId) return null
@@ -444,6 +524,9 @@ export function decodeRun(events: RunEvent[]): Step[] {
         // 人工审批恢复后 LangGraph 会重放该节点，node.started 因此来第二遍。
         // 那不是"又执行了一个步骤"，是同一步继续——复用原来那条，
         // 否则时间线上每审批一次就多一个同名节点。
+        if (nodeId && !spans.has(nodeId)) {
+          spans.set(nodeId, { start: event.ts ?? 0, end: event.ts ?? 0, ms: 0 })
+        }
         const existing = nodeId ? nodeSteps.get(nodeId) : undefined
         if (existing) {
           existing.status = 'running'
@@ -467,6 +550,11 @@ export function decodeRun(events: RunEvent[]): Step[] {
           closeInterrupt(nodeId,
             typeof p === 'object' ? p.approved : undefined,
             typeof p === 'object' ? String(p.note ?? '') : '')
+        }
+        const span = nodeId ? spans.get(nodeId) : undefined
+        if (span) {
+          span.end = event.ts ?? span.end
+          span.ms = num(d.duration_ms) ?? Math.round((span.end - span.start) * 1000)
         }
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         if (step) {
@@ -883,6 +971,8 @@ export function decodeRun(events: RunEvent[]): Step[] {
   }
 
   // 还没收到 end 的工具/模型调用保持 running——它们正在进行，不是丢了
+  groupConcurrent(out, spans)
+
   // 泳道挂到 supervisor 节点的顶层 Step 上。节点内部那些"第N轮交给谁""X：指令"
   // 仍然留着——泳道给的是一眼看清的形状，那些步骤给的是内容，两者不重复
   for (const [nodeId, team] of teams) {

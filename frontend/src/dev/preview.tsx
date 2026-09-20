@@ -229,6 +229,13 @@ function Preview() {
   if (params.get('review') === '1') {
     return <AssistantStream turns={[REVIEW_BROKEN_TURN, REVIEW_DEGRADED_TURN]} />
   }
+  if (params.get('fanout') === '1') {
+    return <AssistantStream dense={params.get('dense') === '1'} turns={[{
+      id: 'fanout', question: '三个库各查一遍，汇总给我', phase: 'done', status: '完成',
+      steps: decodeRun((fixtures as any).fanout),
+      output: { 结果: '三路都回来了' },
+    }]} />
+  }
   if (params.get('team') === '1') {
     return <AssistantStream turns={[TEAM_TURN]} dense={params.get('dense') === '1'} />
   }

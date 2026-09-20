@@ -2030,5 +2030,320 @@
     "duration_ms": 19
    }
   }
+ ],
+ "fanout": [
+  {
+   "seq": 1,
+   "type": "run.started",
+   "node_id": null,
+   "ts": 1789909355.5191329,
+   "data": {
+    "nodes": 6,
+    "resumed": false
+   }
+  },
+  {
+   "seq": 2,
+   "type": "node.started",
+   "node_id": "start",
+   "ts": 1789909355.528116,
+   "data": {
+    "node_type": "input",
+    "label": "start"
+   }
+  },
+  {
+   "seq": 3,
+   "type": "node.finished",
+   "node_id": "start",
+   "ts": 1789909355.5313249,
+   "data": {
+    "duration_ms": 0,
+    "attempt": 1,
+    "preview": {
+     "q": "x"
+    },
+    "vars": {
+     "q": "x"
+    },
+    "artifact": "a69fbbcf7209c6f659a75067c9fa03037c2ae23f55a6f854d5994209129bbbf6"
+   }
+  },
+  {
+   "seq": 4,
+   "type": "node.started",
+   "node_id": "leg0",
+   "ts": 1789909355.566488,
+   "data": {
+    "node_type": "code",
+    "label": "查销售库"
+   }
+  },
+  {
+   "seq": 5,
+   "type": "sandbox.start",
+   "node_id": "leg0",
+   "ts": 1789909355.5680408,
+   "data": {
+    "language": "python",
+    "limits": {
+     "timeout": 30,
+     "memory_mb": 512,
+     "cpus": 1.0,
+     "network": false,
+     "max_output": 20000
+    },
+    "isolation": "auto",
+    "code": "import time;time.sleep(1.8);print('查销售库 完成')",
+    "code_truncated": false,
+    "interpolated": false
+   }
+  },
+  {
+   "seq": 6,
+   "type": "node.started",
+   "node_id": "leg1",
+   "ts": 1789909355.569063,
+   "data": {
+    "node_type": "code",
+    "label": "查库存库"
+   }
+  },
+  {
+   "seq": 7,
+   "type": "sandbox.start",
+   "node_id": "leg1",
+   "ts": 1789909355.5698738,
+   "data": {
+    "language": "python",
+    "limits": {
+     "timeout": 30,
+     "memory_mb": 512,
+     "cpus": 1.0,
+     "network": false,
+     "max_output": 20000
+    },
+    "isolation": "auto",
+    "code": "import time;time.sleep(2.6);print('查库存库 完成')",
+    "code_truncated": false,
+    "interpolated": false
+   }
+  },
+  {
+   "seq": 8,
+   "type": "node.started",
+   "node_id": "leg2",
+   "ts": 1789909355.570695,
+   "data": {
+    "node_type": "code",
+    "label": "查客户库"
+   }
+  },
+  {
+   "seq": 9,
+   "type": "sandbox.start",
+   "node_id": "leg2",
+   "ts": 1789909355.5714948,
+   "data": {
+    "language": "python",
+    "limits": {
+     "timeout": 30,
+     "memory_mb": 512,
+     "cpus": 1.0,
+     "network": false,
+     "max_output": 20000
+    },
+    "isolation": "auto",
+    "code": "import time;time.sleep(1.1);print('查客户库 完成')",
+    "code_truncated": false,
+    "interpolated": false
+   }
+  },
+  {
+   "seq": 10,
+   "type": "sandbox.end",
+   "node_id": "leg2",
+   "ts": 1789909357.024351,
+   "data": {
+    "ok": true,
+    "exit_code": 0,
+    "duration_ms": 1456,
+    "backend": "microvm",
+    "stdout": "查客户库 完成\n",
+    "stderr": ""
+   }
+  },
+  {
+   "seq": 11,
+   "type": "node.finished",
+   "node_id": "leg2",
+   "ts": 1789909357.027894,
+   "data": {
+    "duration_ms": 1456,
+    "attempt": 1,
+    "preview": {
+     "ok": true,
+     "exit_code": 0,
+     "stdout": "查客户库 完成\n",
+     "stderr": "",
+     "duration_ms": 1456,
+     "timed_out": false,
+     "truncated": false,
+     "backend": "microvm",
+     "files_written": "[0 项]",
+     "error": null,
+     "session_reset": false,
+     "data": null,
+     "text": "查客户库 完成\n"
+    },
+    "vars": null,
+    "artifact": "696aaa83aa727152eac49f8b82dabdd860ac3d37af96c37f0854a819b0c0c350"
+   }
+  },
+  {
+   "seq": 12,
+   "type": "sandbox.end",
+   "node_id": "leg0",
+   "ts": 1789909357.7229152,
+   "data": {
+    "ok": true,
+    "exit_code": 0,
+    "duration_ms": 2162,
+    "backend": "microvm",
+    "stdout": "查销售库 完成\n",
+    "stderr": ""
+   }
+  },
+  {
+   "seq": 13,
+   "type": "node.finished",
+   "node_id": "leg0",
+   "ts": 1789909357.725617,
+   "data": {
+    "duration_ms": 2189,
+    "attempt": 1,
+    "preview": {
+     "ok": true,
+     "exit_code": 0,
+     "stdout": "查销售库 完成\n",
+     "stderr": "",
+     "duration_ms": 2162,
+     "timed_out": false,
+     "truncated": false,
+     "backend": "microvm",
+     "files_written": "[0 项]",
+     "error": null,
+     "session_reset": false,
+     "data": null,
+     "text": "查销售库 完成\n"
+    },
+    "vars": null,
+    "artifact": "00944f0b705f77928790de8c042792bea1237d3907293ec249133e7eab0af61f"
+   }
+  },
+  {
+   "seq": 14,
+   "type": "sandbox.end",
+   "node_id": "leg1",
+   "ts": 1789909358.5266712,
+   "data": {
+    "ok": true,
+    "exit_code": 0,
+    "duration_ms": 2959,
+    "backend": "microvm",
+    "stdout": "查库存库 完成\n",
+    "stderr": ""
+   }
+  },
+  {
+   "seq": 15,
+   "type": "node.finished",
+   "node_id": "leg1",
+   "ts": 1789909358.529147,
+   "data": {
+    "duration_ms": 2959,
+    "attempt": 1,
+    "preview": {
+     "ok": true,
+     "exit_code": 0,
+     "stdout": "查库存库 完成\n",
+     "stderr": "",
+     "duration_ms": 2959,
+     "timed_out": false,
+     "truncated": false,
+     "backend": "microvm",
+     "files_written": "[0 项]",
+     "error": null,
+     "session_reset": false,
+     "data": null,
+     "text": "查库存库 完成\n"
+    },
+    "vars": null,
+    "artifact": "5870ecb6df825e09b5b9057ff182a9c933656ed5ab8f42aa9bb0bd01fd962707"
+   }
+  },
+  {
+   "seq": 16,
+   "type": "node.started",
+   "node_id": "merge",
+   "ts": 1789909358.531316,
+   "data": {
+    "node_type": "transform",
+    "label": "merge"
+   }
+  },
+  {
+   "seq": 17,
+   "type": "node.finished",
+   "node_id": "merge",
+   "ts": 1789909358.5334458,
+   "data": {
+    "duration_ms": 0,
+    "attempt": 1,
+    "preview": "三路都回来了",
+    "vars": null,
+    "artifact": "9b4dc39b58e543ae8c5ef60ccc10c79ef2b1a720f04d40a882085731a7b28854"
+   }
+  },
+  {
+   "seq": 18,
+   "type": "node.started",
+   "node_id": "out",
+   "ts": 1789909358.534973,
+   "data": {
+    "node_type": "output",
+    "label": "out"
+   }
+  },
+  {
+   "seq": 19,
+   "type": "node.finished",
+   "node_id": "out",
+   "ts": 1789909358.537149,
+   "data": {
+    "duration_ms": 0,
+    "attempt": 1,
+    "preview": {
+     "r": ""
+    },
+    "vars": null,
+    "artifact": "bd61075bf9ba8f23153729bbad7fada6a82f1dbeaae23f64b746441219f40327"
+   }
+  },
+  {
+   "seq": 20,
+   "type": "run.finished",
+   "node_id": null,
+   "ts": 1789909358.541813,
+   "data": {
+    "output": {
+     "r": ""
+    },
+    "usage": {
+     "duration_ms": 3021
+    },
+    "duration_ms": 3021
+   }
+  }
  ]
 }

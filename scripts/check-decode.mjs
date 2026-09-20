@@ -249,6 +249,24 @@ console.log('\n=== 失败运行 ===')
     !steps.some((s) => s.kind === 'lifecycle' && s.status === 'running'))
 }
 
+console.log('\n=== 并行分支 ===')
+{
+  // 图上一个节点连出多条边就是 fan-out，LangGraph 在同一个 superstep 里并发
+  // 执行——这是真并发。但在时间线上它们原来只是穿插出现的几行，
+  // "这三路是同时跑的、因此省下了 3.6 秒"一个字都没说。
+  // 这份样本是真跑出来的：三路分别 sleep 1.8 / 2.6 / 1.1 秒。
+  const steps = mod.decodeRun(fixtures.fanout)
+  const group = steps.find((s) => /路并行/.test(s.title))
+  check('认出了并行的那一批', !!group, steps.map((s) => s.title).join(' | '))
+  check('三路都在组里', group?.children?.length === 3, `${group?.children?.length} 路`)
+  check('省下多少说出来了', /合计 6\.\ds，实际 3\.\ds/.test(group?.meta ?? ''), group?.meta)
+  // 顺序执行的图不能被误判成并行——误报比漏报更糟，它会让人以为省了时间
+  for (const name of ['db', 'human', 'loop_approve']) {
+    const seq = mod.decodeRun(fixtures[name])
+    check(`顺序执行的 ${name} 没有被误判`, !seq.some((s) => /路并行/.test(s.title)))
+  }
+}
+
 console.log('\n=== 通用规则 ===')
 {
   const all = Object.values(fixtures).flatMap((evts) => flatten(mod.decodeRun(evts)))

@@ -191,6 +191,30 @@ console.log('\n=== 复核说明 ===')
   await page.close()
 }
 
+console.log('\n=== 并行分支 ===')
+{
+  // fan-out 一直是真并发（实测 3 个 sleep 2 秒的节点墙钟 2.6 秒），但时间线上
+  // 原来只是穿插出现的几行，省下的时间一个字都没说
+  for (const [w, dense, label] of [[1000, '0', '宽栏'], [380, '1', '窄栏']]) {
+    const page = await browser.newPage({ viewport: { width: w, height: 700 } })
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    await page.goto(`${WEB}/preview.html?fanout=1&dense=${dense}`, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(400)
+    const body = await page.locator('body').innerText()
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    check(`${label}：说破了这是三路并行`, body.includes('3 路并行'))
+    check(`${label}：省下多少写出来了`, /合计 6\.\ds，实际 3\.\ds/.test(body),
+          body.slice(body.indexOf('3 路并行'), body.indexOf('3 路并行') + 40).replace(/\n/g, ' '))
+    check(`${label}：三路都还看得见`,
+          ['查销售库', '查库存库', '查客户库'].every((n) => body.includes(n)))
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
+    await page.close()
+  }
+}
+
 console.log('\n=== 协作团队的泳道 ===')
 {
   // 这个节点以前在界面上是一条扁平的步骤序列：看得出"谁回了什么"，
