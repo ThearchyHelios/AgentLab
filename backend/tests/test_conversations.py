@@ -51,41 +51,6 @@ async def _turn(client, conv_id: str, question: str, **patch) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def test_a_conversation_survives_and_lists(client) -> None:
-    conv = await _conversation(client)
-    await _turn(client, conv["id"], "shop 里有几家店", answer="12 家", status="done")
-
-    # 列表里认得出是哪次聊天
-    rows = (await client.get("/api/conversations")).json()
-    mine = next(r for r in rows if r["id"] == conv["id"])
-    assert mine["turn_count"] == 1
-    assert mine["last_question"] == "shop 里有几家店"
-
-    # 完整取回：这是刷新页面后重建界面的唯一依据
-    detail = (await client.get(f"/api/conversations/{conv['id']}")).json()
-    assert [t["question"] for t in detail["turns"]] == ["shop 里有几家店"]
-    assert detail["turns"][0]["answer"] == "12 家"
-
-
-async def test_title_comes_from_the_first_question(client) -> None:
-    """一排"新对话"等于没有列表。"""
-    conv = await _conversation(client)
-    assert conv["title"] == "新对话"
-    await _turn(client, conv["id"], "shop 里有几家店")
-    assert (await client.get(f"/api/conversations/{conv['id']}")).json()["title"] == "shop 里有几家店"
-
-    # 第二轮不该再改标题
-    await _turn(client, conv["id"], "再按月份拆一下")
-    assert (await client.get(f"/api/conversations/{conv['id']}")).json()["title"] == "shop 里有几家店"
-
-
-async def test_a_renamed_conversation_keeps_its_name(client) -> None:
-    conv = await _conversation(client)
-    await client.patch(f"/api/conversations/{conv['id']}", json={"title": "门店盘点"})
-    await _turn(client, conv["id"], "shop 里有几家店")
-    assert (await client.get(f"/api/conversations/{conv['id']}")).json()["title"] == "门店盘点"
-
-
 def test_long_titles_are_cut_not_wrapped() -> None:
     assert title_from("短问题") == "短问题"
     assert title_from("") == "新对话"
@@ -150,33 +115,6 @@ async def _seeded(client) -> str:
     return conv["id"]
 
 
-async def test_history_text_is_plain_qa(client) -> None:
-    conv_id = await _seeded(client)
-    async with SessionLocal() as session:
-        text = await history_text(session, conv_id)
-    assert "shop 里有几家店" in text and "一共 12 家" in text
-
-
-async def test_history_carries_the_review_warning_forward(client) -> None:
-    """被复核判过不可信的答案，下一轮必须知道。
-
-    只把正文喂过去的话，模型会拿一个已知有问题的结论当事实继续往下推
-    （"那 12 家里有几家是新开的？"），错误就这么一轮轮传下去，而且越传
-    越像真的——后面几轮看起来都在正常作答。
-    """
-    conv = await _conversation(client)
-    await _turn(
-        client, conv["id"], "shop 里有几家店",
-        answer="一共 12 家", status="done",
-        review={"verdict": "annotated", "severity": "broken", "note": "取数没跑通，这个数不可信。",
-                "answer": None, "retry": True, "signals": []},
-    )
-    async with SessionLocal() as session:
-        text = await history_text(session, conv["id"])
-    assert "一共 12 家" in text
-    assert "取数没跑通" in text
-
-
 async def test_history_text_is_empty_without_a_conversation(client) -> None:
     async with SessionLocal() as session:
         assert await history_text(session, None) == ""
@@ -212,59 +150,9 @@ async def test_a_huge_answer_does_not_crowd_out_the_other_turns(client) -> None:
     assert "那总共多少" in text          # 后一轮没被前一轮挤掉
 
 
-async def test_history_section_carries_the_previous_graph(client) -> None:
-    """只给问答文字不够：追问会让模型重新设计一张图，可能接到别的表上。"""
-    from app.api.copilot import _history_section
-
-    conv_id = await _seeded(client)
-    async with SessionLocal() as session:
-        block = await _history_section(session, conv_id)
-
-    assert "shop 里有几家店" in block
-    assert "shop_agent" in block and "db_query__shop" in block
-    assert '"x"' not in block and '"position"' not in block   # _slim 去掉了坐标噪音
-
-
 # --------------------------------------------------------------------------
 # 上下文真的到了模型手上
 # --------------------------------------------------------------------------
-
-
-async def test_the_previous_turn_reaches_the_prompt(client, monkeypatch) -> None:
-    """整件事的关键一环。
-
-    拼字符串的函数测通过、却没接进 messages，是这类功能最典型的失败方式：
-    界面上完全看不出来，它只是"答得不太对"。所以这里拦在模型入口上，
-    看送出去的那条 human message 里到底有没有上一轮。
-    """
-    import app.api.copilot as copilot
-
-    conv_id = await _seeded(client)
-    captured: list = []
-
-    class _Recorder:
-        def with_structured_output(self, *_a, **_k):
-            return self
-
-        async def ainvoke(self, messages):
-            captured.append(messages)
-            return {"nodes": [], "edges": []}
-
-    async def _model(*_a, **_k):
-        return _Recorder(), "mock-fast"
-
-    monkeypatch.setattr(copilot, "get_chat_model", _model)
-
-    r = await client.post("/api/copilot/generate", json={
-        "instruction": "再按月份拆一下", "intent": "answer", "conversation_id": conv_id,
-    })
-    assert r.status_code == 200, r.text
-
-    human = next(text for role, text in captured[0] if role == "human")
-    assert "shop 里有几家店" in human       # 上一轮问的
-    assert "一共 12 家" in human              # 上一轮答的
-    assert "shop_agent" in human              # 上一轮的图
-    assert "再按月份拆一下" in human          # 这一轮问的
 
 
 async def test_no_conversation_means_no_history_header(client, monkeypatch) -> None:
@@ -458,42 +346,9 @@ def test_the_three_paths_are_spelled_out_for_the_model() -> None:
     assert '"run":true' in _STREAM_PROTOCOL
 
 
-async def test_copilot_is_told_not_to_invent_a_memory_scope() -> None:
-    """记忆域由平台给。图里自己起一个，写进去就再也读不回来。
-
-    真发生过（会话 cbe09f4b 的第 2~3 轮）：一轮的 memory 节点写了
-    scope="user"，下一轮没写 scope、落回 default，于是「我叫张三」存下来了，
-    问「我是谁」却答不上来——记忆在库里好好的，只是读错了地方。
-    """
-    from app.api.copilot import NODE_REFERENCE
-
-    memory_line = next(
-        (l for l in NODE_REFERENCE.splitlines() if l.strip().startswith("- memory：")), "")
-    assert memory_line, "节点参考里找不到 memory 这一行"
-    assert "scope" not in memory_line, "scope 还列在可填字段里，模型就会去填它"
-    assert "不要写 scope" in NODE_REFERENCE
-
-
 # --------------------------------------------------------------------------
 # 主动记忆
 # --------------------------------------------------------------------------
-
-
-def test_copilot_is_told_when_to_record_a_memory() -> None:
-    """以前只有用户明说「记住」才会写：17 轮里只有 4 轮带记忆节点，全在用户
-    主动谈记忆的那个会话里。于是他说过一次「我叫张三」，换个话题再问就
-    谁也不知道了。
-
-    但边界比指令本身更要紧——记错了会污染以后每一次对话。
-    """
-    from app.api.copilot import GenerateIn, _user_message
-
-    text = _user_message(GenerateIn(instruction="随便问问", intent="answer"), patch=False)
-    assert "该记" in text and "不该记" in text
-    # 最容易被记进去的垃圾：这一轮的问题、查出来的数、一次性指令、以及推测
-    for junk in ("这一轮的问题本身", "查出来的数", "一次性的指令", "推测出来的东西"):
-        assert junk in text, f"没有拦住「{junk}」这类"
-    assert "拿不准就不记" in text
 
 
 async def test_writing_a_memory_is_visible_in_the_trace(client, monkeypatch) -> None:

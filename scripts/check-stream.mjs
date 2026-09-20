@@ -57,7 +57,7 @@ console.log('\n=== 展开交互 ===')
   await page.waitForTimeout(300)
   const before = await page.locator('body').innerText()
   check('收起时不显示 SQL', !before.includes('SELECT'))
-  await page.locator('button', { hasText: '在 bi 上查询数据' }).first().click()
+  await page.locator('button', { hasText: '在 warehouse 上查询数据' }).first().click()
   await page.waitForTimeout(250)
   const after = await page.locator('body').innerText()
   check('展开后能看到 SQL 原文', after.includes('SELECT') && after.includes('ANALYTICS'))
@@ -67,8 +67,10 @@ console.log('\n=== 展开交互 ===')
 
 console.log('\n=== Markdown 渲染 ===')
 {
-  // 用库里导出的**真实输出**，不是编的样本：模型写什么才是要渲染的，
-  // 按 CommonMark 规范挑测例只会测到用不上的角落
+  // 样本取自库里导出的**真实输出**，不是按 CommonMark 规范挑的测例：模型
+  // 实际会写成什么样，才是要渲染的东西。涉及业务数据的那几条已换成同构的
+  // 合成内容——换的是领域，markdown 构造（标题层级、表格、引用块、inline
+  // code 密度）逐项对齐，覆盖面没有变窄
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 } })
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))

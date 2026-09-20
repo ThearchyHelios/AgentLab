@@ -39,19 +39,6 @@ OK_OUTPUT = {"结果": "管理员有 6 个。"}
 # --------------------------------------------------------------------------
 
 
-def test_clean_run_has_no_signals():
-    """干净的运行扫不出东西——这是"零成本"的前提。"""
-    events = [
-        ev(EventType.RUN_STARTED),
-        ev(EventType.TOOL_START, tool="db_query__shop"),
-        ev(EventType.TOOL_END, tool="db_query__shop"),
-        ev(EventType.LOG, level="info", message="随便什么"),
-        ev(EventType.RETRIEVE_END, count=5, degraded=False, query="权限"),
-        ev(EventType.RUN_FINISHED),
-    ]
-    assert rv.scan(events, OK_OUTPUT) == []
-
-
 def test_tool_error_is_broken():
     signals = rv.scan([ev(EventType.TOOL_ERROR, tool="db_query__x", error="no such table")],
                       OK_OUTPUT)

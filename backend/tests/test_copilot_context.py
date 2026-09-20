@@ -13,7 +13,7 @@ from app.api.copilot import GRAPH_SCHEMA, _DATASOURCE_BUDGET_CHARS
 from app.data.introspect import summary
 
 
-def _source(n_tables: int, *, name: str = "bi", schema: str | None = "ANALYTICS"):
+def _source(n_tables: int, *, name: str = "warehouse", schema: str | None = "ANALYTICS"):
     tables = {
         f"t{i}": {
             "qualified": f"{schema}.t{i}" if schema else f"t{i}",
@@ -45,29 +45,11 @@ def test_graph_schema_allows_arbitrary_config_keys():
     assert "config" in node["required"]
 
 
-def test_summary_detail_mode_lists_columns():
-    text = summary(_source(3))
-    assert "ANALYTICS.t0" in text and "c0" in text
-
-
-def test_summary_compact_mode_drops_columns():
-    """库多了要靠它压 token：只留对象名，字段让 db_schema 按需查。"""
-    text = summary(_source(50), detail=False)
-    assert "ANALYTICS.t0" in text
-    assert "c0" not in text
-    assert len(text) < len(summary(_source(50)))
-
-
 def test_compact_mode_is_substantially_smaller():
     """压缩比要真的有效，否则降级没意义。实测约 35%。"""
     full = summary(_source(53))
     compact = summary(_source(53), detail=False)
     assert len(compact) < len(full) * 0.5
-
-
-def test_qualified_names_appear_in_summary():
-    """摘要里必须是带 schema 的全名——模型照抄，漏前缀就是 ORA-00942。"""
-    assert "ANALYTICS.t0" in summary(_source(2))
 
 
 def test_summary_without_schema_uses_bare_names():

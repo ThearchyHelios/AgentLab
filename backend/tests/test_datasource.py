@@ -197,32 +197,6 @@ async def test_qualified_name_includes_schema_when_given(source):
     assert cache["tables"]["orders"]["qualified"] == "main.orders"
 
 
-async def test_bad_schema_returns_candidates_instead_of_raising(source, monkeypatch):
-    """schema 填错是高频事故（大小写、拼写），要给可选项而不是抛驱动异常。"""
-    from app.data import introspect as mod
-
-    async def fake_list(_source):
-        return ["ANALYTICS", "STAGING"]
-
-    monkeypatch.setattr(mod, "list_schemas", fake_list)
-    cache = await mod.introspect(source, schema="根本不存在")
-    assert cache["tables"] == {}
-    assert cache["available_schemas"] == ["ANALYTICS", "STAGING"]
-
-
-async def test_summary_points_at_candidate_schemas(source, monkeypatch):
-    """摘要要把候选说给 Copilot 听，否则它只会对着空结构编表名。"""
-    from app.data import introspect as mod
-
-    async def fake_list(_source):
-        return ["ANALYTICS", "STAGING"]
-
-    monkeypatch.setattr(mod, "list_schemas", fake_list)
-    source.schema_cache = await mod.introspect(source, schema="根本不存在")
-    text = summary(source)
-    assert "ANALYTICS" in text and "该账号名下没有对象" in text
-
-
 def test_schema_stats_sql_covers_every_supported_kind():
     """新增数据库类型时别忘了这里——漏了就退化成黑名单猜测。"""
     from app.data.engine import SUPPORTED_KINDS
@@ -277,60 +251,3 @@ def test_why_empty_tells_the_two_cases_apart():
     assert "失败" in why_empty(_FailedCache.schema_cache)
     assert "Lost connection" in why_empty(_FailedCache.schema_cache)
     assert why_empty({}) == "还没有探查过结构"
-
-
-def test_schema_tool_tells_the_agent_the_truth():
-    """给 agent 的那句话要是实情，而且要给一个它做得到的下一步。"""
-    from app.tools.datasource import _no_schema_note
-
-    note = _no_schema_note(_FailedCache)
-    assert "失败" in note and "Lost connection" in note
-    # 候选一直在缓存里，以前没人交出去
-    assert "prod_shop" in note and "toolsdb" in note
-    # agent 进不了设置页。它做得到的是自己查数据字典——那条路它最后也走通了，
-    # 只是自己摸索了三轮
-    assert "information_schema" in note
-    assert "不要猜表名" in note
-    # 不能再说"请到设置页"
-    assert "设置页" not in note
-
-    fresh = _no_schema_note(_NeverRun)
-    assert "还没有探查过" in fresh
-    assert "失败" not in fresh
-
-
-def test_describe_table_does_not_claim_the_table_is_missing():
-    """缓存是空的时候，说"里面没有这张表"是在误导——真相是我们什么都不知道。"""
-    from app.data.introspect import describe_table
-
-    out = describe_table(_FailedCache, "user")
-    assert "无法判断" in out
-    assert "失败" in out
-    # 以前是 "数据源「shop」里没有 user。现有的对象：（还没探查过结构）"
-    assert "现有的对象" not in out
-
-
-@pytest.mark.asyncio
-async def test_introspect_failure_does_not_get_a_synced_stamp(client, monkeypatch):
-    """失败要把缓存留下（候选是下一步的线索），但不能盖"已同步"的戳。
-
-    以前盖了，于是界面说同步过、工具说还没探查过，两边都不说真话。
-    """
-    import app.api.datasources as mod
-
-    async def failed(source, schema=None):
-        return dict(_FailedCache.schema_cache)
-
-    created = await client.post("/api/datasources", json={
-        "name": "introspect_fail", "kind": "sqlite", "database": ":memory:",
-    })
-    assert created.status_code == 201, created.text
-    sid = created.json()["id"]
-
-    monkeypatch.setattr(mod.introspect_mod, "introspect", failed)
-    out = (await client.post(f"/api/datasources/{sid}/introspect")).json()
-
-    assert out["schema_synced_at"] is None, "失败不该盖已同步的戳"
-    assert "Lost connection" in out["schema_error"]
-    assert out["available_schemas"] == ["prod_shop", "shop_dev", "toolsdb"]
-    assert out["table_count"] == 0

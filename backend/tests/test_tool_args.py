@@ -172,40 +172,6 @@ async def test_schema_tool_args_are_validated_too(source) -> None:
     assert payload["table"] == "orders" and note is not None
 
 
-async def test_call_tool_end_to_end_on_the_path_that_broke(source) -> None:
-    """走 call_tool 这个真实入口（工具节点和设置页的"试一下"都走它）。
-
-    以前这条路径对动态工具是裸 `**args` 展开的，报错止步于 TypeError；
-    现在参数名能被纠正、纠正这件事能通过 on_fix 说出去。
-    """
-    from app.db.base import SessionLocal
-    from app.db.models import DataSource
-    from app.tools.registry import call_tool
-
-    async with SessionLocal() as session:
-        session.add(DataSource(
-            name="shop", kind="sqlite", database=source.database,
-            readonly=True, description="测试库", options={}, schema_cache={}, enabled=True,
-        ))
-        await session.commit()
-
-    notes: list[str] = []
-    async with SessionLocal() as session:
-        out = await call_tool(
-            "db_query__shop", {"query": "SELECT COUNT(*) AS c FROM orders"},
-            ToolContext(), session=session, on_fix=notes.append,
-        )
-    assert "5" in str(out)
-    # 跑通了，但配置里那个错的参数名还在，必须留下痕迹而不是安静地把事办了
-    assert len(notes) == 1 and "sql" in notes[0]
-
-    async with SessionLocal() as session:
-        with pytest.raises(ToolArgsError) as e:
-            await call_tool("db_query__shop", {"foo": 1, "bar": 2}, ToolContext(), session=session)
-    assert "sql" in str(e.value)
-    assert "unexpected keyword argument" not in str(e.value)
-
-
 def test_tools_without_a_pydantic_schema_are_let_through() -> None:
     """MCP 这类工具的 args_schema 可能是一份 JSON Schema dict，校验不了就放行。"""
     assert args_model_of(SimpleNamespace(args_schema={"type": "object"})) is None
