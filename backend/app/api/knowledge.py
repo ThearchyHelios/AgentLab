@@ -339,6 +339,51 @@ async def reindex(
     return out
 
 
+#: 单段返回多少字。切块本来就在千字量级，详情页是给人扫一眼"切得对不对"的，
+#: 不是给人通读原文的——整篇几千段全量吐出去，一份大文档能有几兆
+_CHUNK_PREVIEW = 1200
+
+
+@kb_router.get("/documents/{doc_id}")
+async def get_document(
+    doc_id: str, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """一份文档被切成了什么样。
+
+    切块这一层做了不少事——按行边界留重叠、跨块把表头续上（memory/kb.py 的
+    chunk_text），而在此之前结果在界面上一处都看不见。检索不准的时候第一个
+    该看的就是它：表头有没有续上、重叠对不对、哪一段被截断了。
+    """
+    from app.db.models import Chunk
+
+    doc = await session.get(Document, doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+
+    rows = list((await session.execute(
+        select(Chunk).where(Chunk.document_id == doc_id).order_by(Chunk.ordinal)
+    )).scalars())
+
+    return {
+        "document": DocumentOut.model_validate(doc).model_dump(mode="json"),
+        "chunks": [
+            {
+                "id": c.id,
+                "ordinal": c.ordinal,
+                "content": c.content[:_CHUNK_PREVIEW],
+                "truncated": len(c.content) > _CHUNK_PREVIEW,
+                "chars": len(c.content),
+                "token_len": c.token_len,
+                # 哪条向量是谁建的。一份文档里混着两个模型建的向量是真会发生的
+                # （换模型之后只重建了一部分），而那会让检索悄悄退回关键词
+                "embed_model": c.embed_model or "",
+                "has_vector": c.embedding is not None,
+            }
+            for c in rows
+        ],
+    }
+
+
 @kb_router.delete("/documents/{doc_id}", status_code=204)
 async def delete_document(doc_id: str, session: AsyncSession = Depends(get_session)) -> None:
     if not await kb.delete_document(session, doc_id):

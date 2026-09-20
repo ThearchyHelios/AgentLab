@@ -88,6 +88,19 @@ export const api = {
     update: (id: string, body: any) => patch<any>(`/datasources/${id}`, body),
     remove: (id: string) => del(`/datasources/${id}`),
     test: (id: string) => post<any>(`/datasources/${id}/test`, {}),
+    /** 上传 Excel / CSV，变成一个可以用 SQL 查的数据源。同名就地替换 */
+    uploadTable: (file: File, body: { name: string; description?: string; header_row?: number }) => {
+      const form = new FormData()
+      form.append('file', file)
+      form.append('name', body.name)
+      form.append('description', body.description ?? '')
+      form.append('header_row', String(body.header_row ?? 1))
+      return request<{
+        source: any; replaced: boolean
+        tables: { name: string; sheet: string; rows: number
+                  columns: { name: string; type: string }[] }[]
+      }>('/datasources/upload', { method: 'POST', body: form })
+    },
     introspect: (id: string, schema?: string) =>
       post<any>(`/datasources/${id}/introspect${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`, {}),
     schema: (id: string, table?: string) =>
@@ -193,6 +206,14 @@ export const api = {
     },
     search: (q: string, collection?: string, alpha = 0.5) =>
       get<any>(`/kb/search?q=${encodeURIComponent(q)}&alpha=${alpha}${collection ? `&collection=${collection}` : ''}`),
+    /** 一份文档被切成了什么样。检索不准时第一个该看的就是它 */
+    document: (id: string) => get<{
+      document: KbDocument
+      chunks: {
+        id: string; ordinal: number; content: string; truncated: boolean
+        chars: number; token_len: number; embed_model: string; has_vector: boolean
+      }[]
+    }>(`/kb/documents/${id}`),
     remove: (id: string) => del(`/kb/documents/${id}`),
     embedding: (collection?: string) => get<{
       embedder: string; dim: number; configured: boolean

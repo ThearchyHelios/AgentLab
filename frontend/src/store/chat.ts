@@ -96,6 +96,8 @@ interface ChatState {
   loadSteps: (conversationId: string, turnId: string) => Promise<void>
   /** 模型建了图但没自动跑时，用户点「跑一下」 */
   runNow: (conversationId: string, turnId: string) => void
+  /** 跑挂了：从失败的那个节点接着跑，前面跑过的不重来 */
+  continueTurn: (conversationId: string, turnId: string) => Promise<void>
   /** 会话被删了，把内存里那一桶也丢掉 */
   forget: (conversationId: string) => void
 }
@@ -304,17 +306,31 @@ export const useChat = create<ChatState>((set, get) => ({
     void launch(conversationId, turnId, turn.graph, turn.question, patch, set, save)
   },
 
+  continueTurn: async (conversationId, turnId) => {
+    // 从失败的节点接着跑。**不带图**——问数据页的用户改不了图，这里就是
+    // "用原来的配置重试失败的那一步"，对超时、限流、网络抖这类瞬时失败有用。
+    // 配置本身错了（模型 id 写错、缺必填输入）要到画布上改，那边的「接着跑」
+    // 会把改过的图一起带上。
+    //
+    // 接上之后 run.finished 照常触发 settle，复核层自动覆盖这一次
+    const turn = get().byConversation[conversationId]?.find((t) => t.id === turnId)
+    if (!turn?.run || get().busy) return
+    await api.runs.continue(turn.run.id)
+    await get().reattach(conversationId, turnId)
+  },
+
   reattach: async (conversationId, turnId) => {
     const turn = get().byConversation[conversationId]?.find((t) => t.id === turnId)
     if (!turn?.run) return
     const patch = patcher(set, conversationId, turnId)
+    // 上一轮的错要清掉：接着跑之后它还挂在那里，就成了一条已经不成立的红字
     const save = async (body: Record<string, any>) => {
       if (!turn.serverId) return
       try {
         await api.conversations.patchTurn(conversationId, turn.serverId, body)
       } catch { /* 同上 */ }
     }
-    patch(() => ({ phase: 'running', status: PHASE_TEXT.running }))
+    patch(() => ({ phase: 'running', status: PHASE_TEXT.running, error: '' }))
     set({ busy: true })
     watch(turn.run.id, patch, set, save, turn.lastSeq, turn.question)
   },

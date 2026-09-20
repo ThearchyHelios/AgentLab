@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Database, Plug, RefreshCw, Table2, Trash2 } from 'lucide-react'
+import { Database, Plug, RefreshCw, Table2, Trash2, Upload } from 'lucide-react'
 import { api } from '../api/client'
 import { Empty, Modal, Spinner, useToast } from '../components/ui'
 
@@ -15,6 +15,7 @@ export function DataSourcesTab() {
   const [kinds, setKinds] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [editing, setEditing] = useState<any | null>(null)
+  const [uploading, setUploading] = useState(false)
   const toast = useToast()
 
   const load = async () => {
@@ -40,6 +41,11 @@ export function DataSourcesTab() {
           接入后 Copilot 编排时就看得见这些库的结构，agent 运行时能直接查
         </div>
         <span className="flex-1" />
+        {/* 表格走单独的入口：它不是"填连接信息"，是"传个文件"，
+            塞进同一个表单只会让两种都变别扭 */}
+        <button className="btn btn-sm" onClick={() => setUploading(true)}>
+          <Upload size={12} /> 传表格
+        </button>
         <button className="btn btn-sm btn-primary"
                 onClick={() => setEditing({ kind: 'mysql', readonly: true, options: {} })}>
           <Database size={12} /> 添加数据源
@@ -50,7 +56,7 @@ export function DataSourcesTab() {
         <Empty
           icon={<Database size={22} />}
           title="还没有数据源"
-          hint="接一个数据库，就能在「问数据」里直接提问，不用自己写 SQL"
+          hint="接一个数据库、或者传一个 Excel / CSV，就能在「问数据」里直接提问，不用自己写 SQL"
         />
       ) : (
         <div className="space-y-2">
@@ -68,7 +74,141 @@ export function DataSourcesTab() {
           onSaved={async () => { setEditing(null); await load() }}
         />
       )}
+
+      {uploading && (
+        <TableUploader onClose={() => setUploading(false)}
+                       onDone={async () => { setUploading(false); await load() }} />
+      )}
     </div>
+  )
+}
+
+
+/**
+ * 传一个 Excel / CSV，变成可以用 SQL 查的表。
+ *
+ * 为什么不传进知识库：那条路只能把表格切块检索，数字就成了模型从片段里
+ * "读"出来的。而这个项目的地基是"所有算术下沉到 SQL 或口径卡"——表格必须
+ * 变成表，数字才是算出来的、才追溯得到是哪条查询。
+ */
+function TableUploader({ onClose, onDone }: {
+  onClose: () => void; onDone: () => void | Promise<void>
+}) {
+  const toast = useToast()
+  const [file, setFile] = useState<File | null>(null)
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [headerRow, setHeaderRow] = useState(1)
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<any>(null)
+
+  const pick = (f: File | null) => {
+    setFile(f)
+    setResult(null)
+    // 拿文件名当默认数据源名。它会变成工具名的一部分，所以只留 ASCII；
+    // 中文文件名清洗完可能什么都不剩，那就让用户自己填
+    if (f && !name) {
+      const stem = f.name.replace(/\.[^.]+$/, '')
+      const slug = stem.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
+      setName(/^[a-z]/.test(slug) ? slug.slice(0, 40) : '')
+    }
+  }
+
+  const submit = async () => {
+    if (!file || !name) return
+    setBusy(true)
+    try {
+      const out = await api.datasources.uploadTable(file, {
+        name, description, header_row: headerRow,
+      })
+      setResult(out)
+      toast(out.replaced ? `已替换「${name}」里的数据` : `已建好数据源「${name}」`, 'ok')
+      await onDone()
+    } catch (e: any) {
+      toast(e.message ?? '导入失败', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="传表格"
+      footer={
+        <>
+          <button className="btn" onClick={onClose}>{result ? '完成' : '取消'}</button>
+          <button className="btn btn-primary" onClick={submit}
+                  disabled={busy || !file || !name}>
+            {busy ? <Spinner /> : <Upload size={12} />} 导入
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <div>
+          <label className="label">文件</label>
+          <input type="file" className="field" accept=".xlsx,.xlsm,.csv,.tsv"
+                 onChange={(e) => pick(e.target.files?.[0] ?? null)} />
+          <p className="mt-1 text-[10.5px] text-faint">
+            Excel（.xlsx）或 CSV / TSV。每个工作表变成一张表。
+            .xls 和 .ppt 一样是老的二进制格式，请先另存为 .xlsx
+          </p>
+        </div>
+
+        <div className="flex gap-2">
+          <div className="flex-1">
+            <label className="label">数据源名</label>
+            <input className="field" value={name} placeholder="sales"
+                   onChange={(e) => setName(e.target.value)} />
+            <p className="mt-1 text-[10.5px] text-faint">
+              会成为工具名的一部分（db_query__{name || 'sales'}），只能用小写字母数字下划线
+            </p>
+          </div>
+          <div className="w-28">
+            <label className="label">表头在第几行</label>
+            <input className="field" type="number" min={1} value={headerRow}
+                   onChange={(e) => setHeaderRow(Math.max(1, Number(e.target.value) || 1))} />
+          </div>
+        </div>
+
+        <div>
+          <label className="label">说明（给 Copilot 看）</label>
+          <input className="field" value={description} placeholder="2026 年各月销售明细"
+                 onChange={(e) => setDescription(e.target.value)} />
+        </div>
+
+        {/* 推断出的列名和类型要当场回显。表头行取错了（比如文件前两行是标题），
+            列名会变成一行数据——不给看的话，这个错要等到有人发现汇总一直
+            少一行才暴露 */}
+        {result && (
+          <div className="rounded-lg border bg-panel p-2 text-[11px]">
+            <div className="mb-1.5 text-dim">
+              {result.replaced ? '已替换' : '已导入'} {result.tables.length} 张表
+              ——对一眼列名，不对就改上面的表头行号重传
+            </div>
+            {result.tables.map((t: any) => (
+              <div key={t.name} className="mb-1.5">
+                <div className="mono text-[10.5px] text-dim">
+                  {t.name}
+                  {t.sheet !== t.name && <span className="text-faint">（{t.sheet}）</span>}
+                  <span className="text-faint"> · {t.rows} 行</span>
+                </div>
+                <div className="flex flex-wrap gap-1 pt-0.5">
+                  {t.columns.map((c: any) => (
+                    <span key={c.name} className="chip">
+                      {c.name}
+                      <span className="text-faint"> {c.type}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
   )
 }
 

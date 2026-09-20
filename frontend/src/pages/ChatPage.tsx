@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Database, ListTree, MessageSquare, Play, Send, Square } from 'lucide-react'
+import { Database, ListTree, MessageSquare, Play, RotateCw, Send, Square } from 'lucide-react'
 import { api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantStream'
@@ -26,7 +26,7 @@ import { useToast } from '../components/ui'
  * dense 一个开关。两边各写一套的话，同一次运行在两个页面会讲出不同的故事。
  */
 export function ChatPage() {
-  const { busy, ask, stop, load, loadSteps, runNow, turnsOf } = useChat()
+  const { busy, ask, stop, load, loadSteps, runNow, continueTurn, turnsOf } = useChat()
   const { conversationId } = useParams()
   const navigate = useNavigate()
   const currentId = useConversations((s) => s.currentId)
@@ -108,6 +108,13 @@ export function ChatPage() {
             onShowSteps={
               currentId && turnsOf(currentId).find((x) => x.id === t.id)?.restored
                 ? () => void loadSteps(currentId, t.id)
+                : undefined
+            }
+            onContinue={
+              // 只在"跑到一半挂了"时出现：建图阶段就失败的那些没有 run，
+              // 没有断点可续，给个按钮只会让人白点一次
+              currentId && t.phase === 'error' && t.runId
+                ? () => continueTurn(currentId, t.id)
                 : undefined
             }
             onRun={
@@ -200,20 +207,31 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
  * 从库里恢复的轮次没有事件流——一次会话几十轮，把每轮的事件都预加载回来
  * 是几十个请求换一堆没人看的步骤。所以默认只显示问题和答案，想看过程再取。
  */
-function Approvals({ turnId, runId, onShowSteps, onRun }: {
+function Approvals({ turnId, runId, onShowSteps, onRun, onContinue }: {
   turnId: string
   runId?: string
   onShowSteps?: () => void
   onRun?: () => void
+  onContinue?: () => void | Promise<void>
 }) {
   const conversationId = useConversations((s) => s.currentId)
   const approvals = useCatalog((s) => s.approvals)
   const reattach = useChat((s) => s.reattach)
+  const busy = useChat((s) => s.busy)
   const pending = approvals.filter((a) => a.run_id === runId && a.status === 'pending')
 
   if (!runId && !onRun) return null
   return (
     <>
+      {onContinue && (
+        // 跑挂了不该只剩一行红字。断点一直在 checkpoint 里躺着，前面查过的表、
+        // 跑过的 SQL 都还在——重问一遍等于让它们全部重来
+        <button className="btn btn-xs mt-2 gap-1 text-[11px]" disabled={busy}
+                onClick={() => void onContinue()}
+                title="用原来的配置重试失败的那一步，前面跑过的节点不重来。要改配置请到画布上改">
+          <RotateCw size={11} /> 接着跑
+        </button>
+      )}
       {onRun && (
         <button className="btn btn-xs btn-primary mt-2 gap-1 text-[11px]" onClick={onRun}>
           <Play size={11} /> 跑一下

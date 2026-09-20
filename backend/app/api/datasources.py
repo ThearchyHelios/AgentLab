@@ -8,11 +8,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import introspect as introspect_mod
 from app.data.engine import SUPPORTED_KINDS, engines, test_connection
@@ -205,4 +206,112 @@ async def get_schema(source_id: str, table: str | None = None,
         "tables": introspect_mod.table_names(row),
         "summary": introspect_mod.summary(row),
         "synced_at": row.schema_synced_at.isoformat() if row.schema_synced_at else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# 上传表格
+# --------------------------------------------------------------------------
+
+
+@router.post("/upload", response_model=dict, status_code=201)
+async def upload_table(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    description: str = Form(""),
+    header_row: int = Form(1),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """把 Excel / CSV 变成一个可以用 SQL 查的数据源。
+
+    走 SQLite：落成一个 .db 文件，再建一条 kind='sqlite' 的数据源指过去。
+    下游一行都不用改——SQL 守卫、结构探查、db_query__<name> 工具、查询快照进
+    工件库、Copilot 的数据源清单，全都白拿。
+
+    这条路存在的理由不是"多支持一种格式"：表格传进知识库只能被切块检索，
+    数字就成了模型从片段里读出来的，而这个项目的地基是"所有算术下沉到
+    SQL 或口径卡"。表格必须变成表。
+
+    **同名就地替换**，不新建。数据源名字会成为工具名（db_query__sales），
+    而工具名写进了保存过的工作流——重传时另起一个 sales_2 等于悄悄让那些图失效。
+    """
+    import re as _re
+
+    if not _re.match(_NAME_PATTERN, name or ""):
+        raise HTTPException(
+            400, "名字只能用小写字母开头的字母数字下划线——它会成为工具名的一部分"
+        )
+
+    # 边读边数，超了立刻停。和知识库上传同一套：那个检查拦的是"入库"，
+    # 不是"占内存"，读完再判等于先把内存吃掉
+    limit = settings.max_upload_mb * 1024 * 1024
+    pieces: list[bytes] = []
+    total = 0
+    while piece := await file.read(1024 * 1024):
+        total += len(piece)
+        if total > limit:
+            raise HTTPException(413, f"文件超过 {settings.max_upload_mb}MB")
+        pieces.append(piece)
+    raw = b"".join(pieces)
+
+    tables_dir = settings.uploads_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    db_path = tables_dir / f"{name}.db"
+
+    from app.data.tabular import UnsupportedTable, load_into
+
+    existing = (await session.execute(
+        select(DataSource).where(DataSource.name == name)
+    )).scalar_one_or_none()
+    if existing and existing.kind != "sqlite":
+        raise HTTPException(
+            409, f"已经有一个叫 {name} 的数据源了，而且它不是上传来的表格。换个名字。"
+        )
+
+    try:
+        report = load_into(str(db_path), raw, file.filename or name, header_row=header_row)
+    except UnsupportedTable as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"导入失败：{type(e).__name__}: {e}") from e
+
+    row = existing
+    if row is None:
+        row = DataSource(
+            name=name, kind="sqlite", database=str(db_path),
+            readonly=True, description=description,
+        )
+        session.add(row)
+    else:
+        row.database = str(db_path)
+        if description:
+            row.description = description
+        # 换了文件内容，缓存的连接还指着旧的那个 engine
+        await engines.invalidate(row.id)
+
+    await session.flush()
+    # 建完立刻探查：不探的话 db_query 工具的 description 里没有表清单，
+    # 模型得先花一步去问"有哪些表"
+    try:
+        row.schema_cache = await introspect_mod.introspect(row)
+        row.schema_synced_at = datetime.now(timezone.utc)
+    except Exception:  # noqa: BLE001 - 探查失败不该让导入白做，用户可以手动再探
+        pass
+    await session.commit()
+    await session.refresh(row)
+
+    return {
+        "source": _to_out(row).model_dump(),
+        "replaced": existing is not None,
+        # 推断出的列名和类型原样回显：表头行取错了（比如文件前两行是标题），
+        # 这里当场就能看出来——列名会变成一行数据
+        "tables": [
+            {
+                "name": t.name, "sheet": t.source_name, "rows": t.rows,
+                "columns": [
+                    {"name": c, "type": ty} for c, ty in zip(t.columns, t.types)
+                ],
+            }
+            for t in report.tables
+        ],
     }

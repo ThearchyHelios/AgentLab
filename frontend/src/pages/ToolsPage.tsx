@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { Play, Plug, Plus, RefreshCw, Terminal, Trash2, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -8,19 +9,21 @@ import type { ToolInfo } from '../types'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
 const TABS = [
-  { key: 'tools', label: '工具库' },
+  // key 是 URL 的一段。叫 tools 的话地址会变成 /tools/tools/<id>，
+  // 读起来像敲重了。这个 URL 今天才上线，改的代价最小
+  { key: 'library', label: '工具库' },
   { key: 'sandbox', label: '沙箱试验台' },
   { key: 'custom', label: '自定义工具' },
   { key: 'mcp', label: 'MCP 接入' },
 ]
 
 export function ToolsPage() {
-  const [tab, setTab] = useTabRoute(TABS.map((t) => t.key), 'tools')
+  const [tab, setTab] = useTabRoute(TABS.map((t) => t.key), 'library')
   return (
     <div className="flex h-full flex-col">
       <Tabs tabs={TABS} active={tab} onChange={setTab} />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {tab === 'tools' && <ToolLibrary />}
+        {tab === 'library' && <ToolLibrary />}
         {tab === 'sandbox' && <SandboxLab />}
         {tab === 'custom' && <CustomTools />}
         {tab === 'mcp' && <McpServers />}
@@ -33,11 +36,20 @@ export function ToolsPage() {
 
 function ToolLibrary() {
   const tools = useCatalog((s) => s.tools)
-  const [picked, setPicked] = useState<ToolInfo | null>(null)
+  const { id } = useParams()
+  const navigate = useNavigate()
   const [args, setArgs] = useState<any>({})
   const [result, setResult] = useState<any>(null)
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
+
+  // 选中哪个由地址说了算：这样一个工具的参数说明可以直接发给别人
+  const picked = tools.find((t) => t.id === id) ?? null
+  const pick = (tool: ToolInfo) => {
+    setArgs({})
+    setResult(null)
+    navigate(`/tools/library/${tool.id}`)
+  }
 
   const run = async () => {
     if (!picked) return
@@ -71,7 +83,7 @@ function ToolLibrary() {
               {shown.filter((t) => t.category === g).map((t) => (
                 <button
                   key={t.id}
-                  onClick={() => { setPicked(t); setArgs({}); setResult(null) }}
+                  onClick={() => pick(t)}
                   className={clsx(
                     'w-full rounded px-2 py-1.5 text-left hover:bg-hover',
                     picked?.id === t.id && 'bg-hover',

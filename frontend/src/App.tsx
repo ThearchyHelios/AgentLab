@@ -90,8 +90,10 @@ export default function App() {
           <Route path="/runs/:runId" element={<RunsPage />} />
           <Route path="/tools" element={<ToolsPage />} />
           <Route path="/tools/:tab" element={<ToolsPage />} />
+          <Route path="/tools/:tab/:id" element={<ToolsPage />} />
           <Route path="/knowledge" element={<KnowledgePage />} />
           <Route path="/knowledge/:tab" element={<KnowledgePage />} />
+          <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/settings/:tab" element={<SettingsPage />} />
         </Routes>

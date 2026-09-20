@@ -390,6 +390,41 @@ console.log('\n=== URL 指得到 ===')
   }
 
   {
+    // 单个文档 / 单个工具也要能指。文档那边原来连详情视图都没有——
+    // 列表里只有标题和片段数，点不开，而切块结果（重叠、表头续接）
+    // 是检索不准时第一个该看的东西
+    const docs = await (await fetch(`${API}/kb/documents`)).json()
+    const ready = docs.find((d) => d.status !== 'processing' && d.chunk_count > 0)
+    if (ready) {
+      const { page } = await visit(`/knowledge/kb/${ready.id}`)
+      const body = await page.locator('body').innerText()
+      check('深链接直达那份文档', body.includes(ready.title), ready.title)
+      check('看得到切块结果', /片段 \d+/.test(body) && /\d+ 字/.test(body),
+            body.slice(0, 120).replace(/\n/g, ' '))
+      check('回得去列表', (await page.getByRole('button', { name: /回到知识库/ }).count()) === 1)
+      await page.close()
+
+      const gone = await visit('/knowledge/kb/根本没这份文档')
+      const goneBody = await gone.page.locator('body').innerText()
+      check('文档不在了要说出来而不是白屏', goneBody.includes('不在了'),
+            goneBody.slice(-120).replace(/\n/g, ' '))
+      await gone.page.close()
+    } else {
+      check('（跳过：库里没有切完块的文档）', true)
+    }
+
+    const tools = await (await fetch(`${API}/tools`)).json()
+    if (tools.length) {
+      const t = tools[0]
+      const { page } = await visit(`/tools/library/${t.id}`)
+      const body = await page.locator('body').innerText()
+      check('深链接直达那个工具', body.includes(t.name), t.name)
+      check('参数说明跟着出来', body.includes('参数'), '')
+      await page.close()
+    }
+  }
+
+  {
     // 运行列表只取前 100 条，而一条老运行的链接必须也能打开——
     // 所以详情是按 id 直接取的，不是在列表里找
     const all = await (await fetch(`${API}/runs?limit=200`)).json()

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { BookOpen, Brain, Plus, Search, Sparkles, Trash2, Upload } from 'lucide-react'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
@@ -196,7 +197,100 @@ function EmbedderBar({ collection, onChanged }: {
 // -------------------------------------------------------------------------
 
 function KbTab() {
+  // 地址上带了文档 id 就看那一份的详情。集合是筛选条件不是位置，所以不进 URL
+  const { id } = useParams()
+  if (id) return <DocDetail docId={id} />
+  return <KbList />
+}
+
+
+/**
+ * 一份文档被切成了什么样。
+ *
+ * 切块这一层做了不少事——按行边界留重叠、跨块把表头续上（后端 memory/kb.py
+ * 的 chunk_text），而在此之前结果在界面上一处都看不见。检索不准的时候第一个
+ * 该看的就是它：表头有没有续上、重叠对不对、哪一段被截断了。
+ */
+function DocDetail({ docId }: { docId: string }) {
+  const navigate = useNavigate()
+  const [data, setData] = useState<any>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let live = true
+    void api.kb.document(docId)
+      .then((d) => { if (live) setData(d) })
+      .catch((e) => { if (live) setError(e?.message ?? '取不到这份文档') })
+    return () => { live = false }
+  }, [docId])
+
+  if (error) {
+    return (
+      <div className="p-4">
+        <button className="btn btn-sm mb-3" onClick={() => navigate('/knowledge/kb')}>
+          ← 回到知识库
+        </button>
+        <Empty icon={<BookOpen size={22} />} title="这份文档不在了" hint={error} />
+      </div>
+    )
+  }
+  if (!data) return <div className="p-4 text-[12px] text-faint"><Spinner size={12} /> 正在取…</div>
+
+  const doc = data.document
+  // 一份文档里混着两个模型建的向量是真会发生的（换模型之后只重建了一部分），
+  // 而那会让检索对这部分内容悄悄退回关键词
+  const models = [...new Set(data.chunks.map((c: any) => c.embed_model).filter(Boolean))]
+  const noVector = data.chunks.filter((c: any) => !c.has_vector).length
+
+  return (
+    <div className="mx-auto max-w-3xl p-4">
+      <button className="btn btn-sm mb-3" onClick={() => navigate('/knowledge/kb')}>
+        ← 回到知识库
+      </button>
+
+      <div className="mb-1 text-sm font-semibold">{doc.title}</div>
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px] text-faint">
+        <span className="chip">{doc.collection}</span>
+        <span>{doc.source}</span>
+        <span>{data.chunks.length} 个片段</span>
+        {models.map((m: any) => <span key={m} className="mono chip">{m}</span>)}
+        {models.length > 1 && (
+          <span style={{ color: 'var(--warn)' }}>
+            这份文档里混着两个模型建的向量，对不上当前模型的那些会退回关键词检索
+          </span>
+        )}
+        {noVector > 0 && (
+          <span style={{ color: 'var(--warn)' }}>{noVector} 段还没有向量</span>
+        )}
+      </div>
+
+      {!data.chunks.length && (
+        <Empty icon={<BookOpen size={20} />} title="还没有切块"
+               hint={doc.status === 'processing' ? '正在处理，稍后刷新' : doc.error || '这份文档没有产生任何片段'} />
+      )}
+
+      <div className="space-y-2">
+        {data.chunks.map((c: any) => (
+          <div key={c.id} className="rounded-lg border bg-panel p-2.5">
+            <div className="mb-1 flex items-center gap-2 text-[10.5px] text-faint">
+              <span className="font-medium text-dim">片段 {c.ordinal}</span>
+              <span>{c.chars} 字</span>
+              {c.token_len > 0 && <span>{c.token_len} tokens</span>}
+              {!c.has_vector && <span style={{ color: 'var(--warn)' }}>没有向量</span>}
+              {c.truncated && <span className="ml-auto">（这里只显示开头一部分）</span>}
+            </div>
+            <div className="whitespace-pre-wrap text-[11.5px] leading-relaxed">{c.content}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+
+function KbList() {
   const toast = useToast()
+  const navigate = useNavigate()
   const refreshCatalog = useCatalog((s) => s.refresh)
   const [collection, setCollection] = useState('default')
   const [collections, setCollections] = useState<any[]>([])
@@ -316,7 +410,9 @@ function KbTab() {
       <div className="space-y-1.5">
         {docs.map((doc) => (
           <div key={doc.id} className="flex items-center gap-3 rounded-lg border bg-panel px-3 py-2">
-            <div className="min-w-0 flex-1">
+            <button className="min-w-0 flex-1 text-left"
+                    onClick={() => navigate(`/knowledge/kb/${doc.id}`)}
+                    title="看看它被切成了什么样">
               <div className="flex items-center gap-1.5">
                 {doc.status === 'processing' && <Spinner size={11} />}
                 <span className="truncate text-[12px]">{doc.title}</span>
@@ -331,7 +427,7 @@ function KbTab() {
                     ? <span style={{ color: 'var(--err)' }}>处理失败：{doc.error}</span>
                     : `${doc.source} · ${doc.chunk_count} 个片段`}
               </div>
-            </div>
+            </button>
             <button className="btn btn-sm btn-ghost" onClick={async () => {
               if (!confirm(`删除「${doc.title}」？`)) return
               await api.kb.remove(doc.id); await load(); await refreshCatalog()
