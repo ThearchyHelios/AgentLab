@@ -70,6 +70,7 @@ class TurnPatch(BaseModel):
     run_id: str | None = None
     status: str | None = Field(default=None, pattern="^(running|done|error)$")
     error: str | None = None
+    review: dict[str, Any] | None = None
 
 
 class TurnOut(BaseModel):
@@ -82,6 +83,8 @@ class TurnOut(BaseModel):
     run_id: str | None = None
     status: str
     error: str
+    #: 复核结论。None = 这一轮没复核过，和「复核过、没发现问题」不是一回事
+    review: dict[str, Any] | None = None
     created_at: Any = None
 
     model_config = {"from_attributes": True}
@@ -286,7 +289,9 @@ async def patch_turn(
     if not turn or turn.conversation_id != conversation_id:
         raise HTTPException(404, f"轮次 {turn_id} 不存在")
 
-    for field in ("question", "answer", "explanation", "graph", "run_id", "status", "error"):
+    for field in (
+        "question", "answer", "explanation", "graph", "run_id", "status", "error", "review",
+    ):
         value = getattr(payload, field)
         if value is not None:
             setattr(turn, field, value)
@@ -310,7 +315,12 @@ def _answer_of(turn: ConversationTurn) -> str:
     if turn.status == "error" and turn.error:
         return f"（这一轮失败了：{turn.error[:200]}）"
     if len(text) > HISTORY_ANSWER_CHARS:
-        return text[:HISTORY_ANSWER_CHARS] + "…（略）"
+        text = text[:HISTORY_ANSWER_CHARS] + "…（略）"
+    # 复核判过不可信的答案，下一轮必须知道。只给正文的话，模型会拿一个已知
+    # 有问题的结论当事实继续往下推，错误就这么一轮轮传下去了
+    note = (turn.review or {}).get("note", "") if isinstance(turn.review, dict) else ""
+    if note:
+        text = f"{text}\n（复核提示：{note[:200]}）".strip()
     return text
 
 

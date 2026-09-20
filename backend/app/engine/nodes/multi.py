@@ -162,7 +162,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
                     if fix_note:
                         ctx.emit(EventType.LOG, level="warn",
-                                 message=f"工具 {tname}：{fix_note}")
+                                 message=f"工具 {tname}：{fix_note}", code="tool_args_fixed")
                     if args_error:
                         # 参数就不对，没必要真调一次。把"它接受什么"喂回去让它改
                         content = args_error

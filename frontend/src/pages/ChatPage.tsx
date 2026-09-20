@@ -149,6 +149,8 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     graph: turn.graph,
     graphNote: turn.explanation,
     noQuery: turn.noQuery,
+    review: turn.review,
+    rawOutput: turn.rawOutput,
   }
 }
 

@@ -155,6 +155,42 @@ console.log('\n=== 没查库的那一轮 ===')
   await page.close()
 }
 
+console.log('\n=== 复核说明 ===')
+{
+  // 「跑完了」和「答得对」是两回事。复核说明必须排在成果**上方**——排在下面
+  // 等于让人读完整个结论、信了，才知道它是在什么条件下得出的
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
+  await page.goto(`${WEB}/preview.html?review=1`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+  const body = await page.locator('body').innerText()
+
+  check('说破了取数没跑通', body.includes('取数没跑通'))
+  check('说明排在结论前面',
+        body.indexOf('取数没跑通') < body.indexOf('大约 5 个'),
+        `说明@${body.indexOf('取数没跑通')} 结论@${body.indexOf('大约 5 个')}`)
+  check('答案本身照常渲染', body.includes('大约 5 个'))
+  check('异常清单默认收起', !body.includes('no such table'))
+  check('数得出有几处异常', body.includes('检测到 2 处异常'))
+
+  // broken 用报警色，degraded 用普通边框。混成一个样子，用户就学会了一概忽略
+  const colors = await page.evaluate(() => {
+    const err = getComputedStyle(document.documentElement).getPropertyValue('--err').trim()
+    const hit = [...document.querySelectorAll('div[style*="border-color"]')]
+      .map((el) => getComputedStyle(el).borderTopColor)
+    return { err, hit }
+  })
+  check('两档复核长得不一样', new Set(colors.hit).size > 1, colors.hit.join(' / '))
+
+  // 改写是有损的，原件得留着能对照
+  check('改写前的原文可以展开', body.includes('看改写前的原文'))
+  check('原文默认不占地方', !body.includes('平台管理员可以修改他人权限。\n'))
+
+  const overflow = await page.evaluate(() =>
+    document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('页面不横向溢出', overflow <= 0, `${overflow}px`)
+  await page.close()
+}
+
 console.log('\n=== 空态 ===')
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })

@@ -170,7 +170,8 @@ async def _invoke_streaming(
         response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"流式失败，回退非流式：{explain_model_error(e, model_id)}")
+                 message=f"流式失败，回退非流式：{explain_model_error(e, model_id)}",
+                 code="stream_fallback")
         try:
             response = await model.ainvoke(messages)
         except Exception as retry_error:  # noqa: BLE001
@@ -240,7 +241,8 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if not text and reasoning:
             # 思考型模型把额度全花在推理上了，正文是空的 —— 说清楚而不是抛个空结果给下游
             ctx.emit(EventType.LOG, level="warn",
-                     message="模型只输出了思考内容，正文为空。把 max_tokens 调大，或把 thinking 设为 off。")
+                     message="模型只输出了思考内容，正文为空。把 max_tokens 调大，或把 thinking 设为 off。",
+                     code="empty_completion")
         output = {"text": text, "thinking": reasoning}
 
     usage = _usage_of(response, model_id)
@@ -400,7 +402,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     continue
                 if fix_note:
                     ctx.emit(EventType.LOG, level="warn",
-                             message=f"工具 {name}：{fix_note}")
+                             message=f"工具 {name}：{fix_note}", code="tool_args_fixed")
 
             if _needs_approval(ctx, name):
                 ctx.emit(
@@ -494,7 +496,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
         # 一个没头没尾的答案，而不知道是被步数掐断的
         final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
-        ctx.emit(EventType.LOG, level="warn", message=hint)
+        ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit")
 
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {

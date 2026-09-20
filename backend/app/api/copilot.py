@@ -994,3 +994,69 @@ def _extract_json(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
     raise ValueError("模型输出里找不到 JSON")
+
+
+# --------------------------------------------------------------------------
+# 跑完之后的复核
+# --------------------------------------------------------------------------
+
+
+class ReviewIn(BaseModel):
+    run_id: str = Field(min_length=1, description="要复核哪次运行")
+    question: str = Field(default="", description="用户原本问的是什么")
+    provider: str | None = None
+    model: str | None = None
+    #: 默认只在扫出异常信号时才叫模型。打开它就每次都复核——排查时有用，
+    #: 平时不开：干净的运行没什么可复核的，代价却是每次问数都多一次调用
+    always: bool = False
+
+
+@router.post("/review")
+async def review_run(
+    payload: ReviewIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """接住一次编排的产出，判断它能不能就这么交给用户。
+
+    「跑完了」和「答得对」是两回事。运行状态只说明流程走完了，而过程中检索
+    降级、工具报错、agent 步数用满这些事，原先一件都不会进到答案里——用户拿到
+    一个看起来很完整的结论，却无从知道它是在什么条件下得出的。
+
+    规则层先扫一遍（engine/review.py:scan），没扫出东西就到此为止、直接返回，
+    不花一次模型调用；扫出来了才叫模型重组答案并把异常说破。
+    """
+    from app.db.models import Run, RunEvent
+    from app.engine import review as rv
+
+    run = await session.get(Run, payload.run_id)
+    if not run:
+        raise HTTPException(404, f"运行 {payload.run_id} 不存在")
+
+    rows = list((await session.execute(
+        select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)
+    )).scalars())
+
+    output = run.output if isinstance(run.output, dict) else None
+    signals = rv.scan(rows, output)
+    answer = rv.answer_text(output)
+
+    if not signals and not payload.always:
+        return rv.ReviewResult(verdict="ok", signals=[]).as_dict()
+
+    try:
+        spec = await copilot_model_spec(session, GenerateIn(
+            instruction="review", provider=payload.provider, model=payload.model,
+        ), max_tokens=4096)
+        model, _ = await get_chat_model(session, spec)
+    except (ProviderNotConfigured, HTTPException) as e:
+        # 没配模型不该让这一轮挂掉：规则层已经知道出了什么事，照样说得出话
+        return rv.ReviewResult(
+            verdict="annotated",
+            note="；".join(s.detail for s in signals) or str(e),
+            retry=rv.should_retry(signals),
+            signals=signals, severity=rv.worst(signals),
+        ).as_dict()
+
+    result = await rv.review(
+        model, question=payload.question, answer=answer, signals=signals
+    )
+    return result.as_dict()

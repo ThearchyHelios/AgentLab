@@ -423,5 +423,9 @@ class ConversationTurn(Base, TimestampMixin):
     # running | done | error
     status: Mapped[str] = mapped_column(String(20), default="running")
     error: Mapped[str] = mapped_column(Text, default="")
+    # 跑完之后的复核结论（engine/review.py）：判定档位、给用户的异常说明、
+    # 命中的信号清单。落库是因为它是答案的一部分——刷新页面后只剩一个
+    # 看起来很完整的答案、而"它哪里不可靠"没了，比不复核更糟
+    review: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     conversation: Mapped[Conversation] = relationship(back_populates="turns")

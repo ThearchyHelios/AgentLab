@@ -156,7 +156,7 @@ async def run_loop(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if hit_limit:
         ctx.emit(
             EventType.LOG, level="warn",
-            message=f"循环达到上限 {max_iter} 次，强制退出",
+            message=f"循环达到上限 {max_iter} 次，强制退出", code="loop_limit",
         )
 
     decision = "body" if keep_going else "done"

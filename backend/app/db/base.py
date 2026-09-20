@@ -84,6 +84,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("chunks", "token_len", "INTEGER DEFAULT 0"),
     ("documents", "status", "TEXT DEFAULT 'ready'"),
     ("documents", "error", "TEXT DEFAULT ''"),
+    # 存量轮次没有复核结论。NULL 正好表示"这一轮没复核过"，和"复核过、没问题"
+    # （存 verdict=ok）是两回事，前端要分得开
+    ("conversation_turns", "review", "JSON"),
 ]
 
 

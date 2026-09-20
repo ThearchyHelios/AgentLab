@@ -222,5 +222,36 @@ export interface ConversationTurn {
   run_id?: string | null
   status: 'running' | 'done' | 'error'
   error: string
+  /** 复核结论。null = 这一轮没复核过，和「复核过、没发现问题」不是一回事 */
+  review?: ReviewResult | null
   created_at?: string
+}
+
+/**
+ * 一次运行跑完之后的复核结论（后端 engine/review.py）。
+ *
+ * 「跑完了」和「答得对」是两回事：检索降级、工具报错、agent 步数用满这些事
+ * 原先一件都不会进到答案里，用户拿到一个看起来很完整的结论，却无从知道它是在
+ * 什么条件下得出的。复核层就是把这段补上。
+ */
+export interface ReviewSignal {
+  kind: string
+  detail: string
+  /** broken = 答案不可信；degraded = 能用但有缺口 */
+  severity: 'broken' | 'degraded'
+}
+
+export interface ReviewResult {
+  /** ok=没问题 / annotated=加了说明 / rewritten=重写过 / reverted=重写里有新数字被退回 */
+  verdict: 'ok' | 'annotated' | 'rewritten' | 'reverted'
+  /** 给用户看的异常说明。排在成果上方 */
+  note: string
+  /** 重写后的答案。null 表示沿用原答案 */
+  answer: string | null
+  /** 改写之前的那份。改写是有损的，得能对照原件 */
+  original?: string | null
+  /** 换个配置重跑一遍大概率就好了 */
+  retry: boolean
+  severity: 'broken' | 'degraded' | ''
+  signals: ReviewSignal[]
 }

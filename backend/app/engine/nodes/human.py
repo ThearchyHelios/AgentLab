@@ -127,7 +127,8 @@ async def run_validate(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 path = "/".join(str(p) for p in e.absolute_path) or "(根)"
                 errors = [f"{path}: {e.message}"]
 
-        ctx.emit(EventType.LOG, level="warn", message=f"第 {attempt + 1} 次校验失败：{errors[0]}")
+        ctx.emit(EventType.LOG, level="warn", message=f"第 {attempt + 1} 次校验失败：{errors[0]}",
+                 code="validate_retry")
         attempt += 1
         if attempt > max_retries or not repair:
             break

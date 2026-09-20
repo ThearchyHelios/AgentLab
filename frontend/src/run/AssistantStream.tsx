@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  Brain, ChevronRight, CircleCheck, CircleDot, Database,
+  AlertTriangle, Brain, ChevronRight, CircleCheck, CircleDot, Database,
   FileCode, GitBranch, Hand, Info, Sparkles, Table2, Terminal, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -9,6 +9,7 @@ import {
   parseQueryResult, type ResultTable as Table, type Step, type StepKind,
 } from './decode'
 import { Markdown } from './Markdown'
+import type { ReviewResult } from '../types'
 
 /**
  * 助手流：一轮轮「你问什么 → 它做了什么 → 结果」。
@@ -42,6 +43,10 @@ export interface StreamTurn {
   graphNote?: string
   /** 这一条没有查库，答案是根据前几轮说的 */
   noQuery?: boolean
+  /** 复核结论：这次运行有什么不对，以及对这个答案意味着什么 */
+  review?: ReviewResult | null
+  /** 被复核重写之前的答案。改写是有损的，得能对照原件 */
+  rawOutput?: Record<string, any> | null
 }
 
 const ICONS: Record<StepKind, typeof Wrench> = {
@@ -156,8 +161,23 @@ function TurnCard({ turn, dense, approvals, onOpenGraph }: {
           </div>
         )}
 
+        {/* 复核说明排在成果**上方**，和上面那条声明同一个位置。排在下面
+            等于让人读完整个结论、信了，才知道它是在什么条件下得出的 */}
+        {turn.review && <ReviewNote review={turn.review} />}
+
         {turn.output && (
           <Output output={turn.output} dense={dense} runClass={turn.runClass} />
+        )}
+
+        {turn.rawOutput && (
+          <details className="mt-1.5">
+            <summary className="cursor-pointer text-[10.5px] text-faint hover:text-dim">
+              复核改写过这个答案，看改写前的原文
+            </summary>
+            <div className="mt-1.5">
+              <Output output={turn.rawOutput} dense={dense} />
+            </div>
+          </details>
         )}
 
         {turn.graph && (
@@ -165,6 +185,41 @@ function TurnCard({ turn, dense, approvals, onOpenGraph }: {
                      dense={dense} onOpen={onOpenGraph} />
         )}
       </div>
+    </div>
+  )
+}
+
+/**
+ * 这次运行有什么不对。
+ *
+ * broken 用报警色：那意味着答案本身不可信，不是"仅供参考"。degraded 用普通
+ * 边框——它能用，只是有缺口。两者混成一个样子，用户就学会了一概忽略。
+ */
+function ReviewNote({ review }: { review: ReviewResult }) {
+  const broken = review.severity === 'broken'
+  const Icon = broken ? AlertTriangle : Info
+  return (
+    <div className="mt-2 rounded border px-2 py-1.5 text-[10.5px] leading-relaxed"
+         style={{
+           borderColor: broken ? 'var(--err)' : 'var(--border)',
+           color: broken ? 'var(--err)' : 'var(--text-dim)',
+         }}>
+      <div className="flex items-start gap-1.5">
+        <Icon size={11} className="mt-[2px] shrink-0" />
+        <span className="whitespace-pre-wrap">{review.note}</span>
+      </div>
+      {!!review.signals.length && (
+        <details className="mt-1 pl-[17px]">
+          <summary className="cursor-pointer text-faint hover:text-dim">
+            检测到 {review.signals.length} 处异常
+          </summary>
+          <ul className="mt-1 space-y-0.5 text-faint">
+            {review.signals.map((s, i) => (
+              <li key={i}>· {s.detail}</li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   )
 }

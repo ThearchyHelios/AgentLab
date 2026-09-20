@@ -131,6 +131,7 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
                         EventType.LOG,
                         level="warn",
                         message=f"第 {attempt + 1} 次失败（{_describe(e)}），准备重试",
+                        code="node_retry",
                     )
                     await asyncio.sleep(backoff * (2**attempt))
                     continue

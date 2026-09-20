@@ -1,6 +1,6 @@
 import type {
   Approval, Conversation, ConversationDetail, ConversationTurn, GraphSpec,
-  KbDocument, MemoryItem, Provider, Run, RunEvent, Skill, ToolInfo,
+  KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, Skill, ToolInfo,
   ValidationIssue, VarIssue, Variable, Workflow,
 } from '../types'
 
@@ -258,6 +258,9 @@ export const api = {
     }>('/copilot/model'),
     setModel: (body: { provider?: string | null; model?: string | null }) =>
       put<any>('/copilot/model', body),
+    /** 跑完之后复核一次。干净的运行后端直接返回 verdict='ok'，不调模型 */
+    review: (body: { run_id: string; question: string }) =>
+      post<ReviewResult>('/copilot/review', body),
   },
 }
 

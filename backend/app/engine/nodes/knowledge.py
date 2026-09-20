@@ -123,7 +123,7 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         hits = hits[:limit]
     for note in degraded:
         # 检索悄悄少了一半能力，不说的话用户只会觉得"最近搜得不准"
-        ctx.emit(EventType.LOG, level="warn", message=note)
+        ctx.emit(EventType.LOG, level="warn", message=note, code="retrieve_degraded")
 
     min_score = float(ctx.cfg("min_score", 0.0) or 0.0)
     hits = [h for h in hits if h["score"] >= min_score]

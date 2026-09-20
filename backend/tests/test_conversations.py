@@ -157,6 +157,26 @@ async def test_history_text_is_plain_qa(client) -> None:
     assert "shop 里有几家店" in text and "一共 12 家" in text
 
 
+async def test_history_carries_the_review_warning_forward(client) -> None:
+    """被复核判过不可信的答案，下一轮必须知道。
+
+    只把正文喂过去的话，模型会拿一个已知有问题的结论当事实继续往下推
+    （"那 12 家里有几家是新开的？"），错误就这么一轮轮传下去，而且越传
+    越像真的——后面几轮看起来都在正常作答。
+    """
+    conv = await _conversation(client)
+    await _turn(
+        client, conv["id"], "shop 里有几家店",
+        answer="一共 12 家", status="done",
+        review={"verdict": "annotated", "severity": "broken", "note": "取数没跑通，这个数不可信。",
+                "answer": None, "retry": True, "signals": []},
+    )
+    async with SessionLocal() as session:
+        text = await history_text(session, conv["id"])
+    assert "一共 12 家" in text
+    assert "取数没跑通" in text
+
+
 async def test_history_text_is_empty_without_a_conversation(client) -> None:
     async with SessionLocal() as session:
         assert await history_text(session, None) == ""

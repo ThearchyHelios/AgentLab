@@ -60,7 +60,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 替它跑通了这一次，但节点配置里那个错的参数名原封不动，下次还会踩。
         # 所以纠正必须留一条看得见的痕迹，而不是安静地把事办了
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"工具 {name}：{note}。请到节点里改正。")
+                 message=f"工具 {name}：{note}。请到节点里改正。", code="tool_args_fixed")
 
     try:
         async with SessionLocal() as session:
@@ -154,13 +154,15 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if isolation == "strict" and result.backend != "microvm":
         # 要了硬件隔离却没拿到，必须说出来——否则用户以为自己在 VM 里跑
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"节点要求 strict 隔离，但 microVM 未就绪，实际用了 {result.backend}")
+                 message=f"节点要求 strict 隔离，但 microVM 未就绪，实际用了 {result.backend}",
+                 code="isolation_fallback")
     if result.session_reset:
         # 会话工作区被清空了。同一会话的下游节点会突然读不到自己写的文件，
         # 不说一声的话那个 FileNotFoundError 根本无从追查
         ctx.emit(EventType.LOG, level="warn",
                  message="沙箱会话已重置，此前在该会话写入的文件已丢失"
-                         "（多为超时重建，或同会话中各节点的内存限额不一致）")
+                         "（多为超时重建，或同会话中各节点的内存限额不一致）",
+                 code="sandbox_reset")
     ctx.emit(
         EventType.SANDBOX_END,
         ok=result.ok,

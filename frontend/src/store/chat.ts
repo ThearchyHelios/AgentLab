@@ -3,7 +3,7 @@ import { api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp } from '../run/decode'
 import { decodeRun } from '../run/decode'
 import { useConversations } from './conversations'
-import type { GraphSpec, Run, RunEvent } from '../types'
+import type { GraphSpec, ReviewResult, Run, RunEvent, ValidationIssue } from '../types'
 
 /**
  * 对话式入口的状态。
@@ -70,6 +70,13 @@ export interface ChatTurn {
   restored?: boolean
   /** 已经补取过事件（或正在取），别重复拉 */
   stepsLoaded?: boolean
+  /** 跑完之后的复核结论。null = 没复核过，和「复核过、没问题」不是一回事 */
+  review?: ReviewResult | null
+  /** 被复核重写之前的答案。改写是有损的，原件得留着让用户能对照 */
+  rawOutput?: Record<string, any> | null
+  /** 这一轮重建过几次图。上限 1——第二次还不行多半是问题本身没说清，
+   *  该让用户介入，而不是替他一遍遍烧钱 */
+  attempt?: number
 }
 
 interface ChatState {
@@ -111,6 +118,9 @@ const EMPTY: ChatTurn[] = []
 
 /** 落库成果的上限。只是防跑飞，不是显示上限 */
 const ANSWER_CAP = 20_000
+
+/** 等复核的上限。超了就先把原答案交出去，说明后补不了就算了 */
+const REVIEW_TIMEOUT_MS = 25_000
 
 type Patch = (fn: (t: ChatTurn) => Partial<ChatTurn>) => void
 
@@ -183,6 +193,10 @@ export const useChat = create<ChatState>((set, get) => ({
         cancel: null,
         restored: true,
         stepsLoaded: false,
+        // 复核结论是答案的一部分。刷新之后只剩一个看起来很完整的答案、
+        // 而"它哪里不可靠"没了，比一开始就不复核更糟
+        review: t.review && t.review.verdict !== 'ok' ? (t.review as ReviewResult) : null,
+        rawOutput: t.review?.original ? { answer: t.review.original } : null,
       }))
       set((s) => ({
         byConversation: { ...s.byConversation, [conversationId]: turns },
@@ -222,7 +236,7 @@ export const useChat = create<ChatState>((set, get) => ({
             id, serverId: null, question, phase: 'planning', status: PHASE_TEXT.planning,
             thinking: '', ops: [], events: [], graph: null, explanation: '',
             run: null, output: null, error: '', startedAt: Date.now(),
-            lastSeq: 0, cancel: null,
+            lastSeq: 0, cancel: null, attempt: 0,
           },
         ],
       },
@@ -244,94 +258,11 @@ export const useChat = create<ChatState>((set, get) => ({
       } catch { /* 存不下不该影响正在进行的对话 */ }
     }
 
-    const cancelCopilot = streamCopilot(
-      { instruction: question, base_graph: null, intent: 'answer', conversation_id: conversationId },
-      (op) => {
-        // 先原样收下，翻译交给 decodeCopilot。thinking 合并在写入时做：
-        // 一次生成几百上千条 delta，逐条存下来光数组就比图大一个量级
-        patch((t) => {
-          const last = t.ops[t.ops.length - 1]
-          if (op.op === 'thinking' && last?.op === 'thinking') {
-            const merged = { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }
-            return { ops: [...t.ops.slice(0, -1), merged] }
-          }
-          return { ops: [...t.ops, op] }
-        })
-
-        switch (op.op) {
-          case 'thinking':
-            patch((t) => ({
-              phase: 'planning',
-              thinking: (t.thinking + (op.delta ?? '')).slice(-2000),
-            }))
-            break
-          case 'heartbeat':
-            patch(() => ({ status: PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }))
-            break
-          case 'plan':
-            patch(() => ({ phase: 'building', status: op.summary || '正在搭建流程…' }))
-            break
-          case 'add_node':
-            patch((t) => ({
-              phase: 'building',
-              status: `正在搭建流程…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
-            }))
-            break
-          case 'done':
-            patch(() => ({ explanation: op.explanation ?? '' }))
-            break
-          case 'reply': {
-            // 这句话不需要工作流——问的是前几轮已经查出来的东西，或者是
-            // 对过程说的话（「重试」「换个说法」）。以前这些也各自重建一整张
-            // 图、跑一遍 153 张表的库，纯属白花钱
-            const text = String(op.text ?? '')
-            patch(() => ({
-              phase: 'done', status: PHASE_TEXT.done,
-              output: { answer: text }, noQuery: true,
-            }))
-            set({ busy: false, cancel: null })
-            void save({ status: 'done', answer: text })
-            break
-          }
-          case 'final': {
-            const graph = op.graph as GraphSpec
-            void save({ graph, explanation: op.explanation ?? '' })
-            // 用户要的是流程本身时（「设计一个每天跑的工作流」），建完就跑
-            // 等于替他多花一次钱，而他要的是那张图
-            if (op.autorun === false) {
-              patch(() => ({
-                graph, phase: 'ready', status: PHASE_TEXT.ready,
-                explanation: op.explanation ?? '', pendingRun: true,
-              }))
-              set({ busy: false, cancel: null })
-              void save({ status: 'done' })
-              break
-            }
-            patch(() => ({
-              graph, phase: 'running', status: PHASE_TEXT.running,
-              explanation: op.explanation ?? '',
-            }))
-            void launch(conversationId, id, graph, question, patch, set, save)
-            break
-          }
-          case 'error':
-            patch(() => ({ phase: 'error', error: op.message ?? '生成失败' }))
-            set({ busy: false, cancel: null })
-            void save({ status: 'error', error: op.message ?? '生成失败' })
-            break
-        }
-      },
-      (error) => {
-        if (!error) return
-        patch((t) => (t.phase === 'error' ? {} : { phase: 'error', error }))
-        set({ busy: false, cancel: null })
-        void save({ status: 'error', error })
-      },
-    )
-    patch(() => ({ cancel: cancelCopilot }))
-    set({ cancel: cancelCopilot })
+    plan({
+      conversationId, turnId: id, question, instruction: question,
+      attempt: 0, patch, set, save,
+    })
   },
-
   stop: (conversationId) => {
     // 只停最后一轮。把所有非终态 turn 一律标成"已取消"会误杀正等人工介入的
     // 历史轮次——那些是等着用户回来处理的，不是卡住的。
@@ -385,7 +316,7 @@ export const useChat = create<ChatState>((set, get) => ({
     }
     patch(() => ({ phase: 'running', status: PHASE_TEXT.running }))
     set({ busy: true })
-    watch(turn.run.id, patch, set, save, turn.lastSeq)
+    watch(turn.run.id, patch, set, save, turn.lastSeq, turn.question)
   },
 }))
 
@@ -450,9 +381,187 @@ function historyOf(conversationId: string, upToTurnId: string): string {
 }
 
 /** 图建好了就直接跑——用户要的是答案，不是一张图。 */
+/** 一轮最多再试一次。第二次还不行多半是问题本身没说清，该让用户介入 */
+const MAX_ATTEMPTS = 2
+
+interface PlanArgs {
+  conversationId: string
+  turnId: string
+  /** 用户原本问的是什么。跑图取数、复核都要用它，不能被重试的补充说明污染 */
+  question: string
+  /** 真正发给 Copilot 的那句话。重试时会在后面缀上失败原因 */
+  instruction: string
+  /** 重试时把上一次那张图交回去，让它改而不是重建。null = 从零建 */
+  baseGraph?: GraphSpec | null
+  attempt: number
+  patch: Patch
+  set: any
+  save: (body: Record<string, any>) => Promise<void>
+}
+
+/**
+ * 建图 → 跑图。从 ask 里拆出来，是为了能带着失败原因原地重来一次。
+ *
+ * 重试必须回到**同一轮**：用户问了一个问题，中间重建了一次图是过程，不是
+ * 两次对话。之前这件事全靠用户自己发现不对、再打一句「重来」——他那句话
+ * 本来就是在手动做这件事。
+ */
+function plan(args: PlanArgs) {
+  const {
+    conversationId, turnId, question, instruction, baseGraph, attempt, patch, set, save,
+  } = args
+
+  /** 这一轮建出来的图。retry 要把它交回去，所以得在闭包里留一份 */
+  let built: GraphSpec | null = baseGraph ?? null
+
+  /**
+   * 带着原因重来一次。超过上限就把原因如实留在这一轮上，不再烧钱。
+   *
+   * 关键是**把失败的那张图一起交回去**。只给一句"上次没成功：工具参数错了"
+   * 而不给图，模型只能照着原问题从零再建一遍——很可能建出一模一样的那张，
+   * 白跑一个来回。而且它连自己上次建了什么都看不到：会话历史按
+   * `status != running` 过滤，正在重试的这一轮恰好被排除在外。
+   *
+   * 交回去之后走的是后端的"改图"分支：图预置进累加器，模型只输出改动操作，
+   * 于是调大最大步数、改正工具参数这种事就是改一个字段，不是推倒重来。
+   */
+  const retry = (reason: string) => {
+    if (attempt + 1 >= MAX_ATTEMPTS) return false
+    const base = built && (built.nodes?.length ?? 0) > 0 ? built : null
+    patch(() => ({
+      attempt: attempt + 1,
+      phase: 'planning',
+      status: base ? '上一次没跑通，正在调整流程…' : '上一次没跑通，正在重新搭建流程…',
+      // 旧的操作流和事件要清掉：留着会让"执行过程"里出现两段互相矛盾的记录，
+      // 而用户分不清哪段是最终那次。图不清——它正是这次要改的东西
+      ops: [], events: [], run: null, output: null,
+      review: null, rawOutput: null, lastSeq: 0,
+    }))
+    plan({
+      ...args,
+      attempt: attempt + 1,
+      baseGraph: base,
+      instruction: base
+        ? `这张流程上一次运行没有成功：${reason}。\n\n`
+          + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
+          + `改完继续回答原来的问题：${question}`
+        : `${question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`,
+    })
+    return true
+  }
+
+  const cancelCopilot = streamCopilot(
+    { instruction, base_graph: baseGraph ?? null, intent: 'answer', conversation_id: conversationId },
+    (op) => {
+      // 先原样收下，翻译交给 decodeCopilot。thinking 合并在写入时做：
+      // 一次生成几百上千条 delta，逐条存下来光数组就比图大一个量级
+      patch((t) => {
+        const last = t.ops[t.ops.length - 1]
+        if (op.op === 'thinking' && last?.op === 'thinking') {
+          const merged = { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }
+          return { ops: [...t.ops.slice(0, -1), merged] }
+        }
+        return { ops: [...t.ops, op] }
+      })
+      switch (op.op) {
+        case 'thinking':
+          patch((t) => ({
+            phase: 'planning',
+            thinking: (t.thinking + (op.delta ?? '')).slice(-2000),
+          }))
+          break
+        case 'heartbeat':
+          patch(() => ({ status: PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }))
+          break
+        case 'plan':
+          patch(() => ({ phase: 'building', status: op.summary || '正在搭建流程…' }))
+          break
+        case 'add_node':
+          patch((t) => ({
+            phase: 'building',
+            status: `正在搭建流程…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
+          }))
+          break
+        case 'done':
+          patch(() => ({ explanation: op.explanation ?? '' }))
+          break
+        case 'reply': {
+          // 这句话不需要工作流——问的是前几轮已经查出来的东西，或者是
+          // 对过程说的话（「重试」「换个说法」）。以前这些也各自重建一整张
+          // 图、跑一遍 153 张表的库，纯属白花钱
+          const text = String(op.text ?? '')
+          patch(() => ({
+            phase: 'done', status: PHASE_TEXT.done,
+            output: { answer: text }, noQuery: true,
+          }))
+          set({ busy: false, cancel: null })
+          void save({ status: 'done', answer: text })
+          break
+        }
+        case 'final': {
+          const graph = op.graph as GraphSpec
+          built = graph          // 要重试的话，交回去的就是它
+          void save({ graph, explanation: op.explanation ?? '' })
+
+          // 没过校验的图不能拿去跑：引擎会照实抛出它自己的措辞（"图是空的，
+          // 先拖一个节点进来"），而用户根本不在画布上，这句话对他毫无意义。
+          // 这条路真的把它当答案交到用户面前过
+          const blockers = ((op.issues ?? []) as ValidationIssue[])
+            .filter((i) => i.level === 'error')
+            .map((i) => i.message)
+          if (blockers.length && retry(`生成的工作流没有通过校验：${blockers.join('；')}`)) break
+          if (blockers.length) {
+            // 重来一次还是没过。校验消息是写给画布用户的（"先拖一个节点进来"），
+            // 直接甩给一个在问数据页打字的人毫无意义——先给一句他能照做的，
+            // 原因放后面留作线索
+            const why = `这次没能搭出可以运行的流程，你可以换个说法再问一次。`
+              + `（原因：${blockers.join('；')}）`
+            patch(() => ({ graph, phase: 'error', error: why }))
+            set({ busy: false, cancel: null })
+            void save({ status: 'error', error: why })
+            break
+          }
+
+          // 用户要的是流程本身时（「设计一个每天跑的工作流」），建完就跑
+          // 等于替他多花一次钱，而他要的是那张图
+          if (op.autorun === false) {
+            patch(() => ({
+              graph, phase: 'ready', status: PHASE_TEXT.ready,
+              explanation: op.explanation ?? '', pendingRun: true,
+            }))
+            set({ busy: false, cancel: null })
+            void save({ status: 'done' })
+            break
+          }
+          patch(() => ({
+            graph, phase: 'running', status: PHASE_TEXT.running,
+            explanation: op.explanation ?? '',
+          }))
+          void launch(conversationId, turnId, graph, question, patch, set, save, retry)
+          break
+        }
+        case 'error':
+          patch(() => ({ phase: 'error', error: op.message ?? '生成失败' }))
+          set({ busy: false, cancel: null })
+          void save({ status: 'error', error: op.message ?? '生成失败' })
+          break
+      }
+    },
+    (error) => {
+      if (!error) return
+      patch((t) => (t.phase === 'error' ? {} : { phase: 'error', error }))
+      set({ busy: false, cancel: null })
+      void save({ status: 'error', error })
+    },
+  )
+  patch(() => ({ cancel: cancelCopilot }))
+  set({ cancel: cancelCopilot })
+}
+
 async function launch(
   conversationId: string, turnId: string, graph: GraphSpec, question: string,
   patch: Patch, set: any, save: (body: Record<string, any>) => Promise<void>,
+  retry?: (reason: string) => boolean,
 ) {
   try {
     const run = await api.runs.start({
@@ -460,7 +569,7 @@ async function launch(
     })
     patch(() => ({ run }))
     void save({ run_id: run.id })
-    watch(run.id, patch, set, save)
+    watch(run.id, patch, set, save, 0, question, retry)
   } catch (e: any) {
     patch(() => ({ phase: 'error', error: e?.message ?? '启动失败' }))
     set({ busy: false, cancel: null })
@@ -477,6 +586,7 @@ async function launch(
 function watch(
   runId: string, patch: Patch, set: any,
   save: (body: Record<string, any>) => Promise<void>, after = 0,
+  question = '', retry?: (reason: string) => boolean,
 ) {
   const stop = streamRun(runId, (event: RunEvent) => {
     const d: any = event.data ?? {}
@@ -510,14 +620,18 @@ function watch(
       case 'run.finished':
         // 成果在事件里就有，不必再取一次 run；但 run 对象带着 usage 和
         // run_class（出具横幅要用），所以还是拉一次，失败也不影响成果
-        patch(() => ({
-          phase: 'done', status: PHASE_TEXT.done, output: d.output ?? null,
-        }))
-        set({ busy: false, cancel: null })
+        // 成果**先落库**再显示。两件事顺序不能并：
+        //  - 落库要马上，否则复核期间关掉标签页，这次跑出来的东西就没了；
+        //  - 显示要等复核，否则用户已经把结论读完、信了，说明才姗姗来迟——
+        //    实测复核要十秒上下，这十秒里他看到的是一个没人核对过的答案。
+        // 所以这里只改状态，output 交给 settle 在核完之后一次性摆出来
+        patch(() => ({ status: '正在核对结果…' }))
         void save({ status: 'done', answer: answerText(d.output ?? null) })
         void api.runs.get(runId)
           .then((run) => patch(() => ({ run })))
           .catch(() => undefined)
+        // 跑完不等于答对：先接住这次编排，确认没问题再交付
+        void settle(runId, question, d.output ?? null, patch, set, save, retry)
         break
     }
   }, undefined, after)
@@ -525,6 +639,67 @@ function watch(
   // store 上的是"当前活跃流"的快捷方式
   patch(() => ({ cancel: stop }))
   set({ cancel: stop })
+}
+
+
+/**
+ * 接住一次编排的产出，确认能不能就这么交给用户。
+ *
+ * 「跑完了」和「答得对」是两回事。库里能查到大量 status=succeeded 的运行，
+ * 过程中检索降级了、工具报错了、agent 步数用满了，而交到用户手上的答案对此
+ * 只字不提——最糟的一次交出去的干脆是一句内部管道文案。
+ *
+ * 后端先用规则扫一遍事件流，干净的运行直接返回 ok，一次模型都不调；扫出异常
+ * 才叫模型重组答案并把话说破（backend/app/engine/review.py）。
+ *
+ * 这个函数必须**在任何情况下都把答案交出去**：复核是补一层说明，它自己失败了
+ * 不能把已经到手的结果一起带走，更不能让这一轮永远停在"正在核对"。
+ */
+async function settle(
+  runId: string, question: string, output: Record<string, any> | null,
+  patch: Patch, set: any, save: (body: Record<string, any>) => Promise<void>,
+  retry?: (reason: string) => boolean,
+) {
+  let result: ReviewResult | null = null
+  try {
+    // 复核慢到一定程度就不等了。它是补一层说明，不该反过来把答案扣住不放——
+    // 干净的运行后端 15ms 就返回，会走到这个上限的都是真叫了模型的那些
+    result = await Promise.race([
+      api.copilot.review({ run_id: runId, question }),
+      new Promise<null>((r) => setTimeout(() => r(null), REVIEW_TIMEOUT_MS)),
+    ])
+  } catch { /* 复核用不了就按原样交付，下面照常走 */ }
+
+  // 库里存完整结论（包括 verdict='ok'），store 里只留值得摆到界面上的那部分。
+  // 两者分开，"这一轮没复核过"和"复核过、没发现问题"才是两件可区分的事——
+  // 事后排查"它当时为什么没警告我"，靠的就是这个区别
+  const review = result && result.verdict !== 'ok' ? result : null
+
+  // 答案根本不可信，而且原因说得清楚——重建一次图再跑，别让用户自己发现
+  if (review?.retry && review.severity === 'broken' && retry) {
+    const reason = review.signals.map((s) => s.detail).join('；') || review.note
+    if (retry(reason)) return
+  }
+
+  const rewritten = review?.answer ?? null
+  patch(() => ({
+    phase: 'done',
+    status: PHASE_TEXT.done,
+    review,
+    // 到这一步才把成果摆出来：复核说明和结论同时出现，而不是结论先读完
+    output,
+    // 改写是有损的，原件得留着——界面上可以展开对照。它跟着 review 一起
+    // 落库，所以刷新之后还在
+    ...(rewritten
+      ? { rawOutput: { answer: review?.original ?? answerText(output) }, output: { answer: rewritten } }
+      : {}),
+  }))
+  set({ busy: false, cancel: null })
+  void save({
+    status: 'done',
+    answer: rewritten || answerText(output),
+    ...(result ? { review: result } : {}),
+  })
 }
 
 export { decodeRun }

@@ -102,6 +102,40 @@ const NO_QUERY_TURN: StreamTurn = {
   output: { answer: "第 1 轮走的是 `role.level IN (platform, regional)` 这个口径。要换口径我重新查一遍。" },
 }
 
+/** 复核判了「不可信」：说明排在成果上方，且用报警色 */
+const REVIEW_BROKEN_TURN: StreamTurn = {
+  id: "reviewbroken", question: "商家账户有多少个？", phase: "done", status: "完成",
+  steps: [],
+  review: {
+    verdict: "annotated", severity: "broken", retry: true,
+    note: "这次取数没跑通（表名对不上），下面这个数是模型根据上下文推断的，不能当结论用。",
+    answer: null,
+    signals: [
+      { kind: "tool_error", severity: "broken",
+        detail: "工具 db_query__shop 调用失败：no such table: merchant_account" },
+      { kind: "step_limit", severity: "broken", detail: "agent 用满了 8 步还没给出结论" },
+    ],
+  },
+  output: { answer: "大约 5 个左右。" },
+}
+
+/** 复核只是补了一句说明，答案照常给；外加改写前的原文可展开 */
+const REVIEW_DEGRADED_TURN: StreamTurn = {
+  id: "reviewdegraded", question: "谁能改别人的权限？", phase: "done", status: "完成",
+  steps: [],
+  review: {
+    verdict: "rewritten", severity: "degraded", retry: false,
+    note: "这次知识库检索退回了纯关键词匹配，换了说法的内容可能没被搜到。",
+    answer: null,
+    signals: [
+      { kind: "retrieve_degraded", severity: "degraded",
+        detail: "重排结果解析不出来，按初筛顺序返回" },
+    ],
+  },
+  output: { answer: "只有平台管理员可以修改他人权限，且需要走角色变更流程。" },
+  rawOutput: { answer: "平台管理员可以修改他人权限。" },
+}
+
 const LONG_TURN: StreamTurn = {
   id: "long", question: "需要能够显示总结内容", phase: "done", status: "完成",
   steps: [], output: { result: longReport() },
@@ -147,6 +181,9 @@ function Preview() {
   }
   if (params.get('noquery') === '1') {
     return <AssistantStream turns={[NO_QUERY_TURN]} />
+  }
+  if (params.get('review') === '1') {
+    return <AssistantStream turns={[REVIEW_BROKEN_TURN, REVIEW_DEGRADED_TURN]} />
   }
 
   return (
