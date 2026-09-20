@@ -104,6 +104,59 @@ def _depths(spec: GraphSpec) -> dict[str, int]:
     return depth
 
 
+#: 按 AST 白名单求值的字段：里面是裸表达式，不带 {{ }}。
+#: cases 是数组，单独处理。
+_EXPRESSION_FIELDS = ("expression", "condition", "skip_if")
+
+#: 裸引用：vars.x / input.x / nodes.x[.y…]。只认这三个根，
+#: 免得把 str(...) 里的普通标识符也当成变量引用
+_BARE_REF_RE = re.compile(r"\b(?:vars|input|nodes)\.[A-Za-z_][\w.]*")
+
+
+def _iter_expressions(cfg: dict[str, Any]) -> list[tuple[str, str]]:
+    """节点配置里那些按表达式求值的字段。"""
+    out: list[tuple[str, str]] = []
+    for key in _EXPRESSION_FIELDS:
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            out.append((key, value))
+    for i, case in enumerate(cfg.get("cases") or []):
+        cond = (case or {}).get("condition")
+        if isinstance(cond, str) and cond.strip():
+            out.append((f"cases[{i}].condition", cond))
+    return out
+
+
+def _loop_bodies(spec: GraphSpec) -> dict[str, set[str]]:
+    """每个循环节点的"体"里有哪些节点。
+
+    循环变量（item / item_index）只在体内部有值，而拓扑深度在这里完全不可靠：
+    循环体末尾有一条回到循环节点的边，于是循环节点的深度被回边推高，反而排在
+    自己的体后面。模板⑦就因此被报成"{{ vars.item }} 由「逐条循环」产出，
+    但那一步在这之后才跑"——而那是循环最正常的写法。
+
+    从 body 出口走可达闭包，遇到循环节点自己就停（那就是回边）。
+    """
+    bodies: dict[str, set[str]] = {}
+    outgoing: dict[str, list[tuple[str | None, str]]] = {}
+    for e in spec.edges:
+        outgoing.setdefault(e.source, []).append((e.sourceHandle, e.target))
+
+    for node in spec.nodes:
+        if node.type != "loop":
+            continue
+        seen: set[str] = set()
+        stack = [t for h, t in outgoing.get(node.id, []) if h == "body"]
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur == node.id:
+                continue
+            seen.add(cur)
+            stack.extend(t for _, t in outgoing.get(cur, []))
+        bodies[node.id] = seen
+    return bodies
+
+
 def _iter_strings(value: Any, prefix: str = "") -> list[tuple[str, str]]:
     """把配置里所有字符串摊平成 (字段路径, 文本)。"""
     out: list[tuple[str, str]] = []
@@ -172,6 +225,7 @@ def _resolve_fallback(
 def analyze(spec: GraphSpec) -> VariableReport:
     """静态分析一张图的变量。不需要跑，也不需要有运行记录。"""
     depth = _depths(spec)
+    bodies = _loop_bodies(spec)
     report = VariableReport()
     index: dict[str, Variable] = {}
 
@@ -207,6 +261,28 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     description=desc,
                 )
 
+        # 循环节点每轮往 vars 里注入当前项和它的序号（control.py:142）。
+        # 产出侧漏了这一条，于是模板⑦「批量处理」里完全正确的 {{ vars.item }}
+        # 被报成"没有任何节点产出"——那是唯一一个装好就红着的内置模板，
+        # 新用户点开第一眼看到的就是个报错，而运行按钮还是灰的。
+        #
+        # 误报是 linter 最坏的失败模式：它会让人把整个校验一起无视掉。
+        # kind="loop" 在 _KIND_ORDER 里一直有位置，只是从来没人产出过。
+        if node.type == "loop" and str(cfg.get("mode") or "foreach") == "foreach":
+            # while 模式不遍历列表，自然也没有"当前项"
+            item_var = str(cfg.get("item_var") or "item").strip()
+            if item_var:
+                ensure(
+                    f"vars.{item_var}", kind="loop", label=f"「{label}」每轮的当前项",
+                    produced_by=node.id, produced_by_label=label, order=order,
+                    description="只在循环体内部有值",
+                )
+                ensure(
+                    f"vars.{item_var}_index", kind="loop", label=f"「{label}」每轮的序号",
+                    produced_by=node.id, produced_by_label=label, order=order,
+                    description="从 0 开始，只在循环体内部有值",
+                )
+
         var_name = str(cfg.get("assign_to") or "").strip()
         if var_name:
             ensure(
@@ -238,6 +314,21 @@ def analyze(spec: GraphSpec) -> VariableReport:
         cfg = node.data.config or {}
         label = _label_of(node)
         order = depth.get(node.id, 0)
+        # 表达式字段里写的是**裸**引用（vars.one、input.n），没有 {{ }}。
+        # 只扫模板语法的话，模板⑦里 collect 那个
+        # `(vars.collected or '') + str(vars.one)` 就一个引用都认不出来，
+        # 于是 vars.one 被报成"产出了但没有任何地方引用"——而它明明在用。
+        for field, expr_text in _iter_expressions(cfg):
+            for m in _BARE_REF_RE.finditer(expr_text):
+                path, root = _root_of(m.group(0))
+                if not path:
+                    continue
+                target = index.get(path)
+                if target is not None:
+                    target.refs.append(VarRef(
+                        node_id=node.id, node_label=label, field=field, expr=m.group(0),
+                    ))
+
         for field, text in _iter_strings(cfg):
             for m in _TEMPLATE_RE.finditer(text):
                 expr = m.group(1).strip()
@@ -253,6 +344,19 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     target = _resolve_fallback(path, index, input_is_closed=input_is_closed)
                 if target is not None:
                     target.refs.append(ref)
+                    # 循环变量单独判：它只在循环体内部有值，而循环体的拓扑
+                    # 深度因为那条回边天然比循环节点小，套用下面的先后判定
+                    # 必然误报（模板⑦就是这么红的）
+                    if target.kind == "loop" and target.produced_by:
+                        if node.id not in bodies.get(target.produced_by, set()):
+                            report.issues.append(VarIssue(
+                                level="warning", node_id=node.id, path=path,
+                                message=f"{{{{ {path} }}}} 是「{target.produced_by_label}」"
+                                        f"每轮的循环变量，只在循环体内部有值；"
+                                        f"这一步不在循环体里，取到的会是空值",
+                            ))
+                        continue
+
                     # 变量存在，但产出它的节点排在引用者之后——跑到这儿时它还是空的
                     if (
                         target.produced_by
@@ -293,7 +397,16 @@ def analyze(spec: GraphSpec) -> VariableReport:
     for var in index.values():
         if var.kind in ("builtin", "node"):
             continue      # nodes.<id> 是自动存在的，没人引用很正常
-        if not var.refs and var.produced_by:
+        # 只对**作者声明**的变量报"没人用"。系统自动提供的不算：
+        #   - 循环变量（item / item_index）：循环本来就两个都注入，
+        #     用不用是作者的事，提醒他"你没用 item_index"纯属噪音
+        #   - vars.<入口字段> 这个别名：真正的 input.<字段> 用着呢，
+        #     拿别名去报未引用只会让人以为哪里写错了
+        # 内置变量（last_message 等）没有 produced_by，本来就不在这条路上。
+        auto_provided = var.kind == "loop" or (
+            var.kind == "input" and var.path.startswith("vars.")
+        )
+        if not var.refs and var.produced_by and not auto_provided:
             report.issues.append(VarIssue(
                 level="info", node_id=var.produced_by, path=var.path,
                 message=f"{{{{ {var.path} }}}} 产出了但没有任何地方引用",

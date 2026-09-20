@@ -18,7 +18,10 @@ def _graph(nodes, edges=()):
              "data": {"label": n.get("label", ""), "config": n.get("config", {})}}
             for n in nodes
         ],
-        "edges": [{"source": s, "target": t} for s, t in edges],
+        "edges": [
+            {"source": e[0], "target": e[1], **({"sourceHandle": e[2]} if len(e) > 2 else {})}
+            for e in edges
+        ],
     })
 
 
@@ -208,3 +211,133 @@ def test_cycle_does_not_hang() -> None:
         [("a", "b"), ("b", "a")],
     )
     assert analyze(g).variables      # 跑得完就行
+
+
+# --------------------------------------------------------------------------
+# 循环变量
+# --------------------------------------------------------------------------
+#
+# 模板⑦「批量处理（循环）」装好就红着：{{ vars.item }} 被报成"没有任何节点
+# 产出"，而那是循环最正常的写法。它是唯一一个内置模板开箱就报错的，
+# 新用户点开第一眼看到的就是红字，运行按钮还是灰的。
+#
+# 根因不在模板，在这里：产出侧从来没登记过循环注入的变量
+# （control.py:142 每轮写 vars.<item_var> 和 vars.<item_var>_index）。
+# kind="loop" 在 _KIND_ORDER 里一直有位置，只是没人产出过。
+
+
+def _loop_graph(*, item_var="item", body_ref="{{ vars.item }}", extra_node=None):
+    """input → loop →(body) handle → 回到 loop；loop →(done) out。
+
+    末尾那条回边是关键：它让 loop 的拓扑深度反而大于自己的循环体。
+    """
+    nodes = [
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "items"}]}},
+        {"id": "each", "type": "loop", "label": "逐条循环",
+         "config": {"mode": "foreach", "items": "{{ input.items }}", "item_var": item_var}},
+        {"id": "handle", "type": "llm", "label": "处理单条", "config": {"prompt": body_ref}},
+        {"id": "out", "type": "output", "config": {}},
+    ]
+    if extra_node:
+        nodes.append(extra_node)
+    edges = [("start", "each"), ("each", "handle", "body"),
+             ("handle", "each"), ("each", "out", "done")]
+    if extra_node:
+        edges.append(("out", extra_node["id"]))
+    return _graph(nodes, edges)
+
+
+def test_loop_item_is_a_known_variable() -> None:
+    """循环体里引用 {{ vars.item }} 不该被报成未定义。"""
+    report = analyze(_loop_graph())
+    paths = {v.path for v in report.variables}
+    assert "vars.item" in paths
+    assert "vars.item_index" in paths
+
+    errors = [i for i in report.issues if i.level == "error"]
+    assert not errors, [i.message for i in errors]
+
+
+def test_loop_item_follows_the_configured_name() -> None:
+    report = analyze(_loop_graph(item_var="row", body_ref="{{ vars.row }}"))
+    paths = {v.path for v in report.variables}
+    assert {"vars.row", "vars.row_index"} <= paths
+    assert not [i for i in report.issues if i.level == "error"]
+
+
+def test_no_false_ordering_warning_inside_the_loop_body() -> None:
+    """循环体的拓扑深度因为回边天然小于循环节点，套用"先后"判定必然误报。
+
+    以前报的是"{{ vars.item }} 由「逐条循环」产出，但那一步在这之后才跑"——
+    而那正是循环最正常的写法。
+    """
+    report = analyze(_loop_graph())
+    assert not [i for i in report.issues if "在这之后才跑" in i.message], \
+        [i.message for i in report.issues]
+
+
+def test_loop_variable_outside_the_body_still_warns() -> None:
+    """但在循环体**外面**引用它确实取不到值，这条要留着。"""
+    outside = {"id": "after", "type": "llm", "label": "循环之后",
+               "config": {"prompt": "{{ vars.item }}"}}
+    report = analyze(_loop_graph(extra_node=outside))
+    warns = [i for i in report.issues if i.node_id == "after"]
+    assert warns, [i.message for i in report.issues]
+    assert "只在循环体内部有值" in warns[0].message
+
+
+def test_while_loop_has_no_current_item() -> None:
+    """while 模式不遍历列表，自然没有"当前项"（control.py 只在 foreach 分支注入）。"""
+    report = analyze(_graph([
+        {"id": "lp", "type": "loop",
+         "config": {"mode": "while", "condition": "vars.done != True", "item_var": "item"}},
+    ]))
+    assert "vars.item" not in {v.path for v in report.variables}
+
+
+# --------------------------------------------------------------------------
+# 表达式字段里的裸引用
+# --------------------------------------------------------------------------
+
+
+def test_bare_refs_in_expression_fields_count_as_usage() -> None:
+    """表达式字段写的是裸 vars.x，没有 {{ }}——只扫模板语法会认不出来。
+
+    模板⑦里 `(vars.collected or '') + str(vars.one)` 就是这样，
+    于是 vars.one 被报成"产出了但没有任何地方引用"，而它明明在用。
+    """
+    report = analyze(_graph([
+        {"id": "a", "type": "llm", "config": {"prompt": "x", "assign_to": "one"}},
+        {"id": "b", "type": "transform", "config": {
+            "mode": "expression",
+            "expression": "(vars.collected or '') + str(vars.one)",
+            "assign_to": "collected",
+        }},
+    ], [("a", "b")]))
+
+    one = next(v for v in report.variables if v.path == "vars.one")
+    assert one.refs, "表达式里用了就不该说没人用"
+    assert not [i for i in report.issues if "vars.one" in i.message]
+
+
+def test_branch_case_conditions_count_as_usage() -> None:
+    report = analyze(_graph([
+        {"id": "a", "type": "llm", "config": {"prompt": "x", "assign_to": "score"}},
+        {"id": "b", "type": "branch", "config": {
+            "mode": "expression",
+            "cases": [{"key": "hi", "condition": "vars.score > 3"}],
+        }},
+    ], [("a", "b")]))
+    assert next(v for v in report.variables if v.path == "vars.score").refs
+
+
+def test_auto_provided_variables_are_not_nagged_about() -> None:
+    """系统自动提供的变量不报"没人用"——作者没声明过它，提醒他等于噪音。
+
+    内置变量（last_message 等）本来就不在这条路上；循环的 item_index 和
+    入口字段的 vars.<name> 别名以前会被报，而真正的 input.<name> 用着呢。
+    """
+    report = analyze(_loop_graph())
+    unused = [i.message for i in report.issues if "没有任何地方引用" in i.message]
+    assert not any("item_index" in m for m in unused), unused
+    assert not any("vars.items" in m for m in unused), unused
