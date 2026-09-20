@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { Database, ListTree, MessageSquare, Play, Send, Square } from 'lucide-react'
 import { api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
@@ -6,7 +7,7 @@ import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantS
 import { decodeCopilot, decodeRun } from '../run/decode'
 import { useCatalog } from '../store/catalog'
 import { useChat, type ChatTurn } from '../store/chat'
-import { useConversations } from '../store/conversations'
+import { lastVisited, useConversations } from '../store/conversations'
 import { useStudio } from '../store/studio'
 import { ConversationList } from './ConversationList'
 import { useToast } from '../components/ui'
@@ -26,13 +27,47 @@ import { useToast } from '../components/ui'
  */
 export function ChatPage() {
   const { busy, ask, stop, load, loadSteps, runNow, turnsOf } = useChat()
+  const { conversationId } = useParams()
+  const navigate = useNavigate()
   const currentId = useConversations((s) => s.currentId)
   const create = useConversations((s) => s.create)
+  const select = useConversations((s) => s.select)
+  const list = useConversations((s) => s.list)
+  const listLoading = useConversations((s) => s.loading)
   const turns = useChat((s) => (currentId ? s.byConversation[currentId] : undefined))
   const [draft, setDraft] = useState('')
   const sources = useDataSources()
   const setGraph = useStudio((s) => s.setGraph)
   const toast = useToast()
+
+  // URL → store。这是 currentId 唯一的写入口，别处一律靠导航
+  useEffect(() => { select(conversationId ?? null) }, [conversationId, select])
+
+  // /chat 不带 id：落到上次那个，没有就列表第一条。用 replace 而不是 push，
+  // 否则按后退会回到这个空壳地址、又被弹回来，人就卡在这儿出不去了
+  useEffect(() => {
+    if (conversationId || listLoading || !list.length) return
+    const last = lastVisited()
+    const target = list.find((c) => c.id === last)?.id ?? list[0].id
+    navigate(`/chat/${target}`, { replace: true })
+  }, [conversationId, listLoading, list, navigate])
+
+  // 地址指着一个不存在的对话（被删了、链接过期了）。不能白屏，也不能一声不响
+  // 地跳走——点开一个链接却到了别的地方，得让人知道为什么。
+  //
+  // 必须等列表加载完再判：列表是异步取的，在那之前"找不到"是假的，
+  // 照着它跳会让每次深链接进入都先闪一下错误提示
+  const reported = useRef<string | null>(null)
+  useEffect(() => {
+    if (!conversationId || listLoading || !list.length) return
+    if (list.some((c) => c.id === conversationId)) return
+    // 同一个坏地址只说一次。StrictMode 会把 effect 跑两遍，依赖里的 list
+    // 变一次又会再跑一遍——不记着的话同一句提示会连弹好几条
+    if (reported.current === conversationId) return
+    reported.current = conversationId
+    toast('那个对话不在了，已经带你回到最近一个', 'info')
+    navigate(`/chat/${list[0].id}`, { replace: true })
+  }, [conversationId, listLoading, list, navigate, toast])
 
   // 切到哪个会话就把哪个会话的内容取回来。内存里已经有的不会回源——
   // 那一份带着这次跑出来的完整步骤，回源拿到的只有问题和答案
@@ -43,6 +78,8 @@ export function ChatPage() {
     if (!q || busy) return
     // 没有会话就先开一个。第一次进来的人不该先被要求"新建对话"
     const id = currentId ?? (await create())
+    // 地址要跟上，否则内容已经在新对话里、地址栏还停在 /chat
+    if (id !== currentId) navigate(`/chat/${id}`, { replace: true })
     ask(id, q)
     setDraft('')
   }
@@ -81,8 +118,11 @@ export function ChatPage() {
           />
         )}
         onOpenGraph={(graph) => {
+          // 以前只把图放过去、让用户自己去点导航。有了路由就直接送过去——
+          // "已放到画布，切到「编排」继续改"是在让人替系统完成一次跳转
           setGraph(graph)
-          toast('已放到画布，切到「编排」继续改', 'ok')
+          navigate('/studio')
+          toast('已放到画布', 'ok')
         }}
         footer={
           <div className="shrink-0 border-t p-3">

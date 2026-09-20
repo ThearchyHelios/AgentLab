@@ -8,11 +8,24 @@ import type { Conversation } from '../types'
  * 只管"有哪些对话、当前在看哪个"。对话里的内容归 chat store —— 两者分开是
  * 因为列表要常驻（切换时不能闪），而内容是按会话缓存的一大坨东西。
  *
- * 当前会话 id 存进 localStorage：刷新后回到刚才那个对话，而不是甩回空白页。
- * 这是"对话持久化"里用户最先感知到的一半——另一半（内容本身）在 chat store。
+ * **当前在看哪个由 URL 说了算**（/chat/:conversationId），这里的 currentId 只是
+ * 它的派生缓存——十几处在读这个字段，但写它的只有 ChatPage 的那个同步 effect。
+ * 两边都能写就一定会打架：点一下列表，store 改了、地址栏没改，刷新又回到旧的。
+ *
+ * localStorage 留着，但它回答的是另一个问题：**打开不带 id 的 /chat 该去哪**。
+ * URL 里有 id 时一律以 URL 为准。
  */
 
 const LAST_KEY = 'agentlab.lastConversation'
+
+/** 上次看的是哪个。只在 /chat 不带 id 时用来决定落到哪 */
+export const lastVisited = (): string | null => {
+  try {
+    return localStorage.getItem(LAST_KEY)
+  } catch {
+    return null   // 隐私模式下 localStorage 会抛
+  }
+}
 
 interface ConversationState {
   list: Conversation[]
@@ -20,33 +33,28 @@ interface ConversationState {
   loading: boolean
 
   load: () => Promise<void>
+  /** 新建（或复用一条空的），返回它的 id。**不负责切过去**——那是导航的事 */
   create: () => Promise<string>
+  /** 由 URL 回流调用，把「在看哪个」记下来。不要在别处直接调它 */
   select: (id: string | null) => void
   rename: (id: string, title: string) => Promise<void>
-  remove: (id: string) => Promise<void>
+  /** 删掉，返回接下来该去哪个（列表空了就是 null），由调用方导航 */
+  remove: (id: string) => Promise<string | null>
   /** 有人在这个会话里说话了，把它顶到列表最前并刷新副标题 */
   touch: (id: string, lastQuestion?: string) => void
 }
 
 export const useConversations = create<ConversationState>((set, get) => ({
   list: [],
-  currentId: localStorage.getItem(LAST_KEY),
+  currentId: null,   // 由 URL 填，见 ChatPage 的同步 effect
   loading: false,
 
   load: async () => {
+    // 只管把列表取回来。「当前在看哪个」以前也在这里决定，现在归 URL 管——
+    // 两边都能定就会互相覆盖：深链接进来，列表一加载完又被拽回上次那个
     set({ loading: true })
     try {
-      const list = await api.conversations.list('chat')
-      // 记着的那个可能已经被删了（另一个标签页里删的）。指着一个不存在的
-      // 会话会让页面停在空白，这时候退回最近一条，而不是让人对着空屏幕
-      const current = get().currentId
-      const alive = current && list.some((c) => c.id === current)
-      const next = alive ? current : (list[0]?.id ?? null)
-      if (next !== current) {
-        if (next) localStorage.setItem(LAST_KEY, next)
-        else localStorage.removeItem(LAST_KEY)
-      }
-      set({ list, currentId: next, loading: false })
+      set({ list: await api.conversations.list('chat'), loading: false })
     } catch {
       set({ loading: false })
     }
@@ -56,19 +64,17 @@ export const useConversations = create<ConversationState>((set, get) => ({
     // 已经有一条空会话就直接用它。连点几次"新对话"不该留下一串一模一样的
     // 空壳——用户的意思是"我要从头开始说"，不是"我要三个空对话"
     const blank = get().list.find((c) => c.turn_count === 0)
-    if (blank) {
-      get().select(blank.id)
-      return blank.id
-    }
+    if (blank) return blank.id
     const created = await api.conversations.create({ kind: 'chat' })
-    localStorage.setItem(LAST_KEY, created.id)
-    set((s) => ({ list: [created, ...s.list], currentId: created.id }))
+    set((s) => ({ list: [created, ...s.list] }))
     return created.id
   },
 
   select: (id) => {
-    if (id) localStorage.setItem(LAST_KEY, id)
-    else localStorage.removeItem(LAST_KEY)
+    try {
+      if (id) localStorage.setItem(LAST_KEY, id)
+      else localStorage.removeItem(LAST_KEY)
+    } catch { /* 隐私模式，记不住就算了，不影响这次 */ }
     set({ currentId: id })
   },
 
@@ -86,13 +92,10 @@ export const useConversations = create<ConversationState>((set, get) => ({
 
   remove: async (id) => {
     await api.conversations.remove(id)
-    set((s) => {
-      const list = s.list.filter((c) => c.id !== id)
-      const currentId = s.currentId === id ? (list[0]?.id ?? null) : s.currentId
-      if (currentId) localStorage.setItem(LAST_KEY, currentId)
-      else localStorage.removeItem(LAST_KEY)
-      return { list, currentId }
-    })
+    const list = get().list.filter((c) => c.id !== id)
+    set({ list })
+    // 删的不是当前这个就原地不动；删的是当前这个才需要换地方
+    return get().currentId === id ? (list[0]?.id ?? null) : get().currentId
   },
 
   touch: (id, lastQuestion) => {

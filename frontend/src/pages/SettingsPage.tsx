@@ -3,24 +3,23 @@ import { Check, Cpu, KeyRound, Plus, Radio, Trash2, X } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
-import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
+import { Empty, Modal, Spinner, Tabs, useTabRoute, useToast } from '../components/ui'
 import { DataSourcesTab } from './DataSourcesTab'
 import type { Provider } from '../types'
 
+// 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
+const TABS = [
+  { key: 'providers', label: '模型接入' },
+  { key: 'datasources', label: '数据源' },
+  { key: 'prefs', label: '偏好设置' },
+  { key: 'system', label: '运行环境' },
+]
+
 export function SettingsPage() {
-  const [tab, setTab] = useState('providers')
+  const [tab, setTab] = useTabRoute(TABS.map((t) => t.key), 'providers')
   return (
     <div className="mx-auto flex h-full w-full max-w-4xl flex-col">
-      <Tabs
-        tabs={[
-          { key: 'providers', label: '模型接入' },
-          { key: 'datasources', label: '数据源' },
-          { key: 'prefs', label: '偏好设置' },
-          { key: 'system', label: '运行环境' },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
       <div className="flex-1 overflow-y-auto p-4">
         {tab === 'providers' && <ProvidersTab />}
         {tab === 'datasources' && <DataSourcesTab />}

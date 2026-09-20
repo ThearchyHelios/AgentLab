@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Check, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, Trash2, X } from 'lucide-react'
 import clsx from 'clsx'
 import { useChat } from '../store/chat'
@@ -14,9 +15,26 @@ import { useConversations } from '../store/conversations'
  * "改图指令"，和这里的"问题"不是一回事，混进同一个列表只会让两种都更难找。
  */
 export function ConversationList() {
-  const { list, currentId, loading, load, create, select, rename, remove } = useConversations()
+  const { list, currentId, loading, load, create, rename, remove } = useConversations()
   const forget = useChat((s) => s.forget)
   const busy = useChat((s) => s.busy)
+  const navigate = useNavigate()
+
+  // 切会话 = 换地址，不是改 store。store 那个 currentId 是 URL 的派生缓存，
+  // 在这里直接 set 的话，地址栏不动、刷新就跳回旧的那个，前进后退也全失效
+  const open = (id: string) => navigate(`/chat/${id}`)
+
+  const startNew = async () => {
+    const id = await create()
+    navigate(`/chat/${id}`)
+  }
+
+  const drop = async (id: string) => {
+    forget(id)
+    const next = await remove(id)
+    // 删的是当前这个才需要换地方；remove 会把该去哪告诉我们
+    if (next !== currentId) navigate(next ? `/chat/${next}` : '/chat', { replace: true })
+  }
   const [collapsed, setCollapsed] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
 
@@ -34,7 +52,7 @@ export function ConversationList() {
                 onClick={() => setCollapsed(false)}>
           <PanelLeftOpen size={13} />
         </button>
-        <button className="btn btn-sm btn-ghost" title="新对话" onClick={() => void create()}>
+        <button className="btn btn-sm btn-ghost" title="新对话" onClick={() => void startNew()}>
           <MessageSquarePlus size={13} />
         </button>
       </div>
@@ -45,7 +63,7 @@ export function ConversationList() {
     <aside className="flex w-52 shrink-0 flex-col border-r bg-panel">
       <div className="flex items-center gap-1 px-2 py-2">
         <button className="btn btn-sm btn-ghost flex-1 justify-start gap-1.5 text-[12px]"
-                onClick={() => void create()}>
+                onClick={() => void startNew()}>
           <MessageSquarePlus size={13} /> 新对话
         </button>
         <button className="btn btn-sm btn-ghost" title="收起" onClick={() => setCollapsed(true)}>
@@ -75,7 +93,7 @@ export function ConversationList() {
               <div className="flex items-center gap-1">
                 <button
                   className="min-w-0 flex-1 text-left"
-                  onClick={() => select(c.id)}
+                  onClick={() => open(c.id)}
                   title={c.last_question || c.title}
                 >
                   <div className="truncate">{c.title || '新对话'}</div>
@@ -93,7 +111,7 @@ export function ConversationList() {
                     className="btn btn-xs btn-ghost"
                     title={busy && c.id === currentId ? '正在运行，先停下来再删' : '删除'}
                     disabled={busy && c.id === currentId}
-                    onClick={() => { forget(c.id); void remove(c.id) }}
+                    onClick={() => void drop(c.id)}
                   >
                     <Trash2 size={11} />
                   </button>

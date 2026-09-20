@@ -261,6 +261,151 @@ console.log('\n=== 会话 ===')
   await page.close()
 }
 
+console.log('\n=== URL 指得到 ===')
+{
+  // 在此之前「在看哪个对话/哪次运行/哪一屏」全在 store 和 localStorage 里：
+  // 一次对话没有地址，发给同事只能发截图；刷新靠 localStorage，换台机器就丢；
+  // 浏览器后退会直接离开整个页面而不是回到上一个对话。
+  const convs = await (await fetch(`${API}/conversations`)).json()
+  const seeded = convs.filter((c) => c.turn_count > 0)
+
+  if (seeded.length >= 2) {
+    const [a, b] = seeded
+    const { page, errors } = await visit(`/chat/${a.id}`)
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    check('深链接直达那个对话', (await page.locator('main').innerText()).includes(a.title),
+          `想要「${a.title}」`)
+    check('地址里就是那个 chatID', page.url().endsWith(`/chat/${a.id}`), page.url())
+
+    // 点另一个：地址要跟着走，而不是只改 store
+    await page.locator('aside button[title]').filter({ hasText: b.title }).first().click()
+    await page.waitForTimeout(600)
+    check('切换对话会改地址', page.url().endsWith(`/chat/${b.id}`), page.url())
+
+    // 刷新靠的是 URL，不是 localStorage
+    await page.reload({ waitUntil: 'networkidle' })
+    await page.waitForTimeout(800)
+    check('刷新后还在同一个对话', page.url().endsWith(`/chat/${b.id}`)
+          && (await page.locator('main').innerText()).includes(b.title))
+
+    // 后退回到上一个对话，而不是甩出整个页面——这条以前是彻底失效的
+    await page.goBack({ waitUntil: 'networkidle' })
+    await page.waitForTimeout(700)
+    check('后退回到上一个对话', page.url().endsWith(`/chat/${a.id}`), page.url())
+    await shot(page, 'url-chat')
+    await page.close()
+  } else {
+    check('（跳过：库里不足两个带轮次的会话）', true)
+  }
+
+  {
+    // 链接过期/对话被删：不能白屏，也不能一声不响地跳走
+    const { page } = await visit('/chat/这个id根本不存在')
+    const body = await page.locator('body').innerText()
+    check('指向不存在的对话时不白屏', body.length > 40, `${body.length} 字`)
+    check('落到了一个真实对话', /\/chat\/[0-9a-f]{8,}$/.test(page.url()), page.url())
+    // 认整句提示，不认"不在了"三个字——会话标题里碰巧有这仨字就会把它蒙对
+    const notice = body.includes('那个对话不在了')
+    check('说清楚了为什么换了地方', notice,
+          notice ? '' : body.slice(-200).replace(/\n/g, ' '))
+    await page.close()
+  }
+
+  {
+    // tab 也得能指：/settings 永远落在「模型接入」，以前指不到数据源那一屏
+    const { page } = await visit('/settings/datasources')
+    check('深链接直达数据源那一屏', (await page.locator('body').innerText()).includes('数据源'))
+    await page.close()
+    const bare = await visit('/settings')
+    check('不带 tab 时落到第一屏并纠正地址',
+          bare.page.url().endsWith('/settings/providers'), bare.page.url())
+    await bare.page.close()
+    const bogus = await visit('/knowledge/没这个tab')
+    check('认不出的 tab 名回落而不是空白',
+          bogus.page.url().endsWith('/knowledge/kb'), bogus.page.url())
+    await bogus.page.close()
+  }
+
+  {
+    // 画布也该能指。这条路最容易出事：前进/后退会绕过选择器里那道
+    // "未保存改动"的确认直接换图
+    const wfs = await (await fetch(`${API}/workflows`)).json()
+    if (wfs.length >= 2) {
+      const bare = await visit('/studio')
+      check('/studio 落到第一张图并纠正地址',
+            bare.page.url().endsWith(`/studio/${wfs[0].id}`), bare.page.url())
+      await bare.page.close()
+
+      const { page } = await visit(`/studio/${wfs[1].id}`)
+      check('深链接直达那张图', (await page.locator('body').innerText()).includes(wfs[1].name),
+            `想要「${wfs[1].name}」`)
+      await page.close()
+    } else {
+      check(`（跳过：库里只有 ${wfs.length} 张工作流）`, true)
+    }
+
+    const { page } = await visit('/studio/根本没这张图')
+    const body = await page.locator('body').innerText()
+    // 说一次就够。这里真弹过三次——effect 在请求回来之前又跑了两遍
+    const times = (body.match(/那张工作流不在了/g) || []).length
+    check('指向不存在的图时说一次并让开', times === 1 && /\/studio\/[0-9a-f]{8,}$/.test(page.url()),
+          `提示 ${times} 次，落在 ${page.url()}`)
+    await page.close()
+  }
+
+  {
+    // 问数据页的「在画布里打开」：现在会直接把人送去 /studio。
+    // 送过去的是一张还没存、没有 id 的草稿图，所以那边的"不带 id 就落到
+    // 第一张图"必须让开——不让开就会拿第一张图把它盖掉，而且因为 setGraph
+    // 标了脏，还会先弹一句莫名其妙的"有未保存的改动"
+    const convs = await (await fetch(`${API}/conversations`)).json()
+    let seed = null
+    for (const c of convs.slice(0, 8)) {
+      const d = await (await fetch(`${API}/conversations/${c.id}`)).json()
+      const t = (d.turns || []).find((x) => x.graph?.nodes?.length)
+      if (t) { seed = { id: c.id, want: t.graph.nodes.length }; break }
+    }
+    if (seed) {
+      const page = await ctx.newPage()
+      let dialogs = 0
+      page.on('dialog', async (d) => { dialogs++; await d.dismiss() })
+      await page.goto(`${WEB}/chat/${seed.id}`, { waitUntil: 'networkidle' })
+      await page.waitForTimeout(900)
+      const btn = page.getByRole('button', { name: '在画布里打开' }).first()
+      if (await btn.count()) {
+        await btn.click()
+        await page.waitForTimeout(1600)
+        check('「在画布里打开」会把人送到画布', page.url().endsWith('/studio'), page.url())
+        check('送过去的草稿图没被第一张工作流盖掉',
+              (await page.locator('.react-flow__node').count()) === seed.want,
+              `${await page.locator('.react-flow__node').count()} / ${seed.want} 个节点`)
+        check('没有弹莫名其妙的"未保存改动"', dialogs === 0, `弹了 ${dialogs} 次`)
+      } else {
+        check('（跳过：这一轮没有「在画布里打开」）', true)
+      }
+      await page.close()
+    } else {
+      check('（跳过：前 8 个会话里没有带图的轮次）', true)
+    }
+  }
+
+  {
+    // 运行列表只取前 100 条，而一条老运行的链接必须也能打开——
+    // 所以详情是按 id 直接取的，不是在列表里找
+    const all = await (await fetch(`${API}/runs?limit=200`)).json()
+    if (all.length > 100) {
+      const old = all[all.length - 1]
+      const { page } = await visit(`/runs/${old.id}`)
+      const body = await page.locator('body').innerText()
+      check('第 100 条之后的老运行也打得开', body.includes(old.id.slice(0, 6)),
+            `run ${old.id.slice(0, 8)}`)
+      await page.close()
+    } else {
+      check(`（跳过：库里只有 ${all.length} 条运行，不足以验证越过列表上限）`, true)
+    }
+  }
+}
+
 console.log('\n=== 三处讲的是同一个故事 ===')
 {
   // 同一次运行，运行页详情和 preview 里的 dense 渲染应该给出同一批步骤。

@@ -3,23 +3,22 @@ import { Play, Plug, Plus, RefreshCw, Terminal, Trash2, Wrench } from 'lucide-re
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
-import { Empty, JsonInput, Modal, Spinner, Tabs, useToast } from '../components/ui'
+import { Empty, JsonInput, Modal, Spinner, Tabs, useTabRoute, useToast } from '../components/ui'
 import type { ToolInfo } from '../types'
 
+// 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
+const TABS = [
+  { key: 'tools', label: '工具库' },
+  { key: 'sandbox', label: '沙箱试验台' },
+  { key: 'custom', label: '自定义工具' },
+  { key: 'mcp', label: 'MCP 接入' },
+]
+
 export function ToolsPage() {
-  const [tab, setTab] = useState('tools')
+  const [tab, setTab] = useTabRoute(TABS.map((t) => t.key), 'tools')
   return (
     <div className="flex h-full flex-col">
-      <Tabs
-        tabs={[
-          { key: 'tools', label: '工具库' },
-          { key: 'sandbox', label: '沙箱试验台' },
-          { key: 'custom', label: '自定义工具' },
-          { key: 'mcp', label: 'MCP 接入' },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         {tab === 'tools' && <ToolLibrary />}
         {tab === 'sandbox' && <SandboxLab />}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { Code2, GitFork, History, RefreshCw, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -12,6 +13,8 @@ import type { Run, RunEvent } from '../types'
 /** 运行历史。每次运行的完整事件流都落了库，所以这里能完整回放。 */
 export function RunsPage() {
   const toast = useToast()
+  const { runId } = useParams()
+  const navigate = useNavigate()
   const [runs, setRuns] = useState<Run[]>([])
   const [selected, setSelected] = useState<Run | null>(null)
   const [events, setEvents] = useState<RunEvent[]>([])
@@ -31,11 +34,31 @@ export function RunsPage() {
   }
   useEffect(() => { void load() }, [])
 
-  const open = async (run: Run) => {
-    setSelected(run)
-    setEvents([])
-    setEvents(await api.runs.events(run.id).catch(() => []))
+  // URL 说看哪条就看哪条。**按 id 直接取**，不在 runs 里找——列表只有前 100 条，
+  // 而一条老运行的链接必须也能打开，否则"可分享"就只对最近的运行成立
+  const refreshDetail = async (id: string) => {
+    const run = await api.runs.get(id).catch(() => null)
+    if (run) setSelected(run)
+    setEvents(await api.runs.events(id).catch(() => []))
   }
+
+  useEffect(() => {
+    if (!runId) { setSelected(null); setEvents([]); return }
+    let live = true
+    setEvents([])
+    void (async () => {
+      const run = await api.runs.get(runId).catch(() => null)
+      if (!live) return
+      if (!run) {
+        toast('那次运行不在了', 'info')
+        navigate('/runs', { replace: true })
+        return
+      }
+      setSelected(run)
+      setEvents(await api.runs.events(runId).catch(() => []))
+    })()
+    return () => { live = false }
+  }, [runId])
 
   const shown = runs.filter(
     (r) => !filter || r.workflow_name?.includes(filter) || r.status === filter
@@ -81,7 +104,7 @@ export function RunsPage() {
             return (
               <button
                 key={run.id}
-                onClick={() => open(run)}
+                onClick={() => navigate(`/runs/${run.id}`)}
                 className={clsx(
                   'flex w-full flex-col gap-0.5 border-b px-3 py-2 text-left hover:bg-hover',
                   selected?.id === run.id && 'bg-hover',
@@ -160,7 +183,7 @@ export function RunsPage() {
                 onClick={async () => {
                   if (!confirm('删除这条运行记录？')) return
                   await api.runs.remove(selected.id)
-                  setSelected(null)
+                  navigate('/runs', { replace: true })
                   await load()
                   toast('已删除', 'ok')
                 }}
@@ -175,7 +198,7 @@ export function RunsPage() {
             {pendingHere.length > 0 && (
               <div className="shrink-0 border-b" style={{ borderColor: 'var(--warn)' }}>
                 {pendingHere.map((a) => (
-                  <ApprovalCard key={a.id} approval={a} onResolved={() => open(selected)} />
+                  <ApprovalCard key={a.id} approval={a} onResolved={refreshDetail} />
                 ))}
               </div>
             )}

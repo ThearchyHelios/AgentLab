@@ -2,22 +2,21 @@ import { useEffect, useRef, useState } from 'react'
 import { BookOpen, Brain, Plus, Search, Sparkles, Trash2, Upload } from 'lucide-react'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
-import { Empty, Modal, Spinner, Tabs, useToast } from '../components/ui'
+import { Empty, Modal, Spinner, Tabs, useTabRoute, useToast } from '../components/ui'
 import type { KbDocument, MemoryItem, Skill } from '../types'
 
+// 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
+const TABS = [
+  { key: 'kb', label: '知识库' },
+  { key: 'memory', label: '长期记忆' },
+  { key: 'skills', label: '方法论 Skill' },
+]
+
 export function KnowledgePage() {
-  const [tab, setTab] = useState('kb')
+  const [tab, setTab] = useTabRoute(TABS.map((t) => t.key), 'kb')
   return (
     <div className="flex h-full flex-col">
-      <Tabs
-        tabs={[
-          { key: 'kb', label: '知识库' },
-          { key: 'memory', label: '长期记忆' },
-          { key: 'skills', label: '方法论 Skill' },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         {tab === 'kb' && <KbTab />}
         {tab === 'memory' && <MemoryTab />}

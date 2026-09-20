@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import {
   AlertTriangle, Check, ChevronDown, Copy, LayoutGrid, Plus, Save, ShieldCheck,
   Trash2, Variable, Wand2,
@@ -18,12 +19,20 @@ import type { Workflow } from '../types'
 
 export function StudioPage() {
   const toast = useToast()
+  const { workflowId } = useParams()
+  const navigate = useNavigate()
   const { workflows, refresh } = useCatalog()
+  const catalogLoaded = useCatalog((s) => s.loaded)
   const workflow = useStudio((s) => s.workflow)
   const dirty = useStudio((s) => s.dirty)
+  // 只订阅数量，不订阅整个 nodes——后者每拖一下都会让整页重渲染
+  const nodeCount = useStudio((s) => s.nodes.length)
   const issues = useStudio((s) => s.issues)
   const streaming = useStudio((s) => s.streaming)
   const { load, save, setGraph, select } = useStudio()
+
+  /** 正在按 id 去取哪张图。防止 effect 重入时重复发请求、重复弹提示 */
+  const resolving = useRef<string | null>(null)
 
   const [picker, setPicker] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -31,10 +40,45 @@ export function StudioPage() {
   const [vars, setVars] = useState(false)
   const copilotActive = useStudio((s) => s.copilot.active)
 
-  // 首次进来自动打开第一张图
+  // /studio 不带 id：落到第一张图。replace 而不是 push，否则按后退会回到
+  // 这个空壳地址、又被弹回来，人就在这儿出不去了。
+  //
+  // 画布上已经有东西就别跳——问数据页的「在画布里打开」正是这么送过来的：
+  // 一张还没存、还没有 id 的草稿图。跳过去会拿第一张图把它盖掉，
+  // 而且因为 setGraph 标了脏，还会先弹一句莫名其妙的"有未保存的改动"
   useEffect(() => {
-    if (!workflow && workflows.length) load(workflows[0])
-  }, [workflows, workflow, load])
+    if (workflowId || !workflows.length || nodeCount) return
+    navigate(`/studio/${workflows[0].id}`, { replace: true })
+  }, [workflowId, workflows, nodeCount, navigate])
+
+  // URL → 画布。地址说打开哪张就打开哪张
+  useEffect(() => {
+    if (!workflowId || workflow?.id === workflowId || !catalogLoaded) return
+
+    // 选择器里本来就有一道"未保存改动"的确认，但那道闸在它的 onClick 里，
+    // 而浏览器前进/后退会绕过选择器直接换图——改了一半的画布就这么没了。
+    // 所以这里补一道，取消就把地址退回去
+    if (dirty && !confirm('当前画布有未保存的改动，切换后会丢失。确定要切换吗？')) {
+      navigate(workflow ? `/studio/${workflow.id}` : '/studio', { replace: true })
+      return
+    }
+
+    const known = workflows.find((w) => w.id === workflowId)
+    if (known) { load(known); return }
+
+    // 不在目录里：目录可能是旧的，也可能真被删了。按 id 取一次问清楚，
+    // 而不是直接判死——分享出去的链接不该因为对方目录没刷新就打不开。
+    //
+    // 这一路是异步的，而 effect 的依赖里有好几个会变的东西（目录、dirty），
+    // 请求还没回来它就又跑了一遍：实测同一个坏地址弹了三次"不在了"。
+    // 用一个 ref 记住正在解哪个 id，重复的直接让开
+    if (resolving.current === workflowId) return
+    resolving.current = workflowId
+    void api.workflows.get(workflowId).then(load).catch(() => {
+      toast('那张工作流不在了', 'info')
+      navigate('/studio', { replace: true })
+    })
+  }, [workflowId, workflow, workflows, catalogLoaded, dirty, load, navigate, toast])
 
   // 开始跑图或生成时，属性面板让开——不然进展发生在一块被盖住的地方。
   // （选中节点即滑出属性面板，取消选中即收起，不再需要手动切 tab）
@@ -202,7 +246,7 @@ export function StudioPage() {
 // -------------------------------------------------------------------------
 
 function NewWorkflowButton({ onDone }: { onDone: () => void }) {
-  const load = useStudio((s) => s.load)
+  const navigate = useNavigate()
   const toast = useToast()
   return (
     <button
@@ -227,7 +271,9 @@ function NewWorkflowButton({ onDone }: { onDone: () => void }) {
               edges: [{ source: 'start', target: 'done' }],
             },
           })
-          load(created)
+          // 走地址而不是直接 load：新图也得有自己的 URL，否则刚建完
+          // 刷新一下就回到了第一张
+          navigate(`/studio/${created.id}`)
           onDone()
           toast('已创建', 'ok')
         } catch (e: any) {
@@ -242,7 +288,7 @@ function NewWorkflowButton({ onDone }: { onDone: () => void }) {
 
 function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { workflows, refresh } = useCatalog()
-  const load = useStudio((s) => s.load)
+  const navigate = useNavigate()
   const current = useStudio((s) => s.workflow)
   const toast = useToast()
 
@@ -269,14 +315,16 @@ function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void 
             )}
             onClick={() => {
               // 切换会把当前画布整个换掉。没存过的改动就这么没了，
-              // 而且全局没有撤销——至少问一句
+              // 而且全局没有撤销——至少问一句。
+              // 闸放在导航**之前**：地址一变，URL→画布那个 effect 就会加载，
+              // 那时候再问就晚了（虽然那边也补了一道，兜的是前进/后退）
               if (
                 useStudio.getState().dirty &&
                 !confirm('当前画布有未保存的改动，切换后会丢失。确定要切换吗？')
               ) {
                 return
               }
-              load(w)
+              navigate(`/studio/${w.id}`)
               onClose()
             }}
           >
@@ -306,6 +354,9 @@ function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void 
                 e.stopPropagation()
                 if (confirm(`删除「${w.name}」？运行记录也会一并删除。`)) {
                   void act(() => api.workflows.remove(w.id), '已删除')
+                  // 删的就是眼前这张：地址还指着它，不挪走的话刷新一下
+                  // 就会撞上"那张工作流不在了"
+                  if (w.id === current?.id) navigate('/studio', { replace: true })
                 }
               }}
             >

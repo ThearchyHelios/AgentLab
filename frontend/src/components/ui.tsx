@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { AlertCircle, CheckCircle2, Info, Loader2, X } from 'lucide-react'
 import clsx from 'clsx'
@@ -99,6 +100,34 @@ export function Empty({ icon, title, hint, action }: {
       {action && <div className="mt-2">{action}</div>}
     </div>
   )
+}
+
+/**
+ * 把 Tabs 的选中项接到 URL 的最后一段上：/settings/datasources。
+ *
+ * 和 Tabs 放在一起而不是单开一个 hooks 文件——tab 和它的地址是同一件事，
+ * 拆到两处迟早各改各的。三个 tab 页（知识 / 工具 / 设置）各接一行。
+ *
+ * 用 replace 而不是 push：切 tab 不该在后退历史里堆一串，按后退是想离开
+ * 这一页，不是想把四个标签倒着走一遍。
+ *
+ * 认不出的 tab 名（链接过期、手输错了）回落到 fallback，并把地址一起纠正过来，
+ * 免得地址栏和眼前这一屏说的不是同一件事。
+ */
+export function useTabRoute(
+  valid: readonly string[], fallback: string,
+): [string, (key: string) => void] {
+  const { tab } = useParams()
+  const navigate = useNavigate()
+  const { pathname } = useLocation()
+  const base = '/' + pathname.split('/').filter(Boolean)[0]
+  const active = tab && valid.includes(tab) ? tab : fallback
+
+  useEffect(() => {
+    if (tab !== active) navigate(`${base}/${active}`, { replace: true })
+  }, [tab, active, base, navigate])
+
+  return [active, (key: string) => navigate(`${base}/${key}`, { replace: true })]
 }
 
 export function Tabs({ tabs, active, onChange }: {

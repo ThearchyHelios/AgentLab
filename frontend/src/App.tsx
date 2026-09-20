@@ -74,15 +74,26 @@ export default function App() {
       </nav>
 
       <main className="min-w-0 flex-1">
+        {/* 「在看哪个」属于 URL，不属于 store。
+            每页写成两条显式路由（带 id / 不带 id），而不是可选参数 `:id?`：
+            「没带 id」是真要单独处理的一种情况（落到上次那个、或列表第一个），
+            藏在一个问号里下次就没人记得它存在了。
+            导航高亮不用动——NavLink 默认前缀匹配，/chat/abc 照样点亮「问数据」。*/}
         <Routes>
           {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人 */}
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:conversationId" element={<ChatPage />} />
           <Route path="/studio" element={<StudioPage />} />
+          <Route path="/studio/:workflowId" element={<StudioPage />} />
           <Route path="/runs" element={<RunsPage />} />
+          <Route path="/runs/:runId" element={<RunsPage />} />
           <Route path="/tools" element={<ToolsPage />} />
+          <Route path="/tools/:tab" element={<ToolsPage />} />
           <Route path="/knowledge" element={<KnowledgePage />} />
+          <Route path="/knowledge/:tab" element={<KnowledgePage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/settings/:tab" element={<SettingsPage />} />
         </Routes>
       </main>
     </div>
