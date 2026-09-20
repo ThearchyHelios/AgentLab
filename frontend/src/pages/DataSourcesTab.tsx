@@ -234,11 +234,15 @@ function SourceCard({ row, onChanged, onEdit }: {
     setBusy('introspect')
     try {
       const r = await api.datasources.introspect(row.id)
-      toast(`探到 ${r.table_count} 个对象`, r.table_count ? 'ok' : 'error')
-      if (!r.table_count) {
-        // 大概率是 schema 没配对：只读账号名下往往什么都没有
-        const s = await api.datasources.schema(row.id)
-        toast(s.summary?.includes('schema') ? s.summary.slice(0, 120) : '没探到对象，检查 schema 配置', 'error')
+      if (r.table_count) {
+        toast(`探到 ${r.table_count} 个对象`, 'ok')
+      } else if (r.schema_error) {
+        // 真失败了。以前这里一律说"检查 schema 配置"，而超时和填错 schema
+        // 要做的事完全不同，卡片上那段红字写了实情，这里指过去
+        toast(`探查失败：${r.schema_error.slice(0, 100)}`, 'error')
+      } else {
+        // 连得上、也没报错，就是这个 schema 下真的没有对象
+        toast('这个库里没有对象，多半是 schema 填的不对——卡片上列了可选的', 'error')
       }
       await onChanged()
     } catch (e: any) {
@@ -285,6 +289,19 @@ function SourceCard({ row, onChanged, onEdit }: {
         <div className="mt-1 text-[11px] text-dim">{row.description}</div>
       )}
 
+      {row.schema_error && (
+        <div className="mt-1.5 rounded border px-2 py-1.5 text-[10.5px] leading-relaxed"
+             style={{ borderColor: 'var(--err)', color: 'var(--err)' }}>
+          上次探查失败：{row.schema_error}
+          {!!row.available_schemas?.length && (
+            <div className="mt-1 text-dim">
+              这台服务器上可选的库：{row.available_schemas.slice(0, 10).join('、')}
+              ——当前连的是「{row.database || '未指定'}」，不对的话在「编辑」里改
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10.5px] text-faint">
         <span className="mono">
           {row.kind === 'sqlite' ? row.database : `${row.username ?? ''}@${row.host ?? ''}:${row.port ?? ''}`}
@@ -294,6 +311,14 @@ function SourceCard({ row, onChanged, onEdit }: {
           <button className="chip hover:bg-hover" onClick={peek}>
             <Table2 size={9} className="mr-1 inline" />{row.table_count} 个对象
           </button>
+        ) : row.schema_error ? (
+          // "还没探查"和"探查失败了"是两回事：前者点一下按钮就行，后者点了
+          // 也没用。以前两者显示成同一句，于是用户点了探查、看到还是"未探查"，
+          // 而 agent 那边也被告知"还没探查过"——没有一处说的是真话
+          <span className="chip" style={{ color: 'var(--err)', borderColor: 'var(--err)' }}
+                title={row.schema_error}>
+            探查失败
+          </span>
         ) : (
           <span className="chip" style={{ color: 'var(--warn)' }}>结构未探查</span>
         )}

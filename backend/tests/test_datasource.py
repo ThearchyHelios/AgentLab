@@ -15,6 +15,15 @@ import pytest
 from app.data.engine import build_url, run_query, test_connection
 from app.data.guard import QueryLimits, SqlRejected
 from app.data.introspect import describe_table, introspect, summary, table_names
+from app.main import app as _fastapi_app
+from httpx import ASGITransport, AsyncClient
+
+
+@pytest.fixture
+async def client():
+    transport = ASGITransport(app=_fastapi_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
 
 
 @pytest.fixture
@@ -72,7 +81,7 @@ async def test_summary_is_compact_enough_for_a_prompt(source):
 
 async def test_summary_says_so_when_never_introspected(source):
     """没探查过就明说，别让 Copilot 对着空气编表名。"""
-    assert "尚未探查" in summary(source)
+    assert "还没有探查过" in summary(source)
 
 
 async def test_describe_table_accepts_qualified_name(source):
@@ -225,3 +234,103 @@ def test_schema_stats_sql_covers_every_supported_kind():
     for kind in SUPPORTED_KINDS:
         assert kind in _SCHEMA_STATS_SQL or kind in ("sqlite", "mysql", "mariadb",
                                                      "postgres", "postgresql")
+
+
+# --------------------------------------------------------------------------
+# 探查失败 ≠ 还没探查
+# --------------------------------------------------------------------------
+#
+# run 554a0f92：shop 的探查因为 "Lost connection to MySQL server during query"
+# 失败了，但失败被存成了一个"成功但没表"的缓存，schema_synced_at 照常盖戳。
+# 于是 db_schema 工具对 agent 说"还没有探查过结构，请在设置页里执行一次"——
+# 一句错话，配一个 agent 根本做不到的动作。它只好自己摸：猜 7 个表名、发一条
+# SELECT 1 试连通性、再用三条 information_schema 把 schema 重建一遍。
+# 9 次工具调用花掉 6 次，前 29 秒没碰到一点真数据。
+#
+# 而 available_schemas 那 10 个候选一直躺在缓存里，没人交给它。
+
+
+class _FailedCache:
+    """探查失败之后 schema_cache 的样子。"""
+
+    name = "shop"
+    kind = "mysql"
+    database = "prod_shop"
+    description = ""
+    readonly = True
+    schema_cache = {
+        "tables": {}, "total": 0, "failed": True,
+        "error": "OperationalError: (2013, 'Lost connection to MySQL server during query')",
+        "available_schemas": ["prod_shop", "shop_dev", "toolsdb"],
+    }
+
+
+class _NeverRun(_FailedCache):
+    """从来没探查过的样子。和上面必须说不一样的话。"""
+
+    schema_cache: dict = {}
+
+
+def test_why_empty_tells_the_two_cases_apart():
+    from app.data.introspect import why_empty
+
+    assert "失败" in why_empty(_FailedCache.schema_cache)
+    assert "Lost connection" in why_empty(_FailedCache.schema_cache)
+    assert why_empty({}) == "还没有探查过结构"
+
+
+def test_schema_tool_tells_the_agent_the_truth():
+    """给 agent 的那句话要是实情，而且要给一个它做得到的下一步。"""
+    from app.tools.datasource import _no_schema_note
+
+    note = _no_schema_note(_FailedCache)
+    assert "失败" in note and "Lost connection" in note
+    # 候选一直在缓存里，以前没人交出去
+    assert "prod_shop" in note and "toolsdb" in note
+    # agent 进不了设置页。它做得到的是自己查数据字典——那条路它最后也走通了，
+    # 只是自己摸索了三轮
+    assert "information_schema" in note
+    assert "不要猜表名" in note
+    # 不能再说"请到设置页"
+    assert "设置页" not in note
+
+    fresh = _no_schema_note(_NeverRun)
+    assert "还没有探查过" in fresh
+    assert "失败" not in fresh
+
+
+def test_describe_table_does_not_claim_the_table_is_missing():
+    """缓存是空的时候，说"里面没有这张表"是在误导——真相是我们什么都不知道。"""
+    from app.data.introspect import describe_table
+
+    out = describe_table(_FailedCache, "user")
+    assert "无法判断" in out
+    assert "失败" in out
+    # 以前是 "数据源「shop」里没有 user。现有的对象：（还没探查过结构）"
+    assert "现有的对象" not in out
+
+
+@pytest.mark.asyncio
+async def test_introspect_failure_does_not_get_a_synced_stamp(client, monkeypatch):
+    """失败要把缓存留下（候选是下一步的线索），但不能盖"已同步"的戳。
+
+    以前盖了，于是界面说同步过、工具说还没探查过，两边都不说真话。
+    """
+    import app.api.datasources as mod
+
+    async def failed(source, schema=None):
+        return dict(_FailedCache.schema_cache)
+
+    created = await client.post("/api/datasources", json={
+        "name": "introspect_fail", "kind": "sqlite", "database": ":memory:",
+    })
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+
+    monkeypatch.setattr(mod.introspect_mod, "introspect", failed)
+    out = (await client.post(f"/api/datasources/{sid}/introspect")).json()
+
+    assert out["schema_synced_at"] is None, "失败不该盖已同步的戳"
+    assert "Lost connection" in out["schema_error"]
+    assert out["available_schemas"] == ["prod_shop", "shop_dev", "toolsdb"]
+    assert out["table_count"] == 0

@@ -47,6 +47,34 @@ def tool_names(source: DataSource) -> list[str]:
     return [f"{QUERY_PREFIX}{source.name}", f"{SCHEMA_PREFIX}{source.name}"]
 
 
+def _no_schema_note(source: DataSource) -> str:
+    """结构拿不到时，把实情和下一步一起交给 agent。
+
+    以前这里只说"结构尚未探查，请在设置页里执行一次"。两个问题：它可能是错的
+    （探查执行过了，是超时失败），而且它给的下一步 agent 根本做不到——agent
+    进不了设置页。于是它只能自己摸：run 554a0f92 里先猜了 7 个表名、又发了
+    一条 SELECT 1 试连通性、再用三条 information_schema 把 schema 重建一遍，
+    9 次工具调用花掉 6 次、29 秒之后才碰到真正要查的数据。
+
+    那条自救路线是对的，只是它自己摸索了三轮才找到。直接告诉它。
+    """
+    cache = source.schema_cache or {}
+    note = f" {introspect.why_empty(cache)}。"
+    candidates = cache.get("available_schemas") or []
+    if candidates:
+        # 这几个候选一直在缓存里躺着，只是以前没人交给 agent
+        note += (
+            f"当前连的库是「{source.database or '未指定'}」，"
+            f"这台服务器上还有这些库可选：{'、'.join(candidates[:10])}。"
+        )
+    note += (
+        "**不要猜表名**——直接查数据字典自己确认，"
+        "例如 information_schema.tables / information_schema.columns"
+        "（SQLite 则是 sqlite_master），一条带 WHERE 的查询就能拿到表和字段。"
+    )
+    return note
+
+
 def _query_description(source: DataSource) -> str:
     tables = introspect.table_names(source)
     head = f"在数据源「{source.name}」上执行 SQL 查询。"
@@ -57,9 +85,9 @@ def _query_description(source: DataSource) -> str:
         listed = "、".join(tables[:25])
         more = f" 等 {len(tables)} 张表" if len(tables) > 25 else ""
         head += f" 可用表：{listed}{more}。"
+        head += " 字段不确定时先查结构，不要猜字段名。"
     else:
-        head += " 结构尚未探查，先用同名的 db_schema 工具看看有哪些表。"
-    head += " 字段不确定时先查结构，不要猜字段名。"
+        head += _no_schema_note(source)
     return head
 
 
@@ -139,10 +167,8 @@ def _make_schema_tool(source: DataSource) -> StructuredTool:
             return "\n\n".join(introspect.describe_table(source, t) for t in wanted)
         tables = introspect.table_names(source)
         if not tables:
-            return (
-                f"数据源「{source.name}」还没有探查过结构。"
-                "请在设置页里对它执行一次结构探查。"
-            )
+            # 把实情交出去，而不是让它去点一个它点不到的按钮
+            return f"数据源「{source.name}」的结构信息不可用。" + _no_schema_note(source)
         return f"数据源「{source.name}」共 {len(tables)} 张表：\n" + "\n".join(
             f"  {n}" for n in tables
         )

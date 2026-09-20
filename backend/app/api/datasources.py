@@ -72,12 +72,20 @@ class DataSourceOut(BaseModel):
     has_password: bool = False
     table_count: int = 0
     schema_synced_at: str | None = None
+    #: 上次探查为什么没拿到表。"还没探查"和"探查失败了"是两回事：
+    #: 前者去点一下按钮就行，后者点了也没用，得先解决超时或者换 schema
+    schema_error: str = ""
+    #: 这台服务器上还有哪些库/schema 可选。探不到表时它就是下一步的线索
+    available_schemas: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
 
 
 def _to_out(row: DataSource) -> DataSourceOut:
-    tables = (row.schema_cache or {}).get("tables") or {}
+    cache = row.schema_cache or {}
+    tables = cache.get("tables") or {}
     return DataSourceOut(
+        schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
+        available_schemas=list(cache.get("available_schemas") or []),
         id=row.id, name=row.name, kind=row.kind, host=row.host, port=row.port,
         database=row.database, username=row.username, options=row.options or {},
         readonly=row.readonly, description=row.description, enabled=row.enabled,
@@ -190,7 +198,11 @@ async def introspect_source(
         row.schema_cache = await introspect_mod.introspect(row, schema=schema)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"探查失败：{type(e).__name__}: {e}") from e
-    row.schema_synced_at = datetime.now(timezone.utc)
+    # 失败也要把缓存存下来——里面的 available_schemas 正是下一步的线索——
+    # 但**不能盖上"已同步"的戳**。以前盖了，于是界面显示同步过、工具却说
+    # "还没探查过"，两边都不说真话（run 554a0f92）
+    if not row.schema_cache.get("failed"):
+        row.schema_synced_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(row)
     return _to_out(row)

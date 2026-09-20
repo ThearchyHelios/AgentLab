@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.engine.reflection import ObjectKind
 
 from app.data.engine import engines
 
@@ -127,22 +128,39 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         truncated = len(names) + len(views) > _MAX_TABLES
         picked = (names + views)[:_MAX_TABLES]
 
+        # 批量反射接口（SQLAlchemy 2.0）。
+        #
+        # **别指望它能治超时。** 实测 60 张表：逐表调用 121 次往返、批量 122 次
+        # ——SQLAlchemy 的反射缓存本来就把 get_columns / get_pk_constraint 合并
+        # 成了同一次底层查询，而 MySQL 方言压根没实现 get_multi_*，落到基类
+        # 还是每表一次 SHOW CREATE TABLE。真正能少往返的是 PostgreSQL 这类
+        # 原生实现了批量的方言。
+        #
+        # 换成它是因为这是 2.0 的正经接口、少三层 try/except，不是因为它快。
+        # shop 那次 "Lost connection to MySQL server during query"
+        # （run 554a0f92）多半是偶发的服务端超时——所以真正的对策不在这里，
+        # 在下面：失败要如实记成失败，让工具和界面都说真话。
+        def _multi(fn: Any, **kw: Any) -> dict[Any, Any]:
+            try:
+                return dict(fn(schema=target_schema, filter_names=picked,
+                               kind=ObjectKind.ANY, **kw))
+            except NotImplementedError:
+                return {}          # 表注释这类不是所有方言都支持
+            except Exception:  # noqa: BLE001 - 取不到不该让整次探查失败
+                return {}
+
+        columns_by = _multi(inspector.get_multi_columns)
+        pk_by = _multi(inspector.get_multi_pk_constraint)
+        comment_by = _multi(inspector.get_multi_table_comment)
+
         tables: dict[str, Any] = {}
         for name in picked:
-            try:
-                columns = inspector.get_columns(name, schema=target_schema)
-            except Exception:  # noqa: BLE001 - 单表失败不该让整次探查失败
-                continue
-            try:
-                pk = (inspector.get_pk_constraint(name, schema=target_schema) or {}).get(
-                    "constrained_columns"
-                ) or []
-            except Exception:  # noqa: BLE001
-                pk = []
-            try:
-                comment = (inspector.get_table_comment(name, schema=target_schema) or {}).get("text")
-            except Exception:  # noqa: BLE001 - 不是所有方言都支持表注释
-                comment = None
+            key = (target_schema, name)
+            columns = columns_by.get(key)
+            if not columns:
+                continue           # 这张表反射不出来，跳过，别毁掉整次探查
+            pk = (pk_by.get(key) or {}).get("constrained_columns") or []
+            comment = (comment_by.get(key) or {}).get("text")
 
             tables[name] = {
                 # 写 SQL 要用的全名。没有 schema 前缀时 Oracle 直接 ORA-00942——
@@ -171,11 +189,17 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         # schema 名填错是高频事故（大小写、拼写、或者根本不知道该填什么），
         # 直接把驱动异常抛出去等于让人自己去猜。先看看连接本身好不好：
         # 能列出候选说明只是 schema 不对，这种情况给出可选项比报错有用得多。
+        #
+        # 但**这里回来的是一次失败，不是"还没探查"**。以前两者存成了一模一样
+        # 的形状（tables 空 + 一个没人读的 error 字段），于是工具对 agent 说
+        # "还没有探查过结构，请在设置页里执行一次"——而用户明明执行过，是超时了。
+        # run 554a0f92 里 agent 因此花了 6 次调用、29 秒自己重建 schema。
+        # failed 这个标记就是为了让下游分得清。
         candidates = await list_schemas(source)
         if not candidates:
             raise
         payload = {"tables": {}, "truncated": False, "total": 0,
-                   "error": f"{type(exc).__name__}: {exc}"}
+                   "failed": True, "error": f"{type(exc).__name__}: {exc}"}
 
     payload["synced_at"] = datetime.now(timezone.utc).isoformat()
     payload["schema"] = target
@@ -206,6 +230,18 @@ def summary(source: Any, *, max_tables: int = 40, detail: bool = True) -> str:
     return _detailed_summary(source, max_tables=max_tables)
 
 
+def why_empty(cache: dict[str, Any]) -> str:
+    """结构为什么是空的。一句话，给 agent 和用户看的是同一句。
+
+    分清"还没探查"和"探查失败了"：前者该去点一下按钮，后者点了也没用，
+    要先解决超时或换 schema。以前两者说的是同一句话。
+    """
+    if not cache.get("failed"):
+        return "还没有探查过结构"
+    err = str(cache.get("error") or "").strip()
+    return f"结构探查失败了：{err[:200]}" if err else "结构探查失败了"
+
+
 def _empty_summary(source: Any, cache: dict[str, Any]) -> str:
     hint = ""
     candidates = cache.get("available_schemas") or []
@@ -213,7 +249,7 @@ def _empty_summary(source: Any, cache: dict[str, Any]) -> str:
         hint = f"｜该账号名下没有对象，数据可能在这些 schema：{'、'.join(candidates[:8])}"
     return (
         f"- {source.name}（{source.kind}）：{source.description or '未填说明'}"
-        f"｜尚未探查结构{hint}"
+        f"｜{why_empty(cache)}{hint}"
     )
 
 
@@ -255,9 +291,18 @@ def describe_table(source: Any, table: str) -> str:
         lowered = table.rsplit(".", 1)[-1].lower()
         meta = next((m for n, m in tables.items() if n.lower() == lowered), None)
     if not meta:
+        if not tables:
+            # 缓存是空的，说"里面没有这张表"就是在误导——真相是我们什么都不知道。
+            # run 554a0f92 里 agent 一次问了 7 个表名，收到 7 条一模一样的
+            # "没有 X。现有的对象：（还没探查过结构）"，白花一整步
+            return (
+                f"数据源「{source.name}」的结构信息不可用（{why_empty(cache)}），"
+                "所以无法判断有没有这张表。请直接查数据字典"
+                "（information_schema.tables / columns，SQLite 用 sqlite_master）。"
+            )
         available = "、".join(
             m.get("qualified", n) for n, m in list(tables.items())[:30]
-        ) or "（还没探查过结构）"
+        )
         return f"数据源「{source.name}」里没有 {table}。现有的对象：{available}"
 
     head = f"{'视图' if meta.get('is_view') else '表'} {meta.get('qualified', table)}"
