@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, Play, ShieldCheck, Square } from 'lucide-react'
+import { ChevronDown, Play, RotateCw, ShieldCheck, Square } from 'lucide-react'
 import { useStudio } from '../store/studio'
 import { Spinner, useToast } from '../components/ui'
 
@@ -19,7 +19,7 @@ export function RunControl() {
   const issues = useStudio((s) => s.issues)
   const workflow = useStudio((s) => s.workflow)
   const dirty = useStudio((s) => s.dirty)
-  const { startRun, startFormalRun, stopRun } = useStudio()
+  const { startRun, startFormalRun, stopRun, continueRun } = useStudio()
   const toast = useToast()
   const [open, setOpen] = useState(false)
   const [values, setValues] = useState<Record<string, string>>({})
@@ -86,8 +86,30 @@ export function RunControl() {
 
   const blocked = !!errors.length || !nodes.length
 
+  const resume = async () => {
+    setBusy(true)
+    try {
+      await continueRun()
+      toast('从断点接着跑，前面跑过的节点不重来', 'ok')
+    } catch (e: any) {
+      toast(e.message ?? '接着跑失败', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
-    <div className="relative" ref={wrap}>
+    <div className="relative flex items-center gap-1.5" ref={wrap}>
+      {/* 图挂在半路时，"接着跑"才是用户接下来最想做的事：他刚在画布上把那个
+          写错的模型 id / 循环条件改好，重跑一遍意味着前面查过的表、跑过的 SQL
+          全部重来。断点一直在 checkpoint 里躺着，只是以前没有入口 */}
+      {run?.status === 'failed' && !blocked && (
+        <button className="btn gap-1.5" disabled={busy} onClick={resume}
+                title="从失败的那个节点接着跑，前面跑过的节点不重来。只能改节点配置，改了结构要重新发起">
+          {busy ? <Spinner size={11} /> : <RotateCw size={11} />}
+          接着跑
+        </button>
+      )}
       <button
         className="btn btn-primary gap-1.5"
         disabled={busy || blocked}

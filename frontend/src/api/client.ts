@@ -108,6 +108,9 @@ export const api = {
       run_class?: 'formal' | 'exploratory'; version?: number
     }) => post<Run>('/runs', body),
     artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
+    /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */
+    continue: (id: string, graph?: GraphSpec | null) =>
+      post<Run>(`/runs/${id}/continue`, { graph: graph ?? null }),
     cancel: (id: string) => post<{ ok: boolean }>(`/runs/${id}/cancel`),
     resume: (id: string, response: any) => post<Run>(`/runs/${id}/resume`, { response }),
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),

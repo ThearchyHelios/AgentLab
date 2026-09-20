@@ -148,6 +148,25 @@ class ValidationResult(BaseModel):
             self.ok = False
 
 
+def topology_of(spec: GraphSpec) -> tuple[tuple, tuple]:
+    """图的骨架：节点的 id 与类型、加上所有的边。**不含任何配置。**
+
+    断点续跑要用它。LangGraph 的 checkpoint 是按节点名存的（编译时
+    `builder.add_node(node.id, …)`），而节点配置是运行时从 spec 现读的
+    （`NodeContext.cfg`）。所以拿一张只改了配置的图去续，checkpoint 对得上，
+    前面跑过的节点结果照样能用；一旦增删节点或改连线，checkpoint 里的
+    通道状态就和新图对不上了——续下去跑出来的是一份似是而非的结果，
+    比直接报错糟得多。
+
+    这正是 resume 那边踩过的坑：不看有没有 checkpoint 就发 Command，
+    LangGraph 拿空 state 从 START 重跑，最后还落成 succeeded。
+    """
+    return (
+        tuple(sorted((n.id, str(n.type)) for n in spec.nodes)),
+        tuple(sorted((e.source, e.target, e.sourceHandle or "") for e in spec.edges)),
+    )
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()

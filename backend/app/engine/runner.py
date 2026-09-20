@@ -18,7 +18,7 @@ from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
-from app.engine.schema import GraphSpec, validate_graph
+from app.engine.schema import GraphSpec, topology_of, validate_graph
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +302,88 @@ class RunManager:
         )
         return run
 
+    async def continue_failed(
+        self, run_id: str, *, graph: dict[str, Any] | None = None, actor: str | None = None
+    ) -> Run:
+        """从失败的地方接着跑，而不是整张图从头来一遍。
+
+        为什么值得单独开这条路：库里 28 条 failed 里，模型 id 写错、401、循环
+        条件语法错、缺必填输入加起来占了大半——全是**配置错了**，改一下就能跑。
+        而现在"改一下再跑"意味着前面花两分钟查完的表结构、跑完的 SQL 全部重来。
+        checkpointer 一直开着（thread_id = run_id），那些结果本来就在库里躺着。
+
+        graph 可以带一张改过的图，但只准改配置：节点 id、类型、连线必须和原来
+        一模一样。checkpoint 是按节点名存的，改了结构就对不上，续下去会拿着
+        错位的通道状态跑出一份似是而非的结果——那比直接报错糟得多。
+        """
+        async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+            if not run:
+                raise KeyError(f"找不到运行 {run_id}")
+            if run.status != "failed":
+                raise ValueError(
+                    f"当前状态是 {run.status}，只有失败的运行能接着跑。"
+                    "（等人工介入的用恢复，已完成的重新发起一次。）"
+                )
+            spec = GraphSpec.model_validate(run.graph)
+            workflow_id = run.workflow_id
+
+        if graph is not None:
+            revised = GraphSpec.model_validate(graph)
+            if topology_of(revised) != topology_of(spec):
+                raise ValueError(
+                    "接着跑只能改节点配置，不能增删节点或改连线——"
+                    "断点是按节点名存的，结构变了就对不上了。"
+                    "要改结构请重新发起一次运行。"
+                )
+            report = validate_graph(revised)
+            if not report.ok:
+                first = next((i.message for i in report.issues if i.level == "error"), "")
+                raise ValueError(f"改过的图没有通过校验：{first}")
+            spec = revised
+
+        # 先问引擎到底停在哪。没有待跑的节点就不是"能接着跑"的情形——
+        # 硬发一个 None 下去，LangGraph 会从 START 重跑整张图
+        run_ctx = RunContext(run_id=run_id, thread_id=run_id, spec=spec, workflow_id=workflow_id)
+        app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
+        config = {"configurable": {"thread_id": run_id}}
+        snapshot = await app.aget_state(config)
+        pending = [str(n) for n in (getattr(snapshot, "next", None) or [])]
+        if not pending:
+            raise ValueError(
+                "这次运行没有留下可以接着跑的断点（多半是还没跑到第一个节点就挂了）。"
+                "请重新发起一次运行——继续下去只会从头跑一遍，还看不出来。"
+            )
+
+        done = [n for n in (snapshot.values or {}).get("nodes", {}) if n not in pending]
+        async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+            bus.set_seq(run_id, run.last_seq)
+            run.status = "running"
+            run.error = None
+            if graph is not None:
+                run.graph = spec.model_dump(mode="json")
+            if actor:
+                run.started_by = actor
+            await session.commit()
+            await session.refresh(run)
+
+        labels = {n.id: n.title for n in spec.nodes}
+        await self._emit(
+            run_id, EventType.RUN_RESUMED,
+            data={
+                "from": pending,
+                # 说清楚"哪些没重来"——否则用户看到时间线又动起来，
+                # 分不清这次是接着跑还是整张图又跑了一遍
+                "message": f"从「{labels.get(pending[0], pending[0])}」接着跑"
+                           + (f"，前面 {len(done)} 个节点的结果保留" if done else ""),
+            },
+        )
+        self._tasks[run_id] = asyncio.create_task(
+            self._drive(run_id, spec, None, workflow_id=workflow_id)
+        )
+        return run
+
     async def cancel(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
         if task and not task.done():
@@ -342,7 +424,8 @@ class RunManager:
                 await self._emit(
                     run_id,
                     EventType.RUN_STARTED,
-                    data={"nodes": len(spec.nodes), "resumed": isinstance(payload, Command)},
+                    data={"nodes": len(spec.nodes),
+                          "resumed": payload is None or isinstance(payload, Command)},
                 )
 
                 run_ctx = RunContext(

@@ -185,6 +185,8 @@ interface StudioState {
   retryCopilot: () => void
   clearCopilot: () => void
   attachRun: (runId: string) => Promise<void>
+  /** 失败的运行从断点接着跑，把画布上改过的配置一起带过去 */
+  continueRun: () => Promise<void>
   stopRun: () => Promise<void>
   clearRun: () => void
   applyEvent: (event: RunEvent) => void
@@ -714,6 +716,22 @@ export const useStudio = create<StudioState>((set, get) => ({
       after,
     )
     set({ unsubscribe: stop, streaming: true })
+  },
+
+  continueRun: async () => {
+    // 从失败的那个节点接着跑，前面跑过的不重来。
+    //
+    // 把画布**当前**这张图带过去，而不是运行时那份快照——失败的多半是配置错了
+    // （模型 id 写错、循环条件语法错、缺必填输入），用户正是在画布上改完它才
+    // 点的这里。带的是运行时那份的话，改完还会再撞同一个错。
+    //
+    // 后端只接受骨架一致的图：增删节点或改连线就拒绝。checkpoint 是按节点名
+    // 存的，结构变了续下去会拿着错位的状态跑出一份似是而非的结果。
+    const { run, nodes, edges } = get()
+    if (!run) return
+    const continued = await api.runs.continue(run.id, toGraph(nodes, edges))
+    set({ run: continued, streaming: true })
+    await get().attachRun(run.id)
   },
 
   stopRun: async () => {

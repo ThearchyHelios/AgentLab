@@ -246,6 +246,33 @@ async def resume_run(
         raise HTTPException(409, str(e)) from e
 
 
+class ContinueIn(BaseModel):
+    """接着跑。graph 只能带改过配置的同一张图，结构必须一致。"""
+
+    graph: dict[str, Any] | None = None
+
+
+@router.post("/{run_id}/continue", response_model=RunOut)
+async def continue_run(
+    run_id: str, payload: ContinueIn, x_actor: str | None = Header(default=None)
+) -> Run:
+    """从失败的节点接着跑，前面跑过的不重来。
+
+    和 /resume 不是一回事：那条是人工介入的断点（status=interrupted），这条是
+    真的挂了（status=failed）。挡住后者的原来只是 resume 里的一行状态判定，
+    而 checkpoint 一直都在——改个模型 id 就得把前面两分钟的取数重跑一遍，
+    纯属白等。
+    """
+    try:
+        return await run_manager.continue_failed(
+            run_id, graph=payload.graph, actor=(x_actor or "").strip() or None,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+
+
 @router.get("/{run_id}/state")
 async def get_state(run_id: str) -> dict[str, Any]:
     """读取 checkpoint 里的当前状态。调试中断中的 run 时很有用。"""
