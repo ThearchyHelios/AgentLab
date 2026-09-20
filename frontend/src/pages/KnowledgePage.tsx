@@ -215,6 +215,14 @@ function KbTab() {
   }
   useEffect(() => { void load() }, [collection])
 
+  // 有文档还在切块就接着轮询。一个 10MB 文档配上远端 embedding 要几十分钟，
+  // 不轮询的话界面会一直停在"处理中"，人以为卡死了
+  useEffect(() => {
+    if (!docs.some((d) => d.status === 'processing')) return
+    const timer = setInterval(() => { void load() }, 2000)
+    return () => clearInterval(timer)
+  }, [docs, collection])
+
   const search = async () => {
     if (!query.trim()) { setHits(null); return }
     const res = await api.kb.search(query, collection, alpha)
@@ -310,8 +318,20 @@ function KbTab() {
         {docs.map((doc) => (
           <div key={doc.id} className="flex items-center gap-3 rounded-lg border bg-panel px-3 py-2">
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[12px]">{doc.title}</div>
-              <div className="truncate text-[10.5px] text-faint">{doc.source} · {doc.chunk_count} 个片段</div>
+              <div className="flex items-center gap-1.5">
+                {doc.status === 'processing' && <Spinner size={11} />}
+                <span className="truncate text-[12px]">{doc.title}</span>
+              </div>
+              <div className="truncate text-[10.5px] text-faint">
+                {doc.status === 'processing'
+                  ? (doc.meta?.progress
+                      ? `正在切块并算向量… ${doc.meta.progress.done}/${doc.meta.progress.total} 段`
+                      : '正在切块并算向量…')
+                  : doc.status === 'failed'
+                    // 失败原因要写出来："这是扫描件"和"本地服务没起"是两件事
+                    ? <span style={{ color: 'var(--err)' }}>处理失败：{doc.error}</span>
+                    : `${doc.source} · ${doc.chunk_count} 个片段`}
+              </div>
             </div>
             <button className="btn btn-sm btn-ghost" onClick={async () => {
               if (!confirm(`删除「${doc.title}」？`)) return

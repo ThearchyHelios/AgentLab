@@ -43,6 +43,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception as e:  # noqa: BLE001 - key 没了不该拦住整个服务起不来
             logger.warning("embedding 配置没能生效，暂用本地向量：%s", e)
 
+    # 上次被强杀时留下的"处理中"文档。后台任务不会自己回来，留着它只会在
+    # 界面上永远转圈——和 runner 对 running 的 run 是同一个道理
+    from sqlalchemy import update as _update
+
+    from app.db.models import Document as _Doc
+
+    async with SessionLocal() as _s:
+        await _s.execute(
+            _update(_Doc).where(_Doc.status == "processing")
+            .values(status="failed", error="服务重启，这份文档没有处理完，请重新上传")
+        )
+        await _s.commit()
+
     await run_manager.setup()
     from app.sandbox.manager import sandbox_manager as _sbm
 

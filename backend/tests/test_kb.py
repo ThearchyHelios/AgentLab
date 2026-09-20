@@ -30,6 +30,17 @@ def _local_embedder():
     emb.configure("local")
 
 
+@pytest.fixture
+async def client():
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
 # --------------------------------------------------------------------------
 # 切块
 # --------------------------------------------------------------------------
@@ -588,3 +599,105 @@ async def test_the_endpoint_is_remembered_across_restarts(client=None) -> None:
     async with SessionLocal() as session:
         row = await session.get(Setting, e.EMBEDDING_SETTING_KEY)
     assert row is not None and "base_url" in row.value
+
+
+# --------------------------------------------------------------------------
+# 大文件：分批、后台、大小防护
+# --------------------------------------------------------------------------
+
+
+async def test_embedding_is_batched_not_one_giant_call(monkeypatch) -> None:
+    """原来是 embed_texts(pieces) 一次全发。
+
+    本地哈希只是慢，换成远端模型就是必挂：一个 10MB 文档切出近八千段，
+    远端接口单次批量有上限（OpenAI 是 2048），一次请求塞不下。
+    reindex 那边早就分批了，ingest 这条一直漏着。
+    """
+    from app.memory import kb as kb_mod
+
+    sizes: list[int] = []
+    real = kb_mod.embed_texts
+
+    async def spy(texts):
+        sizes.append(len(texts))
+        return await real(texts)
+
+    monkeypatch.setattr(kb_mod, "embed_texts", spy)
+
+    text = "\n\n".join(f"第{i}段内容，讲了一些东西。" * 12 for i in range(400))
+    async with SessionLocal() as session:
+        await kb.ingest_document(session, collection="batch_test", title="大文档", content=text)
+
+    assert len(sizes) > 1, f"只调了 {len(sizes)} 次，没有分批"
+    assert max(sizes) <= kb_mod._EMBED_BATCH, f"有一批 {max(sizes)} 条，超过了上限"
+
+
+async def test_progress_lands_in_the_db_while_it_runs() -> None:
+    """进度要能被别人看见。
+
+    试过用另一个 session 单独写，但 SQLite 只允许一个写者——主事务开着的时候
+    那次写会被堵住，整个过程界面上都是空的、只在结束时闪一下。改成主事务
+    自己按批提交。
+    """
+    from app.db.models import Document
+
+    seen: list[tuple[int, int]] = []
+    # 要切出多于一批（_EMBED_BATCH=64）的片段，否则只会有一次进度回调
+    text = "\n\n".join(f"第{i}段内容，这里要写得长一些才切得够多。" * 30 for i in range(300))
+
+    async with SessionLocal() as session:
+        doc = await kb.create_document(
+            session, collection="prog_test", title="进度", content=text, status="processing")
+        await kb.process_document(session, doc, on_progress=lambda d, t: seen.append((d, t)))
+
+    assert len(seen) > 1, "一次就跑完了，测不到进度"
+    assert seen[-1][0] == seen[-1][1], "最后一次进度不是满的"
+
+    # 关键：中途的进度确实落了库，不是只在内存里
+    async with SessionLocal() as session:
+        row = await session.get(Document, doc.id)
+    assert (row.meta or {}).get("progress", {}).get("total") == seen[-1][1]
+    assert row.status == "ready"
+
+
+async def test_a_failed_document_does_not_stay_processing_forever(client) -> None:
+    """失败了要写回 failed。不写的话它永远停在"处理中"，界面上一直转圈。"""
+    from app.db.models import Document
+    from app.api.knowledge import _process_in_background
+
+    async with SessionLocal() as session:
+        doc = await kb.create_document(
+            session, collection="fail_test", title="会失败的", content="一些内容",
+            status="processing")
+
+    import app.memory.kb as kb_mod
+
+    async def boom(*a, **kw):
+        raise RuntimeError("向量服务挂了")
+
+    orig = kb_mod.process_document
+    kb_mod.process_document = boom
+    try:
+        await _process_in_background(doc.id)
+    finally:
+        kb_mod.process_document = orig
+
+    async with SessionLocal() as session:
+        row = await session.get(Document, doc.id)
+    assert row.status == "failed"
+    assert "向量服务挂了" in row.error
+
+
+async def test_oversized_uploads_are_rejected_before_being_read(client) -> None:
+    """原来是 raw = await file.read() 读完再判断大小。
+
+    传个 1GB 的文件，内存在报 413 之前就已经吃掉了——那个检查拦的是"入库"，
+    不是"占内存"。
+    """
+    from app.core.config import settings
+
+    too_big = b"x" * ((settings.max_upload_mb + 1) * 1024 * 1024)
+    r = await client.post("/api/kb/upload", params={"collection": "big"},
+                          files={"file": ("big.txt", too_big, "text/plain")})
+    assert r.status_code == 413
+    assert str(settings.max_upload_mb) in r.json()["detail"]

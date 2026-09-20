@@ -15,6 +15,9 @@ from app.memory.embeddings import (
 
 _TARGET = 800
 _OVERLAP = 120
+#: 每批送多少段去算向量。远端接口单次批量有上限（OpenAI 是 2048），而且
+#: 一次把上万段全发出去，要么超时要么被限流，中途失败还没有断点
+_EMBED_BATCH = 64
 
 
 def chunk_text(text: str, target: int = _TARGET, overlap: int = _OVERLAP) -> list[str]:
@@ -119,7 +122,32 @@ async def ingest_document(
     source: str = "",
     mime: str = "text/plain",
     meta: dict[str, Any] | None = None,
+    on_progress: Any = None,
 ) -> Document:
+    doc = await create_document(
+        session, collection=collection, title=title, content=content,
+        source=source, mime=mime, meta=meta, status="ready",
+    )
+    await process_document(session, doc, on_progress=on_progress)
+    return doc
+
+
+async def create_document(
+    session: AsyncSession,
+    *,
+    collection: str,
+    title: str,
+    content: str,
+    source: str = "",
+    mime: str = "text/plain",
+    meta: dict[str, Any] | None = None,
+    status: str = "ready",
+) -> Document:
+    """只建文档行，不切块不算向量。
+
+    拆出来是为了让上传能立刻返回：切块 + 算向量在后台跑，一个 10MB 文档配上
+    远端 embedding 要几十分钟，压在 HTTP 请求里必然超时。
+    """
     doc = Document(
         collection=collection,
         title=title or source or "未命名文档",
@@ -127,32 +155,66 @@ async def ingest_document(
         mime=mime,
         content=content,
         meta=meta or {},
+        status=status,
     )
     session.add(doc)
-    await session.flush()
+    await session.commit()
+    await session.refresh(doc)
+    return doc
 
+
+async def process_document(
+    session: AsyncSession, doc: Document, *, on_progress: Any = None
+) -> Document:
+    """切块、算向量、建倒排。可以对着一个已存在的文档行反复跑（会先清掉旧的）。"""
+    from sqlalchemy import delete as sa_delete
+
+    old_ids = list((await session.execute(
+        select(Chunk.id).where(Chunk.document_id == doc.id))).scalars())
+    if old_ids:
+        await inverted.drop_chunk_terms(session, old_ids)
+        await session.execute(sa_delete(Chunk).where(Chunk.document_id == doc.id))
+
+    collection, content = doc.collection, doc.content
     pieces = chunk_text(content)
-    made: list[Chunk] = []
-    if pieces:
-        vectors = await embed_texts(pieces)
-        for i, (piece, vec) in enumerate(zip(pieces, vectors)):
+    model_id, dim = embedder_id(), embedder_dim()
+
+    # 一批算完就落盘。分批本身是必须的——原来 embed_texts(pieces) 一次全发，
+    # 本地哈希只是慢，换成远端模型就是必挂（一个 10MB 文档近八千段，塞不下）。
+    #
+    # 每批都 commit 还有第二个好处：进度能被别人看见。试过用另一个 session
+    # 单独写进度，但 SQLite 只允许一个写者，主事务开着的时候那次写会被堵住，
+    # 界面上整个过程都是空的、只在结束时闪一下。
+    for i in range(0, len(pieces), _EMBED_BATCH):
+        part = pieces[i:i + _EMBED_BATCH]
+        vectors = await embed_texts(part)
+        made: list[Chunk] = []
+        for offset, (piece, vec) in enumerate(zip(part, vectors)):
             chunk = Chunk(
                 document_id=doc.id,
                 collection=collection,
-                ordinal=i,
+                ordinal=i + offset,
                 content=piece,
                 embedding=to_blob(vec),
-                embed_model=embedder_id(),
-                embed_dim=embedder_dim(),
+                embed_model=model_id,
+                embed_dim=dim,
                 meta={"title": doc.title},
             )
             session.add(chunk)
             made.append(chunk)
-        # 先 flush 拿到 chunk.id，倒排行要引用它
-        await session.flush()
+        await session.flush()          # 先拿到 chunk.id，倒排行要引用它
         for chunk in made:
             await inverted.index_chunk(session, chunk)
+
+        done = min(i + _EMBED_BATCH, len(pieces))
+        doc.meta = {**(doc.meta or {}), "progress": {"done": done, "total": len(pieces)}}
+        await session.commit()
+        if on_progress:
+            on_progress(done, len(pieces))
+
     doc.chunk_count = len(pieces)
+    doc.status = "ready"
+    doc.error = ""
     await session.commit()
     await session.refresh(doc)
     return doc
@@ -278,7 +340,7 @@ async def reindex(session: AsyncSession, collection: str | None = None) -> dict[
         return {"collection": collection, "reindexed": 0, "embedder": embedder_id()}
 
     model_id, dim = embedder_id(), embedder_dim()
-    batch = 64
+    batch = _EMBED_BATCH
     for i in range(0, len(rows), batch):
         part = rows[i:i + batch]
         vectors = await embed_texts([r.content for r in part])

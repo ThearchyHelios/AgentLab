@@ -136,6 +136,10 @@ export interface KbDocument {
   source: string
   mime: string
   chunk_count: number
+  /** ready | processing | failed。大文件的切块和算向量在后台跑 */
+  status?: string
+  error?: string
+  meta?: { progress?: { done: number; total: number } }
   created_at?: string
 }
 

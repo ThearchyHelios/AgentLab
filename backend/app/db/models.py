@@ -279,6 +279,11 @@ class Document(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, default="")
     meta: Mapped[dict[str, Any]] = mapped_column(default=dict)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 切块+算向量是在后台跑的：一个 10MB 文档配上远端 embedding 要几十分钟，
+    # 压在 HTTP 请求里必然超时——而后端其实还在跑，界面显示失败、数据其实成功，
+    # 比直接拒绝还糟。ready | processing | failed
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    error: Mapped[str] = mapped_column(Text, default="")
 
     chunks: Mapped[list["Chunk"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"

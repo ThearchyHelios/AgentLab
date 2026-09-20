@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.base import get_session
 from app.db.models import Document, MemoryItem, Skill
 from app.memory import inverted, kb, store
@@ -105,6 +108,10 @@ class DocumentOut(BaseModel):
     source: str
     mime: str
     chunk_count: int
+    #: ready | processing | failed。前端据此显示"处理中 3200/7914 段"
+    status: str = "ready"
+    error: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
     created_at: Any = None
 
     model_config = {"from_attributes": True}
@@ -146,13 +153,23 @@ async def ingest(payload: IngestIn, session: AsyncSession = Depends(get_session)
 
 @kb_router.post("/upload", response_model=DocumentOut, status_code=201)
 async def upload(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     collection: str = "default",
     session: AsyncSession = Depends(get_session),
 ) -> Document:
-    raw = await file.read()
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(413, "文件超过 10MB")
+    # 边读边数，超了立刻停——原来是 raw = await file.read() 读完再判断，
+    # 传个 1GB 的文件，内存在报 413 之前就已经吃掉了。那个检查拦的是"入库"，
+    # 不是"占内存"
+    limit = settings.max_upload_mb * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while piece := await file.read(1024 * 1024):
+        total += len(piece)
+        if total > limit:
+            raise HTTPException(413, f"文件超过 {settings.max_upload_mb}MB")
+        chunks.append(piece)
+    raw = b"".join(chunks)
 
     from app.memory.parsing import UnsupportedDocument, extract
 
@@ -161,14 +178,41 @@ async def upload(
     except UnsupportedDocument as e:
         # 原样交回：里面写的是"装哪个包"或"这是扫描件"，都能照着做
         raise HTTPException(415, str(e)) from None
-    return await kb.ingest_document(
+    doc = await kb.create_document(
         session,
         collection=collection,
         title=file.filename or "上传文档",
         content=content,
         source=file.filename or "",
         mime=file.content_type or "text/plain",
+        status="processing",
     )
+    # 立刻返回，切块和算向量在后台跑。实测一个 10MB 文档用本地哈希要两分半，
+    # 换成远端 embedding 是几十分钟——压在请求里必然超时，而后端其实还在跑，
+    # 界面显示失败、数据其实成功，比直接拒绝还糟
+    background.add_task(_process_in_background, doc.id)
+    return doc
+
+
+async def _process_in_background(doc_id: str) -> None:
+    """后台切块。进度写回文档行，失败也写回——不然它会永远停在"处理中"。"""
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        doc = await session.get(Document, doc_id)
+        if not doc:
+            return
+        try:
+            # 进度由 process_document 自己按批提交——它就在主事务里，
+            # 不会和另一个 session 抢 SQLite 的写锁
+            await kb.process_document(session, doc)
+        except Exception as e:  # noqa: BLE001
+            await session.rollback()
+            doc = await session.get(Document, doc_id)
+            if doc:
+                doc.status = "failed"
+                doc.error = f"{type(e).__name__}: {e}"[:500]
+                await session.commit()
 
 
 @kb_router.get("/search")

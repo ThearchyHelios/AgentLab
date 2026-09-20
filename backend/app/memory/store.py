@@ -210,7 +210,9 @@ async def reindex(session: AsyncSession, scope: str | None = None) -> int:
         return 0
 
     model_id, dim = embedder_id(), embedder_dim()
-    batch = 64   # 和 kb.reindex 一样按批：一次几千条全发给远端接口必被限流
+    from app.memory.kb import _EMBED_BATCH
+
+    batch = _EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
     for i in range(0, len(rows), batch):
         part = rows[i:i + batch]
         vectors = await embed_texts([r.content for r in part])

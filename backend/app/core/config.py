@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     max_run_seconds: int = 600
     max_graph_steps: int = 200
     max_agent_steps: int = 25
+    #: 上传文件的大小上限（MB）。原来写死 10，而且是读完整个文件才检查——
+    #: 传一个 1GB 的文件，内存在报 413 之前就吃掉了
+    max_upload_mb: int = 50
     max_concurrent_runs: int = 20
 
     # --- 工具 ---
