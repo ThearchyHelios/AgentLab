@@ -4,7 +4,7 @@ import hashlib
 import math
 import os
 import re
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -53,7 +53,8 @@ class LocalEmbedder:
 
 
 class OpenAIEmbedder:
-    """配了 key 就用真 embedding 模型，检索质量明显更好。"""
+    """任何讲 OpenAI /v1/embeddings 的服务：官方 API、也可以是本地起的
+    LM Studio / Ollama / vLLM / TEI。区别只在 base_url。"""
 
     name = "openai"
 
@@ -62,13 +63,26 @@ class OpenAIEmbedder:
         from langchain_openai import OpenAIEmbeddings
 
         self.model = model
-        # text-embedding-3-large 是 3072，别写死
-        self.dim = 3072 if "3-large" in model else 1536
-        self._impl = OpenAIEmbeddings(
-            model=model,
-            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-            base_url=base_url,
-        )
+        self.base_url = base_url
+        kwargs: dict[str, Any] = {
+            "model": model,
+            # 本地服务通常不校验 key，但 SDK 要求非空
+            "api_key": api_key or os.environ.get("OPENAI_API_KEY") or "not-needed",
+            "base_url": base_url,
+            # 远端接口单次批量有上限（OpenAI 是 2048），langchain 按这个分块发
+            "chunk_size": 512,
+        }
+        if base_url:
+            # langchain 默认先把文本分词、发 token 数组过去——OpenAI 官方认，
+            # 但 LM Studio 这类本地服务只收字符串，会报
+            # "'input' field must be a string or an array of strings"。
+            # 关掉之后发原文。我们的片段都在 800 字上下，也用不着那套长度保护
+            kwargs["check_embedding_ctx_length"] = False
+        self._impl = OpenAIEmbeddings(**kwargs)
+        # 维度必须问出来，不能按模型名猜。本地部署的模型五花八门——
+        # bge-m3 是 1024、Qwen3-Embedding-4B 是 2560，猜错的后果是所有存量
+        # 向量都被判成"和当前 embedder 对不上"，检索整体退回关键词
+        self.dim = len(self._impl.embed_query("dim probe"))
 
     async def aembed(self, text: str) -> np.ndarray:
         vec = await self._impl.aembed_query(text)
@@ -92,26 +106,30 @@ class EmbedderUnavailable(RuntimeError):
     """配了远端 embedder 但建不起来。message 直接给用户看。"""
 
 
-def _make(kind: str, model: str, *, strict: bool) -> "LocalEmbedder | OpenAIEmbedder":
+def _make(kind: str, model: str, base_url: str = "", *,
+          strict: bool) -> "LocalEmbedder | OpenAIEmbedder":
     if kind != "openai":
         return _local
     try:
-        return OpenAIEmbedder(model=model or "text-embedding-3-small")
+        return OpenAIEmbedder(model=model or "text-embedding-3-small",
+                              base_url=base_url or None)
     except Exception as e:  # noqa: BLE001
         if strict:
             # 人明确选了远端就不能偷偷退回本地：他会以为自己在用语义检索，
             # 而实际拿到的是哈希词袋——搜不出同义表达时完全无从怀疑到这里
+            where = base_url or "api.openai.com"
             raise EmbedderUnavailable(
-                f"用不了 embedding 模型 {model or 'text-embedding-3-small'}："
-                f"{type(e).__name__}: {e}。检查 OPENAI_API_KEY 是否配了。"
+                f"用不了 {where} 上的 embedding 模型 "
+                f"{model or 'text-embedding-3-small'}：{type(e).__name__}: {e}。"
+                f"检查服务在不在、模型名对不对；走官方接口还要看 OPENAI_API_KEY。"
             ) from e
         return _local
 
 
-def configure(kind: str, model: str = "") -> None:
+def configure(kind: str, model: str = "", base_url: str = "") -> None:
     """切换当前 embedder。设置页保存后调用，也用于测试。建不起来会抛。"""
     global _cached
-    _cached = (f"{kind}:{model}", _make(kind, model, strict=True))
+    _cached = (f"{kind}:{model}:{base_url}", _make(kind, model, base_url, strict=True))
 
 
 def get_embedder() -> "LocalEmbedder | OpenAIEmbedder":
@@ -183,7 +201,7 @@ async def load_setting(session: Any) -> None:
     saved = (row.value if row else {}) or {}
     kind = saved.get("kind")
     if kind:
-        configure(kind, saved.get("model", ""))
+        configure(kind, saved.get("model", ""), saved.get("base_url", ""))
 
 
 async def embed_text(text: str) -> np.ndarray:

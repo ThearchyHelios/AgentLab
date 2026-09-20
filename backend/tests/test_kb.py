@@ -443,3 +443,82 @@ async def test_a_word_document_with_a_table_survives_the_whole_pipeline() -> Non
     # 命中的片段里必须能看出这些数是什么
     assert any("门店 | 城市 | 销售额" in h["content"] for h in hits), (
         "召回的片段全都没有表头，拿回去也读不懂")
+
+
+# --------------------------------------------------------------------------
+# 自定义 embedding 端点
+# --------------------------------------------------------------------------
+
+
+def test_dimension_is_probed_not_guessed(monkeypatch) -> None:
+    """维度必须问出来。
+
+    原来是按模型名猜：名字里有 3-large 就 3072，否则一律 1536。本地部署的
+    模型五花八门——bge-m3 是 1024、Qwen3-Embedding-4B 是 2560——猜错的后果是
+    所有存量向量都被判成"和当前 embedder 对不上"，检索整体退回关键词。
+    """
+    from app.memory import embeddings as e
+
+    probed: list[str] = []
+
+    class _Fake:
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def embed_query(self, text):
+            probed.append(text)
+            return [0.0] * 2560        # 假装是个 2560 维的本地模型
+
+    import langchain_openai
+    monkeypatch.setattr(langchain_openai, "OpenAIEmbeddings", _Fake)
+
+    emb_obj = e.OpenAIEmbedder(model="my-local-model", base_url="http://127.0.0.1:1234/v1")
+    assert emb_obj.dim == 2560, "维度没去问，还在按名字猜"
+    assert probed, "根本没探测"
+
+
+def test_a_custom_endpoint_gets_plain_strings(monkeypatch) -> None:
+    """langchain 默认先分词、把 token 数组发过去。
+
+    OpenAI 官方认，但 LM Studio 这类本地服务只收字符串，会直接 400：
+    'input' field must be a string or an array of strings
+    """
+    from app.memory import embeddings as e
+
+    captured: dict = {}
+
+    class _Fake:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def embed_query(self, _t):
+            return [0.0] * 8
+
+    import langchain_openai
+    monkeypatch.setattr(langchain_openai, "OpenAIEmbeddings", _Fake)
+
+    e.OpenAIEmbedder(model="m", base_url="http://127.0.0.1:1234/v1")
+    assert captured.get("check_embedding_ctx_length") is False
+    assert captured.get("base_url") == "http://127.0.0.1:1234/v1"
+    # 批量上限：远端接口单次有上限，不分块的话大文档必挂
+    assert captured.get("chunk_size")
+
+    captured.clear()
+    e.OpenAIEmbedder(model="text-embedding-3-small")     # 官方接口走默认行为
+    assert "check_embedding_ctx_length" not in captured
+
+
+def test_a_broken_endpoint_names_where_it_tried(monkeypatch) -> None:
+    """报错要说清楚是哪个地址上的哪个模型，否则本地服务没起都不知道去哪查。"""
+    from app.memory import embeddings as e
+
+    class _Boom:
+        def __init__(self, **kw):
+            raise RuntimeError("connection refused")
+
+    import langchain_openai
+    monkeypatch.setattr(langchain_openai, "OpenAIEmbeddings", _Boom)
+
+    with pytest.raises(e.EmbedderUnavailable) as err:
+        e.configure("openai", "qwen3-embedding-4b", "http://127.0.0.1:1234/v1")
+    assert "127.0.0.1:1234" in str(err.value) and "qwen3-embedding-4b" in str(err.value)
