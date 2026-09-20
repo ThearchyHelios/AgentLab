@@ -1,106 +1,147 @@
-# AgentLab · 可视化 Agent 编排实验台
+# AgentLab
 
-在画布上拖节点、连线，编出一条 agent 工作流，然后**看着它跑**——哪个节点在执行、
-模型正在吐什么字、调了什么工具、沙箱里的代码返回了什么、在哪一步停下来等你拍板。
+**可视化 Agent 编排实验台**——在画布上定义工作流，运行时逐节点观察执行过程，
+并对产出施加可验证的约束。
 
-不是 demo，是一套能真用的本地实验环境：多模型接入、隔离沙箱、工具链与 MCP、
-长期记忆与知识库、人工介入、断点续跑、结构化校验、运行追踪与成本核算。
+面向工业场景的**受限动态编排**：模板定义骨架，agent 只在被授权的关节处自由。
+所有算术下沉到受控指标集，叙述层无权创造数字；正式运行钉死在不可变版本上，
+每一次执行的完整证据落进内容寻址的工件库。
 
-```
-┌──────────┬──────────────────────────────────┬─────────────────┐
-│ 节点库    │            画布                   │  运行 / 属性     │
-│          │   ┌────┐   ┌────┐   ┌────┐        │  ▸ 输入表单      │
-│ 模型      │   │输入│──▶│Agent│──▶│成果│       │  ▸ 实时时间线    │
-│ 执行      │   └────┘   └─┬──┘   └────┘        │  ▸ 人工审批      │
-│ 控制      │             ▼ 工具调用             │  ▸ 成果 / 用量   │
-│ 上下文    │                                   │                 │
-│ 把关      │                                   │                 │
-└──────────┴──────────────────────────────────┴─────────────────┘
-```
+![运行中的画布](docs/images/canvas-running.png)
+
+<sub>研究助手模板执行中：已完成的节点标绿、执行中的节点高亮并显示进度，
+右栏是同一份事件流驱动的实时时间线。</sub>
+
+---
+
+## 目录
+
+- [快速开始](#快速开始) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
+- [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构) · [关键设计决策](#关键设计决策)
+- [运行环境](#运行环境) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
+
+---
 
 ## 快速开始
 
-需要 conda（[miniforge](https://conda-forge.org/miniforge/) 即可）、Node 20+、pnpm。
-**不需要 Docker** —— 代码沙箱用操作系统自带的隔离原语，可选升级到 microVM。
+环境要求：conda（[miniforge](https://conda-forge.org/miniforge/) 即可）、Node 20+、pnpm。
+**无需 Docker**——代码沙箱基于操作系统自带的隔离原语，可选升级至 microVM。
 
 ```bash
-conda env create -f environment.yml   # 首次：建 agentlab 环境并装依赖
-./scripts/dev.sh                      # 之后：一条命令拉起前后端
+conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装依赖
+./scripts/dev.sh                      # 之后：一条命令启动前后端
 ```
 
-`dev.sh` 会自己找到 `agentlab` 这个 conda 环境；环境不存在时它会照
-`environment.yml` 建一个。想用别的环境名就设 `AGENTLAB_CONDA_ENV`。
+`dev.sh` 自动定位 `agentlab` conda 环境；环境不存在时依 `environment.yml` 创建。
+如需使用其他环境名，设置 `AGENTLAB_CONDA_ENV`。
 
-打开 http://localhost:5273 。
+服务启动于 http://localhost:5273 。
 
-**不配任何 API Key 也能直接玩**——内置了一个 Mock provider，会产出假的流式回复、
-假的工具调用、符合 schema 的假结构化数据，整条编排链路（包括画布高亮、审批中断、
-沙箱执行）都会真实走一遍。想要真结果，去「设置 → 模型接入」填 Key 即可。
+**无需配置 API Key 即可完整体验。** 内置 Mock provider 产出流式回复、工具调用与
+符合 schema 的结构化数据，编排链路（画布高亮、审批中断、沙箱执行）会完整走一遍。
+接入真实模型请在「设置 → 模型接入」配置。启动时若环境变量中存在
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`，将自动导入为 provider。
 
-启动时如果环境里已有 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`，
-会自动导入成 provider，不用手填。
+内置 8 个模板，从「最小问答」到「周报（口径卡 + 三档出具）」，既可直接运行，
+也是各类节点用法的可执行文档。
 
-内置 7 个模板，从「最小问答」到「多 Agent 协作」，既是能直接跑的例子，也是各类节点用法的活文档。
+---
 
-## 能做什么
+## 核心能力
 
-| 能力 | 怎么体现 |
+| 领域 | 能力 |
 |---|---|
-| **可视化编排** | 15 种节点拖拽连线；运行时节点实时高亮、边上数据流动画、卡片里直接看到流式 token |
-| **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama…）+ Mock |
+| **可视化编排** | 16 种节点拖拽连线；运行时节点实时高亮、边上数据流动画、卡片内直接呈现流式 token |
+| **对话式取数** | 「问数据」页：自然语言提问，系统自行接入数据源、生成工作流、执行并给出结论；对话持久化、可分享链接 |
+| **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama 等）+ Mock |
 | **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入 |
-| **代码沙箱** | 两档：系统沙箱（Seatbelt / bubblewrap，冷启动 ~25ms）或 microVM（独立 Linux 内核，内存限额真生效）。断网、家目录不可读、只有工作区可写、超时强杀 |
-| **人工介入** | 图暂停并落盘，人在界面上批准/驳回/改稿，从断点继续——进程重启也不丢 |
-| **记忆与知识库** | 跨运行的长期记忆（自动去重）+ 文档知识库（向量 + BM25 混合检索，可调配比） |
-| **Skill 管理** | 把「怎么做事」抽成可复用的方法论，挂到节点上注入 system prompt |
-| **自然语言编排** | Copilot：一句话生成或改写整张图，自动排版 + 校验 |
-| **结构化成果** | JSON Schema 校验，不合格把错误喂回模型自动返工 |
-| **追踪与成本** | 每步事件全量落库，可回放；逐节点耗时、token、按目录价折算的美元成本 |
-| **三档出具** | 口径卡（受控指标集）+ 出具契约：叙述里每个数字回指指标集，formal / degraded / withheld 三档判定，缺数据声明与口径版本随成果印出 |
-| **正式 / 探索分级** | 正式运行只从已发布的不可变版本发起（按图哈希钉死），画布试跑自动标探索性；受管（governed）发布过治理 lint |
-| **模板生长** | 探索性运行可一键提取为草稿模板（只保留实际走过的路径）；探索问题聚类提示"该晋升为固定节了"；工具白名单衰减报表 |
+| **代码沙箱** | 双档隔离：系统沙箱（Seatbelt / bubblewrap，冷启动约 25ms）或 microVM（独立 Linux 内核，内存限额真实生效） |
+| **人工介入** | 执行暂停并落盘，人工批准 / 驳回 / 改稿后从断点继续；进程重启不丢状态 |
+| **断点续跑** | 失败的运行可从失败节点继续，已完成的节点不重复执行；允许修改节点配置，但拓扑必须一致 |
+| **知识库** | 向量 + BM25 混合检索、倒排索引、可选模型重排；PDF / Word / PowerPoint / HTML / Markdown 解析；向量模型可接本地端点 |
+| **表格入库** | Excel / CSV 上传后转为可用 SQL 查询的表，自动生成 `db_query__<name>` 工具——数字由 SQL 计算得出，而非模型读取 |
+| **长期记忆** | 跨运行的记忆读写与自动去重；Copilot 建图时主动记录应当记住的事实 |
+| **Skill 管理** | 将方法论抽象为可复用单元，挂载到节点上注入 system prompt |
+| **自然语言编排** | Copilot：一句话生成或改写整张图，自动排版与校验 |
+| **结构化成果** | JSON Schema 校验，不合格时将错误回传模型自动返工 |
+| **产出复核** | 运行结束后规则扫描事件流，发现异常才调用模型复核；复核可重组答案但**不得引入原答案中不存在的数字** |
+| **追踪与成本** | 全量事件落库可回放；逐节点耗时、token 用量、按目录价折算的成本 |
+| **三档出具** | 口径卡（受控指标集）+ 出具契约：叙述中每个数字回指指标集，formal / degraded / withheld 三档判定 |
+| **正式 / 探索分级** | 正式运行仅从已发布的不可变版本发起（按图哈希钉死）；画布试跑自动标记为探索性 |
 
-## 受限动态编排：模板定骨架、agent 填关节
+---
 
-工业场景的大多数任务步骤是已知的（接单报价、周报、体检），让模型每次现场重新规划
-是在重复发明已知答案，而且不可复现就不可验收。AgentLab 的引擎是编译式的——运行时
-模型改不了图，它的自由被结构性地关在 agent 节点内部和 branch 决策里。在此之上：
+## 受限动态编排：模板定骨架，agent 填关节
 
-- **模板层**：正式运行只认已发布的不可变版本（`WorkflowVersion` + 图哈希）。
-  发布后改画布不影响它。governed 级发布要过治理 lint：禁 supervisor（全动态属于
-  探索层）、方法卡必须钉版本、agent 不得关闭全部审批、output 必须有出具契约。
-- **关节层**：agent 的工具白名单、分支的语义分类、缺数据时降档——有边界的自由。
-  白名单衰减报表（`/api/governance/tool-usage`）把"授了权没用过"的工具摆上台面。
-- **探索层**：画布试跑、临时图、追问，结果自动标探索性、不进正式归档。跑通的路径
-  用「提取模板」沉淀为草稿（只保留实际执行的节点，剪掉没走的分支），人审后发布。
-  探索问题聚类提示哪些追问该长成模板里的固定一节。
+工业场景中大多数任务的步骤是已知的（接单报价、周报、体检）。让模型每次现场重新规划，
+既是在重复发明已知答案，也使结果不可复现——而不可复现即不可验收。
 
-**出具链路**（模板⑧就是完整示范）：取数（固定，快照落工件库）→ 口径卡（metrics
-节点，所有算术在这里确定性发生，带口径名和版本）→ 叙述（LLM，只许引用指标清单）
-→ 出具契约（从叙述抽出所有数字逐个回指指标集，支持千分位/百分数↔比率/万亿后缀/
-按书写精度的舍入容差；日期、枚举序号、引用标记不参与）。三档判定印在成果上。
-实测：Opus 5 写的正文数字全部回指，但结尾"（约 100 字）"里的 100 被抓住降档——
-修的是 prompt 而不是白名单，这正是校验器该有的行为。
+AgentLab 的引擎是**编译式**的：运行时模型无法修改图结构，其自由被结构性地限制在
+agent 节点内部与 branch 决策之中。在此基础上划分三层：
 
-钉住的方法卡出现新版本时，正式运行会被拒绝启动，直到模板声明升版处置：
-`recompute`（回算历史）/ `dual`（双印）/ `incomparable`（标注不可比），没有默认值
-——口径变更最容易静默翻车的地方是"数看起来都对，只是和上周不可比"。
+```mermaid
+flowchart LR
+    T["<b>模板层</b> · 骨架固定<br/><br/>已发布的不可变版本<br/>WorkflowVersion + 图哈希<br/>governed 级须过治理 lint"]
+    J["<b>关节层</b> · 有边界的自由<br/><br/>agent 工具白名单<br/>branch 语义分类<br/>缺数据时降档"]
+    E["<b>探索层</b> · 不进正式归档<br/><br/>画布试跑 / 临时图 / 追问<br/>跑通的路径提取为草稿"]
+    T ==>|约束| J
+    E -.人工审核后发布.-> T
+```
 
-每次运行的完整证据在内容寻址的工件库里（`data/artifacts/`，sha256 即地址，取回
-复验哈希）；运行终态的事件清单哈希存在 Run 上，事后改流水会对不上。
+- **模板层**　正式运行只认已发布的不可变版本。发布后修改画布不影响已发布版本。
+  governed 级发布须通过治理 lint：禁用 supervisor（全动态归属探索层）、方法卡必须钉版本、
+  agent 不得关闭全部审批、output 必须配置出具契约。
+- **关节层**　授权范围内的自由。工具白名单衰减报表（`/api/governance/tool-usage`）
+  将「已授权但从未使用」的工具显性化，为收缩权限提供依据。
+- **探索层**　结果自动标记为探索性，不进正式归档。跑通的路径经「提取模板」沉淀为草稿
+  （仅保留实际执行的节点，剪除未走的分支），人工审核后发布。探索问题聚类提示哪些追问
+  应当固化为模板中的一节。
 
-## 节点类型
+### 出具链路
 
-| 分类 | 节点 | 说明 |
-|---|---|---|
-| 起止 | `input` `output` | 声明输入字段 / 收集结构化成果 |
-| 模型 | `llm` `agent` `supervisor` | 单次调用 / 带工具循环 / 多 agent 协作 |
-| 执行 | `tool` `code` | 直接调工具 / 沙箱里跑代码 |
-| 控制 | `branch` `loop` `subgraph` | 条件或语义分支 / 遍历与条件循环 / 嵌套工作流 |
-| 上下文 | `memory` `retrieve` `transform` | 长期记忆读写 / 知识检索 / 数据整形 |
-| 把关 | `human` `validate` `metrics` | 人工介入 / Schema 校验与自动返工 / 口径卡（受控指标集） |
+模板⑧是完整示范。设计前提是**派生边界收死**：所有算术发生在口径卡节点内，叙述层只能引用。
 
-节点之间用模板语法传数据：
+```mermaid
+flowchart LR
+    A["取数<br/><i>固定步骤</i>"] --> B["口径卡<br/><i>受控指标集</i>"]
+    B --> C["叙述<br/><i>LLM</i>"]
+    C --> D["出具契约<br/><i>数字回指校验</i>"]
+    D --> E1["formal"]
+    D --> E2["degraded"]
+    D --> E3["withheld"]
+    A -.快照.-> S[("工件库<br/>sha256 寻址")]
+    B -.口径名 + 版本.-> S
+```
+
+![出具链路模板](docs/images/graph-issuance.png)
+
+校验器从叙述中抽取全部数字逐个回指指标集，支持千分位、百分数与比率互转、万/亿后缀、
+按书写精度的舍入容差；日期、枚举序号、引用标记不参与回指。三档判定与缺数据声明随成果印出。
+
+实测记录：Opus 5 撰写的正文数字全部回指成功，但结尾「（约 100 字）」中的 `100` 被判定为
+集合外数字并触发降档。处置方式是修改 prompt 而非扩大白名单——这正是校验器应有的行为。
+
+**口径升版是被迫处置事件。** 钉住的方法卡出现新版本时，正式运行将被拒绝启动，
+直至模板显式声明升版策略：`recompute`（回算历史）/ `dual`（双印）/ `incomparable`
+（标注不可比）。此处无默认值——口径变更最容易静默翻车的形态是「数字看起来都对，
+只是与上周不可比」。
+
+每次运行的完整证据存于内容寻址的工件库（`data/artifacts/`，sha256 即地址，取回时复验哈希）；
+运行终态的事件清单哈希记录在 Run 上，事后修改流水将无法对齐。
+
+---
+
+## 工作流形态
+
+**人工介入与分支**——执行在 `human` 节点暂停并落盘，人工决策后沿对应出口继续：
+
+![人工审批流程](docs/images/graph-human.png)
+
+**多 Agent 协作**——调度者按进展将任务分派给多个专家，属探索层能力，governed 级发布禁用：
+
+![多 Agent 协作](docs/images/graph-supervisor.png)
+
+节点间通过模板语法传递数据：
 
 ```
 {{ input.question }}        入口输入
@@ -109,9 +150,48 @@ conda env create -f environment.yml   # 首次：建 agentlab 环境并装依赖
 {{ vars.items | json }}     过滤器：json / compact / upper / length / first …
 ```
 
-连线即并行：一个节点连出多条边就是 fan-out，多条边汇入同一节点会自动等待汇聚。
+连线即并行：单个节点连出多条边构成 fan-out，多条边汇入同一节点时自动等待汇聚。
+
+---
+
+## 节点类型
+
+| 分类 | 节点 | 说明 |
+|---|---|---|
+| 起止 | `input` `output` | 声明输入字段 / 收集结构化成果 |
+| 模型 | `llm` `agent` `supervisor` | 单次调用 / 带工具循环 / 多 agent 协作 |
+| 执行 | `tool` `code` | 直接调用工具 / 沙箱内执行代码 |
+| 控制 | `branch` `loop` `subgraph` | 条件或语义分支 / 遍历与条件循环 / 嵌套工作流 |
+| 上下文 | `memory` `retrieve` `transform` | 长期记忆读写 / 知识检索 / 数据整形 |
+| 把关 | `human` `validate` `metrics` | 人工介入 / Schema 校验与自动返工 / 口径卡 |
+
+---
 
 ## 架构
+
+```mermaid
+flowchart TB
+    subgraph FE["前端 · React 19 + React Flow + Zustand"]
+        F1["画布编辑"]
+        F2["问数据"]
+        F3["运行追踪"]
+        F4["decode.ts<br/><i>事件 → 人类可读的唯一翻译层</i>"]
+    end
+    subgraph BE["后端 · FastAPI + LangGraph"]
+        B1["engine<br/>编译 · 调度 · 中断恢复"]
+        B2["providers<br/>多模型接入与成本估算"]
+        B3["tools<br/>注册表 · MCP · 数据源"]
+        B4["memory<br/>记忆 · 知识库 · 混合检索"]
+        B5["sandbox<br/>microVM / Seatbelt / bubblewrap"]
+    end
+    subgraph ST["存储"]
+        S1[("agentlab.db<br/>业务数据")]
+        S2[("checkpoints.db<br/>执行断点")]
+        S3[("artifacts/<br/>内容寻址工件库")]
+    end
+    FE <-->|REST + WebSocket| BE
+    B1 --> S1 & S2 & S3
+```
 
 ```
 backend/                  FastAPI + LangGraph
@@ -119,113 +199,206 @@ backend/                  FastAPI + LangGraph
     schema.py             图定义与静态校验
     compiler.py           编译：节点包装、事件、重试、条件路由
     runner.py             执行调度、事件总线、中断与恢复
+    issuance.py           出具契约：数字回指与三档判定
+    review.py             产出复核：事件流规则扫描 + 模型复核
     expressions.py        模板插值 + AST 白名单表达式求值
     nodes/                各类节点的执行器
+  app/data/               数据源接入：连接、SQL 守卫、结构探查、表格导入
   app/providers/          多模型接入与成本估算
   app/sandbox/            microVM / Seatbelt / bubblewrap / 裸子进程四后端
   app/tools/              工具注册表、内置工具、MCP、自定义工具
-  app/memory/             记忆、知识库、混合检索
+  app/memory/             记忆、知识库、倒排索引、混合检索、文档解析
   app/api/                REST + WebSocket
 frontend/                 React 19 + React Flow + Zustand
-  src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩全由它驱动
+  src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩均由其驱动
+  src/run/decode.ts       事件流 → 人类可读步骤的唯一翻译层
   src/store/studio.ts     画布状态 + 事件流到高亮的映射
 environment.yml           conda 环境定义
 scripts/dev.sh            一键启动
-scripts/e2e-check.mjs     浏览器冒烟测试
+scripts/check-*.mjs       三层前端验证脚本
 ```
 
-### 几个值得说明的决定
+---
 
-**为什么用 LangGraph。** 可视化编排真正难的不是画框连线，是暂停、恢复、回放。
-LangGraph 的 checkpointer 和 `interrupt()` 正好把这几件事做在了底层：人工介入是
-一次中断 + 一次 `Command(resume=...)`，进程重启后仍能从断点继续；`aget_state_history()`
-直接给出每一步的状态快照。自己实现这套语义的成本远高于接一个框架。
+## 关键设计决策
 
-**Agent 内部的工具审批不会重复计费。** `interrupt()` 会让整个节点重放，
-朴素实现会把之前的模型调用再跑一遍。Agent 节点里的模型调用和工具执行都包在
-LangGraph 的 `@task` 里，结果进 checkpoint，重放时直接取缓存。
+### 选用 LangGraph
 
-**事件流是唯一的可视化数据源。** 节点通过 `get_stream_writer()` 发事件，runner 转成
-`RunEvent` 落库并广播。画布高亮、token 流、工具卡片、时间线全部由同一份事件驱动，
-所以刷新页面或中途接入都能拿到完整过程（WebSocket 先补历史再接实时）。
+可视化编排的难点不在绘制节点与连线，而在暂停、恢复与回放。LangGraph 的 checkpointer 与
+`interrupt()` 将这几件事做在了底层：人工介入是一次中断加一次 `Command(resume=...)`，
+进程重启后仍可从断点继续；`aget_state_history()` 直接给出每一步的状态快照。
 
-**沙箱不用容器，但分两档。** 轻的一档用操作系统自带的访问控制：macOS 的 Seatbelt
-（`sandbox-exec`）、Linux 的 bubblewrap，冷启动 ~25ms，不用装任何东西。重的一档是
-microVM（libkrun + Hypervisor.framework），起一台带独立内核的虚拟机。
+由此派生的第二项收益：**agent 内部的工具审批不重复计费**。`interrupt()` 会使整个节点重放，
+朴素实现将重复执行此前的模型调用。agent 节点内的模型调用与工具执行均包裹在 LangGraph 的
+`@task` 中，结果进入 checkpoint，重放时直接读取缓存。
 
-两档守的都是那三件事：**默认断网**、**家目录不可读**、**只有工作区可写**。Seatbelt 侧策略
-由内核强制且对子进程继承——沙箱里 `subprocess` 出来的 `cat` 读家目录一样是
-`Operation not permitted`；解释器刻意用 `sys.base_prefix` 下那个干净的 Python 而不是
-项目环境，所以沙箱代码 import 不到 FastAPI、SQLAlchemy 和凭据处理相关的任何东西。
+### 事件流是唯一的可视化数据源
 
-**Seatbelt 少了什么，要说清楚**：它做的是访问控制而非虚拟化——进程表共享（看得见宿主机
-进程列表），代码以当前用户身份运行（不像容器会降到 nobody），而且 **macOS 不强制
-`RLIMIT_AS`，内存用量根本限不住**（实测设 256MB 仍能分配 900MB）。CPU 时间、单文件
-大小、墙钟超时这三项有效。写 SBPL 还有个坑：`(deny default)` 会让 Python 直接 SIGABRT
-起不来，要枚举的路径和 syscall 太多、漏一个就崩，所以用的是「默认允许 + 精确拒绝」。
+节点通过 `get_stream_writer()` 发出事件，runner 转换为 `RunEvent` 落库并广播。
+画布高亮、token 流、工具卡片、时间线全部由同一份事件驱动——刷新页面或中途接入
+均可获得完整过程（WebSocket 先补历史再接实时）。
 
-**microVM 补上的正是内存那一刀。** 本机实测：宿主是 Darwin 27.0.0，VM 里是 Linux 6.12.99
-（libkrunfw 编译），PID 1 是 `init.krun`，`/Users` 在 VM 里根本不存在，`free` 只看得见
-512MB。申请 900MB 会被内核 OOM killer 杀掉而 VM 照常存活——`RLIMIT_AS` 在 macOS 上
-形同虚设的问题在这里不是被修好，是结构上不存在。两台 VM 之间也互不可见。
+前端侧对应地只有一个翻译层 `run/decode.ts`：画布右栏、问数据页、运行详情页共用它。
+分设多套的后果是同一次运行在三个页面讲出三个版本，而使用者无从判断哪个为真。
 
-代价照实说：运行时约 50MB，OCI 镜像**首次拉取实测 54.5s**；拉过之后热启动 0.19s、
-VM 内执行 7~30ms。所以贵的是第一次而不是每一次——也正因为只贵第一次，
-auto 模式在镜像没缓存时会先用 Seatbelt，不让人干等一分钟（显式选 strict 不受此限）。
+### 沙箱：双档隔离，以及必须声明的缺口
 
-**但网络关不干净，这条必须写在前面。** `network=false` 时 HTTP/HTTPS 和域名解析都会断，
-可 **UDP/53 拦不住**——实测手写 DNS 包仍能拿到真实响应。`default_egress=DENY`、
-`Rule.deny_dns()`、显式 deny UDP、`max_connections=0` 全试过，UDP 那条都堵不上
-（deny_dns 生成的规则只针对宿主，DNS 出口在 microsandbox 的网络栈里是硬编码放行的）。
-也就是说 **DNS 隧道外泄通道始终开着**。防「代码意外联网装包」够用，防「恶意代码偷数据」
-不够。所以设置页把网络这项标成「部分生效」的黄色而不是绿色——拦了一半要是显示成全绿，
-比显示成全红更危险。真要防外泄，得在网络层做，不能指望沙箱。
+轻量档使用操作系统自带的访问控制：macOS 的 Seatbelt（`sandbox-exec`）、Linux 的 bubblewrap，
+冷启动约 25ms，无需额外安装。重量档为 microVM（libkrun + Hypervisor.framework），
+启动带独立内核的虚拟机。
 
-**检索为什么是混合的。** 默认 embedding 是本地特征哈希，不联网不下模型，零配置可用，
-但语义泛化弱；BM25 补上精确关键词匹配这一半。两者各自归一化后加权，权重在界面上可调，
-命中结果会分别显示语义分和关键词分，方便调参。配了 OpenAI Key 可切换成真 embedding。
+两档共同保证三项约束：**默认断网**、**家目录不可读**、**仅工作区可写**。Seatbelt 侧策略
+由内核强制且对子进程继承——沙箱内 `subprocess` 启动的 `cat` 读取家目录同样返回
+`Operation not permitted`；解释器刻意使用 `sys.base_prefix` 下的干净 Python 而非项目环境，
+因此沙箱代码无法 import FastAPI、SQLAlchemy 及任何凭据处理相关模块。
 
-**安全边界。** 分支条件用 AST 白名单求值器而不是 `eval`；HTTP 工具解析域名后逐个 IP
-检查，拦截内网、回环和云元数据地址，且不跟随重定向（逐跳重新校验）；文件工具的路径
-`resolve()` 后必须仍在工作区内；API Key 用 Fernet 加密落库，只回掩码给前端。
+**Seatbelt 的局限**：它提供访问控制而非虚拟化。进程表共享（可见宿主机进程列表）；
+代码以当前用户身份运行（不似容器会降权至 nobody）；**macOS 不强制 `RLIMIT_AS`，
+内存用量无法限制**（实测设定 256MB 仍可分配 900MB）。CPU 时间、单文件大小、
+墙钟超时三项有效。
 
-## 常见问题
+**microVM 补齐的正是内存这一项。** 本机实测：宿主为 Darwin 27.0.0，VM 内为 Linux 6.12.99
+（libkrunfw 编译），PID 1 为 `init.krun`，`/Users` 在 VM 内不存在，`free` 仅显示 512MB。
+申请 900MB 将被内核 OOM killer 终止而 VM 存活——`RLIMIT_AS` 在 macOS 上形同虚设的问题
+在此不是被修复，而是结构上不存在。两台 VM 之间亦互不可见。
 
-**沙箱用的是哪个后端？** 设置页「运行环境」会列出所有候选及其可用性，并标出当前选中的那个。
-装了 microVM 依赖且镜像已缓存时 auto 会选 `microvm`；否则 macOS 走 `seatbelt`、Linux 上装了
-`bwrap`（`apt install bubblewrap`）走 `bubblewrap`，都没有则降级到 `local`——**那条路径没有
-任何访问控制**，界面上会明确标红。可以用 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
-也可以在代码节点上单独选「隔离档位」（strict = microVM，fast = 系统沙箱）。
+代价：运行时约 50MB，OCI 镜像**首次拉取实测 54.5 秒**；缓存后热启动 0.19 秒、
+VM 内执行 7–30ms。成本集中在首次而非每次——因此 auto 模式在镜像未缓存时优先使用 Seatbelt，
+避免一分钟的等待（显式指定 strict 不受此限）。
 
-**怎么启用 microVM？** 三件事，**都是一次性的**——日常启动仍然只有 `./scripts/dev.sh`：
+> **网络隔离不完整，此项须置于前列。**
+> `network=false` 时 HTTP/HTTPS 与域名解析均被切断，但 **UDP/53 无法拦截**——实测手写
+> DNS 包仍可获得真实响应。`default_egress=DENY`、`Rule.deny_dns()`、显式 deny UDP、
+> `max_connections=0` 均已尝试，UDP 通道始终无法封堵（`deny_dns` 生成的规则仅作用于宿主，
+> DNS 出口在 microsandbox 的网络栈中硬编码放行）。
+> 即 **DNS 隧道外泄通道始终开放**。该隔离足以防范「代码意外联网安装依赖」，
+> 不足以防范「恶意代码窃取数据」。设置页据此将网络一项标注为「部分生效」的黄色而非绿色——
+> 拦截了一半却显示为全绿，比显示为全红更危险。真正的外泄防护须在网络层实施。
 
-1. Python 包：用 `environment.yml` 建过环境就已经装好了（里面带着 `[microvm]`）
-2. 运行时（约 50MB，落到 `~/.microsandbox`）：一台机器跑一次
-3. OCI 镜像（实测 ~55s）：第一次执行代码时自动拉，一个镜像一次
+### 检索为何是混合的
 
-只有第 2 步要手动跑：
+默认 embedding 为本地特征哈希：不联网、不下载模型、零配置可用，但语义泛化能力弱。
+BM25 补齐精确关键词匹配。两者各自归一化后加权，权重在界面上可调，命中结果分别显示
+语义分与关键词分。
+
+实测（24 文档 / 16 问题评测集，hit@1）：
+
+| 配置 | hit@1 | 字面类 | 语义类 |
+|---|---|---|---|
+| 纯关键词（alpha=0） | 88% | 100% | 75% |
+| 纯向量（本地哈希，alpha=1） | 81% | 88% | 75% |
+| 混合 + Qwen3-Embedding-4B | 94% | 100% | 88% |
+| 上述配置叠加模型重排 | 100% | — | — |
+
+值得注意的一项：纯向量（81%）低于纯关键词（88%），混合才达到 94%。专有名词依靠 BM25、
+同义改写依靠向量，两者各担一半——混合检索在该语料上是必要的，而非装饰。
+样本量为 16 题，单题即 6 个百分点，结论的方向可信而精度不可过度解读。
+
+向量模型可接任意 OpenAI 兼容端点（LM Studio、Ollama、vLLM、TEI）。维度通过实际探测获得
+而非按模型名推断——本地部署的模型维度各异（bge-m3 为 1024、Qwen3-Embedding-4B 为 2560），
+推断错误的后果不是偏差，而是全部存量向量被判定为与当前 embedder 不匹配，检索整体退回关键词。
+
+### 表格数据必须成为表
+
+Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型从片段中「读取」的结果。
+而本项目的基础约定是「所有算术下沉到 SQL 或口径卡」——产出复核层能拦截凭空出现的数字，
+无法拦截「从一堆片段中读错了一格」。
+
+因此表格上传后落为 SQLite 文件并注册为 `kind=sqlite` 的数据源，自动生成
+`db_query__<name>` 工具。列类型逐列推断（INTEGER / REAL / TEXT），空单元格存为 NULL——
+整数列若落为 TEXT，`ORDER BY` 将退化为字典序（`'10' < '9'`），且不产生任何报错。
+
+### 安全边界
+
+- 分支条件使用 AST 白名单求值器而非 `eval`
+- HTTP 工具解析域名后逐 IP 检查，拦截内网、回环与云元数据地址，且不跟随重定向（逐跳重新校验）
+- 文件工具路径 `resolve()` 后必须仍位于工作区内
+- SQL 守卫采用白名单动词判定 + 多语句拦截 + 结果集上限；`DROP` / `TRUNCATE` / `GRANT` 等
+  在可写数据源上亦一律拒绝
+- API Key 经 Fernet 加密落库，仅向前端返回掩码
+
+---
+
+## 运行环境
+
+### 沙箱后端选择
+
+设置页「运行环境」列出全部候选及其可用性，并标注当前选中项。安装 microVM 依赖且镜像已缓存时
+auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
+（`apt install bubblewrap`）后使用 `bubblewrap`；均不可用时降级至 `local`——**该路径不含任何
+访问控制**，界面明确标红。可通过 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
+亦可在代码节点上单独选择隔离档位（strict = microVM，fast = 系统沙箱）。
+
+### 启用 microVM
+
+三项准备，**均为一次性**——日常启动仍只需 `./scripts/dev.sh`：
+
+1. Python 包：使用 `environment.yml` 创建环境时已包含（含 `[microvm]` extra）
+2. 运行时（约 50MB，落于 `~/.microsandbox`）：每台机器一次
+3. OCI 镜像（实测约 55 秒）：首次执行代码时自动拉取，每个镜像一次
+
+仅第 2 项需手动执行：
 
 ```bash
 conda run -n agentlab python -c "import asyncio,microsandbox as m; asyncio.run(m.install())"
 ```
 
-三样都落在磁盘上，重启机器、重开终端都不用再来。装没装好不用猜——设置页「运行环境」
-里 `microvm` 那条的 `warm` 为 true 就是三样齐了，auto 会自动升到 `microvm`。
-镜像可以用 `AGENTLAB_MICROVM_IMAGE` 换，闲置 VM 回收时间用 `AGENTLAB_MICROVM_IDLE_SECONDS`。
+三项均落于磁盘，重启机器或重开终端无需重来。设置页「运行环境」中 `microvm` 条目的
+`warm` 为 true 即表示三项齐备，auto 将自动升级至 `microvm`。镜像可通过
+`AGENTLAB_MICROVM_IMAGE` 更换，闲置 VM 回收时间由 `AGENTLAB_MICROVM_IDLE_SECONDS` 控制。
 
-**模型返回空内容？** Claude 4.6 之后的模型默认开着 thinking，`max_tokens` 给小了会出现
-「思考完就没额度写正文」。节点里把 max_tokens 调大，或把思考模式设为关闭。时间线里会有提示。
-
-**中转网关报 401？** 有的网关只认 `Authorization: Bearer`，且多带一个 `x-api-key` 就会拒。
-在 provider 设置里勾上「用 Authorization: Bearer 认证」。
-
-**端口冲突？** 前端默认 5273、后端 8000，用 `AGENTLAB_WEB_PORT` / `AGENTLAB_PORT` 改。
-
-**数据在哪？** 全在 `data/`：`agentlab.db` 业务数据、`checkpoints.db` 执行断点、
-`workspace/` 沙箱文件、`.secret_key` 加密密钥。删掉 `data/` 就是恢复出厂设置。
-
-## 冒烟测试
+### 可选依赖
 
 ```bash
-node scripts/e2e-check.mjs      # 开浏览器跑一遍：打开画布 → 选模板 → 运行 → 看高亮
+pip install -e 'backend[docs]'     # PDF / Word / PowerPoint / Excel 解析
+pip install -e 'backend[db]'       # MySQL / PostgreSQL / Oracle 驱动
+pip install -e 'backend[microvm]'  # microVM 沙箱
+pip install -e 'backend[dev]'      # pytest
 ```
+
+### 数据位置
+
+全部位于 `data/`：`agentlab.db` 业务数据、`checkpoints.db` 执行断点、
+`artifacts/` 工件库、`workspace/` 沙箱文件、`uploads/` 上传文件、`.secret_key` 加密密钥。
+删除 `data/` 即恢复出厂设置。
+
+---
+
+## 常见问题
+
+**模型返回空内容。** Claude 4.6 之后的模型默认启用 thinking，`max_tokens` 过小会出现
+「思考耗尽额度，正文为空」。将节点的 max_tokens 调大，或将思考模式设为关闭。
+时间线中会给出相应提示。
+
+**中转网关返回 401。** 部分网关仅接受 `Authorization: Bearer`，且额外携带 `x-api-key`
+即会拒绝。在 provider 设置中勾选「用 Authorization: Bearer 认证」。
+
+**数据源结构探查失败。** 探查失败与「尚未探查」是两种状态：前者点击按钮无法解决，
+需先处理超时或更换 schema。数据源卡片会显示失败原因与该服务器上的可选库列表。
+agent 侧同样会收到实情，并被告知可直接查询 `information_schema` 自行确认表结构。
+
+**端口冲突。** 前端默认 5273、后端 8000，通过 `AGENTLAB_WEB_PORT` / `AGENTLAB_PORT` 修改。
+
+---
+
+## 开发与验证
+
+```bash
+# 后端：271 个测试
+cd backend && pytest tests
+
+# 前端类型检查
+cd frontend && npx tsc -b
+
+# 三层前端验证（需先启动 ./scripts/dev.sh）
+node scripts/check-decode.mjs    # 事件 → 步骤的翻译是否正确
+node scripts/check-stream.mjs    # 助手流组件渲染是否正确
+node scripts/check-ui.mjs        # 真浏览器端到端：URL 寻址、会话、运行详情
+node scripts/e2e-check.mjs       # 冒烟：打开画布 → 选模板 → 运行 → 观察高亮
+```
+
+三层前端验证的分工：`check-decode` 守「翻译对不对」，`check-stream` 守「画出来对不对」，
+`check-ui` 守「整条路走得通不通」。三者可各自通过而合起来是坏的——例如 Step 字段全部正确，
+组件却将其渲染为一屏转义 JSON。
+
+README 中的截图由一个空数据目录启动的临时实例产出，仅含内置模板与 Mock provider。
