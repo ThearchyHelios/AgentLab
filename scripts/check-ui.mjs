@@ -200,6 +200,35 @@ console.log('\n=== 问数据 ===')
   await page.close()
 }
 
+console.log('\n=== 向量模型设置 ===')
+{
+  // 以前这里只有三个写死的选项（本地 / OpenAI 3-small / 3-large），接不了
+  // 本机起的服务。而本地哈希向量没有语义能力这件事，界面上也得说出来。
+  const { page, errors } = await visit('/knowledge')
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+
+  let body = await page.locator('body').innerText()
+  check('显示当前用的是什么、几维', /·\s*\d+\s*维/.test(body),
+        body.match(/[\w:.-]+ · \d+ 维/)?.[0])
+  if (body.includes('local-hashing')) {
+    check('本地哈希要标出没有语义能力', body.includes('没有语义能力'))
+  }
+
+  await page.getByRole('button', { name: '换一个' }).first().click()
+  await page.waitForTimeout(400)
+  body = await page.locator('body').innerText()
+  check('能配自定义端点', body.includes('自定义端点'))
+  check('也留着本地那一项', body.includes('本地哈希向量'))
+  // 模型名手填太容易错，必须能探
+  check('给得出探测入口', body.includes('看看有哪些模型'))
+
+  const overflow = await page.evaluate(() =>
+    document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('页面不横向溢出', overflow <= 0, `${overflow}px`)
+  await shot(page, 'embedding')
+  await page.close()
+}
+
 console.log('\n=== 会话 ===')
 {
   // 对话以前只活在内存里，刷新就没了。这一组守的是它真的落了库：

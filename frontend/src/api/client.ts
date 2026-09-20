@@ -193,11 +193,17 @@ export const api = {
     remove: (id: string) => del(`/kb/documents/${id}`),
     embedding: (collection?: string) => get<{
       embedder: string; dim: number; configured: boolean
-      kind: string; model: string; stale_chunks: number; stale_memories: number
-      unindexed_chunks: number
+      kind: string; model: string; base_url: string
+      stale_chunks: number; stale_memories: number; unindexed_chunks: number
     }>(`/kb/embedding${collection ? `?collection=${collection}` : ''}`),
-    setEmbedding: (body: { kind: string; model?: string }) =>
-      put<{ embedder: string; dim: number; stale_chunks: number }>('/kb/embedding', body),
+    setEmbedding: (body: { kind: string; model?: string; base_url?: string }) =>
+      put<{
+        embedder: string; dim: number
+        stale_chunks: number; stale_memories: number
+      }>('/kb/embedding', body),
+    probeEmbedding: (baseUrl: string) =>
+      get<{ base_url: string; models: string[] }>(
+        `/kb/embedding/probe?base_url=${encodeURIComponent(baseUrl)}`),
     reindex: (collection?: string) =>
       post<{ reindexed: number; memories_reindexed: number; embedder: string }>(
         `/kb/reindex${collection ? `?collection=${collection}` : ''}`),

@@ -206,6 +206,7 @@ async def embedding_status(
         "configured": bool(saved.get("kind")),
         "kind": saved.get("kind", "local"),
         "model": saved.get("model", ""),
+        "base_url": saved.get("base_url", ""),
         "stale_chunks": await kb.stale_count(session, collection),
         # 记忆和知识库共用一个 embedder，换模型时一起失效——报一个漏一个
         # 的话，用户点完重建还是想不起事，而且不知道为什么
@@ -220,6 +221,9 @@ async def embedding_status(
 class EmbeddingIn(BaseModel):
     kind: str = Field(default="local", pattern="^(local|openai)$")
     model: str = ""
+    #: 任何讲 OpenAI /v1/embeddings 的地址：本机 LM Studio / Ollama / vLLM / TEI，
+    #: 或者你自己的网关。留空才走 api.openai.com
+    base_url: str = ""
 
 
 @kb_router.put("/embedding")
@@ -235,12 +239,13 @@ async def set_embedding(
     from app.db.models import Setting
 
     try:
-        emb.configure(payload.kind, payload.model)
+        emb.configure(payload.kind, payload.model, payload.base_url)
     except emb.EmbedderUnavailable as e:
         raise HTTPException(400, str(e)) from e
 
     row = await session.get(Setting, emb.EMBEDDING_SETTING_KEY)
-    value = {"kind": payload.kind, "model": payload.model}
+    value = {"kind": payload.kind, "model": payload.model,
+             "base_url": payload.base_url}
     if row:
         row.value = value
     else:
@@ -252,6 +257,26 @@ async def set_embedding(
         "stale_chunks": await kb.stale_count(session),
         "stale_memories": await store.stale_count(session),
     }
+
+
+@kb_router.get("/embedding/probe")
+async def probe_embedding(base_url: str) -> dict[str, Any]:
+    """问问这个地址上有哪些模型。
+
+    自己填模型名太容易写错（LM Studio 里叫
+    text-embedding-qwen3-embedding-4b，不是 Qwen3-Embedding-4B），
+    而填错的表现是切换时报一句 404，人还以为是服务没起。
+    """
+    import httpx
+
+    url = base_url.rstrip("/") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            data = (await client.get(url)).json()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"连不上 {url}：{type(e).__name__}: {e}") from e
+    models = [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
+    return {"base_url": base_url, "models": models}
 
 
 @kb_router.post("/reindex")

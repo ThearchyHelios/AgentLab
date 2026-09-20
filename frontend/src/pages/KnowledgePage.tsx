@@ -46,8 +46,16 @@ function EmbedderBar({ collection, onChanged }: {
   const toast = useToast()
   const [info, setInfo] = useState<any>(null)
   const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [baseUrl, setBaseUrl] = useState('')
+  const [models, setModels] = useState<string[]>([])
+  const [model, setModel] = useState('')
 
-  const refresh = async () => setInfo(await api.kb.embedding(collection).catch(() => null))
+  const refresh = async () => {
+    const next = await api.kb.embedding(collection).catch(() => null)
+    setInfo(next)
+    if (next) { setBaseUrl(next.base_url || ''); setModel(next.model || '') }
+  }
   useEffect(() => { void refresh() }, [collection])
 
   if (!info) return null
@@ -60,15 +68,32 @@ function EmbedderBar({ collection, onChanged }: {
   const unindexed = info.unindexed_chunks ?? 0
   const stale = staleChunks + staleMemories + unindexed
 
-  const pick = async (kind: string, model: string) => {
+  const pick = async (kind: string, m = '', url = '') => {
     setBusy(true)
     try {
-      const out = await api.kb.setEmbedding({ kind, model })
-      toast(`已切到 ${out.embedder}`, 'ok')
+      const out = await api.kb.setEmbedding({ kind, model: m, base_url: url })
+      // 换模型之后维度多半变了，存量向量全部作废——这件事要当场说，
+      // 而不是等用户发现"最近搜得不准"
+      const stale = (out.stale_chunks ?? 0) + (out.stale_memories ?? 0)
+      toast(`已切到 ${out.embedder}（${out.dim} 维）`
+            + (stale ? `，${stale} 条存量向量需要重建` : ''), 'ok')
+      setEditing(false)
       await refresh()
     } catch (e: any) {
-      // 400 里是"缺 OPENAI_API_KEY"这类能照着做的原因，原样交给用户
+      // 400 里写的是"连不上哪个地址""哪个模型名不对"，都能照着做
       toast(e?.message ?? '切换失败', 'error')
+    } finally { setBusy(false) }
+  }
+
+  const probe = async () => {
+    setBusy(true)
+    try {
+      const out = await api.kb.probeEmbedding(baseUrl)
+      setModels(out.models)
+      if (out.models.length === 1) setModel(out.models[0])
+      if (!out.models.length) toast('这个地址上没有可用模型', 'error')
+    } catch (e: any) {
+      toast(e?.message ?? '连不上', 'error')
     } finally { setBusy(false) }
   }
 
@@ -90,17 +115,14 @@ function EmbedderBar({ collection, onChanged }: {
     <div className="mb-3 rounded-lg border bg-panel p-3 text-[12px]">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-faint">向量模型</span>
-        <select className="field h-7 w-auto" disabled={busy}
-                value={info.kind === 'openai' ? `openai:${info.model}` : 'local'}
-                onChange={(e) => {
-                  const [kind, ...rest] = e.target.value.split(':')
-                  void pick(kind, rest.join(':'))
-                }}>
-          <option value="local">本地哈希（零配置，但没有语义能力）</option>
-          <option value="openai:text-embedding-3-small">OpenAI 3-small</option>
-          <option value="openai:text-embedding-3-large">OpenAI 3-large</option>
-        </select>
-        <span className="mono text-[11px] text-faint">{info.embedder} · {info.dim} 维</span>
+        <span className="mono text-[11px]">{info.embedder} · {info.dim} 维</span>
+        {info.kind === 'local' && (
+          <span className="text-[10.5px]" style={{ color: 'var(--warn)' }}>没有语义能力</span>
+        )}
+        <button className="btn btn-sm btn-ghost" disabled={busy}
+                onClick={() => setEditing((v) => !v)}>
+          {editing ? '收起' : '换一个'}
+        </button>
         <span className="flex-1" />
         {stale > 0 && (
           <button className="btn btn-sm btn-primary" disabled={busy} onClick={rebuild}>
@@ -108,6 +130,45 @@ function EmbedderBar({ collection, onChanged }: {
           </button>
         )}
       </div>
+      {editing && (
+        <div className="mt-3 space-y-2 border-t pt-3">
+          <button className="btn btn-sm w-full justify-start" disabled={busy}
+                  onClick={() => void pick('local')}>
+            本地哈希向量 — 零配置、不联网、免费，但只认字面不认语义
+          </button>
+
+          <div className="rounded-lg border p-2">
+            <div className="mb-1.5 text-[11px] text-faint">
+              自定义端点 — 任何讲 OpenAI /v1/embeddings 的服务：本机的 LM Studio、
+              Ollama、vLLM、TEI，或你自己的网关
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input className="field h-7 flex-1" placeholder="http://127.0.0.1:1234/v1"
+                     value={baseUrl} disabled={busy}
+                     onChange={(e) => setBaseUrl(e.target.value)} />
+              {/* 模型名手填太容易错：LM Studio 里叫 text-embedding-qwen3-embedding-4b，
+                  不是 Qwen3-Embedding-4B。填错的表现是切换时 404，人还以为服务没起 */}
+              <button className="btn btn-sm" disabled={busy || !baseUrl.trim()}
+                      onClick={() => void probe()}>看看有哪些模型</button>
+            </div>
+            {!!models.length && (
+              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                <select className="field h-7 flex-1" value={model} disabled={busy}
+                        onChange={(e) => setModel(e.target.value)}>
+                  {models.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+                <button className="btn btn-sm btn-primary" disabled={busy || !model}
+                        onClick={() => void pick('openai', model, baseUrl)}>用它</button>
+              </div>
+            )}
+            <p className="mt-1.5 text-[10.5px] text-faint">
+              留空地址则走 api.openai.com（要 OPENAI_API_KEY，按量计费）。
+              换模型后维度多半会变，存量向量要重建一次。
+            </p>
+          </div>
+        </div>
+      )}
+
       {staleChunks + staleMemories > 0 && (
         <p className="mt-2 text-[11px]" style={{ color: 'var(--warn)' }}>
           有{staleChunks ? ` ${staleChunks} 段知识` : ''}

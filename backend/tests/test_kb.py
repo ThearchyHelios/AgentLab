@@ -522,3 +522,69 @@ def test_a_broken_endpoint_names_where_it_tried(monkeypatch) -> None:
     with pytest.raises(e.EmbedderUnavailable) as err:
         e.configure("openai", "qwen3-embedding-4b", "http://127.0.0.1:1234/v1")
     assert "127.0.0.1:1234" in str(err.value) and "qwen3-embedding-4b" in str(err.value)
+
+
+async def test_the_probe_endpoint_lists_models(monkeypatch) -> None:
+    """模型名手填太容易错：LM Studio 里叫 text-embedding-qwen3-embedding-4b，
+    不是 Qwen3-Embedding-4B。填错的表现是切换时 404，人还以为是服务没起。"""
+    import httpx
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    class _Resp:
+        def json(self):
+            return {"data": [{"id": "text-embedding-qwen3-embedding-4b"}, {"id": "other"}]}
+
+    class _Client:
+        def __init__(self, **kw): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, _url): return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        out = (await c.get("/api/kb/embedding/probe",
+                           params={"base_url": "http://127.0.0.1:1234/v1"})).json()
+    assert "text-embedding-qwen3-embedding-4b" in out["models"]
+
+
+async def test_a_dead_endpoint_says_which_address(monkeypatch) -> None:
+    import httpx
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    class _Client:
+        def __init__(self, **kw): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, _url): raise ConnectionError("refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.get("/api/kb/embedding/probe", params={"base_url": "http://127.0.0.1:9999/v1"})
+    assert r.status_code == 400
+    assert "127.0.0.1:9999" in r.json()["detail"]
+
+
+async def test_the_endpoint_is_remembered_across_restarts(client=None) -> None:
+    """base_url 不落库的话，重启后会悄悄退回本地哈希——而库里的向量是
+    上一个模型建的，检索会整体退回关键词，用户只看到"重启之后搜得不准了"。"""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.db.models import Setting
+    from app.main import app
+    from app.memory import embeddings as e
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        await c.put("/api/kb/embedding", json={"kind": "local"})
+        status = (await c.get("/api/kb/embedding")).json()
+    assert "base_url" in status, "状态里不回显 base_url，界面刷新后就不知道接的是哪"
+
+    async with SessionLocal() as session:
+        row = await session.get(Setting, e.EMBEDDING_SETTING_KEY)
+    assert row is not None and "base_url" in row.value
