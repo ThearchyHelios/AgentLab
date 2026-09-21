@@ -65,7 +65,10 @@ class Settings(BaseSettings):
     # --- 执行引擎护栏 ---
     max_run_seconds: int = 600
     max_graph_steps: int = 200
-    max_agent_steps: int = 25
+    # 节点上配多少步都过不去这个硬顶。默认值仍是节点上的 12（nodeDefs.ts），
+    # 这里只决定"想调大的人最多能调到哪"——实测 87% 的 agent 节点 ≤10 步就收口，
+    # 绷紧的是那 10%，不该让所有人陪着多花钱
+    max_agent_steps: int = 100
     #: 上传文件的大小上限（MB）。原来写死 10，而且是读完整个文件才检查——
     #: 传一个 1GB 的文件，内存在报 413 之前就吃掉了
     max_upload_mb: int = 50

@@ -133,7 +133,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'prompt', label: '任务', type: 'prompt' },
       { key: 'tools', label: '可用工具', type: 'tools' },
       { key: 'skills', label: '挂载 Skill', type: 'skills' },
-      { key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 25 },
+      { key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100 },
       {
         key: 'approval', label: '工具审批', type: 'select',
         options: [

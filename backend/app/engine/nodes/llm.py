@@ -354,6 +354,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         return await _invoke_streaming(model, payload, ctx, model_id)
 
     @task
+    async def settle_step(payload: list[BaseMessage]) -> BaseMessage:
+        # 用 base_model 而不是上面那个绑过工具的 model：收尾轮必须在**结构上**
+        # 发不出工具调用，靠提示词说"别调工具"是约束不住的
+        return await _invoke_streaming(base_model, payload, ctx, model_id)
+
+    @task
     async def tool_step(step: int, name: str, args: dict[str, Any]) -> str:
         tool = tool_map[name]
         result = await tool.ainvoke(args)
@@ -479,24 +485,58 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 {"tool": call.get("name", ""), "args": call.get("args", {}) or {}, "skipped": True}
             )
     else:
-        # 步数用完了。成果只能取模型自己说过的话——messages[-1] 很可能是一条
-        # ToolMessage：工具的原始返回，或者串行模式下那句"本轮只执行了第一个
-        # 工具"。后者真的漏到用户面前当过答案（run dd9927e6），一句内部管道
-        # 文案冒充结论，比明说"没跑完"糟糕得多。
-        final_text = next(
-            (text for m in reversed(messages)
-             if isinstance(m, AIMessage) and (text := message_text(m).strip())),
-            "",
-        )
-        hint = (
-            f"agent 用满了 {max_steps} 步还没给出结论。"
-            "把节点上的「最大步数」调大；如果它大部分步数花在逐张表查结构上，"
-            "也可以在提示词里点明该查哪几张表。"
-        )
-        # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
-        # 一个没头没尾的答案，而不知道是被步数掐断的
-        final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
-        ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit")
+        # 步数用完了。走到这儿一定意味着最后那步**要求了工具**（不要工具会 break），
+        # 也就是说模型从来没拿到过"说结论"的那一轮——它只是被掐断在半路。
+        #
+        # 所以先补上那一轮：不给工具，让它基于已经查到的东西收口。这比把中间
+        # 过程当答案交出去强得多，也比只留一句抱怨强——用户要的是"已知什么、
+        # 还缺什么"，不是"系统哪里不够用"。
+        settled = ""
+        messages.append(HumanMessage(content=(
+            f"步数预算用完了（{max_steps} 步），现在起不能再调用任何工具。"
+            "基于已经查到的信息给出结论；明确说清哪些部分没有查到、"
+            "结论因此有什么局限。不要编造没查到的数据。"
+        )))
+        try:
+            response = await settle_step(messages)
+            usage = _usage_of(response, model_id)
+            for key in ("input_tokens", "output_tokens", "calls"):
+                total_usage[key] += usage[key]
+            total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
+            settled = message_text(response).strip()
+        except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有成果一起赔进去
+            ctx.emit(EventType.LOG, level="warn",
+                     message=f"收尾轮没跑成：{type(e).__name__}: {e}", code="settle_failed")
+
+        if settled:
+            final_text = settled
+            hint = (
+                f"agent 用满了 {max_steps} 步，这个结论是基于已经查到的部分给出的。"
+                "要跑全请把节点上的「最大步数」调大；如果它大部分步数花在逐张表"
+                "查结构上，也可以在提示词里点明该查哪几张表。"
+            )
+            # 和 step_limit 分开发：库里那些老事件的含义确实是"硬截断"，
+            # 复用同一个 code 会把历史运行重新解释成另一回事
+            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit_settled")
+        else:
+            # 收尾轮也没说出话。成果只能取模型自己说过的话——messages[-1] 很可能
+            # 是一条 ToolMessage：工具的原始返回，或者串行模式下那句"本轮只执行了
+            # 第一个工具"。后者真的漏到用户面前当过答案（run dd9927e6），一句内部
+            # 管道文案冒充结论，比明说"没跑完"糟糕得多。
+            final_text = next(
+                (text for m in reversed(messages)
+                 if isinstance(m, AIMessage) and (text := message_text(m).strip())),
+                "",
+            )
+            hint = (
+                f"agent 用满了 {max_steps} 步还没给出结论。"
+                "把节点上的「最大步数」调大；如果它大部分步数花在逐张表查结构上，"
+                "也可以在提示词里点明该查哪几张表。"
+            )
+            # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
+            # 一个没头没尾的答案，而不知道是被步数掐断的
+            final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
+            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit")
 
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {

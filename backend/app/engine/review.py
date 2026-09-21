@@ -58,6 +58,12 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "step_limit": ("step_limit", BROKEN),
     "empty_completion": ("empty_completion", BROKEN),
     # 能用但有缺口
+    # 步数用尽，但收尾轮让模型基于已查到的部分收了口：答案是完整的一段话，
+    # 只是覆盖面不全——这是缺口不是断裂，所以不判 BROKEN。
+    # 连带效果是不再触发自动重跑，那正是想要的：同样配置再跑一遍还撞同一堵墙
+    "step_limit_settled": ("step_limit_settled", DEGRADED),
+    # 收尾轮自己挂了。影响由同时发出的 step_limit(BROKEN) 承担，这条是说清原因
+    "settle_failed": ("settle_failed", DEGRADED),
     "loop_limit": ("loop_limit", DEGRADED),
     "tool_args_fixed": ("tool_args_fixed", DEGRADED),
     "node_retry": ("node_retry", DEGRADED),

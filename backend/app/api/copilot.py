@@ -112,8 +112,10 @@ NODE_REFERENCE = """\
 - output：出口，收集最终成果。config.fields = [{name, value}]，value 里写模板引用
 - llm：单次模型调用。config: {system, prompt, model, temperature, max_tokens, assign_to, output_schema}
 - agent：带工具循环的 agent。config: {system, prompt, tools:[工具名], approval, assign_to}
-  **不要写 max_steps**。平台默认值是按「一步只调一个工具」校准过的；写死一个
-  小数字（见过 8）会让它查完表结构就没额度回答了，用户拿到的是半截结论
+  **默认不要写 max_steps**。平台默认值是按「一步只调一个工具」校准过的；写死一个
+  小数字（见过 8）会让它查完表结构就没额度回答了，用户拿到的是半截结论。
+  唯一的例外：上一次就是因为**步数用尽**没跑完（会在改写理由里写明），
+  这时要显式写一个更大的值（比如 24）——那是这种失败唯一的修法
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
