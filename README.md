@@ -401,4 +401,39 @@ node scripts/e2e-check.mjs       # 冒烟：打开画布 → 选模板 → 运�
 `check-ui` 守「整条路走得通不通」。三者可各自通过而合起来是坏的——例如 Step 字段全部正确，
 组件却将其渲染为一屏转义 JSON。
 
-README 中的截图由一个空数据目录启动的临时实例产出，仅含内置模板与 Mock provider。
+## License
+
+This project is **source-available** and is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
+
+### Noncommercial Use
+
+You may use, study, modify, experiment with, and develop upon this software for purposes permitted under the PolyForm Noncommercial License 1.0.0.
+
+Typical permitted noncommercial uses include:
+
+* personal research;
+* learning and education;
+* experimentation;
+* evaluation and testing;
+* hobby projects;
+* noncommercial software development.
+
+See the [`LICENSE`](./LICENSE) file for the applicable license terms.
+
+### Commercial Use
+
+**Commercial use is not permitted without prior written authorization from Yilun JIANG.**
+
+If you intend to use this software in a commercial product, commercial service, SaaS offering, customer project, commercial deployment, or other commercial context, you must obtain a separate commercial license before doing so.
+
+For commercial licensing, see [`COMMERCIAL-LICENSE.md`](./COMMERCIAL-LICENSE.md) or contact:
+
+**Yilun JIANG**
+**[me@thearchyhelios.com](mailto:me@thearchyhelios.com)**
+
+### Copyright
+
+Copyright (c) 2026 Yilun JIANG.
+
+All rights reserved except as expressly granted under the applicable license.
+
