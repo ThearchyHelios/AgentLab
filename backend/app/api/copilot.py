@@ -120,6 +120,9 @@ NODE_REFERENCE = """\
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
+  assign_to 拿到的是 stdout（尾部的换行已去掉）。**stdout 是 JSON 时会解析成对象**，
+  这时下游要用 {{ vars.x.字段 }} 取字段，拿它比字符串永远不成立。要判一个简单结论，
+  就 print 一个短字符串（比如 print('ok')）并让下游比它
 - branch：条件分支。config: {mode: expression|llm, cases:[{key, condition, label}]}
 - loop：循环。config: {mode: foreach|while, items, item_var, condition, max_iterations}
 - retrieve：知识库检索。config: {query, collection, limit, assign_to}

@@ -180,19 +180,34 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )
 
     payload = result.model_dump()
+    # 节点的"文本输出"要去掉 print() 补的那个换行。
+    #
+    # 代码节点只有 print 一条产出通道，而 print / echo / console.log 一定会补
+    # 一个换行——它是传输的产物，不是值的一部分。以前 assign_to 直接给原始
+    # stdout，于是 `print('ok')` 写进变量的是 "ok\n"：下游 `== 'ok'` 永远不
+    # 成立，而 `== 'fail'` 也不成立。同一个变量、同一个表达式，循环条件和分支
+    # 条件得出相反的结论——循环正常退出（看着像成功），分支掉进 default（判成
+    # 失败），最后交出一份自相矛盾的结果。运行 d47bfcb0 就是这么回事。
+    #
+    # 只削尾不削头：首行的缩进是内容（比如逐行打印一段缩进文本），削掉就毁了。
+    # 原始 stdout 仍在 payload["stdout"] 里，要查"到底跑了什么"看那个。
+    text = result.stdout.rstrip()
+
     # 如果 stdout 是 JSON，顺手解析出来，下游就能直接用字段而不是再写解析
     parsed: Any = None
-    text = result.stdout.strip()
-    if text.startswith(("{", "[")):
+    sniff = result.stdout.strip()
+    if sniff.startswith(("{", "[")):
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(sniff)
         except json.JSONDecodeError:
             parsed = None
     payload["data"] = parsed
-    payload["text"] = result.stdout
+    payload["text"] = text
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: payload}}
     var_name = ctx.cfg("assign_to", "")
     if var_name:
-        updates["vars"] = {var_name: parsed if parsed is not None else result.stdout}
+        # {{ vars.x }} 和 {{ nodes.x.text }} 必须是同一个值：两种写法给不同的
+        # 值比原来的毛病更难查
+        updates["vars"] = {var_name: parsed if parsed is not None else text}
     return updates
