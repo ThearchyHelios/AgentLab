@@ -357,7 +357,7 @@ async def seed_defaults() -> None:
         await session.commit()
 
         # --- 模板工作流 ---
-        from app.api.copilot import auto_layout
+        from app.engine.layout import auto_layout
 
         existing = {n for (n,) in await session.execute(select(Workflow.name))}
         added = 0

@@ -39,7 +39,9 @@ export function toFlow(graph: GraphSpec): { nodes: FlowNode[]; edges: Edge[] } {
       sourceHandle: e.sourceHandle ?? null,
       targetHandle: e.targetHandle ?? null,
       label: e.label || undefined,
-      type: 'smoothstep',
+      // 走线由 canvas/routing.ts 统一算（端口错开 + 走廊车道），
+      // 不用自带的 smoothstep：它的竖直段全都落在同一个 x 上，会叠成一团
+      type: 'flow',
       animated: false,
     })),
   }
@@ -162,6 +164,8 @@ interface StudioState {
   copilotNew: string[]
   copilotTurns: CopilotTurn[]
   cancelCopilot: (() => void) | null
+  /** 每次 +1 = 请求画布重新取景。整张图换过坐标之后不重新取景，人会盯着一片空白 */
+  fitRequest: number
 
   // actions
   load: (workflow: Workflow) => void
@@ -269,6 +273,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   copilotNew: [],
   copilotTurns: [],
   cancelCopilot: null,
+  fitRequest: 0,
 
   load: (workflow) => {
     const { nodes, edges } = toFlow(workflow.graph)
@@ -276,6 +281,9 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({
       workflow, nodes, edges, selectedId: null, dirty: false, issues: [],
       run: null, events: [], runtime: {}, activeEdges: [], streaming: false, unsubscribe: null,
+      // 整张图换了，视角也要跟着换。不换的话打开另一张图看到的还是上一张的
+      // 那块空白——画布位置是视口的，不是图的
+      fitRequest: get().fitRequest + 1,
       // 换了一张图，之前那些"我让它改成这样"就不再指向眼前这张图了
       copilotTurns: [],
       // 先清空再去解析：留着上一张图的会话 id，这中间的任何一条指令
@@ -288,7 +296,7 @@ export const useStudio = create<StudioState>((set, get) => ({
 
   setGraph: (graph) => {
     const { nodes, edges } = toFlow(graph)
-    set({ nodes, edges, dirty: true })
+    set({ nodes, edges, dirty: true, fitRequest: get().fitRequest + 1 })
     void get().validate()
   },
 
@@ -621,6 +629,9 @@ export const useStudio = create<StudioState>((set, get) => ({
             // 后端排版+校验后的最终图整体落位；高亮集合保留几秒供辨认
             const { nodes, edges } = toFlow(op.graph)
             set({ nodes, edges, dirty: true,
+                  // 生成完的图坐标是后端新排的，视角得跟过去，否则"生成好了"
+                  // 这句话落在一片空白上
+                  fitRequest: get().fitRequest + 1,
                   copilot: { ...get().copilot, active: false, lastOp: '', phase: '',
                              thinking: '', elapsedMs: 0, error: '',
                              explanation: op.explanation ?? get().copilot.explanation } })

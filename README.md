@@ -152,6 +152,12 @@ flowchart LR
 
 连线即并行：单个节点连出多条边构成 fan-out，多条边汇入同一节点时自动等待汇聚。
 
+自动排版按拓扑分层：并行的支路落在同一列，层内按中位数启发式排序以减少交叉，
+分支节点的出口按 yes/no 的声明顺序自上而下，循环的回边不参与分层（否则循环体会
+被压到循环节点左边）。层与层之间按"穿过这条走廊的连线在竖直方向最多重叠几条"
+预留走廊宽度，前端 `canvas/routing.ts` 据此给每条线分配独立的竖直车道——扇出、
+汇聚的线因此不会叠在同一段上，跨层的长边则从没有节点的空档绕过去。
+
 ---
 
 ## 节点类型
@@ -211,11 +217,12 @@ backend/                  FastAPI + LangGraph
   app/api/                REST + WebSocket
 frontend/                 React 19 + React Flow + Zustand
   src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩均由其驱动
+  src/canvas/routing.ts   连线走线：端口错开、走廊车道、长边绕行
   src/run/decode.ts       事件流 → 人类可读步骤的唯一翻译层
   src/store/studio.ts     画布状态 + 事件流到高亮的映射
 environment.yml           conda 环境定义
 scripts/dev.sh            一键启动
-scripts/check-*.mjs       三层前端验证脚本
+scripts/check-*.mjs       前端验证脚本
 ```
 
 ---
@@ -384,22 +391,28 @@ agent 侧同样会收到实情，并被告知可直接查询 `information_schema
 ## 开发与验证
 
 ```bash
-# 后端：271 个测试
+# 后端：285 个测试
 cd backend && pytest tests
 
 # 前端类型检查
 cd frontend && npx tsc -b
 
-# 三层前端验证（需先启动 ./scripts/dev.sh）
-node scripts/check-decode.mjs    # 事件 → 步骤的翻译是否正确
-node scripts/check-stream.mjs    # 助手流组件渲染是否正确
-node scripts/check-ui.mjs        # 真浏览器端到端：URL 寻址、会话、运行详情
-node scripts/e2e-check.mjs       # 冒烟：打开画布 → 选模板 → 运行 → 观察高亮
+# 前端验证（需先启动 ./scripts/dev.sh）
+node scripts/check-decode.mjs        # 事件 → 步骤的翻译是否正确
+node scripts/check-stream.mjs        # 助手流组件渲染是否正确
+node scripts/check-ui.mjs            # 真浏览器端到端：URL 寻址、会话、运行详情
+node scripts/check-canvas-layout.mjs # 排版与连线几何：线有没有叠、有没有穿过卡片
+node scripts/e2e-check.mjs           # 冒烟：打开画布 → 选模板 → 运行 → 观察高亮
 ```
 
 三层前端验证的分工：`check-decode` 守「翻译对不对」，`check-stream` 守「画出来对不对」，
 `check-ui` 守「整条路走得通不通」。三者可各自通过而合起来是坏的——例如 Step 字段全部正确，
 组件却将其渲染为一屏转义 JSON。
+
+`check-canvas-layout` 单独守「图好不好看」里唯一能算的那部分：它把夹具图交给后端
+`/api/copilot/layout` 排版，再直接 `import('/src/canvas/routing.ts')` 用页面上正在跑的那份
+走线代码算路径，然后按几何断言——没有两条线压在同一段上、没有线从别人的卡片中间穿过去、
+每条线的两端都接在节点边缘。连线叠成一团时 `check-ui` 和 `e2e-check` 一个字都不会说。
 
 ## License
 

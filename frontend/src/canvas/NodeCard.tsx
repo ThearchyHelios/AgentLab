@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { AlertTriangle, Check, Hand, Loader2, Sparkles, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, sourceHandles } from './nodeDefs'
+import { NODE_WIDTH } from './routing'
 import { formatDuration } from '../run/decode'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
@@ -78,7 +79,7 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
         copilotNew && 'node-copilot-new',
         selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
       )}
-      style={{ width: 238, borderColor: selected ? 'var(--accent)' : undefined }}
+      style={{ width: NODE_WIDTH, borderColor: selected ? 'var(--accent)' : undefined }}
     >
       {def?.hasTarget && (
         <Handle type="target" position={Position.Left} style={{ left: -5 }} />

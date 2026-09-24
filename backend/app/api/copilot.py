@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session
 from app.db.models import Workflow
+from app.engine.layout import auto_layout
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 from app.engine.state import message_text
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
@@ -159,43 +160,6 @@ NODE_REFERENCE = """\
 - human 节点（approve 模式）：sourceHandle 用 "approved" 和 "rejected"
 - 一个节点连出多条普通边 = 并行执行，多条边汇入同一节点 = 等待汇聚
 """
-
-
-def auto_layout(spec: GraphSpec, *, x_gap: int = 300, y_gap: int = 150) -> GraphSpec:
-    """按拓扑层级排版。
-
-    模型生成的图只有结构没有坐标，全堆在原点就没法看了。
-    这里按最长路径分层：同层的节点竖排，层与层横向铺开。
-    """
-    nodes = spec.node_map()
-    depth: dict[str, int] = {}
-
-    def compute(node_id: str, seen: frozenset[str]) -> int:
-        if node_id in depth:
-            return depth[node_id]
-        if node_id in seen:  # 环：就地截断，避免递归爆栈
-            return 0
-        incoming = [e.source for e in spec.incoming(node_id) if e.source in nodes]
-        value = 0 if not incoming else 1 + max(
-            compute(src, seen | {node_id}) for src in incoming
-        )
-        depth[node_id] = value
-        return value
-
-    for node in spec.nodes:
-        compute(node.id, frozenset())
-
-    by_level: dict[int, list[str]] = {}
-    for node_id, level in depth.items():
-        by_level.setdefault(level, []).append(node_id)
-
-    for level, ids in sorted(by_level.items()):
-        offset = -(len(ids) - 1) * y_gap / 2
-        for i, node_id in enumerate(sorted(ids)):
-            node = nodes[node_id]
-            node.position.x = 80 + level * x_gap
-            node.position.y = 300 + offset + i * y_gap
-    return spec
 
 
 class GenerateIn(BaseModel):
@@ -849,7 +813,6 @@ async def extract_template(
     """
     from sqlalchemy import select as _sel
 
-    from app.api.copilot import auto_layout  # 自引用仅为显式
     from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
     from app.core.artifact_store import graph_hash
 
