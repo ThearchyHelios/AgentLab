@@ -36,10 +36,15 @@ class RunManager:
         self._checkpointer: AsyncSqliteSaver | None = None
         self._cm: Any = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
+        #: 正在关停。此时收到的取消来自关停而不是用户，运行要记成可恢复的中断
+        self._closing = False
+        #: 已经跑完、正在落状态和封存的运行。关停不去打断它们
+        self._finalizing: set[str] = set()
 
     # ---------------- 生命周期 ----------------
 
     async def setup(self) -> None:
+        self._closing = False
         settings.ensure_dirs()
         self._cm = AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path))
         self._checkpointer = await self._cm.__aenter__()
@@ -61,11 +66,14 @@ class RunManager:
             await session.commit()
 
     async def shutdown(self) -> None:
+        self._closing = True
         # 只等还没结束的：结束了的没什么可等，而且它可能属于另一个事件循环，
         # gather 会直接抛 "future belongs to a different loop"
         pending = [t for t in self._tasks.values() if not t.done()]
-        for task in pending:
-            task.cancel()
+        for run_id, task in list(self._tasks.items()):
+            # 正在收尾的不打断：状态和封存写到一半，比哪一步都没写更难收拾
+            if not task.done() and run_id not in self._finalizing:
+                task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         self._tasks.clear()
         if self._cm is not None:
@@ -300,13 +308,23 @@ class RunManager:
             await session.commit()
             await session.refresh(run)
 
-        # 单个 interrupt 用标量（LangGraph 两种都认），多个必须用 {interrupt_id: value} 映射
-        command = (
-            Command(resume=response)
-            if len(waiting) <= 1
-            else Command(resume=answers)
-        )
-        await self._emit(run_id, EventType.RUN_RESUMED, data={"response": _safe(response)})
+        # 单个 interrupt 用标量（LangGraph 两种都认），多个必须用 {interrupt_id: value} 映射。
+        #
+        # 一个都没在等：这是服务重启时停下的运行（启动扫描或关停时标成 interrupted），
+        # 只能从断点接着跑（输入传 None）。以前这里照样发 Command(resume=…)——那个值
+        # 会被后面遇到的第一个 interrupt() 当成答复，一个还没轮到的人工关卡就这么被
+        # 自动作答了；当前版本的 LangGraph 则直接在内部崩掉。两样都不是"接着跑"
+        command: Command | None
+        if not waiting:
+            command = None
+        elif len(waiting) == 1:
+            command = Command(resume=response)
+        else:
+            command = Command(resume=answers)
+        await self._emit(run_id, EventType.RUN_RESUMED, data=(
+            {"message": "服务重启时中断的运行，从断点接着跑"} if command is None
+            else {"response": _safe(response)}
+        ))
         self._tasks[run_id] = asyncio.create_task(
             self._drive(run_id, spec, command, workflow_id=workflow_id)
         )
@@ -476,9 +494,20 @@ class RunManager:
                     status = "interrupted"
 
             except asyncio.CancelledError:
-                status = "cancelled"
-                error = "用户取消"
-                await self._emit(run_id, EventType.RUN_CANCELLED, data={})
+                if self._closing:
+                    # 服务关停（dev.sh 的 --reload 改一个文件就是一次）不是用户取消。
+                    # checkpoint 完好，记成中断、重启后从断点接着跑——和强杀后启动
+                    # 扫描的处理一致。以前一律记"用户取消"，resume 和 continue 都拒绝它
+                    status = "interrupted"
+                    error = "服务重启，运行已挂起，可从断点恢复"
+                    await self._emit(run_id, EventType.LOG, data={
+                        "level": "warn", "code": "server_shutdown",
+                        "message": "服务关停时这次运行还在跑，已挂起；重启后可以从断点接着跑",
+                    })
+                else:
+                    status = "cancelled"
+                    error = "用户取消"
+                    await self._emit(run_id, EventType.RUN_CANCELLED, data={})
                 raise
             except TimeoutError as e:
                 status = "failed"
@@ -500,12 +529,14 @@ class RunManager:
                 await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             finally:
                 elapsed = int((time.perf_counter() - started) * 1000)
+                self._finalizing.add(run_id)
                 try:
                     await self._finalize(run_id, status, error, final_state, elapsed)
                 finally:
                     # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
                     # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
                     # gather 在别的事件循环里炸开
+                    self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），

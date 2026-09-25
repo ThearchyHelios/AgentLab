@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Code2, GitFork, History, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
+import { Code2, GitFork, History, Play, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { Empty, Spinner, StatusDot, useToast } from '../components/ui'
@@ -214,6 +214,26 @@ export function RunsPage() {
                 {pendingHere.map((a) => (
                   <ApprovalCard key={a.id} approval={a} onResolved={refreshDetail} />
                 ))}
+              </div>
+            )}
+
+            {/* 中断了却没有待审批：服务重启时停下的，断点还在。以前这里显示"等待人工
+                介入"，却没有任何东西可以点——看起来就是卡死了 */}
+            {selected.status === 'interrupted' && pendingHere.length === 0 && (
+              <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-[11.5px]"
+                   style={{ borderColor: 'var(--warn)' }}>
+                <span className="flex-1 text-dim">
+                  {selected.error || '这次运行中断了'}。前面跑完的节点不会重跑。
+                </span>
+                <button className="btn btn-sm" onClick={async () => {
+                  try {
+                    await api.runs.resume(selected.id, null)
+                    toast('已从断点接着跑', 'ok')
+                    await refreshDetail(selected.id)
+                  } catch (e: any) { toast(e.message ?? '恢复失败', 'error') }
+                }}>
+                  <Play size={11} /> 接着跑
+                </button>
               </div>
             )}
 
