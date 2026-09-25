@@ -116,7 +116,12 @@ async def run_loop(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     mode = ctx.cfg("mode", "foreach")
     node_id = ctx.node.id
     loops = dict(state.get("loops") or {})
-    cursor = int((loops.get(node_id) or {}).get("index", 0)) if isinstance(loops.get(node_id), dict) else 0
+    prev = loops.get(node_id) if isinstance(loops.get(node_id), dict) else {}
+    # 上次已经走过 done 出口还又进来：是外层循环的下一轮把它重新带进来，从头数。
+    # 以前计数原样留着接着往上加，内层的 max_iterations 于是成了整次运行合计的
+    # 上限——运行 87daca70 的内层每拍该跑两个子拍，第四拍起一进来就撞上限直接
+    # 退出；嵌套的 foreach 更糟，外层第二轮起内层一项都不跑，也不报错
+    cursor = 0 if prev.get("finished") else int(prev.get("index", 0))
     max_iter = int(ctx.cfg("max_iterations", 10) or 10)
 
     tctx = template_context(state)
@@ -177,7 +182,8 @@ async def run_loop(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
     updates: dict[str, Any] = {
         "nodes": {node_id: result},
-        "loops": {node_id: {"index": cursor + 1 if keep_going else cursor}},
+        # 走完了 index 留在最后一轮，读 loops.x.index 的照旧拿到轮数；finished 让下次进来重数
+        "loops": {node_id: {"index": cursor + 1 if keep_going else cursor, "finished": not keep_going}},
     }
     if updates_vars:
         updates["vars"] = updates_vars
