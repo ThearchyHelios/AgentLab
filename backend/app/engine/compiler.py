@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
 from langgraph.errors import GraphBubbleUp
@@ -10,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
 from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, tools
-from app.engine.schema import GraphNode, GraphSpec, NodeType
+from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges
 from app.engine.state import GraphState
 
 NodeRunner = Callable[[GraphState, NodeContext], Awaitable[dict[str, Any]]]
@@ -238,6 +239,35 @@ def _make_router(
     return route, path_map
 
 
+def _join_nodes(spec: GraphSpec, node_map: dict[str, GraphNode]) -> set[str]:
+    """有两个以上上游、要等汇齐了才能跑的节点。
+
+    每条入边各 add_edge 一次时，LangGraph 的语义是"任何一个上游跑完就触发
+    一次"。两条支路一样长，两次触发落在同一步里被合并，看不出问题；一长一短，
+    汇合节点就先拿着短的那边跑一次、长的到了再跑一次——模型调用和工具副作用
+    都翻倍，下游跟着重跑；循环体里的汇合还会让循环节点多推进一格，把 done
+    出口提前放行。
+
+    不用屏障（add_edge([a, b], j)）：分支之后的二选一汇合，没走的那条永远
+    不会到，屏障会一直等，而 LangGraph 没有可执行任务时会安静地结束——汇合
+    节点和它下游的一切就这么被跳过了，连报错都没有。defer 的语义是"等图里
+    其余待执行的任务都跑完，再跑这一次"：该到的都到齐了，没走的也不会被等。
+    代价是它也会等图里与它无关、恰好还在跑的支路。
+
+    循环回边不算：循环节点的入边是"入口 + 回边"，那不是汇合。
+    """
+    entries = [n.id for n in spec.entry_nodes()]
+    back = back_edges(node_map, spec.edges, roots=entries)
+    upstream: dict[str, set[str]] = defaultdict(set)
+    for e in spec.edges:
+        if e.source not in node_map or e.target not in node_map:
+            continue
+        if (e.source, e.target, e.sourceHandle or "") in back:
+            continue
+        upstream[e.target].add(e.source)
+    return {node_id for node_id, sources in upstream.items() if len(sources) >= 2}
+
+
 def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
     """把图定义编译成未 compile 的 StateGraph。
 
@@ -246,9 +276,10 @@ def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
     """
     builder = StateGraph(GraphState)
     node_map = spec.node_map()
+    joins = _join_nodes(spec, node_map)
 
     for node in spec.nodes:
-        builder.add_node(node.id, _wrap(node, run_ctx))
+        builder.add_node(node.id, _wrap(node, run_ctx), defer=node.id in joins)
 
     # 入口
     entries = spec.entry_nodes()

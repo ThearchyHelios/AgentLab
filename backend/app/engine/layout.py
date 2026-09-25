@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from statistics import median
 
-from app.engine.schema import GraphNode, GraphSpec, NodeType
+from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges
 
 #: 画布节点的宽度。前端 NodeCard 的 `width: 238` 是写死的，这里必须跟着它——
 #: 排版算出来的走廊是给连线用的，宽度估错了走廊就白留。
@@ -83,42 +83,6 @@ def _dedupe_edges(spec: GraphSpec, nodes: dict[str, GraphNode]) -> list:
         seen.add(key)
         out.append(e)
     return out
-
-
-def _back_edges(nodes: dict[str, GraphNode], edges: list) -> set[tuple[str, str, str]]:
-    """DFS 森林里的回边。剔掉它们，剩下的必然是无环的。
-
-    迭代式而不是递归：一张几百个节点的图不该因为递归深度挂掉。
-    """
-    adj: dict[str, list] = defaultdict(list)
-    for e in edges:
-        adj[e.source].append(e)
-
-    WHITE, GREY, BLACK = 0, 1, 2
-    state = dict.fromkeys(nodes, WHITE)
-    back: set[tuple[str, str, str]] = set()
-
-    for root in nodes:
-        if state[root] != WHITE:
-            continue
-        stack: list[tuple[str, int]] = [(root, 0)]
-        state[root] = GREY
-        while stack:
-            node_id, i = stack[-1]
-            out = adj[node_id]
-            if i >= len(out):
-                state[node_id] = BLACK
-                stack.pop()
-                continue
-            stack[-1] = (node_id, i + 1)
-            edge = out[i]
-            target = edge.target
-            if state[target] == GREY:
-                back.add((edge.source, edge.target, edge.sourceHandle or ""))
-            elif state[target] == WHITE:
-                state[target] = GREY
-                stack.append((target, 0))
-    return back
 
 
 def _ranks(
@@ -390,7 +354,7 @@ def auto_layout(
     # 自环不参与分层：它不跨层，留着只会让"自己的前驱是自己"这种噪音渗进排序
     edges = [e for e in edges if e.source != e.target]
 
-    back = _back_edges(nodes, edges)
+    back = back_edges(nodes, edges)
     rank = _ranks(nodes, edges, back)
 
     preds: dict[str, list[str]] = defaultdict(list)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -165,6 +166,48 @@ def topology_of(spec: GraphSpec) -> tuple[tuple, tuple]:
         tuple(sorted((n.id, str(n.type)) for n in spec.nodes)),
         tuple(sorted((e.source, e.target, e.sourceHandle or "") for e in spec.edges)),
     )
+
+
+def back_edges(
+    node_ids: Iterable[str], edges: Iterable[GraphEdge], *, roots: Iterable[str] = (),
+) -> set[tuple[str, str, str]]:
+    """DFS 森林里的回边，以 (source, target, sourceHandle) 表示。剔掉它们，剩下的必然无环。
+
+    哪条边算"回边"取决于 DFS 从哪里出发。排版不在乎，按节点顺序起算就行；
+    执行语义在乎——得从入口（roots）起算，否则循环体里的一条普通前向边可能被
+    误判成回边。两端有一端不在 node_ids 里的悬空边直接忽略。
+
+    迭代式而不是递归：一张几百个节点的图不该因为递归深度挂掉。
+    """
+    WHITE, GREY, BLACK = 0, 1, 2
+    state = dict.fromkeys(node_ids, WHITE)
+    adj: dict[str, list[GraphEdge]] = defaultdict(list)
+    for e in edges:
+        if e.source in state and e.target in state:
+            adj[e.source].append(e)
+
+    back: set[tuple[str, str, str]] = set()
+    for root in [*roots, *state]:
+        if state.get(root) != WHITE:
+            continue
+        stack: list[tuple[str, int]] = [(root, 0)]
+        state[root] = GREY
+        while stack:
+            node_id, i = stack[-1]
+            out = adj[node_id]
+            if i >= len(out):
+                state[node_id] = BLACK
+                stack.pop()
+                continue
+            stack[-1] = (node_id, i + 1)
+            edge = out[i]
+            target = edge.target
+            if state[target] == GREY:
+                back.add((edge.source, edge.target, edge.sourceHandle or ""))
+            elif state[target] == WHITE:
+                state[target] = GREY
+                stack.append((target, 0))
+    return back
 
 
 def validate_graph(spec: GraphSpec) -> ValidationResult:
