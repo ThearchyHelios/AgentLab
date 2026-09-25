@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Check, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, Trash2, X } from 'lucide-react'
 import clsx from 'clsx'
+import { isComposing } from '../components/ui'
 import { useChat } from '../store/chat'
 import { useConversations } from '../store/conversations'
 
@@ -142,7 +143,7 @@ function RenameField({ initial, onSubmit, onCancel }: {
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') onSubmit(text)
+          if (e.key === 'Enter' && !isComposing(e)) onSubmit(text)
           if (e.key === 'Escape') onCancel()
         }}
         autoFocus

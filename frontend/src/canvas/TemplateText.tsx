@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import clsx from 'clsx'
+import { isComposing } from '../components/ui'
 import { useStudio } from '../store/studio'
 import type { Variable } from '../types'
 
@@ -74,7 +75,7 @@ export function TemplateText({
     // 弹层开着的时候这几个键有原生行为（换行、移光标、跳焦点），得拦下来
     if (e.key === 'ArrowDown') { e.preventDefault(); setActive((i) => (i + 1) % matches.length) }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((i) => (i - 1 + matches.length) % matches.length) }
-    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); insert(matches[active].path) }
+    else if ((e.key === 'Enter' || e.key === 'Tab') && !isComposing(e)) { e.preventDefault(); insert(matches[active].path) }
     else if (e.key === 'Escape') {
       // 只关弹层，别让它冒泡上去——外面 InspectorSheet 也在听 Escape
       e.preventDefault()

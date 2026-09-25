@@ -541,12 +541,17 @@ def _parse_op_line(line: str) -> dict[str, Any] | None:
     return obj
 
 
+_NODE_TYPES = frozenset(t.value for t in NodeType)
+
+
 def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op: dict[str, Any]) -> bool:
     """把一个操作应用到服务端维护的图状态。返回是否真的改了图。"""
     kind = op.get("op")
     if kind == "add_node":
         node = op.get("node") or {}
-        if not node.get("id") or not node.get("type"):
+        # 类型不认识的节点不进图、也不转给前端：前端按类型查节点定义，查不到
+        # 以前是整站白屏，连带没保存的编辑一起丢
+        if not node.get("id") or node.get("type") not in _NODE_TYPES:
             return False
         nodes[node["id"]] = {
             "id": node["id"],
@@ -725,6 +730,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     async def event_stream():
         explanation = ""
         seen_ops: list[dict[str, Any]] = []
+        skipped_types: list[str] = []
         # 建完要不要跑，由模型在 done.run 里表态
         autorun = True
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
@@ -747,6 +753,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                     autorun = op.get("run") is not False
                 seen_ops.append(op)
                 changed = _apply_op(nodes, edges, op)
+                if kind == "add_node" and not changed:
+                    bad_type = (op.get("node") or {}).get("type")
+                    if bad_type and bad_type not in _NODE_TYPES:
+                        skipped_types.append(str(bad_type))
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
@@ -780,6 +790,12 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
             )
             issues = [i.model_dump() for i in validate_graph(spec).issues]
+            # 跳过的节点要说出来，不能安静地少一步
+            issues += [
+                {"level": "warning", "node_id": None, "edge_id": None,
+                 "message": f"模型写了一个不存在的节点类型「{t}」，这一步已跳过"}
+                for t in dict.fromkeys(skipped_types)
+            ]
             final = {
                 "op": "final",
                 "graph": spec.model_dump(mode="json"),

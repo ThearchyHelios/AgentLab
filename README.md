@@ -433,6 +433,7 @@ node scripts/check-stream.mjs        # 助手流组件渲染是否正确
 node scripts/check-ui.mjs            # 真浏览器端到端：URL 寻址、会话、运行详情
 node scripts/check-canvas-layout.mjs # 排版与连线几何：线有没有叠、有没有穿过卡片
 node scripts/check-canvas-fx.mjs     # 运行态动效：协作矩阵、并行度、命中的出口、关掉动效
+node scripts/check-guards.mjs        # 护栏：输入法回车、未知节点类型、页面级错误边界（不写库）
 node scripts/e2e-check.mjs           # 冒烟：打开画布 → 选模板 → 运行 → 观察高亮
 ```
 

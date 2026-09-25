@@ -30,6 +30,16 @@ export function Inspector() {
   }
 
   const def = NODE_DEFS[node.data.nodeType]
+  if (!def) {
+    // 这个界面版本不认识的类型：给出实情和唯一能做的事，而不是读 def.fields 崩掉整页
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+        <div className="text-xs">不认识的节点类型「{node.data.nodeType}」</div>
+        <div className="text-[11px] text-faint">这个版本的界面编辑不了它，运行时后端也会拒绝这张图。</div>
+        <button className="btn btn-sm" onClick={() => removeNode(node.id)}>删除这个节点</button>
+      </div>
+    )
+  }
   const config = node.data.config ?? {}
   const setConfig = (key: string, value: any) =>
     updateNode(node.id, { config: { ...config, [key]: value } })

@@ -8,9 +8,8 @@ import { decodeCopilot, decodeRun } from '../run/decode'
 import { useCatalog } from '../store/catalog'
 import { useChat, type ChatTurn } from '../store/chat'
 import { lastVisited, useConversations } from '../store/conversations'
-import { useStudio } from '../store/studio'
 import { ConversationList } from './ConversationList'
-import { useToast } from '../components/ui'
+import { isComposing, useToast } from '../components/ui'
 
 /**
  * 对话式入口。
@@ -37,7 +36,7 @@ export function ChatPage() {
   const turns = useChat((s) => (currentId ? s.byConversation[currentId] : undefined))
   const [draft, setDraft] = useState('')
   const sources = useDataSources()
-  const setGraph = useStudio((s) => s.setGraph)
+  const refreshCatalog = useCatalog((s) => s.refresh)
   const toast = useToast()
 
   // URL → store。这是 currentId 唯一的写入口，别处一律靠导航
@@ -124,12 +123,20 @@ export function ChatPage() {
             }
           />
         )}
-        onOpenGraph={(graph) => {
-          // 以前只把图放过去、让用户自己去点导航。有了路由就直接送过去——
-          // "已放到画布，切到「编排」继续改"是在让人替系统完成一次跳转
-          setGraph(graph)
-          navigate('/studio')
-          toast('已放到画布', 'ok')
+        onOpenGraph={async (graph, question) => {
+          // 建成一张新工作流，走它自己的地址。以前是 setGraph(graph)：只换掉了画布
+          // 上的节点，store 里的 workflow 还是上一次打开的那张图——于是 ⌘S 把那张图
+          // 整张覆盖了（旧版本还在版本表里，界面上却没有入口找回）；没打开过图时
+          // ⌘S 则什么都不做，也不说一声
+          try {
+            const name = `问数据：${(question ?? '').trim().slice(0, 24) || '未命名'}`
+            const created = await api.workflows.create({ name, graph })
+            void refreshCatalog()
+            navigate(`/studio/${created.id}`)
+            toast('已放到画布：新建了一个工作流，原来的图不受影响', 'ok')
+          } catch (e: any) {
+            toast(e?.message ?? '放到画布失败', 'error')
+          }
         }}
         footer={
           <div className="shrink-0 border-t p-3">
@@ -146,7 +153,7 @@ export function ChatPage() {
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => {
                   // Enter 发送，Shift+Enter 换行——对话框的通用约定
-                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
+                  if (e.key === 'Enter' && !e.shiftKey && !isComposing(e)) { e.preventDefault(); void send() }
                 }}
               />
               {busy ? (

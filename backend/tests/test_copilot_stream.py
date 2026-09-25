@@ -113,3 +113,17 @@ async def test_heartbeat_phase_follows_progress(monkeypatch):
 
     assert beats, "add_node 之后的停顿也该有心跳"
     assert beats[0]["phase"] == "building", "放过节点了，阶段不该还停在 planning"
+
+
+def test_unknown_node_types_never_reach_the_canvas():
+    """模型编一个不存在的节点类型：不进图、不转给前端。
+
+    前端按类型查节点定义，查不到以前是整站白屏、连带没保存的编辑一起丢。
+    """
+    nodes: dict = {}
+    edges: list = []
+    ghost = {"op": "add_node", "node": {"id": "x", "type": "no_such_type", "config": {}}}
+    real = {"op": "add_node", "node": {"id": "a", "type": "llm", "config": {}}}
+    assert cp._apply_op(nodes, edges, ghost) is False    # 生成流只转发 changed 的操作
+    assert cp._apply_op(nodes, edges, real) is True
+    assert set(nodes) == {"a"}

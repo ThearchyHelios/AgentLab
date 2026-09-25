@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { BookOpen, Brain, Plus, Search, Sparkles, Trash2, Upload } from 'lucide-react'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
-import { Empty, Modal, Spinner, Tabs, useTabRoute, useToast } from '../components/ui'
+import { Empty, isComposing, Modal, Spinner, Tabs, useTabRoute, useToast } from '../components/ui'
 import type { KbDocument, MemoryItem, Skill } from '../types'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
@@ -375,7 +375,7 @@ function KbList() {
         <div className="mb-2 flex items-center gap-2">
           <input className="field" placeholder="测试检索效果…" value={query}
                  onChange={(e) => setQuery(e.target.value)}
-                 onKeyDown={(e) => e.key === 'Enter' && search()} />
+                 onKeyDown={(e) => e.key === 'Enter' && !isComposing(e) && search()} />
           <button className="btn" onClick={search}><Search size={12} /> 检索</button>
         </div>
         <label className="flex items-center gap-2 text-[11px] text-faint">

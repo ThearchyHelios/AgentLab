@@ -4,7 +4,7 @@ import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog, modelOptions } from '../store/catalog'
 import { useStudio } from '../store/studio'
-import { Spinner } from '../components/ui'
+import { isComposing, Spinner } from '../components/ui'
 
 /**
  * Copilot 的输入。
@@ -114,7 +114,7 @@ export function Composer({ hero, onFocusChange }: {
           onKeyDown={(e) => {
             // 输入法组字期间的回车是"选词"，不是"发送"。不判 isComposing 的话
             // 中文用户每打一个词就发出去一次
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (e.key === 'Enter' && !e.shiftKey && !isComposing(e)) {
               e.preventDefault()
               send()
             }

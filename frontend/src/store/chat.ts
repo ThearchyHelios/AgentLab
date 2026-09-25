@@ -272,6 +272,11 @@ export const useChat = create<ChatState>((set, get) => ({
     const last = turns[turns.length - 1]
     last?.cancel?.()
     get().cancel?.()
+    // 上面两句只是把自己这头的事件流关了。运行在后端，断开订阅不会让它停：
+    // 以前点了「停止」，模型和 SQL 其实还在跑、还在计费，界面上却已经显示"已取消"
+    if (last?.run?.id && !['done', 'error', 'waiting'].includes(last.phase)) {
+      void api.runs.cancel(last.run.id).catch(() => undefined)   // 已经跑完会回 409，无妨
+    }
     if (last?.serverId && !['done', 'error', 'waiting'].includes(last.phase)) {
       void api.conversations
         .patchTurn(conversationId, last.serverId, { status: 'error', error: '已取消' })

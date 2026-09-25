@@ -438,6 +438,9 @@ export const NODE_CATEGORIES = ['起止', '模型', '执行', '控制', '上下�
 /** branch / loop / human 的出口由配置决定，这里统一算出来。 */
 export function sourceHandles(type: NodeType, config: Record<string, any>): HandleDef[] {
   const def = NODE_DEFS[type]
+  // 不认识的类型给一个普通出口，连线还能接上。以前这里直接读 def.sources，
+  // 一个未知类型就让画布连带整站白屏
+  if (!def) return [{ id: 'out', label: '' }]
   if (def.sources) return def.sources
   if (type === 'branch') {
     const cases = (config.cases ?? []) as { key?: string; label?: string }[]

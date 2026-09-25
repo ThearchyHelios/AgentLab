@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { BookOpen, FlaskConical, History, MessageSquare, Settings, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from './api/client'
@@ -10,7 +10,7 @@ import { RunsPage } from './pages/RunsPage'
 import { ToolsPage } from './pages/ToolsPage'
 import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage, applyTheme } from './pages/SettingsPage'
-import { Spinner } from './components/ui'
+import { ErrorBoundary, Spinner } from './components/ui'
 
 const NAV = [
   { to: '/chat', label: '问数据', icon: MessageSquare },
@@ -23,6 +23,7 @@ const NAV = [
 
 export default function App() {
   const { loaded, refresh, refreshApprovals, approvals } = useCatalog()
+  const location = useLocation()
 
   useEffect(() => {
     void refresh()
@@ -79,6 +80,7 @@ export default function App() {
             「没带 id」是真要单独处理的一种情况（落到上次那个、或列表第一个），
             藏在一个问号里下次就没人记得它存在了。
             导航高亮不用动——NavLink 默认前缀匹配，/chat/abc 照样点亮「问数据」。*/}
+        <ErrorBoundary resetKey={location.pathname}>
         <Routes>
           {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人 */}
           <Route path="/" element={<Navigate to="/chat" replace />} />
@@ -97,6 +99,7 @@ export default function App() {
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/settings/:tab" element={<SettingsPage />} />
         </Routes>
+        </ErrorBoundary>
       </main>
     </div>
   )

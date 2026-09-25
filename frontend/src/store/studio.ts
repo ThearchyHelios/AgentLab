@@ -562,7 +562,9 @@ export const useStudio = create<StudioState>((set, get) => ({
             break
           case 'add_node': {
             const n = op.node
-            if (!n?.id || !n?.type) break
+            // 类型不认识就不放上画布：节点卡片、属性面板都按类型查定义，查不到
+            // 以前是整站白屏、连带没保存的编辑一起丢。后端也会拦，这里是第二道
+            if (!n?.id || !n?.type || !NODE_DEFS[n.type as NodeType]) break
             const node: FlowNode = {
               id: n.id, type: 'card', position: { x: 0, y: 0 },
               data: { nodeType: n.type, label: n.label ?? '', config: n.config ?? {} },

@@ -1,8 +1,60 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { Component, createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type { ReactNode } from 'react'
+import type { ErrorInfo, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { AlertCircle, CheckCircle2, Info, Loader2, X } from 'lucide-react'
 import clsx from 'clsx'
+
+/**
+ * 输入法正在组字吗。组字期间的回车是"选词"，不是"提交"——不判这一条，中文
+ * 用户每选一个词就把半句话发出去一次（问数据页就这么把半句问题送去建图、跑图）。
+ * Safari 在结束组字的那一下 keydown 上 isComposing 已经是 false，keyCode 还是
+ * 229，两个都得看。所有"回车即提交"的输入框都要过这一关。
+ */
+export function isComposing(e: ReactKeyboardEvent): boolean {
+  return e.nativeEvent.isComposing || e.keyCode === 229
+}
+
+/**
+ * 页面级错误边界。没有它，任何一个组件渲染时抛错，React 会卸掉整棵树——整站
+ * 白屏，导航栏也没了，用户只能刷新，没保存的编辑跟着丢。
+ *
+ * 包在路由外面：导航栏还在，换一页（resetKey 变了）就自动恢复。编辑中的图在
+ * store 里、不在组件树上，点「重试」重新渲染时它还在。
+ */
+export class ErrorBoundary extends Component<
+  { resetKey?: string; children: ReactNode }, { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('页面渲染出错', error, info.componentStack)
+  }
+
+  componentDidUpdate(prev: { resetKey?: string }) {
+    if (prev.resetKey !== this.props.resetKey && this.state.error) this.setState({ error: null })
+  }
+
+  render() {
+    const { error } = this.state
+    if (!error) return this.props.children
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+        <AlertCircle size={22} className="text-[var(--err)]" />
+        <div className="text-sm font-medium">这一页出错了</div>
+        <div className="max-w-md break-all text-[11.5px] text-faint">{error.message}</div>
+        <div className="text-[11px] text-faint">没保存的编辑还在内存里：先点「重试」，恢复了就尽快保存。</div>
+        <div className="flex gap-2">
+          <button className="btn btn-sm" onClick={() => this.setState({ error: null })}>重试</button>
+          <button className="btn btn-sm btn-ghost" onClick={() => location.reload()}>刷新页面</button>
+        </div>
+      </div>
+    )
+  }
+}
 
 // -------------------------------------------------------------------------
 // Toast

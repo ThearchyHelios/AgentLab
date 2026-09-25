@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, Play, RotateCw, ShieldCheck, Square } from 'lucide-react'
 import { useStudio } from '../store/studio'
-import { Spinner, useToast } from '../components/ui'
+import { isComposing, Spinner, useToast } from '../components/ui'
 
 /**
  * 工具栏上的运行控件。
@@ -151,7 +151,7 @@ export function RunControl() {
                 placeholder={field.required ? '必填' : '可留空'}
                 onChange={(e) => setValues({ ...values, [field.name]: e.target.value })}
                 onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void launch(false)
+                  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !isComposing(e)) void launch(false)
                 }}
               />
             </div>

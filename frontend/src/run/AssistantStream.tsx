@@ -66,7 +66,7 @@ export function AssistantStream({
   empty?: ReactNode
   /** 这一轮要不要插审批卡——插槽而不是内建，因为不同页面接流的方式不同 */
   approvalsFor?: (turn: StreamTurn) => ReactNode
-  onOpenGraph?: (graph: any) => void
+  onOpenGraph?: (graph: any, question?: string) => void
   footer?: ReactNode
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -99,7 +99,7 @@ export function AssistantStream({
 
 function TurnCard({ turn, dense, approvals, onOpenGraph }: {
   turn: StreamTurn; dense: boolean; approvals?: ReactNode
-  onOpenGraph?: (graph: any) => void
+  onOpenGraph?: (graph: any, question?: string) => void
 }) {
   const running = turn.phase === 'running'
 
@@ -182,8 +182,8 @@ function TurnCard({ turn, dense, approvals, onOpenGraph }: {
         )}
 
         {turn.graph && (
-          <GraphPeek graph={turn.graph} note={turn.graphNote}
-                     dense={dense} onOpen={onOpenGraph} />
+          <GraphPeek graph={turn.graph} note={turn.graphNote} dense={dense}
+                     onOpen={onOpenGraph && ((g) => onOpenGraph(g, turn.question))} />
         )}
       </div>
     </div>
