@@ -354,10 +354,15 @@ console.log('\n=== URL 指得到 ===')
   }
 
   {
-    // 问数据页的「在画布里打开」：现在会直接把人送去 /studio。
-    // 送过去的是一张还没存、没有 id 的草稿图，所以那边的"不带 id 就落到
-    // 第一张图"必须让开——不让开就会拿第一张图把它盖掉，而且因为 setGraph
-    // 标了脏，还会先弹一句莫名其妙的"有未保存的改动"
+    // 问数据页的「在画布里打开」：建成一张新工作流、送去它自己的地址。
+    // 以前只是把节点塞进画布，store 里的 workflow 还是上一张图，⌘S 就把那张
+    // 整张覆盖了。要守的是：送到的是新图的地址、图没被别的工作流盖掉、
+    // 没弹莫名其妙的"有未保存的改动"。
+    //
+    // 这个按钮会写库。检查不该在库里留东西（以前按旧断言跑一次就多一张
+    // 「问数据：…」），所以拦下建图那次 POST，拿它自己发出去的图回一个
+    // "已建好"，之后对这张图的读取也由这里答；校验、变量分析只算不写，放行
+    const DRAFT = 'c0ffee00c0ffee00c0ffee00c0ffee00'
     const convs = await (await fetch(`${API}/conversations`)).json()
     let seed = null
     for (const c of convs.slice(0, 8)) {
@@ -366,20 +371,50 @@ console.log('\n=== URL 指得到 ===')
       if (t) { seed = { id: c.id, want: t.graph.nodes.length }; break }
     }
     if (seed) {
+      const before = await (await fetch(`${API}/workflows`)).json()
       const page = await ctx.newPage()
       let dialogs = 0
       page.on('dialog', async (d) => { dialogs++; await d.dismiss() })
+      let created = null
+      await page.route('**/api/workflows**', (route) => {
+        const r = route.request()
+        const path = new URL(r.url()).pathname
+        if (r.method() === 'POST' && path.endsWith('/api/workflows')) {
+          const body = r.postDataJSON()
+          const now = new Date().toISOString().replace('Z', '')
+          created = { id: DRAFT, name: body.name, description: '', graph: body.graph, tags: [],
+                      version: 1, is_template: false, status: 'draft', published_version: null,
+                      created_at: now, updated_at: now, run_count: 0 }
+          return route.fulfill({ status: 201, json: created })
+        }
+        if (path.includes(`/workflows/${DRAFT}`)) {
+          if (path.endsWith('/versions')) return route.fulfill({ json: [] })
+          if (r.method() === 'GET' && created) return route.fulfill({ json: created })
+        }
+        if (r.method() === 'GET' || /\/workflows\/(validate|variables)$/.test(path)) {
+          return route.continue()
+        }
+        return route.abort()   // 其余写操作一律不放
+      })
       await page.goto(`${WEB}/chat/${seed.id}`, { waitUntil: 'networkidle' })
       await page.waitForTimeout(900)
       const btn = page.getByRole('button', { name: '在画布里打开' }).first()
       if (await btn.count()) {
         await btn.click()
-        await page.waitForTimeout(1600)
-        check('「在画布里打开」会把人送到画布', page.url().endsWith('/studio'), page.url())
+        await page.waitForURL(`**/studio/${DRAFT}`, { timeout: 5000 }).catch(() => {})
+        await page.waitForTimeout(1200)
+        check('「在画布里打开」建了新图、送到它自己的地址',
+              !!created && page.url().endsWith(`/studio/${DRAFT}`), page.url())
+        check('建的是这一轮的图，名字带着问题',
+              created?.graph?.nodes?.length === seed.want && created.name.startsWith('问数据：'),
+              created?.name)
         check('送过去的草稿图没被第一张工作流盖掉',
               (await page.locator('.react-flow__node').count()) === seed.want,
               `${await page.locator('.react-flow__node').count()} / ${seed.want} 个节点`)
         check('没有弹莫名其妙的"未保存改动"', dialogs === 0, `弹了 ${dialogs} 次`)
+        const after = await (await fetch(`${API}/workflows`)).json()
+        check('检查本身没往库里写图', after.length === before.length,
+              `${before.length} → ${after.length}`)
       } else {
         check('（跳过：这一轮没有「在画布里打开」）', true)
       }
