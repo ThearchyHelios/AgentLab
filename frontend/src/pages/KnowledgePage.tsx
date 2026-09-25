@@ -67,15 +67,20 @@ function EmbedderBar({ collection, onChanged }: {
   // 把倒排一起建了。按钮只认"向量对不上"的话，这些片段永远等不到人来点
   const unindexed = info.unindexed_chunks ?? 0
   const stale = staleChunks + staleMemories + unindexed
+  // 配了语义模型、实际在用本地哈希：保存的配置没生效（多半是启动时本机的模型服务
+  // 还没起），服务后来起了也不会自己连上。以前这里按"配的是不是 local"判断，于是
+  // 既不说没有语义能力，还高亮"重建索引"——那些"对不上"的向量正是那个模型建好的，
+  // 一点就拿哈希覆盖掉，连上之后还得再重建一遍
+  const fallback = !!info.fallback
 
-  const pick = async (kind: string, m = '', url = '') => {
+  const pick = async (kind: string, m = '', url = '', done = '切到') => {
     setBusy(true)
     try {
       const out = await api.kb.setEmbedding({ kind, model: m, base_url: url })
       // 换模型之后维度多半变了，存量向量全部作废——这件事要当场说，
       // 而不是等用户发现"最近搜得不准"
       const stale = (out.stale_chunks ?? 0) + (out.stale_memories ?? 0)
-      toast(`已切到 ${out.embedder}（${out.dim} 维）`
+      toast(`已${done} ${out.embedder}（${out.dim} 维）`
             + (stale ? `，${stale} 条存量向量需要重建` : ''), 'ok')
       setEditing(false)
       await refresh()
@@ -116,7 +121,8 @@ function EmbedderBar({ collection, onChanged }: {
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-faint">向量模型</span>
         <span className="mono text-[11px]">{info.embedder} · {info.dim} 维</span>
-        {info.kind === 'local' && (
+        {/* 看实际在用的那个，不看配的是什么 */}
+        {info.has_semantics === false && (
           <span className="text-[10.5px]" style={{ color: 'var(--warn)' }}>没有语义能力</span>
         )}
         <button className="btn btn-sm btn-ghost" disabled={busy}
@@ -124,12 +130,28 @@ function EmbedderBar({ collection, onChanged }: {
           {editing ? '收起' : '换一个'}
         </button>
         <span className="flex-1" />
-        {stale > 0 && (
+        {stale > 0 && !fallback && (
           <button className="btn btn-sm btn-primary" disabled={busy} onClick={rebuild}>
             重建索引（{stale} 段）
           </button>
         )}
       </div>
+      {fallback && (
+        <div className="mt-2 rounded-md border p-2 text-[11px]" style={{ borderColor: 'var(--warn)' }}>
+          <p style={{ color: 'var(--warn)' }}>
+            配置的是 {info.model}（{info.base_url || 'api.openai.com'}），但没连上，
+            现在实际用的是本地哈希向量：检索只认字面，搜不出同义表达。
+          </p>
+          {info.fallback_reason && <p className="mt-1 text-faint">{info.fallback_reason}</p>}
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <button className="btn btn-sm btn-primary" disabled={busy}
+                    onClick={() => void pick('openai', info.model, info.base_url, '重新连上')}>
+              重新连接
+            </button>
+            <span className="text-faint">服务起来之后点这里，不用重启。</span>
+          </div>
+        </div>
+      )}
       {editing && (
         <div className="mt-3 space-y-2 border-t pt-3">
           <button className="btn btn-sm w-full justify-start" disabled={busy}
@@ -175,7 +197,10 @@ function EmbedderBar({ collection, onChanged }: {
           {staleChunks && staleMemories ? '、' : ''}
           {staleMemories ? ` ${staleMemories} 条记忆` : ''}
           的向量是用别的模型建的，和当前模型对不上——检索/召回这些内容时
-          会退回纯关键词（搜不出同义表达）。重建索引后恢复。
+          会退回纯关键词（搜不出同义表达）。
+          {fallback
+            ? '先别重建：现在重建用的是本地哈希，只会把它们覆盖掉，连上之后还得再重建一遍。'
+            : '重建索引后恢复。'}
         </p>
       )}
       {unindexed > 0 && staleChunks + staleMemories === 0 && (

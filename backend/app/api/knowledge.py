@@ -239,11 +239,16 @@ async def embedding_status(
     """当前用的是哪个 embedder，以及有多少条向量已经对不上了。"""
     from app.memory.embeddings import (
         EMBEDDING_SETTING_KEY, default_alpha, embedder_dim, embedder_id, has_semantics,
+        unavailable_reason,
     )
     from app.db.models import Setting
 
     row = await session.get(Setting, EMBEDDING_SETTING_KEY)
     saved = (row.value if row else {}) or {}
+    # 配的是语义模型，实际在用本地哈希：保存的配置没生效（多半是启动时本机的模型
+    # 服务还没起）。这时"对不上"的存量向量正是那个模型建好的，界面不能再劝人重建——
+    # 那等于拿哈希把它们覆盖掉，连上之后还得再重建一遍
+    fallback = saved.get("kind") == "openai" and not has_semantics()
     return {
         "embedder": embedder_id(),
         "dim": embedder_dim(),
@@ -256,6 +261,8 @@ async def embedding_status(
         # 的话，用户点完重建还是想不起事，而且不知道为什么
         "stale_memories": await store.stale_count(session),
         "has_semantics": has_semantics(),
+        "fallback": fallback,
+        "fallback_reason": (unavailable_reason() or "") if fallback else "",
         "default_alpha": default_alpha(),
         # 没建倒排的片段会走全表扫——结果对，但慢
         "unindexed_chunks": await inverted.missing_count(session, collection),

@@ -581,6 +581,78 @@ async def test_a_dead_endpoint_says_which_address(monkeypatch) -> None:
     assert "127.0.0.1:9999" in r.json()["detail"]
 
 
+async def test_a_saved_model_that_did_not_connect_is_reported(monkeypatch) -> None:
+    """配了本机 LM Studio 上的模型，服务启动时它还没起：进程一直用本地哈希。
+
+    以前状态接口只报 local-hashing，页面按"配的是不是 local"判断，于是既不提示
+    没有语义能力，还高亮"重建索引"——那些"对不上"的向量正是那个模型建好的，
+    一点就拿哈希覆盖掉。退回要报出来、原因要带上，重新连上之后提示要消失；
+    明确选了本地哈希的不算退回。
+    """
+    import langchain_openai
+    from httpx import ASGITransport, AsyncClient
+
+    from app.db.models import Setting
+    from app.main import app
+
+    class _Down:
+        def __init__(self, **kw):
+            raise RuntimeError("connection refused")
+
+    class _Up:
+        def __init__(self, **kw):
+            pass
+
+        def embed_query(self, text):
+            return [0.1] * 8
+
+    # 模块级缓存和库里的配置都是整个测试会话共用的，结束时还原
+    monkeypatch.setattr(emb, "_cached", None)
+    monkeypatch.setattr(emb, "_unavailable", None)
+    saved = {"kind": "openai", "model": "text-embedding-qwen3-embedding-4b",
+             "base_url": "http://127.0.0.1:1234/v1"}
+    async with SessionLocal() as session:
+        row = await session.get(Setting, emb.EMBEDDING_SETTING_KEY)
+        before = dict(row.value) if row else None
+        if row:
+            row.value = saved
+        else:
+            session.add(Setting(key=emb.EMBEDDING_SETTING_KEY, value=saved))
+        await session.commit()
+
+    try:
+        monkeypatch.setattr(langchain_openai, "OpenAIEmbeddings", _Down)
+        async with SessionLocal() as session:
+            with pytest.raises(emb.EmbedderUnavailable):
+                await emb.load_setting(session)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            down = (await c.get("/api/kb/embedding")).json()
+            assert down["embedder"] == "local-hashing" and down["has_semantics"] is False
+            assert down["fallback"] is True, "配了语义模型却在用哈希，状态里得说出来"
+            assert "127.0.0.1:1234" in down["fallback_reason"], down["fallback_reason"]
+
+            # 服务起来之后点「重新连接」：发的就是保存着的那份配置
+            monkeypatch.setattr(langchain_openai, "OpenAIEmbeddings", _Up)
+            assert (await c.put("/api/kb/embedding", json=saved)).status_code == 200
+            up = (await c.get("/api/kb/embedding")).json()
+            assert up["has_semantics"] is True
+            assert up["fallback"] is False and up["fallback_reason"] == ""
+
+            await c.put("/api/kb/embedding", json={"kind": "local"})
+            local = (await c.get("/api/kb/embedding")).json()
+            assert local["has_semantics"] is False and local["fallback"] is False
+    finally:
+        async with SessionLocal() as session:
+            row = await session.get(Setting, emb.EMBEDDING_SETTING_KEY)
+            if before is None:
+                await session.delete(row)
+            else:
+                row.value = before
+            await session.commit()
+
+
 async def test_the_endpoint_is_remembered_across_restarts(client=None) -> None:
     """base_url 不落库的话，重启后会悄悄退回本地哈希——而库里的向量是
     上一个模型建的，检索会整体退回关键词，用户只看到"重启之后搜得不准了"。"""

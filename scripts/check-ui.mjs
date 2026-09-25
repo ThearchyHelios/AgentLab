@@ -229,6 +229,88 @@ console.log('\n=== 向量模型设置 ===')
   await page.close()
 }
 
+console.log('\n=== 向量模型：配了语义模型却退回本地 ===')
+{
+  // 配的是本机 LM Studio 上的模型，服务启动时它没起，进程就一直用本地哈希。
+  // 以前页面按"配的是不是 local"判断：不说没有语义能力，还高亮"重建索引"——
+  // 那些"对不上"的向量正是那个模型建好的，一点就被哈希覆盖。真实环境撞不撞得上
+  // 这个状态看运气，所以这里伪造状态接口，几种情况各看一遍；写请求一律拦下
+  const embeddingPage = async (initial, onPut) => {
+    let status = initial
+    const page = await ctx.newPage()
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    const sent = []
+    await page.route('**/api/**', (route) => {
+      const r = route.request()
+      if (new URL(r.url()).pathname.endsWith('/api/kb/embedding')) {
+        if (r.method() === 'GET') return route.fulfill({ json: status })
+        if (r.method() === 'PUT') {
+          sent.push(r.postDataJSON())
+          status = onPut(status)
+          return route.fulfill({ json: {
+            embedder: status.embedder, dim: status.dim,
+            stale_chunks: status.stale_chunks, stale_memories: status.stale_memories } })
+        }
+      }
+      return r.method() === 'GET' ? route.continue() : route.abort()
+    })
+    await page.goto(`${WEB}/knowledge`, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(500)
+    return { page, errors, sent, body: () => page.locator('body').innerText() }
+  }
+  const down = {
+    embedder: 'local-hashing', dim: 512, configured: true, kind: 'openai',
+    model: 'text-embedding-qwen3-embedding-4b', base_url: 'http://127.0.0.1:1234/v1',
+    stale_chunks: 68, stale_memories: 5, unindexed_chunks: 0,
+    has_semantics: false, default_alpha: 0, fallback: true,
+    fallback_reason: '用不了 http://127.0.0.1:1234/v1 上的 embedding 模型 '
+      + 'text-embedding-qwen3-embedding-4b：APIConnectionError: Connection error.。检查服务在不在',
+  }
+  const up = {
+    ...down, embedder: 'openai:text-embedding-qwen3-embedding-4b', dim: 2560,
+    stale_chunks: 0, stale_memories: 0, has_semantics: true, default_alpha: 0.5,
+    fallback: false, fallback_reason: '',
+  }
+
+  const a = await embeddingPage(down, () => up)
+  let body = await a.body()
+  check('退回本地时标出没有语义能力', body.includes('没有语义能力'))
+  check('说清配的是哪个、为什么没用上',
+        body.includes('text-embedding-qwen3-embedding-4b') && body.includes('没连上'))
+  check('没连上的原因原样给出来', body.includes('APIConnectionError'))
+  check('不再劝人重建（会把建好的向量覆盖掉）',
+        await a.page.getByRole('button', { name: /重建索引/ }).count() === 0)
+  check('存量提示改口成先别重建', body.includes('先别重建'))
+
+  const reconnect = a.page.getByRole('button', { name: '重新连接' })
+  check('给得出「重新连接」', await reconnect.count() === 1)
+  if (await reconnect.count()) {
+    await reconnect.click()
+    await a.page.waitForTimeout(800)
+  }
+  const req = a.sent[0]
+  check('重新连接发的是保存着的那份配置',
+        req?.kind === 'openai' && req.model === down.model && req.base_url === down.base_url,
+        JSON.stringify(req))
+  body = await a.body()
+  check('连上了说一声', body.includes('已重新连上'))
+  check('连上之后提示消失', !body.includes('没有语义能力') && !body.includes('没连上'))
+  check('没有运行时报错', a.errors.length === 0, a.errors.slice(0, 2).join(' | '))
+  await a.page.close()
+
+  // 明确选了本地哈希是正常情况：照旧标没有语义能力，重建按钮也还在
+  const b = await embeddingPage(
+    { ...down, kind: 'local', model: '', base_url: '', fallback: false, fallback_reason: '' },
+    (s) => s)
+  body = await b.body()
+  check('明确选了本地哈希：照旧标没有语义能力', body.includes('没有语义能力'))
+  check('……不冒出"没连上"', !body.includes('没连上'))
+  check('……重建按钮还在，正常情况别一起藏了',
+        await b.page.getByRole('button', { name: /重建索引/ }).count() === 1)
+  await b.page.close()
+}
+
 console.log('\n=== 会话 ===')
 {
   // 对话以前只活在内存里，刷新就没了。这一组守的是它真的落了库：

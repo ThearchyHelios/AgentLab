@@ -101,6 +101,11 @@ EMBEDDING_SETTING_KEY = "embedding"
 #: 进程内缓存。get_embedder 在检索热路径上被反复调用，不该每次都去读库
 _cached: tuple[str, Any] | None = None
 
+#: 保存的配置为什么没生效。启动时本机的模型服务还没起就会这样：整个进程一直用
+#: 本地哈希，服务后来起了也不会自己连上。以前只在服务端日志里留一句，界面上看着
+#: 一切正常，检索却一直是纯关键词
+_unavailable: str | None = None
+
 
 class EmbedderUnavailable(RuntimeError):
     """配了远端 embedder 但建不起来。message 直接给用户看。"""
@@ -128,8 +133,14 @@ def _make(kind: str, model: str, base_url: str = "", *,
 
 def configure(kind: str, model: str = "", base_url: str = "") -> None:
     """切换当前 embedder。设置页保存后调用，也用于测试。建不起来会抛。"""
-    global _cached
+    global _cached, _unavailable
     _cached = (f"{kind}:{model}:{base_url}", _make(kind, model, base_url, strict=True))
+    _unavailable = None
+
+
+def unavailable_reason() -> str | None:
+    """保存的配置没能生效的原因；生效了（或还没试过）是 None。"""
+    return _unavailable
 
 
 def get_embedder() -> "LocalEmbedder | OpenAIEmbedder":
@@ -197,11 +208,16 @@ async def load_setting(session: Any) -> None:
     """从库里读 embedding 配置并生效。应用启动时调一次。"""
     from app.db.models import Setting
 
+    global _unavailable
     row = await session.get(Setting, EMBEDDING_SETTING_KEY)
     saved = (row.value if row else {}) or {}
     kind = saved.get("kind")
     if kind:
-        configure(kind, saved.get("model", ""), saved.get("base_url", ""))
+        try:
+            configure(kind, saved.get("model", ""), saved.get("base_url", ""))
+        except EmbedderUnavailable as e:
+            _unavailable = str(e)
+            raise
 
 
 async def embed_text(text: str) -> np.ndarray:

@@ -222,6 +222,8 @@ export const api = {
       embedder: string; dim: number; configured: boolean
       kind: string; model: string; base_url: string
       stale_chunks: number; stale_memories: number; unindexed_chunks: number
+      // has_semantics 看的是实际在用的那个；fallback = 配了语义模型却退回了本地哈希
+      has_semantics: boolean; fallback: boolean; fallback_reason: string
     }>(`/kb/embedding${collection ? `?collection=${collection}` : ''}`),
     setEmbedding: (body: { kind: string; model?: string; base_url?: string }) =>
       put<{
