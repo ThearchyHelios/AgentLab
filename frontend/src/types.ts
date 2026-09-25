@@ -158,7 +158,52 @@ export interface NodeRuntime {
   error?: string
   tokens?: string
   thinking?: string
-  toolCalls?: { tool: string; args?: any; result?: string; ok?: boolean }[]
+  toolCalls?: { tool: string; args?: any; result?: string; ok?: boolean; agent?: string }[]
+  /** supervisor 的协作矩阵：谁被派了、在第几轮、几个人同时在跑。运行中长出来 */
+  team?: TeamRun
+  /** loop 走到第几轮（从 1 数）。卡片上那个"第 2/5 轮" */
+  iteration?: number
+  /** 分支/循环实际走的出口。命中的那条亮起来、其余压暗——不然一个六出口的
+   *  分支节点跑完，谁也说不清它到底选了哪条 */
+  takenHandle?: string
+  /** 走这条出口的理由：表达式分支命中了哪条条件，或调度者为什么派给这个人 */
+  reason?: string
+}
+
+/**
+ * 协作团队一轮里的一个人。
+ *
+ * ms 是**各自量出来**的耗时，不是拿整轮墙钟摊的——界面要显示"并行省了多少"，
+ * 那个数按 N×墙钟 推算会把快的那个也记成最慢那条，省下的时间就被夸大了。
+ */
+export interface TeamMember {
+  agent: string
+  instruction: string
+  ms: number
+  status: 'running' | 'done' | 'failed' | 'waiting'
+  result?: string
+}
+
+export interface TeamRound {
+  round: number
+  /** 这一轮同时派了几个人。1 就是串行的一步 */
+  parallel: number
+  /** 这一轮实际花的时间：并发时是最慢那个 */
+  wallMs: number
+  /** 各人耗时之和：并发时它大于 wallMs，差值就是省下的 */
+  sumMs: number
+  reason?: string
+  members: TeamMember[]
+}
+
+export interface TeamRun {
+  /** 花名册，按第一次出现的顺序——泳道的行顺序 */
+  members: string[]
+  rounds: TeamRound[]
+  /** 并行一共省下多少毫秒。全程串行则为 0 */
+  savedMs: number
+  /** 协作是不是已经收尾了 */
+  finished: boolean
 }
 
 /** 一处 {{ }} 引用 */

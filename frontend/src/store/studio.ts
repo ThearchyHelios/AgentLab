@@ -6,6 +6,7 @@ import {
 import { api, streamCopilot, streamRun } from '../api/client'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import type { CopilotOp } from '../run/decode'
+import { reduceTeam } from '../run/decode'
 import type {
   GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue,
   VarIssue, Variable, Workflow,
@@ -796,13 +797,19 @@ export const useStudio = create<StudioState>((set, get) => ({
         break
       case 'tool.start':
         patch({
-          toolCalls: [...(runtime[nodeId!]?.toolCalls ?? []), { tool: event.data.tool, args: event.data.args }],
+          toolCalls: [...(runtime[nodeId!]?.toolCalls ?? []),
+                     { tool: event.data.tool, args: event.data.args, agent: event.data.agent }],
         })
         break
       case 'tool.end':
       case 'tool.error': {
         const calls = [...(runtime[nodeId!]?.toolCalls ?? [])]
-        const idx = calls.map((c) => c.tool).lastIndexOf(event.data.tool)
+        // 多 agent 时同一个工具名可能被两个成员同时调，只按名字找会配错人
+        const idx = calls
+          .map((c, i) => (c.tool === event.data.tool
+            && (event.data.agent == null || c.agent === event.data.agent) ? i : -1))
+          .filter((i) => i >= 0)
+          .pop() ?? -1
         if (idx >= 0) {
           calls[idx] = { ...calls[idx], result: event.data.preview, ok: event.type === 'tool.end' }
         }
@@ -820,6 +827,21 @@ export const useStudio = create<StudioState>((set, get) => ({
       case 'run.cancelled':
         set({ streaming: false })
         break
+    }
+
+    // 协作矩阵、循环轮次、命中的出口：都从事件里读，只走 decode.ts 那一份翻译，
+    // 免得画布和右栏对同一次运行给出不同的说法
+    const team = reduceTeam(runtime[nodeId ?? '']?.team, event)
+    if (team && nodeId) patch({ team })
+    if (event.type === 'edge.taken') {
+      const handle = String(event.data.branch ?? '')
+      const iteration = Number(event.data.iteration)
+      patch({
+        takenHandle: handle,
+        reason: event.data.reason ? String(event.data.reason) : undefined,
+        // loop 的 edge.taken 带 iteration，从 0 数；卡片上给人看的是第几轮
+        ...(Number.isFinite(iteration) ? { iteration: iteration + 1 } : {}),
+      })
     }
 
     // 高亮当前正在流动的边：从已完成节点指向正在运行的节点

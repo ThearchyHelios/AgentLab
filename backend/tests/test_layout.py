@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from app.engine.layout import NODE_W, auto_layout
+from app.engine.layout import NODE_H, NODE_W, auto_layout
 from app.engine.schema import GraphSpec
 
 
@@ -178,3 +178,48 @@ def test_self_loop_is_kept() -> None:
     spec = auto_layout(_graph([{"id": "a", "type": "llm"}], [("a", "a")]))
     assert spec.nodes[0].position.x >= 0
     assert len(spec.edges) == 1
+
+
+
+#: 前端 TeamMatrix 展开后的卡片高度：标题 34 + 摘要 28 + 表头 19 + n 行 21
+#: + 页脚 25 + 内外边距 14 + 在跑那人的任务行 26
+def _expanded_height(agents: int) -> float:
+    return 146 + 21 * agents + 26
+
+
+def _two_rows(agents: int) -> tuple[float, float]:
+    """同一列里放一个多 agent 节点和一个普通节点，返回两者的中心 y。"""
+    spec = auto_layout(_graph(
+        [
+            {"id": "team", "type": "supervisor",
+             "config": {"agents": [{"name": f"a{i}"} for i in range(agents)]}},
+            {"id": "peer", "type": "llm"},
+        ],
+        [],
+    ))
+    return tuple(sorted(n.position.y for n in spec.nodes))  # type: ignore[return-value]
+
+
+def test_supervisor_reserves_room_for_its_expanded_matrix() -> None:
+    """多 agent 节点跑起来会在卡片里展开协作矩阵，排版要按展开后的高度留位置。
+
+    不然它一跑起来就盖住下面那张卡；而且运行结束后矩阵不会收起来（那正是要
+    回看的东西），重叠是永久的。
+    """
+    for agents in (2, 4, 6):
+        top, bottom = _two_rows(agents)
+        # 展开后的那张卡占的区间，必须和下面那张卡留出间距
+        gap = (bottom - NODE_H / 2) - (top + _expanded_height(agents) / 2)
+        assert gap >= 50, f"{agents} 人矩阵会压到下面那张卡，只剩 {gap:.0f}px"
+
+    # 名册越大留得越多；没有成员就不该白占地方
+    assert _two_rows(6)[1] - _two_rows(6)[0] > _two_rows(2)[1] - _two_rows(2)[0]
+
+
+def test_plain_nodes_keep_the_compact_row_gap() -> None:
+    """没有展开行为的节点不该跟着变高，否则整张图会白白被撑开。"""
+    ys = sorted(n.position.y for n in auto_layout(_graph(
+        [{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"}, {"id": "c", "type": "llm"}],
+        [],
+    )).nodes)
+    assert ys[1] - ys[0] <= 140, f"普通节点之间隔了 {ys[1] - ys[0]:.0f}px"

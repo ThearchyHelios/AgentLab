@@ -52,6 +52,18 @@ BRANCH_FALLBACK = "default"
 
 
 def _height(node: GraphNode) -> float:
+    """节点高度估算。
+
+    多 agent 节点跑起来会在卡片里展开一块协作矩阵（前端 canvas/TeamMatrix）：
+    名册有几个人就多几行。排版必须按**展开后**的高度留位置——它会盖住下面那张
+    卡，而且运行结束后矩阵不会收起来（那正是要回看的东西），重叠是永久的。
+    """
+    if node.type == NodeType.SUPERVISOR:
+        n = len(node.config.get("agents") or [])
+        if n:
+            # 标题 34 + 摘要 28 + 矩阵（表头 19 + n 行 21 + 页脚 25 + 内外边距 14）
+            # + 正在跑的那个人多半还会带一行当前任务 26
+            return 146 + 21 * n + 26
     return NODE_H
 
 

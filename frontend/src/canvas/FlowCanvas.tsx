@@ -26,21 +26,45 @@ function CanvasInner() {
   const edges = useStudio((s) => s.edges)
   const activeEdges = useStudio((s) => s.activeEdges)
   const fitRequest = useStudio((s) => s.fitRequest)
+  // 只订阅一个字符串。直接订阅 runtime 的话每个 token 事件都会换一个新对象，
+  // 整张画布跟着重渲染一次——跑长文本时这是白烧的
+  const takenKey = useStudio((s) => Object.entries(s.runtime)
+    .filter(([, r]) => r.takenHandle)
+    .map(([id, r]) => `${id}:${r.takenHandle}`)
+    .join('|'))
   const { onNodesChange, onEdgesChange, onConnect, addNode, select } = useStudio()
 
   // 走线方案整张图算一次。节点尺寸要等 React Flow 量完才有，量到之后
   // nodes 会变，这里跟着重算，端口和车道就落到实测尺寸上。
   const routes = useMemo(() => buildRoutes(nodes, edges), [nodes, edges])
 
+  // 实际走过的边：分支节点记下命中的出口，据此把那条边挑出来。跑完之后画布上
+  // 留下的就是**这次的执行路径**，而不是一张"所有可能性"的图
+  const takenEdges = useMemo(() => {
+    const hit = new Set<string>()
+    const takenOf = new Map<string, string>()
+    for (const part of takenKey.split('|')) {
+      const at = part.indexOf(':')
+      if (at > 0) takenOf.set(part.slice(0, at), part.slice(at + 1))
+    }
+    if (!takenOf.size) return hit
+    for (const e of edges) {
+      if (e.sourceHandle && takenOf.get(e.source) === e.sourceHandle) hit.add(e.id)
+    }
+    return hit
+  }, [takenKey, edges])
+
   // 正在流动的边加动画，让"数据走到哪了"看得见
   const decorated = useMemo<Edge[]>(
     () =>
-      edges.map((e) =>
-        activeEdges.includes(e.id)
-          ? { ...e, type: 'flow', className: 'edge-active', animated: true }
-          : { ...e, type: 'flow', className: undefined, animated: false },
-      ),
-    [edges, activeEdges],
+      edges.map((e) => {
+        const active = activeEdges.includes(e.id)
+        const taken = takenEdges.has(e.id)
+        const className = [active && 'edge-active', taken && !active && 'edge-taken']
+          .filter(Boolean).join(' ') || undefined
+        return { ...e, type: 'flow', className, animated: active }
+      }),
+    [edges, activeEdges, takenEdges],
   )
 
   // 自动排版 / Copilot 生成完之后把视角拉回图上。位置全变了却不重新取景，

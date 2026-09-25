@@ -1,4 +1,8 @@
-import type { RunEvent } from '../types'
+import type { RunEvent, TeamMember, TeamRound, TeamRun } from '../types'
+
+// 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
+// types.ts 里；这里再导出一遍，老引用不用改
+export type { TeamMember, TeamRound, TeamRun }
 
 /**
  * 事件 → 人能看懂的步骤。
@@ -55,42 +59,6 @@ export interface Step {
   children?: Step[]
   /** 协作团队的泳道数据。只有 supervisor 节点的顶层 Step 会有 */
   team?: TeamRun
-}
-
-/**
- * 协作团队一轮里的一个人。
- *
- * ms 是**各自量出来**的耗时，不是拿整轮墙钟摊的——界面要显示"并行省了多少"，
- * 那个数按 N×墙钟 推算会把快的那个也记成最慢那条，省下的时间就被夸大了。
- */
-export interface TeamMember {
-  agent: string
-  instruction: string
-  ms: number
-  status: StepStatus
-  result?: string
-}
-
-export interface TeamRound {
-  round: number
-  /** 这一轮同时派了几个人。1 就是串行的一步 */
-  parallel: number
-  /** 这一轮实际花的时间：并发时是最慢那个 */
-  wallMs: number
-  /** 各人耗时之和：并发时它大于 wallMs，差值就是省下的 */
-  sumMs: number
-  reason?: string
-  members: TeamMember[]
-}
-
-export interface TeamRun {
-  /** 花名册，按第一次出现的顺序——泳道的行顺序 */
-  members: string[]
-  rounds: TeamRound[]
-  /** 并行一共省下多少毫秒。全程串行则为 0 */
-  savedMs: number
-  /** 协作是不是已经收尾了 */
-  finished: boolean
 }
 
 // 这两个是流式增量，后端根本不落库（_EPHEMERAL）。单次运行的 delta 量级会
@@ -398,6 +366,91 @@ function groupConcurrent(
 }
 
 /**
+ * 把一个事件并进协作团队的泳道数据，返回**新的** TeamRun。
+ *
+ * 时间线和画布都要这份数据：时间线用它画泳道，画布用它把 supervisor 节点
+ * 展开成协作矩阵。两边各写一遍的话，同一个运行在右栏和画布上会给出不同的
+ * 并行度——而"几个人同时在跑、省了多少"正是这个节点唯一值得看的东西。
+ * 所以只留这一份翻译，两处都调它。
+ *
+ * 不可变：每次返回新对象。画布那份挂在 zustand 的节点状态上，原地改的话
+ * 引用不变，React 收不到更新。
+ *
+ * 返回 null 表示这个事件和协作团队无关（绝大多数事件都是）。
+ */
+export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRun | null {
+  const d = (event.data ?? {}) as Record<string, any>
+  const nodeId = event.node_id
+  if (!nodeId) return null
+
+  const roundOf = (team: TeamRun, round: number): TeamRound =>
+    team.rounds.find((x) => x.round === round) ?? {
+      round, parallel: 1, wallMs: 0, sumMs: 0, members: [],
+    }
+
+  const withRound = (team: TeamRun, round: number, patch: Partial<TeamRound>): TeamRun => {
+    const next = { ...roundOf(team, round), ...patch }
+    const rounds = [...team.rounds.filter((x) => x.round !== round), next]
+      .sort((a, b) => a.round - b.round)
+    const savedMs = rounds.reduce((acc, x) => acc + Math.max(0, x.sumMs - x.wallMs), 0)
+    return { ...team, rounds, savedMs }
+  }
+
+  switch (event.type) {
+    case 'agent.step.start': {
+      const team = prev ?? { members: [], rounds: [], savedMs: 0, finished: false }
+      const name = String(d.agent ?? '')
+      const round = num(d.round) ?? 0
+      const cur = roundOf(team, round)
+      const members = [...cur.members, {
+        agent: name, instruction: String(d.instruction ?? ''), ms: 0,
+        status: 'running' as StepStatus,
+      }]
+      return withRound(
+        { ...team, members: team.members.includes(name) ? team.members : [...team.members, name] },
+        round,
+        { members, parallel: Math.max(cur.parallel, num(d.parallel) ?? 1) },
+      )
+    }
+
+    case 'agent.step.end': {
+      if (!prev) return null
+      const name = String(d.agent ?? '')
+      const round = num(d.round) ?? 0
+      const cur = roundOf(prev, round)
+      const ms = num(d.duration_ms) ?? 0
+      const preview = String(d.preview ?? '').slice(0, 2000)
+      const idx = cur.members.findIndex((x) => x.agent === name && x.status === 'running')
+      const members = idx >= 0
+        ? cur.members.map((x, i) => (i === idx ? { ...x, ms, status: 'done' as StepStatus, result: preview || undefined } : x))
+        : [...cur.members, { agent: name, instruction: '', ms, status: 'done' as StepStatus, result: preview || undefined }]
+      // 这一轮实际花的是最慢那个，各人之和减去它就是省下的
+      return withRound(prev, round, {
+        members,
+        wallMs: Math.max(...members.map((x) => x.ms)),
+        sumMs: members.reduce((acc, x) => acc + x.ms, 0),
+      })
+    }
+
+    case 'log': {
+      // 带 round 的 info 日志是调度决策，不是排查日志
+      if (String(d.level ?? 'info') !== 'info' || d.round == null) return null
+      const team = prev ?? { members: [], rounds: [], savedMs: 0, finished: false }
+      const structured = Array.isArray(d.agents)
+      const text = String(d.message ?? '')
+      const legacy = text.match(/^调度\s*→\s*([^（(]+)[（(](.*)[）)]\s*$/)
+      const done = structured ? !!d.done : legacy?.[1]?.trim() === 'FINISH'
+      const reason = structured ? String(d.reason ?? '') : (legacy?.[2]?.trim() ?? '')
+      if (done) return { ...team, finished: true }
+      return reason ? withRound(team, num(d.round) ?? 0, { reason }) : team
+    }
+
+    default:
+      return null
+  }
+}
+
+/**
  * 把一次运行的事件解码成步骤树。
  *
  * 顶层是节点，节点内部的模型/工具调用是子步骤。没有 node_id 的事件
@@ -418,24 +471,10 @@ export function decodeRun(events: RunEvent[]): Step[] {
   /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
   const spans = new Map<string, { start: number; end: number; ms: number }>()
 
-  const teamOf = (nodeId: string | undefined): TeamRun | null => {
-    if (!nodeId) return null
-    let t = teams.get(nodeId)
-    if (!t) {
-      t = { members: [], rounds: [], savedMs: 0, finished: false }
-      teams.set(nodeId, t)
-    }
-    return t
-  }
-
-  const roundOf = (team: TeamRun, round: number): TeamRound => {
-    let r = team.rounds.find((x) => x.round === round)
-    if (!r) {
-      r = { round, parallel: 1, wallMs: 0, sumMs: 0, members: [] }
-      team.rounds.push(r)
-      team.rounds.sort((a, b) => a.round - b.round)
-    }
-    return r
+  /** 协作团队的状态只有一个来源：reduceTeam。画布那边调的是同一个函数 */
+  const trackTeam = (event: RunEvent): void => {
+    const next = reduceTeam(teams.get(event.node_id ?? ''), event)
+    if (next && event.node_id) teams.set(event.node_id, next)
   }
   /**
    * node_id → 这个节点当前那条尚未闭合的审批步骤。
@@ -774,18 +813,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
         }
         pendingAgents.set(agentKey(nodeId, d), step)
         push(step, nodeId)
-
-        const team = teamOf(nodeId)
-        if (team) {
-          const name = String(d.agent ?? '')
-          if (name && !team.members.includes(name)) team.members.push(name)
-          const r = roundOf(team, num(d.round) ?? 0)
-          r.parallel = Math.max(r.parallel, num(d.parallel) ?? 1)
-          r.members.push({
-            agent: name, instruction: String(d.instruction ?? ''),
-            ms: 0, status: 'running',
-          })
-        }
+        trackTeam(event)
         break
       }
 
@@ -805,23 +833,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
             detail: preview,
           }, nodeId)
         }
-
-        const team = teamOf(nodeId)
-        if (team) {
-          const r = roundOf(team, num(d.round) ?? 0)
-          const name = String(d.agent ?? '')
-          const ms = num(d.duration_ms) ?? 0
-          const m = r.members.find((x) => x.agent === name && x.status === 'running')
-            ?? (r.members.push({ agent: name, instruction: '', ms: 0, status: 'running' }),
-                r.members[r.members.length - 1])
-          m.ms = ms
-          m.status = 'done'
-          m.result = preview || undefined
-          // 这一轮实际花的是最慢那个，各人之和减去它就是省下的
-          r.wallMs = Math.max(...r.members.map((x) => x.ms))
-          r.sumMs = r.members.reduce((acc, x) => acc + x.ms, 0)
-          team.savedMs = team.rounds.reduce((acc, x) => acc + Math.max(0, x.sumMs - x.wallMs), 0)
-        }
+        trackTeam(event)
         break
       }
 
@@ -845,11 +857,7 @@ export function decodeRun(events: RunEvent[]): Step[] {
             : (legacyTarget && legacyTarget !== 'FINISH' ? [legacyTarget] : [])
           const done = structured ? !!d.done : legacyTarget === 'FINISH'
           const reason = structured ? String(d.reason ?? '') : (m?.[2].trim() ?? '')
-          const team = teamOf(nodeId)
-          if (team) {
-            if (done) team.finished = true
-            else if (reason) roundOf(team, num(d.round) ?? 0).reason = reason
-          }
+          trackTeam(event)
 
           // FINISH 是协议里的收尾标记，不是某个 agent。"交给 FINISH"
           // 会让人以为还有个叫 FINISH 的成员

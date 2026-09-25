@@ -4,6 +4,7 @@ import { AlertTriangle, Check, Hand, Loader2, Sparkles, Wrench } from 'lucide-re
 import clsx from 'clsx'
 import { NODE_DEFS, sourceHandles } from './nodeDefs'
 import { NODE_WIDTH } from './routing'
+import { TeamMatrix } from './TeamMatrix'
 import { formatDuration } from '../run/decode'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
@@ -68,6 +69,26 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
   const streamed = runtime?.tokens || runtime?.thinking
   const summary = summarize(data.nodeType, data.config)
 
+  // 协作矩阵只在多 agent 节点上展开，而且只在它真的在协作时展开——
+  // 没跑过的图不该凭空长出一块东西
+  const roster = (data.config.agents ?? []) as { name?: string; description?: string }[]
+  const team = runtime?.team
+  const showTeam = data.nodeType === 'supervisor' && !!team
+    && (team.rounds.length > 0 || status === 'running')
+
+  // 头部那枚轮次徽标：循环看第几/共几轮，多 agent 看第几轮
+  const iteration = runtime?.iteration
+  const maxIterations = Number(data.config.max_iterations) || 0
+  const maxRounds = Number(data.config.max_rounds) || 0
+  const roundChip = data.nodeType === 'loop' && iteration
+    ? { text: maxIterations ? `第 ${iteration}/${maxIterations} 轮` : `第 ${iteration} 轮`, muted: false }
+    : showTeam && team
+      ? { text: `第 ${(team.rounds[team.rounds.length - 1]?.round ?? 0) + 1} 轮`, muted: false }
+      : null
+
+  // 分支实际走了哪条出口。跑完之后一眼能看出选的是哪条
+  const taken = runtime?.takenHandle
+
   return (
     <div
       className={clsx(
@@ -81,6 +102,17 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
       )}
       style={{ width: NODE_WIDTH, borderColor: selected ? 'var(--accent)' : undefined }}
     >
+      {/* 光效层。独立一层，见 index.css 里 .node-fx 的说明 */}
+      <div className="node-fx" aria-hidden="true">
+        {status === 'running' && (
+          <>
+            <div className="fx-halo" />
+            <div className="fx-clip"><div className="fx-scan" /></div>
+          </>
+        )}
+        {status === 'done' && <div className="fx-clip"><div className="fx-done" /></div>}
+      </div>
+
       {def?.hasTarget && (
         <Handle type="target" position={Position.Left} style={{ left: -5 }} />
       )}
@@ -99,6 +131,11 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
             {data.label || def?.label}
           </div>
         </div>
+        {roundChip && (
+          <span className={clsx('round-chip', roundChip.muted && 'round-chip-muted')}>
+            {roundChip.text}
+          </span>
+        )}
         {status === 'running' && <Loader2 size={12} className="animate-spin" style={{ color: 'var(--nt)' }} />}
         {status === 'done' && <Check size={12} className="text-[var(--ok)]" />}
         {status === 'waiting' && <Hand size={12} className="text-[var(--warn)]" />}
@@ -108,8 +145,9 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
         )}
       </div>
 
-      {/* 摘要 */}
-      {summary && (
+      {/* 摘要。多 agent 节点展开协作矩阵之后就不再显示——那一行就是成员名单，
+          矩阵里已经逐个列出来了，同一份东西说两遍只是让卡片更高 */}
+      {summary && !showTeam && (
         <div className="px-2.5 pb-2 pt-1.5 text-[11px] leading-snug text-dim">
           <div className="line-clamp-2 break-words">{summary}</div>
         </div>
@@ -147,6 +185,16 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
         </div>
       )}
 
+      {/* 协作矩阵：多 agent 节点的内部编排摊开在卡片里 */}
+      {showTeam && team && (
+        <TeamMatrix
+          roster={roster.filter((a) => a.name).map((a) => ({ name: a.name!, description: a.description }))}
+          team={team}
+          live={status === 'running'}
+          maxRounds={maxRounds}
+        />
+      )}
+
       {/* 底部状态条 */}
       {(runtime?.durationMs != null || runtime?.error) && (
         <div className="flex items-center gap-2 border-t px-2.5 py-1">
@@ -161,20 +209,27 @@ function NodeCardImpl({ id, data, selected }: NodeProps<FlowNode>) {
         </div>
       )}
 
-      {/* 出口：有名字的分支把标签显示出来，不用点开就知道哪条是哪条 */}
+      {/* 出口：有名字的分支把标签显示出来，不用点开就知道哪条是哪条。
+          跑过之后，命中的那条亮起来、落空的压暗——六出口的分支节点跑完，
+          不这样的话谁也说不清它到底选了哪条 */}
       {handles.map((handle, i) => {
         const top = handles.length === 1 ? '50%' : `${((i + 1) / (handles.length + 1)) * 100}%`
+        const hit = taken ? taken === handle.id : null
         return (
           <div key={handle.id}>
             <Handle
               id={handle.id}
               type="source"
               position={Position.Right}
+              className={clsx(hit === true && 'handle-taken', hit === false && 'handle-idle')}
               style={{ top, right: -5, borderColor: handle.color }}
             />
             {handle.label && (
               <span
-                className="pointer-events-none absolute left-full ml-2 -translate-y-1/2 whitespace-nowrap text-[9.5px]"
+                className={clsx(
+                  'pointer-events-none absolute left-full ml-2 -translate-y-1/2 whitespace-nowrap text-[9.5px]',
+                  hit === false && 'opacity-40',
+                )}
                 style={{ top, color: handle.color ?? 'var(--text-faint)' }}
               >
                 {handle.label}

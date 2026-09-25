@@ -51,6 +51,9 @@ export interface Route {
   path: string
   labelX: number
   labelY: number
+  /** 路径长度。边上的流光按它定速度——短线走得快、长线走得慢，
+   *  视觉速度才是一致的；否则长边上的光点会慢得像卡住了 */
+  length: number
 }
 
 /** buildRoutes 需要的节点信息，结构上就是 store 里的 FlowNode。 */
@@ -295,8 +298,8 @@ function roundedPath(points: Point[]): string {
   return d
 }
 
-/** 折线中点，标签摆这儿。 */
-function polylineMidpoint(points: Point[]): Point {
+/** 折线中点，标签摆这儿。顺带把总长算出来（流光的速度要用）。 */
+function polylineMidpoint(points: Point[]): { mid: Point; length: number } {
   const lengths: number[] = []
   let total = 0
   for (let i = 1; i < points.length; i++) {
@@ -304,19 +307,22 @@ function polylineMidpoint(points: Point[]): Point {
     lengths.push(len)
     total += len
   }
-  if (total === 0) return points[0]
+  if (total === 0) return { mid: points[0], length: 0 }
   let target = total / 2
   for (let i = 0; i < lengths.length; i++) {
     if (target <= lengths[i]) {
       const t = lengths[i] === 0 ? 0 : target / lengths[i]
       return {
-        x: points[i].x + (points[i + 1].x - points[i].x) * t,
-        y: points[i].y + (points[i + 1].y - points[i].y) * t,
+        length: total,
+        mid: {
+          x: points[i].x + (points[i + 1].x - points[i].x) * t,
+          y: points[i].y + (points[i + 1].y - points[i].y) * t,
+        },
       }
     }
     target -= lengths[i]
   }
-  return points[points.length - 1]
+  return { mid: points[points.length - 1], length: total }
 }
 
 export function buildRoutes(
@@ -490,11 +496,12 @@ export function buildRoutes(
         { x: plan.tx, y: plan.ty },
       ]
     }
-    const mid = polylineMidpoint(points)
+    const { mid, length } = polylineMidpoint(points)
     routes.set(plan.edge.id, {
       path: roundedPath(points),
       labelX: mid.x,
       labelY: mid.y,
+      length,
     })
   }
 

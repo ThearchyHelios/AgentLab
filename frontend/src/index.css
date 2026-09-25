@@ -181,14 +181,11 @@ pre,
   }
 }
 
-/* 节点运行状态 */
-@keyframes pulse-ring {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--nt, #4f8cff) 55%, transparent); }
-  70% { box-shadow: 0 0 0 9px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
-}
+/* 节点运行状态。
+   以前这里是往外扩的声纳圈（pulse-ring）。换成"边框上转一圈光弧 + 一道扫描
+   线"之后声纳就多余了——同一个意思说两遍只会更吵，而且声纳往外扩会和邻居
+   卡片的边框糊在一起。 */
 .node-running {
-  animation: pulse-ring 1.4s ease-out infinite;
   border-color: var(--nt, #4f8cff) !important;
 }
 .node-done {
@@ -199,6 +196,340 @@ pre,
 }
 .node-waiting {
   border-color: var(--warn) !important;
+}
+
+/* --------------------------------------------------------------------------
+   运行时的光效语汇。
+
+   一条原则：**每个动效都要对应一件真实发生的事**。光环转 = 这个节点正在跑，
+   扫描线过 = 正在产出，绿色扫过 = 刚跑完，抖动 = 刚失败，琥珀呼吸 = 在等人。
+   纯装饰的动效只会让画布变吵——跑一张十几个节点的图，一眼能看出"谁在动"
+   才是这套东西的用处。
+
+   颜色一律走 --nt / --accent / --ok 这些 token，浅色深色都能看。
+   前庭敏感的人由文件末尾那段 prefers-reduced-motion 统一停掉（这些全是 CSS
+   动画，所以那段规则天然覆盖得到；不覆盖的 SMIL 一个都没用）。
+   -------------------------------------------------------------------------- */
+
+/* 光环的角度要能插值，得先声明成一个 <angle> 属性 */
+@property --fx-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* 光效层。做成独立一层而不是伪元素：卡片自己的背景会盖住伪元素，
+   而 overflow:hidden 又不能加在卡片上——分支节点的"yes/no"标签是挂在
+   卡片外面的，一裁就没了 */
+.node-fx {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  pointer-events: none;
+}
+/* 只负责裁剪的那一层：正好是卡片框，扫描线不会漏到邻居卡片上 */
+.fx-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+/* 正在跑：一圈绕着卡片转的光弧 */
+@keyframes fx-halo {
+  to { --fx-angle: 360deg; }
+}
+.fx-halo {
+  position: absolute;
+  inset: -1.5px;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--fx-angle),
+    transparent 0deg,
+    transparent 300deg,
+    color-mix(in srgb, var(--nt) 70%, transparent) 340deg,
+    var(--nt) 358deg,
+    transparent 360deg
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: fx-halo 2.2s linear infinite;
+}
+
+/* 正在跑：一条光带从上往下扫过卡片，像在读取/产出 */
+@keyframes fx-scan {
+  0% { top: -70px; opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+.fx-scan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 48px;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--nt) 8%, transparent),
+    transparent
+  );
+  animation: fx-scan 2.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* 刚跑完：绿色扫过一遍。只跑一次，跑完停在画面外——
+   常驻的完成动画会让整张画布一直在动，而"完成了"这件事只需要说一次 */
+@keyframes fx-done {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(110%); }
+}
+.fx-done {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--ok) 30%, transparent),
+    transparent
+  );
+  animation: fx-done 0.85s cubic-bezier(0.32, 0.72, 0, 1) 1 forwards;
+}
+
+/* 刚失败：短促地抖一下。幅度压在 3px 以内——再大就不像"出错"像"地震" */
+@keyframes fx-shake {
+  0%, 100% { transform: translateX(0); }
+  15% { transform: translateX(-3px); }
+  30% { transform: translateX(3px); }
+  45% { transform: translateX(-2px); }
+  60% { transform: translateX(2px); }
+  80% { transform: translateX(-1px); }
+}
+.node-failed {
+  animation: fx-shake 0.4s cubic-bezier(0.36, 0.07, 0.19, 0.97) 1;
+}
+
+/* 在等人：琥珀色的呼吸。用 box-shadow 而不是边框颜色——边框那圈已经
+   被状态色占着了，两个都改会互相盖 */
+@keyframes fx-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 40%, transparent); }
+  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--warn) 0%, transparent); }
+}
+.node-waiting {
+  animation: fx-breathe 2.2s ease-in-out infinite;
+}
+
+/* 头部那枚"第 N 轮"徽标 */
+.round-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--nt) 45%, transparent);
+  background: color-mix(in srgb, var(--nt) 12%, transparent);
+  color: var(--nt);
+  padding: 0 5px;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+  white-space: nowrap;
+}
+.round-chip-muted {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--text-faint);
+}
+
+/* --------------------------------------------------------------------------
+   协作矩阵：supervisor 节点展开出来的内部编排。
+
+   它要回答三个问题：这一轮派了几个人、谁还在跑、并行到底省了多少。
+   条形长度按"这一轮里最长的那个人"归一化——三个人并排三条长短不一的条，
+   一眼就能看出墙钟为什么等于最长那条而不是三条之和。
+   -------------------------------------------------------------------------- */
+.team-matrix {
+  margin: 0 8px 8px;
+  border-top: 1px dashed color-mix(in srgb, var(--nt) 35%, transparent);
+  padding-top: 6px;
+}
+.team-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 9.5px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+.team-head-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--nt) 40%, transparent),
+    transparent
+  );
+}
+
+.team-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 21px;
+  padding-left: 6px;
+  border-left: 2px solid transparent;
+  font-size: 10.5px;
+}
+/* 被派出去的成员：左边一条竖线把它们串成一组 */
+.team-row-active {
+  border-left-color: color-mix(in srgb, var(--nt) 70%, transparent);
+}
+.team-row-running .team-name {
+  color: var(--text);
+}
+.team-row-idle {
+  opacity: 0.42;
+}
+/* 前几轮干过、这一轮没它：压暗但留着成绩，不是"待命" */
+.team-row-past {
+  opacity: 0.6;
+}
+
+.team-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 999px;
+  border: 1.5px solid var(--border-strong);
+}
+.team-row-running .team-dot {
+  border-color: var(--nt);
+  background: var(--nt);
+  animation: team-dot 1.1s ease-in-out infinite;
+}
+@keyframes team-dot {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--nt) 55%, transparent); }
+  70% { box-shadow: 0 0 0 5px transparent; }
+}
+.team-row-done .team-dot {
+  border-color: var(--ok);
+  background: var(--ok);
+}
+
+.team-name {
+  flex: none;
+  max-width: 84px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.team-bar {
+  position: relative;
+  flex: 1;
+  height: 3px;
+  min-width: 18px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.team-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 999px;
+  background: var(--ok);
+  transition: width 0.4s cubic-bezier(0.32, 0.72, 0, 1);
+}
+/* 还在跑：不知道要多久，所以是不定长的流光，不是百分比 */
+.team-bar-running {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 40%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--nt),
+    transparent
+  );
+  animation: team-shimmer 1.15s ease-in-out infinite;
+}
+@keyframes team-shimmer {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(260%); }
+}
+.team-ms {
+  flex: none;
+  min-width: 34px;
+  text-align: right;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-size: 9.5px;
+}
+
+/* 正在跑的那个人在干什么。只给在跑的看，跑完的留在右栏里慢慢读 */
+.team-note {
+  margin: -1px 0 3px 14px;
+  padding-left: 6px;
+  border-left: 1px solid color-mix(in srgb, var(--nt) 30%, transparent);
+  font-size: 9.5px;
+  line-height: 1.35;
+  color: var(--text-faint);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.team-foot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px dashed color-mix(in srgb, var(--nt) 25%, transparent);
+  font-size: 9.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.team-saved {
+  color: var(--ok);
+  font-weight: 500;
+}
+
+/* 出口被选中/落空：分支节点跑完要能一眼看出走了哪条 */
+.react-flow__handle.handle-taken {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.react-flow__handle.handle-idle {
+  opacity: 0.35;
+}
+
+/* 实际走过的边：运行结束后留在画布上，就是这次的执行路径 */
+.react-flow__edge.edge-taken .react-flow__edge-path {
+  stroke: color-mix(in srgb, var(--accent) 75%, transparent);
+  stroke-width: 2;
+}
+
+/* 活跃边上跑的光点：方向感靠它，虚线只会让人觉得"在动"，看不出往哪走 */
+.edge-packet {
+  fill: var(--accent);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 80%, transparent));
+  offset-rotate: 0deg;
+  animation-name: packet-run;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+@keyframes packet-run {
+  from { offset-distance: 0%; }
+  to { offset-distance: 100%; }
 }
 
 /* Copilot 刚放上来的节点：紫色描边 + 出现动画，final 后几秒淡出 */
@@ -304,6 +635,17 @@ pre,
     -webkit-background-clip: border-box;
     background-clip: border-box;
     color: var(--text-dim);
+  }
+  /* 边框上的光弧、扫描线、流光条、边上的光点——这些"停了就等于没有"的
+     直接不画。只把时长压到 0.01ms 的话它们会停在动画的最后一帧：光弧卡在
+     角落、光点全堆在起点，看着像渲染坏了。
+     正在跑的成员不会因此看不出状态：圆点是实心的，右边写着"进行中" */
+  .fx-halo,
+  .fx-scan,
+  .fx-done,
+  .edge-packet,
+  .team-bar-running {
+    display: none;
   }
 }
 
