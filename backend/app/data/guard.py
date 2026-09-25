@@ -38,6 +38,42 @@ _ALWAYS_DENIED = frozenset({
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 
+# 首关键字是查询、正文却能写的语句。只看首关键字的话它们全都能混过去：
+#   WITH k AS (SELECT 1) DELETE FROM t        SQLite / MySQL / PG 都认
+#   WITH x AS (DELETE … RETURNING *) SELECT … PG 的数据修改 CTE
+#   SELECT … INTO backup / INTO OUTFILE '…'   PG 建表 / MySQL 写服务器文件
+#   EXPLAIN ANALYZE DELETE …                  PG 的 ANALYZE 会真的执行
+# 关键字后面紧跟 ( 的不算：那是同名函数（MySQL 的 INSERT()、TRUNCATE()）。
+_HIDDEN_WRITE = re.compile(
+    r"\b(insert|update|delete|merge|upsert|truncate|drop|alter|create|grant|revoke|"
+    r"call|copy|into|attach|detach|vacuum|reindex|lock\s+tables?|replace\s+into)\b(?!\s*\()",
+    re.I,
+)
+
+# 查询里一调用就有副作用的函数。函数没法白名单，这里只收一小撮要命的：
+# set_config 能把 PG 连接层的只读关掉（真库实测：关掉后同一连接的下一个事务
+# 就能写），dblink 另开一条不受只读约束的连接，nextval/setval 推进序列，其余是
+# 杀连接、读写服务器文件、加载本地扩展。函数名可以加引号写（"set_config"(…)），
+# 所以名字两边允许引号，扫描时也只抹字符串、不抹标识符。
+_SIDE_EFFECT_CALL = re.compile(
+    r"[\"`]?\b(set_config|nextval|setval|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
+    r"lo_import|lo_export|lo_unlink|dblink\w*|load_extension)\b[\"`]?\s*\(",
+    re.I,
+)
+
+# SQLite 的 PRAGMA 有读有写，而且写有两种写法：`= 值` 和 `(值)`。
+# 只放行确定只读的：前一组的参数是表名/索引名，后一组不带参数。
+_PRAGMA_READ_WITH_ARG = frozenset({
+    "table_info", "table_xinfo", "table_list", "index_list", "index_info",
+    "index_xinfo", "foreign_key_list",
+})
+_PRAGMA_READ_NO_ARG = frozenset({
+    "table_list", "database_list", "collation_list", "function_list", "module_list",
+    "pragma_list", "compile_options", "encoding", "page_count", "page_size",
+    "freelist_count", "schema_version", "user_version", "application_id", "data_version",
+})
+_PRAGMA = re.compile(r"pragma\s+(?:\w+\s*\.\s*)?(\w+)\s*(.*)$", re.I | re.S)
+
 
 class SqlRejected(ValueError):
     """SQL 没通过守卫。消息直接给模型看，所以要说清楚为什么被拒、该怎么改。"""
@@ -101,6 +137,75 @@ def first_verb(sql: str) -> str:
     return match.group(0).lower() if match else ""
 
 
+def _blank_quoted(sql: str, *, identifiers: bool = True) -> str:
+    """把引号里的内容换成空格：字符串 'please delete' 和标识符 "update" 都不是关键字。
+
+    identifiers=False 时只抹字符串、保留 "…" 和 `…`——找函数调用时要看得见
+    被引号括起来的函数名。
+    """
+    quotes = ("'", '"', "`") if identifiers else ("'",)
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:   # '' 是转义，不是结束
+                    out.append("  ")
+                    i += 2
+                    continue
+                quote = None
+                out.append(ch)
+            else:
+                out.append(" ")
+        else:
+            if ch in quotes:
+                quote = ch
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _pragma_write_reason(stmt: str) -> str | None:
+    match = _PRAGMA.match(strip_comments(stmt).strip())
+    if not match:
+        return "看不出这条 PRAGMA 读的是什么"
+    name, rest = match.group(1).lower(), match.group(2).strip()
+    if rest.startswith("="):
+        return f"PRAGMA {name} = … 会改数据库设置"
+    if name in _PRAGMA_READ_WITH_ARG or (name in _PRAGMA_READ_NO_ARG and not rest):
+        return None
+    return (
+        f"PRAGMA {name}{' ' + rest if rest else ''} 不在只读白名单里"
+        "（看表结构用 table_info / index_list / foreign_key_list）"
+    )
+
+
+def _write_reason(stmt: str) -> str | None:
+    """这条语句会不会写。会写就返回一句说给模型听的原因，不会写返回 None。
+
+    首关键字只是第一道：以查询开头的语句正文照样能写（见 _HIDDEN_WRITE），
+    所以 SELECT / WITH / EXPLAIN 还要把正文扫一遍。SHOW / DESCRIBE / VALUES
+    结构上写不了，不扫——`SHOW CREATE TABLE` 里的 CREATE 不是在建表。
+    """
+    verb = first_verb(stmt)
+    if verb not in _READONLY_VERBS:
+        return f"{verb.upper()} 会修改数据"
+    if verb == "pragma":
+        return _pragma_write_reason(stmt)
+    if verb in ("select", "with", "explain"):
+        text = strip_comments(stmt)
+        hidden = _HIDDEN_WRITE.search(_blank_quoted(text))
+        if hidden:
+            word = " ".join(hidden.group(1).split()).upper()
+            return f"语句里有 {word}——以查询开头的语句也能写数据"
+        call = _SIDE_EFFECT_CALL.search(_blank_quoted(text, identifiers=False))
+        if call:
+            return f"{call.group(1)}() 有副作用"
+    return None
+
+
 def check(sql: str, *, readonly: bool, source_name: str = "") -> str:
     """校验并返回规范化后的单条 SQL。不通过就抛 SqlRejected。
 
@@ -130,17 +235,24 @@ def check(sql: str, *, readonly: bool, source_name: str = "") -> str:
             "这类操作请在数据库客户端里人工执行。"
         )
 
-    if readonly and verb not in _READONLY_VERBS:
-        where = f"「{source_name}」" if source_name else "这个数据源"
-        raise SqlRejected(
-            f"{where}是只读的，{verb.upper()} 不被允许。"
-            "只能执行 SELECT / WITH / SHOW / DESCRIBE / EXPLAIN。"
-            "确实需要写入的话，请在设置里另建一个关闭了只读的数据源。"
-        )
+    if readonly:
+        reason = _write_reason(stmt)
+        if reason:
+            where = f"「{source_name}」" if source_name else "这个数据源"
+            raise SqlRejected(
+                f"{where}是只读的：{reason}，不被允许。"
+                "只能执行不改数据的 SELECT / WITH / SHOW / DESCRIBE / EXPLAIN。"
+                "确实需要写入的话，请在设置里另建一个关闭了只读的数据源。"
+            )
 
     return stmt
 
 
 def is_write(sql: str) -> bool:
-    """是不是写操作。用来决定要不要走人工审批。"""
-    return first_verb(sql) not in _READONLY_VERBS
+    """是不是写操作。用来决定要不要走人工审批。
+
+    和只读判定用同一份 _write_reason：审批这道门要是只看首关键字，
+    `WITH … DELETE` 在可写源上就能不经审批直接写。
+    """
+    statements = split_statements(sql)
+    return not statements or any(_write_reason(s) is not None for s in statements)

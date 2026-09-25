@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.data.guard import SqlRejected, check, first_verb, split_statements
+from app.data.guard import SqlRejected, check, first_verb, is_write, split_statements
 
 
 def rejected(sql: str, *, readonly: bool = True) -> str | None:
@@ -45,6 +45,68 @@ def test_readonly_allows_queries(sql):
 def test_readonly_blocks_writes(sql):
     reason = rejected(sql)
     assert reason and "只读" in reason
+
+
+@pytest.mark.parametrize("sql", [
+    # 首关键字是查询，正文在写。只看首关键字的话全都能混过去——
+    # 第一条在 SQLite 上实测过：守卫放行，数据真的删了
+    "WITH k AS (SELECT 1) DELETE FROM t WHERE x < 3",
+    "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",      # PG 的数据修改 CTE
+    "WITH k AS (SELECT 1) UPDATE t SET x = 1",
+    "WITH k AS (SELECT 1) INSERT INTO t SELECT * FROM k",
+    "SELECT * INTO backup FROM orders",                           # PG：建一张新表
+    "SELECT * FROM orders INTO OUTFILE '/tmp/o.csv'",             # MySQL：写服务器上的文件
+    "EXPLAIN ANALYZE DELETE FROM orders",                         # PG：ANALYZE 会真的执行
+    "SELECT * FROM orders FOR UPDATE",                            # 行锁
+    "SELECT set_config('default_transaction_read_only', 'off', false)",  # 关掉连接层只读
+    "SELECT \"set_config\"('default_transaction_read_only', 'off', false)",  # 函数名加引号
+    "SELECT pg_catalog.set_config('default_transaction_read_only', 'off', false)",
+    "SELECT * FROM dblink('dbname=x', 'DELETE FROM t RETURNING *') AS r(x int)",  # 另开连接
+    "SELECT nextval('order_seq')",
+])
+def test_readonly_blocks_writes_hidden_behind_a_query_verb(sql):
+    reason = rejected(sql)
+    assert reason and "只读" in reason, f"漏了：{sql!r}"
+
+
+@pytest.mark.parametrize("sql", [
+    "PRAGMA user_version = 7",
+    "PRAGMA user_version(7)",            # 函数写法同样是赋值
+    "PRAGMA query_only = 0",             # 想先把只读关掉
+    "PRAGMA main.writable_schema = 1",
+    "PRAGMA optimize",                   # 会跑 ANALYZE，写统计表
+    "PRAGMA wal_checkpoint(TRUNCATE)",
+])
+def test_readonly_blocks_pragmas_that_write(sql):
+    reason = rejected(sql)
+    assert reason and "只读" in reason, f"漏了：{sql!r}"
+
+
+@pytest.mark.parametrize("sql", [
+    "PRAGMA table_info(orders)",
+    "PRAGMA main.table_info('orders')",
+    "PRAGMA index_list(orders)",
+    "PRAGMA foreign_key_list(orders)",
+    "PRAGMA user_version",
+    "SELECT updated_at, deleted_flag, created_by FROM orders",   # 标识符里带关键字不算
+    "SELECT 'please delete me' AS note",                         # 字符串里的不算
+    'SELECT "update" FROM t',                                    # 引号里的标识符不算
+    "SELECT REPLACE(name, 'a', 'b'), INSERT('abc', 1, 1, 'x'), TRUNCATE(price, 2) FROM t",
+    "SHOW CREATE TABLE orders",                                  # MySQL 看建表语句
+    "WITH t AS (SELECT 1 AS into_count) SELECT * FROM t",
+])
+def test_readonly_does_not_misfire_on_harmless_queries(sql):
+    """正文扫描收紧了，误杀也得守住：同名函数、标识符、字符串都不是在写。"""
+    assert rejected(sql) is None, f"误杀了：{sql!r}"
+
+
+def test_is_write_sees_writes_hidden_behind_a_query_verb():
+    """可写源靠 is_write 决定要不要人工审批——WITH 开头的写不能被当成查询放过去。"""
+    assert is_write("WITH k AS (SELECT 1) DELETE FROM t")
+    assert is_write("SELECT * INTO backup FROM t")
+    assert is_write("UPDATE t SET x = 1")
+    assert not is_write("SELECT * FROM t")
+    assert not is_write("WITH k AS (SELECT 1) SELECT * FROM k")
 
 
 @pytest.mark.parametrize("sql", [

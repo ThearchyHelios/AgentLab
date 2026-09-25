@@ -107,10 +107,41 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
     return f"{driver}://{auth}{host}/{source.database or ''}{('?' + query) if query else ''}"
 
 
+def engine_args(source: Any) -> tuple[str, dict[str, Any]]:
+    """真正连库用的连接串和额外参数。只读源在这里拿到**连接层**的只读。
+
+    守卫按关键字判定，而模型能写出什么 SQL 事前无法穷举——`WITH … DELETE`
+    就曾从首关键字白名单下面钻过去，在 SQLite 上真把数据删了（pysqlite 只在
+    INSERT/UPDATE/DELETE 开头的语句前隐式开事务，WITH 开头的直接自动提交）。
+    所以只读不能只靠猜，连接本身就得写不进去：
+
+    - SQLite：以 mode=ro 打开文件，写操作由 SQLite 自己拒绝。
+    - PostgreSQL：会话的默认事务只读。能关掉它的 SET / set_config() 守卫都拦。
+    - MySQL / MariaDB：会话事务只读。能关掉它的只有 SET，守卫拦。
+    - Oracle：没有会话级只读开关，只剩守卫这一道——只读数据源请配只读账号。
+    """
+    url = build_url(source, reveal=True)
+    if not source.readonly:
+        return url, {}
+    kind = (source.kind or "").lower()
+    if kind == "sqlite":
+        path = source.database or ""
+        if path and path != ":memory:":
+            from urllib.parse import quote
+            url = f"{_DRIVERS['sqlite']}:///file:{quote(path)}?mode=ro&uri=true"
+        return url, {}
+    if kind in ("postgres", "postgresql"):
+        return url, {"connect_args": {"server_settings": {"default_transaction_read_only": "on"}}}
+    if kind in ("mysql", "mariadb"):
+        return url, {"connect_args": {"init_command": "SET SESSION TRANSACTION READ ONLY"}}
+    return url, {}
+
+
 class EngineCache:
     """按数据源 id 缓存 engine。连接池的建立不便宜，不该每次查询都重来一遍。
 
-    配置变了要显式 invalidate——改了密码却还在用旧连接，排查起来很费神。
+    配置变了要显式 invalidate——改了密码却还在用旧连接，排查起来很费神；
+    改了只读开关却还在用旧连接，只读就形同虚设。
     """
 
     def __init__(self) -> None:
@@ -125,12 +156,14 @@ class EngineCache:
         async with self._lock:
             if key in self._engines:
                 return self._engines[key]
+            url, extra = engine_args(source)
             engine = create_async_engine(
-                build_url(source, reveal=True),
+                url,
                 pool_size=3,
                 max_overflow=2,
                 pool_pre_ping=True,   # 长时间空闲后连接会被数据库掐掉，先探活再用
                 pool_recycle=1800,
+                **extra,
             )
             self._engines[key] = engine
             return engine

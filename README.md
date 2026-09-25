@@ -340,8 +340,11 @@ Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型�
 - 分支条件使用 AST 白名单求值器而非 `eval`
 - HTTP 工具解析域名后逐 IP 检查，拦截内网、回环与云元数据地址，且不跟随重定向（逐跳重新校验）
 - 文件工具路径 `resolve()` 后必须仍位于工作区内
-- SQL 守卫采用白名单动词判定 + 多语句拦截 + 结果集上限；`DROP` / `TRUNCATE` / `GRANT` 等
-  在可写数据源上亦一律拒绝
+- SQL 守卫采用白名单动词判定 + 正文扫描 + 多语句拦截 + 结果集上限；`DROP` / `TRUNCATE` / `GRANT` 等
+  在可写数据源上亦一律拒绝。以查询开头却会写的语句（`WITH … DELETE`、`SELECT … INTO`、
+  `EXPLAIN ANALYZE`、`PRAGMA … =`、`set_config()` 等）按写操作处理
+- 只读数据源在**连接层**也只读，不只靠守卫猜：SQLite 以 `mode=ro` 打开，PostgreSQL / MySQL
+  会话事务只读。**Oracle 没有会话级只读开关**，只剩守卫一道——只读数据源请配只读账号
 - API Key 经 Fernet 加密落库，仅向前端返回掩码
 
 ---
