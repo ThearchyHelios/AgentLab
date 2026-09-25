@@ -302,6 +302,17 @@ async def get_state(run_id: str) -> dict[str, Any]:
     }
 
 
+@router.get("/{run_id}/verify")
+async def verify_run(run_id: str) -> dict[str, Any]:
+    """核对事件流和封存时的清单哈希是否一致：事后被改过、删过、插过都会对不上。"""
+    from app.engine.runner import verify_manifest
+
+    try:
+        return await verify_manifest(run_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+
+
 @router.get("/{run_id}/history")
 async def get_history(run_id: str, limit: int = 50) -> list[dict[str, Any]]:
     """checkpoint 历史 —— 可以看到每一步之后的状态快照，用来做时间旅行式调试。"""

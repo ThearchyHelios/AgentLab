@@ -63,7 +63,12 @@ class Settings(BaseSettings):
     microvm_boot_timeout: int = 300
 
     # --- 执行引擎护栏 ---
+    # 单次执行（两次人工介入之间的那一段）的墙钟上限，runner 里强制执行
     max_run_seconds: int = 600
+    # 单次模型调用的超时。流式调用时是"两段输出之间最长沉默多久"，非流式是整次
+    # 请求。不设的话走 SDK 默认的 10 分钟、外加重试——一个挂住的服务商能把一个
+    # 节点拖上半小时
+    model_timeout_seconds: int = 300
     max_graph_steps: int = 200
     # 节点上配多少步都过不去这个硬顶。默认值仍是节点上的 12（nodeDefs.ts），
     # 这里只决定"想调大的人最多能调到哪"——实测 87% 的 agent 节点 ≤10 步就收口，

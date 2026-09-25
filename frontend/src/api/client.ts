@@ -129,6 +129,9 @@ export const api = {
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),
     state: (id: string) => get<any>(`/runs/${id}/state`),
     history: (id: string) => get<any[]>(`/runs/${id}/history`),
+    /** 核对事件流和封存时的清单哈希：事后被改过、删过、插过都会对不上 */
+    verify: (id: string) => get<{ sealed: boolean; ok: boolean | null; message: string }>(
+      `/runs/${id}/verify`),
     remove: (id: string) => del(`/runs/${id}`),
   },
 

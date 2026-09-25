@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Code2, GitFork, History, RefreshCw, Trash2 } from 'lucide-react'
+import { Code2, GitFork, History, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { Empty, Spinner, StatusDot, useToast } from '../components/ui'
@@ -157,6 +157,20 @@ export function RunsPage() {
                 </div>
               </div>
               <StatusDot status={selected.status} />
+              {selected.manifest_hash && (
+                <button
+                  className="btn btn-sm btn-ghost"
+                  title="核对事件流和封存时的清单是否一致"
+                  onClick={async () => {
+                    try {
+                      const res = await api.runs.verify(selected.id)
+                      toast(res.message, res.ok ? 'ok' : 'error')
+                    } catch (e: any) { toast(e.message ?? '核对失败', 'error') }
+                  }}
+                >
+                  <ShieldCheck size={11} />
+                </button>
+              )}
               <button
                 className={clsx('btn btn-sm btn-ghost', raw && 'text-[var(--accent)]')}
                 title={raw ? '回到可读视图' : `看原始事件（${events.length} 条）`}

@@ -471,6 +471,8 @@ function SystemTab() {
           <Row label="图最大步数" value={info.limits?.max_graph_steps} />
           <Row label="Agent 最大步数" value={info.limits?.max_agent_steps} />
           <Row label="最大并发运行" value={info.limits?.max_concurrent_runs} />
+          <Row label="单次执行时限" value={info.limits?.max_run_seconds && `${info.limits.max_run_seconds} 秒`} />
+          <Row label="模型调用超时" value={info.limits?.model_timeout_seconds && `${info.limits.model_timeout_seconds} 秒`} />
         </div>
       </div>
     </div>

@@ -176,6 +176,9 @@ class Run(Base, TimestampMixin):
     version_hash: Mapped[str | None] = mapped_column(String(64), default=None)
     # 结束时对全部事件计算的清单哈希，事后改动事件流会被它戳穿
     manifest_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 清单封到了哪一条事件（含）。之后追加的事件（复核批注之类）不在封存范围内；
+    # 为空的是记录这一列之前封存的老运行，核对时按当时的口径算
+    manifest_seq: Mapped[int | None] = mapped_column(Integer, default=None)
     started_by: Mapped[str | None] = mapped_column(String(100), default=None)
 
     events: Mapped[list["RunEvent"]] = relationship(

@@ -107,6 +107,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs", "version", "INTEGER"),
     ("runs", "version_hash", "VARCHAR(64)"),
     ("runs", "manifest_hash", "VARCHAR(64)"),
+    ("runs", "manifest_seq", "INTEGER"),
     ("runs", "started_by", "VARCHAR(100)"),
     ("workflows", "status", "TEXT DEFAULT 'draft'"),
     ("workflows", "published_version", "INTEGER"),

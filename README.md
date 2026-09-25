@@ -131,7 +131,8 @@ flowchart LR
 只是与上周不可比」。
 
 每次运行的完整证据存于内容寻址的工件库（`data/artifacts/`，sha256 即地址，取回时复验哈希）；
-运行终态的事件清单哈希记录在 Run 上，事后修改流水将无法对齐。
+运行终态的事件清单哈希记录在 Run 上（封存到 `run.finished` 为止），事后修改流水将无法对齐。
+运行详情页一键核对，接口是 `GET /api/runs/{id}/verify`；封存之后追加的事件不在核对范围内。
 
 ---
 
@@ -415,6 +416,10 @@ pip install -e 'backend[dev]'      # pytest
 agent 侧同样会收到实情，并被告知可直接查询 `information_schema` 自行确认表结构。
 
 **端口冲突。** 前端默认 5273、后端 8000，通过 `AGENTLAB_WEB_PORT` / `AGENTLAB_PORT` 修改。
+
+**运行被中止，提示超过时限。** 单次执行（两次人工介入之间的那一段）默认最多 600 秒，
+单次模型调用默认 300 秒没有输出即超时。多半是模型或工具没有响应；确实需要更久，调大
+`AGENTLAB_MAX_RUN_SECONDS` / `AGENTLAB_MODEL_TIMEOUT_SECONDS`。设置页「运行环境」里能看到当前值。
 
 ---
 

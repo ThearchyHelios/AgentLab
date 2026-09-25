@@ -61,9 +61,13 @@ class RunManager:
             await session.commit()
 
     async def shutdown(self) -> None:
-        for task in list(self._tasks.values()):
+        # 只等还没结束的：结束了的没什么可等，而且它可能属于另一个事件循环，
+        # gather 会直接抛 "future belongs to a different loop"
+        pending = [t for t in self._tasks.values() if not t.done()]
+        for task in pending:
             task.cancel()
-        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._tasks.clear()
         if self._cm is not None:
             with contextlib.suppress(Exception):
                 await self._cm.__aexit__(None, None, None)
@@ -418,6 +422,7 @@ class RunManager:
         error: str | None = None
         final_state: dict[str, Any] = {}
 
+        deadline: asyncio.Timeout | None = None
         async with self._semaphore:
             try:
                 async with SessionLocal() as session:
@@ -449,14 +454,19 @@ class RunManager:
                 }
 
                 interrupted = False
-                async for mode, chunk in app.astream(
-                    payload, config=config, stream_mode=["custom", "updates"]
-                ):
-                    if mode == "custom":
-                        await self._handle_custom(run_id, chunk)
-                    elif mode == "updates":
-                        if await self._handle_updates(run_id, chunk):
-                            interrupted = True
+                # 单次执行的墙钟上限。以前 max_run_seconds 只存在于配置里，没有任何
+                # 代码执行它——一个挂住的模型或工具能把运行和它占着的并发名额一直拖着。
+                # 按"这一段执行"计：等人工审批时 _drive 已经结束，那段时间不算。
+                deadline = asyncio.timeout(settings.max_run_seconds)
+                async with deadline:
+                    async for mode, chunk in app.astream(
+                        payload, config=config, stream_mode=["custom", "updates"]
+                    ):
+                        if mode == "custom":
+                            await self._handle_custom(run_id, chunk)
+                        elif mode == "updates":
+                            if await self._handle_updates(run_id, chunk):
+                                interrupted = True
 
                 snapshot = await app.aget_state(config)
                 final_state = dict(snapshot.values or {})
@@ -470,6 +480,17 @@ class RunManager:
                 error = "用户取消"
                 await self._emit(run_id, EventType.RUN_CANCELLED, data={})
                 raise
+            except TimeoutError as e:
+                status = "failed"
+                if deadline is not None and deadline.expired():
+                    error = (
+                        f"这次执行超过了 {settings.max_run_seconds} 秒的上限，已中止。"
+                        "跑得慢的多半是模型或工具没有响应；确实需要更久，调大 AGENTLAB_MAX_RUN_SECONDS"
+                    )
+                else:   # 别处抛的超时，不是这道上限——按普通失败说
+                    error = f"{type(e).__name__}: {e}"
+                    logger.exception("run %s 失败", run_id)
+                await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             except Exception as e:  # noqa: BLE001
                 status = "failed"
                 # NodeError 的 message 本来就是写给人看的（"人工驳回：…"），
@@ -479,8 +500,13 @@ class RunManager:
                 await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             finally:
                 elapsed = int((time.perf_counter() - started) * 1000)
-                await self._finalize(run_id, status, error, final_state, elapsed)
-                self._tasks.pop(run_id, None)
+                try:
+                    await self._finalize(run_id, status, error, final_state, elapsed)
+                finally:
+                    # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
+                    # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
+                    # gather 在别的事件循环里炸开
+                    self._tasks.pop(run_id, None)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
@@ -566,16 +592,6 @@ class RunManager:
                 run.usage = usage
                 if status != "interrupted":
                     run.finished_at = datetime.now(timezone.utc)
-                    # 终态时对全部已落库事件计算清单哈希：事后任何对事件流的
-                    # 增删改都会与这个值对不上。中断态不算——事件还会继续追加。
-                    from app.core.artifact_store import manifest_hash as _manifest
-
-                    rows = await session.execute(
-                        select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
-                        .where(RunEvent.run_id == run_id)
-                        .order_by(RunEvent.seq)
-                    )
-                    run.manifest_hash = _manifest([tuple(r) for r in rows])
                 await session.commit()
 
         if status == "succeeded":
@@ -584,8 +600,73 @@ class RunManager:
                 EventType.RUN_FINISHED,
                 data={"output": _safe(output), "usage": usage, "duration_ms": elapsed_ms},
             )
+        if status != "interrupted":
+            # 终态事件落库之后再封存。以前在 run.finished 之前算，清单里恰恰少了
+            # 那条宣布"跑完了、成果是什么"的事件——改它的成果，清单照样对得上。
+            # 中断态不封：事件还会继续追加
+            await self._seal(run_id)
         if status in ("succeeded", "failed", "cancelled"):
             await bus.close(run_id)
+
+    async def _seal(self, run_id: str) -> None:
+        """对到此为止的全部事件算清单哈希，记下封到了哪一条。"""
+        from app.core.artifact_store import manifest_hash as _manifest
+
+        async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+            if run is None:
+                return
+            rows = [tuple(r) for r in await session.execute(
+                select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
+                .where(RunEvent.run_id == run_id)
+                .order_by(RunEvent.seq)
+            )]
+            run.manifest_hash = _manifest(rows)
+            run.manifest_seq = rows[-1][0] if rows else 0
+            await session.commit()
+
+
+_TERMINAL = (EventType.RUN_FINISHED, EventType.RUN_FAILED, EventType.RUN_CANCELLED)
+
+
+async def verify_manifest(run_id: str) -> dict[str, Any]:
+    """重算封存范围内的清单哈希，和封存时记下的对一下。
+
+    以前只写不验：README 说"事后修改流水将无法对齐"，可仓库里没有一行代码去对。
+    封存范围之后追加的事件不参与核对。没有 manifest_seq 的是加这一列之前封存的
+    老运行——当时的哈希是在 run.finished 落库之前算的，按那时的口径还原范围。
+    """
+    from app.core.artifact_store import manifest_hash as _manifest
+
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        if run is None:
+            raise KeyError(f"找不到运行 {run_id}")
+        if not run.manifest_hash:
+            return {"sealed": False, "ok": None,
+                    "message": "这次运行还没有封存（没跑完，或者停在人工介入）"}
+        rows = [tuple(r) for r in await session.execute(
+            select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
+            .where(RunEvent.run_id == run_id)
+            .order_by(RunEvent.seq)
+        )]
+        expected, sealed_at = run.manifest_hash, run.manifest_seq
+
+    legacy = sealed_at is None
+    if legacy:
+        last = next((r for r in reversed(rows) if r[1] in _TERMINAL), None)
+        if last is None:
+            sealed_at = rows[-1][0] if rows else 0
+        elif last[1] == EventType.RUN_FINISHED:
+            sealed_at = last[0] - 1             # 老口径：run.finished 本身不在清单里
+        else:
+            sealed_at = last[0]                 # run.failed / run.cancelled 在封存前就落库了
+    covered = [r for r in rows if r[0] <= sealed_at]
+    ok = _manifest(covered) == expected
+    return {
+        "sealed": True, "ok": ok, "events": len(covered), "sealed_at": sealed_at, "legacy": legacy,
+        "message": "事件流与封存时一致" if ok else "事件流和封存时对不上：封存之后有事件被改过、删过或插过",
+    }
 
 
 def _safe(value: Any, limit: int = 4000) -> Any:

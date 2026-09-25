@@ -258,5 +258,7 @@ async def system_info() -> dict[str, Any]:
             "max_graph_steps": app_settings.max_graph_steps,
             "max_agent_steps": app_settings.max_agent_steps,
             "max_concurrent_runs": app_settings.max_concurrent_runs,
+            "max_run_seconds": app_settings.max_run_seconds,
+            "model_timeout_seconds": app_settings.model_timeout_seconds,
         },
     }

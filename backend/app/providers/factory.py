@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.crypto import decrypt
 from app.db.models import Provider
 from app.providers import catalog
@@ -106,8 +107,9 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
     kwargs: dict[str, Any] = {"model": model}
     if spec.max_tokens:
         kwargs["max_tokens"] = spec.max_tokens
-    if spec.timeout:
-        kwargs["timeout"] = spec.timeout
+    # 以前只有节点显式配了才传，而没有任何地方给 spec.timeout 赋过值——所有调用
+    # 都走 SDK 默认的 10 分钟
+    kwargs["timeout"] = spec.timeout or settings.model_timeout_seconds
 
     # 采样参数：能力允许才传
     if spec.temperature is not None and catalog.supports_sampling(model):
