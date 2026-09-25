@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Skill
+from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState, message_text, template_context, thinking_text
 from app.providers import catalog
@@ -28,8 +29,8 @@ from app.tools.registry import (
     ToolContext,
     args_model_of,
     build_tools,
+    call_is_dangerous,
     describe_args,
-    get_spec,
     prepare_args,
 )
 
@@ -312,14 +313,13 @@ def split_tool_calls(
     return tool_calls[:1], deferred
 
 
-def _needs_approval(ctx: NodeContext, tool_name: str) -> bool:
+def _needs_approval(ctx: NodeContext, tool: BaseTool, args: dict[str, Any]) -> bool:
     mode = ctx.cfg("approval", "dangerous")  # never | dangerous | always
     if mode == "always":
         return True
     if mode == "never":
         return False
-    spec = get_spec(tool_name)
-    return bool(spec and spec.dangerous)
+    return call_is_dangerous(tool, tool.name, args)
 
 
 async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
@@ -410,7 +410,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     ctx.emit(EventType.LOG, level="warn",
                              message=f"工具 {name}：{fix_note}", code="tool_args_fixed")
 
-            if _needs_approval(ctx, name):
+            if _needs_approval(ctx, tool_map[name], args):
                 ctx.emit(
                     EventType.HUMAN_REQUESTED,
                     mode="approve",
@@ -427,9 +427,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                         "title": f"是否允许调用 {name}？",
                     }
                 )
-                approved, note, override = _parse_decision(decision)
-                ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=approved, note=note)
-                if not approved:
+                verdict = read_decision(decision)
+                note = verdict.note
+                ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved, note=note)
+                if not verdict.approved:
                     messages.append(
                         ToolMessage(
                             content=f"用户拒绝了这次调用。原因：{note or '未说明'}。请换一种方式。",
@@ -438,8 +439,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     )
                     transcript.append({"tool": name, "args": args, "denied": True, "note": note})
                     continue
-                if isinstance(override, dict) and override:
-                    args = override
+                if verdict.args:
+                    args = verdict.args
 
             ctx.emit(EventType.TOOL_START, tool=name, args=args, call_id=call_id)
             started = time.perf_counter()
@@ -555,17 +556,3 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: final_text}
     return updates
-
-
-def _parse_decision(decision: Any) -> tuple[bool, str, dict[str, Any] | None]:
-    """人工审批的返回值兼容几种写法：布尔、字符串、或带备注的结构体。"""
-    if isinstance(decision, bool):
-        return decision, "", None
-    if isinstance(decision, str):
-        return decision.lower() in ("yes", "y", "true", "approve", "ok", "同意"), decision, None
-    if isinstance(decision, dict):
-        approved = decision.get("approved")
-        if approved is None:
-            approved = decision.get("decision") in ("approve", "yes", True)
-        return bool(approved), str(decision.get("note", "")), decision.get("args")
-    return bool(decision), "", None

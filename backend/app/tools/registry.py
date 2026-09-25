@@ -77,6 +77,21 @@ def get_spec(name: str) -> ToolSpec | None:
     return all_specs().get(name)
 
 
+def call_is_dangerous(tool: BaseTool | None, name: str, args: dict[str, Any]) -> bool:
+    """这一次调用要不要人工确认。所有审批关卡都问这一个函数。
+
+    内置工具危不危险是固定的（ToolSpec.dangerous）。动态工具要看这一次传了
+    什么：同一个 db_query__<源>，SELECT 不用确认，可写源上的 DELETE 必须确认。
+    它们把判定挂在工具的 metadata["dangerous_if"] 上。以前没有这一层，数据源
+    工具查不到 ToolSpec，于是在任何审批模式下都被当成安全的。
+    """
+    spec = get_spec(name)
+    if spec is not None:
+        return spec.dangerous
+    judge = ((tool.metadata or {}) if tool is not None else {}).get("dangerous_if")
+    return bool(judge and judge(args))
+
+
 def _stringify(value: Any) -> str:
     """工具结果最终是喂给模型的，所以统一成字符串；结构化数据转紧凑 JSON。"""
     if isinstance(value, str):

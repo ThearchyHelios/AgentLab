@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy import text
 
 from app.core.crypto import decrypt
-from app.data.guard import QueryLimits, SqlRejected, check
+from app.data.guard import QueryLimits, SqlRejected, check, is_write
 
 # 各方言的 SQLAlchemy 驱动。都选 asyncio 原生驱动，没有一个需要装数据库客户端：
 # oracledb 走 thin 模式（纯 Python 协议实现），省掉了 Oracle Instant Client 这个
@@ -222,6 +222,9 @@ async def run_query(
     engine = await engines.get(source)
     started = time.perf_counter()
 
+    if not source.readonly and is_write(statement):
+        return await _run_write(engine, statement, limits, started)
+
     async def _exec() -> tuple[list[str], list[list[Any]], bool]:
         async with engine.connect() as conn:
             cursor = await conn.stream(text(statement))
@@ -253,6 +256,40 @@ async def run_query(
         rows=rows,
         row_count=len(rows),
         truncated=truncated,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        sql=statement,
+    )
+
+
+async def _run_write(
+    engine: AsyncEngine, statement: str, limits: QueryLimits, started: float
+) -> QueryResult:
+    """可写源上的写操作：真的提交。
+
+    以前写和查询走同一条 stream 路径：拿不到结果集就抛 ResourceClosedError，
+    连接关闭时再回滚——可写源上的写从来没落过库，调用方只看到一个报错。
+    能走到这里的写都已经过了审批（registry.call_is_dangerous → 各节点的审批关卡），
+    只读源上的写在 check 里就被拒了。
+    """
+    import time
+
+    async def _exec() -> tuple[list[str], list[list[Any]]]:
+        async with engine.begin() as conn:   # 正常退出提交，出错回滚
+            result = await conn.execute(text(statement))
+            if result.returns_rows:          # RETURNING、PG 的数据修改 CTE
+                return (list(result.keys()),
+                        [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows)])
+            return ["affected_rows"], [[result.rowcount]]
+
+    try:
+        columns, rows = await asyncio.wait_for(_exec(), timeout=limits.timeout_seconds)
+    except asyncio.TimeoutError as e:
+        raise SqlRejected(f"写操作超过 {limits.timeout_seconds}s 被中断，已回滚。") from e
+    return QueryResult(
+        columns=columns,
+        rows=rows,
+        row_count=len(rows),
+        truncated=len(rows) >= limits.max_rows,
         elapsed_ms=int((time.perf_counter() - started) * 1000),
         sql=statement,
     )

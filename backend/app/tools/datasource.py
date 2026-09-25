@@ -154,6 +154,8 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
         args_schema=_QueryArgs,
         coroutine=_run,
         func=None,
+        # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它
+        metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or ""))},
     )
 
 
@@ -187,5 +189,8 @@ def _make_schema_tool(source: DataSource) -> StructuredTool:
 
 
 def is_dangerous_call(source: DataSource, sql: str) -> bool:
-    """这次调用要不要走人工审批：非只读源上的写操作要。"""
+    """这次调用要不要走人工审批：非只读源上的写操作要。
+
+    只读源上的写不需要审批——守卫和连接层都会拒，批了也写不进去。
+    """
     return not source.readonly and is_write(sql)

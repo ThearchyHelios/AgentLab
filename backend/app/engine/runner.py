@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -245,9 +246,10 @@ class RunManager:
             now = datetime.now(timezone.utc)
             if target is not None:
                 target.status = "answered"  # 已回复，但还没提交给引擎
-                target.response = (
-                    _safe(response) if isinstance(response, dict) else {"value": _safe(response)}
-                )
+                # 存全文，不能用 _safe 截：多条审批并存时，交给引擎的就是这一份
+                # （见下面 answers）。截过的版本会把人工改过的长稿砍掉一截再送进节点
+                full = json.loads(json.dumps(response, ensure_ascii=False, default=str))
+                target.response = full if isinstance(full, dict) else {"value": full}
                 target.resolved_at = now
                 if actor:
                     target.resolved_by = actor
@@ -271,7 +273,11 @@ class RunManager:
                     missing.append(iid)
                     continue
                 payload = rec.response or {}
-                answers[iid] = payload.get("value", payload) if isinstance(payload, dict) else payload
+                # 只拆我们自己包的那层 {"value": x}（裸值回复）。带 approved / note / args
+                # 的结构体要原样交给节点——以前一律取 value，只要回复里带了内容，
+                # 驳回、备注、改过的参数就全在这里丢了
+                wrapped = isinstance(payload, dict) and set(payload) == {"value"}
+                answers[iid] = payload["value"] if wrapped else payload
 
             if missing:
                 # 还差人没回。保持 interrupted，把已回复的那条留在 answered 上等齐

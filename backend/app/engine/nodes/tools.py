@@ -8,11 +8,19 @@ from langgraph.types import interrupt
 
 from app.core.events import EventType
 from app.db.base import SessionLocal
+from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
-from app.tools.registry import ToolArgsError, ToolContext, call_tool, get_spec
+from app.tools.registry import (
+    ToolArgsError,
+    ToolContext,
+    build_tools,
+    call_is_dangerous,
+    call_tool,
+    get_spec,
+)
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
@@ -25,6 +33,18 @@ def _tool_ctx(ctx: NodeContext) -> ToolContext:
     )
 
 
+async def _is_dangerous(name: str, args: dict[str, Any], ctx: NodeContext) -> bool:
+    """内置工具看 ToolSpec；数据源这类动态工具得先建出来，才问得到这一次危不危险。
+
+    审批通过后节点会整个重放，这里会再算一遍——所以它必须只取决于 name 和 args。
+    """
+    if get_spec(name) is not None:
+        return call_is_dangerous(None, name, args)
+    async with SessionLocal() as session:
+        tools = await build_tools([name], _tool_ctx(ctx), session=session)
+    return call_is_dangerous(tools[0] if tools else None, name, args)
+
+
 async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """直接调用一个工具。参数里的 {{ }} 会先用当前状态渲染。"""
     name = ctx.cfg("tool", "")
@@ -35,23 +55,21 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise NodeError(ctx.node.id, "工具参数必须是对象")
 
-    spec = get_spec(name)
     approval = ctx.cfg("approval", "dangerous")
-    if approval == "always" or (approval == "dangerous" and spec and spec.dangerous):
+    if approval == "always" or (approval == "dangerous" and await _is_dangerous(name, args, ctx)):
         ctx.emit(EventType.HUMAN_REQUESTED, mode="approve", tool=name, args=args,
                  title=f"是否允许调用 {name}？")
-        decision = interrupt(
+        decision = read_decision(interrupt(
             {"kind": "tool_approval", "node_id": ctx.node.id, "tool": name, "args": args,
              "title": f"是否允许调用 {name}？"}
-        )
-        approved = decision if isinstance(decision, bool) else bool(
-            (decision or {}).get("approved") if isinstance(decision, dict) else decision
-        )
-        if isinstance(decision, dict) and isinstance(decision.get("args"), dict):
-            args = decision["args"]
-        ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=approved)
-        if not approved:
-            raise NodeError(ctx.node.id, f"用户拒绝执行工具 {name}")
+        ))
+        if decision.args is not None:
+            args = decision.args
+        ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved,
+                 note=decision.note)
+        if not decision.approved:
+            raise NodeError(ctx.node.id, f"用户拒绝执行工具 {name}"
+                            + (f"：{decision.note}" if decision.note else ""))
 
     ctx.emit(EventType.TOOL_START, tool=name, args=args)
     started = time.perf_counter()
@@ -118,18 +136,16 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if ctx.cfg("approval", "never") == "always":
         ctx.emit(EventType.HUMAN_REQUESTED, mode="approve", title="是否执行这段代码？",
                  code=code[:4000], language=language)
-        decision = interrupt(
+        decision = read_decision(interrupt(
             {"kind": "code_approval", "node_id": ctx.node.id, "code": code,
              "language": language, "title": "是否执行这段代码？"}
-        )
-        approved = decision if isinstance(decision, bool) else bool(
-            (decision or {}).get("approved") if isinstance(decision, dict) else decision
-        )
-        if isinstance(decision, dict) and decision.get("code"):
-            code = decision["code"]  # 允许人工改完再跑
-        ctx.emit(EventType.HUMAN_RESOLVED, approved=approved)
-        if not approved:
-            raise NodeError(ctx.node.id, "用户拒绝执行代码")
+        ))
+        if decision.code:
+            code = decision.code  # 允许人工改完再跑
+        ctx.emit(EventType.HUMAN_RESOLVED, approved=decision.approved, note=decision.note)
+        if not decision.approved:
+            raise NodeError(ctx.node.id, "用户拒绝执行代码"
+                            + (f"：{decision.note}" if decision.note else ""))
 
     # 隔离档位：strict 要硬件级（microVM），fast 要低延迟（Seatbelt/bwrap），
     # 留空跟随整机默认。要的那档不可用时会安静退回默认，不阻断运行。

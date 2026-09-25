@@ -7,6 +7,7 @@ from langgraph.types import interrupt
 
 from app.core.events import EventType
 from app.db.base import SessionLocal
+from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
 from app.engine.state import GraphState, message_text, template_context
 from app.providers.factory import ModelSpec, get_chat_model
@@ -34,12 +35,13 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     ctx.emit(EventType.HUMAN_REQUESTED, **payload)
     response = interrupt(payload)
     ctx.emit(EventType.HUMAN_RESOLVED, response=response)
+    decision = read_decision(response)
 
     if mode == "approve":
-        approved = _truthy(response)
+        approved = decision.approved
         result: dict[str, Any] = {
             "approved": approved,
-            "note": _note_of(response),
+            "note": decision.note,
             "__decision__": "approved" if approved else "rejected",
         }
         if not approved and ctx.cfg("stop_on_reject", False):
@@ -52,36 +54,19 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 这两种模式在图上只有一个 out 出口（没有 rejected 那条边），所以驳回
         # 的正确语义是终止运行，而不是当作通过继续。缺省仍是通过：只传 value
         # 不带 approved 的老调用方行为不变。
-        rejected = isinstance(response, dict) and response.get("approved") is False
-        if rejected:
-            note = _note_of(response)
-            raise NodeError(ctx.node.id, f"人工驳回：{note or '未说明原因'}")
-        value = response.get("value") if isinstance(response, dict) else response
-        result = {"value": value, "note": _note_of(response), "__decision__": "approved"}
+        #
+        # 只有结构体里明说了"不"才算驳回：这两种模式下裸字符串就是内容本身，
+        # 用户在输入框里回一句"no"是在交稿，不是在驳回。
+        if isinstance(response, dict) and decision.rejected:
+            raise NodeError(ctx.node.id, f"人工驳回：{decision.note or '未说明原因'}")
+        note = decision.note if isinstance(response, dict) else ""   # 裸字符串是内容，不是备注
+        result = {"value": decision.value, "note": note, "__decision__": "approved"}
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: result.get("value", result.get("approved"))}
     return updates
-
-
-def _truthy(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, dict):
-        if "approved" in value:
-            return bool(value["approved"])
-        return str(value.get("decision", "")).lower() in ("approve", "yes", "true", "同意")
-    if isinstance(value, str):
-        return value.strip().lower() in ("yes", "y", "true", "approve", "ok", "同意", "通过")
-    return bool(value)
-
-
-def _note_of(value: Any) -> str:
-    if isinstance(value, dict):
-        return str(value.get("note", "") or value.get("comment", ""))
-    return ""
 
 
 # --------------------------------------------------------------------------

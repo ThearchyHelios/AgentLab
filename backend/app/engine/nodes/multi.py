@@ -21,6 +21,7 @@ from app.tools.registry import (
     ToolContext,
     args_model_of,
     build_tools,
+    call_is_dangerous,
     prepare_args,
 )
 
@@ -97,6 +98,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     #: 一轮最多同时派几个。再多的话调度者多半只是在把任务拆碎，
     #: 而每多一路就多一份"基于陈旧进展"的风险
     max_parallel = max(1, min(int(ctx.cfg("max_parallel", 3) or 3), len(names)))
+    #: dangerous：需要人工确认的调用不执行（成员停不下来等人）；never：全部放行
+    approval = ctx.cfg("approval", "dangerous")
 
     transcript: list[dict[str, Any]] = []
     usage_total = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
@@ -168,7 +171,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             HumanMessage(content=f"团队目标：{goal}\n\n已有进展：\n{progress or '(无)'}\n\n你的任务：{instruction}"),
         ]
         calls: list[dict[str, Any]] = []
-        for _ in range(int(cfg.get("max_steps") or 4)):
+        # 和 agent 节点同一个硬顶：成员上配多少步都过不去 max_agent_steps
+        max_steps = min(int(cfg.get("max_steps") or 4), settings.max_agent_steps)
+        for _ in range(max_steps):
             reply = await bound.ainvoke(messages)
             _accumulate(reply, model_id)
             messages.append(reply)
@@ -199,6 +204,18 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     if args_error:
                         # 参数就不对，没必要真调一次。把"它接受什么"喂回去让它改
                         content = args_error
+                    elif approval != "never" and call_is_dangerous(tool_map[tname], tname, targs):
+                        # 专家们并行跑在同一个节点里，停不下来等人：审批恢复时节点整个
+                        # 重放，几个人的 interrupt 谁先谁后对不上号。以前的做法是不审，
+                        # shell_exec / file_write / 可写库上的 DELETE 照跑不误——
+                        # agent 节点守着的那道门，在这里是敞开的。现在是不跑，并说清原因
+                        content = (
+                            f"没有执行：{tname} 这次调用需要人工确认，而协作团队里的成员"
+                            "不能停下来等人。换一种不需要它的做法；实在需要，交给团队外"
+                            "的 agent 节点去做（那里可以逐次审批）。"
+                        )
+                        ctx.emit(EventType.LOG, level="warn", code="tool_needs_approval",
+                                 message=f"{name} 想调用 {tname}，需要人工确认，协作节点里不执行")
                     else:
                         try:
                             raw = await tool_map[tname].ainvoke(targs)
@@ -208,7 +225,27 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 ctx.emit(EventType.TOOL_END, tool=tname, agent=name, call_id=cid, preview=content[:1500])
                 calls.append({"tool": tname, "args": targs, "result": content[:2000]})
                 messages.append(ToolMessage(content=content, tool_call_id=cid))
-        return {"text": message_text(messages[-1]), "tool_calls": calls}
+
+        # 步数用完了：最后一步一定是要了工具的，模型从没拿到过"说结论"的那一轮。
+        # messages[-1] 是一条 ToolMessage——以前它就被当成这个成员的产出交给调度者，
+        # 工具的原始返回冒充了结论。agent 节点修过同一个问题，这里照做：不给工具
+        # （用没绑工具的 model，结构上就发不出调用）补一轮收尾。
+        messages.append(HumanMessage(content=(
+            f"步数预算用完了（{max_steps} 步），现在起不能再调用任何工具。基于已经查到的"
+            "信息给出你这部分的结论，说清哪些没查到、结论因此有什么局限。不要编造数据。"
+        )))
+        try:
+            settled = await model.ainvoke(messages)
+            _accumulate(settled, model_id)
+            text = message_text(settled).strip()
+        except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有的过程一起赔进去
+            ctx.emit(EventType.LOG, level="warn", code="settle_failed",
+                     message=f"{name} 的收尾轮没跑成：{type(e).__name__}: {e}")
+            text = next((t for m in reversed(messages)
+                         if isinstance(m, AIMessage) and (t := message_text(m).strip())), "")
+        ctx.emit(EventType.LOG, level="warn", code="step_limit_settled",
+                 message=f"{name} 用满了 {max_steps} 步，结论基于已经查到的部分")
+        return {"text": text or f"（{name} 用满了 {max_steps} 步，没有给出结论）", "tool_calls": calls}
 
     progress_lines: list[str] = []
     final_text = ""

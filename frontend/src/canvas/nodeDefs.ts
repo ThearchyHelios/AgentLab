@@ -167,10 +167,19 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           + '设为 1 即退回严格串行——并发的成员看到的是同一份进展快照，'
           + '任务其实有依赖却被同时派出去，两个人会基于一样的旧信息重复劳动',
       },
+      {
+        key: 'approval', label: '工具审批', type: 'select', advanced: true,
+        options: [
+          { value: 'dangerous', label: '需要确认的调用不执行' },
+          { value: 'never', label: '全部自动放行' },
+        ],
+        help: '成员们并行跑在一个节点里，停不下来等人审批。默认把危险工具和可写库上的写操作'
+          + '挡下来，并告诉成员换一种做法；需要逐次审批的事交给团队外的 agent 节点',
+      },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_rounds: 6, max_parallel: 3, agents: [] },
+    defaults: { max_rounds: 6, max_parallel: 3, agents: [], approval: 'dangerous' },
   },
   tool: {
     type: 'tool', label: '调用工具', category: '执行', icon: Wrench,
