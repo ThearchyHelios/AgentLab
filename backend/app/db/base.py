@@ -40,7 +40,45 @@ class TimestampMixin:
     )
 
 
-engine = create_async_engine(settings.db_url, echo=False, future=True)
+def _stop_aiosqlite_once() -> None:
+    """aiosqlite 连接的工作线程只停一次；之后再要求停的，拿到的是同一个结果。
+
+    aiosqlite 0.22 的 stop() 每调一次都往工作线程队列里放一个"关闭并退出线程"
+    的请求，而线程处理完第一个就退出了——之后放进去的请求没人处理，等它的一方
+    永远挂着。close() 的 finally 里会调 stop()，SQLAlchemy 的强制 terminate 也会
+    直接调；两个 close 并发、或者 close 撞上强制 terminate，就会卡死。实测同一
+    连接并发 close 两次，10 次卡 10 次。
+
+    在这里触发它的路径：并行的两条支路一条失败，LangGraph 取消另一条，而那一条
+    正在写工件。取消打进进行中的数据库操作，SQLAlchemy 在两条路径上各 terminate
+    一次同一条连接——节点任务取消不完，整个运行卡在 running，占着的并发名额也不
+    还。大约五次里有一次。连接池和 checkpointer 都走 aiosqlite，补在这一层都管得到。
+    """
+    import weakref
+
+    import aiosqlite
+
+    original = aiosqlite.Connection.stop
+    if getattr(original, "_agentlab_once", False):
+        return
+    stopping: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def stop(self):  # type: ignore[no-untyped-def]
+        if self not in stopping:
+            stopping[self] = original(self)
+        return stopping[self]
+
+    stop._agentlab_once = True  # type: ignore[attr-defined]
+    aiosqlite.Connection.stop = stop  # type: ignore[method-assign]
+
+
+_stop_aiosqlite_once()
+# pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
+# （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
+# 清空的那一行），已经关掉的连接会留在池里，下一个取到它的人拿到的是
+# "no active connection"。探活失败会被当成断开，换一条新的——SQLite 本地一次
+# SELECT 1 的代价，换池子不被污染。
+engine = create_async_engine(settings.db_url, echo=False, future=True, pool_pre_ping=True)
 
 
 @event.listens_for(engine.sync_engine, "connect")
