@@ -1029,6 +1029,7 @@ const PHASE_LABEL: Record<string, string> = {
   building: '正在搭建流程',
   wiring: '正在连接数据流',
   finalizing: '正在排版和校验',
+  repairing: '正在按自查结果修正',
 }
 
 /**
@@ -1117,13 +1118,39 @@ export function decodeCopilot(ops: CopilotOp[]): Step[] {
                    title: `流程搭好了，加了 ${nodeCount} 步`,
                    detail: String(op.explanation ?? '') || undefined })
         break
+      case 'check': {
+        // 服务端自查：用运行时同一套规则过一遍，有问题交回模型改。
+        // 这件事得看得见——否则多出来的那十几秒像是卡住了，改了什么也无从知道
+        const issues = Array.isArray(op.issues) ? op.issues.map(String) : []
+        if (op.status === 'repairing') {
+          out.push({ id: `ck-${i}`, seq: i, kind: 'note', status: 'done',
+                     title: `自查发现 ${issues.length} 处问题，交回去改`,
+                     detail: issues.join('\n') || undefined })
+        } else if (op.status === 'passed') {
+          closeLifecycles(out, 'done')
+          out.push({ id: `ck-${i}`, seq: i, kind: 'note', status: 'done',
+                     title: op.repaired ? '自查通过：问题已经改好' : '自查通过' })
+        } else {
+          closeLifecycles(out, 'failed')
+          out.push({ id: `ck-${i}`, seq: i, kind: 'error', level: 'error', status: 'failed',
+                     title: op.status === 'failed'
+                       ? `自查后还有 ${issues.length} 处问题，没有自动运行`
+                       : String(op.message ?? '自查没能完成'),
+                     detail: issues.join('\n') || undefined })
+        }
+        break
+      }
       case 'final': {
         // 后端排版校验后的最终图才知道整张图有几步。nodeCount 只是这一轮
-        // 新增的数量——在"改图"场景下说"共 2 步"是错的，图上明明有四个节点
+        // 新增的数量——在"改图"场景下说"共 2 步"是错的，图上明明有四个节点。
+        // 自查的记录会排在"搭好了"后面，所以往回找那一行，不能只看最后一条
         const total = op.graph?.nodes?.length
         const last = out[out.length - 1]
-        if (total && last?.kind === 'lifecycle') {
-          last.title = nodeCount && nodeCount < total
+        // 流没等到 done 就断了时没有那一行，沿用原来的做法：改写最后一条生命周期
+        const built = [...out].reverse().find((s) => s.id.startsWith('cd-'))
+          ?? (last?.kind === 'lifecycle' ? last : undefined)
+        if (total && built) {
+          built.title = nodeCount && nodeCount < total
             ? `流程搭好了，加了 ${nodeCount} 步，整张图共 ${total} 步`
             : `流程搭好了，共 ${total} 步`
         }

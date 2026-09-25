@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from enum import StrEnum
 from typing import Any, Iterable, Literal
@@ -210,6 +211,44 @@ def back_edges(
     return back
 
 
+def expression_fields(node: GraphNode) -> list[tuple[str, str]]:
+    """这个节点上按表达式求值的字段：(给人看的名字, 原文)。
+
+    跟着模式走：foreach 循环的 condition、模板模式整形的 expression 不参与求值，
+    拿它们报错就是误报。
+    """
+    cfg = node.config
+    out: list[tuple[str, str]] = []
+
+    def add(label: str, value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            out.append((label, value))
+
+    add("跳过条件", cfg.get("skip_if"))
+    if node.type == NodeType.BRANCH and cfg.get("mode", "expression") == "expression":
+        for case in cfg.get("cases") or []:
+            case = case or {}
+            add(f"分支「{case.get('label') or case.get('key') or '?'}」的条件", case.get("condition"))
+    elif node.type == NodeType.LOOP and cfg.get("mode", "foreach") == "while":
+        add("循环条件", cfg.get("condition"))
+    elif node.type == NodeType.TRANSFORM and cfg.get("mode", "expression") == "expression":
+        add("整形表达式", cfg.get("expression"))
+    elif node.type == NodeType.METRICS:
+        for d in cfg.get("metrics") or []:
+            d = d or {}
+            add(f"指标「{d.get('id') or '?'}」的表达式", d.get("expression"))
+    return out
+
+
+# 代码节点可能往 stdout 写东西的迹象。宁可漏判不可误判：这条是 error 级、会挡住运行，
+# 所以间接的写法（子进程、exec、附带文件里的 print）都算。整行只有一个 {{ }} 的，
+# 那行代码是运行时从上游拿的（⑤号示例整段就是 {{ vars.code }}），看不见，不猜；
+# 而 `state = {{ vars.state | json }}` 这种只是填一个值，照查
+_MAY_WRITE_STDOUT = re.compile(
+    r"\b(print|pprint|exec)\s*\(|\bstdout\b|\bos\.(system|write|popen)\b|\bsubprocess\b"
+    r"|^\s*\{\{.*\}\}\s*$", re.M)
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -281,6 +320,52 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                     "没有指定模型，将回退到默认 provider",
                     level="warning",
                     node_id=node.id,
+                )
+
+    # 表达式：用运行时同一个 parse_expression 先解析一遍。以前写错了只有跑到那一步
+    # 才知道——前面的步骤白跑、钱白花，报错还停在半路（开发库里四次运行死在
+    # "表达式里不允许出现 Set"，就是条件里套了 {{ }}）
+    from app.engine.expressions import ExpressionError, parse_expression
+
+    for node in spec.nodes:
+        for label, text in expression_fields(node):
+            try:
+                _, unwrapped, unknown = parse_expression(text)
+            except ExpressionError as e:
+                result.add(f"{label}写错了：{e}（原文：{text}）", node_id=node.id)
+                continue
+            if unwrapped:
+                result.add(
+                    f"{label}里的 {{{{ }}}} 是多余的——这里是表达式、不是模板，"
+                    f"已按 {'、'.join(unwrapped)} 理解", level="warning", node_id=node.id,
+                )
+            if unknown:
+                result.add(
+                    f"{label}里的 {'、'.join(unknown)} 不是能用的名字，运行时会取到空值"
+                    "（变量要写全：vars.x、input.x、nodes.某节点.text）",
+                    level="warning", node_id=node.id,
+                )
+        cfg = node.config
+        if node.type == NodeType.LOOP and cfg.get("mode", "foreach") == "while" \
+                and not str(cfg.get("condition") or "").strip():
+            result.add("while 循环没有写条件，循环体一次都不会跑", level="warning", node_id=node.id)
+        if node.type == NodeType.TRANSFORM and cfg.get("mode", "expression") == "expression" \
+                and not str(cfg.get("expression") or "").strip():
+            result.add("整形节点没有填表达式", node_id=node.id)
+        # assign_to 拿到的是 stdout。脚本最后一行写个裸表达式不会输出（那是 notebook
+        # 的行为）——变量是空的，下游的循环条件一上来就不成立、成果也是空的，而整次
+        # 运行照样"成功"。开发库里的「测试 1」就是这样：修好条件之后跑通了，结果为空
+        if node.type == NodeType.CODE and cfg.get("assign_to") \
+                and (cfg.get("language") or "python").lower() == "python":
+            files = cfg.get("files")
+            source = "\n".join([str(cfg.get("code") or ""),
+                                 *(map(str, files.values()) if isinstance(files, dict) else ())])
+            if not _MAY_WRITE_STDOUT.search(source):
+                var = cfg["assign_to"]
+                result.add(
+                    f"代码把输出交给 vars.{var}，可代码里没有 print：Python 脚本最后一行的表达式"
+                    f"不会自动输出，vars.{var} 会是空的。把结果 print 出来；要交给下游一个对象，"
+                    "就 print(json.dumps(结果))", node_id=node.id,
                 )
 
     # 孤儿节点

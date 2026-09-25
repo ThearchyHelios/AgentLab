@@ -354,6 +354,37 @@ console.log('\n=== Copilot 操作流 ===')
   check('从零新建时不啰嗦，只说共几步',
     built[built.length - 1].title === '流程搭好了，共 2 步',
     built[built.length - 1].title)
+
+  // 自查：服务端用运行时同一套规则过一遍，有问题交回模型改。多出来的这段得看得见，
+  // 而且它排在"搭好了"后面，不能把那一行的"共几步"挤没了
+  const checked = mod.decodeCopilot([
+    { op: 'add_node', node: { id: 'a', type: 'input' } },
+    { op: 'add_node', node: { id: 'lp', type: 'loop' } },
+    { op: 'done', explanation: '' },
+    { op: 'check', status: 'repairing', round: 1, issues: ['「lp」循环条件写错了：表达式里没有 | 过滤器'] },
+    { op: 'heartbeat', phase: 'repairing', elapsed_ms: 3000 },
+    { op: 'update_node', id: 'lp' },
+    { op: 'check', status: 'passed', repaired: 1 },
+    { op: 'final', graph: { nodes: [{ id: 'a' }, { id: 'lp' }] } },
+  ])
+  const titles = checked.map((s) => s.title)
+  check('自查发现问题要说出来', titles.some((t) => t.includes('自查发现 1 处问题')), titles.join(' | '))
+  check('交回去改的是哪条要看得到',
+    checked.some((s) => (s.detail ?? '').includes('循环条件写错了')))
+  check('改好了要说', titles.includes('自查通过：问题已经改好'), titles.join(' | '))
+  check('自查插在后面也不挤掉"共几步"', titles.includes('流程搭好了，共 2 步'), titles.join(' | '))
+  check('自查结束后没有还在转的行', !checked.some((s) => s.status === 'running'),
+    checked.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+
+  const stuck = mod.decodeCopilot([
+    { op: 'done', explanation: '' },
+    { op: 'check', status: 'failed', issues: ['「lp」循环条件写错了', '「t」整形节点没有填表达式'] },
+    { op: 'final', graph: { nodes: [{ id: 'lp' }, { id: 't' }] } },
+  ])
+  const failedCheck = stuck.find((s) => s.kind === 'error')
+  check('改不好要明说、说清没有自动运行',
+    !!failedCheck?.title.includes('还有 2 处问题') && failedCheck.title.includes('没有自动运行'),
+    failedCheck?.title)
 }
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')

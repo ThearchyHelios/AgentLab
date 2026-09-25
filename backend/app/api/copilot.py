@@ -122,7 +122,9 @@ NODE_REFERENCE = """\
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
   assign_to 拿到的是 stdout（尾部的换行已去掉）。**stdout 是 JSON 时会解析成对象**，
   这时下游要用 {{ vars.x.字段 }} 取字段，拿它比字符串永远不成立。要判一个简单结论，
-  就 print 一个短字符串（比如 print('ok')）并让下游比它
+  就 print 一个短字符串（比如 print('ok')）并让下游比它。
+  **结果必须 print 出来**：脚本最后一行写个裸表达式（state、{"a": 1}）不会输出，那是
+  notebook 的行为——assign_to 会拿到空值。要交给下游一个对象，就 print(json.dumps(结果))
 - branch：条件分支。config: {mode: expression|llm, cases:[{key, condition, label}]}
 - loop：循环。config: {mode: foreach|while, items, item_var, condition, max_iterations}
 - retrieve：知识库检索。config: {query, collection, limit, assign_to}
@@ -141,12 +143,24 @@ NODE_REFERENCE = """\
   "deepseek-chat"）会得到 401 invalid_model，整个节点跑不起来。
 - 只有用户在需求里明确点名了某个模型，才把他说的那个字符串原样填进去。
 
-模板语法（在任意字符串里用）：
+模板语法（在 prompt、template、args、message、query 这类**普通文本字段**里用）：
 - {{ input.字段名 }}        入口输入
 - {{ vars.变量名 }}         某节点 assign_to 写入的变量
 - {{ nodes.节点id.text }}   某节点的输出
 - {{ last_message }}        最近一条消息文本
 - 过滤器：{{ vars.x | json }}
+
+**表达式字段不是模板，不要套 {{ }}**：branch 的 cases[].condition、loop（while 模式）的
+condition、transform（expression 模式）的 expression、口径卡的 metrics[].expression、任意节点的
+skip_if。这些字段按受限的 Python 表达式求值，变量直接写路径：
+- 对：vars.gate == "ok"            错：{{ vars.gate }} == "ok"（会被当成集合，跑不起来）
+- 对：vars.state.count <= 1000     错：'{{ vars.x }}' == "ok"（引号里的模板不会渲染，永远不成立）
+- 对：len(vars.items) > 0          错：{{ vars.items | length }} > 0（表达式里没有 | 过滤器）
+- 能用：and / or / not、== != < <= > >=、in [列表]、x if 条件 else y；函数只有 len str int float
+  round min max sum any all lower upper contains startswith endswith matches get
+- 字符串加引号；判断相等写 ==；"是不是其中之一"用列表 x in ['a', 'b']，不要用 {…}
+
+图搭完会用和运行时同一套规则自查：表达式写错、必填没填、引用了不存在的变量，都会被打回来让你改。
 
 **引用必须有来源**（这条会被校验，不满足整张图跑不起来）：
 - 写 {{ vars.X }} 之前，必须有某个节点的 config.assign_to 正好是 "X"
@@ -640,14 +654,13 @@ async def _iter_ops(model: Any, messages: list[Any]):
 _HEARTBEAT_SECONDS = 3.0
 
 
-async def _with_heartbeat(source: Any):
+async def _with_heartbeat(source: Any, phase: str = "planning"):
     """模型沉默时按拍补心跳，让前端能显示阶段和已用时长。
 
     必须在这一层做而不是在 _iter_ops 里判断时间差：模型不吐 chunk 时那个
     async for 的循环体根本不执行，压根轮不到检查。
     """
     started = time.monotonic()
-    phase = "planning"
     iterator = source.__aiter__()
     while True:
         pending = asyncio.ensure_future(iterator.__anext__())
@@ -673,6 +686,42 @@ async def _with_heartbeat(source: Any):
                 "phase": phase,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
+
+
+#: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是
+#: 需求本身有歧义，该让人看了，而不是继续替他烧钱
+_SELF_CHECK_ROUNDS = 2
+
+
+def _sse(obj: dict[str, Any]) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _blocking_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]]) -> list[Any] | None:
+    """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。"""
+    try:
+        spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
+    except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
+        return None
+    return [i for i in validate_graph(spec).issues if i.level == "error"]
+
+
+def _issue_line(issue: Any) -> str:
+    return f"「{issue.node_id}」{issue.message}" if issue.node_id else issue.message
+
+
+def _repair_request(
+    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[Any],
+) -> str:
+    graph = {"nodes": list(nodes.values()), "edges": edges}
+    return (
+        "这是你刚搭好的工作流：\n"
+        f"{json.dumps(_slim(graph), ensure_ascii=False, indent=2)}\n\n"
+        "上线前自查（和真正运行时同一套规则）发现下面这些问题，不改的话这张图跑不起来：\n"
+        + "\n".join(f"- {_issue_line(i)}" for i in errors)
+        + "\n\n只修这些问题，别的不要动。用操作流输出修正：改节点用 update_node"
+          "（config 整体替换，要带上这个节点完整的 config）；缺节点、缺边就补上。最后一行输出 done。"
+    )
 
 
 @router.post("/generate-stream")
@@ -783,6 +832,40 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             ]
             for op in seen_ops:
                 _apply_op(nodes, edges, op)
+
+        # 自查：按运行时同一套规则把图过一遍，挡住运行的问题交回模型改，改完再查。
+        # 以前这些问题照样交付、照样自动开跑——跑到那一步才炸（开发库里四次运行死在
+        # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
+        repaired = 0
+        for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
+            errors = _blocking_issues(nodes, edges)
+            if not errors:
+                break
+            yield _sse({"op": "check", "status": "repairing", "round": round_no,
+                        "issues": [_issue_line(i) for i in errors]})
+            fix = [("system", system), ("human", _repair_request(nodes, edges, errors))]
+            try:
+                async for op in _with_heartbeat(_iter_ops(model, fix), phase="repairing"):
+                    kind = op.get("op")
+                    if kind in ("thinking", "heartbeat"):
+                        yield _sse(op)
+                    # plan / done 是修补轮自己的开场和收尾，不是新方案，不覆盖原来的说明
+                    elif kind not in ("plan", "done", "reply") and _apply_op(nodes, edges, op):
+                        yield _sse(op)
+            except Exception as e:  # noqa: BLE001 - 修不成就照实交付，下面列出剩下的问题
+                yield _sse({"op": "check", "status": "error",
+                            "message": f"自查修正没跑成：{type(e).__name__}: {e}"})
+                break
+            repaired = round_no
+        remaining = _blocking_issues(nodes, edges)
+        if remaining:
+            # 改不好也照实交付、列出问题，但不自动运行：明知跑不起来的图，开跑只会
+            # 在半路报一个用户看不懂的错
+            autorun = False
+            yield _sse({"op": "check", "status": "failed",
+                        "issues": [_issue_line(i) for i in remaining]})
+        elif remaining is not None:
+            yield _sse({"op": "check", "status": "passed", "repaired": repaired})
 
         # 收尾：排版 + 校验，把最终图整体交付
         try:

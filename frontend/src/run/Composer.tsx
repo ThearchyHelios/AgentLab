@@ -284,4 +284,5 @@ export const PHASE_TEXT: Record<string, string> = {
   building: '正在放置节点…',
   wiring: '正在连接数据流…',
   finalizing: '正在排版和校验…',
+  repairing: '自查发现问题，正在修正…',
 }

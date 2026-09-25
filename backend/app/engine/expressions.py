@@ -176,9 +176,105 @@ _SAFE_FUNCS: dict[str, Any] = {
 
 _MAX_NODES = 200
 
+#: 表达式能引用的根名字，就是 state.template_context 的那几个键（有测试钉住两边一致）。
+#: 不在这里、也不是白名单函数或 true/false/null 的名字，运行时一律取到 None——
+#: `gate == "ok"` 这种漏写了 vars. 的条件永远不成立，而且不报错
+EXPRESSION_ROOTS = frozenset(
+    {"input", "nodes", "vars", "output", "loops", "usage", "messages", "last_message"}
+)
+_LITERAL_NAMES = frozenset({"true", "True", "false", "False", "null", "None"})
+
+_ALLOWED_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression, ast.Constant, ast.Name, ast.Load, ast.Attribute, ast.Subscript,
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.IfExp,
+    ast.Call, ast.keyword, ast.List, ast.Tuple, ast.Dict,
+    *_BIN_OPS, *_UNARY_OPS, *_CMP_OPS,
+)
+_NODE_NAMES = {
+    "ListComp": "列表推导式", "SetComp": "集合推导式", "DictComp": "字典推导式",
+    "GeneratorExp": "生成器表达式", "Lambda": "lambda", "JoinedStr": "f-string",
+    "NamedExpr": ":=", "Slice": "切片 a[i:j]", "Starred": "* 展开", "Await": "await",
+}
+
 
 class ExpressionError(ValueError):
     pass
+
+
+class _Unbrace(ast.NodeTransformer):
+    """`{{ vars.x }}` 在 Python 里是"装着一个集合的集合"。表达式不允许集合，所以
+    它在表达式里只可能是一种笔误：把模板写法带了进来——模型和人都这么写（开发库
+    里四次运行就死在"表达式里不允许出现 Set"）。意思毫无歧义，按 vars.x 理解。
+
+    在语法树上剥，不在文本上剥：字符串字面量里的花括号原样保留。
+    """
+
+    def __init__(self) -> None:
+        self.found: list[str] = []
+
+    def visit_Set(self, node: ast.Set) -> ast.AST:
+        self.generic_visit(node)
+        inner = node.elts[0] if len(node.elts) == 1 else None
+        if isinstance(inner, ast.Set) and len(inner.elts) == 1:
+            self.found.append(ast.unparse(inner.elts[0]))
+            return inner.elts[0]
+        return node
+
+
+def _check_static(tree: ast.Expression) -> list[str]:
+    """不求值，只看结构：违规直接抛 ExpressionError，返回不认识的名字（留给提示用）。
+
+    运行时求值会短路（and/or、三元只走一边），没走到的那一半写错了也发现不了；
+    画布校验和 Copilot 自查要的是"整条表达式都能跑"，所以得把整棵树走一遍。
+    """
+    unknown: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and type(node.op) not in _BIN_OPS:
+            if isinstance(node.op, ast.BitOr):
+                raise ExpressionError(
+                    "表达式里没有 | 过滤器（那是模板的写法）：取长度写 len(x)，大小写写 upper(x) / lower(x)"
+                )
+            raise ExpressionError(f"不支持的运算符 {type(node.op).__name__}")
+        if not isinstance(node, _ALLOWED_NODES):
+            if isinstance(node, ast.Set):
+                raise ExpressionError("表达式里不支持集合 {…}：要判断是不是其中之一，用列表 x in ['a', 'b']")
+            name = type(node).__name__
+            raise ExpressionError(f"表达式里不允许出现 {_NODE_NAMES.get(name, name)}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCS:
+                called = node.func.id if isinstance(node.func, ast.Name) else ast.unparse(node.func)
+                raise ExpressionError(f"不认识的函数 {called}()，能用的只有：{'、'.join(_SAFE_FUNCS)}")
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise ExpressionError("不允许访问私有属性")
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and _TEMPLATE_RE.search(node.value)):
+            raise ExpressionError(
+                f"字符串 {node.value!r} 里的 {{{{ }}}} 不会被渲染——表达式不过模板，直接写路径，比如 vars.x"
+            )
+        elif (isinstance(node, ast.Name) and node.id not in EXPRESSION_ROOTS
+              and node.id not in _SAFE_FUNCS and node.id not in _LITERAL_NAMES):
+            unknown.append(node.id)
+    return list(dict.fromkeys(unknown))
+
+
+def parse_expression(expr: str) -> tuple[ast.Expression, list[str], list[str]]:
+    """解析 + 静态检查：(语法树, 被剥掉的 {{ }}, 不认识的名字)。结构违规抛 ExpressionError。
+
+    运行时求值、画布校验、Copilot 自查都走这一个入口——三处各写一套规则的话，
+    迟早出现"校验说能跑、跑起来报错"。
+    """
+    text = (expr or "").strip()
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as e:
+        hint = "（判断相等要写 ==）" if re.search(r"(?<![=!<>])=(?!=)", text) else ""
+        raise ExpressionError(f"表达式语法错误：{e.msg}{hint}") from e
+    unbrace = _Unbrace()
+    tree = ast.fix_missing_locations(unbrace.visit(tree))
+    if sum(1 for _ in ast.walk(tree)) > _MAX_NODES:
+        raise ExpressionError("表达式太复杂")
+    unknown = _check_static(tree)
+    return tree, unbrace.found, unknown
 
 
 def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
@@ -190,13 +286,7 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
     expr = (expr or "").strip()
     if not expr:
         return None
-    try:
-        tree = ast.parse(expr, mode="eval")
-    except SyntaxError as e:
-        raise ExpressionError(f"表达式语法错误：{e.msg}") from e
-
-    if sum(1 for _ in ast.walk(tree)) > _MAX_NODES:
-        raise ExpressionError("表达式太复杂")
+    tree, _, _ = parse_expression(expr)
 
     def _eval(node: ast.AST) -> Any:
         if isinstance(node, ast.Expression):

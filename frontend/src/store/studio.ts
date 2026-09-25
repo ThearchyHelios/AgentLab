@@ -156,7 +156,7 @@ interface StudioState {
     error: string
     model: string
     // 从提交到第一个操作之间有 5~30 秒，得让用户看见这段在发生什么
-    phase: 'connecting' | 'planning' | 'building' | 'wiring' | 'finalizing' | ''
+    phase: 'connecting' | 'planning' | 'building' | 'wiring' | 'finalizing' | 'repairing' | ''
     thinking: string        // 模型的思考原文（只有支持 thinking 的模型有）
     elapsedMs: number
     lastInstruction: string // 失败后"用同一需求重试"要用
@@ -559,6 +559,14 @@ export const useStudio = create<StudioState>((set, get) => ({
             break
           case 'plan':
             set({ copilot: { ...s.copilot, phase: 'planning', lastOp: op.summary ?? '规划中' } })
+            break
+          case 'check':
+            // 服务端自查：用运行时同一套规则过一遍，有问题交回模型改
+            set({ copilot: { ...s.copilot,
+              phase: op.status === 'repairing' ? 'repairing' : s.copilot.phase,
+              lastOp: op.status === 'repairing'
+                ? `自查发现 ${(op.issues ?? []).length} 处问题，正在修正`
+                : op.status === 'passed' ? '自查通过' : '自查后仍有问题，先别急着运行' } })
             break
           case 'add_node': {
             const n = op.node
