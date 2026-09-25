@@ -437,12 +437,17 @@ agent 侧同样会收到实情，并被告知可直接查询 `information_schema
 单次模型调用默认 300 秒没有输出即超时。多半是模型或工具没有响应；确实需要更久，调大
 `AGENTLAB_MAX_RUN_SECONDS` / `AGENTLAB_MODEL_TIMEOUT_SECONDS`。设置页「运行环境」里能看到当前值。
 
+**运行报「走满了 N 步还没跑完」。** 循环按自己 `max_iterations` 声明的轮数另算步数预算，
+配多少轮就能跑多少轮，不受全局上限约束。走到这条报错的，多半是分支连回上游、却没有
+loop 节点给它定轮数上限的环：用 loop 节点包住它。确实需要更多步，调大
+`AGENTLAB_MAX_GRAPH_STEPS`（默认 200）。
+
 ---
 
 ## 开发与验证
 
 ```bash
-# 后端：292 个测试
+# 后端：470 个测试
 cd backend && pytest tests
 
 # 前端类型检查

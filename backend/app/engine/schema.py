@@ -211,6 +211,51 @@ def back_edges(
     return back
 
 
+def loop_steps(spec: GraphSpec) -> int:
+    """图里的循环按各自声明的轮数跑满，最多要走多少步（LangGraph 的 superstep）。
+
+    整次运行的步数上限（max_graph_steps）防的是没人把关的环；loop 节点自己带着
+    max_iterations，那是作者明说的轮数上限。以前两者打架时全局值悄悄赢：「测试 1」
+    的 while 循环配了 1005 轮、每轮 2 步，跑到 100 轮上下就被 GraphRecursionError
+    掐断——校验通过，跑到一半才死。runner 把这个数加在全局上限之上。
+
+    取上界不求精确：一个节点最多跑 Π(包住它的各层循环的 max_iterations + 1) 次，
+    逐个加起来。一步至少跑一个节点，所以步数只会比这少。
+    """
+    loops = [n for n in spec.nodes if n.type == NodeType.LOOP]
+    if not loops:
+        return 0
+    succ: dict[str, list[str]] = defaultdict(list)
+    pred: dict[str, list[str]] = defaultdict(list)
+    for e in spec.edges:
+        succ[e.source].append(e.target)
+        pred[e.target].append(e.source)
+
+    def reach(starts: Iterable[str], step: dict[str, list[str]], avoid: str) -> set[str]:
+        seen: set[str] = set()
+        stack = [s for s in starts if s != avoid]
+        while stack:
+            n = stack.pop()
+            if n not in seen:
+                seen.add(n)
+                stack.extend(x for x in step[n] if x != avoid)
+        return seen
+
+    runs: dict[str, int] = defaultdict(lambda: 1)
+    for loop in loops:
+        try:
+            cap = int(loop.config.get("max_iterations", 10) or 10)
+        except (TypeError, ValueError):
+            cap = 10    # 运行到这个节点时同样会报错，这里不替它报
+        # 循环体 = 从 body 出口出发、不经过循环节点本身、又能绕回它的那些节点。
+        # 没标出口的边路由时按 default 走，body 也会走它
+        entries = [e.target for e in spec.outgoing(loop.id) if e.sourceHandle != "done"]
+        body = reach(entries, succ, loop.id) & reach(pred[loop.id], pred, loop.id)
+        for n in body | {loop.id}:
+            runs[n] *= max(cap, 0) + 1
+    return sum(runs.values())
+
+
 def expression_fields(node: GraphNode) -> list[tuple[str, str]]:
     """这个节点上按表达式求值的字段：(给人看的名字, 原文)。
 

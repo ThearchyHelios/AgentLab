@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 from langgraph.func import task
 
 from app.core.config import settings
@@ -367,7 +368,7 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     每一步；但它有独立的状态，不会污染父图的变量池。
     """
     from app.engine.compiler import compile_graph  # 延迟导入，避免循环依赖
-    from app.engine.schema import GraphSpec
+    from app.engine.schema import GraphSpec, loop_steps
 
     if ctx.run.depth >= _MAX_DEPTH:
         raise NodeError(ctx.node.id, f"子图嵌套超过 {_MAX_DEPTH} 层，已阻止")
@@ -429,19 +430,28 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     compiled = compile_graph(sub_spec, sub_run)
     # 子图不带 checkpointer：它的断点由父图的 checkpoint 统一承载
     app = compiled.compile()
-    result_state = await app.ainvoke(
-        {
-            "input": sub_input,
-            "vars": sub_input,
-            "nodes": {},
-            "output": {},
-            "messages": [],
-            "usage": {},
-            "trail": [],
-            "loops": {},
-        },
-        {"recursion_limit": settings.max_graph_steps},
-    )
+    limit = settings.max_graph_steps + loop_steps(sub_spec)
+    try:
+        result_state = await app.ainvoke(
+            {
+                "input": sub_input,
+                "vars": sub_input,
+                "nodes": {},
+                "output": {},
+                "messages": [],
+                "usage": {},
+                "trail": [],
+                "loops": {},
+            },
+            {"recursion_limit": limit},
+        )
+    except GraphRecursionError as e:
+        # 不接住的话，外层包装成 NodeError 时带的是 LangGraph 的英文原文
+        raise NodeError(
+            ctx.node.id,
+            f"子图「{workflow.name}」走满了 {limit} 步还没跑完，已中止。多半是子图里有个环"
+            "在空转：分支连回了上游、却没有 loop 节点给它定轮数上限",
+        ) from e
 
     output = result_state.get("output") or {}
     result = {

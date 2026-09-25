@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from sqlalchemy import select, update
 
@@ -19,7 +20,7 @@ from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
-from app.engine.schema import GraphSpec, topology_of, validate_graph
+from app.engine.schema import GraphSpec, loop_steps, topology_of, validate_graph
 
 logger = logging.getLogger(__name__)
 
@@ -466,9 +467,11 @@ class RunManager:
                     collection=collection,
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
+                # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
+                extra_steps = loop_steps(spec)
                 config = {
                     "configurable": {"thread_id": run_id},
-                    "recursion_limit": settings.max_graph_steps,
+                    "recursion_limit": settings.max_graph_steps + extra_steps,
                 }
 
                 interrupted = False
@@ -519,6 +522,18 @@ class RunManager:
                 else:   # 别处抛的超时，不是这道上限——按普通失败说
                     error = f"{type(e).__name__}: {e}"
                     logger.exception("run %s 失败", run_id)
+                await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
+            except GraphRecursionError:
+                status = "failed"
+                # LangGraph 的原文是英文，还叫人去调 recursion_limit——用户碰不到那个键。
+                # 循环的轮数已经另算了预算，走到这里的多半是不归 loop 节点管的环
+                error = (
+                    f"走满了 {settings.max_graph_steps + extra_steps} 步还没跑完，已中止"
+                    f"（图最大步数 {settings.max_graph_steps}"
+                    + (f"，另按循环轮数预留了 {extra_steps} 步" if extra_steps else "") + "）。"
+                    "多半是有个环在空转：分支连回了上游、却没有 loop 节点给它定轮数上限。"
+                    "用 loop 节点包住它；确实需要这么多步，调大 AGENTLAB_MAX_GRAPH_STEPS"
+                )
                 await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             except Exception as e:  # noqa: BLE001
                 status = "failed"
