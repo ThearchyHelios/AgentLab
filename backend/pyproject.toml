@@ -8,18 +8,24 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "sqlalchemy[asyncio]>=2.0.36",
-    "aiosqlite>=0.20",
+    # db/base.py 给 aiosqlite 0.22 的 stop() 打了补丁（并发调用会死锁），SQLAlchemy 连接池
+    # 强制 terminate 时也会走到它。两个一起卡住小版本，换版本前先确认补丁还成立
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "aiosqlite>=0.22.1,<0.23",
     "greenlet>=3.1",
     "httpx>=0.28",
     "python-multipart>=0.0.17",
-    "langgraph",
-    "langgraph-checkpoint-sqlite",
-    "langchain-core",
-    "langchain-anthropic",
-    "langchain-openai",
-    "langchain-mcp-adapters",
-    "mcp",
+    # 引擎直接依赖这一族的运行时语义：断点格式、interrupt / resume、流式事件、
+    # thinking 块。小版本也改过行为（resume 发 Command 在当前版本会直接崩），
+    # 所以上限卡到下一个小版本——升级要主动改这里、重新锁、跑一遍测试。
+    # 精确版本在 requirements.lock 里
+    "langgraph>=1.2.11,<1.3",
+    "langgraph-checkpoint-sqlite>=3.1.1,<3.2",
+    "langchain-core>=1.6.3,<1.7",
+    "langchain-anthropic>=1.7.2,<1.8",
+    "langchain-openai>=1.6.2,<1.7",
+    "langchain-mcp-adapters>=0.3.2,<0.4",
+    "mcp>=1.30,<2",
     "numpy>=2.0",
     "jsonschema>=4.23",
     "beautifulsoup4>=4.12",

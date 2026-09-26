@@ -34,6 +34,8 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 
 `dev.sh` 自动定位 `agentlab` conda 环境；环境不存在时依 `environment.yml` 创建。
 如需使用其他环境名，设置 `AGENTLAB_CONDA_ENV`。
+后端依赖的版本以 `backend/requirements.lock` 为准，装到的是测试跑过的那一套，
+不是当天的最新版（见[依赖与锁文件](#依赖与锁文件)）。
 
 服务启动于 http://localhost:5273 。
 
@@ -399,12 +401,35 @@ conda run -n agentlab python -c "import asyncio,microsandbox as m; asyncio.run(m
 
 ### 可选依赖
 
+`environment.yml` 默认已经全部装上。单独补装时带上锁文件，版本才和测过的一致：
+
 ```bash
-pip install -e 'backend[docs]'     # PDF / Word / PowerPoint / Excel 解析
-pip install -e 'backend[db]'       # MySQL / PostgreSQL / Oracle 驱动
-pip install -e 'backend[microvm]'  # microVM 沙箱
-pip install -e 'backend[dev]'      # pytest
+pip install -e 'backend[docs]' -c backend/requirements.lock     # PDF / Word / PowerPoint / Excel 解析
+pip install -e 'backend[db]' -c backend/requirements.lock       # MySQL / PostgreSQL / Oracle 驱动
+pip install -e 'backend[microvm]' -c backend/requirements.lock  # microVM 沙箱
+pip install -e 'backend[dev]' -c backend/requirements.lock      # pytest
 ```
+
+### 依赖与锁文件
+
+`backend/pyproject.toml` 写版本范围，`backend/requirements.lock` 写精确版本：后端全部
+依赖（含间接依赖、全部 extras）锁在测试跑过的那一套上，跨平台通用。`environment.yml`
+装包时以它为约束，所以换一台机器装到的也是同一套。
+
+LangGraph / LangChain 一族在 `pyproject.toml` 里只放行到下一个小版本：引擎直接依赖
+它们的断点格式、interrupt / resume 和流式事件，这些在小版本里也改过行为。aiosqlite
+与 SQLAlchemy 同理——`db/base.py` 给 aiosqlite 打了补丁，连接池断开连接时会走到它。
+
+升级依赖要主动做，改完跑一遍测试再提交：
+
+```bash
+./scripts/lock-deps.sh --upgrade-package langgraph   # 升一个包（连带它必须跟着动的）
+./scripts/lock-deps.sh --upgrade                     # 全部升到 pyproject 允许的最新
+./scripts/lock-deps.sh                               # 只加了新依赖：补上它，已锁的不动
+pip install -e 'backend[microvm,dev,db,docs]' -c backend/requirements.lock   # 装到当前环境
+```
+
+重新生成锁文件需要 [uv](https://docs.astral.sh/uv/)；装依赖本身只用 pip。
 
 ### 数据位置
 

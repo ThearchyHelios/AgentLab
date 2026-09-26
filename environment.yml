@@ -12,6 +12,9 @@ dependencies:
   - python=3.12
   - pip
   - pip:
+      # 版本以锁文件为准：装到的就是测过的那一套，不是当天的最新版。
+      # 升级依赖见 scripts/lock-deps.sh
+      - -c backend/requirements.lock
       # [microvm] 带上独立内核的沙箱后端（约 35MB wheel，首次运行还要下载
       # 约 50MB 运行时，外加一次 OCI 镜像拉取）。不需要就把方括号去掉，
       # 沙箱会退回 Seatbelt —— 代价是内存限额在 macOS 上限不住。
