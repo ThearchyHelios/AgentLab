@@ -16,6 +16,7 @@ from app.db.base import SessionLocal
 from app.db.models import Skill
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.errors import describe_exception
 from app.engine.state import GraphState, message_text, template_context, thinking_text
 from app.providers import catalog
 from app.providers.factory import (
@@ -140,7 +141,8 @@ def explain_model_error(exc: Exception, model_id: str) -> str:
         )
     if "insufficient" in text.lower() or "quota" in text.lower():
         return f"模型「{model_id}」的额度用完了：{text[:200]}"
-    return f"调用模型「{model_id}」失败：{type(exc).__name__}: {text[:300]}"
+    return (f"调用模型「{model_id}」失败：{describe_exception(exc)}。"
+            "稍后重试；反复失败就去「设置 → 模型接入」测一下这个模型")
 
 
 async def _invoke_streaming(
@@ -231,7 +233,11 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 模型压根不存在也会走到这里，那不是"结构化输出失败"
             if "invalid_model" in str(e) or "model does not exist" in str(e).lower():
                 raise NodeError(ctx.node.id, explain_model_error(e, model_id)) from e
-            raise NodeError(ctx.node.id, f"结构化输出失败：{type(e).__name__}: {e}") from e
+            raise NodeError(
+                ctx.node.id,
+                f"模型没能按「结构化输出 Schema」给出结果：{describe_exception(e)}。"
+                "检查 Schema 是否写对，或者换一个支持结构化输出的模型",
+            ) from e
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
         response: BaseMessage = AIMessage(content=output["text"])
@@ -314,7 +320,7 @@ def split_tool_calls(
 
 
 def _needs_approval(ctx: NodeContext, tool: BaseTool, args: dict[str, Any]) -> bool:
-    mode = ctx.cfg("approval", "dangerous")  # never | dangerous | always
+    mode = ctx.approval_mode()  # never | dangerous | always
     if mode == "always":
         return True
     if mode == "never":
@@ -347,17 +353,30 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     total_usage: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
     transcript: list[dict[str, Any]] = []
 
+    def _report(response: BaseMessage, started: float) -> None:
+        # 每次模型调用一条 llm.end：用量在节点跑的过程中就看得到。发在 task 里面，
+        # 节点因审批重放时 task 结果取自 checkpoint，这条不会重复
+        ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id,
+                 duration_ms=int((time.perf_counter() - started) * 1000),
+                 **_usage_of(response, model_id))
+
     # @task 的返回值会进 checkpoint：人工审批导致节点重放时，
     # 之前已经完成的模型调用和工具执行不会重跑，也就不会重复计费。
     @task
     async def llm_step(step: int, payload: list[BaseMessage]) -> BaseMessage:
-        return await _invoke_streaming(model, payload, ctx, model_id)
+        started = time.perf_counter()
+        response = await _invoke_streaming(model, payload, ctx, model_id)
+        _report(response, started)
+        return response
 
     @task
     async def settle_step(payload: list[BaseMessage]) -> BaseMessage:
         # 用 base_model 而不是上面那个绑过工具的 model：收尾轮必须在**结构上**
         # 发不出工具调用，靠提示词说"别调工具"是约束不住的
-        return await _invoke_streaming(base_model, payload, ctx, model_id)
+        started = time.perf_counter()
+        response = await _invoke_streaming(base_model, payload, ctx, model_id)
+        _report(response, started)
+        return response
 
     @task
     async def tool_step(step: int, name: str, args: dict[str, Any]) -> str:
@@ -429,7 +448,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 )
                 verdict = read_decision(decision)
                 note = verdict.note
-                ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved, note=note)
+                ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved, note=note,
+                         actor=ctx.actor())
                 if not verdict.approved:
                     messages.append(
                         ToolMessage(
@@ -448,7 +468,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 content = await tool_step(step, name, args)
                 ok = True
             except Exception as e:  # noqa: BLE001 - 工具失败要喂回模型，让它自己纠错
-                content = f"工具执行失败：{type(e).__name__}: {e}"
+                content = f"工具执行失败：{describe_exception(e)}"
                 if isinstance(e, TypeError) and schema is not None:
                     # 签名对不上还能走到这儿，说明 schema 和函数本身不一致（工具的 bug）。
                     # 模型改不了这个，但把参数表摊开至少让它别在同一个地方反复试
@@ -507,7 +527,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             settled = message_text(response).strip()
         except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有成果一起赔进去
             ctx.emit(EventType.LOG, level="warn",
-                     message=f"收尾轮没跑成：{type(e).__name__}: {e}", code="settle_failed")
+                     message=f"收尾轮没跑成：{describe_exception(e)}", code="settle_failed")
 
         if settled:
             final_text = settled

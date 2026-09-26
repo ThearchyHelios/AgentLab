@@ -24,6 +24,9 @@ class RunContext:
     depth: int = 0
     memory_scope: str = "default"
     collection: str = "default"
+    #: 工具审批策略的全局默认（设置里的「危险工具默认需要人工确认」）。节点和图级
+    #: defaults 都没配 approval 时才用它；为空表示老运行，按节点各自的缺省走
+    approval_default: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -71,6 +74,18 @@ class NodeContext:
         if value in (None, ""):
             return self.run.spec.defaults.get(key, default)
         return value
+
+    def approval_mode(self, fallback: str = "dangerous") -> str:
+        """工具审批策略：节点 > 图级 defaults > 全局设置 > 节点类型自己的缺省。
+
+        审批恢复时节点会整个重放、再算一遍要不要问人，所以这里只能取决于
+        这次运行固定下来的东西——全局默认在发起时就定死在 RunContext 上了。
+        """
+        return self.cfg("approval") or self.run.approval_default or fallback
+
+    def actor(self) -> str | None:
+        """回复这个节点审批的人（设置里的署名）。没署名、或者不是恢复出来的，就是 None。"""
+        return (self.run.extra.get("actors") or {}).get(self.node.id)
 
 
 class NodeError(RuntimeError):

@@ -10,6 +10,7 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.errors import describe_exception, raw_detail
 from app.engine.state import GraphState
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
@@ -55,7 +56,8 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise NodeError(ctx.node.id, "工具参数必须是对象")
 
-    approval = ctx.cfg("approval", "dangerous")
+    # 节点没配时取全局设置（「危险工具默认需要人工确认」），见 NodeContext.approval_mode
+    approval = ctx.approval_mode()
     if approval == "always" or (approval == "dangerous" and await _is_dangerous(name, args, ctx)):
         ctx.emit(EventType.HUMAN_REQUESTED, mode="approve", tool=name, args=args,
                  title=f"是否允许调用 {name}？")
@@ -66,7 +68,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if decision.args is not None:
             args = decision.args
         ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved,
-                 note=decision.note)
+                 note=decision.note, actor=ctx.actor())
         if not decision.approved:
             raise NodeError(ctx.node.id, f"用户拒绝执行工具 {name}"
                             + (f"：{decision.note}" if decision.note else ""))
@@ -84,7 +86,9 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         async with SessionLocal() as session:
             result = await call_tool(name, args, _tool_ctx(ctx), session=session, on_fix=_fixed)
     except KeyError as e:
-        raise NodeError(ctx.node.id, str(e)) from e
+        # str(KeyError) 是带引号的 repr，直接拼会多出一对引号
+        reason = e.args[0] if e.args else f"找不到工具 {name!r}"
+        raise NodeError(ctx.node.id, f"{reason}。工具可能被删除或改了名字，在节点里重新选一个") from e
     except ToolArgsError as e:
         # 参数对不上且没有唯一候选可纠。报错里已经写清楚该填什么，
         # 不要再套一层 "执行失败：" 把它推远
@@ -93,13 +97,19 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             raise NodeError(ctx.node.id, f"工具 {name}：{e}") from e
         result = {"error": str(e)}
     except Exception as e:  # noqa: BLE001
-        ctx.emit(EventType.TOOL_ERROR, tool=name, error=f"{type(e).__name__}: {e}")
+        # 首行写原因、不带异常类名和内部符号；原始异常进 detail 给排查的人
+        reason = describe_exception(e)
+        ctx.emit(EventType.TOOL_ERROR, tool=name, error=reason, detail=raw_detail(e))
         if ctx.cfg("fail_fast", True):
-            raise NodeError(ctx.node.id, f"工具 {name} 执行失败：{e}") from e
-        result = {"error": f"{type(e).__name__}: {e}"}
+            raise NodeError(
+                ctx.node.id,
+                f"工具 {name} 执行失败：{reason}。检查节点里填的参数；参数没问题的话，"
+                "是这个工具本身出了错，换一个工具或联系管理员",
+            ) from e
+        result = {"error": reason, "detail": raw_detail(e)}
 
     elapsed = int((time.perf_counter() - started) * 1000)
-    # 取数快照：query（args）和结果集一起进工件库，正式出具时数字回指的就是它
+    # 取数快照：query（args）和结果集一起进工件库，完整出具时数字回指的就是它
     from app.core.artifact_store import put_json
 
     try:
@@ -142,7 +152,8 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         ))
         if decision.code:
             code = decision.code  # 允许人工改完再跑
-        ctx.emit(EventType.HUMAN_RESOLVED, approved=decision.approved, note=decision.note)
+        ctx.emit(EventType.HUMAN_RESOLVED, approved=decision.approved, note=decision.note,
+                 actor=ctx.actor())
         if not decision.approved:
             raise NodeError(ctx.node.id, "用户拒绝执行代码"
                             + (f"：{decision.note}" if decision.note else ""))

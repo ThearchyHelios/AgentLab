@@ -130,7 +130,7 @@ def _detail(row: Conversation, turns: list[ConversationTurn]) -> ConversationDet
 async def _get(session: AsyncSession, conversation_id: str) -> Conversation:
     row = await session.get(Conversation, conversation_id)
     if not row:
-        raise HTTPException(404, f"会话 {conversation_id} 不存在")
+        raise HTTPException(404, "这个对话不存在，可能已经被删了")
     return row
 
 
@@ -287,7 +287,7 @@ async def patch_turn(
 ) -> TurnOut:
     turn = await session.get(ConversationTurn, turn_id)
     if not turn or turn.conversation_id != conversation_id:
-        raise HTTPException(404, f"轮次 {turn_id} 不存在")
+        raise HTTPException(404, "这一轮对话不存在，可能已经被删了")
 
     for field in (
         "question", "answer", "explanation", "graph", "run_id", "status", "error", "review",

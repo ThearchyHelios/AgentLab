@@ -1,0 +1,94 @@
+/* 记录页自己的几个时刻。index.css 在第二波归节点卡，这里只放记录页用得到、
+   别处用不着的；全部由真实事件触发、只播一次（核对进行中那道扫描线随请求
+   结束而消失），没有常驻动效。只动 transform / opacity：颜色和阴影画在伪元素
+   上，动的是伪元素的不透明度。 */
+
+/* 核对进行中：凭证条底边一道细线扫过去。时长按事件条数估，扫完就停在末端，
+   不来回跑——它说的是"正在逐条重算"，不是"在忙" */
+.runs-verify-scan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  overflow: hidden;
+  pointer-events: none;
+}
+.runs-verify-scan::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--accent) 40%, var(--accent));
+  transform-origin: left center;
+  transform: scaleX(0);
+  animation: runs-scan var(--scan-ms, 900ms) var(--ease-out) forwards;
+}
+@keyframes runs-scan {
+  to { transform: scaleX(1); }
+}
+
+/* 核对结果落定：印章按下去的那一下。只在点了「核对」拿到结果时播，切回这条
+   运行时读的是记下来的结果，不再播 */
+.runs-stamp {
+  animation: runs-stamp var(--dur-slow) var(--ease-out) 1 both;
+}
+@keyframes runs-stamp {
+  0% { opacity: 0; transform: scale(1.35); }
+  60% { opacity: 1; transform: scale(0.96); }
+  100% { opacity: 1; transform: none; }
+}
+
+/* 列表里某一行的状态刚刚变了（跑完、失败、停到审批上）：铺一层新状态的颜色，
+   再退掉。这一层是行里的一个 span（行本身是 relative），按变化次数换 key：
+   同一行又变了一次就重新挂载、重新播 */
+.runs-row-changed {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--row-flash, var(--accent)) 16%, transparent);
+  opacity: 0;
+  animation: runs-fade-out 1.6s var(--ease-out) 1 both;
+}
+@keyframes runs-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* 跳到审批卡：卡片内圈亮一下，告诉人"就是这张"。卡片外壳是 relative +
+   overflow-hidden，所以描边画在里面 */
+.runs-focus-ring::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--warn) 70%, transparent);
+  opacity: 0;
+  animation: runs-focus 1.4s var(--ease-out) 1 both;
+}
+@keyframes runs-focus {
+  0% { opacity: 0; }
+  20% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 扫描线停了就等于没有：直接不画，凭证条上的「核对中…」文字照样在 */
+  .runs-verify-scan {
+    display: none;
+  }
+  .runs-stamp {
+    animation: none;
+  }
+  /* 闪一下的底色停住就成了常驻的高亮，不如不画 */
+  .runs-row-changed {
+    display: none;
+  }
+  /* 定位到审批卡的提示不能因为关了动效就没了：改成静止的描边，类名到点由
+     脚本摘掉 */
+  .runs-focus-ring::after {
+    animation: none;
+    opacity: 1;
+  }
+}

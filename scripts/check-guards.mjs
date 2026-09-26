@@ -1,9 +1,11 @@
-// 几道"坏了就是整页事故"的护栏：输入法回车、未知节点类型、页面级错误边界。
+// 几道"坏了就是整页事故"的护栏：输入法回车、未知节点类型、页面级错误边界、
+// 全局快捷键不抢输入框、未知地址不是白板。
 //
-// 这三样出事时的样子都很重：中文用户每选一个词就把半句话发去建图、跑图；
+// 出事时的样子都很重：中文用户每选一个词就把半句话发去建图、跑图；
 // Copilot 编出一个不存在的节点类型，整站白屏、没保存的编辑一起丢；任何组件渲染
-// 抛错，React 卸掉整棵树，连导航栏都没了。而 decode / stream / ui 三层检查对它们
-// 一个字都不会说——它们喂的都是合法数据。
+// 抛错，React 卸掉整棵树，连导航栏都没了；外壳的快捷键一旦抢了输入框，问题里
+// 打个问号就弹出一层面板。而 decode / stream / ui 三层检查对它们一个字都不会
+// 说——它们喂的都是合法数据。
 //
 // 探针拦掉所有非 GET 的 /api 请求：不写库、不调模型、不花钱，随时可以跑。
 // 往画布 store 里注入节点走的是 dev 构建挂在 window.__studio 上的那一份。
@@ -87,6 +89,37 @@ await page.getByText('问数据', { exact: true }).first().click()
 await page.waitForURL(/\/chat/)
 check('换一页就恢复', await page.getByText('这一页出错了').waitFor({ state: 'detached', timeout: 8000 })
   .then(() => true, () => false))
+
+console.log('\n=== 全局快捷键：不抢输入框 ===')
+// 外壳在 window 的捕获阶段听键盘，比谁都先拿到。判错一次，问题框里打个问号就
+// 弹出一层面板、⌥3 直接把人带离写了一半的问题
+await page.goto(`${WEB}/chat`, { waitUntil: 'networkidle' })
+const draft = page.locator('textarea').first()
+await draft.fill('本月出勤率')
+await draft.press('?')
+await page.waitForTimeout(300)
+check('输入框里的 ? 是问号，不弹快捷键说明', (await draft.inputValue()).endsWith('?')
+  && (await page.getByRole('dialog', { name: /键盘快捷键/ }).count()) === 0, await draft.inputValue())
+await draft.press('Alt+Digit3')
+await page.waitForTimeout(300)
+check('输入框里的 ⌥3 不切页', new URL(page.url()).pathname.startsWith('/chat'), page.url())
+const mod = process.platform === 'darwin' ? { metaKey: true } : { ctrlKey: true }
+await draft.evaluate((el, mod) => el.dispatchEvent(new KeyboardEvent('keydown',
+  { bubbles: true, cancelable: true, key: 'k', code: 'KeyK', isComposing: true, ...mod })), mod)
+await page.waitForTimeout(300)
+check('输入法组字时的 ⌘K 不开命令面板', (await page.getByRole('dialog', { name: '命令面板' }).count()) === 0)
+await draft.press(process.platform === 'darwin' ? 'Meta+KeyK' : 'Control+KeyK')
+check('⌘K 在输入框里照样能开命令面板', await page.getByRole('dialog', { name: '命令面板' }).waitFor({ timeout: 3000 })
+  .then(() => true, () => false))
+await page.keyboard.press('Escape')
+await page.waitForTimeout(200)
+check('Esc 关掉面板，草稿还在、焦点回到输入框',
+  (await draft.inputValue()).startsWith('本月出勤率') && await draft.evaluate((el) => el === document.activeElement))
+
+console.log('\n=== 未知地址不是白板 ===')
+await page.goto(`${WEB}/no-such-page`, { waitUntil: 'networkidle' })
+check('说清楚「这个地址不存在」', await shows('这个地址不存在'))
+check('导航栏还在', (await page.locator('nav').innerText()).includes('问数据'))
 
 await browser.close()
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 护栏全部通过')

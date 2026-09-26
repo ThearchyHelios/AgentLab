@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { ArrowUp, Database, Settings2, Sparkles, Square, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -31,7 +31,6 @@ export function Composer({ hero, onFocusChange }: {
   const tools = useCatalog((s) => s.tools)
   const [text, setText] = useState('')
   const [opts, setOpts] = useState(false)
-  const [focused, setFocused] = useState(false)
   const [model, setModel] = useState('')
   const [effective, setEffective] = useState('')
   const [useBase, setUseBase] = useState(true)
@@ -81,7 +80,7 @@ export function Composer({ hero, onFocusChange }: {
       {hero && <HeroHeader sources={sources} toolCount={tools?.length ?? 0} />}
 
       {copilot.error && (
-        <div className="fade-up mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10.5px]"
+        <div role="alert" className="fade-up mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10.5px]"
              style={{ borderColor: 'var(--err)', color: 'var(--err)' }}>
           <span className="min-w-0 flex-1 leading-relaxed">{copilot.error}</span>
           {/* 失败多半跟需求本身无关（模型抽风、协议跑偏、网断了），
@@ -92,82 +91,46 @@ export function Composer({ hero, onFocusChange }: {
         </div>
       )}
 
-      {/* 输入坞。整块是一个框，输入区和操作条在里面——比"输入框 + 旁边三个按钮"
-          更像一个可以对它说话的地方 */}
-      <div
-        className={clsx(
-          'rounded-xl border bg-bg transition-[box-shadow,border-color] duration-150',
-          focused && 'dock-focus',
-        )}
-      >
-        <textarea
-          ref={ref}
-          className="w-full resize-none bg-transparent px-3 pt-2.5 text-[12.5px] leading-relaxed outline-none placeholder:text-faint"
-          rows={hero ? 3 : 2}
-          value={text}
-          placeholder={nodes.length
-            ? '告诉它这张图要改成什么样…'
-            : '描述你想要的流程，它会直接画到左边'}
-          onChange={(e) => setText(e.target.value)}
-          onFocus={() => { setFocused(true); onFocusChange?.(true) }}
-          onBlur={() => { setFocused(false); onFocusChange?.(false) }}
-          onKeyDown={(e) => {
-            // 输入法组字期间的回车是"选词"，不是"发送"。不判 isComposing 的话
-            // 中文用户每打一个词就发出去一次
-            if (e.key === 'Enter' && !e.shiftKey && !isComposing(e)) {
-              e.preventDefault()
-              send()
-            }
-          }}
-        />
-
-        <div className="flex items-center gap-1 px-2 pb-2">
-          <button
-            className={clsx('rounded-md p-1.5 transition-colors hover:bg-hover',
-              opts ? 'text-[var(--accent)]' : 'text-faint')}
-            title="模型和生成方式"
-            onClick={() => setOpts((v) => !v)}
-          >
-            <Settings2 size={13} />
-          </button>
-          {!!nodes.length && (
+      <PromptBox
+        inputRef={ref}
+        size="panel"
+        rows={hero ? 3 : 2}
+        value={text}
+        onChange={setText}
+        onSubmit={() => send()}
+        busy={copilot.active}
+        onStop={stopCopilot}
+        stopLabel="停止生成"
+        label="告诉助手要画什么流程"
+        placeholder={nodes.length
+          ? '告诉它这张图要改成什么样…'
+          : '描述你想要的流程，它会直接画到左边'}
+        onFocusChange={onFocusChange}
+        leading={
+          <>
             <button
-              className={clsx('rounded-md px-1.5 py-1 text-[10px] transition-colors hover:bg-hover',
-                useBase ? 'text-dim' : 'text-faint')}
-              title={useBase ? '在当前这张图上改' : '不看现有的图，重新生成一张'}
-              onClick={() => setUseBase((v) => !v)}
+              className={clsx('rounded-md p-1.5 transition-colors hover:bg-hover',
+                opts ? 'text-[var(--accent)]' : 'text-faint')}
+              title="模型和生成方式"
+              aria-label="模型和生成方式"
+              aria-expanded={opts}
+              onClick={() => setOpts((v) => !v)}
             >
-              {useBase ? '改现有的图' : '重新生成'}
+              <Settings2 size={13} />
             </button>
-          )}
-          <span className="flex-1" />
-          <span className="pr-1 text-[9.5px] text-faint">
-            {text.trim() ? '⏎ 发送 · ⇧⏎ 换行' : ''}
-          </span>
-          {copilot.active ? (
-            <button
-              className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors"
-              style={{ background: 'var(--err)', color: '#fff' }}
-              title="停止生成" onClick={stopCopilot}
-            >
-              <Square size={11} fill="currentColor" />
-            </button>
-          ) : (
-            <button
-              className="flex h-7 w-7 items-center justify-center rounded-lg transition-all duration-150 disabled:opacity-30"
-              style={{
-                background: text.trim() ? 'var(--accent)' : 'var(--bg-hover)',
-                color: text.trim() ? '#fff' : 'var(--text-faint)',
-              }}
-              disabled={!text.trim()}
-              title="发送（⏎）"
-              onClick={() => send()}
-            >
-              <ArrowUp size={14} />
-            </button>
-          )}
-        </div>
-      </div>
+            {!!nodes.length && (
+              <button
+                className={clsx('rounded-md px-1.5 py-1 text-[10px] transition-colors hover:bg-hover',
+                  useBase ? 'text-dim' : 'text-faint')}
+                title={useBase ? '在当前这张图上改' : '不看现有的图，重新生成一张'}
+                onClick={() => setUseBase((v) => !v)}
+              >
+                {useBase ? '改现有的图' : '重新生成'}
+              </button>
+            )}
+          </>
+        }
+      />
 
       {opts && (
         <div className="fade-up mt-2 space-y-2 rounded-lg border bg-panel p-2.5">
@@ -223,6 +186,117 @@ export function Composer({ hero, onFocusChange }: {
 }
 
 /**
+ * 输入坞：画布助手栏和问数据页共用的那一块。
+ *
+ * 整块是一个框，输入区和操作条在里面——比"输入框 + 旁边三个按钮"更像一个可以
+ * 对它说话的地方。两个页面各写一份的话，焦点光晕、快捷键提示、停止键的颜色
+ * 迟早各走各的。
+ *
+ * size：panel 是 360px 助手栏里的紧凑版；dock 是问数据页底部；hero 是问数据页
+ * 空会话时居中的主输入。
+ */
+export function PromptBox({
+  value, onChange, onSubmit, onStop, busy = false, blocked, placeholder, label,
+  rows = 2, size = 'dock', inputRef, leading, onFocusChange, stopLabel = '停止', autoFocus,
+}: {
+  value: string
+  onChange: (value: string) => void
+  onSubmit: () => void
+  /** 给了它，busy 期间发送键换成停止键 */
+  onStop?: () => void
+  busy?: boolean
+  /** 暂时不能发的原因（历史没取回来之类）。输入照样能打，草稿不丢 */
+  blocked?: string | null
+  placeholder: string
+  /** 读屏念的名字：占位符一有内容就不见了，不能拿它当标签 */
+  label: string
+  rows?: number
+  size?: 'panel' | 'dock' | 'hero'
+  inputRef?: RefObject<HTMLTextAreaElement | null>
+  /** 操作条左侧的附加按钮 */
+  leading?: ReactNode
+  onFocusChange?: (focused: boolean) => void
+  stopLabel?: string
+  autoFocus?: boolean
+}) {
+  const [focused, setFocused] = useState(false)
+  const ready = !!value.trim() && !blocked
+  const big = size === 'hero'
+  const btn = big ? 'h-8 w-8' : 'h-7 w-7'
+  return (
+    <div
+      className={clsx(
+        'rounded-xl border bg-bg transition-[box-shadow,border-color] duration-150',
+        big && 'shadow-elev-2',
+        focused && 'dock-focus',
+      )}
+    >
+      <textarea
+        ref={inputRef}
+        aria-label={label}
+        className={clsx(
+          'w-full resize-none bg-transparent leading-relaxed outline-none placeholder:text-faint',
+          size === 'panel' ? 'px-3 pt-2.5 text-[12.5px]' : big ? 'px-4 pt-3.5 text-base' : 'px-3 pt-2.5 text-sm',
+        )}
+        rows={rows}
+        value={value}
+        placeholder={placeholder}
+        autoFocus={autoFocus}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={() => { setFocused(true); onFocusChange?.(true) }}
+        onBlur={() => { setFocused(false); onFocusChange?.(false) }}
+        onKeyDown={(e) => {
+          // 输入法组字期间的回车是"选词"，不是"发送"。不判 isComposing 的话
+          // 中文用户每打一个词就发出去一次
+          if (e.key === 'Enter' && !e.shiftKey && !isComposing(e)) {
+            e.preventDefault()
+            if (!busy && ready) onSubmit()
+          }
+        }}
+      />
+
+      <div className={clsx('flex items-center gap-1', big ? 'px-3 pb-3' : 'px-2 pb-2')}>
+        {leading}
+        <span className="flex-1" />
+        <span className={clsx('min-w-0 truncate pr-1 text-faint', size === 'panel' ? 'text-[9.5px]' : 'text-2xs')}
+              role={blocked ? 'status' : undefined}>
+          {blocked || (value.trim() ? '⏎ 发送 · ⇧⏎ 换行' : '')}
+        </span>
+        {/* 两个键各带 key：同一位置的同类元素 React 会复用，停止键的红底会顺着
+            transition 慢慢褪成发送键，中间那几帧像是一个粉色的发送键 */}
+        {busy && onStop ? (
+          <button
+            key="stop"
+            className={clsx('flex shrink-0 items-center justify-center rounded-lg transition-colors', btn)}
+            style={{ background: 'var(--err-solid)', color: 'var(--on-err)' }}
+            title={stopLabel}
+            aria-label={stopLabel}
+            onClick={onStop}
+          >
+            <Square size={11} fill="currentColor" />
+          </button>
+        ) : (
+          <button
+            key="send"
+            className={clsx('flex shrink-0 items-center justify-center rounded-lg transition-[background-color,color,opacity] duration-150 disabled:opacity-30', btn)}
+            style={{
+              background: ready ? 'var(--accent-solid)' : 'var(--bg-hover)',
+              color: ready ? 'var(--on-accent)' : 'var(--text-faint)',
+            }}
+            disabled={!ready || busy}
+            title={blocked || '发送（⏎）'}
+            aria-label="发送"
+            onClick={onSubmit}
+          >
+            <ArrowUp size={big ? 16 : 14} />
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/**
  * hero 态的抬头。
  *
  * 不只是一句标语：它要回答"我能让它干什么"。Copilot 能接到的数据源和工具
@@ -236,7 +310,7 @@ function HeroHeader({ sources, toolCount }: { sources: any[]; toolCount: number 
         <Sparkles size={18} style={{ color: 'var(--accent)' }} />
       </div>
       <div className="text-[13.5px] font-semibold">想让它做什么？</div>
-      <div className="mt-1 text-[11px] leading-relaxed text-faint">
+      <div className="mt-1 text-2xs leading-relaxed text-faint">
         说一句话，它把流程画到左边的画布上
       </div>
       <div className="mt-2 flex items-center justify-center gap-3 text-[10px] text-faint">

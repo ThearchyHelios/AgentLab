@@ -2,6 +2,7 @@ import {
   Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput,
   Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
 } from 'lucide-react'
+import { APPROVAL_POLICY_LABEL, NODE_TYPE_LABEL } from '../lib/terms'
 import type { NodeType } from '../types'
 
 export type FieldType =
@@ -9,10 +10,24 @@ export type FieldType =
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
   | 'ioFields' | 'cases' | 'agents' | 'metricsList'
 
+/**
+ * 这个字段里写的是什么语法。
+ *
+ * 模板和表达式长得像、错法相反：模板里写 `{{ vars.x }}`，取不到值渲染成空字符串、
+ * 不报错；表达式里写裸的 `vars.x == 1`，套上 `{{ }}` 就是另一种错。以前两种输入框
+ * 外观一模一样，只能靠 placeholder 暗示，后端专门加了「{{ }} 是多余的」这条告警，
+ * 说明这类错误很常见。检查器按它挂徽标、补全和高亮。
+ *
+ * 不写时按类型推：prompt / textarea / code 是模板，其余是普通文本。
+ * 显式写 'plain' 的是长得像模板、后端却不渲染的字段（成员的 system）。
+ */
+export type FieldSyntax = 'template' | 'expression' | 'plain'
+
 export interface FieldDef {
   key: string
   label: string
   type: FieldType
+  syntax?: FieldSyntax
   placeholder?: string
   help?: string
   options?: { value: string; label: string }[]
@@ -22,6 +37,13 @@ export interface FieldDef {
   /** 只在满足条件时显示，避免面板一次糊一屏用不上的选项 */
   when?: (config: Record<string, any>) => boolean
   advanced?: boolean
+}
+
+/** 字段实际的语法：显式声明优先，否则按类型推 */
+export function syntaxOf(field: Pick<FieldDef, 'type' | 'syntax'>): FieldSyntax {
+  if (field.syntax) return field.syntax
+  return field.type === 'prompt' || field.type === 'textarea' || field.type === 'code'
+    ? 'template' : 'plain'
 }
 
 export interface HandleDef {
@@ -70,12 +92,30 @@ const MODEL_FIELDS: FieldDef[] = [
   { key: 'max_tokens', label: '最大输出 token', type: 'number', min: 1, advanced: true },
 ]
 
+/**
+ * 审批策略。留空 = 跟随设置里的「危险工具默认需要人工确认」。
+ *
+ * 以前界面新建的节点在 defaults 里写死了 approval:'dangerous'，于是每个节点都带着
+ * 显式配置，全局设置对它们永远不起作用；后端把空值当成「跟随全局」
+ * （NodeContext.approval_mode），这里的默认就该是空。
+ */
+const APPROVAL_FOLLOW = { value: '', label: '跟随全局设置' }
+const APPROVAL_OPTIONS = [
+  APPROVAL_FOLLOW,
+  { value: 'dangerous', label: APPROVAL_POLICY_LABEL.dangerous },
+  { value: 'always', label: APPROVAL_POLICY_LABEL.always },
+  { value: 'never', label: APPROVAL_POLICY_LABEL.never },
+]
+
 const COMMON_TAIL: FieldDef[] = [
   {
     key: 'assign_to', label: '结果存为变量', type: 'text', placeholder: '例如 result',
     help: '下游用 {{ vars.变量名 }} 引用',
   },
-  { key: 'skip_if', label: '跳过条件', type: 'text', advanced: true, placeholder: 'vars.count == 0' },
+  {
+    key: 'skip_if', label: '跳过条件', type: 'text', syntax: 'expression', advanced: true,
+    placeholder: 'vars.count == 0',
+  },
   { key: 'retries', label: '失败重试次数', type: 'number', min: 0, max: 5, advanced: true },
   {
     key: 'on_error', label: '出错时', type: 'select', advanced: true,
@@ -85,20 +125,20 @@ const COMMON_TAIL: FieldDef[] = [
 
 export const NODE_DEFS: Record<NodeType, NodeDef> = {
   input: {
-    type: 'input', label: '输入', category: '起止', icon: FileInput,
+    type: 'input', label: NODE_TYPE_LABEL.input, category: '起止', icon: FileInput,
     description: '工作流入口，声明需要哪些输入',
     hasTarget: false, sources: [{ id: 'out', label: '' }],
     fields: [{ key: 'fields', label: '输入字段', type: 'ioFields' }],
     defaults: { fields: [{ name: 'question', required: true }] },
   },
   output: {
-    type: 'output', label: '成果 / 出具', category: '起止', icon: FileOutput,
-    description: '收集结构化成果；配出具契约后升级为三档出具',
+    type: 'output', label: NODE_TYPE_LABEL.output, category: '起止', icon: FileOutput,
+    description: '收集结构化成果；配出具契约后升级为三档出具（完整 / 降档 / 不予出具）',
     hasTarget: true, sources: [],
     fields: [
       { key: 'fields', label: '成果字段', type: 'ioFields' },
       {
-        key: 'contract', label: '出具契约', type: 'json', advanced: true,
+        key: 'contract', label: '出具契约', type: 'json', syntax: 'template', advanced: true,
         help: '{"metrics_from":["口径卡节点id"],"narrative":"{{ vars.report }}",'
           + '"required":[…],"expected":[…],"allow_numbers":[…],"strict":false}。'
           + '配了之后叙述里的每个数字必须能回指指标集，否则降档或不予出具',
@@ -107,7 +147,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: { fields: [{ name: '结果', value: '{{ last_message }}' }] },
   },
   llm: {
-    type: 'llm', label: '模型调用', category: '模型', icon: Brain,
+    type: 'llm', label: NODE_TYPE_LABEL.llm, category: '模型', icon: Brain,
     description: '单次 LLM 调用，可要求结构化输出',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -125,7 +165,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: { system: '', prompt: '{{ input.question }}' },
   },
   agent: {
-    type: 'agent', label: 'Agent', category: '模型', icon: Bot,
+    type: 'agent', label: NODE_TYPE_LABEL.agent, category: '模型', icon: Bot,
     description: '带工具循环，自己决定调什么工具',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -135,13 +175,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'skills', label: '挂载 Skill', type: 'skills' },
       { key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100 },
       {
-        key: 'approval', label: '工具审批', type: 'select',
-        options: [
-          { value: 'dangerous', label: '仅危险工具需要确认' },
-          { value: 'always', label: '每次调用都确认' },
-          { value: 'never', label: '全部自动放行' },
-        ],
-        help: '需要确认时运行会暂停，等你在审批面板放行',
+        key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS,
+        help: '需要审批时运行会暂停，等你在运行面板或记录页的审批卡上处理',
       },
       {
         key: 'parallel_tools', label: '并行执行工具', type: 'switch', advanced: true,
@@ -151,10 +186,10 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_steps: 12, approval: 'dangerous', tools: [], parallel_tools: false },
+    defaults: { max_steps: 12, tools: [], parallel_tools: false },
   },
   supervisor: {
-    type: 'supervisor', label: '多 Agent 协作', category: '模型', icon: Users,
+    type: 'supervisor', label: NODE_TYPE_LABEL.supervisor, category: '模型', icon: Users,
     description: '调度者按进展把任务分派给多个专家',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -168,10 +203,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           + '任务其实有依赖却被同时派出去，两个人会基于一样的旧信息重复劳动',
       },
       {
-        key: 'approval', label: '工具审批', type: 'select', advanced: true,
+        key: 'approval', label: '审批策略', type: 'select', advanced: true,
         options: [
-          { value: 'dangerous', label: '需要确认的调用不执行' },
-          { value: 'never', label: '全部自动放行' },
+          APPROVAL_FOLLOW,
+          { value: 'dangerous', label: '需要审批的调用直接拦下' },
+          { value: 'never', label: APPROVAL_POLICY_LABEL.never },
         ],
         help: '成员们并行跑在一个节点里，停不下来等人审批。默认把危险工具和可写库上的写操作'
           + '挡下来，并告诉成员换一种做法；需要逐次审批的事交给团队外的 agent 节点',
@@ -179,29 +215,22 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_rounds: 6, max_parallel: 3, agents: [], approval: 'dangerous' },
+    defaults: { max_rounds: 6, max_parallel: 3, agents: [] },
   },
   tool: {
-    type: 'tool', label: '调用工具', category: '执行', icon: Wrench,
+    type: 'tool', label: NODE_TYPE_LABEL.tool, category: '执行', icon: Wrench,
     description: '直接调用一个指定工具',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'tool', label: '工具', type: 'tools', help: '只能选一个' },
-      { key: 'args', label: '参数', type: 'json', help: '值里可以用 {{ }} 引用上游' },
-      {
-        key: 'approval', label: '执行前确认', type: 'select',
-        options: [
-          { value: 'dangerous', label: '危险工具需要确认' },
-          { value: 'always', label: '总是确认' },
-          { value: 'never', label: '不确认' },
-        ],
-      },
+      { key: 'args', label: '参数', type: 'json', syntax: 'template', help: '值里可以用 {{ }} 引用上游' },
+      { key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS },
       ...COMMON_TAIL,
     ],
-    defaults: { args: {}, approval: 'dangerous' },
+    defaults: { args: {} },
   },
   code: {
-    type: 'code', label: '沙箱代码', category: '执行', icon: Code2,
+    type: 'code', label: NODE_TYPE_LABEL.code, category: '执行', icon: Code2,
     description: '在隔离容器里执行代码',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -227,8 +256,12 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           + '真要防数据外泄得靠网络层。要的档位不可用时会退回默认并在时间线上告警',
       },
       {
-        key: 'approval', label: '执行前确认', type: 'select', advanced: true,
-        options: [{ value: 'never', label: '不确认' }, { value: 'always', label: '总是确认（可改代码）' }],
+        key: 'approval', label: '审批策略', type: 'select', advanced: true,
+        // 代码节点不跟全局设置走（后端缺省就是 never），所以没有「跟随全局」
+        options: [
+          { value: 'never', label: APPROVAL_POLICY_LABEL.never },
+          { value: 'always', label: `${APPROVAL_POLICY_LABEL.always}（审批时可改代码）` },
+        ],
       },
       { key: 'fail_fast', label: '执行失败即中断', type: 'switch', advanced: true },
       ...COMMON_TAIL,
@@ -236,7 +269,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: { language: 'python', code: 'print("hello")', timeout: 30, network: false, fail_fast: true },
   },
   branch: {
-    type: 'branch', label: '条件分支', category: '控制', icon: GitBranch,
+    type: 'branch', label: NODE_TYPE_LABEL.branch, category: '控制', icon: GitBranch,
     description: '按条件或语义分类走不同的路',
     hasTarget: true, sources: null,
     fields: [
@@ -261,7 +294,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     defaults: { mode: 'expression', cases: [{ key: 'yes', condition: '', label: '' }] },
   },
   loop: {
-    type: 'loop', label: '循环', category: '控制', icon: Repeat,
+    type: 'loop', label: NODE_TYPE_LABEL.loop, category: '控制', icon: Repeat,
     description: '遍历列表或按条件重复执行',
     hasTarget: true, sources: null,
     fields: [
@@ -273,31 +306,32 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         ],
       },
       {
-        key: 'items', label: '列表来源', type: 'text', when: (c) => c.mode !== 'while',
-        placeholder: '{{ input.items }}',
+        // 后端按模板渲染（control.py 的 ctx.render），以前定义成普通文本，没有补全
+        key: 'items', label: '列表来源', type: 'text', syntax: 'template',
+        when: (c) => c.mode !== 'while', placeholder: '{{ input.items }}',
       },
       { key: 'item_var', label: '当前项变量名', type: 'text', when: (c) => c.mode !== 'while' },
       {
-        key: 'condition', label: '继续条件', type: 'text', when: (c) => c.mode === 'while',
-        placeholder: 'vars.done != true',
+        key: 'condition', label: '继续条件', type: 'text', syntax: 'expression',
+        when: (c) => c.mode === 'while', placeholder: 'vars.done != true',
       },
       { key: 'max_iterations', label: '最大迭代次数', type: 'number', min: 1, max: 100 },
     ],
     defaults: { mode: 'foreach', item_var: 'item', max_iterations: 10 },
   },
   subgraph: {
-    type: 'subgraph', label: '子工作流', category: '控制', icon: Braces,
+    type: 'subgraph', label: NODE_TYPE_LABEL.subgraph, category: '控制', icon: Braces,
     description: '把另一张工作流当成一个节点嵌进来',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'workflow_id', label: '工作流', type: 'select', options: [] },
-      { key: 'input', label: '传入参数', type: 'json' },
+      { key: 'input', label: '传入参数', type: 'json', syntax: 'template' },
       ...COMMON_TAIL,
     ],
     defaults: { input: {} },
   },
   memory: {
-    type: 'memory', label: '长期记忆', category: '上下文', icon: Database,
+    type: 'memory', label: NODE_TYPE_LABEL.memory, category: '上下文', icon: Database,
     description: '读取或写入跨运行的长期记忆',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -309,7 +343,10 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           { value: 'clear', label: '清空该作用域' },
         ],
       },
-      { key: 'scope', label: '作用域', type: 'text', placeholder: 'default' },
+      {
+        key: 'scope', label: '作用域', type: 'text', syntax: 'template',
+        help: '留空 = 跟随这次运行的默认作用域（设置 · 运行默认值）',
+      },
       { key: 'query', label: '回忆什么', type: 'prompt', when: (c) => c.action !== 'write' && c.action !== 'clear' },
       { key: 'limit', label: '返回条数', type: 'number', min: 1, max: 20, when: (c) => c.action !== 'write' },
       { key: 'content', label: '记住的内容', type: 'prompt', when: (c) => c.action === 'write' },
@@ -323,15 +360,20 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'importance', label: '重要程度', type: 'number', min: 0, max: 1, step: 0.1, when: (c) => c.action === 'write' },
       ...COMMON_TAIL,
     ],
-    defaults: { action: 'recall', scope: 'default', limit: 5, query: '{{ last_message }}' },
+    // scope 不写死：留空才会跟着这次运行的默认作用域走（后端 ctx.run.memory_scope），
+    // 写死 default 等于让设置里的「默认记忆作用域」对界面新建的节点永远不起作用
+    defaults: { action: 'recall', limit: 5, query: '{{ last_message }}' },
   },
   retrieve: {
-    type: 'retrieve', label: '知识检索', category: '上下文', icon: Search,
+    type: 'retrieve', label: NODE_TYPE_LABEL.retrieve, category: '上下文', icon: Search,
     description: '从知识库里混合检索相关片段',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'query', label: '检索问题', type: 'prompt' },
-      { key: 'collection', label: '知识库', type: 'collection' },
+      {
+        key: 'collection', label: '知识库', type: 'collection',
+        help: '留空 = 跟随这次运行的默认知识库（设置 · 运行默认值）',
+      },
       { key: 'limit', label: '返回片段数', type: 'number', min: 1, max: 20 },
       {
         key: 'rerank', label: '重排', type: 'select', advanced: true,
@@ -351,10 +393,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     ],
     // alpha 不写死：写死 0.5 等于给一个没有语义能力的信号一半权重，
     // 实测会把 hit@1 从 88% 拉到 81%（backend/tests/test_retrieval_quality.py）
-    defaults: { query: '{{ last_message }}', collection: 'default', limit: 5, rerank: 'off' },
+    // collection 同理：留空跟着运行默认值走，正式运行会把实际用的那个写进封存
+    defaults: { query: '{{ last_message }}', limit: 5, rerank: 'off' },
   },
   transform: {
-    type: 'transform', label: '数据整形', category: '上下文', icon: Shuffle,
+    type: 'transform', label: NODE_TYPE_LABEL.transform, category: '上下文', icon: Shuffle,
     description: '不调模型，直接把数据揉成下游要的形状',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -368,36 +411,36 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       },
       { key: 'template', label: '模板', type: 'textarea', when: (c) => c.mode !== 'expression' },
       {
-        key: 'expression', label: '表达式', type: 'text', when: (c) => c.mode === 'expression',
-        placeholder: "len(vars.items)",
+        key: 'expression', label: '表达式', type: 'text', syntax: 'expression',
+        when: (c) => c.mode === 'expression', placeholder: 'len(vars.items)',
       },
       ...COMMON_TAIL,
     ],
     defaults: { mode: 'template', template: '{{ last_message }}' },
   },
   human: {
-    type: 'human', label: '人工介入', category: '把关', icon: Hand,
-    description: '暂停运行，等人确认或补充信息',
+    type: 'human', label: NODE_TYPE_LABEL.human, category: '把关', icon: Hand,
+    description: '暂停运行，等人审批、补充信息或改草稿',
     hasTarget: true, sources: null,
     fields: [
       {
-        key: 'mode', label: '介入方式', type: 'select',
+        key: 'mode', label: '审批方式', type: 'select',
         options: [
           { value: 'approve', label: '批准 / 驳回' },
           { value: 'input', label: '补充输入' },
           { value: 'edit', label: '编辑草稿' },
         ],
       },
-      { key: 'title', label: '标题', type: 'text' },
+      { key: 'title', label: '标题', type: 'text', syntax: 'template' },
       { key: 'message', label: '给人看的内容', type: 'prompt' },
       { key: 'draft', label: '草稿内容', type: 'prompt', when: (c) => c.mode === 'edit' },
       { key: 'stop_on_reject', label: '驳回即终止运行', type: 'switch', when: (c) => c.mode === 'approve' },
       ...COMMON_TAIL,
     ],
-    defaults: { mode: 'approve', title: '需要你确认', message: '{{ last_message }}' },
+    defaults: { mode: 'approve', title: '需要你审批', message: '{{ last_message }}' },
   },
   validate: {
-    type: 'validate', label: '结构校验', category: '把关', icon: CheckCircle2,
+    type: 'validate', label: NODE_TYPE_LABEL.validate, category: '把关', icon: CheckCircle2,
     description: '按 JSON Schema 校验，不合格可让模型自动返工',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
@@ -414,11 +457,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     },
   },
   metrics: {
-    type: 'metrics', label: '口径卡', category: '把关', icon: Gauge,
+    type: 'metrics', label: NODE_TYPE_LABEL.metrics, category: '把关', icon: Gauge,
     description: '受控指标集：所有算术在这里发生，叙述层只能引用',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
-      { key: 'caliber', label: '口径名称', type: 'text', placeholder: '周报口径' },
+      { key: 'caliber', label: '口径名称', type: 'text', syntax: 'template', placeholder: '周报口径' },
       { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1' },
       { key: 'metrics', label: '指标定义', type: 'metricsList' },
       {
@@ -444,12 +487,22 @@ export function sourceHandles(type: NodeType, config: Record<string, any>): Hand
   if (def.sources) return def.sources
   if (type === 'branch') {
     const cases = (config.cases ?? []) as { key?: string; label?: string }[]
-    return [
-      ...cases
-        .filter((c) => c.key)
-        .map((c) => ({ id: c.key!, label: c.label || c.key!, color: 'var(--ok)' })),
-      { id: 'default', label: '其他', color: 'var(--text-faint)' },
-    ]
+    // 出口颜色是中性的：ok 色只用来说「完成了」，哪条被走过由卡片按 taken 再点亮。
+    // 同名出口只留第一个：key 重复时 React Flow 会出两个同 id 的 handle，跑完两条
+    // 一起亮；重名本身由检查器和校验报错。key 用了保留名 default 的，和兜底出口
+    // 合并成一个——运行时它们本来就是同一个出口（edge.taken 的 branch 都是 default）
+    const seen = new Set<string>()
+    const handles: HandleDef[] = []
+    for (const c of cases) {
+      const key = (c.key ?? '').trim()
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      handles.push(key === 'default'
+        ? { id: 'default', label: `${c.label || '其他'}（兜底）`, color: 'var(--text-dim)' }
+        : { id: key, label: c.label || key, color: 'var(--text-dim)' })
+    }
+    if (!seen.has('default')) handles.push({ id: 'default', label: '其他', color: 'var(--text-faint)' })
+    return handles
   }
   if (type === 'loop') {
     return [

@@ -90,12 +90,16 @@ async def recall(
     kind: str | None = None,
     min_score: float = 0.05,
     on_degrade: Any = None,
+    track: bool = True,
 ) -> list[dict[str, Any]]:
     """按混合相关度取回记忆，并按重要性和使用次数做轻微加权。
 
     存量向量和当前 embedder 对不上时整体退回纯关键词。以前这里退得悄无声息
     ——知识库那边至少会发一条 warn，记忆这边只是"最近想不起事"，而人根本
     不会想到要去重建索引。
+
+    track=False 只看不记：调试台试一次回忆不该算"被召回过"，否则记忆卡上的
+    召回次数会被调试操作抬高，下次排序也跟着偏。
     """
     stmt = select(MemoryItem).where(MemoryItem.scope == scope)
     if kind:
@@ -151,6 +155,8 @@ async def recall(
         if len(results) >= limit:
             break
 
+    if not track:
+        return results
     # 记一下被召回过，作为下次排序的信号
     for r in results:
         item = await session.get(MemoryItem, r["id"])
@@ -159,6 +165,36 @@ async def recall(
             item.last_used_at = now
     await session.commit()
     return results
+
+
+async def revise(
+    session: AsyncSession,
+    memory_id: str,
+    *,
+    content: str | None = None,
+    kind: str | None = None,
+    importance: float | None = None,
+) -> MemoryItem | None:
+    """原地改一条记忆。找不到返回 None。
+
+    内容变了向量必须跟着重算：不然召回按的还是旧话，改完的口径搜不出来，
+    搜得出来的却是已经被改掉的那句。
+    """
+    item = await session.get(MemoryItem, memory_id)
+    if not item:
+        return None
+    if content is not None and content.strip() != item.content:
+        item.content = content.strip()
+        item.embedding = to_blob(await embed_text(item.content))
+        item.embed_model = embedder_id()
+        item.embed_dim = embedder_dim()
+    if kind is not None:
+        item.kind = kind
+    if importance is not None:
+        item.importance = importance
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
 async def forget(session: AsyncSession, memory_id: str) -> bool:

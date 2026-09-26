@@ -31,6 +31,8 @@ interface ConversationState {
   list: Conversation[]
   currentId: string | null
   loading: boolean
+  /** 列表取失败了。和「一个对话都没有」要分开说 */
+  error: unknown
 
   load: () => Promise<void>
   /** 新建（或复用一条空的），返回它的 id。**不负责切过去**——那是导航的事 */
@@ -40,6 +42,15 @@ interface ConversationState {
   rename: (id: string, title: string) => Promise<void>
   /** 删掉，返回接下来该去哪个（列表空了就是 null），由调用方导航 */
   remove: (id: string) => Promise<string | null>
+  /**
+   * 从列表里拿掉（归档），返回接下来该去哪个。撤销就是 restore。
+   *
+   * 用归档而不是「先藏起来、过几秒再真删」：延迟删除在关掉标签页、切走页面时
+   * 要么没删成、要么撤销不了。归档是一次就落库的状态，撤不撤都不会丢
+   */
+  archive: (id: string) => Promise<string | null>
+  /** 撤销归档，放回原来的位置 */
+  restore: (item: Conversation, index: number) => Promise<void>
   /** 有人在这个会话里说话了，把它顶到列表最前并刷新副标题 */
   touch: (id: string, lastQuestion?: string) => void
 }
@@ -48,15 +59,16 @@ export const useConversations = create<ConversationState>((set, get) => ({
   list: [],
   currentId: null,   // 由 URL 填，见 ChatPage 的同步 effect
   loading: false,
+  error: null,
 
   load: async () => {
     // 只管把列表取回来。「当前在看哪个」以前也在这里决定，现在归 URL 管——
     // 两边都能定就会互相覆盖：深链接进来，列表一加载完又被拽回上次那个
     set({ loading: true })
     try {
-      set({ list: await api.conversations.list('chat'), loading: false })
-    } catch {
-      set({ loading: false })
+      set({ list: await api.conversations.list('chat'), loading: false, error: null })
+    } catch (e) {
+      set({ loading: false, error: e })
     }
   },
 
@@ -98,6 +110,30 @@ export const useConversations = create<ConversationState>((set, get) => ({
     return get().currentId === id ? (list[0]?.id ?? null) : get().currentId
   },
 
+  archive: async (id) => {
+    const before = get().list
+    const list = before.filter((c) => c.id !== id)
+    // 先从列表里拿掉再发请求：删除该是即时的，失败了再放回去
+    set({ list })
+    try {
+      await api.conversations.update(id, { archived: true })
+    } catch (e) {
+      set({ list: before })
+      throw e
+    }
+    return get().currentId === id ? (list[0]?.id ?? null) : get().currentId
+  },
+
+  restore: async (item, index) => {
+    await api.conversations.update(item.id, { archived: false })
+    set((s) => {
+      if (s.list.some((c) => c.id === item.id)) return s
+      const list = [...s.list]
+      list.splice(Math.min(index, list.length), 0, { ...item, archived: false })
+      return { list }
+    })
+  },
+
   touch: (id, lastQuestion) => {
     set((s) => {
       const hit = s.list.find((c) => c.id === id)
@@ -110,6 +146,7 @@ export const useConversations = create<ConversationState>((set, get) => ({
           ? (lastQuestion.length > 24 ? lastQuestion.slice(0, 24) + '…' : lastQuestion)
           : hit.title,
         turn_count: hit.turn_count + (lastQuestion ? 1 : 0),
+        last_active_at: new Date().toISOString(),
       }
       return { list: [updated, ...s.list.filter((c) => c.id !== id)] }
     })

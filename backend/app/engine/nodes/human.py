@@ -34,7 +34,8 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     ctx.emit(EventType.HUMAN_REQUESTED, **payload)
     response = interrupt(payload)
-    ctx.emit(EventType.HUMAN_RESOLVED, response=response)
+    # 谁批的跟着事件走：时间线要写得出"张工驳回了"，没署名就是 None，不再默认写"你"
+    ctx.emit(EventType.HUMAN_RESOLVED, response=response, actor=ctx.actor())
     decision = read_decision(response)
 
     if mode == "approve":

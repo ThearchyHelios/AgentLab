@@ -90,7 +90,20 @@ const BOTH_WAYS = {
   ],
 }
 
-const FIXTURES = { PARALLEL, WIDE, LOOP, MERGE_BRANCH, BOTH_WAYS }
+/** case 的 key 用了保留名 default：和兜底出口合并成一个出口，线照样接得上 */
+const DEFAULT_CASE = {
+  nodes: [
+    node('start', 'input'),
+    node('gate', 'branch', { cases: [{ key: 'fast', label: '快速' }, { key: 'default', label: '协作' }] }),
+    node('quick', 'llm'), node('team', 'llm'), node('done', 'output'),
+  ],
+  edges: [
+    edge('start', 'gate'), edge('gate', 'quick', 'fast'), edge('gate', 'team', 'default'),
+    edge('quick', 'done'), edge('team', 'done'),
+  ],
+}
+
+const FIXTURES = { PARALLEL, WIDE, LOOP, MERGE_BRANCH, BOTH_WAYS, DEFAULT_CASE }
 
 // ---------------------------------------------------------------- 几何
 
@@ -321,6 +334,29 @@ console.log('=== 随机坐标（手拖过的图） ===')
   })
   check(`随机坐标下每条边都画得出来（${fuzz.total} 条）`, fuzz.broken === 0,
     fuzz.examples.join('、'))
+}
+
+// 分支出口由 case 算出来。同 id 的两个出口会让 React Flow 出两个 handle、跑完两条一起
+// 亮，React 还会报 key 重复；key=default 和兜底出口在运行时本来就是同一个出口
+console.log('=== 分支出口：保留名 default、重复标识 ===')
+{
+  const r = await page.evaluate(async () => {
+    const { sourceHandles } = await import('/src/canvas/nodeDefs.ts')
+    const merged = sourceHandles('branch', { cases: [{ key: 'fast', label: '快速' }, { key: 'default', label: '协作' }] })
+    const dup = sourceHandles('branch', { cases: [{ key: 'a' }, { key: 'a' }, { key: 'b' }] })
+    const plain = sourceHandles('branch', { cases: [{ key: 'yes' }] })
+    return {
+      merged: merged.map((h) => `${h.id}:${h.label}`),
+      dup: dup.map((h) => h.id),
+      plain: plain.map((h) => h.id),
+      colors: merged.map((h) => h.color ?? ''),
+    }
+  })
+  check('key=default 的 case 和「其他」合并成一个出口', r.merged.length === 2
+    && r.merged[1] === 'default:协作（兜底）', r.merged.join('、'))
+  check('重复的 key 只出一个出口', r.dup.join(',') === 'a,b,default', r.dup.join(','))
+  check('普通分支照常追加「其他」出口', r.plain.join(',') === 'yes,default', r.plain.join(','))
+  check('出口颜色是中性的（ok 色只留给状态）', r.colors.every((c) => !c.includes('--ok')), r.colors.join('、'))
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过')

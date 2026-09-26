@@ -132,7 +132,11 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
             # 给一句笼统的"失败了"只会让它瞎猜
             return f"SQL 被拒绝：{e}"
         except Exception as e:  # noqa: BLE001
-            return f"查询失败：{type(e).__name__}: {e}"
+            from app.api.errors import explain, first_line
+
+            # 驱动的原话留着（"no such table: x" 正是模型改写 SQL 要的线索），
+            # 类名和 SQLAlchemy 的包装前缀去掉：这一行也会原样出现在运行面板上
+            return f"查询失败：{first_line(e) or explain(e)[0]}"
 
         payload = result.to_payload()
         payload["source"] = source.name

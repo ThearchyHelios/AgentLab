@@ -148,6 +148,11 @@ def _apply_contract(
         missing_expected=missing_expected,
         unmatched=len(unmatched),
         calibers=calibers,
+        # 降档的原因要跟着事件走：只有 gaps 的时候，时间线上的出具步骤以前只能写
+        # 一个光秃秃的「降档出具」，横幅还说「请对照下方声明」，下方却什么都没有
+        gaps=gaps,
+        metrics_checked=len(metrics),
+        matched_numbers=len(trace.matched) if trace else 0,
     )
     return issuance
 
@@ -173,7 +178,11 @@ async def run_transform(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         try:
             output = json.loads(rendered)
         except json.JSONDecodeError as e:
-            raise NodeError(ctx.node.id, f"渲染结果不是合法 JSON：{e}") from e
+            raise NodeError(
+                ctx.node.id,
+                f"模板渲染出来的不是合法 JSON（第 {e.lineno} 行第 {e.colno} 列附近）。"
+                "检查模板里的引号、逗号，字符串值要用 | json 过滤器输出",
+            ) from e
     else:
         raise NodeError(ctx.node.id, f"未知的整形模式：{mode}")
 

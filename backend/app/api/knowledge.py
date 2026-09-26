@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import (
@@ -9,10 +10,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import explain, raw
 from app.core.config import settings
 from app.db.base import get_session
 from app.db.models import Document, MemoryItem, Skill
 from app.memory import inverted, kb, store
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # 长期记忆
@@ -22,11 +26,17 @@ memory_router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 
 class MemoryIn(BaseModel):
-    content: str = Field(min_length=1)
+    content: str
     scope: str = "default"
     kind: str = "fact"
     importance: float = Field(default=0.5, ge=0, le=1)
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryPatch(BaseModel):
+    content: str | None = None
+    kind: str | None = None
+    importance: float | None = Field(default=None, ge=0, le=1)
 
 
 class MemoryOut(BaseModel):
@@ -37,9 +47,66 @@ class MemoryOut(BaseModel):
     importance: float
     use_count: int
     meta: dict[str, Any]
+    #: 这条是哪来的：kind=run 时带运行、节点和工作流名；manual 是手动添加的；
+    #: playground 是在工具库里直接调 remember 写进来的
+    source: dict[str, Any] = Field(default_factory=dict)
     created_at: Any = None
+    # 不给 updated_at：每次召回记计数也是一次写，它跟着召回走，当「修改于」
+    # 显示就是错的。界面要的「记下于」「上次召回」各有字段
+    last_used_at: Any = None
 
     model_config = {"from_attributes": True}
+
+
+def _content(text: str) -> str:
+    """只有空白的内容和空串是一回事——存下去就是一条什么都召回不到的空记忆。"""
+    if not text.strip():
+        raise HTTPException(422, "记忆内容是空的：写上要记住的那句话再保存")
+    return text
+
+
+async def _with_source(session: AsyncSession, rows: list[MemoryItem]) -> list[MemoryOut]:
+    """给记忆补上来源。
+
+    长期记忆里存的是口径规则，审查时得知道「这条是哪次运行、哪个节点写进来的」
+    才能判断能不能信。meta 里只有 id，节点名和工作流名要回运行记录里查——
+    运行被删了就照实标 run_exists=false，不编一个出来。
+    """
+    from app.db.models import Run
+
+    run_ids = {str((r.meta or {}).get("run_id") or "") for r in rows} - {"", "playground"}
+    runs: dict[str, Any] = {}
+    if run_ids:
+        for row in await session.execute(
+            select(Run.id, Run.workflow_name, Run.graph).where(Run.id.in_(run_ids))
+        ):
+            runs[row.id] = row
+
+    out: list[MemoryOut] = []
+    for item in rows:
+        meta = item.meta or {}
+        run_id = str(meta.get("run_id") or "")
+        node_id = meta.get("node_id") or None
+        if not run_id:
+            source: dict[str, Any] = {"kind": "manual"}
+        elif run_id == "playground":
+            source = {"kind": "playground"}
+        else:
+            run = runs.get(run_id)
+            nodes = ((run.graph if run else None) or {}).get("nodes") or []
+            label = next(
+                ((n.get("data") or {}).get("label") for n in nodes if n.get("id") == node_id), None
+            )
+            source = {
+                "kind": "run", "run_id": run_id, "node_id": node_id,
+                "node_label": label or None,
+                "workflow_name": (run.workflow_name or None) if run else None,
+                "run_exists": run is not None,
+            }
+        view = MemoryOut.model_validate(item)
+        view.source = source
+        out.append(view)
+    return out
 
 
 @memory_router.get("/scopes")
@@ -52,22 +119,38 @@ async def list_memory(
     scope: str | None = None,
     limit: int = Query(default=200, le=500),
     session: AsyncSession = Depends(get_session),
-) -> list[MemoryItem]:
-    return await store.list_memories(session, scope=scope, limit=limit)
+) -> list[MemoryOut]:
+    return await _with_source(session, await store.list_memories(session, scope=scope, limit=limit))
 
 
 @memory_router.post("", response_model=MemoryOut, status_code=201)
 async def add_memory(
     payload: MemoryIn, session: AsyncSession = Depends(get_session)
-) -> MemoryItem:
-    return await store.remember(
+) -> MemoryOut:
+    item = await store.remember(
         session,
         scope=payload.scope,
-        content=payload.content,
+        content=_content(payload.content),
         kind=payload.kind,
         importance=payload.importance,
         meta=payload.meta,
     )
+    return (await _with_source(session, [item]))[0]
+
+
+@memory_router.patch("/{memory_id}", response_model=MemoryOut)
+async def update_memory(
+    memory_id: str, payload: MemoryPatch, session: AsyncSession = Depends(get_session)
+) -> MemoryOut:
+    """写错了原地改，不必删掉重写——重写会丢掉来源和召回记录。"""
+    item = await store.revise(
+        session, memory_id,
+        content=None if payload.content is None else _content(payload.content),
+        kind=payload.kind, importance=payload.importance,
+    )
+    if item is None:
+        raise HTTPException(404, "这条记忆不存在，可能已经被删了")
+    return (await _with_source(session, [item]))[0]
 
 
 @memory_router.get("/search")
@@ -75,10 +158,11 @@ async def search_memory(
     q: str,
     scope: str = "default",
     limit: int = 10,
+    peek: bool = Query(default=False, description="只看不记：调试台用，不计入召回次数"),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    hits = await store.recall(session, scope=scope, query=q, limit=limit)
-    return {"query": q, "scope": scope, "results": hits}
+    hits = await store.recall(session, scope=scope, query=q, limit=limit, track=not peek)
+    return {"query": q, "scope": scope, "results": hits, "peek": peek}
 
 
 @memory_router.delete("/{memory_id}", status_code=204)
@@ -86,7 +170,7 @@ async def delete_memory(
     memory_id: str, session: AsyncSession = Depends(get_session)
 ) -> None:
     if not await store.forget(session, memory_id):
-        raise HTTPException(404, "记忆不存在")
+        raise HTTPException(404, "这条记忆不存在，可能已经被删了")
 
 
 @memory_router.delete("/scope/{scope}")
@@ -120,6 +204,16 @@ class DocumentOut(BaseModel):
 @kb_router.get("/collections")
 async def collections(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     return await kb.list_collections(session)
+
+
+@kb_router.get("/formats")
+async def formats() -> dict[str, Any]:
+    """上传框收哪些文件。前端的 accept 从这里取，和后端的解析判断是同一份清单。"""
+    from app.memory.parsing import supported_formats
+
+    out: dict[str, Any] = supported_formats()
+    out["accept"] = ",".join(out["extensions"])
+    return out
 
 
 @kb_router.get("/documents", response_model=list[DocumentOut])
@@ -207,11 +301,13 @@ async def _process_in_background(doc_id: str) -> None:
             # 不会和另一个 session 抢 SQLite 的写锁
             await kb.process_document(session, doc)
         except Exception as e:  # noqa: BLE001
+            logger.warning("文档 %s 处理失败：%s", doc_id, raw(e))
             await session.rollback()
             doc = await session.get(Document, doc_id)
             if doc:
+                reason, hint = explain(e)
                 doc.status = "failed"
-                doc.error = f"{type(e).__name__}: {e}"[:500]
+                doc.error = (f"切块或算向量时出错：{reason}" + (f"。{hint}" if hint else ""))[:500]
                 await session.commit()
 
 
@@ -224,12 +320,18 @@ async def search_kb(
                                 description="1=纯向量, 0=纯关键词；不传则按 embedder 能力取默认"),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    from app.memory.embeddings import default_alpha
+
     notes: list[str] = []
+    # 没传就是运行时的默认值。把实际用的那个交回去：调试台的用处是预演 agent
+    # 会拿到什么，默认值对不上，人会照着错的命中去调知识库
+    used = default_alpha() if alpha is None else alpha
     hits = await kb.search(session, collection=collection, query=q, limit=limit,
-                           alpha=alpha, on_degrade=notes.append)
+                           alpha=used, on_degrade=notes.append)
     # 退回关键词这件事要跟着结果一起交出去，而不是只写进服务端日志——
     # 调用方（设置页的"试一下"、外部脚本）看到的是结果变差，得知道为什么
-    return {"query": q, "collection": collection, "results": hits, "degraded": notes}
+    return {"query": q, "collection": collection, "results": hits, "degraded": notes,
+            "alpha": used}
 
 
 @kb_router.get("/embedding")
@@ -325,7 +427,8 @@ async def probe_embedding(base_url: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=8) as client:
             data = (await client.get(url)).json()
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"连不上 {url}：{type(e).__name__}: {e}") from e
+        reason, hint = explain(e)
+        raise HTTPException(400, f"问不到 {url} 上有哪些模型：{reason}" + (f"。{hint}" if hint else "")) from e
     models = [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
     return {"base_url": base_url, "models": models}
 
@@ -365,7 +468,7 @@ async def get_document(
 
     doc = await session.get(Document, doc_id)
     if not doc:
-        raise HTTPException(404, "文档不存在")
+        raise HTTPException(404, "这份文档不存在，可能已经被删了")
 
     rows = list((await session.execute(
         select(Chunk).where(Chunk.document_id == doc_id).order_by(Chunk.ordinal)
@@ -394,7 +497,7 @@ async def get_document(
 @kb_router.delete("/documents/{doc_id}", status_code=204)
 async def delete_document(doc_id: str, session: AsyncSession = Depends(get_session)) -> None:
     if not await kb.delete_document(session, doc_id):
-        raise HTTPException(404, "文档不存在")
+        raise HTTPException(404, "这份文档不存在，可能已经被删了")
 
 
 # --------------------------------------------------------------------------
@@ -443,7 +546,7 @@ async def update_skill(
 ) -> Skill:
     row = await session.get(Skill, skill_id)
     if not row:
-        raise HTTPException(404, "Skill 不存在")
+        raise HTTPException(404, "这个 Skill 不存在，可能已经被删了")
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
     await session.commit()
@@ -455,6 +558,6 @@ async def update_skill(
 async def delete_skill(skill_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await session.get(Skill, skill_id)
     if not row:
-        raise HTTPException(404, "Skill 不存在")
+        raise HTTPException(404, "这个 Skill 不存在，可能已经被删了")
     await session.delete(row)
     await session.commit()

@@ -53,7 +53,7 @@ class McpManager:
             except Exception as e:  # noqa: BLE001 - 一个 server 挂了不影响其他的
                 logger.warning("MCP server %s 连接失败: %s", row.name, e)
                 out[row.name] = []
-                await self._mark(row.id, "error", f"{type(e).__name__}: {e}", [])
+                await self._mark(row.id, "error", _reason(e), [])
         return out
 
     async def _mark(
@@ -127,7 +127,24 @@ class McpManager:
                 ],
             }
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            from app.api.errors import raw
+
+            return {"ok": False, "error": _reason(e), "detail": raw(e)}
+
+
+def _reason(e: BaseException) -> str:
+    """连不上 MCP 服务的原因，写成工具页上看得懂的话。
+
+    最常见的两种：命令不存在（没装 npx / uvx）和超时（进程起来了但不讲 MCP）。
+    """
+    from app.api.errors import explain
+
+    if isinstance(e, FileNotFoundError):
+        return f"启动不了：找不到命令 {e.filename or ''}。确认它已安装、并且在后端的 PATH 里"
+    if isinstance(e, asyncio.TimeoutError):
+        return "连上了但 30 秒内没有应答：确认这个命令启动的是 MCP 服务，参数有没有写错"
+    reason, hint = explain(e)
+    return f"{reason}。{hint}" if hint else reason
 
 
 mcp_manager = McpManager()

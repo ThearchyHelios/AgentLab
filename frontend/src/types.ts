@@ -41,8 +41,46 @@ export interface Workflow {
   updated_at?: string
 }
 
+/** 工作流的一个版本。列表接口只有前四项，取单个版本时才有 graph 等 */
+export interface WorkflowVersion {
+  id: string
+  version: number
+  note: string
+  created_at?: string
+  workflow_id?: string
+  graph?: GraphSpec
+  graph_hash?: string | null
+  /** 这一版入口节点声明的字段。正式运行的表单照它填，不能照画布 */
+  input_fields?: { name: string; required?: boolean; [key: string]: any }[]
+  /** 是不是当前的已发布版本 */
+  published?: boolean
+}
+
+/**
+ * 后端写进 runs.status 的值。interrupted 既可能是停在审批上，也可能是服务重启
+ * 打断后挂起——显示时用 lib/status 的 resolveStatus 配合审批列表区分。
+ * suspended 目前后端不写，前端推导的 RunPhase 会用到，这里一并收下。
+ */
 export type RunStatus =
-  | 'queued' | 'running' | 'interrupted' | 'succeeded' | 'failed' | 'cancelled'
+  | 'queued' | 'running' | 'interrupted' | 'succeeded' | 'failed' | 'cancelled' | 'suspended'
+
+/**
+ * 运行的用量与时长。
+ *
+ * 三种时长口径不同，不能混用：duration_ms / active_ms 是各段执行时长之和（审批
+ * 恢复、续跑的每一段都算），wall_ms 是从第一次开始到结束的墙钟，wait_ms 是等人
+ * 审批的总时长。老数据只有 duration_ms，而且可能只是最后一段。
+ */
+export interface RunUsage {
+  duration_ms?: number
+  wall_ms?: number
+  active_ms?: number
+  wait_ms?: number
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number
+  [key: string]: any
+}
 
 export interface Run {
   id: string
@@ -52,15 +90,19 @@ export interface Run {
   input: Record<string, any>
   output: Record<string, any>
   error: string | null
-  usage: Record<string, any>
+  usage: RunUsage
   run_class?: 'formal' | 'exploratory'
   version?: number | null
   version_hash?: string | null
   manifest_hash?: string | null
+  /** 封存到第几条事件为止。有它才说明这条运行的清单封存过 */
+  manifest_seq?: number | null
+  /** 失败时能定位到的节点 */
+  error_node_id?: string | null
   started_by?: string | null
   created_at?: string
   started_at?: string
-  finished_at?: string
+  finished_at?: string | null
 }
 
 export interface RunEvent {
@@ -82,6 +124,15 @@ export interface Approval {
   status: string
   response: Record<string, any>
   created_at?: string
+  // 以下是审批卡的上下文，老后端不给
+  workflow_id?: string | null
+  workflow_name?: string | null
+  node_label?: string | null
+  run_status?: RunStatus | null
+  run_class?: 'formal' | 'exploratory' | null
+  /** 谁处理的。null 表示处理时没有署名，显示「未署名」 */
+  resolved_by?: string | null
+  resolved_at?: string | null
 }
 
 export interface Provider {
@@ -104,6 +155,8 @@ export interface ToolInfo {
   category: string
   source: 'builtin' | 'custom' | 'mcp'
   dangerous: boolean
+  /** 运行时是否真的会因它停下来等审批。MCP 与自定义工具目前不会，界面别说它「需确认」 */
+  runtime_approval?: boolean
   schema: Record<string, any>
 }
 
@@ -126,7 +179,26 @@ export interface MemoryItem {
   importance: number
   use_count: number
   meta: Record<string, any>
+  /**
+   * 从哪来。kind=run 时带运行、节点和工作流名；manual 是手动添加的；playground 是
+   * 在工具库里直接调 remember 写进来的。老后端不给
+   */
+  source?: MemorySource | null
   created_at?: string
+  /** 后端不再给：每次计数的回忆都会写这一行，updated_at 跟着回忆走，不是编辑时间 */
+  updated_at?: never
+  last_used_at?: string | null
+}
+
+export interface MemorySource {
+  kind?: 'run' | 'manual' | 'playground' | string
+  run_id?: string | null
+  node_id?: string | null
+  workflow_name?: string | null
+  node_label?: string | null
+  /** 来源运行是否还在。删掉之后只剩文字，不再给链接 */
+  run_exists?: boolean
+  [key: string]: any
 }
 
 export interface KbDocument {
@@ -152,7 +224,8 @@ export interface ValidationIssue {
 
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
 export interface NodeRuntime {
-  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped'
+  /** cancelled / suspended 是终态清扫时收的：运行被取消或服务重启时还没跑完的节点 */
+  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended'
   durationMs?: number
   preview?: any
   error?: string
@@ -180,7 +253,7 @@ export interface TeamMember {
   agent: string
   instruction: string
   ms: number
-  status: 'running' | 'done' | 'failed' | 'waiting'
+  status: 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended'
   result?: string
 }
 

@@ -4,11 +4,11 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
-    DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint,
+    Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.base import Base, TimestampMixin, new_id, utcnow
+from app.db.base import Base, TimestampMixin, UTCDateTime, new_id, utcnow
 
 # --------------------------------------------------------------------------
 # 设置：模型供应商 / 用户偏好 / MCP / 自定义工具
@@ -180,6 +180,13 @@ class Run(Base, TimestampMixin):
     # 为空的是记录这一列之前封存的老运行，核对时按当时的口径算
     manifest_seq: Mapped[int | None] = mapped_column(Integer, default=None)
     started_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 第一次发起时实际生效的记忆域、知识库、工具审批默认值。恢复和接着跑沿用它们，
+    # 而不是回落到 "default"——同一次运行前后两段必须查同一个库、守同一道门
+    memory_scope: Mapped[str | None] = mapped_column(String(100), default=None)
+    collection: Mapped[str | None] = mapped_column(String(100), default=None)
+    approval_default: Mapped[str | None] = mapped_column(String(20), default=None)
+    # 失败时能定位到的节点。报错要能落到画布上的那张卡片，而不只是一句话
+    error_node_id: Mapped[str | None] = mapped_column(String(64), default=None)
 
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -388,9 +395,7 @@ class Conversation(Base, TimestampMixin):
     archived: Mapped[bool] = mapped_column(default=False)
     # 列表按活跃度排。不能用 updated_at —— 改个标题就会把这条顶到最前面，
     # 而用户对"最近聊过的"的预期是按说话时间排，不是按编辑时间
-    last_active_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, index=True
-    )
+    last_active_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
 
     turns: Mapped[list["ConversationTurn"]] = relationship(
         back_populates="conversation",

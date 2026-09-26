@@ -1,287 +1,354 @@
-import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
-import { Code2, GitFork, History, Play, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
-import clsx from 'clsx'
-import { api } from '../api/client'
-import { Empty, Spinner, StatusDot, useToast } from '../components/ui'
-import { ApprovalCard } from '../run/RunPanel'
-import { AssistantStream, type StreamTurn } from '../run/AssistantStream'
-import { decodeRun, formatDuration, summarizeRun } from '../run/decode'
-import { useCatalog } from '../store/catalog'
-import type { Run, RunEvent } from '../types'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { History, Inbox, RefreshCw } from 'lucide-react'
+import { EmptyState, IconButton, StatusBadge } from '../components/ui'
+import { STATUS, type StatusCode } from '../lib/status'
+import { useCatalog, useOnReconnect } from '../store/catalog'
+import type { Approval, Run } from '../types'
+import {
+  ApprovalRows, FilterBar, RunRows, StatusSegments,
+} from './runs/RunList'
+import { RunDetailView } from './runs/RunDetailView'
+import {
+  RUNS_TABS, TAB_CODES, TAB_LABEL, ageMs, asTab, duplicateNames, formatSpan, isLiveRun, matchesCodes,
+  parseQuery, runCode, stripStatusWords, type RunsTab,
+} from './runs/model'
+import { RunTabs, useNow, type TabItem } from './runs/parts'
+import { useApprovalQueue, useRunList, useStatusCounts } from './runs/useRunsData'
+import './runs/runs.css'
 
-/** 运行历史。每次运行的完整事件流都落了库，所以这里能完整回放。 */
+/**
+ * 记录：每次运行的完整事件流都落了库，所以这里能完整回放、排错、处理待办。
+ *
+ * 地址就是状态：/runs?tab=approvals|running|failed|all，外加 status / class / wf / q
+ * 几个筛选；/runs/:runId 打开某一条，筛选原样保留在查询串里。导航上的待审批
+ * 徽标指向 ?tab=approvals——这页必须能处理待办，否则刷新后卡在审批上的运行在
+ * 整个界面里没有任何入口可以推进。
+ */
 export function RunsPage() {
-  const toast = useToast()
   const { runId } = useParams()
   const navigate = useNavigate()
-  const [runs, setRuns] = useState<Run[]>([])
-  const [selected, setSelected] = useState<Run | null>(null)
-  const [events, setEvents] = useState<RunEvent[]>([])
-  const [loading, setLoading] = useState(true)
-  const [filter, setFilter] = useState('')
-  const [raw, setRaw] = useState(false)
-  // 导航上的待办徽标指向这一页，所以这页必须能处理待办
-  const approvals = useCatalog((s) => s.approvals)
-  const pendingHere = approvals.filter(
-    (a) => a.run_id === selected?.id && a.status === 'pending',
-  )
+  const location = useLocation()
+  const [params, setParams] = useSearchParams()
 
-  const load = async () => {
-    setLoading(true)
-    setRuns(await api.runs.list({ limit: 100 }).catch(() => []))
-    setLoading(false)
-  }
-  useEffect(() => { void load() }, [])
+  const tab = asTab(params.get('tab'))
+  const text = params.get('q') ?? ''
+  const runClass = (['formal', 'exploratory'].includes(params.get('class') ?? '') ? params.get('class') : '') as
+    '' | 'formal' | 'exploratory'
+  const workflowId = params.get('wf') ?? ''
+  const segment = (params.get('status') ?? '').split(',').filter((c): c is StatusCode => c in STATUS)
 
-  // URL 说看哪条就看哪条。**按 id 直接取**，不在 runs 里找——列表只有前 100 条，
-  // 而一条老运行的链接必须也能打开，否则"可分享"就只对最近的运行成立
-  const refreshDetail = async (id: string) => {
-    const run = await api.runs.get(id).catch(() => null)
-    if (run) setSelected(run)
-    setEvents(await api.runs.events(id).catch(() => []))
-  }
-
-  useEffect(() => {
-    if (!runId) { setSelected(null); setEvents([]); return }
-    let live = true
-    setEvents([])
-    void (async () => {
-      const run = await api.runs.get(runId).catch(() => null)
-      if (!live) return
-      if (!run) {
-        toast('那次运行不在了', 'info')
-        navigate('/runs', { replace: true })
-        return
+  const patchParams = useCallback((patch: Record<string, string | null>) => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      for (const [k, v] of Object.entries(patch)) {
+        if (v == null || v === '') next.delete(k)
+        else next.set(k, v)
       }
-      setSelected(run)
-      setEvents(await api.runs.events(runId).catch(() => []))
-    })()
-    return () => { live = false }
-  }, [runId])
+      return next
+    }, { replace: true })
+  }, [setParams])
 
-  const shown = runs.filter(
-    (r) => !filter || r.workflow_name?.includes(filter) || r.status === filter
-      || summarizeRun(r.input, r.output).includes(filter),
+  // 认不出的页签（链接过期、手输错）落回「全部」，并把地址一起纠正
+  const rawTab = params.get('tab')
+  useEffect(() => {
+    if (rawTab && rawTab !== tab) patchParams({ tab: tab === 'all' ? null : tab })
+  }, [rawTab, tab, patchParams])
+
+  // 搜索框：输入即时显示，停手 250ms 再写进地址、发请求
+  const [draft, setDraft] = useState(text)
+  const typing = useRef(false)
+  useEffect(() => { if (!typing.current) setDraft(text) }, [text])
+  useEffect(() => {
+    if (draft === text) { typing.current = false; return }
+    const t = setTimeout(() => { typing.current = false; patchParams({ q: draft || null }) }, 250)
+    return () => clearTimeout(t)
+  }, [draft, text, patchParams])
+
+  const parsed = useMemo(() => parseQuery(text), [text])
+  const approvals = useCatalog((s) => s.approvals)
+  const catalogLoaded = useCatalog((s) => s.loaded)
+  const workflows = useCatalog((s) => s.workflows)
+
+  // epoch：手动刷新、断网恢复、删除之后，列表以外的几份（计数、待审批）一起重拉；
+  // tick：轮询时只刷计数，待审批跟着 catalog 的轮询走，不另敲一遍
+  const [epoch, setEpoch] = useState(0)
+  const [tick, setTick] = useState(0)
+  const queue = useApprovalQueue(epoch)
+  // 判「等待审批 / 已挂起」用哪份待审批：页面自己那份上限高（500 条），没拿到
+  // 之前用 catalog 的；两份都没有时是 null，按等待审批算，不闪成「已挂起」
+  const known: Approval[] | null = queue.state === 'ok' ? queue.items : catalogLoaded ? approvals : null
+
+  // 实际查询的状态：页签定死的范围和文字里的状态词取交集；「全部」里文字优先于分段
+  const tabCodes = tab === 'running' || tab === 'failed' ? TAB_CODES[tab] : null
+  const codes: StatusCode[] = tabCodes
+    ? (parsed.codes.length ? tabCodes.filter((c) => parsed.codes.includes(c)) : tabCodes)
+    : (parsed.codes.length ? parsed.codes : segment)
+  const impossible = !!tabCodes && parsed.codes.length > 0 && codes.length === 0
+
+  const filters = { codes, runClass, workflowId, q: parsed.q }
+  const list = useRunList(filters, tab !== 'approvals' && !impossible)
+  // 计数两份：页签和分段上的跟着当前的类别、工作流、名称条件走；右侧总览说的
+  // 是全局——筛掉了不代表事情没了
+  const narrowed = !!(runClass || workflowId || parsed.q)
+  const countKey = epoch * 100_000 + tick
+  const globalCounts = useStatusCounts({ runClass: '', workflowId: '', q: '' }, known, countKey)
+  const narrowCounts = useStatusCounts({ runClass, workflowId, q: parsed.q }, known, countKey, narrowed)
+  const counts = narrowed ? narrowCounts : globalCounts
+
+  const { reload: reloadList, patchRow, removeRow } = list
+  const refreshAll = useCallback(() => {
+    void reloadList()
+    setEpoch((e) => e + 1)
+  }, [reloadList])
+  // 断网恢复：列表、计数、待审批一起重拉，不停在「还没有运行记录」的假空态上
+  useOnReconnect(refreshAll)
+
+  // 有在跑的：列表每 4 秒原地刷新（页面不可见时不刷）；「运行中」页签一直刷，
+  // 新发起的运行会自己出现
+  const hasLive = list.rows.some((r) => isLiveRun(r.status))
+  useEffect(() => {
+    if (tab === 'approvals' || (tab !== 'running' && !hasLive)) return
+    const t = setInterval(() => {
+      if (document.hidden) return
+      void reloadList({ silent: true })
+      setTick((n) => n + 1)
+    }, 4000)
+    return () => clearInterval(t)
+  }, [tab, hasLive, reloadList])
+
+  // waiting / held 在后端都是 interrupted：查回来之后按审批列表再分一次
+  const codeSig = codes.join(',')
+  const rows = useMemo(
+    () => (impossible ? [] : list.rows.filter((r) => matchesCodes(r, codes, known))),
+    [list.rows, codeSig, known, impossible], // codes 每次渲染都是新数组，按内容比
   )
+  const shownList = impossible ? { ...list, rows: [], state: 'ok' as const, hasMore: false } : { ...list, rows }
 
-  // 详情走和画布助手栏、问数据页同一个解码器和同一个组件：三处各写一套的话，
-  // 同一次运行会被讲成三个不同的故事，而用户没法判断哪个是真的
-  const turn = useMemo<StreamTurn[]>(() => {
-    if (!selected) return []
-    const finished = [...events].reverse().find((e) => e.type === 'run.finished')
-    const failedEvent = [...events].reverse().find((e) => e.type === 'run.failed')
-    return [{
-      id: selected.id,
-      phase: failedEvent || selected.status === 'failed' ? 'error'
-        : pendingHere.length ? 'waiting'
-        : selected.status === 'running' ? 'running' : 'done',
-      status: STATUS_TEXT[selected.status] ?? selected.status,
-      steps: decodeRun(events),
-      // run 对象是启动时的快照，成果在 run.finished 事件里；历史记录两者
-      // 都已落库，取事件那份更接近"当时真的输出了什么"
-      output: finished?.data?.output ?? selected.output ?? null,
-      error: failedEvent ? String(failedEvent.data?.error ?? '') : selected.error || undefined,
-      runClass: selected.run_class,
-    }]
-  }, [selected, events, pendingHere.length])
+  const dupNames = useMemo(() => duplicateNames([
+    ...workflows.map((w) => ({ id: w.id, name: w.name })),
+    ...list.rows.map((r) => ({ id: r.workflow_id, name: r.workflow_name })),
+  ]), [workflows, list.rows])
+
+  // 待审批页签也吃同样的类别、工作流、名称条件
+  const approvalFilter = useCallback((a: Approval) => {
+    if (runClass && a.run_class !== runClass) return false
+    if (workflowId && a.workflow_id !== workflowId) return false
+    if (parsed.q && !(a.workflow_name ?? '').toLowerCase().includes(parsed.q.toLowerCase())) return false
+    return true
+  }, [runClass, workflowId, parsed.q])
+
+  const pendingOf = useCallback(
+    (id: string) => known?.find((a) => a.run_id === id && a.status === 'pending'),
+    [known],
+  )
+  const codeOf = useCallback((r: Run) => runCode(r, known), [known])
+
+  const open = (id: string) => navigate({ pathname: `/runs/${id}`, search: location.search })
+
+  // 详情里那一条变了：原地换掉列表里的那一行；状态变了顺带刷新计数
+  const lastStatus = useRef(new Map<string, string>())
+  const onRunChange = useCallback((run: Run) => {
+    patchRow(run)
+    const before = lastStatus.current.get(run.id)
+    lastStatus.current.set(run.id, run.status)
+    if (before && before !== run.status) setTick((n) => n + 1)
+  }, [patchRow])
+
+  const onDeleted = useCallback((id: string) => {
+    removeRow(id)
+    setEpoch((e) => e + 1)
+    navigate({ pathname: '/runs', search: location.search }, { replace: true })
+  }, [removeRow, navigate, location.search])
+
+  const now = useNow(60_000)
+  const queueItems = queue.items.filter(approvalFilter)
+  const oldest = oldestAge(queueItems, now)
+  const running = (counts.counts.running ?? 0) + (counts.counts.queued ?? 0)
+  const failed = counts.counts.failed ?? 0
+  const plus = counts.saturated ? '+' : ''
+  const allRunning = (globalCounts.counts.running ?? 0) + (globalCounts.counts.queued ?? 0)
+  const allFailed = globalCounts.counts.failed ?? 0
+  const allPlus = globalCounts.saturated ? '+' : ''
+  const allPending = queue.items.length
+  const allOldest = oldestAge(queue.items, now)
+  const tabs: TabItem<RunsTab>[] = RUNS_TABS.map((key) => {
+    if (key === 'approvals') {
+      return {
+        key, label: TAB_LABEL[key], count: queueItems.length, tone: 'alert',
+        title: queueItems.length
+          ? `${queueItems.length} 条待审批${oldest != null ? `，最久已等 ${formatSpan(oldest, { coarse: true })}` : ''}`
+          : '没有待审批',
+      }
+    }
+    if (key === 'running') return { key, label: TAB_LABEL[key], count: running, countLabel: `${running}${plus}`, tone: 'live' }
+    if (key === 'failed') return { key, label: TAB_LABEL[key], count: failed, countLabel: `${failed}${plus}`, tone: 'quiet' }
+    return { key, label: TAB_LABEL[key] }
+  })
+
+  const setTab = (k: RunsTab) => patchParams({ tab: k === 'all' ? null : k })
+  const setText = (v: string) => { typing.current = true; setDraft(v) }
+  const pickSegment = (code: StatusCode | null) => {
+    // 点了分段，文字里原来的状态词就不该再和它打架
+    const rest = stripStatusWords(draft)
+    typing.current = false
+    setDraft(rest)
+    patchParams({ status: code, q: rest || null })
+  }
+  const clearFilters = () => {
+    typing.current = false
+    setDraft('')
+    patchParams({ q: null, status: null, class: null, wf: null })
+  }
+
+  const filterNote = describeFilters({ tab, parsed, segment, runClass, workflowId, workflows })
 
   return (
-    <div className="flex h-full">
-      <div className="flex w-[380px] shrink-0 flex-col border-r">
-        <div className="flex items-center gap-2 border-b p-2">
-          <input className="field" placeholder="按名称、状态或内容筛选…" value={filter}
-                 onChange={(e) => setFilter(e.target.value)} />
-          <button className="btn btn-sm" onClick={load}><RefreshCw size={11} /></button>
-        </div>
-        <div className="flex-1 overflow-y-auto">
-          {loading && <div className="p-4"><Spinner /></div>}
-          {!loading && !shown.length && <Empty icon={<History size={22} />} title="还没有运行记录" />}
-          {shown.map((run) => {
-            // 一行只有"临时图 · 1.2s · 340 tok"的话，十条运行长得一模一样，
-            // 要分清哪条是哪条只能挨个点开
-            const summary = summarizeRun(run.input, run.output)
-            return (
-              <button
-                key={run.id}
-                onClick={() => navigate(`/runs/${run.id}`)}
-                className={clsx(
-                  'flex w-full flex-col gap-0.5 border-b px-3 py-2 text-left hover:bg-hover',
-                  selected?.id === run.id && 'bg-hover',
-                )}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate text-[12px]">
-                    {run.workflow_name || '临时图'}
-                  </span>
-                  {run.run_class === 'formal' && (
-                    <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>正式</span>
-                  )}
-                  {(run.output as any)?._issuance?.tier === 'withheld' && (
-                    <span className="chip" style={{ color: 'var(--err)' }}>不予出具</span>
-                  )}
-                  <StatusDot status={run.status} />
-                </div>
-                {summary && (
-                  <div className="truncate text-[11px] text-dim" title={summary}>{summary}</div>
-                )}
-                <div className="flex gap-2 text-[10px] text-faint">
-                  <span>{run.created_at ? new Date(run.created_at).toLocaleString('zh-CN') : ''}</span>
-                  {run.usage?.duration_ms ? <span>{formatDuration(run.usage.duration_ms)}</span> : null}
-                  {run.usage?.total_tokens ? <span>{run.usage.total_tokens} tok</span> : null}
-                  {run.usage?.cost_usd ? <span>${Number(run.usage.cost_usd).toFixed(4)}</span> : null}
-                </div>
-              </button>
-            )
-          })}
-        </div>
-      </div>
+    <div className="flex h-full flex-col" data-runs-page="">
+      {/* 页头和工具、知识、数据、设置几页同一个样子：48px 高、图标框、标题、一句
+          说明。待审批的数不在这里重复——紧下面的页签上就有 */}
+      <header className="flex h-12 shrink-0 items-center gap-2.5 border-b bg-panel px-4">
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border bg-elev text-dim" aria-hidden>
+          <History size={13} />
+        </span>
+        <h1 className="shrink-0 text-sm font-semibold">记录</h1>
+        <p className="min-w-0 truncate text-xs text-faint">每次运行的完整轨迹、待处理的审批和封存凭证</p>
+        <span className="flex-1" />
+        <IconButton label="刷新" icon={<RefreshCw size={12} aria-hidden />} onClick={refreshAll} data-runs-refresh="" />
+      </header>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        {!selected && <Empty title="选一条运行记录" hint="左侧点击可以查看完整的执行轨迹、输入输出和用量。" />}
-        {selected && (
-          <>
-            <div className="flex shrink-0 items-start gap-3 border-b px-4 py-2.5">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 text-sm font-semibold">
-                  {selected.workflow_name || '临时图'}
-                  {selected.run_class === 'formal'
-                    ? <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>正式 v{selected.version}</span>
-                    : <span className="chip">探索性</span>}
-                </div>
-                <div className="mono truncate text-[10.5px] text-faint">
-                  {selected.id}
-                  {selected.version_hash && ` · 版本 ${selected.version_hash.slice(0, 10)}`}
-                  {selected.manifest_hash && ` · 清单 ${selected.manifest_hash.slice(0, 10)}`}
-                  {selected.started_by && ` · by ${selected.started_by}`}
-                </div>
-              </div>
-              <StatusDot status={selected.status} />
-              {selected.manifest_hash && (
-                <button
-                  className="btn btn-sm btn-ghost"
-                  title="核对事件流和封存时的清单是否一致"
-                  onClick={async () => {
-                    try {
-                      const res = await api.runs.verify(selected.id)
-                      toast(res.message, res.ok ? 'ok' : 'error')
-                    } catch (e: any) { toast(e.message ?? '核对失败', 'error') }
-                  }}
-                >
-                  <ShieldCheck size={11} />
-                </button>
-              )}
-              <button
-                className={clsx('btn btn-sm btn-ghost', raw && 'text-[var(--accent)]')}
-                title={raw ? '回到可读视图' : `看原始事件（${events.length} 条）`}
-                onClick={() => setRaw((v) => !v)}
-              >
-                <Code2 size={11} />
-              </button>
-              {selected.run_class !== 'formal' && (
-                <button
-                  className="btn btn-sm"
-                  title="把这次实际走过的路径提取成草稿模板（探索层 → 模板层）"
-                  onClick={async () => {
-                    try {
-                      const res = await api.copilot.fromRun(selected.id)
-                      toast(`已提取为草稿「${res.name}」（${res.nodes} 节点，剪掉 ${res.dropped_nodes} 个未走节点）`, 'ok')
-                    } catch (e: any) { toast(e.message ?? '提取失败', 'error') }
-                  }}
-                >
-                  <GitFork size={11} /> 提取模板
-                </button>
-              )}
-              <button
-                className="btn btn-sm btn-ghost"
-                onClick={async () => {
-                  if (!confirm('删除这条运行记录？')) return
-                  await api.runs.remove(selected.id)
-                  navigate('/runs', { replace: true })
-                  await load()
-                  toast('已删除', 'ok')
-                }}
-              >
-                <Trash2 size={11} className="text-[var(--err)]" />
-              </button>
-            </div>
-
-            {/* 等待人工的运行要能就地处理。导航上的待办徽标指向这一页，
-                而这里以前只有只读的事件列表——刷新页面后那些卡在审批上的
-                运行在整个界面里没有任何入口可以推进。 */}
-            {pendingHere.length > 0 && (
-              <div className="shrink-0 border-b" style={{ borderColor: 'var(--warn)' }}>
-                {pendingHere.map((a) => (
-                  <ApprovalCard key={a.id} approval={a} onResolved={refreshDetail} />
-                ))}
-              </div>
+      <div className="flex min-h-0 flex-1">
+        <aside className="flex w-[360px] shrink-0 flex-col border-r bg-panel xl:w-[400px]" aria-label="运行列表">
+          <RunTabs tabs={tabs} active={tab} onChange={setTab} label="记录分类" idPrefix="runs" />
+          <FilterBar
+            text={draft} onText={setText} parsed={parsed}
+            runClass={runClass} onRunClass={(v) => patchParams({ class: v || null })}
+            workflowId={workflowId} onWorkflow={(id) => patchParams({ wf: id || null })}
+            workflows={workflows} dupNames={dupNames}
+          />
+          {tab === 'all'
+            ? <StatusSegments active={codes} onPick={pickSegment} counts={counts} />
+            : <div className="h-2 shrink-0" />}
+          <div
+            className="min-h-0 flex-1 overflow-y-auto border-t"
+            role="tabpanel"
+            id="runs-panel"
+            aria-labelledby={`runs-tab-${tab}`}
+            data-runs-panel={tab}
+            onKeyDown={moveInList}
+          >
+            {tab === 'approvals' ? (
+              <ApprovalRows queue={queue} filter={approvalFilter} onOpen={open} selectedId={runId} dupNames={dupNames} />
+            ) : (
+              <RunRows
+                list={shownList}
+                codeOf={codeOf}
+                pendingOf={pendingOf}
+                selectedId={runId}
+                onOpen={open}
+                dupNames={dupNames}
+                emptyTitle={tab === 'running' ? '现在没有在跑的运行' : tab === 'failed' ? '没有失败的运行' : '还没有运行记录'}
+                emptyBody={tab === 'all' ? '在问数据或画布上发起一次运行，完整轨迹会记在这里。' : undefined}
+                filtered={filterNote}
+                onClear={clearFilters}
+              />
             )}
+          </div>
+        </aside>
 
-            {/* 中断了却没有待审批：服务重启时停下的，断点还在。以前这里显示"等待人工
-                介入"，却没有任何东西可以点——看起来就是卡死了 */}
-            {selected.status === 'interrupted' && pendingHere.length === 0 && (
-              <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-[11.5px]"
-                   style={{ borderColor: 'var(--warn)' }}>
-                <span className="flex-1 text-dim">
-                  {selected.error || '这次运行中断了'}。前面跑完的节点不会重跑。
-                </span>
-                <button className="btn btn-sm" onClick={async () => {
-                  try {
-                    await api.runs.resume(selected.id, null)
-                    toast('已从断点接着跑', 'ok')
-                    await refreshDetail(selected.id)
-                  } catch (e: any) { toast(e.message ?? '恢复失败', 'error') }
-                }}>
-                  <Play size={11} /> 接着跑
-                </button>
-              </div>
-            )}
-
-            <div className="min-h-0 flex-1">
-              {raw ? <RawEvents events={events} /> : <AssistantStream turns={turn} />}
-            </div>
-
-            <div className="flex shrink-0 items-center gap-3 border-t px-4 py-1.5 text-[10px] text-faint">
-              <span>{events.length} 条事件</span>
-              {selected.usage?.total_tokens ? <span>{selected.usage.total_tokens} tok</span> : null}
-              {selected.usage?.cost_usd ? <span>${Number(selected.usage.cost_usd).toFixed(4)}</span> : null}
-              {selected.usage?.duration_ms ? <span>{formatDuration(selected.usage.duration_ms)}</span> : null}
-              <span className="flex-1" />
-              {selected.input && !!Object.keys(selected.input).length && (
-                <span className="truncate" title={JSON.stringify(selected.input, null, 2)}>
-                  输入：{summarizeRun(selected.input)}
-                </span>
-              )}
-            </div>
-          </>
-        )}
+        {/* 外壳已经有 <main>，这里再套一个就是两个主区域地标 */}
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="运行详情">
+          {runId
+            ? <RunDetailView key={runId} runId={runId} onChange={onRunChange} onDeleted={onDeleted} />
+            : <Overview pending={allPending} oldest={allOldest} running={allRunning} failed={allFailed} plus={allPlus}
+                        onTab={setTab} />}
+        </section>
       </div>
     </div>
   )
 }
 
-const STATUS_TEXT: Record<string, string> = {
-  succeeded: '完成', failed: '失败', running: '执行中',
-  interrupted: '等待人工介入', cancelled: '已取消', queued: '排队中',
+/** 一批待审批里等得最久的那条等了多久；空的是 null */
+function oldestAge(items: Approval[], now: number): number | null {
+  return items.reduce<number | null>((m, a) => {
+    const age = ageMs(a.created_at, now)
+    return age != null && (m == null || age > m) ? age : m
+  }, null)
 }
 
-/** 原始事件。翻译层出问题时用来对照。 */
-function RawEvents({ events }: { events: RunEvent[] }) {
-  if (!events.length) {
-    return <div className="p-3 text-center text-[11px] text-faint">没有事件记录</div>
-  }
+/** 列表里 ↑↓ 在行之间移动焦点，回车打开（行本身是按钮）。不在移动时就打开：每按一下就拉一次详情太吵 */
+function moveInList(e: KeyboardEvent<HTMLDivElement>) {
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>('[data-run-id][type=button], [data-approval-id]')]
+  const i = rows.indexOf(document.activeElement as HTMLElement)
+  if (i < 0) return
+  const next = rows[e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1)]
+  if (!next || next === rows[i]) return
+  e.preventDefault()
+  next.focus()
+  next.scrollIntoView({ block: 'nearest' })
+}
+
+/** 空的「没有匹配」要说清是被哪些条件筛空的；没有任何条件时返回 null */
+function describeFilters({ tab, parsed, segment, runClass, workflowId, workflows }: {
+  tab: RunsTab; parsed: ReturnType<typeof parseQuery>; segment: StatusCode[]
+  runClass: string; workflowId: string; workflows: { id: string; name: string }[]
+}): string | null {
+  const parts: string[] = []
+  if (parsed.words.length) parts.push(`状态「${parsed.words.join('、')}」`)
+  else if (tab === 'all' && segment.length) parts.push(`状态「${segment.map((c) => STATUS[c].short).join('、')}」`)
+  if (parsed.q) parts.push(`名称含「${parsed.q}」`)
+  if (runClass) parts.push(runClass === 'formal' ? '正式运行' : '探索运行')
+  if (workflowId) parts.push(`工作流「${workflows.find((w) => w.id === workflowId)?.name ?? '已删除的工作流'}」`)
+  if (!parts.length) return null
+  return `筛选条件：${parts.join(' · ')}${tab !== 'all' ? `（在「${TAB_LABEL[tab]}」里）` : ''}`
+}
+
+/**
+ * 没选中运行时的右侧：不是一句「选一条」，而是此刻要管的几件事——待审批、在跑的、
+ * 失败的，点了就去对应的页签。
+ */
+function Overview({ pending, oldest, running, failed, plus, onTab }: {
+  pending: number; oldest: number | null; running: number; failed: number; plus: string
+  onTab: (t: RunsTab) => void
+}) {
+  const tiles: { key: RunsTab; code: StatusCode; label: string; value: string; sub: string; alert: boolean }[] = [
+    {
+      key: 'approvals', code: 'waiting', label: '待审批', value: String(pending),
+      sub: pending ? `最久已等 ${formatSpan(oldest, { coarse: true })}` : '没有要处理的',
+      alert: pending > 0,
+    },
+    { key: 'running', code: 'running', label: '运行中', value: `${running}${running ? plus : ''}`, sub: running ? '实时看、随时停' : '现在没有在跑的', alert: false },
+    { key: 'failed', code: 'failed', label: '失败', value: `${failed}${failed ? plus : ''}`, sub: failed ? '看原因、从断点接着跑' : '没有失败的', alert: false },
+  ]
   return (
-    <div className="h-full overflow-y-auto">
-      {events.map((e) => (
-        <div key={e.seq} className="flex gap-2 border-b px-3 py-1 text-[10.5px] last:border-0">
-          <span className="w-10 shrink-0 text-faint">#{e.seq}</span>
-          <span className="w-32 shrink-0 text-[var(--accent)]">{e.type}</span>
-          <span className="w-24 shrink-0 truncate text-dim">{e.node_id ?? ''}</span>
-          <span className="min-w-0 flex-1 break-all text-faint">
-            {JSON.stringify(e.data).slice(0, 240)}
-          </span>
-        </div>
-      ))}
+    <div className="flex flex-1 flex-col items-center justify-center gap-6 px-8" data-runs-overview="">
+      <div className="grid w-full max-w-xl grid-cols-3 overflow-hidden rounded-lg border bg-panel">
+        {tiles.map((t, i) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => onTab(t.key)}
+            className="flex flex-col gap-1 px-4 py-3 text-left transition-colors hover:bg-hover"
+            style={i ? { borderLeft: '1px solid var(--border)' } : undefined}
+            data-overview={t.key}
+          >
+            <span className="flex items-center gap-1.5 text-2xs text-faint">
+              <StatusBadge status={t.code} size={11} decorative animate={false} /> {t.label}
+            </span>
+            <span className="mono tnum text-xl leading-7" style={{ color: t.alert ? STATUS[t.code].color : undefined }}>
+              {t.value}
+            </span>
+            <span className="truncate text-2xs text-faint">{t.sub}</span>
+          </button>
+        ))}
+      </div>
+      <EmptyState
+        icon={<Inbox size={22} />}
+        title="选一条运行记录"
+        body="左侧点开一条，可以看完整的执行轨迹、三种时长、封存凭证；失败的能从断点接着跑，等审批的就地处理。"
+        className="py-0"
+      />
     </div>
   )
 }

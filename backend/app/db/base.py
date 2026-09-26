@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator
 from sqlalchemy import JSON, DateTime, MetaData, event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from app.core.config import settings
 
@@ -26,18 +27,46 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+class UTCDateTime(TypeDecorator):
+    """存 UTC、读出来也是带时区的 UTC。
+
+    SQLite 没有时区类型：DateTime(timezone=True) 写进去的只是一串不带偏移的
+    字面时间，读回来是 naive 的。API 于是吐出 '2026-09-26T01:11:19'，浏览器把
+    不带偏移的 ISO 串当本地时间解析，运行列表整体慢了 8 小时。在这一层补上 UTC，
+    pydantic 序列化自然带 +00:00，所有接口一次修好。
+
+    写入前先换算成 UTC 再去掉时区：SQLite 方言格式化时直接丢弃 tzinfo，
+    一个 +08:00 的时间原样写进去，读回来就差出 8 小时。
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
     # 图定义、节点配置、事件负载都是任意形状的 JSON，统一映射到 SQLite 的 JSON 列
-    type_annotation_map = {dict[str, Any]: JSON, list[Any]: JSON}
+    type_annotation_map = {dict[str, Any]: JSON, list[Any]: JSON, datetime: UTCDateTime}
 
 
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 
 
 def _stop_aiosqlite_once() -> None:
@@ -109,6 +138,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs", "manifest_hash", "VARCHAR(64)"),
     ("runs", "manifest_seq", "INTEGER"),
     ("runs", "started_by", "VARCHAR(100)"),
+    # 续跑、恢复要沿用第一次发起时的记忆域、知识库和审批默认值；以前只在第一段
+    # _drive 里传过一次，恢复后回落成 "default"，同一次运行前后两段查的不是同一个库
+    ("runs", "memory_scope", "VARCHAR(100)"),
+    ("runs", "collection", "VARCHAR(100)"),
+    ("runs", "approval_default", "VARCHAR(20)"),
+    ("runs", "error_node_id", "VARCHAR(64)"),
     ("workflows", "status", "TEXT DEFAULT 'draft'"),
     ("workflows", "published_version", "INTEGER"),
     ("workflows", "published_by", "VARCHAR(100)"),

@@ -10,8 +10,9 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
+from app.engine.errors import describe_exception, raw_detail
 from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, tools
-from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges
+from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
 from app.engine.state import GraphState
 
 NodeRunner = Callable[[GraphState, NodeContext], Awaitable[dict[str, Any]]]
@@ -40,11 +41,13 @@ RUNNERS: dict[NodeType, NodeRunner] = {
 ROUTING_TYPES = {NodeType.BRANCH, NodeType.LOOP}
 
 
-def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaitable[dict[str, Any]]]:
+def _wrap(
+    node: GraphNode, run_ctx: RunContext, loop_id: str | None = None,
+) -> Callable[[GraphState], Awaitable[dict[str, Any]]]:
     """给节点执行器套上事件、计时、重试和错误处理。
 
     画布上看到的每一次高亮、每一条耗时，都来自这层包装；
-    执行器本身只管自己那点业务逻辑。
+    执行器本身只管自己那点业务逻辑。loop_id 是直接包住它的那层循环。
     """
     runner = RUNNERS.get(node.type)
     ctx = NodeContext(node=node, run=run_ctx)
@@ -66,7 +69,8 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
         retries = int(node.config.get("retries", 0) or 0)
         backoff = float(node.config.get("retry_backoff", 1.0) or 1.0)
         started = time.perf_counter()
-        ctx.emit(EventType.NODE_STARTED, node_type=str(node.type), label=node.title)
+        ctx.emit(EventType.NODE_STARTED, node_type=str(node.type), label=node.title,
+                 **_started_context(node.id, state, run_ctx, loop_id))
 
         last_error: Exception | None = None
         for attempt in range(retries + 1):
@@ -140,8 +144,10 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
 
         elapsed = int((time.perf_counter() - started) * 1000)
         message = _describe(last_error)
-        # node_id 要带上：前端靠它把出错的节点从"转圈"收敛成"失败"
-        ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed, node_id=node.id)
+        # node_id 要带上：前端靠它把出错的节点从"转圈"收敛成"失败"。
+        # error 是给人看的那句，原始异常放 detail，排查的人照样拿得到
+        ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed, node_id=node.id,
+                 detail=_detail(last_error))
 
         # 容错模式：记下错误继续往下走，而不是让整张图挂掉
         if node.config.get("on_error") == "continue":
@@ -162,12 +168,39 @@ def _wrap(node: GraphNode, run_ctx: RunContext) -> Callable[[GraphState], Awaita
 
 
 def _describe(error: BaseException | None) -> str:
-    """错误消息。NodeError 的 message 本来就是写给人看的，不用再前缀类型名。"""
+    """错误消息。NodeError 的 message 本来就是写给人看的；别的异常翻成一句原因，
+    不带类型名和内部符号——界面上出现过「_make_query_tool.<locals>._run() got an
+    unexpected keyword argument」这种首行报错。"""
     if error is None:
         return "未知错误"
     if isinstance(error, NodeError):
         return str(error)
-    return f"{type(error).__name__}: {error}"
+    return f"执行出错：{describe_exception(error)}"
+
+
+def _detail(error: BaseException | None) -> str | None:
+    """原始异常。NodeError 自己是人话，真正的原因在它包住的那个异常里。"""
+    if isinstance(error, NodeError):
+        return raw_detail(error.__cause__) if error.__cause__ is not None else None
+    return raw_detail(error)
+
+
+def _started_context(
+    node_id: str, state: GraphState, run_ctx: RunContext, loop_id: str | None,
+) -> dict[str, Any]:
+    """node.started 附带的上下文：在循环的第几轮，以及是不是恢复后的那次重放。"""
+    out: dict[str, Any] = {}
+    if loop_id:
+        mark = (state.get("loops") or {}).get(loop_id)
+        # 循环节点决定进 body 时已经把 index 推进到"这一轮的序号"（从 1 数）
+        if isinstance(mark, dict) and not mark.get("finished") and mark.get("index"):
+            out["iteration"] = int(mark["index"])
+    pending = run_ctx.extra.get("resumed")
+    if isinstance(pending, set) and node_id in pending:
+        # 只有恢复后第一次跑到它才算重放；同一次运行里之后再进来是正常执行
+        pending.discard(node_id)
+        out["resumed"] = True
+    return out
 
 
 def _vars_preview(updates: dict[str, Any]) -> dict[str, Any] | None:
@@ -277,9 +310,11 @@ def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
     builder = StateGraph(GraphState)
     node_map = spec.node_map()
     joins = _join_nodes(spec, node_map)
+    enclosing = innermost_loops(spec)
 
     for node in spec.nodes:
-        builder.add_node(node.id, _wrap(node, run_ctx), defer=node.id in joins)
+        builder.add_node(node.id, _wrap(node, run_ctx, enclosing.get(node.id)),
+                         defer=node.id in joins)
 
     # 入口
     entries = spec.entry_nodes()

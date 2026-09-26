@@ -175,5 +175,7 @@ async def web_search(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
             results = await _duckduckgo(args.query, args.max_results)
             engine = "duckduckgo"
     except Exception as e:  # noqa: BLE001 - 搜索失败不该让整个 run 挂掉
-        return {"error": f"搜索失败：{type(e).__name__}: {e}", "results": []}
+        from app.api.errors import explain
+
+        return {"error": f"搜索失败：{explain(e)[0]}", "results": []}
     return {"engine": engine, "query": args.query, "results": results}

@@ -20,5 +20,5 @@ async def get_artifact(artifact_id: str) -> dict[str, Any]:
         # 哈希对不上：明确报给调用方，这正是工件库存在的意义
         raise HTTPException(409, str(e)) from e
     if content is None:
-        raise HTTPException(404, "工件不存在")
+        raise HTTPException(404, "这个工件不存在，可能已经被删了")
     return {"id": artifact_id, "content": content}

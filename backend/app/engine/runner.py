@@ -20,6 +20,7 @@ from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
+from app.engine.errors import describe_exception, raw_detail
 from app.engine.schema import GraphSpec, loop_steps, topology_of, validate_graph
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,9 @@ class RunManager:
         # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
         # 还丢掉 run.input——那不是恢复，是伪造一份结果。
         async with SessionLocal() as session:
+            stranded = list((await session.execute(
+                select(Run.id, Run.last_seq).where(Run.status == "running")
+            )).all())
             await session.execute(
                 update(Run)
                 .where(Run.status == "running")
@@ -65,6 +69,14 @@ class RunManager:
                 .values(status="failed", error="服务重启时这次运行还在排队，没有可恢复的进度，请重新发起")
             )
             await session.commit()
+        # 进程被强杀时连 server_shutdown 日志都来不及发，事件流停在半路。补上这一条，
+        # 回放它的客户端才知道它是挂起了，而不是还在跑
+        for run_id, last_seq in stranded:
+            bus.set_seq(run_id, last_seq or 0)
+            await self._emit(run_id, EventType.LOG, data={
+                "level": "warn", "code": "server_shutdown",
+                "message": "服务上次没有正常关停，这次运行停在了半路；可以从断点接着跑",
+            })
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -97,6 +109,7 @@ class RunManager:
         node_id: str | None = None,
         data: dict[str, Any] | None = None,
         persist: bool = True,
+        ts: float | None = None,
     ) -> None:
         event = RunEventModel(
             run_id=run_id,
@@ -104,6 +117,9 @@ class RunManager:
             type=EventType(str(event_type)),
             node_id=node_id,
             data=data or {},
+            # 节点里发出的事件带着它发生的时刻。以前一律取转发时刻：并行的成员
+            # 先做完的那条也要排到整轮结束才被转发，时间线上的耗时就全错了
+            **({"ts": ts} if ts else {}),
         )
         # 先落库，再广播。顺序反过来会漏事件，而且是结构性的漏：
         #
@@ -155,13 +171,17 @@ class RunManager:
         version: int | None = None,
         version_hash: str | None = None,
         started_by: str | None = None,
+        approval_default: str | None = None,
     ) -> Run:
         spec = GraphSpec.model_validate(graph)
         report = validate_graph(spec)
         if not report.ok:
             raise ValueError(
-                "图校验未通过：" + "；".join(i.message for i in report.issues if i.level == "error")
+                "工作流没有通过校验，先在画布上修好标红的节点再运行："
+                + "；".join(i.message for i in report.issues if i.level == "error")
             )
+        if approval_default is None:
+            approval_default = await _approval_default(run_class=run_class)
 
         async with SessionLocal() as session:
             run = Run(
@@ -174,6 +194,9 @@ class RunManager:
                 version=version,
                 version_hash=version_hash,
                 started_by=started_by,
+                memory_scope=memory_scope,
+                collection=collection,
+                approval_default=approval_default,
             )
             run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
             session.add(run)
@@ -188,6 +211,7 @@ class RunManager:
                 workflow_id=workflow_id,
                 memory_scope=memory_scope,
                 collection=collection,
+                approval_default=approval_default,
             )
         )
         return run
@@ -214,9 +238,10 @@ class RunManager:
             if not run:
                 raise KeyError(f"找不到运行 {run_id}")
             if run.status not in ("interrupted",):
-                raise ValueError(f"当前状态是 {run.status}，无法恢复")
+                raise ValueError(_cannot_resume(run.status))
             spec = GraphSpec.model_validate(run.graph)
             workflow_id = run.workflow_id
+            carried = _carried(run)
 
         # 先问引擎：这条线程到底停在哪、还等着哪些 interrupt
         run_ctx = RunContext(run_id=run_id, thread_id=run_id, spec=spec, workflow_id=workflow_id)
@@ -247,13 +272,13 @@ class RunManager:
             if approval_id:
                 target = next((a for a in pending if a.id == approval_id), None)
                 if target is None:
-                    raise ValueError(f"审批 {approval_id} 不在待处理列表里")
+                    raise ValueError("这条审批已经处理过了，或者不属于这次运行。刷新看看最新状态")
             elif len(pending) == 1:
                 target = pending[0]
             elif len(pending) > 1:
                 raise ValueError(
-                    f"这次运行有 {len(pending)} 条待处理的人工介入，"
-                    "恢复时必须指定 approval_id 说明回复的是哪一条"
+                    f"这次运行有 {len(pending)} 条待处理的审批，"
+                    "得说明回复的是哪一条（approval_id），请在对应的审批卡上操作"
                 )
 
             now = datetime.now(timezone.utc)
@@ -298,10 +323,13 @@ class RunManager:
                 run = await session.get(Run, run_id)
                 return run
 
-            # 齐了：正式落 resolved，然后驱动引擎
+            # 齐了：正式落 resolved，然后驱动引擎。谁批的跟着交给节点，
+            # human.resolved 里才写得出签批人
+            actors: dict[str, str | None] = {}
             for rec in answered:
                 if rec.status == "answered":
                     rec.status = "resolved"
+                    actors[rec.node_id] = rec.resolved_by
             run = await session.get(Run, run_id)
             bus.set_seq(run_id, run.last_seq)
             run.status = "running"
@@ -323,11 +351,13 @@ class RunManager:
         else:
             command = Command(resume=answers)
         await self._emit(run_id, EventType.RUN_RESUMED, data=(
-            {"message": "服务重启时中断的运行，从断点接着跑"} if command is None
-            else {"response": _safe(response)}
+            {"message": "服务重启时中断的运行，从断点接着跑", "actor": actor} if command is None
+            else {"response": _safe(response), "actor": actor}
         ))
         self._tasks[run_id] = asyncio.create_task(
-            self._drive(run_id, spec, command, workflow_id=workflow_id)
+            self._drive(run_id, spec, command, workflow_id=workflow_id, **carried,
+                        resumed=[str(n) for n in (getattr(snapshot, "next", None) or ())],
+                        actors=actors)
         )
         return run
 
@@ -344,18 +374,24 @@ class RunManager:
         graph 可以带一张改过的图，但只准改配置：节点 id、类型、连线必须和原来
         一模一样。checkpoint 是按节点名存的，改了结构就对不上，续下去会拿着
         错位的通道状态跑出一份似是而非的结果——那比直接报错糟得多。
+
+        服务重启挂起的运行（interrupted 且没有待审批）也走这里：它没有在等谁，
+        断点完好，从断点驱动和失败后接着跑是同一件事。界面上两者都叫「接着跑」。
         """
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if not run:
                 raise KeyError(f"找不到运行 {run_id}")
-            if run.status != "failed":
-                raise ValueError(
-                    f"当前状态是 {run.status}，只有失败的运行能接着跑。"
-                    "（等人工介入的用恢复，已完成的重新发起一次。）"
-                )
+            has_pending = run.status == "interrupted" and (await session.execute(
+                select(Approval.id).where(
+                    Approval.run_id == run_id, Approval.status.in_(["pending", "answered"])
+                ).limit(1)
+            )).first() is not None
+            if not (run.status == "failed" or (run.status == "interrupted" and not has_pending)):
+                raise ValueError(_cannot_continue(run.status, has_pending))
             spec = GraphSpec.model_validate(run.graph)
             workflow_id = run.workflow_id
+            carried = _carried(run)
 
         if graph is not None:
             revised = GraphSpec.model_validate(graph)
@@ -406,10 +442,11 @@ class RunManager:
                 # 分不清这次是接着跑还是整张图又跑了一遍
                 "message": f"从「{labels.get(pending[0], pending[0])}」接着跑"
                            + (f"，前面 {len(done)} 个节点的结果保留" if done else ""),
+                "actor": actor,
             },
         )
         self._tasks[run_id] = asyncio.create_task(
-            self._drive(run_id, spec, None, workflow_id=workflow_id)
+            self._drive(run_id, spec, None, workflow_id=workflow_id, **carried, resumed=pending)
         )
         return run
 
@@ -424,6 +461,12 @@ class RunManager:
         task = self._tasks.get(run_id)
         return bool(task and not task.done())
 
+    async def wait_idle(self, run_id: str, timeout: float = 10.0) -> None:
+        """等这次运行手上的执行任务收完尾。不取消它，也不抛它的异常。"""
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
+
     # ---------------- 执行 ----------------
 
     async def _drive(
@@ -435,27 +478,41 @@ class RunManager:
         workflow_id: str | None = None,
         memory_scope: str = "default",
         collection: str = "default",
+        approval_default: str | None = None,
+        resumed: list[str] | tuple[str, ...] = (),
+        actors: dict[str, str | None] | None = None,
     ) -> None:
         started = time.perf_counter()
         status = "succeeded"
         error: str | None = None
         final_state: dict[str, Any] = {}
+        #: 终态事件（run.failed / run.cancelled）等 _finalize 算完耗时再发，timing 才带得上
+        terminal: tuple[EventType, dict[str, Any]] | None = None
+        error_node: str | None = None
 
         deadline: asyncio.Timeout | None = None
         async with self._semaphore:
             try:
                 async with SessionLocal() as session:
-                    await session.execute(
-                        update(Run)
-                        .where(Run.id == run_id)
-                        .values(status="running", started_at=datetime.now(timezone.utc))
-                    )
-                    await session.commit()
+                    row = await session.get(Run, run_id)
+                    if row is not None:
+                        row.status = "running"
+                        # started_at 只在第一次开始时写。以前每段 _drive 都覆盖它，
+                        # 审批恢复、接着跑之后，运行的"开始时间"就成了最后一段的开始
+                        if row.started_at is None:
+                            row.started_at = datetime.now(timezone.utc)
+                        row.finished_at = None
+                        row.error_node_id = None
+                        await session.commit()
                 await self._emit(
                     run_id,
                     EventType.RUN_STARTED,
                     data={"nodes": len(spec.nodes),
-                          "resumed": payload is None or isinstance(payload, Command)},
+                          "resumed": payload is None or isinstance(payload, Command),
+                          # 实际生效的运行参数进事件流，也就进了封存清单：
+                          # 正式运行查的是哪个库、审批默认是什么，事后可复核
+                          "memory_scope": memory_scope, "collection": collection,
+                          "approval_default": approval_default},
                 )
 
                 run_ctx = RunContext(
@@ -465,6 +522,8 @@ class RunManager:
                     workflow_id=workflow_id,
                     memory_scope=memory_scope,
                     collection=collection,
+                    approval_default=approval_default,
+                    extra={"resumed": set(resumed), "actors": dict(actors or {})},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
                 # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
@@ -510,7 +569,7 @@ class RunManager:
                 else:
                     status = "cancelled"
                     error = "用户取消"
-                    await self._emit(run_id, EventType.RUN_CANCELLED, data={})
+                    terminal = (EventType.RUN_CANCELLED, {})
                 raise
             except TimeoutError as e:
                 status = "failed"
@@ -519,10 +578,10 @@ class RunManager:
                         f"这次执行超过了 {settings.max_run_seconds} 秒的上限，已中止。"
                         "跑得慢的多半是模型或工具没有响应；确实需要更久，调大 AGENTLAB_MAX_RUN_SECONDS"
                     )
+                    terminal = (EventType.RUN_FAILED, {"error": error})
                 else:   # 别处抛的超时，不是这道上限——按普通失败说
-                    error = f"{type(e).__name__}: {e}"
+                    error, terminal = _failure(e, spec)
                     logger.exception("run %s 失败", run_id)
-                await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             except GraphRecursionError:
                 status = "failed"
                 # LangGraph 的原文是英文，还叫人去调 recursion_limit——用户碰不到那个键。
@@ -534,19 +593,18 @@ class RunManager:
                     "多半是有个环在空转：分支连回了上游、却没有 loop 节点给它定轮数上限。"
                     "用 loop 节点包住它；确实需要这么多步，调大 AGENTLAB_MAX_GRAPH_STEPS"
                 )
-                await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
+                terminal = (EventType.RUN_FAILED, {"error": error})
             except Exception as e:  # noqa: BLE001
                 status = "failed"
-                # NodeError 的 message 本来就是写给人看的（"人工驳回：…"），
-                # 再套一层类型名只会让界面上的错误更难读
-                error = str(e) if isinstance(e, NodeError) else f"{type(e).__name__}: {e}"
+                error, terminal = _failure(e, spec)
+                error_node = terminal[1].get("node_id")
                 logger.exception("run %s 失败", run_id)
-                await self._emit(run_id, EventType.RUN_FAILED, data={"error": error})
             finally:
                 elapsed = int((time.perf_counter() - started) * 1000)
                 self._finalizing.add(run_id)
                 try:
-                    await self._finalize(run_id, status, error, final_state, elapsed)
+                    await self._finalize(run_id, status, error, final_state, elapsed,
+                                         terminal=terminal, error_node=error_node)
                 finally:
                     # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
                     # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
@@ -572,6 +630,7 @@ class RunManager:
             chunk.get("type", EventType.LOG),
             node_id=chunk.get("node_id"),
             data=chunk.get("data") or {},
+            ts=chunk.get("ts"),
         )
 
     async def _handle_updates(self, run_id: str, chunk: Any) -> bool:
@@ -624,34 +683,54 @@ class RunManager:
         error: str | None,
         state: dict[str, Any],
         elapsed_ms: int,
+        *,
+        terminal: tuple[EventType, dict[str, Any]] | None = None,
+        error_node: str | None = None,
     ) -> None:
         usage = dict(state.get("usage") or {})
-        usage["duration_ms"] = elapsed_ms
         output = dict(state.get("output") or {})
+        now = datetime.now(timezone.utc)
+        timing = {"wall_ms": elapsed_ms, "active_ms": elapsed_ms, "wait_ms": 0}
 
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if run:
+                timing = await _timing(session, run, elapsed_ms, now)
+                # duration_ms 是各段执行时长之和（= active_ms）。以前用这一段的耗时
+                # 覆盖它：87 秒、中间等过一次审批的运行，列表上写着 22ms
+                usage.update(duration_ms=timing["active_ms"], **timing)
                 run.status = status
                 run.error = error
                 run.output = output
                 run.usage = usage
+                run.error_node_id = error_node
                 if status != "interrupted":
-                    run.finished_at = datetime.now(timezone.utc)
+                    run.finished_at = now
                 await session.commit()
 
         if status == "succeeded":
-            await self._emit(
-                run_id,
-                EventType.RUN_FINISHED,
-                data={"output": _safe(output), "usage": usage, "duration_ms": elapsed_ms},
-            )
+            # 事件里的 output 仍然截断（事件体积要控制），但截了就要说：消费方据此
+            # 回源 GET /api/runs/{id} 取全文。以前截得悄无声息，问数据页把 2000 字处
+            # 切断的半截答案当成完整结论落了库
+            clipped, truncated = _clip(output)
+            data: dict[str, Any] = {"output": clipped, "usage": usage,
+                                    "duration_ms": timing["active_ms"], "timing": timing}
+            if truncated:
+                data["output_truncated"] = True
+            await self._emit(run_id, EventType.RUN_FINISHED, data=data)
+        elif terminal is not None:
+            kind, data = terminal
+            await self._emit(run_id, kind, data={**data, "timing": timing})
         if status != "interrupted":
             # 终态事件落库之后再封存。以前在 run.finished 之前算，清单里恰恰少了
             # 那条宣布"跑完了、成果是什么"的事件——改它的成果，清单照样对得上。
             # 中断态不封：事件还会继续追加
             await self._seal(run_id)
-        if status in ("succeeded", "failed", "cancelled"):
+        if status in ("succeeded", "failed", "cancelled") or (
+            status == "interrupted" and self._closing
+        ):
+            # 关停时挂起的也要让在线的客户端收尾：进程马上就没了，不说一声，
+            # 界面会一直以为它还在跑
             await bus.close(run_id)
 
     async def _seal(self, run_id: str) -> None:
@@ -690,7 +769,7 @@ async def verify_manifest(run_id: str) -> dict[str, Any]:
             raise KeyError(f"找不到运行 {run_id}")
         if not run.manifest_hash:
             return {"sealed": False, "ok": None,
-                    "message": "这次运行还没有封存（没跑完，或者停在人工介入）"}
+                    "message": "这次运行还没有封存（没跑完，或者停在人工审批）"}
         rows = [tuple(r) for r in await session.execute(
             select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
             .where(RunEvent.run_id == run_id)
@@ -717,15 +796,138 @@ async def verify_manifest(run_id: str) -> dict[str, Any]:
 
 def _safe(value: Any, limit: int = 4000) -> Any:
     """把任意对象裁剪成能安全放进事件负载的形状。"""
+    return _clip(value, limit)[0]
+
+
+def _clip(value: Any, limit: int = 4000) -> tuple[Any, bool]:
+    """同 _safe，另外说出有没有真的截掉东西。"""
     if isinstance(value, str):
-        return value[:limit]
-    if isinstance(value, dict):
-        return {k: _safe(v, limit // 2) for k, v in list(value.items())[:50]}
-    if isinstance(value, list):
-        return [_safe(v, limit // 2) for v in value[:50]]
+        return value[:limit], len(value) > limit
+    if isinstance(value, (dict, list)):
+        items = list(value.items()) if isinstance(value, dict) else list(enumerate(value))
+        cut = len(items) > 50
+        kept: list[tuple[Any, Any]] = []
+        for key, item in items[:50]:
+            clipped, lost = _clip(item, limit // 2)
+            kept.append((key, clipped))
+            cut = cut or lost
+        return (dict(kept) if isinstance(value, dict) else [v for _, v in kept]), cut
     if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return str(value)[:limit]
+        return value, False
+    text = str(value)
+    return text[:limit], len(text) > limit
+
+
+_STATUS_TEXT = {
+    "queued": "还在排队", "running": "正在运行", "interrupted": "停在断点上",
+    "succeeded": "已完成", "failed": "失败了", "cancelled": "已取消",
+}
+
+
+def _cannot_resume(status: str) -> str:
+    hint = {
+        "running": "它还在跑，不需要恢复。",
+        "queued": "它还没开始跑。",
+        "succeeded": "要再跑一次，请重新发起运行。",
+        "failed": "失败的运行用「接着跑」从出错的节点继续。",
+        "cancelled": "已取消的运行请重新发起。",
+    }.get(status, "")
+    return f"这次运行{_STATUS_TEXT.get(status, status)}，没有在等审批，不能恢复。{hint}"
+
+
+def _cannot_continue(status: str, has_pending: bool) -> str:
+    """接着跑被拒时说清楚为什么、下一步做什么。
+
+    以前一律套一句「在等待审批，只有失败的运行能接着跑」：服务重启挂起的也被说成
+    在等审批，还让人去一张不存在的审批卡上处理；已取消的只说不行，不说该怎么办。
+    """
+    if status == "interrupted" and has_pending:
+        return "这次运行在等审批，不是失败了，不用接着跑。在审批卡上放行或驳回，它会自己往下走。"
+    return {
+        "cancelled": "这次运行已取消，不能接着跑。要继续，请重新发起一次运行。",
+        "succeeded": "这次运行已完成，没有要接着跑的——只有失败的运行或被服务重启打断的运行"
+                     "能接着跑。要再跑一次，请重新发起运行。",
+        "running": "这次运行正在运行，不需要接着跑。",
+        "queued": "这次运行还在排队，还没开始跑，不需要接着跑。",
+    }.get(status, f"这次运行{_STATUS_TEXT.get(status, status)}，"
+                  "只有失败的运行或被服务重启打断的运行能接着跑。")
+
+
+def _carried(run: Run) -> dict[str, Any]:
+    """第一次发起时定下的运行参数。恢复、接着跑都沿用，老运行没记的按缺省。"""
+    return {
+        "memory_scope": run.memory_scope or "default",
+        "collection": run.collection or "default",
+        "approval_default": run.approval_default,
+    }
+
+
+def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType, dict[str, Any]]]:
+    """失败的首行报错（给人看）和 run.failed 的负载（带上定位和原始异常）。"""
+    if isinstance(exc, NodeError):
+        # NodeError 的 message 本来就是写给人看的（"人工驳回：…"），
+        # 再套一层类型名只会让界面上的错误更难读
+        message = str(exc)
+        detail = raw_detail(exc.__cause__) if exc.__cause__ is not None else None
+        node_id: str | None = exc.node_id
+    else:
+        message = (f"运行出错：{describe_exception(exc)}。技术细节已记在服务日志里；"
+                   "可以点「接着跑」重试，仍然失败请把运行编号反馈给维护者")
+        detail = raw_detail(exc)
+        node_id = None
+    data: dict[str, Any] = {"error": message}
+    if detail:
+        data["detail"] = detail
+    if node_id:
+        node = spec.node_map().get(node_id)
+        data.update(node_id=node_id, label=node.title if node else node_id)
+    return message, (EventType.RUN_FAILED, data)
+
+
+async def _approval_default(*, run_class: str) -> str:
+    """工具审批策略的全局默认，取自设置里的「危险工具默认需要人工确认」。
+
+    正式运行不吃"关"。它跑的是封存的发布版，审批行为只该由那一版里写明的配置
+    决定，不能随一个随时能改的偏好变；受管门禁要求危险工具至少人工确认，也不能被
+    全局开关悄悄降掉。不能按工作流的 status 判断是不是受管：画布上再存一次，status
+    就退回 draft，而 published_version 仍指着受管的那一版。
+    """
+    if run_class == "formal":
+        return "dangerous"
+    from app.api.settings import run_defaults, tool_approval_default
+
+    async with SessionLocal() as session:
+        return tool_approval_default(await run_defaults(session))
+
+
+async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dict[str, int]:
+    """wall：从第一次开始到现在的墙钟；active：各段执行时长之和；wait：等人审批的总时长。
+
+    等待按事件算：每段从 run.interrupted 到下一条 run.resumed。服务重启挂起的那段
+    没有 run.interrupted，不算等审批；失败后到接着跑之间也不算。
+    """
+    prev = run.usage or {}
+    before = prev.get("active_ms", prev.get("duration_ms", 0))
+    active = int(before or 0) + elapsed_ms
+
+    rows = await session.execute(
+        select(RunEvent.type, RunEvent.ts)
+        .where(RunEvent.run_id == run.id,
+               RunEvent.type.in_([EventType.RUN_INTERRUPTED, EventType.RUN_RESUMED]))
+        .order_by(RunEvent.seq)
+    )
+    waited, since = 0.0, None
+    for kind, ts in rows:
+        if kind == EventType.RUN_INTERRUPTED:
+            since = ts if since is None else since
+        elif since is not None:
+            waited += max(0.0, ts - since)
+            since = None
+    if since is not None:
+        waited += max(0.0, now.timestamp() - since)
+
+    wall = int((now - run.started_at).total_seconds() * 1000) if run.started_at else active
+    return {"wall_ms": max(wall, active), "active_ms": active, "wait_ms": int(waited * 1000)}
 
 
 run_manager = RunManager()

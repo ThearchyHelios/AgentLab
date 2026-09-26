@@ -1,10 +1,31 @@
 @import 'tailwindcss';
 @import '@xyflow/react/dist/style.css';
 
-/* --------------------------------------------------------------------------
-   主题 token。深色是默认（长时间盯画布，深色更省眼），浅色由 data-theme 切换。
-   -------------------------------------------------------------------------- */
+/* ==========================================================================
+   主题 token。深色是默认（长时间盯画布，深色更省眼），浅色由 data-theme 切换；
+   没有 data-theme 就是「跟随系统」，由下面的 prefers-color-scheme 分支接管。
+   index.html 在首帧前从 localStorage 读偏好写 data-theme（见 lib/theme.ts），
+   所以不会先闪一帧深色再跳浅色。
+
+   对比度都是按 WCAG 公式实算过的：
+   - 文字三级 text / text-dim / text-faint 在 bg、panel、hover 三种底色上都
+     ≥ 4.5:1（faint 以前只有 2.7–3.6，中文小字在投影和强光下读不清）；
+   - --accent-solid / --warn-solid / --err-solid 是给「实心底 + 字」用的，
+     上面的字用配对的 --on-*，同样 ≥ 4.5:1。--accent 本身留给描边、文字和图形，
+     深色下白字压在 #4f8cff 上只有 3.2:1；
+   - 状态色、节点类型色作为图形都 ≥ 3:1。
+
+   颜色的分工（工业 HMI 的做法：常态用中性色，颜色留给状态）：
+   - ok / warn / err / accent 只表达状态（accent 兼管「选中 / 焦点 / 主操作」），
+     状态一律走下面的 --st-* 语义令牌；
+   - 节点类型色 --nt-* 只在青—蓝灰—紫—品红这一段取色，暖色和强调蓝都让给
+     状态，免得「人工审批」平时就是红的、像失败了。
+
+   浅色这一套写了两遍（data-theme='light' 和「跟随系统 + 系统是浅色」），
+   CSS 没法把选择器和媒体查询并成一条规则。改一处必须同步改另一处。
+   ========================================================================== */
 :root {
+  color-scheme: dark;
   --bg: #0b0e14;
   --bg-elev: #11151f;
   --bg-panel: #141926;
@@ -12,17 +33,58 @@
   --border: #232a3a;
   --border-strong: #333c52;
   --text: #e4e8f1;
-  --text-dim: #94a0b8;
-  --text-faint: #5f6b82;
+  --text-dim: #a0abc1;
+  --text-faint: #7f8ba4;
   --accent: #4f8cff;
-  --accent-soft: #1e3a6b;
+  --accent-soft: #15284d;
+  --accent-solid: #336cf0;
+  --on-accent: #ffffff;
   --ok: #3fb950;
   --warn: #d29922;
+  --warn-solid: #d29922;
+  --on-warn: #1a1300;
   --err: #f85149;
-  --canvas-dot: #1e2534;
+  --err-solid: #da3633;
+  --on-err: #ffffff;
+  --copilot: #bc8cff;
+
+  /* 画布底纹两级：细点每格一个，粗点每 5 格一个，像工程图纸的坐标纸 */
+  --grid-dot: #2a3346;
+  --grid-dot-major: #3a445b;
+  --hairline: #1c2230;
+
+  --elev-1: 0 1px 2px rgb(0 0 0 / 0.35);
+  --elev-2: 0 6px 16px -4px rgb(0 0 0 / 0.55), 0 2px 4px -2px rgb(0 0 0 / 0.45);
+  --elev-3: 0 20px 48px -12px rgb(0 0 0 / 0.7), 0 8px 16px -8px rgb(0 0 0 / 0.5);
+
+  /* 推导出来的状态：比基础状态色压一档，只在图形 + 剪影里出现 */
+  --st-queued: #678cd2;
+  --st-suspended: #b4a481;
+  --st-blocked: #bc6e77;
+  --st-unreached: #68738b;
+
+  /* 节点类型色。按类别分色族：起止石板灰、模型紫、执行青绿、控制品红、
+     上下文天青、把关兰紫；族内靠明度区分，一眼先认出「哪一类」，图标认具体类型 */
+  --nt-input: #b1ceee;
+  --nt-output: #93afd4;
+  --nt-llm: #c7c2ff;
+  --nt-agent: #b49af8;
+  --nt-supervisor: #bcadff;
+  --nt-tool: #10c4c9;
+  --nt-code: #57e3df;
+  --nt-branch: #e389ca;
+  --nt-loop: #ffaddd;
+  --nt-subgraph: #dba9c8;
+  --nt-memory: #1ebeeb;
+  --nt-retrieve: #84d7fe;
+  --nt-transform: #93c3d8;
+  --nt-human: #ce91e6;
+  --nt-validate: #ebb1fd;
+  --nt-metrics: #cbaddb;
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
   --bg: #f6f7f9;
   --bg-elev: #ffffff;
   --bg-panel: #ffffff;
@@ -30,14 +92,176 @@
   --border: #dfe3ea;
   --border-strong: #c3cad6;
   --text: #1a1f2b;
-  --text-dim: #5a6579;
-  --text-faint: #8b95a7;
+  --text-dim: #4a5467;
+  --text-faint: #636d80;
   --accent: #2563eb;
-  --accent-soft: #dbeafe;
-  --ok: #1a7f37;
-  --warn: #9a6700;
+  --accent-soft: #e8f0fe;
+  --accent-solid: #2563eb;
+  --on-accent: #ffffff;
+  --ok: #187a34;
+  --warn: #946300;
+  --warn-solid: #946300;
+  --on-warn: #ffffff;
   --err: #cf222e;
-  --canvas-dot: #d8dde6;
+  --err-solid: #cf222e;
+  --on-err: #ffffff;
+  --copilot: #8250df;
+  --grid-dot: #c9cfda;
+  --grid-dot-major: #b4bcc9;
+  --hairline: #e8ebf0;
+  --elev-1: 0 1px 2px rgb(16 24 40 / 0.06);
+  --elev-2: 0 6px 16px -4px rgb(16 24 40 / 0.12), 0 2px 4px -2px rgb(16 24 40 / 0.06);
+  --elev-3: 0 20px 48px -12px rgb(16 24 40 / 0.22), 0 8px 16px -8px rgb(16 24 40 / 0.1);
+  --st-queued: #4468b5;
+  --st-suspended: #6a5c3e;
+  --st-blocked: #994857;
+  --st-unreached: #80899a;
+  --nt-input: #546e8b;
+  --nt-output: #415774;
+  --nt-llm: #695ead;
+  --nt-agent: #5c448f;
+  --nt-supervisor: #63519e;
+  --nt-tool: #026264;
+  --nt-code: #057c79;
+  --nt-branch: #7e376c;
+  --nt-loop: #9b4c7d;
+  --nt-subgraph: #7a516c;
+  --nt-memory: #025f78;
+  --nt-retrieve: #00769d;
+  --nt-transform: #3e6778;
+  --nt-human: #6f3d81;
+  --nt-validate: #885398;
+  --nt-metrics: #6e557b;
+}
+
+/* 「跟随系统」且系统是浅色：和上面那块逐字相同 */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --bg: #f6f7f9;
+    --bg-elev: #ffffff;
+    --bg-panel: #ffffff;
+    --bg-hover: #eef1f6;
+    --border: #dfe3ea;
+    --border-strong: #c3cad6;
+    --text: #1a1f2b;
+    --text-dim: #4a5467;
+    --text-faint: #636d80;
+    --accent: #2563eb;
+    --accent-soft: #e8f0fe;
+    --accent-solid: #2563eb;
+    --on-accent: #ffffff;
+    --ok: #187a34;
+    --warn: #946300;
+    --warn-solid: #946300;
+    --on-warn: #ffffff;
+    --err: #cf222e;
+    --err-solid: #cf222e;
+    --on-err: #ffffff;
+    --copilot: #8250df;
+    --grid-dot: #c9cfda;
+    --grid-dot-major: #b4bcc9;
+    --hairline: #e8ebf0;
+    --elev-1: 0 1px 2px rgb(16 24 40 / 0.06);
+    --elev-2: 0 6px 16px -4px rgb(16 24 40 / 0.12), 0 2px 4px -2px rgb(16 24 40 / 0.06);
+    --elev-3: 0 20px 48px -12px rgb(16 24 40 / 0.22), 0 8px 16px -8px rgb(16 24 40 / 0.1);
+    --st-queued: #4468b5;
+    --st-suspended: #6a5c3e;
+    --st-blocked: #994857;
+    --st-unreached: #80899a;
+    --nt-input: #546e8b;
+    --nt-output: #415774;
+    --nt-llm: #695ead;
+    --nt-agent: #5c448f;
+    --nt-supervisor: #63519e;
+    --nt-tool: #026264;
+    --nt-code: #057c79;
+    --nt-branch: #7e376c;
+    --nt-loop: #9b4c7d;
+    --nt-subgraph: #7a516c;
+    --nt-memory: #025f78;
+    --nt-retrieve: #00769d;
+    --nt-transform: #3e6778;
+    --nt-human: #6f3d81;
+    --nt-validate: #885398;
+    --nt-metrics: #6e557b;
+  }
+}
+
+/* 由上面推出来的令牌，两套主题共用，只写一次 */
+:root {
+  /* 状态语义。组件里只写 --st-*，不直接写 ok / warn / err / accent——
+     哪天「运行中」要换颜色，改这一处就够了。-soft 是同色的浅底 */
+  --st-idle: var(--text-faint);
+  --st-running: var(--accent);
+  --st-done: var(--ok);
+  --st-waiting: var(--warn);
+  --st-failed: var(--err);
+  --st-skipped: var(--text-faint);
+  --st-cancelled: var(--text-dim);
+  --st-idle-soft: color-mix(in srgb, var(--st-idle) 10%, transparent);
+  --st-queued-soft: color-mix(in srgb, var(--st-queued) 14%, transparent);
+  --st-running-soft: color-mix(in srgb, var(--st-running) 14%, transparent);
+  --st-waiting-soft: color-mix(in srgb, var(--st-waiting) 14%, transparent);
+  --st-done-soft: color-mix(in srgb, var(--st-done) 14%, transparent);
+  --st-failed-soft: color-mix(in srgb, var(--st-failed) 14%, transparent);
+  --st-skipped-soft: color-mix(in srgb, var(--st-skipped) 14%, transparent);
+  --st-cancelled-soft: color-mix(in srgb, var(--st-cancelled) 14%, transparent);
+  --st-suspended-soft: color-mix(in srgb, var(--st-suspended) 14%, transparent);
+  --st-blocked-soft: color-mix(in srgb, var(--st-blocked) 14%, transparent);
+  --st-unreached-soft: color-mix(in srgb, var(--st-unreached) 10%, transparent);
+  /* 「有东西在跑」的颜色。和 --st-running 是一回事，给外壳、品牌标这类
+     不属于某个节点的地方用 */
+  --live: var(--st-running);
+
+  /* 当前焦点的光晕。只给一个元素用（正在看的那个节点、聚焦的输入坞），
+     满屏都在发光就等于没有焦点 */
+  --glow-accent: 0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent),
+    0 0 14px -2px color-mix(in srgb, var(--accent) 45%, transparent);
+
+  /* 动效。时长三档：fast 给 hover / 按下，base 给面板开合，slow 给一次性的
+     入场和「时刻」。缓动 out 是「起步快、尾部长」——被推出来的手感 */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 360ms;
+
+  /* 旧名字：--hover 从来没定义过（协作泳道的空格子因此是透明的），原意就是
+     --bg-hover；--canvas-dot 是画布底纹以前的名字 */
+  --hover: var(--bg-hover);
+  --canvas-dot: var(--grid-dot);
+}
+
+/* 字号阶梯。中文正文不低于 11px（2xs）；画布卡片内部和 360px 的助手栏暂时
+   不受这条约束，它们的可读性靠按缩放分级渲染解决。
+   static：这些变量不管 Tailwind 扫没扫到都输出，单独的 .css 文件里也能用 var() */
+@theme static {
+  --text-2xs: 11px;
+  --text-2xs--line-height: calc(16 / 11);
+  --text-xs: 12px;
+  --text-xs--line-height: calc(16 / 12);
+  --text-sm: 13px;
+  --text-sm--line-height: calc(20 / 13);
+  --text-base: 14px;
+  --text-base--line-height: calc(22 / 14);
+  --text-lg: 16px;
+  --text-lg--line-height: calc(24 / 16);
+  --text-xl: 20px;
+  --text-xl--line-height: calc(28 / 20);
+  --text-2xl: 24px;
+  --text-2xl--line-height: calc(32 / 24);
+
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  --ease-out: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
 }
 
 @theme inline {
@@ -47,77 +271,128 @@
   --color-hover: var(--bg-hover);
   --color-line: var(--border);
   --color-line-strong: var(--border-strong);
+  --color-hairline: var(--hairline);
   --color-fg: var(--text);
   --color-dim: var(--text-dim);
   --color-faint: var(--text-faint);
   --color-accent: var(--accent);
   --color-accent-soft: var(--accent-soft);
+  --color-accent-solid: var(--accent-solid);
+  --color-on-accent: var(--on-accent);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
+  --color-warn-solid: var(--warn-solid);
+  --color-on-warn: var(--on-warn);
   --color-err: var(--err);
+  --color-err-solid: var(--err-solid);
+  --color-on-err: var(--on-err);
+  --color-copilot: var(--copilot);
+  --color-st-idle: var(--st-idle);
+  --color-st-queued: var(--st-queued);
+  --color-st-running: var(--st-running);
+  --color-st-waiting: var(--st-waiting);
+  --color-st-done: var(--st-done);
+  --color-st-failed: var(--st-failed);
+  --color-st-skipped: var(--st-skipped);
+  --color-st-cancelled: var(--st-cancelled);
+  --color-st-suspended: var(--st-suspended);
+  --color-st-blocked: var(--st-blocked);
+  --color-st-unreached: var(--st-unreached);
+  --shadow-elev-1: var(--elev-1);
+  --shadow-elev-2: var(--elev-2);
+  --shadow-elev-3: var(--elev-3);
 }
 
-* {
-  border-color: var(--border);
+/* 等宽数字：计时器、耗时、token 数刷新时宽度不跳，列与列对得齐 */
+@utility tnum {
+  font-variant-numeric: tabular-nums;
 }
 
-html,
-body,
-#root {
-  height: 100%;
-}
+/* 全局规则放进 base 层。以前它们不在任何层里，而不分层的样式无论优先级
+   多低都压过分层的——Tailwind 的工具类全在 utilities 层，于是写在元素上的
+   border-[var(--accent)]、border-transparent 统统失效，发布弹窗选了「受管」
+   也看不出来 */
+@layer base {
+  *,
+  ::before,
+  ::after,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--border);
+  }
 
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-  font-size: 13px;
-  -webkit-font-smoothing: antialiased;
-}
+  :root {
+    /* 原生复选框、单选、滑块跟着强调色走；深浅由上面的 color-scheme 管 */
+    accent-color: var(--accent);
+  }
 
-code,
-pre,
-.mono {
-  font-family: 'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
-}
+  /* 切主题那一帧关掉过渡，见 lib/theme.ts */
+  :root.theme-switching *,
+  :root.theme-switching *::before,
+  :root.theme-switching *::after {
+    transition: none !important;
+  }
 
-/* 滚动条：细一点，不抢视觉 */
-::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 5px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--text-faint);
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code,
+  pre,
+  .mono {
+    font-family: var(--font-mono);
+  }
+
+  /* 滚动条：细一点，不抢视觉。别加 scrollbar-color——写了它 Chrome 就不认
+     ::-webkit-scrollbar 了 */
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 5px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--text-faint);
+  }
 }
 
 /* --------------------------------------------------------------------------
-   节点类型配色。同一个色相贯穿：图标底色、边框、连线高亮。
+   节点类型配色。色值在上面的 --nt-* 里（两套主题各一份）；这里只把它接到
+   --nt 上，同一个色相贯穿图标底色、标题栏、协作矩阵。小地图等别处要类型色，
+   直接读 var(--nt-<type>)，不要再抄一份 hex。
    -------------------------------------------------------------------------- */
-.nt-input    { --nt: #3fb950; }
-.nt-output   { --nt: #a371f7; }
-.nt-llm      { --nt: #4f8cff; }
-.nt-agent    { --nt: #6366f1; }
-.nt-supervisor { --nt: #db61a2; }
-.nt-tool     { --nt: #f0883e; }
-.nt-code     { --nt: #2dd4bf; }
-.nt-branch   { --nt: #d29922; }
-.nt-loop     { --nt: #ec4899; }
-.nt-human    { --nt: #f85149; }
-.nt-validate { --nt: #84cc16; }
-.nt-memory   { --nt: #14b8a6; }
-.nt-retrieve { --nt: #0ea5e9; }
-.nt-transform { --nt: #8b949e; }
-.nt-subgraph { --nt: #bc8cff; }
-.nt-metrics  { --nt: #34d399; }
+.nt-input      { --nt: var(--nt-input); }
+.nt-output     { --nt: var(--nt-output); }
+.nt-llm        { --nt: var(--nt-llm); }
+.nt-agent      { --nt: var(--nt-agent); }
+.nt-supervisor { --nt: var(--nt-supervisor); }
+.nt-tool       { --nt: var(--nt-tool); }
+.nt-code       { --nt: var(--nt-code); }
+.nt-branch     { --nt: var(--nt-branch); }
+.nt-loop       { --nt: var(--nt-loop); }
+.nt-human      { --nt: var(--nt-human); }
+.nt-validate   { --nt: var(--nt-validate); }
+.nt-memory     { --nt: var(--nt-memory); }
+.nt-retrieve   { --nt: var(--nt-retrieve); }
+.nt-transform  { --nt: var(--nt-transform); }
+.nt-subgraph   { --nt: var(--nt-subgraph); }
+.nt-metrics    { --nt: var(--nt-metrics); }
 
 /* --------------------------------------------------------------------------
    React Flow 覆盖
@@ -133,7 +408,8 @@ pre,
   height: 9px;
   background: var(--bg-elev);
   border: 2px solid var(--border-strong);
-  transition: all 0.12s;
+  transition-property: border-color, background-color, box-shadow, transform;
+  transition-duration: var(--dur-fast);
 }
 .react-flow__handle:hover {
   border-color: var(--accent);
@@ -168,47 +444,709 @@ pre,
   border-radius: 6px;
 }
 
-/* 正在执行的边：让数据流动可见 */
-.react-flow__edge.edge-active .react-flow__edge-path {
-  stroke: var(--accent);
-  stroke-width: 2.4;
-  stroke-dasharray: 6 4;
-  animation: dash 0.5s linear infinite;
-}
-@keyframes dash {
-  to {
-    stroke-dashoffset: -10;
-  }
+/* --------------------------------------------------------------------------
+   节点卡。
+
+   状态四重编码：剪影（StatusBadge）+ 线型 / 左侧状态槽的纹理 + 状态色 + 文字。
+   去掉任何一条都还认得出来——灰度投影、色弱、关了动效、缩到 0.3 倍都一样。
+   颜色只给状态用：边框、光弧、状态槽一律 --st-*；类型色 --nt 只留在图标块和
+   标题栏极淡的底色里（以前运行中的分支节点是琥珀框，和「等人审批」分不开）。
+
+   正常态安静、异常态醒目：只有等待、失败、挂起才铺底色、加粗边（用 0.5px 的
+   box-shadow 加粗，不改 border-width——边框一变宽盒子就变，走线跟着重算）。
+
+   box-shadow 分四层拼起来，各层只写自己的变量，谁也不盖谁：选中圈 --nc-ring、
+   悬停联动 --nc-focus、Copilot 新节点 --nc-copilot、状态的分量 --nc-weight。
+   以前各写各的 box-shadow，悬停一张等待中的卡，琥珀的加粗和 elev-2 就没了；
+   Copilot 刚放上来的节点点选中，选中圈也被紫色盖掉。
+
+   卡片高度在整个运行期间不变：标题 32 + 正文两行 36 + 遥测槽 22。流式输出原位
+   替换摘要那两行，计时、token、工具、循环进度都收进遥测槽。以前输出框把卡片
+   撑高 80px，正好压住下面那个节点。
+   -------------------------------------------------------------------------- */
+.nc {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elev);
+  box-shadow: var(--nc-ring, 0 0 #0000), var(--nc-focus, 0 0 #0000),
+    var(--nc-copilot, 0 0 #0000), var(--nc-weight, var(--elev-1));
+  /* 状态的压暗（未到达、阻断）和悬停联动的压暗各管各的，乘起来 */
+  opacity: calc(var(--nc-op, 1) * var(--nc-dim, 1));
+  transition: opacity var(--dur-base) var(--ease-out);
 }
 
-/* 节点运行状态。
-   以前这里是往外扩的声纳圈（pulse-ring）。换成"边框上转一圈光弧 + 一道扫描
-   线"之后声纳就多余了——同一个意思说两遍只会更吵，而且声纳往外扩会和邻居
-   卡片的边框糊在一起。 */
-.node-running {
-  border-color: var(--nt, #4f8cff) !important;
+.nc-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 9px 0 10px;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: color-mix(in srgb, var(--nt) 6%, transparent);
 }
-.node-done {
-  border-color: color-mix(in srgb, var(--ok) 60%, transparent) !important;
+.nc-icon {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--nt) 18%, transparent);
+  color: var(--nt);
 }
-.node-failed {
-  border-color: var(--err) !important;
+.nc-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
 }
-.node-waiting {
-  border-color: var(--warn) !important;
+.nc-chip {
+  flex: none;
+  height: 15px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: 9.5px;
+  line-height: 13px;
+  white-space: nowrap;
+}
+.nc-chip-warn {
+  border-color: color-mix(in srgb, var(--st-waiting) 45%, transparent);
+  color: var(--st-waiting);
+}
+.nc-badge {
+  flex: none;
+}
+
+/* 正文：固定两行。摘要和流式输出轮流占这个位置，谁也不把卡片撑高 */
+.nc-body {
+  height: 36px;
+  padding: 4px 10px 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 14px;
+}
+.nc-summary {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+/* 流式尾巴：底对齐，新出的字总在最下面那行，旧的从顶上裁掉 */
+.nc-stream {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  height: 28px;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.nc-stream-tag {
+  color: var(--text-faint);
+  font-family: var(--font-sans);
+}
+
+/* 遥测槽 */
+.nc-tele {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 10px;
+  overflow: hidden;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  color: var(--text-faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.nc-tele-state {
+  flex: none;
+  font-weight: 600;
+}
+.nc-tele-main {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+.nc-tele-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nc-tele-side {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+}
+.nc-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.nc-tools.is-live {
+  color: var(--st-running);
+}
+.nc-tools.is-bad {
+  color: var(--st-failed);
+}
+.nc-tele-dash {
+  color: var(--text-faint);
+}
+.nc-tele-issue {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nc-tele-issue.is-error {
+  color: var(--st-failed);
+}
+.nc-tele-issue.is-warning {
+  color: var(--st-waiting);
+}
+/* 「去审批」：画出来的药丸只有 16px 高（0.65 倍时屏幕上 10px），按钮本身撑满
+   遥测槽的高度、再往右吃进槽的内边距，点击区比看到的大一圈。药丸画在 ::before 上。
+   不用往外扩的伪元素：遥测槽是 overflow:hidden，扩出去的部分点不到 */
+.nc-approve {
+  position: relative;
+  z-index: 0;
+  flex: none;
+  align-self: stretch;
+  margin-right: -6px;
+  padding: 0 13px 0 7px;
+  color: var(--on-warn);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  cursor: pointer;
+}
+.nc-approve::before {
+  content: '';
+  position: absolute;
+  inset: 2.5px 6px 2.5px 0;
+  z-index: -1;
+  border-radius: var(--radius-sm);
+  background: var(--warn-solid);
+}
+.nc-approve:hover::before {
+  background: color-mix(in srgb, var(--warn-solid) 86%, #000);
+}
+.nc-approve:focus-visible {
+  outline: none;
+}
+.nc-approve:focus-visible::before {
+  outline: 2px solid var(--accent);
+}
+
+/* 循环的分段进度：一格一项（或一轮），做完的绿、在做的蓝 */
+.nc-seg {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+}
+.nc-seg i {
+  width: 9px;
+  height: 5px;
+  border-radius: 1px;
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 0.5px var(--border-strong);
+}
+.nc-seg i.is-done {
+  background: color-mix(in srgb, var(--st-done) 70%, transparent);
+  box-shadow: none;
+}
+.nc-seg i.is-cur {
+  background: var(--st-running);
+  box-shadow: none;
+}
+.nc-seg-bar {
+  position: relative;
+  width: 64px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: var(--bg-hover);
+}
+.nc-seg-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: auto;
+  border-radius: 0;
+  background: color-mix(in srgb, var(--st-done) 70%, transparent);
+  box-shadow: none;
+}
+
+/* 左侧状态槽：纹理本身就是编码——实心 = 在跑，断续 = 排队，斜纹 = 等人，
+   粗实心 = 失败，两道竖条 = 挂起 */
+.nc-slot {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  left: -1px;
+  z-index: 2;
+  width: 3px;
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  pointer-events: none;
+}
+
+/* ---- 各状态 ---- */
+.nc.node-queued {
+  --st-c: var(--st-queued);
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--st-queued) 65%, var(--border));
+}
+.node-queued .nc-slot {
+  background: repeating-linear-gradient(to bottom, var(--st-queued) 0 4px, transparent 4px 7px);
+}
+.nc.node-running {
+  --st-c: var(--st-running);
+  border-color: var(--st-running);
+}
+.node-running .nc-slot {
+  background: var(--st-running);
+}
+.nc.node-waiting {
+  --st-c: var(--st-waiting);
+  border-color: var(--st-waiting);
+  --nc-weight: 0 0 0 0.5px var(--st-waiting), var(--elev-2);
+}
+.node-waiting .nc-slot {
+  width: 5px;
+  background: repeating-linear-gradient(135deg, var(--st-waiting) 0 3px, transparent 3px 6px);
+}
+.node-waiting .nc-tele {
+  background: var(--st-waiting-soft);
+}
+.nc.node-done {
+  --st-c: var(--st-done);
+  border-color: color-mix(in srgb, var(--st-done) 45%, var(--border));
+}
+.node-done .nc-slot {
+  width: 2px;
+  background: color-mix(in srgb, var(--st-done) 75%, transparent);
+}
+.nc.node-failed {
+  --st-c: var(--st-failed);
+  border-color: var(--st-failed);
+  --nc-weight: 0 0 0 0.5px var(--st-failed), var(--elev-2);
+}
+.node-failed .nc-slot {
+  width: 5px;
+  background: var(--st-failed);
+}
+.node-failed .nc-tele {
+  background: var(--st-failed-soft);
+}
+.node-failed .nc-tele-note {
+  color: var(--st-failed);
+}
+.nc.node-cancelled {
+  --st-c: var(--st-cancelled);
+  --nc-op: 0.8;
+}
+.node-cancelled .nc-slot {
+  background: var(--st-cancelled);
+}
+.nc.node-suspended {
+  --st-c: var(--st-suspended);
+  border-color: color-mix(in srgb, var(--st-suspended) 70%, var(--border));
+}
+.node-suspended .nc-slot {
+  width: 5px;
+  background: repeating-linear-gradient(to right, var(--st-suspended) 0 1.5px, transparent 1.5px 3.5px);
+}
+.node-suspended .nc-tele {
+  background: var(--st-suspended-soft);
+}
+.nc.node-skipped {
+  --st-c: var(--st-skipped);
+  border-style: dashed;
+  border-color: var(--border-strong);
+}
+.nc.node-blocked {
+  --st-c: var(--st-blocked);
+  --nc-op: 0.62;
+  border-style: dotted;
+  border-color: color-mix(in srgb, var(--st-blocked) 75%, transparent);
+}
+.node-blocked .nc-tele-note {
+  color: var(--st-blocked);
+}
+.nc.node-unreached {
+  --st-c: var(--st-unreached);
+  --nc-op: 0.45;
+  border-style: dashed;
+}
+
+/* 选中：外面隔一圈底色再描一圈强调色。运行中也是强调色的边框，靠这圈空隙分开，
+   不然「选中了」和「在跑」长得一样 */
+.nc.nc-selected {
+  --nc-ring: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--accent),
+    0 0 16px -2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* 右栏悬停某一步：对应的节点亮一圈，其余的退下去 */
+.nc.nc-hover {
+  --nc-focus: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent), var(--glow-accent);
+}
+.nc.nc-dim {
+  --nc-dim: 0.55;
+}
+
+/* Copilot 刚放上来的节点：紫色描边，落位时从上方轻轻落下一次。
+   只在节点还没有运行态时画——运行中、失败、等待的边框永远压过编辑态的紫色，
+   否则停掉一次生成接着试跑，挂掉的那个节点是紫框，一眼看不出谁挂了 */
+@keyframes copilot-land {
+  from { opacity: 0; transform: translateY(-8px) scale(0.96); }
+}
+.nc.node-copilot-new {
+  animation: copilot-land var(--dur-slow) var(--ease-out) 1 both;
+}
+.nc.node-copilot-new[data-state='idle'] {
+  border-color: var(--copilot);
+  --nc-copilot: 0 0 0 3px color-mix(in srgb, var(--copilot) 24%, transparent);
+}
+
+/* 端口不可连时收起来，不给「还能连」的暗示。可不可连只看 React Flow 给端口的
+   connectable 类（运行进行中画布关掉 nodesConnectable，正式、探索都一样），
+   不在这里按运行类别再推一遍。跑中已经亮起的出口照样亮着 */
+.nc .react-flow__handle:not(.connectable) {
+  cursor: default;
+  pointer-events: none;
+}
+.nc .react-flow__handle:not(.connectable):not(.handle-taken) {
+  opacity: 0.3;
+}
+/* 正式运行进行中：跑的是发布快照，画布只读，拖也拖不动 */
+.react-flow:is([data-readonly], [data-run-class='formal']:is([data-run-phase='queued'], [data-run-phase='running'], [data-run-phase='waiting'])) .nc {
+  cursor: default;
+}
+
+/* 出口标签：画在出线第一段的上方（标签底边离线 2px），不压线。底色和画布同色，
+   别的线从后面穿过时字照样读得出。运行前一律中性色，命中的那条亮起来 */
+.nc-exit {
+  position: absolute;
+  left: calc(100% + 8px);
+  z-index: 1;
+  padding: 0 3px;
+  transform: translateY(calc(-100% - 2px));
+  border-radius: var(--radius-xs);
+  background: var(--bg);
+  color: var(--text-faint);
+  font-size: 9.5px;
+  line-height: 13px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.nc-exit.is-hit {
+  color: var(--st-running);
+  font-weight: 600;
+}
+.nc-exit.is-miss {
+  opacity: 0.45;
+}
+/* 出口密（5 个起间距不到 16px）：画在线上方的标签会压住上一条出口的线，
+   改成骑在自己那条线上——标签只截断自己的线，谁是谁的不会看错 */
+.nc-exits-dense .nc-exit {
+  transform: translateY(-50%);
+  font-size: 9px;
+  line-height: 11px;
+}
+
+/* 出口被选中/落空：分支节点跑完要能一眼看出走了哪条 */
+.react-flow__handle.handle-taken {
+  background: var(--st-running);
+  border-color: var(--st-running);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--st-running) 30%, transparent);
+}
+.react-flow__handle.handle-idle {
+  opacity: 0.35;
+}
+
+/* 校验问题的角标。error 和 warning 一样醒目——warning 恰恰是"运行时静默取到
+   空值"那一类，以前有 error 就看不见它，卡片上也根本不画 */
+.nc-issue {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  z-index: 3;
+  display: flex;
+  gap: 2px;
+  transform-origin: top right;
+}
+.nc-issue span {
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  box-shadow: 0 0 0 2px var(--bg);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+}
+.nc-issue .is-error {
+  background: var(--err-solid);
+  color: var(--on-err);
+}
+.nc-issue .is-warning {
+  background: var(--warn-solid);
+  color: var(--on-warn);
+}
+
+/* 出具印章：双线框，成果节点右上角。档位用状态色：完整出具 = 完成的绿，
+   降档 = 琥珀，不予出具 = 红 */
+.nc-stamp {
+  position: absolute;
+  top: -12px;
+  right: 22px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 21px;
+  padding: 0 7px;
+  border: 3px double currentColor;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  box-shadow: 0 0 0 2px var(--bg-elev), var(--elev-1);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.nc-stamp.is-link {
+  cursor: pointer;
+}
+.nc-stamp small {
+  color: var(--text-faint);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.nc-stamp.is-formal { color: var(--st-done); }
+.nc-stamp.is-degraded { color: var(--st-waiting); }
+.nc-stamp.is-withheld { color: var(--st-failed); }
+@keyframes nc-stamp {
+  from { opacity: 0; transform: scale(1.4) rotate(-5deg); }
+  60% { opacity: 1; }
+  to { opacity: 1; transform: none; }
+}
+/* 落章只在实时的出具判定到来时播一次，300ms 以内 */
+.nc-stamp-in {
+  animation: nc-stamp 280ms var(--ease-out) 1 both;
+}
+
+/* 「去审批」浮层：挂在 body 上，屏幕空间，不随画布缩放 */
+.nc-pop {
+  position: fixed;
+  z-index: 60;
+  width: 340px;
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  border: 1px solid var(--st-waiting);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: var(--elev-3);
+}
+
+/* 精简档和信号档的替身层。平时不可见，但一直在：按档切换只改 visibility，
+   不改盒子——display:none 会让卡片高度变，React Flow 重新量尺寸、走线全部重算 */
+.nc-lod,
+.nc-sig {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  visibility: hidden;
+  pointer-events: none;
+}
+.nc-lod {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 14px 0 16px;
+}
+/* 字号按缩放反算：精简档一路到 0.34 倍，屏幕上都是标题 11.5px、读数 9.5px；
+   回滞让这一档最低到 0.33，那时封顶生效，仍有 11.2 / 9.2px。封顶是为了不撑出
+   卡片：34 × 1.15 + 28 × 1.2 + 4 ≈ 77px，装得进 92px 的盒子 */
+.nc-lod-title {
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  min-width: 0;
+  font-size: min(34px, calc(11.5px / var(--zoom, 1)));
+  font-weight: 600;
+  line-height: 1.15;
+}
+.nc-lod-title svg {
+  width: 0.9em;
+  height: 0.9em;
+}
+.nc-lod-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nc-lod-read {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: min(28px, calc(9.5px / var(--zoom, 1)));
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nc-lod-read .nc-tenth,
+.nc-lod-read .nc-seg {
+  display: none;
+}
+.nc-sig {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.nc-sig svg {
+  /* 反向缩放：0.3 倍时屏幕上约 16px，封顶免得比卡片还高 */
+  width: min(56px, calc(16px / var(--zoom, 1)));
+  height: min(56px, calc(16px / var(--zoom, 1)));
+}
+
+.react-flow[data-lod='compact'] .nc-content,
+.react-flow[data-lod='signal'] .nc-content,
+.react-flow[data-lod='compact'] .nc-exit,
+.react-flow[data-lod='signal'] .nc-exit {
+  visibility: hidden;
+}
+.react-flow[data-lod='compact'] .nc-lod,
+.react-flow[data-lod='signal'] .nc-sig {
+  visibility: visible;
+}
+/* 远了扫描线只剩一片模糊的亮斑，而且一张大图里每张都在扫，关掉 */
+.react-flow[data-lod='compact'] .fx-scan,
+.react-flow[data-lod='signal'] .fx-scan {
+  display: none;
+}
+.react-flow[data-lod='compact'] .nc-slot {
+  width: 6px;
+}
+.react-flow[data-lod='compact'] :is(.node-waiting, .node-failed, .node-suspended) .nc-slot {
+  width: 10px;
+}
+.react-flow[data-lod='compact'] .nc-issue,
+.react-flow[data-lod='signal'] .nc-issue {
+  transform: scale(calc(0.9 / var(--zoom, 1)));
+}
+/* 印章同样反向缩放，远景里也读得出档位。用独立的 scale 属性：落章动画占着
+   transform，写在 transform 上会被动画的末帧盖掉 */
+.react-flow[data-lod='compact'] .nc-stamp,
+.react-flow[data-lod='signal'] .nc-stamp {
+  transform-origin: bottom right;
+  scale: calc(0.9 / var(--zoom, 1));
+}
+
+/* 信号档：整张卡就是一块状态色。颜色之外还有纹理（等人斜纹、挂起竖条）、
+   线型（排队 / 未到达虚线、阻断点线）和居中的剪影 */
+.react-flow[data-lod='signal'] .nc {
+  background: color-mix(in srgb, var(--st-c, transparent) 16%, var(--bg-elev));
+  --nc-weight: inset 0 0 0 calc(1px / var(--zoom, 1)) color-mix(in srgb, var(--st-c, var(--border-strong)) 70%, transparent);
+}
+.react-flow[data-lod='signal'] .nc .nc-slot {
+  display: none;
+}
+.react-flow[data-lod='signal'] .nc.node-running {
+  background: color-mix(in srgb, var(--st-running) 34%, var(--bg-elev));
+}
+.react-flow[data-lod='signal'] .nc.node-failed {
+  background: color-mix(in srgb, var(--st-failed) 78%, var(--bg-elev));
+  --nc-weight: 0 0 0 calc(1.5px / var(--zoom, 1)) var(--st-failed);
+}
+.react-flow[data-lod='signal'] .nc.node-waiting {
+  background: repeating-linear-gradient(135deg,
+    color-mix(in srgb, var(--st-waiting) 55%, var(--bg-elev)) 0 14px, var(--bg-elev) 14px 28px);
+  --nc-weight: 0 0 0 calc(1.5px / var(--zoom, 1)) var(--st-waiting);
+}
+.react-flow[data-lod='signal'] .nc.node-suspended {
+  background: repeating-linear-gradient(90deg,
+    color-mix(in srgb, var(--st-suspended) 45%, var(--bg-elev)) 0 12px, var(--bg-elev) 12px 30px);
+}
+/* 失败那块是实心红，剪影反白才看得见（徽标自带行内颜色，这里要压过它） */
+.react-flow[data-lod='signal'] .nc.node-failed .nc-sig svg {
+  color: var(--on-err) !important;
+}
+/* 牌子挂在卡片外面，会被后画的邻居节点盖住：异常节点整体抬到最上层 */
+.react-flow[data-lod='signal'] .react-flow__node:has(> .nc:is(.node-failed, .node-waiting)) {
+  z-index: 1000 !important;
+}
+
+/* 信号档的牌子：失败和等人的节点头上挂一枚，字号反向缩放，任何缩放下都是 11px */
+.nc-pin {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-bottom: 0.5em;
+  padding: 0.3em 0.65em;
+  border: 0.09em solid var(--st-c);
+  border-radius: 0.45em;
+  background: var(--bg-panel);
+  box-shadow: var(--elev-2);
+  color: var(--text-dim);
+  font-size: calc(11px / var(--zoom, 1));
+  line-height: 1.3;
+  white-space: nowrap;
+  visibility: hidden;
+  pointer-events: none;
+}
+.nc-pin svg {
+  width: 1.1em;
+  height: 1.1em;
+}
+.nc-pin b {
+  color: var(--st-c);
+  font-weight: 600;
+}
+.nc-pin em {
+  color: var(--st-c);
+  font-family: var(--font-mono);
+  font-style: normal;
+}
+.react-flow[data-lod='signal'] .nc-pin {
+  visibility: visible;
 }
 
 /* --------------------------------------------------------------------------
    运行时的光效语汇。
 
-   一条原则：**每个动效都要对应一件真实发生的事**。光环转 = 这个节点正在跑，
-   扫描线过 = 正在产出，绿色扫过 = 刚跑完，抖动 = 刚失败，琥珀呼吸 = 在等人。
-   纯装饰的动效只会让画布变吵——跑一张十几个节点的图，一眼能看出"谁在动"
-   才是这套东西的用处。
+   一条原则：**每个动效都要对应一件真实发生的事**。光弧转 = 这个节点正在跑，
+   扫描线过 = 正在产出，绿色扫过 = 刚跑完，抖动 = 刚失败，琥珀一圈 = 刚停下来
+   等人。纯装饰的动效只会让画布变吵——跑一张十几个节点的图，一眼能看出
+   "谁在动"才是这套东西的用处。
 
-   颜色一律走 --nt / --accent / --ok 这些 token，浅色深色都能看。
-   前庭敏感的人由文件末尾那段 prefers-reduced-motion 统一停掉（这些全是 CSS
-   动画，所以那段规则天然覆盖得到；不覆盖的 SMIL 一个都没用）。
+   常驻的只有运行中那一圈光弧和扫描线（外加徽标的转弧）。等待、完成和各种终态
+   都是静态的：以前等人时琥珀色一直在呼吸，停在审批上半小时，画布就半小时在动。
+   进入某个状态的那一下（抖、扫、琥珀一圈）只在实时事件里播，回放和打开历史
+   运行时直接落到终态（NodeCard 给这一下挂 .nc-enter）。
+
+   颜色一律走 --st-* 令牌，浅色深色都能看。前庭敏感的人由文件末尾那段
+   prefers-reduced-motion 统一停掉。
    -------------------------------------------------------------------------- */
 
 /* 光环的角度要能插值，得先声明成一个 <angle> 属性 */
@@ -219,8 +1157,8 @@ pre,
 }
 
 /* 光效层。做成独立一层而不是伪元素：卡片自己的背景会盖住伪元素，
-   而 overflow:hidden 又不能加在卡片上——分支节点的"yes/no"标签是挂在
-   卡片外面的，一裁就没了 */
+   而 overflow:hidden 又不能加在卡片上——出口标签、印章、牌子都挂在卡片外面，
+   一裁就没了 */
 .node-fx {
   position: absolute;
   inset: 0;
@@ -236,21 +1174,21 @@ pre,
   border-radius: inherit;
 }
 
-/* 正在跑：一圈绕着卡片转的光弧 */
+/* 正在跑：一圈绕着卡片转的光弧。状态色，不是类型色 */
 @keyframes fx-halo {
   to { --fx-angle: 360deg; }
 }
 .fx-halo {
   position: absolute;
   inset: -1.5px;
-  border-radius: inherit;
   padding: 1.5px;
+  border-radius: inherit;
   background: conic-gradient(
     from var(--fx-angle),
     transparent 0deg,
     transparent 300deg,
-    color-mix(in srgb, var(--nt) 70%, transparent) 340deg,
-    var(--nt) 358deg,
+    color-mix(in srgb, var(--st-running) 65%, transparent) 340deg,
+    var(--st-running) 358deg,
     transparent 360deg
   );
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
@@ -262,23 +1200,27 @@ pre,
 
 /* 正在跑：一条光带从上往下扫过卡片，像在读取/产出 */
 @keyframes fx-scan {
-  0% { top: -70px; opacity: 0; }
+  0% { transform: translateY(-70px); opacity: 0; }
   15% { opacity: 1; }
   85% { opacity: 1; }
-  100% { top: 100%; opacity: 0; }
+  100% { transform: translateY(var(--scan-h, 120px)); opacity: 0; }
 }
 .fx-scan {
   position: absolute;
-  left: 0;
+  top: 0;
   right: 0;
+  left: 0;
   height: 48px;
   background: linear-gradient(
     to bottom,
     transparent,
-    color-mix(in srgb, var(--nt) 8%, transparent),
+    color-mix(in srgb, var(--st-running) 7%, transparent),
     transparent
   );
-  animation: fx-scan 2.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation: fx-scan 2.8s var(--ease-in-out) infinite;
+}
+.nt-supervisor .fx-scan {
+  --scan-h: 220px;
 }
 
 /* 刚跑完：绿色扫过一遍。只跑一次，跑完停在画面外——
@@ -287,16 +1229,20 @@ pre,
   from { transform: translateX(-110%); }
   to { transform: translateX(110%); }
 }
-.fx-done {
+.fx-done,
+.fx-sweep {
   position: absolute;
   inset: 0;
   background: linear-gradient(
     90deg,
     transparent,
-    color-mix(in srgb, var(--ok) 30%, transparent),
+    color-mix(in srgb, var(--st-done) 28%, transparent),
     transparent
   );
-  animation: fx-done 0.85s cubic-bezier(0.32, 0.72, 0, 1) 1 forwards;
+  transform: translateX(-110%);
+}
+.fx-done {
+  animation: fx-done 0.85s var(--ease-out) 1 forwards;
 }
 
 /* 刚失败：短促地抖一下。幅度压在 3px 以内——再大就不像"出错"像"地震" */
@@ -308,39 +1254,74 @@ pre,
   60% { transform: translateX(2px); }
   80% { transform: translateX(-1px); }
 }
-.node-failed {
+.nc.node-failed.nc-enter {
   animation: fx-shake 0.4s cubic-bezier(0.36, 0.07, 0.19, 0.97) 1;
 }
 
-/* 在等人：琥珀色的呼吸。用 box-shadow 而不是边框颜色——边框那圈已经
-   被状态色占着了，两个都改会互相盖 */
-@keyframes fx-breathe {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 40%, transparent); }
-  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--warn) 0%, transparent); }
+/* 一次性时刻共用的那层描边。平时透明，由下面几种时刻各自点亮一次 */
+.fx-moment {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  opacity: 0;
 }
-.node-waiting {
-  animation: fx-breathe 2.2s ease-in-out infinite;
+@keyframes nc-light {
+  0% { opacity: 0; }
+  30% { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes nc-ring-out {
+  from { opacity: 0.9; transform: scale(1); }
+  to { opacity: 0; transform: scale(1.06, 1.14); }
 }
 
-/* 头部那枚"第 N 轮"徽标 */
-.round-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--nt) 45%, transparent);
-  background: color-mix(in srgb, var(--nt) 12%, transparent);
-  color: var(--nt);
-  padding: 0 5px;
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  line-height: 14px;
-  white-space: nowrap;
+/* 刚停下来等人：琥珀色往外荡一圈，然后静止。停多久都不再动 */
+.nc.node-waiting.nc-enter .fx-moment {
+  box-shadow: 0 0 0 2px var(--st-waiting);
+  animation: nc-ring-out 900ms var(--ease-out) 1 both;
 }
-.round-chip-muted {
-  border-color: var(--border);
-  background: transparent;
-  color: var(--text-faint);
+
+/* 开场点亮：run.started 时沿拓扑层级依次亮一下（--rank 由画布写到节点上） */
+.react-flow[data-moment='start'] .fx-moment {
+  box-shadow: inset 0 0 0 1px var(--st-running),
+    0 0 14px -2px color-mix(in srgb, var(--st-running) 55%, transparent);
+  animation: nc-light 520ms var(--ease-out) 1 both;
+  animation-delay: calc(var(--rank, 0) * 55ms);
+}
+
+/* 成功回扫：执行路径上的节点从入口到成果依次扫一遍 */
+.react-flow[data-moment='success'] .nc[data-state='done'] .fx-sweep {
+  animation: fx-done 700ms var(--ease-out) 1 both;
+  animation-delay: calc(var(--rank, 0) * 70ms);
+}
+.react-flow[data-moment='success'] .nc[data-state='done'] .fx-moment {
+  box-shadow: inset 0 0 0 1px var(--st-done);
+  animation: nc-light 600ms var(--ease-out) 1 both;
+  animation-delay: calc(var(--rank, 0) * 70ms);
+}
+
+/* 失败阻断级联：从失败节点往下游逐层标「阻断」，一层 60ms。
+   --moment-origin 是失败节点的层级（画布写在根元素上），没有就从 0 算 */
+@keyframes nc-block {
+  from { opacity: 1; }
+}
+.react-flow[data-moment='failed'] .nc[data-state='blocked'] {
+  animation: nc-block 420ms var(--ease-out) 1 both;
+  animation-delay: calc(max(0, var(--rank, 0) - var(--moment-origin, 0)) * 60ms);
+}
+.react-flow[data-moment='failed'] .nc[data-state='blocked'] .fx-moment {
+  box-shadow: inset 0 0 0 1px var(--st-blocked);
+  animation: nc-light 420ms var(--ease-out) 1 both;
+  animation-delay: calc(max(0, var(--rank, 0) - var(--moment-origin, 0)) * 60ms);
+}
+
+/* 右栏点了某一步、画布取景过来：落点的节点荡一圈，告诉眼睛"是这个" */
+.fx-focus {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: 0 0 0 2px var(--accent);
+  animation: nc-ring-out 700ms var(--ease-out) 1 both;
 }
 
 /* --------------------------------------------------------------------------
@@ -349,29 +1330,25 @@ pre,
    它要回答三个问题：这一轮派了几个人、谁还在跑、并行到底省了多少。
    条形长度按"这一轮里最长的那个人"归一化——三个人并排三条长短不一的条，
    一眼就能看出墙钟为什么等于最长那条而不是三条之和。
+   行高固定，行数从编辑态起就固定，跑起来卡片不长个子。
    -------------------------------------------------------------------------- */
 .team-matrix {
-  margin: 0 8px 8px;
-  border-top: 1px dashed color-mix(in srgb, var(--nt) 35%, transparent);
-  padding-top: 6px;
+  padding: 3px 10px 0;
 }
 .team-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 5px;
-  font-size: 9.5px;
+  height: 17px;
   color: var(--text-faint);
+  font-size: 9.5px;
   letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 .team-head-rule {
   flex: 1;
   height: 1px;
-  background: linear-gradient(
-    to right,
-    color-mix(in srgb, var(--nt) 40%, transparent),
-    transparent
-  );
+  background: linear-gradient(to right, var(--hairline), transparent);
 }
 
 .team-row {
@@ -379,70 +1356,69 @@ pre,
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 21px;
-  padding-left: 6px;
+  height: 18px;
+  padding-left: 5px;
   border-left: 2px solid transparent;
   font-size: 10.5px;
 }
-/* 被派出去的成员：左边一条竖线把它们串成一组 */
+/* 被派出去的成员：左边一条竖线把它们串成一组。在跑时是运行色，收尾之后
+   退成中性线——蓝色只说「正在跑」 */
 .team-row-active {
-  border-left-color: color-mix(in srgb, var(--nt) 70%, transparent);
+  border-left-color: var(--border-strong);
+}
+.team-matrix.is-live .team-row-active {
+  border-left-color: color-mix(in srgb, var(--st-running) 55%, transparent);
 }
 .team-row-running .team-name {
   color: var(--text);
 }
 .team-row-idle {
-  opacity: 0.42;
+  opacity: 0.5;
 }
 /* 前几轮干过、这一轮没它：压暗但留着成绩，不是"待命" */
 .team-row-past {
   opacity: 0.6;
 }
-
-.team-dot {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 999px;
-  border: 1.5px solid var(--border-strong);
+/* 调度者那一行：和成员分开，底下一道细线 */
+.team-row-dispatch {
+  margin-bottom: 2px;
+  border-bottom: 1px dashed var(--hairline);
 }
-.team-row-running .team-dot {
-  border-color: var(--nt);
-  background: var(--nt);
-  animation: team-dot 1.1s ease-in-out infinite;
+.team-row-dispatch .team-name {
+  color: var(--text-faint);
 }
-@keyframes team-dot {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--nt) 55%, transparent); }
-  70% { box-shadow: 0 0 0 5px transparent; }
-}
-.team-row-done .team-dot {
-  border-color: var(--ok);
-  background: var(--ok);
+.team-row-dispatch.team-row-running .team-name {
+  color: var(--text);
 }
 
 .team-name {
   flex: none;
-  max-width: 84px;
+  width: 58px;
   overflow: hidden;
+  color: var(--text-dim);
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-dim);
 }
 .team-bar {
   position: relative;
   flex: 1;
-  height: 3px;
   min-width: 18px;
+  height: 3px;
+  overflow: hidden;
   border-radius: 999px;
   background: var(--bg-hover);
-  overflow: hidden;
 }
+/* 长度用 scaleX 而不是 width：动效只走 transform */
 .team-bar-fill {
   position: absolute;
-  inset: 0 auto 0 0;
+  inset: 0;
   border-radius: 999px;
-  background: var(--ok);
-  transition: width 0.4s cubic-bezier(0.32, 0.72, 0, 1);
+  background: color-mix(in srgb, var(--st-done) 80%, transparent);
+  transform-origin: left center;
+  transition: transform var(--dur-slow) var(--ease-out);
+}
+.team-row-failed .team-bar-fill {
+  background: var(--st-failed);
 }
 /* 还在跑：不知道要多久，所以是不定长的流光，不是百分比 */
 .team-bar-running {
@@ -451,13 +1427,8 @@ pre,
   bottom: 0;
   width: 40%;
   border-radius: 999px;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    var(--nt),
-    transparent
-  );
-  animation: team-shimmer 1.15s ease-in-out infinite;
+  background: linear-gradient(90deg, transparent, var(--st-running), transparent);
+  animation: team-shimmer 1.15s var(--ease-in-out) infinite;
 }
 @keyframes team-shimmer {
   from { transform: translateX(-110%); }
@@ -465,60 +1436,37 @@ pre,
 }
 .team-ms {
   flex: none;
-  min-width: 34px;
+  min-width: 38px;
+  color: var(--text-faint);
+  font-size: 9.5px;
   text-align: right;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-  font-size: 9.5px;
+  white-space: nowrap;
 }
-
-/* 正在跑的那个人在干什么。只给在跑的看，跑完的留在右栏里慢慢读 */
-.team-note {
-  margin: -1px 0 3px 14px;
-  padding-left: 6px;
-  border-left: 1px solid color-mix(in srgb, var(--nt) 30%, transparent);
-  font-size: 9.5px;
-  line-height: 1.35;
-  color: var(--text-faint);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+.team-row-running .team-ms {
+  color: var(--st-running);
+}
+.team-row-failed .team-ms {
+  color: var(--st-failed);
 }
 
 .team-foot {
   display: flex;
   align-items: center;
   gap: 5px;
-  margin-top: 6px;
-  padding-top: 5px;
-  border-top: 1px dashed color-mix(in srgb, var(--nt) 25%, transparent);
-  font-size: 9.5px;
+  height: 18px;
+  margin-top: 2px;
+  border-top: 1px dashed var(--hairline);
   color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
+  font-size: 9.5px;
 }
 .team-saved {
-  color: var(--ok);
+  color: var(--st-done);
   font-weight: 500;
 }
 
-/* 出口被选中/落空：分支节点跑完要能一眼看出走了哪条 */
-.react-flow__handle.handle-taken {
-  background: var(--accent);
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-.react-flow__handle.handle-idle {
-  opacity: 0.35;
-}
-
-/* 实际走过的边：运行结束后留在画布上，就是这次的执行路径 */
-.react-flow__edge.edge-taken .react-flow__edge-path {
-  stroke: color-mix(in srgb, var(--accent) 75%, transparent);
-  stroke-width: 2;
-}
-
-/* 活跃边上跑的光点：方向感靠它，虚线只会让人觉得"在动"，看不出往哪走 */
+/* 活跃边上跑的光点：方向感靠它，虚线只会让人觉得"在动"，看不出往哪走。
+   边的运行态（走过、正在流、停在审批、阻断）在 canvas/surface.css，这里只留
+   光点的底样式和它的关键帧，surface.css 在画布根上覆盖颜色 */
 .edge-packet {
   fill: var(--accent);
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 80%, transparent));
@@ -532,18 +1480,6 @@ pre,
   to { offset-distance: 100%; }
 }
 
-/* Copilot 刚放上来的节点：紫色描边 + 出现动画，final 后几秒淡出 */
-@keyframes copilot-pop {
-  from { opacity: 0; transform: scale(0.85); }
-  to { opacity: 1; transform: scale(1); }
-}
-.node-copilot-new {
-  animation: copilot-pop 0.25s ease-out;
-  border-color: #bc8cff !important;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #bc8cff 25%, transparent);
-  transition: box-shadow 0.8s, border-color 0.8s;
-}
-
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
@@ -554,9 +1490,8 @@ pre,
 
 /* --------------------------------------------------------------------------
    助手栏的动效。
-   缓动统一用 cubic-bezier(.32,.72,0,1)：起步快、尾部长，是"被推出来"而不是
-   "匀速平移"的手感。时长都压在 240ms 以内——面板滑动超过这个数就开始像卡顿，
-   而不是像流畅。
+   缓动统一用 --ease-out：起步快、尾部长，是"被推出来"而不是"匀速平移"的
+   手感。面板滑动用 --dur-base——超过 240ms 就开始像卡顿，而不是像流畅。
    -------------------------------------------------------------------------- */
 
 /* 属性面板：从右侧盖到助手栏上。它是临时造访者，助手才是常住的，所以用
@@ -567,7 +1502,7 @@ pre,
   to { opacity: 1; transform: none; }
 }
 .sheet-in {
-  animation: sheet-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  animation: sheet-in var(--dur-base) var(--ease-out);
 }
 
 /* 例句卡片依次入场。--i 是序号，错开 40ms 就够读出"一条条出现"，
@@ -578,7 +1513,7 @@ pre,
 }
 .rise-in {
   opacity: 0;
-  animation: rise-in 0.34s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  animation: rise-in var(--dur-slow) var(--ease-out) forwards;
   animation-delay: calc(var(--i, 0) * 40ms);
 }
 
@@ -601,13 +1536,15 @@ pre,
   animation: shimmer 2.4s linear infinite;
 }
 
-/* 空态那枚标记的呼吸感。很轻——它是在暗示"可以开始了"，不是在要求注意力 */
+/* 空态那枚标记出现时"吸一口气"：暗示可以开始了。只播一次就停——空闲时
+   一直在动的东西会一直分走注意力，而这里什么都没发生 */
 @keyframes breathe {
-  0%, 100% { opacity: 0.55; transform: scale(1); }
-  50% { opacity: 1; transform: scale(1.06); }
+  0% { opacity: 0.55; transform: scale(1); }
+  45% { opacity: 1; transform: scale(1.06); }
+  100% { opacity: 1; transform: none; }
 }
 .breathe {
-  animation: breathe 4s ease-in-out infinite;
+  animation: breathe 2.4s var(--ease-in-out) 1 both;
 }
 
 /* 输入坞聚焦时的光晕。焦点是这一栏最重要的状态，值得比 1px 描边更明确 */
@@ -636,110 +1573,138 @@ pre,
     background-clip: border-box;
     color: var(--text-dim);
   }
-  /* 边框上的光弧、扫描线、流光条、边上的光点——这些"停了就等于没有"的
-     直接不画。只把时长压到 0.01ms 的话它们会停在动画的最后一帧：光弧卡在
-     角落、光点全堆在起点，看着像渲染坏了。
-     正在跑的成员不会因此看不出状态：圆点是实心的，右边写着"进行中" */
+  /* 边框上的光弧、扫描线、扫光、一次性时刻的描边、流光条、边上的光点——
+     这些"停了就等于没有"的直接不画。只把时长压到 0.01ms 的话它们会停在动画
+     的最后一帧：光弧卡在角落、光点全堆在起点，看着像渲染坏了。
+     状态不会因此看不出来：卡片还有剪影、左侧状态槽、边框线型和状态文字，
+     在跑的节点和成员照样走着计时 */
   .fx-halo,
   .fx-scan,
   .fx-done,
+  .fx-sweep,
+  .fx-moment,
+  .fx-focus,
   .edge-packet,
   .team-bar-running {
     display: none;
   }
+  /* 时钟这时 1 秒才走一拍，十分位只会一顿一顿地跳 */
+  .nc-tenth {
+    display: none;
+  }
 }
 
-/* 表单控件统一外观 */
-.field {
-  width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 9px;
-  color: var(--text);
-  font-size: 12px;
-  outline: none;
-  transition: border-color 0.12s;
-}
-.field:focus {
-  border-color: var(--accent);
-}
-.field::placeholder {
-  color: var(--text-faint);
-}
-textarea.field {
-  resize: vertical;
-  min-height: 62px;
-  line-height: 1.55;
-}
-select.field {
-  cursor: pointer;
-}
+/* --------------------------------------------------------------------------
+   组件类放进 components 层：排在 utilities 前面，元素上再写的工具类
+   （w-16、text-[12px]、border-[var(--accent)]…）才压得过它们。以前它们不在
+   任何层里，这些工具类全被静默吞掉——`field w-44` 实际占满整行。
+   -------------------------------------------------------------------------- */
+@layer components {
+  /* 表单控件统一外观 */
+  .field {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 6px 9px;
+    color: var(--text);
+    font-size: 12px;
+    outline: none;
+    transition: border-color var(--dur-fast) var(--ease-out);
+  }
+  .field:focus {
+    border-color: var(--accent);
+  }
+  .field::placeholder {
+    color: var(--text-faint);
+  }
+  textarea.field {
+    resize: vertical;
+    min-height: 62px;
+    line-height: 1.55;
+  }
+  select.field {
+    cursor: pointer;
+  }
 
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border-radius: 6px;
-  padding: 6px 11px;
-  font-size: 12px;
-  font-weight: 500;
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
-  color: var(--text);
-  cursor: pointer;
-  transition: all 0.12s;
-  white-space: nowrap;
-}
-.btn:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: var(--border-strong);
-}
-.btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-.btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-.btn-primary:hover:not(:disabled) {
-  filter: brightness(1.12);
-  background: var(--accent);
-}
-.btn-danger {
-  color: var(--err);
-  border-color: color-mix(in srgb, var(--err) 40%, transparent);
-}
-.btn-ghost {
-  background: transparent;
-  border-color: transparent;
-}
-.btn-ghost:hover:not(:disabled) {
-  background: var(--bg-hover);
-}
-.btn-sm {
-  padding: 3px 7px;
-  font-size: 11px;
-}
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: var(--radius-md);
+    padding: 6px 11px;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--bg-elev);
+    color: var(--text);
+    cursor: pointer;
+    /* 按属性列出来：transition: all 会把布局属性也带上，主题切换、尺寸变化
+       时一起慢慢挪 */
+    transition-property: background-color, border-color, color, box-shadow, opacity;
+    transition-duration: var(--dur-fast);
+    transition-timing-function: var(--ease-out);
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    border-color: var(--border-strong);
+  }
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  /* 实心底用 --accent-solid 配 --on-accent：深色下白字压在 --accent 上只有
+     3.2:1。悬停压暗而不是提亮——提亮会把对比度拉回 4.5 以下 */
+  .btn-primary {
+    background: var(--accent-solid);
+    border-color: var(--accent-solid);
+    color: var(--on-accent);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent-solid) 88%, #000);
+    border-color: color-mix(in srgb, var(--accent-solid) 88%, #000);
+  }
+  .btn-danger {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 40%, transparent);
+  }
+  .btn-ghost {
+    background: transparent;
+    border-color: transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn-sm {
+    padding: 3px 7px;
+    font-size: 11px;
+  }
+  /* 行内的小图标按钮（会话列表的重命名 / 删除、气泡下的小操作）。以前用了
+     七处却没定义，实际按普通按钮的尺寸渲染 */
+  .btn-xs {
+    padding: 2px 6px;
+    font-size: 11px;
+    gap: 4px;
+  }
 
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 10.5px;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  white-space: nowrap;
-}
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
 
-.label {
-  display: block;
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-bottom: 4px;
-  font-weight: 500;
+  .label {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    font-weight: 500;
+  }
 }

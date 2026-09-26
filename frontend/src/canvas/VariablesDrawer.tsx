@@ -1,100 +1,57 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  AlertTriangle, ChevronDown, Crosshair, Database, Hash, Info, Package, Variable as VarIcon, X,
+  AlertTriangle, ChevronDown, Crosshair, Database, Hash, Package, RotateCw, Variable as VarIcon,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useStudio } from '../store/studio'
+import { Spinner } from '../components/ui'
 import type { Variable, VarIssue } from '../types'
 
 /**
- * 画布底部的变量抽屉。
+ * 变量：这张图里有哪些变量、谁产出、谁引用、最近一次运行的值。
  *
  * 这套编排靠 `{{ }}` 串数据流，但"这张图里到底有哪些变量"此前在界面上
  * 根本无处可查——只能靠翻每个节点的 assign_to 自己拼。拼错一个名字还不会
  * 报错（模板取不到值渲染成空字符串），于是排查只能靠猜。
  *
- * 做成挤压式而不是浮层：React Flow 的 Controls 和 MiniMap 是绝对定位在
- * 画布容器里的，浮层会把它俩埋掉；挤压会把它俩顶上去。代价是画布底部被
- * 裁掉一截（React Flow v12 的 ResizeObserver 只更新尺寸，不会自动重新取景），
- * 所以要限高，并且保证画布至少剩一截——高度归零时 React Flow 会直接报错。
+ * 悬停一行，画布上亮出它的血缘：谁产出、谁引用（store.lineage，由画布和卡片画出来）。
+ * 排查「为什么这里取到空值」时，不用再在抽屉、检查器、画布三处之间来回对照。
+ *
+ * 它是画布底部停靠栏（CanvasDock）的一页，和「问题」同一个位置。
  */
-const MIN_CANVAS = 200
-const DEFAULT_HEIGHT = 260
-
-export function VariablesDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function VariablesPane() {
   const variables = useStudio((s) => s.variables)
-  const varIssues = useStudio((s) => s.varIssues)
   const analyzeNow = useStudio((s) => s.analyzeNow)
+  const traceVariable = useStudio((s) => s.traceVariable)
   const [picked, setPicked] = useState<string | null>(null)
-  const [height, setHeight] = useState(DEFAULT_HEIGHT)
 
   // 打开时立刻算一次：变量表是按结构签名跳过的，可能已经很久没刷新了
-  useEffect(() => { if (open) void analyzeNow() }, [open, analyzeNow])
-
-  if (!open) return null
+  useEffect(() => { void analyzeNow() }, [analyzeNow])
+  // 收起时把画布上的血缘高亮一起收掉
+  useEffect(() => () => traceVariable(null), [traceVariable])
 
   const selected = variables.find((v) => v.path === picked) ?? null
 
   return (
-    <div
-      className="relative z-10 flex shrink-0 flex-col border-t bg-panel"
-      style={{ height, maxHeight: `max(${MIN_CANVAS}px, 60vh)` }}
-    >
-      <ResizeHandle height={height} onResize={setHeight} />
-
-      <div className="flex shrink-0 items-center gap-2 border-b px-3 py-1.5">
-        <VarIcon size={12} style={{ color: 'var(--accent)' }} />
-        <span className="text-[11.5px] font-semibold">变量</span>
-        <span className="text-[10px] text-faint">{variables.length} 个</span>
-        <IssueChips issues={varIssues} />
-        <span className="flex-1" />
-        <button className="rounded p-1 text-faint transition-colors hover:bg-hover"
-                title="收起（⌥V）" onClick={onClose}>
-          <X size={12} />
-        </button>
+    <div className="flex min-h-0 flex-1">
+      <div className="min-w-0 flex-1 overflow-y-auto"
+           // 离开表格时回到「选中的那个」：点开详情的变量一直亮着，悬停别的只是临时看一眼
+           onMouseLeave={() => traceVariable(picked)}>
+        <VarTable variables={variables} picked={picked}
+                  onPick={(p) => { setPicked(p); traceVariable(p) }}
+                  onHover={traceVariable} />
       </div>
-
-      <div className="flex min-h-0 flex-1">
-        <div className="min-w-0 flex-1 overflow-y-auto">
-          <VarTable variables={variables} picked={picked} onPick={setPicked} />
+      {selected && (
+        <div className="w-[300px] shrink-0 overflow-y-auto border-l">
+          <VarDetail variable={selected} onClose={() => { setPicked(null); traceVariable(null) }} />
         </div>
-        {selected && (
-          <div className="w-[300px] shrink-0 overflow-y-auto border-l">
-            <VarDetail variable={selected} onClose={() => setPicked(null)} />
-          </div>
-        )}
-      </div>
+      )}
     </div>
   )
 }
 
-/** 拖拽改高。上下都要夹住：高度归零会让 React Flow 直接报错 004。 */
-function ResizeHandle({ height, onResize }: {
-  height: number; onResize: (h: number) => void
-}) {
-  return (
-    <div
-      className="absolute inset-x-0 -top-1 z-10 h-2 cursor-row-resize"
-      onPointerDown={(e) => {
-        e.preventDefault()
-        const startY = e.clientY
-        const startH = height
-        const max = Math.max(MIN_CANVAS, window.innerHeight * 0.6)
-        const move = (ev: PointerEvent) => {
-          onResize(Math.min(max, Math.max(120, startH - (ev.clientY - startY))))
-        }
-        const up = () => {
-          window.removeEventListener('pointermove', move)
-          window.removeEventListener('pointerup', up)
-        }
-        window.addEventListener('pointermove', move)
-        window.addEventListener('pointerup', up)
-      }}
-    />
-  )
-}
-
-function IssueChips({ issues }: { issues: VarIssue[] }) {
+/** 停靠栏页签上的计数 */
+export function VarIssueChips({ issues }: { issues: VarIssue[] }) {
   const errors = issues.filter((i) => i.level === 'error').length
   const warns = issues.filter((i) => i.level === 'warning').length
   const infos = issues.filter((i) => i.level === 'info').length
@@ -116,27 +73,43 @@ function IssueChips({ issues }: { issues: VarIssue[] }) {
 const KIND_META: Record<string, { icon: typeof Hash; text: string }> = {
   input: { icon: Database, text: '入口输入' },
   var: { icon: VarIcon, text: '节点写入' },
+  loop: { icon: VarIcon, text: '循环变量' },
   node: { icon: Package, text: '节点输出' },
   builtin: { icon: Hash, text: '内置' },
 }
 
-function VarTable({ variables, picked, onPick }: {
-  variables: Variable[]; picked: string | null; onPick: (p: string | null) => void
+function VarTable({ variables, picked, onPick, onHover }: {
+  variables: Variable[]; picked: string | null
+  onPick: (p: string | null) => void; onHover: (p: string | null) => void
 }) {
   const runtime = useRuntimeValues()
+  const nodeCount = useStudio((s) => s.nodes.length)
+  const analysis = useStudio((s) => s.analysis)
+  const analysisError = useStudio((s) => s.analysisError)
+  const analyzeNow = useStudio((s) => s.analyzeNow)
 
   if (!variables.length) {
+    // 三种空各说各的：以前分析请求失败时也写「画布上还没有节点」，而画布上明明有 8 个
     return (
-      <div className="flex h-full items-center justify-center text-[11px] text-faint">
-        画布上还没有节点
+      <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-2xs text-faint">
+        {!nodeCount ? '画布上还没有节点'
+          : analysis === 'failed' ? (
+            <>
+              <span style={{ color: 'var(--warn)' }}>变量分析失败{analysisError ? `：${analysisError}` : ''}</span>
+              <button type="button" className="btn btn-sm" onClick={() => void analyzeNow()}>
+                <RotateCw size={11} /> 重试
+              </button>
+            </>
+          )
+          : <span className="flex items-center gap-1.5"><Spinner size={11} /> 正在分析变量…</span>}
       </div>
     )
   }
 
   return (
-    <table className="w-full text-[11px]">
-      <thead className="sticky top-0 bg-panel">
-        <tr className="border-b text-left text-[10px] text-faint">
+    <table className="w-full text-2xs">
+      <thead className="sticky top-0 z-[1] bg-panel">
+        <tr className="border-b text-left text-faint">
           <th className="px-3 py-1.5 font-medium">变量</th>
           <th className="px-2 py-1.5 font-medium">来自</th>
           <th className="px-2 py-1.5 font-medium">被引用</th>
@@ -150,14 +123,20 @@ function VarTable({ variables, picked, onPick }: {
           return (
             <tr
               key={v.path}
-              className={clsx('cursor-pointer border-b last:border-0 hover:bg-hover',
+              data-var={v.path}
+              tabIndex={0}
+              aria-selected={picked === v.path}
+              className={clsx('cursor-pointer border-b last:border-0 outline-none hover:bg-hover focus-visible:bg-hover',
                 picked === v.path && 'bg-hover')}
               onClick={() => onPick(picked === v.path ? null : v.path)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPick(picked === v.path ? null : v.path) }
+              }}
+              onMouseEnter={() => onHover(v.path)}
+              onFocus={() => onHover(v.path)}
             >
               <td className="px-3 py-1.5">
-                <span className="mono" style={{ color: 'var(--accent)' }}>
-                  {`{{ ${v.path} }}`}
-                </span>
+                <span className="mono text-fg">{`{{ ${v.path} }}`}</span>
               </td>
               <td className="px-2 py-1.5 text-dim">
                 <span className="flex items-center gap-1">
@@ -167,7 +146,7 @@ function VarTable({ variables, picked, onPick }: {
               </td>
               <td className="px-2 py-1.5">
                 {v.refs.length
-                  ? <span className="text-dim">{v.refs.length} 处</span>
+                  ? <span className="tnum text-dim">{v.refs.length} 处</span>
                   : <span className="text-faint">—</span>}
               </td>
               <td className="max-w-0 px-2 py-1.5">
@@ -185,31 +164,34 @@ function VarTable({ variables, picked, onPick }: {
 
 function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => void }) {
   const select = useStudio((s) => s.select)
+  const focusNode = useStudio((s) => s.focusNode)
   const runtime = useRuntimeValues()
   const value = runtime[variable.path]
+  // 以前只 select 不平移：节点在视野外时点了等于没点，画布上连选中环都不会移过去
+  const go = (id: string) => { select(id); focusNode(id) }
 
   return (
     <div className="p-2.5">
       <div className="mb-1.5 flex items-start gap-2">
-        <span className="mono min-w-0 flex-1 break-all text-[11.5px]"
-              style={{ color: 'var(--accent)' }}>
+        <span className="mono min-w-0 flex-1 break-all text-xs text-fg">
           {`{{ ${variable.path} }}`}
         </span>
-        <button className="rounded p-0.5 text-faint hover:bg-hover" onClick={onClose}>
+        <button type="button" className="rounded p-0.5 text-faint hover:bg-hover" onClick={onClose}
+                aria-label="收起详情" title="收起详情">
           <ChevronDown size={12} className="-rotate-90" />
         </button>
       </div>
-      <div className="mb-2 text-[10.5px] leading-relaxed text-faint">{variable.label}</div>
+      <div className="mb-2 text-2xs leading-relaxed text-faint">{variable.label}</div>
       {variable.description && (
-        <div className="mb-2 rounded bg-bg px-2 py-1.5 text-[10.5px] leading-relaxed text-dim">
+        <div className="mb-2 rounded bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim">
           {variable.description}
         </div>
       )}
 
       {variable.produced_by && (
         <Section title="谁产出">
-          <button className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[10.5px] text-dim hover:bg-hover"
-                  onClick={() => select(variable.produced_by!)}>
+          <button type="button" className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-2xs text-dim hover:bg-hover"
+                  title="在画布上定位" onClick={() => go(variable.produced_by!)}>
             <Crosshair size={10} className="shrink-0 text-faint" />
             <span className="min-w-0 flex-1 truncate">{variable.produced_by_label}</span>
           </button>
@@ -218,15 +200,15 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
 
       <Section title={`被引用 ${variable.refs.length} 处`}>
         {variable.refs.length ? variable.refs.map((r, i) => (
-          <button key={i}
-                  className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[10.5px] hover:bg-hover"
-                  onClick={() => select(r.node_id)}>
+          <button type="button" key={i}
+                  className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-2xs hover:bg-hover"
+                  title="在画布上定位" onClick={() => go(r.node_id)}>
             <Crosshair size={10} className="shrink-0 text-faint" />
             <span className="min-w-0 flex-1 truncate text-dim">{r.node_label}</span>
-            <span className="mono shrink-0 text-[9.5px] text-faint">{r.field}</span>
+            <span className="mono shrink-0 text-2xs text-faint">{r.field}</span>
           </button>
         )) : (
-          <div className="px-1 py-1 text-[10.5px] text-faint">
+          <div className="px-1 py-1 text-2xs text-faint">
             没有任何地方引用它。改图改了一半的话这很正常
           </div>
         )}
@@ -234,11 +216,11 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
 
       <Section title="最近一次运行的值">
         {value === undefined ? (
-          <div className="px-1 text-[10.5px] leading-relaxed text-faint">
+          <div className="px-1 text-2xs leading-relaxed text-faint">
             这次运行里没有它的记录。跑一次就能看到
           </div>
         ) : (
-          <pre className="mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-[10px] leading-relaxed text-dim">
+          <pre className="mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim">
             {value}
           </pre>
         )}
@@ -250,7 +232,7 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="mb-2">
-      <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-faint">
+      <div className="mb-0.5 text-2xs font-semibold text-faint">
         {title}
       </div>
       {children}

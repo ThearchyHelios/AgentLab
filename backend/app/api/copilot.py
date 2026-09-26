@@ -10,9 +10,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
+from app.api.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
 from app.db.base import get_session
 from app.db.models import Workflow
-from app.engine.layout import auto_layout
+from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 from app.engine.state import message_text
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
@@ -384,10 +386,113 @@ async def set_copilot_model(
     return await get_copilot_model(session)
 
 
+def _unconfigured(e: ProviderNotConfigured) -> str:
+    return f"助手用的模型还没配好：{not_configured(e)}。到「设置 → 模型接入」检查一下"
+
+
 class GenerateOut(BaseModel):
     graph: dict[str, Any]
     explanation: str = ""
     issues: list[dict[str, Any]] = Field(default_factory=list)
+    layout: dict[str, Any] = Field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------
+# 改图时的排版：用户摆好的位置不动，只给新节点找空处
+# --------------------------------------------------------------------------
+
+#: 新节点和旧节点之间至少留的空。比排版的走廊窄一点：这里只求不压住、线有地方走，
+#: 不求和整体排版一样舒展——那是「自动排版」按钮的事
+_KEEP_GAP_X = 40.0
+_KEEP_GAP_Y = 24.0
+#: 同一列里上下各找几格，再找不到就往右挪一列
+_KEEP_ROWS = 8
+_KEEP_COLS = 6
+
+
+def _pinned_positions(base_graph: dict[str, Any] | None) -> dict[str, tuple[float, float]]:
+    """base_graph 里用户摆好的坐标。
+
+    全堆在同一点的（接口直接传进来、从没排过版的图）不算摆过，照常整体排版——
+    钉住它们只会让一叠节点永远叠着。
+    """
+    pos: dict[str, tuple[float, float]] = {}
+    for n in (base_graph or {}).get("nodes") or []:
+        p = n.get("position") or {}
+        x, y = p.get("x"), p.get("y")
+        if n.get("id") and isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            pos[n["id"]] = (float(x), float(y))
+    if len(pos) > 1 and len(set(pos.values())) == 1:
+        return {}
+    return pos
+
+
+def _layout_keeping(
+    spec: GraphSpec, pinned: dict[str, tuple[float, float]],
+) -> tuple[GraphSpec, dict[str, Any]]:
+    """已有节点留在原处，新节点按上下游插到最近的空位。
+
+    以前改图无条件 auto_layout 整张图：只改了一句提示词，所有节点也被挪到排版
+    位置。人工整理过的布局常带着业务含义（上游取数、口径计算、出具各占一块），
+    被打乱之后用户就不敢再让助手改图了。新建（没有旧坐标）照旧整体排版。
+    """
+    kept = [n for n in spec.nodes if n.id in pinned]
+    if not kept:
+        auto_layout(spec)
+        return spec, {"mode": "full", "placed": [n.id for n in spec.nodes]}
+
+    # 先整体排一遍，只借它的先后次序：上游的新节点先落位，下游才有东西可挨着
+    auto_layout(spec)
+    ideal = {n.id: (n.position.x, n.position.y) for n in spec.nodes}
+    fresh = sorted((n for n in spec.nodes if n.id not in pinned), key=lambda n: ideal[n.id])
+
+    placed: dict[str, tuple[float, float, float, float]] = {}
+    for n in kept:
+        n.position.x, n.position.y = pinned[n.id]
+        placed[n.id] = (n.position.x, n.position.y, NODE_W, _height(n))
+
+    def free(x: float, y: float, h: float) -> bool:
+        return all(
+            not (x < bx + bw + _KEEP_GAP_X and bx < x + NODE_W + _KEEP_GAP_X
+                 and y < by + bh + _KEEP_GAP_Y and by < y + h + _KEEP_GAP_Y)
+            for bx, by, bw, bh in placed.values()
+        )
+
+    step_x = NODE_W + CORRIDOR_MIN
+    for node in fresh:
+        h = _height(node)
+        preds = [placed[e.source] for e in spec.edges if e.target == node.id and e.source in placed]
+        succs = [placed[e.target] for e in spec.edges if e.source == node.id and e.target in placed]
+        if preds:
+            x0 = max(b[0] for b in preds) + step_x
+            y0 = sum(b[1] for b in preds) / len(preds)
+        elif succs:
+            x0 = min(b[0] for b in succs) - step_x
+            y0 = sum(b[1] for b in succs) / len(succs)
+        else:
+            # 和谁都不连：放到整张图右边，不插进别人的分区里
+            x0 = max(b[0] + b[2] for b in placed.values()) + CORRIDOR_MIN
+            y0 = min(b[1] for b in placed.values())
+
+        spot = None
+        row = h + MIN_ROW_GAP
+        for col in range(_KEEP_COLS):
+            x = x0 + col * step_x * (1 if preds or not succs else -1)
+            for k in range(_KEEP_ROWS * 2 + 1):
+                # 0, +1, -1, +2, -2 …：先试正对着上下游的那一格
+                y = y0 + ((k + 1) // 2) * row * (1 if k % 2 else -1)
+                if free(x, y, h):
+                    spot = (x, y)
+                    break
+            if spot:
+                break
+        if spot is None:
+            # 周围实在挤满了：放到整张图最下面，至少不压住任何东西
+            spot = (x0, max(b[1] + b[3] for b in placed.values()) + MIN_ROW_GAP)
+        node.position.x, node.position.y = round(spot[0], 1), round(spot[1], 1)
+        placed[node.id] = (node.position.x, node.position.y, NODE_W, h)
+
+    return spec, {"mode": "keep", "placed": [n.id for n in fresh]}
 
 
 GRAPH_SCHEMA: dict[str, Any] = {
@@ -467,7 +572,7 @@ async def generate(
     try:
         model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
     except ProviderNotConfigured as e:
-        raise HTTPException(400, str(e)) from e
+        raise HTTPException(400, _unconfigured(e)) from e
 
     messages = [("system", system),
                 ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
@@ -480,7 +585,11 @@ async def generate(
             text = message_text(await model.ainvoke(messages))
             raw = _extract_json(text)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"模型没有返回可用的图：{type(e).__name__}: {e}") from e
+            reason, _ = explain_error(e)
+            raise HTTPException(
+                502, f"模型这次没交回能用的工作流（{reason}）。换个说法再试一次；"
+                     "总是这样的话，到设置里给助手换一个更听指令的模型",
+            ) from e
 
     graph = {
         "nodes": [
@@ -505,14 +614,17 @@ async def generate(
     try:
         spec = GraphSpec.model_validate(graph)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"生成的图结构非法：{e}") from e
+        raise HTTPException(
+            502, f"模型交回的工作流结构不对：{graph_error(e)}。再试一次，或者把需求说得更具体些",
+        ) from e
 
-    spec = auto_layout(spec)
+    spec, layout = _layout_keeping(spec, _pinned_positions(payload.base_graph))
     report = validate_graph(spec)
     return GenerateOut(
         graph=spec.model_dump(mode="json"),
         explanation=str(raw.get("explanation", "")),
         issues=[i.model_dump() for i in report.issues],
+        layout=layout,
     )
 
 
@@ -750,6 +862,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     # 现有图状态：修改场景从 base_graph 起步，新建场景从空图起步
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
+    # 用户摆好的坐标，收尾排版时原样留着
+    pinned = _pinned_positions(payload.base_graph)
     if payload.base_graph and payload.base_graph.get("nodes"):
         for n in payload.base_graph["nodes"]:
             nodes[n["id"]] = n
@@ -769,7 +883,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         spec_ = await copilot_model_spec(session, payload)
         model, model_id = await get_chat_model(session, spec_)
     except ProviderNotConfigured as e:
-        raise HTTPException(400, str(e)) from e
+        raise HTTPException(400, _unconfigured(e)) from e
 
     messages = [("system", system),
                 ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
@@ -809,7 +923,9 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
-            yield f"data: {json.dumps({'op': 'error', 'message': f'{type(e).__name__}: {e}'}, ensure_ascii=False)}\n\n"
+            reason, hint = explain_error(e)
+            yield _sse({"op": "error", "message": f"助手这一轮没跑完：{reason}",
+                        "hint": hint, "detail": raw_error(e)})
             return
 
         # 兜底：一个操作都没落地，而上一轮有图。
@@ -854,7 +970,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                         yield _sse(op)
             except Exception as e:  # noqa: BLE001 - 修不成就照实交付，下面列出剩下的问题
                 yield _sse({"op": "check", "status": "error",
-                            "message": f"自查修正没跑成：{type(e).__name__}: {e}"})
+                            "message": f"自查修正没跑成：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
         remaining = _blocking_issues(nodes, edges)
@@ -867,15 +983,17 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         elif remaining is not None:
             yield _sse({"op": "check", "status": "passed", "repaired": repaired})
 
-        # 收尾：排版 + 校验，把最终图整体交付
+        # 收尾：排版 + 校验，把最终图整体交付。改图时旧节点留在原处，只排新节点
         try:
-            spec = auto_layout(
-                GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
+            spec, layout = _layout_keeping(
+                GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges}), pinned,
             )
             issues = [i.model_dump() for i in validate_graph(spec).issues]
-            # 跳过的节点要说出来，不能安静地少一步
+            # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
+            # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
                 {"level": "warning", "node_id": None, "edge_id": None,
+                 "code": "unknown_node_type", "type": t,
                  "message": f"模型写了一个不存在的节点类型「{t}」，这一步已跳过"}
                 for t in dict.fromkeys(skipped_types)
             ]
@@ -885,9 +1003,11 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 "issues": issues,
                 "explanation": explanation,
                 "autorun": autorun,
+                "layout": layout,
             }
         except Exception as e:  # noqa: BLE001
-            final = {"op": "error", "message": f"生成的图结构非法：{e}"}
+            final = {"op": "error", "message": f"模型交回的工作流结构不对：{graph_error(e)}",
+                     "hint": "再试一次，或者把需求说得更具体些", "detail": raw_error(e)}
         yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -920,7 +1040,14 @@ async def extract_template(
 
     run = await session.get(Run, payload.run_id)
     if not run:
-        raise HTTPException(404, "运行记录不存在")
+        raise HTTPException(404, "这次运行的记录不存在，可能已经被删了")
+    # 没跑通的路径提出来是半截骨架：失败节点之后的步骤一步都不在里面，
+    # 人拿去审改时却看不出它缺了什么
+    if run.status != "succeeded":
+        raise HTTPException(
+            409, "这次运行没有跑完（没有成功结束），提取出来的只是半截路径。"
+                 "先让它跑成功一次，再从那次运行提取",
+        )
     if not run.graph.get("nodes"):
         raise HTTPException(400, "这次运行没有保存图快照，无法提取")
 
@@ -1013,7 +1140,7 @@ async def explain(
             ),
         )
     except ProviderNotConfigured as e:
-        raise HTTPException(400, str(e)) from e
+        raise HTTPException(400, _unconfigured(e)) from e
 
     prompt = (
         "用中文解释下面这个 agent 工作流：它解决什么问题、数据怎么流动、"
@@ -1096,7 +1223,7 @@ async def review_run(
 
     run = await session.get(Run, payload.run_id)
     if not run:
-        raise HTTPException(404, f"运行 {payload.run_id} 不存在")
+        raise HTTPException(404, "这次运行的记录不存在，可能已经被删了")
 
     rows = list((await session.execute(
         select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)
@@ -1118,7 +1245,9 @@ async def review_run(
         # 没配模型不该让这一轮挂掉：规则层已经知道出了什么事，照样说得出话
         return rv.ReviewResult(
             verdict="annotated",
-            note="；".join(s.detail for s in signals) or str(e),
+            note="；".join(s.detail for s in signals) or (
+                _unconfigured(e) if isinstance(e, ProviderNotConfigured) else str(e.detail)
+            ),
             retry=rv.should_retry(signals),
             signals=signals, severity=rv.worst(signals),
         ).as_dict()

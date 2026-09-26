@@ -125,7 +125,7 @@ def _make(kind: str, model: str, base_url: str = "", *,
             where = base_url or "api.openai.com"
             raise EmbedderUnavailable(
                 f"用不了 {where} 上的 embedding 模型 "
-                f"{model or 'text-embedding-3-small'}：{type(e).__name__}: {e}。"
+                f"{model or 'text-embedding-3-small'}：{_why(e)}。"
                 f"检查服务在不在、模型名对不对；走官方接口还要看 OPENAI_API_KEY。"
             ) from e
         return _local
@@ -179,6 +179,12 @@ def has_semantics() -> bool:
     信号打个折再加回自己身上，同义改写一条都召不回。
     """
     return getattr(get_embedder(), "name", "") != "local-hashing"
+
+
+def _why(e: BaseException) -> str:
+    from app.api.errors import explain
+
+    return explain(e)[0]
 
 
 def default_alpha() -> float:

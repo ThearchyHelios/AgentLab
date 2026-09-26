@@ -34,6 +34,21 @@ class NodeType(StrEnum):
     METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
 
 
+# 节点类型在画布上的叫法。报错和门禁文案用它，而不是枚举值——用户在界面上从没
+# 见过 supervisor、llm 这些词。和前端 decode.ts / nodeDefs.ts 的叫法保持一致
+TYPE_LABEL: dict[str, str] = {
+    "input": "输入", "output": "成果 / 出具", "llm": "模型调用", "agent": "Agent",
+    "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码",
+    "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
+    "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
+    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡",
+}
+
+
+def type_label(node_type: Any) -> str:
+    return TYPE_LABEL.get(str(node_type), str(node_type))
+
+
 class Position(BaseModel):
     x: float = 0
     y: float = 0
@@ -222,9 +237,30 @@ def loop_steps(spec: GraphSpec) -> int:
     取上界不求精确：一个节点最多跑 Π(包住它的各层循环的 max_iterations + 1) 次，
     逐个加起来。一步至少跑一个节点，所以步数只会比这少。
     """
+    bodies = loop_bodies(spec)
+    if not bodies:
+        return 0
+    loops = spec.node_map()
+    runs: dict[str, int] = defaultdict(lambda: 1)
+    for loop_id, body in bodies.items():
+        try:
+            cap = int(loops[loop_id].config.get("max_iterations", 10) or 10)
+        except (TypeError, ValueError):
+            cap = 10    # 运行到这个节点时同样会报错，这里不替它报
+        for n in body | {loop_id}:
+            runs[n] *= max(cap, 0) + 1
+    return sum(runs.values())
+
+
+def loop_bodies(spec: GraphSpec) -> dict[str, set[str]]:
+    """每个循环节点的循环体（不含循环节点本身）。
+
+    循环体 = 从 body 出口出发、不经过循环节点本身、又能绕回它的那些节点。
+    没标出口的边路由时按 default 走，body 也会走它。
+    """
     loops = [n for n in spec.nodes if n.type == NodeType.LOOP]
     if not loops:
-        return 0
+        return {}
     succ: dict[str, list[str]] = defaultdict(list)
     pred: dict[str, list[str]] = defaultdict(list)
     for e in spec.edges:
@@ -241,19 +277,21 @@ def loop_steps(spec: GraphSpec) -> int:
                 stack.extend(x for x in step[n] if x != avoid)
         return seen
 
-    runs: dict[str, int] = defaultdict(lambda: 1)
+    out: dict[str, set[str]] = {}
     for loop in loops:
-        try:
-            cap = int(loop.config.get("max_iterations", 10) or 10)
-        except (TypeError, ValueError):
-            cap = 10    # 运行到这个节点时同样会报错，这里不替它报
-        # 循环体 = 从 body 出口出发、不经过循环节点本身、又能绕回它的那些节点。
-        # 没标出口的边路由时按 default 走，body 也会走它
         entries = [e.target for e in spec.outgoing(loop.id) if e.sourceHandle != "done"]
-        body = reach(entries, succ, loop.id) & reach(pred[loop.id], pred, loop.id)
-        for n in body | {loop.id}:
-            runs[n] *= max(cap, 0) + 1
-    return sum(runs.values())
+        out[loop.id] = reach(entries, succ, loop.id) & reach(pred[loop.id], pred, loop.id)
+    return out
+
+
+def innermost_loops(spec: GraphSpec) -> dict[str, str]:
+    """节点 -> 直接包住它的那一层循环。嵌套时取循环体最小的那个。"""
+    bodies = loop_bodies(spec)
+    out: dict[str, str] = {}
+    for loop_id, body in sorted(bodies.items(), key=lambda kv: -len(kv[1])):
+        for n in body:
+            out[n] = loop_id    # 由大到小覆盖，最后留下的是最内层
+    return out
 
 
 def expression_fields(node: GraphNode) -> list[tuple[str, str]]:
@@ -294,6 +332,35 @@ _MAY_WRITE_STDOUT = re.compile(
     r"|^\s*\{\{.*\}\}\s*$", re.M)
 
 
+def _check_case_keys(node: GraphNode, cases: list[Any], result: ValidationResult) -> None:
+    """分支出口的 id 就是 case 的 key，所以 key 得唯一、非空，而且不能占用兜底出口的名字。
+
+    default 只报警告：现存的 ⑥ 模板就写着 key=default、条件为 true，运行语义上等价于
+    兜底，是自洽的；升成 error 会让它和所有从它复制出来的图直接不能跑。可它在画布上
+    会和「其他」撞成同一个出口，跑完两条一起点亮——得说出来。
+    重复和空 key 是真坏了：路由只认 key，重复的那个永远轮不到，空的根本连不出边。
+    """
+    seen: set[str] = set()
+    for i, case in enumerate(cases, start=1):
+        case = case or {}
+        key = str(case.get("key") or "").strip()
+        name = case.get("label") or key or f"第 {i} 个"
+        if not key:
+            result.add(f"「条件分支」的分支「{name}」没有标识（key），连不出边、也走不到它",
+                       node_id=node.id)
+            continue
+        if key == "default":
+            result.add(
+                f"分支「{name}」的标识用了 default：这是「其他」兜底出口的保留名，两者会合并成"
+                "同一个出口，跑完分不清走的是哪条。换一个标识，比如 team",
+                level="warning", node_id=node.id,
+            )
+        elif key in seen:
+            result.add(f"「条件分支」里有两个分支的标识都是 {key!r}：路由只认标识，"
+                       "后一个永远轮不到。给它换一个不重复的标识", node_id=node.id)
+        seen.add(key)
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -319,29 +386,30 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         if node.type == NodeType.BRANCH:
             cases = cfg.get("cases") or []
             if not cases:
-                result.add("分支节点至少要配一个条件分支", node_id=node.id)
+                result.add("「条件分支」至少要配一个分支条件", node_id=node.id)
             handles = {e.sourceHandle for e in spec.outgoing(node.id)}
+            _check_case_keys(node, cases, result)
             for case in cases:
-                key = case.get("key")
-                if key and key not in handles:
+                key = str((case or {}).get("key") or "").strip()
+                if key and key != "default" and key not in handles:
                     result.add(
                         f"分支 {key!r} 没有连出去的边", level="warning", node_id=node.id
                     )
             if "default" not in handles:
                 result.add(
-                    "建议给分支节点连一条 default 边，兜住所有条件都不满足的情况",
+                    "建议给「条件分支」的「其他」出口连一条边，兜住所有条件都不满足的情况",
                     level="warning",
                     node_id=node.id,
                 )
         elif node.type == NodeType.TOOL:
             if not cfg.get("tool"):
-                result.add("工具节点还没选工具", node_id=node.id)
+                result.add("「调用工具」节点还没选工具", node_id=node.id)
         elif node.type == NodeType.SUBGRAPH:
             if not cfg.get("workflow_id"):
-                result.add("子图节点还没选要嵌套的工作流", node_id=node.id)
+                result.add("「子工作流」节点还没选要嵌套的工作流", node_id=node.id)
         elif node.type == NodeType.VALIDATE:
             if not cfg.get("schema"):
-                result.add("校验节点需要一个 JSON Schema", node_id=node.id)
+                result.add("「结构校验」节点需要一个 JSON Schema", node_id=node.id)
         elif node.type == NodeType.METRICS:
             defs = cfg.get("metrics") or []
             if not defs:
@@ -353,11 +421,11 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not contract.get("metrics_from"):
-                result.add("出具契约缺 metrics_from（指标来自哪个口径卡节点）",
+                result.add("出具契约缺 metrics_from（指标来自哪个「口径卡」节点）",
                            node_id=node.id)
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
-                result.add("循环节点没有循环体", node_id=node.id)
+                result.add("「循环」节点没有循环体", node_id=node.id)
 
         if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR):
             if not (cfg.get("model") or spec.defaults.get("model")):

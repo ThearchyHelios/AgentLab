@@ -3,8 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f8cff'/%3E%3Ctext x='16' y='23' font-size='19' font-family='sans-serif' font-weight='bold' fill='white' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>AgentLab · 可视化 Agent 编排实验台</title>
+    <script>
+      // 首帧之前定主题。偏好的真源在后端设置里，但等接口回来再切，浅色用户每次
+      // 打开都会先看到一帧深色；src/lib/theme.ts 每次应用主题都会把偏好写到这个
+      // 键上，两边的键名和取值要一致。「跟随系统」不写属性，交给 CSS 的媒体查询
+      try {
+        var pref = localStorage.getItem('agentlab.theme')
+        if (pref === 'light' || pref === 'dark') document.documentElement.setAttribute('data-theme', pref)
+      } catch (e) {}
+    </script>
+    <style>
+      /* 样式表加载前的那一瞬间页面只有浏览器默认底色。先把底色按主题铺上，
+         不然深色用户会先闪一下白、浅色用户先闪一下黑；取值同 index.css 的 --bg */
+      html { background: #0b0e14; color-scheme: dark; }
+      html[data-theme='light'] { background: #f6f7f9; color-scheme: light; }
+      @media (prefers-color-scheme: light) {
+        html:not([data-theme]) { background: #f6f7f9; color-scheme: light; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
