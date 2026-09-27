@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,13 +16,14 @@ from sqlalchemy import select, update
 
 from app.core.bus import bus
 from app.core.config import settings
+from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType, RunEventModel
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
-from app.engine.errors import describe_exception, raw_detail
-from app.engine.schema import GraphSpec, loop_steps, topology_of, validate_graph
+from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
+from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,8 @@ class RunManager:
         self._closing = False
         #: 已经跑完、正在落状态和封存的运行。关停不去打断它们
         self._finalizing: set[str] = set()
+        #: 谁停的：取消执行任务时记下，run.cancelled 和关掉的审批上写得出人
+        self._stopped_by: dict[str, str | None] = {}
 
     # ---------------- 生命周期 ----------------
 
@@ -111,16 +115,7 @@ class RunManager:
         persist: bool = True,
         ts: float | None = None,
     ) -> None:
-        event = RunEventModel(
-            run_id=run_id,
-            seq=bus.next_seq(run_id),
-            type=EventType(str(event_type)),
-            node_id=node_id,
-            data=data or {},
-            # 节点里发出的事件带着它发生的时刻。以前一律取转发时刻：并行的成员
-            # 先做完的那条也要排到整轮结束才被转发，时间线上的耗时就全错了
-            **({"ts": ts} if ts else {}),
-        )
+        event = self._event(run_id, event_type, node_id=node_id, data=data, ts=ts)
         # 先落库，再广播。顺序反过来会漏事件，而且是结构性的漏：
         #
         # 订阅者的完整性靠"读历史 + 接实时"两段拼起来。它先订阅、再读历史，
@@ -133,21 +128,29 @@ class RunManager:
         # 一半几率就这么没了——界面表现为某个节点永远在转圈。
         if persist and event.type not in _EPHEMERAL:
             async with SessionLocal() as session:
-                session.add(
-                    RunEvent(
-                        run_id=run_id,
-                        seq=event.seq,
-                        type=str(event.type),
-                        node_id=event.node_id,
-                        ts=event.ts,
-                        data=event.data,
-                    )
-                )
-                await session.execute(
-                    update(Run).where(Run.id == run_id).values(last_seq=event.seq)
-                )
+                await _stage(session, event)
                 await session.commit()
         await bus.publish(event)
+
+    @staticmethod
+    def _event(
+        run_id: str,
+        event_type: EventType | str,
+        *,
+        node_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> RunEventModel:
+        return RunEventModel(
+            run_id=run_id,
+            seq=bus.next_seq(run_id),
+            type=EventType(str(event_type)),
+            node_id=node_id,
+            data=data or {},
+            # 节点里发出的事件带着它发生的时刻。以前一律取转发时刻：并行的成员
+            # 先做完的那条也要排到整轮结束才被转发，时间线上的耗时就全错了
+            **({"ts": ts} if ts else {}),
+        )
 
     async def note(
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
@@ -256,6 +259,11 @@ class RunManager:
                 "这次运行没有可恢复的断点（很可能重启前还没真正开始跑）。"
                 "请重新发起一次运行，而不是恢复——继续下去只会用默认值跑出一份假结果。"
             )
+        if stale := await _stale_replay(run_id, spec, snapshot):
+            raise ValueError(
+                f"这次运行是升级前停在「{stale}」上的，引擎记录断点的方式已经变了：现在恢复，"
+                f"「{stale}」里已经执行过的工具会再执行一次。请放弃这次运行，重新发起"
+            )
 
         answers: dict[str, Any] = {}
         async with SessionLocal() as session:
@@ -283,14 +291,21 @@ class RunManager:
 
             now = datetime.now(timezone.utc)
             if target is not None:
-                target.status = "answered"  # 已回复，但还没提交给引擎
                 # 存全文，不能用 _safe 截：多条审批并存时，交给引擎的就是这一份
                 # （见下面 answers）。截过的版本会把人工改过的长稿砍掉一截再送进节点
                 full = json.loads(json.dumps(response, ensure_ascii=False, default=str))
-                target.response = full if isinstance(full, dict) else {"value": full}
-                target.resolved_at = now
-                if actor:
-                    target.resolved_by = actor
+                # 条件更新：上面读到它还是 pending，到这里之间可能已经被放弃运行关掉
+                # （或者另一个人先批了）。无条件写回去，会把关掉的审批又改成已回复
+                marked = await session.execute(
+                    update(Approval)
+                    .where(Approval.id == target.id, Approval.status == "pending")
+                    .values(status="answered",  # 已回复，但还没提交给引擎
+                            response=full if isinstance(full, dict) else {"value": full},
+                            resolved_at=now, **({"resolved_by": actor} if actor else {}))
+                )
+                if marked.rowcount != 1:
+                    await session.rollback()
+                    raise ValueError("这条审批已经处理过了，或者这次运行已经放弃了。刷新看看最新状态")
                 await session.commit()
 
             # 凑齐没有？引擎还在等的每一个 interrupt 都得有答案
@@ -299,7 +314,7 @@ class RunManager:
                     select(Approval).where(
                         Approval.run_id == run_id,
                         Approval.status.in_(["answered", "pending"]),
-                    )
+                    ).execution_options(populate_existing=True)
                 )
             ).scalars())
             by_iid = {a.interrupt_id: a for a in answered if a.interrupt_id}
@@ -321,19 +336,26 @@ class RunManager:
                 # 还差人没回。保持 interrupted，把已回复的那条留在 answered 上等齐
                 await session.commit()
                 run = await session.get(Run, run_id)
+                if run.status != "interrupted":
+                    # 审批没了是因为运行在这期间被放弃了：不能回一个「已记下」
+                    raise ValueError(_cannot_resume(run.status))
                 return run
 
             # 齐了：正式落 resolved，然后驱动引擎。谁批的跟着交给节点，
             # human.resolved 里才写得出签批人
-            actors: dict[str, str | None] = {}
-            for rec in answered:
-                if rec.status == "answered":
-                    rec.status = "resolved"
-                    actors[rec.node_id] = rec.resolved_by
+            ready = [rec for rec in answered if rec.status == "answered"]
+            actors: dict[str, str | None] = {rec.node_id: rec.resolved_by for rec in ready}
+            # 回到 running 也用条件更新占住：从上面读状态到这里隔了好几次 await，
+            # 放弃运行可能正好在这中间把它收成了 cancelled（已经封存、发过 run.cancelled）。
+            # 无条件写 running，一次取消了的运行就又被拉起来跑了
+            await _claim(session, run_id, ("interrupted",), _cannot_resume)
+            await session.execute(
+                update(Approval)
+                .where(Approval.id.in_([rec.id for rec in ready]), Approval.status == "answered")
+                .values(status="resolved")
+            )
             run = await session.get(Run, run_id)
             bus.set_seq(run_id, run.last_seq)
-            run.status = "running"
-            run.error = None
             await session.commit()
             await session.refresh(run)
 
@@ -356,7 +378,7 @@ class RunManager:
         ))
         self._tasks[run_id] = asyncio.create_task(
             self._drive(run_id, spec, command, workflow_id=workflow_id, **carried,
-                        resumed=[str(n) for n in (getattr(snapshot, "next", None) or ())],
+                        resumed=sorted(_replayed(snapshot)),
                         actors=actors)
         )
         return run
@@ -389,6 +411,7 @@ class RunManager:
             )).first() is not None
             if not (run.status == "failed" or (run.status == "interrupted" and not has_pending)):
                 raise ValueError(_cannot_continue(run.status, has_pending))
+            observed = run.status
             spec = GraphSpec.model_validate(run.graph)
             workflow_id = run.workflow_id
             carried = _carried(run)
@@ -419,17 +442,22 @@ class RunManager:
                 "这次运行没有留下可以接着跑的断点（多半是还没跑到第一个节点就挂了）。"
                 "请重新发起一次运行——继续下去只会从头跑一遍，还看不出来。"
             )
+        if stale := await _stale_replay(run_id, spec, snapshot):
+            raise ValueError(
+                f"这次运行是升级前停在「{stale}」上的，引擎记录断点的方式已经变了：现在接着跑，"
+                f"「{stale}」里已经执行过的工具会再执行一次。请重新发起一次运行"
+            )
 
         done = [n for n in (snapshot.values or {}).get("nodes", {}) if n not in pending]
         async with SessionLocal() as session:
+            # 和 resume 一样用条件更新占住：读状态之后，放弃运行、或者另一次接着跑
+            # 可能已经先动了它
+            await _claim(session, run_id, (observed,),
+                              lambda status: _cannot_continue(status, False),
+                              **({"graph": spec.model_dump(mode="json")} if graph is not None else {}),
+                              **({"started_by": actor} if actor else {}))
             run = await session.get(Run, run_id)
             bus.set_seq(run_id, run.last_seq)
-            run.status = "running"
-            run.error = None
-            if graph is not None:
-                run.graph = spec.model_dump(mode="json")
-            if actor:
-                run.started_by = actor
             await session.commit()
             await session.refresh(run)
 
@@ -450,12 +478,65 @@ class RunManager:
         )
         return run
 
-    async def cancel(self, run_id: str) -> bool:
+    async def cancel(self, run_id: str, *, actor: str | None = None) -> str | None:
+        """停止一次运行。返回 "stopping"（执行任务已取消，终态由它自己收尾）、
+        "cancelled"（停在断点上的，这里直接收成终态），或者 None（已经是终态、或不存在）。
+
+        停在断点上的运行——等审批的、服务重启挂起的——手上没有执行任务。以前这里只会
+        去取消任务，于是它们一律「不在执行中」：待审批的那张卡只能批了它、让它跑完。
+        """
+        if run_id in self._finalizing:
+            # 执行任务已经跑完、正在落状态——刚发出 run.interrupted、还在写 interrupted
+            # 的那一刻，界面上已经给出了「放弃这次运行」。这时取消任务会把收尾从中间
+            # 打断：状态停在 running、审批还挂着、任务却没了，再点一次只剩 409。
+            # 等它落完，再按落下的状态处理
+            await self.wait_idle(run_id, timeout=30.0)
+            if run_id in self._finalizing:      # 收尾卡住了（库被锁着）：也不去打断它
+                return None
         task = self._tasks.get(run_id)
         if task and not task.done():
+            self._stopped_by[run_id] = actor
             task.cancel()
-            return True
-        return False
+            return "stopping"
+        return "cancelled" if await self._abandon(run_id, actor) else None
+
+    async def _abandon(self, run_id: str, actor: str | None) -> bool:
+        """把停在断点上的运行收成 cancelled：关掉待审批、发 run.cancelled、封存。"""
+        now = datetime.now(timezone.utc)
+        async with SessionLocal() as session:
+            # 条件更新占住这次收尾：同一时刻有人批了它（resume 把它改回 running），
+            # 或者另一个取消先到了，这里就什么都不做
+            claimed = await session.execute(
+                update(Run).where(Run.id == run_id, Run.status == "interrupted")
+                .values(status="cancelled", finished_at=now)
+            )
+            if claimed.rowcount != 1:
+                await session.rollback()
+                return False
+            closed = await _close_approvals(session, run_id, actor, now)
+            run = await session.get(Run, run_id)
+            timing = await _timing(session, run, 0, now)
+            run.usage = {**(run.usage or {}), "duration_ms": timing["active_ms"], **timing}
+            run.error = "用户取消：在等审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
+            bus.set_seq(run_id, run.last_seq or 0)
+            # 和状态同一个事务提交，理由同 _finalize
+            event = self._event(run_id, EventType.RUN_CANCELLED, data={
+                "timing": timing, "actor": actor,
+                "message": f"放弃了这次运行，{closed} 条待审批一并关闭" if closed
+                           else "放弃了这次挂起的运行",
+            })
+            await _stage(session, event, run)
+            await session.commit()
+
+        await bus.publish(event)
+        await self._seal(run_id)
+        # 等审批时在线的连接没有关（它还在等恢复），这里让它收到终态再结束
+        await bus.close(run_id)
+        with contextlib.suppress(Exception):
+            from app.sandbox.manager import sandbox_manager
+
+            await sandbox_manager.cleanup(run_id)
+        return True
 
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
@@ -512,7 +593,9 @@ class RunManager:
                           # 实际生效的运行参数进事件流，也就进了封存清单：
                           # 正式运行查的是哪个库、审批默认是什么，事后可复核
                           "memory_scope": memory_scope, "collection": collection,
-                          "approval_default": approval_default},
+                          "approval_default": approval_default,
+                          # 这一段是按哪一版重放协议跑的，恢复时据此认出升级前做下的工作
+                          "replay_protocol": PROTOCOL},
                 )
 
                 run_ctx = RunContext(
@@ -531,6 +614,8 @@ class RunManager:
                 config = {
                     "configurable": {"thread_id": run_id},
                     "recursion_limit": settings.max_graph_steps + extra_steps,
+                    # 进每个 checkpoint 的 metadata：恢复时据此认出旧版引擎停下的断点
+                    "metadata": {PROTOCOL_KEY: PROTOCOL},
                 }
 
                 interrupted = False
@@ -569,7 +654,7 @@ class RunManager:
                 else:
                     status = "cancelled"
                     error = "用户取消"
-                    terminal = (EventType.RUN_CANCELLED, {})
+                    terminal = (EventType.RUN_CANCELLED, {"actor": self._stopped_by.pop(run_id, None)})
                 raise
             except TimeoutError as e:
                 status = "failed"
@@ -611,6 +696,7 @@ class RunManager:
                     # gather 在别的事件循环里炸开
                     self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
+                    self._stopped_by.pop(run_id, None)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
@@ -692,13 +778,41 @@ class RunManager:
         now = datetime.now(timezone.utc)
         timing = {"wall_ms": elapsed_ms, "active_ms": elapsed_ms, "wait_ms": 0}
 
+        # 终态事件和运行记录在同一个事务里提交，提交之后再广播。两边都有人在读：
+        # 读到 failed 的一方马上去翻事件，要翻得到 run.failed（报错原因和定位都在
+        # 那条事件里）；收到 run.finished 的一方马上 GET 这次运行取完整成果（事件里
+        # 的 output 是截断的），要读得到 succeeded 和 output。分两次提交，总有一边
+        # 会读到半截——以前先提交状态，前一种偶尔翻不到；反过来先落事件，后一种
+        # 每次都读到 running 和空的 output
+        event: RunEventModel | None = None
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if run:
                 timing = await _timing(session, run, elapsed_ms, now)
+                if status != "succeeded":
+                    # 状态里的用量只算跑完了的节点。失败、取消、停在审批上的那个节点已经
+                    # 花出去的调用（校验修复、agent 的前几步）只在 llm.end 里——以前这部分
+                    # 在运行记录上凭空消失，失败的运行看着像没花钱
+                    usage = _spent(usage, await _usage_of_events(session, run_id))
                 # duration_ms 是各段执行时长之和（= active_ms）。以前用这一段的耗时
                 # 覆盖它：87 秒、中间等过一次审批的运行，列表上写着 22ms
                 usage.update(duration_ms=timing["active_ms"], **timing)
+
+            if status == "succeeded":
+                # 事件里的 output 仍然截断（事件体积要控制），但截了就要说：消费方据此
+                # 回源 GET /api/runs/{id} 取全文。以前截得悄无声息，问数据页把 2000 字处
+                # 切断的半截答案当成完整结论落了库
+                clipped, truncated = _clip(output)
+                data: dict[str, Any] = {"output": clipped, "usage": usage,
+                                        "duration_ms": timing["active_ms"], "timing": timing}
+                if truncated:
+                    data["output_truncated"] = True
+                event = self._event(run_id, EventType.RUN_FINISHED, data=data)
+            elif terminal is not None:
+                kind, data = terminal
+                event = self._event(run_id, kind, data={**data, "timing": timing})
+
+            if run:
                 run.status = status
                 run.error = error
                 run.output = output
@@ -706,21 +820,17 @@ class RunManager:
                 run.error_node_id = error_node
                 if status != "interrupted":
                     run.finished_at = now
+                if status in ("failed", "cancelled"):
+                    # 并行支路上已经停下来等人的那张审批卡，运行结束了它也就没有意义了；
+                    # 留着的话它一直挂在全局待办里，批了也只会被告知运行不在断点上
+                    actor = terminal[1].get("actor") if terminal else None
+                    await _close_approvals(session, run_id, actor, now)
+                if event is not None:
+                    await _stage(session, event, run)
                 await session.commit()
+        if event is not None:
+            await bus.publish(event)
 
-        if status == "succeeded":
-            # 事件里的 output 仍然截断（事件体积要控制），但截了就要说：消费方据此
-            # 回源 GET /api/runs/{id} 取全文。以前截得悄无声息，问数据页把 2000 字处
-            # 切断的半截答案当成完整结论落了库
-            clipped, truncated = _clip(output)
-            data: dict[str, Any] = {"output": clipped, "usage": usage,
-                                    "duration_ms": timing["active_ms"], "timing": timing}
-            if truncated:
-                data["output_truncated"] = True
-            await self._emit(run_id, EventType.RUN_FINISHED, data=data)
-        elif terminal is not None:
-            kind, data = terminal
-            await self._emit(run_id, kind, data={**data, "timing": timing})
         if status != "interrupted":
             # 终态事件落库之后再封存。以前在 run.finished 之前算，清单里恰恰少了
             # 那条宣布"跑完了、成果是什么"的事件——改它的成果，清单照样对得上。
@@ -898,6 +1008,128 @@ async def _approval_default(*, run_class: str) -> str:
 
     async with SessionLocal() as session:
         return tool_approval_default(await run_defaults(session))
+
+
+def _replayed(snapshot: Any) -> set[str]:
+    """从断点驱动时要（重新）执行的节点：还没跑的（next），加上停在 interrupt 上、或者
+    失败了的。恢复过一次的节点手里已经有答复的写入，不在 next 里，只能从 tasks 上认。"""
+    again = {str(x) for x in getattr(snapshot, "next", None) or ()}
+    again.update(str(t.name) for t in getattr(snapshot, "tasks", None) or ()
+                 if getattr(t, "interrupts", None) or getattr(t, "error", None))
+    return again
+
+
+async def _stale_replay(run_id: str, spec: GraphSpec, snapshot: Any) -> str | None:
+    """旧版重放协议写下的断点，按现在的代码重放会不会把做过的工具再做一遍。会的话返回节点名。
+
+    有风险的是：断点之后，旧版代码在这个节点里已经执行过工具、或者已经批过一次。它们
+    的 task 缓存排在旧的位置上，新代码多插了记录 task，位置全错开了。停在第一次审批上、
+    之前什么都没做的，重放只会多发一条 human.requested，照常放行；人工审批节点同理。
+
+    「断点之后」按 checkpoint 的写入时刻算：同一个 superstep 里恢复不会写新的 checkpoint，
+    所以升级后恢复过一次的运行，断点仍是旧版写的，而那之后的工作是新版做的——
+    哪一段是哪一版，看那一段 run.started 里记的 replay_protocol。
+    """
+    if protocol_of(getattr(snapshot, "metadata", None)) >= PROTOCOL:
+        return None
+    nodes = spec.node_map()
+    suspects = [n for n in _replayed(snapshot) if n in nodes and nodes[n].type != NodeType.HUMAN]
+    if not suspects:
+        return None
+    try:
+        since = datetime.fromisoformat(str(snapshot.created_at)).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        since = 0.0
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(RunEvent.type, RunEvent.node_id, RunEvent.ts, RunEvent.data)
+            .where(RunEvent.run_id == run_id,
+                   RunEvent.type.in_([EventType.RUN_STARTED, EventType.TOOL_START,
+                                      EventType.HUMAN_RESOLVED]))
+            .order_by(RunEvent.seq)
+        )).all()
+    protocol = 1
+    for kind, owner, ts, data in rows:
+        if kind == EventType.RUN_STARTED:
+            protocol = protocol_of({PROTOCOL_KEY: (data or {}).get("replay_protocol")})
+            continue
+        if protocol >= PROTOCOL or (ts or 0) < since:
+            continue
+        for node_id in suspects:
+            if owner == node_id or (owner or "").startswith(f"{node_id}/"):
+                return nodes[node_id].title or node_id
+    return None
+
+
+async def _claim(
+    session: Any, run_id: str, expected: tuple[str, ...], refusal: Callable[[str], str],
+    **values: Any,
+) -> None:
+    """只在状态仍是 expected 时把运行改成 running；已经被别人改过就回滚、说明原因。"""
+    claimed = await session.execute(
+        update(Run).where(Run.id == run_id, Run.status.in_(expected))
+        .values(status="running", error=None, **values)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        status = await session.scalar(select(Run.status).where(Run.id == run_id))
+        raise ValueError(refusal(status or ""))
+
+
+async def _stage(session: Any, event: RunEventModel, run: Run | None = None) -> None:
+    """把一条事件写进这个 session，随它一起提交。run 已经在 session 里时直接改它的 last_seq。"""
+    session.add(RunEvent(run_id=event.run_id, seq=event.seq, type=str(event.type),
+                         node_id=event.node_id, ts=event.ts, data=event.data))
+    if run is not None:
+        run.last_seq = event.seq
+    else:
+        await session.execute(
+            update(Run).where(Run.id == event.run_id).values(last_seq=event.seq)
+        )
+
+
+async def _close_approvals(session: Any, run_id: str, actor: str | None, now: datetime) -> int:
+    """运行已经结束，它还没处理完的审批一并关掉。返回关掉了几条。"""
+    rows = list((await session.execute(
+        select(Approval).where(Approval.run_id == run_id,
+                               Approval.status.in_(["pending", "answered"]))
+    )).scalars())
+    for approval in rows:
+        approval.status = "cancelled"
+        approval.resolved_at = now
+        approval.resolved_by = actor
+    return len(rows)
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens", "cost_usd", "calls")
+
+
+async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
+    """按 llm.end 事件逐次加总的用量：每次模型调用都有一条，不管节点最后成没成。"""
+    rows = await session.execute(
+        select(RunEvent.data).where(RunEvent.run_id == run_id, RunEvent.type == EventType.LLM_END)
+    )
+    total: dict[str, Any] = dict.fromkeys(_USAGE_KEYS, 0)
+    for (data,) in rows:
+        for key in _USAGE_KEYS:
+            value = (data or {}).get(key, 1 if key == "calls" else 0)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total[key] += value
+    total["cost_usd"] = round(total["cost_usd"], 6)
+    return total
+
+
+def _spent(state_usage: dict[str, Any], events_usage: dict[str, Any]) -> dict[str, Any]:
+    """两本账取大的那本。新引擎每次调用都发 llm.end，事件那本不会更少；
+    加这条事件之前的老运行（agent 节点不发 llm.end）状态那本更全。"""
+    out = dict(state_usage)
+    for key in _USAGE_KEYS:
+        mine, theirs = out.get(key) or 0, events_usage.get(key) or 0
+        if isinstance(mine, (int, float)) and theirs > mine:
+            out[key] = theirs
+    if "input_tokens" in out or "output_tokens" in out:
+        out["total_tokens"] = int(out.get("input_tokens") or 0) + int(out.get("output_tokens") or 0)
+    return out
 
 
 async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dict[str, int]:

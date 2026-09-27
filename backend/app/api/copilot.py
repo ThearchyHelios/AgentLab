@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import re
 import time
 from typing import Any
 
@@ -11,11 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
-from app.api.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
-from app.engine.schema import GraphSpec, NodeType, validate_graph
+from app.engine.schema import GraphSpec, NodeType, ValidationIssue, validate_graph
 from app.engine.state import message_text
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 from app.tools.registry import all_specs
@@ -23,7 +25,40 @@ from app.tools.registry import all_specs
 router = APIRouter(prefix="/api/copilot", tags=["copilot"])
 
 
-async def _tool_catalog(session: AsyncSession) -> str:
+async def _sources(session: AsyncSession, scope: list[str] | None) -> list[Any]:
+    """这一轮给助手看的数据源：启用着的，限定了范围就只留点名的（id、名字都认）。
+
+    点名的一个都不在（删了、停用了）就直接拒绝：悄悄退回「全部数据源」等于
+    无视用户的限定，而他正是因为想换一个库问才点的。
+    """
+    from app.db.models import DataSource
+
+    rows = list((
+        await session.execute(
+            select(DataSource).where(DataSource.enabled.is_(True)).order_by(DataSource.name)
+        )
+    ).scalars())
+    wanted = {s.strip() for s in scope or [] if isinstance(s, str) and s.strip()}
+    if not wanted:
+        return rows
+    picked = [r for r in rows if r.id in wanted or r.name in wanted]
+    if not picked:
+        raise HTTPException(
+            400, "限定的数据源都不在了：可能已经被删掉或停用。去掉限定再问，"
+                 "或者到「数据」页确认它还在、而且是启用的",
+        )
+    return picked
+
+
+def _scope_note(rows: list[Any], scoped: bool) -> str:
+    if not scoped:
+        return ""
+    names = "、".join(r.name for r in rows)
+    return (f"\n\n这一轮用户把数据源限定为：{names}。只查它们，只能用它们的 db_query__ / "
+            "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
+
+
+def _tool_catalog(rows: list[Any]) -> str:
     """给 Copilot 看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
@@ -36,14 +71,8 @@ async def _tool_catalog(session: AsyncSession) -> str:
     ]
 
     from app.data import introspect as _introspect
-    from app.db.models import DataSource
     from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
 
-    rows = list((
-        await session.execute(
-            select(DataSource).where(DataSource.enabled.is_(True)).order_by(DataSource.name)
-        )
-    ).scalars())
     for row in rows:
         tables = _introspect.table_names(row)
         listed = "、".join(tables[:12]) + (f" 等 {len(tables)} 个对象" if len(tables) > 12 else "")
@@ -68,16 +97,10 @@ _DATASOURCE_BUDGET_CHARS = 6000
 _DETAIL_TABLE_LIMIT = 40
 
 
-async def _datasource_section(session: AsyncSession) -> str:
+def _datasource_section(rows: list[Any]) -> str:
     """数据源与结构摘要。没有数据源时返回空串，不占 prompt。"""
     from app.data import introspect as _introspect
-    from app.db.models import DataSource
 
-    rows = list((
-        await session.execute(
-            select(DataSource).where(DataSource.enabled.is_(True)).order_by(DataSource.name)
-        )
-    ).scalars())
     if not rows:
         return ""
 
@@ -190,6 +213,8 @@ class GenerateIn(BaseModel):
     intent: str = Field(default="build")
     #: 属于哪次对话。带上它，这一轮才知道前面聊过什么
     conversation_id: str | None = None
+    #: 这一轮只查这几个数据源（id 或名字）。不传或空表示不限
+    datasource_ids: list[str] | None = None
 
 
 def _user_message(payload: GenerateIn, *, patch: bool) -> str:
@@ -395,6 +420,8 @@ class GenerateOut(BaseModel):
     explanation: str = ""
     issues: list[dict[str, Any]] = Field(default_factory=list)
     layout: dict[str, Any] = Field(default_factory=dict)
+    #: 改图前后都在、工具绑定却变了的节点和成员，见 tool_changes()
+    tool_changes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -545,8 +572,10 @@ async def generate(
     产物会经过和手工编排完全相同的校验与排版，所以生成完就是可运行、可读的，
     而不是一段还要人去修的 JSON。
     """
-    tool_list = await _tool_catalog(session)
-    datasources = await _datasource_section(session)
+    sources = await _sources(session, payload.datasource_ids)
+    scope = {r.name for r in sources} if payload.datasource_ids else None
+    tool_list = _tool_catalog(sources)
+    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
 
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求产出一张可执行的工作流图。\n\n"
@@ -620,11 +649,16 @@ async def generate(
 
     spec, layout = _layout_keeping(spec, _pinned_positions(payload.base_graph))
     report = validate_graph(spec)
+    out = spec.model_dump(mode="json")
+    changes = tool_changes((payload.base_graph or {}).get("nodes") or [], out["nodes"])
     return GenerateOut(
-        graph=spec.model_dump(mode="json"),
+        graph=out,
         explanation=str(raw.get("explanation", "")),
-        issues=[i.model_dump() for i in report.issues],
+        issues=[i.model_dump() for i in report.issues]
+        + _issue_dicts(scope_issues(out["nodes"], scope), "datasource_out_of_scope")
+        + dropped_tool_warnings(changes, payload.instruction),
         layout=layout,
+        tool_changes=changes,
     )
 
 
@@ -638,13 +672,16 @@ _STREAM_PROTOCOL = """\
 - 可用操作：
   {"op":"plan","summary":"一句话说明打算怎么搭"}          ← 第一行
   {"op":"add_node","node":{"id":"...","type":"...","label":"中文标签","config":{...}}}
-  {"op":"update_node","id":"...","label":"...","config":{...}}   ← 修改现有节点（config 整体替换）
+  {"op":"update_node","id":"...","label":"...","config":{...}}   ← 修改现有节点（config 只写要改的字段）
   {"op":"remove_node","id":"..."}
   {"op":"add_edge","edge":{"source":"...","target":"...","sourceHandle":"..."}}
   {"op":"remove_edge","source":"...","target":"...","sourceHandle":"..."}
   {"op":"done","explanation":"两三句话说明这张图怎么跑","run":true}    ← 最后一行
 - 按执行顺序添加节点（先入口后出口）；每加一个节点，立刻把连向它的边（两端都已存在的）输出出来，让图连贯地生长
 - 修改现有图时只输出改动，没提到的节点不要动
+- update_node 按字段合并：config 只写要改的字段，没写的（tools、assign_to…）原样保留；
+  要删掉某个字段就写成 null。supervisor 的 agents 按成员 name 合并：只写要改的成员和字段，
+  成员没写 tools 就沿用它原来的工具；新名字是新增成员；去掉成员写 {"name":"…","remove":true}
 - done 里的 run：这张图建完要不要立刻执行。默认 true；用户要的是**流程本身**
   （"设计一个每天跑的工作流"）时给 false —— 他要的是这张图，不是这一次的结果
 - 如果这句话根本不需要工作流（见下面的路径约定），**第一行也是最后一行**就输出：
@@ -669,6 +706,64 @@ def _parse_op_line(line: str) -> dict[str, Any] | None:
 
 _NODE_TYPES = frozenset(t.value for t in NodeType)
 
+#: 协作成员条目里写 "remove": true 就把这个成员拿掉。不复用 null：null 在合并里
+#: 的意思是「删这个字段」，成员本身不是一个字段
+_REMOVE_MEMBER = "remove"
+
+
+def _member_key(member: dict[str, Any], index: int) -> str:
+    # 和 engine/nodes/multi.py 的叫法一致：没起名字的成员按位置叫 agentN
+    return str(member.get("name") or f"agent{index}")
+
+
+def _merge_fields(old: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """按字段合并：写了的覆盖，写 null 的删掉，没写的原样保留。返回新 dict。"""
+    out = dict(old)
+    for key, value in patch.items():
+        if value is None:
+            out.pop(key, None)
+        else:
+            out[key] = value
+    return out
+
+
+def _merge_members(old: list[Any], patch: list[Any]) -> list[Any]:
+    """协作成员按 name 合并。原有成员保持原来的次序，新名字接在后面。"""
+    merged: list[Any] = list(old)
+    where = {_member_key(m, i): i for i, m in enumerate(merged) if isinstance(m, dict)}
+    dropped: set[int] = set()
+    for i, entry in enumerate(patch):
+        if not isinstance(entry, dict):
+            continue
+        key = _member_key(entry, i)
+        if entry.get(_REMOVE_MEMBER) is True:
+            if key in where:
+                dropped.add(where[key])
+            continue
+        fields = {k: v for k, v in entry.items() if k != _REMOVE_MEMBER}
+        if key in where:
+            merged[where[key]] = _merge_fields(merged[where[key]], fields)
+        else:
+            where[key] = len(merged)
+            merged.append({k: v for k, v in fields.items() if v is not None})
+    return [m for i, m in enumerate(merged) if i not in dropped]
+
+
+def merge_node_config(
+    node_type: str, old: dict[str, Any], patch: dict[str, Any]
+) -> dict[str, Any]:
+    """update_node 的 config 怎么落到节点上。前端 store/studio.ts 必须是同一套规则。
+
+    以前是整体替换：模型只想改一句提示词，照协议也得把整份 config 抄一遍，
+    漏抄的字段就没了。真出过事——改写提示词时漏了 tools，三个要查库的 agent
+    全丢了工具，一次库都没查，最后把一堆工具调用的原始标记当答案交了出去。
+    改成按字段合并之后，漏写等于不改；真要删一个字段得显式写 null。
+    """
+    if node_type == NodeType.SUPERVISOR.value and isinstance(patch.get("agents"), list):
+        members = old.get("agents") if isinstance(old.get("agents"), list) else []
+        patch = {**patch, "agents": _merge_members(members, patch["agents"])}
+    return _merge_fields(old, patch)
+
 
 def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op: dict[str, Any]) -> bool:
     """把一个操作应用到服务端维护的图状态。返回是否真的改了图。"""
@@ -690,10 +785,12 @@ def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op:
         node = nodes.get(op.get("id") or "")
         if not node:
             return False
+        data = node.setdefault("data", {})
         if op.get("label") is not None:
-            node["data"]["label"] = op["label"]
-        if op.get("config") is not None:
-            node["data"]["config"] = op["config"]
+            data["label"] = op["label"]
+        if isinstance(op.get("config"), dict):
+            data["config"] = merge_node_config(
+                str(node.get("type") or ""), data.get("config") or {}, op["config"])
         return True
     if kind == "remove_node":
         node_id = op.get("id")
@@ -809,21 +906,250 @@ def _sse(obj: dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def _blocking_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]]) -> list[Any] | None:
-    """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。"""
+def _blocking_issues(
+    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
+
+    限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
+    回答他，比跑不起来更糟——答案看起来是对的。
+
+    每条是 ValidationIssue 的字典形状（node_id、field 都在），和 final.issues 一样：
+    界面靠 node_id 定位卡片、靠 field 落到具体的输入框，不用从一行字里抠节点 id。
+    """
     try:
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
     except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
         return None
-    return [i for i in validate_graph(spec).issues if i.level == "error"]
+    return ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
+            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope"))
 
 
-def _issue_line(issue: Any) -> str:
-    return f"「{issue.node_id}」{issue.message}" if issue.node_id else issue.message
+def _source_of(tool: str) -> str | None:
+    from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
+
+    for prefix in (QUERY_PREFIX, SCHEMA_PREFIX):
+        if tool.startswith(prefix):
+            return tool[len(prefix):]
+    return None
+
+
+def scope_issues(nodes: list[dict[str, Any]], scope: set[str] | None) -> list[ValidationIssue]:
+    """用了限定范围之外的数据源的节点，一个节点一条。"""
+    if scope is None:
+        return []
+    out: list[ValidationIssue] = []
+    for node in nodes:
+        cfg = (node.get("data") or {}).get("config") or {}
+        names = _tool_names(cfg.get("tools")) + _tool_names([cfg.get("tool")])
+        for member in cfg.get("agents") or []:
+            if isinstance(member, dict):
+                names += _tool_names(member.get("tools"))
+        outside = sorted({src for src in map(_source_of, names) if src and src not in scope})
+        if outside:
+            out.append(ValidationIssue(
+                level="error", node_id=node.get("id"),
+                message=f"用了限定范围之外的数据源 {'、'.join(outside)}：这一轮只查 "
+                        f"{'、'.join(sorted(scope))}，改用它们的 db_query__ / db_schema__ 工具",
+            ))
+    return out
+
+
+def _issue_dicts(issues: list[ValidationIssue], code: str) -> list[dict[str, Any]]:
+    return [{**i.model_dump(), "code": code} for i in issues]
+
+
+def _issue_line(issue: dict[str, Any]) -> str:
+    """交回模型的修正请求里，一条问题一行，节点 id 在前。"""
+    return f"「{issue['node_id']}」{issue['message']}" if issue.get("node_id") else issue["message"]
+
+
+# --------------------------------------------------------------------------
+# 工具绑定变化：改图前后，每个 agent 和每个协作成员各绑了哪些工具
+# --------------------------------------------------------------------------
+
+
+def _tool_names(value: Any) -> list[str]:
+    return [t for t in value if isinstance(t, str) and t] if isinstance(value, list) else []
+
+
+def _tool_bindings(nodes: list[dict[str, Any]]) -> dict[tuple[str, str | None], dict[str, Any]]:
+    """(节点 id, 成员名) → {label, tools, field}。成员名为 None 的是 agent 节点本身。"""
+    out: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for node in nodes:
+        data = node.get("data") or {}
+        cfg = data.get("config") or {}
+        label = data.get("label") or node.get("id")
+        if node.get("type") == NodeType.AGENT.value:
+            out[(node["id"], None)] = {"label": label, "field": "tools",
+                                       "tools": _tool_names(cfg.get("tools"))}
+        elif node.get("type") == NodeType.SUPERVISOR.value:
+            for i, member in enumerate(cfg.get("agents") or []):
+                if isinstance(member, dict):
+                    out[(node["id"], _member_key(member, i))] = {
+                        "label": label, "field": f"agents[{i}].tools",
+                        "tools": _tool_names(member.get("tools")),
+                    }
+    return out
+
+
+def tool_changes(
+    before: list[dict[str, Any]], after: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """改图前后都在、而绑定的工具不一样了的节点和成员，按改后的图排序。
+
+    新加的、删掉的节点不算：那是结构变化，改图回执本来就会列出来。这里要抓的
+    是「节点还在、工具悄悄没了」——画布上看起来什么都没变，跑起来才发现查不了库。
+    """
+    old = _tool_bindings(before)
+    out: list[dict[str, Any]] = []
+    for (node_id, member), now in _tool_bindings(after).items():
+        was = old.get((node_id, member))
+        if was is None or set(was["tools"]) == set(now["tools"]):
+            continue
+        out.append({
+            "node_id": node_id, "label": now["label"], "member": member, "field": now["field"],
+            "before": was["tools"], "after": now["tools"],
+            "added": [t for t in now["tools"] if t not in was["tools"]],
+            "removed": [t for t in was["tools"] if t not in now["tools"]],
+        })
+    return out
+
+
+# 指令里有没有让删工具。只认「删除动词直接管着工具」：动词和「工具 / 工具名」
+# 挨着、在同一个分句里、中间没有夹别的动作。以前是整句里有「不要 / 不用 / 取消」、
+# 别处又有「工具」就算——「这次要真的用工具查库，不要编造数字」被当成让删工具，
+# 警告关掉，没工具的图照样自动运行。宁可在真让删时多提醒一句，也不能漏掉这种。
+
+#: 删除动词。「不要 / 不用 / 别」只在直接接着工具（或接「用 / 绑」再接工具）时才算
+_DROP_VERB = re.compile(
+    r"去掉|去除|删掉|删除|删了|删去|移除|拿掉|撤掉|撤下|解绑|解除绑定|禁用|停用|卸掉|剔除|砍掉|清空|取消"
+    r"|(?:不要|不用|不需要|无需|用不着|不再|别)再?(?:使用|调用|绑定|用|绑|挂)?"
+    r"|\b(?:remov(?:e|ing)|drop(?:ping)?|unbind|detach|disable|without|get rid of|no longer use)\b"
+    r"|\b(?:don't|do not|never|stop) us(?:e|ing)\b"
+)
+#: 工具在前、动词在后：「把查表的工具去掉」「db_schema__shop 不要了」
+_DROP_AFTER = re.compile(
+    r"去掉|去除|删掉|删除|删了|删去|移除|拿掉|撤掉|撤下|解绑|禁用|停用|卸掉|剔除|砍掉|清空"
+    r"|(?:不要|不用|不需要|用不着)再?(?:用|绑)?(?:了|$)|\b(?:removed|dropped)\b"
+)
+#: 「只保留 X」：别的可以删，但 X 本身不能跟着没了，更不能删光。「只用」只认点了名的——
+#: 「只用工具查库」说的是别编，不是让删哪个工具
+_KEEP_ONLY = re.compile(r"(只保留|只留下|只留|仅保留|\bkeep only\b|\bonly keep\b)"
+                        r"|(只用|仅用|\bonly use\b)")
+#: 动词和工具之间夹了这些，动词管的就不是工具了：「不用改工具」「别用假设的方式调用工具」
+_GAP_BREAK = re.compile(
+    r"改|动|换|变成|编|捏造|虚构|假设|假装|模拟|猜|然后|接着|并且|同时|但|而是|让|把|将|保留|留着|保持|只|必须|一定"
+    r"|make up|made up|making up|\b(?:then|but|instead|change|edit|modify|keep|fake|invent|pretend)\b"
+)
+#: 否定。中文只往前看几个字（「不要去掉工具」「别把工具删了」），英文的否定离动词远，看整个分句
+_NEGATED = re.compile(r"不要|不用|不能|不许|不准|不得|不可|不必|不想|不希望|不让|无需|没让|别|勿|千万")
+_NEGATED_EN = re.compile(r"\b(?:don't|dont|do not|never|no need|not|can't|cannot)\b")
+#: 工具后面紧跟着这些，说的是留着它：「工具保留」「工具不用改」
+_KEPT_AFTER = re.compile(r"\s*(?:都|也|就|还|先)?(?:保留|留着|不变|照旧|保持|别动|不动|不要动|不用动|"
+                         r"不要改|不用改|别改|别删|不要删|不能删)|\s*(?:stay|unchanged|as is)\b")
+_CLAUSE = re.compile(r"[，,。;；！!？?\n]|\.(?=\s|$)")
+_GENERIC = ("工具", "tool", "tools")
+_GAP, _GAP_AFTER, _LOOKBACK = 16, 8, 10
+
+
+def _tool_object(removed: list[str]) -> re.Pattern[str]:
+    """「工具」或一个工具名：这次删掉的、内置的，以及带 __ 的（db_query__x、MCP 工具）。
+
+    只认像工具的名字：表名、字段名也是下划线写法，「去掉 sales_daily 相关的工具」
+    里点名的不是工具。
+    """
+    names = sorted({t.lower() for t in [*removed, *all_specs()] if t}, key=len, reverse=True)
+    return re.compile("|".join([*map(re.escape, names), r"[a-z][a-z0-9_]*__[a-z0-9_-]+",
+                                "工具", r"\btools?\b"]))
+
+
+def _negated(clause: str, pos: int) -> bool:
+    return bool(_NEGATED.search(clause, max(0, pos - _LOOKBACK), pos)
+                or _NEGATED_EN.search(clause, 0, pos))
+
+
+def _drop_request(instruction: str, removed: list[str]) -> tuple[bool, set[str], set[str] | None]:
+    """指令里让删了哪些工具：(泛指「工具」, 点了名的, 「只保留」留下的——没说只保留是 None)。"""
+    target = _tool_object(removed)
+    dropped: set[str] = set()
+    kept: set[str] | None = None
+
+    def near(clause: str, start: int) -> re.Match[str] | None:
+        obj = target.search(clause, start)
+        return obj if obj and obj.start() - start <= _GAP else None
+
+    for clause in _CLAUSE.split((instruction or "").lower()):
+        for verb in _DROP_VERB.finditer(clause):
+            obj = near(clause, verb.end())
+            if not obj:
+                continue
+            gap = clause[verb.end():obj.start()]
+            if (_GAP_BREAK.search(gap) or _DROP_VERB.search(gap) or _negated(clause, verb.start())
+                    or _KEPT_AFTER.match(clause, obj.end())):
+                continue
+            dropped.add(obj.group())
+        for obj in target.finditer(clause):
+            verb = _DROP_AFTER.search(clause, obj.end())
+            if not verb or verb.start() - obj.end() > _GAP_AFTER:
+                continue
+            gap = clause[obj.end():verb.start()]
+            if _GAP_BREAK.search(gap) or _NEGATED.search(gap) or _negated(clause, obj.start()):
+                continue
+            dropped.add(obj.group())
+        for verb in _KEEP_ONLY.finditer(clause):
+            obj = near(clause, verb.end())
+            if obj and not (verb.group(2) and obj.group() in _GENERIC):
+                kept = (kept or set()) | {obj.group()}
+    return bool(dropped & set(_GENERIC)), dropped - set(_GENERIC), kept
+
+
+def _unasked_drops(instruction: str, change: dict[str, Any]) -> list[str]:
+    """这次少掉的工具里，哪些是指令没让删的。"""
+    generic, named, kept = _drop_request(instruction, change["removed"])
+    if generic:
+        return []
+
+    def asked(tool: str) -> bool:
+        if tool.lower() in named:
+            return True
+        # 「只保留 X」：X 以外的可以删；但一个都不剩就不是「保留」了
+        return kept is not None and bool(change["after"]) and tool.lower() not in kept
+
+    return [t for t in change["removed"] if not asked(t)]
+
+
+def dropped_tool_warnings(changes: list[dict[str, Any]], instruction: str) -> list[dict[str, Any]]:
+    """工具集合变小了、而这一轮没让删工具的，逐个报 warning。
+
+    只报变小的：把 db_query__a 换成 db_query__b 是正常的改图，数量没少不必大惊
+    小怪。也不打回去让模型重改——删工具有可能是对的，该让人看一眼，而不是再
+    赌一次模型。
+    """
+    out: list[dict[str, Any]] = []
+    for c in changes:
+        if not c["removed"] or len(set(c["after"])) >= len(set(c["before"])):
+            continue
+        unasked = _unasked_drops(instruction, c)
+        if not unasked:
+            continue
+        who = f"「{c['label']}」" + (f"的成员「{c['member']}」" if c["member"] else "")
+        now = f" {'、'.join(c['after'])}" if c["after"] else "空"
+        said = ("这一轮的要求里没有提到去掉工具" if len(unasked) == len(c["removed"])
+                else f"这一轮的要求里没有提到去掉 {'、'.join(unasked)}")
+        cost = ("没有绑定工具，它只能「假设」调用，查不了库" if not c["after"]
+                else f"{'、'.join(unasked)} 它就调不到了")
+        out.append({
+            "level": "warning", "node_id": c["node_id"], "edge_id": None,
+            "code": "tools_dropped", "field": c["field"],
+            "message": f"{who}的工具从 {'、'.join(c['before'])} 变成了{now}。"
+                       f"{said}，确认一下是不是改漏了：{cost}",
+        })
+    return out
 
 
 def _repair_request(
-    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[Any],
+    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[dict[str, Any]],
 ) -> str:
     graph = {"nodes": list(nodes.values()), "edges": edges}
     return (
@@ -832,7 +1158,8 @@ def _repair_request(
         "上线前自查（和真正运行时同一套规则）发现下面这些问题，不改的话这张图跑不起来：\n"
         + "\n".join(f"- {_issue_line(i)}" for i in errors)
         + "\n\n只修这些问题，别的不要动。用操作流输出修正：改节点用 update_node"
-          "（config 整体替换，要带上这个节点完整的 config）；缺节点、缺边就补上。最后一行输出 done。"
+          "（config 只写要改的字段，没写的保持原样；要删掉一个字段写 null）；"
+          "缺节点、缺边就补上。最后一行输出 done。"
     )
 
 
@@ -845,8 +1172,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     """
     from fastapi.responses import StreamingResponse
 
-    tool_list = await _tool_catalog(session)
-    datasources = await _datasource_section(session)
+    sources = await _sources(session, payload.datasource_ids)
+    scope = {r.name for r in sources} if payload.datasource_ids else None
+    tool_list = _tool_catalog(sources)
+    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
         f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
@@ -865,8 +1194,9 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     # 用户摆好的坐标，收尾排版时原样留着
     pinned = _pinned_positions(payload.base_graph)
     if payload.base_graph and payload.base_graph.get("nodes"):
+        # 拷一份再改：改之前的样子还要留着比对工具绑定有没有被改掉
         for n in payload.base_graph["nodes"]:
-            nodes[n["id"]] = n
+            nodes[n["id"]] = copy.deepcopy(n)
         edges = [
             {k: v for k, v in e.items() if k in ("source", "target", "sourceHandle")}
             for e in payload.base_graph.get("edges") or []
@@ -889,6 +1219,9 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
     # 兜底用：模型只发了改动操作时，把它们重放到这张图上
     prev_graph = await _previous_graph(session, payload.conversation_id)
+    # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
+    baseline = copy.deepcopy(
+        (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
 
     async def event_stream():
         explanation = ""
@@ -939,7 +1272,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         if not nodes and prev_graph and seen_ops:
             for n in prev_graph.get("nodes") or []:
                 if n.get("id"):
-                    nodes[n["id"]] = n
+                    nodes[n["id"]] = copy.deepcopy(n)
             # 原地改，不能重新绑定：给 edges 赋值会让它变成 event_stream 的局部
             # 变量，而它在上面 _apply_op 那一路已经被读过了 —— UnboundLocalError
             edges[:] = [
@@ -954,11 +1287,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         repaired = 0
         for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
-            errors = _blocking_issues(nodes, edges)
+            errors = _blocking_issues(nodes, edges, scope)
             if not errors:
                 break
-            yield _sse({"op": "check", "status": "repairing", "round": round_no,
-                        "issues": [_issue_line(i) for i in errors]})
+            yield _sse({"op": "check", "status": "repairing", "round": round_no, "issues": errors})
             fix = [("system", system), ("human", _repair_request(nodes, edges, errors))]
             try:
                 async for op in _with_heartbeat(_iter_ops(model, fix), phase="repairing"):
@@ -973,15 +1305,20 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                             "message": f"自查修正没跑成：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
-        remaining = _blocking_issues(nodes, edges)
+        remaining = _blocking_issues(nodes, edges, scope)
+        # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
+        # 能跑，只是跑出来的是模型「假设」查过库的答案
+        changes = tool_changes(baseline, list(nodes.values()))
+        warnings = dropped_tool_warnings(changes, payload.instruction)
         if remaining:
             # 改不好也照实交付、列出问题，但不自动运行：明知跑不起来的图，开跑只会
             # 在半路报一个用户看不懂的错
             autorun = False
-            yield _sse({"op": "check", "status": "failed",
-                        "issues": [_issue_line(i) for i in remaining]})
+            yield _sse({"op": "check", "status": "failed", "issues": remaining,
+                        "warnings": warnings})
         elif remaining is not None:
-            yield _sse({"op": "check", "status": "passed", "repaired": repaired})
+            yield _sse({"op": "check", "status": "passed", "repaired": repaired,
+                        "warnings": warnings})
 
         # 收尾：排版 + 校验，把最终图整体交付。改图时旧节点留在原处，只排新节点
         try:
@@ -989,6 +1326,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges}), pinned,
             )
             issues = [i.model_dump() for i in validate_graph(spec).issues]
+            issues += _issue_dicts(scope_issues(list(nodes.values()), scope),
+                                   "datasource_out_of_scope")
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -1000,10 +1339,12 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             final = {
                 "op": "final",
                 "graph": spec.model_dump(mode="json"),
-                "issues": issues,
+                "issues": issues + warnings,
                 "explanation": explanation,
                 "autorun": autorun,
                 "layout": layout,
+                # 改图回执：哪些节点、成员的工具变了。画布上看不出来，得明说
+                "tool_changes": changes,
             }
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型交回的工作流结构不对：{graph_error(e)}",

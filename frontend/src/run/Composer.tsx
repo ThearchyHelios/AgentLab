@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
-import { ArrowUp, Database, Settings2, Sparkles, Square, Wrench } from 'lucide-react'
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
+import { AlertCircle, ArrowUp, CornerDownRight, Database, Settings2, Sparkles, Square, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog, modelOptions } from '../store/catalog'
 import { useStudio } from '../store/studio'
-import { isComposing, Spinner } from '../components/ui'
+import { isComposing, Spinner, TechDetails, useRadioGroup } from '../components/ui'
+import { formatShortcut } from '../lib/keys'
 
 /**
  * Copilot 的输入。
@@ -69,7 +70,11 @@ export function Composer({ hero, onFocusChange }: {
     if (!q || copilot.active) return
     runCopilot(q, useBase && nodes.length > 0, model || undefined)
     setText('')
+    // 从头生成是一次性的：新图一落到画布上，下一句多半是在它上面改。停在「从头生成」
+    // 的话，下一句又把刚生成的图整张换掉（撤销找得回，但人得先发现）
+    setUseBase(true)
   }
+  const mode = useRadioGroup(MODES, useBase ? 'base' : 'fresh', (m) => setUseBase(m === 'base'))
 
   const options = modelOptions(providers)
   const groups = [...new Set(options.map((o) => o.group))]
@@ -79,14 +84,29 @@ export function Composer({ hero, onFocusChange }: {
     <div className={clsx('shrink-0', hero ? 'px-4' : 'border-t px-2.5 pb-2.5 pt-2')}>
       {hero && <HeroHeader sources={sources} toolCount={tools?.length ?? 0} />}
 
-      {copilot.error && (
-        <div role="alert" className="fade-up mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10.5px]"
-             style={{ borderColor: 'var(--err)', color: 'var(--err)' }}>
-          <span className="min-w-0 flex-1 leading-relaxed">{copilot.error}</span>
+      {/* 说过话之后，出错的那一轮在上面的流里自己有报错块（怎么办、原文、「用同一句话
+          重试」都在），这里再摆一条就是同一句话说两遍。只有还没有轮次可挂的时候才由它说。
+          样子和流里的报错块一致：发生了什么、怎么办分开写，原文折进技术细节 */}
+      {copilot.error && hero && (
+        <div role="alert" data-copilot-error=""
+             className="fade-up mb-2 flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-2xs"
+             style={{ borderColor: 'color-mix(in srgb, var(--st-failed) 35%, var(--border))',
+                      background: 'color-mix(in srgb, var(--st-failed) 6%, transparent)' }}>
+          <AlertCircle size={12} className="mt-px shrink-0" style={{ color: 'var(--st-failed)' }} aria-hidden />
+          <div className="min-w-0 flex-1 leading-relaxed">
+            <div className="font-medium text-fg [overflow-wrap:anywhere]">{copilot.error}</div>
+            {copilot.errorHint && (
+              <div className="mt-0.5 flex items-start gap-1 text-dim">
+                <CornerDownRight size={10} className="mt-[3px] shrink-0" aria-hidden />
+                <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{copilot.errorHint}</span>
+              </div>
+            )}
+            {copilot.errorDetail && <TechDetails raw={copilot.errorDetail} className="mt-1" />}
+          </div>
           {/* 失败多半跟需求本身无关（模型抽风、协议跑偏、网断了），
               不该逼用户把需求再敲一遍 */}
           {copilot.lastInstruction && (
-            <button className="btn btn-sm shrink-0" onClick={retryCopilot}>重试</button>
+            <button className="btn btn-xs shrink-0" onClick={retryCopilot}>重试</button>
           )}
         </div>
       )}
@@ -111,22 +131,29 @@ export function Composer({ hero, onFocusChange }: {
             <button
               className={clsx('rounded-md p-1.5 transition-colors hover:bg-hover',
                 opts ? 'text-[var(--accent)]' : 'text-faint')}
-              title="模型和生成方式"
-              aria-label="模型和生成方式"
+              title="助手用哪个模型"
+              aria-label="助手用哪个模型"
               aria-expanded={opts}
               onClick={() => setOpts((v) => !v)}
             >
               <Settings2 size={13} />
             </button>
+            {/* 两种方式并排摆出来，选中的那个就是这一句会怎么做。以前是一个 10px 的字，
+                点一下就翻成另一个词，看不出它是开关，更看不出另一头是什么。从头生成
+                不再二次确认：整轮是一步撤销，失败、停止、只回一句话都会把画布放回原样 */}
             {!!nodes.length && (
-              <button
-                className={clsx('rounded-md px-1.5 py-1 text-[10px] transition-colors hover:bg-hover',
-                  useBase ? 'text-dim' : 'text-faint')}
-                title={useBase ? '在当前这张图上改' : '不看现有的图，重新生成一张'}
-                onClick={() => setUseBase((v) => !v)}
-              >
-                {useBase ? '改现有的图' : '重新生成'}
-              </button>
+              <span role="radiogroup" aria-label="生成方式" className="inline-flex rounded-md border p-px">
+                {MODES.map((m) => (
+                  <button key={m} type="button" {...mode(m)}
+                          className={clsx('rounded px-1.5 text-2xs leading-5 transition-colors',
+                            (m === 'base') === useBase ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
+                          title={m === 'base' ? '把现在这张图交给助手，在它上面改'
+                            : `不看现有的图，整张重新生成。原图可以撤销（${formatShortcut('Mod+Z')}）找回`}
+                          onClick={() => setUseBase(m === 'base')}>
+                    {m === 'base' ? '在现有图上改' : '从头生成'}
+                  </button>
+                ))}
+              </span>
             )}
           </>
         }
@@ -135,8 +162,8 @@ export function Composer({ hero, onFocusChange }: {
       {opts && (
         <div className="fade-up mt-2 space-y-2 rounded-lg border bg-panel p-2.5">
           <div>
-            <label className="label">Copilot 用哪个模型</label>
-            <select className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
+            <label className="label" htmlFor="copilot-model">助手用哪个模型</label>
+            <select id="copilot-model" className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
               <option value="">跟随默认{effective ? `（当前：${effective}）` : ''}</option>
               {groups.map((g) => (
                 <optgroup key={g} label={g}>
@@ -146,8 +173,8 @@ export function Composer({ hero, onFocusChange }: {
                 </optgroup>
               ))}
             </select>
-            <div className="mt-1 text-[10px] leading-snug text-faint">
-              只影响 Copilot 自己，不改节点上的模型。它要按协议逐行输出操作，
+            <div className="mt-1 text-2xs leading-snug text-faint">
+              只影响助手自己，不改节点上的模型。它要按协议逐行输出操作，
               指令遵循弱的模型生成不出东西。
             </div>
           </div>
@@ -155,7 +182,7 @@ export function Composer({ hero, onFocusChange }: {
       )}
 
       {copilot.active && (
-        <div className="fade-up mt-2 flex items-center gap-1.5 text-[10px] text-faint">
+        <div className="fade-up mt-2 flex items-center gap-1.5 text-2xs text-faint">
           <Spinner size={10} />
           <span className="min-w-0 flex-1 truncate">
             {copilot.lastOp || PHASE_TEXT[copilot.phase] || '正在起草…'}
@@ -173,7 +200,7 @@ export function Composer({ hero, onFocusChange }: {
             <button
               key={ex}
               className="rise-in w-full rounded-lg border bg-panel px-3 py-2 text-left text-[11.5px] leading-relaxed text-dim transition-colors hover:border-[var(--accent)] hover:text-fg"
-              style={{ '--i': i + 1 } as any}
+              style={{ '--i': i + 1 } as CSSProperties}
               onClick={() => send(ex)}
             >
               {ex}
@@ -313,7 +340,7 @@ function HeroHeader({ sources, toolCount }: { sources: any[]; toolCount: number 
       <div className="mt-1 text-2xs leading-relaxed text-faint">
         说一句话，它把流程画到左边的画布上
       </div>
-      <div className="mt-2 flex items-center justify-center gap-3 text-[10px] text-faint">
+      <div className="mt-2 flex items-center justify-center gap-3 text-2xs text-faint">
         <span className="flex items-center gap-1">
           <Database size={10} />
           {sources.length ? `${sources.length} 个数据源` : '未接数据源'}
@@ -349,6 +376,8 @@ function exampleFor(nodeCount: number, sources: any[]): string[] {
     '写代码分析数据，在沙箱里跑，出错就把报错喂回去让模型修，最多修三次',
   ]
 }
+
+const MODES = ['base', 'fresh'] as const
 
 // 从提交到第一个节点落地中间有 5~30 秒。阶段会变本身就是"它还活着"的信号，
 // 恒定的"正在起草…"让人分不清是在想还是已经卡死

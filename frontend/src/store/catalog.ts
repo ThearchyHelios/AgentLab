@@ -12,9 +12,12 @@ import type { Approval, Provider, Skill, ToolInfo, Workflow } from '../types'
  */
 export type BackendState = 'checking' | 'ok' | 'down'
 
+/** catalog 里的一张表 */
+export type CatalogKey = 'providers' | 'tools' | 'skills' | 'collections' | 'workflows' | 'approvals'
+
 /** 启动清单里的一行：catalog.refresh 的一个真实请求 */
 export interface CatalogCheck {
-  key: 'providers' | 'tools' | 'skills' | 'collections' | 'workflows' | 'approvals'
+  key: CatalogKey
   label: string
   state: 'pending' | 'ok' | 'error'
   ms?: number
@@ -22,10 +25,19 @@ export interface CatalogCheck {
   error?: string
 }
 
-const CHECK_LABELS: Record<CatalogCheck['key'], string> = {
+/** 各张表的中文名。启动清单、「正在读取工作流」这类空态用 */
+export const CATALOG_LABELS: Record<CatalogKey, string> = {
   providers: '模型接入', tools: '工具', skills: 'Skill',
   collections: '知识库', workflows: '工作流', approvals: '待审批',
 }
+
+const CATALOG_KEYS = Object.keys(CATALOG_LABELS) as CatalogKey[]
+
+/**
+ * refresh 里每个请求最多等多久。一个接口卡住（MCP 服务不应答时的 /tools）不能
+ * 让它那张表永远停在「加载中」；到点掐断、记成出错，别的表不受影响
+ */
+export const CATALOG_TIMEOUT_MS = 15_000
 
 /** 心跳间隔：连着时复用 4 秒一次的待审批轮询，不另起请求 */
 const HEARTBEAT_MS = 4000
@@ -33,14 +45,25 @@ const HEARTBEAT_MS = 4000
 const BACKOFF_MS = [4000, 8000, 16000]
 
 /** 全局参照数据：属性面板的各种下拉都从这里取，只加载一次。 */
-interface CatalogState {
+export interface CatalogState {
   providers: Provider[]
   tools: ToolInfo[]
   skills: Skill[]
   collections: { collection: string; documents: number; chunks: number }[]
   workflows: Workflow[]
   approvals: Approval[]
+  /**
+   * 启动后的第一次 refresh 已经落定（每个请求都回来了或超时了）。只从 false 变 true，
+   * 之后的刷新不会把它打回去——所以它不能回答「这张表是真的空还是没取到」，那个
+   * 看 loadedAt / catalogListState
+   */
   loaded: boolean
+  /** 每张表最近一次成功取回的时刻（ms）。没有这一项 = 从没取到过，空列表不能当「没有」 */
+  loadedAt: Partial<Record<CatalogKey, number>>
+  /**
+   * 重拉全部六张表，谁先回来先填谁：一张表卡住不拖累别的表。每个请求最多等
+   * CATALOG_TIMEOUT_MS，超时记成那一项出错
+   */
   refresh: () => Promise<void>
   refreshApprovals: () => Promise<void>
 
@@ -71,6 +94,9 @@ let probing: Promise<boolean> | null = null
 let retryTimer: ReturnType<typeof setTimeout> | undefined
 let heartbeatOwner: symbol | null = null
 let markUpRef: (latencyMs?: number) => void = () => {}
+/** 第几次 refresh。两次 refresh 交叠时，晚发的那次的结果不能被早发、晚到的覆盖 */
+let refreshEpoch = 0
+const appliedGen: Partial<Record<CatalogKey, number>> = {}
 
 export const useCatalog = create<CatalogState>((set, get) => {
   let backoffStep = 0
@@ -112,6 +138,7 @@ export const useCatalog = create<CatalogState>((set, get) => {
     workflows: [],
     approvals: [],
     loaded: false,
+    loadedAt: {},
 
     backend: 'checking',
     latencyMs: null,
@@ -122,41 +149,50 @@ export const useCatalog = create<CatalogState>((set, get) => {
     reconnects: 0,
 
     refresh: async () => {
-      const keys = Object.keys(CHECK_LABELS) as CatalogCheck['key'][]
-      set({ checks: keys.map((key) => ({ key, label: CHECK_LABELS[key], state: 'pending' })) })
-      const update = (key: CatalogCheck['key'], patch: Partial<CatalogCheck>) =>
+      const gen = ++refreshEpoch
+      const keys = CATALOG_KEYS
+      set({ checks: keys.map((key) => ({ key, label: CATALOG_LABELS[key], state: 'pending' })) })
+      // 清单只归最新一次 refresh 写：交叠时早发的那次别把新清单的行改回去
+      const update = (key: CatalogKey, patch: Partial<CatalogCheck>) => {
+        if (gen !== refreshEpoch) return
         set((s) => ({ checks: s.checks.map((c) => (c.key === key ? { ...c, ...patch } : c)) }))
+      }
+      const opts = { timeoutMs: CATALOG_TIMEOUT_MS }
+      const fetchers: Record<CatalogKey, () => Promise<unknown[]>> = {
+        providers: () => api.providers.list(opts),
+        tools: () => api.tools.list(opts),
+        skills: () => api.skills.list(opts),
+        collections: () => api.kb.collections(opts),
+        workflows: () => api.workflows.list(opts),
+        approvals: () => api.approvals.list('pending', opts),
+      }
 
       let networkFailures = 0
-      let lastError = ''
-      // 单项失败不该让整个面板空掉，各自兜底；但要记下是不是"够不着"，
-      // 六个全是网络失败就是后端断了，不是"什么都没有"
-      const track = <T>(key: CatalogCheck['key'], p: Promise<T>): Promise<T | []> => {
+      // 各张表回来一张填一张：以前是 Promise.all 全到齐才一起写，/tools 卡着不回，
+      // 工作流也跟着一直是空的，编排页就说「还没有工作流」。单项失败各自兜底，
+      // 列表保持原样（不清成 []）；但要记下是不是"够不着"，六个全是网络失败就是
+      // 后端断了，不是"什么都没有"
+      const track = async (key: CatalogKey) => {
         const t0 = performance.now()
-        return p.then(
-          (v) => { update(key, { state: 'ok', ms: Math.round(performance.now() - t0) }); return v },
-          (e: unknown) => {
-            const err = e instanceof ApiError ? e : null
-            if (err?.kind === 'network') networkFailures++
-            lastError = err?.message ?? String((e as any)?.message ?? e)
-            update(key, {
-              state: 'error', ms: Math.round(performance.now() - t0),
-              status: err?.status || undefined, error: lastError,
-            })
-            return []
-          },
-        )
+        try {
+          const rows = await fetchers[key]()
+          update(key, { state: 'ok', ms: Math.round(performance.now() - t0) })
+          if ((appliedGen[key] ?? 0) > gen) return
+          appliedGen[key] = gen
+          set((s) => ({ [key]: rows, loadedAt: { ...s.loadedAt, [key]: Date.now() } }) as Partial<CatalogState>)
+        } catch (e) {
+          const err = e instanceof ApiError ? e : null
+          if (err?.kind === 'network') networkFailures++
+          update(key, {
+            state: 'error', ms: Math.round(performance.now() - t0),
+            status: err?.status || undefined,
+            error: err?.message ?? String((e as any)?.message ?? e),
+          })
+        }
       }
       const t0 = performance.now()
-      const [providers, tools, skills, collections, workflows, approvals] = await Promise.all([
-        track('providers', api.providers.list()),
-        track('tools', api.tools.list()),
-        track('skills', api.skills.list()),
-        track('collections', api.kb.collections()),
-        track('workflows', api.workflows.list()),
-        track('approvals', api.approvals.list()),
-      ])
-      set({ providers, tools, skills, collections, workflows, approvals, loaded: true })
+      await Promise.all(keys.map(track))
+      if (!get().loaded) set({ loaded: true })
       if (networkFailures === keys.length) {
         // 第一个失败的请求已经通过 onConnectivity 起了一次探活；这里并进同一次，
         // 不另记一笔——两笔会让第一次断开就跳到退避的第二档（8 秒而不是 4 秒）
@@ -176,8 +212,14 @@ export const useCatalog = create<CatalogState>((set, get) => {
       }
       const t0 = performance.now()
       try {
-        const approvals = await api.approvals.list()
-        set({ approvals, latencyMs: Math.round(performance.now() - t0), lastOkAt: Date.now() })
+        const gen = refreshEpoch
+        const approvals = await api.approvals.list('pending', { timeoutMs: CATALOG_TIMEOUT_MS })
+        // 这一拍在路上时又发起了 refresh、而且那次已经填过了：以那次为准
+        if ((appliedGen.approvals ?? 0) > gen) return
+        set((s) => ({
+          approvals, latencyMs: Math.round(performance.now() - t0), lastOkAt: Date.now(),
+          loadedAt: { ...s.loadedAt, approvals: Date.now() },
+        }))
       } catch (e) {
         // 后端回了错误码说明它还活着，列表保持原样；够不着才去确认是否断开
         if (e instanceof ApiError && e.kind === 'network' && get().backend !== 'down') await get().checkBackend()
@@ -249,6 +291,29 @@ export function useOnReconnect(cb: () => void): void {
   useEffect(() => useCatalog.subscribe((s, prev) => {
     if (s.reconnects !== prev.reconnects) cbRef.current()
   }), [])
+}
+
+/**
+ * 某张表眼下能不能当真：
+ * - ok：至少成功取回过一次。之后的刷新失败了，手上的也还是真数据；
+ * - offline：从没取到过，后端也断着；
+ * - loading：从没取到过，请求还在路上（或还没发）；
+ * - error：从没取到过，最近一次请求出错或超时了。
+ * 后三种时列表是空的，但那不是「没有」。
+ */
+export type CatalogListState = 'ok' | 'loading' | 'error' | 'offline'
+
+export function catalogListState(
+  s: Pick<CatalogState, 'loadedAt' | 'backend' | 'checks'>, key: CatalogKey,
+): CatalogListState {
+  if (s.loadedAt[key] != null) return 'ok'
+  if (s.backend === 'down') return 'offline'
+  return s.checks.find((c) => c.key === key)?.state === 'error' ? 'error' : 'loading'
+}
+
+/** 同 catalogListState，订阅版。页面判断「空」之前先看它是不是 ok */
+export function useCatalogListState(key: CatalogKey): CatalogListState {
+  return useCatalog((s) => catalogListState(s, key))
 }
 
 /** 这条运行有没有待处理的审批。区分「等待审批」和「已挂起 · 可续跑」要用它 */

@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react'
 import {
-  ChevronDown, Crosshair, Eraser, Hand, History, LocateFixed, Radio, RotateCw, Square,
+  Ban, ChevronDown, Crosshair, Eraser, Hand, History, LocateFixed, Radio, RotateCw, Square,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
-import { Kbd, Spinner, StatusBadge, toast } from '../components/ui'
+import { confirmDialog, Kbd, Spinner, StatusBadge, toast } from '../components/ui'
 import { formatClock, formatCost, formatDuration, formatTokens, NONE } from '../lib/format'
 import { isTypingTarget, matchShortcut } from '../lib/keys'
 import { statusMeta, STATUS, type StatusCode } from '../lib/status'
 import { issuanceLabel, runClassLabel } from '../lib/terms'
 import { lastStampOf, projectSettled, useDock, waitedMs } from '../canvas/RunTimeline'
 import { structureSig, useStudio } from '../store/studio'
+import type { RunEvent } from '../types'
 import { topology } from './derive'
 import {
   isActivePhase, isSettled, isTerminal, liveAt, project, type NodeState, type RunPhase, type Trace,
@@ -29,7 +30,8 @@ import { useRunClock } from './useRunClock'
  *   走不到，循环会让同一节点跑好几遍，百分比要么停在 6/8 要么超过 100%）。
  * - 正常态安静：运行中只有一圈转动的徽标；等人、失败、挂起才上底色。
  * - 主动作随相位变：在跑能停止，等人去审批，失败定位 + 接着跑，结束了回放 + 清除。
- *   等审批时后端已经不在执行，停止必然 409，所以那时不给停止。
+ *   等审批时后端已经不在执行，没有「停止」可言；次级动作是「放弃这次运行」——后端把
+ *   停在审批上的运行直接收成已取消，待审批一并关闭。
  */
 
 // -------------------------------------------------------------------------
@@ -103,8 +105,31 @@ export function phaseLabel(phase: RunPhase): string {
   return statusMeta(phase).label
 }
 
+/**
+ * 这次运行是怎么取消的：run.cancelled 带着谁放弃的（actor）和一句说明（放弃等审批、
+ * 挂起的运行时才有，如「放弃了这次运行，1 条待审批一并关闭」）。按事件数组缓存
+ */
+const cancelCache = new WeakMap<RunEvent[], string>()
+function cancelNote(events: RunEvent[]): string {
+  const hit = cancelCache.get(events)
+  if (hit != null) return hit
+  let note = ''
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i]
+    if (!String(e.type).startsWith('run.')) continue
+    if (e.type === 'run.cancelled') {
+      const who = typeof e.data?.actor === 'string' ? e.data.actor.trim() : ''
+      const what = typeof e.data?.message === 'string' ? e.data.message.trim() : ''
+      note = what ? `${who ? `${who} ` : ''}${what}` : who ? `${who} 取消了这次运行` : ''
+    }
+    break
+  }
+  cancelCache.set(events, note)
+  return note
+}
+
 function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>, at: number,
-                    label: (id: string) => string, errorText: string | null | undefined): string {
+                    label: (id: string) => string, errorText: string | null | undefined, cancelled = ''): string {
   const running = Object.keys(states).filter((id) => states[id] === 'running')
   switch (phase) {
     case 'queued':
@@ -139,7 +164,8 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
       return t.issuance?.tier ? `执行完成 · ${issuanceLabel(t.issuance.tier)}` : '执行完成'
     case 'cancelled': {
       const stopped = Object.keys(states).filter((id) => states[id] === 'cancelled')
-      return stopped.length ? `停在「${label(stopped[0])}」` : '已取消'
+      const where = stopped.length ? `停在「${label(stopped[0])}」` : '已取消'
+      return cancelled ? `${cancelled} · ${where}` : where
     }
     case 'suspended':
       return '服务重启时挂起，可从断点接着跑'
@@ -157,6 +183,7 @@ export function useRunGlance(active: boolean): RunGlance {
   const runError = useStudio((s) => s.run?.error)
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
+  const cancelled = useStudio((s) => (s.runPhase === 'cancelled' ? cancelNote(s.events) : ''))
   const limitMs = useRunLimit()
   const ticking = active && replayAt == null && isActivePhase(phaseLive)
   const now = useRunClock(ticking)
@@ -187,8 +214,10 @@ export function useRunGlance(active: boolean): RunGlance {
     : settledUsage ? num(runUsage.total_tokens) : null
   const backendCost = settledUsage ? num(runUsage.cost_usd) : null
   const seen = usage.tokensIn + usage.tokensOut > 0 || usage.costUsd > 0
-  const tokens = replayAt != null ? null : backendTok ?? (seen ? usage.tokensIn + usage.tokensOut : null)
-  const cost = replayAt != null ? null : backendCost ?? (seen ? usage.costUsd : null)
+  // 回放读投影在游标那一刻的刻度；刻度加起来对不上后端总数时投影给 undefined，写「—」
+  const replayTok = proj.tokensIn != null && proj.tokensOut != null ? proj.tokensIn + proj.tokensOut : null
+  const tokens = replayAt != null ? replayTok : backendTok ?? (seen ? usage.tokensIn + usage.tokensOut : null)
+  const cost = replayAt != null ? proj.costUsd ?? null : backendCost ?? (seen ? usage.costUsd : null)
 
   // 时限按"这一段执行"计：等人工审批时执行已经结束，那段不算（和后端一致）
   const drive = trace.drives[trace.drives.length - 1]
@@ -219,7 +248,7 @@ export function useRunGlance(active: boolean): RunGlance {
   return {
     phase, code: phase, label: phaseLabel(phase), replay: replayAt != null, at,
     elapsedMs: proj.elapsedMs, activeMs: proj.activeMs, waitMs: proj.waitMs,
-    headline: headlineOf(trace, phase, states, at, label, runError),
+    headline: headlineOf(trace, phase, states, at, label, runError, replayAt == null ? cancelled : ''),
     executing: phase === 'running' && cells.some((c) => c.state === 'running' && !trace.nodes[c.id]?.looping),
     cells, done, visited, parallelNow: proj.parallelNow, series: trace.parallelSeries,
     tokens, cost, remainingMs, limitMs, attention,
@@ -233,15 +262,19 @@ export function useRunGlance(active: boolean): RunGlance {
 
 /**
  * 去审批：不在画布上另做审批控件，只把人带到右栏那张审批卡——同一个组件、同一套
- * 治理口径（只认明确的同意，带备注）。右栏归助手面板：先广播一声，让它在对话层时
- * 切到运行层；再等几帧找卡片，找到就滚过去、描一圈、把焦点放进去。
+ * 治理口径（只认明确的同意，带备注）。右栏归助手面板：广播 agentlab:goto-approval，
+ * 它在对话层时先切到运行层，再滚到卡片、把焦点放进去，并 preventDefault 表示接手了。
+ * 没人接手（右栏收起、老版本的面板）时这里自己等几帧找卡片，找到就滚过去、描一圈。
  */
-function gotoApproval(nodeId: string | undefined): void {
+export function gotoApproval(nodeId: string | undefined): void {
   const s = useStudio.getState()
   // 属性面板盖在右栏上：先让开，审批卡在右栏里
   s.select(null)
   if (nodeId) s.focusNode(nodeId)
-  window.dispatchEvent(new CustomEvent('agentlab:goto-approval', { detail: { runId: s.run?.id, nodeId } }))
+  const handled = !window.dispatchEvent(new CustomEvent('agentlab:goto-approval', {
+    detail: { runId: s.run?.id, nodeId }, cancelable: true,
+  }))
+  if (handled) return
   let tries = 0
   const find = () => {
     const slot = document.querySelector<HTMLElement>('[data-approval-slot]:not(:empty)')
@@ -269,6 +302,22 @@ async function stop(): Promise<void> {
   } catch (e) {
     toast.error(e)
   }
+}
+
+/**
+ * 放弃停在审批上的运行。它已经不在执行，没有「停止」可言；后端把它直接收成已取消，
+ * 待审批一并关闭。关掉的审批找不回来，所以先问一句
+ */
+async function abandon(): Promise<void> {
+  const ok = await confirmDialog({
+    title: '放弃这次运行？',
+    body: '运行停在审批上，放弃之后它记为已取消，不能再接着跑。',
+    consequences: ['等着处理的审批卡一并关闭，留痕里写上是谁放弃的', '已经跑完的节点结果照样留在记录里'],
+    confirmLabel: '放弃这次运行',
+    danger: true,
+  })
+  if (!ok) return
+  await stop()
 }
 
 function startReplay(trace: Trace): void {
@@ -470,9 +519,14 @@ export function RunCapsule() {
         )
       case 'waiting':
         return (
-          <Act className="sf-btn-warn" icon={<Hand size={11} />} text="去审批"
-               title="到右栏的审批卡上处理。等审批时运行已经停在断点上，停止不了"
-               onClick={() => gotoApproval(g.waitingNodeId ?? g.attention.find((a) => a.kind === 'waiting')?.nodeId)} />
+          <>
+            <Act className="sf-btn-warn" icon={<Hand size={11} />} text="去审批"
+                 title="到右栏的审批卡上处理"
+                 onClick={() => gotoApproval(g.waitingNodeId ?? g.attention.find((a) => a.kind === 'waiting')?.nodeId)} />
+            {/* 次级动作：胶囊里只留图标，面板里写全名 */}
+            <Act className="btn-ghost sf-btn-abandon" icon={<Ban size={11} />} text="放弃这次运行" iconOnly={compact}
+                 title="不批了：这次运行记为已取消，待审批一并关闭" onClick={() => void abandon()} />
+          </>
         )
       case 'failed':
         return (
@@ -553,6 +607,7 @@ export function RunCapsule() {
               <div className="flex items-center gap-2">
                 <span className="sf-hud-phase">{g.replay ? `回放 · ${g.label}` : g.label}</span>
                 <span className={clsx('sf-class', runClass === 'formal' && 'is-formal')}>
+                  <ClassDot formal={runClass === 'formal'} />
                   {runClassLabel(runClass, run?.version)}{runClass === 'formal' && active ? ' · 画布只读' : ''}
                 </span>
               </div>
@@ -668,6 +723,18 @@ export function RunCapsule() {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * 运行类别的记号：正式运行实心、探索运行空心。盾牌只留给发布等级（已发布 / 受管），
+ * 「正式」一词在发布、运行、出具三层各指一件事，记号不能再混用
+ */
+export function ClassDot({ formal, size = 8 }: { formal: boolean; size?: number }) {
+  return (
+    <svg className="sf-dot" width={size} height={size} viewBox="0 0 8 8" aria-hidden data-class={formal ? 'formal' : 'exploratory'}>
+      <circle cx="4" cy="4" r="3" fill={formal ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.4" />
+    </svg>
   )
 }
 

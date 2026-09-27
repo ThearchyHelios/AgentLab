@@ -4,15 +4,18 @@ import type {
   ButtonHTMLAttributes, CSSProperties, ErrorInfo, KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject,
 } from 'react'
 import {
-  AlertCircle, AlertTriangle, Check, CheckCircle2, CloudOff, Copy, Info, Loader2, RotateCw, X,
+  AlertCircle, AlertTriangle, Check, CheckCircle2, CloudOff, Copy, Info, Loader2, RotateCw, Trash2, X,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { useCatalog } from '../store/catalog'
+import { CATALOG_LABELS, catalogListState, useCatalog } from '../store/catalog'
+import type { CatalogKey } from '../store/catalog'
 import { humanizeError } from '../lib/errors'
 import { ariaShortcut, formatShortcut } from '../lib/keys'
 import { STATUS, statusMeta } from '../lib/status'
 import type { StatusShape } from '../lib/status'
-import { formatDateTime, formatTime } from '../lib/format'
+import { formatDateTime, formatDuration, formatRelative, formatTime } from '../lib/format'
+import type { HealthRecord } from '../lib/health'
+import { useRunClock } from '../run/useRunClock'
 
 /**
  * 输入法正在组字吗。组字期间的回车是"选词"，不是"提交"——不判这一条，中文
@@ -76,7 +79,7 @@ export class ErrorBoundary extends Component<
 }
 
 /** 「技术细节」折叠区：原文给运维复制用，默认收起 */
-function TechDetails({ raw, summary, className }: { raw: string; summary?: string; className?: string }) {
+export function TechDetails({ raw, summary, className }: { raw: string; summary?: string; className?: string }) {
   return (
     <details className={clsx('w-full text-left text-[11px] text-faint', className)}>
       <summary className="cursor-pointer select-none hover:text-dim">
@@ -218,7 +221,8 @@ const TOAST_VISIBLE = 3
  * 位置在内容区顶部居中、各页工具栏的下沿之下：右下角正好压在助手栏的输入区
  * 上，问数据页的输入框又在底部居中；贴着顶边又会盖住工具栏右侧的按钮（1280 宽
  * 时画布的 Copilot 按钮），而出错的 toast 是常驻的，一直盖着。工具栏最高 48px，
- * 离线横幅出现时再让出它的高度。左边让出 56px 的导航栏，在内容区里居中。
+ * 离线横幅出现时再让出它的高度。左边让出 64px 的导航栏（App 里的 w-16），在内容区
+ * 里居中。
  */
 export function ToastHost({ children }: { children?: ReactNode }) {
   const items = useSyncExternalStore(subscribeToasts, () => toastItems, () => toastItems)
@@ -232,7 +236,7 @@ export function ToastHost({ children }: { children?: ReactNode }) {
       {children}
       <DialogHost />
       <div
-        className="pointer-events-none fixed left-14 right-0 z-[100] flex justify-center px-4"
+        className="pointer-events-none fixed left-16 right-0 z-[100] flex justify-center px-4"
         style={{ top: 'calc(3.5rem + var(--offline-banner-h, 0px))' }}
       >
         <div className="flex w-full max-w-md flex-col gap-2">
@@ -788,13 +792,47 @@ export const Spinner = ({ size = 14 }: { size?: number }) => (
  * 默认感知连接状态：后端断开时"空"不代表"没有"，改说「暂时拿不到数据」并把
  * 「新建」这类动作收起来——之前后端挂了，整站都在说「还没有工作流」并引导新建，
  * 用户照做就是一堆重复配置。纯本地的空（比如搜索没匹配）传 offline={false}。
+ *
+ * 后端连着也可能是假的空：某张表卡着没回来、超时或报错，列表照样是 []。这份空
+ * 来自 catalog 的哪张表，就把 source 传进来（source="workflows"），那张表从没
+ * 取回来过时改说「还在读取 / 没取回来」，同样收起动作。
  */
-export function EmptyState({ icon, title, body, action, offline = 'auto', className }: {
+export function EmptyState({ icon, title, body, action, offline = 'auto', source, className }: {
   icon?: ReactNode; title: string; body?: ReactNode; action?: ReactNode
-  offline?: 'auto' | false; className?: string
+  offline?: 'auto' | false
+  /** 这份空来自 catalog 的哪张表。页面自己拉的列表不传，自己区分加载中和出错 */
+  source?: CatalogKey
+  className?: string
 }) {
   const backend = useCatalog((s) => s.backend)
   const checkBackend = useCatalog((s) => s.checkBackend)
+  const list = useCatalog((s) => (source && offline === 'auto' ? catalogListState(s, source) : 'ok'))
+  const listError = useCatalog((s) => (source && offline === 'auto' && catalogListState(s, source) === 'error'
+    ? s.checks.find((c) => c.key === source)?.error ?? null : null))
+  if (offline === 'auto' && source && (list === 'loading' || list === 'error')) {
+    const label = CATALOG_LABELS[source]
+    const loading = list === 'loading'
+    return (
+      <div
+        className={clsx('flex flex-col items-center justify-center gap-2 px-6 py-14 text-center', className)}
+        role={loading ? 'status' : 'alert'}
+        data-empty-unknown={list}
+      >
+        <div className="text-faint">{loading ? <Spinner size={20} /> : <AlertCircle size={22} aria-hidden />}</div>
+        <div className="text-sm text-dim">{loading ? `正在读取${label}` : `${label}没取回来`}</div>
+        <div className="max-w-sm text-xs leading-relaxed text-faint">
+          {loading
+            ? '后端连着，这份列表还在路上。取回来之前，空着不代表没有。'
+            : <>{listError ? `${humanizeError(listError).title.replace(/[。.！!]$/, '')}。` : ''}这里显示为空不代表没有数据。</>}
+        </div>
+        {!loading && (
+          <button className="btn btn-sm mt-2" onClick={() => void useCatalog.getState().refresh()}>
+            <RotateCw size={12} aria-hidden /> 重新读取
+          </button>
+        )}
+      </div>
+    )
+  }
   if (offline === 'auto' && backend === 'down') {
     return (
       <div className={clsx('flex flex-col items-center justify-center gap-2 px-6 py-14 text-center', className)}>
@@ -822,10 +860,10 @@ export function EmptyState({ icon, title, body, action, offline = 'auto', classN
 }
 
 /** 老名字。hint 就是 EmptyState 的 body */
-export function Empty({ icon, title, hint, action, offline }: {
-  icon?: ReactNode; title: string; hint?: string; action?: ReactNode; offline?: 'auto' | false
+export function Empty({ icon, title, hint, action, offline, source }: {
+  icon?: ReactNode; title: string; hint?: string; action?: ReactNode; offline?: 'auto' | false; source?: CatalogKey
 }) {
-  return <EmptyState icon={icon} title={title} body={hint} action={action} offline={offline} />
+  return <EmptyState icon={icon} title={title} body={hint} action={action} offline={offline} source={source} />
 }
 
 /**
@@ -877,15 +915,32 @@ export function ErrorNotice(props: { error: unknown; onRetry?: () => void; class
   return <ErrorState {...props} compact />
 }
 
-/** 每 intervalMs 刷新一次的「现在」。只在 active 时计时，不做常驻定时器 */
-function useNow(active: boolean, intervalMs = 1000): number {
+/**
+ * 每 ms 毫秒重渲染一次的「现在」，给倒计时、「3 分钟前」这类相对时间保鲜。
+ * 只在 active 时计时，不做常驻定时器；页面不可见时不跳，回到前台立刻补一拍，
+ * 不让人看到一个停在几分钟前的数。
+ *
+ * 算相对时间时要现取 Date.now()：返回值是上一拍的时刻，比刚到的结果还早，拿它
+ * 算会把「刚刚」写成一个钟点。运行计时（100ms 一跳、全站同拍）用 useRunClock。
+ */
+export function useTicker(ms: number, active = true): number {
   const [now, setNow] = useState(() => Date.now())
+  const started = useRef(false)
   useEffect(() => {
+    // 挂载那一次不补：初值就是此刻。之后（从停着变成走着）要补，否则头一拍要等满
+    // ms，离线横幅刚出来时的倒计时就是拿挂载时刻算的
+    const first = !started.current
+    started.current = true
     if (!active) return
-    setNow(Date.now())
-    const t = setInterval(() => setNow(Date.now()), intervalMs)
-    return () => clearInterval(t)
-  }, [active, intervalMs])
+    if (!first) setNow(Date.now())
+    const tick = () => { if (!document.hidden) setNow(Date.now()) }
+    const t = setInterval(tick, ms)
+    document.addEventListener('visibilitychange', tick)
+    return () => {
+      clearInterval(t)
+      document.removeEventListener('visibilitychange', tick)
+    }
+  }, [ms, active])
   return now
 }
 
@@ -900,7 +955,7 @@ export function OfflineBanner({ className }: { className?: string }) {
   const lastOkAt = useCatalog((s) => s.lastOkAt)
   const checkBackend = useCatalog((s) => s.checkBackend)
   const down = backend === 'down'
-  const now = useNow(down)
+  const now = useTicker(1000, down)
   const [busy, setBusy] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
@@ -922,7 +977,7 @@ export function OfflineBanner({ className }: { className?: string }) {
   return (
     <div
       ref={ref}
-      role="alert"
+      data-offline-banner=""
       className={clsx('flex min-h-7 flex-wrap items-center gap-x-2 gap-y-0.5 border-b px-3 py-1 text-[11.5px]', className)}
       style={{
         color: 'var(--err)',
@@ -931,14 +986,18 @@ export function OfflineBanner({ className }: { className?: string }) {
       }}
       title={backendError ?? undefined}
     >
-      <CloudOff size={13} className="shrink-0" aria-hidden />
-      <span className="font-medium">后端未连接</span>
-      <span className="text-dim">当前看到的空列表不代表数据丢失</span>
-      {lastOkAt && (
-        <span className="text-faint tabular-nums" title={formatDateTime(lastOkAt)}>· 最后连通 {formatTime(lastOkAt)}</span>
-      )}
+      {/* 播报区只放不变的那几句：role=alert 是整块重念的，倒计时一秒一跳，放进来
+          读屏就一秒念一遍整条横幅 */}
+      <span role="alert" className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        <CloudOff size={13} className="shrink-0" aria-hidden />
+        <span className="font-medium">后端未连接</span>
+        <span className="text-dim">当前看到的空列表不代表数据丢失</span>
+        {lastOkAt && (
+          <span className="text-faint tabular-nums" title={formatDateTime(lastOkAt)}>· 最后连通 {formatTime(lastOkAt)}</span>
+        )}
+      </span>
       <span className="ml-auto flex items-center gap-2">
-        {secs != null && !busy && <span className="text-faint tabular-nums">{secs} 秒后自动重试</span>}
+        {secs != null && !busy && <span className="text-faint tabular-nums" aria-hidden>{secs} 秒后自动重试</span>}
         <button
           className="btn btn-sm"
           disabled={busy}
@@ -1033,11 +1092,7 @@ export function Tabs({ tabs, active, onChange, label, idPrefix }: {
 }) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({})
   const move = (e: ReactKeyboardEvent, i: number) => {
-    let next = -1
-    if (e.key === 'ArrowRight') next = (i + 1) % tabs.length
-    else if (e.key === 'ArrowLeft') next = (i - 1 + tabs.length) % tabs.length
-    else if (e.key === 'Home') next = 0
-    else if (e.key === 'End') next = tabs.length - 1
+    const next = rovingTarget(e, i, tabs.length, 'horizontal')
     if (next < 0) return
     e.preventDefault()
     const key = tabs[next].key
@@ -1081,6 +1136,48 @@ export function Tabs({ tabs, active, onChange, label, idPrefix }: {
       })}
     </div>
   )
+}
+
+/**
+ * 一组「只占一个 Tab 位、组内用方向键走」的控件（标签页、单选组）里，这一键要
+ * 去第几个。首尾相接，Home / End 到两头；不是移动键返回 -1。带 Alt / ⌘ / Ctrl 的
+ * 不接：Alt+← 是浏览器后退
+ */
+export function rovingTarget(e: ReactKeyboardEvent, i: number, n: number, axis: 'horizontal' | 'both'): number {
+  if (!n || e.altKey || e.metaKey || e.ctrlKey) return -1
+  if (e.key === 'ArrowRight' || (axis === 'both' && e.key === 'ArrowDown')) return (i + 1) % n
+  if (e.key === 'ArrowLeft' || (axis === 'both' && e.key === 'ArrowUp')) return (i - 1 + n) % n
+  if (e.key === 'Home') return 0
+  if (e.key === 'End') return n - 1
+  return -1
+}
+
+/**
+ * 单选组（role=radiogroup）的键盘约定：整组只占一个 Tab 位，落在选中项上；
+ * ←→↑↓ 在组内移动并选中，首尾相接，Home / End 到两头。标了 radio 却每项一个
+ * Tab 位、方向键没反应，等于对读屏用户许了个做不到的诺。
+ *
+ * 用法：const radio = useRadioGroup(values, value, onChange)，每个选项展开
+ * {...radio(v)}，点击照旧自己写 onClick；外层容器自己写 role="radiogroup" 和名字。
+ */
+export function useRadioGroup<T extends string>(values: readonly T[], value: T | undefined, onChange: (v: T) => void) {
+  const refs = useRef(new Map<T, HTMLElement | null>())
+  // 选中的值不在选项里（还没加载完之类）：让第一项接住 Tab
+  const focusable = value !== undefined && values.includes(value) ? value : values[0]
+  return (v: T) => ({
+    ref: (el: HTMLElement | null) => { refs.current.set(v, el) },
+    role: 'radio' as const,
+    'aria-checked': v === value,
+    tabIndex: v === focusable ? 0 : -1,
+    onKeyDown: (e: ReactKeyboardEvent) => {
+      const i = rovingTarget(e, values.indexOf(v), values.length, 'both')
+      if (i < 0) return
+      e.preventDefault()
+      const next = values[i]
+      if (next !== value) onChange(next)
+      refs.current.get(next)?.focus()
+    },
+  })
 }
 
 export function TabPanel({ idPrefix, tabKey, children, className }: {
@@ -1431,4 +1528,227 @@ export function CopyButton({ text }: { text: string }) {
       {done ? '已复制' : '复制'}
     </button>
   )
+}
+
+// -------------------------------------------------------------------------
+// 页头、分节、删除按钮：工具、知识、数据、设置、记录几页共用
+// -------------------------------------------------------------------------
+
+/**
+ * 页头：图标、标题、一句说明、页面级按钮。
+ *
+ * 高度卡死 48px：toast 从 56px 起，工具栏比这高，常驻的出错 toast 就会压住
+ * 按钮。标签页（如果有）紧贴在页头下面、左边缘对齐。
+ */
+export function PageHeader({ icon, title, subtitle, actions }: {
+  icon: ReactNode; title: string; subtitle?: string; actions?: ReactNode
+}) {
+  return (
+    <header className="flex h-12 shrink-0 items-center gap-2.5 border-b bg-panel px-4">
+      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border bg-elev text-dim" aria-hidden>
+        {icon}
+      </span>
+      <h1 className="shrink-0 text-sm font-semibold">{title}</h1>
+      {subtitle && <p className="min-w-0 truncate text-xs text-faint" title={subtitle}>{subtitle}</p>}
+      <span className="flex-1" />
+      {actions}
+    </header>
+  )
+}
+
+/** 标签页里一节的标题行：左边标题和一句说明，右边这一节的按钮 */
+export function SectionBar({ title, hint, children }: { title: string; hint?: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="mb-3 flex flex-wrap items-end gap-x-3 gap-y-2">
+      <div className="min-w-0 flex-1">
+        <h2 className="text-sm font-semibold">{title}</h2>
+        {hint && <p className="mt-0.5 text-xs leading-relaxed text-faint">{hint}</p>}
+      </div>
+      {children && <div className="flex flex-wrap items-center gap-2">{children}</div>}
+    </div>
+  )
+}
+
+/** 删除类的纯图标按钮：悬停铺 10% 的 err 底，读屏念得出删的是谁 */
+export function DeleteButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
+  return (
+    <IconButton
+      label={label}
+      onClick={onClick}
+      disabled={disabled}
+      className="text-faint hover:bg-st-failed/10 hover:text-[var(--err)]"
+      icon={<Trash2 size={12} />}
+    />
+  )
+}
+
+/**
+ * 连通状态胶囊：状态剪影 + 一句话。结果存在 lib/health（useHealth / checkHealth）。
+ *
+ * 和画布运行态同一套语言：进行中是转着的圆环、正常是带勾的方块、失败是三角、
+ * 没测过是空心点——去掉颜色也认得出。正常态安静（字是 dim），出错才用 err 色。
+ * 结果刚到的那一下，状态点外圈扩散一次；进页时从缓存读出的旧结果不播。
+ */
+export function HealthPill({ record, checkingSince, labels, className, stale }: {
+  record?: HealthRecord | null
+  checkingSince?: number
+  labels?: { idle?: string; checking?: string; ok?: string; fail?: string }
+  className?: string
+  /** 结果已经不代表眼前这份配置（改过了），淡出显示并提示重测 */
+  stale?: boolean
+}) {
+  const clock = useRunClock(!!checkingSince)
+  useTicker(30_000, !!record && !checkingSince)
+  const state = checkingSince ? 'checking' : !record ? 'idle' : record.ok ? 'ok' : 'fail'
+  const status = ({ idle: 'idle', checking: 'running', ok: 'done', fail: 'failed' } as const)[state]
+  const color = `var(--st-${status})`
+
+  const [ping, setPing] = useState(0)
+  const lastAt = useRef(record?.at)
+  useEffect(() => {
+    const at = record?.at
+    if (at && at !== lastAt.current && Date.now() - at < 3000) setPing(at)
+    lastAt.current = at
+  }, [record?.at])
+
+  // at 为 0：后端记的上次结果，不知道是什么时候测的，就不写时间。带个「测」字：
+  // 这是上次测的时刻，不是此刻的状态
+  const rel = record?.at ? formatRelative(record.at) : ''
+  const when = !rel ? '' : rel === '刚刚' ? '刚测过' : /前$/.test(rel) ? `${rel}测` : `${rel} 测`
+  const text = state === 'checking'
+    ? `${labels?.checking ?? '正在测'} · ${formatDuration(Math.max(0, clock - (checkingSince ?? clock)))}`
+    : state === 'idle'
+      ? (labels?.idle ?? '未测试')
+      : state === 'ok'
+        ? [labels?.ok ?? '已连通', record?.ms != null ? formatDuration(record.ms) : null, when].filter(Boolean).join(' · ')
+        : [labels?.fail ?? '连不上', when].filter(Boolean).join(' · ')
+  const tip = record
+    ? [
+        record.at ? `${formatDateTime(record.at)} 测的` : '上次探测的结果',
+        record.ok ? record.note : record.error,
+        stale ? '配置改过了，这个结果不代表眼前这份，重测一次' : null,
+      ].filter(Boolean).join('\n')
+    : undefined
+  // 念给读屏的那一句只在状态切换时变：看得见的那句里有 100ms 一跳的计时和
+  // 「3 分钟前」，放进播报区的话测连接期间会一直念、之后每分钟每张卡再念一遍。
+  // 时刻写成钟点，不写相对时间
+  const spoken = state === 'checking'
+    ? '正在测连接'
+    : state === 'idle' || !record
+      ? ''
+      : [
+          record.ok
+            ? [labels?.ok ?? '已连通', record.ms != null ? formatDuration(record.ms) : null].filter(Boolean).join(' ')
+            : `${labels?.fail ?? '连不上'}${record.error ? `：${record.error}` : ''}`,
+          record.at ? `${formatTime(record.at)} 测的` : null,
+          stale ? '配置改过了，这个结果不代表眼前这份' : null,
+        ].filter(Boolean).join('，')
+
+  return (
+    <>
+      <span
+        aria-hidden
+        data-health={state}
+        title={tip}
+        className={clsx('inline-flex items-center gap-1.5 whitespace-nowrap text-2xs tnum', stale && 'opacity-55', className)}
+        style={{ color: state === 'fail' ? color : state === 'checking' ? 'var(--accent)' : state === 'ok' ? 'var(--text-dim)' : 'var(--text-faint)' }}
+      >
+        <span className="relative inline-flex">
+          {ping > 0 && (
+            <span
+              key={ping}
+              className="absolute inset-0 animate-ping rounded-full"
+              style={{ background: color, animationIterationCount: 1, animationFillMode: 'forwards' }}
+              onAnimationEnd={() => setPing(0)}
+            />
+          )}
+          <StatusBadge status={status} size={12} decorative />
+        </span>
+        {text}
+        {stale && state !== 'checking' && <span className="text-faint">· 配置改过了</span>}
+      </span>
+      <span role="status" className="sr-only">{spoken}</span>
+    </>
+  )
+}
+
+// -------------------------------------------------------------------------
+// 删除后可撤销
+// -------------------------------------------------------------------------
+
+const UNDO_MS = 5000
+const pendingDeletes = new Map<number, string>()
+let pendingSeq = 0
+/**
+ * 已经点了删除的对象（按 DELETE 的 url 记）。撤销窗口里 DELETE 还没发，这时列表
+ * 一刷新（知识库有文档在处理时 2 秒轮询一次、写完记忆、存完工具都会重拉），后端
+ * 照样返回它，行就回来了——toast 还写着「已删除」，再点一次删除还会多排一个
+ * DELETE，头一个落地后第二个 404。所以各列表的 load 都要过一遍 withoutDeferred。
+ *
+ * 撤销、或者删失败放回原处时才拿出去；删成功了也不拿：id 不会再出现，而删之前
+ * 发出、删之后才回来的那次列表请求里还带着它
+ */
+const deferredGone = new Set<string>()
+
+/** 滤掉还在撤销窗口里（或已经删掉）的行。base 是 DELETE 地址去掉 id 的那段 */
+export function withoutDeferred<T extends { id: string }>(rows: T[], base: string): T[] {
+  return deferredGone.size ? rows.filter((r) => !deferredGone.has(`${base}/${r.id}`)) : rows
+}
+
+// 关页、刷新时，还在撤销窗口里的删除照样发出去：用户已经点了删除，刷新一下它
+// 又回来了，比多等 5 秒更让人糊涂。keepalive 让请求活过页面卸载
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    for (const url of pendingDeletes.values()) {
+      void fetch(url, { method: 'DELETE', keepalive: true }).catch(() => {})
+    }
+    pendingDeletes.clear()
+  })
+}
+
+/**
+ * 低代价的删除：列表里先拿掉，toast 给 5 秒「撤销」，到点才真发 DELETE。
+ * 比弹窗确认少一次打断，误删了又救得回来。发失败了放回原处并说明。
+ *
+ * url 是关页时补发用的（/api/...），commit 是正常路径。url 同时是「已删」的
+ * 记号：列表的 load 用 withoutDeferred 按它滤掉这一行。
+ */
+export function deferDelete({ what, url, hide, restore, commit, done }: {
+  what: string
+  url: string
+  hide: () => void
+  restore: () => void
+  commit: () => Promise<unknown>
+  done?: () => void
+}) {
+  deferredGone.add(url)
+  hide()
+  const id = ++pendingSeq
+  pendingDeletes.set(id, url)
+  // 先拿掉记号再 restore：restore 多半是重拉列表，记号还在的话又被滤掉
+  const putBack = () => { deferredGone.delete(url); restore() }
+  const timer = setTimeout(async () => {
+    if (!pendingDeletes.delete(id)) return
+    toast.dismiss(toastId)
+    try {
+      await commit()
+      done?.()
+    } catch (e) {
+      putBack()
+      const h = humanizeError(e)
+      toast.error(`没删掉${what}：${h.reason ? `${h.title}，${h.reason}` : h.title}`, { detail: h.raw })
+    }
+  }, UNDO_MS)
+  const toastId = toast(`已删除${what}`, 'info', {
+    duration: UNDO_MS,
+    key: `undo:${id}`,
+    action: {
+      label: '撤销',
+      onClick: () => {
+        if (!pendingDeletes.delete(id)) return
+        clearTimeout(timer)
+        putBack()
+      },
+    },
+  })
 }

@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react'
-import { AlertTriangle, CheckCircle2, CornerDownRight, RotateCw, Trash2, Unlink, Workflow, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, CornerDownRight, Plus, RotateCw, Trash2, Unlink, Workflow, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS } from './nodeDefs'
-import type { FieldRef, Problem } from './issues'
+import { unboundToolOf, withToolBound, type FieldRef, type Problem } from './issues'
 import { formatShortcut } from '../lib/keys'
 import { useCatalog } from '../store/catalog'
-import { useStudio } from '../store/studio'
+import { useEditLock, useStudio } from '../store/studio'
 import { Spinner } from '../components/ui'
 
 /**
@@ -129,10 +129,15 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
   problem: Problem; active: boolean; onLocate: () => void; onDeleteEdge: (id: string) => void
 }) {
   const node = useStudio((s) => (p.nodeId ? s.nodes.find((n) => n.id === p.nodeId) : undefined))
+  const updateNode = useStudio((s) => s.updateNode)
+  const locked = useEditLock() != null
   const err = p.level === 'error'
   const Icon = err ? XCircle : AlertTriangle
-  const where = fieldLabel(p.field, node?.data.nodeType)
+  const where = fieldLabel(p.field, node?.data.nodeType, node?.data.config)
   const locatable = p.scope === 'node' && !!node
+  // 提示词点了名的工具没绑：就地绑上，和检查器里那个按钮是同一个修法
+  const tool = unboundToolOf(p.message)
+  const bound = node && tool ? withToolBound(node.data.config ?? {}, p.field, tool) : null
   return (
     <div role="listitem" data-problem={p.id}
          className={clsx('group flex items-start gap-2 pl-6 pr-2', active && 'bg-hover')}>
@@ -153,6 +158,13 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
           </span>
         )}
       </button>
+      {bound && tool && (
+        <button type="button" className="btn btn-xs my-0.5 shrink-0" disabled={locked}
+                title={`把 ${tool} 加进${where || '这个节点的工具'}`}
+                onClick={() => updateNode(node!.id, { config: bound })}>
+          <Plus size={10} aria-hidden /> 绑定 {tool}
+        </button>
+      )}
       {/* 悬空边（指向不存在的节点）：React Flow 不画它，画布上看不见、点不到，只能在这儿删 */}
       {p.scope === 'edge' && p.edgeId && (
         <button type="button" className="btn btn-xs my-0.5 shrink-0" onClick={() => onDeleteEdge(p.edgeId!)}>
@@ -163,13 +175,18 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
   )
 }
 
-function fieldLabel(field: FieldRef | null | undefined, type?: string): string {
+const SUB_LABEL: Record<string, string> = { condition: '的条件', key: '的标识', tools: '的工具', system: '的角色设定' }
+
+function fieldLabel(field: FieldRef | null | undefined, type?: string, config?: Record<string, any>): string {
   if (!field) return ''
   if (field.key === 'label') return '节点名称'
   const def = type ? NODE_DEFS[type as keyof typeof NODE_DEFS] : undefined
   const base = def?.fields.find((f) => f.key === field.key)?.label ?? field.key
   if (field.index == null) return base
+  const sub = (field.sub && SUB_LABEL[field.sub]) || ''
+  // 成员有名字就叫名字：「第 2 个成员」还得数，「成员 writer」一眼就知道是谁
+  const name = field.key === 'agents' ? config?.agents?.[field.index]?.name : undefined
+  if (name) return `成员「${name}」${sub}`
   const item = ({ cases: '分支', fields: '字段', metrics: '指标', agents: '成员' } as Record<string, string>)[field.key]
-  const sub = field.sub === 'condition' ? '的条件' : field.sub === 'key' ? '的标识' : ''
   return item ? `第 ${field.index + 1} 个${item}${sub}` : `${base} · 第 ${field.index + 1} 项`
 }

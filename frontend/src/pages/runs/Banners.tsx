@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowDown, Copy, Crosshair, Play, RotateCcw, Settings2, Wrench, X } from 'lucide-react'
+import { ArrowDown, Ban, ChartGantt, Copy, Crosshair, Play, RotateCcw, Settings2, Wrench, X } from 'lucide-react'
 import { CopyButton, Spinner, StatusBadge } from '../../components/ui'
 import { formatDateTime, formatTime } from '../../lib/format'
 import type { Approval } from '../../types'
-import type { RunErrorExplain } from './explain'
+import type { RunErrorExplain } from '../../lib/explain'
 import { LONG_WAIT_MS, ageMs, formatSpan } from './model'
 import { copyText } from './parts'
 
@@ -32,13 +32,15 @@ function Shell({ color, children, data }: { color: string; children: ReactNode; 
  * 断点续跑在这一页用不上。
  */
 export function FailedBanner({
-  explain, nodeId, nodeLabel, canvasHref, onContinue, onRerun, busy,
+  explain, nodeId, nodeLabel, canvasHref, onShowInTrace, onContinue, onRerun, busy,
 }: {
   explain: RunErrorExplain
   nodeId?: string | null
   nodeLabel?: string
   /** 有工作流才能回画布定位；未保存的图没有地方可回，不放一个点了没用的按钮 */
   canvasHref?: string | null
+  /** 工作流之后改过结构、失败的节点已经不在了：画布上定位不到，改去航迹看它当时的样子 */
+  onShowInTrace?: () => void
   onContinue: () => void
   /** 缺输入的失败：补上那一项，用同一张图重新发起 */
   onRerun?: (field: string) => void
@@ -98,6 +100,12 @@ export function FailedBanner({
                 <Crosshair size={11} aria-hidden /> 在画布中定位
               </Link>
             )}
+            {!canvasHref && onShowInTrace && (
+              <button type="button" className="btn btn-sm" onClick={onShowInTrace} data-action="locate-trace"
+                      title={'工作流在这次运行之后改过结构，现在的图里已经没有这个节点，画布上定位不到它。\n航迹用的是运行时的快照，能看到它当时的样子'}>
+                <ChartGantt size={11} aria-hidden /> 在航迹中看
+              </button>
+            )}
             <button type="button" className="btn btn-sm btn-ghost" data-action="copy-error"
                     onClick={() => void copyText(explain.raw, '报错原文')}>
               <Copy size={11} aria-hidden /> 复制错误
@@ -124,8 +132,13 @@ export function FailedBanner({
 // 挂起
 // -------------------------------------------------------------------------
 
-/** 中断了却没有待审批：服务重启时停下的，断点还在。以前卡头写「等待人工介入」，却没有任何东西可以点 */
-export function HeldBanner({ reason, onContinue, busy }: { reason?: string | null; onContinue: () => void; busy: boolean }) {
+/**
+ * 中断了却没有待审批：服务重启时停下的，断点还在。以前卡头写「等待人工介入」，却没有任何东西可以点。
+ * 不打算再跑的就放弃：挂起的运行没人会再去接，不放弃就在记录里永远挂着「可续跑」
+ */
+export function HeldBanner({ reason, onContinue, onAbandon, busy }: {
+  reason?: string | null; onContinue: () => void; onAbandon: () => void; busy: boolean
+}) {
   return (
     <Shell color="var(--st-suspended)" data="held">
       <div className="flex items-center gap-2.5 text-xs">
@@ -134,11 +147,22 @@ export function HeldBanner({ reason, onContinue, busy }: { reason?: string | nul
           <span className="font-medium text-fg">已挂起，可以接着跑</span>
           <span className="text-dim"> · {reason || '这次运行停在断点上，没有待处理的审批'}。前面跑完的节点不会重跑。</span>
         </span>
+        <AbandonButton onClick={onAbandon} disabled={busy} />
         <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={onContinue} data-action="resume">
           {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 接着跑
         </button>
       </div>
     </Shell>
+  )
+}
+
+/** 放弃是低频、不可逆的：安静的次级按钮，放在主动作左边，点了还要确认一次 */
+function AbandonButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
+  return (
+    <button type="button" className="btn btn-sm btn-ghost shrink-0" disabled={disabled} onClick={onClick}
+            data-action="abandon" title="不再往下跑：记为已取消，待审批一并关闭；已经跑完的节点和产出保留">
+      <Ban size={11} aria-hidden /> 放弃这次运行
+    </button>
   )
 }
 
@@ -150,8 +174,9 @@ export function HeldBanner({ reason, onContinue, busy }: { reason?: string | nul
  * 停在审批上：说清楚卡在哪、等了多久，审批卡本身在时间线里（和它要确认的
  * 那件事挨着）。按钮把人带过去。
  */
-export function WaitingBanner({ approvals, labelOf, onJump, now }: {
-  approvals: Approval[]; labelOf: (id?: string | null) => string | undefined; onJump: (id: string) => void; now: number
+export function WaitingBanner({ approvals, labelOf, onJump, onAbandon, busy, now }: {
+  approvals: Approval[]; labelOf: (id?: string | null) => string | undefined; onJump: (id: string) => void
+  onAbandon: () => void; busy: boolean; now: number
 }) {
   const first = approvals[0]
   const waited = ageMs(first.created_at, now)
@@ -172,6 +197,7 @@ export function WaitingBanner({ approvals, labelOf, onJump, now }: {
           </span>
           {approvals.length > 1 && <span className="text-faint"> · 共 {approvals.length} 张审批卡</span>}
         </span>
+        <AbandonButton onClick={onAbandon} disabled={busy} />
         <button type="button" className="btn btn-sm" onClick={() => onJump(first.id)} data-action="jump-approval">
           <ArrowDown size={11} aria-hidden /> 去审批卡
         </button>

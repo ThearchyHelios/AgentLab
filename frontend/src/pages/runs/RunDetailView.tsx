@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { Code2, Copy, GitFork, Link2, Square, SquareArrowOutUpRight, Trash2 } from 'lucide-react'
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { Code2, Copy, GitFork, Link2, Rewind, Square, SquareArrowOutUpRight, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import {
-  ErrorState, IconButton, Skeleton, Spinner, confirmDialog, promptDialog, toast,
+  ErrorState, IconButton, Skeleton, Spinner, confirmDialog, promptDialog, toast, useTicker,
 } from '../../components/ui'
 import { formatDateTime, formatNumber, formatTime, shortId } from '../../lib/format'
 import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
@@ -15,16 +15,26 @@ import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
-import { explainRunError } from './explain'
-import { UNSAVED_HINT, duplicateNames, idTail, isLiveRun, isUnsaved, runName, runScope } from './model'
-import { ClassChip, MoreMenu, TierChip, copyText, useNow, type MenuItem } from './parts'
+import { explainRunError } from '../../lib/explain'
+import {
+  UNSAVED_HINT, asView, duplicateNames, graphShape, idTail, isLiveRun, isUnsaved, runName, runScope, type DetailView,
+} from './model'
+import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
+import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
+import { TracePane } from './TracePane'
 import { useRunDetail } from './useRunDetail'
 
 /**
- * 一次运行的详情：头部读数、凭证、排错路径，下面是和画布助手栏、问数据页同一个
- * 解码器、同一个组件画的时间线——三处各写一套的话，同一次运行会被讲成三个
- * 不同的故事，而用户没法判断哪个是真的。
+ * 一次运行的详情：头部读数、凭证、排错路径，下面分三个视图——
+ *
+ * - 时间线：和画布助手栏、问数据页同一个解码器、同一个组件画的逐步叙述。三处各写
+ *   一套的话，同一次运行会被讲成三个不同的故事，而用户没法判断哪个是真的；
+ * - 航迹：和画布底部同一个航迹坞，按时间摊开，能拖到任意一刻回放；
+ * - 工件：这次运行按内容哈希存下的每一件证据和产出。
+ *
+ * 视图记在地址的 ?view= 里，换一条运行时留在同一个视图；?at= 是航迹上的时刻
+ * （相对开始的毫秒），从工件、分享的链接直接落到那一刻。
  */
 export function RunDetailView({ runId, onChange, onDeleted }: {
   runId: string
@@ -34,15 +44,17 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
 }) {
   const navigate = useNavigate()
   const { search } = useLocation()
+  const [params, setParams] = useSearchParams()
   const d = useRunDetail(runId, onChange)
   const workflows = useCatalog((s) => s.workflows)
   const catalogLoaded = useCatalog((s) => s.loaded)
   const refreshCatalog = useCatalog((s) => s.refresh)
+  const refreshApprovals = useCatalog((s) => s.refreshApprovals)
   const [raw, setRaw] = useState(false)
-  const [busy, setBusy] = useState<null | 'stop' | 'continue' | 'rerun' | 'extract' | 'delete'>(null)
+  const [busy, setBusy] = useState<null | 'stop' | 'continue' | 'rerun' | 'extract' | 'delete' | 'abandon'>(null)
   const [feedback, setFeedback] = useState<Feedback | null>(null)
   const streamBox = useRef<HTMLDivElement>(null)
-  const now = useNow(60_000)
+  const now = useTicker(60_000)
 
   useEffect(() => {
     if (d.state !== 'missing') return
@@ -62,6 +74,59 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const phase = useMemo(() => decodePhase(d.events, final), [d.events, final])
   const steps = useMemo(() => decodeRun(d.events, final), [d.events, final])
   const code = run ? displayCode(run, phase, pendingFlag) : 'idle'
+
+  // ---- 视图、航迹游标 ----
+  const view = asView(params.get('view'))
+  const setView = useCallback((v: DetailView) => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      if (v === 'stream') next.delete('view')
+      else next.set('view', v)
+      return next
+    }, { replace: true })
+  }, [setParams])
+  const [replayAt, setReplayAt] = useState<number | null>(null)
+  // 航迹上选中的节点；undefined 是还没人点过（点过「收起」就是 null）
+  const [traceNode, setTraceNode] = useState<string | null | undefined>(undefined)
+  // 地址里的时刻只在进来时读一次，读完摘掉：拖动游标不回写地址（一帧一次会让
+  // 整页跟着重渲染），留着就和游标对不上了。等事件到了、知道从哪一刻开始才读
+  const atParam = params.get('at')
+  const t0 = d.trace.timed ? d.trace.startedAt : undefined
+  useEffect(() => {
+    if (atParam == null || d.state !== 'ok') return
+    const ms = Number(atParam)
+    if (t0 != null && Number.isFinite(ms) && ms >= 0) setReplayAt(t0 + ms)
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('at')
+      return next
+    }, { replace: true })
+  }, [atParam, d.state, t0, setParams])
+  // 失败的、等审批的，航迹上默认就看那个节点。和数据同一次渲染就定下来，不等一个
+  // effect：航迹坞按读数区第一次画出来的高度分地方，晚一拍才出现的节点卡会被压住
+  const focusDefault = d.trace.failedNodeId ?? d.trace.waitingNodeId ?? null
+  const traceSelected = traceNode === undefined ? focusDefault : traceNode
+  const pickTraceNode = useCallback((id: string | null) => setTraceNode(id), [])
+
+  // 从航迹、工件、原始事件切回时间线之后要做的定位（去审批卡、描出某个节点那几步）。
+  // 视图是经地址切的，提交要晚好几帧：固定等两帧的话，焦点会落进还 inert 着的
+  // 时间线，什么也不发生，焦点留在横幅的按钮上。所以等切回来的那次提交再做
+  const reveal = useRef<(() => void) | null>(null)
+  useEffect(() => {
+    const fn = reveal.current
+    if (!fn || view !== 'stream' || raw) return
+    reveal.current = null
+    // inert 已经随这次提交摘掉；再等一帧，让刚换回来的可读视图把审批卡画出来
+    requestAnimationFrame(fn)
+  }, [view, raw])
+
+  // 工件：页签上要写件数，一打开详情就取；又有节点跑完、运行收尾时再取
+  const artifactKey = useMemo(() => {
+    let n = 0
+    for (const e of d.events) if (e.type === 'node.finished' || e.type === 'tool.end' || e.type === 'tool.error') n += 1
+    return `${d.run?.status ?? ''}|${n}`
+  }, [d.events, d.run?.status])
+  const artifacts = useRunArtifacts(runId, artifactKey)
 
   // 接流期间状态变了（跑完、停到审批上）：左边那一行跟着变，不用等整表刷新
   const lastPhase = useRef<RunPhase | null>(null)
@@ -102,9 +167,24 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const workflowGone = !!run.workflow_id && catalogLoaded && !workflows.some((w) => w.id === run.workflow_id)
   const waitingNode = d.trace.waitingNodeId ?? d.pending?.[0]?.node_id
   const focus = code === 'failed' ? failedNode : code === 'waiting' ? waitingNode : null
-  const canvasHref = run.workflow_id && !workflowGone
-    ? `/studio/${run.workflow_id}?run=${run.id}${focus ? `&focus=${encodeURIComponent(focus)}` : ''}`
-    : null
+  // 画布上回放是把这次的事件套在工作流「现在」的图上。之后改过结构的，对不上的
+  // 节点不会亮——先说清，并指到航迹：那里用的是运行时的快照
+  const current = run.workflow_id ? workflows.find((w) => w.id === run.workflow_id)?.graph : undefined
+  const drift = !!d.graph && !!current && graphShape(d.graph) !== graphShape(current)
+  // 这个节点在现在的图里已经没有了：画布上对准它，什么也对不到。工作流还没取回来时
+  // 不知道，照常给
+  const goneFromCanvas = (node?: string | null) => !!node && !!current && !current.nodes.some((n) => n.id === node)
+  const canvasBase = run.workflow_id && !workflowGone ? `/studio/${run.workflow_id}?run=${run.id}` : null
+  // 对准某个节点的入口（失败横幅的定位、航迹节点卡）：节点不在了就不给，免得放一个
+  // 点了落空的按钮
+  const hrefFor = (node?: string | null) => (canvasBase && !goneFromCanvas(node)
+    ? `${canvasBase}${node ? `&focus=${encodeURIComponent(node)}` : ''}`
+    : null)
+  // 详情头是回放整次运行，一直给；对准的节点不在了就只打开，不带 focus
+  const aimed = focus && !goneFromCanvas(focus) ? focus : null
+  const canvasHref = hrefFor(aimed)
+  // 还在往前走的叫「打开」（接着看实时的、去处理），停下的叫「回放」
+  const replayable = code === 'succeeded' || code === 'failed' || code === 'cancelled'
   const dup = !!run.workflow_id && duplicateNames(workflows.map((w) => ({ id: w.id, name: w.name }))).has(run.workflow_name)
 
   // ---- 动作 ----
@@ -116,6 +196,38 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       toast.info('已发出停止，正在收尾…')
     } catch (e) {
       toast.error(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // 等审批、挂起的运行不再往下跑：收成已取消，待审批一并关闭（后端记下署名）
+  const abandon = async () => {
+    const n = d.pending?.length ?? 0
+    const actor = localActor()
+    const ok = await confirmDialog({
+      title: '放弃这次运行？',
+      body: code === 'waiting'
+        ? `「${runName(run)}」停在审批上。放弃之后它不会再往下跑，也不能再恢复。`
+        : `「${runName(run)}」挂起在断点上。放弃之后不能再接着跑。`,
+      consequences: [
+        ...(n ? [`${n} 条待审批一并关闭，${actor ? `留痕署名「${actor}」` : '留痕记为未署名（署名在 设置 → 偏好设置 里填）'}`] : []),
+        '运行记为已取消；已经跑完的节点、产出和事件照样保留',
+      ],
+      danger: true,
+      confirmLabel: '放弃这次运行',
+    })
+    if (!ok) return
+    setBusy('abandon')
+    try {
+      await api.runs.cancel(run.id)
+      toast.ok('已放弃这次运行')
+      await d.reload()
+      void d.refreshPending()
+      void refreshApprovals()
+    } catch (e) {
+      toast.error(e)
+      void d.reload()
     } finally {
       setBusy(null)
     }
@@ -206,16 +318,54 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     void d.refreshPending()
   }
 
-  const jumpToApproval = (id: string) => {
+  // 审批卡、某个节点的几步都在时间线里：别的视图上点过来，先切回时间线，等它
+  // 回来了再定位（见上面的 reveal）
+  const inStream = (fn: () => void) => {
+    if (view === 'stream' && !raw) {
+      fn()
+      return
+    }
+    reveal.current = fn
+    if (raw) setRaw(false)
+    if (view !== 'stream') setView('stream')
+  }
+  const reduceMotion = () => !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+
+  const jumpToApproval = (id: string) => inStream(() => {
     const el = streamBox.current?.querySelector<HTMLElement>(`[data-approval-card="${id}"]`)
     if (!el) return
-    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' })
+    el.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'center' })
     el.classList.remove('runs-focus-ring')
     void el.offsetWidth
     el.classList.add('runs-focus-ring')
     setTimeout(() => el.classList.remove('runs-focus-ring'), 1500)
     el.querySelector<HTMLElement>('textarea, input, button')?.focus({ preventScroll: true })
+  })
+
+  // 航迹上选中的节点，回到时间线里看它那几步：定位到第一步，用强调色描一下
+  // （data-flash 是时间线自己的描边样式，和点名定位同一种）
+  const revealStep = (nodeId: string) => inStream(() => {
+    const rows = [...(streamBox.current?.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(nodeId)}"]`) ?? [])]
+    if (!rows.length) {
+      toast.info(`时间线里没有「${labelOf(nodeId) ?? nodeId}」的步骤：它没有执行过`)
+      return
+    }
+    rows[0].scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'center' })
+    for (const el of rows) el.dataset.flash = 'focus'
+    setTimeout(() => { for (const el of rows) if (el.dataset.flash === 'focus') delete el.dataset.flash }, 1800)
+  })
+
+  // 工件产出的那一刻：去航迹，游标落在那里，选中产出它的节点
+  const showMoment = (at: number, nodeId: string | null) => {
+    setReplayAt(at)
+    if (nodeId) pickTraceNode(nodeId)
+    setView('trace')
+  }
+  // 画布上已经没有的节点：去航迹看它停下时的样子
+  const showInTrace = (nodeId: string) => {
+    setReplayAt(null)
+    pickTraceNode(nodeId)
+    setView('trace')
   }
 
   const extract = async () => {
@@ -337,10 +487,19 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   ) : null
 
   const unsaved = isUnsaved(run)
+  const artifactCount = artifacts.items?.length
+  const viewTabs: TabItem<DetailView>[] = [
+    { key: 'stream', label: '时间线', title: '逐步看每个节点做了什么、说了什么' },
+    { key: 'trace', label: '航迹', title: '按时间摊开：慢在哪、卡在哪、谁和谁同时；拖到任意一刻回放' },
+    {
+      key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
+      title: artifactCount == null ? '这次运行存下的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
+    },
+  ]
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-run-detail={run.id} data-run-code={code}>
-      <header className="shrink-0 border-b">
+      <header className="runs-head shrink-0 border-b">
         <div className="flex items-start gap-3 px-4 pb-2 pt-2.5">
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
@@ -374,10 +533,21 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                 {busy === 'stop' ? <Spinner size={11} /> : <Square size={10} aria-hidden fill="currentColor" />} 停止
               </button>
             )}
-            {canvasHref && code !== 'failed' && (
-              <Link className="btn btn-sm" to={canvasHref} data-action="open-canvas"
-                    title={code === 'waiting' ? '打开这张工作流，并对准等审批的节点' : '在画布里打开这张工作流和这次运行'}>
-                <SquareArrowOutUpRight size={11} aria-hidden /> 在画布中打开
+            {canvasHref && (
+              <Link className="btn btn-sm relative" to={canvasHref} data-action="open-canvas"
+                    data-canvas-mode={replayable ? 'replay' : 'live'} data-graph-drift={drift ? '1' : undefined}
+                    title={[
+                      replayable
+                        ? `在画布上回放这次运行：拖底部的航迹，卡片回到那一刻${aimed ? '；对准失败的节点' : ''}`
+                        : code === 'waiting' && aimed ? '打开这张工作流，并对准等审批的节点' : '在画布里打开这张工作流，接着看这次运行',
+                      drift ? '注意：工作流在这次运行之后改过结构，画布上是现在的图，对不上的节点不会亮起来；当时的全貌看「航迹」' : '',
+                    ].filter(Boolean).join('\n')}>
+                {replayable ? <Rewind size={11} aria-hidden /> : <SquareArrowOutUpRight size={11} aria-hidden />}
+                {replayable ? '在画布中回放' : '在画布中打开'}
+                {drift && (
+                  <span aria-hidden className="absolute -right-1 -top-1 h-2 w-2 rounded-full border-2"
+                        style={{ background: 'var(--st-waiting)', borderColor: 'var(--bg)' }} />
+                )}
               </Link>
             )}
             {code === 'succeeded' && run.run_class !== 'formal' && (
@@ -386,6 +556,32 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                 {busy === 'extract' ? <Spinner size={11} /> : <GitFork size={11} aria-hidden />} 提取模板
               </button>
             )}
+            <MoreMenu items={menu} />
+          </div>
+        </div>
+        <Telemetry run={run} trace={d.trace} phase={phase} code={code} streaming={d.streaming}
+                   pending={d.pending} labelOf={labelOf} cancelled={lastOf(d.events, 'run.cancelled')?.data} />
+        <ProvenanceBar run={run} eventCount={d.events.length} phase={phase} />
+        {explain && (
+          <FailedBanner explain={explain} nodeId={failedNode} nodeLabel={labelOf(failedNode)}
+                        canvasHref={hrefFor(failedNode)}
+                        onShowInTrace={failedNode && goneFromCanvas(failedNode) ? () => showInTrace(failedNode) : undefined}
+                        onContinue={() => void carryOn()}
+                        onRerun={(field) => void rerun(field)} busy={busy === 'continue' || busy === 'rerun'} />
+        )}
+        {(code === 'held' || code === 'suspended') && (
+          <HeldBanner reason={run.error} onContinue={() => void carryOn()} onAbandon={() => void abandon()}
+                      busy={busy === 'continue' || busy === 'abandon'} />
+        )}
+        {code === 'waiting' && !!d.pending?.length && (
+          <WaitingBanner approvals={d.pending} labelOf={labelOf} onJump={jumpToApproval}
+                         onAbandon={() => void abandon()} busy={busy === 'abandon'} now={now} />
+        )}
+        {feedback && <FeedbackStrip feedback={feedback} onDismiss={() => setFeedback(null)} />}
+        <div className="flex items-center border-t pr-2">
+          <RunTabs tabs={viewTabs} active={view} onChange={setView} label="运行详情视图" idPrefix="run-view"
+                   className="min-w-0 flex-1" />
+          {view === 'stream' && (
             <IconButton
               label={raw ? '回到可读视图' : `看原始事件（${d.events.length} 条）`}
               aria-pressed={raw}
@@ -394,39 +590,41 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               icon={<Code2 size={13} aria-hidden />}
               data-action="raw"
             />
-            <MoreMenu items={menu} />
-          </div>
+          )}
         </div>
-        <Telemetry run={run} trace={d.trace} phase={phase} code={code} streaming={d.streaming}
-                   pending={d.pending} labelOf={labelOf} />
-        <ProvenanceBar run={run} eventCount={d.events.length} phase={phase} />
-        {explain && (
-          <FailedBanner explain={explain} nodeId={failedNode} nodeLabel={labelOf(failedNode)}
-                        canvasHref={canvasHref} onContinue={() => void carryOn()}
-                        onRerun={(field) => void rerun(field)} busy={busy === 'continue' || busy === 'rerun'} />
-        )}
-        {(code === 'held' || code === 'suspended') && (
-          <HeldBanner reason={run.error} onContinue={() => void carryOn()} busy={busy === 'continue'} />
-        )}
-        {code === 'waiting' && !!d.pending?.length && (
-          <WaitingBanner approvals={d.pending} labelOf={labelOf} onJump={jumpToApproval} now={now} />
-        )}
-        {feedback && <FeedbackStrip feedback={feedback} onDismiss={() => setFeedback(null)} />}
       </header>
 
-      <div ref={streamBox} className="min-h-0 flex-1">
-        {raw
-          ? <RawEvents events={d.events} />
-          : (
-            // 回看历史停在摘要（第一处失败、审批卡或顶部），在跑的才贴着最新处
-            <AssistantStream
-              key={run.id}
-              turns={[turn]}
-              approvalsFor={() => cards}
-              landing={live ? 'end' : 'summary'}
-              clockSkewMs={d.trace.skewMs ?? 0}
-            />
-          )}
+      {/* 时间线一直挂着（换视图回来还停在原来的位置，也不重新解码），不在看时只是
+          不可见、不可聚焦；航迹和工件用到才挂 */}
+      <div className="relative min-h-0 flex-1" role="tabpanel" id="run-view-panel" aria-labelledby={`run-view-tab-${view}`}>
+        <div ref={streamBox} className={clsx('absolute inset-0', view !== 'stream' && 'invisible')}
+             inert={view !== 'stream'} data-view-pane="stream">
+          {raw
+            ? <RawEvents events={d.events} />
+            : (
+              // 回看历史停在摘要（第一处失败、审批卡或顶部），在跑的才贴着最新处
+              <AssistantStream
+                key={run.id}
+                turns={[turn]}
+                approvalsFor={() => cards}
+                landing={live ? 'end' : 'summary'}
+                clockSkewMs={d.trace.skewMs ?? 0}
+              />
+            )}
+        </div>
+        {view === 'trace' && (
+          <div className="absolute inset-0" data-view-pane="trace">
+            <TracePane run={run} events={d.events} trace={d.trace} graph={d.graph} code={code}
+                       replayAt={replayAt} onReplayAt={setReplayAt} selected={traceSelected} onSelect={pickTraceNode}
+                       labelOf={labelOf} nodeHref={hrefFor} goneFromCanvas={goneFromCanvas} onRevealStep={revealStep} />
+          </div>
+        )}
+        {view === 'artifacts' && (
+          <div className="absolute inset-0" data-view-pane="artifacts">
+            <ArtifactsPane list={artifacts} graph={d.graph} trace={d.trace} labelOf={labelOf}
+                           onMoment={t0 != null ? showMoment : undefined} />
+          </div>
+        )}
       </div>
 
       <footer className="flex shrink-0 items-center gap-3 border-t px-4 py-1.5 text-2xs text-faint">
@@ -441,6 +639,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       </footer>
     </div>
   )
+}
+
+/** 本机填的署名：随 X-Actor 发给后端，写进审批和取消的留痕 */
+function localActor(): string {
+  try { return (localStorage.getItem('agentlab_actor') ?? '').trim() } catch { return '' }
 }
 
 /** 事件之外的事实（查到的状态、有没有审批）和事件推出的相位合成一个显示码 */

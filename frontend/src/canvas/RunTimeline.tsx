@@ -7,8 +7,8 @@ import { formatClock, formatDuration, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import { topology, type GraphLike } from '../run/derive'
 import {
-  isActivePhase, isTerminal, liveAt, project, type NodeState, type NodeTrace, type Projection, type Segment,
-  type Trace,
+  isActivePhase, isTerminal, lastEventAt, liveAt, project, type NodeState, type NodeTrace, type Projection,
+  type Segment, type Trace,
 } from '../run/trace'
 import { projectCached } from '../run/useNodeView'
 import { useRunClock } from '../run/useRunClock'
@@ -277,8 +277,11 @@ function measuredOf(n: NodeTrace | undefined, at: number): number | undefined {
   return runs.length === 1 && runs[0].end != null && runs[0].end <= at ? n.lastDurationMs : undefined
 }
 
-/** 一条泳道右侧的摘要：执行了几次、一共多久、等了多久、用了多少 token */
-function summarize(n: NodeTrace | undefined, state: NodeState, at: number): string {
+/**
+ * 一条泳道右侧的摘要：执行了几次、一共多久、等了多久、用了多少 token。
+ * tokens 回放时是游标那一刻的读数（投影给的），实时是累计
+ */
+function summarize(n: NodeTrace | undefined, state: NodeState, at: number, tokens?: number): string {
   if (!n || state === 'idle' || state === 'queued') return state === 'queued' ? '排队' : NONE
   if (state === 'blocked') return '阻断'
   if (state === 'unreached') return '未到达'
@@ -296,7 +299,7 @@ function summarize(n: NodeTrace | undefined, state: NodeState, at: number): stri
   const measured = measuredOf(n, at)
   if (run > 0 || state === 'done') parts.push(formatDuration(measured ?? (run || n.lastDurationMs)))
   if (wait > 0) parts.push(`等 ${formatClock(wait).replace(/\.\d$/, '')}`)
-  const tok = n.tokensIn + n.tokensOut
+  const tok = tokens ?? n.tokensIn + n.tokensOut
   if (tok > 0 && parts.length < 3) parts.push(formatTokens(tok, { compact: true }))
   return parts.join(' · ') || NONE
 }
@@ -312,13 +315,15 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
   for (const id of ids) {
     const n = trace.nodes[id]
     // 回放时状态取游标那一刻的投影：摘要和泳道底色要和画布上的卡片一致
-    const state: NodeState = states ? states[id]?.state ?? 'idle' : n?.state ?? 'idle'
+    const p = states?.[id]
+    const state: NodeState = states ? p?.state ?? 'idle' : n?.state ?? 'idle'
     const type = nodeTypeOf(byId.get(id))
     const label = labels.get(id) ?? id
     rows.push({
       key: id, kind: 'node', nodeId: id, label, type,
       segs: (n?.segments ?? []).filter((s) => s.kind === 'run' || s.kind === 'wait' || s.kind === 'retry'),
-      state, count: n?.count ?? 0, summary: summarize(n, state, at), measuredMs: measuredOf(n, at),
+      state, count: n?.count ?? 0, measuredMs: measuredOf(n, at),
+      summary: summarize(n, state, at, states ? (p?.tokensIn ?? 0) + (p?.tokensOut ?? 0) : undefined),
       note: state === 'blocked' ? (failedLabel ? `阻断：上游「${failedLabel}」失败` : '阻断：上游失败')
         : state === 'unreached' ? '未到达' : undefined,
       name: label, top, height: ROW_H,
@@ -381,11 +386,11 @@ export function lastStampOf(trace: Trace, stamps: number[] = stampsOf(trace)): n
 
 /**
  * 停下的运行此刻的样子。project 在「不早于最后一条事件」时读节点的当前状态（含推导出的
- * 阻断、未到达）和后端给的权威时长，早于它就按段重建、这两样都丢了。最后一条事件的时刻
- * 只记在内部簿记里，所以有 endedAt 时取一个一定不早于它的时刻；结束时刻照样按 endedAt 算
+ * 阻断、未到达）和后端给的权威时长，早于它就按段重建、这两样都丢了。所以按最后一条事件
+ * 的时刻投影；结束时刻照样按 endedAt 算
  */
 export function projectSettled(trace: Trace): Projection {
-  return project(trace, trace.endedAt != null ? Number.MAX_SAFE_INTEGER : lastStampOf(trace))
+  return project(trace, lastEventAt(trace))
 }
 
 /**

@@ -1,5 +1,5 @@
-// 几道"坏了就是整页事故"的护栏：输入法回车、未知节点类型、页面级错误边界、
-// 全局快捷键不抢输入框、未知地址不是白板。
+// 几道"坏了就是整页事故"的护栏：输入法回车、未知节点类型、页面级和外壳级的
+// 错误边界、全局快捷键不抢输入框、未知地址不是白板。
 //
 // 出事时的样子都很重：中文用户每选一个词就把半句话发去建图、跑图；
 // Copilot 编出一个不存在的节点类型，整站白屏、没保存的编辑一起丢；任何组件渲染
@@ -89,6 +89,20 @@ await page.getByText('问数据', { exact: true }).first().click()
 await page.waitForURL(/\/chat/)
 check('换一页就恢复', await page.getByText('这一页出错了').waitFor({ state: 'detached', timeout: 8000 })
   .then(() => true, () => false))
+
+console.log('\n=== 外壳自己出错：落在中文错误页，不是路由库的英文报错页 ===')
+// 导航、后台信号不在页面那一层错误边界里。路由换成 data router 之后，它们一出错，
+// 没人接的话 react-router 会画它自带的「Unexpected Application Error!」和一屏堆栈。
+// 导航上的「有运行在跑」要读画布的 trace：跑着却没有 trace，导航渲染就会抛
+await page.evaluate(() => {
+  window.__savedTrace = window.__studio.getState().trace
+  window.__studio.setState({ runPhase: 'running', trace: null })
+})
+check('给出中文的错误页', await shows('这一页出错了'))
+check('不是 react-router 的英文报错页', !(await page.locator('body').innerText()).includes('Unexpected Application Error'))
+await page.evaluate(() => window.__studio.setState({ runPhase: 'idle', trace: window.__savedTrace }))
+await page.getByRole('button', { name: '重试' }).first().click()
+check('点「重试」外壳就回来', await page.locator('nav[aria-label="主导航"]').waitFor({ timeout: 8000 }).then(() => true, () => false))
 
 console.log('\n=== 全局快捷键：不抢输入框 ===')
 // 外壳在 window 的捕获阶段听键盘，比谁都先拿到。判错一次，问题框里打个问号就

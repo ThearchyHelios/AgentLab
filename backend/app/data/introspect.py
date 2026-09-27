@@ -279,17 +279,43 @@ def _detailed_summary(source: Any, *, max_tables: int = 40) -> str:
     return "\n".join(lines)
 
 
-def describe_table(source: Any, table: str) -> str:
-    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。"""
-    cache = source.schema_cache or {}
-    tables = cache.get("tables") or {}
-    # 模型可能传全名（ANALYTICS.V_TRIP_FACT），也可能只传表名，两种都认
+def find_table(source: Any, table: str) -> dict[str, Any] | None:
+    """在缓存里找一张表。全名、只有表名、大小写不一致都认——模型和人都可能这么写。"""
+    tables = (source.schema_cache or {}).get("tables") or {}
     meta = tables.get(table)
     if meta is None and "." in table:
         meta = tables.get(table.rsplit(".", 1)[-1])
     if meta is None:
         lowered = table.rsplit(".", 1)[-1].lower()
         meta = next((m for n, m in tables.items() if n.lower() == lowered), None)
+    return meta or None
+
+
+def table_columns(meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """结构化的列：{name, type, pk, not_null, comment}。
+
+    界面要画表格，以前只能去解析 describe_table 那段给模型看的文本，文本格式
+    一改就全乱。两份出自同一份缓存，说法一致。
+    """
+    pk = set(meta.get("primary_key") or [])
+    return [
+        {
+            "name": col["name"],
+            "type": col.get("type") or "",
+            "pk": col["name"] in pk,
+            "not_null": not col.get("nullable", True),
+            "comment": col.get("comment") or None,
+        }
+        for col in meta.get("columns") or []
+    ]
+
+
+def describe_table(source: Any, table: str) -> str:
+    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。"""
+    cache = source.schema_cache or {}
+    tables = cache.get("tables") or {}
+    # 模型可能传全名（ANALYTICS.V_TRIP_FACT），也可能只传表名，两种都认
+    meta = find_table(source, table)
     if not meta:
         if not tables:
             # 缓存是空的，说"里面没有这张表"就是在误导——真相是我们什么都不知道。

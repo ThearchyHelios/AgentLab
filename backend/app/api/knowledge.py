@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import explain, raw
+from app.core.errors import explain, raw
 from app.core.config import settings
 from app.db.base import get_session
 from app.db.models import Document, MemoryItem, Skill
@@ -433,20 +433,129 @@ async def probe_embedding(base_url: str) -> dict[str, Any]:
     return {"base_url": base_url, "models": models}
 
 
+class _ReindexJob:
+    """一次重建索引。进度按批更新：kb / store 每提交一批回调一次，不插值。"""
+
+    def __init__(self, collection: str | None, chunks: int, memories: int) -> None:
+        from app.db.base import new_id, utcnow
+
+        self.id = new_id()
+        self.collection = collection
+        self.state = "running"          # running | done | failed
+        # chunks → index（倒排重建，没有分批进度）→ memories → done
+        self.phase = "chunks"
+        self.chunks = {"total": chunks, "done": 0}
+        self.memories = {"total": memories, "done": 0}
+        self.started_at = utcnow()
+        self.finished_at: Any = None
+        self.error: str | None = None
+        self.hint: str | None = None
+        self.result: dict[str, Any] | None = None
+
+    def chunk_step(self, done: int, total: int) -> None:
+        self.chunks = {"total": total, "done": done}
+        if done >= total:
+            self.phase = "index"
+
+    def memory_step(self, done: int, total: int) -> None:
+        self.memories = {"total": total, "done": done}
+
+    def view(self) -> dict[str, Any]:
+        return {
+            "id": self.id, "state": self.state, "phase": self.phase,
+            "collection": self.collection,
+            "total": self.chunks["total"] + self.memories["total"],
+            "done": self.chunks["done"] + self.memories["done"],
+            "chunks": dict(self.chunks), "memories": dict(self.memories),
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "error": self.error, "hint": self.hint, "result": self.result,
+        }
+
+
+#: 最近一次重建。只在进程里记：重建是幂等的，服务重启丢了进度，再点一次就是
+_REINDEX: _ReindexJob | None = None
+#: 后台任务要有人拿着引用，否则跑到一半可能被回收
+_REINDEX_TASK: Any = None
+
+
+def reindex_job() -> _ReindexJob | None:
+    return _REINDEX
+
+
+async def _run_reindex(job: _ReindexJob) -> None:
+    from app.db.base import SessionLocal, utcnow
+
+    try:
+        async with SessionLocal() as session:
+            out = await kb.reindex(session, job.collection, on_progress=job.chunk_step)
+            job.phase = "memories"
+            # 记忆不按 collection 分，重建就是全量
+            out["memories_reindexed"] = await store.reindex(session, on_progress=job.memory_step)
+        job.result, job.state, job.phase = out, "done", "done"
+    except Exception as e:  # noqa: BLE001 - 失败要落到任务状态上，不能只进日志
+        logger.warning("重建索引失败：%s", raw(e))
+        reason, hint = explain(e)
+        job.state, job.error, job.hint = "failed", f"重建索引没做完：{reason}", hint or None
+    finally:
+        job.finished_at = utcnow()
+
+
 @kb_router.post("/reindex")
 async def reindex(
-    collection: str | None = None, session: AsyncSession = Depends(get_session)
-) -> dict[str, Any]:
+    collection: str | None = None,
+    background: bool = Query(default=False, description="后台跑，立刻返回任务；进度用 GET /kb/reindex 查"),
+    session: AsyncSession = Depends(get_session),
+):
     """用当前 embedder 重算向量。换了模型之后唯一的恢复手段。
 
     知识库和长期记忆一起重建：它们共用一个 embedder，换模型时一起失效。
     分成两个按钮的结果是点了一个、以为好了，另一个还在悄悄退回关键词——
     真踩过，记忆那边连个提示都没有。
+
+    几千段配远端 embedding 要好几分钟，压在请求里界面只能干转圈。background=true
+    时立刻返回 202 和任务，按批更新进度；不带它仍然等做完再返回，老调用方不受影响。
+    同一时间只跑一个：两次重建交错写同一批向量，谁最后写赢都说不清。
     """
-    out = await kb.reindex(session, collection)
-    # 记忆不按 collection 分，重建就是全量
-    out["memories_reindexed"] = await store.reindex(session)
-    return out
+    global _REINDEX, _REINDEX_TASK
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+    from sqlalchemy import func
+
+    from app.db.models import Chunk
+
+    count = select(func.count(Chunk.id))
+    if collection:
+        count = count.where(Chunk.collection == collection)
+    chunks = int((await session.execute(count)).scalar_one() or 0)
+    memories = int((await session.execute(select(func.count(MemoryItem.id)))).scalar_one() or 0)
+    # 先数完再查「有没有在跑」，查和占位之间不能有 await：以前先查后数，两个同时
+    # 到的请求都在计数那里让出去，回来都以为没在跑，于是两个都起了
+    if _REINDEX is not None and _REINDEX.state == "running":
+        running = _REINDEX.view()
+        raise HTTPException(
+            409, f"已经在重建索引了（{_REINDEX.collection or '全部集合'}，"
+                 f"已完成 {running['done']}/{running['total']}），等它做完再点",
+        )
+    job = _REINDEX = _ReindexJob(collection, chunks, memories)
+    if background:
+        _REINDEX_TASK = asyncio.create_task(_run_reindex(job))
+        return JSONResponse(job.view(), status_code=202)
+
+    await _run_reindex(job)
+    if job.state == "failed":
+        raise HTTPException(502, job.error + (f"。{job.hint}" if job.hint else ""))
+    return job.result
+
+
+@kb_router.get("/reindex")
+async def reindex_status() -> dict[str, Any]:
+    """最近一次重建的进度：{state, phase, total, done, chunks, memories, result, error…}。
+
+    还没重建过返回 {state: "idle"}。
+    """
+    return _REINDEX.view() if _REINDEX is not None else {"state": "idle"}
 
 
 #: 单段返回多少字。切块本来就在千字量级，详情页是给人扫一眼"切得对不对"的，

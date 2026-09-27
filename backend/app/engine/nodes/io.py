@@ -78,6 +78,8 @@ def _apply_contract(
     # 没有它，一个写错的节点名会让所有列表都是空的，看起来和"全部通过"一模一样。
     gaps: list[str] = []
     unresolved: list[str] = []
+    #: 指标 id → 它来自哪张口径卡（「销售口径 @ v2」），逐个数字回指时标出处
+    caliber_of: dict[str, str] = {}
     for source in sources:
         payload = nodes.get(source)
         if isinstance(payload, dict) and payload.get("kind") == "metric_set":
@@ -89,6 +91,9 @@ def _apply_contract(
                     "version": payload.get("caliber_version", ""),
                 }
             )
+            label = " @ ".join(str(v) for v in (payload.get("caliber"), payload.get("caliber_version")) if v)
+            for m in payload.get("metrics") or []:
+                caliber_of.setdefault(str(m.get("id")), label)
         else:
             # 节点不存在、还没跑到、或者根本不是口径卡——指标集就是缺的，
             # 不能当作"这次没有指标要查"
@@ -121,6 +126,14 @@ def _apply_contract(
     if sources and not metrics:
         gaps.append("指标集为空，叙述里的数字无从回指")
 
+    # 上游有协作团队用完轮数、按降档交付的：叙述里的话不是调度者认可的结论，
+    # 数字全都对得上也不能盖「完整出具」
+    titles = {n.id: n.title for n in ctx.run.spec.nodes}
+    for node_id, payload in nodes.items():
+        if isinstance(payload, dict) and payload.get("exhausted"):
+            gaps.append(f"协作团队「{titles.get(node_id, node_id)}」用完 {payload.get('rounds', '?')} "
+                        "轮仍未完成，交来的是成员最后的原话")
+
     tier = decide_tier(
         missing_required=missing_required,
         missing_expected=missing_expected,
@@ -129,6 +142,11 @@ def _apply_contract(
         gaps=gaps,
     )
 
+    # 逐个数字的出处。以前只有一个计数，界面标不出「这个数来自哪个指标」
+    matched = [
+        {**hit, **({"caliber": caliber_of[hit["metric"]]} if caliber_of.get(hit.get("metric")) else {})}
+        for hit in (trace.matched if trace else [])
+    ][:50]
     issuance = {
         "tier": tier,
         "calibers": calibers,  # 口径版本照常印
@@ -137,6 +155,7 @@ def _apply_contract(
         "missing_expected": missing_expected,  # 缺数据声明照常印
         "unmatched_numbers": unmatched[:20],
         "matched_numbers": len(trace.matched) if trace else 0,
+        "matched": matched,
         # 校验没跑全的原因照实印出来——读的人要能分辨"查过都对"和"根本没查"
         "gaps": gaps,
         "declared_at": datetime.now(timezone.utc).isoformat(),
@@ -153,6 +172,7 @@ def _apply_contract(
         gaps=gaps,
         metrics_checked=len(metrics),
         matched_numbers=len(trace.matched) if trace else 0,
+        matched=matched,
     )
     return issuance
 

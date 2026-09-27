@@ -43,6 +43,12 @@ export interface Segment {
   resumed?: boolean
 }
 
+/**
+ * 用量刻度：这一刻为止的累计 [时刻, 输入 tokens, 输出 tokens, 成本, 工具调用次数, 在跑的工具数]。
+ * 只在数变了的时候记一条（llm.end、tool.start、tool.end / tool.error）
+ */
+export type UsageMark = [at: number, tokensIn: number, tokensOut: number, costUsd: number, tools: number, toolsRunning: number]
+
 export interface NodeTrace {
   id: string
   state: NodeState
@@ -74,6 +80,8 @@ export interface NodeTrace {
   taken?: string[]
   /** 分支命中的理由 */
   reason?: string
+  /** 用量随时间的累计，回放时按游标取那一刻的 tokens 和工具数。没调过模型和工具的节点没有 */
+  marks?: UsageMark[]
 }
 
 export interface Trace {
@@ -103,6 +111,11 @@ export interface Trace {
   lastSeq: number
   /** [时刻, 此刻同时在跑的数量]，只在数量变化时记一条 */
   parallelSeries: [number, number][]
+  /**
+   * [时刻, 输入 tokens, 输出 tokens, 成本]：各次 llm.end 累加到这一刻的整次运行用量。
+   * run.finished 用后端累计校正 tokensIn 等总数时不记在这里——那不是某一刻的读数
+   */
+  usageSeries: [number, number, number, number][]
 
   /** false = 老数据没有 ts：段按顺序排、宽度只来自 duration_ms，墙钟和等人时长不可知 */
   timed: boolean
@@ -155,7 +168,29 @@ export interface Projection {
   nodesDone: number
   nodesTotal: number
   parallelNow: number
-  nodes: Record<string, { state: NodeState; elapsedMs?: number; count: number; iteration?: number }>
+  /**
+   * 这一刻为止的整次运行用量。回放时如果各次 llm.end 加起来对不上后端的总数（老
+   * 后端的 agent / 协作调用不发 llm.end），那一刻的读数不可信，给 undefined，不拿
+   * 终值冒充
+   */
+  tokensIn?: number
+  tokensOut?: number
+  costUsd?: number
+  nodes: Record<string, ProjectedNode>
+}
+
+export interface ProjectedNode {
+  state: NodeState
+  elapsedMs?: number
+  count: number
+  iteration?: number
+  /** 这一刻为止这个节点的用量和工具调用次数（实时就是当前值） */
+  tokensIn: number
+  tokensOut: number
+  costUsd: number
+  tools: number
+  /** 这一刻正在跑的工具数。节点不在跑时是 0 */
+  toolsRunning: number
 }
 
 // 流式增量：后端不落库，刷新后也不会回来。航迹不能建立在它们之上
@@ -194,10 +229,17 @@ export function runStatusOf(phase: RunPhase): RunStatus | null {
  */
 export const liveAt = (t: Trace, now: number): number => now - (t.skewMs ?? 0)
 
+/**
+ * 最后一条事件的时刻（毫秒；没有 ts 的老数据是按时长推出来的虚拟时钟）。
+ * project(t, lastEventAt(t)) 就是「此刻的样子」：节点的当前状态（含推导出的阻断、
+ * 未到达）和后端给的权威时长都在，而不是按段重建的回放
+ */
+export const lastEventAt = (t: Trace): number => t.book.clock
+
 export function emptyTrace(): Trace {
   return {
     phase: 'idle', waitMs: 0, nodes: {}, tokensIn: 0, tokensOut: 0, costUsd: 0,
-    lastSeq: 0, parallelSeries: [], timed: true, drives: [], waits: [], phases: [],
+    lastSeq: 0, parallelSeries: [], usageSeries: [], timed: true, drives: [], waits: [], phases: [],
     lastReplay: false,
     book: { clock: 0, awaiting: false, dispatchFrom: {}, exactDispatch: {}, asking: {} },
   }
@@ -390,6 +432,10 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
     const last = next.drives[next.drives.length - 1]
     if (!last || last[1] != null) next.drives = [...next.drives, [dr.at, null]]
   }
+  /** 节点的用量、工具数变了：记一条刻度，回放才知道那一刻是多少 */
+  const mark = (n: NodeTrace) => {
+    n.marks = [...(n.marks ?? []), [at, n.tokensIn, n.tokensOut, n.costUsd, n.tools, n.toolsRunning]]
+  }
   /** 续跑、恢复之后：上一回合的失败、推出来的"被阻断 / 没走到"都不再成立 */
   const reopen = () => {
     next.endedAt = undefined
@@ -479,7 +525,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
         n.endedAt = undefined
         n.lastDurationMs = undefined
         n.error = undefined
-        n.toolsRunning = 0
+        if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
         if (num(d.iteration) != null) n.iteration = num(d.iteration)
         book().dispatchFrom[nodeId] = at
       }
@@ -546,7 +592,8 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (!tsOk) at = dr.at = Math.max(at, end)
       n.endedAt = end
       n.lastDurationMs = ms ?? (open >= 0 ? Math.max(0, end - n.segments[open].start) : undefined)
-      n.toolsRunning = 0
+      // 漏了 tool.end 的工具随节点一起收掉；记一条刻度，下一轮回放时不带着上一轮的「在跑」
+      if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
       n.looping = looping
       n.state = failed ? 'failed' : looping ? 'running' : 'done'
       if (failed) {
@@ -602,12 +649,17 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
         const n = node(nodeId)
         n.tools += 1
         n.toolsRunning += 1
+        mark(n)
       }
       break
 
     case 'tool.end':
     case 'tool.error':
-      if (nodeId && next.nodes[nodeId]?.toolsRunning) node(nodeId).toolsRunning -= 1
+      if (nodeId && next.nodes[nodeId]?.toolsRunning) {
+        const n = node(nodeId)
+        n.toolsRunning -= 1
+        mark(n)
+      }
       break
 
     case 'llm.start':
@@ -621,12 +673,14 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       next.tokensIn += inTok
       next.tokensOut += outTok
       next.costUsd += cost
+      next.usageSeries = [...next.usageSeries, [at, next.tokensIn, next.tokensOut, next.costUsd]]
       if (nodeId) {
         const n = node(nodeId)
         n.tokensIn += inTok
         n.tokensOut += outTok
         n.costUsd += cost
         if (d.model) n.model = String(d.model)
+        mark(n)
       }
       break
     }
@@ -849,6 +903,19 @@ function phaseAt(t: Trace, at: number): RunPhase {
 const clipped = (spans: [number, number | null][], at: number): number =>
   spans.reduce((acc, [s, e]) => (s > at ? acc : acc + Math.max(0, Math.min(e ?? at, at) - s)), 0)
 
+/** 按时刻排好的序列里，不晚于 at 的最后一条 */
+function lastAt<T extends [number, ...unknown[]]>(series: T[] | undefined, at: number): T | undefined {
+  if (!series?.length || series[0][0] > at) return undefined
+  let lo = 0
+  let hi = series.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (series[mid][0] <= at) lo = mid
+    else hi = mid - 1
+  }
+  return series[lo]
+}
+
 /**
  * 把航迹投影到某一刻：实时时 at 取 liveAt(trace, now)，回放时取游标。
  *
@@ -870,7 +937,7 @@ export function project(t: Trace, at: number): Projection {
   const nodes: Projection['nodes'] = {}
   let nodesDone = 0
   for (const n of Object.values(t.nodes)) {
-    let view: Projection['nodes'][string]
+    let view: ProjectedNode
     if (live) {
       const open = n.segments[openIndex(n.segments, 'run')]
       view = {
@@ -880,6 +947,8 @@ export function project(t: Trace, at: number): Projection {
         ...(open && n.state === 'running'
           ? { elapsedMs: Math.max(0, (t.timed ? at : t.book.clock) - open.start) }
           : n.lastDurationMs != null ? { elapsedMs: n.lastDurationMs } : {}),
+        tokensIn: n.tokensIn, tokensOut: n.tokensOut, costUsd: n.costUsd, tools: n.tools,
+        toolsRunning: n.state === 'running' ? n.toolsRunning : 0,
       }
     } else {
       let state: NodeState = 'idle'
@@ -903,8 +972,17 @@ export function project(t: Trace, at: number): Projection {
           elapsedMs = s.end - s.start
         }
       }
-      view = { state, count, ...(iteration != null ? { iteration } : {}),
-               ...(elapsedMs != null ? { elapsedMs } : {}) }
+      // 没有刻度 = 到这一刻为止没有过 llm.end / tool.start，就是 0
+      const m = lastAt(n.marks, at)
+      view = {
+        state, count, ...(iteration != null ? { iteration } : {}),
+        ...(elapsedMs != null ? { elapsedMs } : {}),
+        tokensIn: m?.[1] ?? 0,
+        tokensOut: m?.[2] ?? 0,
+        costUsd: m?.[3] ?? 0,
+        tools: m?.[4] ?? 0,
+        toolsRunning: state === 'running' ? m?.[5] ?? 0 : 0,
+      }
     }
     if (view.state === 'done' || view.state === 'skipped') nodesDone += 1
     nodes[n.id] = view
@@ -918,9 +996,22 @@ export function project(t: Trace, at: number): Projection {
     }
   }
 
+  // 整次运行的用量：实时读总数（终态时已按后端校正）；回放读刻度，但刻度加起来得
+  // 对得上总数才算数
+  let usage: Pick<Projection, 'tokensIn' | 'tokensOut' | 'costUsd'> = {}
+  if (live) {
+    usage = { tokensIn: t.tokensIn, tokensOut: t.tokensOut, costUsd: t.costUsd }
+  } else {
+    const final = t.usageSeries[t.usageSeries.length - 1]
+    const complete = final ? final[1] === t.tokensIn && final[2] === t.tokensOut
+      : t.tokensIn === 0 && t.tokensOut === 0
+    const u = complete ? lastAt(t.usageSeries, at) : undefined
+    if (complete) usage = { tokensIn: u?.[1] ?? 0, tokensOut: u?.[2] ?? 0, costUsd: u?.[3] ?? 0 }
+  }
+
   return {
     phase, elapsedMs, activeMs, waitMs, nodesDone,
     nodesTotal: t.nodesTotal ?? Object.keys(t.nodes).length,
-    parallelNow, nodes,
+    parallelNow, ...usage, nodes,
   }
 }

@@ -96,7 +96,7 @@ async def rerank(
         return hits[:top_n]
     except Exception as e:  # noqa: BLE001
         if on_note:
-            from app.api.errors import explain
+            from app.core.errors import explain
 
             on_note(f"重排失败，按初筛顺序返回：{explain(e)[0]}")
         return hits[:top_n]

@@ -82,6 +82,8 @@ async function open({ theme = 'dark', state }) {
     if (state.offline) return route.abort('connectionrefused')
     // 后端连得上但不回：/health 照常，其余请求一直挂着
     if (state.hang && url.pathname !== '/api/health') return
+    // 只卡一张表：别的照常回
+    if (state.hangPath === url.pathname) return
     if (r.method() !== 'GET') {
       state.writes.push({ method: r.method(), path: url.pathname, body: r.postData() })
       return route.fulfill({ json: {} })
@@ -98,11 +100,19 @@ async function open({ theme = 'dark', state }) {
 const nav = (page) => page.locator('nav[aria-label="主导航"]')
 const waitNav = (page) => nav(page).waitFor({ timeout: 15000 })
 const isMac = process.platform === 'darwin'
+// 只跑其中几段：CHECK_ONLY=离开前确认,启动页 node scripts/check-shell.mjs（按段名包含匹配）
+const ONLY = process.env.CHECK_ONLY?.split(',').map((s) => s.trim()).filter(Boolean)
+const want = (name) => !ONLY?.length || ONLY.some((k) => name.includes(k))
+/** 这一段要跑就打出段标题、返回 true */
+const section = (name, title) => {
+  if (!want(name)) return false
+  console.log(title)
+  return true
+}
 const MOD = isMac ? 'Meta' : 'Control'
 
 // ---------------------------------------------------------------------------
-console.log('=== 导航 ===')
-{
+if (section('导航', '=== 导航 ===')) {
   const state = { approvals: PENDING, offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
@@ -187,8 +197,7 @@ console.log('=== 导航 ===')
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 待审批徽标 ===')
-for (const theme of ['dark', 'light']) {
+if (section('待审批徽标', '\n=== 待审批徽标 ===')) for (const theme of ['dark', 'light']) {
   const state = { approvals: PENDING, offline: false, writes: [] }
   const { ctx, page } = await open({ theme, state })
   await page.goto(`${WEB}/chat`)
@@ -225,8 +234,7 @@ for (const theme of ['dark', 'light']) {
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 404 ===')
-{
+if (section('404', '\n=== 404 ===')) {
   const state = { approvals: [], offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/does-not-exist/at-all`)
@@ -244,8 +252,7 @@ console.log('\n=== 404 ===')
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 标签页标题、favicon、后台提醒 ===')
-{
+if (section('标签页标题', '\n=== 标签页标题、favicon、后台提醒 ===')) {
   const state = { approvals: [], offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/runs`)
@@ -331,8 +338,7 @@ console.log('\n=== 标签页标题、favicon、后台提醒 ===')
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== ⌘K 命令面板 ===')
-{
+if (section('⌘K 命令面板', '\n=== ⌘K 命令面板 ===')) {
   const state = { approvals: PENDING, offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/runs`)
@@ -374,6 +380,22 @@ console.log('\n=== ⌘K 命令面板 ===')
     check('点工作流进它的画布', await page.waitForURL(new RegExp(`/studio/${wf.id}`), { timeout: 5000 }).then(() => true, () => false), page.url())
   }
 
+  // 页面刚挂载时的自动聚焦（比如画布助手的输入框）会把焦点从开着的面板里抢走，
+  // 之后打的字、按的 Esc 就都落到了面板底下
+  await page.keyboard.press(`${MOD}+KeyK`)
+  await dialog.waitFor({ timeout: 3000 })
+  const stolen = await page.evaluate(() => {
+    const el = document.querySelector('main textarea') ?? document.querySelector('main input, main button, nav a')
+    el?.focus()
+    return el?.tagName ?? null
+  })
+  check('面板开着时焦点被页面抢走，会回到搜索框', await dialog.getByRole('combobox').evaluate((el) => el === document.activeElement),
+    `${stolen} → ${await page.evaluate(() => document.activeElement?.tagName)}`)
+  await page.keyboard.press('Escape')
+  check('……Esc 照样关掉面板', await dialog.waitFor({ state: 'detached', timeout: 3000 }).then(() => true, () => false))
+  // 上面没过时面板还开着：⌘K 再按一下把它收掉，后面几项照常跑
+  if (await dialog.count()) await page.keyboard.press(`${MOD}+KeyK`)
+
   await page.keyboard.press(`${MOD}+KeyK`)
   await dialog.getByRole('combobox').fill('zzqq没有这个东西')
   check('没结果时说清楚', (await dialog.innerText()).includes('没有匹配'))
@@ -403,8 +425,7 @@ console.log('\n=== ⌘K 命令面板 ===')
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== ? 快捷键说明 ===')
-{
+if (section('快捷键说明', '\n=== ? 快捷键说明 ===')) {
   const state = { approvals: [], offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/studio`)
@@ -428,8 +449,117 @@ console.log('\n=== ? 快捷键说明 ===')
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 离线横幅 ===')
-{
+if (section('离开前确认', '\n=== 离开前确认 ===')) {
+  // 页面有没保存的改动时登记一道守卫（lib/leave）。以前设置页只在捕获阶段拦 <a> 的
+  // 点击：⌘K、⌥ 数字直接调 navigate()，浏览器后退也不走 <a>，改到一半的表单就这么丢了。
+  // 这里用 dev 构建挂出的 window.__leave 登记一道测试守卫：每问一次记一笔，答案由脚本给
+  const state = { approvals: PENDING, offline: false, writes: [] }
+  const { ctx, page } = await open({ state })
+  await page.goto(`${WEB}/runs`)
+  await waitNav(page)
+  const hooked = await page.waitForFunction(() => !!window.__leave, null, { timeout: 5000 }).then(() => true, () => false)
+  check('dev 构建挂出了 window.__leave', hooked)
+  if (hooked) {
+    await page.evaluate(() => {
+      window.__asks = []
+      window.__answer = null
+      window.__unguard = window.__leave.register({
+        confirm: (next) => new Promise((resolve) => {
+          window.__asks.push(next ? next.pathname + next.search : null)
+          window.__answer = resolve
+        }),
+      })
+    })
+    const asks = () => page.evaluate(() => window.__asks.length)
+    const asked = (n) => page.waitForFunction((n) => window.__asks.length >= n, n, { timeout: 3000 }).then(() => true, () => false)
+    const answer = (ok) => page.evaluate((ok) => { const r = window.__answer; window.__answer = null; r?.(ok) }, ok)
+    const where = () => { const u = new URL(page.url()); return u.pathname + u.search }
+    const settle = () => page.waitForTimeout(250)
+    const dialog = page.getByRole('dialog', { name: '命令面板' })
+
+    await page.keyboard.press(`${MOD}+KeyK`)
+    await dialog.getByRole('combobox').fill('设置')
+    await page.keyboard.press('Enter')
+    check('⌘K 跳页先问守卫，问的时候地址不动', await asked(1) && where().startsWith('/runs'), `${await asks()} 次 · ${where()}`)
+    check('守卫拿得到要去哪', (await page.evaluate(() => window.__asks[0])) === '/settings', await page.evaluate(() => window.__asks[0]))
+    await answer(false)
+    await settle()
+    check('选「留下」：还在原地，面板也关了', where().startsWith('/runs') && (await dialog.count()) === 0, where())
+
+    await page.evaluate(() => document.activeElement?.blur())
+    await page.keyboard.press('Alt+Digit1')
+    check('⌥1 切页先问守卫', await asked(2) && where().startsWith('/runs'), where())
+    await answer(true)
+    check('选「离开」：去到问数据', await page.waitForURL(/\/chat/, { timeout: 5000 }).then(() => true, () => false), where())
+
+    await nav(page).locator('a[href="/data"]').click()
+    check('点左侧导航先问守卫', await asked(3))
+    await answer(false)
+    await settle()
+    check('选「留下」：地址不变', where().startsWith('/chat'), where())
+
+    await page.evaluate(() => history.back())
+    check('浏览器后退也先问守卫', await asked(4))
+    await answer(false)
+    await page.waitForTimeout(400)
+    check('选「留下」：地址退回原处', where().startsWith('/chat'), where())
+    await page.evaluate(() => history.back())
+    await asked(5)
+    await answer(true)
+    check('后退时选「离开」：真的退回去了', await page.waitForURL(/\/runs/, { timeout: 5000 }).then(() => true, () => false), where())
+
+    const before = await asks()
+    await page.locator('[data-approval-badge]').click()
+    await page.waitForURL(/tab=approvals/, { timeout: 5000 }).catch(() => {})
+    check('同一页里只换 ?tab 不问', (await asks()) === before && /\/runs\?tab=approvals/.test(where()), `${await asks() - before} 次 · ${where()}`)
+
+    // 先建东西再跳的命令：得先问，不然人点了「留下」，会话已经建出来了
+    state.writes.length = 0
+    await page.keyboard.press(`${MOD}+KeyK`)
+    await dialog.getByRole('combobox').fill('新对话')
+    await page.keyboard.press('Enter')
+    check('⌘K「新对话」先问守卫', await asked(before + 1))
+    check('……问的时候还没建会话', !state.writes.some((w) => w.method === 'POST' && w.path === '/api/conversations'),
+      state.writes.map((w) => `${w.method} ${w.path}`).join(', '))
+    await answer(false)
+    await settle()
+    check('选「留下」：不建会话、不跳', !state.writes.some((w) => w.method === 'POST' && w.path === '/api/conversations')
+      && where().startsWith('/runs'), where())
+
+    await page.keyboard.press(`${MOD}+KeyK`)
+    await dialog.getByRole('combobox').fill('新建工作流')
+    await page.keyboard.press('Enter')
+    check('⌘K「新建工作流」先问守卫，再问名字', await asked(before + 2)
+      && (await page.getByRole('dialog', { name: '新建工作流' }).count()) === 0)
+    await answer(false)
+    await settle()
+    check('选「留下」：不弹起名框', (await page.getByRole('dialog', { name: '新建工作流' }).count()) === 0 && where().startsWith('/runs'))
+
+    // 关页、刷新：守卫在时浏览器会问（它只给通用文案），撤了就不问
+    const unloadAsks = []
+    page.on('dialog', (d) => { unloadAsks.push(d.type()); void d.dismiss() })
+    await page.close({ runBeforeUnload: true })
+    await page.waitForTimeout(500)
+    check('有守卫时关页，浏览器先问', unloadAsks.includes('beforeunload') && !page.isClosed(), unloadAsks.join(',') || '没问')
+
+    await page.evaluate(() => window.__unguard())
+    const n = await asks()
+    await page.evaluate(() => document.activeElement?.blur())
+    await page.keyboard.press('Alt+Digit1')
+    check('撤掉守卫后照常切页，不再问', await page.waitForURL(/\/chat/, { timeout: 5000 }).then(() => true, () => false)
+      && (await asks()) === n, where())
+    unloadAsks.length = 0
+    await page.close({ runBeforeUnload: true })
+    // 页面这回真关了，只能在外面等
+    await new Promise((r) => setTimeout(r, 500))
+    check('撤掉守卫后关页不再问', unloadAsks.length === 0 && page.isClosed(), unloadAsks.join(','))
+  }
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await ctx.close()
+}
+
+// ---------------------------------------------------------------------------
+if (section('离线横幅', '\n=== 离线横幅 ===')) {
   const state = { approvals: [], offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
@@ -440,7 +570,11 @@ console.log('\n=== 离线横幅 ===')
   const banner = page.locator('main').getByText('后端未连接')
   check('断网后出横幅', await banner.waitFor({ timeout: 15000 }).then(() => true, () => false))
   check('横幅是主区第一个孩子（toast 才会跟着下移）',
-    await page.evaluate(() => document.querySelector('main')?.firstElementChild?.getAttribute('role') === 'alert'))
+    // role=alert 只包不变的那几句（整块重念会把倒计时也念一遍），外层认 data-offline-banner
+    await page.evaluate(() => document.querySelector('main')?.firstElementChild?.hasAttribute('data-offline-banner') === true))
+  const alertText = await page.evaluate(() => document.querySelector('[data-offline-banner] [role="alert"]')?.textContent ?? null)
+  check('横幅的播报区只有不变的那几句：倒计时不在里面', alertText != null && alertText.includes('后端未连接') && !/秒后/.test(alertText)
+    && /秒后自动重试/.test(await page.locator('[data-offline-banner]').innerText()), alertText ?? '没有 role=alert')
   check('遥测点变成离线', /离线/.test(await nav(page).locator('[data-telemetry]').innerText()))
   state.offline = false
   await page.getByRole('button', { name: '立即重试' }).first().click()
@@ -463,8 +597,7 @@ const bootLiveRegions = (page) => page.evaluate(() => {
 })
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 启动页 ===')
-for (const theme of ['dark', 'light']) {
+if (section('启动页', '\n=== 启动页 ===')) for (const theme of ['dark', 'light']) {
   const state = { approvals: [], offline: true, writes: [] }
   const { ctx, page } = await open({ theme, state })
   await page.goto(`${WEB}/chat`)
@@ -488,20 +621,27 @@ for (const theme of ['dark', 'light']) {
   await ctx.close()
 }
 
-{
+if (want('启动页')) {
   // 后端连着、只有一张表报错：照常进，但要说出来，不然那张表对应的下拉就是空的，看着像"没有"
   const state = { approvals: [], offline: false, writes: [], broken: '/api/skills' }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
   await waitNav(page)
-  const warned = await page.getByText(/有 1 项没加载成功：Skill（500）/).waitFor({ timeout: 5000 }).then(() => true, () => false)
+  const warn = page.getByText(/有 1 项没加载成功（Skill 500）/)
+  const warned = await warn.waitFor({ timeout: 5000 }).then(() => true, () => false)
   check('部分请求报错：照常进页面，并说出哪一项没加载', warned)
   const tone = await nav(page).locator('[data-telemetry]').getAttribute('data-tone')
   check('遥测点记为「降级」（琥珀），不是一片绿', tone === '降级', tone)
+  // 那张表一直是空的，提示就一直在：4 秒一闪就没，人还是会对着空列表去新建
+  await page.waitForTimeout(4500)
+  check('提示常驻，直到那张表取回来', await warn.isVisible())
+  state.broken = null
+  await page.locator('[role="status"] > div', { hasText: '没加载成功' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
+  check('重试取回来：提示撤掉', await warn.waitFor({ state: 'detached', timeout: 5000 }).then(() => true, () => false))
   await ctx.close()
 }
 
-{
+if (want('启动页')) {
   // 后端连得上、请求却卡着不回：「先进去看看」之后不能是一片绿加一屏「还没有工作流」
   const state = { approvals: [], offline: false, writes: [], hang: true }
   const { ctx, page } = await open({ state })
@@ -515,6 +655,9 @@ for (const theme of ['dark', 'light']) {
   await enter.click()
   await waitNav(page)
   const telemetry = nav(page).locator('[data-telemetry]')
+  // 这一路唯一的 /health 探活和「先进去看看」同时出现，按钮点得快时它还在路上
+  await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-telemetry') !== 'checking', null, { timeout: 5000 })
+    .catch(() => {})
   const tone = await telemetry.getAttribute('data-tone')
   check('进去以后遥测点不是「在线」，而是「加载中」', tone === '加载中', `${tone} / ${await telemetry.innerText()}`)
   const warn = page.getByText(/没取回来.*先别新建/)
@@ -537,7 +680,62 @@ for (const theme of ['dark', 'light']) {
   await ctx.close()
 }
 
-{
+if (want('启动页')) {
+  // 只有一张表卡住（后端连着）：每个请求最多等 15 秒，到点记成出错。遥测点从「加载中」
+  // 转成「降级」，提示也得跟着改口说「没加载成功」，而不是悄悄撤掉——那张表还是空的
+  const state = { approvals: [], offline: false, writes: [], hangPath: '/api/tools' }
+  const { ctx, page } = await open({ state })
+  await page.goto(`${WEB}/chat`)
+  // 第一次全量加载要等那一项超时才算落定，启动页到点自己放人进来
+  const entered = await nav(page).waitFor({ timeout: 25000 }).then(() => true, () => false)
+  check('卡住的那一项超时后，启动页自己放人进来', entered)
+  const warn = page.getByText(/有 1 项没加载成功（工具 超时）.*先别新建/)
+  check('超时的那一项：进门就说它没加载成功，劝先别新建', await warn.waitFor({ timeout: 5000 }).then(() => true, () => false),
+    await warn.innerText().catch(() => '没有这条提示'))
+  const telemetry = nav(page).locator('[data-telemetry]')
+  check('遥测点记为「降级」', (await telemetry.getAttribute('data-tone')) === '降级', await telemetry.getAttribute('data-tone'))
+  await telemetry.click()
+  const row = page.getByRole('dialog', { name: '后端连接' }).locator('[data-check="tools"]')
+  const rowText = (await row.innerText()).replace(/\s+/g, ' ')
+  check('加载清单里那一项写「超时」，不写「连不上」', /超时/.test(rowText), rowText)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(4500)
+  check('提示常驻，不会自己消失', await warn.isVisible())
+  state.hangPath = null
+  await page.locator('[role="status"] > div', { hasText: '没加载成功' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
+  check('重试取回来：提示撤掉', await warn.waitFor({ state: 'detached', timeout: 5000 }).then(() => true, () => false))
+  check('遥测点回到「在线」', await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-tone') === '在线', null, { timeout: 8000 })
+    .then(() => true, () => false), await telemetry.getAttribute('data-tone'))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await ctx.close()
+}
+
+if (want('启动页')) {
+  // 取回来过的表，后来的刷新卡住了：手上的列表是真的（失败不清空），遥测点说「加载中」
+  // 就够了，不能再弹「列表可能不全，先别新建」吓人
+  const state = { approvals: [], offline: false, writes: [] }
+  const { ctx, page } = await open({ state })
+  await page.goto(`${WEB}/chat`)
+  await waitNav(page)
+  const telemetry = nav(page).locator('[data-telemetry]')
+  await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-tone') === '在线', null, { timeout: 10000 }).catch(() => {})
+  state.hangPath = '/api/tools'
+  await telemetry.click()
+  await page.getByRole('dialog', { name: '后端连接' }).getByRole('button', { name: '重新检测' }).click()
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(3800)
+  check('刷新卡住：遥测点说「加载中」', (await telemetry.getAttribute('data-tone')) === '加载中', await telemetry.getAttribute('data-tone'))
+  check('……但不弹「先别新建」：那张表之前取回来过', (await page.getByText(/先别新建/).count()) === 0)
+  await telemetry.click()
+  const panel = page.getByRole('dialog', { name: '后端连接' })
+  check('遥测浮层照样写出哪一项还没回来，但不劝别新建', /工具还没回来/.test(await panel.innerText()) && !/先别急着新建/.test(await panel.innerText()),
+    (await panel.innerText()).replace(/\n/g, ' '))
+  await page.keyboard.press('Escape')
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await ctx.close()
+}
+
+if (want('启动页')) {
   // 断线时在导航上换了主题：重连后补存进设置，不能被服务端的旧值翻回去
   const state = { approvals: [], offline: true, writes: [] }
   const { ctx, page } = await open({ state })

@@ -170,6 +170,18 @@ export function formatRelative(v: string | number | Date | null | undefined, now
   return formatTime(d, now)
 }
 
+/** 文件大小：「820 B」「12.4 KB」「3.1 MB」「1.2 GB」 */
+export function formatBytes(n: number | null | undefined): string {
+  if (!isNum(n) || n < 0) return NONE
+  if (n < 1024) return `${Math.round(n)} B`
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`
+  return `${(n / 1024 ** 3).toFixed(1)} GB`
+}
+
+/** 去掉名字后面括号里的补充说明：「OpenAI 兼容（DeepSeek、通义…）」→「OpenAI 兼容」 */
+export const shortLabel = (label?: string | null): string => (label ?? '').replace(/[（(].*$/, '').trim()
+
 /** 短 id：「#66a5a6」。完整 id 放 title，点击复制由调用方决定 */
 export function shortId(id: string | null | undefined, len = 6): string {
   if (!id) return NONE

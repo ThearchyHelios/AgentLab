@@ -100,7 +100,7 @@ async def test_a_broken_condition_is_sent_back_and_fixed_before_delivery(client,
 
     checks = [e for e in events if e["op"] == "check"]
     assert [c["status"] for c in checks] == ["repairing", "passed"], checks
-    assert any("len(x)" in i for i in checks[0]["issues"]), "交回去的问题里得带着能照改的提示"
+    assert any("len(x)" in i["message"] for i in checks[0]["issues"]), "交回去的问题里得带着能照改的提示"
     assert "len(x)" in model.calls[1], "自查请求没把问题原文交给模型"
 
     final = events[-1]
@@ -138,3 +138,23 @@ async def test_template_braces_are_accepted_without_a_rework(client, monkeypatch
     final = events[-1]
     assert final["autorun"] is True
     assert any("是多余的" in i["message"] for i in final["issues"])
+
+
+async def test_check_issues_point_at_the_node_and_the_field(client, monkeypatch):
+    """自查的问题是对象，不是拼好的一行字：界面要靠 node_id 定位到卡片、靠 field
+    落到检查器里具体的输入框。以前是「「lp」循环条件写错了」，节点 id 只能从字里抠。"""
+    model = _Scripted(_graph_ops("foo(vars.items)"), _fix_ops("bar(vars.items)"))
+    events = await _generate(client, monkeypatch, model)
+
+    checks = [e for e in events if e["op"] == "check"]
+    assert [c["status"] for c in checks] == ["repairing", "repairing", "failed"], checks
+    for check in checks:
+        assert check["issues"], check
+        for issue in check["issues"]:
+            assert isinstance(issue, dict), f"自查问题还是一行字：{issue!r}"
+            assert issue["node_id"] == "lp" and issue["field"] == "condition", issue
+            assert issue["level"] == "error"
+            assert issue["message"] and not issue["message"].startswith("「"), \
+                "节点另有 node_id，消息里不该再拼一遍"
+    # 交回模型的修正请求照旧是能读的一行一条，节点 id 在前
+    assert "「lp」" in model.calls[1]

@@ -1,11 +1,12 @@
 import { useEffect, useId, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertTriangle, ChevronLeft, Copy, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
+import { AlertTriangle, ChevronLeft, Copy, Lock, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax } from './nodeDefs'
-import { fieldOfIssue, type FieldRef } from './issues'
+import { fieldOfIssue, unboundToolOf, withToolBound, type FieldRef } from './issues'
 import { hintOf } from './shortcuts'
-import { useStudio } from '../store/studio'
+import { isActivePhase } from '../run/trace'
+import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { useCatalog, modelOptions } from '../store/catalog'
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing } from '../components/ui'
@@ -35,12 +36,61 @@ function useRunDefaults() {
   return value
 }
 
+interface ToolOption { value: string; label: string; hint?: string; danger?: boolean; group?: string }
+
+/**
+ * 数据源的查询工具（db_query__<源> / db_schema__<源>）。/tools 的列表只有内置、自定义和 MCP，
+ * 以前检查器里挑不到它们：校验说「提示词要求用 db_query__x，把它加进工具里」，界面上却做不到。
+ * 30 秒内复用上一次的结果：每点一个节点都去问一遍没必要，可刚在数据页加的源也不能一直看不见
+ */
+let sourceTools: { at: number; list: Promise<ToolOption[]> } | null = null
+function useSourceTools(): ToolOption[] {
+  const [value, setValue] = useState<ToolOption[]>([])
+  useEffect(() => {
+    if (!sourceTools || Date.now() - sourceTools.at > 30_000) {
+      sourceTools = {
+        at: Date.now(),
+        list: api.datasources.list().then((rows) => rows
+          .filter((r) => r && r.enabled !== false)
+          .flatMap((r) => (Array.isArray(r.tools) ? r.tools as string[] : []).map((t) => ({
+            value: t, label: t, group: '数据源',
+            hint: `${t.startsWith('db_schema__') ? '查表结构' : '执行 SQL'} · 数据源「${r.name}」`,
+            // 可写的源上，写语句要人确认（运行时的审批关卡认它）
+            danger: t.startsWith('db_query__') && r.readonly === false,
+          }))))
+          .catch(() => { sourceTools = null; return [] }),
+      }
+    }
+    let alive = true
+    void sourceTools?.list.then((v) => { if (alive) setValue(v) })
+    return () => { alive = false }
+  }, [])
+  return value
+}
+
+/** 节点能绑的全部工具：目录里的，加上数据源的 */
+function useToolOptions(): ToolOption[] {
+  const tools = useCatalog((s) => s.tools)
+  const sources = useSourceTools()
+  return useMemo(() => {
+    const known = new Set(tools.map((t) => t.id))
+    return [
+      ...tools.map((t) => ({ value: t.id, label: t.name, hint: t.description, danger: t.dangerous, group: t.category })),
+      ...sources.filter((o) => !known.has(o.value)),
+    ]
+  }, [tools, sources])
+}
+
 /** 属性面板。所有字段都由 nodeDefs 的声明驱动渲染，加节点类型不用改这里。 */
 export function Inspector() {
   const selectedId = useStudio((s) => s.selectedId)
   const node = useStudio((s) => s.nodes.find((n) => n.id === s.selectedId))
   const allIssues = useStudio((s) => s.issues)
-  const locked = useStudio((s) => s.copilot.active)
+  // 助手在改、正式运行在跑：整块只读，说清为什么
+  const lock = useEditLock()
+  const locked = lock != null
+  // 运行中（探索运行也算）不删节点：画布那边同样关了删除键，事件会对到一个已经不在的节点上
+  const running = useStudio((s) => isActivePhase(s.runPhase))
   const runtime = useStudio((s) => (selectedId ? s.runtime[selectedId] : undefined))
   // 动作逐个取：不带选择器的 useStudio() 订阅整个 store，运行时每来一个 token 这块面板都要重渲染
   const updateNode = useStudio((s) => s.updateNode)
@@ -96,12 +146,24 @@ export function Inspector() {
         <span className="min-w-0 flex-1 truncate text-xs font-semibold">{def.label}</span>
         <IconButton label="复制节点" title={hintOf('复制一份', 'duplicate')} disabled={locked}
                     onClick={() => duplicateNode(node.id)} icon={<Copy size={12} />} />
-        <IconButton label="删除节点" title={`${hintOf('删除节点', 'delete')} · 可撤销`} disabled={locked}
+        <IconButton label="删除节点" disabled={locked || running}
+                    title={running && !locked ? '运行中不能删节点：等它结束或者先停下' : `${hintOf('删除节点', 'delete')} · 可撤销`}
                     onClick={() => removeNode(node.id)} icon={<Trash2 size={12} className="text-[var(--err)]" />} />
       </Header>
 
-      {/* 助手改图期间整块只读：这时候改的东西会被它的最终结果悄悄覆盖 */}
+      {/* 助手改图、正式运行期间整块只读：前者改的东西会被它的最终结果悄悄覆盖，后者跑的是
+          已发布的不可变版本 */}
       <fieldset disabled={locked} className="min-h-0 min-w-0 flex-1 overflow-y-auto p-3">
+        {lock && (
+          <div className="mb-3 flex items-start gap-1.5 rounded border px-2 py-1.5 text-2xs leading-snug"
+               role="note" style={{ borderColor: 'var(--border-strong)', background: 'var(--bg-hover)' }}>
+            <Lock size={11} className="mt-px shrink-0 text-dim" aria-hidden />
+            <span className="min-w-0 flex-1">
+              <span className="font-medium">只能看，不能改</span>
+              <span className="text-dim"> · {EDIT_LOCK_TEXT[lock]}</span>
+            </span>
+          </div>
+        )}
         <div className="mb-3 text-2xs leading-relaxed text-faint">{def.description}</div>
 
         {!!loose.length && (
@@ -182,8 +244,10 @@ function Header({ onBack, children }: { onBack: () => void; children?: React.Rea
   )
 }
 
-/** 一条问题。字段下面用行内版，面板顶部用带框的版本 */
-function IssueLine({ issue, boxed }: { issue: Pick<ValidationIssue, 'level' | 'message'>; boxed?: boolean }) {
+/** 一条问题。字段下面用行内版，面板顶部用带框的版本。action 是就地修好它的那个按钮 */
+function IssueLine({ issue, boxed, action }: {
+  issue: Pick<ValidationIssue, 'level' | 'message'>; boxed?: boolean; action?: React.ReactNode
+}) {
   const err = issue.level === 'error'
   const Icon = err ? XCircle : AlertTriangle
   return (
@@ -196,8 +260,27 @@ function IssueLine({ issue, boxed }: { issue: Pick<ValidationIssue, 'level' | 'm
       role={err ? 'alert' : undefined}
     >
       <Icon size={11} className="mt-px shrink-0" aria-hidden />
-      <span className="min-w-0 flex-1">{issue.message}</span>
+      {/* 修法放在话的下面：检查器只有三百来像素宽，并排的话这句要折成七八行 */}
+      <span className="min-w-0 flex-1">
+        {issue.message}
+        {action && <span className="mt-1 flex">{action}</span>}
+      </span>
     </div>
+  )
+}
+
+/**
+ * 「提示词要求用 X，但没绑定」的就地修法：把 X 加进这一栏。返回新 config，已经绑了就是 null
+ * （按钮不出现）。修法和问题面板那一行的「绑定」是同一个 withToolBound
+ */
+function bindFix(issue: FieldIssue, config: Record<string, any>, apply: (next: Record<string, any>) => void) {
+  const tool = unboundToolOf(issue.message)
+  const next = tool ? withToolBound(config, issue.at, tool) : null
+  if (!tool || !next) return null
+  return (
+    <button type="button" className="btn btn-xs shrink-0" onClick={() => apply(next)}>
+      <Plus size={10} aria-hidden /> 绑定 {tool}
+    </button>
   )
 }
 
@@ -268,7 +351,7 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
       )}
       {!!own.length && (
         <div id={errorId} className="mt-1 space-y-0.5">
-          {own.map((i, k) => <IssueLine key={k} issue={i} />)}
+          {own.map((i, k) => <IssueLine key={k} issue={i} action={bindFix(i, config, (c) => onChange(c[field.key]))} />)}
         </div>
       )}
     </div>
@@ -282,6 +365,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 }) {
   const catalog = useCatalog()
   const defaults = useRunDefaults()
+  const toolOptions = useToolOptions()
   const aria = { 'aria-invalid': invalid || undefined, 'aria-describedby': describedBy }
 
   switch (field.type) {
@@ -401,9 +485,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
       )
 
     case 'tools': {
-      const options = catalog.tools.map((t) => ({
-        value: t.id, label: t.name, hint: t.description, danger: t.dangerous, group: t.category,
-      }))
+      const options = toolOptions
       // tool 节点只选一个，agent 节点可以多选
       if (field.help?.includes('只能选一个')) {
         return (
@@ -437,7 +519,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
       return <MetricList nodeId={nodeId} value={value ?? []} issues={issues} onChange={onChange} />
 
     case 'agents':
-      return <AgentList value={value ?? []} onChange={onChange} />
+      return <AgentList value={value ?? []} issues={issues} config={config} onChange={onChange} />
 
     default:
       return <input id={id} className="field" value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
@@ -608,12 +690,14 @@ function MultiPick({ options, value, onChange, empty }: {
   )
 }
 
-function Row({ children, onRemove, removeLabel, tone }: {
+function Row({ children, onRemove, removeLabel, tone, item }: {
   children: React.ReactNode; onRemove: () => void; removeLabel: string
   tone?: 'error' | 'warning'
+  /** 第几项。问题面板定位时按 [data-field] [data-item] 滚到这一项 */
+  item?: number
 }) {
   return (
-    <div className="mb-1.5 rounded border bg-bg p-2"
+    <div className="mb-1.5 rounded border bg-bg p-2" data-item={item}
          style={tone ? { borderColor: tone === 'error' ? 'var(--err)' : 'var(--warn)' } : undefined}>
       <div className="flex items-start gap-1.5">
         <div className="min-w-0 flex-1 space-y-1.5">{children}</div>
@@ -653,7 +737,7 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
       {value.map((field, i) => {
         const own = issues.filter((x) => x.at?.index === i)
         return (
-          <Row key={i} removeLabel={`删除字段 ${field.name || i + 1}`}
+          <Row key={i} item={i} removeLabel={`删除字段 ${field.name || i + 1}`}
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <Sub label="字段名" htmlFor={`${uid}-${i}-name`}>
@@ -775,7 +859,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
           : keyIssue || own.length ? 'warning' : undefined
         const condBad = own.some((x) => x.at?.sub === 'condition' && x.level === 'error')
         return (
-          <Row key={i} removeLabel={`删除分支 ${c.label || c.key || i + 1}`} tone={tone}
+          <Row key={i} item={i} removeLabel={`删除分支 ${c.label || c.key || i + 1}`} tone={tone}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
               <Sub label="标识（连线出口）" htmlFor={`${uid}-${i}-key`} className="w-[42%] shrink-0">
@@ -848,7 +932,7 @@ function MetricList({ nodeId, value, issues, onChange }: {
       {value.map((m, i) => {
         const own = issues.filter((x) => x.at?.index === i)
         return (
-          <Row key={i} removeLabel={`删除指标 ${m.id || i + 1}`}
+          <Row key={i} item={i} removeLabel={`删除指标 ${m.id || i + 1}`}
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
@@ -886,45 +970,65 @@ function MetricList({ nodeId, value, issues, onChange }: {
   )
 }
 
-function AgentList({ value, onChange }: { value: any[]; onChange: (v: any[]) => void }) {
-  const catalog = useCatalog()
+/**
+ * 协作成员。成员自己的问题（提示词点名的工具没绑、角色设定写得不对）落在那个成员的那一栏下面：
+ * 以前它们既不在成员行里、也不在面板顶上，问题面板说有错，点过来却什么都看不见
+ */
+function AgentList({ value, issues, config, onChange }: {
+  value: any[]; issues: FieldIssue[]; config: Record<string, any>; onChange: (v: any[]) => void
+}) {
+  const options = useToolOptions()
   const uid = useId()
   const update = (i: number, patch: any) =>
     onChange(value.map((a, idx) => (idx === i ? { ...a, ...patch } : a)))
+  const fix = (x: FieldIssue) => bindFix(x, config, (c) => onChange(c.agents))
   return (
     <div>
-      {value.map((agent, i) => (
-        <Row key={i} removeLabel={`删除成员 ${agent.name || i + 1}`}
-             onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
-          <div className="flex gap-1.5">
-            <Sub label="成员名（英文）" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1">
-              <input id={`${uid}-${i}-name`} className="field mono text-xs" placeholder="researcher"
-                     value={agent.name ?? ''} onChange={(e) => update(i, { name: e.target.value })} />
+      {value.map((agent, i) => {
+        const own = issues.filter((x) => x.at?.index === i)
+        const at = (sub: string) => own.filter((x) => x.at?.sub === sub)
+        const rest = own.filter((x) => x.at?.sub !== 'system' && x.at?.sub !== 'tools')
+        return (
+          <Row key={i} item={i} removeLabel={`删除成员 ${agent.name || i + 1}`}
+               tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
+               onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
+            <div className="flex gap-1.5">
+              <Sub label="成员名（英文）" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1">
+                <input id={`${uid}-${i}-name`} className="field mono text-xs" placeholder="researcher"
+                       value={agent.name ?? ''} onChange={(e) => update(i, { name: e.target.value })} />
+              </Sub>
+              <Sub label="最多几步" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0">
+                <input id={`${uid}-${i}-steps`} className="field tnum" type="number" min={1} max={30} placeholder="4"
+                       value={agent.max_steps ?? ''}
+                       onChange={(e) => update(i, { max_steps: e.target.value === '' ? undefined : Number(e.target.value) })} />
+              </Sub>
+            </div>
+            <Sub label="职责（调度者据此分派）" htmlFor={`${uid}-${i}-desc`}>
+              <input id={`${uid}-${i}-desc`} className="field" value={agent.description ?? ''}
+                     onChange={(e) => update(i, { description: e.target.value })} />
             </Sub>
-            <Sub label="最多几步" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0">
-              <input id={`${uid}-${i}-steps`} className="field tnum" type="number" min={1} max={30} placeholder="4"
-                     value={agent.max_steps ?? ''}
-                     onChange={(e) => update(i, { max_steps: e.target.value === '' ? undefined : Number(e.target.value) })} />
-            </Sub>
-          </div>
-          <Sub label="职责（调度者据此分派）" htmlFor={`${uid}-${i}-desc`}>
-            <input id={`${uid}-${i}-desc`} className="field" value={agent.description ?? ''}
-                   onChange={(e) => update(i, { description: e.target.value })} />
-          </Sub>
-          {/* 成员的 system 后端直接取值、不过模板渲染：这里不挂补全，免得教人写 {{ }} */}
-          <Sub label="角色设定（system，原样发给模型）" htmlFor={`${uid}-${i}-sys`}>
-            <textarea id={`${uid}-${i}-sys`} className="field" rows={2}
-                      value={agent.system ?? ''} onChange={(e) => update(i, { system: e.target.value })} />
-          </Sub>
-          <div>
-            <div className="mb-0.5 text-2xs text-faint">可用工具</div>
-            <MultiPick
-              options={catalog.tools.map((t) => ({ value: t.id, label: t.name, hint: t.description, group: t.category }))}
-              value={agent.tools ?? []} onChange={(v) => update(i, { tools: v })} empty="没有可用工具"
-            />
-          </div>
-        </Row>
-      ))}
+            {/* 成员的 system 后端直接取值、不过模板渲染：这里不挂补全，免得教人写 {{ }} */}
+            <div data-sub="system">
+              <Sub label="角色设定（system，原样发给模型）" htmlFor={`${uid}-${i}-sys`}>
+                <textarea id={`${uid}-${i}-sys`} className="field" rows={2}
+                          value={agent.system ?? ''} onChange={(e) => update(i, { system: e.target.value })} />
+              </Sub>
+              {at('system').map((x, k) => <IssueLine key={k} issue={x} />)}
+            </div>
+            <div data-sub="tools">
+              <div className="mb-0.5 text-2xs text-faint">可用工具</div>
+              <MultiPick options={options} value={agent.tools ?? []} onChange={(v) => update(i, { tools: v })}
+                         empty="没有可用工具" />
+              {!!at('tools').length && (
+                <div className="mt-1 space-y-0.5">
+                  {at('tools').map((x, k) => <IssueLine key={k} issue={x} action={fix(x)} />)}
+                </div>
+              )}
+            </div>
+            {rest.map((x, k) => <IssueLine key={k} issue={x} />)}
+          </Row>
+        )
+      })}
       <button type="button" className="btn btn-sm w-full justify-center"
               onClick={() => onChange([...value, { name: '', description: '', system: '', tools: [] }])}>
         <Plus size={11} /> 添加成员

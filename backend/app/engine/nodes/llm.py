@@ -7,17 +7,27 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.func import task
-from langgraph.types import interrupt
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Skill
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
-from app.engine.errors import describe_exception
+from app.engine.replay import ask, once
 from app.engine.state import GraphState, message_text, template_context, thinking_text
+from app.engine.toolcalls import (
+    TOOL_MARKUP_ERROR,
+    TOOL_MARKUP_NUDGE,
+    ToolTimeout,
+    leaked_markup,
+    limit_fields,
+    limit_of,
+    markup_warning,
+    run_bounded,
+)
 from app.providers import catalog
 from app.providers.factory import (
     ModelSpec,
@@ -27,6 +37,7 @@ from app.providers.factory import (
 )
 from app.tools.registry import (
     ToolArgsError,
+    ToolBuildError,
     ToolContext,
     args_model_of,
     build_tools,
@@ -124,6 +135,14 @@ def _usage_of(message: BaseMessage, model_id: str) -> dict[str, Any]:
     }
 
 
+def _report_call(ctx: NodeContext, response: BaseMessage, model_id: str, started: float) -> dict[str, Any]:
+    """一次模型调用一条 llm.end。返回这一次的用量。"""
+    usage = _usage_of(response, model_id)
+    ctx.emit(EventType.LLM_END, model=model_id,
+             duration_ms=int((time.perf_counter() - started) * 1000), **usage)
+    return usage
+
+
 def explain_model_error(exc: Exception, model_id: str) -> str:
     """把供应商的原始报错翻成能照着做的一句话。
 
@@ -218,6 +237,8 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     messages = await _build_messages(state, ctx)
     schema = ctx.cfg("output_schema")
     started = time.perf_counter()
+    #: 这个节点里每次模型调用的用量。正常只有一次；模型把工具调用写成文字时会多一次纠正
+    spent: list[dict[str, Any]] = []
 
     if schema:
         # 要结构化结果就走原生 structured output，这条路径拿不到 token 流
@@ -241,9 +262,23 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
         response: BaseMessage = AIMessage(content=output["text"])
+        spent.append(_report_call(ctx, response, model_id, started))
     else:
         response = await _invoke_streaming(model, messages, ctx, model_id)
+        spent.append(_report_call(ctx, response, model_id, started))
         text = message_text(response)
+        if snippet := leaked_markup(text):
+            # 模型把工具调用当正文写了出来：这个节点压根没有工具，那段"调用"什么都没查到。
+            # 带一句纠正再问一次；还这样就判失败，别让一堆标记当答案往下游走
+            ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
+                     message=f"{markup_warning(snippet)}，已提醒它重试一次")
+            retried = time.perf_counter()
+            response = await _invoke_streaming(
+                model, [*messages, response, HumanMessage(content=TOOL_MARKUP_NUDGE)], ctx, model_id)
+            spent.append(_report_call(ctx, response, model_id, retried))
+            text = message_text(response)
+            if leaked_markup(text):
+                raise NodeError(ctx.node.id, TOOL_MARKUP_ERROR)
         reasoning = thinking_text(response)
         if not text and reasoning:
             # 思考型模型把额度全花在推理上了，正文是空的 —— 说清楚而不是抛个空结果给下游
@@ -252,14 +287,9 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                      code="empty_completion")
         output = {"text": text, "thinking": reasoning}
 
-    usage = _usage_of(response, model_id)
     elapsed = int((time.perf_counter() - started) * 1000)
-    ctx.emit(
-        EventType.LLM_END,
-        model=model_id,
-        duration_ms=elapsed,
-        **usage,
-    )
+    usage = {key: sum(one[key] for one in spent) for key in spent[0]}
+    usage["cost_usd"] = round(usage["cost_usd"], 6)
 
     result = {**output, "model": model_id, "duration_ms": elapsed}
     updates: dict[str, Any] = {
@@ -289,7 +319,11 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         collection=ctx.cfg("collection") or ctx.run.collection,
     )
     async with SessionLocal() as session:
-        return await build_tools(names, tool_ctx, session=session)
+        try:
+            return await build_tools(names, tool_ctx, session=session)
+        except ToolBuildError as e:
+            # 绑的工具自己坏了（参数定义写坏的自定义工具）：说清是哪个、去哪里改
+            raise NodeError(ctx.node.id, str(e)) from e
 
 
 SKIPPED_NOTE = (
@@ -333,6 +367,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     这里没有用 prebuilt 的 create_react_agent，因为需要在循环内部做三件它不做的事：
     每步工具调用都往画布推事件、对危险工具逐个弹人工审批、以及步数护栏。
+
+    人工审批恢复时整个节点从头重放。模型调用和工具调用都包在 @task 里，重放时结果
+    取自 checkpoint，不重复计费、不重复执行；它们的事件也发在 task 里面，于是轨迹里
+    同一次调用只出现一回。写在 task 外面的事件一律经 replay.once 发，道理相同。
     """
     model_spec = _model_spec(ctx)
     async with SessionLocal() as session:
@@ -354,11 +392,16 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     transcript: list[dict[str, Any]] = []
 
     def _report(response: BaseMessage, started: float) -> None:
-        # 每次模型调用一条 llm.end：用量在节点跑的过程中就看得到。发在 task 里面，
-        # 节点因审批重放时 task 结果取自 checkpoint，这条不会重复
+        # 每次模型调用一条 llm.end：用量在节点跑的过程中就看得到
         ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id,
                  duration_ms=int((time.perf_counter() - started) * 1000),
                  **_usage_of(response, model_id))
+
+    def _count(response: BaseMessage) -> None:
+        usage = _usage_of(response, model_id)
+        for key in ("input_tokens", "output_tokens", "calls"):
+            total_usage[key] += usage[key]
+        total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
 
     # @task 的返回值会进 checkpoint：人工审批导致节点重放时，
     # 之前已经完成的模型调用和工具执行不会重跑，也就不会重复计费。
@@ -379,23 +422,75 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         return response
 
     @task
-    async def tool_step(step: int, name: str, args: dict[str, Any]) -> str:
+    async def tool_step(step: int, name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
+        # 失败也在这里收住、作为结果返回：失败的那次同样只执行一回，重放时不再重试
         tool = tool_map[name]
-        result = await tool.ainvoke(args)
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        limit = limit_of(tool, name, args)
+        ctx.emit(EventType.TOOL_START, tool=name, args=args, call_id=call_id, **limit_fields(limit))
+        started = time.perf_counter()
+        extra: dict[str, Any] = {}
+        try:
+            result = await run_bounded(tool.ainvoke(args), limit, name)
+            content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+            ok = True
+        except ToolTimeout as e:
+            # 到点就收回控制权，驱动的收尾在后台做完。模型拿到的是"等了多久、为什么放弃"
+            content, ok = str(e), False
+            extra = {"error": str(e), "timed_out": True}
+        except Exception as e:  # noqa: BLE001 - 工具失败要喂回模型，让它自己纠错
+            content = f"工具执行失败：{describe_exception(e)}"
+            schema = args_model_of(tool)
+            if isinstance(e, TypeError) and schema is not None:
+                # 签名对不上还能走到这儿，说明 schema 和函数本身不一致（工具的 bug）。
+                # 模型改不了这个，但把参数表摊开至少让它别在同一个地方反复试
+                content += f"\n{describe_args(schema, args)}"
+            ok = False
+            extra = {"error": content.splitlines()[0][:300], "detail": raw_detail(e)}
+        elapsed = int((time.perf_counter() - started) * 1000)
+        snapshot_id: str | None = None
+        if ok:
+            from app.core.artifact_store import put_json
+
+            try:
+                snapshot_id = await put_json(
+                    {"tool": name, "args": args, "result": content},
+                    kind="tool_snapshot", run_id=ctx.run.run_id, node_id=ctx.node.id,
+                )
+            except Exception:  # noqa: BLE001
+                snapshot_id = None
+        ctx.emit(
+            EventType.TOOL_END if ok else EventType.TOOL_ERROR,
+            tool=name,
+            call_id=call_id,
+            duration_ms=elapsed,
+            preview=content[:2000],
+            artifact=snapshot_id,
+            **extra,
+        )
+        return {"content": content, "ok": ok, "duration_ms": elapsed}
 
     final_text = ""
+    #: 模型把工具调用写成了文字：纠正过一次了没有
+    nudged = False
     for step in range(max_steps):
         response = await llm_step(step, messages)
         messages.append(response)
-        usage = _usage_of(response, model_id)
-        for key in ("input_tokens", "output_tokens", "calls"):
-            total_usage[key] += usage[key]
-        total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
+        _count(response)
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             final_text = message_text(response)
+            if snippet := leaked_markup(final_text):
+                # 没有真实的调用，正文里却是一段调用标记：这一步什么都没查到。
+                # 纠正一次；再来一次就是这个节点/模型根本调不了工具，判失败
+                if nudged:
+                    raise NodeError(ctx.node.id, TOOL_MARKUP_ERROR)
+                nudged = True
+                await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
+                           message=f"{markup_warning(snippet)}，已提醒它重试一次")
+                messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
+                final_text = ""
+                continue
             break
 
         run_calls, deferred = split_tool_calls(tool_calls, parallel=parallel_tools)
@@ -421,35 +516,25 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     # 不执行，把"它接受什么"原样喂回去。模型下一步照着改就行，
                     # 这才是失败之后真正能自愈的重试——以前喂回去的是一句
                     # TypeError，里面既没有正确参数名也没有字段说明
-                    ctx.emit(EventType.TOOL_ERROR, tool=name, call_id=call_id, error=str(e))
+                    await once(ctx, EventType.TOOL_ERROR, tool=name, call_id=call_id, error=str(e))
                     messages.append(ToolMessage(content=str(e), tool_call_id=call_id))
                     transcript.append({"tool": name, "args": args, "ok": False, "result": str(e)})
                     continue
                 if fix_note:
-                    ctx.emit(EventType.LOG, level="warn",
-                             message=f"工具 {name}：{fix_note}", code="tool_args_fixed")
+                    await once(ctx, EventType.LOG, level="warn",
+                               message=f"工具 {name}：{fix_note}", code="tool_args_fixed")
 
             if _needs_approval(ctx, tool_map[name], args):
-                ctx.emit(
-                    EventType.HUMAN_REQUESTED,
-                    mode="approve",
-                    tool=name,
-                    args=args,
-                    title=f"Agent 想调用工具 {name}",
-                )
-                decision = interrupt(
-                    {
-                        "kind": "tool_approval",
-                        "node_id": ctx.node.id,
-                        "tool": name,
-                        "args": args,
-                        "title": f"是否允许调用 {name}？",
-                    }
+                decision = await ask(
+                    ctx,
+                    {"kind": "tool_approval", "node_id": ctx.node.id, "tool": name, "args": args,
+                     "title": f"是否允许调用 {name}？"},
+                    mode="approve", tool=name, args=args, title=f"Agent 想调用工具 {name}",
                 )
                 verdict = read_decision(decision)
                 note = verdict.note
-                ctx.emit(EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved, note=note,
-                         actor=ctx.actor())
+                await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved,
+                           note=note, actor=ctx.actor())
                 if not verdict.approved:
                     messages.append(
                         ToolMessage(
@@ -462,41 +547,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 if verdict.args:
                     args = verdict.args
 
-            ctx.emit(EventType.TOOL_START, tool=name, args=args, call_id=call_id)
-            started = time.perf_counter()
-            try:
-                content = await tool_step(step, name, args)
-                ok = True
-            except Exception as e:  # noqa: BLE001 - 工具失败要喂回模型，让它自己纠错
-                content = f"工具执行失败：{describe_exception(e)}"
-                if isinstance(e, TypeError) and schema is not None:
-                    # 签名对不上还能走到这儿，说明 schema 和函数本身不一致（工具的 bug）。
-                    # 模型改不了这个，但把参数表摊开至少让它别在同一个地方反复试
-                    content += f"\n{describe_args(schema, args)}"
-                ok = False
-            elapsed = int((time.perf_counter() - started) * 1000)
-            snapshot_id: str | None = None
-            if ok:
-                from app.core.artifact_store import put_json
-
-                try:
-                    snapshot_id = await put_json(
-                        {"tool": name, "args": args, "result": content},
-                        kind="tool_snapshot", run_id=ctx.run.run_id, node_id=ctx.node.id,
-                    )
-                except Exception:  # noqa: BLE001
-                    snapshot_id = None
-            ctx.emit(
-                EventType.TOOL_END if ok else EventType.TOOL_ERROR,
-                tool=name,
-                call_id=call_id,
-                duration_ms=elapsed,
-                preview=content[:2000],
-                artifact=snapshot_id,
-            )
-            transcript.append(
-                {"tool": name, "args": args, "ok": ok, "duration_ms": elapsed, "result": content[:4000]}
-            )
+            outcome = await tool_step(step, name, args, call_id)
+            content = outcome["content"]
+            transcript.append({"tool": name, "args": args, "ok": outcome["ok"],
+                               "duration_ms": outcome["duration_ms"], "result": content[:4000]})
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
 
         # 没跑的那些排在执行过的后面，保持模型原本的调用顺序
@@ -506,7 +560,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 {"tool": call.get("name", ""), "args": call.get("args", {}) or {}, "skipped": True}
             )
     else:
-        # 步数用完了。走到这儿一定意味着最后那步**要求了工具**（不要工具会 break），
+        # 步数用完了：最后那步要么要求了工具，要么是纠正之后还没来得及答。
         # 也就是说模型从来没拿到过"说结论"的那一轮——它只是被掐断在半路。
         #
         # 所以先补上那一轮：不给工具，让它基于已经查到的东西收口。这比把中间
@@ -520,14 +574,23 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )))
         try:
             response = await settle_step(messages)
-            usage = _usage_of(response, model_id)
-            for key in ("input_tokens", "output_tokens", "calls"):
-                total_usage[key] += usage[key]
-            total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
+            _count(response)
             settled = message_text(response).strip()
         except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有成果一起赔进去
-            ctx.emit(EventType.LOG, level="warn",
-                     message=f"收尾轮没跑成：{describe_exception(e)}", code="settle_failed")
+            await once(ctx, EventType.LOG, level="warn",
+                       message=f"收尾轮没跑成：{describe_exception(e)}", code="settle_failed")
+
+        if snippet := leaked_markup(settled):
+            if not any(isinstance(m, AIMessage) and getattr(m, "tool_calls", None) for m in messages):
+                # 从头到尾一次真调用都没有，步数全耗在写标记上：还是那个「调不了工具」
+                raise NodeError(ctx.node.id, TOOL_MARKUP_ERROR)
+            # 收尾轮拿的是没绑工具的模型，它还是写了一段调用标记：想接着查、没能收口。
+            # 这不是「节点没绑工具」（前面的步数里工具是真调过的），不能套 TOOL_MARKUP_ERROR
+            # 判失败、把已经查到的一起丢掉——按收尾轮没说出话处理，取它之前说过的话
+            await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
+                       message=f"{markup_warning(snippet)}：步数用完后的收尾轮仍想调用工具，"
+                               "没能给出结论")
+            settled = ""
 
         if settled:
             final_text = settled
@@ -546,7 +609,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 管道文案冒充结论，比明说"没跑完"糟糕得多。
             final_text = next(
                 (text for m in reversed(messages)
-                 if isinstance(m, AIMessage) and (text := message_text(m).strip())),
+                 if isinstance(m, AIMessage) and (text := message_text(m).strip())
+                 and not leaked_markup(text)),
                 "",
             )
             hint = (

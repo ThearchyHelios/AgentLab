@@ -1,27 +1,29 @@
 import './surface.css'
 import {
-  createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties,
+  createContext, memo, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties,
 } from 'react'
 import {
   Background, BackgroundVariant, ControlButton, Controls, MiniMap, ReactFlow, ReactFlowProvider,
-  useReactFlow, useStoreApi, type AriaLabelConfig, type Edge, type MiniMapNodeProps, type Viewport,
+  useReactFlow, useStoreApi, ViewportPortal, type AriaLabelConfig, type Edge, type MiniMapNodeProps, type Viewport,
 } from '@xyflow/react'
-import { Crosshair, Lock, Route as RouteIcon } from 'lucide-react'
+import { Crosshair, Lock, PanelRightOpen, Route as RouteIcon, Search } from 'lucide-react'
 import clsx from 'clsx'
 import { FlowEdge, MomentContext, RoutingContext, type EdgeRunState, type EdgeView } from './FlowEdge'
+import { openInspector, stepsFirst, useSheet } from './InspectorSheet'
 import { NodeCard } from './NodeCard'
+import { NODE_CATEGORIES, NODE_DEFS, type NodeDef } from './nodeDefs'
 import { buildRoutes, NODE_WIDTH } from './routing'
 import { RunTimeline, useDock } from './RunTimeline'
-import { toast } from '../components/ui'
+import { isComposing, toast } from '../components/ui'
 import { runClassLabel } from '../lib/terms'
 import { shortId } from '../lib/format'
 import {
-  activeEdgesOf, applyDerived, edgeIdOf, edgeKey, heldEdgesOf, topology, walkedEdges, type GraphLike,
+  activeEdgesOf, edgeIdOf, edgeKey, heldEdgesOf, topology, walkedEdges, type GraphLike,
 } from '../run/derive'
 import {
   isActivePhase, isTerminal, type NodeState, type NodeTrace, type RunPhase, type Trace,
 } from '../run/trace'
-import { projectCached } from '../run/useNodeView'
+import { replayTraceCached } from '../run/useNodeView'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
 
@@ -30,6 +32,11 @@ const edgeTypes = { flow: FlowEdge }
 
 /** 读得清卡片字的最低缩放。低于它，12px 的标题落到 7px 以下，光弧也细到看不见 */
 const READABLE_ZOOM = 0.6
+/**
+ * 精简档里标题换成放大的字（见 NodeCard 的 .nc-lod），0.4 倍时屏幕上仍有 11px 以上。
+ * 整张图在可读缩放下放不下、在这里放得下时，打开就看全图的形状，而不是只看前两列
+ */
+const COMPACT_ZOOM = 0.4
 /** 语义缩放三档的门槛，上下各留 0.02 的回滞，免得停在门槛上来回跳 */
 const LOD_FULL = 0.6
 const LOD_SIGNAL = 0.35
@@ -105,31 +112,43 @@ let lastFocus: object | null = null
 const setStudio = useStudio.setState as (patch: Record<string, unknown>) => void
 
 // -------------------------------------------------------------------------
-// 回放：把航迹投影到游标那一刻，边和小地图按那一刻的样子画
+// 回放：航迹投影到游标那一刻（run/useNodeView 的 replayTraceCached，卡片读同一份），
+// 边、小地图、回边的圈数都按那一刻画
 // -------------------------------------------------------------------------
 
-function replayTrace(t: Trace, at: number, graph: GraphLike): Trace {
-  const proj = projectCached(t, at)
-  const nodes: Record<string, NodeTrace> = {}
-  for (const [id, n] of Object.entries(t.nodes)) {
-    const p = proj.nodes[id]
-    const taken: string[] = []
-    let looping = false
-    for (const s of n.segments) {
-      if (s.kind !== 'run' || s.start > at) continue
-      if (s.handle && !taken.includes(s.handle)) taken.push(s.handle)
-      looping = s.handle === 'body' && s.end != null && s.end <= at
-    }
-    const state = p?.state ?? 'idle'
-    // 人工审批的通过 / 驳回只记在节点上，不在段上：它结束了就用节点上的
-    const finished = state === 'done' || state === 'failed'
-    const decided = taken.length ? taken : finished ? n.taken ?? [] : []
-    nodes[id] = {
-      ...n, state, count: p?.count ?? 0, taken: decided, takenHandle: decided[decided.length - 1],
-      looping: state === 'running' && looping,
-    }
+/**
+ * 回边兜回去了几次：目标这一次进入以来开跑的次数减一。回放截到游标。
+ * 走过 done 出口的那一段是上一次进入的收尾——嵌套在外层循环里时，内层每次进来
+ * 重新数，和循环卡片上「第几轮」同一个口径。审批恢复的重放不算又跑了一次
+ */
+function loopsOf(n: NodeTrace | undefined, at: number | null): number {
+  if (!n) return 0
+  let runs = 0
+  for (let i = n.segments.length - 1; i >= 0; i -= 1) {
+    const s = n.segments[i]
+    if (s.kind !== 'run' || s.resumed || (at != null && s.start > at)) continue
+    if (s.handle === 'done' && runs > 0) break
+    runs += 1
   }
-  return applyDerived({ ...t, phase: proj.phase, nodes }, graph)
+  return Math.max(0, runs - 1)
+}
+
+/**
+ * 运行中点了一个跑过的节点：右栏滚到它的步骤。右栏归助手面板，它接这个事件
+ * （在对话层时先切到运行层），接了就 preventDefault；没人接时自己找步骤行描一圈
+ */
+function revealStep(nodeId: string): void {
+  const runId = useStudio.getState().run?.id
+  const handled = !window.dispatchEvent(new CustomEvent('agentlab:reveal-step', {
+    detail: { runId, nodeId }, cancelable: true,
+  }))
+  if (handled) return
+  const rows = document.querySelectorAll<HTMLElement>(`[data-step-status][data-node-id="${CSS.escape(nodeId)}"]`)
+  const row = rows[rows.length - 1]
+  if (!row) return
+  row.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' })
+  row.dataset.flash = 'focus'
+  setTimeout(() => { if (row.dataset.flash === 'focus') delete row.dataset.flash }, 1800)
 }
 
 /** 每条边此刻的运行态 */
@@ -212,6 +231,160 @@ const typeColor = (n: { data?: unknown }): string => {
 }
 
 // -------------------------------------------------------------------------
+// Copilot 这一轮删掉的节点：原地留一道虚线框，停一下再淡出
+// -------------------------------------------------------------------------
+
+/** 虚线框停留的总时长，和 surface.css 里 sf-ghost-out 的时长一致 */
+const GHOST_MS = 2400
+
+interface Ghost {
+  id: string
+  x: number
+  y: number
+  w: number
+  h: number
+  label: string
+  type: NodeType
+}
+
+const ghostOf = (n: FlowNode): Ghost => ({
+  id: n.id, x: n.position.x, y: n.position.y,
+  w: n.measured?.width ?? NODE_WIDTH, h: n.measured?.height ?? 80,
+  label: n.data.label || NODE_DEFS[n.data.nodeType]?.label || n.id, type: n.data.nodeType,
+})
+
+/**
+ * 助手改完图，新加的节点有入场、改过的有标记，删掉的却是一声不响就没了——回执写着
+ * 「删除 1」，画布上看不出删的是哪一个、原来在哪。在它原来的位置画一道虚线框、
+ * 写上名字，停两秒淡出。只由这一轮落定触发、只播一次；关了动效就不画（回执里照样写着）
+ */
+function useRemovedGhosts(): { seq: number; items: Ghost[] } | null {
+  const [ghosts, setGhosts] = useState<{ seq: number; items: Ghost[] } | null>(null)
+  useEffect(() => {
+    // 这一轮开始前的样子：删掉的节点可能在流式途中就没了，落定时 store 里已经找不到
+    let before = new Map<string, Ghost>()
+    let timer = 0
+    const unsub = useStudio.subscribe((s, prev) => {
+      if (s.copilot.active && !prev.copilot.active) before = new Map(prev.nodes.map((n) => [n.id, ghostOf(n)]))
+      if (s.copilotTurns === prev.copilotTurns) return
+      const turn = s.copilotTurns[s.copilotTurns.length - 1]
+      if (!turn || turn.phase !== 'done' || turn.outcome !== 'applied') return
+      if (prev.copilotTurns.find((t) => t.id === turn.id)?.phase === 'done') return
+      const items = (turn.diff?.removed ?? []).flatMap((id) => before.get(id) ?? [])
+      before = new Map()
+      if (!items.length || reducedMotion()) return
+      clearTimeout(timer)
+      setGhosts((g) => ({ seq: (g?.seq ?? 0) + 1, items }))
+      timer = window.setTimeout(() => setGhosts(null), GHOST_MS)
+    })
+    return () => {
+      unsub()
+      clearTimeout(timer)
+    }
+  }, [])
+  return ghosts
+}
+
+// -------------------------------------------------------------------------
+// 双击空白处快速添加：在光标处搜类型、回车放下。和节点库读同一份节点定义
+// -------------------------------------------------------------------------
+
+const QUICK_W = 248
+const QUICK_H = 312
+
+function QuickAdd({ x, y, bounds, onPick, onClose }: {
+  /** 双击处，相对画布容器的像素 */
+  x: number
+  y: number
+  bounds: { w: number; h: number }
+  onPick: (type: NodeType) => void
+  onClose: () => void
+}) {
+  const [query, setQuery] = useState('')
+  const [cur, setCur] = useState(0)
+  const box = useRef<HTMLDivElement>(null)
+  const list = useRef<HTMLDivElement>(null)
+  const defs = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    // 按节点库的分组顺序排；搜的时候名字里有的排在只是说明里提到的前面——搜「分」
+    // 要的是「条件分支」，不是说明里写着「分派」的协作节点
+    const all = NODE_CATEGORIES.flatMap((c) => Object.values(NODE_DEFS).filter((d) => d.category === c))
+    if (!q) return all
+    const named = (d: NodeDef) => d.label.toLowerCase().includes(q) || d.type.includes(q)
+    return [...all.filter(named), ...all.filter((d) => !named(d) && d.description.toLowerCase().includes(q))]
+  }, [query])
+  const at = Math.min(cur, Math.max(0, defs.length - 1))
+  const listId = useId()
+
+  // 点到外面就收起；它是个一次性的小面板，不该留在那儿挡画布
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => { if (!box.current?.contains(e.target as Node)) onClose() }
+    document.addEventListener('pointerdown', onDown, true)
+    return () => document.removeEventListener('pointerdown', onDown, true)
+  }, [onClose])
+  useEffect(() => {
+    list.current?.querySelector<HTMLElement>(`[data-i="${at}"]`)?.scrollIntoView({ block: 'nearest' })
+  }, [at])
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (isComposing(e)) return
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      setCur(Math.max(0, Math.min(defs.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1))))
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      if (defs[at]) onPick(defs[at].type)
+    } else if (e.key === 'Escape') {
+      // 用掉这一下：别再让它去关属性面板、清运行结果
+      e.preventDefault()
+      e.stopPropagation()
+      onClose()
+    }
+  }
+  // 贴着光标放，放不下就往回收，不伸出画布
+  const left = Math.max(8, Math.min(x, bounds.w - QUICK_W - 8))
+  const top = Math.max(8, Math.min(y, bounds.h - QUICK_H - 8))
+  const optId = (i: number) => `${listId}-${i}`
+  return (
+    <div ref={box} className="sf-quick sheet-in nodrag nopan nowheel" style={{ left, top, width: QUICK_W }}
+         role="dialog" aria-label="快速添加节点" data-esc-layer onKeyDown={onKeyDown}>
+      <label className="sf-quick-search">
+        <Search size={12} aria-hidden />
+        <input
+          autoFocus
+          value={query}
+          placeholder="添加节点：搜名字或用途"
+          role="combobox"
+          aria-expanded
+          aria-controls={listId}
+          aria-activedescendant={defs[at] ? optId(at) : undefined}
+          aria-autocomplete="list"
+          onChange={(e) => { setQuery(e.target.value); setCur(0) }}
+        />
+      </label>
+      <div className="sf-quick-list" role="listbox" id={listId} ref={list} aria-label="节点类型">
+        {defs.map((d, i) => {
+          const Icon = d.icon
+          return (
+            <div key={d.type} id={optId(i)} data-i={i} role="option" aria-selected={i === at}
+                 className={clsx('sf-quick-item', `nt-${d.type}`, i === at && 'is-active')}
+                 title={d.description}
+                 onPointerEnter={() => setCur(i)}
+                 onClick={() => onPick(d.type)}>
+              <span className="sf-quick-icon"><Icon size={12} aria-hidden /></span>
+              <span className="min-w-0 flex-1 truncate">{d.label}</span>
+              <span className="sf-dim">{d.category}</span>
+            </div>
+          )
+        })}
+        {!defs.length && <div className="sf-quick-empty">没有叫「{query.trim()}」的节点</div>}
+      </div>
+      <div className="sf-quick-foot">↑↓ 选择 · ↵ 放在这里 · Esc 关闭</div>
+    </div>
+  )
+}
+
+// -------------------------------------------------------------------------
 
 function CanvasInner() {
   const rf = useRef<HTMLDivElement>(null)
@@ -231,6 +404,7 @@ function CanvasInner() {
   const selectedId = useStudio((s) => s.selectedId)
   const follow = useStudio((s) => s.follow)
   const pathOnly = useDock((s) => s.pathOnly)
+  const sheetOpen = useSheet((s) => s.open)
   // 动作从 getState 取：整个 useStudio() 解构会订阅全部字段，每个 token 都让画布重渲染一次
   const actions = useStudio.getState()
 
@@ -248,9 +422,10 @@ function CanvasInner() {
   const routes = useMemo(() => buildRoutes(nodes, edges), [nodes, edges])
 
   // ---- 此刻（实时或回放游标那一刻）的航迹 ----
+  // graph 直接用 store 里的 nodes / edges 数组：卡片那边按同样的引用取，缓存才对得上
   const view = useMemo(() => {
     if (replayAt == null) return { trace, phase: runPhase, flowing: activeEdges }
-    const t = replayTrace(trace, replayAt, graph)
+    const t = replayTraceCached(trace, replayAt, graph)
     return { trace: t, phase: t.phase, flowing: activeEdgesOf(t, graph) }
   }, [trace, runPhase, activeEdges, replayAt, graph])
 
@@ -307,10 +482,9 @@ function CanvasInner() {
     return edges.map((e) => {
       const state = edgeStates.get(e.id) ?? 'idle'
       const back = topo.back.has(edgeKey(e))
-      const target = view.trace.nodes[e.target]
       const sf: EdgeView = {
         state, back, rank: topo.rank[e.target] ?? 0,
-        loops: back ? Math.max(0, target?.iteration ?? (target?.count ?? 1) - 1) : 0,
+        loops: back ? loopsOf(view.trace.nodes[e.target], replayAt) : 0,
       }
       const className = clsx(
         `sf-e-${state}`,
@@ -321,7 +495,7 @@ function CanvasInner() {
       // animated 一律关掉：React Flow 的 animated 是一条永远在走的虚线，方向和"是否真在流"都说不清
       return { ...e, type: 'flow', className, animated: false, data: { ...e.data, sf } }
     })
-  }, [edges, edgeStates, topo, view.trace, hasRun, selectedId, pathView])
+  }, [edges, edgeStates, topo, view.trace, replayAt, hasRun, selectedId, pathView])
 
   // ---- 节点：注入拓扑层级（一次性时刻按它错开），只看执行路径时压暗没走的 ----
   // 按原节点对象缓存：拖一个节点只换那一个的副本，其余卡片的 data 引用不变，memo 生效
@@ -385,6 +559,15 @@ function CanvasInner() {
     })
   }, [rfStore, applyZoom])
 
+  // ---- 取景 ----
+  /**
+   * 正在飞的那一次程序取景（跟随、点名定位、Copilot 跟镜头）。画布尺寸恰好在
+   * 半路变了（运行一开始航迹坞就升起来）时，下面的保持中心会打断它；这里记着
+   * 目标，打断之后重新飞一次，不然镜头停在半路、要看的节点还在视口外
+   */
+  const flight = useRef<{ ids: string[]; zoomAtLeast?: number; until: number } | null>(null)
+  const retarget = useRef<(() => void) | null>(null)
+
   // 画布尺寸变了（航迹坞出现、变量抽屉挤进来）时保持视口中心不动。React Flow
   // 默认钉住左上角，坞一升起来，画面下半截的节点就被它盖住了
   const box = useRef<HTMLDivElement>(null)
@@ -398,6 +581,7 @@ function CanvasInner() {
       if (last.w && last.h && (w !== last.w || h !== last.h)) {
         const { x, y, zoom } = getViewport()
         void setViewport({ x: x + (w - last.w) / 2, y: y + (h - last.h) / 2, zoom })
+        if (flight.current && Date.now() < flight.current.until) requestAnimationFrame(() => retarget.current?.())
       }
       last = { w, h }
     })
@@ -405,7 +589,6 @@ function CanvasInner() {
     return () => ro.disconnect()
   }, [getViewport, setViewport])
 
-  // ---- 取景 ----
   const pausedUntil = useRef(0)
   /**
    * 人手动平移、缩放的那一下：开始时记下视口，结束时真的动过才让跟随让路。
@@ -426,7 +609,7 @@ function CanvasInner() {
   /**
    * 打开一张图时的取景。整图放得下、缩放不低于可读下限就整图居中；放不下就
    * 不再硬塞——以入口为左锚、按可读缩放只取前几列，其余交给小地图。以前一律
-   * 整图塞进来，12 节点的图缩到 0.2，标题只剩 3px。
+   * 整图塞进来，12 节点的图缩到 0.2，标题只剩 3px。窄画布另有一档，见下面 narrow。
    */
   const frame = useCallback((duration: number) => {
     const el = rf.current
@@ -442,16 +625,26 @@ function CanvasInner() {
       void fitView({ padding: 0.12, maxZoom: 1.1, minZoom: READABLE_ZOOM, duration, interpolate: LINEAR })
       return
     }
-    // 按列聚类，取前四列的跨度定缩放
+    // 按列聚类
     const xs = [...new Set(all.map((n) => Math.round(n.position.x)))].sort((a, b) => a - b)
     const cols: number[] = []
     for (const x of xs) if (!cols.length || x - cols[cols.length - 1] > 60) cols.push(x)
-    const firstCols = cols.slice(0, 4)
-    const span = (firstCols[firstCols.length - 1] ?? bounds.x) + NODE_WIDTH - bounds.x
-    let zoom = Math.min(1, Math.max(READABLE_ZOOM, (W - 2 * PAD) / Math.max(span, NODE_WIDTH)))
+    const spanOf = (k: number) => (cols[Math.min(k, cols.length) - 1] ?? bounds.x) + NODE_WIDTH - bounds.x
+    // 窄画布（1024 宽、两边栏都开着时只剩五百来 px）：可读缩放下连前三列都放不下，
+    // 打开只看得见两张半卡片。这时退到精简档：整张图放得下就看全图，放不下就多看几列。
+    // 宽画布照旧按可读缩放——精简卡没有摘要和遥测，能看清就不该让人先放大一次
+    const narrow = cols.length >= 3 && spanOf(3) * READABLE_ZOOM > W - 2 * PAD
+    if (narrow && fit >= COMPACT_ZOOM) {
+      void fitView({ padding: 0.12, maxZoom: READABLE_ZOOM, minZoom: COMPACT_ZOOM, duration, interpolate: LINEAR })
+      return
+    }
+    // 取前四列的跨度定缩放
+    let zoom = narrow
+      ? Math.max(COMPACT_ZOOM, Math.min(READABLE_ZOOM, (W - 2 * PAD) / spanOf(4)))
+      : Math.min(1, Math.max(READABLE_ZOOM, (W - 2 * PAD) / Math.max(spanOf(4), NODE_WIDTH)))
     // 竖直方向放得下就别再放大：宁可多看几列
     const vfit = (H - 2 * PAD) / bounds.height
-    if (vfit >= READABLE_ZOOM) zoom = Math.min(zoom, vfit)
+    if (vfit >= (narrow ? COMPACT_ZOOM : READABLE_ZOOM)) zoom = Math.min(zoom, vfit)
     const entries = all.filter((n) => (n.data as FlowNode['data']).nodeType === 'input')
     const anchor = entries[0] ?? all.reduce((a, b) => (a.position.x <= b.position.x ? a : b))
     const anchorH = anchor.measured?.height ?? 80
@@ -511,9 +704,15 @@ function CanvasInner() {
     const fits = (maxX - minX) * z <= el.clientWidth - 2 * M && (maxY - minY) * z <= el.clientHeight - 2 * M
     const target = fits ? { cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 }
       : { cx: rects[0].x + rects[0].w / 2, cy: rects[0].y + rects[0].h / 2 }
-    void setCenter(target.cx, target.cy, { zoom: z, duration: reducedMotion() ? 0 : 320, interpolate: LINEAR })
+    const duration = reducedMotion() ? 0 : 320
+    flight.current = { ids, zoomAtLeast: opts.zoomAtLeast, until: Date.now() + duration + 80 }
+    void setCenter(target.cx, target.cy, { zoom: z, duration, interpolate: LINEAR })
     return true
   }, [getInternalNode, getViewport, setCenter])
+  retarget.current = () => {
+    const f = flight.current
+    if (f) bringIntoView(f.ids, { force: true, zoomAtLeast: f.zoomAtLeast })
+  }
 
   // 跟随执行：有节点实时开跑、而它在视口外时平移过去。只由 node.started 驱动，
   // 不新增任何动画循环；同一帧里一起开跑的并成一次
@@ -533,6 +732,31 @@ function CanvasInner() {
         // 人正拖着画布时也不抢：松手之后再按"动过没有"决定暂不暂停
         if (Date.now() < pausedUntil.current || userMove.current) return
         bringIntoView(ids, { zoomAtLeast: 0.5 })
+      })
+    })
+    return () => {
+      unsub()
+      cancelAnimationFrame(raf)
+    }
+  }, [bringIntoView])
+
+  // Copilot 搭图时镜头跟着它刚动过的节点：落在视口外就平移过去，不改缩放（新节点
+  // 本来就落在上游旁边或视口中心附近的空地上）。人一旦手动平移、缩放，这一轮就不再跟；
+  // 节点还在滑向落点时每帧都会变，飞行途中不重新起飞，免得镜头追着它抖
+  const copilotOff = useRef(false)
+  useEffect(() => {
+    let raf = 0
+    const unsub = useStudio.subscribe((s, prev) => {
+      if (s.copilot.active && !prev.copilot.active) copilotOff.current = false
+      if (!s.copilot.active || !s.copilotCursor || copilotOff.current) return
+      if (s.copilotCursor === prev.copilotCursor && s.nodes === prev.nodes) return
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        const st = useStudio.getState()
+        if (!st.copilot.active || !st.copilotCursor || copilotOff.current || userMove.current) return
+        if (flight.current && Date.now() < flight.current.until) return
+        bringIntoView([st.copilotCursor])
       })
     })
     return () => {
@@ -585,6 +809,41 @@ function CanvasInner() {
     [actions, screenToFlowPosition, formalLock],
   )
 
+  const ghosts = useRemovedGhosts()
+
+  // ---- 双击空白处快速添加 ----
+  const [quick, setQuick] = useState<{ x: number; y: number; flow: { x: number; y: number } } | null>(null)
+  const closeQuick = useCallback(() => setQuick(null), [])
+  const onPaneDoubleClick = (e: React.MouseEvent) => {
+    if (!(e.target as Element).classList?.contains('react-flow__pane')) return
+    if (formalLock) {
+      toast.warn('正式运行进行中，画布只读。等它结束再改')
+      return
+    }
+    if (useStudio.getState().copilot.active) {
+      toast.info('助手正在改这张图，等这一轮结束再加节点')
+      return
+    }
+    const r = box.current?.getBoundingClientRect()
+    if (!r) return
+    setQuick({ x: e.clientX - r.left, y: e.clientY - r.top, flow: screenToFlowPosition({ x: e.clientX, y: e.clientY }) })
+  }
+  const pickQuick = (type: NodeType) => {
+    const at = quick?.flow
+    setQuick(null)
+    // 双击处是卡片的中心，不是左上角
+    if (at) actions.addNode(type, { x: at.x - NODE_WIDTH / 2, y: at.y - 40 })
+  }
+
+  // ---- 运行中点节点：先看它的步骤，属性面板是次级入口 ----
+  // 看运行（进行中或回放）时点了跑过的节点，属性面板不自动盖上右栏（见 InspectorSheet）；
+  // 这里给一个明确的入口，双击节点也能开
+  // 选中了却没开面板，只会是「先看步骤」那条路。运行结束后它照样留着：不然节点选中着、
+  // 面板没开、入口也没了
+  const peekId = selectedId && sheetOpen !== selectedId ? selectedId : null
+  const peekNode = peekId ? nodes.find((n) => n.id === peekId) : undefined
+  const peekLabel = peekNode ? peekNode.data.label || NODE_DEFS[peekNode.data.nodeType]?.label || peekNode.id : ''
+
   const rootStyle = useMemo(
     () => (moment?.kind === 'failed' ? { '--moment-origin': moment.origin } as CSSProperties : undefined),
     [moment],
@@ -619,22 +878,42 @@ function CanvasInner() {
               onNodesChange={actions.onNodesChange}
               onEdgesChange={actions.onEdgesChange}
               onConnect={actions.onConnect}
-              onNodeClick={(_, node) => actions.select(node.id)}
+              onNodeClick={(_, node) => {
+                if (!stepsFirst(node.id)) {
+                  // 点的是已经选中、面板却没开的节点（先看过步骤、运行随后结束了）：
+                  // 选中不变就不会触发面板的订阅，这里直接点名打开
+                  openInspector(node.id)
+                  return
+                }
+                actions.select(node.id)
+                revealStep(node.id)
+              }}
+              onNodeDoubleClick={(_, node) => openInspector(node.id)}
               onPaneClick={() => actions.select(null)}
+              onDoubleClick={onPaneDoubleClick}
+              zoomOnDoubleClick={false}
               onNodeMouseEnter={(_, node) => { if (hasRun) useDock.getState().set({ canvasHover: node.id }) }}
               onNodeMouseLeave={() => { if (hasRun) useDock.getState().set({ canvasHover: null }) }}
               onMoveStart={(event, vp) => {
                 // 程序取景（跟随、聚焦）没有 event；有 event 的是人在拖、在滚轮
                 if (event) userMove.current = vp
               }}
-              onMoveEnd={(_, vp) => {
+              onMoveEnd={(event, vp) => {
                 applyZoom(vp.zoom, true)
+                // 只认人手的那一下收尾。程序取景飞到一半被人抓住时，d3 先收掉那段动画，
+                // React Flow 却把它的收尾推迟到下一拍才报——那时人的拖动已经开始，这条
+                // 不带 event 的收尾要是也来结账，就把人的起点吃掉了，拖完跟随照样不暂停
+                if (!event) return
                 const from = userMove.current
                 if (!from) return
                 userMove.current = null
                 const moved = Math.abs(vp.x - from.x) > 2 || Math.abs(vp.y - from.y) > 2
                   || Math.abs(vp.zoom - from.zoom) > 1e-3
-                if (moved && active) pauseFollow()
+                if (!moved) return
+                // 人接过了镜头：程序取景不再续飞，Copilot 这一轮也不再跟
+                flight.current = null
+                if (useStudio.getState().copilot.active) copilotOff.current = true
+                if (active) pauseFollow()
               }}
               onDrop={onDrop}
               onDragOver={(e) => {
@@ -674,6 +953,16 @@ function CanvasInner() {
                 style={{ width: 150, height: 100 }}
                 ariaLabel={hasRun ? '小地图（按运行状态着色）' : '小地图'}
               />
+              {ghosts && (
+                <ViewportPortal>
+                  {ghosts.items.map((g) => (
+                    <div key={`${ghosts.seq}:${g.id}`} className={clsx('sf-ghost', `nt-${g.type}`)} data-ghost={g.id}
+                         style={{ transform: `translate(${g.x}px, ${g.y}px)`, width: g.w, height: g.h }} aria-hidden>
+                      <span className="sf-ghost-tag">已删除 · {g.label}</span>
+                    </div>
+                  ))}
+                </ViewportPortal>
+              )}
             </ReactFlow>
           </MiniStates.Provider>
         </MomentContext.Provider>
@@ -681,7 +970,7 @@ function CanvasInner() {
 
       {/* 画布顶上的浮条排成一行：跟随在左，只读横幅居中；放不下时横幅折到下一行、
           再不够就截掉说明文字。各自绝对定位的话，笔记本宽度下横幅会盖住「恢复」 */}
-      {(formalLock || showFollow) && (
+      {(formalLock || showFollow || peekId) && (
         <div className="sf-float">
           {showFollow && (
             <div className={clsx('sf-follow', followPaused && 'is-paused')}>
@@ -698,6 +987,14 @@ function CanvasInner() {
               )}
             </div>
           )}
+          {peekId && (
+            <button type="button" className="sf-peek" onClick={() => openInspector(peekId)}
+                    title="属性面板会盖住右栏的运行视图，底部那一条点一下就回来。双击节点也能打开">
+              <PanelRightOpen size={11} aria-hidden />
+              <span className="sf-peek-name">{peekLabel}</span>
+              <span>的配置</span>
+            </button>
+          )}
           {formalLock && (
             <div className="sf-banner" role="status">
               <Lock size={12} />
@@ -706,6 +1003,11 @@ function CanvasInner() {
             </div>
           )}
         </div>
+      )}
+
+      {quick && box.current && (
+        <QuickAdd x={quick.x} y={quick.y} bounds={{ w: box.current.clientWidth, h: box.current.clientHeight }}
+                  onPick={pickQuick} onClose={closeQuick} />
       )}
     </div>
   )

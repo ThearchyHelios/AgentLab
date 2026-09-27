@@ -1,4 +1,4 @@
-import type { RunEvent, TeamMember, TeamRound, TeamRun } from '../types'
+import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import { TYPE_LABEL, issuanceLabel, nodeTypeLabel } from '../lib/terms'
@@ -6,6 +6,35 @@ import { TYPE_LABEL, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
 export type { TeamMember, TeamRound, TeamRun }
+
+/**
+ * 协作团队怎么收的尾。只看 finished 分不出「调度者说完成了」和「轮数用完、硬停」——
+ * 后者以前把成员的原话当结论交了出去，画布和右栏却都是一个安静的「完成」。
+ */
+export interface TeamVerdict {
+  /** 轮数用完后补的那一次只判定、不派活的决定（agent.route.* 带 closing） */
+  closing?: boolean
+  /** 那次判定的结论 */
+  done?: boolean
+  reason?: string
+  /** 用完轮数仍未完成的结局：failed 判失败（默认），degraded 降档交付 */
+  outcome?: 'failed' | 'degraded'
+  /** 一共派了几轮 */
+  rounds?: number
+  /** 一次都没被派到的成员 */
+  never?: string[]
+}
+
+/** 成员这一步为什么失败（agent.step.end 的 error）。types.ts 冻结，先在这里扩 */
+export interface TeamMemberEx extends TeamMember { error?: string }
+export interface TeamRunEx extends TeamRun { verdict?: TeamVerdict }
+
+/** 画布的协作矩阵读这个：runtime.team 是 reduceTeam 给的，带着结局 */
+export const teamVerdictOf = (team: TeamRun | undefined | null): TeamVerdict | undefined =>
+  (team as TeamRunEx | undefined | null)?.verdict
+
+/** 下一步该去哪儿改。界面据此给一个直达的入口，而不只是一句话 */
+export type FixKind = 'canvas' | 'settings' | 'tools'
 
 /**
  * 事件 → 人能看懂的步骤。
@@ -98,6 +127,16 @@ export interface Step {
   source?: string
   /** 相邻的同一件事合并成一行后的统计（见 compactSteps） */
   repeat?: { count: number; ms: number[] }
+  /** 后端给的机读代号（log.code 等）：tool_markup_leak、team_exhausted、repair… */
+  code?: string
+  /** 怎么办：出了状况的行直接说下一步，不让人自己去猜 */
+  next?: string
+  /** 下一步该去的地方 */
+  fix?: FixKind
+  /** 工具的时限（秒，tool.start.timeout_s）。进行中的行超过它就要说破 */
+  limitS?: number
+  /** 出具那一行的档位（formal / degraded / withheld） */
+  tier?: string
 }
 
 // 这两个是流式增量，后端根本不落库（_EPHEMERAL）。单次运行的 delta 量级会
@@ -554,6 +593,54 @@ function queryTitle(sql: string, source: string): string {
   return clip(`查询 ${what}${how ? ` · ${how}` : ''}`)
 }
 
+/**
+ * 几种「看着跑完了、其实没做成」的状况（NI-3/4/5）。后端这几条日志是写给排查的，原样
+ * 贴出来是一串标记和术语，而且不说该去哪儿改——这里说成人话，并给出下一步。
+ * 认不得的 code 返回 null，照原话显示
+ */
+function explainLog(code: string | undefined, message: string): Pick<Step, 'title' | 'sub' | 'next' | 'fix'> | null {
+  switch (code) {
+    case 'tool_markup_leak': {
+      // 「数据查询把工具调用写成了文字（<｜｜DSML｜｜…），没有真正调用工具，已提醒它重试一次」
+      const who = message.match(/^(.+?)把工具调用写成了文字/)?.[1]?.trim() || '模型'
+      // 收尾轮那种是真调过工具、只是步数用完了还想接着查：不是没绑工具，节点也照常完成，
+      // 说成「没有真正执行」会让人去查一个并不存在的故障
+      const settle = message.includes('收尾轮')
+      return {
+        title: settle ? `${who === '模型' ? '' : `${who}：`}步数用完了，收尾时还想接着查`
+          : `${who}把工具调用写成了文字，没有真正执行`,
+        sub: settle ? '收尾那一轮的调用没有执行，结论只基于之前查到的部分'
+          : message.includes('重试') ? '已提醒它重试一次' : undefined,
+        next: settle ? '到画布里调大这一步的「最多步数」，或者把问题问得更具体'
+          : `常见原因：${who === '模型' ? '这个节点' : `成员「${who}」`}没有绑定工具，或者模型不支持工具调用。到画布里给它绑定要用的工具`,
+        fix: 'canvas',
+      }
+    }
+    case 'team_exhausted': {
+      const x = exhaustedOf(message)
+      return {
+        title: `协作团队${x?.rounds != null ? `用完 ${x.rounds} 轮` : '用完了轮数'}仍未完成 · 按降档交付`,
+        sub: [x?.reason, x?.never?.length ? `没派到：${x.never.join('、')}` : ''].filter(Boolean).join(' · ') || undefined,
+        next: '交出去的是成员最后的原话，不能当结论用。到画布里看成员有没有绑定要用的工具，再调大「最多轮数」',
+        fix: 'canvas',
+      }
+    }
+    case 'repair_invented': {
+      // 「第 1 次修复作废：修复时出现了原文没有的值：total_count=0」
+      const values = message.match(/原文没有的值[：:]\s*(.+)$/)?.[1]?.trim()
+      const what = values ? `（${values}）` : ''
+      return {
+        title: clip(`修复被作废：出现了原文没有的值${what}`),
+        sub: `结果里有原文没有的值${what}，已作废`,
+        next: '修复只许改格式、不许补数据。先看上游节点为什么没拿到数据（常见是没有绑定查询工具）',
+        fix: 'canvas',
+      }
+    }
+    default:
+      return null
+  }
+}
+
 function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
   const base = { id: `tool-${seq}`, seq, status: 'running' as StepStatus }
   // 数据库工具单独认：它是这个产品最主要的取数方式，"调用 db_query__warehouse"
@@ -660,6 +747,20 @@ function groupConcurrent(
 }
 
 /**
+ * 「协作团队用完 N 轮仍未完成：<理由>。一次都没被派到的成员：A、B。…」里的几样东西。
+ * 判失败的报错和降档的那条日志是同一个开头；产出里的 never_dispatched 进事件时被
+ * 缩成了「[1 项]」，成员名只能从这句话里认
+ */
+function exhaustedOf(text: string): Pick<TeamVerdict, 'rounds' | 'reason' | 'never'> | null {
+  const m = text.match(/用完\s*(\d+)\s*轮仍未完成[：:]\s*([\s\S]*?)(?:。一次都没被派到的成员|。先看成员|。按降档交付|$)/)
+  if (!m) return null
+  const never = text.match(/一次都没被派到的成员[：:]\s*([^。]+)/)?.[1]
+    .split('、').map((s) => s.trim()).filter(Boolean) ?? []
+  const reason = m[2].trim()
+  return { rounds: Number(m[1]), ...(reason ? { reason } : {}), never }
+}
+
+/**
  * 把一个事件并进协作团队的泳道数据，返回**新的** TeamRun。
  *
  * 时间线和画布都要这份数据：时间线用它画泳道，画布用它把 supervisor 节点
@@ -672,10 +773,13 @@ function groupConcurrent(
  *
  * 返回 null 表示这个事件和协作团队无关（绝大多数事件都是）。
  */
-export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRun | null {
+export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRunEx | null {
   const d = (event.data ?? {}) as Record<string, any>
   const nodeId = event.node_id
   if (!nodeId) return null
+  const verdictOf = (team: TeamRun) => (team as TeamRunEx).verdict
+  const withVerdict = (team: TeamRun, patch: TeamVerdict): TeamRunEx =>
+    ({ ...team, verdict: { ...verdictOf(team), ...patch } })
 
   const roundOf = (team: TeamRun, round: number): TeamRound =>
     team.rounds.find((x) => x.round === round) ?? {
@@ -718,10 +822,15 @@ export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRun 
       const cur = roundOf(prev, round)
       const ms = num(d.duration_ms) ?? 0
       const preview = String(d.preview ?? '').slice(0, 2000)
+      // 失败的成员（异常，或者把工具调用写成了文字）：格子画成失败，而不是一个写着
+      // 失败原因的「完成」格子
+      const ended: Partial<TeamMemberEx> = d.failed
+        ? { ms, status: 'failed', result: preview || undefined, error: String(d.error ?? '') || undefined }
+        : { ms, status: 'done', result: preview || undefined }
       const idx = cur.members.findIndex((x) => x.agent === name && x.status === 'running')
-      const members = idx >= 0
-        ? cur.members.map((x, i) => (i === idx ? { ...x, ms, status: 'done' as const, result: preview || undefined } : x))
-        : [...cur.members, { agent: name, instruction: '', ms, status: 'done' as const, result: preview || undefined }]
+      const members: TeamMember[] = idx >= 0
+        ? cur.members.map((x, i) => (i === idx ? { ...x, ...ended } : x))
+        : [...cur.members, { agent: name, instruction: '', ms, status: 'done', ...ended }]
       // 这一轮实际花的是最慢那个，各人之和减去它就是省下的
       return withRound(prev, round, {
         members,
@@ -731,6 +840,11 @@ export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRun 
     }
 
     case 'log': {
+      // 降档交付的那一条：轮数用完、调度者始终没说完成，按降档把成员原话交出去
+      if (d.code === 'team_exhausted') {
+        const team = prev ?? { members: [], rounds: [], savedMs: 0, finished: false }
+        return withVerdict({ ...team, finished: true }, { outcome: 'degraded', ...exhaustedOf(String(d.message ?? '')) })
+      }
       // 带 round 的 info 日志是调度决策，不是排查日志
       if (String(d.level ?? 'info') !== 'info' || d.round == null) return null
       const team = prev ?? { members: [], rounds: [], savedMs: 0, finished: false }
@@ -740,16 +854,50 @@ export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRun 
       const done = structured ? !!d.done : legacy?.[1]?.trim() === 'FINISH'
       const reason = structured ? String(d.reason ?? '') : (legacy?.[2]?.trim() ?? '')
       if (done) return { ...team, finished: true }
+      // 最后那次判定的 round 是「派过的轮数」，不是新的一轮：记进一列的话矩阵会多出一列空的
+      if (d.closing) return team
       return reason ? withRound(team, num(d.round) ?? 0, { reason }) : team
+    }
+
+    case 'agent.route.start': {
+      // 普通的一轮等 route.end 带着派给谁再记；只有收尾判定要先记一笔「在判定」，
+      // 不然那几秒泳道上什么都不说，看着像卡住了
+      if (!d.closing) return null
+      return withVerdict(prev ?? { members: [], rounds: [], savedMs: 0, finished: false }, { closing: true })
     }
 
     case 'agent.route.end': {
       // 调度者的结构化决策。后端同一轮还会再发一条带 round 的 log，两条说的是
       // 同一件事，按哪条来结果都一样；只认 log 的话，哪天 log 不发了理由就丢了
       const team = prev ?? { members: [], rounds: [], savedMs: 0, finished: false }
-      if (d.done) return { ...team, finished: true }
       const reason = String(d.reason ?? '')
+      if (d.closing) {
+        // 轮数用完后补的那一次判定：只下结论、不派活，不是第 N+1 轮
+        const judged = withVerdict(team, { closing: true, done: !!d.done, ...(reason ? { reason } : {}) })
+        return d.done ? { ...judged, finished: true } : judged
+      }
+      if (d.done) return { ...team, finished: true }
       return reason ? withRound(team, num(d.round) ?? 0, { reason }) : team
+    }
+
+    case 'node.finished': {
+      // 降档交付：产出里带 exhausted。老后端没有 team_exhausted 那条日志时也认得出
+      const p = d.preview
+      if (!prev || !p || typeof p !== 'object' || !p.exhausted) return null
+      const rounds = num(p.rounds)
+      const known = verdictOf(prev)
+      return withVerdict({ ...prev, finished: true }, {
+        outcome: 'degraded',
+        ...(rounds != null ? { rounds } : {}),
+        ...(!known?.reason && p.exhausted_reason ? { reason: String(p.exhausted_reason) } : {}),
+      })
+    }
+
+    case 'node.failed': {
+      // 判失败（on_exhausted 默认）：报错首句就是「协作团队用完 N 轮仍未完成：…」
+      if (!prev) return null
+      const exhausted = exhaustedOf(String(d.error ?? ''))
+      return exhausted ? withVerdict({ ...prev, finished: true }, { outcome: 'failed', ...exhausted }) : null
     }
 
     default:
@@ -786,7 +934,9 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
   /** 已经有结构化调度事件的轮次。同一轮那条带 round 的 log 说的是同一件事，不再成行 */
   const routed = new Set<string>()
   /** node_id → 协作团队的泳道数据。边解码边攒，最后挂到该节点的顶层 Step 上 */
-  const teams = new Map<string, TeamRun>()
+  const teams = new Map<string, TeamRunEx>()
+  /** node_id → 校验节点最近一次修复。被作废的说明（repair_invented）折进这一行 */
+  const repairs = new Map<string, Step>()
   /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
   const spans = new Map<string, { start: number; end: number; ms: number }>()
 
@@ -1034,7 +1184,14 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
             const preview = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2)
             step.detail = preview.slice(0, 4000)
           }
+          // 协作团队降档交付：节点确实跑完了，但交出去的是成员最后的原话，不是一个安静的勾
+          if (raw && typeof raw === 'object' && raw.exhausted) {
+            step.level = 'warn'
+            const rounds = num(raw.rounds)
+            step.sub = `${rounds != null ? `用完 ${rounds} 轮` : '用完了轮数'}仍未完成，按降档交付`
+          }
         }
+        trackTeam(event)
         break
       }
 
@@ -1056,6 +1213,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
           push({ id: `e-${seq}`, seq, kind: 'error', level: 'error', status: 'failed',
                  title: String(d.error ?? '这一步失败了'), nodeId, raw }, nodeId)
         }
+        trackTeam(event)
         break
       }
 
@@ -1073,6 +1231,19 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
       }
 
       case 'llm.end': {
+        if (d.purpose === 'repair') {
+          // 校验节点让模型修格式：一次真实的模型调用（前面没有 llm.start）。以前它不成行，
+          // 修复编出来的值被作废时，时间线上连「修过」这件事都看不到
+          const ms = num(d.duration_ms)
+          const step: Step = {
+            id: `rp-${seq}`, seq, kind: 'llm', code: 'repair', nodeId, status: 'done',
+            title: '让模型修复格式', ms, meta: dur(ms),
+            ...(d.model ? { detail: `模型：${d.model}` } : {}),
+          }
+          repairs.set(nodeId ?? '_', step)
+          push(step, nodeId)
+          break
+        }
         const step = pendingLlm.get(nodeId ?? '_')
         if (!step) break
         step.status = 'done'
@@ -1112,6 +1283,9 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         const step = toolStep(seq, String(d.tool ?? ''), d.args ?? {})
         step.nodeId = nodeId
         step.startedAt = at
+        // 引擎到点会放弃等待：进行中的秒表越过它时，界面要说「已超出上限」，而不是一直走
+        const limit = num(d.timeout_s)
+        if (limit != null && limit > 0) step.limitS = limit
         // 协作成员调的工具说清是谁调的
         if (d.agent) step.sub = `${d.agent} 调用`
         // call_id 才是可靠的配对键：同一节点并发调同名工具时，按名字配会错位。
@@ -1131,6 +1305,13 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
             || preview.startsWith('查询失败')
           step.status = failed ? 'failed' : 'done'
           if (failed) step.level = 'error'
+          if (d.timed_out) {
+            // 到点被放弃的：数据库那边可能还在跑，这里只是不等了。上限写出来，才知道
+            // 该缩小查询范围还是去调时限
+            const limit = step.limitS ?? num(Number(preview.match(/超过\s*(\d+(?:\.\d+)?)\s*s/)?.[1]))
+            const why = limit != null ? `超过 ${formatNumber(limit)} s 上限，已放弃等待` : '超过时限，已放弃等待'
+            step.sub = d.agent ? `${why} · ${d.agent} 调用` : why
+          }
           // tool.error 只有 {tool,error}，没有 duration_ms/preview——不能假设统一形状
           const rows = rowCountOf(preview)
           step.ms = num(d.duration_ms)
@@ -1264,7 +1445,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
           num(d.matched_numbers) != null ? `回指 ${d.matched_numbers} 个数字` : '',
         ].filter(Boolean).join(' · ')
         out.push({
-          id: `is-${seq}`, seq, kind: 'issuance', status: 'done',
+          id: `is-${seq}`, seq, kind: 'issuance', status: 'done', ...(tier ? { tier } : {}),
           level: tier === 'formal' ? 'info' : tier === 'withheld' ? 'error' : 'warn',
           title: clip(gaps.length ? `${label}：${gaps.join('；')}` : label, 120),
           // 核对了几个指标、回指了几个数字放进展开区：横幅上有同样的数，窄栏的行尾放不下
@@ -1286,10 +1467,13 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         const round = num(d.round) ?? 0
         const step: Step = {
           id: `rs-${seq}`, seq, kind: 'branch', nodeId, status: 'running', startedAt: at,
-          title: `第 ${round + 1} 轮：调度者在想下一步…`,
+          // 轮数用完后补的那一次只判定、不派活。它的 round 是「派过几轮」，写成「第 N+1 轮」
+          // 读起来像还有新的一轮
+          title: d.closing ? '轮数用完 · 调度者在做最后判定…' : `第 ${round + 1} 轮：调度者在想下一步…`,
         }
         pendingRoutes.set(`${nodeId}|${round}`, step)
         push(step, nodeId)
+        trackTeam(event)
         break
       }
 
@@ -1298,19 +1482,24 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         const key = `${nodeId}|${round}`
         routed.add(key)
         const agents: string[] = Array.isArray(d.agents) ? d.agents.map(String) : []
-        const title = d.done || !agents.length ? `第 ${round + 1} 轮：结束协作`
-          : agents.length > 1 ? `第 ${round + 1} 轮：交给 ${agents.join('、')}（并行）`
-          : `第 ${round + 1} 轮：交给 ${agents[0]}`
         const ms = num(d.duration_ms)
         const reason = String(d.reason ?? '')
+        // 最后那次判定说「没完成」时不能写「结束协作」：那读起来像团队正常收尾了
+        const title = d.closing
+          ? d.done ? '轮数用完 · 调度者判定：已完成'
+            : clip(`轮数用完 · 调度者判定：未完成${reason ? `（${reason}）` : ''}`)
+          : d.done || !agents.length ? `第 ${round + 1} 轮：结束协作`
+          : agents.length > 1 ? `第 ${round + 1} 轮：交给 ${agents.join('、')}（并行）`
+          : `第 ${round + 1} 轮：交给 ${agents[0]}`
+        const verdictLevel = d.closing && !d.done ? { level: 'warn' as const } : {}
         const step = pendingRoutes.get(key)
         if (step) {
-          Object.assign(step, { status: 'done', title, ms, meta: dur(ms),
+          Object.assign(step, { status: 'done', title, ms, meta: dur(ms), ...verdictLevel,
                                 ...(reason ? { detail: reason } : {}) })
           pendingRoutes.delete(key)
         } else {
           push({ id: `re-${seq}`, seq, kind: 'branch', nodeId, status: 'done', title, ms,
-                 meta: dur(ms), ...(reason ? { detail: reason } : {}) }, nodeId)
+                 meta: dur(ms), ...verdictLevel, ...(reason ? { detail: reason } : {}) }, nodeId)
         }
         trackTeam(event)
         break
@@ -1335,8 +1524,16 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         const step = pendingAgents.get(key)
         const preview = String(d.preview ?? '').slice(0, 2000)
         const ms = num(d.duration_ms)
+        // 成员这一步失败了（异常，或者把工具调用写成了文字）：原因写在副标题上，不用展开才看得到。
+        // 标记那种的原话是一整句排查说明，窄栏里截断后只剩半句，这里换成和报错行同一个说法
+        const why = String(d.error ?? '')
+        const failure: Partial<Step> = d.failed
+          ? { status: 'failed', level: 'error',
+              sub: /没有真正调用工具|工具调用的原始标记/.test(why) ? '模型没有真正调用工具，这一步什么都没查到'
+                : clip(why || '这一步失败了', 80) }
+          : { status: 'done' }
         if (step) {
-          step.status = 'done'
+          Object.assign(step, failure)
           step.ms = ms
           step.meta = dur(ms)
           step.result = preview || undefined
@@ -1345,7 +1542,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
           push({
             id: `ae-${seq}`, seq, kind: 'note', nodeId, status: 'done',
             title: `${d.agent} 回复`, ms, meta: dur(ms),
-            detail: preview || undefined,
+            detail: preview || undefined, ...failure,
           }, nodeId)
         }
         trackTeam(event)
@@ -1400,11 +1597,26 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         }
         // 其余 info 是给排查用的，不进主流程——但 warn/error 用户必须看到
         if (level === 'info' || !message) break
+        const code = typeof d.code === 'string' && d.code ? d.code : undefined
+        const said = explainLog(code, message)
+        if (code === 'repair_invented') {
+          // 修复编出了原文没有的值：折进刚才那一行「让模型修复格式」，一件事一行
+          const repair = repairs.get(nodeId ?? '_')
+          if (repair && said) {
+            Object.assign(repair, { level: 'warn', sub: said.sub, next: said.next, fix: said.fix,
+                                    detail: [repair.detail, message].filter(Boolean).join('\n') })
+            repairs.delete(nodeId ?? '_')
+            break
+          }
+        }
+        if (code === 'team_exhausted') trackTeam(event)
         push({
           id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done',
           level: level === 'error' ? 'error' : 'warn',
-          title: clip(message, 120),
-          ...(message.length > 120 ? { detail: message } : {}),
+          ...(code ? { code } : {}),
+          ...(said
+            ? { ...said, detail: message }
+            : { title: clip(message, 120), ...(message.length > 120 ? { detail: message } : {}) }),
         }, nodeId)
         break
       }
@@ -1431,11 +1643,18 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         break
       }
 
-      case 'run.cancelled':
-        // 用户主动停下的，不是出错：收成中性的"已取消"，不画红色的失败
+      case 'run.cancelled': {
+        // 用户主动停下的，不是出错：收成中性的"已取消"，不画红色的失败。谁停的、放弃等
+        // 审批时一并关了几条，写在副标题上——多人用时「怎么没了」得有个交代
         settle(endingOf(event, awaiting)!)
-        out.push({ id: `rc-${seq}`, seq, kind: 'lifecycle', status: 'cancelled', title: '已取消' })
+        // 说法和画布胶囊的那一句一致：「张工 放弃了这次运行，1 条待审批一并关闭」
+        const who = typeof d.actor === 'string' && d.actor.trim() ? d.actor.trim() : ''
+        const said = String(d.message ?? '').trim()
+        const sub = said ? `${who ? `${who} ` : ''}${said}` : who ? `${who} 取消了这次运行` : ''
+        out.push({ id: `rc-${seq}`, seq, kind: 'lifecycle', status: 'cancelled', title: '已取消',
+                   ...(sub ? { sub } : {}) })
         break
+      }
 
       case 'run.finished': {
         // 开头那条"开始执行"要收尾，否则跑完了还挂着一个转圈的图标。
@@ -1648,8 +1867,10 @@ const median = (xs: number[]): number => {
  */
 export function compactSteps(steps: Step[]): Step[] {
   const out: Step[] = []
+  // 出了状况的行，副标题和下一步说的是为什么、怎么办：说法不同就是两件事，并成一行只剩第一件
   const same = (a: Step, b: Step) => a.kind === b.kind && a.title === b.title
     && a.level === b.level && a.status === b.status && a.nodeId === b.nodeId
+    && (!a.level || (a.sub === b.sub && a.next === b.next))
   const mergeable = (s: Step) => !s.children?.length && !s.team && !s.execs?.length
     && s.status !== 'running' && s.status !== 'waiting'
   for (const s of steps) {
@@ -1769,8 +1990,11 @@ function parseIssue(v: unknown): CopilotIssue {
  *
  * context：画布上从不自动运行，「没有自动运行」是问数据页的说法，放到画布上
  * 读起来像出了别的故障。
+ *
+ * unchanged：收到了 final，但画布一处都没变（store 比对出来的，操作流里看不出）。
+ * 那一行不能再说「流程搭好了」。
  */
-export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'chat' }): Step[] {
+export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'chat'; unchanged?: boolean }): Step[] {
   const canvas = opts?.context === 'canvas'
   const out: Step[] = []
   let i = 0
@@ -1896,8 +2120,14 @@ export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'c
                 detail: lines.join('\n') || undefined })
         } else if (op.status === 'passed') {
           settleAll('done')
+          // 规则上通过了，但有节点的工具被悄悄去掉了（模型改提示词时漏写 tools）：这不是
+          // 一句安静的「自查通过」能交代的，图照样能跑，只是跑起来什么都查不到
+          const dropped = droppedOf(op)
           add({ id: `ck-${i}`, seq: i, kind: 'note', status: 'done',
-                title: op.repaired ? '自查通过：问题已经改好' : '自查通过' })
+                title: `${op.repaired ? '自查通过：问题已经改好' : '自查通过'}${dropped.length
+                  ? `，但有 ${dropped.length} 处工具被去掉了` : ''}`,
+                ...(dropped.length ? { level: 'warn' as const, code: 'tools_dropped',
+                                       detail: dropped.map((x) => x.message).join('\n') } : {}) })
         } else {
           // 修正那一轮本身是跑完了的；没修好由下面这行红字说，不把阶段行也画红
           settleAll('done')
@@ -1907,7 +2137,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'c
                     ? `自查后还有 ${issues.length} 处问题没能自动修好`
                     : `自查后还有 ${issues.length} 处问题，没有自动运行`
                   : String(op.message ?? '自查没能完成'),
-                detail: lines.join('\n') || undefined,
+                detail: [...lines, ...droppedOf(op).map((x) => x.message)].join('\n') || undefined,
                 ...(typeof op.detail === 'string' && op.detail ? { raw: op.detail } : {}) })
         }
         break
@@ -1922,9 +2152,10 @@ export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'c
         const built = [...out].reverse().find((s) => s.id.startsWith('cd-'))
           ?? (last?.kind === 'lifecycle' ? last : undefined)
         if (total && built) {
-          built.title = nodeCount && nodeCount < total
-            ? `流程搭好了，加了 ${nodeCount} 步，整张图共 ${total} 步`
-            : `流程搭好了，共 ${total} 步`
+          built.title = opts?.unchanged ? `看过了，没有改动（整张图共 ${total} 步）`
+            : nodeCount && nodeCount < total
+              ? `流程搭好了，加了 ${nodeCount} 步，整张图共 ${total} 步`
+              : `流程搭好了，共 ${total} 步`
         }
         settleAll('done')
         // 模型写了不存在的节点类型：那一步被跳过了。不说出来的话"共 N 步"是
@@ -1932,6 +2163,24 @@ export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'c
         for (const t of skippedTypes(op)) {
           add({ id: `cm-${i}-${t}`, seq: i, kind: 'note', status: 'done', level: 'warn',
                 title: clip(`少了一步：模型用了不存在的节点类型「${t}」，已跳过`, 80) })
+        }
+        // 工具绑定变化单独成一行：改图回执以前只说「修改 1」，模型改提示词时漏写 tools、
+        // 把查库的工具整个抹掉，要到运行结果不对才发现
+        const changes = toolChangesOf(op)
+        if (changes.length) {
+          const lost = changes.filter((c) => c.removed.length)
+          const one = changes.length === 1 ? changes[0] : null
+          add({
+            id: `cg-${i}`, seq: i, kind: 'tool', status: 'done', code: 'tool_changes',
+            ...(lost.length ? { level: 'warn' as const } : {}),
+            title: clip(one
+              ? one.removed.length && !one.after.length ? `${changeWho(one)}的工具被清空了`
+                : one.removed.length ? `${changeWho(one)}少了 ${one.removed.length} 个工具`
+                : `${changeWho(one)}的工具变了`
+              : `${changes.length} 处工具绑定变了${lost.length ? `，${lost.length} 处少了工具` : ''}`, 80),
+            detail: changes.map((c) => `${changeWho(c)}：${c.before.join('、') || '（空）'} → ${c.after.join('、') || '（空）'}`)
+              .join('\n'),
+          })
         }
         break
       }
@@ -1951,6 +2200,30 @@ export function decodeCopilot(ops: CopilotOp[], opts?: { context?: 'canvas' | 'c
     }
   }
   return out
+}
+
+/** final.tool_changes：后端比对新旧图得出的工具绑定变化（NI-1） */
+function toolChangesOf(op: CopilotOp): ToolChange[] {
+  const list: any[] = Array.isArray(op.tool_changes) ? op.tool_changes : []
+  const names = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : [])
+  return list.filter((c) => c && typeof c === 'object').map((c) => ({
+    node_id: String(c.node_id ?? ''),
+    field: String(c.field ?? 'tools'),
+    label: String(c.label ?? c.node_id ?? ''),
+    member: c.member == null ? null : String(c.member),
+    before: names(c.before), after: names(c.after), added: names(c.added), removed: names(c.removed),
+  }))
+}
+
+/** 「数据查询」/「销售分析团队」的成员「取数员」 */
+const changeWho = (c: ToolChange): string =>
+  c.member ? `「${c.label}」的成员「${c.member}」` : `「${c.label}」`
+
+/** 自查带回的「工具被去掉了」警告（code=tools_dropped）。check 里有就用它，否则看 final.issues */
+function droppedOf(op: CopilotOp): CopilotIssue[] {
+  const list: any[] = [...(Array.isArray(op.warnings) ? op.warnings : []),
+                       ...(op.op === 'final' && Array.isArray(op.issues) ? op.issues : [])]
+  return list.filter((x) => x && typeof x === 'object' && x.code === 'tools_dropped').map(parseIssue)
 }
 
 function skippedTypes(op: CopilotOp): string[] {
@@ -1983,10 +2256,17 @@ export interface CopilotOutcome {
   updated: number
   removed: number
   error?: { message: string; hint?: string; raw?: string }
+  /** 工具绑定变化（final.tool_changes）。removed 非空的那几处要提醒 */
+  toolChanges: ToolChange[]
+  /** 自查的「工具被去掉了」警告（tools_dropped）：这一轮的要求里没提到去掉 */
+  dropped: CopilotIssue[]
 }
 
 export function copilotOutcome(ops: CopilotOp[], running = false): CopilotOutcome {
-  const res: CopilotOutcome = { kind: running ? 'running' : 'empty', skipped: [], added: 0, updated: 0, removed: 0 }
+  const res: CopilotOutcome = {
+    kind: running ? 'running' : 'empty', skipped: [], added: 0, updated: 0, removed: 0,
+    toolChanges: [], dropped: [],
+  }
   for (const op of ops) {
     switch (op.op) {
       case 'add_node': res.added += 1; break
@@ -2006,12 +2286,16 @@ export function copilotOutcome(ops: CopilotOp[], running = false): CopilotOutcom
             repaired: num(op.repaired) ?? 0,
             issues,
           }
+          res.dropped = droppedOf(op)
         }
         break
       }
       case 'final':
         res.total = op.graph?.nodes?.length
         res.skipped = skippedTypes(op)
+        res.toolChanges = toolChangesOf(op)
+        // 同一批警告 final.issues 里也有一份：自查已经带回来了就不再算一遍
+        if (!res.dropped.length) res.dropped = droppedOf(op)
         if (!running) res.kind = 'built'
         break
       case 'error':

@@ -589,17 +589,45 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 跑完了但有要留意的事：降档交付、收尾时还想调工具 */
+.nc-tele-note.is-warn {
+  color: var(--st-waiting);
+}
+/* 工具调用超出了后端声明的时限：只有这时才上色，平常是安静的「⋯」 */
+.nc-over {
+  color: var(--st-waiting);
+  font-family: var(--font-sans);
+  font-weight: 600;
+}
 .nc-tele-side {
   display: flex;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   align-items: center;
   gap: 7px;
   font-family: var(--font-mono);
+}
+.nc-tele-side > * {
+  flex: none;
+}
+/* 在跑的工具名可以很长（db_query__warehouse）：只有它让位，截成省略号 */
+.nc-tele-side > .nc-tools {
+  flex: 0 1 auto;
+  min-width: 0;
 }
 .nc-tools {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  white-space: nowrap;
+}
+.nc-tools > svg {
+  flex: none;
+}
+.nc-tool-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nc-tools.is-live {
   color: var(--st-running);
@@ -1347,8 +1375,23 @@
 }
 .team-head-rule {
   flex: 1;
+  min-width: 6px;
   height: 1px;
   background: linear-gradient(to right, var(--hairline), transparent);
+}
+.team-head-right {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 用完轮数仍未完成：失败是红、降档交付是琥珀。平常的表头是安静的灰 */
+.team-head-right.is-err {
+  color: var(--st-failed);
+  font-weight: 600;
+}
+.team-head-right.is-warn {
+  color: var(--st-waiting);
+  font-weight: 600;
 }
 
 .team-row {
@@ -1378,6 +1421,14 @@
 /* 前几轮干过、这一轮没它：压暗但留着成绩，不是"待命" */
 .team-row-past {
   opacity: 0.6;
+}
+/* 轮数用完、一次都没被派到：不压暗，左边一道琥珀虚线——它正是这次没做完的线索 */
+.team-row-never {
+  border-left: 2px dashed color-mix(in srgb, var(--st-waiting) 70%, transparent);
+}
+.team-row-never .team-name,
+.team-row-never .team-ms {
+  color: var(--st-waiting);
 }
 /* 调度者那一行：和成员分开，底下一道细线 */
 .team-row-dispatch {

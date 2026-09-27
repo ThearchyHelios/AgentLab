@@ -1,412 +1,25 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   AlertTriangle, ChevronRight, Database, FileSpreadsheet, Info, KeyRound, Lock, Plug, Plus, RefreshCw,
-  Search, Table2, Trash2, Upload, X,
+  Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
+import type { IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
-  confirmDialog, EmptyState, ErrorState, Field, IconButton, Modal, promptDialog, Skeleton, Spinner, StatusBadge,
-  toast,
+  confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Modal, promptDialog,
+  SectionBar, Skeleton, Spinner, toast, useRadioGroup, useTicker,
 } from '../components/ui'
 import { humanizeError } from '../lib/errors'
-import { formatDateTime, formatDuration, formatNumber, formatRelative, formatTime, parseServerTime } from '../lib/format'
+import {
+  formatBytes, formatDateTime, formatDuration, formatNumber, formatRelative, parseServerTime, shortLabel,
+} from '../lib/format'
+import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
+import type { HealthRecord } from '../lib/health'
+import { workflowList, workflowsMentioning } from '../lib/mentions'
 import { useRunClock } from '../run/useRunClock'
-import type { Workflow } from '../types'
-
-// ===========================================================================
-// 管理页共用件：工具、知识、数据、设置四页都用。
-//
-// 暂住在这里：这一轮不动 components/ui.tsx，也不另开文件。等 ui.tsx 能改了，
-// PageHeader / HealthPill / deferDelete 挪过去。
-// ===========================================================================
-
-/**
- * 页头：图标、标题、一句说明、页面级按钮。
- *
- * 高度卡死 48px：toast 从 56px 起，工具栏比这高，常驻的出错 toast 就会压住
- * 按钮。标签页（如果有）紧贴在页头下面、左边缘对齐。
- */
-export function PageHeader({ icon, title, subtitle, actions }: {
-  icon: ReactNode; title: string; subtitle?: string; actions?: ReactNode
-}) {
-  return (
-    <header className="flex h-12 shrink-0 items-center gap-2.5 border-b bg-panel px-4">
-      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border bg-elev text-dim" aria-hidden>
-        {icon}
-      </span>
-      <h1 className="shrink-0 text-sm font-semibold">{title}</h1>
-      {subtitle && <p className="min-w-0 truncate text-xs text-faint" title={subtitle}>{subtitle}</p>}
-      <span className="flex-1" />
-      {actions}
-    </header>
-  )
-}
-
-/** 标签页里一节的标题行：左边标题和一句说明，右边这一节的按钮 */
-export function SectionBar({ title, hint, children }: { title: string; hint?: ReactNode; children?: ReactNode }) {
-  return (
-    <div className="mb-3 flex flex-wrap items-end gap-x-3 gap-y-2">
-      <div className="min-w-0 flex-1">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        {hint && <p className="mt-0.5 text-xs leading-relaxed text-faint">{hint}</p>}
-      </div>
-      {children && <div className="flex flex-wrap items-center gap-2">{children}</div>}
-    </div>
-  )
-}
-
-/** 删除类的纯图标按钮：悬停铺 10% 的 err 底，读屏念得出删的是谁 */
-export function DeleteButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
-  return (
-    <IconButton
-      label={label}
-      onClick={onClick}
-      disabled={disabled}
-      className="text-faint hover:bg-st-failed/10 hover:text-[var(--err)]"
-      icon={<Trash2 size={12} />}
-    />
-  )
-}
-
-/**
- * 单选组（role=radiogroup）的键盘约定：整组只占一个 Tab 位，落在选中项上；
- * ←→↑↓ 在组内移动并选中，首尾相接。标了 radio 却每项一个 Tab 位、方向键没反应，
- * 等于对读屏用户许了个做不到的诺。
- *
- * 用法：const radio = useRadioGroup(values, value, onChange)，每个选项展开
- * {...radio(v)}，点击照旧自己写 onClick。
- */
-export function useRadioGroup<T extends string>(values: readonly T[], value: T | undefined, onChange: (v: T) => void) {
-  const refs = useRef(new Map<T, HTMLElement | null>())
-  // 选中的值不在选项里（还没加载完之类）：让第一项接住 Tab
-  const focusable = value !== undefined && values.includes(value) ? value : values[0]
-  return (v: T) => ({
-    ref: (el: HTMLElement | null) => { refs.current.set(v, el) },
-    role: 'radio' as const,
-    'aria-checked': v === value,
-    tabIndex: v === focusable ? 0 : -1,
-    onKeyDown: (e: ReactKeyboardEvent) => {
-      const step = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 0
-      if (!step || e.altKey || e.metaKey || e.ctrlKey) return
-      e.preventDefault()
-      const i = values.indexOf(v)
-      const next = values[(i + step + values.length) % values.length]
-      if (next !== value) onChange(next)
-      refs.current.get(next)?.focus()
-    },
-  })
-}
-
-/**
- * 每 ms 毫秒重渲染一次，给「3 分钟前」这类相对时间保鲜。
- * 只负责触发重渲染：算相对时间时要现取 Date.now()——返回值是上一拍的时刻，
- * 比刚到的结果还早，拿它算会把「刚刚」写成一个钟点。
- */
-export function useTicker(ms: number, active = true): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!active) return
-    const t = setInterval(() => setNow(Date.now()), ms)
-    return () => clearInterval(t)
-  }, [ms, active])
-  return now
-}
-
-/** 图里引用了这些名字（工具名、模型 id）的工作流。按 JSON 里的整串值匹配，不做子串 */
-export function workflowsMentioning(workflows: Workflow[], tokens: string[]): Workflow[] {
-  const needles = tokens.filter(Boolean).map((t) => JSON.stringify(t))
-  if (!needles.length) return []
-  return workflows.filter((w) => {
-    const text = JSON.stringify(w.graph ?? {})
-    return needles.some((n) => text.includes(n))
-  })
-}
-
-/** 「3 个工作流（周报、巡检 等）」 */
-export function workflowList(list: Workflow[], max = 3): string {
-  const names = list.slice(0, max).map((w) => `「${w.name}」`).join('')
-  return `${list.length} 个工作流（${names}${list.length > max ? ' 等' : ''}）`
-}
-
-// ---------------------------------------------------------------------------
-// 连没连上：统一、持久的状态
-// ---------------------------------------------------------------------------
-
-/**
- * 一次「测连接」的结果。按 `种类:id` 存：模型接入 provider:<id>、数据源
- * datasource:<id>、MCP mcp:<id>。
- *
- * 以前测完只弹 4 秒 toast，结果存在组件 state 里，切个标签就没了；卡片上的圆点
- * 又各说各的（模型卡的绿点其实是「启用」）。管理页最核心的问题是「现在能不能
- * 用」，答案得留在对象上，并注明是什么时候测的。
- *
- * 模块级而不是组件 state：切标签、换页都还在。再写一份到 localStorage，刷新
- * 也还在——只是这台浏览器的缓存，后端不记，所以一律带上「几分钟前测的」。
- */
-export interface HealthRecord {
-  ok: boolean
-  /** 往返毫秒 */
-  ms?: number | null
-  /** 测的时刻（ms） */
-  at: number
-  error?: string
-  hint?: string
-  detail?: string
-  /** 成功时的补充：用的哪个模型、回了什么 */
-  note?: string
-}
-
-const HEALTH_KEY = 'agentlab.health'
-
-function readHealth(): Record<string, HealthRecord> {
-  try {
-    const raw = JSON.parse(localStorage.getItem(HEALTH_KEY) ?? '{}')
-    return raw && typeof raw === 'object' ? raw : {}
-  } catch {
-    return {}
-  }
-}
-
-let healthSnap: { records: Record<string, HealthRecord>; checking: Record<string, number> } = {
-  records: readHealth(), checking: {},
-}
-const healthListeners = new Set<() => void>()
-const subscribeHealth = (l: () => void) => {
-  healthListeners.add(l)
-  return () => { healthListeners.delete(l) }
-}
-function emitHealth(next: Partial<typeof healthSnap>, persist = false) {
-  healthSnap = { ...healthSnap, ...next }
-  if (persist) {
-    try { localStorage.setItem(HEALTH_KEY, JSON.stringify(healthSnap.records)) } catch { /* 隐私模式：只是刷新后不记得 */ }
-  }
-  healthListeners.forEach((l) => l())
-}
-
-export function useHealth(key: string): { record?: HealthRecord; checkingSince?: number } {
-  const snap = useSyncExternalStore(subscribeHealth, () => healthSnap, () => healthSnap)
-  return { record: snap.records[key], checkingSince: snap.checking[key] }
-}
-
-export function setHealth(key: string, record: HealthRecord) {
-  emitHealth({ records: { ...healthSnap.records, [key]: record } }, true)
-}
-
-export function forgetHealth(key: string) {
-  const { [key]: _gone, ...rest } = healthSnap.records
-  emitHealth({ records: rest }, true)
-}
-
-/**
- * 测一次并记下结果。run 返回后端的 {ok, error, hint, detail}；ms 和 note 由调用方
- * 从各自的字段里取（latency_ms / elapsed_ms）。
- *
- * 后端本身够不着时不记：那说的是「我们连不上后端」，不是这个库或模型坏了，
- * 记成它的失败就是冤枉它。只弹 toast。
- */
-export async function checkHealth(
-  key: string,
-  run: () => Promise<Omit<HealthRecord, 'at'>>,
-): Promise<HealthRecord | null> {
-  if (healthSnap.checking[key]) return null
-  emitHealth({ checking: { ...healthSnap.checking, [key]: Date.now() } })
-  let record: HealthRecord | null = null
-  try {
-    record = { ...(await run()), at: Date.now() }
-  } catch (e) {
-    const h = humanizeError(e)
-    if (h.kind === 'network') {
-      toast.error(e)
-    } else {
-      record = {
-        ok: false, at: Date.now(),
-        error: h.reason ? `${h.title}：${h.reason}` : h.title, hint: h.action, detail: h.raw,
-      }
-    }
-  } finally {
-    const { [key]: _done, ...checking } = healthSnap.checking
-    emitHealth({
-      checking,
-      ...(record ? { records: { ...healthSnap.records, [key]: record } } : {}),
-    }, !!record)
-  }
-  return record
-}
-
-/**
- * 连通状态胶囊：状态剪影 + 一句话。
- *
- * 和画布运行态同一套语言：进行中是转着的圆环、正常是带勾的方块、失败是三角、
- * 没测过是空心点——去掉颜色也认得出。正常态安静（字是 dim），出错才用 err 色。
- * 结果刚到的那一下，状态点外圈扩散一次；进页时从缓存读出的旧结果不播。
- */
-export function HealthPill({ record, checkingSince, labels, className, stale }: {
-  record?: HealthRecord | null
-  checkingSince?: number
-  labels?: { idle?: string; checking?: string; ok?: string; fail?: string }
-  className?: string
-  /** 结果已经不代表眼前这份配置（改过了），淡出显示并提示重测 */
-  stale?: boolean
-}) {
-  const clock = useRunClock(!!checkingSince)
-  useTicker(30_000, !!record && !checkingSince)
-  const state = checkingSince ? 'checking' : !record ? 'idle' : record.ok ? 'ok' : 'fail'
-  const status = ({ idle: 'idle', checking: 'running', ok: 'done', fail: 'failed' } as const)[state]
-  const color = `var(--st-${status})`
-
-  const [ping, setPing] = useState(0)
-  const lastAt = useRef(record?.at)
-  useEffect(() => {
-    const at = record?.at
-    if (at && at !== lastAt.current && Date.now() - at < 3000) setPing(at)
-    lastAt.current = at
-  }, [record?.at])
-
-  // at 为 0：后端记的上次结果，不知道是什么时候测的，就不写时间。带个「测」字：
-  // 这是上次测的时刻，不是此刻的状态
-  const rel = record?.at ? formatRelative(record.at) : ''
-  const when = !rel ? '' : rel === '刚刚' ? '刚测过' : /前$/.test(rel) ? `${rel}测` : `${rel} 测`
-  const text = state === 'checking'
-    ? `${labels?.checking ?? '正在测'} · ${formatDuration(Math.max(0, clock - (checkingSince ?? clock)))}`
-    : state === 'idle'
-      ? (labels?.idle ?? '未测试')
-      : state === 'ok'
-        ? [labels?.ok ?? '已连通', record?.ms != null ? formatDuration(record.ms) : null, when].filter(Boolean).join(' · ')
-        : [labels?.fail ?? '连不上', when].join(' · ')
-  const tip = record
-    ? [
-        record.at ? `${formatDateTime(record.at)} 测的` : '上次探测的结果',
-        record.ok ? record.note : record.error,
-        stale ? '配置改过了，这个结果不代表眼前这份，重测一次' : null,
-      ].filter(Boolean).join('\n')
-    : undefined
-  // 念给读屏的那一句只在状态切换时变：看得见的那句里有 100ms 一跳的计时和
-  // 「3 分钟前」，放进播报区的话测连接期间会一直念、之后每分钟每张卡再念一遍。
-  // 时刻写成钟点，不写相对时间
-  const spoken = state === 'checking'
-    ? '正在测连接'
-    : state === 'idle' || !record
-      ? ''
-      : [
-          record.ok
-            ? [labels?.ok ?? '已连通', record.ms != null ? formatDuration(record.ms) : null].filter(Boolean).join(' ')
-            : `${labels?.fail ?? '连不上'}${record.error ? `：${record.error}` : ''}`,
-          record.at ? `${formatTime(record.at)} 测的` : null,
-          stale ? '配置改过了，这个结果不代表眼前这份' : null,
-        ].filter(Boolean).join('，')
-
-  return (
-    <>
-      <span
-        aria-hidden
-        data-health={state}
-        title={tip}
-        className={clsx('inline-flex items-center gap-1.5 whitespace-nowrap text-2xs tnum', stale && 'opacity-55', className)}
-        style={{ color: state === 'fail' ? color : state === 'checking' ? 'var(--accent)' : state === 'ok' ? 'var(--text-dim)' : 'var(--text-faint)' }}
-      >
-        <span className="relative inline-flex">
-          {ping > 0 && (
-            <span
-              key={ping}
-              className="absolute inset-0 animate-ping rounded-full"
-              style={{ background: color, animationIterationCount: 1, animationFillMode: 'forwards' }}
-              onAnimationEnd={() => setPing(0)}
-            />
-          )}
-          <StatusBadge status={status} size={12} decorative />
-        </span>
-        {text}
-        {stale && state !== 'checking' && <span className="text-faint">· 配置改过了</span>}
-      </span>
-      <span role="status" className="sr-only">{spoken}</span>
-    </>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// 删除后可撤销
-// ---------------------------------------------------------------------------
-
-const UNDO_MS = 5000
-const pendingDeletes = new Map<number, string>()
-let pendingSeq = 0
-/**
- * 已经点了删除的对象（按 DELETE 的 url 记）。撤销窗口里 DELETE 还没发，这时列表
- * 一刷新（知识库有文档在处理时 2 秒轮询一次、写完记忆、存完工具都会重拉），后端
- * 照样返回它，行就回来了——toast 还写着「已删除」，再点一次删除还会多排一个
- * DELETE，头一个落地后第二个 404。所以各列表的 load 都要过一遍 withoutDeferred。
- *
- * 撤销、或者删失败放回原处时才拿出去；删成功了也不拿：id 不会再出现，而删之前
- * 发出、删之后才回来的那次列表请求里还带着它
- */
-const deferredGone = new Set<string>()
-
-/** 滤掉还在撤销窗口里（或已经删掉）的行。base 是 DELETE 地址去掉 id 的那段 */
-export function withoutDeferred<T extends { id: string }>(rows: T[], base: string): T[] {
-  return deferredGone.size ? rows.filter((r) => !deferredGone.has(`${base}/${r.id}`)) : rows
-}
-
-// 关页、刷新时，还在撤销窗口里的删除照样发出去：用户已经点了删除，刷新一下它
-// 又回来了，比多等 5 秒更让人糊涂。keepalive 让请求活过页面卸载
-if (typeof window !== 'undefined') {
-  window.addEventListener('pagehide', () => {
-    for (const url of pendingDeletes.values()) {
-      void fetch(url, { method: 'DELETE', keepalive: true }).catch(() => {})
-    }
-    pendingDeletes.clear()
-  })
-}
-
-/**
- * 低代价的删除：列表里先拿掉，toast 给 5 秒「撤销」，到点才真发 DELETE。
- * 比弹窗确认少一次打断，误删了又救得回来。发失败了放回原处并说明。
- *
- * url 是关页时补发用的（/api/...），commit 是正常路径。url 同时是「已删」的
- * 记号：列表的 load 用 withoutDeferred 按它滤掉这一行。
- */
-export function deferDelete({ what, url, hide, restore, commit, done }: {
-  what: string
-  url: string
-  hide: () => void
-  restore: () => void
-  commit: () => Promise<unknown>
-  done?: () => void
-}) {
-  deferredGone.add(url)
-  hide()
-  const id = ++pendingSeq
-  pendingDeletes.set(id, url)
-  // 先拿掉记号再 restore：restore 多半是重拉列表，记号还在的话又被滤掉
-  const putBack = () => { deferredGone.delete(url); restore() }
-  const timer = setTimeout(async () => {
-    if (!pendingDeletes.delete(id)) return
-    toast.dismiss(toastId)
-    try {
-      await commit()
-      done?.()
-    } catch (e) {
-      putBack()
-      const h = humanizeError(e)
-      toast.error(`没删掉${what}：${h.reason ? `${h.title}，${h.reason}` : h.title}`, { detail: h.raw })
-    }
-  }, UNDO_MS)
-  const toastId = toast(`已删除${what}`, 'info', {
-    duration: UNDO_MS,
-    key: `undo:${id}`,
-    action: {
-      label: '撤销',
-      onClick: () => {
-        if (!pendingDeletes.delete(id)) return
-        clearTimeout(timer)
-        putBack()
-      },
-    },
-  })
-}
 
 // ===========================================================================
 // 数据源
@@ -427,9 +40,6 @@ export const isUploadedTable = (row: any): boolean =>
   row?.kind === 'sqlite' && /[\\/]uploads[\\/]tables[\\/][^\\/]+\.db$/.test(row?.database ?? '')
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
-
-/** 「OpenAI 兼容（DeepSeek / …）」→「OpenAI 兼容」。卡片上的类型标签要短 */
-export const shortLabel = (label?: string | null) => (label ?? '').replace(/[（(].*$/, '').trim()
 
 export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
   const navigate = useNavigate()
@@ -546,11 +156,14 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
           source={editing}
           kinds={kinds}
           onClose={() => setEditing(null)}
-          onSaved={(row, tested) => {
+          onSaved={(row, tested, reconnected) => {
             const isNew = !editing.id
             setEditing(null)
             upsert(row)
+            // 本机记着的那次测连接说的是改之前的库：换了地址、账号或连接参数就不作数了
+            // （后端同样清掉了自己记的那份，除非表单里刚测过这一份）
             if (tested) setHealth(`datasource:${row.id}`, tested)
+            else if (reconnected) forgetHealth(`datasource:${row.id}`)
             if (isNew) {
               toast.ok(`已接入「${row.name}」。下一步：探查结构，助手靠它写 SQL`, {
                 action: { label: '探查结构', onClick: () => setKick({ id: row.id, seq: Date.now() }) },
@@ -590,7 +203,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   kick: number
 }) {
   const healthKey = `datasource:${row.id}`
-  const { record, checkingSince } = useHealth(healthKey)
+  // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
+  const { record, checkingSince } = useHealth(healthKey, healthFromServer(row))
   const workflows = useCatalog((s) => s.workflows)
   const [busy, setBusy] = useState('')
   const uploaded = isUploadedTable(row)
@@ -608,17 +222,19 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
 
   const configured: string = row.options?.schema ?? ''
   const configuredLabel = configured || '默认 schema'
+  // 缓存是按哪个 schema 探的（null：老缓存没记，或者还没探过）。和配置对不上时，
+  // 助手写 SQL 用的是另一个 schema 的表——改了配置没重探、或者重探失败都会这样
+  const cachedSchema: string | null = row.cached_schema ?? null
+  const schemaDrift = cachedSchema != null && cachedSchema !== configured
 
-  const introspect = async (schema?: string) => {
+  const introspect = async () => {
     if (busy) return
     busySince.current = Date.now()
-    setBusy(schema ? `schema:${schema}` : 'introspect')
+    setBusy('introspect')
     try {
-      const next = await api.datasources.introspect(row.id, schema)
+      const next = await api.datasources.introspect(row.id)
       onChange(next)
-      if (schema && schema !== configured) {
-        await settleOther(schema, next)
-      } else if (next.table_count) {
+      if (next.table_count) {
         toast.ok(`「${row.name}」探到 ${formatNumber(next.table_count)} 个对象`)
       } else if (!next.schema_error) {
         // 连得上、也没报错，就是这个 schema 下真的没有对象。探查失败的红字
@@ -633,72 +249,86 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   }
 
   /**
-   * 用别的 schema 探完之后：要么写进配置，要么马上换回配置里的。
+   * 换个 schema 看看：只看不存（dry_run），缓存和配置都不动。探到对象再问要不要
+   * 写进配置；要，就改配置并按新配置真探一次。
    *
-   * 后端的探查没有「只看不存」，结果直接落进缓存——助手和「问数据」此刻看到的
-   * 已经是这份。以前「只看看，不改」就停在这儿：卡片上的 schema 还写着原来的，
-   * 对象数和结构却是另一个 schema 的，只有一条几秒就消失的 toast 提过一句。
-   * 现在不写进配置就重新探一次配置里的，让缓存和配置始终对得上
+   * 以前后端没有「只看」，一探结果就落进缓存，选「不改」还得马上再探一次换回去，
+   * 换回去失败时助手看到的就是另一个 schema 的表
    */
-  const settleOther = async (schema: string, next: any) => {
-    if (!next.table_count) {
-      await restoreConfigured(schema, `「${schema}」下没探到对象，配置不改`)
+  const probeOther = async (schema: string) => {
+    if (busy) return
+    busySince.current = Date.now()
+    setBusy(`schema:${schema}`)
+    let preview: IntrospectPreview
+    try {
+      preview = await api.datasources.previewSchema(row.id, schema)
+    } catch (e) {
+      toast.error(e)
+      return
+    } finally {
+      setBusy('')
+    }
+    if (preview.schema_error) {
+      toast.warn(`「${schema}」探不出来：${preview.schema_error}`, { detail: '只是看看：配置和缓存都没动' })
       return
     }
-    const names: string[] = await api.datasources.schema(row.id).then((s) => s.tables ?? [], () => [])
-    const sample = names.slice(0, 6).map((t) => t.slice(t.lastIndexOf('.') + 1))
+    if (!preview.table_count) {
+      toast.info(`「${schema}」下没有对象。只是看看，配置和缓存都没动`)
+      return
+    }
+    const total = Math.max(preview.table_count, preview.total ?? 0)
+    const sample = preview.tables.slice(0, 6).map((t) => t.slice(t.lastIndexOf('.') + 1))
     const ok = await confirmDialog({
       title: `把 schema 改成「${schema}」？`,
-      body: `用 ${schema} 探到了 ${formatNumber(next.table_count)} 个对象${sample.length ? `，比如 ${sample.join('、')}${names.length > sample.length ? ' 等' : ''}` : ''}。`,
+      body: `「${schema}」下有 ${formatNumber(total)} 个对象${sample.length ? `，比如 ${sample.join('、')}${total > sample.length ? ' 等' : ''}` : ''}。`,
       consequences: [
-        `改：写进这个数据源的配置，以后探查结构、助手写 SQL 都用 ${schema}`,
-        `不改：马上重新探查配置里的「${configuredLabel}」，助手看到的结构跟着换回去`,
+        `改：写进这个数据源的配置并重新探查，以后助手写 SQL 都用 ${schema}`,
+        `不改：什么都不动。刚才只是看看，助手看到的还是「${configuredLabel}」的结构`,
       ],
       confirmLabel: `改成 ${schema}`,
-      cancelLabel: `不改，换回 ${configured || '默认'}`,
+      cancelLabel: '不改',
     })
-    if (!ok) {
-      await restoreConfigured(schema, '没改配置')
-      return
-    }
-    try {
-      onChange(await api.datasources.update(row.id, { options: { ...(next.options ?? {}), schema } }))
-      toast.ok(`已把「${row.name}」的 schema 改成 ${schema}`)
-    } catch (e) {
-      const h = humanizeError(e)
-      toast.error(`没改成（${h.title}）：配置里还是「${configuredLabel}」，缓存里却是 ${schema} 的结构。再点一次「探查结构」换回去`, { detail: h.raw })
-    }
-  }
-
-  const restoreConfigured = async (probed: string, lead: string) => {
+    if (!ok) return
     busySince.current = Date.now()
     setBusy('introspect')
     try {
-      onChange(await api.datasources.introspect(row.id))
-      toast.info(`${lead}。已重新探查「${configuredLabel}」，助手看到的结构和配置一致`)
+      // options 整组替换：Oracle 的 service_name / sid 这些要原样带上
+      onChange(await api.datasources.update(row.id, { options: { ...(row.options ?? {}), schema } }))
     } catch (e) {
       const h = humanizeError(e)
-      toast.error(`${lead}，但没能换回「${configuredLabel}」的结构（${h.title}）：助手眼下看到的还是 ${probed} 的。再点一次「探查结构」`, { detail: h.raw })
+      toast.error(`没改成（${h.title}）：配置还是「${configuredLabel}」，缓存也没动`, { detail: h.raw })
+      setBusy('')
+      return
+    }
+    try {
+      const next = await api.datasources.introspect(row.id)
+      onChange(next)
+      toast.ok(`已把「${row.name}」的 schema 改成 ${schema}，探到 ${formatNumber(next.table_count ?? 0)} 个对象`)
+    } catch (e) {
+      // 配置已经改了、缓存还是旧的：卡片上那行「结构和配置对不上」会一直提醒
+      const h = humanizeError(e)
+      toast.error(`schema 已改成 ${schema}，但重新探查没成功（${h.title}）：助手眼下看到的还是原来的结构。再点一次「探查结构」`, { detail: h.raw })
+    } finally {
+      setBusy('')
     }
   }
 
   useEffect(() => { if (kick) void introspect() }, [kick])
 
-  // 配置里的 schema 探不出对象（失败或是空的）时，才给「换个 schema」：换着探
-  // 会改掉缓存，好好的库没必要冒这个险——要换 schema 走「编辑」
+  // 只看不存，好好的库也可以随手看看别的 schema；单文件的 SQLite 和传上来的表没有 schema 可换
   const synced = parseServerTime(row.schema_synced_at)?.getTime() ?? 0
-  const canProbeOther = !uploaded && row.kind !== 'sqlite' && !row.table_count && (!!row.schema_error || synced > 0)
+  const canProbeOther = !uploaded && row.kind !== 'sqlite'
   const introspectOther = async () => {
     const others: string[] = (row.available_schemas ?? []).filter((s: string) => s !== configured).slice(0, 8)
     const schema = await promptDialog({
-      title: '用哪个 schema 探查？',
-      body: `探到的结构会先换掉眼下缓存的那份；探到对象再问要不要写进配置，不写就马上换回「${configuredLabel}」。${others.length ? `这台服务器上还有：${others.join('、')}` : ''}`,
+      title: '看看哪个 schema？',
+      body: `只看不存：缓存和配置都不动，探到对象再问要不要写进配置。${others.length ? `这台服务器上还有：${others.join('、')}` : ''}`,
       label: 'schema',
       placeholder: others[0] ?? (row.kind === 'postgres' ? 'public' : row.kind === 'oracle' ? 'ANALYTICS' : row.database || ''),
-      confirmLabel: '探查',
+      confirmLabel: '看看',
       validate: (v) => (!v ? '填一个 schema 名' : v === configured ? `「${v}」就是配置里的，点「探查结构」就行` : null),
     })
-    if (schema) await introspect(schema)
+    if (schema) await probeOther(schema)
   }
 
   const remove = async () => {
@@ -798,17 +428,39 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           {!!row.available_schemas?.length && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <span className="text-faint">
-                当前是「{row.options?.schema || row.database || '默认'}」。这台服务器上还有，点一个换它探查：
+                当前是「{row.options?.schema || row.database || '默认'}」。这台服务器上还有，点一个看看（只看不存）：
               </span>
               {row.available_schemas.slice(0, 12).map((s: string) => (
                 <button key={s} className="chip hover:border-[var(--accent)] hover:text-fg" disabled={!!busy}
-                        onClick={() => void introspect(s)}>
+                        onClick={() => void probeOther(s)}>
                   {busy === `schema:${s}` ? <Spinner size={10} /> : <Search size={10} aria-hidden />}
-                  用 {s} 探查
+                  看看 {s}
                 </button>
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {schemaDrift && (
+        <div
+          className="mx-3 mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-3 py-2 text-xs leading-relaxed"
+          style={{
+            borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--border))',
+            background: 'color-mix(in srgb, var(--warn) 7%, transparent)',
+          }}
+          data-schema-drift
+        >
+          <AlertTriangle size={12} className="shrink-0 text-[var(--warn)]" aria-hidden />
+          <span className="min-w-0 flex-1">
+            <span className="text-[var(--warn)]">
+              助手看到的结构是按「{cachedSchema || '默认 schema'}」探的，配置里写的是「{configuredLabel}」
+            </span>
+            <span className="text-dim">：它写 SQL 用的表可能不在配置的 schema 里。</span>
+          </span>
+          <button className="btn btn-xs" disabled={!!busy} onClick={() => void introspect()}>
+            <RefreshCw size={11} aria-hidden /> 按配置重新探查
+          </button>
         </div>
       )}
 
@@ -835,11 +487,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           <span className="text-[var(--warn)]">结构还没探查 · 助手看不到有哪些表</span>
         )}
         {canProbeOther && (
-          <button className="inline-flex items-center gap-1 rounded px-1 py-0.5 text-faint hover:bg-hover hover:text-fg disabled:opacity-50"
+          <button className="tnum inline-flex items-center gap-1 rounded px-1 py-0.5 text-faint hover:bg-hover hover:text-fg disabled:opacity-50"
                   disabled={!!busy} onClick={() => void introspectOther()} data-probe-schema
-                  title="指定一个 schema 探查；探到了再决定要不要写进配置，不写就换回原来的">
-            {busy.startsWith('schema:') ? <Spinner size={10} /> : <Search size={10} aria-hidden />}
-            换个 schema 探查…
+                  title="指定一个 schema 看看有哪些对象：只看不存，缓存和配置都不动；探到了再决定要不要写进配置">
+            {busy.startsWith('schema:')
+              ? <><Spinner size={10} /> 在看「{busy.slice(7)}」 {formatDuration(clock - busySince.current)}</>
+              : <><Search size={10} aria-hidden /> 换个 schema 看看…</>}
           </button>
         )}
         <span className="flex-1" />
@@ -877,60 +530,24 @@ function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: bool
   )
 }
 
-interface TableDetail {
-  kind: string
-  name: string
-  comment?: string
-  columns: { name: string; type: string; pk: boolean; notNull: boolean; note: string }[]
-  /** 解析不出来时的原文（比如「数据源里没有这张表」） */
-  text?: string
-}
-
-/**
- * 解析 GET /datasources/{id}/schema?table= 的 detail 文本：
- *   视图 ANALYTICS.X（注释，可能跨行）
- *     COL  TYPE  主键、非空、列注释
- * 列之间用两个以上空格分隔。
- */
-export function parseTableDetail(text: string): TableDetail {
-  const lines = (text ?? '').split('\n')
-  const first = lines.findIndex((l) => l.startsWith('  '))
-  const head = (first < 0 ? lines : lines.slice(0, first)).join('\n')
-  const m = head.match(/^(表|视图) (\S+?)(?:（([\s\S]*)）)?$/)
-  if (!m) return { kind: '', name: '', columns: [], text }
-  const columns: TableDetail['columns'] = []
-  for (const line of first < 0 ? [] : lines.slice(first)) {
-    if (!line.startsWith('  ')) {
-      // 列注释里的换行：接到上一列后面
-      const last = columns[columns.length - 1]
-      if (last) last.note = `${last.note}\n${line}`.trim()
-      continue
-    }
-    const [name, type = '', marks = ''] = line.trim().split(/\s{2,}/)
-    const tags = marks ? marks.split('、') : []
-    columns.push({
-      name, type,
-      pk: tags.includes('主键'),
-      notNull: tags.includes('非空'),
-      note: tags.filter((t) => t !== '主键' && t !== '非空').join('、'),
-    })
-  }
-  return { kind: m[1], name: m[2], comment: m[3]?.trim(), columns }
-}
-
 /** 一次最多画这么多行：上千个对象的库全画出来会卡，过滤一下就够用了 */
 const SCHEMA_ROWS = 300
 
+type ColumnsState = TableSchema | { error: unknown } | 'loading'
+
 /**
- * 结构浏览器：Copilot 写 SQL 靠的就是这份结构，用户得能方便地核对「它看到了
+ * 结构浏览器：助手写 SQL 靠的就是这份结构，用户得能方便地核对「它看到了
  * 什么」。按 schema 分组，一行一张表，点开懒加载列（名称 / 类型 / 说明）。
+ *
+ * 列信息取后端给的结构化字段（columns / kind / comment / found）。以前解析给
+ * 模型看的那段 detail 文本，列注释里带两个空格或换行就会错位
  */
 function SchemaBrowser({ row }: { row: any }) {
   const [tables, setTables] = useState<string[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [q, setQ] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
-  const [details, setDetails] = useState<Record<string, TableDetail | { error: unknown } | 'loading'>>({})
+  const [details, setDetails] = useState<Record<string, ColumnsState>>({})
 
   // 重新探查后表清单和列都可能变了：重取清单、清掉列缓存，但展开着的那几张
   // 保持展开（下面会按需重取）
@@ -948,8 +565,8 @@ function SchemaBrowser({ row }: { row: any }) {
     for (const t of expanded) {
       if (details[t]) continue
       setDetails((d) => ({ ...d, [t]: 'loading' }))
-      api.datasources.schema(row.id, t).then(
-        (s) => setDetails((d) => ({ ...d, [t]: parseTableDetail(s.detail ?? '') })),
+      api.datasources.tableSchema(row.id, t).then(
+        (s) => setDetails((d) => ({ ...d, [t]: s })),
         (e) => setDetails((d) => ({ ...d, [t]: { error: e } })),
       )
     }
@@ -1007,6 +624,7 @@ function SchemaBrowser({ row }: { row: any }) {
             {list.map((t) => {
               const isOpen = expanded.has(t)
               const d = details[t]
+              const loaded = d && typeof d === 'object' && 'table' in d ? d : null
               return (
                 <div key={t}>
                   <button
@@ -1016,8 +634,9 @@ function SchemaBrowser({ row }: { row: any }) {
                   >
                     <ChevronRight size={11} className={clsx('shrink-0 text-faint transition-transform', isOpen && 'rotate-90')} aria-hidden />
                     <span className="mono truncate text-xs">{group ? t.slice(group.length + 1) : t}</span>
-                    {d && typeof d === 'object' && 'columns' in d && d.columns.length > 0 && (
-                      <span className="tnum text-2xs text-faint">{d.columns.length} 列</span>
+                    {loaded?.kind === 'view' && <span className="text-2xs text-faint">视图</span>}
+                    {!!loaded?.columns?.length && (
+                      <span className="tnum text-2xs text-faint">{loaded.columns.length} 列</span>
                     )}
                   </button>
                   {isOpen && <ColumnList detail={d} />}
@@ -1036,46 +655,60 @@ function SchemaBrowser({ row }: { row: any }) {
   )
 }
 
-function ColumnList({ detail }: { detail?: TableDetail | { error: unknown } | 'loading' }) {
+function ColumnList({ detail }: { detail?: ColumnsState }) {
   if (!detail || detail === 'loading') {
     return <div className="mb-1 ml-5 py-1"><Skeleton rows={3} height={9} gap={6} /></div>
   }
   if ('error' in detail) return <div className="mb-1.5 ml-5"><ErrorState compact error={detail.error} /></div>
-  if (!detail.columns.length) {
-    return <div className="mb-1.5 ml-5 whitespace-pre-line text-2xs text-faint">{detail.text || '没有列信息'}</div>
+  if (!detail.found) {
+    // 清单里有、缓存里却找不到：清单和列是两次请求取的，中间重新探查过
+    return (
+      <div className="mb-1.5 ml-5 text-2xs text-faint">
+        缓存里没有这张表的结构了，多半是刚重新探查过。收起再展开，或者点「探查结构」
+      </div>
+    )
   }
+  // 老后端只给 detail 文本：原样显示，不去解析
+  if (!detail.columns) {
+    return <div className="mono mb-1.5 ml-5 whitespace-pre-wrap text-2xs text-dim">{detail.detail || '没有列信息'}</div>
+  }
+  const view = detail.kind === 'view'
   return (
     <div className="mb-1.5 ml-5 mt-0.5 overflow-hidden rounded-md border bg-bg">
-      {(detail.comment || detail.kind === '视图') && (
+      {(detail.comment || view) && (
         <div className="flex gap-2 border-b px-2 py-1 text-2xs text-dim">
-          {detail.kind === '视图' && <span className="chip">视图</span>}
+          {view && <span className="chip">视图</span>}
           {detail.comment && <span className="whitespace-pre-line">{detail.comment}</span>}
         </div>
       )}
-      <table className="w-full text-2xs">
-        <thead className="text-faint">
-          <tr className="border-b">
-            <th className="w-[38%] px-2 py-1 text-left font-medium">列</th>
-            <th className="w-[24%] px-2 py-1 text-left font-medium">类型</th>
-            <th className="px-2 py-1 text-left font-medium">说明</th>
-          </tr>
-        </thead>
-        <tbody>
-          {detail.columns.map((c) => (
-            <tr key={c.name} className="border-b border-[var(--hairline)] last:border-0">
-              <td className="mono px-2 py-[3px]">
-                {c.pk && <KeyRound size={9} className="mr-1 inline text-[var(--accent)]" aria-label="主键" />}
-                {c.name}
-              </td>
-              <td className="mono px-2 py-[3px] text-faint">{c.type}</td>
-              <td className="px-2 py-[3px] text-dim">
-                {c.notNull && <span className="mr-1.5 text-faint">非空</span>}
-                <span className="whitespace-pre-line">{c.note}</span>
-              </td>
+      {!detail.columns.length ? (
+        <div className="px-2 py-1.5 text-2xs text-faint">探查时没读到列信息</div>
+      ) : (
+        <table className="w-full text-2xs">
+          <thead className="text-faint">
+            <tr className="border-b">
+              <th className="w-[38%] px-2 py-1 text-left font-medium">列</th>
+              <th className="w-[24%] px-2 py-1 text-left font-medium">类型</th>
+              <th className="px-2 py-1 text-left font-medium">说明</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {detail.columns.map((c) => (
+              <tr key={c.name} className="border-b border-[var(--hairline)] last:border-0">
+                <td className="mono px-2 py-[3px]">
+                  {c.pk && <KeyRound size={9} className="mr-1 inline text-[var(--accent)]" aria-label="主键" />}
+                  {c.name}
+                </td>
+                <td className="mono px-2 py-[3px] text-faint">{c.type}</td>
+                <td className="px-2 py-[3px] text-dim">
+                  {c.not_null && <span className="mr-1.5 text-faint">非空</span>}
+                  {c.comment && <span className="whitespace-pre-line">{c.comment}</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }
@@ -1165,9 +798,22 @@ const FIELD_LABEL: Record<string, string> = {
   host: '主机', database: '数据库', username: '用户名',
 }
 
+/**
+ * 决定连到哪个库的那几项（提交体里的）。schema 不在内：它只影响探查哪一片，不影响
+ * 连不连得上，后端判断测连接结果还作不作数时同样不看它
+ */
+function connectionOf(body: any): string {
+  const { schema: _schema, ...options } = body.options ?? {}
+  return JSON.stringify([
+    body.kind, body.host ?? null, body.port ?? null, body.database ?? null, body.username ?? null,
+    options, !!body.password,
+  ])
+}
+
 function SourceEditor({ source, kinds, onClose, onSaved }: {
   source: any; kinds: any[]; onClose: () => void
-  onSaved: (row: any, tested?: HealthRecord) => void
+  /** reconnected：连接配置改过了，之前测的结果不再代表它 */
+  onSaved: (row: any, tested?: HealthRecord, reconnected?: boolean) => void
 }) {
   const isNew = !source.id
   const [initial] = useState(() => toForm(source))
@@ -1232,7 +878,8 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       const row = isNew
         ? await api.datasources.create(body)
         : await api.datasources.update(source.id, body)
-      onSaved(row, testFresh ? test.result : undefined)
+      const before = connectionOf(toBody(initial, isNew, source.kind === 'oracle'))
+      onSaved(row, testFresh ? test.result : undefined, connectionOf(body) !== before)
     } catch (e) {
       toast.error(e)
     } finally {
@@ -1508,6 +1155,56 @@ function suspiciousColumns(cols: { name: string }[]): Set<string> {
   return out
 }
 
+const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError'
+
+/**
+ * 上传的真实进度：字节发了多少（XHR 的上传进度），发完之后是后端在处理，那段
+ * 没有进度可报——只写「处理中」和已等了多久，不把条拉满冒充完成。浏览器算不出
+ * 总字节时只写已发多少，不画百分比。
+ *
+ * 知识库的上传占位行也用它
+ */
+export function UploadMeter({ progress, startedAt, sentAt, processing, now }: {
+  progress: UploadProgress | null
+  /** 开始发的时刻；还没轮到它时不传 */
+  startedAt?: number
+  /** 字节发完的时刻 */
+  sentAt?: number
+  /** 发完之后后端在干什么，比如「正在读表、推断列类型」 */
+  processing: string
+  now: number
+}) {
+  if (!startedAt) return <span className="text-faint">排队中，前面的传完就轮到它</span>
+  if (progress?.sent) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-dim" data-upload-phase="processing">
+        <Spinner size={10} /> 传完了，{processing} · <span className="tnum">{formatDuration(now - (sentAt ?? now))}</span>
+      </span>
+    )
+  }
+  // 浏览器还没报过进度（刚开始，或者中间有层拦着不报）：不写「已传 0 B」，只写在传
+  const loaded = progress?.loaded ?? null
+  const total = progress?.total ?? null
+  const pct = total && loaded != null ? Math.min(1, loaded / total) : null
+  return (
+    <span className="block" data-upload-phase="sending">
+      <span className="tnum flex flex-wrap gap-x-1.5 text-dim">
+        <span>上传中{loaded != null && <> · 已传 {formatBytes(loaded)}{total ? ` / ${formatBytes(total)}` : ''}</>}</span>
+        {pct != null && <span>· {Math.round(pct * 100)}%</span>}
+        <span className="text-faint">· {formatDuration(now - startedAt)}</span>
+      </span>
+      {pct != null && (
+        <span className="mt-1 block h-1 overflow-hidden rounded-full bg-hover" role="progressbar"
+              aria-label="上传进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct * 100)}>
+          {/* 用 scaleX 推进而不是改 width：只动 transform，不触发重排 */}
+          <span className="block h-full origin-left rounded-full bg-[var(--st-running)] transition-transform duration-200"
+                style={{ transform: `scaleX(${pct})` }} />
+        </span>
+      )}
+    </span>
+  )
+}
+
 /**
  * 传一个 Excel / CSV，变成可以用 SQL 查的表。
  *
@@ -1532,11 +1229,18 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
   const [description, setDescription] = useState('')
   const [headerRow, setHeaderRow] = useState(1)
   const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<{ p: UploadProgress; sentAt?: number } | null>(null)
   const [dragging, setDragging] = useState(false)
   const [result, setResult] = useState<Awaited<ReturnType<typeof api.datasources.uploadTable>> | null>(null)
   const headerRef = useRef<HTMLInputElement>(null)
   const clock = useRunClock(busy)
   const busySince = useRef(0)
+  const upload = useRef<{ abort: () => void; sent: boolean } | null>(null)
+  const sent = !!progress?.p.sent
+
+  // 弹窗关掉时字节还没发完，就不传了：后端收不全，什么都不会建。已经发完的让它
+  // 做完——后端已经在建表，这时断开只会让人以为没传上
+  useEffect(() => () => { if (upload.current && !upload.current.sent) upload.current.abort() }, [])
 
   const pick = (f: File | null) => {
     setFile(f)
@@ -1556,16 +1260,29 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
 
   const submit = async () => {
     if (!file || !name || nameError) return
+    const ctl = new AbortController()
+    const handle = { abort: () => ctl.abort(), sent: false }
+    upload.current = handle
     busySince.current = Date.now()
+    setProgress(null)
     setBusy(true)
     try {
-      const out = await api.datasources.uploadTable(file, { name, description, header_row: headerRow })
+      const out = await api.datasources.uploadTable(file, { name, description, header_row: headerRow }, {
+        signal: ctl.signal,
+        onProgress: (p) => {
+          if (p.sent) handle.sent = true
+          setProgress((cur) => ({ p, sentAt: cur?.sentAt ?? (p.sent ? Date.now() : undefined) }))
+        },
+      })
       setResult(out)
       onImported(out.source)
     } catch (e) {
-      toast.error(e)
+      if (isAbort(e)) toast.info(`没传完就取消了，「${name}」没有建也没有改`)
+      else toast.error(e)
     } finally {
+      if (upload.current === handle) upload.current = null
       setBusy(false)
+      setProgress(null)
     }
   }
 
@@ -1644,7 +1361,12 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       title="传表格"
       footer={
         <>
-          <button className="btn" onClick={onClose} disabled={busy}>取消</button>
+          {busy && !sent ? (
+            <button className="btn" onClick={() => upload.current?.abort()}>取消上传</button>
+          ) : (
+            <button className="btn" onClick={onClose} disabled={busy}
+                    title={busy ? '文件已经传完，后端正在建表，等它做完' : undefined}>取消</button>
+          )}
           <button className="btn btn-primary tnum" onClick={() => void submit()}
                   disabled={busy || !file || !name || !!nameError}
                   title={!file ? '先选一个文件' : !name ? '给数据源起个名' : undefined}>
@@ -1656,12 +1378,13 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       <div className="space-y-3">
         <label
           className={clsx(
-            'flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-4 py-5 text-center transition-colors',
-            dragging ? 'border-[var(--accent)] bg-accent-soft' : 'hover:border-[var(--border-strong)] hover:bg-hover',
+            'flex flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-4 py-5 text-center transition-colors',
+            busy ? 'opacity-60' : 'cursor-pointer',
+            dragging ? 'border-[var(--accent)] bg-accent-soft' : !busy && 'hover:border-[var(--border-strong)] hover:bg-hover',
           )}
-          onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+          onDragOver={(e) => { e.preventDefault(); if (!busy) setDragging(true) }}
           onDragLeave={() => setDragging(false)}
-          onDrop={(e) => { e.preventDefault(); setDragging(false); pick(e.dataTransfer.files?.[0] ?? null) }}
+          onDrop={(e) => { e.preventDefault(); setDragging(false); if (!busy) pick(e.dataTransfer.files?.[0] ?? null) }}
         >
           <FileSpreadsheet size={20} className={file ? 'text-[var(--accent)]' : 'text-faint'} aria-hidden />
           {file ? (
@@ -1670,9 +1393,16 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
             <span className="text-xs text-dim">拖一个文件进来，或点这里选</span>
           )}
           <span className="text-2xs text-faint">Excel（.xlsx）或 CSV / TSV，每个工作表变成一张表。.xls 是老格式，先另存为 .xlsx</span>
-          <input type="file" className="sr-only" accept=".xlsx,.xlsm,.csv,.tsv" aria-label="选择表格文件"
+          <input type="file" className="sr-only" accept=".xlsx,.xlsm,.csv,.tsv" aria-label="选择表格文件" disabled={busy}
                  onChange={(e) => pick(e.target.files?.[0] ?? null)} />
         </label>
+
+        {busy && (
+          <div className="rounded-lg border bg-bg px-3 py-2 text-2xs" data-upload-progress>
+            <UploadMeter progress={progress?.p ?? null} startedAt={busySince.current} sentAt={progress?.sentAt}
+                         processing="正在读表、推断列类型" now={clock} />
+          </div>
+        )}
 
         <div className="grid grid-cols-[1fr_120px] gap-3">
           <Field label="数据源名" required error={nameError}
@@ -1700,11 +1430,4 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       </div>
     </Modal>
   )
-}
-
-export function formatBytes(n: number): string {
-  if (!Number.isFinite(n)) return '—'
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(1)} MB`
 }

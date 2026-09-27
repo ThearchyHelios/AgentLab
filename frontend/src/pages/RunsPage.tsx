@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { History, Inbox, RefreshCw } from 'lucide-react'
-import { EmptyState, IconButton, StatusBadge } from '../components/ui'
+import { EmptyState, IconButton, PageHeader, StatusBadge, useTicker } from '../components/ui'
+import { UNSAVED_WORKFLOW_ID } from '../api/client'
 import { STATUS, type StatusCode } from '../lib/status'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import type { Approval, Run } from '../types'
@@ -10,10 +11,10 @@ import {
 } from './runs/RunList'
 import { RunDetailView } from './runs/RunDetailView'
 import {
-  RUNS_TABS, TAB_CODES, TAB_LABEL, ageMs, asTab, duplicateNames, formatSpan, isLiveRun, matchesCodes,
+  RUNS_TABS, TAB_CODES, TAB_LABEL, UNSAVED_NAME, ageMs, asTab, duplicateNames, formatSpan, isLiveRun, matchesCodes,
   parseQuery, runCode, stripStatusWords, type RunsTab,
 } from './runs/model'
-import { RunTabs, useNow, type TabItem } from './runs/parts'
+import { RunTabs, type TabItem } from './runs/parts'
 import { useApprovalQueue, useRunList, useStatusCounts } from './runs/useRunsData'
 import './runs/runs.css'
 
@@ -133,7 +134,7 @@ export function RunsPage() {
   // 待审批页签也吃同样的类别、工作流、名称条件
   const approvalFilter = useCallback((a: Approval) => {
     if (runClass && a.run_class !== runClass) return false
-    if (workflowId && a.workflow_id !== workflowId) return false
+    if (workflowId === UNSAVED_WORKFLOW_ID ? !!a.workflow_id : workflowId && a.workflow_id !== workflowId) return false
     if (parsed.q && !(a.workflow_name ?? '').toLowerCase().includes(parsed.q.toLowerCase())) return false
     return true
   }, [runClass, workflowId, parsed.q])
@@ -161,7 +162,7 @@ export function RunsPage() {
     navigate({ pathname: '/runs', search: location.search }, { replace: true })
   }, [removeRow, navigate, location.search])
 
-  const now = useNow(60_000)
+  const now = useTicker(60_000)
   const queueItems = queue.items.filter(approvalFilter)
   const oldest = oldestAge(queueItems, now)
   const running = (counts.counts.running ?? 0) + (counts.counts.queued ?? 0)
@@ -205,17 +206,13 @@ export function RunsPage() {
 
   return (
     <div className="flex h-full flex-col" data-runs-page="">
-      {/* 页头和工具、知识、数据、设置几页同一个样子：48px 高、图标框、标题、一句
-          说明。待审批的数不在这里重复——紧下面的页签上就有 */}
-      <header className="flex h-12 shrink-0 items-center gap-2.5 border-b bg-panel px-4">
-        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border bg-elev text-dim" aria-hidden>
-          <History size={13} />
-        </span>
-        <h1 className="shrink-0 text-sm font-semibold">记录</h1>
-        <p className="min-w-0 truncate text-xs text-faint">每次运行的完整轨迹、待处理的审批和封存凭证</p>
-        <span className="flex-1" />
-        <IconButton label="刷新" icon={<RefreshCw size={12} aria-hidden />} onClick={refreshAll} data-runs-refresh="" />
-      </header>
+      {/* 待审批的数不在页头里重复——紧下面的页签上就有 */}
+      <PageHeader
+        icon={<History size={13} />}
+        title="记录"
+        subtitle="每次运行的完整轨迹、待处理的审批和封存凭证"
+        actions={<IconButton label="刷新" icon={<RefreshCw size={12} aria-hidden />} onClick={refreshAll} data-runs-refresh="" />}
+      />
 
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-[360px] shrink-0 flex-col border-r bg-panel xl:w-[400px]" aria-label="运行列表">
@@ -299,7 +296,8 @@ function describeFilters({ tab, parsed, segment, runClass, workflowId, workflows
   else if (tab === 'all' && segment.length) parts.push(`状态「${segment.map((c) => STATUS[c].short).join('、')}」`)
   if (parsed.q) parts.push(`名称含「${parsed.q}」`)
   if (runClass) parts.push(runClass === 'formal' ? '正式运行' : '探索运行')
-  if (workflowId) parts.push(`工作流「${workflows.find((w) => w.id === workflowId)?.name ?? '已删除的工作流'}」`)
+  if (workflowId === UNSAVED_WORKFLOW_ID) parts.push(UNSAVED_NAME)
+  else if (workflowId) parts.push(`工作流「${workflows.find((w) => w.id === workflowId)?.name ?? '已删除的工作流'}」`)
   if (!parts.length) return null
   return `筛选条件：${parts.join(' · ')}${tab !== 'all' ? `（在「${TAB_LABEL[tab]}」里）` : ''}`
 }

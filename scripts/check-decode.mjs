@@ -592,6 +592,14 @@ console.log('\n=== 长运行：按轮折叠（runs-5）===')
   check('相邻重复行并成一行', rows.length === 2, rows.map((r) => r.title).join(' | '))
   check('并后的行写出次数、中位和最慢', rows[0].meta === '×3 · 中位 12 ms · 最慢 63 ms', rows[0].meta)
   check('警告并完还是警告', rows[1].level === 'warn' && rows[1].repeat?.count === 2)
+  // 出了状况的行，副标题说的是为什么：两次修复凑出来的值不一样，并成一行就只剩第一次的
+  const why = mod.compactSteps([
+    { id: 'r1', seq: 1, kind: 'llm', title: '让模型修复格式', level: 'warn', status: 'done', sub: '出现了原文没有的值（total_count=0）' },
+    { id: 'r2', seq: 2, kind: 'llm', title: '让模型修复格式', level: 'warn', status: 'done', sub: '出现了原文没有的值（region=华东）' },
+    { id: 'r3', seq: 3, kind: 'llm', title: '让模型修复格式', level: 'warn', status: 'done', sub: '出现了原文没有的值（region=华东）' },
+  ])
+  check('原因不同的警告不并成一行，原因相同的照并', why.length === 2 && why[1].repeat?.count === 2,
+    why.map((r) => `${r.sub} ${r.meta ?? ''}`).join(' | '))
 
   // 恢复后的重放（resumed）不算新的一轮；循环体真的又跑一次才算
   const replay = mod.decodeRun([
@@ -652,6 +660,180 @@ console.log('\n=== Copilot：心跳穿插、回话、少了一步、报错 ===')
     `${row?.title} / ${row?.sub} / ${row?.raw}`)
   const eo = mod.copilotOutcome([{ op: 'error', message: 'm', hint: 'h', detail: 'd' }])
   check('结局里的报错分开带着 hint 和 detail', eo.kind === 'error' && eo.error?.hint === 'h' && eo.error?.raw === 'd')
+}
+
+console.log('\n=== 协作团队用完轮数：最后那次判定不是新的一轮（REQ-3A-3、NI-5）===')
+{
+  const team = (evts) => mod.decodeRun(evts).find((s) => s.nodeId === 'team')
+  const routes = (evts) => flatten(mod.decodeRun(evts)).filter((s) => s.kind === 'branch' && s.nodeId === 'team')
+
+  // 以前 closing 判定被写成「第 3 轮：调度者在想下一步…」→「第 3 轮：结束协作」，done=false 时
+  // 读起来像团队正常收尾了；泳道还多出一列空的第 3 轮
+  const failRoutes = routes(synthetic.exhaustedTeam('fail'))
+  const closing = failRoutes[failRoutes.length - 1]
+  check('判定没完成：说「轮数用完 · 调度者判定：未完成」并带理由',
+    closing?.title === '轮数用完 · 调度者判定：未完成（还没有查到任何订单数据）', closing?.title)
+  check('判定没完成的那一行是提醒色', closing?.level === 'warn', closing?.level)
+  check('不再把判定写成「第 3 轮」', !failRoutes.some((s) => s.title.includes('第 3 轮')),
+    failRoutes.map((s) => s.title).join(' | '))
+  const judged = routes(synthetic.exhaustedTeam('judged'))
+  check('判定完成：说「轮数用完 · 调度者判定：已完成」',
+    judged[judged.length - 1]?.title === '轮数用完 · 调度者判定：已完成', judged[judged.length - 1]?.title)
+  const live = routes(synthetic.exhaustedTeam('closing'))
+  const pending = live[live.length - 1]
+  check('还在判定时有一行进行中，不说「第 3 轮」',
+    pending?.status === 'running' && pending.title === '轮数用完 · 调度者在做最后判定…', `${pending?.status} ${pending?.title}`)
+
+  for (const mode of ['fail', 'judged', 'degrade']) {
+    const t = team(synthetic.exhaustedTeam(mode))?.team
+    check(`${mode}：泳道只有派过活的 2 轮，判定不加列`, t?.rounds.length === 2, `${t?.rounds.length} 轮`)
+  }
+  // reduceTeam 是画布协作矩阵和右栏共用的那一份：直接喂事件也不能多出一列
+  let direct
+  for (const e of synthetic.exhaustedTeam('fail')) {
+    const next = mod.reduceTeam(direct, e)
+    if (next && e.node_id === 'team') direct = next
+  }
+  check('reduceTeam 直接喂也只有 2 轮', direct?.rounds.length === 2, `${direct?.rounds.length}`)
+  check('reduceTeam 记下了判定结论', direct?.verdict?.closing === true && direct.verdict.done === false
+    && direct.verdict.reason === '还没有查到任何订单数据', JSON.stringify(direct?.verdict))
+  // 还在判定：泳道据此写「调度者在判定」，而不是空着或多一列
+  let judging
+  for (const e of synthetic.exhaustedTeam('closing')) {
+    const next = mod.reduceTeam(judging, e)
+    if (next && e.node_id === 'team') judging = next
+  }
+  check('判定进行中：记下在判定、还没有结论，也不加列', judging?.verdict?.closing === true && judging.verdict.done === undefined
+    && judging.rounds.length === 2, JSON.stringify(judging?.verdict))
+  const judgedTeam = team(synthetic.exhaustedTeam('judged'))?.team
+  check('判定完成时团队算收尾了', judgedTeam?.finished === true && judgedTeam.verdict?.done === true)
+
+  // 成员把工具调用写成文字：这一步是失败，不是一个写着失败原因的「完成」格子
+  const r0 = direct?.rounds[0]?.members.find((m) => m.agent === '取数员')
+  check('失败的成员格子是 failed', r0?.status === 'failed', r0?.status)
+  check('失败的成员带着原因', !!r0?.error?.includes('没有真正调用工具'), r0?.error)
+  const r1 = direct?.rounds[1]?.members.find((m) => m.agent === '分析员')
+  check('同一轮做完的成员照常是 done', r1?.status === 'done', r1?.status)
+  const memberRow = flatten(mod.decodeRun(synthetic.exhaustedTeam('fail')))
+    .find((s) => s.title.startsWith('取数员：') && s.status === 'failed')
+  check('失败的成员那一行也画成失败', !!memberRow && memberRow.level === 'error', memberRow?.status)
+  check('失败的成员那一行说清为什么', !!memberRow?.sub?.includes('没有真正调用工具'), memberRow?.sub)
+  check('一轮里有人失败时不算「省下」', direct?.savedMs === 0, `${direct?.savedMs}`)
+
+  // 判失败：矩阵和右栏都要说「用完 N 轮未完成」，点出从没派到的成员
+  check('判失败：团队的结局是 failed', direct?.verdict?.outcome === 'failed', JSON.stringify(direct?.verdict))
+  check('判失败：认出轮数', direct?.verdict?.rounds === 2, `${direct?.verdict?.rounds}`)
+  check('判失败：点出从没派到的成员', direct?.verdict?.never?.join(',') === '汇总员', direct?.verdict?.never?.join(','))
+
+  // 降档交付：节点「完成」了，但不能是一个安静的勾
+  const degraded = mod.decodeRun(synthetic.exhaustedTeam('degrade'))
+  const node = degraded.find((s) => s.nodeId === 'team')
+  check('降档：团队节点行是提醒色', node?.status === 'done' && node.level === 'warn', `${node?.status} ${node?.level}`)
+  check('降档：团队节点行说清是降档交付', !!node?.sub?.includes('用完 2 轮') && node.sub.includes('降档'), node?.sub)
+  check('降档：泳道的结局是 degraded，点出没派到的成员',
+    node?.team?.verdict?.outcome === 'degraded' && node.team.verdict.never?.join(',') === '汇总员',
+    JSON.stringify(node?.team?.verdict))
+  const note = flatten(degraded).find((s) => s.code === 'team_exhausted')
+  check('降档那条提醒说人话', note?.title === '协作团队用完 2 轮仍未完成 · 按降档交付', note?.title)
+  check('降档那条提醒给出下一步', !!note?.next && note.fix === 'canvas', `${note?.next} / ${note?.fix}`)
+  // 认不出轮数（老后端、措辞变了）时照实说「用完了轮数」，不拿「?」凑一个数
+  const vague = flatten(mod.decodeRun([
+    { seq: 1, type: 'node.started', node_id: 'team', ts: 1, data: { node_type: 'supervisor', label: '团队' } },
+    { seq: 2, type: 'log', node_id: 'team', ts: 2, data: { level: 'warn', code: 'team_exhausted', message: '协作团队没做完，按降档交付' } },
+    { seq: 3, type: 'node.finished', node_id: 'team', ts: 3, data: { duration_ms: 5, preview: { text: 'x', exhausted: true } } },
+  ]))
+  const vagueNote = vague.find((s) => s.code === 'team_exhausted')
+  const vagueNode = vague.find((s) => s.kind === 'node' && s.nodeId === 'team')
+  check('认不出轮数时不写「?」', !vagueNote?.title.includes('?') && !vagueNode?.sub?.includes('?')
+    && !!vagueNote?.title.includes('用完了轮数'), `${vagueNote?.title} / ${vagueNode?.sub}`)
+}
+
+console.log('\n=== 模型把工具调用写成了文字（NI-4）===')
+{
+  const all = flatten(mod.decodeRun(synthetic.markupRun()))
+  const warn = all.find((s) => s.code === 'tool_markup_leak')
+  check('提醒行说人话，不贴原始标记', warn?.title === '模型把工具调用写成了文字，没有真正执行'
+    && !warn.title.includes('DSML'), warn?.title)
+  check('说清已经提醒它重试', !!warn?.sub?.includes('重试一次'), warn?.sub)
+  check('给出下一步：去画布绑定工具', !!warn?.next?.includes('绑定') && warn.fix === 'canvas', `${warn?.next} / ${warn?.fix}`)
+  check('原始标记留在展开区给排查', !!warn?.detail?.includes('DSML'))
+  const team = flatten(mod.decodeRun(synthetic.exhaustedTeam('fail'))).find((s) => s.code === 'tool_markup_leak')
+  check('成员写成文字时说是哪个成员', team?.title === '取数员把工具调用写成了文字，没有真正执行', team?.title)
+  const node = mod.decodeRun(synthetic.markupRun()).find((s) => s.nodeId === 'query')
+  check('失败的节点照常是失败，原因留在详情', node?.status === 'failed' && !!node.detail?.includes('原始标记'))
+  // 收尾轮那种：真调过工具，只是步数用完了还想接着查。节点照常完成，不能说成「没有真正执行」
+  const settle = flatten(mod.decodeRun([
+    { seq: 1, type: 'node.started', node_id: 'q', ts: 1, data: { node_type: 'agent', label: '数据查询' } },
+    { seq: 2, type: 'log', node_id: 'q', ts: 2, data: { level: 'warn', code: 'tool_markup_leak',
+      message: '模型把工具调用写成了文字（<tool_call>{"name": "db_query__shop"…），没有真正调用工具：步数用完后的收尾轮仍想调用工具，结论只基于之前查到的部分' } },
+    { seq: 3, type: 'node.finished', node_id: 'q', ts: 3, data: { duration_ms: 9, preview: { text: '华东 1,204 单' } } },
+  ])).find((s) => s.code === 'tool_markup_leak')
+  check('收尾轮还想查：说步数用完，不说没有真正执行', !!settle?.title.includes('步数用完') && !settle.title.includes('没有真正执行'),
+    settle?.title)
+  check('收尾轮还想查：下一步是调大最多步数', !!settle?.next?.includes('最多步数'), settle?.next)
+}
+
+console.log('\n=== 校验修复想凑数（NI-3）===')
+{
+  const all = flatten(mod.decodeRun(synthetic.repairRun()))
+  const repairs = all.filter((s) => s.code === 'repair')
+  check('每次修复是一行模型调用', repairs.length === 2 && repairs.every((s) => s.kind === 'llm' && s.title === '让模型修复格式'),
+    repairs.map((s) => s.title).join(' | '))
+  check('修复调用带着耗时', repairs[0]?.meta === '1.3 s', repairs[0]?.meta)
+  check('被作废的修复折进那一行，不另起孤行', !all.some((s) => s.code === 'repair_invented'),
+    all.filter((s) => s.code === 'repair_invented').map((s) => s.title).join(','))
+  check('作废的修复画成提醒，说出凑出来的值', repairs.every((s) => s.level === 'warn' && s.sub?.includes('total_count=0')),
+    repairs.map((s) => `${s.level} ${s.sub}`).join(' | '))
+  check('作废的修复给出下一步', !!repairs[0]?.next?.includes('上游'), repairs[0]?.next)
+  check('第一次校验失败那条照常显示', all.some((s) => s.code === 'validate_retry' && s.title.includes('第 1 次校验失败')))
+  // 老数据：没有 purpose=repair 的 llm.end，作废说明也不能丢
+  const legacy = flatten(mod.decodeRun(synthetic.repairRun().filter((e) => e.type !== 'llm.end')))
+  const orphan = legacy.find((s) => s.code === 'repair_invented')
+  check('没有修复行可折时单独成一行说人话', !!orphan?.title.includes('修复被作废') && orphan.level === 'warn', orphan?.title)
+}
+
+console.log('\n=== 工具时限（timeout_s / timed_out）===')
+{
+  const live = flatten(mod.decodeRun(synthetic.timeoutRun('live'))).find((s) => s.kind === 'query')
+  check('进行中的查询带着时限', live?.limitS === 30 && live.status === 'running', `${live?.limitS} ${live?.status}`)
+  const done = flatten(mod.decodeRun(synthetic.timeoutRun('done'))).find((s) => s.kind === 'query')
+  check('超时的查询是失败', done?.status === 'failed' && done.level === 'error', done?.status)
+  check('超时的查询说清超了多少上限、已放弃等待', done?.sub === '超过 30 s 上限，已放弃等待', done?.sub)
+  check('超时的原话留在结果里', !!done?.result?.includes('缩小范围'))
+}
+
+console.log('\n=== 放弃等审批的运行 ===')
+{
+  const steps = mod.decodeRun(synthetic.abandonedRun())
+  const row = steps.find((s) => s.kind === 'lifecycle' && s.status === 'cancelled')
+  check('取消那一行说清谁放弃的、一并关了什么', !!row?.sub?.includes('张工') && row.sub.includes('1 条待审批一并关闭'), row?.sub)
+  check('放弃之后审批不再是待办', !flatten(steps).some((s) => s.status === 'waiting' || s.status === 'running'))
+  const plain = mod.decodeRun(synthetic.cancelledRun()).find((s) => s.kind === 'lifecycle' && s.status === 'cancelled')
+  check('老数据的取消行不硬编副标题', plain && !plain.sub, plain?.sub)
+}
+
+console.log('\n=== 出具那一行记着档位 ===')
+{
+  const is = mod.decodeRun(synthetic.mixedRun()).find((s) => s.kind === 'issuance')
+  check('出具步骤带 tier，头部能据此提醒', is?.tier === 'degraded', is?.tier)
+}
+
+console.log('\n=== Copilot 改图：工具绑定变化（NI-1）===')
+{
+  const steps = mod.decodeCopilot(synthetic.COPILOT_TOOLS_DROPPED, { context: 'chat' })
+  const change = steps.find((s) => s.code === 'tool_changes')
+  check('工具绑定变化单独成一行', !!change, steps.map((s) => s.title).join(' | '))
+  check('工具少了用提醒色，说清是哪个节点', change?.level === 'warn' && change.title.includes('数据查询'), change?.title)
+  check('逐项列出前后', !!change?.detail?.includes('db_query__shop') && change.detail.includes('→'), change?.detail)
+  const selfCheck = steps.find((s) => s.title.startsWith('自查通过'))
+  check('自查通过但有工具被去掉：自查那一行是提醒，不是安静的通过', selfCheck?.level === 'warn'
+    && selfCheck.title.includes('工具'), `${selfCheck?.level} ${selfCheck?.title}`)
+  const out = mod.copilotOutcome(synthetic.COPILOT_TOOLS_DROPPED)
+  check('结局里带着工具绑定变化', out.toolChanges?.length === 1 && out.toolChanges[0].removed.length === 2,
+    JSON.stringify(out.toolChanges))
+  check('结局里带着「工具被去掉」的警告', out.dropped?.length === 1, JSON.stringify(out.dropped))
+  const plain = mod.copilotOutcome(synthetic.COPILOT_STUCK)
+  check('没有变化时两样都是空的', !plain.toolChanges?.length && !plain.dropped?.length)
 }
 
 console.log('\n=== 术语 ===')

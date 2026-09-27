@@ -4,7 +4,7 @@ import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from
 import { Bell, BellOff, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, NETWORK_MESSAGE, api } from './api/client'
-import { useCatalog, useOnReconnect } from './store/catalog'
+import { CATALOG_TIMEOUT_MS, catalogListState, useCatalog, useOnReconnect } from './store/catalog'
 import type { CatalogCheck } from './store/catalog'
 import { useStudio } from './store/studio'
 import { useChat } from './store/chat'
@@ -22,7 +22,7 @@ import {
   CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
   toggleTheme, useTheme, waitedFor,
 } from './components/CommandPalette'
-import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast } from './components/ui'
+import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
 import { applyTheme, normalizeTheme } from './lib/theme'
 import { ariaShortcut, isTypingTarget, matchShortcut } from './lib/keys'
 import { formatDateTime, formatDuration, formatRelative, shortId } from './lib/format'
@@ -32,6 +32,7 @@ import {
   composeTitle, flagAttention, notifyInBackground, notifySupported, paintFavicon, useSignals,
 } from './lib/notify'
 import type { Attention, FaviconDot } from './lib/notify'
+import { useLeaveBlocker } from './lib/leave'
 
 export default function App() {
   const loaded = useCatalog((s) => s.loaded)
@@ -66,7 +67,6 @@ export default function App() {
   // 断线时换的那一下当时没存上：恢复后补存，而不是去读服务端
   useOnReconnect(() => { if (!flushThemePref()) loadTheme() })
 
-  useBootReport(loaded)
   // 在 App 这一层算，从启动那一刻起计时：从启动页「先进去看看」时已经卡了好几秒，
   // 进门那一下就得是琥珀，不能进了门再从头等
   const stalled = useStalledChecks()
@@ -74,8 +74,8 @@ export default function App() {
   // 从没连上过就断着：停在启动页说清楚原因，而不是放人进去看一屏「还没有…」
   const offlineAtBoot = !everOk && (backend === 'down' || (allFailed && backend === 'checking'))
   const booting = !offlineOk && (!loaded || offlineAtBoot)
-  // 启动页的清单自己会说哪几项还在等；进了外壳才需要当面提醒
-  useStallWarning(booting ? NO_CHECKS : stalled)
+  // 启动页的清单自己会说哪几项还在等、哪几项失败了；进了外壳才需要当面提醒
+  useCatalogWarning(stalled, !booting)
   if (booting) return <BootScreen onEnterOffline={() => setOfflineOk(true)} />
 
   return (
@@ -123,6 +123,7 @@ export default function App() {
       <ShortcutHelp />
       <ShellKeys />
       <ShellSignals />
+      <LeaveBlocker />
     </div>
   )
 }
@@ -130,6 +131,15 @@ export default function App() {
 // -------------------------------------------------------------------------
 // 全局快捷键
 // -------------------------------------------------------------------------
+
+/**
+ * 离开前确认的那一个 blocker（lib/leave）：导航、链接、⌘K、⌥ 数字、浏览器后退，
+ * 换页都先经过页面登记的守卫。单独成一个组件，blocker 变了只重绘它
+ */
+function LeaveBlocker() {
+  useLeaveBlocker()
+  return null
+}
 
 /** 启动页上不挂：那时按下的 ⌘K 会在加载完之后才突然弹出面板 */
 function ShellKeys() {
@@ -161,6 +171,7 @@ function ShellKeys() {
       const page = PAGES.find((p) => matchShortcut(e, p.shortcut))
       if (page) {
         e.preventDefault()
+        // 有没保存的改动时由 LeaveBlocker 先问，这里照常跳
         navRef.current(page.to)
       }
     }
@@ -454,10 +465,10 @@ const STALL_MS = 3000
 /**
  * 卡着没回来的 catalog 请求（后端没断时）。
  *
- * refresh 是一个 Promise.all：一张表卡住（后端连得上、就是不回），六张表全都还是
- * 空的，backend 却是 ok——遥测点一片绿，编排页一屏「还没有工作流 / 新建工作流」，
- * 正是离线横幅要消灭的那种假空态，只是换了个来路。正常刷新几十毫秒就回，不到
- * STALL_MS 不算，免得每次刷新遥测点都闪一下琥珀。
+ * refresh 按表各自请求、先回先填，每个请求最多等 CATALOG_TIMEOUT_MS。一张表卡住
+ * （后端连得上、就是不回）只拖它自己：卡着的这段时间遥测点是「加载中」，到点那一项
+ * 记成出错，遥测点转成「降级」。正常刷新几十毫秒就回，不到 STALL_MS 不算，免得
+ * 每次刷新遥测点都闪一下琥珀。
  */
 function useStalledChecks(): CatalogCheck[] {
   const waiting = useCatalog((s) => s.checks.some((c) => c.state === 'pending'))
@@ -473,26 +484,52 @@ function useStalledChecks(): CatalogCheck[] {
   return stalled && waiting && !down ? checks.filter((c) => c.state === 'pending') : NO_CHECKS
 }
 
+/** 失败的那一项怎么说：回了错误码写码；等满 CATALOG_TIMEOUT_MS 才断的是超时；其余是够不着 */
+function failWord(c: CatalogCheck): string {
+  if (c.status) return String(c.status)
+  return c.ms != null && c.ms >= CATALOG_TIMEOUT_MS ? '超时' : '连不上'
+}
+
 /**
- * 进了外壳还有请求卡着：挂一条常驻提示，点名是哪几项；全部回来（或者断开，归
- * 横幅管）就撤掉。遥测点只是一个小琥珀点，人眼前是「还没有工作流」和一个「新建」
- * 按钮，得当面说一句。点名的是卡住那一刻的几项，实时的看遥测浮层。
+ * 眼下是空的、却不能当「没有」的那几张表：从没取回来过（catalogListState 不是 ok），
+ * 请求又卡着（超过 STALL_MS）或者已经失败了（回了错误码、超时）。人眼前是「还没有
+ * 工作流」和一个「新建」按钮，得当面说一句，而且一直挂着，直到那几张表取回来：
+ * 卡着的那一项到点超时，提示跟着改口说「没加载成功」，不能悄悄撤掉。
+ *
+ * 取回来过的表刷新卡住、失败了都不算：失败不清空，手上的还是真数据，遥测点说一声
+ * 就够。后端断开归离线横幅说；启动页上清单自己会说（enabled=false）。
  */
-function useStallWarning(stalled: CatalogCheck[]) {
-  const any = stalled.length > 0
-  const latest = useRef(stalled)
-  latest.current = stalled
+function useCatalogWarning(stalled: CatalogCheck[], enabled: boolean) {
+  // 选成字符串：只在「是哪几张表」变了的时候才换提示
+  const waiting = useCatalog((s) => stalled
+    .filter((c) => catalogListState(s, c.key) === 'loading').map((c) => c.key).join(','))
+  const failed = useCatalog((s) => s.checks
+    .filter((c) => catalogListState(s, c.key) === 'error').map((c) => c.key).join(','))
   useEffect(() => {
-    if (!any) return
-    const labels = latest.current.map((c) => c.label)
-    const id = toast.warn(`还有 ${labels.length} 项没取回来（${labels.join('、')}）：列表可能不全，先别新建`, {
+    if (!enabled || (!waiting && !failed)) return
+    const { checks } = useCatalog.getState()
+    const pick = (keys: string) => keys.split(',').filter(Boolean)
+      .map((k) => checks.find((c) => c.key === k)).filter((c): c is CatalogCheck => !!c)
+    const w = pick(waiting)
+    const f = pick(failed)
+    const text = [
+      w.length ? `还有 ${w.length} 项没取回来（${w.map((c) => c.label).join('、')}）` : '',
+      f.length ? `${w.length ? '' : '有 '}${f.length} 项没加载成功（${f.map((c) => `${c.label} ${failWord(c)}`).join('、')}）` : '',
+    ].filter(Boolean).join('，')
+    const detail = [
+      w.length ? '后端连得上，但这几个请求发出去好几秒了还没回来。' : '',
+      ...f.map((c) => `${c.label}：${c.error ?? failWord(c)}`),
+      '在它们取回来之前，对应的列表和下拉可能是空的，不代表数据没了。导航最底下的连接指示灯里能看到每一项的情况。',
+    ].filter(Boolean).join('\n')
+    // 键跟着「是哪几张表」走：同一个键的提示只会累计次数，不会换字
+    const id = toast.warn(`${text}：列表可能不全，先别新建`, {
       sticky: true,
-      key: 'boot-pending',
-      detail: '后端连得上，但这几个请求发出去好几秒了还没回来。在它们回来之前，工作流、知识库这些列表可能是空的，不代表数据没了。导航最底下的连接指示灯里能看到哪一项回来了。',
+      key: `catalog-unknown:${waiting}|${failed}`,
+      detail,
       action: { label: '重试', onClick: () => void useCatalog.getState().refresh() },
     })
     return () => toast.dismiss(id)
-  }, [any])
+  }, [enabled, waiting, failed])
 }
 
 /** 连接遥测点：导航最底下，像仪表盘上的指示灯。点开看地址、延迟、最近一次错误 */
@@ -535,17 +572,6 @@ function Telemetry({ stalled }: { stalled: CatalogCheck[] }) {
   )
 }
 
-function useTicker(active: boolean, ms = 1000): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!active) return
-    setNow(Date.now())
-    const t = setInterval(() => setNow(Date.now()), ms)
-    return () => clearInterval(t)
-  }, [active, ms])
-  return now
-}
-
 function TelemetryPanel({ onClose, anchor, stalled }: {
   onClose: (refocus: boolean) => void
   anchor: RefObject<HTMLButtonElement | null>
@@ -560,8 +586,10 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
   const [busy, setBusy] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   const down = backend === 'down'
-  const now = useTicker(down)
+  const now = useTicker(1000, down)
   const tone = backendTone(backend, latency, useFailingChecks(), stalled.length)
+  // 卡着的里头有没有从没取回来过的：有的话那张表眼下是空的，才要劝一句别急着新建
+  const unknown = useCatalog((s) => stalled.some((c) => catalogListState(s, c.key) !== 'ok'))
 
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
@@ -634,7 +662,11 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
         <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
              style={{ borderColor: 'color-mix(in srgb, var(--warn) 35%, var(--border))', background: 'var(--st-waiting-soft)' }}>
           <div className="text-[var(--st-waiting)]">{stalled.map((c) => c.label).join('、')}还没回来</div>
-          <div className="mt-0.5 text-dim">在那之前各页的列表可能不全，不代表数据没了，先别急着新建。</div>
+          <div className="mt-0.5 text-dim">
+            {unknown
+              ? '在那之前各页的列表可能不全，不代表数据没了，先别急着新建。'
+              : '页面上是上次取回来的列表，回来之后自动换新。'}
+          </div>
         </div>
       )}
       {checks.length > 0 && (
@@ -667,7 +699,7 @@ function CheckList({ checks, lead }: { checks: CatalogCheck[]; lead?: ReactNode 
             <span className="sr-only">{c.state === 'pending' ? '还在等' : c.state === 'ok' ? '已取回 ' : '失败 '}</span>
             {c.state === 'pending'
               ? <span aria-hidden>…</span>
-              : c.state === 'ok' ? `${c.ms ?? '—'} ms` : c.status ? String(c.status) : '连不上'}
+              : c.state === 'ok' ? `${c.ms ?? '—'} ms` : failWord(c)}
           </span>
         </li>
       ))}
@@ -711,7 +743,7 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
   const retryAt = useCatalog((s) => s.retryAt)
   const loaded = useCatalog((s) => s.loaded)
   const [t0] = useState(() => Date.now())
-  const now = useTicker(true, 250)
+  const now = useTicker(250)
   const [busy, setBusy] = useState(false)
   const elapsed = now - t0
   const down = backend === 'down'
@@ -719,8 +751,8 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
   // 一闪而过的启动（本机几十毫秒）不画清单，免得整屏跳一下
   const reveal = down || elapsed > 300
 
-  // 请求没有超时，后端卡死（连得上但不回）时会一直挂着：到点主动探一次 /health，
-  // 它带超时，卡死和断开都能在这里判出来
+  // 每张表要等满 CATALOG_TIMEOUT_MS 才记成失败，后端卡死（连得上但不回）时启动页得
+  // 干等 15 秒：到点先主动探一次 /health，它的超时短得多，卡死和断开都能在这里先判出来
   useEffect(() => { if (slow) void useCatalog.getState().checkBackend() }, [slow])
 
   const retry = async () => {
@@ -825,30 +857,6 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
       </div>
     </div>
   )
-}
-
-/**
- * 启动时部分请求失败（后端连着，但某几张表报错）：进页面，但要说出来。
- * 不说的话，那几张表对应的下拉、列表就是空的，看着像"没有"。
- */
-function useBootReport(loaded: boolean) {
-  const reported = useRef(false)
-  useEffect(() => {
-    if (!loaded || reported.current) return
-    reported.current = true
-    // 只报后端回了错误码的那几项：够不着后端（没有状态码）归启动页和离线横幅说，
-    // 这里再弹一条「6 项没加载成功」就是同一件事说两遍
-    const bad = useCatalog.getState().checks.filter((c) => c.state === 'error' && c.status)
-    if (!bad.length) return
-    toast.warn(
-      `有 ${bad.length} 项没加载成功：${bad.map((c) => (c.status ? `${c.label}（${c.status}）` : c.label)).join('、')}`,
-      {
-        detail: bad.map((c) => `${c.label}：${c.error ?? ''}`).join('\n'),
-        action: { label: '重试', onClick: () => void useCatalog.getState().refresh() },
-        key: 'boot-partial',
-      },
-    )
-  }, [loaded])
 }
 
 // -------------------------------------------------------------------------

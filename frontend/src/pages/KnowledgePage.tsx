@@ -6,22 +6,22 @@ import {
   X,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
+import type { KbHit, KbSearchResult, ReindexJob, UploadProgress } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
-  confirmDialog, EmptyState, ErrorState, Field, IconButton, isComposing, Modal, promptDialog, Skeleton, Spinner,
-  StatusBadge, TabPanel, Tabs, toast, useTabRoute,
+  confirmDialog, deferDelete, DeleteButton, EmptyState, ErrorState, Field, IconButton, isComposing, Modal,
+  PageHeader, promptDialog, SectionBar, Skeleton, Spinner, StatusBadge, TabPanel, Tabs, toast, useRadioGroup,
+  useTabRoute, useTicker, withoutDeferred,
 } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import {
-  formatDateTime, formatDuration, formatNumber, formatRelative, formatTime, parseServerTime, shortId,
+  formatBytes, formatDateTime, formatDuration, formatNumber, formatRelative, formatTime, NONE, parseServerTime, shortId,
 } from '../lib/format'
 import { matchShortcut } from '../lib/keys'
 import { useRunClock } from '../run/useRunClock'
 import type { KbDocument, MemoryItem, MemorySource, Skill } from '../types'
-import {
-  DeleteButton, deferDelete, formatBytes, PageHeader, SectionBar, useRadioGroup, useTicker, withoutDeferred,
-} from './DataSourcesTab'
+import { UploadMeter } from './DataSourcesTab'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
 const TABS = [
@@ -102,12 +102,56 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
   const [baseUrl, setBaseUrl] = useState('')
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState('')
-  const since = useRef(0)
-  const clock = useRunClock(busy === 'rebuild')
+  // 在看的那次重建（后台跑，轮询进度）。只有看着它跑完的，才报「重建完了」
+  const [job, setJob] = useState<ReindexJob | null>(null)
+  const [jobFailed, setJobFailed] = useState<ReindexJob | null>(null)
+  const running = job?.state === 'running'
+  // 重建途中换模型，前半截是旧模型建的、后半截是新的：跑着的时候把换模型也锁上
+  const locked = !!busy || running
+  const clock = useRunClock(running)
 
   useEffect(() => {
     if (info) { setBaseUrl(info.base_url || ''); setModel(info.model || '') }
   }, [info?.base_url, info?.model])
+
+  // 进页先看一眼：刷新之前、或者别的标签页点的重建可能还在跑，接着显示它的进度
+  useEffect(() => {
+    let live = true
+    api.kb.reindexStatus().then((j) => { if (live && j.state === 'running') setJob(j) }, () => {})
+    return () => { live = false }
+  }, [])
+
+  // 一秒问一次进度，拿到的就是后端按批记下的真实数字，不在两次之间插值
+  useEffect(() => {
+    if (!running) return
+    let live = true
+    const t = setTimeout(async () => {
+      let next: ReindexJob | { state: 'idle' }
+      try {
+        next = await api.kb.reindexStatus()
+      } catch {
+        // 这一拍没问到（后端抖了一下）：原样再排一拍
+        if (live) setJob((j) => (j ? { ...j } : j))
+        return
+      }
+      if (!live) return
+      if (next.state === 'running') { setJob(next); return }
+      setJob(null)
+      if (next.state === 'idle') {
+        // 进度只记在后端进程里：重启过就没了，重建多半也没做完
+        toast.warn('后端重启过，这次重建的进度丢了：看一眼还剩多少对不上的，需要就再点一次重建')
+      } else if (next.state === 'failed') {
+        setJobFailed(next)
+      } else {
+        const r = next.result
+        const mem = r?.memories_reindexed ?? 0
+        toast.ok(`已用 ${r?.embedder ?? '当前模型'} 重建 ${formatNumber(r?.reindexed ?? 0)} 段知识` + (mem ? ` 和 ${formatNumber(mem)} 条记忆` : ''))
+      }
+      await refresh()
+      await onChanged()
+    }, 1000)
+    return () => { live = false; clearTimeout(t) }
+  }, [job])
 
   if (!info) return <Skeleton rows={1} height={44} className="mb-3" />
   // 记忆和知识库共用一个 embedder，换模型时一起失效。只报一个的话，
@@ -193,17 +237,24 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
     } finally { setBusy('') }
   }
 
+  /**
+   * 后台重建：立刻回来，进度靠轮询。几千段配远端 embedding 要好几分钟，以前整个
+   * 请求压着，按钮上只有一个不知道还要多久的计时
+   */
   const rebuild = async () => {
-    since.current = Date.now()
+    setJobFailed(null)
     setBusy('rebuild')
     try {
-      const out = await api.kb.reindex(collection)
-      const mem = out.memories_reindexed ?? 0
-      toast.ok(`已用 ${out.embedder} 重建 ${formatNumber(out.reindexed)} 段知识` + (mem ? ` 和 ${formatNumber(mem)} 条记忆` : ''))
-      await refresh()
-      await onChanged()
+      setJob(await api.kb.startReindex(collection))
     } catch (e) {
-      toast.error(e)
+      if (e instanceof ApiError && e.status === 409) {
+        // 已经有一次在跑（别的标签页，或者别人点的）：不再起第二次，接着看它的进度
+        toast.info(e.message)
+        const cur = await api.kb.reindexStatus().catch(() => null)
+        if (cur?.state === 'running') setJob(cur)
+      } else {
+        toast.error(e)
+      }
     } finally { setBusy('') }
   }
 
@@ -214,19 +265,27 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
         <span className="mono">{info.embedder} · <span className="tnum">{info.dim}</span> 维</span>
         {/* 看实际在用的那个，不看配的是什么 */}
         <SemanticPill info={info} />
-        <button className="btn btn-sm btn-ghost" disabled={!!busy} aria-expanded={editing}
+        <button className="btn btn-sm btn-ghost" disabled={locked} aria-expanded={editing}
                 onClick={() => setEditing((v) => !v)}>
           {editing ? '收起' : '换一个'}
         </button>
         <span className="flex-1" />
-        {stale > 0 && !fallback && (
-          <button className="btn btn-sm btn-primary tnum" disabled={!!busy} onClick={() => void rebuild()}>
-            {busy === 'rebuild'
-              ? <><Spinner size={11} /> 重建中 {formatDuration(clock - since.current)}</>
+        {(running || (stale > 0 && !fallback)) && (
+          <button className="btn btn-sm btn-primary tnum" disabled={locked || running} onClick={() => void rebuild()}>
+            {running || busy === 'rebuild'
+              ? <><Spinner size={11} /> 重建中</>
               : <>重建索引（{formatNumber(stale)} 段）</>}
           </button>
         )}
       </div>
+
+      {running && job && <ReindexProgress job={job} now={clock} />}
+      {jobFailed && !running && (
+        <div className="mx-3 mb-3">
+          <ErrorState compact error={{ ok: false, error: jobFailed.error ?? '重建索引没做完', hint: jobFailed.hint ?? undefined }}
+                      onRetry={() => void rebuild()} />
+        </div>
+      )}
 
       {fallback && (
         <div className="mx-3 mb-3 rounded-lg border px-3 py-2 text-xs leading-relaxed"
@@ -243,7 +302,7 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
             </p>
           )}
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <button className="btn btn-sm btn-primary" disabled={!!busy}
+            <button className="btn btn-sm btn-primary" disabled={locked}
                     onClick={() => void pickModel(info.model, info.base_url)}>
               {busy === 'pick' ? <Spinner size={11} /> : null} 重新连接
             </button>
@@ -260,21 +319,21 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <input className="field h-7 flex-1" placeholder="http://127.0.0.1:1234/v1" aria-label="embedding 服务地址"
-                     value={baseUrl} disabled={!!busy}
+                     value={baseUrl} disabled={locked}
                      onChange={(e) => setBaseUrl(e.target.value)} />
               {/* 模型名手填太容易错：LM Studio 里叫 text-embedding-qwen3-embedding-4b，
                   不是 Qwen3-Embedding-4B。填错的表现是切换时 404，人还以为服务没起 */}
-              <button className="btn btn-sm" disabled={!!busy || !baseUrl.trim()} onClick={() => void probe()}>
+              <button className="btn btn-sm" disabled={locked || !baseUrl.trim()} onClick={() => void probe()}>
                 {busy === 'probe' ? <Spinner size={11} /> : null} 看看有哪些模型
               </button>
             </div>
             {!!models.length && (
               <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                <select className="field h-7 flex-1" value={model} disabled={!!busy} aria-label="embedding 模型"
+                <select className="field h-7 flex-1" value={model} disabled={locked} aria-label="embedding 模型"
                         onChange={(e) => setModel(e.target.value)}>
                   {models.map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
-                <button className="btn btn-sm btn-primary" disabled={!!busy || !model}
+                <button className="btn btn-sm btn-primary" disabled={locked || !model}
                         onClick={() => void pickModel(model, baseUrl)}>用它</button>
               </div>
             )}
@@ -283,7 +342,7 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
             </p>
           </div>
 
-          <button className="btn btn-sm w-full justify-start" disabled={!!busy || info.kind === 'local'}
+          <button className="btn btn-sm w-full justify-start" disabled={locked || info.kind === 'local'}
                   onClick={() => void pickLocal()}>
             本地哈希向量 <span className="font-normal text-faint">— 零配置、不联网、免费，但只认字面不认语义（全局降级，会先确认）</span>
           </button>
@@ -308,6 +367,48 @@ function EmbedderBar({ info, collection, refresh, onChanged }: {
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * 重建索引的进度：后端按批（64 条一批）记下的真实数字，不插值。
+ *
+ * 三段：知识片段的向量 → 倒排索引 → 记忆的向量。倒排那一段后端没有分批进度，
+ * 条停在片段做完的位置，写明「这一步没有分批进度」，不去假装它在走
+ */
+function ReindexProgress({ job, now }: { job: ReindexJob; now: number }) {
+  const started = parseServerTime(job.started_at)?.getTime()
+  const pct = job.total > 0 ? Math.min(1, job.done / job.total) : null
+  const step = job.phase === 'index'
+    ? '正在重建倒排索引'
+    : job.phase === 'memories'
+      ? `正在重算记忆的向量 · ${formatNumber(job.memories.done)} / ${formatNumber(job.memories.total)} 条`
+      : `正在重算知识片段的向量 · ${formatNumber(job.chunks.done)} / ${formatNumber(job.chunks.total)} 段`
+  return (
+    <div className="border-t px-3 py-2.5" data-reindex={job.phase}>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        <span className="tnum">{step}</span>
+        <span className="flex-1" />
+        <span className="tnum text-2xs text-faint">
+          {pct != null && <>合计 {formatNumber(job.done)} / {formatNumber(job.total)} · {Math.round(pct * 100)}% · </>}
+          已用 {started ? formatDuration(Math.max(0, now - started)) : NONE}
+        </span>
+      </div>
+      {pct != null && (
+        <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-hover" role="progressbar" aria-label="重建索引进度"
+             aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}
+             aria-valuetext={`${step}，合计 ${job.done} / ${job.total}`}>
+          {/* 用 scaleX 推进而不是改 width：只动 transform，不触发重排 */}
+          <div className="h-full origin-left rounded-full bg-[var(--st-running)] transition-transform duration-500"
+               style={{ transform: `scaleX(${pct})` }} />
+        </div>
+      )}
+      <p className="mt-1.5 text-2xs text-faint">
+        {job.phase === 'index'
+          ? '片段的向量都算完了，在把倒排索引整个重建一遍。这一步没有分批进度，库大的话要等一会儿。'
+          : `${job.collection ? `只重建「${job.collection}」的片段；` : ''}记忆和知识库共用一个向量模型，一起重建。可以离开这一页，回来还能看到进度。`}
+      </p>
+    </div>
   )
 }
 
@@ -486,7 +587,14 @@ const FALLBACK_FORMATS = {
   legacy: ['.doc', '.ppt', '.xls'],
 }
 
-interface Uploading { key: number; name: string; size: number; at: number }
+interface Uploading {
+  key: number; name: string; size: number
+  /** 轮到它、开始发的时刻。一次传一个，排在后面的还没开始 */
+  startedAt?: number
+  progress?: UploadProgress
+  /** 字节发完的时刻：之后是后端在解析、切块 */
+  sentAt?: number
+}
 
 function KbList() {
   const navigate = useNavigate()
@@ -501,6 +609,7 @@ function KbList() {
   const [dragging, setDragging] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const uploadSeq = useRef(0)
+  const aborts = useRef(new Map<number, AbortController>())
   const { info, refresh: refreshInfo } = useEmbedding(collection)
 
   const load = async () => {
@@ -544,22 +653,40 @@ function KbList() {
       }
     }
     if (!ok.length) return
-    const items = ok.map((f) => ({ key: ++uploadSeq.current, name: f.name, size: f.size, at: Date.now(), file: f }))
+    const items = ok.map((f) => ({ key: ++uploadSeq.current, name: f.name, size: f.size, file: f }))
+    for (const item of items) aborts.current.set(item.key, new AbortController())
     setUploads((u) => [...items.map(({ file: _f, ...rest }) => rest), ...u])
+    const patch = (key: number, next: (x: Uploading) => Partial<Uploading>) =>
+      setUploads((u) => u.map((x) => (x.key === key ? { ...x, ...next(x) } : x)))
+    // 一次传一个：并发传几个大文件，每个都慢，谁都等不到「处理中」
     for (const item of items) {
+      const ctl = aborts.current.get(item.key)
       try {
-        await api.kb.upload(item.file, collection)
+        if (!ctl || ctl.signal.aborted) continue
+        patch(item.key, () => ({ startedAt: Date.now() }))
+        await api.kb.upload(item.file, collection, {
+          signal: ctl.signal,
+          onProgress: (p) => patch(item.key, (x) => ({ progress: p, sentAt: x.sentAt ?? (p.sent ? Date.now() : undefined) })),
+        })
         await load()
       } catch (e) {
+        // 人点的取消：不算出错
+        if (e instanceof DOMException && e.name === 'AbortError') continue
         const h = humanizeError(e)
         const text = `${item.name} 没传上：${h.reason ? `${h.title}，${h.reason}` : h.title}`
         toast.error(text, { detail: h.raw, action: /表格|数据源/.test(text) ? toData : undefined })
       } finally {
+        aborts.current.delete(item.key)
         setUploads((u) => u.filter((x) => x.key !== item.key))
       }
     }
     await load()
     await refreshCatalog()
+  }
+  // 排着队的直接拿掉；在传的由上面那个循环收尾（它会拿到 AbortError）
+  const cancelUpload = (key: number) => {
+    aborts.current.get(key)?.abort()
+    setUploads((u) => u.filter((x) => x.key !== key || !!x.startedAt))
   }
 
   const newCollection = async () => {
@@ -646,7 +773,7 @@ function KbList() {
           </div>
         )}
 
-        {uploads.map((u) => <UploadingRow key={u.key} item={u} />)}
+        {uploads.map((u) => <UploadingRow key={u.key} item={u} onCancel={() => cancelUpload(u.key)} />)}
 
         {docs === null ? (
           docsError ? <ErrorState compact error={docsError} onRetry={() => void load()} className="m-3" />
@@ -676,15 +803,31 @@ function KbList() {
   )
 }
 
-function UploadingRow({ item }: { item: Uploading }) {
+/**
+ * 上传占位行：真实的字节进度，发完之后写「处理中」。字节没发完之前可以取消——
+ * 后端收不全就什么都不会建；发完了后端已经在切块，取消只会让人以为没传上
+ */
+function UploadingRow({ item, onCancel }: { item: Uploading; onCancel: () => void }) {
   const now = useRunClock(true)
+  const sent = !!item.progress?.sent
   return (
     <div className="flex items-center gap-3 border-b px-3 py-2" data-uploading>
-      <Spinner size={14} />
+      {item.startedAt ? <Spinner size={14} /> : <Upload size={14} className="shrink-0 text-faint" aria-hidden />}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm">{item.name}</div>
-        <div className="tnum text-2xs text-faint">上传中 · {formatBytes(item.size)} · {formatDuration(now - item.at)}</div>
+        <div className="flex items-baseline gap-2">
+          <span className="truncate text-sm">{item.name}</span>
+          <span className="tnum shrink-0 text-2xs text-faint">{formatBytes(item.size)}</span>
+        </div>
+        <div className="mt-0.5 text-2xs">
+          <UploadMeter progress={item.progress ?? null} startedAt={item.startedAt} sentAt={item.sentAt}
+                       processing="后端在解析、切块" now={now} />
+        </div>
       </div>
+      {!sent && (
+        <button className="btn btn-sm btn-ghost shrink-0" onClick={onCancel} aria-label={`取消上传 ${item.name}`}>
+          <X size={12} aria-hidden /> 取消
+        </button>
+      )}
     </div>
   )
 }
@@ -765,7 +908,7 @@ function KbSearch({ collection, info }: { collection: string; info: EmbeddingInf
   const [query, setQuery] = useState('')
   const [alpha, setAlpha] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
-  const [res, setRes] = useState<{ results: any[]; degraded?: string[]; alpha?: number } | null>(null)
+  const [res, setRes] = useState<KbSearchResult | null>(null)
 
   // 集合切换、或运行时默认值变了（换了 embedder），就回到运行时的值
   useEffect(() => { if (runtime != null) setAlpha(runtime) }, [collection, runtime])
@@ -846,6 +989,13 @@ function KbSearch({ collection, info }: { collection: string; info: EmbeddingInf
             {!!res.degraded?.length && (
               <span className="text-[var(--warn)]" title={res.degraded.join('\n')}>已退回关键词：{res.degraded[0]}</span>
             )}
+            {res.results.some((h) => h.contrib) && (
+              <span className="ml-auto inline-flex items-center gap-1.5" data-contrib-legend>
+                总分 =
+                <Swatch color={VIA_SEMANTIC} /> 语义贡献 +
+                <Swatch color={VIA_KEYWORD} /> 关键词贡献
+              </span>
+            )}
           </div>
           {!res.results.length && <div className="text-xs text-faint">没有命中</div>}
           {res.results.map((hit) => <HitCard key={hit.chunk_id} hit={hit} />)}
@@ -856,13 +1006,31 @@ function KbSearch({ collection, info }: { collection: string; info: EmbeddingInf
 }
 
 /**
- * 一条命中。总分是候选集上归一化后的混合分（0–1），可以画成条；语义分是原始
- * 余弦（0–1）也可以；关键词分是原始 BM25，没有上界，画条会误导——只写数。
+ * 贡献条的两种颜色：分类色，只说「哪一路检索」，不表达状态（ok / warn / err /
+ * accent 留给状态）。亮暗各一套，都过了色觉区分度和对表面的对比度检查；跟着
+ * color-scheme 走，所以写成 light-dark()
  */
-function HitCard({ hit }: { hit: any }) {
+const VIA_SEMANTIC = 'light-dark(#0a7ea4, #2b95c0)'
+const VIA_KEYWORD = 'light-dark(#c2447a, #d55181)'
+
+function Swatch({ color }: { color: string }) {
+  return <i aria-hidden className="inline-block h-2 w-2 shrink-0 rounded-[2px]" style={{ background: color }} />
+}
+
+/**
+ * 一条命中。总分是候选集上归一化后的混合分（0–1），拆成两段：语义那一路贡献了
+ * 多少、关键词那一路贡献了多少（两段之和就是总分，后端按 α 加权后给的）。人一眼
+ * 看得出这条是靠哪一路捞上来的，调 α 时知道在动哪一段。
+ *
+ * 原始分另外写成数：语义是余弦（0–1），关键词是 BM25（没有上界，画条会误导）。
+ * 老后端没有 contrib，就退回一根总分条
+ */
+function HitCard({ hit }: { hit: KbHit }) {
   const vec = typeof hit.signals?.vector === 'number' ? hit.signals.vector : null
   const kw = typeof hit.signals?.keyword === 'number' ? hit.signals.keyword : null
+  const c = hit.contrib
   const only = vec && !kw ? '只靠语义命中' : kw && !vec ? '只靠关键词命中' : null
+  const raw = (v: number | null, digits: number) => (v == null ? '—' : v.toFixed(digits))
   return (
     <Link to={`/knowledge/kb/${hit.document_id}#chunk-${hit.ordinal}`}
           className="block rounded-lg border bg-bg p-2.5 hover:border-[var(--border-strong)]" data-hit>
@@ -871,15 +1039,44 @@ function HitCard({ hit }: { hit: any }) {
         <span className="shrink-0">片段 {hit.ordinal}</span>
         {only && <span className="chip shrink-0">{only}</span>}
         <span className="ml-auto shrink-0">总分</span>
-        <Bar value={hit.score} />
+        {c ? <ContribBar vector={c.vector} keyword={c.keyword} /> : <Bar value={hit.score} />}
         <span className="mono tnum w-11 shrink-0 text-right text-dim">{Number(hit.score).toFixed(3)}</span>
       </div>
-      <div className="mt-1 flex items-center gap-3 text-2xs text-faint">
-        <span className="inline-flex items-center gap-1.5">语义余弦 <Bar value={vec ?? 0} thin /> <span className="mono tnum">{vec == null ? '—' : vec.toFixed(3)}</span></span>
-        <span>关键词 BM25 <span className="mono tnum">{kw == null ? '—' : kw.toFixed(2)}</span></span>
-      </div>
+      {c ? (
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-faint" data-contrib>
+          <span className="inline-flex items-center gap-1">
+            <Swatch color={VIA_SEMANTIC} />语义 <span className="mono tnum text-dim">+{Math.max(0, c.vector).toFixed(3)}</span>
+            <span>（余弦 <span className="mono tnum">{raw(vec, 3)}</span>）</span>
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Swatch color={VIA_KEYWORD} />关键词 <span className="mono tnum text-dim">+{Math.max(0, c.keyword).toFixed(3)}</span>
+            <span>（BM25 <span className="mono tnum">{raw(kw, 2)}</span>）</span>
+          </span>
+        </div>
+      ) : (
+        <div className="mt-1 flex items-center gap-3 text-2xs text-faint">
+          <span className="inline-flex items-center gap-1.5">语义余弦 <Bar value={vec ?? 0} thin /> <span className="mono tnum">{raw(vec, 3)}</span></span>
+          <span>关键词 BM25 <span className="mono tnum">{raw(kw, 2)}</span></span>
+        </div>
+      )}
       <div className="mt-1.5 line-clamp-3 text-xs leading-relaxed">{hit.content}</div>
     </Link>
+  )
+}
+
+/**
+ * 总分拆成两段的条：整根轨道是 1 分，两段依次排开，中间留 2px 缝。关键词那段是
+ * 后端用减法算出来的，四舍五入可能出一点点负数，画的时候当 0
+ */
+function ContribBar({ vector, keyword }: { vector: number; keyword: number }) {
+  const v = Math.max(0, Math.min(1, vector))
+  const k = Math.max(0, Math.min(1 - v, keyword))
+  return (
+    <span className="inline-flex h-1.5 w-16 shrink-0 gap-[2px] overflow-hidden rounded-full bg-hover" aria-hidden
+          title={`语义贡献 ${v.toFixed(3)} + 关键词贡献 ${k.toFixed(3)} = 总分 ${(v + k).toFixed(3)}`}>
+      {v > 0 && <span className="h-full shrink-0 rounded-l-full" style={{ width: `${v * 100}%`, background: VIA_SEMANTIC }} />}
+      {k > 0 && <span className={clsx('h-full shrink-0', !v && 'rounded-l-full')} style={{ width: `${k * 100}%`, background: VIA_KEYWORD }} />}
+    </span>
   )
 }
 
@@ -1304,6 +1501,7 @@ function SkillsTab() {
         <EmptyState
           icon={<Sparkles size={22} />}
           title="还没有 Skill"
+          source="skills"
           body="把「先给结论、区分事实与推断」「口径卡怎么写」这类做事方法写成 Skill，挂到节点上复用。"
           action={<button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 新建 Skill</button>}
         />

@@ -38,7 +38,7 @@ def _clean(text: str) -> None:
 def test_common_failures_are_put_in_plain_words():
     import httpx
 
-    from app.api.errors import explain, graph_error, raw
+    from app.core.errors import explain, graph_error, raw
 
     reason, hint = explain(httpx.ConnectError("[Errno 61] Connection refused"))
     assert "连不上" in reason and hint

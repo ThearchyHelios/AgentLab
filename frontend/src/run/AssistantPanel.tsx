@@ -1,22 +1,24 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  ChevronLeft, ChevronRight, Code2, Crosshair, Hand, History, MessageSquarePlus, Play, Square,
-  Undo2, Wand2,
+  Ban, ChevronLeft, ChevronRight, Code2, Crosshair, Hand, History, MessageSquarePlus, Play, Square,
+  Undo2, Wand2, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useCatalog } from '../store/catalog'
 import { useStudio, type CopilotTurn } from '../store/studio'
-import { IconButton, StatusBadge, toast } from '../components/ui'
+import { confirmDialog, IconButton, StatusBadge, toast } from '../components/ui'
 import { formatClock, formatCost, formatDuration, formatTokens, shortId, NONE } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { runClassLabel } from '../lib/terms'
+import type { ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import {
-  copilotOutcome, decodeCopilot, decodeRun, SELF_CHECK_ROUNDS, type CopilotIssue, type Step,
+  copilotOutcome, decodeCopilot, decodeRun, SELF_CHECK_ROUNDS, type CopilotIssue,
 } from './decode'
 import { ApprovalCard } from './RunPanel'
+import { useRunGlance } from './RunHud'
 import { isSettled, liveAt, project, type RunPhase } from './trace'
 import { useRunClock } from './useRunClock'
 
@@ -42,19 +44,56 @@ import { useRunClock } from './useRunClock'
 export function AssistantPanel() {
   const run = useStudio((s) => s.run)
   const [view, setView] = useState<'chat' | 'run'>('chat')
+  const [reveal, setReveal] = useState<Reveal | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   // 发起一次新运行就把这一层推到前面——那是此刻唯一在发生的事
   useEffect(() => {
     if (run?.id) setView('run')
+    setReveal(null)
   }, [run?.id])
 
+  // 画布上的胶囊「去审批」、成果节点的出具印章要把人带到右栏的审批卡 / 出具横幅。右栏停在
+  // 对话层时那两样根本不在页面上，以前只能退回一句 toast——所以由右栏自己听、自己切过去，
+  // 并 preventDefault 告诉派发方「接手了」。右栏收起时它还挂着（只是藏起来），那时不接：
+  // 切过去也没人看得见，让派发方自己兜底
+  useEffect(() => {
+    const listen = (kind: Reveal['kind']) => (e: Event) => {
+      const runId = (e as CustomEvent<{ runId?: string }>).detail?.runId
+      const s = useStudio.getState()
+      const root = rootRef.current
+      if (!s.run || (runId && runId !== s.run.id)) return
+      if (!root || !root.offsetWidth || getComputedStyle(root).visibility !== 'visible') return
+      e.preventDefault()
+      // 属性面板盖在右栏上：先让开，要看的东西在它下面
+      s.select(null)
+      setView('run')
+      setReveal((r) => ({ kind, seq: (r?.seq ?? 0) + 1 }))
+    }
+    const approval = listen('approval')
+    const issuance = listen('issuance')
+    window.addEventListener('agentlab:goto-approval', approval)
+    window.addEventListener('agentlab:goto-issuance', issuance)
+    return () => {
+      window.removeEventListener('agentlab:goto-approval', approval)
+      window.removeEventListener('agentlab:goto-issuance', issuance)
+    }
+  }, [])
+
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    // data-assistant-panel：画布上的出具印章据此判断「点了有人接」，右栏在对话层时它照样能点
+    <div ref={rootRef} data-assistant-panel="" className="relative flex h-full min-h-0 flex-col">
       {view === 'run' && run
-        ? <RunView onBack={() => setView('chat')} />
+        ? <RunView onBack={() => setView('chat')} reveal={reveal} />
         : <ChatView hasRun={!!run} onOpenRun={() => setView('run')} />}
     </div>
   )
+}
+
+/** 别处请右栏摆到眼前的东西：审批卡、出具横幅。seq 让同一个请求连着来两次也会再做一遍 */
+interface Reveal {
+  kind: 'approval' | 'issuance'
+  seq: number
 }
 
 // -------------------------------------------------------------------------
@@ -84,7 +123,10 @@ function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repai
   const foundN = Array.isArray(found?.issues) ? found!.issues.length : 0
   const reply = out.reply ?? t.reply
   const errorOp = out.error
-  const steps = decodeCopilot(t.ops, { context: 'canvas' })
+  const unchanged = t.outcome === 'unchanged'
+  const steps = decodeCopilot(t.ops, { context: 'canvas', unchanged })
+  // 模型改提示词时漏写了 tools、把节点的工具抹掉了：图照样能跑，只是什么都查不到
+  const lost = out.toolChanges.filter((c) => c.removed.length)
   // 回执说清改了什么：「流程已更新」不说改了哪几处，改坏了都不知道从哪看起
   const d = t.diff
   const changed = d ? [
@@ -111,13 +153,22 @@ function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repai
     status = '已回答（没有改动画布）'
   } else if (out.kind === 'built') {
     if (out.check?.status === 'failed') {
-      status = `已放到画布，但还有 ${out.check.issues.length} 处问题要你处理`
+      status = unchanged
+        ? `画布没有改动，但还有 ${out.check.issues.length} 处问题要你处理`
+        : `已放到画布，但还有 ${out.check.issues.length} 处问题要你处理`
       tone = 'warn'
     } else if (out.skipped.length) {
       status = `已放到画布，但有 ${out.skipped.length} 步没放上`
       tone = 'warn'
+    } else if (lost.length) {
+      status = `${updated} · ${lost.length} 处工具被去掉了`
+      tone = 'warn'
+    } else if (unchanged) {
+      // 收到了 final，但一处都没变：说「已更新画布」是在报一个没发生的改动
+      status = '看过了，画布没有需要改的地方'
     } else if (out.check?.status === 'passed' && out.check.repaired) {
-      status = `${updated} · 自查发现 ${foundN || '几'} 处问题，已自动修好`
+      // 修了几处只有「交回去改」那一条带着数；没有它（一次就修好）时不硬凑「几 处」
+      status = `${updated} · ${foundN ? `自查发现 ${foundN} 处问题，已自动修好` : '自查发现的问题已自动修好'}`
     } else if (out.check?.status === 'passed') {
       status = `${updated} · 自查通过`
     } else {
@@ -200,25 +251,32 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
       )
     }
     const issues = out.check?.status === 'failed' ? out.check.issues : []
+    const lost = out.toolChanges.filter((c) => c.removed.length)
     const undo = source.outcome === 'applied' || (out.kind === 'built' && source.outcome !== 'reverted')
-    if (!issues.length && !out.skipped.length) {
+    if (!issues.length && !out.skipped.length && !lost.length) {
       return undo ? (
         <button type="button" className="btn btn-xs btn-ghost" onClick={() => undoCopilotTurn(source.id)}>
           <Undo2 size={11} aria-hidden /> 撤销这次生成
         </button>
       ) : null
     }
+    // 只是工具被抹掉了：让 Copilot 再修不管用（自查是通过的），撤回这一轮才是一步到位的补救
+    const repairable = issues.length > 0 || out.skipped.length > 0
     return (
       <div className="w-full space-y-1.5">
         {/* 没修好的问题直接摊开，不折叠：这是此刻唯一要做的事 */}
         {issues.length > 0 && <IssueList issues={issues} onLocate={locate} />}
+        {lost.length > 0 && <ToolLossList changes={lost} onLocate={locate} />}
         <div className="flex flex-wrap items-center gap-1.5">
-          <button type="button" className="btn btn-xs btn-primary"
-                  onClick={() => repairWithCopilot(source.id)}>
-            <Wand2 size={11} aria-hidden /> {issues.length ? '让 Copilot 再修' : '让 Copilot 补上'}
-          </button>
+          {repairable && (
+            <button type="button" className="btn btn-xs btn-primary"
+                    onClick={() => repairWithCopilot(source.id)}>
+              <Wand2 size={11} aria-hidden /> {issues.length ? '让 Copilot 再修' : '让 Copilot 补上'}
+            </button>
+          )}
           {undo && (
-            <button type="button" className="btn btn-xs btn-ghost" onClick={() => undoCopilotTurn(source.id)}>
+            <button type="button" className={clsx('btn btn-xs', repairable ? 'btn-ghost' : 'btn-primary')}
+                    onClick={() => undoCopilotTurn(source.id)}>
               <Undo2 size={11} aria-hidden /> 撤销这次生成
             </button>
           )}
@@ -306,40 +364,75 @@ function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (id
 }
 
 /**
+ * 这一轮被去掉的工具，逐个节点列出来：去掉了什么、还剩什么。「修改 1」说不出节点的
+ * 查库工具被整个抹掉了，要到运行结果不对才会发现
+ */
+function ToolLossList({ changes, onLocate }: { changes: ToolChange[]; onLocate: (id: string) => void }) {
+  return (
+    <ul data-tool-changes="" className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
+        style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))',
+                 background: 'var(--st-waiting-soft)' }}>
+      {changes.map((c) => (
+        <li key={`${c.node_id}|${c.member ?? ''}`} className="flex items-start gap-1.5">
+          <Wrench size={10} className="mt-[3px] shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
+          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            「{c.label}」{c.member ? `的成员「${c.member}」` : ''}去掉了{' '}
+            <span className="mono">{c.removed.join('、')}</span>
+            {c.after.length ? `，还剩 ${c.after.join('、')}` : '，现在一个工具都没有'}
+          </span>
+          {c.node_id && (
+            <button type="button"
+                    className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
+                    onClick={() => onLocate(c.node_id)}>
+              <Crosshair size={10} aria-hidden /> 定位
+            </button>
+          )}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/**
  * 对话下面那条运行进度。
  *
  * 运行搬去自己那一层之后，这条是它在对话视图里留下的唯一痕迹——没有它，
- * 点了运行再切回对话，这次运行在眼前就彻底没了。状态只读 runPhase：以前这里
- * 看步骤、审批列表、streaming 三样各自猜，等审批时会同时写"正在执行"。
+ * 点了运行再切回对话，这次运行在眼前就彻底没了。相位、那一句话和计时读
+ * useRunGlance，和画布上的胶囊同一份：以前这里自己解码步骤、自己起名，同一时刻
+ * 胶囊写「停在『主管审批』」、这里写「等待审批」，计时也各走各的。
  */
 function RunStrip({ onClick }: { onClick: () => void }) {
   const run = useStudio((s) => s.run)
-  const events = useStudio((s) => s.events)
-  const phase = useStudio((s) => s.runPhase)
-  const steps = useMemo(() => (phase === 'running' ? decodeRun(events) : []), [events, phase])
+  const g = useRunGlance(true)
   if (!run) return null
 
-  const last = phase === 'running' ? lastMeaningful(steps) : undefined
+  const phase = g.phase
   const waiting = phase === 'waiting'
   const alert = phase === 'failed' || phase === 'suspended'
+  const ticking = phase === 'running' || phase === 'queued'
 
   return (
     <button
       type="button"
+      data-run-strip={phase}
       className="flex w-full shrink-0 items-center gap-2 border-t px-2.5 py-1.5 text-left text-2xs transition-colors hover:bg-hover"
       style={waiting ? { background: 'var(--st-waiting-soft)' } : undefined}
       title="看这次运行的完整过程" onClick={onClick}
     >
       {phase === 'idle'
         ? <Play size={10} className="shrink-0 text-faint" fill="currentColor" aria-hidden />
-        : <StatusBadge status={phase === 'succeeded' ? 'succeeded' : phase} size={11} decorative />}
-      <span className={clsx('min-w-0 flex-1 truncate', !waiting && !alert && 'text-dim')}
-            style={waiting ? { color: 'var(--st-waiting)' } : alert ? { color: 'var(--st-failed)' } : undefined}>
-        {waiting ? `${statusLabel('waiting')} · 去处理`
-          : phase === 'running' ? (last?.title || statusLabel('running'))
-          : phase === 'idle' ? '运行'
-          : `这次运行${statusLabel(phase)}`}
+        : <StatusBadge status={phase} size={11} decorative />}
+      <span className="min-w-0 flex-1 truncate">
+        <span className={clsx('font-medium', !waiting && !alert && 'text-fg')}
+              style={waiting ? { color: 'var(--st-waiting)' } : alert ? { color: 'var(--st-failed)' } : undefined}>
+          {phase === 'idle' ? '运行' : g.label}
+        </span>
+        {g.headline && phase !== 'idle' && <span className="text-dim"> · {g.headline}</span>}
+        {waiting && <span style={{ color: 'var(--st-waiting)' }}> · 去处理</span>}
       </span>
+      {ticking && (
+        <span className="mono tnum shrink-0" style={{ color: 'var(--st-running)' }}>{formatClock(g.elapsedMs)}</span>
+      )}
       <ChevronRight size={11} className="shrink-0 text-faint" aria-hidden />
     </button>
   )
@@ -354,7 +447,7 @@ const STREAM_PHASE: Record<RunPhase, StreamTurn['phase']> = {
   succeeded: 'done', failed: 'error', cancelled: 'done', suspended: 'done',
 }
 
-function RunView({ onBack }: { onBack: () => void }) {
+function RunView({ onBack, reveal }: { onBack: () => void; reveal: Reveal | null }) {
   const run = useStudio((s) => s.run)!
   const events = useStudio((s) => s.events)
   const phase = useStudio((s) => s.runPhase)
@@ -363,6 +456,7 @@ function RunView({ onBack }: { onBack: () => void }) {
   const stopRun = useStudio((s) => s.stopRun)
   const setHoveredNode = useStudio((s) => s.setHoveredNode)
   const focusNode = useStudio((s) => s.focusNode)
+  const select = useStudio((s) => s.select)
   const hoveredNodeId = useStudio((s) => s.hoveredNodeId)
   const approvals = useCatalog((s) => s.approvals)
   const refreshApprovals = useCatalog((s) => s.refreshApprovals)
@@ -430,14 +524,63 @@ function RunView({ onBack }: { onBack: () => void }) {
       setStopping(false)
     }
   }
+  /**
+   * 放弃停在审批上（或服务重启时挂起）的运行。它已经不在执行，没有「停止」可言；后端
+   * 把它直接收成已取消，待审批一并关闭。关掉的审批找不回来，所以先问一句——和画布
+   * 胶囊上的「放弃」同一套说法
+   */
+  const abandon = async () => {
+    const ok = await confirmDialog({
+      title: '放弃这次运行？',
+      body: phase === 'suspended'
+        ? '运行在服务重启时挂起了。放弃之后它记为已取消，不能再从断点接着跑。'
+        : '运行停在审批上。放弃之后它记为已取消，不能再接着跑。',
+      consequences: [
+        ...(pending.length ? [`这次运行的 ${pending.length} 条待审批一并关闭，留痕里写上是谁放弃的`] : []),
+        '已经跑完的节点结果照样留在记录里',
+      ],
+      confirmLabel: '放弃这次运行',
+      danger: true,
+    })
+    if (ok) await stop()
+  }
+  const reducedMotion = () => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
   const toApproval = () => {
     const slot = bodyRef.current?.querySelector<HTMLElement>('[data-approval-slot]:not(:empty)')
-    const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
-    slot?.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' })
-    slot?.querySelector<HTMLElement>('textarea, input, button')?.focus({ preventScroll: true })
+    if (!slot) return
+    const card = slot.querySelector<HTMLElement>('[data-approval]') ?? slot
+    card.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' })
+    card.querySelector<HTMLElement>('textarea, input, button')?.focus({ preventScroll: true })
+    // 和胶囊找到卡片时同一个描边：人从画布那头被带过来，得知道「是这张」
+    card.classList.add('sf-flash')
+    setTimeout(() => card.classList.remove('sf-flash'), 1600)
+  }
+  const toIssuance = () => {
+    const banner = bodyRef.current?.querySelector<HTMLElement>('[data-issuance-banner]')
+    if (!banner) return
+    banner.scrollIntoView({ block: 'start', behavior: reducedMotion() ? 'auto' : 'smooth' })
+    banner.focus({ preventScroll: true })
+    banner.dataset.flash = 'focus'
+    setTimeout(() => { if (banner.dataset.flash === 'focus') delete banner.dataset.flash }, 1600)
   }
 
+  // 别处请这一层把审批卡 / 出具横幅摆到眼前（胶囊的「去审批」、成果节点的出具印章）。
+  // 卡片跟着审批列表来，刚停下时可能还在路上：等取回来（或确认没有）再办，别滚到空处
+  const revealed = useRef(0)
+  useEffect(() => {
+    if (!reveal || reveal.seq === revealed.current) return
+    if (raw) { setRaw(false); return }
+    if (reveal.kind === 'approval' && !hasCard && phase === 'waiting' && looked !== run.id) return
+    revealed.current = reveal.seq
+    // 等这一帧的布局落定：运行层刚挂上时，助手流自己也在做打开时的定位。不在清理里
+    // 取消——紧跟着来一条事件就会把这次请求吞掉；卸载了的话两个函数找不到东西自然不做
+    requestAnimationFrame(reveal.kind === 'approval' ? toApproval : toIssuance)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal, raw, hasCard, phase, looked, run.id, turns])
+
   const live = phase === 'running' || phase === 'queued'
+  // 停在审批上、服务重启时挂起的：不在执行，给的是「放弃」而不是「停止」
+  const parked = phase === 'waiting' || phase === 'suspended'
 
   return (
     <div className="sheet-in flex h-full min-h-0 flex-col">
@@ -458,11 +601,15 @@ function RunView({ onBack }: { onBack: () => void }) {
         </Link>
         <span className="flex-1" />
         {phase === 'waiting' && pending.length > 0 && (
-          // 等人时工具栏不给"停止"（后端对停在审批上的运行没有取消路径，点了必然
-          // 409），给的是此刻真正该做的事
+          // 等人时首要的是此刻真正该做的事；「放弃」是次一级的，收成一枚图标
           <button type="button" className="btn btn-xs" style={{ color: 'var(--st-waiting)' }} onClick={toApproval}>
             <Hand size={11} aria-hidden /> 去审批
           </button>
+        )}
+        {parked && (
+          <IconButton label="放弃这次运行" variant="danger" disabled={stopping} onClick={() => void abandon()}>
+            <Ban size={12} aria-hidden />
+          </IconButton>
         )}
         {live && (
           <IconButton label="停止这次运行" variant="danger" disabled={stopping} onClick={() => void stop()}>
@@ -489,6 +636,8 @@ function RunView({ onBack }: { onBack: () => void }) {
             clockSkewMs={trace.skewMs ?? 0}
             onStepHover={setHoveredNode}
             onStepFocus={focusNode}
+            // 没绑工具、轮数不够这种要去画布上改的：直接打开那个节点的设置，镜头也带过去
+            onStepOpen={(id) => { select(id); focusNode(id) }}
             activeNodeId={hoveredNodeId}
             // 审批卡插在它所属的那一轮里，而不是浮在整栏顶上：
             // 要确认的那件事和确认按钮之间不该隔着整条执行过程
@@ -575,17 +724,6 @@ function RunFooter() {
       <span className="mono">{approx && cost ? '≥' : ''}{cost != null && (cost > 0 || settled) ? formatCost(cost) : NONE}</span>
     </div>
   )
-}
-
-/** 最后一条有意义的步骤：跳过生命周期行，那才是"此刻在干什么"。 */
-export function lastMeaningful(steps: Step[]): Step | undefined {
-  const flat: Step[] = []
-  const walk = (list: Step[]) => list.forEach((s) => {
-    flat.push(s)
-    if (s.children) walk(s.children)
-  })
-  walk(steps)
-  return [...flat].reverse().find((s) => s.kind !== 'lifecycle') ?? flat[flat.length - 1]
 }
 
 /** 原始事件。翻译层出问题时用来对照，平时收着。和步骤流一样只在贴底时跟随 */

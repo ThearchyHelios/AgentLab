@@ -19,7 +19,11 @@
 // - 定位 / 去审批取景半路被拉远，落地卡在 compact 档（错误正文被藏）；
 // - 「只看执行路径」带进下一次运行；正式运行横幅盖住「恢复」；
 // - 同一刻的等人时长几处写几个数；只是点一下画布就暂停跟随；
-// - Esc 在右栏里按也清掉整次运行；泳道、节点格、坞高只能用鼠标。
+// - Esc 在右栏里按也清掉整次运行；泳道、节点格、坞高只能用鼠标；
+// - 运行中点节点，属性面板整块盖住右栏的运行视图（应当先请右栏滚到它的步骤）；
+// - 等审批时只能批不能放弃；回放时回边的 ×N、面板的用量拿终值冒充那一刻；
+// - Copilot 搭图时新节点落在视口外看不见；双击空白处只会缩放；1024 宽打开只看得见两张半卡；
+// - Copilot 删掉的节点一声不响就没了，看不出删的是哪个、原来在哪。
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -187,6 +191,13 @@ async function openStudio({ id = FX_ID, theme = 'dark', ...extra } = {}) {
   page.on('pageerror', (e) => errors.push('pageerror: ' + e.message))
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('404') && !m.text().includes('409')) errors.push(m.text()) })
   await fakeBackend(page)
+  // 主题：设置接口里存的偏好会在启动时盖过本地缓存，不改它的话「暗色」那一遍画出来是亮的
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue()
+    const res = await route.fetch()
+    const body = await res.json().catch(() => ({}))
+    await route.fulfill({ response: res, json: { ...body, ui: { ...(body.ui ?? {}), theme } } })
+  })
   await page.goto(`${WEB}/studio/${id}`, { waitUntil: 'networkidle' })
   await page.waitForFunction((wid) => window.__studio?.getState().workflow?.id === wid, id, { timeout: 15000 })
   await page.waitForTimeout(700)
@@ -207,6 +218,18 @@ const seedRun = (page, extra = {}) => page.evaluate((x) => {
 }, extra)
 
 const count = (page, sel) => page.locator(sel).count()
+/** 轮询到条件成立或超时。取景有动画、热更新可能插一脚，固定等几百毫秒会偶发失败 */
+async function until(fn, { timeout = 3000, every = 100 } = {}) {
+  const end = Date.now() + timeout
+  for (;;) {
+    const v = await fn().catch(() => false)
+    if (v || Date.now() > end) return v
+    await new Promise((r) => setTimeout(r, every))
+  }
+}
+/** 开发服务器热更新会把页面整个重载（别的代理恰好在改代码），store 里灌的运行就没了 */
+const markBoot = (page) => page.evaluate(() => { window.__fxBoot = true })
+const reloaded = (page) => page.evaluate(() => !window.__fxBoot).catch(() => true)
 const capsule = (page) => page.locator('.sf-capsule')
 /** 工具栏上的「运行」发起按钮（胶囊的名字也以「运行中」开头，按全名找） */
 const launcher = (page) => page.locator('[data-run-control]').getByRole('button', { name: /^运行$/ })
@@ -330,6 +353,7 @@ console.log('=== 运行中：胶囊、光点、计时 ===')
 console.log('=== 等人：入边闸门，不流光点；去审批代替停止 ===')
 {
   const { browser, page } = await openStudio()
+  await markBoot(page)
   await seedRun(page)
   await feed(page, [...PARALLEL, ...TEAM_DONE, ...TO_REVIEW])
   await page.waitForTimeout(400)
@@ -351,12 +375,34 @@ console.log('=== 等人：入边闸门，不流光点；去审批代替停止 ==
   check('等人时全图 0 个光点', await count(page, '.edge-packet') === 0, `${await count(page, '.edge-packet')} 个`)
   check('小地图上等人的节点放大了一圈', await count(page, '.sf-mm-ring.sf-mm-waiting') === 1)
 
-  // 去审批：属性面板盖在右栏上时先让开，画布取景到等人的节点
-  await page.evaluate(() => window.__studio.setState({ focusRequest: null, selectedId: 'gate' }))
+  // 去审批：属性面板盖在右栏上时先让开，画布取景到等人的节点。右栏（助手面板）接
+  // agentlab:goto-approval 事件切到运行层、滚到审批卡；它接了（preventDefault）胶囊就不再自己找
+  await page.evaluate(() => {
+    window.__goto = []
+    window.addEventListener('agentlab:goto-approval', (e) => { window.__goto.push(e.detail); e.preventDefault() })
+    window.__studio.setState({ focusRequest: null, selectedId: 'gate' })
+    // 胶囊自己兜底时在整页里找审批卡（document.querySelector）；右栏接手时只在自己的
+    // 滚动区里找。数一下前者，就知道胶囊有没有在右栏接手之后还去找
+    window.__slotLookups = 0
+    const find = Document.prototype.querySelector
+    window.__restoreQuery = () => { Document.prototype.querySelector = find }
+    Document.prototype.querySelector = function (sel) {
+      if (String(sel).includes('data-approval-slot')) window.__slotLookups += 1
+      return find.call(this, sel)
+    }
+  })
   await capsule(page).getByRole('button', { name: /去审批/ }).click()
   await page.waitForTimeout(200)
   const went = await page.evaluate(() => ({ sel: window.__studio.getState().selectedId, focus: window.__studio.getState().focusRequest?.id }))
   check('去审批：属性面板让开、取景到等人的节点', went.sel === null && went.focus === 'review', JSON.stringify(went))
+  const goto = await page.evaluate(() => window.__goto)
+  check('去审批：广播给右栏（带运行和节点）', goto.length === 1 && goto[0].nodeId === 'review' && goto[0].runId === 'fxrun000001',
+    JSON.stringify(goto))
+  // 描边、滚动都不能拿来判断——右栏接手时自己也描同一圈、滚到同一张卡
+  await page.waitForTimeout(600)
+  const lookups = await page.evaluate(() => { window.__restoreQuery(); return window.__slotLookups })
+  check('右栏接手之后胶囊不再自己找卡片、不报「还没出现」', lookups === 0
+    && !(await page.locator('[aria-live]').allInnerTexts()).join('').includes('审批卡还没出现'), `整页找了 ${lookups} 次`)
 
   // F：在需要处理的队列里逐个定位
   await page.evaluate(() => window.__studio.setState({ focusRequest: null }))
@@ -365,6 +411,32 @@ console.log('=== 等人：入边闸门，不流光点；去审批代替停止 ==
   await page.waitForTimeout(200)
   const focus = await page.evaluate(() => window.__studio.getState().focusRequest?.id)
   check('F 定位到等人的节点', focus === 'review', String(focus))
+
+  // 放弃这次运行：等审批时的次级动作。关掉的审批找不回来，先问一句；确认后才调 /cancel
+  let cancels = 0
+  await page.route(/\/api\/runs\/fxrun000001\/cancel$/, (route) => {
+    cancels += 1
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, status: 'cancelled' }) })
+  })
+  const abandon = capsule(page).getByRole('button', { name: '放弃这次运行' })
+  check('等审批时有「放弃这次运行」', await abandon.count() === 1)
+  await abandon.click()
+  const ask = page.getByRole('dialog').filter({ hasText: '放弃这次运行？' })
+  await ask.waitFor({ timeout: 3000 }).catch(() => {})
+  const askText = (await ask.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('放弃之前先问一句，写清后果', askText.includes('审批卡一并关闭') && cancels === 0, askText.slice(0, 80))
+  await ask.getByRole('button', { name: '放弃这次运行' }).click().catch(() => {})
+  await until(async () => cancels === 1, { timeout: 2000 })
+  check('确认后才调 /cancel', cancels === 1, String(cancels))
+  await feed(page, [ev(19, 'run.cancelled', null, {
+    timing: { wall_ms: 20000, active_ms: 14000, wait_ms: 6000 }, actor: '检查员', message: '放弃了这次运行，1 条待审批一并关闭',
+  }, 20)])
+  await page.waitForTimeout(300)
+  // 胶囊不见了多半是别的代理改代码触发了整页热更新（灌进 store 的运行没了）：报出来，别卡 30 秒崩掉
+  const opened = await capsule(page).locator('.sf-cap-main').click({ timeout: 5000 }).then(() => true).catch(() => false)
+  const line = opened ? await page.locator('.sf-hud-line').innerText().catch(() => '') : ''
+  check('取消之后说清谁放弃的、关了什么', line.includes('检查员 放弃了这次运行，1 条待审批一并关闭'),
+    opened ? line : `胶囊不见了${await reloaded(page) ? '：页面被热更新重载过，重跑确认' : ''}`)
   await browser.close()
 }
 
@@ -691,6 +763,17 @@ console.log('=== 正式运行：入口看 published_version；运行期间画布
   const formal = page.getByRole('button', { name: /正式运行 v2/ })
   check('草稿状态下正式运行入口还在（看 published_version）', await formal.count() === 1)
   check('画布有未保存改动时也能点', await formal.isEnabled())
+  // 运行类别的记号：正式运行实心圆点、探索运行空心；盾牌只留给发布等级，不在发起入口上混用
+  const marks = (sel) => page.evaluate((sel) => {
+    const root = document.querySelector(sel)
+    return {
+      formal: root?.querySelectorAll('svg.sf-dot[data-class="formal"]').length ?? 0,
+      exploratory: root?.querySelectorAll('svg.sf-dot[data-class="exploratory"]').length ?? 0,
+      shield: root?.querySelectorAll('.lucide-shield-check, svg[class*="shield"]').length ?? 0,
+    }
+  }, sel)
+  const bar = await marks('[data-run-control]')
+  check('正式运行入口是实心圆点，没有盾牌', bar.formal === 1 && bar.shield === 0, JSON.stringify(bar))
   await formal.click()
   await page.waitForSelector('.sf-pop', { timeout: 5000 })
   await page.waitForTimeout(400)
@@ -699,6 +782,16 @@ console.log('=== 正式运行：入口看 published_version；运行期间画布
   check('表单字段取已发布版本的（topic），不取画布的（q）',
     await page.locator('.sf-pop textarea#run-field-topic').count() === 1
     && await page.locator('.sf-pop textarea#run-field-q').count() === 0)
+  const formalPop = await marks('.sf-pop')
+  check('正式运行浮层的标题和确认按钮都是实心圆点', formalPop.formal === 2 && formalPop.exploratory === 0 && formalPop.shield === 0,
+    JSON.stringify(formalPop))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  await launcher(page).click()
+  await page.waitForSelector('.sf-pop', { timeout: 5000 })
+  const explorePop = await marks('.sf-pop')
+  check('探索运行浮层是空心圆点', explorePop.exploratory === 1 && explorePop.formal === 0 && explorePop.shield === 0,
+    JSON.stringify(explorePop))
   await page.keyboard.press('Escape')
 
   await page.evaluate(() => window.__studio.setState({ dirty: false }))
@@ -782,13 +875,30 @@ console.log('=== 打开宽图：以入口为左锚，缩放不低于可读下限
   const vp = () => page.evaluate(() => document.querySelector('.react-flow__viewport').style.transform)
   const t0 = Date.now() / 1000
   const wev = (seq, type, node_id, dt) => ({ seq, type, node_id, data: {}, ts: t0 + dt })
+  await markBoot(page)
   await seedRun(page, { workflow_id: WIDE_ID })
   await feed(page, [wev(1, 'run.started', null, 0), wev(2, 'node.started', 'n0', 0.1), wev(3, 'node.finished', 'n0', 0.2)])
+  // 航迹坞升起来、画布变矮之后再量：坞出现时保持中心的那一下也会挪视口
+  await page.waitForSelector('.tl', { timeout: 3000 }).catch(() => {})
   await page.waitForTimeout(300)
   check('n9 起初在视口外', !(await inView('n9')))
+  const vpFrom = await vp()
   await feed(page, [wev(4, 'node.started', 'n9', 0.3)])
-  await page.waitForTimeout(700)
-  check('跟随执行：视口外的节点开跑，镜头跟过去', await inView('n9'))
+  // 等视口真的动了、并且停在 n9 上：取景有 320ms 的动画，固定等一段时间会偶发落空
+  const followed = await until(async () => (await vp()) !== vpFrom && await inView('n9'))
+  const why = followed ? '' : JSON.stringify({
+    reloaded: await reloaded(page),
+    phase: await page.evaluate(() => window.__studio?.getState().runPhase).catch(() => null),
+    follow: await page.evaluate(() => window.__studio?.getState().follow).catch(() => null),
+    moved: (await vp()) !== vpFrom,
+  })
+  check('跟随执行：视口外的节点开跑，镜头跟过去', !!followed, why)
+  // 等这一趟飞完，再让下一个远处的节点开跑，趁镜头飞到一半时人抓住画布拖一下。
+  // React Flow 把被打断的那段动画的收尾推迟一拍才报，报到时人的拖动已经开始——
+  // 以前它把人的起点吃掉，拖完跟随照样不暂停
+  await until(async () => { const a = await vp(); await new Promise((r) => setTimeout(r, 120)); return a === await vp() })
+  await feed(page, [wev(5, 'node.finished', 'n9', 0.4), wev(6, 'node.started', 'n1', 0.5)])
+  await page.waitForTimeout(110)
   const pane = await page.locator('.react-flow__pane').boundingBox()
   await page.mouse.move(pane.x + 300, pane.y + 60)
   await page.mouse.down()
@@ -796,14 +906,21 @@ console.log('=== 打开宽图：以入口为左锚，缩放不低于可读下限
   await page.mouse.up()
   await page.waitForTimeout(200)
   const paused = await vp()
-  check('手动拖过画布：显示「已暂停跟随」', (await page.locator('.sf-follow').innerText()).includes('已暂停跟随'))
-  await feed(page, [wev(5, 'node.finished', 'n9', 0.4), wev(6, 'node.started', 'n2', 0.5)])
+  check('镜头飞到一半被人拖住：显示「已暂停跟随」',
+    (await page.locator('.sf-follow').innerText({ timeout: 3000 }).catch(() => '')).includes('已暂停跟随'))
+  await feed(page, [wev(7, 'node.finished', 'n1', 0.6), wev(8, 'node.started', 'n2', 0.7)])
   await page.waitForTimeout(700)
   check('暂停期间不再抢镜头', await vp() === paused)
   // 点名取景：已暂停也照做（是人要看它）
   await page.evaluate(() => window.__studio.getState().focusNode('n11'))
-  await page.waitForTimeout(700)
-  check('focusNode：画布取景到点名的节点', await inView('n11'))
+  check('focusNode：画布取景到点名的节点', !!(await until(() => inView('n11'))))
+  // 画布尺寸恰好在取景半路变了（航迹坞收起、升起）：保持中心那一下会打断动画，
+  // 打断之后要重新飞到目标，不能停在半路
+  await page.evaluate(() => window.__studio.getState().focusNode('n0'))
+  await page.waitForTimeout(90)
+  await page.locator('.tl').getByRole('button', { name: '收起航迹' }).click().catch(() => {})
+  check('取景半路画布变高：照样落到目标上', !!(await until(() => inView('n0'))))
+  await page.locator('.tl').getByRole('button', { name: '展开' }).click().catch(() => {})
   await page.evaluate(() => window.__studio.getState().clearRun())
   await page.waitForTimeout(200)
 
@@ -817,6 +934,294 @@ console.log('=== 打开宽图：以入口为左锚，缩放不低于可读下限
   check('点缩放读数回到 100%', (await page.locator('.sf-zoom-btn').innerText()).trim() === '100%'
     && await page.evaluate(() => document.querySelector('.react-flow')?.dataset.lod) === 'full')
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- 运行中点节点
+
+console.log('=== 运行中点节点：先看它的步骤，属性面板是次级入口 ===')
+{
+  const { browser, page, errors } = await openStudio()
+  await seedRun(page)
+  await feed(page, PARALLEL_NOW)
+  await page.waitForTimeout(400)
+  await page.evaluate(() => {
+    window.__reveal = []
+    window.addEventListener('agentlab:reveal-step', (e) => window.__reveal.push(e.detail))
+  })
+  const sheet = () => count(page, '[data-inspector-sheet]')
+  const head = (id) => page.locator(`.react-flow__node[data-id="${id}"] .nc-head`)
+  await head('start').click()
+  await page.waitForTimeout(250)
+  const picked = await page.evaluate(() => ({ sel: window.__studio.getState().selectedId, reveal: window.__reveal }))
+  check('点跑过的节点：选中它', picked.sel === 'start', String(picked.sel))
+  check('属性面板不自动盖上右栏', await sheet() === 0)
+  check('请右栏滚到它的步骤（agentlab:reveal-step）', picked.reveal.length === 1 && picked.reveal[0].nodeId === 'start'
+    && picked.reveal[0].runId === 'fxrun000001', JSON.stringify(picked.reveal))
+  const peek = page.locator('.sf-peek')
+  check('画布上给出「…的配置」入口', await peek.count() === 1 && (await peek.innerText()).includes('问题'), await peek.innerText().catch(() => ''))
+  await peek.click()
+  await page.waitForTimeout(250)
+  check('点入口才打开属性面板', await sheet() === 1 && await count(page, '.sf-peek') === 0)
+  check('打开之后底部留着回到运行的那一条', await count(page, '[data-inspector-sheet] [data-run-phase]') === 1)
+  // 没跑过的节点在右栏里没有步骤可看：照常打开属性面板
+  await page.locator('.react-flow__pane').click({ position: { x: 20, y: 300 } })
+  await page.waitForTimeout(150)
+  await page.evaluate(() => { window.__reveal = [] })
+  await head('gate').click()
+  await page.waitForTimeout(250)
+  check('点没跑过的节点：照常打开属性面板，不请右栏滚动', await sheet() === 1
+    && await page.evaluate(() => window.__reveal.length) === 0)
+  // 双击跑过的节点：直接看配置
+  await page.locator('.react-flow__pane').click({ position: { x: 20, y: 300 } })
+  await page.waitForTimeout(150)
+  await head('team').dblclick()
+  await page.waitForTimeout(250)
+  check('双击节点直接打开属性面板', await sheet() === 1 && await page.evaluate(() => window.__studio.getState().selectedId) === 'team')
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('Esc 收起属性面板、取消选中，运行还在', await sheet() === 0
+    && await page.evaluate(() => window.__studio.getState().runPhase) === 'running')
+  // 先看了步骤、运行随后结束：节点还选中着、面板没开。再点它（选中没变）也得打开面板
+  await head('start').click()
+  await page.waitForTimeout(200)
+  await page.evaluate(() => window.__studio.getState().clearRun())
+  await page.waitForTimeout(200)
+  const kept = await page.evaluate(() => window.__studio.getState().selectedId)
+  check('运行清掉之后仍选中的节点留着「…的配置」入口', kept !== 'start' || await count(page, '.sf-peek') === 1, String(kept))
+  await head('start').click()
+  await page.waitForTimeout(250)
+  check('没有运行时再点这个节点：打开属性面板', await sheet() === 1)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- 回放：回边圈数、用量跟着游标
+
+console.log('=== 回放：回边的 ×N 和面板的用量都是那一刻的 ===')
+{
+  const { browser, page, errors } = await openStudio()
+  await seedRun(page)
+  // 两次模型调用，一次在第 5 秒、一次在第 12 秒；终态的后端累计和它们对得上
+  const usage = [
+    ev(30, 'llm.end', 'team', { agent: '检索员', model: 'm', input_tokens: 600, output_tokens: 200, cost_usd: 0.002 }, 5),
+    ev(31, 'llm.end', 'team', { agent: '分析员', model: 'm', input_tokens: 400, output_tokens: 200, cost_usd: 0.001 }, 12),
+  ]
+  const finished = TO_LOOP.map((e) => (e.type === 'run.finished'
+    ? { ...e, data: { ...e.data, usage: { input_tokens: 1000, output_tokens: 400, cost_usd: 0.003 } } } : e))
+  const all = [...PARALLEL, ...usage, ...TEAM_DONE, ...finished].sort((a, b) => a.ts - b.ts)
+    .map((e, i) => ({ ...e, seq: i + 1, replay: true }))
+  await feed(page, all)
+  await page.waitForTimeout(400)
+  const badge = () => page.locator('.sf-loop-badge').innerText().catch(() => '')
+  check('跑完：回边写兜回去几次（↺ ×1）', (await badge()).replace(/\s+/g, ' ') === '↺ ×1', await badge())
+  const at = (t) => page.evaluate((ms) => window.__studio.getState().setReplayAt(ms), (BASE + t) * 1000)
+  // 返工的第一轮还在跑：还没兜回去过
+  await at(18)
+  await page.waitForTimeout(250)
+  check('回放到第一轮：回边还没兜回去，不写次数', (await badge()).trim() === '↺', await badge())
+  // 协作团队跑到一半：只有第一次模型调用
+  await at(8)
+  await page.waitForTimeout(250)
+  await capsule(page).locator('.sf-cap-main').click()
+  const usageOf = async () => (await page.locator('.sf-metric', { hasText: '用量' }).innerText().catch(() => '')).replace(/\s+/g, ' ')
+  const mid = await usageOf()
+  check('回放：面板的用量是那一刻的（800 tok），不是终值', /800 tok/.test(mid) && !/1\.4k/.test(mid), mid)
+  const side = await page.locator('.react-flow__node[data-id="team"] .nc-tele-side').innerText().catch(() => '')
+  check('回放：卡片上的 token 也是那一刻的', /800 tok/.test(side), side)
+  await page.keyboard.press('Escape')
+  await page.evaluate(() => window.__studio.getState().setReplayAt(null))
+  await page.waitForTimeout(250)
+  await capsule(page).locator('.sf-cap-main').click()
+  const live = await usageOf()
+  check('回到实时：用量是整次运行的（1.4k tok）', /1\.4k tok/.test(live), live)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- Copilot 搭图时的镜头
+
+console.log('=== Copilot 搭图：新节点在视口外时镜头跟过去，人一动手这一轮就不跟 ===')
+for (const reducedMotion of ['no-preference', 'reduce']) {
+  const { browser, page, errors } = await openStudio({ id: WIDE_ID, reducedMotion })
+  const inView = (id) => page.evaluate((nid) => {
+    const pane = document.querySelector('.react-flow').getBoundingClientRect()
+    const r = document.querySelector(`.react-flow__node[data-id="${nid}"]`).getBoundingClientRect()
+    return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
+  }, id)
+  const vp = () => page.evaluate(() => document.querySelector('.react-flow__viewport').style.transform)
+  const building = (on, cursor) => page.evaluate(({ on, cursor }) => {
+    const st = window.__studio
+    st.setState({ copilot: { ...st.getState().copilot, active: on }, copilotCursor: cursor })
+  }, { on, cursor })
+  const label = reducedMotion === 'reduce' ? '（减少动效）' : ''
+  check(`n11 起初在视口外${label}`, !(await inView('n11')))
+  await building(true, 'n11')
+  if (reducedMotion === 'reduce') {
+    // 减少动效时不做动画：下一帧就到位
+    await page.waitForTimeout(120)
+    check('减少动效：镜头直接到位，不飞', await inView('n11'))
+  } else {
+    check('助手刚放下的节点在视口外：镜头跟过去', !!(await until(() => inView('n11'))))
+    const z0 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
+    // 人拖了一下画布：这一轮不再跟
+    const pane = await page.locator('.react-flow__pane').boundingBox()
+    await page.mouse.move(pane.x + 200, pane.y + 200)
+    await page.mouse.down()
+    await page.mouse.move(pane.x + 380, pane.y + 240, { steps: 5 })
+    await page.mouse.up()
+    await page.waitForTimeout(250)
+    const held = await vp()
+    await building(true, 'n0')
+    await page.waitForTimeout(700)
+    check('人动过镜头之后，这一轮不再抢', await vp() === held)
+    // 下一轮重新跟
+    await building(false, null)
+    await building(true, 'n0')
+    check('下一轮又跟上', !!(await until(() => inView('n0'))))
+    const z1 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
+    check('跟镜头只平移，不改缩放', z0 === z1, `${z0} → ${z1}`)
+  }
+  await building(false, null)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- Copilot 删掉的节点：原地虚线框
+
+console.log('=== Copilot 这一轮删掉的节点：原地留一道虚线框，停一下再淡出 ===')
+/** 照 store 的真实顺序走一轮：开始 → 节点没了 → 这一轮落定（diff 写着删了谁）→ 结束 */
+const removeInTurn = (page, id) => page.evaluate((id) => {
+  const st = window.__studio
+  const turn = { id: 'fx-turn', instruction: '去掉返工那一步', ops: [], phase: 'running', explanation: '', error: '' }
+  st.setState({ copilot: { ...st.getState().copilot, active: true } })
+  st.setState({ copilotTurns: [...st.getState().copilotTurns, turn] })
+  st.setState({
+    nodes: st.getState().nodes.filter((n) => n.id !== id),
+    edges: st.getState().edges.filter((e) => e.source !== id && e.target !== id),
+  })
+  st.setState({ copilotTurns: st.getState().copilotTurns.map((t) => (t.id === turn.id ? {
+    ...t, phase: 'done', outcome: 'applied',
+    diff: { added: [], removed: [id], changed: [], edgesAdded: 0, edgesRemoved: 2, total: 3 },
+  } : t)) })
+  st.setState({ copilot: { ...st.getState().copilot, active: false } })
+}, id)
+for (const reducedMotion of ['no-preference', 'reduce']) {
+  const { browser, page, errors } = await openStudio({ reducedMotion })
+  const was = await page.locator('.react-flow__node[data-id="fix"]').boundingBox()
+  await removeInTurn(page, 'fix')
+  await page.waitForTimeout(400)
+  const ghost = page.locator('.sf-ghost[data-ghost="fix"]')
+  if (reducedMotion === 'reduce') {
+    check('减少动效：不画虚线框', await ghost.count() === 0)
+  } else {
+    const box = await ghost.boundingBox()
+    const tag = await ghost.innerText().catch(() => '')
+    check('删掉的节点原地留一道虚线框，写着删的是谁', !!box && tag.includes('已删除 · 返工'), tag)
+    check('框就在它原来的位置、一样大', !!box && !!was && Math.abs(box.x - was.x) < 4 && Math.abs(box.y - was.y) < 4
+      && Math.abs(box.width - was.width) < 4, JSON.stringify({ was, box }))
+    const tagPx = await ghost.locator('.sf-ghost-tag').evaluate((el) => el.getBoundingClientRect().height)
+    check('标签在屏幕上读得清', tagPx >= 14, `${tagPx.toFixed(1)}px`)
+    check('虚线框不挡操作', await ghost.evaluate((el) => getComputedStyle(el).pointerEvents) === 'none')
+    await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost.png' })
+    check('停一下就淡出、收掉', !!(await until(async () => await ghost.count() === 0, { timeout: 4000 })))
+  }
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+// 窄画布打开就是精简档（缩放 0.4 上下）：标签的字照样补回 11px，不跟着缩成 7px
+{
+  const { browser, page, errors } = await openStudio({ viewport: { width: 1024, height: 768 } })
+  await page.waitForTimeout(400)
+  const zoom = Number(await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom')))
+  // 质量门在前三列里，这个缩放下在视口内：截图看得到
+  await removeInTurn(page, 'gate')
+  await page.waitForTimeout(400)
+  const tag = await page.locator('.sf-ghost[data-ghost="gate"] .sf-ghost-tag').evaluate((el) => ({
+    h: el.getBoundingClientRect().height, font: parseFloat(getComputedStyle(el).fontSize),
+    clipped: el.scrollWidth > el.clientWidth + 1,
+  })).catch(() => null)
+  const px = tag ? tag.font * zoom : 0
+  check(`精简档（缩放 ${zoom.toFixed(2)}）：虚线框的标签照样读得清（屏幕上 ≥ 11px、高 ≥ 14px）`,
+    zoom < 0.5 && !!tag && px >= 10.9 && tag.h >= 14 && !tag.clipped,
+    tag ? `字 ${px.toFixed(1)}px · 高 ${tag.h.toFixed(1)}px${tag.clipped ? ' · 被截断' : ''}` : '没画虚线框')
+  await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost-compact.png' })
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- 双击快速添加
+
+console.log('=== 双击空白处：在光标处快速添加节点 ===')
+{
+  const { browser, page, errors } = await openStudio()
+  const spot = await emptySpot(page)
+  const zoomOf = () => page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
+  const z0 = await zoomOf()
+  const n0 = await page.evaluate(() => window.__studio.getState().nodes.length)
+  await page.mouse.dblclick(spot.x, spot.y)
+  await page.waitForTimeout(250)
+  const quick = page.locator('.sf-quick')
+  check('双击空白处打开快速添加', await quick.count() === 1)
+  check('双击不再缩放画布', await zoomOf() === z0, `${z0} → ${await zoomOf()}`)
+  check('焦点直接在搜索框里', await page.evaluate(() => !!document.activeElement?.closest('.sf-quick input')))
+  const panel = await quick.boundingBox()
+  check('面板贴着双击处', !!panel && Math.abs(panel.x - spot.x) < 260 && Math.abs(panel.y - spot.y) < 320,
+    panel ? `${Math.round(panel.x)},${Math.round(panel.y)} / ${Math.round(spot.x)},${Math.round(spot.y)}` : '没有面板')
+  // 只打一个字：名字里有它的排在只是说明里提到它的前面（协作节点的说明里有「分派」）
+  await page.keyboard.type('分')
+  await page.waitForTimeout(100)
+  const first = await quick.locator('[role="option"][aria-selected="true"]').innerText().catch(() => '')
+  check('按名字搜，第一个就是要的', first.includes('条件分支'), first)
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  const added = await page.evaluate(() => {
+    const st = window.__studio.getState()
+    const n = st.nodes[st.nodes.length - 1]
+    const el = document.querySelector(`.react-flow__node[data-id="${n.id}"]`)?.getBoundingClientRect()
+    return { total: st.nodes.length, type: n.data.nodeType, cx: el ? el.left + el.width / 2 : null, cy: el ? el.top + el.height / 2 : null }
+  })
+  check('回车放下一个条件分支', added.total === n0 + 1 && added.type === 'branch', JSON.stringify(added))
+  check('落在双击处（卡片中心对着光标）', added.cx != null && Math.abs(added.cx - spot.x) < 40 && Math.abs(added.cy - spot.y) < 40,
+    JSON.stringify({ spot, at: [added.cx, added.cy] }))
+  check('放下之后面板收起', await quick.count() === 0)
+  await page.evaluate(() => window.__studio.getState().select(null))
+  const spot2 = await emptySpot(page)
+  await page.mouse.dblclick(spot2.x, spot2.y)
+  await page.waitForTimeout(200)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('Esc 收起、不加节点', await quick.count() === 0
+    && await page.evaluate(() => window.__studio.getState().nodes.length) === n0 + 1)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await browser.close()
+}
+
+// ---------------------------------------------------------------- 窄画布的打开取景
+
+console.log('=== 1024 宽打开：可读缩放下放不下三列时退到精简档，多看几列 ===')
+for (const theme of ['dark', 'light']) {
+  const { browser, page } = await openStudio({ theme, viewport: { width: 1024, height: 768 } })
+  await page.waitForTimeout(500)
+  // 两遍真的是两套主题：不然「亮暗都看过」只是同一张图看了两次
+  const shown = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme ?? null,
+    scheme: getComputedStyle(document.documentElement).colorScheme,
+  }))
+  check(`${theme}: 画出来的确实是这一套主题`, shown.attr === theme && shown.scheme.includes(theme), JSON.stringify(shown))
+  const view = await page.evaluate(() => {
+    const rf = document.querySelector('.react-flow')
+    const pane = rf.getBoundingClientRect()
+    const nodes = [...document.querySelectorAll('.react-flow__node')]
+    const whole = nodes.filter((n) => {
+      const r = n.getBoundingClientRect()
+      return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
+    }).length
+    return { zoom: Number(rf.style.getPropertyValue('--zoom')), lod: rf.dataset.lod, whole, total: nodes.length, w: Math.round(pane.width) }
+  })
+  check(`${theme}: 1024 宽打开至少看得全四张卡`, view.whole >= 4, JSON.stringify(view))
+  check(`${theme}: 缩放不低于精简档下限 0.4，档位是精简卡`, view.zoom >= 0.4 - 1e-3 && view.lod === 'compact', JSON.stringify(view))
+  await page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-1024-${theme}.png` })
   await browser.close()
 }
 

@@ -10,12 +10,21 @@ from langgraph.errors import GraphRecursionError
 from langgraph.func import task
 
 from app.core.config import settings
+from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Workflow
 from app.engine.context import NodeContext, NodeError
-from app.engine.errors import describe_exception
 from app.engine.state import GraphState, message_text, template_context
+from app.engine.toolcalls import (
+    TOOL_MARKUP_NUDGE,
+    ToolTimeout,
+    leaked_markup,
+    limit_fields,
+    limit_of,
+    markup_warning,
+    run_bounded,
+)
 from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
 from app.tools.registry import (
@@ -31,6 +40,10 @@ _MAX_DEPTH = 3
 
 #: 调度者在 llm.end 里的 agent 名。成员用各自的名字
 COORDINATOR = "调度者"
+
+#: 成员把工具调用写成文字、纠正之后还是这样时，交给调度者的那句话
+MEMBER_MARKUP_FAILED = ("模型输出了工具调用的原始标记，但没有真正调用工具，这一步什么都没查到"
+                        "（常见原因：这个成员没有绑定工具，或者模型、服务不支持工具调用）")
 
 
 # --------------------------------------------------------------------------
@@ -52,6 +65,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     names = [a.get("name") or f"agent{i}" for i, a in enumerate(agents)]
     agent_map = {n: a for n, a in zip(names, agents)}
     max_rounds = min(int(ctx.cfg("max_rounds", 6) or 6), settings.max_agent_steps)
+    #: 轮数用完、调度者始终没判定完成时怎么办。fail：判失败；degrade：照样交付但标明降档。
+    #: 缺省 fail——成员的原话不是结论，把它当成功交出去比失败更糟
+    on_exhausted = "degrade" if ctx.cfg("on_exhausted") == "degrade" else "fail"
 
     goal = ctx.render_str(ctx.cfg("goal", "{{ last_message }}"), state)
     if not goal.strip():
@@ -115,11 +131,12 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         return {"input_tokens": i, "output_tokens": o,
                 "cost_usd": round(catalog.estimate_cost(model_id, i, o), 6)}
 
-    def _accumulate(one: dict[str, Any]) -> None:
-        usage_total["input_tokens"] += one["input_tokens"]
-        usage_total["output_tokens"] += one["output_tokens"]
-        usage_total["calls"] += 1
-        usage_total["cost_usd"] = round(usage_total["cost_usd"] + one["cost_usd"], 6)
+    def _accumulate(one: dict[str, Any], into: dict[str, Any] | None = None) -> None:
+        into = usage_total if into is None else into
+        into["input_tokens"] += one["input_tokens"]
+        into["output_tokens"] += one["output_tokens"]
+        into["calls"] += one.get("calls", 1)
+        into["cost_usd"] = round(into["cost_usd"] + one["cost_usd"], 6)
 
     def _report(who: str, model_id: str, one: dict[str, Any], t0: float) -> None:
         # 每次模型调用各发一条 llm.end，界面上的用量才能实时涨，而且分得清是谁花的。
@@ -127,24 +144,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         ctx.emit(EventType.LLM_END, agent=who, model=model_id,
                  duration_ms=int((time.perf_counter() - t0) * 1000), **one)
 
-    @task
-    async def route(round_no: int, progress: str) -> dict[str, Any]:
-        prompt = (
-            f"你是团队调度者。目标：\n{goal}\n\n"
-            f"可用成员：\n{roster}\n\n"
-            f"当前进展：\n{progress or '(还没有任何进展)'}\n\n"
-            "决定这一轮把什么任务交给谁，每个任务给一句明确的指令。\n\n"
-            f"**互不依赖的任务可以放在同一轮**（最多 {max_parallel} 个），它们会同时执行，"
-            "总耗时按最慢的那个算。判断依据只有一条：**后一个任务需不需要看到前一个的结果**。\n"
-            "  可以同时派：「查 A 产品的资料」和「查 B 产品的资料」——两边互不相干\n"
-            "  不能同时派：「查资料」和「根据资料写报告」——后者要等前者\n"
-            "  不能同时派：「写初稿」和「校对初稿」——同上\n\n"
-            "同时派出去的成员看到的是**同一份进展快照**，谁也看不见谁这一轮干了什么。"
-            "拿不准是否独立时就分两轮派，代价只是慢一点；派错了则是两个人基于同样的"
-            "旧信息重复劳动，而这在结果里很难看出来。\n\n"
-            "目标已经达成时，done 填 true、assignments 给空数组。"
-        )
-        t0 = time.perf_counter()
+    async def _decide(prompt: str, *, closing: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+        """问调度者一次。返回 (决定, 这次调用的用量)。"""
         spent = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
         try:
             # include_raw：结构化结果之外把原始消息也要回来，用量在那条消息上。
@@ -161,19 +162,139 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             if not isinstance(value, dict):
                 value = json.loads(message_text(value))
         except Exception:  # noqa: BLE001
-            # 不支持结构化输出的模型退回文本：从回复里认出一个成员名，按单人派
+            # 不支持结构化输出的模型退回文本：从回复里认出一个成员名，按单人派。
+            # 收尾判定时同理：回复里还点着哪个成员，就是还没完
             reply = await supervisor_model.ainvoke(prompt)
             spent = _usage(reply, sup_model_id)
             raw = message_text(reply)
             picked = next((n for n in names if n in raw), None)
-            value = ({"assignments": [{"agent": picked, "instruction": raw[:500]}]}
-                     if picked else {"assignments": [], "done": True, "reason": raw[:200]})
-        # 在 task 里发：节点重放时 task 结果取自 checkpoint，这条不会重复
+            if closing:
+                value = {"assignments": [], "done": picked is None, "reason": raw[:200]}
+            else:
+                value = ({"assignments": [{"agent": picked, "instruction": raw[:500]}]}
+                         if picked else {"assignments": [], "done": True, "reason": raw[:200]})
+        return (value if isinstance(value, dict) else {}), spent
+
+    def _batch_of(decision: dict[str, Any]) -> list[tuple[str, str]]:
+        # 只留认得出的成员，并按上限截断。模型偶尔会重复派同一个人或者编一个
+        # 不存在的名字——这两种在并发里都是纯浪费
+        batch: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in decision.get("assignments") or []:
+            name = str((item or {}).get("agent") or "")
+            if name in agent_map and name not in seen:
+                seen.add(name)
+                batch.append((name, str(item.get("instruction") or goal)))
+            if len(batch) >= max_parallel:
+                break
+        return batch
+
+    def _finished(round_no: int, reason: str, **extra: Any) -> None:
+        # agents / done 是结构化字段，界面照着它渲染。以前只有一句中文
+        # 消息串，解码层得拿正则去拆「调度 → X（理由）」——文案一改就散架
+        ctx.emit(EventType.LOG, level="info", round=round_no, agents=[], done=True,
+                 message="调度 → 结束协作" + (f"（{reason}）" if reason else ""), **extra)
+
+    # 调度者决策前后各一条事件（它常常占掉团队节点大半的时间，以前是黑盒），和派活的
+    # 那条日志一起都在 task 里发：「接着跑」一个失败的团队节点时整个节点重放，前几轮
+    # 的决定取自 checkpoint，这些事件不该在时间线上再出现一遍
+    @task
+    async def route(round_no: int, progress: str) -> dict[str, Any]:
+        ctx.emit(EventType.AGENT_ROUTE_START, round=round_no)
+        prompt = (
+            f"你是团队调度者。目标：\n{goal}\n\n"
+            f"可用成员：\n{roster}\n\n"
+            f"当前进展：\n{progress or '(还没有任何进展)'}\n\n"
+            "决定这一轮把什么任务交给谁，每个任务给一句明确的指令。\n\n"
+            f"**互不依赖的任务可以放在同一轮**（最多 {max_parallel} 个），它们会同时执行，"
+            "总耗时按最慢的那个算。判断依据只有一条：**后一个任务需不需要看到前一个的结果**。\n"
+            "  可以同时派：「查 A 产品的资料」和「查 B 产品的资料」——两边互不相干\n"
+            "  不能同时派：「查资料」和「根据资料写报告」——后者要等前者\n"
+            "  不能同时派：「写初稿」和「校对初稿」——同上\n\n"
+            "同时派出去的成员看到的是**同一份进展快照**，谁也看不见谁这一轮干了什么。"
+            "拿不准是否独立时就分两轮派，代价只是慢一点；派错了则是两个人基于同样的"
+            "旧信息重复劳动，而这在结果里很难看出来。\n\n"
+            "目标已经达成时，done 填 true、assignments 给空数组。"
+        )
+        t0 = time.perf_counter()
+        value, spent = await _decide(prompt)
         _report(COORDINATOR, sup_model_id, spent, t0)
+
+        batch = _batch_of(value)
+        finishing = bool(value.get("done")) or not batch
+        reason = str(value.get("reason", ""))
+        ctx.emit(EventType.AGENT_ROUTE_END, round=round_no,
+                 duration_ms=int((time.perf_counter() - t0) * 1000),
+                 agents=[] if finishing else [n for n, _ in batch],
+                 parallel=0 if finishing else len(batch), done=finishing, reason=reason)
+        if finishing:
+            _finished(round_no, reason)
+        else:
+            who = "、".join(n for n, _ in batch)
+            ctx.emit(
+                EventType.LOG, level="info", round=round_no, parallel=len(batch),
+                agents=[n for n, _ in batch], done=False, reason=reason,
+                message=(f"调度 → {who}" + (f"（{reason}）" if reason else "")
+                         + (f" · {len(batch)} 人同时进行" if len(batch) > 1 else "")),
+            )
         return {"decision": value, "usage": spent}
 
+    # 最后一轮派出去的成员（常常就是定稿的那个）交回来之后，调度者还没看过它的产出。
+    # 以前轮数一到就算用完：步数恰好等于最多轮数的正常流水线（查数 → 撰稿，2 轮）也会
+    # 被判成没完成。补这一次只判定、不派活的决定，它说完成了才算完成
     @task
-    async def work(round_no: int, name: str, instruction: str, progress: str) -> dict[str, Any]:
+    async def verdict(round_no: int, progress: str) -> dict[str, Any]:
+        ctx.emit(EventType.AGENT_ROUTE_START, round=round_no, closing=True)
+        prompt = (
+            f"你是团队调度者。目标：\n{goal}\n\n"
+            f"当前进展：\n{progress or '(还没有任何进展)'}\n\n"
+            f"轮数已经用完（{max_rounds} 轮），不能再派任何任务。只判断一件事：按上面的进展，"
+            "目标是不是已经达成、能不能把最后一个成员的产出作为结论交出去。\n"
+            "达成了 done 填 true；没达成 done 填 false，并在 reason 里说清还缺什么。"
+            "assignments 给空数组。"
+        )
+        t0 = time.perf_counter()
+        value, spent = await _decide(prompt, closing=True)
+        _report(COORDINATOR, sup_model_id, spent, t0)
+        done = value.get("done") is True
+        reason = str(value.get("reason", ""))
+        ctx.emit(EventType.AGENT_ROUTE_END, round=round_no,
+                 duration_ms=int((time.perf_counter() - t0) * 1000),
+                 agents=[], parallel=0, done=done, reason=reason, closing=True)
+        if done:
+            _finished(round_no, reason, closing=True)
+        return {"done": done, "reason": reason, "usage": spent}
+
+    # 成员的开始、结束两条事件也在 task 里发，理由同 route。失败也在 task 里收住、作为
+    # 结果缓存：重放时这一步照旧是失败，不会换一个结果。用量随结果带出来再记账——在
+    # task 里直接记进 usage_total 的话，重放取了缓存，这一笔就没了
+    @task
+    async def work(round_no: int, name: str, instruction: str, progress: str,
+                   parallel: int = 1) -> dict[str, Any]:
+        ctx.emit(EventType.AGENT_STEP_START, agent=name, instruction=instruction[:300],
+                 round=round_no, parallel=parallel)
+        tally = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+        t0 = time.perf_counter()
+        try:
+            out: dict[str, Any] = await _member(name, instruction, progress, tally)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 一个专家挂了不该拖垮整轮
+            # 把失败当成它的产出交回调度者，让它决定改派还是收工
+            why = describe_exception(exc)
+            text = f"（{name} 执行失败：{why}）"
+            out = {"text": text, "tool_calls": [], "failed": True, "error": why}
+            ctx.emit(EventType.LOG, level="warn", round=round_no,
+                     message=f"{name} 这一轮失败了：{text}")
+        each_ms = int((time.perf_counter() - t0) * 1000)
+        # failed / error 让矩阵把这一格画成失败，而不是一个"完成"的格子里写着失败原因
+        failure = {"failed": True, "error": out.get("error") or ""} if out.get("failed") else {}
+        ctx.emit(EventType.AGENT_STEP_END, agent=name, duration_ms=each_ms,
+                 round=round_no, parallel=parallel, preview=out["text"][:500], **failure)
+        return {**out, "duration_ms": each_ms, "usage": tally}
+
+    async def _member(name: str, instruction: str, progress: str,
+                      tally: dict[str, Any]) -> dict[str, Any]:
         cfg = agent_map[name]
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(
@@ -202,20 +323,37 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         calls: list[dict[str, Any]] = []
         # 和 agent 节点同一个硬顶：成员上配多少步都过不去 max_agent_steps
         max_steps = min(int(cfg.get("max_steps") or 4), settings.max_agent_steps)
+        nudged = False
         for _ in range(max_steps):
             t0 = time.perf_counter()
             reply = await bound.ainvoke(messages)
             spent = _usage(reply, model_id)
-            _accumulate(spent)
+            _accumulate(spent, tally)
             _report(name, model_id, spent, t0)
             messages.append(reply)
             tool_calls = getattr(reply, "tool_calls", None) or []
             if not tool_calls:
-                return {"text": message_text(reply), "tool_calls": calls}
+                text = message_text(reply)
+                snippet = leaked_markup(text)
+                if not snippet:
+                    return {"text": text, "tool_calls": calls}
+                # 把工具调用写成了文字：这一步什么都没查到。纠正一次，还这样就记为失败，
+                # 原因交给调度者——以前这段标记会被当成这个成员的结论交上去
+                if nudged:
+                    return {"text": f"（{name} 这一步失败：{MEMBER_MARKUP_FAILED}）",
+                            "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
+                nudged = True
+                ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
+                         message=f"{markup_warning(snippet, name)}，已提醒它重试一次")
+                messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
+                continue
             for call in tool_calls:
                 tname = call.get("name", "")
                 targs = call.get("args", {}) or {}
                 cid = call.get("id") or f"{name}-{tname}"
+                limit = None
+                failure: dict[str, Any] = {}
+                started = time.perf_counter()
                 if tname not in tool_map:
                     ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
                     content = f"错误：没有名为 {tname} 的工具"
@@ -229,7 +367,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                         except ToolArgsError as e:
                             args_error = str(e)
                     # 纠正后的参数才是真正要执行的那份，tool.start 要发它
-                    ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid)
+                    limit = limit_of(tool_map[tname], tname, targs)
+                    ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid,
+                             **limit_fields(limit))
                     if fix_note:
                         ctx.emit(EventType.LOG, level="warn",
                                  message=f"工具 {tname}：{fix_note}", code="tool_args_fixed")
@@ -250,11 +390,17 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                                  message=f"{name} 想调用 {tname}，需要人工确认，协作节点里不执行")
                     else:
                         try:
-                            raw = await tool_map[tname].ainvoke(targs)
+                            raw = await run_bounded(tool_map[tname].ainvoke(targs), limit, tname)
                             content = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
+                        except ToolTimeout as e:
+                            content = str(e)
+                            failure = {"error": content, "timed_out": True}
                         except Exception as e:  # noqa: BLE001
                             content = f"工具失败：{describe_exception(e)}"
-                ctx.emit(EventType.TOOL_END, tool=tname, agent=name, call_id=cid, preview=content[:1500])
+                            failure = {"error": content, "detail": raw_detail(e)}
+                ctx.emit(EventType.TOOL_ERROR if failure else EventType.TOOL_END, tool=tname,
+                         agent=name, call_id=cid, preview=content[:1500],
+                         duration_ms=int((time.perf_counter() - started) * 1000), **failure)
                 calls.append({"tool": tname, "args": targs, "result": content[:2000]})
                 messages.append(ToolMessage(content=content, tool_call_id=cid))
 
@@ -270,14 +416,25 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             t0 = time.perf_counter()
             settled = await model.ainvoke(messages)
             spent = _usage(settled, model_id)
-            _accumulate(spent)
+            _accumulate(spent, tally)
             _report(name, model_id, spent, t0)
             text = message_text(settled).strip()
         except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有的过程一起赔进去
             ctx.emit(EventType.LOG, level="warn", code="settle_failed",
                      message=f"{name} 的收尾轮没跑成：{describe_exception(e)}")
             text = next((t for m in reversed(messages)
-                         if isinstance(m, AIMessage) and (t := message_text(m).strip())), "")
+                         if isinstance(m, AIMessage) and (t := message_text(m).strip())
+                         and not leaked_markup(t)), "")
+        if snippet := leaked_markup(text):
+            if not calls:
+                return {"text": f"（{name} 这一步失败：{MEMBER_MARKUP_FAILED}）",
+                        "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
+            # 真调过工具，只是收尾轮还想接着查：取它之前说过的话，和 agent 节点一样
+            ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
+                     message=f"{markup_warning(snippet, name)}：步数用完后的收尾轮仍想调用工具")
+            text = next((t for m in reversed(messages)
+                         if isinstance(m, AIMessage) and (t := message_text(m).strip())
+                         and not leaked_markup(t)), "")
         ctx.emit(EventType.LOG, level="warn", code="step_limit_settled",
                  message=f"{name} 用满了 {max_steps} 步，结论基于已经查到的部分")
         return {"text": text or f"（{name} 用满了 {max_steps} 步，没有给出结论）", "tool_calls": calls}
@@ -285,54 +442,26 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     progress_lines: list[str] = []
     final_text = ""
     rounds_meta: list[dict[str, Any]] = []
+    #: 调度者最后一轮给的理由，以及派过活的成员。轮数用完时报错要说清卡在哪、谁从没上过场
+    last_reason = ""
+    dispatched: set[str] = set()
+    finished = False
     for round_no in range(max_rounds):
         progress = "\n\n".join(progress_lines)
-        # 调度者决策前后各一条事件。它常常占掉团队节点大半的时间，以前是黑盒
-        ctx.emit(EventType.AGENT_ROUTE_START, round=round_no)
-        route_t0 = time.perf_counter()
         routed = await route(round_no, progress)
-        route_ms = int((time.perf_counter() - route_t0) * 1000)
         decision = routed.get("decision", routed) if isinstance(routed, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
         _accumulate(routed.get("usage") or _usage(None, sup_model_id))
         reason = str(decision.get("reason", ""))
+        last_reason = reason or last_reason
 
-        # 只留认得出的成员，并按上限截断。模型偶尔会重复派同一个人或者编一个
-        # 不存在的名字——这两种在并发里都是纯浪费
-        batch: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        for item in decision.get("assignments") or []:
-            name = str((item or {}).get("agent") or "")
-            if name in agent_map and name not in seen:
-                seen.add(name)
-                batch.append((name, str(item.get("instruction") or goal)))
-            if len(batch) >= max_parallel:
-                break
-
-        finishing = bool(decision.get("done")) or not batch
-        ctx.emit(EventType.AGENT_ROUTE_END, round=round_no, duration_ms=route_ms,
-                 agents=[] if finishing else [n for n, _ in batch],
-                 parallel=0 if finishing else len(batch), done=finishing, reason=reason)
-
-        if finishing:
-            # agents / done 是结构化字段，界面照着它渲染。以前只有一句中文
-            # 消息串，解码层得拿正则去拆「调度 → X（理由）」——文案一改就散架
-            ctx.emit(EventType.LOG, level="info", round=round_no,
-                     agents=[], done=True,
-                     message="调度 → 结束协作" + (f"（{reason}）" if reason else ""))
+        batch = _batch_of(decision)
+        if bool(decision.get("done")) or not batch:
             final_text = progress_lines[-1].split("】", 1)[-1] if progress_lines else ""
+            finished = True
             break
 
-        who = "、".join(n for n, _ in batch)
-        ctx.emit(
-            EventType.LOG, level="info", round=round_no, parallel=len(batch),
-            agents=[n for n, _ in batch], done=False, reason=reason,
-            message=(f"调度 → {who}" + (f"（{reason}）" if reason else "")
-                     + (f" · {len(batch)} 人同时进行" if len(batch) > 1 else "")),
-        )
-
-        for name, instruction in batch:
-            ctx.emit(EventType.AGENT_STEP_START, agent=name, instruction=instruction[:300],
-                     round=round_no, parallel=len(batch))
+        dispatched.update(n for n, _ in batch)
 
         # 并发执行。它们拿到的是**同一份** progress 快照——这正是"任务必须
         # 互不依赖"的技术含义，也是上面提示词里那几条反例的由来。
@@ -341,32 +470,23 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 时间"，那个数必须是量出来的。按 N×墙钟 推算等于假设每个人都跑满了
         # 最慢那条，而实际上快的那个可能只花了三分之一。
         #
-        # 结束事件也在这里一完成就发，不等整轮 gather：以前先做完的成员要一直
-        # 显示"进行中"，直到最慢的那个做完——矩阵答不了"谁还在跑"
-        async def _timed(name: str, instruction: str, parallel: int) -> tuple[str, Any, int]:
-            t0 = time.perf_counter()
-            try:
-                out: Any = await work(round_no, name, instruction, progress)
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:  # noqa: BLE001 - 一个专家挂了不该拖垮整轮
-                # 把失败当成它的产出交回调度者，让它决定改派还是收工
-                text = f"（{name} 执行失败：{describe_exception(exc)}）"
-                out = {"text": text, "tool_calls": []}
-                ctx.emit(EventType.LOG, level="warn", round=round_no,
-                         message=f"{name} 这一轮失败了：{text}")
-            each_ms = int((time.perf_counter() - t0) * 1000)
-            ctx.emit(EventType.AGENT_STEP_END, agent=name, duration_ms=each_ms,
-                     round=round_no, parallel=parallel, preview=out["text"][:500])
-            return name, out, each_ms
+        # 结束事件也在各自的 task 里一完成就发，不等整轮 gather：以前先做完的成员要
+        # 一直显示"进行中"，直到最慢的那个做完——矩阵答不了"谁还在跑"
+        async def _one(name: str, instruction: str, parallel: int) -> dict[str, Any]:
+            return await work(round_no, name, instruction, progress, parallel)
 
         started = time.perf_counter()
-        results = await asyncio.gather(*(_timed(n, i, len(batch)) for n, i in batch))
+        results = await asyncio.gather(*(_one(n, i, len(batch)) for n, i in batch))
         wall_ms = int((time.perf_counter() - started) * 1000)
 
         # 进展仍按派活顺序拼：它是下一轮调度者读的输入，语义不随谁先回来而变
         sum_ms = 0
-        for (name, instruction), (_, outcome, each_ms) in zip(batch, results):
+        for (name, instruction), result in zip(batch, results):
+            outcome = dict(result)
+            spent = outcome.pop("usage", None)
+            if spent:
+                _accumulate(spent)
+            each_ms = int(outcome.pop("duration_ms", 0) or 0)
             sum_ms += each_ms
             progress_lines.append(f"【{name}】{outcome['text']}")
             transcript.append(
@@ -380,6 +500,32 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "parallel": len(batch), "wall_ms": wall_ms, "sum_ms": sum_ms,
         })
 
+    if not finished and progress_lines:
+        judged = await verdict(max_rounds, "\n\n".join(progress_lines))
+        _accumulate(judged.get("usage") or _usage(None, sup_model_id))
+        last_reason = str(judged.get("reason") or "") or last_reason
+        if judged.get("done"):
+            final_text = progress_lines[-1].split("】", 1)[-1]
+            finished = True
+
+    exhausted: dict[str, Any] = {}
+    if not finished:
+        # 轮数用完，调度者一次都没说「完成」。这时手上只有最后一个成员的原话——
+        # 以前它就被当作团队的结论交了出去：真实运行里是一段没执行的工具调用标记，
+        # 而负责定稿的成员一次都没被派到
+        never = [n for n in names if n not in dispatched]
+        summary = (f"协作团队用完 {max_rounds} 轮仍未完成："
+                   f"{last_reason or '调度者没有给出理由'}")
+        if never:
+            summary += f"。一次都没被派到的成员：{'、'.join(never)}"
+        if on_exhausted == "fail":
+            raise NodeError(ctx.node.id, f"{summary}。先看成员有没有绑定要用的工具，再调大「最多"
+                                         "轮数」；也可以把「用完轮数时」改成降档交付")
+        exhausted = {"exhausted": True, "exhausted_reason": last_reason,
+                     "never_dispatched": never}
+        ctx.emit(EventType.LOG, level="warn", code="team_exhausted",
+                 message=f"{summary}。按降档交付：成果是成员最后的原话，不是调度者认可的结论")
+
     usage_total["total_tokens"] = usage_total["input_tokens"] + usage_total["output_tokens"]
     # 并行省下的时间：各轮"串行本该花的"减去"实际花的"。只有并发过才有差值
     saved_ms = sum(r["sum_ms"] - r["wall_ms"] for r in rounds_meta)
@@ -391,6 +537,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "agents": names,
         "schedule": rounds_meta,
         "parallel_saved_ms": saved_ms,
+        **exhausted,
     }
     updates: dict[str, Any] = {
         "nodes": {ctx.node.id: result},

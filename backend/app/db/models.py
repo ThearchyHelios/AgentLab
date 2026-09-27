@@ -59,6 +59,8 @@ class DataSource(Base, TimestampMixin):
     schema_cache: Mapped[dict[str, Any]] = mapped_column(default=dict)
     schema_synced_at: Mapped[datetime | None] = mapped_column(default=None)
     enabled: Mapped[bool] = mapped_column(default=True)
+    # 最近一次测连接：{at, ok, latency_ms, error}。记在对象上，换台浏览器也看得到
+    last_check: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
 
 class Setting(Base, TimestampMixin):
@@ -85,6 +87,8 @@ class McpServer(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
     tools_cache: Mapped[list[Any]] = mapped_column(default=list)
+    # 最近一次连接的时刻和耗时（status / last_error 只有结论，没有「何时、多快」）
+    last_check: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
 
 class CustomTool(Base, TimestampMixin):
@@ -435,5 +439,8 @@ class ConversationTurn(Base, TimestampMixin):
     # 命中的信号清单。落库是因为它是答案的一部分——刷新页面后只剩一个
     # 看起来很完整的答案、而"它哪里不可靠"没了，比不复核更糟
     review: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 这一轮的可信度元数据（出具档位、运行类别、未查库、结局、耗时、查库次数…），
+    # 前端写、前端读。单独一列：塞在 review 里的话，没复核过的轮次 review 也不为空
+    meta: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     conversation: Mapped[Conversation] = relationship(back_populates="turns")

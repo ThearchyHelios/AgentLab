@@ -73,6 +73,184 @@
   100% { opacity: 0; }
 }
 
+/* 列表行的缩略条：墙钟里执行、等人各占多少。执行是安静的灰，等人用斜纹的
+   琥珀（和航迹里等人的段同一种纹理），失败、取消、挂起在末端点一下。颜色之外
+   还有纹理和位置两条通道，去掉颜色也分得出 */
+.runs-shape {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  width: 40px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--bg-hover);
+}
+.runs-shape[data-empty] {
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.runs-shape > i {
+  display: block;
+  flex: none;
+  height: 100%;
+}
+/* 太短的段也留 2px：墙钟里占 1% 的执行照样看得见"有过" */
+.runs-shape > i:not([style*='width: 0%']) {
+  min-width: 2px;
+}
+.runs-shape-active {
+  background: color-mix(in srgb, var(--text-faint) 75%, transparent);
+}
+.runs-shape-live {
+  background: color-mix(in srgb, var(--st-running) 60%, transparent);
+}
+.runs-shape-wait {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--st-waiting) 0 2px,
+    color-mix(in srgb, var(--st-waiting) 35%, transparent) 2px 4px
+  );
+}
+.runs-shape-other {
+  background: transparent;
+}
+.runs-shape-unknown {
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--text-faint) 55%, transparent) 0 2px,
+    transparent 2px 4px
+  );
+}
+.runs-shape-end {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--st-cancelled);
+}
+.runs-shape-end[data-shape-end='failed'] {
+  background: var(--st-failed);
+}
+.runs-shape-end[data-shape-end='suspended'] {
+  background: var(--st-suspended);
+}
+
+/* 详情头的六格读数。1024 宽下详情区只有 600px，一格不到 70px 的字宽：「5 分 06 秒」
+   「2.8k tok」差几像素就被截成省略号。按详情区自己的宽度（不是视口）让状态格让出
+   一点、收紧边距、小一号字 */
+.runs-head {
+  container: rhead / inline-size;
+}
+.runs-telemetry {
+  grid-template-columns: minmax(140px, 1.5fr) repeat(5, minmax(76px, 1fr));
+}
+@container rhead (max-width: 720px) {
+  .runs-telemetry {
+    grid-template-columns: minmax(124px, 1.2fr) repeat(5, minmax(0, 1fr));
+  }
+  .runs-telemetry > * {
+    padding-inline: 8px;
+  }
+  .runs-telemetry [data-telemetry] {
+    font-size: var(--text-sm);
+  }
+}
+
+/* 航迹页签上面的游标读数。按自己的宽度排（左栏 360–400px、详情区从 600px 起），
+   不按视口：窄时八格排两行、「此刻」和节点卡上下叠 */
+.runs-trace-read {
+  container: tread / inline-size;
+}
+.runs-trace-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.runs-trace-grid > * {
+  border-left: 1px solid var(--hairline);
+}
+.runs-trace-grid > :nth-child(4n + 1) {
+  border-left: 0;
+}
+.runs-trace-grid > :nth-child(n + 5) {
+  border-top: 1px solid var(--hairline);
+}
+/* 排成两行时每格少 4px 的上下留白：两行省下的，正好让节点卡露全 */
+.runs-trace-grid > * {
+  padding-block: 4px;
+}
+/* 很窄时（左栏里）从上往下：此刻、节点（或最耗时的）、关键时刻；详情区里就分两栏，
+   左栏上下是此刻和关键时刻，右栏是节点——点了关键时刻，右边的节点卡跟着换成那一刻。
+   1024 宽时详情区只有 600px、下面还有航迹坞，叠成一栏的话节点卡和关键时刻都在视线外 */
+.runs-trace-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: 'now' 'side' 'moments';
+}
+.runs-trace-now {
+  grid-area: now;
+}
+.runs-trace-side {
+  grid-area: side;
+  border-top: 1px solid var(--hairline);
+}
+.runs-trace-moments {
+  grid-area: moments;
+  border-top: 1px solid var(--hairline);
+}
+/* 排成一行要每格都放得下最长的读数：游标「T+10 天 05:30:07」约 123px，跨天的时长
+   「10 天 05 小时」约 94px。1440 宽时详情区 976px，左右各留 10px 刚好；再窄就排两行 */
+@container tread (min-width: 948px) {
+  .runs-trace-grid {
+    grid-template-columns: minmax(0, 1.32fr) repeat(7, minmax(0, 1fr));
+  }
+  .runs-trace-grid > :nth-child(4n + 1) {
+    border-left: 1px solid var(--hairline);
+  }
+  .runs-trace-grid > :first-child {
+    border-left: 0;
+  }
+  .runs-trace-grid > :nth-child(n + 5) {
+    border-top: 0;
+  }
+  .runs-trace-grid > * {
+    padding-block: 6px;
+    padding-inline: 10px;
+  }
+}
+@container tread (min-width: 560px) {
+  .runs-trace-cols {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    grid-template-areas: 'now side' 'moments side';
+  }
+  .runs-trace-side {
+    border-top: 0;
+    border-left: 1px solid var(--hairline);
+  }
+}
+
+/* 读数区放不下、下面还有：底边淡出一截，看得出能往下滚。遮罩按滚动框算，不随内容走 */
+.runs-trace-read[data-more] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+}
+
+/* 关键时刻：时刻那一栏按最宽的一条排齐（「T+05:03.4」到「T+9 天 00:38:26」），
+   各行共用一套列，不猜一个固定宽度——固定 76px 时跨天的时刻压到了后面的徽标上 */
+.runs-moments {
+  display: grid;
+  grid-template-columns: max-content 14px minmax(0, 1fr);
+  column-gap: 6px;
+}
+.runs-moments > li,
+.runs-moments > li > button {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* 扫描线停了就等于没有：直接不画，凭证条上的「核对中…」文字照样在 */
   .runs-verify-scan {

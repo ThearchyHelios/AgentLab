@@ -313,6 +313,161 @@
   text-underline-offset: 2px;
 }
 
+/* 看运行时选中了跑过的节点：属性面板不自动盖上右栏，这里给一个明确的入口 */
+.sf-peek {
+  display: inline-flex;
+  flex: none;
+  max-width: 260px;
+  pointer-events: auto;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  box-shadow: var(--elev-1);
+  color: var(--text-dim);
+  font-size: var(--text-2xs);
+  line-height: 18px;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+.sf-peek:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.sf-peek:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.sf-peek-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+
+/* Copilot 这一轮删掉的节点：原地一道虚线框，停一下再淡出（时长和 FlowCanvas 的
+   GHOST_MS 一致）。框在画布坐标里，跟着平移缩放；标签的字按缩放补回来，精简档里
+   （窄画布打开就是 0.4）也不小于 11px，到远景档才跟着缩小。长名字由 max-width 截成省略号 */
+.sf-ghost {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1.5px dashed color-mix(in srgb, var(--nt, var(--text-faint)) 60%, var(--text-faint));
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--nt, var(--text-faint)) 5%, transparent);
+  pointer-events: none;
+  animation: sf-ghost-out 2400ms var(--ease-out) forwards;
+}
+.sf-ghost-tag {
+  position: absolute;
+  top: 0;
+  left: 10px;
+  max-width: calc(100% - 20px);
+  padding: 0 6px;
+  overflow: hidden;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font-size: calc(11px / min(max(var(--zoom, 1), 0.35), 1));
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes sf-ghost-out {
+  0% { opacity: 0; }
+  10% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* 双击空白处的快速添加 */
+.sf-quick {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  max-height: 312px;
+  overflow: hidden;
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  box-shadow: var(--elev-3);
+}
+.sf-quick-search {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+}
+.sf-quick-search input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-xs);
+  outline: none;
+}
+.sf-quick-search input::placeholder {
+  color: var(--text-faint);
+}
+.sf-quick-search:focus-within {
+  color: var(--accent);
+}
+.sf-quick-list {
+  flex: 1;
+  min-height: 0;
+  padding: 4px;
+  overflow-y: auto;
+}
+.sf-quick-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.sf-quick-item.is-active {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.sf-quick-item .sf-dim {
+  flex: none;
+  font-size: var(--text-2xs);
+}
+.sf-quick-icon {
+  display: inline-flex;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--nt) 18%, transparent);
+  color: var(--nt);
+}
+.sf-quick-empty {
+  padding: 10px 8px;
+  color: var(--text-faint);
+  font-size: var(--text-2xs);
+}
+.sf-quick-foot {
+  flex: none;
+  padding: 5px 10px;
+  border-top: 1px solid var(--hairline);
+  color: var(--text-faint);
+  font-size: var(--text-2xs);
+}
+
 /* --------------------------------------------------------------------------
    运行胶囊（工具栏）
    -------------------------------------------------------------------------- */
@@ -423,6 +578,15 @@
   height: 5px;
   border-radius: 999px;
   background: var(--text-faint);
+}
+
+/* 运行类别的记号：正式实心、探索空心，颜色跟字走 */
+.sf-dot {
+  flex: none;
+}
+/* 放弃停在审批上的运行：次级动作，悬停才露出危险色 */
+.sf-btn-abandon:hover:not(:disabled) {
+  color: var(--st-failed);
 }
 
 /* 发起浮层 */
@@ -537,6 +701,7 @@
 .sf-class {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   padding: 0 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
@@ -1280,7 +1445,8 @@
    -------------------------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   .sf-canvas .edge-packet,
-  .sf-sweep {
+  .sf-sweep,
+  .sf-ghost {
     display: none;
   }
   .sf-canvas[data-moment='failed'] .react-flow__edge.sf-e-cut .react-flow__edge-path,

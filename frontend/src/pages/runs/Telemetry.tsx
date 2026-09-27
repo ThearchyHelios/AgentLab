@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { ChevronDown, Shield, ShieldAlert, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
-import { StatusPill, toast } from '../../components/ui'
+import { StatusPill, toast, useTicker } from '../../components/ui'
 import {
   NONE, formatClock, formatCost, formatDateTime, formatNumber, formatTime, formatTokens, shortId,
 } from '../../lib/format'
@@ -11,9 +11,9 @@ import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trac
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
 import {
-  LONG_WAIT_MS, UNSAVED_HINT, ageMs, formatSpan, isUnsaved, runName, runScope, runTiming, type RunTiming,
+  LONG_WAIT_MS, UNSAVED_HINT, ageMs, cancelReason, formatSpan, isUnsaved, runName, runScope, runTiming, type RunTiming,
 } from './model'
-import { CLOCK_MAX_MS, CopyValue, useNow } from './parts'
+import { CLOCK_MAX_MS, CopyValue } from './parts'
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
 
@@ -62,7 +62,7 @@ export function runClocks(run: Run, trace: Trace, phase: RunPhase, streaming: bo
  *
  * 数从哪来见 runClocks。都拿不到就写「—」，不猜。
  */
-export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf }: {
+export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf, cancelled }: {
   run: Run
   trace: Trace
   phase: RunPhase
@@ -70,11 +70,13 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   streaming: boolean
   pending: Approval[] | null
   labelOf: (id?: string | null) => string | undefined
+  /** run.cancelled 的 data：谁停的、为什么。老后端没有这两个字段 */
+  cancelled?: Record<string, any> | null
 }) {
   const executing = streaming && (phase === 'running' || phase === 'queued')
   const clock = useRunClock(executing)
   // 等审批的时候数字按分钟涨就够了
-  const slow = useNow(30_000, phase === 'waiting')
+  const slow = useTicker(30_000, phase === 'waiting')
   const now = executing ? clock : Math.max(slow, Date.now())
 
   const usage = run.usage ?? {}
@@ -109,7 +111,7 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   } else if (code === 'held' || code === 'suspended') {
     sub = '断点还在，可接着跑'
   } else if (code === 'cancelled') {
-    sub = run.error && run.error !== '用户取消' ? run.error : '用户取消'
+    sub = cancelNote(run.error, cancelled)
   }
 
   const nodesTotal = proj?.nodesTotal ?? 0
@@ -121,11 +123,7 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   const activeTicks = executing && isNum(active) && active < CLOCK_MAX_MS
 
   return (
-    <div
-      className="grid border-t"
-      style={{ gridTemplateColumns: 'minmax(140px, 1.5fr) repeat(5, minmax(76px, 1fr))' }}
-      data-run-telemetry=""
-    >
+    <div className="runs-telemetry grid border-t" data-run-telemetry="">
       <Cell label="状态" first>
         <StatusPill status={code} className="-ml-1.5 self-start" />
         {sub && <Sub title={sub}>{sub}</Sub>}
@@ -161,6 +159,20 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
       </Cell>
     </div>
   )
+}
+
+/**
+ * 已取消的那一句：谁、做了什么。事件里带了 actor 键（哪怕是 null）就说人，没署名写
+ * 「未署名」；老数据没有这个键，只说原因
+ */
+export function cancelNote(error: string | null | undefined, data?: Record<string, any> | null): string {
+  const reason = cancelReason(error)
+  const signed = !!data && 'actor' in data
+  const who = signed ? (typeof data!.actor === 'string' && data!.actor.trim() ? data!.actor.trim() : '未署名') : null
+  const message = typeof data?.message === 'string' && data.message.trim() ? data.message.trim() : null
+  if (who && message) return `${who} ${message}`
+  if (who) return reason ? `${who} · ${reason}` : `${who} 停止了运行`
+  return reason ?? '用户取消'
 }
 
 function Cell({ label, title, first, children }: { label: string; title?: string; first?: boolean; children: ReactNode }) {

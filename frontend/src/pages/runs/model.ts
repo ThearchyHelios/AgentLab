@@ -9,7 +9,7 @@ import type { Approval, Run, RunStatus, RunUsage } from '../../types'
 import {
   RUN_STATUS_ORDER, STATUS, resolveStatus, serverStatusOf, type StatusCode,
 } from '../../lib/status'
-import { NONE, formatDuration, parseServerTime } from '../../lib/format'
+import { NONE, formatClock, formatDuration, parseServerTime } from '../../lib/format'
 import { hasPendingApproval } from '../../store/catalog'
 
 // -------------------------------------------------------------------------
@@ -202,6 +202,136 @@ export function runTiming(run: Pick<Run, 'usage' | 'created_at' | 'started_at' |
 /** 列表里那一个数：优先墙钟 */
 export const headlineMs = (t: RunTiming): number | null => t.wallMs ?? t.activeMs
 
+// -------------------------------------------------------------------------
+// 列表行的缩略条
+// -------------------------------------------------------------------------
+
+/**
+ * active：执行；wait：等人审批；other：墙钟里既不算执行也不算等人的部分（排队、
+ * 两段之间的空当）；unknown：老数据，只知道总长、分不出执行和等人；live：还在跑
+ */
+export type ShapeKind = 'active' | 'wait' | 'other' | 'unknown' | 'live'
+
+export interface RunShape {
+  /** 各段占墙钟的比例，加起来是 1；空数组 = 连墙钟都不知道 */
+  segs: { kind: ShapeKind; frac: number; open?: boolean }[]
+  /** 收在哪种结局上：只给要注意的几种，已完成不标 */
+  end: 'failed' | 'cancelled' | 'suspended' | null
+  title: string
+}
+
+/**
+ * 一条运行的墙钟里执行、等人各占多少。只用列表里就有的 usage 和审批，不为每一
+ * 行去拉事件——所以它是构成，不是时间顺序：几段审批各在哪里，要进详情看航迹。
+ * 唯一的例外是正在等的那一段，它一定在最后。
+ *
+ * 分不出来的（老数据没有分段计时）画成虚的一整条，不按比例猜。
+ */
+export function runShape(
+  run: Pick<Run, 'usage' | 'created_at' | 'started_at' | 'finished_at' | 'status'>,
+  code: StatusCode,
+  opts: { waitingSince?: string | null; now?: number } = {},
+): RunShape {
+  const now = opts.now ?? Date.now()
+  if (code === 'running' || code === 'queued') {
+    return { segs: [{ kind: 'live', frac: 1 }], end: null, title: code === 'queued' ? '排队中' : '运行中：跑完才分得出执行和等人' }
+  }
+  const t = runTiming(run)
+  const pieces =(wall: number, active: number | null, wait: number, openWait = 0) => {
+    const f = (ms: number) => Math.max(0, Math.min(1, ms / wall))
+    const segs: RunShape['segs'] = []
+    if (active != null) segs.push({ kind: 'active', frac: f(active) })
+    if (wait > 0) segs.push({ kind: 'wait', frac: f(wait) })
+    const used = segs.reduce((n, s) => n + s.frac, 0) + f(openWait)
+    const rest = Math.max(0, 1 - used)
+    if (rest > 0.005) segs.push({ kind: active == null ? 'unknown' : 'other', frac: rest })
+    if (openWait > 0) segs.push({ kind: 'wait', frac: f(openWait), open: true })
+    return segs
+  }
+
+  if (code === 'waiting') {
+    const start = parseServerTime(run.started_at ?? run.created_at ?? null)?.getTime()
+    const since = parseServerTime(opts.waitingSince ?? null)?.getTime()
+    if (start == null || since == null || now <= start) return { segs: [], end: null, title: '等待审批' }
+    const wall = now - start
+    const open = Math.max(0, now - since)
+    const active = t.source === 'usage' ? t.activeMs : null
+    const before = t.source === 'usage' ? t.waitMs ?? 0 : 0
+    return {
+      segs: pieces(wall, active, before, open),
+      end: null,
+      title: `墙钟 ${formatSpan(wall)}（至今） · 执行 ${formatSpan(active)} · 等人 ${formatSpan(before + open)}（还在等）`,
+    }
+  }
+
+  const end: RunShape['end'] = code === 'failed' ? 'failed' : code === 'cancelled' ? 'cancelled'
+    : code === 'held' || code === 'suspended' ? 'suspended' : null
+  if (t.wallMs == null || t.wallMs <= 0) {
+    return { segs: [], end, title: t.activeMs != null ? timingTitle(t) : '没有时长记录' }
+  }
+  return { segs: pieces(t.wallMs, t.activeMs, t.waitMs ?? 0), end, title: timingTitle(t) }
+}
+
+// -------------------------------------------------------------------------
+// 取消
+// -------------------------------------------------------------------------
+
+/**
+ * 取消的原因，去掉后端统一加的「用户取消：」前缀；只有那四个字的（跑着时点了
+ * 停止）没有别的原因，返回 null。列表写「已取消 · 在等审批时放弃了这次运行」，
+ * 不写「已取消 · 用户取消：在等审批时…」
+ */
+export function cancelReason(error: string | null | undefined): string | null {
+  const text = (error ?? '').trim()
+  if (!text || text === '用户取消') return null
+  return text.replace(/^用户取消\s*[:：]\s*/, '') || null
+}
+
+// -------------------------------------------------------------------------
+// 详情的几个视图
+// -------------------------------------------------------------------------
+
+/** stream：时间线（逐步的文字）；trace：航迹（按时间摊开、可回放）；artifacts：工件 */
+export type DetailView = 'stream' | 'trace' | 'artifacts'
+export const DETAIL_VIEWS: readonly DetailView[] = ['stream', 'trace', 'artifacts']
+export const asView = (v: string | null | undefined): DetailView =>
+  (DETAIL_VIEWS as readonly string[]).includes(v ?? '') ? (v as DetailView) : 'stream'
+
+/**
+ * 图的骨架：节点 id 和连线。运行时的快照和工作流现在的样子骨架不同，画布上回放
+ * 就是把这次的事件套在另一张图上——对不上的节点不会亮，要先说清
+ */
+export function graphShape(g: { nodes?: { id: string }[]; edges?: { source: string; target: string; sourceHandle?: string | null }[] } | null | undefined): string | null {
+  if (!g?.nodes) return null
+  const ids = g.nodes.map((n) => n.id).sort().join(',')
+  const links = (g.edges ?? []).map((e) => `${e.source}>${e.target}:${e.sourceHandle ?? ''}`).sort().join(',')
+  return `${ids}|${links}`
+}
+
+// -------------------------------------------------------------------------
+// 工件
+// -------------------------------------------------------------------------
+
+export interface RunArtifact {
+  id: string
+  kind: string
+  node_id: string | null
+  size: number | null
+  meta: Record<string, any> | null
+  created_at: string | null
+}
+
+export const ARTIFACT_KIND_LABEL: Record<string, string> = {
+  query_snapshot: '查询快照',
+  tool_snapshot: '工具快照',
+  retrieval_snapshot: '检索快照',
+  node_output: '节点产出',
+}
+export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
+
+/** 证据：查询、工具、检索的快照。节点产出是过程里的中间值，一次循环就是几十件 */
+export const isEvidence = (kind: string): boolean => kind !== 'node_output'
+
 /** 三种时长写进 title：「墙钟 1 分 27 秒 · 执行 7.6 s · 等人 1 分 14 秒」 */
 export function timingTitle(t: RunTiming): string {
   const parts = [
@@ -238,6 +368,19 @@ export function formatSpan(ms: number | null | undefined, opts?: { coarse?: bool
     return '不到 1 分钟'
   }
   return formatDuration(ms)
+}
+
+/**
+ * 航迹上相对开始的时刻（不带「T+」）。一天以内是秒表读数「05:03.4」「3:05:03.4」；
+ * 过了一天写「9 天 00:38:26」：「216:38:26.2」得自己除 24，而同一行的墙钟、等人
+ * 写的是「9 天」。十分之一秒放不下了，隔了几天也没人要它
+ */
+export function formatOffset(ms: number | null | undefined): string {
+  if (!isNum(ms) || ms < 0) return NONE
+  const DAY = 86_400_000
+  if (ms < DAY) return formatClock(ms)
+  const secs = Math.floor((ms % DAY) / 1000)
+  return `${Math.floor(ms / DAY)} 天 ${pad2(Math.floor(secs / 3600))}:${pad2(Math.floor(secs / 60) % 60)}:${pad2(secs % 60)}`
 }
 
 /** 等了多久算"久"：超过一天就该有人管了 */
@@ -281,11 +424,7 @@ export const isUnsaved = (run: Pick<Run, 'workflow_id' | 'workflow_name'>): bool
 export const runName = (run: Pick<Run, 'workflow_id' | 'workflow_name'>): string =>
   isUnsaved(run) ? UNSAVED_NAME : run.workflow_name
 
-/**
- * 这次运行实际用的记忆域和知识库。后端 RunOut 已经带着，types.ts 的 Run 还没
- * 声明（第二波不能改 types），先在这里收窄一次，别处不再写 as any。
- */
+/** 这次运行实际用的记忆域和知识库，null 收成 undefined：重新发起时原样带上，没有就不带 */
 export function runScope(run: Run): { memory_scope?: string; collection?: string } {
-  const r = run as Run & { memory_scope?: string | null; collection?: string | null }
-  return { memory_scope: r.memory_scope ?? undefined, collection: r.collection ?? undefined }
+  return { memory_scope: run.memory_scope ?? undefined, collection: run.collection ?? undefined }
 }

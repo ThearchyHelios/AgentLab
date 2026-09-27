@@ -14,6 +14,9 @@
 //   这些推导状态和循环容器「两轮之间」也按那一刻算
 // - 协作矩阵的表头不和底部打架：并行的一轮交回一部分、全部交回等调度时都不说「串行」
 // - 去审批浮层键盘可达；出口密的分支节点标签不压别人的线；精简档读数够大
+// - 收场要说人话：协作团队用完轮数（判失败 / 降档交付）写清「用完 N 轮未完成」、点出
+//   一次都没被派到的成员，收尾判定不另算一轮；模型把工具调用写成文字的失败写原因，
+//   不是半句原话；工具超出后端声明的时限直说「已超出 Ns 上限」；校验靠修复才过要提一句
 //
 // 用法：AGENTLAB_WEB=http://localhost:5373 AGENTLAB_API=http://localhost:8100/api node scripts/check-run-states.mjs
 // 截图落在 RUN_STATES_SHOTS（默认 /tmp/agentlab-run-states）。
@@ -25,8 +28,10 @@ const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const SHOTS = process.env.RUN_STATES_SHOTS ?? '/tmp/agentlab-run-states'
+// 截图的像素密度：要看清卡片里 11px 的字时设成 2
+const DSF = Number(process.env.RUN_STATES_DSF ?? 1) || 1
 mkdirSync(SHOTS, { recursive: true })
-// 只跑其中几段（逗号分隔：themes, interact, team, replay, history, reduced, exits），调样式时省时间
+// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, reduced, exits），调样式时省时间
 const ONLY = (process.env.RUN_STATES_ONLY ?? '').split(',').filter(Boolean)
 const want = (part) => !ONLY.length || ONLY.includes(part)
 
@@ -237,6 +242,7 @@ async function open({ theme = 'dark', reduced = false, workflow = WORKFLOW } = {
   const browser = await chromium.launch({ executablePath: CHROME })
   const ctx = await browser.newContext({
     viewport: { width: 1440, height: 900 },
+    deviceScaleFactor: DSF,
     colorScheme: theme,
     reducedMotion: reduced ? 'reduce' : 'no-preference',
   })
@@ -369,6 +375,20 @@ const countOf = (anim) => Object.entries(anim).reduce((acc, [k, v]) => (k === 'n
 async function shot(page, name) {
   const path = `${SHOTS}/${name}.png`
   await page.locator('.react-flow').screenshot({ path })
+  return path
+}
+
+/** 只截几张卡（外扩一圈）：看卡片里的字用，整张画布截图里它们太小 */
+async function cardShot(page, ids, name) {
+  const boxes = (await Promise.all(ids.map((id) => page.locator(`.react-flow__node[data-id="${id}"]`).boundingBox())))
+    .filter(Boolean)
+  if (!boxes.length) return null
+  const x = Math.min(...boxes.map((b) => b.x)) - 16
+  const y = Math.min(...boxes.map((b) => b.y)) - 16
+  const w = Math.max(...boxes.map((b) => b.x + b.width)) + 16 - x
+  const h = Math.max(...boxes.map((b) => b.y + b.height)) + 16 - y
+  const path = `${SHOTS}/${name}.png`
+  await page.screenshot({ path, clip: { x: Math.max(0, x), y: Math.max(0, y), width: w, height: h } })
   return path
 }
 
@@ -717,10 +737,32 @@ if (want('interact')) {
   const stampInfo = await stamp.evaluate((el) => ({
     tag: el.tagName, role: el.getAttribute('role'), tab: el.tabIndex, cursor: getComputedStyle(el).cursor, title: el.title,
   })).catch(() => null)
-  // 右栏还没有可以滚过去的出具横幅：它是一枚章，不装作能点
-  check('印章不是个点了没反应的按钮', !!stampInfo && stampInfo.tag !== 'BUTTON' && stampInfo.role === 'img'
+  // 它是一枚章，不是按钮：不进 Tab 序列，悬停前没有手形
+  check('印章不是个按钮', !!stampInfo && stampInfo.tag !== 'BUTTON' && stampInfo.role === 'img'
     && stampInfo.tab < 0 && stampInfo.cursor !== 'pointer', JSON.stringify(stampInfo && { ...stampInfo, title: undefined }))
   check('印章悬停写出「校验没跑全」', (stampInfo?.title ?? '').includes('校验没跑全：指标集为空'), (stampInfo?.title ?? '').split('\n').join(' / '))
+  // 右栏看得见时点它是去看完整判定的捷径：广播 agentlab:goto-issuance，右栏在对话层时自己切过去
+  await page.evaluate(() => {
+    window.__issuance = []
+    window.addEventListener('agentlab:goto-issuance', (e) => window.__issuance.push(e.detail))
+  })
+  await stamp.hover()
+  const cursor = await stamp.evaluate((el) => getComputedStyle(el).cursor)
+  await stamp.click()
+  const went = await page.evaluate(() => window.__issuance)
+  check('右栏看得见：悬停成了链接，点它请右栏摆出出具横幅', cursor === 'pointer' && went.length === 1 && went[0].runId === RUN_ID,
+    `${cursor} · ${JSON.stringify(went)}`)
+  // 回指明细带口径（issuance.matched[].caliber）：同一个指标换过口径，看得出这次按的是哪一版
+  await page.evaluate(() => {
+    const st = window.__studio
+    const out = st.getState().run.output
+    st.setState({ run: { ...st.getState().run, output: { ...out, _issuance: { ...out._issuance,
+      matched: [{ token: '12.4%', metric: '毛利率', caliber: '月度口径 @ v2' }, { token: '1,204', metric: '订单数' }] } } } })
+  })
+  await page.waitForTimeout(150)
+  const matchedTitle = await stamp.getAttribute('title')
+  check('印章悬停列出回指明细和口径', (matchedTitle ?? '').includes('12.4% → 毛利率（月度口径 @ v2）')
+    && (matchedTitle ?? '').includes('1,204 → 订单数'), (matchedTitle ?? '').split('\n').join(' / '))
   check('运行结束后端口恢复可连', await page.evaluate(() =>
     document.querySelector('.react-flow__node[data-id="gate"] .react-flow__handle')?.classList.contains('connectable')))
   // 探索运行进行中也不能连线：端口跟着 React Flow 的 connectable 走
@@ -785,6 +827,371 @@ if (want('team')) {
   shots.push(await shot(page, 'dark-team-all-back'))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
+}
+
+// ---------------------------------------------------------------- 收场：用完轮数、写成文字的工具调用、超时
+
+if (want('endings')) {
+  // 一张小图：协作团队两轮上限、三个成员（「定稿员」一次都派不到）；一个 agent 节点把
+  // 工具调用写成了文字；一个工具节点查询超时；一个校验节点靠修复才过
+  const graph = await (await fetch(`${API}/copilot/layout`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ graph: {
+      nodes: [
+        { id: 'in', type: 'input', data: { label: '入口', config: { fields: [{ name: 'week' }] } } },
+        { id: 'team', type: 'supervisor', data: { label: '复盘小组', config: {
+          goal: '汇总本周订单异常', max_rounds: 2, max_parallel: 2,
+          agents: [agent('检索员', '拉订单明细'), agent('分析员', '找异常原因'), agent('定稿员', '写结论')],
+        } } },
+        { id: 'ask', type: 'agent', data: { label: '订单查询', config: { prompt: '查 orders 本周异常', tools: ['db_query__shop'] } } },
+        { id: 'q', type: 'tool', data: { label: '取订单', config: { tool: 'db_query__shop' } } },
+        { id: 'chk', type: 'validate', data: { label: '结构校验', config: { repair_with_llm: true, max_retries: 2 } } },
+        { id: 'out', type: 'output', data: { label: '周报', config: { fields: [{ name: 'report' }] } } },
+      ],
+      edges: [
+        { source: 'in', target: 'team' }, { source: 'in', target: 'ask' }, { source: 'in', target: 'q' },
+        { source: 'q', target: 'chk' }, { source: 'team', target: 'out' }, { source: 'ask', target: 'out' },
+        { source: 'chk', target: 'out' },
+      ],
+    } }),
+  })).json()
+  const workflow = { ...WORKFLOW, id: 'wcard-endings', name: '__endings__', graph }
+
+  const MARKUP = '模型输出了工具调用的原始标记，但没有真正调用工具。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。'
+  const EXHAUSTED = '协作团队用完 2 轮仍未完成：还没有定稿。一次都没被派到的成员：定稿员。先看成员有没有绑定要用的工具，再调大「最多轮数」；也可以把「用完轮数时」改成降档交付'
+  const START = [
+    [0, 'run.started', null, { nodes: 6 }],
+    [0.1, 'node.started', 'in', {}],
+    [0.05, 'node.finished', 'in', { duration_ms: 3, preview: { week: '2026-W39' } }],
+  ]
+  // 两轮都派了、调度者始终没说完成；第一轮的检索员把工具调用写成了文字，这一步记失败
+  const ROUNDS = [
+    [0.05, 'node.started', 'team', {}],
+    [0.02, 'agent.route.start', 'team', { round: 0 }],
+    [1.2, 'agent.route.end', 'team', { round: 0, duration_ms: 1200, agents: ['检索员'], parallel: 1, done: false, reason: '先拉订单明细' }],
+    [0.02, 'agent.step.start', 'team', { agent: '检索员', instruction: '拉本周订单', round: 0, parallel: 1 }],
+    [2.0, 'agent.step.end', 'team', { agent: '检索员', duration_ms: 2000, round: 0, parallel: 1, preview: '<tool_call>{"name": "db_query__shop"}</tool_call>',
+      failed: true, error: '模型输出了工具调用的原始标记，但没有真正调用工具' }],
+    [0.02, 'agent.route.start', 'team', { round: 1 }],
+    [1.0, 'agent.route.end', 'team', { round: 1, duration_ms: 1000, agents: ['分析员'], parallel: 1, done: false, reason: '换人分析' }],
+    [0.02, 'agent.step.start', 'team', { agent: '分析员', instruction: '找异常原因', round: 1, parallel: 1 }],
+    [1.5, 'agent.step.end', 'team', { agent: '分析员', duration_ms: 1500, round: 1, parallel: 1, preview: '缺数据，无法判断' }],
+  ]
+  // 轮数用完之后的收尾判定：只判定、不派活，round 是上限（从 0 数就是「第 3 轮」）
+  const closing = (done, reason) => [
+    [0.02, 'agent.route.start', 'team', { round: 2, closing: true }],
+    [0.9, 'agent.route.end', 'team', { round: 2, closing: true, duration_ms: 900, agents: [], parallel: 0, done, reason }],
+    [0.05, 'llm.end', 'team', { agent: '调度者', model: 'm', input_tokens: 900, output_tokens: 120, cost_usd: 0.001 }],
+  ]
+  const FAIL = script([...START,
+    [0.02, 'node.started', 'ask', {}],
+    ...ROUNDS, ...closing(false, '还没有定稿'),
+    [0.02, 'log', 'ask', { level: 'warn', code: 'tool_markup_leak', message: '模型输出了工具调用的原始标记，但没有真正调用工具' }],
+    [0.02, 'node.failed', 'ask', { duration_ms: 6800, error: MARKUP }],
+    [0.05, 'node.failed', 'team', { duration_ms: 6800, error: EXHAUSTED }],
+    [0.05, 'run.failed', null, { error: '「复盘小组」失败', node_id: 'team', timing: { wall_ms: 7000, active_ms: 7000, wait_ms: 0 } }],
+  ])
+  const DEGRADE = script([...START,
+    [0.02, 'node.started', 'ask', {}],
+    // 第一次查询超出声明的 2s 时限被放弃，第二次查到了；收尾时模型还想要工具
+    [0.05, 'tool.start', 'ask', { tool: 'db_query__shop', call_id: 'c1', timeout_s: 2 }],
+    [3.0, 'tool.error', 'ask', { tool: 'db_query__shop', call_id: 'c1', duration_ms: 3000, timed_out: true, error: '查询超过 2s 没有返回，已放弃等待' }],
+    [0.05, 'tool.start', 'ask', { tool: 'db_query__shop', call_id: 'c2', timeout_s: 2 }],
+    [0.4, 'tool.end', 'ask', { tool: 'db_query__shop', call_id: 'c2', duration_ms: 400, preview: '{"row_count": 12}' }],
+    [0.1, 'log', 'ask', { level: 'warn', code: 'tool_markup_leak', message: '收尾轮仍想调用工具：步数用完了' }],
+    [0.05, 'llm.end', 'ask', { agent: '订单查询', model: 'm', input_tokens: 1200, output_tokens: 300, cost_usd: 0.002 }],
+    [0.02, 'node.finished', 'ask', { duration_ms: 3700, preview: { text: '本周异常 12 单' } }],
+    [0.02, 'node.started', 'q', {}],
+    [0.02, 'tool.start', 'q', { tool: 'db_query__shop', call_id: 'c3', timeout_s: 30 }],
+    [0.3, 'tool.end', 'q', { tool: 'db_query__shop', call_id: 'c3', duration_ms: 300, preview: '{"row_count": 12}' }],
+    [0.02, 'node.finished', 'q', { duration_ms: 320, preview: { row_count: 12 } }],
+    [0.02, 'node.started', 'chk', {}],
+    [0.4, 'llm.end', 'chk', { model: 'm', purpose: 'repair', duration_ms: 400, input_tokens: 300, output_tokens: 40, cost_usd: 0.0005, calls: 1 }],
+    [0.02, 'log', 'chk', { level: 'warn', code: 'repair_invented', message: '修复时出现了原文没有的值：total_count=0' }],
+    [0.4, 'llm.end', 'chk', { model: 'm', purpose: 'repair', duration_ms: 400, input_tokens: 300, output_tokens: 40, cost_usd: 0.0005, calls: 1 }],
+    [0.02, 'node.finished', 'chk', { duration_ms: 850, preview: { total_count: 12 } }],
+    ...ROUNDS, ...closing(false, '还没有定稿'),
+    [0.02, 'log', 'team', { level: 'warn', code: 'team_exhausted', message: '协作团队用完 2 轮仍未完成：还没有定稿。一次都没被派到的成员：定稿员。按降档交付' }],
+    [0.02, 'node.finished', 'team', { duration_ms: 6800, preview: { exhausted: true, exhausted_reason: '还没有定稿', never_dispatched: '[1 项]', text: '缺数据，无法判断' } }],
+    [0.05, 'node.started', 'out', {}],
+    [0.05, 'node.finished', 'out', { duration_ms: 4, preview: { report: '…' } }],
+    [0.05, 'run.finished', null, { output: {}, usage: {}, duration_ms: 9000, timing: { wall_ms: 9000, active_ms: 9000, wait_ms: 0 } }],
+  ])
+  // 进行中：收尾判定还没出结论；工具节点的查询已经超出声明的 2s
+  const LIVE_JUDGING = script([...START,
+    ...ROUNDS,
+    [0.02, 'agent.route.start', 'team', { round: 2, closing: true }],
+    [0.02, 'node.started', 'q', {}],
+    [0.02, 'tool.start', 'q', { tool: 'db_query__shop', call_id: 'c9', timeout_s: 2 }],
+    [3.2, 'log', null, { level: 'info', message: '心跳' }],
+  ])
+  // 收尾判定说完成了：正常交付，表头说清是轮数用完之后判的，不点名谁没被派到
+  const CLOSED_OK = script([...START,
+    ...ROUNDS, ...closing(true, '材料够了，可以收尾'),
+    [0.05, 'node.finished', 'team', { duration_ms: 6800, preview: { text: '结论：…' } }],
+    [0.05, 'run.finished', null, { output: {}, usage: {}, duration_ms: 7000, timing: { wall_ms: 7000, active_ms: 7000, wait_ms: 0 } }],
+  ])
+  const askLlm = (out) => [0.05, 'llm.end', 'ask', { agent: '订单查询', model: 'm', input_tokens: 600, output_tokens: out, cost_usd: 0.001 }]
+  // 同一个节点执行两次：第一次的收场不能挂到第二次上。团队用完轮数判失败 → 调大轮数
+  // 接着跑（后端给失败的节点标 resumed，但这是重新执行；前两轮在断点里，不重发）→ 派到
+  // 定稿员、调度者判完成。agent 第一次收尾时还想调工具，第二次（循环体每一轮也是这样）干干净净
+  const RERUN = script([...START,
+    [0.02, 'node.started', 'ask', {}],
+    [0.3, 'log', 'ask', { level: 'warn', code: 'tool_markup_leak',
+      message: '模型把工具调用写成了文字（<tool_call>{"name": "db_query__shop"…），没有真正调用工具：步数用完后的收尾轮仍想调用工具，没能给出结论' }],
+    askLlm(300),
+    [0.02, 'node.finished', 'ask', { duration_ms: 400, preview: { text: '本周异常 12 单' } }],
+    ...ROUNDS, ...closing(false, '还没有定稿'),
+    [0.05, 'node.failed', 'team', { duration_ms: 6800, error: EXHAUSTED }],
+    [0.05, 'run.failed', null, { error: '「复盘小组」失败', node_id: 'team', timing: { wall_ms: 7000, active_ms: 7000, wait_ms: 0 } }],
+    [2.0, 'run.resumed', null, { from: ['team'], message: '从「复盘小组」接着跑，前面 2 个节点的结果保留' }],
+    [0.02, 'run.started', null, { nodes: 6, resumed: true }],
+    [0.05, 'node.started', 'team', { resumed: true }],
+    [0.02, 'agent.route.start', 'team', { round: 2 }],
+    [0.8, 'agent.route.end', 'team', { round: 2, duration_ms: 800, agents: ['定稿员'], parallel: 1, done: false, reason: '派定稿员写结论' }],
+    [0.02, 'agent.step.start', 'team', { agent: '定稿员', instruction: '写结论', round: 2, parallel: 1 }],
+    [1.2, 'agent.step.end', 'team', { agent: '定稿员', duration_ms: 1200, round: 2, parallel: 1, preview: '结论：…' }],
+    [0.02, 'agent.route.start', 'team', { round: 3 }],
+    [0.6, 'agent.route.end', 'team', { round: 3, duration_ms: 600, agents: [], parallel: 0, done: true, reason: '已经定稿' }],
+    [0.05, 'node.finished', 'team', { duration_ms: 2700, preview: { text: '结论：…' } }],
+    [0.05, 'node.started', 'ask', {}],
+    askLlm(240),
+    [0.3, 'node.finished', 'ask', { duration_ms: 320, preview: { text: '本周异常 9 单' } }],
+    [0.05, 'node.started', 'out', {}],
+    [0.05, 'node.finished', 'out', { duration_ms: 4, preview: { report: '…' } }],
+    [0.05, 'run.finished', null, { output: {}, usage: {}, duration_ms: 12000, timing: { wall_ms: 12000, active_ms: 10000, wait_ms: 0 } }],
+  ])
+  // 写成文字、被提醒之后重答了：成果是重答的那一次，不是「收尾时仍想调用工具」那种不完整。
+  // 团队里检索员提醒后重答了；分析员提醒后还这样，这一步记失败，不能算进「纠正过」
+  const NUDGE = script([...START,
+    [0.02, 'node.started', 'ask', {}],
+    [0.3, 'log', 'ask', { level: 'warn', code: 'tool_markup_leak',
+      message: '模型把工具调用写成了文字（<tool_call>{"name": "db_query__shop"…），没有真正调用工具，已提醒它重试一次' }],
+    [0.02, 'tool.start', 'ask', { tool: 'db_query__shop', call_id: 'n1', timeout_s: 30 }],
+    [0.3, 'tool.end', 'ask', { tool: 'db_query__shop', call_id: 'n1', duration_ms: 300, preview: '{"row_count": 12}' }],
+    askLlm(280),
+    [0.02, 'node.finished', 'ask', { duration_ms: 700, preview: { text: '本周异常 12 单' } }],
+    [0.02, 'node.started', 'team', {}],
+    [0.02, 'agent.route.start', 'team', { round: 0 }],
+    [0.8, 'agent.route.end', 'team', { round: 0, duration_ms: 800, agents: ['检索员', '分析员'], parallel: 2, done: false, reason: '先拉明细、再找原因' }],
+    [0.02, 'agent.step.start', 'team', { agent: '检索员', instruction: '拉本周订单', round: 0, parallel: 2 }],
+    [0.01, 'agent.step.start', 'team', { agent: '分析员', instruction: '找异常原因', round: 0, parallel: 2 }],
+    [0.4, 'log', 'team', { level: 'warn', code: 'tool_markup_leak',
+      message: '检索员把工具调用写成了文字（<tool_call>{"name": "db_query__shop"…），没有真正调用工具，已提醒它重试一次' }],
+    [0.2, 'log', 'team', { level: 'warn', code: 'tool_markup_leak',
+      message: '分析员把工具调用写成了文字（<tool_call>{"name": "db_query__shop"…），没有真正调用工具，已提醒它重试一次' }],
+    [0.6, 'agent.step.end', 'team', { agent: '检索员', duration_ms: 1200, round: 0, parallel: 2, preview: '拉到 12 单' }],
+    [0.3, 'agent.step.end', 'team', { agent: '分析员', duration_ms: 1500, round: 0, parallel: 2, preview: '',
+      failed: true, error: '模型输出了工具调用的原始标记，但没有真正调用工具，这一步什么都没查到' }],
+    [0.02, 'agent.route.start', 'team', { round: 1 }],
+    [0.6, 'agent.route.end', 'team', { round: 1, duration_ms: 600, agents: [], parallel: 0, done: true, reason: '明细够了' }],
+    [0.05, 'node.finished', 'team', { duration_ms: 2500, preview: { text: '结论：…' } }],
+    [0.05, 'run.finished', null, { output: {}, usage: {}, duration_ms: 3500, timing: { wall_ms: 3500, active_ms: 3500, wait_ms: 0 } }],
+  ])
+  /** 改团队节点的配置（运行之后调过「最多轮数」、或者压根没配）。值给 null 就是删掉这一项 */
+  const setTeamConfig = (page, patch) => page.evaluate((patch) => {
+    const st = window.__studio
+    const node = st.getState().nodes.find((n) => n.id === 'team')
+    const config = { ...node.data.config, ...patch }
+    for (const [k, v] of Object.entries(patch)) if (v === null) delete config[k]
+    st.setState({ nodes: st.getState().nodes.map((n) => (n.id === 'team' ? { ...n, data: { ...n.data, config } } : n)) })
+  }, patch)
+
+  const at = (page, id) => page.locator(`.react-flow__node[data-id="${id}"]`)
+  const flat = (t) => (t ?? '').replace(/\s+/g, ' ').trim()
+  const matrixOf = (page) => page.evaluate(() => {
+    const m = document.querySelector('.react-flow__node[data-id="team"] .team-matrix')
+    const right = m?.querySelector('.team-head-right')
+    const row = (name) => [...(m?.querySelectorAll('.team-row') ?? [])].find((r) => r.textContent.includes(name))
+    const member = (name) => {
+      const r = row(name)
+      return r ? { status: r.dataset.memberStatus, text: r.innerText.replace(/\s+/g, ' ').trim(), title: r.title } : null
+    }
+    return {
+      head: (m?.querySelector('.team-head')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      headTitle: m?.querySelector('.team-head')?.getAttribute('title') ?? '',
+      right: right?.textContent ?? '', tone: right?.classList.contains('is-err') ? 'err' : right?.classList.contains('is-warn') ? 'warn' : '',
+      dispatch: (m?.querySelector('.team-row-dispatch')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      a: member('检索员'), b: member('分析员'), c: member('定稿员'),
+    }
+  })
+  const note = (page, id) => page.evaluate((id) => {
+    const el = document.querySelector(`.react-flow__node[data-id="${id}"] .nc-tele-note`)
+    return el ? { text: el.textContent.trim(), title: el.title, warn: el.classList.contains('is-warn') } : null
+  }, id)
+
+  for (const theme of ['dark', 'light']) {
+    console.log(`\n=== ${theme === 'dark' ? '暗色' : '亮色'}：收场说人话（用完轮数、工具调用写成文字、超时、修复） ===`)
+    const { browser, page, errors } = await open({ theme, workflow })
+    await setLod(page, 'full')
+    const base = Object.fromEntries(Object.entries(await cards(page)).map(([id, c]) => [id, c.h]))
+
+    // ---- 判失败：用完轮数（默认）
+    await feed(page, FAIL(Date.now()))
+    await page.waitForTimeout(900)
+    let c = await cards(page)
+    let m = await matrixOf(page)
+    const teamNote = await note(page, 'team')
+    check(`${theme}: 团队用完轮数判失败，卡片写「用完 2 轮仍未完成」`, c.team.state === 'failed'
+      && teamNote?.text === '协作团队用完 2 轮仍未完成', JSON.stringify(teamNote?.text))
+    check(`${theme}: 悬停写清理由和怎么办`, (teamNote?.title ?? '').includes('还没有定稿') && (teamNote?.title ?? '').includes('怎么办'),
+      flat(teamNote?.title))
+    check(`${theme}: 收尾判定不另算一轮（表头仍是第 2 轮 / 上限 2）`, m.head.startsWith('第 2 轮 / 上限 2'), m.head)
+    check(`${theme}: 表头说「用完 2 轮 · 未完成」，失败上红`, m.right === '用完 2 轮 · 未完成' && m.tone === 'err', `${m.right} · ${m.tone}`)
+    check(`${theme}: 调度者那一行写「收尾判定」`, m.dispatch.includes('收尾判定'), m.dispatch)
+    check(`${theme}: 一次都没被派到的成员点出来`, m.c?.status === 'never' && m.c.text.includes('未派到')
+      && m.headTitle.includes('一次都没被派到：定稿员'), JSON.stringify(m.c))
+    check(`${theme}: 成员把工具调用写成文字：格子是失败，悬停写原因`, m.a?.status === 'failed'
+      && (m.a.title ?? '').includes('原因：模型输出了工具调用的原始标记'), JSON.stringify(m.a))
+    const askNote = await note(page, 'ask')
+    check(`${theme}: agent 把工具调用写成文字而失败：卡片写原因，不是半句原话`, c.ask.state === 'failed'
+      && askNote?.text === '模型没有真正调用工具' && (askNote?.title ?? '').includes('怎么办'), JSON.stringify(askNote))
+    const grew = Object.entries(c).filter(([id, x]) => x.h !== base[id])
+    check(`${theme}: 失败收场不撑高卡片`, grew.length === 0, grew.map(([id, x]) => `${id} ${base[id]}→${x.h}`).join(', '))
+    shots.push(await shot(page, `${theme}-endings-failed`), await cardShot(page, ['team', 'ask'], `${theme}-endings-failed-cards`))
+
+    // ---- 降档交付、收尾时还想调工具、查询超时、修复才过
+    await feed(page, DEGRADE(Date.now()))
+    await page.waitForTimeout(900)
+    c = await cards(page)
+    m = await matrixOf(page)
+    const degr = await note(page, 'team')
+    const chip = await at(page, 'team').locator('.nc-head .nc-chip-warn', { hasText: '降档' }).count()
+    check(`${theme}: 降档交付：卡片写「用完 2 轮未完成 · 降档交付」，琥珀色、带「降档」标`, c.team.state === 'done'
+      && degr?.text === '用完 2 轮未完成 · 降档交付' && degr.warn && chip === 1, JSON.stringify({ degr, chip }))
+    check(`${theme}: 降档交付：表头琥珀、点出没被派到的成员`, m.right === '用完 2 轮 · 未完成' && m.tone === 'warn'
+      && m.c?.status === 'never', `${m.right} · ${m.tone} · ${m.c?.status}`)
+    const askDone = await note(page, 'ask')
+    check(`${theme}: 收尾时还想调工具：跑完了但琥珀色提一句`, c.ask.state === 'done' && askDone?.text === '收尾时仍想调用工具' && askDone.warn,
+      JSON.stringify(askDone))
+    const tools = await at(page, 'ask').locator('.nc-tools').evaluate((el) => ({ bad: el.classList.contains('is-bad'), title: el.title }))
+      .catch(() => null)
+    check(`${theme}: 超时的那次调用算失败，悬停写「超时（上限 2s）」`, !!tools?.bad && tools.title.includes('超时（上限 2s）'), JSON.stringify(tools))
+    const chkNote = await note(page, 'chk')
+    check(`${theme}: 校验靠修复才过：写「修复 2 次后通过」，有一次凑数被作废就上琥珀`, chkNote?.text === '修复 2 次后通过'
+      && chkNote.warn && chkNote.title.includes('total_count=0'), JSON.stringify(chkNote))
+    shots.push(await shot(page, `${theme}-endings-degraded`), await cardShot(page, ['team', 'ask', 'q'], `${theme}-endings-degraded-cards`))
+    // 校验节点在右边，常被右栏挡住：取景过去再截
+    await page.evaluate(() => window.__studio.getState().focusNode('chk'))
+    await page.waitForTimeout(600)
+    shots.push(await cardShot(page, ['chk'], `${theme}-endings-degraded-validate`))
+
+    // 回放到收尾判定还没出结论的那一刻：不提前降档、不提前点名
+    const judging = await page.evaluate(() => {
+      const segs = window.__studio.getState().trace.nodes.team.segments.filter((s) => s.kind === 'dispatch')
+      return segs[segs.length - 1].start + 300
+    })
+    await page.evaluate((t) => window.__studio.getState().setReplayAt(t), judging)
+    await page.waitForTimeout(300)
+    m = await matrixOf(page)
+    const early = await at(page, 'team').locator('.nc-head .nc-chip-warn', { hasText: '降档' }).count()
+    check(`${theme}: 回放到收尾判定中：表头写「调度者在判定」，不提前降档、不点名`, m.right.includes('调度者在判定') && early === 0
+      && m.c?.status !== 'never', `${m.right} · 降档标 ${early} · ${m.c?.status}`)
+    await page.evaluate(() => window.__studio.getState().setReplayAt(null))
+
+    // ---- 进行中：收尾判定中；查询超出声明的时限
+    await feed(page, LIVE_JUDGING(Date.now()))
+    await page.waitForTimeout(600)
+    m = await matrixOf(page)
+    check(`${theme}: 进行中的收尾判定：表头写「轮数用完 · 调度者在判定」，不是新的一轮`,
+      m.right === '轮数用完 · 调度者在判定' && m.head.startsWith('第 2 轮 / 上限 2') && m.dispatch.includes('判定'), `${m.head} | ${m.dispatch}`)
+    const over = await at(page, 'q').locator('.nc-over').innerText().catch(() => '')
+    const overTitle = await at(page, 'q').locator('.nc-tools').getAttribute('title').catch(() => '') ?? ''
+    // 这句话整个落在卡片里，不被右边沿切掉
+    const overFits = await page.evaluate(() => {
+      const el = document.querySelector('.react-flow__node[data-id="q"] .nc-over')
+      const card = el?.closest('.nc')
+      if (!el || !card) return false
+      return el.getBoundingClientRect().right <= card.getBoundingClientRect().right - 2
+    })
+    check(`${theme}: 查询超出声明的时限：直说「已超出 2s 上限」，工具名在悬停里`, over === '已超出 2s 上限' && overTitle.includes('db_query__shop ⋯ 进行中（上限 2s）') && overFits, `${over} · ${flat(overTitle)}${overFits ? '' : ' · 超出了卡片'}`)
+    shots.push(await shot(page, `${theme}-endings-live`), await cardShot(page, ['team', 'q'], `${theme}-endings-live-cards`))
+    await setLod(page, 'compact')
+    const brief = await at(page, 'team').locator('.nc-lod-read').innerText()
+    check(`${theme}: 精简档：收尾判定中写清是判定，不写「第 3 轮」`, brief === '轮数用完 · 收尾判定中', brief)
+    // 收尾判定认事件里的 closing，不拿配置里的「最多轮数」比：没配（后端按缺省值跑）、
+    // 运行之后调大了（接着跑之前、回放历史运行），照样认得出是在判定
+    await setTeamConfig(page, { max_rounds: null })
+    await page.waitForTimeout(150)
+    const briefBare = await at(page, 'team').locator('.nc-lod-read').innerText()
+    await setLod(page, 'full')
+    m = await matrixOf(page)
+    check(`${theme}: 没配最多轮数：照样认出收尾判定（精简档、表头、调度者那一行）`, briefBare === '轮数用完 · 收尾判定中'
+      && m.right === '轮数用完 · 调度者在判定' && m.dispatch.includes('判定'), `${briefBare} | ${m.right} | ${m.dispatch}`)
+    await setTeamConfig(page, { max_rounds: 4 })
+    await page.waitForTimeout(150)
+    m = await matrixOf(page)
+    check(`${theme}: 运行之后调大了最多轮数：照样认出收尾判定`, m.right === '轮数用完 · 调度者在判定'
+      && m.dispatch.includes('判定'), `${m.right} | ${m.dispatch}`)
+    await setTeamConfig(page, { max_rounds: 2 })
+
+    // ---- 收尾判定说完成了
+    await feed(page, CLOSED_OK(Date.now()))
+    await page.waitForTimeout(600)
+    m = await matrixOf(page)
+    check(`${theme}: 收尾判定已完成：表头说清、安静、不点名`, m.right === '轮数用完 · 判定已完成' && m.tone === ''
+      && m.head.startsWith('第 2 轮 / 上限 2') && m.c?.status !== 'never', `${m.head} · ${m.tone} · ${m.c?.status}`)
+    check(`${theme}: 悬停写完整判定`, m.headTitle.includes('轮数用完 · 调度者判定：已完成') && m.headTitle.includes('材料够了'), flat(m.headTitle))
+
+    // ---- 同一个节点执行第二次：上一次的收场不挂到这一次上。照真实流程先把最多轮数调大
+    // 再接着跑：回放到第一次时「用完 2 轮」得按那一次的原话，不按现在的配置写成 4
+    await setTeamConfig(page, { max_rounds: 4 })
+    await feed(page, RERUN(Date.now()))
+    await page.waitForTimeout(700)
+    const quietEnding = async (label) => {
+      const cs = await cards(page)
+      const mx = await matrixOf(page)
+      const never = await at(page, 'team').locator('[data-member-status="never"]').count()
+      const chips = await at(page, 'team').locator('.nc-head .nc-chip-warn', { hasText: '降档' }).count()
+      const tn = await note(page, 'team')
+      const an = await note(page, 'ask')
+      check(`${theme}: ${label}：团队表头不挂上一次的「判定未完成」、安静、不点名`, cs.team.state === 'done' && mx.tone === ''
+        && !mx.right.includes('未完成') && !mx.headTitle.includes('未完成') && never === 0 && chips === 0 && !tn?.warn,
+        `${mx.right} · 语气「${mx.tone}」· 未派到 ${never} · 降档标 ${chips} · ${JSON.stringify(tn)}`)
+      check(`${theme}: ${label}：agent 这一次干干净净，写产出量，不写上一次的「收尾时仍想调用工具」`, cs.ask.state === 'done'
+        && !!an && !an.warn && /tok/.test(an.text), JSON.stringify(an))
+    }
+    await quietEnding('调大轮数接着跑成功、agent 再执行一次')
+    shots.push(await cardShot(page, ['team', 'ask'], `${theme}-endings-rerun-cards`))
+    const execs = await page.evaluate(() => {
+      const n = window.__studio.getState().trace.nodes
+      const runs = (id) => n[id].segments.filter((s) => s.kind === 'run')
+      return { teamRuns: runs('team').length, askRuns: runs('ask').length,
+               first: runs('team')[0].end + 300, second: runs('ask').at(-1).end + 10 }
+    })
+    check(`${theme}: 夹具确实是两次执行（团队、agent 各两段）`, execs.teamRuns === 2 && execs.askRuns === 2, JSON.stringify(execs))
+    await page.evaluate((t) => window.__studio.getState().setReplayAt(t), execs.second)
+    await page.waitForTimeout(300)
+    await quietEnding('回放到第二次执行里')
+    // 回放到第一次失败的那一刻：说的是那一次的收场，不因为后来成功了就不说
+    await page.evaluate((t) => window.__studio.getState().setReplayAt(t), execs.first)
+    await page.waitForTimeout(300)
+    m = await matrixOf(page)
+    const firstTeam = await note(page, 'team')
+    const firstAsk = await note(page, 'ask')
+    check(`${theme}: 回放到第一次失败那一刻：团队写那一次的「用完 2 轮仍未完成」，表头红、点名定稿员`,
+      firstTeam?.text === '协作团队用完 2 轮仍未完成' && m.right === '用完 2 轮 · 未完成' && m.tone === 'err' && m.c?.status === 'never',
+      `${JSON.stringify(firstTeam?.text)} · ${m.right} · ${m.tone} · ${m.c?.status}`)
+    check(`${theme}: 回放到第一次执行：agent 写那一次的「收尾时仍想调用工具」`, firstAsk?.text === '收尾时仍想调用工具' && firstAsk.warn,
+      JSON.stringify(firstAsk))
+    await page.evaluate(() => window.__studio.getState().setReplayAt(null))
+    await setTeamConfig(page, { max_rounds: 2 })
+
+    // ---- 写成文字、被提醒之后重答了：不是「收尾时仍想调用工具」
+    await feed(page, NUDGE(Date.now()))
+    await page.waitForTimeout(700)
+    const askNudge = await note(page, 'ask')
+    check(`${theme}: agent 写成文字被提醒后重答了：写「纠正过一次工具调用」，不说成果可能不完整`,
+      askNudge?.text === '纠正过一次工具调用' && askNudge.warn && askNudge.title.includes('提醒之后重答了')
+      && !askNudge.title.includes('可能不完整'), JSON.stringify(askNudge))
+    const teamNudge = await note(page, 'team')
+    check(`${theme}: 协作成员提醒后重答了：团队卡同样写「纠正过一次」，提醒后仍失败的那位不算进去`,
+      teamNudge?.text === '纠正过一次工具调用' && teamNudge.warn && teamNudge.title.includes('检索员')
+      && !teamNudge.title.includes('分析员'), JSON.stringify(teamNudge))
+    shots.push(await cardShot(page, ['team', 'ask'], `${theme}-endings-nudge-cards`))
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+    await browser.close()
+  }
 }
 
 if (want('replay')) {

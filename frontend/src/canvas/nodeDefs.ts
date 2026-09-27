@@ -195,7 +195,21 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     fields: [
       { key: 'goal', label: '团队目标', type: 'prompt' },
       { key: 'agents', label: '团队成员', type: 'agents' },
-      { key: 'max_rounds', label: '最大轮次', type: 'number', min: 1, max: 25 },
+      // 叫「最多轮数」：团队用完轮数的报错和右栏都说「调大『最多轮数』」，字段名得对得上
+      { key: 'max_rounds', label: '最多轮数', type: 'number', min: 1, max: 25 },
+      {
+        // 以前轮数用完就把成员最后的原话当成功结果交出去：成员一直没查到数、只会输出
+        // 工具调用的原始标记，运行照样显示「已完成」。默认改成判失败，降档要自己选
+        key: 'on_exhausted', label: '用完轮数时', type: 'select',
+        // 没写和写 fail 是一回事（后端只认 degrade）。选项用 fail：没写时下拉框落在第一项上
+        options: [
+          { value: 'fail', label: '判为失败（默认）' },
+          { value: 'degrade', label: '降档交付' },
+        ],
+        help: '最后一轮调度者仍没判定完成时怎么收场。判为失败：节点报错、运行停下，并点出一次都没'
+          + '被派到的成员；降档交付：把成员最后的原话交给下游，标上「未完成」，出具和复核随之降档。'
+          + '要出数、要出报告的，留在判为失败',
+      },
       {
         key: 'max_parallel', label: '每轮最多同时派几人', type: 'number', min: 1, max: 6,
         help: '互不依赖的任务调度者可以放在同一轮同时执行，总耗时按最慢的那个算。'

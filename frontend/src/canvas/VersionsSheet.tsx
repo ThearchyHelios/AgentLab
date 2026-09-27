@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { ChevronLeft, History, RotateCcw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
-import { diffGraphs, toFlow, useStudio, type FlowNode, type GraphDiff } from '../store/studio'
+import {
+  EDIT_LOCK_TEXT, diffGraphs, toFlow, useEditLock, useStudio, type EditLock, type FlowNode, type GraphDiff,
+} from '../store/studio'
 import { ErrorState, Skeleton, toast } from '../components/ui'
 import { formatDateTime, formatTime } from '../lib/format'
 import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
@@ -29,7 +31,8 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
   const dirty = useStudio((s) => s.dirty)
-  const locked = useStudio((s) => s.copilot.active)
+  // 助手在改、正式运行在跑：恢复旧版也是改图，一样拦下
+  const lock = useEditLock()
   const restoreVersion = useStudio((s) => s.restoreVersion)
   const undo = useStudio((s) => s.undo)
 
@@ -135,7 +138,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                           : 'error' in detail ? <ErrorState error={detail.error} compact />
                           : target && diff && (
                             <VersionPreview version={v.version} target={target} diff={diff}
-                                            locked={locked} onRestore={restore} />
+                                            lock={lock} onRestore={restore} />
                           )}
                       </div>
                     )}
@@ -153,9 +156,9 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
   )
 }
 
-function VersionPreview({ version, target, diff, locked, onRestore }: {
+function VersionPreview({ version, target, diff, lock, onRestore }: {
   version: number; target: { nodes: FlowNode[]; edges: Edge[] }; diff: GraphDiff
-  locked: boolean; onRestore: () => void
+  lock: EditLock; onRestore: () => void
 }) {
   const current = useStudio((s) => s.nodes)
   const same = diff.total === 0
@@ -192,8 +195,8 @@ function VersionPreview({ version, target, diff, locked, onRestore }: {
           </ul>
         </>
       )}
-      <button type="button" className="btn btn-sm mt-2 w-full justify-center" disabled={same || locked}
-              title={locked ? '助手正在改这张工作流，等它做完' : undefined} onClick={onRestore}>
+      <button type="button" className="btn btn-sm mt-2 w-full justify-center" disabled={same || lock != null}
+              title={lock ? EDIT_LOCK_TEXT[lock] : undefined} onClick={onRestore}>
         <RotateCcw size={11} /> 恢复 v{version} 到画布
       </button>
     </div>

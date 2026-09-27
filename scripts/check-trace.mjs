@@ -541,6 +541,76 @@ console.log('\n=== 右栏收尾（decodeRun） ===')
     fold([start('甲', 1), start('乙', 2), end('甲', 3, 100), end('乙', 4, 300)]).savedMs === 100)
 }
 
+console.log('\n=== 回放时的用量和工具数（逐刻度） ===')
+{
+  // 回放到半路，卡片和 HUD 要写「那一刻」的 tokens 和工具数，而不是拿终值冒充
+  const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 5000 + seq, data })
+  const events = [
+    ev(1, 'run.started', null, { nodes: 2 }),
+    ev(2, 'node.started', 'agent'),
+    ev(3, 'llm.end', 'agent', { input_tokens: 100, output_tokens: 20, cost_usd: 0.001 }),
+    ev(4, 'tool.start', 'agent', { tool: 'db_query__shop' }),
+    ev(5, 'tool.end', 'agent', { tool: 'db_query__shop' }),
+    ev(6, 'tool.start', 'agent', { tool: 'db_query__shop' }),
+    ev(7, 'tool.end', 'agent', { tool: 'db_query__shop' }),
+    ev(8, 'llm.end', 'agent', { input_tokens: 300, output_tokens: 80, cost_usd: 0.004 }),
+    ev(9, 'node.finished', 'agent', { duration_ms: 7000 }),
+    ev(10, 'node.started', 'out'), ev(11, 'node.finished', 'out'),
+    ev(12, 'run.finished', null, { usage: { input_tokens: 400, output_tokens: 100, cost_usd: 0.005 } }),
+  ]
+  const gr = g(['agent', 'out'], [['agent', 'out']])
+  const t = run(events, gr)
+  const at = (seq) => (5000 + seq) * 1000
+  const p4 = project(t, at(4) + 1)
+  check('第一次调工具那一刻：1 次工具、1 个在跑、tokens 只有第一轮',
+    p4.nodes.agent.tools === 1 && p4.nodes.agent.toolsRunning === 1 && p4.nodes.agent.tokensIn === 100
+    && p4.nodes.agent.tokensOut === 20,
+    JSON.stringify(p4.nodes.agent))
+  const p6 = project(t, at(6) + 0.5)
+  check('第二次调工具时：2 次，第一次已经回来', p6.nodes.agent.tools === 2 && p6.nodes.agent.toolsRunning === 1,
+    JSON.stringify(p6.nodes.agent))
+  const p9 = project(t, at(9) + 1)
+  check('节点跑完：用量是这个节点的最终值、没有在跑的工具', p9.nodes.agent.tokensIn === 400
+    && p9.nodes.agent.tokensOut === 100 && p9.nodes.agent.tools === 2 && p9.nodes.agent.toolsRunning === 0,
+    JSON.stringify(p9.nodes.agent))
+  check('回放到开始之前：0，不是终值', project(t, at(1)).nodes.agent.tools === 0
+    && project(t, at(1)).nodes.agent.tokensIn === 0)
+  check('整次运行的用量也按刻度走', p4.tokensIn === 100 && p4.tokensOut === 20 && p9.tokensIn === 400,
+    `${p4.tokensIn}/${p4.tokensOut} → ${p9.tokensIn}`)
+  const live = project(t, trace.lastEventAt(t))
+  check('此刻（实时）读节点的当前值', live.nodes.agent.tokensIn === 400 && live.nodes.agent.tools === 2
+    && live.tokensIn === 400)
+  // 老后端：agent 的调用不发 llm.end，run.finished 的总数比刻度加起来多——回放时那一刻的
+  // 整次用量不可信，给 undefined，不拿终值冒充
+  const old = run([...events.slice(0, 11),
+    ev(12, 'run.finished', null, { usage: { input_tokens: 9000, output_tokens: 900, cost_usd: 0.05 } })], gr)
+  const op = project(old, at(4) + 1)
+  check('刻度对不上后端总数：回放时整次用量写不出', op.tokensIn === undefined && op.tokensOut === undefined,
+    `${op.tokensIn}/${op.tokensOut}`)
+  check('……实时时照样是后端的总数', project(old, trace.lastEventAt(old)).tokensIn === 9000)
+  check('没有 tool / llm 事件的节点刻度为空、读数是 0',
+    t.nodes.out.marks === undefined && project(t, at(11)).nodes.out.tools === 0)
+}
+
+console.log('\n=== 最后一条事件的时刻（lastEventAt） ===')
+{
+  const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 6000 + seq, data })
+  const gr = g([{ id: 'in', type: 'input' }, 'boom', 'after'], [['in', 'boom'], ['boom', 'after']])
+  const t = run([
+    ev(1, 'run.started', null, { nodes: 3 }),
+    ev(2, 'node.started', 'in'), ev(3, 'node.finished', 'in'),
+    ev(4, 'node.started', 'boom'), ev(5, 'node.failed', 'boom', { error: 'x' }),
+    ev(6, 'run.failed', null, { error: 'x', timing: { wall_ms: 5000, active_ms: 4000, wait_ms: 0 } }),
+  ], gr)
+  check('lastEventAt 是最后一条事件的 ts（毫秒）', trace.lastEventAt(t) === 6006 * 1000, `${trace.lastEventAt(t)}`)
+  const settled = project(t, trace.lastEventAt(t))
+  check('投影到这一刻 = 此刻：推导出的阻断还在', settled.nodes.after?.state === 'blocked', settled.nodes.after?.state)
+  check('……后端给的权威时长也在', settled.elapsedMs === 5000 && settled.activeMs === 4000,
+    `${settled.elapsedMs}/${settled.activeMs}`)
+  check('早一毫秒就是按段重建的回放（阻断不在）', project(t, trace.lastEventAt(t) - 1).nodes.after?.state !== 'blocked')
+  check('空航迹的 lastEventAt 是 0', trace.lastEventAt(emptyTrace()) === 0)
+}
+
 console.log('\n=== 性能 ===')
 {
   // 256 段的大循环（真实运行里见过）：一次折叠 + 投影都要快，拖游标才不卡

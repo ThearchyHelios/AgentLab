@@ -1,6 +1,6 @@
 import { Database } from 'lucide-react'
-import { TabPanel, Tabs, useTabRoute } from '../components/ui'
-import { DataSourcesTab, PageHeader } from './DataSourcesTab'
+import { PageHeader, TabPanel, Tabs, useTabRoute } from '../components/ui'
+import { DataSourcesTab } from './DataSourcesTab'
 import type { DataView } from './DataSourcesTab'
 
 /**

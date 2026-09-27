@@ -5,18 +5,16 @@ import clsx from 'clsx'
 import { api, ApiError } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
-  confirmDialog, EmptyState, ErrorState, Field, JsonInput, Kbd, Modal, Skeleton, Spinner, StatusBadge, TabPanel,
-  Tabs, toast, useTabRoute,
+  confirmDialog, deferDelete, DeleteButton, EmptyState, ErrorState, Field, HealthPill, JsonInput, Kbd, Modal,
+  PageHeader, SectionBar, Skeleton, Spinner, StatusBadge, TabPanel, Tabs, toast, useTabRoute, withoutDeferred,
 } from '../components/ui'
 import { formatDuration } from '../lib/format'
+import { checkHealth, forgetHealth, healthFromServer, useHealth } from '../lib/health'
+import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
+import { workflowList, workflowsMentioning } from '../lib/mentions'
 import { useRunClock } from '../run/useRunClock'
 import type { ToolInfo } from '../types'
-import {
-  checkHealth, DeleteButton, deferDelete, forgetHealth, HealthPill, PageHeader, SectionBar, useHealth,
-  withoutDeferred, workflowList, workflowsMentioning,
-} from './DataSourcesTab'
-import type { HealthRecord } from './DataSourcesTab'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
 const TABS = [
@@ -281,15 +279,33 @@ function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean })
   return null
 }
 
-function ToolResult({ result }: { result: any }) {
+/**
+ * 执行 / 试跑的结果。
+ *
+ * note：后端把拼错的参数名按唯一候选纠正了（「参数名 cuont 不存在，已按唯一候选
+ * count 执行」）。跑是跑通了，但人会照着这份参数去配工作流，所以跟在结果下面
+ * 用 warn 写出来，不能只当成功
+ */
+function ToolResult({ result, stale = false }: { result: any; stale?: boolean }) {
   const failed = result.ok === false
   return (
-    <div className="mt-3" data-tool-result={failed ? 'fail' : 'ok'}>
+    <div className={clsx('mt-3', stale && 'opacity-60')} data-tool-result={failed ? 'fail' : 'ok'}>
       <div className="mb-1 flex items-center gap-1.5 text-xs">
         <StatusBadge status={failed ? 'failed' : 'done'} size={12} decorative />
         <span style={{ color: failed ? 'var(--err)' : 'var(--text-dim)' }}>{failed ? '失败' : '成功'}</span>
         {result.duration_ms != null && <span className="tnum text-faint">· {formatDuration(result.duration_ms)}</span>}
+        {stale && <span className="text-faint">· 配置或参数改过了，这是改之前的结果</span>}
       </div>
+      {result.note && (
+        <div className="mb-1.5 flex items-start gap-1.5 rounded-md border px-2 py-1.5 text-xs leading-relaxed" data-tool-note
+             style={{ borderColor: 'color-mix(in srgb, var(--warn) 40%, var(--border))', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
+          <AlertTriangle size={12} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
+          <span>
+            <span className="text-[var(--warn)]">{String(result.note).replace(/[。.]\s*$/, '')}</span>
+            <span className="text-dim">。这次按纠正后的名字跑了，往工作流里抄参数前先把名字改对</span>
+          </span>
+        </div>
+      )}
       {failed ? (
         <ErrorState compact error={result.thrown ?? result} />
       ) : (
@@ -466,7 +482,7 @@ function CustomTools() {
         <EmptyState
           icon={<Wrench size={22} />}
           title="还没有自定义工具"
-          body="把 MES、ERP 的查询接口包成工具，模型就能按需调用。写好参数说明，保存后能直接试跑。"
+          body="把 MES、ERP 的查询接口包成工具，模型就能按需调用。写好参数说明，不用先保存就能试跑。"
           action={<button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 新建工具</button>}
         />
       ) : (
@@ -526,12 +542,16 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
   const noParams = !Object.keys(form.parameters?.properties ?? {}).length
   const [busy, setBusy] = useState(false)
   const [args, setArgs] = useState<any>(() => exampleArgs(initial.parameters, true))
-  const [trial, setTrial] = useState<{ busy?: boolean; result?: any } | null>(null)
+  const [trial, setTrial] = useState<{ since?: number; result?: any; sig?: string } | null>(null)
+  const clock = useRunClock(!!trial?.since)
 
   const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能用英文字母、数字、下划线，不能以数字开头' : null
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
-  const missing = [!form.name && '名称', form.kind === 'http' && !form.config.url && 'URL', form.kind === 'python' && !form.config.code && '代码']
+  const missingConfig = [form.kind === 'http' && !form.config.url && 'URL', form.kind === 'python' && !form.config.code && '代码']
     .filter(Boolean) as string[]
+  const missing = [...(form.name ? [] : ['名称']), ...missingConfig]
+  // 试跑结果对应的是哪一份配置和参数：之后改了就把结果标成旧的，免得拿旧结果当新配置的
+  const trialSig = JSON.stringify([form.kind, form.parameters ?? {}, form.config, args ?? {}])
 
   const submit = async () => {
     if (missing.length || nameError) return
@@ -546,12 +566,22 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
     }
   }
 
+  /**
+   * 试跑眼前这份配置（testDraft），不落库。以前只能跑已保存的：新建要先保存，
+   * 改了代码也得先存——保存等于让节点立刻用上一个还没试过的版本
+   */
   const tryIt = async () => {
-    setTrial({ busy: true })
+    if (trial?.since || missingConfig.length) return
+    const sig = trialSig
+    setTrial({ since: Date.now() })
     try {
-      setTrial({ result: await api.customTools.test(row.id, args ?? {}) })
+      const result = await api.customTools.testDraft({
+        name: form.name && !nameError ? form.name : undefined,
+        kind: form.kind, parameters: form.parameters ?? {}, config: form.config, args: args ?? {},
+      })
+      setTrial({ result, sig })
     } catch (e) {
-      setTrial({ result: { ok: false, thrown: e } })
+      setTrial({ result: { ok: false, thrown: e }, sig })
     }
   }
 
@@ -660,7 +690,9 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
           <div className="mb-1.5 flex items-center gap-2">
             <span className="text-xs font-medium">试跑</span>
             <span className="text-2xs text-faint">
-              {!row.id ? '先保存，才能试跑' : dirty ? '跑的是已保存的版本：改动先保存再试' : '带上参数跑一次，看返回的样子'}
+              {!row.id
+                ? '用眼前这份配置跑一次，不用先保存'
+                : dirty ? '跑的是眼前这份（含没保存的改动），已保存的版本不受影响' : '带上参数跑一次，看返回的样子'}
             </span>
             <button className="btn btn-xs ml-auto" onClick={() => setArgs(exampleArgs(form.parameters, true))}
                     title="按参数 Schema 重新填示例">
@@ -668,10 +700,14 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
             </button>
           </div>
           <JsonInput value={args} onChange={setArgs} rows={3} placeholder="{}" />
-          <button className="btn btn-sm mt-2" disabled={!row.id || !!trial?.busy} onClick={() => void tryIt()}>
-            {trial?.busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 试跑
+          <button className="btn btn-sm tnum mt-2" disabled={!!trial?.since || missingConfig.length > 0}
+                  title={missingConfig.length ? `还缺：${missingConfig.join('、')}` : '用眼前这份配置和参数跑一次，不保存'}
+                  onClick={() => void tryIt()}>
+            {trial?.since
+              ? <><Spinner size={11} /> 试跑中 {formatDuration(clock - trial.since)}</>
+              : <><Play size={11} aria-hidden /> 试跑</>}
           </button>
-          {trial?.result && <ToolResult result={trial.result} />}
+          {trial?.result && <ToolResult result={trial.result} stale={trial.sig !== trialSig} />}
         </div>
       </div>
     </Modal>
@@ -680,13 +716,17 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
 
 // -------------------------------------------------------------------------
 
-/** MCP 的连通状态：这次会话里测过的用测的结果，否则用后端记的上次探测状态（不知道是何时的） */
-function mcpRecord(row: any, tested?: HealthRecord): HealthRecord | undefined {
-  if (tested) return tested
-  if (row.status === 'ok') return { ok: true, at: 0, note: `上次探测发现 ${row.tools_cache?.length ?? 0} 个工具` }
-  if (row.status === 'error') return { ok: false, at: 0, error: row.last_error || '上次探测失败' }
-  return undefined
+/**
+ * 后端记着的上次探测（last_check_*，含启动和「重新加载」时的那次连接）。成功时
+ * 补一句发现了几个工具——探测的结论后端只记了连没连上，工具数在 tools_cache 里
+ */
+function mcpServerRecord(row: any): HealthRecord | undefined {
+  const rec = healthFromServer(row)
+  return rec?.ok ? { ...rec, note: `发现 ${row.tools_cache?.length ?? 0} 个工具` } : rec
 }
+
+/** 决定连哪个进程 / 地址的那几项。改了它们，上次探测的结果说的就是另一个服务了 */
+const mcpConnection = (f: any) => JSON.stringify([f.transport, f.command.trim(), f.args.trim(), f.env ?? {}, f.url.trim()])
 
 function McpServers() {
   const refresh = useCatalog((s) => s.refresh)
@@ -785,7 +825,14 @@ function McpServers() {
 
       {editing && (
         <McpEditor row={editing} onClose={() => setEditing(null)}
-                   onSaved={async (name) => { setEditing(null); await load(); await refresh(); toast.ok(`已保存 MCP 服务「${name}」`) }} />
+                   onSaved={async (name, reconnected) => {
+                     // 本机记的那次探测说的是改之前的命令 / 地址（后端同样清掉了自己记的）
+                     if (reconnected && editing.id) forgetHealth(`mcp:${editing.id}`)
+                     setEditing(null)
+                     await load()
+                     await refresh()
+                     toast.ok(`已保存 MCP 服务「${name}」`)
+                   }} />
       )}
     </div>
   )
@@ -795,14 +842,15 @@ function McpCard({ row, onEdit, onRemove, onProbed }: {
   row: any; onEdit: () => void; onRemove: () => void; onProbed: () => Promise<void>
 }) {
   const key = `mcp:${row.id}`
-  const { record, checkingSince } = useHealth(key)
-  const shown = mcpRecord(row, record)
+  const { record: shown, checkingSince } = useHealth(key, mcpServerRecord(row))
   const probe = async () => {
     await checkHealth(key, async () => {
       const t0 = performance.now()
       const res = await api.mcp.probe(row.id)
       return {
-        ok: !!res.ok, ms: Math.round(performance.now() - t0), error: res.error, hint: res.hint, detail: res.detail,
+        // 后端量的是连上并列出工具的时间；老后端没有就用往返时间
+        ok: !!res.ok, ms: res.elapsed_ms ?? Math.round(performance.now() - t0),
+        error: res.error, hint: res.hint, detail: res.detail,
         note: res.ok ? `发现 ${res.tools?.length ?? 0} 个工具` : undefined,
       }
     })
@@ -836,7 +884,11 @@ function McpCard({ row, onEdit, onRemove, onProbed }: {
   )
 }
 
-function McpEditor({ row, onClose, onSaved }: { row: any; onClose: () => void; onSaved: (name: string) => void }) {
+function McpEditor({ row, onClose, onSaved }: {
+  row: any; onClose: () => void
+  /** reconnected：连接配置改过了，之前的探测结果不再代表它 */
+  onSaved: (name: string, reconnected: boolean) => void
+}) {
   const [initial] = useState(() => ({
     name: row.name ?? '', transport: row.transport ?? 'stdio', command: row.command ?? '',
     args: (row.args ?? []).join(' '), env: row.env ?? {}, url: row.url ?? '', enabled: row.enabled ?? true,
@@ -857,7 +909,7 @@ function McpEditor({ row, onClose, onSaved }: { row: any; onClose: () => void; o
       const payload = { ...form, args: form.args.split(/\s+/).filter(Boolean) }
       if (row.id) await api.mcp.update(row.id, payload)
       else await api.mcp.create(payload)
-      onSaved(form.name)
+      onSaved(form.name, mcpConnection(form) !== mcpConnection(initial))
     } catch (e) {
       toast.error(e)
     } finally {

@@ -4,19 +4,22 @@ import {
 } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  AlertTriangle, ArrowDown, Brain, ChevronRight, CircleCheck, CircleDot, Database, Download,
-  ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, Play, ShieldCheck, Sparkles,
-  Table2, Terminal, Users, Wrench, XCircle,
+  AlertCircle, AlertTriangle, ArrowDown, Brain, ChevronRight, CircleCheck, CircleDot, CornerDownRight,
+  Database, Download, ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, Play, Settings2,
+  ShieldCheck, Sparkles, Table2, Terminal, UserX, Users, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { ErrorNotice, Modal, Skeleton, StatusBadge } from '../components/ui'
+import { humanizeError } from '../lib/errors'
+import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
-  childrenByExec, compactSteps, parseQueryResult, progressOf, spread,
-  type Exec, type ResultTable as Table, type Step, type StepKind, type TeamRun,
+  childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
+  type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
+  type TeamRun,
 } from './decode'
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { useRunClock } from './useRunClock'
@@ -34,6 +37,22 @@ import type { ReviewResult } from '../types'
  * 在哪儿看讲的都是同一个故事。
  */
 
+/**
+ * 页面已经拆好的报错：问数据页的 Failure、记录页的 explainRunError。照原样画，不再
+ * 交给 humanizeError 翻一遍——已经是人话的「操作超时：查询超时…」再翻一遍，就成了
+ * 「操作超时 / 操作超时：查询超时…」
+ */
+export interface TurnFailure {
+  title: string
+  reason?: string
+  /** 怎么办 */
+  hint?: string
+  /** 原文，收进技术细节 */
+  detail?: string
+  /** 该去哪儿改（lib/explain 的 fix）：给了就在报错里放直达入口 */
+  fix?: FixKind | 'rerun'
+}
+
 export interface StreamTurn {
   id: string
   /** 用户说了什么。画布上的 Copilot 指令也走这个字段 */
@@ -45,8 +64,18 @@ export interface StreamTurn {
   /** 还在流的思考（尚未成为 Step）。只有 Anthropic 系模型会有 */
   thinking?: string
   output?: Record<string, any> | null
-  /** 一句报错，或者 {error, hint, detail}（Copilot 的 error 操作）：原因和怎么办分开写，原文收进技术细节 */
-  error?: string | { error: string; hint?: string; detail?: string }
+  /**
+   * 报错，三种给法：
+   * - 一句原话：运行的失败按 lib/explain 讲清为什么、怎么办，别的按 humanizeError；
+   * - {error, hint?, detail?}：原话 + 怎么办 + 原文（Copilot 的 error 操作）；
+   * - TurnFailure：页面已经拆好的，照原样画。
+   */
+  error?: string | { error: string; hint?: string; detail?: string } | TurnFailure
+  /**
+   * 这一轮查了几次库。从库里恢复的轮次没有事件，步骤里数不出来，页面手上有落库的
+   * 次数就传进来；步骤里数得出来时以步骤为准
+   */
+  queries?: number
   runId?: string
   /** formal / exploratory。出具横幅要据此标注"不进正式归档" */
   runClass?: string
@@ -83,6 +112,8 @@ interface StreamCtx {
   dense: boolean
   onHover?: (nodeId: string | null) => void
   onFocus?: (nodeId: string) => void
+  /** 打开这个节点的设置去改（编排页）。下一步是「去画布改」的行据此给直达入口 */
+  onOpen?: (nodeId: string) => void
   activeNodeId?: string | null
   skewMs: number
   openArtifact: (id: string, title?: string) => void
@@ -119,7 +150,7 @@ const STICK_PX = 64
 
 export function AssistantStream({
   turns, dense = false, empty, approvalsFor, onOpenGraph, footer, renderTurnActions,
-  onStepHover, onStepFocus, activeNodeId, follow = true, landing, onFollowUp,
+  onStepHover, onStepFocus, onStepOpen, activeNodeId, follow = true, landing, onFollowUp,
   clockSkewMs = 0, className, resetKey,
 }: {
   turns: StreamTurn[]
@@ -136,6 +167,11 @@ export function AssistantStream({
   /** 编排页：步骤行悬停 / 点击时联动画布。问数据页没有画布，不传 */
   onStepHover?: (nodeId: string | null) => void
   onStepFocus?: (nodeId: string) => void
+  /**
+   * 编排页：打开某个节点的设置。节点没绑工具、团队轮数不够这类要去画布上改的，
+   * 报错和提醒行据此给「打开设置」；不传就只说该去哪儿改
+   */
+  onStepOpen?: (nodeId: string) => void
   /** 画布上悬停的节点：对应的步骤行高亮 */
   activeNodeId?: string | null
   /** 贴着底部时，新步骤到来自动滚到底。离开底部就不再拽人 */
@@ -236,9 +272,9 @@ export function AssistantStream({
   }
 
   const ctx = useMemo<StreamCtx>(() => ({
-    dense, onHover: onStepHover, onFocus: onStepFocus, activeNodeId, skewMs: clockSkewMs,
+    dense, onHover: onStepHover, onFocus: onStepFocus, onOpen: onStepOpen, activeNodeId, skewMs: clockSkewMs,
     openArtifact: (id, title) => setArtifact({ id, title }), reduced,
-  }), [dense, onStepHover, onStepFocus, activeNodeId, clockSkewMs, reduced])
+  }), [dense, onStepHover, onStepFocus, onStepOpen, activeNodeId, clockSkewMs, reduced])
 
   const rootClass = clsx('flex h-full min-h-0 flex-1 flex-col', className)
   if (!turns.length && empty) {
@@ -314,11 +350,12 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
   onFollowUp?: (text: string) => void
 }) {
   const { dense } = useContext(Ctx)
-  // 报错已经在卡片顶上说了一遍（带原因、怎么办、技术细节），步骤列表末尾
-  // 那条同一句话的红行不再重复
-  const errText = typeof turn.error === 'string' ? turn.error : turn.error?.error
-  const steps = turn.phase === 'error' && errText
-    ? turn.steps.filter((s) => !(s.kind === 'error' && s.title === errText))
+  // 报错已经在卡片顶上说了一遍（带原因、怎么办、技术细节），步骤列表末尾那条运行级的
+  // 红行（run.failed）不再重复。页面拆好的报错标题是改写过的，对不上原话，所以按来源认
+  const errText = typeof turn.error === 'string' ? turn.error
+    : turn.error && 'error' in turn.error ? turn.error.error : undefined
+  const steps = turn.phase === 'error' && turn.error
+    ? turn.steps.filter((s) => !(s.kind === 'error' && (s.title === errText || s.id.startsWith('rf-'))))
     : turn.steps
   const plan = steps.filter((s) => s.stage === 'plan')
   // 「开始执行（6 个节点）」「完成」和轮次头说的是同一件事（状态、节点数、耗时），
@@ -354,7 +391,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
         <div className={clsx(dense ? 'px-2.5 pb-2.5' : 'px-3 pb-3')}>
           {turn.phase === 'error' && turn.error && (
             // 报错不截成一行：原因和怎么办要读得全，原文收进可展开的技术细节
-            <ErrorNotice error={turn.error} className="mt-2" />
+            <TurnError turn={turn} />
           )}
 
           {/* 还在流、但还没成为步骤的思考。解码器已经把思考并成了步骤行的话就不再
@@ -439,10 +476,14 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
     : turn.phase === 'error' ? 'failed'
     : 'succeeded'
 
+  // 协作团队用完轮数、按降档交付：节点「完成」了，交出去的却是成员最后的原话
+  const teamShort = useMemo(() => !!findFirst(turn.steps, (s) =>
+    s.code === 'team_exhausted' || (!!s.team && teamVerdictOf(s.team)?.outcome === 'degraded')), [turn.steps])
   // 跑完了但复核说结论不能用：头部不能还是一个安静的「完成」
   const base = turn.status || statusLabel(turn.statusCode ?? code)
   const verdict = turn.phase === 'done' && review === 'broken' ? '结论不可用'
-    : turn.phase === 'done' && review === 'degraded' ? '有缺口' : ''
+    : turn.phase === 'done' && review === 'degraded' ? '有缺口'
+    : turn.phase === 'done' && teamShort ? '协作团队没做完' : ''
   // 复核结论说的是答案，不是运行：运行确实跑完了，徽标和「已完成」照常，红 / 琥珀只
   // 落在结论那几个字上。把完成的勾染成红色，形状说成功、颜色说失败，两头打架
   const tone = turn.tone === 'failed' ? 'var(--st-failed)'
@@ -462,8 +503,12 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
   const took = turn.elapsedMs != null ? (turn.elapsedMs >= 10 ? formatDuration(turn.elapsedMs) : '')
     : doneRow?.meta ?? ''
   const elapsed = live && started != null ? Math.max(0, now - skewMs - started) : undefined
-  const queries = useMemo(() => countKind(turn.steps, 'query'), [turn.steps])
-  const tier = typeof turn.output?._issuance?.tier === 'string' ? turn.output._issuance.tier as string : ''
+  // 从库里恢复的轮次没有事件，步骤里数不出查询：用页面带过来的落库次数
+  const counted = useMemo(() => countKind(turn.steps, 'query'), [turn.steps])
+  const queries = counted || turn.queries || 0
+  // 档位优先取成果里那份（带全了核对明细），失败的运行、成果被替换过的轮次退到出具那一行
+  const tierStep = useMemo(() => findFirst(turn.steps, (s) => s.kind === 'issuance' && !!s.tier)?.tier, [turn.steps])
+  const tier = typeof turn.output?._issuance?.tier === 'string' ? turn.output._issuance.tier as string : tierStep ?? ''
 
   const tags = [
     progress.total ? `${progress.done}/${progress.total} 节点` : '',
@@ -494,10 +539,14 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
           <span className="tnum min-w-0 shrink truncate text-2xs text-dim">{tags.join(' · ')}</span>
         )}
         {tier && (
-          // 出具档位也挂在吸顶的头上：往下翻到报告中段时，"这份结论能不能当真"还看得见
-          <span className="shrink-0 rounded px-1 text-2xs font-medium"
+          // 出具档位也挂在吸顶的头上：往下翻到报告中段时，"这份结论能不能当真"还看得见。
+          // 降档、不予出具带个警示形状，只靠颜色的话色弱的人读不出它和「完整出具」的差别
+          <span data-head-tier={tier}
+                className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-2xs font-medium"
+                title={TIER_META[tier]?.hint}
                 style={{ color: TIER_META[tier]?.color ?? 'var(--st-waiting)',
                          background: TIER_META[tier]?.soft ?? 'var(--st-waiting-soft)' }}>
+            {tier !== 'formal' && <AlertTriangle size={10} aria-hidden />}
             {issuanceLabel(tier)}
           </span>
         )}
@@ -514,7 +563,9 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
             {shortId(turn.runId)}
           </Link>
         )}
-        <span className="sr-only" role="status" aria-live="polite">{`${base}${verdict ? `，${verdict}` : ''}`}</span>
+        <span className="sr-only" role="status" aria-live="polite">
+          {`${base}${verdict ? `，${verdict}` : ''}${tier ? `，${issuanceLabel(tier)}` : ''}`}
+        </span>
       </div>
       {live && progress.current && (
         <div className="mt-0.5 truncate pl-[21px] text-2xs text-dim" title={progress.current.title}>
@@ -636,8 +687,8 @@ function StepSection({ label, steps, turn, defaultOpen, titled = true }: {
  * 「→ 已放行」已经说过了，而且步骤按节点归并之后它的位置也对不上真实的先后
  */
 const redundant = (s: Step): boolean =>
-  s.kind === 'lifecycle' && (s.title.startsWith('开始执行') || s.title === '完成' || s.title === '已取消'
-    || (s.title === '继续执行' && !s.sub))
+  s.kind === 'lifecycle' && (s.title.startsWith('开始执行') || s.title === '完成'
+    || ((s.title === '已取消' || s.title === '继续执行') && !s.sub))
 
 /** 这一轮一共跑了多久，给耗时细条当分母 */
 function turnMs(turn: StreamTurn): number | undefined {
@@ -681,6 +732,110 @@ function ReviewNote({ review }: { review: ReviewResult }) {
           </ul>
         </details>
       )}
+    </div>
+  )
+}
+
+/** 拆好的一处报错：发生了什么、为什么、怎么办、该去哪儿改、原文 */
+interface Failure {
+  title: string
+  reason?: string
+  action?: string
+  raw?: string
+  fix?: FixKind | 'rerun'
+}
+
+/** 这一轮是不是一次运行。Copilot 建图、发起就失败的，不能按运行的失败去讲（「接着跑」无从谈起） */
+const isRunTurn = (turn: StreamTurn): boolean =>
+  !!turn.runId || turn.steps.some((s) => s.stage !== 'plan')
+
+function failureOf(turn: StreamTurn): Failure | null {
+  const e = turn.error
+  if (!e) return null
+  if (typeof e === 'object' && 'title' in e) {
+    return { title: e.title, reason: e.reason, action: e.hint, raw: e.detail || undefined, fix: e.fix }
+  }
+  const text = typeof e === 'string' ? e : e.error
+  const detail = typeof e === 'string' ? undefined : e.detail
+  const hint = typeof e === 'string' ? undefined : e.hint
+  // 运行的失败和记录页、问数据页读同一份「为什么 + 怎么办」：同一次失败三处说法不一，
+  // 人就不知道该信哪句、该点哪个按钮
+  if (!hint && isRunTurn(turn)) {
+    const x = explainRunError(text, detail)
+    return { title: x.title, reason: x.reason, action: x.action, fix: x.fix,
+             raw: x.raw && x.raw !== x.title ? x.raw : undefined }
+  }
+  const h = humanizeError(hint || detail ? { error: text, hint, detail } : text)
+  return { title: h.title, reason: h.reason, action: h.action, raw: h.raw && h.raw !== h.title ? h.raw : undefined }
+}
+
+/**
+ * 下一步的直达入口。要去画布上改的，编排页能直接打开那个节点的设置；别处只说该去哪儿，
+ * 不装作能点。「接着跑」「重新运行」由页面自己放（renderTurnActions），这里不给
+ */
+function FixAction({ fix, nodeId, label }: { fix?: FixKind | 'rerun'; nodeId?: string; label?: string }) {
+  const { onOpen } = useContext(Ctx)
+  const cls = 'inline-flex shrink-0 items-center gap-1 rounded px-1 text-2xs text-[var(--accent)] underline-offset-2 transition-colors hover:bg-hover hover:underline'
+  if (fix === 'canvas' && nodeId && onOpen) {
+    return (
+      <button type="button" className={cls} data-fix="canvas" onClick={() => onOpen(nodeId)}>
+        <Settings2 size={10} aria-hidden /> 打开{label ? `「${label}」的` : ''}设置
+      </button>
+    )
+  }
+  if (fix === 'settings') {
+    return <Link to="/settings/providers" className={cls} data-fix="settings"><Settings2 size={10} aria-hidden /> 去模型接入</Link>
+  }
+  if (fix === 'tools') {
+    return <Link to="/tools" className={cls} data-fix="tools"><Wrench size={10} aria-hidden /> 去工具库</Link>
+  }
+  return null
+}
+
+/**
+ * 轮次级的报错。样子和 ErrorState 的 compact 版一致，但先把话讲清再画：运行的失败走
+ * lib/explain（模型没真调工具、团队轮数用完这类，给的是「去画布改」而不是「接着跑」），
+ * 页面拆好的照原样，其余交给 humanizeError。出错的是哪个节点也写在这里，点一下画布取景
+ */
+function TurnError({ turn }: { turn: StreamTurn }) {
+  const { onFocus } = useContext(Ctx)
+  const f = useMemo(() => failureOf(turn), [turn])
+  if (!f) return null
+  // run.failed 那一行定位得到节点就用它（它在流里已经不单列了），否则第一个失败的节点
+  const rf = findFirst(turn.steps, (s) => s.kind === 'error' && s.id.startsWith('rf-') && !!s.nodeId)
+  const node = findFirst(turn.steps, (s) => s.kind === 'node' && s.status === 'failed' && !!s.nodeId)
+  const whereId = rf?.nodeId ?? node?.nodeId
+  const whereLabel = rf?.sub?.replace(/^出错的节点：/, '') || node?.title
+  return (
+    <div role="alert" data-turn-error=""
+         className="mt-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs"
+         style={{ borderColor: 'color-mix(in srgb, var(--st-failed) 35%, var(--border))',
+                  background: 'color-mix(in srgb, var(--st-failed) 6%, transparent)' }}>
+      <AlertCircle size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--st-failed)' }} aria-hidden />
+      <div className="min-w-0 flex-1">
+        <div className="font-medium text-fg [overflow-wrap:anywhere]">{f.title}</div>
+        {whereId && whereLabel && (
+          onFocus
+            ? (
+              <button type="button" className="mt-0.5 text-2xs text-dim underline-offset-2 hover:text-fg hover:underline"
+                      title="在画布上定位这个节点" onClick={() => onFocus(whereId)}>
+                出错的节点：「{whereLabel}」
+              </button>
+            )
+            : <div className="mt-0.5 text-2xs text-dim">出错的节点：「{whereLabel}」</div>
+        )}
+        {f.reason && <div className="mt-0.5 leading-relaxed text-dim [overflow-wrap:anywhere]">{f.reason}</div>}
+        {f.action && (
+          <div className="mt-0.5 flex items-start gap-1 leading-relaxed text-dim">
+            <CornerDownRight size={11} className="mt-[3px] shrink-0" aria-hidden />
+            <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{f.action}</span>
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-x-2">
+          <FixAction fix={f.fix} nodeId={whereId} label={whereLabel} />
+        </div>
+        {f.raw && <div className="mt-1"><TechDetails raw={f.raw} /></div>}
+      </div>
     </div>
   )
 }
@@ -780,6 +935,11 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
   const expandable = !!(step.detail || result || step.raw || step.artifact)
   const table = result ? parseQueryResult(result) : null
   const status = step.status ?? 'done'
+  // 失败的节点：收着的时候就说为什么（和轮次顶上的报错同一份 lib/explain），展开再看原因、
+  // 怎么办和原话。以前这一行只有节点名和一个红叉，得点开才知道是没绑工具还是超时
+  const explained = useMemo(() => (step.kind === 'node' && status === 'failed' && step.detail
+    ? explainRunError(step.detail, step.raw) : null), [step.kind, status, step.detail, step.raw])
+  const sub = step.sub ?? explained?.title
 
   // 失败要压过 kind：一条 lifecycle 跑挂了还画成打勾的"完成"图标，是把失败说成了成功
   const failed = status === 'failed' || step.level === 'error'
@@ -818,6 +978,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
       style={running && reduced ? { borderColor: 'var(--st-running)' } : undefined}
       data-node-id={step.nodeId}
       data-step-status={failed ? 'failed' : status}
+      data-step-code={step.code}
       aria-busy={running || undefined}
     >
       <button
@@ -845,9 +1006,14 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
             running && !reduced && !step.children?.length && 'shimmer')}>
             {step.title}
           </span>
-          {step.sub && (
-            <span className="block truncate text-2xs italic leading-snug text-faint" title={step.sub}>
-              {step.sub}
+          {sub && (
+            // 副标题平时是淡色斜体的旁白（这次调用前在想什么、为什么跳过）；出了事的行
+            // 它说的是为什么，用正体、跟着行的颜色，别让最要紧的那句成了最淡的字
+            <span className={clsx('block truncate text-2xs leading-snug',
+                    failed || step.level === 'warn' ? 'not-italic' : 'italic text-faint')}
+                  style={failed ? { color: 'var(--st-failed)' } : step.level === 'warn' ? { color: 'var(--text-dim)' } : undefined}
+                  title={sub}>
+              {sub}
             </span>
           )}
         </span>
@@ -858,7 +1024,18 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
         )}
       </button>
 
-      {open && <StepDetail step={step} table={table} />}
+      {step.next && (
+        // 下一步不收进展开区：模型没真调工具、团队轮数用完这种，人要的就是这一句
+        <div data-step-next="" className="flex flex-wrap items-start gap-x-1.5 pl-[18px] text-2xs leading-snug text-dim">
+          <span className="flex min-w-0 flex-1 items-start gap-1">
+            <CornerDownRight size={10} className="mt-[2px] shrink-0" aria-hidden />
+            <span className="min-w-0 [overflow-wrap:anywhere]">{step.next}</span>
+          </span>
+          <FixAction fix={step.fix} nodeId={step.nodeId} />
+        </div>
+      )}
+
+      {open && <StepDetail step={step} table={table} explained={explained} />}
 
       {/* 泳道排在子步骤**前面**：先给一眼看清的形状（谁做了哪几轮、哪些是
           同时进行的、各花多久），再往下是每一步的内容。反过来的话，得把
@@ -908,7 +1085,7 @@ function StepMeta({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
       )}
       {/* 「开始执行」那一行的秒表和轮次头部的是同一个数，不重复 */}
       {running && step.startedAt != null && step.kind !== 'lifecycle'
-        ? <LiveClock since={step.startedAt} label={reduced ? '进行中' : undefined} />
+        ? <LiveClock since={step.startedAt} label={reduced ? '进行中' : undefined} limitS={step.limitS} />
         : (step.meta || STOPPED[step.status ?? '']) && !(running && step.startedAt != null) && (
           <span className={clsx('tnum mt-[1px] shrink-0 text-dim', dense ? 'text-[10px]' : 'text-2xs',
             step.meta && 'mono')}>
@@ -926,15 +1103,21 @@ const STOPPED: Record<string, string> = {
   suspended: statusLabel('suspended', { short: true }),
 }
 
-/** 进行中那一行的秒表。只有它订阅时钟，其余行不会跟着每 100ms 重画 */
-function LiveClock({ since, label }: { since: number; label?: string }) {
+/**
+ * 进行中那一行的秒表。只有它订阅时钟，其余行不会跟着每 100ms 重画。
+ * 带时限的工具越过上限就换成提醒色、说破「已超出」：引擎马上会放弃等待，秒表一声
+ * 不吭地接着走，看着像还有指望
+ */
+function LiveClock({ since, label, limitS }: { since: number; label?: string; limitS?: number }) {
   const { dense, skewMs } = useContext(Ctx)
   const now = useRunClock(true)
   const ms = Math.max(0, now - skewMs - since)
+  const over = limitS != null && ms > limitS * 1000
   return (
     <span className={clsx('mono tnum mt-[1px] shrink-0', dense ? 'text-[10px]' : 'text-2xs')}
-          style={{ color: 'var(--st-running)' }}>
-      {label ? `${label} · ` : ''}{formatClock(ms)}
+          style={{ color: over ? 'var(--st-waiting)' : 'var(--st-running)' }}
+          {...(over ? { 'data-over-limit': '', title: `这一步的时限是 ${formatNumber(limitS!)} s，到点会放弃等待` } : {})}>
+      {over ? `已超出 ${formatNumber(limitS!)} s 上限 · ` : label ? `${label} · ` : ''}{formatClock(ms)}
     </span>
   )
 }
@@ -1126,13 +1309,31 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
 }
 
 /** 展开区：跑的是什么（SQL、代码、参数）+ 跑出了什么 + 技术细节 + 完整证据 */
-function StepDetail({ step, table }: { step: Step; table: Table | null }) {
+function StepDetail({ step, table, explained }: {
+  step: Step; table: Table | null
+  /** 失败节点按 lib/explain 讲的为什么、怎么办 */
+  explained?: { reason?: string; action?: string; fix?: FixKind | 'rerun' } | null
+}) {
   const { openArtifact, dense } = useContext(Ctx)
   const pre = clsx('mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 leading-relaxed text-dim [overflow-wrap:anywhere]',
     dense ? 'text-[10.5px]' : 'text-2xs')
   const result = step.result
   return (
     <div className="mb-1 mt-1 space-y-1.5 pl-[18px]">
+      {explained && (explained.reason || explained.action) && (
+        <div className="space-y-0.5 text-2xs leading-relaxed text-dim" data-step-explain="">
+          {explained.reason && <div className="[overflow-wrap:anywhere]">{explained.reason}</div>}
+          {explained.action && (
+            <div className="flex flex-wrap items-start gap-x-1.5">
+              <span className="flex min-w-0 flex-1 items-start gap-1">
+                <CornerDownRight size={10} className="mt-[3px] shrink-0" aria-hidden />
+                <span className="min-w-0 [overflow-wrap:anywhere]">{explained.action}</span>
+              </span>
+              <FixAction fix={explained.fix} nodeId={step.nodeId} label={step.title} />
+            </div>
+          )}
+        </div>
+      )}
       {step.detail && (
         <div className="group/detail relative">
           {step.kind === 'query' && (
@@ -1211,12 +1412,29 @@ function TeamLanes({ team }: { team: TeamRun }) {
   const slowest = Math.max(1, ...team.rounds.flatMap((r) => r.members.map((m) => m.ms)))
   const parallelRounds = team.rounds.filter((r) => r.parallel > 1).length
   const liveRound = [...team.rounds].reverse().find((r) => r.members.some((m) => m.status === 'running'))
+  const verdict = teamVerdictOf(team)
+  // 一次都没派到的成员也占一行：团队「没做完」时，最该被看见的往往就是那个从没上过场的
+  const never = (verdict?.never ?? []).filter((n) => !team.members.includes(n))
+  const rounds = verdict?.rounds ?? team.rounds.length
+  const ending = verdict?.outcome === 'failed'
+    ? { text: `用完 ${rounds} 轮仍未完成`, color: 'var(--st-failed)' }
+    : verdict?.outcome === 'degraded'
+      ? { text: `用完 ${rounds} 轮仍未完成 · 按降档交付`, color: 'var(--st-waiting)' }
+    : verdict?.closing && verdict.done
+      ? { text: '轮数用完 · 调度者判定：已完成', color: 'var(--text-dim)' }
+    : verdict?.closing && verdict.done === false
+      ? { text: '轮数用完 · 调度者判定：未完成', color: 'var(--st-waiting)' }
+    // 还在判定。运行在这时停了（取消、失败）团队会被收成 finished，就不再说「在判定」
+    : verdict?.closing && !team.finished
+      ? { text: '轮数用完 · 调度者在判定…', color: 'var(--st-running)' }
+    : null
+  const laneLabel = clsx('shrink-0 truncate text-2xs text-dim', dense ? 'w-14' : 'w-20')
 
   return (
-    <div className="mt-2 rounded-lg border bg-bg p-2">
+    <div className="mt-2 rounded-lg border bg-bg p-2" data-team-lanes="">
       <div className="mb-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-2xs text-dim">
         <span className="flex items-center gap-1">
-          <Users size={11} aria-hidden /> {team.members.length} 名成员 · {team.rounds.length} 轮
+          <Users size={11} aria-hidden /> {team.members.length + never.length} 名成员 · {team.rounds.length} 轮
         </span>
         {liveRound && (
           <span style={{ color: 'var(--st-running)' }}>
@@ -1228,11 +1446,22 @@ function TeamLanes({ team }: { team: TeamRun }) {
             并行省下 {formatDuration(team.savedMs)}（{parallelRounds} 轮并行）
           </span>
         )}
-        {parallelRounds === 0 && team.finished && (
+        {parallelRounds === 0 && team.finished && !verdict?.outcome && (
           // 全程串行不是故障，但值得说一句——任务本来就互相依赖时它就该是串行的
           <span title="调度者每轮只派了一个人：后一步依赖前一步的结论">全程串行</span>
         )}
       </div>
+      {ending && (
+        // 怎么收的尾单独一行：只说「3 轮」的话，调度者说完成了和轮数用完硬停长得一样
+        <div className="-mt-1 mb-2 flex items-start gap-1 text-2xs font-medium leading-snug" style={{ color: ending.color }}
+             data-team-ending={verdict?.outcome ?? (verdict?.done ? 'done' : verdict?.done === false ? 'undone' : 'judging')}>
+          {verdict?.outcome && <AlertTriangle size={11} className="mt-[1px] shrink-0" aria-hidden />}
+          <span className="min-w-0 [overflow-wrap:anywhere]">
+            {ending.text}
+            {verdict?.reason && <span className="font-normal text-dim">：{verdict.reason}</span>}
+          </span>
+        </div>
+      )}
 
       <div className="space-y-1">
         {team.members.map((name) => (
@@ -1253,7 +1482,8 @@ function TeamLanes({ team }: { team: TeamRun }) {
                   : running ? 'var(--st-running)'
                   : 'var(--text-faint)'
                 const hatched = running || stopped
-                const said = running ? '进行中' : stopped ? statusLabel(m!.status, { short: true }) : formatDuration(m?.ms)
+                const said = running ? '进行中' : stopped ? statusLabel(m!.status, { short: true })
+                  : m?.status === 'failed' ? `失败 · ${formatDuration(m.ms)}` : formatDuration(m?.ms)
                 return (
                   <div key={r.round} className="min-w-0 flex-1 rounded-sm" style={{ background: 'var(--bg-hover)' }}>
                     {m ? (
@@ -1276,6 +1506,19 @@ function TeamLanes({ team }: { team: TeamRun }) {
                   </div>
                 )
               })}
+            </div>
+          </div>
+        ))}
+
+        {never.map((name) => (
+          <div key={`never-${name}`} className="flex items-center gap-1.5" data-never-dispatched={name}>
+            <div className={clsx(laneLabel, 'text-faint line-through decoration-dotted')} title={`${name}：一次都没被派到`}>
+              {name}
+            </div>
+            <div className="flex h-4 min-w-0 flex-1 items-center gap-1 rounded-sm border border-dashed px-1.5 text-2xs text-dim"
+                 style={{ borderColor: 'var(--border-strong, var(--border))' }}>
+              <UserX size={10} aria-hidden className="shrink-0" />
+              <span className="truncate">没派到：{rounds} 轮里调度者一次都没派给它</span>
             </div>
           </div>
         ))}
@@ -1304,17 +1547,21 @@ function TeamLanes({ team }: { team: TeamRun }) {
       {openKey && (() => {
         const [rd, name] = openKey.split(':')
         const m = team.rounds.find((r) => String(r.round) === rd)
-          ?.members.find((x) => x.agent === name)
+          ?.members.find((x) => x.agent === name) as TeamMemberEx | undefined
         if (!m) return null
         return (
           <div className="mt-2 rounded border bg-panel p-2 text-2xs leading-relaxed">
             <div className="mb-1 text-dim">
               {name} · 第 {Number(rd) + 1} 轮 · {m.status === 'running' ? '进行中'
                 : m.status === 'cancelled' || m.status === 'suspended' ? statusLabel(m.status, { short: true })
+                : m.status === 'failed' ? `失败 · ${formatDuration(m.ms)}`
                 : formatDuration(m.ms)}
             </div>
             {m.instruction && (
               <div className="mb-1.5 text-dim">任务：{m.instruction}</div>
+            )}
+            {m.error && (
+              <div className="mb-1.5 [overflow-wrap:anywhere]" style={{ color: 'var(--st-failed)' }}>为什么失败：{m.error}</div>
             )}
             {m.result && (
               <pre className="mono max-h-36 overflow-auto whitespace-pre-wrap text-dim">
@@ -1815,9 +2062,19 @@ export function IssuanceBanner({ issuance, runClass }: {
   const gaps: string[] = Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []
   const calibers: any[] = issuance?.calibers ?? []
   const matched = Number(issuance?.matched_numbers ?? 0)
+  // 逐个数字的出处（matched[].caliber 形如「口径名 @ v2」）：有它就能按卡数清楚，
+  // 不必只在「只有一张卡」时才敢说数字来自哪
+  const perCaliber = new Map<string, number>()
+  for (const m of Array.isArray(issuance?.matched) ? issuance.matched : []) {
+    if (m?.caliber) perCaliber.set(String(m.caliber), (perCaliber.get(String(m.caliber)) ?? 0) + 1)
+  }
+  const hitsOf = (c: any): number | undefined =>
+    perCaliber.get([c?.caliber, c?.version].filter(Boolean).join(' @ '))
 
   return (
-    <div className="rounded-lg border p-2" style={{ borderColor: meta.color }}>
+    // data-issuance-banner：画布上成果节点的出具印章据此滚过来；tabIndex 让「去看出具」能把焦点带到这里
+    <div className="scroll-mt-14 rounded-lg border p-2 outline-none data-[flash]:outline data-[flash]:outline-2 data-[flash]:outline-offset-1 data-[flash=focus]:outline-[color:var(--accent)]"
+         style={{ borderColor: meta.color }} data-issuance-banner={tier} tabIndex={-1}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="rounded px-1.5 py-px text-xs font-semibold" style={{ color: meta.color, background: meta.soft }}>
           ⚖ {issuanceLabel(tier)}
@@ -1864,15 +2121,18 @@ export function IssuanceBanner({ issuance, runClass }: {
         // 数字回指到哪张口径卡。后端目前只给「回指了几个」，没给逐个数字对哪张卡；
         // 只有一张卡时，回指上的数字必然来自它，可以直说
         <div className="mt-1.5 space-y-0.5 border-t pt-1.5 text-2xs text-dim">
-          {calibers.map((c: any) => (
-            <div key={c.node ?? c.caliber} className="flex items-center gap-1.5">
-              <FileCode size={10} aria-hidden className="shrink-0" />
-              <span>口径卡「{c.caliber}」<span className="mono">{c.version}</span></span>
-              {calibers.length === 1 && matched > 0 && (
-                <span style={{ color: 'var(--st-done)' }}>· 回指上的 {matched} 个数字都来自这张卡</span>
-              )}
-            </div>
-          ))}
+          {calibers.map((c: any) => {
+            const hits = hitsOf(c)
+            return (
+              <div key={c.node ?? c.caliber} className="flex items-center gap-1.5">
+                <FileCode size={10} aria-hidden className="shrink-0" />
+                <span>口径卡「{c.caliber}」<span className="mono">{c.version}</span></span>
+                {calibers.length === 1 && matched > 0 && (hits == null || hits === matched)
+                  ? <span style={{ color: 'var(--st-done)' }}>· 回指上的 {matched} 个数字都来自这张卡</span>
+                  : hits != null && <span className="tnum" style={{ color: 'var(--st-done)' }}>· 回指 {hits} 个数字</span>}
+              </div>
+            )
+          })}
         </div>
       )}
     </div>

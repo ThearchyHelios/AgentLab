@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import graph_error
+from app.core.errors import graph_error
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
 from app.db.base import get_session

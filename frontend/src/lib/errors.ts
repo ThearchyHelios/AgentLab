@@ -36,6 +36,8 @@ export const NETWORK_ERROR: Omit<HumanError, 'raw'> = {
 /** Python 异常类名前缀：「KeyError: 'x'」「sqlalchemy.exc.OperationalError: …」 */
 const PY_EXC_RE = /^(?:[a-z_][\w.]*\.)?([A-Z]\w*(?:Error|Exception|Exit|Timeout))\s*:\s*/
 
+const CJK_RE = /[一-鿿]/
+
 /**
  * network=false 用在「后端已经回了话」的文本上：那里面提到 fetch failed、
  * ECONNREFUSED，说的是后端够不着的下游（模型、数据库、MCP），不是我们连不上后端。
@@ -65,7 +67,9 @@ function fromText(text: string, { network = true }: { network?: boolean } = {}):
       raw,
     }
   }
-  if (/timed? ?out|timeout|超时/i.test(raw) && raw.length < 200) {
+  // 只接英文原文（「ReadTimeout: timed out」）。带中文的已经是后端写好的人话，
+  // 标题、原因、怎么办都在句子里：再套一个「操作超时」，标题和原因就说了两遍
+  if (!CJK_RE.test(raw) && /timed? ?out|timeout/i.test(raw) && raw.length < 200) {
     return { title: '操作超时', reason: raw.replace(PY_EXC_RE, ''), action: '稍后重试；反复超时就调大超时或检查下游服务。', raw }
   }
   // 类名前缀去掉，剩下的才是给人看的；类名留在 raw 里

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, Play, ShieldCheck } from 'lucide-react'
+import { ChevronDown, Play } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { isComposing, Kbd, Skeleton, Spinner, toast } from '../components/ui'
@@ -8,7 +8,7 @@ import { matchShortcut } from '../lib/keys'
 import { runClassLabel } from '../lib/terms'
 import { useStudio } from '../store/studio'
 import type { WorkflowVersion } from '../types'
-import { escapeRun, RunCapsule } from './RunHud'
+import { ClassDot, escapeRun, RunCapsule } from './RunHud'
 import { isActivePhase } from './trace'
 
 /**
@@ -177,7 +177,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
       {open && (
         <div className="sf-pop sheet-in" role="dialog" aria-label={runClassLabel('exploratory')} data-esc-layer>
           <div className="sf-pop-head">
-            <Play size={11} fill="currentColor" className="text-[var(--accent)]" />
+            <ClassDot formal={false} />
             <span>{runClassLabel('exploratory')}</span>
             <span className="sf-dim">· 用画布当前内容，结果不归档</span>
           </div>
@@ -262,8 +262,9 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
         title={`从已发布的 v${version} 发起${runClassLabel('formal')}，结果归档、可审计${ahead ? '。不含画布上的改动' : ''}`}
         onClick={() => setOpen((v) => !v)}
       >
-        {busy ? <Spinner size={11} /> : <ShieldCheck size={12} />}
-        {/* 窄屏上工具栏放不下全名：留盾牌和版本号，全名在 aria-label 和 title 里 */}
+        {/* 实心圆点是正式运行的记号（探索运行空心）；盾牌只留给发布等级，不再两处混用 */}
+        {busy ? <Spinner size={11} /> : <ClassDot formal />}
+        {/* 窄屏上工具栏放不下全名：留圆点和版本号，全名在 aria-label 和 title 里 */}
         <span aria-hidden><span className="hidden xl:inline">{runClassLabel('formal')} </span>v{version}</span>
         <ChevronDown size={10} className="hidden opacity-60 transition-transform xl:block"
                      style={{ transform: open ? 'rotate(180deg)' : 'none' }} />
@@ -272,7 +273,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
       {open && (
         <div className="sf-pop sheet-in" role="dialog" aria-label={label} data-esc-layer>
           <div className="sf-pop-head">
-            <ShieldCheck size={12} />
+            <ClassDot formal />
             <span>{label}</span>
             <span className="sf-dim">· 已发布的不可变版本，结果归档</span>
           </div>
@@ -298,7 +299,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           )}
           <button type="button" className="btn w-full justify-center sf-formal-go"
                   disabled={busy || fields == null} onClick={() => void launch()}>
-            {busy ? <Spinner size={11} /> : <ShieldCheck size={12} />} {label}
+            {busy ? <Spinner size={11} /> : <ClassDot formal />} {label}
           </button>
           {!!fields?.length && (
             <div className="mt-1.5 flex items-center gap-1 text-2xs text-faint">

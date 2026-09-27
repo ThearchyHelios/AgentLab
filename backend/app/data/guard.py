@@ -83,7 +83,8 @@ class SqlRejected(ValueError):
 class QueryLimits:
     max_rows: int = 1000
     max_bytes: int = 1_000_000
-    timeout_seconds: int = 30
+    #: 数据源可以在 options.query_timeout_s 里自己定（见 data.engine.query_timeout），可以带小数
+    timeout_seconds: float = 30
 
 
 def strip_comments(sql: str) -> str:

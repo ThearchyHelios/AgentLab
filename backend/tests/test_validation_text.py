@@ -173,7 +173,7 @@ async def test_resume_refusal_does_not_leak_the_status_enum(engine_up):
 
 
 def test_exception_wording_helper():
-    from app.engine.errors import describe_exception
+    from app.core.errors import describe_exception
 
     assert "query" in describe_exception(TypeError(RAW))
     assert "TypeError" not in describe_exception(TypeError(RAW))

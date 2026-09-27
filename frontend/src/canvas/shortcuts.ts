@@ -48,7 +48,9 @@ export const STUDIO_SHORTCUTS: StudioShortcut[] = [
   { id: 'delete', combo: 'Backspace', alt: ['Delete'], label: '删除选中的节点或连线', group: '编辑', passive: true },
 
   { id: 'focus', combo: 'F', label: '镜头对准选中的节点（运行中没有选中时：逐个对准要处理的节点）', group: '画布' },
-  { id: 'fit', combo: 'Shift+1', label: '缩放到看全所有节点', group: '画布' },
+  // 它回到打开时的取景（从入口看起，缩放不低于可读下限），不是「看全所有节点」：大图上
+  // 看全要把卡片缩到读不清。真要看全，用画布左下角的「适配全图」
+  { id: 'fit', combo: 'Shift+1', label: '重新取景（回到打开时的视角，从入口看起）', group: '画布' },
   { id: 'layout', combo: 'Shift+L', label: '自动排版', group: '画布' },
   { id: 'search', combo: '/', label: '搜索节点库', group: '画布' },
   { id: 'nextProblem', combo: 'F8', label: '跳到下一个问题', group: '画布' },

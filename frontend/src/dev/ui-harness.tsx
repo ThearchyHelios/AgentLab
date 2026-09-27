@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
-import { Inbox, Plus, Trash2, RefreshCw } from 'lucide-react'
+import { Database, Inbox, Plus, Trash2, RefreshCw } from 'lucide-react'
 import {
-  EmptyState, ErrorState, Field, IconButton, Kbd, Modal, OfflineBanner, Skeleton, StatusBadge,
-  StatusPill, Tabs, TabPanel, ToastHost, confirmDialog, promptDialog, toast,
+  DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Kbd, Modal, OfflineBanner, PageHeader,
+  SectionBar, Skeleton, StatusBadge, StatusPill, Tabs, TabPanel, ToastHost, confirmDialog, deferDelete,
+  promptDialog, toast, useRadioGroup, withoutDeferred,
 } from '../components/ui'
 import { ApiError, api } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
@@ -16,6 +17,8 @@ import * as status from '../lib/status'
 import * as keys from '../lib/keys'
 import * as terms from '../lib/terms'
 import * as errors from '../lib/errors'
+import * as explain from '../lib/explain'
+import * as health from '../lib/health'
 import '../index.css'
 
 /**
@@ -97,6 +100,63 @@ function LocalListDemo() {
         <button className="btn btn-sm ml-auto" id="local-list-reload" onClick={load}>重新拉取</button>
       </div>
       {runs && !runs.length && <EmptyState title="还没有运行记录" className="py-4" />}
+    </div>
+  )
+}
+
+const DEMO_ROWS = [
+  { id: 'orders', name: 'orders' }, { id: 'sales_daily', name: 'sales_daily' }, { id: 'hr_attendance', name: 'hr_attendance' },
+]
+const RADIO = ['service_name', 'sid', 'dsn'] as const
+
+/** 管理页共用件：页头、分节、连通胶囊、单选组、删除后可撤销 */
+function ManageKitDemo() {
+  const [rows, setRows] = useState(DEMO_ROWS)
+  const [mode, setMode] = useState<(typeof RADIO)[number]>('service_name')
+  const radio = useRadioGroup(RADIO, mode, setMode)
+  const [now] = useState(() => Date.now())
+  const reload = () => setRows(withoutDeferred(DEMO_ROWS, '/api/__harness__/rows'))
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="overflow-hidden rounded-lg border" id="page-header-demo">
+        <PageHeader icon={<Database size={13} />} title="数据" subtitle="接入的数据库和传上来的表格" actions={<button className="btn btn-sm">刷新</button>} />
+      </div>
+      <SectionBar title="数据库" hint="接入后助手编排时看得见这些库的结构">
+        <button className="btn btn-sm btn-primary"><Plus size={12} /> 接入数据库</button>
+      </SectionBar>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2" id="health-demo">
+        <HealthPill />
+        <HealthPill checkingSince={now - 1200} />
+        <HealthPill record={{ ok: true, ms: 42, at: now - 3 * 60_000 }} />
+        <HealthPill record={{ ok: false, at: now - 60 * 60_000, error: '连不上：端口没开' }} />
+        <HealthPill record={{ ok: true, ms: 380, at: 0 }} stale />
+        <HealthPill record={{ ok: false, at: 0, error: '连不上：认证没通过' }} />
+      </div>
+      <div role="radiogroup" aria-label="连接方式" className="flex gap-1" id="radio-demo">
+        {RADIO.map((v) => (
+          <button key={v} type="button" className={v === mode ? 'btn btn-sm btn-primary' : 'btn btn-sm'} {...radio(v)} onClick={() => setMode(v)}>
+            {v}
+          </button>
+        ))}
+      </div>
+      <ul className="flex flex-col gap-1 text-xs" id="defer-demo">
+        {rows.map((r) => (
+          <li key={r.id} className="flex items-center gap-2" data-row={r.id}>
+            <span className="mono flex-1">{r.name}</span>
+            <DeleteButton
+              label={`删除 ${r.name}`}
+              onClick={() => deferDelete({
+                what: `「${r.name}」`,
+                url: `/api/__harness__/rows/${r.id}`,
+                hide: () => setRows((l) => l.filter((x) => x.id !== r.id)),
+                restore: reload,
+                commit: () => Promise.resolve(),
+              })}
+            />
+          </li>
+        ))}
+      </ul>
+      <button className="btn btn-sm self-start" id="defer-reload" onClick={reload}>重拉列表</button>
     </div>
   )
 }
@@ -261,6 +321,14 @@ function Harness() {
                 action={<button className="btn btn-sm btn-primary"><Plus size={12} /> 新建工作流</button>}
               />
               <EmptyState title="没有匹配的工具" offline={false} className="py-4" />
+              <div id="empty-source-demo" className="border-t">
+                <EmptyState
+                  source="workflows"
+                  title="还没有工作流"
+                  className="py-4"
+                  action={<button className="btn btn-sm btn-primary" id="empty-source-action"><Plus size={12} /> 新建</button>}
+                />
+              </div>
             </Block>
             <Block title="出错 ErrorState">
               <ErrorState
@@ -313,6 +381,10 @@ function Harness() {
             </Block>
           </div>
 
+          <Block title="管理页共用件">
+            <ManageKitDemo />
+          </Block>
+
           <Block title="标签页 Tabs · 表单字段 Field">
             <Tabs
               label="示例标签"
@@ -339,7 +411,7 @@ function Harness() {
 ;(window as any).__ui = {
   toast, confirmDialog, promptDialog, useCatalog, ApiError, api,
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
-  lib: { format, status, keys, terms, errors },
+  lib: { format, status, keys, terms, errors, explain, health },
 }
 
 createRoot(document.getElementById('root')!).render(

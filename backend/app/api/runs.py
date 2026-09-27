@@ -172,9 +172,14 @@ async def start_run(
     return run
 
 
+#: workflow_id 取这个值时只要没挂在任何工作流上的运行：画布上没保存就跑的临时图，
+#: 以及工作流被删掉之后留下来的运行（外键是 SET NULL）
+UNSAVED = "__none__"
+
+
 @router.get("", response_model=list[RunOut])
 async def list_runs(
-    workflow_id: str | None = None,
+    workflow_id: str | None = Query(default=None, description=f"{UNSAVED} 表示没保存的工作流"),
     status: str | None = Query(default=None, description="逗号分隔，如 failed,cancelled"),
     run_class: str | None = None,
     q: str | None = Query(default=None, description="按工作流名模糊匹配"),
@@ -188,7 +193,9 @@ async def list_runs(
     筛选都走服务端，翻页用 created_at 做游标（before 传上一页最后一条的 created_at）。
     """
     stmt = select(Run).order_by(Run.created_at.desc()).limit(limit)
-    if workflow_id:
+    if workflow_id == UNSAVED:
+        stmt = stmt.where(Run.workflow_id.is_(None))
+    elif workflow_id:
         stmt = stmt.where(Run.workflow_id == workflow_id)
     if statuses := _csv(status):
         stmt = stmt.where(Run.status.in_(statuses))
@@ -283,13 +290,25 @@ async def list_artifacts(
 
 
 @router.post("/{run_id}/cancel")
-async def cancel_run(run_id: str) -> dict[str, Any]:
-    stopped = await run_manager.cancel(run_id)
-    if not stopped:
-        raise HTTPException(
-            409, "这次运行已经不在执行中（可能刚结束，或者服务重启过），不需要再停止。刷新看看最新状态"
-        )
-    return {"ok": True}
+async def cancel_run(run_id: str, x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """停止一次运行。status 是 stopping（正在执行的，取消已发出，稍后收到 run.cancelled）
+    或 cancelled（停在审批上、或服务重启挂起的，已经收成终态，待审批一并关闭）。"""
+    outcome = await run_manager.cancel(run_id, actor=actor_of(x_actor))
+    if outcome is None:
+        async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+        if run is None:
+            raise HTTPException(404, "运行记录不存在")
+        raise HTTPException(409, _cannot_cancel(run.status))
+    return {"ok": True, "status": outcome}
+
+
+def _cannot_cancel(status: str) -> str:
+    return {
+        "succeeded": "这次运行已完成，没有要停止的。",
+        "failed": "这次运行已经失败结束了，没有要停止的；要继续请用「接着跑」。",
+        "cancelled": "这次运行已经取消了。",
+    }.get(status, "这次运行已经不在执行中（可能刚结束，或者服务重启过），不需要再停止。刷新看看最新状态")
 
 
 class ResumeIn(BaseModel):

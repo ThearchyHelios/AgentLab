@@ -1,12 +1,14 @@
 /**
  * 校验问题 → 能定位的东西：哪一类（图级 / 节点 / 边）、哪个节点、节点里的哪个字段。
  *
- * 后端的 ValidationIssue 只带 node_id / edge_id，不带字段。可检查器要把消息落到具体
- * 输入框下面——「分支「协作」的条件写错了」只挂在面板顶上，人还得自己去找是第几个
- * case。这里按两条线索补上字段：
+ * 检查器要把消息落到具体输入框下面——「分支「协作」的条件写错了」只挂在面板顶上，人还得
+ * 自己去找是第几个 case。后端给了 field 就用它；老后端不给时按两条线索补上：
  *   1. 消息里带 {{ path }} 的（变量问题），去节点配置里找写着这个引用的字段；
  *   2. 其余按后端 schema.py 里那几句固定说法认（「跳过条件」「分支「X」的条件」……）。
- * 认不出来的就不认，留在面板顶部，不猜。后端哪天给了 field，优先用它。
+ * 认不出来的就不认，留在面板顶部，不猜。
+ *
+ * 例外是「提示词要求用 X，但没绑定」：后端的 field 指着点名的那句提示词，可修法在工具
+ * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import type { FlowNode } from '../store/studio'
 import type { ValidationIssue } from '../types'
@@ -59,6 +61,53 @@ function findText(config: Record<string, any>, needle: string): string | null {
   return walk(config, '')
 }
 
+/**
+ * 「提示词要求用「X」，但节点没有绑定它」这一类（后端 schema._check_named_tools）。
+ * 点了名的是 error，只是「提到了」的是 warning；笼统的「要求调用工具，但没有绑定任何工具」
+ * 没有点名。三种的修法都是去绑工具
+ */
+const NAMED_TOOL = /(?:要求用|提到了)「([^」]+)」，但/
+const VAGUE_TOOL = /要求调用工具，但(?:这个节点|这个成员)没有绑定任何工具/
+
+/** 这条问题要绑的是哪个工具。不是这一类、或者没有点名，返回 null */
+export function unboundToolOf(message: string): string | null {
+  return NAMED_TOOL.exec(message)?.[1] ?? null
+}
+
+/** 工具没绑的问题落到哪一栏：agent 的「可用工具」，或者那个成员的工具；协作目标点的名落到成员列表 */
+function toolBindingOf(issue: ValidationIssue, node: FlowNode): FieldRef | null {
+  if (!NAMED_TOOL.test(issue.message) && !VAGUE_TOOL.test(issue.message)) return null
+  const at = issue.field ? parseFieldPath(issue.field) : null
+  if (at?.key === 'agents' && at.index != null) return { key: 'agents', index: at.index, sub: 'tools' }
+  if (node.data.nodeType === 'supervisor') return { key: 'agents' }
+  if (node.data.nodeType === 'agent') return { key: 'tools' }
+  return at
+}
+
+const toolList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((t) => typeof t === 'string') : [])
+
+/**
+ * 一键绑定：把 tool 加进 at 指着的那一栏（agent 的 tools，或第 i 个成员的 tools），返回新的
+ * config。已经绑了、或者 at 指的不是工具栏，返回 null——按钮就不出现
+ */
+export function withToolBound(
+  config: Record<string, any>, at: FieldRef | null | undefined, tool: string,
+): Record<string, any> | null {
+  if (!at) return null
+  if (at.key === 'tools' && at.index == null) {
+    const cur = toolList(config.tools)
+    return cur.includes(tool) ? null : { ...config, tools: [...cur, tool] }
+  }
+  if (at.key === 'agents' && at.index != null && at.sub === 'tools' && Array.isArray(config.agents)) {
+    const member = config.agents[at.index]
+    if (!member || typeof member !== 'object') return null
+    const cur = toolList(member.tools)
+    if (cur.includes(tool)) return null
+    return { ...config, agents: config.agents.map((a: any, i: number) => (i === at.index ? { ...a, tools: [...cur, tool] } : a)) }
+  }
+  return null
+}
+
 /** 后端 schema.py 的固定说法 → 字段。顺序有讲究：具体的在前 */
 const RULES: [RegExp, string][] = [
   [/^跳过条件/, 'skip_if'],
@@ -74,9 +123,9 @@ const RULES: [RegExp, string][] = [
   [/代码把输出交给/, 'code'],
 ]
 
-export function fieldOfIssue(
-  issue: ValidationIssue & { field?: string | null }, node: FlowNode | undefined,
-): FieldRef | null {
+export function fieldOfIssue(issue: ValidationIssue, node: FlowNode | undefined): FieldRef | null {
+  const binding = node ? toolBindingOf(issue, node) : null
+  if (binding) return binding
   if (issue.field) return parseFieldPath(issue.field)
   if (!node) return null
   const config = node.data.config ?? {}

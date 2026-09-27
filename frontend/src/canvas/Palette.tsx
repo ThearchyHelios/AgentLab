@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { Lock, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_CATEGORIES, NODE_DEFS, type NodeDef } from './nodeDefs'
 import { hintOf } from './shortcuts'
-import { useStudio } from '../store/studio'
+import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { IconButton } from '../components/ui'
 import type { NodeType } from '../types'
 
@@ -25,9 +25,11 @@ const startDrag = (e: React.DragEvent, def: NodeDef) => {
 export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const [query, setQuery] = useState('')
   const addNode = useStudio((s) => s.addNode)
-  const locked = useStudio((s) => s.copilot.active)
+  // 助手在改、正式运行在跑：点了、拖了都落不下来，整块置灰并说清为什么
+  const lock = useEditLock()
+  const locked = lock != null
 
-  if (collapsed) return <Rail onToggle={onToggle} onAdd={(t) => addNode(t)} locked={locked} />
+  if (collapsed) return <Rail onToggle={onToggle} onAdd={(t) => addNode(t)} lock={lock} />
 
   const q = query.trim().toLowerCase()
   const defs = Object.values(NODE_DEFS).filter(
@@ -98,10 +100,17 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
           <div className="px-2 py-6 text-center text-2xs text-faint">没有匹配的节点</div>
         )}
       </div>
-      <div className="border-t px-3 py-2 text-2xs leading-relaxed text-faint">
-        拖到画布，或点击放在视野中间。<br />
-        从节点右侧圆点拖到另一个节点左侧即可连线。
-      </div>
+      {lock ? (
+        <div className="flex items-start gap-1.5 border-t px-3 py-2 text-2xs leading-relaxed text-dim" role="note">
+          <Lock size={11} className="mt-0.5 shrink-0" aria-hidden />
+          <span>{EDIT_LOCK_TEXT[lock]}</span>
+        </div>
+      ) : (
+        <div className="border-t px-3 py-2 text-2xs leading-relaxed text-faint">
+          拖到画布，或点击放在视野中间。<br />
+          从节点右侧圆点拖到另一个节点左侧即可连线。
+        </div>
+      )}
     </div>
   )
 }
@@ -125,22 +134,26 @@ function TypeIcon({ def, size = 20 }: { def: NodeDef; size?: number }) {
  * 收起后的图标轨。说明不用原生 title：原生提示要停一秒多才出来，而且只能一行灰字；
  * 这里悬停即浮出名字和一句话说明。浮层挂到 body 上，不被这一栏的滚动裁掉
  */
-function Rail({ onToggle, onAdd, locked }: {
-  onToggle: () => void; onAdd: (t: NodeType) => void; locked: boolean
+function Rail({ onToggle, onAdd, lock }: {
+  onToggle: () => void; onAdd: (t: NodeType) => void; lock: ReturnType<typeof useEditLock>
 }) {
+  const locked = lock != null
   const [tip, setTip] = useState<{ def: NodeDef; top: number; left: number } | null>(null)
   const show = (def: NodeDef, el: HTMLElement) => {
     const r = el.getBoundingClientRect()
     setTip({ def, top: r.top + r.height / 2, left: r.right + 8 })
   }
   return (
-    <div className="flex h-full flex-col items-center" aria-label="节点库（已收起）">
+    <div className="flex h-full flex-col items-center" aria-label="节点库（已收起）"
+         title={lock ? EDIT_LOCK_TEXT[lock] : undefined}>
       <div className="flex w-full justify-center border-b py-2">
         <IconButton label="展开节点库" title={hintOf('展开节点库', 'palette')} onClick={onToggle}
                     icon={<PanelLeftOpen size={13} />} />
       </div>
+      {/* 置灰的图标轨接不到悬停，也就没有说明可看：原因挂在外面那一层的 title 上 */}
       <div className={clsx('flex w-full flex-1 flex-col items-center gap-0.5 overflow-y-auto py-1.5',
         locked && 'pointer-events-none opacity-50')}
+           aria-disabled={locked || undefined}
            onMouseLeave={() => setTip(null)}>
         {NODE_CATEGORIES.map((category, ci) => (
           <div key={category} className="flex w-full flex-col items-center gap-0.5">

@@ -166,6 +166,14 @@ async def build_tools(
     return tools
 
 
+class ToolBuildError(ValueError):
+    """绑定的工具建不出来：它自己的配置写坏了（比如自定义工具的参数定义）。
+
+    message 直接给人看：是哪个工具、坏在哪、去哪里改。节点据此报一句清楚的错，
+    而不是让 schema 转换在半路炸出一句「'str' object has no attribute 'get'」。
+    """
+
+
 class ToolArgsError(ValueError):
     """工具参数对不上 schema。
 

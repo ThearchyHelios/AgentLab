@@ -20,7 +20,7 @@ import { AssistantPanel } from '../run/AssistantPanel'
 import { RunControl } from '../run/RunControl'
 import { useRunClock } from '../run/useRunClock'
 import { topology } from '../run/derive'
-import { useStudio, toGraph } from '../store/studio'
+import { EDIT_LOCK_TEXT, editLockOf, toGraph, useEditLock, useStudio } from '../store/studio'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
   EmptyState, ErrorState, IconButton, Spinner, isComposing, promptDialog, toast,
@@ -68,6 +68,9 @@ function matches(e: KeyboardEvent, combo: string): boolean {
     && !e.metaKey && !e.ctrlKey && !e.altKey
 }
 
+/** 改图的快捷键。正式运行期间按了要说为什么没反应，不能安静地什么都不做 */
+const EDIT_SHORTCUTS = new Set<StudioShortcutId>(['undo', 'redo', 'paste', 'duplicate', 'layout'])
+
 const PHASE_TEXT: Record<string, string> = {
   connecting: '正在连接模型',
   planning: '正在理解需求、规划步骤',
@@ -98,6 +101,8 @@ export function StudioPage() {
   const redoLabel = useStudio((s) => s.future[s.future.length - 1]?.label)
   const pendingNote = useStudio((s) => s.pendingNote)
   const copilotActive = useStudio((s) => s.copilot.active)
+  // 正式运行在跑已发布的版本：改图的按钮置灰（运行控制照常能用，停得下来）
+  const formalLock = useEditLock() === 'formal'
   // 动作逐个取：解构整个 store 会让这一页跟着每一次状态变化（运行时每个 token）重渲染
   const load = useStudio((s) => s.load)
   const save = useStudio((s) => s.save)
@@ -300,8 +305,9 @@ export function StudioPage() {
   }, [dirty])
 
   const relayout = useCallback(async () => {
-    const { nodes, edges, copilot } = useStudio.getState()
-    if (copilot.active || !nodes.length) return
+    const s = useStudio.getState()
+    const { nodes, edges } = s
+    if (editLockOf(s) || !nodes.length) return
     try {
       setGraph(await api.copilot.layout(toGraph(nodes, edges)))
       toast.ok('已重新排版', { key: 'studio:layout', action: { label: '撤销', onClick: () => useStudio.getState().undo() } })
@@ -329,11 +335,15 @@ export function StudioPage() {
     select(p.nodeId)
     focusNode(p.nodeId)
     if (p.field) {
-      // 检查器是跟着 selectedId 挂上的：等它渲染出来再滚
-      const key = p.field.key
+      // 检查器是跟着 selectedId 挂上的：等它渲染出来再滚。能落到第几项、项里的哪一栏
+      // （第 2 个成员的工具）就落到那儿：成员一多，只滚到「团队成员」还得自己往下找
+      const { key, index, sub } = p.field
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        const el = document.querySelector(`[data-field="${CSS.escape(key)}"]`)
-        el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+        const field = document.querySelector(`[data-field="${CSS.escape(key)}"]`)
+        const item = index != null ? field?.querySelector(`[data-item="${index}"]`) : null
+        const part = sub ? item?.querySelector(`[data-sub="${CSS.escape(sub)}"]`) : null
+        const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ;(part ?? item ?? field)?.scrollIntoView({ block: 'center', behavior: still ? 'auto' : 'smooth' })
       }))
     }
   }, [select, focusNode])
@@ -406,6 +416,11 @@ export function StudioPage() {
       if (!hit) return
       // 输入框里只放行保存和 F8：撤销、复制粘贴、⌥V 在那儿是给文字的
       if (isTypingTarget(e.target) && !hit.inInputs && hit.id !== 'nextProblem' && hit.id !== 'prevProblem') return
+      if (EDIT_SHORTCUTS.has(hit.id) && editLockOf(useStudio.getState()) === 'formal') {
+        e.preventDefault()
+        toast.warn(EDIT_LOCK_TEXT.formal, { key: 'studio:readonly' })
+        return
+      }
       if (run(hit.id)) e.preventDefault()
     }
     window.addEventListener('keydown', onKey)
@@ -418,6 +433,7 @@ export function StudioPage() {
     return (
       <EmptyState
         className="h-full"
+        source="workflows"
         title="还没有工作流"
         body="新建一张空白工作流，从模板开始，或者在右边用助手直接把想法生成出来。"
         action={<button className="btn btn-primary" onClick={() => void createWorkflow(navigate, refresh)}>
@@ -457,15 +473,18 @@ export function StudioPage() {
             半张图，运行跑的也是半张图，排版会被它的最终结果覆盖 */}
         <fieldset disabled={copilotActive} className="flex min-w-0 items-center gap-1.5">
           <div className="flex items-center">
-            <IconButton label="撤销" title={undoLabel ? `${hintOf('撤销', 'undo')}：${undoLabel}` : hintOf('撤销', 'undo')}
-                        disabled={!canUndo} onClick={undo} icon={<Undo2 size={13} />} />
-            <IconButton label="重做" title={redoLabel ? `${hintOf('重做', 'redo')}：${redoLabel}` : hintOf('重做', 'redo')}
-                        disabled={!canRedo} onClick={redo} icon={<Redo2 size={13} />} />
+            <IconButton label="撤销" title={formalLock ? EDIT_LOCK_TEXT.formal
+                          : undoLabel ? `${hintOf('撤销', 'undo')}：${undoLabel}` : hintOf('撤销', 'undo')}
+                        disabled={!canUndo || formalLock} onClick={undo} icon={<Undo2 size={13} />} />
+            <IconButton label="重做" title={formalLock ? EDIT_LOCK_TEXT.formal
+                          : redoLabel ? `${hintOf('重做', 'redo')}：${redoLabel}` : hintOf('重做', 'redo')}
+                        disabled={!canRedo || formalLock} onClick={redo} icon={<Redo2 size={13} />} />
           </div>
           <span className="h-4 w-px shrink-0" style={{ background: 'var(--border)' }} />
           <button
             className="btn shrink-0"
-            title="用自然语言生成或修改工作流（Copilot）"
+            title={formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流（Copilot）'}
+            disabled={formalLock}
             onClick={() => {
               select(null)   // 属性面板盖着的话先让开
               setHistory(false)
@@ -488,8 +507,9 @@ export function StudioPage() {
                       aria-pressed={history} disabled={!workflow}
                       className={clsx(history && 'bg-hover')} onClick={openHistory}
                       icon={<History size={12} />} />
-          <IconButton label="自动排版" title={hintOf('自动排版', 'layout')} variant="default"
-                      disabled={!nodeCount} onClick={() => void relayout()} icon={<LayoutGrid size={12} />} />
+          <IconButton label="自动排版" title={formalLock ? EDIT_LOCK_TEXT.formal : hintOf('自动排版', 'layout')}
+                      variant="default" disabled={!nodeCount || formalLock}
+                      onClick={() => void relayout()} icon={<LayoutGrid size={12} />} />
           <button className="btn shrink-0" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
                   title={dirty ? '先保存再发布' : '把当前版本立为已发布版本，正式运行只认它'}>
             <ShieldCheck size={12} /> <span className="@max-[1000px]:hidden">发布</span>
@@ -606,7 +626,7 @@ function WidthHandle({ width, onChange }: { width: number; onChange: (w: number)
  * 仍由 published_version 指着。以前只显示一个「草稿」，看不出正式运行其实还能跑、
  * 跑的是哪一版。
  */
-function VersionLabel({ workflow: w }: { workflow: Workflow & { published_by?: string | null } }) {
+function VersionLabel({ workflow: w }: { workflow: Workflow }) {
   const p = w.published_version
   // 画布就是已发布的那一版才算「在线」。老数据里有状态还挂着受管、版本却已经往前走了的
   // （旧的 restore 接口不退回草稿），那也得说清画布是草稿

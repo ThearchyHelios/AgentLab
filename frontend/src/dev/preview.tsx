@@ -11,7 +11,8 @@ import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
 import mdSamples from '../run/__tests__/markdown-samples.json'
 import {
-  COPILOT_STUCK, MIXED_OUTPUT, cancelledRun, longLoop, mixedRun, pipelineRun, teamRun,
+  COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
 
@@ -285,6 +286,53 @@ function synthetic(name: string): StreamTurn[] {
       return [{ id: 'schema', question: '看看有哪些人事表', phase: 'done', status: '已完成',
                 steps: decodeRun(ev, { status: 'succeeded' }) }]
     }
+    // ---- 平台问题的几种结局（NI-3/4/5）：失败的轮次把 run.failed 的原话交给流，和运行页、画布右栏一样
+    case 'exhausted':
+    case 'markup':
+    case 'repair': {
+      const ev = name === 'exhausted' ? exhaustedTeam('fail') : name === 'markup' ? markupRun() : repairRun()
+      const end = ev[ev.length - 1].data
+      return [{ id: name, question: '上月各区域订单额', phase: 'error', steps: decodeRun(ev), runId: `syn-${name}`,
+                error: { error: String(end.error), ...(end.detail ? { detail: end.detail } : {}) } }]
+    }
+    case 'exhausted-degrade': {
+      const ev = exhaustedTeam('degrade')
+      return [{ id: 'exhausted-degrade', question: '上月各区域订单额', phase: 'done', steps: decodeRun(ev),
+                output: { 结论: ev[ev.length - 1].data.output.结论, _issuance: {
+                  tier: 'degraded', calibers: [], metrics_checked: 0, matched_numbers: 0, unmatched_numbers: [],
+                  missing_required: [], missing_expected: [],
+                  gaps: ['协作团队「销售分析团队」用完 2 轮仍未完成，交来的是成员最后的原话'] } },
+                runId: 'syn-exhausted-degrade', runClass: 'exploratory' }]
+    }
+    case 'exhausted-closing': {
+      const ev = rebase(exhaustedTeam('closing'))
+      return [{ id: 'exhausted-closing', question: '上月各区域订单额', phase: 'running', steps: decodeRun(ev),
+                runId: 'syn-exhausted-closing' }]
+    }
+    case 'timeout-live': {
+      // 查询已经走了 34 秒，时限是 30 秒：秒表要说破「已超出上限」
+      const ev = rebase(timeoutRun('live'), 34000)
+      return [{ id: 'timeout-live', question: '把订单明细全拉出来', phase: 'running', steps: decodeRun(ev),
+                runId: 'syn-timeout-live' }]
+    }
+    case 'timeout':
+      return [{ id: 'timeout', question: '把订单明细全拉出来', phase: 'error', steps: decodeRun(timeoutRun('done')),
+                runId: 'syn-timeout', error: { error: '查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查' } }]
+    case 'abandoned':
+      return [{ id: 'abandoned', question: '把这份报表发出去', phase: 'done', statusCode: 'cancelled',
+                steps: decodeRun(abandonedRun()), runId: 'syn-abandoned' }]
+    case 'structured':
+      // 页面已经把报错拆好了（问数据页的 Failure）：照原样画，不再翻译一遍
+      return [{ id: 'structured', question: '上周各区域订单数', phase: 'error', steps: [],
+                error: { title: '操作超时', reason: '查询超时：数据库 90 秒没有返回', hint: '缩小时间范围后点「重试这一轮」',
+                         detail: 'OperationalError: (3024) maximum statement execution time exceeded' } }]
+    case 'restored':
+      // 从库里恢复的一轮：没有事件，查询次数由页面从落库的 meta 带过来
+      return [{ id: 'restored', question: '上周各区域订单数', phase: 'done', steps: [], queries: 3, elapsedMs: 8400,
+                output: { answer: '华东 1,204 单，华南 986 单，华北 731 单。' }, runId: 'syn-restored' }]
+    case 'tools-dropped':
+      return [{ id: 'tools-dropped', question: '只查上月的数据', phase: 'done', status: '已更新画布（修改 1）',
+                tone: 'warn', steps: decodeCopilot(COPILOT_TOOLS_DROPPED, { context: 'canvas' }) }]
     default:
       return []
   }

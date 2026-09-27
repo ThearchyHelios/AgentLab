@@ -3,6 +3,7 @@ import clsx from 'clsx'
 import { StatusBadge } from '../components/ui'
 import { formatClock, formatDuration, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
+import type { TeamMemberEx } from '../run/decode'
 import type { NodeTrace, Segment } from '../run/trace'
 import { useRunClock } from '../run/useRunClock'
 import type { TeamMember, TeamRound, TeamRun } from '../types'
@@ -63,6 +64,27 @@ interface Roster {
   description?: string
 }
 
+/**
+ * 轮数用完之后怎么收场。后端在最后一轮交回之后还会让调度者只判定、不派活地
+ * 看一次（agent.route.* 带 closing）：它说完成了就正常交付；没说完成，节点按
+ * 「用完轮数时」的配置失败或降档交付。这一次判定不是新的一轮，矩阵不给它加列
+ */
+export interface TeamEnding {
+  /**
+   * 收尾判定。open = 调度者还在判；at 是开始判定的时刻（agent.route.start），
+   * 矩阵据此认出哪一段调度是这次判定。老后端没有这一步
+   */
+  verdict?: { done: boolean; reason: string; open: boolean; at?: number }
+  /** 用完轮数仍未完成：fail 节点失败，degrade 降档交付（成果是成员最后的原话） */
+  exhausted?: 'fail' | 'degrade'
+  /** 调度者最后给的理由：收尾判定的，没有就取报错或产出里的 */
+  reason?: string
+  /** 后端点名的「一次都没被派到」的成员（报错原话、产出的 never_dispatched） */
+  never?: string[]
+  /** 报错、日志原话里的「用完 N 轮」：配置里的最多轮数可能在运行之后改过 */
+  rounds?: number
+}
+
 interface Props {
   roster: Roster[]
   /** 还没跑过就没有：这时矩阵就是花名册 */
@@ -79,6 +101,18 @@ interface Props {
   maxParallel?: number
   /** 服务端时钟偏差，实时计时要扣掉 */
   skewMs?: number
+  ending?: TeamEnding
+  /** 成员失败的原因（agent.step.end 的 error），按名字 */
+  memberErrors?: Record<string, string>
+}
+
+/**
+ * 真正派过活的轮次。调度者的理由按轮记，收尾判定那一次（round = 上限）也会记下
+ * 一条只有理由、没有成员的「轮」——它不是一轮协作，不能让表头写成「第 5 轮 / 上限 4」
+ */
+function worked(team: TeamRun | undefined): TeamRun | undefined {
+  if (!team || team.rounds.every((r) => r.members.length)) return team
+  return { ...team, rounds: team.rounds.filter((r) => r.members.length) }
 }
 
 /** 当前该看哪一轮：有在跑的就看那一轮，否则看最后一轮 */
@@ -86,6 +120,24 @@ function currentRound(team: TeamRun | undefined) {
   if (!team?.rounds.length) return undefined
   const running = team.rounds.filter((r) => r.members.some((m) => m.status === 'running'))
   return running.length ? running[running.length - 1] : team.rounds[team.rounds.length - 1]
+}
+
+/**
+ * 这一段调度是不是轮数用完后的收尾判定。认事件（agent.route.* 带 closing，卡片折成
+ * verdict）：不拿轮次和配置里的「最多轮数」比——没配时后端按缺省值跑，运行之后还可能
+ * 改过（调大了再接着跑、回放历史运行），那样比出来的是错的。收尾判定是这一次执行里
+ * 最后一段调度，它开始之后的那段就是它
+ */
+const isClosing = (seg: Segment | undefined, verdict: TeamEnding['verdict']): boolean =>
+  !!seg && !!verdict && (verdict.at == null || seg.start >= verdict.at)
+
+/** 收尾判定的一句话。reason 太长的放悬停，表头只放得下结论 */
+export function verdictText(v: TeamEnding['verdict'], full = false): string {
+  if (!v) return ''
+  if (v.open) return '轮数用完 · 调度者在判定'
+  if (v.done) return full ? '轮数用完 · 调度者判定：已完成' : '轮数用完 · 判定已完成'
+  const why = v.reason.trim()
+  return full ? `轮数用完 · 调度者判定：未完成${why ? `（${why}）` : ''}` : '轮数用完 · 判定未完成'
 }
 
 /**
@@ -156,15 +208,16 @@ export function teamAt(team: TeamRun | undefined, trace: NodeTrace | undefined, 
  * 「2/3 在跑 · 第 2 轮」「调度中 · 第 2 轮」「共 3 轮 · 并行省下 28.4 s」
  * 进行中的把此刻的读数放前面：精简档缩到 0.4 倍以下时这一句放不全，截掉的该是轮次
  */
-export function teamBrief(team: TeamRun | undefined, trace: NodeTrace | undefined, live: boolean, at?: number | null): string {
-  team = teamAt(team, trace, at)
+export function teamBrief(team: TeamRun | undefined, trace: NodeTrace | undefined, live: boolean, at?: number | null,
+                          verdict?: TeamEnding['verdict']): string {
+  team = worked(teamAt(team, trace, at))
   const round = currentRound(team)
   const dispatch = lastSeg(trace, 'dispatch', undefined, at)
   const thinking = live && dispatch && dispatch.end == null
   if (!team?.rounds.length) return thinking ? '调度中' : live ? '进行中' : NONE
   const no = `第 ${(round?.round ?? 0) + 1} 轮`
   if (live) {
-    if (thinking) return `调度中 · ${no}`
+    if (thinking) return isClosing(dispatch, verdict) ? '轮数用完 · 收尾判定中' : `调度中 · ${no}`
     const running = round?.members.filter((m) => m.status === 'running').length ?? 0
     const size = round?.members.length ?? 0
     if (running) return `${running}/${size} 在跑 · ${no}`
@@ -192,8 +245,10 @@ function memberText(m: TeamMember | undefined, status = m?.status): string {
   return statusMeta(status).short
 }
 
-function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRounds, maxParallel, skewMs = 0 }: Props) {
-  const team = teamAt(final, trace, at)
+function TeamMatrixImpl({
+  roster, team: final, trace, live, replay, at, maxRounds, maxParallel, skewMs = 0, ending, memberErrors,
+}: Props) {
+  const team = worked(teamAt(final, trace, at))
   const round = currentRound(team)
   // 事件里出现过、但花名册里没有的名字也要显示。配置被人改过、或者调度者报了
   // 一个不存在的成员时，这里至少能看出"确实派过这么个人"
@@ -224,8 +279,16 @@ function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRound
       status,
       roundNo,
       hint: roster.find((r) => r.name === name)?.description,
+      // 原因按轮记在 reduceTeam 给的那一格上；老数据没有就用事件里捞到的最后一次
+      error: status === 'failed' ? (member as TeamMemberEx | undefined)?.error || memberErrors?.[name] : undefined,
     }
   })
+  // 轮数用完还没完成时，一次都没被派到的人要点出来：负责定稿的那个常常就在里面，
+  // 写「—」看着像它还没轮到，其实是整次协作都没用上它
+  const undone = !!ending?.exhausted || (!!ending?.verdict && !ending.verdict.open && !ending.verdict.done)
+  const never = undone && !live ? new Set(rows.filter((r) => !r.member).map((r) => r.name)) : null
+  // 悬停里的名单再并上后端点的名：花名册在运行之后被改过时，矩阵里可能已经没有那一行
+  const neverNamed = never ? [...new Set([...never, ...(ending?.never ?? [])])] : []
 
   // 条形按同一批数归一化，长短才可比
   const busiest = Math.max(1, ...rows.map((r) => (r.active ? r.member?.ms ?? 0 : 0)))
@@ -236,43 +299,66 @@ function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRound
   const dispatch = lastSeg(trace, 'dispatch', undefined, at)
   const thinking = live && !!dispatch && dispatch.end == null
   const decided = dispatch?.end != null ? dispatch.end - dispatch.start : undefined
+  const verdict = ending?.verdict
+  const closing = isClosing(dispatch, verdict)
   const dispatchRound = team?.rounds.find((r) => r.round === (dispatch?.iteration ?? 0) - 1)
   const dispatchNote = dispatch && !thinking
-    ? dispatchRound?.members.length ? `派 ${dispatchRound.members.length} 人` : '收尾'
+    ? closing ? '收尾判定' : dispatchRound?.members.length ? `派 ${dispatchRound.members.length} 人` : '收尾'
     : ''
+  // 用完了几轮：以报错、日志原话为准，配置里的数可能在运行之后改过
+  const usedUp = ending?.rounds ?? (maxRounds || team?.rounds.length)
 
   const width = widthOf(round)
   let headRight = ''
+  /** 表头右边这句的语气：用完轮数没完成时失败是红、降档是琥珀，别的安静 */
+  let headTone: 'err' | 'warn' | '' = ''
   if (!team) headRight = maxParallel ? `并发上限 ${maxParallel}` : ''
   else if (live) {
-    headRight = thinking ? '调度中'
+    headRight = thinking ? closing ? verdictText({ done: false, reason: '', open: true }) : '调度中'
       : width > 1 ? runningNow ? `本轮 ${width} 人并行 · ${runningNow} 人在跑` : `本轮 ${width} 人已交回`
         : runningNow ? '串行推进' : '等调度者'
+  } else if (ending?.exhausted) {
+    headRight = `用完 ${usedUp} 轮 · 未完成`
+    headTone = ending.exhausted === 'fail' ? 'err' : 'warn'
+  } else if (verdict && !verdict.open) {
+    headRight = verdictText(verdict)
+    headTone = verdict.done ? '' : 'warn'
   } else {
     headRight = unsettledNote(rows.filter((r) => r.active && r.member)
       .map((r) => ({ ...r.member!, status: r.status! })))
       || (width > 1 ? `${width} 人并行完成` : team.finished ? '已收尾' : '')
   }
+  const reason = ending?.reason || verdict?.reason || ''
+  const headTitle = ending?.exhausted || verdict
+    ? [
+        verdict ? verdictText(verdict, true) : `协作团队用完 ${usedUp} 轮仍未完成`,
+        ending?.exhausted === 'degrade' ? '按降档交付：成果是成员最后的原话，不是调度者认可的结论' : '',
+        ending?.exhausted === 'fail' ? '节点判为失败。可以调大「最多轮数」，或把「用完轮数时」改成降档交付' : '',
+        reason && !(verdict && !verdict.done && !verdict.open) ? `理由：${reason}` : '',
+        neverNamed.length ? `一次都没被派到：${neverNamed.join('、')}` : '',
+      ].filter(Boolean).join('\n')
+    : undefined
   // 省下多少只算整轮交齐的；有并行过但没交齐（失败、取消）的不能说成"全程串行"
   const serialOnly = !!team?.finished && !team.rounds.some((r) => widthOf(r) > 1)
 
   return (
     <div className={clsx('team-matrix', live && 'is-live')}>
-      <div className="team-head">
+      <div className="team-head" title={headTitle}>
         <span className="tnum">
           {team?.rounds.length
             ? `第 ${(round?.round ?? 0) + 1} 轮${maxRounds ? ` / 上限 ${maxRounds}` : ''}`
             : `花名册${maxRounds ? ` · 上限 ${maxRounds} 轮` : ''}`}
         </span>
         <span className="team-head-rule" />
-        <span>{headRight}</span>
+        <span className={clsx('team-head-right', headTone && `is-${headTone}`)}>{headRight}</span>
       </div>
 
       <div
         className={clsx('team-row team-row-dispatch', thinking && 'team-row-running', !dispatch && 'team-row-idle')}
         title={[
           '调度者：决定下一轮派谁、几个人同时做',
-          round?.reason ? `理由：${round.reason}` : '',
+          closing && verdict ? verdictText(verdict, true)
+            : round?.reason ? `理由：${round.reason}` : '',
           dispatch?.estimated ? '耗时由事件间隔推算' : '',
         ].filter(Boolean).join('\n')}
       >
@@ -283,19 +369,20 @@ function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRound
         </span>
         <span className="team-ms tnum">
           {thinking ? (
-            ticking ? <>思考 <LiveClock from={dispatch!.start} skewMs={skewMs} coarse /></>
-              : at != null ? `思考 ${stillClock(at - dispatch!.start)}` : '思考中'
+            ticking ? <>{closing ? '判定' : '思考'} <LiveClock from={dispatch!.start} skewMs={skewMs} coarse /></>
+              : at != null ? `${closing ? '判定' : '思考'} ${stillClock(at - dispatch!.start)}` : '思考中'
           ) : decided != null ? (
             `${dispatch?.estimated ? '≈' : ''}${formatDuration(decided)}${dispatchNote ? ` · ${dispatchNote}` : ''}`
           ) : NONE}
         </span>
       </div>
 
-      {rows.map(({ name, active, member, status, roundNo, hint }) => {
+      {rows.map(({ name, active, member, status, roundNo, hint, error }) => {
         const running = status === 'running'
         const done = status === 'done'
         const failed = status === 'failed'
         const open = running ? lastSeg(trace, 'member', name, at) : undefined
+        const unused = !!never?.has(name)
         return (
           <div
             key={name}
@@ -305,14 +392,17 @@ function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRound
               done && 'team-row-done',
               failed && 'team-row-failed',
               active && 'team-row-active',
-              !member && 'team-row-idle',
+              !member && !unused && 'team-row-idle',
+              unused && 'team-row-never',
               member && !active && 'team-row-past',
             )}
-            data-member-status={status ?? 'idle'}
+            data-member-status={unused ? 'never' : status ?? 'idle'}
             title={[
               hint,
               running && member?.instruction ? `在做：${member.instruction}` : '',
               member ? `第 ${roundNo + 1} 轮 · ${memberText(member, status)}` : '',
+              failed && error ? `原因：${error}` : '',
+              unused ? `用完 ${usedUp} 轮，一次都没被派到` : '',
             ].filter(Boolean).join('\n') || name}
           >
             <StatusBadge status={status ?? 'idle'} size={9} decorative />
@@ -332,7 +422,7 @@ function TeamMatrixImpl({ roster, team: final, trace, live, replay, at, maxRound
               {running && open && open.end == null && ticking
                 ? <LiveClock from={open.start} skewMs={skewMs} coarse />
                 : running && open && at != null ? stillClock(at - open.start)
-                : memberText(member, status)}
+                : unused ? '未派到' : memberText(member, status)}
             </span>
           </div>
         )

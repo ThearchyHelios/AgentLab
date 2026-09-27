@@ -42,14 +42,54 @@ try {
 const browser = await chromium.launch({ executablePath: CHROME })
 
 /**
+ * 上传进度靠浏览器的 xhr.upload 事件，而 page.route 拦下的请求 Chrome 一个进度事件
+ * 都不报（真请求会报，已实测）。所以在页面里替 XHR 报：发 /upload 时先报 40%，
+ * 0.7 秒后报发完，再真正 send（被 page.route 接住）。发之前 abort 的，照浏览器的
+ * 样子报一次 abort。只测界面怎么接这些事件，不碰后端
+ */
+function fakeUploadProgress() {
+  const open = XMLHttpRequest.prototype.open
+  const send = XMLHttpRequest.prototype.send
+  const abort = XMLHttpRequest.prototype.abort
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__url = String(url)
+    return open.call(this, method, url, ...rest)
+  }
+  XMLHttpRequest.prototype.abort = function () {
+    if (this.__pending) {
+      this.__pending = false
+      this.dispatchEvent(new ProgressEvent('abort'))
+      return
+    }
+    return abort.call(this)
+  }
+  XMLHttpRequest.prototype.send = function (body) {
+    if (!/\/upload(\?|$)/.test(this.__url ?? '')) return send.call(this, body)
+    const total = 2_000_000
+    const up = this.upload
+    this.__pending = true
+    const fire = (type, loaded) => up.dispatchEvent(new ProgressEvent(type, { lengthComputable: true, loaded, total }))
+    setTimeout(() => { if (this.__pending) fire('progress', 800_000) }, 50)
+    setTimeout(() => {
+      if (!this.__pending) return
+      this.__pending = false
+      fire('progress', total)
+      fire('load', total)
+      send.call(this, body)
+    }, 700)
+  }
+}
+
+/**
  * 开一页：GET 放行，写请求交给 handlers（按「METHOD 路径正则」匹配），没配的一律
  * 拦成 503——既不写库，也顺带检验「写失败有反馈」。所有原生对话框都算失败。
  */
-async function open(path, { handlers = [], theme = THEME, viewport = { width: 1280, height: 860 } } = {}) {
+async function open(path, { handlers = [], theme = THEME, viewport = { width: 1280, height: 860 }, uploadProgress = false } = {}) {
   const ctx = await browser.newContext({ viewport, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
   await ctx.addInitScript((t) => {
     try { localStorage.setItem('agentlab.theme', t); localStorage.removeItem('agentlab.health') } catch { /* noop */ }
   }, theme)
+  if (uploadProgress) await ctx.addInitScript(fakeUploadProgress)
   const page = await ctx.newPage()
   const sent = []
   const errors = []
@@ -85,6 +125,15 @@ const goto = async (page, path) => {
   await page.waitForTimeout(300)
 }
 const json = (data, status = 200) => (route) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
+/** 多久之前的服务器时间（后端列表里的 last_checked_at 就是这种带时区的 ISO） */
+const ago = (ms) => new Date(Date.now() - ms).toISOString()
+/** 等到条件成立或超时，返回最后一次的值 */
+const until = async (fn, ms = 8000, step = 200) => {
+  const end = Date.now() + ms
+  let v = await fn()
+  while (!v && Date.now() < end) { await new Promise((r) => setTimeout(r, step)); v = await fn() }
+  return v
+}
 const delayed = (ms, data, status = 200) => async (route) => { await new Promise((r) => setTimeout(r, ms)); return json(data, status)(route) }
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` }) }
 const text = (page) => page.locator('main').innerText()
@@ -135,8 +184,14 @@ for (const [path, title] of [['/tools', '工具'], ['/knowledge', '知识'], ['/
 console.log('\n=== 设置 · 模型接入 ===')
 {
   const p0 = providers[0]
+  // 后端记着上次测连接的结果（last_check_*）：第一张卡 3 小时前测过、没通过，其余没测过
+  const listed = providers.map((p, i) => (i === 0 ? {
+    ...p, last_checked_at: ago(3 * 3600_000), last_check_ok: false, last_latency_ms: null,
+    last_error: '鉴权没通过（401）：对方拒绝了这把密钥',
+  } : { ...p, last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null }))
   const { page, sent, natives, errors, close } = await open('/settings/providers', {
     handlers: [
+      [/^GET \/providers$/, json(listed)],
       [/^POST \/providers\/[^/]+\/test$/, delayed(300, { ok: true, latency_ms: 128, model: p0?.default_model ?? 'm', reply: 'pong' })],
       [/^POST \/providers\/test$/, json({ ok: false, error: '测试没通过：连不上对方的服务', hint: '核对地址和端口，确认服务已经启动', detail: 'OpenAIConnectionError: Connection error.' })],
       [/^POST \/providers\/models$/, json({ ok: true, models: ['qwen-max', 'qwen-plus'], url: 'x' })],
@@ -144,7 +199,14 @@ console.log('\n=== 设置 · 模型接入 ===')
   })
   if (p0) {
     const card = page.locator(`[data-provider="${p0.name}"]`)
-    check('卡片上的状态点说的是连通，没测过写「未测试」', (await card.locator('[data-health]').getAttribute('data-health')) === 'idle')
+    const first = await card.locator('[data-health]').innerText()
+    check('卡片初值是后端记着的上次结果：连不上 · 3 小时前测（换了浏览器也在）', /连不上.*3 小时前测/.test(first), first)
+    check('……原因也写在卡片上', (await card.innerText()).includes('对方拒绝了这把密钥'))
+    const p1 = providers[1]
+    if (p1) {
+      check('后端没测过的卡片写「未测试」',
+            (await page.locator(`[data-provider="${p1.name}"] [data-health]`).getAttribute('data-health')) === 'idle')
+    }
     const disabled = providers.find((p) => !p.enabled)
     if (disabled) {
       check('停用单独标「已停用」，不再借圆点表达',
@@ -155,7 +217,7 @@ console.log('\n=== 设置 · 模型接入 ===')
     check('测试中状态点在转、写已用时间', (await card.locator('[data-health]').getAttribute('data-health')) === 'checking')
     await page.waitForTimeout(600)
     const pill = await card.locator('[data-health]').innerText()
-    check('测完留在卡片上，写明是什么时候测的：已连通 · 128 ms · 刚测过', /已连通.*128 ms.*刚测过/.test(pill), pill)
+    check('本机刚测的比后端记的新，用本机的：已连通 · 128 ms · 刚测过', /已连通.*128 ms.*刚测过/.test(pill), pill)
     await shot(page, 'providers-tested')
     await page.getByRole('tab', { name: '运行环境' }).click()
     await page.waitForTimeout(300)
@@ -214,27 +276,45 @@ console.log('\n=== 设置 · 模型接入 ===')
 
 console.log('\n=== 设置 · 偏好 ===')
 {
-  const settings = await get('/settings')
+  // 设置读写都走假的一份：PUT 写进去，GET 读回来（主题的「已保存」是读回来核对过才写的）
+  let stored = await get('/settings')
   const { page, sent, natives, close } = await open('/settings/prefs', {
-    handlers: [[/^PUT \/settings$/, (route, { body }) => json({ ...settings, ...body.values })(route)]],
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => { stored = { ...stored, ...body.values }; return json(stored)(route) }],
+    ],
   })
+  const themeRadio = (label) => page.getByRole('radiogroup', { name: '主题' }).getByRole('radio', { name: label })
+  const checkedTheme = () => page.getByRole('radiogroup', { name: '主题' }).locator('[aria-checked="true"]').innerText()
   // 选一个和这次要截图的主题一致的值（浅色跑选「跟随系统」，上下文的 colorScheme
   // 是浅色）；它已经是选中的就先绕一下别的，点选中项不会发请求
   const [label, value] = THEME === 'dark' ? ['深色', 'dark'] : ['跟随系统', 'system']
-  const radio = page.getByRole('radio', { name: label })
-  if ((await radio.getAttribute('aria-checked')) === 'true') {
-    await page.getByRole('radio', { name: '浅色' }).click()
-    await page.waitForTimeout(300)
+  if ((await themeRadio(label).getAttribute('aria-checked')) === 'true') {
+    await themeRadio('浅色').click()
+    await page.waitForTimeout(400)
   }
-  await radio.click()
-  await page.waitForTimeout(400)
+  await themeRadio(label).click()
+  await page.waitForTimeout(500)
   const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)
   check('主题选中即保存，只 PUT ui 一组', !!put && Object.keys(put.body?.values ?? {}).join() === 'ui' && put.body.values.ui.theme === value,
         JSON.stringify(put?.body ?? {}).slice(0, 100))
-  check('主题旁显示「已保存」', (await page.locator('[data-theme-save]').innerText()).includes('已保存'))
+  check('主题旁显示「已保存」（读回来核对过）', (await page.locator('[data-theme-save]').innerText()).includes('已保存'))
   await page.waitForTimeout(1600)
   check('……约 1.6 秒后淡出，不一直挂着', await page.getByText('已保存', { exact: true }).count() === 0
         && await page.locator('[data-theme-save="saved"]').count() === 0)
+
+  // REQ：从导航（或 ⌘K）换主题时偏好页开着，选项要跟着变，不能还显示旧值
+  const resolvedBefore = await page.evaluate(() => {
+    const a = document.documentElement.getAttribute('data-theme')
+    return a === 'light' || a === 'dark' ? a : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+  })
+  await page.getByRole('button', { name: /^切换到(浅色|深色)主题$/ }).click()
+  await page.waitForTimeout(500)
+  const synced = await checkedTheme()
+  check('从导航换主题：偏好页的主题选项跟着变', synced.includes(resolvedBefore === 'dark' ? '浅色' : '深色'), synced)
+  await themeRadio(label).click()
+  await page.waitForTimeout(500)
+
   check('默认知识库是下拉，选项来自已有知识库',
         await page.locator('#pref-collection').evaluate((el) => el.tagName) === 'SELECT'
         && (await page.locator('#pref-collection option').allInnerTexts()).some((t) => t.startsWith(collections[0]?.collection ?? 'default')))
@@ -252,23 +332,71 @@ console.log('\n=== 设置 · 偏好 ===')
   await page.waitForTimeout(200)
   check('选「留下」就还在偏好页', page.url().endsWith('/settings/prefs'), page.url())
 
+  const putsBefore = sent.filter((s) => s.key === 'PUT /settings').length
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(250)
+  check('只改署名：存在本机就行，不发 PUT', sent.filter((s) => s.key === 'PUT /settings').length === putsBefore)
+  check('保存后说「已保存」', (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).includes('已保存'))
+  check('署名写进本机', await page.evaluate(() => localStorage.getItem('agentlab_actor')) === '检查脚本')
+  const initial = await page.locator('nav a[href="/settings/prefs"]').first().innerText().catch(() => '')
+  check('……导航底部的署名首字立刻换成「检」（同一个标签页也收得到）', initial.trim() === '检', initial)
+
+  await page.locator('#pref-confirm-hint').locator('xpath=ancestor::label//input').click()
   await page.getByRole('button', { name: /保存设置/ }).click()
   await page.waitForTimeout(400)
   const put2 = sent.filter((s) => s.key === 'PUT /settings').at(-1)
-  check('保存设置只 PUT run 一组', Object.keys(put2?.body?.values ?? {}).join() === 'run', JSON.stringify(put2?.body ?? {}).slice(0, 100))
-  check('保存后说「已保存」', (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).includes('已保存'))
-  check('署名跟着保存写进本机', await page.evaluate(() => localStorage.getItem('agentlab_actor')) === '检查脚本')
+  check('改了运行默认值：保存只 PUT run 一组', Object.keys(put2?.body?.values ?? {}).join() === 'run', JSON.stringify(put2?.body ?? {}).slice(0, 100))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   await close()
 
   // 保存失败要看得见（以前 pageerror 一条，界面毫无变化）
   const failing = await open('/settings/prefs')
   await failing.page.locator('#pref-actor').fill('x')
+  await failing.page.locator('#pref-confirm-hint').locator('xpath=ancestor::label//input').click()
   await failing.page.getByRole('button', { name: /保存设置/ }).click()
   await failing.page.waitForTimeout(600)
-  check('保存失败：条上写「没存上」', (await failing.page.locator('[data-prefs-bar]').innerText()).includes('没存上'))
+  const bar = await failing.page.locator('[data-prefs-bar]').innerText()
+  check('保存失败：条上写「没存上」', bar.includes('没存上'))
+  check('……署名只在本机，已经存上了；条上只剩危险工具审批一项', bar.includes('有 1 项未保存') && bar.includes('危险工具审批') && !bar.includes('署名'), bar.replace(/\s+/g, ' '))
   check('保存失败不抛未捕获异常', failing.errors.length === 0, failing.errors[0] ?? '')
   await failing.close()
+
+  // 断线时在偏好页换的主题：先在本机生效，恢复后自动补存，而不是被服务端的旧值翻回去。
+  // 断线要断得像真的：/health 也够不着，catalog 才会判断开、恢复时才算「重连」
+  let offline = false
+  let puts = 0
+  let stored2 = await get('/settings')
+  const cut = (route) => route.abort('internetdisconnected')
+  const off = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => (offline ? cut(route) : json(stored2)(route))],
+      [/^PUT \/settings$/, (route, { body }) => {
+        puts++
+        if (offline) return cut(route)
+        stored2 = { ...stored2, ...body.values }
+        return json(stored2)(route)
+      }],
+      [/^GET \//, (route) => (offline ? cut(route) : route.continue())],
+    ],
+  })
+  const offRadio = (l) => off.page.getByRole('radiogroup', { name: '主题' }).getByRole('radio', { name: l })
+  const target = (await offRadio('浅色').getAttribute('aria-checked')) === 'true' ? ['深色', 'dark'] : ['浅色', 'light']
+  offline = true
+  await offRadio(target[0]).click()
+  await off.page.waitForTimeout(800)
+  check('断线时换主题：说清先在本机生效、连上后自动存', (await off.page.locator('body').innerText()).includes('连上后端后自动存进设置'))
+  check('……选项和页面都已经是新主题', (await offRadio(target[0]).getAttribute('aria-checked')) === 'true'
+        && await off.page.evaluate(() => document.documentElement.getAttribute('data-theme')) === target[1])
+  const down = await until(() => off.page.locator('[data-offline-banner]').count().then((n) => n > 0), 6000)
+  check('……整站也判了断开（横幅出来了）', !!down)
+  const putsOffline = puts
+  offline = false
+  await until(() => stored2?.ui?.theme === target[1], 20000)
+  await off.page.waitForTimeout(400)
+  check('……后端恢复后自动补存这个主题', puts > putsOffline && stored2?.ui?.theme === target[1], `PUT ${puts} 次，存的是 ${stored2?.ui?.theme}`)
+  check('……没有被服务端的旧值翻回去', await off.page.evaluate(() => document.documentElement.getAttribute('data-theme')) === target[1]
+        && (await offRadio(target[0]).getAttribute('aria-checked')) === 'true')
+  await off.close()
 }
 
 console.log('\n=== 数据 · 数据库 ===')
@@ -276,22 +404,50 @@ console.log('\n=== 数据 · 数据库 ===')
   const dbs = sources.filter((s) => !/[\\/]uploads[\\/]tables[\\/]/.test(s.database ?? ''))
   const first = dbs.find((s) => s.table_count > 0) ?? dbs[0]
   const oracle = dbs.find((s) => s.kind === 'oracle')
-  // 一个配置里的 schema 探不出对象的假库：只有这种库才给「换个 schema 探查」。
-  // 顺带是个免密库（has_password:false），验证密码不再拦保存
+  const noCheck = { last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null }
+  // 假库一：配置里的 schema 探不出对象；后端记着 2 小时前测连接没通过。顺带是个免密库
+  // （has_password:false），验证密码不再拦保存
   const empty = {
     id: 'check-manage-empty', name: 'zz_probe', kind: 'postgres', host: '10.0.0.9', port: null, database: 'mes',
-    username: 'reader', options: { schema: 'ods' }, readonly: true, description: '检查脚本的假库', enabled: true,
-    password_masked: '', has_password: false, table_count: 0, schema_synced_at: null,
+    username: 'reader', options: { schema: 'ods', sslmode: 'disable' }, readonly: true, description: '检查脚本的假库', enabled: true,
+    password_masked: '', has_password: false, table_count: 0, schema_synced_at: null, cached_schema: 'ods',
     schema_error: 'NoSuchTableError: ods', available_schemas: ['mes', 'ods', 'public'], tools: ['db_query__zz_probe'],
+    last_checked_at: ago(2 * 3600_000), last_check_ok: false, last_latency_ms: null, last_error: '连不上：认证失败',
   }
-  const probed = { ...empty, table_count: 3, schema_error: '', schema_synced_at: new Date().toISOString() }
+  // 假库二：配置改成了 sales，缓存还是按 legacy 探的——助手看到的和配置对不上
+  const drifted = {
+    ...empty, ...noCheck, id: 'check-manage-drift', name: 'zz_drift', options: { schema: 'sales' }, cached_schema: 'legacy',
+    table_count: 2, schema_error: '', available_schemas: [], schema_synced_at: ago(3600_000), tools: ['db_query__zz_drift'],
+  }
+  let cur = empty
+  let drift = drifted
   const { page, sent, natives, errors, close } = await open('/data/databases', {
     handlers: [
-      [/^GET \/datasources$/, json([...sources, empty])],
-      [/^GET \/datasources\/check-manage-empty\/schema$/, json({ tables: ['mes.work_order', 'mes.line', 'mes.shift'], summary: '', synced_at: probed.schema_synced_at })],
-      [/^POST \/datasources\/check-manage-empty\/introspect$/, (route, { url }) =>
-        json(url.searchParams.get('schema') === 'mes' ? probed : empty)(route)],
-      [/^PATCH \/datasources\/check-manage-empty$/, (route, { body }) => json({ ...empty, ...body, options: body?.options ?? empty.options })(route)],
+      [/^GET \/datasources$/, (route) => json([...sources, cur, drift])(route)],
+      [/^GET \/datasources\/check-manage-empty\/schema$/, json({ tables: ['mes.work_order', 'mes.line', 'mes.shift'], summary: '', synced_at: ago(0) })],
+      [/^GET \/datasources\/check-manage-drift\/schema$/, json({ tables: ['sales.orders', 'sales.sales_daily'], summary: '', synced_at: ago(0) })],
+      [/^POST \/datasources\/check-manage-empty\/introspect$/, (route, { url }) => {
+        const schema = url.searchParams.get('schema')
+        if (url.searchParams.get('dry_run') === 'true') {
+          return json(schema === 'mes'
+            ? { dry_run: true, schema: 'mes', table_count: 3, tables: ['mes.work_order', 'mes.line', 'mes.shift'], truncated: false, total: 3, schema_error: '', available_schemas: empty.available_schemas }
+            : { dry_run: true, schema, table_count: 0, tables: [], truncated: false, total: 0, schema_error: '', available_schemas: empty.available_schemas })(route)
+        }
+        const hit = cur.options.schema === 'mes'
+        cur = { ...cur, cached_schema: cur.options.schema ?? '', table_count: hit ? 3 : 0, schema_error: hit ? '' : empty.schema_error,
+                schema_synced_at: hit ? ago(0) : cur.schema_synced_at }
+        return json(cur)(route)
+      }],
+      [/^POST \/datasources\/check-manage-drift\/introspect$/, (route) => {
+        drift = { ...drift, cached_schema: drift.options.schema, schema_synced_at: ago(0) }
+        return json(drift)(route)
+      }],
+      // 后端的规矩：连接配置（地址、账号、库）改了，上次测连接的结果作废
+      [/^PATCH \/datasources\/check-manage-empty$/, (route, { body }) => {
+        const reconnect = ['host', 'port', 'database', 'username'].some((k) => k in (body ?? {}) && body[k] !== cur[k]) || 'password' in (body ?? {})
+        cur = { ...cur, ...body, options: body?.options ?? cur.options, ...(reconnect ? noCheck : {}) }
+        return json(cur)(route)
+      }],
       [/^POST \/datasources\/[^/]+\/test$/, delayed(250, { ok: true, elapsed_ms: 42, url: 'x' })],
       [/^POST \/datasources\/test$/, json({ ok: false, error: '连不上：认证失败', hint: '核对用户名和密码', detail: 'ORA-01017' })],
       [/^POST \/datasources\/[^/]+\/introspect/, (route, { url }) => {
@@ -332,7 +488,7 @@ console.log('\n=== 数据 · 数据库 ===')
       await rows.first().click()
       await page.waitForTimeout(800)
       const cols = await card.locator('[data-schema-browser] tbody tr').count()
-      check('点表名懒加载出逐列信息', cols > 0, `${cols} 列`)
+      check('点表名懒加载出逐列信息（后端给的结构化列）', cols > 0, `${cols} 列`)
       const scroller = card.locator('[data-schema-browser] .overflow-y-auto')
       await scroller.evaluate((el) => { el.scrollTop = 60 })
       const before = await scroller.evaluate((el) => el.scrollTop)
@@ -345,8 +501,9 @@ console.log('\n=== 数据 · 数据库 ===')
       await shot(page, 'datasource-schema')
     }
 
-    // 好好的库不给「换个 schema 探查」：后端探查会落进缓存，换着探就把助手看到的结构换掉了
-    check('结构正常的库不给「换个 schema 探查」', await card.locator('[data-probe-schema]').count() === 0)
+    // 「换个 schema 看看」只看不存，好好的库也给；单文件的 SQLite 没有 schema 可换
+    check(first.kind === 'sqlite' ? 'SQLite 不给「换个 schema 看看」' : '结构正常的库也能「换个 schema 看看」（只看不存，没有风险）',
+          await card.locator('[data-probe-schema]').count() === (first.kind === 'sqlite' ? 0 : 1))
 
     await card.getByRole('button', { name: `删除数据源 ${first.name}` }).click()
     const del = dialog(page)
@@ -358,40 +515,50 @@ console.log('\n=== 数据 · 数据库 ===')
   }
 
   {
-    // 配置里的 schema 探不出东西：才给「换个 schema 探查」
     const ec = page.locator(`[data-source="${empty.name}"]`)
-    check('探查失败的库给「换个 schema 探查」', await ec.locator('[data-probe-schema]').count() === 1)
+    const pill0 = await ec.locator('[data-health]').innerText()
+    check('卡片初值是后端记着的上次测连接：连不上 · 2 小时前测', /连不上.*2 小时前测/.test(pill0), pill0)
+    check('……原因写在卡片上', (await ec.innerText()).includes('认证失败'))
+
+    // 换个 schema 看看：只看不存（dry_run），缓存和配置都不动
+    check('探查失败的库给「换个 schema 看看」', await ec.locator('[data-probe-schema]').count() === 1)
     await ec.locator('[data-probe-schema]').click()
     const pd = dialog(page)
     const pdText = await pd.innerText()
-    check('……先说清楚：探到的结构会换掉缓存，不写进配置就换回来', pdText.includes('换掉') && pdText.includes('换回「ods」'), pdText.slice(0, 120))
+    check('……先说清楚：只看不存，缓存和配置都不动', pdText.includes('只看不存') && pdText.includes('缓存和配置都不动'), pdText.slice(0, 120))
     await pd.locator('input').fill('mes')
-    await pd.getByRole('button', { name: '探查', exact: true }).click()
+    await pd.getByRole('button', { name: '看看', exact: true }).click()
     await page.waitForTimeout(500)
     const probeReq = sent.filter((s) => s.key.endsWith('/introspect')).at(-1)
-    check('……请求带上指定的 schema', !!probeReq?.url.includes('schema=mes'), probeReq?.url ?? '')
+    check('……请求带上 schema 和 dry_run=true（不写缓存）', !!probeReq?.url.includes('schema=mes') && probeReq.url.includes('dry_run=true'), probeReq?.url ?? '')
     const ask = dialog(page)
     const askText = await ask.innerText().catch(() => '')
     check('……探到了再问要不要写进配置，并举出探到的表名', askText.includes('mes') && askText.includes('work_order'), askText.slice(0, 160))
+    check('……「不改」说的是什么都不动，不再「换回去」', askText.includes('什么都不动') && !askText.includes('换回'), askText.slice(0, 200))
     await shot(page, 'datasource-probe-schema')
-    const before = sent.filter((s) => s.key.endsWith('/introspect')).length
-    await ask.getByRole('button', { name: '不改，换回 ods' }).click()
+    const before = sent.length
+    await ask.getByRole('button', { name: '不改', exact: true }).click()
     await page.waitForTimeout(500)
-    const restore = sent.filter((s) => s.key.endsWith('/introspect')).slice(before)
-    check('……不改：马上按配置里的 schema 重探一次，缓存和配置对得上',
-          restore.length === 1 && !restore[0].url.includes('schema='), restore.map((r) => r.url).join(' | '))
-    check('……不改就不发 PATCH', !sent.some((s) => s.key.startsWith('PATCH /datasources')))
-    check('……卡片回到配置里那份（探查失败、0 个对象）', (await ec.innerText()).includes('上次探查失败'))
+    check('……不改：一个请求都不再发（以前要再探一次把缓存换回来）', sent.length === before, sent.slice(before).map((r) => r.url).join(' | '))
+    check('……卡片还是配置里那份（探查失败、0 个对象）', (await ec.innerText()).includes('上次探查失败'))
 
-    // 失败框里的候选 chip：探到了选「改」就写进配置
-    await ec.getByRole('button', { name: '用 mes 探查' }).click()
+    // 失败框里的候选 chip：探到了选「改」就写进配置，再按新配置真探一次
+    await ec.getByRole('button', { name: '看看 mes' }).click()
     await page.waitForTimeout(500)
     await dialog(page).getByRole('button', { name: '改成 mes' }).click()
-    await page.waitForTimeout(400)
+    await page.waitForTimeout(600)
     const patch = sent.filter((s) => s.key === 'PATCH /datasources/check-manage-empty').at(-1)
-    check('……选「改成 mes」：PATCH 写进 options.schema', patch?.body?.options?.schema === 'mes', JSON.stringify(patch?.body ?? {}))
+    check('……选「改成 mes」：PATCH 写进 options.schema，别的连接参数原样带上',
+          patch?.body?.options?.schema === 'mes' && patch?.body?.options?.sslmode === 'disable', JSON.stringify(patch?.body ?? {}))
+    const real = sent.filter((s) => s.key.endsWith('check-manage-empty/introspect')).at(-1)
+    check('……再按新配置真探一次（不带 dry_run）', !!real && !real.url.includes('dry_run') && !real.url.includes('schema='), real?.url ?? '')
+    const ecText = await ec.innerText()
+    check('……卡片换成新 schema 的结构', /3\s*个对象/.test(ecText) && !ecText.includes('上次探查失败'), ecText.replace(/\s+/g, ' ').slice(0, 160))
 
-    // 免密库：密码不拦保存
+    // 本机刚测的比后端记的新；只改说明不动它，改了连接配置就作废
+    await ec.getByRole('button', { name: /测连接/ }).click()
+    await page.waitForTimeout(500)
+    check('本机刚测过：卡片换成本机的结果', /已连通.*42 ms/.test(await ec.locator('[data-health]').innerText()))
     await ec.getByRole('button', { name: '编辑' }).click()
     const ed = dialog(page)
     await ed.getByLabel('说明', { exact: true }).fill('检查脚本的假库（改过说明）')
@@ -407,6 +574,24 @@ console.log('\n=== 数据 · 数据库 ===')
     const saved = sent.filter((s) => s.key === 'PATCH /datasources/check-manage-empty').at(-1)
     check('……保存时不带 password（不动它）', !!saved && !('password' in (saved.body ?? {})) && saved.body?.description?.includes('改过说明'),
           JSON.stringify(saved?.body ?? {}).slice(0, 120))
+    check('……只改说明：刚测的结果还作数', /已连通/.test(await ec.locator('[data-health]').innerText()))
+    await ec.getByRole('button', { name: '编辑' }).click()
+    await dialog(page).getByLabel(/主机/).fill('10.0.0.10')
+    await dialog(page).getByRole('button', { name: '保存' }).click()
+    await page.waitForTimeout(400)
+    const after = await ec.locator('[data-health]').innerText()
+    check('……换了主机：之前测的不再代表它，回到「未测试」', after.includes('未测试'), after)
+
+    // 缓存和配置对不上：常驻一行 warn，一键按配置重探
+    const dc = page.locator(`[data-source="${drifted.name}"]`)
+    const driftText = await dc.locator('[data-schema-drift]').innerText().catch(() => '')
+    check('缓存按 legacy 探、配置写着 sales：卡片上常驻一行说对不上', driftText.includes('legacy') && driftText.includes('sales'), driftText)
+    await shot(page, 'datasource-drift')
+    await dc.getByRole('button', { name: '按配置重新探查' }).click()
+    await page.waitForTimeout(500)
+    const re = sent.filter((s) => s.key === 'POST /datasources/check-manage-drift/introspect').at(-1)
+    check('……点「按配置重新探查」：按配置真探（不带 schema、不带 dry_run）', !!re && !re.url.includes('?'), re?.url ?? '')
+    check('……探完那行 warn 就消失', await dc.locator('[data-schema-drift]').count() === 0)
   }
 
   if (oracle) {
@@ -463,11 +648,21 @@ console.log('\n=== 数据 · 表格 ===')
     ] }],
   }
   const { page, sent, natives, close } = await open('/data/tables', {
+    uploadProgress: true,
     handlers: [
       [/^POST \/datasources\/upload$/, delayed(400, fake, 201)],
       // 传上来的表只有一两张，卡片会自动摊开结构：假的那张也得有结构可取
+      // 列注释里带两个空格：以前解析 detail 文本（按两个以上空格切列），「见附表」会被切丢
       [/^GET \/datasources\/check-manage-fake\/schema$/, (route, { url }) => json(url.searchParams.get('table')
-        ? { table: 'sales_demo', detail: '表 sales_demo\n  2026-01  REAL\n  region  TEXT\n  Unnamed: 2  TEXT' }
+        ? {
+            table: 'sales_demo', found: true, qualified: 'sales_demo', kind: 'table', comment: '按月的销售明细',
+            detail: '表 sales_demo（按月的销售明细）\n  2026-01  REAL\n  region  TEXT  主键、非空、销售区域  见附表\n  Unnamed: 2  TEXT',
+            columns: [
+              { name: '2026-01', type: 'REAL', pk: false, not_null: false, comment: null },
+              { name: 'region', type: 'TEXT', pk: true, not_null: true, comment: '销售区域  见附表' },
+              { name: 'Unnamed: 2', type: 'TEXT', pk: false, not_null: false, comment: null },
+            ],
+          }
         : { tables: ['sales_demo'], summary: '', synced_at: fake.source.schema_synced_at })(route)],
     ],
   })
@@ -476,8 +671,21 @@ console.log('\n=== 数据 · 表格 ===')
   await dlg.locator('input[type="file"]').setInputFiles({ name: 'sales_demo.csv', mimeType: 'text/csv', buffer: Buffer.from('2026-01,region\n1,east\n') })
   check('文件名自动变成数据源名', (await dlg.locator('input.mono').first().inputValue()) === 'sales_demo')
   await dlg.getByRole('button', { name: /导入/ }).click()
-  await page.waitForTimeout(100)
+  await page.waitForTimeout(250)
   check('导入中按钮写已用时间', /导入中/.test(await dlg.getByRole('button', { name: /导入中/ }).innerText().catch(() => '')))
+  const sending = await dlg.locator('[data-upload-progress]').innerText().catch(() => '')
+  check('上传中画真实的字节进度：已传多少 / 总共多少 · 百分比', sending.includes('已传') && sending.includes('40%')
+        && (await dlg.locator('[data-upload-progress] [role="progressbar"]').getAttribute('aria-valuenow').catch(() => '')) === '40',
+        sending.replace(/\s+/g, ' '))
+  check('……字节没发完之前可以取消', await dlg.getByRole('button', { name: '取消上传' }).count() === 1)
+  await shot(page, 'table-uploading')
+  await page.waitForTimeout(650)
+  const processing = await dlg.locator('[data-upload-progress]').innerText().catch(() => '')
+  check('……发完写「正在读表」，不把条拉满冒充完成', processing.includes('正在读表')
+        && await dlg.locator('[data-upload-progress] [role="progressbar"]').count() === 0, processing.replace(/\s+/g, ' '))
+  const cancel = dlg.getByRole('button', { name: '取消', exact: true })
+  check('……发完之后不能取消（后端已经在建表），悬停说明为什么',
+        await cancel.isDisabled() && ((await cancel.getAttribute('title')) ?? '').includes('传完'))
   await page.waitForTimeout(700)
   const res = await dialog(page).innerText()
   check('导入完弹窗不关，停在列名和类型上', res.includes('region') && res.includes('TEXT'))
@@ -490,7 +698,26 @@ console.log('\n=== 数据 · 表格 ===')
   await dialog(page).getByRole('button', { name: /表头不对/ }).click()
   await page.waitForTimeout(200)
   check('改行号重传：回到表单，行号 +1', (await dialog(page).locator('input[type="number"]').inputValue()) === '2')
+  // 这次发到一半取消：后端收不全，什么都不会建
+  await dialog(page).getByRole('button', { name: /导入/ }).click()
+  await page.waitForTimeout(250)
+  await dialog(page).getByRole('button', { name: '取消上传' }).click()
+  await page.waitForTimeout(900)
+  check('发到一半取消：说清什么都没建，弹窗留在表单上', (await page.locator('body').innerText()).includes('没传完就取消了')
+        && await dialog(page).getByRole('button', { name: /导入/ }).isEnabled())
   await dialog(page).getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(300)
+  // 结构浏览器的列清单用后端给的结构化列，不再解析 detail 文本
+  const tcard = page.locator('[data-source="sales_demo"]')
+  await tcard.locator('[data-schema-browser] button[aria-expanded]').first().click()
+  await page.waitForTimeout(500)
+  const region = tcard.locator('[data-schema-browser] tbody tr', { hasText: 'region' })
+  const cells = await region.locator('td').allInnerTexts()
+  check('列清单：类型、主键、非空、说明各归各的格子', cells.length === 3 && cells[1] === 'TEXT'
+        && await region.locator('[aria-label="主键"]').count() === 1 && cells[2].includes('非空'), cells.join(' | '))
+  check('……列注释里的两个空格不再把说明切丢（「见附表」还在）', cells[2]?.includes('销售区域') && cells[2]?.includes('见附表'), cells[2] ?? '')
+  check('……表注释写在列表上方', (await tcard.locator('[data-schema-browser]').innerText()).includes('按月的销售明细'))
+  await shot(page, 'table-columns')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('上传只发了一次', sent.filter((s) => s.key === 'POST /datasources/upload').length === 1)
   await close()
@@ -499,6 +726,7 @@ console.log('\n=== 数据 · 表格 ===')
 console.log('\n=== 知识库 ===')
 {
   const { page, sent, natives, errors, close } = await open('/knowledge/kb', {
+    uploadProgress: true,
     handlers: [[/^POST \/kb\/upload$/, delayed(1200, {
       id: 'fake-doc', collection: 'default', title: 'note.md', source: 'note.md', mime: 'text/markdown',
       chunk_count: 0, status: 'processing', meta: { progress: { done: 1, total: 4 } },
@@ -515,13 +743,34 @@ console.log('\n=== 知识库 ===')
   await page.locator('[data-alpha-off] button', { hasText: '重置' }).click()
   check('一键回到运行时值', Number(await page.locator('input[data-alpha]').inputValue()) === embedding.default_alpha)
 
-  await page.locator('input[data-kb-upload]').setInputFiles({ name: 'note.md', mimeType: 'text/markdown', buffer: Buffer.from('# hi') })
-  await page.waitForTimeout(250)
-  check('上传中列表顶上有占位行', await page.locator('[data-uploading]').count() === 1)
+  // 一次选两份：一次传一个，第二份排队；排队的能取消
+  await page.locator('input[data-kb-upload]').setInputFiles([
+    { name: 'note.md', mimeType: 'text/markdown', buffer: Buffer.from('# hi') },
+    { name: 'more.md', mimeType: 'text/markdown', buffer: Buffer.from('# more') },
+  ])
+  await page.waitForTimeout(300)
+  check('上传中列表顶上有占位行，一份一行', await page.locator('[data-uploading]').count() === 2)
   check('上传按钮写着上传中', (await page.getByRole('button', { name: /上传中/ }).count()) === 1)
+  const first = page.locator('[data-uploading]', { hasText: 'note.md' })
+  const sendingRow = await first.innerText()
+  check('……在传的那份画真实的字节进度', sendingRow.includes('已传') && sendingRow.includes('40%')
+        && await first.locator('[role="progressbar"]').count() === 1, sendingRow.replace(/\s+/g, ' '))
+  const second = page.locator('[data-uploading]', { hasText: 'more.md' })
+  check('……第二份写「排队中」，还能取消', (await second.innerText()).includes('排队中')
+        && await second.getByRole('button', { name: '取消上传 more.md' }).count() === 1)
   await shot(page, 'kb-uploading')
-  await page.waitForTimeout(1300)
+  await second.getByRole('button', { name: '取消上传 more.md' }).click()
+  await page.waitForTimeout(200)
+  check('……排队的取消了立刻从列表拿掉', await page.locator('[data-uploading]', { hasText: 'more.md' }).count() === 0)
+  await page.waitForTimeout(500)
+  const processingRow = await first.innerText()
+  check('……字节发完写「处理中」（后端在解析、切块），不把条拉满冒充完成',
+        processingRow.includes('后端在解析、切块') && await first.locator('[role="progressbar"]').count() === 0,
+        processingRow.replace(/\s+/g, ' '))
+  check('……发完的那份不给取消（后端已经在切块）', await page.getByRole('button', { name: '取消上传 note.md' }).count() === 0)
+  await page.waitForTimeout(1500)
   check('传完占位行消失', await page.locator('[data-uploading]').count() === 0)
+  check('……取消的那份没有发出去', sent.filter((s) => s.key === 'POST /kb/upload').length === 1)
 
   await page.locator('input[data-kb-upload]').setInputFiles({ name: 'data.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n1,2') })
   await page.waitForTimeout(300)
@@ -546,6 +795,104 @@ console.log('\n=== 知识库 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
+}
+
+console.log('\n=== 知识库 · 检索贡献条与重建进度 ===')
+{
+  const hits = {
+    query: '出勤', collection: 'default', degraded: [], alpha: embedding.default_alpha ?? 0.5,
+    results: [
+      { chunk_id: 'c1', document_id: 'd1', title: 'hr_attendance.md', ordinal: 3, content: '出勤率 = 实际出勤 / 计划出勤',
+        score: 0.42, signals: { vector: 0.6, keyword: 3.21 }, contrib: { vector: 0.3, keyword: 0.12 } },
+      { chunk_id: 'c2', document_id: 'd1', title: 'hr_attendance.md', ordinal: 4, content: '计划出勤按排班表算',
+        score: 0.25, signals: { vector: 0.5 }, contrib: { vector: 0.25, keyword: 0 } },
+    ],
+  }
+  const job = (phase, chunks, memories, state = 'running') => ({
+    id: 'check-job', state, phase, collection: 'default', total: 15, done: chunks + memories,
+    chunks: { total: 12, done: chunks }, memories: { total: 3, done: memories },
+    started_at: ago(4000), finished_at: state === 'running' ? null : ago(0), error: null, hint: null,
+    result: state === 'done' ? { reindexed: 12, memories_reindexed: 3, embedder: 'openai:demo-embed' } : null,
+  })
+  // GET /kb/reindex：点重建之前没在跑（开发模式下进页那一眼会问两次）；之后依次是
+  // 片段 → 倒排 → 记忆 → 做完
+  const steps = [job('chunks', 6, 0), job('index', 12, 0), job('memories', 12, 2), job('done', 12, 3, 'done')]
+  let started = false
+  let polled = 0
+  let rebuilt = false
+  const { page, sent, natives, errors, close } = await open('/knowledge/kb', {
+    handlers: [
+      [/^GET \/kb\/search$/, json(hits)],
+      [/^GET \/kb\/embedding$/, (route) => json({ ...embedding, fallback: false, has_semantics: true, unindexed_chunks: 0,
+        stale_chunks: rebuilt ? 0 : 12, stale_memories: rebuilt ? 0 : 3 })(route)],
+      [/^POST \/kb\/reindex$/, (route) => { started = true; return json(job('chunks', 0, 0), 202)(route) }],
+      [/^GET \/kb\/reindex$/, (route) => {
+        if (!started) return json({ state: 'idle' })(route)
+        const out = steps[Math.min(polled++, steps.length - 1)]
+        if (out.state === 'done') rebuilt = true
+        return json(out)(route)
+      }],
+    ],
+  })
+  await page.getByLabel('检索内容').fill('出勤')
+  await page.getByRole('button', { name: '检索', exact: true }).click()
+  await page.waitForTimeout(400)
+  const hit = page.locator('[data-hit]').first()
+  const contrib = await hit.locator('[data-contrib]').innerText().catch(() => '')
+  check('命中拆成两路贡献：语义 +0.300、关键词 +0.120（两段之和就是总分）',
+        /语义\s*\+0\.300/.test(contrib) && /关键词\s*\+0\.120/.test(contrib), contrib.replace(/\s+/g, ' '))
+  check('……原始分另写成数：余弦、BM25', contrib.includes('余弦') && contrib.includes('0.600') && contrib.includes('3.21'))
+  const segs = await hit.locator('span[title^="语义贡献"] > span').count()
+  const segs2 = await page.locator('[data-hit]').nth(1).locator('span[title^="语义贡献"] > span').count()
+  check('……贡献条两段；只靠语义命中的那条只有一段', segs === 2 && segs2 === 1, `${segs} / ${segs2}`)
+  check('……结果上方有图例：总分 = 语义贡献 + 关键词贡献', (await page.locator('[data-contrib-legend]').innerText().catch(() => '')).includes('关键词贡献'))
+  await shot(page, 'kb-search-contrib')
+
+  const rebuild = page.getByRole('button', { name: /重建索引（15 段）/ })
+  check('向量对不上时给「重建索引（15 段）」', await rebuild.count() === 1,
+        (await page.locator('[data-embedder]').innerText().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160))
+  await rebuild.click()
+  const post = sent.find((s) => s.key === 'POST /kb/reindex')
+  check('重建走后台：POST 带 background=true', !!post?.url.includes('background=true'), post?.url ?? '')
+  const chunksText = await until(async () => {
+    const t = await page.locator('[data-reindex="chunks"]').innerText().catch(() => '')
+    return t.includes('6 / 12') ? t : ''
+  }, 4000)
+  check('进度是后端按批记的真实数：正在重算知识片段的向量 · 6 / 12 段', !!chunksText, chunksText)
+  check('……进度条的值就是 done / total', (await page.locator('[data-reindex] [role="progressbar"]').getAttribute('aria-valuenow').catch(() => '')) === '6')
+  check('……跑着的时候不能换向量模型', await page.getByRole('button', { name: '换一个' }).isDisabled())
+  await shot(page, 'kb-reindex-progress')
+  const indexText = await until(() => page.locator('[data-reindex="index"]').innerText().catch(() => ''), 4000)
+  check('倒排那一段没有分批进度：写明，不去假装它在走', indexText.includes('没有分批进度'), indexText.replace(/\s+/g, ' '))
+  const memText = await until(() => page.locator('[data-reindex="memories"]').innerText().catch(() => ''), 4000)
+  check('……接着重算记忆：2 / 3 条', memText.includes('2 / 3 条'), memText.replace(/\s+/g, ' '))
+  const doneToast = await until(async () => {
+    const t = await page.locator('body').innerText()
+    return t.includes('重建 12 段知识') ? t : ''
+  }, 4000)
+  check('做完了报一句：用哪个模型重建了多少', !!doneToast && doneToast.includes('openai:demo-embed') && doneToast.includes('3 条记忆'))
+  check('……进度收起，重建按钮也跟着消失（不再有对不上的）',
+        await page.locator('[data-reindex]').count() === 0 && await page.getByRole('button', { name: /重建索引/ }).count() === 0)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 已经有一次在跑：回 409 就说明，并接着看它的进度，不起第二次
+  let other = false
+  const busy = await open('/knowledge/kb', {
+    handlers: [
+      [/^GET \/kb\/embedding$/, json({ ...embedding, fallback: false, has_semantics: true, unindexed_chunks: 0, stale_chunks: 12, stale_memories: 3 })],
+      [/^POST \/kb\/reindex$/, (route) => { other = true; return json({ detail: '已经在重建索引了（全部集合，已完成 3/15），等它做完再点' }, 409)(route) }],
+      // 进页那一眼还没在跑；点了之后别处起的那一次才露面
+      [/^GET \/kb\/reindex$/, (route) => json(other ? { ...job('chunks', 3, 0), collection: null } : { state: 'idle' })(route)],
+    ],
+  })
+  await busy.page.getByRole('button', { name: /重建索引（15 段）/ }).click()
+  await busy.page.waitForTimeout(600)
+  check('已经在重建：回 409 时说明已经在跑', (await busy.page.locator('body').innerText()).includes('已经在重建索引了'))
+  check('……接着显示那一次的进度', ((await busy.page.locator('[data-reindex]').innerText().catch(() => '')).includes('3 / 12')))
+  check('……只发了一次 POST，不起第二次', busy.sent.filter((s) => s.key === 'POST /kb/reindex').length === 1)
+  await busy.close()
 }
 
 console.log('\n=== 长期记忆 ===')
@@ -607,6 +954,20 @@ console.log('\n=== 长期记忆 ===')
   await close()
 }
 
+console.log('\n=== 目录没取回来：空态不冒充「还没有」 ===')
+for (const [path, pattern, label] of [
+  ['/settings/providers', /^GET \/providers$/, '模型接入'],
+  ['/knowledge/skills', /^GET \/skills$/, 'Skill'],
+]) {
+  const { page, close } = await open(path, { handlers: [[pattern, json({ detail: '后端出错了' }, 500)]] })
+  await page.waitForTimeout(600)
+  const el = page.locator('main [data-empty-unknown]')
+  check(`${label}那张表没取回来：不说「还没有」，说没取回来并给「重新读取」`,
+        (await el.getAttribute('data-empty-unknown').catch(() => null)) === 'error' && (await el.innerText().catch(() => '')).includes('重新读取'))
+  check('……收起「添加 / 新建」这类动作，免得照着建出重复的', await el.getByRole('button', { name: /添加接入|新建 Skill/ }).count() === 0)
+  await close()
+}
+
 console.log('\n=== Skill ===')
 {
   const { page, sent, natives, close } = await open('/knowledge/skills', {
@@ -637,10 +998,23 @@ console.log('\n=== 工具 ===')
       [/^POST \/tools\/[^/]+\/run$/, (route, { body }) => {
         calls++
         return body?.confirm
-          ? json({ ok: true, result: 'done', duration_ms: 5 })(route)
+          ? json({ ok: true, result: 'done', duration_ms: 5, note: '参数名 cuont 不存在，已按唯一候选 count 执行' })(route)
           : json({ detail: '会在 playground 工作目录里写入「x.txt」，同名文件会被覆盖。在工具库里执行不经过审批，确认后才会执行。' }, 409)(route)
       }],
       [/^POST \/mcp\/refresh$/, (route) => route.abort()],
+      [/^POST \/custom-tools\/test$/, (route, { body }) => json(body?.config?.url?.includes('fail')
+        ? { ok: false, error: '工具执行失败：HTTP 404', hint: '核对接口地址', detail: '', duration_ms: 12 }
+        : { ok: true, result: { echo: body?.args ?? {} }, duration_ms: 34, note: '参数名 qurey 不存在，已按唯一候选 query 执行' })(route)],
+      // 沙箱里没有 MCP 服务：两台假的，一台后端记着 5 分钟前连上过，一台老数据只有 status、没有测连接记录
+      [/^GET \/mcp\/servers$/, json([
+        { id: 'check-mcp-ok', name: 'files_demo', transport: 'stdio', command: 'npx', args: ['-y', 'demo-mcp'], env: {}, url: null,
+          enabled: true, status: 'ok', last_error: null, tools_cache: ['read', 'list'],
+          last_checked_at: ago(5 * 60_000), last_check_ok: true, last_latency_ms: 88 },
+        { id: 'check-mcp-old', name: 'legacy_demo', transport: 'http', command: null, args: [], env: {}, url: 'https://example.com/mcp',
+          enabled: true, status: 'error', last_error: '连不上', tools_cache: [],
+          last_checked_at: null, last_check_ok: null, last_latency_ms: null },
+      ])],
+      [/^POST \/mcp\/servers\/check-mcp-ok\/probe$/, delayed(200, { ok: true, tools: [{ name: 'read' }, { name: 'list' }, { name: 'write' }], elapsed_ms: 120 })],
     ],
   })
   if (danger) {
@@ -661,17 +1035,52 @@ console.log('\n=== 工具 ===')
     const runs = sent.filter((s) => /^POST \/tools\/.+\/run$/.test(s.key))
     check('确认后带 confirm:true 重发', runs.length === 2 && runs[1].body?.confirm === true, JSON.stringify(runs.map((r) => r.body?.confirm)))
     check('结果显示成功', (await page.locator('[data-tool-result]').getAttribute('data-tool-result')) === 'ok')
+    const note = await page.locator('[data-tool-note]').innerText().catch(() => '')
+    check('参数名被纠正过：成功结果下面用 warn 写出来，提醒先改对再抄进工作流', note.includes('cuont') && note.includes('改对'), note)
   }
   await page.getByRole('tab', { name: '自定义工具' }).click()
   await page.waitForTimeout(400)
   await page.getByRole('button', { name: /新建工具/ }).first().click()
-  const params = await dialog(page).locator('textarea').nth(1).inputValue()
+  const ed = dialog(page)
+  const params = await ed.locator('textarea').nth(1).inputValue()
   check('新建工具的参数给了能跑的示例，不是 {}', params.includes('"query"'), params.slice(0, 60))
-  check('编辑器里有试跑区（保存后可用）', (await dialog(page).locator('[data-tool-trial]').innerText()).includes('先保存'))
-  await dialog(page).getByRole('button', { name: '取消' }).click()
+  const trialBox = ed.locator('[data-tool-trial]')
+  check('新建时不用先保存就能试跑', (await trialBox.innerText()).includes('不用先保存'))
+  const tryBtn = trialBox.getByRole('button', { name: /试跑/ }).last()
+  check('……URL 还没填时试跑不可点，悬停说缺什么', await tryBtn.isDisabled() && ((await tryBtn.getAttribute('title')) ?? '').includes('URL'))
+  await ed.getByLabel(/^URL/).fill('https://api.example.com/search?q={{ query }}')
+  await tryBtn.click()
+  await page.waitForTimeout(400)
+  const draft = sent.filter((s) => s.key === 'POST /custom-tools/test').at(-1)
+  check('……试跑的是眼前这份没保存的配置（POST /custom-tools/test）',
+        draft?.body?.kind === 'http' && draft?.body?.config?.url?.includes('api.example.com') && 'query' in (draft?.body?.parameters?.properties ?? {})
+        && 'args' in (draft?.body ?? {}), JSON.stringify(draft?.body ?? {}).slice(0, 160))
+  check('……没有保存（没发 POST /custom-tools）', !sent.some((s) => s.key === 'POST /custom-tools'))
+  const trialNote = await trialBox.locator('[data-tool-note]').innerText().catch(() => '')
+  check('……试跑结果里参数名被纠正过也写出来', trialNote.includes('qurey'), trialNote)
+  await shot(page, 'custom-tool-trial')
+  await ed.getByLabel(/^URL/).fill('https://api.example.com/fail')
+  check('……改了配置，刚才的结果标成旧的', (await trialBox.innerText()).includes('这是改之前的结果'))
+  await tryBtn.click()
+  await page.waitForTimeout(400)
+  check('……失败：原因和怎么办写在试跑区', (await trialBox.innerText()).includes('HTTP 404') && (await trialBox.innerText()).includes('核对接口地址'))
+  await ed.getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(200)
+  const discard = dialog(page).getByRole('button', { name: '放弃修改' })
+  if (await discard.count()) await discard.click()
 
   await page.getByRole('tab', { name: 'MCP 接入' }).click()
   await page.waitForTimeout(400)
+  const okCard = page.locator('article', { hasText: 'files_demo' })
+  const okPill = await okCard.locator('[data-health]').innerText().catch(() => '')
+  check('MCP 卡片初值是后端记着的上次探测：已连通 · 88 ms · 5 分钟前测', /已连通.*88 ms.*5 分钟前测/.test(okPill), okPill)
+  check('……只有 status、没有测连接记录的老数据写「未测试」，不再拿 status 猜',
+        (await page.locator('article', { hasText: 'legacy_demo' }).locator('[data-health]').getAttribute('data-health')) === 'idle')
+  await okCard.getByRole('button', { name: /测试/ }).click()
+  await page.waitForTimeout(500)
+  const probed = await okCard.locator('[data-health]').innerText()
+  check('……测一次：用后端量的耗时（120 ms），不是往返时间', /已连通.*120 ms.*刚测过/.test(probed), probed)
+  await shot(page, 'mcp-health')
   await page.getByRole('button', { name: /重新加载/ }).click()
   await page.waitForTimeout(700)
   check('写操作失败有 error toast（以前一声不响）', await page.locator('[role="alert"][aria-live="assertive"] > *').count() > 0)

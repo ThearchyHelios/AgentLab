@@ -150,6 +150,9 @@ class ValidationIssue(BaseModel):
     node_id: str | None = None
     edge_id: str | None = None
     message: str
+    #: 节点配置里出问题的那个字段：prompt、cases[1].condition、agents[0].system。
+    #: 检查器靠它把问题落到具体的输入框下面；说不清是哪个字段的（连线、图级）为空
+    field: str | None = None
 
 
 class ValidationResult(BaseModel):
@@ -157,9 +160,10 @@ class ValidationResult(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
     def add(self, message: str, *, level: str = "error", node_id: str | None = None,
-            edge_id: str | None = None) -> None:
+            edge_id: str | None = None, field: str | None = None) -> None:
         self.issues.append(
-            ValidationIssue(level=level, message=message, node_id=node_id, edge_id=edge_id)  # type: ignore[arg-type]
+            ValidationIssue(level=level, message=message, node_id=node_id,  # type: ignore[arg-type]
+                            edge_id=edge_id, field=field)
         )
         if level == "error":
             self.ok = False
@@ -294,32 +298,33 @@ def innermost_loops(spec: GraphSpec) -> dict[str, str]:
     return out
 
 
-def expression_fields(node: GraphNode) -> list[tuple[str, str]]:
-    """这个节点上按表达式求值的字段：(给人看的名字, 原文)。
+def expression_fields(node: GraphNode) -> list[tuple[str, str, str]]:
+    """这个节点上按表达式求值的字段：(给人看的名字, 原文, 字段路径)。
 
     跟着模式走：foreach 循环的 condition、模板模式整形的 expression 不参与求值，
     拿它们报错就是误报。
     """
     cfg = node.config
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
 
-    def add(label: str, value: Any) -> None:
+    def add(label: str, value: Any, field: str) -> None:
         if isinstance(value, str) and value.strip():
-            out.append((label, value))
+            out.append((label, value, field))
 
-    add("跳过条件", cfg.get("skip_if"))
+    add("跳过条件", cfg.get("skip_if"), "skip_if")
     if node.type == NodeType.BRANCH and cfg.get("mode", "expression") == "expression":
-        for case in cfg.get("cases") or []:
+        for i, case in enumerate(cfg.get("cases") or []):
             case = case or {}
-            add(f"分支「{case.get('label') or case.get('key') or '?'}」的条件", case.get("condition"))
+            add(f"分支「{case.get('label') or case.get('key') or '?'}」的条件", case.get("condition"),
+                f"cases[{i}].condition")
     elif node.type == NodeType.LOOP and cfg.get("mode", "foreach") == "while":
-        add("循环条件", cfg.get("condition"))
+        add("循环条件", cfg.get("condition"), "condition")
     elif node.type == NodeType.TRANSFORM and cfg.get("mode", "expression") == "expression":
-        add("整形表达式", cfg.get("expression"))
+        add("整形表达式", cfg.get("expression"), "expression")
     elif node.type == NodeType.METRICS:
-        for d in cfg.get("metrics") or []:
+        for i, d in enumerate(cfg.get("metrics") or []):
             d = d or {}
-            add(f"指标「{d.get('id') or '?'}」的表达式", d.get("expression"))
+            add(f"指标「{d.get('id') or '?'}」的表达式", d.get("expression"), f"metrics[{i}].expression")
     return out
 
 
@@ -345,19 +350,20 @@ def _check_case_keys(node: GraphNode, cases: list[Any], result: ValidationResult
         case = case or {}
         key = str(case.get("key") or "").strip()
         name = case.get("label") or key or f"第 {i} 个"
+        field = f"cases[{i - 1}].key"
         if not key:
             result.add(f"「条件分支」的分支「{name}」没有标识（key），连不出边、也走不到它",
-                       node_id=node.id)
+                       node_id=node.id, field=field)
             continue
         if key == "default":
             result.add(
                 f"分支「{name}」的标识用了 default：这是「其他」兜底出口的保留名，两者会合并成"
                 "同一个出口，跑完分不清走的是哪条。换一个标识，比如 team",
-                level="warning", node_id=node.id,
+                level="warning", node_id=node.id, field=field,
             )
         elif key in seen:
             result.add(f"「条件分支」里有两个分支的标识都是 {key!r}：路由只认标识，"
-                       "后一个永远轮不到。给它换一个不重复的标识", node_id=node.id)
+                       "后一个永远轮不到。给它换一个不重复的标识", node_id=node.id, field=field)
         seen.add(key)
 
 
@@ -386,43 +392,46 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         if node.type == NodeType.BRANCH:
             cases = cfg.get("cases") or []
             if not cases:
-                result.add("「条件分支」至少要配一个分支条件", node_id=node.id)
+                result.add("「条件分支」至少要配一个分支条件", node_id=node.id, field="cases")
             handles = {e.sourceHandle for e in spec.outgoing(node.id)}
             _check_case_keys(node, cases, result)
-            for case in cases:
+            for i, case in enumerate(cases):
                 key = str((case or {}).get("key") or "").strip()
                 if key and key != "default" and key not in handles:
                     result.add(
-                        f"分支 {key!r} 没有连出去的边", level="warning", node_id=node.id
+                        f"分支 {key!r} 没有连出去的边", level="warning", node_id=node.id,
+                        field=f"cases[{i}].key",
                     )
             if "default" not in handles:
                 result.add(
                     "建议给「条件分支」的「其他」出口连一条边，兜住所有条件都不满足的情况",
                     level="warning",
                     node_id=node.id,
+                    field="cases",
                 )
         elif node.type == NodeType.TOOL:
             if not cfg.get("tool"):
-                result.add("「调用工具」节点还没选工具", node_id=node.id)
+                result.add("「调用工具」节点还没选工具", node_id=node.id, field="tool")
         elif node.type == NodeType.SUBGRAPH:
             if not cfg.get("workflow_id"):
-                result.add("「子工作流」节点还没选要嵌套的工作流", node_id=node.id)
+                result.add("「子工作流」节点还没选要嵌套的工作流", node_id=node.id,
+                           field="workflow_id")
         elif node.type == NodeType.VALIDATE:
             if not cfg.get("schema"):
-                result.add("「结构校验」节点需要一个 JSON Schema", node_id=node.id)
+                result.add("「结构校验」节点需要一个 JSON Schema", node_id=node.id, field="schema")
         elif node.type == NodeType.METRICS:
             defs = cfg.get("metrics") or []
             if not defs:
-                result.add("口径卡还没有定义指标", node_id=node.id)
-            for d in defs:
+                result.add("口径卡还没有定义指标", node_id=node.id, field="metrics")
+            for i, d in enumerate(defs):
                 if not d.get("id") or not d.get("expression"):
                     result.add(f"指标定义缺 id 或 expression：{d.get('id') or '(空)'}",
-                               node_id=node.id)
+                               node_id=node.id, field=f"metrics[{i}]")
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not contract.get("metrics_from"):
                 result.add("出具契约缺 metrics_from（指标来自哪个「口径卡」节点）",
-                           node_id=node.id)
+                           node_id=node.id, field="contract.metrics_from")
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("「循环」节点没有循环体", node_id=node.id)
@@ -433,6 +442,7 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                     "没有指定模型，将回退到默认 provider",
                     level="warning",
                     node_id=node.id,
+                    field="model",
                 )
 
     # 表达式：用运行时同一个 parse_expression 先解析一遍。以前写错了只有跑到那一步
@@ -441,30 +451,32 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
     from app.engine.expressions import ExpressionError, parse_expression
 
     for node in spec.nodes:
-        for label, text in expression_fields(node):
+        for label, text, field in expression_fields(node):
             try:
                 _, unwrapped, unknown = parse_expression(text)
             except ExpressionError as e:
-                result.add(f"{label}写错了：{e}（原文：{text}）", node_id=node.id)
+                result.add(f"{label}写错了：{e}（原文：{text}）", node_id=node.id, field=field)
                 continue
             if unwrapped:
                 result.add(
                     f"{label}里的 {{{{ }}}} 是多余的——这里是表达式、不是模板，"
                     f"已按 {'、'.join(unwrapped)} 理解", level="warning", node_id=node.id,
+                    field=field,
                 )
             if unknown:
                 result.add(
                     f"{label}里的 {'、'.join(unknown)} 不是能用的名字，运行时会取到空值"
                     "（变量要写全：vars.x、input.x、nodes.某节点.text）",
-                    level="warning", node_id=node.id,
+                    level="warning", node_id=node.id, field=field,
                 )
         cfg = node.config
         if node.type == NodeType.LOOP and cfg.get("mode", "foreach") == "while" \
                 and not str(cfg.get("condition") or "").strip():
-            result.add("while 循环没有写条件，循环体一次都不会跑", level="warning", node_id=node.id)
+            result.add("while 循环没有写条件，循环体一次都不会跑", level="warning", node_id=node.id,
+                       field="condition")
         if node.type == NodeType.TRANSFORM and cfg.get("mode", "expression") == "expression" \
                 and not str(cfg.get("expression") or "").strip():
-            result.add("整形节点没有填表达式", node_id=node.id)
+            result.add("整形节点没有填表达式", node_id=node.id, field="expression")
         # assign_to 拿到的是 stdout。脚本最后一行写个裸表达式不会输出（那是 notebook
         # 的行为）——变量是空的，下游的循环条件一上来就不成立、成果也是空的，而整次
         # 运行照样"成功"。开发库里的「测试 1」就是这样：修好条件之后跑通了，结果为空
@@ -478,8 +490,10 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 result.add(
                     f"代码把输出交给 vars.{var}，可代码里没有 print：Python 脚本最后一行的表达式"
                     f"不会自动输出，vars.{var} 会是空的。把结果 print 出来；要交给下游一个对象，"
-                    "就 print(json.dumps(结果))", node_id=node.id,
+                    "就 print(json.dumps(结果))", node_id=node.id, field="code",
                 )
+
+    _check_named_tools(spec, result)
 
     # 孤儿节点
     for node in spec.nodes:
@@ -497,6 +511,204 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         # info 级是"产出没人用"这类提示，不进校验（它不影响能不能跑）
         if issue.level == "info":
             continue
-        result.add(issue.message, level=issue.level, node_id=issue.node_id)
+        result.add(issue.message, level=issue.level, node_id=issue.node_id,
+                   field=issue.field or None)
 
     return result
+
+
+# --------------------------------------------------------------------------
+# 提示词点名的工具，节点得真的绑了它
+#
+# 一次真实运行：助手改图时把三个查库 agent 的 tools 丢了，提示词里还写着「用
+# db_query__… 查」。模型拿不到工具，只能写一句「假设调用工具」，再往下编；校验节点
+# 的修复又替它编了个 0。这张图在跑之前就能认出来。Copilot 的自查读的是同一份
+# error，搭图时就会交回模型去修。
+#
+# 这条是 error，会挡住运行，还会作为 Copilot 自查的阻断项交回模型（模型可能反过来
+# 把提示词里禁用的工具绑上去），所以宁可漏判不可误判：
+#   - 认得出的工具名才算点名：内置工具、db_query__ / db_schema__ / mcp: 这几种形状，
+#     以及这张图里别的节点绑过的名字；
+#   - 「不要用 X」「Never call X」「X 的结果」不是在要求用它；
+#   - calculator 这种本身就是个普通词的工具名，只有写在反引号里、或者紧跟在「用 /
+#     调用 / use / call」后面才算点名；「可以用」「如有需要」「if needed」这类非强制的
+#     说法也一样。这两种只报 warning。
+# --------------------------------------------------------------------------
+
+_DYNAMIC_TOOL = r"db_(?:query|schema)__[A-Za-z0-9_\-]+|mcp:[\w\-]+/[\w\-.]+"
+# 工具名紧挨着汉字是常态（「用python_exec核对」），所以边界只排 ASCII 标识符字符
+_EDGE_BEFORE, _EDGE_AFTER = r"(?<![A-Za-z0-9_:/\-])", r"(?![A-Za-z0-9_\-])"
+_TEMPLATE_SPAN = re.compile(r"\{\{.*?\}\}", re.S)
+_NEGATED = re.compile(
+    r"(?:(?:不要|不用|不必|无需|无须|毋须|不需要|不再|别再|别|禁止|停止|不能|不得|不应|不可|避免|切勿|勿|严禁)"
+    r"\s*(?:再|去)?(?:使用|调用|用|执行|运行|跑)?"
+    r"|(?<![A-Za-z])(?:don['’]?t|do\s+not|never|avoid|without|must\s+not|mustn['’]?t|should\s+not"
+    r"|shouldn['’]?t|cannot|can['’]t|no\s+need\s+to|not|no)\s+(?:(?:use|call|invoke|run|execute|using|calling"
+    r"|invoking|running|rely\s+on|touch)\s+)?(?:the\s+|any\s+)?)"
+    r"\s*[「“\"'`]?\s*$", re.I)
+_REFERENCED = re.compile(r"^\s*[」”\"'`]?\s*(的|返回|给出|查到|产出|输出|结果"
+                         r"|(?:'s\b)|(?:results?|outputs?|returned|returns)\b)", re.I)
+# 普通词形的工具名（calculator）要有明确的「用」字眼紧挨着才算点名
+_PLAIN_WORD = re.compile(r"[A-Za-z][a-z]*(?:-[a-z]+)*")
+_USE_VERB = re.compile(r"(?:使用|调用|用|(?<![A-Za-z])(?:use|call|invoke|run))\s*$", re.I)
+# 非强制的说法：同一句里出现就只算提到，不算要求
+_OPTIONAL = re.compile(r"可以|可选|如有需要|如需|若需|必要时|需要时|有需要|酌情"
+                       r"|(?<![A-Za-z])(?:may|might|can|could|optionally|if\s+(?:needed|necessary|required)"
+                       r"|when\s+needed|feel\s+free)(?![A-Za-z])", re.I)
+_CLAUSE_END = re.compile(r"[。；;！!？?\n]|\.(?:\s|$)")
+# 笼统地要求用工具、却没点名
+_VAGUE = re.compile(r"(调用|使用|用|借助|通过)\s*(相关|对应|可用|数据库|查询)?\s*工具"
+                    r"|查询?数据库|查库|执行\s*SQL|跑\s*SQL", re.I)
+
+
+def _bound_tools(cfg: dict[str, Any]) -> set[str]:
+    return {t for t in cfg.get("tools") or [] if isinstance(t, str)}
+
+
+def _covers(bound: set[str], tool: str) -> bool:
+    """tool 在不在 bound 里。mcp:<server>/*（或只写 mcp:<server>）绑的是这个 server 的全部工具。"""
+    if tool in bound:
+        return True
+    if not tool.startswith("mcp:"):
+        return False
+    server = tool[4:].partition("/")[0]
+    return any(b in (f"mcp:{server}", f"mcp:{server}/", f"mcp:{server}/*") for b in bound)
+
+
+def _named_tool_pattern(spec: GraphSpec) -> re.Pattern[str]:
+    from app.tools.registry import all_specs
+
+    bound: set[str] = set()
+    for node in spec.nodes:
+        cfg = node.config
+        bound.update(_bound_tools(cfg))
+        if isinstance(cfg.get("tool"), str):
+            bound.add(cfg["tool"])
+        for member in cfg.get("agents") or []:
+            if isinstance(member, dict):
+                bound.update(_bound_tools(member))
+    names = sorted({*all_specs(), *bound}, key=len, reverse=True)
+    literal = "|".join(re.escape(n) for n in names if n)
+    body = f"{_DYNAMIC_TOOL}|{literal}" if literal else _DYNAMIC_TOOL
+    return re.compile(f"{_EDGE_BEFORE}(?:{body}){_EDGE_AFTER}")
+
+
+# 列举里的分隔：「严禁调用 web_search、web_fetch、http_request 等」「never call a, b or c」
+_LIST_TAIL = re.compile(r"(?:[\s、，,/和或及与跟以「」“”\"'`]|(?<![A-Za-z])(?:or|and|nor)(?![A-Za-z]))+$",
+                        re.I)
+
+
+def _negated(plain: str, start: int, pattern: re.Pattern[str]) -> bool:
+    """这个工具名前面是不是一句「不要用」。列举里排在后面的也算：往回跳过前面的工具名和顿号。"""
+    head = plain[max(0, start - 120):start]
+    while True:
+        trimmed = _LIST_TAIL.sub("", head)
+        last = None
+        for last in pattern.finditer(trimmed):
+            pass
+        if last is not None and last.end() == len(trimmed):
+            trimmed = trimmed[:last.start()]
+        if trimmed == head:
+            break
+        head = trimmed
+    return bool(_NEGATED.search(head[-40:] + " "))
+
+
+def _clause(plain: str, start: int, end: int) -> str:
+    """工具名所在的那一句。"""
+    before = [m.end() for m in _CLAUSE_END.finditer(plain, 0, start)]
+    after = _CLAUSE_END.search(plain, end)
+    return plain[before[-1] if before else 0:after.start() if after else len(plain)]
+
+
+def _asked_tools(text: str, pattern: re.Pattern[str]) -> dict[str, bool]:
+    """文本里被要求使用的工具名，按出现顺序。值是「是不是明确要求」：否的只算提到了。"""
+    # {{ }} 里的是模板引用，不是在点名工具；换成等长空白，位置不变
+    plain = _TEMPLATE_SPAN.sub(lambda m: " " * len(m.group(0)), text)
+    found: dict[str, bool] = {}
+    for m in pattern.finditer(plain):
+        if _negated(plain, m.start(), pattern) or _REFERENCED.match(plain[m.end():m.end() + 12]):
+            continue
+        name = m.group(0)
+        explicit = not _OPTIONAL.search(_clause(plain, m.start(), m.end()))
+        if explicit and _PLAIN_WORD.fullmatch(name):
+            quoted = plain[m.start() - 1:m.start()] == "`" and plain[m.end():m.end() + 1] == "`"
+            explicit = quoted or bool(_USE_VERB.search(plain[max(0, m.start() - 12):m.start()]))
+        found[name] = found.get(name, False) or explicit
+    return found
+
+
+def _asks_vaguely(text: str) -> bool:
+    plain = _TEMPLATE_SPAN.sub(" ", text)
+    return any(not _NEGATED.search(plain[max(0, m.start() - 12):m.start()])
+               for m in _VAGUE.finditer(plain))
+
+
+def _check_named_tools(spec: GraphSpec, result: ValidationResult) -> None:
+    agents = [n for n in spec.nodes if n.type in (NodeType.AGENT, NodeType.SUPERVISOR)]
+    if not agents:
+        return
+    pattern = _named_tool_pattern(spec)
+
+    def check(node: GraphNode, texts: list[tuple[str, Any]], tools: Any, who: str = "") -> None:
+        bound = {t for t in tools or [] if isinstance(t, str)}
+        vague_at: str | None = None
+        reported: set[str] = set()
+        asked: dict[str, tuple[bool, str]] = {}
+        for field, text in texts:
+            if not isinstance(text, str) or not text.strip():
+                continue
+            for tool, explicit in _asked_tools(text, pattern).items():
+                # system 和 prompt 里都点了同一个工具，报一次就够：指到先出现的那处，
+                # 哪一处是明确要求就按要求算
+                seen = asked.get(tool)
+                asked[tool] = (explicit or bool(seen and seen[0]), seen[1] if seen else field)
+            if not bound and vague_at is None and _asks_vaguely(text):
+                vague_at = field
+        for tool, (explicit, field) in asked.items():
+            if _covers(bound, tool):
+                continue
+            reported.add(tool)
+            if explicit:
+                message = (f"{who}的提示词要求用「{tool}」，但没有给这个成员绑定它" if who
+                           else f"提示词要求用「{tool}」，但节点没有绑定它")
+                result.add(f"{message}：运行时模型拿不到这个工具，只能编一个结果出来。"
+                           "把它加进工具里，或者改掉提示词里的要求",
+                           node_id=node.id, field=field)
+            else:
+                result.add(f"{who + '的' if who else ''}提示词提到了「{tool}」，但{'这个成员' if who else '节点'}没有"
+                           "绑定它：如果是要模型调用它，运行时拿不到。需要就把它加进工具里",
+                           level="warning", node_id=node.id, field=field)
+        # 已经点名报过了，那句笼统的就不再重复
+        if vague_at is not None and not reported:
+            result.add(f"{who or '提示词'}要求调用工具，但{'这个成员' if who else '这个节点'}没有绑定任何"
+                       "工具：模型拿不到工具，只能假设一个结果。绑定要用的工具，或者改掉这句要求",
+                       level="warning", node_id=node.id, field=vague_at)
+
+    for node in agents:
+        cfg = node.config
+        if node.type == NodeType.AGENT:
+            check(node, [("system", cfg.get("system")), ("prompt", cfg.get("prompt"))],
+                  cfg.get("tools"))
+            continue
+        members = [m for m in cfg.get("agents") or [] if isinstance(m, dict)]
+        team_tools: set[str] = set()
+        for i, member in enumerate(members):
+            name = member.get("name") or f"agent{i}"
+            team_tools.update(_bound_tools(member))
+            check(node, [(f"agents[{i}].system", member.get("system"))], member.get("tools"),
+                  who=f"成员「{name}」")
+        # 协作目标是给调度者看的：点了名的工具，至少得有一个成员拿得到
+        goal = cfg.get("goal")
+        if isinstance(goal, str):
+            for tool, explicit in _asked_tools(goal, pattern).items():
+                if _covers(team_tools, tool):
+                    continue
+                if explicit:
+                    result.add(f"协作目标要求用「{tool}」，但没有哪个成员绑定了它：调度者派出去的人"
+                               "谁都调不了它。给负责的成员加上这个工具，或者改掉目标里的要求",
+                               node_id=node.id, field="goal")
+                else:
+                    result.add(f"协作目标提到了「{tool}」，但没有哪个成员绑定了它：如果是要成员"
+                               "调用它，谁都拿不到。需要就给负责的成员加上",
+                               level="warning", node_id=node.id, field="goal")

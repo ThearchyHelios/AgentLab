@@ -36,6 +36,8 @@ export interface Workflow {
   is_template: boolean
   status?: 'draft' | 'published' | 'governed'
   published_version?: number | null
+  /** 最近一次发布的署名。发布时没有署名为 null */
+  published_by?: string | null
   run_count?: number
   created_at?: string
   updated_at?: string
@@ -100,6 +102,9 @@ export interface Run {
   /** 失败时能定位到的节点 */
   error_node_id?: string | null
   started_by?: string | null
+  /** 发起时实际生效的记忆域和知识库（没指定时取设置里的默认值）。老后端不给 */
+  memory_scope?: string | null
+  collection?: string | null
   created_at?: string
   started_at?: string
   finished_at?: string | null
@@ -135,7 +140,19 @@ export interface Approval {
   resolved_at?: string | null
 }
 
-export interface Provider {
+/**
+ * 后端记着的最近一次测连接（模型接入、数据源、MCP 的列表接口都平铺这四项）。
+ * 没测过、或者连接配置改过之后全是 null。用 lib/health 的 healthFromServer 转成
+ * HealthRecord 给 HealthPill
+ */
+export interface ServerHealth {
+  last_checked_at?: string | null
+  last_check_ok?: boolean | null
+  last_latency_ms?: number | null
+  last_error?: string | null
+}
+
+export interface Provider extends ServerHealth {
   id: string
   name: string
   kind: string
@@ -220,6 +237,8 @@ export interface ValidationIssue {
   node_id?: string | null
   edge_id?: string | null
   message: string
+  /** 出问题的是节点配置里的哪一项：'prompt'、'tools'、'cases[1].condition'。老后端不给 */
+  field?: string | null
 }
 
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
@@ -323,6 +342,13 @@ export interface Conversation {
   turn_count: number
   /** 列表里的副标题，让人一眼认出是哪次聊天 */
   last_question: string
+  /**
+   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败。
+   * 没有轮次时为 null；老后端不给
+   */
+  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'suspended' | 'done' | null
+  /** 最后一轮的运行。建图阶段就断了的没有 */
+  last_run_id?: string | null
 }
 
 export interface ConversationDetail extends Conversation {
@@ -342,7 +368,29 @@ export interface ConversationTurn {
   error: string
   /** 复核结论。null = 这一轮没复核过，和「复核过、没发现问题」不是一回事 */
   review?: ReviewResult | null
+  /**
+   * 可信度元数据（出具档位、运行类别、耗时、查库次数……），前端整块写、整块读，
+   * 后端只用它算 last_status。老轮次挂在 review.meta 下，后端读出来时统一放到这里
+   */
+  meta?: Record<string, any> | null
   created_at?: string
+}
+
+/**
+ * Copilot 改图前后都在、而绑定的工具变了的节点或协作成员。
+ * 画布上看不出来（节点还在），跑起来才发现查不了库，所以改图回执要明说
+ */
+export interface ToolChange {
+  node_id: string
+  label: string
+  /** 协作成员的名字；节点本身的工具为 null */
+  member: string | null
+  /** 配置里的哪一项：'tools' 或 'agents[2].tools' */
+  field: string
+  before: string[]
+  after: string[]
+  added: string[]
+  removed: string[]
 }
 
 /**

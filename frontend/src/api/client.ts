@@ -1,6 +1,6 @@
 import type {
   Approval, Conversation, ConversationDetail, ConversationTurn, GraphSpec,
-  KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus, Skill, ToolInfo,
+  KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus, Skill, ToolChange, ToolInfo,
   ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 
@@ -129,33 +129,105 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   } finally {
     if (timer) clearTimeout(timer)
   }
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    let body: any
-    let isJson = false
-    try { body = JSON.parse(text); isJson = true } catch { /* 响应体不是 JSON */ }
-    if (isGatewayFailure(res.status, text, isJson)) {
-      const err = new ApiError(res.status, NETWORK_MESSAGE, {
-        kind: 'network', raw: `${res.status} ${res.statusText}${text ? `\n${text.slice(0, 500)}` : ''}`,
-      })
-      report(false, err)
-      throw err
-    }
-    report(true)
-    if (isJson) {
-      const detail = body?.detail ?? body
-      throw new ApiError(res.status, describeDetail(detail), {
-        detail, raw: typeof body?.raw === 'string' ? body.raw : `${res.status} ${text.slice(0, 2000)}`,
-      })
-    }
-    const message = res.status >= 500
-      ? `后端出错了（${res.status}），详情看服务日志`
-      : `请求没有成功（${res.status} ${res.statusText}）`
-    throw new ApiError(res.status, message, { raw: `${res.status} ${res.statusText}\n${text.slice(0, 2000)}` })
-  }
+  if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''))
   report(true)
   if (res.status === 204) return undefined as T
   return res.json()
+}
+
+/** 非 2xx 的响应 → ApiError，顺带报告连接状态。fetch 和 XHR 两条路共用 */
+function failure(status: number, statusText: string, text: string): ApiError {
+  let body: any
+  let isJson = false
+  try { body = JSON.parse(text); isJson = true } catch { /* 响应体不是 JSON */ }
+  if (isGatewayFailure(status, text, isJson)) {
+    const err = new ApiError(status, NETWORK_MESSAGE, {
+      kind: 'network', raw: `${status} ${statusText}${text ? `\n${text.slice(0, 500)}` : ''}`,
+    })
+    report(false, err)
+    return err
+  }
+  report(true)
+  if (isJson) {
+    const detail = body?.detail ?? body
+    return new ApiError(status, describeDetail(detail), {
+      detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
+    })
+  }
+  const message = status >= 500
+    ? `后端出错了（${status}），详情看服务日志`
+    : `请求没有成功（${status} ${statusText}）`
+  return new ApiError(status, message, { raw: `${status} ${statusText}\n${text.slice(0, 2000)}` })
+}
+
+/** 上传进度。字节发完（sent）之后还要等后端解析、切块，那段没有进度可报 */
+export interface UploadProgress {
+  /** 已经发出去的字节 */
+  loaded: number
+  /** 总字节；浏览器算不出来时为 null，这时只能画已发多少，不画百分比 */
+  total: number | null
+  /** 字节已经全部发完，在等后端处理 */
+  sent: boolean
+}
+
+export interface UploadOptions {
+  onProgress?: (p: UploadProgress) => void
+  signal?: AbortSignal
+}
+
+/**
+ * 带字节进度的上传。fetch 拿不到上传进度，只能用 XHR；报错、连接状态、署名头和
+ * request 走同一套，调用方看到的 ApiError 没有区别。取消照旧抛 AbortError。
+ */
+function upload<T>(path: string, form: FormData, opts?: UploadOptions): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', BASE + path)
+    for (const [k, v] of Object.entries(actorHeader())) xhr.setRequestHeader(k, v)
+    const onProgress = opts?.onProgress
+    if (onProgress) {
+      // 进度事件里的字节数含 multipart 的边界和表头，比文件本身略大；发完那一下
+      // 沿用它的总数，前后两个数才对得上
+      let total: number | null = null
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) total = e.total
+        onProgress({ loaded: e.loaded, total, sent: false })
+      }
+      xhr.upload.onload = () => {
+        const bytes = total ?? [...form.values()].reduce((n, v) => n + (v instanceof Blob ? v.size : 0), 0)
+        onProgress({ loaded: bytes, total: bytes || null, sent: true })
+      }
+    }
+    const abort = () => xhr.abort()
+    opts?.signal?.addEventListener('abort', abort)
+    const cleanup = () => opts?.signal?.removeEventListener('abort', abort)
+    xhr.onload = () => {
+      cleanup()
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(failure(xhr.status, xhr.statusText, xhr.responseText ?? ''))
+        return
+      }
+      report(true)
+      if (xhr.status === 204 || !xhr.responseText) { resolve(undefined as T); return }
+      try {
+        resolve(JSON.parse(xhr.responseText))
+      } catch {
+        reject(new ApiError(xhr.status, '后端回的内容读不懂', { raw: xhr.responseText.slice(0, 2000) }))
+      }
+    }
+    xhr.onerror = () => {
+      cleanup()
+      const err = new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: `XMLHttpRequest error: POST ${path}` })
+      report(false, err)
+      reject(err)
+    }
+    xhr.onabort = () => {
+      cleanup()
+      reject(new DOMException('上传已取消', 'AbortError'))
+    }
+    if (opts?.signal?.aborted) { xhr.abort(); return }
+    xhr.send(form)
+  })
 }
 
 /**
@@ -197,6 +269,89 @@ export interface ProviderDraft {
   extra?: Record<string, any>
 }
 
+/** 探查结构的预览（dry_run）：只看不存，缓存和同步时间都没动 */
+export interface IntrospectPreview {
+  dry_run: true
+  /** 这次探的是哪个 schema，'' 是默认 schema */
+  schema: string
+  table_count: number
+  /** 带 schema 前缀的对象全名，最多 200 个 */
+  tables: string[]
+  truncated: boolean
+  total: number
+  schema_error: string
+  available_schemas: string[]
+}
+
+/** 一张表的结构化列信息（和给模型看的 detail 文本出自同一份缓存） */
+export interface SchemaColumn {
+  name: string
+  type: string
+  pk: boolean
+  not_null: boolean
+  comment: string | null
+}
+
+export interface TableSchema {
+  table: string
+  /** 给模型看的那段文本 */
+  detail: string
+  found: boolean
+  qualified: string | null
+  kind: 'table' | 'view' | null
+  comment: string | null
+  /** 老后端没有，只有 detail */
+  columns?: SchemaColumn[]
+}
+
+/** 知识库检索的一条命中 */
+export interface KbHit {
+  chunk_id: string
+  document_id: string
+  title: string
+  ordinal: number
+  content: string
+  score: number
+  signals?: Record<string, number>
+  /** 向量、关键词两路各贡献了多少分，两者之和等于 score。老后端不给 */
+  contrib?: { vector: number; keyword: number }
+  [key: string]: any
+}
+
+export interface KbSearchResult {
+  query: string
+  collection: string | null
+  results: KbHit[]
+  /** 这次检索降级了（比如退回纯关键词）的说明 */
+  degraded: string[]
+  /** 实际用的混合权重 */
+  alpha?: number
+  [key: string]: any
+}
+
+/**
+ * 后台重建索引的进度。phase：chunks（知识库切块）→ index（倒排，没有分批进度）→
+ * memories（长期记忆）→ done。total / done 是切块加记忆的合计
+ */
+export interface ReindexJob {
+  id: string
+  state: 'running' | 'done' | 'failed'
+  phase: 'chunks' | 'index' | 'memories' | 'done'
+  collection: string | null
+  total: number
+  done: number
+  chunks: { total: number; done: number }
+  memories: { total: number; done: number }
+  started_at: string
+  finished_at: string | null
+  error: string | null
+  hint: string | null
+  result: { reindexed: number; memories_reindexed: number; embedder: string; [key: string]: any } | null
+}
+
+/** runs.list 的 workflow_id 传它：只看没保存成工作流的那些运行（问数据页、画布上的临时图） */
+export const UNSAVED_WORKFLOW_ID = '__none__'
+
 /** 拼查询串：null / undefined / 空串跳过，数组用逗号连起来 */
 function qs(params?: Record<string, unknown>): string {
   if (!params) return ''
@@ -213,7 +368,17 @@ function qs(params?: Record<string, unknown>): string {
   return s ? `?${s}` : ''
 }
 
-const get = <T>(p: string) => request<T>(p)
+/**
+ * 单次请求的选项。timeoutMs 到点就掐断并按网络失败抛出（带 timeoutMs）：连得上但
+ * 卡着不回的接口（MCP 服务不应答时的 /tools）不能让调用方永远等下去，也不该一直
+ * 占着浏览器对同一主机的那几条连接
+ */
+export interface RequestOptions {
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+const get = <T>(p: string, opts?: RequestOptions) => request<T>(p, opts)
 const post = <T>(p: string, body?: unknown) =>
   request<T>(p, { method: 'POST', body: JSON.stringify(body ?? {}) })
 const patch = <T>(p: string, body: unknown) =>
@@ -229,7 +394,7 @@ export const api = {
 
   // ---- 工作流 ----
   workflows: {
-    list: () => get<Workflow[]>('/workflows'),
+    list: (opts?: RequestOptions) => get<Workflow[]>('/workflows', opts),
     get: (id: string) => get<Workflow>(`/workflows/${id}`),
     create: (body: { name: string; description?: string; graph?: GraphSpec; tags?: string[] }) =>
       post<Workflow>('/workflows', body),
@@ -261,23 +426,32 @@ export const api = {
     test: (id: string) => post<ConnectionTest>(`/datasources/${id}/test`, {}),
     /** 测一份还没保存的配置，只测连接不落库。编辑时带上 id，后端可以沿用已存的密码 */
     testConfig: (body: any) => post<ConnectionTest>('/datasources/test', body),
-    /** 上传 Excel / CSV，变成一个可以用 SQL 查的数据源。同名就地替换 */
-    uploadTable: (file: File, body: { name: string; description?: string; header_row?: number }) => {
+    /** 上传 Excel / CSV，变成一个可以用 SQL 查的数据源。同名就地替换。onProgress 报字节进度 */
+    uploadTable: (file: File, body: { name: string; description?: string; header_row?: number }, opts?: UploadOptions) => {
       const form = new FormData()
       form.append('file', file)
       form.append('name', body.name)
       form.append('description', body.description ?? '')
       form.append('header_row', String(body.header_row ?? 1))
-      return request<{
+      type Out = {
         source: any; replaced: boolean
         tables: { name: string; sheet: string; rows: number
                   columns: { name: string; type: string }[] }[]
-      }>('/datasources/upload', { method: 'POST', body: form })
+      }
+      return opts?.onProgress
+        ? upload<Out>('/datasources/upload', form, opts)
+        : request<Out>('/datasources/upload', { method: 'POST', body: form, signal: opts?.signal })
     },
     introspect: (id: string, schema?: string) =>
       post<any>(`/datasources/${id}/introspect${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`, {}),
+    /** 换个 schema 看看：只返回探到的结果，不覆盖缓存（Copilot 看到的还是原来那份） */
+    previewSchema: (id: string, schema?: string) =>
+      post<IntrospectPreview>(`/datasources/${id}/introspect${qs({ schema, dry_run: 'true' })}`, {}),
     schema: (id: string, table?: string) =>
       get<any>(`/datasources/${id}/schema${table ? `?table=${encodeURIComponent(table)}` : ''}`),
+    /** 一张表的结构，带结构化的列信息，不用再去解析 detail 文本 */
+    tableSchema: (id: string, table: string) =>
+      get<TableSchema>(`/datasources/${id}/schema?table=${encodeURIComponent(table)}`),
   },
 
   runs: {
@@ -302,7 +476,8 @@ export const api = {
     /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */
     continue: (id: string, graph?: GraphSpec | null) =>
       post<Run>(`/runs/${id}/continue`, { graph: graph ?? null }),
-    cancel: (id: string) => post<{ ok: boolean }>(`/runs/${id}/cancel`),
+    // 等审批的运行直接收成 cancelled；在跑的要等引擎收尾，先回 stopping
+    cancel: (id: string) => post<{ ok: boolean; status?: 'stopping' | 'cancelled' }>(`/runs/${id}/cancel`),
     resume: (id: string, response: any) => post<Run>(`/runs/${id}/resume`, { response }),
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),
     state: (id: string) => get<any>(`/runs/${id}/state`),
@@ -317,15 +492,15 @@ export const api = {
 
   approvals: {
     /** 老写法 list('pending') 照旧可用。status 可逗号分隔，'all' 取全部 */
-    list: (params: string | { status?: string; run_id?: string; limit?: number } = 'pending') =>
-      get<Approval[]>(`/approvals${qs(typeof params === 'string' ? { status: params } : { status: 'pending', ...params })}`),
+    list: (params: string | { status?: string; run_id?: string; limit?: number } = 'pending', opts?: RequestOptions) =>
+      get<Approval[]>(`/approvals${qs(typeof params === 'string' ? { status: params } : { status: 'pending', ...params })}`, opts),
     decide: (id: string, body: { approved: boolean; note?: string; value?: any; args?: any }) =>
       post<Run>(`/approvals/${id}/decide`, body),
   },
 
   // ---- 设置 ----
   providers: {
-    list: () => get<Provider[]>('/providers'),
+    list: (opts?: RequestOptions) => get<Provider[]>('/providers', opts),
     catalog: () => get<any>('/providers/catalog'),
     create: (body: any) => post<Provider>('/providers', body),
     update: (id: string, body: any) => patch<Provider>(`/providers/${id}`, body),
@@ -347,7 +522,7 @@ export const api = {
 
   // ---- 工具 ----
   tools: {
-    list: () => get<ToolInfo[]>('/tools'),
+    list: (opts?: RequestOptions) => get<ToolInfo[]>('/tools', opts),
     /** 危险工具要 confirm，否则后端回 409，detail 写明它会做什么 */
     run: (name: string, args: Record<string, any>, opts?: { confirm?: boolean }) =>
       post<any>(`/tools/${name}/run`, opts?.confirm ? { args, confirm: true } : { args }),
@@ -358,6 +533,11 @@ export const api = {
     update: (id: string, body: any) => patch<any>(`/custom-tools/${id}`, body),
     remove: (id: string) => del(`/custom-tools/${id}`),
     test: (id: string, args: Record<string, any>) => post<any>(`/custom-tools/${id}/test`, { args }),
+    /** 试跑一份还没保存的配置，不落库。失败时回 {ok:false, error, hint, detail, duration_ms} */
+    testDraft: (body: {
+      name?: string; kind: string; parameters?: Record<string, any>; config?: Record<string, any>
+      args?: Record<string, any>
+    }) => post<any>('/custom-tools/test', body),
   },
   mcp: {
     list: () => get<any[]>('/mcp/servers'),
@@ -398,18 +578,26 @@ export const api = {
     clearScope: (scope: string) => del(`/memory/scope/${scope}`),
   },
   kb: {
-    collections: () => get<{ collection: string; documents: number; chunks: number }[]>('/kb/collections'),
+    collections: (opts?: RequestOptions) =>
+      get<{ collection: string; documents: number; chunks: number }[]>('/kb/collections', opts),
     documents: (collection?: string) =>
       get<KbDocument[]>(`/kb/documents${collection ? `?collection=${collection}` : ''}`),
     ingest: (body: { collection?: string; title?: string; content: string; source?: string }) =>
       post<KbDocument>('/kb/documents', body),
-    upload: (file: File, collection = 'default') => {
+    /**
+     * 上传一份文档。给了 onProgress 就报真实的字节进度（XHR）；字节发完以后是后端
+     * 在解析、切块，那段没有进度，调用方写「处理中」，不要把条拉满冒充完成
+     */
+    upload: (file: File, collection = 'default', opts?: UploadOptions) => {
       const form = new FormData()
       form.append('file', file)
-      return request<KbDocument>(`/kb/upload?collection=${collection}`, { method: 'POST', body: form })
+      const path = `/kb/upload?collection=${encodeURIComponent(collection)}`
+      return opts?.onProgress
+        ? upload<KbDocument>(path, form, opts)
+        : request<KbDocument>(path, { method: 'POST', body: form, signal: opts?.signal })
     },
     search: (q: string, collection?: string, alpha = 0.5) =>
-      get<any & { alpha?: number }>(`/kb/search?q=${encodeURIComponent(q)}&alpha=${alpha}${collection ? `&collection=${collection}` : ''}`),
+      get<KbSearchResult>(`/kb/search?q=${encodeURIComponent(q)}&alpha=${alpha}${collection ? `&collection=${encodeURIComponent(collection)}` : ''}`),
     /** 上传框能收哪些文件。以后端解析器为准，免得界面放行了后端必拒的格式 */
     formats: () => get<{
       extensions: string[]; text: string[]; tabular: string[]; legacy: string[]; accept: string
@@ -440,12 +628,21 @@ export const api = {
     probeEmbedding: (baseUrl: string) =>
       get<{ base_url: string; models: string[] }>(
         `/kb/embedding/probe?base_url=${encodeURIComponent(baseUrl)}`),
+    /** 等做完再返回。几千段配远端 embedding 要好几分钟，界面上用 startReindex */
     reindex: (collection?: string) =>
       post<{ reindexed: number; memories_reindexed: number; embedder: string }>(
-        `/kb/reindex${collection ? `?collection=${collection}` : ''}`),
+        `/kb/reindex${qs({ collection })}`),
+    /**
+     * 后台重建，立刻返回任务；进度用 reindexStatus 轮询。已经有一次在跑时回 409，
+     * detail 写着进度
+     */
+    startReindex: (collection?: string) =>
+      post<ReindexJob>(`/kb/reindex${qs({ collection, background: 'true' })}`),
+    /** 最近一次重建的进度。进程里只记最近一次，还没重建过是 {state:'idle'} */
+    reindexStatus: () => get<ReindexJob | { state: 'idle' }>('/kb/reindex'),
   },
   skills: {
-    list: () => get<Skill[]>('/skills'),
+    list: (opts?: RequestOptions) => get<Skill[]>('/skills', opts),
     create: (body: Partial<Skill>) => post<Skill>('/skills', body),
     update: (id: string, body: Partial<Skill>) => patch<Skill>(`/skills/${id}`, body),
     remove: (id: string) => del(`/skills/${id}`),
@@ -481,9 +678,15 @@ export const api = {
     generate: (body: {
       instruction: string; base_graph?: GraphSpec | null
       conversation_id?: string | null
+      /** 这一轮只查这几个数据源（id 或名字）。不传或空表示不限 */
+      datasource_ids?: string[] | null
     }) =>
-      post<{ graph: GraphSpec; explanation: string; issues: ValidationIssue[] }>(
-        '/copilot/generate', body),
+      post<{
+        graph: GraphSpec; explanation: string; issues: ValidationIssue[]
+        layout?: { mode: 'keep' | 'full'; placed: string[] }
+        /** 改图前后都在、工具绑定却变了的节点和成员。老后端不给 */
+        tool_changes?: ToolChange[]
+      }>('/copilot/generate', body),
     explain: (graph: GraphSpec) => post<{ explanation: string }>('/copilot/explain', { graph }),
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
     fromRun: (runId: string, name?: string) =>
@@ -514,7 +717,10 @@ export function streamCopilot(
     intent?: 'build' | 'answer'
     /** 属于哪次对话。带上它，这一轮才知道前面聊过什么 */
     conversation_id?: string | null
+    /** 这一轮只查这几个数据源（id 或名字）。不传或空表示不限 */
+    datasource_ids?: string[] | null
   },
+  // final 操作里带 tool_changes（ToolChange[]）：改图回执要显式列出工具绑定的变化
   onOp: (op: any) => void,
   onEnd: (error?: string) => void,
 ): () => void {

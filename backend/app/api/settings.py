@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import explain, not_configured, raw
+from app.api import health
+from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
@@ -57,9 +58,49 @@ class ProviderOut(BaseModel):
     # 只回掩码，明文 key 永远不出后端
     api_key_masked: str = ""
     has_key: bool = False
+    #: 最近一次测连接（见 app/api/health.py）。没测过、或者连接配置改过之后都是 None
+    last_checked_at: str | None = None
+    last_check_ok: bool | None = None
+    last_latency_ms: int | None = None
+    last_error: str | None = None
+
+
+#: extra 里这一项是后端记的最近一次测连接结果，不是用户填的配置：不回显、
+#: 不接受客户端写入，保存 extra 时原样留着
+LAST_CHECK = "last_check"
+
+
+def _user_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (extra or {}).items() if k != LAST_CHECK}
+
+
+def _with_saved_headers(extra: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, Any]:
+    """请求头的值回显的是 ***：原样带回来的，换回存着的真值。
+
+    设置页保存时会把读到的 extra 整块带回来。以前照单全收，于是改个名字、
+    勾一下启用，自定义请求头就全变成了字面上的 ***，接口从此 401。
+    """
+    headers = extra.get("headers")
+    if not isinstance(headers, dict):
+        return extra
+    old = (saved or {}).get("headers") or {}
+    return {**extra, "headers": {k: (old.get(k, v) if v == "***" else v) for k, v in headers.items()}}
+
+
+def _connection(provider: Provider, model: str | None = None) -> str:
+    """连接配置的指纹：类型、地址、实际用的钥匙、请求头这些、测的哪个模型。"""
+    return health.fingerprint(
+        "provider", provider.kind, (provider.base_url or "").strip(), _resolve_key(provider) or "",
+        _user_extra(provider.extra), model or provider.default_model or "",
+    )
+
+
+def _set_last_check(row: Provider, last: dict[str, Any] | None) -> None:
+    row.extra = {**_user_extra(row.extra), **({LAST_CHECK: last} if last else {})}
 
 
 def _to_out(row: Provider) -> ProviderOut:
+    extra = _user_extra(row.extra)
     return ProviderOut(
         id=row.id,
         name=row.name,
@@ -68,13 +109,14 @@ def _to_out(row: Provider) -> ProviderOut:
         default_model=row.default_model,
         models=row.models or [],
         enabled=row.enabled,
-        extra={k: v for k, v in (row.extra or {}).items() if k != "headers"} | (
-            {"headers": {k: "***" for k in (row.extra or {}).get("headers", {})}}
-            if (row.extra or {}).get("headers")
+        extra={k: v for k, v in extra.items() if k != "headers"} | (
+            {"headers": {k: "***" for k in extra.get("headers", {})}}
+            if extra.get("headers")
             else {}
         ),
         api_key_masked=mask(row.api_key),
         has_key=bool(row.api_key),
+        **health.fields((row.extra or {}).get(LAST_CHECK)),
     )
 
 
@@ -120,8 +162,10 @@ async def create_provider(
         models=payload.models,
         default_model=payload.default_model,
         enabled=payload.enabled,
-        extra=payload.extra,
+        extra=_user_extra(payload.extra),
     )
+    # 表单里刚测过这份配置：保存下来就带着那次结果
+    _set_last_check(row, health.draft_result(_connection(row)))
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -137,11 +181,21 @@ async def update_provider(
         raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
 
     data = payload.model_dump(exclude_unset=True)
+    before, last = _connection(row), (row.extra or {}).get(LAST_CHECK)
     if "api_key" in data:
         row.api_key = encrypt(data.pop("api_key")) if data["api_key"] else None
         data.pop("api_key", None)
+    if data.get("extra") is not None:
+        data["extra"] = _with_saved_headers(_user_extra(data["extra"]), row.extra)
+    else:
+        data.pop("extra", None)
     for key, value in data.items():
         setattr(row, key, value)
+    after = _connection(row)
+    if after != before:
+        # 测过的已经不是这份配置了：旧结果作废，表单里测过这一份的话换成那一次
+        last = health.draft_result(after)
+    _set_last_check(row, last)
     await session.commit()
     await session.refresh(row)
     return _to_out(row)
@@ -224,7 +278,16 @@ async def test_provider(
     row = await session.get(Provider, provider_id)
     if not row:
         raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
-    return await _try_model(row, payload.model, payload.prompt)
+    result = await _try_model(row, payload.model, payload.prompt)
+    # 只记默认模型的结果：拿别的模型测出 invalid_model，不等于这个接入连不上
+    if (payload.model or row.default_model) == row.default_model:
+        _set_last_check(row, _test_record(result))
+        await session.commit()
+    return result
+
+
+def _test_record(result: dict[str, Any]) -> dict[str, Any]:
+    return health.record(result.get("ok"), result.get("latency_ms"), result.get("error"))
 
 
 class ProviderDraftIn(BaseModel):
@@ -249,11 +312,9 @@ def _draft_provider(payload: ProviderDraftIn, saved: Provider | None) -> Provide
     编辑时 Key 框留空表示不改、请求头回显的是 ***——测试都得换回存着的真值，
     否则改个 Base URL 想测一下，只会得到一句"密钥不对"。
     """
-    extra = dict(payload.extra or {})
-    headers = extra.get("headers")
-    if saved and isinstance(headers, dict):
-        old = (saved.extra or {}).get("headers") or {}
-        extra["headers"] = {k: (old.get(k, v) if v == "***" else v) for k, v in headers.items()}
+    extra = _user_extra(payload.extra)
+    if saved:
+        extra = _with_saved_headers(extra, saved.extra)
     return Provider(
         name=payload.name or (saved.name if saved else "草稿"),
         kind=payload.kind,
@@ -284,7 +345,16 @@ async def test_provider_draft(
     problem = _config_problem(payload.kind, payload.base_url)
     if problem:
         return {"ok": False, "error": problem, "hint": "", "detail": ""}
-    return await _try_model(await _draft(payload, session), payload.model, payload.prompt)
+    saved = await session.get(Provider, payload.id) if payload.id else None
+    draft = _draft_provider(payload, saved)
+    result = await _try_model(draft, payload.model, payload.prompt)
+    last, key = _test_record(result), _connection(draft, payload.model)
+    health.remember_draft(key, last)
+    if saved is not None and key == _connection(saved):
+        # 编辑框里没改连接、只是再测一次：测的就是已保存的那份
+        _set_last_check(saved, last)
+        await session.commit()
+    return result
 
 
 @router.post("/providers/models")

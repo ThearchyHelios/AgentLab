@@ -232,11 +232,14 @@ async def stale_count(session: AsyncSession, scope: str | None = None) -> int:
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
-async def reindex(session: AsyncSession, scope: str | None = None) -> int:
+async def reindex(
+    session: AsyncSession, scope: str | None = None, *, on_progress: Any = None,
+) -> int:
     """用当前 embedder 重算记忆的向量，返回重算了多少条。
 
     换 embedding 模型之后记忆和知识库一起失效，但在此之前只有知识库有重建
     路径——记忆这边悄悄退回关键词，而且没有任何恢复手段。
+    on_progress(已完成, 总数) 每批提交之后回调一次。
     """
     stmt = select(MemoryItem)
     if scope:
@@ -246,9 +249,9 @@ async def reindex(session: AsyncSession, scope: str | None = None) -> int:
         return 0
 
     model_id, dim = embedder_id(), embedder_dim()
-    from app.memory.kb import _EMBED_BATCH
+    from app.memory import kb
 
-    batch = _EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
+    batch = kb._EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
     for i in range(0, len(rows), batch):
         part = rows[i:i + batch]
         vectors = await embed_texts([r.content for r in part])
@@ -257,6 +260,8 @@ async def reindex(session: AsyncSession, scope: str | None = None) -> int:
             row.embed_model = model_id
             row.embed_dim = dim
         await session.commit()
+        if on_progress:
+            on_progress(min(i + batch, len(rows)), len(rows))
     return len(rows)
 
 

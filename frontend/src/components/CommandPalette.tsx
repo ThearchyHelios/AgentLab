@@ -22,6 +22,7 @@ import { statusLabel } from '../lib/status'
 import { WORKFLOW_STATUS_LABEL, runClassLabel } from '../lib/terms'
 import { errorMessage } from '../lib/errors'
 import { disableNotify, enableNotify, notifySupported, useSignals } from '../lib/notify'
+import { canLeave, leavePass } from '../lib/leave'
 import type { Run } from '../types'
 
 /**
@@ -165,12 +166,21 @@ export async function toggleNotify(): Promise<void> {
 }
 
 export async function newConversation(navigate: NavigateFunction): Promise<void> {
+  // 先问再建：跳的时候才问的话，人点了「留下」，会话已经建出来了
+  if (!(await canLeave())) return
   try {
     const id = await useConversations.getState().create()
-    navigate(`/chat/${id}`)
+    navigate(`/chat/${id}`, leavePass())
   } catch (e) {
     toast.error(e)
   }
+}
+
+/** 同上：先问离开，再问名字、建工作流 */
+async function newWorkflow(navigate: NavigateFunction): Promise<void> {
+  if (!(await canLeave())) return
+  // 和编排页的「新建工作流」同一条路：同名校验、画布上有没保存的改动先问
+  await createWorkflow((to, opts) => navigate(to, leavePass(opts)), () => useCatalog.getState().refresh())
 }
 
 /** 等了多久，给待审批用：「12 分钟」「3 小时」「8 天」。粗粒度就够，要的是一眼看出晾了多久 */
@@ -247,6 +257,7 @@ function PaletteView() {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
   const listId = useId()
   const workflows = useCatalog((s) => s.workflows)
   const approvals = useCatalog((s) => s.approvals)
@@ -268,6 +279,16 @@ function PaletteView() {
       if (opener?.isConnected && (!now || now === document.body)) opener.focus({ preventScroll: true })
     }
   }, [opener])
+
+  // 开着时焦点只在面板里：刚跳过去的页面挂载时会自动聚焦（画布助手的输入框），
+  // 焦点一被抢走，接着打的字和 Esc 就都落到了面板底下
+  useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      if (e.target instanceof Node && !panelRef.current?.contains(e.target)) inputRef.current?.focus({ preventScroll: true })
+    }
+    document.addEventListener('focusin', onFocusIn)
+    return () => document.removeEventListener('focusin', onFocusIn)
+  }, [])
 
   // 最近运行、最近会话是打开面板时才取：常驻轮询它们不值得
   useEffect(() => {
@@ -324,8 +345,7 @@ function PaletteView() {
       {
         id: 'act:new-workflow', group: 'actions', label: '新建工作流', hint: '起手是一个输入、一个成果',
         keywords: 'new workflow 画布 编排 创建', icon: <Plus size={14} />,
-        // 和编排页的「新建工作流」同一条路：同名校验、画布上有没保存的改动先问
-        run: () => void createWorkflow((to, opts) => navigate(to, opts), () => useCatalog.getState().refresh()),
+        run: () => void newWorkflow(navigate),
       },
       {
         id: 'act:theme', group: 'actions',
@@ -455,6 +475,7 @@ function PaletteView() {
       onKeyDown={onKeyDown}
     >
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label="命令面板"

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ChevronRight, History, Inbox, Search, X } from 'lucide-react'
 import clsx from 'clsx'
-import { EmptyState, ErrorState, Skeleton, Spinner, StatusBadge } from '../../components/ui'
+import { EmptyState, ErrorState, Skeleton, Spinner, StatusBadge, useTicker } from '../../components/ui'
 import { STATUS, statusMeta, type StatusCode } from '../../lib/status'
 import {
   formatCost, formatDateTime, formatDay, formatTime, formatTokens, parseServerTime, shortId,
@@ -9,12 +9,13 @@ import {
 import { RUN_CLASS_LABEL, runClassLabel } from '../../lib/terms'
 import { summarizeRun } from '../../run/decode'
 import type { Approval, Run, Workflow } from '../../types'
-import { explainRunError } from './explain'
+import { UNSAVED_WORKFLOW_ID } from '../../api/client'
+import { explainRunError } from '../../lib/explain'
 import {
-  LONG_WAIT_MS, SEARCH_PLACEHOLDER, SEGMENT_CODES, UNSAVED_HINT, ageMs, formatSpan, headlineMs, idTail,
-  isLiveRun, isUnsaved, runName, runTiming, timingTitle, type ParsedQuery,
+  LONG_WAIT_MS, SEARCH_PLACEHOLDER, SEGMENT_CODES, UNSAVED_HINT, UNSAVED_NAME, ageMs, cancelReason, formatSpan,
+  headlineMs, idTail, isLiveRun, isUnsaved, runName, runShape, runTiming, timingTitle, type ParsedQuery,
 } from './model'
-import { ClassChip, LiveElapsed, TierChip, useNow } from './parts'
+import { ClassChip, LiveElapsed, TierChip } from './parts'
 import type { ApprovalQueue, RunList, StatusCounts } from './useRunsData'
 
 // -------------------------------------------------------------------------
@@ -39,7 +40,7 @@ export function FilterBar({
     [workflows],
   )
   // 链接里带着一个已经删掉的工作流：下拉里也得有它，否则选中项和实际筛选对不上
-  const orphan = workflowId && !workflows.some((w) => w.id === workflowId)
+  const orphan = workflowId && workflowId !== UNSAVED_WORKFLOW_ID && !workflows.some((w) => w.id === workflowId)
   return (
     <div className="flex shrink-0 flex-col gap-1.5 px-3 pt-2.5">
       <div className="relative">
@@ -86,12 +87,18 @@ export function FilterBar({
           data-runs-workflow=""
         >
           <option value="">全部工作流</option>
-          {orphan && <option value={workflowId}>已删除的工作流 {idTail(workflowId)}</option>}
-          {options.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}{dupNames.has(w.name) ? `  ${idTail(w.id)}` : ''}
-            </option>
-          ))}
+          {/* 画布、问数据当场建的图没有工作流 id，按名字筛不出来，单列一项 */}
+          <option value={UNSAVED_WORKFLOW_ID} title={UNSAVED_HINT}>{UNSAVED_NAME}</option>
+          {(orphan || options.length > 0) && (
+            <optgroup label="工作流">
+              {orphan && <option value={workflowId}>已删除的工作流 {idTail(workflowId)}</option>}
+              {options.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}{dupNames.has(w.name) ? `  ${idTail(w.id)}` : ''}
+                </option>
+              ))}
+            </optgroup>
+          )}
         </select>
       </div>
       {parsed.words.length > 0 && (
@@ -183,7 +190,7 @@ export function RunRows({
   onClear: () => void
 }) {
   const changed = useChangedRows(list.rows)
-  const now = useNow(60_000)
+  const now = useTicker(60_000)
 
   if (list.state === 'loading') {
     return <div className="p-3"><Skeleton rows={6} height={46} gap={8} /></div>
@@ -347,19 +354,43 @@ function RunRow({ run, code, approval, selected, dup, flash, now, onOpen }: {
         </time>
       </div>
       <RowContext run={run} code={code} approval={approval} now={now} />
-      <div className="flex items-center gap-2 text-2xs text-faint">
-        <span className="tnum" title={timingTitle(timing)} data-run-duration="">
+      {/* 一行放不下时让时长那一段截断（完整的分项在 title 里），别的都不折行：
+          折成两行时「2.8k tok」会被拆开，缩略条也跟着掉到下一行 */}
+      <div className="flex items-center gap-2 whitespace-nowrap text-2xs text-faint">
+        <span className="tnum min-w-0 truncate" title={timingTitle(timing)} data-run-duration="">
           {live ? <LiveElapsed since={run.started_at ?? run.created_at} prefix="" /> : formatSpan(headlineMs(timing))}
           {timing.source === 'usage' && (timing.waitMs ?? 0) > 0 && (
             <span className="text-faint"> · 含等人 {formatSpan(timing.waitMs, { coarse: (timing.waitMs ?? 0) >= 3_600_000 })}</span>
           )}
         </span>
-        {tokens ? <span className="tnum">{formatTokens(tokens, { compact: true })}</span> : null}
-        {run.usage?.cost_usd ? <span className="tnum">{formatCost(Number(run.usage.cost_usd))}</span> : null}
+        <ShapeBar run={run} code={code} waitingSince={approval?.created_at} now={now} />
+        {tokens ? <span className="tnum shrink-0">{formatTokens(tokens, { compact: true })}</span> : null}
+        {run.usage?.cost_usd ? <span className="tnum shrink-0">{formatCost(Number(run.usage.cost_usd))}</span> : null}
         <span className="flex-1" />
-        <span className="mono">{shortId(run.id)}</span>
+        <span className="mono shrink-0">{shortId(run.id)}</span>
       </div>
     </button>
+  )
+}
+
+/**
+ * 一行一条缩略条：墙钟里执行、等人各占多少，收在什么结局上。执行是安静的灰，
+ * 等人铺斜纹的琥珀，失败和取消在末端点一下——一眼扫下去，挂着等人的、失败的
+ * 自己会跳出来。构成怎么来的见 runShape
+ */
+function ShapeBar({ run, code, waitingSince, now }: {
+  run: Run; code: StatusCode; waitingSince?: string | null; now: number
+}) {
+  const shape = runShape(run, code, { waitingSince, now })
+  return (
+    <span className="runs-shape" title={shape.title} data-run-shape="" data-empty={shape.segs.length ? undefined : ''}
+          aria-hidden>
+      {shape.segs.map((s, i) => (
+        <i key={i} className={`runs-shape-${s.kind}`} style={{ width: `${s.frac * 100}%` }}
+           data-shape-seg={s.kind} data-open={s.open ? '' : undefined} />
+      ))}
+      {shape.end && <b className="runs-shape-end" data-shape-end={shape.end} />}
+    </span>
   )
 }
 
@@ -403,8 +434,10 @@ function RowContext({ run, code, approval, now }: {
           {code === 'queued' ? '排队中，等待开始' : '正在运行'}
         </div>
       )
-    case 'cancelled':
-      return <div className={clsx(line, 'text-faint')}>已取消{run.error && run.error !== '用户取消' ? ` · ${run.error}` : ''}</div>
+    case 'cancelled': {
+      const reason = cancelReason(run.error)
+      return <div className={clsx(line, 'text-faint')} title={run.error ?? undefined}>已取消{reason ? ` · ${reason}` : ''}</div>
+    }
     default: {
       const summary = summarizeRun(run.input, run.output)
       return summary
@@ -435,7 +468,7 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
   selectedId?: string
   dupNames: Set<string>
 }) {
-  const now = useNow(60_000)
+  const now = useTicker(60_000)
   if (queue.state === 'loading' && !queue.items.length) {
     return <div className="p-3"><Skeleton rows={3} height={56} gap={8} /></div>
   }

@@ -1,7 +1,7 @@
 /**
  * 失败运行的「为什么 + 怎么办」。
  *
- * 新后端的 run.error 已经是人话（engine/errors.py），但库里大量老运行留的是原始
+ * 新后端的 run.error 已经是人话（后端 app/core/errors.py），但库里大量老运行留的是原始
  * 异常：「NodeError: AnthropicModelNotFoundError: Error code: 404 - {…}」「_make_
  * query_tool.<locals>._run() got an unexpected keyword argument」。排错的人要的是
  * 哪个节点、为什么、下一步点哪里，所以这里按库里真实出现过的失败归类，并说清
@@ -9,10 +9,12 @@
  * 这个按钮。
  *
  * 归类之外的一律交给 lib/errors 的 humanizeError（去掉异常类名、拆标题和原因）。
- * 这份规则应当和助手流的报错行共用，先放在记录页，见 requests。
+ *
+ * 记录页的失败横幅、列表行，助手流的报错行、失败的步骤，问数据页的失败轮次都读
+ * 这一份：同一次失败在三处说法不一，人就不知道该信哪句、该点哪个按钮。
  */
 
-import { humanizeError } from '../../lib/errors'
+import { humanizeError } from './errors'
 
 export type FixKind = 'settings' | 'canvas' | 'rerun' | 'tools'
 
@@ -58,6 +60,56 @@ export function explainRunError(error: string | null | undefined, detail?: strin
 
   if (!text) {
     return { title: '运行失败，但没有留下原因', action: '打开「原始事件」看最后几条记录。', continuable: true, raw }
+  }
+  // 下面四类是「图本身有缺口」：模型没真调工具、团队轮数用完、校验修复想凑数、
+  // 提示词点名的工具没绑定。原样接着跑是同一份配置，只会再来一遍，所以都不给
+  // 「接着跑」，指到画布上去改
+  if (/没有真正调用工具|工具调用的原始标记|tool_markup_leak/.test(text)) {
+    return {
+      title: '模型没有真正调用工具',
+      reason: '它把工具调用当成文字写了出来，这一步一次都没查到数据。常见原因是节点没有绑定工具，或者模型、服务不支持工具调用。',
+      action: '到画布里确认这个节点绑定了要用的工具；绑定了还这样，就换一个支持工具调用的模型。改完再运行。',
+      continuable: false,
+      fix: 'canvas',
+      raw,
+    }
+  }
+  const exhausted = plain.match(/用完\s*(\d+)\s*轮(?:仍|还)?未完成[：:]?\s*(.*)/s)
+  if (exhausted || /team_exhausted/.test(text)) {
+    return {
+      title: exhausted ? `协作团队用完 ${exhausted[1]} 轮仍未完成` : '协作团队用完了轮数仍未完成',
+      reason: exhausted?.[2]?.trim() || '调度者一直没有判定完成，成员的原话不能当作结论交出去。',
+      action: '到画布里看看成员有没有绑定要用的工具，再调大这个团队的最多轮数；也可以把「用完轮数时」改成降档交付。',
+      continuable: false,
+      fix: 'canvas',
+      raw,
+    }
+  }
+  if (/原文没有的值|修复.*编造/.test(text)) {
+    const values = plain.match(/原文没有的值[：:]\s*([^\n。]+)/)?.[1]?.trim()
+    return {
+      title: '校验修复被拒绝：修复结果里出现了原文没有的值',
+      reason: `上游产出里没有这些数据${values ? `（${values}）` : ''}，修复不许凑数，这次校验判为失败。`,
+      action: '先看上游节点为什么没拿到数据（常见是没有绑定查询工具），改好后重新运行。',
+      continuable: false,
+      fix: 'canvas',
+      raw,
+    }
+  }
+  // 节点和协作成员两种说法：「…但节点没有绑定它」「成员「X」的…但没有给这个成员绑定它」
+  const unbound = plain.match(/提示词要求用\s*「?([^」，,\s]+?)」?\s*[，,]?\s*但(?:节点)?没有(?:给这个成员)?绑定/)
+  if (unbound) {
+    const member = plain.match(/成员「([^」]+)」的提示词/)?.[1]
+    return {
+      title: member
+        ? `成员「${member}」的提示词要求用「${unbound[1]}」，但没有给它绑定`
+        : `提示词要求用「${unbound[1]}」，但节点没有绑定它`,
+      reason: '运行时模型拿不到这个工具，只能编一个结果出来。',
+      action: '到画布里给这个节点绑定该工具，或者改掉提示词里的要求。',
+      continuable: false,
+      fix: 'canvas',
+      raw,
+    }
   }
   if (/人工驳回/.test(text)) {
     return {

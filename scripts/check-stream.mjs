@@ -939,6 +939,401 @@ console.log('\n=== 编号列、追问、CSV ===')
   await q.page.close()
 }
 
+// ---------------------------------------------------------------- 第三波
+/** 量一个 CSS 颜色表达式算出来的 rgb，跟元素的实际颜色比 */
+const colorOf = (page, v) => page.evaluate((expr) => {
+  const probe = document.createElement('span')
+  probe.style.color = expr
+  document.body.append(probe)
+  const c = getComputedStyle(probe).color
+  probe.remove()
+  return c
+}, v)
+const count = (text, needle) => text.split(needle).length - 1
+
+console.log('\n=== 协作团队用完轮数：泳道、头部、报错（NI-5、REQ-3A-3）===')
+for (const [w, dense, label] of [[1100, '0', '宽栏'], [380, '1', '窄栏']]) {
+  const { page, errors } = await open(`syn=exhausted&dense=${dense}`, { w, h: 900, name: `exhausted-${dense === '1' ? 'dense' : 'wide'}` })
+  const body = await page.locator('body').innerText()
+  const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
+  check(`${label}：泳道头说「用完 2 轮仍未完成」`, lanes.includes('用完 2 轮仍未完成'), lanes.split('\n')[0])
+  check(`${label}：泳道点出从没派到的成员`, lanes.includes('汇总员') && lanes.includes('没派到'), lanes.replace(/\n/g, ' ').slice(0, 120))
+  check(`${label}：最后那次判定不画成第 3 轮`, !/第\s?3\s?轮/.test(lanes), lanes.replace(/\n/g, ' ').slice(0, 160))
+  const cell = await page.evaluate(() => {
+    const b = document.querySelector('[data-team-lanes] button[aria-label^="取数员 第 1 轮"]')
+    return b ? getComputedStyle(b).backgroundColor : ''
+  })
+  check(`${label}：失败的成员格子是失败色`, !!cell && cell === await colorOf(page, 'var(--st-failed)'), cell)
+  check(`${label}：判定那一行说「轮数用完 · 调度者判定：未完成」`, body.includes('轮数用完 · 调度者判定：未完成'))
+  // 报错用 lib/explain 讲清为什么、怎么办，不再原样贴后端那一整句
+  const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
+  check(`${label}：报错标题说人话`, alert.startsWith('协作团队用完 2 轮仍未完成'), alert.split('\n')[0])
+  check(`${label}：报错给出怎么办`, alert.includes('最多轮数'), alert.replace(/\n/g, ' ').slice(0, 160))
+  check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
+  await page.close()
+}
+{
+  const { page } = await open('syn=exhausted-degrade', { w: 1100, h: 900, name: 'exhausted-degrade' })
+  const head = await page.locator('[data-turn] .sticky').first().innerText()
+  check('降档交付：头部不是一个安静的「已完成」', head.includes('协作团队没做完'), head.replace(/\n/g, ' '))
+  const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
+  check('降档交付：泳道头说按降档交付', lanes.includes('按降档交付'), lanes.split('\n')[0])
+  const body = await page.locator('body').innerText()
+  check('降档交付：团队那一行说清是降档', body.includes('用完 2 轮仍未完成，按降档交付'))
+  check('降档交付：提醒行给出下一步', body.includes('不能当结论用'))
+  await page.close()
+  const r = await open('syn=exhausted-closing&dense=1', { w: 380, h: 800, name: 'exhausted-closing' })
+  const rb = await r.page.locator('body').innerText()
+  check('最后那次判定进行中：写「调度者在做最后判定」', rb.includes('轮数用完 · 调度者在做最后判定'))
+  check('最后那次判定进行中：不写「第 3 轮」', !rb.includes('第 3 轮'))
+  const rl = await r.page.locator('[data-team-lanes]').innerText().catch(() => '')
+  check('最后那次判定进行中：泳道也说在判定', rl.includes('轮数用完 · 调度者在判定'), rl.split('\n').slice(0, 2).join(' '))
+  await r.page.close()
+}
+
+console.log('\n=== 模型把工具调用写成文字、修复凑数、工具超时（NI-3/4）===')
+{
+  const { page, errors } = await open('syn=markup&dense=1', { w: 380, h: 900, name: 'markup' })
+  const body = await page.locator('body').innerText()
+  const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
+  check('报错标题：模型没有真正调用工具', alert.startsWith('模型没有真正调用工具'), alert.split('\n')[0])
+  check('报错说原因和怎么办', alert.includes('当成文字') && alert.includes('绑定'), alert.replace(/\n/g, ' '))
+  check('原始标记不出现在正文里', !body.includes('DSML'))
+  const row = await page.locator('[data-node-id="query"][data-step-status="failed"]').first().innerText().catch(() => '')
+  check('失败的节点行说人话', row.includes('模型没有真正调用工具'), row.replace(/\n/g, ' '))
+  const warn = page.locator('[data-step-code="tool_markup_leak"]').first()
+  const warnText = await warn.innerText().catch(() => '')
+  check('提醒行说人话', warnText.includes('模型把工具调用写成了文字，没有真正执行'), warnText.replace(/\n/g, ' '))
+  check('下一步不用展开就看得到', await warn.locator('[data-step-next]').count() === 1
+    && (await warn.locator('[data-step-next]').innerText()).includes('绑定'))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+
+  const rp = await open('syn=repair', { w: 1100, h: 900, name: 'repair' })
+  const rbody = await rp.page.locator('body').innerText()
+  // 两次修复凑出的是同一个值：并成一行「×2」，原因照样写在行上；值不同时分行（见 check-decode）
+  check('每次修复都算上、说出凑出来的值', rbody.includes('让模型修复格式') && /×2/.test(rbody) && rbody.includes('total_count=0'),
+    rbody.split('\n').filter((l) => l.includes('修复') || l.includes('×')).join(' | '))
+  const ralert = await rp.page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
+  check('报错：校验修复被拒绝', ralert.startsWith('校验修复被拒绝'), ralert.split('\n')[0])
+  await rp.page.close()
+
+  const tl = await open('syn=timeout-live&dense=1', { w: 380, h: 700, name: 'timeout-live' })
+  const over = await tl.page.evaluate(() => {
+    const row = document.querySelector('[aria-busy="true"][data-step-status="running"]')
+    const clock = row?.querySelector('[data-over-limit]')
+    return { text: clock?.textContent ?? '', color: clock ? getComputedStyle(clock).color : '' }
+  })
+  check('进行中的查询越过时限要说破', over.text.includes('已超出 30 s 上限'), over.text)
+  check('越过时限的秒表是提醒色', over.color === await colorOf(tl.page, 'var(--st-waiting)'), over.color)
+  await tl.page.close()
+  const td = await open('syn=timeout', { w: 1100, h: 700 })
+  check('超时的查询写明超了多少上限', (await td.page.locator('body').innerText()).includes('超过 30 s 上限，已放弃等待'))
+  await td.page.close()
+}
+
+console.log('\n=== 放弃、结构化的报错、恢复的轮次、出具横幅（REQ-1/5/6、REQ-3A-2）===')
+{
+  const { page } = await open('syn=abandoned', { w: 1100, h: 600, name: 'abandoned' })
+  const mark = await page.locator('[data-phase-mark]').allInnerTexts()
+  check('放弃的运行：分段线说清谁放弃的、一并关了什么', mark.some((t) => t.includes('已取消') && t.includes('张工')
+    && t.includes('1 条待审批一并关闭')), mark.join(' | '))
+  await page.close()
+
+  const s = await open('syn=structured', { w: 1100, h: 600, name: 'structured' })
+  const alert = await s.page.locator('[data-turn] [role="alert"]').first().innerText()
+  // 以前页面拆好的「操作超时」又被翻译一遍：「操作超时 / 操作超时：查询超时…」
+  check('拆好的报错照原样画，标题不重复', count(alert, '操作超时') === 1 && alert.startsWith('操作超时'), alert.replace(/\n/g, ' '))
+  check('原因、怎么办各一行', alert.includes('查询超时：数据库 90 秒没有返回') && alert.includes('缩小时间范围'))
+  check('原文收进技术细节', !alert.includes('OperationalError') && alert.includes('技术细节'))
+  await s.page.close()
+
+  const r = await open('syn=restored', { w: 1100, h: 600 })
+  const head = await r.page.locator('[data-turn] .sticky').first().innerText()
+  check('恢复的轮次：头部照样写几次查询', head.includes('3 次查询'), head.replace(/\n/g, ' '))
+  await r.page.close()
+
+  const i = await open('syn=issued', { w: 1100, h: 900 })
+  check('出具横幅带 data-issuance-banner（画布印章据此滚过来）', await i.page.locator('[data-issuance-banner]').count() === 1)
+  const live = await i.page.locator('[data-turn] [role="status"][aria-live="polite"]').first().innerText()
+  check('读屏也播报出具档位', live.includes('降档出具'), live)
+  await i.page.close()
+
+  const c = await open('syn=tools-dropped&dense=1', { w: 380, h: 700, name: 'tools-dropped' })
+  const cb = await c.page.locator('body').innerText()
+  check('改图时工具被清空要单独说', cb.includes('「数据查询」的工具被清空了'))
+  check('自查通过但工具被去掉，自查那行不是安静的通过', cb.includes('自查通过，但有 1 处工具被去掉了'))
+  await c.page.close()
+}
+
+console.log('\n=== 吸顶的轮次头贴着顶边（REQ-8）===')
+for (const [q, w, h, label] of [['syn=mixed', 1024, 768, '宽栏 1024'], ['syn=mixed', 1180, 800, '宽栏 1180'],
+                                ['syn=mixed&dense=1', 380, 700, '窄栏']]) {
+  const { page } = await open(q, { w, h })
+  const gap = await page.evaluate(() => {
+    const sc = document.querySelector('[data-stream-scroll]')
+    sc.scrollTop = Math.min(sc.scrollHeight - sc.clientHeight, 260)
+    sc.dispatchEvent(new Event('scroll'))
+    const head = document.querySelector('[data-turn] .sticky')
+    const s = sc.getBoundingClientRect()
+    const hd = head.getBoundingClientRect()
+    // 顶边往下 1px 那一行像素：落在头上才算没缝
+    const hit = document.elementFromPoint(s.left + s.width / 2, s.top + 1)
+    return { gap: Math.round(hd.top - s.top), onHead: !!hit && head.contains(hit), scrolled: sc.scrollTop }
+  })
+  check(`${label}：往下翻后轮次头贴着滚动区顶边，上面不露正文`, gap.scrolled > 0 && gap.gap === 0 && gap.onHead, JSON.stringify(gap))
+  await page.close()
+}
+
+console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（REQ-1/3/4、REQ-3A-2）===')
+{
+  const WF_ID = 'fx-stream3'
+  const RUN = 'fxstream0003'
+  const GRAPH = {
+    nodes: [
+      { id: 'in', type: 'input', position: { x: 0, y: 0 }, data: { label: '问题', config: { fields: [{ name: 'q' }] } } },
+      { id: 'review', type: 'human', position: { x: 300, y: 0 }, data: { label: '主管审批', config: { mode: 'approve' } } },
+      { id: 'out', type: 'output', position: { x: 620, y: 0 }, data: { label: '成果', config: {} } },
+      { id: 'query', type: 'agent', position: { x: 300, y: 200 }, data: { label: '数据查询', config: { tools: [] } } },
+    ],
+    edges: [{ id: 'e1', source: 'in', target: 'review' }, { id: 'e2', source: 'review', target: 'out', sourceHandle: 'approved' }],
+  }
+  const WF = { id: WF_ID, name: '右栏检查三', description: '', graph: GRAPH, tags: [], version: 1, status: 'draft',
+    published_version: null, run_count: 0, created_at: '2026-09-26T00:00:00Z', updated_at: '2026-09-26T00:00:00Z' }
+  const APPROVAL = { id: 'ap-3', run_id: RUN, node_id: 'review', mode: 'approve', title: '这份报表可以发出吗？',
+    payload: { message: '华东 1,204 单' }, status: 'pending', response: {}, created_at: new Date(Date.now() - 60_000).toISOString(),
+    workflow_name: '右栏检查三', node_label: '主管审批', run_class: 'exploratory' }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' })
+  await ctx.addInitScript(() => { try { localStorage.setItem('agentlab_actor', '张工') } catch { /* 隐私窗口 */ } })
+  const page = await ctx.newPage()
+  const errors = []
+  page.on('pageerror', (e) => errors.push(e.message))
+  const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+  let pending = true
+  let status = 'interrupted'
+  const cancels = []
+  await page.route(/\/api\/workflows(\?.*)?$/, async (route) => {
+    if (route.request().method() !== 'GET') return json(route, { detail: '检查脚本不写库' }, 409)
+    const real = await (await route.fetch()).json().catch(() => [])
+    return json(route, [WF, ...(Array.isArray(real) ? real : [])])
+  })
+  await page.route(/\/api\/workflows\/fx-stream3(\/.*)?(\?.*)?$/, (route) =>
+    route.request().method() === 'GET' ? json(route, WF) : json(route, { detail: '检查脚本不写库' }, 409))
+  await page.route(/\/api\/conversations(\/.*)?(\?.*)?$/, (route) =>
+    route.request().method() === 'GET' ? json(route, []) : json(route, { id: 'fx-conv3', kind: 'canvas', title: '', turns: [] }))
+  await page.route(/\/api\/approvals(\/.*)?(\?.*)?$/, (route) =>
+    route.request().method() !== 'GET' ? json(route, { detail: '检查脚本不写库' }, 409) : json(route, pending ? [APPROVAL] : []))
+  await page.route(/\/api\/runs(\/.*)?(\?.*)?$/, (route) => {
+    const req = route.request()
+    if (req.method() === 'POST' && req.url().includes(`${RUN}/cancel`)) {
+      cancels.push(req.headers()['x-actor'] ?? '')
+      return json(route, { ok: true, status: 'cancelled' })
+    }
+    if (req.method() === 'GET' && req.url().includes(RUN)) {
+      return json(route, { id: RUN, workflow_id: WF_ID, status, input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory' })
+    }
+    return req.method() === 'GET' ? route.continue() : json(route, { detail: '检查脚本不写库' }, 409)
+  })
+  await page.goto(`${WEB}/studio/${WF_ID}`, { waitUntil: 'networkidle' })
+  await page.waitForFunction((id) => window.__studio?.getState().workflow?.id === id, WF_ID, { timeout: 15000 })
+  const now = Date.now() / 1000
+  const ev = (seq, type, node_id, data = {}, t = 0) => ({ seq, type, node_id, data, ts: now - 30 + t })
+  const WAIT = [
+    ev(1, 'run.started', null, { nodes: 3 }, 0),
+    ev(2, 'node.started', 'in', { node_type: 'input', label: '问题' }, 0.1),
+    ev(3, 'node.finished', 'in', { duration_ms: 3, preview: { q: 'x' } }, 0.2),
+    ev(4, 'node.started', 'review', { node_type: 'human', label: '主管审批' }, 0.3),
+    ev(5, 'human.requested', 'review', { kind: 'human_node', node_id: 'review', mode: 'approve', title: '这份报表可以发出吗？' }, 0.4),
+    ev(6, 'run.interrupted', 'review', { payload: { node_id: 'review', title: '这份报表可以发出吗？' } }, 0.5),
+  ]
+  const feed = (list) => page.evaluate((l) => { const s = window.__studio.getState(); for (const e of l) s.applyEvent(e) }, list)
+  await page.evaluate((run) => window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'queued', input: {},
+    output: {}, error: null, usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} }), RUN)
+  await feed(WAIT)
+  await page.waitForTimeout(600)
+  const panel = page.locator('.sheet-in').first()
+  check('等人：栏头「去审批」旁边有「放弃这次运行」', await panel.getByRole('button', { name: '放弃这次运行' }).count() === 1)
+
+  // 胶囊的「去审批」在右栏处于对话层时派发 agentlab:goto-approval：右栏得自己切过去、把焦点放进审批卡
+  await panel.getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  check('回到对话层后运行层收起', await page.locator('.sheet-in').count() === 0)
+  // 右栏条和胶囊同一套说法：停在谁、等了多久
+  const strip = await page.locator('[data-run-strip]').innerText().catch(() => '')
+  check('对话层的运行条说停在哪个节点', strip.includes('主管审批'), strip.replace(/\n/g, ' '))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-strip-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  // 右栏收起时它还挂着（只是藏起来）：那时不接手，让胶囊自己兜底，别切到一层没人看得见的运行层
+  const unhandled = await page.evaluate((run) => {
+    const aside = document.querySelector('[data-assistant-panel]').closest('aside')
+    aside.style.visibility = 'hidden'
+    const passed = window.dispatchEvent(new CustomEvent('agentlab:goto-approval', { detail: { runId: run }, cancelable: true }))
+    aside.style.visibility = ''
+    return passed
+  }, RUN)
+  await page.waitForTimeout(200)
+  check('右栏收起时不接手 goto-approval', unhandled && await page.locator('.sheet-in').count() === 0)
+  await page.evaluate((run) => window.dispatchEvent(new CustomEvent('agentlab:goto-approval', { detail: { runId: run, nodeId: 'review' } })), RUN)
+  await page.waitForTimeout(900)
+  const focusIn = await page.evaluate(() => !!document.activeElement?.closest('[data-approval]'))
+  check('goto-approval：切到运行层', await page.locator('.sheet-in').count() === 1)
+  check('goto-approval：焦点落在审批卡里', focusIn)
+  check('goto-approval：审批卡描了一圈', await page.locator('[data-approval].sf-flash').count() === 1)
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/stream-panel-goto-approval-dark.png` })
+
+  // 放弃：确认之后调 cancel，带着署名；事件流过来就收成「已取消」，说清是谁放弃的
+  await page.locator('.sheet-in').first().getByRole('button', { name: '放弃这次运行' }).click()
+  await page.waitForTimeout(300)
+  const dialog = await page.locator('[role="dialog"]').innerText().catch(() => '')
+  check('放弃前先确认，说清后果', dialog.includes('待审批') && dialog.includes('不能再接着跑'), dialog.replace(/\n/g, ' ').slice(0, 160))
+  await page.locator('[role="dialog"]').getByRole('button', { name: '放弃这次运行' }).click()
+  await page.waitForTimeout(400)
+  check('放弃：调了 cancel，带着署名', cancels.length === 1 && decodeURIComponent(cancels[0]) === '张工', JSON.stringify(cancels))
+  pending = false
+  status = 'cancelled'
+  await feed([ev(7, 'run.cancelled', null, { timing: { wall_ms: 30000, active_ms: 500, wait_ms: 29500 }, actor: '张工',
+    message: '放弃了这次运行，1 条待审批一并关闭' }, 30), ev(8, 'stream.end', null, { status: 'cancelled' }, 30)])
+  await page.waitForTimeout(500)
+  const head = await page.locator('.sheet-in [data-turn] .sticky').first().innerText().catch(() => '')
+  check('放弃：头部写已取消', head.includes('已取消'), head.replace(/\n/g, ' '))
+  const marks = await page.locator('.sheet-in [data-phase-mark]').allInnerTexts()
+  check('放弃：分段线写清谁放弃、一并关了什么', marks.some((t) => t.includes('张工') && t.includes('一并关闭')), marks.join(' | '))
+  check('放弃之后不再给「去审批」和「放弃」', await page.locator('.sheet-in').getByRole('button', { name: /去审批|放弃这次运行/ }).count() === 0)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.screenshot({ path: `${SHOTS}/stream-panel-abandoned-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+
+  // 出具横幅：画布上的印章派发 agentlab:goto-issuance；右栏在对话层时先切过去再滚到横幅
+  await page.evaluate((run) => {
+    const s = window.__studio.getState()
+    s.clearRun()
+    window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'succeeded', input: {}, output: {
+      结论: '华东 1,204 单', _issuance: { tier: 'degraded', calibers: [], metrics_checked: 1, matched_numbers: 0,
+        unmatched_numbers: [{ token: '1,204', context: '华东 1,204 单' }], missing_required: [], missing_expected: [], gaps: [] } },
+      error: null, usage: {}, run_class: 'exploratory', version: null }, streaming: false, unsubscribe: () => {} })
+  }, RUN)
+  await feed([ev(1, 'run.started', null, { nodes: 3 }, 0), ev(2, 'node.started', 'out', { node_type: 'output', label: '成果' }, 0.1),
+    ev(3, 'issuance', 'out', { tier: 'degraded', unmatched: 1, gaps: [], metrics_checked: 1, matched_numbers: 0 }, 0.2),
+    ev(4, 'node.finished', 'out', { duration_ms: 2, preview: {} }, 0.3),
+    ev(5, 'run.finished', null, { output: { 结论: '华东 1,204 单', _issuance: { tier: 'degraded', calibers: [], metrics_checked: 1,
+      matched_numbers: 0, unmatched_numbers: [{ token: '1,204', context: '华东 1,204 单' }], missing_required: [], missing_expected: [], gaps: [] } },
+      usage: {}, duration_ms: 400, timing: { wall_ms: 400, active_ms: 400, wait_ms: 0 } }, 0.4)])
+  await page.waitForTimeout(400)
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  await page.evaluate((run) => window.dispatchEvent(new CustomEvent('agentlab:goto-issuance', { detail: { runId: run } })), RUN)
+  await page.waitForTimeout(900)
+  const banner = await page.evaluate(() => {
+    const b = document.querySelector('.sheet-in [data-issuance-banner]')
+    const s = b?.closest('[data-stream-scroll]')?.getBoundingClientRect()
+    const r = b?.getBoundingClientRect()
+    return { found: !!b, inView: !!r && !!s && r.top >= s.top - 1 && r.top < s.bottom, focused: !!b && document.activeElement === b }
+  })
+  check('goto-issuance：切到运行层、横幅在视野里', banner.found && banner.inView, JSON.stringify(banner))
+  // 焦点带过去：读屏和键盘用户从画布那头被带过来，得落在横幅上，而不是留在画布的印章上
+  check('goto-issuance：焦点落在出具横幅上', banner.focused)
+
+  // 回执：看过了没改（unchanged）不说「已更新画布」；修过几处数不出来时不写「几 处」
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.evaluate(() => {
+    const s = window.__studio.getState()
+    s.clearRun()
+    const base = { explanation: '', error: '', phase: 'done' }
+    window.__studio.setState({ copilotTurns: [
+      { ...base, id: 'u1', instruction: '检查一下有没有问题', outcome: 'unchanged',
+        ops: [{ op: 'done', explanation: '' }, { op: 'check', status: 'passed', repaired: 0 }, { op: 'final', graph: { nodes: [{ id: 'in' }] } }] },
+      { ...base, id: 'u2', instruction: '把循环条件改对', outcome: 'applied', diff: { added: [], changed: ['review'], removed: [], total: 1 },
+        ops: [{ op: 'update_node', id: 'review' }, { op: 'check', status: 'passed', repaired: 1 }, { op: 'final', graph: { nodes: [{ id: 'in' }] } }] },
+    ] })
+  })
+  await page.waitForTimeout(400)
+  const turns = await page.locator('[data-turn]').allInnerTexts()
+  check('unchanged：说「看过了，画布没有需要改的地方」', turns[0]?.includes('看过了，画布没有需要改的地方')
+    && !turns[0]?.includes('已更新画布'), turns[0]?.split('\n').slice(0, 3).join(' '))
+  check('修过但数不出几处：不写「几 处」', turns[1]?.includes('自查发现的问题已自动修好') && !turns[1]?.includes('几 处'),
+    turns[1]?.split('\n').slice(0, 3).join(' '))
+
+  // 改图时模型漏写了 tools：回执逐项列出去掉了什么；自查是通过的，「让 Copilot 再修」不管用，撤销是首选
+  const dropped = { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
+    message: '「数据查询」的工具从 db_query__shop 变成了空：这一轮的要求里没有提到去掉工具' }
+  await page.evaluate((warn) => {
+    window.__studio.setState({ copilotTurns: [{ explanation: '', error: '', phase: 'done', id: 'u3', instruction: '只查上月的数据',
+      outcome: 'applied', diff: { added: [], changed: ['query'], removed: [], total: 1 },
+      ops: [{ op: 'update_node', id: 'query', label: '数据查询', config: { system: '只查上月' } },
+        { op: 'check', status: 'passed', repaired: 0, warnings: [warn] },
+        { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'query' }] }, issues: [warn], tool_changes: [{ node_id: 'query',
+          label: '数据查询', member: null, field: 'tools', before: ['db_query__shop'], after: [], added: [], removed: ['db_query__shop'] }] }] }] })
+  }, dropped)
+  await page.waitForTimeout(400)
+  const loss = await page.locator('[data-tool-changes]').innerText().catch(() => '')
+  check('回执逐项列出被去掉的工具', loss.includes('「数据查询」去掉了') && loss.includes('db_query__shop') && loss.includes('一个工具都没有'),
+    loss.replace(/\n/g, ' '))
+  const head3 = await page.locator('[data-turn="u3"] .sticky').innerText().catch(() => '')
+  check('回执头部是提醒，写清几处工具被去掉', head3.includes('1 处工具被去掉了'), head3.replace(/\n/g, ' '))
+  check('只丢了工具时不给「让 Copilot 再修」，撤销是主按钮',
+    await page.getByRole('button', { name: /让 Copilot/ }).count() === 0
+    && await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-tools-lost-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+
+  // 模型把工具调用写成文字、判失败：报错和提醒行给「打开『数据查询』的设置」，点了就是那个节点的属性面板
+  const MARKUP_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
+  await page.evaluate((run) => {
+    window.__studio.setState({ copilotTurns: [] })
+    window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'running', input: {}, output: {}, error: null,
+      usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} })
+  }, RUN)
+  await feed([ev(1, 'run.started', null, { nodes: 4 }, 0), ev(2, 'node.started', 'query', { node_type: 'agent', label: '数据查询' }, 0.1),
+    ev(3, 'llm.start', 'query', { model: 'demo-chat' }, 0.2),
+    ev(4, 'llm.end', 'query', { model: 'demo-chat', duration_ms: 1800, input_tokens: 800, output_tokens: 90, cost_usd: 0.001 }, 2),
+    ev(5, 'log', 'query', { level: 'warn', code: 'tool_markup_leak', message: '模型把工具调用写成了文字（<｜｜DSML｜｜invoke name="db_query__shop">…），没有真正调用工具，已提醒它重试一次' }, 2.1),
+    ev(6, 'node.failed', 'query', { error: MARKUP_ERROR, duration_ms: 3900 }, 4),
+    ev(7, 'run.failed', null, { error: MARKUP_ERROR, node_id: 'query', label: '数据查询', timing: { wall_ms: 4000, active_ms: 4000, wait_ms: 0 } }, 4)])
+  await page.waitForTimeout(500)
+  const runPanel = page.locator('.sheet-in').first()
+  const alertText = await runPanel.locator('[data-turn-error]').innerText().catch(() => '')
+  check('右栏报错说人话：模型没有真正调用工具', alertText.startsWith('模型没有真正调用工具') && !alertText.includes('DSML'),
+    alertText.split('\n')[0])
+  check('提醒行的下一步也给直达入口', await runPanel.locator('[data-step-code="tool_markup_leak"] [data-fix="canvas"]').count() === 1)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-markup-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const openSettings = runPanel.locator('[data-turn-error]').getByRole('button', { name: '打开「数据查询」的设置' })
+  check('报错给「打开『数据查询』的设置」', await openSettings.count() === 1)
+  if (await openSettings.count()) {
+    await openSettings.click()
+    await page.waitForTimeout(300)
+    check('点「打开设置」就是那个节点的属性面板', await page.evaluate(() => window.__studio.getState().selectedId) === 'query')
+  }
+
+  check('画布右栏没有运行时报错', errors.length === 0, errors.join(' | '))
+  await ctx.close()
+}
+
 await browser.close()
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 助手流渲染全部通过')
 process.exit(failed ? 1 : 0)

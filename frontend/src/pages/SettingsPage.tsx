@@ -9,19 +9,18 @@ import { api } from '../api/client'
 import type { ProviderDraft } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
-  confirmDialog, EmptyState, ErrorState, Field, isComposing, Modal, promptDialog, Skeleton, Spinner,
-  TabPanel, Tabs, toast, useTabRoute,
+  confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, isComposing, Modal, PageHeader,
+  promptDialog, SectionBar, Skeleton, Spinner, TabPanel, Tabs, toast, useRadioGroup, useTabRoute,
 } from '../components/ui'
+import { setThemePref, useTheme } from '../components/CommandPalette'
 import { humanizeError } from '../lib/errors'
-import { formatNumber } from '../lib/format'
+import { formatNumber, shortLabel } from '../lib/format'
+import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
+import type { HealthRecord } from '../lib/health'
+import { workflowList, workflowsMentioning } from '../lib/mentions'
 import type { Provider } from '../types'
-import { applyTheme, normalizeTheme, readThemePref } from '../lib/theme'
+import { normalizeTheme } from '../lib/theme'
 import type { ThemePref } from '../lib/theme'
-import {
-  checkHealth, DeleteButton, forgetHealth, HealthPill, PageHeader, SectionBar, setHealth, shortLabel,
-  useHealth, useRadioGroup, workflowList, workflowsMentioning,
-} from './DataSourcesTab'
-import type { HealthRecord } from './DataSourcesTab'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -127,6 +126,7 @@ function ProvidersTab() {
         <EmptyState
           icon={<KeyRound size={22} />}
           title="还没有配置模型"
+          source="providers"
           body="接一个 Anthropic、OpenAI，或任何 OpenAI 兼容的服务（DeepSeek、通义、本机 Ollama…），agent 才跑得起来。"
           action={<button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>}
         />
@@ -144,9 +144,12 @@ function ProvidersTab() {
           provider={editing === 'new' ? null : editing}
           catalog={catalog}
           onClose={() => setEditing(null)}
-          onSaved={(saved, tested) => {
+          onSaved={(saved, tested, reconnected) => {
             setEditing(null)
+            // 本机记着的那次测连接说的是改之前的配置：换了地址、钥匙或默认模型，
+            // 它就不作数了（后端同样清掉了自己记的那份）
             if (tested) setHealth(`provider:${saved.id}`, tested)
+            else if (reconnected) forgetHealth(`provider:${saved.id}`)
             void refresh()
             toast.ok(`已保存「${saved.name}」`)
           }}
@@ -160,7 +163,8 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
   provider: Provider; kindLabel: string; onEdit: () => void; onRemove: () => void
 }) {
   const key = `provider:${p.id}`
-  const { record, checkingSince } = useHealth(key)
+  // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
+  const { record, checkingSince } = useHealth(key, healthFromServer(p))
   const test = () => checkHealth(key, async () => {
     const r = await api.providers.test(p.id, { model: p.default_model ?? undefined })
     return {
@@ -215,9 +219,18 @@ interface ProviderForm {
   extra: Record<string, any>
 }
 
+/**
+ * 决定「连不连得上」的那几项：类型、地址、钥匙、请求头、测的哪个模型。和后端
+ * 判断测连接结果还作不作数的那份指纹是同一组字段，改名字、改可选模型不算
+ */
+const providerConnection = (f: ProviderForm) => JSON.stringify([
+  f.kind, f.base_url.trim(), !!f.api_key, f.extra?.auth_style ?? null, f.extra?.headers ?? null, f.default_model,
+])
+
 function ProviderEditor({ provider, catalog, onClose, onSaved }: {
   provider: Provider | null; catalog: any; onClose: () => void
-  onSaved: (saved: Provider, tested?: HealthRecord) => void
+  /** reconnected：连接配置改过了，之前测的结果不再代表它 */
+  onSaved: (saved: Provider, tested?: HealthRecord, reconnected?: boolean) => void
 }) {
   const [initial, setInitial] = useState<ProviderForm>(() => ({
     name: provider?.name ?? '',
@@ -353,7 +366,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
       const saved = provider
         ? await api.providers.update(provider.id, payload)
         : await api.providers.create(payload)
-      onSaved(saved, testFresh ? test.result : undefined)
+      onSaved(saved, testFresh ? test.result : undefined, providerConnection(form) !== providerConnection(initial))
     } catch (e) {
       toast.error(e)
     } finally {
@@ -579,8 +592,8 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
 
 /**
  * 偏好设置。保存规则只有两条，页面上写明：
- * - 主题：选中即生效、即保存（只 PUT ui.theme）。它当场就变了样，再要求点保存，
- *   用户离开时会以为已经存了，下次打开又回到旧主题；
+ * - 主题：选中即生效、即保存（setThemePref，和导航、⌘K 的切换同一条路）。它当场
+ *   就变了样，再要求点保存，用户离开时会以为已经存了，下次打开又回到旧主题；
  * - 其余（署名、运行默认值）：改完点「保存设置」，底部常驻一条「有 N 项未保存」，
  *   切标签、点导航、关页都会先问。危险工具审批这种安全开关不能误点一下就生效，
  *   所以不做自动保存。署名以前每敲一个字就写 localStorage，现在跟着一起保存。
@@ -590,8 +603,6 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
   const [values, setValues] = useState<Record<string, any> | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
   const [scopes, setScopes] = useState<{ scope: string; count: number }[]>([])
-  const [theme, setTheme] = useState<ThemePref>(() => readThemePref())
-  const [themeSave, setThemeSave] = useState<{ state: 'saving' | 'saved' | 'error'; error?: unknown } | null>(null)
   // 署名存在 localStorage，保存后成为新的基线，不再算作改动
   const savedActor = useRef<string>((() => { try { return localStorage.getItem('agentlab_actor') ?? '' } catch { return '' } })())
   const [draft, setDraft] = useState<{ actor: string; scope: string; collection: string; confirm: boolean } | null>(null)
@@ -601,9 +612,7 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
 
   const load = async () => {
     try {
-      const v = await api.settings.get()
-      setValues(v)
-      setTheme(normalizeTheme(v?.ui?.theme))
+      setValues(await api.settings.get())
       setLoadError(null)
     } catch (e) {
       setLoadError(e)
@@ -632,62 +641,51 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
     const t = setTimeout(() => setSavedFlash(0), 1600)
     return () => clearTimeout(t)
   }, [savedFlash])
-  // 主题旁的「已保存」同样只亮一下：一直挂着就不再是「刚存上」的回执了
-  useEffect(() => {
-    if (themeSave?.state !== 'saved') return
-    const t = setTimeout(() => setThemeSave((s) => (s?.state === 'saved' ? null : s)), 1600)
-    return () => clearTimeout(t)
-  }, [themeSave])
 
   const edit = (patch: Partial<typeof saved>) => {
     setSaveError(null)
     setDraft({ ...cur, ...patch })
   }
 
-  const pickTheme = async (next: ThemePref) => {
-    setTheme(next)
-    applyTheme(normalizeTheme(next))
-    if (!values) return
-    setThemeSave({ state: 'saving' })
-    try {
-      const out = await api.settings.put({ ui: { ...(values.ui ?? {}), theme: next } })
-      setValues((v) => ({ ...(v ?? {}), ui: out?.ui ?? { ...(v?.ui ?? {}), theme: next } }))
-      setThemeSave({ state: 'saved' })
-    } catch (e) {
-      setThemeSave({ state: 'error', error: e })
-    }
-  }
-
+  /**
+   * 署名只在这台浏览器里，先落本机：它不该跟着后端一起「没存上」。运行默认值
+   * 有改动才 PUT——只改了署名时不必碰服务端，断线时也存得上
+   */
   const save = async () => {
     if (!values || !dirty) return
     setSaving(true)
     setSaveError(null)
-    try {
-      const run = {
-        ...(values.run ?? {}),
-        default_memory_scope: cur.scope,
-        default_collection: cur.collection,
-        confirm_dangerous_tools: cur.confirm,
-      }
-      const out = await api.settings.put({ run })
+    const actor = cur.actor.trim()
+    if (actor !== savedActor.current) {
       try {
-        if (cur.actor.trim()) localStorage.setItem('agentlab_actor', cur.actor.trim())
+        if (actor) localStorage.setItem('agentlab_actor', actor)
         else localStorage.removeItem('agentlab_actor')
       } catch { /* 隐私模式：署名只能这一次会话有效 */ }
-      setValues((v) => ({ ...(v ?? {}), run: out?.run ?? run }))
-      savedActor.current = cur.actor.trim()
+      savedActor.current = actor
+      // 同一个标签页里写 localStorage 不触发 storage 事件：导航底部的署名首字靠它立刻跟上
+      window.dispatchEvent(new Event('agentlab:actor'))
+    }
+    const runChanged = changed.some((k) => k !== 'actor')
+    try {
+      if (runChanged) {
+        const run = {
+          ...(values.run ?? {}),
+          default_memory_scope: cur.scope,
+          default_collection: cur.collection,
+          confirm_dangerous_tools: cur.confirm,
+        }
+        const out = await api.settings.put({ run })
+        setValues((v) => ({ ...(v ?? {}), run: out?.run ?? run }))
+      }
       setDraft(null)
       setSavedFlash(Date.now())
     } catch (e) {
+      // 署名已经存上了：留在草稿里的只剩运行默认值，条上的计数跟着变少
+      setDraft({ ...cur, actor })
       setSaveError(e)
     } finally {
       setSaving(false)
     }
-  }
-  if (!values) {
-    return loadError
-      ? <ErrorState error={loadError} onRetry={() => void load()} />
-      : <Skeleton rows={6} height={14} />
   }
 
   const scopeOptions = [...new Set(['default', ...scopes.map((s) => s.scope), cur.scope])]
@@ -696,83 +694,77 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
 
   return (
     <div className="max-w-2xl space-y-6 pb-20">
-      <section>
-        <SectionBar title="界面" hint="选中就生效、就保存，所有设备共用。" />
-        <div className="flex flex-wrap items-center gap-3">
-          <ThemeChoice value={theme} onChange={(v) => void pickTheme(v)} />
-          <span className="text-2xs" aria-live="polite" data-theme-save={themeSave?.state}>
-            {themeSave?.state === 'saving' && <span className="inline-flex items-center gap-1 text-faint"><Spinner size={10} /> 正在保存…</span>}
-            {themeSave?.state === 'saved' && <span className="fade-up text-faint"><Check size={11} className="mr-0.5 inline text-[var(--ok)]" aria-hidden />已保存</span>}
-            {themeSave?.state === 'error' && (
-              <span className="text-[var(--err)]">
-                没存上（{humanizeError(themeSave.error).title}），下次打开会回到原来的主题
-                <button className="btn btn-xs ml-2" onClick={() => void pickTheme(theme)}>重试</button>
+      {/* 主题不依赖设置接口：断线时也能换，恢复后自动补存 */}
+      <ThemeSection />
+
+      {!values ? (
+        loadError
+          ? <ErrorState error={loadError} onRetry={() => void load()} />
+          : <Skeleton rows={6} height={14} />
+      ) : (
+        <>
+          <section>
+            <SectionBar title="操作者署名" hint="只存在这台浏览器里，换台电脑要重新填。" />
+            <Field label="名字" htmlFor="pref-actor"
+                   hint="发布、审批、发起正式运行会记到这个名下，随请求头 X-Actor 发送。这是归属记录不是身份认证——多人环境需要真正的登录体系。">
+              <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如 yilun"
+                     aria-describedby="pref-actor-hint"
+                     onChange={(e) => edit({ actor: e.target.value })} />
+            </Field>
+          </section>
+
+          <section>
+            <SectionBar title="运行默认值" hint="存在服务端，所有人共用。发起运行时没单独指定，就用这里的。" />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="默认记忆作用域" htmlFor="pref-scope" hint="agent 读写长期记忆用哪一格">
+                <select id="pref-scope" className="field" value={cur.scope}
+                        aria-describedby="pref-scope-hint"
+                        onChange={async (e) => {
+                          if (e.target.value !== '__new__') { edit({ scope: e.target.value }); return }
+                          const name = await promptDialog({
+                            title: '新的记忆作用域', label: '作用域名', placeholder: '比如 quality',
+                            validate: (v) => (/^[\w.-]{1,64}$/.test(v) ? null : '只用字母、数字、下划线、点和短横'),
+                            confirmLabel: '用这个',
+                          })
+                          if (name) edit({ scope: name })
+                        }}>
+                  {scopeOptions.map((s) => {
+                    const n = scopes.find((x) => x.scope === s)?.count
+                    return <option key={s} value={s}>{s}{n != null ? ` · ${formatNumber(n)} 条` : ' · 还没有记忆'}</option>
+                  })}
+                  <option value="__new__">新建一个作用域…</option>
+                </select>
+              </Field>
+              <Field label="默认知识库" htmlFor="pref-collection"
+                     error={collectionMissing ? `「${cur.collection}」这个知识库不存在：检索会落到空库上` : undefined}
+                     hint="检索节点没指定知识库时查它">
+                <select id="pref-collection" className="field" value={cur.collection}
+                        aria-describedby={collectionMissing ? 'pref-collection-error' : 'pref-collection-hint'}
+                        aria-invalid={collectionMissing || undefined}
+                        onChange={(e) => edit({ collection: e.target.value })}>
+                  {collectionMissing && <option value={cur.collection}>{cur.collection}（不存在）</option>}
+                  {collections.map((c) => (
+                    <option key={c.collection} value={c.collection}>
+                      {c.collection} · {formatNumber(c.documents)} 篇 / {formatNumber(c.chunks)} 段
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            <label className="mt-3 flex items-start gap-2 text-xs">
+              <input type="checkbox" className="mt-0.5" checked={cur.confirm}
+                     aria-describedby="pref-confirm-hint"
+                     onChange={(e) => edit({ confirm: e.target.checked })} />
+              <span>
+                危险工具默认需要人工审批
+                <span id="pref-confirm-hint" className="mt-0.5 block text-2xs leading-relaxed text-faint">
+                  只影响探索运行里没单独配置审批策略的节点；正式运行始终至少审批危险工具。受管工作流的发布门禁另外生效。
+                </span>
               </span>
-            )}
-          </span>
-        </div>
-      </section>
-
-      <section>
-        <SectionBar title="操作者署名" hint="只存在这台浏览器里，换台电脑要重新填。" />
-        <Field label="名字" htmlFor="pref-actor"
-               hint="发布、审批、发起正式运行会记到这个名下，随请求头 X-Actor 发送。这是归属记录不是身份认证——多人环境需要真正的登录体系。">
-          <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如 yilun"
-                 aria-describedby="pref-actor-hint"
-                 onChange={(e) => edit({ actor: e.target.value })} />
-        </Field>
-      </section>
-
-      <section>
-        <SectionBar title="运行默认值" hint="存在服务端，所有人共用。发起运行时没单独指定，就用这里的。" />
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="默认记忆作用域" htmlFor="pref-scope" hint="agent 读写长期记忆用哪一格">
-            <select id="pref-scope" className="field" value={cur.scope}
-                    aria-describedby="pref-scope-hint"
-                    onChange={async (e) => {
-                      if (e.target.value !== '__new__') { edit({ scope: e.target.value }); return }
-                      const name = await promptDialog({
-                        title: '新的记忆作用域', label: '作用域名', placeholder: '比如 quality',
-                        validate: (v) => (/^[\w.-]{1,64}$/.test(v) ? null : '只用字母、数字、下划线、点和短横'),
-                        confirmLabel: '用这个',
-                      })
-                      if (name) edit({ scope: name })
-                    }}>
-              {scopeOptions.map((s) => {
-                const n = scopes.find((x) => x.scope === s)?.count
-                return <option key={s} value={s}>{s}{n != null ? ` · ${formatNumber(n)} 条` : ' · 还没有记忆'}</option>
-              })}
-              <option value="__new__">新建一个作用域…</option>
-            </select>
-          </Field>
-          <Field label="默认知识库" htmlFor="pref-collection"
-                 error={collectionMissing ? `「${cur.collection}」这个知识库不存在：检索会落到空库上` : undefined}
-                 hint="检索节点没指定知识库时查它">
-            <select id="pref-collection" className="field" value={cur.collection}
-                    aria-describedby={collectionMissing ? 'pref-collection-error' : 'pref-collection-hint'}
-                    aria-invalid={collectionMissing || undefined}
-                    onChange={(e) => edit({ collection: e.target.value })}>
-              {collectionMissing && <option value={cur.collection}>{cur.collection}（不存在）</option>}
-              {collections.map((c) => (
-                <option key={c.collection} value={c.collection}>
-                  {c.collection} · {formatNumber(c.documents)} 篇 / {formatNumber(c.chunks)} 段
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
-        <label className="mt-3 flex items-start gap-2 text-xs">
-          <input type="checkbox" className="mt-0.5" checked={cur.confirm}
-                 aria-describedby="pref-confirm-hint"
-                 onChange={(e) => edit({ confirm: e.target.checked })} />
-          <span>
-            危险工具默认需要人工审批
-            <span id="pref-confirm-hint" className="mt-0.5 block text-2xs leading-relaxed text-faint">
-              只影响探索运行里没单独配置审批策略的节点；正式运行始终至少审批危险工具。受管工作流的发布门禁另外生效。
-            </span>
-          </span>
-        </label>
-      </section>
+            </label>
+          </section>
+        </>
+      )}
 
       {(dirty > 0 || savedFlash > 0 || saveError != null) && (
         <div
@@ -808,6 +800,50 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * 主题：选中即生效、即保存。显示的是眼下实际应用的偏好（useTheme）——从导航、
+ * ⌘K 换了主题，这里跟着变，不会留着旧值。
+ *
+ * setThemePref 自己处理失败：断线时先在本机生效、恢复后补存，别的失败弹提示。
+ * 它不告诉调用方存没存上，所以「已保存」这句回执是把设置读回来核对过才写的，
+ * 不是猜的；没核对上就不写，失败的那句提示由 setThemePref 给
+ */
+function ThemeSection() {
+  const { pref } = useTheme()
+  const [receipt, setReceipt] = useState<'saving' | 'saved' | null>(null)
+  const latest = useRef<ThemePref>(pref)
+
+  useEffect(() => {
+    if (receipt !== 'saved') return
+    // 「已保存」只亮一下：一直挂着就不再是「刚存上」的回执了
+    const t = setTimeout(() => setReceipt((r) => (r === 'saved' ? null : r)), 1600)
+    return () => clearTimeout(t)
+  }, [receipt])
+
+  const pick = async (next: ThemePref) => {
+    latest.current = next
+    setReceipt('saving')
+    await setThemePref(next)
+    if (latest.current !== next) return
+    const stored = await api.settings.get().then((s) => normalizeTheme(s?.ui?.theme), () => null)
+    if (latest.current !== next) return
+    setReceipt(stored === next ? 'saved' : null)
+  }
+
+  return (
+    <section>
+      <SectionBar title="界面" hint="选中就生效、就保存，所有设备共用。" />
+      <div className="flex flex-wrap items-center gap-3">
+        <ThemeChoice value={pref} onChange={(v) => void pick(v)} />
+        <span className="text-2xs" aria-live="polite" data-theme-save={receipt ?? undefined}>
+          {receipt === 'saving' && <span className="inline-flex items-center gap-1 text-faint"><Spinner size={10} /> 正在保存…</span>}
+          {receipt === 'saved' && <span className="fade-up text-faint"><Check size={11} className="mr-0.5 inline text-[var(--ok)]" aria-hidden />已保存</span>}
+        </span>
+      </div>
+    </section>
   )
 }
 

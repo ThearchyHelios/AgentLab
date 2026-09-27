@@ -4,6 +4,7 @@ import {
   type Connection, type Edge, type EdgeChange, type Node, type NodeChange,
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
+import { describeToolChange, mergeNodeConfig, shrunkTools, toolChangesOf } from '../canvas/copilotMerge'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
@@ -16,7 +17,7 @@ import {
   type NodeState, type RunPhase, type Trace,
 } from '../run/trace'
 import type {
-  ConversationTurn, GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ValidationIssue,
+  ConversationTurn, GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ToolChange, ValidationIssue,
   VarIssue, Variable, Workflow,
 } from '../types'
 
@@ -114,9 +115,24 @@ export interface CopilotTurn {
     round?: number
     repaired?: number
     message?: string
+    /** 自查时发现的工具被删（tools_dropped）。不挡运行，但要在这一步说出来 */
+    warnings?: string[]
   }
   /** 这一轮开始前打的撤销点。还在栈顶时「撤销这次」直接撤它 */
   checkpoint?: number
+  /** 提交的时刻（毫秒）。助手流的头部据此走实时计时，不用等 3 秒一次的心跳 */
+  startedAt?: number
+  /**
+   * 这一轮改了哪些节点、成员的工具绑定。画布上看不出来（节点还在），跑起来才发现查不了库，
+   * 所以回执要明说。取后端 final.tool_changes；老后端不给时前端自己比对前后两张图
+   */
+  toolChanges?: ToolChange[]
+  /**
+   * 工具集合变小、而这一轮的指令没让删的提醒（check.warnings 和 final.issues 里
+   * code === 'tools_dropped' 的，去重）。单独放：和「成果字段可能为空」这类普通校验提示
+   * 混在一起，最要紧的这句就淹没了
+   */
+  toolWarnings?: CopilotIssue[]
 }
 
 export interface CopilotIssue {
@@ -125,7 +141,33 @@ export interface CopilotIssue {
   node_id?: string | null
   code?: string
   type?: string
+  field?: string | null
 }
+
+/**
+ * 画布此刻为什么改不了：
+ * - copilot：助手正在改它，这时候的手动编辑会被它的最终结果悄悄覆盖；
+ * - formal：正式运行在跑已发布的不可变版本，此刻改图既改不了它，还会让事件对到
+ *   已经被删掉的节点上。画布那边（FlowCanvas）按同一个条件写 data-readonly
+ */
+export type EditLock = 'copilot' | 'formal' | null
+
+const formalRunning = (s: Pick<StudioState, 'runPhase' | 'trace' | 'run'>): boolean =>
+  isActivePhase(s.runPhase) && (s.trace.runClass ?? s.run?.run_class) === 'formal'
+
+export function editLockOf(s: Pick<StudioState, 'copilot' | 'runPhase' | 'trace' | 'run'>): EditLock {
+  if (s.copilot.active) return 'copilot'
+  return formalRunning(s) ? 'formal' : null
+}
+
+/** 改图入口被拦下时说的话。检查器、节点库、快捷键都用这一份 */
+export const EDIT_LOCK_TEXT: Record<Exclude<EditLock, null>, string> = {
+  copilot: '助手正在改这张工作流：等它做完，或者先停下',
+  formal: '正式运行进行中，画布只读：它跑的是已发布的不可变版本，结束后再改',
+}
+
+/** 组件里订阅锁：只在锁的原因变了时重渲染 */
+export const useEditLock = (): EditLock => useStudio(editLockOf)
 
 /** 两张图差在哪。只看节点的名字和配置，挪位置不算改动 */
 export interface GraphDiff {
@@ -136,6 +178,17 @@ export interface GraphDiff {
   edgesRemoved: number
   /** 一共几处：回执里的 N */
   total: number
+}
+
+/** 自查的 warnings 和 final.issues 里是同样的几条：按节点、字段、文字去重 */
+function dedupeIssues(list: CopilotIssue[]): CopilotIssue[] {
+  const seen = new Set<string>()
+  return list.filter((i) => {
+    const key = `${i.node_id ?? ''}|${i.field ?? ''}|${i.message}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 // 只留最近几轮。画布只反映最后一次生成的结果，更早的轮次是参考而不是现状，
@@ -458,6 +511,10 @@ interface StudioState {
     lastOp: string
     explanation: string
     error: string
+    /** 出错时「怎么办」（后端 error 操作的 hint）。Composer 的错误条和问数据页一样摊开它 */
+    errorHint: string
+    /** 出错时的原始报错（后端 error 操作的 detail），折叠在技术细节里 */
+    errorDetail: string
     model: string
     // 从提交到第一个操作之间有 5~30 秒，得让用户看见这段在发生什么
     phase: 'connecting' | 'planning' | 'building' | 'wiring' | 'finalizing' | 'repairing' | ''
@@ -505,7 +562,11 @@ interface StudioState {
 
   startRun: (input: Record<string, any>) => Promise<Run | null>
   startFormalRun: (input: Record<string, any>) => Promise<Run | null>
-  runCopilot: (instruction: string, useBase: boolean, model?: string | null) => void
+  /**
+   * 开始一轮助手改图。返回开没开始：正式运行期间画布只读，会被拦下（并提示为什么），
+   * 输入框据此决定要不要清掉用户刚写的那句
+   */
+  runCopilot: (instruction: string, useBase: boolean, model?: string | null) => boolean
   /** 停掉这一轮，画布退回这一轮之前（半成品进 future，⇧⌘Z 能找回来） */
   stopCopilot: () => void
   retryCopilot: () => void
@@ -831,8 +892,8 @@ function commit(
   return entry
 }
 
-/** 画布锁着：助手正在改这张图，这时候的手动编辑会被它的最终结果悄悄覆盖 */
-const locked = (get: () => StudioState) => get().copilot.active
+/** 画布锁着：助手正在改，或者正式运行在跑（见 editLockOf） */
+const locked = (get: () => StudioState) => editLockOf(get()) !== null
 
 /** 撤销 / 重做之后：选中的节点没了就收起检查器，未保存标记按内容重算 */
 function afterJump(set: SetFn, get: () => StudioState, nodes: FlowNode[], edges: Edge[]) {
@@ -977,7 +1038,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   copilotConversationId: null,
   copilotMemory: { past: [], total: 0, turns: 0 },
   copilotCursor: null,
-  copilot: { active: false, lastOp: '', explanation: '', error: '', model: '',
+  copilot: { active: false, lastOp: '', explanation: '', error: '', errorHint: '', errorDetail: '', model: '',
              phase: '', thinking: '', elapsedMs: 0, lastInstruction: '', lastUseBase: false },
   copilotNew: [],
   copilotTurns: [],
@@ -1014,7 +1075,8 @@ export const useStudio = create<StudioState>((set, get) => ({
       copilotTurns: [],
       copilotNew: [],
       copilotCursor: null,
-      copilot: { ...get().copilot, active: false, phase: '', thinking: '', lastOp: '', error: '' },
+      copilot: { ...get().copilot, active: false, phase: '', thinking: '', lastOp: '', error: '',
+                 errorHint: '', errorDetail: '' },
       cancelCopilot: null,
       // 先清空再去解析：留着上一张图的会话 id，这中间的任何一条指令
       // 都会带着别的图的上下文发出去
@@ -1415,6 +1477,11 @@ export const useStudio = create<StudioState>((set, get) => ({
   },
 
   runCopilot: (instruction, useBase, model) => {
+    // 正式运行跑的是已发布的版本，画布此刻只读：助手改完的图落不下来，不如先说清楚
+    if (formalRunning(get())) {
+      toast.warn(EDIT_LOCK_TEXT.formal, { key: 'studio:readonly' })
+      return false
+    }
     // 上一轮还在跑：先按停止收掉，免得两条流一起往画布上写
     if (get().copilot.active) get().stopCopilot()
     glideSeq++
@@ -1432,6 +1499,8 @@ export const useStudio = create<StudioState>((set, get) => ({
     const anchored = new Set<string>()
     /** 前端认不出来、没放上画布的节点类型。后端 final.issues 没说到的，收尾时补上，不能安静地少一步 */
     const dropped: string[] = []
+    /** 自查时报出来的工具被删（check.warnings）。收尾时和 final 里同样的那几条合并去重 */
+    const toolDrops: CopilotIssue[] = []
     const withDropped = (raw: unknown): CopilotIssue[] => {
       const issues: CopilotIssue[] = Array.isArray(raw) ? [...raw] : []
       for (const type of dropped) {
@@ -1444,7 +1513,7 @@ export const useStudio = create<StudioState>((set, get) => ({
 
     set({
       copilot: {
-        active: true, lastOp: '', explanation: '', error: '', model: model ?? '',
+        active: true, lastOp: '', explanation: '', error: '', errorHint: '', errorDetail: '', model: model ?? '',
         phase: 'connecting', thinking: '', elapsedMs: 0,
         lastInstruction: instruction, lastUseBase: useBase,
       },
@@ -1456,7 +1525,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       copilotTurns: [
         ...state.copilotTurns.slice(-(COPILOT_TURN_LIMIT - 1)),
         { id: turnId, instruction, ops: [], phase: 'running', explanation: '', error: '',
-          useBase, checkpoint: checkpoint.id },
+          useBase, checkpoint: checkpoint.id, startedAt: Date.now() },
       ],
     })
 
@@ -1488,7 +1557,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       if (activeTurn?.id === turnId) activeTurn = null
       set({
         copilot: { ...get().copilot, active: false, lastOp: '', phase: '', thinking: '',
-                   elapsedMs: 0, ...patch },
+                   elapsedMs: 0, errorHint: '', errorDetail: '', ...patch },
         cancelCopilot: null, copilotCursor: null,
       })
     }
@@ -1541,8 +1610,17 @@ export const useStudio = create<StudioState>((set, get) => ({
       (op) => {
         if (finished) return
         const s = get()
-        // 卡片上的「少了一步」读的是记下来的 final：这里认不出来而后端没提的，一并记进去
-        record(op.op === 'final' && dropped.length ? { ...op, issues: withDropped(op.issues) } : op)
+        if (op.op === 'final') {
+          // 卡片上的「少了一步」、回执里的工具绑定变化读的都是记下来的 final：这里认不出来
+          // 而后端没提的类型，老后端不给的 tool_changes（前端自己比对），一并补齐了再记
+          op = {
+            ...op,
+            issues: withDropped(op.issues),
+            tool_changes: Array.isArray(op.tool_changes) ? op.tool_changes
+              : toolChangesOf(before.nodes, op.graph ? toFlow(op.graph).nodes : []),
+          }
+        }
+        record(op)
         switch (op.op) {
           case 'model':
             // 后端首帧告知实际用的模型，浮条上直接显示，不用猜
@@ -1573,16 +1651,21 @@ export const useStudio = create<StudioState>((set, get) => ({
             break
           case 'check': {
             // 服务端自查：用运行时同一套规则过一遍，有问题交回模型改
-            // 现在是一句话；以后后端会改成 {node_id, message}（能定位到节点），两种都接住。
+            // 以前是一句话，后端改成 {node_id, message, field?} 之后能定位到节点，两种都接住。
             // 带节点的前面补上节点名，「再修一次」拼指令时模型才知道说的是哪个
-            const issues = (op.issues ?? []).map((x: any) => {
+            const lineOf = (x: any): string => {
               if (typeof x === 'string') return x
               const message = String(x?.message ?? JSON.stringify(x))
               const label = x?.node_id ? s.nodes.find((n) => n.id === x.node_id)?.data.label : ''
               return label && !message.includes(`「${label}」`) ? `「${label}」：${message}` : message
-            })
+            }
+            const issues = (op.issues ?? []).map(lineOf)
+            // 工具被删不挡运行，但自查这一步就要说出来（tools_dropped）
+            const warnings: any[] = Array.isArray(op.warnings) ? op.warnings : []
+            for (const w of warnings) if (w && typeof w === 'object') toolDrops.push(w)
             settle({ check: { status: op.status, issues, round: op.round, repaired: op.repaired,
-                              message: op.message } })
+                              message: op.message,
+                              ...(warnings.length ? { warnings: warnings.map(lineOf) } : {}) } })
             set({ copilot: { ...s.copilot,
               phase: op.status === 'repairing' ? 'repairing' : s.copilot.phase,
               lastOp: op.status === 'repairing'
@@ -1634,21 +1717,27 @@ export const useStudio = create<StudioState>((set, get) => ({
             })
             break
           }
-          case 'update_node':
-            if (!s.nodes.some((x) => x.id === op.id)) break
+          case 'update_node': {
+            const target = s.nodes.find((x) => x.id === op.id)
+            if (!target) break
+            // 按字段合并，和后端 merge_node_config 同一套规则：没写的保留、写 null 删键、
+            // 协作成员按 name 合并。整体替换的话，模型只改一句提示词，工具就跟着没了——
+            // 流到一半断掉时，重做栈里的半成品就是那个没有工具的样子
+            const patch = op.config && typeof op.config === 'object' && !Array.isArray(op.config) ? op.config : null
             set({
               nodes: s.nodes.map((x) =>
                 x.id === op.id
                   ? { ...x, data: { ...x.data,
                       ...(op.label != null ? { label: op.label } : {}),
-                      ...(op.config != null ? { config: op.config } : {}) } }
+                      ...(patch ? { config: mergeNodeConfig(x.data.nodeType, x.data.config ?? {}, patch) } : {}) } }
                   : x),
               copilotNew: s.copilotNew.includes(op.id) ? s.copilotNew : [...s.copilotNew, op.id],
               copilotCursor: op.id,
-              copilot: { ...s.copilot, lastOp: `修改节点：${op.label || op.id}` },
+              copilot: { ...s.copilot, lastOp: `修改节点：${op.label || target.data.label || op.id}` },
               dirty: true,
             })
             break
+          }
           case 'remove_node':
             set({
               nodes: s.nodes.filter((x) => x.id !== op.id),
@@ -1709,7 +1798,10 @@ export const useStudio = create<StudioState>((set, get) => ({
               }
             })
             const diff = diffGraphs(before, { nodes, edges: next.edges })
-            const issues = withDropped(op.issues)
+            // 上面记录时已经补齐：认不出的类型并进了 issues，老后端缺的 tool_changes 由前端比对
+            const issues: CopilotIssue[] = op.issues
+            const toolChanges: ToolChange[] = op.tool_changes
+            const toolWarnings = dedupeIssues([...toolDrops, ...issues.filter((i) => i.code === 'tools_dropped')])
             const explanation = op.explanation ?? get().copilot.explanation
             const outcome = diff.total ? 'applied' : 'unchanged'
             if (!diff.total) {
@@ -1740,7 +1832,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             })
             // 落定之后再取景：取景时节点还在半路的话，镜头对着的是它们出发的地方
             if (moving) glide(set, get, targets, () => { if (refit) set({ fitRequest: get().fitRequest + 1 }) })
-            settle({ phase: 'done', outcome, diff, issues, explanation })
+            settle({ phase: 'done', outcome, diff, issues, explanation, toolChanges, toolWarnings })
             finish({ explanation, error: '' })
             recordCanvasTurn(get().copilotConversationId, instruction, {
               graph: op.graph, explanation: explanation ?? '', status: 'done',
@@ -1754,12 +1846,25 @@ export const useStudio = create<StudioState>((set, get) => ({
               const turn = get().copilotTurns.find((t) => t.id === turnId)
               const missing = issues.filter((i) => i.code === 'unknown_node_type').length
               const left = turn?.check?.status === 'failed' ? turn.check.issues.length : 0
+              // 工具绑定变了画布上看不出来，回执里逐条写明前后。变少了用 warn 色：指令里
+              // 没让删的（后端 tools_dropped）常驻到人看过为止——没工具的 agent 照样能跑，
+              // 只是跑出来的是模型「假设」查过库的答案
+              const shrunk = shrunkTools(toolChanges)
+              const unasked = shrunk.length > 0 && toolWarnings.length > 0
+              const head = left ? `已放到画布，但还有 ${left} 处问题要你处理`
+                : missing ? `已应用 ${diff.total} 处改动，但有 ${missing} 步没放上`
+                : `已应用 ${diff.total} 处改动`
+              const lines = shrunk.length
+                ? [unasked ? '工具绑定变少了，这一轮没让删，确认一下是不是改漏了：' : '工具绑定变少了：',
+                   ...shrunk.map(describeToolChange)]
+                : []
               toast(
-                left ? `已放到画布，但还有 ${left} 处问题要你处理`
-                  : missing ? `已应用 ${diff.total} 处改动，但有 ${missing} 步没放上`
-                  : `已应用 ${diff.total} 处改动`,
-                left || missing ? 'warn' : 'ok',
-                { key: `copilot:${turnId}`, duration: 8000,
+                [toolChanges.length && !shrunk.length ? `${head} · 工具绑定变了 ${toolChanges.length} 处` : head,
+                 ...lines].join('\n'),
+                left || missing || shrunk.length ? 'warn' : 'ok',
+                { key: `copilot:${turnId}`, duration: 8000, sticky: unasked,
+                  ...(toolChanges.length > shrunk.length
+                    ? { detail: toolChanges.map(describeToolChange).join('\n') } : {}),
                   action: { label: '撤销', onClick: () => { get().undoCopilotTurn(turnId) } } },
               )
             }
@@ -1771,7 +1876,10 @@ export const useStudio = create<StudioState>((set, get) => ({
             const message = op.message ?? '生成失败'
             const outcome = revert()
             settle({ phase: 'error', error: message, outcome })
-            finish({ explanation: '', error: message })
+            // 「怎么办」和原始报错一起留下：Composer 的错误条和问数据页一样摊开它们
+            finish({ explanation: '', error: message,
+                     errorHint: typeof op.hint === 'string' ? op.hint : '',
+                     errorDetail: typeof op.detail === 'string' ? op.detail : '' })
             recordCanvasTurn(get().copilotConversationId, instruction, { status: 'error', error: message }, set)
             break
           }
@@ -1808,6 +1916,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       },
     }
     set({ cancelCopilot: stop })
+    return true
   },
 
   stopCopilot: () => {
@@ -1879,6 +1988,11 @@ export const useStudio = create<StudioState>((set, get) => ({
     const s = get()
     const turn = s.copilotTurns.find((t) => t.id === turnId)
     const top = s.past[s.past.length - 1]
+    // 正式运行期间 undo 会被锁拦下、画布不动：不能照样把这一轮标成「已撤回」
+    if (formalRunning(s)) {
+      toast.warn(EDIT_LOCK_TEXT.formal, { key: 'studio:readonly' })
+      return false
+    }
     if (!turn?.checkpoint || !top || top.id !== turn.checkpoint || s.copilot.active) {
       toast.warn(`这一轮之后画布又改过了，不能单独撤掉它。用 ${formatShortcut('Mod+Z')} 逐步撤回，或者在版本历史里找回`)
       return false

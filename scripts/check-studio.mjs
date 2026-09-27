@@ -51,6 +51,34 @@ const GRAPH = {
 }
 const V1 = { nodes: GRAPH.nodes.slice(0, 3).concat([GRAPH.nodes[6]]), edges: [edge('start', 'lookup'), edge('lookup', 'gate'), edge('gate', 'done', 'fast')] }
 
+// 查库的 agent 和带成员的协作团队：助手改节点时工具不能被悄悄改没（NI-1），提示词点名的
+// 工具没绑定要能定位到工具那一栏（NI-2）。全是通用示例名
+const QUERY_TOOLS = ['db_query__shop', 'db_schema__shop']
+const TEAM_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 200, '输入', { fields: [{ name: 'question', required: true }] }),
+    node('fetch', 'agent', 300, 200, '数据查询', {
+      system: '你是取数助手。', prompt: '先用 db_schema__shop 看表结构，再用 db_query__shop 查 orders 表里每个门店的订单数',
+      tools: ['db_query__shop'], assign_to: 'rows', max_steps: 8,
+    }),
+    node('team', 'supervisor', 600, 200, '复核团队', {
+      goal: '核对订单数', max_rounds: 4,
+      agents: [
+        { name: 'fetcher', description: '负责查库', system: '只用 SQL 取数', tools: ['db_query__shop'] },
+        { name: 'writer', description: '写结论', system: '用 python_exec 算出占比再写结论', tools: [] },
+      ],
+    }),
+    node('done', 'output', 900, 200, '成果', { fields: [{ name: 'answer', value: '{{ vars.rows }}' }] }),
+  ],
+  edges: [edge('start', 'fetch'), edge('fetch', 'team'), edge('team', 'done')],
+}
+/** 工具都绑好了的那一版：合并语义要守住的就是它 */
+const TEAM_BOUND = {
+  ...TEAM_GRAPH,
+  nodes: TEAM_GRAPH.nodes.map((n) => (n.id === 'fetch'
+    ? { ...n, data: { ...n.data, config: { ...n.data.config, tools: [...QUERY_TOOLS] } } } : n)),
+}
+
 const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
@@ -62,6 +90,8 @@ const FAKES = {
   'st-main': wf('st-main', { name: '__studio_check__', version: 3, published_version: 2 }),
   'st-gov': wf('st-gov', { name: '__studio_check_gov__', status: 'governed', version: 3, published_version: 3, published_by: '张工' }),
   'st-tpl': wf('st-tpl', { name: '__studio_check_tpl__', is_template: true, tags: ['extracted'] }),
+  'st-team': wf('st-team', { name: '__studio_check_team__', graph: TEAM_BOUND, version: 2, published_version: 2, status: 'published' }),
+  'st-lint': wf('st-lint', { name: '__studio_check_lint__', graph: TEAM_GRAPH, version: 1 }),
 }
 const VERSIONS = [
   { id: 'v3', version: 3, note: '', created_at: '2026-09-26T02:00:00Z' },
@@ -182,7 +212,7 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
   return { ctx, page, errors, state }
 }
 
-const S = (page, fn) => page.evaluate(fn)
+const S = (page, fn, arg) => page.evaluate(fn, arg)
 const st = (page) => page.evaluate(() => {
   const s = window.__studio.getState()
   return { nodes: s.nodes.map((n) => n.id), edges: s.edges.length, selectedId: s.selectedId,
@@ -675,9 +705,10 @@ console.log('=== 助手改图：一步撤销、回执、只回话、失败退回
         message: '模型写了一个不存在的节点类型「magic」，这一步已跳过' }] },
   ]
   const past0 = (await st(page)).past
-  await S(page, () => window.__studio.getState().runCopilot('给快速回答后面加一步润色', true))
+  const began = await S(page, () => window.__studio.getState().runCopilot('给快速回答后面加一步润色', true))
   await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
   const t1 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('开始了就告诉输入框（runCopilot 返回 true）', began === true, String(began))
   check('收到 final：这一轮是「已应用」', t1.outcome === 'applied', t1.outcome)
   check('diff 记下新增和改动', t1.diff?.added.includes('polish') && t1.diff?.changed.includes('answer'), JSON.stringify(t1.diff))
   check('final.issues 进了这一轮（少了一步）', t1.issues?.some((i) => i.code === 'unknown_node_type'))
@@ -767,8 +798,7 @@ console.log('=== 助手改图：一步撤销、回执、只回话、失败退回
   await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
   state.stream = [{ op: 'model', model: 'fake-model' }, { op: 'reply', text: '好' }]
   const turnId = await S(page, () => window.__studio.getState().copilotTurns.at(-1).id)
-  await S(page, (id) => window.__studio.getState().repairWithCopilot(id), turnId).catch(() => null)
-  await page.evaluate((id) => window.__studio.getState().repairWithCopilot(id), turnId)
+  await S(page, (id) => window.__studio.getState().repairWithCopilot(id), turnId)
   await page.waitForTimeout(400)
   const lastBody = state.bodies.at(-1)
   check('再修一次：指令里带着剩下的问题', lastBody?.instruction?.includes('还没选工具') && !!lastBody?.base_graph,
@@ -798,7 +828,7 @@ console.log('=== 入口：?run=&focus=、选择器、发布弹窗 ===')
   await page.keyboard.type('__studio_check')
   await page.waitForTimeout(200)
   const rows = await count(page, '[role="listbox"][aria-label="工作流"] > li')
-  check('选择器能搜索', rows === 3, `${rows} 条`)
+  check('选择器能搜索', rows === Object.keys(FAKES).length, `${rows} 条`)
   check('当前工作流有底色和勾', await count(page, 'li[aria-selected="true"] .bg-accent-solid') === 1)
   check('模板行常驻「用它新建」', await count(page, 'li:has-text("__studio_check_tpl__") button:has-text("用它新建")') === 1)
   check('标签本地化（extracted → 从运行提取）', await count(page, 'li:has-text("__studio_check_tpl__") :text("从运行提取")') === 1)
@@ -822,7 +852,8 @@ console.log('=== 入口：?run=&focus=、选择器、发布弹窗 ===')
     : route.fallback()))
   await S(pub.page, () => { const s = window.__studio.getState(); s.updateNode('lookup', { label: '背景检索2' }); s.undo() })
   const pb = await S(pub.page, () => { const s = window.__studio.getState(); return { future: s.future.length, fit: s.fitRequest, dirty: s.dirty } })
-  await pub.page.locator('button:has-text("发布")').first().click()
+  await pub.page.getByRole('button', { name: '发布', exact: true }).click()
+  await pub.page.waitForSelector('[role="dialog"] button.btn-primary', { timeout: 5000 }).catch(() => {})
   await pub.page.waitForTimeout(300)
   await pub.page.locator('[role="dialog"] button.btn-primary').click()
   await pub.page.waitForFunction(() => window.__studio.getState().workflow?.status === 'published', null, { timeout: 5000 }).catch(() => {})
@@ -843,15 +874,346 @@ console.log('=== 入口：?run=&focus=、选择器、发布弹窗 ===')
   await win.ctx.close()
 
   const gov = await open({ path: '/studio/st-gov' })
-  await gov.page.locator('button:has-text("发布")').first().click()
+  // 按名字找：别的按钮（版本标签、提示）也可能带着「发布」两个字
+  await gov.page.getByRole('button', { name: '发布', exact: true }).click()
+  await gov.page.waitForSelector('[role="dialog"] [role="radio"]', { timeout: 5000 }).catch(() => {})
   await gov.page.waitForTimeout(300)
-  const radio = await gov.page.locator('[role="radio"][aria-checked="true"]').innerText()
+  // 只看发布弹窗里的：助手输入框的「在现有图上改 | 从头生成」也是一组 radio
+  const radio = await gov.page.locator('[role="dialog"] [role="radio"][aria-checked="true"]').innerText()
   check('受管工作流的发布默认选「受管」', radio.includes('受管'), radio.slice(0, 20))
   check('选项用统一术语（已发布 — 可发起正式运行）', await gov.page.getByText('已发布 — 可发起正式运行').count() === 1)
   check('写明以谁的名义发布', await gov.page.getByText('检查脚本').count() >= 1)
-  await gov.page.locator('[role="radio"]:has-text("已发布")').click()
+  await gov.page.locator('[role="dialog"] [role="radio"]:has-text("已发布")').click()
   check('从受管降级要说出来', await gov.page.getByText(/会降级/).count() === 1)
   await gov.ctx.close()
+}
+
+// ================================================================ 6b
+console.log('=== 助手改节点是合并，不是整体替换（NI-1）；出错留下「怎么办」 ===')
+{
+  const { ctx, page, state, errors } = await open({ path: '/studio/st-team' })
+  // 流在最后一步出错：画布退回这一轮之前，半成品进重做栈。读重做栈顶就是按操作流逐条
+  // 落上去的样子——final 会拿后端合并好的整张图覆盖，只看 final 看不出前端合得对不对
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'update_node', id: 'fetch', label: '数据查询',
+      config: { system: '你是取数助手，按月份汇总。', prompt: '按月份统计 orders 的订单数' } },
+    { op: 'update_node', id: 'team', config: { goal: '核对按月的订单数', agents: [
+      { name: 'fetcher', system: '按月份取数' },
+      { name: 'writer', remove: true },
+      { name: 'checker', description: '复核口径', tools: ['db_schema__shop'], system: null },
+    ] } },
+    { op: 'update_node', id: 'fetch', config: { max_steps: null } },
+    { op: 'error', message: '助手这一轮没跑完：等待超时', hint: '换一个响应快的模型再试', detail: 'ReadTimeout: 120s' },
+  ]
+  await S(page, () => window.__studio.getState().runCopilot('按月份拆一下', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const half = await S(page, () => {
+    const s = window.__studio.getState()
+    const nodes = s.future.at(-1)?.nodes ?? []
+    const cfg = (id) => nodes.find((n) => n.id === id)?.data.config ?? null
+    return { fetch: cfg('fetch'), team: cfg('team') }
+  })
+  const f = half.fetch ?? {}
+  const members = half.team?.agents ?? []
+  const fetcher = members.find((m) => m.name === 'fetcher') ?? {}
+  const checker = members.find((m) => m.name === 'checker') ?? {}
+  check('只改提示词：agent 的工具一个不少', JSON.stringify(f.tools) === JSON.stringify(QUERY_TOOLS), JSON.stringify(f.tools))
+  check('写了的键改上去、没写的键保留', f.prompt === '按月份统计 orders 的订单数' && f.assign_to === 'rows',
+    `${f.prompt} / ${f.assign_to}`)
+  check('写 null 的键删掉', !('max_steps' in f), JSON.stringify(Object.keys(f)))
+  check('成员按 name 合并：没写 tools 的保留原来的 tools 和别的字段',
+    JSON.stringify(fetcher.tools) === '["db_query__shop"]' && fetcher.system === '按月份取数' && fetcher.description === '负责查库',
+    JSON.stringify(fetcher))
+  check('{name, remove:true} 删掉成员，新名字接在后面', members.map((m) => m.name).join(',') === 'fetcher,checker',
+    members.map((m) => m.name).join(','))
+  check('新成员里写 null 的字段不留', !('system' in checker) && JSON.stringify(checker.tools) === '["db_schema__shop"]',
+    JSON.stringify(checker))
+  check('团队没写的顶层键保留', half.team?.max_rounds === 4 && half.team?.goal === '核对按月的订单数')
+  const cp = await S(page, () => window.__studio.getState().copilot)
+  check('出错时保留「怎么办」和技术细节（Composer 的错误条要用）',
+    cp.error.includes('等待超时') && cp.errorHint === '换一个响应快的模型再试' && cp.errorDetail === 'ReadTimeout: 120s',
+    JSON.stringify({ hint: cp.errorHint, detail: cp.errorDetail }))
+  const t0 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('这一轮记下开始时刻（助手流头部的实时计时用）', typeof t0.startedAt === 'number'
+    && Math.abs(Date.now() - t0.startedAt) < 60_000, String(t0.startedAt))
+
+  // 改图回执：后端 final 带回的工具绑定变化。工具集合变小、指令又没让删的，warn 色、可一键撤销
+  const dropped = {
+    ...TEAM_BOUND,
+    nodes: TEAM_BOUND.nodes.map((n) => {
+      if (n.id === 'fetch') return { ...n, data: { ...n.data, config: { ...n.data.config, prompt: '简短一点', tools: [] } } }
+      if (n.id === 'team') {
+        return { ...n, data: { ...n.data, config: { ...n.data.config,
+          agents: n.data.config.agents.map((a) => (a.name === 'fetcher' ? { ...a, tools: [] } : a)) } } }
+      }
+      return n
+    }),
+  }
+  const warn = (id, field, message) => ({ level: 'warning', node_id: id, edge_id: null, code: 'tools_dropped', field, message })
+  const warnings = [
+    warn('fetch', 'tools', '「数据查询」的工具从 db_query__shop、db_schema__shop 变成了空。这一轮的要求里没有提到去掉工具，确认一下是不是改漏了'),
+    warn('team', 'agents[0].tools', '「复核团队」的成员「fetcher」的工具从 db_query__shop 变成了空。这一轮的要求里没有提到去掉工具，确认一下是不是改漏了'),
+  ]
+  const changes = [
+    { node_id: 'fetch', label: '数据查询', member: null, field: 'tools', before: QUERY_TOOLS, after: [], added: [], removed: QUERY_TOOLS },
+    { node_id: 'team', label: '复核团队', member: 'fetcher', field: 'agents[0].tools', before: ['db_query__shop'], after: [], added: [], removed: ['db_query__shop'] },
+  ]
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'update_node', id: 'fetch', config: { prompt: '简短一点', tools: [] } },
+    { op: 'update_node', id: 'team', config: { agents: [{ name: 'fetcher', tools: [] }] } },
+    { op: 'done', explanation: '改短了' },
+    { op: 'check', status: 'passed', repaired: 0, warnings },
+    { op: 'final', graph: dropped, explanation: '改短了', layout: { mode: 'keep', placed: [] },
+      issues: [...warnings, { level: 'warning', node_id: 'done', edge_id: null, message: '成果字段引用的变量可能为空' }],
+      tool_changes: changes },
+  ]
+  await S(page, () => window.__studio.getState().runCopilot('提示词写短一点', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const t1 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('回执记下后端给的工具绑定变化', t1.toolChanges?.length === 2 && t1.toolChanges[0].node_id === 'fetch',
+    JSON.stringify(t1.toolChanges?.map((c) => c.node_id)))
+  check('工具被删的提醒单独记，不混进普通校验提示', t1.toolWarnings?.length === 2
+    && t1.toolWarnings.every((w) => w.code === 'tools_dropped'), JSON.stringify(t1.toolWarnings?.map((w) => w.node_id)))
+  check('自查那一步也带着这两条提醒', t1.check?.warnings?.length === 2, JSON.stringify(t1.check?.warnings))
+  check('记下的 final 操作带着 tool_changes（右栏回执从它解码）',
+    t1.ops.find((o) => o.op === 'final')?.tool_changes?.length === 2)
+  const toastBox = page.locator('[role="status"] > div').filter({ hasText: '工具绑定变少了' })
+  const toastText = (await toastBox.first().innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('工具集合变小：回执是 warn 色，逐条列出前后', await toastBox.count() === 1
+    && toastText.includes('「数据查询」') && toastText.includes('db_query__shop、db_schema__shop → 空')
+    && toastText.includes('fetcher'), toastText.slice(0, 120))
+  check('工具被删的回执用 warn 色边框', await toastBox.first().evaluate((el) =>
+    el.getAttribute('style')?.includes('var(--warn)'), null, { timeout: 2000 }).catch(() => false))
+  await toastBox.first().locator('button:has-text("撤销")').click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(250)
+  const back = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'fetch').data.config.tools)
+  check('回执里一键撤销：工具回来了', JSON.stringify(back) === JSON.stringify(QUERY_TOOLS), JSON.stringify(back))
+
+  // 老后端的 final 不带 tool_changes：前端自己比对前后两张图
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'update_node', id: 'fetch', config: { tools: ['db_query__shop', 'python_exec'] } },
+    { op: 'final', graph: { ...TEAM_BOUND, nodes: TEAM_BOUND.nodes.map((n) => (n.id === 'fetch'
+      ? { ...n, data: { ...n.data, config: { ...n.data.config, tools: ['db_query__shop', 'python_exec'] } } } : n)) },
+      explanation: '', layout: { mode: 'keep', placed: [] }, issues: [] },
+  ]
+  await S(page, () => window.__studio.getState().runCopilot('查表结构换成算一下', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const t2 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  const c2 = t2.toolChanges?.[0]
+  check('老后端不给 tool_changes：前端自己比对出来', t2.toolChanges?.length === 1 && c2.node_id === 'fetch'
+    && c2.added.join() === 'python_exec' && c2.removed.join() === 'db_schema__shop' && c2.member === null,
+    JSON.stringify(t2.toolChanges))
+  check('换了一个工具（数量没少）不算被删，没有提醒', !(t2.toolWarnings ?? []).length)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
+
+  // 合并规则本身：和后端 merge_node_config 同一组用例（backend/tests/test_copilot_merge.py）
+  const unit = await open({ path: '/studio/st-team' })
+  const r = await unit.page.evaluate(async () => {
+    const m = await import('/src/canvas/copilotMerge.ts')
+    const old = { prompt: 'p', tools: ['db_query__shop', 'db_schema__shop'], assign_to: 'rows',
+      agents: [{ name: '取数员', system: '只用 SQL 取数', tools: ['db_query__shop'] }, { system: '无名', tools: ['x'] }] }
+    const snapshot = JSON.stringify(old)
+    const a = m.mergeNodeConfig('agent', old, { assign_to: null, temperature: 0.2 })
+    const b = m.mergeNodeConfig('agent', old, { tools: ['db_query__shop'] })
+    const c = m.mergeNodeConfig('supervisor', old, { agents: [
+      { name: 'agent1', tools: null }, { name: '核对员', tools: ['db_schema__shop'], note: null }, { name: '取数员', remove: true }] })
+    // agents 不是列表、或者不是 supervisor：整体替换这一个键（和后端一样只对 supervisor 的成员列表按 name 合并）
+    const d = m.mergeNodeConfig('agent', old, { agents: [{ name: 'x' }] })
+    return { a, b, c, d, untouched: JSON.stringify(old) === snapshot }
+  })
+  check('合并：null 删键，没写的留着', !('assign_to' in r.a) && r.a.temperature === 0.2 && r.a.tools.length === 2, JSON.stringify(r.a))
+  check('合并：显式写 tools 就换成新的', r.b.tools.join() === 'db_query__shop')
+  // 没名字的那个按 agent1 认出来、合并进去：条目里写的 name 也跟着落上（后端同样如此）
+  check('合并：没名字的成员按 agentN 认；删成员、新名字接在后面', r.c.agents.map((x) => x.name).join() === 'agent1,核对员'
+    && !('tools' in r.c.agents[0]) && r.c.agents[0].system === '无名' && !('note' in r.c.agents[1]), JSON.stringify(r.c.agents))
+  check('合并：不是 supervisor 时 agents 整体替换', JSON.stringify(r.d.agents) === '[{"name":"x"}]')
+  check('合并：旧 config 不被原地改（比对工具变化还要用它）', r.untouched)
+  await unit.ctx.close()
+}
+
+// ================================================================ 6c
+console.log('=== 正式运行期间画布只读：调色板、粘贴、复制、排版、检查器、撤销都拦下 ===')
+{
+  const { ctx, page, errors, state } = await open({ path: '/studio/st-team' })
+  const layoutCalls = []
+  page.on('request', (req) => { if (req.url().includes('/copilot/layout')) layoutCalls.push(req.url()) })
+  const formal = (phase) => page.evaluate((p) => window.__studio.setState((s) => ({
+    run: { id: 'st-formal-0001', workflow_id: 'st-team', status: p === 'succeeded' ? 'succeeded' : 'running',
+      run_class: 'formal', version: 2, input: {}, output: {}, error: '', usage: {}, created_at: '2026-09-26T02:00:00Z' },
+    runPhase: p, trace: { ...s.trace, phase: p, runClass: 'formal' },
+  })), phase)
+  // 先选中一个节点、复制下来，再开始正式运行
+  await S(page, () => window.__studio.getState().select('fetch'))
+  await blur(page)
+  await S(page, () => window.__studio.getState().select('fetch'))
+  await page.evaluate(() => document.activeElement instanceof HTMLElement && document.activeElement.blur())
+  await page.keyboard.press(`${MOD}+c`)
+  // 助手先改一轮（改成果节点的名字），正式运行开始后再点这一轮的「撤销这次生成」
+  const renamed = { ...TEAM_BOUND, nodes: TEAM_BOUND.nodes.map((n) => (n.id === 'done'
+    ? { ...n, data: { ...n.data, label: '成果（按月）' } } : n)) }
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'update_node', id: 'done', label: '成果（按月）' },
+    { op: 'final', graph: renamed, explanation: '', layout: { mode: 'keep', placed: [] }, issues: [] },
+  ]
+  await S(page, () => window.__studio.getState().runCopilot('成果改个名字', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const turnId = await S(page, () => window.__studio.getState().copilotTurns.at(-1).id)
+  await formal('running')
+  await page.waitForTimeout(200)
+  const s0 = await st(page)
+
+  await page.locator('button:has-text("模型调用"), button[aria-label="添加模型调用"]').first().click({ force: true, timeout: 2000 }).catch(() => {})
+  await S(page, () => window.__studio.getState().addNode('llm'))
+  check('调色板点击添加被拦下', (await st(page)).nodes.length === s0.nodes.length)
+  check('调色板标成不可用并说明为什么', await count(page, '[aria-label^="节点库"] [aria-disabled="true"]') === 1
+    && (await page.locator('[aria-label^="节点库"]').innerText()).includes('只读'))
+
+  await page.evaluate(() => document.activeElement instanceof HTMLElement && document.activeElement.blur())
+  await page.keyboard.press(`${MOD}+v`)
+  await page.keyboard.press(`${MOD}+d`)
+  await page.keyboard.press('Shift+KeyL')
+  await page.keyboard.press(`${MOD}+z`)
+  await page.waitForTimeout(400)
+  const s1 = await st(page)
+  check('⌘V 粘贴、⌘D 复制、⇧L 排版、⌘Z 撤销都不改图', s1.nodes.length === s0.nodes.length && s1.past === s0.past
+    && layoutCalls.length === 0, `${s1.nodes.length}/${s0.nodes.length} 节点 · 排版请求 ${layoutCalls.length}`)
+  check('按了改图快捷键会说为什么不行', await page.getByText(/正式运行进行中/).count() >= 1)
+  check('工具栏的撤销、自动排版置灰', await page.getByRole('button', { name: '自动排版' }).isDisabled()
+    && await page.getByRole('button', { name: '撤销', exact: true }).first().isDisabled())
+  // 撤销被锁拦下、画布没动：这一轮不能被标成「已撤回」，回执也不能说撤掉了
+  const undone = await S(page, (id) => window.__studio.getState().undoCopilotTurn(id), turnId)
+  const kept = await S(page, (id) => {
+    const s = window.__studio.getState()
+    return { outcome: s.copilotTurns.find((t) => t.id === id)?.outcome,
+      label: s.nodes.find((n) => n.id === 'done')?.data.label }
+  }, turnId)
+  check('「撤销这次生成」也拦下，这一轮不被标成已撤回', undone === false && kept.outcome === 'applied'
+    && kept.label === '成果（按月）', JSON.stringify({ undone, ...kept }))
+
+  await S(page, () => window.__studio.getState().select('fetch'))
+  await page.waitForTimeout(300)
+  check('检查器整块只读，并说明原因', await count(page, 'fieldset[disabled]:has([data-field="prompt"])') === 1
+    && await page.getByText('只能看，不能改').count() === 1)
+  await S(page, () => window.__studio.getState().updateNode('fetch', { label: '改不动' }))
+  check('store 这一层也拦着（直接调 updateNode 不生效）',
+    (await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'fetch').data.label)) === '数据查询')
+  const prompt0 = await S(page, () => window.__studio.getState().copilotTurns.length)
+  // 返回 false：输入框据此留着用户刚写的那句，不能拦下了还把它清掉
+  const started = await S(page, () => window.__studio.getState().runCopilot('加一步', true))
+  check('正式运行期间不让助手改图（并告诉输入框没开始）', started === false
+    && (await S(page, () => window.__studio.getState().copilotTurns.length)) === prompt0
+    && !(await S(page, () => window.__studio.getState().copilot.active)), String(started))
+
+  // 跑完就能改了
+  await formal('succeeded')
+  await page.waitForTimeout(150)
+  await S(page, () => window.__studio.getState().addNode('llm'))
+  check('正式运行结束后恢复编辑', (await st(page)).nodes.length === s0.nodes.length + 1)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+
+  // Shift+1 的名字要和它做的事一致：它回到打开时的取景（从入口看起），不是「看全所有节点」
+  const fit = await page.evaluate(async () => (await import('/src/canvas/shortcuts.ts')).studioShortcut('fit').label)
+  check('Shift+1 叫「重新取景」', fit.startsWith('重新取景') && !fit.includes('看全'), fit)
+  await ctx.close()
+}
+
+// ================================================================ 6d
+console.log('=== 提示词点名的工具没绑定：问题面板定位到工具那一栏，一键绑定（NI-2）；团队用完轮数（NI-5） ===')
+{
+  const { ctx, page, errors } = await open({ path: '/studio/st-lint' })
+  await page.waitForFunction(() => window.__studio.getState().analysis === 'ok', null, { timeout: 8000 })
+  const lint = await S(page, () => window.__studio.getState().issues
+    .filter((i) => /要求用「/.test(i.message)).map((i) => ({ node: i.node_id, field: i.field, msg: i.message.slice(0, 30) })))
+  check('后端校验报出两处「提示词要求用 X 但没绑定」', lint.length === 2, JSON.stringify(lint))
+
+  await page.locator('button[aria-expanded]').filter({ hasText: /错|提示|可运行/ }).first().click()
+  await page.waitForTimeout(250)
+  const agentRow = page.locator('[data-problem]').filter({ hasText: '节点没有绑定它' })
+  check('问题面板里这一条指向「可用工具」', (await agentRow.innerText().catch(() => '')).includes('可用工具'),
+    (await agentRow.innerText().catch(() => '')).replace(/\s+/g, ' ').slice(-20))
+  const memberRow = page.locator('[data-problem]').filter({ hasText: '没有给这个成员绑定它' })
+  check('成员那一条指向「成员「writer」的工具」', (await memberRow.innerText().catch(() => '')).includes('成员「writer」的工具'),
+    (await memberRow.innerText().catch(() => '')).replace(/\s+/g, ' ').slice(-20))
+
+  await agentRow.locator('button').first().click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(500)
+  const tools = page.locator('[data-field="tools"]')
+  check('点一下：检查器翻到工具那一栏，问题落在那儿', await S(page, () => window.__studio.getState().selectedId) === 'fetch'
+    && (await tools.innerText()).includes('db_schema__shop'))
+  await tools.locator('button:has-text("绑定 db_schema__shop")').click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(200)
+  const bound = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'fetch').data.config.tools)
+  check('一键绑定：工具加进这个节点', JSON.stringify(bound) === JSON.stringify(['db_query__shop', 'db_schema__shop']), JSON.stringify(bound))
+
+  await memberRow.locator('button').first().click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(500)
+  const member = page.locator('[data-field="agents"] [data-item="1"]')
+  check('成员那一条落在第 2 个成员的工具下面', (await member.locator('[data-sub="tools"]').innerText({ timeout: 2000 })
+    .catch(() => '')).includes('没有给这个成员绑定它'))
+  const inView = await member.locator('[data-sub="tools"]').evaluate((el) => {
+    const r = el.getBoundingClientRect()
+    return r.top >= 0 && r.bottom <= window.innerHeight
+  }, null, { timeout: 2000 }).catch(() => false)
+  check('镜头滚到那个成员的工具', inView)
+  await member.locator('button:has-text("绑定 python_exec")').click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(200)
+  const mt = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'team').data.config.agents[1].tools)
+  check('一键绑定到那个成员', JSON.stringify(mt) === '["python_exec"]', JSON.stringify(mt))
+  await page.waitForFunction(() => !window.__studio.getState().issues.some((i) => /要求用「/.test(i.message)), null, { timeout: 6000 }).catch(() => {})
+  check('绑好之后这两条问题消失', !(await S(page, () => window.__studio.getState().issues.some((i) => /要求用「/.test(i.message)))))
+
+  // 数据源的查询工具要能在选择器里挑到：不然「把它加进工具里」这句话做不到
+  await member.locator('button:has-text("添加")').click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(300)
+  const pick = await member.innerText({ timeout: 2000 }).catch(() => '')
+  check('工具选择器列出数据源的 db_query__ / db_schema__ 工具', /db_query__/.test(pick) && /db_schema__/.test(pick))
+  await member.locator('button:has-text("收起")').click({ timeout: 2000 }).catch(() => {})
+
+  // NI-5：协作团队用完轮数时怎么收场
+  await S(page, () => window.__studio.getState().select('team'))
+  await page.waitForTimeout(300)
+  const ex = page.locator('[data-field="on_exhausted"]')
+  const exText = await ex.innerText().catch(() => '')
+  check('团队有「用完轮数时」，默认判为失败', exText.includes('用完轮数时')
+    && String(await ex.locator('select').evaluate((el) => el.options[el.selectedIndex].text, null, { timeout: 2000 })
+      .catch(() => '')).includes('判为失败'), exText.slice(0, 40))
+  check('选项说清两者差别', /降档/.test(exText) && /失败/.test(exText) && exText.length > 40)
+  // 报错和右栏都叫人「调大『最多轮数』」：字段名得是这四个字，照着找得到
+  check('轮数字段叫「最多轮数」，和报错里的说法一致',
+    (await page.locator('[data-field="max_rounds"]').innerText().catch(() => '')).includes('最多轮数'))
+  await ex.locator('select').selectOption({ label: '降档交付' }, { timeout: 2000 }).catch(() => {})
+  check('选降档交付写进配置', (await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'team').data.config.on_exhausted)) === 'degrade')
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
+}
+
+// ================================================================ 7b
+console.log('=== 工作流目录没取回来：不劝人新建（EmptyState source） ===')
+{
+  // 目录还在读、或者读失败时，「还没有工作流 · 新建」是一句假话：库里可能有几十张
+  for (const mode of ['loading', 'error']) {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } })
+    const page = await ctx.newPage()
+    await page.route(/\/api\/workflows(\?.*)?$/, (route) => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      return mode === 'loading' ? new Promise(() => {})
+        : route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本伪造的 500' }) })
+    })
+    await page.goto(`${WEB}/studio`, { waitUntil: 'domcontentloaded' })
+    // 目录一直不回来时，启动屏 5 秒后给「先进去看看」：进去之后才轮到编排页说话
+    if (mode === 'loading') await page.getByRole('button', { name: '先进去看看' }).click({ timeout: 12000 }).catch(() => {})
+    const hit = await page.waitForSelector(`[data-empty-unknown="${mode}"]`, { timeout: 8000 }).then(() => true).catch(() => false)
+    check(mode === 'loading' ? '目录还在读：说「正在读取」' : '目录没取回来：说没取回来、给重新读取', hit
+      && (mode === 'loading' ? /正在读取/ : /没取回来/).test(await page.locator('[data-empty-unknown]').innerText()))
+    check(mode === 'loading' ? '读的时候不劝人新建' : '读失败时不劝人新建',
+      await page.getByRole('button', { name: /新建工作流/ }).count() === 0)
+    await ctx.close()
+  }
 }
 
 // ================================================================ 8

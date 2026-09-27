@@ -28,7 +28,7 @@ export interface EdgeView {
   back: boolean
   /** 目标节点的拓扑层级，一次性时刻按它错开 */
   rank: number
-  /** 回边已经兜回去几次（循环第几轮）。0 不显示 */
+  /** 回边已经兜回去几次：这一次进入循环以来，回放截到游标。0 不显示 */
   loops?: number
 }
 

@@ -357,9 +357,28 @@ if (authFail) {
   check('有「接着跑」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 1)
   check('有「去模型接入」', await page.locator('[data-run-banner=failed] [data-action=settings]').count() === 1)
   check('有「复制错误」', await page.locator('[data-run-banner=failed] [data-action=copy-error]').count() === 1)
-  const href = await page.locator('[data-run-banner=failed] [data-action=locate]').getAttribute('href')
-  check('「在画布中定位」带 run 和 focus', href === `/studio/${authFail.workflow_id}?run=${authFail.id}&focus=${full.error_node_id}`, href ?? '')
   check('失败的运行不给「提取模板」', await page.locator('[data-action=extract]').count() === 0)
+  // 横幅里的定位是排错的主路，详情头上的回放是看全程：两处都得够得着画布。失败的节点
+  // 在工作流现在的图里已经没了的话（之后改过结构），对准它会落空：横幅改给「在航迹中看」，
+  // 详情头照样回放、只是不带 focus。两种情形下面的航迹夹具各测一遍，这里按库里的实情测
+  const authWf = (await getJson('/workflows')).find((w) => w.id === authFail.workflow_id)
+  const stillThere = !!authWf?.graph?.nodes?.some((n) => n.id === full.error_node_id)
+  const canvasBase = `/studio/${authFail.workflow_id}?run=${authFail.id}`
+  const headLink = page.locator('[data-run-detail] > header [data-action=open-canvas]')
+  const headHref = await headLink.getAttribute('href').catch(() => null)
+  const headText = await headLink.innerText().catch(() => '')
+  if (stillThere) {
+    const href = await page.locator('[data-run-banner=failed] [data-action=locate]').getAttribute('href').catch(() => null)
+    check('「在画布中定位」带 run 和 focus', href === `${canvasBase}&focus=${full.error_node_id}`, href ?? '')
+    check('失败的运行详情头上也有「在画布中回放」，对准失败的节点',
+      headText.includes('在画布中回放') && headHref === href, headHref ?? '没有这个按钮')
+  } else {
+    check('失败的节点在工作流现在的图里没了：不给落空的「在画布中定位」，改给「在航迹中看」',
+      await page.locator('[data-run-banner=failed] [data-action=locate]').count() === 0
+        && await page.locator('[data-run-banner=failed] [data-action=locate-trace]').count() === 1)
+    check('失败的运行详情头上照样「在画布中回放」，不带对不上的 focus',
+      headText.includes('在画布中回放') && headHref === canvasBase, headHref ?? '没有这个按钮')
+  }
 
   // 接着跑：POST 伪造成功，实时流在上面已经伪造好
   fakes.set(`POST /api/runs/${authFail.id}/continue`, () => ({
@@ -463,7 +482,16 @@ if (syntaxFail) {
   await page.locator('[data-run-banner=failed]').waitFor()
   check('表达式写错的失败不给「接着跑」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 0)
   const locate = page.locator('[data-run-banner=failed] [data-action=locate]')
-  check('「在画布中定位」成了主按钮', await locate.count() === 1 && /\bbtn-primary\b/.test(await locate.getAttribute('class') ?? ''))
+  // 失败的节点在工作流现在的图里没了的话，定位落空，主路改成去航迹看（定位作主按钮的
+  // 情形由后面「模型没有真正调用工具」的夹具测）
+  const synNode = (await getJson(`/runs/${syntaxFail.id}`)).error_node_id
+  const synWf = (await getJson('/workflows')).find((w) => w.id === syntaxFail.workflow_id)
+  if (synWf?.graph?.nodes?.some((n) => n.id === synNode)) {
+    check('「在画布中定位」成了主按钮', await locate.count() === 1 && /\bbtn-primary\b/.test(await locate.getAttribute('class') ?? ''))
+  } else {
+    check('失败的节点在工作流现在的图里没了：不给落空的定位，给「在航迹中看」',
+      await locate.count() === 0 && await page.locator('[data-run-banner=failed] [data-action=locate-trace]').count() === 1)
+  }
 } else {
   check('沙箱里有一条表达式写错的失败运行', false)
 }
@@ -478,6 +506,8 @@ if (held) {
   await page.waitForTimeout(500)
   check('显示「已挂起」而不是「等待审批」', await page.locator('[data-run-detail]').getAttribute('data-run-code') === 'held')
   check('挂起横幅带「接着跑」', await page.locator('[data-run-banner=held] [data-action=resume]').count() === 1)
+  // 挂起的没人会再去接：不放弃的话它在记录里永远挂着「可续跑」
+  check('挂起横幅也能放弃这次运行', await page.locator('[data-run-banner=held] [data-action=abandon]').count() === 1)
 }
 
 // ------------------------------------------------------------------ 封存凭证
@@ -573,6 +603,16 @@ await page.waitForTimeout(700)
 const clockB = await page.locator('[data-telemetry=wall]').innerText()
 check('墙钟在走（mm:ss.s）', /^\d\d:\d\d\.\d$/.test(clockB) && clockA !== clockB, `${clockA} → ${clockB}`)
 check('状态格写着当前节点', (await page.locator('[data-run-telemetry]').innerText()).includes('当前「总结」'))
+// 在跑的运行看航迹：游标跟着现在走，「此刻」列出在跑的节点
+await page.locator('[data-run-detail] [role=tab][data-tab=trace]').click()
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+const liveAtA = await page.locator('[data-trace-readout] [data-readout=at]').innerText().catch(() => '')
+await page.waitForTimeout(500)
+const liveAtB = await page.locator('[data-trace-readout] [data-readout=at]').innerText().catch(() => '')
+const liveMode = await page.locator('[data-trace-readout]').getAttribute('data-mode').catch(() => '')
+check('航迹上游标是实时的，而且在走', liveMode === '实时' && liveAtA !== liveAtB, `${liveMode} ${liveAtA} → ${liveAtB}`.replace(/\s+/g, ' '))
+check('「此刻」列出在跑的「总结」', await page.locator('[data-trace-now] [data-now-node=b]').count() === 1)
+await page.locator('[data-run-detail] [role=tab][data-tab=stream]').click()
 await page.getByRole('button', { name: '更多操作' }).click()
 const del = page.locator('[data-menu=delete]')
 check('运行中「删除记录」不可点，并说明要先停止', await del.isDisabled() && (await del.innerText()).includes('先停止'))
@@ -703,8 +743,583 @@ await page.getByRole('dialog').getByRole('button', { name: '删除记录' }).cli
 check('409 时把后端的话原样告诉人', await page.getByText('先停止它，再删除').first().waitFor({ timeout: 4000 }).then(() => true, () => false))
 check('409 时停在原地', new URL(page.url()).pathname === `/runs/${BUSY}`)
 
+// ------------------------------------------------------------------ 航迹
+
+console.log('\n=== 航迹：按时间摊开，拖到哪一刻读到哪一刻 ===')
+// 一次等过 5 分钟审批的运行：查询 → 审批 → 汇总。名字都是编的通用示例
+const wfHost = (await getJson('/workflows'))[0]
+const iso = (s) => new Date(s * 1000).toISOString()
+const TRACE = 'fake0trace00000000000000000000'
+const TRACE_OFF = 'fake0traceoff00000000000000000'
+const tt = Date.now() / 1000 - 3600
+const WAIT_S = 300
+const traceGraph = { nodes: [
+  { id: 'in', type: 'input', position: { x: 0, y: 0 }, data: { label: '输入', config: {} } },
+  { id: 'query', type: 'agent', position: { x: 200, y: 0 }, data: { label: '查询订单', config: { tools: ['db_query__shop'] } } },
+  { id: 'gate', type: 'human', position: { x: 400, y: 0 }, data: { label: '人工审批', config: {} } },
+  { id: 'sum', type: 'llm', position: { x: 600, y: 0 }, data: { label: '汇总', config: {} } },
+], edges: [{ source: 'in', target: 'query' }, { source: 'query', target: 'gate' }, { source: 'gate', target: 'sum' }] }
+const traceEvents = (usageIn = 2000) => [
+  { seq: 1, type: 'run.started', node_id: null, ts: tt, data: { nodes: 4 } },
+  { seq: 2, type: 'node.started', node_id: 'in', ts: tt + 0.1, data: { node_type: 'input', label: '输入' } },
+  { seq: 3, type: 'node.finished', node_id: 'in', ts: tt + 0.2, data: { duration_ms: 100 } },
+  { seq: 4, type: 'node.started', node_id: 'query', ts: tt + 0.3, data: { node_type: 'agent', label: '查询订单' } },
+  { seq: 5, type: 'tool.start', node_id: 'query', ts: tt + 0.5,
+    data: { tool: 'db_query__shop', call_id: 'c1', args: { sql: 'select count(*) as n from orders' } } },
+  { seq: 6, type: 'tool.end', node_id: 'query', ts: tt + 2.5,
+    data: { tool: 'db_query__shop', call_id: 'c1', duration_ms: 2000, preview: '{"columns":["n"],"rows":[[42]]}' } },
+  { seq: 7, type: 'llm.end', node_id: 'query', ts: tt + 3.0,
+    data: { agent: '查询订单', model: 'demo-model', input_tokens: 1200, output_tokens: 300, cost_usd: 0.004 } },
+  { seq: 8, type: 'node.finished', node_id: 'query', ts: tt + 3.1, data: { duration_ms: 2800, preview: '共 42 单' } },
+  { seq: 9, type: 'node.started', node_id: 'gate', ts: tt + 3.2, data: { node_type: 'human', label: '人工审批' } },
+  { seq: 10, type: 'human.requested', node_id: 'gate', ts: tt + 3.3, data: { mode: 'approve', prompt: '放行吗？' } },
+  { seq: 11, type: 'run.interrupted', node_id: null, ts: tt + 3.4, data: {} },
+  { seq: 12, type: 'human.resolved', node_id: 'gate', ts: tt + 3.4 + WAIT_S, data: { response: { approved: true }, actor: '张工' } },
+  { seq: 13, type: 'run.resumed', node_id: null, ts: tt + 3.4 + WAIT_S, data: { actor: '张工' } },
+  { seq: 14, type: 'node.finished', node_id: 'gate', ts: tt + 3.5 + WAIT_S, data: { duration_ms: 1 } },
+  { seq: 15, type: 'node.started', node_id: 'sum', ts: tt + 3.6 + WAIT_S, data: { node_type: 'llm', label: '汇总' } },
+  { seq: 16, type: 'llm.end', node_id: 'sum', ts: tt + 6.0 + WAIT_S,
+    data: { model: 'demo-model', input_tokens: 800, output_tokens: 500, cost_usd: 0.003 } },
+  { seq: 17, type: 'node.finished', node_id: 'sum', ts: tt + 6.1 + WAIT_S, data: { duration_ms: 2500 } },
+  { seq: 18, type: 'run.finished', node_id: null, ts: tt + 6.2 + WAIT_S, data: {
+    output: { answer: '共 42 单' }, usage: { input_tokens: usageIn, output_tokens: 800, cost_usd: 0.007 },
+    timing: { wall_ms: (6.2 + WAIT_S) * 1000, active_ms: 6200, wait_ms: WAIT_S * 1000 } } },
+]
+const traceRun = (id, usageIn = 2000) => ({
+  ...base, id, workflow_id: wfHost.id, workflow_name: wfHost.name, status: 'succeeded', run_class: 'exploratory',
+  version: null, version_hash: null, manifest_hash: null, manifest_seq: null, error: null, error_node_id: null,
+  input: { q: '上周的订单' }, output: { answer: '共 42 单' },
+  usage: { input_tokens: usageIn, output_tokens: 800, cost_usd: 0.007, duration_ms: 6200,
+           wall_ms: (6.2 + WAIT_S) * 1000, active_ms: 6200, wait_ms: WAIT_S * 1000 },
+  created_at: iso(tt), started_at: iso(tt), finished_at: iso(tt + 6.2 + WAIT_S),
+})
+const ART_Q = 'a1'.repeat(32)
+const ART_QOUT = 'b2'.repeat(32)
+const ART_SUM = 'c3'.repeat(32)
+const traceArtifacts = [
+  { id: ART_Q, kind: 'query_snapshot', node_id: 'query', size: 2048, meta: {}, created_at: iso(tt + 2.5) },
+  { id: ART_QOUT, kind: 'node_output', node_id: 'query', size: 120, meta: { type: 'agent', attempt: 1 }, created_at: iso(tt + 3.1) },
+  { id: ART_SUM, kind: 'node_output', node_id: 'sum', size: 300, meta: { type: 'llm', attempt: 1 }, created_at: iso(tt + 6.1 + WAIT_S) },
+]
+for (const [id, usageIn] of [[TRACE, 2000], [TRACE_OFF, 5000]]) {
+  fakes.set(`GET /api/runs/${id}`, () => ({ status: 200, json: traceRun(id, usageIn) }))
+  fakes.set(`GET /api/runs/${id}/events`, () => ({ status: 200, json: traceEvents(usageIn) }))
+  fakes.set(`GET /api/runs/${id}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+  fakes.set(`GET /api/runs/${id}/artifacts`, () => ({ status: 200, json: traceArtifacts }))
+}
+fakes.set(`GET /api/artifacts/${ART_Q}`, () => ({ status: 200, json: { id: ART_Q, content: {
+  tool: 'db_query__shop', args: { sql: 'select count(*) as n from orders' }, result: '{"columns":["n"],"rows":[[42]]}',
+} } }))
+// 工作流「现在」的图：这些运行之后改过结构——「汇总」删了，换成「通知」；「查询订单」还在。
+// 画布上还对得准的节点给「在画布中看这一步」，已经没了的不给（给了也对不到任何东西）
+const wfNow = (await getJson('/workflows')).map((w) => (w.id !== wfHost.id ? w : { ...w, graph: {
+  nodes: [...traceGraph.nodes.filter((n) => n.id !== 'sum'),
+    { id: 'notify', type: 'output', position: { x: 600, y: 0 }, data: { label: '通知', config: {} } }],
+  edges: [...traceGraph.edges.filter((e) => e.target !== 'sum'), { source: 'gate', target: 'notify' }],
+} }))
+fakes.set('GET /api/workflows', () => ({ status: 200, json: wfNow }))
+
+const viewTab = (k) => page.locator(`[data-run-detail] [role=tab][data-tab=${k}]`)
+const readout = (k) => page.locator(`[data-trace-readout] [data-readout=${k}]`).innerText().catch(() => '')
+// 实时、回放、终态写在游标那一格的标签行，数值那一行只有时刻
+const mode = () => page.locator('[data-trace-readout]').getAttribute('data-mode').catch(() => '')
+await page.goto(`${WEB}/runs/${TRACE}`, { waitUntil: 'networkidle' })
+await page.locator('[data-run-detail]').waitFor()
+check('详情分「时间线 / 航迹 / 工件」三个页签',
+  await viewTab('stream').count() === 1 && await viewTab('trace').count() === 1 && await viewTab('artifacts').count() === 1)
+check('默认停在时间线', await viewTab('stream').getAttribute('aria-selected').catch(() => null) === 'true')
+check('工件页签上写着有几件', (await viewTab('artifacts').innerText().catch(() => '')).includes('3'))
+check('读屏念的是「3 件」，不是「3 条」',
+  await viewTab('artifacts').locator('[aria-label]').getAttribute('aria-label').catch(() => null) === '3 件',
+  await viewTab('artifacts').locator('[aria-label]').getAttribute('aria-label').catch(() => '') ?? '')
+await viewTab('trace').click().catch(() => {})
+await page.locator('[data-run-trace] section[aria-label="航迹"]').waitFor({ timeout: 5000 }).catch(() => {})
+check('点「航迹」地址记下 ?view=trace', new URL(page.url()).searchParams.get('view') === 'trace')
+const lanes = await page.locator('[data-run-trace] [data-lane]').evaluateAll((els) => els.map((e) => e.getAttribute('data-lane')))
+check('每个节点一条泳道，按执行顺序排', lanes.join(',') === 'in,query,gate,sum', lanes.join(',') || '没有泳道')
+check('没拖游标时读的是终态：已完成、2.8k tok',
+  (await readout('phase')).includes('已完成') && (await readout('tokens')).includes('2.8k'),
+  `${await readout('phase')} / ${await readout('tokens')}`)
+check('没选节点时列出最耗时的节点（慢在哪）',
+  (await page.locator('[data-trace-slowest] [data-slow-node]').first().getAttribute('data-slow-node').catch(() => null)) === 'query')
+
+// 地址里带着时刻：从工件、分享的链接直接落到那一刻
+await page.goto(`${WEB}/runs/${TRACE}?view=trace&at=2500`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+check('?at=2500 落到 T+00:02.5', (await readout('at')).includes('00:02.5'), await readout('at'))
+check('游标在时间轴上也在回放', (await page.locator('[data-run-trace] [role=slider]').getAttribute('aria-valuenow').catch(() => null)) === '2500')
+check('那一刻在跑的是「查询订单」', await page.locator('[data-trace-now] [data-now-node=query]').count() === 1)
+check('那一刻整次运行还没用 token（模型 3.0 s 才回）', /^0\b/.test((await readout('tokens')).trim()), await readout('tokens'))
+check('进来之后地址里的时刻摘掉（拖动时不再和它对不上）', !new URL(page.url()).searchParams.has('at'))
+
+// 慢在哪：那一刻卡在哪个工具上（查询 0.5 s 开始、2.5 s 返回）
+await page.goto(`${WEB}/runs/${TRACE}?view=trace&at=2000`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+await page.locator('[data-run-trace] [data-lane=query] .tl-label').click().catch(() => {})
+const callText = await page.locator('[data-trace-node=query] [data-node-field=call]').innerText().catch(() => '')
+check('那一刻在跑的节点，卡片写着正在调哪个工具、调了多久', /db_query__shop.*已 1\.5 s/.test(callText), callText || '没有这一行')
+check('点泳道名只是选中节点，游标不动', (await readout('at')).includes('00:02.0'), await readout('at'))
+
+// 拖动：在坞的刻度行上按下、拖过去，读数跟着游标走
+const track = page.locator('[data-run-trace] .tl-scrub').first()
+const box = await track.boundingBox().catch(() => null)
+if (box) {
+  await page.mouse.move(box.x + box.width * 0.05, box.y + box.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(box.x + box.width * 0.15, box.y + box.height / 2, { steps: 4 })
+  await page.waitForTimeout(120)
+  const mid = `${await mode()} ${await readout('at')}`
+  await page.mouse.move(box.x + box.width * 0.3, box.y + box.height / 2, { steps: 4 })
+  await page.mouse.up()
+  await page.waitForTimeout(150)
+  const after = `${await mode()} ${await readout('at')}`
+  check('拖动游标：读数跟着走，并标成回放', mid.includes('回放') && after.includes('回放') && mid !== after, `${mid} → ${after}`)
+} else {
+  check('拖动游标：读数跟着走，并标成回放', false, '找不到坞的刻度行')
+}
+const slider = page.locator('[data-run-trace] [role=slider]')
+await slider.focus().catch(() => {})
+await page.keyboard.press('Home')
+await page.waitForTimeout(100)
+check('键盘 Home：游标回到开始', (await readout('at')).includes('00:00.0'), await readout('at'))
+await page.keyboard.press('End')
+await page.waitForTimeout(100)
+check('键盘 End：回到终态读数', await mode() === '终态', await mode())
+
+// 关键时刻：长时间等人的空档被压缩了，拖游标很难正好停在那一下
+const moments = page.locator('[data-trace-moments] [data-moment]')
+const momentText = (await moments.allInnerTexts().catch(() => [])).map((t) => t.replace(/\s+/g, ' '))
+check('列出关键时刻：开始、停下等审批、审批已处理（等了多久）、结局',
+  momentText.length === 4 && momentText[0].includes('开始运行') && momentText[1].includes('「人工审批」停下等审批')
+    && momentText[2].includes('审批已处理') && momentText[2].includes('5 分 00 秒') && momentText[3].includes('运行完成'),
+  momentText.join(' | '))
+check('没拖游标时，当前落在结局那一条', await moments.nth(3).getAttribute('aria-current').catch(() => null) === 'step')
+await moments.nth(2).click().catch(() => {})
+await page.waitForTimeout(150)
+check('点「审批已处理」：游标跳到那一刻（T+05:03.4）', await mode() === '回放' && (await readout('at')).includes('05:03.4'),
+  `${await mode()} ${await readout('at')}`)
+check('跳过去之后它成了当前那一条', await moments.nth(2).getAttribute('aria-current').catch(() => null) === 'step')
+check('坞上的游标也跟着过去', (await slider.getAttribute('aria-valuenow').catch(() => null)) === '303400',
+  await slider.getAttribute('aria-valuenow').catch(() => '') ?? '')
+await moments.nth(3).click().catch(() => {})
+await page.waitForTimeout(150)
+check('点结局那一条回到终态', await mode() === '终态', await mode())
+
+await page.goto(`${WEB}/runs/${TRACE}?view=trace&at=30000`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+check('拖到等审批那一段：状态是等待审批', (await readout('phase')).includes('等待审批'), await readout('phase'))
+check('那一刻等审批的是「人工审批」', await page.locator('[data-trace-now] [data-now-node=gate]').count() === 1)
+check('用量只算到那一刻：1.5k', (await readout('tokens')).includes('1.5k'), await readout('tokens'))
+await page.locator('[data-run-trace] [data-lane=query]').click().catch(() => {})
+const nodeCard = page.locator('[data-trace-node=query]')
+check('点泳道看这个节点在那一刻的样子', await nodeCard.count() === 1)
+check('节点的用量、工具数取自那一刻',
+  (await nodeCard.locator('[data-node-field=tokens]').innerText().catch(() => '')).includes('1.5k')
+    && (await nodeCard.locator('[data-node-field=tools]').innerText().catch(() => '')).includes('1'))
+check('节点卡能回画布看这一步',
+  (await nodeCard.locator('[data-action=node-canvas]').getAttribute('href').catch(() => null)) === `/studio/${wfHost.id}?run=${TRACE}&focus=query`)
+await page.locator('[data-run-trace] [data-lane=sum] .tl-label').click().catch(() => {})
+const goneCard = page.locator('[data-trace-node=sum]')
+check('工作流现在的图里已经没有的节点：节点卡不给落空的「在画布中看这一步」，说明为什么',
+  await goneCard.count() === 1 && await goneCard.locator('[data-action=node-canvas]').count() === 0
+    && await goneCard.locator('[data-node-gone]').count() === 1)
+await page.locator('[data-run-trace] [data-lane=query] .tl-label').click().catch(() => {})
+await nodeCard.locator('[data-action=node-stream]').click().catch(() => {})
+await page.waitForTimeout(300)
+check('「在时间线里看」切回时间线', await viewTab('stream').getAttribute('aria-selected').catch(() => null) === 'true')
+check('并且把那一步描出来', await page.locator('[data-run-detail] [data-node-id="query"][data-flash]').count() >= 1)
+
+await page.goto(`${WEB}/runs/${TRACE_OFF}?view=trace&at=30000`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+check('各次调用加起来对不上后端总数时，那一刻的用量写「—」，不拿终值冒充', (await readout('tokens')).trim().startsWith('—'), await readout('tokens'))
+
+// 模型把工具调用写成了文字、一次都没真正查（引擎判失败）：结局是失败，而且说得出为什么
+console.log('\n=== 航迹：模型没有真正调用工具 ===')
+const LEAK = 'fake0leak000000000000000000000'
+const LEAK_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
+fakes.set(`GET /api/runs/${LEAK}`, () => ({ status: 200, json: {
+  ...traceRun(LEAK), status: 'failed', output: null, error: LEAK_ERROR, error_node_id: 'query',
+  usage: { input_tokens: 900, output_tokens: 400, cost_usd: 0.002, duration_ms: 4200, wall_ms: 4200, active_ms: 4200, wait_ms: 0 },
+  finished_at: iso(tt + 4.2),
+} }))
+fakes.set(`GET /api/runs/${LEAK}/events`, () => ({ status: 200, json: [
+  ...traceEvents().slice(0, 4),
+  { seq: 5, type: 'llm.end', node_id: 'query', ts: tt + 2.0,
+    data: { agent: '查询订单', model: 'demo-model', input_tokens: 450, output_tokens: 200, cost_usd: 0.001 } },
+  { seq: 6, type: 'log', node_id: 'query', ts: tt + 2.1, data: {
+    level: 'warn', code: 'tool_markup_leak', message: '模型把工具调用写成了文字（<｜｜DSML｜｜invoke name="db_query__shop"…），没有真正调用工具' } },
+  { seq: 7, type: 'llm.end', node_id: 'query', ts: tt + 4.0,
+    data: { agent: '查询订单', model: 'demo-model', input_tokens: 450, output_tokens: 200, cost_usd: 0.001 } },
+  { seq: 8, type: 'node.failed', node_id: 'query', ts: tt + 4.1, data: { error: LEAK_ERROR, duration_ms: 3800 } },
+  { seq: 9, type: 'run.failed', node_id: null, ts: tt + 4.2, data: {
+    error: LEAK_ERROR, node_id: 'query', timing: { wall_ms: 4200, active_ms: 4200, wait_ms: 0 } } },
+] }))
+fakes.set(`GET /api/runs/${LEAK}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+fakes.set(`GET /api/runs/${LEAK}/artifacts`, () => ({ status: 200, json: [] }))
+await page.goto(`${WEB}/runs/${LEAK}?view=trace`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+const leakBanner = (await page.locator('[data-run-banner=failed]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+check('失败横幅说清是模型没有真正调用工具', leakBanner.includes('没有真正调用工具'), leakBanner.slice(0, 60))
+const leakLocate = page.locator('[data-run-banner=failed] [data-action=locate]')
+check('失败的节点还在工作流现在的图里：「在画布中定位」对准它；接着跑过不去，它就是主按钮',
+  await leakLocate.getAttribute('href').catch(() => null) === `/studio/${wfHost.id}?run=${LEAK}&focus=query`
+    && /\bbtn-primary\b/.test(await leakLocate.getAttribute('class').catch(() => '') ?? '')
+    && await page.locator('[data-run-banner=failed] [data-action=locate-trace]').count() === 0)
+const leakMoments = (await page.locator('[data-trace-moments] [data-moment]').allInnerTexts().catch(() => [])).map((t) => t.replace(/\s+/g, ' '))
+check('关键时刻里有那一下警告，结局写失败于哪个节点',
+  leakMoments.some((t) => t.includes('「查询订单」把工具调用写成了文字'))
+    && (leakMoments.at(-1) ?? '').includes('失败于「查询订单」') && (leakMoments.at(-1) ?? '').includes('没有真正调用工具'),
+  leakMoments.join(' | '))
+const leakCard = (await page.locator('[data-trace-node=query]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+check('失败的节点默认选中，卡片上写着警告和原因',
+  leakCard.includes('把工具调用写成了文字') && leakCard.includes('没有真正调用工具') && leakCard.includes('失败'),
+  leakCard.slice(0, 80))
+await page.locator('[data-trace-moments] [data-moment="query:markup"]').click().catch(() => {})
+await page.waitForTimeout(150)
+check('跳到警告那一刻：节点还在跑，卡片上已经有警告',
+  (await readout('at')).includes('00:02.1') && (await page.locator('[data-trace-node=query] [data-node-warn]').count()) === 1,
+  await readout('at'))
+
+// 失败在「汇总」上，而工作流之后把「汇总」删了：画布上对准它什么也对不到
+console.log('\n=== 失败的节点在工作流现在的图里已经没了 ===')
+const GONE = 'fake0gonefail00000000000000000'
+const GONE_ERROR = '节点「汇总」失败：模型服务出错了（HTTP 500）'
+fakes.set(`GET /api/runs/${GONE}`, () => ({ status: 200, json: {
+  ...traceRun(GONE), status: 'failed', output: null, error: GONE_ERROR, error_node_id: 'sum', finished_at: iso(tt + 6.2 + WAIT_S),
+} }))
+fakes.set(`GET /api/runs/${GONE}/events`, () => ({ status: 200, json: [
+  ...traceEvents().slice(0, 15),
+  { seq: 16, type: 'node.failed', node_id: 'sum', ts: tt + 6.0 + WAIT_S, data: { error: GONE_ERROR, duration_ms: 2400 } },
+  { seq: 17, type: 'run.failed', node_id: null, ts: tt + 6.1 + WAIT_S, data: {
+    error: GONE_ERROR, node_id: 'sum', timing: { wall_ms: (6.1 + WAIT_S) * 1000, active_ms: 6100, wait_ms: WAIT_S * 1000 } } },
+] }))
+fakes.set(`GET /api/runs/${GONE}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+fakes.set(`GET /api/runs/${GONE}/artifacts`, () => ({ status: 200, json: [] }))
+await page.goto(`${WEB}/runs/${GONE}`, { waitUntil: 'networkidle' })
+await page.locator('[data-run-banner=failed]').waitFor({ timeout: 5000 }).catch(() => {})
+check('横幅不给落空的「在画布中定位」，改给「在航迹中看」',
+  await page.locator('[data-run-banner=failed] [data-action=locate]').count() === 0
+    && await page.locator('[data-run-banner=failed] [data-action=locate-trace]').count() === 1)
+const goneHead = page.locator('[data-run-detail] > header [data-action=open-canvas]')
+check('详情头照样能在画布中回放，只是不带对不上的 focus',
+  await goneHead.getAttribute('href').catch(() => null) === `/studio/${wfHost.id}?run=${GONE}`
+    && !/对准/.test(await goneHead.getAttribute('title').catch(() => '') ?? ''),
+  await goneHead.getAttribute('href').catch(() => '没有这个按钮') ?? '')
+await page.locator('[data-run-banner=failed] [data-action=locate-trace]').click().catch(() => {})
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+check('「在航迹中看」：切到航迹，选中失败的那个节点，停在终态',
+  await viewTab('trace').getAttribute('aria-selected').catch(() => null) === 'true'
+    && await page.locator('[data-trace-node=sum]').count() === 1 && await mode() === '终态')
+check('那张节点卡也说清画布上已经没有它', await page.locator('[data-trace-node=sum] [data-node-gone]').count() === 1)
+
+// ------------------------------------------------------------------ 工件
+
+console.log('\n=== 工件：按节点分组，就地打开 ===')
+await page.goto(`${WEB}/runs/${TRACE}?view=artifacts`, { waitUntil: 'networkidle' })
+await page.locator('[data-run-artifacts]').waitFor({ timeout: 5000 }).catch(() => {})
+const groups = await page.locator('[data-run-artifacts] [data-artifact-group]').evaluateAll((els) => els.map((e) => e.getAttribute('data-artifact-group')))
+check('按节点分组，按执行顺序', groups.join(',') === 'query,sum', groups.join(',') || '没有分组')
+const qText = await page.locator(`[data-artifact-id="${ART_Q}"]`).innerText().catch(() => '')
+check('每件写着类型和大小', qText.includes('查询快照') && qText.includes('2.0 KB'), qText.replace(/\s+/g, ' '))
+await page.locator(`[data-artifact-id="${ART_Q}"] [data-action=artifact-open]`).click().catch(() => {})
+const artDialog = page.getByRole('dialog')
+// 弹窗先出来、内容取回来之后才画表：等到解开的那一块再读
+await artDialog.locator('[data-artifact]').waitFor({ timeout: 5000 }).catch(() => {})
+const artText = await artDialog.innerText().catch(() => '')
+check('用证据查看器打开：带节点名，解开 SQL 和结果表',
+  artText.includes('查询订单') && artText.includes('select count(*)') && artText.includes('42'), artText.replace(/\s+/g, ' ').slice(0, 90))
+await page.keyboard.press('Escape')
+await page.locator(`[data-artifact-id="${ART_Q}"] [data-action=artifact-moment]`).click().catch(() => {})
+await page.waitForTimeout(400)
+check('「在航迹里看这一刻」跳到航迹、定位到它产出的时刻',
+  await viewTab('trace').getAttribute('aria-selected').catch(() => null) === 'true' && (await readout('at')).includes('00:02.5'),
+  await readout('at'))
+const realWithArt = []
+for (const r of allRuns.slice(0, 40)) {
+  const a = await getJson(`/runs/${r.id}/artifacts`)
+  if (a.length) { realWithArt.push([r, a]); break }
+}
+if (realWithArt.length) {
+  const [r, a] = realWithArt[0]
+  await page.goto(`${WEB}/runs/${r.id}`, { waitUntil: 'networkidle' })
+  await page.locator('[data-run-detail]').waitFor()
+  await page.waitForTimeout(300)
+  check('真实运行：工件页签的数和接口一致', (await viewTab('artifacts').innerText().catch(() => '')).includes(String(a.length)),
+    `接口 ${a.length} 件`)
+}
+
+// ------------------------------------------------------------------ 回画布
+
+console.log('\n=== 在画布中回放 ===')
+await page.goto(`${WEB}/runs/${TRACE}`, { waitUntil: 'networkidle' })
+await page.locator('[data-run-detail]').waitFor()
+const replayLink = page.locator('[data-run-detail] > header [data-action=open-canvas]')
+check('跑完的运行，详情头是「在画布中回放」',
+  (await replayLink.innerText().catch(() => '')).includes('在画布中回放')
+    && await replayLink.getAttribute('href').catch(() => null) === `/studio/${wfHost.id}?run=${TRACE}`,
+  await replayLink.getAttribute('href').catch(() => '') ?? '')
+check('工作流之后改过结构：链接说明画布上是现在的图',
+  await replayLink.getAttribute('data-graph-drift').catch(() => null) === '1'
+    && /改过/.test(await replayLink.getAttribute('title').catch(() => '') ?? ''))
+fakes.delete('GET /api/workflows')
+
+// ------------------------------------------------------------------ 列表：缩略条、取消原因
+
+console.log('\n=== 列表：每行一条缩略条 ===')
+const FAILED_ROW = 'fake0failedrow0000000000000000'
+const CANCEL_ROW = 'fake0cancelrow0000000000000000'
+const failedRow = { ...traceRun(FAILED_ROW), status: 'failed', error: '节点「汇总」失败：模型服务出错了（HTTP 500）', error_node_id: 'sum',
+  usage: { wall_ms: 4000, active_ms: 4000, wait_ms: 0, duration_ms: 4000 }, finished_at: iso(tt + 4) }
+const cancelRow = { ...traceRun(CANCEL_ROW), status: 'cancelled', error: '用户取消：在等审批时放弃了这次运行',
+  usage: { wall_ms: 90000, active_ms: 3000, wait_ms: 87000, duration_ms: 3000 }, finished_at: iso(tt + 90) }
+fakes.set('GET /api/runs', () => ({ status: 200, json: [traceRun(TRACE), failedRow, cancelRow, ...listTop] }))
+await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+await rowsOf().first().waitFor()
+const shapeCount = await page.locator('[data-runs-list] [data-run-id] [data-run-shape]').count()
+check('每一行都有一条缩略条', shapeCount === await rowsOf().count() && shapeCount > 0, `${shapeCount} 条`)
+const waitFrac = await page.locator(`[data-run-id="${TRACE}"] [data-shape-seg=wait]`).evaluate(
+  (el) => el.getBoundingClientRect().width / el.parentElement.getBoundingClientRect().width).catch(() => 0)
+check('等人占了九成八的墙钟，缩略条上等人那段也占大半', waitFrac > 0.9, waitFrac.toFixed(2))
+check('失败的那一行收在失败色上', await page.locator(`[data-run-id="${FAILED_ROW}"] [data-shape-end=failed]`).count() === 1)
+check('缩略条的 title 写着执行和等人',
+  /执行 .+ · 等人 .+/.test(await page.locator(`[data-run-id="${TRACE}"] [data-run-shape]`).getAttribute('title').catch(() => '') ?? ''))
+const cancelText = (await page.locator(`[data-run-id="${CANCEL_ROW}"]`).innerText().catch(() => '')).replace(/\s+/g, ' ')
+check('已取消写原因，不重复「用户取消」', cancelText.includes('在等审批时放弃了这次运行') && !cancelText.includes('用户取消'), cancelText.slice(0, 80))
+fakes.delete('GET /api/runs')
+
+console.log('\n=== 工作流筛选：未保存的工作流 ===')
+await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+await rowsOf().first().waitFor()
+const wfOptions = await page.locator('[data-runs-workflow] option').evaluateAll((els) => els.map((e) => e.value))
+check('工作流下拉里有「未保存的工作流」', wfOptions.includes('__none__'))
+if (wfOptions.includes('__none__')) {
+  await listAfter(() => page.locator('[data-runs-workflow]').selectOption('__none__'), (p) => p.get('workflow_id') === '__none__')
+  check('地址记下 ?wf=__none__', new URL(page.url()).searchParams.get('wf') === '__none__')
+  const names = await page.locator('[data-runs-list] [data-run-id] > div:first-of-type').evaluateAll((els) => els.map((e) => e.textContent ?? ''))
+  check('筛出来的都是未保存的工作流', names.length > 0 && names.every((n) => n.includes('未保存的工作流')), `${names.length} 行`)
+  await page.locator('[data-runs-workflow]').selectOption('')
+  await settle()
+}
+
+// ------------------------------------------------------------------ 放弃
+
+if (pending.length) {
+  console.log('\n=== 等审批的运行就地放弃 ===')
+  const target = pending[0]
+  const full = await getJson(`/runs/${target.run_id}`)
+  const evs = await getJson(`/runs/${target.run_id}/events`)
+  await page.goto(`${WEB}/runs/${target.run_id}`, { waitUntil: 'networkidle' })
+  await page.locator('[data-run-detail][data-run-code=waiting]').waitFor({ timeout: 8000 }).catch(() => {})
+  const abandon = page.locator('[data-run-banner=waiting] [data-action=abandon]')
+  check('等审批的横幅上有「放弃这次运行」', await abandon.count() === 1)
+  if (await abandon.count()) {
+    let cancelCalls = 0
+    fakes.set(`POST /api/runs/${target.run_id}/cancel`, () => { cancelCalls++; return { status: 200, json: { ok: true, status: 'cancelled' } } })
+    await abandon.click()
+    const ask = page.getByRole('dialog')
+    await ask.waitFor({ timeout: 5000 }).catch(() => {})
+    check('放弃前要确认，并写清待审批一并关闭', (await ask.innerText().catch(() => '')).includes('待审批'))
+    const tc = Date.now() / 1000
+    fakes.set(`GET /api/runs/${target.run_id}`, () => ({ status: 200, json: {
+      ...full, status: 'cancelled', error: '用户取消：在等审批时放弃了这次运行', finished_at: iso(tc),
+    } }))
+    fakes.set(`GET /api/runs/${target.run_id}/events`, () => ({ status: 200, json: [...evs, {
+      seq: (evs.at(-1)?.seq ?? 0) + 1, type: 'run.cancelled', node_id: null, ts: tc,
+      data: { actor: '张工', message: '放弃了这次运行，1 条待审批一并关闭', timing: { wall_ms: 1000, active_ms: 10, wait_ms: 990 } },
+    }] }))
+    fakes.set('GET /api/approvals', (url) => ({
+      status: 200, json: pending.filter((a) => a.id !== target.id && (!url.searchParams.get('run_id') || a.run_id === url.searchParams.get('run_id'))),
+    }))
+    await ask.getByRole('button', { name: '放弃这次运行' }).click({ timeout: 5000 }).catch(() => {})
+    const gone = await page.waitForFunction(
+      () => document.querySelector('[data-run-detail]')?.getAttribute('data-run-code') === 'cancelled',
+      null, { timeout: 6000 },
+    ).then(() => true, () => false)
+    check('发的是 POST /cancel', cancelCalls === 1)
+    check('状态变成已取消', gone)
+    const status = (await page.locator('[data-run-telemetry]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check('状态格写着谁放弃的', status.includes('张工') && status.includes('放弃'), status.slice(0, 60))
+    fakes.delete(`POST /api/runs/${target.run_id}/cancel`)
+    fakes.delete(`GET /api/runs/${target.run_id}`)
+    fakes.delete(`GET /api/runs/${target.run_id}/events`)
+    fakes.delete('GET /api/approvals')
+  }
+}
+
+// ------------------------------------------------------------------ 等了几天、窄屏
+
+console.log('\n=== 等了几天的审批、1024 宽 ===')
+// 停在审批上十天多：等人要写「10 天 05 小时」，而不是被截成「245 小时 3…」；游标写「T+10 天 05:30:07」，
+// 不写「T+245:30:07.3」（同一行的墙钟、等人写的是「10 天」，而且放不下）。等人的时长在涨，游标要走
+const STALE = 'fake0stalewait0000000000000000'
+const tw = Date.now() / 1000 - 10 * 86400 - 5.5 * 3600
+const longApproval = {
+  id: 'fake0longappr0000000000000000', run_id: STALE, node_id: 'gate', mode: 'approve', title: '放行吗？',
+  payload: { kind: 'human_node', node_id: 'gate', mode: 'approve', title: '放行吗？', message: '', schema: {}, context: {} },
+  status: 'pending', response: {}, created_at: iso(tw + 3.3), resolved_by: null, resolved_at: null,
+  workflow_id: wfHost.id, workflow_name: '订单日报', node_label: '人工审批', run_status: 'interrupted', run_class: 'exploratory',
+}
+fakes.set(`GET /api/runs/${STALE}`, () => ({ status: 200, json: {
+  ...traceRun(STALE), status: 'interrupted', output: null, finished_at: null, created_at: iso(tw), started_at: iso(tw),
+  usage: { input_tokens: 1200, output_tokens: 300, cost_usd: 0.004 },
+} }))
+fakes.set(`GET /api/runs/${STALE}/events`, () => ({ status: 200, json: traceEvents().slice(0, 11).map((e) => ({ ...e, ts: e.ts - tt + tw })) }))
+fakes.set(`GET /api/runs/${STALE}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+fakes.set(`GET /api/runs/${STALE}/artifacts`, () => ({ status: 200, json: [] }))
+fakes.set('GET /api/approvals', (url) => ({
+  status: 200, json: !url.searchParams.get('run_id') || url.searchParams.get('run_id') === STALE ? [longApproval] : [],
+}))
+const fits = (sel) => page.locator(sel).evaluateAll((els) => els.length > 0 && els.every((e) => e.scrollWidth <= e.clientWidth + 0.5))
+const DAY_AT = /^T\+10 天 05:3\d:\d\d$/
+// 1300 宽：详情区 836px，排成一行的话一格只剩 78px，「10 天 05 小时」放不下，得排两行
+for (const [w, h] of [[1440, 900], [1300, 860], [1024, 768]]) {
+  await page.setViewportSize({ width: w, height: h })
+  await page.goto(`${WEB}/runs/${STALE}?view=trace`, { waitUntil: 'networkidle' })
+  await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+  const waitRead = await readout('wait')
+  check(`${w} 宽：等人写成跨天的跨度（10 天 05 小时），不被截断`,
+    waitRead.startsWith('10 天 05 小时') && await fits('[data-trace-readout] [data-readout=wait]'), waitRead)
+  const atRead = (await readout('at')).trim()
+  check(`${w} 宽：游标写成跨天的时刻（T+10 天 05:30:xx），不被截断`,
+    DAY_AT.test(atRead) && await fits('[data-trace-readout] [data-readout=at]'), atRead)
+}
+await page.setViewportSize({ width: 1440, height: 900 })
+await page.goto(`${WEB}/runs/${STALE}?view=trace`, { waitUntil: 'networkidle' })
+await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
+check('「此刻」的等审批也写跨天', (await page.locator('[data-trace-now] [data-now-node=gate]').innerText().catch(() => '')).includes('10 天 05 小时'))
+const waitAtA = await readout('at')
+// 跨天的时刻只写到秒：隔一秒多再读
+await page.waitForTimeout(1100)
+const waitAtB = await readout('at')
+check('停在审批上时游标照样跟着现在走（和坞里同一拍）', await mode() === '实时' && waitAtA !== waitAtB, `${waitAtA} → ${waitAtB}`.replace(/\s+/g, ' '))
+
+// 去审批卡：审批卡在时间线里。从航迹、工件、原始事件点过来，要切回时间线、描一下卡片，
+// 并且焦点进到卡片里——键盘和读屏用户才接得着。视图经地址切，提交比点击晚好几帧
+console.log('\n=== 去审批卡：从哪个视图点都能把焦点送进卡片 ===')
+for (const [from, label] of [['trace', '航迹'], ['artifacts', '工件'], ['raw', '原始事件'], ['stream', '时间线']]) {
+  await page.goto(`${WEB}/runs/${STALE}${from === 'trace' || from === 'artifacts' ? `?view=${from}` : ''}`, { waitUntil: 'networkidle' })
+  await page.locator('[data-run-banner=waiting] [data-action=jump-approval]').waitFor({ timeout: 5000 }).catch(() => {})
+  if (from === 'raw') {
+    await page.locator('[data-action=raw]').click().catch(() => {})
+    await page.locator('[data-raw-events]').waitFor({ timeout: 3000 }).catch(() => {})
+  }
+  await page.locator('[data-run-banner=waiting] [data-action=jump-approval]').click().catch(() => {})
+  const into = await page.waitForFunction(() => !!document.activeElement?.closest('[data-approval-card]'), null, { timeout: 3000 })
+    .then(() => true, () => false)
+  const ringed = await page.locator(`[data-approval-card="${longApproval.id}"].runs-focus-ring`).count()
+  const back = await viewTab('stream').getAttribute('aria-selected').catch(() => null) === 'true'
+  check(`从「${label}」点「去审批卡」：回到时间线，焦点进了审批卡，卡片描了一下边`, into && ringed === 1 && back,
+    `时间线 ${back ? '是' : '否'} · 描边 ${ringed} · 焦点在 ${await page.evaluate(() => {
+      const a = document.activeElement
+      return `${a?.tagName}${a?.getAttribute('data-action') ? `[${a.getAttribute('data-action')}]` : ''}`
+    })}`)
+}
+
+// 批过的十天等待：「审批已处理」「运行完成」都在 T+10 天之后。关键时刻里时刻那一栏按最宽的
+// 一条排齐，不压到后面的徽标上；终态的游标放得下
+console.log('\n=== 跨天的关键时刻 ===')
+const LONGDONE = 'fake0longdone00000000000000000'
+const td = Date.now() / 1000 - 11 * 86400
+const LONG_S = 10 * 86400
+const longTiming = { wall_ms: (6.2 + LONG_S) * 1000, active_ms: 6200, wait_ms: LONG_S * 1000 }
+fakes.set(`GET /api/runs/${LONGDONE}`, () => ({ status: 200, json: {
+  ...traceRun(LONGDONE), created_at: iso(td), started_at: iso(td), finished_at: iso(td + 6.2 + LONG_S),
+  usage: { input_tokens: 2000, output_tokens: 800, cost_usd: 0.007, duration_ms: 6200, ...longTiming },
+} }))
+fakes.set(`GET /api/runs/${LONGDONE}/events`, () => ({ status: 200, json: traceEvents().map((e) => ({
+  ...e,
+  ts: e.ts - tt + td + (e.seq >= 12 ? LONG_S - WAIT_S : 0),
+  ...(e.type === 'run.finished' ? { data: { ...e.data, timing: longTiming } } : {}),
+})) }))
+fakes.set(`GET /api/runs/${LONGDONE}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+fakes.set(`GET /api/runs/${LONGDONE}/artifacts`, () => ({ status: 200, json: [] }))
+const momentsAligned = () => page.locator('[data-trace-moments] [data-moment]').evaluateAll((els) => {
+  const cols = els.map((b) => {
+    const at = b.querySelector('[data-moment-at]')
+    return { at: at.getBoundingClientRect(), fit: at.scrollWidth <= at.clientWidth + 0.5, mark: at.nextElementSibling.getBoundingClientRect().left }
+  })
+  return cols.length > 0 && cols.every((c) => c.fit && c.at.right <= c.mark + 0.5 && Math.abs(c.mark - cols[0].mark) < 0.5)
+})
+for (const [w, h] of [[1440, 900], [1024, 768]]) {
+  await page.setViewportSize({ width: w, height: h })
+  await page.goto(`${WEB}/runs/${LONGDONE}?view=trace`, { waitUntil: 'networkidle' })
+  await page.locator('[data-trace-moments]').waitFor({ timeout: 5000 }).catch(() => {})
+  const texts = (await page.locator('[data-trace-moments] [data-moment]').allInnerTexts().catch(() => [])).map((t) => t.replace(/\s+/g, ' '))
+  check(`${w} 宽：跨天的关键时刻写「T+10 天 00:00:03」，时刻一栏排齐、不压到徽标上`,
+    texts.some((t) => t.includes('T+10 天 00:00:03') && t.includes('审批已处理') && t.includes('等了 10 天')) && await momentsAligned(),
+    texts.join(' | '))
+  check(`${w} 宽：终态的游标写「T+10 天 00:00:06」，放得下`,
+    (await readout('at')).trim() === 'T+10 天 00:00:06' && await fits('[data-trace-readout] [data-readout=at]'), await readout('at'))
+}
+
+// 屏幕矮、节点多：九个节点的失败运行，横幅占去一截。读数区先拿够它要的，默认选中的失败
+// 节点卡、关键时刻都得在首屏；坞拿剩下的，不矮过能拖到的最矮，泳道在坞里滚
+console.log('\n=== 屏幕矮、节点多：读数区不被航迹坞压住 ===')
+const FAN = 'fake0fanfail000000000000000000'
+const FAN_ERROR = '节点「查询订单」失败：模型服务出错了（HTTP 500）'
+const FAN_STEPS = ['check', 'score', 'route', 'publish', 'archive']
+const fanGraph = {
+  nodes: [...traceGraph.nodes, ...FAN_STEPS.map((id, i) => ({
+    id, type: 'llm', position: { x: 800 + i * 200, y: 0 }, data: { label: `步骤 ${i + 1}`, config: {} },
+  }))],
+  edges: [...traceGraph.edges, ...FAN_STEPS.map((id, i) => ({ source: i ? FAN_STEPS[i - 1] : 'sum', target: id }))],
+}
+fakes.set(`GET /api/runs/${FAN}`, () => ({ status: 200, json: {
+  ...traceRun(FAN), status: 'failed', output: null, error: FAN_ERROR, error_node_id: 'query',
+  usage: { input_tokens: 0, output_tokens: 0, cost_usd: 0, duration_ms: 1200, wall_ms: 1200, active_ms: 1200, wait_ms: 0 },
+  finished_at: iso(tt + 1.2),
+} }))
+fakes.set(`GET /api/runs/${FAN}/events`, () => ({ status: 200, json: [
+  ...traceEvents().slice(0, 4),
+  { seq: 5, type: 'node.failed', node_id: 'query', ts: tt + 1.1, data: { error: FAN_ERROR, duration_ms: 800 } },
+  { seq: 6, type: 'run.failed', node_id: null, ts: tt + 1.2, data: {
+    error: FAN_ERROR, node_id: 'query', timing: { wall_ms: 1200, active_ms: 1200, wait_ms: 0 } } },
+] }))
+fakes.set(`GET /api/runs/${FAN}/graph`, () => ({ status: 200, json: { graph: fanGraph, workflow_id: wfHost.id, version: null } }))
+fakes.set(`GET /api/runs/${FAN}/artifacts`, () => ({ status: 200, json: [] }))
+const firstScreen = () => page.evaluate(() => {
+  const read = document.querySelector('[data-trace-readout]')?.getBoundingClientRect()
+  const whole = (sel) => {
+    const b = document.querySelector(sel)?.getBoundingClientRect()
+    return !!b && !!read && b.top >= read.top - 0.5 && b.bottom <= read.bottom + 1
+  }
+  return {
+    card: whole('[data-trace-node=query]'), moments: whole('[data-trace-moments]'),
+    dock: Math.round(document.querySelector('[data-run-trace] section[aria-label="航迹"]')?.getBoundingClientRect().height ?? 0),
+  }
+})
+for (const [w, h] of [[1440, 900], [1180, 800], [1024, 768]]) {
+  await page.setViewportSize({ width: w, height: h })
+  await page.goto(`${WEB}/runs/${FAN}?view=trace`, { waitUntil: 'networkidle' })
+  await page.locator('[data-trace-node=query]').waitFor({ timeout: 5000 }).catch(() => {})
+  await page.waitForTimeout(150)
+  const seen = await firstScreen()
+  check(`${w}×${h}：失败节点卡、关键时刻整块都在首屏，坞不矮过 132px`, seen.card && seen.moments && seen.dock >= 132, JSON.stringify(seen))
+}
+// 再矮（或者横幅更高）就放不下了：坞不再让，读数区底边淡出，看得出下面还有
+await page.setViewportSize({ width: 1024, height: 640 })
+await page.waitForTimeout(300)
+check('1024×640：读数区放不下时底边淡出，提示能往下滚', await page.locator('[data-trace-readout][data-more]').count() === 1)
+
+// 1024 宽：详情区只有 600px，读数一格不到 70px 的字宽
+await page.setViewportSize({ width: 1024, height: 768 })
+fakes.set('GET /api/runs', () => ({ status: 200, json: [traceRun(TRACE), ...listTop] }))
+await page.goto(`${WEB}/runs/${TRACE}`, { waitUntil: 'networkidle' })
+await page.locator('[data-run-telemetry]').waitFor({ timeout: 5000 }).catch(() => {})
+const cut = await page.locator('[data-run-telemetry] [data-telemetry]').evaluateAll((els) =>
+  els.filter((e) => e.scrollWidth > e.clientWidth + 0.5).map((e) => `${e.getAttribute('data-telemetry')}「${e.textContent}」`))
+check('1024 宽：详情头的读数没有一格被截成省略号', cut.length === 0, cut.join('、') || '全部放得下')
+const footH = await page.locator(`[data-runs-list] [data-run-id="${TRACE}"] [data-run-duration]`).evaluate(
+  (el) => el.parentElement.getBoundingClientRect().height).catch(() => 99)
+check('1024 宽：列表行底下那一行不折行（时长太长就截断，用量不被拆开）', footH <= 18, `${footH}px`)
+await page.setViewportSize({ width: 1440, height: 900 })
+fakes.delete('GET /api/runs')
+fakes.delete('GET /api/approvals')
+
 console.log('\n=== 收尾 ===')
-check('只有伪造过的写请求', writes.every((w) => /\/continue$|\/cancel$|\/copilot\/from-run$|DELETE \/api\/runs\/fake0|^POST \/api\/runs$/.test(w)),
+// 提取模板之后会跳进画布：画布一打开就拿图去做校验、变量分析，这两个是带图的只读 POST
+// （同样被探针拦下，不落库）。赶上它们发出来之前就离开了画布的话就没有
+check('只有伪造过的写请求', writes.every((w) => /\/continue$|\/cancel$|\/copilot\/from-run$|DELETE \/api\/runs\/fake0|^POST \/api\/runs$|^POST \/api\/workflows\/(validate|variables)$/.test(w)),
   writes.join(', '))
 check('没有未捕获的运行时错误', errors.length === 0, errors[0] ?? '')
 

@@ -31,8 +31,7 @@ const readActor = () => {
  * 门禁拦下的问题一条一行、前置节点名，点一下关掉弹窗、定位到那个节点。
  */
 export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
-  // published_by 后端已经给了，types.ts 还没跟上
-  workflow: Workflow & { published_by?: string | null }
+  workflow: Workflow
   onClose: () => void
   onDone: () => void
   onLocate: (nodeId: string) => void

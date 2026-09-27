@@ -8,16 +8,21 @@ import { Sparkles, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, sourceHandles } from './nodeDefs'
 import { NODE_WIDTH } from './routing'
-import { LiveClock, stillClock, TeamMatrix, teamBrief } from './TeamMatrix'
+import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from './TeamMatrix'
 import { edgeKey, topology } from '../run/derive'
 import { api } from '../api/client'
-import { isComposing, StatusBadge } from '../components/ui'
+import { isComposing, StatusBadge, toast } from '../components/ui'
+import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import { issuanceLabel, RUN_CLASS_LABEL } from '../lib/terms'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
-import { loopSince, loopSpan, openSince, useNodeView, type NodeView } from '../run/useNodeView'
+import { useRunClock } from '../run/useRunClock'
+import {
+  execStart, lastIn, loopSince, loopSpan, openCall, openSince, repairsOf, useNodeFacts, useNodeView, within,
+  type NodeFacts, type NodeUsage, type NodeView, type ToolSpan,
+} from '../run/useNodeView'
 import { useCatalog } from '../store/catalog'
 import { configSig, useStudio, type FlowNode } from '../store/studio'
 import type { Approval, NodeType, RunEvent, ValidationIssue } from '../types'
@@ -96,20 +101,75 @@ function issueKey(issues: ValidationIssue[], id: string): string {
  * 出具判定挂在哪个成果节点上、什么时候落下的（毫秒，和航迹同一条时间轴，回放时
  * 游标没走到这一刻就不盖章）。按事件数组缓存：一张图里通常只有一两个成果节点在问
  */
-const issuanceCache = new WeakMap<RunEvent[], { id: string | null; at: number | null }>()
-function issuanceOf(events: RunEvent[]): { id: string | null; at: number | null } {
+interface IssuanceAt {
+  id: string | null
+  at: number | null
+  /** 事件原样的 data：运行还没结束时 run.output 里还没有 _issuance，悬停说明从这里取 */
+  data?: Record<string, any>
+}
+const issuanceCache = new WeakMap<RunEvent[], IssuanceAt>()
+function issuanceOf(events: RunEvent[]): IssuanceAt {
   const hit = issuanceCache.get(events)
   if (hit) return hit
-  let found = { id: null as string | null, at: null as number | null }
+  let found: IssuanceAt = { id: null, at: null }
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const e = events[i]
     if (e.type === 'issuance') {
-      found = { id: e.node_id ?? null, at: typeof e.ts === 'number' ? e.ts * 1000 : null }
+      found = { id: e.node_id ?? null, at: typeof e.ts === 'number' ? e.ts * 1000 : null, data: e.data ?? undefined }
       break
     }
   }
   issuanceCache.set(events, found)
   return found
+}
+
+/** 点印章够不够得着出具横幅：横幅或右栏（助手面板）看得见就行，右栏在对话层时会自己切过去 */
+function issuanceReachable(): boolean {
+  return ['[data-issuance-banner]', '[data-assistant-panel]'].some((sel) => {
+    const el = document.querySelector<HTMLElement>(sel)
+    return !!el && el.offsetWidth > 0 && getComputedStyle(el).visibility === 'visible'
+  })
+}
+
+/**
+ * 印章 → 右栏运行视图里的出具横幅。和「去审批」同一个约定：先广播，右栏在对话层时
+ * 自己切过去；接手了就 preventDefault。没人接手时这里等几帧找横幅滚过去，还是找不到
+ * 就说一声，不让印章像是点坏了
+ */
+function gotoIssuance(runId: string | undefined): void {
+  const handled = !window.dispatchEvent(new CustomEvent('agentlab:goto-issuance', {
+    detail: { runId }, cancelable: true,
+  }))
+  if (handled) return
+  let tries = 0
+  const find = () => {
+    const banner = document.querySelector<HTMLElement>('[data-issuance-banner]')
+    if (banner && banner.offsetWidth > 0 && getComputedStyle(banner).visibility === 'visible') {
+      const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
+      banner.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' })
+      return
+    }
+    if (tries++ < 12) requestAnimationFrame(find)
+    else toast.info('右栏收起来了：展开助手栏，在运行视图的成果区看完整判定', { key: 'card:issuance' })
+  }
+  requestAnimationFrame(find)
+}
+
+/**
+ * 回指上了哪些数字、各按哪个口径核的：「12.4% → 毛利率（月度口径 @ v2）」。
+ * 口径带版本，同一个指标换过口径时一眼看得出这次按的是哪一版。悬停里只放前几条
+ */
+function matchedLines(matched: unknown): string {
+  if (!Array.isArray(matched) || !matched.length) return ''
+  const lines = matched.slice(0, 5).map((m: any) => {
+    const token = String(m?.token ?? '').trim()
+    const metric = String(m?.metric ?? '').trim()
+    const caliber = typeof m?.caliber === 'string' && m.caliber.trim() ? `（${m.caliber.trim()}）` : ''
+    return token ? `  ${token}${metric ? ` → ${metric}` : ''}${caliber}` : ''
+  }).filter(Boolean)
+  if (!lines.length) return ''
+  const more = matched.length > lines.length ? `\n  …另有 ${matched.length - lines.length} 个` : ''
+  return `回指明细：\n${lines.join('\n')}${more}`
 }
 
 /**
@@ -149,9 +209,42 @@ function takenAt(n: NodeTrace | undefined, at: number): string | undefined {
   return handle
 }
 
+/**
+ * 失败摘要。「模型没真调工具」「团队用完轮数」「修复想凑数」「提示词点名的工具没绑」
+ * 这几类是图本身有缺口，后端的原话很长、槽里只截得下半句：换成 lib/explain 的短标题，
+ * 原因和下一步放悬停。别的失败照原话的第一句——它们本来就是写给人看的，
+ * 再归一次类会把「工艺员 30 秒没有回应」这种具体的话抹成「等待超时」
+ */
+function failureOf(error: string): { note: string; title: string } {
+  if (!error) return { note: '没有给出原因', title: '' }
+  const ex = explainRunError(error)
+  if (ex.continuable || ex.fix !== 'canvas') return { note: firstSentence(error), title: error }
+  return {
+    note: ex.title,
+    title: [ex.title, ex.reason, ex.action ? `怎么办：${ex.action}` : ''].filter(Boolean).join('\n'),
+  }
+}
+
+/** 协作团队是不是因为轮数用完而失败的（后端的报错首句「协作团队用完 N 轮仍未完成」） */
+const EXHAUSTED_ERROR = /用完\s*\d+\s*轮(?:仍|还)?未完成/
+
+/**
+ * 「协作团队用完 N 轮仍未完成：<理由>。一次都没被派到的成员：A、B。…」里的轮数、理由
+ * 和没派到的人。判失败的报错和降档的那条日志是同一个开头；产出里的 never_dispatched
+ * 进事件时被缩成了「[1 项]」，成员名只能从这句话里认。只认这一次执行的那句话——
+ * 右栏泳道那份结局是整次运行攒下来的，接着跑成功之后还留着上一次的
+ */
+function exhaustedText(text: string): { rounds?: number; reason?: string; never: string[] } | undefined {
+  const m = text.match(/用完\s*(\d+)\s*轮(?:仍|还)?未完成[：:]\s*([\s\S]*?)(?:。一次都没被派到的成员|。先看成员|。按降档交付|$)/)
+  if (!m) return undefined
+  const never = text.match(/一次都没被派到的成员[：:]\s*([^。]+)/)?.[1]
+    .split('、').map((s) => s.trim()).filter(Boolean) ?? []
+  return { rounds: Number(m[1]) || undefined, reason: m[2].trim() || undefined, never }
+}
+
 /** 完成之后的产出量：模型出了多少 token、查到几行、取回几条 */
-function outputOf(n: NodeTrace | undefined, preview: any): string {
-  if (n && n.tokensOut > 0) return formatTokens(n.tokensOut, { compact: true })
+function outputOf(u: NodeUsage, preview: any): string {
+  if (u.tokensOut > 0) return formatTokens(u.tokensOut, { compact: true })
   if (Array.isArray(preview)) return `${formatNumber(preview.length)} 条`
   if (preview && typeof preview === 'object') {
     if (typeof preview.row_count === 'number') return `${formatNumber(preview.row_count)} 行`
@@ -172,6 +265,8 @@ interface Reading {
   /** 主读数之后的补充：理由、错误摘要、产出量 */
   note?: ReactNode
   noteTitle?: string
+  /** 跑完了但有要留意的事（降档交付、收尾时还想调工具）：note 用琥珀色 */
+  noteWarn?: boolean
   /** 靠右的一组小读数：token、工具 */
   side?: ReactNode
 }
@@ -185,6 +280,12 @@ interface ReadingInput {
   timed: boolean
   /** 上游有几路：排队时说清在等什么 */
   fanIn: number
+  facts?: NodeFacts
+  /** 卡片在说的那一次执行的起点（execStart）：事件里捞的事只算这之后的 */
+  since: number
+  /** 这一次执行的报错 */
+  error: string
+  ending?: TeamEnding
 }
 
 /**
@@ -229,10 +330,104 @@ function LoopProgress({ n, iteration = 0, config, phase }: {
   )
 }
 
-function readingOf({ state, view, type, config, skewMs, timed, fanIn }: ReadingInput): Reading {
+/**
+ * 在跑的那次工具调用。后端声明了时限（tool.start.timeout_s）的，超出之后直说
+ * 「已超出 30s 上限」，不再写一个看不出等了多久的「⋯」。没超出时照常安静
+ */
+function ToolTag({ call, at, skewMs }: { call: ToolSpan; at: number | null; skewMs: number }) {
+  // 老事件没有时间戳时起点是 0，算不出等了多久，就不判超没超
+  if (!call.limitS || !call.start) return <ToolName tool={call.tool} />
+  if (at != null) return <ToolTagText call={call} elapsed={at - call.start} />
+  return <LiveToolTag call={call} skewMs={skewMs} />
+}
+
+function LiveToolTag({ call, skewMs }: { call: ToolSpan; skewMs: number }) {
+  const now = useRunClock(true)
+  return <ToolTagText call={call} elapsed={now - skewMs - call.start} />
+}
+
+/**
+ * 超出之后槽里只放得下一件事：说超时，不再写工具名（扳手已经说了是工具，名字在悬停里）。
+ * db_query__shop 这种名字加上「已超出 30s 上限」，比卡片还宽
+ */
+function ToolTagText({ call, elapsed }: { call: ToolSpan; elapsed: number }) {
+  if (elapsed <= call.limitS! * 1000) return <ToolName tool={call.tool} />
+  return <span className="nc-over">已超出 {call.limitS}s 上限</span>
+}
+
+/** 在跑的工具名：名字长时截掉，省略号前后都留着「⋯」这个在跑的记号 */
+const ToolName = ({ tool }: { tool: string }) => <><span className="nc-tool-name">{tool}</span> ⋯</>
+
+/** 工具明细（放悬停）：谁调的（成员首字）、调了什么、成没成、有没有超时 */
+function toolLines(calls: { tool: string; agent?: string; ok?: boolean; timedOut?: boolean; limitS?: number }[]): string {
+  return calls.slice(-8).map((c) => `${c.agent ? `[${c.agent.slice(0, 1)}] ` : ''}${c.tool} ${
+    c.timedOut ? `⏱ 超时${c.limitS ? `（上限 ${c.limitS}s）` : ''}`
+      : c.ok === false ? '✗ 失败' : c.ok ? '✓' : `⋯ 进行中${c.limitS ? `（上限 ${c.limitS}s）` : ''}`}`).join('\n')
+}
+
+/**
+ * 跑完之后那半句：平常是产出量；有要留意的事时换成那件事——降档交付、
+ * 收尾时还想调工具、纠正过工具调用、校验靠修复才过。正常态安静，只在这些时候上琥珀色。
+ * 只看这一次执行（since 之后）：上一轮循环、接着跑之前的事不挂到这一次的结果上
+ */
+function doneNote(type: NodeType, u: NodeUsage, preview: any, facts: NodeFacts | undefined,
+                  ending: TeamEnding | undefined, at: number | null, since: number, maxRounds: number,
+): Pick<Reading, 'note' | 'noteTitle' | 'noteWarn'> {
+  if (ending?.exhausted === 'degrade') {
+    const rounds = ending.rounds ?? (maxRounds || '全部')
+    return {
+      note: `用完 ${rounds} 轮未完成 · 降档交付`,
+      noteTitle: [
+        `协作团队用完 ${rounds} 轮，调度者始终没有判定完成`,
+        ending.reason ? `理由：${ending.reason}` : '',
+        '按降档交付：成果是成员最后的原话，不是调度者认可的结论。下游的复核、出具会跟着降档',
+      ].filter(Boolean).join('\n'),
+      noteWarn: true,
+    }
+  }
+  const marks = within(facts?.markups, at, since)
+  const settle = marks.filter((m) => m.settle).pop()
+  if (settle) {
+    return {
+      note: '收尾时仍想调用工具',
+      noteTitle: `${settle.message}\n步数用完之后模型还在要工具：交出来的是它前面写的内容，可能不完整`,
+      noteWarn: true,
+    }
+  }
+  // 写成文字、被提醒之后重答了：成果是重答的那一次，不是不完整。复核仍按降档算，所以还是琥珀。
+  // 协作成员提醒之后还这样的，这一步记失败（矩阵里那一格是红的），不能说成重答了
+  const fails = type === 'supervisor' ? within(facts?.memberErrors, at, since) : []
+  const nudged = marks.filter((m) => !m.settle && !fails.some((f) => f.at >= m.at && m.message.startsWith(f.agent)))
+  if (nudged.length) {
+    return {
+      note: nudged.length > 1 ? `纠正过 ${nudged.length} 次工具调用` : '纠正过一次工具调用',
+      noteTitle: [
+        ...nudged.slice(-3).map((m) => m.message),
+        `${type === 'supervisor' ? '成员' : '模型'}把工具调用写成了文字，提醒之后重答了，成果是重答的那一次；复核按降档算`,
+      ].join('\n'),
+      noteWarn: true,
+    }
+  }
+  const repairs = type === 'validate' ? repairsOf(facts, at, since) : 0
+  if (repairs) {
+    // 有一次修复想拿原文没有的值凑数、被作废了：最后虽然过了，复核照样按降档算
+    const invented = lastIn(facts?.inventions, at, since)
+    return {
+      note: `修复 ${repairs} 次后通过`,
+      noteTitle: invented
+        ? `第一次没过校验。其中一次修复出现了原文没有的值，已作废：${invented.message}\n最后通过的那次只调整了格式，复核按降档算`
+        : '第一次没过校验，模型只调整了格式，没有补数据',
+      noteWarn: !!invented,
+    }
+  }
+  return { note: outputOf(u, preview) }
+}
+
+function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, since, error, ending }: ReadingInput): Reading {
   const n = view.trace
   const runtime = view.runtime
   const at = view.at
+  const u = view.usage
   // 回放时计时是定值：游标减去那一段的起点。实时的交给 LiveClock 自己走
   const clock = (from: number | undefined, coarse = false): ReactNode => {
     if (at != null) return stillClock(from != null ? at - from : undefined)
@@ -241,42 +436,49 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn }: ReadingI
   const loop = (phase: 'live' | 'done' | 'stopped') => (
     <LoopProgress n={n} iteration={view.iteration} config={config} phase={phase} />
   )
-  const tokens = (n?.tokensIn ?? 0) + (n?.tokensOut ?? 0)
-  const failedTools = (runtime?.toolCalls ?? []).filter((c) => c.ok === false).length
-  const runningTool = n?.toolsRunning
-    ? [...(runtime?.toolCalls ?? [])].reverse().find((c) => c.ok === undefined)?.tool
+  const tokens = u.tokensIn + u.tokensOut
+  // 工具调用：事件里捞出来的那份带起止和时限，回放能按游标截；没有时退回 runtime。
+  // 只数这一次执行的：上一轮失败的调用不能让这一轮的扳手变红
+  const calls = facts
+    ? facts.calls.filter((c) => c.start >= since && (at == null || c.start <= at))
+      .map((c) => (at != null && c.end != null && c.end > at ? { ...c, ok: undefined, timedOut: false } : c))
+    : runtime?.toolCalls ?? []
+  const failedTools = calls.filter((c) => c.ok === false).length
+  const open = u.toolsRunning ? openCall(facts, at, since) : undefined
+  const runningTool = u.toolsRunning
+    ? open?.tool ?? [...(runtime?.toolCalls ?? [])].reverse().find((c) => c.ok === undefined)?.tool
     : undefined
-  // 工具明细放悬停：谁调的（成员首字）、调了什么、成没成
-  const toolTitle = (runtime?.toolCalls ?? []).slice(-8).map((c) =>
-    `${c.agent ? `[${c.agent.slice(0, 1)}] ` : ''}${c.tool} ${c.ok === false ? '✗ 失败' : c.ok ? '✓' : '⋯ 进行中'}`).join('\n')
+  const toolTitle = toolLines(calls)
   const side = (
     <>
       {tokens > 0 && (
-        <span className="tnum" title={`输入 ${formatNumber(n?.tokensIn)} · 输出 ${formatNumber(n?.tokensOut)} tokens`}>
+        <span className="tnum" title={`输入 ${formatNumber(u.tokensIn)} · 输出 ${formatNumber(u.tokensOut)} tokens`}>
           {formatTokens(tokens, { compact: true })}
         </span>
       )}
-      {!!n?.tools && (
+      {!!u.tools && (
         <span
           className={clsx('nc-tools tnum', runningTool && 'is-live', failedTools && 'is-bad')}
           title={toolTitle}
         >
           <Wrench size={9} aria-hidden />
-          {runningTool ? `${runningTool} ⋯` : n.tools}
+          {open ? <ToolTag call={open} at={at} skewMs={skewMs} /> : runningTool ? <ToolName tool={runningTool} /> : u.tools}
         </span>
       )}
     </>
   )
 
-  // 航迹里的 token、工具是整次运行的累计，回放到半路时它们还没发生：不拿终值冒充那一刻
-  const final = at == null || view.count === (n?.count ?? 0)
+  // 预览（查到几行、取回几条）只有最后一次执行的：回放到更早的一次执行时不拿它冒充那一刻。
+  // token、工具次数不受这个限制，投影给的就是那一刻的读数
+  const lastExec = at == null || view.count === (n?.count ?? 0)
+  const preview = lastExec ? runtime?.preview : undefined
 
   switch (state) {
     case 'running':
       if (type === 'loop') {
         return { main: loop('live'), side: clock(loopSince(n, at), true) }
       }
-      return { main: clock(openSince(n, 'run', at)), side: at == null ? side : undefined }
+      return { main: clock(openSince(n, 'run', at)), side }
     case 'waiting':
       return { main: <>已等 {clock(openSince(n, 'wait', at), true)}</> }
     case 'done':
@@ -285,23 +487,23 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn }: ReadingI
       }
       return {
         main: formatDuration(at != null ? view.replayElapsedMs : n?.lastDurationMs ?? runtime?.durationMs),
-        note: final ? outputOf(n, runtime?.preview) : '',
+        ...doneNote(type, u, preview, facts, ending, at, since, Number(config.max_rounds) || 0),
         // 跑完了只留工具次数：token 已经在产出量里说过（输出多少），再挂一个总数是两套数
-        side: n?.tools && final ? (
+        side: u.tools ? (
           <span className={clsx('nc-tools tnum', failedTools && 'is-bad')} title={toolTitle}>
-            <Wrench size={9} aria-hidden />{n.tools}
+            <Wrench size={9} aria-hidden />{u.tools}
           </span>
         ) : undefined,
       }
     case 'failed': {
-      const error = n?.error || runtime?.error || ''
+      const why = failureOf(error)
       if (type === 'loop') {
-        return { main: loop('stopped'), note: firstSentence(error), noteTitle: error }
+        return { main: loop('stopped'), note: error ? why.note : '', noteTitle: why.title }
       }
       return {
         main: formatDuration(n?.lastDurationMs ?? runtime?.durationMs),
-        note: firstSentence(error) || '没有给出原因',
-        noteTitle: error,
+        note: why.note,
+        noteTitle: why.title,
       }
     }
     case 'queued':
@@ -484,6 +686,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const def = NODE_DEFS[data.nodeType]
   const type = data.nodeType
   const view = useNodeView(id)
+  const facts = useNodeFacts(id)
   const { state, runtime, trace: nt } = view
 
   const runActive = useStudio((s) => s.runPhase !== 'idle')
@@ -504,7 +707,8 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
     (type === 'output' && issuanceOf(s.events).id === id ? s.trace.issuance : undefined))
   const issuedAt = useStudio((s) => (type === 'output' ? issuanceOf(s.events).at : null))
   const issuanceDetail = useStudio((s) =>
-    (type === 'output' ? (s.run?.output as any)?._issuance as Record<string, any> | undefined : undefined))
+    (type === 'output' ? (s.run?.output as any)?._issuance as Record<string, any> | undefined
+      ?? (issuanceOf(s.events).id === id ? issuanceOf(s.events).data : undefined) : undefined))
   // 只有排队中的卡片要知道自己有几路上游，别的卡片不必为改图重跑这一趟
   const fanIn = useStudio((s) => (state === 'queued' ? fanInOf(s.nodes, s.edges)[id] ?? 0 : 0))
 
@@ -563,7 +767,53 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const streamText = executing && !view.replay ? (runtime?.tokens || runtime?.thinking || '') : ''
   const thinkingOnly = !!streamText && !runtime?.tokens
 
-  const reading = readingOf({ state, view, type, config: data.config, skewMs, timed, fanIn })
+  // 这张卡在说哪一次执行：循环的下一轮、失败后接着跑都是新的一次，事件里捞的事只算
+  // 这一次的。不截的话，调大轮数接着跑成功了，表头还挂着上一次的「判定未完成」
+  const since = execStart(nt, view.at, facts)
+  const lastExec = view.at == null || view.count === (nt?.count ?? 0)
+  // 报错：航迹、runtime 上的是最后一次执行的；回放到更早的一次失败时取那一次的原话
+  const failure = view.at != null ? lastIn(facts?.failures, view.at, since) : undefined
+  const error = failure?.message || (lastExec ? nt?.error || runtime?.error || '' : '')
+  const preview = lastExec ? runtime?.preview : undefined
+
+  // 协作团队怎么收场：收尾判定、用完轮数之后是失败还是降档。卡片和矩阵说同一件事
+  const verdictMark = type === 'supervisor' ? lastIn(facts?.closings, view.at, since) : undefined
+  // 判定开始了、结论还没到（回放时按游标：那一刻结论还没出来也算在判）
+  const verdictOpen = !!verdictMark && (verdictMark.end == null || (view.at != null && verdictMark.end > view.at))
+  const exhaustedLog = type === 'supervisor' ? lastIn(facts?.exhausts, view.at, since) : undefined
+  const failedOut = type === 'supervisor' && state === 'failed' && EXHAUSTED_ERROR.test(error)
+  const degraded = type === 'supervisor' && state === 'done' && (preview?.exhausted === true || !!exhaustedLog)
+  const told = failedOut ? exhaustedText(error) : degraded && exhaustedLog ? exhaustedText(exhaustedLog.message) : undefined
+  const exhaustedReason = typeof preview?.exhausted_reason === 'string' ? preview.exhausted_reason : told?.reason ?? ''
+  // 产出进事件时数组会被缩成「[1 项]」，是数组才用；否则用报错、日志原话里认出来的
+  const neverSig = failedOut || degraded
+    ? (Array.isArray(preview?.never_dispatched) ? preview.never_dispatched.map(String) : told?.never ?? []).join('\u0000')
+    : ''
+  const exhaustedRounds = told?.rounds
+  const ending = useMemo<TeamEnding | undefined>(() => {
+    if (!verdictMark && !failedOut && !degraded) return undefined
+    const verdict = verdictMark && {
+      at: verdictMark.at,
+      done: !verdictOpen && verdictMark.done,
+      reason: verdictOpen ? '' : verdictMark.reason,
+      open: verdictOpen,
+    }
+    return {
+      verdict,
+      exhausted: failedOut ? 'fail' : degraded ? 'degrade' : undefined,
+      reason: verdict?.reason || exhaustedReason,
+      never: neverSig ? neverSig.split('\u0000') : undefined,
+      rounds: exhaustedRounds,
+    }
+  }, [verdictMark, verdictOpen, failedOut, degraded, exhaustedReason, neverSig, exhaustedRounds])
+  // 成员失败的原因也只要这一次执行的
+  const memberErrors = useMemo(() => {
+    const out: Record<string, string> = {}
+    for (const f of within(facts?.memberErrors, view.at, since)) out[f.agent] = f.error
+    return out
+  }, [facts?.memberErrors, view.at, since])
+
+  const reading = readingOf({ state, view, type, config: data.config, skewMs, timed, fanIn, facts, since, error, ending })
 
   // 编辑态（没有运行）槽里放校验问题，有运行时放遥测
   const [errCount, warnCount, firstIssue] = issues ? issues.split('\u0000') : ['0', '0', '']
@@ -581,7 +831,8 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   // 模型名放悬停：槽里放不下 claude-sonnet-4-5 这么长的名字，也不是一眼要看的东西
   const teleTitle = !editing && nt ? [
     nt.model ? `模型 ${nt.model}` : '',
-    nt.tokensIn + nt.tokensOut > 0 ? `输入 ${formatNumber(nt.tokensIn)} · 输出 ${formatNumber(nt.tokensOut)} tokens` : '',
+    view.usage.tokensIn + view.usage.tokensOut > 0
+      ? `输入 ${formatNumber(view.usage.tokensIn)} · 输出 ${formatNumber(view.usage.tokensOut)} tokens` : '',
     retries > 0 ? `失败后重试了 ${retries} 次` : '',
   ].filter(Boolean).join('\n') || undefined : undefined
 
@@ -602,6 +853,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
       ? `无法回指的数字：${(detail?.unmatched_numbers ?? issuance?.unmatched).map((u: any) => u?.token ?? u).join('、')}`
       : issuance?.unmatchedCount ? `无法回指的数字 ${issuance.unmatchedCount} 个` : '',
     (detail?.missing_expected ?? []).length ? `缺数据声明：${detail!.missing_expected.join('、')} 本期缺失` : '',
+    matchedLines(detail?.matched),
     runClass === 'exploratory' ? '探索运行的结论不进正式归档' : '',
     '完整判定在右栏运行视图的成果区',
   ].filter(Boolean).join('\n') : ''
@@ -666,6 +918,9 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
           {retries > 0 && (
             <span className="nc-chip nc-chip-warn tnum" title={`失败后重试了 ${retries} 次`}>↻{retries}</span>
           )}
+          {ending?.exhausted === 'degrade' && (
+            <span className="nc-chip nc-chip-warn" title="轮数用完仍未完成，按降档交付">降档</span>
+          )}
           {(runActive || state !== 'idle') && (
             <StatusBadge status={state} size={14} animate={executing} className="nc-badge" />
           )}
@@ -682,6 +937,8 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
             maxRounds={Number(data.config.max_rounds) || 0}
             maxParallel={Number(data.config.max_parallel) || 0}
             skewMs={skewMs}
+            ending={ending}
+            memberErrors={memberErrors}
           />
         ) : (
           <div className={clsx('nc-body', streamText && 'is-stream')}>
@@ -711,7 +968,9 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
               <span className="nc-tele-state" style={{ color: meta.color }}>{meta.short}</span>
               {reading.main !== '' && <span className="nc-tele-main tnum">{reading.main}</span>}
               {reading.note && (
-                <span className="nc-tele-note" title={reading.noteTitle}>{reading.note}</span>
+                <span className={clsx('nc-tele-note', reading.noteWarn && 'is-warn')} title={reading.noteTitle}>
+                  {reading.note}
+                </span>
               )}
               <span className="flex-1" />
               {reading.side && <span className="nc-tele-side">{reading.side}</span>}
@@ -744,7 +1003,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
             这里不再写状态字，把位置让给计时、进度；没有读数的状态才写状态字 */}
         <div className="nc-lod-read tnum" style={{ color: state === 'idle' ? undefined : meta.color }}>
           {isTeam && state === 'running'
-            ? teamBrief(runtime?.team, nt, true, view.at)
+            ? teamBrief(runtime?.team, nt, true, view.at, ending?.verdict)
             : state === 'idle' ? (runActive ? NONE : '') : reading.main !== '' ? reading.main : meta.short}
         </div>
       </div>
@@ -774,21 +1033,20 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
       )}
 
       {/* 出具印章：成果节点上，跟着 issuance 事件落下。它是一枚章不是按钮：
-          只有右栏的出具横幅在页面上时，点它才滚过去（悬停时看一眼，届时才有
-          手形光标）；没有横幅就是一张带悬停说明的图，不装作能点 */}
+          点它是去右栏看完整判定的捷径（悬停时看一眼够不够得着，届时才有手形光标），
+          够不着就是一张带悬停说明的图，不装作能点。右栏停在对话层时横幅不在页面上，
+          由右栏听 agentlab:goto-issuance 自己切到运行层 */}
       {tier && (
         <span
           role="img"
           aria-label={stampTitle}
           className={clsx('nc-stamp', tierClass, stampLive.current && 'nc-stamp-in', stampLink && 'is-link nodrag')}
           title={stampTitle}
-          onPointerEnter={() => setStampLink(!!document.querySelector('[data-issuance-banner]'))}
+          onPointerEnter={() => setStampLink(issuanceReachable())}
           onPointerDown={stampLink ? (e) => e.stopPropagation() : undefined}
           onClick={stampLink ? (e) => {
-            const banner = document.querySelector('[data-issuance-banner]')
-            if (!banner) return
             e.stopPropagation()
-            banner.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            gotoIssuance(useStudio.getState().run?.id)
           } : undefined}
         >
           <StatusBadge status={tier === 'formal' ? 'done' : tier === 'withheld' ? 'failed' : 'waiting'} size={11} animate={false} decorative />

@@ -2,7 +2,8 @@ import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, RunFinal } from '../run/decode'
 import { decodeRun } from '../run/decode'
-import { humanizeError } from '../lib/errors'
+import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
+import { explainRunError } from '../lib/explain'
 import { parseServerTime } from '../lib/format'
 import { useCatalog } from './catalog'
 import { useConversations } from './conversations'
@@ -45,6 +46,11 @@ export type Phase =
   | 'error'
   | 'cancelled'   // 用户点了停止。不是出错：不画红，也不给「接着跑」
   | 'suspended'   // 服务重启打断了，断点还在，可以接着跑
+  /**
+   * 核对撞上后端出错、超时：不知道它现在是在跑、跑完了还是失败了。只给「重新核对」——
+   * 给「重试」会在旧运行可能还活着的时候另起一次
+   */
+  | 'unknown'
 
 /** 占着这个会话的相位：这时再问一句、或者删掉这个会话，都会撞上正在跑的东西 */
 const BUSY_PHASES: ReadonlySet<Phase> = new Set(['planning', 'building', 'running'])
@@ -56,10 +62,23 @@ export interface Failure {
   hint?: string
   detail?: string
   /**
-   * 翻成人话之前的那句原话。流里的报错块会自己再翻一遍，交给它的得是原话：
-   * 把翻好的「操作超时：查询超时…」再翻一遍，标题和原因就成了两遍「操作超时」
+   * 翻成人话之前的那句原话。运行的失败把它交给流里的报错块按 lib/explain 再讲一遍；
+   * 别的交拆好的 title / reason——把翻好的「操作超时：查询超时…」再翻一遍，标题和
+   * 原因就成了两遍「操作超时」
    */
   source?: string
+  /** 原样接着跑也过不去（缺输入、人驳回、没绑工具…），不给「接着跑」。见 lib/explain */
+  continuable?: false
+  /** 流程本身没问题，是发起那一下没到后端：原图再发起一次就行，不必让 Copilot 重新搭 */
+  rerun?: true
+  /** 限定的数据源都不在了（删了、停用了）。带着原范围重试只会再被拒一次 */
+  scopeGone?: true
+}
+
+/** 限定这一问只查哪些数据源。名字跟着存：库删了之后，这一轮查的是谁还得说得出来 */
+export interface ScopeSource {
+  id: string
+  name: string
 }
 
 /**
@@ -80,12 +99,11 @@ export interface Attempt {
 }
 
 /**
- * 刷新之后还得在的可信度信息。
+ * 刷新之后还得在的可信度信息，存在 conversation_turns.meta。
  *
- * conversation_turns 没有专门放它的列：出具档位、运行类别、「这一条没查库」
- * 以前都只活在内存里，刷新就没了——而历史会话恰恰是事后复盘、转发结论时最常看
- * 的地方。后端补上 meta 列之前，它挂在 review 这个 JSON 字段的 meta 键下：
- * 后端对 review 只读 note，多一个键不影响任何逻辑。读的时候两处都认。
+ * 出具档位、运行类别、「这一条没查库」以前都只活在内存里，刷新就没了——而历史
+ * 会话恰恰是事后复盘、转发结论时最常看的地方。老轮次把它挂在 review.meta 下，
+ * 后端读出来时已经统一放进 meta，这里只认 meta。
  */
 export interface TurnMeta {
   v: 1
@@ -103,6 +121,18 @@ export interface TurnMeta {
   ms?: number
   /** 查了几次库 */
   queries?: number
+  /**
+   * 答案没取全。不记下来的话，刷新之后只能靠「恰好 2000 字」去猜：多个成果键拼起来的
+   * 答案比 2000 长，猜不中，「刷新后会自动补全」的承诺就落空了
+   */
+  clipped?: 'partial' | 'lost'
+  /** 这一问限定了只查哪些数据源 */
+  scope?: ScopeSource[]
+  /**
+   * 这份 meta 写下的时刻（本机时钟）。断在建图阶段的轮次按它和 created_at 里晚的那个算
+   * 有多久没动静：后端按 updated_at 算，而重试一轮昨天的问题时 created_at 是昨天的
+   */
+  at?: number
 }
 
 export interface ChatTurn {
@@ -174,6 +204,8 @@ export interface ChatTurn {
    * 复核完才摆出来，这里给的是「它没卡住」的证据，不是提前看答案的口子
    */
   writing?: { chars: number; thought: string } | null
+  /** 这一问只查这几个数据源。重试、重新问都沿用它 */
+  scope?: ScopeSource[]
 }
 
 export type LoadState = 'loading' | 'ready' | 'error'
@@ -190,12 +222,21 @@ interface ChatState {
    */
   loadState: Record<string, LoadState>
   loadError: Record<string, unknown>
+  /**
+   * 每个会话限定查哪些数据源，空数组 = 不限。键 '' 是还没建出会话的首屏：开口那一下
+   * 建出会话后由调用方带过去。按会话记：换一个会话问别的库，回来还是原来的范围
+   */
+  scopes: Record<string, ScopeSource[]>
+  setScope: (key: string, scope: ScopeSource[]) => void
 
   turnsOf: (conversationId: string | null) => ChatTurn[]
   /** force：已经取回来过也再取一次（重连后、点重试时） */
   load: (conversationId: string, opts?: { force?: boolean }) => Promise<void>
-  /** 发出去了返回 true。会话还在加载或加载失败、或者正忙时不发 */
-  ask: (conversationId: string, question: string) => boolean
+  /**
+   * 发出去了返回 true。会话还在加载或加载失败、或者正忙时不发。
+   * scope 不给就用这个会话眼下的范围
+   */
+  ask: (conversationId: string, question: string, opts?: { scope?: ScopeSource[] }) => boolean
   /** 只停这个会话自己正在跑的那一轮 */
   stop: (conversationId: string) => void
   /** 审批完成后重新接上运行 */
@@ -209,11 +250,17 @@ interface ChatState {
   /**
    * 用户主动重试这一轮：上一次折叠留档，新的一次接在同一轮里。
    * maxSteps：把图里 agent 的步数上限调到这个值，原图重跑（「放宽步数重跑」）；
-   * rerun：原图原样重跑（取消了、中断了的那种，不需要改）
+   * rerun：原图原样重跑（取消了、中断了的那种，不需要改）；
+   * scope：换一个数据源范围重来（限定的库不在了），不给就沿用这一轮的
    */
-  retryTurn: (conversationId: string, turnId: string, opts?: { maxSteps?: number; rerun?: boolean }) => void
+  retryTurn: (
+    conversationId: string, turnId: string,
+    opts?: { maxSteps?: number; rerun?: boolean; scope?: ScopeSource[] },
+  ) => void
   /** 向后端核对一轮历史：真实状态、完整答案、档位。只做一次 */
   hydrate: (conversationId: string, turnId: string) => Promise<void>
+  /** 上次核对撞上后端出错（unknown）的轮次，再核对一次 */
+  recheck: (conversationId: string, turnId: string) => Promise<void>
   /** 会话被删了，把内存里那一桶也丢掉 */
   forget: (conversationId: string) => void
 }
@@ -233,6 +280,7 @@ const PHASE_TEXT: Record<Phase, string> = {
   error: '失败',
   cancelled: '已取消',
   suspended: '服务重启，这一轮中断了',
+  unknown: '没核对上这一轮现在的状态',
 }
 
 const EMPTY: ChatTurn[] = []
@@ -248,6 +296,24 @@ const REVIEW_TIMEOUT_MS = 25_000
  * 2000 字截断，而以前落库和显示用的都是事件里那份。恰好这么长的历史答案要回源核对
  */
 const LEGACY_CLIP = 2000
+
+/**
+ * 是不是恰好切在 LEGACY_CLIP。后端按码点切，JS 的 length 数的是 UTF-16：答案里
+ * 有一个 emoji 就多出一个，按 length 比就认不出来了
+ */
+function atClip(s: string): boolean {
+  if (s.length < LEGACY_CLIP || s.length > LEGACY_CLIP * 2) return false
+  let n = 0
+  for (const _ of s) n++
+  return n === LEGACY_CLIP
+}
+
+/**
+ * 还停在 running 的轮次、又没有运行：断在建图阶段了。建图跟着页面那条流走，页面一关
+ * 就停；这么久还没动静就当它断了（和后端 conversations.BUILD_STALE 一致）。「动静」
+ * 按最后一次落库算，见 TurnMeta.at
+ */
+const BUILD_STALE_MS = 15 * 60_000
 
 /** 留档的旧答案存多少。它是用来对照的，不是用来读全文的——全文在运行记录里 */
 const ATTEMPT_ANSWER_CAP = 4000
@@ -312,7 +378,7 @@ function answerText(output: Record<string, any> | null | undefined): string {
 /** 事件里那份 output 看起来是不是被切过：老后端不带 output_truncated，只能看长度 */
 function looksClipped(output: Record<string, any> | null | undefined): boolean {
   if (!output) return false
-  return Object.values(output).some((v) => typeof v === 'string' && v.length === LEGACY_CLIP)
+  return Object.values(output).some((v) => typeof v === 'string' && atClip(v))
 }
 
 /** 出具信息存进 meta 前瘦一下身：无法回指的数字可能有上百个，横幅只列得下一行 */
@@ -328,13 +394,10 @@ function countQueries(events: RunEvent[]): number {
 }
 
 export function metaOf(t: ConversationTurn): TurnMeta | null {
-  const own = (t as any).meta
-  if (own && typeof own === 'object') return own as TurnMeta
-  const bridged = (t.review as any)?.meta
-  return bridged && typeof bridged === 'object' ? (bridged as TurnMeta) : null
+  return t.meta && typeof t.meta === 'object' ? (t.meta as TurnMeta) : null
 }
 
-/** review 字段里真正的复核结论。只挂了 meta、没有 verdict 的不算复核过 */
+/** review 字段里真正的复核结论。只挂了 meta、没有 verdict 的不算复核过（老轮次的 meta 在里面，剥掉） */
 function reviewOf(t: ConversationTurn): ReviewResult | null {
   const r = t.review as any
   if (!r || typeof r !== 'object' || !r.verdict) return null
@@ -355,28 +418,59 @@ function buildMeta(t: ChatTurn): TurnMeta {
     attempts: t.attempts?.length ? t.attempts : undefined,
     ms: t.endedAt ? t.endedAt - t.startedAt : t.meta?.ms,
     queries: t.events.length ? countQueries(t.events) : t.meta?.queries,
+    clipped: t.clipped,
+    scope: t.scope?.length ? t.scope : undefined,
+    at: Date.now(),
   }
 }
 
-/** 写回 review 字段的那份：复核原样 + meta */
-function packReview(t: ChatTurn): Record<string, any> {
-  return { ...(t.reviewRaw ?? {}), meta: buildMeta(t) }
-}
-
-/** 一行错误文案 → 结构化。后端的 detail 按约定已是人话，humanizeError 只做拆句和去类名 */
+/**
+ * 一行错误文案 → 结构化。后端的 detail 按约定已是人话，humanizeError 只做拆句和去类名。
+ * 运行本身的失败不走这里，走 runFailure
+ */
 function failureOf(e: unknown, extra?: { hint?: string; detail?: string }): Failure {
   const h = humanizeError(e)
+  // 原话留一份（后端的 detail）。连不上后端时原话是「Failed to fetch」，没有留的价值
+  const source = h.kind === 'network' ? undefined
+    : typeof e === 'string' ? e
+    : e instanceof ApiError ? e.message
+    : undefined
   return {
     title: h.title,
     reason: h.reason,
-    hint: extra?.hint || h.action,
+    // 通用的「稍等几秒会自动重试」在这一页不成立：没有谁会替这一轮重发，得人来点
+    hint: extra?.hint || (h.kind === 'network' ? '后端连上之后点「重试这一轮」。' : h.action),
     detail: extra?.detail || (h.raw && h.raw !== h.title ? h.raw : undefined),
-    // 连不上后端时原话是「Failed to fetch」，再翻一遍不会再判成网络问题，不能交出去
-    ...(typeof e === 'string' && h.kind !== 'network' ? { source: e } : {}),
+    ...(source ? { source } : {}),
+  }
+}
+
+/**
+ * 运行失败的说明：和记录页、画布右栏读同一份 lib/explain，同一次失败三处说法一致。
+ * 它还说得出「原样接着跑有没有用」：缺输入、人驳回、工具没绑，接着跑只会再失败一次。
+ * 原话跟着留：流里的报错块拿它按同一份 lib/explain 再讲一遍，才给得出「去模型接入」
+ * 这类直达入口
+ */
+function runFailure(error: string | null | undefined, detail?: string | null): Failure {
+  const x = explainRunError(error, detail)
+  return {
+    title: x.title,
+    reason: x.reason,
+    hint: x.action,
+    detail: x.raw && x.raw !== x.title ? x.raw : undefined,
+    ...(x.continuable ? {} : { continuable: false as const }),
+    ...(error ? { source: error } : {}),
   }
 }
 
 const lineOf = (f: Failure) => (f.reason ? `${f.title}：${f.reason}` : f.title)
+
+/** 运行记录被删了：没有断点可续，也补不回完整答案 */
+const GONE: Failure = {
+  title: '上次没有跑完',
+  reason: '对应的运行记录已经删掉了，没有断点可以接着跑。',
+  hint: '点「重试这一轮」重新来一次。',
+}
 
 const SUSPENDED: Failure = {
   title: PHASE_TEXT.suspended,
@@ -412,11 +506,21 @@ function findTurn(conversationId: string, turnId: string): ChatTurn | undefined 
   return useChat.getState().byConversation[conversationId]?.find((t) => t.id === turnId)
 }
 
-/** 带上 meta 一起写：review 字段是整块替换的，只写一半另一半就没了 */
+/**
+ * 在回收站里的会话只能翻看。从这里发起的运行左栏找不到、没人看着，却照样计费；
+ * 跑着的时候又不能彻底删除。按钮已经按这个关掉了，这里再守一道
+ */
+const inTrash = (conversationId: string) =>
+  useConversations.getState().trash.some((c) => c.id === conversationId)
+
+/**
+ * 连同 meta 和复核一起写。两者在后端都是整块替换。review 写 {} 而不是 null：null 等于
+ * 「这次不改」，重试之后上一次的复核就留在库里，刷新后挂到新答案头上
+ */
 function persist(conversationId: string, turnId: string, body: Record<string, any> = {}) {
   const turn = findTurn(conversationId, turnId)
   if (!turn) return Promise.resolve()
-  return saver(conversationId, turnId)({ ...body, review: packReview(turn) })
+  return saver(conversationId, turnId)({ ...body, meta: buildMeta(turn), review: turn.reviewRaw ?? {} })
 }
 
 /**
@@ -467,7 +571,9 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
   // 老数据没有 meta：停止写的是 status=error + 「已取消」
   const outcome = meta?.outcome ?? (t.status === 'error' && t.error === '已取消' ? 'cancelled' : undefined)
   const answer = t.answer ?? ''
-  const failure = meta?.failure ?? (t.error && t.error !== '已取消' ? failureOf(t.error) : null)
+  // 老数据没有 meta.failure，error 列里是原始异常：有运行的按运行失败解释
+  const failure = meta?.failure
+    ?? (t.error && t.error !== '已取消' ? (runId ? runFailure(t.error) : failureOf(t.error)) : null)
 
   let phase: Phase
   let status: string
@@ -531,9 +637,13 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
     reviewRaw: review,
     rawOutput: review?.original ? { answer: review.original } : null,
     attempts: meta?.attempts,
-    // 旧版本切在 2000 字、运行也删了：补不回来，但至少别装作完整
-    clipped: !runId && graphful && answer.length === LEGACY_CLIP && !review?.answer ? 'lost' : undefined,
+    // 上次记下没取全的：运行还在就等 hydrate 补，运行没了就补不回来了。
+    // 老数据没记过，只能看是不是恰好切在 2000 字——运行也删了的，至少别装作完整
+    clipped: meta?.clipped === 'partial' ? (runId ? 'partial' : 'lost')
+      : meta?.clipped === 'lost' ? 'lost'
+      : !runId && graphful && atClip(answer) && !review?.answer ? 'lost' : undefined,
     meta,
+    scope: meta?.scope,
   }
 }
 
@@ -543,9 +653,9 @@ function needsEagerHydrate(t: ChatTurn): boolean {
   if (t.phase === 'checking' || t.phase === 'suspended') return true
   // 「接着跑」给不给取决于运行现在的状态；老数据没存过
   if (t.phase === 'error' && !t.runStatus) return true
-  // 旧版本被切在 2000 字的答案：运行还在就把完整版补回来
+  // 答案没取全：运行还在就把完整版补回来
   return t.phase === 'done' && !t.review?.answer
-    && typeof t.output?.answer === 'string' && t.output.answer.length === LEGACY_CLIP
+    && (t.clipped === 'partial' || (typeof t.output?.answer === 'string' && atClip(t.output.answer)))
 }
 
 
@@ -553,6 +663,9 @@ export const useChat = create<ChatState>((set, get) => ({
   byConversation: {},
   loadState: {},
   loadError: {},
+  scopes: {},
+
+  setScope: (key, scope) => set((s) => ({ scopes: { ...s.scopes, [key]: scope } })),
 
   turnsOf: (conversationId) =>
     (conversationId && get().byConversation[conversationId]) || EMPTY,
@@ -581,15 +694,28 @@ export const useChat = create<ChatState>((set, get) => ({
         // 完整的事件和进行中的流。库里多出来的补在前面
         const known = new Set(mem.map((t) => t.serverId).filter(Boolean))
         const extra = restored.filter((t) => !known.has(t.serverId))
+        // 数据源范围接着上一问的：回来追问的多半还是那个库。输入框旁写着范围，不是暗中沿用
+        const lastScope = restored[restored.length - 1]?.scope
         return {
           byConversation: { ...s.byConversation, [conversationId]: mem.length ? [...extra, ...mem] : restored },
           loadState: { ...s.loadState, [conversationId]: 'ready' },
           loadError: { ...s.loadError, [conversationId]: undefined },
+          ...(lastScope && !(conversationId in s.scopes) ? { scopes: { ...s.scopes, [conversationId]: lastScope } } : {}),
         }
       })
-      for (const t of restored) {
+      // 内存里已有的那几轮没有并进来，下面对它们的 hydrate / persist 按 id 找不到，自然跳过
+      const now = Date.now()
+      detail.turns.forEach((row, i) => {
+        const t = restored[i]
         if (needsEagerHydrate(t)) void get().hydrate(conversationId, t.id)
-      }
+        // 断在建图阶段、早就没动静的：库里那行一直是 running，每次进来都当它还在跑，
+        // Copilot 的上下文也把它当成没答完的一轮漏掉。认定断了就写回去。
+        // 动静按最后一次落库算：重试昨天那一轮时 created_at 是昨天，而它正在别的页面里建图
+        const at = Math.max(parseServerTime(row.created_at ?? null)?.getTime() ?? 0, t.meta?.at ?? 0)
+        if (row.status === 'running' && !t.run && t.phase === 'error' && at && now - at > BUILD_STALE_MS) {
+          void persist(conversationId, t.id, { status: 'error', error: lineOf(t.failure ?? GONE) })
+        }
+      })
     } catch (e) {
       set((s) => ({
         loadState: { ...s.loadState, [conversationId]: 'error' },
@@ -618,14 +744,15 @@ export const useChat = create<ChatState>((set, get) => ({
     }
   },
 
-  ask: (conversationId, question) => {
+  ask: (conversationId, question, opts) => {
     const state = get().loadState[conversationId]
     // 历史还没回来就提问，新的一轮会把"这个会话"变成只有它一轮；加载失败时
     // 页面上什么都没有，更像是空会话——两种情况都先别让它发
     if (state === 'loading' || state === 'error') return false
-    if (isBusy(get().byConversation[conversationId])) return false
+    if (isBusy(get().byConversation[conversationId]) || inTrash(conversationId)) return false
 
     const id = newId()
+    const scope = opts?.scope ?? get().scopes[conversationId] ?? []
     set((s) => ({
       byConversation: {
         ...s.byConversation,
@@ -635,7 +762,7 @@ export const useChat = create<ChatState>((set, get) => ({
             id, serverId: null, question, phase: 'planning', status: PHASE_TEXT.planning,
             thinking: '', ops: [], events: [], graph: null, explanation: '',
             run: null, output: null, error: '', startedAt: Date.now(),
-            lastSeq: 0, cancel: null, attempt: 0,
+            lastSeq: 0, cancel: null, attempt: 0, scope: scope.length ? scope : undefined,
           },
         ],
       },
@@ -656,7 +783,7 @@ export const useChat = create<ChatState>((set, get) => ({
       .catch(() => null)
     serverIds.set(id, started)
 
-    plan(flow, { question, instruction: question, attempt: 0 })
+    plan(flow, { question, instruction: question, attempt: 0, scope })
     return true
   },
 
@@ -682,7 +809,7 @@ export const useChat = create<ChatState>((set, get) => ({
 
   runNow: (conversationId, turnId) => {
     const turn = findTurn(conversationId, turnId)
-    if (!turn?.graph || isBusy(get().byConversation[conversationId])) return
+    if (!turn?.graph || isBusy(get().byConversation[conversationId]) || inTrash(conversationId)) return
     const flow = flowOf(conversationId, turnId)
     flow.patch(() => ({
       phase: 'running', status: PHASE_TEXT.running, pendingRun: false,
@@ -699,7 +826,7 @@ export const useChat = create<ChatState>((set, get) => ({
     //
     // 接上之后 run.finished 照常触发 settle，复核层自动覆盖这一次
     const turn = findTurn(conversationId, turnId)
-    if (!turn?.run || isBusy(get().byConversation[conversationId])) return false
+    if (!turn?.run || isBusy(get().byConversation[conversationId]) || inTrash(conversationId)) return false
     try {
       await api.runs.continue(turn.run.id)
     } catch (e) {
@@ -716,13 +843,19 @@ export const useChat = create<ChatState>((set, get) => ({
   retryTurn: (conversationId, turnId, opts) => {
     const turns = get().byConversation[conversationId]
     const turn = turns?.find((t) => t.id === turnId)
-    if (!turn || isBusy(turns)) return
+    if (!turn || isBusy(turns) || inTrash(conversationId)) return
     turn.cancel?.()
+    // 服务重启挂起的旧运行没人会再去续它：不取消的话，它在记录里一直是「已挂起 · 可续跑」。
+    // 停在审批上的不算——重试不会从那里发起
+    if (turn.run?.id && turn.phase !== 'waiting' && (turn.phase === 'suspended' || turn.runStatus === 'interrupted')) {
+      void api.runs.cancel(turn.run.id).catch(() => undefined)
+    }
     const flow = flowOf(conversationId, turnId)
     const base = turn.graph && (turn.graph.nodes?.length ?? 0) > 0 ? turn.graph : null
     const record = attemptOf(turn)
     const reason = record.detail ? `${record.summary}（${record.detail.slice(0, 300)}）` : record.summary
     const direct = !!base && !!(opts?.maxSteps || opts?.rerun)
+    const scope = opts?.scope ?? turn.scope
 
     // 上一次原样留档，这一次从头记：旧的事件、答案、复核留在这里只会让人分不清
     // 哪段是最终那次
@@ -735,7 +868,7 @@ export const useChat = create<ChatState>((set, get) => ({
       rawOutput: null, failure: null, error: '', lastSeq: 0, final: undefined,
       runStatus: undefined, clipped: undefined, pendingRun: false, steps: undefined,
       hydrated: 'done', startedAt: Date.now(), endedAt: undefined, attempt: 0, cancel: null,
-      noQuery: false, thinking: '', writing: null,
+      noQuery: false, thinking: '', writing: null, scope: scope?.length ? scope : undefined,
     }))
     void flow.persist({ status: 'running', error: '', answer: '' })
 
@@ -746,7 +879,7 @@ export const useChat = create<ChatState>((set, get) => ({
       return
     }
     plan(flow, {
-      question: turn.question, attempt: 0, baseGraph: base,
+      question: turn.question, attempt: 0, baseGraph: base, scope,
       instruction: base
         ? `这张流程上一次没有给出可用的结果：${reason}。\n\n`
           + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
@@ -764,29 +897,51 @@ export const useChat = create<ChatState>((set, get) => ({
     const stale = () => (epochs.get(turnId) ?? 0) !== epoch
     const patch = patcher(set, conversationId, turnId)
     patch(() => ({ hydrated: 'pending' }))
+    /**
+     * 查到了库里那行还不知道的结局：内存里改，库里也改。只改内存的话那行永远是
+     * running——每次进来都要再核对一遍，Copilot 的上下文把它当没答完的一轮漏掉，
+     * 运行一删它就只能退成「上次没有跑完」，连「已取消」都说不出来了
+     */
+    const conclude = (fields: Partial<ChatTurn>, error: string) => {
+      patch(() => fields)
+      void persist(conversationId, turnId, { status: 'error', error })
+    }
     let run: Run
     try {
       run = await api.runs.get(runId)
     } catch (e) {
-      if (stale()) return
+      const cur = findTurn(conversationId, turnId)
+      if (stale() || !cur) return
       if (e instanceof ApiError && e.status === 404) {
-        // 运行被删了：没有断点可续，也补不回完整答案
-        patch((t) => ({
-          hydrated: 'done',
-          runStatus: 'gone',
-          ...(t.phase === 'checking' ? {
-            phase: 'error' as Phase, status: PHASE_TEXT.error, error: '上次没有跑完',
-            failure: {
-              title: '上次没有跑完',
-              reason: '对应的运行记录已经删掉了，没有断点可以接着跑。',
-              hint: '点「重试这一轮」重新来一次。',
-            },
-          } : {}),
-          clipped: t.phase === 'done' && !t.review?.answer
-            && String(t.output?.answer ?? '').length === LEGACY_CLIP ? 'lost' : t.clipped,
+        if (cur.phase === 'checking') {
+          conclude({
+            hydrated: 'done', runStatus: 'gone', phase: 'error', status: PHASE_TEXT.error,
+            error: GONE.title, failure: GONE,
+          }, GONE.title)
+          return
+        }
+        // 没取全的答案，运行又删了：补不回来，但得说出来，也记下来
+        const lost = cur.phase === 'done' && !cur.review?.answer
+          && (cur.clipped === 'partial' || atClip(String(cur.output?.answer ?? '')))
+        patch((t) => ({ hydrated: 'done', runStatus: 'gone', clipped: lost ? 'lost' : t.clipped }))
+        if (lost) void persist(conversationId, turnId)
+      } else if (cur.phase === 'checking') {
+        // 后端出错、超时：不知道它现在怎样，但不能一直停在「正在核对」转圈——那之后
+        // 再也没有人来核对（重连只在断开过之后才触发）。说清楚，给「重新核对」
+        const said = errorMessage(e)
+        const raw = humanizeError(e).raw
+        const failure: Failure = {
+          title: PHASE_TEXT.unknown,
+          reason: `去后端查这一轮的运行时出错了（${said}）。它可能还在跑，也可能已经结束。`,
+          hint: '稍后点「重新核对」；后端断开又连上时会自动再核对一次。',
+          // 原话已经在括号里的，技术细节不再重复一遍
+          detail: raw && !said.includes(raw) ? raw : undefined,
+        }
+        patch(() => ({
+          hydrated: undefined, phase: 'unknown', status: PHASE_TEXT.unknown, failure, error: lineOf(failure),
         }))
       } else {
-        patch(() => ({ hydrated: undefined }))   // 网断了之类：下次再试
+        patch(() => ({ hydrated: undefined }))   // 已经有个结局摆着，下次再补
       }
       return
     }
@@ -800,41 +955,54 @@ export const useChat = create<ChatState>((set, get) => ({
     if (run.status === 'running' || run.status === 'queued') {
       if (unsettled) {
         const flow = flowOf(conversationId, turnId)
-        flow.patch(() => ({ phase: 'running', status: PHASE_TEXT.running, failure: null, error: '', endedAt: undefined }))
+        // 计时不从提问那天算：中断过的接着上次停下的地方走，停在半路的从运行开始算
+        const spent = cur.endedAt ? Math.max(0, cur.endedAt - cur.startedAt) : null
+        const startedAt = spent != null ? Date.now() - spent
+          : parseServerTime(run.started_at ?? null)?.getTime() ?? cur.startedAt
+        flow.patch(() => ({
+          phase: 'running', status: PHASE_TEXT.running, failure: null, error: '', startedAt, endedAt: undefined,
+        }))
         watch(flow, run.id, cur.lastSeq, cur.question)
       }
       return
     }
     if (run.status === 'interrupted') {
       if (pending) {
+        // 还在等人：库里那行保持 running 就是对的，它确实没结束
         patch(() => ({ phase: 'waiting', status: PHASE_TEXT.waiting, failure: null, error: '' }))
         void useCatalog.getState().refreshApprovals()
-      } else if (cur.phase !== 'done') {
-        patch(() => ({ phase: 'suspended', status: PHASE_TEXT.suspended, failure: SUSPENDED, error: '' }))
+      } else if (cur.phase !== 'done' && cur.phase !== 'suspended') {
+        conclude({ phase: 'suspended', status: PHASE_TEXT.suspended, failure: SUSPENDED, error: '' }, PHASE_TEXT.suspended)
       }
       return
     }
-    if (run.status === 'cancelled' && cur.phase !== 'done') {
-      patch(() => ({ phase: 'cancelled', status: PHASE_TEXT.cancelled, failure: null, error: '' }))
+    if (run.status === 'cancelled') {
+      if (cur.phase !== 'done' && cur.phase !== 'cancelled') {
+        conclude({ phase: 'cancelled', status: PHASE_TEXT.cancelled, failure: null, error: '' }, '已取消')
+      }
       return
     }
-    if (run.status === 'failed' && cur.phase !== 'done') {
-      const failure = cur.phase === 'error' && cur.failure ? cur.failure : failureOf(run.error || '运行失败')
-      patch(() => ({ phase: 'error', status: PHASE_TEXT.error, failure, error: lineOf(failure) }))
+    if (run.status === 'failed') {
+      if (cur.phase === 'error' && cur.failure) return
+      if (cur.phase !== 'done') {
+        const failure = runFailure(run.error || '')
+        conclude({ phase: 'error', status: PHASE_TEXT.error, failure, error: lineOf(failure) }, lineOf(failure))
+      }
       return
     }
     if (run.status !== 'succeeded') return
     if (unsettled) {
       // 跑完了，但交付没赶上（复核期间关了页面、服务重启）：把这一轮补完，
-      // 走一遍和实时一样的复核与落库
+      // 走一遍和实时一样的复核与落库。相位停在「正在核对」而不是「运行中」：运行
+      // 早就结束了，按实时算的计时会从提问那天一路数到现在（「72:00:01」）
       const flow = flowOf(conversationId, turnId)
-      flow.patch(() => ({ phase: 'running', status: '正在核对结果…', failure: null, error: '' }))
+      flow.patch(() => ({ phase: 'checking', status: '正在核对结果…', failure: null, error: '' }))
       // 耗时按运行真正结束的时刻算：补交付可能发生在几天之后
       const endedAt = parseServerTime(run.finished_at ?? null)?.getTime()
       void settle(flow, run.id, cur.question, run.output ?? null, { run, endedAt })
       return
     }
-    // 已经交付过的：答案被旧版本切过就换成完整的，顺手把档位补回来
+    // 已经交付过的：答案没取全就换成完整的，顺手把档位补回来
     const full = answerText(run.output)
     const stored = String(cur.output?.answer ?? '')
     const repaired = !cur.review?.answer && stored.length >= 200
@@ -846,6 +1014,15 @@ export const useChat = create<ChatState>((set, get) => ({
     } else if (issuance && !cur.output?._issuance) {
       patch((t) => ({ output: t.output ? { ...t.output, _issuance: issuance } : t.output }))
     }
+  },
+
+  recheck: (conversationId, turnId) => {
+    const turn = findTurn(conversationId, turnId)
+    if (!turn || turn.phase !== 'unknown') return Promise.resolve()
+    patcher(set, conversationId, turnId)(() => ({
+      phase: 'checking', status: PHASE_TEXT.checking, failure: null, error: '', hydrated: undefined,
+    }))
+    return get().hydrate(conversationId, turnId)
   },
 
   reattach: async (conversationId, turnId) => {
@@ -1005,6 +1182,8 @@ interface PlanArgs {
   /** 重试时把上一次那张图交回去，让它改而不是重建。null = 从零建 */
   baseGraph?: GraphSpec | null
   attempt: number
+  /** 这一问限定只查的数据源。空或不给 = 不限 */
+  scope?: ScopeSource[]
 }
 
 /**
@@ -1015,8 +1194,8 @@ interface PlanArgs {
  * 本来就是在手动做这件事。
  */
 function plan(flow: Flow, args: PlanArgs) {
-  const { question, instruction, baseGraph, attempt } = args
-  const { patch, save } = flow
+  const { question, instruction, baseGraph, attempt, scope } = args
+  const { patch } = flow
 
   /** 这一轮建出来的图。retry 要把它交回去，所以得在闭包里留一份 */
   let built: GraphSpec | null = baseGraph ?? null
@@ -1049,6 +1228,7 @@ function plan(flow: Flow, args: PlanArgs) {
       question,
       attempt: attempt + 1,
       baseGraph: base,
+      scope,
       instruction: base
         ? `这张流程上一次运行没有成功：${reason}。\n\n`
           + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
@@ -1069,7 +1249,10 @@ function plan(flow: Flow, args: PlanArgs) {
   }
 
   const cancelCopilot = streamCopilot(
-    { instruction, base_graph: baseGraph ?? null, intent: 'answer', conversation_id: flow.conversationId },
+    {
+      instruction, base_graph: baseGraph ?? null, intent: 'answer', conversation_id: flow.conversationId,
+      ...(scope?.length ? { datasource_ids: scope.map((d) => d.id) } : {}),
+    },
     (op) => {
       // 停止之后缓冲里还没派发完的操作：一条 final 就能把这一轮又跑起来
       if (!flow.alive()) return
@@ -1120,7 +1303,8 @@ function plan(flow: Flow, args: PlanArgs) {
         case 'final': {
           const graph = op.graph as GraphSpec
           built = graph          // 要重试的话，交回去的就是它
-          void save({ graph, explanation: op.explanation ?? '' })
+          // 连 meta 一起写：它的 at 是「建图还有动静」的凭据，后端这时也会刷新 updated_at
+          void flow.persist({ graph, explanation: op.explanation ?? '' })
 
           // 没过校验的图不能拿去跑：引擎会照实抛出它自己的措辞（"图是空的，
           // 先拖一个节点进来"），而用户根本不在画布上，这句话对他毫无意义。
@@ -1174,6 +1358,19 @@ function plan(flow: Flow, args: PlanArgs) {
       if (!error || !flow.alive()) return
       const turn = findTurn(flow.conversationId, flow.turnId)
       if (!turn || !BUSY_PHASES.has(turn.phase) || turn.run) return
+      // 限定的库一个都不在了：后端在开流之前就 400。流的结束回调只拿得到那句 detail，
+      // 按它认；认出来了，补救得是「不限数据源重试」，带着原范围重试只会再被拒一次
+      if (scope?.length && error.startsWith('限定的数据源')) {
+        const at = error.indexOf('：')
+        fail({
+          title: at > 0 ? error.slice(0, at) : error,
+          reason: at > 0 ? `${error.slice(at + 1).split('。')[0]}。` : undefined,
+          hint: '点「不限数据源重试」；想还只查它，先到「数据」页确认它还在、而且是启用的。',
+          detail: error,
+          scopeGone: true,
+        })
+        return
+      }
       fail(failureOf(error))
     },
   )
@@ -1194,10 +1391,18 @@ async function launch(
       return
     }
     patch(() => ({ run, runStatus: run.status }))
-    void flow.save({ run_id: run.id })
+    // meta 里的 runId 优先于 run_id 列（重试建图失败时那一列清不掉），所以得一起改：
+    // 只写列的话，重试出来的这次运行在库里一直挂着 runId=null，跑着的时候刷新或者
+    // 另开一页，它就成了「断在建图阶段」，放久了还会被当成断了写回 error。
+    // 「跑一下」发起时库里那行还是 done，一并改成 running
+    void flow.persist({ run_id: run.id, status: 'running' })
     watch(flow, run.id, 0, question, retry)
   } catch (e) {
-    const failure = failureOf(e)
+    // 发起那一下没到后端：流程是好的，原样再发起就行。通用的「稍等几秒会自动重试」
+    // 在这里不成立——这一页没有谁会替它重发
+    const failure: Failure = isNetworkError(e)
+      ? { ...failureOf(e, { hint: '后端连上之后点「重跑这一轮」，搭好的流程不用重来。' }), rerun: true }
+      : failureOf(e)
     patch(() => ({
       phase: 'error', status: PHASE_TEXT.error, error: lineOf(failure), failure,
       cancel: null, endedAt: Date.now(),
@@ -1359,7 +1564,7 @@ function watch(
       case 'run.failed': {
         ended = true
         batch.now()
-        const failure = failureOf(String(d.error ?? '运行失败'), { detail: d.detail ? String(d.detail) : undefined })
+        const failure = runFailure(d.error ? String(d.error) : '', d.detail ? String(d.detail) : undefined)
         patch(() => ({
           phase: 'error', status: PHASE_TEXT.error, error: lineOf(failure), failure,
           cancel: null, endedAt: Date.now(), runStatus: 'failed', final: { status: 'failed' },
@@ -1482,7 +1687,8 @@ async function settle(
     reviewRaw: result,
     cancel: null,
     endedAt: opts.endedAt ?? Date.now(),
-    clipped,
+    // 复核改写时读的是库里那份完整成果，改写出来的答案不缺尾巴
+    clipped: rewritten ? undefined : clipped,
     // 到这一步才把成果摆出来：复核说明和结论同时出现，而不是结论先读完
     output,
     // 改写是有损的，原件得留着——界面上可以展开对照。它跟着 review 一起

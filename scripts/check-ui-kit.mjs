@@ -1,5 +1,7 @@
-// 基础组件（components/ui.tsx）、前端工具库（lib/*）和连接状态（store/catalog.ts）
-// 的回归检查。
+// 基础组件（components/ui.tsx）、前端工具库（lib/*）、连接状态（store/catalog.ts）
+// 和 api/client 的上传进度的回归检查。管理页共用件（页头、连通胶囊、单选组、删除
+// 后撤销）和失败说明（lib/explain）也在这里：它们从页面挪进了公共层，页面级检查
+// 只走得到其中一两种情况。
 //
 // 这几样是全站的地基，坏了不会在哪一页上报错，只会悄悄变样：弹窗的焦点漏到页面
 // 上、组字时按 Esc 把半屏草稿关掉、toast 压住工具栏按钮、后端一抖整站说「还没有
@@ -105,6 +107,11 @@ for (const [name, ok, detail] of await page.evaluate(() => {
   eq('相对时间：59.6 分钟进位到小时档', ago(59.6 * 60_000), '1 小时前')
   ok('相对时间：23.6 小时不写「24 小时前」', !/24 小时前/.test(ago(23.6 * 3_600_000)), ago(23.6 * 3_600_000))
   eq('短 id', f.shortId('66a5a6ff0011'), '#66a5a6')
+  eq('文件大小：字节', f.formatBytes(820), '820 B')
+  eq('文件大小：KB', f.formatBytes(12_700), '12.4 KB')
+  eq('文件大小：MB', f.formatBytes(3.1 * 1024 * 1024), '3.1 MB')
+  eq('文件大小拿不到写 —', f.formatBytes(undefined), '—')
+  eq('短名去掉括号里的补充', f.shortLabel('OpenAI 兼容（DeepSeek、通义…）'), 'OpenAI 兼容')
 
   // 状态
   eq('succeeded = 已完成', st.statusLabel('succeeded'), '已完成')
@@ -157,6 +164,29 @@ for (const [name, ok, detail] of await page.evaluate(() => {
   ok('isNetworkError 对 HTTP 错误为假', !e.isNetworkError(new ApiError(500, 'NetworkError when attempting to fetch resource')))
   ok('测连接结果里的 ECONNREFUSED 不算连不上后端',
     e.humanizeError({ ok: false, error: 'connect ECONNREFUSED 10.0.0.5:5432' }).title !== '连不上后端服务')
+  // 已经是「标题：原因」的中文人话，不再套一个「操作超时」、把整句当原因（标题说两遍）
+  const zh = e.humanizeError(new ApiError(504, '数据库查询超时：超过 30 秒没有返回，已中断。缩小查询范围后重试。'))
+  ok('中文人话里的「超时」不套「操作超时」', zh.title !== '操作超时' && !(zh.reason ?? '').includes('操作超时')
+    && !(zh.reason && zh.reason.includes(zh.title)), JSON.stringify(zh))
+  eq('英文 timeout 原文照样翻成「操作超时」', e.humanizeError('ReadTimeout: timed out').title, '操作超时')
+  ok('……原因里不带异常类名', !/ReadTimeout/.test(e.humanizeError('ReadTimeout: timed out').reason ?? ''))
+
+  // 失败说明（lib/explain）：记录页、助手流、问数据页共用一份
+  const x = window.__ui.lib.explain
+  const leak = x.explainRunError('模型输出了工具调用的原始标记，但没有真正调用工具。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。')
+  ok('工具调用标记泄漏：说人话、不给接着跑、指到画布', leak.title === '模型没有真正调用工具' && !leak.continuable && leak.fix === 'canvas', JSON.stringify(leak))
+  const tired = x.explainRunError('NodeError: 协作团队用完 4 轮仍未完成：还缺汇总员的结论')
+  ok('团队轮数用完：标题带轮数，原因是调度者最后的理由', tired.title === '协作团队用完 4 轮仍未完成'
+    && tired.reason === '还缺汇总员的结论' && !tired.continuable, JSON.stringify(tired))
+  const made = x.explainRunError('校验修复无效：修复时出现了原文没有的值：total_count=0')
+  ok('校验修复编造数值：点出是哪个值、不给接着跑', made.reason.includes('total_count=0') && !made.continuable, JSON.stringify(made))
+  eq('提示词点名的工具没绑定', x.explainRunError('提示词要求用 db_query__shop，但节点没有绑定它').title,
+    '提示词要求用「db_query__shop」，但节点没有绑定它')
+  eq('老运行的鉴权失败', x.explainRunError('NodeError: AuthenticationError: Error code: 401 - invalid_api_key').title, '模型鉴权没通过')
+  const miss = x.explainRunError('缺少必填输入：region')
+  ok('缺必填输入：给出是哪一项、重新发起', miss.missingInput === 'region' && miss.fix === 'rerun' && !miss.continuable)
+  eq('没留原因', x.explainRunError(null).title, '运行失败，但没有留下原因')
+  ok('兜底：句中的异常类名也去掉', !/ValueError/.test(x.explainRunError('结构不对：ValueError: bad').title))
   return out
 })) check(name, ok, detail)
 
@@ -305,12 +335,13 @@ await page.waitForTimeout(100)
 check('出错的在 assertive 区', (await page.locator('[role="alert"][aria-live="assertive"]').innerText()).includes('保存失败'))
 check('普通的在 polite 区', (await page.locator('[role="status"][aria-live="polite"]').first().innerText()).includes('已复制到剪贴板'))
 check('出错的能复制', (await page.getByRole('button', { name: '复制详情' }).count()) >= 1)
-// 位置：内容区（让出 56px 导航）居中，顶边在 48px 工具栏之下
+// 位置：内容区（让出 64px 的导航，App 里的 w-16）居中，顶边在 48px 工具栏之下
+const NAV_W = 64
 const stackBox = await page.locator('[role="alert"][aria-live="assertive"]').boundingBox()
 const vw = page.viewportSize().width
 check('toast 在工具栏下沿之下（≥ 56px）', stackBox.y >= 56, `top=${Math.round(stackBox.y)}`)
-check('toast 在内容区里居中', Math.abs(stackBox.x + stackBox.width / 2 - (56 + vw) / 2) < 4,
-  `中线 ${Math.round(stackBox.x + stackBox.width / 2)}，内容区中线 ${(56 + vw) / 2}`)
+check('toast 在内容区里居中', Math.abs(stackBox.x + stackBox.width / 2 - (NAV_W + vw) / 2) < 2,
+  `中线 ${Math.round(stackBox.x + stackBox.width / 2)}，内容区中线 ${(NAV_W + vw) / 2}`)
 const infoCard = page.getByText('已复制到剪贴板')
 await infoCard.hover()
 await page.waitForTimeout(4600)
@@ -339,14 +370,24 @@ const emptyBlock = page.locator('[data-block="空态 EmptyState（模拟离线�
 await page.click('#toggle-offline')
 await page.waitForTimeout(100)
 check('横幅出现', (await page.getByText('后端未连接').count()) === 1)
-check('空态改说拿不到数据', (await emptyBlock.getByText('暂时拿不到数据').count()) === 1)
+// 横幅早就挂着（连着时什么都不画），计时器是这一刻才走起来的：头一个数得按此刻算
+const firstSecs = Number((await page.getByText(/秒后自动重试/).innerText()).match(/\d+/)?.[0])
+check('刚断开时倒计时从此刻算（8 秒）', firstSecs === 8 || firstSecs === 7, `横幅 ${firstSecs} 秒`)
+check('空态改说拿不到数据', (await emptyBlock.getByText('暂时拿不到数据').count()) >= 1)
 check('离线空态不许诺「会自动刷新」', (await emptyBlock.getByText(/自动刷新/).count()) === 0)
 check('离线时收起「新建」', (await page.getByRole('button', { name: '新建工作流' }).count()) === 0)
 check('本地空态不受影响', (await page.getByText('没有匹配的工具').count()) === 1)
+// role=alert 整块重念：倒计时一秒一跳，放在里面读屏就一秒念一遍整条横幅
+const bannerAlert = page.locator('[data-offline-banner] [role="alert"]')
+check('横幅外层不是 role=alert', (await page.locator('[data-offline-banner]').getAttribute('role')) === null)
+check('横幅的播报区只有不变的那几句', (await bannerAlert.count()) === 1
+  && (await bannerAlert.innerText()).includes('后端未连接') && !/秒后自动重试/.test(await bannerAlert.innerText()),
+  await bannerAlert.innerText().catch(() => ''))
+check('倒计时对读屏隐藏', (await page.getByText(/秒后自动重试/).getAttribute('aria-hidden')) === 'true')
 // 横幅把工具栏往下推了多少，toast 就跟着让多少
 await page.click('#toast-error')
 await page.waitForTimeout(80)
-const bannerH = (await page.locator('[role="alert"]', { hasText: '后端未连接' }).boundingBox()).height
+const bannerH = (await page.locator('[data-offline-banner]').boundingBox()).height
 const offTop = (await page.locator('[role="alert"][aria-live="assertive"]').boundingBox()).y
 check('离线时 toast 再让出横幅的高度', Math.abs(offTop - (56 + bannerH)) < 2, `top=${Math.round(offTop)}，横幅 ${Math.round(bannerH)}px`)
 await page.evaluate(() => window.__ui.toast.dismiss())
@@ -363,6 +404,158 @@ check('Field：label 关联输入框', (await page.getByLabel('Base URL').count(
 const wantAria = await page.evaluate(() => window.__ui.lib.keys.ariaShortcut('Mod+R'))
 const gotAria = await page.getByRole('button', { name: '刷新列表' }).getAttribute('aria-keyshortcuts')
 check('IconButton 的 aria-keyshortcuts 按平台写', gotAria === wantAria && !/Ctrl|Mod/.test(gotAria), gotAria)
+
+console.log('\n=== 管理页共用件：页头、连通胶囊、单选组、删除后撤销 ===')
+check('页头 48px 高', Math.round((await page.locator('#page-header-demo header').boundingBox()).height) === 48)
+const pills = await page.locator('#health-demo [data-health]').evaluateAll((els) => els.map((el) => el.textContent))
+// 「3 分钟前」是从预览页挂载时算的，跑到这里可能已经过了一分钟
+check('连通胶囊五种说法', pills[0] === '未测试' && /^正在测 · /.test(pills[1]) && /^已连通 · 42 ms · [34] 分钟前测$/.test(pills[2])
+  && pills[3] === '连不上 · 1 小时前测' && /已连通 · 380 ms.*配置改过了/.test(pills[4]), pills.join(' | '))
+check('不知道测的时刻：不留一个悬空的「 · 」', pills[5] === '连不上', JSON.stringify(pills[5]))
+const spoken = await page.locator('#health-demo [role="status"]').evaluateAll((els) => els.map((el) => el.textContent))
+check('读屏那一句不带跳动的计时和相对时间', spoken[1] === '正在测连接' && /^已连通 42 ms，\d\d:\d\d 测的$/.test(spoken[2]), spoken.join(' | '))
+
+const radios = page.locator('#radio-demo [role="radio"]')
+check('单选组只占一个 Tab 位', JSON.stringify(await radios.evaluateAll((els) => els.map((el) => el.tabIndex))) === '[0,-1,-1]')
+const checkedRadio = () => page.locator('#radio-demo [role="radio"][aria-checked="true"]').innerText()
+const focusedRadio = () => page.evaluate(() => document.activeElement?.textContent)
+await radios.first().focus()
+await page.keyboard.press('ArrowRight')
+check('→ 选中下一项并聚焦', (await checkedRadio()) === 'sid' && (await focusedRadio()) === 'sid')
+await page.keyboard.press('End')
+check('End 到最后一项', (await checkedRadio()) === 'dsn')
+await page.keyboard.press('ArrowDown')
+check('↓ 首尾相接', (await checkedRadio()) === 'service_name')
+await page.keyboard.press('ArrowUp')
+await page.keyboard.press('Home')
+check('↑ 往回、Home 到第一项', (await checkedRadio()) === 'service_name' && (await focusedRadio()) === 'service_name')
+await page.keyboard.press('Alt+ArrowRight')
+check('带 Alt 的方向键不接（那是浏览器后退 / 前进）', (await checkedRadio()) === 'service_name')
+await page.getByRole('tab', { name: '模型接入' }).focus()
+await page.keyboard.press('End')
+check('标签页：End 到最后一个', (await page.getByRole('tab', { name: '偏好' }).getAttribute('aria-selected')) === 'true')
+await page.keyboard.press('Home')
+
+let deletes = 0
+page.on('request', (r) => { if (r.method() === 'DELETE') deletes++ })
+const rowShown = (id) => page.locator(`#defer-demo [data-row="${id}"]`).count()
+const undoBtn = page.locator('[role="status"][aria-live="polite"]').getByRole('button', { name: '撤销' })
+await page.getByRole('button', { name: '删除 orders' }).click()
+await page.waitForTimeout(80)
+check('删除：行先拿掉，toast 给「撤销」', (await rowShown('orders')) === 0
+  && (await page.getByText('已删除「orders」').count()) === 1 && (await undoBtn.count()) === 1)
+await page.click('#defer-reload')
+await page.waitForTimeout(50)
+check('撤销窗口里重拉列表，删掉的行不回来', (await rowShown('orders')) === 0)
+await undoBtn.click()
+await page.waitForTimeout(80)
+check('撤销：行回来了，一个 DELETE 都没发', (await rowShown('orders')) === 1 && deletes === 0)
+await page.evaluate(() => window.__ui.toast.dismiss())
+
+console.log('\n=== 空态：catalog 的表没取回来时不说「还没有」 ===')
+const sourceEmpty = page.locator('#empty-source-demo')
+await page.evaluate(() => window.__ui.useCatalog.getState().refresh())
+check('取回来了：照常说「还没有工作流」、给新建', (await sourceEmpty.getByText('还没有工作流').count()) === 1
+  && (await sourceEmpty.locator('#empty-source-action').count()) === 1)
+const realCatalog = await page.evaluate(() => {
+  const s = window.__ui.useCatalog.getState()
+  return { loadedAt: s.loadedAt, checks: s.checks }
+})
+await page.evaluate(() => window.__ui.useCatalog.setState({
+  loadedAt: {}, checks: [{ key: 'workflows', label: '工作流', state: 'pending' }],
+}))
+await page.waitForTimeout(50)
+check('从没取回来过、还在路上：说「正在读取工作流」、收起新建', (await sourceEmpty.getByText('正在读取工作流').count()) === 1
+  && (await sourceEmpty.locator('#empty-source-action').count()) === 0
+  && (await sourceEmpty.locator('[data-empty-unknown="loading"]').getAttribute('role')) === 'status')
+await page.evaluate(() => window.__ui.useCatalog.setState({
+  checks: [{ key: 'workflows', label: '工作流', state: 'error', error: '后端 15 秒没有响应，稍后重试' }],
+}))
+await page.waitForTimeout(50)
+check('超时或报错：说「工作流没取回来」和原因、给重新读取', (await sourceEmpty.getByText('工作流没取回来').count()) === 1
+  && (await sourceEmpty.getByText(/15 秒没有响应.*这里显示为空不代表没有数据/).count()) === 1
+  && (await sourceEmpty.getByRole('button', { name: '重新读取' }).count()) === 1
+  && (await sourceEmpty.locator('#empty-source-action').count()) === 0)
+await page.evaluate((c) => window.__ui.useCatalog.setState(c), realCatalog)
+
+console.log('\n=== catalog：一张表卡住不拖累别的表 ===')
+// /tools 连得上但不回（MCP 服务不应答时就是这样）：以前 Promise.all 等它，工作流也一直空着
+const toolsBefore = await page.evaluate(() => window.__ui.useCatalog.getState().tools.length)
+// unroute 要拿同一个函数引用才摘得掉
+const isTools = (u) => new URL(u).pathname === '/api/tools'
+await page.route(isTools, () => { /* 永远不回 */ })
+const expectWf = await fetch(`${API}/workflows`).then((r) => r.json()).then((l) => l.length, () => null)
+await page.evaluate(() => window.__ui.useCatalog.setState({ workflows: [] }))
+const tHang = Date.now()
+let settled = false
+const hung = page.evaluate(() => window.__ui.useCatalog.getState().refresh()).then(() => { settled = true })
+await page.waitForFunction(() => window.__ui.useCatalog.getState().workflows.length > 0, null, { timeout: 8000 }).catch(() => {})
+let cat = await page.evaluate(() => {
+  const s = window.__ui.useCatalog.getState()
+  return { wf: s.workflows.length, wfAt: s.loadedAt.workflows, tools: s.checks.find((c) => c.key === 'tools')?.state }
+})
+if (expectWf) {
+  check('工作流先回来先填，不等卡住的工具', cat.wf === expectWf && cat.wfAt >= tHang && cat.tools === 'pending',
+    `${JSON.stringify(cat)}，后端有 ${expectWf} 个工作流`)
+}
+// 最多等 20 秒：没有超时的话 refresh 永远不落定，检查自己也不能跟着挂死
+await Promise.race([hung, new Promise((r) => setTimeout(r, 20_000))])
+const hangMs = Date.now() - tHang
+check('refresh 在超时之后落定', settled, `${hangMs}ms 还没落定`)
+cat = await page.evaluate(() => {
+  const s = window.__ui.useCatalog.getState()
+  const c = s.checks.find((x) => x.key === 'tools')
+  return { state: c?.state, error: c?.error, backend: s.backend, tools: s.tools.length, loaded: s.loaded }
+})
+check('卡住的那张 15 秒超时，记成出错并说清', cat.state === 'error' && /15 秒/.test(cat.error ?? '') && hangMs > 14_500 && hangMs < 18_000,
+  `${cat.state} ${cat.error} ${hangMs}ms`)
+check('一张表超时不算后端断开', cat.backend === 'ok', cat.backend)
+check('超时不清空手上已有的那份', cat.tools === toolsBefore, `${toolsBefore} → ${cat.tools}`)
+await page.unroute(isTools)
+
+console.log('\n=== 上传进度（kb.upload 走 XHR） ===')
+const isUpload = (u) => new URL(u).pathname === '/api/kb/upload'
+const uploadVia = async (handler) => {
+  await page.unroute(isUpload)
+  await page.route(isUpload, handler)
+}
+const tryUpload = (size) => page.evaluate(async (size) => {
+  const events = []
+  try {
+    const doc = await window.__ui.api.kb.upload(new File([new Uint8Array(size)], 'orders.csv', { type: 'text/csv' }), 'default',
+      { onProgress: (p) => events.push(p) })
+    return { events, doc }
+  } catch (e) {
+    return { events, err: { isApi: e instanceof window.__ui.ApiError, status: e.status, kind: e.kind, message: e.message } }
+  }
+}, size)
+// 上传进度只有真的走网络才有（page.route 直接 fulfill 时浏览器不发进度事件）。
+// 转给 dev server 上一个不存在的地址：字节真发出去，回 404，什么都不写
+await uploadVia((r) => r.continue({ url: `${WEB}/__upload_probe__` }))
+let up = await tryUpload(300_000)
+const lastUp = up.events.at(-1)
+check('字节发完报 sent，已发 = 总数，且不小于文件大小', !!lastUp?.sent && lastUp.loaded === lastUp.total && lastUp.total >= 300_000,
+  JSON.stringify(up.events.slice(-2)))
+check('sent 只在最后', up.events.filter((p) => p.sent).length === 1 && !up.events.slice(0, -1).some((p) => p.sent))
+check('非 JSON 的错误响应：http 类的 ApiError', up.err?.isApi && up.err.kind === 'http' && up.err.status === 404, JSON.stringify(up.err))
+await uploadVia((r) => r.fulfill({
+  status: 200, contentType: 'application/json',
+  body: JSON.stringify({ id: 'doc_demo', collection: 'default', title: 'orders.csv', source: 'upload', mime: 'text/csv', chunk_count: 0, status: 'processing' }),
+}))
+up = await tryUpload(10)
+check('成功：返回值照常解析', up.doc?.id === 'doc_demo', JSON.stringify(up.err ?? up.doc))
+await uploadVia((r) => r.fulfill({
+  status: 409, contentType: 'application/json', body: JSON.stringify({ detail: '同名文档已经在处理：等它处理完再传' }),
+}))
+up = await tryUpload(10)
+check('后端拒绝：和 fetch 那条路一样的 ApiError，message 是 detail', up.err?.isApi && up.err.status === 409
+  && up.err.kind === 'http' && up.err.message === '同名文档已经在处理：等它处理完再传', JSON.stringify(up.err))
+await uploadVia((r) => r.abort('connectionrefused'))
+up = await tryUpload(10)
+check('连不上：network 类的 ApiError', up.err?.isApi && up.err.kind === 'network' && up.err.status === 0, JSON.stringify(up.err))
+await page.unroute(isUpload)
+// 网络失败会顺手探一次活，等它落定再往下，免得下一段的探活计数多一次
+await page.evaluate(() => window.__ui.useCatalog.getState().checkBackend())
 
 console.log('\n=== 连接状态：心跳、退避、恢复 ===')
 const expectRuns = await fetch(`${API}/runs?limit=3`).then((r) => r.json()).then((r) => r.length, () => null)

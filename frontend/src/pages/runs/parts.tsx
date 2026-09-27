@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { Check, Copy, MoreHorizontal, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
-import { toast } from '../../components/ui'
+import { rovingTarget, toast, useTicker } from '../../components/ui'
 import { formatClock, parseServerTime } from '../../lib/format'
 import { ISSUANCE_LABEL, runClassLabel } from '../../lib/terms'
 import { useRunClock } from '../../run/useRunClock'
@@ -17,6 +17,8 @@ export interface TabItem<K extends string> {
   /** 右侧的计数。tone 决定它醒不醒目：待审批要人处理，失败是历史，不该一样响 */
   count?: number | null
   countLabel?: string
+  /** 读屏念计数时的量词：运行、审批论「条」，工件论「件」 */
+  unit?: string
   tone?: 'alert' | 'live' | 'quiet'
   title?: string
 }
@@ -26,23 +28,21 @@ export interface TabItem<K extends string> {
  * 多了一样：计数分轻重。Tabs 的徽标只有一种强调色，「失败 32」天天亮着就成了
  * 噪音，而「待审批 2」必须醒目。
  */
-export function RunTabs<K extends string>({ tabs, active, onChange, label, idPrefix }: {
+export function RunTabs<K extends string>({ tabs, active, onChange, label, idPrefix, className }: {
   tabs: TabItem<K>[]; active: K; onChange: (k: K) => void; label: string; idPrefix: string
+  /** 换掉默认的底边线（放进已经有分隔线的地方时） */
+  className?: string
 }) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({})
   const move = (e: KeyboardEvent, i: number) => {
-    let next = -1
-    if (e.key === 'ArrowRight') next = (i + 1) % tabs.length
-    else if (e.key === 'ArrowLeft') next = (i - 1 + tabs.length) % tabs.length
-    else if (e.key === 'Home') next = 0
-    else if (e.key === 'End') next = tabs.length - 1
+    const next = rovingTarget(e, i, tabs.length, 'horizontal')
     if (next < 0) return
     e.preventDefault()
     onChange(tabs[next].key)
     refs.current[tabs[next].key]?.focus()
   }
   return (
-    <div className="flex shrink-0 gap-0.5 border-b px-2" role="tablist" aria-label={label}>
+    <div className={clsx('flex shrink-0 gap-0.5 px-2', className ?? 'border-b')} role="tablist" aria-label={label}>
       {tabs.map((t, i) => {
         const selected = t.key === active
         const n = t.count ?? 0
@@ -74,7 +74,7 @@ export function RunTabs<K extends string>({ tabs, active, onChange, label, idPre
                   t.tone === 'live' && 'text-st-running',
                   (!t.tone || t.tone === 'quiet') && 'text-faint',
                 )}
-                aria-label={`${t.countLabel ?? n} 条`}
+                aria-label={`${t.countLabel ?? n} ${t.unit ?? '条'}`}
               >
                 {t.countLabel ?? n}
               </span>
@@ -149,7 +149,7 @@ export function LiveElapsed({ since, prefix = '已运行 ' }: { since?: string |
   const start = parseServerTime(since ?? null)?.getTime()
   const long = start != null && Date.now() - start >= CLOCK_MAX_MS
   const tick = useRunClock(!long)
-  const slow = useNow(60_000, long)
+  const slow = useTicker(60_000, long)
   if (start == null) return <span className="tnum">{prefix}—</span>
   const ms = Math.max(0, (long ? Math.max(slow, Date.now()) : tick) - start)
   return <span className="tnum">{prefix}{long ? formatSpan(ms) : formatClock(ms)}</span>
@@ -157,20 +157,6 @@ export function LiveElapsed({ since, prefix = '已运行 ' }: { since?: string |
 
 /** 秒表读数只用到一小时以内；再长就换成「X 小时 YY 分」「X 天 YY 小时」 */
 export const CLOCK_MAX_MS = 3_600_000
-
-/**
- * 慢节拍的「现在」：等了几天的审批按分钟刷新就够了，用不着 100ms 一拍的运行
- * 时钟。页面不可见时不刷。
- */
-export function useNow(intervalMs: number, active = true): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!active) return
-    const t = setInterval(() => { if (!document.hidden) setNow(Date.now()) }, intervalMs)
-    return () => clearInterval(t)
-  }, [intervalMs, active])
-  return now
-}
 
 // -------------------------------------------------------------------------
 // 复制
