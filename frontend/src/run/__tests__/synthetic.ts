@@ -163,6 +163,51 @@ export const MIXED_OUTPUT = {
 }
 
 /**
+ * 两张口径卡的出具：逐个数字的出处在 matched[].caliber 里，写成「口径名 @ 版本」
+ * （后端 io.py 的拼法）。横幅按它逐张清点「回指 N 个数字」——拼法一变，这一支就悄悄不画了
+ */
+export const CALIBERS_OUTPUT = {
+  answer: '上周订单 **128** 单，已付款 **96** 单，退款 **7** 单。',
+  _issuance: {
+    tier: 'formal',
+    calibers: [
+      { node: 'k1', caliber: '订单口径', version: 'v2' },
+      { node: 'k2', caliber: '退款口径', version: 'v1' },
+    ],
+    metrics_checked: 3,
+    missing_required: [],
+    missing_expected: [],
+    unmatched_numbers: [],
+    matched_numbers: 3,
+    matched: [
+      { token: '128', metric: 'orders', caliber: '订单口径 @ v2' },
+      { token: '96', metric: 'paid', caliber: '订单口径 @ v2' },
+      { token: '7', metric: 'refunds', caliber: '退款口径 @ v1' },
+    ],
+    gaps: [],
+  },
+}
+
+/** 只有一张口径卡、逐个出处都指向它：直说「都来自这张卡」 */
+export const CALIBER_ONE_OUTPUT = {
+  answer: '上周订单 **128** 单，已付款 **96** 单。',
+  _issuance: {
+    tier: 'formal',
+    calibers: [{ node: 'k1', caliber: '订单口径', version: 'v2' }],
+    metrics_checked: 2,
+    missing_required: [],
+    missing_expected: [],
+    unmatched_numbers: [],
+    matched_numbers: 2,
+    matched: [
+      { token: '128', metric: 'orders', caliber: '订单口径 @ v2' },
+      { token: '96', metric: 'paid', caliber: '订单口径 @ v2' },
+    ],
+    gaps: [],
+  },
+}
+
+/**
  * 一条一条往下走的取数流水线：n 个不同的节点，各查一张表。不折叠、不合并，
  * 行数随事件线性增长——用来验"只在贴底时跟随"
  */
@@ -370,4 +415,98 @@ export const COPILOT_STUCK = [
     { level: 'error', node_id: 'lp', message: '循环条件写错了' },
     { level: 'warning', node_id: null, code: 'unknown_node_type', type: 'excel_export', message: '模型写了一个不存在的节点类型「excel_export」，这一步已跳过' },
   ] },
+]
+
+/**
+ * 同一个协作团队执行了不止一次，看结局、泳道是不是按「这一次」算。
+ * - rerun：用完 2 轮判失败 → 调大轮数接着跑（后端给这个节点也标 resumed:true）→ 一轮就收尾；
+ * - loop：循环体里的团队，第 1 轮降档交付（产出不带轮数，后端就是这样发的），第 2 轮正常收尾；
+ * - approval：成员要调的工具要审批，停下、放行后同一次执行接着走（这次重放不算新的一次）。
+ */
+export function rerunTeam(mode: 'rerun' | 'loop' | 'approval'): RunEvent[] {
+  const { out, ev } = builder(`syn-team-${mode}`)
+  const route = (round: number, agents: string[], done: boolean, reason: string) => {
+    ev('agent.route.start', 'team', { round })
+    ev('agent.route.end', 'team', { round, duration_ms: 800, agents, parallel: agents.length, done, reason })
+  }
+  const member = (round: number, name: string, preview: string) => {
+    ev('agent.step.start', 'team', { agent: name, instruction: `第 ${round + 1} 轮的活`, round, parallel: 1 }, 0.001)
+    ev('agent.step.end', 'team', { agent: name, duration_ms: 1200, round, parallel: 1, preview }, 1.2)
+  }
+  ev('run.started', null, { nodes: 3, resumed: false, replay_protocol: 2 })
+  if (mode === 'rerun') {
+    ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组' })
+    route(0, ['检索员'], false, '先把订单查出来')
+    member(0, '检索员', '没查到')
+    route(1, ['检索员'], false, '再试一次')
+    member(1, '检索员', '还是没查到')
+    const error = '协作团队用完 2 轮仍未完成：还没有查到订单。一次都没被派到的成员：定稿员。先看成员有没有绑定要用的工具，再调大「最多轮数」'
+    ev('node.failed', 'team', { error, duration_ms: 4000 })
+    ev('run.failed', null, { error, node_id: 'team', label: '复盘小组', timing: { wall_ms: 4200, active_ms: 4200, wait_ms: 0 } })
+    // 真实的接着跑顺序：run.resumed → run.started{resumed} → node.started{resumed:true}
+    ev('run.resumed', null, { from: 'team', message: '从「复盘小组」接着跑…', actor: null }, 5)
+    ev('run.started', null, { nodes: 3, resumed: true, replay_protocol: 2 })
+    ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组', resumed: true })
+    route(0, ['检索员'], false, '查订单')
+    member(0, '检索员', '查到 128 单')
+    route(1, [], true, '查到了，可以收尾')
+    ev('node.finished', 'team', { duration_ms: 2500, attempt: 1, preview: { text: '128 单' } })
+    ev('run.finished', null, { output: { 结论: '128 单' }, usage: {}, duration_ms: 7000, timing: { wall_ms: 12000, active_ms: 7000, wait_ms: 0 } })
+    return out
+  }
+  if (mode === 'loop') {
+    ev('node.started', 'lp', { node_type: 'loop', label: '逐周循环' })
+    for (const iteration of [1, 2]) {
+      ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组', iteration })
+      route(0, ['分析员'], false, `第 ${iteration} 周`)
+      member(0, '分析员', `第 ${iteration} 周的原话`)
+      if (iteration === 1) {
+        route(1, ['分析员'], false, '再看看')
+        member(1, '分析员', '还是原话')
+        ev('agent.route.start', 'team', { round: 2, closing: true })
+        ev('agent.route.end', 'team', { round: 2, duration_ms: 600, agents: [], parallel: 0, done: false, reason: '数据不全', closing: true })
+        ev('log', 'team', { level: 'warn', code: 'team_exhausted',
+          message: '协作团队用完 2 轮仍未完成：数据不全。按降档交付：成果是成员最后的原话，不是调度者认可的结论' })
+        ev('node.finished', 'team', { duration_ms: 3000, attempt: 1,
+          preview: { text: '还是原话', exhausted: true, exhausted_reason: '数据不全', never_dispatched: '[0 项]' } })
+      } else {
+        route(1, [], true, '这周齐了')
+        ev('node.finished', 'team', { duration_ms: 1500, attempt: 1, preview: { text: '第 2 周的原话' } })
+      }
+      ev('edge.taken', 'lp', { branch: iteration === 1 ? 'body' : 'done' })
+    }
+    ev('node.finished', 'lp', { duration_ms: 5000, attempt: 1, preview: {} })
+    ev('run.finished', null, { output: { 结论: '两周都看完了' }, usage: {}, duration_ms: 5200, timing: { wall_ms: 5200, active_ms: 5200, wait_ms: 0 } })
+    return out
+  }
+  ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组' })
+  route(0, ['检索员'], false, '先查订单')
+  ev('agent.step.start', 'team', { agent: '检索员', instruction: '改一条订单备注', round: 0, parallel: 1 }, 0.001)
+  ev('human.requested', 'team', { node_id: 'team', kind: 'tool', tool: 'db_query__shop' })
+  ev('run.interrupted', null, { payload: { node_id: 'team' } })
+  ev('run.resumed', null, { actor: null }, 3)
+  ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组', resumed: true })
+  ev('human.resolved', 'team', { approved: true, actor: null })
+  ev('agent.step.end', 'team', { agent: '检索员', duration_ms: 3500, round: 0, parallel: 1, preview: '改好了' }, 0.5)
+  route(1, [], true, '改好了，可以收尾')
+  ev('node.finished', 'team', { duration_ms: 4200, attempt: 1, preview: { text: '改好了' } })
+  ev('run.finished', null, { output: { 结论: '改好了' }, usage: {}, duration_ms: 4400, timing: { wall_ms: 7400, active_ms: 4400, wait_ms: 3000 } })
+  return out
+}
+
+/** 新后端的自查问题是对象：带 field、code，message 不再以「节点 id」开头 */
+export const COPILOT_OBJECT_ISSUES = [
+  { op: 'add_node', node: { id: 'lp', type: 'loop', label: '逐周循环' } },
+  { op: 'add_node', node: { id: 'ask', type: 'agent', label: '订单查询' } },
+  { op: 'done', explanation: '两步' },
+  { op: 'check', status: 'repairing', round: 1, issues: [
+    { level: 'error', node_id: 'lp', edge_id: null, field: 'condition', message: '循环条件写错了：表达式里没有 | 过滤器' },
+  ] },
+  { op: 'check', status: 'failed', issues: [
+    { level: 'error', node_id: 'ask', edge_id: null, field: 'tools', code: 'datasource_out_of_scope',
+      message: '用了限定范围之外的数据源 sales_daily：这一轮只查 orders' },
+    { level: 'error', node_id: 'gone', edge_id: null, field: null, message: '这个节点不在这一轮的操作里' },
+  ] },
+  { op: 'remove_node', id: 'old' },
+  { op: 'final', graph: { nodes: [{ id: 'lp' }, { id: 'ask' }] }, issues: [] },
 ]

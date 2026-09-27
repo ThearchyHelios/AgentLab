@@ -81,6 +81,12 @@
   --nt-human: #ce91e6;
   --nt-validate: #ebb1fd;
   --nt-metrics: #cbaddb;
+
+  /* 检索通路的分类色：只说「这一分是哪一路检索贡献的」，不表示状态，所以
+     不借 accent / ok / warn。两色按 dataviz 校验过：色觉异常下也分得开，
+     在 panel 底上作为图形 ≥ 3:1 */
+  --via-semantic: #2b95c0;
+  --via-keyword: #d55181;
 }
 
 :root[data-theme='light'] {
@@ -132,6 +138,8 @@
   --nt-human: #6f3d81;
   --nt-validate: #885398;
   --nt-metrics: #6e557b;
+  --via-semantic: #0a7ea4;
+  --via-keyword: #c2447a;
 }
 
 /* 「跟随系统」且系统是浅色：和上面那块逐字相同 */
@@ -185,6 +193,8 @@
     --nt-human: #6f3d81;
     --nt-validate: #885398;
     --nt-metrics: #6e557b;
+    --via-semantic: #0a7ea4;
+    --via-keyword: #c2447a;
   }
 }
 
@@ -225,10 +235,6 @@
   --dur-base: 200ms;
   --dur-slow: 360ms;
 
-  /* 旧名字：--hover 从来没定义过（协作泳道的空格子因此是透明的），原意就是
-     --bg-hover；--canvas-dot 是画布底纹以前的名字 */
-  --hover: var(--bg-hover);
-  --canvas-dot: var(--grid-dot);
 }
 
 /* 字号阶梯。中文正文不低于 11px（2xs）；画布卡片内部和 360px 的助手栏暂时

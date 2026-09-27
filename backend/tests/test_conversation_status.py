@@ -193,3 +193,50 @@ async def test_the_detail_carries_the_same_status(client):
     await _turn(client, conv, run_id=run)
     detail = (await client.get(f"/api/conversations/{conv}")).json()
     assert (detail["last_status"], detail["last_run_id"]) == ("waiting", run)
+
+
+# --------------------------------------------------------------------------
+# 重试之后：meta.runId 才是这一轮现在的运行
+# --------------------------------------------------------------------------
+
+
+async def test_a_retried_turn_reports_the_new_run_not_the_old_one(client):
+    """重试会换一次运行，可 run_id 列清不掉（TurnPatch 的 None 表示「不改」），
+    还指着上一次失败的运行；前端写的 meta.runId 才是权威。列表得按它报，
+    不然重试正在建图时，左栏还挂着上一次的「失败」。"""
+    conv = await _conversation(client, "重试了")
+    old = await _run("failed")
+    turn = await _turn(client, conv, run_id=old, status="error", error="查询超时",
+                       meta={"v": 1, "runId": old})
+    # 重试：重新建图，还没有运行
+    r = await client.patch(f"/api/conversations/{conv}/turns/{turn['id']}",
+                           json={"status": "running", "meta": {"v": 1, "runId": None}})
+    assert r.status_code == 200
+    item = (await _listed(client))[conv]
+    assert (item["last_status"], item["last_run_id"]) == ("running", None)
+
+    # 重试出来的运行起来了，还在跑
+    new = await _run("running")
+    await client.patch(f"/api/conversations/{conv}/turns/{turn['id']}",
+                       json={"meta": {"v": 1, "runId": new}})
+    item = (await _listed(client))[conv]
+    assert (item["last_status"], item["last_run_id"]) == ("running", new)
+    detail = (await client.get(f"/api/conversations/{conv}")).json()
+    assert (detail["last_status"], detail["last_run_id"]) == ("running", new)
+
+
+async def test_old_turns_without_run_id_in_meta_still_use_the_column(client):
+    conv = await _conversation(client, "老轮次")
+    run = await _run("interrupted", pending=True)
+    await _turn(client, conv, run_id=run, meta={"v": 1, "ms": 1200})
+    item = (await _listed(client))[conv]
+    assert (item["last_status"], item["last_run_id"]) == ("waiting", run)
+
+
+async def test_turns_carry_updated_at_for_the_same_staleness_clock(client):
+    """前端判断「建图断了」要和后端用同一只钟：后端按 updated_at 算。"""
+    conv = await _conversation(client, "带时间")
+    turn = await _turn(client, conv)
+    assert turn.get("updated_at"), turn
+    detail = (await client.get(f"/api/conversations/{conv}")).json()
+    assert detail["turns"][0]["updated_at"]

@@ -30,17 +30,21 @@ export function isComposing(e: ReactKeyboardEvent | KeyboardEvent): boolean {
 }
 
 /**
- * 页面级错误边界。没有它，任何一个组件渲染时抛错，React 会卸掉整棵树——整站
- * 白屏，导航栏也没了，用户只能刷新，没保存的编辑跟着丢。
+ * 错误边界。没有它，任何一个组件渲染时抛错，React 会卸掉整棵树——整站白屏，
+ * 导航栏也没了，用户只能刷新，没保存的编辑跟着丢。
  *
- * 包在路由外面：导航栏还在，换一页（resetKey 变了）就自动恢复。编辑中的图在
- * store 里、不在组件树上，点「重试」重新渲染时它还在。
+ * scope 说明兜的是哪一层：
+ * - page（默认）：App 里包在路由外面，出错只换掉内容区，导航还在，换一页（resetKey
+ *   变了）就自动恢复；
+ * - shell：main.tsx 里包着整个 App，这时导航也没了，文案不能再说「这一页」。
+ * title 可以再覆盖标题。编辑中的图在 store 里、不在组件树上，点「重试」重新渲染时它还在。
  *
  * 技术信息（error.message）收进「技术细节」折叠区并能复制：对用户是噪音，对
- * 排障是全部线索。
+ * 排障是全部线索。role=alert 只包标题和那句说明：按钮和技术细节也在里面的话，
+ * 读屏会把「重试 刷新页面 技术细节…」连同堆栈摘要一起当成警报念出来。
  */
 export class ErrorBoundary extends Component<
-  { resetKey?: string; children: ReactNode }, { error: Error | null }
+  { resetKey?: string; scope?: 'page' | 'shell'; title?: string; children: ReactNode }, { error: Error | null }
 > {
   state: { error: Error | null } = { error: null }
 
@@ -63,11 +67,17 @@ export class ErrorBoundary extends Component<
     const raw = error.stack?.includes(error.message)
       ? error.stack
       : `${error.name}: ${error.message}${error.stack ? `\n\n${error.stack}` : ''}`
+    const shell = this.props.scope === 'shell'
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+      <div data-error-scope={shell ? 'shell' : 'page'}
+           className={clsx('flex flex-col items-center justify-center gap-3 p-8 text-center', shell ? 'h-screen bg-[var(--bg)]' : 'h-full')}>
         <AlertCircle size={22} className="text-[var(--err)]" aria-hidden />
-        <div className="text-sm font-medium">这一页出错了</div>
-        <div className="text-[11.5px] text-dim">没保存的编辑还在内存里：先点「重试」，恢复了就尽快保存。</div>
+        <div role="alert" className="flex flex-col items-center gap-3">
+          <div className="text-sm font-medium">{this.props.title ?? (shell ? '界面出错了' : '这一页出错了')}</div>
+          <div className="text-xs text-dim">
+            {shell ? '导航和页面都停了。' : ''}没保存的编辑还在内存里：先点「重试」，恢复了就尽快保存。
+          </div>
+        </div>
         <div className="flex gap-2">
           <button className="btn btn-sm" onClick={() => this.setState({ error: null })}>重试</button>
           <button className="btn btn-sm btn-ghost" onClick={() => location.reload()}>刷新页面</button>
@@ -81,12 +91,12 @@ export class ErrorBoundary extends Component<
 /** 「技术细节」折叠区：原文给运维复制用，默认收起 */
 export function TechDetails({ raw, summary, className }: { raw: string; summary?: string; className?: string }) {
   return (
-    <details className={clsx('w-full text-left text-[11px] text-faint', className)}>
+    <details className={clsx('w-full text-left text-2xs text-faint', className)}>
       <summary className="cursor-pointer select-none hover:text-dim">
         技术细节{summary ? <span className="ml-1.5 opacity-80">· {summary.length > 60 ? `${summary.slice(0, 60)}…` : summary}</span> : null}
       </summary>
       <div className="mt-1.5 flex items-start gap-1.5">
-        <pre className="mono max-h-40 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-[var(--bg)] p-2 text-[11px] leading-relaxed text-dim">
+        <pre className="mono max-h-40 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-[var(--bg)] p-2 text-2xs leading-relaxed text-dim">
           {raw}
         </pre>
         <CopyButton text={raw} />
@@ -242,7 +252,7 @@ export function ToastHost({ children }: { children?: ReactNode }) {
         <div className="flex w-full max-w-md flex-col gap-2">
           {hidden > 0 && (
             <button
-              className="pointer-events-auto self-center rounded-full border bg-panel px-3 py-1 text-[11px] text-dim shadow-md hover:text-fg"
+              className="pointer-events-auto self-center rounded-full border bg-panel px-3 py-1 text-2xs text-dim shadow-md hover:text-fg"
               onClick={() => setExpanded(true)}
             >
               还有 {hidden} 条 · 展开
@@ -257,7 +267,7 @@ export function ToastHost({ children }: { children?: ReactNode }) {
           </div>
           {expanded && items.length > TOAST_VISIBLE && (
             <button
-              className="pointer-events-auto self-center text-[11px] text-faint hover:text-dim"
+              className="pointer-events-auto self-center text-2xs text-faint hover:text-dim"
               onClick={() => { dismissToast(); setExpanded(false) }}
             >
               全部关闭
@@ -312,9 +322,9 @@ function ToastCard({ item }: { item: ToastItem }) {
           {item.count > 1 && <span className="ml-1.5 tabular-nums text-faint">×{item.count}</span>}
         </div>
         {item.detail && (
-          <details className="mt-1 text-[11px] text-faint">
+          <details className="mt-1 text-2xs text-faint">
             <summary className="cursor-pointer select-none hover:text-dim">详情</summary>
-            <pre className="mono mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed">
+            <pre className="mono mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all text-2xs leading-relaxed">
               {item.detail}
             </pre>
           </details>
@@ -732,7 +742,7 @@ function DialogView({ req }: { req: DialogRequest }) {
     >
       <div className="flex flex-col gap-3">
         {(opts.body || opts.consequences?.length) && (
-          <div id={bodyId} className="flex flex-col gap-2 text-[13px] leading-relaxed text-dim">
+          <div id={bodyId} className="flex flex-col gap-2 text-sm leading-relaxed text-dim">
             {opts.body && <div>{opts.body}</div>}
             {!!opts.consequences?.length && (
               <ul className="flex flex-col gap-1">
@@ -978,7 +988,7 @@ export function OfflineBanner({ className }: { className?: string }) {
     <div
       ref={ref}
       data-offline-banner=""
-      className={clsx('flex min-h-7 flex-wrap items-center gap-x-2 gap-y-0.5 border-b px-3 py-1 text-[11.5px]', className)}
+      className={clsx('flex min-h-7 flex-wrap items-center gap-x-2 gap-y-0.5 border-b px-3 py-1 text-xs', className)}
       style={{
         color: 'var(--err)',
         borderColor: 'color-mix(in srgb, var(--err) 30%, var(--border))',
@@ -1200,7 +1210,7 @@ export function Section({ title, right, children, defaultOpen = true }: {
         <button
           onClick={() => setOpen(!open)}
           aria-expanded={open}
-          className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-faint hover:text-dim"
+          className="flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-faint hover:text-dim"
         >
           <span className={clsx('transition-transform', open ? 'rotate-90' : '')} aria-hidden>›</span>
           {title}
@@ -1355,7 +1365,7 @@ export function StatusPill({ status, pendingApproval, short = false, plain = fal
   return (
     <span
       className={clsx(
-        'inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px] leading-4',
+        'inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-2xs leading-4',
         !plain && 'rounded-full px-1.5 py-px',
         className,
       )}
@@ -1464,21 +1474,29 @@ export function Field({ label, htmlFor, hint, error, required, children, classNa
         ? children({ id, 'aria-describedby': describedBy, 'aria-invalid': error ? true : undefined })
         : children}
       {error
-        ? <div id={errorId} className="mt-1 text-[11px] leading-relaxed text-[var(--err)]">{error}</div>
+        ? <div id={errorId} className="mt-1 text-2xs leading-relaxed text-[var(--err)]">{error}</div>
         : hint
-          ? <div id={hintId} className="mt-1 text-[11px] leading-relaxed text-faint">{hint}</div>
+          ? <div id={hintId} className="mt-1 text-2xs leading-relaxed text-faint">{hint}</div>
           : null}
     </div>
   )
 }
 
-/** 受控的 JSON 编辑框：输入过程中允许非法 JSON，失焦或合法时才回写。 */
-export function JsonInput({ value, onChange, rows = 5, placeholder, id }: {
+/**
+ * 受控的 JSON 编辑框：输入过程中允许非法 JSON，失焦或合法时才回写。
+ *
+ * aria-describedby / aria-invalid 照 Field 的 render-prop 原样传进来：外面（比如后端
+ * 422）说这一项有错时，框要标成出错、描红，读屏聚焦到框上就念出那句原因
+ */
+export function JsonInput({ value, onChange, rows = 5, placeholder, id, 'aria-describedby': describedBy, 'aria-invalid': invalid }: {
   value: any; onChange: (v: any) => void; rows?: number; placeholder?: string; id?: string
+  'aria-describedby'?: string; 'aria-invalid'?: boolean
 }) {
   const [text, setText] = useState(() => (value == null ? '' : JSON.stringify(value, null, 2)))
   const [bad, setBad] = useState(false)
   const touched = useRef(false)
+  const autoId = useId()
+  const badId = `${id ?? `json${autoId.replace(/[^a-zA-Z0-9_-]/g, '')}`}-json`
 
   useEffect(() => {
     if (touched.current) return
@@ -1489,12 +1507,13 @@ export function JsonInput({ value, onChange, rows = 5, placeholder, id }: {
     <div>
       <textarea
         id={id}
-        className="field mono text-[11px]"
+        className="field mono text-2xs"
         rows={rows}
         value={text}
         placeholder={placeholder}
-        aria-invalid={bad || undefined}
-        style={bad ? { borderColor: 'var(--err)' } : undefined}
+        aria-invalid={bad || invalid || undefined}
+        aria-describedby={[bad ? badId : null, describedBy].filter(Boolean).join(' ') || undefined}
+        style={bad || invalid ? { borderColor: 'var(--err)' } : undefined}
         onChange={(e) => {
           touched.current = true
           setText(e.target.value)
@@ -1508,7 +1527,7 @@ export function JsonInput({ value, onChange, rows = 5, placeholder, id }: {
         }}
         onBlur={() => { touched.current = false }}
       />
-      {bad && <div className="mt-1 text-[11px] text-[var(--err)]">JSON 格式不对，还没保存</div>}
+      {bad && <div id={badId} className="mt-1 text-2xs text-[var(--err)]">JSON 格式不对，还没保存</div>}
     </div>
   )
 }

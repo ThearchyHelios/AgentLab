@@ -279,7 +279,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           </div>
           {ahead && (
             <div className="sf-pop-note">
-              不含画布改动：{dirty ? '画布上有未保存的改动' : `画布是 v${canvasVersion}，还没发布`}，这次执行的是 v{version}。
+              不含画布改动：{dirty ? '画布上有未保存的改动' : `画布是 v${canvasVersion}，还没发布`}，这次运行的是 v{version}。
             </div>
           )}
           {fields == null && !loadError && <Skeleton rows={2} height={28} className="mb-2.5" />}

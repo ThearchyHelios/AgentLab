@@ -8,12 +8,12 @@ import clsx from 'clsx'
 import { api } from '../api/client'
 import { FlowCanvas } from '../canvas/FlowCanvas'
 import { Palette, PALETTE_SEARCH_ID } from '../canvas/Palette'
-import { InspectorSheet } from '../canvas/InspectorSheet'
+import { InspectorSheet, revealField } from '../canvas/InspectorSheet'
 import { CanvasDock, type DockTab } from '../canvas/CanvasDock'
 import { LineageLayer } from '../canvas/LineageLayer'
 import { VersionsSheet } from '../canvas/VersionsSheet'
 import { PublishDialog } from '../canvas/PublishDialog'
-import { WorkflowPicker, confirmDiscard, createWorkflow } from '../canvas/WorkflowPicker'
+import { WorkflowPicker, confirmDiscard, createWorkflow, takeDiscarded } from '../canvas/WorkflowPicker'
 import { problemsOf, type Problem } from '../canvas/issues'
 import { STUDIO_SHORTCUTS, hintOf, type StudioShortcutId } from '../canvas/shortcuts'
 import { AssistantPanel } from '../run/AssistantPanel'
@@ -85,7 +85,9 @@ export function StudioPage() {
   const [params] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
-  const { workflows, refresh } = useCatalog()
+  // 逐个取：整个 catalog 订阅下来，连接心跳、待审批轮询每跳一次整页（连同检查器里每个字段）都要重渲染
+  const workflows = useCatalog((s) => s.workflows)
+  const refresh = useCatalog((s) => s.refresh)
   const catalogLoaded = useCatalog((s) => s.loaded)
   const workflow = useStudio((s) => s.workflow)
   const dirty = useStudio((s) => s.dirty)
@@ -194,10 +196,15 @@ export function StudioPage() {
   useEffect(() => {
     if (!workflowId || workflow?.id === workflowId || !catalogLoaded) return
 
-    // 选择器里本来就有一道"未保存改动"的确认，但那道闸在它的 onClick 里，
-    // 而浏览器前进/后退会绕过选择器直接换图——改了一半的画布就这么没了。
-    // 所以这里补一道，取消就把地址退回去。选择器问过的（state.discard）不再问
+    // 换到另一张之前的确认，平时在地址跳之前就问过了：选择器自己问（state.discard），
+    // 后退、⌘K、别的页上的链接由离开守卫问（见 WorkflowPicker 的 discardGuard，问过的
+    // 那一跳 takeDiscarded 认得出来）。这里是兜底：绕过了守卫还带着没存的改动进来的，
+    // 事后问一句，取消就把地址退回去
     if (dirty && !(location.state as { discard?: boolean } | null)?.discard) {
+      if (takeDiscarded(location.pathname)) {
+        useStudio.setState({ dirty: false })
+        return
+      }
       if (asking.current === workflowId) return
       asking.current = workflowId
       void confirmDiscard().then((ok) => {
@@ -293,24 +300,30 @@ export function StudioPage() {
     if (note != null) await doSave(note)
   }, [doSave])
 
-  // 有未保存改动时拦一下关标签页／刷新。撤销栈只在这一页里，关掉就没了
-  useEffect(() => {
-    if (!dirty) return
-    const guard = (e: BeforeUnloadEvent) => {
-      e.preventDefault()
-      e.returnValue = ''
-    }
-    window.addEventListener('beforeunload', guard)
-    return () => window.removeEventListener('beforeunload', guard)
-  }, [dirty])
-
   const relayout = useCallback(async () => {
     const s = useStudio.getState()
     const { nodes, edges } = s
     if (editLockOf(s) || !nodes.length) return
+    const sent = toGraph(nodes, edges)
+    const sig = JSON.stringify(sent)
     try {
-      setGraph(await api.copilot.layout(toGraph(nodes, edges)))
-      toast.ok('已重新排版', { key: 'studio:layout', action: { label: '撤销', onClick: () => useStudio.getState().undo() } })
+      const laid = await api.copilot.layout(sent)
+      // 排的是发请求那一刻的图。回来之前画布锁了（正式运行开始、助手开始改），或者人又动过它，
+      // 就不套用：锁着时 setGraph 落不下，改过的话旧图的排版会把刚才那几下盖掉。两种都不能
+      // 照样报「已重新排版」——那条的撤销撤的是别的改动
+      const now = useStudio.getState()
+      const lock = editLockOf(now)
+      if (lock) {
+        toast.warn(EDIT_LOCK_TEXT[lock], { key: 'studio:readonly' })
+        return
+      }
+      if (JSON.stringify(toGraph(now.nodes, now.edges)) !== sig) {
+        toast.info('排版期间画布又改过了，这次排版没套用：再排一次', { key: 'studio:layout-stale' })
+        return
+      }
+      if (setGraph(laid)) {
+        toast.ok('已重新排版', { key: 'studio:layout', action: { label: '撤销', onClick: () => useStudio.getState().undo() } })
+      }
     } catch (e) {
       toast.error(e)
     }
@@ -328,25 +341,14 @@ export function StudioPage() {
   const errorCount = problems.filter((p) => p.level === 'error').length
   const warnCount = problems.length - errorCount
 
-  /** 点一条问题：选中节点、镜头对过去、检查器翻到出问题的字段 */
+  /**
+   * 点一条问题：选中节点、镜头对过去、检查器翻到出问题的字段——能落到第几项、项里的哪一栏
+   * （第 2 个成员的工具）就落到那儿。不抢焦点：F8 在问题之间跳时键盘还留在原处
+   */
   const locate = useCallback((p: Problem) => {
     setCursor(p.id)
-    if (!p.nodeId) return
-    select(p.nodeId)
-    focusNode(p.nodeId)
-    if (p.field) {
-      // 检查器是跟着 selectedId 挂上的：等它渲染出来再滚。能落到第几项、项里的哪一栏
-      // （第 2 个成员的工具）就落到那儿：成员一多，只滚到「团队成员」还得自己往下找
-      const { key, index, sub } = p.field
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        const field = document.querySelector(`[data-field="${CSS.escape(key)}"]`)
-        const item = index != null ? field?.querySelector(`[data-item="${index}"]`) : null
-        const part = sub ? item?.querySelector(`[data-sub="${CSS.escape(sub)}"]`) : null
-        const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-        ;(part ?? item ?? field)?.scrollIntoView({ block: 'center', behavior: still ? 'auto' : 'smooth' })
-      }))
-    }
-  }, [select, focusNode])
+    if (p.nodeId) revealField(p.nodeId, p.field)
+  }, [])
 
   /** F8 / ⇧F8：在落在节点上的问题之间跳。图级、边上的没有节点可对准，列在面板顶上 */
   const step = useCallback((dir: 1 | -1) => {
@@ -665,7 +667,7 @@ function AnalysisChip({ analysis, errors, warnings, open, onClick, onRetry }: {
     return (
       <button type="button" className="chip shrink-0 cursor-pointer hover:bg-hover" onClick={onRetry}
               style={{ color: 'var(--warn)', borderColor: 'var(--warn)' }}
-              title="校验和变量分析的请求没有成功，现在说不清这张图能不能跑。点一下重试">
+              title="校验和变量分析的请求没有成功，现在说不清这个工作流能不能运行。点一下重试">
         <RotateCw size={9} /> 分析失败 · 重试
       </button>
     )

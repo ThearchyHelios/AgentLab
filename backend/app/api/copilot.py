@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
 from app.db.base import get_session
@@ -43,9 +44,10 @@ async def _sources(session: AsyncSession, scope: list[str] | None) -> list[Any]:
         return rows
     picked = [r for r in rows if r.id in wanted or r.name in wanted]
     if not picked:
-        raise HTTPException(
+        raise CodedHTTPException(
             400, "限定的数据源都不在了：可能已经被删掉或停用。去掉限定再问，"
                  "或者到「数据」页确认它还在、而且是启用的",
+            DATASOURCE_SCOPE_EMPTY,
         )
     return picked
 
@@ -157,7 +159,7 @@ NODE_REFERENCE = """\
   **不要写 scope**。记忆域由平台给（当前统一是 default）。自己起一个域的后果是
   写进去再也读不回来——真发生过：一轮写进 scope"user"，下一轮没写 scope 落回
   default，于是「我叫张三」存下来了，问「我是谁」却答不上来
-- human：人工介入。config: {mode: approve|input|edit, title, message}
+- human：人工审批。config: {mode: approve|input|edit, title, message}
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
@@ -1390,7 +1392,7 @@ async def extract_template(
                  "先让它跑成功一次，再从那次运行提取",
         )
     if not run.graph.get("nodes"):
-        raise HTTPException(400, "这次运行没有保存图快照，无法提取")
+        raise HTTPException(400, "这次运行没有保存工作流快照，无法提取")
 
     events = list(
         (

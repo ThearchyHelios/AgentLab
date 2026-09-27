@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine.reflection import ObjectKind
 
+from app.core.errors import describe_exception, first_line
 from app.data.engine import engines
 
 # 一次探查最多带回多少张表。生产库动辄上千张，全拉回来既慢又没人看得完。
@@ -198,8 +199,9 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         candidates = await list_schemas(source)
         if not candidates:
             raise
+        # error 原样画在数据源卡片上、也交给 agent 看：驱动的异常类名和文档链接去掉，只留它自己的说明
         payload = {"tables": {}, "truncated": False, "total": 0,
-                   "failed": True, "error": f"{type(exc).__name__}: {exc}"}
+                   "failed": True, "error": first_line(exc) or describe_exception(exc)}
 
     payload["synced_at"] = datetime.now(timezone.utc).isoformat()
     payload["schema"] = target

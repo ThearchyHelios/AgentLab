@@ -744,9 +744,11 @@
 }
 .sf-metric-v {
   margin-top: 1px;
+  overflow: hidden;
   font-family: var(--font-mono);
   font-size: var(--text-base);
   font-weight: 600;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .sf-metric-u {
@@ -909,6 +911,7 @@
   display: flex;
   flex: none;
   flex-direction: column;
+  /* 改粗细要跟着改 RunTimeline 的 DOCK_BORDER_H：它算在坞的高度里 */
   border-top: 1px solid var(--border);
   background: var(--bg-panel);
   font-size: var(--text-2xs);
@@ -1010,7 +1013,7 @@
   flex: none;
   align-items: center;
   gap: 6px;
-  height: 34px;
+  /* 高度见 RunTimeline 的 DOCK_HEAD_H（行内写的） */
   padding: 0 8px 0 12px;
   border-bottom: 1px solid var(--hairline);
   white-space: nowrap;

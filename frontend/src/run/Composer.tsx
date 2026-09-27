@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { AlertCircle, ArrowUp, CornerDownRight, Database, Settings2, Sparkles, Square, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
-import { useCatalog, modelOptions } from '../store/catalog'
-import { useStudio } from '../store/studio'
+import { useCatalog, useDatasources, modelOptions } from '../store/catalog'
+import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { isComposing, Spinner, TechDetails, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
+import type { DataSource } from '../types'
 
 /**
  * Copilot 的输入。
@@ -30,12 +31,16 @@ export function Composer({ hero, onFocusChange }: {
   const { runCopilot, stopCopilot, retryCopilot } = useStudio()
   const providers = useCatalog((s) => s.providers)
   const tools = useCatalog((s) => s.tools)
+  // 数据源和检查器挑工具读的是 catalog 里同一份（数据页改了会 reload）。停用的助手看不见，不算
+  const { list: allSources } = useDatasources()
+  const sources = useMemo(() => allSources.filter((d) => d.enabled !== false), [allSources])
+  // 正式运行在跑已发布的版本：这时发出去 store 也会拦下，输入框先说清为什么发不了
+  const lock = useEditLock()
   const [text, setText] = useState('')
   const [opts, setOpts] = useState(false)
   const [model, setModel] = useState('')
   const [effective, setEffective] = useState('')
   const [useBase, setUseBase] = useState(true)
-  const [sources, setSources] = useState<any[]>([])
   const ref = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
@@ -43,7 +48,6 @@ export function Composer({ hero, onFocusChange }: {
       setModel(m.model ?? '')
       setEffective(m.effective_model ?? '')
     }).catch(() => undefined)
-    void api.datasources.list().then(setSources).catch(() => undefined)
   }, [])
 
   // 工具栏的 Copilot 按钮把焦点甩过来
@@ -68,7 +72,8 @@ export function Composer({ hero, onFocusChange }: {
   const send = (override?: string) => {
     const q = (override ?? text).trim()
     if (!q || copilot.active) return
-    runCopilot(q, useBase && nodes.length > 0, model || undefined)
+    // 被正式运行拦下时（store 已经弹过提示）什么都没开始：这句话留在框里，结束后直接再发
+    if (!runCopilot(q, useBase && nodes.length > 0, model || undefined)) return
     setText('')
     // 从头生成是一次性的：新图一落到画布上，下一句多半是在它上面改。停在「从头生成」
     // 的话，下一句又把刚生成的图整张换掉（撤销找得回，但人得先发现）
@@ -118,13 +123,14 @@ export function Composer({ hero, onFocusChange }: {
         value={text}
         onChange={setText}
         onSubmit={() => send()}
+        blocked={lock === 'formal' ? EDIT_LOCK_TEXT.formal : null}
         busy={copilot.active}
         onStop={stopCopilot}
         stopLabel="停止生成"
-        label="告诉助手要画什么流程"
+        label="告诉助手要画什么工作流"
         placeholder={nodes.length
-          ? '告诉它这张图要改成什么样…'
-          : '描述你想要的流程，它会直接画到左边'}
+          ? '告诉它这个工作流要改成什么样…'
+          : '描述你想要的工作流，它会直接画到左边'}
         onFocusChange={onFocusChange}
         leading={
           <>
@@ -142,15 +148,15 @@ export function Composer({ hero, onFocusChange }: {
                 点一下就翻成另一个词，看不出它是开关，更看不出另一头是什么。从头生成
                 不再二次确认：整轮是一步撤销，失败、停止、只回一句话都会把画布放回原样 */}
             {!!nodes.length && (
-              <span role="radiogroup" aria-label="生成方式" className="inline-flex rounded-md border p-px">
+              <span role="radiogroup" aria-label="生成方式" className="inline-flex shrink-0 whitespace-nowrap rounded-md border p-px">
                 {MODES.map((m) => (
                   <button key={m} type="button" {...mode(m)}
                           className={clsx('rounded px-1.5 text-2xs leading-5 transition-colors',
                             (m === 'base') === useBase ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
-                          title={m === 'base' ? '把现在这张图交给助手，在它上面改'
-                            : `不看现有的图，整张重新生成。原图可以撤销（${formatShortcut('Mod+Z')}）找回`}
+                          title={m === 'base' ? '把画布上现在的工作流交给助手，在它上面改'
+                            : `不看画布上现有的，整个重新生成。原来的可以撤销（${formatShortcut('Mod+Z')}）找回`}
                           onClick={() => setUseBase(m === 'base')}>
-                    {m === 'base' ? '在现有图上改' : '从头生成'}
+                    {m === 'base' ? '在现有工作流上改' : '从头生成'}
                   </button>
                 ))}
               </span>
@@ -199,8 +205,11 @@ export function Composer({ hero, onFocusChange }: {
           {examples.map((ex, i) => (
             <button
               key={ex}
-              className="rise-in w-full rounded-lg border bg-panel px-3 py-2 text-left text-[11.5px] leading-relaxed text-dim transition-colors hover:border-[var(--accent)] hover:text-fg"
+              // 锁着时不能用透明度表示：rise-in 的动画停在 opacity:1，会把它盖掉
+              className="rise-in w-full rounded-lg border bg-panel px-3 py-2 text-left text-[11.5px] leading-relaxed text-dim transition-colors hover:border-[var(--accent)] hover:text-fg disabled:pointer-events-none disabled:text-faint"
               style={{ '--i': i + 1 } as CSSProperties}
+              disabled={lock === 'formal'}
+              title={lock === 'formal' ? EDIT_LOCK_TEXT.formal : undefined}
               onClick={() => send(ex)}
             >
               {ex}
@@ -282,13 +291,22 @@ export function PromptBox({
         }}
       />
 
+      {blocked && (
+        // 发不出去的原因单占一行、可以折行：挤在按键旁边截成「正式运行进行中，画…」就读不到为什么、
+        // 什么时候能改；禁用的发送键上的 title 很多浏览器不显示
+        <div role="status" data-prompt-blocked="" title={blocked}
+             className={clsx('text-2xs leading-snug text-dim [overflow-wrap:anywhere]', big ? 'px-4 pb-1' : 'px-3 pb-1')}>
+          {blocked}
+        </div>
+      )}
       <div className={clsx('flex items-center gap-1', big ? 'px-3 pb-3' : 'px-2 pb-2')}>
         {leading}
         <span className="flex-1" />
-        <span className={clsx('min-w-0 truncate pr-1 text-faint', size === 'panel' ? 'text-[9.5px]' : 'text-2xs')}
-              role={blocked ? 'status' : undefined}>
-          {blocked || (value.trim() ? '⏎ 发送 · ⇧⏎ 换行' : '')}
-        </span>
+        {!blocked && (
+          <span className={clsx('min-w-0 truncate pr-1 text-faint', size === 'panel' ? 'text-[9.5px]' : 'text-2xs')}>
+            {value.trim() ? '⏎ 发送 · ⇧⏎ 换行' : ''}
+          </span>
+        )}
         {/* 两个键各带 key：同一位置的同类元素 React 会复用，停止键的红底会顺着
             transition 慢慢褪成发送键，中间那几帧像是一个粉色的发送键 */}
         {busy && onStop ? (
@@ -329,7 +347,7 @@ export function PromptBox({
  * 不只是一句标语：它要回答"我能让它干什么"。Copilot 能接到的数据源和工具
  * 数量摆在这里，用户才知道"查销售库"这种话是有意义的——否则只能猜。
  */
-function HeroHeader({ sources, toolCount }: { sources: any[]; toolCount: number }) {
+function HeroHeader({ sources, toolCount }: { sources: DataSource[]; toolCount: number }) {
   return (
     <div className="mb-4 text-center">
       <div className="breathe mx-auto mb-2.5 flex h-10 w-10 items-center justify-center rounded-2xl"
@@ -338,7 +356,7 @@ function HeroHeader({ sources, toolCount }: { sources: any[]; toolCount: number 
       </div>
       <div className="text-[13.5px] font-semibold">想让它做什么？</div>
       <div className="mt-1 text-2xs leading-relaxed text-faint">
-        说一句话，它把流程画到左边的画布上
+        说一句话，它把工作流画到左边的画布上
       </div>
       <div className="mt-2 flex items-center justify-center gap-3 text-2xs text-faint">
         <span className="flex items-center gap-1">
@@ -359,7 +377,7 @@ function HeroHeader({ sources, toolCount }: { sources: any[]; toolCount: number 
  *
  * 有数据源就用真实的库名造句：用户一眼看到的是自己的数据，而不是别人的示例。
  */
-function exampleFor(nodeCount: number, sources: any[]): string[] {
+function exampleFor(nodeCount: number, sources: DataSource[]): string[] {
   if (nodeCount) {
     return [
       '在最后加一步人工审核，通过了才输出',

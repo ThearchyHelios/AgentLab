@@ -319,7 +319,7 @@ def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
     # 入口
     entries = spec.entry_nodes()
     if not entries:
-        raise ValueError("这张图没有入口节点")
+        raise ValueError("这个工作流没有入口节点")
     for node in entries:
         builder.add_edge(START, node.id)
 

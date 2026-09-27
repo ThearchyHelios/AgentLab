@@ -5,8 +5,9 @@
 // 空 preview、节点没起过名字。构造的样本永远不会长成那样。
 // 库名表名已脱敏（改的只是标识符字面量，事件的结构和脏细节原样保留）。
 //
-// 转译借 vite dev server（它 serve 的就是应用实际运行的那份），所以跑之前
-// 前端得起着：./scripts/dev.sh
+// 转译借 vite dev server（它 serve 的就是应用实际运行的那份）。
+// 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
+// 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-decode.mjs
 import { readFileSync } from 'node:fs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -48,11 +49,24 @@ const check = (name, cond, detail = '') => {
   console.log(`  ${cond ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`)
   if (!cond) failed++
 }
+
+/**
+ * 一节一节地跑：某一节里抛了异常，只记成这一节失败，接着跑下一节，
+ * 不让一处卡住把后面的检查一起吞掉。这里是纯函数的检查：
+ * 某种事件让翻译层直接抛了异常，也只算这一节
+ */
+async function section(name, fn) {
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  }
+}
 const flatten = (steps) =>
   steps.flatMap((s) => [s, ...(s.children ? flatten(s.children) : [])])
 
-console.log('=== 数据库查询 ===')
-{
+await section('数据库查询', async () => {
   const steps = mod.decodeRun(fixtures.db)
   const all = flatten(steps)
   const q = all.find((s) => s.kind === 'query')
@@ -66,10 +80,9 @@ console.log('=== 数据库查询 ===')
   check('查询结果和 SQL 分开存，不互相覆盖', !!q?.result && q.result !== q.detail)
   check('工具调用挂在节点下，不是平铺',
     steps.some((s) => s.kind === 'node' && s.children?.some((c) => c.kind === 'query')))
-}
+})
 
-console.log('\n=== 知识检索 ===')
-{
+await section('知识检索', async () => {
   // 以前检索只发一条 info 日志，轨迹里查不到"这句结论依据的是哪一段"。
   // 现在它是一条正经事件，而且带工件 id 可以下钻。
   const ev = (data) => [{ seq: 1, type: 'retrieve.end', node_id: 'kb', data }]
@@ -97,10 +110,9 @@ console.log('\n=== 知识检索 ===')
   check('未知事件不被静默吞掉', unknown.some((x) => x.detail?.startsWith('事件类型：brand.new')),
     unknown.map((x) => x.title).join(','))
   check('未知事件的类型名不上标题和副标题', !unknown.some((x) => x.title.includes('brand.new') || x.sub?.includes('brand.new')))
-}
+})
 
-console.log('\n=== 长期记忆 ===')
-{
+await section('长期记忆', async () => {
   // 写记忆以前只发 info 日志，而 info 在这一层是被丢弃的——系统往长期记忆里
   // 存东西，界面上一点痕迹都没有。Copilot 会主动记之后，这条不可接受。
   const ev = (data) => [{ seq: 1, type: 'memory.end', node_id: 'mem', data }]
@@ -121,10 +133,9 @@ console.log('\n=== 长期记忆 ===')
 
   const c = flatten(mod.decodeRun(ev({ action: 'clear', scope: 'default', count: 7 })))[0]
   check('清空是破坏性的，标成警告', c?.level === 'warn' && c.title.includes('7'))
-}
+})
 
-console.log('\n=== 被截断的结果集 ===')
-{
+await section('被截断的结果集', async () => {
   // 后端按字符数硬切预览，切点落在 JSON 中间是常态。严格 JSON.parse 一律失败，
   // 于是最典型的一次取数运行，成果会变成满屏 \"attribute01\"。这几条守的就是它。
   const fin = fixtures.db.find((e) => e.type === 'run.finished')
@@ -146,35 +157,33 @@ console.log('\n=== 被截断的结果集 ===')
   check('完整结果集不标截断', w?.rows.length === 2 && !w.clipped)
   check('普通文本不会被硬认成表格', mod.parseQueryResult('查到 3 条记录') === null)
   check('空串不报错', mod.parseQueryResult('') === null)
-}
+})
 
-console.log('\n=== 人工审批（含重放）===')
-{
+await section('人工审批（含重放）', async () => {
   const steps = mod.decodeRun(fixtures.human)
   const all = flatten(steps)
   // 一次审批会产生 human.requested ×2（重放）+ run.interrupted，界面上只该有一条
   check('"等你确认"只出现一次',
     all.filter((s) => s.kind === 'human' && s.title.includes('确认')).length === 1,
     `${all.filter((s) => s.kind === 'human' && s.title.includes('确认')).length} 条`)
-  check('"继续执行"只出现一次',
-    steps.filter((s) => s.title === '继续执行').length === 1,
-    `${steps.filter((s) => s.title === '继续执行').length} 条`)
+  check('"继续运行"只出现一次',
+    steps.filter((s) => s.title === '继续运行').length === 1,
+    `${steps.filter((s) => s.title === '继续运行').length} 条`)
   // 节点重放不该让同一个节点在时间线上出现两遍
   const nodeIds = steps.filter((s) => s.kind === 'node').map((s) => s.nodeId)
   check('节点不因重放而重复', new Set(nodeIds).size === nodeIds.length,
     nodeIds.join(','))
   check('审批结果有交代', all.some((s) => s.title.includes('放行') || s.title.includes('驳回')))
-  // 恢复过的运行有"开始执行"+"继续执行"两条生命周期。只收第一条的话，
-  // "继续执行"会永远转圈——明明整条已经跑完了
+  // 恢复过的运行有"开始运行"+"继续运行"两条生命周期。只收第一条的话，
+  // "继续运行"会永远转圈——明明整条已经跑完了
   check('恢复过的运行不会留下转圈的行',
     !all.some((s) => s.status === 'running'),
     all.filter((s) => s.status === 'running').map((s) => s.title).join(','))
   check('处理完的审批不再是待办色',
     !all.some((s) => s.status === 'done' && s.level === 'warn'))
-}
+})
 
-console.log('\n=== 停在审批时的状态 ===')
-{
+await section('停在审批时的状态', async () => {
   // 只喂到中断为止，模拟"运行正卡在人工介入上"这一刻
   const upto = fixtures.human.slice(0, fixtures.human.findIndex((e) => e.type === 'run.interrupted') + 1)
   const all = flatten(mod.decodeRun(upto))
@@ -198,10 +207,9 @@ console.log('\n=== 停在审批时的状态 ===')
   check('跑完了就不再说在等人', mod.isAwaitingHuman(after) === false)
   check('压根没有人工节点的运行也不误报',
     mod.isAwaitingHuman(mod.decodeRun(fixtures.db)) === false)
-}
+})
 
-console.log('\n=== 循环里的多轮审批 ===')
-{
+await section('循环里的多轮审批', async () => {
   // 真实运行：驳回 → 改写 → 再驳回（带备注）→ 改写 → 放行。三轮，每轮都有
   // 重放。按内容去重必然出错——三轮的 title 一模一样，和重放无法区分。
   // 这条只有拿真实运行才测得出来：构造样本不会长成这样。
@@ -234,10 +242,9 @@ console.log('\n=== 循环里的多轮审批 ===')
     return new Set(ids).size === ids.length
   })())
   check('跑完了没有还在转的行', !all.some((s) => s.status === 'running'))
-}
+})
 
-console.log('\n=== 多 agent 协作 ===')
-{
+await section('多 agent 协作', async () => {
   // 真实运行 #6038f5：supervisor 派给 researcher 一次就 FINISH 了。
   // 界面上那个多智能体节点跑完 31.7s 之后，researcher 那行还在转圈。
   const steps = mod.decodeRun(fixtures.supervisor)
@@ -266,17 +273,15 @@ console.log('\n=== 多 agent 协作 ===')
   check('warn 日志照常显示', all.some((s) => s.title.includes('校验失败')))
   check('整条流跑完没有转圈的行', !all.some((s) => s.status === 'running'),
     all.filter((s) => s.status === 'running').map((s) => s.title.slice(0, 24)).join(','))
-}
+})
 
-console.log('\n=== 出具判定 ===')
-{
+await section('出具判定', async () => {
   const steps = mod.decodeRun(fixtures.issue)
   check('出具档位翻译成中文', steps.some((s) => s.kind === 'issuance' && s.title.includes('出具')),
     steps.find((s) => s.kind === 'issuance')?.title)
-}
+})
 
-console.log('\n=== 失败运行 ===')
-{
+await section('失败运行', async () => {
   const steps = mod.decodeRun(fixtures.failed)
   const all = flatten(steps)
   const errs = all.filter((s) => s.level === 'error')
@@ -285,10 +290,9 @@ console.log('\n=== 失败运行 ===')
     `${errs.length} 条错误`)
   check('开头那条不会一直转圈',
     !steps.some((s) => s.kind === 'lifecycle' && s.status === 'running'))
-}
+})
 
-console.log('\n=== 并行分支 ===')
-{
+await section('并行分支', async () => {
   // 图上一个节点连出多条边就是 fan-out，LangGraph 在同一个 superstep 里并发
   // 执行——这是真并发。但在时间线上它们原来只是穿插出现的几行，
   // "这三路是同时跑的、因此省下了 3.6 秒"一个字都没说。
@@ -303,10 +307,9 @@ console.log('\n=== 并行分支 ===')
     const seq = mod.decodeRun(fixtures[name])
     check(`顺序执行的 ${name} 没有被误判`, !seq.some((s) => /路并行/.test(s.title)))
   }
-}
+})
 
-console.log('\n=== 通用规则 ===')
-{
+await section('通用规则', async () => {
   const all = Object.values(fixtures).flatMap((evts) => flatten(mod.decodeRun(evts)))
   check('没有裸节点 id 当标题',
     !all.some((s) => s.kind === 'node' && /^(in|out|h|m|t\d|n\d)$/.test(s.title)),
@@ -325,10 +328,9 @@ console.log('\n=== 通用规则 ===')
   check('不显示 0 ms 这种没信息量的耗时', !metas.some((m) => /(^|[^\d.])0 ms/.test(m)),
     all.filter((s) => /(^|[^\d.])0 ms/.test(s.meta ?? '')).map((s) => s.title).join(','))
   check('没有空 meta 占位', !all.some((s) => s.meta === ''))
-}
+})
 
-console.log('\n=== Copilot 操作流 ===')
-{
+await section('Copilot 操作流', async () => {
   const ops = [
     { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
     { op: 'heartbeat', phase: 'planning', elapsed_ms: 6000 },
@@ -392,7 +394,7 @@ console.log('\n=== Copilot 操作流 ===')
     { op: 'final', graph: { nodes: [{ id: 'a' }, { id: 'b' }] } },
   ])
   check('从零新建时不啰嗦，只说共几步',
-    built[built.length - 1].title === '流程搭好了，共 2 步',
+    built[built.length - 1].title === '工作流搭好了，共 2 步',
     built[built.length - 1].title)
 
   // 自查：服务端用运行时同一套规则过一遍，有问题交回模型改。多出来的这段得看得见，
@@ -412,7 +414,7 @@ console.log('\n=== Copilot 操作流 ===')
   check('交回去改的是哪条要看得到',
     checked.some((s) => (s.detail ?? '').includes('循环条件写错了')))
   check('改好了要说', titles.includes('自查通过：问题已经改好'), titles.join(' | '))
-  check('自查插在后面也不挤掉"共几步"', titles.includes('流程搭好了，共 2 步'), titles.join(' | '))
+  check('自查插在后面也不挤掉"共几步"', titles.includes('工作流搭好了，共 2 步'), titles.join(' | '))
   check('自查结束后没有还在转的行', !checked.some((s) => s.status === 'running'),
     checked.filter((s) => s.status === 'running').map((s) => s.title).join(','))
 
@@ -431,10 +433,9 @@ console.log('\n=== Copilot 操作流 ===')
   ], { context: 'canvas' }).find((s) => s.kind === 'error')
   check('画布语境说「没能自动修好」', !!onCanvas?.title.includes('没能自动修好')
     && !onCanvas.title.includes('自动运行'), onCanvas?.title)
-}
+})
 
-console.log('\n=== 协作团队：调度者的决策（新后端的 agent.route.*）===')
-{
+await section('协作团队：调度者的决策（新后端的 agent.route.*）', async () => {
   // 以前没有映射，每一轮多出两行标题是「agent.route.start」「agent.route.end」的原始类型名
   const done = mod.decodeRun(synthetic.teamRun('done'))
   const all = flatten(done)
@@ -478,10 +479,9 @@ console.log('\n=== 协作团队：调度者的决策（新后端的 agent.route.
   check('终态用后端累计的总数', total.final && total.tokensIn === 4470 && total.tokensOut === 946,
     `${total.tokensIn}/${total.tokensOut}`)
   check('终态带着执行时长', total.activeMs === 12300, `${total.activeMs}`)
-}
+})
 
-console.log('\n=== 被跳过的节点、思考、查询标题、技术细节、签批人、出具缺口 ===')
-{
+await section('被跳过的节点、思考、查询标题、技术细节、签批人、出具缺口', async () => {
   const steps = mod.decodeRun(synthetic.mixedRun())
   const all = flatten(steps)
   const skipped = steps.find((s) => s.nodeId === 'kb')
@@ -513,7 +513,7 @@ console.log('\n=== 被跳过的节点、思考、查询标题、技术细节、�
   const human = all.find((s) => s.kind === 'human')
   check('签批人照事件写', !!human?.title.endsWith('→ 张工 放行了'), human?.title)
   check('备注跟着那一轮', !!human?.detail?.includes('备注：晚班偏低要跟进'))
-  const resume = steps.find((s) => s.title === '继续执行')
+  const resume = steps.find((s) => s.title === '继续运行')
   check('续跑是谁发起的写在副标题', !!resume?.sub?.includes('张工'), resume?.sub)
 
   const issuance = steps.find((s) => s.kind === 'issuance')
@@ -543,10 +543,9 @@ console.log('\n=== 被跳过的节点、思考、查询标题、技术细节、�
 
   const p = mod.progressOf(steps)
   check('进度按不同节点数算', p.total === 6 && p.done >= 4 && p.done <= 6, `${p.done}/${p.total}`)
-}
+})
 
-console.log('\n=== 停下来的运行 ===')
-{
+await section('停下来的运行', async () => {
   // 用户主动停止：还在跑的查询收成中性的「已取消」，不画红色的失败，也不再转圈
   const all = flatten(mod.decodeRun(synthetic.cancelledRun()))
   const q = all.find((s) => s.kind === 'query')
@@ -563,10 +562,9 @@ console.log('\n=== 停下来的运行 ===')
     ended.filter((s) => s.status === 'running').map((s) => s.title).join(','))
   check('stream.end 本身不成行', !ended.some((s) => s.title.includes('stream') || s.title === '一条还没翻译的记录'))
   check('挂起的步骤标成 suspended', ended.some((s) => s.status === 'suspended'))
-}
+})
 
-console.log('\n=== 长运行：按轮折叠（runs-5）===')
-{
+await section('长运行：按轮折叠（runs-5）', async () => {
   const ev = synthetic.longLoop(145)
   const steps = mod.decodeRun(ev)
   // 1100 多条事件、145 拍：顶层仍然只有「开始、参数、循环、读传感器、成果、完成」这几行
@@ -611,10 +609,9 @@ console.log('\n=== 长运行：按轮折叠（runs-5）===')
   ]).find((s) => s.nodeId === 'x')
   check('接着跑的重放不算新一轮', replay?.execs?.length === 1 && replay.status === 'done' && !replay.level,
     `${replay?.execs?.length} ${replay?.status} ${replay?.level}`)
-}
+})
 
-console.log('\n=== 从 SQL 认表名 ===')
-{
+await section('从 SQL 认表名', async () => {
   const g = mod.describeSql
   check('JOIN 的两张表都认出来', g('SELECT a.x FROM orders a JOIN users u ON a.uid = u.id')?.tables.join(',') === 'orders,users')
   check('WITH 里的临时名不算表', g('WITH t AS (SELECT * FROM sales) SELECT * FROM t')?.tables.join(',') === 'sales')
@@ -622,10 +619,9 @@ console.log('\n=== 从 SQL 认表名 ===')
   check('聚合认得出', g('SELECT COUNT(*) FROM s')?.aggregate === true)
   check('函数包着的分组列取里面的列名', g('SELECT DATE(ts), COUNT(*) FROM s GROUP BY DATE(ts)')?.groupBy[0] === 'ts')
   check('不是查询就不硬认', g('这不是 SQL') === null)
-}
+})
 
-console.log('\n=== Copilot：心跳穿插、回话、少了一步、报错 ===')
-{
+await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,
     steps.filter((s) => s.kind === 'think').map((s) => s.title).join(' | '))
@@ -660,10 +656,9 @@ console.log('\n=== Copilot：心跳穿插、回话、少了一步、报错 ===')
     `${row?.title} / ${row?.sub} / ${row?.raw}`)
   const eo = mod.copilotOutcome([{ op: 'error', message: 'm', hint: 'h', detail: 'd' }])
   check('结局里的报错分开带着 hint 和 detail', eo.kind === 'error' && eo.error?.hint === 'h' && eo.error?.raw === 'd')
-}
+})
 
-console.log('\n=== 协作团队用完轮数：最后那次判定不是新的一轮（REQ-3A-3、NI-5）===')
-{
+await section('协作团队用完轮数：最后那次判定不是新的一轮（REQ-3A-3、NI-5）', async () => {
   const team = (evts) => mod.decodeRun(evts).find((s) => s.nodeId === 'team')
   const routes = (evts) => flatten(mod.decodeRun(evts)).filter((s) => s.kind === 'branch' && s.nodeId === 'team')
 
@@ -746,10 +741,9 @@ console.log('\n=== 协作团队用完轮数：最后那次判定不是新的一�
   const vagueNode = vague.find((s) => s.kind === 'node' && s.nodeId === 'team')
   check('认不出轮数时不写「?」', !vagueNote?.title.includes('?') && !vagueNode?.sub?.includes('?')
     && !!vagueNote?.title.includes('用完了轮数'), `${vagueNote?.title} / ${vagueNode?.sub}`)
-}
+})
 
-console.log('\n=== 模型把工具调用写成了文字（NI-4）===')
-{
+await section('模型把工具调用写成了文字（NI-4）', async () => {
   const all = flatten(mod.decodeRun(synthetic.markupRun()))
   const warn = all.find((s) => s.code === 'tool_markup_leak')
   check('提醒行说人话，不贴原始标记', warn?.title === '模型把工具调用写成了文字，没有真正执行'
@@ -771,10 +765,9 @@ console.log('\n=== 模型把工具调用写成了文字（NI-4）===')
   check('收尾轮还想查：说步数用完，不说没有真正执行', !!settle?.title.includes('步数用完') && !settle.title.includes('没有真正执行'),
     settle?.title)
   check('收尾轮还想查：下一步是调大最多步数', !!settle?.next?.includes('最多步数'), settle?.next)
-}
+})
 
-console.log('\n=== 校验修复想凑数（NI-3）===')
-{
+await section('校验修复想凑数（NI-3）', async () => {
   const all = flatten(mod.decodeRun(synthetic.repairRun()))
   const repairs = all.filter((s) => s.code === 'repair')
   check('每次修复是一行模型调用', repairs.length === 2 && repairs.every((s) => s.kind === 'llm' && s.title === '让模型修复格式'),
@@ -790,36 +783,32 @@ console.log('\n=== 校验修复想凑数（NI-3）===')
   const legacy = flatten(mod.decodeRun(synthetic.repairRun().filter((e) => e.type !== 'llm.end')))
   const orphan = legacy.find((s) => s.code === 'repair_invented')
   check('没有修复行可折时单独成一行说人话', !!orphan?.title.includes('修复被作废') && orphan.level === 'warn', orphan?.title)
-}
+})
 
-console.log('\n=== 工具时限（timeout_s / timed_out）===')
-{
+await section('工具时限（timeout_s / timed_out）', async () => {
   const live = flatten(mod.decodeRun(synthetic.timeoutRun('live'))).find((s) => s.kind === 'query')
   check('进行中的查询带着时限', live?.limitS === 30 && live.status === 'running', `${live?.limitS} ${live?.status}`)
   const done = flatten(mod.decodeRun(synthetic.timeoutRun('done'))).find((s) => s.kind === 'query')
   check('超时的查询是失败', done?.status === 'failed' && done.level === 'error', done?.status)
   check('超时的查询说清超了多少上限、已放弃等待', done?.sub === '超过 30 s 上限，已放弃等待', done?.sub)
   check('超时的原话留在结果里', !!done?.result?.includes('缩小范围'))
-}
+})
 
-console.log('\n=== 放弃等审批的运行 ===')
-{
+await section('放弃等审批的运行', async () => {
   const steps = mod.decodeRun(synthetic.abandonedRun())
   const row = steps.find((s) => s.kind === 'lifecycle' && s.status === 'cancelled')
   check('取消那一行说清谁放弃的、一并关了什么', !!row?.sub?.includes('张工') && row.sub.includes('1 条待审批一并关闭'), row?.sub)
   check('放弃之后审批不再是待办', !flatten(steps).some((s) => s.status === 'waiting' || s.status === 'running'))
   const plain = mod.decodeRun(synthetic.cancelledRun()).find((s) => s.kind === 'lifecycle' && s.status === 'cancelled')
   check('老数据的取消行不硬编副标题', plain && !plain.sub, plain?.sub)
-}
+})
 
-console.log('\n=== 出具那一行记着档位 ===')
-{
+await section('出具那一行记着档位', async () => {
   const is = mod.decodeRun(synthetic.mixedRun()).find((s) => s.kind === 'issuance')
   check('出具步骤带 tier，头部能据此提醒', is?.tier === 'degraded', is?.tier)
-}
+})
 
-console.log('\n=== Copilot 改图：工具绑定变化（NI-1）===')
-{
+await section('Copilot 改图：工具绑定变化（NI-1）', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_TOOLS_DROPPED, { context: 'chat' })
   const change = steps.find((s) => s.code === 'tool_changes')
   check('工具绑定变化单独成一行', !!change, steps.map((s) => s.title).join(' | '))
@@ -834,14 +823,116 @@ console.log('\n=== Copilot 改图：工具绑定变化（NI-1）===')
   check('结局里带着「工具被去掉」的警告', out.dropped?.length === 1, JSON.stringify(out.dropped))
   const plain = mod.copilotOutcome(synthetic.COPILOT_STUCK)
   check('没有变化时两样都是空的', !plain.toolChanges?.length && !plain.dropped?.length)
-}
+})
 
-console.log('\n=== 术语 ===')
-{
+await section('协作团队执行了不止一次：结局和泳道按这一次算（3C REQ-2/3）', async () => {
+  // 画布卡片和右栏泳道都读 reduceTeam 的结果：store 对每个事件都调它，没有别的清理
+  const feed = (evts) => {
+    let t
+    const seen = []
+    for (const e of evts) {
+      const next = mod.reduceTeam(t, e)
+      if (next && e.node_id === 'team') { t = next; seen.push([e, t]) }
+    }
+    return { team: t, seen }
+  }
+
+  // 用完轮数判失败 → 调大轮数接着跑（后端也标 resumed:true）→ 成功
+  const rerun = feed(synthetic.rerunTeam('rerun'))
+  check('接着跑成功后：结局不再是上一次的「用完 2 轮仍未完成」', !rerun.team?.verdict?.outcome
+    && !rerun.team?.verdict?.never, JSON.stringify(rerun.team?.verdict))
+  check('接着跑成功后：团队收尾了', rerun.team?.finished === true)
+  check('接着跑成功后：泳道只剩这一次的 1 轮', rerun.team?.rounds.length === 1
+    && rerun.team.rounds[0].members.length === 1 && rerun.team.rounds[0].members[0].result === '查到 128 单',
+    JSON.stringify(rerun.team?.rounds.map((r) => r.members.map((m) => m.result))))
+  const atFailure = rerun.seen.find(([e]) => e.type === 'node.failed')?.[1]
+  check('判失败的那一刻结局照常是 failed', atFailure?.verdict?.outcome === 'failed', JSON.stringify(atFailure?.verdict))
+  const rerunNode = mod.decodeRun(synthetic.rerunTeam('rerun')).find((s) => s.nodeId === 'team')
+  check('右栏泳道：接着跑成功后不画「用完 N 轮」的结局', !rerunNode?.team?.verdict?.outcome,
+    JSON.stringify(rerunNode?.team?.verdict))
+
+  // 循环里的团队：第 1 轮降档、第 2 轮正常
+  const loop = feed(synthetic.rerunTeam('loop'))
+  check('循环第 2 轮正常收尾：结局不再是上一轮的 degraded', !loop.team?.verdict?.outcome,
+    JSON.stringify(loop.team?.verdict))
+  check('循环第 2 轮：round 从 0 数，不并进上一轮同号的那一列', loop.team?.rounds.length === 1
+    && loop.team.rounds[0].members.length === 1 && loop.team.rounds[0].members[0].result === '第 2 周的原话',
+    JSON.stringify(loop.team?.rounds.map((r) => r.members.map((m) => m.result))))
+  const degradedAt = loop.seen.find(([e]) => e.type === 'node.finished')?.[1]
+  // 产出里不带轮数（后端只给 exhausted / exhausted_reason / never_dispatched）：从日志原话里认
+  check('降档那一刻：轮数从日志原话里认出来', degradedAt?.verdict?.outcome === 'degraded'
+    && degradedAt.verdict.rounds === 2, JSON.stringify(degradedAt?.verdict))
+  const loopEvents = synthetic.rerunTeam('loop')
+  const firstEnd = loopEvents.findIndex((e) => e.type === 'node.finished' && e.node_id === 'team')
+  const midNode = flatten(mod.decodeRun(loopEvents.slice(0, firstEnd + 1))).find((s) => s.kind === 'node' && s.nodeId === 'team')
+  check('降档的节点行写「用完 2 轮」，不写「用完 ? 轮」', midNode?.sub === '用完 2 轮仍未完成，按降档交付'
+    && midNode.level === 'warn', `${midNode?.sub} / ${midNode?.level}`)
+  const loopNode = flatten(mod.decodeRun(loopEvents)).find((s) => s.kind === 'node' && s.nodeId === 'team')
+  check('循环第 2 轮正常收尾：节点行不再挂着上一轮的降档说明', loopNode?.execs?.length === 2
+    && !loopNode.sub && !loopNode.level, `${loopNode?.execs?.length} / ${loopNode?.sub} / ${loopNode?.level}`)
+
+  // 日志也没有轮数时，退到这一次实际派过几轮
+  const noLog = feed([
+    { seq: 1, type: 'node.started', node_id: 'team', ts: 1, data: { node_type: 'supervisor' } },
+    { seq: 2, type: 'agent.route.end', node_id: 'team', ts: 2, data: { round: 0, agents: ['分析员'], parallel: 1, done: false, reason: '看看' } },
+    { seq: 3, type: 'agent.step.start', node_id: 'team', ts: 3, data: { agent: '分析员', round: 0 } },
+    { seq: 4, type: 'agent.step.end', node_id: 'team', ts: 4, data: { agent: '分析员', round: 0, duration_ms: 5 } },
+    { seq: 5, type: 'agent.step.start', node_id: 'team', ts: 5, data: { agent: '分析员', round: 1 } },
+    { seq: 6, type: 'agent.step.end', node_id: 'team', ts: 6, data: { agent: '分析员', round: 1, duration_ms: 5 } },
+    { seq: 7, type: 'node.finished', node_id: 'team', ts: 7, data: { duration_ms: 20, preview: { exhausted: true, exhausted_reason: '没做完' } } },
+  ])
+  check('日志也没说几轮：用派过的轮数', noLog.team?.verdict?.rounds === 2, JSON.stringify(noLog.team?.verdict))
+
+  // 等过审批之后的重放是同一次执行：泳道不清空
+  const approval = feed(synthetic.rerunTeam('approval'))
+  check('审批放行后的重放不算新的一次：第 1 轮的成员还在', approval.team?.rounds.length === 1
+    && approval.team.rounds[0].members[0]?.result === '改好了' && approval.team.finished === true,
+    JSON.stringify(approval.team?.rounds))
+  check('审批收尾后不再挂着「等重放」的记号', !approval.team?.paused, JSON.stringify(approval.team))
+})
+
+await section('Copilot 自查问题：对象形状、节点名、超出限定范围（3C REQ-6）', async () => {
+  const steps = mod.decodeCopilot(synthetic.COPILOT_OBJECT_ISSUES, { context: 'chat' })
+  const repairing = steps.find((s) => s.title.startsWith('自查发现'))
+  check('对象形状：交回去改的那一行写节点名，不写「lp」', !!repairing?.detail?.startsWith('「逐周循环」循环条件写错了')
+    && !repairing.detail.includes('「lp」'), repairing?.detail)
+  const failed = steps.find((s) => s.kind === 'error')
+  check('对象形状：没修好的问题也写节点名', !!failed?.detail?.includes('「订单查询」用了限定范围之外的数据源'), failed?.detail)
+  check('认不出名字的节点退到 id', !!failed?.detail?.includes('「gone」'), failed?.detail)
+  check('超出限定范围：单独给一句下一步', failed?.code === 'datasource_out_of_scope' && !!failed.next?.includes('限定'),
+    `${failed?.code} / ${failed?.next}`)
+  const canvasNames = mod.decodeCopilot(synthetic.COPILOT_OBJECT_ISSUES, { context: 'canvas', labelOf: (id) => ({ old: '旧的汇总', gone: '质量门' })[id] })
+  check('画布给了节点名：操作流里没出现过的也写名字', !!canvasNames.find((s) => s.kind === 'error')?.detail?.includes('「质量门」'),
+    canvasNames.find((s) => s.kind === 'error')?.detail)
+  check('「去掉了」那一行也写名字', canvasNames.some((s) => s.title === '去掉了「旧的汇总」'),
+    canvasNames.filter((s) => s.title.startsWith('去掉了')).map((s) => s.title).join(','))
+  // 只改配置的 update_node 常常不带 label：「调整了」那一行也向画布要名字，不写「调整了「lp」」（3C REQ-27）
+  const bare = mod.decodeCopilot([{ op: 'update_node', id: 'lp', config: { max_iterations: 4 } }],
+    { context: 'canvas', labelOf: (id) => ({ lp: '逐周循环' })[id] })
+  check('不带 label 的 update_node：写画布上的节点名', bare.some((s) => s.title === '调整了「逐周循环」'),
+    bare.map((s) => s.title).join(','))
+  const bareNoName = mod.decodeCopilot([{ op: 'update_node', id: 'lp', config: {} }], { context: 'canvas' })
+  check('画布上也认不出：退到 id', bareNoName.some((s) => s.title === '调整了「lp」'), bareNoName.map((s) => s.title).join(','))
+
+  const out = mod.copilotOutcome(synthetic.COPILOT_OBJECT_ISSUES)
+  const scoped = out.check?.issues[0]
+  check('结局里的问题留着 field 和 code', scoped?.nodeId === 'ask' && scoped.field === 'tools'
+    && scoped.code === 'datasource_out_of_scope' && scoped.label === '订单查询', JSON.stringify(scoped))
+  check('field 为 null 的不带 field', out.check?.issues[1] && !('field' in out.check.issues[1]), JSON.stringify(out.check?.issues[1]))
+  check('issueLine 用名字', mod.issueLine(scoped) === '「订单查询」用了限定范围之外的数据源 sales_daily：这一轮只查 orders',
+    mod.issueLine(scoped))
+  // 老会话里存的还是字符串：照旧认出节点 id
+  const legacy = mod.copilotOutcome(synthetic.COPILOT_STUCK)
+  check('字符串形状照旧：节点 id 从开头的「」里认', legacy.check?.issues[0]?.nodeId === 'lp'
+    && legacy.check.issues[0].label === '逐日循环' && !legacy.check.issues[0].field,
+    JSON.stringify(legacy.check?.issues[0]))
+})
+
+await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])
   check('人工节点叫「人工审批」', h[0]?.title === '人工审批', h[0]?.title)
-}
+})
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

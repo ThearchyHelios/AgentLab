@@ -2,10 +2,9 @@ import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 
 import { Check, Copy, MoreHorizontal, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget, toast, useTicker } from '../../components/ui'
-import { formatClock, parseServerTime } from '../../lib/format'
+import { formatClock, formatSpan, parseServerTime } from '../../lib/format'
 import { ISSUANCE_LABEL, runClassLabel } from '../../lib/terms'
 import { useRunClock } from '../../run/useRunClock'
-import { formatSpan } from './model'
 
 // -------------------------------------------------------------------------
 // 页签

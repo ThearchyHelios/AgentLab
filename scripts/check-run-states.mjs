@@ -18,7 +18,9 @@
 //   一次都没被派到的成员，收尾判定不另算一轮；模型把工具调用写成文字的失败写原因，
 //   不是半句原话；工具超出后端声明的时限直说「已超出 Ns 上限」；校验靠修复才过要提一句
 //
-// 用法：AGENTLAB_WEB=http://localhost:5373 AGENTLAB_API=http://localhost:8100/api node scripts/check-run-states.mjs
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
+// 沙箱拷贝）跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-run-states.mjs
 // 截图落在 RUN_STATES_SHOTS（默认 /tmp/agentlab-run-states）。
 import { mkdirSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
@@ -34,6 +36,22 @@ mkdirSync(SHOTS, { recursive: true })
 // 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, reduced, exits），调样式时省时间
 const ONLY = (process.env.RUN_STATES_ONLY ?? '').split(',').filter(Boolean)
 const want = (part) => !ONLY.length || ONLY.includes(part)
+/**
+ * 一段一段地跑：某一段里等待超时、元素找不到，只记成这一段失败，关掉它开的浏览器，
+ * 接着跑下一段——不让一处卡住把后面几百项一起吞掉。段标题在各段自己里面打
+ */
+const opened = new Set()
+async function section(part, fn) {
+  if (!want(part)) return
+  try {
+    await fn()
+  } catch (e) {
+    check(`「${part}」这一段中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  } finally {
+    for (const b of opened) await b.close().catch(() => {})
+    opened.clear()
+  }
+}
 
 let failed = 0
 const check = (name, cond, detail = '') => {
@@ -240,6 +258,7 @@ const lost = async (page) => {
 
 async function open({ theme = 'dark', reduced = false, workflow = WORKFLOW } = {}) {
   const browser = await chromium.launch({ executablePath: CHROME })
+  opened.add(browser)
   const ctx = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     deviceScaleFactor: DSF,
@@ -325,6 +344,25 @@ async function park(page) {
   await page.mouse.move(pane.x + pane.width / 2, pane.y + 24)
 }
 
+/**
+ * 精简档的主读数。它只在 compact 档露出来，别的档是 visibility:hidden——innerText 这时取到
+ * 空串。LOD 切换、换数据后的重画都可能晚一拍：等它露出来、有字（给了 ready 就等 ready 成立），
+ * 最多 3 秒，到点就按当时读到的算（真回归照样判错，只是不再因为早读了一拍取到空文本）
+ */
+async function lodRead(page, id, ready = (t) => t !== '') {
+  const sel = `.react-flow__node[data-id="${id}"] .nc-lod-read`
+  const read = () => page.evaluate((q) => {
+    const el = document.querySelector(q)
+    return el && getComputedStyle(el).visibility === 'visible' ? el.innerText.trim() : ''
+  }, sel)
+  const end = Date.now() + 3000
+  for (;;) {
+    const text = await read().catch(() => '')
+    if (ready(text) || Date.now() > end) return text
+    await page.waitForTimeout(80)
+  }
+}
+
 async function feed(page, events, extra = {}) {
   await page.evaluate(({ events, runId, extra }) => {
     const st = window.__studio
@@ -406,7 +444,7 @@ const SCENARIOS = [
 const shapesByState = {}
 const shots = []
 
-for (const theme of want('themes') ? ['dark', 'light'] : []) {
+for (const theme of want('themes') ? ['dark', 'light'] : []) await section('themes', async () => {
   console.log(`\n=== ${theme === 'dark' ? '暗色' : '亮色'}主题 ===`)
   const { browser, page, errors } = await open({ theme })
 
@@ -589,7 +627,7 @@ for (const theme of want('themes') ? ['dark', 'light'] : []) {
         const vis = await page.evaluate(() => getComputedStyle(document.querySelector('.nc-lod')).visibility)
         check(`${sc.key}/compact: 精简卡替身可见`, vis === 'visible')
         if (sc.key === 'live') {
-          const brief = await page.locator('.react-flow__node[data-id="team"] .nc-lod-read').innerText()
+          const brief = await lodRead(page, 'team')
           check('live/compact: 协作矩阵收成一行摘要（读数在前）', /^\d\/\d 在跑 · 第 1 轮/.test(brief), brief)
           // 精简档的读数是这一档的重点：屏幕上不小于 9px，档内最低的 0.33 倍也一样
           // （回滞让精简档一直留到 0.33）。--zoom 临时改成 0.33 量一遍再改回去
@@ -609,7 +647,7 @@ for (const theme of want('themes') ? ['dark', 'light'] : []) {
           check('live/compact: 读数屏幕字号不小于 9px（当前缩放与 0.33 倍）',
             fonts.now.read >= 9 && fonts.low.read >= 9 && fonts.low.title >= 11 && fonts.low.fits,
             `当前 ${fonts.now.read.toFixed(1)} / 标题 ${fonts.now.title.toFixed(1)}px · 0.33 倍 ${fonts.low.read.toFixed(1)} / ${fonts.low.title.toFixed(1)}px${fonts.low.fits ? '' : ' · 撑出了卡片'}`)
-          const bodyRead = await page.locator('.react-flow__node[data-id="body"] .nc-lod-read').innerText()
+          const bodyRead = await lodRead(page, 'body')
           check('live/compact: 读数不再重复状态字', /^\d\d:\d\d/.test(bodyRead), bodyRead)
         }
       }
@@ -630,11 +668,11 @@ for (const theme of want('themes') ? ['dark', 'light'] : []) {
 
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 剪影
 
-if (want('themes')) {
+await section('themes', async () => {
   console.log('\n=== 剪影 ===')
   const pairs = Object.entries(shapesByState).map(([s, set]) => [s, [...set]])
   const owner = {}
@@ -650,11 +688,11 @@ if (want('themes')) {
   const all = ['blocked', 'cancelled', 'done', 'failed', 'idle', 'queued', 'running', 'skipped', 'suspended', 'unreached', 'waiting']
   check('每种状态都在卡片上出现过', all.every((s) => covered.includes(s)), covered.join(' '))
   check('每种状态的剪影互不相同', !clash, clash || pairs.map(([s, sh]) => `${s}=${sh}`).join(' '))
-}
+})
 
 // ---------------------------------------------------------------- 历史灌入
 
-if (want('interact')) {
+await section('interact', async () => {
   console.log('\n=== 选中、聚焦、Copilot 新节点、一次性时刻 ===')
   const { browser, page, errors } = await open({ theme: 'dark' })
   await setLod(page, 'full')
@@ -752,6 +790,21 @@ if (want('interact')) {
   const went = await page.evaluate(() => window.__issuance)
   check('右栏看得见：悬停成了链接，点它请右栏摆出出具横幅', cursor === 'pointer' && went.length === 1 && went[0].runId === RUN_ID,
     `${cursor} · ${JSON.stringify(went)}`)
+  // 右栏停在对话层时横幅不在页面上：还是能点，右栏接手——切到运行层、滚到横幅、焦点落上去
+  await page.locator('[data-assistant-panel] button[title="回到和助手的对话"]').click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(250)
+  const bannerGone = await page.locator('[data-issuance-banner]').count() === 0
+  await stamp.hover()
+  const chatCursor = await stamp.evaluate((el) => getComputedStyle(el).cursor)
+  await stamp.click()
+  await page.waitForFunction(() => document.activeElement?.closest('[data-issuance-banner]'), null, { timeout: 3000 }).catch(() => {})
+  const landed = await page.evaluate(() => {
+    const b = document.querySelector('[data-issuance-banner]')
+    return { banner: !!b, focus: !!document.activeElement?.closest('[data-issuance-banner]'), flash: b?.dataset.flash ?? null }
+  })
+  check('右栏在对话层：印章照样是链接，点了切到运行层、落到出具横幅上', bannerGone && chatCursor === 'pointer'
+    && landed.banner && landed.focus && landed.flash === 'focus',
+    `${bannerGone ? '' : '（准备：横幅还在页面上）'}${chatCursor} · ${JSON.stringify(landed)}`)
   // 回指明细带口径（issuance.matched[].caliber）：同一个指标换过口径，看得出这次按的是哪一版
   await page.evaluate(() => {
     const st = window.__studio
@@ -789,11 +842,11 @@ if (want('interact')) {
 
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 协作矩阵的措辞
 
-if (want('team')) {
+await section('team', async () => {
   console.log('\n=== 协作矩阵：并行的一轮交回一部分、全部交回等调度 ===')
   const { browser, page, errors } = await open({ theme: 'dark' })
   await setLod(page, 'full')
@@ -822,16 +875,16 @@ if (want('team')) {
   check('三人都交回、等下一次调度：表头不说串行', !all.head.includes('串行') && all.head.includes('已交回'), all.head)
   check('三人都交回：底部报省下的时间，和表头不打架', all.foot.includes('并行省下') && !all.head.includes('串行'), `${all.head} | ${all.foot}`)
   await setLod(page, 'compact')
-  const brief = await page.locator('.react-flow__node[data-id="team"] .nc-lod-read').innerText()
+  const brief = await lodRead(page, 'team')
   check('精简档摘要不写「0/3 在跑」', !brief.includes('0/') && brief.includes('已交回'), brief)
   shots.push(await shot(page, 'dark-team-all-back'))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 收场：用完轮数、写成文字的工具调用、超时
 
-if (want('endings')) {
+await section('endings', async () => {
   // 一张小图：协作团队两轮上限、三个成员（「定稿员」一次都派不到）；一个 agent 节点把
   // 工具调用写成了文字；一个工具节点查询超时；一个校验节点靠修复才过
   const graph = await (await fetch(`${API}/copilot/layout`, {
@@ -1107,13 +1160,13 @@ if (want('endings')) {
     check(`${theme}: 查询超出声明的时限：直说「已超出 2s 上限」，工具名在悬停里`, over === '已超出 2s 上限' && overTitle.includes('db_query__shop ⋯ 进行中（上限 2s）') && overFits, `${over} · ${flat(overTitle)}${overFits ? '' : ' · 超出了卡片'}`)
     shots.push(await shot(page, `${theme}-endings-live`), await cardShot(page, ['team', 'q'], `${theme}-endings-live-cards`))
     await setLod(page, 'compact')
-    const brief = await at(page, 'team').locator('.nc-lod-read').innerText()
+    const brief = await lodRead(page, 'team', (t) => t === '轮数用完 · 收尾判定中')
     check(`${theme}: 精简档：收尾判定中写清是判定，不写「第 3 轮」`, brief === '轮数用完 · 收尾判定中', brief)
     // 收尾判定认事件里的 closing，不拿配置里的「最多轮数」比：没配（后端按缺省值跑）、
     // 运行之后调大了（接着跑之前、回放历史运行），照样认得出是在判定
     await setTeamConfig(page, { max_rounds: null })
     await page.waitForTimeout(150)
-    const briefBare = await at(page, 'team').locator('.nc-lod-read').innerText()
+    const briefBare = await lodRead(page, 'team', (t) => t === '轮数用完 · 收尾判定中')
     await setLod(page, 'full')
     m = await matrixOf(page)
     check(`${theme}: 没配最多轮数：照样认出收尾判定（精简档、表头、调度者那一行）`, briefBare === '轮数用完 · 收尾判定中'
@@ -1136,6 +1189,19 @@ if (want('endings')) {
     // ---- 同一个节点执行第二次：上一次的收场不挂到这一次上。照真实流程先把最多轮数调大
     // 再接着跑：回放到第一次时「用完 2 轮」得按那一次的原话，不按现在的配置写成 4
     await setTeamConfig(page, { max_rounds: 4 })
+    // 接着跑、团队重新执行而调度者还没开口：reduceTeam 刚把上一次清空（rounds 为空）。矩阵要画成
+    // 「还没有数据」，和第一次执行刚开始时一模一样，不写「等调度者」「已收尾」（3C REQ-17）
+    const rr = RERUN(Date.now())
+    const teamStarts = rr.map((e, i) => (e.type === 'node.started' && e.node_id === 'team' ? i : -1)).filter((i) => i >= 0)
+    await feed(page, rr.slice(0, teamStarts[1] + 1))
+    await page.waitForTimeout(250)
+    const resetM = await matrixOf(page)
+    await feed(page, rr.slice(0, teamStarts[0] + 1))
+    await page.waitForTimeout(250)
+    const freshM = await matrixOf(page)
+    check(`${theme}: 接着跑、团队重新执行还没派活：矩阵和第一次刚开始时一样（还没有数据）`,
+      teamStarts.length >= 2 && resetM.head === freshM.head && resetM.right === freshM.right
+        && !/等调度者|已收尾|共 0 轮/.test(resetM.head), `${resetM.head} ‖ ${freshM.head}`)
     await feed(page, RERUN(Date.now()))
     await page.waitForTimeout(700)
     const quietEnding = async (label) => {
@@ -1192,9 +1258,9 @@ if (want('endings')) {
     check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
     await browser.close()
   }
-}
+})
 
-if (want('replay')) {
+await section('replay', async () => {
   console.log('\n=== 回放：卡片回到游标那一刻 ===')
   const { browser, page, errors } = await open({ theme: 'dark' })
   await setLod(page, 'full')
@@ -1247,9 +1313,9 @@ if (want('replay')) {
   check('回到实时：命中的出口亮回来', await page.locator('.react-flow__node[data-id="gate"] .nc-exit.is-hit').count() === 1)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
-}
+})
 
-if (want('history')) {
+await section('history', async () => {
   console.log('\n=== 打开历史运行：一次性动效不播 ===')
   const { browser, page } = await open({ theme: 'dark' })
   await feed(page, FAILED(Date.now()), { replay: true })
@@ -1261,11 +1327,11 @@ if (want('history')) {
   check('补发的历史不抖、不扫、不落章', moments.length === 0, anim.names.join(', ') || '无')
   check('补发的历史不挂 .nc-enter', await page.locator('.nc.nc-enter').count() === 0)
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 出口密的分支
 
-if (want('exits')) {
+await section('exits', async () => {
   console.log('\n=== 六出口分支：标签不压别的出口的线 ===')
   const cases = ['A', 'B', 'C', 'D', 'E'].map((k, i) => ({ key: `c${i}`, condition: `vars.x == ${i}`, label: `产线${k}` }))
   const graph = await (await fetch(`${API}/copilot/layout`, {
@@ -1309,11 +1375,11 @@ if (want('exits')) {
     check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
     await browser.close()
   }
-}
+})
 
 // ---------------------------------------------------------------- 关掉动效
 
-if (want('reduced')) {
+await section('reduced', async () => {
   console.log('\n=== 系统关了动效 ===')
   const { browser, page } = await open({ theme: 'dark', reduced: true })
   await setLod(page, 'full')
@@ -1334,7 +1400,7 @@ if (want('reduced')) {
   check('静态下仍看得出在跑：左侧实心状态槽', drawn.slot !== 'rgba(0, 0, 0, 0)', drawn.slot)
   shots.push(await shot(page, 'dark-live-reduced'))
   await browser.close()
-}
+})
 
 console.log(`\n截图 ${shots.length} 张：${SHOTS}`)
 if (reloads) console.log(`注意：测试中页面被重载或 store 被热更新重建了 ${reloads} 次，失败项请重跑确认`)

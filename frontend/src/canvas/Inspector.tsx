@@ -7,7 +7,7 @@ import { fieldOfIssue, unboundToolOf, withToolBound, type FieldRef } from './iss
 import { hintOf } from './shortcuts'
 import { isActivePhase } from '../run/trace'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
-import { useCatalog, modelOptions } from '../store/catalog'
+import { datasourceTools, modelOptions, useCatalog, useDatasources } from '../store/catalog'
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
@@ -19,67 +19,87 @@ type FieldIssue = ValidationIssue & { at: FieldRef | null }
 
 /**
  * 运行默认值（设置 · 运行默认值）。检查器里「留空 = 跟随默认」的字段要把实际会用
- * 哪个写出来，否则「留空」是个黑箱。整个会话取一次就够：这两项很少改
+ * 哪个写出来，否则「留空」是个黑箱。整个会话取一次就够：这两项很少改。
+ * 只有用得上的字段（记忆范围、知识库）才取：取回来时每个订阅的字段都要重渲染一次，
+ * 取回来之后再挂上的直接用缓存
  */
-let runDefaults: Promise<{ default_collection?: string; default_memory_scope?: string }> | null = null
-function useRunDefaults() {
-  const [value, setValue] = useState<{ default_collection?: string; default_memory_scope?: string }>({})
+type RunDefaults = { default_collection?: string; default_memory_scope?: string }
+let runDefaults: Promise<RunDefaults> | null = null
+let runDefaultsValue: RunDefaults | null = null
+function useRunDefaults(active: boolean): RunDefaults {
+  const [value, setValue] = useState<RunDefaults>(() => runDefaultsValue ?? {})
   useEffect(() => {
-    runDefaults ??= api.settings.get().then((s) => s?.run ?? {}).catch(() => {
+    if (!active || runDefaultsValue) return
+    runDefaults ??= api.settings.get().then((s) => (runDefaultsValue = s?.run ?? {})).catch(() => {
       runDefaults = null   // 这次没取到，下次打开再试
       return {}
     })
     let alive = true
     void runDefaults.then((v) => { if (alive) setValue(v) })
     return () => { alive = false }
-  }, [])
-  return value
+  }, [active])
+  return runDefaultsValue ?? value
 }
 
 interface ToolOption { value: string; label: string; hint?: string; danger?: boolean; group?: string }
 
 /**
- * 数据源的查询工具（db_query__<源> / db_schema__<源>）。/tools 的列表只有内置、自定义和 MCP，
- * 以前检查器里挑不到它们：校验说「提示词要求用 db_query__x，把它加进工具里」，界面上却做不到。
- * 30 秒内复用上一次的结果：每点一个节点都去问一遍没必要，可刚在数据页加的源也不能一直看不见
+ * 节点能绑的全部工具：目录里的，加上数据源的查询工具（db_query__<源> / db_schema__<源>）。
+ * 后者不在 /tools 里，以前检查器里挑不到它们：校验说「提示词要求用 db_query__x，把它加进
+ * 工具里」，界面上却做不到。数据源读 catalog 的那一份（问数据页、助手用的也是它），
+ * 只有挂着工具选择器的地方订阅——别的字段不跟着目录重渲染
  */
-let sourceTools: { at: number; list: Promise<ToolOption[]> } | null = null
-function useSourceTools(): ToolOption[] {
-  const [value, setValue] = useState<ToolOption[]>([])
-  useEffect(() => {
-    if (!sourceTools || Date.now() - sourceTools.at > 30_000) {
-      sourceTools = {
-        at: Date.now(),
-        list: api.datasources.list().then((rows) => rows
-          .filter((r) => r && r.enabled !== false)
-          .flatMap((r) => (Array.isArray(r.tools) ? r.tools as string[] : []).map((t) => ({
-            value: t, label: t, group: '数据源',
-            hint: `${t.startsWith('db_schema__') ? '查表结构' : '执行 SQL'} · 数据源「${r.name}」`,
-            // 可写的源上，写语句要人确认（运行时的审批关卡认它）
-            danger: t.startsWith('db_query__') && r.readonly === false,
-          }))))
-          .catch(() => { sourceTools = null; return [] }),
-      }
-    }
-    let alive = true
-    void sourceTools?.list.then((v) => { if (alive) setValue(v) })
-    return () => { alive = false }
-  }, [])
-  return value
-}
-
-/** 节点能绑的全部工具：目录里的，加上数据源的 */
 function useToolOptions(): ToolOption[] {
   const tools = useCatalog((s) => s.tools)
-  const sources = useSourceTools()
+  // 超过 30 秒没取过时挂上就后台重拉一次：刚在数据页加的源不能一直看不见
+  const { list: sources } = useDatasources()
   return useMemo(() => {
     const known = new Set(tools.map((t) => t.id))
+    const fromSources: ToolOption[] = sources
+      .filter((r) => r.enabled !== false)
+      .flatMap((r) => datasourceTools(r).map((t) => ({
+        value: t, label: t, group: '数据源',
+        hint: `${t.startsWith('db_schema__') ? '查表结构' : '执行 SQL'} · 数据源「${r.name}」`,
+        // 可写的源上，写语句要人确认（运行时的审批关卡认它）
+        danger: t.startsWith('db_query__') && r.readonly === false,
+      })))
     return [
       ...tools.map((t) => ({ value: t.id, label: t.name, hint: t.description, danger: t.dangerous, group: t.category })),
-      ...sources.filter((o) => !known.has(o.value)),
+      ...fromSources.filter((o) => !known.has(o.value)),
     ]
   }, [tools, sources])
 }
+
+/**
+ * 工具字段。单独一个组件：只有它订阅工具目录和数据源，别的字段（提示词、模型、条件……）
+ * 不因为目录刷新、数据源取回来而跟着重渲染
+ */
+function ToolsInput({ id, single, value, invalid, aria, onChange }: {
+  id: string; single: boolean; value: any; invalid: boolean
+  aria: { 'aria-invalid'?: boolean; 'aria-describedby'?: string }; onChange: (v: any) => void
+}) {
+  const options = useToolOptions()
+  if (single) {
+    return (
+      <select id={id} className="field" value={value ?? ''} {...aria}
+              style={invalid ? { borderColor: 'var(--err)' } : undefined}
+              onChange={(e) => onChange(e.target.value)}>
+        <option value="">— 选择工具 —</option>
+        {[...new Set(options.map((o) => o.group))].map((g) => (
+          <optgroup key={g} label={g}>
+            {options.filter((o) => o.group === g).map((o) => (
+              <option key={o.value} value={o.value}>{o.label}{o.danger ? ' ⚠' : ''}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    )
+  }
+  return <MultiPick options={options} value={Array.isArray(value) ? value : []} onChange={onChange} empty="没有可用工具" />
+}
+
+/** 不需要某张目录表的字段拿到的都是这一个空数组：选择器结果不变，就不重渲染 */
+const NO_ROWS: never[] = []
 
 /** 属性面板。所有字段都由 nodeDefs 的声明驱动渲染，加节点类型不用改这里。 */
 export function Inspector() {
@@ -363,9 +383,12 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
   config: Record<string, any>; invalid: boolean; describedBy?: string
   issues: FieldIssue[]; onChange: (v: any) => void
 }) {
-  const catalog = useCatalog()
-  const defaults = useRunDefaults()
-  const toolOptions = useToolOptions()
+  // 目录只按这个字段用得上的那一张订阅。以前每个字段都订阅整个 catalog：连接心跳、
+  // 待审批轮询每跳一次，检查器里十几个字段全跟着重渲染
+  const providers = useCatalog((s) => (field.type === 'model' ? s.providers : NO_ROWS))
+  const collections = useCatalog((s) => (field.type === 'collection' ? s.collections : NO_ROWS))
+  const skills = useCatalog((s) => (field.type === 'skills' ? s.skills : NO_ROWS))
+  const defaults = useRunDefaults(field.key === 'scope' || field.type === 'collection')
   const aria = { 'aria-invalid': invalid || undefined, 'aria-describedby': describedBy }
 
   switch (field.type) {
@@ -444,7 +467,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
         : <JsonInput id={id} value={value} onChange={onChange} placeholder={field.placeholder} />
 
     case 'model': {
-      const options = modelOptions(catalog.providers)
+      const options = modelOptions(providers)
       const groups = [...new Set(options.map((o) => o.group))]
       return (
         <select id={id} className="field" value={value ?? ''} {...aria} onChange={(e) => onChange(e.target.value)}>
@@ -467,7 +490,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
                  placeholder={`跟随运行默认（${defaults.default_collection ?? 'default'}）`}
                  onChange={(e) => onChange(e.target.value)} />
           <datalist id={`${id}-list`}>
-            {catalog.collections.map((c) => (
+            {collections.map((c) => (
               <option key={c.collection} value={c.collection}>{`${c.documents} 篇文档`}</option>
             ))}
           </datalist>
@@ -477,37 +500,17 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
     case 'skills':
       return (
         <MultiPick
-          options={catalog.skills.filter((s) => s.enabled).map((s) => ({ value: s.name, label: s.name, hint: s.description }))}
+          options={skills.filter((s) => s.enabled).map((s) => ({ value: s.name, label: s.name, hint: s.description }))}
           value={Array.isArray(value) ? value : []}
           onChange={onChange}
           empty="还没有 Skill，去「方法论」页创建"
         />
       )
 
-    case 'tools': {
-      const options = toolOptions
+    case 'tools':
       // tool 节点只选一个，agent 节点可以多选
-      if (field.help?.includes('只能选一个')) {
-        return (
-          <select id={id} className="field" value={value ?? ''} {...aria}
-                  style={invalid ? { borderColor: 'var(--err)' } : undefined}
-                  onChange={(e) => onChange(e.target.value)}>
-            <option value="">— 选择工具 —</option>
-            {[...new Set(options.map((o) => o.group))].map((g) => (
-              <optgroup key={g} label={g}>
-                {options.filter((o) => o.group === g).map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}{o.danger ? ' ⚠' : ''}</option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-        )
-      }
-      return (
-        <MultiPick options={options} value={Array.isArray(value) ? value : []} onChange={onChange}
-                   empty="没有可用工具" />
-      )
-    }
+      return <ToolsInput id={id} single={!!field.help?.includes('只能选一个')} value={value} invalid={invalid}
+                         aria={aria} onChange={onChange} />
 
     case 'ioFields':
       return <IoFieldList nodeId={nodeId} value={value ?? []} issues={issues} onChange={onChange} />
@@ -653,7 +656,8 @@ function MultiPick({ options, value, onChange, empty }: {
         })}
         {!value.length && <span className="text-2xs text-faint">未选择</span>}
       </div>
-      <button type="button" className="btn btn-sm w-full justify-center" onClick={() => setOpen(!open)}>
+      {/* 定位（revealField）把光标放在这儿，不放在前面那排芯片的 × 上 */}
+      <button type="button" className="btn btn-sm w-full justify-center" onClick={() => setOpen(!open)} data-reveal-focus>
         <Plus size={11} /> {open ? '收起' : '添加'}
       </button>
       {open && (
@@ -709,11 +713,13 @@ function Row({ children, onRemove, removeLabel, tone, item }: {
 }
 
 /** 行内的小标签：填满之后还分得清哪个框是什么 */
-function Sub({ label, htmlFor, children, syntax, className }: {
+function Sub({ label, htmlFor, children, syntax, className, sub }: {
   label: string; htmlFor: string; children: React.ReactNode; syntax?: FieldSyntax; className?: string
+  /** 这一栏在项里的键（condition、value…）：定位按 [data-item] [data-sub] 落到这儿、光标放进来 */
+  sub?: string
 }) {
   return (
-    <div className={className}>
+    <div className={className} data-sub={sub}>
       <div className="mb-0.5 flex items-center gap-1.5">
         <label htmlFor={htmlFor} className="min-w-0 flex-1 truncate text-2xs text-faint">{label}</label>
         {syntax && <SyntaxBadge syntax={syntax} />}
@@ -740,20 +746,20 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
           <Row key={i} item={i} removeLabel={`删除字段 ${field.name || i + 1}`}
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
-            <Sub label="字段名" htmlFor={`${uid}-${i}-name`}>
+            <Sub label="字段名" htmlFor={`${uid}-${i}-name`} sub="name">
               <input id={`${uid}-${i}-name`} className="field" value={field.name ?? ''}
                      onChange={(e) => update(i, { name: e.target.value })} />
             </Sub>
             {isOutput ? (
               // 成果字段是写 {{ }} 最多的地方，以前却是普通输入框，敲 {{ 没有任何弹出
-              <Sub label="取值" htmlFor={`${uid}-${i}-value`} syntax="template">
+              <Sub label="取值" htmlFor={`${uid}-${i}-value`} syntax="template" sub="value">
                 <TemplateText id={`${uid}-${i}-value`} multiline={false} nodeId={nodeId}
                               className="mono text-xs" placeholder="{{ vars.xxx }}"
                               value={field.value ?? ''} onChange={(v) => update(i, { value: v })} />
               </Sub>
             ) : (
               <>
-                <Sub label="说明（可选）" htmlFor={`${uid}-${i}-desc`}>
+                <Sub label="说明（可选）" htmlFor={`${uid}-${i}-desc`} sub="description">
                   <input id={`${uid}-${i}-desc`} className="field" value={field.description ?? ''}
                          onChange={(e) => update(i, { description: e.target.value })} />
                 </Sub>
@@ -763,7 +769,7 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
                            onChange={(e) => update(i, { required: e.target.checked })} />
                     必填
                   </label>
-                  <Sub label="默认值" htmlFor={`${uid}-${i}-def`} className="flex-1">
+                  <Sub label="默认值" htmlFor={`${uid}-${i}-def`} className="flex-1" sub="default">
                     <input id={`${uid}-${i}-def`} className="field" value={field.default ?? ''}
                            onChange={(e) => update(i, { default: e.target.value })} />
                   </Sub>
@@ -862,7 +868,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
           <Row key={i} item={i} removeLabel={`删除分支 ${c.label || c.key || i + 1}`} tone={tone}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
-              <Sub label="标识（连线出口）" htmlFor={`${uid}-${i}-key`} className="w-[42%] shrink-0">
+              <Sub label="标识（连线出口）" htmlFor={`${uid}-${i}-key`} className="w-[42%] shrink-0" sub="key">
                 <input id={`${uid}-${i}-key`} className="field mono text-xs"
                        value={editing ? draft.text : c.key ?? ''}
                        aria-invalid={keyBad || undefined}
@@ -880,7 +886,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
                          }
                        }} />
               </Sub>
-              <Sub label={byModel ? '类别说明（给模型看）' : '说明'} htmlFor={`${uid}-${i}-label`} className="min-w-0 flex-1">
+              <Sub label={byModel ? '类别说明（给模型看）' : '说明'} htmlFor={`${uid}-${i}-label`} className="min-w-0 flex-1" sub="label">
                 <input id={`${uid}-${i}-label`} className="field" value={c.label ?? ''}
                        onChange={(e) => update(i, { label: e.target.value })} />
               </Sub>
@@ -899,7 +905,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
             )}
             {/* 让模型分类时条件不参与判断，别让人以为要填 */}
             {!byModel && (
-              <Sub label="条件" htmlFor={`${uid}-${i}-cond`} syntax="expression">
+              <Sub label="条件" htmlFor={`${uid}-${i}-cond`} syntax="expression" sub="condition">
                 <TemplateText id={`${uid}-${i}-cond`} multiline={false} syntax="expression" nodeId={nodeId}
                               className="text-xs" placeholder="len(vars.text) > 100" invalid={condBad}
                               value={c.condition ?? ''} onChange={(v) => update(i, { condition: v })} />
@@ -936,20 +942,20 @@ function MetricList({ nodeId, value, issues, onChange }: {
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
-              <Sub label="指标 id（英文）" htmlFor={`${uid}-${i}-id`} className="min-w-0 flex-1">
+              <Sub label="指标 id（英文）" htmlFor={`${uid}-${i}-id`} className="min-w-0 flex-1" sub="id">
                 <input id={`${uid}-${i}-id`} className="field mono text-xs" value={m.id ?? ''}
                        onChange={(e) => update(i, { id: e.target.value })} />
               </Sub>
-              <Sub label="名称" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1">
+              <Sub label="名称" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1" sub="name">
                 <input id={`${uid}-${i}-name`} className="field" value={m.name ?? ''}
                        onChange={(e) => update(i, { name: e.target.value })} />
               </Sub>
-              <Sub label="单位" htmlFor={`${uid}-${i}-unit`} className="w-16 shrink-0">
+              <Sub label="单位" htmlFor={`${uid}-${i}-unit`} className="w-16 shrink-0" sub="unit">
                 <input id={`${uid}-${i}-unit`} className="field" value={m.unit ?? ''}
                        onChange={(e) => update(i, { unit: e.target.value })} />
               </Sub>
             </div>
-            <Sub label="计算" htmlFor={`${uid}-${i}-expr`} syntax="expression">
+            <Sub label="计算" htmlFor={`${uid}-${i}-expr`} syntax="expression" sub="expression">
               <TemplateText id={`${uid}-${i}-expr`} multiline={false} syntax="expression" nodeId={nodeId}
                             className="text-xs" placeholder="round(vars.agg.amount / vars.agg.orders, 2)"
                             value={m.expression ?? ''} onChange={(v) => update(i, { expression: v })} />
@@ -993,17 +999,17 @@ function AgentList({ value, issues, config, onChange }: {
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
-              <Sub label="成员名（英文）" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1">
+              <Sub label="成员名（英文）" htmlFor={`${uid}-${i}-name`} className="min-w-0 flex-1" sub="name">
                 <input id={`${uid}-${i}-name`} className="field mono text-xs" placeholder="researcher"
                        value={agent.name ?? ''} onChange={(e) => update(i, { name: e.target.value })} />
               </Sub>
-              <Sub label="最多几步" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0">
+              <Sub label="最多几步" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0" sub="max_steps">
                 <input id={`${uid}-${i}-steps`} className="field tnum" type="number" min={1} max={30} placeholder="4"
                        value={agent.max_steps ?? ''}
                        onChange={(e) => update(i, { max_steps: e.target.value === '' ? undefined : Number(e.target.value) })} />
               </Sub>
             </div>
-            <Sub label="职责（调度者据此分派）" htmlFor={`${uid}-${i}-desc`}>
+            <Sub label="职责（调度者据此分派）" htmlFor={`${uid}-${i}-desc`} sub="description">
               <input id={`${uid}-${i}-desc`} className="field" value={agent.description ?? ''}
                      onChange={(e) => update(i, { description: e.target.value })} />
             </Sub>

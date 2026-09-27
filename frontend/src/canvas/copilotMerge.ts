@@ -148,3 +148,46 @@ export function describeToolChange(c: ToolChange): string {
   const list = (xs: string[]) => (xs.length ? xs.join('、') : '空')
   return `${who}：${list(c.before)} → ${list(c.after)}`
 }
+
+/** 后端的 tools_dropped 提醒里用得上的那两个字段（check.warnings / final.issues 的一条） */
+export interface DropWarning { node_id?: string | null; field?: string | null }
+
+/**
+ * 变少了的工具绑定分两组：后端点了名（tools_dropped，同节点同字段）的是「这一轮没让删」，
+ * 其余是按要求删的。改图回执（toast）和右栏的卡片都按这一条分，免得两处说法不一
+ */
+export function splitShrunk(changes: ToolChange[], warnings: DropWarning[]): { unasked: ToolChange[]; asked: ToolChange[] } {
+  const shrunk = shrunkTools(changes)
+  // 老后端的提醒不带 field：同一个节点的就算
+  const warned = (c: ToolChange) => warnings.some((w) => w.node_id === c.node_id && (w.field == null || w.field === c.field))
+  return { unasked: shrunk.filter(warned), asked: shrunk.filter((c) => !warned(c)) }
+}
+
+/**
+ * 改图回执：一轮 final 落定之后那条 toast 写什么、什么色、要不要常驻。
+ *
+ * 工具绑定变了画布上看不出来，逐条写明前后。变少了的分两组：后端点了名（tools_dropped，
+ * 同节点同字段）的是「这一轮没让删」，warn 色、常驻到人看过——没工具的 agent 照样能跑，
+ * 跑出来的是模型「假设」查过库的答案；其余是按要求删的，另列一组、不催。以前整轮只要有
+ * 一条提醒，所有变少的都列在「没让删」底下，按要求删的也被说成改漏了，要紧的那句被冲淡
+ */
+export function copilotReceipt(r: {
+  total: number; left: number; missing: number; toolChanges: ToolChange[]; toolWarnings: DropWarning[]
+}): { text: string; kind: 'ok' | 'warn'; sticky: boolean; detail?: string } {
+  const { unasked, asked } = splitShrunk(r.toolChanges, r.toolWarnings)
+  const shrunk = [...unasked, ...asked]
+  const head = r.left ? `已放到画布，但还有 ${r.left} 处问题要你处理`
+    : r.missing ? `已应用 ${r.total} 处改动，但有 ${r.missing} 步没放上`
+    : `已应用 ${r.total} 处改动`
+  const lines = [
+    ...(unasked.length ? ['工具绑定变少了，这一轮没让删，确认一下是不是改漏了：', ...unasked.map(describeToolChange)] : []),
+    ...(asked.length ? ['工具绑定变少了（按要求）：', ...asked.map(describeToolChange)] : []),
+  ]
+  return {
+    text: [r.toolChanges.length && !shrunk.length ? `${head} · 工具绑定变了 ${r.toolChanges.length} 处` : head, ...lines].join('\n'),
+    kind: r.left || r.missing || unasked.length ? 'warn' : 'ok',
+    sticky: unasked.length > 0,
+    // 加了、换了的那些不在正文里：放进详情
+    ...(r.toolChanges.length > shrunk.length ? { detail: r.toolChanges.map(describeToolChange).join('\n') } : {}),
+  }
+}

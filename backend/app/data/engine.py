@@ -292,7 +292,11 @@ def _causes(e: BaseException) -> list[BaseException]:
 
 
 class _Deadline:
-    """一条语句的时限。数据库那边按它停下；停下时报的错据此认成超时。"""
+    """一条语句的时限。数据库那边按它停下；停下时报的错据此认成超时。
+
+    从取连接之前起算，和后端兜底同一个起点：取连接花掉的也算在时限里，数据库只拿到
+    剩下的那段（remaining_ms）。否则取连接一慢，兜底就抢在数据库前面取消语句。
+    """
 
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
@@ -302,9 +306,11 @@ class _Deadline:
         #: 语句已经结束。回调这时要是还挂在连接上（摘除没成功），也不能再掐别人的语句
         self.over = False
 
-    @property
-    def ms(self) -> int:
-        return max(1, int(self.seconds * 1000))
+    def remaining_ms(self) -> int:
+        return max(1, int((self.ends - time.monotonic()) * 1000))
+
+    def remaining_seconds(self) -> float:
+        return max(0.001, round(self.ends - time.monotonic(), 3))
 
     def expired(self) -> bool:
         return time.monotonic() >= self.ends
@@ -354,7 +360,7 @@ async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline
     """
     if kind in ("postgres", "postgresql"):
         # SET LOCAL 只管这一个事务：连接还回池子时回滚，设置随之作废
-        await conn.execute(text(f"SET LOCAL statement_timeout = {deadline.ms}"))
+        await conn.execute(text(f"SET LOCAL statement_timeout = {deadline.remaining_ms()}"))
         yield
         return
 
@@ -362,9 +368,9 @@ async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline
         # MySQL 的 max_execution_time 以毫秒计、只管 SELECT；MariaDB 没有它，
         # 用 max_statement_time（秒）。按连上的服务器认，不按表单里选的类型
         if getattr(conn.dialect, "is_mariadb", False):
-            var, value = "max_statement_time", _seconds(deadline.seconds)
+            var, value = "max_statement_time", _seconds(deadline.remaining_seconds())
         else:
-            var, value = "max_execution_time", str(deadline.ms)
+            var, value = "max_execution_time", str(deadline.remaining_ms())
         try:
             await conn.execute(text(f"SET SESSION {var} = {value}"))
         except Exception as e:  # noqa: BLE001
@@ -390,7 +396,7 @@ async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline
         driver = await _driver(conn)
         before = getattr(driver, "call_timeout", 0)
         try:
-            driver.call_timeout = deadline.ms
+            driver.call_timeout = deadline.remaining_ms()
         except Exception as e:  # noqa: BLE001
             logger.warning("Oracle call_timeout 没设上（%s），只剩后端兜底", e)
             yield
@@ -427,13 +433,17 @@ async def _bounded(
     """在 opener() 开的连接上跑 work，时限交给数据库执行，后端这边再留一道兜底。
 
     数据库按时限停下语句时报的错，翻成 over 这句话：「超过 Ns 被中断」。
+    两道时限从同一刻（取连接之前）算起，数据库那道先到，兜底晚 BACKSTOP_S。
     """
     deadline: _Deadline | None = None
 
     async def _exec() -> Any:
         nonlocal deadline
+        deadline = _Deadline(limits.timeout_seconds)
         async with opener() as conn:
-            deadline = _Deadline(limits.timeout_seconds)
+            # 光等连接就把时限用完了：语句不必再发，发出去也只剩 1ms
+            if deadline.expired():
+                raise SqlRejected(over)
             async with _server_deadline(conn, kind, deadline):
                 return await work(conn)
 

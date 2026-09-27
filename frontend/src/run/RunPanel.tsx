@@ -6,8 +6,9 @@ import { useStudio } from '../store/studio'
 import { useCatalog } from '../store/catalog'
 import { NODE_DEFS } from '../canvas/nodeDefs'
 import { StatusDot, useToast } from '../components/ui'
-import { formatDateTime, formatTime, parseServerTime } from '../lib/format'
-import { runClassLabel } from '../lib/terms'
+import { useLocalActor } from '../lib/actor'
+import { formatDateTime, formatSpan, formatTime, parseServerTime } from '../lib/format'
+import { runClassLabel, runName } from '../lib/terms'
 import { useRunClock } from './useRunClock'
 import { Markdown } from './Markdown'
 import type { Approval } from '../types'
@@ -16,18 +17,6 @@ import type { Approval } from '../types'
 // 助手栏顶部，和 Copilot 输入框两个"主要动作"互相压着——而它们是两种不同的
 // 意图（跑这张图 / 改这张图），不该争同一块地方。运行是对整张图的动作，
 // 和保存、发布同类，属于工具栏。
-
-/** 本机填的署名（设置 → 偏好设置），随 X-Actor 发给后端，写进审批留痕 */
-function localActor(): string {
-  try { return (localStorage.getItem('agentlab_actor') ?? '').trim() } catch { return '' }
-}
-
-/** 等了多久：「12 分钟」「5 小时」「8 天」。审批按天积压是常态，精确到秒没有意义 */
-function waited(ms: number): string {
-  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))} 分钟`
-  if (ms < 48 * 3_600_000) return `${Math.floor(ms / 3_600_000)} 小时`
-  return `${Math.floor(ms / 86_400_000)} 天`
-}
 
 /**
  * 审批卡。
@@ -57,7 +46,8 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
   )
   const [busy, setBusy] = useState(false)
   const payload = approval.payload ?? {}
-  const actor = localActor()
+  // 本机署名随 X-Actor 发给后端、写进审批留痕；在设置或发布弹窗里改了，卡底这句跟着变
+  const actor = useLocalActor()
   // 等待时长一分钟级就够，不订阅 100ms 的时钟；卡片因别的原因重画时顺带更新
   const now = useRunClock(false)
   const created = parseServerTime(approval.created_at)
@@ -101,7 +91,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
       </div>
       <div className="tnum mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs text-dim">
         <span>人工审批</span>
-        {showWorkflow && approval.workflow_name && <><span aria-hidden>·</span><span>{approval.workflow_name}</span></>}
+        {showWorkflow && approval.workflow_name && <><span aria-hidden>·</span><span>{runName(approval)}</span></>}
         {where && <><span aria-hidden>·</span><span>节点「{where}」</span></>}
         {approval.run_class && <><span aria-hidden>·</span><span>{runClassLabel(approval.run_class)}</span></>}
         {created && (
@@ -114,7 +104,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
           <>
             <span aria-hidden>·</span>
             <span style={stale ? { color: 'var(--st-waiting)', fontWeight: 600 } : undefined}>
-              已等待 {waited(age)}
+              已等待 {formatSpan(age, { coarse: true })}
             </span>
           </>
         )}

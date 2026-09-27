@@ -6,9 +6,10 @@
 // 页面级的 check-ui 走的都是正常路径，这些一个字都不会说。
 //
 // 不写库：GET 放行到后端（读真实数据），其余一律 page.route 拦下伪造——断言
-// 请求体对不对，再回一个像样的响应。所以对哪个后端跑都不会改数据；但照规矩
-// 还是只对沙箱跑：
-//   AGENTLAB_WEB=http://localhost:5373 AGENTLAB_API=http://localhost:8100/api node scripts/check-manage.mjs
+// 请求体对不对，再回一个像样的响应。所以对哪个后端跑都不会改数据。
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
+// 沙箱拷贝）跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-manage.mjs
 // 截图：CHECK_SHOTS=/某个目录 时把关键状态存下来；CHECK_THEME=light 换浅色跑一遍。
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
@@ -86,6 +87,10 @@ function fakeUploadProgress() {
  */
 async function open(path, { handlers = [], theme = THEME, viewport = { width: 1280, height: 860 }, uploadProgress = false } = {}) {
   const ctx = await browser.newContext({ viewport, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
+  opened.add(ctx)
+  // 找不到元素就早点失败：默认 30 秒一项，一处点不到能拖住整节半分钟
+  ctx.setDefaultTimeout(6000)
+  ctx.setDefaultNavigationTimeout(30000)
   await ctx.addInitScript((t) => {
     try { localStorage.setItem('agentlab.theme', t); localStorage.removeItem('agentlab.health') } catch { /* noop */ }
   }, theme)
@@ -116,7 +121,7 @@ async function open(path, { handlers = [], theme = THEME, viewport = { width: 12
   // App 会拿后端 settings 里的主题覆盖一次：钉回来，截图才是想看的那一套
   await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
   await page.waitForTimeout(400)
-  return { page, ctx, sent, errors, natives, close: () => ctx.close() }
+  return { page, ctx, sent, errors, natives, close: () => { opened.delete(ctx); return ctx.close() } }
 }
 // 页内换地址：App 会拿后端 settings 里的主题再覆盖一次，跟 open() 一样钉回来
 const goto = async (page, path) => {
@@ -138,9 +143,36 @@ const delayed = (ms, data, status = 200) => async (route) => { await new Promise
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` }) }
 const text = (page) => page.locator('main').innerText()
 const dialog = (page) => page.locator('[role="dialog"]').last()
+/** 元素正中那一点最上层的就是它自己：在视口里、没被滚走也没被盖住 */
+const inView = (locator) => locator.evaluate((el) => {
+  const r = el.getBoundingClientRect()
+  const hit = document.elementFromPoint(r.left + Math.min(24, r.width / 2), r.top + r.height / 2)
+  return !!hit && el.contains(hit)
+}).catch(() => false)
 const composingEnter = (locator) => locator.evaluate((el) => {
   el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true, bubbles: true, cancelable: true }))
 })
+
+/**
+ * 一节一节地跑。某个元素找不到（点击超时）以前会抛出未捕获的异常，整个脚本就停在
+ * 那里，后面各节一项都不跑——变异测试也就证明不了后面那些检查抓得住回归。现在
+ * 这一节记一项失败、关掉它开的页面，接着跑下一节。
+ * 只跑其中几节：CHECK_ONLY=知识库,工具 node scripts/check-manage.mjs（按节名包含匹配）
+ */
+const ONLY = process.env.CHECK_ONLY?.split(',').map((x) => x.trim()).filter(Boolean)
+const opened = new Set()
+async function section(name, fn) {
+  if (ONLY?.length && !ONLY.some((k) => name.includes(k))) return
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  } finally {
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
+}
 
 try {
   const probe = await open('/data')
@@ -155,34 +187,34 @@ try {
   process.exit(1)
 }
 
-console.log('=== 页面骨架：页头、标签、地址 ===')
-for (const [path, title] of [['/tools', '工具'], ['/knowledge', '知识'], ['/data', '数据'], ['/settings', '设置']]) {
-  const { page, errors, close } = await open(path)
-  const h1 = await page.locator('main h1').first().innerText().catch(() => '')
-  const box = await page.locator('main header').first().boundingBox()
-  check(`${path} 有页头「${title}」`, h1 === title, h1)
-  check(`${path} 页头不高于 48px（toast 从 56px 起）`, !!box && box.height <= 48, box ? `${box.height}px` : '没有页头')
-  check(`${path} 标签页有 tablist 语义`, await page.locator('main [role="tablist"]').count() === 1)
-  check(`${path} 没有运行时报错`, errors.length === 0, errors[0] ?? '')
-  await close()
-}
-{
-  const { page, close } = await open('/settings')
-  const tabs = await page.locator('main [role="tab"]').allInnerTexts()
-  check('设置页不再有数据源标签', !tabs.some((t) => t.includes('数据源')), tabs.join(' / '))
-  await close()
-  const old = await open('/settings/datasources')
-  check('/settings/datasources 跳到 /data', new URL(old.page.url()).pathname.startsWith('/data'), old.page.url())
-  await old.close()
-  const data = await open('/data')
-  const dtabs = await data.page.locator('main [role="tab"]').allInnerTexts()
-  check('/data 有「数据库」「表格」两个标签', dtabs.join('|') === '数据库|表格', dtabs.join(' / '))
-  check('/data 落到 /data/databases', data.page.url().endsWith('/data/databases'), data.page.url())
-  await data.close()
-}
+await section('页面骨架：页头、标签、地址', async () => {
+  for (const [path, title] of [['/tools', '工具'], ['/knowledge', '知识'], ['/data', '数据'], ['/settings', '设置']]) {
+    const { page, errors, close } = await open(path)
+    const h1 = await page.locator('main h1').first().innerText().catch(() => '')
+    const box = await page.locator('main header').first().boundingBox()
+    check(`${path} 有页头「${title}」`, h1 === title, h1)
+    check(`${path} 页头不高于 48px（toast 从 56px 起）`, !!box && box.height <= 48, box ? `${box.height}px` : '没有页头')
+    check(`${path} 标签页有 tablist 语义`, await page.locator('main [role="tablist"]').count() === 1)
+    check(`${path} 没有运行时报错`, errors.length === 0, errors[0] ?? '')
+    await close()
+  }
+  {
+    const { page, close } = await open('/settings')
+    const tabs = await page.locator('main [role="tab"]').allInnerTexts()
+    check('设置页不再有数据源标签', !tabs.some((t) => t.includes('数据源')), tabs.join(' / '))
+    await close()
+    const old = await open('/settings/datasources')
+    check('/settings/datasources 跳到 /data', new URL(old.page.url()).pathname.startsWith('/data'), old.page.url())
+    await old.close()
+    const data = await open('/data')
+    const dtabs = await data.page.locator('main [role="tab"]').allInnerTexts()
+    check('/data 有「数据库」「表格」两个标签', dtabs.join('|') === '数据库|表格', dtabs.join(' / '))
+    check('/data 落到 /data/databases', data.page.url().endsWith('/data/databases'), data.page.url())
+    await data.close()
+  }
+})
 
-console.log('\n=== 设置 · 模型接入 ===')
-{
+await section('设置 · 模型接入', async () => {
   const p0 = providers[0]
   // 后端记着上次测连接的结果（last_check_*）：第一张卡 3 小时前测过、没通过，其余没测过
   const listed = providers.map((p, i) => (i === 0 ? {
@@ -272,10 +304,9 @@ console.log('\n=== 设置 · 模型接入 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 设置 · 偏好 ===')
-{
+await section('设置 · 偏好', async () => {
   // 设置读写都走假的一份：PUT 写进去，GET 读回来（主题的「已保存」是读回来核对过才写的）
   let stored = await get('/settings')
   const { page, sent, natives, close } = await open('/settings/prefs', {
@@ -296,8 +327,9 @@ console.log('\n=== 设置 · 偏好 ===')
   await themeRadio(label).click()
   await page.waitForTimeout(500)
   const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)
+  // 细节只报组名和主题：settings 里别的组存着沙箱的真实配置，日志常被贴进报告
   check('主题选中即保存，只 PUT ui 一组', !!put && Object.keys(put.body?.values ?? {}).join() === 'ui' && put.body.values.ui.theme === value,
-        JSON.stringify(put?.body ?? {}).slice(0, 100))
+        `组：${Object.keys(put?.body?.values ?? {}).join(',') || '（没发）'} · theme=${put?.body?.values?.ui?.theme ?? '—'}`)
   check('主题旁显示「已保存」（读回来核对过）', (await page.locator('[data-theme-save]').innerText()).includes('已保存'))
   await page.waitForTimeout(1600)
   check('……约 1.6 秒后淡出，不一直挂着', await page.getByText('已保存', { exact: true }).count() === 0
@@ -332,6 +364,32 @@ console.log('\n=== 设置 · 偏好 ===')
   await page.waitForTimeout(200)
   check('选「留下」就还在偏好页', page.url().endsWith('/settings/prefs'), page.url())
 
+  // 切标签只问一次：以前 change() 先问一遍，守卫在地址变化时又问一遍
+  const asking = () => page.locator('[role="dialog"]').filter({ hasText: '还没保存' }).count()
+  await page.getByRole('tab', { name: '模型接入' }).click()
+  await page.waitForTimeout(400)
+  check('有改动时切标签：只弹一个确认框', await asking() === 1, `${await asking()} 个`)
+  await dialog(page).getByRole('button', { name: '留下来保存' }).click()
+  await page.waitForTimeout(400)
+  check('……选「留下」：标签和地址都不变，也没有第二个框冒出来', page.url().endsWith('/settings/prefs')
+        && (await page.getByRole('tab', { name: '偏好设置' }).getAttribute('aria-selected')) === 'true' && await asking() === 0, page.url())
+  // ⌘K 和 ⌥ 数字不走 <a>：以前页面自己在捕获阶段拦 <a> 的点击，这两条路拦不住
+  const mod = process.platform === 'darwin' ? 'Meta' : 'Control'
+  await page.keyboard.press(`${mod}+KeyK`)
+  await page.getByRole('dialog', { name: '命令面板' }).getByRole('combobox').fill('工具')
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(400)
+  check('⌘K 跳页也先问', await asking() === 1 && page.url().endsWith('/settings/prefs'), page.url())
+  await dialog(page).getByRole('button', { name: '留下来保存' }).click()
+  await page.waitForTimeout(300)
+  await page.evaluate(() => document.activeElement?.blur())
+  await page.keyboard.press('Alt+Digit1')
+  await page.waitForTimeout(400)
+  check('⌥1 切页也先问', await asking() === 1 && page.url().endsWith('/settings/prefs'), page.url())
+  await dialog(page).getByRole('button', { name: '留下来保存' }).click()
+  await page.waitForTimeout(300)
+  check('……都选「留下」：改动还在', (await page.locator('#pref-actor').inputValue()) === '检查脚本')
+
   const putsBefore = sent.filter((s) => s.key === 'PUT /settings').length
   await page.getByRole('button', { name: /保存设置/ }).click()
   await page.waitForTimeout(250)
@@ -345,7 +403,18 @@ console.log('\n=== 设置 · 偏好 ===')
   await page.getByRole('button', { name: /保存设置/ }).click()
   await page.waitForTimeout(400)
   const put2 = sent.filter((s) => s.key === 'PUT /settings').at(-1)
-  check('改了运行默认值：保存只 PUT run 一组', Object.keys(put2?.body?.values ?? {}).join() === 'run', JSON.stringify(put2?.body ?? {}).slice(0, 100))
+  // run 组里是默认知识库、记忆作用域这些沙箱里的真实名字：只报组名
+  check('改了运行默认值：保存只 PUT run 一组', Object.keys(put2?.body?.values ?? {}).join() === 'run',
+        `组：${Object.keys(put2?.body?.values ?? {}).join(',') || '（没发）'}`)
+
+  // 有改动时切标签选「放弃修改」：一问就走，不再补问第二遍
+  await page.locator('#pref-actor').fill('再改一次')
+  await page.getByRole('tab', { name: '运行环境' }).click()
+  await page.waitForTimeout(400)
+  await dialog(page).getByRole('button', { name: '放弃修改' }).click()
+  await page.waitForTimeout(500)
+  check('切标签选「放弃修改」：直接到运行环境，不再问第二遍', page.url().endsWith('/settings/system') && await asking() === 0,
+        `${page.url()} · 还开着 ${await asking()} 个`)
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   await close()
 
@@ -357,7 +426,7 @@ console.log('\n=== 设置 · 偏好 ===')
   await failing.page.waitForTimeout(600)
   const bar = await failing.page.locator('[data-prefs-bar]').innerText()
   check('保存失败：条上写「没存上」', bar.includes('没存上'))
-  check('……署名只在本机，已经存上了；条上只剩危险工具审批一项', bar.includes('有 1 项未保存') && bar.includes('危险工具审批') && !bar.includes('署名'), bar.replace(/\s+/g, ' '))
+  check('……署名只在本机，已经存上了；条上只剩危险工具的默认审批策略一项', bar.includes('有 1 项未保存') && bar.includes('危险工具的默认审批策略') && !bar.includes('署名'), bar.replace(/\s+/g, ' '))
   check('保存失败不抛未捕获异常', failing.errors.length === 0, failing.errors[0] ?? '')
   await failing.close()
 
@@ -397,10 +466,9 @@ console.log('\n=== 设置 · 偏好 ===')
   check('……没有被服务端的旧值翻回去', await off.page.evaluate(() => document.documentElement.getAttribute('data-theme')) === target[1]
         && (await offRadio(target[0]).getAttribute('aria-checked')) === 'true')
   await off.close()
-}
+})
 
-console.log('\n=== 数据 · 数据库 ===')
-{
+await section('数据 · 数据库', async () => {
   const dbs = sources.filter((s) => !/[\\/]uploads[\\/]tables[\\/]/.test(s.database ?? ''))
   const first = dbs.find((s) => s.table_count > 0) ?? dbs[0]
   const oracle = dbs.find((s) => s.kind === 'oracle')
@@ -425,7 +493,11 @@ console.log('\n=== 数据 · 数据库 ===')
     handlers: [
       [/^GET \/datasources$/, (route) => json([...sources, cur, drift])(route)],
       [/^GET \/datasources\/check-manage-empty\/schema$/, json({ tables: ['mes.work_order', 'mes.line', 'mes.shift'], summary: '', synced_at: ago(0) })],
-      [/^GET \/datasources\/check-manage-drift\/schema$/, json({ tables: ['sales.orders', 'sales.sales_daily'], summary: '', synced_at: ago(0) })],
+      // 取单张表时回老后端的样子：只有 detail 文本，没有 found、没有 columns
+      [/^GET \/datasources\/check-manage-drift\/schema$/, (route, { url }) => json(url.searchParams.get('table')
+        ? { table: url.searchParams.get('table'), detail: '表 sales.orders\n  order_id  INTEGER\n  amount  REAL' }
+        : { tables: ['sales.orders', 'sales.sales_daily'], summary: '', synced_at: ago(0) })(route)],
+      [/^POST \/datasources$/, json({ detail: '查询时限要填 1 到 600 之间的秒数：现在填的是 0' }, 422)],
       [/^POST \/datasources\/check-manage-empty\/introspect$/, (route, { url }) => {
         const schema = url.searchParams.get('schema')
         if (url.searchParams.get('dry_run') === 'true') {
@@ -448,7 +520,9 @@ console.log('\n=== 数据 · 数据库 ===')
         cur = { ...cur, ...body, options: body?.options ?? cur.options, ...(reconnect ? noCheck : {}) }
         return json(cur)(route)
       }],
-      [/^POST \/datasources\/[^/]+\/test$/, delayed(250, { ok: true, elapsed_ms: 42, url: 'x' })],
+      // 回得慢一点：「测连接期间只说一句」要在结果回来之前读两次播报区。250ms 在机器
+      // 负载高时第一次读就已经是结果了，这项时过时不过
+      [/^POST \/datasources\/[^/]+\/test$/, delayed(1500, { ok: true, elapsed_ms: 42, url: 'x' })],
       [/^POST \/datasources\/test$/, json({ ok: false, error: '连不上：认证失败', hint: '核对用户名和密码', detail: 'ORA-01017' })],
       [/^POST \/datasources\/[^/]+\/introspect/, (route, { url }) => {
         const id = url.pathname.split('/')[3]
@@ -461,19 +535,22 @@ console.log('\n=== 数据 · 数据库 ===')
     check('（跳过：沙箱里没有数据库）', true)
   } else {
     const card = page.locator(`[data-source="${first.name}"]`)
+    // 地址是沙箱库里真实的连接串（主机、账号、库名）：日志常被贴进报告，只报出问题的条数
     const addrs = await page.locator('article[data-source] .mono').allInnerTexts()
-    check('地址不留尾巴冒号', !addrs.some((a) => /:\s*$/.test(a)), addrs.join(' | ').slice(0, 160))
+    const tails = addrs.filter((a) => /:\s*$/.test(a))
+    check('地址不留尾巴冒号', !tails.length, tails.length ? `${tails.length} 条（内容不打出来）` : '')
     await card.getByRole('button', { name: /测连接/ }).click()
-    await page.waitForTimeout(40)
+    // 先等到真在测，再隔 1 秒读两次：计时每 100ms 一跳，播报区要是跟着念就对不上
+    await card.locator('[data-health="checking"]').first().waitFor({ timeout: 3000 })
     const spoken0 = await card.locator('[role="status"]').first().innerText().catch(() => '')
-    await page.waitForTimeout(160)
+    await page.waitForTimeout(700)
     const spoken1 = await card.locator('[role="status"]').first().innerText().catch(() => '')
     check('测连接期间播报区只说一句「正在测连接」，不跟着计时一跳一跳地念',
           spoken0 === '正在测连接' && spoken1 === spoken0, `${spoken0} / ${spoken1}`)
     check('……看得见的胶囊不是播报区（里面有计时）',
           (await card.locator('[data-health]').first().getAttribute('aria-hidden')) === 'true'
           && (await card.locator('[data-health]').first().getAttribute('role')) === null)
-    await page.waitForTimeout(400)
+    await until(() => card.locator('[data-health]').first().getAttribute('data-health').then((v) => v !== 'checking'), 5000)
     const pill = await card.locator('[data-health]').first().innerText()
     check('测连接的结果留在卡片上：已连通 · 42 ms', /已连通.*42 ms/.test(pill), pill)
     const spoken = await card.locator('[role="status"]').first().innerText()
@@ -516,12 +593,16 @@ console.log('\n=== 数据 · 数据库 ===')
 
   {
     const ec = page.locator(`[data-source="${empty.name}"]`)
+    // 全局数据源目录（store/catalog）每重拉一次就是一个 GET /datasources；页面自己的列表只在进页时拉
+    const lists = () => sent.filter((s) => s.key === 'GET /datasources').length
     const pill0 = await ec.locator('[data-health]').innerText()
     check('卡片初值是后端记着的上次测连接：连不上 · 2 小时前测', /连不上.*2 小时前测/.test(pill0), pill0)
     check('……原因写在卡片上', (await ec.innerText()).includes('认证失败'))
 
     // 换个 schema 看看：只看不存（dry_run），缓存和配置都不动
     check('探查失败的库给「换个 schema 看看」', await ec.locator('[data-probe-schema]').count() === 1)
+    check('失败框的候选里不含配置里现有的那个（ods），只列别的', await ec.getByRole('button', { name: '看看 ods' }).count() === 0
+          && await ec.getByRole('button', { name: '看看 mes' }).count() === 1)
     await ec.locator('[data-probe-schema]').click()
     const pd = dialog(page)
     const pdText = await pd.innerText()
@@ -545,8 +626,11 @@ console.log('\n=== 数据 · 数据库 ===')
     // 失败框里的候选 chip：探到了选「改」就写进配置，再按新配置真探一次
     await ec.getByRole('button', { name: '看看 mes' }).click()
     await page.waitForTimeout(500)
+    const listsBeforeSwitch = lists()
     await dialog(page).getByRole('button', { name: '改成 mes' }).click()
     await page.waitForTimeout(600)
+    check('……卡片上换了 schema、重探了：全局的数据源目录也跟着重拉（检查器、问数据读它的 schema 和结构）',
+          lists() > listsBeforeSwitch, `${listsBeforeSwitch} → ${lists()}`)
     const patch = sent.filter((s) => s.key === 'PATCH /datasources/check-manage-empty').at(-1)
     check('……选「改成 mes」：PATCH 写进 options.schema，别的连接参数原样带上',
           patch?.body?.options?.schema === 'mes' && patch?.body?.options?.sslmode === 'disable', JSON.stringify(patch?.body ?? {}))
@@ -557,8 +641,11 @@ console.log('\n=== 数据 · 数据库 ===')
 
     // 本机刚测的比后端记的新；只改说明不动它，改了连接配置就作废
     await ec.getByRole('button', { name: /测连接/ }).click()
-    await page.waitForTimeout(500)
-    check('本机刚测过：卡片换成本机的结果', /已连通.*42 ms/.test(await ec.locator('[data-health]').innerText()))
+    const tested = await until(async () => {
+      const t = await ec.locator('[data-health]').innerText()
+      return /已连通.*42 ms/.test(t) ? t : ''
+    }, 5000)
+    check('本机刚测过：卡片换成本机的结果', !!tested)
     await ec.getByRole('button', { name: '编辑' }).click()
     const ed = dialog(page)
     await ed.getByLabel('说明', { exact: true }).fill('检查脚本的假库（改过说明）')
@@ -568,9 +655,11 @@ console.log('\n=== 数据 · 数据库 ===')
           (await saveBtn.getAttribute('title')) ?? '')
     check('……密码框下软提示「只有免密登录的库才能这样连」', (await ed.innerText()).includes('免密登录'))
     await shot(page, 'datasource-nopw-edit')
+    const listsBefore = lists()
     if (await saveBtn.isEnabled()) await saveBtn.click()
     else await ed.getByRole('button', { name: '取消' }).click()
     await page.waitForTimeout(400)
+    check('……保存后全局的数据源目录跟着重拉（检查器挑工具、问数据的范围读它）', lists() > listsBefore, `${listsBefore} → ${lists()}`)
     const saved = sent.filter((s) => s.key === 'PATCH /datasources/check-manage-empty').at(-1)
     check('……保存时不带 password（不动它）', !!saved && !('password' in (saved.body ?? {})) && saved.body?.description?.includes('改过说明'),
           JSON.stringify(saved?.body ?? {}).slice(0, 120))
@@ -592,6 +681,53 @@ console.log('\n=== 数据 · 数据库 ===')
     const re = sent.filter((s) => s.key === 'POST /datasources/check-manage-drift/introspect').at(-1)
     check('……点「按配置重新探查」：按配置真探（不带 schema、不带 dry_run）', !!re && !re.url.includes('?'), re?.url ?? '')
     check('……探完那行 warn 就消失', await dc.locator('[data-schema-drift]').count() === 0)
+
+    // 老后端取单张表只给 detail 文本（没有 found）：原样显示，不能误报成「缓存里没有这张表」
+    await dc.getByRole('button', { name: /个对象/ }).click()
+    await page.waitForTimeout(500)
+    await dc.locator('[data-schema-browser] button[aria-expanded]').first().click()
+    await page.waitForTimeout(500)
+    const oldCols = await dc.locator('[data-schema-browser]').innerText()
+    check('老后端的列信息：照原文显示，不说「缓存里没有这张表」', oldCols.includes('amount') && oldCols.includes('REAL')
+          && !oldCols.includes('缓存里没有这张表'), oldCols.replace(/\s+/g, ' ').slice(0, 160))
+  }
+
+  {
+    // SQLite 也有高级连接参数（查询时限）；填错被 422 拒掉时写在那一项下面，不只弹 toast
+    await page.getByRole('button', { name: /接入数据库/ }).first().click()
+    const nd = dialog(page)
+    await nd.getByLabel('类型').selectOption('sqlite')
+    await nd.getByLabel(/^标识/).fill('zz_sqlite_demo')
+    await nd.getByLabel(/数据库文件路径/).fill('/tmp/zz_sqlite_demo.db')
+    const timeout = nd.locator('#ds-adv-query_timeout_s')
+    check('SQLite 表单有「查询时限（秒）」', await timeout.count() === 1)
+    if (await timeout.count()) {
+      if (!(await timeout.isVisible())) await nd.getByText('高级连接参数').click()
+      await timeout.fill('0')
+      await nd.getByRole('button', { name: '保存' }).click()
+      await page.waitForTimeout(500)
+      const err = await nd.locator('#ds-adv-query_timeout_s-error').innerText().catch(() => '')
+      check('……查询时限填错：后端的那句话写在这一项下面', err.includes('1 到 600'), err)
+      check('……输入框标成出错，焦点落在它上面', (await timeout.getAttribute('aria-invalid')) === 'true'
+            && await timeout.evaluate((el) => el === document.activeElement))
+      check('……不再只弹 toast', !(await page.locator('[aria-live="assertive"]').innerText().catch(() => '')).includes('1 到 600'))
+      await shot(page, 'datasource-sqlite-timeout-error')
+      // 照人的改法：退格删掉 0 再敲 30。删空的那一下高级参数一项都不剩，以前 <details> 跟着
+      // 收起，焦点掉到 body，后面敲的字落空（fill 一步到位，不经过空值，抓不到）
+      await timeout.press('Backspace')
+      await page.waitForTimeout(150)
+      check('……改了这一项，出错提示就收起', await nd.locator('#ds-adv-query_timeout_s-error').count() === 0)
+      const advOpen = () => timeout.evaluate((el) => !!el.closest('details')?.open)
+      check('……删空那一下：高级连接参数不收起，焦点还在这一项上', await advOpen()
+            && await timeout.evaluate((el) => el === document.activeElement),
+            `${await advOpen() ? '开着' : '收起了'} · 焦点在 ${await page.evaluate(() => document.activeElement?.id || document.activeElement?.tagName)}`)
+      await page.keyboard.type('30')
+      check('……接着敲 30 就填进这一项', (await timeout.inputValue()) === '30', `框里是「${await timeout.inputValue()}」`)
+    }
+    await nd.getByRole('button', { name: '取消' }).click()
+    await page.waitForTimeout(200)
+    const discard = dialog(page).getByRole('button', { name: '放弃修改' })
+    if (await discard.count()) await discard.click()
   }
 
   if (oracle) {
@@ -599,7 +735,9 @@ console.log('\n=== 数据 · 数据库 ===')
     const dlg = dialog(page)
     const target = dlg.locator('#ds-oracle-target')
     const svc = oracle.options?.service_name ?? oracle.database ?? ''
-    check('Oracle 编辑框回显 service_name（以前绑在 database 上，显示为空）', (await target.inputValue()) === svc, `「${await target.inputValue()}」应为「${svc}」`)
+    // 回显的是沙箱里真实的服务名：对不上也只说对不上，不把两边的值打出来
+    check('Oracle 编辑框回显 service_name（以前绑在 database 上，显示为空）', (await target.inputValue()) === svc,
+          (await target.inputValue()) === svc ? '' : '回显和配置不一致（内容不打出来）')
     check('类型提示不再指向表单上没有的 options', !(await dlg.innerText()).includes('options.'))
     const svcRadio = dlg.getByRole('radio', { name: 'service_name' })
     check('service_name / SID 单选组只占一个 Tab 位',
@@ -614,9 +752,12 @@ console.log('\n=== 数据 · 数据库 ===')
     await dlg.getByRole('button', { name: /测试连接/ }).click()
     await page.waitForTimeout(400)
     const req = sent.find((s) => s.key === 'POST /datasources/test')
-    check('弹窗里先测连接：带 id、只写 options.sid、不写 database',
-          req?.body?.id === oracle.id && req?.body?.options?.sid === 'ORCL' && !('service_name' in (req?.body?.options ?? {})) && !('database' in (req?.body ?? {})),
-          JSON.stringify(req?.body ?? {}).slice(0, 160))
+    // 请求体里是沙箱库真实的主机、账号、schema、说明：只报键名和判断用到的几个真假
+    const reqOk = req?.body?.id === oracle.id && req?.body?.options?.sid === 'ORCL'
+      && !('service_name' in (req?.body?.options ?? {})) && !('database' in (req?.body ?? {}))
+    check('弹窗里先测连接：带 id、只写 options.sid、不写 database', reqOk, reqOk ? '' : !req ? '没发 POST /datasources/test'
+          : `键：${Object.keys(req.body ?? {}).join(',')} · options 键：${Object.keys(req.body?.options ?? {}).join(',')}`
+            + ` · id 对=${req.body?.id === oracle.id} · sid=ORCL:${req.body?.options?.sid === 'ORCL'}`)
     check('测试失败的原因留在弹窗里', (await dlg.innerText()).includes('核对用户名和密码'))
     await dlg.getByLabel(/主机/).fill('')
     const title = (await dlg.getByRole('button', { name: '保存' }).getAttribute('title')) ?? ''
@@ -631,10 +772,9 @@ console.log('\n=== 数据 · 数据库 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 数据 · 表格 ===')
-{
+await section('数据 · 表格', async () => {
   const fake = {
     source: {
       id: 'check-manage-fake', name: 'sales_demo', kind: 'sqlite', host: null, port: null,
@@ -721,10 +861,9 @@ console.log('\n=== 数据 · 表格 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('上传只发了一次', sent.filter((s) => s.key === 'POST /datasources/upload').length === 1)
   await close()
-}
+})
 
-console.log('\n=== 知识库 ===')
-{
+await section('知识库', async () => {
   const { page, sent, natives, errors, close } = await open('/knowledge/kb', {
     uploadProgress: true,
     handlers: [[/^POST \/kb\/upload$/, delayed(1200, {
@@ -795,10 +934,9 @@ console.log('\n=== 知识库 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 知识库 · 检索贡献条与重建进度 ===')
-{
+await section('知识库 · 检索贡献条与重建进度', async () => {
   const hits = {
     query: '出勤', collection: 'default', degraded: [], alpha: embedding.default_alpha ?? 0.5,
     results: [
@@ -893,10 +1031,9 @@ console.log('\n=== 知识库 · 检索贡献条与重建进度 ===')
   check('……接着显示那一次的进度', ((await busy.page.locator('[data-reindex]').innerText().catch(() => '')).includes('3 / 12')))
   check('……只发了一次 POST，不起第二次', busy.sent.filter((s) => s.key === 'POST /kb/reindex').length === 1)
   await busy.close()
-}
+})
 
-console.log('\n=== 长期记忆 ===')
-{
+await section('长期记忆', async () => {
   const withRun = memories.find((m) => m.source?.kind === 'run' && m.source?.run_exists)
   const target = memories[0]
   const { page, sent, natives, errors, close } = await open('/knowledge/memory', {
@@ -934,7 +1071,9 @@ console.log('\n=== 长期记忆 ===')
     await row.getByRole('button', { name: '保存' }).click()
     await page.waitForTimeout(400)
     const patch = sent.find((s) => s.key.startsWith('PATCH /memory/'))
-    check('原地修改走 PATCH', patch?.body?.content?.endsWith('（已核对）'), JSON.stringify(patch?.body ?? {}).slice(-40))
+    // content 是沙箱里一条真实的记忆：只报有没有发、键名
+    check('原地修改走 PATCH', patch?.body?.content?.endsWith('（已核对）'),
+          patch?.body?.content?.endsWith('（已核对）') ? '' : patch ? `键：${Object.keys(patch.body ?? {}).join(',')}` : '没发 PATCH')
 
     await page.locator(`[data-memory="${target.id}"]`).getByRole('button', { name: '删除这条记忆' }).click()
     const d = dialog(page)
@@ -952,24 +1091,24 @@ console.log('\n=== 长期记忆 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 目录没取回来：空态不冒充「还没有」 ===')
-for (const [path, pattern, label] of [
-  ['/settings/providers', /^GET \/providers$/, '模型接入'],
-  ['/knowledge/skills', /^GET \/skills$/, 'Skill'],
-]) {
-  const { page, close } = await open(path, { handlers: [[pattern, json({ detail: '后端出错了' }, 500)]] })
-  await page.waitForTimeout(600)
-  const el = page.locator('main [data-empty-unknown]')
-  check(`${label}那张表没取回来：不说「还没有」，说没取回来并给「重新读取」`,
-        (await el.getAttribute('data-empty-unknown').catch(() => null)) === 'error' && (await el.innerText().catch(() => '')).includes('重新读取'))
-  check('……收起「添加 / 新建」这类动作，免得照着建出重复的', await el.getByRole('button', { name: /添加接入|新建 Skill/ }).count() === 0)
-  await close()
-}
+await section('目录没取回来：空态不冒充「还没有」', async () => {
+  for (const [path, pattern, label] of [
+    ['/settings/providers', /^GET \/providers$/, '模型接入'],
+    ['/knowledge/skills', /^GET \/skills$/, 'Skill'],
+  ]) {
+    const { page, close } = await open(path, { handlers: [[pattern, json({ detail: '后端出错了' }, 500)]] })
+    await page.waitForTimeout(600)
+    const el = page.locator('main [data-empty-unknown]')
+    check(`${label}那张表没取回来：不说「还没有」，说没取回来并给「重新读取」`,
+          (await el.getAttribute('data-empty-unknown').catch(() => null)) === 'error' && (await el.innerText().catch(() => '')).includes('重新读取'))
+    check('……收起「添加 / 新建」这类动作，免得照着建出重复的', await el.getByRole('button', { name: /添加接入|新建 Skill/ }).count() === 0)
+    await close()
+  }
+})
 
-console.log('\n=== Skill ===')
-{
+await section('Skill', async () => {
   const { page, sent, natives, close } = await open('/knowledge/skills', {
     handlers: [[/^POST \/skills$/, (route, { body }) => json({ id: 'fake-skill', ...body }, 201)(route)]],
   })
@@ -986,15 +1125,22 @@ console.log('\n=== Skill ===')
   check('保存时框里没收成标签的那半截也算上', JSON.stringify(post?.body?.tags) === JSON.stringify(['质量', '工艺', '出具']), JSON.stringify(post?.body?.tags))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   await close()
-}
+})
 
-console.log('\n=== 工具 ===')
-{
+await section('工具', async () => {
   const danger = tools.find((t) => t.runtime_approval)
   const safe = tools.find((t) => t.source === 'builtin' && !t.dangerous)
   let calls = 0
+  // 库里早就存着的坏参数定义：后端在工具项上给 problem
+  const brokenProblem = '参数定义格式不对：参数 store 要写成 {"type": "string"} 这样的对象，不能直接写 "string"'
+  const brokenTool = { id: 'broken_demo', name: 'broken_demo', description: '检查脚本的坏工具', category: '自定义 · http',
+    source: 'custom', dangerous: true, runtime_approval: false, schema: { properties: { store: 'string' } }, problem: brokenProblem }
+  const brokenRow = { id: 'check-manage-broken', name: 'broken_demo', kind: 'http', description: '检查脚本的坏工具',
+    parameters: { properties: { store: 'string' } }, config: { method: 'GET', url: 'https://example.com/x' }, enabled: true, problem: brokenProblem }
   const { page, sent, natives, errors, close } = await open(danger ? `/tools/library/${danger.id}` : '/tools', {
     handlers: [
+      [/^GET \/tools$/, async (route) => json([...await (await route.fetch()).json(), brokenTool])(route)],
+      [/^GET \/custom-tools$/, async (route) => json([...await (await route.fetch()).json(), brokenRow])(route)],
       [/^POST \/tools\/[^/]+\/run$/, (route, { body }) => {
         calls++
         return body?.confirm
@@ -1037,6 +1183,30 @@ console.log('\n=== 工具 ===')
     check('结果显示成功', (await page.locator('[data-tool-result]').getAttribute('data-tool-result')) === 'ok')
     const note = await page.locator('[data-tool-note]').innerText().catch(() => '')
     check('参数名被纠正过：成功结果下面用 warn 写出来，提醒先改对再抄进工作流', note.includes('cuont') && note.includes('改对'), note)
+    check('……结果和提醒落在看得见的地方（不用自己滚）', await inView(page.locator('[data-tool-note]')))
+  }
+  {
+    const item = page.locator('nav[aria-label="工具列表"] button', { hasText: 'broken_demo' }).first()
+    const chip = item.locator('[data-tool-problem]')
+    check('工具库：参数定义写坏的自定义工具挂醒目的 chip，悬停看完整原因', await chip.count() === 1
+          && (await chip.getAttribute('title')) === brokenProblem, await chip.innerText().catch(() => ''))
+    await item.click()
+    await page.waitForTimeout(300)
+    const alert = page.locator('[data-tool-problem-detail]')
+    check('……详情区写明原因和「绑了它的节点一定失败」', (await alert.innerText().catch(() => '')).includes('一定失败'))
+    await shot(page, 'tool-broken-detail')
+    await alert.getByRole('button', { name: '去改参数定义' }).click()
+    await page.waitForTimeout(700)
+    const ed0 = page.getByRole('dialog', { name: '编辑工具「broken_demo」' })
+    check('……「去改参数定义」直接打开它的编辑框（/tools/custom?edit=）', await ed0.count() === 1, page.url())
+    check('……读完 ?edit= 就从地址里摘掉', !page.url().includes('edit='), page.url())
+    const perr = await ed0.locator('[data-params-field]').innerText().catch(() => '')
+    check('……编辑框一打开，参数定义下面就写着坏在哪', perr.includes('参数 store'), perr.replace(/\s+/g, ' ').slice(0, 120))
+    const row0 = page.locator('div.rounded-lg', { hasText: 'broken_demo' }).last()
+    await ed0.getByRole('button', { name: '取消' }).click()
+    await page.waitForTimeout(300)
+    check('自定义工具列表：坏工具那一行也挂 chip，并写出原因', await row0.locator('[data-tool-problem]').count() === 1
+          && (await row0.innerText()).includes('参数 store'))
   }
   await page.getByRole('tab', { name: '自定义工具' }).click()
   await page.waitForTimeout(400)
@@ -1058,6 +1228,7 @@ console.log('\n=== 工具 ===')
   check('……没有保存（没发 POST /custom-tools）', !sent.some((s) => s.key === 'POST /custom-tools'))
   const trialNote = await trialBox.locator('[data-tool-note]').innerText().catch(() => '')
   check('……试跑结果里参数名被纠正过也写出来', trialNote.includes('qurey'), trialNote)
+  check('……试跑结果和提醒自己滚进弹窗的可视范围（试跑区在编辑框最底下）', await inView(trialBox.locator('[data-tool-note]')))
   await shot(page, 'custom-tool-trial')
   await ed.getByLabel(/^URL/).fill('https://api.example.com/fail')
   check('……改了配置，刚才的结果标成旧的', (await trialBox.innerText()).includes('这是改之前的结果'))
@@ -1087,10 +1258,9 @@ console.log('\n=== 工具 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 自定义工具 · 已有工具 ===')
-{
+await section('自定义工具 · 已有工具', async () => {
   // 参数是 {} 的已有工具：编辑器要显示存着的样子，只改描述不能把示例参数一起存回去
   const tool = {
     id: 'check-manage-tool', name: 'ping_mes', kind: 'http', description: '旧描述', parameters: {},
@@ -1101,6 +1271,7 @@ console.log('\n=== 自定义工具 · 已有工具 ===')
   const { page, sent, natives, errors, close } = await open('/tools/custom', {
     handlers: [
       [/^GET \/custom-tools$/, (route) => json(list)(route)],
+      [/^POST \/custom-tools$/, json({ detail: '参数定义格式不对：类型「int」认不出来，是不是想写 integer' }, 422)],
       [/^PATCH \/custom-tools\/check-manage-tool$/, (route, { body }) => json({ ...tool, ...body })(route)],
       [/^DELETE \/custom-tools\//, (route) => route.fulfill({ status: 204, body: '' })],
     ],
@@ -1125,6 +1296,34 @@ console.log('\n=== 自定义工具 · 已有工具 ===')
   check('……点「插入示例参数」才填进 query', (await dialog(page).locator('textarea').nth(1).inputValue()).includes('"query"'))
   await dialog(page).getByRole('button', { name: '取消' }).click()
 
+  // 新建时参数定义写坏了：后端 422 的那句话写在「参数 JSON Schema」下面，不是盖在标题上的 toast
+  await page.getByRole('button', { name: /新建工具/ }).first().click()
+  const nt = dialog(page)
+  await nt.getByLabel(/^名称/).fill('bad_schema_demo')
+  await nt.getByLabel(/^URL/).fill('https://example.com/x')
+  await nt.getByRole('button', { name: '保存' }).click()
+  await page.waitForTimeout(500)
+  const pe = await nt.locator('[data-params-field]').innerText().catch(() => '')
+  check('新建时保存被 422 拒掉：原因写在「参数 JSON Schema」下面', pe.includes('int') && pe.includes('integer'), pe.replace(/\s+/g, ' ').slice(0, 120))
+  check('……不再弹 toast', !(await page.locator('[aria-live="assertive"]').innerText().catch(() => '')).includes('integer'))
+  // toast 在 assertive 区里会被念出来；挪进字段之后，要靠焦点落到框上、框标成出错并指向那句话
+  const paramsBox = nt.locator('[data-params-field] textarea')
+  const described = await paramsBox.getAttribute('aria-describedby').catch(() => null)
+  const describedText = described
+    ? await page.evaluate((ids) => ids.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? '').join(' '), described) : ''
+  check('……参数框标成出错（aria-invalid），aria-describedby 指向那句原因', (await paramsBox.getAttribute('aria-invalid')) === 'true'
+        && describedText.includes('integer'), `aria-invalid=${await paramsBox.getAttribute('aria-invalid')} · describedby=${described ?? '无'}`)
+  check('……焦点落在参数框上（保存按钮忙时禁用，以前焦点掉到 body、弹窗外）', await paramsBox.evaluate((el) => el === document.activeElement),
+        await page.evaluate(() => document.activeElement?.tagName ?? 'null'))
+  check('……参数框描红', await paramsBox.evaluate((el) => getComputedStyle(el).borderTopColor)
+        === await page.evaluate(() => { const d = document.createElement('div'); d.style.color = 'var(--err)'; document.body.append(d); const c = getComputedStyle(d).color; d.remove(); return c }))
+  check('……弹窗还开着，填的东西都在', await nt.getByLabel(/^名称/).inputValue() === 'bad_schema_demo')
+  await shot(page, 'custom-tool-schema-error')
+  await nt.getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(200)
+  const discard0 = dialog(page).getByRole('button', { name: '放弃修改' })
+  if (await discard0.count()) await discard0.click()
+
   // 撤销窗口里别的操作重拉列表：删掉的那行不能跟着回来
   await page.getByRole('button', { name: '删除自定义工具 doomed_tool' }).click()
   await page.waitForTimeout(200)
@@ -1143,10 +1342,9 @@ console.log('\n=== 自定义工具 · 已有工具 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 知识库 · 撤销窗口里的轮询 ===')
-{
+await section('知识库 · 撤销窗口里的轮询', async () => {
   // 有文档在处理时列表 2 秒轮询一次。以前删掉的那行 2.6 秒后又被轮询救回来
   const now = new Date().toISOString()
   const busy = { id: 'check-manage-busy', collection: 'default', title: 'big.pdf', source: 'big.pdf', mime: 'application/pdf',
@@ -1187,10 +1385,9 @@ console.log('\n=== 知识库 · 撤销窗口里的轮询 ===')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
-}
+})
 
-console.log('\n=== 知识库 · 切块地图 ===')
-{
+await section('知识库 · 切块地图', async () => {
   const doc = (await get('/kb/documents?collection=default'))[0]
   if (doc) {
     const { page, close } = await open(`/knowledge/kb/${doc.id}`)
@@ -1203,7 +1400,7 @@ console.log('\n=== 知识库 · 切块地图 ===')
   } else {
     check('（跳过：沙箱知识库里没有文档）', true)
   }
-}
+})
 
 if (SHOTS) {
   console.log('\n=== 截图（亮 / 暗） ===')

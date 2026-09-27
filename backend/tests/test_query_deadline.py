@@ -258,6 +258,12 @@ def _fake(monkeypatch, **kw: Any) -> _FakeEngine:
     return fake
 
 
+def _budget(sql: str, prefix: str, scale: float = 1) -> float:
+    """下发的时限值。数据库拿到的是剩下的预算，取连接也算在里面，所以略小于整段时限。"""
+    assert sql.startswith(prefix), sql
+    return float(sql[len(prefix):]) * scale
+
+
 def _remote(kind: str, *, readonly: bool = True) -> Any:
     return types.SimpleNamespace(id=f"r_{kind}", name="shop", kind=kind, readonly=readonly,
                                  options={}, database="shop")
@@ -266,7 +272,8 @@ def _remote(kind: str, *, readonly: bool = True) -> Any:
 async def test_postgres_gets_a_statement_timeout_for_this_transaction_only(monkeypatch):
     fake = _fake(monkeypatch)
     await run_query(_remote("postgres"), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
-    assert fake.log[:2] == ["SET LOCAL statement_timeout = 5000", "SELECT 1"], fake.log
+    assert 4900 <= _budget(fake.log[0], "SET LOCAL statement_timeout = ") <= 5000, fake.log
+    assert fake.log[1] == "SELECT 1", fake.log
     # SET LOCAL 随事务回滚作废，不用也不该再发一条恢复
     assert not [s for s in fake.log[2:] if s.startswith("SET")]
 
@@ -275,13 +282,14 @@ async def test_postgres_writes_are_bounded_too(monkeypatch):
     fake = _fake(monkeypatch)
     await run_query(_remote("postgresql", readonly=False), "UPDATE orders SET id = 1",
                     limits=QueryLimits(timeout_seconds=5))
-    assert fake.log[:2] == ["SET LOCAL statement_timeout = 5000", "UPDATE orders SET id = 1"]
+    assert 4900 <= _budget(fake.log[0], "SET LOCAL statement_timeout = ") <= 5000, fake.log
+    assert fake.log[1] == "UPDATE orders SET id = 1"
 
 
 async def test_mysql_gets_max_execution_time_and_it_is_put_back(monkeypatch):
     fake = _fake(monkeypatch)
     await run_query(_remote("mysql"), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
-    assert fake.log[0] == "SET SESSION max_execution_time = 5000"
+    assert 4900 <= _budget(fake.log[0], "SET SESSION max_execution_time = ") <= 5000, fake.log
     assert "SELECT 1" in fake.log
     # 会话级设置跟着连接回池子：用完恢复成服务器的缺省，探查结构这类长操作不受它牵连
     assert fake.log[-1] == "SET SESSION max_execution_time = DEFAULT"
@@ -290,14 +298,15 @@ async def test_mysql_gets_max_execution_time_and_it_is_put_back(monkeypatch):
 async def test_mariadb_uses_its_own_variable_in_seconds(monkeypatch):
     fake = _fake(monkeypatch, mariadb=True)
     await run_query(_remote("mysql"), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
-    assert fake.log[0] == "SET SESSION max_statement_time = 5"
+    assert 4900 <= _budget(fake.log[0], "SET SESSION max_statement_time = ", 1000) <= 5000, fake.log
     assert fake.log[-1] == "SET SESSION max_statement_time = DEFAULT"
 
 
 async def test_oracle_gets_a_call_timeout_and_it_is_put_back(monkeypatch):
     fake = _fake(monkeypatch)
     await run_query(_remote("oracle"), "SELECT 1 FROM DUAL", limits=QueryLimits(timeout_seconds=5))
-    assert "call_timeout=5000" in fake.log, fake.log
+    sent = next(_budget(s, "call_timeout=") for s in fake.log if s.startswith("call_timeout="))
+    assert 4900 <= sent <= 5000, fake.log
     assert fake.driver.call_timeout == 0, "call_timeout 跟着连接回池子，探查结构时也会被它掐"
 
 
@@ -346,6 +355,81 @@ async def test_other_errors_are_not_mistaken_for_a_timeout(monkeypatch):
     _fake(monkeypatch, fail=RuntimeError('relation "orderz" does not exist'))
     with pytest.raises(RuntimeError, match="orderz"):
         await run_query(_remote("postgres"), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
+
+
+# --------------------------------------------------------------------------
+# 取连接慢：数据库的时限和后端兜底从同一刻算起
+# --------------------------------------------------------------------------
+
+
+class _HonouringConn:
+    """一台守 statement_timeout 的「服务器」：从收到 SET LOCAL 那一刻起算，到点报超时。"""
+
+    def __init__(self, log: list[tuple[float, str]], t0: float) -> None:
+        self.log, self.t0 = log, t0
+        self.dialect = types.SimpleNamespace(is_mariadb=False)
+
+    async def execute(self, clause):
+        self.log.append((time.monotonic() - self.t0, str(clause)))
+        return _Result([])
+
+    async def stream(self, clause):
+        self.log.append((time.monotonic() - self.t0, str(clause)))
+        set_at, sql = next((t, s) for t, s in self.log if s.startswith("SET LOCAL"))
+        ms = int(sql.rsplit("=", 1)[1])
+        await asyncio.sleep(max(0.0, set_at + ms / 1000 - (time.monotonic() - self.t0)))
+        raise RuntimeError("canceling statement due to statement timeout")
+
+
+class _SlowPool:
+    """取一个连接要等 wait 秒：冷启动的远程库、pool_recycle 之后重连、团队并行把池子占满。"""
+
+    def __init__(self, wait: float) -> None:
+        self.wait = wait
+        self.log: list[tuple[float, str]] = []
+        self.t0 = time.monotonic()
+
+    @asynccontextmanager
+    async def connect(self):
+        await asyncio.sleep(self.wait)
+        yield _HonouringConn(self.log, self.t0)
+
+    begin = connect
+
+
+def _slow(monkeypatch, wait: float) -> _SlowPool:
+    pool = _SlowPool(wait)
+
+    async def _get(_source):
+        pool.t0 = time.monotonic()
+        return pool
+
+    monkeypatch.setattr(engines, "get", _get)
+    return pool
+
+
+async def test_a_slow_connection_does_not_let_the_backstop_beat_the_database(monkeypatch):
+    """取连接花掉的时间也算在时限里：数据库拿到的是剩下的预算，于是它先停下语句、
+    报出「超过 Ns 被中断」；后端兜底只在数据层也卡住时才出面。以前兜底从取连接之前
+    算起、数据库却拿到整段时限，取连接一慢，兜底就抢在数据库前面把语句取消了——
+    PG 的连接照样被占到「连上的时刻 + 时限」。"""
+    pool = _slow(monkeypatch, 0.7)
+    with pytest.raises(SqlRejected) as caught:
+        await run_query(_remote("postgres"), "SELECT 1", limits=QueryLimits(timeout_seconds=1))
+    sent = next(int(s.rsplit("=", 1)[1]) for _t, s in pool.log if s.startswith("SET LOCAL"))
+    assert 0 < sent < 1000, f"数据库拿到的该是剩下的预算，实际是 {sent}ms"
+    assert not isinstance(caught.value.__cause__, TimeoutError), \
+        "该是数据库按时限停下的那条路（deadline.stopped），不是后端兜底的 TimeoutError"
+    assert "查询超过 1s 被中断" in str(caught.value)
+
+
+async def test_a_budget_spent_waiting_for_a_connection_sends_nothing(monkeypatch):
+    """取到连接时时限已经用完：直接按超时报，一条语句也不发给数据库。"""
+    pool = _slow(monkeypatch, 0.4)
+    with pytest.raises(SqlRejected) as caught:
+        await run_query(_remote("postgres"), "SELECT 1", limits=QueryLimits(timeout_seconds=0.3))
+    assert pool.log == [], pool.log
+    assert "查询超过 0.3s 被中断" in str(caught.value)
 
 
 # --------------------------------------------------------------------------

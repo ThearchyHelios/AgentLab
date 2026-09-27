@@ -13,7 +13,7 @@ import { edgeKey, topology } from '../run/derive'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
 import { explainRunError } from '../lib/explain'
-import { formatClock, formatDuration, formatNumber, formatTokens, NONE } from '../lib/format'
+import { formatDuration, formatLapse, formatNumber, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import { issuanceLabel, RUN_CLASS_LABEL } from '../lib/terms'
 import { ApprovalCard } from '../run/RunPanel'
@@ -520,7 +520,7 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
         return { main: loop('stopped'), side: <span className="tnum">{formatDuration(timed ? loopSpan(n, at) : undefined)}</span> }
       }
       return {
-        main: n?.startedAt != null && n.endedAt != null && timed ? `停在 ${formatClock(n.endedAt - n.startedAt)}` : '',
+        main: n?.startedAt != null && n.endedAt != null && timed ? `停在 ${formatLapse(n.endedAt - n.startedAt)}` : '',
         note: n?.count ? '' : '没有开始',
       }
     case 'suspended':

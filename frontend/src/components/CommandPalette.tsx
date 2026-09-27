@@ -19,7 +19,7 @@ import type { ThemePref } from '../lib/theme'
 import { isMac } from '../lib/keys'
 import { formatDateTime, formatTime, parseServerTime, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { WORKFLOW_STATUS_LABEL, runClassLabel } from '../lib/terms'
+import { WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
 import { errorMessage } from '../lib/errors'
 import { disableNotify, enableNotify, notifySupported, useSignals } from '../lib/notify'
 import { canLeave, leavePass } from '../lib/leave'
@@ -51,7 +51,7 @@ export interface PageDef {
 // ⌥ + 数字切页：不和浏览器的 ⌘1–9（切标签页，页面拦不住）撞，也不和画布上的
 // Backspace / Delete 以及各处输入框打架——「g c」这类两键序列就是栽在这上面
 export const PAGES: PageDef[] = [
-  { to: '/chat', label: '问数据', hint: '说需求，自动接数据源、建流程、跑出结论', icon: MessageSquare, shortcut: 'Alt+1', keywords: 'chat ask 对话 提问 首页' },
+  { to: '/chat', label: '问数据', hint: '说需求，自动接数据源、搭工作流、跑出结论', icon: MessageSquare, shortcut: 'Alt+1', keywords: 'chat ask 对话 提问 首页' },
   { to: '/studio', label: '编排', hint: '在画布上搭工作流、调试、发布', icon: FlaskConical, shortcut: 'Alt+2', keywords: 'studio canvas 画布 工作流 workflow' },
   { to: '/runs', label: '记录', hint: '每次运行的过程、成果和待审批', icon: History, shortcut: 'Alt+3', keywords: 'runs history 运行 运行记录 历史 审批' },
   { to: '/data', label: '数据', hint: '接入数据库和表格，问数据和工作流从这里取数', icon: Database, shortcut: 'Alt+4', keywords: 'data datasource 数据源 数据库 表格 excel csv' },
@@ -247,6 +247,10 @@ function score(c: Command, tokens: string[]): number {
   return total
 }
 
+/** 面板以外的模态框（离开前确认、各页的弹窗） */
+const OTHER_MODAL = '[aria-modal="true"]:not([data-command-palette])'
+const otherModal = () => !!document.querySelector(OTHER_MODAL)
+
 export function CommandPalette() {
   const open = useShell((s) => s.palette)
   return open ? <PaletteView /> : null
@@ -274,20 +278,32 @@ function PaletteView() {
   useEffect(() => {
     inputRef.current?.focus()
     return () => {
-      // 焦点还给打开前的那个元素；选中的命令已经把焦点带去别处（跳了页、开了弹窗）就不抢
+      // 焦点还给打开前的那个元素；选中的命令已经把焦点带去别处（跳了页、开了弹窗）就不抢。
+      // 别的模态框开着时也不还：焦点该在它里面，还给 opener 就落到了它外面
       const now = document.activeElement
+      if (otherModal()) return
       if (opener?.isConnected && (!now || now === document.body)) opener.focus({ preventScroll: true })
     }
   }, [opener])
 
   // 开着时焦点只在面板里：刚跳过去的页面挂载时会自动聚焦（画布助手的输入框），
-  // 焦点一被抢走，接着打的字和 Esc 就都落到了面板底下
+  // 焦点一被抢走，接着打的字和 Esc 就都落到了面板底下。落进别的模态框（离开前确认）
+  // 的不拉回：那是更要紧的问题，拉回来人就答不了它
   useEffect(() => {
     const onFocusIn = (e: FocusEvent) => {
-      if (e.target instanceof Node && !panelRef.current?.contains(e.target)) inputRef.current?.focus({ preventScroll: true })
+      if (!(e.target instanceof Element) || panelRef.current?.contains(e.target)) return
+      if (e.target.closest(OTHER_MODAL)) return
+      inputRef.current?.focus({ preventScroll: true })
     }
     document.addEventListener('focusin', onFocusIn)
     return () => document.removeEventListener('focusin', onFocusIn)
+  }, [])
+
+  // 浏览器后退、前进（侧键、触控板手势、⌘[）时先收起面板：离开前确认的框要弹出来，
+  // 面板压在它上面（z 更高）就看不见，焦点也被拉回搜索框，人只能对着面板按键
+  useEffect(() => {
+    window.addEventListener('popstate', closeCommandPalette)
+    return () => window.removeEventListener('popstate', closeCommandPalette)
   }, [])
 
   // 最近运行、最近会话是打开面板时才取：常驻轮询它们不值得
@@ -314,7 +330,7 @@ function PaletteView() {
       list.push({
         id: `approval:${a.id}`, group: 'approvals', label: a.title || '待审批',
         // 同一个审批节点跑过几次，标题会一模一样：带上运行的短 id 才分得开
-        hint: [a.workflow_name, a.node_label, shortId(a.run_id)].filter(Boolean).join(' · '),
+        hint: [a.workflow_name && runName(a), a.node_label, shortId(a.run_id)].filter(Boolean).join(' · '),
         keywords: `审批 approval 待办 ${a.run_id}`,
         icon: <Hourglass size={14} />,
         meta: waited && <span title={formatDateTime(a.created_at)}>已等 {waited}</span>,
@@ -388,7 +404,7 @@ function PaletteView() {
     for (const r of runs ?? []) {
       const pendingHere = r.status === 'interrupted' ? hasPendingApproval(approvals, r.id) : undefined
       list.push({
-        id: `run:${r.id}`, group: 'runs', label: r.workflow_name || '未命名工作流',
+        id: `run:${r.id}`, group: 'runs', label: runName(r) || '未命名工作流',
         hint: `${statusLabel(r.status, { pendingApproval: pendingHere })} · ${runClassLabel(r.run_class, r.version)} · ${shortId(r.id)}`,
         keywords: `run 运行 ${r.id}`,
         icon: <StatusBadge status={r.status} pendingApproval={pendingHere} size={14} animate={false} decorative />,

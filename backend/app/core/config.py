@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -83,7 +86,38 @@ class Settings(BaseSettings):
     http_tool_timeout: int = 20
     http_tool_max_bytes: int = 2_000_000
     # 逗号分隔的域名白名单；为空表示不限制（仅拦截内网地址）
-    http_tool_allowlist: list[str] = []
+    http_tool_allowlist: Annotated[list[str], NoDecode] = []
+    # 本机代理 fake-ip 模式给的假地址段，逗号分隔（Clash / mihomo 默认 198.18.0.0/15）。
+    # 为空表示不认：解析到这些地址一律按内网拦截。配了之后，落在段里的解析结果改向
+    # 下面的公共 DNS 核实真实地址——不能直接放行，内网域名在 fake-ip 下也是这个段
+    http_tool_fake_ip_ranges: Annotated[list[str], NoDecode] = []
+    # 核实用的 DNS-over-HTTPS（JSON 接口），按顺序试。写 IP 形式免得解析 DoH 自己的域名。
+    # 境外的排前面：境内公共 DNS 对被封锁的域名返回污染结果（维基百科的 AAAA 给 2001::1），
+    # 会被当成内网误拦；开 fake-ip 的机器本来就有代理，连得上境外的 DoH
+    http_tool_doh_urls: Annotated[list[str], NoDecode] = [
+        "https://1.1.1.1/dns-query",
+        "https://223.5.5.5/resolve",
+    ]
+
+    @field_validator("http_tool_allowlist", "http_tool_fake_ip_ranges", "http_tool_doh_urls", mode="before")
+    @classmethod
+    def _comma_list(cls, value: object) -> object:
+        # 环境变量里写逗号分隔；也兼容 JSON 数组的写法
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                import json
+
+                return json.loads(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @field_validator("http_tool_fake_ip_ranges")
+    @classmethod
+    def _valid_ranges(cls, value: list[str]) -> list[str]:
+        for cidr in value:
+            ipaddress.ip_network(cidr, strict=False)  # 写错就在启动时报出来，别到运行时才静默失效
+        return value
 
     @property
     def db_path(self) -> Path:

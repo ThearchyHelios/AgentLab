@@ -24,12 +24,36 @@
 // - 等审批时只能批不能放弃；回放时回边的 ×N、面板的用量拿终值冒充那一刻；
 // - Copilot 搭图时新节点落在视口外看不见；双击空白处只会缩放；1024 宽打开只看得见两张半卡；
 // - Copilot 删掉的节点一声不响就没了，看不出删的是哪个、原来在哪。
+//
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
+// 沙箱拷贝）跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-canvas-fx.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+// FX_ONLY=九天,运行中点节点 只跑段名里含这些字的段（逗号分隔）
+const ONLY = (process.env.FX_ONLY ?? '').split(',').filter(Boolean)
+/**
+ * 一节一节地跑：某一节里等待超时、元素找不到，只记成这一节失败，关掉它开的浏览器，
+ * 接着跑下一节——不让一处卡住把后面几十项一起吞掉
+ */
+const opened = new Set()
+async function section(name, fn) {
+  if (ONLY.length && !ONLY.some((k) => name.includes(k))) return
+  console.log(`=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  } finally {
+    for (const b of opened) await b.close().catch(() => {})
+    opened.clear()
+  }
+}
 
 let failed = 0
 const check = (name, cond, detail = '') => {
@@ -184,8 +208,16 @@ async function fakeBackend(page) {
 
 async function openStudio({ id = FX_ID, theme = 'dark', ...extra } = {}) {
   const browser = await chromium.launch({ executablePath: CHROME })
+  opened.add(browser)
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 950 }, colorScheme: theme, ...extra })
   await ctx.addInitScript((t) => { try { localStorage.setItem('agentlab.theme', t) } catch { /* 隐私窗口 */ } }, theme)
+  // 按页面自己加载时的地址 import 模块：热更新过的模块地址带 ?t=，直接写 /src/… 会拿到
+  // 另一份实例（另一个坞的 store），改了它页面上什么都不变
+  await ctx.addInitScript(() => {
+    performance.setResourceTimingBufferSize(10_000)
+    window.__appImport = (path) => import(performance.getEntriesByType('resource').map((e) => e.name)
+      .find((n) => { try { return new URL(n).pathname === path } catch { return false } }) ?? path)
+  })
   const page = await ctx.newPage()
   const errors = []
   page.on('pageerror', (e) => errors.push('pageerror: ' + e.message))
@@ -253,8 +285,7 @@ const nodeState = (page, id) => page.evaluate((nid) => {
 
 // ---------------------------------------------------------------- 运行中
 
-console.log('=== 运行中：胶囊、光点、计时 ===')
-{
+await section('运行中：胶囊、光点、计时', async () => {
   const { browser, page, errors } = await openStudio()
   await seedRun(page)
   await feed(page, PARALLEL_NOW)
@@ -346,12 +377,11 @@ console.log('=== 运行中：胶囊、光点、计时 ===')
   check('节点上写了 --rank', lod.rank === '2', `gate 的 --rank=${lod.rank}`)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 等人
 
-console.log('=== 等人：入边闸门，不流光点；去审批代替停止 ===')
-{
+await section('等人：入边闸门，不流光点；去审批代替停止', async () => {
   const { browser, page } = await openStudio()
   await markBoot(page)
   await seedRun(page)
@@ -438,10 +468,9 @@ console.log('=== 等人：入边闸门，不流光点；去审批代替停止 ==
   check('取消之后说清谁放弃的、关了什么', line.includes('检查员 放弃了这次运行，1 条待审批一并关闭'),
     opened ? line : `胶囊不见了${await reloaded(page) ? '：页面被热更新重载过，重跑确认' : ''}`)
   await browser.close()
-}
+})
 
-console.log('=== 等人：同一刻的等待时长各处同一个数 ===')
-{
+await section('等人：同一刻的等待时长各处同一个数', async () => {
   // 打开一条正在等审批的运行（?run= 接上时补发的历史）。事件挪到"刚才"：等了七八秒，
   // 段够宽、写得下字；补发的历史不参与时钟偏差，等待时长按真实时间走
   const { browser, page } = await openStudio()
@@ -483,28 +512,93 @@ console.log('=== 等人：同一刻的等待时长各处同一个数 ===')
   check('坞头、面板标题、需要处理、等人合计、运行行、泳道、右边合计：同一个数', same, JSON.stringify(waits.raw))
   check('等了几秒而不是 0', typeof base === 'number' && base >= 30, String(base))
   await browser.close()
-}
+})
+
+await section('等了九天：跨天的读数按天、小时写，各处同一个说法（和记录页一致）', async () => {
+  // 审批挂了九天一小时：以前坞头写「已等 217:00:14.3」、泳道「等 217:00…」，记录页写「9 天 01 小时」
+  const { browser, page } = await openStudio()
+  await seedRun(page)
+  const shift = Date.now() / 1000 - (9 * 86_400 + 3600) - 14.3 - BASE
+  const history = [...PARALLEL, ...TEAM_DONE, ...TO_REVIEW,
+    ev(18, 'run.interrupted', 'review', { payload: { node_id: 'review' } }, 14.3)]
+  await feed(page, history.map((e) => ({ ...e, ts: e.ts + shift, replay: true })))
+  await page.waitForTimeout(400)
+  await capsule(page).locator('.sf-cap-main').click()
+  await page.waitForTimeout(300)
+  const read = () => page.evaluate(() => {
+    const txt = (el) => el?.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+    const find = (sel, head) => [...document.querySelectorAll(sel)].map(txt).find((t) => t.startsWith(head)) ?? ''
+    return {
+      header: txt(document.querySelector('.tl-alert.is-warn')),
+      headline: txt(document.querySelector('.sf-hud-line')),
+      queue: txt(document.querySelector('.sf-queue-item.is-waiting .sf-dim')),
+      metric: find('.sf-metric-s', '等人'),
+      sum: txt(document.querySelector('.tl-run .tl-sum')),
+      sumTitle: document.querySelector('.tl-run .tl-sum')?.getAttribute('title') ?? '',
+      lane: txt(document.querySelector('.tl-lane[data-node-id="review"] .tl-sum')),
+      laneTitle: document.querySelector('.tl-lane[data-node-id="review"] .tl-sum')?.getAttribute('title') ?? '',
+      clipped: [...document.querySelectorAll('.tl-sum')].filter((el) => el.scrollWidth > el.clientWidth + 1).map(txt),
+      wall: find('.sf-metric-v', 'T+'),
+      wallOver: [...document.querySelectorAll('.sf-metric-v')].filter((el) => el.scrollWidth > el.clientWidth + 1).map((el) => `${txt(el)} ${el.scrollWidth}/${el.clientWidth}`),
+      card: txt(document.querySelector('.react-flow__node[data-id="review"] .nc')),
+      clock: txt(document.querySelector('.sf-cap-clock')),
+      cursor: txt(document.querySelector('.tl-cursor-head')),
+      folds: [...document.querySelectorAll('.tl-fold-tag')].map(txt),
+    }
+  })
+  const r = await read()
+  const spans = ['header', 'headline', 'queue', 'metric', 'card', 'sumTitle', 'laneTitle']
+  check('等了多久：坞头、面板、需要处理、等人合计、卡片、摘要的悬停都写「9 天 01 小时」',
+    spans.every((k) => r[k].includes('9 天 01 小时')), JSON.stringify(Object.fromEntries(spans.map((k) => [k, r[k]]))))
+  // 摘要那一列只有 116px：只写最大的单位，不被截成「等 9 天 0…」
+  check('泳道和运行行的摘要写「等 9 天」，一列都没被截断', r.sum.endsWith('等 9 天') && r.lane.endsWith('等 9 天')
+    && !r.clipped.length, `${r.sum} | ${r.lane}${r.clipped.length ? ` · 截断：${r.clipped.join(' / ')}` : ''}`)
+  check('面板的墙钟过了一天写「T+9 天」，读数都放得下（不压到旁边那一格）', r.wall === 'T+9 天' && !r.wallOver.length, `${r.wall} ${r.wallOver.join(' / ')}`)
+  check('相对开始的时刻（胶囊计时、游标）写「9 天 01:00:xx」', /^9 天 01:00:\d\d$/.test(r.clock)
+    && /9 天 01:00:\d\d/.test(r.cursor), `${r.clock} · ${r.cursor}`)
+  check('压起来的空档写「9 天」', r.folds.includes('9 天'), r.folds.join(' | '))
+  // 右栏运行层底部的用量行：以前写「等人 219:34:39.6」，和上面一众「9 天 01 小时」不是一个说法（3C REQ-9）
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('agentlab:goto-approval',
+    { detail: { runId: window.__studio.getState().run?.id, nodeId: 'review' }, cancelable: true })))
+  await page.waitForTimeout(400)
+  const panelUsage = await page.evaluate(() =>
+    document.querySelector('[data-assistant-panel] [aria-label="这次运行的用量"]')?.textContent?.replace(/\s+/g, ' ').trim() ?? '')
+  check('右栏用量行的等人也写「9 天 01 小时」', /等人 9 天 01 小时/.test(panelUsage) && !/\d{3}:\d\d/.test(panelUsage), panelUsage)
+  check('没有一处写成「217:…」这种得自己除 24 的钟面', !Object.values(r).flat().some((v) => /\d{3}:\d\d/.test(v)),
+    Object.values(r).flat().filter((v) => /\d{3}:\d\d/.test(v)).join(' | '))
+  // 不压缩空档时九天摊开：刻度按天排，不能挤成一团
+  await page.locator('.tl-toggle input[aria-label="压缩空闲"]').uncheck({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(300)
+  const ticks = await page.evaluate(() => [...document.querySelectorAll('.tl-axis .tl-tick')].map((el) => ({
+    x: el.getBoundingClientRect().left, text: el.textContent ?? '' })))
+  const gap = Math.min(...ticks.slice(1).map((t, i) => t.x - ticks[i].x))
+  check('不压缩时刻度按天排、互不挤压', ticks.length >= 3 && ticks.length <= 30 && gap >= 60
+    && ticks.some((t) => /^\d+ 天/.test(t.text)), `${ticks.length} 个 · 最近 ${Math.round(gap)}px · ${ticks.slice(0, 4).map((t) => t.text).join(' ')}`)
+  await page.locator('.tl-toggle input[aria-label="压缩空闲"]').check({ timeout: 2000 }).catch(() => {})
+  await browser.close()
+})
 
 // ---------------------------------------------------------------- 失败 / 取消 / 挂起
 
 const settleCase = async (label, tail, expect) => {
-  console.log(`=== ${label} ===`)
-  const { browser, page } = await openStudio()
-  await seedRun(page)
-  await feed(page, [...PARALLEL, ...tail])
-  await page.waitForTimeout(500)
-  check('光弧全部收掉', await count(page, '.fx-halo') === 0, `${await count(page, '.fx-halo')} 个`)
-  check('光点全部收掉', await count(page, '.edge-packet') === 0, `${await count(page, '.edge-packet')} 个`)
-  check('协作行不再"进行中"', await count(page, '.team-row-running') === 0, `${await count(page, '.team-row-running')} 行`)
-  const cap = await capText(page)
-  check(`胶囊写着${expect.text}`, cap.includes(expect.text), cap)
-  for (const name of expect.actions) {
-    check(`有「${name}」`, await capsule(page).getByRole('button', { name: new RegExp(name) }).count() >= 1)
-  }
-  check('不再给停止', await capsule(page).getByRole('button', { name: /停止/ }).count() === 0)
-  check('发起按钮回来了', await launcher(page).count() === 1)
-  await expect.more?.(page)
-  await browser.close()
+  await section(label, async () => {
+    const { browser, page } = await openStudio()
+    await seedRun(page)
+    await feed(page, [...PARALLEL, ...tail])
+    await page.waitForTimeout(500)
+    check('光弧全部收掉', await count(page, '.fx-halo') === 0, `${await count(page, '.fx-halo')} 个`)
+    check('光点全部收掉', await count(page, '.edge-packet') === 0, `${await count(page, '.edge-packet')} 个`)
+    check('协作行不再"进行中"', await count(page, '.team-row-running') === 0, `${await count(page, '.team-row-running')} 行`)
+    const cap = await capText(page)
+    check(`胶囊写着${expect.text}`, cap.includes(expect.text), cap)
+    for (const name of expect.actions) {
+      check(`有「${name}」`, await capsule(page).getByRole('button', { name: new RegExp(name) }).count() >= 1)
+    }
+    check('不再给停止', await capsule(page).getByRole('button', { name: /停止/ }).count() === 0)
+    check('发起按钮回来了', await launcher(page).count() === 1)
+    await expect.more?.(page)
+    await browser.close()
+  })
 }
 
 await settleCase('失败：接着跑、定位，下游阻断', [
@@ -578,8 +672,7 @@ await settleCase('服务重启挂起：接着跑', [
 
 // ---------------------------------------------------------------- 跑完
 
-console.log('=== 跑完：执行路径、回边、回放、清除 ===')
-{
+await section('跑完：执行路径、回边、回放、清除', async () => {
   const { browser, page, errors } = await openStudio()
   await seedRun(page)
   // 分两批灌：同一秒里只放一个一次性时刻，开场点亮和成功回扫挤在一起时后一个会被让掉
@@ -685,6 +778,33 @@ console.log('=== 跑完：执行路径、回边、回放、清除 ===')
   check('段上的字、折叠标签、游标头都不小于 11px', sizes.bar >= 11 && sizes.head >= 11 && sizes.fold >= 11,
     JSON.stringify(sizes))
 
+  // 给坞分高度的人（记录页的航迹页签）照 dockHeightFor 给高度：泳道一行不裁，也不多出一截。
+  // 少 1px 就得滚——上边框那 1px 算在坞的高度里，漏算它最后一条泳道被裁掉 1px
+  const fit = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/canvas/RunTimeline.tsx')
+    const s = window.__studio.getState()
+    const want = m.dockHeightFor(s.trace, { nodes: s.nodes, edges: s.edges })
+    const was = m.useDock.getState().height
+    const measure = async (h) => {
+      m.useDock.getState().set({ height: h })
+      await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)))
+      const sc = document.querySelector('.tl-scroll')
+      const lanes = [...document.querySelectorAll('.tl-lane')]
+      const last = lanes[lanes.length - 1]?.getBoundingClientRect()
+      return { box: Math.round(document.querySelector('.tl').getBoundingClientRect().height),
+        over: sc.scrollHeight - sc.clientHeight, cut: last ? Math.round(last.bottom - sc.getBoundingClientRect().bottom) : null,
+        lanes: lanes.length }
+    }
+    const exact = await measure(want)
+    const short = await measure(want - 1)
+    m.useDock.getState().set({ height: was })
+    return { want, exact, short, border: m.DOCK_BORDER_H }
+  }).catch((e) => ({ error: e.message.split('\n')[0] }))
+  check('坞高给 dockHeightFor：泳道一行不裁，也不用滚', fit.exact?.box === fit.want && fit.exact.over === 0
+    && fit.exact.cut <= 0 && fit.exact.lanes > 7, JSON.stringify(fit))
+  check('少 1px 就得滚：dockHeightFor 不多给（上边框算进去了）', fit.short?.over === 1 && fit.short.cut === 1,
+    JSON.stringify(fit.short))
+
   await page.locator('.tl-seg').getByRole('button', { name: /实时/ }).click()
   await page.waitForTimeout(200)
   check('切回实时', await page.evaluate(() => window.__studio.getState().replayAt) === null)
@@ -733,10 +853,9 @@ console.log('=== 跑完：执行路径、回边、回放、清除 ===')
   check('那次运行结束后开关是关着的', await toggle.count() === 1 && !(await toggle.isChecked()))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
-console.log('=== 补发的历史（attachRun 回放）：直接落终态，不播时刻 ===')
-{
+await section('补发的历史（attachRun 回放）：直接落终态，不播时刻', async () => {
   const { browser, page } = await openStudio()
   await seedRun(page)
   const replayed = [...PARALLEL, ...TEAM_DONE, ...TO_LOOP].map((e) => ({ ...e, replay: true }))
@@ -751,12 +870,11 @@ console.log('=== 补发的历史（attachRun 回放）：直接落终态，不�
   check('历史事件不触发一次性时刻', seen.moment === null && seen.sweeps === 0, JSON.stringify(seen))
   check('历史事件照样落到终态', seen.phase === 'succeeded', seen.phase)
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 正式运行
 
-console.log('=== 正式运行：入口看 published_version；运行期间画布只读 ===')
-{
+await section('正式运行：入口看 published_version；运行期间画布只读', async () => {
   const { browser, page } = await openStudio()
   // 保存过一次（status 退回草稿）且画布有未保存改动：正式运行入口照样在
   await page.evaluate(() => window.__studio.setState({ dirty: true }))
@@ -813,10 +931,9 @@ console.log('=== 正式运行：入口看 published_version；运行期间画布
   const p1 = await pos()
   check('正式运行期间拖拽被禁', p0.x === p1.x && p0.y === p1.y, `${JSON.stringify(p0)} → ${JSON.stringify(p1)}`)
   await browser.close()
-}
+})
 
-for (const width of [1280, 1024]) {
-  console.log(`=== 正式运行 @${width}：只读横幅不盖住跟随那一枚 ===`)
+for (const width of [1280, 1024]) await section(`正式运行 @${width}：只读横幅不盖住跟随那一枚`, async () => {
   const { browser, page } = await openStudio({ viewport: { width, height: 860 } })
   await seedRun(page, { run_class: 'formal', version: 2 })
   await feed(page, PARALLEL_NOW)
@@ -842,12 +959,11 @@ for (const width of [1280, 1024]) {
   check('横幅和跟随那一枚不重叠', !geo.overlap && !!geo.banner && !!geo.follow, JSON.stringify(geo))
   check('「恢复」点得到', geo.resume)
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 取景
 
-console.log('=== 打开宽图：以入口为左锚，缩放不低于可读下限 ===')
-{
+await section('打开宽图：以入口为左锚，缩放不低于可读下限', async () => {
   const { browser, page, errors } = await openStudio({ id: WIDE_ID })
   await page.waitForTimeout(600)
   const view = await page.evaluate(() => {
@@ -935,12 +1051,11 @@ console.log('=== 打开宽图：以入口为左锚，缩放不低于可读下限
     && await page.evaluate(() => document.querySelector('.react-flow')?.dataset.lod) === 'full')
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 运行中点节点
 
-console.log('=== 运行中点节点：先看它的步骤，属性面板是次级入口 ===')
-{
+await section('运行中点节点：先看它的步骤，属性面板是次级入口', async () => {
   const { browser, page, errors } = await openStudio()
   await seedRun(page)
   await feed(page, PARALLEL_NOW)
@@ -982,6 +1097,37 @@ console.log('=== 运行中点节点：先看它的步骤，属性面板是次级
   await page.waitForTimeout(150)
   check('Esc 收起属性面板、取消选中，运行还在', await sheet() === 0
     && await page.evaluate(() => window.__studio.getState().runPhase) === 'running')
+  // 右栏停在对话层时步骤行根本不在页面上：由右栏接手这个事件，切到运行层、滚到这个节点
+  // 最后一次执行的步骤、描一圈。以前画布只能在右栏已经是运行层时自己去找，对话层时点了没反应
+  const toChat = page.locator('[data-assistant-panel] button[title="回到和助手的对话"]')
+  await toChat.click({ timeout: 2000 }).catch(() => {})
+  await page.waitForTimeout(250)
+  const inChat = await count(page, '[data-assistant-panel] [data-step-status]') === 0
+  await page.evaluate(() => { window.__reveal = [] })
+  await head('start').click()
+  const stepRow = () => page.evaluate(() => {
+    const row = [...document.querySelectorAll('[data-assistant-panel] [data-step-status][data-node-id="start"]')].at(-1)
+    return row ? { flash: row.dataset.flash ?? null, handled: window.__reveal.length } : null
+  })
+  const shown = await until(async () => ((await stepRow())?.flash === 'focus' ? stepRow() : false), { timeout: 2500 })
+    || await stepRow()
+  check('右栏在对话层：点跑过的节点，右栏切到运行层并描出它的步骤', inChat && !!shown && shown.flash === 'focus',
+    `${inChat ? '' : '（准备：右栏没回到对话层）'}${JSON.stringify(shown)}`)
+  // 先选中、再请右栏滚过去（派发的先后换一下）：右栏接手时不能把选中清掉，
+  // 不然画布上「…的配置」入口跟着没了（3C REQ-7）
+  const selectFirst = await page.evaluate(() => {
+    const s = window.__studio.getState()
+    s.select('team')
+    const e = new CustomEvent('agentlab:reveal-step', { detail: { runId: s.run?.id, nodeId: 'team' }, cancelable: true })
+    const unhandled = window.dispatchEvent(e)
+    return { handled: !unhandled, sel: window.__studio.getState().selectedId }
+  })
+  await page.waitForTimeout(250)
+  check('先选中再请右栏滚过去：右栏接手，选中留着，「…的配置」入口还在',
+    selectFirst.handled && selectFirst.sel === 'team' && await page.evaluate(() => window.__studio.getState().selectedId) === 'team'
+      && await count(page, '.sf-peek') === 1 && await sheet() === 0, JSON.stringify(selectFirst))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
   // 先看了步骤、运行随后结束：节点还选中着、面板没开。再点它（选中没变）也得打开面板
   await head('start').click()
   await page.waitForTimeout(200)
@@ -994,12 +1140,11 @@ console.log('=== 运行中点节点：先看它的步骤，属性面板是次级
   check('没有运行时再点这个节点：打开属性面板', await sheet() === 1)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 回放：回边圈数、用量跟着游标
 
-console.log('=== 回放：回边的 ×N 和面板的用量都是那一刻的 ===')
-{
+await section('回放：回边的 ×N 和面板的用量都是那一刻的', async () => {
   const { browser, page, errors } = await openStudio()
   await seedRun(page)
   // 两次模型调用，一次在第 5 秒、一次在第 12 秒；终态的后端累计和它们对得上
@@ -1037,59 +1182,59 @@ console.log('=== 回放：回边的 ×N 和面板的用量都是那一刻的 ===
   check('回到实时：用量是整次运行的（1.4k tok）', /1\.4k tok/.test(live), live)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- Copilot 搭图时的镜头
 
-console.log('=== Copilot 搭图：新节点在视口外时镜头跟过去，人一动手这一轮就不跟 ===')
-for (const reducedMotion of ['no-preference', 'reduce']) {
-  const { browser, page, errors } = await openStudio({ id: WIDE_ID, reducedMotion })
-  const inView = (id) => page.evaluate((nid) => {
-    const pane = document.querySelector('.react-flow').getBoundingClientRect()
-    const r = document.querySelector(`.react-flow__node[data-id="${nid}"]`).getBoundingClientRect()
-    return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
-  }, id)
-  const vp = () => page.evaluate(() => document.querySelector('.react-flow__viewport').style.transform)
-  const building = (on, cursor) => page.evaluate(({ on, cursor }) => {
-    const st = window.__studio
-    st.setState({ copilot: { ...st.getState().copilot, active: on }, copilotCursor: cursor })
-  }, { on, cursor })
-  const label = reducedMotion === 'reduce' ? '（减少动效）' : ''
-  check(`n11 起初在视口外${label}`, !(await inView('n11')))
-  await building(true, 'n11')
-  if (reducedMotion === 'reduce') {
-    // 减少动效时不做动画：下一帧就到位
-    await page.waitForTimeout(120)
-    check('减少动效：镜头直接到位，不飞', await inView('n11'))
-  } else {
-    check('助手刚放下的节点在视口外：镜头跟过去', !!(await until(() => inView('n11'))))
-    const z0 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
-    // 人拖了一下画布：这一轮不再跟
-    const pane = await page.locator('.react-flow__pane').boundingBox()
-    await page.mouse.move(pane.x + 200, pane.y + 200)
-    await page.mouse.down()
-    await page.mouse.move(pane.x + 380, pane.y + 240, { steps: 5 })
-    await page.mouse.up()
-    await page.waitForTimeout(250)
-    const held = await vp()
-    await building(true, 'n0')
-    await page.waitForTimeout(700)
-    check('人动过镜头之后，这一轮不再抢', await vp() === held)
-    // 下一轮重新跟
+await section('Copilot 搭图：新节点在视口外时镜头跟过去，人一动手这一轮就不跟', async () => {
+  for (const reducedMotion of ['no-preference', 'reduce']) {
+    const { browser, page, errors } = await openStudio({ id: WIDE_ID, reducedMotion })
+    const inView = (id) => page.evaluate((nid) => {
+      const pane = document.querySelector('.react-flow').getBoundingClientRect()
+      const r = document.querySelector(`.react-flow__node[data-id="${nid}"]`).getBoundingClientRect()
+      return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
+    }, id)
+    const vp = () => page.evaluate(() => document.querySelector('.react-flow__viewport').style.transform)
+    const building = (on, cursor) => page.evaluate(({ on, cursor }) => {
+      const st = window.__studio
+      st.setState({ copilot: { ...st.getState().copilot, active: on }, copilotCursor: cursor })
+    }, { on, cursor })
+    const label = reducedMotion === 'reduce' ? '（减少动效）' : ''
+    check(`n11 起初在视口外${label}`, !(await inView('n11')))
+    await building(true, 'n11')
+    if (reducedMotion === 'reduce') {
+      // 减少动效时不做动画：下一帧就到位
+      await page.waitForTimeout(120)
+      check('减少动效：镜头直接到位，不飞', await inView('n11'))
+    } else {
+      check('助手刚放下的节点在视口外：镜头跟过去', !!(await until(() => inView('n11'))))
+      const z0 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
+      // 人拖了一下画布：这一轮不再跟
+      const pane = await page.locator('.react-flow__pane').boundingBox()
+      await page.mouse.move(pane.x + 200, pane.y + 200)
+      await page.mouse.down()
+      await page.mouse.move(pane.x + 380, pane.y + 240, { steps: 5 })
+      await page.mouse.up()
+      await page.waitForTimeout(250)
+      const held = await vp()
+      await building(true, 'n0')
+      await page.waitForTimeout(700)
+      check('人动过镜头之后，这一轮不再抢', await vp() === held)
+      // 下一轮重新跟
+      await building(false, null)
+      await building(true, 'n0')
+      check('下一轮又跟上', !!(await until(() => inView('n0'))))
+      const z1 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
+      check('跟镜头只平移，不改缩放', z0 === z1, `${z0} → ${z1}`)
+    }
     await building(false, null)
-    await building(true, 'n0')
-    check('下一轮又跟上', !!(await until(() => inView('n0'))))
-    const z1 = await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
-    check('跟镜头只平移，不改缩放', z0 === z1, `${z0} → ${z1}`)
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    await browser.close()
   }
-  await building(false, null)
-  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
-  await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- Copilot 删掉的节点：原地虚线框
 
-console.log('=== Copilot 这一轮删掉的节点：原地留一道虚线框，停一下再淡出 ===')
 /** 照 store 的真实顺序走一轮：开始 → 节点没了 → 这一轮落定（diff 写着删了谁）→ 结束 */
 const removeInTurn = (page, id) => page.evaluate((id) => {
   const st = window.__studio
@@ -1106,54 +1251,55 @@ const removeInTurn = (page, id) => page.evaluate((id) => {
   } : t)) })
   st.setState({ copilot: { ...st.getState().copilot, active: false } })
 }, id)
-for (const reducedMotion of ['no-preference', 'reduce']) {
-  const { browser, page, errors } = await openStudio({ reducedMotion })
-  const was = await page.locator('.react-flow__node[data-id="fix"]').boundingBox()
-  await removeInTurn(page, 'fix')
-  await page.waitForTimeout(400)
-  const ghost = page.locator('.sf-ghost[data-ghost="fix"]')
-  if (reducedMotion === 'reduce') {
-    check('减少动效：不画虚线框', await ghost.count() === 0)
-  } else {
-    const box = await ghost.boundingBox()
-    const tag = await ghost.innerText().catch(() => '')
-    check('删掉的节点原地留一道虚线框，写着删的是谁', !!box && tag.includes('已删除 · 返工'), tag)
-    check('框就在它原来的位置、一样大', !!box && !!was && Math.abs(box.x - was.x) < 4 && Math.abs(box.y - was.y) < 4
-      && Math.abs(box.width - was.width) < 4, JSON.stringify({ was, box }))
-    const tagPx = await ghost.locator('.sf-ghost-tag').evaluate((el) => el.getBoundingClientRect().height)
-    check('标签在屏幕上读得清', tagPx >= 14, `${tagPx.toFixed(1)}px`)
-    check('虚线框不挡操作', await ghost.evaluate((el) => getComputedStyle(el).pointerEvents) === 'none')
-    await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost.png' })
-    check('停一下就淡出、收掉', !!(await until(async () => await ghost.count() === 0, { timeout: 4000 })))
+await section('Copilot 这一轮删掉的节点：原地留一道虚线框，停一下再淡出', async () => {
+  for (const reducedMotion of ['no-preference', 'reduce']) {
+    const { browser, page, errors } = await openStudio({ reducedMotion })
+    const was = await page.locator('.react-flow__node[data-id="fix"]').boundingBox()
+    await removeInTurn(page, 'fix')
+    await page.waitForTimeout(400)
+    const ghost = page.locator('.sf-ghost[data-ghost="fix"]')
+    if (reducedMotion === 'reduce') {
+      check('减少动效：不画虚线框', await ghost.count() === 0)
+    } else {
+      const box = await ghost.boundingBox()
+      const tag = await ghost.innerText().catch(() => '')
+      check('删掉的节点原地留一道虚线框，写着删的是谁', !!box && tag.includes('已删除 · 返工'), tag)
+      check('框就在它原来的位置、一样大', !!box && !!was && Math.abs(box.x - was.x) < 4 && Math.abs(box.y - was.y) < 4
+        && Math.abs(box.width - was.width) < 4, JSON.stringify({ was, box }))
+      const tagPx = await ghost.locator('.sf-ghost-tag').evaluate((el) => el.getBoundingClientRect().height)
+      check('标签在屏幕上读得清', tagPx >= 14, `${tagPx.toFixed(1)}px`)
+      check('虚线框不挡操作', await ghost.evaluate((el) => getComputedStyle(el).pointerEvents) === 'none')
+      await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost.png' })
+      check('停一下就淡出、收掉', !!(await until(async () => await ghost.count() === 0, { timeout: 4000 })))
+    }
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    await browser.close()
   }
-  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
-  await browser.close()
-}
-// 窄画布打开就是精简档（缩放 0.4 上下）：标签的字照样补回 11px，不跟着缩成 7px
-{
-  const { browser, page, errors } = await openStudio({ viewport: { width: 1024, height: 768 } })
-  await page.waitForTimeout(400)
-  const zoom = Number(await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom')))
-  // 质量门在前三列里，这个缩放下在视口内：截图看得到
-  await removeInTurn(page, 'gate')
-  await page.waitForTimeout(400)
-  const tag = await page.locator('.sf-ghost[data-ghost="gate"] .sf-ghost-tag').evaluate((el) => ({
-    h: el.getBoundingClientRect().height, font: parseFloat(getComputedStyle(el).fontSize),
-    clipped: el.scrollWidth > el.clientWidth + 1,
-  })).catch(() => null)
-  const px = tag ? tag.font * zoom : 0
-  check(`精简档（缩放 ${zoom.toFixed(2)}）：虚线框的标签照样读得清（屏幕上 ≥ 11px、高 ≥ 14px）`,
-    zoom < 0.5 && !!tag && px >= 10.9 && tag.h >= 14 && !tag.clipped,
-    tag ? `字 ${px.toFixed(1)}px · 高 ${tag.h.toFixed(1)}px${tag.clipped ? ' · 被截断' : ''}` : '没画虚线框')
-  await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost-compact.png' })
-  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
-  await browser.close()
-}
+  // 窄画布打开就是精简档（缩放 0.4 上下）：标签的字照样补回 11px，不跟着缩成 7px
+  {
+    const { browser, page, errors } = await openStudio({ viewport: { width: 1024, height: 768 } })
+    await page.waitForTimeout(400)
+    const zoom = Number(await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom')))
+    // 质量门在前三列里，这个缩放下在视口内：截图看得到
+    await removeInTurn(page, 'gate')
+    await page.waitForTimeout(400)
+    const tag = await page.locator('.sf-ghost[data-ghost="gate"] .sf-ghost-tag').evaluate((el) => ({
+      h: el.getBoundingClientRect().height, font: parseFloat(getComputedStyle(el).fontSize),
+      clipped: el.scrollWidth > el.clientWidth + 1,
+    })).catch(() => null)
+    const px = tag ? tag.font * zoom : 0
+    check(`精简档（缩放 ${zoom.toFixed(2)}）：虚线框的标签照样读得清（屏幕上 ≥ 11px、高 ≥ 14px）`,
+      zoom < 0.5 && !!tag && px >= 10.9 && tag.h >= 14 && !tag.clipped,
+      tag ? `字 ${px.toFixed(1)}px · 高 ${tag.h.toFixed(1)}px${tag.clipped ? ' · 被截断' : ''}` : '没画虚线框')
+    await page.screenshot({ path: '/tmp/agentlab-canvas-fx-ghost-compact.png' })
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    await browser.close()
+  }
+})
 
 // ---------------------------------------------------------------- 双击快速添加
 
-console.log('=== 双击空白处：在光标处快速添加节点 ===')
-{
+await section('双击空白处：在光标处快速添加节点', async () => {
   const { browser, page, errors } = await openStudio()
   const spot = await emptySpot(page)
   const zoomOf = () => page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom'))
@@ -1195,40 +1341,40 @@ console.log('=== 双击空白处：在光标处快速添加节点 ===')
     && await page.evaluate(() => window.__studio.getState().nodes.length) === n0 + 1)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
-}
+})
 
 // ---------------------------------------------------------------- 窄画布的打开取景
 
-console.log('=== 1024 宽打开：可读缩放下放不下三列时退到精简档，多看几列 ===')
-for (const theme of ['dark', 'light']) {
-  const { browser, page } = await openStudio({ theme, viewport: { width: 1024, height: 768 } })
-  await page.waitForTimeout(500)
-  // 两遍真的是两套主题：不然「亮暗都看过」只是同一张图看了两次
-  const shown = await page.evaluate(() => ({
-    attr: document.documentElement.dataset.theme ?? null,
-    scheme: getComputedStyle(document.documentElement).colorScheme,
-  }))
-  check(`${theme}: 画出来的确实是这一套主题`, shown.attr === theme && shown.scheme.includes(theme), JSON.stringify(shown))
-  const view = await page.evaluate(() => {
-    const rf = document.querySelector('.react-flow')
-    const pane = rf.getBoundingClientRect()
-    const nodes = [...document.querySelectorAll('.react-flow__node')]
-    const whole = nodes.filter((n) => {
-      const r = n.getBoundingClientRect()
-      return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
-    }).length
-    return { zoom: Number(rf.style.getPropertyValue('--zoom')), lod: rf.dataset.lod, whole, total: nodes.length, w: Math.round(pane.width) }
-  })
-  check(`${theme}: 1024 宽打开至少看得全四张卡`, view.whole >= 4, JSON.stringify(view))
-  check(`${theme}: 缩放不低于精简档下限 0.4，档位是精简卡`, view.zoom >= 0.4 - 1e-3 && view.lod === 'compact', JSON.stringify(view))
-  await page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-1024-${theme}.png` })
-  await browser.close()
-}
+await section('1024 宽打开：可读缩放下放不下三列时退到精简档，多看几列', async () => {
+  for (const theme of ['dark', 'light']) {
+    const { browser, page } = await openStudio({ theme, viewport: { width: 1024, height: 768 } })
+    await page.waitForTimeout(500)
+    // 两遍真的是两套主题：不然「亮暗都看过」只是同一张图看了两次
+    const shown = await page.evaluate(() => ({
+      attr: document.documentElement.dataset.theme ?? null,
+      scheme: getComputedStyle(document.documentElement).colorScheme,
+    }))
+    check(`${theme}: 画出来的确实是这一套主题`, shown.attr === theme && shown.scheme.includes(theme), JSON.stringify(shown))
+    const view = await page.evaluate(() => {
+      const rf = document.querySelector('.react-flow')
+      const pane = rf.getBoundingClientRect()
+      const nodes = [...document.querySelectorAll('.react-flow__node')]
+      const whole = nodes.filter((n) => {
+        const r = n.getBoundingClientRect()
+        return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
+      }).length
+      return { zoom: Number(rf.style.getPropertyValue('--zoom')), lod: rf.dataset.lod, whole, total: nodes.length, w: Math.round(pane.width) }
+    })
+    check(`${theme}: 1024 宽打开至少看得全四张卡`, view.whole >= 4, JSON.stringify(view))
+    check(`${theme}: 缩放不低于精简档下限 0.4，档位是精简卡`, view.zoom >= 0.4 - 1e-3 && view.lod === 'compact', JSON.stringify(view))
+    await page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-1024-${theme}.png` })
+    await browser.close()
+  }
+})
 
 // ---------------------------------------------------------------- 关掉动效
 
-console.log('=== 系统关了动效 ===')
-{
+await section('系统关了动效', async () => {
   const { browser, page } = await openStudio({ reducedMotion: 'reduce' })
   await seedRun(page)
   await feed(page, PARALLEL_NOW)
@@ -1265,7 +1411,7 @@ console.log('=== 系统关了动效 ===')
   const later = await vp()
   check('减少动效时「适配全图」直接到位', soon !== moved && soon === later, `${moved} → ${soon} → ${later}`)
   await browser.close()
-}
+})
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过')
 process.exit(failed ? 1 : 0)

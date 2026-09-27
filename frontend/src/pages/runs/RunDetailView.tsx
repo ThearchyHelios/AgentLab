@@ -8,16 +8,19 @@ import {
 } from '../../components/ui'
 import { formatDateTime, formatNumber, formatTime, shortId } from '../../lib/format'
 import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
-import { AssistantStream, type StreamTurn } from '../../run/AssistantStream'
+import { AssistantStream, type StreamTurn, type TurnFailure } from '../../run/AssistantStream'
 import { decodePhase, decodeRun, summarizeRun, type RunFinal } from '../../run/decode'
 import { ApprovalCard } from '../../run/RunPanel'
 import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
+import { localActor } from '../../lib/actor'
 import { explainRunError } from '../../lib/explain'
+import { canLeave, leavePass } from '../../lib/leave'
+import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
 import {
-  UNSAVED_HINT, asView, duplicateNames, graphShape, idTail, isLiveRun, isUnsaved, runName, runScope, type DetailView,
+  asView, duplicateNames, graphShape, idTail, isLiveRun, runScope, type DetailView,
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
@@ -266,8 +269,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       body: formal
         ? `正式运行只跑当前发布的版本${published ? `：这次跑 v${published}${run.version && run.version !== published ? `，不是原来那次的 v${run.version}` : ''}` : ''}。其余输入照旧，发起一次新的运行；这条失败的记录保留。`
         : run.run_class === 'formal'
-          ? '工作流已经删除，正式运行发不起来：这次按探索运行跑同一张图，其余输入照旧；这条失败的记录保留。'
-          : '跑的是这次的同一张图，其余输入照旧，发起一次新的运行；这条失败的记录保留。',
+          ? '工作流已经删除，正式运行发不起来：这次按探索运行，用这次运行时的工作流快照，其余输入照旧；这条失败的记录保留。'
+          : '用这次运行时的工作流快照，其余输入照旧，发起一次新的运行；这条失败的记录保留。',
       label: field,
       placeholder: `填写 ${field}`,
       confirmLabel: '重新运行',
@@ -369,6 +372,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   }
 
   const extract = async () => {
+    // 画布上还有没保存的改动：先问要不要放弃，再建。建完才问的话，人说「取消」，库里就多出
+    // 一张没人要的草稿
+    if (!(await canLeave('/studio/'))) return
     setBusy('extract')
     try {
       const res = await api.copilot.fromRun(run.id)
@@ -376,8 +382,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       toast.ok(
         `已提取为草稿「${res.name}」：${res.nodes} 个节点${res.dropped_nodes ? `，剪掉 ${res.dropped_nodes} 个没走到的` : ''}`,
       )
-      // 提取出来的草稿接下来一定要去画布审改，直接带过去
-      navigate(`/studio/${res.workflow_id}`)
+      // 提取出来的草稿接下来一定要去画布审改，直接带过去。上面已经问过，这一跳不再问
+      navigate(`/studio/${res.workflow_id}`, leavePass())
     } catch (e) {
       toast.error(e)
     } finally {
@@ -460,7 +466,15 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     // 事件里的成果会被截断（output_truncated），截断了就取 run 上那份完整的
     output: (finished && !finished.data?.output_truncated ? finished.data?.output : null)
       ?? (run.output && Object.keys(run.output).length ? run.output : null),
-    error: explain ? (failedNode ? `「${labelOf(failedNode)}」${explain.title}` : explain.title) : undefined,
+    // 拆好的交过去（TurnFailure）：只交标题的话，流会拿它再跑一遍 explainRunError，原因和
+    // 怎么办就丢了；fix 为 settings / tools 时报错里还有直达入口。标题不再拼节点名：报错块
+    // 紧接着一行「出错的节点：「X」」，上面的横幅也写着「失败于「X」」。
+    // 归不了类的失败标题就是原话，原文和标题相同时不再收进技术细节里重复一遍
+    error: explain ? {
+      title: explain.title, reason: explain.reason, hint: explain.action,
+      detail: explain.raw && explain.raw !== explain.title ? explain.raw : undefined,
+      fix: explain.fix, fixTo: explain.fixTo, fixFirst: explain.fixFirst,
+    } satisfies TurnFailure : undefined,
     runClass: run.run_class,
     statusCode: code,
     // 轮次头的计时和详情头同一个口径：跑完写墙钟，跑着从航迹的起点实时算。
@@ -540,7 +554,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                       replayable
                         ? `在画布上回放这次运行：拖底部的航迹，卡片回到那一刻${aimed ? '；对准失败的节点' : ''}`
                         : code === 'waiting' && aimed ? '打开这张工作流，并对准等审批的节点' : '在画布里打开这张工作流，接着看这次运行',
-                      drift ? '注意：工作流在这次运行之后改过结构，画布上是现在的图，对不上的节点不会亮起来；当时的全貌看「航迹」' : '',
+                      drift ? '注意：工作流在这次运行之后改过结构，画布上是现在的工作流，对不上的节点不会亮起来；当时的全貌看「航迹」' : '',
                     ].filter(Boolean).join('\n')}>
                 {replayable ? <Rewind size={11} aria-hidden /> : <SquareArrowOutUpRight size={11} aria-hidden />}
                 {replayable ? '在画布中回放' : '在画布中打开'}
@@ -639,11 +653,6 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       </footer>
     </div>
   )
-}
-
-/** 本机填的署名：随 X-Actor 发给后端，写进审批和取消的留痕 */
-function localActor(): string {
-  try { return (localStorage.getItem('agentlab_actor') ?? '').trim() } catch { return '' }
 }
 
 /** 事件之外的事实（查到的状态、有没有审批）和事件推出的相位合成一个显示码 */

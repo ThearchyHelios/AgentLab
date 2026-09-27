@@ -2,10 +2,10 @@ import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowDown, Ban, ChartGantt, Copy, Crosshair, Play, RotateCcw, Settings2, Wrench, X } from 'lucide-react'
 import { CopyButton, Spinner, StatusBadge } from '../../components/ui'
-import { formatDateTime, formatTime } from '../../lib/format'
+import { formatDateTime, formatSpan, formatTime } from '../../lib/format'
 import type { Approval } from '../../types'
 import type { RunErrorExplain } from '../../lib/explain'
-import { LONG_WAIT_MS, ageMs, formatSpan } from './model'
+import { LONG_WAIT_MS, ageMs } from './model'
 import { copyText } from './parts'
 
 /** 横幅外壳：左侧状态色条 + 淡底。只有异常态用它 */
@@ -46,6 +46,24 @@ export function FailedBanner({
   onRerun?: (field: string) => void
   busy: boolean
 }) {
+  // 要改的东西不在运行快照里（工具库里的参数定义）：先改好再接着跑，主按钮给去改的那一处，
+  // 「接着跑」退到后面但不藏——改好之后原样接着跑就能过
+  const fixFirst = !!explain.fixFirst && (explain.fix === 'settings' || explain.fix === 'tools')
+  const fixCls = `btn btn-sm${fixFirst ? ' btn-primary' : ''}`
+  const fixLink = explain.fix === 'settings'
+    ? (
+      <Link className={fixCls} to={explain.fixTo ?? '/settings/providers'} data-action="settings">
+        <Settings2 size={11} aria-hidden /> 去模型接入
+      </Link>
+    )
+    : explain.fix === 'tools'
+      ? (
+        <Link className={fixCls} to={explain.fixTo ?? '/tools'} data-action="tools"
+              title={explain.fixTo ? '打开要改的那个工具的编辑框' : undefined}>
+          <Wrench size={11} aria-hidden /> {fixFirst ? '去改参数定义' : '去工具库'}
+        </Link>
+      )
+      : null
   return (
     <Shell color="var(--st-failed)" data="failed">
       <div className="flex items-start gap-2.5">
@@ -69,29 +87,23 @@ export function FailedBanner({
             </div>
           )}
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {fixFirst && fixLink}
             {explain.continuable && (
-              <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={onContinue}
-                      title="从失败的节点接着跑，前面跑完的不重跑。要改节点配置请到画布" data-action="continue">
+              <button type="button" className={`btn btn-sm${fixFirst ? '' : ' btn-primary'}`} disabled={busy} onClick={onContinue}
+                      title={fixFirst ? '先把上面说的改好再接着跑：原样接着跑还会在同一处失败。前面跑完的节点不重跑'
+                        : '从失败的节点接着跑，前面跑完的不重跑。要改节点配置请到画布'}
+                      data-action="continue">
                 {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 接着跑
               </button>
             )}
             {explain.fix === 'rerun' && explain.missingInput && onRerun && (
               <button type="button" className="btn btn-sm btn-primary" disabled={busy}
                       onClick={() => onRerun(explain.missingInput!)} data-action="rerun"
-                      title="用这次运行的同一张图和其余输入，补上这一项，发起一次新的运行；这条失败记录保留">
+                      title="用这次运行时的工作流快照和其余输入，补上这一项，发起一次新的运行；这条失败记录保留">
                 {busy ? <Spinner size={11} /> : <RotateCcw size={11} aria-hidden />} 补上「{explain.missingInput}」重新运行
               </button>
             )}
-            {explain.fix === 'settings' && (
-              <Link className="btn btn-sm" to="/settings/providers" data-action="settings">
-                <Settings2 size={11} aria-hidden /> 去模型接入
-              </Link>
-            )}
-            {explain.fix === 'tools' && (
-              <Link className="btn btn-sm" to="/tools" data-action="tools">
-                <Wrench size={11} aria-hidden /> 去工具库
-              </Link>
-            )}
+            {!fixFirst && fixLink}
             {canvasHref && (
               // 这里接着跑过不去、得回画布改的，定位就是主路
               <Link className={`btn btn-sm${!explain.continuable && explain.fix === 'canvas' ? ' btn-primary' : ''}`}
@@ -102,7 +114,7 @@ export function FailedBanner({
             )}
             {!canvasHref && onShowInTrace && (
               <button type="button" className="btn btn-sm" onClick={onShowInTrace} data-action="locate-trace"
-                      title={'工作流在这次运行之后改过结构，现在的图里已经没有这个节点，画布上定位不到它。\n航迹用的是运行时的快照，能看到它当时的样子'}>
+                      title={'工作流在这次运行之后改过结构，现在的工作流里已经没有这个节点，画布上定位不到它。\n航迹用的是运行时的快照，能看到它当时的样子'}>
                 <ChartGantt size={11} aria-hidden /> 在航迹中看
               </button>
             )}

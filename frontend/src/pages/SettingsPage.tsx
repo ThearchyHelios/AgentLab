@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { Navigate, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, useParams } from 'react-router-dom'
 import {
   Check, Cpu, Download, KeyRound, Monitor, Moon, Plug, Plus, Settings as SettingsIcon, Sun, X,
 } from 'lucide-react'
@@ -20,6 +20,8 @@ import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import type { Provider } from '../types'
 import { normalizeTheme } from '../lib/theme'
+import { useLeaveGuard } from '../lib/leave'
+import { localActor, setLocalActor } from '../lib/actor'
 import type { ThemePref } from '../lib/theme'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
@@ -34,25 +36,23 @@ export function SettingsPage() {
   const { tab: raw } = useParams()
   // datasources 也算认得：否则 useTabRoute 会先把地址纠正回 providers，和下面的跳转打架
   const [tab, setTab] = useTabRoute([...TABS.map((t) => t.key), 'datasources'], 'providers')
-  // 偏好设置有没保存的改动时，切标签先问一句
-  const [prefsDirty, setPrefsDirty] = useState(0)
 
   if (raw === 'datasources') return <Navigate to="/data" replace />
 
-  const change = async (key: string) => {
-    if (key === tab) return
-    if (tab === 'prefs' && prefsDirty && !(await confirmLeave(prefsDirty))) return
-    setTab(key)
+  // 偏好设置有没保存的改动时，切标签由 PrefsTab 登记的守卫在地址变化时问一次。
+  // 这里不再先问：问过再 setTab，守卫还在，会再问第二遍（useTabRoute 带不了 leavePass）
+  const change = (key: string) => {
+    if (key !== tab) setTab(key)
   }
 
   return (
     <div className="flex h-full flex-col">
       <PageHeader icon={<SettingsIcon size={13} />} title="设置" subtitle="模型接入、偏好和运行环境" />
-      <Tabs tabs={TABS} active={tab} onChange={(k) => void change(k)} label="设置" idPrefix="settings" />
+      <Tabs tabs={TABS} active={tab} onChange={change} label="设置" idPrefix="settings" />
       <TabPanel idPrefix="settings" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl p-4">
           {tab === 'providers' && <ProvidersTab />}
-          {tab === 'prefs' && <PrefsTab onDirty={setPrefsDirty} />}
+          {tab === 'prefs' && <PrefsTab />}
           {tab === 'system' && <SystemTab />}
         </div>
       </TabPanel>
@@ -598,13 +598,13 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
  *   切标签、点导航、关页都会先问。危险工具审批这种安全开关不能误点一下就生效，
  *   所以不做自动保存。署名以前每敲一个字就写 localStorage，现在跟着一起保存。
  */
-function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
+function PrefsTab() {
   const collections = useCatalog((s) => s.collections)
   const [values, setValues] = useState<Record<string, any> | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
   const [scopes, setScopes] = useState<{ scope: string; count: number }[]>([])
   // 署名存在 localStorage，保存后成为新的基线，不再算作改动
-  const savedActor = useRef<string>((() => { try { return localStorage.getItem('agentlab_actor') ?? '' } catch { return '' } })())
+  const savedActor = useRef<string>(localActor() ?? '')
   const [draft, setDraft] = useState<{ actor: string; scope: string; collection: string; confirm: boolean } | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
@@ -632,9 +632,8 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
   const cur = draft ?? saved
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
   const dirty = values ? changed.length : 0
-  useEffect(() => { onDirty(dirty) }, [dirty])
-  useEffect(() => () => onDirty(0), [])
-  useLeaveGuard(dirty)
+  // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
+  useLeaveGuard(dirty > 0, () => confirmLeave(dirty))
 
   useEffect(() => {
     if (!savedFlash) return
@@ -657,13 +656,9 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
     setSaveError(null)
     const actor = cur.actor.trim()
     if (actor !== savedActor.current) {
-      try {
-        if (actor) localStorage.setItem('agentlab_actor', actor)
-        else localStorage.removeItem('agentlab_actor')
-      } catch { /* 隐私模式：署名只能这一次会话有效 */ }
+      // 写不进去（隐私模式）时署名只在这一次会话里有效；setLocalActor 会通知导航底部的首字
+      setLocalActor(actor)
       savedActor.current = actor
-      // 同一个标签页里写 localStorage 不触发 storage 事件：导航底部的署名首字靠它立刻跟上
-      window.dispatchEvent(new Event('agentlab:actor'))
     }
     const runChanged = changed.some((k) => k !== 'actor')
     try {
@@ -707,7 +702,7 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
             <SectionBar title="操作者署名" hint="只存在这台浏览器里，换台电脑要重新填。" />
             <Field label="名字" htmlFor="pref-actor"
                    hint="发布、审批、发起正式运行会记到这个名下，随请求头 X-Actor 发送。这是归属记录不是身份认证——多人环境需要真正的登录体系。">
-              <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如 yilun"
+              <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如 王工"
                      aria-describedby="pref-actor-hint"
                      onChange={(e) => edit({ actor: e.target.value })} />
             </Field>
@@ -779,7 +774,7 @@ function PrefsTab({ onDirty }: { onDirty: (n: number) => void }) {
               <span className="text-xs">
                 有 <span className="tnum">{dirty}</span> 项未保存
                 <span className="ml-1.5 text-2xs text-faint">
-                  {changed.map((k) => ({ actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具审批' })[k]).join('、')}
+                  {changed.map((k) => ({ actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具的默认审批策略' })[k]).join('、')}
                 </span>
               </span>
               {saveError != null && (
@@ -882,35 +877,6 @@ function ThemeChoice({ value, onChange }: { value: ThemePref; onChange: (v: Them
   )
 }
 
-/**
- * 有没保存的改动时拦住离开：关页、刷新走 beforeunload；站内导航（左侧导航、
- * 页面里的链接）在捕获阶段拦下点击，问过再走。路由是 BrowserRouter，用不了
- * react-router 的 useBlocker。
- */
-function useLeaveGuard(dirty: number) {
-  const navigate = useNavigate()
-  useEffect(() => {
-    if (!dirty) return
-    const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
-    const onClick = (e: MouseEvent) => {
-      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
-      const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null
-      if (!a || a.target === '_blank' || a.hasAttribute('download')) return
-      const url = new URL(a.href, location.href)
-      if (url.origin !== location.origin || url.pathname === location.pathname) return
-      e.preventDefault()
-      e.stopPropagation()
-      void confirmLeave(dirty).then((ok) => { if (ok) navigate(url.pathname + url.search + url.hash) })
-    }
-    window.addEventListener('beforeunload', onBeforeUnload)
-    document.addEventListener('click', onClick, true)
-    return () => {
-      window.removeEventListener('beforeunload', onBeforeUnload)
-      document.removeEventListener('click', onClick, true)
-    }
-  }, [dirty, navigate])
-}
-
 // -------------------------------------------------------------------------
 
 function SystemTab() {
@@ -978,10 +944,10 @@ function SystemTab() {
         <div className="space-y-1.5 text-xs">
           <Row label="Python" value={<span className="mono">{info.python}</span>} />
           <Row label="数据目录" value={<code className="mono text-2xs">{info.data_dir}</code>} />
-          <Row label="图最大步数" value={<span className="tnum">{info.limits?.max_graph_steps}</span>} />
+          <Row label="工作流最大步数" value={<span className="tnum">{info.limits?.max_graph_steps}</span>} />
           <Row label="Agent 最大步数" value={<span className="tnum">{info.limits?.max_agent_steps}</span>} />
           <Row label="最大并发运行" value={<span className="tnum">{info.limits?.max_concurrent_runs}</span>} />
-          <Row label="单次执行时限" value={info.limits?.max_run_seconds && `${info.limits.max_run_seconds} 秒`} />
+          <Row label="单次运行时限" value={info.limits?.max_run_seconds && `${info.limits.max_run_seconds} 秒`} />
           <Row label="模型调用超时" value={info.limits?.model_timeout_seconds && `${info.limits.model_timeout_seconds} 秒`} />
         </div>
       </section>

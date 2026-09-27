@@ -59,6 +59,20 @@ export function runClassLabel(runClass: 'formal' | 'exploratory' | null | undefi
   return '探索运行'
 }
 
+/**
+ * 没挂在工作流上的运行：画布或问数据当场搭的，从没存成工作流。后端给它的名字老数据是
+ * 「临时图」、新的是「未保存的工作流」，也可能是空的；界面上一律叫「未保存的工作流」。
+ * 运行和审批都带 workflow_id / workflow_name，记录页、命令面板、审批卡、通知走同一处
+ */
+export const UNSAVED_NAME = '未保存的工作流'
+export const UNSAVED_HINT = '这次运行跑的是画布或问数据当场搭的工作流，没有存下来，所以回不到画布里'
+const UNSAVED_NAMES = new Set(['临时图', UNSAVED_NAME])
+type WorkflowRef = { workflow_id?: string | null; workflow_name?: string | null }
+export const isUnsaved = (x: WorkflowRef): boolean =>
+  !x.workflow_id && (!x.workflow_name || UNSAVED_NAMES.has(x.workflow_name))
+export const runName = (x: WorkflowRef): string =>
+  isUnsaved(x) ? UNSAVED_NAME : x.workflow_name ?? ''
+
 /** 出具档位 */
 export const ISSUANCE_LABEL: Record<'formal' | 'degraded' | 'withheld', string> = {
   formal: '完整出具',

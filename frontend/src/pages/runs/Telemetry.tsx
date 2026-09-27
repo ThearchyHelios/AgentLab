@@ -4,14 +4,15 @@ import clsx from 'clsx'
 import { api } from '../../api/client'
 import { StatusPill, toast, useTicker } from '../../components/ui'
 import {
-  NONE, formatClock, formatCost, formatDateTime, formatNumber, formatTime, formatTokens, shortId,
+  NONE, formatClock, formatCost, formatDateTime, formatNumber, formatSpan, formatTime, formatTokens, shortId,
 } from '../../lib/format'
 import { type StatusCode } from '../../lib/status'
 import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
+import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
 import {
-  LONG_WAIT_MS, UNSAVED_HINT, ageMs, cancelReason, formatSpan, isUnsaved, runName, runScope, runTiming, type RunTiming,
+  LONG_WAIT_MS, ageMs, cancelReason, runScope, runTiming, type RunTiming,
 } from './model'
 import { CLOCK_MAX_MS, CopyValue } from './parts'
 
@@ -147,7 +148,7 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
         </Value>
         <Sub>{waits ? `审批 ${waits} 次` : ' '}</Sub>
       </Cell>
-      <Cell label="节点" title="已完成（含跳过）/ 图上的节点总数">
+      <Cell label="节点" title="已完成（含跳过）/ 工作流里的节点总数">
         <Value data="nodes">{nodesTotal ? <>{proj!.nodesDone}<span className="text-faint">/{nodesTotal}</span></> : NONE}</Value>
         <Sub>{executing && proj && proj.parallelNow > 1 ? `${proj.parallelNow} 个并行` : ' '}</Sub>
       </Cell>

@@ -5,8 +5,9 @@
 // 老运行的事件没有 ts、协作成员的 end 事件晚发。夹具里没有图，下面按节点 id
 // 搭了和那次运行一致的最小图；分支、容错、取消这几种夹具里没有的结局才用构造的。
 //
-// 转译借 vite dev server（它 serve 的就是应用实际运行的那份），所以跑之前
-// 前端得起着：./scripts/dev.sh
+// 转译借 vite dev server（它 serve 的就是应用实际运行的那份）。
+// 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
+// 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-trace.mjs
 import { readFileSync } from 'node:fs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -52,6 +53,20 @@ const check = (name, cond, detail = '') => {
   if (!cond) failed++
 }
 
+/**
+ * 一节一节地跑：某一节里抛了异常，只记成这一节失败，接着跑下一节，
+ * 不让一处卡住把后面的检查一起吞掉。这里是纯函数的检查：
+ * 某种事件让翻译层直接抛了异常，也只算这一节
+ */
+async function section(name, fn) {
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  }
+}
+
 /** store 里的那条路：折一条、推导一次，终态时收尾 */
 const run = (events, graph) => events.reduce((t, ev) => {
   const folded = foldEvent(t, ev)
@@ -90,8 +105,7 @@ const G = {
             ['each', 'done', 'done']]),
 }
 
-console.log('=== 段 ===')
-{
+await section('段', async () => {
   const t = run(fixtures.db, G.db)
   const q = t.nodes.query_kpi
   const started = fixtures.db.find((e) => e.type === 'node.started' && e.node_id === 'query_kpi')
@@ -108,10 +122,9 @@ console.log('=== 段 ===')
   check('llm.token 不改航迹引用',
     foldEvent(t, { seq: 999, type: 'llm.token', node_id: 'query_kpi', ts: 1, data: { delta: 'x' } }) === t)
   check('收过的 seq 再来一遍原样返回', foldEvent(t, fixtures.db[3]) === t)
-}
+})
 
-console.log('\n=== 并行度 ===')
-{
+await section('并行度', async () => {
   const t = run(fixtures.fanout, G.fanout)
   const peak = Math.max(...t.parallelSeries.map(([, v]) => v))
   check('三路同时在跑，峰值 3', peak === 3, `峰值 ${peak}`)
@@ -127,10 +140,9 @@ console.log('\n=== 并行度 ===')
     `${later.nodes.leg2?.state} / ${later.parallelNow}`)
   check('跑完后此刻并行度是 0', project(t, LATER).parallelNow === 0)
   check('回放到开始之前：什么都没跑', project(t, at(1) - 1).nodes.leg0?.state === 'idle')
-}
+})
 
-console.log('\n=== defer 汇合 ===')
-{
+await section('defer 汇合', async () => {
   // 汇合节点等其余任务都跑完再跑一次。一路回来了、其余还在跑时它是"待汇合"
   const e = fixtures.fanout
   const s3 = run(upto(e, 3), G.fanout)
@@ -149,10 +161,9 @@ console.log('\n=== defer 汇合 ===')
     activeEdgesOf(s16, G.fanout).join(' '))
   const done = run(e, G.fanout)
   check('汇合节点只跑了一次', done.nodes.merge?.count === 1, `×${done.nodes.merge?.count}`)
-}
+})
 
-console.log('\n=== 墙钟 / 执行 / 等人 ===')
-{
+await section('墙钟 / 执行 / 等人', async () => {
   const e = fixtures.human
   const t = run(e, G.human)
   const ts = (type) => e.find((x) => x.type === type).ts * 1000
@@ -182,10 +193,9 @@ console.log('\n=== 墙钟 / 执行 / 等人 ===')
     `墙钟 ${ms(later.elapsedMs)} · 等人 ${ms(later.waitMs)} · 执行 ${ms(later.activeMs)}`)
   check('回放到等待中间：h 是 waiting',
     project(t, ts('run.interrupted') + 1).nodes.h?.state === 'waiting')
-}
+})
 
-console.log('\n=== 循环轮次 ===')
-{
+await section('循环轮次', async () => {
   const e = fixtures.think
   const t = run(e, G.think)
   const each = t.nodes.each
@@ -202,10 +212,9 @@ console.log('\n=== 循环轮次 ===')
   check('第二轮时轮次是 2', mid.nodes.each?.iteration === 2)
   check('用量从 llm.end 累加、终态以后端总数校正',
     t.tokensIn === 177 && t.tokensOut === 922, `${t.tokensIn} / ${t.tokensOut}`)
-}
+})
 
-console.log('\n=== 循环回边 ===')
-{
+await section('循环回边', async () => {
   const topo = topology(G.loop_approve)
   check('认出改写连回审批那条是回边', topo.back.size === 1 && topo.back.has('rewrite|review|'),
     [...topo.back].join(' '))
@@ -217,10 +226,9 @@ console.log('\n=== 循环回边 ===')
   check('改写两次', t.nodes.rewrite?.count === 2)
   const walked = walkedEdges(t, G.loop_approve)
   check('走过的边包含回边和两条出口', walked.size === 5, [...walked].join(' '))
-}
+})
 
-console.log('\n=== 失败后下游被阻断 ===')
-{
+await section('失败后下游被阻断', async () => {
   const t = run(fixtures.failed, G.failed)
   check('失败的是循环节点', t.failedNodeId === 'loop_sum' && t.nodes.loop_sum.state === 'failed')
   check('循环体和 done 出口之后都是 blocked',
@@ -228,10 +236,9 @@ console.log('\n=== 失败后下游被阻断 ===')
     `${t.nodes.add_one?.state} / ${t.nodes.result?.state}`)
   check('跑过的上游不受影响', t.nodes.init_state?.state === 'done')
   check('相位是失败，没有活跃的边', t.phase === 'failed' && activeEdgesOf(t, G.failed).length === 0)
-}
+})
 
-console.log('\n=== on_error=continue ===')
-{
+await section('on_error=continue', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1000 + seq / 10, data })
   const base = [
     ev(1, 'run.started', null, { nodes: 3 }),
@@ -249,10 +256,9 @@ console.log('\n=== on_error=continue ===')
   const bad = run([...base, ev(6, 'run.failed', null, { error: '接口超时' })], strict)
   check('不容错的失败：下游 blocked', bad.nodes.c?.state === 'blocked', bad.nodes.c?.state)
   check('没有 on_error=continue 时失败节点不放行', mid.nodes.c && run(base, strict).nodes.c?.state !== 'queued')
-}
+})
 
-console.log('\n=== 分支落空 ===')
-{
+await section('分支落空', async () => {
   const t = run(fixtures.human, G.human)
   check('审批走了通过：驳回那条下游是 unreached', t.nodes.rejected_note?.state === 'unreached',
     t.nodes.rejected_note?.state)
@@ -261,10 +267,9 @@ console.log('\n=== 分支落空 ===')
     [...walkedEdges(t, G.human)].join(' '))
   const loop = run(fixtures.think, G.think)
   check('循环跑完所有节点都走到了', !Object.values(loop.nodes).some((n) => n.state === 'unreached'))
-}
+})
 
-console.log('\n=== 终态清扫 ===')
-{
+await section('终态清扫', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 2000 + seq, data })
   const team = [
     ev(1, 'run.started', null, { nodes: 3 }),
@@ -309,10 +314,9 @@ console.log('\n=== 终态清扫 ===')
   const fail = run([...team, ev(8, 'run.failed', null, { error: '超时' })], gr)
   check('失败但没有节点报错（超时）：在跑的收成 cancelled', fail.nodes.team.state === 'cancelled'
     && fail.failedNodeId == null, fail.nodes.team.state)
-}
+})
 
-console.log('\n=== 老数据没有 ts ===')
-{
+await section('老数据没有 ts', async () => {
   for (const name of ['loop_approve', 'supervisor']) {
     let t
     try { t = run(fixtures[name]) } catch (e) { check(`${name} 折叠不抛错`, false, e.message); continue }
@@ -329,10 +333,9 @@ console.log('\n=== 老数据没有 ts ===')
   check('成员段按 duration 定宽', researcher && researcher.end - researcher.start === 6660,
     researcher && `${researcher.end - researcher.start}`)
   check('等人节点在无 ts 时也只算一次', sup.nodes.human_review?.count === 1)
-}
+})
 
-console.log('\n=== 相位和右栏同一个来源 ===')
-{
+await section('相位和右栏同一个来源', async () => {
   let same = true
   let where = ''
   for (const [name, events] of Object.entries(fixtures)) {
@@ -375,10 +378,9 @@ console.log('\n=== 相位和右栏同一个来源 ===')
     }
   }
   check('审批事件之后画布和右栏认定的"在等人"是同一批节点', same2, where2)
-}
+})
 
-console.log('\n=== 并行时 human.requested 先到 ===')
-{
+await section('并行时 human.requested 先到', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 6000 + seq / 10, data })
   const gr = g([{ id: 'in', type: 'input' }, { id: 'h', type: 'human' }, 'x', 'ok'],
                [['in', 'h'], ['in', 'x'], ['h', 'ok', 'approved']])
@@ -408,10 +410,9 @@ console.log('\n=== 并行时 human.requested 先到 ===')
     `${resumed.nodes.h.state} ×${resumed.nodes.h.count}`)
   const again = run(upto(fixtures.loop_approve, 75))
   check('驳回后真的第二轮审批：human.requested 一到就是等待', again.nodes.review?.state === 'waiting', again.nodes.review?.state)
-}
+})
 
-console.log('\n=== 画布的节点形状（type 是渲染器 card，类型在 data.nodeType） ===')
-{
+await section('画布的节点形状（type 是渲染器 card，类型在 data.nodeType）', async () => {
   // store 传进 derive 的是 FlowNode。以前只读 type，拿到的全是 'card'，分支、循环、
   // 审批的出口路由一概不认，没选的出口后面全显示成排队
   const fn = (id, nodeType, config = {}) => ({ id, type: 'card', data: { nodeType, label: id, config } })
@@ -466,10 +467,9 @@ console.log('\n=== 画布的节点形状（type 是渲染器 card，类型在 da
   check('审批通过：驳回出口的目标不排队、通过出口的排队',
     (hv.nodes.no?.state ?? 'idle') === 'idle' && hv.nodes.ok?.state === 'queued',
     `${hv.nodes.no?.state} / ${hv.nodes.ok?.state}`)
-}
+})
 
-console.log('\n=== 失败后接着跑 ===')
-{
+await section('失败后接着跑', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 8000 + seq / 10, data })
   const failed = [
     ev(1, 'run.started', null, { nodes: 2 }),
@@ -483,10 +483,9 @@ console.log('\n=== 失败后接着跑 ===')
   const ok = run([...cont, ev(7, 'node.started', 'a'), ev(8, 'node.finished', 'a'),
                   ev(9, 'node.started', 'b'), ev(10, 'node.finished', 'b'), ev(11, 'run.finished', null, { usage: {} })], gr)
   check('接着跑成功了：不再挂着"失败于 a"', ok.phase === 'succeeded' && ok.failedNodeId == null, `${ok.phase} / ${ok.failedNodeId}`)
-}
+})
 
-console.log('\n=== 右栏收尾（decodeRun） ===')
-{
+await section('右栏收尾（decodeRun）', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 9000 + seq, data })
   const live = [
     ev(1, 'run.started', null, { nodes: 4 }),
@@ -499,7 +498,7 @@ console.log('\n=== 右栏收尾（decodeRun） ===')
   ]
   const rows = (steps) => flat(steps).map((s) => `${s.kind}:${s.status}`).join(',')
   const before = decode.decodeRun(live)
-  check('进行中：节点、工具、成员、开始执行都在转',
+  check('进行中：节点、工具、成员、开始运行都在转',
     ['node', 'query', 'tool', 'note', 'lifecycle'].every((k) => flat(before).some((s) => s.kind === k && s.status === 'running')),
     rows(before))
 
@@ -509,7 +508,7 @@ console.log('\n=== 右栏收尾（decodeRun） ===')
   check('取消：节点下面的查询、工具行也收成已取消',
     ['query', 'tool'].every((k) => flat(stop).find((s) => s.kind === k)?.status === 'cancelled')
     && flat(stop).find((s) => s.nodeId === 'q' && s.kind === 'node')?.status === 'cancelled')
-  check('取消：开始执行那行收成已取消', stop.find((s) => s.kind === 'lifecycle')?.status === 'cancelled')
+  check('取消：开始运行那行收成已取消', stop.find((s) => s.kind === 'lifecycle')?.status === 'cancelled')
   const member = stop.find((s) => s.nodeId === 'team')?.team?.rounds[0]?.members[0]
   check('取消：协作成员一起收', member?.status === 'cancelled', member?.status)
 
@@ -526,7 +525,7 @@ console.log('\n=== 右栏收尾（decodeRun） ===')
     && !flat(failedRun).some((s) => s.status === 'running'), rows(failedRun))
 
   const waiting = decode.decodeRun(upto(fixtures.human, 6))
-  check('停在审批上：开始执行收成 done，不再转圈',
+  check('停在审批上：开始运行收成 done，不再转圈',
     waiting.find((s) => s.kind === 'lifecycle')?.status === 'done', rows(waiting))
   const killed = decode.decodeRun(live, { status: 'interrupted', pending: false })
   check('强杀后对账（interrupted、无待审批）：没有还在转的行',
@@ -539,10 +538,9 @@ console.log('\n=== 右栏收尾（decodeRun） ===')
   check('只回来一个：还是 0', fold([start('甲', 1), start('乙', 2), end('甲', 3, 100)]).savedMs === 0)
   check('整轮都交回了：省下 = 各人之和 − 最慢的',
     fold([start('甲', 1), start('乙', 2), end('甲', 3, 100), end('乙', 4, 300)]).savedMs === 100)
-}
+})
 
-console.log('\n=== 回放时的用量和工具数（逐刻度） ===')
-{
+await section('回放时的用量和工具数（逐刻度）', async () => {
   // 回放到半路，卡片和 HUD 要写「那一刻」的 tokens 和工具数，而不是拿终值冒充
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 5000 + seq, data })
   const events = [
@@ -590,10 +588,9 @@ console.log('\n=== 回放时的用量和工具数（逐刻度） ===')
   check('……实时时照样是后端的总数', project(old, trace.lastEventAt(old)).tokensIn === 9000)
   check('没有 tool / llm 事件的节点刻度为空、读数是 0',
     t.nodes.out.marks === undefined && project(t, at(11)).nodes.out.tools === 0)
-}
+})
 
-console.log('\n=== 最后一条事件的时刻（lastEventAt） ===')
-{
+await section('最后一条事件的时刻（lastEventAt）', async () => {
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 6000 + seq, data })
   const gr = g([{ id: 'in', type: 'input' }, 'boom', 'after'], [['in', 'boom'], ['boom', 'after']])
   const t = run([
@@ -609,10 +606,9 @@ console.log('\n=== 最后一条事件的时刻（lastEventAt） ===')
     `${settled.elapsedMs}/${settled.activeMs}`)
   check('早一毫秒就是按段重建的回放（阻断不在）', project(t, trace.lastEventAt(t) - 1).nodes.after?.state !== 'blocked')
   check('空航迹的 lastEventAt 是 0', trace.lastEventAt(emptyTrace()) === 0)
-}
+})
 
-console.log('\n=== 性能 ===')
-{
+await section('性能', async () => {
   // 256 段的大循环（真实运行里见过）：一次折叠 + 投影都要快，拖游标才不卡
   const ev = []
   let seq = 0
@@ -636,7 +632,7 @@ console.log('\n=== 性能 ===')
   check('折叠 ~770 条事件（含 256 段）', foldMs < 100, `${foldMs.toFixed(1)}ms`)
   check('一次投影 < 5ms', projMs < 5, `${projMs.toFixed(2)}ms`)
   check('循环轮次对得上', t.nodes.loop.iteration === 128 && t.nodes.body.count === 128)
-}
+})
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 航迹全部通过')
 process.exit(failed ? 1 : 0)

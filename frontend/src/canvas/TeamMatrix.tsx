@@ -1,12 +1,13 @@
 import { memo } from 'react'
 import clsx from 'clsx'
 import { StatusBadge } from '../components/ui'
-import { formatClock, formatDuration, NONE } from '../lib/format'
+import { formatDuration, formatLapse, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import type { TeamMemberEx } from '../run/decode'
 import type { NodeTrace, Segment } from '../run/trace'
 import { useRunClock } from '../run/useRunClock'
 import type { TeamMember, TeamRound, TeamRun } from '../types'
+
 
 /**
  * 实时计时：「01:14.3」。只有它订阅时钟，所在的卡片、矩阵不跟着每 100ms 重画。
@@ -14,6 +15,7 @@ import type { TeamMember, TeamRound, TeamRun } from '../types'
  * from 是服务端时钟的毫秒时间戳，skewMs 是客户端减服务端的偏差（见 trace.liveAt）。
  * coarse 只到秒：成员行、等待时长这些地方十分位只会让一排数字一直在抖。
  * 十分位单独包一层，系统关了动效时由 CSS 藏掉（那时时钟也只 1 秒走一次）。
+ * 过了一小时按 formatLapse 换成「3 小时 05 分」，那时已经没有十分位了。
  */
 export function LiveClock({ from, skewMs = 0, coarse = false }: {
   from: number
@@ -21,7 +23,7 @@ export function LiveClock({ from, skewMs = 0, coarse = false }: {
   coarse?: boolean
 }) {
   const now = useRunClock(true)
-  const text = formatClock(Math.max(0, now - skewMs - from))
+  const text = formatLapse(Math.max(0, now - skewMs - from))
   const dot = text.lastIndexOf('.')
   if (dot < 0) return <span className="tnum">{text}</span>
   return (
@@ -34,7 +36,7 @@ export function LiveClock({ from, skewMs = 0, coarse = false }: {
 
 /** 回放时的定值计时：和 LiveClock 的 coarse 一样只到秒，拿不到就是「—」 */
 export const stillClock = (ms: number | undefined): string =>
-  (ms == null ? NONE : formatClock(Math.max(0, ms)).replace(/\.\d$/, ''))
+  (ms == null ? NONE : formatLapse(Math.max(0, ms), false))
 
 /**
  * 协作矩阵：supervisor 节点在卡片内部摊开的那块东西。
@@ -312,9 +314,14 @@ function TeamMatrixImpl({
   let headRight = ''
   /** 表头右边这句的语气：用完轮数没完成时失败是红、降档是琥珀，别的安静 */
   let headTone: 'err' | 'warn' | '' = ''
-  if (!team) headRight = maxParallel ? `并发上限 ${maxParallel}` : ''
-  else if (live) {
+  // 一轮都还没派（第一次刚开始；接着跑时 reduceTeam 把上一次清空了，rounds 为空）就是还没有
+  // 数据：只写配置里的并发上限，别按有过几轮的样子说「等调度者」「已收尾」。调度者正在想的
+  // 照说；收场（用完轮数、收尾判定）以事件为准，回放到上一次的收场时照样说
+  const started = !!team?.rounds.length
+  const idle = maxParallel ? `并发上限 ${maxParallel}` : ''
+  if (live) {
     headRight = thinking ? closing ? verdictText({ done: false, reason: '', open: true }) : '调度中'
+      : !started ? idle
       : width > 1 ? runningNow ? `本轮 ${width} 人并行 · ${runningNow} 人在跑` : `本轮 ${width} 人已交回`
         : runningNow ? '串行推进' : '等调度者'
   } else if (ending?.exhausted) {
@@ -323,6 +330,8 @@ function TeamMatrixImpl({
   } else if (verdict && !verdict.open) {
     headRight = verdictText(verdict)
     headTone = verdict.done ? '' : 'warn'
+  } else if (!started) {
+    headRight = idle
   } else {
     headRight = unsettledNote(rows.filter((r) => r.active && r.member)
       .map((r) => ({ ...r.member!, status: r.status! })))

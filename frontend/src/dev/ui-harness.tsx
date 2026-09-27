@@ -9,7 +9,7 @@ import {
   promptDialog, toast, useRadioGroup, withoutDeferred,
 } from '../components/ui'
 import { ApiError, api } from '../api/client'
-import { useCatalog, useOnReconnect } from '../store/catalog'
+import { useCatalog, useDatasources, useOnReconnect } from '../store/catalog'
 import { STATUS } from '../lib/status'
 import { formatClock, formatCost, formatDateTime, formatDuration, formatTime, formatTokens } from '../lib/format'
 import * as format from '../lib/format'
@@ -19,6 +19,7 @@ import * as terms from '../lib/terms'
 import * as errors from '../lib/errors'
 import * as explain from '../lib/explain'
 import * as health from '../lib/health'
+import * as actor from '../lib/actor'
 import '../index.css'
 
 /**
@@ -161,6 +162,21 @@ function ManageKitDemo() {
   )
 }
 
+/**
+ * useDatasources 的挂载探针：检查脚本用 window.__ui.mountDatasources(n) 同时挂 n 个消费方，
+ * 数请求看「过期才拉、多处挂载只拉一次、启动落定后补拉」
+ */
+let setDatasourceConsumers: (n: number) => void = () => {}
+function DatasourceConsumer() {
+  const { list, state } = useDatasources()
+  return <span data-ds-consumer={state}>{list.length}</span>
+}
+function DatasourceConsumers() {
+  const [n, setN] = useState(0)
+  useEffect(() => { setDatasourceConsumers = setN }, [])
+  return <div hidden data-ds-consumers={n}>{Array.from({ length: n }, (_, i) => <DatasourceConsumer key={i} />)}</div>
+}
+
 function Harness() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     // 没有显式主题时会跟随系统；预览要确定是哪一套，开场就钉住
@@ -180,6 +196,7 @@ function Harness() {
   return (
     <div className="flex h-full flex-col">
       <OfflineBanner />
+      <DatasourceConsumers />
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-5xl flex-col gap-4 p-6">
           <div className="flex items-center gap-2">
@@ -410,8 +427,9 @@ function Harness() {
 
 ;(window as any).__ui = {
   toast, confirmDialog, promptDialog, useCatalog, ApiError, api,
+  mountDatasources: (n: number) => setDatasourceConsumers(n),
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
-  lib: { format, status, keys, terms, errors, explain, health },
+  lib: { format, status, keys, terms, errors, explain, health, actor },
 }
 
 createRoot(document.getElementById('root')!).render(

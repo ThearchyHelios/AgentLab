@@ -282,3 +282,17 @@ async def test_upload_will_not_hijack_a_real_database(client):
     resp = await _upload(client, "tab_real", xlsx({"s": [["a"], [1]]}))
     assert resp.status_code == 409
     assert "换个名字" in resp.json()["detail"]
+
+
+def test_broken_excel_message_has_no_exception_class_name():
+    """坏掉的 .xlsx：报错说人话，不带 Python 异常类名（BadZipFile、InvalidFileException…）。
+
+    这句话原样进上传的 400 detail，界面上是红字首行。
+    """
+    from app.data.tabular import read_tables
+
+    with pytest.raises(UnsupportedTable) as info:
+        read_tables(b"not really an xlsx", "orders.xlsx")
+    text = str(info.value)
+    assert text.startswith("这个 Excel 读不开")
+    assert "BadZipFile" not in text and "Error" not in text and "Exception" not in text

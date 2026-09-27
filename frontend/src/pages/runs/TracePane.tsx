@@ -3,11 +3,13 @@ import { Link } from 'react-router-dom'
 import { Crosshair, ListTree, TriangleAlert, X } from 'lucide-react'
 import clsx from 'clsx'
 import '../../canvas/surface.css'
-import { RunTimeline, lastStampOf, projectSettled, waitedMs, type DockUi } from '../../canvas/RunTimeline'
+import {
+  MIN_H, RunTimeline, dockHeightFor, lastStampOf, projectSettled, waitedMs, type DockUi,
+} from '../../canvas/RunTimeline'
 import { EmptyState, StatusBadge, StatusPill } from '../../components/ui'
 import { explainRunError } from '../../lib/explain'
 import {
-  NONE, formatCost, formatDateTime, formatNumber, formatTokens, shortId,
+  NONE, formatCost, formatDateTime, formatNumber, formatOffset, formatSpan, formatTokens, shortId,
 } from '../../lib/format'
 import { runClassLabel, nodeTypeLabel } from '../../lib/terms'
 import { topology, type GraphLike } from '../../run/derive'
@@ -15,21 +17,14 @@ import {
   isActivePhase, isSettled, liveAt, project, type NodeState, type Projection, type RunPhase, type Trace,
 } from '../../run/trace'
 import {
-  factsOf, happened, openCall, projectCached, replayTraceCached, type NodeFacts,
+  execStart, factsOf, lastIn, openCall, projectCached, replayTraceCached, type FactMark, type NodeFacts,
 } from '../../run/useNodeView'
 import { useRunClock } from '../../run/useRunClock'
 import type { StatusCode } from '../../lib/status'
 import type { GraphSpec, Run, RunEvent } from '../../types'
-import { cancelReason, formatOffset, formatSpan } from './model'
+import { cancelReason } from './model'
 
 const EMPTY_GRAPH: GraphSpec = { nodes: [], edges: [] }
-
-// 坞头 34 + 吸顶三行 70；泳道 22，协作的子泳道 18（和 RunTimeline 的排版一致）
-const DOCK_HEAD = 34 + 70
-const LANE_H = 22
-const SUB_H = 18
-// 坞能拖到的最矮（RunTimeline 的 MIN_H）：刻度行和整次运行那一条还在，泳道在坞里滚
-const MIN_DOCK = 132
 
 const DOCK_KEY = 'agentlab.runs.dock'
 function readDock(): Pick<DockUi, 'open' | 'compress'> {
@@ -82,17 +77,11 @@ export function TracePane({
   const box = useRef<HTMLDivElement>(null)
   const [ui, setUi] = useState<DockUi>(() => ({ ...readDock(), height: 0, playing: false, speed: 1 }))
   const sized = useRef(false)
-  const lanes = useMemo(() => {
-    let n = new Set([...g.nodes.map((x) => x.id), ...Object.keys(trace.nodes)]).size * LANE_H
-    for (const t of Object.values(trace.nodes)) {
-      if (t.segments.some((s) => s.kind === 'dispatch')) n += SUB_H
-      n += new Set(t.segments.filter((s) => s.kind === 'member').map((s) => s.agent)).size * SUB_H
-    }
-    return n
-  }, [g.nodes, trace.nodes])
+  // 泳道一条不裁时坞要多高：排版的几个常量只在 RunTimeline 里有一份，这里不再抄
+  const fullDock = useMemo(() => dockHeightFor(trace, g), [trace, g])
   // 读数区先拿够它要的（八格读数，加上此刻、节点卡、关键时刻），坞拿剩下的：屏幕矮、
   // 节点多时，按泳道要的高度给坞会把读数区挤得只剩八格，默认选中的失败节点卡、关键
-  // 时刻全落在视线外。坞最矮到能拖到的最矮，泳道在坞里滚。只在面板尺寸、泳道数变了时
+  // 时刻全落在视线外。坞最矮到能拖到的最矮（MIN_H），泳道在坞里滚。只在面板尺寸、泳道数变了时
   // 重分：拖游标、点节点时读数区的高度在变，坞跟着跳的话，手底下的泳道会挪走
   const empty = !Object.keys(trace.nodes).length && trace.startedAt == null
   useLayoutEffect(() => {
@@ -100,12 +89,12 @@ export function TracePane({
     if (!el) return
     const fit = () => {
       const h = el.clientHeight
-      const cap = Math.max(MIN_DOCK, h * 0.7)
+      const cap = Math.max(MIN_H, h * 0.7)
       const read = el.querySelector<HTMLElement>('[data-trace-readout]')
       const need = read ? [...read.children].reduce((n, c) => n + c.getBoundingClientRect().height, 0) : 0
       setUi((cur) => {
-        const want = sized.current ? cur.height : Math.min(DOCK_HEAD + lanes + 10, h - Math.ceil(need))
-        const height = Math.round(Math.min(cap, Math.max(MIN_DOCK, want)))
+        const want = sized.current ? cur.height : Math.min(fullDock, h - Math.ceil(need))
+        const height = Math.round(Math.min(cap, Math.max(MIN_H, want)))
         return height === cur.height ? cur : { ...cur, height }
       })
     }
@@ -113,7 +102,7 @@ export function TracePane({
     const ro = new ResizeObserver(fit)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [lanes, empty])
+  }, [fullDock, empty])
   const patchUi = (p: Partial<DockUi>) => {
     if ('height' in p) sized.current = true
     setUi((cur) => {
@@ -245,7 +234,7 @@ function Readout({
                 tone={proj.phase === 'waiting' ? 'var(--st-waiting)' : undefined}>
           {span(proj.waitMs, trace.timed)}
         </Metric>
-        <Metric label="节点" data="nodes" title="已完成（含跳过）/ 图上的节点总数"
+        <Metric label="节点" data="nodes" title="已完成（含跳过）/ 工作流里的节点总数"
                 sub={proj.parallelNow > 1 ? `${proj.parallelNow} 个并行` : undefined}>
           {proj.nodesTotal ? <>{proj.nodesDone}<span className="text-faint">/{proj.nodesTotal}</span></> : NONE}
         </Metric>
@@ -432,10 +421,19 @@ function momentsOf(
         })
       }
     })
+    // 引擎的警告一次执行一件：同一个节点跑了几次，每次的都各算一个时刻，说法和节点卡同一份。
+    // 只取整次运行最后那一下的话，前几次的从列表里消失，列表和节点卡就对不上了。
+    // 最后一件的 key 不带序号，老链接和检查照旧认得
     const f = facts[id]
-    if (f?.markup) out.push({ key: `${id}:markup`, at: f.markup.at, status: 'warn', text: `${name(id)}把工具调用写成了文字`, nodeId: id })
-    if (f?.exhausted) out.push({ key: `${id}:exhausted`, at: f.exhausted.at, status: 'warn', text: `${name(id)}协作轮数用完，降档交付`, nodeId: id })
-    if (f?.invented) out.push({ key: `${id}:invented`, at: f.invented.at, status: 'warn', text: `${name(id)}校验修复编了原文没有的值`, nodeId: id })
+    const each = <T extends FactMark>(list: T[] | undefined, tag: string, say: (m: T) => Pick<Moment, 'text' | 'sub'>) =>
+      (list ?? []).forEach((m, i, all) => out.push({
+        key: i === all.length - 1 ? `${id}:${tag}` : `${id}:${tag}${i}`, at: m.at, status: 'warn', nodeId: id, ...say(m),
+      }))
+    each(f?.markups, 'markup', (m) => (m.settle
+      ? { text: `${name(id)}收尾轮仍想调用工具`, sub: '交出来的可能不完整' }
+      : { text: `${name(id)}把工具调用写成了文字`, sub: '提醒之后重答了' }))
+    each(f?.exhausts, 'exhausted', () => ({ text: `${name(id)}协作轮数用完，降档交付` }))
+    each(f?.inventions, 'invented', () => ({ text: `${name(id)}校验修复编了原文没有的值` }))
   }
   // 失败、挂起之后又跑起来：接着跑。等审批之后的恢复已经由「审批已处理」说了
   let prev: RunPhase | null = null
@@ -610,8 +608,11 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
   if (n?.takenHandle && (state === 'done' || state === 'failed')) rows.push(['出口', <span className="mono">{n.takenHandle}</span>])
   if (n?.reason) rows.push(['理由', n.reason])
   if (state === 'skipped' && n?.skippedReason) rows.push(['跳过', n.skippedReason])
-  // 那一刻卡在哪个工具上：「慢在哪」往往就是这一次查询。实时只看这一次执行里开着的
-  const call = state === 'running' ? openCall(facts, at) : undefined
+  // 卡片说的是游标那一刻所在的那一次执行（和画布卡片同一个划分）：循环上一轮、接着跑之前
+  // 的事不挂到这一次干净的执行上；回放到更早的一次时，也不因为后面还有一件就看不到这一次的
+  const since = execStart(n, at, facts)
+  // 那一刻卡在哪个工具上：「慢在哪」往往就是这一次查询。上一次撒手没收尾的调用不算
+  const call = state === 'running' ? openCall(facts, at, since) : undefined
   if (call) {
     const since = (at ?? Date.now() - (trace.skewMs ?? 0)) - call.start
     rows.push(['在调', (
@@ -622,11 +623,14 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
       </span>
     )])
   }
-  // 引擎判为降档、失败的几种「没按要求做完」：到游标那一刻已经发生的才说
+  // 引擎判为降档、失败的几种「没按要求做完」：这一次执行里、到游标那一刻已经发生的才说。
+  // 写成文字分两种：收尾轮还想调工具（交出来的是前面写的，可能不完整）；写成文字被提醒、
+  // 重答了（成果是重答的那一次）。一律说「没有真正调用工具」，对重答成功的情况不准
+  const markup = lastIn(facts?.markups, at, since)
   const warns = [
-    happened(facts?.markup, at) && '模型把工具调用写成了文字，没有真正调用工具',
-    happened(facts?.exhausted, at) && '协作轮数用完仍未完成，按降档交付',
-    happened(facts?.invented, at) && '校验修复时出现了原文没有的值，修复被拒',
+    markup && (markup.settle ? '收尾轮仍想调用工具，交出来的可能不完整' : '模型把工具调用写成了文字，提醒之后重答了'),
+    lastIn(facts?.exhausts, at, since) && '协作轮数用完仍未完成，按降档交付',
+    lastIn(facts?.inventions, at, since) && '校验修复时出现了原文没有的值，修复被拒',
   ].filter((w): w is string => !!w)
 
   return (
@@ -687,7 +691,7 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
           </Link>
         ) : gone && (
           <span className="self-center text-2xs text-faint" data-node-gone=""
-                title="工作流在这次运行之后改过结构，现在的图里已经没有这个节点：画布上看不到它，当时的样子就在这里">
+                title="工作流在这次运行之后改过结构，现在的工作流里已经没有这个节点：画布上看不到它，当时的样子就在这里">
             画布上已没有这个节点
           </span>
         )}

@@ -6,6 +6,7 @@ import { api } from '../api/client'
 import { diffGraphs, toFlow, useStudio, type GraphDiff } from '../store/studio'
 import { Modal, Spinner, toast } from '../components/ui'
 import { WORKFLOW_STATUS_HINT } from '../lib/terms'
+import { setLocalActor, useLocalActor } from '../lib/actor'
 import type { Workflow } from '../types'
 
 type Level = 'published' | 'governed'
@@ -14,12 +15,6 @@ const LEVEL_DETAIL: Record<Level, string> = {
   published: '基础校验通过即可。正式运行从这一版发起，之后画布上继续改不影响它',
   governed: '另过治理门禁：不许有「多 Agent 协作」这类全动态规划节点；子工作流要钉住版本；'
     + '至少一个「成果」节点声明出具契约；Agent 的危险工具至少要人工审批',
-}
-
-/** 署名只存在这台浏览器里（和请求头 X-Actor 是同一份） */
-const ACTOR_KEY = 'agentlab_actor'
-const readActor = () => {
-  try { return localStorage.getItem(ACTOR_KEY)?.trim() ?? '' } catch { return '' }
 }
 
 /**
@@ -41,7 +36,11 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   const [level, setLevel] = useState<Level>(workflow.status === 'governed' ? 'governed' : 'published')
   const [busy, setBusy] = useState(false)
   const [issues, setIssues] = useState<any[] | null>(null)
-  const [actor, setActor] = useState(readActor)
+  // 署名只存在这台浏览器里（和请求头 X-Actor 是同一份，见 lib/actor）。存不进去（隐私模式）
+  // 时这一次弹窗里先记着，照样写得进发布提示
+  const stored = useLocalActor()
+  const [unsaved, setUnsaved] = useState<string | null>(null)
+  const actor = stored ?? unsaved ?? ''
   const [signing, setSigning] = useState('')
   const [delta, setDelta] = useState<GraphDiff | null>(null)
   const published = workflow.published_version
@@ -61,8 +60,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   const sign = () => {
     const name = signing.trim()
     if (!name) return
-    try { localStorage.setItem(ACTOR_KEY, name) } catch { /* 隐私模式：只这一次有效 */ }
-    setActor(name)
+    // 写完会广播：导航底部的首字、别处的署名跟着变，不用等下一次获得焦点
+    if (!setLocalActor(name)) setUnsaved(name)
   }
 
   const publish = async () => {

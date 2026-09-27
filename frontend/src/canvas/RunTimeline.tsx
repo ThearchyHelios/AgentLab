@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp, FoldHorizontal, Pause, Play, Radio } from 'luci
 import clsx from 'clsx'
 import { create } from 'zustand'
 import { StatusBadge } from '../components/ui'
-import { formatClock, formatDuration, formatTokens, NONE } from '../lib/format'
+import { formatClock, formatDuration, formatLapse, formatOffset, formatSpan, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import { topology, type GraphLike } from '../run/derive'
 import {
@@ -58,19 +58,28 @@ export interface RunTimelineProps {
   className?: string
 }
 
+// 排版尺寸。导出的几个是给坞分高度的人用的（记录页的航迹页签）：照抄的话这边一改，
+// 两边就对不上——泳道被裁掉半行，或者底下空出一截
 const COLLAPSED = 30
-const MIN_H = 132
+/** 坞能拖到的最矮：刻度行和整次运行那一条还在，泳道在坞里滚 */
+export const MIN_H = 132
+/** 坞头（航迹 · 实时/回放 · 播放……那一行） */
+export const DOCK_HEAD_H = 34
 const LABEL_W = 136
 const SUM_W = 116
-const ROW_H = 22
-const SUB_H = 18
+/** 一个节点一条泳道 */
+export const ROW_H = 22
+/** 协作团队展开的子泳道：调度者一条，每个成员一条 */
+export const SUB_H = 18
 const AXIS_H = 22
 /** 游标头在刻度行里占 2–20px */
 const CURSOR_TOP = 20
 const PAR_H = 26
 const RUN_H = 22
 /** 吸顶的三行（刻度、并行度、运行本身）一共多高：泳道从它下面开始 */
-const HEAD_H = AXIS_H + PAR_H + RUN_H
+export const STICKY_H = AXIS_H + PAR_H + RUN_H
+/** .tl 的上边框（surface.css）。坞的 height 按 border-box 算，这 1px 占的是泳道的地方 */
+export const DOCK_BORDER_H = 1
 const FOLD_MIN_MS = 120_000
 const FOLD_PX = 48
 /** 超过这么多泳道只画看得见的那些 */
@@ -136,37 +145,49 @@ interface Scale {
   ticks: { t: number; x: number; label: string }[]
 }
 
+const HOUR = 3_600_000
+const DAY = 86_400_000
+// 挂了几天的运行不压缩空档时，最粗也得排得下：以前止于 2 小时一格，九天的轴上
+// 刻度一格几像素，200 个数字叠成一团
 const STEPS = [100, 200, 500, 1000, 2000, 5000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000,
-  600_000, 900_000, 1_800_000, 3_600_000, 7_200_000]
+  600_000, 900_000, 1_800_000, HOUR, 2 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 7 * DAY]
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
-/** 刻度上的相对时刻：「00:05」「1:02:00」，步长不到一秒时带十分位 */
+/**
+ * 刻度上的相对时刻：「00:05」「1:02:00」，步长不到一秒时带十分位。过了一天写
+ * 「9 天」「9 天 06:00」，和游标读数（formatOffset）同一种写法
+ */
 function relLabel(ms: number, fine: boolean): string {
   if (fine) return formatClock(ms)
   const s = Math.round(ms / 1000)
   const h = Math.floor(s / 3600)
   const m = Math.floor(s / 60) % 60
+  if (ms >= DAY) {
+    const d = Math.floor(s / 86_400)
+    return h % 24 || m ? `${d} 天 ${pad2(h % 24)}:${pad2(m)}` : `${d} 天`
+  }
   return h > 0 ? `${h}:${pad2(m)}:${pad2(s % 60)}` : `${pad2(m)}:${pad2(s % 60)}`
 }
 
 /**
- * 窄处的时长：一分钟以内照常（「14.3 s」），以上写钟面（「1:28」「1:02:05」）。
+ * 窄处的时长：一分钟以内照常（「14.3 s」），一小时以内写钟面（「1:28」），再长只写最大的
+ * 单位（「3 小时」「9 天」，和记录页列表的「已等 9 天」同一种写法），完整的在 title 里。
  * trunc：还在走的数和计时器一样截断——四舍五入的话同一刻这里写 3.8、计时器写 00:03.7
  */
 function span(ms: number, trunc = false): string {
   if (ms < 60_000) return trunc ? `${(Math.floor(ms / 100) / 10).toFixed(1)} s` : formatDuration(ms)
+  if (ms >= HOUR) return formatSpan(ms, { coarse: true })
   const s = trunc ? Math.floor(ms / 1000) : Math.round(ms / 1000)
-  const h = Math.floor(s / 3600)
-  const m = Math.floor(s / 60) % 60
-  return h > 0 ? `${h}:${pad2(m)}:${pad2(s % 60)}` : `${m}:${pad2(s % 60)}`
+  return `${Math.floor(s / 60)}:${pad2(s % 60)}`
 }
 
 /**
- * 折叠处的小标签只有 48px：写整数分钟 / 小时，完整时长在 title 里。
+ * 折叠处的小标签只有 48px：写整数分钟 / 小时 / 天，完整时长在 title 里。
  * 不再两头加「⋯」——11px 下它们放不下、被截成半个，斜纹本身已经说明这里折起来了
  */
 function foldLabel(ms: number): string {
+  if (ms >= DAY) return formatSpan(ms, { coarse: true })
   const m = Math.round(ms / 60_000)
   return m < 60 ? `${m} 分` : `${Math.floor(m / 60)} 时 ${pad2(m % 60)}`
 }
@@ -253,7 +274,10 @@ interface Row {
   segs: Segment[]
   state: NodeState
   count: number
+  /** 右边那一列：窄，一小时以上的时长只写最大的单位 */
   summary: string
+  /** 同一句的完整写法（「等 9 天 03 小时」）：悬停和读屏用 */
+  detail: string
   /**
    * 只执行过一段的节点，用后端量的耗时（事件时间戳之间还夹着转发的延迟）。
    * 段上的数字和右边的摘要都用它，同一行不出现两个数
@@ -278,10 +302,17 @@ function measuredOf(n: NodeTrace | undefined, at: number): number | undefined {
 }
 
 /**
- * 一条泳道右侧的摘要：执行了几次、一共多久、等了多久、用了多少 token。
- * tokens 回放时是游标那一刻的读数（投影给的），实时是累计
+ * 摘要那一列只有 116px：一小时以上的时长只写最大的单位（「等 9 天」「3 小时」），
+ * 「3.7 s · 等 9 天 03 小时」会被截成半截、偏偏截掉的是等了多久。完整的写法放悬停和读屏
  */
-function summarize(n: NodeTrace | undefined, state: NodeState, at: number, tokens?: number): string {
+const brief = (ms: number | undefined, full: boolean): string =>
+  (ms != null && ms >= HOUR && !full ? formatSpan(ms, { coarse: true }) : formatSpan(ms))
+
+/**
+ * 一条泳道右侧的摘要：执行了几次、一共多久、等了多久、用了多少 token。
+ * tokens 回放时是游标那一刻的读数（投影给的），实时是累计。full 给悬停用
+ */
+function summarize(n: NodeTrace | undefined, state: NodeState, at: number, tokens?: number, full = false): string {
   if (!n || state === 'idle' || state === 'queued') return state === 'queued' ? '排队' : NONE
   if (state === 'blocked') return '阻断'
   if (state === 'unreached') return '未到达'
@@ -297,8 +328,8 @@ function summarize(n: NodeTrace | undefined, state: NodeState, at: number, token
   const parts: string[] = []
   if (n.count > 1) parts.push(`×${n.count}`)
   const measured = measuredOf(n, at)
-  if (run > 0 || state === 'done') parts.push(formatDuration(measured ?? (run || n.lastDurationMs)))
-  if (wait > 0) parts.push(`等 ${formatClock(wait).replace(/\.\d$/, '')}`)
+  if (run > 0 || state === 'done') parts.push(brief(measured ?? (run || n.lastDurationMs), full))
+  if (wait > 0) parts.push(`等 ${wait >= HOUR ? brief(wait, full) : formatLapse(wait, false)}`)
   const tok = tokens ?? n.tokensIn + n.tokensOut
   if (tok > 0 && parts.length < 3) parts.push(formatTokens(tok, { compact: true }))
   return parts.join(' · ') || NONE
@@ -319,11 +350,13 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
     const state: NodeState = states ? p?.state ?? 'idle' : n?.state ?? 'idle'
     const type = nodeTypeOf(byId.get(id))
     const label = labels.get(id) ?? id
+    const tokens = states ? (p?.tokensIn ?? 0) + (p?.tokensOut ?? 0) : undefined
     rows.push({
       key: id, kind: 'node', nodeId: id, label, type,
       segs: (n?.segments ?? []).filter((s) => s.kind === 'run' || s.kind === 'wait' || s.kind === 'retry'),
       state, count: n?.count ?? 0, measuredMs: measuredOf(n, at),
-      summary: summarize(n, state, at, states ? (p?.tokensIn ?? 0) + (p?.tokensOut ?? 0) : undefined),
+      summary: summarize(n, state, at, tokens),
+      detail: summarize(n, state, at, tokens, true),
       note: state === 'blocked' ? (failedLabel ? `阻断：上游「${failedLabel}」失败` : '阻断：上游失败')
         : state === 'unreached' ? '未到达' : undefined,
       name: label, top, height: ROW_H,
@@ -338,7 +371,8 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
       rows.push({
         key: `${id}::dispatch`, kind: 'dispatch', nodeId: id, label: '调度者',
         segs: dispatch, state, count: dispatch.length,
-        summary: `${formatDuration(total)}${estimated ? ' · 推算' : ''}`,
+        summary: `${brief(total, false)}${estimated ? ' · 推算' : ''}`,
+        detail: `${formatSpan(total)}${estimated ? ' · 推算：由事件间隙推出，不是测量值' : ''}`,
         name: `${label} · 调度者`, top, height: SUB_H,
       })
       top += SUB_H
@@ -350,13 +384,35 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
       const total = segs.reduce((acc, s) => acc + Math.max(0, Math.min(s.end ?? at, at) - s.start), 0)
       rows.push({
         key: `${id}::${agent}`, kind: 'member', nodeId: id, label: agent, segs, state,
-        count: segs.length, summary: `${segs.length > 1 ? `×${segs.length} · ` : ''}${formatDuration(total)}`,
+        count: segs.length, summary: `${segs.length > 1 ? `×${segs.length} · ` : ''}${brief(total, false)}`,
+        detail: `${segs.length > 1 ? `×${segs.length} · ` : ''}${formatSpan(total)}`,
         name: `${label} · ${agent}`, top, height: SUB_H,
       })
       top += SUB_H
     }
   }
   return rows
+}
+
+/**
+ * 泳道一共多高（不含坞头和吸顶三行）。和 buildRows 同一套规则：图里的每个节点、加上
+ * 航迹里有而图里没有的各一行，协作团队另有调度者一行、每个成员一行
+ */
+export function lanesHeight(trace: Trace, graph: TimelineGraph): number {
+  let h = new Set([...graph.nodes.map((n) => n.id), ...Object.keys(trace.nodes)]).size * ROW_H
+  for (const n of Object.values(trace.nodes)) {
+    if (n.segments.some((s) => s.kind === 'dispatch')) h += SUB_H
+    h += new Set(n.segments.filter((s) => s.kind === 'member' && s.agent).map((s) => s.agent)).size * SUB_H
+  }
+  return h
+}
+
+/**
+ * 泳道一行不裁时坞要多高，直接当 ui.height 用。给坞分高度的人用这一个，别自己拼那几个
+ * 常量：少算上边框那 1px，最后一条泳道就被裁掉 1px
+ */
+export function dockHeightFor(trace: Trace, graph: TimelineGraph): number {
+  return DOCK_BORDER_H + DOCK_HEAD_H + STICKY_H + lanesHeight(trace, graph)
 }
 
 /** 所有有意义的时刻：折叠空档时，只有这些之间的空白才算"什么都没发生" */
@@ -420,8 +476,8 @@ function segTitle(row: Row, s: Segment, t0: number, at: number): string {
   return [
     `${row.label}${s.iteration != null ? ` · 第 ${s.iteration} ${row.kind === 'node' ? '轮' : '轮协作'}` : ''}`,
     `${what}${s.handle && s.kind === 'run' ? ` → ${s.handle}` : ''}`,
-    `开始 T+${formatClock(s.start - t0)}${s.end == null ? ' · 进行中' : ''}`,
-    s.kind === 'retry' ? '' : `耗时 ${formatDuration(end - s.start)}`,
+    `开始 T+${formatOffset(s.start - t0)}${s.end == null ? ' · 进行中' : ''}`,
+    s.kind === 'retry' ? '' : `耗时 ${formatSpan(end - s.start)}`,
   ].filter(Boolean).join('\n')
 }
 
@@ -613,7 +669,7 @@ export function RunTimeline({
     // 目标可能在可见区外（虚拟化时还没画出来）：先滚过去，吸顶的三行会盖住最上面那截
     const el = scroller.current
     if (!el) return
-    const room = el.clientHeight - HEAD_H
+    const room = el.clientHeight - STICKY_H
     if (next.top < el.scrollTop) el.scrollTop = next.top
     else if (next.top + next.height > el.scrollTop + room) el.scrollTop = next.top + next.height - room
     if (rows.length > VIRTUAL_AFTER) setView({ top: el.scrollTop, height: el.clientHeight })
@@ -636,8 +692,8 @@ export function RunTimeline({
   const failed = trace.phase === 'failed'
   const phaseMeta = statusMeta(trace.phase === 'idle' ? 'idle' : trace.phase)
   const cursorLabel = live
-    ? (running ? `实时 ${formatClock(cursor - t0)}` : `结束 ${formatClock(tEnd - t0)}`)
-    : `回放 ${formatClock(cursor - t0)}`
+    ? (running ? `实时 ${formatOffset(cursor - t0)}` : `结束 ${formatOffset(tEnd - t0)}`)
+    : `回放 ${formatOffset(cursor - t0)}`
   const peak = trace.parallelSeries.reduce((m, [, v]) => Math.max(m, v), 0)
   // 实时在跑时和游标、胶囊用同一种写法（mm:ss.s），数字才对得上；有等人就两段都写，
   // 用紧凑的钟面写法，不然「1 分 28 秒 · 等 25 分 00 秒」塞不进这一列。还在走的那一段截断
@@ -646,7 +702,7 @@ export function RunTimeline({
   const wait = trace.waits[trace.waits.length - 1]
   const runSum = proj.waitMs > 0
     ? `${span(proj.activeMs, liveRun && !!drive && drive[1] == null)} · 等 ${span(proj.waitMs, liveRun && !!wait && wait[1] == null)}`
-    : liveRun ? formatClock(proj.activeMs) : formatDuration(proj.activeMs)
+    : liveRun ? formatLapse(proj.activeMs) : formatSpan(proj.activeMs)
   // 停在哪个节点、已经等了多久：和胶囊、面板、泳道、运行那一行同一个数（见 waitedMs）
   const waitedNow = trace.phase === 'waiting' && trace.waitingNodeId
     ? waitedMs(trace, trace.waitingNodeId, liveNow) : null
@@ -692,7 +748,8 @@ export function RunTimeline({
            onKeyDown={onGripKey}
            onPointerDown={onGripDown} onPointerMove={onGripMove} onPointerUp={onGripUp} onPointerCancel={onGripUp} />
 
-      <header className="tl-head">
+      {/* 高度写在这里不写在 CSS：DOCK_HEAD_H 是给坞分高度的人读的那一份 */}
+      <header className="tl-head" style={{ height: DOCK_HEAD_H }}>
         <span className="tl-name">航迹</span>
         <div className="tl-seg" role="group" aria-label="实时或回放">
           <button type="button" className={clsx(live && 'is-on')} aria-pressed={live} onClick={goLive}
@@ -731,7 +788,7 @@ export function RunTimeline({
             <StatusBadge status="waiting" size={11} animate={false} decorative />
             <span className="min-w-0 truncate">
               停在「{labels.get(trace.waitingNodeId) ?? trace.waitingNodeId}」
-              {waitedNow != null && <> · 已等 <span className="tnum">{formatClock(waitedNow)}</span></>}
+              {waitedNow != null && <> · 已等 <span className="tnum">{formatLapse(waitedNow)}</span></>}
             </span>
           </button>
         )}
@@ -743,7 +800,7 @@ export function RunTimeline({
       </header>
 
       <div className="tl-body" ref={body}>
-        <div className="tl-scroll" ref={scroller} onScroll={onScroll} style={{ scrollPaddingTop: HEAD_H }}>
+        <div className="tl-scroll" ref={scroller} onScroll={onScroll} style={{ scrollPaddingTop: STICKY_H }}>
           {/* 刻度 + 并行度 + 运行本身：拖这三行就是拖游标 */}
           <div className="tl-sticky">
             <div className="tl-row tl-axis" style={{ height: AXIS_H }}>
@@ -756,7 +813,7 @@ export function RunTimeline({
                 ))}
                 {scale.folds.map((f) => (
                   <span key={f.a} className="tl-fold-tag tnum" style={{ left: f.x0, width: f.x1 - f.x0 }}
-                        title={`这 ${formatDuration(f.b - f.a)} 里没有任何事件，已压缩`}>
+                        title={`这 ${formatSpan(f.b - f.a)} 里没有任何事件，已压缩`}>
                     {foldLabel(f.b - f.a)}
                   </span>
                 ))}
@@ -794,7 +851,7 @@ export function RunTimeline({
                   const x0 = scale.x(a)
                   const w = Math.max(2, scale.x(b ?? drawAt) - x0)
                   // 宽度按 200ms 一格排，字按时钟走：还开着的这一段和右边、游标写同一个数
-                  const text = b == null && running && live ? formatClock(liveNow - a) : formatDuration((b ?? drawAt) - a)
+                  const text = b == null && running && live ? formatLapse(liveNow - a) : formatSpan((b ?? drawAt) - a)
                   return (
                     <span key={`d${i}`} className="tl-bar tl-drive" style={{ left: x0, width: w }}>
                       {w > 70 && <em className="tnum">执行 {text}</em>}
@@ -805,7 +862,7 @@ export function RunTimeline({
                   const x0 = scale.x(a)
                   const w = Math.max(2, scale.x(b ?? drawAt) - x0)
                   // 还开着的这一段和执行段一样按时钟写：和坞头「已等」、右边合计、胶囊同一个数
-                  const text = b == null && liveRun ? formatClock(liveNow - a) : formatDuration((b ?? drawAt) - a)
+                  const text = b == null && liveRun ? formatLapse(liveNow - a) : formatSpan((b ?? drawAt) - a)
                   return (
                     <span key={`w${i}`} className="tl-bar tl-s-waiting tl-hatch" style={{ left: x0, width: w }}
                           title={`等人审批 ${text}`}>
@@ -815,10 +872,10 @@ export function RunTimeline({
                 })}
                 {isTerminal(trace.phase) && trace.endedAt != null && (
                   <span className={clsx('tl-end', `tl-end-${trace.phase}`)} style={{ left: scale.x(trace.endedAt) }}
-                        title={`${phaseMeta.label} · T+${formatClock(trace.endedAt - t0)}`} />
+                        title={`${phaseMeta.label} · T+${formatOffset(trace.endedAt - t0)}`} />
                 )}
               </div>
-              <div className="tl-sum tnum" title={`执行 ${formatDuration(proj.activeMs)}${proj.waitMs > 0 ? ` · 等人 ${formatDuration(proj.waitMs)}` : ''}`}>
+              <div className="tl-sum tnum" title={`执行 ${formatSpan(proj.activeMs)}${proj.waitMs > 0 ? ` · 等人 ${formatSpan(proj.waitMs)}` : ''}`}>
                 {runSum}
               </div>
             </div>
@@ -830,7 +887,7 @@ export function RunTimeline({
             )}
             {/* 竖线从游标头下沿开始：回放时游标头是描边的，线穿过去会划掉上面的数字 */}
             <div className={clsx('tl-cursor', live ? 'is-live' : 'is-replay')} aria-hidden
-                 style={{ top: CURSOR_TOP, transform: `translateX(${LABEL_W + cursorX}px)`, height: HEAD_H - CURSOR_TOP }} />
+                 style={{ top: CURSOR_TOP, transform: `translateX(${LABEL_W + cursorX}px)`, height: STICKY_H - CURSOR_TOP }} />
           </div>
 
           <div className="tl-lanes" style={{ height: totalH }} role="group" aria-label="泳道：上下键切换，回车在画布上定位">
@@ -846,14 +903,14 @@ export function RunTimeline({
           {/* 折叠的空档：斜纹贯穿所有泳道——整张图在这段时间里都停着 */}
           {scale.folds.map((f) => (
             <span key={`f${f.a}`} className="tl-fold" aria-hidden
-                  style={{ left: LABEL_W + f.x0, width: f.x1 - f.x0, height: HEAD_H + totalH }} />
+                  style={{ left: LABEL_W + f.x0, width: f.x1 - f.x0, height: STICKY_H + totalH }} />
           ))}
           {!live && (
             <span className="tl-future" aria-hidden
-                  style={{ left: LABEL_W + cursorX, width: Math.max(0, scale.width - cursorX), top: HEAD_H, height: totalH }} />
+                  style={{ left: LABEL_W + cursorX, width: Math.max(0, scale.width - cursorX), top: STICKY_H, height: totalH }} />
           )}
           <div className={clsx('tl-cursor', live ? 'is-live' : 'is-replay')} aria-hidden
-               style={{ top: HEAD_H, transform: `translateX(${LABEL_W + cursorX}px)`, height: totalH }} />
+               style={{ top: STICKY_H, transform: `translateX(${LABEL_W + cursorX}px)`, height: totalH }} />
         </div>
       </div>
     </section>
@@ -898,7 +955,7 @@ function Lane({ row, scale, at, t0, hovered, tabbable, waitNow, onHover, onPick,
       data-lane={row.key}
       role="button"
       tabIndex={tabbable ? 0 : -1}
-      aria-label={`${row.name}：${statusMeta(row.state).label}${row.summary !== NONE ? ` · ${row.summary}` : ''}`}
+      aria-label={`${row.name}：${statusMeta(row.state).label}${row.detail !== NONE ? ` · ${row.detail}` : ''}`}
       onMouseEnter={() => onHover?.(row.nodeId)}
       onMouseLeave={() => onHover?.(null)}
       onFocus={() => { onTake(row.key); onHover?.(row.nodeId) }}
@@ -927,10 +984,10 @@ function Lane({ row, scale, at, t0, hovered, tabbable, waitNow, onHover, onPick,
           const w = Math.max(3, scale.x(end) - x0)
           const ms = s.kind === 'run' && s.end != null && row.measuredMs != null ? row.measuredMs : end - s.start
           const text = s.kind === 'wait'
-            ? `等待审批 ${s.end == null && waitNow != null ? formatClock(waitNow) : formatClock(end - s.start).replace(/\.\d$/, '')}`
+            ? `等待审批 ${s.end == null && waitNow != null ? formatLapse(waitNow) : formatLapse(end - s.start, false)}`
             : s.kind === 'dispatch'
-              ? `调度 ${formatDuration(end - s.start)}${s.estimated ? ' · 推算' : ''}`
-              : `${s.iteration != null && row.kind === 'node' ? `#${s.iteration} · ` : ''}${formatDuration(ms)}`
+              ? `调度 ${formatSpan(end - s.start)}${s.estimated ? ' · 推算' : ''}`
+              : `${s.iteration != null && row.kind === 'node' ? `#${s.iteration} · ` : ''}${formatSpan(ms)}`
           return (
             <span key={i} className={clsx('tl-bar', segClass(s), s.end == null && 'is-open')}
                   style={{ left: x0, width: w }} title={segTitle(row, s, t0, at)}>
@@ -939,7 +996,7 @@ function Lane({ row, scale, at, t0, hovered, tabbable, waitNow, onHover, onPick,
           )
         })}
       </div>
-      <div className="tl-sum tnum" title={row.summary}>{row.summary}</div>
+      <div className="tl-sum tnum" title={row.detail}>{row.summary}</div>
     </div>
   )
 }

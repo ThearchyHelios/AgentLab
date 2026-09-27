@@ -5,7 +5,7 @@ import {
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { confirmDialog, Kbd, Spinner, StatusBadge, toast } from '../components/ui'
-import { formatClock, formatCost, formatDuration, formatTokens, NONE } from '../lib/format'
+import { formatCost, formatDuration, formatLapse, formatOffset, formatSpan, formatTokens, NONE } from '../lib/format'
 import { isTypingTarget, matchShortcut } from '../lib/keys'
 import { statusMeta, STATUS, type StatusCode } from '../lib/status'
 import { issuanceLabel, runClassLabel } from '../lib/terms'
@@ -33,6 +33,8 @@ import { useRunClock } from './useRunClock'
  *   等审批时后端已经不在执行，没有「停止」可言；次级动作是「放弃这次运行」——后端把
  *   停在审批上的运行直接收成已取消，待审批一并关闭。
  */
+
+const DAY_MS = 86_400_000
 
 // -------------------------------------------------------------------------
 // 时限：GET /api/system 的 limits，全站取一次
@@ -133,7 +135,7 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
   const running = Object.keys(states).filter((id) => states[id] === 'running')
   switch (phase) {
     case 'queued':
-      return '排队中：等空出执行名额'
+      return '排队中：等空出运行名额'
     case 'running': {
       const exec = running.filter((id) => !t.nodes[id]?.looping)
       if (!exec.length) {
@@ -153,7 +155,7 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
       const id = t.waitingNodeId ?? Object.keys(states).find((k) => states[k] === 'waiting')
       if (!id) return '等人处理审批卡'
       const waited = waitedMs(t, id, at)
-      return `停在「${label(id)}」${waited != null ? ` · 已等 ${formatClock(waited)}` : ''}`
+      return `停在「${label(id)}」${waited != null ? ` · 已等 ${formatLapse(waited)}` : ''}`
     }
     case 'failed': {
       const id = t.failedNodeId
@@ -161,7 +163,7 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
       return `${id ? `失败于「${label(id)}」` : '运行失败'}${why ? `：${why}` : ''}`
     }
     case 'succeeded':
-      return t.issuance?.tier ? `执行完成 · ${issuanceLabel(t.issuance.tier)}` : '执行完成'
+      return t.issuance?.tier ? `运行完成 · ${issuanceLabel(t.issuance.tier)}` : '运行完成'
     case 'cancelled': {
       const stopped = Object.keys(states).filter((id) => states[id] === 'cancelled')
       const where = stopped.length ? `停在「${label(stopped[0])}」` : '已取消'
@@ -234,14 +236,14 @@ export function useRunGlance(active: boolean): RunGlance {
     const waited = waitedMs(trace, c.id, at)
     attention.push({
       kind: 'waiting', nodeId: c.id, title: `等待审批 · ${c.label}`,
-      detail: waited != null ? `已等 ${formatClock(waited)}` : undefined,
+      detail: waited != null ? `已等 ${formatLapse(waited)}` : undefined,
     })
   }
   if (remainingMs != null && limitMs != null && remainingMs < Math.max(60_000, limitMs * 0.2)) {
     const running = cells.find((c) => c.state === 'running')
     attention.push({
       kind: 'budget', nodeId: running?.id, title: '时限将尽',
-      detail: `这一段执行还剩 ${formatClock(remainingMs).replace(/\.\d$/, '')}，上限 ${formatDuration(limitMs)}`,
+      detail: `这一段执行还剩 ${formatLapse(remainingMs, false)}，上限 ${formatDuration(limitMs)}`,
     })
   }
 
@@ -345,7 +347,7 @@ function useResume(phase: RunPhase) {
   )
   const structureChanged = structure != null && snapshot !== structure
   const blockedBy = structureChanged
-    ? '增删过节点或连线：接着跑只接受结构不变的图，需要重新运行'
+    ? '增删过节点或连线：接着跑只接受结构没变的工作流，需要重新运行'
     : phase === 'failed' && errors ? `画布上有 ${errors} 个问题要先改掉` : ''
   const resume = async () => {
     setBusy(true)
@@ -580,7 +582,7 @@ export function RunCapsule() {
           {/* 结束之后工具栏还要放发起按钮：窄屏上计时收进面板和航迹里 */}
           <span className={clsx('sf-cap-sep', narrow && 'hidden xl:block')} />
           <span className={clsx('sf-cap-clock tnum', narrow && 'hidden xl:inline')} data-clock>
-            {formatClock(g.elapsedMs)}
+            {formatOffset(g.elapsedMs)}
           </span>
           {/* 窄处只留相位和计时；节点数、用量在面板里。结束之后胶囊让出地方给发起按钮 */}
           {!narrow && !g.replay && (
@@ -625,11 +627,15 @@ export function RunCapsule() {
           <div className="sf-hud-grid">
             <div className="sf-metric">
               <div className="sf-metric-k">墙钟</div>
-              <div className="sf-metric-v tnum">T+{formatClock(g.elapsedMs)}</div>
+              {/* 过了一天只写「T+9 天」：这一格窄，「T+9 天 03:30:45」会压到旁边的节点数上。
+                  完整的在悬停里，跳秒的读数在胶囊和航迹游标上，下面两行是执行、等人各多久 */}
+              <div className="sf-metric-v tnum" title={`T+${formatOffset(g.elapsedMs)}`}>
+                T+{g.elapsedMs >= DAY_MS ? formatSpan(g.elapsedMs, { coarse: true }) : formatOffset(g.elapsedMs)}
+              </div>
               {/* 执行和等人分两行：挤在一行时后半截被截掉，恰好是等人那段 */}
-              <div className="sf-metric-s tnum">执行 {formatClock(g.activeMs)}</div>
+              <div className="sf-metric-s tnum">执行 {formatLapse(g.activeMs)}</div>
               {(g.waitMs > 0 || g.phase === 'waiting') && (
-                <div className={clsx('sf-metric-s tnum', g.phase === 'waiting' && 'sf-warn')}>等人 {formatClock(g.waitMs)}</div>
+                <div className={clsx('sf-metric-s tnum', g.phase === 'waiting' && 'sf-warn')}>等人 {formatLapse(g.waitMs)}</div>
               )}
             </div>
             <div className="sf-metric sf-metric-wide">
@@ -657,7 +663,7 @@ export function RunCapsule() {
                   <div className={clsx('sf-metric-v tnum flex items-center gap-1.5',
                     g.remainingMs < g.limitMs * 0.2 && 'sf-warn')}>
                     <Budget remaining={g.remainingMs} limit={g.limitMs} />
-                    余 {formatClock(g.remainingMs).replace(/\.\d$/, '')}
+                    余 {formatLapse(g.remainingMs, false)}
                   </div>
                   <div className="sf-metric-s" title="每一段执行各算各的：审批恢复、接着跑之后重新计">
                     上限 {formatDuration(g.limitMs)}

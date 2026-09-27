@@ -175,6 +175,53 @@ export interface ToolInfo {
   /** 运行时是否真的会因它停下来等审批。MCP 与自定义工具目前不会，界面别说它「需确认」 */
   runtime_approval?: boolean
   schema: Record<string, any>
+  /**
+   * 只有自定义工具有：库里存着的参数定义哪里写坏了（一句中文）。绑了它的节点运行时
+   * 一定失败，列表上要醒目地标出来。null / 缺省表示没问题
+   */
+  problem?: string | null
+}
+
+/**
+ * 数据源（GET /api/datasources 的一行）。tools 是它给模型的两个工具名
+ * db_query__<name> / db_schema__<name>——/api/tools 里没有它们，挑工具要从这里取
+ */
+export interface DataSource extends ServerHealth {
+  id: string
+  /** 标识，进了工具名，建好不能改 */
+  name: string
+  kind: string
+  host: string | null
+  port: number | null
+  database: string | null
+  username: string | null
+  options: Record<string, any>
+  readonly: boolean
+  description: string
+  enabled: boolean
+  password_masked?: string
+  has_password?: boolean
+  table_count?: number
+  schema_synced_at?: string | null
+  /** 上次探查为什么没拿到表；空串 = 没出错（或还没探查） */
+  schema_error?: string
+  available_schemas?: string[]
+  tools?: string[]
+  /** 缓存按哪个 schema 探的：'' 默认 schema，null 没有缓存 */
+  cached_schema?: string | null
+}
+
+/** 自定义工具（GET /api/custom-tools 的一行；POST / PATCH 的返回同形） */
+export interface CustomTool {
+  id: string
+  name: string
+  description: string
+  kind: 'http' | 'python' | (string & {})
+  parameters: Record<string, any>
+  config: Record<string, any>
+  enabled: boolean
+  /** 同 ToolInfo.problem：参数定义写坏了的那句话，没问题是 null */
+  problem?: string | null
 }
 
 export interface Skill {
@@ -374,6 +421,11 @@ export interface ConversationTurn {
    */
   meta?: Record<string, any> | null
   created_at?: string
+  /**
+   * 这一轮最后一次落库的时刻（UTC，后端 TurnOut）。后端判「建图断了」按它算
+   * （conversations.BUILD_STALE），前端判断同一件事时用同一只钟。老后端没有
+   */
+  updated_at?: string
 }
 
 /**
@@ -391,6 +443,36 @@ export interface ToolChange {
   after: string[]
   added: string[]
   removed: string[]
+}
+
+/**
+ * Copilot 自查（SSE op='check'）里的一条问题。新后端给对象，老会话里存的是
+ * 「「node_id」message」一行字符串，两种都要认，见 CopilotCheckEntry
+ */
+export interface CopilotCheckIssue {
+  level: 'error' | 'warning'
+  node_id: string | null
+  edge_id: string | null
+  /** 不再以「节点 id」开头；要带节点名自己用 node_id 查 */
+  message: string
+  /** 出问题的配置项，比如 'tools'、'agents[1].tools'，检查器据此定位 */
+  field?: string | null
+  /** datasource_out_of_scope、tools_dropped 这类机器码 */
+  code?: string
+}
+
+export type CopilotCheckEntry = string | CopilotCheckIssue
+
+/** SSE 的自查操作。repairing 时带第几轮；warnings 是不挡运行的提醒（tools_dropped） */
+export interface CopilotCheckOp {
+  op: 'check'
+  status: 'repairing' | 'passed' | 'failed' | 'error'
+  issues?: CopilotCheckEntry[]
+  warnings?: CopilotCheckIssue[]
+  round?: number
+  repaired?: number
+  message?: string
+  detail?: string
 }
 
 /**

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import resource
 import shutil
@@ -9,8 +10,11 @@ import time
 from pathlib import Path
 
 from app.core.config import settings, sanitize_session
+from app.core.errors import describe_exception, raw
 from app.sandbox import interpreter
 from app.sandbox.base import ENTRY_PREFIX, ExecResult, Sandbox, SandboxLimits, entry_name, truncate
+
+logger = logging.getLogger(__name__)
 
 # 入口脚本后缀 + 执行命令。文件名运行时生成（entry_name），不能写死：
 # 同会话并发执行都写 main.py 会互相覆盖。
@@ -131,7 +135,9 @@ class LocalSandbox(Sandbox):
                 preexec_fn=self._preexec(limits),
             )
         except Exception as e:  # noqa: BLE001
-            return ExecResult(ok=False, backend=self.name, error=f"{type(e).__name__}: {e}")
+            # 首行只说原因，类名和 errno 这些留给日志
+            logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
+            return ExecResult(ok=False, backend=self.name, error=f"没能启动进程：{describe_exception(e)}")
 
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)

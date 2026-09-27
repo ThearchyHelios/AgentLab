@@ -91,6 +91,8 @@ class TurnOut(BaseModel):
     #: 可信度元数据。老轮次挂在 review.meta 下，读出来时统一放到这里
     meta: dict[str, Any] | None = None
     created_at: Any = None
+    #: 最后一次落库。列表判「建图断了」按它算（BUILD_STALE），前端用同一只钟
+    updated_at: Any = None
 
     model_config = {"from_attributes": True}
 
@@ -130,6 +132,15 @@ def turn_meta(turn: Any) -> dict[str, Any] | None:
         return turn.meta
     bridged = turn.review.get("meta") if isinstance(turn.review, dict) else None
     return bridged if isinstance(bridged, dict) else None
+
+
+def turn_run_id(turn: Any) -> str | None:
+    """这一轮现在的运行。meta 里写了 runId 就以它为准，哪怕是 null：重试会换一次运行，
+    run_id 列却清不掉（回填里 None 表示「不改」），还指着上一次的。老轮次没有这个键，看列。"""
+    meta = turn_meta(turn) or {}
+    if "runId" in meta:
+        return meta["runId"] or None
+    return turn.run_id or None
 
 
 def _turn_out(turn: ConversationTurn) -> TurnOut:
@@ -212,9 +223,7 @@ async def _statuses(
     session: AsyncSession, turns: dict[str, ConversationTurn]
 ) -> dict[str, tuple[str, str | None]]:
     """会话 id → (last_status, last_run_id)。运行状态和待审批各一次查询。"""
-    run_of = {
-        cid: t.run_id or (turn_meta(t) or {}).get("runId") or None for cid, t in turns.items()
-    }
+    run_of = {cid: turn_run_id(t) for cid, t in turns.items()}
     run_ids = {r for r in run_of.values() if r}
     runs: dict[str, str] = {}
     waiting: set[str] = set()

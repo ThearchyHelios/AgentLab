@@ -5,7 +5,8 @@
 // 一屏转义 JSON，或者在 360px 窄栏里把页面撑得横向滚动。
 //
 // 用真浏览器跑真组件，数据还是 fixtures.json 里那批真实事件。
-// 跑之前前端得起着：./scripts/dev.sh
+// 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
+// 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-stream.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -20,10 +21,22 @@ const check = (name, cond, detail = '') => {
   if (!cond) failed++
 }
 
+/**
+ * 一节一节地跑：某一节里元素找不到、等待超时，只记成这一节失败，接着跑下一节，
+ * 不让一处卡住把后面的检查一起吞掉。各节自己开页面
+ */
+async function section(name, fn) {
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  }
+}
+
 const browser = await chromium.launch({ executablePath: CHROME })
 
-for (const kind of CASES) {
-  console.log(`\n=== ${kind} ===`)
+for (const kind of CASES) await section(kind, async () => {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
@@ -49,10 +62,9 @@ for (const kind of CASES) {
   check('页面不横向溢出', overflow <= 0, `${overflow}px`)
 
   await page.close()
-}
+})
 
-console.log('\n=== 展开交互 ===')
-{
+await section('展开交互', async () => {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
   await page.goto(`${WEB}/preview.html?case=db`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(300)
@@ -67,10 +79,9 @@ console.log('\n=== 展开交互 ===')
   check('展开区写明数据源', after.includes('数据源 warehouse'))
   check('SQL 可以一键复制', await page.locator('button[aria-label="复制 SQL"]').count() > 0)
   await page.close()
-}
+})
 
-console.log('\n=== Markdown 渲染 ===')
-{
+await section('Markdown 渲染', async () => {
   // 样本取自库里导出的**真实输出**，不是按 CommonMark 规范挑的测例：模型
   // 实际会写成什么样，才是要渲染的东西。涉及业务数据的那几条已换成同构的
   // 合成内容——换的是领域，markdown 构造（标题层级、表格、引用块、inline
@@ -119,10 +130,9 @@ console.log('\n=== Markdown 渲染 ===')
   check('注入的脚本没有执行', el.pwned === false)
   check('原始 HTML 当文本显示出来了', text.includes('<script>'))
   await page.close()
-}
+})
 
-console.log('\n=== 长报告的折叠 ===')
-{
+await section('长报告的折叠', async () => {
   // 折叠以前是按字符硬切的，切点落进表格中间：前面几行渲染成表格、最后半行
   // 留成原始的 `| 1 | ThearchyHelios | …`。用户看到的是一份被咬掉一口的报告。
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
@@ -143,10 +153,9 @@ console.log('\n=== 长报告的折叠 ===')
   check('展开后拿得到结尾', full.includes('身兼管理员与商家双重身份'))
   check('展开后表格渲染完整', full.includes('user_39'))
   await page.close()
-}
+})
 
-console.log('\n=== 没查库的那一轮 ===')
-{
+await section('没查库的那一轮', async () => {
   // 「涉及数据必须真查」是这条路径上最硬的约定，放开直接回答之后，用户得能
   // 一眼分清哪些结论背后真的动了库
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
@@ -159,10 +168,9 @@ console.log('\n=== 没查库的那一轮 ===')
         `声明@${body.indexOf('没有查库')} 结论@${body.indexOf('role.level')}`)
   check('答案本身照常渲染', body.includes('口径'))
   await page.close()
-}
+})
 
-console.log('\n=== 复核说明 ===')
-{
+await section('复核说明', async () => {
   // 「跑完了」和「答得对」是两回事。复核说明必须排在成果**上方**——排在下面
   // 等于让人读完整个结论、信了，才知道它是在什么条件下得出的
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
@@ -195,10 +203,9 @@ console.log('\n=== 复核说明 ===')
     document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('页面不横向溢出', overflow <= 0, `${overflow}px`)
   await page.close()
-}
+})
 
-console.log('\n=== 并行分支 ===')
-{
+await section('并行分支', async () => {
   // fan-out 一直是真并发（实测 3 个 sleep 2 秒的节点墙钟 2.6 秒），但时间线上
   // 原来只是穿插出现的几行，省下的时间一个字都没说
   for (const [w, dense, label] of [[1000, '0', '宽栏'], [380, '1', '窄栏']]) {
@@ -219,10 +226,9 @@ console.log('\n=== 并行分支 ===')
     check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
     await page.close()
   }
-}
+})
 
-console.log('\n=== 协作团队的泳道 ===')
-{
+await section('协作团队的泳道', async () => {
   // 这个节点以前在界面上是一条扁平的步骤序列：看得出"谁回了什么"，
   // 看不出"谁和谁是同时干的"——而一轮同时派几个人正是它相对单 agent 的
   // 全部优势，不画出来等于没有
@@ -280,17 +286,7 @@ console.log('\n=== 协作团队的泳道 ===')
     }
     await page.close()
   }
-}
-
-console.log('\n=== 空态 ===')
-{
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
-  await page.goto(`${WEB}/preview.html?case=__none__`, { waitUntil: 'networkidle' })
-  await page.waitForTimeout(250)
-  const text = await page.locator('body').innerText()
-  check('没有内容时给的是空态而不是白屏', text.includes('问点什么'))
-  await page.close()
-}
+})
 
 // ---------------------------------------------------------------- 第二波
 const SHOTS = process.env.STREAM_SHOTS
@@ -316,9 +312,17 @@ const scrollState = (page) => page.evaluate(() => {
   const el = document.querySelector('[data-stream-scroll]')
   return { top: Math.round(el.scrollTop), max: Math.round(el.scrollHeight - el.clientHeight) }
 })
+await section('空态', async () => {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
+  await page.goto(`${WEB}/preview.html?case=__none__`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(250)
+  const text = await page.locator('body').innerText()
+  check('没有内容时给的是空态而不是白屏', text.includes('问点什么'))
+  await page.close()
 
-console.log('\n=== 跟随：只在贴底时跟 ===')
-{
+})
+
+await section('跟随：只在贴底时跟', async () => {
   // 以前每来一个节点就 scrollIntoView 到底：往上翻着看某一步时被一次次拽回去
   const { page, errors } = await open('grow=1&dense=1', { w: 380, h: 560, name: 'follow' })
   const first = await scrollState(page)
@@ -347,10 +351,9 @@ console.log('\n=== 跟随：只在贴底时跟 ===')
   check('回到底部后恢复跟随', again.max - again.top < 64, `${again.top}/${again.max}`)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await page.close()
-}
+})
 
-console.log('\n=== 回看历史运行：停在失败处 ===')
-{
+await section('回看历史运行：停在失败处', async () => {
   const { page } = await open('syn=mixed', { w: 1100, h: 560, name: 'history-failed' })
   const s1 = await scrollState(page)
   const where = await page.evaluate(() => {
@@ -379,19 +382,18 @@ console.log('\n=== 回看历史运行：停在失败处 ===')
   check('动作槽渲染出页面给的按钮', body.includes('重试这一轮'))
   check('跳过的节点在时间线上留痕', body.includes('跳过「背景检索」') && body.includes('skip_if 成立'))
   check('#runId 可以点去运行记录', await page.locator('a[href="/runs/syn-mixed"]').count() === 1)
-  // 「开始执行」「完成」和头部说的是同一件事，不再单列；「继续执行」是分段线，
+  // 「开始运行」「完成」和头部说的是同一件事，不再单列；「继续运行」是分段线，
   // 失败的运行里它以前是一个红叉，读起来像续跑本身出了错
-  check('和头部重复的生命周期行不再单列', !body.includes('开始执行（6 个节点）'))
+  check('和头部重复的生命周期行不再单列', !body.includes('开始运行（6 个节点）'))
   const mark = await page.locator('[data-phase-mark]').allInnerTexts()
-  check('续跑是一条分段线，说清谁发起的', mark.some((t) => t.includes('继续执行') && t.includes('张工')), mark.join(' | '))
+  check('续跑是一条分段线，说清谁发起的', mark.some((t) => t.includes('继续运行') && t.includes('张工')), mark.join(' | '))
   check('分段线不画成失败', await page.locator('[data-phase-mark] [data-status="failed"]').count() === 0)
   const live = await page.locator('[role="status"][aria-live="polite"]').allInnerTexts()
   check('状态变化有读屏播报区', live.some((t) => t.includes('失败')), live.join(' | '))
   await page.close()
-}
+})
 
-console.log('\n=== 运行中的时间感 ===')
-{
+await section('运行中的时间感', async () => {
   const { page } = await open('syn=live', { w: 1100, h: 760, name: 'live' })
   const clock = () => page.evaluate(() => [...document.querySelectorAll('[aria-busy="true"] .mono')]
     .map((e) => e.textContent).find((t) => /\d\d:\d\d\.\d/.test(t ?? '')))
@@ -448,10 +450,9 @@ console.log('\n=== 运行中的时间感 ===')
   check('减少动效时写「进行中」', busy.text.includes('进行中'), busy.text.slice(0, 40))
   check('减少动效时有左侧竖线', busy.border === '2px', busy.border)
   await r.page.close()
-}
+})
 
-console.log('\n=== 长运行：按轮折叠 ===')
-{
+await section('长运行：按轮折叠', async () => {
   // 1100 多条事件、145 拍。以前 5970 个 DOM 节点、14390px 高
   const { page, errors } = await open('syn=long', { w: 1100, h: 800, name: 'long' })
   const dom = await page.evaluate(() => document.querySelector('[data-stream-scroll]').querySelectorAll('*').length)
@@ -502,21 +503,19 @@ console.log('\n=== 长运行：按轮折叠 ===')
   check('全部列出后 145 轮一轮不少、不重复', every.length === 145 && new Set(every).size === 145, `${every.length} 行`)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await page.close()
-}
+})
 
-console.log('\n=== 几轮审批：分轮但不收起 ===')
-{
+await section('几轮审批：分轮但不收起', async () => {
   // 驳回两次再放行：只执行了三次的节点按轮分组、全部摊开——收起来就把那两次驳回藏了
   const { page } = await open('case=loop_approve', { w: 1100, h: 900 })
   const body = await page.locator('body').innerText()
   check('三轮审批都看得见（宽窄两栏各三条）', (body.match(/这条公告可以发吗/g) ?? []).length === 6)
   check('轮次边界画出来了', body.includes('第 3 次'))
-  check('老数据里光秃秃的「继续执行」不单列', !body.includes('继续执行'))
+  check('老数据里光秃秃的「继续运行」不单列', !body.includes('继续运行'))
   await page.close()
-}
+})
 
-console.log('\n=== 协作团队：运行中的说法 ===')
-{
+await section('协作团队：运行中的说法', async () => {
   const { page } = await open('syn=team-live&dense=1', { w: 380, h: 760, name: 'team-live' })
   const body = await page.locator('body').innerText()
   check('运行中写「N 人并行中」', body.includes('3 人并行中'))
@@ -529,10 +528,9 @@ console.log('\n=== 协作团队：运行中的说法 ===')
   const r = await open('syn=team-routing&dense=1', { w: 380, h: 760, name: 'team-routing' })
   check('调度者在想时有一行进行中', (await r.page.locator('body').innerText()).includes('调度者在想下一步'))
   await r.page.close()
-}
+})
 
-console.log('\n=== 出具横幅、答案操作、证据下钻 ===')
-{
+await section('出具横幅、答案操作、证据下钻', async () => {
   const { page } = await open('syn=issued', { w: 1100, h: 900, name: 'issued' })
   const body = await page.locator('body').innerText()
   // gaps 以前一条都不显示：横幅说「请对照下方声明」，下方什么都没有
@@ -596,10 +594,9 @@ console.log('\n=== 出具横幅、答案操作、证据下钻 ===')
     if (SHOTS) await p2.screenshot({ path: `${SHOTS}/stream-artifact-${theme}.png` })
     await p2.close()
   }
-}
+})
 
-console.log('\n=== 复核判了不可信 ===')
-{
+await section('复核判了不可信', async () => {
   const { page } = await open('review=1', { w: 1100, h: 800, name: 'review' })
   const body = await page.locator('body').innerText()
   // 以前 broken 时头部仍是普通字重的「完成」
@@ -630,10 +627,9 @@ console.log('\n=== 复核判了不可信 ===')
   })
   check('可信度相关的字不小于 11px', parseFloat(faint) >= 11, faint)
   await page.close()
-}
+})
 
-console.log('\n=== 长表名、Copilot 结局、问数据的分段 ===')
-{
+await section('长表名、Copilot 结局、问数据的分段', async () => {
   const { page } = await open('syn=schema&dense=1', { w: 380, h: 700, name: 'schema' })
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('十几张表的标题不撑破窄栏', overflow <= 0, `${overflow}px`)
@@ -659,10 +655,9 @@ console.log('\n=== 长表名、Copilot 结局、问数据的分段 ===')
   await q.page.locator('button.chip').first().click()
   check('点追问把话交给页面', !!(await q.page.evaluate(() => window.__followUp)))
   await q.page.close()
-}
+})
 
-console.log('\n=== 步骤行和画布联动 ===')
-{
+await section('步骤行和画布联动', async () => {
   const { page } = await open('syn=mixed&link=1', { w: 1100, h: 800 })
   const row = page.locator('[data-node-id="agent"]').first()
   check('步骤行带 data-node-id', await row.count() === 1)
@@ -676,10 +671,9 @@ console.log('\n=== 步骤行和画布联动 ===')
   await row.locator('button').first().click()
   check('点击请画布取景到它', (await page.evaluate(() => window.__linked)).includes('agent'))
   await page.close()
-}
+})
 
-console.log('\n=== 审批卡的上下文 ===')
-{
+await section('审批卡的上下文', async () => {
   const { page } = await open('approval=1&actor=', { w: 820, h: 500, name: 'approval-unsigned' })
   const body = await page.locator('body').innerText()
   check('说出挂在哪个节点', body.includes('节点「班长复核」'))
@@ -690,10 +684,9 @@ console.log('\n=== 审批卡的上下文 ===')
   const s = await open('approval=1&actor=张工', { w: 820, h: 500, name: 'approval-signed' })
   check('署了名就写明以谁的名义', (await s.page.locator('body').innerText()).includes('将以「张工」签批'))
   await s.page.close()
-}
+})
 
-console.log('\n=== 画布右栏：运行视图 ===')
-{
+await section('画布右栏：运行视图', async () => {
   // 真页面、真 store：往 window.__studio 灌事件（同 check-canvas-fx）。工作流、会话、审批、
   // 运行全用 page.route 伪造，写操作一律回 409——检查脚本不写库
   const WF_ID = 'fx-stream'
@@ -849,10 +842,9 @@ console.log('\n=== 画布右栏：运行视图 ===')
     }
   }
   await ctx.close()
-}
+})
 
-console.log('\n=== 助手栏：展开之前的轮次 ===')
-{
+await section('助手栏：展开之前的轮次', async () => {
   // 以前展开后补在上面的轮次改了"第一轮是谁"，被当成换了一批、重新定位到最底：
   // 刚补出来的那几轮在视野上方，看着像没点上
   const WF_ID = 'fx-past'
@@ -906,10 +898,20 @@ console.log('\n=== 助手栏：展开之前的轮次 ===')
     }
   }
   await ctx.close()
-}
+})
 
-console.log('\n=== 编号列、追问、CSV ===')
-{
+// ---------------------------------------------------------------- 第三波
+/** 量一个 CSS 颜色表达式算出来的 rgb，跟元素的实际颜色比 */
+const colorOf = (page, v) => page.evaluate((expr) => {
+  const probe = document.createElement('span')
+  probe.style.color = expr
+  document.body.append(probe)
+  const c = getComputedStyle(probe).color
+  probe.remove()
+  return c
+}, v)
+const count = (text, needle) => text.split(needle).length - 1
+await section('编号列、追问、CSV', async () => {
   // attribute_group 的 '001'、factory_code 的 '1063' 长得像数：以前右对齐，还给出
   // 「按 attribute_group 从高到低排」这种说不通的追问
   const { page } = await open('syn=codes', { w: 1100, h: 500, name: 'codes' })
@@ -937,64 +939,53 @@ console.log('\n=== 编号列、追问、CSV ===')
   const one = await q.page.$$eval('button.chip', (b) => b.map((x) => x.innerText))
   check('一行的结果不给排序、筛选的追问', !one.some((c) => /从高到低|只看/.test(c)), one.join(' | '))
   await q.page.close()
-}
 
-// ---------------------------------------------------------------- 第三波
-/** 量一个 CSS 颜色表达式算出来的 rgb，跟元素的实际颜色比 */
-const colorOf = (page, v) => page.evaluate((expr) => {
-  const probe = document.createElement('span')
-  probe.style.color = expr
-  document.body.append(probe)
-  const c = getComputedStyle(probe).color
-  probe.remove()
-  return c
-}, v)
-const count = (text, needle) => text.split(needle).length - 1
+})
 
-console.log('\n=== 协作团队用完轮数：泳道、头部、报错（NI-5、REQ-3A-3）===')
-for (const [w, dense, label] of [[1100, '0', '宽栏'], [380, '1', '窄栏']]) {
-  const { page, errors } = await open(`syn=exhausted&dense=${dense}`, { w, h: 900, name: `exhausted-${dense === '1' ? 'dense' : 'wide'}` })
-  const body = await page.locator('body').innerText()
-  const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
-  check(`${label}：泳道头说「用完 2 轮仍未完成」`, lanes.includes('用完 2 轮仍未完成'), lanes.split('\n')[0])
-  check(`${label}：泳道点出从没派到的成员`, lanes.includes('汇总员') && lanes.includes('没派到'), lanes.replace(/\n/g, ' ').slice(0, 120))
-  check(`${label}：最后那次判定不画成第 3 轮`, !/第\s?3\s?轮/.test(lanes), lanes.replace(/\n/g, ' ').slice(0, 160))
-  const cell = await page.evaluate(() => {
-    const b = document.querySelector('[data-team-lanes] button[aria-label^="取数员 第 1 轮"]')
-    return b ? getComputedStyle(b).backgroundColor : ''
-  })
-  check(`${label}：失败的成员格子是失败色`, !!cell && cell === await colorOf(page, 'var(--st-failed)'), cell)
-  check(`${label}：判定那一行说「轮数用完 · 调度者判定：未完成」`, body.includes('轮数用完 · 调度者判定：未完成'))
-  // 报错用 lib/explain 讲清为什么、怎么办，不再原样贴后端那一整句
-  const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
-  check(`${label}：报错标题说人话`, alert.startsWith('协作团队用完 2 轮仍未完成'), alert.split('\n')[0])
-  check(`${label}：报错给出怎么办`, alert.includes('最多轮数'), alert.replace(/\n/g, ' ').slice(0, 160))
-  check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-  check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
-  await page.close()
-}
-{
-  const { page } = await open('syn=exhausted-degrade', { w: 1100, h: 900, name: 'exhausted-degrade' })
-  const head = await page.locator('[data-turn] .sticky').first().innerText()
-  check('降档交付：头部不是一个安静的「已完成」', head.includes('协作团队没做完'), head.replace(/\n/g, ' '))
-  const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
-  check('降档交付：泳道头说按降档交付', lanes.includes('按降档交付'), lanes.split('\n')[0])
-  const body = await page.locator('body').innerText()
-  check('降档交付：团队那一行说清是降档', body.includes('用完 2 轮仍未完成，按降档交付'))
-  check('降档交付：提醒行给出下一步', body.includes('不能当结论用'))
-  await page.close()
-  const r = await open('syn=exhausted-closing&dense=1', { w: 380, h: 800, name: 'exhausted-closing' })
-  const rb = await r.page.locator('body').innerText()
-  check('最后那次判定进行中：写「调度者在做最后判定」', rb.includes('轮数用完 · 调度者在做最后判定'))
-  check('最后那次判定进行中：不写「第 3 轮」', !rb.includes('第 3 轮'))
-  const rl = await r.page.locator('[data-team-lanes]').innerText().catch(() => '')
-  check('最后那次判定进行中：泳道也说在判定', rl.includes('轮数用完 · 调度者在判定'), rl.split('\n').slice(0, 2).join(' '))
-  await r.page.close()
-}
+await section('协作团队用完轮数：泳道、头部、报错（NI-5、REQ-3A-3）', async () => {
+  for (const [w, dense, label] of [[1100, '0', '宽栏'], [380, '1', '窄栏']]) {
+    const { page, errors } = await open(`syn=exhausted&dense=${dense}`, { w, h: 900, name: `exhausted-${dense === '1' ? 'dense' : 'wide'}` })
+    const body = await page.locator('body').innerText()
+    const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
+    check(`${label}：泳道头说「用完 2 轮仍未完成」`, lanes.includes('用完 2 轮仍未完成'), lanes.split('\n')[0])
+    check(`${label}：泳道点出从没派到的成员`, lanes.includes('汇总员') && lanes.includes('没派到'), lanes.replace(/\n/g, ' ').slice(0, 120))
+    check(`${label}：最后那次判定不画成第 3 轮`, !/第\s?3\s?轮/.test(lanes), lanes.replace(/\n/g, ' ').slice(0, 160))
+    const cell = await page.evaluate(() => {
+      const b = document.querySelector('[data-team-lanes] button[aria-label^="取数员 第 1 轮"]')
+      return b ? getComputedStyle(b).backgroundColor : ''
+    })
+    check(`${label}：失败的成员格子是失败色`, !!cell && cell === await colorOf(page, 'var(--st-failed)'), cell)
+    check(`${label}：判定那一行说「轮数用完 · 调度者判定：未完成」`, body.includes('轮数用完 · 调度者判定：未完成'))
+    // 报错用 lib/explain 讲清为什么、怎么办，不再原样贴后端那一整句
+    const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
+    check(`${label}：报错标题说人话`, alert.startsWith('协作团队用完 2 轮仍未完成'), alert.split('\n')[0])
+    check(`${label}：报错给出怎么办`, alert.includes('最多轮数'), alert.replace(/\n/g, ' ').slice(0, 160))
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${label}：不横向溢出`, overflow <= 0, `${overflow}px`)
+    await page.close()
+  }
+  {
+    const { page } = await open('syn=exhausted-degrade', { w: 1100, h: 900, name: 'exhausted-degrade' })
+    const head = await page.locator('[data-turn] .sticky').first().innerText()
+    check('降档交付：头部不是一个安静的「已完成」', head.includes('协作团队没做完'), head.replace(/\n/g, ' '))
+    const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
+    check('降档交付：泳道头说按降档交付', lanes.includes('按降档交付'), lanes.split('\n')[0])
+    const body = await page.locator('body').innerText()
+    check('降档交付：团队那一行说清是降档', body.includes('用完 2 轮仍未完成，按降档交付'))
+    check('降档交付：提醒行给出下一步', body.includes('不能当结论用'))
+    await page.close()
+    const r = await open('syn=exhausted-closing&dense=1', { w: 380, h: 800, name: 'exhausted-closing' })
+    const rb = await r.page.locator('body').innerText()
+    check('最后那次判定进行中：写「调度者在做最后判定」', rb.includes('轮数用完 · 调度者在做最后判定'))
+    check('最后那次判定进行中：不写「第 3 轮」', !rb.includes('第 3 轮'))
+    const rl = await r.page.locator('[data-team-lanes]').innerText().catch(() => '')
+    check('最后那次判定进行中：泳道也说在判定', rl.includes('轮数用完 · 调度者在判定'), rl.split('\n').slice(0, 2).join(' '))
+    await r.page.close()
+  }
+})
 
-console.log('\n=== 模型把工具调用写成文字、修复凑数、工具超时（NI-3/4）===')
-{
+await section('模型把工具调用写成文字、修复凑数、工具超时（NI-3/4）', async () => {
   const { page, errors } = await open('syn=markup&dense=1', { w: 380, h: 900, name: 'markup' })
   const body = await page.locator('body').innerText()
   const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
@@ -1032,10 +1023,9 @@ console.log('\n=== 模型把工具调用写成文字、修复凑数、工具超�
   const td = await open('syn=timeout', { w: 1100, h: 700 })
   check('超时的查询写明超了多少上限', (await td.page.locator('body').innerText()).includes('超过 30 s 上限，已放弃等待'))
   await td.page.close()
-}
+})
 
-console.log('\n=== 放弃、结构化的报错、恢复的轮次、出具横幅（REQ-1/5/6、REQ-3A-2）===')
-{
+await section('放弃、结构化的报错、恢复的轮次、出具横幅（REQ-1/5/6、REQ-3A-2）', async () => {
   const { page } = await open('syn=abandoned', { w: 1100, h: 600, name: 'abandoned' })
   const mark = await page.locator('[data-phase-mark]').allInnerTexts()
   check('放弃的运行：分段线说清谁放弃的、一并关了什么', mark.some((t) => t.includes('已取消') && t.includes('张工')
@@ -1066,29 +1056,45 @@ console.log('\n=== 放弃、结构化的报错、恢复的轮次、出具横幅�
   check('改图时工具被清空要单独说', cb.includes('「数据查询」的工具被清空了'))
   check('自查通过但工具被去掉，自查那行不是安静的通过', cb.includes('自查通过，但有 1 处工具被去掉了'))
   await c.page.close()
-}
 
-console.log('\n=== 吸顶的轮次头贴着顶边（REQ-8）===')
-for (const [q, w, h, label] of [['syn=mixed', 1024, 768, '宽栏 1024'], ['syn=mixed', 1180, 800, '宽栏 1180'],
-                                ['syn=mixed&dense=1', 380, 700, '窄栏']]) {
-  const { page } = await open(q, { w, h })
-  const gap = await page.evaluate(() => {
-    const sc = document.querySelector('[data-stream-scroll]')
-    sc.scrollTop = Math.min(sc.scrollHeight - sc.clientHeight, 260)
-    sc.dispatchEvent(new Event('scroll'))
-    const head = document.querySelector('[data-turn] .sticky')
-    const s = sc.getBoundingClientRect()
-    const hd = head.getBoundingClientRect()
-    // 顶边往下 1px 那一行像素：落在头上才算没缝
-    const hit = document.elementFromPoint(s.left + s.width / 2, s.top + 1)
-    return { gap: Math.round(hd.top - s.top), onHead: !!hit && head.contains(hit), scrolled: sc.scrollTop }
-  })
-  check(`${label}：往下翻后轮次头贴着滚动区顶边，上面不露正文`, gap.scrolled > 0 && gap.gap === 0 && gap.onHead, JSON.stringify(gap))
-  await page.close()
-}
+  // 按口径卡清点回指的数字（3C REQ-10）：出处是 matched[].caliber「口径名 @ 版本」，和后端 io.py
+  // 同一种拼法。拼法一变，横幅就悄悄只剩「回指 3 个数字」，说不出哪个来自哪张卡
+  const k = await open('syn=calibers', { w: 1100, h: 800, name: 'calibers' })
+  const rows = await k.page.locator('[data-issuance-banner] [data-caliber]').evaluateAll((els) =>
+    els.map((e) => [e.getAttribute('data-caliber'), e.textContent.replace(/\s+/g, ' ')]))
+  check('两张口径卡各数各的：订单口径回指 2 个、退款口径回指 1 个',
+    rows.length === 2 && rows[0][0] === '订单口径' && rows[0][1].includes('回指 2 个数字')
+      && rows[1][0] === '退款口径' && rows[1][1].includes('回指 1 个数字'), JSON.stringify(rows))
+  check('两张卡时不说「都来自这张卡」', !rows.some(([, t]) => t.includes('都来自这张卡')))
+  await k.page.close()
+  const one = await open('syn=caliber-one', { w: 1100, h: 800 })
+  const oneRow = await one.page.locator('[data-issuance-banner] [data-caliber]').allInnerTexts()
+  check('只有一张卡、逐个出处都指向它：写「都来自这张卡」', oneRow.length === 1
+    && oneRow[0].includes('回指上的 2 个数字都来自这张卡'), oneRow.join(' | '))
+  await one.page.close()
+})
 
-console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（REQ-1/3/4、REQ-3A-2）===')
-{
+await section('吸顶的轮次头贴着顶边（REQ-8）', async () => {
+  for (const [q, w, h, label] of [['syn=mixed', 1024, 768, '宽栏 1024'], ['syn=mixed', 1180, 800, '宽栏 1180'],
+                                  ['syn=mixed&dense=1', 380, 700, '窄栏']]) {
+    const { page } = await open(q, { w, h })
+    const gap = await page.evaluate(() => {
+      const sc = document.querySelector('[data-stream-scroll]')
+      sc.scrollTop = Math.min(sc.scrollHeight - sc.clientHeight, 260)
+      sc.dispatchEvent(new Event('scroll'))
+      const head = document.querySelector('[data-turn] .sticky')
+      const s = sc.getBoundingClientRect()
+      const hd = head.getBoundingClientRect()
+      // 顶边往下 1px 那一行像素：落在头上才算没缝
+      const hit = document.elementFromPoint(s.left + s.width / 2, s.top + 1)
+      return { gap: Math.round(hd.top - s.top), onHead: !!hit && head.contains(hit), scrolled: sc.scrollTop }
+    })
+    check(`${label}：往下翻后轮次头贴着滚动区顶边，上面不露正文`, gap.scrolled > 0 && gap.gap === 0 && gap.onHead, JSON.stringify(gap))
+    await page.close()
+  }
+})
+
+await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1/3/4、REQ-3A-2）', async () => {
   const WF_ID = 'fx-stream3'
   const RUN = 'fxstream0003'
   const GRAPH = {
@@ -1240,11 +1246,30 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
     const b = document.querySelector('.sheet-in [data-issuance-banner]')
     const s = b?.closest('[data-stream-scroll]')?.getBoundingClientRect()
     const r = b?.getBoundingClientRect()
-    return { found: !!b, inView: !!r && !!s && r.top >= s.top - 1 && r.top < s.bottom, focused: !!b && document.activeElement === b }
+    return { found: !!b, inView: !!r && !!s && r.top >= s.top - 1 && r.top < s.bottom, focused: !!b && document.activeElement === b,
+             flash: b?.dataset.flash ?? null, outline: b ? getComputedStyle(b).outlineStyle : null }
   })
   check('goto-issuance：切到运行层、横幅在视野里', banner.found && banner.inView, JSON.stringify(banner))
   // 焦点带过去：读屏和键盘用户从画布那头被带过来，得落在横幅上，而不是留在画布的印章上
   check('goto-issuance：焦点落在出具横幅上', banner.focused)
+  // 描边得真的画出来（3C REQ-7）：横幅带 outline-none，data-[flash]:outline 读的是被它设成 none 的变量，
+  // 以前 data-flash 挂上了、焦点也到了，算出来却是 outline: none
+  check('goto-issuance：横幅那一下描边真的画出来了', banner.flash === 'focus' && banner.outline !== 'none',
+    `${banner.flash} ${banner.outline}`)
+
+  // 请求办完就清掉（3C REQ-8）：回到对话层、焦点放进输入框，再点运行条打开运行层，
+  // 旧的 goto-issuance 不能再办一遍——又滚走、又抢焦点、又描边
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  await page.locator('[data-assistant-panel] textarea').first().focus()
+  await page.locator('[data-run-strip]').click()
+  await page.waitForTimeout(900)
+  const again = await page.evaluate(() => {
+    const b = document.querySelector('.sheet-in [data-issuance-banner]')
+    return { opened: !!document.querySelector('.sheet-in'), stolen: !!b && document.activeElement === b, flash: b?.dataset.flash ?? null }
+  })
+  check('点运行条重新打开运行层：焦点不被旧请求抢到横幅上，也不再描边', again.opened && !again.stolen && !again.flash,
+    JSON.stringify(again))
 
   // 回执：看过了没改（unchanged）不说「已更新画布」；修过几处数不出来时不写「几 处」
   await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
@@ -1257,6 +1282,10 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
         ops: [{ op: 'done', explanation: '' }, { op: 'check', status: 'passed', repaired: 0 }, { op: 'final', graph: { nodes: [{ id: 'in' }] } }] },
       { ...base, id: 'u2', instruction: '把循环条件改对', outcome: 'applied', diff: { added: [], changed: ['review'], removed: [], total: 1 },
         ops: [{ op: 'update_node', id: 'review' }, { op: 'check', status: 'passed', repaired: 1 }, { op: 'final', graph: { nodes: [{ id: 'in' }] } }] },
+      { ...base, id: 'u4', instruction: '最后加一步导出表格', outcome: 'unchanged',
+        ops: [{ op: 'add_node', node: { id: 'x', type: 'sheet_export', label: '导出表格' } }, { op: 'done', explanation: '' },
+          { op: 'final', graph: { nodes: [{ id: 'in' }] }, issues: [{ level: 'warning', node_id: null, code: 'unknown_node_type',
+            type: 'sheet_export', message: '模型写了一个不存在的节点类型「sheet_export」，这一步已跳过' }] }] },
     ] })
   })
   await page.waitForTimeout(400)
@@ -1265,8 +1294,15 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
     && !turns[0]?.includes('已更新画布'), turns[0]?.split('\n').slice(0, 3).join(' '))
   check('修过但数不出几处：不写「几 处」', turns[1]?.includes('自查发现的问题已自动修好') && !turns[1]?.includes('几 处'),
     turns[1]?.split('\n').slice(0, 3).join(' '))
+  // 只加了认不出类型的节点、全被跳过：画布一处没变，不能说「已放到画布」（3C REQ-9）
+  const skippedHead = await page.locator('[data-turn="u4"] .sticky').innerText().catch(() => '')
+  check('全被跳过的轮次：写「画布没有改动：有 1 步没放上」', skippedHead.includes('画布没有改动：有 1 步没放上')
+    && !skippedHead.includes('已放到画布'), skippedHead.replace(/\n/g, ' '))
+  // 画布一处没变就没有可撤的：给了「撤销这次生成」，撤掉的是这一轮之前的那一步
+  check('画布没变的轮次不给「撤销这次生成」', await page.getByRole('button', { name: '撤销这次生成' }).count() === 0
+    && await page.getByRole('button', { name: /让助手补上/ }).count() === 1)
 
-  // 改图时模型漏写了 tools：回执逐项列出去掉了什么；自查是通过的，「让 Copilot 再修」不管用，撤销是首选
+  // 改图时模型漏写了 tools：回执逐项列出去掉了什么；自查是通过的，「让助手再修」不管用，撤销是首选
   const dropped = { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
     message: '「数据查询」的工具从 db_query__shop 变成了空：这一轮的要求里没有提到去掉工具' }
   await page.evaluate((warn) => {
@@ -1282,9 +1318,9 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
   check('回执逐项列出被去掉的工具', loss.includes('「数据查询」去掉了') && loss.includes('db_query__shop') && loss.includes('一个工具都没有'),
     loss.replace(/\n/g, ' '))
   const head3 = await page.locator('[data-turn="u3"] .sticky').innerText().catch(() => '')
-  check('回执头部是提醒，写清几处工具被去掉', head3.includes('1 处工具被去掉了'), head3.replace(/\n/g, ' '))
-  check('只丢了工具时不给「让 Copilot 再修」，撤销是主按钮',
-    await page.getByRole('button', { name: /让 Copilot/ }).count() === 0
+  check('回执头部是提醒，写清几处工具被去掉', head3.includes('没让删却少了 1 处工具'), head3.replace(/\n/g, ' '))
+  check('只丢了工具时不给「让助手再修」，撤销是主按钮',
+    await page.getByRole('button', { name: /让助手/ }).count() === 0
     && await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {
@@ -1294,6 +1330,99 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
     }
     await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
   }
+
+  // 「定位」被去掉的工具：光标落在那个节点工具选择器的「添加」上，回车就能加回去，
+  // 不会落在别的工具的「移除」上（3C REQ-6 / REQ-14）
+  await page.locator('[data-tool-changes]').getByRole('button', { name: /定位/ }).first().click()
+  await page.waitForTimeout(500)
+  const toolFocus = await page.evaluate(() => {
+    const a = document.activeElement
+    return { sel: window.__studio.getState().selectedId, inSheet: !!a?.closest('[data-inspector-sheet]'),
+             field: a?.closest('[data-field]')?.getAttribute('data-field') ?? null,
+             text: (a?.getAttribute('aria-label') || a?.textContent || '').trim().slice(0, 20) }
+  })
+  check('定位被去掉的工具：打开这个节点，光标在工具那一栏的「添加」上',
+    toolFocus.sel === 'query' && toolFocus.inSheet && toolFocus.field === 'tools' && /添加/.test(toolFocus.text)
+      && !/^(移除|删除)/.test(toolFocus.text), JSON.stringify(toolFocus))
+  await page.evaluate(() => window.__studio.getState().select(null))
+  await page.waitForTimeout(200)
+
+  // 同一轮里一处是没让删的（后端点了名）、一处是按要求删的：卡片和改图回执一样分两组，
+  // 卡头只为没让删的那处提醒（3C REQ-10）
+  const unaskedWarn = { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
+    message: '这一轮的要求里没有提到去掉 db_query__shop，确认一下是不是改漏了' }
+  const splitTurn = (id, warnings, changes) => ({ explanation: '', error: '', phase: 'done', id, instruction: '汇总那一步别再查库了',
+    outcome: 'applied', diff: { added: [], changed: changes.map((c) => c.node_id), removed: [], total: changes.length },
+    ops: [{ op: 'update_node', id: 'query', config: { system: '只查上月' } },
+      { op: 'check', status: 'passed', repaired: 0, warnings },
+      { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'query' }] }, issues: warnings, tool_changes: changes }] })
+  const lossQuery = { node_id: 'query', label: '数据查询', member: null, field: 'tools', before: ['db_query__shop'], after: [], added: [], removed: ['db_query__shop'] }
+  const lossSum = { node_id: 'summary', label: '汇总', member: null, field: 'tools', before: ['db_query__shop', 'python_exec'], after: ['python_exec'], added: [], removed: ['db_query__shop'] }
+  await page.evaluate((t) => window.__studio.setState({ copilotTurns: [t] }), splitTurn('u5', [unaskedWarn], [lossQuery, lossSum]))
+  await page.waitForTimeout(400)
+  const head5 = await page.locator('[data-turn="u5"] .sticky').innerText().catch(() => '')
+  const unaskedText = await page.locator('[data-tool-loss="unasked"]').innerText().catch(() => '')
+  const askedText = await page.locator('[data-tool-loss="asked"]').innerText().catch(() => '')
+  check('卡头只数没让删的那处', head5.includes('没让删却少了 1 处工具') && !head5.includes('2 处'), head5.replace(/\n/g, ' '))
+  // 360px 的卡头放得下「没让删」这几个字；万一截断了，悬停也读得到整句（3C 返工 D5）
+  const status5 = await page.locator('[data-turn="u5"] [data-turn-status]').evaluate((el) => {
+    // 「没让删」最后一个字的右缘在框内：截断的省略号只能落在它后面
+    const node = el.firstChild
+    const at = node?.textContent?.indexOf('没让删') ?? -1
+    let right = Infinity
+    if (at >= 0) {
+      const r = document.createRange()
+      r.setStart(node, at + 2)
+      r.setEnd(node, at + 3)
+      right = r.getBoundingClientRect().right
+    }
+    const box = el.getBoundingClientRect()
+    return { title: el.getAttribute('title') ?? '', visible: right <= box.right + 0.5, width: Math.round(box.width) }
+  }).catch(() => ({ title: '', visible: false, width: 0 }))
+  check('卡头的「没让删」在 360px 里看得见，整句在悬停里', status5.visible && status5.title.includes('没让删却少了 1 处工具'),
+    JSON.stringify(status5))
+  check('没让删的一组在前，写明确认是不是改漏了', unaskedText.includes('没让删') && unaskedText.includes('「数据查询」')
+    && !unaskedText.includes('「汇总」'), unaskedText.replace(/\n/g, ' '))
+  check('按要求删的另列一组', askedText.includes('按要求') && askedText.includes('「汇总」') && !askedText.includes('「数据查询」'),
+    askedText.replace(/\n/g, ' '))
+  check('有没让删的：撤销仍是主按钮', await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-tools-split-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  // 全是按要求删的：卡头不提醒，撤销退成次要
+  await page.evaluate((t) => window.__studio.setState({ copilotTurns: [t] }), splitTurn('u6', [], [lossSum]))
+  await page.waitForTimeout(400)
+  const head6 = await page.locator('[data-turn="u6"] .sticky').innerText().catch(() => '')
+  check('全是按要求删的：卡头不说「没让删」，只列在「按要求」底下', !head6.includes('没让删')
+    && await page.locator('[data-tool-loss="asked"]').count() === 1 && await page.locator('[data-tool-loss="unasked"]').count() === 0,
+    head6.replace(/\n/g, ' '))
+  check('全是按要求删的：撤销不是主按钮', await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 0
+    && await page.getByRole('button', { name: '撤销这次生成' }).count() === 1)
+
+  // 自查没修好的问题带着落点（field）：「定位」把光标放进那一栏的输入框
+  await page.evaluate(() => window.__studio.setState({ copilotTurns: [{ explanation: '', error: '', phase: 'done', id: 'u7',
+    instruction: '让查询多想几步', outcome: 'applied', diff: { added: [], changed: ['query'], removed: [], total: 1 },
+    ops: [{ op: 'update_node', id: 'query', config: { max_steps: 0 } },
+      { op: 'check', status: 'failed', issues: [{ level: 'error', node_id: 'query', edge_id: null, field: 'max_steps',
+        message: '最大步数要在 1 到 100 之间' }] },
+      { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'query' }] } }] }] }))
+  await page.waitForTimeout(400)
+  await page.locator('[data-issue-list]').getByRole('button', { name: /定位/ }).first().click()
+  await page.waitForTimeout(500)
+  const issueFocus = await page.evaluate(() => {
+    const a = document.activeElement
+    return { sel: window.__studio.getState().selectedId, tag: a?.tagName ?? null,
+             field: a?.closest('[data-inspector-sheet] [data-field]')?.getAttribute('data-field') ?? null }
+  })
+  check('定位自查问题：光标落进出问题的那一栏', issueFocus.sel === 'query' && issueFocus.field === 'max_steps'
+    && issueFocus.tag === 'INPUT', JSON.stringify(issueFocus))
+  await page.evaluate(() => window.__studio.getState().select(null))
+  await page.waitForTimeout(200)
 
   // 模型把工具调用写成文字、判失败：报错和提醒行给「打开『数据查询』的设置」，点了就是那个节点的属性面板
   const MARKUP_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
@@ -1330,9 +1459,136 @@ console.log('\n=== 画布右栏：去审批、放弃、出具横幅、回执（R
     check('点「打开设置」就是那个节点的属性面板', await page.evaluate(() => window.__studio.getState().selectedId) === 'query')
   }
 
+  // 画布上点了跑过的节点（3C REQ-1）：画布派发 agentlab:reveal-step，右栏在对话层也要接手——
+  // 切到运行层、滚到这个节点最后一次执行那一行、描一下边；滚过去之后暂停跟随，人滚回底部再恢复
+  const RUN2 = 'fxstream0004'
+  await page.evaluate((run) => {
+    // 上面点「打开设置」开着的属性面板先收起来：它盖在右栏上
+    window.__studio.getState().select(null)
+    window.__studio.getState().clearRun()
+    window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'running', input: {}, output: {}, error: null,
+      usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} })
+  }, RUN2)
+  let seq2 = 0
+  const pipe = (from, to) => {
+    const out = []
+    for (let i = from; i <= to; i += 1) {
+      out.push(ev(++seq2, 'node.started', `n${i}`, { node_type: 'tool', label: `取数 ${i}` }, i * 0.2))
+      out.push(ev(++seq2, 'node.finished', `n${i}`, { duration_ms: 120, preview: { rows: i } }, i * 0.2 + 0.1))
+    }
+    return out
+  }
+  await feed([ev(++seq2, 'run.started', null, { nodes: 40 }, 0), ...pipe(1, 30)])
+  await page.waitForTimeout(500)
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  const notOurs = await page.evaluate(() => window.dispatchEvent(new CustomEvent('agentlab:reveal-step',
+    { detail: { runId: 'someone-else', nodeId: 'n3' }, cancelable: true })))
+  check('reveal-step：不是这次运行的不接手', notOurs && await page.locator('.sheet-in').count() === 0)
+  const taken = await page.evaluate((run) => !window.dispatchEvent(new CustomEvent('agentlab:reveal-step',
+    { detail: { runId: run, nodeId: 'n3' }, cancelable: true })), RUN2)
+  await page.waitForTimeout(900)
+  const revealed = await page.evaluate(() => {
+    const row = document.querySelector('.sheet-in [data-step-status][data-node-id="n3"]')
+    const box = row?.closest('[data-stream-scroll]')
+    const r = row?.getBoundingClientRect()
+    const b = box?.getBoundingClientRect()
+    return { found: !!row, flash: row?.dataset.flash ?? null, outline: row ? getComputedStyle(row).outlineStyle : null,
+             inView: !!r && !!b && r.top >= b.top - 1 && r.bottom <= b.bottom + 1,
+             atBottom: !!box && box.scrollHeight - box.scrollTop - box.clientHeight < 64 }
+  })
+  check('reveal-step：右栏在对话层也接手（preventDefault），切到运行层', taken && await page.locator('.sheet-in').count() === 1)
+  check('reveal-step：滚到那个节点的步骤行，描了一下边', revealed.found && revealed.inView && revealed.flash === 'focus'
+    && revealed.outline !== 'none', JSON.stringify(revealed))
+  check('reveal-step：滚过去之后不在底部', !revealed.atBottom)
+  await feed(pipe(31, 33))
+  await page.waitForTimeout(500)
+  const paused = await page.evaluate(() => {
+    const row = document.querySelector('.sheet-in [data-step-status][data-node-id="n3"]')
+    const box = row?.closest('[data-stream-scroll]')
+    const r = row?.getBoundingClientRect()
+    const b = box?.getBoundingClientRect()
+    return { inView: !!r && !!b && r.top >= b.top - 1 && r.bottom <= b.bottom + 1, jump: !!document.querySelector('.sheet-in [data-jump-latest]') }
+  })
+  check('reveal-step：新进展来了不把人拽回底部，给一枚「跳到最新」', paused.inView && paused.jump, JSON.stringify(paused))
+  await page.evaluate(() => {
+    const box = document.querySelector('.sheet-in [data-stream-scroll]')
+    box.scrollTop = box.scrollHeight
+    box.dispatchEvent(new Event('scroll'))
+  })
+  await page.waitForTimeout(200)
+  await feed(pipe(34, 36))
+  await page.waitForTimeout(500)
+  const resumed = await page.evaluate(() => {
+    const box = document.querySelector('.sheet-in [data-stream-scroll]')
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 64
+  })
+  check('reveal-step：人滚回底部之后恢复跟随', resumed)
+  if (SHOTS) {
+    await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+    await page.waitForTimeout(200)
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.evaluate((run) => window.dispatchEvent(new CustomEvent('agentlab:reveal-step',
+        { detail: { runId: run, nodeId: 'n5' }, cancelable: true })), RUN2)
+      await page.waitForTimeout(700)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-reveal-step-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  // 办过的 reveal-step 同样清掉：回到对话层再点运行条，不再滚回 n3、不再描边
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  await page.locator('[data-run-strip]').click()
+  await page.waitForTimeout(900)
+  const reopened = await page.evaluate(() => {
+    const box = document.querySelector('.sheet-in [data-stream-scroll]')
+    return { flashed: document.querySelectorAll('.sheet-in [data-flash]').length,
+             atBottom: !!box && box.scrollHeight - box.scrollTop - box.clientHeight < 64 }
+  })
+  check('reveal-step 办过之后点运行条重新打开：停在最新处，不再描边', reopened.flashed === 0 && reopened.atBottom,
+    JSON.stringify(reopened))
+  const hiddenTaken = await page.evaluate((run) => {
+    const aside = document.querySelector('[data-assistant-panel]').closest('aside')
+    aside.style.visibility = 'hidden'
+    const passed = window.dispatchEvent(new CustomEvent('agentlab:reveal-step', { detail: { runId: run, nodeId: 'n3' }, cancelable: true }))
+    aside.style.visibility = ''
+    return !passed
+  }, RUN2)
+  check('reveal-step：右栏收起时不接手，让画布自己兜底', !hiddenTaken)
+
+  // 长运行：顶层超过 50 行时前面的收在「展开前面的 N 条」里。点名要看的节点正好在收起的那一截：
+  // 先展开、再滚过去描边。以前找不到那一行就什么都不做，却照样报「办完了」（3C REQ-22）
+  const RUN3 = 'fxstream0005'
+  await page.evaluate((run) => {
+    window.__studio.getState().clearRun()
+    window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'running', input: {}, output: {}, error: null,
+      usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} })
+  }, RUN3)
+  seq2 = 0
+  await feed([ev(++seq2, 'run.started', null, { nodes: 60 }, 0), ...pipe(1, 60)])
+  await page.waitForTimeout(600)
+  const folded = await page.evaluate(() => [...document.querySelectorAll('.sheet-in button')]
+    .some((b) => /展开前面的 \d+ 条/.test(b.textContent ?? '')))
+  await page.locator('.sheet-in').first().getByRole('button', { name: /助手/ }).first().click()
+  await page.waitForTimeout(300)
+  const takenLong = await page.evaluate((run) => !window.dispatchEvent(new CustomEvent('agentlab:reveal-step',
+    { detail: { runId: run, nodeId: 'n3' }, cancelable: true })), RUN3)
+  await page.waitForTimeout(1000)
+  const deep = await page.evaluate(() => {
+    const row = document.querySelector('.sheet-in [data-step-status][data-node-id="n3"]')
+    const box = row?.closest('[data-stream-scroll]')
+    const r = row?.getBoundingClientRect()
+    const b = box?.getBoundingClientRect()
+    return { found: !!row, flash: row?.dataset.flash ?? null,
+             inView: !!r && !!b && r.top >= b.top - 1 && r.bottom <= b.bottom + 1 }
+  })
+  check('长运行（60 个节点）：点名的节点收在「展开前面的 N 条」里，先展开再滚过去描边',
+    folded && takenLong && deep.found && deep.inView && deep.flash === 'focus', JSON.stringify({ folded, takenLong, ...deep }))
+
   check('画布右栏没有运行时报错', errors.length === 0, errors.join(' | '))
   await ctx.close()
-}
+})
 
 await browser.close()
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 助手流渲染全部通过')

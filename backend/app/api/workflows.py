@@ -152,7 +152,7 @@ async def delete_workflow(
         )
     )
     if live:
-        raise HTTPException(409, f"这个工作流还有 {live} 次运行在执行，现在删除它们会失去归属。先停止运行，再删除")
+        raise HTTPException(409, f"这个工作流还有 {live} 次运行在进行，现在删除它们会失去归属。先停止运行，再删除")
     await session.delete(workflow)
     await session.commit()
 

@@ -83,7 +83,8 @@ async def start_run(
     x_actor: str | None = Header(default=None),
 ) -> Run:
     actor = actor_of(x_actor)
-    name = "临时图"
+    # 没挂在工作流上（画布没保存就跑、问数据当场搭的）。老数据里是「临时图」，前端两种都认
+    name = "未保存的工作流"
     version: int | None = None
     version_hash: str | None = None
 
@@ -93,7 +94,7 @@ async def start_run(
         if not payload.workflow_id:
             raise HTTPException(400, "正式运行要从一个已保存的工作流发起：请求里没有指定工作流")
         if payload.graph is not None:
-            raise HTTPException(400, "正式运行只跑已发布的版本，不接受画布上的临时图——先保存并发布")
+            raise HTTPException(400, "正式运行只跑已发布的版本，不接受画布上没发布的改动——先保存并发布")
         workflow = await session.get(Workflow, payload.workflow_id)
         if not workflow:
             raise HTTPException(404, "找不到这个工作流，可能已经被删除了")
@@ -141,7 +142,7 @@ async def start_run(
             graph = graph or workflow.graph
             name = workflow.name
     if not graph:
-        raise HTTPException(400, "没有要运行的内容：请求里既没有工作流，也没有图")
+        raise HTTPException(400, "没有要运行的内容：请求里既没有工作流 id，也没有工作流内容")
 
     from app.api.settings import resolve_run_scope
 
@@ -453,7 +454,7 @@ async def delete_run(
     if not run:
         raise HTTPException(404, "运行记录不存在")
     if run.status in ("queued", "running") or run_manager.is_active(run_id):
-        raise HTTPException(409, "这次运行还在执行，现在删除会留下没人管的任务。先停止它，再删除")
+        raise HTTPException(409, "这次运行还在进行，现在删除会留下没人管的任务。先停止它，再删除")
     if run.run_class == "formal" and run.manifest_hash and not force:
         raise HTTPException(
             409,

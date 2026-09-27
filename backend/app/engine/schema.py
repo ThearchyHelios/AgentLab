@@ -384,7 +384,7 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             result.add(f"边指向了不存在的目标节点 {edge.target!r}", edge_id=edge.id)
 
     if not spec.entry_nodes():
-        result.add("找不到入口：每个节点都有入边，图里存在环且没有起点")
+        result.add("找不到入口：每个节点都有入边，工作流里有环且没有起点")
 
     # 节点级必填项
     for node in spec.nodes:

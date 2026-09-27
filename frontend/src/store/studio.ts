@@ -4,7 +4,7 @@ import {
   type Connection, type Edge, type EdgeChange, type Node, type NodeChange,
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
-import { describeToolChange, mergeNodeConfig, shrunkTools, toolChangesOf } from '../canvas/copilotMerge'
+import { copilotReceipt, mergeNodeConfig, toolChangesOf } from '../canvas/copilotMerge'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
@@ -17,8 +17,8 @@ import {
   type NodeState, type RunPhase, type Trace,
 } from '../run/trace'
 import type {
-  ConversationTurn, GraphEdge, GraphSpec, NodeRuntime, NodeType, Run, RunEvent, ToolChange, ValidationIssue,
-  VarIssue, Variable, Workflow,
+  ConversationTurn, CopilotCheckEntry, CopilotCheckIssue, CopilotCheckOp, GraphEdge, GraphSpec, NodeRuntime, NodeType, Run,
+  RunEvent, ToolChange, ValidationIssue, VarIssue, Variable, Workflow,
 } from '../types'
 
 export type FlowNode = Node<{ nodeType: NodeType; label: string; config: Record<string, any> }>
@@ -110,8 +110,18 @@ export interface CopilotTurn {
   issues?: CopilotIssue[]
   /** 服务端自查的结论；repairing 时带第几轮 */
   check?: {
-    status: 'repairing' | 'passed' | 'failed' | 'error'
+    status: CopilotCheckOp['status']
+    /**
+     * 拼好的一行一条（带节点名）：「再修一次」原样交回模型。线上来的是 CopilotCheckEntry
+     * （对象或老会话的字符串），对象版在 items 里
+     */
     issues: string[]
+    /**
+     * 同一批问题原样的对象（后端给的 {level, node_id, field, code}），和 issues 一一对应。
+     * 「定位」要落到检查器里具体那一栏（循环的条件、成员的工具），拼好的字认不出来。
+     * 老会话、老后端给的是字符串，那几条这里 node_id / field 为空
+     */
+    items?: CopilotIssue[]
     round?: number
     repaired?: number
     message?: string
@@ -142,6 +152,22 @@ export interface CopilotIssue {
   code?: string
   type?: string
   field?: string | null
+}
+
+/**
+ * 自查问题的一条。后端现在给 {level, node_id, edge_id, message, field, code?}；老会话里存的、
+ * 老后端给的是一行字，那种 node_id / field 为空，照样拼得进「再修一次」
+ */
+export function checkIssueOf(x: CopilotCheckEntry | unknown): CopilotIssue {
+  if (typeof x === 'string') return { level: 'error', message: x, node_id: null, field: null }
+  const o = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>
+  return {
+    level: o.level === 'warning' ? 'warning' : 'error',
+    message: typeof o.message === 'string' ? o.message : JSON.stringify(x),
+    node_id: typeof o.node_id === 'string' && o.node_id ? o.node_id : null,
+    field: typeof o.field === 'string' && o.field ? o.field : null,
+    ...(typeof o.code === 'string' ? { code: o.code } : {}),
+  }
 }
 
 /**
@@ -532,7 +558,8 @@ interface StudioState {
   // actions
   /** 打开一张工作流。传 null 是卸下眼前这张：它被删了、又没有别的可换 */
   load: (workflow: Workflow | null) => void
-  setGraph: (graph: GraphSpec) => void
+  /** 整张换掉（自动排版）。画布锁着时不换、返回 false：调用方别再报「已换好」 */
+  setGraph: (graph: GraphSpec) => boolean
   onNodesChange: (changes: NodeChange[]) => void
   onEdgesChange: (changes: EdgeChange[]) => void
   onConnect: (conn: Connection) => void
@@ -1091,12 +1118,13 @@ export const useStudio = create<StudioState>((set, get) => ({
   },
 
   setGraph: (graph) => {
-    if (locked(get)) return
+    if (locked(get)) return false
     const { nodes, edges } = toFlow(graph)
     glideSeq++
     commit(set, get, '替换整个画布')
     set({ nodes, edges, selectedId: null, dirty: true, fitRequest: get().fitRequest + 1 })
     void get().validate()
+    return true
   },
 
   onNodesChange: (changes) => {
@@ -1653,26 +1681,26 @@ export const useStudio = create<StudioState>((set, get) => ({
             // 服务端自查：用运行时同一套规则过一遍，有问题交回模型改
             // 以前是一句话，后端改成 {node_id, message, field?} 之后能定位到节点，两种都接住。
             // 带节点的前面补上节点名，「再修一次」拼指令时模型才知道说的是哪个
-            const lineOf = (x: any): string => {
-              if (typeof x === 'string') return x
-              const message = String(x?.message ?? JSON.stringify(x))
-              const label = x?.node_id ? s.nodes.find((n) => n.id === x.node_id)?.data.label : ''
-              return label && !message.includes(`「${label}」`) ? `「${label}」：${message}` : message
+            const c = op as CopilotCheckOp
+            const items = (Array.isArray(c.issues) ? c.issues : []).map(checkIssueOf)
+            const lineOf = (x: CopilotIssue): string => {
+              const label = x.node_id ? s.nodes.find((n) => n.id === x.node_id)?.data.label : ''
+              return label && !x.message.includes(`「${label}」`) ? `「${label}」：${x.message}` : x.message
             }
-            const issues = (op.issues ?? []).map(lineOf)
+            const issues = items.map(lineOf)
             // 工具被删不挡运行，但自查这一步就要说出来（tools_dropped）
-            const warnings: any[] = Array.isArray(op.warnings) ? op.warnings : []
-            for (const w of warnings) if (w && typeof w === 'object') toolDrops.push(w)
-            settle({ check: { status: op.status, issues, round: op.round, repaired: op.repaired,
-                              message: op.message,
-                              ...(warnings.length ? { warnings: warnings.map(lineOf) } : {}) } })
+            const warnings: CopilotCheckIssue[] = Array.isArray(c.warnings) ? c.warnings : []
+            for (const w of warnings) if (w && typeof w === 'object') toolDrops.push(checkIssueOf(w))
+            settle({ check: { status: c.status, issues, items, round: c.round, repaired: c.repaired,
+                              message: c.message,
+                              ...(warnings.length ? { warnings: warnings.map((w) => lineOf(checkIssueOf(w))) } : {}) } })
             set({ copilot: { ...s.copilot,
-              phase: op.status === 'repairing' ? 'repairing' : s.copilot.phase,
-              lastOp: op.status === 'repairing'
-                ? `第 ${op.round ?? 1} 轮修正：自查发现 ${issues.length} 处问题`
-                : op.status === 'passed'
-                  ? (op.repaired ? `自查发现的问题已修好（${op.repaired} 轮）` : '自查通过')
-                  : op.status === 'failed' ? `自查后还有 ${issues.length} 处问题` : '自查修正没跑成' } })
+              phase: c.status === 'repairing' ? 'repairing' : s.copilot.phase,
+              lastOp: c.status === 'repairing'
+                ? `第 ${c.round ?? 1} 轮修正：自查发现 ${issues.length} 处问题`
+                : c.status === 'passed'
+                  ? (c.repaired ? `自查发现的问题已修好（${c.repaired} 轮）` : '自查通过')
+                  : c.status === 'failed' ? `自查后还有 ${issues.length} 处问题` : '自查修正没跑成' } })
             break
           }
           case 'reply': {
@@ -1844,29 +1872,16 @@ export const useStudio = create<StudioState>((set, get) => ({
             }, 6000)
             if (outcome === 'applied') {
               const turn = get().copilotTurns.find((t) => t.id === turnId)
-              const missing = issues.filter((i) => i.code === 'unknown_node_type').length
-              const left = turn?.check?.status === 'failed' ? turn.check.issues.length : 0
-              // 工具绑定变了画布上看不出来，回执里逐条写明前后。变少了用 warn 色：指令里
-              // 没让删的（后端 tools_dropped）常驻到人看过为止——没工具的 agent 照样能跑，
-              // 只是跑出来的是模型「假设」查过库的答案
-              const shrunk = shrunkTools(toolChanges)
-              const unasked = shrunk.length > 0 && toolWarnings.length > 0
-              const head = left ? `已放到画布，但还有 ${left} 处问题要你处理`
-                : missing ? `已应用 ${diff.total} 处改动，但有 ${missing} 步没放上`
-                : `已应用 ${diff.total} 处改动`
-              const lines = shrunk.length
-                ? [unasked ? '工具绑定变少了，这一轮没让删，确认一下是不是改漏了：' : '工具绑定变少了：',
-                   ...shrunk.map(describeToolChange)]
-                : []
-              toast(
-                [toolChanges.length && !shrunk.length ? `${head} · 工具绑定变了 ${toolChanges.length} 处` : head,
-                 ...lines].join('\n'),
-                left || missing || shrunk.length ? 'warn' : 'ok',
-                { key: `copilot:${turnId}`, duration: 8000, sticky: unasked,
-                  ...(toolChanges.length > shrunk.length
-                    ? { detail: toolChanges.map(describeToolChange).join('\n') } : {}),
-                  action: { label: '撤销', onClick: () => { get().undoCopilotTurn(turnId) } } },
-              )
+              const receipt = copilotReceipt({
+                total: diff.total,
+                left: turn?.check?.status === 'failed' ? turn.check.issues.length : 0,
+                missing: issues.filter((i) => i.code === 'unknown_node_type').length,
+                toolChanges, toolWarnings,
+              })
+              toast(receipt.text, receipt.kind, {
+                key: `copilot:${turnId}`, duration: 8000, sticky: receipt.sticky, detail: receipt.detail,
+                action: { label: '撤销', onClick: () => { get().undoCopilotTurn(turnId) } },
+              })
             }
             break
           }
@@ -1938,8 +1953,12 @@ export const useStudio = create<StudioState>((set, get) => ({
   newCopilotConversation: async () => {
     const workflow = get().workflow
     if (get().copilot.active) get().stopCopilot()
-    // 先把界面清了：就算新会话建不成，也不能让旧轮次挂在那儿冒充「这次对话」
-    set({ copilotTurns: [], copilotMemory: { past: [], total: 0, turns: 0 } })
+    // 先把界面清了：就算新会话建不成，也不能让旧轮次挂在那儿冒充「这次对话」。上一段的
+    // 报错一起清——空面板上输入框会摊开错误条，旧的那条会被当成这一段出的错
+    set({
+      copilotTurns: [], copilotMemory: { past: [], total: 0, turns: 0 },
+      copilot: { ...get().copilot, error: '', errorHint: '', errorDetail: '' },
+    })
     if (!workflow) {
       set({ copilotConversationId: null })
       return

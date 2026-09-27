@@ -9,7 +9,7 @@ import type { Approval, Run, RunStatus, RunUsage } from '../../types'
 import {
   RUN_STATUS_ORDER, STATUS, resolveStatus, serverStatusOf, type StatusCode,
 } from '../../lib/status'
-import { NONE, formatClock, formatDuration, parseServerTime } from '../../lib/format'
+import { formatSpan, parseServerTime } from '../../lib/format'
 import { hasPendingApproval } from '../../store/catalog'
 
 // -------------------------------------------------------------------------
@@ -347,42 +347,6 @@ export function timingTitle(t: RunTiming): string {
   return parts.join(' · ') + note
 }
 
-const pad2 = (n: number) => String(n).padStart(2, '0')
-
-/**
- * 耗时，能跨天。一天以内同 formatDuration；一天以上写「8 天 02 小时」——审批
- * 挂了一周的运行，「192 小时 05 分」没人会去换算。coarse 只要最大的单位：
- * 「已等 8 天」。
- */
-export function formatSpan(ms: number | null | undefined, opts?: { coarse?: boolean }): string {
-  if (!isNum(ms) || ms < 0) return NONE
-  const DAY = 86_400_000
-  if (ms >= DAY) {
-    const d = Math.floor(ms / DAY)
-    const h = Math.floor((ms % DAY) / 3_600_000)
-    return opts?.coarse || h === 0 ? `${d} 天` : `${d} 天 ${pad2(h)} 小时`
-  }
-  if (opts?.coarse) {
-    if (ms >= 3_600_000) return `${Math.floor(ms / 3_600_000)} 小时`
-    if (ms >= 60_000) return `${Math.floor(ms / 60_000)} 分钟`
-    return '不到 1 分钟'
-  }
-  return formatDuration(ms)
-}
-
-/**
- * 航迹上相对开始的时刻（不带「T+」）。一天以内是秒表读数「05:03.4」「3:05:03.4」；
- * 过了一天写「9 天 00:38:26」：「216:38:26.2」得自己除 24，而同一行的墙钟、等人
- * 写的是「9 天」。十分之一秒放不下了，隔了几天也没人要它
- */
-export function formatOffset(ms: number | null | undefined): string {
-  if (!isNum(ms) || ms < 0) return NONE
-  const DAY = 86_400_000
-  if (ms < DAY) return formatClock(ms)
-  const secs = Math.floor((ms % DAY) / 1000)
-  return `${Math.floor(ms / DAY)} 天 ${pad2(Math.floor(secs / 3600))}:${pad2(Math.floor(secs / 60) % 60)}:${pad2(secs % 60)}`
-}
-
 /** 等了多久算"久"：超过一天就该有人管了 */
 export const LONG_WAIT_MS = 86_400_000
 
@@ -412,17 +376,6 @@ export function duplicateNames(items: { id: string | null; name: string }[]): Se
 
 export const idTail = (id: string | null | undefined, len = 4): string =>
   id ? `…${id.slice(-len)}` : ''
-
-/**
- * 没有 workflow_id、名字是后端默认的「临时图」：画布或问数据当场建的图，从没
- * 存成工作流。界面上按术语表叫它「未保存的工作流」——「图」只在技术细节里出现。
- */
-export const UNSAVED_NAME = '未保存的工作流'
-export const UNSAVED_HINT = '这次运行跑的是画布或问数据当场建的图，没有存成工作流，所以回不到画布里'
-export const isUnsaved = (run: Pick<Run, 'workflow_id' | 'workflow_name'>): boolean =>
-  !run.workflow_id && (!run.workflow_name || run.workflow_name === '临时图')
-export const runName = (run: Pick<Run, 'workflow_id' | 'workflow_name'>): string =>
-  isUnsaved(run) ? UNSAVED_NAME : run.workflow_name
 
 /** 这次运行实际用的记忆域和知识库，null 收成 undefined：重新发起时原样带上，没有就不带 */
 export function runScope(run: Run): { memory_scope?: string; collection?: string } {

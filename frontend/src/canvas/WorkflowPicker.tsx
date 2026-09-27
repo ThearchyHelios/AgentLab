@@ -8,6 +8,7 @@ import { useStudio } from '../store/studio'
 import { EmptyState, IconButton, Modal, confirmDialog, promptDialog, toast } from '../components/ui'
 import { formatDateTime, formatTime, parseServerTime } from '../lib/format'
 import { formatShortcut } from '../lib/keys'
+import { leavePass, registerLeaveGuard } from '../lib/leave'
 import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import type { GraphSpec, Workflow } from '../types'
 
@@ -22,9 +23,12 @@ export function defaultWorkflowName(now = new Date()): string {
   return `未命名工作流 ${stamp(now)}`
 }
 
-/** 选择器已经问过「放弃改动吗」：带着这个标记换图，画布那边不再问第二遍 */
+/**
+ * 已经问过「放弃改动吗」：带着这个标记换图，画布那边不再问第二遍。leavePass 让外壳的
+ * 离开守卫（见下面的 discardGuard）也放行这一跳
+ */
 type Go = (to: string, opts?: { replace?: boolean; state?: unknown }) => void
-const DISCARDED = { state: { discard: true } }
+const DISCARDED = leavePass({ state: { discard: true } })
 
 const BLANK: GraphSpec = {
   nodes: [
@@ -45,14 +49,70 @@ const BLANK: GraphSpec = {
  * 返回 true 表示可以换。
  */
 export async function confirmDiscard(): Promise<boolean> {
-  if (!useStudio.getState().dirty) return true
+  const { dirty, workflow } = useStudio.getState()
+  if (!dirty) return true
   return confirmDialog({
-    title: '放弃画布上未保存的改动？',
-    consequences: ['切换之后这些改动和撤销记录都会丢失', `要留着的话，先取消、按 ${formatShortcut('Mod+S')} 保存`],
+    // 可能是在别的页上问的（记录页打开另一张工作流）：说出是哪一张的改动
+    title: workflow ? `放弃「${workflow.name}」未保存的改动？` : '放弃画布上未保存的改动？',
+    consequences: ['切换之后这些改动和撤销记录都会丢失', `要留着的话，先取消，回到画布按 ${formatShortcut('Mod+S')} 保存`],
     confirmLabel: '放弃并切换',
     danger: true,
   })
 }
+
+/**
+ * 守卫里人已经说了「放弃并切换」的那一跳。地址落到那儿之后编排页的 URL→画布不再问
+ * 第二遍：takeDiscarded(pathname) 取一次就清掉。
+ *
+ * 先建再跳的（canLeave('/studio/') 问过，建完 navigate(`/studio/${新 id}`, leavePass())）
+ * 问的时候还没有新 id，记下的只是 '/studio/'：它认接下来打开的任何一张。只认完全相同的
+ * 路径的话，照着这个写法做反而要问两遍——第二遍点取消，刚建的那张就成了孤儿
+ */
+const ANY_WORKFLOW = '/studio/'
+let discardedFor: string | null = null
+export function takeDiscarded(pathname: string): boolean {
+  const hit = discardedFor === pathname || (discardedFor === ANY_WORKFLOW && pathname.startsWith(ANY_WORKFLOW))
+  if (hit) discardedFor = null
+  return hit
+}
+
+/**
+ * 画布有没保存的改动时，换到另一张工作流先问——在地址跳之前问。以前是编排页的 URL→画布
+ * 事后才问：浏览器后退、⌘K、记录页的「在画布中打开」已经把地址换成了那一张，取消时再
+ * replace 回来，从记录页过来的连 ?run= 也丢了。
+ *
+ * 跟着 dirty 登记在模块级，不是编排页挂着时才登记：画布在 store 里，离开编排页它也还在，
+ * 从别的页打开另一张工作流一样会把它换掉。去别的页不拦（只认 /studio/<别的 id>）；关页、
+ * 刷新由 lib/leave 让浏览器问一句。要先建东西再跳的（从问数据页建一张再打开），先
+ * canLeave('/studio/') 问过、跳的时候带 leavePass()，整条路只问这一遍（见 takeDiscarded）
+ */
+const discardGuard = (): (() => void) => registerLeaveGuard({
+  blocks: (next) => {
+    const id = useStudio.getState().workflow?.id
+    return next != null && next.pathname.startsWith('/studio/') && next.pathname !== `/studio/${id}`
+  },
+  confirm: async (next) => {
+    const ok = await confirmDiscard()
+    // 这一问说了取消，就别让上一问记下的还作数
+    discardedFor = ok && next ? next.pathname : null
+    return ok
+  },
+})
+let unguard: (() => void) | null = null
+const stopWatching = useStudio.subscribe((s) => {
+  if (s.dirty === (unguard != null)) return
+  if (s.dirty) {
+    unguard = discardGuard()
+  } else {
+    unguard?.()
+    unguard = null
+    discardedFor = null
+  }
+})
+// 热更新换上这个模块时画布可能已经带着没存的改动：订阅要等下一次变化才登记，先补上
+if (useStudio.getState().dirty) unguard = discardGuard()
+// 热更新换掉这个模块时撤掉旧的那道：两道守卫会把同一句问两遍
+import.meta.hot?.dispose(() => { stopWatching(); unguard?.() })
 
 /**
  * 新建工作流。起点可以是空白（输入 → 成果），也可以是一张模板。
@@ -122,7 +182,9 @@ type Filter = 'all' | 'mine' | 'templates'
  * ↑↓ 移动、⏎ 打开。复制和删除常驻（淡色），不再只在悬停时出现。
  */
 export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { workflows, refresh } = useCatalog()
+  // 逐个取：整个 catalog 订阅下来，连接心跳每跳一次开着的选择器都要重算一遍列表
+  const workflows = useCatalog((s) => s.workflows)
+  const refresh = useCatalog((s) => s.refresh)
   const navigate = useNavigate()
   const current = useStudio((s) => s.workflow)
   const [query, setQuery] = useState('')

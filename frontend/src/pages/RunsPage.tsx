@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useParams, useSearchParams } from 'react-rout
 import { History, Inbox, RefreshCw } from 'lucide-react'
 import { EmptyState, IconButton, PageHeader, StatusBadge, useTicker } from '../components/ui'
 import { UNSAVED_WORKFLOW_ID } from '../api/client'
+import { formatSpan } from '../lib/format'
 import { STATUS, type StatusCode } from '../lib/status'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import type { Approval, Run } from '../types'
@@ -11,9 +12,10 @@ import {
 } from './runs/RunList'
 import { RunDetailView } from './runs/RunDetailView'
 import {
-  RUNS_TABS, TAB_CODES, TAB_LABEL, UNSAVED_NAME, ageMs, asTab, duplicateNames, formatSpan, isLiveRun, matchesCodes,
+  RUNS_TABS, TAB_CODES, TAB_LABEL, ageMs, asTab, duplicateNames, isLiveRun, matchesCodes,
   parseQuery, runCode, stripStatusWords, type RunsTab,
 } from './runs/model'
+import { UNSAVED_NAME } from '../lib/terms'
 import { RunTabs, type TabItem } from './runs/parts'
 import { useApprovalQueue, useRunList, useStatusCounts } from './runs/useRunsData'
 import './runs/runs.css'

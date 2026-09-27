@@ -2,18 +2,20 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNod
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   AlertCircle, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, CloudOff, Database, History, ListTree,
-  MessageSquare, PenLine, Play, RotateCw, StepForward, Trash2, Wrench,
+  MessageSquare, PenLine, Play, RotateCw, Settings2, StepForward, Trash2, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
-import { AssistantStream, type StreamTurn } from '../run/AssistantStream'
+import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/AssistantStream'
 import { PromptBox } from '../run/Composer'
 import { decodeCopilot, decodeRun } from '../run/decode'
 import { isComposing, PageHeader, Skeleton, Spinner, StatusBadge, TechDetails, toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
+import { explainRunError } from '../lib/explain'
+import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { useCatalog, useOnReconnect } from '../store/catalog'
+import { useCatalog, useDatasources, useOnReconnect } from '../store/catalog'
 import {
   agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
 } from '../store/chat'
@@ -295,13 +297,15 @@ export function ChatPage() {
           // 建成一张新工作流，走它自己的地址。以前是 setGraph(graph)：只换掉了画布
           // 上的节点，store 里的 workflow 还是上一次打开的那张图——于是 ⌘S 把那张图
           // 整张覆盖了（旧版本还在版本表里，界面上却没有入口找回）；没打开过图时
-          // ⌘S 则什么都不做，也不说一声
+          // ⌘S 则什么都不做，也不说一声。
+          // 画布上还有没保存的改动：先问要不要放弃，再建——建完才问，人说「取消」就留下一张孤儿工作流
+          if (!(await canLeave('/studio/'))) return
           try {
             const name = `问数据：${(question ?? '').trim().slice(0, 24) || '未命名'}`
             const created = await api.workflows.create({ name, graph })
             void refreshCatalog()
-            navigate(`/studio/${created.id}`)
-            toast.ok('已放到画布：新建了一个工作流，原来的图不受影响')
+            navigate(`/studio/${created.id}`, leavePass())
+            toast.ok('已放到画布：新建了一个工作流，画布上原来的工作流不受影响')
           } catch (e) {
             toast.error(e)
           }
@@ -316,7 +320,7 @@ export function ChatPage() {
       <ConversationList />
       <div className="flex min-w-0 flex-1 flex-col">
         <PageHeader icon={<MessageSquare size={14} />} title="问数据"
-                    subtitle="说需求，它自己接数据源、建流程、跑完给结论" />
+                    subtitle="说需求，它自己接数据源、搭工作流、跑完给结论" />
         {trashed && (
           // 输入框那里也写着为什么发不出去；这里给出路，免得人再回左栏的回收站里找它
           <div data-trash-banner="" role="status"
@@ -393,8 +397,9 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     noQuery: turn.noQuery,
     review: turn.review,
     rawOutput: turn.rawOutput,
-    // 正在核对的历史轮次不给起点：它的 startedAt 是提问那天，计时器会从几天前跑起
-    startedAt: live ? turn.startedAt : undefined,
+    // 不在跑的一律明说「没有实时计时」（null）：正在核对的历史轮次，流结束到对账完成之间
+    // 可能先到一两条事件，流会拿第一步的起点顶上，计时器从提问那天跑起
+    startedAt: live ? turn.startedAt : null,
     elapsedMs: !live && turn.endedAt ? turn.endedAt - turn.startedAt : turn.meta?.ms ?? undefined,
   }
   streamCache.set(turn, out)
@@ -402,14 +407,26 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
 }
 
 /**
- * 交给流里报错块的那份。运行的失败交原话：报错块按 lib/explain 讲，和记录页同一套说法，
- * 还给得出「去模型接入」这类直达入口。别的（建图失败、发起没到后端、核对不到运行）
- * 交拆好的标题和原因，照原样画——拼成一行「标题：原因」交出去，会被当成一句原话，
- * 整句成了粗体标题
+ * 交给流里报错块的那份：store 已经拆好的标题、原因、怎么办，照原样画。运行的失败在
+ * store 里就按 lib/explain 讲过了（和记录页同一套说法），再把原话交过去会被翻第二遍；
+ * 拼成一行「标题：原因」交出去，又会被当成一句原话，整句成了粗体标题。
+ * 直达入口（去模型接入、去工具库）跟着 fix 走：新写的失败 store 记着；库里恢复的老失败
+ * 没记，拿原话认一下该去哪儿，只取 fix
  */
-function streamError(turn: ChatTurn, f: Failure): StreamTurn['error'] {
-  if (f.source && turn.run?.id) return { error: f.source, detail: f.detail }
-  return { title: f.title, reason: f.reason, hint: f.hint, detail: f.detail }
+function streamError(turn: ChatTurn, f: Failure): TurnFailure {
+  const { fix, fixTo, fixFirst } = failureFix(turn, f)
+  return {
+    title: f.title, reason: f.reason, hint: f.hint, detail: f.detail,
+    ...(fix ? { fix } : {}), ...(fixTo ? { fixTo } : {}), ...(fixFirst ? { fixFirst } : {}),
+  }
+}
+
+/** 该去哪儿改：store 记着就用它的，库里恢复的老失败拿原话再认一次 */
+function failureFix(turn: ChatTurn, f: Failure): Pick<TurnFailure, 'fix' | 'fixTo' | 'fixFirst'> {
+  if (f.fix) return { fix: f.fix, fixTo: f.fixTo, fixFirst: f.fixFirst }
+  if (!f.source || !turn.run?.id) return {}
+  const x = explainRunError(f.source, f.detail)
+  return { fix: x.fix, fixTo: x.fixTo, fixFirst: x.fixFirst }
 }
 
 /**
@@ -472,7 +489,7 @@ function TurnExtras({ turnId, readOnly }: {
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {turn.pendingRun && (
             <button className="btn btn-xs btn-primary" disabled={busy || readOnly}
-                    title={readOnly ? IN_TRASH : busy ? '这个对话还有一轮在跑' : '按搭好的流程跑一次'}
+                    title={readOnly ? IN_TRASH : busy ? '这个对话还有一轮在跑' : '按搭好的工作流运行一次'}
                     onClick={() => runNow(conversationId, turn.id)}>
               <Play size={11} /> 跑一下
             </button>
@@ -560,6 +577,10 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   const off = busy || readOnly
   // 异常态醒目、正常态安静：失败、中断、不可用的第一个动作是实心的
   const alarm = kind === 'failed' || kind === 'suspended' || kind === 'unusable'
+  // 要改的东西不在这一轮的流程里（工具库里的参数定义）：先去改，主按钮给它；「接着跑」
+  // 照样给，改好之后原样接着跑就能过
+  const fx = kind === 'failed' && turn.failure ? failureFix(turn, turn.failure) : {}
+  const fixFirst = !!fx.fixFirst && (fx.fix === 'tools' || fx.fix === 'settings')
 
   const resume = async () => {
     setResuming(true)
@@ -588,9 +609,23 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
       </button>,
     )
   }
+  if (fixFirst) {
+    buttons.push(fx.fix === 'tools'
+      ? (
+        <Link key="fix" className="btn btn-xs btn-primary" to={fx.fixTo ?? '/tools'} data-remedy-fix="tools"
+              title={fx.fixTo ? '打开要改的那个工具的编辑框；改好保存，回来接着跑' : '到工具库把它改好，回来接着跑'}>
+          <Wrench size={11} /> 去改参数定义
+        </Link>
+      )
+      : (
+        <Link key="fix" className="btn btn-xs btn-primary" to={fx.fixTo ?? '/settings/providers'} data-remedy-fix="settings">
+          <Settings2 size={11} /> 去模型接入
+        </Link>
+      ))
+  }
   if (canContinue) {
     buttons.push(
-      <button key="continue" className="btn btn-xs btn-primary" disabled={off || resuming}
+      <button key="continue" className={clsx('btn btn-xs', !fixFirst && 'btn-primary')} disabled={off || resuming}
               title={offNote ?? '从断点接着跑：前面跑过的步骤不重来。要改配置请到画布上改'}
               onClick={() => void resume()}>
         {resuming ? <Spinner size={11} /> : <StepForward size={11} />} 接着跑
@@ -602,12 +637,12 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
     const plain = (kind === 'cancelled' || kind === 'suspended' || !!turn.failure?.rerun) && graphful
     const label = scopeGone ? '不限数据源重试' : !last ? '重新问一次' : plain ? '重跑这一轮' : '重试这一轮'
     buttons.push(
-      <button key="retry" className={clsx('btn btn-xs', alarm && !canContinue && 'btn-primary')}
+      <button key="retry" className={clsx('btn btn-xs', alarm && !canContinue && !fixFirst && 'btn-primary')}
               disabled={off}
               title={offNote ?? (scopeGone ? '去掉数据源限定，由它自己挑库，再问一次'
                 : !last ? '在对话末尾用同一个问题再问一次'
-                : plain ? '按原来的流程从头再跑一次，上一次留档可以对照'
-                : '带着上一次的原因重来，它会先调整流程；上一次留档可以对照')}
+                : plain ? '按原来的工作流从头再运行一次，上一次留档可以对照'
+                : '带着上一次的原因重来，它会先调整工作流；上一次留档可以对照')}
               onClick={() => {
                 if (!scopeGone) return again(plain ? { rerun: true } : undefined)
                 // 输入框左边的范围也一起放开，不然下一问又撞上同一个 400
@@ -621,7 +656,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   if (stepSignal && last && graphful && current && target && target > current) {
     buttons.push(
       <button key="steps" className="btn btn-xs" disabled={off}
-              title={offNote ?? `把 agent 的步数上限从 ${current} 调到 ${target}（全局上限 ${cap} 步，在设置里改），流程不变，重跑一次`}
+              title={offNote ?? `把 agent 的步数上限从 ${current} 调到 ${target}（全局上限 ${cap} 步，在设置里改），工作流不变，重跑一次`}
               onClick={() => again({ maxSteps: target })}>
         <ArrowRight size={11} /> 放宽步数重跑（{current} → {target} 步）
       </button>,
@@ -638,7 +673,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
 
   // 中断、取消、没核对上在流里不出红框（它们不是故障），为什么停、停了意味着什么在这里说
   const note = kind === 'suspended' || kind === 'unknown' ? turn.failure
-    : kind === 'cancelled' ? { title: '', reason: turn.run ? '你停下了这一轮，后端的运行也一并取消了。' : '你在搭流程时停下了这一轮。' }
+    : kind === 'cancelled' ? { title: '', reason: turn.run ? '你停下了这一轮，后端的运行也一并取消了。' : '你在搭工作流时停下了这一轮。' }
     : null
 
   return (
@@ -1125,26 +1160,31 @@ function recentQuestions(byConversation: Record<string, ChatTurn[]>): string[] {
 interface Source { id: string; name: string; kind?: string; enabled?: boolean; description?: string; tables?: string[] }
 interface SourcesState { state: 'loading' | 'ready' | 'error'; list: Source[] }
 
+/**
+ * 数据源列表读 catalog 里那一份：编排页挑工具、助手栏读的也是它，数据页增删改了会 reload，
+ * 这里的范围选择跟着变。表名只用来给没写描述的库造例句，按列表里的库各取一次，取不到也无所谓
+ */
 function useDataSources(): SourcesState {
-  const [sources, setSources] = useState<SourcesState>({ state: 'loading', list: [] })
-  const load = () => {
-    void api.datasources.list()
-      .then(async (rows) => {
-        setSources({ state: 'ready', list: rows })
-        // 表名只用来给没写描述的库造例句，取不到也无所谓
-        const withTables = await Promise.all(rows.map(async (r: any) => {
-          try {
-            const s = await api.datasources.schema(r.id)
-            return { ...r, tables: s.tables ?? [] }
-          } catch { return r }
-        }))
-        setSources({ state: 'ready', list: withTables })
-      })
-      // 取失败和「没有数据源」是两回事：前者不能劝人去新建
-      .catch(() => setSources((s) => ({ state: s.list.length ? 'ready' : 'error', list: s.list })))
-  }
-  useEffect(load, [])
-  useOnReconnect(load)
-  return sources
+  // 列表是全站共用的那份；旧了（半分钟以上）进页面时后台重取，别的标签页、别人刚加的库
+  // 不用整页刷新就能出现在范围、例句里
+  const { list, state: listState } = useDatasources()
+  const [tables, setTables] = useState<Record<string, string[]>>({})
+  useEffect(() => {
+    const todo = list.filter((r) => !(r.id in tables))
+    if (!todo.length) return
+    let alive = true
+    void Promise.all(todo.map(async (r) => {
+      try {
+        return [r.id, (await api.datasources.schema(r.id)).tables ?? []] as const
+      } catch { return [r.id, []] as const }
+    })).then((pairs) => { if (alive) setTables((t) => ({ ...t, ...Object.fromEntries(pairs) })) })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list])
+  return useMemo<SourcesState>(() => ({
+    // 取失败和「没有数据源」是两回事：前者不能劝人去新建。取回来过一次就按手上的列表算
+    state: listState === 'ok' ? 'ready' : listState === 'loading' ? 'loading' : list.length ? 'ready' : 'error',
+    list: list.map((r) => (tables[r.id] ? { ...r, tables: tables[r.id] } : r)),
+  }), [list, listState, tables])
 }
 

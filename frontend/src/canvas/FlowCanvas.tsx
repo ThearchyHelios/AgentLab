@@ -451,7 +451,8 @@ function CanvasInner() {
     let seq = 0
     let timer: ReturnType<typeof setTimeout> | null = null
     const unsub = useStudio.subscribe((s, prev) => {
-      if (s.runPhase === prev.runPhase || s.trace.lastReplay || s.replayAt != null) return
+      // trace 可能被脚本、热更新短暂置空：订阅回调在 setState 里抛，崩的是调用 setState 的那一方
+      if (s.runPhase === prev.runPhase || s.trace?.lastReplay || s.replayAt != null) return
       let kind: 'start' | 'success' | 'failed' | null = null
       if ((prev.runPhase === 'idle' || prev.runPhase === 'queued') && s.runPhase === 'running') {
         // 大图的开场点亮会变成一场烟花，跳过
@@ -463,7 +464,7 @@ function CanvasInner() {
       if (!kind || now - last < 1000) return
       last = now
       seq += 1
-      const failedId = s.trace.failedNodeId
+      const failedId = s.trace?.failedNodeId
       const origin = kind === 'failed' && failedId ? topology({ nodes: s.nodes, edges: s.edges }).rank[failedId] ?? 0 : 0
       setMoment({ kind, seq, origin })
       if (timer) clearTimeout(timer)
@@ -720,9 +721,9 @@ function CanvasInner() {
     let raf = 0
     let pending: string[] = []
     const unsub = useStudio.subscribe((s, prev) => {
-      if (s.trace === prev.trace || !s.follow || s.replayAt != null || s.trace.lastReplay) return
+      if (s.trace === prev.trace || !s.trace || !s.follow || s.replayAt != null || s.trace.lastReplay) return
       for (const [id, n] of Object.entries(s.trace.nodes)) {
-        if (n.state === 'running' && !n.looping && n.count > (prev.trace.nodes[id]?.count ?? 0)) pending.push(id)
+        if (n.state === 'running' && !n.looping && n.count > (prev.trace?.nodes[id]?.count ?? 0)) pending.push(id)
       }
       if (!pending.length || raf) return
       raf = requestAnimationFrame(() => {
@@ -821,7 +822,7 @@ function CanvasInner() {
       return
     }
     if (useStudio.getState().copilot.active) {
-      toast.info('助手正在改这张图，等这一轮结束再加节点')
+      toast.info('助手正在改画布，等这一轮结束再加节点')
       return
     }
     const r = box.current?.getBoundingClientRect()
@@ -885,8 +886,10 @@ function CanvasInner() {
                   openInspector(node.id)
                   return
                 }
-                actions.select(node.id)
+                // 先请右栏滚过去、再选中：右栏接手时会先收起盖在它上面的属性面板（select(null)），
+                // 顺序反过来的话刚点的这个节点就被取消选中，「…的配置」入口也跟着没了
                 revealStep(node.id)
+                actions.select(node.id)
               }}
               onNodeDoubleClick={(_, node) => openInspector(node.id)}
               onPaneClick={() => actions.select(null)}

@@ -4,9 +4,12 @@
 // 从卡片中间穿过去、线有没有接在节点外面。check-ui / e2e-check 只看得到
 // "页面没报错、节点在、能点"，连线叠成一团它们一个字都不会说。
 //
-// 跑之前前端得起着（./scripts/dev.sh），因为走线模块是 Vite 现编的 TS：
-// 检查脚本直接 import('/src/canvas/routing.ts')，用的是页面上跑的那份代码，
-// 不是抄一遍逻辑——抄一遍就等于只测了抄的那份。
+// 走线模块是 Vite 现编的 TS：检查脚本直接 import('/src/canvas/routing.ts')，用的是
+// 页面上跑的那份代码，不是抄一遍逻辑——抄一遍就等于只测了抄的那份。排版走后端。
+//
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
+// 沙箱拷贝）跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-canvas-layout.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -18,6 +21,19 @@ let failed = 0
 const check = (name, cond, detail = '') => {
   console.log(`  ${cond ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`)
   if (!cond) failed++
+}
+
+/**
+ * 一节一节地跑：某一节里元素找不到、等待超时，只记成这一节失败，接着跑下一节，
+ * 不让一处卡住把后面的检查一起吞掉。各节自己开页面
+ */
+async function section(name, fn) {
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  }
 }
 
 // ---------------------------------------------------------------- 夹具
@@ -189,9 +205,7 @@ try {
   process.exit(1)
 }
 
-for (const [name, graph] of Object.entries(FIXTURES)) {
-  console.log(`=== ${name} ===`)
-
+for (const [name, graph] of Object.entries(FIXTURES)) await section(name, async () => {
   const res = await fetch(`${API}/copilot/layout`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -199,7 +213,7 @@ for (const [name, graph] of Object.entries(FIXTURES)) {
   })
   if (!res.ok) {
     check('后端排版可用', false, `${res.status}`)
-    continue
+    return
   }
   const laid = await res.json()
 
@@ -281,14 +295,13 @@ for (const [name, graph] of Object.entries(FIXTURES)) {
     }
   }
   check('每条线的两端都接在节点上', dangling.length === 0, dangling.slice(0, 3).join('、'))
-}
+})
 
 check('页面没有运行时错误', pageErrors.length === 0, pageErrors.join(' | '))
 
 // 手拖过的节点位置是随机的：坐标乱七八糟时不能算出 NaN 路径。
 // NaN 的 path 什么都不画，界面上就是"线没了"，而且一声不吭。
-console.log('=== 随机坐标（手拖过的图） ===')
-{
+await section('随机坐标（手拖过的图）', async () => {
   const fuzz = await page.evaluate(async () => {
     const mod = await import('/src/canvas/routing.ts')
     let seed = 20240924
@@ -334,12 +347,11 @@ console.log('=== 随机坐标（手拖过的图） ===')
   })
   check(`随机坐标下每条边都画得出来（${fuzz.total} 条）`, fuzz.broken === 0,
     fuzz.examples.join('、'))
-}
+})
 
 // 分支出口由 case 算出来。同 id 的两个出口会让 React Flow 出两个 handle、跑完两条一起
 // 亮，React 还会报 key 重复；key=default 和兜底出口在运行时本来就是同一个出口
-console.log('=== 分支出口：保留名 default、重复标识 ===')
-{
+await section('分支出口：保留名 default、重复标识', async () => {
   const r = await page.evaluate(async () => {
     const { sourceHandles } = await import('/src/canvas/nodeDefs.ts')
     const merged = sourceHandles('branch', { cases: [{ key: 'fast', label: '快速' }, { key: 'default', label: '协作' }] })
@@ -357,7 +369,7 @@ console.log('=== 分支出口：保留名 default、重复标识 ===')
   check('重复的 key 只出一个出口', r.dup.join(',') === 'a,b,default', r.dup.join(','))
   check('普通分支照常追加「其他」出口', r.plain.join(',') === 'yes,default', r.plain.join(','))
   check('出口颜色是中性的（ok 色只留给状态）', r.colors.every((c) => !c.includes('--ok')), r.colors.join('、'))
-}
+})
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过')
 await browser.close()

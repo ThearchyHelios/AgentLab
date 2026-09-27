@@ -170,6 +170,19 @@ async def test_a_scope_of_unknown_sources_is_refused_up_front(client, monkeypatc
     assert status == 400
     detail = body[0]["detail"]
     assert "数据源" in detail and "no_such_source" not in detail.split("：")[0]
+    # 前端按机器码认，不按「限定的数据源」这几个字的前缀认：文案改了也不失灵。
+    # detail 仍是一句话，老前端照旧能显示
+    assert isinstance(detail, str)
+    assert body[0]["code"] == "datasource_scope_empty"
+
+
+async def test_the_one_shot_generate_refuses_an_empty_scope_with_the_same_code(client, sources):
+    r = await client.post("/api/copilot/generate", json={
+        "instruction": "订单多少", "datasource_ids": ["no_such_source"],
+    })
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == "datasource_scope_empty"
+    assert isinstance(r.json()["detail"], str)
 
 
 async def test_the_one_shot_generate_honours_the_scope(client, monkeypatch, sources):

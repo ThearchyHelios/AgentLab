@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Bell, BellOff, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
@@ -33,6 +33,8 @@ import {
 } from './lib/notify'
 import type { Attention, FaviconDot } from './lib/notify'
 import { useLeaveBlocker } from './lib/leave'
+import { useLocalActor } from './lib/actor'
+import { runName } from './lib/terms'
 
 export default function App() {
   const loaded = useCatalog((s) => s.loaded)
@@ -383,27 +385,10 @@ function ThemeToggle() {
   )
 }
 
-const ACTOR_KEY = 'agentlab_actor'
-
-function readActor(): string {
-  try {
-    return localStorage.getItem(ACTOR_KEY)?.trim() ?? ''
-  } catch {
-    return ''
-  }
-}
-
-function subscribeActor(cb: () => void): () => void {
-  // 设置页在同一个标签页里改署名不会触发 storage 事件；它若派发 agentlab:actor
-  // 就立刻跟上，否则下一次导航重绘时也会重新读到
-  const events = ['storage', 'agentlab:actor', 'focus']
-  events.forEach((e) => window.addEventListener(e, cb))
-  return () => events.forEach((e) => window.removeEventListener(e, cb))
-}
-
 /** 操作者署名的首字：发布、审批、正式运行都记在这个名下，得一直看得见是谁 */
 function ActorButton() {
-  const actor = useSyncExternalStore(subscribeActor, readActor, () => '')
+  const actor = useLocalActor()
+  // 兜底：绕开 setLocalActor 直接写 localStorage 的地方不会通知，导航重绘时也重读一次
   useLocation()
   const initial = actor ? Array.from(actor)[0].toUpperCase() : ''
   return (
@@ -605,6 +590,7 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
 
   const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
   const retry = async () => {
+    if (busy) return
     setBusy(true)
     try {
       const ok = await useCatalog.getState().checkBackend()
@@ -676,7 +662,10 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
         </div>
       )}
       <div className="flex justify-end border-t px-3 py-2">
-        <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void retry()}>
+        {/* 忙着时用 aria-disabled 而不是 disabled：按钮一 disabled 焦点就掉到 body，
+            Esc 到不了浮层，键盘用户关不掉它 */}
+        <button type="button" className="btn btn-sm aria-disabled:cursor-not-allowed aria-disabled:opacity-45"
+                aria-disabled={busy || undefined} onClick={() => void retry()}>
           {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} {down ? '立即重试' : '重新检测'}
         </button>
       </div>
@@ -905,8 +894,8 @@ function watchStudio(go: Go): () => void {
     }
     const w = watch
     watch = null
-    if (!w || w.runId !== id || s.trace.lastReplay || Date.now() - w.since < MIN_LIVE_MS) return
-    const name = s.workflow?.name || s.run?.workflow_name || '工作流'
+    if (!w || w.runId !== id || s.trace?.lastReplay || Date.now() - w.since < MIN_LIVE_MS) return
+    const name = s.workflow?.name || (s.run?.workflow_name && runName(s.run)) || '工作流'
     // 人多半还停在这张画布上：点通知回来就行，不跳走
     const here = s.workflow && window.location.pathname.startsWith(`/studio/${s.workflow.id}`)
     const to = here ? null : `/runs/${id}`
@@ -980,7 +969,7 @@ function watchApprovals(go: Go): () => void {
     for (const a of fresh) {
       notifyInBackground({
         title: `新的待审批：${a.title || '有一步在等你处理'}`,
-        body: [a.workflow_name, a.node_label].filter(Boolean).join(' · ') || undefined,
+        body: [a.workflow_name && runName(a), a.node_label].filter(Boolean).join(' · ') || undefined,
         tag: `approval:${a.id}`,
         onClick: () => go(`/runs/${a.run_id}`),
       })

@@ -28,12 +28,6 @@ export const lastVisited = (): string | null => {
   }
 }
 
-/**
- * 列表接口带上已归档的（回收站）。client 的 list 还不认 include_archived 参数（已提给 3c），
- * kind 原样拼进查询串，先借它带上
- */
-const WITH_TRASH = 'chat&include_archived=true' as 'chat'
-
 /** 按最后活跃时间排：恢复出来的会话回到它原本该在的位置 */
 const activeAt = (c: Conversation) => parseServerTime(c.last_active_at ?? c.created_at ?? '')?.getTime() ?? 0
 
@@ -91,7 +85,8 @@ export const useConversations = create<ConversationState>((set, get) => ({
     // 两边都能定就会互相覆盖：深链接进来，列表一加载完又被拽回上次那个
     set({ loading: true })
     try {
-      const rows = await api.conversations.list(WITH_TRASH)
+      // 连回收站里的一起取：一次请求，各行的 archived 区分放进哪一边
+      const rows = await api.conversations.list('chat', undefined, { includeArchived: true })
       set({
         list: rows.filter((c) => !c.archived),
         trash: rows.filter((c) => c.archived),

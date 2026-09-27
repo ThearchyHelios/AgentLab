@@ -5,7 +5,7 @@ import {
   Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
@@ -40,6 +40,12 @@ export const isUploadedTable = (row: any): boolean =>
   row?.kind === 'sqlite' && /[\\/]uploads[\\/]tables[\\/][^\\/]+\.db$/.test(row?.database ?? '')
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
+
+/**
+ * 增、删、改、传之后让全局的数据源目录跟上：检查器挑工具、问数据的范围、助手的数据源
+ * 提示都读它（store/catalog 的 datasources），不重拉的话刚接入的库在那几处看不见
+ */
+const syncCatalog = () => void useCatalog.getState().reload('datasources')
 
 export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
   const navigate = useNavigate()
@@ -78,7 +84,10 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
       ? rs.map((r) => (r.id === row.id ? row : r))
       : [...rs, row].sort((a, b) => a.name.localeCompare(b.name))
   })
-  const drop = (id: string) => setRows((rs) => rs && rs.filter((r) => r.id !== id))
+  const drop = (id: string) => {
+    setRows((rs) => rs && rs.filter((r) => r.id !== id))
+    syncCatalog()
+  }
 
   const tables = view === 'tables'
   const shown = rows?.filter((r) => isUploadedTable(r) === tables) ?? []
@@ -141,7 +150,8 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
               key={row.id}
               row={row}
               meta={kindOf(row.kind)}
-              onChange={upsert}
+              // 卡片上换 schema、探查结构改的也是这个源：检查器、问数据读的目录要跟上
+              onChange={(r) => { upsert(r); syncCatalog() }}
               onRemoved={drop}
               onEdit={() => setEditing(row)}
               onReupload={() => setUploading({ name: row.name })}
@@ -160,6 +170,7 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
             const isNew = !editing.id
             setEditing(null)
             upsert(row)
+            syncCatalog()
             // 本机记着的那次测连接说的是改之前的库：换了地址、账号或连接参数就不作数了
             // （后端同样清掉了自己记的那份，除非表单里刚测过这一份）
             if (tested) setHealth(`datasource:${row.id}`, tested)
@@ -182,6 +193,7 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
           onClose={() => setUploading(null)}
           onImported={(row) => {
             upsert(row)
+            syncCatalog()
             if (!tables) navigate('/data/tables', { replace: true })
           }}
         />
@@ -318,8 +330,10 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   // 只看不存，好好的库也可以随手看看别的 schema；单文件的 SQLite 和传上来的表没有 schema 可换
   const synced = parseServerTime(row.schema_synced_at)?.getTime() ?? 0
   const canProbeOther = !uploaded && row.kind !== 'sqlite'
+  // 候选里去掉配置里现有的那个：点它等于 dry_run 自己，探到了还问「把 schema 改成它？」
+  const otherSchemas: string[] = (row.available_schemas ?? []).filter((s: string) => s !== configured).slice(0, 12)
   const introspectOther = async () => {
-    const others: string[] = (row.available_schemas ?? []).filter((s: string) => s !== configured).slice(0, 8)
+    const others = otherSchemas.slice(0, 8)
     const schema = await promptDialog({
       title: '看看哪个 schema？',
       body: `只看不存：缓存和配置都不动，探到对象再问要不要写进配置。${others.length ? `这台服务器上还有：${others.join('、')}` : ''}`,
@@ -425,12 +439,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
         >
           <div className="font-medium text-[var(--err)]">上次探查失败</div>
           <div className="mt-0.5 break-all text-dim">{row.schema_error}</div>
-          {!!row.available_schemas?.length && (
+          {!!otherSchemas.length && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <span className="text-faint">
                 当前是「{row.options?.schema || row.database || '默认'}」。这台服务器上还有，点一个看看（只看不存）：
               </span>
-              {row.available_schemas.slice(0, 12).map((s: string) => (
+              {otherSchemas.map((s: string) => (
                 <button key={s} className="chip hover:border-[var(--accent)] hover:text-fg" disabled={!!busy}
                         onClick={() => void probeOther(s)}>
                   {busy === `schema:${s}` ? <Spinner size={10} /> : <Search size={10} aria-hidden />}
@@ -660,8 +674,9 @@ function ColumnList({ detail }: { detail?: ColumnsState }) {
     return <div className="mb-1 ml-5 py-1"><Skeleton rows={3} height={9} gap={6} /></div>
   }
   if ('error' in detail) return <div className="mb-1.5 ml-5"><ErrorState compact error={detail.error} /></div>
-  if (!detail.found) {
-    // 清单里有、缓存里却找不到：清单和列是两次请求取的，中间重新探查过
+  if (detail.found === false) {
+    // 清单里有、缓存里却找不到：清单和列是两次请求取的，中间重新探查过。
+    // 只认明确的 false：老后端的响应里根本没有 found，得往下走到原文显示
     return (
       <div className="mb-1.5 ml-5 text-2xs text-faint">
         缓存里没有这张表的结构了，多半是刚重新探查过。收起再展开，或者点「探查结构」
@@ -794,6 +809,15 @@ function toBody(form: SourceForm, isNew: boolean, wasOracle = true): any {
   return body
 }
 
+/**
+ * 422 的中文 detail 说的是哪一项。眼下只有查询时限按字段拒（后端 query_timeout_problem），
+ * 认不出的交回 toast
+ */
+function fieldOfRejection(message: string): string | null {
+  if (/查询时限/.test(message)) return 'query_timeout_s'
+  return null
+}
+
 const FIELD_LABEL: Record<string, string> = {
   host: '主机', database: '数据库', username: '用户名',
 }
@@ -820,6 +844,12 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   const [form, setForm] = useState<SourceForm>(initial)
   const [saving, setSaving] = useState(false)
   const [test, setTest] = useState<{ since?: number; result?: HealthRecord; sig?: string }>({})
+  // 后端按字段拒掉的保存（422，detail 是一句中文）：写在那一项下面，不只弹 toast——
+  // toast 盖在弹窗上面，几秒就没了，人还得猜是哪一项
+  const [fieldError, setFieldError] = useState<{ key: string; message: string } | null>(null)
+  // 高级连接参数开没开，由人（和报错）决定，不跟着「填了几项」走：删空唯一一项的那一下
+  // 要是跟着收起，正在改的框被藏起来，焦点掉到 body，接着敲的字全落空
+  const [advOpen, setAdvOpen] = useState(() => initial.advanced.some(([, v]) => v))
   const resultRef = useRef<HTMLDivElement>(null)
   const meta = kinds.find((k) => k.value === form.kind)
   const set = (patch: Partial<SourceForm>) => setForm((f) => ({ ...f, ...patch }))
@@ -874,6 +904,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   const save = async () => {
     if (blocked) return
     setSaving(true)
+    setFieldError(null)
     try {
       const row = isNew
         ? await api.datasources.create(body)
@@ -881,7 +912,15 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       const before = connectionOf(toBody(initial, isNew, source.kind === 'oracle'))
       onSaved(row, testFresh ? test.result : undefined, connectionOf(body) !== before)
     } catch (e) {
-      toast.error(e)
+      const rejected = e instanceof ApiError && e.status === 422 ? e.message : ''
+      const key = rejected ? fieldOfRejection(rejected) : null
+      if (key) {
+        setFieldError({ key, message: rejected })
+        setAdvOpen(true)
+        requestAnimationFrame(() => document.getElementById(`ds-adv-${key}`)?.focus())
+      } else {
+        toast.error(e)
+      }
     } finally {
       setSaving(false)
     }
@@ -890,12 +929,57 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   const advancedDefs: any[] = (meta?.advanced ?? []).filter((a: any) => !OWN_OPTION_KEYS.has(a.key))
   const knownAdvanced = new Set(advancedDefs.map((a) => a.key))
   const advValue = (k: string) => form.advanced.find(([key]) => key === k)?.[1] ?? ''
-  const setAdv = (k: string, v: string) => setForm((f) => {
-    const rest = f.advanced.filter(([key]) => key !== k)
-    return { ...f, advanced: v ? [...rest, [k, v]] : rest }
-  })
+  const setAdv = (k: string, v: string) => {
+    if (fieldError?.key === k) setFieldError(null)
+    setForm((f) => {
+      const rest = f.advanced.filter(([key]) => key !== k)
+      return { ...f, advanced: v ? [...rest, [k, v]] : rest }
+    })
+  }
   const extras = form.advanced.map((kv, i) => [kv, i] as const).filter(([[k]]) => !knownAdvanced.has(k))
   const advancedCount = form.advanced.filter(([, v]) => v).length
+
+  // 高级连接参数：SQLite 也有（查询时限），以前只在网络库的分支里画，SQLite 源配不了
+  const advanced = (
+    <details className="rounded-lg border" open={advOpen} onToggle={(e) => setAdvOpen(e.currentTarget.open)}>
+      <summary className="cursor-pointer select-none px-2.5 py-1.5 text-xs text-dim hover:text-fg">
+        高级连接参数{advancedCount ? `（${advancedCount}）` : ''}
+        <span className="ml-1.5 text-2xs text-faint">
+          {sqlite ? '查询时限这类，没特殊需要不用填' : '对应连接串里的 options，没特殊需要不用填'}
+        </span>
+      </summary>
+      <div className="space-y-2.5 border-t px-2.5 py-2.5">
+        {advancedDefs.map((a) => {
+          const err = fieldError && fieldError.key === a.key ? fieldError.message : undefined
+          return (
+            <Field key={a.key} htmlFor={`ds-adv-${a.key}`} label={<>{a.label} <span className="mono text-faint">{a.key}</span></>}
+                   hint={a.help} error={err}>
+              <input id={`ds-adv-${a.key}`} className="field mono" value={advValue(a.key)} placeholder={a.placeholder ?? ''}
+                     aria-invalid={err ? true : undefined}
+                     aria-describedby={err ? `ds-adv-${a.key}-error` : a.help ? `ds-adv-${a.key}-hint` : undefined}
+                     style={err ? { borderColor: 'var(--err)' } : undefined}
+                     onChange={(e) => setAdv(a.key, e.target.value)} />
+            </Field>
+          )
+        })}
+        {extras.map(([[k, v], i]) => (
+          <div key={i} className="flex items-center gap-2">
+            <input className="field mono w-40" value={k} placeholder="参数名" aria-label="参数名"
+                   onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [e.target.value, kv[1]] : kv)) }))} />
+            <input className="field mono flex-1" value={v} placeholder="值" aria-label={`参数 ${k || '（未命名）'} 的值`}
+                   onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [kv[0], e.target.value] : kv)) }))} />
+            <IconButton label={`去掉参数 ${k || '（未命名）'}`} icon={<X size={12} />}
+                        onClick={() => setForm((f) => ({ ...f, advanced: f.advanced.filter((_, j) => j !== i) }))} />
+          </div>
+        ))}
+        {!sqlite && (
+          <button className="btn btn-sm btn-ghost" onClick={() => setForm((f) => ({ ...f, advanced: [...f.advanced, ['', '']] }))}>
+            <Plus size={11} aria-hidden /> 加一项
+          </button>
+        )}
+      </div>
+    </details>
+  )
 
   return (
     <Modal
@@ -963,12 +1047,15 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
         )}
 
         {sqlite ? (
-          <Field label="数据库文件路径" required={required('database')} hint="绝对路径；~ 不会被展开">
-            {(p) => (
-              <input {...p} className="field mono" value={form.database} placeholder="/绝对/路径/data.db"
-                     onChange={(e) => set({ database: e.target.value })} />
-            )}
-          </Field>
+          <>
+            <Field label="数据库文件路径" required={required('database')} hint="绝对路径；~ 不会被展开">
+              {(p) => (
+                <input {...p} className="field mono" value={form.database} placeholder="/绝对/路径/data.db"
+                       onChange={(e) => set({ database: e.target.value })} />
+              )}
+            </Field>
+            {advancedDefs.length > 0 && advanced}
+          </>
         ) : (
           <>
             <div className="grid grid-cols-[1fr_110px] gap-3">
@@ -1022,35 +1109,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
               </Field>
             </div>
 
-            <details className="rounded-lg border" open={advancedCount > 0 || undefined}>
-              <summary className="cursor-pointer select-none px-2.5 py-1.5 text-xs text-dim hover:text-fg">
-                高级连接参数{advancedCount ? `（${advancedCount}）` : ''}
-                <span className="ml-1.5 text-2xs text-faint">对应连接串里的 options，没特殊需要不用填</span>
-              </summary>
-              <div className="space-y-2.5 border-t px-2.5 py-2.5">
-                {advancedDefs.map((a) => (
-                  <Field key={a.key} label={<>{a.label} <span className="mono text-faint">{a.key}</span></>} hint={a.help}>
-                    {(p) => (
-                      <input {...p} className="field mono" value={advValue(a.key)} placeholder={a.placeholder ?? ''}
-                             onChange={(e) => setAdv(a.key, e.target.value)} />
-                    )}
-                  </Field>
-                ))}
-                {extras.map(([[k, v], i]) => (
-                  <div key={i} className="flex items-center gap-2">
-                    <input className="field mono w-40" value={k} placeholder="参数名" aria-label="参数名"
-                           onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [e.target.value, kv[1]] : kv)) }))} />
-                    <input className="field mono flex-1" value={v} placeholder="值" aria-label={`参数 ${k || '（未命名）'} 的值`}
-                           onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [kv[0], e.target.value] : kv)) }))} />
-                    <IconButton label={`去掉参数 ${k || '（未命名）'}`} icon={<X size={12} />}
-                                onClick={() => setForm((f) => ({ ...f, advanced: f.advanced.filter((_, j) => j !== i) }))} />
-                  </div>
-                ))}
-                <button className="btn btn-sm btn-ghost" onClick={() => setForm((f) => ({ ...f, advanced: [...f.advanced, ['', '']] }))}>
-                  <Plus size={11} aria-hidden /> 加一项
-                </button>
-              </div>
-            </details>
+            {advanced}
           </>
         )}
 

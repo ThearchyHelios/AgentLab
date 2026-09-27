@@ -8,6 +8,8 @@ schema 把缓存换回来，而那一次要是失败，缓存和配置就对不�
 """
 from __future__ import annotations
 
+import re
+
 import sqlite3
 
 import pytest
@@ -95,6 +97,8 @@ async def test_a_dry_run_that_finds_nothing_says_why_and_still_leaves_the_cache(
     preview = r.json()
     assert preview["dry_run"] is True and preview["table_count"] == 0
     assert preview["schema_error"], "探失败了要说出来，不能看起来像「这个 schema 是空的」"
+    # 这句话原样画在数据源卡片上：不带驱动的异常类名（OperationalError: …）
+    assert not re.search(r"\b[A-Z]\w*(Error|Exception)\b", preview["schema_error"]), preview["schema_error"]
     assert "main" in preview["available_schemas"]
     assert await _cache(source["id"]) == before
 

@@ -51,6 +51,10 @@ export interface TurnFailure {
   detail?: string
   /** 该去哪儿改（lib/explain 的 fix）：给了就在报错里放直达入口 */
   fix?: FixKind | 'rerun'
+  /** fix 的站内地址（lib/explain 的 fixTo）：直接打开要改的那一项，比笼统的「去工具库」准 */
+  fixTo?: string
+  /** 先改再接着跑（lib/explain 的 fixFirst）：入口写明要改什么 */
+  fixFirst?: boolean
 }
 
 export interface StreamTurn {
@@ -88,8 +92,12 @@ export interface StreamTurn {
   review?: ReviewResult | null
   /** 被复核重写之前的答案。改写是有损的，得能对照原件 */
   rawOutput?: Record<string, any> | null
-  /** 这一轮开始的时刻（毫秒时间戳）。有它，进行中的轮次头部才走实时计时 */
-  startedAt?: number
+  /**
+   * 这一轮开始的时刻（毫秒时间戳）。有它，进行中的轮次头部才走实时计时；不给就从第一步
+   * 开始的时刻推。null 表示明确不要实时计时：问数据页刚从库里恢复、正在对账的轮次，
+   * 事件可能先到一两条，那不是它开始跑了
+   */
+  startedAt?: number | null
   /** 跑完的轮次花了多久（毫秒）。不给就从「完成」那一行推 */
   elapsedMs?: number
   /**
@@ -118,6 +126,8 @@ interface StreamCtx {
   skewMs: number
   openArtifact: (id: string, title?: string) => void
   reduced: boolean
+  /** 还没办完的点名请求：要看的那一行收在「展开前面的 N 条」里时，列表先展开 */
+  reveal?: { nodeId: string; seq: number } | null
 }
 const Ctx = createContext<StreamCtx>({
   dense: false, skewMs: 0, openArtifact: () => undefined, reduced: false,
@@ -151,7 +161,7 @@ const STICK_PX = 64
 export function AssistantStream({
   turns, dense = false, empty, approvalsFor, onOpenGraph, footer, renderTurnActions,
   onStepHover, onStepFocus, onStepOpen, activeNodeId, follow = true, landing, onFollowUp,
-  clockSkewMs = 0, className, resetKey,
+  clockSkewMs = 0, className, resetKey, reveal, onRevealed,
 }: {
   turns: StreamTurn[]
   /** 窄栏模式：更紧的排版、表格少列 */
@@ -191,6 +201,12 @@ export function AssistantStream({
    * （助手栏展开「之前的 N 轮」）时第一轮变了，但人还在看同一段对话，得传一个不随之变的
    */
   resetKey?: string
+  /**
+   * 请这条流把某个节点最后一次执行摆到眼前、描一下边（画布上点了跑过的节点）。seq 变了才办；
+   * 办完调 onRevealed，页面据此把请求清掉，免得重新挂载时又办一遍
+   */
+  reveal?: { nodeId: string; seq: number } | null
+  onRevealed?: (seq: number) => void
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
@@ -248,6 +264,44 @@ export function AssistantStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature, follow])
 
+  // 点名要看某个节点（画布上点了它）：滚过去就暂停跟随——人要看的是那一步，新进展来了
+  // 也不能把他拽回底部；他自己滚回底部再恢复（onScroll）。
+  // 等这一帧落定再滚：右栏刚从对话层切过来时，「打开时停在最新处」的定位（开发期 StrictMode
+  // 还会把它重跑一遍）都得排在这一次前面，不然人刚被带到那一步又被拽回底部。不在清理里
+  // 取消，理由同 RunView：清理一跑请求就吞掉了；卸载了的话找不到东西自然不做
+  const revealed = useRef(0)
+  const unflash = useRef<(() => void) | null>(null)
+  // 长运行里那一行可能收在「展开前面的 N 条」里：StepList 从 Ctx 看到请求会先展开，这里多等
+  // 几帧再找。找到了才暂停跟随、描边、报办完；始终找不到就原地不动，不把人带走又什么都不描。
+  // 用 useEffect 不用 useLayoutEffect：开发期 StrictMode 把挂载时的 effect 重跑一遍是在
+  // passive 这一拍里做的，排在它后面起跳，重跑的「打开时停在最新处」和卸载时摘描边都已经过去
+  useEffect(() => {
+    if (!reveal || reveal.seq === revealed.current) return
+    revealed.current = reveal.seq
+    const { nodeId, seq } = reveal
+    const seen = total
+    let tries = 0
+    const attempt = () => {
+      const el = scrollRef.current
+      const target = el ? lastExecOf(el, nodeId) : null
+      if (!el) return
+      if (!target) {
+        if (++tries < REVEAL_TRIES) requestAnimationFrame(attempt)
+        return
+      }
+      pinned.current = false
+      baseline.current = seen
+      target.scrollIntoView({ block: 'start', behavior: reduced ? 'auto' : 'smooth' })
+      unflash.current?.()
+      unflash.current = flash(target, 'focus')
+      onRevealed?.(seq)
+    }
+    requestAnimationFrame(attempt)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal])
+  // 请求清掉（reveal 变回 null）时描边照常留满时长，只在卸载时摘
+  useEffect(() => () => unflash.current?.(), [])
+
   // 悬停联动画布：在滚动容器上统一认"指着哪个节点"。挂在每一行上的话，从节点行移进
   // 它下面的查询行会先触发子行的 leave，把高亮清掉，人明明还指着这个节点
   const hovered = useRef<string | null>(null)
@@ -273,8 +327,8 @@ export function AssistantStream({
 
   const ctx = useMemo<StreamCtx>(() => ({
     dense, onHover: onStepHover, onFocus: onStepFocus, onOpen: onStepOpen, activeNodeId, skewMs: clockSkewMs,
-    openArtifact: (id, title) => setArtifact({ id, title }), reduced,
-  }), [dense, onStepHover, onStepFocus, onStepOpen, activeNodeId, clockSkewMs, reduced])
+    openArtifact: (id, title) => setArtifact({ id, title }), reduced, reveal,
+  }), [dense, onStepHover, onStepFocus, onStepOpen, activeNodeId, clockSkewMs, reduced, reveal])
 
   const rootClass = clsx('flex h-full min-h-0 flex-1 flex-col', className)
   if (!turns.length && empty) {
@@ -322,6 +376,20 @@ export function AssistantStream({
   )
 }
 
+/**
+ * 节点最后一次执行的那一块：执行过多次的，是分轮折叠里最后那一轮（它总是列着的）；
+ * 只执行过一次的，是节点那一行本身。节点行里套着它自己的子步骤（同一个 data-node-id），
+ * 取最外层那个
+ */
+function lastExecOf(root: HTMLElement, nodeId: string): HTMLElement | null {
+  const id = CSS.escape(nodeId)
+  const row = [...root.querySelectorAll<HTMLElement>(`[data-step-status][data-node-id="${id}"]`)]
+    .find((el) => !el.parentElement?.closest(`[data-node-id="${id}"]`))
+  if (!row) return null
+  const execs = row.querySelectorAll<HTMLElement>(`[data-exec-groups="${id}"] [data-exec]`)
+  return execs.length ? execs[execs.length - 1] : row
+}
+
 /** 空的动作槽不占位：页面对某些轮次什么都不放是常态 */
 function TurnActions({ children }: { children: ReactNode }) {
   if (children == null || children === false) return null
@@ -358,8 +426,8 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
     ? turn.steps.filter((s) => !(s.kind === 'error' && (s.title === errText || s.id.startsWith('rf-'))))
     : turn.steps
   const plan = steps.filter((s) => s.stage === 'plan')
-  // 「开始执行（6 个节点）」「完成」和轮次头说的是同一件事（状态、节点数、耗时），
-  // 再列一遍只是噪音；失败时「开始执行」还会被画成红叉，像是出了第二个错
+  // 「开始运行（6 个节点）」「完成」和轮次头说的是同一件事（状态、节点数、耗时），
+  // 再列一遍只是噪音；失败时「开始运行」还会被画成红叉，像是出了第二个错
   const exec = steps.filter((s) => s.stage !== 'plan' && !redundant(s))
   const broken = turn.review?.severity === 'broken'
 
@@ -404,7 +472,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
             <StepSection
               label={exec.length ? '规划' : '过程'}
               steps={plan}
-              // 开始执行之后规划那段自动收起："建图时加的节点"和"执行时跑的节点"
+              // 开始运行之后规划那段自动收起："建图时加的节点"和"执行时跑的节点"
               // 同名同序地再出现一遍只是噪音
               defaultOpen={exec.length ? false : turn.phase !== 'done' || last}
               turn={turn}
@@ -497,7 +565,7 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
       : turn.tone === 'failed' && turn.phase === 'done' ? 'failed' : code)
 
   const firstStart = useMemo(() => findFirst(turn.steps, (s) => s.startedAt != null)?.startedAt, [turn.steps])
-  const started = turn.startedAt ?? firstStart
+  const started = turn.startedAt === null ? undefined : turn.startedAt ?? firstStart
   // 「完成」那一行不再单独列出，它的「执行 1.2 s · 等人 3 分」挪到头上
   const doneRow = turn.steps.find((s) => s.kind === 'lifecycle' && s.title === '完成')
   const took = turn.elapsedMs != null ? (turn.elapsedMs >= 10 ? formatDuration(turn.elapsedMs) : '')
@@ -531,7 +599,8 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
       <div className={clsx('flex items-center gap-2', dense ? 'text-[11.5px]' : 'text-xs')}>
         <StatusBadge status={badgeCode} size={13} decorative />
         <span className={clsx('min-w-0 truncate font-medium', !tone && 'text-fg')}
-              style={tone ? { color: tone } : undefined}>
+              style={tone ? { color: tone } : undefined} data-turn-status=""
+              title={verdict ? `${base} · ${verdict}` : base}>
           {base}
           {verdict && <span data-verdict="" style={{ color: verdictTone }}> · {verdict}</span>}
         </span>
@@ -682,13 +751,13 @@ function StepSection({ label, steps, turn, defaultOpen, titled = true }: {
 }
 
 /**
- * 不必单列的生命周期行：「开始执行」「完成」「已取消」和轮次头说的是同一件事。
- * 「继续执行」带着从哪接着跑、谁发起的才留；老数据里光秃秃的一句，审批行上的
+ * 不必单列的生命周期行：「开始运行」「完成」「已取消」和轮次头说的是同一件事。
+ * 「继续运行」带着从哪接着跑、谁发起的才留；老数据里光秃秃的一句，审批行上的
  * 「→ 已放行」已经说过了，而且步骤按节点归并之后它的位置也对不上真实的先后
  */
 const redundant = (s: Step): boolean =>
-  s.kind === 'lifecycle' && (s.title.startsWith('开始执行') || s.title === '完成'
-    || ((s.title === '已取消' || s.title === '继续执行') && !s.sub))
+  s.kind === 'lifecycle' && (s.title.startsWith('开始运行') || s.title === '完成'
+    || ((s.title === '已取消' || s.title === '继续运行') && !s.sub))
 
 /** 这一轮一共跑了多久，给耗时细条当分母 */
 function turnMs(turn: StreamTurn): number | undefined {
@@ -743,6 +812,8 @@ interface Failure {
   action?: string
   raw?: string
   fix?: FixKind | 'rerun'
+  fixTo?: string
+  fixFirst?: boolean
 }
 
 /** 这一轮是不是一次运行。Copilot 建图、发起就失败的，不能按运行的失败去讲（「接着跑」无从谈起） */
@@ -753,7 +824,8 @@ function failureOf(turn: StreamTurn): Failure | null {
   const e = turn.error
   if (!e) return null
   if (typeof e === 'object' && 'title' in e) {
-    return { title: e.title, reason: e.reason, action: e.hint, raw: e.detail || undefined, fix: e.fix }
+    return { title: e.title, reason: e.reason, action: e.hint, raw: e.detail || undefined,
+             fix: e.fix, fixTo: e.fixTo, fixFirst: e.fixFirst }
   }
   const text = typeof e === 'string' ? e : e.error
   const detail = typeof e === 'string' ? undefined : e.detail
@@ -762,7 +834,7 @@ function failureOf(turn: StreamTurn): Failure | null {
   // 人就不知道该信哪句、该点哪个按钮
   if (!hint && isRunTurn(turn)) {
     const x = explainRunError(text, detail)
-    return { title: x.title, reason: x.reason, action: x.action, fix: x.fix,
+    return { title: x.title, reason: x.reason, action: x.action, fix: x.fix, fixTo: x.fixTo, fixFirst: x.fixFirst,
              raw: x.raw && x.raw !== x.title ? x.raw : undefined }
   }
   const h = humanizeError(hint || detail ? { error: text, hint, detail } : text)
@@ -773,7 +845,13 @@ function failureOf(turn: StreamTurn): Failure | null {
  * 下一步的直达入口。要去画布上改的，编排页能直接打开那个节点的设置；别处只说该去哪儿，
  * 不装作能点。「接着跑」「重新运行」由页面自己放（renderTurnActions），这里不给
  */
-function FixAction({ fix, nodeId, label }: { fix?: FixKind | 'rerun'; nodeId?: string; label?: string }) {
+function FixAction({ fix, nodeId, label, to, first }: {
+  fix?: FixKind | 'rerun'; nodeId?: string; label?: string
+  /** lib/explain 的 fixTo：直达要改的那一项 */
+  to?: string
+  /** lib/explain 的 fixFirst：先改好才接得下去，入口写明要改什么 */
+  first?: boolean
+}) {
   const { onOpen } = useContext(Ctx)
   const cls = 'inline-flex shrink-0 items-center gap-1 rounded px-1 text-2xs text-[var(--accent)] underline-offset-2 transition-colors hover:bg-hover hover:underline'
   if (fix === 'canvas' && nodeId && onOpen) {
@@ -784,10 +862,14 @@ function FixAction({ fix, nodeId, label }: { fix?: FixKind | 'rerun'; nodeId?: s
     )
   }
   if (fix === 'settings') {
-    return <Link to="/settings/providers" className={cls} data-fix="settings"><Settings2 size={10} aria-hidden /> 去模型接入</Link>
+    return <Link to={to ?? '/settings/providers'} className={cls} data-fix="settings"><Settings2 size={10} aria-hidden /> 去模型接入</Link>
   }
   if (fix === 'tools') {
-    return <Link to="/tools" className={cls} data-fix="tools"><Wrench size={10} aria-hidden /> 去工具库</Link>
+    return (
+      <Link to={to ?? '/tools'} className={cls} data-fix="tools">
+        <Wrench size={10} aria-hidden /> {first ? '去改参数定义' : '去工具库'}
+      </Link>
+    )
   }
   return null
 }
@@ -832,7 +914,7 @@ function TurnError({ turn }: { turn: StreamTurn }) {
           </div>
         )}
         <div className="flex flex-wrap items-center gap-x-2">
-          <FixAction fix={f.fix} nodeId={whereId} label={whereLabel} />
+          <FixAction fix={f.fix} nodeId={whereId} label={whereLabel} to={f.fixTo} first={f.fixFirst} />
         </div>
         {f.raw && <div className="mt-1"><TechDetails raw={f.raw} /></div>}
       </div>
@@ -864,6 +946,8 @@ const FOLD_FROM = 5
 /** 一层超过这么多条时先只画一部分。1860 条事件的运行以前是 5970 个 DOM 节点 */
 const LIST_CAP = 50
 const LIST_HEAD = 20
+/** 点名的那一行等展开之后再找，最多等这么多帧 */
+const REVEAL_TRIES = 4
 
 const notable = (s: Step): boolean =>
   s.status === 'failed' || s.status === 'running' || s.status === 'waiting'
@@ -876,6 +960,7 @@ function StepList({ steps, depth, turnMs, fold = false }: {
 }) {
   const [all, setAll] = useState(false)
   const rows = useMemo(() => compactSteps(steps), [steps])
+  const { reveal } = useContext(Ctx)
 
   // 收起的是前面那些平平无奇的：最新的几条（运行中正在发生的就在这里）和出了
   // 问题的一律留着。反过来只画前 20 条的话，长运行跑到后面，正在跑的那一步反而
@@ -883,6 +968,13 @@ function StepList({ steps, depth, turnMs, fold = false }: {
   const keep = fold && rows.length > 6 ? 3 : rows.length > LIST_CAP ? LIST_HEAD : 0
   const shown = !all && keep ? rows.filter((s, i) => notable(s) || i >= rows.length - keep) : rows
   const hidden = rows.length - shown.length
+  // 画布上点名要看的节点正好收在前面那一截里：先展开，上面的定位下一帧就找得到它
+  useLayoutEffect(() => {
+    if (!reveal || !hidden) return
+    const kept = new Set(shown)
+    if (rows.some((s) => !kept.has(s) && s.nodeId === reveal.nodeId)) setAll(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal?.seq])
 
   return (
     <div className={clsx(depth > 0 && 'ml-[5px] border-l pl-2.5')}
@@ -909,9 +1001,9 @@ function StepRow({ step, depth, turnMs }: { step: Step; depth: number; turnMs?: 
 }
 
 /**
- * 执行里的分段线：「继续执行 · 由 张工 发起」。它标的是这次运行在时间线上的一个
+ * 执行里的分段线：「继续运行 · 由 张工 发起」。它标的是这次运行在时间线上的一个
  * 转折，不是一件做完或做砸的事——画成打勾或红叉就像多了一个步骤（失败的运行里
- * 「继续执行」以前是一个红叉，读起来像续跑本身出了错）
+ * 「继续运行」以前是一个红叉，读起来像续跑本身出了错）
  */
 function PhaseMark({ step }: { step: Step }) {
   const line = { background: 'var(--hairline, var(--border))' }
@@ -1083,7 +1175,7 @@ function StepMeta({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
                 }} />
         </span>
       )}
-      {/* 「开始执行」那一行的秒表和轮次头部的是同一个数，不重复 */}
+      {/* 「开始运行」那一行的秒表和轮次头部的是同一个数，不重复 */}
       {running && step.startedAt != null && step.kind !== 'lifecycle'
         ? <LiveClock since={step.startedAt} label={reduced ? '进行中' : undefined} limitS={step.limitS} />
         : (step.meta || STOPPED[step.status ?? '']) && !(running && step.startedAt != null) && (
@@ -1312,7 +1404,7 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
 function StepDetail({ step, table, explained }: {
   step: Step; table: Table | null
   /** 失败节点按 lib/explain 讲的为什么、怎么办 */
-  explained?: { reason?: string; action?: string; fix?: FixKind | 'rerun' } | null
+  explained?: { reason?: string; action?: string; fix?: FixKind | 'rerun'; fixTo?: string; fixFirst?: boolean } | null
 }) {
   const { openArtifact, dense } = useContext(Ctx)
   const pre = clsx('mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 leading-relaxed text-dim [overflow-wrap:anywhere]',
@@ -1329,7 +1421,8 @@ function StepDetail({ step, table, explained }: {
                 <CornerDownRight size={10} className="mt-[3px] shrink-0" aria-hidden />
                 <span className="min-w-0 [overflow-wrap:anywhere]">{explained.action}</span>
               </span>
-              <FixAction fix={explained.fix} nodeId={step.nodeId} label={step.title} />
+              <FixAction fix={explained.fix} nodeId={step.nodeId} label={step.title}
+                         to={explained.fixTo} first={explained.fixFirst} />
             </div>
           )}
         </div>
@@ -2073,7 +2166,9 @@ export function IssuanceBanner({ issuance, runClass }: {
 
   return (
     // data-issuance-banner：画布上成果节点的出具印章据此滚过来；tabIndex 让「去看出具」能把焦点带到这里
-    <div className="scroll-mt-14 rounded-lg border p-2 outline-none data-[flash]:outline data-[flash]:outline-2 data-[flash]:outline-offset-1 data-[flash=focus]:outline-[color:var(--accent)]"
+    // outline-none 把 --tw-outline-style 设成了 none，data-[flash]:outline 读的就是它：得显式
+    // 写回 solid，带到这里的那一下描边才画得出来（以前焦点落上了、描边却是 none）
+    <div className="scroll-mt-14 rounded-lg border p-2 outline-none data-[flash]:outline data-[flash]:outline-solid data-[flash]:outline-2 data-[flash]:outline-offset-1 data-[flash=focus]:outline-[color:var(--accent)]"
          style={{ borderColor: meta.color }} data-issuance-banner={tier} tabIndex={-1}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="rounded px-1.5 py-px text-xs font-semibold" style={{ color: meta.color, background: meta.soft }}>
@@ -2118,18 +2213,19 @@ export function IssuanceBanner({ issuance, runClass }: {
         </div>
       )}
       {!!calibers.length && (
-        // 数字回指到哪张口径卡。后端目前只给「回指了几个」，没给逐个数字对哪张卡；
-        // 只有一张卡时，回指上的数字必然来自它，可以直说
+        // 数字回指到哪张口径卡：按 matched[].caliber 逐张数（hitsOf 的 key 和后端 io.py 的
+        // 「口径名 @ 版本」同一种拼法，check-stream 盯着）。老后端没有逐个出处，只有一张卡时
+        // 回指上的数字必然来自它，可以直说
         <div className="mt-1.5 space-y-0.5 border-t pt-1.5 text-2xs text-dim">
           {calibers.map((c: any) => {
             const hits = hitsOf(c)
             return (
-              <div key={c.node ?? c.caliber} className="flex items-center gap-1.5">
+              <div key={c.node ?? c.caliber} className="flex items-center gap-1.5" data-caliber={c.caliber}>
                 <FileCode size={10} aria-hidden className="shrink-0" />
                 <span>口径卡「{c.caliber}」<span className="mono">{c.version}</span></span>
                 {calibers.length === 1 && matched > 0 && (hits == null || hits === matched)
-                  ? <span style={{ color: 'var(--st-done)' }}>· 回指上的 {matched} 个数字都来自这张卡</span>
-                  : hits != null && <span className="tnum" style={{ color: 'var(--st-done)' }}>· 回指 {hits} 个数字</span>}
+                  ? <span data-caliber-hits={matched} style={{ color: 'var(--st-done)' }}>· 回指上的 {matched} 个数字都来自这张卡</span>
+                  : hits != null && <span data-caliber-hits={hits} className="tnum" style={{ color: 'var(--st-done)' }}>· 回指 {hits} 个数字</span>}
               </div>
             )
           })}

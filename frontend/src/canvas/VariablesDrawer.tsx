@@ -209,7 +209,7 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
           </button>
         )) : (
           <div className="px-1 py-1 text-2xs text-faint">
-            没有任何地方引用它。改图改了一半的话这很正常
+            没有任何地方引用它。工作流改了一半的话这很正常
           </div>
         )}
       </Section>

@@ -4,12 +4,13 @@ import clsx from 'clsx'
 import { create } from 'zustand'
 import { useStudio } from '../store/studio'
 import { StatusBadge } from '../components/ui'
-import { formatClock } from '../lib/format'
+import { formatOffset } from '../lib/format'
 import { isTypingTarget } from '../lib/keys'
 import { statusMeta } from '../lib/status'
 import { useRunGlance } from '../run/RunHud'
 import { isActivePhase } from '../run/trace'
 import { Inspector } from './Inspector'
+import { parseFieldPath, type FieldRef } from './issues'
 
 type StudioSnapshot = ReturnType<typeof useStudio.getState>
 
@@ -25,7 +26,7 @@ export const useSheet = create<{ open: string | null }>(() => ({ open: null }))
  */
 export function stepsFirst(id: string, s: StudioSnapshot = useStudio.getState()): boolean {
   if (!isActivePhase(s.runPhase) && s.replayAt == null) return false
-  const n = s.trace.nodes[id]
+  const n = s.trace?.nodes[id]
   return !!n && (n.count > 0 || n.state !== 'idle')
 }
 
@@ -34,6 +35,48 @@ export function openInspector(id: string): void {
   // 先记下再选中：选中触发的订阅看到它已经点名要开，就不再按「先看步骤」收回去
   useSheet.setState({ open: id })
   useStudio.getState().select(id)
+}
+
+/**
+ * 光标落到哪：先找能填的——输入框、下拉，或控件自己点名的入口（data-reveal-focus，比如工具
+ * 多选的「添加」）——按文档顺序取第一个；一个都没有才退到按钮，而且不落在「移除」「删除」上。
+ * 从「工具被去掉了」点定位过来的人是要把工具加回去的：光标停在已绑工具芯片的 × 上，
+ * 顺手一个回车又解绑一个
+ */
+const FILLABLE = '[data-reveal-focus]:not([disabled]), input:not([type="hidden"]):not([disabled]):not([tabindex="-1"]), textarea:not([disabled]), select:not([disabled])'
+const PRESSABLE = 'button:not([disabled]):not([aria-label^="移除"]):not([aria-label^="删除"])'
+
+/**
+ * 落到检查器里的某一栏：选中节点、画布取景、打开属性面板、滚到那一栏；focus 时把光标放进去。
+ * 问题面板的定位、助手自查问题的「定位」都走这里——只选中节点的话，人还得在十几个字段里
+ * 自己找是第几个分支的条件、哪个成员的工具。
+ *
+ * field 是后端给的路径（'cases[1].condition'、'agents[0].tools'）或解析好的 FieldRef。
+ * 能落到第几项、项里的哪一栏就落到那儿，落不到就退一层；认不出来（老后端没给 field）
+ * 就只选中、取景，不乱抢焦点。运行中也打开面板：要改的就是那一栏
+ */
+export function revealField(nodeId: string, field?: FieldRef | string | null, opts: { focus?: boolean } = {}): void {
+  const s = useStudio.getState()
+  if (!s.nodes.some((n) => n.id === nodeId)) return
+  openInspector(nodeId)
+  s.focusNode(nodeId)
+  const at = typeof field === 'string' ? parseFieldPath(field) : field ?? null
+  if (!at) return
+  // 面板跟着选中挂上：等它渲染出来再找
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const sheet = document.querySelector('[data-inspector-sheet]') ?? document
+    const box = sheet.querySelector<HTMLElement>(`[data-field="${CSS.escape(at.key)}"]`)
+    const item = at.index != null ? box?.querySelector<HTMLElement>(`[data-item="${at.index}"]`) : null
+    const part = at.sub ? item?.querySelector<HTMLElement>(`[data-sub="${CSS.escape(at.sub)}"]`) : null
+    const target = part ?? item ?? box
+    if (!target) return
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    target.scrollIntoView({ block: 'center', behavior: still ? 'auto' : 'smooth' })
+    if (opts.focus) {
+      const to = target.querySelector<HTMLElement>(FILLABLE) ?? target.querySelector<HTMLElement>(PRESSABLE)
+      to?.focus({ preventScroll: true })
+    }
+  }))
 }
 
 // 选中 → 面板开不开。放在模块级：选中可能来自别处（问题面板定位、发布弹窗、快捷键），
@@ -132,7 +175,7 @@ function LiveStripBody({ onBack }: { onBack: () => void }) {
       <span className="shrink-0 font-medium" style={{ color: alert ? meta.color : undefined }}>{g.label}</span>
       <span className={clsx('min-w-0 flex-1 truncate', alert ? 'text-fg' : 'text-dim')}>{g.headline}</span>
       {isActivePhase(g.phase) && (
-        <span className="shrink-0 tnum text-faint">{formatClock(g.elapsedMs)}</span>
+        <span className="shrink-0 tnum text-faint">{formatOffset(g.elapsedMs)}</span>
       )}
       <ChevronLeft size={11} className="shrink-0 rotate-180 text-faint" />
     </button>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, Play, Plug, Plus, RefreshCw, Search, Terminal, Wand2, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api, ApiError } from '../api/client'
@@ -9,6 +9,7 @@ import {
   PageHeader, SectionBar, Skeleton, Spinner, StatusBadge, TabPanel, Tabs, toast, useTabRoute, withoutDeferred,
 } from '../components/ui'
 import { formatDuration } from '../lib/format'
+import { customToolEditPath } from '../lib/explain'
 import { checkHealth, forgetHealth, healthFromServer, useHealth } from '../lib/health'
 import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
@@ -173,7 +174,7 @@ function ToolLibrary() {
                     {on && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded bg-[var(--accent)]" aria-hidden />}
                     <div className="flex items-center gap-1.5">
                       <span className="mono truncate text-xs">{t.name}</span>
-                      <ApprovalTag tool={t} />
+                      {t.problem ? <ProblemChip problem={t.problem} /> : <ApprovalTag tool={t} />}
                     </div>
                     <div className="truncate text-2xs text-faint">{t.description}</div>
                   </button>
@@ -201,6 +202,18 @@ function ToolLibrary() {
               <ApprovalTag tool={picked} long />
             </div>
             <p className="mb-3 text-xs leading-relaxed text-dim">{picked.description}</p>
+
+            {picked.problem && (
+              <div role="alert" className="mb-3 flex items-start gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed" data-tool-problem-detail
+                   style={{ borderColor: 'color-mix(in srgb, var(--st-failed) 40%, var(--border))', background: 'var(--st-failed-soft)' }}>
+                <StatusBadge status="failed" size={13} decorative className="mt-0.5 shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="font-medium" style={{ color: 'var(--st-failed)' }}>{picked.problem}</span>
+                  <span className="block text-dim">绑了它的节点运行时一定失败。先把参数定义改好，再在这里试。</span>
+                </span>
+                <button className="btn btn-sm shrink-0" onClick={() => navigate(customToolEditPath(picked.name))}>去改参数定义</button>
+              </div>
+            )}
 
             {picked.dangerous && (
               <div className="mb-3 flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed"
@@ -254,6 +267,19 @@ function ToolLibrary() {
 }
 
 /**
+ * 自定义工具存着的参数定义写坏了（后端 schema_problem）。绑了它的节点运行时一定失败，
+ * 所以是醒目的失败色、带剪影，完整的那句放 title 和读屏名字里
+ */
+function ProblemChip({ problem }: { problem: string }) {
+  return (
+    <span className="chip shrink-0" data-tool-problem title={problem} aria-label={`参数定义写坏了：${problem}`}
+          style={{ color: 'var(--st-failed)', borderColor: 'color-mix(in srgb, var(--st-failed) 45%, transparent)', background: 'var(--st-failed-soft)' }}>
+      <StatusBadge status="failed" size={10} decorative />参数定义写坏了
+    </span>
+  )
+}
+
+/**
  * 「运行时需审批」只给真会停下来等人的工具打（后端的 runtime_approval）。
  * 自定义和 MCP 工具在工作流里运行时审批关卡认不出它们，就明说「运行时不审批」——
  * 以前它们也挂着「需确认」，标签说的不是实话，给人虚假的安全感。
@@ -288,8 +314,13 @@ function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean })
  */
 function ToolResult({ result, stale = false }: { result: any; stale?: boolean }) {
   const failed = result.ok === false
+  // 新结果常落在弹窗或详情区的可视范围以外（试跑区在编辑框最底下），note 的提醒不滚就
+  // 看不见——而它就是要人在抄参数之前看到。每来一份新结果带进视野一次；不加 smooth，
+  // reduced-motion 下也不会有滚动动画
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => { ref.current?.scrollIntoView({ block: 'nearest' }) }, [result])
   return (
-    <div className={clsx('mt-3', stale && 'opacity-60')} data-tool-result={failed ? 'fail' : 'ok'}>
+    <div ref={ref} className={clsx('mt-3', stale && 'opacity-60')} data-tool-result={failed ? 'fail' : 'ok'}>
       <div className="mb-1 flex items-center gap-1.5 text-xs">
         <StatusBadge status={failed ? 'failed' : 'done'} size={12} decorative />
         <span style={{ color: failed ? 'var(--err)' : 'var(--text-dim)' }}>{failed ? '失败' : '成功'}</span>
@@ -442,9 +473,21 @@ const PARAMS_NONE = { type: 'object', properties: {}, required: [] }
 function CustomTools() {
   const refresh = useCatalog((s) => s.refresh)
   const navigate = useNavigate()
+  const [params, setParams] = useSearchParams()
   const [rows, setRows] = useState<any[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [editing, setEditing] = useState<any | null>(null)
+
+  // ?edit=<工具名>：运行失败说「参数定义写坏了」时直接打开那一个的编辑框，不用再翻列表。
+  // 读完就从地址里摘掉，免得关了弹窗、刷新一下又弹出来
+  const wanted = params.get('edit')
+  useEffect(() => {
+    if (!wanted || !rows) return
+    const row = rows.find((r) => r.name === wanted)
+    if (row) setEditing(row)
+    else toast.warn(`没有叫「${wanted}」的自定义工具，可能已经被删了或改了名`)
+    setParams((p) => { p.delete('edit'); return p }, { replace: true })
+  }, [wanted, rows])
 
   const load = async () => {
     try {
@@ -493,9 +536,12 @@ function CustomTools() {
                 <div className="flex items-center gap-2">
                   <span className="mono text-sm font-medium">{row.name}</span>
                   <span className="chip">{row.kind === 'python' ? 'Python' : 'HTTP'}</span>
+                  {row.problem && <ProblemChip problem={row.problem} />}
                   {!row.enabled && <span className="chip" title="停用的工具不出现在工具库和节点里">已停用</span>}
                 </div>
-                <div className="truncate text-xs text-faint">{row.description || '没写描述：模型不知道什么时候该用它'}</div>
+                {row.problem
+                  ? <div className="truncate text-xs" style={{ color: 'var(--st-failed)' }} title={row.problem}>{row.problem}</div>
+                  : <div className="truncate text-xs text-faint">{row.description || '没写描述：模型不知道什么时候该用它'}</div>}
               </div>
               <button className="btn btn-sm" disabled={!row.enabled}
                       title={row.enabled ? '去工具库里带参数试跑' : '停用的工具不在工具库里'}
@@ -544,6 +590,19 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
   const [args, setArgs] = useState<any>(() => exampleArgs(initial.parameters, true))
   const [trial, setTrial] = useState<{ since?: number; result?: any; sig?: string } | null>(null)
   const clock = useRunClock(!!trial?.since)
+  // 参数定义写坏了（保存被 422 拒掉，或者试跑时后端说格式不对）：写在「参数 JSON Schema」
+  // 下面。以前是 toast，盖在弹窗标题上，几秒就没了
+  const [paramsError, setParamsError] = useState<string | null>(row.problem ?? null)
+  const paramsRef = useRef<HTMLDivElement>(null)
+  // 焦点也挪到参数框上：保存、试跑的按钮忙时禁用，焦点会掉到 body（弹窗外）。框标着
+  // aria-invalid 并指向那句原因，读屏聚焦就念出来——以前的 toast 在 assertive 区里是会念的
+  const showParamsError = (message: string) => {
+    setParamsError(message)
+    requestAnimationFrame(() => {
+      paramsRef.current?.scrollIntoView({ block: 'nearest' })
+      paramsRef.current?.querySelector('textarea')?.focus({ preventScroll: true })
+    })
+  }
 
   const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能用英文字母、数字、下划线，不能以数字开头' : null
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
@@ -560,7 +619,8 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
       const saved = row.id ? await api.customTools.update(row.id, form) : await api.customTools.create(form)
       onSaved(saved ?? form)
     } catch (e) {
-      toast.error(e)
+      if (e instanceof ApiError && e.status === 422 && /参数定义/.test(e.message)) showParamsError(e.message)
+      else toast.error(e)
     } finally {
       setBusy(false)
     }
@@ -580,6 +640,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
         kind: form.kind, parameters: form.parameters ?? {}, config: form.config, args: args ?? {},
       })
       setTrial({ result, sig })
+      if (result?.ok === false && /^参数定义/.test(String(result.error ?? ''))) showParamsError(String(result.error))
     } catch (e) {
       setTrial({ result: { ok: false, thrown: e }, sig })
     }
@@ -621,16 +682,17 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
                       onChange={(e) => setForm({ ...form, description: e.target.value })} />
           )}
         </Field>
-        <Field label="参数 JSON Schema" hint="每个参数写清 description：模型照着它填值">
+        <div ref={paramsRef} data-params-field>
+        <Field label="参数 JSON Schema" hint="每个参数写清 description：模型照着它填值" error={paramsError}>
           {(p) => (
             <>
-              <JsonInput key={paramsKey} id={p.id} value={form.parameters} rows={7}
-                         onChange={(v) => setForm((f: any) => ({ ...f, parameters: v }))} />
+              <JsonInput key={paramsKey} {...p} value={form.parameters} rows={7}
+                         onChange={(v) => { setParamsError(null); setForm((f: any) => ({ ...f, parameters: v })) }} />
               {noParams && (
                 <div className="mt-1 flex items-center gap-2 text-2xs text-faint">
                   <span>现在不收参数：模型调用它时什么都不传</span>
                   <button type="button" className="btn btn-xs"
-                          onClick={() => { setForm((f: any) => ({ ...f, parameters: PARAMS_EXAMPLE })); setParamsKey((k) => k + 1) }}>
+                          onClick={() => { setParamsError(null); setForm((f: any) => ({ ...f, parameters: PARAMS_EXAMPLE })); setParamsKey((k) => k + 1) }}>
                     <Wand2 size={11} aria-hidden /> 插入示例参数
                   </button>
                 </div>
@@ -638,6 +700,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
             </>
           )}
         </Field>
+        </div>
 
         {form.kind === 'http' ? (
           <>

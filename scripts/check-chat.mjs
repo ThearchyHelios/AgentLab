@@ -25,9 +25,11 @@
 //      彻底删除（清空也跳过它）；
 //  12. 限定数据源：点一下只查这个库，请求里带上 datasource_ids，库不在了说人话、补救是放开范围；
 //      库列表没取回来时，从上一问接过来的范围照样看得见；
-//  13. 画布助手的「在现有图上改 | 从头生成」分段控件；助手出错时同一句报错只说一遍。
+//  13. 画布助手的「在现有工作流上改 | 从头生成」分段控件；助手出错时同一句报错只说一遍。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
+// 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
+// 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-chat.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import { mkdirSync } from 'node:fs'
 
@@ -40,10 +42,22 @@ mkdirSync(SHOTS, { recursive: true })
 // 只跑其中几段：ONLY=busy,restart THEMES=dark node scripts/check-chat.mjs
 const ONLY = (process.env.ONLY ?? '').split(',').filter(Boolean)
 const THEMES = (process.env.THEMES ?? 'light,dark').split(',').filter(Boolean)
-const section = (name, title) => {
-  if (ONLY.length && !ONLY.includes(name)) return false
+/**
+ * 一节一节地跑：某一节里等待超时、元素找不到，只记成这一节失败，收掉它开的页面，
+ * 接着跑下一节。以前一处超时就让整个脚本崩掉，后面几百项一项都不跑
+ */
+const opened = new Set()
+async function section(name, title, fn) {
+  if (ONLY.length && !ONLY.includes(name)) return
   console.log(`\n=== ${title} ===`)
-  return true
+  try {
+    await fn()
+  } catch (e) {
+    check(`${title} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  } finally {
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
 }
 
 let failed = 0
@@ -56,6 +70,8 @@ const check = (name, cond, detail = '') => {
 
 const iso = (minsAgo) => new Date(Date.now() - minsAgo * 60_000).toISOString()
 const YESTERDAY_NOON = Math.round((Date.now() - new Date(new Date().setHours(12, 0, 0, 0) - 86_400_000).getTime()) / 60_000)
+// 「今天」同理：零点刚过的那一分钟里，「1 分钟前」已经是昨天
+const TODAY_RECENT = Math.min(1, Math.floor((Date.now() - new Date().setHours(0, 0, 0, 0)) / 60_000))
 const conv = (id, title, turns, minsAgo, extra = {}) => ({
   id, title, kind: 'chat', workflow_id: null, archived: false,
   created_at: iso(minsAgo + 5), last_active_at: iso(minsAgo), turn_count: turns, last_question: title,
@@ -70,6 +86,8 @@ const turn = (id, question, extra = {}) => ({
   id, seq: 0, question, answer: '', explanation: '', graph: null, run_id: null,
   status: 'done', error: '', review: null, created_at: iso(30), ...extra,
 })
+const BROKEN_TOOL = '自定义工具「lookup_order」的参数定义格式不对：参数 store 要写成 {"type": "string"} 这样的对象，'
+  + '不能直接写 "string"。到「工具」页把它的参数定义改好再运行'
 const GRAPH = {
   nodes: [
     { id: 'in', type: 'input', position: { x: 0, y: 0 }, data: { label: '问题', config: { fields: [{ name: 'question' }] } } },
@@ -80,7 +98,7 @@ const GRAPH = {
 }
 
 const CONVS = {
-  busyA: conv('c0busya', '会话 A：跑得很久的那个', 0, 1),
+  busyA: conv('c0busya', '会话 A：跑得很久的那个', 0, TODAY_RECENT),
   idleB: conv('c0idleb', '会话 B：已经答完的那个', 1, 3),
   longC: conv('c0longc', '会话 C：长会话，检查布局', 6, 60),
   slowD: conv('c0slowd', '会话 D：历史取得慢', 2, 90),
@@ -106,6 +124,7 @@ const CONVS = {
   scopeV: conv('c0scopv', '会话 V：限定数据源', 1, 60 * 24 * 23),
   scopeW: conv('c0scopw', '会话 W：上一问限定过数据源', 1, 60 * 24 * 24),
   buildX: conv('c0buildx', '会话 X：两天前的问题，别处刚又跑了一遍', 2, 60 * 24 * 25),
+  fixY: conv('c0fixy', '会话 Y：绑的自定义工具参数定义写坏了', 1, 60 * 24 * 26),
 }
 /** 回收站里的：列表接口只有带 include_archived 才给 */
 const TRASHED = {
@@ -134,6 +153,15 @@ const DETAIL = {
     turn('tf2', '跑挂了的那一轮', { status: 'error', error: 'KeyError: 查询超时，数据库没有在 30 秒内返回', graph: GRAPH, run_id: 'run-failed' }),
     // 人工驳回：原样接着跑只会再被驳回一次（lib/explain 的 continuable=false），不给「接着跑」
     turn('tf5', '被人驳回的那一轮', { status: 'error', error: '人工驳回：数字对不上', graph: GRAPH, run_id: 'run-rejected' }),
+    // 当时就拆好、落进 meta 的运行失败（带着原话 source，没记 fix 的老写法）：流里照这份画，
+    // 不拿原话再讲一遍；直达入口按原话认出来（401 → 去模型接入）
+    turn('tf6', '密钥失效的那一轮', {
+      status: 'error', error: '当时记下的标题：这把密钥被拒了', graph: GRAPH, run_id: 'run-auth',
+      meta: { v: 1, runId: 'run-auth', runStatus: 'failed', failure: {
+        title: '当时记下的标题：这把密钥被拒了', reason: '当时记下的原因：对方回了 401。',
+        hint: '当时记下的怎么办：换一把密钥再来。', continuable: false,
+        source: 'AuthenticationError: Error code: 401 - invalid x-api-key' } },
+    }),
     // 没有运行、没有图，却有答案：reply，没查库。老数据没有 meta，靠推断
     turn('tf3', '上一轮的数字是多少', { answer: '上一轮查到的是 42。' }),
     // 复核判为不可用，原因是步数用满
@@ -232,11 +260,14 @@ const DETAIL = {
     }),
   ],
   c0trash4: [turn('tz1', '删掉之后还在跑的问题', { status: 'running', graph: GRAPH, run_id: 'run-trash-live', created_at: iso(10) })],
+  // 要改的是工具库里的参数定义，不在这一轮的流程里：先去改，再接着跑（没记 fix 的老写法，按原话认）
+  c0fixy: [turn('ty1', '查一下订单状态', { status: 'error', error: BROKEN_TOOL, graph: GRAPH, run_id: 'run-badtool' })],
 }
 const RUNS = {
   'run-cancelled': { status: 'cancelled', output: {}, error: null },
   'run-failed': { status: 'failed', output: {}, error: '查询超时' },
   'run-rejected': { status: 'failed', output: {}, error: '人工驳回：数字对不上' },
+  'run-auth': { status: 'failed', output: {}, error: 'AuthenticationError: Error code: 401 - invalid x-api-key' },
   'run-broken': { status: 'succeeded', output: { answer: '只查了一半的结论' }, error: null },
   'run-late': { status: 'succeeded', output: { answer: '补交付的答案：三条记录。' }, error: null,
                 started_at: iso(60 * 24 * 3 - 1), finished_at: iso(60 * 24 * 3 - 1.5) },
@@ -244,11 +275,14 @@ const RUNS = {
   'run-t-failed': { status: 'failed', output: {}, error: '鉴权没通过（401）：对方拒绝了这把密钥' },
   'run-multi': { status: 'succeeded', output: { answer: FULL, note: '附注：另一个成果键' }, error: null },
   'run-trash-live': { status: 'running', output: {}, error: null },
+  'run-badtool': { status: 'failed', output: {}, error: BROKEN_TOOL },
 }
 const SOURCES = [
   { id: 'ds-mig', name: 'shop', kind: 'mysql', description: '' },
   { id: 'ds-plant', name: 'factory', kind: 'oracle', description: '示例工厂库：采购、物料、生产、设备' },
 ]
+/** 别处（另一个标签页、别人）刚加上的库：只有重新取列表才看得到 */
+const EXTRA_SOURCE = { id: 'ds-new', name: 'warehouse', kind: 'postgres', description: '' }
 const TABLES = {
   'ds-mig': ['__prisma_migrations', 'schema_migrations', 'admin_audit_log', 'app_log', 'test_sales', 'user', 'orders'],
   'ds-plant': ['ANALYTICS.test_sales', 'ANALYTICS.job_etl_audit', 'ANALYTICS.v_demo_table'],
@@ -258,7 +292,7 @@ const TABLES = {
 
 const log = {
   patches: [], cancels: [], continues: [], runStarts: [], archived: [], posts: [], approvalGets: [], runGets: [],
-  deleted: [], gens: [],
+  deleted: [], gens: [], sourceGets: 0,
 }
 const ctl = {
   slowMs: 0, failE: true, wsClosed: {}, approvals: [], thinkGo: false, writingGo: false, writingAt: 0,
@@ -268,6 +302,8 @@ const ctl = {
   trashMore: false,
   /** 数据源列表取不回来 */
   sourcesFail: false,
+  /** 数据源列表里多一个别处刚加的库 */
+  extraSource: false,
 }
 /** 会话的归档 / 删除状态。各段各自 resetDb，免得上一段删掉的会话影响下一段 */
 const db = { archived: new Set(), purged: new Set() }
@@ -331,7 +367,10 @@ async function fakeApi(route) {
     const b = body()
     log.gens.push(b)
     if (ctl.scope400 && b.datasource_ids?.length) {
-      return json({ detail: '限定的数据源都不在了：可能已经被删掉或停用。去掉限定再问，或者到「数据」页确认它还在、而且是启用的' }, 400)
+      // 和后端 copilot._sources 同一个形状：detail 是一句话，code 是稳定的机读码
+      // reworded：后端换了说法，只剩机读码认得出来
+      return json({ detail: ctl.scope400 === 'reworded' ? '这一轮圈定的库一个也找不到了：可能已经被删掉或停用'
+        : '限定的数据源都不在了：可能已经被删掉或停用。去掉限定再问，或者到「数据」页确认它还在、而且是启用的', code: 'datasource_scope_empty' }, 400)
     }
     if (String(b.instruction ?? '').includes('建流程就失败')) {
       // 后端的 error 操作是三段：人话、怎么办、原始异常
@@ -404,7 +443,9 @@ async function fakeApi(route) {
       ev(3, 'node.finished', 'ag', { duration_ms: 700 }), ev(4, 'run.finished', null, { output: {} })])
   }
   if (path === '/datasources' && method === 'GET') {
-    return ctl.sourcesFail ? json({ detail: '数据源列表暂时取不到' }, 500) : json(SOURCES)
+    log.sourceGets++
+    return ctl.sourcesFail ? json({ detail: '数据源列表暂时取不到' }, 500)
+      : json(ctl.extraSource ? [...SOURCES, EXTRA_SOURCE] : SOURCES)
   }
   m = path.match(/^\/datasources\/([^/]+)\/schema$/)
   if (m) return json({ tables: TABLES[m[1]] ?? [] })
@@ -547,10 +588,12 @@ const browser = await chromium.launch({ executablePath: CHROME })
 
 async function open(theme = 'light', { width = 1440, height = 900, reducedMotion = 'no-preference' } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, reducedMotion })
+  opened.add(ctx)
   await ctx.addInitScript((t) => localStorage.setItem('agentlab.theme', t), theme)
   const page = await ctx.newPage()
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
+  watchLoad(page)
   await page.route('**/api/settings', async (route) => {
     if (route.request().method() !== 'GET') return route.abort()
     // 主题以设置为准（沙箱里存的是 light），这里按要看的那套改掉
@@ -561,9 +604,43 @@ async function open(theme = 'light', { width = 1440, height = 900, reducedMotion
   return { page, ctx, errors }
 }
 
+/** 记下页面加载时出的岔子（页面报错、模块没取到），等不到 store 时拿来说清卡在哪 */
+const loadTrouble = new WeakMap()
+function watchLoad(page) {
+  const list = []
+  loadTrouble.set(page, list)
+  const isModule = (url) => /^\/(src|node_modules|@vite|@id|@fs)\//.test(new URL(url).pathname)
+  page.on('pageerror', (e) => list.push(`页面报错「${e.message.split('\n')[0]}」`))
+  page.on('requestfailed', (r) => { if (isModule(r.url())) list.push(`模块没取到 ${new URL(r.url()).pathname}`) })
+  page.on('response', (r) => { if (r.status() >= 400 && isModule(r.url())) list.push(`模块 ${r.status()} ${new URL(r.url()).pathname}`) })
+}
+/**
+ * 等页面把 store 挂到 window 上。main → App → store 全是静态 import，load 之前就求值完了
+ * （实测单跑、四个检查并行跑，load 那一刻都已挂出），所以等不到不是「慢」，是模块图断了
+ * 或页面卡死。只有「模块没取到」（开发服务器那一下没答上）重载一次，并打一行出来；
+ * 页面报错、vite 报错层、主线程卡死是真问题，说清卡在哪，不只留一句 Timeout
+ */
+async function ready(page, fn, what, { arg = null, timeout = 15000, retry = true } = {}) {
+  if (await page.waitForFunction(fn, arg, { timeout }).then(() => true, () => false)) return
+  const trouble = loadTrouble.get(page) ?? []
+  if (retry && trouble.length && trouble.every((t) => t.startsWith('模块'))) {
+    console.log(`  · ${what} 没挂出来（${trouble.slice(0, 2).join('；')}），重载一次`)
+    trouble.length = 0
+    await page.reload()
+    return ready(page, fn, what, { arg, timeout, retry: false })
+  }
+  const probe = page.evaluate(() => {
+    const overlay = document.querySelector('vite-error-overlay')
+    if (overlay) return `vite 报错层「${(overlay.shadowRoot?.querySelector('.message')?.textContent ?? '').trim().slice(0, 120)}」`
+    return `页面停在 ${location.pathname}，#root 下 ${document.getElementById('root')?.childElementCount ?? 0} 个元素`
+  }).catch((e) => `读不到页面：${String(e.message).split('\n')[0]}`)
+  const hung = new Promise((r) => setTimeout(() => r('页面主线程 3 秒没有响应'), 3000))
+  const where = await Promise.race([probe, hung])
+  throw new Error(`${what} ${timeout / 1000} 秒没挂出来：${[where, ...trouble.slice(0, 3)].join('；')}`)
+}
 const goto = async (page, id) => {
   await page.goto(`${WEB}/chat/${id}`)
-  await page.waitForFunction(() => !!window.__chat, null, { timeout: 15000 })
+  await ready(page, () => !!window.__chat, '问数据页的 store（window.__chat）')
 }
 const shows = (page, text, timeout = 6000) =>
   page.getByText(text).first().waitFor({ timeout }).then(() => true, () => false)
@@ -583,7 +660,7 @@ const send = async (page, q) => {
 for (const theme of THEMES) {
   console.log(`\n######## ${theme} ########`)
 
-  if (section('hero', '首屏：输入框是主角，例句不拿系统表造句')) {
+  await section('hero', '首屏：输入框是主角，例句不拿系统表造句', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0emptg')
     check('空会话显示首屏', await shows(page, '问你的数据'))
@@ -605,13 +682,13 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/hero-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('states', '三种状态：加载中 / 加载失败 / 空')) {
+  await section('states', '三种状态：加载中 / 加载失败 / 空', async () => {
     const { page, ctx, errors } = await open(theme)
     ctl.slowMs = 2500
     await page.goto(`${WEB}/chat/c0slowd`)
-    await page.waitForFunction(() => !!window.__chat, null, { timeout: 15000 })
+    await ready(page, () => !!window.__chat, '问数据页的 store（window.__chat）')
     await page.waitForTimeout(600)
     check('取历史时画骨架', await page.locator('[aria-busy="true"]').count() > 0)
     check('取历史时不显示首屏', !(await page.getByText('问你的数据').count()))
@@ -642,9 +719,9 @@ for (const theme of THEMES) {
     check('落到一个真实的对话', await page.waitForURL(/\/chat\/c0[a-z]+$/, { timeout: 5000 }).then(() => !page.url().endsWith('c0gone'), () => false), page.url())
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('layout', '布局：长会话里输入框和发送键完整可见（1440×900，另看 1024×700）')) {
+  await section('layout', '布局：长会话里输入框和发送键完整可见（1440×900，另看 1024×700）', async () => {
     for (const [width, height] of [[1440, 900], [1024, 700]]) {
       const { page, ctx } = await open(theme, { width, height })
       await goto(page, 'c0longc')
@@ -663,9 +740,9 @@ for (const theme of THEMES) {
       await page.screenshot({ path: `${SHOTS}/long-${width}-${theme}.png` })
       await ctx.close()
     }
-  }
+  })
 
-  if (section('busy', '忙不忙按会话算')) {
+  await section('busy', '忙不忙按会话算', async () => {
     const { page, ctx, errors } = await open(theme)
     const cancelsBefore = log.cancels.length
     await goto(page, 'c0busya')
@@ -709,9 +786,9 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/cancelled-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('truncated', '长答案：事件里截断了，用 GET 运行的完整版')) {
+  await section('truncated', '长答案：事件里截断了，用 GET 运行的完整版', async () => {
     const { page, ctx, errors } = await open(theme)
     const patchesBefore = log.patches.length
     await goto(page, 'c0trunc')
@@ -740,9 +817,9 @@ for (const theme of THEMES) {
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('restart', '服务重启：interrupted 且没有待审批，收尾而不是转圈')) {
+  await section('restart', '服务重启：interrupted 且没有待审批，收尾而不是转圈', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0resti')
     await send(page, '跑到一半服务重启')
@@ -778,9 +855,9 @@ for (const theme of THEMES) {
     check('强杀之后同样给「接着跑」', await page.getByRole('button', { name: '接着跑' }).count() === 1)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('resume', '隔了几天再接着跑：计时接着上次的走')) {
+  await section('resume', '隔了几天再接着跑：计时接着上次的走', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0suspo')
     check('从库里恢复的中断轮次认成中断', await shows(page, '服务重启，这一轮中断了'))
@@ -794,9 +871,9 @@ for (const theme of THEMES) {
     await page.getByRole('button', { name: '停止这一轮' }).click()
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('history', '历史：已取消、续跑被拒、没查库、放宽步数')) {
+  await section('history', '历史：已取消、续跑被拒、没查库、放宽步数', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0histf')
     await shows(page, '步数用满的那一轮')
@@ -818,6 +895,15 @@ for (const theme of THEMES) {
     check('人驳回的失败：不给「接着跑」（原样续上只会再被驳回）', await rejected.count() === 1
       && !(await rejected.getByRole('button', { name: '接着跑' }).count()), (await rejected.innerText().catch(() => '')).replace(/\n/g, ' / '))
     check('没查库的老答案标出来了', await shows(page, '这一条没有查库'))
+    // 流里的报错照 store 拆好的那份画（3C REQ-12）：以前交的是原话，流拿它再讲一遍，当时记下的
+    // 标题、原因、怎么办全被换掉
+    const authErr = page.locator('[data-turn="tf6"] [data-turn-error]')
+    const authText = (await authErr.innerText().catch(() => '')).replace(/\n/g, ' / ')
+    check('落库的失败照原样画：标题、原因、怎么办都是当时记下的那份，只出现一次',
+      authText.startsWith('当时记下的标题：这把密钥被拒了') && authText.includes('当时记下的原因')
+        && authText.includes('当时记下的怎么办') && authText.split('当时记下的标题').length === 2, authText.slice(0, 120))
+    check('老失败没记 fix：按原话认出该去模型接入，给直达入口',
+      await authErr.locator('a[data-fix="settings"][href="/settings/providers"]').count() === 1)
     const stepBtn = page.getByRole('button', { name: /放宽步数重跑（12 → 24 步）/ })
     check('步数用满给出「放宽步数重跑」并写明目标值', await stepBtn.count() === 1)
 
@@ -841,9 +927,38 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/retried-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('build', '建流程就失败：说人话、原文收进技术细节、给补救')) {
+  await section('fixfirst', '要改的东西在工具库里：先去改参数定义，「接着跑」退成次要', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0fixy')
+    const card = page.locator('[data-remedy="failed"]')
+    await card.waitFor({ timeout: 6000 }).catch(() => {})
+    const fix = card.locator('[data-remedy-fix="tools"]')
+    const go = card.getByRole('button', { name: '接着跑' })
+    check('主按钮是「去改参数定义」，直达那个工具的编辑框',
+      (await fix.innerText().catch(() => '')).includes('去改参数定义')
+        && /\bbtn-primary\b/.test(await fix.getAttribute('class').catch(() => '') ?? '')
+        && await fix.getAttribute('href').catch(() => null) === '/tools/custom?edit=lookup_order',
+      await fix.getAttribute('href').catch(() => '没有这个按钮') ?? '')
+    check('「接着跑」还在，但不是实心的，排在去改的后面',
+      await go.count() === 1 && !/\bbtn-primary\b/.test(await go.getAttribute('class').catch(() => '') ?? '')
+        && await page.evaluate(() => {
+          const c = document.querySelector('[data-remedy="failed"]')
+          const f = c?.querySelector('[data-remedy-fix]')
+          const g = [...(c?.querySelectorAll('button') ?? [])].find((b) => b.textContent?.includes('接着跑'))
+          return !!f && !!g && !!(f.compareDocumentPosition(g) & Node.DOCUMENT_POSITION_FOLLOWING)
+        }))
+    check('没有别的实心按钮抢主位', await card.locator('.btn-primary').count() === 1)
+    const streamFix = page.locator('[data-turn="ty1"] [data-turn-error] a[data-fix="tools"]')
+    check('流里的报错也直达那个工具', await streamFix.getAttribute('href').catch(() => null) === '/tools/custom?edit=lookup_order'
+      && (await streamFix.innerText().catch(() => '')).includes('去改参数定义'))
+    await page.screenshot({ path: `${SHOTS}/fixfirst-${theme}.png` })
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('build', '建流程就失败：说人话、原文收进技术细节、给补救', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0buildj')
     await send(page, '一个建流程就失败的问题')
@@ -865,9 +980,9 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/build-failed-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('approval', '停在审批上：审批卡立刻出现，不等 4 秒轮询')) {
+  await section('approval', '停在审批上：审批卡立刻出现，不等 4 秒轮询', async () => {
     const { page, ctx, errors } = await open(theme)
     ctl.approvals = []
     ctl.pendingApproval = {
@@ -892,9 +1007,9 @@ for (const theme of THEMES) {
     ctl.approvals = []
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('steps', '历史轮次的执行过程：点开、收起')) {
+  await section('steps', '历史轮次的执行过程：点开、收起', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0idleb')
     await shows(page, 'B 的答案')
@@ -907,9 +1022,9 @@ for (const theme of THEMES) {
     check('收起之后按钮回到「看执行过程」', await page.getByRole('button', { name: '看执行过程' }).count() === 1)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('writing', '模型出字：只给计数和思考的最后一句，不进 events')) {
+  await section('writing', '模型出字：只给计数和思考的最后一句，不进 events', async () => {
     for (const reducedMotion of ['no-preference', 'reduce']) {
       const { page, ctx, errors } = await open(theme, { reducedMotion })
       ctl.thinkGo = ctl.writingGo = false
@@ -950,9 +1065,9 @@ for (const theme of THEMES) {
       check('没有运行时报错', errors.length === 0, errors[0] ?? '')
       await ctx.close()
     }
-  }
+  })
 
-  if (section('meta', '可信度信息刷新之后还在')) {
+  await section('meta', '可信度信息刷新之后还在', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0metam')
     await shows(page, '一线 96.2%')
@@ -966,9 +1081,9 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/meta-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('list', '会话列表：分组、相对时间、完整标题、筛选、没打开过的也标状态')) {
+  await section('list', '会话列表：分组、相对时间、完整标题、筛选、没打开过的也标状态', async () => {
     resetDb()
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0idleb')
@@ -1003,9 +1118,9 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/list-status-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('filter', '筛选框：有筛选词时不跟着列表变短一起消失')) {
+  await section('filter', '筛选框：有筛选词时不跟着列表变短一起消失', async () => {
     resetDb()
     ctl.few = true
     const { page, ctx, errors } = await open(theme)
@@ -1036,9 +1151,9 @@ for (const theme of THEMES) {
     ctl.few = false
     resetDb()
     await ctx.close()
-  }
+  })
 
-  if (section('delete', '删除：先进回收站，可以撤销')) {
+  await section('delete', '删除：先进回收站，可以撤销', async () => {
     resetDb()
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0idleb')
@@ -1068,9 +1183,9 @@ for (const theme of THEMES) {
       && await page.locator('aside[aria-label="对话列表"]').getByText('会话 B').count() > 0)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('trash', '回收站：预览、恢复、彻底删除（要确认）')) {
+  await section('trash', '回收站：预览、恢复、彻底删除（要确认）', async () => {
     resetDb()
     const deletedBefore = log.deleted.length
     const { page, ctx, errors } = await open(theme)
@@ -1120,9 +1235,9 @@ for (const theme of THEMES) {
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     resetDb()
     await ctx.close()
-  }
+  })
 
-  if (section('readonly', '回收站里只能看：不发起运行，正在跑的不给彻底删除')) {
+  await section('readonly', '回收站里只能看：不发起运行，正在跑的不给彻底删除', async () => {
     resetDb()
     ctl.trashMore = true
     ctl.approvals = [{ id: 'ap-bin', run_id: 'run-trash-wait', node_id: 'ag', mode: 'approve', title: '确认一下再查',
@@ -1224,9 +1339,9 @@ for (const theme of THEMES) {
     ctl.approvals = []
     resetDb()
     await ctx.close()
-  }
+  })
 
-  if (section('recheck', '恢复的半路轮次：核对撞上 500 有出路、补交付不计实时、终态落库')) {
+  await section('recheck', '恢复的半路轮次：核对撞上 500 有出路、补交付不计实时、终态落库', async () => {
     const { page, ctx, errors } = await open(theme)
     ctl.run500 = true
     await goto(page, 'c0unkp')
@@ -1283,9 +1398,9 @@ for (const theme of THEMES) {
     ctl.approvals = []
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('clipped', '长答案没取全：记进 meta、刷新后补全，2000 字按码点数')) {
+  await section('clipped', '长答案没取全：记进 meta、刷新后补全，2000 字按码点数', async () => {
     const { page, ctx, errors } = await open(theme)
     const patchesBefore = log.patches.length
     await goto(page, 'c0clips')
@@ -1315,9 +1430,9 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/clipped-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('launch', '发起运行失败：报错分得清标题和原因，补救说真话')) {
+  await section('launch', '发起运行失败：报错分得清标题和原因，补救说真话', async () => {
     const { page, ctx, errors } = await open(theme)
     ctl.launchFail = true
     await goto(page, 'c0launu')
@@ -1343,9 +1458,9 @@ for (const theme of THEMES) {
     ctl.launchFail = true
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('rerun', '重跑服务重启挂起的那一轮：旧运行顺手取消')) {
+  await section('rerun', '重跑服务重启挂起的那一轮：旧运行顺手取消', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0suspo')
     await shows(page, '服务重启，这一轮中断了')
@@ -1359,9 +1474,9 @@ for (const theme of THEMES) {
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('stale', '断在建图阶段：按最后一次落库算有没有动静；发起运行时 meta 跟上新运行')) {
+  await section('stale', '断在建图阶段：按最后一次落库算有没有动静；发起运行时 meta 跟上新运行', async () => {
     const { page, ctx, errors } = await open(theme)
     const patchesBefore = log.patches.length
     await goto(page, 'c0buildx')
@@ -1391,9 +1506,9 @@ for (const theme of THEMES) {
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('scope', '限定数据源：点一下只查这个库')) {
+  await section('scope', '限定数据源：点一下只查这个库', async () => {
     const { page, ctx, errors } = await open(theme)
     await goto(page, 'c0emptg')
     await shows(page, '问你的数据')
@@ -1432,13 +1547,21 @@ for (const theme of THEMES) {
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     await page.waitForTimeout(200)
 
+    // 认的是机读码，不是那句话的开头：后端换了说法，补救照样是放开范围（3C REQ-20）
+    ctl.scope400 = 'reworded'
+    await send(page, '限定的库换了说法')
+    await shows(page, '这一轮圈定的库一个也找不到了')
+    check('换了说法的 400：凭机读码认出来，补救是「不限数据源重试」',
+      await page.locator('[data-remedy="failed"]').last().getByRole('button', { name: '不限数据源重试' }).count() === 1)
+    await page.waitForTimeout(200)
+
     // 限定的库被删了、停用了：后端 400，把原因原样说出来
     ctl.scope400 = true
     await send(page, '限定的库已经不在了')
     check('库不在了：说清原因', await shows(page, '限定的数据源都不在了'))
     await page.screenshot({ path: `${SHOTS}/scope-400-${theme}.png` })
     // 带着原范围的「重试这一轮」只会再撞一次 400：补救得是放开范围
-    const loose = page.locator('[data-remedy="failed"]').getByRole('button', { name: '不限数据源重试' })
+    const loose = page.locator('[data-remedy="failed"]').last().getByRole('button', { name: '不限数据源重试' })
     check('库不在了：补救是「不限数据源重试」', await loose.count() === 1)
     const before3 = log.gens.length
     await loose.click().catch(() => {})
@@ -1478,9 +1601,87 @@ for (const theme of THEMES) {
     ctl.sourcesFail = false
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 
-  if (section('composer', '画布助手：「在现有图上改 | 从头生成」分段控件')) {
+  await section('opencanvas', '在画布里打开：画布有没保存的改动时，先问再建，整条路只问一遍', async () => {
+    const { page, ctx, errors } = await open(theme)
+    const creates = []
+    await page.route(/\/api\/workflows(\?.*)?$/, (route) => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      creates.push(route.request().postDataJSON())
+      return route.fulfill({ status: 201, json: { id: 'wf-chat-open', name: '问数据：B 的问题', description: '', graph: GRAPH,
+        tags: [], version: 1, is_template: false, status: 'draft', published_version: null, published_by: null, run_count: 0,
+        created_at: iso(0), updated_at: iso(0) } })
+    })
+    await page.route(/\/api\/workflows\/wf-chat-open(\/.*)?(\?.*)?$/, (route) => {
+      if (route.request().method() !== 'GET') return route.abort()
+      const url = new URL(route.request().url())
+      if (url.pathname.endsWith('/versions')) return route.fulfill({ json: [] })
+      return route.fulfill({ json: { id: 'wf-chat-open', name: '问数据：B 的问题', description: '', graph: GRAPH, tags: [], version: 1,
+        is_template: false, status: 'draft', published_version: null, published_by: null, run_count: 0,
+        created_at: iso(0), updated_at: iso(0) } })
+    })
+    await goto(page, 'c0idleb')
+    await shows(page, 'B 的答案')
+    // 画布（store 里的那张）有没保存的改动：离开编排页它也还在
+    await page.evaluate(() => window.__studio.setState({ dirty: true,
+      workflow: { ...(window.__studio.getState().workflow ?? {}), id: 'wf-dirty', name: '没存的那张' } }))
+    await page.evaluate(() => {
+      window.__asks = 0
+      new MutationObserver(() => {
+        const d = [...document.querySelectorAll('[role=dialog]')].some((e) => e.textContent?.includes('未保存的改动'))
+        if (d && !window.__askOpen) window.__asks += 1
+        window.__askOpen = d
+      }).observe(document.body, { childList: true, subtree: true })
+    })
+    const openBtn = page.getByRole('button', { name: '在画布里打开' }).first()
+    const ask = page.getByRole('dialog').filter({ hasText: '未保存的改动' })
+    await openBtn.click()
+    const asked = await ask.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    check('先问要不要放弃画布上的改动，还没建工作流', asked && creates.length === 0, `${asked ? '问了' : '没问'} · 建了 ${creates.length} 个`)
+    await ask.getByRole('button', { name: '取消' }).click().catch(() => {})
+    await page.waitForTimeout(300)
+    check('说了取消：不建，留在问数据页', creates.length === 0 && new URL(page.url()).pathname.startsWith('/chat'))
+    await openBtn.click()
+    await ask.waitFor({ timeout: 3000 }).catch(() => {})
+    await ask.getByRole('button', { name: '放弃并切换' }).click().catch(() => {})
+    await page.waitForURL((u) => u.pathname === '/studio/wf-chat-open', { timeout: 6000 }).catch(() => {})
+    await page.waitForTimeout(400)
+    const asks = await page.evaluate(() => window.__asks)
+    check('说了放弃：建一个、跳过去，整条路只问这一遍', creates.length === 1 && asks === 2
+      && new URL(page.url()).pathname === '/studio/wf-chat-open', `建了 ${creates.length} 个 · 一共问了 ${asks} 遍（取消那次算一遍）`)
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('fresh', '数据源列表：旧了就在进页面时重取，别处加的库不用整页刷新', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    await page.locator('[data-scope-chip="ds-plant"]').waitFor({ timeout: 5000 }).catch(() => {})
+    check('先看到的是启动时取回来的两个库', await page.locator('[data-scope-chip]').count() === 2)
+    // 别处加了一个库；这一页的列表已经是半分钟以前的了
+    ctl.extraSource = true
+    await page.evaluate(async () => {
+      const url = performance.getEntriesByType('resource').map((e) => e.name).find((n) => n.includes('/src/store/catalog.ts'))
+      const { useCatalog } = await import(url ?? '/src/store/catalog.ts')
+      useCatalog.setState((s) => ({ loadedAt: { ...s.loadedAt, datasources: Date.now() - 120_000 } }))
+    })
+    const getsBefore = log.sourceGets
+    // 站内跳走再回来：页面重新挂载，不整页刷新
+    await page.locator('nav[aria-label="主导航"] a[href="/runs"]').click()
+    await page.waitForURL((u) => u.pathname.startsWith('/runs'), { timeout: 5000 }).catch(() => {})
+    await page.locator('nav[aria-label="主导航"] a[href^="/chat"]').first().click()
+    await page.waitForURL((u) => u.pathname.startsWith('/chat'), { timeout: 5000 }).catch(() => {})
+    check('回到问数据页：重新取了一次库列表', await until(() => log.sourceGets > getsBefore, 5000),
+      `${log.sourceGets - getsBefore} 次`)
+    check('别处刚加的库出现在首屏的标签里', await page.locator('[data-scope-chip="ds-new"]').waitFor({ timeout: 5000 })
+      .then(() => true, () => false))
+    ctl.extraSource = false
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('composer', '画布助手：「在现有工作流上改 | 从头生成」分段控件', async () => {
     const { page, ctx, errors } = await open(theme)
     const WF = {
       id: 'wf-chat-check', name: '__chat_check_composer__', description: '检查脚本伪造的工作流', graph: GRAPH,
@@ -1496,13 +1697,13 @@ for (const theme of THEMES) {
       return route.fulfill({ json: WF })
     })
     await page.goto(`${WEB}/studio/wf-chat-check`)
-    await page.waitForFunction(() => window.__studio?.getState().workflow?.id === 'wf-chat-check', null, { timeout: 15000 })
+    await ready(page, () => window.__studio?.getState().workflow?.id === 'wf-chat-check', '画布上伪造的工作流（window.__studio）')
       .catch(() => {})
     const group = page.getByRole('radiogroup', { name: '生成方式' })
     check('有「生成方式」分段控件', await group.waitFor({ timeout: 6000 }).then(() => true, () => false))
-    const base = group.getByRole('radio', { name: '在现有图上改' })
+    const base = group.getByRole('radio', { name: '在现有工作流上改' })
     const fresh = group.getByRole('radio', { name: '从头生成' })
-    check('默认「在现有图上改」', (await base.getAttribute('aria-checked')) === 'true'
+    check('默认「在现有工作流上改」', (await base.getAttribute('aria-checked')) === 'true'
       && (await fresh.getAttribute('aria-checked')) === 'false')
     const size = await fresh.evaluate((el) => parseFloat(getComputedStyle(el).fontSize)).catch(() => 0)
     check('字不小于 11px', size >= 11, `${size}px`)
@@ -1513,7 +1714,7 @@ for (const theme of THEMES) {
     await page.waitForTimeout(300)   // 底色有过渡，等它换完再截
     await page.screenshot({ path: `${SHOTS}/composer-fresh-${theme}.png` })
     const gensBefore = log.gens.length
-    const box = page.getByRole('textbox', { name: '告诉助手要画什么流程' })
+    const box = page.getByRole('textbox', { name: '告诉助手要画什么工作流' })
     await box.fill('重新画一张三步的图')
     await box.press('Enter')
     await until(() => log.gens.length > gensBefore, 5000)
@@ -1523,7 +1724,7 @@ for (const theme of THEMES) {
     await box.fill('在最后加一步人工审批')
     await box.press('Enter')
     await until(() => log.gens.length > gensBefore + 1, 5000)
-    check('在现有图上改：带上现有的图', !!log.gens.at(-1)?.base_graph?.nodes?.length)
+    check('在现有工作流上改：带上现有的工作流', !!log.gens.at(-1)?.base_graph?.nodes?.length)
 
     // 助手出错：出错的那一轮自己有报错块（怎么办、原文都在），输入框上面不再重复一条
     await page.waitForFunction(() => !window.__studio.getState().copilot.active, null, { timeout: 8000 }).catch(() => {})
@@ -1541,7 +1742,7 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/composer-error-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
-  }
+  })
 }
 
 await browser.close()

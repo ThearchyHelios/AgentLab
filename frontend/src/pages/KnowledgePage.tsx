@@ -19,6 +19,7 @@ import {
   formatBytes, formatDateTime, formatDuration, formatNumber, formatRelative, formatTime, NONE, parseServerTime, shortId,
 } from '../lib/format'
 import { matchShortcut } from '../lib/keys'
+import { runName } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
 import type { KbDocument, MemoryItem, MemorySource, Skill } from '../types'
 import { UploadMeter } from './DataSourcesTab'
@@ -1007,11 +1008,10 @@ function KbSearch({ collection, info }: { collection: string; info: EmbeddingInf
 
 /**
  * 贡献条的两种颜色：分类色，只说「哪一路检索」，不表达状态（ok / warn / err /
- * accent 留给状态）。亮暗各一套，都过了色觉区分度和对表面的对比度检查；跟着
- * color-scheme 走，所以写成 light-dark()
+ * accent 留给状态）。取值在 index.css 的主题令牌里，亮暗各一套
  */
-const VIA_SEMANTIC = 'light-dark(#0a7ea4, #2b95c0)'
-const VIA_KEYWORD = 'light-dark(#c2447a, #d55181)'
+const VIA_SEMANTIC = 'var(--via-semantic)'
+const VIA_KEYWORD = 'var(--via-keyword)'
 
 function Swatch({ color }: { color: string }) {
   return <i aria-hidden className="inline-block h-2 w-2 shrink-0 rounded-[2px]" style={{ background: color }} />
@@ -1162,7 +1162,7 @@ function MemorySourceLine({ item }: { item: MemoryItem }) {
   if (src.kind === 'manual') return <span>手动添加</span>
   if (src.kind === 'playground') return <span>在工具库里写入</span>
   if (src.kind !== 'run' || !src.run_id) return <span>{src.kind}</span>
-  const bits = [src.node_label || src.node_id, src.workflow_name].filter(Boolean).join(' · ')
+  const bits = [src.node_label || src.node_id, src.workflow_name && runName(src)].filter(Boolean).join(' · ')
   const label = <>运行 <span className="mono">{shortId(src.run_id)}</span>{bits ? ` · ${bits}` : ''}</>
   return src.run_exists === false ? (
     <span title="写下它的那次运行已经删了">来源：{label}（运行已删除）</span>

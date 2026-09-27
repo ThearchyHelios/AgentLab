@@ -214,6 +214,19 @@ async def test_pending_approvals_carry_their_context_newest_first(client):
     assert a["resolved_by"] is None and a["resolved_at"] is None
 
 
+async def test_a_run_without_a_workflow_is_named_by_the_glossary(client):
+    # 画布没保存就跑、问数据当场搭的：以前记成「临时图」，运行和审批上原样露给人看。
+    # 术语表里「图」只在技术细节里出现，这里叫「未保存的工作流」
+    run_id = (await client.post("/api/runs", json={
+        "graph": GATED, "input": {"question": "q"}})).json()["id"]
+    await _wait(run_id, ("interrupted",))
+
+    assert (await client.get(f"/api/runs/{run_id}")).json()["workflow_name"] == "未保存的工作流"
+    [pending] = (await client.get("/api/approvals", params={"run_id": run_id})).json()
+    assert pending["workflow_id"] is None
+    assert pending["workflow_name"] == "未保存的工作流"
+
+
 async def test_resolution_records_who_signed_and_when(client):
     run_id = (await client.post("/api/runs", json={
         "graph": GATED, "input": {"question": "q"}})).json()["id"]

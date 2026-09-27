@@ -33,6 +33,54 @@ export function formatDuration(ms: number | null | undefined): string {
   return `${Math.floor(secs / 3600)} 小时 ${pad2(Math.floor((secs % 3600) / 60))} 分`
 }
 
+const DAY_MS = 86_400_000
+
+/**
+ * 耗时，能跨天。一天以内同 formatDuration；一天以上写「8 天 02 小时」——审批
+ * 挂了一周的运行，「192 小时 05 分」没人会去换算。coarse 只要最大的单位：
+ * 「已等 8 天」。记录页、时间轴、HUD、右栏共用这一份，同一段等待各处说法一致。
+ */
+export function formatSpan(ms: number | null | undefined, opts?: { coarse?: boolean }): string {
+  if (!isNum(ms) || ms < 0) return NONE
+  if (ms >= DAY_MS) {
+    const d = Math.floor(ms / DAY_MS)
+    const h = Math.floor((ms % DAY_MS) / 3_600_000)
+    return opts?.coarse || h === 0 ? `${d} 天` : `${d} 天 ${pad2(h)} 小时`
+  }
+  if (opts?.coarse) {
+    if (ms >= 3_600_000) return `${Math.floor(ms / 3_600_000)} 小时`
+    if (ms >= 60_000) return `${Math.floor(ms / 60_000)} 分钟`
+    return '不到 1 分钟'
+  }
+  return formatDuration(ms)
+}
+
+/**
+ * 一段时长的读数（已等、已跑、等人）。一小时以内是钟面「25:00.3」，和计时器同一种写法；
+ * 一小时以上换成 formatSpan 的「3 小时 05 分」「8 天 23 小时」——审批挂了九天，
+ * 「215:56:48.6」得自己除 24，而记录页同一段等待写的是「8 天 23 小时」。
+ * 画布卡片、胶囊、坞头、泳道、右栏的用量行都走这一份，同一刻写同一个数。
+ * tenth=false 去掉十分位：停下的读数、成员行这些地方十分位只会让一排数字一直在抖
+ */
+export function formatLapse(ms: number | null | undefined, tenth = true): string {
+  if (!isNum(ms) || ms < 0) return NONE
+  if (ms >= 3_600_000) return formatSpan(ms)
+  const clock = formatClock(ms)
+  return tenth ? clock : clock.replace(/\.\d$/, '')
+}
+
+/**
+ * 相对开始的时刻（不带「T+」）。一天以内是秒表读数「05:03.4」「3:05:03.4」；
+ * 过了一天写「9 天 00:38:26」：「216:38:26.2」得自己除 24，而同一行的墙钟、等人
+ * 写的是「9 天」。十分之一秒放不下了，隔了几天也没人要它
+ */
+export function formatOffset(ms: number | null | undefined): string {
+  if (!isNum(ms) || ms < 0) return NONE
+  if (ms < DAY_MS) return formatClock(ms)
+  const secs = Math.floor((ms % DAY_MS) / 1000)
+  return `${Math.floor(ms / DAY_MS)} 天 ${pad2(Math.floor(secs / 3600))}:${pad2(Math.floor(secs / 60) % 60)}:${pad2(secs % 60)}`
+}
+
 /**
  * 实时计时器：「01:14.3」，一小时以上「1:02:03.4」。固定位数，配 tabular-nums
  * 跳字时不抖。截断而不是四舍五入：计时器读数不该跑在真实时间前面。

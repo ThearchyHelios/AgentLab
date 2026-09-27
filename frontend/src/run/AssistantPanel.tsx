@@ -7,15 +7,18 @@ import {
 import clsx from 'clsx'
 import { useCatalog } from '../store/catalog'
 import { useStudio, type CopilotTurn } from '../store/studio'
+import { revealField, useSheet } from '../canvas/InspectorSheet'
+import { fieldOfIssue } from '../canvas/issues'
+import { splitShrunk } from '../canvas/copilotMerge'
 import { confirmDialog, IconButton, StatusBadge, toast } from '../components/ui'
-import { formatClock, formatCost, formatDuration, formatTokens, shortId, NONE } from '../lib/format'
+import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortId, NONE } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { runClassLabel } from '../lib/terms'
 import type { ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import {
-  copilotOutcome, decodeCopilot, decodeRun, SELF_CHECK_ROUNDS, type CopilotIssue,
+  copilotOutcome, decodeCopilot, decodeRun, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
 } from './decode'
 import { ApprovalCard } from './RunPanel'
 import { useRunGlance } from './RunHud'
@@ -45,6 +48,9 @@ export function AssistantPanel() {
   const run = useStudio((s) => s.run)
   const [view, setView] = useState<'chat' | 'run'>('chat')
   const [reveal, setReveal] = useState<Reveal | null>(null)
+  // 请求办完就清掉（onRevealed），seq 不能跟着归零：运行层那头记着办过的 seq，归零后下一个
+  // 请求会撞上旧号被当成办过了
+  const seq = useRef(0)
   const rootRef = useRef<HTMLDivElement>(null)
 
   // 发起一次新运行就把这一层推到前面——那是此刻唯一在发生的事
@@ -53,30 +59,36 @@ export function AssistantPanel() {
     setReveal(null)
   }, [run?.id])
 
-  // 画布上的胶囊「去审批」、成果节点的出具印章要把人带到右栏的审批卡 / 出具横幅。右栏停在
-  // 对话层时那两样根本不在页面上，以前只能退回一句 toast——所以由右栏自己听、自己切过去，
-  // 并 preventDefault 告诉派发方「接手了」。右栏收起时它还挂着（只是藏起来），那时不接：
-  // 切过去也没人看得见，让派发方自己兜底
+  // 画布上的胶囊「去审批」、成果节点的出具印章、点一个跑过的节点，要把人带到右栏的审批卡 /
+  // 出具横幅 / 那个节点的步骤。右栏停在对话层时这些根本不在页面上，以前只能退回一句 toast
+  // 或者干脆没反应——所以由右栏自己听、自己切过去，并 preventDefault 告诉派发方「接手了」。
+  // 右栏收起时它还挂着（只是藏起来），那时不接：切过去也没人看得见，让派发方自己兜底
   useEffect(() => {
     const listen = (kind: Reveal['kind']) => (e: Event) => {
-      const runId = (e as CustomEvent<{ runId?: string }>).detail?.runId
+      const detail = (e as CustomEvent<{ runId?: string; nodeId?: string }>).detail
       const s = useStudio.getState()
       const root = rootRef.current
-      if (!s.run || (runId && runId !== s.run.id)) return
+      if (!s.run || (detail?.runId && detail.runId !== s.run.id)) return
+      if (kind === 'step' && !detail?.nodeId) return
       if (!root || !root.offsetWidth || getComputedStyle(root).visibility !== 'visible') return
       e.preventDefault()
-      // 属性面板盖在右栏上：先让开，要看的东西在它下面
-      s.select(null)
+      // 属性面板盖在右栏上：先让开，要看的东西在它下面。点跑过的节点来的只收起面板、
+      // 不清选中：画布上「…的配置」入口跟着选中走，派发方先选中再派发时清掉就没了
+      if (kind === 'step') useSheet.setState({ open: null })
+      else s.select(null)
       setView('run')
-      setReveal((r) => ({ kind, seq: (r?.seq ?? 0) + 1 }))
+      setReveal({ kind, seq: ++seq.current, ...(kind === 'step' ? { nodeId: detail!.nodeId } : {}) })
     }
     const approval = listen('approval')
     const issuance = listen('issuance')
+    const step = listen('step')
     window.addEventListener('agentlab:goto-approval', approval)
     window.addEventListener('agentlab:goto-issuance', issuance)
+    window.addEventListener('agentlab:reveal-step', step)
     return () => {
       window.removeEventListener('agentlab:goto-approval', approval)
       window.removeEventListener('agentlab:goto-issuance', issuance)
+      window.removeEventListener('agentlab:reveal-step', step)
     }
   }, [])
 
@@ -84,29 +96,31 @@ export function AssistantPanel() {
     // data-assistant-panel：画布上的出具印章据此判断「点了有人接」，右栏在对话层时它照样能点
     <div ref={rootRef} data-assistant-panel="" className="relative flex h-full min-h-0 flex-col">
       {view === 'run' && run
-        ? <RunView onBack={() => setView('chat')} reveal={reveal} />
+        ? <RunView onBack={() => setView('chat')} reveal={reveal} onRevealed={() => setReveal(null)} />
         : <ChatView hasRun={!!run} onOpenRun={() => setView('run')} />}
     </div>
   )
 }
 
-/** 别处请右栏摆到眼前的东西：审批卡、出具横幅。seq 让同一个请求连着来两次也会再做一遍 */
+/**
+ * 别处请右栏摆到眼前的东西：审批卡、出具横幅、某个节点最后一次执行的步骤。seq 让同一个
+ * 请求连着来两次也会再做一遍。办完就清掉：请求要是留着，回到对话层再点运行条打开运行层
+ * 时它会再办一遍——又滚走、又抢焦点、又描一次边
+ */
 interface Reveal {
-  kind: 'approval' | 'issuance'
+  kind: 'approval' | 'issuance' | 'step'
   seq: number
+  nodeId?: string
 }
 
 // -------------------------------------------------------------------------
 // 对话：和 Copilot 说话的地方
 // -------------------------------------------------------------------------
 
-/** 一轮开始的时刻：store 记了就用它，老轮次没有 */
-type TurnExtras = CopilotTurn & { startedAt?: number }
-
 const PHASE_TEXT: Record<string, string> = {
   connecting: '正在连接模型',
   planning: '正在理解需求、规划步骤',
-  building: '正在搭建流程',
+  building: '正在搭建工作流',
   wiring: '正在连接数据流',
   finalizing: '正在排版和校验',
   repairing: '正在按自查结果修正',
@@ -116,7 +130,10 @@ const PHASE_TEXT: Record<string, string> = {
  * 一轮 Copilot 的卡片标题。只看 phase 的话，只回了一句话、自查没修好、少放了
  * 一步，全都写「流程已更新到画布」——而这几种的下一步完全不同
  */
-function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repairing?: number }): StreamTurn {
+function copilotTurn(
+  t: CopilotTurn, live: { lastOp: string; phase: string; repairing?: number },
+  labelOf: (id: string) => string | undefined,
+): StreamTurn {
   const running = t.phase === 'running'
   const out = copilotOutcome(t.ops, running)
   const found = t.ops.find((o) => o.op === 'check' && o.status === 'repairing')
@@ -124,9 +141,10 @@ function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repai
   const reply = out.reply ?? t.reply
   const errorOp = out.error
   const unchanged = t.outcome === 'unchanged'
-  const steps = decodeCopilot(t.ops, { context: 'canvas', unchanged })
-  // 模型改提示词时漏写了 tools、把节点的工具抹掉了：图照样能跑，只是什么都查不到
-  const lost = out.toolChanges.filter((c) => c.removed.length)
+  const steps = decodeCopilot(t.ops, { context: 'canvas', unchanged, labelOf })
+  // 模型改提示词时漏写了 tools、把节点的工具抹掉了：图照样能跑，只是什么都查不到。
+  // 按要求删的不算：只有这一轮没让删的才在卡头上提醒
+  const { unasked } = toolLossOf(out)
   // 回执说清改了什么：「流程已更新」不说改了哪几处，改坏了都不知道从哪看起
   const d = t.diff
   const changed = d ? [
@@ -158,10 +176,14 @@ function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repai
         : `已放到画布，但还有 ${out.check.issues.length} 处问题要你处理`
       tone = 'warn'
     } else if (out.skipped.length) {
-      status = `已放到画布，但有 ${out.skipped.length} 步没放上`
+      // 模型只加了认不出类型的节点、全被跳过时画布一处没变：说「已放到画布」是在报一个没发生的改动
+      status = unchanged
+        ? `画布没有改动：有 ${out.skipped.length} 步没放上`
+        : `已放到画布，但有 ${out.skipped.length} 步没放上`
       tone = 'warn'
-    } else if (lost.length) {
-      status = `${updated} · ${lost.length} 处工具被去掉了`
+    } else if (unasked.length) {
+      // 360px 的卡头放不下长句：要紧的「没让删」放前面，逐项说明在下面的工具清单里
+      status = `${updated} · 没让删却少了 ${unasked.length} 处工具`
       tone = 'warn'
     } else if (unchanged) {
       // 收到了 final，但一处都没变：说「已更新画布」是在报一个没发生的改动
@@ -196,19 +218,28 @@ function copilotTurn(t: TurnExtras, live: { lastOp: string; phase: string; repai
   }
 }
 
+/** 这一轮变少了的工具，分「没让删」和「按要求」两组：和改图回执（toast）同一条规则 */
+const toolLossOf = (out: CopilotOutcome) =>
+  splitShrunk(out.toolChanges, out.dropped.map((w) => ({ node_id: w.nodeId, field: w.field })))
+
+/**
+ * 画布上的节点名。自查问题、「去掉了」这些行只带节点 id；不订阅 nodes（拖一帧就要重解码
+ * 整条对话），取的是解码那一刻的名字
+ */
+const canvasLabel = (id: string): string | undefined =>
+  useStudio.getState().nodes.find((n) => n.id === id)?.data.label || undefined
+
 function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => void }) {
-  const copilotTurns = useStudio((s) => s.copilotTurns) as TurnExtras[]
+  const copilotTurns = useStudio((s) => s.copilotTurns)
   const copilot = useStudio((s) => s.copilot)
   const retryCopilot = useStudio((s) => s.retryCopilot)
   const repairWithCopilot = useStudio((s) => s.repairWithCopilot)
   const undoCopilotTurn = useStudio((s) => s.undoCopilotTurn)
   const newCopilotConversation = useStudio((s) => s.newCopilotConversation)
   const memory = useStudio((s) => s.copilotMemory)
-  const focusNode = useStudio((s) => s.focusNode)
-  const select = useStudio((s) => s.select)
   const [showPast, setShowPast] = useState(false)
 
-  const turns = useMemo<StreamTurn[]>(() => copilotTurns.map((t) => copilotTurn(t, copilot)),
+  const turns = useMemo<StreamTurn[]>(() => copilotTurns.map((t) => copilotTurn(t, copilot, canvasLabel)),
     [copilotTurns, copilot])
   // 打开这张图之前就有的那几轮：模型下一条指令照样会带上它们。面板上一片空白、
   // 模型却记着之前的事，它引用「刚才那个团队」时用户无从理解
@@ -235,14 +266,26 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
 
   const empty = !copilotTurns.length && !earlier.length
 
-  const locate = (id: string) => { select(id); focusNode(id) }
+  /**
+   * 定位一条自查问题：和问题面板同一个落点、同一套推断（绑工具的问题落到工具选择器上）。
+   * 知道落在哪一项配置上（循环条件、第 2 个成员的工具）就打开检查器、翻到那一栏并把光标
+   * 放进去；落不到的只打开、取景
+   */
+  const locateIssue = (x: CopilotIssue) => {
+    if (!x.nodeId) return
+    const node = useStudio.getState().nodes.find((n) => n.id === x.nodeId)
+    const at = node ? fieldOfIssue({ level: 'error', node_id: x.nodeId, message: x.message, field: x.field }, node) : null
+    revealField(x.nodeId, at, { focus: !!at })
+  }
+  /** 被去掉的工具：光标落在那个节点（或成员）工具选择器的「添加」上，回车就能加回去 */
+  const locateTools = (c: ToolChange) => revealField(c.node_id, c.field, { focus: true })
 
-  /** 一轮之后的动作：定位问题节点、让 Copilot 再修、撤销这次生成、重试 */
+  /** 一轮之后的动作：定位问题节点、让助手再修、撤销这次生成、重试 */
   const actions = (turn: StreamTurn, i: number) => {
     if (i !== shown.length - 1 || turn.phase === 'running') return null
     const source = copilotTurns.find((t) => t.id === turn.id)
     if (!source) return null
-    const out = copilotOutcome(source.ops)
+    const out = copilotOutcome(source.ops, false, canvasLabel)
     if (turn.phase === 'error') {
       return (
         <button type="button" className="btn btn-xs" onClick={() => retryCopilot()}>
@@ -251,31 +294,34 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
       )
     }
     const issues = out.check?.status === 'failed' ? out.check.issues : []
-    const lost = out.toolChanges.filter((c) => c.removed.length)
-    const undo = source.outcome === 'applied' || (out.kind === 'built' && source.outcome !== 'reverted')
-    if (!issues.length && !out.skipped.length && !lost.length) {
+    const { unasked, asked } = toolLossOf(out)
+    // 画布一处没变（unchanged）就没有可撤的：给了按钮，撤掉的是这一轮之前的那一步
+    const undo = source.outcome === 'applied'
+      || (out.kind === 'built' && source.outcome !== 'reverted' && source.outcome !== 'unchanged')
+    if (!issues.length && !out.skipped.length && !unasked.length && !asked.length) {
       return undo ? (
         <button type="button" className="btn btn-xs btn-ghost" onClick={() => undoCopilotTurn(source.id)}>
           <Undo2 size={11} aria-hidden /> 撤销这次生成
         </button>
       ) : null
     }
-    // 只是工具被抹掉了：让 Copilot 再修不管用（自查是通过的），撤回这一轮才是一步到位的补救
+    // 只是工具被抹掉了：让助手再修不管用（自查是通过的），撤回这一轮才是一步到位的补救
     const repairable = issues.length > 0 || out.skipped.length > 0
     return (
       <div className="w-full space-y-1.5">
         {/* 没修好的问题直接摊开，不折叠：这是此刻唯一要做的事 */}
-        {issues.length > 0 && <IssueList issues={issues} onLocate={locate} />}
-        {lost.length > 0 && <ToolLossList changes={lost} onLocate={locate} />}
+        {issues.length > 0 && <IssueList issues={issues} onLocate={locateIssue} />}
+        {(unasked.length > 0 || asked.length > 0) && <ToolLossList unasked={unasked} asked={asked} onLocate={locateTools} />}
         <div className="flex flex-wrap items-center gap-1.5">
           {repairable && (
             <button type="button" className="btn btn-xs btn-primary"
                     onClick={() => repairWithCopilot(source.id)}>
-              <Wand2 size={11} aria-hidden /> {issues.length ? '让 Copilot 再修' : '让 Copilot 补上'}
+              <Wand2 size={11} aria-hidden /> {issues.length ? '让助手再修' : '让助手补上'}
             </button>
           )}
           {undo && (
-            <button type="button" className={clsx('btn btn-xs', repairable ? 'btn-ghost' : 'btn-primary')}
+            // 只有按要求删的：这一轮做的就是人要的，撤销退成次要
+            <button type="button" className={clsx('btn btn-xs', repairable || !unasked.length ? 'btn-ghost' : 'btn-primary')}
                     onClick={() => undoCopilotTurn(source.id)}>
               <Undo2 size={11} aria-hidden /> 撤销这次生成
             </button>
@@ -339,21 +385,22 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
   )
 }
 
-/** 自查没修好的问题，逐条带「定位」。问题落在哪个节点上认得出来才给 */
-function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (id: string) => void }) {
+/** 自查没修好的问题，逐条带「定位」。问题落在哪个节点上认得出来才给；写节点名，认不出才写 id */
+function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (x: CopilotIssue) => void }) {
   return (
-    <ul className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
+    <ul data-issue-list="" className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
         style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))',
                  background: 'var(--st-waiting-soft)' }}>
       {issues.map((x, i) => (
-        <li key={i} className="flex items-start gap-1.5">
-          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
-            {x.nodeId && <span className="mono text-dim">「{x.nodeId}」</span>}{x.message}
+        <li key={i} className="flex items-start gap-1.5" data-issue-node={x.nodeId} data-issue-field={x.field}>
+          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]" title={issueLine(x)}>
+            {x.nodeId && <span className={clsx('text-dim', !x.label && 'mono')}>「{x.label ?? x.nodeId}」</span>}{x.message}
           </span>
           {x.nodeId && (
             <button type="button"
                     className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
-                    onClick={() => onLocate(x.nodeId!)}>
+                    title={x.field ? '打开这个节点的设置，翻到出问题的那一项' : '在画布上定位这个节点'}
+                    onClick={() => onLocate(x)}>
               <Crosshair size={10} aria-hidden /> 定位
             </button>
           )}
@@ -365,31 +412,49 @@ function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (id
 
 /**
  * 这一轮被去掉的工具，逐个节点列出来：去掉了什么、还剩什么。「修改 1」说不出节点的
- * 查库工具被整个抹掉了，要到运行结果不对才会发现
+ * 查库工具被整个抹掉了，要到运行结果不对才会发现。分两组，和改图回执一样：这一轮没让删的
+ * 在前、提醒色；按要求删的另列一组、不催——混在一起，按要求删的也像是改漏了，要紧的那句被冲淡
  */
-function ToolLossList({ changes, onLocate }: { changes: ToolChange[]; onLocate: (id: string) => void }) {
+function ToolLossList({ unasked, asked, onLocate }: {
+  unasked: ToolChange[]; asked: ToolChange[]; onLocate: (c: ToolChange) => void
+}) {
+  const group = (kind: 'unasked' | 'asked', changes: ToolChange[]) => {
+    const warn = kind === 'unasked'
+    return (
+      <div data-tool-loss={kind} className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
+           style={warn ? { borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))', background: 'var(--st-waiting-soft)' }
+             : undefined}>
+        <div className={warn ? 'font-medium text-fg' : 'text-dim'}>
+          {warn ? '这一轮没让删，确认一下是不是改漏了：' : '按要求去掉的：'}
+        </div>
+        <ul className="space-y-0.5">
+          {changes.map((c) => (
+            <li key={`${c.node_id}|${c.member ?? ''}|${c.field}`} className="flex items-start gap-1.5">
+              <Wrench size={10} className="mt-[3px] shrink-0" style={{ color: warn ? 'var(--st-waiting)' : 'var(--text-faint)' }} aria-hidden />
+              <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                「{c.label}」{c.member ? `的成员「${c.member}」` : ''}去掉了{' '}
+                <span className="mono">{c.removed.join('、')}</span>
+                {c.after.length ? `，还剩 ${c.after.join('、')}` : '，现在一个工具都没有'}
+              </span>
+              {c.node_id && (
+                <button type="button"
+                        className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
+                        title="打开这个节点的设置，光标放在工具那一栏的「添加」上"
+                        onClick={() => onLocate(c)}>
+                  <Crosshair size={10} aria-hidden /> 定位
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+    )
+  }
   return (
-    <ul data-tool-changes="" className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
-        style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))',
-                 background: 'var(--st-waiting-soft)' }}>
-      {changes.map((c) => (
-        <li key={`${c.node_id}|${c.member ?? ''}`} className="flex items-start gap-1.5">
-          <Wrench size={10} className="mt-[3px] shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
-          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
-            「{c.label}」{c.member ? `的成员「${c.member}」` : ''}去掉了{' '}
-            <span className="mono">{c.removed.join('、')}</span>
-            {c.after.length ? `，还剩 ${c.after.join('、')}` : '，现在一个工具都没有'}
-          </span>
-          {c.node_id && (
-            <button type="button"
-                    className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
-                    onClick={() => onLocate(c.node_id)}>
-              <Crosshair size={10} aria-hidden /> 定位
-            </button>
-          )}
-        </li>
-      ))}
-    </ul>
+    <div data-tool-changes="" className="space-y-1">
+      {unasked.length > 0 && group('unasked', unasked)}
+      {asked.length > 0 && group('asked', asked)}
+    </div>
   )
 }
 
@@ -431,7 +496,8 @@ function RunStrip({ onClick }: { onClick: () => void }) {
         {waiting && <span style={{ color: 'var(--st-waiting)' }}> · 去处理</span>}
       </span>
       {ticking && (
-        <span className="mono tnum shrink-0" style={{ color: 'var(--st-running)' }}>{formatClock(g.elapsedMs)}</span>
+        // 从开始算的时刻，和画布上胶囊的读数同一种写法：跨天写「9 天 00:38:26」
+        <span className="mono tnum shrink-0" style={{ color: 'var(--st-running)' }}>{formatOffset(g.elapsedMs)}</span>
       )}
       <ChevronRight size={11} className="shrink-0 text-faint" aria-hidden />
     </button>
@@ -447,7 +513,9 @@ const STREAM_PHASE: Record<RunPhase, StreamTurn['phase']> = {
   succeeded: 'done', failed: 'error', cancelled: 'done', suspended: 'done',
 }
 
-function RunView({ onBack, reveal }: { onBack: () => void; reveal: Reveal | null }) {
+function RunView({ onBack, reveal, onRevealed }: {
+  onBack: () => void; reveal: Reveal | null; onRevealed: () => void
+}) {
   const run = useStudio((s) => s.run)!
   const events = useStudio((s) => s.events)
   const phase = useStudio((s) => s.runPhase)
@@ -566,17 +634,22 @@ function RunView({ onBack, reveal }: { onBack: () => void; reveal: Reveal | null
 
   // 别处请这一层把审批卡 / 出具横幅摆到眼前（胶囊的「去审批」、成果节点的出具印章）。
   // 卡片跟着审批列表来，刚停下时可能还在路上：等取回来（或确认没有）再办，别滚到空处
+  // 节点的步骤交给助手流自己滚：滚过去要暂停跟随，贴底跟随的开关在它手里
   const revealed = useRef(0)
   useEffect(() => {
     if (!reveal || reveal.seq === revealed.current) return
     if (raw) { setRaw(false); return }
+    if (reveal.kind === 'step') return
     if (reveal.kind === 'approval' && !hasCard && phase === 'waiting' && looked !== run.id) return
     revealed.current = reveal.seq
     // 等这一帧的布局落定：运行层刚挂上时，助手流自己也在做打开时的定位。不在清理里
     // 取消——紧跟着来一条事件就会把这次请求吞掉；卸载了的话两个函数找不到东西自然不做
     requestAnimationFrame(reveal.kind === 'approval' ? toApproval : toIssuance)
+    onRevealed()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reveal, raw, hasCard, phase, looked, run.id, turns])
+  const stepReveal = useMemo(() => (reveal?.kind === 'step' && reveal.nodeId && !raw
+    ? { nodeId: reveal.nodeId, seq: reveal.seq } : null), [reveal, raw])
 
   const live = phase === 'running' || phase === 'queued'
   // 停在审批上、服务重启时挂起的：不在执行，给的是「放弃」而不是「停止」
@@ -639,6 +712,8 @@ function RunView({ onBack, reveal }: { onBack: () => void; reveal: Reveal | null
             // 没绑工具、轮数不够这种要去画布上改的：直接打开那个节点的设置，镜头也带过去
             onStepOpen={(id) => { select(id); focusNode(id) }}
             activeNodeId={hoveredNodeId}
+            reveal={stepReveal}
+            onRevealed={onRevealed}
             // 审批卡插在它所属的那一轮里，而不是浮在整栏顶上：
             // 要确认的那件事和确认按钮之间不该隔着整条执行过程
             approvalsFor={() => (pending.length ? (
@@ -710,12 +785,12 @@ function RunFooter() {
       <span className="flex-1" />
       <span title="执行时长：各段执行之和，不含等人审批的时间">
         执行 <span className="mono text-fg">
-          {activeMs == null ? NONE : ticking ? formatClock(activeMs) : formatDuration(activeMs)}
+          {activeMs == null ? NONE : ticking ? formatLapse(activeMs) : formatSpan(activeMs)}
         </span>
       </span>
       {(waitMs ?? 0) > 0 && (
         <span title="等人审批的总时长" style={phase === 'waiting' ? { color: 'var(--st-waiting)' } : undefined}>
-          等人 <span className="mono">{ticking ? formatClock(waitMs!) : formatDuration(waitMs!)}</span>
+          等人 <span className="mono">{ticking ? formatLapse(waitMs!) : formatSpan(waitMs!)}</span>
         </span>
       )}
       <span title={approx ? '运行中实时累加，可能偏少；跑完以后端累计为准' : '后端累计'}>

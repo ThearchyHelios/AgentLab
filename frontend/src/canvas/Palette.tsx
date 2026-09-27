@@ -1,11 +1,11 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Lock, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_CATEGORIES, NODE_DEFS, type NodeDef } from './nodeDefs'
 import { hintOf } from './shortcuts'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
-import { IconButton } from '../components/ui'
+import { IconButton, toast } from '../components/ui'
 import type { NodeType } from '../types'
 
 /** 节点库搜索框的 id：「/」要把焦点送过来 */
@@ -28,8 +28,18 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
   // 助手在改、正式运行在跑：点了、拖了都落不下来，整块置灰并说清为什么
   const lock = useEditLock()
   const locked = lock != null
+  const noteId = useId()
+  // 锁着时卡片照样能 Tab 到、能按：按了说为什么没放上。以前整块 pointer-events:none，
+  // aria-disabled 挂在外层 div 上读屏听不到，键盘用户按了回车什么都没发生、也没人告诉他
+  const add = (type: NodeType) => {
+    if (lock) {
+      toast.warn(EDIT_LOCK_TEXT[lock], { key: 'studio:readonly' })
+      return
+    }
+    addNode(type)
+  }
 
-  if (collapsed) return <Rail onToggle={onToggle} onAdd={(t) => addNode(t)} lock={lock} />
+  if (collapsed) return <Rail onToggle={onToggle} onAdd={add} lock={lock} />
 
   const q = query.trim().toLowerCase()
   const defs = Object.values(NODE_DEFS).filter(
@@ -42,14 +52,16 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         <input
           id={PALETTE_SEARCH_ID}
           className="field"
+          // 占位符一输入就没了，读屏也不把它当名字
+          aria-label="搜索节点"
           placeholder="搜索节点…（/）"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            // 回车直接加第一个：搜索 → 添加一气呵成，不用再去点
-            if (e.key === 'Enter' && defs[0] && !locked && !e.nativeEvent.isComposing) {
+            // 回车直接加第一个：搜索 → 添加一气呵成，不用再去点。锁着时一样说为什么
+            if (e.key === 'Enter' && defs[0] && !e.nativeEvent.isComposing) {
               e.preventDefault()
-              addNode(defs[0].type as NodeType)
+              add(defs[0].type as NodeType)
             } else if (e.key === 'Escape') {
               setQuery('')
               ;(e.target as HTMLInputElement).blur()
@@ -59,8 +71,7 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         <IconButton label="收起节点库" title={hintOf('收起节点库', 'palette')} onClick={onToggle}
                     icon={<PanelLeftClose size={13} />} />
       </div>
-      <div className={clsx('flex-1 overflow-y-auto p-2', locked && 'pointer-events-none opacity-50')}
-           aria-disabled={locked || undefined}>
+      <div className="flex-1 overflow-y-auto p-2">
         {NODE_CATEGORIES.map((category) => {
           const items = defs.filter((d) => d.category === category)
           if (!items.length) return null
@@ -74,14 +85,19 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
                   <button
                     type="button"
                     key={def.type}
+                    data-node-type={def.type}
                     draggable={!locked}
+                    aria-disabled={locked || undefined}
+                    aria-describedby={locked ? noteId : undefined}
                     onDragStart={(e) => startDrag(e, def)}
-                    onClick={() => addNode(def.type as NodeType)}
+                    onClick={() => add(def.type as NodeType)}
                     className={clsx(
-                      `nt-${def.type} group flex w-full cursor-grab items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left hover:border-[var(--border)] hover:bg-hover active:cursor-grabbing`,
+                      `nt-${def.type} group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left`,
+                      locked ? 'cursor-not-allowed opacity-50'
+                        : 'cursor-grab hover:border-[var(--border)] hover:bg-hover active:cursor-grabbing',
                       q && category === defs[0]?.category && i === 0 && 'border-[var(--border)] bg-hover',
                     )}
-                    title={`${def.description}\n点一下放在视野中间，或拖到画布上`}
+                    title={lock ? `${def.label}：${EDIT_LOCK_TEXT[lock]}` : `${def.description}\n点一下放在视野中间，或拖到画布上`}
                   >
                     <TypeIcon def={def} />
                     <div className="min-w-0">
@@ -101,7 +117,7 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         )}
       </div>
       {lock ? (
-        <div className="flex items-start gap-1.5 border-t px-3 py-2 text-2xs leading-relaxed text-dim" role="note">
+        <div id={noteId} className="flex items-start gap-1.5 border-t px-3 py-2 text-2xs leading-relaxed text-dim" role="note">
           <Lock size={11} className="mt-0.5 shrink-0" aria-hidden />
           <span>{EDIT_LOCK_TEXT[lock]}</span>
         </div>
@@ -138,22 +154,21 @@ function Rail({ onToggle, onAdd, lock }: {
   onToggle: () => void; onAdd: (t: NodeType) => void; lock: ReturnType<typeof useEditLock>
 }) {
   const locked = lock != null
+  const noteId = useId()
   const [tip, setTip] = useState<{ def: NodeDef; top: number; left: number } | null>(null)
   const show = (def: NodeDef, el: HTMLElement) => {
     const r = el.getBoundingClientRect()
     setTip({ def, top: r.top + r.height / 2, left: r.right + 8 })
   }
   return (
-    <div className="flex h-full flex-col items-center" aria-label="节点库（已收起）"
-         title={lock ? EDIT_LOCK_TEXT[lock] : undefined}>
+    <div className="flex h-full flex-col items-center" aria-label="节点库（已收起）">
       <div className="flex w-full justify-center border-b py-2">
         <IconButton label="展开节点库" title={hintOf('展开节点库', 'palette')} onClick={onToggle}
                     icon={<PanelLeftOpen size={13} />} />
       </div>
-      {/* 置灰的图标轨接不到悬停，也就没有说明可看：原因挂在外面那一层的 title 上 */}
-      <div className={clsx('flex w-full flex-1 flex-col items-center gap-0.5 overflow-y-auto py-1.5',
-        locked && 'pointer-events-none opacity-50')}
-           aria-disabled={locked || undefined}
+      {/* 锁着时图标照样接得到悬停和焦点：浮层里写锁的原因，读屏从 aria-describedby 听到同一句 */}
+      {lock && <span id={noteId} className="sr-only">{EDIT_LOCK_TEXT[lock]}</span>}
+      <div className="flex w-full flex-1 flex-col items-center gap-0.5 overflow-y-auto py-1.5"
            onMouseLeave={() => setTip(null)}>
         {NODE_CATEGORIES.map((category, ci) => (
           <div key={category} className="flex w-full flex-col items-center gap-0.5">
@@ -162,14 +177,18 @@ function Rail({ onToggle, onAdd, lock }: {
               <button
                 type="button"
                 key={def.type}
+                data-node-type={def.type}
                 aria-label={`添加${def.label}`}
+                aria-disabled={locked || undefined}
+                aria-describedby={locked ? noteId : undefined}
                 draggable={!locked}
                 onDragStart={(e) => { setTip(null); startDrag(e, def) }}
                 onClick={() => onAdd(def.type as NodeType)}
                 onMouseEnter={(e) => show(def, e.currentTarget)}
                 onFocus={(e) => show(def, e.currentTarget)}
                 onBlur={() => setTip(null)}
-                className={`nt-${def.type} flex h-8 w-8 cursor-grab items-center justify-center rounded-md hover:bg-hover active:cursor-grabbing`}
+                className={clsx(`nt-${def.type} flex h-8 w-8 items-center justify-center rounded-md`,
+                  locked ? 'cursor-not-allowed opacity-50' : 'cursor-grab hover:bg-hover active:cursor-grabbing')}
               >
                 <TypeIcon def={def} size={22} />
               </button>
@@ -185,7 +204,14 @@ function Rail({ onToggle, onAdd, lock }: {
           <div className="fade-up rounded-md border bg-panel px-2.5 py-2 shadow-elev-2">
             <div className="text-xs font-medium">{tip.def.label}</div>
             <div className="mt-0.5 text-2xs leading-snug text-faint">{tip.def.description}</div>
-            <div className="mt-1 text-2xs text-faint">点一下放在视野中间 · 或拖到画布上</div>
+            {lock ? (
+              <div className="mt-1 flex items-start gap-1 text-2xs leading-snug text-dim">
+                <Lock size={10} className="mt-[3px] shrink-0" aria-hidden />
+                <span>{EDIT_LOCK_TEXT[lock]}</span>
+              </div>
+            ) : (
+              <div className="mt-1 text-2xs text-faint">点一下放在视野中间 · 或拖到画布上</div>
+            )}
           </div>
         </div>,
         document.body,

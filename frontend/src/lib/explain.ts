@@ -28,6 +28,14 @@ export interface RunErrorExplain {
   fix?: FixKind
   /** fix 为 rerun 时缺的是哪一项输入：补上它就能重新发起 */
   missingInput?: string
+  /**
+   * 接着跑之前得先去 fix 那里改好：要改的东西不在这次运行的快照里（比如工具库里的
+   * 参数定义），改好之后原样接着跑就能过，所以 continuable 仍为 true。主按钮给 fix，
+   * 「接着跑」退成次要——否则人先点接着跑，同样的错再来一遍
+   */
+  fixFirst?: boolean
+  /** fix 的站内地址，比笼统的「去工具库」更准：直接打开要改的那一项 */
+  fixTo?: string
   /** 原文，放进「技术细节」 */
   raw: string
 }
@@ -53,6 +61,72 @@ export function stripClassPrefix(text: string): string {
   return s.trim()
 }
 
+/** 直达某个自定义工具的编辑框（工具页读 ?edit= 打开它）。fixTo 和工具库里的「去改」共用 */
+export const customToolEditPath = (name: string) => `/tools/custom?edit=${encodeURIComponent(name)}`
+
+const TIMEOUT = /timed? ?out|timeout|超时|超过\s*[\d.]+\s*(?:s|秒)\s*(?:没有返回|被中断)/i
+/** 够得上「一句中文人话」：零星一两个汉字（「httpx.ReadTimeout: 超时」）不算 */
+const isZhProse = (s: string) => (s.match(/[\u4e00-\u9fff]/g)?.length ?? 0) >= 6
+const endStop = (s: string) => (/[。！？.!?]$/.test(s) ? s : `${s}。`)
+
+/**
+ * 后端已经写成中文人话的超时（查询超时、工具超时、「等待超时：…」）。原话里有具体的
+ * 原因（哪个查询、等了多久），常常还跟着一句建议（「加上 WHERE 条件或 LIMIT 缩小范围
+ * 再查」）；换成笼统的「下游服务没在限定时间内响应」，这两样就都丢了。
+ * 「X超时：…」的冒号前当标题；后面按第一个句号拆成原因和建议
+ */
+function explainZhTimeout(plain: string, raw: string): RunErrorExplain {
+  const head = plain.match(/^([^：:。，,；]{2,12})[：:]\s*([\s\S]+)$/)
+  const titled = head && /超时/.test(head[1])
+  const body = (titled ? head[2] : plain).trim()
+  const cut = body.search(/[。；](?=\s*\S)/)
+  // 在「；」处拆开时原因不能挂着半个分号收尾
+  const reason = (cut >= 0 ? body.slice(0, cut + 1).trim() : body).replace(/[；;，,]$/, '。')
+  const advice = cut >= 0 ? body.slice(cut + 1).trim() : ''
+  const title = titled ? head[1].trim() : /查询|SQL|数据库/i.test(plain) ? '查询超时' : /工具/.test(plain) ? '工具超时' : '等待超时'
+  return {
+    title,
+    reason,
+    // 查询等多久归数据源管（查询时限），画布上的节点没有这一项
+    action: advice ? endStop(advice)
+      : /查询|SQL/i.test(title) ? '缩小查询范围（加 WHERE / LIMIT）；确实要跑更久，就到「数据」页把这个库的查询时限调大，再接着跑。'
+        : '直接接着跑；反复超时就到画布里调大这个节点的超时。',
+    continuable: true,
+    raw,
+  }
+}
+
+/**
+ * 工具库里存着的坏参数定义（后端 tools.custom.broken_tool_message）。一个节点绑了几个
+ * 坏工具时后端用「；」连成一句；单个工具的原因里自己也可能带「；」（「…是不是想写
+ * integer；只能是 …」），所以只在下一段「自定义工具「」开头的地方断开
+ */
+const BROKEN_TOOL = /自定义工具「([^」]+)」的(参数定义[\s\S]*?)(?:[。.]\s*到「工具」页[^；]*)?(?=；\s*自定义工具「|$)/g
+
+function explainBrokenTools(plain: string, raw: string): RunErrorExplain | null {
+  const found = new Map<string, string>()
+  for (const m of plain.matchAll(BROKEN_TOOL)) if (!found.has(m[1])) found.set(m[1], m[2].trim())
+  if (!found.size) return null
+  const [[first, problem], ...rest] = [...found]
+  const base = { continuable: true, fix: 'tools' as const, fixFirst: true, fixTo: customToolEditPath(first), raw }
+  if (!rest.length) {
+    return {
+      ...base,
+      title: `自定义工具「${first}」的参数定义写坏了`,
+      reason: `${endStop(problem)}绑了这个工具的节点运行时一定失败。`,
+      action: '到「工具」页打开它，把参数定义改好保存；回来接着跑就能过，前面跑完的节点不会重跑。',
+    }
+  }
+  // 只报第一个的话，人改好它、接着跑，又在第二个上失败一次
+  const names = [...found.keys()].map((n) => `「${n}」`).join('、')
+  return {
+    ...base,
+    title: `${found.size} 个自定义工具的参数定义写坏了`,
+    reason: `${[...found].map(([n, p]) => `「${n}」：${p.replace(/[。.]$/, '')}`).join('；')}。绑了这些工具的节点运行时一定失败。`,
+    action: `到「工具」页把${names}的参数定义都改好保存；全改好再接着跑，前面跑完的节点不会重跑。`,
+  }
+}
+
 export function explainRunError(error: string | null | undefined, detail?: string | null): RunErrorExplain {
   const raw = [error, detail && detail !== error ? detail : null].filter(Boolean).join('\n\n')
   const text = String(error ?? '').trim()
@@ -61,6 +135,10 @@ export function explainRunError(error: string | null | undefined, detail?: strin
   if (!text) {
     return { title: '运行失败，但没有留下原因', action: '打开「原始事件」看最后几条记录。', continuable: true, raw }
   }
+  // 工具库里存着的坏参数定义。它不在这次运行的快照里：到工具页改好，回来原样接着跑
+  // 就能过；不先改，接着跑还是同样的失败
+  const broken = explainBrokenTools(plain, raw)
+  if (broken) return broken
   // 下面四类是「图本身有缺口」：模型没真调工具、团队轮数用完、校验修复想凑数、
   // 提示词点名的工具没绑定。原样接着跑是同一份配置，只会再来一遍，所以都不给
   // 「接着跑」，指到画布上去改
@@ -76,9 +154,12 @@ export function explainRunError(error: string | null | undefined, detail?: strin
   }
   const exhausted = plain.match(/用完\s*(\d+)\s*轮(?:仍|还)?未完成[：:]?\s*(.*)/s)
   if (exhausted || /team_exhausted/.test(text)) {
+    // 后端原话在理由和没派到的成员后面还跟着自己的建议（「。先看成员…」「。按降档交付：…」），
+    // 那部分由下面的 action 说，原因里再留一遍就是同样的话说两遍
+    const why = exhausted?.[2]?.split(/。\s*(?:先看成员|按降档交付)/)[0].replace(/[。\s]+$/, '').trim()
     return {
       title: exhausted ? `协作团队用完 ${exhausted[1]} 轮仍未完成` : '协作团队用完了轮数仍未完成',
-      reason: exhausted?.[2]?.trim() || '调度者一直没有判定完成，成员的原话不能当作结论交出去。',
+      reason: why || '调度者一直没有判定完成，成员的原话不能当作结论交出去。',
       action: '到画布里看看成员有没有绑定要用的工具，再调大这个团队的最多轮数；也可以把「用完轮数时」改成降档交付。',
       continuable: false,
       fix: 'canvas',
@@ -164,7 +245,8 @@ export function explainRunError(error: string | null | undefined, detail?: strin
       raw,
     }
   }
-  if (/timed? ?out|timeout|超时/i.test(text)) {
+  if (TIMEOUT.test(text)) {
+    if (isZhProse(plain)) return explainZhTimeout(plain, raw)
     return {
       title: '等待超时',
       reason: '下游服务没在限定时间内响应，多半是暂时的。',
@@ -197,7 +279,7 @@ export function explainRunError(error: string | null | undefined, detail?: strin
     return {
       title: '条件表达式用了旧写法',
       reason: '当时的版本不认 {{ x }} 这种写法；现在已经自动兼容。',
-      action: '不用改图，直接接着跑。',
+      action: '不用改工作流，直接接着跑。',
       continuable: true,
       raw,
     }

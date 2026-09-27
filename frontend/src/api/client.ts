@@ -1,8 +1,9 @@
 import type {
-  Approval, Conversation, ConversationDetail, ConversationTurn, GraphSpec,
+  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, GraphSpec,
   KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus, Skill, ToolChange, ToolInfo,
   ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
+import { localActor } from '../lib/actor'
 
 const BASE = '/api'
 
@@ -22,11 +23,16 @@ export class ApiError extends Error {
   raw?: string
   /** 超时断开时等了多久 */
   timeoutMs?: number
+  /**
+   * 后端的机读码（app/api/coded.py 的 {detail, code}，比如 datasource_scope_empty）。
+   * detail 是给人看的话，随时可能改写；要按错误种类分支的认这个
+   */
+  code?: string
 
   constructor(
     public status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number },
+    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string },
   ) {
     super(message)
     this.name = 'ApiError'
@@ -34,6 +40,7 @@ export class ApiError extends Error {
     this.detail = opts?.detail
     this.raw = opts?.raw
     this.timeoutMs = opts?.timeoutMs
+    this.code = opts?.code
   }
 }
 
@@ -56,14 +63,10 @@ function report(reachable: boolean, error?: ApiError) {
 }
 
 function actorHeader(): Record<string, string> {
-  try {
-    const actor = localStorage.getItem('agentlab_actor')
-    // 请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求发不出去。
-    // 后端 runs.actor_of 解码，纯 ASCII 的老署名编码前后一样
-    return actor ? { 'X-Actor': encodeURIComponent(actor) } : {}
-  } catch {
-    return {}
-  }
+  const actor = localActor()
+  // 请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求发不出去。
+  // 后端 runs.actor_of 解码，纯 ASCII 的老署名编码前后一样
+  return actor ? { 'X-Actor': encodeURIComponent(actor) } : {}
 }
 
 /** FastAPI 的 422 是 [{loc, msg, type}] 数组，直接 String() 会变成 [object Object] */
@@ -135,6 +138,12 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   return res.json()
 }
 
+/** 后端 {detail, code} 里的机读码；没有就是 undefined */
+const codeOf = (body: unknown): string | undefined => {
+  const code = body && typeof body === 'object' ? (body as { code?: unknown }).code : undefined
+  return typeof code === 'string' && code ? code : undefined
+}
+
 /** 非 2xx 的响应 → ApiError，顺带报告连接状态。fetch 和 XHR 两条路共用 */
 function failure(status: number, statusText: string, text: string): ApiError {
   let body: any
@@ -152,6 +161,7 @@ function failure(status: number, statusText: string, text: string): ApiError {
     const detail = body?.detail ?? body
     return new ApiError(status, describeDetail(detail), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
+      code: codeOf(body),
     })
   }
   const message = status >= 500
@@ -296,7 +306,8 @@ export interface TableSchema {
   table: string
   /** 给模型看的那段文本 */
   detail: string
-  found: boolean
+  /** 缓存里找没找到这张表。老后端没有这个字段：只有明确的 false 才算找不到 */
+  found?: boolean
   qualified: string | null
   kind: 'table' | 'view' | null
   comment: string | null
@@ -418,7 +429,7 @@ export const api = {
 
   // ---- 运行 ----
   datasources: {
-    list: () => get<any[]>('/datasources'),
+    list: (opts?: RequestOptions) => get<DataSource[]>('/datasources', opts),
     kinds: () => get<any>('/datasources/kinds'),
     create: (body: any) => post<any>('/datasources', body),
     update: (id: string, body: any) => patch<any>(`/datasources/${id}`, body),
@@ -528,9 +539,11 @@ export const api = {
       post<any>(`/tools/${name}/run`, opts?.confirm ? { args, confirm: true } : { args }),
   },
   customTools: {
-    list: () => get<any[]>('/custom-tools'),
-    create: (body: any) => post<any>('/custom-tools', body),
-    update: (id: string, body: any) => patch<any>(`/custom-tools/${id}`, body),
+    /** 每行带 problem：库里存着的参数定义写坏了时是一句中文，绑了它的节点一定失败 */
+    list: () => get<CustomTool[]>('/custom-tools'),
+    /** 参数定义写坏了回 422，detail 是一句中文（ApiError.message），显示在参数字段下面 */
+    create: (body: any) => post<CustomTool>('/custom-tools', body),
+    update: (id: string, body: any) => patch<CustomTool>(`/custom-tools/${id}`, body),
     remove: (id: string) => del(`/custom-tools/${id}`),
     test: (id: string, args: Record<string, any>) => post<any>(`/custom-tools/${id}/test`, { args }),
     /** 试跑一份还没保存的配置，不落库。失败时回 {ok:false, error, hint, detail, duration_ms} */
@@ -658,9 +671,12 @@ export const api = {
 
   // ---- 会话 ----
   conversations: {
-    list: (kind: 'chat' | 'canvas' = 'chat', workflowId?: string) =>
+    /** includeArchived：连回收站里的一起取（每行的 archived 区分），回收站视图要它 */
+    list: (kind: 'chat' | 'canvas' = 'chat', workflowId?: string, opts?: { includeArchived?: boolean }) =>
       get<Conversation[]>(
-        `/conversations?kind=${kind}` + (workflowId ? `&workflow_id=${workflowId}` : '')),
+        `/conversations?kind=${kind}`
+        + (workflowId ? `&workflow_id=${encodeURIComponent(workflowId)}` : '')
+        + (opts?.includeArchived ? '&include_archived=true' : '')),
     create: (body: { kind?: 'chat' | 'canvas'; workflow_id?: string; title?: string }) =>
       post<ConversationDetail>('/conversations', body),
     get: (id: string) => get<ConversationDetail>(`/conversations/${id}`),
@@ -722,7 +738,8 @@ export function streamCopilot(
   },
   // final 操作里带 tool_changes（ToolChange[]）：改图回执要显式列出工具绑定的变化
   onOp: (op: any) => void,
-  onEnd: (error?: string) => void,
+  // 开流之前就被拒（4xx/5xx）时第二个参数带状态码和后端的机读码（{detail, code}），调用方按码分支
+  onEnd: (error?: string, info?: { status?: number; code?: string }) => void,
 ): () => void {
   const controller = new AbortController()
   void (async () => {
@@ -746,7 +763,7 @@ export function streamCopilot(
         report(true)
         onEnd(isJson ? describeDetail(body?.detail ?? body)
           : res.status >= 500 ? `后端出错了（${res.status}），详情看服务日志`
-          : `请求没有成功（${res.status} ${res.statusText}）`)
+          : `请求没有成功（${res.status} ${res.statusText}）`, { status: res.status, code: isJson ? codeOf(body) : undefined })
         return
       }
       report(true)

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
-import type { CopilotOp, RunFinal } from '../run/decode'
+import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { decodeRun } from '../run/decode'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
@@ -73,6 +73,15 @@ export interface Failure {
   rerun?: true
   /** 限定的数据源都不在了（删了、停用了）。带着原范围重试只会再被拒一次 */
   scopeGone?: true
+  /**
+   * 该去哪儿改（lib/explain 的 fix）。流里的报错块据此放直达入口（去模型接入、去工具库），
+   * 不必再把原话交过去让它重讲一遍
+   */
+  fix?: FixKind | 'rerun'
+  /** fix 的站内地址（lib/explain 的 fixTo）：直接打开要改的那一项 */
+  fixTo?: string
+  /** 先去 fix 那里改好，再接着跑（lib/explain 的 fixFirst）：补救按钮里去改的那一个排在「接着跑」前面 */
+  fixFirst?: true
 }
 
 /** 限定这一问只查哪些数据源。名字跟着存：库删了之后，这一轮查的是谁还得说得出来 */
@@ -271,10 +280,10 @@ const newId = () => `t${Date.now().toString(36)}${seq++}`
 const PHASE_TEXT: Record<Phase, string> = {
   idle: '',
   planning: '正在理解需求…',
-  building: '正在搭建流程…',
-  running: '正在执行…',
+  building: '正在搭建工作流…',
+  running: '正在运行…',
   waiting: '等待审批',
-  ready: '流程搭好了，没有自动执行',
+  ready: '工作流搭好了，没有自动运行',
   checking: '正在核对这一轮的状态…',
   done: '已完成',
   error: '失败',
@@ -459,6 +468,9 @@ function runFailure(error: string | null | undefined, detail?: string | null): F
     hint: x.action,
     detail: x.raw && x.raw !== x.title ? x.raw : undefined,
     ...(x.continuable ? {} : { continuable: false as const }),
+    ...(x.fix ? { fix: x.fix } : {}),
+    ...(x.fixTo ? { fixTo: x.fixTo } : {}),
+    ...(x.fixFirst ? { fixFirst: true as const } : {}),
     ...(error ? { source: error } : {}),
   }
 }
@@ -595,7 +607,7 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
 
   const buildInterrupted: Failure = {
     title: '上次没有跑完',
-    reason: '建流程的时候页面被关掉了，或者服务重启了，这一轮没有留下可以接着跑的断点。',
+    reason: '搭工作流的时候页面被关掉了，或者服务重启了，这一轮没有留下可以接着跑的断点。',
     hint: '点「重试这一轮」重新来一次。',
   }
   const output: Record<string, any> | null = answer
@@ -711,7 +723,10 @@ export const useChat = create<ChatState>((set, get) => ({
         // 断在建图阶段、早就没动静的：库里那行一直是 running，每次进来都当它还在跑，
         // Copilot 的上下文也把它当成没答完的一轮漏掉。认定断了就写回去。
         // 动静按最后一次落库算：重试昨天那一轮时 created_at 是昨天，而它正在别的页面里建图
-        const at = Math.max(parseServerTime(row.created_at ?? null)?.getTime() ?? 0, t.meta?.at ?? 0)
+        // 后端判「断了」按 updated_at（conversations.BUILD_STALE），有就用同一只钟；老后端
+        // 没有这一列，退到 created_at 和本机记下的 meta.at 里晚的那个
+        const updated = parseServerTime(row.updated_at ?? null)?.getTime()
+        const at = updated ?? Math.max(parseServerTime(row.created_at ?? null)?.getTime() ?? 0, t.meta?.at ?? 0)
         if (row.status === 'running' && !t.run && t.phase === 'error' && at && now - at > BUILD_STALE_MS) {
           void persist(conversationId, t.id, { status: 'error', error: lineOf(t.failure ?? GONE) })
         }
@@ -881,7 +896,7 @@ export const useChat = create<ChatState>((set, get) => ({
     plan(flow, {
       question: turn.question, attempt: 0, baseGraph: base, scope,
       instruction: base
-        ? `这张流程上一次没有给出可用的结果：${reason}。\n\n`
+        ? `这个工作流上一次没有给出可用的结果：${reason}。\n\n`
           + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
           + `改完继续回答原来的问题：${turn.question}`
         : `${turn.question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`,
@@ -1220,7 +1235,7 @@ function plan(flow: Flow, args: PlanArgs) {
     patch(() => ({
       attempt: attempt + 1,
       phase: 'planning',
-      status: base ? '上一次没跑通，正在调整流程…' : '上一次没跑通，正在重新搭建流程…',
+      status: base ? '上一次没跑通，正在调整工作流…' : '上一次没跑通，正在重新搭建工作流…',
       ops: [], events: [], run: null, output: null, final: undefined, runStatus: undefined,
       review: null, reviewRaw: null, rawOutput: null, lastSeq: 0, failure: null, error: '',
     }))
@@ -1230,7 +1245,7 @@ function plan(flow: Flow, args: PlanArgs) {
       baseGraph: base,
       scope,
       instruction: base
-        ? `这张流程上一次运行没有成功：${reason}。\n\n`
+        ? `这个工作流上一次运行没有成功：${reason}。\n\n`
           + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
           + `改完继续回答原来的问题：${question}`
         : `${question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`,
@@ -1277,12 +1292,12 @@ function plan(flow: Flow, args: PlanArgs) {
           patch(() => ({ status: PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }))
           break
         case 'plan':
-          patch(() => ({ phase: 'building', status: op.summary || '正在搭建流程…' }))
+          patch(() => ({ phase: 'building', status: op.summary || '正在搭建工作流…' }))
           break
         case 'add_node':
           patch((t) => ({
             phase: 'building',
-            status: `正在搭建流程…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
+            status: `正在搭建工作流…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
           }))
           break
         case 'done':
@@ -1318,8 +1333,8 @@ function plan(flow: Flow, args: PlanArgs) {
             // 直接甩给一个在问数据页打字的人毫无意义——先给一句他能照做的，
             // 原文留在技术细节里作线索
             fail({
-              title: '这次没能搭出可以运行的流程',
-              reason: '自动调整过一次，生成的流程还是没通过检查。',
+              title: '这次没能搭出可以运行的工作流',
+              reason: '自动调整过一次，生成的工作流还是没通过检查。',
               hint: '换个说法再问一次：写明查哪个库、什么时间范围、要什么指标。',
               detail: blockers.join('\n'),
             }, graph)
@@ -1354,13 +1369,14 @@ function plan(flow: Flow, args: PlanArgs) {
           break
       }
     },
-    (error) => {
+    (error, info?: { code?: string }) => {
       if (!error || !flow.alive()) return
       const turn = findTurn(flow.conversationId, flow.turnId)
       if (!turn || !BUSY_PHASES.has(turn.phase) || turn.run) return
-      // 限定的库一个都不在了：后端在开流之前就 400。流的结束回调只拿得到那句 detail，
-      // 按它认；认出来了，补救得是「不限数据源重试」，带着原范围重试只会再被拒一次
-      if (scope?.length && error.startsWith('限定的数据源')) {
+      // 限定的库一个都不在了：后端在开流之前就 400，带机读码 datasource_scope_empty。
+      // 认出来了，补救得是「不限数据源重试」，带着原范围重试只会再被拒一次。
+      // 认码不认话；不带码的老后端退回按 detail 的开头认
+      if (scope?.length && (info?.code === 'datasource_scope_empty' || error.startsWith('限定的数据源'))) {
         const at = error.indexOf('：')
         fail({
           title: at > 0 ? error.slice(0, at) : error,
@@ -1401,7 +1417,7 @@ async function launch(
     // 发起那一下没到后端：流程是好的，原样再发起就行。通用的「稍等几秒会自动重试」
     // 在这里不成立——这一页没有谁会替它重发
     const failure: Failure = isNetworkError(e)
-      ? { ...failureOf(e, { hint: '后端连上之后点「重跑这一轮」，搭好的流程不用重来。' }), rerun: true }
+      ? { ...failureOf(e, { hint: '后端连上之后点「重跑这一轮」，搭好的工作流不用重来。' }), rerun: true }
       : failureOf(e)
     patch(() => ({
       phase: 'error', status: PHASE_TEXT.error, error: lineOf(failure), failure,
@@ -1532,7 +1548,7 @@ function watch(
         patch(() => ({
           status: tool.startsWith('db_query') ? '正在查询数据…'
             : tool.startsWith('db_schema') ? '正在了解数据结构…'
-            : tool ? `正在调用 ${tool}…` : '正在执行…',
+            : tool ? `正在调用 ${tool}…` : '正在运行…',
         }))
         break
       }

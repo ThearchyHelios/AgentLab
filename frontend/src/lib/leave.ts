@@ -9,6 +9,13 @@
  * 那一个（useLeaveBlocker），页面只往这里登记，别自己调 useBlocker。
  *
  *   useLeaveGuard(dirty > 0, () => confirmDialog({ title: `有 ${dirty} 项设置还没保存`, … }))
+ *
+ * 接入时的几条约定：
+ * - 页面原来自己拦 <a>、自己挂 beforeunload 的那套要删掉：两套并存，点一下导航问两遍；
+ * - 页面里已有的「先问再跳」（切标签前自己 confirm 一次、再 navigate）也要么删掉、交给
+ *   这里在 pathname 变化时问，要么跳转时带 leavePass()。否则先问一遍，跳的时候守卫还在，
+ *   又问一遍。useTabRoute 的 navigate 不收参数、带不了通行证，所以只能删掉预问；
+ * - 不要自己调 react-router 的 useBlocker。
  */
 import { useEffect, useRef } from 'react'
 import { NavigationType, parsePath, useBlocker } from 'react-router-dom'

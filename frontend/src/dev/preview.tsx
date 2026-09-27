@@ -11,7 +11,7 @@ import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
 import mdSamples from '../run/__tests__/markdown-samples.json'
 import {
-  COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
@@ -240,6 +240,13 @@ function synthetic(name: string): StreamTurn[] {
       return [{ id: 'issued', question: '9 月 19 日各班次出勤率', phase: 'done', status: '已完成',
                 steps: decodeRun(ev, { status: 'succeeded' }), output: MIXED_OUTPUT, runId: 'syn-issued',
                 runClass: 'exploratory', review: REVIEW_DEGRADED_TURN.review }]
+    }
+    case 'calibers':
+    case 'caliber-one': {
+      // 按口径卡清点回指的数字：两张卡各数各的；只有一张卡时直说都来自它
+      return [{ id: name, question: '上周订单情况', phase: 'done', status: '已完成',
+                steps: decodeRun(pipelineRun(2), { status: 'succeeded' }), runId: `syn-${name}`, runClass: 'formal',
+                output: name === 'calibers' ? CALIBERS_OUTPUT : CALIBER_ONE_OUTPUT }]
     }
     case 'live': {
       // 取数正在进行：第一条查询还没回来

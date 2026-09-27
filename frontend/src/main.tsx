@@ -14,7 +14,7 @@ const router = createBrowserRouter([
     path: '*',
     element: (
       <ToastHost>
-        <ErrorBoundary>
+        <ErrorBoundary scope="shell">
           <App />
         </ErrorBoundary>
       </ToastHost>

@@ -4,16 +4,16 @@ import clsx from 'clsx'
 import { EmptyState, ErrorState, Skeleton, Spinner, StatusBadge, useTicker } from '../../components/ui'
 import { STATUS, statusMeta, type StatusCode } from '../../lib/status'
 import {
-  formatCost, formatDateTime, formatDay, formatTime, formatTokens, parseServerTime, shortId,
+  formatCost, formatDateTime, formatDay, formatSpan, formatTime, formatTokens, parseServerTime, shortId,
 } from '../../lib/format'
-import { RUN_CLASS_LABEL, runClassLabel } from '../../lib/terms'
+import { RUN_CLASS_LABEL, UNSAVED_HINT, UNSAVED_NAME, isUnsaved, runClassLabel, runName } from '../../lib/terms'
 import { summarizeRun } from '../../run/decode'
 import type { Approval, Run, Workflow } from '../../types'
 import { UNSAVED_WORKFLOW_ID } from '../../api/client'
 import { explainRunError } from '../../lib/explain'
 import {
-  LONG_WAIT_MS, SEARCH_PLACEHOLDER, SEGMENT_CODES, UNSAVED_HINT, UNSAVED_NAME, ageMs, cancelReason, formatSpan,
-  headlineMs, idTail, isLiveRun, isUnsaved, runName, runShape, runTiming, timingTitle, type ParsedQuery,
+  LONG_WAIT_MS, SEARCH_PLACEHOLDER, SEGMENT_CODES, ageMs, cancelReason,
+  headlineMs, idTail, isLiveRun, runShape, runTiming, timingTitle, type ParsedQuery,
 } from './model'
 import { ClassChip, LiveElapsed, TierChip } from './parts'
 import type { ApprovalQueue, RunList, StatusCounts } from './useRunsData'
@@ -493,7 +493,7 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
         const age = ageMs(a.created_at, now)
         const long = age != null && age >= LONG_WAIT_MS
         const stale = a.run_status && a.run_status !== 'interrupted'
-        const unsaved = !a.workflow_id && (!a.workflow_name || a.workflow_name === '临时图')
+        const unsaved = isUnsaved(a)
         return (
           <button
             key={a.id}
@@ -525,7 +525,7 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
             </div>
             <div className="min-w-0 truncate text-2xs text-dim">
               <span className={unsaved ? 'text-faint' : undefined}>
-                {unsaved ? '未保存的工作流' : a.workflow_name ?? '—'}
+                {runName(a) || '—'}
               </span>
               {a.workflow_id && a.workflow_name && dupNames.has(a.workflow_name) && (
                 <span className="mono text-faint"> {idTail(a.workflow_id)}</span>

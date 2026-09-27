@@ -110,7 +110,13 @@ export function useRunDetail(runId: string, onChange: (run: Run) => void): RunDe
   pendingRef.current = pending
   const syncEpoch = useRef(0)
   const syncTimer = useRef(0)
-  const resync = useCallback((force: boolean) => {
+  /**
+   * ended：从流收尾处来时带上 stream.end 报的状态。流一路收到了底，手上的事件到那一刻
+   * 是全的：再查时还是同一个终态就不用重拉，还在跑的从已有的最大 seq 接回流就补齐了。
+   * 其余的——流停在审批上、再查时已经跑完或又停到别的审批上——中间的事件这里一条也
+   * 没收到，只能整条重拉。不带 ended（别处批掉、断网恢复）一律整条重拉
+   */
+  const resync = useCallback((force: boolean, ended?: { status?: string | null }) => {
     const epoch = ++syncEpoch.current
     window.clearTimeout(syncTimer.current)
     const attempt = (retry: boolean) => Promise.all([
@@ -128,7 +134,9 @@ export function useRunDetail(runId: string, onChange: (run: Run) => void): RunDe
       const moved = force || r.status !== 'interrupted' || idsOf(mine) !== idsOf(pendingRef.current)
       setPending(mine)
       adopt(r)
-      if (moved) void reload()
+      if (!moved) return
+      if (ended && isLiveRun(r.status)) setStreaming(true)
+      else if (!ended || r.status !== ended.status || r.status === 'interrupted') void reload()
     }, () => {})
     void attempt(true)
   }, [runId, adopt, reload])
@@ -178,11 +186,12 @@ export function useRunDetail(runId: string, onChange: (run: Run) => void): RunDe
         void refreshApprovals()
       }
     }
-    const onClose = () => {
+    const onClose = (end?: { status?: string | null }) => {
       setStreaming(false)
-      // 终态以后端为准：状态、用量、封存凭证都在 run 上
-      void api.runs.get(runId).then(adopt, () => {})
-      void refreshPending()
+      // 终态以后端为准：状态、用量、封存凭证都在 run 上。运行和审批要一起查、同一拍
+      // 换上：等审批时流断了重连，后端回 interrupted 的那一刻审批可能刚在别处批掉，
+      // 分两头查就拼出「interrupted、没有审批」，判成挂起、再没人重查
+      resync(false, end ?? {})
       void refreshApprovals()
     }
     const stop = streamRun(runId, onEvent, onClose, lastSeq.current)
@@ -191,7 +200,7 @@ export function useRunDetail(runId: string, onChange: (run: Run) => void): RunDe
       if (frame.current) cancelAnimationFrame(frame.current)
       flush()
     }
-  }, [streaming, runId, flush, adopt, refreshPending, refreshApprovals])
+  }, [streaming, runId, flush, resync, refreshPending, refreshApprovals])
 
   const follow = useCallback((next?: Run | null) => {
     if (next) adopt(next)
