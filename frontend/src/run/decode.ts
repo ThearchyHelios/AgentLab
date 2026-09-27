@@ -295,6 +295,49 @@ const finalEvent = (final: RunFinal): RunEvent => ({
 })
 
 /**
+ * 分支、循环的出口在图上叫什么。edge.taken 只带出口的 key：右栏写「走「team」这条路」，
+ * 而画布出口上写的是 case 的说明，两处对不上号。给不出（没加载图、图改过）时退回 key
+ */
+export type ExitLabelOf = (nodeId: string, key: string) => string | undefined
+
+export interface DecodeOptions {
+  exitLabelOf?: ExitLabelOf
+}
+
+/**
+ * 从图里攒出口说明。出口怎么命名（兜底叫「其他」、default 撞名合并）只有画布那边的
+ * sourceHandles 说了算，由调用方传进来：这里 import 画布模块的话，解码器就不再是
+ * 能在 node 里直接跑的纯函数了
+ */
+export function exitLabels(
+  nodes: { id: string; type: string; config?: Record<string, any> }[],
+  handles: (type: any, config: Record<string, any>) => { id: string; label: string }[],
+): ExitLabelOf {
+  const map = new Map<string, string>()
+  for (const n of nodes) {
+    if (n.type !== 'branch' && n.type !== 'loop') continue
+    for (const h of handles(n.type, n.config ?? {})) if (h.label) map.set(`${n.id}\u0000${h.id}`, h.label)
+  }
+  return (id, key) => map.get(`${id}\u0000${key}`)
+}
+
+/** 没有图时的叫法，和画布出口上写的一样 */
+const LOOP_EXIT: Record<string, string> = { body: '循环体', done: '结束' }
+
+/**
+ * 循环走 done 时这一轮说什么。后端的 iteration 是「这次决定之前已经跑过几轮」：走循环体时
+ * +1 是正要开始的那一轮，走 done 时它本身就是一共跑了几轮——按 +1 写，5 项的 foreach
+ * 走完就成了「第 6 轮」，一项都没有的成了「第 1 轮」
+ */
+function loopDoneNote(ran: number, total: number | undefined): string {
+  if (total != null) {
+    if (total === 0) return '（没有要处理的项）'
+    return ran >= total ? `（共 ${total} 项）` : `（跑了 ${ran} 轮，共 ${total} 项）`
+  }
+  return ran === 0 ? '（一轮都没跑）' : `（跑了 ${ran} 轮）`
+}
+
+/**
  * 这次运行此刻的相位。运行面板标题、运行页卡头读它，不再从 streaming 猜：
  * 等待审批时不能写"正在执行…"。
  *
@@ -955,7 +998,7 @@ export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRunE
  * final 是事件之外知道的结局（见 decodePhase）：服务被强杀的运行事件停在半路，
  * 只有查到它是 interrupted、又没有待审批，才能把那几行转圈收成"挂起"。
  */
-export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
+export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOptions): Step[] {
   const out: Step[] = []
   /** node_id → 该节点的顶层 Step，用于把子步骤挂进去 */
   const nodeSteps = new Map<string, Step>()
@@ -1008,6 +1051,24 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
   const execOf = (nodeId?: string): Exec | undefined => {
     const execs = nodeId ? nodeSteps.get(nodeId)?.execs : undefined
     return execs?.[execs.length - 1]
+  }
+
+  /**
+   * 老后端的 agent 不发 llm.end，一次模型调用做没做完只能看它后面来了什么：同一节点接着
+   * 调了工具、开始了下一次调用、节点收了尾，前一次就是做完了。不收的话它们一直挂着，
+   * 运行被取消或失败时终态清扫把一整列「思考并作答」都写成已取消——而它们后面明明跟着
+   * 真执行过的工具。结束时刻取那条事件的时刻；清扫只剩最后那一次真在进行中的
+   */
+  const thought = new WeakSet<Step>()
+  const closeLlm = (nodeId: string | undefined, status: StepStatus, at?: number) => {
+    const step = pendingLlm.get(nodeId ?? '_')
+    if (!step) return
+    step.status = status
+    if (step.ms == null && at != null && step.startedAt != null) {
+      step.ms = Math.max(0, Math.round(at - step.startedAt))
+      step.meta = dur(step.ms)
+    }
+    pendingLlm.delete(nodeId ?? '_')
   }
 
   /**
@@ -1197,6 +1258,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
           span.end = event.ts ?? span.end
           span.ms = num(d.duration_ms) ?? Math.round((span.end - span.start) * 1000)
         }
+        closeLlm(nodeId, 'done', at)
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         if (step) {
           const ms = num(d.duration_ms)
@@ -1237,6 +1299,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
       }
 
       case 'node.failed': {
+        // 节点失败时还在进行中的那次调用就是出错的那次，跟节点一起算失败，不留给清扫写成已取消
+        closeLlm(nodeId, 'failed', at)
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         const ms = num(d.duration_ms)
         // detail 是原始异常：给排查用，不给人读，折起来
@@ -1261,6 +1325,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
       case 'llm.start': {
         // 一出现就成行：模型想的那几十秒里得有一行在走，而不是等 end 才冒出来。
         // 团队成员和调度者的调用没有 start（它们的 end 只用来记账），不会走到这
+        closeLlm(nodeId, 'done', at)
         const step: Step = {
           id: `llm-${seq}`, seq, kind: 'llm', title: '思考并作答',
           status: 'running', nodeId, startedAt: at,
@@ -1305,10 +1370,14 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         const full = text + (d.truncated ? '\n\n（已截断）' : '')
         // 思考是这次调用的"意图"，不单独成行：挂到它所属的那次模型调用上当副
         // 标题。以前一次运行 23 行里 9 行是斜体的思考摘录，把真正的动作挤散了
+        // 一次调用只在收尾时落一条完整思考：进行中的那次已经带着一条，说明它早做完了
+        const open = pendingLlm.get(nodeId ?? '_')
+        if (open && thought.has(open)) closeLlm(nodeId, 'done', at)
         const siblings = nodeId ? nodeSteps.get(nodeId)?.children : undefined
         const host = pendingLlm.get(nodeId ?? '_')
           ?? [...(siblings ?? [])].reverse().find((s) => s.kind === 'llm' && !s.sub)
         if (host) {
+          thought.add(host)
           host.sub = thinkingHeadline(text, false)
           host.detail = [full, host.detail].filter(Boolean).join('\n\n')
           break
@@ -1321,6 +1390,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
       }
 
       case 'tool.start': {
+        closeLlm(nodeId, 'done', at)
         const step = toolStep(seq, String(d.tool ?? ''), d.args ?? {})
         step.nodeId = nodeId
         step.startedAt = at
@@ -1412,14 +1482,20 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
         break
       }
 
-      case 'edge.taken':
+      case 'edge.taken': {
+        const key = String(d.branch ?? '')
+        const ran = num(d.iteration)
+        const loop = d.mode === 'foreach' || d.mode === 'while' || ran != null
+        const name = (nodeId && opts?.exitLabelOf?.(nodeId, key))
+          || (loop ? LOOP_EXIT[key] : key === 'default' ? '其他' : undefined) || key
         push({
           id: `br-${seq}`, seq, kind: 'branch', nodeId, status: 'done',
-          title: `走「${d.branch}」这条路`
-            + (d.iteration != null ? `（第 ${Number(d.iteration) + 1} 轮）` : ''),
+          title: `走「${name}」这条路`
+            + (ran == null ? '' : key === 'done' ? loopDoneNote(ran, num(d.total)) : `（第 ${ran + 1} 轮）`),
           detail: d.reason ? String(d.reason) : undefined,
         }, nodeId)
         break
+      }
 
       case 'human.requested':
       case 'run.interrupted': {
@@ -1433,6 +1509,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal): Step[] {
           if (type === 'run.interrupted') closeLifecycles(out, 'done')
           break
         }
+        // agent 要调的工具等审批：要调什么是那次模型调用答出来的，它已经做完了
+        closeLlm(nodeId, 'done', at)
         const step: Step = {
           id: `hm-${seq}`, seq, kind: 'human', nodeId, status: 'waiting', level: 'warn',
           startedAt: at,

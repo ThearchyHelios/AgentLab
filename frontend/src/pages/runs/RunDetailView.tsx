@@ -9,7 +9,8 @@ import {
 import { formatDateTime, formatNumber, formatTime, shortId } from '../../lib/format'
 import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../../run/AssistantStream'
-import { decodePhase, decodeRun, summarizeRun, type RunFinal } from '../../run/decode'
+import { decodePhase, decodeRun, exitLabels, summarizeRun, type RunFinal } from '../../run/decode'
+import { sourceHandles } from '../../canvas/nodeDefs'
 import { ApprovalCard } from '../../run/RunPanel'
 import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
@@ -75,7 +76,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     [finalStatus, pendingFlag],
   )
   const phase = useMemo(() => decodePhase(d.events, final), [d.events, final])
-  const steps = useMemo(() => decodeRun(d.events, final), [d.events, final])
+  // 分支、循环那一行写运行时快照里出口的说明，不写 case 的 key
+  const exitLabelOf = useMemo(() => (d.graph
+    ? exitLabels(d.graph.nodes.map((n) => ({ id: n.id, type: n.type, config: n.data?.config })), sourceHandles)
+    : undefined), [d.graph])
+  const steps = useMemo(() => decodeRun(d.events, final, { exitLabelOf }), [d.events, final, exitLabelOf])
   const code = run ? displayCode(run, phase, pendingFlag) : 'idle'
 
   // ---- 视图、航迹游标 ----

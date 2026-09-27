@@ -187,6 +187,7 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
       sessionStorage.setItem('st-init', '1')
       localStorage.removeItem('agentlab.studio.palette')
       localStorage.removeItem('agentlab.studio.assistant')
+      localStorage.removeItem('agentlab.studio.assistant.narrow')
       localStorage.setItem('agentlab_actor', '检查脚本')
       for (const [k, v] of Object.entries(p)) localStorage.setItem(k, v)
     } catch { /* noop */ }
@@ -731,6 +732,192 @@ await section('快捷键与三栏', async () => {
   check('1440 宽默认展开节点库', await wide.page.locator('aside:has([aria-label^="节点库"])')
     .evaluate((el) => Math.round(el.getBoundingClientRect().width)) === 208)
   await wide.ctx.close()
+})
+
+// ================================================================ 3b
+/**
+ * 工具栏里看得见的一排控件：谁压着谁、有没有伸出视口。嵌在别的控件里的（芯片里的图标）不单算
+ */
+const toolbarLayout = (page) => page.evaluate(() => {
+  const bar = document.querySelector('.\\@container')
+  const vw = document.documentElement.clientWidth
+  const all = [...bar.querySelectorAll('button, .chip, [data-toolbar-item]')]
+    .filter((el) => el.offsetParent && el.getBoundingClientRect().width > 0)
+  const items = all.filter((el) => !all.some((o) => o !== el && o.contains(el)))
+  const box = items.map((el) => { const r = el.getBoundingClientRect(); return { n: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 10), l: r.left, r: r.right } })
+  const overlaps = []
+  for (let i = 0; i < box.length; i++) {
+    for (let j = i + 1; j < box.length; j++) {
+      if (Math.min(box[i].r, box[j].r) - Math.max(box[i].l, box[j].l) > 1) overlaps.push(`${box[i].n}×${box[j].n}`)
+    }
+  }
+  return { sw: bar.scrollWidth, cw: bar.clientWidth, vw, right: Math.round(Math.max(...box.map((b) => b.r))), overlaps, names: box.map((b) => b.n) }
+})
+
+await section('窄屏：次要按钮收进「更多」、助手栏默认收起、展开是浮层', async () => {
+  const { ctx, page, errors } = await open({ width: 768, height: 860 })
+  await waitAnalysis(page)
+  // 最挤的时候：有未保存改动、校验同时有错和提示
+  await S(page, () => window.__studio.setState({ dirty: true }))
+  await page.waitForTimeout(300)
+  const bar = await toolbarLayout(page)
+  check('768 宽、两枚芯片都在时：工具栏上没有互相压着的控件', bar.overlaps.length === 0, bar.overlaps.join('、'))
+  check('768 宽：最右的控件也在视口里、工具栏不溢出', bar.right <= bar.vw && bar.sw <= bar.cw, JSON.stringify({ right: bar.right, vw: bar.vw, sw: bar.sw, cw: bar.cw }))
+  check('768 宽：运行和收起助手栏都露在外面', bar.names.includes('运行') && bar.names.some((n) => n.includes('助手栏')), bar.names.join(' '))
+
+  const more = page.getByRole('button', { name: '更多操作' })
+  check('窄屏把次要按钮收进「更多操作」', await more.count() === 1 && await more.isVisible())
+  await more.click()
+  await page.waitForTimeout(200)
+  const menu = await page.locator('[role="menu"][aria-label="更多操作"] [role^="menuitem"]').allInnerTexts()
+  check('「更多操作」里有助手、变量、版本历史、自动排版', ['助手', '变量', '版本历史', '自动排版'].every((t) => menu.some((m) => m.includes(t))), menu.join(' | '))
+  await page.locator('[role="menu"][aria-label="更多操作"] [role^="menuitem"]', { hasText: '变量' }).click()
+  await page.waitForTimeout(250)
+  check('从「更多操作」打开变量抽屉，菜单随即收起', await count(page, '#dock-variables') === 1 && await count(page, '[role="menu"][aria-label="更多操作"]') === 0)
+  await more.click()
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('Esc 收起「更多操作」', await count(page, '[role="menu"][aria-label="更多操作"]') === 0)
+
+  // 画布那一栏是助手栏前面的 <main>（外壳自己还有一个 <main>，不能按标签取第一个）
+  const widths = () => page.evaluate(() => {
+    const aside = document.querySelector('main + aside')
+    return {
+      main: Math.round(aside.previousElementSibling.getBoundingClientRect().width),
+      aside: Math.round(aside.getBoundingClientRect().width),
+      over: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }
+  })
+  const closed = await widths()
+  check('窄于 1280：助手栏默认收起，画布拿到整块宽度', closed.aside === 0 && closed.main >= 640, JSON.stringify(closed))
+  await page.getByRole('button', { name: '展开助手栏' }).click()
+  await page.waitForTimeout(250)
+  const opened = await widths()
+  check('窄屏展开助手栏：浮在画布上，不把画布挤窄', opened.aside >= 300 && Math.abs(opened.main - closed.main) <= 1 && opened.over <= 0, JSON.stringify(opened))
+  const prefs = await S(page, () => ({ wide: localStorage.getItem('agentlab.studio.assistant'), narrow: localStorage.getItem('agentlab.studio.assistant.narrow') }))
+  check('窄屏的开合单独记，不改宽屏的偏好', prefs.narrow === 'open' && prefs.wide === null, JSON.stringify(prefs))
+  await S(page, () => window.__studio.getState().select('answer'))
+  await page.waitForTimeout(250)
+  check('窄屏选中节点：属性面板在浮层里', await count(page, '[data-inspector-sheet] [data-field="prompt"]') === 1)
+  await page.getByRole('button', { name: '收起助手栏' }).click()
+  await page.waitForTimeout(200)
+  check('窄屏收起浮层', (await widths()).aside === 0)
+
+  // 有一次跑完的运行：胶囊 + 发起按钮一起挤在工具栏上
+  await S(page, () => {
+    const st = window.__studio
+    const t = Date.now() / 1000 - 5
+    st.setState({ run: { id: 'st-run-narrow', workflow_id: 'st-main', workflow_name: '__studio_check__', status: 'queued', input: {},
+      output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    for (const [i, e] of [['run.started', null, {}], ['node.started', 'start', {}], ['node.finished', 'start', { duration_ms: 3 }],
+      ['run.finished', null, { output: {}, usage: {}, timing: { wall_ms: 800, active_ms: 800, wait_ms: 0 } }]].entries()) {
+      st.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 })
+    }
+  })
+  await page.waitForTimeout(400)
+  const ran = await toolbarLayout(page)
+  check('768 宽、有运行结果时：胶囊和发起按钮也不压着别的、不伸出视口', ran.overlaps.length === 0 && ran.right <= ran.vw,
+    `${ran.overlaps.join('、')} right=${ran.right}`)
+  // 最挤的一种：失败的运行（胶囊里多一个「接着跑」）+ 画布不是已发布那一版 + 未保存 + 有错有提示
+  await S(page, () => {
+    const st = window.__studio
+    const t = Date.now() / 1000 - 5
+    st.getState().clearRun()
+    st.setState({ dirty: true, run: { id: 'st-run-narrow2', workflow_id: 'st-main', workflow_name: '__studio_check__', status: 'queued',
+      input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    for (const [i, e] of [['run.started', null, {}], ['node.started', 'start', {}],
+      ['node.failed', 'start', { error: '检查脚本造的失败', duration_ms: 3 }], ['run.failed', null, { error: '检查脚本造的失败', node_id: 'start' }]].entries()) {
+      st.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 })
+    }
+  })
+  await page.waitForTimeout(400)
+  const worst = await toolbarLayout(page)
+  check('768 宽、失败的运行 + 未保存 + 有错有提示：仍不压、不伸出视口，接着跑露在外面',
+    worst.overlaps.length === 0 && worst.right <= worst.vw && worst.names.includes('接着跑'),
+    `${worst.overlaps.join('、')} right=${worst.right} ${worst.names.join(' ')}`)
+  const ver = await page.locator('span[title*="画布是草稿"]').innerText().catch(() => '')
+  check('最窄的工具栏里版本标签只留「草稿 vN」（已发布的版本号在正式运行按钮上）', /草稿 v3/.test(ver) && !/已发布/.test(ver), ver)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
+
+  // 窄屏里点开过的，刷新后还开着；宽屏照旧默认展开
+  const again = await open({ width: 1024, height: 760, prefs: { 'agentlab.studio.assistant.narrow': 'open' } })
+  check('窄屏记住的「展开」刷新后还在', await again.page.evaluate(() => Math.round(document.querySelector('main + aside').getBoundingClientRect().width)) >= 300)
+  await again.ctx.close()
+  const fresh = await open({ width: 1024, height: 760 })
+  check('1024 宽没记过偏好：助手栏默认收起', await fresh.page.evaluate(() => Math.round(document.querySelector('main + aside').getBoundingClientRect().width)) === 0)
+  await fresh.ctx.close()
+  const wide = await open({ width: 1440 })
+  check('1440 宽：助手栏默认展开、占位不浮', await wide.page.evaluate(() => {
+    const a = document.querySelector('main + aside')
+    return Math.round(a.getBoundingClientRect().width) >= 300 && getComputedStyle(a).position !== 'absolute'
+  }))
+  await wide.ctx.close()
+})
+
+// ================================================================ 3c
+await section('文案：运行被拦时点名节点、人工审批兜底摘要、Skill 空提示、正式运行署名', async () => {
+  const { ctx, page, errors } = await open()
+  await waitAnalysis(page)
+  const runTitle = await page.locator('[data-run-control] button[aria-label="运行"]').getAttribute('title')
+  check('运行被拦：提示前面点出是哪个节点', /「查询销量」/.test(runTitle ?? '') && /还没选工具/.test(runTitle ?? ''), runTitle)
+  check('运行被拦：指向问题面板', /问题面板/.test(runTitle ?? ''), runTitle)
+
+  await S(page, () => {
+    const s = window.__studio.getState()
+    s.addNode('human', { x: 0, y: 700 })
+    const n = window.__studio.getState().nodes.find((x) => x.data.nodeType === 'human')
+    s.updateNode(n.id, { config: { ...n.data.config, title: '' } })
+  })
+  await page.waitForTimeout(300)
+  const humanSummary = await page.evaluate(() => {
+    const n = window.__studio.getState().nodes.find((x) => x.data.nodeType === 'human')
+    return document.querySelector(`.react-flow__node[data-id="${CSS.escape(n.id)}"] .nc-summary`)?.textContent ?? ''
+  })
+  check('没填标题的人工审批：摘要不写成像状态的「等待人工」', humanSummary === '人工审批 · 未填标题', humanSummary)
+  await S(page, () => { window.__studio.getState().undo(); window.__studio.getState().undo() })
+
+  // Skill 目录是空的：空提示给一条去创建的链接
+  await S(page, async () => { const m = await window.__appImport('/src/store/catalog.ts'); m.useCatalog.setState({ skills: [] }) })
+  await S(page, () => window.__studio.getState().select('answer'))
+  await page.waitForTimeout(400)
+  const skills = page.locator('[data-field="skills"]')
+  const addSkill = skills.getByRole('button', { name: /添加 Skill/ })
+  check('Skill 的多选按钮写「添加 Skill」', await addSkill.count() === 1)
+  await addSkill.click()
+  await page.waitForTimeout(200)
+  const link = skills.locator('a[href="/knowledge/skills"]')
+  const linkText = await link.innerText().catch(() => '')
+  check('没有 Skill：空提示是一条去「知识 → 方法论 Skill」的链接', await link.count() === 1 && linkText.includes('知识') && linkText.includes('方法论 Skill'), linkText)
+  await S(page, () => window.__studio.getState().select(null))
+
+  // 正式运行的弹层：写明以谁的名义发起；没署名用琥珀色说出来，给去设置的路
+  const formal = page.locator('[data-run-control]').getByRole('button', { name: /^正式运行 v2$/ })
+  await formal.click()
+  await page.waitForTimeout(300)
+  const signed = await page.locator('[role="dialog"][aria-label="正式运行 v2"]').innerText().catch(() => '')
+  check('正式运行弹层写出署名', signed.includes('将以「检查脚本」的名义发起'), signed.replace(/\s+/g, ' ').slice(0, 80))
+  await page.keyboard.press('Escape')
+  await S(page, async () => { const m = await window.__appImport('/src/lib/actor.ts'); m.setLocalActor(null) })
+  await page.waitForTimeout(150)
+  await formal.click()
+  await page.waitForTimeout(300)
+  const pop = page.locator('[role="dialog"][aria-label="正式运行 v2"]')
+  const unsigned = await pop.innerText().catch(() => '')
+  const warn = await pop.locator('[data-signer]').evaluate((el) => {
+    const probe = document.createElement('span')
+    probe.style.color = 'var(--st-waiting)'
+    document.body.append(probe)
+    const want = getComputedStyle(probe).color
+    probe.remove()
+    return { color: getComputedStyle(el).color, want }
+  }).catch(() => null)
+  check('没署名：写「未署名」并给去设置的链接', unsigned.includes('未署名') && await pop.locator('a[href="/settings/prefs"]').count() === 1,
+    unsigned.replace(/\s+/g, ' ').slice(0, 80))
+  check('没署名那一行是琥珀色（等待色）', !!warn && warn.color === warn.want && await pop.locator('[data-signer="unsigned"]').count() === 1, JSON.stringify(warn))
+  await page.keyboard.press('Escape')
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
 })
 
 // ================================================================ 4b
@@ -1524,7 +1711,7 @@ await section('定位落到输入框：自查问题的 {node_id, field} 直接�
         add: !!a?.hasAttribute('data-reveal-focus') }
     }, [node, field, within]).catch((e) => ({ error: e.message.split('\n')[0] }))
     check(`${field}：有已绑工具的芯片（这条检查才有意义）`, f.chips > 0, JSON.stringify(f))
-    check(`${field}：光标落在「添加」上，不落在「移除」上`, f.inField && f.text === '添加' && !f.label.startsWith('移除'), JSON.stringify(f))
+    check(`${field}：光标落在「添加工具」上，不落在「移除」上`, f.inField && f.text === '添加工具' && !f.label.startsWith('移除'), JSON.stringify(f))
     await team.page.keyboard.press('Enter')
     await team.page.waitForTimeout(200)
     const after = await toolsOf(node, member)

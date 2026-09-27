@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
-  AlertTriangle, Check, ChevronDown, History, LayoutGrid, PanelRightClose, PanelRightOpen, Plus,
+  AlertTriangle, Check, ChevronDown, History, LayoutGrid, MoreHorizontal, PanelRightClose, PanelRightOpen, Plus,
   Redo2, RotateCw, Save, ShieldCheck, Square, Undo2, Variable, Wand2, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -15,7 +15,7 @@ import { VersionsSheet } from '../canvas/VersionsSheet'
 import { PublishDialog } from '../canvas/PublishDialog'
 import { WorkflowPicker, confirmDiscard, createWorkflow, takeDiscarded } from '../canvas/WorkflowPicker'
 import { problemsOf, type Problem } from '../canvas/issues'
-import { STUDIO_SHORTCUTS, hintOf, type StudioShortcutId } from '../canvas/shortcuts'
+import { STUDIO_SHORTCUTS, hintOf, studioShortcut, type StudioShortcutId } from '../canvas/shortcuts'
 import { AssistantPanel } from '../run/AssistantPanel'
 import { RunControl } from '../run/RunControl'
 import { useRunClock } from '../run/useRunClock'
@@ -27,13 +27,15 @@ import {
 } from '../components/ui'
 import { isNetworkError } from '../lib/errors'
 import { formatClock } from '../lib/format'
-import { isTypingTarget, matchShortcut } from '../lib/keys'
+import { formatShortcut, isTypingTarget, matchShortcut } from '../lib/keys'
 import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import type { Workflow } from '../types'
 
 // 三栏的收起状态存在这台浏览器里。读写都可能抛（隐私模式、存储被禁），抛了就用默认值
 const PALETTE_KEY = 'agentlab.studio.palette'
 const ASSISTANT_KEY = 'agentlab.studio.assistant'
+/** 窄屏上助手栏的开合单独记：宽屏上一直开着，不等于在 1024 的笔记本上也要它压掉半张画布 */
+const ASSISTANT_NARROW_KEY = 'agentlab.studio.assistant.narrow'
 const readPref = (key: string): 'open' | 'closed' | null => {
   try {
     const v = localStorage.getItem(key)
@@ -45,8 +47,12 @@ const readPref = (key: string): 'open' | 'closed' | null => {
 const writePref = (key: string, open: boolean) => {
   try { localStorage.setItem(key, open ? 'open' : 'closed') } catch { /* 下次用默认值 */ }
 }
-/** 窄于这个宽度默认收起节点库：1024 宽时三栏固定占掉 624px，画布只剩约 400px */
+/**
+ * 窄于这个宽度：节点库默认收成图标轨，助手栏默认收起、展开时浮在画布上而不是挤它。
+ * 1024 宽时三栏固定占掉 624px，画布只剩约 400px；768 宽时 8 个节点只看得见 3 个
+ */
 const NARROW = 1280
+const isNarrow = () => window.innerWidth < NARROW
 /** 助手栏可拖宽：长 prompt、成员 system 在 360px 里没法编辑；再宽画布就不够了 */
 const ASIDE_KEY = 'agentlab.studio.assistantWidth'
 const ASIDE_MIN = 300
@@ -133,7 +139,20 @@ export function StudioPage() {
     const pref = readPref(PALETTE_KEY)
     return pref ? pref === 'open' : window.innerWidth >= NARROW
   })
-  const [assistantOpen, setAssistantOpen] = useState(() => readPref(ASSISTANT_KEY) !== 'closed')
+  // 窗口拖过门槛时只换摆法（占位 / 浮层），不替人开合：正开着的栏不会因为拖窄一点就没了
+  const [narrow, setNarrow] = useState(isNarrow)
+  useEffect(() => {
+    const mq = matchMedia(`(max-width: ${NARROW - 0.02}px)`)
+    const sync = () => setNarrow(mq.matches)
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [])
+  const narrowRef = useRef(narrow)
+  narrowRef.current = narrow
+  const [assistantOpen, setAssistantOpen] = useState(() => {
+    const pref = readPref(isNarrow() ? ASSISTANT_NARROW_KEY : ASSISTANT_KEY)
+    return pref ? pref === 'open' : !isNarrow()
+  })
   const [asideWidth, setAsideWidth] = useState(readAsideWidth)
 
   const togglePalette = useCallback((open?: boolean) => {
@@ -147,7 +166,7 @@ export function StudioPage() {
   const toggleAssistant = useCallback((open?: boolean) => {
     const next = open ?? !assistantRef.current
     assistantRef.current = next
-    writePref(ASSISTANT_KEY, next)
+    writePref(narrowRef.current ? ASSISTANT_NARROW_KEY : ASSISTANT_KEY, next)
     setAssistantOpen(next)
     // 属性面板和版本历史都叠在这一栏里：栏收起了它们也跟着收，别在看不见的地方开着
     if (!next) {
@@ -371,6 +390,13 @@ export function StudioPage() {
     toggleAssistant(true)
     select(null)
   }, [toggleAssistant, select])
+  const openCopilot = useCallback(() => {
+    select(null)   // 属性面板盖着的话先让开
+    setHistory(false)
+    toggleAssistant(true)
+    requestAnimationFrame(() => window.dispatchEvent(new Event('agentlab:focus-copilot')))
+  }, [select, toggleAssistant])
+  const toggleVariables = useCallback(() => setDock((d) => (d === 'variables' ? null : 'variables')), [])
 
   useEffect(() => {
     const run = (id: StudioShortcutId): boolean => {
@@ -472,8 +498,10 @@ export function StudioPage() {
         <div className="min-w-2 flex-1" />
 
         {/* 生成期间这一排全部锁住（停止在画布上方的条和助手栏里）：这时候保存会存下
-            半张图，运行跑的也是半张图，排版会被它的最终结果覆盖 */}
-        <fieldset disabled={copilotActive} className="flex min-w-0 items-center gap-1.5">
+            半张图，运行跑的也是半张图，排版会被它的最终结果覆盖。
+            这一排不许被压得比内容窄：以前压窄了子项互相叠着画，768 宽时「运行」盖住了
+            收起助手栏。放不下时让左边的工作流名先截短，次要按钮收进「更多操作」 */}
+        <fieldset disabled={copilotActive} className="flex shrink-0 items-center gap-1.5">
           <div className="flex items-center">
             <IconButton label="撤销" title={formalLock ? EDIT_LOCK_TEXT.formal
                           : undoLabel ? `${hintOf('撤销', 'undo')}：${undoLabel}` : hintOf('撤销', 'undo')}
@@ -484,35 +512,42 @@ export function StudioPage() {
           </div>
           <span className="h-4 w-px shrink-0" style={{ background: 'var(--border)' }} />
           <button
-            className="btn shrink-0"
+            className="btn shrink-0 @max-[880px]:hidden"
             title={formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流（Copilot）'}
             disabled={formalLock}
-            onClick={() => {
-              select(null)   // 属性面板盖着的话先让开
-              setHistory(false)
-              toggleAssistant(true)
-              requestAnimationFrame(() =>
-                window.dispatchEvent(new Event('agentlab:focus-copilot')))
-            }}
+            onClick={openCopilot}
           >
             <Wand2 size={12} /> <span className="@max-[1120px]:hidden">助手</span>
           </button>
           <button
-            className={clsx('btn shrink-0', dock === 'variables' && 'border-[var(--border-strong)] bg-hover')}
+            className={clsx('btn shrink-0 @max-[880px]:hidden', dock === 'variables' && 'border-[var(--border-strong)] bg-hover')}
             aria-pressed={dock === 'variables'}
             title={hintOf('看这张工作流里有哪些变量、谁产出、谁引用', 'variables')}
-            onClick={() => setDock((d) => (d === 'variables' ? null : 'variables'))}
+            onClick={toggleVariables}
           >
             <Variable size={12} /> <span className="@max-[1000px]:hidden">变量</span>
           </button>
           <IconButton label="版本历史" title={hintOf('版本历史', 'history')} variant="default"
                       aria-pressed={history} disabled={!workflow}
-                      className={clsx(history && 'bg-hover')} onClick={openHistory}
+                      className={clsx('@max-[880px]:hidden', history && 'bg-hover')} onClick={openHistory}
                       icon={<History size={12} />} />
           <IconButton label="自动排版" title={formalLock ? EDIT_LOCK_TEXT.formal : hintOf('自动排版', 'layout')}
-                      variant="default" disabled={!nodeCount || formalLock}
+                      variant="default" disabled={!nodeCount || formalLock} className="@max-[880px]:hidden"
                       onClick={() => void relayout()} icon={<LayoutGrid size={12} />} />
-          <button className="btn shrink-0" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
+          <MoreMenu items={[
+            { id: 'copilot', label: '助手', icon: <Wand2 size={12} />, disabled: formalLock,
+              title: formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流（Copilot）', onSelect: openCopilot },
+            { id: 'variables', label: '变量', icon: <Variable size={12} />, shortcut: 'variables', checked: dock === 'variables',
+              onSelect: toggleVariables },
+            { id: 'history', label: '版本历史', icon: <History size={12} />, shortcut: 'history', checked: history,
+              disabled: !workflow, onSelect: openHistory },
+            { id: 'layout', label: '自动排版', icon: <LayoutGrid size={12} />, shortcut: 'layout',
+              disabled: !nodeCount || formalLock, title: formalLock ? EDIT_LOCK_TEXT.formal : undefined,
+              onSelect: () => void relayout() },
+            { id: 'publish', label: '发布…', icon: <ShieldCheck size={12} />, disabled: !workflow || dirty,
+              title: dirty ? '先保存再发布' : '把当前版本立为已发布版本，正式运行只认它', onSelect: () => setPublishing(true) },
+          ]} />
+          <button className="btn shrink-0 @max-[880px]:hidden" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
                   title={dirty ? '先保存再发布' : '把当前版本立为已发布版本，正式运行只认它'}>
             <ShieldCheck size={12} /> <span className="@max-[1000px]:hidden">发布</span>
           </button>
@@ -531,7 +566,7 @@ export function StudioPage() {
       </div>
 
       {/* 三栏 */}
-      <div className="flex min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1">
         <aside className={clsx('shrink-0 border-r bg-panel', paletteOpen ? 'w-52' : 'w-12')}>
           <Palette collapsed={!paletteOpen} onToggle={() => togglePalette()} />
         </aside>
@@ -553,9 +588,12 @@ export function StudioPage() {
         {/* 助手常驻，属性和版本历史是盖在它上面的一层。做成 tab 的话它们就互斥了，
             而这几件事在时间上并不互斥——跑图跑到一半点开节点看配置，整条执行过程
             会从眼前消失，切回来滚动位置和输入草稿也没了。
-            收起时只是藏起来不卸载：输入框里打了一半的字、滚动位置都留着 */}
-        <aside className={clsx('relative shrink-0 border-l bg-panel', !assistantOpen && 'invisible overflow-hidden border-l-0')}
-               style={{ width: assistantOpen ? asideWidth : 0 }}
+            收起时只是藏起来不卸载：输入框里打了一半的字、滚动位置都留着。
+            窄屏上它浮在画布右侧、不挤画布：展开看一眼助手、改一个节点，画布不跟着缩一半 */}
+        <aside className={clsx('shrink-0 border-l bg-panel',
+                               narrow ? 'absolute inset-y-0 right-0 z-30 shadow-elev-3' : 'relative',
+                               !assistantOpen && 'invisible overflow-hidden border-l-0')}
+               style={{ width: assistantOpen ? asideWidth : 0, ...(narrow ? { maxWidth: 'calc(100% - 48px)' } : {}) }}
                aria-hidden={!assistantOpen || undefined}>
           {assistantOpen && <WidthHandle width={asideWidth} onChange={setAsideWidth} />}
           {/* 展开时填满（左边框占掉 1px，写死宽度会顶出页面）；收起时保持原宽，里面的排版不塌 */}
@@ -578,6 +616,76 @@ export function StudioPage() {
 }
 
 // -------------------------------------------------------------------------
+
+interface MoreItem {
+  id: string
+  label: string
+  icon: ReactNode
+  onSelect: () => void
+  shortcut?: StudioShortcutId
+  disabled?: boolean
+  checked?: boolean
+  title?: string
+}
+
+/**
+ * 工具栏窄了（容器 < 880px）才出现的「更多操作」：助手、变量、版本历史、自动排版、发布收在这里，
+ * 快捷键照常能用。点外面、按 Esc、选了一项都收起；↑↓ 在项之间走
+ */
+function MoreMenu({ items }: { items: MoreItem[] }) {
+  const [open, setOpen] = useState(false)
+  const wrap = useRef<HTMLDivElement>(null)
+  const menuId = useId()
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => { if (!wrap.current?.contains(e.target as Node)) setOpen(false) }
+    // 捕获阶段先接住 Esc：不然它会接着去清画布上的运行结果、收属性面板
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || isComposing(e)) return
+      e.preventDefault()
+      e.stopPropagation()
+      setOpen(false)
+      wrap.current?.querySelector<HTMLElement>('[aria-haspopup="menu"]')?.focus()
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey, true)
+    requestAnimationFrame(() => wrap.current?.querySelector<HTMLElement>('[role^="menuitem"]:not(:disabled)')?.focus())
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [open])
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+    e.preventDefault()
+    const list = [...(wrap.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]:not(:disabled)') ?? [])]
+    const i = list.indexOf(document.activeElement as HTMLElement)
+    list[(i + (e.key === 'ArrowDown' ? 1 : -1) + list.length) % list.length]?.focus()
+  }
+  return (
+    <div ref={wrap} className="relative hidden shrink-0 @max-[880px]:block">
+      <IconButton label="更多操作" variant="default" aria-haspopup="menu" aria-expanded={open}
+                  aria-controls={open ? menuId : undefined} className={clsx(open && 'bg-hover')}
+                  onClick={() => setOpen((v) => !v)} icon={<MoreHorizontal size={13} />} />
+      {open && (
+        <div id={menuId} role="menu" aria-label="更多操作" data-esc-layer onKeyDown={onKeyDown}
+             className="fade-up absolute right-0 top-[calc(100%+6px)] z-50 w-48 rounded-lg border bg-panel p-1 shadow-elev-3">
+          {items.map((it) => (
+            <button key={it.id} type="button" role={it.checked == null ? 'menuitem' : 'menuitemcheckbox'}
+                    aria-checked={it.checked} disabled={it.disabled} title={it.title}
+                    className={clsx('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-hover disabled:opacity-50',
+                                    it.checked && 'bg-hover')}
+                    onClick={() => { setOpen(false); it.onSelect() }}>
+              <span className="shrink-0 text-dim">{it.icon}</span>
+              <span className="min-w-0 flex-1 truncate">{it.label}</span>
+              {it.shortcut && <span className="tnum shrink-0 text-2xs text-faint">{formatShortcut(studioShortcut(it.shortcut).combo)}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 /** 助手栏左边缘的拖拽条。键盘也能调：←→ 每次 20px */
 function WidthHandle({ width, onChange }: { width: number; onChange: (w: number) => void }) {
@@ -634,7 +742,8 @@ function VersionLabel({ workflow: w }: { workflow: Workflow }) {
   // （旧的 restore 接口不退回草稿），那也得说清画布是草稿
   const live = (w.status === 'governed' || w.status === 'published') && p === w.version
   const ahead = p != null ? w.version - p : 0
-  const pubText = p != null ? `${WORKFLOW_STATUS_LABEL[w.status === 'governed' ? 'governed' : 'published']} v${p}` : ''
+  const pubWord = WORKFLOW_STATUS_LABEL[w.status === 'governed' ? 'governed' : 'published']
+  const pubText = p != null ? `${pubWord} v${p}` : ''
   const title = [
     live ? `画布就是${pubText}` : `画布是草稿 v${w.version}`,
     p != null && !live ? `正式运行跑的是已发布的 v${p}${ahead > 0 ? `，画布比它新 ${ahead} 版` : ''}` : '',
@@ -644,10 +753,12 @@ function VersionLabel({ workflow: w }: { workflow: Workflow }) {
   return (
     <span className="flex shrink-0 items-center overflow-hidden rounded-full border text-2xs leading-5" title={title}>
       {!live && <span className="tnum px-2 text-dim">草稿 v{w.version}</span>}
+      {/* 最窄的工具栏里画布不是已发布那一版时只留「草稿 vN」：已发布的版本号在正式运行按钮上 */}
       {p != null && (
-        <span className={clsx('tnum flex items-center gap-1 px-2', !live && 'border-l')}
+        <span className={clsx('tnum flex items-center gap-1 px-2', !live && 'border-l @max-[760px]:hidden')}
               style={{ color: 'var(--ok)', ...(w.status === 'governed' ? { background: 'var(--st-done-soft)' } : {}) }}>
-          <ShieldCheck size={10} /> {pubText}
+          {/* 工具栏窄了只留盾牌和版本号，字留给读屏（全文在 title 里） */}
+          <ShieldCheck size={10} /> <span><span className="@max-[880px]:sr-only">{pubWord} </span>v{p}</span>
           {!live && ahead > 0 && <span className="text-faint @max-[1120px]:hidden">（领先 {ahead} 版）</span>}
         </span>
       )}
@@ -685,11 +796,16 @@ function AnalysisChip({ analysis, errors, warnings, open, onClick, onRetry }: {
       title={hintOf(errors || warnings ? '打开问题面板，点一条定位到节点' : '打开问题面板', 'problems')}
       onClick={onClick}
     >
-      {errors > 0 && <span className="tnum flex items-center gap-0.5"><XCircle size={9} /> {errors} 错</span>}
+      {/* 工具栏窄了只留图标和数字：「错」「提示」两个字给读屏，数字和图标的颜色、形状照样分得开 */}
+      {errors > 0 && (
+        <span className="tnum flex items-center gap-0.5">
+          <XCircle size={9} /> <span>{errors}<span className="@max-[880px]:sr-only"> 错</span></span>
+        </span>
+      )}
       {errors > 0 && warnings > 0 && <span className="text-faint">·</span>}
       {warnings > 0 && (
         <span className="tnum flex items-center gap-0.5" style={{ color: 'var(--warn)' }}>
-          <AlertTriangle size={9} /> {warnings} 提示
+          <AlertTriangle size={9} /> <span>{warnings}<span className="@max-[880px]:sr-only"> 提示</span></span>
         </span>
       )}
       {!errors && !warnings && <><Check size={9} /> 可运行</>}

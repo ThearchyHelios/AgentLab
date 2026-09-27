@@ -7,7 +7,7 @@ import { Handle, Position, type Edge, type NodeProps } from '@xyflow/react'
 import { Sparkles, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, sourceHandles } from './nodeDefs'
-import { NODE_WIDTH } from './routing'
+import { DENSE_EXITS, NODE_WIDTH } from './routing'
 import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from './TeamMatrix'
 import { edgeKey, topology } from '../run/derive'
 import { api } from '../api/client'
@@ -60,7 +60,8 @@ function summarize(type: NodeType, config: Record<string, any>): string {
     case 'memory':
       return `${{ recall: '回忆', write: '记住', clear: '清空' }[config.action as string] ?? ''} @ ${config.scope || 'default'}`
     case 'human':
-      return first(config.title) || '等待人工'
+      // 兜底不写「等待人工」：挂在还没跑的卡上读着像一个状态
+      return first(config.title) || '人工审批 · 未填标题'
     case 'validate':
       return 'JSON Schema 校验' + (config.repair_with_llm ? ' · 失败自动返工' : '')
     case 'metrics':
@@ -859,6 +860,8 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   ].filter(Boolean).join('\n') : ''
 
   const rank = typeof (data as any).rank === 'number' ? (data as any).rank : undefined
+  // 画布算出来的：走廊挪不出地方时，出口标签最多多宽（见 routing 的 Route.exit）
+  const exitRoom = (data as { exitRoom?: Record<string, number> }).exitRoom
   const style: CSSProperties & Record<string, any> = { width: NODE_WIDTH }
   if (rank != null) style['--rank'] = rank
 
@@ -875,7 +878,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
         copilotNew && 'node-copilot-new',
         // 出口一多（92px 高的卡上 5 个起，间距不到 16px），画在线上方的标签会压住
         // 上一条出口的线：改成标签骑在自己那条线上，谁是谁的不会看错
-        handles.length >= 5 && 'nc-exits-dense',
+        handles.length >= DENSE_EXITS && 'nc-exits-dense',
       )}
       data-state={state}
       data-type={type}
@@ -1024,8 +1027,11 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
         </div>
       )}
 
-      {/* 校验问题的角标：error 和 warning 同样醒目，谁也不挡谁 */}
-      {(hasErrors || hasWarnings) && (
+      {/* 校验问题的角标：error 和 warning 同样醒目，谁也不挡谁。只在编辑时挂——运行中、
+          结果还留在画布上时，卡片上要读的是状态：实心琥珀的「! 1」和等待审批同一个色相，
+          远景里又跟状态牌一样大，满屏的「没指定模型」会把真正的异常淹掉。问题清单照样在
+          工具栏的 chip 和问题面板里 */}
+      {editing && (hasErrors || hasWarnings) && (
         <div className="nc-issue" title={firstIssue}>
           {hasErrors && <span className="is-error tnum">✕ {errCount}</span>}
           {hasWarnings && <span className="is-warning tnum">! {warnCount}</span>}
@@ -1074,7 +1080,10 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
             {handle.label && (
               <span
                 className={clsx('nc-exit', hit === true && 'is-hit', hit === false && 'is-miss')}
-                style={{ top }}
+                style={exitRoom?.[handle.id] != null
+                  // 截短时往拐弯前收：拐弯从字里穿过去，比少几个字难认得多
+                  ? { top, maxWidth: exitRoom[handle.id], overflow: 'hidden', textOverflow: 'ellipsis' }
+                  : { top }}
               >
                 {handle.label}
               </span>

@@ -353,6 +353,29 @@ await section('跟随：只在贴底时跟', async () => {
   await page.close()
 })
 
+await section('点开已完成轮次的执行过程：不算新进展、不拽人（终验 NEW）', async () => {
+  // 按需取回的历史步骤以前算进「N 条新进展」：没有任何运行在跑，底下却浮出「24 条新进展」
+  for (const [n, pick, label] of [[1, 0, '单轮停在顶部'], [6, 2, '6 轮点开中间一轮']]) {
+    const { page, errors } = await open(`expand=${n}`, { w: 1100, h: 700, name: `expand-${n}` })
+    const at = await page.evaluate((i) => {
+      const el = document.querySelector('[data-stream-scroll]')
+      const turn = document.querySelectorAll('[data-turn]')[i]
+      el.scrollTop = i === 0 ? 0 : Math.max(0, el.scrollTop + turn.getBoundingClientRect().top - el.getBoundingClientRect().top - 40)
+      el.dispatchEvent(new Event('scroll'))
+      return Math.round(el.scrollTop)
+    }, pick)
+    await page.waitForTimeout(150)
+    await page.evaluate((i) => window.__expand(i), pick)
+    await page.waitForTimeout(400)
+    const after = await scrollState(page)
+    const pill = await page.locator('[data-jump-latest]').innerText().catch(() => '')
+    check(`${label}：点开之后不浮出「条新进展」`, !/条新进展/.test(pill), pill)
+    check(`${label}：没被拽到底部`, Math.abs(after.top - at) < 8, `${at} → ${after.top}/${after.max}`)
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    await page.close()
+  }
+})
+
 await section('回看历史运行：停在失败处', async () => {
   const { page } = await open('syn=mixed', { w: 1100, h: 560, name: 'history-failed' })
   const s1 = await scrollState(page)
@@ -528,6 +551,14 @@ await section('协作团队：运行中的说法', async () => {
   const r = await open('syn=team-routing&dense=1', { w: 380, h: 760, name: 'team-routing' })
   check('调度者在想时有一行进行中', (await r.page.locator('body').innerText()).includes('调度者在想下一步'))
   await r.page.close()
+  // 一轮里三人都还在跑时被取消（runfx-17 终验）：那一轮不知道本来要多久，不写「0 ms」
+  for (const [w, dense] of [[380, '1'], [1100, '0']]) {
+    const c = await open(`syn=team-cancelled&dense=${dense}`, { w, h: 760, name: `team-cancelled-${dense === '1' ? 'dense' : 'wide'}` })
+    const lanes = (await c.page.locator('[data-team-lanes]').innerText().catch(() => '')).replace(/\n/g, ' ')
+    check(`${dense === '1' ? '窄栏' : '宽栏'}：取消在一轮中途，轮次脚注不写 0 ms`, !!lanes && !/第\s?1\s?轮[^第]*· 0 ms/.test(lanes) && !/(^|[^\d.])0 ms/.test(lanes), lanes.slice(-80))
+    check(`${dense === '1' ? '窄栏' : '宽栏'}：轮次脚注说这一轮被取消了`, /第\s?1\s?轮[^第]*已取消/.test(lanes), lanes.slice(-80))
+    await c.page.close()
+  }
 })
 
 await section('出具横幅、答案操作、证据下钻', async () => {
@@ -833,6 +864,33 @@ await section('画布右栏：运行视图', async () => {
   check('跑完：审批卡不再挂着', await panel.locator('[data-approval]').count() === 0)
   check('续跑是谁发起的写在分段线上', (await panel.locator('[data-phase-mark]').allInnerTexts()).some((t) => t.includes('张工')))
   check('审批留痕写签批人，不写「你」', (await panel.innerText()).includes('→ 张工 放行了'))
+
+  // 老后端的历史运行（runfx-3 终验）：usage 里没有 active_ms，duration_ms 只记了审批恢复后的
+  // 最后一段。栏头、底栏得和航迹一样按事件算执行时长，不写「22 ms」
+  const OLD = [...HEAD, ...WAIT, ...FINISH.slice(0, -1), ev(23, 'run.finished', null,
+    { output: { 结论: 'C 供应商交期最短' }, usage: { input_tokens: 4470, output_tokens: 946, cost_usd: 0.0322 }, duration_ms: 22 }, 20.5)]
+  await page.evaluate((run) => {
+    const s = window.__studio.getState()
+    s.clearRun()
+    window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream', status: 'queued', input: {}, output: {}, error: null,
+      usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} })
+  }, RUN)
+  await feed(OLD)
+  await page.evaluate(() => {
+    const s = window.__studio.getState()
+    window.__studio.setState({ run: { ...s.run, status: 'succeeded', usage: { duration_ms: 22, input_tokens: 4470, output_tokens: 946, cost_usd: 0.0322 } } })
+  })
+  await page.waitForTimeout(500)
+  const oldHead = (await head()).replace(/\n/g, ' ')
+  const oldFoot = (await panel.locator('[aria-label="这次运行的用量"]').innerText()).replace(/\n/g, ' ')
+  const active = await page.evaluate(() => {
+    const t = window.__studio.getState().trace
+    return t.drives.reduce((n, [a, b]) => n + ((b ?? a) - a), 0)
+  })
+  const said = oldFoot.match(/执行\s*([\d.]+ s)/)?.[1] ?? ''
+  check('老运行：栏头、底栏不写最后一段的「22 ms」', !/22 ms/.test(oldHead) && !/22 ms/.test(oldFoot), `${oldHead} / ${oldFoot}`)
+  check('老运行：执行时长按事件算（和航迹同一个数）', !!said && Math.abs(parseFloat(said) * 1000 - active) < 100 && oldHead.includes(said),
+    `航迹 ${active} ms · 底栏 ${said} · 栏头 ${oldHead}`)
   check('画布右栏没有运行时报错', errors.length === 0, errors.join(' | '))
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {

@@ -4,6 +4,7 @@ import type {
   ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
+import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
 
 const BASE = '/api'
 
@@ -69,16 +70,13 @@ function actorHeader(): Record<string, string> {
   return actor ? { 'X-Actor': encodeURIComponent(actor) } : {}
 }
 
-/** FastAPI 的 422 是 [{loc, msg, type}] 数组，直接 String() 会变成 [object Object] */
-function describeDetail(detail: unknown): string {
+/**
+ * FastAPI 的 422 是 [{loc, msg, type}] 数组：直接 String() 是 [object Object]，照拼 msg
+ * 又是 pydantic 的英文原文。按 type 翻成中文（lib/validation），path 用来查表单上的叫法
+ */
+function describeDetail(detail: unknown, path?: string): string {
   if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) {
-    const parts = detail.map((d: any) => {
-      const loc = Array.isArray(d?.loc) ? d.loc.filter((x: unknown) => x !== 'body' && x !== 'query').join('.') : ''
-      return loc ? `${loc}：${d?.msg ?? ''}` : String(d?.msg ?? JSON.stringify(d))
-    })
-    return `提交的内容不符合要求：${parts.join('；')}`
-  }
+  if (Array.isArray(detail)) return `${VALIDATION_TITLE}：${describeValidation(detail, path).join('；')}`
   try { return JSON.stringify(detail) } catch { return String(detail) }
 }
 
@@ -132,7 +130,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   } finally {
     if (timer) clearTimeout(timer)
   }
-  if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''))
+  if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''), path)
   report(true)
   if (res.status === 204) return undefined as T
   return res.json()
@@ -145,7 +143,7 @@ const codeOf = (body: unknown): string | undefined => {
 }
 
 /** 非 2xx 的响应 → ApiError，顺带报告连接状态。fetch 和 XHR 两条路共用 */
-function failure(status: number, statusText: string, text: string): ApiError {
+function failure(status: number, statusText: string, text: string, path?: string): ApiError {
   let body: any
   let isJson = false
   try { body = JSON.parse(text); isJson = true } catch { /* 响应体不是 JSON */ }
@@ -159,7 +157,7 @@ function failure(status: number, statusText: string, text: string): ApiError {
   report(true)
   if (isJson) {
     const detail = body?.detail ?? body
-    return new ApiError(status, describeDetail(detail), {
+    return new ApiError(status, describeDetail(detail, path), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
       code: codeOf(body),
     })
@@ -214,7 +212,7 @@ function upload<T>(path: string, form: FormData, opts?: UploadOptions): Promise<
     xhr.onload = () => {
       cleanup()
       if (xhr.status < 200 || xhr.status >= 300) {
-        reject(failure(xhr.status, xhr.statusText, xhr.responseText ?? ''))
+        reject(failure(xhr.status, xhr.statusText, xhr.responseText ?? '', path))
         return
       }
       report(true)
@@ -761,7 +759,7 @@ export function streamCopilot(
           return
         }
         report(true)
-        onEnd(isJson ? describeDetail(body?.detail ?? body)
+        onEnd(isJson ? describeDetail(body?.detail ?? body, '/copilot/generate-stream')
           : res.status >= 500 ? `后端出错了（${res.status}），详情看服务日志`
           : `请求没有成功（${res.status} ${res.statusText}）`, { status: res.status, code: isJson ? codeOf(body) : undefined })
         return

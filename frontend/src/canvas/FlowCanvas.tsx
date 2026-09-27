@@ -12,6 +12,7 @@ import { FlowEdge, MomentContext, RoutingContext, type EdgeRunState, type EdgeVi
 import { openInspector, stepsFirst, useSheet } from './InspectorSheet'
 import { NodeCard } from './NodeCard'
 import { NODE_CATEGORIES, NODE_DEFS, type NodeDef } from './nodeDefs'
+import { loopFrames } from './loops'
 import { buildRoutes, NODE_WIDTH } from './routing'
 import { RunTimeline, useDock } from './RunTimeline'
 import { isComposing, toast } from '../components/ui'
@@ -286,6 +287,44 @@ function useRemovedGhosts(): { seq: number; items: Ghost[] } | null {
 }
 
 // -------------------------------------------------------------------------
+// 循环体底框：垫在边和卡片下面，只画不接指针
+// -------------------------------------------------------------------------
+
+/**
+ * 每个循环一块淡色区域，左上角写「循环体 · 最多 N 轮」；在跑的循环再补一句「第 k 轮」，
+ * 回放时是游标那一刻的轮次。几何只跟着节点、连线重算，事件进来只换标签上的轮次
+ */
+const LoopFrames = memo(function LoopFrames({ nodes, edges, trace }: {
+  nodes: FlowNode[]
+  edges: Edge[]
+  trace: Trace
+}) {
+  const frames = useMemo(() => loopFrames(nodes, edges), [nodes, edges])
+  if (!frames.length) return null
+  return (
+    <ViewportPortal>
+      <div className="sf-loops" aria-hidden>
+        <svg className="sf-loops-svg">
+          {frames.map((f) => <path key={f.id} className="sf-loop-frame" data-loop={f.id} d={f.path} />)}
+        </svg>
+        {frames.map((f) => {
+          const n = trace.nodes[f.id]
+          const round = n?.state === 'running' && n.iteration ? n.iteration : null
+          return (
+            <div key={f.id} className={clsx('sf-loop-tag', round && 'is-running')} data-loop={f.id}
+                 style={{ transform: `translate(${f.labelX}px, ${f.labelY}px) translateY(-50%)` }}>
+              <span className="sf-loop-glyph">↻</span>
+              <span>循环体 · 最多 {f.max} 轮</span>
+              {round && <b className="tnum">第 {round} 轮</b>}
+            </div>
+          )
+        })}
+      </div>
+    </ViewportPortal>
+  )
+})
+
+// -------------------------------------------------------------------------
 // 双击空白处快速添加：在光标处搜类型、回车放下。和节点库读同一份节点定义
 // -------------------------------------------------------------------------
 
@@ -420,6 +459,18 @@ function CanvasInner() {
   // 走线方案整张图算一次。节点尺寸要等 React Flow 量完才有，量到之后
   // nodes 会变，这里跟着重算，端口和车道就落到实测尺寸上。
   const routes = useMemo(() => buildRoutes(nodes, edges), [nodes, edges])
+  // 走廊挪不出地方的出口标签：节点 → 出口 → 最多多宽。卡片按它截短，不伸进拐弯
+  const exitRooms = useMemo(() => {
+    const out = new Map<string, Record<string, number>>()
+    for (const e of edges) {
+      const exit = routes.get(e.id)?.exit
+      if (!exit) continue
+      const rooms = out.get(e.source) ?? {}
+      rooms[exit.handle] = Math.min(rooms[exit.handle] ?? Infinity, exit.room)
+      out.set(e.source, rooms)
+    }
+    return out
+  }, [routes, edges])
 
   // ---- 此刻（实时或回放游标那一刻）的航迹 ----
   // graph 直接用 store 里的 nodes / edges 数组：卡片那边按同样的引用取，缓存才对得上
@@ -498,24 +549,25 @@ function CanvasInner() {
     })
   }, [edges, edgeStates, topo, view.trace, replayAt, hasRun, selectedId, pathView])
 
-  // ---- 节点：注入拓扑层级（一次性时刻按它错开），只看执行路径时压暗没走的 ----
+  // ---- 节点：注入拓扑层级（一次性时刻按它错开）和出口标签的宽度上限，只看执行路径时压暗没走的 ----
   // 按原节点对象缓存：拖一个节点只换那一个的副本，其余卡片的 data 引用不变，memo 生效
   const nodeCache = useRef(new WeakMap<FlowNode, { key: string; out: FlowNode }>())
   const flowNodes = useMemo(() => nodes.map((n) => {
     const rank = topo.rank[n.id] ?? 0
     const off = pathView && !visited.has(n.id)
-    const key = `${rank}|${off ? 1 : 0}`
+    const exitRoom = exitRooms.get(n.id)
+    const key = `${rank}|${off ? 1 : 0}|${exitRoom ? JSON.stringify(exitRoom) : ''}`
     const hit = nodeCache.current.get(n)
     if (hit && hit.key === key) return hit.out
     const out: FlowNode = {
       ...n,
       className: clsx(n.className, off && 'sf-offpath') || undefined,
       style: { ...n.style, '--rank': rank } as CSSProperties,
-      data: { ...n.data, rank } as FlowNode['data'],
+      data: { ...n.data, rank, ...(exitRoom ? { exitRoom } : {}) } as FlowNode['data'],
     }
     nodeCache.current.set(n, { key, out })
     return out
-  }), [nodes, topo, pathView, visited])
+  }), [nodes, topo, pathView, visited, exitRooms])
 
   // ---- 小地图的状态表 ----
   // 小地图按节点和视口的并集缩进 150×100。这里只按节点算（视口一动就重算不值得），
@@ -956,6 +1008,7 @@ function CanvasInner() {
                 style={{ width: 150, height: 100 }}
                 ariaLabel={hasRun ? '小地图（按运行状态着色）' : '小地图'}
               />
+              <LoopFrames nodes={nodes} edges={edges} trace={view.trace} />
               {ghosts && (
                 <ViewportPortal>
                   {ghosts.items.map((g) => (

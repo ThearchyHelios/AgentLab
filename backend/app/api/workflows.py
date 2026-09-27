@@ -271,6 +271,9 @@ async def restore_version(
             note=f"回滚到 v{version}",
         )
     )
+    # 恢复旧版也是改图，和 PATCH 同一条规矩：旧图没过这次的闸，不能挂着受管 / 已发布
+    if workflow.status in ("published", "governed"):
+        workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
     return workflow

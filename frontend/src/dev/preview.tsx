@@ -212,6 +212,15 @@ function synthetic(name: string): StreamTurn[] {
       return [{ id: 'team-live', question: '比较三家供应商的交期风险', phase: 'running', status: '运行中',
                 steps: decodeRun(ev), runId: 'syn-team-live' }]
     }
+    case 'team-cancelled': {
+      // 第 1 轮三人都还在跑时被取消：那一轮不知道本来要多久
+      const ev = rebase(teamRun('members').filter((e) =>
+        !(e.data?.agent === '物流员' && (e.type === 'agent.step.end' || e.type === 'llm.end'))))
+      const last = ev[ev.length - 1]
+      ev.push({ seq: last.seq + 1, type: 'run.cancelled', node_id: null, ts: last.ts + 1, data: {} })
+      return [{ id: 'team-cancelled', question: '比较三家供应商的交期风险', phase: 'done', statusCode: 'cancelled',
+                steps: decodeRun(ev), runId: 'syn-team-cancelled' }]
+    }
     case 'team-routing': {
       const ev = rebase(teamRun('routing'))
       return [{ id: 'team-routing', question: '比较三家供应商的交期风险', phase: 'running', status: '运行中',
@@ -378,6 +387,23 @@ function Growing({ dense }: { dense: boolean }) {
   )
 }
 
+/**
+ * 几轮已经完成的对话，执行过程按需取回：window.__expand(i) 给第 i 轮填上步骤，和问数据页点
+ * 「看执行过程」一样。check-stream 用它验证取回的历史步骤不算「新进展」、也不把人拽走
+ */
+function Expanding({ dense, n }: { dense: boolean; n: number }) {
+  const [open, setOpen] = useState<number[]>([])
+  useEffect(() => {
+    ;(window as any).__expand = (i: number) => setOpen((x) => [...x, i])
+  }, [])
+  const turns: StreamTurn[] = Array.from({ length: n }, (_, i) => ({
+    id: `past-${i}`, question: `第 ${i + 1} 个问题：把这批报表各查一遍`, phase: 'done', status: '已完成',
+    steps: open.includes(i) ? decodeRun(pipelineRun(12), { status: 'succeeded' }) : [],
+    output: { result: longReport() }, runId: `syn-past-${i}`,
+  }))
+  return <AssistantStream dense={dense} turns={turns} />
+}
+
 /** 审批卡的上下文：等了多久、挂在哪个节点、将以谁的名义签批 */
 const APPROVAL = {
   id: 'ap-1', run_id: 'syn-mixed', node_id: 'review', mode: 'approve' as const,
@@ -418,6 +444,7 @@ function Preview() {
 
   if (md) return <div className="h-full overflow-y-auto"><MarkdownCases /></div>
   if (params.get('grow') === '1') return <Growing dense={dense} />
+  if (params.get('expand')) return <Expanding dense={dense} n={Number(params.get('expand')) || 1} />
   if (params.get('approval') === '1') {
     return (
       <div className={dense ? 'w-[360px] border-r' : 'mx-auto max-w-3xl p-4'}>

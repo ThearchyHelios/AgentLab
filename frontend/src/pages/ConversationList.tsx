@@ -38,9 +38,19 @@ export function ConversationList() {
   // 相对时间和分组一分钟重算一次就够：「刚刚」「3 分钟前」不需要更细
   const now = useTicker(60_000)
 
+  const narrow = useNarrow()
+  const [collapsed, setCollapsed] = useState(narrow)
+  // 跨过断点时跟着变；窄屏上挑了一个对话（或新建、从回收站点开）就把抽屉收回去
+  useEffect(() => { setCollapsed(narrow) }, [narrow])
+  useEffect(() => { if (narrow) setCollapsed(true) }, [currentId, narrow])
+
   // 切会话 = 换地址，不是改 store。store 那个 currentId 是 URL 的派生缓存，
   // 在这里直接 set 的话，地址栏不动、刷新就跳回旧的那个，前进后退也全失效
-  const open = (id: string) => navigate(`/chat/${id}`)
+  const open = (id: string) => {
+    navigate(`/chat/${id}`)
+    // 窄屏上点的就是当前这个时地址不变，抽屉也得收
+    if (narrow) setCollapsed(true)
+  }
 
   const startNew = async () => {
     try {
@@ -79,7 +89,6 @@ export function ConversationList() {
       },
     })
   }
-  const [collapsed, setCollapsed] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
   const [query, setQuery] = useState('')
 
@@ -100,26 +109,7 @@ export function ConversationList() {
     : list), [list, needle])
   const groups = useMemo(() => groupByDay(shown, now), [shown, now])
 
-  if (collapsed) {
-    return (
-      <div className="flex w-9 shrink-0 flex-col items-center gap-1 border-r bg-panel py-2">
-        <button className="btn btn-sm btn-ghost" title="展开对话列表" aria-label="展开对话列表"
-                onClick={() => setCollapsed(false)}>
-          <PanelLeftOpen size={13} />
-        </button>
-        <button className="btn btn-sm btn-ghost" title="新对话" aria-label="新对话" onClick={() => void startNew()}>
-          <MessageSquarePlus size={13} />
-        </button>
-      </div>
-    )
-  }
-
-  if (showTrash) {
-    // 相对时间跟着这一层每分钟重渲染
-    return <TrashView items={trash} currentId={currentId} onBack={() => setShowTrash(false)} />
-  }
-
-  return (
+  const listPanel = (
     <aside className="flex w-60 shrink-0 flex-col border-r bg-panel" aria-label="对话列表">
       {/* 和右边的页头同高（48px）、同一条底线：两栏顶边对齐 */}
       <div className="flex h-12 shrink-0 items-center gap-1 border-b px-2">
@@ -252,6 +242,50 @@ export function ConversationList() {
       </div>
     </aside>
   )
+
+  const strip = (
+    <div className="flex w-9 shrink-0 flex-col items-center gap-1 border-r bg-panel py-2">
+      <button className="btn btn-sm btn-ghost" title="展开对话列表" aria-label="展开对话列表"
+              onClick={() => setCollapsed(false)}>
+        <PanelLeftOpen size={13} />
+      </button>
+      <button className="btn btn-sm btn-ghost" title="新对话" aria-label="新对话" onClick={() => void startNew()}>
+        <MessageSquarePlus size={13} />
+      </button>
+    </div>
+  )
+  if (collapsed) return strip
+
+  // 相对时间跟着这一层每分钟重渲染
+  const panel = showTrash
+    ? <TrashView items={trash} currentId={currentId} onBack={() => setShowTrash(false)} />
+    : listPanel
+  if (!narrow) return panel
+  // 窄屏上 240px 的列表和正文抢宽度，正文被挤成一字一行、整页横向溢出：列表改成浮在
+  // 正文上面的抽屉，收起条留在原处占位，开合时正文不跟着跳
+  return (
+    <>
+      {strip}
+      <div className="absolute inset-0 z-20 bg-black/40" aria-hidden onClick={() => setCollapsed(true)} />
+      <div className="absolute inset-y-0 left-0 z-30 flex" style={{ boxShadow: 'var(--elev-3)' }} data-conversation-drawer="">
+        {panel}
+      </div>
+    </>
+  )
+}
+
+/** 窄于 768px 算窄屏：会话列表默认收起，展开时是抽屉 */
+function useNarrow(): boolean {
+  const query = '(max-width: 767px)'
+  const [narrow, setNarrow] = useState(() => typeof matchMedia === 'function' && matchMedia(query).matches)
+  useEffect(() => {
+    if (typeof matchMedia !== 'function') return
+    const mq = matchMedia(query)
+    const on = () => setNarrow(mq.matches)
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
+  }, [])
+  return narrow
 }
 
 /** 行尾的浮层按钮：悬停或键盘聚焦到这一行才出现，渐隐背景盖住标题尾巴而不挤占宽度 */

@@ -8,7 +8,7 @@ import {
   SectionBar, Skeleton, StatusBadge, StatusPill, Tabs, TabPanel, ToastHost, confirmDialog, deferDelete,
   promptDialog, toast, useRadioGroup, withoutDeferred,
 } from '../components/ui'
-import { ApiError, api } from '../api/client'
+import { ApiError, api, streamCopilot } from '../api/client'
 import { useCatalog, useDatasources, useOnReconnect } from '../store/catalog'
 import { STATUS } from '../lib/status'
 import { formatClock, formatCost, formatDateTime, formatDuration, formatTime, formatTokens } from '../lib/format'
@@ -20,6 +20,7 @@ import * as errors from '../lib/errors'
 import * as explain from '../lib/explain'
 import * as health from '../lib/health'
 import * as actor from '../lib/actor'
+import * as validation from '../lib/validation'
 import '../index.css'
 
 /**
@@ -426,10 +427,10 @@ function Harness() {
 }
 
 ;(window as any).__ui = {
-  toast, confirmDialog, promptDialog, useCatalog, ApiError, api,
+  toast, confirmDialog, promptDialog, useCatalog, ApiError, api, streamCopilot,
   mountDatasources: (n: number) => setDatasourceConsumers(n),
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
-  lib: { format, status, keys, terms, errors, explain, health, actor },
+  lib: { format, status, keys, terms, errors, explain, health, actor, validation },
 }
 
 createRoot(document.getElementById('root')!).render(

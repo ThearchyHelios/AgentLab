@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { Link } from 'react-router-dom'
 import { AlertTriangle, ChevronLeft, Copy, Lock, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax } from './nodeDefs'
@@ -503,7 +504,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
           options={skills.filter((s) => s.enabled).map((s) => ({ value: s.name, label: s.name, hint: s.description }))}
           value={Array.isArray(value) ? value : []}
           onChange={onChange}
-          empty="还没有 Skill，去「方法论」页创建"
+          addLabel="添加 Skill"
+          empty={<>还没有可用的 Skill。<Link to="/knowledge/skills" className="underline underline-offset-2 hover:text-fg">
+            去「知识 → 方法论 Skill」创建</Link></>}
         />
       )
 
@@ -627,9 +630,11 @@ function SubgraphPicker({ id, value, version, invalid, describedBy, onChange }: 
 // 复合编辑器
 // -------------------------------------------------------------------------
 
-function MultiPick({ options, value, onChange, empty }: {
+function MultiPick({ options, value, onChange, empty, addLabel = '添加工具' }: {
   options: { value: string; label: string; hint?: string; danger?: boolean; group?: string }[]
-  value: string[]; onChange: (v: string[]) => void; empty: string
+  value: string[]; onChange: (v: string[]) => void; empty: React.ReactNode
+  /** 展开按钮上写添加的是什么：只写「添加」时，一个检查器里有两个多选就分不清 */
+  addLabel?: string
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -658,14 +663,18 @@ function MultiPick({ options, value, onChange, empty }: {
       </div>
       {/* 定位（revealField）把光标放在这儿，不放在前面那排芯片的 × 上 */}
       <button type="button" className="btn btn-sm w-full justify-center" onClick={() => setOpen(!open)} data-reveal-focus>
-        <Plus size={11} /> {open ? '收起' : '添加'}
+        <Plus size={11} /> {open ? '收起' : addLabel}
       </button>
       {open && (
         <div className="mt-1.5 rounded border bg-bg">
           <input className="field rounded-b-none border-0 border-b" placeholder="搜索…"
                  value={query} onChange={(e) => setQuery(e.target.value)} autoFocus />
           <div className="max-h-52 overflow-y-auto p-1">
-            {!filtered.length && <div className="px-2 py-3 text-center text-2xs text-faint">{empty}</div>}
+            {!filtered.length && (
+              <div className="px-2 py-3 text-center text-2xs text-faint">
+                {options.length ? `没有匹配「${query.trim()}」的` : empty}
+              </div>
+            )}
             {filtered.map((o) => (
               <button
                 type="button"

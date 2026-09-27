@@ -69,14 +69,24 @@ const check = (name, cond, detail = '') => {
 // ---------------------------------------------------------------- 伪造的数据
 
 const iso = (minsAgo) => new Date(Date.now() - minsAgo * 60_000).toISOString()
-const YESTERDAY_NOON = Math.round((Date.now() - new Date(new Date().setHours(12, 0, 0, 0) - 86_400_000).getTime()) / 60_000)
+const YESTERDAY_NOON = () => Math.round((Date.now() - new Date(new Date().setHours(12, 0, 0, 0) - 86_400_000).getTime()) / 60_000)
 // 「今天」同理：零点刚过的那一分钟里，「1 分钟前」已经是昨天
-const TODAY_RECENT = Math.min(1, Math.floor((Date.now() - new Date().setHours(0, 0, 0, 0)) / 60_000))
-const conv = (id, title, turns, minsAgo, extra = {}) => ({
-  id, title, kind: 'chat', workflow_id: null, archived: false,
-  created_at: iso(minsAgo + 5), last_active_at: iso(minsAgo), turn_count: turns, last_question: title,
-  last_status: turns ? 'done' : null, last_run_id: null, ...extra,
-})
+const TODAY_RECENT = () => Math.min(1, Math.floor((Date.now() - new Date().setHours(0, 0, 0, 0)) / 60_000))
+/**
+ * 会话的时间在每次被读到（列表接口序列化、展开拷贝）时现算。以前模块加载时就算好了：
+ * 整套跑十几分钟，23:4x 开跑、跑到会话列表那段已经过了零点，「今天」的全成了「昨天」，
+ * 分组检查误报。minsAgo 可以是函数：「昨天中午」「今天刚才」要按读的那一刻算
+ */
+const conv = (id, title, turns, minsAgo, extra = {}) => {
+  const ago = typeof minsAgo === 'function' ? minsAgo : () => minsAgo
+  return {
+    id, title, kind: 'chat', workflow_id: null, archived: false,
+    get created_at() { return iso(ago() + 5) },
+    get last_active_at() { return iso(ago()) },
+    turn_count: turns, last_question: title,
+    last_status: turns ? 'done' : null, last_run_id: null, ...extra,
+  }
+}
 const LONG = (n) => Array.from({ length: n }, (_, i) =>
   `${i + 1}. 这一段是很长的结论正文，用来把会话撑到超过一屏，检查输入框会不会被挤出视口。`).join('\n')
 const FULL = '这是完整答案的开头。' + '正文'.repeat(1920) + '【完整结尾】'   // 3,850 字左右
@@ -682,6 +692,22 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/hero-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+
+    // 知识库、工具没取回来（system-2 终验）：能力条不能把「没取回来」说成「0 个」
+    const off = await open(theme)
+    await off.page.route(/\/api\/(tools|kb\/collections)(\?|$)/, (route) => route.fulfill({ status: 502, body: 'bad gateway' }))
+    await goto(off.page, 'c0emptg')
+    await shows(off.page, '问你的数据')
+    // 导航里也有这两个链接（「知识」「工具」），只看首屏能力条上的
+    const strip = off.page.locator('a[href="/knowledge"], a[href="/tools"]').filter({ hasText: /知识库|工具\s*(\d|—|没)/ })
+    // 请求还在路上时写「—」，等它落定
+    await off.page.waitForFunction(() => [...document.querySelectorAll('a[href="/knowledge"], a[href="/tools"]')]
+      .every((a) => !a.textContent.includes('—')), null, { timeout: 8000 }).catch(() => {})
+    const said = (await strip.allInnerTexts()).join(' | ')
+    check('知识库、工具没取回来：不写「0 个」', !/知识库 0 个|工具 0 个/.test(said), said)
+    check('知识库、工具没取回来：说没取回来', /知识库没取回来/.test(said) && /工具没取回来/.test(said), said)
+    await off.page.screenshot({ path: `${SHOTS}/hero-catalog-failed-${theme}.png` })
+    await off.ctx.close()
   })
 
   await section('states', '三种状态：加载中 / 加载失败 / 空', async () => {
@@ -740,6 +766,37 @@ for (const theme of THEMES) {
       await page.screenshot({ path: `${SHOTS}/long-${width}-${theme}.png` })
       await ctx.close()
     }
+
+    // 窄屏（390×844）：240px 的会话列表以前照常占宽，正文一行只剩一两个字、整页横向溢出
+    const { page, ctx } = await open(theme, { width: 390, height: 844 })
+    await goto(page, 'c0longc')
+    await shows(page, '第 6 个问题')
+    await page.waitForTimeout(400)
+    const narrow = await page.evaluate(() => {
+      const root = document.querySelector('button[aria-label="展开对话列表"]')?.closest('.relative')
+      const body = document.querySelector('[data-stream-scroll]')?.getBoundingClientRect()
+      const ta = document.querySelector('textarea')?.getBoundingClientRect()
+      return { list: !!document.querySelector('aside[aria-label="对话列表"]'), toggle: !!root,
+               over: root ? root.scrollWidth - root.clientWidth : null, body: body && Math.round(body.width),
+               ta: ta && Math.round(ta.right), w: innerWidth }
+    })
+    check('390 宽：会话列表默认收起', !narrow.list && narrow.toggle, JSON.stringify(narrow))
+    check('390 宽：问数据这一栏不横向溢出', narrow.over === 0, JSON.stringify(narrow))
+    check('390 宽：正文宽度够读（≥ 260px）', (narrow.body ?? 0) >= 260, JSON.stringify(narrow))
+    check('390 宽：输入框右边在视口内', !!narrow.ta && narrow.ta <= narrow.w, JSON.stringify(narrow))
+    await page.screenshot({ path: `${SHOTS}/narrow-390-${theme}.png` })
+    await page.getByRole('button', { name: '展开对话列表' }).click()
+    const drawer = page.locator('[data-conversation-drawer] aside[aria-label="对话列表"]')
+    check('390 宽：展开是浮在正文上面的抽屉', await drawer.waitFor({ timeout: 3000 }).then(() => true, () => false))
+    const bodyAfter = await page.evaluate(() => Math.round(document.querySelector('[data-stream-scroll]')?.getBoundingClientRect().width ?? 0))
+    check('390 宽：抽屉打开时正文不被挤窄', bodyAfter === narrow.body, `${narrow.body} → ${bodyAfter}`)
+    await page.screenshot({ path: `${SHOTS}/narrow-390-drawer-${theme}.png` })
+    await drawer.locator('div.group', { hasText: '会话 B' }).locator('button').first().click()
+    await page.waitForURL(/\/chat\/c0idleb$/, { timeout: 5000 }).catch(() => {})
+    await page.waitForTimeout(300)
+    check('390 宽：挑了一个对话，抽屉收回去', page.url().endsWith('/chat/c0idleb')
+      && await page.locator('aside[aria-label="对话列表"]').count() === 0, page.url())
+    await ctx.close()
   })
 
   await section('busy', '忙不忙按会话算', async () => {
@@ -1707,6 +1764,11 @@ for (const theme of THEMES) {
       && (await fresh.getAttribute('aria-checked')) === 'false')
     const size = await fresh.evaluate((el) => parseFloat(getComputedStyle(el).fontSize)).catch(() => 0)
     check('字不小于 11px', size >= 11, `${size}px`)
+    // 从头生成只是不带画布上的图：后端照样垫上之前几轮对话和上一轮的图（studio-m2 终验）。
+    // 提示不能说成「整个重新生成」、像是什么都不记得
+    const freshTip = await fresh.getAttribute('title') ?? ''
+    check('「从头生成」的提示说清之前的对话仍会参考', /不看画布/.test(freshTip) && /之前.*对话/.test(freshTip)
+      && /参考/.test(freshTip), freshTip)
     await base.focus()
     await page.keyboard.press('ArrowRight')
     check('方向键切到「从头生成」', (await fresh.getAttribute('aria-checked')) === 'true'

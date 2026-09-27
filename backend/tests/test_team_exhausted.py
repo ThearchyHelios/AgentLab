@@ -212,3 +212,70 @@ async def test_continuing_a_failed_team_does_not_replay_its_rounds(monkeypatch):
     assert tally(after_events) == before, "接着跑把前几轮的调度和成员又发了一遍"
     # 前几轮取自断点，用量不能跟着丢：成员的调用也要算进去
     assert row.usage["calls"] == before["llm.end"], (row.usage, before)
+
+
+# --------------------------------------------------------------------------
+# 调度者说完成了，可派出去的成员一个都没交回结果
+# --------------------------------------------------------------------------
+
+DSML = ('<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="db_query__shop">\n'
+        '<｜｜DSML｜｜ parameter name="sql">SELECT COUNT(*) FROM orders</｜｜DSML｜｜ parameter>\n'
+        '</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>')
+
+
+def _gives_up_after(monkeypatch, *plan: str, writes: dict[str, str]) -> None:
+    """调度者按 plan 依次派人，派完就判完成；成员按 system 认人，照 writes 回话。"""
+    from app.providers import mock_model
+
+    routed = {"n": 0}
+
+    def _decide(self, messages):
+        if self.response_format:
+            routed["n"] += 1
+            if routed["n"] <= len(plan):
+                who = plan[routed["n"] - 1]
+                decision = {"assignments": [{"agent": who, "instruction": "做你那部分"}],
+                            "done": False, "reason": f"交给{who}"}
+            else:
+                decision = {"assignments": [], "done": True, "reason": "查不到了，先这样"}
+            return AIMessage(content=json.dumps(decision, ensure_ascii=False))
+        role = str(messages[0].content)
+        return AIMessage(content=next(v for k, v in writes.items() if k in role))
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_decide", _decide)
+
+
+async def test_nobody_delivering_is_not_a_finished_team(monkeypatch):
+    """验收时的一次：成员没绑工具，两次都把工具调用写成文字；调度者读到失败说明，
+    判定完成。团队把「（<成员> 这一步失败：…）」当成果交了出去，运行 succeeded，
+    画布头部是绿色的已完成——一条数据都没查到。"""
+    _gives_up_after(monkeypatch, "核对员", writes={"复核": DSML, "结论": "不该轮到我"})
+    row, events = await _finish(_graph())
+    assert row.status == "failed", f"失败说明被当成了成果：{row.output}"
+    assert row.error_node_id == "team"
+    assert "没有交出结论" in row.error and "查不到了，先这样" in row.error, row.error
+    # 失败的原因一起带上：界面照它说「模型没有真正调用工具」、指到画布上去绑工具
+    assert "工具调用的原始标记" in row.error, row.error
+    assert "撰稿员" in row.error, "从没被派过的成员要点出来"
+
+
+async def test_nobody_delivering_fails_even_when_set_to_degrade(monkeypatch):
+    """「用完轮数时 · 降档交付」交的是成员原话。没人交回结果时手上只有失败说明，
+    交下去不是降档、是冒充：照样判失败，也不借用「用完 N 轮」的说法。"""
+    _gives_up_after(monkeypatch, "核对员", writes={"复核": DSML, "结论": "不该轮到我"})
+    row, events = await _finish(_graph(on_exhausted="degrade"))
+    assert row.status == "failed", f"失败说明被当成了成果：{row.output}"
+    assert "没有交出结论" in row.error and "用完" not in row.error, row.error
+    assert not [e for e in events if e.data.get("code") == "team_exhausted"]
+
+
+async def test_a_failed_last_step_is_not_handed_over_as_the_result(monkeypatch):
+    """核对员查到了，撰稿员失败，调度者判完成：成果是核对员查到的，不是撰稿员的失败说明。"""
+    _gives_up_after(monkeypatch, "核对员", "撰稿员", writes={"复核": "一共 1 条。", "结论": DSML})
+    row, events = await _finish(_graph())
+    assert row.status == "succeeded", row.error
+    assert row.output["r"] == "一共 1 条。", row.output
+    warn = [e.data for e in events if e.type == "log" and e.data.get("code") == "team_last_failed"]
+    assert warn and "撰稿员" in warn[0]["message"] and "核对员" in warn[0]["message"], warn
+    signals = review.scan(events, row.output)
+    assert any(s.kind == "team_last_failed" for s in signals), signals

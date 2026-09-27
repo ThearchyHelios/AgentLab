@@ -22,8 +22,9 @@
 // - Esc 在右栏里按也清掉整次运行；泳道、节点格、坞高只能用鼠标；
 // - 运行中点节点，属性面板整块盖住右栏的运行视图（应当先请右栏滚到它的步骤）；
 // - 等审批时只能批不能放弃；回放时回边的 ×N、面板的用量拿终值冒充那一刻；
-// - Copilot 搭图时新节点落在视口外看不见；双击空白处只会缩放；1024 宽打开只看得见两张半卡；
-// - Copilot 删掉的节点一声不响就没了，看不出删的是哪个、原来在哪。
+// - Copilot 搭图时新节点落在视口外看不见；双击空白处只会缩放；窄画布打开只看得见两张半卡；
+// - Copilot 删掉的节点一声不响就没了，看不出删的是哪个、原来在哪；
+// - 循环体没有范围：哪些节点每轮都跑、最多几轮、现在第几轮，只能顺着回边倒推。
 //
 // 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
 // 沙箱拷贝）跑时带上地址：
@@ -101,6 +102,33 @@ const WIDE = {
   edges: Array.from({ length: 11 }, (_, i) => ({ id: `w${i}`, source: `n${i}`, target: `n${i + 1}` })),
 }
 
+/**
+ * 嵌套循环：外层逐批、内层逐条复核。另有一支和循环体同列、却不在循环里的旁路：
+ * 底框按列圈，不能把它也圈进去
+ */
+const LOOPS = {
+  nodes: [
+    { id: 'in', type: 'input', data: { label: '批次', config: { fields: [{ name: 'batches' }] } } },
+    { id: 'outer', type: 'loop', data: { label: '逐批处理', config: { mode: 'foreach', items: '{{ input.batches }}', item_var: 'batch', max_iterations: 3 } } },
+    { id: 'inner', type: 'loop', data: { label: '逐条复核', config: { mode: 'while', condition: 'vars.left > 0', max_iterations: 4 } } },
+    { id: 'check', type: 'llm', data: { label: '复核一条', config: { prompt: '{{ vars.batch }}' } } },
+    { id: 'merge', type: 'transform', data: { label: '合并本批', config: { expression: 'vars.batch' } } },
+    { id: 'side', type: 'llm', data: { label: '旁路抽检', config: { prompt: 'x' } } },
+    { id: 'report', type: 'output', data: { label: '汇总报告', config: { fields: [{ name: 'r' }] } } },
+  ],
+  edges: [
+    { id: 'l1', source: 'in', target: 'outer' },
+    { id: 'l2', source: 'outer', target: 'inner', sourceHandle: 'body' },
+    { id: 'l3', source: 'inner', target: 'check', sourceHandle: 'body' },
+    { id: 'l4', source: 'check', target: 'inner' },
+    { id: 'l5', source: 'inner', target: 'merge', sourceHandle: 'done' },
+    { id: 'l6', source: 'merge', target: 'outer' },
+    { id: 'l7', source: 'outer', target: 'report', sourceHandle: 'done' },
+    { id: 'l8', source: 'in', target: 'side' },
+    { id: 'l9', source: 'side', target: 'report' },
+  ],
+}
+
 // ---------------------------------------------------------------- 事件
 
 const BASE = Date.now() / 1000 - 45
@@ -158,6 +186,7 @@ const TO_LOOP = [
 
 const FX_ID = 'fx-canvas'
 const WIDE_ID = 'fx-wide'
+const LOOPS_ID = 'fx-loops'
 
 async function layout(graph) {
   const res = await fetch(`${API}/copilot/layout`, {
@@ -167,7 +196,7 @@ async function layout(graph) {
   return res.json()
 }
 
-const [LAID, LAID_WIDE] = await Promise.all([layout(GRAPH), layout(WIDE)])
+const [LAID, LAID_WIDE, LAID_LOOPS] = await Promise.all([layout(GRAPH), layout(WIDE), layout(LOOPS)])
 const workflow = (id, name, graph, extra = {}) => ({
   id, name, description: '', graph, tags: [], version: 3, is_template: false, status: 'draft',
   published_version: 2, run_count: 0, created_at: '2026-09-26T00:00:00Z', updated_at: '2026-09-26T00:00:00Z', ...extra,
@@ -175,6 +204,7 @@ const workflow = (id, name, graph, extra = {}) => ({
 const FAKES = {
   [FX_ID]: workflow(FX_ID, '画布表层检查', LAID),
   [WIDE_ID]: workflow(WIDE_ID, '取景检查', LAID_WIDE, { published_version: null }),
+  [LOOPS_ID]: workflow(LOOPS_ID, '循环体检查', LAID_LOOPS, { published_version: null }),
 }
 // 已发布的 v2 入口字段和画布上的不一样：正式运行的表单必须照 v2 填
 const VERSION = { id: 'v2', version: 2, note: '', workflow_id: FX_ID, graph: LAID, graph_hash: 'x',
@@ -206,11 +236,26 @@ async function fakeBackend(page) {
     route.request().method() === 'GET' ? route.continue() : json(route, { detail: '检查脚本不发起运行' }, 409))
 }
 
-async function openStudio({ id = FX_ID, theme = 'dark', ...extra } = {}) {
+/**
+ * 画布真窄的一种摆法：1280 宽（助手栏占位、不浮）、节点库展开、助手栏拖到 456px，画布只剩 552px（和以前 1024 宽三栏全开时一样）。
+ * 窄于 1280 时助手栏默认收着、展开也是浮层，画布不会被挤成这样
+ */
+const NARROW_CANVAS = {
+  viewport: { width: 1280, height: 768 },
+  prefs: { 'agentlab.studio.palette': 'open', 'agentlab.studio.assistant': 'open', 'agentlab.studio.assistantWidth': '456' },
+}
+
+/** prefs：页面脚本之前写进 localStorage 的偏好（三栏开合、助手栏宽度） */
+async function openStudio({ id = FX_ID, theme = 'dark', prefs = {}, ...extra } = {}) {
   const browser = await chromium.launch({ executablePath: CHROME })
   opened.add(browser)
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 950 }, colorScheme: theme, ...extra })
-  await ctx.addInitScript((t) => { try { localStorage.setItem('agentlab.theme', t) } catch { /* 隐私窗口 */ } }, theme)
+  await ctx.addInitScript(([t, p]) => {
+    try {
+      localStorage.setItem('agentlab.theme', t)
+      for (const [k, v] of Object.entries(p)) localStorage.setItem(k, v)
+    } catch { /* 隐私窗口 */ }
+  }, [theme, prefs])
   // 按页面自己加载时的地址 import 模块：热更新过的模块地址带 ?t=，直接写 /src/… 会拿到
   // 另一份实例（另一个坞的 store），改了它页面上什么都不变
   await ctx.addInitScript(() => {
@@ -1277,7 +1322,7 @@ await section('Copilot 这一轮删掉的节点：原地留一道虚线框，停
   }
   // 窄画布打开就是精简档（缩放 0.4 上下）：标签的字照样补回 11px，不跟着缩成 7px
   {
-    const { browser, page, errors } = await openStudio({ viewport: { width: 1024, height: 768 } })
+    const { browser, page, errors } = await openStudio(NARROW_CANVAS)
     await page.waitForTimeout(400)
     const zoom = Number(await page.evaluate(() => document.querySelector('.react-flow').style.getPropertyValue('--zoom')))
     // 质量门在前三列里，这个缩放下在视口内：截图看得到
@@ -1345,9 +1390,29 @@ await section('双击空白处：在光标处快速添加节点', async () => {
 
 // ---------------------------------------------------------------- 窄画布的打开取景
 
-await section('1024 宽打开：可读缩放下放不下三列时退到精简档，多看几列', async () => {
+await section('打开取景：1024 宽助手栏收着、画布够宽就用可读缩放；画布真窄时退到精简档，多看几列', async () => {
+  const viewOf = (page) => page.evaluate(() => {
+    const rf = document.querySelector('.react-flow')
+    const pane = rf.getBoundingClientRect()
+    const nodes = [...document.querySelectorAll('.react-flow__node')]
+    const whole = nodes.filter((n) => {
+      const r = n.getBoundingClientRect()
+      return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
+    }).length
+    return { zoom: Number(rf.style.getPropertyValue('--zoom')), lod: rf.dataset.lod, whole, total: nodes.length, w: Math.round(pane.width) }
+  })
   for (const theme of ['dark', 'light']) {
-    const { browser, page } = await openStudio({ theme, viewport: { width: 1024, height: 768 } })
+    // 1024 宽：窄屏的助手栏默认收着（展开是浮层），画布拿到整块宽度，完整卡片就放得下
+    const wide = await openStudio({ theme, viewport: { width: 1024, height: 768 } })
+    await wide.page.waitForTimeout(500)
+    const open1024 = await viewOf(wide.page)
+    check(`${theme}: 1024 宽打开画布有 880px 以上、至少看得全四张完整卡片`,
+      open1024.w >= 880 && open1024.whole >= 4 && open1024.lod === 'full', JSON.stringify(open1024))
+    await wide.page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-1024-${theme}.png` })
+    await wide.browser.close()
+
+    // 画布真窄：可读缩放下连前三列都放不下
+    const { browser, page } = await openStudio({ theme, ...NARROW_CANVAS })
     await page.waitForTimeout(500)
     // 两遍真的是两套主题：不然「亮暗都看过」只是同一张图看了两次
     const shown = await page.evaluate(() => ({
@@ -1355,24 +1420,124 @@ await section('1024 宽打开：可读缩放下放不下三列时退到精简档
       scheme: getComputedStyle(document.documentElement).colorScheme,
     }))
     check(`${theme}: 画出来的确实是这一套主题`, shown.attr === theme && shown.scheme.includes(theme), JSON.stringify(shown))
-    const view = await page.evaluate(() => {
-      const rf = document.querySelector('.react-flow')
-      const pane = rf.getBoundingClientRect()
-      const nodes = [...document.querySelectorAll('.react-flow__node')]
-      const whole = nodes.filter((n) => {
-        const r = n.getBoundingClientRect()
-        return r.left >= pane.left && r.right <= pane.right && r.top >= pane.top && r.bottom <= pane.bottom
-      }).length
-      return { zoom: Number(rf.style.getPropertyValue('--zoom')), lod: rf.dataset.lod, whole, total: nodes.length, w: Math.round(pane.width) }
-    })
-    check(`${theme}: 1024 宽打开至少看得全四张卡`, view.whole >= 4, JSON.stringify(view))
-    check(`${theme}: 缩放不低于精简档下限 0.4，档位是精简卡`, view.zoom >= 0.4 - 1e-3 && view.lod === 'compact', JSON.stringify(view))
-    await page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-1024-${theme}.png` })
+    const view = await viewOf(page)
+    check(`${theme}: 窄画布（${view.w}px）打开至少看得全四张卡`, view.w < 600 && view.whole >= 4, JSON.stringify(view))
+    check(`${theme}: 窄画布：缩放不低于精简档下限 0.4，档位是精简卡`, view.zoom >= 0.4 - 1e-3 && view.lod === 'compact', JSON.stringify(view))
+    await page.screenshot({ path: `/tmp/agentlab-canvas-fx-open-narrow-${theme}.png` })
     await browser.close()
   }
 })
 
 // ---------------------------------------------------------------- 关掉动效
+
+await section('循环体底框：框套框、按列圈、写上限，跑起来写第几轮', async () => {
+  for (const theme of ['dark', 'light']) {
+    const { browser, page, errors } = await openStudio({ id: LOOPS_ID, theme })
+    await page.getByRole('button', { name: '适配全图' }).click()
+    await page.waitForTimeout(500)
+    const read = () => page.evaluate(() => {
+      const frames = [...document.querySelectorAll('.sf-loop-frame')]
+      const tags = Object.fromEntries([...document.querySelectorAll('.sf-loop-tag')].map((t) => [t.dataset.loop, {
+        text: t.innerText.replace(/\s+/g, ' ').trim(), shown: getComputedStyle(t).visibility === 'visible', running: t.classList.contains('is-running'),
+      }]))
+      const nodes = window.__studio.getState().nodes.map((n) => ({ id: n.id, x: n.position.x, y: n.position.y,
+        w: n.measured?.width ?? 238, h: n.measured?.height ?? 80 }))
+      // 节点的中心和四角落不落在框里：框在画布坐标里，和节点位置同一套
+      const inside = (path, n) => {
+        const pts = [[n.x + n.w / 2, n.y + n.h / 2], [n.x + 2, n.y + 2], [n.x + n.w - 2, n.y + 2], [n.x + 2, n.y + n.h - 2], [n.x + n.w - 2, n.y + n.h - 2]]
+        return pts.map(([x, y]) => path.isPointInFill(new DOMPoint(x, y)))
+      }
+      const cover = Object.fromEntries(frames.map((f) => [f.dataset.loop, Object.fromEntries(nodes.map((n) => [n.id, inside(f, n)]))]))
+      const box = Object.fromEntries(frames.map((f) => { const b = f.getBBox(); return [f.dataset.loop, { x: b.x, y: b.y, r: b.x + b.width, b: b.y + b.height }] }))
+      const layer = document.querySelector('.sf-loops')
+      return { n: frames.length, tags, cover, box, pe: layer ? getComputedStyle(layer).pointerEvents : null,
+        stroke: frames[0] ? getComputedStyle(frames[0]).vectorEffect : null }
+    })
+    const r = await read()
+    const all = (arr) => arr.every(Boolean)
+    const none = (arr) => arr.every((v) => !v)
+    check(`${theme}: 两个循环各一块底框`, r.n === 2, `${r.n}`)
+    check(`${theme}: 标签写出每进来一次最多几轮`, r.tags.outer?.text === '↻ 循环体 · 最多 3 轮' && r.tags.inner?.text === '↻ 循环体 · 最多 4 轮',
+      JSON.stringify(r.tags))
+    check(`${theme}: 外层框圈住循环节点和整个循环体（含内层）`, ['outer', 'inner', 'check', 'merge'].every((id) => all(r.cover.outer?.[id] ?? [])),
+      JSON.stringify(r.cover.outer))
+    check(`${theme}: 内层框只圈内层循环和它的循环体`, all(r.cover.inner?.inner ?? []) && all(r.cover.inner?.check ?? [])
+      && none(r.cover.inner?.merge ?? [true]) && none(r.cover.inner?.outer ?? [true]), JSON.stringify(r.cover.inner))
+    check(`${theme}: 同列却不在循环里的节点不被圈进去`, ['in', 'side', 'report'].every((id) => none(r.cover.outer?.[id] ?? [true])),
+      JSON.stringify({ side: r.cover.outer?.side, report: r.cover.outer?.report }))
+    const b = r.box
+    check(`${theme}: 框套框：内层四周都在外层以内、留出一圈`, !!b.outer && !!b.inner && b.inner.x - b.outer.x >= 8 && b.inner.y - b.outer.y >= 8
+      && b.outer.r - b.inner.r >= 8 && b.outer.b - b.inner.b >= 8, JSON.stringify(b))
+    check(`${theme}: 底框不接指针（平移、点空白处照常）`, r.pe === 'none', r.pe)
+    check(`${theme}: 框线不随缩放变粗变细`, r.stroke === 'non-scaling-stroke', r.stroke)
+    // 点框里的空白处：落到画布上，选中的节点被取消
+    await page.evaluate(() => window.__studio.getState().select('check'))
+    const spot = await page.evaluate(() => {
+      const f = document.querySelector('.sf-loop-frame[data-loop="outer"]')
+      const bb = f.getBoundingClientRect()
+      for (let y = bb.top + 4; y < bb.bottom - 4; y += 6) {
+        for (let x = bb.left + 4; x < bb.right - 4; x += 6) {
+          const el = document.elementFromPoint(x, y)
+          const m = f.getScreenCTM().inverse()
+          const p = new DOMPoint(x, y).matrixTransform(m)
+          if (el?.classList.contains('react-flow__pane') && f.isPointInFill(p)) return { x, y }
+        }
+      }
+      return null
+    })
+    if (spot) await page.mouse.click(spot.x, spot.y)
+    await page.waitForTimeout(200)
+    check(`${theme}: 点框里的空白处等于点画布（取消选中）`, !!spot && (await page.evaluate(() => window.__studio.getState().selectedId)) === null, JSON.stringify(spot))
+    await page.screenshot({ path: `/tmp/agentlab-canvas-fx-loops-${theme}.png` })
+
+    // 跑起来：外层第 1 轮、内层第 2 轮
+    const t0 = Date.now() / 1000 - 5
+    const le = (seq, type, node_id, data = {}, t = seq * 0.2) => ({ seq, type, node_id, data, ts: t0 + t })
+    const ROUNDS = [
+      le(1, 'run.started', null, { nodes: 7 }), le(2, 'node.started', 'in'), le(3, 'node.finished', 'in', { duration_ms: 5 }),
+      le(4, 'node.started', 'outer'), le(5, 'edge.taken', 'outer', { branch: 'body', iteration: 0, total: 2, mode: 'foreach' }),
+      le(6, 'node.finished', 'outer', { duration_ms: 1, preview: { __decision__: 'body' } }),
+      le(7, 'node.started', 'inner'), le(8, 'edge.taken', 'inner', { branch: 'body', iteration: 0, mode: 'while' }),
+      le(9, 'node.finished', 'inner', { duration_ms: 1, preview: { __decision__: 'body' } }),
+      le(10, 'node.started', 'check', { iteration: 1 }), le(11, 'node.finished', 'check', { duration_ms: 180 }),
+      le(12, 'node.started', 'inner'), le(13, 'edge.taken', 'inner', { branch: 'body', iteration: 1, mode: 'while' }),
+      le(14, 'node.finished', 'inner', { duration_ms: 1, preview: { __decision__: 'body' } }),
+      le(15, 'node.started', 'check', { iteration: 2 }),
+    ]
+    await seedRun(page)
+    await feed(page, ROUNDS)
+    await page.waitForTimeout(300)
+    const live = await read()
+    check(`${theme}: 在跑的循环写出第几轮（外层第 1 轮、内层第 2 轮）`,
+      live.tags.outer?.text.endsWith('第 1 轮') && live.tags.inner?.text.endsWith('第 2 轮') && live.tags.inner.running, JSON.stringify(live.tags))
+    // 回放到内层第 1 轮
+    await page.evaluate((ts) => window.__studio.getState().setReplayAt(ts * 1000), ROUNDS[9].ts + 0.05)
+    await page.waitForTimeout(250)
+    const past = await read()
+    check(`${theme}: 回放时写的是游标那一刻的轮次`, past.tags.inner?.text.endsWith('第 1 轮'), JSON.stringify(past.tags.inner))
+    await page.evaluate(() => window.__studio.getState().setReplayAt(null))
+    await feed(page, [le(16, 'run.cancelled', null, { timing: { wall_ms: 3000, active_ms: 3000, wait_ms: 0 } })])
+    await page.waitForTimeout(300)
+    const ended = await read()
+    check(`${theme}: 运行结束就不再写轮次（正常态安静）`, !ended.tags.outer?.running && !ended.tags.inner?.running
+      && !/第 \d+ 轮/.test(`${ended.tags.outer?.text}${ended.tags.inner?.text}`), JSON.stringify(ended.tags))
+    await page.evaluate(() => window.__studio.getState().clearRun())
+
+    // 远景：框还在（一道细线），标签不画
+    for (let i = 0; i < 10; i++) {
+      if (await page.evaluate(() => document.querySelector('.react-flow').dataset.lod === 'signal')) break
+      await page.locator('.react-flow__controls-zoomout').click()
+      await page.waitForTimeout(250)
+    }
+    await page.waitForTimeout(300)
+    const far = await page.evaluate(() => ({ lod: document.querySelector('.react-flow').dataset.lod,
+      frames: document.querySelectorAll('.sf-loop-frame').length,
+      tag: getComputedStyle(document.querySelector('.sf-loop-tag')).visibility }))
+    check(`${theme}: 信号档里框线还在、标签不画`, far.lod === 'signal' && far.frames === 2 && far.tag === 'hidden', JSON.stringify(far))
+    check(`${theme}: 没有运行时报错`, errors.length === 0, errors.slice(0, 2).join(' | '))
+    await browser.close()
+  }
+})
 
 await section('系统关了动效', async () => {
   const { browser, page } = await openStudio({ reducedMotion: 'reduce' })

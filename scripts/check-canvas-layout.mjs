@@ -349,6 +349,80 @@ await section('随机坐标（手拖过的图）', async () => {
     fuzz.examples.join('、'))
 })
 
+// 出口标签画在出线上方（出口密时骑在线上）。往标签那一侧拐的线，第一道弯要让过标签；
+// 走廊挪不出地方时 Route.exit 给出截短后的宽度，截短的标签同样不能被穿过
+await section('出口标签不被自己的线穿过', async () => {
+  const UP = {
+    nodes: [
+      node('start', 'input'), node('prep', 'llm'),
+      node('gate', 'branch', { cases: [{ key: 'fast', label: '按客户分层的快速处理通道' }, { key: 'slow', label: '协作模式' }] }),
+      node('a', 'llm'), node('b', 'supervisor', { agents: [{ name: 'x' }, { name: 'y' }, { name: 'z' }] }), node('done', 'output'),
+    ],
+    edges: [edge('start', 'prep'), edge('prep', 'gate'), edge('gate', 'a', 'fast'), edge('gate', 'b', 'slow'),
+      edge('a', 'done'), edge('b', 'done')],
+  }
+  const all = { ...FIXTURES, UP }
+  const bad = []
+  let checked = 0
+  let cut = 0
+  for (const [name, graph] of Object.entries(all)) {
+    const laid = await (await fetch(`${API}/copilot/layout`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ graph }),
+    })).json()
+    const r = await page.evaluate(async ({ laid }) => {
+      const mod = await import('/src/canvas/routing.ts')
+      const defs = await import('/src/canvas/nodeDefs.ts')
+      // 协作节点带花名册，实测比别的卡高：排版把上面那一支顶上去，线一出来就往上拐
+      const nodes = laid.nodes.map((n) => ({
+        id: n.id, position: n.position, measured: { width: 238, height: n.type === 'supervisor' ? 170 : 92 },
+        data: { nodeType: n.type, config: n.data?.config ?? {} },
+      }))
+      const edges = laid.edges.map((e, i) => ({ id: e.id || `e${i}`, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? null }))
+      const routes = mod.buildRoutes(nodes, edges)
+      const out = []
+      for (const e of edges) {
+        const src = nodes.find((n) => n.id === e.source)
+        const handles = defs.sourceHandles(src.data.nodeType, src.data.config)
+        const i = Math.max(0, handles.findIndex((h) => h.id === e.sourceHandle))
+        const h = handles[i]
+        if (!h?.label) continue
+        const route = routes.get(e.id)
+        const dense = handles.length >= mod.DENSE_EXITS
+        const y = handles.length <= 1 ? src.position.y + 46 : src.position.y + (92 * (i + 1)) / (handles.length + 1)
+        const left = src.position.x + 238 + 8
+        const width = route.exit ? route.exit.room : mod.exitLabelWidth(h.label, dense)
+        const box = dense ? { l: left, r: left + width, t: y - 5.5, b: y + 5.5 } : { l: left, r: left + width, t: y - 15, b: y - 2 }
+        // 圆角按折线端点近似：弯里那一小段贴着拐点，端点落不进标签，折线就更落不进
+        const pts = (route.path.match(/[MLQ][^MLQ]*/g) ?? []).flatMap((tk) => {
+          const n = tk.slice(1).trim().split(/[\s,]+/).map(Number)
+          return tk[0] === 'Q' ? [{ x: n[0], y: n[1] }, { x: n[2], y: n[3] }] : [{ x: n[0], y: n[1] }]
+        })
+        let hit = null
+        for (let k = 1; k < pts.length && !hit; k++) {
+          const a = pts[k - 1]
+          const b = pts[k]
+          for (let s = 0; s <= 20; s++) {
+            const x = a.x + ((b.x - a.x) * s) / 20
+            const yy = a.y + ((b.y - a.y) * s) / 20
+            // 出口密时标签骑在线上：只盖住自己那条的水平出线，这一段不算
+            if (dense && Math.abs(yy - y) < 1) continue
+            if (x > box.l + 1 && x < box.r - 1 && yy > box.t + 1 && yy < box.b - 1) { hit = `${Math.round(x)},${Math.round(yy)}`; break }
+          }
+        }
+        out.push({ id: e.id, label: h.label, hit, cut: !!route.exit })
+      }
+      return out
+    }, { laid })
+    for (const x of r) {
+      checked++
+      if (x.cut) cut++
+      if (x.hit) bad.push(`${name}/${x.label}@${x.hit}`)
+    }
+  }
+  check(`带标签的出口线都让过了标签（${checked} 条，其中 ${cut} 条截短）`, checked > 0 && bad.length === 0, bad.slice(0, 4).join('、'))
+  check('放不下的长标签给出了截短宽度', cut > 0, `${cut}`)
+})
+
 // 分支出口由 case 算出来。同 id 的两个出口会让 React Flow 出两个 handle、跑完两条一起
 // 亮，React 还会报 key 重复；key=default 和兜底出口在运行时本来就是同一个出口
 await section('分支出口：保留名 default、重复标识', async () => {

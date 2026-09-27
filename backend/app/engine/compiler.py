@@ -63,7 +63,8 @@ def _wrap(
             from app.engine.state import template_context
 
             if eval_condition(skip_if, template_context(state)):
-                ctx.emit(EventType.NODE_SKIPPED, reason=f"skip_if 成立：{skip_if}")
+                ctx.emit(EventType.NODE_SKIPPED, node_type=str(node.type), label=node.title,
+                         reason=f"skip_if 成立：{skip_if}")
                 return {"nodes": {node.id: {"skipped": True}}}
 
         retries = int(node.config.get("retries", 0) or 0)

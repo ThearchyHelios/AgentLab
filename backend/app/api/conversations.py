@@ -412,9 +412,13 @@ async def patch_turn(
         if value is not None:
             setattr(turn, field, value)
 
-    conversation = await session.get(Conversation, conversation_id)
-    if conversation:
-        conversation.last_active_at = utcnow()
+    # 活跃时间只认人在这里开始做事：改问题、按下运行、重试（状态回到 running）。
+    # 打开会话时前端的回源核对也走这里——补全截断的答案、记下运行已删、把断掉的
+    # 建图写回 error、补交付错过的结果——这些不算，否则旧会话一打开就顶到列表最上面
+    if payload.question is not None or payload.run_id is not None or payload.status == "running":
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation:
+            conversation.last_active_at = utcnow()
     await session.commit()
     await session.refresh(turn)
     return _turn_out(turn)

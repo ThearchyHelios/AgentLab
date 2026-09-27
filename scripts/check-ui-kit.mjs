@@ -743,6 +743,113 @@ await section('后端的机读码跟着 ApiError 走', async () => {
   await page.unroute(isGen)
 })
 
+await section('FastAPI 422：校验错误说中文，英文原文收进详情', async () => {
+  // pydantic 的 msg 是英文、loc 是内部键名，原样拼出来就是「name：Field required」（验收 NEW）。
+  // 样例照沙箱后端真实回的 422 摘的，伪造响应，不碰后端
+  const detailOf = {
+    '/api/providers': [{ type: 'missing', loc: ['body', 'name'], msg: 'Field required', input: {} }],
+    '/api/datasources': [
+      { type: 'string_pattern_mismatch', loc: ['body', 'name'], msg: "String should match pattern '^[a-z][a-z0-9_]{0,40}$'", input: 'X', ctx: { pattern: '^[a-z][a-z0-9_]{0,40}$' } },
+      { type: 'int_parsing', loc: ['body', 'port'], msg: 'Input should be a valid integer, unable to parse string as an integer', input: 'abc' },
+    ],
+    '/api/memory': [{ type: 'less_than_equal', loc: ['body', 'importance'], msg: 'Input should be less than or equal to 1', input: 3, ctx: { le: 1.0 } }],
+    '/api/conversations': [{ type: 'literal_error', loc: ['body', 'kind'], msg: "Input should be 'chat' or 'canvas'", input: 'x', ctx: { expected: "'chat' or 'canvas'" } }],
+    '/api/workflows': [{ type: 'some_future_type', loc: ['body', 'graph', 'nodes', 0, 'shape'], msg: 'Something went wrong in English', input: 1 }],
+    '/api/copilot/generate-stream': [{ type: 'string_too_short', loc: ['body', 'instruction'], msg: 'String should have at least 1 character', input: '', ctx: { min_length: 1 } }],
+  }
+  const is422 = (u) => Object.hasOwn(detailOf, new URL(u).pathname)
+  await page.route(is422, (r) => r.fulfill({ status: 422, contentType: 'application/json',
+    body: JSON.stringify({ detail: detailOf[new URL(r.request().url()).pathname] }) }))
+  const got = await page.evaluate(async () => {
+    const { api, ApiError, streamCopilot } = window.__ui
+    const { errors } = window.__ui.lib
+    const call = async (fn) => {
+      try { await fn(); return null } catch (e) {
+        const h = errors.humanizeError(e)
+        return { isApi: e instanceof ApiError, status: e.status, message: e.message, raw: e.raw ?? '', arr: Array.isArray(e.detail),
+                 title: h.title, reason: h.reason ?? '', hraw: h.raw ?? '' }
+      }
+    }
+    const stream = await new Promise((resolve) => {
+      if (!streamCopilot) return resolve(null)
+      streamCopilot({ instruction: '' }, () => {}, (error, info) => resolve({ error: error ?? '', status: info?.status }))
+    })
+    return {
+      provider: await call(() => api.providers.create({})),
+      source: await call(() => api.datasources.create({ name: 'X', kind: 'sqlite', port: 'abc' })),
+      memory: await call(() => api.memory.add({ content: 'x', importance: 3 })),
+      conv: await call(() => api.conversations.create({ kind: 'x' })),
+      wf: await call(() => api.workflows.create({ name: 'x' })),
+      stream,
+    }
+  })
+  await page.unroute(is422)
+  // 英文原文里的词（Field required、String should…、Input should…）一个都不能出现在给人看的话里
+  const english = /Field required|should|Input|valid|String|Something|went wrong/
+  const p = got.provider
+  check('缺必填：字段按表单叫法、说「没有填」', p?.message === '提交的内容不符合要求：「名称」没有填', JSON.stringify(p?.message))
+  check('……humanizeError 拆成标题和原因，英文原文进 raw（「详情」里看得到）',
+    p?.title === '提交的内容不符合要求' && p.reason === '「名称」没有填' && /Field required/.test(p.hraw) && p.arr, JSON.stringify(p))
+  const s = got.source
+  check('同一个键在不同表单上叫法不同：数据源的 name 是「标识」；格式不对、要填整数逐条说',
+    s?.message === '提交的内容不符合要求：「标识」格式不对；「端口」要填整数', JSON.stringify(s?.message))
+  check('数值上限：不能大于 1（1.0 不写成 1.0）', got.memory?.message === '提交的内容不符合要求：「重要度」不能大于 1', JSON.stringify(got.memory?.message))
+  check('只能取几个值之一：把可选值列出来', got.conv?.message === '提交的内容不符合要求：「类型」只能取 chat 或 canvas', JSON.stringify(got.conv?.message))
+  const w = got.wf
+  check('没见过的错误类型、查不到叫法的嵌套字段：写字段路径 + 笼统说法，不露英文',
+    /「graph\.nodes\.0\.shape」不符合要求/.test(w?.message ?? '') && !english.test(w?.message ?? ''), JSON.stringify(w?.message))
+  check('……英文原文还在 raw 里', /Something went wrong in English/.test(w?.raw ?? ''), (w?.raw ?? '').slice(0, 80))
+  for (const [k, v] of Object.entries(got)) {
+    const said = k === 'stream' ? v?.error : `${v?.message ?? ''} ${v?.title ?? ''} ${v?.reason ?? ''}`
+    check(`${k}：给人看的话里没有英文原文`, !!said && !english.test(said), said)
+  }
+  check('Copilot 流式接口开流前被 422 拒：onEnd 的话同样说中文', got.stream?.status === 422
+    && got.stream.error === '提交的内容不符合要求：「输入的内容」不能为空', JSON.stringify(got.stream))
+
+  const unit = await page.evaluate(() => {
+    const v = window.__ui.lib.validation
+    if (!v) return null
+    const d = (type, loc, extra = {}) => ({ type, loc, msg: 'English original', input: null, ...extra })
+    const one = (item, path) => v.describeValidation([item], path)[0]
+    return {
+      query: one(d('int_parsing', ['query', 'limit']), '/runs'),
+      pathParam: one(d('missing', ['path', 'run_id']), '/runs/x'),
+      json: one(d('json_invalid', ['body', 1], { ctx: { error: 'Expecting value' } }), '/providers'),
+      bodyMissing: one(d('missing', ['body']), '/providers'),
+      zhValue: one(d('value_error', ['body', 'graph'], { msg: 'Value error, 节点 id 只能包含字母数字、下划线和连字符' }), '/workflows'),
+      enValue: one(d('value_error', ['body', 'name'], { msg: 'Value error, bad name' }), '/providers'),
+      tooLong: one(d('string_too_long', ['body', 'name'], { ctx: { max_length: 100 } }), '/skills'),
+      listItem: one(d('dict_type', ['body', 'examples', 0]), '/skills'),
+      gt: one(d('greater_than', ['body', 'importance'], { ctx: { gt: 0 } }), '/memory'),
+      manyChoices: one(d('literal_error', ['body', 'run_class'], { ctx: { expected: "'a', 'b', 'c', 'd', 'e', 'f', 'g' or 'h'" } }), '/runs'),
+      enumInts: one(d('enum', ['body', 'level'], { ctx: { expected: '1, 2 or 3' } }), '/x'),
+      bool: one(d('bool_parsing', ['body', 'readonly']), '/datasources'),
+      unknownPath: one(d('missing', ['body', 'foo_bar']), '/nowhere'),
+    }
+  })
+  check('lib/validation 挂在预览页上', !!unit)
+  if (unit) {
+    const want = {
+      query: '参数「limit」要填整数',
+      pathParam: '地址里的「run_id」没有填',
+      json: '提交的内容不是合法的 JSON',
+      bodyMissing: '没有收到提交的内容',
+      zhValue: '「工作流」：节点 id 只能包含字母数字、下划线和连字符',
+      enValue: '「名称」取值不对',
+      tooLong: '「名称」太长，最多 100 个字符',
+      listItem: '「示例」第 1 项格式不对，要是一组键值',
+      gt: '「重要度」要大于 0',
+      manyChoices: '「运行类别」不在允许的取值里',
+      enumInts: '「level」只能取 1、2 或 3',
+      bool: '「只读」只能是「是」或「否」',
+      unknownPath: '「foo_bar」没有填',
+    }
+    for (const [k, w] of Object.entries(want)) {
+      check(`describeValidation · ${k}：${w}`, unit[k] === w, unit[k] === w ? '' : `得到 ${JSON.stringify(unit[k])}`)
+    }
+  }
+})
+
 await section('上传进度（kb.upload 走 XHR）', async () => {
   const isUpload = (u) => new URL(u).pathname === '/api/kb/upload'
   const uploadVia = async (handler) => {

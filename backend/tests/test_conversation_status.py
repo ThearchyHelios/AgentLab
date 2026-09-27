@@ -15,7 +15,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.db.base import SessionLocal, utcnow
-from app.db.models import Approval, ConversationTurn, Run
+from app.db.models import Approval, Conversation, ConversationTurn, Run
 from app.main import app
 
 
@@ -240,3 +240,76 @@ async def test_turns_carry_updated_at_for_the_same_staleness_clock(client):
     assert turn.get("updated_at"), turn
     detail = (await client.get(f"/api/conversations/{conv}")).json()
     assert detail["turns"][0]["updated_at"]
+
+
+# --------------------------------------------------------------------------
+# 活跃时间：只是打开一个旧会话，不算在这里做了事
+# --------------------------------------------------------------------------
+
+
+async def _age(conv_id: str, days: int) -> None:
+    async with SessionLocal() as session:
+        row = await session.get(Conversation, conv_id)
+        row.last_active_at = utcnow() - timedelta(days=days)
+        await session.commit()
+
+
+async def _order(client, *ids: str) -> list[str]:
+    r = await client.get("/api/conversations")
+    return [c["id"] for c in r.json() if c["id"] in ids]
+
+
+async def test_catching_up_on_open_does_not_bump_the_conversation(client):
+    """打开会话时前端会回源核对：补全截断的答案、记下运行已删、把断掉的建图写回
+    error、补交付错过的结果。这些都不是人在这里做了事——以前每一次都把
+    last_active_at 改成现在，旧会话一打开就跳到列表最上面、写着「刚刚」。"""
+    old = await _conversation(client, "上周的")
+    turn = await _turn(client, old, run_id=await _run("succeeded"), status="done", answer="十二")
+    recent = await _conversation(client, "昨天的")
+    await _turn(client, recent)
+    await _age(old, 7)
+    await _age(recent, 1)
+    before = (await _listed(client))[old]["last_active_at"]
+    assert await _order(client, old, recent) == [recent, old]
+
+    url = f"/api/conversations/{old}/turns/{turn['id']}"
+    for body in (
+        {"meta": {"v": 1, "clipped": "lost"}, "review": {}},             # 运行删了、答案补不回来
+        {"answer": "十二（完整版）", "meta": {"v": 1}, "review": {}},     # 截断的答案换成完整的
+        {"status": "error", "error": "上次没有跑完", "meta": {"v": 1}, "review": {}},
+        {"status": "done", "answer": "补交付", "meta": {"v": 1}, "review": {}},
+    ):
+        r = await client.patch(url, json=body)
+        assert r.status_code == 200, r.text
+        assert (await _listed(client))[old]["last_active_at"] == before, body
+    assert await _order(client, old, recent) == [recent, old]
+
+
+@pytest.mark.parametrize("body", [
+    {"run_id": "RUN", "status": "running"},              # 按下运行
+    {"status": "running", "error": "", "answer": ""},    # 重试这一轮
+    {"question": "换个问法"},
+])
+async def test_starting_something_in_a_turn_still_bumps_it(client, body):
+    old = await _conversation(client, "上周的")
+    turn = await _turn(client, old)
+    recent = await _conversation(client, "昨天的")
+    await _turn(client, recent)
+    await _age(old, 7)
+    await _age(recent, 1)
+    if body.get("run_id") == "RUN":
+        body = {**body, "run_id": await _run("running")}
+    r = await client.patch(f"/api/conversations/{old}/turns/{turn['id']}", json=body)
+    assert r.status_code == 200, r.text
+    assert await _order(client, old, recent) == [old, recent]
+
+
+async def test_a_new_turn_bumps_it(client):
+    old = await _conversation(client, "上周的")
+    await _turn(client, old)
+    recent = await _conversation(client, "昨天的")
+    await _turn(client, recent)
+    await _age(old, 7)
+    await _age(recent, 1)
+    await _turn(client, old, "接着问")
+    assert await _order(client, old, recent) == [old, recent]

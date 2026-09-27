@@ -306,6 +306,31 @@ await section('设置 · 模型接入', async () => {
   await close()
 })
 
+await section('设置 · 模型接入：后端校验没过', async () => {
+  // FastAPI 的 422 是 pydantic 的英文原文 + 内部键名。弹窗上说中文、按表单叫法点字段，原文收进「详情」（验收 NEW）
+  const detail = [{ type: 'missing', loc: ['body', 'name'], msg: 'Field required', input: {} }]
+  const { page, sent, errors, close } = await open('/settings/providers', {
+    handlers: [[/^POST \/providers$/, json({ detail }, 422)]],
+  })
+  await page.getByRole('button', { name: /添加接入/ }).first().click()
+  const dlg = dialog(page)
+  await dlg.getByRole('radio', { name: /Mock/ }).click()
+  await dlg.getByRole('button', { name: '保存' }).click()
+  const alert = page.locator('[role="alert"][aria-live="assertive"]').first()
+  const said = await until(async () => { const t = await alert.innerText().catch(() => ''); return t.includes('不符合要求') ? t : '' }, 4000)
+  check('保存发出去了', sent.some((s) => s.key === 'POST /providers'))
+  check('toast 说中文：哪个字段、怎么了', said.includes('提交的内容不符合要求') && said.includes('「名称」没有填'), said.replace(/\s+/g, ' '))
+  const summary = said.split('详情')[0]
+  check('……英文原文和内部键名不在正文里', !/Field required|\bname\b/.test(summary), summary.replace(/\s+/g, ' '))
+  await alert.getByText('详情').first().click()
+  const raw = await alert.locator('details pre').first().innerText().catch(() => '')
+  check('……英文原文收在「详情」里，给维护者复制', raw.includes('Field required'), raw.slice(0, 80))
+  check('弹窗还开着，填的东西没丢', await dlg.isVisible())
+  await shot(page, 'provider-422')
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('设置 · 偏好', async () => {
   // 设置读写都走假的一份：PUT 写进去，GET 读回来（主题的「已保存」是读回来核对过才写的）
   let stored = await get('/settings')

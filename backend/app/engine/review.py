@@ -76,6 +76,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "tool_markup_leak": ("tool_markup_leak", DEGRADED),
     # 协作团队用完轮数、按降档交付：交来的是成员原话，不是调度者认可的结论
     "team_exhausted": ("team_exhausted", BROKEN),
+    # 调度者收了工，但最后派出去的成员失败了，成果取自更早的那份：有缺口，不是断裂
+    "team_last_failed": ("team_last_failed", DEGRADED),
     # 校验节点的修复编出了原文没有的值，这次修复被作废
     "repair_invented": ("repair_invented", DEGRADED),
 }

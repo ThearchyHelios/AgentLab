@@ -9,20 +9,21 @@ import { useCatalog } from '../store/catalog'
 import { useStudio, type CopilotTurn } from '../store/studio'
 import { revealField, useSheet } from '../canvas/InspectorSheet'
 import { fieldOfIssue } from '../canvas/issues'
+import { sourceHandles } from '../canvas/nodeDefs'
 import { splitShrunk } from '../canvas/copilotMerge'
 import { confirmDialog, IconButton, StatusBadge, toast } from '../components/ui'
 import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortId, NONE } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { runClassLabel } from '../lib/terms'
-import type { ToolChange } from '../types'
+import type { RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import {
-  copilotOutcome, decodeCopilot, decodeRun, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
+  copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
 } from './decode'
 import { ApprovalCard } from './RunPanel'
 import { useRunGlance } from './RunHud'
-import { isSettled, liveAt, project, type RunPhase } from './trace'
+import { isSettled, lastEventAt, liveAt, project, type RunPhase, type Trace } from './trace'
 import { useRunClock } from './useRunClock'
 
 /**
@@ -513,6 +514,33 @@ const STREAM_PHASE: Record<RunPhase, StreamTurn['phase']> = {
   succeeded: 'done', failed: 'error', cancelled: 'done', suspended: 'done',
 }
 
+const finite = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+
+/**
+ * 停下来之后「执行」写多久。新后端的 usage.active_ms 是各段执行之和；老数据没有它，而
+ * duration_ms 只记了审批恢复后的最后一段——同屏的胶囊、航迹按事件算出一分多钟，栏头和
+ * 底栏写「22 ms」。所以退到航迹（和航迹坞同一个投影），连事件都没有才用 duration_ms
+ */
+function stoppedActiveMs(usage: RunUsage | undefined, trace: Trace): number | undefined {
+  return finite(usage?.active_ms)
+    ?? (trace.startedAt != null ? project(trace, lastEventAt(trace)).activeMs : undefined)
+    ?? finite(usage?.duration_ms)
+}
+
+/**
+ * 画布上分支、循环出口的说明。签名只取这两类节点的出口配置：拖动、选中节点都会换掉
+ * nodes 数组，不能因此把整条时间线重新解码一遍
+ */
+function useExitLabels() {
+  const sig = useStudio((s) => JSON.stringify(s.nodes
+    .filter((n) => n.data.nodeType === 'branch' || n.data.nodeType === 'loop')
+    .map((n) => [n.id, n.data.nodeType, n.data.nodeType === 'branch' ? n.data.config?.cases ?? [] : null])))
+  return useMemo(() => exitLabels(
+    (JSON.parse(sig) as [string, string, unknown][]).map(([id, type, cases]) => ({ id, type, config: { cases } })),
+    sourceHandles,
+  ), [sig])
+}
+
 function RunView({ onBack, reveal, onRevealed }: {
   onBack: () => void; reveal: Reveal | null; onRevealed: () => void
 }) {
@@ -534,13 +562,14 @@ function RunView({ onBack, reveal, onRevealed }: {
   const [raw, setRaw] = useState(false)
   const [stopping, setStopping] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
+  const exitLabelOf = useExitLabels()
 
   const turns = useMemo<StreamTurn[]>(() => {
     const finished = [...events].reverse().find((e) => e.type === 'run.finished')
     const failedEvent = [...events].reverse().find((e) => e.type === 'run.failed')
     // 结局以 runPhase 为准，连同对账查到的状态一起喂给解码器：服务被强杀、
     // 事件停在半路的运行，右栏的行也得收住，不能一直转
-    const steps = decodeRun(events, { status: run.status })
+    const steps = decodeRun(events, { status: run.status }, { exitLabelOf })
     const output = run.output && Object.keys(run.output).length ? run.output : finished?.data?.output
     return [{
       id: run.id,
@@ -561,9 +590,10 @@ function RunView({ onBack, reveal, onRevealed }: {
       // #runId 已经在栏头上了（可点，去运行记录），卡片里不再重复
       runClass: run.run_class,
       startedAt: trace.startedAt,
-      elapsedMs: run.usage?.active_ms ?? run.usage?.duration_ms,
+      // 栏头只在不跑的时候写它；跑着的时候耗时细条按各步自己的耗时比
+      elapsedMs: phase === 'waiting' || isSettled(phase) ? stoppedActiveMs(run.usage, trace) : undefined,
     }]
-  }, [run, events, phase, trace.startedAt])
+  }, [run, events, phase, trace, exitLabelOf])
 
   // 停下来等人的那一刻就去取审批卡。列表 4 秒才轮询一次：头上已经写着「等待审批」，
   // 通过/驳回却要晚几秒才出来
@@ -763,8 +793,8 @@ function RunFooter() {
   const view = trace.startedAt != null ? project(trace, liveAt(trace, now)) : undefined
 
   const u = run.usage ?? {}
-  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
-  const activeMs = settled ? num(u.active_ms) ?? num(u.duration_ms) ?? view?.activeMs : view?.activeMs
+  const num = finite
+  const activeMs = settled ? stoppedActiveMs(u, trace) : view?.activeMs
   const waitMs = settled ? num(u.wait_ms) ?? view?.waitMs : view?.waitMs
   const finalTokens = num(u.total_tokens)
     ?? (num(u.input_tokens) != null || num(u.output_tokens) != null

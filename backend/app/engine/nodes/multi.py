@@ -441,6 +441,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     progress_lines: list[str] = []
     final_text = ""
+    #: 成功交回来的产出（成员, 原话）。调度者说完成时，成果取最后一份成功的：
+    #: 失败说明是写给调度者看的，不是结论
+    delivered: list[tuple[str, str]] = []
     rounds_meta: list[dict[str, Any]] = []
     #: 调度者最后一轮给的理由，以及派过活的成员。轮数用完时报错要说清卡在哪、谁从没上过场
     last_reason = ""
@@ -457,7 +460,6 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
         batch = _batch_of(decision)
         if bool(decision.get("done")) or not batch:
-            final_text = progress_lines[-1].split("】", 1)[-1] if progress_lines else ""
             finished = True
             break
 
@@ -494,6 +496,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  "duration_ms": each_ms}
             )
             final_text = outcome["text"]
+            if not outcome.get("failed"):
+                delivered.append((name, outcome["text"]))
 
         rounds_meta.append({
             "round": round_no, "agents": [n for n, _ in batch],
@@ -505,15 +509,36 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         _accumulate(judged.get("usage") or _usage(None, sup_model_id))
         last_reason = str(judged.get("reason") or "") or last_reason
         if judged.get("done"):
-            final_text = progress_lines[-1].split("】", 1)[-1]
             finished = True
 
     exhausted: dict[str, Any] = {}
-    if not finished:
+    failed = [t for t in transcript if t.get("failed")]
+    never = [n for n in names if n not in dispatched]
+    if finished and delivered:
+        final_text = delivered[-1][1]
+        if transcript[-1].get("failed"):
+            # 调度者认可了收工，可最后派出去的人没交回东西：成果取最后一份成功的产出，
+            # 并说清楚——下游拿到的是它，不是本该定稿的那个人的
+            late = "、".join(dict.fromkeys(t["agent"] for t in failed
+                                           if t["round"] == transcript[-1]["round"]))
+            ctx.emit(EventType.LOG, level="warn", code="team_last_failed",
+                     message=f"{late} 最后一轮没有交回结果，团队成果取自{delivered[-1][0]}的产出")
+    elif finished and transcript:
+        # 调度者说完成了，派出去的成员却一个都没交回结果，手上只有失败说明。以前最后
+        # 那段失败说明就被当成团队的结论交出去：一条数据都没查到，运行照样是已完成。
+        # 不看 on_exhausted：那是「用完轮数时」的收场方式，降档交的是成员原话；这里
+        # 连原话都没有，交下去的只能是失败说明，界面还会把它说成「用完 N 轮」
+        why = "；".join(f"{who}：{err[:200]}" for who, err in dict.fromkeys(
+            (t["agent"], t.get("error") or "没有说明原因") for t in failed))
+        summary = (f"协作团队没有交出结论：派出去的成员都没能交回结果，调度者仍判定完成"
+                   f"（{last_reason or '没有给出理由'}）。{why}")
+        if never:
+            summary += f"。一次都没被派到的成员：{'、'.join(never)}"
+        raise NodeError(ctx.node.id, f"{summary}。按各成员的失败原因改好配置，再运行")
+    elif not finished:
         # 轮数用完，调度者一次都没说「完成」。这时手上只有最后一个成员的原话——
         # 以前它就被当作团队的结论交了出去：真实运行里是一段没执行的工具调用标记，
         # 而负责定稿的成员一次都没被派到
-        never = [n for n in names if n not in dispatched]
         summary = (f"协作团队用完 {max_rounds} 轮仍未完成："
                    f"{last_reason or '调度者没有给出理由'}")
         if never:

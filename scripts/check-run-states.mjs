@@ -13,7 +13,9 @@
 // - 回放（replayAt）时卡片、矩阵、印章都回到那一刻，不拿终值冒充；排队、阻断
 //   这些推导状态和循环容器「两轮之间」也按那一刻算
 // - 协作矩阵的表头不和底部打架：并行的一轮交回一部分、全部交回等调度时都不说「串行」
-// - 去审批浮层键盘可达；出口密的分支节点标签不压别人的线；精简档读数够大
+// - 去审批浮层键盘可达；出口密的分支节点标签不压别人的线；往上拐的出口线不穿过自己的
+//   标签（放不下就截短）；精简档读数够大
+// - 校验角标只在编辑态上卡：运行中、结果还挂着时不和状态抢，信号档不给 warning 反向放大
 // - 收场要说人话：协作团队用完轮数（判失败 / 降档交付）写清「用完 N 轮未完成」、点出
 //   一次都没被派到的成员，收尾判定不另算一轮；模型把工具调用写成文字的失败写原因，
 //   不是半句原话；工具超出后端声明的时限直说「已超出 Ns 上限」；校验靠修复才过要提一句
@@ -33,7 +35,7 @@ const SHOTS = process.env.RUN_STATES_SHOTS ?? '/tmp/agentlab-run-states'
 // 截图的像素密度：要看清卡片里 11px 的字时设成 2
 const DSF = Number(process.env.RUN_STATES_DSF ?? 1) || 1
 mkdirSync(SHOTS, { recursive: true })
-// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, reduced, exits），调样式时省时间
+// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, issues, exits, reduced），调样式时省时间
 const ONLY = (process.env.RUN_STATES_ONLY ?? '').split(',').filter(Boolean)
 const want = (part) => !ONLY.length || ONLY.includes(part)
 /**
@@ -1329,9 +1331,132 @@ await section('history', async () => {
   await browser.close()
 })
 
+// ---------------------------------------------------------------- 校验角标
+
+await section('issues', async () => {
+  console.log('\n=== 校验角标：只在编辑时上卡，运行态、远景不和状态抢 ===')
+  const { browser, page, errors } = await open({ theme: 'dark' })
+  // 「没有指定模型」是每个没选模型的节点都有的提示：真实的图里满屏都是它
+  issues = [
+    { level: 'error', node_id: 'body', message: '引用了不存在的变量 item.name' },
+    { level: 'warning', node_id: 'join', message: '产出者排在后面，这里取到空值' },
+    { level: 'warning', node_id: 'team', field: 'model', message: '没有指定模型，将回退到默认 provider' },
+  ]
+  await page.evaluate((iss) => window.__studio.setState({ issues: iss }), issues)
+  /** 看得见的角标：哪个节点、挂着哪几种、屏幕上多高 */
+  const badges = () => page.evaluate(() => [...document.querySelectorAll('.react-flow__node .nc-issue')].map((el) => {
+    const shown = [...el.children].filter((c) => {
+      const cs = getComputedStyle(c)
+      return cs.visibility === 'visible' && cs.display !== 'none' && c.getBoundingClientRect().width > 0
+    })
+    return { id: el.closest('.react-flow__node').dataset.id, kinds: shown.map((c) => (c.classList.contains('is-error') ? 'error' : 'warning')),
+      h: Math.round(Math.max(0, ...shown.map((c) => c.getBoundingClientRect().height))) }
+  }).filter((b) => b.kinds.length))
+  await setLod(page, 'full')
+  const edit = await badges()
+  check('编辑态：error、warning 都上卡', edit.some((b) => b.id === 'body' && b.kinds.includes('error'))
+    && edit.some((b) => b.id === 'join' && b.kinds.includes('warning')), JSON.stringify(edit))
+  const lod = await setLod(page, 'signal')
+  const far = await badges()
+  check('编辑态缩到信号档：warning 不再按缩放反向放大、挂满整张图，只留会拦住运行的 error',
+    far.every((b) => !b.kinds.includes('warning')) && far.some((b) => b.id === 'body'), `${lod.lod} ${JSON.stringify(far)}`)
+
+  for (const [name, events] of [['运行中', LIVE], ['等人', WAITING], ['跑完结果还挂着', SUCCEEDED]]) {
+    await setLod(page, 'full')
+    await feed(page, events(Date.now()))
+    await page.waitForTimeout(400)
+    const near = await badges()
+    await setLod(page, 'signal')
+    const away = await badges()
+    check(`${name}：卡片上不挂校验角标（近景、信号档都没有），状态标记是这时唯一的主角`,
+      near.length === 0 && away.length === 0, JSON.stringify({ near, away }))
+  }
+  await setLod(page, 'signal')
+  shots.push(await shot(page, 'dark-run-signal-no-issue-badges'))
+  await page.evaluate(() => window.__studio.getState().clearRun())
+  await setLod(page, 'full')
+  await page.waitForTimeout(200)
+  check('清掉运行结果回到编辑态：角标回来', (await badges()).length === 3, JSON.stringify(await badges()))
+  issues = []
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+  await browser.close()
+})
+
 // ---------------------------------------------------------------- 出口密的分支
 
 await section('exits', async () => {
+  console.log('\n=== 两出口分支：往上拐的线不穿过自己的出口标签（100% 缩放） ===')
+  // 协作节点比别的卡高，排版把「快速」那一支顶到分支上方：上面那个出口的线一出来就往上拐。
+  // 以前拐弯落在走廊正中，正好压在「快速模式」四个字的尾巴上。标签太长、走廊放不下时截短
+  const branchGraph = (fastLabel) => ({
+    nodes: [
+      { id: 'in', type: 'input', data: { label: '问题', config: { fields: [{ name: 'q' }] } } },
+      { id: 'prep', type: 'llm', data: { label: '整理问题', config: { prompt: '{{ input.q }}' } } },
+      { id: 'gate', type: 'branch', data: { label: '模式分支', config: { mode: 'expression', cases: [
+        { key: 'fast', condition: "input.q == 'a'", label: fastLabel },
+        { key: 'team', condition: 'true', label: '协作模式' },
+      ] } } },
+      { id: 'quick', type: 'llm', data: { label: '快速回答', config: { prompt: '{{ input.q }}' } } },
+      { id: 'crew', type: 'supervisor', data: { label: '协作团队', config: { goal: '研究', max_rounds: 3,
+        agents: ['检索', '分析', '撰写'].map((n) => ({ name: n, description: n, system: n, tools: [] })) } } },
+      { id: 'out', type: 'output', data: { label: '成果', config: { fields: [{ name: 'r' }] } } },
+    ],
+    edges: [
+      { id: 'x1', source: 'in', target: 'prep' }, { id: 'x2', source: 'prep', target: 'gate' },
+      { id: 'x3', source: 'gate', target: 'quick', sourceHandle: 'fast' },
+      { id: 'x4', source: 'gate', target: 'crew', sourceHandle: 'team' },
+      { id: 'x5', source: 'quick', target: 'out' }, { id: 'x6', source: 'crew', target: 'out' },
+    ],
+  })
+  for (const [variant, fastLabel] of [['四个字', '快速模式'], ['放不下的长标签', '按客户分层的快速处理通道']]) {
+    const graph = await (await fetch(`${API}/copilot/layout`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ graph: branchGraph(fastLabel) }),
+    })).json()
+    for (const theme of ['dark', 'light']) {
+      const workflow = { ...WORKFLOW, id: 'wcard-two-exits', name: '__two_exits__', graph }
+      const { browser, page, errors } = await open({ theme, workflow })
+      await page.locator('.react-flow__controls button[aria-label="回到 100% 缩放"]').click()
+      await page.waitForTimeout(400)
+      await page.evaluate(() => window.__studio.getState().focusNode('gate'))
+      await page.waitForTimeout(900)
+      const r = await page.evaluate(() => {
+        const n = document.querySelector('.react-flow__node[data-id="gate"]')
+        const labels = [...n.querySelectorAll('.nc-exit')].map((el) => {
+          const b = el.getBoundingClientRect()
+          return { t: el.textContent, l: b.left, r: b.right, top: b.top, b: b.bottom, cut: el.scrollWidth > el.clientWidth + 1 }
+        })
+        const up = window.__studio.getState().edges.find((e) => e.source === 'gate' && e.sourceHandle === 'fast')
+        const hits = []
+        for (const e of window.__studio.getState().edges.filter((x) => x.source === 'gate')) {
+          const p = document.querySelector(`.react-flow__edge[data-id="${CSS.escape(e.id)}"] .react-flow__edge-path`)
+          if (!p) { hits.push(`${e.id} 没画出来`); continue }
+          const len = p.getTotalLength()
+          const m = p.getScreenCTM()
+          for (let s = 0; s <= len; s += 1) {
+            const pt = p.getPointAtLength(s)
+            const x = pt.x * m.a + m.e
+            const y = pt.y * m.d + m.f
+            const hit = labels.find((b) => x > b.l + 1 && x < b.r - 1 && y > b.top + 1 && y < b.b - 1)
+            if (hit) { hits.push(`${hit.t}@${Math.round(x)},${Math.round(y)}`); break }
+          }
+        }
+        const zoom = getComputedStyle(document.querySelector('.react-flow')).getPropertyValue('--zoom').trim()
+        return { labels, hits, zoom, upward: !!up }
+      })
+      check(`${variant} · ${theme}: 100% 缩放下分支出口标签不被走线穿过`, r.zoom === '1' && r.upward && r.hits.length === 0,
+        `${r.zoom} ${r.hits.join('，')}`)
+      const fast = r.labels.find((l) => l.t === fastLabel)
+      if (variant === '四个字') check(`${variant} · ${theme}: 走廊放得下就写全，不截`, !!fast && !fast.cut, JSON.stringify(fast))
+      else check(`${variant} · ${theme}: 放不下的标签截短（省略号），不伸进拐弯`, !!fast && fast.cut, JSON.stringify(fast))
+      const box = await page.locator('.react-flow__node[data-id="gate"]').boundingBox()
+      const path = `${SHOTS}/${theme}-two-exits-${variant === '四个字' ? 'short' : 'long'}.png`
+      await page.screenshot({ path, clip: { x: box.x - 10, y: box.y - 90, width: box.width + 200, height: box.height + 180 } })
+      shots.push(path)
+      check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+      await browser.close()
+    }
+  }
+
   console.log('\n=== 六出口分支：标签不压别的出口的线 ===')
   const cases = ['A', 'B', 'C', 'D', 'E'].map((k, i) => ({ key: `c${i}`, condition: `vars.x == ${i}`, label: `产线${k}` }))
   const graph = await (await fetch(`${API}/copilot/layout`, {

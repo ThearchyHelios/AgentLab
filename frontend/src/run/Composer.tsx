@@ -154,7 +154,7 @@ export function Composer({ hero, onFocusChange }: {
                           className={clsx('rounded px-1.5 text-2xs leading-5 transition-colors',
                             (m === 'base') === useBase ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
                           title={m === 'base' ? '把画布上现在的工作流交给助手，在它上面改'
-                            : `不看画布上现有的，整个重新生成。原来的可以撤销（${formatShortcut('Mod+Z')}）找回`}
+                            : `不看画布上现有的工作流，重新画一张；之前几轮对话（连同上一轮的工作流）它仍会参考。原来的可以撤销（${formatShortcut('Mod+Z')}）找回`}
                           onClick={() => setUseBase(m === 'base')}>
                     {m === 'base' ? '在现有工作流上改' : '从头生成'}
                   </button>

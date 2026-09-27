@@ -45,6 +45,11 @@
 .sf-canvas[data-lod='signal'] .sf-loop-badge {
   visibility: hidden;
 }
+/* 校验角标在信号档只留 error：它会拦住运行，远景里也要找得到。warning 多半是「没指定
+   模型」这类提示，每个模型节点一枚，反向放大之后比卡片还显眼 */
+.sf-canvas[data-lod='signal'] .nc-issue .is-warning {
+  display: none;
+}
 
 /* 选中的边（编辑态） */
 .sf-canvas .react-flow__edge.selected .react-flow__edge-path {
@@ -348,6 +353,61 @@
   text-overflow: ellipsis;
 }
 
+/* 循环体底框：垫在边和卡片下面（视口里的层叠上下文里排最底），不接指针，平移、框选、
+   点空白处都照常。线宽不随缩放变，远景里仍是一道 1px 的细线；颜色用循环的类型色，
+   不用状态色——框本身不表达运行态，只有标签上的「第 k 轮」是 */
+.sf-loops {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+.sf-loops-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+}
+.sf-loop-frame {
+  fill: color-mix(in srgb, var(--nt-loop) 5%, transparent);
+  stroke: color-mix(in srgb, var(--nt-loop) 40%, transparent);
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+.sf-loop-tag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0 0.55em;
+  border: 1px solid color-mix(in srgb, var(--nt-loop) 40%, transparent);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-dim);
+  /* 和删除虚线框的标签同一条规矩：精简档里也不小于 11px，远景档不画 */
+  font-size: calc(11px / min(max(var(--zoom, 1), 0.35), 1));
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.sf-loop-glyph {
+  color: var(--nt-loop);
+}
+.sf-loop-tag b {
+  color: var(--st-running);
+  font-weight: 600;
+}
+.sf-canvas[data-lod='signal'] .sf-loop-tag {
+  visibility: hidden;
+}
+.sf-canvas[data-path-only] .sf-loops {
+  opacity: 0.45;
+}
+
 /* Copilot 这一轮删掉的节点：原地一道虚线框，停一下再淡出（时长和 FlowCanvas 的
    GHOST_MS 一致）。框在画布坐标里，跟着平移缩放；标签的字按缩放补回来，精简档里
    （窄画布打开就是 0.4）也不小于 11px，到远景档才跟着缩小。长名字由 max-width 截成省略号 */
@@ -631,6 +691,27 @@
 .sf-formal-go {
   border-color: var(--border-strong);
   font-weight: 600;
+}
+/* 以谁的名义发起：正式运行要留痕。没署名用等待色说出来，和审批卡、发布弹窗同一个说法 */
+.sf-pop-sign {
+  margin-bottom: 8px;
+  color: var(--text-dim);
+  font-size: var(--text-2xs);
+  line-height: 1.55;
+}
+.sf-pop-sign b {
+  color: var(--text);
+  font-weight: 600;
+}
+.sf-pop-sign.is-unsigned {
+  color: var(--st-waiting);
+}
+.sf-pop-sign a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.sf-pop-sign a:hover {
+  color: var(--text);
 }
 
 /* 「去审批」落到右栏那张审批卡上时描一圈，1.6 秒后撤掉。静态的，不做动画 */

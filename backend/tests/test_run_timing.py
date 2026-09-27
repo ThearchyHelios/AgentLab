@@ -251,3 +251,23 @@ async def test_node_started_says_which_iteration_and_whether_it_was_a_replay(slo
     assert gate[1].get("resumed") is True, "恢复后重放的那一次要标出来"
     out = [e.data for e in events if e.type == "node.started" and e.node_id == "out"]
     assert not out[0].get("resumed"), "恢复之后新走到的节点不是重放"
+
+
+async def test_node_skipped_says_which_node_by_name_not_just_id():
+    """被 skip_if 跳过的节点也得带上名称和类型：界面按名字写「跳过「整理结果」」，
+    以前只带 reason，右栏只能退回写节点 id。"""
+    graph = chain(
+        node("start", "input", fields=[{"name": "question"}]),
+        {"id": "bg", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"label": "整理结果",
+                  "config": {"mode": "template", "template": "x", "skip_if": "true"}}},
+        node("out", "output", fields=[{"name": "结果", "value": "ok"}]),
+    )
+    run = await run_manager.start(graph=graph, input_payload={"question": "q"})
+    done = await _wait(run.id, ("succeeded", "failed"))
+    assert done.status == "succeeded", done.error
+    [skipped] = [e for e in await _events(run.id) if e.type == "node.skipped"]
+    assert skipped.node_id == "bg"
+    assert skipped.data.get("label") == "整理结果"
+    assert skipped.data.get("node_type") == "transform"
+    assert "skip_if 成立" in skipped.data.get("reason", "")

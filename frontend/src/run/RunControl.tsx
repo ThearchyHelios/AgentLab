@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { ChevronDown, Play } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
+import { NODE_DEFS } from '../canvas/nodeDefs'
+import { hintOf } from '../canvas/shortcuts'
 import { isComposing, Kbd, Skeleton, Spinner, toast } from '../components/ui'
+import { useLocalActor } from '../lib/actor'
 import { errorMessage } from '../lib/errors'
 import { matchShortcut } from '../lib/keys'
 import { runClassLabel } from '../lib/terms'
-import { useStudio } from '../store/studio'
-import type { WorkflowVersion } from '../types'
+import { useStudio, type FlowNode } from '../store/studio'
+import type { ValidationIssue, WorkflowVersion } from '../types'
 import { ClassDot, escapeRun, RunCapsule } from './RunHud'
 import { isActivePhase } from './trace'
 
@@ -98,6 +102,19 @@ function FieldsForm({ fields, values, onChange, onSubmit }: {
   )
 }
 
+/**
+ * 运行被拦时按钮上的说明：点出是哪个节点。后端的原话只说节点类型（「调用工具」节点还没选工具），
+ * 图里有两个工具节点就分不清是哪一个；全部问题在问题面板里，点一条能定位过去
+ */
+function blockedTitle(errors: ValidationIssue[], nodes: FlowNode[]): string {
+  const first = errors[0]
+  const node = first.node_id ? nodes.find((n) => n.id === first.node_id) : undefined
+  const name = node ? node.data.label || NODE_DEFS[node.data.nodeType]?.label || node.id : ''
+  const text = name && !first.message.includes(`「${name}」`) ? `「${name}」· ${first.message}` : first.message
+  const head = errors.length > 1 ? `${errors.length} 个问题会阻止运行，第一个：` : '这个问题会阻止运行：'
+  return `${head}${text}。${hintOf('全部列在问题面板里，点一条定位到节点', 'problems')}`
+}
+
 /** 点外面、按 Esc 关掉浮层。浮层不能只靠再点一次按钮关——那是很容易漏掉的死路 */
 function useDismiss(open: boolean, close: () => void, wrap: React.RefObject<HTMLDivElement | null>) {
   useEffect(() => {
@@ -158,7 +175,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
         aria-label="运行"
         aria-expanded={fields.length ? open : undefined}
         title={blocked
-          ? (errors.length ? `${errors.length} 个问题会阻止运行：${errors[0].message}` : '画布是空的')
+          ? (errors.length ? blockedTitle(errors, nodes) : '画布是空的')
           : `用画布当前内容发起一次${runClassLabel('exploratory')}`}
         onClick={() => {
           // 没有输入字段就没什么可填的，多弹一层只是多一次点击
@@ -207,6 +224,8 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
   const dirty = useStudio((s) => s.dirty)
   const canvasVersion = useStudio((s) => s.workflow?.version)
   const startFormalRun = useStudio((s) => s.startFormalRun)
+  // 正式运行记在署名下（请求头 X-Actor）：和发布、审批一样写明以谁的名义
+  const actor = useLocalActor()
   const key = `${workflowId}@${version}`
   const [open, setOpen] = useState(false)
   const [fields, setFields] = useState<Field[] | null>(versionFields.get(key) ?? null)
@@ -296,6 +315,15 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           )}
           {fields && (
             <FieldsForm fields={fields} values={values} onChange={setValues} onSubmit={() => void launch()} />
+          )}
+          {actor ? (
+            <div className="sf-pop-sign" data-signer="signed">
+              将以「<b>{actor}</b>」的名义发起，写进运行记录
+            </div>
+          ) : (
+            <div className="sf-pop-sign is-unsigned" data-signer="unsigned">
+              未署名：这次运行不会记录发起人 · <Link to="/settings/prefs">去设置署名</Link>
+            </div>
           )}
           <button type="button" className="btn w-full justify-center sf-formal-go"
                   disabled={busy || fields == null} onClick={() => void launch()}>

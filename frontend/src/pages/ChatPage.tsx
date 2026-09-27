@@ -9,13 +9,14 @@ import { ApiError, api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/AssistantStream'
 import { PromptBox } from '../run/Composer'
-import { decodeCopilot, decodeRun } from '../run/decode'
+import { decodeCopilot, decodeRun, exitLabels } from '../run/decode'
+import { sourceHandles } from '../canvas/nodeDefs'
 import { isComposing, PageHeader, Skeleton, Spinner, StatusBadge, TechDetails, toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { useCatalog, useDatasources, useOnReconnect } from '../store/catalog'
+import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import {
   agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
 } from '../store/chat'
@@ -316,7 +317,8 @@ export function ChatPage() {
   }
 
   return (
-    <div className="flex h-full">
+    // relative：窄屏上会话列表是浮在正文上面的抽屉，按这一层定位
+    <div className="relative flex h-full">
       <ConversationList />
       <div className="flex min-w-0 flex-1 flex-col">
         <PageHeader icon={<MessageSquare size={14} />} title="问数据"
@@ -384,7 +386,12 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
         : undefined,
     // 从库里恢复、还没点开「执行过程」的轮次只有问题和答案；点开后又收起的，
     // 步骤留在内存里但不画
-    steps: stepsVisible(turn) ? [...decodeCopilot(turn.ops), ...decodeRun(turn.events, turn.final)] : [],
+    steps: stepsVisible(turn) ? [...decodeCopilot(turn.ops), ...decodeRun(turn.events, turn.final, {
+      // 分支、循环那一行写这一轮工作流里出口的说明，不写 case 的 key
+      exitLabelOf: turn.graph?.nodes?.length
+        ? exitLabels(turn.graph.nodes.map((n) => ({ id: n.id, type: n.type, config: n.data?.config })), sourceHandles)
+        : undefined,
+    })] : [],
     thinking: turn.thinking,
     output: turn.output,
     error: turn.phase === 'error' && f ? streamError(turn, f) : turn.error || undefined,
@@ -864,6 +871,8 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
 }) {
   const collections = useCatalog((s) => s.collections)
   const tools = useCatalog((s) => s.tools)
+  const collectionsState = useCatalogListState('collections')
+  const toolsState = useCatalogListState('tools')
   const byConversation = useChat((s) => s.byConversation)
   const list = sources.list
   // 停用的库 Copilot 看不见，拿它造句等于教人问一个答不了的问题
@@ -904,8 +913,8 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
               : list.length ? `${list.length} 个数据源`
               : '还没有数据源'} />
           <Capability to="/knowledge" icon={<BookOpen size={11} />}
-            text={`知识库 ${collections.length} 个`} />
-          <Capability to="/tools" icon={<Wrench size={11} />} text={`工具 ${tools.length} 个`} />
+            text={countLine('知识库', collections.length, collectionsState)} />
+          <Capability to="/tools" icon={<Wrench size={11} />} text={countLine('工具', tools.length, toolsState)} />
         </div>
 
         {/* 库名本身就是开关：点一下这一问只查它。以前它只是一行说明文字，想换个库问
@@ -1065,6 +1074,15 @@ function ScopePicker({ sources, scope, onChange, unconfirmed }: {
       )}
     </div>
   )
+}
+
+/**
+ * 能力条上的「知识库 N 个」。没取回来（后端断着、请求出错）时手上的空列表不是「0 个」，
+ * 和数据源那一项一样说没取回来；还在路上写「—」
+ */
+function countLine(what: string, n: number, state: CatalogListState): string {
+  if (state === 'ok') return `${what} ${n} 个`
+  return state === 'loading' ? `${what} —` : `${what}没取回来`
 }
 
 function Capability({ to, icon, text }: { to: string; icon: ReactNode; text: string }) {

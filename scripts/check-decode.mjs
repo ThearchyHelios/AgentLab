@@ -928,6 +928,127 @@ await section('Copilot 自查问题：对象形状、节点名、超出限定范
     JSON.stringify(legacy.check?.issues[0]))
 })
 
+await section('老后端没有 llm.end：做完的模型调用不算「已取消」（终验 NEW）', async () => {
+  const E = (seq, type, node_id, ts, data = {}) => ({ seq, type, node_id, ts, data })
+  const llms = (steps) => flatten(steps).filter((s) => s.kind === 'llm')
+  // 最小复现：一次调用后面跟着真执行过的工具，第二次调用进行中被取消
+  const cancelled = mod.decodeRun([
+    E(1, 'run.started', null, 100, { nodes: 1 }),
+    E(2, 'node.started', 'a', 100.1, { label: '取数' }),
+    E(3, 'llm.start', 'a', 100.2, { model: 'm' }),
+    E(4, 'llm.thinking', 'a', 101.0, { text: '先查一下订单表' }),
+    E(5, 'tool.start', 'a', 101.4, { tool: 'calc', call_id: 'c1', args: {} }),
+    E(6, 'tool.end', 'a', 101.5, { tool: 'calc', call_id: 'c1', output: '1' }),
+    E(7, 'llm.start', 'a', 101.6, { model: 'm' }),
+    E(8, 'run.cancelled', null, 102, {}),
+  ])
+  const rows = flatten(cancelled).filter((s) => s.kind === 'llm' || s.kind === 'tool' || s.kind === 'query')
+  check('后面跟着工具调用的那次模型调用收成完成，不是已取消',
+    rows.map((s) => `${s.kind}|${s.status}`).join(',') === 'llm|done,tool|done,llm|cancelled',
+    rows.map((s) => `${s.kind}|${s.status}`).join(','))
+  const first = llms(cancelled)[0]
+  check('收尾时刻取下一条事件（tool.start）：耗时 1.2 s', first?.ms === 1200, `${first?.ms} / ${first?.meta}`)
+  check('思考仍挂在它那次调用上', first?.sub === '先查一下订单表', first?.sub)
+
+  // 连着两次调用、中间没有工具：前一次也做完了
+  const twice = llms(mod.decodeRun([
+    E(1, 'node.started', 'a', 1, {}),
+    E(2, 'llm.start', 'a', 1.1, {}),
+    E(3, 'llm.start', 'a', 2.1, {}),
+    E(4, 'run.cancelled', null, 3, {}),
+  ]))
+  check('又开始下一次调用：前一次收成完成', twice.map((s) => s.status).join(',') === 'done,cancelled',
+    twice.map((s) => s.status).join(','))
+  // 同一次调用只会有一条完整思考；又来一条，说明前一次已经做完
+  const thought = llms(mod.decodeRun([
+    E(1, 'node.started', 'a', 1, {}),
+    E(2, 'llm.start', 'a', 1.1, {}),
+    E(3, 'llm.thinking', 'a', 2, { text: '第一次的想法' }),
+    E(4, 'llm.thinking', 'a', 3, { text: '第二次的想法' }),
+    E(5, 'run.cancelled', null, 4, {}),
+  ]))
+  check('又来一条思考：前一次收成完成', thought[0]?.status === 'done' && thought[0].sub === '第一次的想法',
+    `${thought[0]?.status} / ${thought[0]?.sub}`)
+  // 节点跑完了，它最后那次调用当然也做完了：之后别的节点上被取消，不能连带
+  const finished = llms(mod.decodeRun([
+    E(1, 'node.started', 'a', 1, {}),
+    E(2, 'llm.start', 'a', 1.1, {}),
+    E(3, 'node.finished', 'a', 2, { duration_ms: 900 }),
+    E(4, 'node.started', 'b', 2.1, {}),
+    E(5, 'llm.start', 'b', 2.2, {}),
+    E(6, 'run.cancelled', null, 3, {}),
+  ]))
+  check('节点收尾时它那次调用收成完成，别的节点上进行中的才是已取消',
+    finished.map((s) => `${s.nodeId}|${s.status}`).join(',') === 'a|done,b|cancelled',
+    finished.map((s) => `${s.nodeId}|${s.status}`).join(','))
+
+  // 节点失败：出错的就是它最后那次调用，跟节点一起算失败，不写「已取消」
+  const failed = mod.decodeRun([
+    E(1, 'run.started', null, 1, { nodes: 1 }),
+    E(2, 'node.started', 'a', 1, {}),
+    E(3, 'llm.start', 'a', 1.1, {}),
+    E(4, 'tool.start', 'a', 2, { tool: 'calc', call_id: 'c1', args: {} }),
+    E(5, 'tool.end', 'a', 2.1, { tool: 'calc', call_id: 'c1', output: '1' }),
+    E(6, 'llm.start', 'a', 2.2, {}),
+    E(7, 'node.failed', 'a', 3, { error: '模型接口拒绝了请求（401）' }),
+    E(8, 'run.failed', null, 3, { error: '模型接口拒绝了请求（401）', node_id: 'a' }),
+  ])
+  check('节点失败：最后那次调用算失败，之前的算完成',
+    llms(failed).map((s) => s.status).join(',') === 'done,failed', llms(failed).map((s) => s.status).join(','))
+
+  // 新后端照常：llm.end 的耗时为准
+  const modern = llms(mod.decodeRun([
+    E(1, 'node.started', 'a', 1, {}),
+    E(2, 'llm.start', 'a', 1.1, {}),
+    E(3, 'llm.end', 'a', 1.5, { duration_ms: 420 }),
+    E(4, 'tool.start', 'a', 1.6, { tool: 'calc', call_id: 'c1', args: {} }),
+    E(5, 'run.cancelled', null, 2, {}),
+  ]))
+  check('有 llm.end 的照旧：耗时用它给的', modern[0]?.status === 'done' && modern[0].ms === 420, `${modern[0]?.status} ${modern[0]?.ms}`)
+})
+
+await section('分支、循环出口的说法（runfx-9、终验 NEW）', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: seq, data })
+  const branchRow = (events, opts) => flatten(mod.decodeRun(events, undefined, opts)).filter((s) => s.kind === 'branch')
+  const loop = (data) => branchRow([E(1, 'node.started', 'each'), E(2, 'edge.taken', 'each', data)])[0]?.title ?? ''
+  // 循环节点的 iteration 是「这次决定之前跑过几轮」：走循环体时 +1 是正要开始的那一轮，走 done 时它就是一共几轮
+  check('走循环体：第 3 轮', /第 3 轮/.test(loop({ branch: 'body', iteration: 2, total: 5, mode: 'foreach' })),
+    loop({ branch: 'body', iteration: 2, total: 5, mode: 'foreach' }))
+  const done5 = loop({ branch: 'done', iteration: 5, total: 5, mode: 'foreach' })
+  check('5 项走完：写共 5 项，不写第 6 轮', /共 5 项/.test(done5) && !/第\s*6/.test(done5), done5)
+  const done0 = loop({ branch: 'done', iteration: 0, total: 0, mode: 'foreach' })
+  check('0 项：不写第 1 轮', !/第\s*1\s*轮/.test(done0) && /没有要处理的项/.test(done0), done0)
+  const capped = loop({ branch: 'done', iteration: 10, total: 20, mode: 'foreach' })
+  check('撞上限退出：跑了几轮、一共几项都说', /跑了 10 轮/.test(capped) && /共 20 项/.test(capped), capped)
+  const whileDone = loop({ branch: 'done', iteration: 3, total: null, mode: 'while' })
+  check('while 走完：跑了 3 轮', /跑了 3 轮/.test(whileDone) && !/第/.test(whileDone), whileDone)
+  const whileNone = loop({ branch: 'done', iteration: 0, total: null, mode: 'while' })
+  check('while 一轮都没跑', /一轮都没跑/.test(whileNone), whileNone)
+  // 没有图的时候，循环的两个出口和兜底出口也不写 body / done / default
+  check('循环体出口不写 body', /走「循环体」/.test(loop({ branch: 'body', iteration: 0, total: 2, mode: 'foreach' })))
+  check('结束出口不写 done', /走「结束」/.test(done5), done5)
+  const fallback = branchRow([E(1, 'node.started', 'br'), E(2, 'edge.taken', 'br', { branch: 'default', reason: '都不满足', mode: 'expression' })])[0]
+  check('兜底出口写「其他」', fallback?.title === '走「其他」这条路', fallback?.title)
+
+  // 画布给了出口说明：写说明，不写 key
+  const labelOf = mod.exitLabels(
+    [{ id: 'br', type: 'branch', config: { cases: [{ key: 'team', label: '交给团队' }, { key: 'solo', label: '' }] } },
+     { id: 'each', type: 'loop', config: {} }, { id: 'x', type: 'agent', config: {} }],
+    (type, config) => (type === 'branch'
+      ? [...config.cases.map((c) => ({ id: c.key, label: c.label || c.key })), { id: 'default', label: '其他' }]
+      : type === 'loop' ? [{ id: 'body', label: '每一项' }, { id: 'done', label: '收尾' }] : [{ id: 'out', label: '' }]),
+  )
+  const labelled = branchRow([E(1, 'node.started', 'br'), E(2, 'edge.taken', 'br', { branch: 'team', mode: 'llm' })], { exitLabelOf: labelOf })[0]
+  check('分支行写 case 的说明，不写 key', labelled?.title === '走「交给团队」这条路', labelled?.title)
+  const bare = branchRow([E(1, 'node.started', 'br'), E(2, 'edge.taken', 'br', { branch: 'solo', mode: 'expression' })], { exitLabelOf: labelOf })[0]
+  check('case 没写说明：退回 key', bare?.title === '走「solo」这条路', bare?.title)
+  const gone = branchRow([E(1, 'node.started', 'br'), E(2, 'edge.taken', 'br', { branch: 'removed', mode: 'expression' })], { exitLabelOf: labelOf })[0]
+  check('图上已经没有这个出口：退回 key', gone?.title === '走「removed」这条路', gone?.title)
+  const loopLabelled = branchRow([E(1, 'node.started', 'each'), E(2, 'edge.taken', 'each', { branch: 'done', iteration: 2, total: 2, mode: 'foreach' })], { exitLabelOf: labelOf })[0]
+  check('循环出口也按图上的叫法', loopLabelled?.title === '走「收尾」这条路（共 2 项）', loopLabelled?.title)
+  check('没有出口的节点不进表', labelOf('x', 'out') === undefined)
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

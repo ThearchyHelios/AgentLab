@@ -161,6 +161,8 @@ async def test_a_team_member_writing_markup_fails_its_step_and_the_coordinator_i
     routes = [batch[1] for batch in seen if batch and batch[0] == "route"]
     assert len(routes) == 2 and "原始标记" in routes[1], routes
     assert "<｜｜DSML" not in json.dumps(row.output, ensure_ascii=False)
+    # 调度者读完失败说明判了完成，可一条数据都没查到：不能把失败说明当成果、记为已完成
+    assert row.status == "failed" and "工具调用的原始标记" in (row.error or ""), (row.status, row.output)
 
 
 async def test_markup_in_the_settle_round_keeps_what_the_agent_found(monkeypatch):

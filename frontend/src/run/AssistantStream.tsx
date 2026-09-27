@@ -13,7 +13,7 @@ import { api } from '../api/client'
 import { ErrorNotice, Modal, Skeleton, StatusBadge } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
-import { formatClock, formatDuration, formatNumber, shortId } from '../lib/format'
+import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
@@ -210,15 +210,20 @@ export function AssistantStream({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
-  const baseline = useRef(0)
+  /** 上一次跟随时看到的最后一轮：哪一轮、多少步、其余会变的东西 */
+  const seen = useRef({ id: '', n: 0, sig: '' })
   const [fresh, setFresh] = useState(0)
   const [artifact, setArtifact] = useState<{ id: string; title?: string } | null>(null)
   const reduced = useReducedMotion()
 
   const last = turns[turns.length - 1]
-  const total = useMemo(() => turns.reduce((n, t) => n + countSteps(t.steps), 0), [turns])
-  // 变了才值得跟随的东西：新的一轮、相位、步骤数、成果或报错出现
-  const signature = `${turns.length}|${last?.phase}|${total}|${!!last?.output}|${!!last?.error}`
+  // 跟随和「N 条新进展」只看最后一轮、而且只数它还在进行时长出来的步骤。已经停下的轮次点开
+  // 「看执行过程」时步骤是按需取回的历史：以前也算进总数，没有任何运行在跑，底下却浮出
+  // 「24 条新进展」；贴着底时还被一把拽到底部，刚点开的执行过程被推出视口
+  const lastCount = useMemo(() => (last ? countSteps(last.steps) : 0), [last])
+  const lastLive = last?.phase === 'running' || last?.phase === 'waiting'
+  // 除步骤数以外，变了就值得跟随的东西：新的一轮、相位、成果或报错出现
+  const signature = `${turns.length}|${last?.id}|${last?.phase}|${!!last?.output}|${!!last?.error}`
   const mode = landing ?? (turns.length === 1 && last?.phase !== 'running' ? 'summary' : 'end')
   // 换了一批轮次（切换会话、打开另一条运行）就当作第一次打开，重新定位
   const identity = resetKey ?? turns[0]?.id ?? ''
@@ -229,15 +234,16 @@ export function AssistantStream({
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_PX
     if (atBottom === pinned.current) return
     pinned.current = atBottom
+    // 离开底部时不用记基数：新进展是离开之后一条条累加的，贴底时它一直是 0
     if (atBottom) setFresh(0)
-    else baseline.current = total
-  }, [total])
+  }, [])
 
   // 首次打开：直接定位，不做平滑滚动——从顶部平滑滚过六轮对话只是让人晕
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (!el || !turns.length) return
     setFresh(0)
+    seen.current = { id: last?.id ?? '', n: lastCount, sig: signature }
     if (mode === 'end') {
       el.scrollTop = el.scrollHeight
       pinned.current = true
@@ -249,7 +255,6 @@ export function AssistantStream({
     if (target) target.scrollIntoView({ block: 'center' })
     else el.scrollTop = 0
     pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_PX
-    baseline.current = total
     if (failed) return flash(failed, 'failed')
     // 只在换了一批轮次时重新定位；之后的变化交给下面的跟随
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -257,12 +262,16 @@ export function AssistantStream({
 
   // 跟随：只在贴底时跟；离开底部就数一数来了几条新的，给一枚「跳到最新」
   useLayoutEffect(() => {
+    const prev = seen.current
+    seen.current = { id: last?.id ?? '', n: lastCount, sig: signature }
     const el = scrollRef.current
     if (!el || !follow) return
+    const grown = last?.id !== prev.id ? lastCount : lastLive ? Math.max(0, lastCount - prev.n) : 0
+    if (!grown && signature === prev.sig) return
     if (pinned.current) el.scrollTop = el.scrollHeight
-    else setFresh(Math.max(0, total - baseline.current))
+    else if (grown) setFresh((f) => f + grown)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signature, follow])
+  }, [signature, lastCount, follow])
 
   // 点名要看某个节点（画布上点了它）：滚过去就暂停跟随——人要看的是那一步，新进展来了
   // 也不能把他拽回底部；他自己滚回底部再恢复（onScroll）。
@@ -279,7 +288,6 @@ export function AssistantStream({
     if (!reveal || reveal.seq === revealed.current) return
     revealed.current = reveal.seq
     const { nodeId, seq } = reveal
-    const seen = total
     let tries = 0
     const attempt = () => {
       const el = scrollRef.current
@@ -290,7 +298,7 @@ export function AssistantStream({
         return
       }
       pinned.current = false
-      baseline.current = seen
+      setFresh(0)
       target.scrollIntoView({ block: 'start', behavior: reduced ? 'auto' : 'smooth' })
       unflash.current?.()
       unflash.current = flash(target, 'focus')
@@ -1621,6 +1629,9 @@ function TeamLanes({ team }: { team: TeamRun }) {
           <div className="flex min-w-0 flex-1 gap-1">
             {team.rounds.map((r) => {
               const live = r.members.some((m) => m.status === 'running')
+              // 没收齐就停下的一轮（取消、服务重启）不知道本来要多久：写怎么停的。以前写
+              // 「第1轮 · 0 ms」，有人先交回的话还写成先交回那人的耗时，像是这一轮跑完了
+              const stopped = r.members.find((m) => m.status === 'cancelled' || m.status === 'suspended')
               return (
                 <div key={r.round}
                      className={clsx('tnum min-w-0 flex-1 truncate text-center text-dim', dense ? 'text-[10px]' : 'text-2xs')}
@@ -1629,7 +1640,9 @@ function TeamLanes({ team }: { team: TeamRun }) {
                       宁可只留轮次和耗时，并行与否看上面那行条形本来就一目了然 */}
                   {`第${r.round + 1}轮`}
                   {r.parallel > 1 && !dense ? ` · ${r.parallel} 人并行` : ''}
-                  {' · '}{live ? '进行中' : formatDuration(r.wallMs)}
+                  {' · '}{live ? '进行中'
+                    : stopped ? statusLabel(stopped.status, { short: true })
+                    : r.wallMs > 0 ? formatDuration(r.wallMs) : NONE}
                 </div>
               )
             })}

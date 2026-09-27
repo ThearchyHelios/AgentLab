@@ -9,6 +9,7 @@
  */
 
 import { ApiError } from '../api/client'
+import { VALIDATION_TITLE } from './validation'
 
 export interface HumanError {
   /** 一句人话：发生了什么 */
@@ -45,6 +46,11 @@ const CJK_RE = /[一-鿿]/
 function fromText(text: string, { network = true }: { network?: boolean } = {}): Omit<HumanError, 'kind'> & { kind?: HumanError['kind'] } {
   const raw = text.trim()
   if (!raw) return { title: '出错了，但没有给出原因', raw }
+  // 422：client 已经把 pydantic 的原文逐条翻好了（lib/validation）。标题固定、逐条进原因，
+  // 不交给 splitSentence——那边会在第一个「；」处把第二条切成原因、第一条挂在标题上
+  if (raw.startsWith(`${VALIDATION_TITLE}：`)) {
+    return { title: VALIDATION_TITLE, reason: raw.slice(VALIDATION_TITLE.length + 1), action: '按提示改好再提交。' }
+  }
   if (network && NETWORK_RE.test(raw)) return { ...NETWORK_ERROR, raw }
   if (/exit (?:code )?undefined|exit_code.*none/i.test(raw)) {
     return { title: '请求没到沙箱', reason: '沙箱没有返回退出码，可能没启动或者中途被中断。', action: '看一眼设置里的沙箱状态，再重试。', raw }
