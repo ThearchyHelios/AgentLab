@@ -358,6 +358,8 @@ Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型�
 
 - 分支条件使用 AST 白名单求值器而非 `eval`
 - HTTP 工具解析域名后逐 IP 检查，拦截内网、回环与云元数据地址，且不跟随重定向（逐跳重新校验）
+  本机代理开 fake-ip 时，解析结果是 198.18 段的假地址：配置 fake-ip 网段后，这类结果改向公共 DNS（DoH）
+  核实真实地址再判断，核实不了按拦截处理
 - 文件工具路径 `resolve()` 后必须仍位于工作区内
 - SQL 守卫采用白名单动词判定 + 正文扫描 + 多语句拦截 + 结果集上限；`DROP` / `TRUNCATE` / `GRANT` 等
   在可写数据源上亦一律拒绝。以查询开头却会写的语句（`WITH … DELETE`、`SELECT … INTO`、
@@ -451,6 +453,12 @@ pip install -e 'backend[microvm,dev,db,docs]' -c backend/requirements.lock   # �
 **数据源结构探查失败。** 探查失败与「尚未探查」是两种状态：前者点击按钮无法解决，
 需先处理超时或更换 schema。数据源卡片会显示失败原因与该服务器上的可选库列表。
 agent 侧同样会收到实情，并被告知可直接查询 `information_schema` 自行确认表结构。
+
+**网页工具报「解析到内网地址 198.18.x.x，已拦截」。** 本机代理（Clash / mihomo 等）开了 TUN + fake-ip，
+查任何域名都先拿到 198.18 段的假地址，被当成内网拦掉了。在 `.env` 里加一行
+`AGENTLAB_HTTP_TOOL_FAKE_IP_RANGES=198.18.0.0/15`，重启后端即可：落在这个段里的解析结果会改向公共 DNS
+核实真实地址，公网放行、内网照拦。核实用的 DoH 地址由 `AGENTLAB_HTTP_TOOL_DOH_URLS` 指定（逗号分隔）。
+不想改配置的话，把代理 DNS 改成 redir-host，或把要访问的域名加进 `fake-ip-filter`。
 
 **端口冲突。** 前端默认 5273、后端 8000，通过 `AGENTLAB_WEB_PORT` / `AGENTLAB_PORT` 修改。
 

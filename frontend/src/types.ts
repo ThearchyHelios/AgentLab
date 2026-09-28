@@ -36,13 +36,53 @@ export interface Workflow {
   is_template: boolean
   status?: 'draft' | 'published' | 'governed'
   published_version?: number | null
+  /** 最近一次发布的署名。发布时没有署名为 null */
+  published_by?: string | null
   run_count?: number
   created_at?: string
   updated_at?: string
 }
 
+/** 工作流的一个版本。列表接口只有前四项，取单个版本时才有 graph 等 */
+export interface WorkflowVersion {
+  id: string
+  version: number
+  note: string
+  created_at?: string
+  workflow_id?: string
+  graph?: GraphSpec
+  graph_hash?: string | null
+  /** 这一版入口节点声明的字段。正式运行的表单照它填，不能照画布 */
+  input_fields?: { name: string; required?: boolean; [key: string]: any }[]
+  /** 是不是当前的已发布版本 */
+  published?: boolean
+}
+
+/**
+ * 后端写进 runs.status 的值。interrupted 既可能是停在审批上，也可能是服务重启
+ * 打断后挂起——显示时用 lib/status 的 resolveStatus 配合审批列表区分。
+ * suspended 目前后端不写，前端推导的 RunPhase 会用到，这里一并收下。
+ */
 export type RunStatus =
-  | 'queued' | 'running' | 'interrupted' | 'succeeded' | 'failed' | 'cancelled'
+  | 'queued' | 'running' | 'interrupted' | 'succeeded' | 'failed' | 'cancelled' | 'suspended'
+
+/**
+ * 运行的用量与时长。
+ *
+ * 三种时长口径不同，不能混用：duration_ms / active_ms 是各段执行时长之和（审批
+ * 恢复、续跑的每一段都算），wall_ms 是从第一次开始到结束的墙钟，wait_ms 是等人
+ * 审批的总时长。老数据只有 duration_ms，而且可能只是最后一段。
+ */
+export interface RunUsage {
+  duration_ms?: number
+  wall_ms?: number
+  active_ms?: number
+  wait_ms?: number
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number
+  [key: string]: any
+}
 
 export interface Run {
   id: string
@@ -52,15 +92,22 @@ export interface Run {
   input: Record<string, any>
   output: Record<string, any>
   error: string | null
-  usage: Record<string, any>
+  usage: RunUsage
   run_class?: 'formal' | 'exploratory'
   version?: number | null
   version_hash?: string | null
   manifest_hash?: string | null
+  /** 封存到第几条事件为止。有它才说明这条运行的清单封存过 */
+  manifest_seq?: number | null
+  /** 失败时能定位到的节点 */
+  error_node_id?: string | null
   started_by?: string | null
+  /** 发起时实际生效的记忆域和知识库（没指定时取设置里的默认值）。老后端不给 */
+  memory_scope?: string | null
+  collection?: string | null
   created_at?: string
   started_at?: string
-  finished_at?: string
+  finished_at?: string | null
 }
 
 export interface RunEvent {
@@ -82,9 +129,30 @@ export interface Approval {
   status: string
   response: Record<string, any>
   created_at?: string
+  // 以下是审批卡的上下文，老后端不给
+  workflow_id?: string | null
+  workflow_name?: string | null
+  node_label?: string | null
+  run_status?: RunStatus | null
+  run_class?: 'formal' | 'exploratory' | null
+  /** 谁处理的。null 表示处理时没有署名，显示「未署名」 */
+  resolved_by?: string | null
+  resolved_at?: string | null
 }
 
-export interface Provider {
+/**
+ * 后端记着的最近一次测连接（模型接入、数据源、MCP 的列表接口都平铺这四项）。
+ * 没测过、或者连接配置改过之后全是 null。用 lib/health 的 healthFromServer 转成
+ * HealthRecord 给 HealthPill
+ */
+export interface ServerHealth {
+  last_checked_at?: string | null
+  last_check_ok?: boolean | null
+  last_latency_ms?: number | null
+  last_error?: string | null
+}
+
+export interface Provider extends ServerHealth {
   id: string
   name: string
   kind: string
@@ -104,7 +172,56 @@ export interface ToolInfo {
   category: string
   source: 'builtin' | 'custom' | 'mcp'
   dangerous: boolean
+  /** 运行时是否真的会因它停下来等审批。MCP 与自定义工具目前不会，界面别说它「需确认」 */
+  runtime_approval?: boolean
   schema: Record<string, any>
+  /**
+   * 只有自定义工具有：库里存着的参数定义哪里写坏了（一句中文）。绑了它的节点运行时
+   * 一定失败，列表上要醒目地标出来。null / 缺省表示没问题
+   */
+  problem?: string | null
+}
+
+/**
+ * 数据源（GET /api/datasources 的一行）。tools 是它给模型的两个工具名
+ * db_query__<name> / db_schema__<name>——/api/tools 里没有它们，挑工具要从这里取
+ */
+export interface DataSource extends ServerHealth {
+  id: string
+  /** 标识，进了工具名，建好不能改 */
+  name: string
+  kind: string
+  host: string | null
+  port: number | null
+  database: string | null
+  username: string | null
+  options: Record<string, any>
+  readonly: boolean
+  description: string
+  enabled: boolean
+  password_masked?: string
+  has_password?: boolean
+  table_count?: number
+  schema_synced_at?: string | null
+  /** 上次探查为什么没拿到表；空串 = 没出错（或还没探查） */
+  schema_error?: string
+  available_schemas?: string[]
+  tools?: string[]
+  /** 缓存按哪个 schema 探的：'' 默认 schema，null 没有缓存 */
+  cached_schema?: string | null
+}
+
+/** 自定义工具（GET /api/custom-tools 的一行；POST / PATCH 的返回同形） */
+export interface CustomTool {
+  id: string
+  name: string
+  description: string
+  kind: 'http' | 'python' | (string & {})
+  parameters: Record<string, any>
+  config: Record<string, any>
+  enabled: boolean
+  /** 同 ToolInfo.problem：参数定义写坏了的那句话，没问题是 null */
+  problem?: string | null
 }
 
 export interface Skill {
@@ -126,7 +243,26 @@ export interface MemoryItem {
   importance: number
   use_count: number
   meta: Record<string, any>
+  /**
+   * 从哪来。kind=run 时带运行、节点和工作流名；manual 是手动添加的；playground 是
+   * 在工具库里直接调 remember 写进来的。老后端不给
+   */
+  source?: MemorySource | null
   created_at?: string
+  /** 后端不再给：每次计数的回忆都会写这一行，updated_at 跟着回忆走，不是编辑时间 */
+  updated_at?: never
+  last_used_at?: string | null
+}
+
+export interface MemorySource {
+  kind?: 'run' | 'manual' | 'playground' | string
+  run_id?: string | null
+  node_id?: string | null
+  workflow_name?: string | null
+  node_label?: string | null
+  /** 来源运行是否还在。删掉之后只剩文字，不再给链接 */
+  run_exists?: boolean
+  [key: string]: any
 }
 
 export interface KbDocument {
@@ -148,11 +284,14 @@ export interface ValidationIssue {
   node_id?: string | null
   edge_id?: string | null
   message: string
+  /** 出问题的是节点配置里的哪一项：'prompt'、'tools'、'cases[1].condition'。老后端不给 */
+  field?: string | null
 }
 
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
 export interface NodeRuntime {
-  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped'
+  /** cancelled / suspended 是终态清扫时收的：运行被取消或服务重启时还没跑完的节点 */
+  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended'
   durationMs?: number
   preview?: any
   error?: string
@@ -180,7 +319,7 @@ export interface TeamMember {
   agent: string
   instruction: string
   ms: number
-  status: 'running' | 'done' | 'failed' | 'waiting'
+  status: 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended'
   result?: string
 }
 
@@ -250,6 +389,13 @@ export interface Conversation {
   turn_count: number
   /** 列表里的副标题，让人一眼认出是哪次聊天 */
   last_question: string
+  /**
+   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败。
+   * 没有轮次时为 null；老后端不给
+   */
+  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'suspended' | 'done' | null
+  /** 最后一轮的运行。建图阶段就断了的没有 */
+  last_run_id?: string | null
 }
 
 export interface ConversationDetail extends Conversation {
@@ -269,7 +415,64 @@ export interface ConversationTurn {
   error: string
   /** 复核结论。null = 这一轮没复核过，和「复核过、没发现问题」不是一回事 */
   review?: ReviewResult | null
+  /**
+   * 可信度元数据（出具档位、运行类别、耗时、查库次数……），前端整块写、整块读，
+   * 后端只用它算 last_status。老轮次挂在 review.meta 下，后端读出来时统一放到这里
+   */
+  meta?: Record<string, any> | null
   created_at?: string
+  /**
+   * 这一轮最后一次落库的时刻（UTC，后端 TurnOut）。后端判「建图断了」按它算
+   * （conversations.BUILD_STALE），前端判断同一件事时用同一只钟。老后端没有
+   */
+  updated_at?: string
+}
+
+/**
+ * Copilot 改图前后都在、而绑定的工具变了的节点或协作成员。
+ * 画布上看不出来（节点还在），跑起来才发现查不了库，所以改图回执要明说
+ */
+export interface ToolChange {
+  node_id: string
+  label: string
+  /** 协作成员的名字；节点本身的工具为 null */
+  member: string | null
+  /** 配置里的哪一项：'tools' 或 'agents[2].tools' */
+  field: string
+  before: string[]
+  after: string[]
+  added: string[]
+  removed: string[]
+}
+
+/**
+ * Copilot 自查（SSE op='check'）里的一条问题。新后端给对象，老会话里存的是
+ * 「「node_id」message」一行字符串，两种都要认，见 CopilotCheckEntry
+ */
+export interface CopilotCheckIssue {
+  level: 'error' | 'warning'
+  node_id: string | null
+  edge_id: string | null
+  /** 不再以「节点 id」开头；要带节点名自己用 node_id 查 */
+  message: string
+  /** 出问题的配置项，比如 'tools'、'agents[1].tools'，检查器据此定位 */
+  field?: string | null
+  /** datasource_out_of_scope、tools_dropped 这类机器码 */
+  code?: string
+}
+
+export type CopilotCheckEntry = string | CopilotCheckIssue
+
+/** SSE 的自查操作。repairing 时带第几轮；warnings 是不挡运行的提醒（tools_dropped） */
+export interface CopilotCheckOp {
+  op: 'check'
+  status: 'repairing' | 'passed' | 'failed' | 'error'
+  issues?: CopilotCheckEntry[]
+  warnings?: CopilotCheckIssue[]
+  round?: number
+  repaired?: number
+  message?: string
+  detail?: string
 }
 
 /**

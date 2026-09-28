@@ -41,6 +41,14 @@ const LANE_TOLERANCE = 6
 const BAND_PAD = 12
 /** 两列的中心距离小于它就算同一列。用户手拖过的节点不至于被拆成两列。 */
 const COLUMN_TOLERANCE = 60
+/** 出口标签的左缘在卡片右边外这么远，和 index.css 的 .nc-exit（left: 100% + 8px）一致 */
+const EXIT_LABEL_DX = 8
+/** 标签右缘和拐上去的那道弯之间至少留的空。比圆角半径小一点：弯刚起头时还贴着水平线 */
+const EXIT_LABEL_GAP = 6
+/** 竖直车道离目标卡片至少这么远：末段水平线要放得下圆角和箭头 */
+const TARGET_ROOM = 26
+/** 出口多到这个数，标签改成骑在自己那条线上（NodeCard 的 nc-exits-dense） */
+export const DENSE_EXITS = 5
 
 export interface Point {
   x: number
@@ -54,6 +62,22 @@ export interface Route {
   /** 路径长度。边上的流光按它定速度——短线走得快、长线走得慢，
    *  视觉速度才是一致的；否则长边上的光点会慢得像卡住了 */
   length: number
+  /**
+   * 这条线离开带标签的出口后往标签那一侧拐、走廊又挪不出地方时：那个出口的标签最多
+   * 能占多宽（含内边距），超出的由卡片截短。放得下就没有这一项
+   */
+  exit?: { handle: string; room: number }
+}
+
+/**
+ * 出口标签的宽度估算：9.5px 的字（出口密时 9px），中日韩字符按一个字宽、其余按 0.62 个，
+ * 加左右各 3px 内边距。宁可估宽一点：估窄了拐弯照样压字
+ */
+export function exitLabelWidth(label: string, dense: boolean): number {
+  const size = dense ? 9 : 9.5
+  let width = 6
+  for (const ch of label) width += /[\u2e80-\uffff]/.test(ch) ? size : size * 0.62
+  return Math.ceil(width)
 }
 
 /** buildRoutes 需要的节点信息，结构上就是 store 里的 FlowNode。 */
@@ -194,14 +218,24 @@ function assignLanes(segments: Segment[]): number {
   return lanes.length
 }
 
-/** 车道在走廊里的 x。整束车道居中，走廊窄的时候自动压缩间距。 */
-function laneX(column: Column, next: Column, lane: number, total: number): number {
+/**
+ * 车道在走廊里的 x。整束车道居中，走廊窄的时候自动压缩间距。
+ *
+ * floor：走廊左侧有出口标签、线又往标签那一侧拐时，第一条车道至少要在这儿以右——
+ * 居中的车道正好落在「快速模式」四个字的尾巴上，拐弯从字里穿过去。整束往右挪，
+ * 挪不下先压间距，再不够就挪到能挪的最右（剩下的由卡片截短标签）
+ */
+function laneX(column: Column, next: Column, lane: number, total: number, floor = 0): number {
   const left = column.right
   const avail = Math.max(0, next.left - left)
-  if (total <= 1) return left + avail / 2
-  const gap = Math.max(6, Math.min(LANE, (avail - STUB * 2) / (total - 1)))
-  const span = gap * (total - 1)
-  return left + (avail - span) / 2 + lane * gap
+  let gap = total <= 1 ? 0 : Math.max(6, Math.min(LANE, (avail - STUB * 2) / (total - 1)))
+  let start = left + (avail - gap * (total - 1)) / 2
+  if (floor > start) {
+    const right = next.left - TARGET_ROOM
+    if (total > 1 && floor + gap * (total - 1) > right) gap = Math.max(6, (right - floor) / (total - 1))
+    start = Math.max(start, Math.min(floor, right - gap * (total - 1)))
+  }
+  return start + lane * gap
 }
 
 /**
@@ -385,6 +419,23 @@ export function buildRoutes(
     tx: number
     ty: number
     band: number
+    /** 从哪个出口出来（没标出口的按第一个算） */
+    handle: string
+    /** 那个出口的标签左缘 */
+    labelLeft: number
+    /** 第一道弯至少要在这个 x 以右才不压标签；0 表示不用让 */
+    floor: number
+  }
+  /**
+   * 第一道弯会不会压到出口标签。标签平时画在出线上方，只有往上拐的弯会穿过它；
+   * 出口密时标签骑在线上，往哪边拐都会。turnTo 是第一段竖线的另一头
+   */
+  const labelFloor = (node: Geometry, handleId: string, sy: number, turnTo: number): number => {
+    const label = node.handles.find((h) => h.id === handleId)?.label
+    if (!label) return 0
+    const dense = node.handles.length >= DENSE_EXITS
+    const crosses = dense ? Math.abs(turnTo - sy) > 0.5 : turnTo < sy - 0.5
+    return crosses ? node.right + EXIT_LABEL_DX + exitLabelWidth(label, dense) + EXIT_LABEL_GAP : 0
   }
   const plans: Plan[] = []
   const usedBands: number[] = []
@@ -418,11 +469,16 @@ export function buildRoutes(
       band = freeBand(columns, from, to, ideal, usedBands)
       usedBands.push(band)
     }
+    const handle = resolveHandleId(source, e.sourceHandle)
+    const turnTo = kind === 'short' ? ty : kind === 'self' ? source.bottom + 34 : band
     plans.push({
       edge: e, kind, colS, colT,
       sx: source.right + SOURCE_PORT_DX, sy,
       tx: target.left + TARGET_PORT_DX, ty,
       band,
+      handle,
+      labelLeft: source.right + EXIT_LABEL_DX,
+      floor: labelFloor(source, handle, sy, turnTo),
     })
   }
 
@@ -450,11 +506,19 @@ export function buildRoutes(
     corridorLanes.set(corridor, total)
     for (const seg of segments) laneOf.set(`${seg.edgeId}\u0000${corridor}`, seg.lane)
   }
+  // 走廊左侧有出口标签要让：整条走廊的车道一起往右挪，谁的竖线都不从标签里穿过
+  const corridorFloor = new Map<number, number>()
+  for (const plan of plans) {
+    if (plan.floor && plan.kind !== 'self') {
+      corridorFloor.set(plan.colS, Math.max(corridorFloor.get(plan.colS) ?? 0, plan.floor))
+    }
+  }
 
   const laneAt = (corridor: number, edgeId: string): number | null => {
     if (corridor < 0 || corridor >= columns.length - 1) return null
     const lane = laneOf.get(`${edgeId}\u0000${corridor}`) ?? 0
-    return laneX(columns[corridor], columns[corridor + 1], lane, corridorLanes.get(corridor) ?? 1)
+    return laneX(columns[corridor], columns[corridor + 1], lane, corridorLanes.get(corridor) ?? 1,
+      corridorFloor.get(corridor))
   }
 
   // ---- 4. 出路径 ----
@@ -471,7 +535,8 @@ export function buildRoutes(
     } else if (plan.kind === 'long' || plan.kind === 'back') {
       const outX = laneAt(plan.colS, plan.edge.id)
       const inX = laneAt(plan.colT - 1, plan.edge.id)
-      const startX = outX ?? plan.sx + STUB
+      // 源在最右一列、右边没有走廊：拐弯点不受车道约束，直接让过标签
+      const startX = outX ?? Math.max(plan.sx + STUB, plan.floor)
       const endX = inX ?? plan.tx - 26
       points = [
         { x: plan.sx, y: plan.sy },
@@ -484,7 +549,7 @@ export function buildRoutes(
     } else {
       // 自环：贴着卡片右边出去，从下面兜回来
       const node = byId.get(plan.edge.source)!
-      const outX = node.right + 26
+      const outX = Math.max(node.right + 26, plan.floor)
       const inX = node.left - 26
       const band = node.bottom + 34
       points = [
@@ -497,11 +562,17 @@ export function buildRoutes(
       ]
     }
     const { mid, length } = polylineMidpoint(points)
+    // 车道挪到头也没让开标签：告诉卡片这个出口的标签最多能多宽
+    const bend = points[1].x
+    const exit = plan.floor && bend < plan.floor
+      ? { handle: plan.handle, room: Math.max(0, Math.floor(bend - EXIT_LABEL_GAP - plan.labelLeft)) }
+      : undefined
     routes.set(plan.edge.id, {
       path: roundedPath(points),
       labelX: mid.x,
       labelY: mid.y,
       length,
+      ...(exit ? { exit } : {}),
     })
   }
 

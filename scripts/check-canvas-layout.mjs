@@ -4,9 +4,12 @@
 // 从卡片中间穿过去、线有没有接在节点外面。check-ui / e2e-check 只看得到
 // "页面没报错、节点在、能点"，连线叠成一团它们一个字都不会说。
 //
-// 跑之前前端得起着（./scripts/dev.sh），因为走线模块是 Vite 现编的 TS：
-// 检查脚本直接 import('/src/canvas/routing.ts')，用的是页面上跑的那份代码，
-// 不是抄一遍逻辑——抄一遍就等于只测了抄的那份。
+// 走线模块是 Vite 现编的 TS：检查脚本直接 import('/src/canvas/routing.ts')，用的是
+// 页面上跑的那份代码，不是抄一遍逻辑——抄一遍就等于只测了抄的那份。排版走后端。
+//
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
+// 沙箱拷贝）跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-canvas-layout.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -18,6 +21,19 @@ let failed = 0
 const check = (name, cond, detail = '') => {
   console.log(`  ${cond ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`)
   if (!cond) failed++
+}
+
+/**
+ * 一节一节地跑：某一节里元素找不到、等待超时，只记成这一节失败，接着跑下一节，
+ * 不让一处卡住把后面的检查一起吞掉。各节自己开页面
+ */
+async function section(name, fn) {
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  }
 }
 
 // ---------------------------------------------------------------- 夹具
@@ -90,7 +106,20 @@ const BOTH_WAYS = {
   ],
 }
 
-const FIXTURES = { PARALLEL, WIDE, LOOP, MERGE_BRANCH, BOTH_WAYS }
+/** case 的 key 用了保留名 default：和兜底出口合并成一个出口，线照样接得上 */
+const DEFAULT_CASE = {
+  nodes: [
+    node('start', 'input'),
+    node('gate', 'branch', { cases: [{ key: 'fast', label: '快速' }, { key: 'default', label: '协作' }] }),
+    node('quick', 'llm'), node('team', 'llm'), node('done', 'output'),
+  ],
+  edges: [
+    edge('start', 'gate'), edge('gate', 'quick', 'fast'), edge('gate', 'team', 'default'),
+    edge('quick', 'done'), edge('team', 'done'),
+  ],
+}
+
+const FIXTURES = { PARALLEL, WIDE, LOOP, MERGE_BRANCH, BOTH_WAYS, DEFAULT_CASE }
 
 // ---------------------------------------------------------------- 几何
 
@@ -176,9 +205,7 @@ try {
   process.exit(1)
 }
 
-for (const [name, graph] of Object.entries(FIXTURES)) {
-  console.log(`=== ${name} ===`)
-
+for (const [name, graph] of Object.entries(FIXTURES)) await section(name, async () => {
   const res = await fetch(`${API}/copilot/layout`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -186,7 +213,7 @@ for (const [name, graph] of Object.entries(FIXTURES)) {
   })
   if (!res.ok) {
     check('后端排版可用', false, `${res.status}`)
-    continue
+    return
   }
   const laid = await res.json()
 
@@ -268,14 +295,13 @@ for (const [name, graph] of Object.entries(FIXTURES)) {
     }
   }
   check('每条线的两端都接在节点上', dangling.length === 0, dangling.slice(0, 3).join('、'))
-}
+})
 
 check('页面没有运行时错误', pageErrors.length === 0, pageErrors.join(' | '))
 
 // 手拖过的节点位置是随机的：坐标乱七八糟时不能算出 NaN 路径。
 // NaN 的 path 什么都不画，界面上就是"线没了"，而且一声不吭。
-console.log('=== 随机坐标（手拖过的图） ===')
-{
+await section('随机坐标（手拖过的图）', async () => {
   const fuzz = await page.evaluate(async () => {
     const mod = await import('/src/canvas/routing.ts')
     let seed = 20240924
@@ -321,7 +347,103 @@ console.log('=== 随机坐标（手拖过的图） ===')
   })
   check(`随机坐标下每条边都画得出来（${fuzz.total} 条）`, fuzz.broken === 0,
     fuzz.examples.join('、'))
-}
+})
+
+// 出口标签画在出线上方（出口密时骑在线上）。往标签那一侧拐的线，第一道弯要让过标签；
+// 走廊挪不出地方时 Route.exit 给出截短后的宽度，截短的标签同样不能被穿过
+await section('出口标签不被自己的线穿过', async () => {
+  const UP = {
+    nodes: [
+      node('start', 'input'), node('prep', 'llm'),
+      node('gate', 'branch', { cases: [{ key: 'fast', label: '按客户分层的快速处理通道' }, { key: 'slow', label: '协作模式' }] }),
+      node('a', 'llm'), node('b', 'supervisor', { agents: [{ name: 'x' }, { name: 'y' }, { name: 'z' }] }), node('done', 'output'),
+    ],
+    edges: [edge('start', 'prep'), edge('prep', 'gate'), edge('gate', 'a', 'fast'), edge('gate', 'b', 'slow'),
+      edge('a', 'done'), edge('b', 'done')],
+  }
+  const all = { ...FIXTURES, UP }
+  const bad = []
+  let checked = 0
+  let cut = 0
+  for (const [name, graph] of Object.entries(all)) {
+    const laid = await (await fetch(`${API}/copilot/layout`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ graph }),
+    })).json()
+    const r = await page.evaluate(async ({ laid }) => {
+      const mod = await import('/src/canvas/routing.ts')
+      const defs = await import('/src/canvas/nodeDefs.ts')
+      // 协作节点带花名册，实测比别的卡高：排版把上面那一支顶上去，线一出来就往上拐
+      const nodes = laid.nodes.map((n) => ({
+        id: n.id, position: n.position, measured: { width: 238, height: n.type === 'supervisor' ? 170 : 92 },
+        data: { nodeType: n.type, config: n.data?.config ?? {} },
+      }))
+      const edges = laid.edges.map((e, i) => ({ id: e.id || `e${i}`, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? null }))
+      const routes = mod.buildRoutes(nodes, edges)
+      const out = []
+      for (const e of edges) {
+        const src = nodes.find((n) => n.id === e.source)
+        const handles = defs.sourceHandles(src.data.nodeType, src.data.config)
+        const i = Math.max(0, handles.findIndex((h) => h.id === e.sourceHandle))
+        const h = handles[i]
+        if (!h?.label) continue
+        const route = routes.get(e.id)
+        const dense = handles.length >= mod.DENSE_EXITS
+        const y = handles.length <= 1 ? src.position.y + 46 : src.position.y + (92 * (i + 1)) / (handles.length + 1)
+        const left = src.position.x + 238 + 8
+        const width = route.exit ? route.exit.room : mod.exitLabelWidth(h.label, dense)
+        const box = dense ? { l: left, r: left + width, t: y - 5.5, b: y + 5.5 } : { l: left, r: left + width, t: y - 15, b: y - 2 }
+        // 圆角按折线端点近似：弯里那一小段贴着拐点，端点落不进标签，折线就更落不进
+        const pts = (route.path.match(/[MLQ][^MLQ]*/g) ?? []).flatMap((tk) => {
+          const n = tk.slice(1).trim().split(/[\s,]+/).map(Number)
+          return tk[0] === 'Q' ? [{ x: n[0], y: n[1] }, { x: n[2], y: n[3] }] : [{ x: n[0], y: n[1] }]
+        })
+        let hit = null
+        for (let k = 1; k < pts.length && !hit; k++) {
+          const a = pts[k - 1]
+          const b = pts[k]
+          for (let s = 0; s <= 20; s++) {
+            const x = a.x + ((b.x - a.x) * s) / 20
+            const yy = a.y + ((b.y - a.y) * s) / 20
+            // 出口密时标签骑在线上：只盖住自己那条的水平出线，这一段不算
+            if (dense && Math.abs(yy - y) < 1) continue
+            if (x > box.l + 1 && x < box.r - 1 && yy > box.t + 1 && yy < box.b - 1) { hit = `${Math.round(x)},${Math.round(yy)}`; break }
+          }
+        }
+        out.push({ id: e.id, label: h.label, hit, cut: !!route.exit })
+      }
+      return out
+    }, { laid })
+    for (const x of r) {
+      checked++
+      if (x.cut) cut++
+      if (x.hit) bad.push(`${name}/${x.label}@${x.hit}`)
+    }
+  }
+  check(`带标签的出口线都让过了标签（${checked} 条，其中 ${cut} 条截短）`, checked > 0 && bad.length === 0, bad.slice(0, 4).join('、'))
+  check('放不下的长标签给出了截短宽度', cut > 0, `${cut}`)
+})
+
+// 分支出口由 case 算出来。同 id 的两个出口会让 React Flow 出两个 handle、跑完两条一起
+// 亮，React 还会报 key 重复；key=default 和兜底出口在运行时本来就是同一个出口
+await section('分支出口：保留名 default、重复标识', async () => {
+  const r = await page.evaluate(async () => {
+    const { sourceHandles } = await import('/src/canvas/nodeDefs.ts')
+    const merged = sourceHandles('branch', { cases: [{ key: 'fast', label: '快速' }, { key: 'default', label: '协作' }] })
+    const dup = sourceHandles('branch', { cases: [{ key: 'a' }, { key: 'a' }, { key: 'b' }] })
+    const plain = sourceHandles('branch', { cases: [{ key: 'yes' }] })
+    return {
+      merged: merged.map((h) => `${h.id}:${h.label}`),
+      dup: dup.map((h) => h.id),
+      plain: plain.map((h) => h.id),
+      colors: merged.map((h) => h.color ?? ''),
+    }
+  })
+  check('key=default 的 case 和「其他」合并成一个出口', r.merged.length === 2
+    && r.merged[1] === 'default:协作（兜底）', r.merged.join('、'))
+  check('重复的 key 只出一个出口', r.dup.join(',') === 'a,b,default', r.dup.join(','))
+  check('普通分支照常追加「其他」出口', r.plain.join(',') === 'yes,default', r.plain.join(','))
+  check('出口颜色是中性的（ok 色只留给状态）', r.colors.every((c) => !c.includes('--ok')), r.colors.join('、'))
+})
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过')
 await browser.close()

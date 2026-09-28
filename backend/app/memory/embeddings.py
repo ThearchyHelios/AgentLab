@@ -4,7 +4,7 @@ import hashlib
 import math
 import os
 import re
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import numpy as np
 
@@ -125,7 +125,7 @@ def _make(kind: str, model: str, base_url: str = "", *,
             where = base_url or "api.openai.com"
             raise EmbedderUnavailable(
                 f"用不了 {where} 上的 embedding 模型 "
-                f"{model or 'text-embedding-3-small'}：{type(e).__name__}: {e}。"
+                f"{model or 'text-embedding-3-small'}：{_why(e)}。"
                 f"检查服务在不在、模型名对不对；走官方接口还要看 OPENAI_API_KEY。"
             ) from e
         return _local
@@ -179,6 +179,12 @@ def has_semantics() -> bool:
     信号打个折再加回自己身上，同义改写一条都召不回。
     """
     return getattr(get_embedder(), "name", "") != "local-hashing"
+
+
+def _why(e: BaseException) -> str:
+    from app.core.errors import explain
+
+    return explain(e)[0]
 
 
 def default_alpha() -> float:
@@ -287,7 +293,18 @@ class BM25:
         return scores
 
 
-def hybrid_rank(
+class Ranked(NamedTuple):
+    """一条混合排序的结果。contrib 两项之和就是 score。"""
+
+    index: int
+    score: float
+    #: 两路的原始分：余弦、BM25
+    signals: dict[str, float]
+    #: 两路各自对总分的贡献：归一化之后乘上 α / 1-α
+    contrib: dict[str, float]
+
+
+def hybrid_contrib(
     query: str,
     texts: Sequence[str],
     vectors: Sequence[np.ndarray | None],
@@ -295,8 +312,8 @@ def hybrid_rank(
     *,
     alpha: float = 0.5,
     keyword_scores: Sequence[float] | None = None,
-) -> list[tuple[int, float, dict[str, float]]]:
-    """向量相似度和 BM25 各归一化后加权合并。
+) -> list[Ranked]:
+    """向量相似度和 BM25 各归一化后加权合并，并交出每一路的贡献。
 
     纯向量会漏掉精确的专有名词，纯 BM25 又抓不住同义表达，
     混合排序在本地小知识库上稳定优于任何一个单独使用。
@@ -305,6 +322,9 @@ def hybrid_rank(
     统计（N、avg_len、df）算好了分，而这里只拿到候选子集——在子集上重算，
     df 和平均长度全是另一套数，排出来的名次和全表扫不一样。真踩过，
     test_the_index_ranks_the_same_as_a_full_scan 就是为此写的。
+
+    贡献要在这里算：归一化是在整个候选集上做的，调用方只拿得到前几条，
+    复现不了。
     """
     if not texts:
         return []
@@ -322,10 +342,24 @@ def hybrid_rank(
         return [(x - lo) / (hi - lo) for x in xs]
 
     kw_n, vec_n = _norm(kw_scores), _norm(vec_scores)
-    ranked = [
-        (i, alpha * vec_n[i] + (1 - alpha) * kw_n[i],
-         {"vector": vec_scores[i], "keyword": kw_scores[i]})
-        for i in range(len(texts))
-    ]
-    ranked.sort(key=lambda t: t[1], reverse=True)
+    ranked: list[Ranked] = []
+    for i in range(len(texts)):
+        by_vec, by_kw = alpha * vec_n[i], (1 - alpha) * kw_n[i]
+        ranked.append(Ranked(i, by_vec + by_kw, {"vector": vec_scores[i], "keyword": kw_scores[i]},
+                             {"vector": by_vec, "keyword": by_kw}))
+    ranked.sort(key=lambda r: r.score, reverse=True)
     return ranked
+
+
+def hybrid_rank(
+    query: str,
+    texts: Sequence[str],
+    vectors: Sequence[np.ndarray | None],
+    query_vec: np.ndarray,
+    *,
+    alpha: float = 0.5,
+    keyword_scores: Sequence[float] | None = None,
+) -> list[tuple[int, float, dict[str, float]]]:
+    """同 hybrid_contrib，只要 (下标, 总分, 原始分)。"""
+    return [(r.index, r.score, r.signals) for r in hybrid_contrib(
+        query, texts, vectors, query_vec, alpha=alpha, keyword_scores=keyword_scores)]

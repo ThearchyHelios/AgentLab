@@ -8,12 +8,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import health
+from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
 from app.db.models import Provider, Setting
 from app.providers import catalog
-from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model
+from app.providers.factory import ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -56,9 +58,49 @@ class ProviderOut(BaseModel):
     # 只回掩码，明文 key 永远不出后端
     api_key_masked: str = ""
     has_key: bool = False
+    #: 最近一次测连接（见 app/api/health.py）。没测过、或者连接配置改过之后都是 None
+    last_checked_at: str | None = None
+    last_check_ok: bool | None = None
+    last_latency_ms: int | None = None
+    last_error: str | None = None
+
+
+#: extra 里这一项是后端记的最近一次测连接结果，不是用户填的配置：不回显、
+#: 不接受客户端写入，保存 extra 时原样留着
+LAST_CHECK = "last_check"
+
+
+def _user_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (extra or {}).items() if k != LAST_CHECK}
+
+
+def _with_saved_headers(extra: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, Any]:
+    """请求头的值回显的是 ***：原样带回来的，换回存着的真值。
+
+    设置页保存时会把读到的 extra 整块带回来。以前照单全收，于是改个名字、
+    勾一下启用，自定义请求头就全变成了字面上的 ***，接口从此 401。
+    """
+    headers = extra.get("headers")
+    if not isinstance(headers, dict):
+        return extra
+    old = (saved or {}).get("headers") or {}
+    return {**extra, "headers": {k: (old.get(k, v) if v == "***" else v) for k, v in headers.items()}}
+
+
+def _connection(provider: Provider, model: str | None = None) -> str:
+    """连接配置的指纹：类型、地址、实际用的钥匙、请求头这些、测的哪个模型。"""
+    return health.fingerprint(
+        "provider", provider.kind, (provider.base_url or "").strip(), _resolve_key(provider) or "",
+        _user_extra(provider.extra), model or provider.default_model or "",
+    )
+
+
+def _set_last_check(row: Provider, last: dict[str, Any] | None) -> None:
+    row.extra = {**_user_extra(row.extra), **({LAST_CHECK: last} if last else {})}
 
 
 def _to_out(row: Provider) -> ProviderOut:
+    extra = _user_extra(row.extra)
     return ProviderOut(
         id=row.id,
         name=row.name,
@@ -67,13 +109,14 @@ def _to_out(row: Provider) -> ProviderOut:
         default_model=row.default_model,
         models=row.models or [],
         enabled=row.enabled,
-        extra={k: v for k, v in (row.extra or {}).items() if k != "headers"} | (
-            {"headers": {k: "***" for k in (row.extra or {}).get("headers", {})}}
-            if (row.extra or {}).get("headers")
+        extra={k: v for k, v in extra.items() if k != "headers"} | (
+            {"headers": {k: "***" for k in extra.get("headers", {})}}
+            if extra.get("headers")
             else {}
         ),
         api_key_masked=mask(row.api_key),
         has_key=bool(row.api_key),
+        **health.fields((row.extra or {}).get(LAST_CHECK)),
     )
 
 
@@ -102,11 +145,14 @@ async def provider_catalog() -> dict[str, Any]:
 async def create_provider(
     payload: ProviderIn, session: AsyncSession = Depends(get_session)
 ) -> ProviderOut:
+    problem = _config_problem(payload.kind, payload.base_url)
+    if problem:
+        raise HTTPException(400, problem)
     exists = (
         await session.execute(select(Provider).where(Provider.name == payload.name))
     ).scalar_one_or_none()
     if exists:
-        raise HTTPException(409, f"已经有叫 {payload.name!r} 的 provider 了")
+        raise HTTPException(409, f"已经有叫「{payload.name}」的模型接入了，换个名字")
 
     row = Provider(
         name=payload.name,
@@ -116,8 +162,10 @@ async def create_provider(
         models=payload.models,
         default_model=payload.default_model,
         enabled=payload.enabled,
-        extra=payload.extra,
+        extra=_user_extra(payload.extra),
     )
+    # 表单里刚测过这份配置：保存下来就带着那次结果
+    _set_last_check(row, health.draft_result(_connection(row)))
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -130,14 +178,24 @@ async def update_provider(
 ) -> ProviderOut:
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "provider 不存在")
+        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
 
     data = payload.model_dump(exclude_unset=True)
+    before, last = _connection(row), (row.extra or {}).get(LAST_CHECK)
     if "api_key" in data:
         row.api_key = encrypt(data.pop("api_key")) if data["api_key"] else None
         data.pop("api_key", None)
+    if data.get("extra") is not None:
+        data["extra"] = _with_saved_headers(_user_extra(data["extra"]), row.extra)
+    else:
+        data.pop("extra", None)
     for key, value in data.items():
         setattr(row, key, value)
+    after = _connection(row)
+    if after != before:
+        # 测过的已经不是这份配置了：旧结果作废，表单里测过这一份的话换成那一次
+        last = health.draft_result(after)
+    _set_last_check(row, last)
     await session.commit()
     await session.refresh(row)
     return _to_out(row)
@@ -149,7 +207,7 @@ async def delete_provider(
 ) -> None:
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "provider 不存在")
+        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
     await session.delete(row)
     await session.commit()
 
@@ -159,6 +217,59 @@ class TestIn(BaseModel):
     prompt: str = "用一句话介绍你自己"
 
 
+def _config_problem(kind: str, base_url: str | None) -> str | None:
+    """保存或测试前就能看出来的配置错误。"""
+    if kind not in {k["kind"] for k in catalog.PROVIDER_KINDS}:
+        return f"不认识「{kind}」这种接入类型"
+    if kind == "openai_compatible" and not (base_url or "").strip():
+        return "「OpenAI 兼容」必须填 Base URL，例如 https://api.deepseek.com/v1"
+    return None
+
+
+#: 测试连接最多等多久。真正跑节点用的是 model_timeout_seconds（默认 5 分钟），
+#: 弹窗里转 5 分钟等于没有反馈
+_TEST_TIMEOUT = 30
+
+
+async def _try_model(provider: Provider, model: str | None, prompt: str) -> dict[str, Any]:
+    """真发一次请求。失败也是正常结果，照实返回原因，不抛。"""
+    import asyncio
+    import time
+
+    from app.engine.state import message_text
+
+    model = model or provider.default_model
+    if not model:
+        return {"ok": False, "error": "还没有可测的模型",
+                "hint": "先在「可选模型」里加一个，或者填上默认模型", "detail": ""}
+    try:
+        chat = build_chat_model(provider, ModelSpec(model=model, max_tokens=256,
+                                                    timeout=_TEST_TIMEOUT))
+    except ProviderNotConfigured as e:
+        if "API Key" in str(e):
+            return {"ok": False, "error": "还没有填 API Key",
+                    "hint": "填上 Key 再测；也可以在后端的环境变量里配", "detail": str(e)}
+        return {"ok": False, "error": not_configured(e), "hint": "", "detail": str(e)}
+
+    started = time.perf_counter()
+    try:
+        async with asyncio.timeout(_TEST_TIMEOUT):
+            reply = await chat.ainvoke(prompt)
+    except Exception as e:  # noqa: BLE001
+        reason, hint = explain(e)
+        return {"ok": False, "error": f"测试没通过：{reason}", "hint": hint, "detail": raw(e),
+                "model": model}
+
+    usage = getattr(reply, "usage_metadata", None) or {}
+    return {
+        "ok": True,
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "model": model,
+        "reply": message_text(reply)[:500],
+        "usage": usage,
+    }
+
+
 @router.post("/providers/{provider_id}/test")
 async def test_provider(
     provider_id: str, payload: TestIn, session: AsyncSession = Depends(get_session)
@@ -166,33 +277,136 @@ async def test_provider(
     """真发一次请求验证配置。设置页的"测试连接"按钮调它。"""
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "provider 不存在")
+        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
+    result = await _try_model(row, payload.model, payload.prompt)
+    # 只记默认模型的结果：拿别的模型测出 invalid_model，不等于这个接入连不上
+    if (payload.model or row.default_model) == row.default_model:
+        _set_last_check(row, _test_record(result))
+        await session.commit()
+    return result
 
-    import time
 
-    from app.engine.state import message_text
+def _test_record(result: dict[str, Any]) -> dict[str, Any]:
+    return health.record(result.get("ok"), result.get("latency_ms"), result.get("error"))
+
+
+class ProviderDraftIn(BaseModel):
+    """一份还没保存（或改了还没保存）的接入配置。带 id 表示在编辑已有的那个。"""
+
+    id: str | None = None
+    name: str = "草稿"
+    kind: str = "anthropic"
+    base_url: str | None = None
+    api_key: str | None = None  # 编辑时留空=沿用已保存的
+    models: list[dict[str, Any]] = Field(default_factory=list)
+    default_model: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+    #: 这次测哪个模型，不填用 default_model
+    model: str | None = None
+    prompt: str = "用一句话介绍你自己"
+
+
+def _draft_provider(payload: ProviderDraftIn, saved: Provider | None) -> Provider:
+    """拼一个不进会话的临时接入点，只拿来试一下。
+
+    编辑时 Key 框留空表示不改、请求头回显的是 ***——测试都得换回存着的真值，
+    否则改个 Base URL 想测一下，只会得到一句"密钥不对"。
+    """
+    extra = _user_extra(payload.extra)
+    if saved:
+        extra = _with_saved_headers(extra, saved.extra)
+    return Provider(
+        name=payload.name or (saved.name if saved else "草稿"),
+        kind=payload.kind,
+        base_url=(payload.base_url or "").strip() or None,
+        api_key=encrypt(payload.api_key) if payload.api_key else (saved.api_key if saved else None),
+        models=payload.models,
+        default_model=payload.default_model,
+        enabled=True,
+        extra=extra,
+    )
+
+
+async def _draft(payload: ProviderDraftIn, session: AsyncSession) -> Provider:
+    saved = await session.get(Provider, payload.id) if payload.id else None
+    return _draft_provider(payload, saved)
+
+
+@router.post("/providers/test")
+@router.post("/settings/providers/test", include_in_schema=False)
+async def test_provider_draft(
+    payload: ProviderDraftIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """测一份没保存的配置，不落库。
+
+    以前只能测已保存的：Base URL 填错要保存→关弹窗→点测试→看提示→再打开改。
+    接内网网关这种填错一个字就连不上的东西，来回四五趟。
+    """
+    problem = _config_problem(payload.kind, payload.base_url)
+    if problem:
+        return {"ok": False, "error": problem, "hint": "", "detail": ""}
+    saved = await session.get(Provider, payload.id) if payload.id else None
+    draft = _draft_provider(payload, saved)
+    result = await _try_model(draft, payload.model, payload.prompt)
+    last, key = _test_record(result), _connection(draft, payload.model)
+    health.remember_draft(key, last)
+    if saved is not None and key == _connection(saved):
+        # 编辑框里没改连接、只是再测一次：测的就是已保存的那份
+        _set_last_check(saved, last)
+        await session.commit()
+    return result
+
+
+@router.post("/providers/models")
+async def probe_provider_models(
+    payload: ProviderDraftIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """问这个接入点有哪些模型，省得手敲模型 id。
+
+    知识库那边的探测不带鉴权，接需要 Key 的网关时必然 401，所以这里单独做一份：
+    Key、自定义请求头都按真正调用时的方式带上。
+    """
+    import httpx
+
+    problem = _config_problem(payload.kind, payload.base_url)
+    if problem:
+        return {"ok": False, "error": problem, "hint": "", "detail": "", "models": []}
+    provider = await _draft(payload, session)
+    if provider.kind == "mock":
+        return {"ok": True, "models": [m["id"] for m in catalog.MOCK_MODELS], "url": ""}
+
+    extra = dict(provider.extra or {})
+    # 和真正调用时取同一把钥匙：只有官方 OpenAI / Anthropic 才退回环境变量。
+    # 兼容网关是别人家的服务，Key 框空着就不带——否则点一下「拉取模型」，
+    # 环境里那把 OpenAI 的钥匙就发给了表单上随便填的一个地址
+    key = _resolve_key(provider) or ""
+    headers: dict[str, str] = {}
+    if provider.kind == "anthropic":
+        base = provider.base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        url = base.rstrip("/") + "/v1/models"
+        headers["anthropic-version"] = "2023-06-01"
+        if key:
+            if extra.get("auth_style") == "bearer":
+                headers["Authorization"] = f"Bearer {key}"
+            else:
+                headers["x-api-key"] = key
+    else:
+        url = (provider.base_url or "https://api.openai.com/v1").rstrip("/") + "/models"
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    headers.update({k: str(v) for k, v in (extra.get("headers") or {}).items()})
 
     try:
-        model = build_chat_model(
-            row, ModelSpec(model=payload.model or row.default_model, max_tokens=256)
-        )
-    except ProviderNotConfigured as e:
-        return {"ok": False, "error": str(e)}
-
-    started = time.perf_counter()
-    try:
-        reply = await model.ainvoke(payload.prompt)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    usage = getattr(reply, "usage_metadata", None) or {}
-    return {
-        "ok": True,
-        "latency_ms": int((time.perf_counter() - started) * 1000),
-        "model": payload.model or row.default_model,
-        "reply": message_text(reply)[:500],
-        "usage": usage,
-    }
+        reason, hint = explain(e)
+        return {"ok": False, "error": f"没拿到模型列表：{reason}", "hint": hint,
+                "detail": raw(e), "models": [], "url": url}
+    models = [m.get("id", "") for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")]
+    return {"ok": True, "models": models, "url": url}
 
 
 # --------------------------------------------------------------------------
@@ -213,6 +427,44 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "max_run_seconds": app_settings.max_run_seconds,
     },
 }
+
+
+async def run_defaults(session: AsyncSession) -> dict[str, Any]:
+    """设置里 run 这一组，没存过的键补内置默认。
+
+    发起运行和引擎都从这里读。各拼各的默认值，两边迟早会对「没存过」理解得
+    不一样——以前这三项就是只存不读，设置页上改了等于没改。
+    """
+    row = await session.get(Setting, "run")
+    return {**DEFAULT_SETTINGS["run"], **((row.value if row else None) or {})}
+
+
+def tool_approval_default(run: dict[str, Any]) -> str:
+    """「危险工具默认需要人工确认」换算成节点 approval 的取值，节点自己配了的不看它。
+
+    只有明确存了 False 才关：值缺了、存坏了都按开着算。关掉审批得是一次明确的
+    选择，不能是某个字段没写上的副作用。
+    """
+    return "never" if run.get("confirm_dangerous_tools") is False else "dangerous"
+
+
+async def resolve_run_scope(
+    session: AsyncSession, memory_scope: str | None, collection: str | None
+) -> tuple[str, str]:
+    """请求没带的记忆域和知识库，取设置里的运行默认值。
+
+    空串等于没填：设置页把输入框清空再保存，存下来的就是空串，拿它当记忆域
+    写进去的东西谁也读不回来。
+    """
+    defaults = await run_defaults(session)
+
+    def pick(explicit: str | None, key: str) -> str:
+        for value in (explicit, defaults.get(key)):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "default"
+
+    return pick(memory_scope, "default_memory_scope"), pick(collection, "default_collection")
 
 
 @router.get("/settings")

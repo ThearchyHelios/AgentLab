@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- 与 src/components/Logo.tsx 同一个图形：三个节点、两段正交折线边。
+       标签栏有深有浅，所以带一块底板，并跟着系统配色换一套 -->
+  <style>
+    .tile { fill: #eef3fe; stroke: #c3d3f3; }
+    .mark { stroke: #2563eb; }
+    .hub { fill: #2563eb; }
+    @media (prefers-color-scheme: dark) {
+      .tile { fill: #141926; stroke: #333c52; }
+      .mark { stroke: #4f8cff; }
+      .hub { fill: #4f8cff; }
+    }
+  </style>
+  <rect class="tile" x="0.5" y="0.5" width="31" height="31" rx="7" />
+  <g class="mark" transform="translate(4 4)" fill="none" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8.5 12H12V6h3.5M12 12v6h3.5" />
+    <rect class="hub" x="2.5" y="9" width="6" height="6" rx="1.5" />
+    <rect x="15.5" y="3" width="6" height="6" rx="1.5" />
+    <rect x="15.5" y="15" width="6" height="6" rx="1.5" />
+  </g>
+</svg>

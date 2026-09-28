@@ -51,6 +51,10 @@ class EventType(StrEnum):
     # 多 agent 协作中的单个 agent 步骤
     AGENT_STEP_START = "agent.step.start"
     AGENT_STEP_END = "agent.step.end"
+    # 调度者的一次决策。它是一次结构化模型调用，常常占掉团队节点大半的时间；
+    # 以前前后都没有事件，界面上那几十秒是黑盒
+    AGENT_ROUTE_START = "agent.route.start"
+    AGENT_ROUTE_END = "agent.route.end"
 
     # 人工介入
     HUMAN_REQUESTED = "human.requested"

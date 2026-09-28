@@ -29,7 +29,7 @@ async def tool_usage(
     """
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
-        raise HTTPException(404, "工作流不存在")
+        raise HTTPException(404, "这个工作流不存在，可能已经被删了")
     spec = GraphSpec.model_validate(workflow.graph)
 
     # 各节点声明的白名单
@@ -83,7 +83,7 @@ async def tool_usage(
         "workflow_id": workflow_id,
         "runs_considered": len(run_ids),
         "nodes": report,
-        "hint": "unused 里躺了很多轮的工具是白名单衰减的信号，考虑摘除",
+        "hint": "授权了却很多轮都没用过的工具，是白名单在慢慢放宽的信号，考虑从节点里摘掉",
     }
 
 
@@ -147,5 +147,5 @@ async def exploratory_clusters(
     return {
         "clusters": out,
         "considered": len(items),
-        "hint": "promote_candidate=true 的问题反复出现，考虑用「从运行提取模板」晋升为固定节",
+        "hint": "标为晋升候选的问题反复出现，考虑用「提取模板」把它固定成工作流里的一步",
     }

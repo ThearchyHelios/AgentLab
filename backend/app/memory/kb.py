@@ -10,7 +10,7 @@ from app.db.models import Chunk, Document
 from app.memory import inverted
 from app.memory.embeddings import (
     default_alpha, embed_text, embed_texts, embedder_dim, embedder_id, from_blob,
-    hybrid_rank, to_blob, usable,
+    hybrid_contrib, to_blob, usable,
 )
 
 _TARGET = 800
@@ -301,7 +301,7 @@ async def search(
         query_vec = await embed_text(query)
         vectors = [from_blob(r.embedding, embedder_dim()) for r in rows]
 
-    ranked = hybrid_rank(
+    ranked = hybrid_contrib(
         query,
         [r.content for r in rows],
         vectors,
@@ -310,8 +310,11 @@ async def search(
         keyword_scores=kw_scores,
     )
     out: list[dict[str, Any]] = []
-    for idx, score, parts in ranked[:limit]:
-        row = rows[idx]
+    for hit in ranked[:limit]:
+        row = rows[hit.index]
+        score = round(hit.score, 4)
+        # 关键词那份用减法得出：各自四舍五入之后再相加，会和总分差出一个末位
+        by_vec = min(round(hit.contrib["vector"], 4), score)
         out.append(
             {
                 "chunk_id": row.id,
@@ -319,18 +322,23 @@ async def search(
                 "title": (row.meta or {}).get("title", ""),
                 "ordinal": row.ordinal,
                 "content": row.content,
-                "score": round(score, 4),
-                "signals": {k: round(v, 4) for k, v in parts.items()},
+                "score": score,
+                "signals": {k: round(v, 4) for k, v in hit.signals.items()},
+                # 两路各贡献了多少分，两者之和等于 score。调试台据此画贡献条
+                "contrib": {"vector": by_vec, "keyword": round(score - by_vec, 4)},
             }
         )
     return out
 
 
-async def reindex(session: AsyncSession, collection: str | None = None) -> dict[str, Any]:
+async def reindex(
+    session: AsyncSession, collection: str | None = None, *, on_progress: Any = None,
+) -> dict[str, Any]:
     """用当前 embedder 重算向量。
 
     换了 embedding 模型之后唯一的恢复手段。按批做：一次几千条 chunk 全塞给
     远端 embedding 接口，要么超时要么被限流，而中途失败又没有断点。
+    on_progress(已完成, 总数) 每批提交之后回调一次。
     """
     stmt = select(Chunk)
     if collection:
@@ -349,6 +357,8 @@ async def reindex(session: AsyncSession, collection: str | None = None) -> dict[
             row.embed_model = model_id
             row.embed_dim = dim
         await session.commit()
+        if on_progress:
+            on_progress(min(i + batch, len(rows)), len(rows))
     # 倒排一起重建：两者都是"存量数据升级"的恢复手段，分成两个按钮只会漏点一个
     await inverted.rebuild(session, collection)
     return {"collection": collection, "reindexed": len(rows), "embedder": model_id}

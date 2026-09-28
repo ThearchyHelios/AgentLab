@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.events import EventType
 from app.engine.issuance import extract_numbers, trace_numbers
+from app.engine.toolcalls import leaked_markup
 
 # --------------------------------------------------------------------------
 # 跑完之后的复核层。
@@ -70,6 +71,15 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "validate_retry": ("validate_retry", DEGRADED),
     "sandbox_reset": ("sandbox_reset", DEGRADED),
     "retrieve_degraded": ("retrieve_degraded", DEGRADED),
+    # 模型把工具调用写成了文字。纠正一次好了的，答案是真查过的，只记缺口；
+    # 没好的那次节点已经判失败，node_failed 会按 BROKEN 算
+    "tool_markup_leak": ("tool_markup_leak", DEGRADED),
+    # 协作团队用完轮数、按降档交付：交来的是成员原话，不是调度者认可的结论
+    "team_exhausted": ("team_exhausted", BROKEN),
+    # 调度者收了工，但最后派出去的成员失败了，成果取自更早的那份：有缺口，不是断裂
+    "team_last_failed": ("team_last_failed", DEGRADED),
+    # 校验节点的修复编出了原文没有的值，这次修复被作废
+    "repair_invented": ("repair_invented", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
@@ -178,6 +188,9 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
         add("empty_output", "这次运行没有产出任何成果内容", BROKEN)
     elif any(mark in text for mark in _PLACEHOLDER_MARKS):
         add("placeholder_output", "交出来的是一句内部流程说明，不是对问题的回答", BROKEN)
+    elif leaked_markup(text):
+        # 老运行、或者绕过了节点检查的路径：成果本身就是一段没执行的工具调用标记
+        add("markup_output", "交出来的是一段没有执行的工具调用标记，不是对问题的回答", BROKEN)
 
     return signals
 

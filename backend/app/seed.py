@@ -74,7 +74,7 @@ TEMPLATES: list[dict[str, Any]] = [
     {
         "name": "③ 带人工审批的发布流",
         "description": "起草 → 人工把关 → 通过就发布、驳回就改写。演示中断与断点恢复。",
-        "tags": ["人工介入", "分支"],
+        "tags": ["人工审批", "分支"],
         "nodes": [
             _n("start", "input", "主题", fields=[{"name": "topic", "required": True}]),
             _n("draft", "llm", "起草", system="你是品牌文案。",

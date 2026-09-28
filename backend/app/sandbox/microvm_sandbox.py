@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from app.core.config import sanitize_session, settings
+from app.core.errors import describe_exception, raw
 from app.sandbox.base import (
     ENTRY_PREFIX,
     ExecResult,
@@ -15,6 +17,8 @@ from app.sandbox.base import (
     entry_name,
     truncate,
 )
+
+logger = logging.getLogger(__name__)
 
 _WORKDIR = "/workspace"
 
@@ -279,10 +283,11 @@ class MicroVMSandbox(Sandbox):
                       + ("" if self.image_ready() else "（镜像未缓存，首次需拉取约 55s）"),
             )
         except Exception as e:  # noqa: BLE001
+            logger.warning("microVM 启动失败：%s", raw(e))
             return ExecResult(
                 ok=False, backend=self.name,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"microVM 启动失败：{type(e).__name__}: {e}",
+                error=f"microVM 启动失败：{describe_exception(e)}",
             )
 
         try:
@@ -327,10 +332,11 @@ class MicroVMSandbox(Sandbox):
                       + ("" if killed else "；VM 已重置，该会话之前写的文件已丢失"),
             )
         except Exception as e:  # noqa: BLE001
+            logger.warning("microVM 执行中断：%s", raw(e))
             return ExecResult(
                 ok=False, backend=self.name,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"{type(e).__name__}: {e}",
+                error=f"microVM 里的执行中断了：{describe_exception(e)}",
             )
         finally:
             if ephemeral:

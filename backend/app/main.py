@@ -12,6 +12,7 @@ from app.api import (
     artifacts, conversations, copilot, datasources, governance, knowledge, runs,
     sandbox, settings as settings_api, tools, workflows,
 )
+from app.api.coded import CodedHTTPException, coded_handler
 from app.core.config import settings
 from app.db.base import init_db
 from app.engine.runner import run_manager
@@ -105,6 +106,9 @@ for router in (
     datasources.router,
 ):
     app.include_router(router)
+
+
+app.add_exception_handler(CodedHTTPException, coded_handler)
 
 
 @app.exception_handler(ValueError)

@@ -1,14 +1,20 @@
 // 冒烟测试：真开一个浏览器，跑一遍「打开画布 → 选模板 → 运行 → 看高亮」。
 // 依赖 frontend 里的 playwright-core，并复用系统已装的 Chrome，不额外下载浏览器。
+//
+// 和 check-* 不同，这一个是真的发起运行（模型换成 Mock，不花钱），会在库里留下一条
+// 运行记录；只打印、截图，不断言。所以它不在 check-all 里，要人看着跑。
+// 默认连 5273；对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/e2e-check.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const browser = await chromium.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--no-sandbox'] })
+  executablePath: process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  args: ['--no-sandbox'] })
 const page = await browser.newPage({ viewport: { width: 1680, height: 1000 } })
 const errs = []
 page.on('pageerror', e => errs.push(e.message))
 page.on('console', m => m.type() === 'error' && errs.push(m.text()))
 
-await page.goto('http://localhost:5273/studio', { waitUntil: 'networkidle' })
+await page.goto(`${WEB}/studio`, { waitUntil: 'networkidle' })
 await page.waitForSelector('.react-flow__node', { timeout: 15000 })
 
 // 切到「最小问答」模板，用 mock 模型跑，验证画布实时高亮

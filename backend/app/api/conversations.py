@@ -13,15 +13,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session, utcnow
-from app.db.models import Conversation, ConversationTurn
+from app.db.models import Approval, Conversation, ConversationTurn, Run
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -71,6 +72,8 @@ class TurnPatch(BaseModel):
     status: str | None = Field(default=None, pattern="^(running|done|error)$")
     error: str | None = None
     review: dict[str, Any] | None = None
+    #: 可信度元数据，前端整块写、整块读，后端不解读它的内容（列表状态除外，见 last_status）
+    meta: dict[str, Any] | None = None
 
 
 class TurnOut(BaseModel):
@@ -85,7 +88,11 @@ class TurnOut(BaseModel):
     error: str
     #: 复核结论。None = 这一轮没复核过，和「复核过、没发现问题」不是一回事
     review: dict[str, Any] | None = None
+    #: 可信度元数据。老轮次挂在 review.meta 下，读出来时统一放到这里
+    meta: dict[str, Any] | None = None
     created_at: Any = None
+    #: 最后一次落库。列表判「建图断了」按它算（BUILD_STALE），前端用同一只钟
+    updated_at: Any = None
 
     model_config = {"from_attributes": True}
 
@@ -101,6 +108,11 @@ class ConversationOut(BaseModel):
     turn_count: int = 0
     #: 列表里给个副标题，让人一眼认出是哪次聊天
     last_question: str = ""
+    #: 最后一轮停在哪：running | waiting | error | cancelled | suspended | done，
+    #: 没有轮次时为 None。见 last_status()
+    last_status: str | None = None
+    #: 最后一轮的运行。建图阶段就断了的没有
+    last_run_id: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -114,12 +126,124 @@ class ConversationDetail(ConversationOut):
     model_config = {"from_attributes": False}
 
 
+def turn_meta(turn: Any) -> dict[str, Any] | None:
+    """这一轮的元数据：meta 列优先，老数据退回 review.meta。"""
+    if isinstance(turn.meta, dict):
+        return turn.meta
+    bridged = turn.review.get("meta") if isinstance(turn.review, dict) else None
+    return bridged if isinstance(bridged, dict) else None
+
+
+def turn_run_id(turn: Any) -> str | None:
+    """这一轮现在的运行。meta 里写了 runId 就以它为准，哪怕是 null：重试会换一次运行，
+    run_id 列却清不掉（回填里 None 表示「不改」），还指着上一次的。老轮次没有这个键，看列。"""
+    meta = turn_meta(turn) or {}
+    if "runId" in meta:
+        return meta["runId"] or None
+    return turn.run_id or None
+
+
+def _turn_out(turn: ConversationTurn) -> TurnOut:
+    out = TurnOut.model_validate(turn)
+    out.meta = turn_meta(turn)
+    return out
+
+
 def _detail(row: Conversation, turns: list[ConversationTurn]) -> ConversationDetail:
     base = ConversationOut.model_validate(row)
     return ConversationDetail(
         **base.model_dump(),
-        turns=[TurnOut.model_validate(t) for t in turns],
+        turns=[_turn_out(t) for t in turns],
     )
+
+
+#: 还没有运行的轮次停在 running 超过这么久，就当建图断了。建图跟着浏览器那条流走，
+#: 页面一关就停，轮次却一直是 running；最长的正常情况是模型超时再加两轮自查修正
+BUILD_STALE = timedelta(minutes=15)
+
+
+def last_status(
+    turn: Any, run_status: str | None, pending: bool, now: datetime | None = None,
+) -> str:
+    """一轮停在哪。轮次状态只有 running / done / error 三种，细分要看运行和元数据。
+
+    轮次状态是前端写的：页面关掉、服务重启时它停在 running，这时要以运行的状态为准；
+    运行也没有的，是断在了建图阶段。已经收尾的轮次以轮次自己为准——它写下的就是
+    用户看到的结局（取消、服务重启挂起在 error 里分开记）。
+    """
+    outcome = (turn_meta(turn) or {}).get("outcome")
+    if turn.status == "done":
+        return "done"
+    if turn.status == "error":
+        if outcome == "cancelled" or (turn.error or "").strip() == "已取消":
+            return "cancelled"
+        if outcome == "suspended":
+            # 挂起之后可能已经在别处接着跑了
+            live = _from_run(run_status, pending)
+            return live if live in ("running", "waiting") else "suspended"
+        return "error"
+    live = _from_run(run_status, pending)
+    if live:
+        return live
+    updated = turn.updated_at
+    if updated is not None and updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    stale = updated is not None and (now or utcnow()) - updated > BUILD_STALE
+    return "error" if stale else "running"
+
+
+def _from_run(run_status: str | None, pending: bool) -> str | None:
+    return {
+        "queued": "running", "running": "running",
+        "interrupted": "waiting" if pending else "suspended",
+        "succeeded": "done", "failed": "error", "cancelled": "cancelled",
+    }.get(run_status or "")
+
+
+async def _last_turns(
+    session: AsyncSession, ids: list[str]
+) -> dict[str, ConversationTurn]:
+    """每个会话 seq 最大的那一轮。一次查完，列表长了也只是一次往返。"""
+    latest = (
+        select(ConversationTurn.conversation_id, func.max(ConversationTurn.seq).label("seq"))
+        .where(ConversationTurn.conversation_id.in_(ids))
+        .group_by(ConversationTurn.conversation_id)
+        .subquery()
+    )
+    rows = (await session.execute(
+        select(ConversationTurn).join(latest, and_(
+            ConversationTurn.conversation_id == latest.c.conversation_id,
+            ConversationTurn.seq == latest.c.seq,
+        ))
+    )).scalars()
+    return {t.conversation_id: t for t in rows}
+
+
+async def _statuses(
+    session: AsyncSession, turns: dict[str, ConversationTurn]
+) -> dict[str, tuple[str, str | None]]:
+    """会话 id → (last_status, last_run_id)。运行状态和待审批各一次查询。"""
+    run_of = {cid: turn_run_id(t) for cid, t in turns.items()}
+    run_ids = {r for r in run_of.values() if r}
+    runs: dict[str, str] = {}
+    waiting: set[str] = set()
+    if run_ids:
+        runs = dict((await session.execute(
+            select(Run.id, Run.status).where(Run.id.in_(run_ids))
+        )).all())
+        stopped = [r for r, st in runs.items() if st == "interrupted"]
+        if stopped:
+            waiting = set((await session.execute(
+                select(Approval.run_id).where(
+                    Approval.run_id.in_(stopped), Approval.status == "pending")
+            )).scalars())
+    now = utcnow()
+    out: dict[str, tuple[str, str | None]] = {}
+    for cid, turn in turns.items():
+        run_id = run_of[cid] if run_of[cid] in runs else None
+        out[cid] = (last_status(turn, runs.get(run_id or ""), run_id in waiting, now),
+                    run_id)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +254,7 @@ def _detail(row: Conversation, turns: list[ConversationTurn]) -> ConversationDet
 async def _get(session: AsyncSession, conversation_id: str) -> Conversation:
     row = await session.get(Conversation, conversation_id)
     if not row:
-        raise HTTPException(404, f"会话 {conversation_id} 不存在")
+        raise HTTPException(404, "这个对话不存在，可能已经被删了")
     return row
 
 
@@ -152,34 +276,24 @@ async def list_conversations(
     if not rows:
         return []
 
-    # 轮数和最后一问一次查完。每条会话各查一次的话，列表长了就是几十次往返
+    # 轮数、最后一轮、它的运行状态一次查完。每条会话各查一次的话，列表长了就是
+    # 几十次往返。状态要带上：没打开过的会话也得标得出「在等审批」「失败了」
     ids = [r.id for r in rows]
     counts = dict((await session.execute(
         select(ConversationTurn.conversation_id, func.count(ConversationTurn.id))
         .where(ConversationTurn.conversation_id.in_(ids))
         .group_by(ConversationTurn.conversation_id)
     )).all())
-    last_seq = dict((await session.execute(
-        select(ConversationTurn.conversation_id, func.max(ConversationTurn.seq))
-        .where(ConversationTurn.conversation_id.in_(ids))
-        .group_by(ConversationTurn.conversation_id)
-    )).all())
-    last_questions: dict[str, str] = {}
-    if last_seq:
-        pairs = list(last_seq.items())
-        rows_q = list((await session.execute(
-            select(ConversationTurn.conversation_id, ConversationTurn.seq, ConversationTurn.question)
-            .where(ConversationTurn.conversation_id.in_([c for c, _ in pairs]))
-        )).all())
-        for conv_id, seq, question in rows_q:
-            if last_seq.get(conv_id) == seq:
-                last_questions[conv_id] = question or ""
+    last = await _last_turns(session, ids)
+    status = await _statuses(session, last)
 
     out: list[ConversationOut] = []
     for row in rows:
         item = ConversationOut.model_validate(row)
         item.turn_count = int(counts.get(row.id, 0))
-        item.last_question = last_questions.get(row.id, "")
+        if row.id in last:
+            item.last_question = last[row.id].question or ""
+            item.last_status, item.last_run_id = status[row.id]
         out.append(item)
     return out
 
@@ -212,6 +326,8 @@ async def get_conversation(
     out = _detail(row, turns)
     out.turn_count = len(turns)
     out.last_question = turns[-1].question if turns else ""
+    if turns:
+        out.last_status, out.last_run_id = (await _statuses(session, {row.id: turns[-1]}))[row.id]
     return out
 
 
@@ -275,7 +391,7 @@ async def create_turn(
 
     await session.commit()
     await session.refresh(turn)
-    return TurnOut.model_validate(turn)
+    return _turn_out(turn)
 
 
 @router.patch("/{conversation_id}/turns/{turn_id}", response_model=TurnOut)
@@ -287,21 +403,25 @@ async def patch_turn(
 ) -> TurnOut:
     turn = await session.get(ConversationTurn, turn_id)
     if not turn or turn.conversation_id != conversation_id:
-        raise HTTPException(404, f"轮次 {turn_id} 不存在")
+        raise HTTPException(404, "这一轮对话不存在，可能已经被删了")
 
     for field in (
-        "question", "answer", "explanation", "graph", "run_id", "status", "error", "review",
+        "question", "answer", "explanation", "graph", "run_id", "status", "error", "review", "meta",
     ):
         value = getattr(payload, field)
         if value is not None:
             setattr(turn, field, value)
 
-    conversation = await session.get(Conversation, conversation_id)
-    if conversation:
-        conversation.last_active_at = utcnow()
+    # 活跃时间只认人在这里开始做事：改问题、按下运行、重试（状态回到 running）。
+    # 打开会话时前端的回源核对也走这里——补全截断的答案、记下运行已删、把断掉的
+    # 建图写回 error、补交付错过的结果——这些不算，否则旧会话一打开就顶到列表最上面
+    if payload.question is not None or payload.run_id is not None or payload.status == "running":
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation:
+            conversation.last_active_at = utcnow()
     await session.commit()
     await session.refresh(turn)
-    return TurnOut.model_validate(turn)
+    return _turn_out(turn)
 
 
 # --------------------------------------------------------------------------

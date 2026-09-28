@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import introspect
-from app.data.engine import run_query
+from app.data.engine import query_timeout, run_query
 from app.data.guard import QueryLimits, SqlRejected, is_write
 from app.db.models import DataSource
 from app.tools.registry import ToolContext
@@ -123,8 +123,12 @@ async def build_datasource_tools(
 
 
 def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
+    # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
+    # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
+    seconds = query_timeout(source)
+
     async def _run(sql: str, limit: int | None = None) -> str:
-        limits = QueryLimits(max_rows=int(limit)) if limit else QueryLimits()
+        limits = QueryLimits(timeout_seconds=seconds, **({"max_rows": int(limit)} if limit else {}))
         try:
             result = await run_query(source, sql, limits=limits)
         except SqlRejected as e:
@@ -132,7 +136,11 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
             # 给一句笼统的"失败了"只会让它瞎猜
             return f"SQL 被拒绝：{e}"
         except Exception as e:  # noqa: BLE001
-            return f"查询失败：{type(e).__name__}: {e}"
+            from app.core.errors import explain, first_line
+
+            # 驱动的原话留着（"no such table: x" 正是模型改写 SQL 要的线索），
+            # 类名和 SQLAlchemy 的包装前缀去掉：这一行也会原样出现在运行面板上
+            return f"查询失败：{first_line(e) or explain(e)[0]}"
 
         payload = result.to_payload()
         payload["source"] = source.name
@@ -155,7 +163,8 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
         coroutine=_run,
         func=None,
         # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它
-        metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or ""))},
+        metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or "")),
+                  "timeout_s": seconds},
     )
 
 

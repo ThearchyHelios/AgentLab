@@ -22,8 +22,11 @@ import csv
 import io
 import re
 import sqlite3
+import zipfile
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.core.errors import describe_exception
 
 #: 扫多少行来推断列类型。全表扫一遍对几十万行的文件太慢，而类型这种东西
 #: 前几千行看不出来的，后面多半也看不出来——真看错了，SQLite 的动态类型
@@ -246,7 +249,10 @@ def _read_excel(raw: bytes, *, header_row: int) -> list[tuple[str, list[list[Any
         # data_only 取公式算出来的值而不是公式本身——用户要的是数
         book = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     except Exception as e:  # noqa: BLE001
-        raise UnsupportedTable(f"这个 Excel 读不开：{type(e).__name__}: {e}") from e
+        # 这句话原样进上传的 400：异常类名留在日志（from e），界面上只说能照着做的
+        reason = "文件不是有效的 .xlsx（可能损坏，或者只是改了扩展名）" if isinstance(e, zipfile.BadZipFile) \
+            else describe_exception(e)
+        raise UnsupportedTable(f"这个 Excel 读不开：{reason}。在 Excel 里另存为 .xlsx 或 .csv 再传") from e
 
     out: list[tuple[str, list[list[Any]]]] = []
     for sheet in book.worksheets:

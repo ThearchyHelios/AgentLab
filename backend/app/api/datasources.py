@@ -8,15 +8,20 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import health
+from app.core.errors import explain, first_line, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import introspect as introspect_mod
-from app.data.engine import SUPPORTED_KINDS, engines, test_connection
+from app.data.engine import (
+    MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, build_url, engine_args, engines,
+    query_timeout_problem,
+)
 from app.db.base import get_session
 from app.db.models import DataSource
 from app.tools.datasource import tool_names
@@ -78,12 +83,27 @@ class DataSourceOut(BaseModel):
     #: 这台服务器上还有哪些库/schema 可选。探不到表时它就是下一步的线索
     available_schemas: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
+    #: 缓存是按哪个 schema 探的："" 是默认 schema，None 是没有缓存（或老缓存没记）。
+    #: 和 options.schema 对不上时，助手看到的结构不是配置里那个 schema 的
+    cached_schema: str | None = None
+    #: 最近一次测连接（见 app/api/health.py）。没测过、或者连接配置改过之后都是 None
+    last_checked_at: str | None = None
+    last_check_ok: bool | None = None
+    last_latency_ms: int | None = None
+    last_error: str | None = None
+
+
+def _cached_schema(cache: dict[str, Any]) -> str | None:
+    if not cache or "schema" not in cache:
+        return None
+    return str(cache.get("schema") or "")
 
 
 def _to_out(row: DataSource) -> DataSourceOut:
     cache = row.schema_cache or {}
     tables = cache.get("tables") or {}
     return DataSourceOut(
+        cached_schema=_cached_schema(cache),
         schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
         available_schemas=list(cache.get("available_schemas") or []),
         id=row.id, name=row.name, kind=row.kind, host=row.host, port=row.port,
@@ -94,13 +114,31 @@ def _to_out(row: DataSource) -> DataSourceOut:
         table_count=len(tables),
         schema_synced_at=row.schema_synced_at.isoformat() if row.schema_synced_at else None,
         tools=tool_names(row),
+        **health.fields(row.last_check),
     )
+
+
+def _connection(source: Any) -> str | None:
+    """连接配置的指纹：驱动实际拿到的连接串和参数。配置拼不出连接串时为 None。
+
+    按连接串比而不是按字段比：Oracle 的服务名填在「数据库」还是 options 里，
+    连的是同一个库；探查用的 schema 不进连接串，改它也不影响连不连得上。
+    """
+    try:
+        url, extra = engine_args(source)
+    except Exception:  # noqa: BLE001 - 拼不出来就谈不上「测的是同一份」
+        return None
+    return health.fingerprint("datasource", url, extra)
+
+
+def _probe_record(result: dict[str, Any]) -> dict[str, Any]:
+    return health.record(result.get("ok"), result.get("elapsed_ms"), result.get("error"))
 
 
 async def _get_or_404(session: AsyncSession, source_id: str) -> DataSource:
     row = await session.get(DataSource, source_id)
     if not row:
-        raise HTTPException(404, "数据源不存在")
+        raise HTTPException(404, "这个数据源不存在，可能已经被删了")
     return row
 
 
@@ -110,27 +148,86 @@ async def list_sources(session: AsyncSession = Depends(get_session)) -> list[Dat
     return [_to_out(r) for r in rows]
 
 
+#: 每种库都有的「查询时限」。数据库按它自己停下语句，不只是后端不再等
+_TIMEOUT_FIELD = {
+    "key": QUERY_TIMEOUT_OPTION, "label": "查询时限（秒）", "placeholder": "30",
+    "help": f"一条查询最多跑多久，到点由数据库自己停下；留空是 30 秒，最多 {MAX_QUERY_TIMEOUT_S} 秒",
+}
+
+
+def _refuse_bad_options(options: dict[str, Any] | None) -> None:
+    problem = query_timeout_problem(options)
+    if problem:
+        raise HTTPException(422, problem)
+
+
 @router.get("/kinds")
 async def list_kinds() -> dict[str, Any]:
-    """支持哪些数据库，以及各自需要填什么——前端表单据此渲染。"""
+    """支持哪些数据库，以及各自需要填什么——前端表单据此渲染。
+
+    hint 只用表单上看得见的说法。以前写的是「在 options 里给 service_name」
+    「options 可填 charset」，表单上根本没有叫 options 的地方。advanced 列出
+    「高级连接参数」里常用的键，hint 提到的每个键都在那里找得到。
+    """
     return {
         "kinds": [
             {"value": "mysql", "label": "MySQL / MariaDB", "default_port": 3306,
              "needs": ["host", "database", "username", "password"],
-             "hint": "options 可填 charset（默认 utf8mb4）"},
+             "hint": "字符集默认 utf8mb4，要换就在「高级连接参数」里加 charset",
+             "advanced": [{"key": "charset", "label": "字符集", "placeholder": "utf8mb4"},
+                          _TIMEOUT_FIELD]},
             {"value": "postgres", "label": "PostgreSQL", "default_port": 5432,
-             "needs": ["host", "database", "username", "password"], "hint": ""},
+             "needs": ["host", "database", "username", "password"],
+             "hint": "「schema」留空就用 public",
+             "advanced": [_TIMEOUT_FIELD]},
             {"value": "oracle", "label": "Oracle", "default_port": 1521,
              "needs": ["host", "username", "password"],
-             "hint": "库名填 service_name，或在 options 里给 service_name / sid。"
+             "hint": "service_name 和 SID 二选一：一般填 service_name，老库只给了 SID 就切到 SID。"
                      "驱动走 thin 模式，不需要装 Instant Client。"
                      "只读账号名下通常没有对象——数据在别的 schema 里，"
-                     "用 options.schema 指定（如 ANALYTICS），否则探查结果是空的"},
+                     "把它填进「schema」（如 ANALYTICS），否则探查结果是空的",
+             "advanced": [
+                 {"key": "service_name", "label": "service_name", "placeholder": "ORCLPDB1",
+                  "help": "和 SID 二选一"},
+                 {"key": "sid", "label": "SID", "placeholder": "ORCL", "help": "和 service_name 二选一"},
+                 _TIMEOUT_FIELD,
+             ]},
             {"value": "sqlite", "label": "SQLite（文件）", "default_port": None,
-             "needs": ["database"], "hint": "库名填数据库文件的绝对路径"},
+             "needs": ["database"], "hint": "「数据库文件路径」填 .db 文件的绝对路径",
+             "advanced": [_TIMEOUT_FIELD]},
         ],
         "supported": list(SUPPORTED_KINDS),
     }
+
+
+def _oracle_target(options: dict[str, Any] | None) -> tuple[str, str]:
+    opts = options or {}
+    return str(opts.get("service_name") or "").strip(), str(opts.get("sid") or "").strip()
+
+
+def _settle_oracle(
+    row: DataSource, old_options: dict[str, Any] | None, old_database: str | None
+) -> None:
+    """Oracle 的 service_name / SID 只存一处：options 里，database 清空。
+
+    引擎按 `options.service_name or database` 取服务名，两者都空才看 sid。老数据
+    把服务名存在 database，于是新表单切到 SID 存下去会被它压住、悄悄无视；旧表单
+    把 service_name 框绑在 database 上、保存时又原样带回 options，新填的值同样
+    被压住。两处都能存，就总有一处在暗中说了算，所以存的时候收成一处：这次
+    改了哪一处就听哪一处；都没改就照引擎原来的取法，连的还是同一个库。
+    """
+    if (row.kind or "").lower() != "oracle":
+        return
+    opts = {k: v for k, v in (row.options or {}).items()
+            if k not in ("service_name", "sid") or str(v or "").strip()}
+    database = (row.database or "").strip()
+    picked = any(_oracle_target(opts)) and _oracle_target(opts) != _oracle_target(old_options)
+    typed = bool(database) and database != (old_database or "").strip()
+    if not picked and (typed or (database and "service_name" not in opts)):
+        opts["service_name"] = database
+        opts.pop("sid", None)
+    row.options = opts
+    row.database = None
 
 
 @router.post("", response_model=DataSourceOut, status_code=201)
@@ -138,17 +235,21 @@ async def create_source(
     payload: DataSourceIn, session: AsyncSession = Depends(get_session)
 ) -> DataSourceOut:
     if payload.kind not in SUPPORTED_KINDS:
-        raise HTTPException(400, f"不支持的类型 {payload.kind}，支持：{', '.join(SUPPORTED_KINDS)}")
+        raise HTTPException(400, f"不支持「{payload.kind}」这种数据库，支持：{'、'.join(SUPPORTED_KINDS)}")
     exists = (await session.execute(
         select(DataSource).where(DataSource.name == payload.name)
     )).scalar_one_or_none()
     if exists:
-        raise HTTPException(409, f"已经有叫 {payload.name} 的数据源了")
+        raise HTTPException(409, f"已经有叫「{payload.name}」的数据源了，换个标识")
+    _refuse_bad_options(payload.options)
 
     row = DataSource(
         **payload.model_dump(exclude={"password"}),
         password=encrypt(payload.password),
     )
+    _settle_oracle(row, None, None)
+    # 表单里刚测过这份配置：保存下来就带着那次结果，不必再测一遍
+    row.last_check = health.draft_result(_connection(row))
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -161,11 +262,20 @@ async def update_source(
 ) -> DataSourceOut:
     row = await _get_or_404(session, source_id)
     data = payload.model_dump(exclude_unset=True)
+    if "options" in data:
+        _refuse_bad_options(data["options"])
     if "password" in data:
         # 空串表示清空，非空表示换新的
         data["password"] = encrypt(data["password"]) if data["password"] else None
+    old_options, old_database = dict(row.options or {}), row.database
+    before = _connection(row)
     for key, value in data.items():
         setattr(row, key, value)
+    _settle_oracle(row, old_options, old_database)
+    after = _connection(row)
+    if after != before:
+        # 连的已经不是测过的那个了：旧结果作废，表单里测过这一份的话换成那一次
+        row.last_check = health.draft_result(after)
     await session.commit()
     await session.refresh(row)
     # 连接参数可能变了，旧连接池不能再用——否则改完密码还在用旧连接，很难排查
@@ -181,23 +291,229 @@ async def delete_source(source_id: str, session: AsyncSession = Depends(get_sess
     await engines.invalidate(source_id)
 
 
+#: 测连接最多等多久。内网库防火墙丢包时驱动默认要等一分钟，弹窗里干转一分钟
+#: 等于没有反馈
+_TEST_TIMEOUT = 15
+
+
+def _explain_connect(e: BaseException, kind: str) -> tuple[str, str]:
+    """连库失败的常见原因。驱动的原文九成能定位问题，但得先翻译成表单上的说法。"""
+    low = str(e).lower()
+    if any(s in low for s in ("password authentication failed", "access denied", "ora-01017",
+                              "invalid username/password", "(1045")):
+        return "账号或密码不对", "核对「用户名」和「密码」；编辑时密码留空表示沿用已保存的那个"
+    if "ora-12514" in low:
+        return "Oracle 不认识这个 service_name", "核对 service_name；老库可能只给了 SID，切到 SID 再试"
+    if "ora-12505" in low:
+        return "Oracle 不认识这个 SID", "核对 SID，或者改用 service_name"
+    if "service_name 或 sid" in low:
+        return "没填 service_name 或 SID", "在「service_name」一栏填上，或者切到 SID"
+    if "unknown database" in low or "(1049" in low or (
+        "does not exist" in low and "database" in low
+    ):
+        return "服务器上没有这个库", "核对「数据库」一栏"
+    if "unable to open database file" in low:
+        return "打不开这个数据库文件", "核对路径是不是绝对路径、文件在不在，以及后端进程有没有读权限"
+    if "file is not a database" in low:
+        return "这个文件不是 SQLite 数据库", "核对路径指的是不是 .db 文件"
+    if "no module named" in low:
+        return "后端没装这种数据库的驱动", "pip install 'agentlab-backend[db]' 之后重启后端"
+    reason, hint = explain(e)
+    if reason in ("等了太久没有响应", "连不上对方的服务"):
+        # 通用那句说的是 API，这里是数据库：多半是主机、端口或者网络不通
+        hint = "核对「主机」和「端口」；内网库要确认这台机器访问得到它（防火墙、VPN）"
+    elif kind == "sqlite" and not hint:
+        hint = "核对数据库文件的路径"
+    return reason, hint
+
+
+def _safe_url(source: Any) -> str:
+    try:
+        return build_url(source)   # 遮掉密码的版本
+    except Exception:  # noqa: BLE001 - 连串都拼不出来时，原因已经在 error 里了
+        return ""
+
+
+def _missing_sqlite_file(source: Any) -> tuple[str, str, str] | None:
+    """SQLite 的路径指向不存在的文件时，返回 (reason, hint, detail)。
+
+    可写模式下 SQLite 连一个不存在的路径会当场建一个空库：测试说「连得上」，
+    连的却是个空文件，「只测不存」的接口还往磁盘上写了东西。没填路径时连的
+    是内存库，一样是假的「连得上」。按 SQLite 自己的解析方式判断（不展开 ~）。
+    """
+    from pathlib import Path
+
+    if (source.kind or "").lower() != "sqlite":
+        return None
+    path = source.database or ""
+    if not path.strip():
+        return "没填数据库文件路径", "在「数据库文件路径」里填 .db 文件的绝对路径", "database 为空"
+    if path == ":memory:" or Path(path).is_file():
+        return None
+    return ("打不开这个数据库文件",
+            "这个路径上没有文件。核对路径是不是绝对路径、文件在不在（~ 不会被展开）",
+            f"文件不存在：{path}")
+
+
+async def _probe(source: Any, *, cached: bool) -> dict[str, Any]:
+    """真连一次。cached=False 用一次性的 engine，测完就扔——草稿不该进连接池缓存，
+    否则改完配置再测，拿到的还是上一版的连接。"""
+    import asyncio
+    import time
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    started = time.perf_counter()
+    missing = _missing_sqlite_file(source)
+    if missing:
+        reason, hint, detail = missing
+        return {"ok": False, "error": f"连不上：{reason}", "hint": hint, "detail": detail,
+                "elapsed_ms": 0, "url": _safe_url(source)}
+    engine = None
+    try:
+        if cached:
+            engine = await engines.get(source)
+        else:
+            url, extra = engine_args(source)
+            engine = create_async_engine(url, poolclass=NullPool, **extra)
+        async with asyncio.timeout(_TEST_TIMEOUT):
+            async with engine.connect() as conn:
+                oracle = (source.kind or "").lower() == "oracle"
+                await conn.execute(text("SELECT 1 FROM DUAL" if oracle else "SELECT 1"))
+        return {
+            "ok": True,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "url": _safe_url(source),
+        }
+    except Exception as e:  # noqa: BLE001
+        reason, hint = _explain_connect(e, (source.kind or "").lower())
+        return {
+            "ok": False,
+            "error": f"连不上：{reason}",
+            "hint": hint,
+            "detail": raw(e),
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "url": _safe_url(source),
+        }
+    finally:
+        if engine is not None and not cached:
+            await engine.dispose()
+
+
+class DataSourceTestIn(BaseModel):
+    """一份还没保存（或改了还没保存）的配置。带 id 表示在编辑已有的那个。"""
+
+    id: str | None = None
+    name: str = ""
+    kind: str
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    username: str | None = None
+    password: str | None = None  # 编辑时留空=沿用已保存的
+    options: dict[str, Any] = Field(default_factory=dict)
+    readonly: bool = True
+
+
+def _draft_source(payload: DataSourceTestIn, saved: DataSource | None) -> DataSource:
+    """拼一个不进会话的临时数据源，只拿来连一下。
+
+    编辑时密码框留空表示不改——测连接也得用存着的那个，否则改个端口想测一下，
+    只会得到一句"密码不对"。
+    """
+    if payload.password:
+        password = encrypt(payload.password)
+    else:
+        password = saved.password if saved else None
+    return DataSource(
+        name=payload.name or (saved.name if saved else "draft"),
+        kind=payload.kind, host=payload.host, port=payload.port, database=payload.database,
+        username=payload.username, password=password, options=dict(payload.options or {}),
+        readonly=payload.readonly,
+    )
+
+
+@router.post("/test")
+async def test_draft(
+    payload: DataSourceTestIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """测一份没保存的配置，不落库。
+
+    以前只能测已存在的数据源：填错一项要保存→关弹窗→点测试→看提示→再打开改，
+    接内网 Oracle 这类填错一个字段就连不上的东西，来回四五趟。
+    """
+    if payload.kind not in SUPPORTED_KINDS:
+        return {"ok": False, "error": f"不支持「{payload.kind}」这种数据库",
+                "hint": f"支持：{'、'.join(SUPPORTED_KINDS)}", "detail": "", "elapsed_ms": 0, "url": ""}
+    saved = await session.get(DataSource, payload.id) if payload.id else None
+    draft = _draft_source(payload, saved)
+    result = await _probe(draft, cached=False)
+    last, key = _probe_record(result), _connection(draft)
+    health.remember_draft(key, last)
+    if saved is not None and key is not None and key == _connection(saved):
+        # 编辑框里没改连接、只是再测一次：测的就是已保存的那份
+        saved.last_check = last
+        await session.commit()
+    return result
+
+
 @router.post("/{source_id}/test")
 async def test_source(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """测连接。失败时把驱动的原始报错带出来——这类问题九成靠错误信息定位。"""
+    """测连接。失败时说清原因和怎么办，驱动的原始报错放在 detail——这类问题九成靠它定位。"""
     row = await _get_or_404(session, source_id)
-    return await test_connection(row)
+    result = await _probe(row, cached=True)
+    row.last_check = _probe_record(result)
+    await session.commit()
+    return result
 
 
-@router.post("/{source_id}/introspect", response_model=DataSourceOut)
+class IntrospectPreview(BaseModel):
+    """只看不存的探查结果。缓存、同步时间都没动。"""
+
+    dry_run: bool = True
+    #: 这次探的是哪个 schema，"" 是默认 schema
+    schema_: str = Field(default="", serialization_alias="schema")
+    table_count: int = 0
+    #: 带 schema 前缀的对象全名，最多 200 个（和真探查的上限一样）
+    tables: list[str] = Field(default_factory=list)
+    truncated: bool = False
+    total: int = 0
+    schema_error: str = ""
+    available_schemas: list[str] = Field(default_factory=list)
+
+
+@router.post("/{source_id}/introspect", response_model=DataSourceOut | IntrospectPreview)
 async def introspect_source(
-    source_id: str, schema: str | None = None, session: AsyncSession = Depends(get_session)
-) -> DataSourceOut:
-    """探查结构并缓存。显式动作，不做后台轮询——生产库不该被实验工具定时扫。"""
+    source_id: str,
+    schema: str | None = None,
+    dry_run: bool = Query(default=False, description="只返回探到的结构，不写缓存"),
+    session: AsyncSession = Depends(get_session),
+) -> DataSourceOut | IntrospectPreview:
+    """探查结构并缓存。显式动作，不做后台轮询——生产库不该被实验工具定时扫。
+
+    dry_run=true 只看不存：「换个 schema 看看」以前一探就把缓存换掉，用户随后
+    选了「不改」，助手此刻看到的也已经是另一套表了。
+    """
     row = await _get_or_404(session, source_id)
     try:
-        row.schema_cache = await introspect_mod.introspect(row, schema=schema)
+        cache = await introspect_mod.introspect(row, schema=schema)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"探查失败：{type(e).__name__}: {e}") from e
+        reason, hint = _explain_connect(e, (row.kind or "").lower())
+        raise HTTPException(400, f"探查表结构失败：{reason}" + (f"。{hint}" if hint else "")) from e
+    if dry_run:
+        tables = cache.get("tables") or {}
+        return IntrospectPreview(
+            schema_=str(cache.get("schema") or ""),
+            table_count=len(tables),
+            tables=[m.get("qualified", n) for n, m in tables.items()],
+            truncated=bool(cache.get("truncated")),
+            total=int(cache.get("total") or 0),
+            schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
+            available_schemas=list(cache.get("available_schemas") or []),
+        )
+    row.schema_cache = cache
     # 失败也要把缓存存下来——里面的 available_schemas 正是下一步的线索——
     # 但**不能盖上"已同步"的戳**。以前盖了，于是界面显示同步过、工具却说
     # "还没探查过"，两边都不说真话（run 554a0f92）
@@ -213,7 +529,17 @@ async def get_schema(source_id: str, table: str | None = None,
                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     row = await _get_or_404(session, source_id)
     if table:
-        return {"table": table, "detail": introspect_mod.describe_table(row, table)}
+        meta = introspect_mod.find_table(row, table)
+        return {
+            "table": table,
+            # 给模型看的那段文本照旧；界面画表格用下面的结构化字段
+            "detail": introspect_mod.describe_table(row, table),
+            "found": meta is not None,
+            "qualified": meta.get("qualified", table) if meta else None,
+            "kind": ("view" if meta.get("is_view") else "table") if meta else None,
+            "comment": meta.get("comment") if meta else None,
+            "columns": introspect_mod.table_columns(meta) if meta else [],
+        }
     return {
         "tables": introspect_mod.table_names(row),
         "summary": introspect_mod.summary(row),
@@ -285,7 +611,10 @@ async def upload_table(
     except UnsupportedTable as e:
         raise HTTPException(400, str(e)) from e
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"导入失败：{type(e).__name__}: {e}") from e
+        raise HTTPException(
+            400, f"导入失败：{first_line(e) if isinstance(e, ValueError) else explain(e)[0]}。"
+                 "确认文件是 Excel 或 CSV、没有加密，表头行号填得对",
+        ) from e
 
     row = existing
     if row is None:

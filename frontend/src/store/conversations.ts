@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { api } from '../api/client'
+import { parseServerTime } from '../lib/format'
 import type { Conversation } from '../types'
 
 /**
@@ -27,10 +28,22 @@ export const lastVisited = (): string | null => {
   }
 }
 
+/** 按最后活跃时间排：恢复出来的会话回到它原本该在的位置 */
+const activeAt = (c: Conversation) => parseServerTime(c.last_active_at ?? c.created_at ?? '')?.getTime() ?? 0
+
 interface ConversationState {
   list: Conversation[]
+  /**
+   * 回收站：删掉（归档）的会话。删除先归档，是因为误删一个聊了七轮的对话没有别的
+   * 找回途径；撤销只有几秒，回收站一直在
+   */
+  trash: Conversation[]
+  /** 左栏在看回收站。放在 store 里：问数据页的「恢复」要能把左栏切回列表 */
+  showTrash: boolean
   currentId: string | null
   loading: boolean
+  /** 列表取失败了。和「一个对话都没有」要分开说 */
+  error: unknown
 
   load: () => Promise<void>
   /** 新建（或复用一条空的），返回它的 id。**不负责切过去**——那是导航的事 */
@@ -38,25 +51,50 @@ interface ConversationState {
   /** 由 URL 回流调用，把「在看哪个」记下来。不要在别处直接调它 */
   select: (id: string | null) => void
   rename: (id: string, title: string) => Promise<void>
-  /** 删掉，返回接下来该去哪个（列表空了就是 null），由调用方导航 */
-  remove: (id: string) => Promise<string | null>
+  setShowTrash: (show: boolean) => void
+  /**
+   * 从列表里拿掉、放进回收站（归档），返回接下来该去哪个。撤销就是 restore。
+   *
+   * 用归档而不是「先藏起来、过几秒再真删」：延迟删除在关掉标签页、切走页面时
+   * 要么没删成、要么撤销不了。归档是一次就落库的状态，撤不撤都不会丢
+   */
+  archive: (id: string) => Promise<string | null>
+  /** 从回收站拿回来。index 是撤销时的原位置；不给就按最后活跃时间插回去 */
+  restore: (item: Conversation, index?: number) => Promise<void>
+  /** 真删（DELETE）。只从回收站里发起，调用方负责先确认 */
+  purge: (id: string) => Promise<void>
+  /**
+   * 回收站里的这些真删（不给就是全部），返回没删掉的个数。正在跑的由调用方挑出去：
+   * 删掉会话只会关掉这一头的事件流，后端的运行照样跑、照样计费
+   */
+  emptyTrash: (ids?: string[]) => Promise<number>
   /** 有人在这个会话里说话了，把它顶到列表最前并刷新副标题 */
   touch: (id: string, lastQuestion?: string) => void
 }
 
 export const useConversations = create<ConversationState>((set, get) => ({
   list: [],
+  trash: [],
+  showTrash: false,
   currentId: null,   // 由 URL 填，见 ChatPage 的同步 effect
   loading: false,
+  error: null,
 
   load: async () => {
     // 只管把列表取回来。「当前在看哪个」以前也在这里决定，现在归 URL 管——
     // 两边都能定就会互相覆盖：深链接进来，列表一加载完又被拽回上次那个
     set({ loading: true })
     try {
-      set({ list: await api.conversations.list('chat'), loading: false })
-    } catch {
-      set({ loading: false })
+      // 连回收站里的一起取：一次请求，各行的 archived 区分放进哪一边
+      const rows = await api.conversations.list('chat', undefined, { includeArchived: true })
+      set({
+        list: rows.filter((c) => !c.archived),
+        trash: rows.filter((c) => c.archived),
+        loading: false,
+        error: null,
+      })
+    } catch (e) {
+      set({ loading: false, error: e })
     }
   },
 
@@ -90,12 +128,47 @@ export const useConversations = create<ConversationState>((set, get) => ({
     }
   },
 
-  remove: async (id) => {
-    await api.conversations.remove(id)
-    const list = get().list.filter((c) => c.id !== id)
-    set({ list })
-    // 删的不是当前这个就原地不动；删的是当前这个才需要换地方
+  setShowTrash: (show) => set({ showTrash: show }),
+
+  archive: async (id) => {
+    const { list: before, trash } = get()
+    const item = before.find((c) => c.id === id)
+    const list = before.filter((c) => c.id !== id)
+    // 先从列表里拿掉再发请求：删除该是即时的，失败了再放回去
+    set({ list, trash: item ? [{ ...item, archived: true }, ...trash] : trash })
+    try {
+      await api.conversations.update(id, { archived: true })
+    } catch (e) {
+      set({ list: before, trash })
+      throw e
+    }
     return get().currentId === id ? (list[0]?.id ?? null) : get().currentId
+  },
+
+  restore: async (item, index) => {
+    await api.conversations.update(item.id, { archived: false })
+    set((s) => {
+      const trash = s.trash.filter((c) => c.id !== item.id)
+      if (s.list.some((c) => c.id === item.id)) return { trash }
+      const list = [...s.list]
+      const later = list.findIndex((c) => activeAt(c) < activeAt(item))
+      const at = index ?? (later < 0 ? list.length : later)
+      list.splice(Math.min(at, list.length), 0, { ...item, archived: false })
+      return { list, trash }
+    })
+  },
+
+  purge: async (id) => {
+    await api.conversations.remove(id)
+    set((s) => ({ trash: s.trash.filter((c) => c.id !== id), list: s.list.filter((c) => c.id !== id) }))
+  },
+
+  emptyTrash: async (only) => {
+    const ids = get().trash.map((c) => c.id).filter((id) => !only || only.includes(id))
+    const results = await Promise.allSettled(ids.map((id) => api.conversations.remove(id)))
+    const gone = new Set(ids.filter((_, i) => results[i].status === 'fulfilled'))
+    set((s) => ({ trash: s.trash.filter((c) => !gone.has(c.id)) }))
+    return ids.length - gone.size
   },
 
   touch: (id, lastQuestion) => {
@@ -110,6 +183,7 @@ export const useConversations = create<ConversationState>((set, get) => ({
           ? (lastQuestion.length > 24 ? lastQuestion.slice(0, 24) + '…' : lastQuestion)
           : hit.title,
         turn_count: hit.turn_count + (lastQuestion ? 1 : 0),
+        last_active_at: new Date().toISOString(),
       }
       return { list: [updated, ...s.list.filter((c) => c.id !== id)] }
     })

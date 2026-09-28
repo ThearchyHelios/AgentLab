@@ -21,6 +21,10 @@ _DOCX = {".docx"}
 _PPTX = {".pptx"}
 _HTML = {".html", ".htm"}
 
+#: 按 UTF-8 文本读的常见格式。清单外的文件也会按文本试，这里列的是上传框里
+#: 该让人选得到的那些——前端的 accept 从 GET /api/kb/formats 取，只在这一处定义
+_TEXT = (".txt", ".md", ".markdown", ".json", ".log", ".yaml", ".yml", ".py", ".ts", ".js")
+
 #: 表格数据。它们有更好的去处——数据源那条路会把它变成可以真查的表，
 #: 而传进知识库只能当文本检索：数字是模型"读"出来的不是"算"出来的，
 #: 而这个项目的地基恰恰是"所有算术下沉到 SQL 或口径卡"（见 engine/issuance.py）
@@ -34,6 +38,24 @@ _LEGACY_OFFICE = {".ppt": "PowerPoint", ".doc": "Word", ".xls": "Excel"}
 
 class UnsupportedDocument(ValueError):
     """认不出或解析不了。message 直接给用户看。"""
+
+
+def supported_formats() -> dict[str, list[str]]:
+    """知识库收哪些格式、拒哪些。上传框的 accept 和后端的判断必须是同一份清单：
+    以前前端手写了一份，漏了 .pptx（后端支持）、多了 .csv（后端必拒）。"""
+    extensions = sorted(_PDF | _DOCX | _PPTX) + sorted(_HTML) + list(_TEXT)
+    return {
+        "extensions": extensions,
+        "text": list(_TEXT),
+        "tabular": sorted(_TABULAR),
+        "legacy": sorted(_LEGACY_OFFICE),
+    }
+
+
+def _why(e: BaseException) -> str:
+    """解析库的原话，去掉类名。它们常常是英文，但比"读不开"多一点线索。"""
+    text = str(e).strip()
+    return (text.splitlines()[0][:120] if text else "") or "没有更多说明"
 
 
 def _ext(filename: str) -> str:
@@ -51,7 +73,10 @@ def _from_pdf(raw: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
-        raise UnsupportedDocument(f"这个 PDF 读不开：{type(e).__name__}: {e}") from e
+        raise UnsupportedDocument(
+            f"这个 PDF 读不开：文件可能损坏、加了密码，或者其实不是 PDF（{_why(e)}）。"
+            "用原软件打开另存一份再传"
+        ) from e
 
     # 按页拼，页与页之间留空行——切块是按段落切的，页边界正好是天然的段落边界
     pages = []
@@ -86,7 +111,10 @@ def _from_docx(raw: bytes) -> str:
     try:
         doc = docx.Document(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
-        raise UnsupportedDocument(f"这个 Word 文档读不开：{type(e).__name__}: {e}") from e
+        raise UnsupportedDocument(
+            f"这个 Word 文档读不开：文件可能损坏、加了密码，或者其实不是 Word（{_why(e)}）。"
+            "用原软件打开另存一份再传"
+        ) from e
 
     parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     # 表格也要：合同、口径说明这类文档的关键信息常常整个在表里，
@@ -112,7 +140,10 @@ def _from_pptx(raw: bytes) -> str:
     try:
         deck = Presentation(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
-        raise UnsupportedDocument(f"这个 PowerPoint 读不开：{type(e).__name__}: {e}") from e
+        raise UnsupportedDocument(
+            f"这个 PowerPoint 读不开：文件可能损坏、加了密码，或者其实不是 PowerPoint（{_why(e)}）。"
+            "用原软件打开另存一份再传"
+        ) from e
 
     slides: list[str] = []
     for page in deck.slides:
@@ -167,9 +198,9 @@ def extract(raw: bytes, filename: str, mime: str = "") -> str:
         return _from_html(raw)
     if ext in _TABULAR:
         raise UnsupportedDocument(
-            f"{filename} 是表格数据，请传到「设置 → 数据源」那里——"
-            "它会变成一张可以用 SQL 查的表，数字是算出来的、能追溯到哪条查询。"
-            "传进知识库只能当文本检索，模型只是把数字读出来，容易读错也查不出来源。"
+            f"「{filename}」是表格，知识库不收表格。请到「数据源」点「传表格」导入："
+            "它会变成一张能用 SQL 查的表，数字是算出来的、查得到出自哪条查询。"
+            "放进知识库只能按文字检索，数字靠模型去读，容易读错，也追不到来源。"
         )
     if ext in _LEGACY_OFFICE:
         # 认出来再拒，而不是让它掉进下面那个"不是 UTF-8"的兜底——

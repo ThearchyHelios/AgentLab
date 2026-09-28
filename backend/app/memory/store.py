@@ -90,12 +90,16 @@ async def recall(
     kind: str | None = None,
     min_score: float = 0.05,
     on_degrade: Any = None,
+    track: bool = True,
 ) -> list[dict[str, Any]]:
     """按混合相关度取回记忆，并按重要性和使用次数做轻微加权。
 
     存量向量和当前 embedder 对不上时整体退回纯关键词。以前这里退得悄无声息
     ——知识库那边至少会发一条 warn，记忆这边只是"最近想不起事"，而人根本
     不会想到要去重建索引。
+
+    track=False 只看不记：调试台试一次回忆不该算"被召回过"，否则记忆卡上的
+    召回次数会被调试操作抬高，下次排序也跟着偏。
     """
     stmt = select(MemoryItem).where(MemoryItem.scope == scope)
     if kind:
@@ -151,6 +155,8 @@ async def recall(
         if len(results) >= limit:
             break
 
+    if not track:
+        return results
     # 记一下被召回过，作为下次排序的信号
     for r in results:
         item = await session.get(MemoryItem, r["id"])
@@ -159,6 +165,36 @@ async def recall(
             item.last_used_at = now
     await session.commit()
     return results
+
+
+async def revise(
+    session: AsyncSession,
+    memory_id: str,
+    *,
+    content: str | None = None,
+    kind: str | None = None,
+    importance: float | None = None,
+) -> MemoryItem | None:
+    """原地改一条记忆。找不到返回 None。
+
+    内容变了向量必须跟着重算：不然召回按的还是旧话，改完的口径搜不出来，
+    搜得出来的却是已经被改掉的那句。
+    """
+    item = await session.get(MemoryItem, memory_id)
+    if not item:
+        return None
+    if content is not None and content.strip() != item.content:
+        item.content = content.strip()
+        item.embedding = to_blob(await embed_text(item.content))
+        item.embed_model = embedder_id()
+        item.embed_dim = embedder_dim()
+    if kind is not None:
+        item.kind = kind
+    if importance is not None:
+        item.importance = importance
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
 async def forget(session: AsyncSession, memory_id: str) -> bool:
@@ -196,11 +232,14 @@ async def stale_count(session: AsyncSession, scope: str | None = None) -> int:
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
-async def reindex(session: AsyncSession, scope: str | None = None) -> int:
+async def reindex(
+    session: AsyncSession, scope: str | None = None, *, on_progress: Any = None,
+) -> int:
     """用当前 embedder 重算记忆的向量，返回重算了多少条。
 
     换 embedding 模型之后记忆和知识库一起失效，但在此之前只有知识库有重建
     路径——记忆这边悄悄退回关键词，而且没有任何恢复手段。
+    on_progress(已完成, 总数) 每批提交之后回调一次。
     """
     stmt = select(MemoryItem)
     if scope:
@@ -210,9 +249,9 @@ async def reindex(session: AsyncSession, scope: str | None = None) -> int:
         return 0
 
     model_id, dim = embedder_id(), embedder_dim()
-    from app.memory.kb import _EMBED_BATCH
+    from app.memory import kb
 
-    batch = _EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
+    batch = kb._EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
     for i in range(0, len(rows), batch):
         part = rows[i:i + batch]
         vectors = await embed_texts([r.content for r in part])
@@ -221,6 +260,8 @@ async def reindex(session: AsyncSession, scope: str | None = None) -> int:
             row.embed_model = model_id
             row.embed_dim = dim
         await session.commit()
+        if on_progress:
+            on_progress(min(i + batch, len(rows)), len(rows))
     return len(rows)
 
 

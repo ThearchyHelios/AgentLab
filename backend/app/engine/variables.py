@@ -68,6 +68,8 @@ class VarIssue(BaseModel):
     message: str
     node_id: str | None = None
     path: str = ""
+    #: 引用写在节点配置的哪个字段里（prompt、cases[0].condition）。产出侧的问题为空
+    field: str = ""
 
 
 class VariableReport(BaseModel):
@@ -350,7 +352,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     if target.kind == "loop" and target.produced_by:
                         if node.id not in bodies.get(target.produced_by, set()):
                             report.issues.append(VarIssue(
-                                level="warning", node_id=node.id, path=path,
+                                level="warning", node_id=node.id, path=path, field=field,
                                 message=f"{{{{ {path} }}}} 是「{target.produced_by_label}」"
                                         f"每轮的循环变量，只在循环体内部有值；"
                                         f"这一步不在循环体里，取到的会是空值",
@@ -364,7 +366,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                         and target.order > order
                     ):
                         report.issues.append(VarIssue(
-                            level="warning", node_id=node.id, path=path,
+                            level="warning", node_id=node.id, path=path, field=field,
                             message=f"{{{{ {path} }}}} 由「{target.produced_by_label}」产出，"
                                     f"但那一步在这之后才跑，这里取到的会是空值",
                         ))
@@ -383,7 +385,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                 hint = _did_you_mean(path, index)
                 report.issues.append(VarIssue(
                     level="error" if known_root else "warning",
-                    node_id=node.id, path=path,
+                    node_id=node.id, path=path, field=field,
                     message=(
                         f"{{{{ {path} }}}} 没有任何节点产出，"
                         f"是不是想写 {{{{ {hint} }}}}？取不到值会渲染成空字符串，不报错"

@@ -7,14 +7,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncIterator, Awaitable, Callable
 
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy import text
 
 from app.core.crypto import decrypt
+from app.data import guard
 from app.data.guard import QueryLimits, SqlRejected, check, is_write
+
+logger = logging.getLogger(__name__)
 
 # 各方言的 SQLAlchemy 驱动。都选 asyncio 原生驱动，没有一个需要装数据库客户端：
 # oracledb 走 thin 模式（纯 Python 协议实现），省掉了 Oracle Instant Client 这个
@@ -36,9 +42,16 @@ _DEFAULT_PORTS = {
 
 SUPPORTED_KINDS = tuple(sorted(set(_DRIVERS)))
 
+#: 数据源 options 里按源配置的查询时限（秒）。表单上叫「查询时限」
+QUERY_TIMEOUT_OPTION = "query_timeout_s"
+#: 按源配置时能填的范围。再长的查询不该让一个 agent 干等：该做成离线任务了
+MIN_QUERY_TIMEOUT_S = 1
+MAX_QUERY_TIMEOUT_S = 600
+
 # options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
 # schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
-_NON_DRIVER_OPTIONS = frozenset({"schema"})
+# query_timeout_s：查询时限，由数据层按语句下发给数据库，见 _server_deadline
+_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION})
 
 
 @dataclass
@@ -137,6 +150,43 @@ def engine_args(source: Any) -> tuple[str, dict[str, Any]]:
     return url, {}
 
 
+def _timeout_value(value: Any) -> float | None:
+    """options 里的查询时限：表单存的是字符串，也认数字。填得不对返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        return None
+    if not MIN_QUERY_TIMEOUT_S <= seconds <= MAX_QUERY_TIMEOUT_S:
+        return None
+    return int(seconds) if seconds.is_integer() else seconds
+
+
+def query_timeout_problem(options: dict[str, Any] | None) -> str | None:
+    """保存数据源时查一下查询时限填得对不对；没填、或者填对了返回 None。"""
+    value = (options or {}).get(QUERY_TIMEOUT_OPTION)
+    if value is None or str(value).strip() == "":
+        return None
+    if _timeout_value(value) is None:
+        return (f"查询时限要填 {MIN_QUERY_TIMEOUT_S} 到 {MAX_QUERY_TIMEOUT_S} 之间的秒数，"
+                f"比如 60；现在填的是「{value}」")
+    return None
+
+
+def query_timeout(source: Any) -> float:
+    """这个数据源上一条查询最多跑多久（秒）。没配、或者库里存着的值不对，用缺省。
+
+    缺省按模块属性现取：只有 guard.QueryLimits 这一处定义。
+    """
+    value = _timeout_value((source.options or {}).get(QUERY_TIMEOUT_OPTION))
+    return value if value is not None else guard.QueryLimits().timeout_seconds
+
+
+def _seconds(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
 class EngineCache:
     """按数据源 id 缓存 engine。连接池的建立不便宜，不该每次查询都重来一遍。
 
@@ -184,8 +234,6 @@ engines = EngineCache()
 
 async def test_connection(source: Any) -> dict[str, Any]:
     """测连接。失败时把驱动的原始错误带出来——这类问题九成靠错误信息定位。"""
-    import time
-
     started = time.perf_counter()
     try:
         engine = await engines.get(source)
@@ -206,6 +254,209 @@ async def test_connection(source: Any) -> dict[str, Any]:
         }
 
 
+#: 数据库按时限停下语句之后，数据层自己的兜底再多等多久。要比引擎的宽限
+#: （toolcalls.GRACE_S）短：数据库报上来的「超过 Ns 被中断」才是给人看的那句，
+#: 引擎那边只在数据层也卡住时才出面
+BACKSTOP_S = 0.5
+
+#: SQLite 每执行多少条虚拟机指令问一次进度回调。回调只比一次时间，几毫秒一问足够准
+_SQLITE_STEPS = 10_000
+
+#: 各家数据库按时限停下语句时的报错。认出来就说「超时」，而不是把驱动原文当成
+#: SQL 写错了交给模型——它会去改一条本来没错的 SQL。
+#:
+#: 先认错误码：服务器的报错文字会跟着它的语言设置走，中文环境的 PostgreSQL 报的是
+#: 「由于语句执行超时，正在取消查询命令」，按英文原文找一个也认不出来
+_PG_CANCELED = "57014"                    # PostgreSQL query_canceled（statement_timeout 到点）
+_MYSQL_TIMEOUT_CODES = frozenset({3024,   # MySQL：max_execution_time 到点
+                                  1969})  # MariaDB：max_statement_time 到点
+_TIMEOUT_MARKERS = (
+    "statement timeout",                   # PostgreSQL（英文环境）
+    "maximum statement execution time",    # MySQL 3024
+    "max_statement_time",                  # MariaDB 1969
+    "dpy-4024", "dpi-1067", "call timeout",  # python-oracledb：call timeout of N ms exceeded（驱动自己的话，不随服务器语言变）
+)
+
+
+def _causes(e: BaseException) -> list[BaseException]:
+    """异常连同它包着的原始驱动异常。SQLAlchemy 包一层（.orig），适配器再包一层（__cause__），
+    有的路径（服务端游标取行）又原样抛出驱动异常，所以几条链都走一遍。"""
+    out: list[BaseException] = []
+    todo: list[Any] = [e]
+    while todo and len(out) < 8:
+        err = todo.pop(0)
+        if isinstance(err, BaseException) and err not in out:
+            out.append(err)
+            todo += [getattr(err, "orig", None), err.__cause__, err.__context__]
+    return out
+
+
+class _Deadline:
+    """一条语句的时限。数据库那边按它停下；停下时报的错据此认成超时。
+
+    从取连接之前起算，和后端兜底同一个起点：取连接花掉的也算在时限里，数据库只拿到
+    剩下的那段（remaining_ms）。否则取连接一慢，兜底就抢在数据库前面取消语句。
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.ends = time.monotonic() + seconds
+        #: SQLite 的进度回调真的掐过
+        self.fired = False
+        #: 语句已经结束。回调这时要是还挂在连接上（摘除没成功），也不能再掐别人的语句
+        self.over = False
+
+    def remaining_ms(self) -> int:
+        return max(1, int((self.ends - time.monotonic()) * 1000))
+
+    def remaining_seconds(self) -> float:
+        return max(0.001, round(self.ends - time.monotonic(), 3))
+
+    def expired(self) -> bool:
+        return time.monotonic() >= self.ends
+
+    def sqlite_progress(self) -> int:
+        # 在 SQLite 执行语句的那个线程里被调用；返回非零，SQLite 就中止当前语句
+        if not self.over and time.monotonic() >= self.ends:
+            self.fired = True
+            return 1
+        return 0
+
+    def stopped(self, e: BaseException) -> bool:
+        """这个报错是不是数据库按时限停下语句造成的。"""
+        if self.fired:
+            return True
+        for err in _causes(e):
+            if _PG_CANCELED in (getattr(err, "sqlstate", None), getattr(err, "pgcode", None)):
+                return True
+            args = getattr(err, "args", None) or ()
+            if args and isinstance(args[0], int) and args[0] in _MYSQL_TIMEOUT_CODES:
+                return True
+            low = str(err).lower()
+            if any(marker in low for marker in _TIMEOUT_MARKERS):
+                return True
+            # 各家的措辞不一（interrupted / canceled，或者干脆只在类名里）；
+            # 过了时限才报出来的，就是时限掐的
+            if self.expired() and any(w in f"{type(err).__name__} {low}".lower()
+                                      for w in ("interrupt", "cancel")):
+                return True
+        return False
+
+
+async def _driver(conn: AsyncConnection) -> Any:
+    return (await conn.get_raw_connection()).driver_connection
+
+
+@asynccontextmanager
+async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline) -> AsyncIterator[None]:
+    """让数据库自己在时限处停下这条语句。
+
+    只靠后端这边 wait_for 放弃等待是不够的：数据库那边的语句照样在跑，占着连接池
+    里的一个连接直到跑完（Oracle 实测多占了 60 秒）；aiosqlite 更糟，语句在线程里
+    跑，取消之后关连接要排在它后面，一条不收敛的查询能让调用永远回不来。
+
+    会话级的设置用完要恢复：连接会回到池子里，探查结构这类长操作也用它。
+    下发失败（老版本的 MySQL 没有这个变量）不挡查询，只剩后端这边的兜底。
+    """
+    if kind in ("postgres", "postgresql"):
+        # SET LOCAL 只管这一个事务：连接还回池子时回滚，设置随之作废
+        await conn.execute(text(f"SET LOCAL statement_timeout = {deadline.remaining_ms()}"))
+        yield
+        return
+
+    if kind in ("mysql", "mariadb"):
+        # MySQL 的 max_execution_time 以毫秒计、只管 SELECT；MariaDB 没有它，
+        # 用 max_statement_time（秒）。按连上的服务器认，不按表单里选的类型
+        if getattr(conn.dialect, "is_mariadb", False):
+            var, value = "max_statement_time", _seconds(deadline.remaining_seconds())
+        else:
+            var, value = "max_execution_time", str(deadline.remaining_ms())
+        try:
+            await conn.execute(text(f"SET SESSION {var} = {value}"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("MySQL 语句时限没下发成功（%s），只剩后端兜底", e)
+            yield
+            return
+        cancelled = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            # 连接还卡在那条语句上，这时再发一条只会排在它后面
+            cancelled = True
+            raise
+        finally:
+            if not cancelled:
+                try:
+                    await conn.execute(text(f"SET SESSION {var} = DEFAULT"))
+                except Exception:  # noqa: BLE001 - 连接已经坏了的话，连接池会把它作废
+                    pass
+        return
+
+    if kind == "oracle":
+        driver = await _driver(conn)
+        before = getattr(driver, "call_timeout", 0)
+        try:
+            driver.call_timeout = deadline.remaining_ms()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Oracle call_timeout 没设上（%s），只剩后端兜底", e)
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                driver.call_timeout = before
+            except Exception:  # noqa: BLE001 - 超时后连接可能已经被驱动关掉
+                pass
+        return
+
+    if kind == "sqlite":
+        driver = await _driver(conn)
+        await driver.set_progress_handler(deadline.sqlite_progress, _SQLITE_STEPS)
+        try:
+            yield
+        finally:
+            deadline.over = True
+            try:
+                await driver.set_progress_handler(None, 0)
+            except Exception:  # noqa: BLE001 - over 已经让它不再掐人
+                pass
+        return
+
+    yield
+
+
+async def _bounded(
+    opener: Callable[[], Any], kind: str, limits: QueryLimits, over: str,
+    work: Callable[[AsyncConnection], Awaitable[Any]],
+) -> Any:
+    """在 opener() 开的连接上跑 work，时限交给数据库执行，后端这边再留一道兜底。
+
+    数据库按时限停下语句时报的错，翻成 over 这句话：「超过 Ns 被中断」。
+    两道时限从同一刻（取连接之前）算起，数据库那道先到，兜底晚 BACKSTOP_S。
+    """
+    deadline: _Deadline | None = None
+
+    async def _exec() -> Any:
+        nonlocal deadline
+        deadline = _Deadline(limits.timeout_seconds)
+        async with opener() as conn:
+            # 光等连接就把时限用完了：语句不必再发，发出去也只剩 1ms
+            if deadline.expired():
+                raise SqlRejected(over)
+            async with _server_deadline(conn, kind, deadline):
+                return await work(conn)
+
+    try:
+        return await asyncio.wait_for(_exec(), timeout=limits.timeout_seconds + BACKSTOP_S)
+    except asyncio.TimeoutError as e:
+        raise SqlRejected(over) from e
+    except Exception as e:
+        if deadline is not None and deadline.stopped(e):
+            raise SqlRejected(over) from e
+        raise
+
+
 async def run_query(
     source: Any, sql: str, *, limits: QueryLimits | None = None
 ) -> QueryResult:
@@ -213,44 +464,40 @@ async def run_query(
 
     注意执行的是 guard.check 的返回值而不是原始输入——守卫会把尾分号之类
     规范掉，执行原文等于绕过了守卫。
-    """
-    import time
 
-    limits = limits or QueryLimits()
+    时限没指定时按数据源自己的配置（query_timeout），由数据库执行（_server_deadline）。
+    """
+    limits = limits or QueryLimits(timeout_seconds=query_timeout(source))
     statement = check(sql, readonly=bool(source.readonly), source_name=source.name)
+    kind = (source.kind or "").lower()
 
     engine = await engines.get(source)
     started = time.perf_counter()
 
     if not source.readonly and is_write(statement):
-        return await _run_write(engine, statement, limits, started)
+        return await _run_write(engine, kind, statement, limits, started)
 
-    async def _exec() -> tuple[list[str], list[list[Any]], bool]:
-        async with engine.connect() as conn:
-            cursor = await conn.stream(text(statement))
-            columns = list(cursor.keys())
-            rows: list[list[Any]] = []
-            truncated = False
-            size = 0
-            async for row in cursor:
-                # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
-                values = [_jsonable(v) for v in row]
-                rows.append(values)
-                size += len(json.dumps(values, ensure_ascii=False, default=str))
-                if len(rows) >= limits.max_rows or size >= limits.max_bytes:
-                    truncated = True
-                    break
-            return columns, rows, truncated
+    async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool]:
+        cursor = await conn.stream(text(statement))
+        columns = list(cursor.keys())
+        rows: list[list[Any]] = []
+        truncated = False
+        size = 0
+        async for row in cursor:
+            # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
+            values = [_jsonable(v) for v in row]
+            rows.append(values)
+            size += len(json.dumps(values, ensure_ascii=False, default=str))
+            if len(rows) >= limits.max_rows or size >= limits.max_bytes:
+                truncated = True
+                break
+        return columns, rows, truncated
 
-    try:
-        columns, rows, truncated = await asyncio.wait_for(
-            _exec(), timeout=limits.timeout_seconds
-        )
-    except asyncio.TimeoutError as e:
-        raise SqlRejected(
-            f"查询超过 {limits.timeout_seconds}s 被中断。加上 WHERE 条件或 LIMIT 缩小范围。"
-        ) from e
-
+    columns, rows, truncated = await _bounded(
+        engine.connect, kind, limits,
+        f"查询超过 {_seconds(limits.timeout_seconds)}s 被中断。加上 WHERE 条件或 LIMIT 缩小范围。",
+        _read,
+    )
     return QueryResult(
         columns=columns,
         rows=rows,
@@ -262,7 +509,7 @@ async def run_query(
 
 
 async def _run_write(
-    engine: AsyncEngine, statement: str, limits: QueryLimits, started: float
+    engine: AsyncEngine, kind: str, statement: str, limits: QueryLimits, started: float
 ) -> QueryResult:
     """可写源上的写操作：真的提交。
 
@@ -271,20 +518,19 @@ async def _run_write(
     能走到这里的写都已经过了审批（registry.call_is_dangerous → 各节点的审批关卡），
     只读源上的写在 check 里就被拒了。
     """
-    import time
 
-    async def _exec() -> tuple[list[str], list[list[Any]]]:
-        async with engine.begin() as conn:   # 正常退出提交，出错回滚
-            result = await conn.execute(text(statement))
-            if result.returns_rows:          # RETURNING、PG 的数据修改 CTE
-                return (list(result.keys()),
-                        [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows)])
-            return ["affected_rows"], [[result.rowcount]]
+    async def _write(conn: AsyncConnection) -> tuple[list[str], list[list[Any]]]:
+        result = await conn.execute(text(statement))
+        if result.returns_rows:          # RETURNING、PG 的数据修改 CTE
+            return (list(result.keys()),
+                    [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows)])
+        return ["affected_rows"], [[result.rowcount]]
 
-    try:
-        columns, rows = await asyncio.wait_for(_exec(), timeout=limits.timeout_seconds)
-    except asyncio.TimeoutError as e:
-        raise SqlRejected(f"写操作超过 {limits.timeout_seconds}s 被中断，已回滚。") from e
+    # engine.begin()：正常退出提交，出错（包括数据库按时限停下）回滚
+    columns, rows = await _bounded(
+        engine.begin, kind, limits,
+        f"写操作超过 {_seconds(limits.timeout_seconds)}s 被中断，已回滚。", _write,
+    )
     return QueryResult(
         columns=columns,
         rows=rows,
