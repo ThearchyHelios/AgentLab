@@ -52,9 +52,10 @@ const ORDER = [
 ]
 // 最近一次全量里各项的耗时（秒）。只决定排队顺序：长的先开跑，短的填空，结果不受影响。
 // 新加的检查不在表里就按 60 秒算
+// 2026-09-29 三期收尾那一次四道并行的实测（秒）：只用来排先后，长的先跑
 const ESTIMATE = {
-  'run-states': 220, 'canvas-fx': 181, stream: 162, studio: 125, chat: 124, manage: 115, runs: 91,
-  shell: 84, 'ui-kit': 69, ui: 61, evidence: 56, publish: 31, guards: 10, 'canvas-layout': 4, tokens: 1, trace: 1, decode: 1,
+  'run-states': 299, 'canvas-fx': 264, stream: 176, chat: 164, studio: 153, manage: 142, runs: 105,
+  shell: 85, 'ui-kit': 74, evidence: 67, ui: 67, publish: 54, guards: 17, 'canvas-layout': 8, tokens: 1, trace: 1, decode: 1,
 }
 // 量时间最多、以前并行最容易挂的：同一时刻最多跑其中一项
 const EXCLUSIVE = new Set(['run-states', 'canvas-fx'])

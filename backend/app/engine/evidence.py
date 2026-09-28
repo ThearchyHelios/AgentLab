@@ -15,13 +15,22 @@
     [[v:Q<n>.r<行>.<列>]]           查询快照里的一格（取回时复验哈希），也能加 |万 这类换算
     [[table:Q<n> cols=a,b rows=0-4]] 整表：系统从快照生成 Markdown 表，每一格都是带出处的片段
     [[i:<输入字段>]]                运行输入
+    [[t:<表>]] / [[c:<表>.<列>]]    实体：表 / 字段，显示名字本身（反引号里写的已知名字也会自动链接）
+    [[q:K<n>|<逐字引文>]]           引文：必须在那次检索命中的片段里逐字出现，显示引文本身
     [[see:<ref>,<ref>…]]           依据：挂在句末，不渲染
 
-`[[t:]]` `[[c:]]` `[[q:]]` 能解析，本期一律判为解析不了，原因写「这种引用在后续版本支持」。
+实体只在这次运行冻结了表结构（schema_snapshot）时才核对：目录里没有表和字段条目的，
+t / c 仍按一期判为解析不了（「这种引用在后续版本支持」），反引号里的名字也不查；报告节点
+写了 entities: off 的，照实说是它关掉的。表结构快照不全（库里的表太多、只存了一部分）时，
+找不到的名字只说「核对不了」，不说「可能是编造的」。自动链接的名字只是标注：一句结论挂没挂
+依据，只看写作者自己写的 [[…]] 和 [[see:…]]。
 沙箱代码节点的产出不能直接引用（`[[v:N:calc.x]]`），原因写「沙箱算出来的数要进口径卡」。
 
-单元格和整表要读快照：整个模块仍然不碰数据库、不调模型，快照经 loader 取（缺省是
+单元格、整表、引文要读快照：整个模块仍然不碰数据库、不调模型，快照经 loader 取（缺省是
 artifact_store.load，只读文件）。测试和接口可以换成自己的 loader。
+
+旧运行没有报告文档时，guess_sources 按数值去已封存的证据里找「可能的来源」：那只是猜测，
+不是证据，界面要照实这么说；遮罩的列不当候选。
 
 偏移一律按 Unicode 码点算（Python 的 str 下标）。前端的 JS 字符串按 UTF-16 计，
 碰到码点在 BMP 之外的字符（emoji）要自己换算。
@@ -30,6 +39,7 @@ artifact_store.load，只读文件）。测试和接口可以换成自己的 loa
 from __future__ import annotations
 
 import bisect
+import difflib
 import json
 import math
 import re
@@ -40,7 +50,7 @@ from typing import Any, Literal, TypedDict
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
-from app.engine.issuance import extract_numbers, number_allowance
+from app.engine.issuance import _tolerance, extract_numbers, number_allowance
 
 DOC_SCHEMA = "agentlab.report/1"
 
@@ -69,20 +79,26 @@ class EvidenceEntry(TypedDict, total=False):
     code_sha: str             # node_output（代码节点）专有：实际执行的代码的 sha256、
     role: str                 # evidence_role（source / compute）、语言
     language: str
+    schema_artifact: str      # query 专有（有表结构快照时）：查询当时数据源的表结构快照
+    tables: Any               # query：SQL 里 FROM / JOIN 的表名（list）；schema：{表: [列…]}
+    schema: str | None        # schema 专有：数据库里的 schema 名（全名 = schema.表）、同步时间
+    synced_at: str | None
 
 
 class Citation(TypedDict, total=False):
-    ref: str                  # 标记里写的原文：gmv、week、Q4.r0.amount
-    alias: str                # 目录里的键：m:gmv、i:week、Q4
+    ref: str                  # 标记里写的原文：gmv、week、Q4.r0.amount、orders
+    alias: str                # 目录里的键：m:gmv、i:week、Q4、t:orders、K1
     locator: dict[str, Any]
     eid: str
     kind: str                 # metric / input / query / cell / table / column / quote
     role: Literal["value", "entity", "quote", "support"]
     status: Literal["resolved", "unresolved", "mismatch"]
     reason: str               # unresolved 时为什么
+    unknown: bool             # 实体：本次运行哪里都没有这个名字（可疑实体，不是写法错了）
     conv: str                 # 换算：万 / 亿 / pct / int / .N
     value: Any
     rendered: str
+    source: dict[str, Any]    # 引文：原文所在的检索快照、文档、片段
 
 
 class Segment(TypedDict, total=False):
@@ -90,11 +106,14 @@ class Segment(TypedDict, total=False):
     kind: Literal["text", "number", "value", "entity", "quote", "structural"]
     text: str
     span: list[int]           # [start, end)，在 doc.markdown 里的码点偏移
-    ref: str                  # 带前缀的原始引用：m:gmv、i:week
+    ref: str                  # 带前缀的原始引用：m:gmv、i:week、t:orders
     cite: Citation
     state: Literal["deterministic", "probabilistic", "none", "neutral"]
     strong: bool
-    issue: str                # 这一段本身的问题：uncited_number / unresolved_ref
+    code: bool                # 实体写在反引号里：text 带着两个反引号，渲染成行内代码
+    auto: bool                # 实体是正文里自动链接出来的，不是 [[t:]] / [[c:]] 标记
+    name: str                 # 可疑实体（没有 ref）：反引号里写的那个名字
+    issue: str                # 这一段本身的问题：uncited_number / unresolved_ref / unknown_entity
 
 
 class Unit(TypedDict, total=False):
@@ -198,8 +217,214 @@ def query_entry_fields(payload: Any) -> dict[str, Any] | None:
     artifact, columns, rows = data.get("artifact"), data.get("columns"), data.get("rows")
     if not (isinstance(artifact, str) and artifact and isinstance(columns, list) and isinstance(rows, list)):
         return None
-    return {"artifact": artifact, "source": data.get("source"), "columns": [str(c) for c in columns],
-            "rows": len(rows), "truncated": bool(data.get("truncated"))}
+    fields = {"artifact": artifact, "source": data.get("source"), "columns": [str(c) for c in columns],
+              "rows": len(rows), "truncated": bool(data.get("truncated"))}
+    schema = data.get("schema_artifact")
+    if isinstance(schema, str) and schema:
+        # 表结构快照和 SQL 里的表名成对出现：没探查过结构的数据源，只凭 SQL 和结果列核对名字，
+        # 反引号里写的真实表名（没进这条 SQL）会被误标成编造的，这种查询不启用实体核对
+        fields.update(schema_artifact=schema, tables=sql_tables(str(data.get("sql") or "")))
+    return fields
+
+
+# --------------------------------------------------------------------------
+# 表结构：冻结的快照、SQL 里用到的表
+# --------------------------------------------------------------------------
+
+#: 数据源工具每次查询时把当时的表结构存成这种工件
+SCHEMA_SNAPSHOT = "schema_snapshot"
+
+_SQL_IDENT = r'(?:"[^"\n]+"|`[^`\n]+`|\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_$#]*)'
+_SQL_NAME = re.compile(rf"\s*({_SQL_IDENT}(?:\s*\.\s*{_SQL_IDENT}){{0,2}})")
+_SQL_PART = re.compile(_SQL_IDENT)
+_SQL_FROM = re.compile(r"\b(?:from|join)\b", re.I)
+#: WITH x AS (…), y AS (…)：公用表表达式的名字不是真表
+_SQL_CTE = re.compile(rf"(?:\bwith\b(?:\s+recursive\b)?|,)\s*({_SQL_IDENT})\s*(?:\([^()]*\)\s*)?\bas\s*\(", re.I)
+#: 跟在 FROM 后面、却不是表名的词
+_SQL_NOT_TABLE = frozenset({"select", "lateral", "unnest", "dual", "values", "table"})
+#: 表名后面紧跟这些词时，它们不是别名
+_SQL_CLAUSE = frozenset({
+    "where", "group", "order", "having", "limit", "offset", "fetch", "join", "inner", "left", "right", "full",
+    "cross", "outer", "natural", "on", "using", "union", "except", "intersect", "window", "for", "as", "and",
+    "or", "not", "when", "then", "else", "end", "set", "returning", "into", "pivot", "unpivot", "qualify"})
+#: FROM 出现在这些函数的括号里时是语法的一部分：EXTRACT(YEAR FROM ts)、TRIM(' ' FROM name)
+_SQL_FROM_FUNCS = frozenset({"extract", "substring", "trim", "overlay", "position"})
+#: SQLite / SQL Server 的方括号标识符：里面有引号的不是（那是 ARRAY['…'] 这样的数组字面量）
+_SQL_BRACKET = re.compile(r"\[[^\]'\"\n]*\]")
+#: PostgreSQL 的美元引号字符串：$$…$$、$tag$…$tag$（$1 这种参数不是）
+_SQL_DOLLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_SQL_WORD_CHAR = re.compile(r"[A-Za-z0-9_$#]")
+
+
+def _sql_scan(sql: str) -> tuple[str, str]:
+    """一趟扫完注释、字符串、带引号的标识符，返回两份和原文等长的文本：
+
+    - code：注释换成空格，字符串字面量的内容换成空格（引号留着），标识符原样——取表名用
+    - words：在 code 的基础上，带引号的标识符的内容也换成空格——找 FROM / JOIN 这些关键字用，
+      "FROM x" 这样的名字（MySQL 默认还把它当字符串）里的 FROM 不是关键字
+
+    字符串和注释必须一起认：先去注释再抹字符串的话，'--x' 会把后半条语句当注释吞掉，
+    '/*' 和 '*/' 两个字符串之间的正文也会被当成注释。拿不准的地方一律往「少认一张表」偏：
+    反斜杠当转义（MySQL、E'…'），块注释可以嵌套（PostgreSQL），# 开头到行尾是注释（MySQL）。
+    换行原样保留。
+    """
+    code, words = list(sql), list(sql)
+    n = len(sql)
+
+    def blank(a: int, b: int, *targets: list[str]) -> None:
+        for k in range(a, min(b, n)):
+            if sql[k] != "\n":
+                for t in targets:
+                    t[k] = " "
+
+    i = 0
+    while i < n:
+        ch, nxt = sql[i], sql[i + 1] if i + 1 < n else ""
+        word_before = i > 0 and bool(_SQL_WORD_CHAR.match(sql[i - 1]))
+        if (ch == "-" and nxt == "-") or (ch == "#" and not word_before):
+            end = sql.find("\n", i)
+            end = n if end < 0 else end
+            blank(i, end, code, words)
+            i = end
+        elif ch == "/" and nxt == "*":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j, code, words)
+            i = j
+        elif ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "\\":
+                    j += 2
+                elif sql[j] == "'" and j + 1 < n and sql[j + 1] == "'":
+                    j += 2
+                elif sql[j] == "'":
+                    break
+                else:
+                    j += 1
+            blank(i + 1, j, code, words)
+            i = j + 1
+        elif ch in ('"', "`"):
+            j = i + 1
+            while j < n and not (sql[j] == ch and not (j + 1 < n and sql[j + 1] == ch)):
+                j += 2 if sql[j] == ch else 1
+            blank(i + 1, j, words)
+            i = j + 1
+        elif ch == "[" and (m := _SQL_BRACKET.match(sql, i)):
+            blank(i + 1, m.end() - 1, words)
+            i = m.end()
+        elif ch == "$" and not word_before and (m := _SQL_DOLLAR.match(sql, i)):
+            close = sql.find(m.group(0), m.end())
+            end = n if close < 0 else close
+            blank(m.end(), end, code, words)
+            i = n if close < 0 else close + len(m.group(0))
+        else:
+            i += 1
+    return "".join(code), "".join(words)
+
+
+def _unquote(name: str) -> str:
+    return ".".join(p[1:-1] if p[:1] in ('"', "`", "[") else p for p in _SQL_PART.findall(name))
+
+
+def _inside_call(code: str, pos: int) -> bool:
+    """pos 所在的最内层括号，是不是 EXTRACT( / TRIM( 这类把 FROM 当语法用的函数；IS DISTINCT FROM 同理。"""
+    if re.search(r"\bdistinct\s*$", code[:pos], re.I):
+        return True
+    depth = 0
+    for i in range(pos - 1, -1, -1):
+        ch = code[i]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            if depth == 0:
+                word = re.search(r"([A-Za-z_]+)\s*$", code[:i])
+                return bool(word and word.group(1).lower() in _SQL_FROM_FUNCS)
+            depth -= 1
+    return False
+
+
+def sql_tables(sql: str) -> list[str]:
+    """SQL 里 FROM / JOIN 后面的表名，按第一次出现的顺序、不分大小写去重。
+
+    注释、字符串字面量一趟扫掉（_sql_scan：`-- FROM ghost`、'JOIN ghost'、'--x' 后面的正文都
+    处理对）。双引号、反引号、方括号括起来的标识符照样认，去掉引号；引号里的 FROM 不算关键字。
+    WITH 定义的公用表表达式、子查询、表函数（generate_series(…)）不算表。
+    """
+    if not sql:
+        return []
+    code, words = _sql_scan(sql)
+    ctes = {_unquote(code[m.start(1):m.end(1)]).lower() for m in _SQL_CTE.finditer(words)}
+    out: dict[str, str] = {}
+    for keyword in _SQL_FROM.finditer(words):
+        if _inside_call(words, keyword.start()):
+            continue
+        pos = keyword.end()
+        while True:
+            m = _SQL_NAME.match(code, pos)
+            if not m or re.match(r"\s*\(", code[m.end():]):
+                break                                   # 子查询、表函数
+            name = _unquote(m.group(1))
+            lowered = name.lower()
+            if lowered == "only":                       # FROM ONLY t（PostgreSQL）
+                pos = m.end()
+                continue
+            if lowered in _SQL_NOT_TABLE:
+                break
+            if lowered not in ctes:
+                out.setdefault(lowered, name)
+            pos = m.end()
+            alias = re.match(rf"\s+(?:as\s+)?({_SQL_IDENT})", code[pos:], re.I)
+            if alias and alias.group(1).lower() not in _SQL_CLAUSE:
+                pos += alias.end()
+            comma = re.match(r"\s*,", code[pos:])
+            if not comma:
+                break
+            pos += comma.end()
+    return list(out.values())
+
+
+def schema_entry_fields(content: Any) -> dict[str, Any] | None:
+    """表结构快照的内容 → 台账 schema 条目要的字段：{source, schema, synced_at, tables: {表: [列…]}}，
+    快照不全（探查时表太多被截断）时另有 truncated: True 和 total（库里一共几张表）。
+
+    只记名字，不记类型、注释：目录核对名字存不存在就够了，类型要看的时候去取快照本身
+    （它在封存范围内，取回时复验哈希）。没有表的快照返回 None。
+    """
+    if not isinstance(content, dict) or not isinstance(content.get("tables"), dict) or not content["tables"]:
+        return None
+    tables: dict[str, list[str]] = {}
+    for name, meta in content["tables"].items():
+        cols = meta.get("columns") if isinstance(meta, dict) else None
+        tables[str(name)] = [str(c["name"]) for c in cols or [] if isinstance(c, dict) and c.get("name")]
+    fields = {"source": content.get("source"), "schema": content.get("schema"), "synced_at": content.get("synced_at"),
+              "tables": tables}
+    if content.get("truncated"):
+        # 库里的表太多、探查只存了前一部分：没列出的名字可能是真的，实体核对据此只说「核对不了」
+        total = content.get("total")
+        fields.update(truncated=True, **({"total": total} if isinstance(total, int) else {}))
+    return fields
+
+
+def schema_ledger_entry(artifact: str, *, node_id: str, exec_no: int,
+                        loader: Callable[[str], Any] | None = None) -> dict[str, Any] | None:
+    """一件表结构快照 → 台账的 schema 条目。快照取不回来（或者哈希对不上）返回 None。
+
+    节点执行器在工具调用之后调它：快照是内容寻址的，重放时读到的是同一份，条目也就是同一条。
+    """
+    try:
+        fields = schema_entry_fields((loader or load_artifact)(artifact))
+    except Exception:  # noqa: BLE001 - 取不回来就不记，不能让一次查询因此失败
+        return None
+    if fields is None:
+        return None
+    return {"kind": "schema", "node_id": node_id, "exec": exec_no, "artifact": artifact, **fields}
 
 
 # --------------------------------------------------------------------------
@@ -406,8 +631,10 @@ _MARKER_GUARD = rf"(?=[^\[\]\n]{{0,{MARKER_MAX - 4}}}\]\])"
 #: [[kind:body]]。body 里不许有方括号和换行——这样一个没闭合的 [[ 最多吞到行尾
 MARKER_RE = re.compile(
     r"\[\[" + _MARKER_GUARD + r"[ \t]*(?P<kind>[A-Za-z]+)[ \t]*:(?P<body>[^\[\]\n]*?)\]\]")
-SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table"})
-LATER_KINDS = frozenset({"t", "c", "q"})
+SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q"})
+#: 三期起没有「以后才支持」的标记了；留着这个名字给老代码 import
+LATER_KINDS: frozenset[str] = frozenset()
+#: 这次运行没冻结表结构（没查过库、升级前的运行）时，t / c 仍按一期判为解析不了，原因还是这一句
 LATER_REASON = "这种引用在后续版本支持"
 #: 沙箱代码节点的产出不能直接引用：它能做任意计算，那种数要进口径卡、留下代入式
 CODE_REASON = "沙箱算出来的数要进口径卡"
@@ -507,6 +734,10 @@ def build_catalog(
 
     沙箱代码节点的台账条目登记成 N:<节点 id>（kind node_output，code: True）：不编号、不进
     写作目录，只为了有人写 [[v:N:calc.x]] 时能说清为什么不行。
+
+    表和字段（t:<表>、c:<表>.<列>、c:<列>）来自三处：表结构快照（schema 条目）、查询 SQL 用到的
+    表、查询结果的列，后两样只认带着表结构快照的查询条目（见 query_entry_fields）。二期的台账
+    里没有这些，编不出实体条目，实体核对也就不启用。
     """
     if not metrics_from:
         metrics_from = None
@@ -547,8 +778,13 @@ def build_catalog(
             }
 
     queries = retrievals = 0
+    schemas: list[dict[str, Any]] = []
+    shaped: list[tuple[dict[str, Any], str]] = []      # 带表结构快照的查询条目和它的全局编号
     for entry in entries:
         if allow is not None and entry.get("node_id") not in allow:
+            continue
+        if entry.get("kind") == "schema":
+            schemas.append(entry)
             continue
         rows = entry.get("rows")
         if entry.get("kind") == "node_output" and entry.get("code_sha"):
@@ -565,6 +801,8 @@ def build_catalog(
             queries += 1
             alias, kind = f"Q{queries}", "query"
             label = f"{entry.get('tool') or entry.get('source') or kind}" + (f" · {rows} 行" if isinstance(rows, int) else "")
+            if entry.get("schema_artifact") and isinstance(entry.get("tables"), list):
+                shaped.append((entry, alias))
         elif entry.get("kind") == "retrieval":
             retrievals += 1
             alias, kind = f"K{retrievals}", "retrieval"
@@ -579,6 +817,8 @@ def build_catalog(
                                      "columns", "rows", "truncated") if k in entry},
             "label": label,
         }
+    if schemas or shaped:
+        catalog.update(_entity_entries(schemas, shaped))
 
     for key, value in (inputs or {}).items():
         if not isinstance(key, str) or not key or isinstance(value, (dict, list, tuple)):
@@ -590,6 +830,231 @@ def build_catalog(
             "locator": locator, "value": value, "rendered": rendered, "label": f"{key} = {rendered}",
         }
     return catalog
+
+
+# --------------------------------------------------------------------------
+# 实体：表和字段
+# --------------------------------------------------------------------------
+
+ENTITY_KINDS = frozenset({"table", "column"})
+UNKNOWN_ENTITY_REASON = "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字"
+#: 表结构快照不全（库里的表太多、只存了一部分）时找不到的名字：可能在没存下来的表里，只能说核对不了
+UNVERIFIED_ENTITY_REASON = ("这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，"
+                            "核对不了它存不存在")
+#: 报告节点写了 entities: off：作者有意关掉了表名、字段名核对
+ENTITIES_OFF_REASON = "这个报告节点关掉了表名、字段名核对（entities: off），[[t:]] / [[c:]] 不解析：直接写名字就行"
+
+
+def _add_origin(entry: dict[str, Any], origin: dict[str, Any]) -> None:
+    key = (origin.get("kind"), origin.get("artifact"), origin.get("alias"))
+    if all((o.get("kind"), o.get("artifact"), o.get("alias")) != key for o in entry["sources"]):
+        entry["sources"].append(origin)
+    alias = origin.get("alias")
+    if alias and alias not in entry["queries"]:
+        entry["queries"].append(alias)
+
+
+def _entity_entries(schemas: list[dict[str, Any]], queries: list[tuple[dict[str, Any], str]]) -> dict[str, Any]:
+    """表条目 t:<表>、列条目 c:<表>.<列>，没有表名的结果列（聚合的别名）是 c:<列>。
+
+    每个条目的 eid 取它第一次出现的那件工件：表结构快照里有的按快照，只在 SQL / 结果列里出现
+    的按那份查询快照。sources 记全三种来历（schema / sql / result），queries 是哪几次查询用到。
+    同名字段在好几张表里（id、amount）另编一条 c:<列>，tables 写明是哪几张：正文里只写字段名时
+    指的是哪张说不准，但这个名字确实存在。
+    """
+    tables: dict[str, dict[str, Any]] = {}
+    columns: dict[str, dict[str, Any]] = {}
+    by_lower: dict[str, str] = {}                  # 小写的表名、全名、全名的末段 → 条目里的表名
+    owners: dict[str, list[str]] = {}              # 小写的列名 → 表结构里有它的表
+
+    def table(name: str, artifact: Any, *, qualified: str | None = None, source: Any = None) -> str:
+        key = by_lower.get(name.lower()) or (by_lower.get(qualified.lower()) if qualified else None)
+        if key is None and not qualified and "." in name:
+            key = by_lower.get(name.rsplit(".", 1)[-1].lower())     # SQL 里写了别的 schema 前缀的同名表
+        if key is None:
+            key = name
+            tables[key] = {"alias": f"t:{key}", "kind": "table", "eid": make_eid("table", artifact, {"table": key}),
+                           "artifact": artifact, "locator": {"table": key}, "name": key,
+                           **({"qualified": qualified} if qualified and qualified != key else {}),
+                           **({"source": source} if source else {}), "sources": [], "queries": [],
+                           "label": f"表 {key}"}
+            for k in (key, qualified, key.rsplit(".", 1)[-1]):
+                if k:
+                    by_lower.setdefault(k.lower(), key)
+        return key
+
+    def column(alias: str, name: str, artifact: Any, locator: dict[str, str], source: Any) -> dict[str, Any]:
+        if alias not in columns:
+            columns[alias] = {"alias": alias, "kind": "column", "eid": make_eid("column", artifact, locator),
+                              "artifact": artifact, "locator": locator, "name": name,
+                              **({"table": locator["table"]} if "table" in locator else {}),
+                              **({"source": source} if source else {}), "sources": [], "queries": [],
+                              "label": f"字段 {alias[2:]}"}
+        return columns[alias]
+
+    for entry in schemas:
+        artifact, source, prefix = entry.get("artifact"), entry.get("source"), entry.get("schema")
+        origin = {"kind": "schema", "artifact": artifact, **({"source": source} if source else {}),
+                  **({"truncated": True} if entry.get("truncated") else {})}
+        for name, cols in (entry.get("tables") or {}).items():
+            key = table(str(name), artifact, qualified=f"{prefix}.{name}" if prefix else None, source=source)
+            _add_origin(tables[key], origin)
+            for col in cols or []:
+                col = str(col)
+                _add_origin(column(f"c:{key}.{col}", col, artifact, {"table": key, "column": col}, source), origin)
+                listed = owners.setdefault(col.lower(), [])
+                if key not in listed:
+                    listed.append(key)
+    by_column = {a.lower(): a for a in columns}
+    for entry, alias in queries:
+        artifact, source = entry.get("artifact"), entry.get("source")
+        extra = {"source": source} if source else {}
+        used = []
+        for written in entry.get("tables") or []:
+            key = table(str(written), artifact, source=source)
+            _add_origin(tables[key], {"kind": "sql", "artifact": artifact, "alias": alias, **extra})
+            used.append(key)
+        for col in entry.get("columns") or []:
+            col = str(col)
+            mine = [a for t in used if (a := by_column.get(f"c:{t}.{col}".lower()))]
+            target = columns[mine[0]] if len(mine) == 1 else column(f"c:{col}", col, artifact, {"column": col}, source)
+            _add_origin(target, {"kind": "result", "artifact": artifact, "alias": alias, **extra})
+    for lowered, keys in owners.items():
+        if len(keys) < 2:
+            continue
+        first = columns[by_column[f"c:{keys[0]}.{lowered}".lower()]]
+        target = column(f"c:{first['name']}", first["name"], first["artifact"], {"column": first["name"]},
+                        first.get("source"))
+        target["tables"] = list(keys)
+        for key in keys:
+            for origin in columns[by_column[f"c:{key}.{lowered}".lower()]]["sources"]:
+                if origin["kind"] == "schema":
+                    _add_origin(target, origin)
+    return {**{e["alias"]: e for e in tables.values()}, **{e["alias"]: e for e in columns.values()}}
+
+
+#: 反引号里、正文里像标识符的名字：字母或下划线开头，最多四段用点连起来
+_ENTITY_NAME = r"[A-Za-z_][A-Za-z0-9_$#]*(?:\.[A-Za-z_][A-Za-z0-9_$#]*){0,3}"
+_IDENTIFIER = re.compile(rf"^{_ENTITY_NAME}$")
+#: 反引号里写了这些不算名字：SQL 关键字、字面量、常用函数
+_SQL_WORDS = frozenset({
+    "null", "true", "false", "none", "nan", "select", "from", "where", "group", "order", "by", "having", "limit",
+    "join", "left", "right", "inner", "outer", "on", "as", "and", "or", "not", "in", "is", "like", "between",
+    "case", "when", "then", "else", "end", "distinct", "union", "all", "with", "sum", "count", "avg", "min",
+    "max", "asc", "desc", "date", "now", "offset", "insert", "update", "delete"})
+#: 正文里的裸名字：这些常用英文词就算恰好是表名也不自动链接，免得满屏下划线
+_COMMON_WORDS = frozenset({
+    "id", "name", "date", "time", "type", "status", "value", "data", "info", "key", "code", "text", "title",
+    "count", "sum", "total", "year", "month", "day", "week", "user", "users", "item", "items", "list", "table",
+    "log", "note", "notes", "order", "group", "level", "rank", "score", "price", "amount", "region",
+    "city", "source", "target", "event", "events", "result", "results", "report", "detail", "details"})
+
+
+class _EntityIndex:
+    """按名字找目录里的表和字段。不分大小写；全名（schema.表）和末段都认。
+
+    表和字段的查法分开（t: 只找表，c: 只找字段）。正文里的名字两样都试：先整名当表，再当
+    字段（表.字段、只有字段名），最后才把 schema.表 按末段认成表——「orders.amount」不能因为
+    恰好有一张叫 amount 的表就认成表。
+    """
+
+    def __init__(self, catalog: dict[str, Any]) -> None:
+        self.catalog = catalog
+        self.tables: dict[str, str] = {}
+        self.columns: dict[str, str] = {}
+        self.owners: dict[str, list[str]] = {}
+        self.others: set[str] = set()
+        self.described: set[str] = set()           # 表结构快照里列出了全部字段的表（目录键）
+        self.partial = False                       # 有表结构快照不全（探查时被截断）
+        for alias, entry in catalog.items():
+            if not isinstance(entry, dict):
+                continue
+            kind, locator = entry.get("kind"), entry.get("locator") or {}
+            if kind == "table":
+                frozen = [o for o in entry.get("sources") or [] if isinstance(o, dict) and o.get("kind") == "schema"]
+                if frozen:
+                    self.described.add(alias)
+                    self.partial = self.partial or any(o.get("truncated") for o in frozen)
+                name = str(entry.get("name") or alias[2:])
+                for key in (name, entry.get("qualified"), name.rsplit(".", 1)[-1]):
+                    if key:
+                        self.tables.setdefault(str(key).lower(), alias)
+            elif kind == "column":
+                col = str(locator.get("column") or entry.get("name") or "")
+                if locator.get("table"):
+                    self.columns.setdefault(f"{locator['table']}.{col}".lower(), alias)
+                    self.owners.setdefault(col.lower(), []).append(alias)
+                else:
+                    self.columns.setdefault(col.lower(), alias)
+            elif kind == "metric":
+                self.others.add(str(locator.get("metric") or "").lower())
+            elif kind == "input":
+                self.others.add(str(locator.get("field") or "").lower())
+            self.others.add(alias.lower())
+        self.active = bool(self.tables or self.columns)
+
+    def table(self, name: str, *, tail: bool = True) -> str | None:
+        lowered = name.lower()
+        hit = self.tables.get(lowered)
+        if hit is None and tail and "." in lowered:
+            hit = self.tables.get(lowered.rsplit(".", 1)[-1])
+        return hit
+
+    def column(self, name: str) -> str | None:
+        lowered = name.lower()
+        if lowered in self.columns:
+            return self.columns[lowered]
+        if "." in lowered:
+            head, col = lowered.rsplit(".", 1)
+            owner = self.table(head)
+            if owner is None:
+                return None
+            return self.columns.get(f"{self.catalog[owner]['name']}.{col}".lower())
+        mine = self.owners.get(lowered) or []
+        return mine[0] if len(mine) == 1 else None
+
+    def find(self, name: str, kind: str | None = None) -> tuple[str, str] | None:
+        """(table | column, alias)，找不到返回 None。"""
+        if kind in (None, "table") and (hit := self.table(name, tail=kind == "table")):
+            return "table", hit
+        if kind in (None, "column") and (hit := self.column(name)):
+            return "column", hit
+        if kind is None and (hit := self.table(name)):
+            return "table", hit
+        return None
+
+    def known(self, name: str) -> bool:
+        """这个名字在这次运行里有没有出处：表、字段，或者指标 id、运行输入、证据编号。"""
+        return self.find(name) is not None or name.lower() in self.others
+
+    def unsure(self, name: str) -> bool:
+        """一个找不到的名字是不是只能说「核对不了」：表结构快照不全时，它可能在没存下来的表里。
+
+        快照里列出的表，字段是全的：「orders.ghost」里的 orders 在快照里，ghost 找不到就是真没有。
+        """
+        if not self.partial:
+            return False
+        head = name.rsplit(".", 1)[0] if "." in name else ""
+        owner = self.table(head) if head else None
+        return owner is None or owner not in self.described
+
+
+def find_entity(name: str, catalog: dict[str, Any], kind: str | None = None) -> str | None:
+    """按名字找表或字段的目录键（t:orders、c:orders.amount），找不到返回 None。kind 为 table / column 时只找那一种。"""
+    hit = _EntityIndex(catalog).find(name.strip(), kind)
+    return hit[1] if hit else None
+
+
+def closest_entities(name: str, catalog: dict[str, Any], *, limit: int = 3) -> list[str]:
+    """和一个可疑的名字最像的已知表、字段（目录键，最多 limit 个），给「你是不是想写…」用。"""
+    names: dict[str, str] = {}
+    for alias, entry in catalog.items():
+        if isinstance(entry, dict) and entry.get("kind") in ENTITY_KINDS:
+            names.setdefault(alias[2:].lower(), alias)
+            names.setdefault(str(entry.get("name") or "").lower(), alias)
+    names.pop("", None)
+    picked = difflib.get_close_matches(name.strip().lower(), list(names), n=limit * 3, cutoff=0.6)
+    return list(dict.fromkeys(names[p] for p in picked))[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -626,42 +1091,69 @@ Loader = Callable[[str], Any]
 
 
 class _Snapshots:
-    """这一次解析里取过的查询快照。
+    """这一次解析里取过的快照（查询、检索），以及按名字找表和字段的索引。
 
     一张整表每一格都要读同一份快照，每格都读盘、复验一次哈希不值。缓存只活在这一次
     compose / verify / 流式渲染里：出口复核是另一次调用，照样重新取、重新验。
     """
 
-    def __init__(self, loader: Loader | None = None) -> None:
+    def __init__(self, loader: Loader | None = None, *, entities: bool = True) -> None:
         self.loader = loader or load_artifact
         self.memo: dict[str, tuple[Any, str | None]] = {}
+        self._index: tuple[dict[str, Any], _EntityIndex] | None = None
+        #: False：报告节点写了 entities: off，目录里就算有表和字段也整层不管
+        self.entities_on = entities
+
+    def entities(self, catalog: dict[str, Any]) -> _EntityIndex:
+        if self._index is None or self._index[0] is not catalog:
+            shown = catalog if self.entities_on else \
+                {a: e for a, e in catalog.items() if not (isinstance(e, dict) and e.get("kind") in ENTITY_KINDS)}
+            self._index = (catalog, _EntityIndex(shown))
+        return self._index[1]
 
     def get(self, alias: str, artifact: Any) -> tuple[Any, str | None]:
-        """(快照内容, 取不到的原因)。原因以 alias 开头，能直接当 unresolved 的 reason。"""
+        """查询快照：(内容, 取不到的原因)。原因以 alias 开头，能直接当 unresolved 的 reason。"""
+        content, why = self._fetch(artifact, "查询快照")
+        if why is None and (not isinstance(content, dict) or not isinstance(content.get("rows"), list)):
+            why = "的快照里没有表格数据"
+        return (None, f"{alias} {why}") if why else (content, None)
+
+    def hits(self, alias: str, artifact: Any) -> tuple[list[Any], str | None]:
+        """检索快照里的命中：(命中列表, 取不到的原因)。"""
+        content, why = self._fetch(artifact, "检索快照")
+        if why is None and (not isinstance(content, dict) or not isinstance(content.get("hits"), list)):
+            why = "的快照里没有检索命中"
+        return ([], f"{alias} {why}") if why else (content["hits"], None)
+
+    def _fetch(self, artifact: Any, noun: str) -> tuple[Any, str | None]:
         key = str(artifact or "")
         if key not in self.memo:
-            self.memo[key] = self._fetch(key)
-        content, why = self.memo[key]
-        return content, (f"{alias} {why}" if why else None)
+            self.memo[key] = self._load(key)
+        content, problem = self.memo[key]
+        if problem is None:
+            return content, None
+        if problem == "missing":
+            return None, f"没有{noun}"
+        if problem == "tampered":
+            return None, f"的{noun}和哈希对不上，疑似被改过"
+        if problem == "absent":
+            return None, f"的{noun}取不回来（工件 {key[:12]}… 不存在）"
+        return None, f"的{noun}取不回来（{problem}）"
 
-    def _fetch(self, artifact: str) -> tuple[Any, str | None]:
+    def _load(self, artifact: str) -> tuple[Any, str | None]:
         if not artifact:
-            return None, "没有查询快照"
+            return None, "missing"
         try:
             content = self.loader(artifact)
         except ValueError:
-            return None, "的查询快照和哈希对不上，疑似被改过"
+            return None, "tampered"
         except Exception as e:  # noqa: BLE001 - 取不回来就是解析不了，不能让整篇报告崩掉
-            return None, f"的查询快照取不回来（{type(e).__name__}）"
-        if content is None:
-            return None, f"的查询快照取不回来（工件 {artifact[:12]}… 不存在）"
-        if not isinstance(content, dict) or not isinstance(content.get("rows"), list):
-            return None, "的快照里没有表格数据"
-        return content, None
+            return None, type(e).__name__
+        return (None, "absent") if content is None else (content, None)
 
 
-def _snapshots(loader: Loader | _Snapshots | None) -> _Snapshots:
-    return loader if isinstance(loader, _Snapshots) else _Snapshots(loader)
+def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True) -> _Snapshots:
+    return loader if isinstance(loader, _Snapshots) else _Snapshots(loader, entities=entities)
 
 
 _CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
@@ -849,14 +1341,14 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
         # 整篇渲染时整表已经按上下文展开过了，走到这里的是复核一个片段：给出不带上下文的样子
         return {"ref": ref, "alias": ref, "locator": {}, "eid": catalog[ref]["eid"], "kind": "query",
                 "role": "value", "status": "resolved", "rendered": _render(table or "", catalog, snaps, cells_allowed)}
-    if kind in LATER_KINDS:
-        alias = {"t": f"t:{ref}", "c": f"c:{ref}"}.get(kind, ref.split(".")[0])
-        ev_kind = {"t": "table", "c": "column", "q": "quote"}[kind]
-        return _unresolved(marker, alias, ev_kind, LATER_REASON)
+    if kind in ("t", "c"):
+        return _resolve_entity(marker, catalog, _snapshots(loader))
+    if kind == "q":
+        return _resolve_quote(marker, catalog, _snapshots(loader))
     if kind not in ("m", "i"):
         return _unresolved(marker, f"{kind}:{ref}", kind,
                            f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
-                           "i（运行输入）、see（依据）")
+                           "i（运行输入）、t / c（表 / 字段）、q（引文）、see（依据）")
 
     conv = marker.get("conv")
     if kind == "m":
@@ -891,16 +1383,149 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
     return cite
 
 
+def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots) -> dict[str, Any]:
+    """[[t:orders]] / [[c:orders.amount]]：显示名字本身（照写作者写的大小写），出处是目录里的表或字段。
+
+    报告节点关掉了实体层（entities: off）时照实说关掉了；这次运行没冻结表结构时没有东西可以核对，
+    按一期的样子判为解析不了。名字哪里都找不到的是可疑实体（unknown: True）：它不是写法错了，是可能
+    编造了一个名字——出口按缺口处理，不拦。表结构快照不全时找不到的名字只是核对不了（unverified: True）。
+    """
+    kind, ref = marker["kind"], (marker.get("ref") or "").strip()
+    ev_kind, other = ("table", "column") if kind == "t" else ("column", "table")
+    alias = f"{kind}:{ref}"
+    index = snaps.entities(catalog)
+    if not snaps.entities_on:
+        return _unresolved(marker, alias, ev_kind, ENTITIES_OFF_REASON)
+    if not index.active:
+        return _unresolved(marker, alias, ev_kind, LATER_REASON)
+    if not ref or not _IDENTIFIER.match(ref):
+        return _unresolved(marker, alias, ev_kind, "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，"
+                           "名字是字母或下划线开头的标识符")
+    hit = index.find(ref, ev_kind)
+    if hit is None:
+        if index.find(ref, other):
+            right = "c" if kind == "t" else "t"
+            return _unresolved(marker, alias, ev_kind, f"{ref} 是{'字段' if kind == 't' else '表'}，"
+                               f"不是{'表' if kind == 't' else '字段'}：写成 [[{right}:{ref}]]")
+        if index.unsure(ref):
+            cite = _unresolved(marker, alias, ev_kind, UNVERIFIED_ENTITY_REASON, rendered=ref)
+            cite["unverified"] = True
+            return cite
+        cite = _unresolved(marker, alias, ev_kind, UNKNOWN_ENTITY_REASON, rendered=ref)
+        cite["unknown"] = True
+        return cite
+    entry = catalog[hit[1]]
+    return {"ref": ref, "alias": hit[1], "locator": dict(entry.get("locator") or {}), "eid": entry["eid"],
+            "kind": ev_kind, "role": "entity", "status": "resolved", "rendered": ref}
+
+
+# --------------------------------------------------------------------------
+# 引文：[[q:K1|原话]] 要在检索快照的命中片段里逐字出现
+# --------------------------------------------------------------------------
+
+#: 引文至少几个字（空白归一化之后）：「东区」这种两个字的「原话」哪里都找得到，证明不了什么
+QUOTE_MIN = 4
+
+
+def _wide(ch: str) -> bool:
+    """中日韩文字和全角标点：它们之间的空白是排版（换行、PDF 断行），不是词的分隔。"""
+    code = ord(ch)
+    return (0x2E80 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF or 0xFF00 <= code <= 0xFFEF
+            or 0x3000 <= code <= 0x303F)
+
+
+def _normalized(text: str) -> tuple[str, list[int]]:
+    """空白归一化：连续空白并成一个空格、去掉首尾，挨着中文或全角字符的空白直接去掉。
+
+    同时记下归一化后每个字在原文里的位置，命中之后能换算回原文的起止。
+    """
+    out: list[str] = []
+    where: list[int] = []
+    gap: int | None = None
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if out and gap is None:
+                gap = i
+            continue
+        if gap is not None and not (_wide(out[-1]) or _wide(ch)):
+            out.append(" ")
+            where.append(gap)
+        gap = None
+        out.append(ch)
+        where.append(i)
+    return "".join(out), where
+
+
+def normalize_quote(text: str) -> str:
+    """引文比对前的样子：见 _normalized。大小写、标点、全半角都不改——要的是逐字。"""
+    return _normalized(text or "")[0]
+
+
+def find_quote(quote: str, hits: list[Any]) -> tuple[int, int, int] | None:
+    """引文落在哪条命中、原文里的 [起, 止)。按命中的顺序找第一处；找不到返回 None。"""
+    wanted = normalize_quote(quote)
+    if not wanted:
+        return None
+    for i, hit in enumerate(hits):
+        content = hit.get("content") if isinstance(hit, dict) else None
+        if not isinstance(content, str):
+            continue
+        flat, where = _normalized(content)
+        at = flat.find(wanted)
+        if at >= 0:
+            return i, where[at], where[at + len(wanted) - 1] + 1
+    return None
+
+
+def _resolve_quote(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots) -> dict[str, Any]:
+    """引文显示引文本身；原话对不上时照样显示（写作者的话），只是标成没有出处。
+
+    目录里没有这次检索、快照取不回来时没有东西可以对，和别的解析不了的引用一样显示占位。
+    """
+    alias = (marker.get("ref") or "").strip()
+    quote = _clean(str(marker.get("quote") or ""))
+    entry = catalog.get(alias)
+    if entry is None:
+        return _unresolved(marker, alias, "quote", f"目录里没有 {alias}（能引原话的知识库检索见证据目录）")
+    if entry.get("kind") != "retrieval":
+        return _unresolved(marker, alias, "quote", f"{alias} 不是知识库检索：引文只能引检索命中的原文")
+    if not quote:
+        return _unresolved(marker, alias, "quote", "引文是空的：写成 [[q:K1|原话]]")
+    hits, why = snaps.hits(alias, entry.get("artifact"))
+    if why:
+        return _unresolved(marker, alias, "quote", why)
+    if len(normalize_quote(quote)) < QUOTE_MIN:
+        return _unresolved(marker, alias, "quote", f"引文太短（至少 {QUOTE_MIN} 个字），看不出是不是原话",
+                           rendered=quote)
+    found = find_quote(quote, hits)
+    if found is None:
+        return _unresolved(marker, alias, "quote", f"{alias} 的命中片段里找不到这句原话（空白归一化后逐字比对）："
+                           "引文要一字不差地抄原文", rendered=quote)
+    at, start, end = found
+    hit = hits[at]
+    locator = {"hit": at, "start": start, "end": end}
+    source = {"artifact": entry.get("artifact"), "document": hit.get("document_id"), "chunk": hit.get("chunk_id"),
+              "title": hit.get("title"), "ordinal": hit.get("ordinal")}
+    return {"ref": alias, "alias": alias, "locator": locator, "eid": make_eid("quote", entry.get("artifact"), locator),
+            "kind": "quote", "role": "quote", "status": "resolved", "rendered": quote,
+            "source": {k: v for k, v in source.items() if v is not None}}
+
+
 _ROW_REF = re.compile(r"^(?P<alias>[QK]\d+)(?:\.r(?P<row>\d+))?$")
 
 
-def resolve_support(ref: str, catalog: dict[str, Any]) -> dict[str, Any]:
-    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2。只核对「这件证据存在」。"""
+def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
+    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2、t:orders、c:orders.amount。只核对「这件证据存在」。"""
     ref = ref.strip()
     kind, sep, body = ref.partition(":")
     base = {"ref": ref, "role": "support"}
-    if sep and kind in LATER_KINDS:
-        return {**base, "alias": ref, "kind": kind, "status": "unresolved", "reason": LATER_REASON}
+    if sep and kind in ("t", "c"):
+        cite = _resolve_entity({"kind": kind, "ref": body, "body": body}, catalog, _snapshots(loader))
+        return {**base, **{k: cite[k] for k in ("alias", "kind", "status", "eid", "locator", "reason", "unknown",
+                                                "unverified") if k in cite}}
+    if sep and kind == "q":
+        return {**base, "alias": ref, "kind": "quote", "status": "unresolved",
+                "reason": "引文不能当依据：依据写那次检索的编号，比如 [[see:K1]]"}
     alias: str | None = None
     locator: dict[str, Any] = {}
     why = f"目录里没有 {ref}"
@@ -1396,14 +2021,117 @@ def _normalize_strong(raw: str) -> tuple[str, list[tuple[int, int]]]:
     return "".join(out), ranges
 
 
+# --------------------------------------------------------------------------
+# 实体的自动链接：反引号里的名字一律核对，正文里的裸名字只链接明显是标识符的
+# --------------------------------------------------------------------------
+
+_CODE_NAME = re.compile(r"^`([^`\n]+)`$")
+#: 复核时找反引号：粗体、链接里面的也算——组装时它们没切成片段（切开会拆坏粗体），违规照记
+_CODE_SPAN = re.compile(r"(?<![`\\])`([^`\n]+?)`(?!`)")
+_BARE_NAME = re.compile(rf"(?<![A-Za-z0-9_$#.`/\\@]){_ENTITY_NAME}(?![A-Za-z0-9_$#])")
+
+
+def _checked_name(name: str) -> bool:
+    """反引号里的这段是不是要核对的名字：像标识符、不止一个字、不是 SQL 关键字和常用函数。"""
+    return len(name) >= 2 and bool(_IDENTIFIER.match(name)) and name.lower() not in _SQL_WORDS
+
+
+def _bare_link(name: str, catalog: dict[str, Any], index: _EntityIndex) -> tuple[str, str] | None:
+    """正文里的裸名字要不要自动链接：保守，只链接一眼就是标识符的。
+
+    表.列 这种全名、和表名一字不差的（大小写也一样）、带下划线或数字或大小写混排的（order_id、
+    orderId）才链接；name、date、id 这类常用词，哪怕恰好是字段名、表名，也不链接，免得满屏下划线。
+    """
+    if name.lower() in _COMMON_WORDS:
+        return None
+    hit = index.find(name)
+    if hit is None:
+        return None
+    entry = catalog[hit[1]]
+    if "." in name or (hit[0] == "table" and name in (entry.get("name"), entry.get("qualified"))):
+        return hit
+    mixed = any(ch.isupper() for ch in name[1:]) and any(ch.islower() for ch in name)
+    if "_" in name or any(ch.isdigit() for ch in name) or mixed:
+        return hit
+    return None
+
+
+def _entity_segment(name: str, hit: tuple[str, str], catalog: dict[str, Any], *, code: bool) -> dict[str, Any]:
+    kind, alias = hit
+    entry = catalog[alias]
+    cite = {"ref": name, "alias": alias, "locator": dict(entry.get("locator") or {}), "eid": entry["eid"],
+            "kind": kind, "role": "entity", "status": "resolved", "rendered": name}
+    seg = {"kind": "entity", "text": f"`{name}`" if code else name, "ref": f"{'t' if kind == 'table' else 'c'}:{name}",
+           "cite": cite, "state": "deterministic", "auto": True}
+    if code:
+        seg["code"] = True
+    return seg
+
+
+def _mentions(text: str, catalog: dict[str, Any], index: _EntityIndex) -> list[tuple[int, int, dict[str, Any]]]:
+    """一段文字里要切出来的实体：(起, 止, 片段)。只切顶层的行内代码和粗体、链接外面的裸名字。"""
+    found: list[tuple[int, int, dict[str, Any]]] = []
+    protected: list[tuple[int, int]] = []
+    for m in _INLINE.finditer(text):
+        protected.append((m.start(), m.end()))
+        code = _CODE_NAME.match(m.group(0))
+        name = code.group(1) if code else ""
+        if not code or not _checked_name(name):
+            continue
+        if hit := index.find(name):
+            found.append((m.start(), m.end(), _entity_segment(name, hit, catalog, code=True)))
+        elif not index.known(name):
+            issue = "unverified_entity" if index.unsure(name) else "unknown_entity"
+            found.append((m.start(), m.end(), {"kind": "entity", "text": m.group(0), "state": "none",
+                                               "issue": issue, "code": True, "name": name}))
+    for m in _BARE_NAME.finditer(text):
+        if any(a <= m.start() < b for a, b in protected):
+            continue
+        if hit := _bare_link(m.group(0), catalog, index):
+            found.append((m.start(), m.end(), _entity_segment(m.group(0), hit, catalog, code=False)))
+    return sorted(found, key=lambda f: f[0])
+
+
+def _link_entities(segments: list[dict[str, Any]], catalog: dict[str, Any],
+                   index: _EntityIndex) -> list[dict[str, Any]]:
+    """把文字片段里的表名、字段名切成实体片段。只重新切片，正文一个字不改。"""
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        found = _mentions(seg["text"], catalog, index) if seg["kind"] == "text" else []
+        if not found:
+            out.append(seg)
+            continue
+        s0, text = seg["span"][0], seg["text"]
+        extra = {"strong": True} if seg.get("strong") else {}
+        cursor = 0
+        for a, b, piece in found:
+            if cursor < a:
+                out.append({"kind": "text", "text": text[cursor:a], "span": [s0 + cursor, s0 + a],
+                            "state": seg["state"], **extra})
+            out.append({**piece, "span": [s0 + a, s0 + b], **extra})
+            cursor = b
+        if cursor < len(text):
+            out.append({"kind": "text", "text": text[cursor:], "span": [s0 + cursor, s0 + len(text)],
+                        "state": seg["state"], **extra})
+    return out
+
+
+def _auto_entity(seg: dict[str, Any]) -> bool:
+    """系统在正文里自动切出来的实体片段（自动链接的名字、反引号里的可疑名字），不是写作者写的标记。"""
+    return seg.get("kind") == "entity" and (bool(seg.get("auto")) or not seg.get("ref"))
+
+
 def _classify(kind: str | None, segments: list[dict[str, Any]], see: list[dict[str, Any]]) -> str:
     """unit 的种类。本期没有裁判，按确定的规则分：引用了证据、写了数字、或者有方向词、
-    因果词的算结论；其余的是连接性的话。"""
+    因果词的算结论；其余的是连接性的话。
+
+    自动链接的名字按文字算：它只是把正文重新切了一刀，句子算不算结论和开没开实体层无关。
+    """
     if kind:
         return kind
-    if see or any(s["kind"] != "text" and s["kind"] != "structural" for s in segments):
+    if see or any(s["kind"] not in ("text", "structural") and not _auto_entity(s) for s in segments):
         return "claim"
-    if any(s["kind"] == "text" and _DIRECTIONAL.search(s["text"]) for s in segments):
+    if any((s["kind"] == "text" or _auto_entity(s)) and _DIRECTIONAL.search(s["text"]) for s in segments):
         return "claim"
     return "connective"
 
@@ -1417,15 +2145,19 @@ def compose_doc(
     allow_numbers: list[Any] | None = None,
     cells_allowed: bool = True,
     loader: Loader | None = None,
+    entities: bool = True,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
+
+    entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
+    [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
     doc["source"] 仍是模型的原文。
     """
     source = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    snaps = _Snapshots(loader)
+    snaps = _Snapshots(loader, entities=entities)
     text, strong = _normalize_strong(_expand_tables(source, catalog, snaps, cells_allowed))
     markers = parse_markers(text)
     for marker in markers:
@@ -1485,7 +2217,7 @@ def compose_doc(
                             plain(cursor, marker["start"])
                         cursor = marker["end"]
                         if marker["kind"] == "see":
-                            see.extend(resolve_support(r, catalog) for r in marker["refs"])
+                            see.extend(resolve_support(r, catalog, loader=snaps) for r in marker["refs"])
                             continue
                         cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
                         ok = cite["status"] == "resolved"
@@ -1497,7 +2229,10 @@ def compose_doc(
                             "cite": cite, "state": "deterministic" if ok else "none",
                         }
                         if not ok:
-                            seg["issue"] = "unresolved_ref"
+                            # 实体名字哪里都找不到：可疑实体，不是写法错了（出口只按缺口处理）；
+                            # 表结构快照不全时只是核对不了（出口只标注）
+                            seg["issue"] = "unknown_entity" if cite.get("unknown") else \
+                                "unverified_entity" if cite.get("unverified") else "unresolved_ref"
                         if marker["strong"]:
                             seg["strong"] = True
                         push(seg, segments)
@@ -1514,6 +2249,14 @@ def compose_doc(
         out_blocks.append({"type": block.type, **block.meta, "units": units})
 
     markdown = "".join(parts)
+    index = snaps.entities(catalog)
+    if index.active:
+        # 表名、字段名切成实体片段（代码块里的不算：那是 SQL 原文，不是在报告里提到一个名字）
+        for block in out_blocks:
+            if block["type"] != "code":
+                for unit in block["units"]:
+                    unit["segments"] = _link_entities(unit["segments"], catalog, index)
+        all_segments = [s for block in out_blocks for unit in block["units"] for s in unit["segments"]]
     # 裸数字单独切成片段：前端要在那几个字底下画「无出处」
     refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog)
     syntax = [tuple(s["span"]) for s in all_segments if s["kind"] == "structural"]
@@ -1535,8 +2278,11 @@ def compose_doc(
             anchor = unit.pop("_anchor")
             unit["span"] = [body[0]["span"][0], body[-1]["span"][1]] if body else [anchor, anchor]
             unit["kind"] = _classify(unit["kind"], unit["segments"], unit["see"])
+            # 这句话挂的依据：只认写作者自己写的标记和 [[see:]]。自动链接的名字是系统加的标注，
+            # 提一个字段名不等于给结论挂了出处（claims: require_citation 按这个判）
             unit["cites"] = list(dict.fromkeys(
-                c["alias"] for c in [*(s["cite"] for s in unit["segments"] if s.get("cite")), *unit["see"]]
+                c["alias"] for c in [*(s["cite"] for s in unit["segments"] if s.get("cite") and not s.get("auto")),
+                                     *unit["see"]]
                 if c["status"] == "resolved"))
             # 字段顺序固定，文档内容寻址，同样的输入要得到同样的哈希
             ordered = {k: unit[k] for k in ("id", "kind", "span", "cites", "see", "segments", "loc", "depth")
@@ -1544,9 +2290,15 @@ def compose_doc(
             unit.clear()
             unit.update(ordered)
 
+    # 表结构可能有几百张表、几千个字段：文档里只留正文用到的实体条目（复核用的是重建的目录，不看这份）。
+    # 自动链接的名字不进 cites，但点开它要查这份目录，所以按片段自己的 cite 收
+    used = {c["alias"] for block in out_blocks for unit in block["units"]
+            for c in [*(s["cite"] for s in unit["segments"] if s.get("cite")), *unit["see"]]
+            if c.get("status") == "resolved" and c.get("alias")}
+    kept = {a: e for a, e in catalog.items() if e.get("kind") not in ENTITY_KINDS or a in used}
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "run_id": run_id, "node_id": node_id,
-        "markdown": markdown, "source": source, "catalog": catalog, "blocks": out_blocks,
+        "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
     doc["stats"], doc["violations"] = checked["stats"], checked["violations"]
@@ -1653,11 +2405,13 @@ def verify_doc(
     allow_numbers: list[Any] | None = None,
     cells_allowed: bool = True,
     loader: Loader | _Snapshots | None = None,
+    entities: bool = True,
 ) -> dict[str, Any]:
-    """逐项复核一份报告文档：{ok, violations, stats}。
+    """逐项复核一份报告文档：{ok, violations, stats, uncited}。
 
     cells_allowed=False：单元格引用（含整表里的格）一律判解析不了，原因是 CELLS_REASON——
     受管级别的正式出具，契约没声明 cells 时出口复核这样调。快照经 loader 重新取、复验哈希。
+    entities=False：报告节点写了 entities: off，和组装时一样整层不管表名、字段名。
 
     报告节点自查用它（违规就让写作者重写），出口契约复核也用它（判档）——后者传的
     是自己从状态里重建的目录，不用文档里存的那份。复核什么：
@@ -1668,16 +2422,31 @@ def verify_doc(
     - [[see:]] 里的每个依据都能解析
     - 引用涂白、结构片段只涂符号之后，正文里剩下的数字全部算裸数字（结构片段里的
       「100. 」「```45678」也在内）
+    - 目录里有表和字段时（这次运行冻结了表结构）：反引号里像标识符、却哪里都找不到的名字
+      全部算可疑实体（unknown_entity）——不管文档有没有把它切成片段，粗体、链接里的也算；
+      表结构快照不全时，这样的名字只算核对不了（unverified_entity）
+    - 引文重新取检索快照、重新逐字比对
     - 片段标的状态和核对结果一致（界面按状态画线，不能标着「有出处」其实没有）
+
+    另外返回 uncited：没挂依据的结论句 [{unit, span, text}]（按这次核对的引用算，不信文档里的 cites；
+    自动链接的名字不算依据）。
+
+    stats 里 entities、quotes、unknown_entities、unverified_entities 四个键只在目录里有表和字段、或者
+    有知识库检索时才有（它们才可能不是 0）：升级前的运行统计的键和以前一模一样。
     """
-    snaps = _snapshots(loader)
+    snaps = _snapshots(loader, entities=entities)
+    index = snaps.entities(catalog)
     violations: list[dict[str, Any]] = []
+    uncited: list[dict[str, Any]] = []
+    layered = index.active or any(isinstance(e, dict) and e.get("kind") == "retrieval" for e in catalog.values())
     stats = {"units": 0, "segments": 0, "claims": 0, "connective": 0, "headings": 0, "numbers": 0,
-             "numbers_cited": 0, "values": 0, "uncited_numbers": 0, "unresolved": 0, "see": 0,
-             "uncited_claims": 0, "violations": 0}
+             "numbers_cited": 0, "values": 0, **({"entities": 0, "quotes": 0} if layered else {}),
+             "uncited_numbers": 0, "unresolved": 0,
+             **({"unknown_entities": 0, "unverified_entities": 0} if layered else {}),
+             "see": 0, "uncited_claims": 0, "violations": 0}
     if not isinstance(doc, dict):
         violations.append(_violation("bad_schema", "报告文档不是一个对象"))
-        return {"ok": False, "violations": violations, "stats": stats}
+        return {"ok": False, "violations": violations, "stats": stats, "uncited": uncited}
     if doc.get("schema") != DOC_SCHEMA:
         violations.append(_violation("bad_schema", f"不认识的报告文档格式 {doc.get('schema')!r}"))
 
@@ -1686,7 +2455,7 @@ def verify_doc(
     syntax: list[tuple[int, int]] = []                 # 结构片段：只涂符号，数字照查
     owners: list[tuple[int, int, str, str]] = []        # (start, end, segment id, unit id)
     pos, tiled = 0, True
-    for _, unit in iter_units(doc):
+    for block, unit in iter_units(doc):
         stats["units"] += 1
         kind = unit.get("kind")
         if kind in ("claim", "connective"):
@@ -1720,17 +2489,26 @@ def verify_doc(
                                                  f"结构片段里夹带了内容「{text[:30]}」", **where))
             elif seg.get("ref"):
                 ref = str(seg["ref"])
-                cite = resolve_ref(ref, catalog, cells_allowed=cells_allowed, loader=snaps)
+                cite = _phase_two_cite(seg, ref, text) \
+                    or resolve_ref(ref, catalog, cells_allowed=cells_allowed, loader=snaps)
                 ok = cite["status"] == "resolved"
-                matches = cite["rendered"] == text
+                # 反引号里的实体：片段的字带着两个反引号
+                shown = f"`{cite['rendered']}`" if seg.get("code") and seg.get("kind") == "entity" else cite["rendered"]
+                matches = shown == text
                 if intact:
                     masks.append((span[0], span[1]))
-                if not ok:
+                if not ok and cite.get("unknown"):
+                    violations.append(_violation("unknown_entity", _unknown_message(cite.get("ref") or ref),
+                                                 ref=ref, **where))
+                elif not ok and cite.get("unverified"):
+                    violations.append(_violation("unverified_entity", _unverified_message(cite.get("ref") or ref),
+                                                 ref=ref, **where))
+                elif not ok:
                     violations.append(_violation("unresolved_ref", f"引用 [[{ref}]] 解析不了：{cite['reason']}",
                                                  ref=ref, **where))
                 elif not matches:
                     violations.append(_violation(
-                        "render_mismatch", f"片段「{text}」和引用 [[{ref}]] 重新渲染出来的「{cite['rendered']}」"
+                        "render_mismatch", f"片段「{text}」和引用 [[{ref}]] 重新渲染出来的「{shown}」"
                         "对不上", ref=ref, **where))
                 elif (seg.get("cite") or {}).get("eid") not in (None, cite["eid"]):
                     violations.append(_violation("eid_mismatch", f"引用 [[{ref}]] 记的证据标识和目录里的不一致，"
@@ -1741,13 +2519,30 @@ def verify_doc(
                     stats["numbers"] += 1
                     stats["numbers_cited"] += int(good)
                 elif good:
-                    stats["values"] += 1
-                if ok:
+                    key = {"entity": "entities", "quote": "quotes"}.get(seg.get("kind"), "values")
+                    stats[key if key in stats else "values"] += 1
+                if ok and not seg.get("auto"):
+                    # 自动链接的名字是标注，不是写作者给这句话挂的依据
                     cited.append(cite["alias"])
             elif seg.get("kind") == "number":
                 expected = "none"
+            elif seg.get("kind") == "entity":
+                # 可疑实体（没有引用）：反引号里那个名字这次核对下来确实哪里都没有，才该标 none
+                code = _CODE_NAME.match(text)
+                expected = "none" if code and index.active and not index.known(code.group(1)) else "neutral"
             elif state == "deterministic":
                 expected = "neutral"
+            if seg.get("kind") in ("text", "entity") and not seg.get("ref") and index.active \
+                    and block.get("type") != "code":
+                for m in _CODE_SPAN.finditer(text):
+                    name = m.group(1)
+                    if _checked_name(name) and not index.known(name):
+                        at = [span[0] + m.start(1), span[0] + m.end(1)] if intact else None
+                        unsure = index.unsure(name)
+                        violations.append(_violation("unverified_entity" if unsure else "unknown_entity",
+                                                     (_unverified_message if unsure else _unknown_message)(name),
+                                                     span=at, text=name, segment=seg.get("id"), unit=unit.get("id"),
+                                                     context=_context(markdown, *at) if at else None))
             # 已经为这一段报过别的问题，状态不对是它的推论，不再重复
             if expected is not None and state != expected and len(violations) == found:
                 violations.append(_violation("state_mismatch",
@@ -1755,9 +2550,16 @@ def verify_doc(
                                              **where))
         for support in unit.get("see") or []:
             stats["see"] += 1
-            again = resolve_support(str(support.get("ref") or ""), catalog)
+            again = resolve_support(str(support.get("ref") or ""), catalog, loader=snaps)
             if again["status"] == "resolved":
                 cited.append(again["alias"])
+            elif again.get("unknown") or again.get("unverified"):
+                unsure = bool(again.get("unverified"))
+                violations.append(_violation("unverified_entity" if unsure else "unknown_entity",
+                                             (_unverified_message if unsure else _unknown_message)(
+                                                 again["ref"].partition(":")[2]),
+                                             ref=again["ref"], unit=unit.get("id"),
+                                             span=list(unit.get("span") or []) or None))
             else:
                 violations.append(_violation("unresolved_ref",
                                              f"依据 [[see:{again['ref']}]] 解析不了：{again['reason']}",
@@ -1765,6 +2567,10 @@ def verify_doc(
                                              span=list(unit.get("span") or []) or None))
         if kind == "claim" and not cited:
             stats["uncited_claims"] += 1
+            where = unit.get("span")
+            ok_span = isinstance(where, list) and len(where) == 2 and all(isinstance(x, int) for x in where)
+            uncited.append({"unit": unit.get("id"), "span": list(where) if ok_span else None,
+                            "text": markdown[where[0]:where[1]] if ok_span else ""})
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不在任何片段里：文档可能被改过"))
 
@@ -1781,8 +2587,48 @@ def verify_doc(
     stats["uncited_numbers"] = sum(1 for v in violations if v["code"] == "uncited_number")
     stats["numbers"] += stats["uncited_numbers"]
     stats["unresolved"] = sum(1 for v in violations if v["code"] == "unresolved_ref")
+    if layered:
+        stats["unknown_entities"] = sum(1 for v in violations if v["code"] == "unknown_entity")
+        stats["unverified_entities"] = sum(1 for v in violations if v["code"] == "unverified_entity")
     stats["violations"] = len(violations)
-    return {"ok": not violations, "violations": violations, "stats": stats}
+    return {"ok": not violations, "violations": violations, "stats": stats, "uncited": uncited}
+
+
+def _phase_two_cite(seg: dict[str, Any], ref: str, text: str) -> dict[str, Any] | None:
+    """升级前（二期）组装的文档里的 t / c / q：那时一律判为解析不了，正文是占位，原因是 LATER_REASON。
+
+    这样的文档升级后才被复核（运行停在报告和出口之间）时，按当时的规矩查：正文确实是占位、确实
+    没有出处，记解析不了——不能因为今天解析得了，就把它判成「渲染对不上」（完整性问题，出口记缺口）。
+    只认「原因是 LATER_REASON 并且正文恰好是占位」的片段：自称二期却显示了别的字的，照现在的规矩查。
+    """
+    kind, _, body = ref.partition(":")
+    stored = seg.get("cite")
+    if kind not in ("t", "c", "q") or not isinstance(stored, dict) or stored.get("reason") != LATER_REASON \
+            or text != placeholder(kind, body):
+        return None
+    alias = stored.get("alias") if isinstance(stored.get("alias"), str) else ref
+    return {"ref": body, "alias": alias, "kind": stored.get("kind") or kind, "role": _ROLE.get(kind, "value"),
+            "status": "unresolved", "reason": LATER_REASON, "rendered": text}
+
+
+def _unknown_message(name: str) -> str:
+    return f"「{name}」{UNKNOWN_ENTITY_REASON}：只写本次运行的表结构、查询里真实存在的表名和字段名"
+
+
+def _unverified_message(name: str) -> str:
+    return f"「{name}」核对不了：{UNVERIFIED_ENTITY_REASON}"
+
+
+def uncited_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """文档里没挂依据的结论句：[{unit, span, text}]。按文档自己记的 cites 算，给界面用；
+    出口判档要用 verify_doc 返回的 uncited（按重新核对的引用算）。"""
+    markdown = str(doc.get("markdown") or "")
+    out = []
+    for _, unit in iter_units(doc):
+        span = unit.get("span")
+        if unit.get("kind") == "claim" and not unit.get("cites") and isinstance(span, list) and len(span) == 2:
+            out.append({"unit": unit.get("id"), "span": list(span), "text": markdown[span[0]:span[1]]})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1806,9 +2652,32 @@ CELL_RULES = (
     "结论的依据可以写查询编号，比如 [[see:Q1]]。下面没有的查询、行、列不要编造。"
 )
 
+#: 表名、字段名的写法。只在这次运行冻结了表结构（目录里有表和字段）时出现
+ENTITY_RULES = (
+    "表和字段（系统会核对）：提到表名、字段名时写 [[t:表名]]、[[c:表名.字段名]]，或者放进反引号（`表名`）；"
+    "只写下面列出的、或者这次查过的数据源里真实存在的名字——本次运行的表结构快照、查询用到的表、"
+    "查询结果列里都没有的名字，会被标成「可能是编造的名字」。"
+)
+#: 引原话的写法。只跟着目录里的知识库检索出现
+QUOTE_RULES = (
+    "知识库检索：引用原话写 [[q:K1|原话]]，原话必须和下面片段里的字一字不差（系统逐字核对，可以只抄其中"
+    "连续的一段，至少 4 个字）；只是拿检索当依据时写 [[see:K1]]。下面没有的检索、片段里没有的话不要编造。"
+)
+#: 报告节点 claims 为 require_citation 时，拼在写作规则后面
+CLAIMS_RULE = (
+    "这次要求每句结论都挂依据：陈述数据、比较、变化、原因的句子，句末必须写 [[see:…]]（指标、查询编号、"
+    "知识库编号都可以）。没挂依据的结论句会被记为缺口，报告因此降档出具；过渡、连接性的话不用挂。"
+)
+
 #: 写作目录里每次查询最多列出几行、几列。更多的行照样能按行号引用
 _PROMPT_ROWS = 20
 _PROMPT_COLS = 12
+#: 表和字段：最多列几张查询用到的表、几张别的表、几个结果列；每条检索最多几段、每段多长
+_PROMPT_TABLES = 20
+_PROMPT_OTHER_TABLES = 40
+_PROMPT_RESULT_COLS = 40
+_PROMPT_HITS = 8
+_PROMPT_HIT_CHARS = 300
 
 
 def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
@@ -1884,14 +2753,68 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
                      "\n查询结果（这次出具不允许直接引用单元格，只能写在 [[see:Q1]] 这样的依据里）：")
         for e in queries:
             lines.extend(_query_prompt(e, snaps, cells_allowed))
+    if (index := snaps.entities(catalog)).active:
+        lines.extend(_entity_prompt(catalog, partial=index.partial))
     retrievals = [e for e in catalog.values() if e.get("kind") == "retrieval"]
     if retrievals:
-        lines.append("\n知识库检索（只能写在 [[see:K1]] 这样的依据里）：")
-        lines.extend(f"- {e['alias']}：{e.get('label')}" for e in retrievals)
+        lines.append(f"\n{QUOTE_RULES}")
+        for e in retrievals:
+            lines.extend(_retrieval_prompt(e, snaps))
     text = "\n".join(lines)
     if len(text) > budget:
         text = text[:budget].rsplit("\n", 1)[0] + "\n…（目录太长，后面的省略了）"
     return text
+
+
+def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False) -> list[str]:
+    """表和字段在写作目录里的样子：查询用到的表连同字段，查询结果里的列，别的表只列名字。"""
+    tables = [e for e in catalog.values() if e.get("kind") == "table"]
+    fields: dict[str, list[str]] = {}
+    loose: list[str] = []
+    for e in catalog.values():
+        if e.get("kind") != "column":
+            continue
+        table = (e.get("locator") or {}).get("table")
+        if table:
+            fields.setdefault(table, []).append(str(e.get("name")))
+        elif any(o.get("kind") == "result" for o in e.get("sources") or []):
+            loose.append(str(e.get("name")))
+    lines = [f"\n{ENTITY_RULES}"]
+    used = [t for t in tables if t.get("queries")]
+    for t in used[:_PROMPT_TABLES]:
+        cols = fields.get(t["name"], [])
+        more = f" 等 {len(cols)} 个" if len(cols) > _PROMPT_COLS else ""
+        lines.append(f"- {t['name']}（{'、'.join(t['queries'])} 用到）" + (f"：{', '.join(cols[:_PROMPT_COLS])}{more}"
+                                                                          if cols else ""))
+    if loose:
+        more = f" 等 {len(loose)} 个" if len(loose) > _PROMPT_RESULT_COLS else ""
+        lines.append(f"- 查询结果里的列：{', '.join(loose[:_PROMPT_RESULT_COLS])}{more}")
+    others = [str(t["name"]) for t in tables if not t.get("queries")]
+    if others:
+        more = f" 等 {len(others)} 张" if len(others) > _PROMPT_OTHER_TABLES else ""
+        lines.append(f"- 其他表：{'、'.join(others[:_PROMPT_OTHER_TABLES])}{more}")
+    if partial:
+        lines.append("- 这个数据源的表太多，表结构快照只存了一部分：没列出的名字系统核对不了，只写你确定存在的")
+    return lines
+
+
+def _retrieval_prompt(entry: dict[str, Any], snaps: _Snapshots) -> list[str]:
+    """一次检索在写作目录里的样子：编号、来源，以及能引原话的片段（压成一行，太长的截断）。"""
+    alias = entry["alias"]
+    lines = [f"- {alias}：{entry.get('label')}"]
+    hits, why = snaps.hits(alias, entry.get("artifact"))
+    if why:
+        return [*lines, f"  （{why}，只能写 [[see:{alias}]]，不要引原话）"]
+    for i, hit in enumerate(hits[:_PROMPT_HITS]):
+        if not isinstance(hit, dict) or not isinstance(hit.get("content"), str):
+            continue
+        body = _clean(hit["content"])
+        body = body if len(body) <= _PROMPT_HIT_CHARS else body[:_PROMPT_HIT_CHARS] + "…"
+        title = f"《{_clean(str(hit['title']))}》" if hit.get("title") else ""
+        lines.append(f"  片段 {i + 1}{title}：{body}")
+    if len(hits) > _PROMPT_HITS:
+        lines.append(f"  …共 {len(hits)} 段，这里只列出前 {_PROMPT_HITS} 段")
+    return lines
 
 
 def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) -> str:
@@ -1903,3 +2826,195 @@ def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) ->
     if len(violations) > limit:
         lines.append(f"- …另有 {len(violations) - limit} 处")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 旧运行：按数值猜「可能的来源」
+#
+# 没有契约、没有报告文档的旧答案，界面上仍想让人看看每个数大概是从哪来的。这件事一期就
+# 核对过：按数值匹配巧合极多（168 个数里 131 个能在快照里找到相同的值，大量是 0、1、2），
+# 所以它只做降级展示：state 记 candidate，界面默认折叠，写明「猜测的来源，不能当证据」。
+# --------------------------------------------------------------------------
+
+GUESS_SCHEMA = "agentlab.guess/1"
+GUESS_NOTE = "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多"
+#: 每个数字最多给几个候选
+MAX_CANDIDATES = 3
+
+
+#: 同一个值的格往往成千上万（0、1）：一个值最多看这么多个，够挑出候选、又不必逐个过一遍
+_GUESS_GROUP_SCAN = 16
+_MASK_SPLIT = re.compile(r"[,，、;；\n]+")
+
+
+def _mask_names(raw: Any) -> set[str]:
+    """遮罩列名 → 小写的集合。列表和「a, b」这样的文字都认（和 data.engine.masked_columns 一样）；
+    别的形状当作没遮——但字符串一律当列名处理，宁可多遮，不能因为写法不同露出原值。"""
+    items = _MASK_SPLIT.split(raw) if isinstance(raw, str) else raw if isinstance(raw, (list, tuple, set)) else []
+    return {str(c).strip().lower() for c in items if isinstance(c, (str, int)) and str(c).strip()}
+
+
+def _guess_pool(sealed: list[Any], masked: dict[str, Any] | None
+                ) -> tuple[list[tuple[float, int, tuple[Any, ...]]], list[dict[str, Any]]]:
+    """已封存的条目摊成 (数值, 顺序号, 出处) 和每个条目的上下文。
+
+    只取值、不渲染：一份几千行的快照有几万格，渲染只留给最后挑中的候选（每个数字至多 limit 个）。
+    顺序号按传入顺序、行、列递增，距离相同时靠它排。遮罩的列（快照记下的 mask_columns，加上调用方
+    按 artifact 交来的数据源现有遮罩）整列不进池子：候选的值、渲染、差值都会把原值带出去。
+    """
+    pool: list[tuple[float, int, tuple[Any, ...]]] = []
+    contexts: list[dict[str, Any]] = []
+
+    def add(value: Any, where: tuple[Any, ...]) -> None:
+        if not is_number(value):
+            return
+        try:
+            number = float(value)
+        except OverflowError:           # 几百位的整数：换不成浮点数，也不会有人按它写报告
+            return
+        if math.isfinite(number):
+            pool.append((number, len(pool), where))
+
+    for entry in sealed or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("artifact"), str) or not entry["artifact"]:
+            continue
+        artifact, content = entry["artifact"], entry.get("content")
+        if not isinstance(content, dict):
+            continue
+        at = len(contexts)
+        context = {"entry": entry, "artifact": artifact, "content": content,
+                   "extra": {k: entry[k] for k in ("node_id", "tool") if entry.get(k)}}
+        if entry.get("kind") == "metric_set" and isinstance(content.get("metrics"), list):
+            contexts.append(context)
+            for metric in content["metrics"]:
+                if isinstance(metric, dict) and metric.get("id"):
+                    add(metric.get("value"), (at, metric))
+        elif entry.get("kind") == "query" and isinstance(content.get("rows"), list):
+            contexts.append(context)
+            hidden = _mask_names(content.get("mask_columns")) | _mask_names((masked or {}).get(artifact))
+            names = [str(c) for c in content.get("columns") or []]
+            types = content.get("column_types") if isinstance(content.get("column_types"), dict) else {}
+            # 同名的列按第一个算（和 locate_cell 一样），只算一次
+            columns = [(name, names.index(name), types.get(name) if isinstance(types.get(name), str) else None)
+                       for name in dict.fromkeys(names) if name.lower() not in hidden]
+            for r, record in enumerate(content["rows"]):
+                for name, index, kind in columns:
+                    if isinstance(record, dict):
+                        if name not in record:
+                            continue
+                        raw = record[name]
+                    elif isinstance(record, (list, tuple)) and index < len(record):
+                        raw = record[index]
+                    else:
+                        continue
+                    add(cell_value(raw, kind), (at, r, name, kind, raw))
+    return pool, contexts
+
+
+def _guess_candidate(where: tuple[Any, ...], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """池子里的一项 → 候选。单元格渲染不出来（非零却显示成 0）的返回 None，名额让给下一个。"""
+    context = contexts[where[0]]
+    artifact, content, extra = context["artifact"], context["content"], context["extra"]
+    if len(where) == 2:
+        metric = where[1]
+        mid = str(metric["id"])
+        try:
+            rendered = render_metric(metric)
+        except RenderError:
+            rendered = MISSING
+        return {"kind": "metric", "ref": f"m:{mid}", "artifact": artifact, "locator": {"metric": mid},
+                "eid": make_eid("metric", artifact, {"metric": mid}), "value": metric.get("value"),
+                "rendered": rendered, "name": metric.get("name") or mid,
+                **{k: v for k, v in (("caliber", content.get("caliber")),
+                                     ("version", content.get("caliber_version"))) if v},
+                **{k: v for k, v in extra.items() if k == "node_id"}}
+    _, r, name, kind, raw = where
+    try:
+        rendered = render_cell(raw, kind=kind)
+    except RenderError:
+        return None
+    alias = context["entry"].get("alias")
+    return {"kind": "cell", **({"ref": f"{alias}.r{r}.{name}", "alias": alias} if alias else {}),
+            "artifact": artifact, "locator": {"row": r, "column": name}, "eid": cell_eid(artifact, r, name),
+            "value": cell_value(raw, kind), "rendered": rendered, **extra}
+
+
+def _guesses(token: Any, values: list[float], pool: list[tuple[float, int, tuple[Any, ...]]],
+             contexts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """一个数字的候选：书写精度以内相等的值（写成 8.7% 的也和比率 0.087 比），按距离、再按传入顺序。"""
+    if limit <= 0:
+        return []
+    tolerance = _tolerance(token) + 1e-9
+    best: dict[int, tuple[float, int]] = {}
+    targets = [(token.value, 1.0)] + ([(token.value / 100, 100.0)] if token.is_percent else [])
+    for target, scale in targets:
+        k = bisect.bisect_left(values, target - tolerance / scale)
+        hi = bisect.bisect_right(values, target + tolerance / scale)
+        while k < hi:
+            # 同一个值的一串（池子按值、顺序号排好了）：差值一样，只有前几个有机会入选
+            group_end = bisect.bisect_right(values, values[k], k, hi)
+            for j in range(k, min(group_end, k + _GUESS_GROUP_SCAN)):
+                value, order, _ = pool[j]
+                diff = abs(token.value - value * scale)
+                if diff <= tolerance and (order not in best or diff < best[order][0]):
+                    best[order] = (diff, j)
+            k = group_end
+    out: list[dict[str, Any]] = []
+    for _, (diff, j) in sorted(best.items(), key=lambda item: (item[1][0], item[0])):
+        candidate = _guess_candidate(pool[j][2], contexts)
+        if candidate is not None:
+            out.append({**candidate, "diff": round(diff, 10)})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def guess_sources(text: str, sealed: list[Any], *, limit: int = MAX_CANDIDATES,
+                  masked: dict[str, Any] | None = None) -> dict[str, Any]:
+    """旧答案里的每个数字，去调用方交来的已封存条目里按数值找候选。只做展示，不是证据。
+
+    sealed 的每一项：{kind: "query" | "metric_set", artifact, content, alias?, node_id?, tool?}
+    - query：content 是查询快照（columns / rows / column_types / mask_columns），候选是单元格，ref 形如
+      Q1.r0.gmv（给了 alias 才有）；文本列里的数字样子的字（编号 "00123"）不按数比
+    - metric_set：content 是口径卡的指标集，候选是指标，ref 形如 m:gmv
+    这个函数不读库：调用方只把封存范围内的事件引用得到、取回时复验过哈希的工件交进来。
+
+    遮罩：快照自己记下的 mask_columns，加上 masked（{查询快照工件: 数据源现在的遮罩列}，调用方按
+    masked_columns(source.options) 给）里的列，一律不当候选——候选的 value、rendered、diff 都会带出
+    原值，写成 8,123 的数也会对上 8,123.45。列名不分大小写。
+
+    数字的抽取和容差沿用出具校验（日期、ISO 周、行首序号不算数字；写 12.3 的容差是 0.05）。
+    每个数字最多 limit 个候选，按距离从近到远，距离相同的按传入顺序（条目、行、列），同样的输入
+    永远同样的输出。返回 {schema, mode: "legacy_text", note, markdown, segments, stats}：
+    segments 铺满原文，数字片段有候选的 state 为 candidate（带 candidates），没有的为 none。
+    """
+    text = text or ""
+    pool, contexts = _guess_pool(sealed, masked if isinstance(masked, dict) else None)
+    pool.sort(key=lambda item: (item[0], item[1]))
+    values = [item[0] for item in pool]
+    segments: list[dict[str, Any]] = []
+    stats = {"numbers": 0, "guessed": 0, "unguessed": 0, "candidates": 0}
+    cursor = 0
+
+    def push(seg: dict[str, Any]) -> None:
+        segments.append({"id": f"s{len(segments)}", **seg})
+
+    for token in sorted(extract_numbers(text), key=lambda t: t.start):
+        if token.start < cursor:
+            continue
+        if cursor < token.start:
+            push({"kind": "text", "text": text[cursor:token.start], "span": [cursor, token.start], "state": "neutral"})
+        found = _guesses(token, values, pool, contexts, limit)
+        seg = {"kind": "number", "text": text[token.start:token.end], "span": [token.start, token.end],
+               "state": "candidate" if found else "none"}
+        if found:
+            seg["candidates"] = found
+        push(seg)
+        stats["numbers"] += 1
+        stats["guessed" if found else "unguessed"] += 1
+        stats["candidates"] += len(found)
+        cursor = token.end
+    if cursor < len(text):
+        push({"kind": "text", "text": text[cursor:], "span": [cursor, len(text)], "state": "neutral"})
+    return {"schema": GUESS_SCHEMA, "mode": "legacy_text", "note": GUESS_NOTE, "markdown": text,
+            "segments": segments, "stats": stats}

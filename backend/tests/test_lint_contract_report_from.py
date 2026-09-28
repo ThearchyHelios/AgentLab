@@ -100,4 +100,6 @@ def test_a_narrative_contract_is_unchanged():
     contract = contract_of(graph)
     del contract["report_from"]
     contract["narrative"] = "{{ nodes.write.text }}"
-    assert [i for i in lint(graph) if i.level == "error"] == []
+    # _lint_contract 对叙述模式照旧；受管级别另有门禁 G1 要求核对报告撰写节点的文档
+    assert [i for i in lint(graph, "published") if i.level == "error"] == []
+    assert [i.code for i in lint(graph) if i.level == "error"] == ["governed.report_from_required"]

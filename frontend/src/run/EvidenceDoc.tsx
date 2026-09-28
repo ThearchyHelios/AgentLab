@@ -8,7 +8,7 @@ import { ListChecks } from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
-  EVIDENCE_STATE, docTally, segmentLabel, segmentState, tallySummary, unitText, type EvidenceStateCode,
+  EVIDENCE_STATE, docTally, segmentKind, segmentLabel, segmentState, tallySummary, unitText, type EvidenceStateCode,
   type EvidenceTally as Tally,
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
@@ -40,6 +40,8 @@ export interface EvidenceDocHandle {
   next: (dir?: 1 | -1) => boolean
   /** 打开违规清单。没有违规返回 false */
   list: () => boolean
+  /** 打开某个片段的面板（记录页的审计表点一行）。focus 为 true 时焦点也挪到正文里那一段；没有这个片段返回 false */
+  open: (segId: string, opts?: { focus?: boolean }) => boolean
 }
 
 /** 和 AssistantStream 的长文本折叠同一个量级：先显示这么多字，后面的折起来 */
@@ -131,10 +133,16 @@ function verticalTarget(model: Model, id: string, down: boolean): string | null 
   return model.unitFirst[(u + (down ? 1 : -1) + n) % n] ?? null
 }
 
-/** 片段的外观：线型走 data 属性（CSS 里只管线型），颜色写成两个变量交给 index.css */
+/** 片段的外观：线型走 data 属性（CSS 里只管线型），颜色写成变量交给 index.css（引文前的引号用 --ev-glyph） */
 function segStyle(state: EvidenceStateCode): CSSProperties {
   const meta = EVIDENCE_STATE[state]
-  return { '--ev-line': meta.decoration, '--ev-soft': meta.soft } as CSSProperties
+  return { '--ev-line': meta.decoration, '--ev-soft': meta.soft, '--ev-glyph': meta.color } as CSSProperties
+}
+
+/** 句末小标签：哪几种异常态在句末挂字形加文字（去掉颜色也读得出）。可疑名字和无证据分开挂 */
+const TAG_TEXT: Partial<Record<EvidenceStateCode, string>> = {
+  none: EVIDENCE_STATE_LABEL.none,
+  suspect: EVIDENCE_TEXT.suspectTag,
 }
 
 export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
@@ -149,11 +157,18 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   dense?: boolean
   /** 成果字段名，读屏用 */
   label?: string
-  /** 面板放哪：窄栏里栏内展开，宽屏从右侧弹出，窄屏从底部抽出。auto 按 dense 和屏宽定 */
+  /**
+   * 面板放哪：窄栏里栏内展开，宽屏从右侧弹出，窄屏从底部抽出，dock 放进页面给的 dock 元素里（记录页
+   * 的常驻面板）。auto 按 dense 和屏宽定
+   */
   panel?: 'auto' | PanelMode
+  /** panel 为 dock 时面板挂在这个元素里 */
+  dock?: HTMLElement | null
+  /** 面板开了、关了（dock 的空位据此显示提示） */
+  onView?: (open: boolean) => void
   /** 自己显示「N/N 数字有出处」那一条。上面已经有出具横幅（它会写这一行）时不用 */
   tally?: boolean
-}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', tally = false }, ref) {
+}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false }, ref) {
   const blocks = useMemo(() => doc.blocks ?? [], [doc])
   const model = useMemo(() => buildModel(blocks), [blocks])
   const counts = useMemo(() => docTally(doc), [doc])
@@ -246,7 +261,18 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     return list[list.length - 1]
   }, [model])
 
+  // 面板开关告诉页面（dock 的空位据此显示「点片段看出处」）
+  const open = !!view
+  useEffect(() => { onView?.(open) }, [open, onView])
+
   useImperativeHandle(ref, () => ({
+    open: (id, opts) => {
+      if (!model.seg.has(id)) return false
+      if (opts?.focus) focusSeg(id, { flash: true })
+      else setCurrent(id)
+      openSeg(id)
+      return true
+    },
     next: (dir = 1) => {
       const target = step(model.alerts, view?.kind === 'seg' ? view.id : current, dir)
       if (target) {
@@ -300,7 +326,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       close()
       return
     } else if (e.key === 'Tab' && !e.shiftKey && view && mode !== 'inline') {
-      // 面板在页面末尾（portal）：Tab 直接进面板，不让人穿过整页去找
+      // 面板在页面末尾（portal）或页面另一栏（dock）：Tab 直接进面板，不让人穿过整页去找
       const heading = document.getElementById(`${panelId}-title`)
       if (heading) { e.preventDefault(); heading.focus() }
       return
@@ -341,7 +367,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     <div ref={rootRef} data-evidence-doc="" className="min-w-0">
       <p id={summaryId} className="sr-only" data-evidence-summary="">{summary}</p>
       <div className="sr-only" aria-live="polite" aria-atomic="true">{announce}</div>
-      {tally && (counts.total > 0 || counts.other > 0) && (
+      {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect) && (
         <EvidenceTally counts={counts} onNext={() => {
           const target = step(model.alerts, current, 1)
           if (target) { focusSeg(target, { flash: true }); openSeg(target) } else openViolations()
@@ -381,7 +407,8 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
           <button type="button" className="text-[var(--accent)] hover:underline" onClick={() => setExpanded(false)}>收起</button>
         </div>
       )}
-      {mode !== 'inline' && panelNode && createPortal(panelNode, document.body)}
+      {mode === 'dock' && panelNode && dock && createPortal(panelNode, dock)}
+      {mode !== 'inline' && mode !== 'dock' && panelNode && createPortal(panelNode, document.body)}
     </div>
   )
 })
@@ -394,6 +421,7 @@ function flashOnce(el: HTMLElement) {
 
 /** 面板放哪。auto：窄栏（dense）里栏内展开，宽屏侧边，窄屏底部抽屉；屏宽变了跟着变 */
 function usePanelMode(panel: 'auto' | PanelMode, dense: boolean): PanelMode {
+  // dock 由页面自己定宽窄（记录页窄的时候换成 drawer 再传进来），这里原样用
   const query = '(min-width: 900px)'
   const [wide, setWide] = useState(() => typeof matchMedia !== 'function' || matchMedia(query).matches)
   useEffect(() => {
@@ -411,16 +439,26 @@ function usePanelMode(panel: 'auto' | PanelMode, dense: boolean): PanelMode {
 
 /** 证据条：没有出具横幅时由文档自己说「7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了」 */
 export function EvidenceTally({ counts, onNext, onList }: {
-  counts: Pick<Tally, 'total' | 'cited' | 'none' | 'other'>
+  counts: Pick<Tally, 'total' | 'cited' | 'none' | 'other' | 'suspect'>
   onNext?: () => void
   onList?: () => void
 }) {
-  const clean = !counts.none && !counts.other
+  const suspect = counts.suspect ?? 0
+  const clean = !counts.none && !counts.other && !suspect
+  const numbers = evidenceTally(counts.cited, counts.total, counts.other)
   return (
     <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-evidence-tally="">
-      <span className="tnum" style={{ color: clean ? 'var(--st-done)' : 'var(--st-waiting)' }}>
-        {evidenceTally(counts.cited, counts.total, counts.other)}
-      </span>
+      {numbers && (
+        <span className="tnum" style={{ color: !counts.none && !counts.other ? 'var(--st-done)' : 'var(--st-waiting)' }}>
+          {numbers}
+        </span>
+      )}
+      {/* 可疑名字另起一句：它不是数字，混进「无证据 M」就算不平了 */}
+      {suspect > 0 && (
+        <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-tally-suspect="">
+          {numbers ? '· ' : ''}{EVIDENCE_STATE.suspect.glyph} {EVIDENCE_TEXT.suspectTag} {formatNumber(suspect)}
+        </span>
+      )}
       {!clean && onNext && (
         <button type="button" className="btn btn-xs" data-evidence-next="" onClick={onNext}>
           {EVIDENCE_TEXT.locateNext}
@@ -541,7 +579,7 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
   const text = segs.map((s) => s.text).join('')
   const styles = useMemo<InlineStyles | null>(() => (code ? null : inlineStyles(text)), [text, code])
   let pos = 0
-  let alert = false
+  const alerts = new Set<EvidenceStateCode>()
   const nodes = segs.map((s) => {
     const from = pos
     pos += s.text.length
@@ -551,7 +589,7 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
       : s.text
     if (!state) return <span key={s.id}>{s.strong ? <strong className="font-semibold">{body}</strong> : body}</span>
     const meta = EVIDENCE_STATE[state]
-    if (meta.alert) alert = true
+    if (meta.alert && TAG_TEXT[state]) alerts.add(state)
     const open = active === s.id
     return (
       <button
@@ -561,6 +599,8 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
         data-seg={s.id}
         data-ev-state={state}
         data-ev-line={meta.line}
+        // 实体、引文：线型和颜色照状态，另有自己的样子（引文前挂引号，见 index.css）
+        data-ev-kind={segmentKind(s) ?? undefined}
         tabIndex={current === s.id ? 0 : -1}
         aria-label={segmentLabel(s, doc)}
         aria-expanded={open}
@@ -574,11 +614,11 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
   return (
     <>
       {nodes}
-      {alert && tag && (
-        <span className="ev-tag" aria-hidden="true" title={EVIDENCE_STATE.none.hint}>
-          {EVIDENCE_STATE.none.glyph}{EVIDENCE_STATE_LABEL.none}
+      {tag && [...alerts].map((state) => (
+        <span key={state} className="ev-tag" aria-hidden="true" title={EVIDENCE_STATE[state].hint} data-ev-tag={state}>
+          {EVIDENCE_STATE[state].glyph}{TAG_TEXT[state]}
         </span>
-      )}
+      ))}
     </>
   )
 }

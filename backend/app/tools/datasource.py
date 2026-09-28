@@ -144,6 +144,10 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
 
         payload = result.to_payload()
         payload["source"] = source.name
+        # 表结构快照：这次查询时数据源的结构冻结下来，报告里写的表名、字段名按它核对。事后数据源
+        # 重新探查、改了结构，已经跑完的运行核对的还是当时那一份
+        if schema := await _store_schema(source, ctx):
+            payload["schema_artifact"] = schema
         # 查询快照进工件库：出具体系的数字回指要能下钻到"这个数是哪条 SQL 查出来的"
         try:
             from app.core.artifact_store import put_json
@@ -170,6 +174,28 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
         metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or "")),
                   "timeout_s": seconds},
     )
+
+
+async def _store_schema(source: DataSource, ctx: ToolContext) -> str | None:
+    """把数据源此刻的 schema_cache 存成 schema_snapshot 工件，返回工件 id。
+
+    内容寻址：结构没变的话，同一次运行里查多少次都是同一件，文件只有一份。没探查过结构
+    （或者探查失败、一张表都没有）返回 None：没有东西可以冻结，报告也就不核对表名。
+    """
+    cache = source.schema_cache or {}
+    tables = cache.get("tables")
+    if not isinstance(tables, dict) or not tables:
+        return None
+    from app.core.artifact_store import put_json
+    from app.engine.evidence import SCHEMA_SNAPSHOT
+
+    content = {"source": source.name, "tables": tables,
+               **{k: cache[k] for k in ("schema", "synced_at", "truncated", "total") if k in cache}}
+    try:
+        return await put_json(content, kind=SCHEMA_SNAPSHOT, run_id=ctx.run_id or "", node_id=ctx.node_id or "",
+                              meta={"source": source.name, "tables": len(tables)})
+    except Exception:  # noqa: BLE001 - 存不下不影响查询本身，只是这次报告不核对表名
+        return None
 
 
 def _make_schema_tool(source: DataSource) -> StructuredTool:
@@ -206,4 +232,4 @@ def is_dangerous_call(source: DataSource, sql: str) -> bool:
 
     只读源上的写不需要审批——守卫和连接层都会拒，批了也写不进去。
     """
-    return not source.readonly and is_write(sql)
+    return not source.readonly and is_write(sql, dialect=source.kind)

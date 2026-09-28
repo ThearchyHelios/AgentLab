@@ -16,6 +16,8 @@ import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
+// RUNS_SHOTS=<目录>：证据页签亮暗各截几张，供人眼复核
+const SHOTS = process.env.RUNS_SHOTS ?? ''
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
@@ -47,7 +49,11 @@ const check = (name, cond, detail = '') => {
  * 不让一处卡住把后面的检查一起吞掉。页面是各节共用的：
  * 出错那一节停在哪，下一节就从哪接着
  */
+// RUNS_ONLY=证据页签 只跑段名里含这些字的段（逗号分隔；改坏验证时省时间）。前面几段给后面留的数据
+// （航迹那一节的时刻、工件）只在整本跑时有，单跑依赖它们的段会报「中途出错」；check-all 不传它
+const ONLY = (process.env.RUNS_ONLY ?? '').split(',').filter(Boolean)
 async function section(name, fn) {
+  if (ONLY.length && !ONLY.some((k) => name.includes(k)) && name !== '收尾') return
   console.log(`\n=== ${name} ===`)
   try {
     await fn()
@@ -1696,6 +1702,296 @@ await section('屏幕矮、节点多：读数区不被航迹坞压住', async ()
   await page.setViewportSize({ width: 1440, height: 900 })
   fakes.delete('GET /api/runs')
   fakes.delete('GET /api/approvals')
+})
+
+// ------------------------------------------------------------------ 证据页签（可点击证据三期）
+
+// 夹具是后端真跑出来的（compose_doc、guess_sources、api/evidence.py 的审计函数），只用通用名
+const fxe = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-entity.json', import.meta.url), 'utf8'))
+const EV = 'fake0evidence0000000000000000'
+const EV_LEGACY = 'fake0evlegacy0000000000000000'
+const EV_NONE = 'fake0evnone000000000000000000'
+const EV_OLD = 'fake0evoldback000000000000000'
+const evGraph = { nodes: [
+  { id: 'in', type: 'input', position: { x: 0, y: 0 }, data: { label: '输入', config: {} } },
+  { id: 'fetch', type: 'agent', position: { x: 200, y: 0 }, data: { label: '取数', config: { tools: ['db_query__shop'] } } },
+  { id: 'manual', type: 'retrieve', position: { x: 200, y: 150 }, data: { label: '查手册', config: {} } },
+  { id: 'write', type: 'report', position: { x: 400, y: 0 }, data: { label: '写周报', config: {} } },
+  { id: 'out', type: 'output', position: { x: 600, y: 0 }, data: { label: '成果', config: {} } },
+], edges: [{ source: 'in', target: 'fetch' }, { source: 'fetch', target: 'write' }, { source: 'manual', target: 'write' },
+  { source: 'write', target: 'out' }] }
+const evRun = (id, output) => ({
+  ...base, id, workflow_id: null, workflow_name: '证据检查', status: 'succeeded', run_class: 'formal',
+  version: 3, version_hash: null, manifest_hash: 'f'.repeat(64), manifest_seq: 88, error: null, error_node_id: null,
+  input: { week: '2026-W37' }, output, usage: { input_tokens: 10, output_tokens: 10, cost_usd: 0, wall_ms: 4000, active_ms: 4000, wait_ms: 0 },
+  created_at: new Date(Date.now() - 7200e3).toISOString(), started_at: new Date(Date.now() - 7200e3).toISOString(),
+  finished_at: new Date(Date.now() - 7196e3).toISOString(),
+})
+const evEvents = (output, report = true) => {
+  const t0 = Date.now() / 1000 - 7200
+  return [
+    { seq: 1, type: 'run.started', node_id: null, ts: t0, data: { nodes: 5 } },
+    { seq: 2, type: 'node.started', node_id: 'write', ts: t0 + 1, data: { node_type: 'report', label: '写周报' } },
+    ...(report ? [{ seq: 3, type: 'report.checked', node_id: 'write', ts: t0 + 3, data: fxe.report_checked }] : []),
+    { seq: 4, type: 'node.finished', node_id: 'write', ts: t0 + 3.1, data: { duration_ms: 2100 } },
+    { seq: 5, type: 'run.finished', node_id: null, ts: t0 + 4, data: { output, usage: {}, timing: { wall_ms: 4000, active_ms: 4000, wait_ms: 0 } } },
+  ]
+}
+/** 证据相关的请求（审计、导出、片段）记下来：导出发出的请求要带对 format 和 groups */
+const evRequests = []
+page.on('request', (r) => {
+  const u = new URL(r.url())
+  if (/\/api\/runs\/fake0ev[^/]*\/evidence/.test(u.pathname)) evRequests.push(`${u.pathname}${u.search}`)
+})
+const auditFake = (body, csv) => (url) => {
+  const format = url.searchParams.get('format')
+  const groups = url.searchParams.get('groups')?.split(',')
+  const pick = groups ? { ...body, groups: body.groups.filter((g) => groups.includes(g.key)) } : body
+  if (format === 'csv') {
+    return { status: 200, body: csv, headers: { 'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="evidence-${body.run_id.slice(0, 8)}.csv"` } }
+  }
+  if (format === 'json') {
+    return { status: 200, body: JSON.stringify(pick), headers: { 'Content-Type': 'application/json',
+      'Content-Disposition': `attachment; filename="evidence-${body.run_id.slice(0, 8)}.json"` } }
+  }
+  return { status: 200, json: pick }
+}
+const evFakes = (id, { output, graph, audit, csv, report = true }) => {
+  fakes.set(`GET /api/runs/${id}`, () => ({ status: 200, json: evRun(id, output) }))
+  fakes.set(`GET /api/runs/${id}/events`, () => ({ status: 200, json: evEvents(output, report) }))
+  fakes.set(`GET /api/runs/${id}/graph`, () => ({ status: 200, json: { graph: evGraph, workflow_id: null, version: 3 } }))
+  fakes.set(`GET /api/runs/${id}/artifacts`, () => ({ status: 200, json: [] }))
+  fakes.set(`GET /api/runs/${id}/evidence`, () => ({ status: 200, json: { ...graph, run_id: id } }))
+  fakes.set(`GET /api/runs/${id}/evidence/audit`, audit ? auditFake({ ...audit, run_id: id }, csv ?? '')
+    : () => ({ status: 404, json: { detail: 'Not Found' } }))
+}
+const openEvidence = async (id) => {
+  await page.goto(`${WEB}/runs/${id}?view=evidence`, { waitUntil: 'networkidle' })
+  await page.locator('[data-view-pane=evidence] [data-evidence-pane]:not([data-evidence-pane=loading])').waitFor({ timeout: 8000 })
+  await page.waitForTimeout(300)
+}
+const auditGroups = () => page.locator('[data-audit-table] tbody[data-audit-group]').evaluateAll((els) => els.map((e) => e.getAttribute('data-audit-group')))
+const auditRowsShown = () => page.locator('[data-audit-table] tr[data-audit-row]').count()
+
+await section('证据页签：左边报告、右边常驻面板、下方审计表', async () => {
+  evFakes(EV, { output: fxe.output, graph: fxe.graph, audit: fxe.audit, csv: fxe.audit_csv })
+  fakes.set(`GET /api/artifacts/${fxe.doc_artifact}`, () => ({ status: 200, json: { id: fxe.doc_artifact, content: fxe.doc } }))
+  fakes.set(`GET /api/runs/${EV}/evidence/segments/`, () => ({ status: 404, json: {} }))
+  await page.route(new RegExp(`/api/runs/${EV}/evidence/segments/`), (r) => {
+    const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
+    return fxe.segments[sid] ? r.fulfill({ json: fxe.segments[sid] }) : r.fulfill({ status: 404, json: { detail: '没有这个片段' } })
+  })
+  await page.goto(`${WEB}/runs/${EV}`, { waitUntil: 'networkidle' })
+  await page.locator('[data-run-detail]').waitFor()
+  check('详情多了「证据」页签（在航迹和工件之间）', await viewTab('evidence').count() === 1
+    && (await page.locator('[data-run-detail] [role=tab]').evaluateAll((els) => els.map((e) => e.getAttribute('data-tab')))).join(',') === 'stream,trace,evidence,artifacts')
+  check('没打开证据页签之前不取证据图和审计表', !evRequests.some((u) => u.includes(EV)), evRequests.join(' '))
+  await viewTab('evidence').click()
+  await page.locator('[data-view-pane=evidence] [data-evidence-pane=cited]').waitFor({ timeout: 8000 }).catch(() => {})
+  await page.waitForTimeout(400)
+  check('证据页签能打开，地址记着 ?view=evidence', await viewTab('evidence').getAttribute('aria-selected') === 'true'
+    && new URL(page.url()).searchParams.get('view') === 'evidence')
+  check('左边是报告（逐段可点的文档）', await page.locator('[data-evidence-report=write] [data-evidence-doc] [data-seg]').count() > 5)
+  check('右边是常驻面板的位置，没点片段时说怎么用', await page.locator('[data-evidence-dock] [data-evidence-dock-idle]').count() === 1)
+  const seal = await page.locator('[data-evidence-seal]').innerText().catch(() => '')
+  check('显示封存核对的结果', await page.locator('[data-evidence-seal]').getAttribute('data-evidence-seal') === 'done'
+    && seal.includes('已封存 · 核对一致') && seal.includes('88'), seal)
+  check('……也说报告文档的哈希一致', (await page.locator('[data-evidence-doc-hash=ok]').innerText().catch(() => '')).includes('写周报'))
+  check('审计表按状态分组：无证据、可疑实体在前，有出处在后', (await auditGroups()).join(',') === 'none,suspicious,cited',
+    (await auditGroups()).join(','))
+  const counts = await page.locator('[data-audit-group-toggle]').allInnerTexts()
+  check('每组写着条数（无证据 3、可疑实体 3、有出处 10）', counts.join('|').includes('无证据\n3') || (counts[0].includes('3') && counts[1].includes('3') && counts[2].includes('10')),
+    counts.join(' | ').replace(/\n/g, ' '))
+  check('一共 16 行', await auditRowsShown() === 16, String(await auditRowsShown()))
+  // 这张图的出口没有出具契约：后端说「要求了，但没有契约按它判档」，不说「出具时计入缺口」。表里照后端的原话写
+  const claim = page.locator('[data-audit-table] tbody[data-audit-group=none] tr[data-audit-row]', { hasText: '另外参考了' })
+  const claimNote = fxe.audit.groups.find((g) => g.key === 'none')?.rows.find((r) => r.kind === 'claim')?.note ?? '（夹具里没有结论句那行）'
+  check('没挂依据的结论句也列在无证据里，原因照后端的原话（claims: require_citation、没有出具契约）', await claim.count() === 1
+    && claimNote.includes('require_citation') && (await claim.innerText()).includes(claimNote), claimNote)
+  check('可疑实体那组有「可能是编造的名字」和「核对不了」', (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText())
+    .includes('可能是编造的名字') && (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText()).includes('核对不了'))
+  check('有出处的行写着在封存范围内', await page.locator('[data-audit-table] tbody[data-audit-group=cited] [data-audit-sealed=yes]').count() === 10)
+  check('反引号里的名字在表里不带反引号', !(await page.locator('[data-audit-table]').innerText()).includes('`'))
+
+  // 只看无证据 / 可疑实体
+  await page.locator('[data-audit-filter-option=problems]').click()
+  await page.waitForTimeout(200)
+  check('筛选「只看无证据 / 可疑实体」：只剩这两组', (await auditGroups()).join(',') === 'none,suspicious' && await auditRowsShown() === 6,
+    `${(await auditGroups()).join(',')} ${await auditRowsShown()}`)
+  check('筛选是一组单选（radio），选中的那项 aria-checked', await page.locator('[data-audit-filter-option=problems]').getAttribute('aria-checked') === 'true')
+
+  // 导出：发出的请求要带对 format，筛选了就带 groups
+  evRequests.length = 0
+  const dl1 = page.waitForEvent('download', { timeout: 5000 }).catch(() => null)
+  await page.locator('[data-audit-export=csv]').click()
+  const d1 = await dl1
+  check('导出 CSV：请求 /evidence/audit?format=csv，只要筛出来的两组',
+    evRequests.some((u) => u === `/api/runs/${EV}/evidence/audit?format=csv&groups=none%2Csuspicious`), evRequests.join(' '))
+  check('……下载的文件名是后端给的', d1?.suggestedFilename() === `evidence-${EV.slice(0, 8)}.csv`, d1?.suggestedFilename() ?? '没有下载')
+  await page.locator('[data-audit-filter-option=all]').click()
+  evRequests.length = 0
+  const dl2 = page.waitForEvent('download', { timeout: 5000 }).catch(() => null)
+  await page.locator('[data-audit-export=json]').click()
+  const d2 = await dl2
+  check('导出 JSON：请求 ?format=json，不筛就不带 groups', evRequests.some((u) => u === `/api/runs/${EV}/evidence/audit?format=json`),
+    evRequests.join(' '))
+  check('……下载了 .json', d2?.suggestedFilename()?.endsWith('.json'), d2?.suggestedFilename() ?? '没有下载')
+
+  // 键盘：整张表一个 Tab 位，↑/↓ 逐行走完每一行，回车在右边打开
+  const focusables = await page.locator('[data-audit-table] [data-audit-focus]').evaluateAll((els) => els.map((e) => e.tabIndex))
+  check('表里只有一个 Tab 位（roving）', focusables.filter((t) => t === 0).length === 1 && focusables.length === 16, focusables.join(','))
+  await page.locator('[data-audit-table] [data-audit-focus][tabindex="0"]').focus()
+  const seen = [await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus'))]
+  for (let i = 0; i < 20; i++) {
+    await page.keyboard.press('ArrowDown')
+    seen.push(await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus')))
+  }
+  const uniq = [...new Set(seen.filter(Boolean))]
+  check('↓ 能逐行走完全部 16 行（包括没挂依据的结论句这种打不开的行）', uniq.length === 16, `${uniq.length} 行`)
+  check('走到底停住，不首尾相接', seen[seen.length - 1] === seen[seen.length - 2])
+  await page.keyboard.press('Home')
+  const home = await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus'))
+  await page.keyboard.press('End')
+  const end = await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus'))
+  check('Home / End 到第一行、最后一行', home === uniq[0] && end === uniq[uniq.length - 1], `${home} / ${end}`)
+  // 找到「orders.week」那一行，回车打开
+  const target = await page.locator('[data-audit-table] [data-audit-open]', { hasText: /^orders\.week$/ }).getAttribute('data-audit-focus')
+  await page.keyboard.press('Home')
+  for (let i = 0; i < 20; i++) {
+    if (await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus')) === target) break
+    await page.keyboard.press('ArrowDown')
+  }
+  await page.keyboard.press('Enter')
+  await page.locator('[data-evidence-dock] [data-evidence-panel=dock] [data-ev-entity-type]').waitFor({ timeout: 5000 }).catch(() => {})
+  check('回车在右边的常驻面板里打开这一段：实体步骤、字段类型', (await page.locator('[data-evidence-dock] [data-evidence-panel] h3').innerText().catch(() => '')) === 'orders.week'
+    && (await page.locator('[data-evidence-dock] [data-ev-entity-type]').innerText().catch(() => '')).includes('VARCHAR'))
+  check('打开之后焦点还在表里（接着往下走）', await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus')) === target)
+  check('面板开着时空位提示收起', await page.locator('[data-evidence-dock] [data-evidence-dock-idle]').count() === 0)
+  check('正文里对应的片段标着展开', await page.locator('[data-evidence-report=write] [data-seg][aria-expanded=true]').innerText().catch(() => '') === 'orders.week')
+  // 点正文里的片段：面板跟着换
+  await page.locator('[data-evidence-report=write] [data-seg]', { hasText: '退款金额以财务确认日为准' }).click()
+  await page.locator('[data-evidence-dock] [data-ev-quote-hit]').waitFor({ timeout: 5000 }).catch(() => {})
+  check('点正文里的引文：右边换成引文步骤，原文里高亮', (await page.locator('[data-evidence-dock] [data-ev-quote-hit]').innerText().catch(() => ''))
+    .includes('退款金额以财务确认日为准'))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/runs-evidence-${theme}.png` })
+      await page.locator('[data-evidence-audit]').scrollIntoViewIfNeeded()
+      await page.waitForTimeout(150)
+      await page.screenshot({ path: `${SHOTS}/runs-evidence-audit-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  }
+  await page.keyboard.press('Escape')
+})
+
+await section('证据页签：同一段文字里好几条同样的违规、正文里点不开的行', async () => {
+  // 夹具同样是后端真跑的：粗体、链接里反引号写的可疑名字只记违规、不切片段——同一段文字上两条 unknown_entity、
+  // 两条 unverified_entity（片段和 code 都相同），列表序号 100. 是结构片段上的裸数字。这几行正文里都点不开
+  const dup = fxe.dup
+  const EV_DUP = 'fake0evdupviol000000000000000'
+  evFakes(EV_DUP, { output: dup.output, graph: dup.graph, audit: dup.audit })
+  fakes.set(`GET /api/artifacts/${dup.doc_artifact}`, () => ({ status: 200, json: { id: dup.doc_artifact, content: dup.doc } }))
+  await page.route(new RegExp(`/api/runs/${EV_DUP}/evidence/segments/`), (r) => {
+    const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
+    return dup.segments[sid] ? r.fulfill({ json: dup.segments[sid] }) : r.fulfill({ status: 404, json: { detail: '没有这个片段' } })
+  })
+  const consoleErrors = []
+  const onConsole = (m) => { if (m.type() === 'error') consoleErrors.push(m.text()) }
+  page.on('console', onConsole)
+  try {
+    await openEvidence(EV_DUP)
+    await page.locator('[data-audit-table]').waitFor({ timeout: 5000 }).catch(() => {})
+    const texts = await page.locator('[data-audit-table] [data-audit-focus]').allInnerTexts()
+    const keys = await page.locator('[data-audit-table] tr[data-audit-row]').evaluateAll((els) => els.map((e) => e.getAttribute('data-audit-row')))
+    const total = dup.audit.groups.reduce((n, g) => n + g.rows.length, 0)
+    check(`每条违规一行（${total} 行），同一片段同一种问题的几行键各不相同`, keys.length === total && new Set(keys).size === keys.length,
+      keys.join(' '))
+    check('React 没有报「两个子元素键相同」', !consoleErrors.some((t) => /same key/i.test(t)), consoleErrors.find((t) => /same key/i.test(t))?.slice(0, 120) ?? '')
+
+    await page.locator('[data-audit-table] [data-audit-focus][tabindex="0"]').focus()
+    const seen = [await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus'))]
+    for (let i = 0; i < total + 2; i++) {
+      await page.keyboard.press('ArrowDown')
+      seen.push(await page.evaluate(() => document.activeElement?.getAttribute('data-audit-focus')))
+    }
+    const walked = [...new Set(seen.filter(Boolean))]
+    check(`↓ 逐行走完全部 ${total} 行，不卡在同一片段的第一条违规上`, walked.length === total
+      && seen.slice(0, total - 1).every((k, i) => k !== seen[i + 1]), `${walked.length} 行：${seen.join(' → ')}`)
+    const reached = await page.evaluate((ks) => ks.map((k) => document.querySelector(`[data-audit-focus="${CSS.escape(k)}"]`)?.textContent), walked)
+    check('……粗体、链接里的四个可疑名字都走得到', ['orders.coupon_id', 'orders.promo_code', 'campaign_tags', 'promo_rules'].every((n) => reached.includes(n)),
+      reached.join('、'))
+
+    // 点不开的行不画成按钮：只有有状态的片段（这里是那个有出处的数字）能在右边打开
+    const openers = await page.locator('[data-audit-table] [data-audit-open]').evaluateAll((els) => els.map((e) => e.getAttribute('data-audit-open')))
+    check('只有正文里点得开的片段画成按钮（文字片段、结构片段上的违规不是）', openers.join(',') === 's1', openers.join(',') || '一个都没有')
+    const hidden = page.locator('[data-audit-table] tr[data-audit-row]:has([data-audit-hidden])')
+    check('……点不开的五行都说清只在表里列出', await hidden.count() === 5
+      && (await hidden.first().innerText()).includes('只在这里列出'), String(await hidden.count()))
+    const deadKey = keys.find((k, i) => texts[i] === 'orders.promo_code')
+    await page.locator(`[data-audit-table] [data-audit-focus="${deadKey}"]`).focus()
+    await page.keyboard.press('Enter')
+    await page.waitForTimeout(300)
+    check('……在点不开的行上按回车：右边不开一个空面板，也不报错', await page.locator('[data-evidence-dock] [data-evidence-dock-idle]').count() === 1)
+    await page.locator('[data-audit-table] [data-audit-open="s1"]').click()
+    await page.locator('[data-evidence-dock] [data-evidence-panel]').waitFor({ timeout: 5000 }).catch(() => {})
+    check('点得开的那行：右边打开这一段', (await page.locator('[data-evidence-dock] [data-evidence-panel] h3').innerText().catch(() => '')) === '45,678.5')
+    await page.keyboard.press('Escape')
+  } finally {
+    page.off('console', onConsole)
+    for (const k of [...fakes.keys()]) if (k.includes(EV_DUP)) fakes.delete(k)
+    fakes.delete(`GET /api/artifacts/${dup.doc_artifact}`)
+  }
+})
+
+await section('证据页签：没有报告的运行照实说明（none / 旧运行猜测 / 老后端）', async () => {
+  evFakes(EV_LEGACY, { output: fxe.legacy.output, graph: fxe.legacy.graph, audit: fxe.legacy.audit, report: false })
+  await openEvidence(EV_LEGACY)
+  check('没有契约的旧运行：mode 是 legacy_text，照实说', await page.locator('[data-evidence-pane=legacy_text]').count() === 1
+    && (await page.locator('[data-evidence-mode-note=legacy_text]').innerText()).includes('没有出具契约'))
+  check('猜测默认收起', await page.locator('[data-evidence-legacy-text] [data-ev-guess]').getAttribute('data-open') === 'false')
+  check('审计表里「旧运行猜测」那组默认收起', await page.locator('tbody[data-audit-group=candidate]').getAttribute('data-audit-collapsed') === '1'
+    && await page.locator('tbody[data-audit-group=candidate] tr[data-audit-row]').count() === 0)
+  await page.locator('[data-evidence-legacy-text] [data-ev-guess-toggle]').click()
+  check('展开猜测写明「猜测的来源，不能当证据」', (await page.locator('[data-evidence-legacy-text] [data-ev-guess-note]').innerText().catch(() => ''))
+    .includes('猜测的来源，不能当证据'))
+  await page.locator('[data-audit-group-toggle=candidate]').click()
+  check('展开那一组：有候选的 4 个数字，线型是候选那一档', await page.locator('tbody[data-audit-group=candidate] tr[data-audit-row]').count() === 4
+    && (await page.locator('tbody[data-audit-group=candidate] tr[data-audit-row]').evaluateAll((els) => els.every((e) => e.getAttribute('data-audit-state') === 'candidate'))))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.screenshot({ path: `${SHOTS}/runs-evidence-legacy-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  }
+
+  evFakes(EV_NONE, { output: { answer: '这次没有数字' }, report: false,
+    graph: { schema: 'agentlab.evidence/1', mode: 'none', note: '这次运行没有报告文档，也没有出具契约，没有可以展示的证据', seal: { sealed: true, ok: true },
+             reports: [], evidence: [], edges: [] },
+    audit: { schema: 'agentlab.evidence.audit/1', mode: 'none', seal: { sealed: true, ok: true }, reports: [], groups: [], counts: {}, total: 0 } })
+  await openEvidence(EV_NONE)
+  check('mode 为 none：照实说没有证据', await page.locator('[data-evidence-pane=none] [data-evidence-mode-note=none]').count() === 1
+    && (await page.locator('[data-evidence-mode-note=none]').innerText()).includes('没有'))
+
+  // 老后端：审计接口不存在（404 没有机读码）——清单按页面上的报告自己拼，导出也按页面上的
+  evFakes(EV_OLD, { output: fxe.output, graph: fxe.graph, audit: null })
+  await openEvidence(EV_OLD)
+  await page.locator('[data-audit-fallback]').waitFor({ timeout: 5000 }).catch(() => {})
+  check('老后端没有审计接口：照实说，清单按页面上的报告拼', await page.locator('[data-audit-fallback=unsupported]').count() === 1
+    && await auditRowsShown() > 10, String(await auditRowsShown()))
+  const dl = page.waitForEvent('download', { timeout: 5000 }).catch(() => null)
+  await page.locator('[data-audit-export=csv]').click()
+  const d = await dl
+  check('……导出退回按页面上的清单，也照实说', !!d && (await page.locator('[data-toast], [role=status], [role=alert]').allInnerTexts()).join(' ').includes('后端没有导出接口'))
+  for (const id of [EV, EV_LEGACY, EV_NONE, EV_OLD]) {
+    for (const k of [...fakes.keys()]) if (k.includes(id)) fakes.delete(k)
+  }
+  fakes.delete(`GET /api/artifacts/${fxe.doc_artifact}`)
 })
 
 await section('收尾', async () => {

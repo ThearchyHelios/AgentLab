@@ -325,7 +325,9 @@ export interface PublishFix {
   node_id?: string | null
   label: string
   preview?: { field?: string | null; before?: unknown; after?: unknown } | null
-  options?: { value: unknown; label: string; hint?: string | null }[]
+  /** handoff：选了这一项就是「交给 Copilot」（G4 的「它在做计算」）。只认这个标记，不认值——
+   *  别的选项拿节点 id 当值，节点 id 恰好叫 copilot 的报告撰写节点照样是普通候选 */
+  options?: { value: unknown; label: string; hint?: string | null; handoff?: boolean }[]
   multiple?: boolean
   /** 建议值：界面上标「建议」，仍然要人选 */
   default?: unknown
@@ -599,7 +601,9 @@ export interface EvidenceCitation {
   ref?: string
   /** 目录里的别名，如 m:gmv、i:week、Q1 */
   alias?: string
-  locator?: { metric?: string; field?: string; row?: number; column?: string; table?: string }
+  /** 引文：hit 是检索快照里第几条命中，start / end 是引文在那条原文里的码点位置 */
+  locator?: { metric?: string; field?: string; row?: number; column?: string; table?: string
+              hit?: number; start?: number; end?: number }
   eid?: string
   /** metric / input / cell / table / column / quote / query */
   kind?: string
@@ -610,6 +614,21 @@ export interface EvidenceCitation {
   conv?: string
   value?: unknown
   rendered?: string
+  /** 引文的原文出处：检索快照、文档、片段 */
+  source?: EvidenceQuoteSource
+  /** [[t:]] / [[c:]] 写了一个哪里都找不到的名字：可能是编造的 */
+  unknown?: boolean
+  /** 表结构快照不全，找不到的名字只能说核对不了 */
+  unverified?: boolean
+}
+
+/** 引文出自哪：检索快照工件、知识库里的文档和片段 */
+export interface EvidenceQuoteSource {
+  artifact?: string
+  document?: string
+  chunk?: string
+  title?: string
+  ordinal?: number
 }
 
 /** 可点的最小片段 */
@@ -625,8 +644,53 @@ export interface EvidenceSegment {
   ref?: string
   cite?: EvidenceCitation
   strong?: boolean
-  /** uncited_number / unresolved_ref */
+  /** uncited_number / unresolved_ref / unknown_entity（可能是编造的名字）/ unverified_entity（核对不了） */
   issue?: string
+  /** 实体写在反引号里：text 自带两个反引号，按行内代码画 */
+  code?: boolean
+  /** 系统自动链接的名字，不是写作者写的标记（不算句子的依据） */
+  auto?: boolean
+  /** 反引号里自动发现的可疑名字（没有 ref 时名字在这里） */
+  name?: string
+  /** 旧运行按数值猜的候选（state 为 candidate） */
+  candidates?: EvidenceCandidate[]
+}
+
+/**
+ * 旧运行（没有契约）按数值猜的一个候选：查询快照的一格，或口径卡的一个指标。
+ * 只做展示，不是证据
+ */
+export interface EvidenceCandidate {
+  kind?: 'cell' | 'metric' | string
+  /** Q1.r0.gmv / m:gmv */
+  ref?: string
+  alias?: string
+  artifact?: string
+  locator?: EvidenceLocator & { metric?: string }
+  eid?: string
+  value?: unknown
+  rendered?: string
+  /** 指标名 */
+  name?: string
+  caliber?: string
+  version?: string
+  node_id?: string
+  tool?: string
+  /** 和答案里那个数差多少 */
+  diff?: number
+}
+
+/** 旧运行的猜测：guess_sources 的输出（agentlab.guess/1） */
+export interface EvidenceGuess {
+  schema?: string
+  mode?: string
+  /** 「猜测的来源，不能当证据：…」 */
+  note?: string
+  markdown?: string
+  segments?: EvidenceSegment[]
+  stats?: { numbers?: number; guessed?: number; unguessed?: number; candidates?: number }
+  /** 猜的是成果里哪个字段 */
+  field?: string
 }
 
 /** 句子、列表项或表格单元格 */
@@ -681,6 +745,11 @@ export interface EvidenceStats {
   see?: number
   uncited_claims?: number
   violations?: number
+  /** 三期：有出处的实体、引文片段数；可疑实体、核对不了的名字数。老文档没有这几个键，缺省当 0 */
+  entities?: number
+  quotes?: number
+  unknown_entities?: number
+  unverified_entities?: number
 }
 
 /** report_doc 工件的内容 */
@@ -724,12 +793,23 @@ export interface EvidenceGraph {
   schema?: string
   /** cited / legacy_contract / legacy_text / none */
   mode?: string
+  /** 没有报告时为什么（none）、旧版出具怎么认的（legacy_*）：一句人话 */
+  note?: string
+  /**
+   * legacy_contract：{note, tier, matched, unmatched, field}，按旧契约的位置标出的数字；
+   * legacy_text：guess_sources 的输出（EvidenceGuess），可能按字段分成几份
+   */
+  legacy?: Record<string, any> | Record<string, any>[] | null
+  /** legacy_text 另一种放法：猜测单独放在这里 */
+  guess?: EvidenceGuess | EvidenceGuess[] | Record<string, EvidenceGuess> | null
   seal?: EvidenceSeal
   reports?: { node_id?: string; doc_artifact?: string; doc_sealed?: boolean; fields?: string[]; stats?: EvidenceStats
               /** 文档取回时哈希复验：false 对不上（或不是这次运行这个节点写的），null 文件不在了 */
-              hash_ok?: boolean | null }[]
+              hash_ok?: boolean | null
+              /** 写这份报告时的结论句策略（report.checked 里记的；老后端、升级前的运行没有） */
+              claims?: string | null }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
-               sealed?: boolean; cited_by?: string[] }[]
+               sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
 }
 
@@ -864,6 +944,98 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   note?: string
   /** 数据源改名或删掉了、按查询当时记下的遮罩处理时的那句说明。行照样有 */
   mask_note?: string
+  // ---- entity：表或字段（三期）----
+  /** entity：table / column */
+  kind?: string
+  table?: string
+  column?: string
+  /** 字段类型（表结构快照里记的） */
+  type?: string
+  /** 同名字段在好几张表里时，是哪几张 */
+  tables?: string[]
+  /** 这个名字的来历：表结构快照、查询 SQL、查询结果列 */
+  sources?: EvidenceEntitySource[]
+  /** 出现在哪几次查询里（报告目录的全局编号） */
+  queries?: string[]
+  /** 表结构快照什么时候同步的 */
+  synced_at?: string
+  /** 可疑实体：最接近的已知名字 */
+  closest?: (string | { alias?: string; name?: string; table?: string; kind?: string })[]
+  /** 可疑实体：查过几份表结构快照、几次查询 */
+  checked?: { schemas?: number; queries?: number }
+  /** 表结构快照只存了一部分（库里表太多） */
+  snapshot_truncated?: boolean
+  /** 好几张表都有的同名字段：各表的类型 */
+  types?: Record<string, string>
+  /** 表：几个字段、是不是视图；表或字段的注释 */
+  is_view?: boolean
+  comment?: string
+  nullable?: boolean
+  primary_key?: boolean
+  // ---- quote：逐字引文（三期）----
+  /** quote：引文所在那条命中的原文（也可能放在 content 里） */
+  text?: string
+  /** quote：引文所在那条命中的全文；快照不在封存范围里、取不回来时是 null */
+  content?: string | null
+  quote?: string
+  match?: { hit?: number; start?: number; end?: number }
+  /** quote：按记下的位置把原文切出来，和引文逐字比对的结果 */
+  match_ok?: boolean | null
+  /** quote：哪个知识库、检索的是什么 */
+  collection?: string
+  query?: string | null
+}
+
+/** 实体的一处来历 */
+export interface EvidenceEntitySource {
+  /** schema（表结构快照）/ sql（查询 SQL 用到的表）/ result（查询结果列） */
+  kind?: string
+  artifact?: string
+  alias?: string
+  source?: string
+  truncated?: boolean
+}
+
+/** GET /runs/{id}/evidence/audit 的一行（形状照 api/evidence.py；前端经 lib/evidence 的 auditFromApi 读） */
+export interface EvidenceAuditRow {
+  /** cited / none / suspicious / candidate */
+  group?: string
+  report?: string | null
+  field?: string | null
+  segment?: string | null
+  unit?: string | null
+  /** number / value / entity / quote / claim / violation */
+  kind?: string
+  text?: string
+  state?: string
+  issue?: string | null
+  ref?: string | null
+  alias?: string | null
+  evidence_kind?: string | null
+  evidence?: string | null
+  eid?: string | null
+  artifact?: string | null
+  node_id?: string | null
+  sealed?: boolean | null
+  span?: [number, number] | null
+  sentence?: string
+  note?: string | null
+  candidates?: EvidenceCandidate[]
+}
+
+/** GET /runs/{id}/evidence/audit：记录页的审计表 */
+export interface EvidenceAudit {
+  run_id?: string
+  schema?: string
+  mode?: string
+  seal?: EvidenceSeal & { events?: number; message?: string }
+  reports?: { node_id?: string; doc_artifact?: string; hash_ok?: boolean | null; doc_sealed?: boolean
+              fields?: string[]; claims?: string | null; stats?: EvidenceStats }[]
+  groups?: { key?: string; label?: string; count?: number; rows?: EvidenceAuditRow[] }[]
+  counts?: Record<string, number>
+  total?: number
+  note?: string
+  legacy_note?: string
 }
 
 /** GET /runs/{id}/evidence/segments/{sid}：点开一个片段 */
@@ -880,4 +1052,6 @@ export interface EvidenceSegmentDetail {
   seal?: EvidenceSeal
   /** 查询步骤里被遮罩的列（数据源 options.mask_columns）。遮罩只减少暴露，不是安全边界 */
   redacted?: { columns?: string[] }
+  /** 可疑实体：最接近的已知名字（最多 3 个），给「是不是想写…」 */
+  closest?: (string | { alias?: string; name?: string; table?: string; kind?: string })[]
 }

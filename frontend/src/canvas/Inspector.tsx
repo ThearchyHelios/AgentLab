@@ -522,6 +522,10 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
           {(field.options ?? []).map((o) => (
             <option key={o.value} value={o.value}>{o.label}</option>
           ))}
+          {/* config 里是个不在选项里的值：照实列出来（不能选回去），不让它看着像第一个选项 */}
+          {field.unknownLabel && typeof value === 'string' && value && !(field.options ?? []).some((o) => o.value === value) && (
+            <option value={value} disabled>{field.unknownLabel(value)}</option>
+          )}
         </select>
       )
 

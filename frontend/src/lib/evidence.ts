@@ -7,16 +7,21 @@
  * 「未裁判」借 --st-cancelled（暗字色），「猜测」借 --st-idle（最淡的字色）——
  * 绝不用确定性的绿，模型的判断不能长得像系统核对过的事实。
  *
- * 本期（数字层）实际只会出现两种：确定性（引用解析成功）和无证据（裸数字、引用
- * 不存在）。其余几种先把外观定下，后续期接上时不用再各处补。
+ * 一期（数字层）只会出现两种：确定性（引用解析成功）和无证据（裸数字、引用不存在）。
+ * 三期多了表名字段名、逐字引文：有出处的实体、引文和数字同一套「有出处」线型（状态就是
+ * 确定性，另有 EVIDENCE_KIND_STYLE 给它们各自的字形和说法）；可疑实体（可能是编造的
+ * 名字）和核对不了的名字是无证据的两个变体，线型同无证据、字形和文字各不相同；旧运行
+ * 按数值猜的候选用最淡的点状线。概率性的几种先把外观定下，四期接上时不用再各处补。
  */
 
-import { EVIDENCE_KIND_LABEL, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, UPGRADE_POLICY_LABEL, evidenceTally } from './terms'
+import {
+  EVIDENCE_AUDIT_TEXT, EVIDENCE_KIND_LABEL, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, UPGRADE_POLICY_LABEL, evidenceTally,
+} from './terms'
 import { NONE, formatNumber, shortId } from './format'
 import type {
-  EvidenceBlock, EvidenceCaliberSource, EvidenceCaliberUpgrade, EvidenceDocData, EvidenceFieldRef, EvidenceGraph,
-  EvidenceInput, EvidenceLocator, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit,
-  EvidenceViolation, ReviewResult,
+  EvidenceBlock, EvidenceCaliberSource, EvidenceCaliberUpgrade, EvidenceCandidate, EvidenceDocData, EvidenceFieldRef,
+  EvidenceGraph, EvidenceGuess, EvidenceInput, EvidenceLocator, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail,
+  EvidenceStats, EvidenceStep, EvidenceUnit, EvidenceViolation, ReviewResult,
 } from '../types'
 import type { MarkSpec } from '../run/Markdown'
 
@@ -100,6 +105,20 @@ export const EVIDENCE_STATE: Record<EvidenceStateCode, EvidenceStateMeta> = {
     alert: false, phase: 3,
     hint: '旧运行按数值猜的可能来源，不能当证据',
   },
+  // 可疑实体：线型同无证据（点状），字形和文字另起，一眼分得出「没写出处」和「名字可能是编的」
+  suspect: {
+    code: 'suspect', label: EVIDENCE_STATE_LABEL.suspect, line: 'dotted', glyph: '?!',
+    color: 'var(--st-waiting)', decoration: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)',
+    alert: true, phase: 3,
+    hint: '本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的',
+  },
+  // 核对不了：表结构快照不全，找不到不等于不存在。只是标注，不进 n / N 的跳转，颜色压低
+  unverified: {
+    code: 'unverified', label: EVIDENCE_STATE_LABEL.unverified, line: 'dotted', glyph: '…',
+    color: 'var(--st-cancelled)', decoration: mix('--st-cancelled', 80), soft: 'var(--st-cancelled-soft)',
+    alert: false, phase: 3,
+    hint: '这个数据源的表太多，表结构快照只存了一部分：找不到这个名字，也说不准它不存在',
+  },
 }
 
 /** 图例、检查脚本按这个顺序列 */
@@ -109,15 +128,56 @@ export const EVIDENCE_STATES = Object.keys(EVIDENCE_STATE) as EvidenceStateCode[
  * 片段在正文里的状态。文字、结构片段（行首符号、表格竖线）是 null：不画线、不进键盘顺序。
  * 后端的 probabilistic 在裁判给出结论之前按「未裁判」画
  */
-export function segmentState(seg: Pick<EvidenceSegment, 'kind' | 'state'>): EvidenceStateCode | null {
+export function segmentState(
+  seg: Pick<EvidenceSegment, 'kind' | 'state'> & Partial<Pick<EvidenceSegment, 'issue' | 'cite'>>,
+): EvidenceStateCode | null {
   if (seg.kind === 'structural') return null
   switch (seg.state) {
     case 'deterministic': return 'deterministic'
-    case 'none': return 'none'
+    case 'none':
+      // 无证据的两个变体：可疑实体（反引号里发现的没有 cite，[[t:编造]] 的 cite 带 unknown）、核对不了
+      if (seg.issue === 'unknown_entity' || seg.cite?.unknown) return 'suspect'
+      if (seg.issue === 'unverified_entity' || seg.cite?.unverified) return 'unverified'
+      return 'none'
     case 'probabilistic': return 'unjudged'
     case 'candidate': return 'candidate'
     default: return null
   }
+}
+
+/**
+ * 有出处的片段里，实体和引文另有一层外观：线型、颜色和数字同一套「有出处」，字形和文字
+ * 各自不同——引文前面挂一个引号，实体写在反引号里的照行内代码画。四个通道同 EVIDENCE_STATE
+ */
+export type EvidenceKindCode = 'entity' | 'quote'
+export interface EvidenceKindStyle {
+  code: EvidenceKindCode
+  line: EvidenceLine
+  glyph: string
+  color: string
+  label: string
+  hint: string
+}
+export const EVIDENCE_KIND_STYLE: Record<EvidenceKindCode, EvidenceKindStyle> = {
+  entity: {
+    code: 'entity', line: 'solid', glyph: '', color: 'var(--st-done)', label: '有出处 · 表或字段',
+    hint: '本次运行的表结构快照、查询用到的表或查询结果列里真实存在的名字',
+  },
+  quote: {
+    code: 'quote', line: 'solid', glyph: '“', color: 'var(--st-done)', label: '有出处 · 逐字引文',
+    hint: '在知识库检索命中的原文里逐字出现（空白归一化后比对）',
+  },
+}
+
+/** 片段是实体还是引文（状态另看 segmentState）：其余返回 null */
+export function segmentKind(seg: Pick<EvidenceSegment, 'kind'>): EvidenceKindCode | null {
+  return seg.kind === 'entity' ? 'entity' : seg.kind === 'quote' ? 'quote' : null
+}
+
+/** 片段给人看的名字：反引号里的实体去掉两个反引号 */
+export function segName(seg: Pick<EvidenceSegment, 'text' | 'kind' | 'code' | 'name'>): string {
+  if (seg.kind === 'entity' && (seg.code || /^`[^`]+`$/.test(seg.text))) return seg.name ?? seg.text.replace(/^`|`$/g, '')
+  return seg.text
 }
 
 /** 一个句子（单元格、列表项）的正文：结构片段不算 */
@@ -144,8 +204,28 @@ export function sourceOf(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'cata
   if (cite.kind === 'input' || entry?.kind === 'input') {
     return `${EVIDENCE_KIND_LABEL.input} ${entry?.locator?.field ?? cite.locator?.field ?? cite.ref ?? ''}`.trim()
   }
+  if (cite.kind === 'table' || cite.kind === 'column' || entry?.kind === 'table' || entry?.kind === 'column') {
+    // 「表 orders · 出现在查询 Q1、Q2」：名字从目录取（大小写照库里的），查询编号是报告里的全局编号
+    const kind = (cite.kind ?? entry?.kind) === 'table' ? EVIDENCE_TEXT.table : EVIDENCE_TEXT.column
+    const name = entry?.alias ? String(entry.alias).replace(/^[tc]:/, '') : cite.ref ?? ''
+    const queries: string[] = Array.isArray(entry?.queries) ? entry.queries.map(String) : []
+    return [`${kind} ${name}`.trim(), queries.length ? EVIDENCE_TEXT.entityQueries(queries) : ''].filter(Boolean).join(' · ')
+  }
+  if (cite.kind === 'quote') {
+    const where = quoteWhere(cite.source)
+    return [`${EVIDENCE_KIND_LABEL.quote} ${cite.alias ?? ''}`.trim(), where].filter(Boolean).join(' · ')
+  }
   const kind = cite.kind ? EVIDENCE_KIND_LABEL[cite.kind] : ''
   return [kind, cite.alias ?? cite.ref].filter(Boolean).join(' ')
+}
+
+/** 引文出自哪：「出自「运营手册 · 退款」第 3 段」；只有文档 id 时写 id 的前几位 */
+export function quoteWhere(src: { title?: string; document?: string; ordinal?: number } | null | undefined): string {
+  if (!src || typeof src !== 'object') return ''
+  const title = typeof src.title === 'string' && src.title.trim() ? src.title.trim()
+    : typeof src.document === 'string' && src.document ? shortId(src.document, 12) : ''
+  const ordinal = typeof src.ordinal === 'number' && Number.isFinite(src.ordinal) ? EVIDENCE_TEXT.quoteChunk(src.ordinal) : ''
+  return [title ? EVIDENCE_TEXT.quoteFrom(title) : '', ordinal].filter(Boolean).join(' ')
 }
 
 /**
@@ -331,10 +411,16 @@ export function caliberUpgradeText(up: EvidenceCaliberUpgrade | null | undefined
   return EVIDENCE_TEXT.caliberUpgrade(latest, policy)
 }
 
-/** 无证据的原因：裸数字，还是引用解析不了（带后端给的人话原因） */
+/**
+ * 无证据的原因：裸数字、引用解析不了（带后端给的人话原因）、可疑实体、核对不了。
+ * 反引号里自动发现的可疑名字没有 cite，用固定的说法
+ */
 export function reasonOf(seg: EvidenceSegment): string {
   if (seg.issue === 'uncited_number' || (!seg.cite && seg.kind === 'number')) return EVIDENCE_TEXT.uncited
-  return seg.cite?.reason ?? (seg.ref ? `引用 ${seg.ref} 解析不了` : '')
+  if (seg.cite?.reason) return seg.cite.reason
+  if (seg.issue === 'unknown_entity') return EVIDENCE_TEXT.suspect
+  if (seg.issue === 'unverified_entity') return EVIDENCE_TEXT.unverified
+  return seg.ref ? `引用 ${seg.ref} 解析不了` : ''
 }
 
 /**
@@ -344,8 +430,10 @@ export function reasonOf(seg: EvidenceSegment): string {
 export function segmentLabel(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'catalog'> | null): string {
   const state = segmentState(seg)
   if (!state) return seg.text
-  const why = state === 'none' ? reasonOf(seg) : sourceOf(seg, doc)
-  return `${seg.text}，${EVIDENCE_STATE[state].label}${why ? `：${why}` : ''}`
+  const why = state === 'none' || state === 'suspect' || state === 'unverified' ? reasonOf(seg) : sourceOf(seg, doc)
+  // 可疑实体的原话本身就以「可能是编造的名字」收尾，状态那几个字不再重复一遍
+  const label = state === 'suspect' && why.includes(EVIDENCE_STATE.suspect.label) ? '' : EVIDENCE_STATE[state].label
+  return `${segName(seg)}，${[label, why].filter(Boolean).join('：')}`
 }
 
 /** 在正文里画得出线的违规：指向的片段存在，而且不是结构片段 */
@@ -364,6 +452,9 @@ export function locatable(doc: EvidenceDocData, v: EvidenceViolation): EvidenceS
 export interface EvidenceTally {
   /** 数字总数：带引用的数字片段 + 裸数字（含列表序号、代码块标签里的） */
   total: number
+  /** 可疑实体（可能是编造的名字）、核对不了的名字：数字那半句之外另说 */
+  suspect?: number
+  unverified?: number
   cited: number
   /** 没有出处的数字：总数 − 有出处（裸数字、解析不了的数字引用）。横幅上「无证据 M」的 M */
   none: number
@@ -409,7 +500,11 @@ export function docTally(doc: EvidenceDocData): EvidenceTally {
     : uncited != null && unresolved != null
       ? Math.max(0, uncited + unresolved - none)
       : segs.filter((s) => segmentState(s) === 'none' && s.kind !== 'number').length
-  return { total, cited, none, other, hidden: hidden.length, structural, noSegment: hidden.length - structural }
+  // 三期：可疑实体、核对不了的名字。stats 缺这两个键（老文档、没开实体层）时按违规清单数
+  const suspect = num(st.unknown_entities) ?? all.filter((v) => v.code === 'unknown_entity').length
+  const unverified = num(st.unverified_entities) ?? all.filter((v) => v.code === 'unverified_entity').length
+  return { total, cited, none, other, hidden: hidden.length, structural, noSegment: hidden.length - structural,
+           suspect, unverified }
 }
 
 /**
@@ -431,6 +526,8 @@ export function statsTally(stats: EvidenceDocData['stats'] | null | undefined):
 export function tallySummary(t: EvidenceTally, keys: boolean): string {
   return [
     evidenceTally(t.cited, t.total, t.other),
+    t.suspect ? `${formatNumber(t.suspect)} 个${EVIDENCE_STATE.suspect.label}` : '',
+    t.unverified ? `${formatNumber(t.unverified)} 个名字${EVIDENCE_STATE.unverified.label}` : '',
     t.structural ? EVIDENCE_TEXT.structuralCount(t.structural) : '',
     t.noSegment ? EVIDENCE_TEXT.noSegmentCount(t.noSegment) : '',
     keys ? EVIDENCE_TEXT.keysHint : '',
@@ -618,4 +715,321 @@ export function codePointIndex(text: string): (cp: number) => number {
 /** 文档里的全部片段，按正文顺序 */
 export function segmentsOf(blocks: EvidenceBlock[]): EvidenceSegment[] {
   return blocks.flatMap((b) => (b.units ?? []).flatMap((u) => u.segments ?? []))
+}
+
+// -------------------------------------------------------------------------
+// 三期：实体步骤、引文步骤、画布上的证据路径
+// -------------------------------------------------------------------------
+
+/**
+ * 可疑实体的「最接近的已知名字」：接口给目录键（c:orders.amount），或对象 {alias, kind, name, table?}
+ * （字段的 name 只是字段名，带着 table 时写成 表.字段）。统一成去掉 t: / c: 前缀的名字，最多 3 个
+ */
+export function closestNames(list: unknown): string[] {
+  if (!Array.isArray(list)) return []
+  const names = list.map((x) => {
+    if (typeof x === 'string') return x
+    if (!x || typeof x !== 'object') return ''
+    const o = x as { alias?: unknown; name?: unknown; table?: unknown }
+    if (typeof o.alias === 'string' && o.alias) return o.alias
+    const name = typeof o.name === 'string' ? o.name : ''
+    return typeof o.table === 'string' && o.table && name && !name.includes('.') ? `${o.table}.${name}` : name
+  }).map((n) => n.replace(/^[tc]:/, '').trim()).filter(Boolean)
+  return [...new Set(names)].slice(0, 3)
+}
+
+/** 实体的来历一行一句：「表结构快照」「查询 Q2 · 查询 SQL 用到的表」「查询 Q1 · 查询结果列」 */
+export function entitySources(list: unknown): { kind: string; text: string; truncated: boolean }[] {
+  if (!Array.isArray(list)) return []
+  const out: { kind: string; text: string; truncated: boolean }[] = []
+  for (const src of list) {
+    if (!src || typeof src !== 'object') continue
+    const kind = String((src as any).kind ?? '')
+    const alias = typeof (src as any).alias === 'string' ? (src as any).alias : ''
+    const what = EVIDENCE_TEXT.entitySource[kind] ?? kind
+    const text = [alias ? EVIDENCE_TEXT.query(alias) : '', what].filter(Boolean).join(' · ')
+    if (text && !out.some((o) => o.text === text)) out.push({ kind, text, truncated: !!(src as any).truncated })
+  }
+  return out
+}
+
+/**
+ * 引文在原文里的位置，切成前、中、后三截给面板高亮。match 是码点偏移（后端 Python 的下标），
+ * 先换成 JS 的 UTF-16 下标。对不上（越界、那一截的字和引文对不上）时按引文在原文里找一次，
+ * 再找不到就不高亮——宁可不标，不标错地方。原文很长时前后各留 context 个字，多的写省略号
+ */
+export function quoteWindow(original: string, match: { start?: number; end?: number } | null | undefined,
+  quote: string, context = 120): { before: string; hit: string; after: string; cutBefore: boolean; cutAfter: boolean } | null {
+  if (!original) return null
+  const norm = (t: string) => t.replace(/\s+/g, '')
+  const at = codePointIndex(original)
+  let a = typeof match?.start === 'number' ? at(match.start) : -1
+  let b = typeof match?.end === 'number' ? at(match.end) : -1
+  const fits = a >= 0 && b > a && b <= original.length && (!quote || norm(original.slice(a, b)) === norm(quote))
+  if (!fits) {
+    const i = quote ? original.indexOf(quote) : -1
+    if (i < 0) return null
+    a = i
+    b = i + quote.length
+  }
+  const from = Math.max(0, a - context)
+  const to = Math.min(original.length, b + context)
+  return { before: original.slice(from, a), hit: original.slice(a, b), after: original.slice(b, to),
+           cutBefore: from > 0, cutAfter: to < original.length }
+}
+
+/**
+ * 点开一个片段时，画布上该亮哪些节点：产出证据的（查询、口径卡、检索）和用到它的（报告）。
+ * 先按文档目录认（打开就有），证据链取回来后再补上链里每一步的节点（口径卡的输入、查询）
+ */
+export function evidenceTrace(
+  seg: EvidenceSegment, doc: Pick<EvidenceDocData, 'catalog' | 'node_id'>, chain: EvidenceStep[] = [],
+): { producers: string[]; consumers: string[] } {
+  const catalog = doc.catalog ?? {}
+  const producers = new Set<string>()
+  const add = (id: unknown) => { if (typeof id === 'string' && id) producers.add(id) }
+  const entry = seg.cite?.alias ? catalog[seg.cite.alias] : undefined
+  add(entry?.node_id)
+  // 实体：它出现在哪几次查询里，那几次查询是谁跑的
+  const aliases = [
+    ...(Array.isArray(entry?.queries) ? entry.queries : []),
+    ...(Array.isArray(entry?.sources) ? entry.sources.map((s: any) => s?.alias) : []),
+  ]
+  for (const a of aliases) if (typeof a === 'string') add(catalog[a]?.node_id)
+  for (const step of chain) {
+    add(step.node_id)
+    for (const inp of step.inputs ?? []) add(inp.node_id)
+    for (const q of step.queries ?? []) if (typeof q === 'string') add(catalog[q]?.node_id)
+  }
+  const consumers = doc.node_id ? [doc.node_id] : []
+  for (const c of consumers) producers.delete(c)
+  return { producers: [...producers], consumers }
+}
+
+// -------------------------------------------------------------------------
+// 报告节点卡上的章
+// -------------------------------------------------------------------------
+
+/**
+ * 章上的两个数：「引用 N」是有出处的片段（数字、值、表名字段名、引文），「无证据 M」是没出处的
+ * 数字、解析不了的引用、可疑实体，结论句策略为 require_citation 时再加上没挂依据的结论句。
+ * 统计缺了数字那两项（别的版本的后端）返回 null，不画章
+ */
+export function stampCounts(stats: EvidenceStats | null | undefined, claims?: string | null):
+  { cited: number; none: number } | null {
+  const t = statsTally(stats)
+  if (!t) return null
+  const cited = t.cited + (num(stats?.values) ?? 0) + (num(stats?.entities) ?? 0) + (num(stats?.quotes) ?? 0)
+  const none = t.none + t.other + (num(stats?.unknown_entities) ?? 0)
+    + (claims === 'require_citation' ? num(stats?.uncited_claims) ?? 0 : 0)
+  return { cited, none }
+}
+
+// -------------------------------------------------------------------------
+// 旧运行的猜测
+// -------------------------------------------------------------------------
+
+/** 证据图里的猜测（legacy_text）：可能是一份、一个列表、或按字段分的对象。认不出的丢掉 */
+export function guessesOf(graph: EvidenceGraph | null | undefined): EvidenceGuess[] {
+  if (!graph) return []
+  const isGuess = (g: unknown): g is EvidenceGuess =>
+    !!g && typeof g === 'object' && Array.isArray((g as EvidenceGuess).segments)
+  const from = graph.guess ?? (graph.mode === 'legacy_text' ? graph.legacy : null)
+  if (!from) return []
+  if (isGuess(from)) return [from]
+  if (Array.isArray(from)) return from.filter(isGuess)
+  if (typeof from === 'object') {
+    // {字段名: guess} 或 {fields: {…}}
+    // {note, fields: [{field, markdown, segments, stats}]}（后端 legacy_text 的样子），或 {字段名: guess}
+    const note = typeof (from as any).note === 'string' ? (from as any).note : undefined
+    const inner = (from as any).fields && typeof (from as any).fields === 'object' ? (from as any).fields : from
+    if (Array.isArray(inner)) return inner.filter(isGuess).map((g) => ({ note, ...g }))
+    return Object.entries(inner).filter(([, g]) => isGuess(g)).map(([field, g]) => ({ note, field, ...(g as EvidenceGuess) }))
+  }
+  return []
+}
+
+/** 一个候选说一句：「查询 Q1 · 第 1 行 · gmv」「口径卡指标 销售额」，差值不为 0 时补一句 */
+export function candidateText(c: EvidenceCandidate): string {
+  const loc = c.locator ?? {}
+  let where = ''
+  if (c.kind === 'metric' || typeof loc.metric === 'string') {
+    const name = c.name ?? loc.metric ?? c.ref?.replace(/^m:/, '') ?? ''
+    where = `${EVIDENCE_KIND_LABEL.metric} ${name}`.trim()
+  } else {
+    const alias = c.alias ?? (typeof c.ref === 'string' ? c.ref.split('.')[0] : '')
+    where = [alias ? EVIDENCE_TEXT.query(alias) : EVIDENCE_KIND_LABEL.cell, locatorText(loc)].filter(Boolean).join(' · ')
+  }
+  const diff = typeof c.diff === 'number' && Number.isFinite(c.diff) && c.diff !== 0
+    ? EVIDENCE_TEXT.guessDiff(evidenceValue(Math.abs(c.diff))) : ''
+  return [where, c.rendered && c.rendered !== NONE ? `= ${c.rendered}` : '', diff].filter(Boolean).join(' ')
+}
+
+// -------------------------------------------------------------------------
+// 记录页的审计表
+// -------------------------------------------------------------------------
+
+/** 分组的键和后端 /evidence/audit 一致：有出处 / 无证据 / 可疑实体 / 旧运行猜测 */
+export type AuditGroup = 'cited' | 'none' | 'suspicious' | 'candidate'
+/** 表里分组的顺序：有问题的在前（正常态安静，异常态醒目）。导出的文件按后端的顺序 */
+export const AUDIT_GROUPS: readonly AuditGroup[] = ['none', 'suspicious', 'cited', 'candidate']
+export type AuditFilter = 'all' | 'problems'
+/** 「只看无证据 / 可疑实体」对应的分组，也是导出时 ?groups= 的值 */
+export const PROBLEM_GROUPS: readonly AuditGroup[] = ['none', 'suspicious']
+
+export interface AuditRow {
+  /**
+   * 行的键，一张表里各不相同（React 的 key，也是键盘走表时找行的依据）：片段的行 `报告:片段`；
+   * 违规、没挂依据的结论句 `报告:片段:问题:位置`——同一段文字里可以有好几条同样的违规（粗体、链接里
+   * 两个可疑名字），片段和问题都一样，只有位置不同。万一还撞上，后来的带 `#序号`
+   */
+  key: string
+  /** 报告节点 id；旧运行的猜测是成果字段名 */
+  report: string
+  /** 能在正文里打开的片段 id */
+  seg?: string
+  text: string
+  state: EvidenceStateCode
+  group: AuditGroup
+  /** number / value / entity / quote / claim / violation */
+  kind: string
+  /** 出处（有出处的）或原因（没有的） */
+  source: string
+  ref?: string
+  /** 所在的句子 */
+  sentence: string
+  /** 这件证据在不在封存范围内（封存核对也通过）；没有证据的是 null */
+  sealed: boolean | null
+}
+
+const GROUP_OF: Record<EvidenceStateCode, AuditGroup> = {
+  deterministic: 'cited', none: 'none', suspect: 'suspicious', unverified: 'suspicious', candidate: 'candidate',
+  supported: 'cited', partial: 'none', unsupported: 'none', unjudged: 'cited', connective: 'cited',
+}
+const AUDIT_GROUP_SET = new Set<string>(['cited', 'none', 'suspicious', 'candidate'])
+
+/** 反引号里的名字去掉反引号（后端审计行的 text 照正文原样带着） */
+const bareName = (kind: string, text: string) => (kind === 'entity' && /^`[^`]+`$/.test(text) ? text.slice(1, -1) : text)
+
+/**
+ * 后端 /evidence/audit 的 JSON → 表里的行。形状照 api/evidence.py（groups[].rows[]），缺字段的宽容：
+ * 状态按 state + issue 认（可疑实体、核对不了是无证据的两个变体），出处写 evidence，原因写 note
+ */
+export function auditFromApi(body: unknown): AuditRow[] {
+  const groups = body && typeof body === 'object' && Array.isArray((body as any).groups) ? (body as any).groups : []
+  const rows: AuditRow[] = []
+  const taken = new Map<string, number>()
+  /** 后端每条违规一行：同一片段、同一个 code 的违规可以有好几条，键带上位置；还撞的按出现顺序编号 */
+  const unique = (base: string) => {
+    const n = taken.get(base) ?? 0
+    taken.set(base, n + 1)
+    return n ? `${base}#${n}` : base
+  }
+  groups.forEach((g: any, gi: number) => {
+    for (const [ri, r] of (Array.isArray(g?.rows) ? g.rows : []).entries()) {
+      if (!r || typeof r !== 'object') continue
+      const kind = String(r.kind ?? '')
+      const state = segmentState({ kind, state: r.state ?? 'none', issue: r.issue ?? undefined })
+        ?? (r.group === 'candidate' ? 'candidate' : 'none')
+      const group: AuditGroup = AUDIT_GROUP_SET.has(r.group) ? r.group : AUDIT_GROUP_SET.has(g?.key) ? g.key : GROUP_OF[state]
+      const report = String(r.report ?? r.field ?? '')
+      const seg = typeof r.segment === 'string' && r.segment ? r.segment : undefined
+      const at = Array.isArray(r.span) && Number.isInteger(r.span[0]) ? String(r.span[0]) : `${gi}.${ri}`
+      rows.push({
+        key: unique(seg && kind !== 'violation' && kind !== 'claim' ? `${report}:${seg}`
+          : `${report}:${seg ?? '-'}:${r.issue ?? kind}:${at}`),
+        report, seg: kind === 'claim' ? undefined : seg,
+        text: bareName(kind, String(r.text ?? '')) || NONE, state, group, kind,
+        source: String((group === 'cited' || group === 'candidate') && r.evidence ? r.evidence : r.note ?? r.evidence ?? ''),
+        ref: typeof r.ref === 'string' ? r.ref : undefined,
+        sentence: String(r.sentence ?? '').trim(),
+        sealed: typeof r.sealed === 'boolean' ? r.sealed : null,
+      })
+    }
+  })
+  return rows
+}
+
+/**
+ * 后端没有审计接口时（老后端），按正文这份文档自己拼：每个有状态的片段一行（连接性文字、结构片段不进），
+ * 另加画不了线的违规（列表序号、代码块标签里的数字，句末依据里写错的引用）——键盘用户在表里能看全每一处。
+ * 封存状态按证据图里同一份报告、同一个别名的 sealed 取；没有证据图时是 null
+ */
+export function auditRows(doc: EvidenceDocData, opts: { report?: string; graph?: EvidenceGraph | null } = {}): AuditRow[] {
+  const report = opts.report ?? doc.node_id ?? ''
+  const sealedOf = (alias?: string): boolean | null => {
+    if (!alias || !opts.graph?.evidence) return null
+    const hit = opts.graph.evidence.find((e) => e?.alias === alias && (!e.report || !report || e.report === report))
+    return typeof hit?.sealed === 'boolean' ? hit.sealed : null
+  }
+  const rows: AuditRow[] = []
+  const shown = new Set<string>()
+  for (const block of doc.blocks ?? []) {
+    for (const unit of block.units ?? []) {
+      const sentence = unitText(unit).trim()
+      for (const seg of unit.segments ?? []) {
+        const state = segmentState(seg)
+        if (!state) continue
+        shown.add(seg.id)
+        const bad = state === 'none' || state === 'suspect' || state === 'unverified'
+        rows.push({
+          key: `${report}:${seg.id}`, report, seg: seg.id, text: segName(seg), state, group: GROUP_OF[state],
+          kind: seg.kind, source: bad ? reasonOf(seg) : sourceOf(seg, doc), ref: seg.ref, sentence,
+          sealed: bad ? null : sealedOf(seg.cite?.alias),
+        })
+      }
+    }
+  }
+  ;(doc.violations ?? []).forEach((v, i) => {
+    if (!GAP_CODES.has(v.code) && v.code !== 'unknown_entity' && v.code !== 'unverified_entity') return
+    // 画得出线的违规已经是上面的一行；粗体、链接里的可疑名字没切片段（指着一段文字），也在这里补上
+    if (v.segment && shown.has(v.segment)) return
+    const state: EvidenceStateCode = v.code === 'unknown_entity' ? 'suspect' : v.code === 'unverified_entity' ? 'unverified' : 'none'
+    rows.push({
+      key: `${report}:v${i}`, report, text: v.text ?? (v.ref ? `[[${v.ref}]]` : NONE), state, group: GROUP_OF[state],
+      // 「正文里画不了线」由表格按行能不能打开来写（后端的行也一样），这里只放违规本身的话
+      kind: 'violation', source: v.message ?? '', ref: v.ref,
+      sentence: (v.context ?? '').trim(), sealed: null,
+    })
+  })
+  return rows
+}
+
+/** 旧运行的猜测 → 表里的行：有候选的数字进「旧运行猜测」，没有的进「无证据」（和后端一致） */
+export function guessRows(guess: EvidenceGuess): AuditRow[] {
+  const field = guess.field ?? ''
+  return (guess.segments ?? []).filter((s) => s.kind === 'number').map((s) => {
+    const hit = s.state === 'candidate' && !!s.candidates?.length
+    return {
+      key: `${field}:${s.id}`, report: field, text: s.text, state: hit ? 'candidate' as const : 'none' as const,
+      group: hit ? 'candidate' as const : 'none' as const, kind: 'number',
+      source: hit ? (s.candidates ?? []).map(candidateText).join('；') : EVIDENCE_TEXT.guessNone,
+      sentence: '', sealed: null,
+    }
+  })
+}
+
+/** 按组归拢；problems 只留无证据和可疑实体两组。空组不返回 */
+export function groupRows(rows: AuditRow[], filter: AuditFilter = 'all'): { group: AuditGroup; rows: AuditRow[] }[] {
+  const keep = filter === 'problems' ? new Set<AuditGroup>(PROBLEM_GROUPS) : null
+  return AUDIT_GROUPS.filter((g) => !keep || keep.has(g))
+    .map((group) => ({ group, rows: rows.filter((r) => r.group === group) }))
+    .filter((g) => g.rows.length > 0)
+}
+
+/** 后端没有导出接口时按表里的行导出的 CSV：中文表头，逗号、引号、换行转义，公式字符开头的格子前面加 ' */
+export function auditCsv(rows: AuditRow[]): string {
+  const cell = (v: unknown) => {
+    let t = v == null ? '' : String(v)
+    // 电子表格会把 = + - @ 开头的格子当公式算：报告里的字来自模型，不能照原样写进去（纯数字除外）
+    if (/^[=+\-@\t\r]/.test(t) && !/^[+-]?[\d,.]+%?$/.test(t)) t = `'${t}`
+    return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t
+  }
+  const c = EVIDENCE_AUDIT_TEXT.cols
+  const head = ['分组', c.report, '片段', c.text, c.state, c.source, '引用', c.sentence, c.seal]
+  const seal = (v: boolean | null) => (v == null ? '' : v ? '是' : '否')
+  return [head, ...rows.map((r) => [
+    EVIDENCE_AUDIT_TEXT.groups[r.group], r.report, r.seg ?? '', r.text, EVIDENCE_STATE[r.state].label, r.source,
+    r.ref ?? '', r.sentence, seal(r.sealed),
+  ])].map((r) => r.map(cell).join(',')).join('\r\n')
 }

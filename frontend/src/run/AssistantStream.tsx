@@ -23,7 +23,7 @@ import {
 } from './decode'
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
-import { docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
+import { EVIDENCE_STATE, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
 import type { EvidenceDocData } from '../types'
 import { useRunClock } from './useRunClock'
 import type { ReviewResult } from '../types'
@@ -2256,6 +2256,12 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   }
   const hitsOf = (c: any): number | undefined =>
     perCaliber.get([c?.caliber, c?.version].filter(Boolean).join(' @ '))
+  // 数字之外另说的两样：可疑名字（按报告文档数，和文档自己的证据条同一个数）、没挂依据的结论句（只在要求挂依据时有）
+  const counts = evidence?.counts
+  const suspect = counts?.suspect ?? 0
+  const uncitedClaims = Number(issuance?.claims?.uncited_claims ?? 0) || 0
+  const numbers = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
+  const numbersOk = !counts?.none && !counts?.other
 
   return (
     // data-issuance-banner：画布上成果节点的出具印章据此滚过来；tabIndex 让「去看出具」能把焦点带到这里
@@ -2275,14 +2281,24 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         </span>
       </div>
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
-      {evidence?.counts && (evidence.counts.total > 0 || evidence.counts.other > 0) && (
-        // 逐段证据的计数：和报告核对那一行、证据条同一种说法。有无证据的地方才给「定位下一处」
+      {counts && (counts.total > 0 || counts.other > 0 || suspect > 0 || uncitedClaims > 0) && (
+        // 逐段证据的计数：和报告核对那一行、证据条同一种说法。可疑名字、没挂依据的结论句不是数字，
+        // 各自另起一句。有无证据的数字、可疑名字时才给「定位下一处」（结论句不是片段，定位不到）
         <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
-          <span className="tnum" style={{
-            color: evidence.counts.none || evidence.counts.other ? 'var(--st-waiting)' : 'var(--st-done)' }}>
-            {evidenceTally(evidence.counts.cited, evidence.counts.total, evidence.counts.other)}
-          </span>
-          {(evidence.counts.none > 0 || evidence.counts.other > 0) && evidence.onNext && (
+          {numbers && (
+            <span className="tnum" style={{ color: numbersOk ? 'var(--st-done)' : 'var(--st-waiting)' }}>{numbers}</span>
+          )}
+          {suspect > 0 && (
+            <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-suspect="">
+              {numbers ? '· ' : ''}{EVIDENCE_STATE.suspect.glyph} {EVIDENCE_TEXT.suspectTag} {formatNumber(suspect)}
+            </span>
+          )}
+          {uncitedClaims > 0 && (
+            <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-claims="">
+              {numbers || suspect > 0 ? '· ' : ''}{EVIDENCE_TEXT.uncitedClaimsTag} {formatNumber(uncitedClaims)}
+            </span>
+          )}
+          {(counts.none > 0 || counts.other > 0 || suspect > 0) && evidence?.onNext && (
             <button type="button" className="btn btn-xs" data-evidence-next="" onClick={evidence.onNext}>
               {EVIDENCE_TEXT.locateNext}
             </button>

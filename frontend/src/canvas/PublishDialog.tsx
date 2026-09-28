@@ -581,6 +581,8 @@ function FixControl({ fix, pf }: { fix: PublishFix; pf: PreflightState }) {
     const picked = (v: unknown) => (fix.multiple
       ? Array.isArray(value) && value.some((x) => same(x, v))
       : value !== undefined && same(value, v))
+    // 选的是「交给 Copilot」那一项：和点「交给 Copilot」一回事，请求带 assist，等待时说 Copilot 在修
+    const handoff = !fix.multiple && (fix.options ?? []).some((o) => o.handoff === true && picked(o.value))
     return (
       <fieldset className="mb-1 ml-[22px] mt-0.5 rounded border px-2 py-1.5" data-fix-choice={fix.id}>
         <legend className="px-1 text-faint">{fix.label}{fix.multiple ? ` · ${T.multiple}` : ''}</legend>
@@ -603,8 +605,10 @@ function FixControl({ fix, pf }: { fix: PublishFix; pf: PreflightState }) {
         </div>
         <div className="mt-1.5 flex items-center gap-2">
           <button type="button" className="btn btn-xs" data-fix-action="choice" disabled={!ready || pf.working}
-                  onClick={() => void pf.requestPreview({ apply: [fix.id], choices: { [fix.id]: value } })}>
-            <Wand2 size={10} aria-hidden /> {T.choose}
+                  data-fix-handoff={handoff ? '' : undefined} title={handoff ? T.assistHint : undefined}
+                  onClick={() => void pf.requestPreview({
+                    apply: [fix.id], choices: { [fix.id]: value }, ...(handoff ? { assist: true } : {}) })}>
+            {handoff ? <Sparkles size={10} aria-hidden /> : <Wand2 size={10} aria-hidden />} {handoff ? T.assist : T.choose}
           </button>
           {!ready && <span className="text-faint">{T.chooseFirst}</span>}
         </div>

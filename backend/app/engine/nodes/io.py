@@ -57,12 +57,13 @@ async def run_output(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     reports = _report_fields(result, mapping, state, ctx)
     contract = ctx.cfg("contract")
     if contract:
-        cells = True
+        cells, governed = True, False
         if isinstance(contract, dict) and contract.get("report_from") not in (None, ""):
             from app.engine.governance import cells_allowed, governed_formal
 
-            cells = cells_allowed(contract, governed=await governed_formal(ctx.run.run_id))
-        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports, cells=cells)
+            governed = await governed_formal(ctx.run.run_id)
+            cells = cells_allowed(contract, governed=governed)
+        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports, cells=cells, governed=governed)
     evidence = _evidence_of(reports, contract)
     if evidence:
         result["_evidence"] = evidence
@@ -142,7 +143,7 @@ def _evidence_of(reports: list[dict[str, Any]], contract: Any) -> dict[str, Any]
 
 def _apply_contract(
     contract: dict[str, Any], state: GraphState, ctx: NodeContext,
-    *, reports: list[dict[str, Any]] | None = None, cells: bool = True,
+    *, reports: list[dict[str, Any]] | None = None, cells: bool = True, governed: bool = False,
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
@@ -195,7 +196,8 @@ def _apply_contract(
     trace = None
     cited: dict[str, Any] = {}
     if citations:
-        cited = _check_citations(str(report_from), contract, state, ctx, reports or [], cells=cells)
+        cited = _check_citations(str(report_from), contract, state, ctx, reports or [], cells=cells,
+                                 governed=governed)
         gaps.extend(cited["gaps"])
         unmatched = cited["unmatched"]
     else:
@@ -235,6 +237,8 @@ def _apply_contract(
         strict=bool(contract.get("strict")),
         gaps=gaps,
         unresolved=cited.get("unresolved"),
+        uncited_claims=cited.get("uncited"),
+        claims_policy=cited.get("claims_policy"),
     )
 
     if citations:
@@ -285,26 +289,31 @@ def _apply_contract(
 #: 文档本身对不上（不是某个数没出处）：这次复核没法完成，记 gap
 _INTEGRITY = {"bad_schema", "segment_mismatch", "structural_text", "render_mismatch", "eid_mismatch",
               "state_mismatch"}
+#: 出具声明里列多少个可疑名字、多少句没挂依据的结论（计数照实，列表只是给人看的样本）
+_LISTED = 20
 
 
 def _check_citations(
     report_from: str, contract: dict[str, Any], state: GraphState, ctx: NodeContext,
-    reports: list[dict[str, Any]], *, cells: bool = True,
+    reports: list[dict[str, Any]], *, cells: bool = True, governed: bool = False,
 ) -> dict[str, Any]:
-    """独立复核报告文档：{matched, unmatched, unresolved, gaps, doc_artifact, stats}。
+    """独立复核报告文档：{matched, unmatched, unresolved, gaps, doc_artifact, stats, claims_policy, uncited,
+    claims, entities}。
 
     不信报告节点自己的统计：文档按 id 从工件库取回（取回时复验哈希），目录按报告节点
     同一套参数从状态里重建（不用文档里存的那份），每个带引用的片段重新解析、重新渲染、
     逐字比对。一个配错的报告节点绕不过这里。
 
     cells：受管级别的正式运行、契约没声明 cells 时为 False，单元格引用一律判解析不了。
+    governed：受管级别的正式运行。可疑实体（名字哪里都找不到）只在这时按缺口降档，别处只标注。
     """
     from app.core.artifact_store import load
-    from app.engine.evidence import iter_units, resolve_ref, verify_doc
-    from app.engine.nodes.report import report_catalog
+    from app.engine.evidence import iter_units, ledger_enabled, resolve_ref, verify_doc
+    from app.engine.nodes.report import report_catalog, report_entities
 
     out: dict[str, Any] = {"matched": [], "unmatched": [], "unresolved": [], "gaps": [],
-                           "doc_artifact": None, "stats": None}
+                           "doc_artifact": None, "stats": None, "claims_policy": None, "uncited": None,
+                           "claims": None, "entities": None}
     gaps = out["gaps"]
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
@@ -332,10 +341,12 @@ def _check_citations(
         return out
 
     catalog = report_catalog(state, spec, node)
-    checked = verify_doc(doc, catalog, allow_numbers=contract.get("allow_numbers"), cells_allowed=cells)
+    checked = verify_doc(doc, catalog, allow_numbers=contract.get("allow_numbers"), cells_allowed=cells,
+                         entities=report_entities(spec, node) == "link")
     out["stats"] = checked["stats"]
     broken: list[str] = []
     flagged: set[str] = set()
+    suspicious: dict[str, list[dict[str, Any]]] = {"unknown_entity": [], "unverified_entity": []}
     for v in checked["violations"]:
         where = {k: v[k] for k in ("segment", "unit") if v.get(k)}
         if v.get("span"):
@@ -346,11 +357,27 @@ def _check_citations(
             out["unmatched"].append({"token": v.get("text", ""), "context": v.get("context", ""), **where})
         elif v["code"] == "unresolved_ref":
             out["unresolved"].append({"ref": v.get("ref", ""), "message": v["message"], **where})
+        elif v["code"] in suspicious:
+            # 写 [[see:t:x]] 时违规上没有正文里的字，名字取自引用
+            name = v.get("text") or str(v.get("ref") or "").partition(":")[2]
+            suspicious[v["code"]].append({"name": name, **({"ref": v["ref"]} if v.get("ref") else {}), **where})
         elif v["code"] in _INTEGRITY:
             broken.append(v["message"])
     if broken:
         more = f"等 {len(broken)} 处" if len(broken) > 1 else ""
         gaps.append(f"报告「{node.title}」的文档没通过复核：{broken[0]}{more}")
+    unknown, unverified = suspicious["unknown_entity"], suspicious["unverified_entity"]
+    if unknown and governed:
+        # 用户拍板：可疑实体在受管级别的正式出具里按「有缺口」降档，不拦截——反引号里的一个业务词
+        # 也可能被当成名字，为它不予出具太重；探索运行、已发布级别只标注
+        names = "".join(f"「{n}」" for n in dict.fromkeys(u["name"] for u in unknown[:5]))
+        more = "等" if len(unknown) > 5 else ""
+        gaps.append(f"报告「{node.title}」里有 {len(unknown)} 处可疑实体（{names}{more}）：本次运行的表结构、查询、"
+                    "结果列里都没有这些名字，可能是编造的")
+    if unknown or unverified:
+        # 表结构快照不全时核对不了的名字（unverified）在哪个级别都只标注
+        out["entities"] = {"unknown": unknown[:_LISTED], "unverified": unverified[:_LISTED],
+                           "counted": governed and bool(unknown)}
 
     # 老前端要用的逐个数字出处，从复核通过的数字片段拼出来
     for _, unit in iter_units(doc):
@@ -375,10 +402,8 @@ def _check_citations(
             out["matched"].append({**hit, "segment": seg["id"], "unit": unit["id"], "start": start, "end": end,
                                    "span": [start, end], "eid": cite["eid"]})
 
-    claims = contract.get("claims")
-    policy = claims.get("policy") if isinstance(claims, dict) else claims
-    if policy not in (None, "", "off"):
-        gaps.append("契约声明了结论句检查（claims），这一版还不支持，结论句没有核对")
+    _claims(out, contract, payload, evidence_on=ledger_enabled(ctx.run), governed=governed,
+            uncited=checked.get("uncited") or [])
 
     mine = next((r for r in reports if r["node"].id == report_from), None)
     edited = mine["edited"] if mine else []
@@ -387,6 +412,48 @@ def _check_citations(
     if not (mine and mine["verbatim"]) and not edited:
         gaps.append(f"成果里没有哪个字段是报告「{node.title}」的原文：读者看到的内容没有经过引用核对")
     return out
+
+
+#: 没挂依据的结论句怎么处置，从松到严。认不出的写法按 degrade 算：写错一个词不能让缺口悄悄消失
+_ON_UNCITED = ("ignore", "degrade", "withhold")
+
+
+def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, Any], *, evidence_on: bool,
+            governed: bool = False, uncited: list[dict[str, Any]]) -> None:
+    """结论句策略：没挂依据的结论句按 claims_policy 交给 decide_tier 判档。
+
+    两处可以要求挂依据：报告节点写作时记下的 claims（节点产出里的，写作提示按它要求过），和契约自己写的
+    require_citation（对象形式可以另写 on_uncited）。两处都写了取更严的那个——契约只能收紧、不能放松：
+    报告节点要求了，契约写 ignore 或 off 也照旧计入缺口，写 withhold 就收紧成不予出具。受管级别的正式运行
+    里 ignore 一律当 degrade：没有哪道门禁查契约里的 claims，不能让它把用户要的底线拉低。
+
+    数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
+    包括跨着升级还没跑完的运行）一律不管，契约写了也照旧记「这一版还不支持」。judge（裁判模型）是后续版本
+    的事，契约写了照实记缺口。
+    """
+    written = payload.get("claims") if isinstance(payload, dict) else None
+    # 报告节点升级后才在产出里记 claims（off 也记）：没有这个键就是升级前写的报告
+    upgraded = evidence_on and isinstance(payload, dict) and "claims" in payload
+    declared = contract.get("claims")
+    name = declared.get("policy") if isinstance(declared, dict) else declared
+    asks: list[str] = []
+    if upgraded and written == "require_citation":
+        asks.append("degrade")
+    if upgraded and name == "require_citation":
+        wanted = declared.get("on_uncited") if isinstance(declared, dict) else None
+        asks.append(wanted if wanted in _ON_UNCITED else "degrade")
+    elif name not in (None, "", "off"):
+        out["gaps"].append("契约声明了结论句检查（claims），这一版还不支持，结论句没有核对")
+    if not asks:
+        return
+    on_uncited = max(asks, key=_ON_UNCITED.index)
+    if governed and on_uncited == "ignore":
+        on_uncited = "degrade"
+    policy: Any = "require_citation" if on_uncited == "degrade" else \
+        {"policy": "require_citation", "on_uncited": on_uncited}
+    out["claims_policy"], out["uncited"] = policy, uncited
+    out["claims"] = {"policy": "require_citation", "uncited_claims": len(uncited), "uncited": uncited[:_LISTED],
+                     **({"on_uncited": on_uncited} if on_uncited != "degrade" else {})}
 
 
 def _declare_citations(
@@ -411,7 +478,11 @@ def _declare_citations(
         "stats": cited["stats"],
         "gaps": gaps,
         "declared_at": declared_at.isoformat(),
+        # 结论句策略和可疑实体：只在用上时才有这两个键，升级前的运行和没用上的契约形状不变
+        **({"claims": cited["claims"]} if cited.get("claims") else {}),
+        **({"entities": cited["entities"]} if cited.get("entities") else {}),
     }
+    entities = cited.get("entities")
     ctx.emit(
         EventType.ISSUANCE,
         mode="citations",
@@ -426,6 +497,13 @@ def _declare_citations(
         metrics_checked=len(metrics),
         matched_numbers=len(cited["matched"]),
         matched=cited["matched"][:50],
+        # on_uncited 只在不是默认的 degrade 时才有（收紧成 withhold、探索运行的契约写了 ignore）
+        **({"claims": {k: cited["claims"][k] for k in ("policy", "uncited_claims", "on_uncited")
+                       if k in cited["claims"]}} if cited.get("claims") else {}),
+        # 计数取复核的统计（声明里的名单最多列 _LISTED 个）
+        **({"entities": {"unknown": (cited["stats"] or {}).get("unknown_entities", len(entities["unknown"])),
+                         "unverified": (cited["stats"] or {}).get("unverified_entities", len(entities["unverified"])),
+                         "counted": entities["counted"]}} if entities else {}),
     )
     return issuance
 

@@ -39,7 +39,8 @@ def two_exits() -> dict:
         node("fetch", "tool", "取数", tool="db_query__shop", args={"sql": "SELECT SUM(amount) AS gmv FROM orders"}),
         node("card", "metrics", "周报口径卡", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"}]),
-        node("write", "report", "报告撰写", instructions="写周报"),
+        node("write", "report", "报告撰写", instructions="写周报",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
         node("raw", "output", "原始数", fields=[{"name": "数", "value": "{{ nodes.fetch }}"}]),
     ]
@@ -227,7 +228,8 @@ def guarded() -> dict:
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"}]),
         node("team", "supervisor", "复核团队", goal="复核", agents=[{"name": "checker", "tools": []}]),
         node("gate", "human", "人工把关", prompt="确认数字"),
-        node("write", "report", "报告撰写", instructions="写周报"),
+        node("write", "report", "报告撰写", instructions="写周报",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}], contract=CONTRACT),
     ]
     edges = [{"id": f"e{i}", "source": a, "target": b} for i, (a, b) in enumerate(

@@ -26,8 +26,11 @@ import { EvidenceDoc, EvidenceField } from '../run/EvidenceDoc'
 import { Markdown } from '../run/Markdown'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceQuery from '../run/__tests__/evidence-query.json'
+import evidenceEntity from '../run/__tests__/evidence-entity.json'
+import { EvidenceGuessView } from '../run/EvidenceGuess'
+import { IssuanceBanner } from '../run/AssistantStream'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
-import type { EvidenceDocData } from '../types'
+import type { EvidenceDocData, EvidenceGraph } from '../types'
 import '../index.css'
 
 /**
@@ -189,6 +192,8 @@ const EV_DOC = evidenceFixture.doc as unknown as EvidenceDocData
 /** 第二期：查询单元格、整表、口径卡来源（evidence-query.json，compose_doc 真跑出来的） */
 const EV_QUERY = evidenceQuery.doc as unknown as EvidenceDocData
 const EV_LEGACY = evidenceFixture.legacy
+/** 第三期：表名字段名、可疑实体、核对不了的名字、逐字引文（evidence-entity.json，compose_doc 真跑出来的） */
+const EV_ENTITY = evidenceEntity.doc as unknown as EvidenceDocData
 /** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
 const LEGACY_LOOSE = {
   matched: EV_LEGACY.matched.map(({ start: _s, end: _e, ...m }) => m),
@@ -267,6 +272,38 @@ function EvidenceOnly() {
           </div>
           <div id="evidence-query-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
             <EvidenceDoc doc={EV_QUERY} artifact={evidenceQuery.doc_artifact} runId={evidenceQuery.run_id} label="answer" dense tally />
+          </div>
+        </div>
+        {/*
+          第三期：表名字段名（反引号里的、标记的、自动链接的）、可疑实体、核对不了的名字、逐字引文。
+          片段接口由 check-evidence 用 page.route 伪造（按 runId 认出这一份夹具）
+        */}
+        <div className="flex flex-col gap-4" id="evidence-entity-demo">
+          <div id="evidence-entity" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">表名字段名、可疑实体、逐字引文</div>
+            <EvidenceDoc doc={EV_ENTITY} artifact={evidenceEntity.doc_artifact} runId={evidenceEntity.run_id} label="answer" tally />
+          </div>
+          <div id="evidence-entity-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_ENTITY} artifact={evidenceEntity.doc_artifact} runId={evidenceEntity.run_id} label="answer" dense tally />
+          </div>
+          {/* 没有契约的旧运行：按数值猜的候选（guess_sources 真跑出来的），默认折叠 */}
+          <div id="evidence-guess" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">旧运行 · 按数值猜的可能来源</div>
+            <EvidenceGuessView guesses={evidence.guessesOf(evidenceEntity.legacy.graph as unknown as EvidenceGraph)} />
+          </div>
+          {/* 出具横幅那一行：数字都有出处，可疑名字、没挂依据的结论句也要写出来，可疑名字也给「定位下一处」 */}
+          <div id="issuance-line" className="flex flex-col gap-2 rounded-lg border p-3">
+            {([['suspect', 3, 2, 1], ['clean', 3, 0, 0], ['names', 0, 1, 0]] as const).map(([key, total, suspect, claims]) => (
+              <div key={key} data-issuance-case={key}>
+                <IssuanceBanner
+                  issuance={{ tier: 'degraded', matched_numbers: 3, metrics_checked: 2,
+                              ...(claims ? { claims: { policy: 'require_citation', uncited_claims: claims } } : {}) }}
+                  evidence={{
+                    counts: { total, cited: total, none: 0, other: 0, hidden: 0, structural: 0, noSegment: 0, suspect, unverified: 0 },
+                    onNext: () => { const w = window as any; w.__issuanceNext = (w.__issuanceNext ?? 0) + 1 },
+                  }} />
+              </div>
+            ))}
           </div>
         </div>
         <div id="evidence-long" className="rounded-lg border p-3">
@@ -561,6 +598,7 @@ function Harness() {
   lib: { format, status, keys, terms, errors, explain, health, actor, validation, evidence },
   evidenceFixture,
   evidenceQuery,
+  evidenceEntity,
 }
 
 createRoot(document.getElementById('root')!).render(

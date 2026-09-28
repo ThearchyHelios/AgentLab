@@ -1,10 +1,10 @@
 import {
-  createContext, Fragment, useContext, useMemo, useState, type HTMLAttributes, type ReactNode,
+  createContext, Fragment, useContext, useMemo, useState, type CSSProperties, type HTMLAttributes, type ReactNode,
 } from 'react'
 import { Check, Copy } from 'lucide-react'
 import clsx from 'clsx'
 import { toast } from '../components/ui'
-import { codePointIndex } from '../lib/evidence'
+import { EVIDENCE_STATE, codePointIndex } from '../lib/evidence'
 
 /**
  * 模型输出的 Markdown 渲染。
@@ -60,8 +60,11 @@ export function Markdown({ text, dense, marks }: {
 export interface MarkSpec {
   token: string
   title: string
-  /** ambiguous：回指上了，但同一个值对得上好几个指标，出处不唯一 */
-  tone: 'warn' | 'ok' | 'ambiguous'
+  /**
+   * ambiguous：回指上了，但同一个值对得上好几个指标，出处不唯一；
+   * candidate：没有契约的旧运行按数值猜的候选（最淡的点状线，读屏在字后面听到「猜测的来源：…」）
+   */
+  tone: 'warn' | 'ok' | 'ambiguous' | 'candidate'
   /** 在原文里的码点偏移 [start, end) */
   start?: number
   end?: number
@@ -108,6 +111,16 @@ const shiftAt = (at: At | undefined, i: number): At | undefined =>
   at == null ? undefined : typeof at === 'number' ? at + i : at.slice(i)
 
 function markSpan(spec: MarkSpec, text: string, key: string): ReactNode {
+  if (spec.tone === 'candidate') {
+    // 猜测：外观取证据状态表里「旧运行候选」那一档，绝不用确定性的实线和绿
+    const meta = EVIDENCE_STATE.candidate
+    return (
+      <span key={key} title={spec.title} className="ev-mark cursor-help" data-mark="candidate"
+            data-ev-state={meta.code} data-ev-line={meta.line} style={{ '--ev-line': meta.decoration } as CSSProperties}>
+        {text}<span className="sr-only">（{meta.label}：{spec.title}）</span>
+      </span>
+    )
+  }
   const color = spec.tone === 'ok' ? 'var(--st-done)' : 'var(--st-waiting)'
   return (
     <span key={key} title={spec.title}

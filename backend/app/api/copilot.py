@@ -190,19 +190,33 @@ NODE_REFERENCE = """\
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
   取 tool 节点查库的结果用 cell(nodes.取数节点id, 行, '列名')（行号从 0 数，列按列名）：cell() 直接认查询工具
   交回的结果，出处精确到快照里的那一格，不用再接 transform 解析。取 agent 的字段写 vars.<agent 的 assign_to>.字段
-- report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], on_violation, max_repairs, assign_to}
+- report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
+  claims, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
-  （tool 节点和 agent 查过的库，按查询先后编成 Q1、Q2…）和运行输入，模型只能写引用标记，数值由系统从证据里
-  取出来渲染；模型自己写的数字会被打回重写：
+  （tool 节点和 agent 查过的库，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
+  和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；模型自己写的数字会被打回重写：
   - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用
   - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
   - [[table:Q1 cols=列a,列b rows=0-4]]：把查询结果的几行几列原样生成表格，每一格都点得开出处
   - [[i:输入字段]]：运行输入
-  metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail
+  - [[t:表名]]、[[c:表名.字段名]]：表和字段，点得开是哪次查询用到的、表结构里是什么类型。写在反引号里的名字
+    （`orders`）也会被核对：只写本次运行查过的数据源里真实存在的名字，表结构、查询、结果列里都没有的会被标成
+    「可能是编造的名字」（受管模板的正式出具因此降档）
+  - [[q:K1|逐字引文]]：知识库检索的原话，必须和命中片段里的字逐字一致（空白不计，至少 4 个字），改一个字就算
+    没有出处；只是拿检索当依据时写 [[see:K1]]。要引原话，在 report 前面接 retrieve 节点
+  - 句末的 [[see:m:指标id,Q1,K1]]：这句结论的依据，不显示
+  metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
+  numbers 默认 strict（裸数字算违规）。claims 是结论句策略：off（默认，不管）/ require_citation（每句结论都要
+  挂引用，没挂的计入缺口、出具降档）；judge（模型裁判）在后续版本支持，现在写了整张图跑不起来。entities 默认 link
+  （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
   required:[必需指标id], expected:[期望指标id], strict: true}。成果字段写 {{ nodes.报告节点id.text }}，
   前后不要拼别的字——拼了就没法逐段对应证据，出具会降档。受管模板的报告要直接引用查询单元格
   （[[v:]] / [[table:]]）的，契约里写 cells: true，否则这些引用按解析不了算
+  要按受管级别发布的模板（发布前检查不过就发不出去）：报告节点写明 numbers: "strict"、on_violation: "fail"、
+  claims: "require_citation"；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
+  供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
+  否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
 
 搭图规则（有数字结论时必须遵守）：
 1. 取数（tool 节点查库；或者 agent 查库并配 output_schema + cite_fields）→ 口径卡 → report → output
@@ -304,6 +318,10 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "直接引用 agent 查过的单元格，不必经过口径卡；要比率、增幅再在 agent 和 report 之间加口径卡，agent 配 "
             "output_schema + cite_fields，口径卡读 vars.<assign_to>.字段。出口字段写 {{ nodes.report的id.text }}\n"
             "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
+            # 三期起报告会核对写出来的表名、字段名：instructions 里让它「列出用到的表」时，编出来的名字会被标出来
+            "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]] 或放进反引号，只写 agent 真查过的名字，"
+            "编造的会被标出来；要引用知识库原话就在 report 前接 retrieve，用 [[q:K1|原话]] 逐字引用。问数是探索运行，"
+            "report 的 claims 不用写\n"
             "- 用户要的是周报、要三档出具时，按搭图规则配口径卡和 report_from 契约\n"
             "- 不要用 transform 解析 agent / llm 的文字：要把 agent 查到的数交给下游，就给它配 output_schema + "
             "cite_fields\n"
@@ -968,7 +986,7 @@ def _sse(obj: dict[str, Any]) -> str:
 def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
-    level: str | None = None,
+    level: str | None = None, defaults: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
@@ -983,9 +1001,13 @@ def _blocking_issues(
 
     每条是 ValidationIssue 的字典形状（node_id、field 都在），和 final.issues 一样：
     界面靠 node_id 定位卡片、靠 field 落到具体的输入框，不用从一行字里抠节点 id。
+
+    defaults 是全图默认（graph.defaults）：报告撰写节点的 numbers / claims、审批策略都跟随它，不带上的话
+    自查看到的问题和真正的门禁对不上。
     """
     try:
-        spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
+        spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges,
+                                         **({"defaults": defaults} if isinstance(defaults, dict) else {})})
     except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
         return None
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
@@ -1609,9 +1631,12 @@ _ASSIST_RULES = """\
 - 不许降低要求：不删节点、不删连线，add_node 不许用图里已有的节点 id（那等于把旧节点删了重建），也不换节点类型；
   不删掉或清空出具契约，不删 required 里的指标，不把 strict 改成 false，不往 allow_numbers 里加数，不替人打开 cells；
   审批策略只能往严里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行），不放宽、不删掉，更不改成 never；
-  不取消子工作流钉住的版本；发布级别不是你能改的。结构要动（比如换掉协作团队），输出 question 说明怎么拆，不要自己动手
+  不取消子工作流钉住的版本；发布级别不是你能改的。结构要动（比如换掉协作团队），输出 question 说明怎么拆，不要自己动手；
+  报告撰写节点的 numbers、on_violation、claims 只能往严里改（numbers: strict、on_violation: fail、
+  claims: require_citation），不放宽、不删掉；契约里的 claims 也一样；不关 agent 的 cite_fields，不删它的 output_schema
 - 要人拿主意的，不替人选、不编：required 该包括哪些指标、几张口径卡该用哪张、钉哪个版本、协作团队拆成哪几个
-  固定步骤……每一处输出一行 {"op":"question","node_id":"节点 id","text":"要问的话，把候选列出来"}，那一处不改
+  固定步骤、沙箱代码节点是在取数还是在计算（不许自己把 evidence_role 设成 source）……每一处输出一行
+  {"op":"question","node_id":"节点 id","text":"要问的话，把候选列出来"}，那一处不改
 - 只修下面列出的问题，别的不要动
 - 可用操作只有 update_node（config 只写要改的字段，没写的原样保留）、add_node、add_edge 和 question；
   不要输出 remove_node、remove_edge、reply
@@ -1648,7 +1673,8 @@ async def assist_publish_fix(
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
     before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
     baseline = list(copy.deepcopy(before_nodes).values())
-    errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level) or []
+    errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
+                              defaults=base.get("defaults")) or []
     out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
                            "ops": []}
     if not errors:
@@ -1705,7 +1731,7 @@ async def assist_publish_fix(
     proposed = _proposed_graph(base, nodes, edges)
     reasons = forbidden_changes(base, proposed, tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
-                             baseline=baseline, level=level)
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
     if reasons:
         out["reason"] = "Copilot 的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:

@@ -37,7 +37,8 @@ def weekly(**contract_overrides) -> dict:
         node("card", "metrics", "周报口径卡", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"},
             {"id": "orders", "name": "订单数", "unit": "单", "expression": "cell(nodes.fetch, 0, 'orders')"}]),
-        node("write", "report", "报告撰写", instructions="写周报"),
+        node("write", "report", "报告撰写", instructions="写周报",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={k: v for k, v in contract.items() if v is not None}),
     ]

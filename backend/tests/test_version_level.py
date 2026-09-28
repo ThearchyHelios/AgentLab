@@ -51,7 +51,8 @@ def weekly() -> dict:
         node("fetch", "transform", mode="expression", expression="{'gmv': 300.5}", assign_to="kpi"),
         node("card", "metrics", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "vars.kpi.gmv"}]),
-        node("write", "report", instructions="写周报"),
+        node("write", "report", instructions="写周报",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={"report_from": "write", "metrics_from": ["card"], "required": ["gmv"], "strict": True}),
     ]

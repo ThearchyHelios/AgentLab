@@ -18,20 +18,26 @@
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any, Callable
 
 from pydantic import BaseModel
 
-from app.engine.governance import publish_issues
-from app.engine.schema import GraphNode, GraphSpec, NodeType, _ancestors
+from app.engine.governance import REPORT_POLICY, exit_text_fields, publish_issues
+from app.engine.schema import REPORT_CLAIMS, GraphNode, GraphSpec, NodeType, _ancestors, claims_problem
 
 #: 被选中的修复按这个顺序应用：先补契约骨架，再补契约里的各项，最后是节点上的开关。
-#: 前面的修复可能改变后面的候选（metrics_from 决定 required 从哪几张卡里挑）
+#: 前面的修复可能改变后面的候选（metrics_from 决定 required 从哪几张卡里挑，report_from 决定
+#: 成果字段默认接哪个报告撰写节点）
 _ORDER = (
     "governed.no_contract", "contract.metrics_from_missing", "contract.metrics_from_invalid",
-    "contract.report_from_missing", "contract.report_from_invalid", "report.metrics_from_invalid",
-    "contract.required_missing", "contract.strict_off", "governed.agent_approval_never",
+    "contract.report_from_missing", "contract.report_from_invalid", "governed.report_from_required",
+    "governed.exit_text_source", "report.metrics_from_invalid",
+    "contract.required_missing", "contract.strict_off", "contract.claims_ignored", "report.claims_invalid",
+    "governed.report_policy",
+    "governed.caliber_agent_cite_fields", "governed.caliber_compute_input", "governed.agent_approval_never",
     "governed.default_approval_never", "governed.subgraph_unpinned", "governed.supervisor", "contract.not_object",
+    "governed.text_bypass", "governed.caliber_agent_schema", "governed.caliber_model_input",
 )
 
 #: 修复落在全图上、不落在任何节点上的问题：问题各挂在跟随全图默认的那几个节点上（点一条能定位），
@@ -40,14 +46,17 @@ _GRAPH_FIXES = frozenset({"governed.default_approval_never"})
 
 #: 除了 error，这几条警告也给修复（受管档位下）。已发布档位的门禁只给警告，不借「一键修复」
 #: 替人把审批、strict 这些往受管的要求上拧
-_WARNING_FIXES = {"governed": frozenset({"contract.strict_off"})}
+_WARNING_FIXES = {"governed": frozenset({"contract.strict_off", "contract.claims_ignored"})}
+
+#: choice 类修复里「交给 Copilot」那个候选的值。候选上另有 handoff: true 标记：只认标记，不认值——
+#: 别的 choice 拿节点 id 当候选值，节点 id 恰好叫 copilot 的报告撰写节点照样是个普通候选
+HANDOFF = "copilot"
 
 ASSIST_ONLY = "这一处是结构性的问题，要交给 Copilot：请求里带上 assist: true"
 STALE = "这处问题现在已经没有了（修复 id 过期），重新检查一次"
 SOLVED = "前面的修复已经一并解决了这一处"
 NEED_CHOICE = "这一处要你来选：{label}"
 
-_TEXT_NODES = (NodeType.LLM, NodeType.AGENT)
 #: 修复和 Copilot 兜底只许改节点配置、补节点和连线。其余的图操作（删节点、删连线）和
 #: 任何不认识的操作（发布、改级别…）一律当降低要求处理
 _GRAPH_OPS = frozenset({"add_node", "update_node", "add_edge"})
@@ -59,11 +68,13 @@ _GRAPH_OPS = frozenset({"add_node", "update_node", "add_edge"})
 
 
 class _Ctx:
-    def __init__(self, spec: GraphSpec, versions: dict[str, Any] | None, cards: dict[str, Any] | None) -> None:
+    def __init__(self, spec: GraphSpec, versions: dict[str, Any] | None, cards: dict[str, Any] | None,
+                 level: str = "governed") -> None:
         self.spec = spec
         self.nodes = spec.node_map()
         self.versions = versions or {}
         self.cards = cards or {}
+        self.level = level
 
     def upstream(self, node_id: str, *types: NodeType) -> list[GraphNode]:
         """这个节点上游的某几类节点，按画布上的节点顺序。"""
@@ -148,7 +159,10 @@ def _plan_metrics_from_invalid(ctx: _Ctx, issue: dict[str, Any], node: GraphNode
     return _cards_choice(ctx, node, before, "contract.metrics_from")
 
 
-def _reports_choice(ctx: _Ctx, node: GraphNode, before: Any, *, narrative: bool) -> dict[str, Any]:
+def _reports_choice(ctx: _Ctx, node: GraphNode, before: Any) -> dict[str, Any]:
+    """report_from 指向哪个报告撰写节点。以前没有报告撰写节点时退回让人选 narrative（旧的叙述模式），
+    可受管级别的叙述模式过不了 G1（governed.report_from_required），已发布级别这几条又只是警告、不给
+    修复——那个候选修了也发不出去，所以没有报告撰写节点就交给 Copilot 加一个。"""
     field = "contract.report_from"
     reports = ctx.upstream(node.id, NodeType.REPORT)
     if len(reports) == 1:
@@ -156,27 +170,120 @@ def _reports_choice(ctx: _Ctx, node: GraphNode, before: Any, *, narrative: bool)
                      before, reports[0].id)
     if reports:
         return _choice("选出具契约核对哪个「报告撰写」节点的文档（report_from）", field, _node_options(reports))
-    writers = ctx.upstream(node.id, *_TEXT_NODES) if narrative else []
-    if writers:
-        # 没有报告撰写节点时退回旧的叙述模式：数字按叙述回指口径卡。只有一个候选也要人确认——
-        # 它是不是那段该核对的叙述，只有作者知道
-        options = [{"value": f"{{{{ nodes.{n.id}.text }}}}", "label": f"「{n.title}」写的文字",
-                    "hint": f"narrative = {{{{ nodes.{n.id}.text }}}}"} for n in writers]
-        return _choice("选出具契约要核对的叙述来自哪个节点（narrative）", "contract.narrative", options,
-                       default=options[0]["value"] if len(options) == 1 else None)
-    return _assist("出口上游没有「报告撰写」节点，也没有写叙述的模型节点", field)
+    return _assist("出口上游没有「报告撰写」节点：要在出口前面加一个，出具契约才有文档可核对", field)
 
 
 def _plan_report_from_missing(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
     if node is None:
         return None
-    return _reports_choice(ctx, node, _contract(node).get("report_from"), narrative=True)
+    return _reports_choice(ctx, node, _contract(node).get("report_from"))
+
+
+def _plan_report_from_required(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    if node is None:
+        return None
+    return _reports_choice(ctx, node, _contract(node).get("report_from"))
+
+
+def _report_text(report_id: str) -> str:
+    return f"{{{{ nodes.{report_id}.text }}}}"
+
+
+def _plan_exit_fields(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """G1：成果字段改成取报告撰写节点的正文。就一个候选也给选项——字段里放什么是作者的事，
+    改了就是换掉原来的内容；报告撰写节点一个都没有，交给 Copilot 加。"""
+    if node is None:
+        return None
+    bad = exit_text_fields(ctx.spec, node)
+    if not bad:
+        return None
+    named = [f"「{name}」" for _, name, _ in bad if name is not None]
+    action = f"把成果字段{'、'.join(named)}改成取" if named else "给出口配一个成果字段 result，取"
+    reports = ctx.upstream(node.id, NodeType.REPORT)
+    if not reports:
+        return _assist(f"「{node.title}」上游没有报告撰写节点：要在出口前面加一个，{action}它的正文", "fields")
+    options = [{**o, "hint": f"{o['hint']} · {_report_text(o['value'])}"} for o in _node_options(reports)]
+    pinned = _contract(node).get("report_from")
+    default = pinned if pinned in {r.id for r in reports} else reports[0].id if len(reports) == 1 else None
+    return _choice(f"{action}哪个报告撰写节点的正文", "fields", options, default=default,
+                   _fields=[field for field, _, _ in bad])
+
+
+def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """G3：报告撰写节点写明最严的三项。答案唯一，只往严里改；写了不支持的 claims 由 claims_invalid 管。"""
+    if node is None:
+        return None
+    writes: dict[str, Any] = {}
+    before: dict[str, Any] = {}
+    for key, want, _ in REPORT_POLICY:
+        value = node.config.get(key)
+        effective = ctx.spec.defaults.get(key) if value in (None, "") else value
+        if effective != want and not (key == "claims" and claims_problem(effective)):
+            writes[key], before[key] = want, copy.deepcopy(value)
+    if not writes:
+        return None
+    keys = list(writes)
+    preview = ({"field": keys[0], "before": before[keys[0]], "after": writes[keys[0]]} if len(keys) == 1
+               else {"field": "、".join(keys), "before": before, "after": writes})
+    return {"kind": "auto", "label": f"给「{node.title}」写明 " + "、".join(f"{k}: {v}" for k, v in writes.items()),
+            "field": keys[0], "preview": preview, "_set": writes}
+
+
+def _plan_claims(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """claims 写了不支持的值。受管级别只认 require_citation，答案唯一；已发布级别 off 和 require_citation
+    都行，要人选——写的是 judge（还不支持的模型裁判）时建议 require_citation：它离裁判最近。"""
+    if node is None:
+        return None
+    before = node.config.get("claims")
+    if ctx.level == "governed":
+        return _auto(f"把「{node.title}」的 claims 改成 require_citation：受管出具要求每句结论挂引用"
+                     + ("（结论句裁判在后续版本支持）" if before == "judge" else ""), "claims", before, "require_citation")
+    hints = {"off": "结论句不参与判档，和以前一样", "require_citation": "没挂引用的结论句计入缺口，按出具档位降档"}
+    options = [{"value": v, "label": v, "hint": hints[v]} for v in REPORT_CLAIMS]
+    return _choice(f"选「{node.title}」的结论句策略（claims）", "claims", options,
+                   default="require_citation" if before == "judge" else None)
+
+
+def _plan_compute_input(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """G4：沙箱代码到底是在取数还是在算，只有作者知道。取数的标成 source；在算的交给 Copilot 把计算
+    挪进口径卡——两样都不替人选，也不给建议。"""
+    if node is None:
+        return None
+    options = [
+        {"value": "source", "label": "它在取数：标成 source（取数）",
+         "hint": "evidence_role = source，口径卡读它时记得下出处"},
+        {"value": HANDOFF, "label": "它在做计算：交给 Copilot 把计算挪进口径卡",
+         "hint": "Copilot 改的同样只是预览，要人拿主意的会原样问你", "handoff": True},
+    ]
+    return _choice(f"「{node.title}」的产出喂给了口径卡：它是在取数，还是在做计算？", "evidence_role", options)
+
+
+def _plan_cite_fields(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    if node is None:
+        return None
+    return _auto(f"打开「{node.title}」的 cite_fields：每个字段都核对到查询结果里的那一格", "cite_fields",
+                 node.config.get("cite_fields"), True)
+
+
+def _plan_agent_schema(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    return _assist(f"给「{_title(node)}」配 output_schema：交哪些字段、什么类型要你或 Copilot 定，自动修复不替你编；"
+                   "配好之后再开 cite_fields", "output_schema")
+
+
+def _plan_model_input(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    return _assist(f"「{_title(node)}」写的数进了口径卡：要换成 Agent（配 output_schema、开 cite_fields）或「调用工具」"
+                   "节点取数。修复不删节点，Copilot 会拟一个改法")
+
+
+def _plan_text_bypass(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    return _assist(f"「{_title(node)}」写的文字要改由报告撰写节点来写：在它和出口之间加一个报告撰写节点，出口改成取"
+                   f"报告的正文。修复不删节点，「{_title(node)}」会留在图上")
 
 
 def _plan_report_from_invalid(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
     if node is None:
         return None
-    return _reports_choice(ctx, node, _contract(node).get("report_from"), narrative=False)
+    return _reports_choice(ctx, node, _contract(node).get("report_from"))
 
 
 def _plan_report_metrics_from(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
@@ -224,6 +331,18 @@ def _plan_strict(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> di
         return None
     return _auto("把出具契约设为 strict：没有出处的数字直接拦下，而不是只降档", "contract.strict",
                  _contract(node).get("strict"), True)
+
+
+def _plan_claims_ignored(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """受管契约的 claims 写了 on_uncited: ignore：受管正式运行本来就按 degrade 办，改成 degrade 答案唯一、
+    不降低要求，只是让写法和实际一致。"""
+    if node is None:
+        return None
+    claims = _contract(node).get("claims")
+    if not isinstance(claims, dict):
+        return None
+    return _auto("把出具契约 claims 的 on_uncited 改成 degrade：受管级别的正式运行本来就这么办，写法和实际一致",
+                 "contract.claims.on_uncited", claims.get("on_uncited"), "degrade")
 
 
 def _plan_approval(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
@@ -292,7 +411,18 @@ _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str
     "contract.report_from_invalid": _plan_report_from_invalid,
     "contract.required_missing": _plan_required,
     "contract.strict_off": _plan_strict,
+    "contract.claims_ignored": _plan_claims_ignored,
     "report.metrics_from_invalid": _plan_report_metrics_from,
+    # 证据门禁 G1–G5
+    "governed.report_from_required": _plan_report_from_required,
+    "governed.exit_text_source": _plan_exit_fields,
+    "governed.text_bypass": _plan_text_bypass,
+    "governed.report_policy": _plan_report_policy,
+    "report.claims_invalid": _plan_claims,
+    "governed.caliber_compute_input": _plan_compute_input,
+    "governed.caliber_agent_cite_fields": _plan_cite_fields,
+    "governed.caliber_agent_schema": _plan_agent_schema,
+    "governed.caliber_model_input": _plan_model_input,
 }
 
 
@@ -320,7 +450,7 @@ def plan_fixes(spec: GraphSpec, issues: list[Any], *, level: str, versions: dict
     cards：钉在别处（caliber_from）的口径卡节点 id → 那一版里的指标定义，用来列 required 的候选。
     返回的 Fix 里以 _ 开头的键是应用时要用的内部信息，交给前端前用 public() 去掉。
     """
-    ctx = _Ctx(spec, versions, cards)
+    ctx = _Ctx(spec, versions, cards, level)
     warned = _WARNING_FIXES.get(level, frozenset())
     out: dict[str, dict[str, Any]] = {}
     for issue in map(_as_dict, issues):
@@ -426,11 +556,41 @@ def _edit_defaults(graph: dict[str, Any], fix: dict[str, Any], value: Any) -> li
             for path, after in (fix.get("_set") or {}).items() if path.startswith("defaults.")]
 
 
-#: 每类问题怎么改图。大多是同一种「按节点字段写值」，改全图默认的另走一格；留着这张表是为了哪天
+def _edit_exit_fields(graph: dict[str, Any], fix: dict[str, Any], value: Any) -> list[tuple[str, str, Any, Any]]:
+    """G1：文字不是来自报告撰写节点的成果字段，改成取选中那个报告的正文；只动门禁点了名的那几个字段。
+    出口没配字段的补一个 result——没配字段时成果的键就叫 result，下游照旧取得到。"""
+    node = _node(graph, fix["node_id"])
+    if node is None:
+        return []
+    config = _config(node)
+    text = _report_text(str(value))
+    targets = list(fix.get("_fields") or [])
+    if targets == ["fields"]:
+        before = copy.deepcopy(config.get("fields"))
+        config["fields"] = [{"name": "result", "value": text}]
+        return [(str(node["id"]), "fields", before, copy.deepcopy(config["fields"]))]
+    fields = config.get("fields") if isinstance(config.get("fields"), list) else []
+    out = []
+    for path in targets:
+        m = re.fullmatch(r"fields\[(\d+)\]\.value", path)
+        field = fields[int(m.group(1))] if m and int(m.group(1)) < len(fields) else None
+        if isinstance(field, dict):
+            out.append((str(node["id"]), path, copy.deepcopy(field.get("value")), text))
+            field["value"] = text
+    return out
+
+
+#: 每类问题怎么改图。大多是同一种「按节点字段写值」，改全图默认、改成果字段的各走一格；留着这张表是为了
 #: 某类修复要特殊处理时只换它自己的那一格（测试里也借它模拟一条出错的修复规则）
 _EDITORS: dict[str, Callable[[dict[str, Any], dict[str, Any], Any], list[tuple[str | None, str, Any, Any]]]] = {
     code: (_edit_defaults if code in _GRAPH_FIXES else _edit) for code in _PLANNERS
 }
+_EDITORS["governed.exit_text_source"] = _edit_exit_fields
+
+
+def _handoff(fix: dict[str, Any], value: Any) -> bool:
+    """选中的是不是「交给 Copilot」那个候选：只认候选上的 handoff 标记。"""
+    return any(o.get("handoff") is True and o.get("value") == value for o in fix.get("options") or [])
 
 
 def _chosen(fix: dict[str, Any], choices: dict[str, Any]) -> tuple[Any, str]:
@@ -460,7 +620,7 @@ def _op(graph: dict[str, Any], node_id: str | None, edits: list[tuple[str | None
         keys = dict.fromkeys(path.split(".", 1)[1] for _, path, _, _ in edits if path.startswith("defaults."))
         return {"op": "update_defaults", "defaults": {k: copy.deepcopy(defaults.get(k)) for k in keys}}
     config = _config(_node(graph, node_id) or {})
-    tops = dict.fromkeys(path.split(".")[0] for _, path, _, _ in edits)
+    tops = dict.fromkeys(re.split(r"[.\[]", path, maxsplit=1)[0] for _, path, _, _ in edits)
     return {"op": "update_node", "id": node_id, "config": {k: copy.deepcopy(config.get(k)) for k in tops}}
 
 
@@ -469,7 +629,8 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
                 cards: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     """在副本上逐个应用修复，每一个都复核：降低要求、错误没变少或者冒出新错误的，丢弃并写明原因。
 
-    返回 {graph, changes, ops, applied, rejected, remaining, fixes, ok}。graph 只是预览，不落库。
+    返回 {graph, changes, ops, applied, rejected, handoff, remaining, fixes, ok}。graph 只是预览，不落库。
+    handoff 是人在 choice 里选了「交给 Copilot」的修复 id：图不动，调用方据此把剩下的 error 交给 Copilot。
     """
     raw = graph.model_dump(mode="json") if isinstance(graph, GraphSpec) else graph
     current = copy.deepcopy(raw)
@@ -481,6 +642,7 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
     wanted = sorted(dict.fromkeys(fix_ids), key=lambda fid: rank.get(fid.split(":")[0], len(rank)))
     applied: list[str] = []
     rejected: list[dict[str, str]] = []
+    handoff: list[str] = []
     changes: list[dict[str, Any]] = []
     ops: list[dict[str, Any]] = []
     for fid in wanted:
@@ -495,6 +657,9 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
         if why:
             rejected.append({"fix_id": fid, "reason": why})
             continue
+        if fix["kind"] == "choice" and _handoff(fix, value):
+            handoff.append(fid)
+            continue
         trial = copy.deepcopy(current)
         edits = _EDITORS.get(fix["code"], _edit)(trial, fix, value)
         try:
@@ -503,7 +668,9 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
             rejected.append({"fix_id": fid, "reason": "改完的图结构读不懂，这条修复已丢弃"})
             continue
         trial_issues = publish_issues(trial_spec, level=level)
-        why = "；".join(forbidden_changes(current, trial)) or judge(
+        # choice 里人亲手选的值不算「替人决定」（比如把沙箱代码标成取数）；别的降低要求照样拦
+        chosen = {(str(nid), path) for nid, path, _, _ in edits} if fix["kind"] == "choice" else set()
+        why = "；".join(forbidden_changes(current, trial, chosen=chosen)) or judge(
             issues, trial_issues, target=(fix["code"], fix["node_id"]))
         if why:
             rejected.append({"fix_id": fid, "reason": why})
@@ -517,7 +684,7 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
             ops.append(_op(current, fix["node_id"], edits))
         plan = plan_fixes(spec, issues, level=level, versions=versions, cards=cards)
     return {"graph": current, "changes": changes, "ops": ops, "applied": applied, "rejected": rejected,
-            "remaining": annotate(issues, plan), "fixes": [public(f) for f in plan],
+            "handoff": handoff, "remaining": annotate(issues, plan), "fixes": [public(f) for f in plan],
             "ok": not any(i.level == "error" for i in issues)}
 
 
@@ -643,11 +810,31 @@ def _contract_loosened(name: str, prior: Any, contract: Any) -> list[str]:
         out.append(f"往「{name}」出具契约的 allow_numbers 里加了 {'、'.join(extra)}（不带出处也能放行的数）")
     if contract.get("cells") is True and prior.get("cells") is not True:
         out.append(f"替你打开了「{name}」出具契约的 cells（允许报告直接引用查询单元格），这要你自己决定")
+    was, now = _claims_rank(prior.get("claims")), _claims_rank(contract.get("claims"))
+    if was is not None and now is not None and now < was:
+        out.append(f"把「{name}」出具契约的 claims 往宽里改了（没挂依据的结论句{_CLAIMS_WORDS[was]} → "
+                   f"{_CLAIMS_WORDS[now]}）")
     return out
 
 
+#: 契约 claims 的严格程度：不查 < 查了不算缺口（ignore）< 计入缺口降档（degrade）< 不予出具（withhold）
+_CLAIMS_WORDS = ("不检查", "只标出来", "计入缺口", "不予出具")
+
+
+def _claims_rank(value: Any) -> int | None:
+    """契约里 claims 的严格程度，越大越严。judge 这类还不支持的写法不比较（validate 另报）。"""
+    name = value.get("policy") if isinstance(value, dict) else value
+    if name in (None, "", "off"):
+        return 0
+    if name != "require_citation":
+        return None
+    on_uncited = value.get("on_uncited") if isinstance(value, dict) else None
+    return {"ignore": 1, "withhold": 3}.get(on_uncited, 2)
+
+
 def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
-                      ops: list[dict[str, Any]] | None = None) -> list[str]:
+                      ops: list[dict[str, Any]] | None = None, *,
+                      chosen: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset()) -> list[str]:
     """降低要求的改动，一条一句。空列表表示没有。确定性修复和 Copilot 兜底过的是同一道检查。
 
     禁止：
@@ -657,6 +844,9 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     - 审批策略往宽里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行）、删掉写明的审批策略，
       把审批写成（或新加一个）「全部自动放行」；全图默认同理
     - 取消子工作流钉住的版本
+    - 报告撰写节点的 numbers、on_violation、claims 往宽里改；关掉 agent 的 cite_fields
+    - 替人把沙箱代码标成取数（evidence_role: source）：它在取数还是在算只有作者知道。chosen 里的
+      (节点 id, 字段) 是人在 choice 里亲手选的，不算
     - 改发布级别——级别不在图里，修复接口也从不写工作流的 status，所以只可能以一个不认识的
       操作出现，按不认识的操作拒掉
     """
@@ -701,8 +891,21 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
             reasons.append(why)
         contract, prior = cfg.get("contract"), prev.get("contract")
         reasons += _contract_loosened(name, prior, contract)
+        if node.get("type") == "code" and cfg.get("evidence_role") == "source" \
+                and prev.get("evidence_role") != "source" and (nid, "evidence_role") not in chosen:
+            reasons.append((f"替你把「{name}」标成了取数（evidence_role: source）" if was
+                            else f"新加的「{name}」标成了取数（evidence_role: source）")
+                           + "，它是在取数还是在算要你自己决定")
         if was is None:
             continue
+        if was.get("type") == node.get("type") == "report":
+            reasons += _report_loosened(name, prev, cfg, before.get("defaults"), after.get("defaults"))
+        if was.get("type") == node.get("type") == "agent" and prev.get("cite_fields") is True \
+                and cfg.get("cite_fields") is not True:
+            reasons.append(f"关掉了「{name}」的 cite_fields（字段不再逐个核对到查询结果）")
+        elif was.get("type") == node.get("type") == "agent" and prev.get("cite_fields") is True \
+                and prev.get("output_schema") and not cfg.get("output_schema"):
+            reasons.append(f"删掉了「{name}」的 output_schema（cite_fields 随之失效，字段不再逐个核对到查询结果）")
         if prev.get("workflow_version") and not cfg.get("workflow_version"):
             reasons.append(f"取消了「{name}」钉住的版本")
         if not isinstance(prior, dict) or not prior:
@@ -720,6 +923,30 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     elif why := _approval_lowered("全图默认", old_default, new_default, inherited=None, fallback=None):
         reasons.append(why)
     return reasons
+
+
+#: 报告撰写节点三项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag）
+_REPORT_STRICT = {"numbers": ("strict", "strict"), "on_violation": ("fail", "flag"),
+                  "claims": ("require_citation", "off")}
+
+
+def _report_loosened(name: str, prev: dict[str, Any], cfg: dict[str, Any], old_defaults: Any,
+                     new_defaults: Any) -> list[str]:
+    """报告撰写节点的三项设置有没有往宽里改：原来（按节点、再按全图默认）是最严的值，改完不是了。
+    claims 改成 judge 不算放宽——那是还不支持的更严的写法，validate 会报。"""
+    def effective(config: dict[str, Any], defaults: Any, key: str, fallback: str) -> Any:
+        value = config.get(key)
+        if value in (None, ""):
+            value = (defaults if isinstance(defaults, dict) else {}).get(key)
+        return fallback if value in (None, "") else value
+
+    out = []
+    for key, (strict, fallback) in _REPORT_STRICT.items():
+        was, now = effective(prev, old_defaults, key, fallback), effective(cfg, new_defaults, key, fallback)
+        if was == strict and now != strict and not (key == "claims" and now == "judge"):
+            out.append(f"把「{name}」的 {key} 从 {strict} 放宽成了 {now}"
+                       + ("（去掉了写明的值，运行时退回缺省）" if cfg.get(key) in (None, "") else ""))
+    return out
 
 
 def _type_word(node_type: Any, type_label: Callable[[Any], str]) -> str:
