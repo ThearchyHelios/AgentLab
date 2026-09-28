@@ -644,6 +644,20 @@ function queryTitle(sql: string, source: string): string {
   return clip(`查询 ${what}${how ? ` · ${how}` : ''}`)
 }
 
+/** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
+const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
+
+/**
+ * 门控模型（工具信任档「始终允许 · 门控把关」）对一次调用的结论。team：协作团队里拦下的，
+ * 成员停不下来等人，这次调用不执行。没有工具名（老数据、字段缺了）就说「一次工具调用」
+ */
+function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason: string): string {
+  const what = tool ? ` ${tool}` : '一次工具调用'
+  const head = verdict === 'allow' ? `门控放行${what}`
+    : `门控拦下${what}，${verdict === 'team' ? '协作团队里不执行' : '交给人工审批'}`
+  return reason ? `${head}：${reason}` : head
+}
+
 /**
  * 几种「看着跑完了、其实没做成」的状况（NI-3/4/5）。后端这几条日志是写给排查的，原样
  * 贴出来是一串标记和术语，而且不说该去哪儿改——这里说成人话，并给出下一步。
@@ -1027,6 +1041,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
   const teams = new Map<string, TeamRunEx>()
   /** node_id → 校验节点最近一次修复。被作废的说明（repair_invented）折进这一行 */
   const repairs = new Map<string, Step>()
+  /**
+   * node_id → 门控拦下、还没见到下文的调用。下文是 human.requested（agent、工具节点：交给人批），
+   * 或者 code 为 tool_needs_approval 的 log（协作团队：成员停不下来，这次不执行）
+   */
+  const escalated = new Map<string, { step: Step; tool: string; reason: string }[]>()
   /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
   const spans = new Map<string, { start: number; end: number; ms: number }>()
 
@@ -1093,12 +1112,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
     const what = approved === false ? '驳回了' : '放行了'
     return who ? `${who} ${what}` : `已${what.slice(0, 2)}`
   }
-  const closeInterrupt = (key: string, approved: unknown, note: string, actor?: unknown): boolean => {
+  const closeInterrupt = (key: string, approved: unknown, note: string, actor?: unknown, always = false): boolean => {
     const step = openInterrupts.get(key)
     if (!step) return false
     step.status = 'done'
     step.level = undefined
-    step.title = `${step.title} → ${verdict(approved, actor)}`
+    step.title = `${step.title} → ${verdict(approved, actor)}${always ? ALWAYS_NOTE : ''}`
     if (note) step.detail = [step.detail, `备注：${note}`].filter(Boolean).join('\n')
     openInterrupts.delete(key)
     return true
@@ -1456,6 +1475,31 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         break
       }
 
+      case 'tool.gated': {
+        // 放行是安静的一行（接着就是正常的工具调用）；拦下的要人看见，并说清交给了谁。
+        // 要调什么是那次模型调用答出来的，问门控时它已经做完了（同 tool.start）
+        closeLlm(nodeId, 'done', at)
+        const tool = typeof d.tool === 'string' ? d.tool : ''
+        const reason = typeof d.reason === 'string' ? d.reason.trim() : ''
+        const allow = d.verdict === 'allow'
+        const full = gateTitle(tool, allow ? 'allow' : 'escalate', reason)
+        const step: Step = {
+          id: `gt-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: 'tool_gated',
+          level: allow ? 'info' : 'warn',
+          title: clip(full, 120),
+          ...(full.length > 120 ? { detail: reason } : {}),
+          ...(d.agent ? { sub: `${d.agent} 调用` } : {}),
+          meta: [typeof d.model === 'string' && d.model ? `门控 ${d.model}` : '', dur(num(d.duration_ms)) ?? '']
+            .filter(Boolean).join(' · ') || undefined,
+        }
+        push(step, nodeId)
+        if (!allow) {
+          const key = nodeId ?? '_'
+          escalated.set(key, [...(escalated.get(key) ?? []), { step, tool, reason }])
+        }
+        break
+      }
+
       case 'sandbox.start':
         pendingTools.set(`sandbox-${nodeId ?? seq}`, (() => {
           const step: Step = {
@@ -1514,6 +1558,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 节点重放又来一条 human.requested（LangGraph 的重放语义，不是 bug）。
         // 三条都指向同一次"等你确认"，界面上只该有一条。
         trackTeam(event)
+        // 门控拦下的那次调用交到了人手里：「交给人工审批」说的是实话，不会再等协作团队那条 log
+        escalated.delete(nodeId ?? '_')
         const payload = d.payload ?? d
         const key = String(payload.node_id ?? nodeId ?? '_')
         if (openInterrupts.has(key)) {       // 同一次中断的后续事件
@@ -1545,16 +1591,20 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
       }
 
       case 'human.resolved': {
-        const r = d.response ?? {}
-        const approved = typeof r === 'object' ? r.approved : undefined
-        const note = typeof r === 'object' ? String(r.note ?? '') : ''
+        // 人工节点把答复包在 response 里；agent / 工具节点的工具审批是平铺的 {tool, approved, note, always}。
+        // 以前只读 response，工具审批被驳回也写成「放行了」
+        const r = d.response && typeof d.response === 'object' ? d.response : d
+        const approved = r.approved
+        const note = String(r.note ?? '')
+        // 审批卡上点的是「始终允许」：批了这次，这个工具之后改由门控把关
+        const always = r.always === true || d.always === true
         const actor = d.actor !== undefined ? d.actor : resumedActor
-        if (closeInterrupt(String(nodeId ?? '_'), approved, note, actor)) break
+        if (closeInterrupt(String(nodeId ?? '_'), approved, note, actor, always)) break
         // 没有对应的待决审批（历史事件不全、或者审批发生在别处）——
         // 还是要把决定说出来，只是没地方折进去
         push({
           id: `hr-${seq}`, seq, kind: 'human', nodeId, status: 'done',
-          title: verdict(approved, actor),
+          title: `${verdict(approved, actor)}${always ? ALWAYS_NOTE : ''}`,
           detail: note || undefined,
         }, nodeId)
         break
@@ -1750,6 +1800,24 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           push({ id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done', title: clip(message) },
                nodeId)
           break
+        }
+        if (d.code === 'tool_needs_approval') {
+          // 门控刚拦下的调用落在协作团队里：成员停不下来等人，这次调用不执行。折进门控那一行，
+          // 改口说「协作团队里不执行」，而不是先说交给人工、再冒出一行不执行。成员并行时几条
+          // 可能交错，按日志带的 tool 认（老后端没有这个字段，按原话里的工具名认）；认不出就是最近那一条
+          const list = escalated.get(nodeId ?? '_')
+          if (list?.length) {
+            const named = typeof d.tool === 'string' && d.tool ? d.tool : ''
+            let i = list.length - 1
+            for (let j = list.length - 1; j >= 0; j -= 1) {
+              if (list[j].tool && (named ? list[j].tool === named : message.includes(list[j].tool))) { i = j; break }
+            }
+            const [gate] = list.splice(i, 1)
+            const full = gateTitle(gate.tool, 'team', gate.reason)
+            gate.step.title = clip(full, 120)
+            gate.step.detail = [full.length > 120 ? gate.reason : '', message].filter(Boolean).join('\n') || undefined
+            break
+          }
         }
         // 其余 info 是给排查用的，不进主流程——但 warn/error 用户必须看到
         if (level === 'info' || !message) break

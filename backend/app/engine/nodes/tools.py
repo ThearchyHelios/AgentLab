@@ -7,6 +7,8 @@ from typing import Any
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
+from langgraph.func import task
+
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
 from app.engine.replay import ask, once
@@ -23,6 +25,7 @@ from app.tools.registry import (
     call_tool,
     get_spec,
 )
+from app.tools.trust import ask_gate, asks_trustable, call_policy, node_task
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
@@ -65,17 +68,32 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 节点没配时取全局设置（「危险工具默认需要人工确认」），见 NodeContext.approval_mode
     tool = await _dynamic_tool(name, ctx)
     approval = ctx.approval_mode()
-    if approval == "always" or (approval == "dangerous" and call_is_dangerous(tool, name, args)):
+    policy = ("ask" if approval == "always" else "safe" if approval == "never"
+              else call_policy(tool, name, args, ctx.run.tool_trust))
+    if policy == "gate":
+        @task
+        async def gate_step(call_args: dict[str, Any]) -> bool:
+            # 门控的判定进 checkpoint：审批恢复重放时不再问一遍，免得这次判得不一样
+            gate = await ask_gate(tool=tool, args=call_args, node_title=ctx.node.title,
+                                  task=node_task(ctx.config))
+            ctx.emit(EventType.TOOL_GATED, tool=name, **gate.event())
+            return gate.allowed
+
+        policy = "safe" if await gate_step(args) else "ask"
+    if policy == "ask":
+        trust_key = asks_trustable(tool, ctx.run.tool_trust) if approval == "dangerous" else None
+        trustable = {"trust_key": trust_key} if trust_key else {}
         decision = read_decision(await ask(
             ctx,
             {"kind": "tool_approval", "node_id": ctx.node.id, "tool": name, "args": args,
-             "title": f"是否允许调用 {name}？"},
-            mode="approve", tool=name, args=args, title=f"是否允许调用 {name}？",
+             "title": f"是否允许调用 {name}？", **trustable},
+            mode="approve", tool=name, args=args, title=f"是否允许调用 {name}？", **trustable,
         ))
         if decision.args is not None:
             args = decision.args
+        always = decision.always and bool(trust_key)
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved,
-                   note=decision.note, actor=ctx.actor())
+                   note=decision.note, actor=ctx.actor(), **({"always": True} if always else {}))
         if not decision.approved:
             raise NodeError(ctx.node.id, f"用户拒绝执行工具 {name}"
                             + (f"：{decision.note}" if decision.note else ""))

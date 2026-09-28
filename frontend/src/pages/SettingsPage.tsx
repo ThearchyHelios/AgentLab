@@ -22,6 +22,7 @@ import type { Provider } from '../types'
 import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
+import { AGENT_GUARD_TEXT, TOOL_GATE_TEXT } from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
@@ -600,12 +601,16 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
  */
 function PrefsTab() {
   const collections = useCatalog((s) => s.collections)
+  const providers = useCatalog((s) => s.providers)
   const [values, setValues] = useState<Record<string, any> | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
   const [scopes, setScopes] = useState<{ scope: string; count: number }[]>([])
   // 署名存在 localStorage，保存后成为新的基线，不再算作改动
   const savedActor = useRef<string>(localActor() ?? '')
-  const [draft, setDraft] = useState<{ actor: string; scope: string; collection: string; confirm: boolean } | null>(null)
+  const [draft, setDraft] = useState<{
+    actor: string; scope: string; collection: string; confirm: boolean; gateProvider: string; gateModel: string
+    steps: string; budgetTokens: string; budgetUsd: string
+  } | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
   const [saveError, setSaveError] = useState<unknown>(null)
@@ -628,8 +633,30 @@ function PrefsTab() {
     scope: values?.run?.default_memory_scope ?? 'default',
     collection: values?.run?.default_collection ?? 'default',
     confirm: values?.run?.confirm_dangerous_tools ?? true,
+    // 门控模型：null（老后端没有这两项也一样）= 用默认接入的默认模型，表单里是空串
+    gateProvider: values?.run?.tool_gate_provider ?? '',
+    gateModel: values?.run?.tool_gate_model ?? '',
+    // agent 护栏（后端 engine/guards.py）。表单里是字符串：预算空串 = 不限（存 null）
+    steps: String(values?.run?.agent_max_steps ?? 100),
+    budgetTokens: values?.run?.agent_budget_tokens == null ? '' : String(values.run.agent_budget_tokens),
+    budgetUsd: values?.run?.agent_budget_usd == null ? '' : String(values.run.agent_budget_usd),
   }
   const cur = draft ?? saved
+  const stepCap = Number(values?.limits?.max_agent_steps) || 100
+  // 只校验改过的：存着的值不合规（比如服务端的硬上限后来调小了）不该挡住别的设置保存，
+  // 后端发起运行时本来就按硬上限截
+  const guardErrors = {
+    steps: cur.steps === saved.steps
+      || (/^\d+$/.test(cur.steps.trim()) && Number(cur.steps) >= 1 && Number(cur.steps) <= stepCap)
+      ? undefined : `填 1 到 ${stepCap} 的整数（${stepCap} 是服务端的硬上限，由环境变量 AGENTLAB_MAX_AGENT_STEPS 定）`,
+    budgetTokens: cur.budgetTokens === saved.budgetTokens || cur.budgetTokens.trim() === ''
+      || (/^\d+$/.test(cur.budgetTokens.trim()) && Number(cur.budgetTokens) >= 1000)
+      ? undefined : '填不少于 1000 的整数，或者留空表示不限',
+    budgetUsd: cur.budgetUsd === saved.budgetUsd || cur.budgetUsd.trim() === ''
+      || (Number(cur.budgetUsd) > 0 && Number.isFinite(Number(cur.budgetUsd)))
+      ? undefined : '填大于 0 的金额，或者留空表示不限',
+  }
+  const guardInvalid = Object.values(guardErrors).some(Boolean)
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
   const dirty = values ? changed.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
@@ -651,7 +678,7 @@ function PrefsTab() {
    * 有改动才 PUT——只改了署名时不必碰服务端，断线时也存得上
    */
   const save = async () => {
-    if (!values || !dirty) return
+    if (!values || !dirty || guardInvalid) return
     setSaving(true)
     setSaveError(null)
     const actor = cur.actor.trim()
@@ -668,6 +695,11 @@ function PrefsTab() {
           default_memory_scope: cur.scope,
           default_collection: cur.collection,
           confirm_dangerous_tools: cur.confirm,
+          tool_gate_provider: cur.gateProvider || null,
+          tool_gate_model: cur.gateModel.trim() || null,
+          agent_max_steps: Number(cur.steps),
+          agent_budget_tokens: cur.budgetTokens.trim() === '' ? null : Number(cur.budgetTokens),
+          agent_budget_usd: cur.budgetUsd.trim() === '' ? null : Number(cur.budgetUsd),
         }
         const out = await api.settings.put({ run })
         setValues((v) => ({ ...(v ?? {}), run: out?.run ?? run }))
@@ -686,6 +718,18 @@ function PrefsTab() {
   const scopeOptions = [...new Set(['default', ...scopes.map((s) => s.scope), cur.scope])]
   const collectionNames = collections.map((c) => c.collection)
   const collectionMissing = !collectionNames.includes(cur.collection)
+  // 门控模型留空时后端的挑法（resolve_provider）：第一个启用的真实接入，没有就第一个启用的
+  const enabledProviders = providers.filter((p) => p.enabled)
+  const defaultProvider = enabledProviders.find((p) => p.kind !== 'mock') ?? enabledProviders[0]
+  const gateProvider = cur.gateProvider ? providers.find((p) => p.name === cur.gateProvider) : defaultProvider
+  const gateProviderMissing = !!cur.gateProvider && providers.length > 0 && !gateProvider
+  const gateModels = (gateProvider?.models ?? []).map((m) => m.id)
+  const pickGateProvider = (name: string) => {
+    // 换了接入，原来填的模型不在新接入的清单里就清掉：拿 A 家的模型名去调 B 家必然失败
+    const next = name ? providers.find((p) => p.name === name) : defaultProvider
+    const keep = !cur.gateModel || (next?.models ?? []).some((m) => m.id === cur.gateModel) || next?.default_model === cur.gateModel
+    edit({ gateProvider: name, ...(keep ? {} : { gateModel: '' }) })
+  }
 
   return (
     <div className="max-w-2xl space-y-6 pb-20">
@@ -757,6 +801,68 @@ function PrefsTab() {
                 </span>
               </span>
             </label>
+            <div className="mt-4" role="group" aria-labelledby="pref-gate-label" aria-describedby="pref-gate-hint" data-gate-model>
+              <div id="pref-gate-label" className="text-xs font-medium">{TOOL_GATE_TEXT.label}</div>
+              <p id="pref-gate-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{TOOL_GATE_TEXT.hint}</p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={TOOL_GATE_TEXT.provider} htmlFor="pref-gate-provider"
+                       error={gateProviderMissing ? `「${cur.gateProvider}」这个接入不存在：门控模型答不上来，每次调用都会交给你审批` : undefined}>
+                  {(p) => (
+                    <select {...p} className="field" value={cur.gateProvider} onChange={(e) => pickGateProvider(e.target.value)}>
+                      <option value="">
+                        {TOOL_GATE_TEXT.providerDefault}{defaultProvider ? `（现在是 ${defaultProvider.name}）` : ''}
+                      </option>
+                      {gateProviderMissing && <option value={cur.gateProvider}>{cur.gateProvider}（不存在）</option>}
+                      {providers.map((pv) => (
+                        <option key={pv.id} value={pv.name}>{pv.name}{pv.enabled ? '' : '（已停用）'}</option>
+                      ))}
+                    </select>
+                  )}
+                </Field>
+                <Field label={TOOL_GATE_TEXT.model} htmlFor="pref-gate-model"
+                       hint={gateProvider?.default_model ? `留空就用 ${gateProvider.default_model}` : undefined}>
+                  {(p) => (
+                    <>
+                      <input {...p} className="field mono text-xs" value={cur.gateModel} list="pref-gate-models"
+                             placeholder={TOOL_GATE_TEXT.modelDefault} spellCheck={false}
+                             onChange={(e) => edit({ gateModel: e.target.value })} />
+                      <datalist id="pref-gate-models">
+                        {gateModels.map((m) => <option key={m} value={m} />)}
+                      </datalist>
+                    </>
+                  )}
+                </Field>
+              </div>
+            </div>
+            <div className="mt-4" role="group" aria-labelledby="pref-guard-label" aria-describedby="pref-guard-hint" data-agent-guard>
+              <div id="pref-guard-label" className="text-xs font-medium">{AGENT_GUARD_TEXT.label}</div>
+              <p id="pref-guard-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{AGENT_GUARD_TEXT.hint}</p>
+              <div className="grid grid-cols-3 gap-3">
+                <Field label={AGENT_GUARD_TEXT.steps} htmlFor="pref-guard-steps" error={guardErrors.steps}
+                       hint={AGENT_GUARD_TEXT.stepsHint}>
+                  {(p) => (
+                    <input {...p} className="field tnum" inputMode="numeric" value={cur.steps}
+                           onChange={(e) => edit({ steps: e.target.value })} />
+                  )}
+                </Field>
+                <Field label={AGENT_GUARD_TEXT.tokens} htmlFor="pref-guard-tokens" error={guardErrors.budgetTokens}
+                       hint={cur.budgetTokens.trim() === '' ? AGENT_GUARD_TEXT.unlimited : AGENT_GUARD_TEXT.tokensHint}>
+                  {(p) => (
+                    <input {...p} className="field tnum" inputMode="numeric" value={cur.budgetTokens}
+                           placeholder={AGENT_GUARD_TEXT.unlimitedShort}
+                           onChange={(e) => edit({ budgetTokens: e.target.value })} />
+                  )}
+                </Field>
+                <Field label={AGENT_GUARD_TEXT.usd} htmlFor="pref-guard-usd" error={guardErrors.budgetUsd}
+                       hint={cur.budgetUsd.trim() === '' ? AGENT_GUARD_TEXT.unlimited : AGENT_GUARD_TEXT.usdHint}>
+                  {(p) => (
+                    <input {...p} className="field tnum" inputMode="decimal" value={cur.budgetUsd}
+                           placeholder={AGENT_GUARD_TEXT.unlimitedShort}
+                           onChange={(e) => edit({ budgetUsd: e.target.value })} />
+                  )}
+                </Field>
+              </div>
+            </div>
           </section>
         </>
       )}
@@ -774,7 +880,11 @@ function PrefsTab() {
               <span className="text-xs">
                 有 <span className="tnum">{dirty}</span> 项未保存
                 <span className="ml-1.5 text-2xs text-faint">
-                  {changed.map((k) => ({ actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具的默认审批策略' })[k]).join('、')}
+                  {changed.map((k) => ({
+                    actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具的默认审批策略',
+                    gateProvider: '门控模型的接入', gateModel: '门控模型',
+                    steps: '默认最大步数', budgetTokens: '令牌预算', budgetUsd: '金额预算',
+                  })[k]).join('、')}
                 </span>
               </span>
               {saveError != null && (
@@ -783,7 +893,9 @@ function PrefsTab() {
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
                       onClick={() => { setDraft(null); setSaveError(null) }}>放弃</button>
-              <button className="btn btn-sm btn-primary" disabled={saving} onClick={() => void save()}>
+              <button className="btn btn-sm btn-primary" disabled={saving || guardInvalid}
+                      title={guardInvalid ? '护栏那几项有没填对的，改好再保存' : undefined}
+                      onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>
             </>

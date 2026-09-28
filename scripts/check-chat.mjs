@@ -149,7 +149,26 @@ const TRASH_MORE = {
   trash4: conv('c0trash4', '删掉的对话丁：还在跑', 1, 60 * 24 * 5,
     { archived: true, last_status: 'running', last_run_id: 'run-trash-live' }),
 }
+/** 只在「护栏」那段出现：放宽步数只在步数用满、而且还有得放宽时给（后端 engine/guards.py） */
+const GRAPH8 = { ...GRAPH, nodes: GRAPH.nodes.map((n) => (n.type === 'agent'
+  ? { ...n, data: { ...n.data, config: { max_steps: 8 } } } : n)) }
+const guardTurn = (id, graph, reason, detail) => turn(id, '查一下各门店的销量', {
+  answer: '只查了一部分的结论', graph, run_id: `run-${id}`,
+  review: {
+    verdict: 'annotated', note: detail, answer: null, retry: true, severity: 'broken',
+    signals: [{ kind: 'step_limit', detail, severity: 'broken', ...(reason ? { reason } : {}) }],
+  },
+  meta: { v: 1, runId: `run-${id}`, runClass: 'exploratory', runStatus: 'succeeded' },
+})
+const GUARD_CONVS = {
+  stall: conv('c0gstall', '护栏：连续几步没进展收的尾', 1, 60 * 24 * 30),
+  steps: conv('c0gsteps', '护栏：写死 8 步、用满了', 1, 60 * 24 * 31),
+  dflt: conv('c0gdflt', '护栏：跟随默认步数', 1, 60 * 24 * 32),
+}
 const DETAIL = {
+  c0gstall: [guardTurn('tg1', GRAPH8, 'stall', 'agent 连续 3 步没有拿到新信息，收尾轮也没有给出结论。')],
+  c0gsteps: [guardTurn('tg2', GRAPH8, 'steps', 'agent 用满了 8 步。收尾轮也没有给出结论。')],
+  c0gdflt: [guardTurn('tg3', GRAPH, null, 'agent 用满了 12 步还没给出结论。')],
   c0busya: [],
   c0idleb: [turn('tb1', 'B 的问题', { answer: 'B 的答案', graph: GRAPH, run_id: 'run-b1' })],
   c0longc: Array.from({ length: 6 }, (_, i) =>
@@ -316,6 +335,8 @@ const ctl = {
   few: false, run500: true, reviewDelay: {}, launchFail: true, scope400: false,
   /** 回收站里多摆两个（TRASH_MORE） */
   trashMore: false,
+  /** 列表里多摆「护栏」那段的三个会话（GUARD_CONVS） */
+  guardConvs: false,
   /** 数据源列表取不回来 */
   sourcesFail: false,
   /** 数据源列表里多一个别处刚加的库 */
@@ -328,7 +349,8 @@ const resetDb = () => {
   db.purged = new Set()
 }
 resetDb()
-const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : [])]
+const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
+  ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
 let runSeq = 0
@@ -621,7 +643,7 @@ async function fakeStream(ws) {
 
 const browser = await chromium.launch({ executablePath: CHROME })
 
-async function open(theme = 'light', { width = 1440, height = 900, reducedMotion = 'no-preference' } = {}) {
+async function open(theme = 'light', { width = 1440, height = 900, reducedMotion = 'no-preference', settings = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, reducedMotion })
   opened.add(ctx)
   await ctx.addInitScript((t) => localStorage.setItem('agentlab.theme', t), theme)
@@ -632,7 +654,8 @@ async function open(theme = 'light', { width = 1440, height = 900, reducedMotion
   await page.route('**/api/settings', async (route) => {
     if (route.request().method() !== 'GET') return route.abort()
     // 主题以设置为准（沙箱里存的是 light），这里按要看的那套改掉
-    return route.fulfill({ json: { ui: { theme }, run: {}, limits: { max_agent_steps: 25 }, copilot: {}, embedding: {} } })
+    return route.fulfill({ json: { ui: { theme }, run: {}, limits: { max_agent_steps: 25 }, copilot: {}, embedding: {},
+      ...(settings ?? {}) } })
   })
   await page.route(/\/api\/(conversations|copilot\/(generate-stream|review)|runs|approvals|datasources)(\/|\?|$)/, fakeApi)
   await page.routeWebSocket(/\/api\/runs\/[^/]+\/stream/, fakeStream)
@@ -1571,6 +1594,32 @@ for (const theme of THEMES) {
     ctl.launchFail = true
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+  })
+
+  await section('guard', '放宽步数只在对症时给：停滞、预算收的尾不给，跟随默认 100 步的也不给', async () => {
+    resetDb()
+    ctl.guardConvs = true
+    try {
+      const stepBtn = (page) => page.getByRole('button', { name: /放宽步数重跑/ })
+      // 新后端：默认 100 步、硬上限 100
+      const fresh = { run: { agent_max_steps: 100 }, limits: { max_agent_steps: 100 } }
+      const { page, ctx, errors } = await open(theme, { settings: fresh })
+      await goto(page, 'c0gstall')
+      await shows(page, '只查了一部分的结论')
+      check('连续几步没进展收的尾：不给「放宽步数」（加步数只会原样再撞一次）', await stepBtn(page).count() === 0)
+      await goto(page, 'c0gsteps')
+      await shows(page, '只查了一部分的结论')
+      const eight = stepBtn(page)
+      check('节点写死 8 步、步数用满：给「放宽步数」，从 8 放到 16', await eight.count() === 1
+        && /8 → 16 步/.test(await eight.innerText()), await eight.innerText().catch(() => '（没有按钮）'))
+      await goto(page, 'c0gdflt')
+      await shows(page, '只查了一部分的结论')
+      check('节点上的 12 跟随默认 100 步、已经到硬上限：不许一个放不宽的数', await stepBtn(page).count() === 0)
+      check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    } finally {
+      ctl.guardConvs = false
+    }
   })
 
   await section('rerun', '重跑服务重启挂起的那一轮：旧运行顺手取消', async () => {

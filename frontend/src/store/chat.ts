@@ -1138,11 +1138,17 @@ function attemptOf(t: ChatTurn): Attempt {
   return { ...base, outcome: 'done', summary: '上一次的答案' }
 }
 
-/** 图里 agent 节点的步数上限（取最大的那个）。没配就是后端的默认 12 */
-export function agentSteps(graph: GraphSpec | null | undefined): number | null {
+/**
+ * 图里 agent 节点的步数上限（取最大的那个）。没配的跟随设置里的默认值 fallback；
+ * 以前画布自动写进去的 12 后端按「没配」处理（engine/guards.py），这里口径一致
+ */
+export function agentSteps(graph: GraphSpec | null | undefined, fallback: number): number | null {
   const agents = (graph?.nodes ?? []).filter((n: any) => n.type === 'agent')
   if (!agents.length) return null
-  return Math.max(...agents.map((n: any) => Number(n.data?.config?.max_steps) || 12))
+  return Math.max(...agents.map((n: any) => {
+    const steps = Number(n.data?.config?.max_steps)
+    return steps > 0 && steps !== 12 ? steps : fallback
+  }))
 }
 
 function withMaxSteps(graph: GraphSpec, steps: number): GraphSpec {

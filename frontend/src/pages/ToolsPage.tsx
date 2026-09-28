@@ -1,21 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { AlertTriangle, Play, Plug, Plus, RefreshCw, Search, Terminal, Wand2, Wrench } from 'lucide-react'
+import { AlertTriangle, Play, Plug, Plus, RefreshCw, Search, ShieldCheck, Terminal, Wand2, Wrench } from 'lucide-react'
 import clsx from 'clsx'
 import { api, ApiError } from '../api/client'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
   confirmDialog, deferDelete, DeleteButton, EmptyState, ErrorState, Field, HealthPill, JsonInput, Kbd, Modal,
-  PageHeader, SectionBar, Skeleton, Spinner, StatusBadge, TabPanel, Tabs, toast, useTabRoute, withoutDeferred,
+  PageHeader, SectionBar, Skeleton, Spinner, StatusBadge, TabPanel, Tabs, toast, useRadioGroup, useTabRoute, withoutDeferred,
 } from '../components/ui'
+import { humanizeError } from '../lib/errors'
 import { formatDuration } from '../lib/format'
 import { customToolEditPath } from '../lib/explain'
 import { checkHealth, forgetHealth, healthFromServer, useHealth } from '../lib/health'
 import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
+import { TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
-import type { ToolInfo } from '../types'
+import type { ToolInfo, ToolTrust } from '../types'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上
 const TABS = [
@@ -164,7 +166,8 @@ function ToolLibrary() {
                 return (
                   <button
                     key={t.id}
-                    onClick={() => navigate(`/tools/library/${t.id}`)}
+                    // MCP 工具的 id 是 mcp:服务名/工具名，带斜杠：不转义就对不上 /tools/:tab/:id，落到 404
+                    onClick={() => navigate(`/tools/library/${encodeURIComponent(t.id)}`)}
                     aria-current={on ? 'true' : undefined}
                     className={clsx(
                       'relative w-full rounded-md px-2 py-1.5 text-left hover:bg-hover',
@@ -202,6 +205,16 @@ function ToolLibrary() {
               <ApprovalTag tool={picked} long />
             </div>
             <p className="mb-3 text-xs leading-relaxed text-dim">{picked.description}</p>
+
+            {hasTrust(picked) && (
+              <div className="mb-3 rounded-lg border bg-panel px-2.5 py-2" data-trust-block>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium">{TOOL_TRUST_TEXT.title}</span>
+                  <TrustControl tool={picked} />
+                </div>
+                <p className="mt-1 text-2xs leading-relaxed text-faint">{TOOL_TRUST_TEXT.explain}</p>
+              </div>
+            )}
 
             {picked.problem && (
               <div role="alert" className="mb-3 flex items-start gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed" data-tool-problem-detail
@@ -281,16 +294,28 @@ function ProblemChip({ problem }: { problem: string }) {
 
 /**
  * 「运行时需审批」只给真会停下来等人的工具打（后端的 runtime_approval）。
- * 自定义和 MCP 工具在工作流里运行时审批关卡认不出它们，就明说「运行时不审批」——
- * 以前它们也挂着「需确认」，标签说的不是实话，给人虚假的安全感。
+ *
+ * MCP / 自定义工具按信任档说：等审批挂「运行时需审批」，门控把关挂「门控把关」，
+ * 始终允许什么都不挂——它就是不会停。老后端没有信任档，那时审批关卡认不出它们，
+ * 就明说「运行时不审批」：以前它们也挂着「需确认」，标签说的不是实话，给人虚假的安全感。
  */
 function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean }) {
-  const needs = tool.runtime_approval ?? (tool.source === 'builtin' && tool.dangerous)
+  const trust = tool.source !== 'builtin' ? tool.trust : undefined
+  if (trust === 'always') return null
+  if (trust === 'gated') {
+    return (
+      <span className="chip shrink-0" title={TOOL_TRUST_TEXT.badgeGatedHint} data-trust-badge="gated">
+        <ShieldCheck size={10} aria-hidden />{TOOL_TRUST_TEXT.badgeGated}
+      </span>
+    )
+  }
+  const needs = trust === 'ask' || (tool.runtime_approval ?? (tool.source === 'builtin' && tool.dangerous))
   if (needs) {
     return (
       <span className="chip shrink-0" style={{ color: 'var(--st-waiting)', borderColor: 'color-mix(in srgb, var(--st-waiting) 40%, transparent)' }}
+            data-trust-badge={trust ? 'ask' : undefined}
             title="在工作流里跑到它会停下来等人工审批（审批策略为「危险工具」时）。在工具库里直接执行不经审批，执行前会先说明它要做什么。">
-        <StatusBadge status="waiting" size={10} decorative />运行时需审批
+        <StatusBadge status="waiting" size={10} decorative />{TOOL_TRUST_TEXT.badgeAsk}
       </span>
     )
   }
@@ -303,6 +328,69 @@ function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean })
     )
   }
   return null
+}
+
+/** 后端给了信任档的才显示三选一：内置工具没有，老后端也没有 */
+const hasTrust = (tool: ToolInfo | undefined | null): tool is ToolInfo & { trust: ToolTrust } =>
+  !!tool && tool.source !== 'builtin' && typeof tool.trust === 'string'
+
+/** MCP 工具的 name 只是裸名（search），同名的可能来自几台服务：说全称 */
+const toolLabel = (tool: ToolInfo) => (tool.source === 'mcp' ? tool.id : tool.name)
+
+/** 同一个工具最近一次改档的序号：只有最后那次请求的结果算数 */
+const trustSeq = new Map<string, number>()
+
+/**
+ * 改信任档：先改 catalog 里的这一项（工具库、自定义工具、MCP 三处读的都是它），再 PUT；
+ * 失败就改回去，并说原因。连点几档时，前面那次请求的失败不回退：界面上已经是后来
+ * 选的那一档，退回去反而和最后那次请求对不上
+ */
+async function setToolTrust(tool: ToolInfo, next: ToolTrust) {
+  const key = tool.trust_key ?? tool.id
+  if (tool.trust === next) return
+  const prev = { trust: tool.trust, runtime_approval: tool.runtime_approval }
+  const seq = (trustSeq.get(key) ?? 0) + 1
+  trustSeq.set(key, seq)
+  const patch = (fields: Partial<ToolInfo>) => useCatalog.setState((s) => ({
+    tools: s.tools.map((t) => ((t.trust_key ?? t.id) === key && t.source === tool.source ? { ...t, ...fields } : t)),
+  }))
+  patch({ trust: next, runtime_approval: next !== 'always' })
+  try {
+    const out = await api.tools.setTrust(key, next)
+    // 后端可能把值规范过（比如 key 在表里已经删了）：以它回的为准
+    if (trustSeq.get(key) === seq && out?.trust && out.trust !== next && TOOL_TRUST_VALUES.includes(out.trust)) {
+      patch({ trust: out.trust, runtime_approval: out.trust !== 'always' })
+    }
+  } catch (e) {
+    if (trustSeq.get(key) !== seq) return
+    patch(prev)
+    const h = humanizeError(e)
+    toast.error(`${TOOL_TRUST_TEXT.saveFailed(toolLabel(tool))}：${h.reason ? `${h.title}，${h.reason}` : h.title}`,
+      { detail: h.raw })
+  }
+}
+
+/**
+ * 信任档三选一。整组一个 Tab 位、方向键切换（useRadioGroup），选中即保存：
+ * 这是偏好不是表单，和主题一样不设「保存」按钮。没有信任档的（内置、老后端）不画
+ */
+function TrustControl({ tool }: { tool: ToolInfo | null | undefined }) {
+  const radio = useRadioGroup(TOOL_TRUST_VALUES, tool?.trust, (v) => { if (tool) void setToolTrust(tool, v) })
+  if (!hasTrust(tool)) return null
+  return (
+    <span role="radiogroup" aria-label={TOOL_TRUST_TEXT.groupLabel(toolLabel(tool))}
+          className="inline-flex shrink-0 whitespace-nowrap rounded-md border p-px"
+          data-trust-control={tool.trust_key ?? tool.id} data-trust={tool.trust}>
+      {TOOL_TRUST_VALUES.map((v) => (
+        <button key={v} type="button" {...radio(v)} title={TOOL_TRUST_HINT[v]}
+                className={clsx('rounded px-1.5 text-2xs leading-5 transition-colors',
+                  v === tool.trust ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
+                onClick={() => void setToolTrust(tool, v)}>
+          {TOOL_TRUST_LABEL[v]}
+        </button>
+      ))}
+    </span>
+  )
 }
 
 /**
@@ -472,6 +560,9 @@ const PARAMS_NONE = { type: 'object', properties: {}, required: [] }
 
 function CustomTools() {
   const refresh = useCatalog((s) => s.refresh)
+  // 信任档在工具目录（GET /tools）里，按名字对上。停用的不在目录里，也就没有这一项
+  const catalogTools = useCatalog((s) => s.tools)
+  const trustOf = (row: any) => catalogTools.find((t) => t.source === 'custom' && t.id === row.name && hasTrust(t))
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [rows, setRows] = useState<any[] | null>(null)
@@ -530,6 +621,11 @@ function CustomTools() {
         />
       ) : (
         <div className="space-y-2">
+          {rows.some(trustOf) && (
+            <p className="text-2xs leading-relaxed text-faint" data-trust-explain>
+              {TOOL_TRUST_TEXT.title}：{TOOL_TRUST_TEXT.explain}
+            </p>
+          )}
           {rows.map((row) => (
             <div key={row.id} className="flex items-center gap-2 rounded-lg border bg-panel px-3 py-2.5">
               <div className="min-w-0 flex-1">
@@ -543,6 +639,7 @@ function CustomTools() {
                   ? <div className="truncate text-xs" style={{ color: 'var(--st-failed)' }} title={row.problem}>{row.problem}</div>
                   : <div className="truncate text-xs text-faint">{row.description || '没写描述：模型不知道什么时候该用它'}</div>}
               </div>
+              <TrustControl tool={trustOf(row)} />
               <button className="btn btn-sm" disabled={!row.enabled}
                       title={row.enabled ? '去工具库里带参数试跑' : '停用的工具不在工具库里'}
                       onClick={() => navigate(`/tools/library/${row.name}`)}>
@@ -879,6 +976,11 @@ function McpServers() {
         />
       ) : (
         <div className="space-y-2.5">
+          {tools.some((t) => t.source === 'mcp' && hasTrust(t)) && (
+            <p className="text-2xs leading-relaxed text-faint" data-trust-explain>
+              {TOOL_TRUST_TEXT.title}：{TOOL_TRUST_TEXT.explain}
+            </p>
+          )}
           {rows.map((row) => (
             <McpCard key={row.id} row={row} onEdit={() => setEditing(row)} onRemove={() => void remove(row)}
                      onProbed={async () => { await load(); await refresh() }} />
@@ -906,6 +1008,8 @@ function McpCard({ row, onEdit, onRemove, onProbed }: {
 }) {
   const key = `mcp:${row.id}`
   const { record: shown, checkingSince } = useHealth(key, mcpServerRecord(row))
+  // 这台服务的工具，逐个设信任档（键是 mcp:服务名/工具名）
+  const trusted = useCatalog((s) => s.tools).filter((t) => t.source === 'mcp' && t.id.startsWith(`mcp:${row.name}/`) && hasTrust(t))
   const probe = async () => {
     await checkHealth(key, async () => {
       const t0 = performance.now()
@@ -940,6 +1044,17 @@ function McpCard({ row, onEdit, onRemove, onProbed }: {
       <div className="mono mt-1.5 break-all text-2xs text-faint">
         {row.transport === 'stdio' ? `${row.command ?? ''} ${(row.args ?? []).join(' ')}` : row.url}
       </div>
+      {trusted.length > 0 && (
+        <ul className="mt-2 rounded-md border bg-bg" aria-label={`${row.name} 的工具`}>
+          {trusted.map((t) => (
+            <li key={t.id} className="flex items-center gap-2 border-b border-[var(--hairline)] px-2.5 py-1.5 last:border-0">
+              <span className="mono shrink-0 text-xs">{t.name}</span>
+              <span className="min-w-0 flex-1 truncate text-2xs text-faint" title={t.description}>{t.description}</span>
+              <TrustControl tool={t} />
+            </li>
+          ))}
+        </ul>
+      )}
       {shown && !shown.ok && !checkingSince && (
         <ErrorState compact error={shown} onRetry={() => void probe()} className="mt-2" />
       )}

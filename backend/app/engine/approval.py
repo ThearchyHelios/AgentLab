@@ -36,6 +36,9 @@ class Decision:
     code: str | None = None
     #: human 节点收到的内容（input / edit 模式）
     value: Any = None
+    #: 审批卡上点的是「始终允许」：批准这次，并且这个工具以后改由门控把关（tools/trust.py）。
+    #: 只认明确的 True，而且只跟着批准走
+    always: bool = False
 
 
 def _word(value: Any) -> str:
@@ -67,6 +70,7 @@ def read_decision(response: Any) -> Decision:
             args=args if isinstance(args, dict) else None,
             code=code if isinstance(code, str) and code else None,
             value=response.get("value"),
+            always=verdict is True and response.get("always") is True,
         )
     verdict = _verdict(response)
     # 不是一个是/否词的字符串（"拒绝，这个表是生产库"）既算不上批准，本身又

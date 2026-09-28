@@ -125,6 +125,10 @@ export interface Approval {
   node_id: string
   mode: 'approve' | 'input' | 'edit'
   title: string
+  /**
+   * 工具审批的 payload 是 {kind: 'tool_approval', tool, args, title}。探索运行里 MCP /
+   * 自定义工具的审批另带 trust_key（同 ToolInfo.trust_key）：有它，审批卡才给「始终允许」
+   */
   payload: Record<string, any>
   status: string
   response: Record<string, any>
@@ -165,6 +169,13 @@ export interface Provider extends ServerHealth {
   has_key: boolean
 }
 
+/**
+ * MCP / 自定义工具在探索运行里的信任档（节点审批策略为「仅危险工具」时才看它）：
+ * ask 每次等人批（默认）；gated 每次先问门控模型，它判可疑的仍交给人；always 直接执行。
+ * 正式运行不看它，一律按 ask
+ */
+export type ToolTrust = 'ask' | 'gated' | 'always'
+
 export interface ToolInfo {
   id: string
   name: string
@@ -172,8 +183,15 @@ export interface ToolInfo {
   category: string
   source: 'builtin' | 'custom' | 'mcp'
   dangerous: boolean
-  /** 运行时是否真的会因它停下来等审批。MCP 与自定义工具目前不会，界面别说它「需确认」 */
+  /**
+   * 运行时可能停下来等审批。MCP / 自定义工具：ask、gated 为 true，always 为 false；
+   * 更老的后端一律给 false（那时审批关卡认不出它们）
+   */
   runtime_approval?: boolean
+  /** 只有 MCP / 自定义工具有，老后端不给：没有它就不显示信任档控件 */
+  trust?: ToolTrust
+  /** 改信任档时用的键（PUT /api/tools/trust），等于 id */
+  trust_key?: string
   schema: Record<string, any>
   /**
    * 只有自定义工具有：库里存着的参数定义哪里写坏了（一句中文）。绑了它的节点运行时
@@ -487,6 +505,11 @@ export interface ReviewSignal {
   detail: string
   /** broken = 答案不可信；degraded = 能用但有缺口 */
   severity: 'broken' | 'degraded'
+  /**
+   * agent 为什么提前收尾（后端 engine/guards.py）：steps / stall / budget_tokens / budget_usd / context。
+   * 老运行没有。只有 steps（或者没有这个字段的老运行）放宽步数才对症
+   */
+  reason?: string
 }
 
 export interface ReviewResult {

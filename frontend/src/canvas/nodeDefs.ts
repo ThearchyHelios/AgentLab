@@ -175,7 +175,21 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'prompt', label: '任务', type: 'prompt' },
       { key: 'tools', label: '可用工具', type: 'tools' },
       { key: 'skills', label: '挂载 Skill', type: 'skills' },
-      { key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100 },
+      {
+        key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100, placeholder: '跟随设置',
+        help: '只是兜底。重复调用、连续几步没拿到新信息、预算用完、上下文快满时，它会先按查到的部分收尾。'
+          + '留空跟随「设置 → 运行默认值」；以前默认写进来的 12 也按留空处理',
+      },
+      {
+        key: 'budget_tokens', label: '令牌预算', type: 'number', min: 1000, step: 10000, advanced: true,
+        placeholder: '跟随设置',
+        help: '这个节点最多用多少令牌（输入加输出），用完就按查到的部分收尾。留空跟随设置，设置里可以改成不限',
+      },
+      {
+        key: 'budget_usd', label: '金额预算（美元）', type: 'number', min: 0.01, step: 0.1, advanced: true,
+        placeholder: '跟随设置',
+        help: '按模型目录里的价格估算。目录里没有价格的模型估不出金额，只能靠令牌预算',
+      },
       {
         key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS,
         help: '需要审批时运行会暂停，等你在运行面板或记录页的审批卡上处理',
@@ -188,7 +202,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_steps: 12, tools: [], parallel_tools: false },
+    defaults: { tools: [], parallel_tools: false },
   },
   supervisor: {
     type: 'supervisor', label: NODE_TYPE_LABEL.supervisor, category: '模型', icon: Users,

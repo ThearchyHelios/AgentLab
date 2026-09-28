@@ -39,6 +39,9 @@ class EventType(StrEnum):
     TOOL_START = "tool.start"
     TOOL_END = "tool.end"
     TOOL_ERROR = "tool.error"
+    # 信任档是「始终允许 · 门控把关」的工具，门控模型对这一次调用的判定（tools/trust.py）。
+    # allow 之后是正常的 tool.start；escalate 之后是人工审批，协作团队里则是不执行
+    TOOL_GATED = "tool.gated"
     # 知识检索。以前只发一条 info 日志，于是"这句结论依据的是哪份文档的哪一段"
     # 在轨迹里查不到——而 SQL 取数那条路早就有工件快照可以下钻
     RETRIEVE_END = "retrieve.end"

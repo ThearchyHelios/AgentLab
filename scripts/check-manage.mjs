@@ -493,6 +493,122 @@ await section('设置 · 偏好', async () => {
   await off.close()
 })
 
+await section('设置 · 门控模型', async () => {
+  // 设置读写都走假的一份；接入列表也换成假的两家（日志里只出现这些通用名）
+  let stored = await get('/settings')
+  stored = { ...stored, run: { ...(stored.run ?? {}), tool_gate_provider: null, tool_gate_model: null } }
+  const scope0 = stored.run.default_memory_scope ?? 'default'
+  const PROVIDERS = [
+    { id: 'check-gate-p1', name: 'demo-main', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'big-model',
+      models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-gate-p2', name: 'demo-small', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'tiny-1',
+      models: [{ id: 'tiny-1' }, { id: 'tiny-2' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+  ]
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => { stored = { ...stored, ...body.values }; return json(stored)(route) }],
+      [/^GET \/providers$/, json(PROVIDERS)],
+    ],
+  })
+  const box = page.locator('[data-gate-model]')
+  const hint = await box.innerText().catch(() => '')
+  check('运行默认值里有「门控模型」，提示留空用默认、建议选小模型', hint.includes('门控模型') && hint.includes('留空') && hint.includes('小模型'),
+    hint.replace(/\s+/g, ' ').slice(0, 100))
+  const provider = page.getByLabel('门控模型 · 接入')
+  const model = page.getByLabel('门控模型 · 模型')
+  check('……留空时写明默认是哪家（第一个启用的接入）', (await provider.locator('option').first().innerText()).includes('demo-main'))
+  await provider.selectOption('demo-small')
+  await model.fill('tiny-2')
+  const bar = await page.locator('[data-prefs-bar]').innerText().catch(() => '')
+  check('……改了两项：保存条写「门控模型的接入、门控模型」', bar.includes('有 2 项未保存') && bar.includes('门控模型的接入') && bar.includes('门控模型'),
+    bar.replace(/\s+/g, ' '))
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)
+  const run = put?.body?.values?.run ?? {}
+  // run 组里别的键是沙箱的真实配置：只报门控这两项
+  check('保存只 PUT run 一组，写 tool_gate_provider / tool_gate_model', Object.keys(put?.body?.values ?? {}).join() === 'run'
+    && run.tool_gate_provider === 'demo-small' && run.tool_gate_model === 'tiny-2',
+    `provider=${run.tool_gate_provider ?? '—'} · model=${run.tool_gate_model ?? '—'}`)
+  check('……其余运行默认值原样带着', run.default_memory_scope === scope0 && 'confirm_dangerous_tools' in run)
+  await shot(page, 'prefs-gate-model')
+
+  // 换接入：原来填的模型不在新接入里就清掉；都清空保存成 null（= 用默认接入的默认模型）
+  await provider.selectOption('demo-main')
+  check('换了接入，旧接入的模型清掉', await model.inputValue() === '', await model.inputValue())
+  await provider.selectOption('')
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const run2 = sent.filter((s) => s.key === 'PUT /settings').at(-1)?.body?.values?.run ?? {}
+  check('……两项都留空：存成 null', run2.tool_gate_provider === null && run2.tool_gate_model === null,
+    `provider=${JSON.stringify(run2.tool_gate_provider)} · model=${JSON.stringify(run2.tool_gate_model)}`)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 老后端：run 组里没有这两项，读进来就是空，不算改动
+  let legacy = await get('/settings')
+  legacy = { ...legacy, run: Object.fromEntries(Object.entries(legacy.run ?? {}).filter(([k]) => !k.startsWith('tool_gate_'))) }
+  const old = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(legacy)(route)], [/^GET \/providers$/, json(PROVIDERS)]] })
+  check('老后端没有这两项：显示空、没有保存条', await old.page.getByLabel('门控模型 · 模型').inputValue() === ''
+    && await old.page.locator('[data-prefs-bar]').count() === 0)
+  await old.close()
+})
+
+await section('设置 · 智能体护栏', async () => {
+  // 默认步数、令牌预算、金额预算（后端 engine/guards.py）。预算留空 = 不限，存 null
+  let stored = await get('/settings')
+  stored = { ...stored, run: { ...(stored.run ?? {}), agent_max_steps: 100, agent_budget_tokens: 2000000, agent_budget_usd: null },
+    limits: { ...(stored.limits ?? {}), max_agent_steps: 100 } }
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => { stored = { ...stored, ...body.values }; return json(stored)(route) }],
+    ],
+  })
+  const box = page.locator('[data-agent-guard]')
+  const text = (await box.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('运行默认值里有「智能体护栏」，说清不再被固定步数掐断', text.includes('智能体护栏') && text.includes('按查到的部分收尾'),
+    text.slice(0, 100))
+  const steps = page.getByLabel('默认最大步数')
+  const tokens = page.getByLabel('令牌预算（每个节点）')
+  const usd = page.getByLabel('金额预算（美元）')
+  check('……读回设置里的值：100 步、200 万令牌、金额不限', await steps.inputValue() === '100'
+    && await tokens.inputValue() === '2000000' && await usd.inputValue() === '')
+  check('……金额留空写明「不限」', text.includes('不限：费用只受步数兜底和上下文约束'))
+
+  await steps.fill('500')
+  const save = page.getByRole('button', { name: /保存设置/ })
+  check('步数超过硬上限：标红、保存按钮不可用', await save.isDisabled()
+    && (await box.innerText()).includes('填 1 到 100 的整数'))
+  await steps.fill('60')
+  await tokens.fill('')
+  await usd.fill('1.5')
+  const bar = (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……改了三项：保存条写明是哪三项', bar.includes('有 3 项未保存') && bar.includes('默认最大步数')
+    && bar.includes('令牌预算') && bar.includes('金额预算'), bar)
+  await save.click()
+  await page.waitForTimeout(500)
+  const run = sent.filter((s) => s.key === 'PUT /settings').at(-1)?.body?.values?.run ?? {}
+  check('保存：步数写数字，令牌留空存 null（不限），金额写数字', run.agent_max_steps === 60
+    && run.agent_budget_tokens === null && run.agent_budget_usd === 1.5,
+    `steps=${JSON.stringify(run.agent_max_steps)} tokens=${JSON.stringify(run.agent_budget_tokens)} usd=${JSON.stringify(run.agent_budget_usd)}`)
+  await tokens.fill('500')
+  check('令牌预算少于 1000：标红、不能保存', await save.isDisabled())
+  await shot(page, 'prefs-agent-guard')
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 存着的步数比硬上限大（硬上限后来调小了）：没动它就不挡别的设置保存，后端发起运行时自己会截
+  const tight = { ...stored, run: { ...stored.run, agent_max_steps: 100 }, limits: { ...stored.limits, max_agent_steps: 25 } }
+  const t = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(tight)(route)],
+    [/^PUT \/settings$/, (route) => json(tight)(route)]] })
+  await t.page.getByLabel('金额预算（美元）').fill('2')
+  check('存着的步数超过硬上限、这次没改它：只改金额照样能保存',
+    !(await t.page.getByRole('button', { name: /保存设置/ }).isDisabled()))
+  await t.close()
+})
+
 await section('数据 · 数据库', async () => {
   const dbs = sources.filter((s) => !/[\\/]uploads[\\/]tables[\\/]/.test(s.database ?? ''))
   const first = dbs.find((s) => s.table_count > 0) ?? dbs[0]
@@ -1367,6 +1483,143 @@ await section('自定义工具 · 已有工具', async () => {
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
+})
+
+await section('工具 · 信任三档', async () => {
+  // 后端的 trust / trust_key 可能还没上线：GET /tools 在真列表后面补三件假的（一个自定义、两个 MCP），
+  // PUT /tools/trust 一律拦下来。fail 打开时回 422，看界面退回原样、说出后端给的原因
+  const custom = { id: 'crm_lookup', name: 'crm_lookup', description: '按客户编号查客户档案', category: '自定义 · http',
+    source: 'custom', dangerous: true, runtime_approval: true, schema: {}, problem: null, trust: 'ask', trust_key: 'crm_lookup' }
+  const search = { id: 'mcp:demo/search', name: 'search', server: 'demo', description: '全文检索', category: 'MCP · demo',
+    source: 'mcp', dangerous: true, runtime_approval: true, schema: {}, trust: 'gated', trust_key: 'mcp:demo/search' }
+  const weather = { id: 'mcp:demo/weather', name: 'weather', server: 'demo', description: '查天气', category: 'MCP · demo',
+    source: 'mcp', dangerous: true, runtime_approval: false, schema: {}, trust: 'always', trust_key: 'mcp:demo/weather' }
+  const customRow = { id: 'check-trust-crm', name: 'crm_lookup', kind: 'http', description: '按客户编号查客户档案', parameters: {},
+    config: { method: 'GET', url: 'https://example.com/crm' }, enabled: true, problem: null }
+  const server = { id: 'check-trust-demo', name: 'demo', transport: 'http', command: null, args: [], env: {}, url: 'https://example.com/mcp',
+    enabled: true, status: 'ok', last_error: null, tools_cache: ['search', 'weather'], last_checked_at: null, last_check_ok: null, last_latency_ms: null }
+  let fail = false
+  const builtin = tools.find((t) => t.source === 'builtin')
+  const { page, sent, natives, errors, close } = await open('/tools/library/crm_lookup', {
+    handlers: [
+      [/^GET \/tools$/, async (route) => json([...await (await route.fetch()).json(), custom, search, weather])(route)],
+      [/^GET \/custom-tools$/, json([customRow])],
+      [/^GET \/mcp\/servers$/, json([server])],
+      [/^PUT \/tools\/trust$/, (route, { body }) => (fail
+        ? delayed(500, { detail: '信任档只能是 ask、gated、always 之一' }, 422)(route)
+        : delayed(150, { key: body?.key, trust: body?.trust })(route))],
+    ],
+  })
+  const puts = () => sent.filter((s) => s.key === 'PUT /tools/trust')
+  const group = (name) => page.getByRole('radiogroup', { name: `${name} 的运行时审批` })
+  const checkedIn = (g) => g.locator('[aria-checked="true"]').innerText().catch(() => '')
+  // 按名字整段认：search 这种短名会撞上内置工具名里的子串
+  const listItem = (name) => page.locator('nav[aria-label="工具列表"] button')
+    .filter({ has: page.locator('span.mono', { hasText: new RegExp(`^${name}$`) }) }).first()
+
+  const detail = group('crm_lookup')
+  check('自定义工具：详情区有三选一，三档是等审批 / 始终允许 · 门控把关 / 始终允许',
+    (await detail.getByRole('radio').allInnerTexts()).join('|') === '等审批|始终允许 · 门控把关|始终允许',
+    (await detail.getByRole('radio').allInnerTexts().catch(() => [])).join('|'))
+  check('……现在选中的是后端给的「等审批」', await checkedIn(detail) === '等审批', await checkedIn(detail))
+  check('……旁边说清三档的差别，写明正式运行不看这个设置', (await page.locator('[data-trust-block]').innerText()).includes('正式运行不看这个设置'))
+  check('徽标按信任档：等审批挂「运行时需审批」', (await listItem('crm_lookup').innerText()).includes('运行时需审批'))
+  check('……门控把关挂「门控把关」', (await listItem('search').innerText()).includes('门控把关')
+    && !(await listItem('search').innerText()).includes('运行时需审批'))
+  const alwaysText = await listItem('weather').innerText()
+  check('……始终允许什么都不挂', !alwaysText.includes('审批') && !alwaysText.includes('门控'), alwaysText.replace(/\s+/g, ' '))
+  await shot(page, 'tool-trust-library')
+
+  // 改档：乐观更新，PUT 的载荷是 {key, trust}
+  await detail.getByRole('radio', { name: '始终允许 · 门控把关' }).click()
+  await page.waitForTimeout(40)
+  check('改档先改界面（请求还没回来就已经选中、徽标跟着变）', await checkedIn(detail) === '始终允许 · 门控把关'
+    && (await listItem('crm_lookup').innerText()).includes('门控把关'), await checkedIn(detail))
+  await page.waitForTimeout(300)
+  const put = puts().at(-1)
+  check('……PUT /tools/trust 的载荷是 {key: crm_lookup, trust: gated}', put?.body?.key === 'crm_lookup' && put?.body?.trust === 'gated'
+    && Object.keys(put?.body ?? {}).length === 2, JSON.stringify(put?.body ?? null))
+  // 方向键：整组一个 Tab 位，→ 选下一档并保存
+  await detail.getByRole('radio', { name: '始终允许 · 门控把关' }).focus()
+  await page.keyboard.press('ArrowRight')
+  await page.waitForTimeout(300)
+  check('……方向键也能改（→ 到「始终允许」，同样发 PUT）', puts().at(-1)?.body?.trust === 'always' && await checkedIn(detail) === '始终允许',
+    JSON.stringify(puts().map((p) => p.body?.trust)))
+  check('……始终允许之后徽标不挂了', !(await listItem('crm_lookup').innerText()).includes('审批'))
+
+  // 失败：退回原来那一档，并说出后端给的原因
+  fail = true
+  await detail.getByRole('radio', { name: '等审批' }).click()
+  await page.waitForTimeout(120)
+  const optimistic = await checkedIn(detail)
+  await page.waitForTimeout(700)
+  const reverted = await checkedIn(detail)
+  const alert = await page.locator('[role="alert"][aria-live="assertive"]').innerText().catch(() => '')
+  check('PUT 失败：先按新的显示，回来后退回「始终允许」', optimistic === '等审批' && reverted === '始终允许', `${optimistic} → ${reverted}`)
+  check('……徽标也退回去（始终允许不挂）', !(await listItem('crm_lookup').innerText()).includes('审批'))
+  check('……出错提示说哪个工具没改成、为什么', alert.includes('crm_lookup') && alert.includes('没改成') && alert.includes('ask、gated、always'),
+    alert.replace(/\s+/g, ' ').slice(0, 120))
+  fail = false
+  await page.locator('[role="alert"][aria-live="assertive"] button[aria-label*="关闭"]').first().click().catch(() => {})
+
+  // MCP 工具的 id 带斜杠（mcp:demo/search）：以前点它落到 404，详情区里的三选一根本到不了
+  await listItem('search').click()
+  await page.waitForTimeout(300)
+  check('MCP 工具在工具库里点得开，详情区有三选一（门控把关选中）', await checkedIn(group('mcp:demo/search')) === '始终允许 · 门控把关',
+    page.url().replace(WEB, ''))
+
+  // 内置工具没有这个控件
+  if (builtin) {
+    await listItem(builtin.name).click()
+    await page.waitForTimeout(300)
+    check('内置工具的详情区没有三选一', await page.locator('[data-trust-control]').count() === 0 && await page.locator('[data-trust-block]').count() === 0)
+  }
+
+  await page.getByRole('tab', { name: '自定义工具' }).click()
+  await page.waitForTimeout(400)
+  const row = page.locator('div.rounded-lg', { hasText: 'crm_lookup' }).last()
+  check('自定义工具列表：那一行有三选一，跟着刚才改的是「始终允许」', await checkedIn(row.getByRole('radiogroup')) === '始终允许')
+  check('……列表上方说清三档的差别', (await page.locator('[data-trust-explain]').innerText().catch(() => '')).includes('门控把关是每次先让一个小模型看参数'))
+  await shot(page, 'tool-trust-custom')
+
+  await page.getByRole('tab', { name: 'MCP 接入' }).click()
+  await page.waitForTimeout(400)
+  const card = page.locator('article', { hasText: 'demo' })
+  check('MCP 卡片列出这台服务的工具，每个一组三选一', await card.getByRole('radiogroup').count() === 2
+    && await checkedIn(group('mcp:demo/search')) === '始终允许 · 门控把关' && await checkedIn(group('mcp:demo/weather')) === '始终允许')
+  await group('mcp:demo/weather').getByRole('radio', { name: '等审批' }).click()
+  await page.waitForTimeout(300)
+  check('……MCP 工具改档，键是 mcp:服务名/工具名', puts().at(-1)?.body?.key === 'mcp:demo/weather' && puts().at(-1)?.body?.trust === 'ask',
+    JSON.stringify(puts().at(-1)?.body ?? null))
+  await shot(page, 'tool-trust-mcp')
+  check('改档只发 PUT /tools/trust，没有别的写请求', sent.filter((s) => s.key !== 'PUT /tools/trust' && !s.key.startsWith('GET ')).length === 0,
+    sent.filter((s) => s.key !== 'PUT /tools/trust' && !s.key.startsWith('GET ')).map((s) => s.key).join(', '))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  // 渲染崩了由错误边界接住，不一定有 pageerror：边界的兜底页也算
+  check('没有运行时报错', errors.length === 0 && await page.locator('[data-error-scope]').count() === 0, errors[0] ?? '')
+  await close()
+
+  // 老后端：工具项上没有 trust / trust_key。界面照旧：没有三选一，自定义 / MCP 写「运行时不审批」
+  const strip = ({ trust, trust_key, ...rest }) => ({ ...rest, runtime_approval: false })
+  const old = await open('/tools/library/crm_lookup', {
+    handlers: [
+      [/^GET \/tools$/, async (route) => json([...await (await route.fetch()).json(), strip(custom), strip(search)])(route)],
+      [/^GET \/custom-tools$/, json([customRow])],
+      [/^GET \/mcp\/servers$/, json([server])],
+    ],
+  })
+  check('老后端：详情区没有三选一', await old.page.locator('[data-trust-control]').count() === 0 && await old.page.locator('[data-trust-block]').count() === 0)
+  check('……徽标照旧写「运行时不审批」', (await old.page.locator('nav[aria-label="工具列表"] button', { hasText: 'crm_lookup' }).first()
+    .innerText({ timeout: 3000 }).catch(() => '')).includes('运行时不审批'))
+  // 页面要是渲染崩了，后面几项照样跑完，最后那条「没有运行时报错」说出原因
+  await old.page.getByRole('tab', { name: '自定义工具' }).click({ timeout: 3000 }).catch(() => {})
+  await old.page.waitForTimeout(400)
+  check('……自定义工具列表也没有，没有那段说明', await old.page.locator('[data-trust-control]').count() === 0 && await old.page.locator('[data-trust-explain]').count() === 0)
+  await old.page.getByRole('tab', { name: 'MCP 接入' }).click({ timeout: 3000 }).catch(() => {})
+  await old.page.waitForTimeout(400)
+  check('……MCP 卡片不列工具', await old.page.locator('[data-trust-control]').count() === 0 && await old.page.locator('article ul').count() === 0)
+  check('……没有运行时报错', old.errors.length === 0 && await old.page.locator('[data-error-scope]').count() === 0, old.errors[0] ?? '')
+  await old.close()
 })
 
 await section('知识库 · 撤销窗口里的轮询', async () => {

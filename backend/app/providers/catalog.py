@@ -216,6 +216,19 @@ def find_pricing(model: str) -> dict[str, float] | None:
     return None
 
 
+def find_context(model: str) -> int | None:
+    """目录里登记的上下文窗口（token）。没登记的返回 None，由调用方取保守值。"""
+    target = _norm(model)
+    pools = [ANTHROPIC_MODELS, OPENAI_MODELS, MOCK_MODELS]
+    pools += [p["models"] for p in COMPATIBLE_PRESETS]
+    for pool in pools:
+        for entry in pool:
+            if _norm(entry["id"]) == target:
+                value = entry.get("context")
+                return int(value) if isinstance(value, (int, float)) and value > 0 else None
+    return None
+
+
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """按目录价估算一次调用的花费（美元）。"""
     pricing = find_pricing(model)

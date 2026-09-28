@@ -32,9 +32,9 @@ from app.tools.registry import (
     ToolContext,
     args_model_of,
     build_tools,
-    call_is_dangerous,
     prepare_args,
 )
+from app.tools.trust import ask_gate, call_policy
 
 _MAX_DEPTH = 3
 
@@ -366,6 +366,21 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                             targs, fix_note = prepare_args(schema, targs)
                         except ToolArgsError as e:
                             args_error = str(e)
+                    # 要不要人工确认、要不要先问门控：按纠正后的参数判
+                    policy = "safe"
+                    gate_reason = ""
+                    if not args_error and approval != "never":
+                        policy = call_policy(tool_map[tname], tname, targs, ctx.run.tool_trust)
+                        if policy == "gate":
+                            gate = await ask_gate(
+                                tool=tool_map[tname], args=targs, node_title=f"{ctx.node.title} · {name}",
+                                task=f"团队目标：{goal}\n\n{name} 的任务：{instruction}")
+                            ctx.emit(EventType.TOOL_GATED, tool=tname, agent=name, call_id=cid, **gate.event())
+                            _accumulate({"input_tokens": gate.usage.get("input_tokens", 0),
+                                         "output_tokens": gate.usage.get("output_tokens", 0),
+                                         "cost_usd": gate.usage.get("cost_usd", 0.0), "calls": 1}, tally)
+                            policy = "safe" if gate.allowed else "ask"
+                            gate_reason = gate.reason
                     # 纠正后的参数才是真正要执行的那份，tool.start 要发它
                     limit = limit_of(tool_map[tname], tname, targs)
                     ctx.emit(EventType.TOOL_START, tool=tname, args=targs, agent=name, call_id=cid,
@@ -376,17 +391,19 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     if args_error:
                         # 参数就不对，没必要真调一次。把"它接受什么"喂回去让它改
                         content = args_error
-                    elif approval != "never" and call_is_dangerous(tool_map[tname], tname, targs):
+                    elif policy == "ask":
                         # 专家们并行跑在同一个节点里，停不下来等人：审批恢复时节点整个
                         # 重放，几个人的 interrupt 谁先谁后对不上号。以前的做法是不审，
                         # shell_exec / file_write / 可写库上的 DELETE 照跑不误——
                         # agent 节点守着的那道门，在这里是敞开的。现在是不跑，并说清原因
                         content = (
-                            f"没有执行：{tname} 这次调用需要人工确认，而协作团队里的成员"
+                            (f"门控模型没有放行（{gate_reason}）。" if gate_reason else "")
+                            + f"没有执行：{tname} 这次调用需要人工确认，而协作团队里的成员"
                             "不能停下来等人。换一种不需要它的做法；实在需要，交给团队外"
                             "的 agent 节点去做（那里可以逐次审批）。"
                         )
-                        ctx.emit(EventType.LOG, level="warn", code="tool_needs_approval",
+                        ctx.emit(EventType.LOG, level="warn", code="tool_needs_approval", tool=tname,
+                                 agent=name, call_id=cid,
                                  message=f"{name} 想调用 {tname}，需要人工确认，协作节点里不执行")
                     else:
                         try:
@@ -644,6 +661,8 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         memory_scope=ctx.run.memory_scope,
         collection=ctx.run.collection,
         approval_default=ctx.run.approval_default,
+        tool_trust=ctx.run.tool_trust,
+        agent_limits=ctx.run.agent_limits,
         # 恢复重放的标记和签批人只属于父图的节点，不能漏进子图（节点 id 可能重名）
         extra={**{k: v for k, v in ctx.run.extra.items() if k not in ("resumed", "actors")},
                "node_prefix": f"{ctx.node.id}/"},

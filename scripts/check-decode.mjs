@@ -1125,6 +1125,113 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
   check('载荷缺字段也不崩，只说核对了报告', bare?.title === '核对报告' && !bare.artifact, bare?.title)
 })
 
+await section('工具门控 tool.gated（工具信任三档）', async () => {
+  // 契约：data = {tool, verdict: allow|escalate, reason, model, duration_ms, call_id?, agent?}，node_id 是所在节点
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const gated = (steps) => flatten(steps).filter((s) => s.code === 'tool_gated')
+  const nodeOf = (steps, id) => steps.find((s) => s.nodeId === id && s.kind === 'node')
+
+  // 放行：info 级的一行，挂在 agent 节点下，接着是正常的工具调用
+  const allowRun = mod.decodeRun([
+    E(1, 'node.started', 'agent', { node_type: 'agent', label: '查档案' }),
+    E(2, 'tool.gated', 'agent', { tool: 'crm_lookup', verdict: 'allow', reason: '只读查询，参数正常', model: 'tiny-1', duration_ms: 820, call_id: 'c1' }),
+    E(3, 'tool.start', 'agent', { tool: 'crm_lookup', args: { id: 'C-1' }, call_id: 'c1' }),
+    E(4, 'tool.end', 'agent', { tool: 'crm_lookup', call_id: 'c1', preview: '{"name":"示例客户"}', duration_ms: 40 }),
+  ])
+  const allow = gated(allowRun)[0]
+  check('放行：说「门控放行 <工具>：<理由>」', allow?.title === '门控放行 crm_lookup：只读查询，参数正常', allow?.title)
+  check('……info 级，不是提醒', allow?.level === 'info', allow?.level)
+  check('……挂在所在节点下面，排在工具调用前', nodeOf(allowRun, 'agent')?.children?.[0] === allow
+    && nodeOf(allowRun, 'agent')?.children?.[1]?.kind === 'tool', nodeOf(allowRun, 'agent')?.children?.map((c) => c.kind).join(','))
+  check('……行尾写门控用的模型和耗时', allow?.meta === '门控 tiny-1 · 820 ms', allow?.meta)
+  // 问门控时那次模型调用已经答完了：不能在门控那几秒里还转着「思考并作答」
+  const thinking = flatten(mod.decodeRun([E(1, 'node.started', 'agent', { node_type: 'agent' }), E(2, 'llm.start', 'agent', { model: 'm' }),
+    E(3, 'tool.gated', 'agent', { tool: 'crm_lookup', verdict: 'allow', reason: '只读' })])).find((s) => s.kind === 'llm')
+  check('……门控一来，前面那次模型调用收成完成', thinking?.status === 'done', thinking?.status)
+
+  // 拦下（agent 节点）：warn 级，接着是 human.requested，交给人批
+  const escEvents = [
+    E(1, 'node.started', 'agent', { node_type: 'agent', label: '改档案' }),
+    E(2, 'tool.gated', 'agent', { tool: 'mcp:demo/search', verdict: 'escalate', reason: '参数里带了删除条件', model: 'tiny-1', duration_ms: 910 }),
+    E(3, 'human.requested', 'agent', { mode: 'approve', tool: 'mcp:demo/search', args: {}, title: 'Agent 想调用工具 mcp:demo/search', trust_key: 'mcp:demo/search' }),
+    E(4, 'run.interrupted', 'agent', { payload: { kind: 'tool_approval', node_id: 'agent', tool: 'mcp:demo/search', trust_key: 'mcp:demo/search' } }),
+  ]
+  const escRun = mod.decodeRun(escEvents)
+  const esc = gated(escRun)[0]
+  check('拦下：说「门控拦下 <工具>，交给人工审批：<理由>」', esc?.title === '门控拦下 mcp:demo/search，交给人工审批：参数里带了删除条件', esc?.title)
+  check('……warn 级', esc?.level === 'warn', esc?.level)
+  check('……挂在所在节点下面，后面跟着等审批的那一行', nodeOf(escRun, 'agent')?.children?.includes(esc)
+    && flatten(escRun).some((s) => s.kind === 'human' && s.status === 'waiting'))
+
+  // 协作团队里拦下：成员停不下来，紧接着一条 tool_needs_approval 的 log，调用不执行。
+  // 两个成员并行，两条门控都拦下之后 log 才到：按工具名各认各的（按先后取最近的一条会配错）
+  const teamRun = mod.decodeRun([
+    E(1, 'node.started', 'team', { node_type: 'supervisor', label: '调研团队' }),
+    E(2, 'tool.start', 'team', { tool: 'crm_lookup', args: {}, agent: '研究员', call_id: 't1' }),
+    E(3, 'tool.start', 'team', { tool: 'weather', args: {}, agent: '分析员', call_id: 't2' }),
+    E(4, 'tool.gated', 'team', { tool: 'crm_lookup', verdict: 'escalate', reason: '要批量导出', model: 'tiny-1', duration_ms: 700, agent: '研究员', call_id: 't1' }),
+    E(5, 'tool.gated', 'team', { tool: 'weather', verdict: 'escalate', reason: '门控模型没答上来：超时', model: 'tiny-1', duration_ms: 20000, agent: '分析员', call_id: 't2' }),
+    E(6, 'log', 'team', { level: 'warn', code: 'tool_needs_approval', message: '研究员 想调用 crm_lookup，需要人工确认，协作节点里不执行' }),
+    E(7, 'log', 'team', { level: 'warn', code: 'tool_needs_approval', message: '分析员 想调用 weather，需要人工确认，协作节点里不执行' }),
+    E(8, 'tool.end', 'team', { tool: 'crm_lookup', agent: '研究员', call_id: 't1', preview: '没有执行：crm_lookup 这次调用需要人工确认', duration_ms: 710 }),
+    E(9, 'tool.end', 'team', { tool: 'weather', agent: '分析员', call_id: 't2', preview: '没有执行：weather 这次调用需要人工确认', duration_ms: 20010 }),
+  ])
+  const teamRows = gated(teamRun)
+  const crm = teamRows.find((s) => s.title.includes('crm_lookup'))
+  const wx = teamRows.find((s) => s.title.includes('weather'))
+  check('团队里拦下：改说「门控拦下 <工具>，协作团队里不执行：<理由>」', crm?.title === '门控拦下 crm_lookup，协作团队里不执行：要批量导出', crm?.title)
+  check('……并行的两条按工具名各认各的：标题和折进来的原话都对得上', wx?.title === '门控拦下 weather，协作团队里不执行：门控模型没答上来：超时'
+    && !!crm?.detail?.includes('研究员 想调用 crm_lookup') && !!wx.detail?.includes('分析员 想调用 weather'), `${wx?.title} / ${crm?.detail} / ${wx?.detail}`)
+  check('……副标题写是哪个成员调的', crm?.sub === '研究员 调用' && wx?.sub === '分析员 调用', `${crm?.sub} / ${wx?.sub}`)
+  check('……那条 log 折进门控那一行，不另起一行', !flatten(teamRun).some((s) => s.code === 'tool_needs_approval')
+    && !!crm?.detail?.includes('协作节点里不执行'), flatten(teamRun).filter((s) => s.kind === 'note').map((s) => s.title).join(' | '))
+  check('……挂在团队节点下面', !!nodeOf(teamRun, 'team')?.children?.includes(crm))
+  // 没有门控的团队审批（ask 档）照旧：log 自己成一行
+  const plain = flatten(mod.decodeRun([E(1, 'node.started', 'team', { node_type: 'supervisor' }),
+    E(2, 'log', 'team', { level: 'warn', code: 'tool_needs_approval', message: '研究员 想调用 crm_lookup，需要人工确认，协作节点里不执行' })]))
+  check('……没过门控的 tool_needs_approval 照旧自己成一行', plain.some((s) => s.code === 'tool_needs_approval'))
+  // 拦下后交给了人（agent 节点），之后同一节点再来的 log 不改写它
+  const handed = mod.decodeRun([E(1, 'node.started', 'a', { node_type: 'agent' }),
+    E(2, 'tool.gated', 'a', { tool: 'crm_lookup', verdict: 'escalate', reason: '可疑' }),
+    E(3, 'human.requested', 'a', { mode: 'approve', tool: 'crm_lookup', title: '要调用 crm_lookup' }),
+    E(4, 'log', 'a', { level: 'warn', code: 'tool_needs_approval', message: 'x 想调用 crm_lookup' })])
+  check('……已经交给人工的，不会被后来的 log 改口', gated(handed)[0]?.title === '门控拦下 crm_lookup，交给人工审批：可疑', gated(handed)[0]?.title)
+
+  // 审批卡上点了「始终允许」：后端的 human.resolved 带 always（工具审批是平铺的 {tool, approved, note, always}）
+  const resolved = (data) => flatten(mod.decodeRun([...escEvents, E(5, 'run.resumed', null, { response: data, actor: '张工' }),
+    E(6, 'human.resolved', 'agent', data)]))
+    .find((s) => s.kind === 'human')
+  const always = resolved({ tool: 'mcp:demo/search', approved: true, note: '', actor: '张工', always: true })
+  check('始终允许：审批那一行写「放行了，并设为「始终允许 · 门控把关」」', always?.title === 'Agent 想调用工具 mcp:demo/search → 张工 放行了，并设为「始终允许 · 门控把关」',
+    always?.title)
+  const once = resolved({ tool: 'mcp:demo/search', approved: true, note: '', actor: '张工' })
+  check('……只是通过的不带这句', once?.title === 'Agent 想调用工具 mcp:demo/search → 张工 放行了', once?.title)
+  const denied = resolved({ tool: 'mcp:demo/search', approved: false, note: '不许导出', actor: '张工' })
+  check('……工具审批被驳回写「驳回了」（以前只读 response，平铺的 approved 读不到，一律写放行）',
+    denied?.title === 'Agent 想调用工具 mcp:demo/search → 张工 驳回了' && !!denied.detail?.includes('备注：不许导出'), `${denied?.title} / ${denied?.detail}`)
+
+  // 缺字段：不崩，不出 undefined，不当成没翻译的记录
+  let bare = []
+  let thrown = null
+  try {
+    bare = flatten(mod.decodeRun([
+      E(1, 'tool.gated', null, {}),
+      E(2, 'node.started', 'x', { node_type: 'agent' }),
+      E(3, 'tool.gated', 'x', { verdict: 'allow' }),
+      E(4, 'tool.gated', 'x', { tool: 'crm_lookup', verdict: 'escalate', reason: null, duration_ms: 'slow' }),
+      E(5, 'log', 'x', { level: 'warn', code: 'tool_needs_approval' }),
+    ]))
+  } catch (e) { thrown = e }
+  const rows = bare.filter((s) => s.code === 'tool_gated')
+  check('缺字段：不抛异常，每条都成一行', !thrown && rows.length === 3, thrown ? String(thrown.message) : `${rows.length} 行`)
+  check('……没有工具名说「一次工具调用」，没有理由就不带冒号', rows[0]?.title === '门控拦下一次工具调用，交给人工审批'
+    && rows[1]?.title === '门控放行一次工具调用', rows.map((r) => r.title).join(' | '))
+  check('……理由、耗时不是字符串 / 数字时不拼出 undefined / null', !rows.some((r) => /undefined|null|NaN/.test(`${r.title}${r.meta ?? ''}${r.detail ?? ''}`)),
+    rows.map((r) => `${r.title} ${r.meta ?? ''}`).join(' | '))
+  check('……没有消息的 tool_needs_approval 也折进去', rows[2]?.title === '门控拦下 crm_lookup，协作团队里不执行', rows[2]?.title)
+  check('……不是「一条还没翻译的记录」', !bare.some((s) => s.title === '一条还没翻译的记录'))
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

@@ -161,11 +161,11 @@ class McpManager:
         for server, tool_name in parsed:
             tools = self._tools.get(server, []) if server in live else []
             if tool_name in ("", "*"):
-                wanted.extend(tools)
+                wanted.extend(_keyed(server, t) for t in tools)
                 continue
             for tool in tools:
                 if tool.name == tool_name:
-                    wanted.append(tool)
+                    wanted.append(_keyed(server, tool))
                     break
         return wanted
 
@@ -206,3 +206,12 @@ def _reason(e: BaseException, command: str | None = None) -> str:
 
 
 mcp_manager = McpManager()
+
+
+def _keyed(server: str, tool: BaseTool) -> BaseTool:
+    """标上信任三档用的 key（`mcp:<server>/<tool>`，和工具列表里的 id 一致）。
+
+    缓存里的工具对象是共用的，key 只由 server 和工具名决定，重复标同一个值不会串。
+    """
+    tool.metadata = {**(tool.metadata or {}), "trust_key": f"mcp:{server}/{tool.name}"}
+    return tool

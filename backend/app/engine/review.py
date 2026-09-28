@@ -40,9 +40,13 @@ class Signal:
     kind: str
     detail: str
     severity: str = DEGRADED
+    #: agent 为什么提前收尾（engine/guards.py：steps / stall / budget_tokens / budget_usd / context）。
+    #: 问数据页据此决定给不给「放宽步数重跑」：只有步数用满时放宽步数才对症
+    reason: str | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return {"kind": self.kind, "detail": self.detail, "severity": self.severity}
+        out = {"kind": self.kind, "detail": self.detail, "severity": self.severity}
+        return {**out, "reason": self.reason} if self.reason else out
 
 
 # warn 日志按 code 分类，而不是靠匹配中文消息串——消息是给人读的，随时会改，
@@ -125,7 +129,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     signals: list[Signal] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(kind: str, detail: str, severity: str) -> None:
+    def add(kind: str, detail: str, severity: str, reason: str | None = None) -> None:
         if severity == BENIGN:
             return
         key = (kind, detail)
@@ -133,7 +137,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             return
         seen.add(key)
         kinds.add(kind)
-        signals.append(Signal(kind, detail, severity))
+        signals.append(Signal(kind, detail, severity, reason))
 
     kinds: set[str] = set()
 
@@ -187,8 +191,9 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             message = str(data.get("message") or "").strip()
             code = str(data.get("code") or "")
             kind, severity = WARN_CODES.get(code, ("warn", DEGRADED))
+            reason = data.get("reason")
             if message:
-                add(kind, message[:300], severity)
+                add(kind, message[:300], severity, reason if isinstance(reason, str) and reason else None)
 
     text = answer_text(output)
     if not text:

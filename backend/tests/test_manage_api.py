@@ -129,9 +129,10 @@ async def test_the_tool_list_says_whether_runtime_approval_really_applies(client
         tools = {t["id"]: t for t in (await client.get("/api/tools")).json()}
         assert tools["file_write"]["runtime_approval"] is True
         assert tools["file_read"]["runtime_approval"] is False
-        # 有副作用，但运行时的审批关卡认不出它——标签不能说它会被审批
+        # 自定义工具默认「等审批」：运行时的关卡真的会停下来（tools/trust.py）
         assert tools["probe_hook"]["dangerous"] is True
-        assert tools["probe_hook"]["runtime_approval"] is False
+        assert tools["probe_hook"]["runtime_approval"] is True
+        assert (tools["probe_hook"]["trust"], tools["probe_hook"]["trust_key"]) == ("ask", "probe_hook")
     finally:
         await client.delete(f"/api/custom-tools/{r.json()['id']}")
 

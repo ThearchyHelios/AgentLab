@@ -140,11 +140,18 @@ NODE_REFERENCE = """\
 - output：出口，收集最终成果。config.fields = [{name, value}]，value 里写模板引用
 - llm：单次模型调用。config: {system, prompt, model, temperature, max_tokens, assign_to, output_schema}
 - agent：带工具循环的 agent。config: {system, prompt, tools:[工具名], approval, assign_to}
-  **默认不要写 max_steps**。平台默认值是按「一步只调一个工具」校准过的；写死一个
-  小数字（见过 8）会让它查完表结构就没额度回答了，用户拿到的是半截结论。
-  唯一的例外：上一次就是因为**步数用尽**没跑完（会在改写理由里写明），
-  这时要显式写一个更大的值（比如 24）——那是这种失败唯一的修法
+  **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
+  步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
+  上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
+  上一次如果是被护栏收了尾（改写理由里会写明原因），按原因改，而不是加步数：
+  - 连续几步没有新信息：提示词里点明该查哪几张表、要哪些字段，或者工具参数写法有问题；
+  - 预算用完：写一个更大的 budget_tokens；
+  - 上下文快满：让它每次查更小的范围（SQL 加 LIMIT、只选需要的列）；
+  - 步数用满：通常说明任务拆得太大，拆成几个节点比加步数更可靠
+  MCP 工具和自定义工具默认每次调用都要人工审批（用户可以在工具页改成「始终允许」）。
+  **不要为了不停下来就把 approval 写成 never**，这是绕过用户的审批设置；要不要放行由用户在工具页决定
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
+  成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
   assign_to 拿到的是 stdout（尾部的换行已去掉）。**stdout 是 JSON 时会解析成对象**，

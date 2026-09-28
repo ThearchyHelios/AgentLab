@@ -137,8 +137,28 @@ async def run_validate(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     result = {"valid": False, "data": value, "attempts": attempt, "errors": errors}
     if ctx.cfg("fail_fast", True):
-        raise NodeError(ctx.node.id, f"结构化校验未通过：{'; '.join(errors)}")
+        raise NodeError(ctx.node.id, f"结构化校验未通过：{'; '.join(errors)}{_upstream_cut_short(state, ctx)}")
     return {"nodes": {ctx.node.id: result}, **({"usage": usage} if usage else {})}
+
+
+def _upstream_cut_short(state: GraphState, ctx: NodeContext) -> str:
+    """上游有 agent 没等到自己给结论就收了尾（步数、预算、上下文……），缺字段多半出在那里。
+
+    以前报错只有一句「regions: None is not of type 'array'」，看不出根源是上游
+    agent 用满了步数、查到一半就被收了尾（run 719253eb / 6310f291）。
+    """
+    from app.engine.guards import LIMITED_LABEL
+
+    nodes = ctx.run.spec.node_map()
+    cut = [
+        f"「{nodes[nid].title if nid in nodes else nid}」{LIMITED_LABEL.get(out['limited'], '提前收了尾')}"
+        for nid, out in (state.get("nodes") or {}).items()
+        if isinstance(out, dict) and out.get("limited")
+    ]
+    if not cut:
+        return ""
+    return (f"。上游{'、'.join(cut)}，没等查全就收了尾，缺的字段多半出在这里："
+            "看它的收尾提示，把对应的上限调大或者缩小它要查的范围")
 
 
 def _coerce_json(raw: Any) -> tuple[Any, str | None]:

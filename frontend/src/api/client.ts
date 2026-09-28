@@ -1,7 +1,7 @@
 import type {
   Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
   EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus,
-  Skill, ToolChange, ToolInfo, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
+  Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
 import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
@@ -487,7 +487,12 @@ export const api = {
       post<Run>(`/runs/${id}/continue`, { graph: graph ?? null }),
     // 等审批的运行直接收成 cancelled；在跑的要等引擎收尾，先回 stopping
     cancel: (id: string) => post<{ ok: boolean; status?: 'stopping' | 'cancelled' }>(`/runs/${id}/cancel`),
-    resume: (id: string, response: any) => post<Run>(`/runs/${id}/resume`, { response }),
+    /**
+     * 回复审批。approvalId 指明回复的是哪一条（一次运行里可能有几条同时等着）。
+     * 审批卡的「始终允许」走这里：response 多带 always，/approvals/{id}/decide 的请求体没有这一项
+     */
+    resume: (id: string, response: any, approvalId?: string) =>
+      post<Run>(`/runs/${id}/resume`, approvalId ? { response, approval_id: approvalId } : { response }),
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),
     state: (id: string) => get<any>(`/runs/${id}/state`),
     history: (id: string) => get<any[]>(`/runs/${id}/history`),
@@ -535,6 +540,9 @@ export const api = {
     /** 危险工具要 confirm，否则后端回 409，detail 写明它会做什么 */
     run: (name: string, args: Record<string, any>, opts?: { confirm?: boolean }) =>
       post<any>(`/tools/${name}/run`, opts?.confirm ? { args, confirm: true } : { args }),
+    /** MCP / 自定义工具的信任档。key 是 ToolInfo.trust_key；设回 ask 等于删掉这一条 */
+    setTrust: (key: string, trust: ToolTrust) =>
+      put<{ key: string; trust: ToolTrust }>('/tools/trust', { key, trust }),
   },
   customTools: {
     /** 每行带 problem：库里存着的参数定义写坏了时是一句中文，绑了它的节点一定失败 */

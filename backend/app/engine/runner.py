@@ -20,6 +20,7 @@ from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType, RunEventModel
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
+from app.engine.approval import read_decision
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
@@ -187,6 +188,10 @@ class RunManager:
             approval_default = await _approval_default(run_class=run_class)
 
         async with SessionLocal() as session:
+            from app.tools.trust import run_snapshot
+
+            tool_trust = await run_snapshot(session, run_class=run_class)
+            agent_limits = await _agent_limits(session)
             run = Run(
                 workflow_id=workflow_id,
                 workflow_name=workflow_name,
@@ -200,6 +205,8 @@ class RunManager:
                 memory_scope=memory_scope,
                 collection=collection,
                 approval_default=approval_default,
+                tool_trust=tool_trust,
+                agent_limits=agent_limits,
             )
             run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
             session.add(run)
@@ -215,6 +222,8 @@ class RunManager:
                 memory_scope=memory_scope,
                 collection=collection,
                 approval_default=approval_default,
+                tool_trust=tool_trust,
+                agent_limits=agent_limits,
             )
         )
         return run
@@ -307,6 +316,14 @@ class RunManager:
                     await session.rollback()
                     raise ValueError("这条审批已经处理过了，或者这次运行已经放弃了。刷新看看最新状态")
                 await session.commit()
+                # 审批卡上点的是「始终允许」：这个工具以后改由门控把关。只有带 trust_key 的
+                # 审批才有这个按钮（MCP / 自定义工具、探索运行），别的审批带了 always 也不理。
+                # 这次运行里本节点后面的调用由节点自己从答复里认出来（见 llm.py 的 granted）
+                trust_key = (target.payload or {}).get("trust_key")
+                if isinstance(trust_key, str) and trust_key and read_decision(response).always:
+                    from app.tools.trust import set_trust
+
+                    await set_trust(session, trust_key, "gated")
 
             # 凑齐没有？引擎还在等的每一个 interrupt 都得有答案
             answered = list((
@@ -560,6 +577,8 @@ class RunManager:
         memory_scope: str = "default",
         collection: str = "default",
         approval_default: str | None = None,
+        tool_trust: dict[str, str] | None = None,
+        agent_limits: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
     ) -> None:
@@ -594,6 +613,10 @@ class RunManager:
                           # 正式运行查的是哪个库、审批默认是什么，事后可复核
                           "memory_scope": memory_scope, "collection": collection,
                           "approval_default": approval_default,
+                          # MCP / 自定义工具的信任三档（只列不是「等审批」的；正式运行记 formal）
+                          "tool_trust": _trust_event(tool_trust),
+                          # agent 护栏的上限（步数兜底、令牌 / 金额预算），None 是升级前的运行
+                          "agent_limits": agent_limits,
                           # 这一段是按哪一版重放协议跑的，恢复时据此认出升级前做下的工作
                           "replay_protocol": PROTOCOL},
                 )
@@ -606,6 +629,8 @@ class RunManager:
                     memory_scope=memory_scope,
                     collection=collection,
                     approval_default=approval_default,
+                    tool_trust=tool_trust,
+                    agent_limits=agent_limits,
                     extra={"resumed": set(resumed), "actors": dict(actors or {})},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
@@ -969,7 +994,24 @@ def _carried(run: Run) -> dict[str, Any]:
         "memory_scope": run.memory_scope or "default",
         "collection": run.collection or "default",
         "approval_default": run.approval_default,
+        "tool_trust": run.tool_trust,
+        "agent_limits": run.agent_limits,
     }
+
+
+async def _agent_limits(session: Any) -> dict[str, Any]:
+    from app.api.settings import run_defaults
+    from app.engine.guards import run_limits
+
+    return run_limits(await run_defaults(session), settings.max_agent_steps)
+
+
+def _trust_event(tool_trust: dict[str, str] | None) -> Any:
+    from app.tools.trust import FORMAL_MARK, snapshot_levels
+
+    if tool_trust is None:
+        return None
+    return "formal" if tool_trust.get(FORMAL_MARK) else snapshot_levels(tool_trust)
 
 
 def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType, dict[str, Any]]]:

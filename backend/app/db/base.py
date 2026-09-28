@@ -143,6 +143,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs", "memory_scope", "VARCHAR(100)"),
     ("runs", "collection", "VARCHAR(100)"),
     ("runs", "approval_default", "VARCHAR(20)"),
+    ("runs", "tool_trust", "JSON"),
+    ("runs", "agent_limits", "JSON"),
     ("runs", "error_node_id", "VARCHAR(64)"),
     ("workflows", "status", "TEXT DEFAULT 'draft'"),
     ("workflows", "published_version", "INTEGER"),

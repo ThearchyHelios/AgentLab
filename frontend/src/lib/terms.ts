@@ -17,7 +17,7 @@
  * 枚举值（formal / degraded / withheld 等）不动，只换显示。
  */
 
-import type { NodeType } from '../types'
+import type { NodeType, ToolTrust } from '../types'
 import { formatNumber } from './format'
 
 export const TERMS = {
@@ -230,4 +230,64 @@ export const EVIDENCE_TEXT = {
   docMismatch: '成果字段和报告文档对不上，按普通文本显示',
   docOtherRun: '证据文档不是这次运行写的，按普通文本显示',
   ambiguous: (candidates: string[]) => `出处不唯一：候选 ${candidates.join('、')}`,
+} as const
+
+/**
+ * MCP / 自定义工具的信任档：工具页的三选一、工具徽标、审批卡的「始终允许」共用这一份。
+ * 「始终允许」只指 always；审批卡上那个按钮设的是 gated，按钮字短，说明里写全
+ */
+export const TOOL_TRUST_VALUES: readonly ToolTrust[] = ['ask', 'gated', 'always']
+
+export const TOOL_TRUST_LABEL: Record<ToolTrust, string> = {
+  ask: '等审批',
+  gated: '始终允许 · 门控把关',
+  always: '始终允许',
+}
+
+/** 每一档悬停看的那句：它在运行时具体怎么做 */
+export const TOOL_TRUST_HINT: Record<ToolTrust, string> = {
+  ask: '每次调用都停下来等你批。协作团队里的成员停不下来，这次调用不执行',
+  gated: '每次调用先让门控模型看一眼参数：它放行就直接执行，判可疑、没答上来都交给你批',
+  always: '不问你，直接执行',
+}
+
+export const TOOL_TRUST_TEXT = {
+  title: '运行时审批',
+  /** 三选一的读屏名字 */
+  groupLabel: (tool: string) => `${tool} 的运行时审批`,
+  explain: '默认每次都等你批；门控把关是每次先让一个小模型看参数，可疑的仍然交给你；正式运行不看这个设置，一律等审批。',
+  /** 工具徽标：ask 和 gated 各一个，always 不挂 */
+  badgeAsk: '运行时需审批',
+  badgeGated: '门控把关',
+  badgeGatedHint: '在探索运行里调用它之前，先让门控模型看一眼参数，判可疑的仍然停下来等人工审批。正式运行一律等审批。',
+  saveFailed: (tool: string) => `${tool} 的运行时审批没改成，已恢复原样`,
+  /** 审批卡 */
+  alwaysButton: '始终允许',
+  alwaysHint: (tool: string) =>
+    `批准这次，并把 ${tool} 设为「始终允许 · 门控把关」：本节点后面的调用和以后的运行不再问你，由门控模型逐次把关；可以在工具页改回`,
+  alwaysDone: (tool: string) => `已放行，运行继续；${tool} 以后由门控模型把关`,
+} as const
+
+/** 设置页「运行默认值」里的门控模型 */
+export const TOOL_GATE_TEXT = {
+  label: '门控模型',
+  provider: '门控模型 · 接入',
+  model: '门控模型 · 模型',
+  hint: '工具设成「始终允许 · 门控把关」时，每次调用前由它看一眼参数。留空就用默认接入的默认模型。每次调用都会多问它一次，建议选又快又便宜的小模型。',
+  providerDefault: '默认接入',
+  modelDefault: '留空：用接入的默认模型',
+} as const
+
+/** 设置页「运行默认值」里 agent 护栏那一组（后端 engine/guards.py） */
+export const AGENT_GUARD_TEXT = {
+  label: '智能体护栏',
+  hint: '智能体不再被一个固定步数掐断：同样的调用第二次不执行、连续 3 步没拿到新信息、预算用完、上下文快满时，它会按查到的部分收尾。这里是每个智能体节点的默认上限，节点上可以单独改。只影响以后发起的运行。',
+  steps: '默认最大步数',
+  stepsHint: '只是兜底，正常任务碰不到',
+  tokens: '令牌预算（每个节点）',
+  tokensHint: '输入加输出。留空表示不限',
+  usd: '金额预算（美元）',
+  usdHint: '按模型目录里的价格估算；没登记价格的模型估不出来，只能靠令牌预算',
+  unlimited: '不限：费用只受步数兜底和上下文约束',
+  unlimitedShort: '不限',
 } as const
