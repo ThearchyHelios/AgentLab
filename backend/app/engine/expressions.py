@@ -277,6 +277,104 @@ def parse_expression(expr: str) -> tuple[ast.Expression, list[str], list[str]]:
     return tree, unbrace.found, unknown
 
 
+# --------------------------------------------------------------------------
+# 引用与代入：口径卡要说清「这个数是拿哪几个输入算出来的」
+# --------------------------------------------------------------------------
+
+
+def _chain_root(node: ast.AST) -> str | None:
+    """node 是不是一条从根名字出发的取值链（vars.kpi.gmv、nodes.q.rows[0]）。是就返回根。"""
+    cur = node
+    while isinstance(cur, (ast.Attribute, ast.Subscript)):
+        cur = cur.value
+    if isinstance(cur, ast.Name) and cur.id in EXPRESSION_ROOTS:
+        return cur.id
+    return None
+
+
+def _walk_refs(node: ast.AST, found: list[ast.AST]) -> None:
+    if isinstance(node, (ast.Attribute, ast.Subscript, ast.Name)) and _chain_root(node):
+        found.append(node)
+        # 链本身不再往里拆（vars.kpi 是 vars.kpi.gmv 的一部分），但下标里的表达式是
+        # 独立的输入：vars.rows[vars.i] 取哪一格由 vars.i 决定
+        cur = node
+        while isinstance(cur, (ast.Attribute, ast.Subscript)):
+            if isinstance(cur, ast.Subscript):
+                _walk_refs(cur.slice, found)
+            cur = cur.value
+        return
+    for child in ast.iter_child_nodes(node):
+        _walk_refs(child, found)
+
+
+def leaf_refs(tree: ast.AST) -> list[str]:
+    """表达式引用了哪些值：每条从根名字出发的最长取值链，按出现顺序去重。
+
+    parse_expression 只告诉你「有没有不认识的名字」；口径卡要记来源，得知道
+    round((vars.kpi.gmv - vars.kpi.gmv_prev) / …) 里用到的是 vars.kpi.gmv 和
+    vars.kpi.gmv_prev 这两个值，而不是 vars、kpi 这些零件。
+    路径用 ast.unparse 的写法，substitute 按同样的写法认。
+    """
+    found: list[ast.AST] = []
+    _walk_refs(tree, found)
+    return list(dict.fromkeys(ast.unparse(n) for n in found))
+
+
+_SCALARS = (int, float, str, bool, type(None))
+#: 字符串长过这个数就不代进去：上游模型写的一大段文本抄进代入式（和 metric_set 工件），
+#: 没人看得懂，只是把工件撑大
+_INLINE_STR_MAX = 80
+
+
+def _inlinable(value: Any) -> bool:
+    """这个值能不能以字面量的样子写进代入式。
+
+    容器不行；含 {{ 或 }} 的字符串不行——parse_expression 会把整条代入式当成
+    「表达式里写了模板」拒掉，复算就成了假的「对不上」；太长的字符串也不代。
+    """
+    if not isinstance(value, _SCALARS):
+        return False
+    if isinstance(value, str):
+        return len(value) <= _INLINE_STR_MAX and "{{" not in value and "}}" not in value
+    return True
+
+
+def _literal(value: Any) -> ast.expr:
+    """负数写成一元负号：Constant(-3) 放在幂运算左边会被 unparse 成 -3 ** 2，
+    读起来和算起来都是 -(3 ** 2)。一元负号节点 unparse 时会自己加括号。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
+        return ast.UnaryOp(op=ast.USub(), operand=ast.Constant(-value))
+    return ast.Constant(value)
+
+
+class _Substitute(ast.NodeTransformer):
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    def _replace(self, node: ast.AST) -> ast.AST:
+        if _chain_root(node):
+            path = ast.unparse(node)
+            if path in self.values and _inlinable(self.values[path]):
+                return ast.copy_location(_literal(self.values[path]), node)
+            if path in self.values:
+                return node      # 容器、含 {{ }} 的或太长的字符串留原路径，复算时照样取得到
+        return self.generic_visit(node)
+
+    visit_Attribute = visit_Subscript = visit_Name = _replace
+
+
+def substitute(tree: ast.AST, values: dict[str, Any]) -> str:
+    """把引用换成它当时的值，得到代入式：round((45678.5 - 42010.0) / 42010.0 * 100, 1)。
+
+    只代标量（含 {{ }} 或长过 80 字的字符串除外）。代入式本身还是一条合法表达式——拿同一个上下文再求一遍，结果必须和
+    原式一样，这是口径卡复算（recompute_ok）的依据。不改动传进来的语法树。
+    """
+    import copy
+
+    replaced = _Substitute(values).visit(copy.deepcopy(tree))
+    return ast.unparse(ast.fix_missing_locations(replaced))
+
+
 def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
     """求值一个受限的 Python 表达式。
 

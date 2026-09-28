@@ -9,7 +9,7 @@ import { ArtifactViewer } from '../../run/AssistantStream'
 import { topology } from '../../run/derive'
 import type { Trace } from '../../run/trace'
 import type { GraphSpec } from '../../types'
-import { artifactKindLabel, isEvidence, type RunArtifact } from './model'
+import { artifactDescription, artifactKindLabel, isEvidence, type RunArtifact } from './model'
 
 // -------------------------------------------------------------------------
 // 数据
@@ -244,7 +244,7 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
                 {kind}
               </span>
               <span className="min-w-0 truncate text-xs text-dim">
-                {describe(a.kind)}
+                {artifactDescription(a.kind, a.meta)}
                 {numbered && <span className="tnum text-faint"> #{n}</span>}
                 {attempt > 1 && <span className="text-faint"> · 第 {attempt} 次尝试</span>}
               </span>
@@ -268,14 +268,4 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
       })}
     </section>
   )
-}
-
-function describe(kind: string): string {
-  switch (kind) {
-    case 'query_snapshot': return '查询：SQL 和结果集'
-    case 'tool_snapshot': return '工具调用：参数和返回'
-    case 'retrieval_snapshot': return '知识检索：命中的片段'
-    case 'node_output': return '这一次执行的产出'
-    default: return '工件'
-  }
 }

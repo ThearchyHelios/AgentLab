@@ -17,7 +17,8 @@
  * 枚举值（formal / degraded / withheld 等）不动，只换显示。
  */
 
-import type { NodeType } from '../types'
+import type { NodeType, ToolTrust } from '../types'
+import { formatNumber } from './format'
 
 export const TERMS = {
   workflow: '工作流',
@@ -108,6 +109,7 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   human: '人工审批',
   validate: '结构校验',
   metrics: '口径卡',
+  report: '报告撰写',
 }
 
 /** 与 decode.ts 里旧名字同名的出口，第二波改成从这里导入时不用改调用处 */
@@ -125,3 +127,167 @@ export const APPROVAL_POLICY_LABEL: Record<'dangerous' | 'always' | 'never', str
   always: '每次调用都审批',
   never: '全部自动放行',
 }
+
+/**
+ * 可点击证据：片段状态的叫法。正文里片段的 aria-label、面板标题、图例都用这一份。
+ * 外观（线型、字形、颜色）在 lib/evidence.ts，和这里一一对应。
+ *
+ * 本期（数字层）实际只会出现「有出处」和「无证据」；其余几种是后续期的，先把叫法定下，
+ * 免得到时候各处各起一个名字。
+ */
+export const EVIDENCE_STATE_LABEL = {
+  deterministic: '有出处',
+  supported: '模型判断：有依据',
+  partial: '模型判断：部分有依据',
+  unsupported: '模型判断：证据不支持',
+  unjudged: '有引用，未裁判',
+  none: '无证据',
+  connective: '连接性文字',
+  candidate: '猜测的来源',
+} as const
+
+/**
+ * 「7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了」：出具横幅、报告核对那一行、证据条、
+ * 读屏摘要共用一种说法。
+ *
+ * 前半句只数数字，要让人一眼算得平：无证据 = 总数 − 有出处（12 − 7 = 5）。不是数字的
+ * 引用（[[v:]] 值、句末 [[see:]] 依据）解析不了的另起一句——以前把它们也算进「无证据」，
+ * 12 − 7 却写成 6，读的人以为算错了。一个数字都没有、也没有别的问题时返回空串，调用方
+ * 自己决定说什么
+ */
+export function evidenceTally(cited: number, total: number, other = 0): string {
+  const gaps = Math.max(0, total - cited)
+  const parts: string[] = []
+  if (total > 0) {
+    parts.push(gaps
+      ? `${formatNumber(cited)}/${formatNumber(total)} 数字有出处 · 无证据 ${formatNumber(gaps)}`
+      : `${formatNumber(total)} 个数字都有出处`)
+  }
+  if (other > 0) parts.push(`${total > 0 ? '另有 ' : ''}${formatNumber(other)} 处引用解析不了`)
+  return parts.join(' · ')
+}
+
+/** 证据面板和证据条的文案 */
+export const EVIDENCE_TEXT = {
+  allCited: (n: number) => `${formatNumber(n)} 个数字都有出处`,
+  locateNext: '定位下一处',
+  /** 读屏摘要末尾的操作说明 */
+  keysHint: '用左右方向键逐个查看，上下键按句子走，n 跳到下一处无证据，回车打开证据，Esc 关闭',
+  panelTitle: '证据',
+  close: '关闭证据',
+  back: '回到正文',
+  sentence: '所在的句子',
+  metric: '口径卡指标',
+  expression: '原式',
+  substituted: '代入式',
+  inputs: '输入',
+  recompute: '复算',
+  recomputeOk: '复算一致',
+  recomputeBad: '复算不一致：代入式算出来和记录的值对不上',
+  recomputeNone: '没法复算',
+  input: '运行输入',
+  seal: '封存',
+  sealOk: '已封存 · 核对一致',
+  sealDocOk: '报告文档已封存 · 核对一致（这个数字本身没有证据可封存）',
+  /** 片段接口取不到、封存状态是从整次运行的证据图查的：只核对了文档在封存范围内，这个数的链没逐项核对 */
+  sealDocChain: '报告文档已封存 · 核对一致（这个数字的证据链这次没取到，没有逐项核对）',
+  sealBad: '已封存 · 核对不一致',
+  sealOpen: '尚未封存',
+  sealOutside: '不在封存范围内',
+  /** 正文这份报告不是封存的那一份：封存链再完好，也证明不了屏幕上这些字 */
+  sealForeign: '正文不是封存的那份报告，封存证明不了这里的字',
+  sealUnknown: '封存状态拿不到',
+  violations: '违规清单',
+  violationsHint: '报告撰写节点核对出来的全部问题。列表序号、代码块标签里的数字在正文里画不了线，只能在这里看',
+  structural: '这个数字在列表序号、代码块标签这类 Markdown 语法里，正文里画不了线',
+  noSegment: '这一条在正文里没有对应的字，比如句末依据里写错的引用',
+  /** 读屏摘要：画不了线的两种，分开说在哪（和违规清单里每条的 structural / noSegment 同一个意思） */
+  structuralCount: (n: number) => `其中 ${formatNumber(n)} 个数字在列表序号、代码块标签这类 Markdown 语法里，正文里画不了线，只在违规清单里列出`,
+  noSegmentCount: (n: number) => `${formatNumber(n)} 处在正文里没有对应的字（比如句末依据里写错的引用），只在违规清单里列出`,
+  /** 出具横幅：回指不上的数字。有报告文档时点状线只画得出一部分（列表序号里的画不了），不能说「已用虚线标出」 */
+  unmatchedInDoc: '无法回指的数字（逐条见报告的违规清单）：',
+  unmatchedPlain: '无法回指的数字：',
+  uncited: '这个数字没有写成引用标记，系统核对不到它从哪来',
+  missingValue: '缺输入：口径卡这次没有算出这个指标的值',
+  unshowable: (value: string) => `有值（${value}），但按口径卡的格式显示不出来`,
+  chainPending: '正在取算式和输入…',
+  /** 证据接口逐项复核出来的问题。正常时不说，出问题才醒目 */
+  integrity: {
+    eid: '证据标识对不上：目录里记的和按工件重算的不一样',
+    hash: '口径卡工件取回时哈希对不上，或者卡里找不到这个指标',
+    render: '按口径卡重新渲染出来的字和报告上的不一样',
+    sealed: '这件证据不在封存范围内：事后补进来的，不能当证据',
+    /** 证据接口答的是封存范围内那份报告，和正文这份不是同一份（工件 id 或这个位置的字对不上） */
+    doc: '正文这份报告不是封存范围内的那一份：下面的出处是正文自己记的，没有经过封存核对',
+    /** 证据图里正文这份报告的哈希对不上 */
+    docHash: '正文这份报告和它的哈希对不上，疑似被改过',
+    sealedText: (text: string) => `封存的那一份在这个位置写的是「${text}」`,
+  },
+  chainMissing: '算式、代入式和输入要从证据接口取，这一次没取到',
+  chainForeign: '证据接口给的是封存的那份报告的算式，和正文这份对不上，不在这里展示',
+  noRun: '这份报告不属于某次运行，只能看文档里记下的出处',
+  docMissing: '证据文档取不到，按普通文本显示',
+  docMismatch: '成果字段和报告文档对不上，按普通文本显示',
+  docOtherRun: '证据文档不是这次运行写的，按普通文本显示',
+  ambiguous: (candidates: string[]) => `出处不唯一：候选 ${candidates.join('、')}`,
+} as const
+
+/**
+ * MCP / 自定义工具的信任档：工具页的三选一、工具徽标、审批卡的「始终允许」共用这一份。
+ * 「始终允许」只指 always；审批卡上那个按钮设的是 gated，按钮字短，说明里写全
+ */
+export const TOOL_TRUST_VALUES: readonly ToolTrust[] = ['ask', 'gated', 'always']
+
+export const TOOL_TRUST_LABEL: Record<ToolTrust, string> = {
+  ask: '等审批',
+  gated: '始终允许 · 门控把关',
+  always: '始终允许',
+}
+
+/** 每一档悬停看的那句：它在运行时具体怎么做 */
+export const TOOL_TRUST_HINT: Record<ToolTrust, string> = {
+  ask: '每次调用都停下来等你批。协作团队里的成员停不下来，这次调用不执行',
+  gated: '每次调用先让门控模型看一眼参数：它放行就直接执行，判可疑、没答上来都交给你批',
+  always: '不问你，直接执行',
+}
+
+export const TOOL_TRUST_TEXT = {
+  title: '运行时审批',
+  /** 三选一的读屏名字 */
+  groupLabel: (tool: string) => `${tool} 的运行时审批`,
+  explain: '默认每次都等你批；门控把关是每次先让一个小模型看参数，可疑的仍然交给你；正式运行不看这个设置，一律等审批。',
+  /** 工具徽标：ask 和 gated 各一个，always 不挂 */
+  badgeAsk: '运行时需审批',
+  badgeGated: '门控把关',
+  badgeGatedHint: '在探索运行里调用它之前，先让门控模型看一眼参数，判可疑的仍然停下来等人工审批。正式运行一律等审批。',
+  saveFailed: (tool: string) => `${tool} 的运行时审批没改成，已恢复原样`,
+  /** 审批卡 */
+  alwaysButton: '始终允许',
+  alwaysHint: (tool: string) =>
+    `批准这次，并把 ${tool} 设为「始终允许 · 门控把关」：本节点后面的调用和以后的运行不再问你，由门控模型逐次把关；可以在工具页改回`,
+  alwaysDone: (tool: string) => `已放行，运行继续；${tool} 以后由门控模型把关`,
+} as const
+
+/** 设置页「运行默认值」里的门控模型 */
+export const TOOL_GATE_TEXT = {
+  label: '门控模型',
+  provider: '门控模型 · 接入',
+  model: '门控模型 · 模型',
+  hint: '工具设成「始终允许 · 门控把关」时，每次调用前由它看一眼参数。留空就用默认接入的默认模型。每次调用都会多问它一次，建议选又快又便宜的小模型。',
+  providerDefault: '默认接入',
+  modelDefault: '留空：用接入的默认模型',
+} as const
+
+/** 设置页「运行默认值」里 agent 护栏那一组（后端 engine/guards.py） */
+export const AGENT_GUARD_TEXT = {
+  label: '智能体护栏',
+  hint: '智能体不再被一个固定步数掐断：同样的调用第二次不执行、连续 3 步没拿到新信息、预算用完、上下文快满时，它会按查到的部分收尾。这里是每个智能体节点的默认上限，节点上可以单独改。只影响以后发起的运行。',
+  steps: '默认最大步数',
+  stepsHint: '只是兜底，正常任务碰不到',
+  tokens: '令牌预算（每个节点）',
+  tokensHint: '输入加输出。留空表示不限',
+  usd: '金额预算（美元）',
+  usdHint: '按模型目录里的价格估算；没登记价格的模型估不出来，只能靠令牌预算',
+  unlimited: '不限：费用只受步数兜底和上下文约束',
+  unlimitedShort: '不限',
+} as const

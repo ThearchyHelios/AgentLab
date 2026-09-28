@@ -27,6 +27,11 @@ class RunContext:
     #: 工具审批策略的全局默认（设置里的「危险工具默认需要人工确认」）。节点和图级
     #: defaults 都没配 approval 时才用它；为空表示老运行，按节点各自的缺省走
     approval_default: str | None = None
+    #: MCP / 自定义工具信任三档的快照（tools/trust.py）。None 是升级前发起的运行，
+    #: 这两类工具照旧不问人
+    tool_trust: dict[str, str] | None = None
+    #: agent 护栏的上限快照（engine/guards.py）。None 是升级前发起的运行，走旧逻辑
+    agent_limits: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

@@ -1,7 +1,7 @@
 export type NodeType =
   | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
-  | 'human' | 'validate' | 'metrics'
+  | 'human' | 'validate' | 'metrics' | 'report'
 
 export interface GraphNode {
   id: string
@@ -125,6 +125,10 @@ export interface Approval {
   node_id: string
   mode: 'approve' | 'input' | 'edit'
   title: string
+  /**
+   * 工具审批的 payload 是 {kind: 'tool_approval', tool, args, title}。探索运行里 MCP /
+   * 自定义工具的审批另带 trust_key（同 ToolInfo.trust_key）：有它，审批卡才给「始终允许」
+   */
   payload: Record<string, any>
   status: string
   response: Record<string, any>
@@ -165,6 +169,13 @@ export interface Provider extends ServerHealth {
   has_key: boolean
 }
 
+/**
+ * MCP / 自定义工具在探索运行里的信任档（节点审批策略为「仅危险工具」时才看它）：
+ * ask 每次等人批（默认）；gated 每次先问门控模型，它判可疑的仍交给人；always 直接执行。
+ * 正式运行不看它，一律按 ask
+ */
+export type ToolTrust = 'ask' | 'gated' | 'always'
+
 export interface ToolInfo {
   id: string
   name: string
@@ -172,8 +183,15 @@ export interface ToolInfo {
   category: string
   source: 'builtin' | 'custom' | 'mcp'
   dangerous: boolean
-  /** 运行时是否真的会因它停下来等审批。MCP 与自定义工具目前不会，界面别说它「需确认」 */
+  /**
+   * 运行时可能停下来等审批。MCP / 自定义工具：ask、gated 为 true，always 为 false；
+   * 更老的后端一律给 false（那时审批关卡认不出它们）
+   */
   runtime_approval?: boolean
+  /** 只有 MCP / 自定义工具有，老后端不给：没有它就不显示信任档控件 */
+  trust?: ToolTrust
+  /** 改信任档时用的键（PUT /api/tools/trust），等于 id */
+  trust_key?: string
   schema: Record<string, any>
   /**
    * 只有自定义工具有：库里存着的参数定义哪里写坏了（一句中文）。绑了它的节点运行时
@@ -487,6 +505,11 @@ export interface ReviewSignal {
   detail: string
   /** broken = 答案不可信；degraded = 能用但有缺口 */
   severity: 'broken' | 'degraded'
+  /**
+   * agent 为什么提前收尾（后端 engine/guards.py）：steps / stall / budget_tokens / budget_usd / context。
+   * 老运行没有。只有 steps（或者没有这个字段的老运行）放宽步数才对症
+   */
+  reason?: string
 }
 
 export interface ReviewResult {
@@ -502,4 +525,216 @@ export interface ReviewResult {
   retry: boolean
   severity: 'broken' | 'degraded' | ''
   signals: ReviewSignal[]
+}
+
+// -------------------------------------------------------------------------
+// 可点击证据（报告撰写节点产出的文档、证据接口）
+//
+// 形状照后端 engine/evidence.py 和 api/evidence.py。前端对缺字段一律宽容：接口和文档
+// 是分期长出来的，老运行、别的版本的后端都可能少几个键，少了就降级显示，不白屏。
+// 偏移（span、start/end）按 Unicode 码点算，不是 JS 的 UTF-16 下标。
+// -------------------------------------------------------------------------
+
+/** 一处引用解析后的结果 */
+export interface EvidenceCitation {
+  /** 不带前缀的引用，如 gmv、week */
+  ref?: string
+  /** 目录里的别名，如 m:gmv、i:week、Q1 */
+  alias?: string
+  locator?: { metric?: string; field?: string; row?: number; column?: string; table?: string }
+  eid?: string
+  /** metric / input / cell / table / column / quote / query */
+  kind?: string
+  role?: string
+  status?: 'resolved' | 'unresolved' | string
+  /** 解析不了的原因（人话） */
+  reason?: string
+  conv?: string
+  value?: unknown
+  rendered?: string
+}
+
+/** 可点的最小片段 */
+export interface EvidenceSegment {
+  id: string
+  /** text / number / value / entity / quote / structural */
+  kind: string
+  text: string
+  span?: [number, number]
+  /** deterministic / none / neutral，后续期还有 probabilistic、candidate */
+  state?: string
+  /** 带前缀的原始引用，如 m:gmv|万 */
+  ref?: string
+  cite?: EvidenceCitation
+  strong?: boolean
+  /** uncited_number / unresolved_ref */
+  issue?: string
+}
+
+/** 句子、列表项或表格单元格 */
+export interface EvidenceUnit {
+  id: string
+  /** claim / connective / heading / code。确定性规则分的，不是裁判结论 */
+  kind?: string
+  span?: [number, number]
+  cites?: string[]
+  see?: EvidenceCitation[]
+  segments: EvidenceSegment[]
+  /** 表格单元格的位置，表头 row = -1 */
+  loc?: { row: number; col: number }
+  /** 列表项的缩进层级 */
+  depth?: number
+}
+
+export interface EvidenceBlock {
+  id: string
+  /** heading / paragraph / list / table / quote / code / hr */
+  type: string
+  level?: number
+  ordered?: boolean
+  start?: number
+  lang?: string
+  units: EvidenceUnit[]
+}
+
+export interface EvidenceViolation {
+  /** uncited_number / unresolved_ref / render_mismatch / eid_mismatch / … */
+  code: string
+  message?: string
+  span?: [number, number]
+  text?: string
+  /** 指向的片段。结构片段（列表序号、代码围栏标签）里的数字没有可画线的文字，只能在清单里找 */
+  segment?: string
+  unit?: string
+  ref?: string
+  context?: string
+}
+
+export interface EvidenceStats {
+  units?: number
+  segments?: number
+  claims?: number
+  connective?: number
+  numbers?: number
+  numbers_cited?: number
+  values?: number
+  uncited_numbers?: number
+  unresolved?: number
+  see?: number
+  uncited_claims?: number
+  violations?: number
+}
+
+/** report_doc 工件的内容 */
+export interface EvidenceDocData {
+  schema?: string
+  run_id?: string | null
+  node_id?: string
+  /** 渲染后的全文（真实数字，不含标记） */
+  markdown?: string
+  /** 建文档时的完整目录：alias → 条目 */
+  catalog?: Record<string, Record<string, any>>
+  blocks: EvidenceBlock[]
+  stats?: EvidenceStats
+  violations?: EvidenceViolation[]
+}
+
+/**
+ * 成果上的标注：这几个字段逐字等于某个报告撰写节点的文档，可以逐段点开看证据。
+ * 契约 report_from 指着的那份在最外层；另有报告也被原样放进成果的，列在 others 里
+ */
+export interface EvidenceFieldRef {
+  report_node?: string
+  doc_artifact?: string
+  fields?: string[]
+  others?: EvidenceFieldRef[]
+}
+
+/** 封存状态 */
+export interface EvidenceSeal {
+  sealed?: boolean
+  ok?: boolean | null
+  /** 这件证据在不在封存范围内 */
+  covered?: boolean
+  manifest_seq?: number
+  legacy?: boolean
+}
+
+/** GET /runs/{id}/evidence：整次运行的证据图 */
+export interface EvidenceGraph {
+  run_id?: string
+  schema?: string
+  /** cited / legacy_contract / legacy_text / none */
+  mode?: string
+  seal?: EvidenceSeal
+  reports?: { node_id?: string; doc_artifact?: string; doc_sealed?: boolean; fields?: string[]; stats?: EvidenceStats
+              /** 文档取回时哈希复验：false 对不上（或不是这次运行这个节点写的），null 文件不在了 */
+              hash_ok?: boolean | null }[]
+  evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
+               sealed?: boolean; cited_by?: string[] }[]
+  edges?: { from: string; to: string; rel: string }[]
+}
+
+/** 指标的一个输入：值从哪来 */
+export interface EvidenceInput {
+  path?: string
+  value?: unknown
+  node_id?: string
+  via?: string
+  field?: string
+  role?: string
+  /** ok / missing */
+  status?: string
+}
+
+/**
+ * 片段证据链的一步。本期有三种：metric（指标）、input（指标的一个输入，也可能挂在
+ * metric.inputs 里）、run_input（报告直接引用的运行输入）
+ */
+export interface EvidenceStep {
+  step: string
+  metric?: string
+  decimals?: number | null
+  format?: string
+  conv?: string | null
+  eid?: string
+  /** eid 能由工件和定位重算出来 */
+  eid_ok?: boolean
+  /** 工件取回时哈希复验通过、指标在卡里 */
+  hash_ok?: boolean
+  /** 卡里的值按同样的格式渲染出来就是报告上的字 */
+  render_ok?: boolean
+  /** 这件证据在封存范围内 */
+  sealed?: boolean
+  alias?: string
+  name?: string
+  value?: unknown
+  unit?: string
+  rendered?: string
+  caliber?: string
+  version?: string
+  node_id?: string
+  artifact?: string
+  expression?: string
+  substituted?: string
+  recompute_ok?: boolean | null
+  status?: string
+  inputs?: EvidenceInput[]
+  path?: string
+  field?: string
+  via?: string
+}
+
+/** GET /runs/{id}/evidence/segments/{sid}：点开一个片段 */
+export interface EvidenceSegmentDetail {
+  report?: { node_id?: string; doc_artifact?: string }
+  segment?: Partial<EvidenceSegment> & { unit?: string }
+  unit?: { id?: string; kind?: string; text?: string; span?: [number, number]; cites?: string[] }
+  block?: { id?: string; type?: string }
+  chain?: EvidenceStep[]
+  /** 片段为什么是现在这个状态，一句人话 */
+  note?: string
+  /** 落在这个片段（或这一句、没有片段的）上的违规 */
+  violations?: EvidenceViolation[]
+  seal?: EvidenceSeal
 }

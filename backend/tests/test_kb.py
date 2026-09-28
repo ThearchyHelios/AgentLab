@@ -174,7 +174,16 @@ async def test_reindex_restores_hybrid_search() -> None:
 
 def test_choosing_a_remote_embedder_that_cannot_be_built_says_so(monkeypatch) -> None:
     """选了远端却静默退回本地哈希向量，用户会以为自己在用语义检索。"""
+    from langchain_openai import OpenAIEmbeddings
+
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    # 建 embedder 时会真调一次接口探维度：单测不走网络（以前真连 api.openai.com，
+    # 代理慢的时候这一条要等将近 4 分钟），直接给一个鉴权失败
+    def refuse(self, text):
+        raise RuntimeError("Error code: 401 - invalid api key")
+
+    monkeypatch.setattr(OpenAIEmbeddings, "embed_query", refuse)
     with pytest.raises(emb.EmbedderUnavailable) as e:
         emb.configure("openai", "text-embedding-3-small")
     assert "OPENAI_API_KEY" in str(e.value)

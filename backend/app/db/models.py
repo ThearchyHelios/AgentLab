@@ -189,6 +189,11 @@ class Run(Base, TimestampMixin):
     memory_scope: Mapped[str | None] = mapped_column(String(100), default=None)
     collection: Mapped[str | None] = mapped_column(String(100), default=None)
     approval_default: Mapped[str | None] = mapped_column(String(20), default=None)
+    # MCP / 自定义工具信任三档在发起时的快照（tools/trust.py）。None 是升级前发起的运行：
+    # 那时这两类工具不问人，恢复时也不能开始问，否则审批的答复会对错号
+    tool_trust: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # agent 护栏的上限在发起时的快照（engine/guards.py）。None 是升级前发起的运行，走旧逻辑
+    agent_limits: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     # 失败时能定位到的节点。报错要能落到画布上的那张卡片，而不只是一句话
     error_node_id: Mapped[str | None] = mapped_column(String(64), default=None)
 

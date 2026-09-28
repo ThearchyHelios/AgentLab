@@ -569,14 +569,16 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   const turn = useChat((s) => s.byConversation[conversationId]?.find((t) => t.id === turnId))
   const busy = useChat((s) => isBusy(s.byConversation[conversationId]))
   const { retryTurn, continueTurn, ask, recheck, setScope } = useChat.getState()
-  const cap = useStepCap()
+  const { cap, fallback } = useStepCap()
   const [resuming, setResuming] = useState(false)
   if (!turn) return null
 
   const kind = remedyOf(turn)
   const graphful = (turn.graph?.nodes?.length ?? 0) > 0
-  const stepSignal = turn.review?.signals.some((s) => s.kind === 'step_limit' || s.kind === 'step_limit_settled')
-  const current = agentSteps(turn.graph)
+  // 只有「步数用满」放宽步数才对症：因为停滞、预算、上下文收的尾，加步数只会原样再撞一次
+  const stepSignal = turn.review?.signals.some((s) => (s.kind === 'step_limit' || s.kind === 'step_limit_settled')
+    && (!s.reason || s.reason === 'steps'))
+  const current = fallback ? agentSteps(turn.graph, fallback) : null
   const target = current && cap ? Math.min(cap, Math.max(current * 2, current + 8)) : null
   const canContinue = !!turn.run?.id && (kind === 'suspended'
     || (kind === 'failed' && turn.runStatus === 'failed' && turn.failure?.continuable !== false))
@@ -788,19 +790,26 @@ function AttemptHistory({ attempts }: { attempts: Attempt[] }) {
   )
 }
 
-/** 设置里 agent 步数的全局上限：「放宽步数」不能许一个后端会截掉的数 */
-let stepCapCache: Promise<number | null> | null = null
-function useStepCap(): number | null {
-  const [cap, setCap] = useState<number | null>(null)
+/**
+ * 设置里 agent 步数的全局上限（「放宽步数」不能许一个后端会截掉的数），和没配步数的节点
+ * 跟随的默认值（运行默认值里的「默认最大步数」；老后端没有这一项，按以前的 12）
+ */
+type StepLimits = { cap: number | null; fallback: number | null }
+let stepCapCache: Promise<StepLimits> | null = null
+function useStepCap(): StepLimits {
+  const [limits, setLimits] = useState<StepLimits>({ cap: null, fallback: null })
   useEffect(() => {
     stepCapCache ??= api.settings.get()
-      .then((s) => Number(s?.limits?.max_agent_steps) || null)
-      .catch(() => { stepCapCache = null; return null })
+      .then((s) => ({
+        cap: Number(s?.limits?.max_agent_steps) || null,
+        fallback: Number(s?.run?.agent_max_steps) || 12,
+      }))
+      .catch(() => { stepCapCache = null; return { cap: null, fallback: null } })
     let alive = true
-    void stepCapCache.then((v) => { if (alive) setCap(v) })
+    void stepCapCache.then((v) => { if (alive) setLimits(v) })
     return () => { alive = false }
   }, [])
-  return cap
+  return limits
 }
 
 // -------------------------------------------------------------------------

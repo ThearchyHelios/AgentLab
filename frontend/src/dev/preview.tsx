@@ -10,6 +10,7 @@ import { ToastHost } from '../components/ui'
 import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
 import mdSamples from '../run/__tests__/markdown-samples.json'
+import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import {
   CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
@@ -204,9 +205,40 @@ const LONG_TURN: StreamTurn = {
   steps: [], output: { result: longReport() },
 }
 
+/**
+ * 带逐段证据的一轮：口径卡 → 报告撰写 → 成果（_evidence 标注了「周报」字段）。报告文档和
+ * 片段接口由 check-stream 用 page.route 伪造（/api/artifacts/<doc>、…/evidence/segments/…）。
+ * 后面跟一轮同样的答案、但没有 _evidence：旧运行就是这样，渲染必须和普通 Markdown 一模一样
+ */
+function evidenceTurns(): StreamTurn[] {
+  const fx = evidenceFixture
+  const E = (seq: number, type: string, node_id: string | null, data: Record<string, any> = {}): RunEvent =>
+    ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const events = [
+    E(1, 'run.started', null, { total: 3 }),
+    E(2, 'node.started', 'caliber', { node_type: 'metrics', label: '周报口径' }),
+    E(3, 'node.finished', 'caliber', { duration_ms: 12, preview: { kind: 'metric_set', caliber: '周报口径' } }),
+    E(4, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+    E(5, 'report.checked', 'write', fx.report_checked),
+    E(6, 'node.finished', 'write', { duration_ms: 2300 }),
+    E(7, 'node.started', 'out', { node_type: 'output', label: '成果' }),
+    E(8, 'node.finished', 'out', { duration_ms: 3 }),
+    E(9, 'run.finished', null, { output: {} }),
+  ]
+  const text = fx.output['周报']
+  return [
+    { id: 'evidence', question: '写一份本周周报', phase: 'done', status: '已完成', runClass: 'exploratory',
+      steps: decodeRun(events, { status: 'succeeded' }), output: fx.output, runId: fx.run_id },
+    { id: 'evidence-legacy', question: '写一份本周周报（旧运行）', phase: 'done', status: '已完成',
+      steps: [], output: { 周报: text }, runId: 'syn-evidence-legacy' },
+  ]
+}
+
 /** 合成场景：新后端才有的事件，老库里导不出来 */
 function synthetic(name: string): StreamTurn[] {
   switch (name) {
+    case 'evidence':
+      return evidenceTurns()
     case 'team-live': {
       const ev = rebase(teamRun('members'))
       return [{ id: 'team-live', question: '比较三家供应商的交期风险', phase: 'running', status: '运行中',
@@ -468,7 +500,13 @@ function Preview() {
         onFollowUp={(q) => { (window as any).__followUp = q }}
       />
     )
-    return dense ? <div className="h-full w-[360px] border-r bg-panel">{stream}</div> : stream
+    // 证据场景另摆一份同样文字的普通 Markdown：没有 _evidence 的那一轮必须和它长得一模一样
+    const baseline = syn === 'evidence' && (
+      <div id="md-baseline" hidden><Markdown text={evidenceFixture.output['周报']} dense={dense} /></div>
+    )
+    return dense
+      ? <div className="h-full w-[360px] border-r bg-panel">{stream}{baseline}</div>
+      : <>{stream}{baseline}</>
   }
   if (params.get('long') === '1') {
     return <AssistantStream turns={[LONG_TURN]} />

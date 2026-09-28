@@ -1,5 +1,5 @@
 import {
-  Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput,
+  Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
 } from 'lucide-react'
 import { APPROVAL_POLICY_LABEL, NODE_TYPE_LABEL } from '../lib/terms'
@@ -8,7 +8,7 @@ import type { NodeType } from '../types'
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
-  | 'ioFields' | 'cases' | 'agents' | 'metricsList'
+  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs'
 
 /**
  * 这个字段里写的是什么语法。
@@ -36,6 +36,8 @@ export interface FieldDef {
   step?: number
   /** 只在满足条件时显示，避免面板一次糊一屏用不上的选项 */
   when?: (config: Record<string, any>) => boolean
+  /** nodeRefs：只能选这一类的上游节点（报告的 metrics_from 只收口径卡） */
+  refType?: NodeType
   advanced?: boolean
 }
 
@@ -173,7 +175,21 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'prompt', label: '任务', type: 'prompt' },
       { key: 'tools', label: '可用工具', type: 'tools' },
       { key: 'skills', label: '挂载 Skill', type: 'skills' },
-      { key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100 },
+      {
+        key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100, placeholder: '跟随设置',
+        help: '只是兜底。重复调用、连续几步没拿到新信息、预算用完、上下文快满时，它会先按查到的部分收尾。'
+          + '留空跟随「设置 → 运行默认值」；以前默认写进来的 12 也按留空处理',
+      },
+      {
+        key: 'budget_tokens', label: '令牌预算', type: 'number', min: 1000, step: 10000, advanced: true,
+        placeholder: '跟随设置',
+        help: '这个节点最多用多少令牌（输入加输出），用完就按查到的部分收尾。留空跟随设置，设置里可以改成不限',
+      },
+      {
+        key: 'budget_usd', label: '金额预算（美元）', type: 'number', min: 0.01, step: 0.1, advanced: true,
+        placeholder: '跟随设置',
+        help: '按模型目录里的价格估算。目录里没有价格的模型估不出金额，只能靠令牌预算',
+      },
       {
         key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS,
         help: '需要审批时运行会暂停，等你在运行面板或记录页的审批卡上处理',
@@ -186,7 +202,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
-    defaults: { max_steps: 12, tools: [], parallel_tools: false },
+    defaults: { tools: [], parallel_tools: false },
   },
   supervisor: {
     type: 'supervisor', label: NODE_TYPE_LABEL.supervisor, category: '模型', icon: Users,
@@ -470,6 +486,47 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       schema: { type: 'object', properties: {}, required: [] },
     },
   },
+  report: {
+    type: 'report', label: NODE_TYPE_LABEL.report, category: '模型', icon: FileText,
+    description: '带引用的报告：模型只写引用标记，数字由系统从口径卡取出来渲染，每个数字都能点开看出处',
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    fields: [
+      {
+        key: 'instructions', label: '写作要求', type: 'prompt', placeholder: '为 {{ input.week }} 写周报，先总后分',
+        help: '写什么、怎么写。上游口径卡的指标和运行输入会自动整理成证据目录交给模型，不用在这里手抄',
+      },
+      {
+        key: 'metrics_from', label: '指标来自', type: 'nodeRefs', refType: 'metrics',
+        help: '留空 = 用上游全部口径卡。报告里的数字只能引用这些卡里的指标',
+      },
+      {
+        // 后端只认 strict / off（report.py 的 NUMBERS）
+        key: 'numbers', label: '没写引用的数字', type: 'select',
+        options: [
+          { value: 'strict', label: '算违规，要求重写（默认）' },
+          { value: 'off', label: '只标出来，不要求重写' },
+        ],
+        help: '报告里每个数字都该写成引用标记，由系统取值渲染。模型自己写的数字核对不到出处',
+      },
+      {
+        // 留空不是「不处理」：后端按运行类别取默认，探索运行照常产出、正式运行判失败
+        key: 'on_violation', label: '重写后仍有违规时', type: 'select',
+        options: [
+          { value: '', label: '按运行类别：探索运行照常产出，正式运行判失败' },
+          { value: 'flag', label: '照常产出，把违规的地方标出来' },
+          { value: 'fail', label: '判为失败，报告不往下交' },
+        ],
+      },
+      {
+        key: 'max_repairs', label: '最多重写几次', type: 'number', min: 0, max: 3, placeholder: '1',
+        help: '有违规时把清单交回去让模型重写。每次都是一整篇的调用，写不对的模型多给几次也大多写不对',
+      },
+      ...MODEL_FIELDS,
+      { key: 'system', label: '角色设定', type: 'textarea', advanced: true, placeholder: '你是…' },
+      ...COMMON_TAIL,
+    ],
+    defaults: { instructions: '', numbers: 'strict', max_repairs: 1 },
+  },
   metrics: {
     type: 'metrics', label: NODE_TYPE_LABEL.metrics, category: '把关', icon: Gauge,
     description: '受控指标集：所有算术在这里发生，叙述层只能引用',
@@ -478,6 +535,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'caliber', label: '口径名称', type: 'text', syntax: 'template', placeholder: '周报口径' },
       { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1' },
       { key: 'metrics', label: '指标定义', type: 'metricsList' },
+      {
+        key: 'on_missing', label: '缺输入时', type: 'select', advanced: true,
+        options: [{ value: '', label: '整个节点失败' }, { value: 'null', label: '记为空值，交给出具契约判档' }],
+        help: '上游没给出某个指标要的数时怎么办。记为空值的指标在报告里显示「—」，出具契约按必需 / 期望项降档',
+      },
       {
         key: 'assign_to', label: '结果存为变量', type: 'text',
         help: '叙述节点用 {{ nodes.节点id.text }} 引用指标清单',

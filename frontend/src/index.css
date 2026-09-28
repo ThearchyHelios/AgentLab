@@ -81,6 +81,7 @@
   --nt-human: #ce91e6;
   --nt-validate: #ebb1fd;
   --nt-metrics: #cbaddb;
+  --nt-report: #a9b0ec;
 
   /* 检索通路的分类色：只说「这一分是哪一路检索贡献的」，不表示状态，所以
      不借 accent / ok / warn。两色按 dataviz 校验过：色觉异常下也分得开，
@@ -138,6 +139,7 @@
   --nt-human: #6f3d81;
   --nt-validate: #885398;
   --nt-metrics: #6e557b;
+  --nt-report: #4f5694;
   --via-semantic: #0a7ea4;
   --via-keyword: #c2447a;
 }
@@ -193,6 +195,7 @@
     --nt-human: #6f3d81;
     --nt-validate: #885398;
     --nt-metrics: #6e557b;
+    --nt-report: #4f5694;
     --via-semantic: #0a7ea4;
     --via-keyword: #c2447a;
   }
@@ -399,6 +402,7 @@
 .nt-transform  { --nt: var(--nt-transform); }
 .nt-subgraph   { --nt: var(--nt-subgraph); }
 .nt-metrics    { --nt: var(--nt-metrics); }
+.nt-report     { --nt: var(--nt-report); }
 
 /* --------------------------------------------------------------------------
    React Flow 覆盖
@@ -1562,6 +1566,55 @@
   animation: sheet-in var(--dur-base) var(--ease-out);
 }
 
+/* --------------------------------------------------------------------------
+   可点击证据（run/EvidenceDoc）。报告里有出处、没出处的片段是原生 button，外观
+   和正文一样；状态靠下划线的线型和颜色，外观数据在 lib/evidence.ts（颜色、淡底
+   由组件写成 --ev-line / --ev-soft），这里只管线型和交互态。
+   不画整句下划线：一份报告满屏都是线就什么都看不出来了。
+   -------------------------------------------------------------------------- */
+.ev-seg {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+  text-align: inherit;
+  white-space: inherit;
+  cursor: pointer;
+  text-decoration-line: underline;
+  text-decoration-color: var(--ev-line, currentColor);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+.ev-seg[data-ev-line="solid"] { text-decoration-style: solid; }
+/* 点状线比实线细碎，同样 1px 在小字号下几乎看不见 */
+.ev-seg[data-ev-line="dotted"] { text-decoration-style: dotted; text-decoration-thickness: 1.5px; }
+.ev-seg:hover,
+.ev-seg[aria-expanded="true"] { background: var(--ev-soft, transparent); }
+.ev-seg:focus-visible,
+.ev-seg[data-flash] {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* 句末的「无证据」小标签：字形加文字，去掉颜色也读得出 */
+.ev-tag {
+  margin: 0 3px;
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+  vertical-align: 1px;
+  color: var(--st-waiting);
+}
+.ev-panel-side { animation: sheet-in var(--dur-base) var(--ease-out); }
+.ev-panel-rise { animation: fade-up var(--dur-base) var(--ease-out); }
+
 /* 例句卡片依次入场。--i 是序号，错开 40ms 就够读出"一条条出现"，
    再多就开始等 */
 @keyframes rise-in {
@@ -1648,6 +1701,11 @@
   /* 时钟这时 1 秒才走一拍，十分位只会一顿一顿地跳 */
   .nc-tenth {
     display: none;
+  }
+  /* 证据面板直接出现，不滑入：滑入停在 0.01ms 的最后一帧虽然看不出来，但它仍然是一段动画 */
+  .ev-panel-side,
+  .ev-panel-rise {
+    animation: none !important;
   }
 }
 

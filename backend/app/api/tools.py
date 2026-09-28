@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from app.tools.registry import (
     ToolArgsError, ToolBuildError, ToolContext, all_specs, build_tools, call_is_dangerous,
     call_tool, get_spec,
 )
+from app.tools.trust import load_trust, set_trust
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
 
@@ -25,6 +26,7 @@ router = APIRouter(prefix="/api/tools", tags=["tools"])
 async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     """把内置、自定义、MCP 三类工具拉平成一个列表，前端节点面板直接用。"""
     out: list[dict[str, Any]] = []
+    trust = await load_trust(session)
     for name, spec in sorted(all_specs().items()):
         out.append(
             {
@@ -53,9 +55,8 @@ async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[
                 "category": f"自定义 · {row.kind}",
                 "source": "custom",
                 "dangerous": True,
-                # 运行时的审批关卡查不到自定义工具的危险标记，不会停下来等人——
-                # 在补上之前不能让标签说它会被审批
-                "runtime_approval": False,
+                # 信任三档（tools/trust.py）：等审批、门控把关都可能停下来等人
+                **_trust_fields(row.name, trust),
                 "schema": row.parameters or {},
                 # 这道关卡之前存进库的坏参数定义：绑上它的节点会失败，列表上先标出来
                 "problem": schema_problem(row.parameters or {}),
@@ -63,11 +64,28 @@ async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[
         )
 
     try:
-        out.extend({**t, "source": "mcp", "dangerous": True, "runtime_approval": False}
+        out.extend({**t, "source": "mcp", "dangerous": True, **_trust_fields(t["id"], trust)}
                    for t in await mcp_manager.list_tools())
     except Exception:  # noqa: BLE001 - MCP 连不上不该让整个工具列表挂掉
         pass
     return out
+
+
+def _trust_fields(key: str, trust: dict[str, str]) -> dict[str, Any]:
+    level = trust.get(key, "ask")
+    return {"trust": level, "trust_key": key, "runtime_approval": level != "always"}
+
+
+class TrustIn(BaseModel):
+    key: str = Field(min_length=1, max_length=300)
+    trust: Literal["ask", "gated", "always"]
+
+
+@router.put("/trust")
+async def put_trust(payload: TrustIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """MCP / 自定义工具的信任三档。改了只影响以后发起的运行：每次运行在发起时快照一份。"""
+    await set_trust(session, payload.key, payload.trust)
+    return {"key": payload.key, "trust": payload.trust}
 
 
 class RunToolIn(BaseModel):

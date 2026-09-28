@@ -420,6 +420,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "default_collection": "default",
         "stream_tokens": True,
         "confirm_dangerous_tools": True,
+        # 「始终允许 · 门控把关」的工具每次调用前问的那个模型（tools/trust.py）。
+        # 空着就用默认 provider 的默认模型
+        "tool_gate_provider": None,
+        "tool_gate_model": None,
+        # agent 护栏（engine/guards.py）：兜底步数、每个节点的令牌 / 金额预算。预算为 null 表示不限
+        "agent_max_steps": 100,
+        "agent_budget_tokens": 2_000_000,
+        "agent_budget_usd": None,
     },
     "limits": {
         "max_graph_steps": app_settings.max_graph_steps,
@@ -471,6 +479,9 @@ async def resolve_run_scope(
 async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     rows = (await session.execute(select(Setting))).scalars()
     stored = {r.key: r.value for r in rows}
+    # limits 是服务端配置（环境变量），只读：库里可能存着旧版设置页写进去的一份
+    #（见过 max_agent_steps: 25），它从来不生效，却会盖住真实的上限，界面照着错的数许诺
+    stored.pop("limits", None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
     for key, value in stored.items():
         merged.setdefault(key, value)
@@ -485,7 +496,13 @@ class SettingsIn(BaseModel):
 async def put_settings(
     payload: SettingsIn, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
+    from app.tools.trust import SETTING_KEY as TRUST_KEY
+
     for key, value in payload.values.items():
+        if key in (TRUST_KEY, "limits"):
+            # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
+            # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效
+            continue
         row = await session.get(Setting, key)
         if row:
             row.value = value

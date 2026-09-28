@@ -228,6 +228,62 @@ TEMPLATES: list[dict[str, Any]] = [
         ],
     },
     {
+        "name": "⑨ 可追溯周报",
+        "description": "报告里的每个数都点得开出处：tool 节点查库、口径卡登记指标、报告撰写节点只写引用"
+        "标记，数字由系统从口径卡取出来渲染，出口按引用逐段核对后三档出具。取数节点查的是示例数据源 "
+        "shop 的 orders 表（week、amount、refunded 三列）：先接入你的库（或者上传一张表格、命名为 "
+        "shop），再把 SQL 换成你的口径。",
+        "tags": ["出具", "口径卡", "周报", "证据"],
+        "nodes": [
+            _n("start", "input", "周期", fields=[
+                {"name": "week", "default": "2026-W37", "description": "报告周期（ISO 周）"},
+                {"name": "prev_week", "default": "2026-W36", "description": "对比的上一周期"}]),
+            # 聚合放在 SQL 里做完，口径卡只做标量运算。列的顺序就是口径卡里 rows[0][n] 的 n
+            _n("fetch", "tool", "取数（查库）", tool="db_query__shop", args={"sql": (
+                "SELECT\n"
+                "  SUM(CASE WHEN week = '{{ input.week }}' THEN amount ELSE 0 END) AS gmv,\n"
+                "  SUM(CASE WHEN week = '{{ input.prev_week }}' THEN amount ELSE 0 END) AS gmv_prev,\n"
+                "  SUM(CASE WHEN week = '{{ input.week }}' THEN 1 ELSE 0 END) AS order_cnt,\n"
+                "  SUM(CASE WHEN week = '{{ input.week }}' AND refunded = 1 THEN 1 ELSE 0 END) AS refund_cnt\n"
+                "FROM orders")}),
+            # 查询工具交回来的是 JSON 文本 {columns, rows}，解析成对象口径卡才取得到里面的数
+            _n("parse", "transform", "解析查询结果", mode="json", template="{{ nodes.fetch }}",
+               assign_to="q"),
+            _n("caliber", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1",
+               metrics=[
+                   {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 2, "format": "thousands",
+                    "expression": "vars.q.rows[0][0]"},
+                   {"id": "orders", "name": "订单数", "unit": "单", "format": "thousands",
+                    "expression": "vars.q.rows[0][2]"},
+                   # 分母为 0 时记为空值（缺输入），交给契约按 expected 降档，而不是整张卡失败
+                   {"id": "wow", "name": "环比增幅", "unit": "%", "decimals": 1, "format": "plain",
+                    "expression": "round((vars.q.rows[0][0] - vars.q.rows[0][1]) / vars.q.rows[0][1] * 100, 1)"
+                                  " if vars.q.rows[0][1] else None"},
+                   {"id": "aov", "name": "客单价", "unit": "元", "decimals": 2, "format": "thousands",
+                    "expression": "round(vars.q.rows[0][0] / vars.q.rows[0][2], 2) if vars.q.rows[0][2] else None"},
+                   {"id": "refund_rate", "name": "退款率", "decimals": 4, "format": "percent_of_ratio",
+                    "expression": "vars.q.rows[0][3] / vars.q.rows[0][2] if vars.q.rows[0][2] else None"},
+               ]),
+            _n("write", "report", "报告撰写", metrics_from=["caliber"],
+               system="你是周报撰写人：结论先行，只写有数据支撑的判断。",
+               instructions="为 {{ input.week }} 写一份简短的周报：先用一两句话总结本周，"
+                            "再分点说销售额、订单、客单价和退款的变化。"),
+            _n("done", "output", "出具",
+               fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
+               contract={
+                   "report_from": "write",
+                   "metrics_from": ["caliber"],
+                   "required": ["gmv", "orders"],
+                   "expected": ["wow", "aov", "refund_rate"],
+                   "strict": True,
+               }),
+        ],
+        "edges": [
+            _e("start", "fetch"), _e("fetch", "parse"), _e("parse", "caliber"),
+            _e("caliber", "write"), _e("write", "done"),
+        ],
+    },
+    {
         "name": "⑦ 批量处理（循环）",
         "description": "对列表逐项处理再汇总。演示 loop 节点的 body / done 两个出口怎么接。",
         "tags": ["循环"],

@@ -12,6 +12,7 @@ import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from '.
 import { edgeKey, topology } from '../run/derive'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
+import { matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
@@ -66,6 +67,10 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return 'JSON Schema 校验' + (config.repair_with_llm ? ' · 失败自动返工' : '')
     case 'metrics':
       return `${config.caliber || '口径'}@${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
+    case 'report': {
+      const from = Array.isArray(config.metrics_from) ? config.metrics_from.length : 0
+      return `${first(config.instructions) || '未填写作要求'} · ${from ? `${from} 张口径卡` : '上游全部口径卡'}`
+    }
     case 'transform':
       return first(config.expression, config.template) || '未配置'
     case 'subgraph':
@@ -164,9 +169,10 @@ function matchedLines(matched: unknown): string {
   if (!Array.isArray(matched) || !matched.length) return ''
   const lines = matched.slice(0, 5).map((m: any) => {
     const token = String(m?.token ?? '').trim()
-    const metric = String(m?.metric ?? '').trim()
+    // 出处不唯一的（metric 为 null、带候选）照实写，不能写成空箭头
+    const source = matchedSource(m).text
     const caliber = typeof m?.caliber === 'string' && m.caliber.trim() ? `（${m.caliber.trim()}）` : ''
-    return token ? `  ${token}${metric ? ` → ${metric}` : ''}${caliber}` : ''
+    return token ? `  ${token}${source ? ` → ${source}` : ''}${caliber}` : ''
   }).filter(Boolean)
   if (!lines.length) return ''
   const more = matched.length > lines.length ? `\n  …另有 ${matched.length - lines.length} 个` : ''

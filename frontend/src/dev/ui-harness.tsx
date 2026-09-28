@@ -21,6 +21,12 @@ import * as explain from '../lib/explain'
 import * as health from '../lib/health'
 import * as actor from '../lib/actor'
 import * as validation from '../lib/validation'
+import * as evidence from '../lib/evidence'
+import { EvidenceDoc, EvidenceField } from '../run/EvidenceDoc'
+import { Markdown } from '../run/Markdown'
+import evidenceFixture from '../run/__tests__/evidence-doc.json'
+import mdPinned from '../run/__tests__/markdown-pinned.json'
+import type { EvidenceDocData } from '../types'
 import '../index.css'
 
 /**
@@ -176,6 +182,108 @@ function DatasourceConsumers() {
   const [n, setN] = useState(0)
   useEffect(() => { setDatasourceConsumers = setN }, [])
   return <div hidden data-ds-consumers={n}>{Array.from({ length: n }, (_, i) => <DatasourceConsumer key={i} />)}</div>
+}
+
+const EV_DOC = evidenceFixture.doc as unknown as EvidenceDocData
+const EV_LEGACY = evidenceFixture.legacy
+/** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
+const LEGACY_LOOSE = {
+  matched: EV_LEGACY.matched.map(({ start: _s, end: _e, ...m }) => m),
+  unmatched_numbers: EV_LEGACY.unmatched.map(({ start: _s, end: _e, ...u }) => u),
+}
+
+/**
+ * 长报告：把夹具的块重复 n 遍（块、句、片段的 id 各自加后缀），stats 和违规清单去掉，
+ * 计数从片段自己数。用来看块级 content-visibility、超长折叠、跳转进折叠区时自动展开
+ */
+function longDoc(doc: EvidenceDocData, times: number): EvidenceDocData {
+  const blocks = Array.from({ length: times }, (_, k) => doc.blocks.map((b) => ({
+    ...b, id: `${b.id}-${k}`,
+    units: b.units.map((u) => ({ ...u, id: `${u.id}-${k}`, segments: u.segments.map((s) => ({ ...s, id: `${s.id}-${k}` })) })),
+  }))).flat()
+  return { ...doc, blocks, stats: undefined, violations: undefined, markdown: undefined }
+}
+const EV_LONG = longDoc(EV_DOC, 16)
+
+/**
+ * 可点击证据的演示：宽栏（侧边面板 / 窄屏时底部抽屉）、360px 窄栏（栏内展开）、旧契约的
+ * 按位置标记。文档是后端 compose_doc 真跑出来的夹具（evidence-doc.json，只用通用名）；
+ * runId 是假的，片段接口由 check-evidence 用 page.route 伪造，直接打开时面板照实说取不到
+ */
+function EvidenceDemo() {
+  return (
+    <div className="flex flex-col gap-4" id="evidence-demo">
+      <div id="evidence-wide" className="rounded-lg border p-3">
+        <EvidenceDoc doc={EV_DOC} artifact={evidenceFixture.doc_artifact} runId={evidenceFixture.run_id} label="周报" tally />
+      </div>
+      <div id="evidence-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+        <EvidenceDoc doc={EV_DOC} artifact={evidenceFixture.doc_artifact} runId={evidenceFixture.run_id} label="周报" dense tally />
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        <div id="legacy-marks" className="rounded-lg border p-3">
+          <div className="mb-1 text-2xs text-faint">旧契约 · 按位置标（日期里的 15 不画）</div>
+          <Markdown text={EV_LEGACY.text}
+                    marks={evidence.issuanceMarks({ matched: EV_LEGACY.matched, unmatched_numbers: EV_LEGACY.unmatched })} />
+        </div>
+        <div id="legacy-loose" className="rounded-lg border p-3">
+          <div className="mb-1 text-2xs text-faint">老运行 · 没有位置，按字符串标</div>
+          <Markdown text={EV_LEGACY.text} marks={evidence.issuanceMarks(LEGACY_LOOSE)} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** ?evidence=1：只摆证据演示，360px 宽度的检查和截图不被别的演示撑宽 */
+function EvidenceOnly() {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const t = new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark'
+    document.documentElement.setAttribute('data-theme', t)
+    return t
+  })
+  const flip = (t: 'dark' | 'light') => { setTheme(t); document.documentElement.setAttribute('data-theme', t) }
+  return (
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex max-w-5xl flex-col gap-3 p-4">
+        <div className="flex items-center gap-2">
+          <h1 className="text-base font-semibold">可点击证据</h1>
+          <div className="ml-auto flex gap-1">
+            <button className="btn btn-sm" id="theme-dark" onClick={() => flip('dark')} aria-pressed={theme === 'dark'}>暗</button>
+            <button className="btn btn-sm" id="theme-light" onClick={() => flip('light')} aria-pressed={theme === 'light'}>亮</button>
+          </div>
+        </div>
+        <EvidenceDemo />
+        <div id="evidence-long" className="rounded-lg border p-3">
+          <div className="mb-1 text-2xs text-faint">长报告：{EV_LONG.blocks.length} 块，块级 content-visibility，超过 3000 字先折叠</div>
+          <EvidenceDoc doc={EV_LONG} label="长报告" tally />
+        </div>
+        {/*
+          成果字段按工件 id 取文档。check-evidence 把这几件工件伪造成：正文这份（能画）、
+          另一次运行写的（run_id 不同）、没记正文的（缺 markdown）——后两种都得退回普通文本
+        */}
+        <div id="evidence-fields" className="grid gap-3 md:grid-cols-3">
+          {[['fx-field-ok', '正文这份'], ['fx-field-other-run', '另一次运行写的'], ['fx-field-no-markdown', '没记正文']].map(([id, name]) => (
+            <div key={id} id={id} className="rounded-lg border p-3">
+              <div className="mb-1 text-2xs text-faint">成果字段 · {name}</div>
+              <EvidenceField artifact={id} text={evidenceFixture.output['周报']} runId={evidenceFixture.run_id} dense label="周报" />
+            </div>
+          ))}
+        </div>
+        {/*
+          没有 _evidence 的旧回答：同一批文字用现在的 Markdown 渲染，check-evidence 拿它和
+          Markdown.tsx 改动前（HEAD）渲染出来的 outerHTML（markdown-pinned.json）逐字比对
+        */}
+        <div id="md-pinned" className="rounded-lg border p-3">
+          <div className="mb-1 text-2xs text-faint">旧回答的 Markdown：和改动前逐字比对</div>
+          {(mdPinned.samples as { id: string; text: string; dense: boolean; marks?: any[] }[]).map((p) => (
+            <div key={p.id} data-pin={p.id} className="border-t py-2 first:border-t-0">
+              <Markdown text={p.text} dense={p.dense} marks={p.marks} />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function Harness() {
@@ -403,6 +511,10 @@ function Harness() {
             <ManageKitDemo />
           </Block>
 
+          <Block title="可点击证据 EvidenceDoc（单独看：?evidence=1）">
+            <EvidenceDemo />
+          </Block>
+
           <Block title="标签页 Tabs · 表单字段 Field">
             <Tabs
               label="示例标签"
@@ -430,13 +542,14 @@ function Harness() {
   toast, confirmDialog, promptDialog, useCatalog, ApiError, api, streamCopilot,
   mountDatasources: (n: number) => setDatasourceConsumers(n),
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
-  lib: { format, status, keys, terms, errors, explain, health, actor, validation },
+  lib: { format, status, keys, terms, errors, explain, health, actor, validation, evidence },
+  evidenceFixture,
 }
 
 createRoot(document.getElementById('root')!).render(
   <BrowserRouter>
     <ToastHost>
-      <Harness />
+      {new URLSearchParams(location.search).get('evidence') === '1' ? <EvidenceOnly /> : <Harness />}
     </ToastHost>
   </BrowserRouter>,
 )

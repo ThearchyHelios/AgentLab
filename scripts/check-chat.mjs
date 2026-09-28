@@ -31,7 +31,7 @@
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-chat.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync } from 'node:fs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const CHROME = process.env.CHROME_PATH
@@ -149,7 +149,26 @@ const TRASH_MORE = {
   trash4: conv('c0trash4', '删掉的对话丁：还在跑', 1, 60 * 24 * 5,
     { archived: true, last_status: 'running', last_run_id: 'run-trash-live' }),
 }
+/** 只在「护栏」那段出现：放宽步数只在步数用满、而且还有得放宽时给（后端 engine/guards.py） */
+const GRAPH8 = { ...GRAPH, nodes: GRAPH.nodes.map((n) => (n.type === 'agent'
+  ? { ...n, data: { ...n.data, config: { max_steps: 8 } } } : n)) }
+const guardTurn = (id, graph, reason, detail) => turn(id, '查一下各门店的销量', {
+  answer: '只查了一部分的结论', graph, run_id: `run-${id}`,
+  review: {
+    verdict: 'annotated', note: detail, answer: null, retry: true, severity: 'broken',
+    signals: [{ kind: 'step_limit', detail, severity: 'broken', ...(reason ? { reason } : {}) }],
+  },
+  meta: { v: 1, runId: `run-${id}`, runClass: 'exploratory', runStatus: 'succeeded' },
+})
+const GUARD_CONVS = {
+  stall: conv('c0gstall', '护栏：连续几步没进展收的尾', 1, 60 * 24 * 30),
+  steps: conv('c0gsteps', '护栏：写死 8 步、用满了', 1, 60 * 24 * 31),
+  dflt: conv('c0gdflt', '护栏：跟随默认步数', 1, 60 * 24 * 32),
+}
 const DETAIL = {
+  c0gstall: [guardTurn('tg1', GRAPH8, 'stall', 'agent 连续 3 步没有拿到新信息，收尾轮也没有给出结论。')],
+  c0gsteps: [guardTurn('tg2', GRAPH8, 'steps', 'agent 用满了 8 步。收尾轮也没有给出结论。')],
+  c0gdflt: [guardTurn('tg3', GRAPH, null, 'agent 用满了 12 步还没给出结论。')],
   c0busya: [],
   c0idleb: [turn('tb1', 'B 的问题', { answer: 'B 的答案', graph: GRAPH, run_id: 'run-b1' })],
   c0longc: Array.from({ length: 6 }, (_, i) =>
@@ -273,7 +292,13 @@ const DETAIL = {
   // 要改的是工具库里的参数定义，不在这一轮的流程里：先去改，再接着跑（没记 fix 的老写法，按原话认）
   c0fixy: [turn('ty1', '查一下订单状态', { status: 'error', error: BROKEN_TOOL, graph: GRAPH, run_id: 'run-badtool' })],
 }
+/**
+ * 成果带逐段证据的一轮（报告撰写节点 + _evidence）。夹具是后端 compose_doc 真跑出来的，只用
+ * 通用名。复核回的是一次改写：有证据时复核只能加说明，答案不能被换掉
+ */
+const EVIDENCE = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
 const RUNS = {
+  'run-evid': { status: 'succeeded', output: EVIDENCE.output, error: null },
   'run-cancelled': { status: 'cancelled', output: {}, error: null },
   'run-failed': { status: 'failed', output: {}, error: '查询超时' },
   'run-rejected': { status: 'failed', output: {}, error: '人工驳回：数字对不上' },
@@ -310,6 +335,8 @@ const ctl = {
   few: false, run500: true, reviewDelay: {}, launchFail: true, scope400: false,
   /** 回收站里多摆两个（TRASH_MORE） */
   trashMore: false,
+  /** 列表里多摆「护栏」那段的三个会话（GUARD_CONVS） */
+  guardConvs: false,
   /** 数据源列表取不回来 */
   sourcesFail: false,
   /** 数据源列表里多一个别处刚加的库 */
@@ -322,7 +349,8 @@ const resetDb = () => {
   db.purged = new Set()
 }
 resetDb()
-const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : [])]
+const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
+  ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
 let runSeq = 0
@@ -406,6 +434,12 @@ async function fakeApi(route) {
   if (path === '/copilot/review' && method === 'POST') {
     const wait = ctl.reviewDelay[body().run_id]
     if (wait) await new Promise((r) => setTimeout(r, wait))
+    // 老后端的复核不认 _evidence，照样回一次改写
+    if (body().run_id === 'run-evid') {
+      return json({ verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
+                    original: EVIDENCE.output['周报'], retry: false, severity: 'degraded',
+                    signals: [{ kind: 'retrieval_degraded', detail: '检索退回关键词', severity: 'degraded' }] })
+    }
     return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [] })
   }
   if (path === '/runs' && method === 'POST') {
@@ -413,7 +447,8 @@ async function fakeApi(route) {
     const conversation = String(b.input?.question ?? '')
     // 发起请求根本没到后端（网断了、后端正在重启）
     if (conversation.includes('启动失败') && ctl.launchFail) return route.abort('connectionrefused')
-    const id = conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
+    const id = conversation.includes('带证据') ? 'run-evid'
+      : conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
       : conversation.includes('审批') ? 'run-wait'
       : conversation.includes('重启') ? 'run-restart'
       : conversation.includes('正在写') ? 'run-writing'
@@ -474,6 +509,18 @@ function script(runId, after = 0) {
         ev(1, 'run.started', null, { nodes: 3 }),
         ev(2, 'node.finished', 'ag', { duration_ms: 900 }),
         ev(3, 'run.finished', null, { output: { answer: FULL.slice(0, 2000), note: '附注' }, output_truncated: true }),
+      ],
+      end: 'succeeded',
+    }
+  }
+  if (runId === 'run-evid') {
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 3 }),
+        ev(2, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+        ev(3, 'report.checked', 'write', EVIDENCE.report_checked),
+        ev(4, 'node.finished', 'write', { duration_ms: 900 }),
+        ev(5, 'run.finished', null, { output: EVIDENCE.output }),
       ],
       end: 'succeeded',
     }
@@ -596,7 +643,7 @@ async function fakeStream(ws) {
 
 const browser = await chromium.launch({ executablePath: CHROME })
 
-async function open(theme = 'light', { width = 1440, height = 900, reducedMotion = 'no-preference' } = {}) {
+async function open(theme = 'light', { width = 1440, height = 900, reducedMotion = 'no-preference', settings = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, reducedMotion })
   opened.add(ctx)
   await ctx.addInitScript((t) => localStorage.setItem('agentlab.theme', t), theme)
@@ -607,7 +654,8 @@ async function open(theme = 'light', { width = 1440, height = 900, reducedMotion
   await page.route('**/api/settings', async (route) => {
     if (route.request().method() !== 'GET') return route.abort()
     // 主题以设置为准（沙箱里存的是 light），这里按要看的那套改掉
-    return route.fulfill({ json: { ui: { theme }, run: {}, limits: { max_agent_steps: 25 }, copilot: {}, embedding: {} } })
+    return route.fulfill({ json: { ui: { theme }, run: {}, limits: { max_agent_steps: 25 }, copilot: {}, embedding: {},
+      ...(settings ?? {}) } })
   })
   await page.route(/\/api\/(conversations|copilot\/(generate-stream|review)|runs|approvals|datasources)(\/|\?|$)/, fakeApi)
   await page.routeWebSocket(/\/api\/runs\/[^/]+\/stream/, fakeStream)
@@ -872,6 +920,37 @@ for (const theme of THEMES) {
     check('完整答案取到了，meta 里没有「没取全」', !meta?.clipped, JSON.stringify(meta?.clipped))
     await page.getByText('展开全部').first().click().catch(() => {})
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('evidence', '成果带逐段证据：复核只加说明，不改写答案（可点击证据第一期）', async () => {
+    const { page, ctx, errors } = await open(theme)
+    // 文档记着的运行要和成果的运行对得上（run-evid），不然前端按「别的运行写的」退回普通文本
+    await page.route(/\/api\/artifacts\//, (route) => route.fulfill({ json: { id: EVIDENCE.doc_artifact,
+      content: { ...EVIDENCE.doc, run_id: 'run-evid' } } }))
+    await page.route(/\/api\/runs\/run-evid\/evidence(\/.*)?(\?.*)?$/, (route) => route.fulfill({ json: EVIDENCE.graph }))
+    const patchesBefore = log.patches.length
+    await goto(page, 'c0trunc')
+    await send(page, '写一份带证据的周报')
+    check('答完了', await page.waitForFunction(
+      () => window.__chat.getState().byConversation.c0trunc?.at(-1)?.phase === 'done', null, { timeout: 10000 })
+      .then(() => true, () => false))
+    const t = (await chatState(page)).byConversation.c0trunc.at(-1)
+    check('复核的改写没有落到答案上：成果还是报告原文和它的证据标注',
+      t.output?.['周报'] === EVIDENCE.output['周报'] && !!t.output?._evidence && !t.output?.answer, JSON.stringify(Object.keys(t.output ?? {})))
+    check('复核的说明照样摆出来，改写的文字丢掉', t.review?.note?.includes('检索降级过') && t.review.answer === null
+      && t.review.verdict === 'annotated' && !t.rawOutput, JSON.stringify(t.review))
+    await page.waitForSelector('[data-evidence-doc]', { timeout: 5000 }).catch(() => {})
+    check('页面上是逐段可点的报告，不是改写后的文字', await page.locator('[data-evidence-doc] [data-seg]').count() > 0
+      && !(await shows(page, '改写后的答案')))
+    check('没有「复核改写过这个答案」的对照', await page.getByText('复核改写过这个答案').count() === 0)
+    await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
+    const saved = log.patches.slice(patchesBefore)
+    check('落库的是报告原文，不是改写', saved.filter((p) => typeof p.body.answer === 'string' && p.body.answer)
+      .every((p) => p.body.answer === EVIDENCE.output['周报']), saved.map((p) => String(p.body.answer ?? '').slice(0, 12)).join(' | '))
+    check('meta 记下这一轮有证据（刷新后回运行那里取标注）', saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
+    check('落库的复核也不带改写', saved.filter((p) => p.body.review?.verdict).every((p) => !p.body.review.answer))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })
@@ -1515,6 +1594,32 @@ for (const theme of THEMES) {
     ctl.launchFail = true
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+  })
+
+  await section('guard', '放宽步数只在对症时给：停滞、预算收的尾不给，跟随默认 100 步的也不给', async () => {
+    resetDb()
+    ctl.guardConvs = true
+    try {
+      const stepBtn = (page) => page.getByRole('button', { name: /放宽步数重跑/ })
+      // 新后端：默认 100 步、硬上限 100
+      const fresh = { run: { agent_max_steps: 100 }, limits: { max_agent_steps: 100 } }
+      const { page, ctx, errors } = await open(theme, { settings: fresh })
+      await goto(page, 'c0gstall')
+      await shows(page, '只查了一部分的结论')
+      check('连续几步没进展收的尾：不给「放宽步数」（加步数只会原样再撞一次）', await stepBtn(page).count() === 0)
+      await goto(page, 'c0gsteps')
+      await shows(page, '只查了一部分的结论')
+      const eight = stepBtn(page)
+      check('节点写死 8 步、步数用满：给「放宽步数」，从 8 放到 16', await eight.count() === 1
+        && /8 → 16 步/.test(await eight.innerText()), await eight.innerText().catch(() => '（没有按钮）'))
+      await goto(page, 'c0gdflt')
+      await shows(page, '只查了一部分的结论')
+      check('节点上的 12 跟随默认 100 步、已经到硬上限：不许一个放不宽的数', await stepBtn(page).count() === 0)
+      check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    } finally {
+      ctl.guardConvs = false
+    }
   })
 
   await section('rerun', '重跑服务重启挂起的那一轮：旧运行顺手取消', async () => {

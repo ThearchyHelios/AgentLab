@@ -348,3 +348,56 @@ async def test_review_endpoint_reports_signals(client, monkeypatch):
 async def test_review_endpoint_404(client):
     resp = await client.post("/api/copilot/review", json={"run_id": "没这个", "question": "q"})
     assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 带逐段证据的答案：只加说明，不改写
+# --------------------------------------------------------------------------
+
+
+class RecordingModel(FakeModel):
+    def __init__(self, reply):
+        super().__init__(reply)
+        self.seen: list = []
+
+    async def ainvoke(self, messages):
+        self.seen.append(messages)
+        return await super().ainvoke(messages)
+
+
+@pytest.mark.asyncio
+async def test_review_never_rewrites_an_answer_that_carries_evidence():
+    """报告节点产出的答案，每个数字都按位置对应着证据文档。复核把它整段改写，
+    文档和答案就对不上了——界面上点开的出处指向一段已经不存在的文字。"""
+    model = RecordingModel({"note": "报告被要求重写过一次。", "answer": "改写后的周报，销售额 45,678.5元。",
+                            "retry": False})
+    result = await rv.review(model, question="q", answer="周报：销售额 45,678.5元。", signals=SIGNALS,
+                             locked=True)
+    assert result.verdict == "annotated"
+    assert result.answer is None and result.original is None
+    assert result.note == "报告被要求重写过一次。"
+    prompt = "\n".join(str(text) for _, text in model.seen[0])
+    assert "不能改写" in prompt
+
+
+def test_report_repair_is_a_degraded_signal():
+    signals = rv.scan([warn("报告里有 1 处没通过核对（「45678」），已要求写作者重写（第 1 次）",
+                            "report_repair")], OK_OUTPUT)
+    assert [(s.kind, s.severity) for s in signals] == [("report_repair", rv.DEGRADED)]
+
+
+@pytest.mark.asyncio
+async def test_review_endpoint_keeps_answers_with_evidence(client, monkeypatch):
+    model = FakeModel({"note": "报告被要求重写过一次。", "answer": "整段改写过的周报。", "retry": False})
+
+    async def fake_model(*a, **k):
+        return model, "fake"
+
+    monkeypatch.setattr("app.api.copilot.get_chat_model", fake_model)
+    output = {"周报": "周报：销售额 45,678.5元。",
+              "_evidence": {"report_node": "write", "doc_artifact": "a" * 64, "fields": ["周报"]}}
+    run_id = await _make_run(client, output, [warn("报告里有 1 处没通过核对，已要求写作者重写", "report_repair")])
+    body = (await client.post("/api/copilot/review", json={"run_id": run_id, "question": "q"})).json()
+    assert model.calls == 1
+    assert body["verdict"] == "annotated" and body["answer"] is None
+    assert body["note"] == "报告被要求重写过一次。"

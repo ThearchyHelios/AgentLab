@@ -40,9 +40,13 @@ class Signal:
     kind: str
     detail: str
     severity: str = DEGRADED
+    #: agent 为什么提前收尾（engine/guards.py：steps / stall / budget_tokens / budget_usd / context）。
+    #: 问数据页据此决定给不给「放宽步数重跑」：只有步数用满时放宽步数才对症
+    reason: str | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return {"kind": self.kind, "detail": self.detail, "severity": self.severity}
+        out = {"kind": self.kind, "detail": self.detail, "severity": self.severity}
+        return {**out, "reason": self.reason} if self.reason else out
 
 
 # warn 日志按 code 分类，而不是靠匹配中文消息串——消息是给人读的，随时会改，
@@ -80,6 +84,13 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "team_last_failed": ("team_last_failed", DEGRADED),
     # 校验节点的修复编出了原文没有的值，这次修复被作废
     "repair_invented": ("repair_invented", DEGRADED),
+    # 报告撰写节点：写作者写了裸数字或引用了不存在的指标，被要求重写。重写好了的
+    # 答案是核对过的，只记缺口；没好的那次按 on_violation 失败或把违规标在报告里
+    "report_repair": ("report_repair", DEGRADED),
+    # 报告撰写节点的上游没有可引用的口径卡指标：报告里的数都没有出处
+    "report_no_evidence": ("report_no_evidence", DEGRADED),
+    # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
+    "evidence_store_failed": ("evidence_store_failed", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
@@ -118,7 +129,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     signals: list[Signal] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(kind: str, detail: str, severity: str) -> None:
+    def add(kind: str, detail: str, severity: str, reason: str | None = None) -> None:
         if severity == BENIGN:
             return
         key = (kind, detail)
@@ -126,7 +137,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             return
         seen.add(key)
         kinds.add(kind)
-        signals.append(Signal(kind, detail, severity))
+        signals.append(Signal(kind, detail, severity, reason))
 
     kinds: set[str] = set()
 
@@ -180,8 +191,9 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             message = str(data.get("message") or "").strip()
             code = str(data.get("code") or "")
             kind, severity = WARN_CODES.get(code, ("warn", DEGRADED))
+            reason = data.get("reason")
             if message:
-                add(kind, message[:300], severity)
+                add(kind, message[:300], severity, reason if isinstance(reason, str) and reason else None)
 
     text = answer_text(output)
     if not text:
@@ -253,7 +265,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 
-def review_prompt(question: str, answer: str, signals: list[Signal]) -> str:
+#: 答案带着逐段证据时追加给复核模型的话
+LOCKED_NOTE = (
+    "\n\n这份答案带有逐段证据（报告里的每个数字都对应着核对过的出处），不能改写："
+    "answer 必须留空，只在 note 里说明异常。"
+)
+
+
+def review_prompt(question: str, answer: str, signals: list[Signal], *, locked: bool = False) -> str:
     """拼给复核模型的请求。
 
     只给信号清单，不给原始事件流：几百条事件塞进 prompt 既贵又没用，而信号
@@ -266,6 +285,7 @@ def review_prompt(question: str, answer: str, signals: list[Signal]) -> str:
         f"用户的问题：\n{question or '（未记录）'}\n\n"
         f"系统给出的原答案：\n{answer or '（空）'}\n\n"
         f"检测到的异常：\n{lines}"
+        + (LOCKED_NOTE if locked else "")
     )
 
 
@@ -296,12 +316,15 @@ class ReviewResult:
 
 
 async def review(
-    model: Any, *, question: str, answer: str, signals: list[Signal]
+    model: Any, *, question: str, answer: str, signals: list[Signal], locked: bool = False,
 ) -> ReviewResult:
     """叫一次模型复核。调用方负责确保 signals 非空——空信号根本不该走到这里。
 
     复核本身失败不能让整轮挂掉：答案已经在手上了，复核只是加一层说明。
     所以这里把异常全兜住，最差也要把原答案原样交出去。
+
+    locked：成果带 _evidence（报告撰写节点产出、逐段对应证据文档）。这种答案只能
+    加说明、不能改写——改写之后界面上点开的出处，指向的是一段已经不存在的文字。
     """
     severity = worst(signals)
     rule_retry = should_retry(signals)
@@ -309,7 +332,7 @@ async def review(
         s.detail for s in signals
     )
 
-    messages = [("system", REVIEW_SYSTEM), ("human", review_prompt(question, answer, signals))]
+    messages = [("system", REVIEW_SYSTEM), ("human", review_prompt(question, answer, signals, locked=locked))]
     try:
         raw = await model.with_structured_output(REVIEW_SCHEMA).ainvoke(messages)
         if not isinstance(raw, dict):
@@ -334,7 +357,7 @@ async def review(
     # 白烧一次建图加一次跑图。模型没表态时按规则走
     retry = rule_retry and bool(raw.get("retry", True))
 
-    if not revised or revised == answer.strip():
+    if locked or not revised or revised == answer.strip():
         return ReviewResult(
             verdict="annotated", note=note, retry=retry, signals=signals, severity=severity,
         )

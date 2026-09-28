@@ -481,6 +481,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       fix: explain.fix, fixTo: explain.fixTo, fixFirst: explain.fixFirst,
     } satisfies TurnFailure : undefined,
     runClass: run.run_class,
+    // 成果里的报告点开片段时要按运行号取证据链；不给 runId（详情头上已经有运行号）
+    outputRun: run.id,
     statusCode: code,
     // 轮次头的计时和详情头同一个口径：跑完写墙钟，跑着从航迹的起点实时算。
     // 停下来过的（等过审批、失败后接着跑）例外，只数执行的部分：从第一次开始算，

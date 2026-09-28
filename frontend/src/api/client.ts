@@ -1,7 +1,7 @@
 import type {
-  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, GraphSpec,
-  KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus, Skill, ToolChange, ToolInfo,
-  ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
+  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
+  EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus,
+  Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
 import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
@@ -487,7 +487,12 @@ export const api = {
       post<Run>(`/runs/${id}/continue`, { graph: graph ?? null }),
     // 等审批的运行直接收成 cancelled；在跑的要等引擎收尾，先回 stopping
     cancel: (id: string) => post<{ ok: boolean; status?: 'stopping' | 'cancelled' }>(`/runs/${id}/cancel`),
-    resume: (id: string, response: any) => post<Run>(`/runs/${id}/resume`, { response }),
+    /**
+     * 回复审批。approvalId 指明回复的是哪一条（一次运行里可能有几条同时等着）。
+     * 审批卡的「始终允许」走这里：response 多带 always，/approvals/{id}/decide 的请求体没有这一项
+     */
+    resume: (id: string, response: any, approvalId?: string) =>
+      post<Run>(`/runs/${id}/resume`, approvalId ? { response, approval_id: approvalId } : { response }),
     events: (id: string, after = 0) => get<RunEvent[]>(`/runs/${id}/events?after=${after}`),
     state: (id: string) => get<any>(`/runs/${id}/state`),
     history: (id: string) => get<any[]>(`/runs/${id}/history`),
@@ -535,6 +540,9 @@ export const api = {
     /** 危险工具要 confirm，否则后端回 409，detail 写明它会做什么 */
     run: (name: string, args: Record<string, any>, opts?: { confirm?: boolean }) =>
       post<any>(`/tools/${name}/run`, opts?.confirm ? { args, confirm: true } : { args }),
+    /** MCP / 自定义工具的信任档。key 是 ToolInfo.trust_key；设回 ask 等于删掉这一条 */
+    setTrust: (key: string, trust: ToolTrust) =>
+      put<{ key: string; trust: ToolTrust }>('/tools/trust', { key, trust }),
   },
   customTools: {
     /** 每行带 problem：库里存着的参数定义写坏了时是一句中文，绑了它的节点一定失败 */
@@ -666,6 +674,22 @@ export const api = {
     clusters: () => get<any>('/governance/exploratory-clusters'),
   },
   artifact: (id: string) => get<{ id: string; content: any }>(`/artifacts/${id}`),
+
+  // ---- 可点击证据 ----
+  // 只认封存范围内的事件追得到的工件（后端 api/evidence.py）。老后端没有这两个接口，调用方按 404 降级
+  evidence: {
+    /** 整次运行的证据图：模式（cited / legacy_contract / none）、封存状态、报告和证据清单 */
+    graph: (runId: string, opts?: RequestOptions) =>
+      get<EvidenceGraph>(`/runs/${encodeURIComponent(runId)}/evidence`, opts),
+    /**
+     * 点开一个片段：所在的句子、指标步骤（原式、代入式、输入、复算）、封存状态。一次运行
+     * 里有好几份报告时 report 给报告节点 id（片段 id 每份文档各自从 s0 数起），不给取成果标注的那份
+     */
+    segment: (runId: string, segmentId: string, opts?: RequestOptions & { report?: string }) =>
+      get<EvidenceSegmentDetail>(
+        `/runs/${encodeURIComponent(runId)}/evidence/segments/${encodeURIComponent(segmentId)}${qs({ report: opts?.report })}`,
+        opts),
+  },
 
   // ---- 会话 ----
   conversations: {

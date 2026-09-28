@@ -32,6 +32,7 @@ class NodeType(StrEnum):
     HUMAN = "human"  # 人工介入
     VALIDATE = "validate"  # 结构化校验 + 自动重试
     METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
+    REPORT = "report"  # 报告撰写：模型只写引用标记，数字由系统从口径卡取出来渲染
 
 
 # 节点类型在画布上的叫法。报错和门禁文案用它，而不是枚举值——用户在界面上从没
@@ -41,7 +42,7 @@ TYPE_LABEL: dict[str, str] = {
     "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码",
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
-    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡",
+    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
 }
 
 
@@ -367,6 +368,75 @@ def _check_case_keys(node: GraphNode, cases: list[Any], result: ValidationResult
         seen.add(key)
 
 
+def _ancestors(spec: GraphSpec, node_id: str) -> set[str]:
+    """沿连线往回走能到的所有节点（不含自己）。循环里的节点彼此都算上游。"""
+    parents: dict[str, list[str]] = defaultdict(list)
+    for e in spec.edges:
+        parents[e.target].append(e.source)
+    seen: set[str] = set()
+    stack = list(parents[node_id])
+    while stack:
+        cur = stack.pop()
+        if cur not in seen:
+            seen.add(cur)
+            stack.extend(parents[cur])
+    seen.discard(node_id)
+    return seen
+
+
+def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """报告的 metrics_from 只能指向它上游的口径卡。
+
+    指错了运行时不会报错：目录里就是没有那张卡的指标，模型要么写不出数、要么被
+    判成引用不存在——在画图时说破比跑完再猜原因便宜得多。
+    """
+    sources = node.config.get("metrics_from")
+    if sources in (None, "", []):
+        return      # 不写就取所有上游口径卡
+    if isinstance(sources, str):
+        sources = [sources]
+    if not isinstance(sources, list) or not all(isinstance(s, str) and s for s in sources):
+        result.add("「报告撰写」的 metrics_from 要写口径卡节点的 id 列表", node_id=node.id,
+                   field="metrics_from")
+        return
+    nodes = spec.node_map()
+    upstream = _ancestors(spec, node.id)
+    for src in sources:
+        target = nodes.get(src)
+        if target is None:
+            result.add(f"「报告撰写」的 metrics_from 指向 {src!r}，但工作流里不存在这个节点",
+                       node_id=node.id, field="metrics_from")
+        elif target.type != NodeType.METRICS:
+            result.add(f"「报告撰写」的 metrics_from 指向「{target.title}」（{src}），它不是「口径卡」"
+                       f"节点，而是「{type_label(target.type)}」：报告里的指标只能从口径卡来",
+                       node_id=node.id, field="metrics_from")
+        elif src not in upstream:
+            result.add(f"「报告撰写」的 metrics_from 指向的口径卡「{target.title}」不在它的上游：报告跑的"
+                       "时候那张卡还没算，目录里不会有它的指标。把口径卡连到报告前面",
+                       node_id=node.id, field="metrics_from")
+
+
+def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
+                       result: ValidationResult) -> None:
+    """引用模式的契约：report_from 必须是出口上游的报告撰写节点。"""
+    field = "contract.report_from"
+    if not isinstance(report_from, str):
+        result.add("出具契约的 report_from 要写「报告撰写」节点的 id", node_id=node.id, field=field)
+        return
+    target = spec.node_map().get(report_from)
+    if target is None:
+        result.add(f"出具契约的 report_from 指向 {report_from!r}，但工作流里不存在这个节点",
+                   node_id=node.id, field=field)
+    elif target.type != NodeType.REPORT:
+        result.add(f"出具契约的 report_from 指向「{target.title}」（{report_from}），它不是「报告撰写」"
+                   f"节点，而是「{type_label(target.type)}」：引用模式只核对报告撰写节点产出的文档",
+                   node_id=node.id, field=field)
+    elif report_from not in _ancestors(spec, node.id):
+        result.add(f"出具契约的 report_from 指向的「{target.title}」不在这个出口的上游：出口核对的时候"
+                   "那份报告还没写出来。把报告撰写节点连到出口前面",
+                   node_id=node.id, field=field)
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -427,11 +497,15 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 if not d.get("id") or not d.get("expression"):
                     result.add(f"指标定义缺 id 或 expression：{d.get('id') or '(空)'}",
                                node_id=node.id, field=f"metrics[{i}]")
+        elif node.type == NodeType.REPORT:
+            _check_report_sources(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not contract.get("metrics_from"):
                 result.add("出具契约缺 metrics_from（指标来自哪个「口径卡」节点）",
                            node_id=node.id, field="contract.metrics_from")
+            if isinstance(contract, dict) and contract.get("report_from") not in (None, ""):
+                _check_report_from(node, contract["report_from"], spec, result)
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("「循环」节点没有循环体", node_id=node.id)

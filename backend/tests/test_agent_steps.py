@@ -65,8 +65,9 @@ def never_concludes(monkeypatch, *, settle_raises: bool = False) -> None:
         if self.tools:
             return AIMessage(
                 content=MIDWAY,
+                # 每步参数不同：同样的调用第二次不会再执行（engine/guards.py），这里要的是真把步数用完
                 tool_calls=[{"name": self.tools[0]["name"],
-                             "args": {"expression": "1+1"},
+                             "args": {"expression": f"1+{len(messages)}"},
                              "id": f"call_{len(messages)}"}],
             )
         if settle_raises:

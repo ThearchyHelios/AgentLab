@@ -223,6 +223,8 @@ async def build_custom_tools(
                 args_schema=args_model,
                 coroutine=_make(row),
                 func=None,
+                # 信任三档按它认工具（trust.py）；和工具列表里的 id 一致
+                metadata={"trust_key": row.name},
             )
         )
     return tools

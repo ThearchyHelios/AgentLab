@@ -130,7 +130,7 @@ def _datasource_section(rows: list[Any]) -> str:
         "- 认准方言：Oracle 用 FETCH FIRST n ROWS ONLY，不是 LIMIT\n"
         "- 一次只写一条语句；分号拼接会被拒\n"
         "- 字段拿不准就在图里先放一个 db_schema 工具节点，别猜字段名\n"
-        "- 取数结果要进口径卡（metrics 节点）才能被叙述引用，别让 llm 节点直接对数字做算术\n"
+        "- 取数结果要进口径卡（metrics 节点）才能被报告撰写节点（report）引用，别让 llm 节点直接对数字做算术\n"
     )
 
 
@@ -140,11 +140,18 @@ NODE_REFERENCE = """\
 - output：出口，收集最终成果。config.fields = [{name, value}]，value 里写模板引用
 - llm：单次模型调用。config: {system, prompt, model, temperature, max_tokens, assign_to, output_schema}
 - agent：带工具循环的 agent。config: {system, prompt, tools:[工具名], approval, assign_to}
-  **默认不要写 max_steps**。平台默认值是按「一步只调一个工具」校准过的；写死一个
-  小数字（见过 8）会让它查完表结构就没额度回答了，用户拿到的是半截结论。
-  唯一的例外：上一次就是因为**步数用尽**没跑完（会在改写理由里写明），
-  这时要显式写一个更大的值（比如 24）——那是这种失败唯一的修法
+  **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
+  步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
+  上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
+  上一次如果是被护栏收了尾（改写理由里会写明原因），按原因改，而不是加步数：
+  - 连续几步没有新信息：提示词里点明该查哪几张表、要哪些字段，或者工具参数写法有问题；
+  - 预算用完：写一个更大的 budget_tokens；
+  - 上下文快满：让它每次查更小的范围（SQL 加 LIMIT、只选需要的列）；
+  - 步数用满：通常说明任务拆得太大，拆成几个节点比加步数更可靠
+  MCP 工具和自定义工具默认每次调用都要人工审批（用户可以在工具页改成「始终允许」）。
+  **不要为了不停下来就把 approval 写成 never**，这是绕过用户的审批设置；要不要放行由用户在工具页决定
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
+  成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
   assign_to 拿到的是 stdout（尾部的换行已去掉）。**stdout 是 JSON 时会解析成对象**，
@@ -163,8 +170,30 @@ NODE_REFERENCE = """\
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
+- metrics：口径卡。报告里要出现的数字、以及所有派生计算（比率、增幅、占比、差值）都登记在这里。
+  config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
+  expression 是受限表达式（不是模板）：vars.q.rows[0][0]、round((vars.q.rows[0][0] - vars.q.rows[0][1]) / vars.q.rows[0][1] * 100, 1)
+  format：thousands（默认，千分位）/ plain（不分组，年份编号这类）/ percent_of_ratio（值是 0.0235 这样的比率，显示成 2.35%）；
+  decimals 写 -15 到 15 的整数；percent_of_ratio 的 decimals 按比率算：要显示两位百分比（2.35%）写 4，
+  写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
+  db_query__* 返回的是 JSON 文本 {columns, rows}，口径卡取不到里面的字段：先接一个
+  transform（mode=json，template="{{ nodes.取数节点id }}"，assign_to="q"），口径卡再写 vars.q.rows[0][0]
+- report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], on_violation, max_repairs, assign_to}
+  **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游口径卡的指标和运行输入，
+  模型只能写 [[m:指标id]]、[[i:输入字段]] 这样的引用标记，数值由系统换成口径卡里的真实值；
+  模型自己写的数字会被打回重写。它只能引用口径卡指标和运行输入，所以报告里要出现的每个数都得先在口径卡里登记。
+  metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail
+- output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
+  required:[必需指标id], expected:[期望指标id], strict: true}。成果字段写 {{ nodes.报告节点id.text }}，
+  前后不要拼别的字——拼了就没法逐段对应证据，出具会降档
 
-模型字段（llm / agent / supervisor 的 config.model）：
+搭图规则（有数字结论时必须遵守）：
+1. 取数（tool 节点查库，接 transform 解析）→ 口径卡 → report → output（配 report_from 契约）。
+   agent 的回答是自由文本，进不了口径卡：要出可追溯的报告，取数用 tool 节点
+2. 能用 SUM / COUNT 做的聚合放在 SQL 里，口径卡只做标量运算
+3. 不要用 code 节点做业务计算；code 只做格式转换
+
+模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
 - 你不知道这套部署里有哪些 model id——凭供应商名字猜（比如看到 DeepSeek 就写
   "deepseek-chat"）会得到 401 invalid_model，整个节点跑不起来。
@@ -250,6 +279,10 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "- 涉及数据的问题必须用 db_query__* / db_schema__* 去真查，"
             "不要只对问题本身做文字加工（改写、摘要、分类都不是回答）\n"
             "- 出口节点给出的应当是这个问题的答案本身\n"
+            # 报告撰写节点只能引用口径卡里登记过的数。agent 查到的结论还进不了口径卡，
+            # 普通问数也套上 report 的话，答案里的数会全部被判成没有出处
+            "- 用户要的是报告、周报，或者要能核对每个数的出处时，按搭图规则走 tool 取数 → 口径卡 → "
+            "report → output（配 report_from 契约）；普通的问数照旧用 agent，不必加 report\n"
             # 只把历史放进 prompt 是不够的：模型拿到上一轮的图，默认仍然会
             # 重新设计一张"更完整"的。而用户说"再按月份拆一下"时要的是上一张
             # 图改个 SQL——重建出来的那张经常接到另一张表上，答案对不上前一轮。
@@ -1596,6 +1629,8 @@ async def review_run(
         ).as_dict()
 
     result = await rv.review(
-        model, question=payload.question, answer=answer, signals=signals
+        model, question=payload.question, answer=answer, signals=signals,
+        # 报告撰写节点产出的答案逐段对应着证据文档：只能加说明，不能改写
+        locked=bool(output and output.get("_evidence")),
     )
     return result.as_dict()

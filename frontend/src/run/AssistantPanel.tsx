@@ -587,8 +587,9 @@ function RunView({ onBack, reveal, onRevealed }: {
         ? { error: String(failedEvent?.data?.error ?? run.error ?? '运行失败'),
             ...(failedEvent?.data?.detail ? { detail: String(failedEvent.data.detail) } : {}) }
         : undefined,
-      // #runId 已经在栏头上了（可点，去运行记录），卡片里不再重复
+      // #runId 已经在栏头上了（可点，去运行记录），卡片里不再重复；成果里的报告取证据链照样要它
       runClass: run.run_class,
+      outputRun: run.id,
       startedAt: trace.startedAt,
       // 栏头只在不跑的时候写它；跑着的时候耗时细条按各步自己的耗时比
       elapsedMs: phase === 'waiting' || isSettled(phase) ? stoppedActiveMs(run.usage, trace) : undefined,

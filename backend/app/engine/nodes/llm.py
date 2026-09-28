@@ -16,6 +16,7 @@ from app.db.base import SessionLocal
 from app.db.models import Skill
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.guards import FALLBACK_CONTEXT, Guard, legacy_hint, node_limits
 from app.engine.replay import ask, once
 from app.engine.state import GraphState, message_text, template_context, thinking_text
 from app.engine.toolcalls import (
@@ -41,10 +42,10 @@ from app.tools.registry import (
     ToolContext,
     args_model_of,
     build_tools,
-    call_is_dangerous,
     describe_args,
     prepare_args,
 )
+from app.tools.trust import asks_trustable, ask_gate, call_policy, node_task, trust_key_of
 
 # --------------------------------------------------------------------------
 # 公共部分
@@ -353,13 +354,30 @@ def split_tool_calls(
     return tool_calls[:1], deferred
 
 
-def _needs_approval(ctx: NodeContext, tool: BaseTool, args: dict[str, Any]) -> bool:
+def _guard(ctx: NodeContext, model_id: str) -> Guard | None:
+    """这个节点的护栏。升级前发起的运行（没有快照）返回 None，走旧逻辑。"""
+    if ctx.run.agent_limits is None:
+        return None
+    limits = node_limits(
+        {k: ctx.cfg(k) for k in ("max_steps", "budget_tokens", "budget_usd")},
+        ctx.run.agent_limits, settings.max_agent_steps,
+    )
+    return Guard(limits=limits, window=catalog.find_context(model_id) or FALLBACK_CONTEXT)
+
+
+def _policy(ctx: NodeContext, tool: BaseTool, args: dict[str, Any], granted: set[str]) -> str:
+    """这一次调用怎么放：safe 直接跑 / gate 先问门控模型 / ask 问人。"""
     mode = ctx.approval_mode()  # never | dangerous | always
     if mode == "always":
-        return True
+        return "ask"
     if mode == "never":
-        return False
-    return call_is_dangerous(tool, tool.name, args)
+        return "safe"
+    policy = call_policy(tool, tool.name, args, ctx.run.tool_trust)
+    # 本节点里点过「始终允许」的工具，后面的调用改由门控把关。这个集合只从本节点
+    # 重放出来的审批答复里长出来，重放时照样长到同一个位置，不会让 interrupt 错号
+    if policy == "ask" and trust_key_of(tool) in granted:
+        return "gate"
+    return policy
 
 
 async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
@@ -387,7 +405,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     model = bind_tools_safely(base_model, tools, parallel=parallel_tools)
 
     messages = await _build_messages(state, ctx)
-    max_steps = min(int(ctx.cfg("max_steps", 12) or 12), settings.max_agent_steps)
+    # 护栏（engine/guards.py）。None 是升级前发起的运行：默认 12 步、没有别的护栏，和以前一样
+    guard = _guard(ctx, model_id)
+    max_steps = (guard.limits.max_steps if guard
+                 else min(int(ctx.cfg("max_steps", 12) or 12), settings.max_agent_steps))
     total_usage: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
     transcript: list[dict[str, Any]] = []
 
@@ -469,11 +490,27 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )
         return {"content": content, "ok": ok, "duration_ms": elapsed}
 
+    @task
+    async def gate_step(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
+        # 门控的判定进 checkpoint：审批恢复重放时不再问一遍。再问一遍可能判得不一样，
+        # 后面的 interrupt 就对错号了
+        gate = await ask_gate(tool=tool_map[name], args=args, node_title=ctx.node.title,
+                              task=node_task(ctx.config))
+        ctx.emit(EventType.TOOL_GATED, tool=name, call_id=call_id, **gate.event())
+        return {"allowed": gate.allowed, **gate.usage}
+
     final_text = ""
     #: 模型把工具调用写成了文字：纠正过一次了没有
     nudged = False
+    #: 本节点里审批时点了「始终允许」的工具（trust_key）
+    granted: set[str] = set()
+    #: 为什么没等到模型自己给结论：steps / stall / budget_tokens / budget_usd / context
+    settle_reason: str | None = None
+    answered = False
     for step in range(max_steps):
         response = await llm_step(step, messages)
+        if guard:
+            guard.observe(response, messages)
         messages.append(response)
         _count(response)
 
@@ -491,9 +528,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
                 final_text = ""
                 continue
+            answered = True
             break
 
         run_calls, deferred = split_tool_calls(tool_calls, parallel=parallel_tools)
+        #: 这一步有没有拿到新信息：至少一个调用真的执行成功了（复用上次结果的不算）
+        progressed = False
 
         for call in run_calls:
             name = call.get("name", "")
@@ -524,17 +564,38 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     await once(ctx, EventType.LOG, level="warn",
                                message=f"工具 {name}：{fix_note}", code="tool_args_fixed")
 
-            if _needs_approval(ctx, tool_map[name], args):
+            if guard and (again := guard.repeat(name, args)) is not None:
+                # 同样的调用已经成功跑过：不再执行（也就不用再审批），把上次的结果交还给它
+                await once(ctx, EventType.LOG, level="info", code="tool_repeat",
+                           message=f"{name} 用同样的参数又调了一次，没有再执行，把上次的结果交还给它")
+                messages.append(ToolMessage(content=again, tool_call_id=call_id))
+                transcript.append({"tool": name, "args": args, "repeat": True})
+                continue
+
+            policy = _policy(ctx, tool_map[name], args, granted)
+            if policy == "gate":
+                gated = await gate_step(name, args, call_id)
+                for key in ("input_tokens", "output_tokens"):
+                    total_usage[key] += int(gated.get(key) or 0)
+                total_usage["cost_usd"] = round(total_usage["cost_usd"] + float(gated.get("cost_usd") or 0), 6)
+                policy = "safe" if gated["allowed"] else "ask"
+            if policy == "ask":
+                trust_key = (asks_trustable(tool_map[name], ctx.run.tool_trust)
+                             if ctx.approval_mode() == "dangerous" else None)
+                trustable = {"trust_key": trust_key} if trust_key else {}
                 decision = await ask(
                     ctx,
                     {"kind": "tool_approval", "node_id": ctx.node.id, "tool": name, "args": args,
-                     "title": f"是否允许调用 {name}？"},
-                    mode="approve", tool=name, args=args, title=f"Agent 想调用工具 {name}",
+                     "title": f"是否允许调用 {name}？", **trustable},
+                    mode="approve", tool=name, args=args, title=f"Agent 想调用工具 {name}", **trustable,
                 )
                 verdict = read_decision(decision)
                 note = verdict.note
+                always = verdict.always and bool(trust_key)
+                if always:
+                    granted.add(trust_key)
                 await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=verdict.approved,
-                           note=note, actor=ctx.actor())
+                           note=note, actor=ctx.actor(), **({"always": True} if always else {}))
                 if not verdict.approved:
                     messages.append(
                         ToolMessage(
@@ -552,6 +613,9 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             transcript.append({"tool": name, "args": args, "ok": outcome["ok"],
                                "duration_ms": outcome["duration_ms"], "result": content[:4000]})
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
+            if guard:
+                guard.record(step, name, args, outcome["ok"], content)
+            progressed = progressed or outcome["ok"]
 
         # 没跑的那些排在执行过的后面，保持模型原本的调用顺序
         for call, message in deferred:
@@ -559,16 +623,35 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             transcript.append(
                 {"tool": call.get("name", ""), "args": call.get("args", {}) or {}, "skipped": True}
             )
-    else:
-        # 步数用完了：最后那步要么要求了工具，要么是纠正之后还没来得及答。
-        # 也就是说模型从来没拿到过"说结论"的那一轮——它只是被掐断在半路。
+
+        if guard:
+            guard.step_done(progressed)
+            squeezed = guard.compress(messages)
+            if squeezed:
+                await once(ctx, EventType.LOG, level="info", code="context_compressed",
+                           message=f"对话用到上下文窗口的 {guard.last_input * 100 // guard.window}%，"
+                                   f"已压缩 {squeezed} 条早期的工具结果")
+            # 刚压缩过的这一步不按上下文收尾：压缩的效果要到下一次调用才看得出来
+            if settle_reason := guard.stop_reason(total_usage, context=not squeezed):
+                break
+            if note := guard.reminder(step, total_usage):
+                messages.append(HumanMessage(content=note))
+
+    if not answered and settle_reason is None:
+        # 步数用完了：最后那步要么要求了工具，要么是纠正之后还没来得及答
+        settle_reason = "steps"
+
+    if settle_reason:
+        # 模型从来没拿到过"说结论"的那一轮——它只是被掐断在半路。
         #
         # 所以先补上那一轮：不给工具，让它基于已经查到的东西收口。这比把中间
         # 过程当答案交出去强得多，也比只留一句抱怨强——用户要的是"已知什么、
         # 还缺什么"，不是"系统哪里不够用"。
+        to_model, to_user = (guard.describe(settle_reason, total_usage) if guard
+                             else (f"步数预算用完了（{max_steps} 步）", ""))
         settled = ""
         messages.append(HumanMessage(content=(
-            f"步数预算用完了（{max_steps} 步），现在起不能再调用任何工具。"
+            f"{to_model}，现在起不能再调用任何工具。"
             "基于已经查到的信息给出结论；明确说清哪些部分没有查到、"
             "结论因此有什么局限。不要编造没查到的数据。"
         )))
@@ -592,16 +675,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                                "没能给出结论")
             settled = ""
 
+        limited = {"reason": settle_reason} if guard else {}
         if settled:
             final_text = settled
-            hint = (
-                f"agent 用满了 {max_steps} 步，这个结论是基于已经查到的部分给出的。"
-                "要跑全请把节点上的「最大步数」调大；如果它大部分步数花在逐张表"
-                "查结构上，也可以在提示词里点明该查哪几张表。"
-            )
+            hint = f"{to_user}这个结论是基于已经查到的部分给出的。" if guard else legacy_hint(max_steps, True)
             # 和 step_limit 分开发：库里那些老事件的含义确实是"硬截断"，
             # 复用同一个 code 会把历史运行重新解释成另一回事
-            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit_settled")
+            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit_settled", **limited)
         else:
             # 收尾轮也没说出话。成果只能取模型自己说过的话——messages[-1] 很可能
             # 是一条 ToolMessage：工具的原始返回，或者串行模式下那句"本轮只执行了
@@ -613,15 +693,11 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  and not leaked_markup(text)),
                 "",
             )
-            hint = (
-                f"agent 用满了 {max_steps} 步还没给出结论。"
-                "把节点上的「最大步数」调大；如果它大部分步数花在逐张表查结构上，"
-                "也可以在提示词里点明该查哪几张表。"
-            )
+            hint = f"{to_user}收尾轮也没有给出结论。" if guard else legacy_hint(max_steps, False)
             # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
             # 一个没头没尾的答案，而不知道是被步数掐断的
             final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
-            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit")
+            ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit", **limited)
 
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
@@ -629,6 +705,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "steps": len(transcript),
         "tool_calls": transcript,
         "model": model_id,
+        # 没等到模型自己给结论就收了尾：下游校验失败时拿它说明根源（human.py）
+        **({"limited": settle_reason} if settle_reason else {}),
     }
     updates: dict[str, Any] = {
         "nodes": {ctx.node.id: result},

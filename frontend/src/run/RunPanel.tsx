@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Ban, Check, Hand, PenLine, Wrench } from 'lucide-react'
+import { Ban, Check, CheckCheck, Hand, PenLine, Wrench } from 'lucide-react'
 import { api } from '../api/client'
 import { useStudio } from '../store/studio'
 import { useCatalog } from '../store/catalog'
@@ -8,7 +8,7 @@ import { NODE_DEFS } from '../canvas/nodeDefs'
 import { StatusDot, useToast } from '../components/ui'
 import { useLocalActor } from '../lib/actor'
 import { formatDateTime, formatSpan, formatTime, parseServerTime } from '../lib/format'
-import { runClassLabel, runName } from '../lib/terms'
+import { runClassLabel, runName, TOOL_TRUST_TEXT } from '../lib/terms'
 import { useRunClock } from './useRunClock'
 import { Markdown } from './Markdown'
 import type { Approval } from '../types'
@@ -54,23 +54,39 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
   const age = created ? now - created.getTime() : undefined
   const stale = age != null && age > 24 * 3_600_000
   const approveMode = approval.mode === 'approve'
+  // 探索运行里 MCP / 自定义工具的审批才带它（契约：payload.trust_key）。没有就和以前一模一样
+  const trustKey: string | undefined = approveMode
+    ? (typeof payload.trust_key === 'string' && payload.trust_key) || undefined
+    : undefined
 
-  const decide = async (approved: boolean) => {
+  /**
+   * always：「始终允许」——批准这次，并让后端把这个工具设成门控把关。/approvals/{id}/decide
+   * 的请求体没有 always，所以走 /runs/{id}/resume，带上 approval_id 指明是哪一条
+   */
+  const decide = async (approved: boolean, always = false) => {
     setBusy(true)
     try {
-      await api.approvals.decide(approval.id, {
-        approved,
-        note,
-        ...(!approveMode ? { value } : {}),
-      })
+      if (always && trustKey) {
+        await api.runs.resume(approval.run_id, { approved: true, always: true, note }, approval.id)
+      } else {
+        await api.approvals.decide(approval.id, {
+          approved,
+          note,
+          ...(!approveMode ? { value } : {}),
+        })
+      }
       await refreshApprovals()
+      // 工具页的信任档跟着变了（后端设成了门控把关）：目录重拉一次，那边不显示旧档
+      if (always && trustKey) void useCatalog.getState().reload('tools')
       // 恢复后重新接上事件流：调用方给了 onResolved 就听它的
       if (onResolved) await onResolved(approval.run_id)
       else await attachRun(approval.run_id)
       // 驳回在"补充输入/编辑草稿"模式下会终止整个运行（图上没有 rejected 那条
       // 出口边），说清楚比笼统一句"已驳回"诚实
       toast(
-        approved
+        always && trustKey
+          ? TOOL_TRUST_TEXT.alwaysDone(trustKey)
+          : approved
           ? '已放行，运行继续'
           : approveMode ? '已驳回，走驳回那条出口' : '已驳回，本次运行终止',
         'ok',
@@ -158,6 +174,13 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         <button className="btn btn-primary flex-1 justify-center" disabled={busy} onClick={() => decide(true)}>
           <Check size={12} aria-hidden /> {approveMode ? '通过' : '提交'}
         </button>
+        {trustKey && (
+          <button className="btn flex-1 justify-center" disabled={busy} data-approval-always
+                  title={TOOL_TRUST_TEXT.alwaysHint(trustKey)} aria-describedby={`approval-always-${approval.id}`}
+                  onClick={() => decide(true, true)}>
+            <CheckCheck size={12} aria-hidden /> {TOOL_TRUST_TEXT.alwaysButton}
+          </button>
+        )}
         <button className="btn btn-danger flex-1 justify-center" disabled={busy} onClick={() => decide(false)}>
           <Ban size={12} aria-hidden /> {approveMode ? '驳回' : '驳回并终止'}
         </button>
@@ -168,6 +191,11 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
           ? '通过 → 接着往下跑；驳回 → 走「驳回」那条出口'
           : '提交 → 用你填的内容接着跑；驳回 → 这次运行到此终止'}
       </div>
+      {trustKey && (
+        <div id={`approval-always-${approval.id}`} className="mt-0.5 text-2xs leading-relaxed text-dim">
+          {TOOL_TRUST_TEXT.alwaysButton} → {TOOL_TRUST_TEXT.alwaysHint(trustKey)}
+        </div>
+      )}
       <div className="mt-1 flex items-center gap-1 text-2xs leading-relaxed"
            style={actor ? { color: 'var(--text-dim)' } : { color: 'var(--st-waiting)' }}>
         <PenLine size={10} aria-hidden className="shrink-0" />

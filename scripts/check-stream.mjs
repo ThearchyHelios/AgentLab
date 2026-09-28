@@ -308,10 +308,15 @@ async function open(query, { w = 1100, h = 800, reduced = false, name } = {}) {
   }
   return { page, errors }
 }
-const scrollState = (page) => page.evaluate(() => {
-  const el = document.querySelector('[data-stream-scroll]')
-  return { top: Math.round(el.scrollTop), max: Math.round(el.scrollHeight - el.clientHeight) }
-})
+// 先等滚动容器挂上：open() 只固定等 400ms，并行跑、机器忙的时候组件还没渲染出来
+// （check-all 分道并行后实测挂过一次：读 null 的 scrollTop）
+const scrollState = async (page) => {
+  await page.waitForSelector('[data-stream-scroll]', { timeout: 10_000 })
+  return page.evaluate(() => {
+    const el = document.querySelector('[data-stream-scroll]')
+    return { top: Math.round(el.scrollTop), max: Math.round(el.scrollHeight - el.clientHeight) }
+  })
+}
 await section('空态', async () => {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
   await page.goto(`${WEB}/preview.html?case=__none__`, { waitUntil: 'networkidle' })
@@ -357,6 +362,7 @@ await section('点开已完成轮次的执行过程：不算新进展、不拽�
   // 按需取回的历史步骤以前算进「N 条新进展」：没有任何运行在跑，底下却浮出「24 条新进展」
   for (const [n, pick, label] of [[1, 0, '单轮停在顶部'], [6, 2, '6 轮点开中间一轮']]) {
     const { page, errors } = await open(`expand=${n}`, { w: 1100, h: 700, name: `expand-${n}` })
+    await page.waitForSelector('[data-stream-scroll]', { timeout: 10_000 })
     const at = await page.evaluate((i) => {
       const el = document.querySelector('[data-stream-scroll]')
       const turn = document.querySelectorAll('[data-turn]')[i]
@@ -1646,6 +1652,198 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
 
   check('画布右栏没有运行时报错', errors.length === 0, errors.join(' | '))
   await ctx.close()
+})
+
+await section('逐段证据：带 _evidence 的成果（可点击证据第一期）', async () => {
+  // 报告文档和片段接口用夹具伪造（后端 compose_doc 真跑出来的，只用通用名），非 GET 一律拦掉
+  const { readFileSync } = await import('node:fs')
+  const fx = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
+  for (const [w, dense] of [[1100, false], [380, true]]) {
+    const page = await browser.newPage({ viewport: { width: w, height: 900 } })
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
+      const url = new URL(r.request().url())
+      if (r.request().method() !== 'GET') return r.abort()
+      const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+      if (seg) return r.fulfill({ json: fx.segments[seg[1]] ?? {} })
+      if (url.pathname === `/api/artifacts/${fx.doc_artifact}`) return r.fulfill({ json: { id: fx.doc_artifact, content: fx.doc } })
+      return r.continue()
+    })
+    const tag = dense ? '窄栏' : '宽栏'
+    await page.goto(`${WEB}/preview.html?syn=evidence${dense ? '&dense=1' : ''}`, { waitUntil: 'networkidle' })
+    await page.waitForSelector('[data-turn="evidence"] [data-evidence-doc]', { timeout: 6000 })
+    const turn = page.locator('[data-turn="evidence"]')
+    check(`${tag}：带证据的字段换成逐段文档，数字是可点的片段`, await turn.locator('[data-seg]').count() === 13)
+    check(`${tag}：出具横幅多一行计数`, (await turn.locator('[data-evidence-line]').innerText())
+      .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了'))
+    check(`${tag}：没有 _evidence 的那一轮不变`, await page.locator('[data-turn="evidence-legacy"] [data-seg]').count() === 0)
+    await turn.locator('[data-seg="s6"]').click()
+    await page.waitForSelector('[data-evidence-panel] [data-ev-substituted]')
+    const mode = await page.locator('[data-evidence-panel]').getAttribute('data-evidence-panel')
+    check(`${tag}：面板${dense ? '在栏内展开' : '从侧边弹出'}`, mode === (dense ? 'inline' : 'side'), mode)
+    const box = await page.evaluate(() => {
+      const el = document.querySelector('[data-stream-scroll]')
+      return { sw: el.scrollWidth, cw: el.clientWidth }
+    })
+    check(`${tag}：打开面板后流里没有横向滚动`, box.sw <= box.cw, JSON.stringify(box))
+    const copy = await turn.locator('button[aria-label="复制"]').count()
+    check(`${tag}：答案的复制 / 导出照常在`, copy > 0)
+    check(`${tag}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    if (SHOTS) {
+      for (const theme of ['dark', 'light']) {
+        await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await page.waitForTimeout(250)
+        await page.screenshot({ path: `${SHOTS}/stream-evidence-${dense ? 'dense' : 'wide'}-${theme}.png` })
+      }
+    }
+    await page.close()
+  }
+})
+
+await section('审批卡：始终允许（工具信任三档）', async () => {
+  // 探索运行里 MCP / 自定义工具的审批带 trust_key：「通过」旁边多一个「始终允许」，回复走
+  // POST /runs/{id}/resume，response 多带 always。不带 trust_key 的审批和以前一模一样。
+  // 真页面、真 store，工作流、审批、运行全用 page.route 伪造，写请求只记下来不落库
+  const WF_ID = 'fx-trust'
+  const RUN = 'fxtrust0001'
+  const GRAPH = {
+    nodes: [
+      { id: 'in', type: 'input', position: { x: 0, y: 0 }, data: { label: '问题', config: { fields: [{ name: 'q' }] } } },
+      { id: 'query', type: 'agent', position: { x: 300, y: 0 }, data: { label: '查档案', config: { tools: ['crm_lookup'] } } },
+      { id: 'out', type: 'output', position: { x: 620, y: 0 }, data: { label: '成果', config: {} } },
+    ],
+    edges: [{ id: 'e1', source: 'in', target: 'query' }, { id: 'e2', source: 'query', target: 'out' }],
+  }
+  const WF = { id: WF_ID, name: '信任检查', description: '', graph: GRAPH, tags: [], version: 1, status: 'draft',
+    published_version: null, run_count: 0, created_at: '2026-09-28T00:00:00Z', updated_at: '2026-09-28T00:00:00Z' }
+  const approvalOf = (tool, trustKey) => ({ id: `ap-${tool}`, run_id: RUN, node_id: 'query', mode: 'approve', title: `Agent 想调用工具 ${tool}`,
+    payload: { kind: 'tool_approval', node_id: 'query', tool, args: { id: 'C-1' }, title: `是否允许调用 ${tool}？`,
+      ...(trustKey ? { trust_key: trustKey } : {}) },
+    status: 'pending', response: {}, created_at: new Date(Date.now() - 30_000).toISOString(),
+    workflow_name: '信任检查', node_label: '查档案', run_class: 'exploratory' })
+
+  const setup = async (approval) => {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' })
+    await ctx.addInitScript(() => { try { localStorage.setItem('agentlab_actor', '张工') } catch { /* 隐私窗口 */ } })
+    const page = await ctx.newPage()
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+    const writes = []
+    const toolHits = []
+    let pending = true
+    await page.route(/\/api\/workflows(\?.*)?$/, async (route) => {
+      if (route.request().method() !== 'GET') return json(route, { detail: '检查脚本不写库' }, 409)
+      const real = await (await route.fetch()).json().catch(() => [])
+      return json(route, [WF, ...(Array.isArray(real) ? real : [])])
+    })
+    await page.route(/\/api\/workflows\/fx-trust(\/.*)?(\?.*)?$/, (route) =>
+      route.request().method() === 'GET' ? json(route, WF) : json(route, { detail: '检查脚本不写库' }, 409))
+    await page.route(/\/api\/conversations(\/.*)?(\?.*)?$/, (route) =>
+      route.request().method() === 'GET' ? json(route, []) : json(route, { id: 'fx-conv-trust', kind: 'canvas', title: '', turns: [] }))
+    await page.route(/\/api\/tools(\?.*)?$/, (route) => { toolHits.push(Date.now()); return route.continue() })
+    await page.route(/\/api\/approvals(\/.*)?(\?.*)?$/, (route) => {
+      const req = route.request()
+      if (req.method() === 'GET') return json(route, pending ? [approval] : [])
+      writes.push({ url: new URL(req.url()).pathname, body: req.postDataJSON(), actor: req.headers()['x-actor'] ?? '' })
+      return json(route, { detail: '检查脚本不写库' }, 409)
+    })
+    await page.route(/\/api\/runs(\/.*)?(\?.*)?$/, (route) => {
+      const req = route.request()
+      const path = new URL(req.url()).pathname
+      if (req.method() !== 'GET') {
+        writes.push({ url: path, body: req.postDataJSON(), actor: req.headers()['x-actor'] ?? '' })
+        if (path.endsWith(`${RUN}/resume`)) {
+          pending = false
+          return json(route, { id: RUN, workflow_id: WF_ID, status: 'running', input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory' })
+        }
+        return json(route, { detail: '检查脚本不写库' }, 409)
+      }
+      if (path.includes(`${RUN}/events`)) return json(route, [])
+      if (path.includes(RUN)) {
+        return json(route, { id: RUN, workflow_id: WF_ID, status: pending ? 'interrupted' : 'running', input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory' })
+      }
+      return route.continue()
+    })
+    await page.goto(`${WEB}/studio/${WF_ID}`, { waitUntil: 'networkidle' })
+    await page.waitForFunction((id) => window.__studio?.getState().workflow?.id === id, WF_ID, { timeout: 15000 })
+    const now = Date.now() / 1000
+    const ev = (seq, type, node_id, data = {}, t = 0) => ({ seq, type, node_id, data, ts: now - 30 + t })
+    const tool = approval.payload.tool
+    const WAIT = [
+      ev(1, 'run.started', null, { nodes: 3 }, 0),
+      ev(2, 'node.started', 'in', { node_type: 'input', label: '问题' }, 0.1),
+      ev(3, 'node.finished', 'in', { duration_ms: 3, preview: { q: 'x' } }, 0.2),
+      ev(4, 'node.started', 'query', { node_type: 'agent', label: '查档案' }, 0.3),
+      ...(approval.payload.trust_key
+        ? [ev(5, 'tool.gated', 'query', { tool, verdict: 'escalate', reason: '要导出整张客户表', model: 'tiny-1', duration_ms: 640 }, 0.9)] : []),
+      ev(6, 'human.requested', 'query', { mode: 'approve', tool, args: { id: 'C-1' }, title: `Agent 想调用工具 ${tool}`,
+        ...(approval.payload.trust_key ? { trust_key: approval.payload.trust_key } : {}) }, 1.0),
+      ev(7, 'run.interrupted', 'query', { payload: approval.payload }, 1.1),
+    ]
+    await page.evaluate((run) => window.__studio.setState({ run: { id: run, workflow_id: 'fx-trust', status: 'queued', input: {},
+      output: {}, error: null, usage: {}, run_class: 'exploratory', version: null }, streaming: true, unsubscribe: () => {} }), RUN)
+    await page.evaluate((l) => { const s = window.__studio.getState(); for (const e of l) s.applyEvent(e) }, WAIT)
+    await page.waitForTimeout(700)
+    return { ctx, page, errors, writes, toolHits, card: page.locator('.sheet-in [data-approval]').first() }
+  }
+
+  {
+    const { ctx, page, errors, writes, toolHits, card } = await setup(approvalOf('crm_lookup', 'crm_lookup'))
+    const buttons = await card.locator('button').allInnerTexts()
+    check('带 trust_key：「通过」旁边有「始终允许」', buttons.map((b) => b.trim()).join('|').includes('通过|始终允许|驳回'), buttons.join(' | '))
+    const always = card.getByRole('button', { name: '始终允许' })
+    const title = await always.getAttribute('title')
+    check('……悬停说明：批准这次，并把工具设为「始终允许 · 门控把关」，可以在工具页改回',
+      !!title?.includes('批准这次，并把 crm_lookup 设为「始终允许 · 门控把关」') && title.includes('由门控模型逐次把关') && title.includes('可以在工具页改回'), title)
+    const note = await card.innerText()
+    check('……卡上常显同一句旁注，不只藏在悬停里', note.includes('始终允许 → 批准这次') && note.includes('以后的运行不再问你'))
+    check('……时间线上写着门控为什么拦下', (await page.locator('.sheet-in').first().innerText()).includes('门控拦下 crm_lookup，交给人工审批：要导出整张客户表'))
+    if (SHOTS) {
+      for (const theme of ['dark', 'light']) {
+        await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await page.waitForTimeout(250)
+        await card.screenshot({ path: `${SHOTS}/stream-approval-always-${theme}.png` })
+        await page.locator('.sheet-in').first().screenshot({ path: `${SHOTS}/stream-approval-always-panel-${theme}.png` })
+      }
+      await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+    }
+    await card.getByLabel('备注').fill('只查一条，放行')
+    const hitsBefore = toolHits.length
+    await always.click()
+    await page.waitForTimeout(700)
+    const resume = writes.find((w) => w.url.endsWith(`/runs/${RUN}/resume`))
+    check('点了发 POST /runs/{id}/resume，response 是 {approved: true, always: true, note}',
+      resume?.body?.response?.approved === true && resume.body.response.always === true && resume.body.response.note === '只查一条，放行',
+      JSON.stringify(resume?.body ?? writes.map((w) => w.url)))
+    check('……带 approval_id 指明回复的是哪一条', resume?.body?.approval_id === 'ap-crm_lookup', resume?.body?.approval_id)
+    check('……带着署名，不另走 /approvals/…/decide', decodeURIComponent(resume?.actor ?? '') === '张工'
+      && !writes.some((w) => w.url.includes('/decide')), writes.map((w) => w.url).join(', '))
+    const toastText = await page.locator('[aria-live]').allInnerTexts().then((t) => t.join(' ')).catch(() => '')
+    check('……回执说运行继续、以后由门控模型把关', toastText.includes('以后由门控模型把关'), toastText.replace(/\s+/g, ' ').slice(0, 120))
+    check('……工具目录重拉了一次（工具页跟着显示门控把关）', toolHits.length > hitsBefore, `${hitsBefore} → ${toolHits.length}`)
+    check('……审批卡收起来了', await page.locator('.sheet-in [data-approval]').count() === 0)
+    check('没有运行时报错', errors.length === 0, errors.join(' | '))
+    await ctx.close()
+  }
+
+  {
+    // 内置工具的审批（不带 trust_key）：和以前一模一样
+    const { ctx, errors, writes, card } = await setup(approvalOf('file_write', null))
+    const buttons = (await card.locator('button').allInnerTexts()).map((b) => b.trim())
+    check('不带 trust_key：没有「始终允许」，按钮还是通过 / 驳回', buttons.join('|').includes('通过|驳回') && !buttons.includes('始终允许'), buttons.join(' | '))
+    const text = await card.innerText()
+    check('……卡上不提始终允许和门控', !text.includes('始终允许') && !text.includes('门控'), text.replace(/\s+/g, ' ').slice(0, 160))
+    check('……批了会怎样还是原来那句', text.includes('通过 → 接着往下跑；驳回 → 走「驳回」那条出口'))
+    await card.getByRole('button', { name: '通过' }).click()
+    await ctx.pages()[0].waitForTimeout(400)
+    const decide = writes.find((w) => w.url.includes('/decide'))
+    check('……「通过」照旧走 /approvals/…/decide，请求体里没有 always', !!decide && decide.body?.approved === true && !('always' in (decide.body ?? {}))
+      && !writes.some((w) => w.url.endsWith('/resume')), JSON.stringify(decide?.body ?? writes.map((w) => w.url)))
+    check('没有运行时报错', errors.length === 0, errors.join(' | '))
+    await ctx.close()
+  }
 })
 
 await browser.close()
