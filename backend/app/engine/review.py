@@ -91,6 +91,10 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_no_evidence": ("report_no_evidence", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),
+    # agent 的结构化字段：模型报的值和查询快照对不上（已按快照取值），或者出处核对不了
+    # （记成空值，不兜底成 0）。答案能用，缺口要说清是哪一种
+    "agent_field_mismatch": ("agent_field_mismatch", DEGRADED),
+    "agent_field_unverified": ("agent_field_unverified", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。

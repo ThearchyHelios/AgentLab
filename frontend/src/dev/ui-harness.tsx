@@ -25,6 +25,7 @@ import * as evidence from '../lib/evidence'
 import { EvidenceDoc, EvidenceField } from '../run/EvidenceDoc'
 import { Markdown } from '../run/Markdown'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
+import evidenceQuery from '../run/__tests__/evidence-query.json'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
 import type { EvidenceDocData } from '../types'
 import '../index.css'
@@ -185,6 +186,8 @@ function DatasourceConsumers() {
 }
 
 const EV_DOC = evidenceFixture.doc as unknown as EvidenceDocData
+/** 第二期：查询单元格、整表、口径卡来源（evidence-query.json，compose_doc 真跑出来的） */
+const EV_QUERY = evidenceQuery.doc as unknown as EvidenceDocData
 const EV_LEGACY = evidenceFixture.legacy
 /** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
 const LEGACY_LOOSE = {
@@ -253,6 +256,19 @@ function EvidenceOnly() {
           </div>
         </div>
         <EvidenceDemo />
+        {/*
+          第二期：报告直接引用查询单元格、整表，口径卡的输入核对到 agent 字段和查询快照。
+          片段接口由 check-evidence 用 page.route 伪造（按 runId 认出这一份夹具）
+        */}
+        <div className="flex flex-col gap-4" id="evidence-query-demo">
+          <div id="evidence-query" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">查询单元格、整表、口径卡来源</div>
+            <EvidenceDoc doc={EV_QUERY} artifact={evidenceQuery.doc_artifact} runId={evidenceQuery.run_id} label="answer" tally />
+          </div>
+          <div id="evidence-query-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_QUERY} artifact={evidenceQuery.doc_artifact} runId={evidenceQuery.run_id} label="answer" dense tally />
+          </div>
+        </div>
         <div id="evidence-long" className="rounded-lg border p-3">
           <div className="mb-1 text-2xs text-faint">长报告：{EV_LONG.blocks.length} 块，块级 content-visibility，超过 3000 字先折叠</div>
           <EvidenceDoc doc={EV_LONG} label="长报告" tally />
@@ -544,6 +560,7 @@ function Harness() {
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
   lib: { format, status, keys, terms, errors, explain, health, actor, validation, evidence },
   evidenceFixture,
+  evidenceQuery,
 }
 
 createRoot(document.getElementById('root')!).render(

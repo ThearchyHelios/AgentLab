@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -9,6 +10,7 @@ from langchain_core.tools import BaseTool
 from langgraph.func import task
 from sqlalchemy import select
 
+from app.core import artifact_store
 from app.core.config import settings
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
@@ -16,6 +18,8 @@ from app.db.base import SessionLocal
 from app.db.models import Skill
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.evidence import cell_eid, ledger_enabled, make_eid, next_exec, query_entry_fields
+from app.engine.expressions import CellError, cell_value, column_kind, locate_cell, numeric_text, same_value
 from app.engine.guards import FALLBACK_CONTEXT, Guard, legacy_hint, node_limits
 from app.engine.replay import ask, once
 from app.engine.state import GraphState, message_text, template_context, thinking_text
@@ -36,6 +40,7 @@ from app.providers.factory import (
     bind_tools_safely,
     get_chat_model,
 )
+from app.tools.datasource import QUERY_PREFIX
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -407,6 +412,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     messages = await _build_messages(state, ctx)
     # 护栏（engine/guards.py）。None 是升级前发起的运行：默认 12 步、没有别的护栏，和以前一样
     guard = _guard(ctx, model_id)
+    # 证据台账、工具结果前的编号、cite_fields：升级前发起的运行一样都不加（见 evidence.ledger_enabled）
+    evidence_on = ledger_enabled(ctx.run)
+    exec_no = next_exec(state, ctx.node.id)
+    #: 本节点查成功的库：编号 Q1… 只在本节点内有效，cite_fields 抽取靠它找快照
+    queries: list[dict[str, Any]] = []
+    #: 要记进证据台账的条目，按调用顺序
+    entries: list[dict[str, Any]] = []
     max_steps = (guard.limits.max_steps if guard
                  else min(int(ctx.cfg("max_steps", 12) or 12), settings.max_agent_steps))
     total_usage: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
@@ -479,6 +491,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 snapshot_id = None
+        # 查库成功时工具交回的 JSON 里带着查询快照的工件 id：记进返回值（进 checkpoint，重放拿到的
+        # 是同一份）和 tool.end（在封存范围内，证据接口从这里出发找快照）。只认数据源工具：那个 id 是
+        # 我们自己落的；MCP、自定义工具的文字来自外面，拼一个同样形状的 JSON 就能把任意快照塞进封存范围
+        query = query_entry_fields(content) if evidence_on and ok and name.startswith(QUERY_PREFIX) else None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -486,9 +502,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             duration_ms=elapsed,
             preview=content[:2000],
             artifact=snapshot_id,
+            **({"query_artifact": query["artifact"]} if query else {}),
             **extra,
         )
-        return {"content": content, "ok": ok, "duration_ms": elapsed}
+        outcome: dict[str, Any] = {"content": content, "ok": ok, "duration_ms": elapsed}
+        if evidence_on:
+            outcome.update(snapshot=snapshot_id, query_artifact=query["artifact"] if query else None)
+        return outcome
 
     @task
     async def gate_step(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
@@ -498,6 +518,30 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                               task=node_task(ctx.config))
         ctx.emit(EventType.TOOL_GATED, tool=name, call_id=call_id, **gate.event())
         return {"allowed": gate.allowed, **gate.usage}
+
+    @task
+    async def extract_step(payload: list[BaseMessage], schema: dict[str, Any]) -> dict[str, Any]:
+        # cite_fields 的结构化抽取：进 checkpoint，节点重放时不再调用、不再计费。失败也在这里收住、
+        # 作为结果返回——agent 的结论还在，字段记空值、发警告，而不是把整个节点赔进去。
+        # thinking 关掉：结构化输出靠强制工具调用，和思考模式不兼容，抽取也用不着思考
+        spec = model_spec.model_copy(update={
+            "thinking": "off", "max_tokens": max(int(ctx.cfg("max_tokens") or 0), 4096)})
+        started = time.perf_counter()
+        ctx.emit(EventType.LLM_START, model=model_id, structured=True, purpose="cite_fields",
+                 message_count=len(payload))
+        try:
+            async with SessionLocal() as session:
+                extractor, _ = await get_chat_model(session, spec)
+            got = await extractor.with_structured_output(schema, include_raw=True).ainvoke(payload)
+        except Exception as e:  # noqa: BLE001
+            ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                     duration_ms=int((time.perf_counter() - started) * 1000), error=describe_exception(e))
+            return {"error": f"结构化抽取没跑成：{explain_model_error(e, model_id)}"}
+        raw, parsed = _split_structured(got)
+        usage = _usage_of(raw if raw is not None else AIMessage(content=""), model_id)
+        ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                 duration_ms=int((time.perf_counter() - started) * 1000), **usage)
+        return {"parsed": parsed, **usage}
 
     final_text = ""
     #: 模型把工具调用写成了文字：纠正过一次了没有
@@ -610,8 +654,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
             outcome = await tool_step(step, name, args, call_id)
             content = outcome["content"]
-            transcript.append({"tool": name, "args": args, "ok": outcome["ok"],
-                               "duration_ms": outcome["duration_ms"], "result": content[:4000]})
+            record = {"tool": name, "args": args, "ok": outcome["ok"],
+                      "duration_ms": outcome["duration_ms"], "result": content[:4000]}
+            if evidence_on:
+                # 编号只取决于 tool_step 的返回值（重放时取自 checkpoint），重放出来的还是这一套
+                content = _record_call(ctx.node.id, exec_no, call_id, name, args, outcome, record,
+                                       queries, entries)
+            transcript.append(record)
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
             if guard:
                 guard.record(step, name, args, outcome["ok"], content)
@@ -699,6 +748,21 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
             ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit", **limited)
 
+    cited: tuple[dict[str, Any], dict[str, Any]] | None = None
+    schema = _output_schema(ctx) if evidence_on and ctx.cfg("cite_fields") is True else None
+    if schema is not None and (fields := cited_fields(schema)):
+        # 结构化抽取只能追加在循环之后：循环里的 task 按调用位置从 checkpoint 取回，插一个进去，
+        # 停在审批上的运行恢复时位置就错开了
+        extracted: dict[str, Any] = {"error": "这个节点没有查成功的库，没有可以核对出处的数据"}
+        if queries:
+            extracted = await extract_step(_extract_messages(final_text, queries, fields), cited_schema(schema))
+            for key in ("input_tokens", "output_tokens", "calls"):
+                total_usage[key] += int(extracted.get(key) or 0)
+            total_usage["cost_usd"] = round(total_usage["cost_usd"] + float(extracted.get("cost_usd") or 0), 6)
+        cited = verify_cited_fields(extracted, fields, queries)
+        for code, message, names in _field_warnings(*cited, extracted.get("error")):
+            await once(ctx, EventType.LOG, level="warn", code=code, message=message, fields=names)
+
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
         "text": final_text,
@@ -708,13 +772,405 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 没等到模型自己给结论就收了尾：下游校验失败时拿它说明根源（human.py）
         **({"limited": settle_reason} if settle_reason else {}),
     }
+    if cited is not None:
+        result["data"], result["data_evidence"] = cited
     updates: dict[str, Any] = {
         "nodes": {ctx.node.id: result},
         "usage": total_usage,
     }
+    if entries:
+        updates["evidence"] = entries
     if ctx.cfg("emit_message", True):
         updates["messages"] = [AIMessage(content=final_text or "(空)")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
-        updates["vars"] = {var_name: final_text}
+        # 开了 cite_fields 的，变量里是核对过的 data（值以快照为准），下游口径卡按字段取
+        updates["vars"] = {var_name: cited[0] if cited is not None else final_text}
     return updates
+
+
+# --------------------------------------------------------------------------
+# 证据台账与 cite_fields：agent 查到的数怎么变成能核对的证据
+# --------------------------------------------------------------------------
+
+
+def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict[str, Any],
+                 outcome: dict[str, Any], record: dict[str, Any], queries: list[dict[str, Any]],
+                 entries: list[dict[str, Any]]) -> str:
+    """把一次执行过的工具调用记进台账、调用记录和本节点的查询清单，返回给模型看的内容。
+
+    查库成功的结果前面加一行「【证据 Q1】」：模型在循环里就知道每次查询的编号，cite_fields
+    抽取时照这个编号写出处。编号只在本节点内有效；报告目录里的 Q1… 按全局台账另编，两边
+    靠工件 id 对应，不靠编号。
+    """
+    content = outcome["content"]
+    record["call_id"] = call_id
+    snapshot, artifact = outcome.get("snapshot"), outcome.get("query_artifact")
+    if snapshot:
+        record["via"] = snapshot
+        entries.append({"kind": "tool", "node_id": node_id, "exec": exec_no, "artifact": snapshot,
+                        "call_id": call_id, "tool": name})
+    if not artifact or not name.startswith(QUERY_PREFIX):
+        return content
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = None
+    fields = query_entry_fields(data)
+    if fields is None:
+        return content
+    alias = f"Q{len(queries) + 1}"
+    record.update(alias=alias, artifact=artifact)
+    entries.append({"kind": "query", "node_id": node_id, "exec": exec_no, "artifact": artifact,
+                    **({"via": snapshot} if snapshot else {}), "call_id": call_id, "tool": name,
+                    "source": fields["source"], "columns": fields["columns"], "rows": fields["rows"],
+                    "truncated": fields["truncated"]})
+    queries.append({"alias": alias, "call_id": call_id, "tool": name, "sql": str(args.get("sql") or ""),
+                    "artifact": artifact, "via": snapshot, "columns": fields["columns"],
+                    "rows": data.get("rows") or [], "truncated": fields["truncated"]})
+    return f"【证据 {alias}】\n{content}"
+
+
+def _output_schema(ctx: NodeContext) -> dict[str, Any] | None:
+    """节点的 output_schema（对象形状）。画布里存成 JSON 文本的也认。"""
+    schema = ctx.cfg("output_schema")
+    if isinstance(schema, str) and schema.strip():
+        try:
+            schema = json.loads(schema)
+        except ValueError:
+            return None
+    if isinstance(schema, dict) and (schema.get("type") == "object" or "properties" in schema):
+        return schema
+    return None
+
+
+def _is_object(schema: Any) -> bool:
+    return isinstance(schema, dict) and (schema.get("type") == "object" or "properties" in schema)
+
+
+def cited_fields(schema: dict[str, Any], prefix: str = "") -> list[tuple[str, dict[str, Any]]]:
+    """output_schema 里要标出处的字段：(点号路径, 字段的 schema)，按声明顺序，嵌套对象展开。"""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for key, sub in (schema.get("properties") or {}).items():
+        path = f"{prefix}{key}"
+        if _is_object(sub):
+            out.extend(cited_fields(sub, f"{path}."))
+        else:
+            out.append((path, sub if isinstance(sub, dict) else {}))
+    return out
+
+
+#: 一个值在哪次查询的哪一格
+_FROM_CELL: dict[str, Any] = {
+    "type": "object",
+    "description": "这个值在哪次查询的哪一格：call 是【证据 Qn】里的编号，row 是行号（从 0 数），column 是列名",
+    "properties": {"call": {"type": "string"}, "row": {"type": "integer"}, "column": {"type": "string"}},
+    "required": ["call", "row", "column"],
+}
+
+
+def _is_array(schema: Any) -> bool:
+    return isinstance(schema, dict) and schema.get("type") == "array"
+
+
+def _row_columns(schema: dict[str, Any]) -> list[str] | None:
+    """数组里是对象时，对象的字段（都得是标量）；不是对象返回 None。"""
+    items = schema.get("items")
+    if not _is_object(items):
+        return None
+    return list((items.get("properties") or {}).keys())
+
+
+def _from_rows(schema: dict[str, Any]) -> dict[str, Any]:
+    """数组字段按行映射：一段连续的行，标量数组对应一列，对象数组的每个字段各对应一列。"""
+    fields = _row_columns(schema)
+    where = ({"columns": {"type": "object", "description": "对象的每个字段取自哪一列：{字段: 列名}",
+                          "properties": {f: {"type": "string"} for f in fields}, "required": fields}}
+             if fields is not None else {"column": {"type": "string"}})
+    return {"type": "object",
+            "description": "这组值在哪次查询的哪几行：call 是【证据 Qn】里的编号，rows 写行号范围（从 0 数，"
+                           "如 0-4，数组第 k 个元素就是第 起始+k 行）",
+            "properties": {"call": {"type": "string"}, "rows": {"type": "string"}, **where},
+            "required": ["call", "rows", *where]}
+
+
+def cited_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """抽取用的 schema：每个标量字段改写成 {value, from}，查不到时两个都是 null。
+
+    数组字段整个是一个 {value, from}：from 写一段连续的行（rows: "0-4"）和对应的列。
+    """
+
+    def rewrite(node: dict[str, Any]) -> dict[str, Any]:
+        if _is_object(node):
+            props = node.get("properties") or {}
+            return {"type": "object", **({"description": node["description"]} if node.get("description") else {}),
+                    "properties": {k: rewrite(v if isinstance(v, dict) else {}) for k, v in props.items()},
+                    "required": list(props)}
+        source = _from_rows(node) if _is_array(node) else _FROM_CELL
+        return {"type": "object",
+                "properties": {"value": {"anyOf": [node, {"type": "null"}]},
+                               "from": {"anyOf": [source, {"type": "null"}]}},
+                "required": ["value", "from"]}
+
+    # 走工具调用的结构化输出要求函数名只含字母、数字、下划线
+    return {"title": "cited_fields", **rewrite(schema)}
+
+
+EXTRACT_SYSTEM = (
+    "你是数据抽取员：把智能体查到的数据按给定结构填好，每个字段都写出处。\n"
+    "- value 是字段的值；from 写它在哪次查询的哪一格：call 是【证据 Qn】里的编号，row 是行号（从 0 数），"
+    "column 是列名。\n"
+    "- 只能用下面查询结果里真实出现的值。查不到就把 value 和 from 都填 null，禁止估算，"
+    "禁止用 0 或空字符串代替没查到的值。\n"
+    "- 不要做计算：比率、增幅、合计这类要算出来的量填 null，交给口径卡去算。"
+)
+#: 抽取提示里每次查询最多列出几行、整段最多多少字
+_DIGEST_ROWS, _DIGEST_BUDGET = 50, 16000
+
+
+def _digest(queries: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for q in queries:
+        lines = [f"【证据 {q['alias']}】{q['tool']}"]
+        if q["sql"]:
+            lines.append(f"SQL：{q['sql'][:300]}")
+        columns = q["columns"]
+        lines.append(f"列：{', '.join(columns)}")
+        for r, record in enumerate(q["rows"][:_DIGEST_ROWS]):
+            values = record if isinstance(record, list) else [record.get(c) for c in columns] \
+                if isinstance(record, dict) else [record]
+            lines.append(f"r{r}：" + "，".join(f"{c}={json.dumps(v, ensure_ascii=False, default=str)}"
+                                              for c, v in zip(columns, values)))
+        if len(q["rows"]) > _DIGEST_ROWS:
+            lines.append(f"…共 {len(q['rows'])} 行，只列出前 {_DIGEST_ROWS} 行")
+        elif not q["rows"]:
+            lines.append("（0 行）")
+        parts.append("\n".join(lines))
+    text = "\n\n".join(parts)
+    return text if len(text) <= _DIGEST_BUDGET else text[:_DIGEST_BUDGET] + "\n…（查询结果太长，后面的省略了）"
+
+
+def _extract_messages(final_text: str, queries: list[dict[str, Any]],
+                      fields: list[tuple[str, dict[str, Any]]]) -> list[BaseMessage]:
+    wanted = "\n".join(
+        f"- {path}（{sub.get('type') or '任意'}）" + (f"：{sub['description']}" if sub.get("description") else "")
+        for path, sub in fields)
+    return [
+        SystemMessage(content=EXTRACT_SYSTEM),
+        HumanMessage(content=(
+            f"智能体的结论（只作参考，数以查询结果为准）：\n{final_text or '（没有结论）'}\n\n"
+            f"查询结果：\n{_digest(queries)}\n\n要填的字段：\n{wanted}"
+        )),
+    ]
+
+
+def _split_structured(got: Any) -> tuple[BaseMessage | None, Any]:
+    """with_structured_output(include_raw=True) 的结果拆成 (原始回复, 解析结果)。
+
+    不认 include_raw 的模型（比如 mock）直接给解析结果。
+    """
+    if isinstance(got, dict) and isinstance(got.get("raw"), BaseMessage) and "parsed" in got:
+        raw, parsed = got["raw"], got["parsed"]
+    else:
+        raw, parsed = None, got
+    if parsed is not None and not isinstance(parsed, (dict, list)) and hasattr(parsed, "model_dump"):
+        parsed = parsed.model_dump()
+    return raw, parsed
+
+
+def _typed(raw: Any, schema: Any, kind: str | None = None) -> Any:
+    """快照里的一格 → 按字段声明的类型给出的值（data 里放的就是它）。
+
+    数据源把 DECIMAL 落成文本，小数位为 0 的是 "45678"：声明成 number / integer 的换成数，下游口径卡
+    才能拿它做除法；声明成 string 的原样是文本，"2026" 不会变成 2026。没声明类型的按 cell_value，
+    kind（查询时记下的列类型）是 text 的原样是文本；老快照没记类型就按值猜。
+    声明成 integer 而快照里是 3.0 这样的整值，给 3；是 45678.5 就照实给 45678.5，不替它取整。
+    """
+    declared = schema.get("type") if isinstance(schema, dict) else None
+    types = {declared} if isinstance(declared, str) else set(declared) if isinstance(declared, list) else set()
+    value = cell_value(raw, kind)
+    if types & {"number", "integer"}:
+        loose = numeric_text(raw, loose=True)
+        value = value if loose is None else loose
+        if "integer" in types and isinstance(value, float) and value.is_integer():
+            value = int(value)
+    elif "string" in types and isinstance(raw, str):
+        value = raw
+    return value
+
+
+def _dig(data: Any, path: str) -> Any:
+    for key in path.split("."):
+        data = data.get(key) if isinstance(data, dict) else None
+    return data
+
+
+def _plant(data: dict[str, Any], path: str, value: Any) -> None:
+    *heads, last = path.split(".")
+    for key in heads:
+        data = data.setdefault(key, {})
+    data[last] = value
+
+
+def verify_cited_fields(extracted: dict[str, Any], fields: list[tuple[str, dict[str, Any]]],
+                        queries: list[dict[str, Any]], loader: Any = None
+                        ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """确定性核对：按 from 取出快照里的那一格，以快照为准。返回 (data, data_evidence)。
+
+    每个字段的结果是四种之一：
+    - verified：和模型报的值一致，取快照的值
+    - mismatch：不一致，取快照的值，model_value 留着模型报的
+    - unresolved：出处取不到（没有这次查询、行列不存在、快照取不回来），值为 None，reason 写原因
+    - missing：模型说查不到（from 为 null），值为 None
+    值为 None 就是 None：永远不兜底成 0，也不采信没有出处的模型值。
+    """
+    load = loader or artifact_store.load
+    by_alias = {q["alias"]: q for q in queries}
+    snapshots: dict[str, tuple[Any, str | None]] = {}
+
+    def snapshot_of(q: dict[str, Any]) -> tuple[Any, str | None]:
+        if q["artifact"] not in snapshots:
+            try:
+                content = load(q["artifact"])
+                snapshots[q["artifact"]] = (content, None if content is not None else "查询快照取不回来")
+            except ValueError:
+                snapshots[q["artifact"]] = (None, "查询快照和哈希对不上，疑似被改过")
+        return snapshots[q["artifact"]]
+
+    parsed = extracted.get("parsed")
+    failed = extracted.get("error") or (None if isinstance(parsed, dict) else "抽取结果不是一个对象")
+    data: dict[str, Any] = {}
+    evidence: dict[str, Any] = {}
+    for path, sub in fields:
+        _plant(data, path, None)
+        if failed:
+            evidence[path] = {"status": "unresolved", "reason": str(failed)}
+            continue
+        node = _dig(parsed, path)
+        if not isinstance(node, dict) or "from" not in node:
+            evidence[path] = {"status": "unresolved", "reason": "抽取结果里没有按 {value, from} 写出这个字段"}
+            continue
+        told, source = node.get("value"), node.get("from")
+        if source is None:
+            evidence[path] = {"ref": None, "status": "missing",
+                              **({"model_value": told} if told is not None else {})}
+            continue
+        if _is_array(sub):
+            value, evidence[path] = _verify_rows(sub, told, source, by_alias, snapshot_of)
+            _plant(data, path, value)
+            continue
+        call = str(source.get("call") or "").strip() if isinstance(source, dict) else ""
+        row, column = (source.get("row"), source.get("column")) if isinstance(source, dict) else (None, None)
+        if isinstance(row, str) and row.strip().isdigit():
+            row = int(row)      # 有的模型把整数写成 "0"：意思没有歧义
+        elif isinstance(row, float) and row.is_integer():
+            row = int(row)
+        ref = f"{call}.r{row}.{column}" if call and isinstance(row, int) and column not in (None, "") else None
+        q = by_alias.get(call)
+        if q is None:
+            evidence[path] = {"ref": ref, "call": call, "status": "unresolved",
+                              "reason": f"本节点没有 {call or '（空）'} 这次查询，能用的是 "
+                                        + ("、".join(by_alias) or "（没有）")}
+            continue
+        base = {"ref": ref, "call": call, "artifact": q["artifact"], "via": q["via"]}
+        content, why = snapshot_of(q)
+        if why:
+            evidence[path] = {**base, "status": "unresolved", "reason": f"{call} 的{why}"}
+            continue
+        try:
+            raw, name = locate_cell(content, row, column)
+        except CellError as e:
+            evidence[path] = {**base, "status": "unresolved", "reason": f"{call} {e}"}
+            continue
+        truth = _typed(raw, sub, column_kind(content, name))
+        locator = {"row": row, "column": name}
+        cited = {**base, "ref": f"{call}.r{row}.{name}", "locator": locator,
+                 "eid": cell_eid(q["artifact"], row, name)}
+        if same_value(told, truth):
+            cited["status"] = "verified"
+        else:
+            cited.update(status="mismatch", model_value=told)
+        _plant(data, path, truth)
+        evidence[path] = cited
+    return data, evidence
+
+
+_ROWS = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
+
+
+def _verify_rows(schema: dict[str, Any], told: Any, source: Any, by_alias: dict[str, dict[str, Any]],
+                 snapshot_of: Any) -> tuple[Any, dict[str, Any]]:
+    """数组字段：按 from 的行范围和列从快照里取出整组值，以快照为准。返回 (值, 出处)。"""
+    if not isinstance(source, dict):
+        return None, {"status": "unresolved", "reason": "数组的 from 要写成 {call, rows, column（或 columns）}"}
+    call = str(source.get("call") or "").strip()
+    span = _ROWS.match(str(source.get("rows") or ""))
+    fields = _row_columns(schema)
+    wanted = source.get("columns") if fields is not None else source.get("column")
+    if fields is not None and not (isinstance(wanted, dict) and all(isinstance(wanted.get(f), str) for f in fields)):
+        return None, {"call": call, "status": "unresolved", "reason": "对象数组要写 columns：每个字段取自哪一列"}
+    if fields is None and not isinstance(wanted, str):
+        return None, {"call": call, "status": "unresolved", "reason": "数组要写 column：这组值取自哪一列"}
+    if span is None:
+        return None, {"call": call, "status": "unresolved", "reason": "rows 要写成 0-4 这样的行号范围（从 0 数）"}
+    first, last = int(span.group(1)), int(span.group(2) or span.group(1))
+    q = by_alias.get(call)
+    if q is None or last < first:
+        reason = (f"rows 要从小到大写，写的是 {source.get('rows')}" if q is not None else
+                  f"本节点没有 {call or '（空）'} 这次查询，能用的是 " + ("、".join(by_alias) or "（没有）"))
+        return None, {"call": call, "status": "unresolved", "reason": reason}
+    base = {"call": call, "artifact": q["artifact"], "via": q["via"]}
+    content, why = snapshot_of(q)
+    if why:
+        return None, {**base, "status": "unresolved", "reason": f"{call} 的{why}"}
+    columns = {f: wanted[f] for f in fields} if fields is not None else {"": wanted}
+    items = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+    kinds = ({f: (items.get("properties") or {}).get(f) for f in fields} if fields is not None else {"": items})
+    truth: list[Any] = []
+    names: dict[str, str] = {}
+    try:
+        for r in range(first, last + 1):
+            one = {}
+            for f, col in columns.items():
+                raw, names[f] = locate_cell(content, r, col)
+                one[f] = _typed(raw, kinds[f], column_kind(content, names[f]))
+            truth.append(one if fields is not None else one[""])
+    except CellError as e:
+        return None, {**base, "status": "unresolved", "reason": f"{call} {e}"}
+    locator: dict[str, Any] = {"rows": [first, last],
+                               **({"columns": names} if fields is not None else {"column": names[""]})}
+    cited = {"ref": f"{call}.r{first}-{last}" + ("" if fields is not None else f".{names['']}"), **base,
+             "locator": locator, "eid": make_eid("rows", q["artifact"], locator)}
+    same = isinstance(told, list) and len(told) == len(truth) and all(
+        (isinstance(m, dict) and all(same_value(m.get(f), t[f]) for f in t)) if isinstance(t, dict)
+        else same_value(m, t)
+        for m, t in zip(told, truth))
+    cited.update({"status": "verified"} if same else {"status": "mismatch", "model_value": told})
+    return truth, cited
+
+
+def _shown(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, default=str) if not isinstance(value, str) else value
+    return text if len(text) <= 40 else text[:40] + "…"
+
+
+def _field_warnings(data: dict[str, Any], evidence: dict[str, Any],
+                    failed: str | None) -> list[tuple[str, str, list[str]]]:
+    """核对结果里要让人看见的：(code, message, 字段)。mismatch 和 unresolved 各一条；missing 是模型
+    照实说没查到，值已经是空的，不另发警告。"""
+    out: list[tuple[str, str, list[str]]] = []
+    mismatched = [(p, e) for p, e in evidence.items() if e.get("status") == "mismatch"]
+    if mismatched:
+        detail = "；".join(f"{p} 模型报 {_shown(e.get('model_value'))}，快照是 {_shown(_dig(data, p))}"
+                          for p, e in mismatched[:6])
+        out.append(("agent_field_mismatch",
+                    f"有 {len(mismatched)} 个字段和查询快照对不上，已按快照取值：{detail}", [p for p, _ in mismatched]))
+    unresolved = [(p, e) for p, e in evidence.items() if e.get("status") == "unresolved"]
+    if unresolved:
+        if failed:
+            message = f"{failed}。{len(unresolved)} 个字段都记为空值（没有兜底成 0）"
+        else:
+            detail = "；".join(f"{p}（{e.get('reason')}）" for p, e in unresolved[:6])
+            message = f"有 {len(unresolved)} 个字段核对不了出处，记为空值（没有兜底成 0）：{detail}"
+        out.append(("agent_field_unverified", message, [p for p, _ in unresolved]))
+    return out

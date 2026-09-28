@@ -10,8 +10,11 @@
  * 例外是「提示词要求用 X，但没绑定」：后端的 field 指着点名的那句提示词，可修法在工具
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
+import { ApiError } from '../api/client'
+import { APPROVAL_POLICY_LABEL } from '../lib/terms'
+import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
-import type { ValidationIssue } from '../types'
+import type { AutofixResult, GraphSpec, PublishCheck, PublishFix, PublishLevel, ValidationIssue } from '../types'
 
 export interface FieldRef {
   /** 顶层配置键：prompt、cases、fields… 'label' 表示节点名称 */
@@ -186,4 +189,228 @@ export function problemsOf(
     return hit ? (rank?.[p.nodeId!] ?? 0) * 10_000 + hit.i : 1e9
   }
   return list.sort((a, b) => order(a) - order(b) || (a.level === b.level ? 0 : a.level === 'error' ? -1 : 1))
+}
+
+// -------------------------------------------------------------------------
+// 发布前检查与自动修复（POST /workflows/{id}/publish-check、/autofix）
+//
+// 接口是这一期才有的，老后端没有；新后端也可能少给字段。这里把回来的东西收成确定的形状，
+// 认不出的丢掉，不猜：少了 fixes 就当没有修复，少了 changes 就当没有改动。
+// -------------------------------------------------------------------------
+
+const asArray = <T = unknown>(v: unknown): T[] => (Array.isArray(v) ? v as T[] : [])
+const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v))
+
+function normalizeIssue(raw: any): ValidationIssue | null {
+  if (!raw || typeof raw !== 'object' || !raw.message) return null
+  return {
+    level: raw.level === 'error' ? 'error' : 'warning',
+    message: asText(raw.message),
+    node_id: raw.node_id ?? null,
+    edge_id: raw.edge_id ?? null,
+    field: raw.field ?? null,
+    code: typeof raw.code === 'string' ? raw.code : null,
+    fix: typeof raw.fix === 'string' && raw.fix ? raw.fix : null,
+  }
+}
+
+function normalizeFix(raw: any): PublishFix | null {
+  if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id) return null
+  const kind = raw.kind === 'choice' || raw.kind === 'assist' ? raw.kind : raw.kind === 'auto' ? 'auto' : null
+  if (!kind) return null
+  const options = asArray<any>(raw.options)
+    .filter((o) => o && typeof o === 'object' && 'value' in o)
+    .map((o) => ({ value: o.value, label: asText(o.label ?? o.value), hint: o.hint ? asText(o.hint) : null }))
+  // 选项类没有候选就没法选：不给控件，比给一个空下拉强
+  if (kind === 'choice' && !options.length) return null
+  return {
+    id: raw.id,
+    code: asText(raw.code),
+    kind,
+    node_id: raw.node_id ?? null,
+    label: asText(raw.label) || raw.id,
+    preview: raw.preview && typeof raw.preview === 'object' ? raw.preview : null,
+    options,
+    multiple: !!raw.multiple,
+    default: raw.default,
+  }
+}
+
+export function normalizeCheck(raw: any, level: PublishLevel): PublishCheck {
+  const issues = asArray(raw?.issues).map(normalizeIssue).filter((i): i is ValidationIssue => !!i)
+  const fixes = asArray(raw?.fixes).map(normalizeFix).filter((f): f is PublishFix => !!f)
+  return {
+    level: raw?.level === 'governed' || raw?.level === 'published' ? raw.level : level,
+    ok: typeof raw?.ok === 'boolean' ? raw.ok : !issues.some((i) => i.level === 'error'),
+    issues,
+    fixes: [...new Map(fixes.map((f) => [f.id, f])).values()],
+  }
+}
+
+export function normalizeAutofix(raw: any): AutofixResult {
+  const graph = raw?.graph && typeof raw.graph === 'object' && Array.isArray(raw.graph.nodes) ? raw.graph as GraphSpec : null
+  const remaining = asArray(raw?.remaining).map(normalizeIssue).filter((i): i is ValidationIssue => !!i)
+  const assist = raw?.assist && typeof raw.assist === 'object'
+    ? { ok: !!raw.assist.ok, summary: asText(raw.assist.summary), questions: asArray(raw.assist.questions).map(asText).filter(Boolean) }
+    : null
+  return {
+    graph,
+    changes: asArray<any>(raw?.changes).filter((c) => c && typeof c === 'object').map((c) => ({
+      fix_id: asText(c.fix_id), node_id: c.node_id ?? null, node_title: c.node_title ?? null,
+      field: c.field ?? null, before: c.before, after: c.after, label: c.label ? asText(c.label) : null,
+    })),
+    applied: asArray(raw?.applied).map(asText).filter(Boolean),
+    rejected: asArray<any>(raw?.rejected).filter((r) => r && typeof r === 'object')
+      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '没说原因' })),
+    remaining,
+    assist,
+    ok: typeof raw?.ok === 'boolean' ? raw.ok : !remaining.some((i) => i.level === 'error'),
+  }
+}
+
+/**
+ * 老后端没有这个接口：FastAPI 对不存在的路由回 404 {"detail":"Not Found"}（方法不对是 405）。
+ * 别的 404（工作流不在了）是真的出错，要照实说
+ */
+export function isMissingEndpoint(e: unknown): boolean {
+  if (!(e instanceof ApiError) || e.kind !== 'http') return false
+  return e.status === 405 || (e.status === 404 && (e.detail == null || e.detail === 'Not Found'))
+}
+
+/**
+ * 这条问题的修复：后端点了 fix id 就按 id 找；没点的（/publish 被拦时的回包只有 code）按 code + 节点认。
+ * 认不出时和后端 autofix.annotate 同一个退路：图级问题（没有节点，比如「没有带契约的出口」，
+ * 修复却落在唯一的出口上）认同一编号的第一条修复；图级修复（改的是全图默认，不落在任何节点上）
+ * 认同一编号的每一条问题。再认不出就没有
+ */
+export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix | undefined {
+  if (issue.fix) return fixes.find((f) => f.id === issue.fix)
+  if (!issue.code) return undefined
+  const same = fixes.filter((f) => f.code === issue.code)
+  const exact = same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
+  if (exact) return exact
+  return issue.node_id == null ? same[0] : same.find((f) => f.node_id == null)
+}
+
+/**
+ * 同一处问题只列一行：validate 和门禁常对同一处各报一条（同 code、同节点，说法不同），
+ * 列两行就是两组一样的修复控件、「会被拦下 2 处」。合成的那一行取最重的级别、第一条 error 的说法，
+ * 其余说法收进 others（悬停可见）。没有 code 的认不出是不是同一处，照原样各列一行
+ */
+export function mergeIssues(issues: ValidationIssue[]): { issue: ValidationIssue; others: string[] }[] {
+  const out: { issue: ValidationIssue; others: string[] }[] = []
+  const at = new Map<string, number>()
+  for (const issue of issues) {
+    const key = issue.code ? `${issue.code}\u0000${issue.node_id ?? ''}` : null
+    const i = key != null ? at.get(key) : undefined
+    if (i == null) {
+      if (key != null) at.set(key, out.length)
+      out.push({ issue, others: [] })
+      continue
+    }
+    const row = out[i]
+    const cur = row.issue
+    const worse = issue.level === 'error' && cur.level !== 'error'
+    const [keep, drop] = worse ? [issue, cur] : [cur, issue]
+    row.issue = { ...keep, fix: cur.fix ?? issue.fix ?? null, field: keep.field ?? drop.field ?? null }
+    if (drop.message !== keep.message && !row.others.includes(drop.message)) row.others.push(drop.message)
+    row.others = row.others.filter((m) => m !== keep.message)
+  }
+  return out
+}
+
+/** 「一键修复」会应用的那几项：挂在眼前这些问题上的 auto 修复，去重 */
+export function autoFixIds(issues: ValidationIssue[], fixes: PublishFix[]): string[] {
+  const ids = issues.map((i) => fixFor(i, fixes)).filter((f) => f?.kind === 'auto').map((f) => f!.id)
+  return [...new Set(ids)]
+}
+
+/** 选项类修复选好了没有：多选至少一项，单选要有值 */
+export function choiceReady(fix: PublishFix, value: unknown): boolean {
+  if (fix.multiple) return Array.isArray(value) && value.length > 0
+  return value !== undefined
+}
+
+/**
+ * 画布内容的签名：节点的类型、名字、配置和连线，不含位置。预览是按发请求那一刻的图算的，
+ * 应用时画布内容变了就对不上；只是挪了挪节点不算变
+ */
+export function contentSig(graph: GraphSpec): string {
+  return JSON.stringify({
+    nodes: (graph.nodes ?? []).map((n) => [n.id, n.type, n.data?.label ?? '', n.data?.config ?? {}]),
+    edges: (graph.edges ?? []).map((e) => [e.source, e.target, e.sourceHandle ?? null]),
+  })
+}
+
+/** 出具契约里的几个键在界面上的叫法。拆成几行写契约骨架时也按这个顺序 */
+const CONTRACT_KEYS: Record<string, string> = {
+  metrics_from: '指标来自', report_from: '报告来自', required: '必需指标', expected: '期望指标',
+  strict: '严格模式', narrative: '叙述', cells: '单元格引用', allow_numbers: '允许不带出处的数',
+}
+
+/** 不在节点定义的字段表里、由检查器自己画的几项（子工作流钉的版本、升版处置），以及图级的全图默认 */
+const EXTRA_FIELDS: Record<string, string> = {
+  workflow_version: '钉住版本', upgrade_policy: '上游发了新版本时', defaults: '全图默认',
+}
+/** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略 */
+const SUB_KEYS: Record<string, string> = { ...CONTRACT_KEYS, approval: '审批策略' }
+
+/** 值是节点 id 的几个键（报告、契约的 metrics_from，契约的 report_from）：预览里写节点名，不写 id */
+const NODE_REF_KEYS = new Set(['metrics_from', 'report_from'])
+
+/** 节点 id → 画布上的名字；画布上没有这个节点时返回 undefined */
+export type NodeNameOf = (id: string) => string | undefined
+
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/** 修复改的是哪个字段：顶层键用节点定义里的叫法，契约里的键另有一张表，其余原样 */
+export function fixFieldLabel(field: string | null | undefined, nodeType?: string): string {
+  if (!field) return ''
+  const [head, ...rest] = field.split('.')
+  if (head === 'label') return '节点名称'
+  const def = nodeType ? NODE_DEFS[nodeType as keyof typeof NODE_DEFS] : undefined
+  const base = def?.fields.find((f) => f.key === head)?.label ?? EXTRA_FIELDS[head] ?? head
+  return [base, ...rest.map((k) => SUB_KEYS[k] ?? k)].join(' · ')
+}
+
+/**
+ * 改动前后的值怎么写：空写「（空）」，审批策略写界面上的选项文字，节点引用写「节点名」
+ * （画布上找不到的照写 id——它本来就指着一个不存在的节点），契约骨架按键写成「指标来自：…；…」，
+ * 其余压成一行
+ */
+export function fixValueText(value: unknown, field?: string | null, nameOf?: NodeNameOf): string {
+  if (value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length)
+    || (isRecord(value) && !Object.keys(value).length)) return '（空）'
+  const key = field?.split('.').pop()
+  if (key === 'approval' && typeof value === 'string' && value in APPROVAL_POLICY_LABEL) {
+    return APPROVAL_POLICY_LABEL[value as keyof typeof APPROVAL_POLICY_LABEL]
+  }
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (key === 'workflow_version' && (typeof value === 'number' || /^\d+$/.test(String(value)))) return `v${value}`
+  if (key && NODE_REF_KEYS.has(key)) {
+    const ids = Array.isArray(value) ? value : [value]
+    if (ids.every((v) => typeof v === 'string')) {
+      return ids.map((id) => { const name = nameOf?.(id as string); return name ? `「${name}」` : id }).join('、')
+    }
+  }
+  const lines = fixValueLines(value, field, nameOf)
+  if (lines) return lines.join('；')
+  if (Array.isArray(value) && value.every((v) => typeof v !== 'object' || v === null)) return value.join('、')
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text
+}
+
+/**
+ * 整份契约（field 为 contract、值是对象，比如「生成契约骨架」）拆成一键一行：「指标来自：「周报口径」」
+ * 「必需指标：gmv、orders」。键名用界面叫法、按 CONTRACT_KEYS 的顺序，值和单独改一项时写法相同。
+ * 不是整份契约的返回 null
+ */
+export function fixValueLines(value: unknown, field?: string | null, nameOf?: NodeNameOf): string[] | null {
+  if (field !== 'contract' || !isRecord(value) || !Object.keys(value).length) return null
+  const order = Object.keys(CONTRACT_KEYS)
+  const keys = Object.keys(value).sort((a, b) => {
+    const [x, y] = [order.indexOf(a), order.indexOf(b)]
+    return (x < 0 ? order.length : x) - (y < 0 ? order.length : y)
+  })
+  return keys.map((k) => `${CONTRACT_KEYS[k] ?? k}：${fixValueText(value[k], `contract.${k}`, nameOf)}`)
 }

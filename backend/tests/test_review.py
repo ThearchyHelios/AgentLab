@@ -401,3 +401,14 @@ async def test_review_endpoint_keeps_answers_with_evidence(client, monkeypatch):
     assert model.calls == 1
     assert body["verdict"] == "annotated" and body["answer"] is None
     assert body["note"] == "报告被要求重写过一次。"
+
+
+def test_agent_field_warnings_are_degraded_signals():
+    """agent 的结构化字段和快照对不上（以快照为准）、或者核对不了（记成空值）：答案能用，但有缺口要说明。
+    按自己的 kind 记下，界面才说得清是哪一种，而不是一个笼统的「警告」。"""
+    signals = rv.scan([
+        warn("字段 orders：模型报 30，快照是 3，已按快照取值", "agent_field_mismatch"),
+        warn("字段 region 核对不了出处，记为空值", "agent_field_unverified"),
+    ], OK_OUTPUT)
+    assert [(s.kind, s.severity) for s in signals] == [
+        ("agent_field_mismatch", rv.DEGRADED), ("agent_field_unverified", rv.DEGRADED)]

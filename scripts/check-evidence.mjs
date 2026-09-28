@@ -24,6 +24,9 @@ const CHROME = process.env.CHROME_PATH
 const SHOTS = process.env.EVIDENCE_SHOTS
 const root = new URL('..', import.meta.url).pathname
 const fx = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-doc.json`, 'utf8'))
+// 第二期：报告直接引用查询单元格、整表，口径卡的输入核对到 agent 字段和查询快照。文档同样是
+// compose_doc 真跑出来的（查询快照走 loader），片段接口的答复按方案第 5 节和 NOTES-A2 的形状拼
+const fxq = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-query.json`, 'utf8'))
 
 let failed = 0
 const check = (name, cond, detail = '') => {
@@ -51,26 +54,43 @@ async function routed(page) {
     const req = r.request()
     const url = new URL(req.url())
     if (req.method() !== 'GET') return r.abort()
-    const seg = url.pathname.match(/\/api\/runs\/[^/]+\/evidence\/segments\/([^/]+)$/)
+    const seg = url.pathname.match(/\/api\/runs\/([^/]+)\/evidence\/segments\/([^/]+)$/)
+    // 按运行认夹具：第二期那份（查询链）和第一期那份各有自己的片段
+    const set = url.pathname.includes(`/runs/${fxq.run_id}/`) ? fxq : fx
     if (seg) {
-      hits.push(decodeURIComponent(seg[1]))
-      const body = fx.segments[decodeURIComponent(seg[1])]
+      hits.push(`${set === fxq ? 'q:' : ''}${decodeURIComponent(seg[2])}`)
+      const body = set.segments[decodeURIComponent(seg[2])]
       return body ? r.fulfill({ json: body })
         : r.fulfill({ status: 404, json: { detail: '报告里没有这个片段', code: 'evidence_segment_not_found' } })
     }
-    if (/\/api\/runs\/[^/]+\/evidence$/.test(url.pathname)) return r.fulfill({ json: fx.graph })
+    if (/\/api\/runs\/[^/]+\/evidence$/.test(url.pathname)) return r.fulfill({ json: set.graph })
     if (url.pathname === `/api/artifacts/${fx.doc_artifact}`) return r.fulfill({ json: { id: fx.doc_artifact, content: fx.doc } })
+    if (url.pathname === `/api/artifacts/${fxq.snapshots.Q3.artifact}`) {
+      hits.push('artifact:Q3')
+      // 工件接口给的是原值（遮罩只在证据接口里换）：夹具里存的是换过的，这里换回「原值」
+      const content = structuredClone(fxq.snapshots.Q3.content)
+      const j = content.columns.indexOf('phone')
+      content.rows.forEach((row, i) => { row[j] = `RAW-PHONE-${i}` })
+      return r.fulfill({ json: { id: fxq.snapshots.Q3.artifact, content } })
+    }
     return r.continue()
   })
   return hits
 }
 
-async function open(url, { w = 1280, h = 1000, reduced = false } = {}) {
+async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width: w, height: h }, ...(reduced ? { reducedMotion: 'reduce' } : {}) })
   const page = await ctx.newPage()
+  // 找不到元素时 8 秒就报，不等默认的 30 秒：改坏验证时一节里十几处都找不到
+  page.setDefaultTimeout(8000)
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
   const hits = await routed(page)
+  // 预览页直接 import 第二期夹具（vite 把 JSON 当模块给）：要一份改过的文档时把那个模块换掉
+  if (patchQuery) {
+    await page.route((u) => new URL(u).pathname.endsWith('/run/__tests__/evidence-query.json'), (r) =>
+      r.fulfill({ contentType: 'application/javascript', body: `export default ${JSON.stringify(patchQuery(structuredClone(fxq)))}` }))
+  }
   await page.goto(`${WEB}${url}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('[data-evidence-doc], [data-turn]', { timeout: 8000 })
   return { ctx, page, errors, hits }
@@ -578,6 +598,444 @@ await section('fields', '成果字段取文档：别的运行写的、没记正�
   await r.ctx.close()
 })
 
+// ---------------------------------------------------------------------------
+// 第二期：查询步骤、输入来源、整表、口径卡来源（夹具 evidence-query.json）
+// ---------------------------------------------------------------------------
+const Q = '#evidence-query'
+const QN = '#evidence-query-narrow'
+/** 夹具里的片段 id：按文字认，免得重新生成夹具后编号挪了这里全错 */
+const qseg = (text, nth = 0) => Object.values(fxq.segments).filter((d) => d.segment.text === text)[nth]?.segment.id
+const Q3 = fxq.snapshots.Q3.artifact
+const qsteps = (text) => fxq.segments[qseg(text)].chain.filter((st) => st.step === 'query')
+/** 第二期的组件预览：片段接口按 answer(segId, 夹具拷贝) 回（数字当状态码），其余照 routed */
+async function probeQ(answer, opts = {}) {
+  const r = await open('/ui-harness.html?evidence=1', opts)
+  await r.page.route((u) => new URL(u).pathname.includes(`/runs/${fxq.run_id}/evidence/segments/`), (route) => {
+    const id = decodeURIComponent(new URL(route.request().url()).pathname.split('/').pop())
+    const body = answer(id, structuredClone(fxq.segments[id] ?? {}))
+    return typeof body === 'number'
+      ? route.fulfill({ status: body, json: { detail: '伪造的错误', code: 'evidence_report_not_found' } })
+      : route.fulfill({ json: body })
+  })
+  return r
+}
+async function openQ(p, text, { box = Q, nth = 0, wait = '[data-ev-query]' } = {}) {
+  await p.locator(`${box} [data-seg="${qseg(text, nth)}"]`).click()
+  await p.waitForSelector(`[data-evidence-panel] ${wait}`, { timeout: 4000 }).catch(() => {})
+  await p.waitForTimeout(120)
+}
+/** 令牌算出来的颜色：拿一个探针元素量，不在脚本里写死色值 */
+const tokenColor = (p, prop, value) => p.evaluate(([prop, value]) => {
+  const el = document.createElement('div')
+  el.style[prop] = value
+  document.body.appendChild(el)
+  const got = getComputedStyle(el)[prop]
+  el.remove()
+  return got
+}, [prop, value])
+
+await section('query', '查询步骤：SQL 带复制、被引用的行和格高亮、窗口说明、完整快照、遮罩', async () => {
+  await openQ(page, '1,288')
+  const part = panel(page).locator(`[data-ev-query="${Q3}"]`)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/evidence-query-step-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  check('点开单元格：面板里有这次查询的步骤', await part.count() === 1, String(await part.count()))
+  check('标题写查询编号和工具', (await part.innerText()).includes('Q3') && (await part.innerText()).includes('db_query__shop'))
+  check('SQL 原样摆出来', (await part.locator('[data-ev-sql]').innerText()).startsWith('SELECT order_id, region, amount, phone'))
+  check('SQL 带复制按钮', await part.locator('button', { hasText: '复制 SQL' }).count() === 1)
+  const rows = part.locator('tbody tr[data-highlight="row"]')
+  check('被引用的行加 data-highlight="row"，只有这一行', await rows.count() === 1
+    && (await rows.first().innerText()).includes('10006'), await rows.first().innerText().catch(() => ''))
+  const cell = part.locator('td[data-highlight="cell"]')
+  check('被引用的格加 data-highlight="cell"，在 amount 列', await cell.count() === 1 && (await cell.innerText()) === '1288'
+    && await cell.evaluate((td) => td.closest('table').querySelectorAll('th')[td.cellIndex]?.textContent === 'amount'),
+    await cell.innerText().catch(() => ''))
+  const [rowBg, cellLine] = await Promise.all([
+    rows.first().evaluate((el) => getComputedStyle(el).backgroundColor),
+    cell.evaluate((el) => getComputedStyle(el).outlineColor),
+  ])
+  check('高亮只用令牌：行底是 --st-done-soft', rowBg === await tokenColor(page, 'backgroundColor', 'var(--st-done-soft)'), rowBg)
+  check('高亮只用令牌：格的描边是 --st-done', cellLine === await tokenColor(page, 'outlineColor', 'var(--st-done)'), cellLine)
+  check('只显示窗口：被引用的第 6 行加前后各 2 行，共 5 行', await part.locator('tbody tr').count() === 5)
+  const win = await part.locator('[data-ev-window]').innerText().catch(() => '')
+  check('窗口外的行写明「仅显示被引用的行及前后各 2 行」和位置', win.includes('仅显示被引用的行及前后各 2 行')
+    && win.includes('第 4–8 行') && win.includes('共 12 行'), win)
+  const masked = await part.locator('td[data-masked]').allInnerTexts()
+  check('被遮罩的列（phone）每格写「已遮罩」', masked.length === 5 && masked.every((t) => t === '已遮罩'), masked.join('|'))
+  const note = await panel(page).locator('[data-ev-mask-note]').innerText().catch(() => '')
+  check('面板底部说明遮罩：列名 + 不是安全边界', note.includes('phone') && note.includes('遮罩只减少暴露，不是安全边界'), note)
+  check('遮罩说明在面板最后（封存那一行之后）', await panel(page).evaluate((p) => {
+    const note = p.querySelector('[data-ev-mask-note]')
+    const seal = p.querySelector('[data-ev-seal]')
+    return !!note && !!seal && !!(seal.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING)
+  }))
+  check('查询快照复验通过时不多说一句', await panel(page).locator('[data-ev-integrity]').count() === 0)
+  const aria = await page.locator(`${Q} [data-seg="${qseg('1,288')}"]`).getAttribute('aria-label')
+  check('单元格的 aria-label 写明查询、第几行、哪一列', aria === '1,288，有出处：查询 Q3 · 第 6 行 · amount', aria)
+
+  const before = harness.hits.filter((h) => h === 'artifact:Q3').length
+  await part.locator('[data-ev-snapshot]').click()
+  await page.waitForSelector('[role="dialog"] [data-artifact] tbody tr', { timeout: 4000 }).catch(() => {})
+  const full = await page.locator('[role="dialog"] [data-artifact] tbody tr').count()
+  check('「打开完整快照」复用工件查看，12 行全在', full === 12 && harness.hits.filter((h) => h === 'artifact:Q3').length === before + 1, `${full} 行`)
+  const fullText = await page.locator('[role="dialog"] [data-artifact]').innerText().catch(() => '')
+  check('……完整快照里遮罩列同样写「已遮罩」，工件接口给的原值不画出来', !fullText.includes('RAW-PHONE')
+    && await page.locator('[role="dialog"] [data-artifact] td[data-masked]').count() === 12,
+    fullText.includes('RAW-PHONE') ? '原值漏出来了' : String(await page.locator('[role="dialog"] [data-artifact] td[data-masked]').count()))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+  check('在完整快照里按 Esc 只关快照，证据面板还开着', await page.locator('[role="dialog"]').count() === 0 && await panel(page).count() === 1)
+
+  await openQ(page, '华东')
+  const v = panel(page).locator('[data-ev-query]')
+  check('值片段（华东）也给查询步骤，高亮第 1 行 region 格', (await v.locator('td[data-highlight="cell"]').innerText().catch(() => '')) === '华东'
+    && await v.locator('tbody tr').first().getAttribute('data-highlight') === 'row')
+  check('第 1 行：窗口是第 1–3 行（前面没有行可补），照实写', (await v.locator('[data-ev-window]').innerText().catch(() => ''))
+    .includes('第 1–3 行，共 4 行'))
+  check('没有遮罩列时不写遮罩说明', await panel(page).locator('[data-ev-mask-note]').count() === 0)
+  await page.keyboard.press('Escape')
+  await openQ(page, '45,678.5元')
+  const one = panel(page).locator('[data-ev-query]')
+  check('整份快照都在窗口里（1 行）：不写窗口说明，完整快照照样能开', await one.count() === 1
+    && await one.locator('[data-ev-window]').count() === 0 && await one.locator('[data-ev-snapshot]').count() === 1)
+  await page.keyboard.press('Escape')
+
+  // 被引用的两格隔得远（第 6、12 行）：窗口不连续，行号那一列看得出跳过了哪几行，只标那两格
+  await openQ(page, '672.5元')
+  const gap = panel(page).locator(`[data-ev-query="${Q3}"]`)
+  const nums = await gap.locator('tbody tr td:first-child').allInnerTexts()
+  check('窗口不连续：最前面一列是快照里的行号（4–8、10–12）', nums.join(',') === '4,5,6,7,8,10,11,12', nums.join(','))
+  check('……窗口说明写成「第 4–8、10–12 行，共 12 行」', (await gap.locator('[data-ev-window]').innerText().catch(() => ''))
+    .includes('第 4–8、10–12 行，共 12 行'))
+  const hit2 = await gap.locator('td[data-highlight="cell"]').allInnerTexts()
+  check('……两格都高亮（1288、615.5）', hit2.join(',') === '1288,615.5', hit2.join(','))
+  await page.keyboard.press('Escape')
+  const exact = await probeQ((id, body) => (id === qseg('1,288') ? { ...body, chain: body.chain.map((st) => (st.step === 'query'
+    ? { ...st, highlight: { rows: [5, 6], cols: ['amount', 'region'], cells: [[5, 'amount'], [6, 'region']] } } : st)) } : body))
+  await openQ(exact.page, '1,288')
+  const exactCells = await exact.page.locator('[data-evidence-panel] td[data-highlight="cell"]').allInnerTexts()
+  check('highlight 给了 cells：只标那几格，不按行 × 列全标', exactCells.join(',') === '1288,华北', exactCells.join(','))
+  await exact.ctx.close()
+  const unsealed = await probeQ((id, body) => (id === qseg('1,288') ? { ...body, chain: body.chain.map((st) => (st.step === 'query'
+    ? { step: 'query', alias: st.alias, artifact: st.artifact, tool: st.tool, columns: [], rows: [], hash_ok: null, sealed: false,
+        highlight: st.highlight, note: '这份查询快照不在封存范围内的任何事件里，不能当证据展示' } : st)) } : body))
+  await openQ(unsealed.page, '1,288')
+  const un = await unsealed.page.locator('[data-evidence-panel] [data-ev-query]').innerText().catch(() => '')
+  check('查询快照不在封存范围里：一行都不画，照接口原话说，并用失败色写「不在封存范围内」', un.includes('不能当证据展示')
+    && await unsealed.page.locator('[data-evidence-panel] [data-ev-query] [data-ev-integrity~="sealed"]').count() === 1
+    && await unsealed.page.locator('[data-evidence-panel] [data-ev-query] tbody tr').count() === 0,
+    un.replace(/\s+/g, ' ').slice(0, 200))
+  // 后端这时照样带着工件 id：按钮一点就绕过证据接口把整份快照打开，还挂着「哈希已校验」
+  check('……不给「打开完整快照」（接口不给行，面板也不能开整份快照）',
+    await unsealed.page.locator('[data-evidence-panel] [data-ev-snapshot]').count() === 0)
+  await unsealed.ctx.close()
+
+  // 接口把遮罩列的原值带回来了（老接口、改错了的后端）：列在遮罩里就一律不画原值
+  const leak = await probeQ((id, body) => (id === qseg('1,288') ? { ...body, chain: body.chain.map((st) => (st.step === 'query'
+    ? { ...st, rows: st.rows.map((r) => r.map((v, j) => (st.columns[j] === 'phone' ? `RAW-PHONE-${j}` : v))) } : st)) } : body))
+  await openQ(leak.page, '1,288')
+  const leaked = await leak.page.locator('[data-evidence-panel]').innerText().catch(() => '')
+  check('遮罩列带回了原值也不画：表里一律写「已遮罩」', !leaked.includes('RAW-PHONE')
+    && await leak.page.locator('[data-evidence-panel] td[data-masked]').count() === 5, leaked.includes('RAW-PHONE') ? '原值漏出来了' : '')
+  await leak.ctx.close()
+
+  const bad = await probeQ((id, body) => (id === qseg('1,288')
+    ? { ...body, chain: body.chain.map((st) => (st.step === 'query' ? { ...st, hash_ok: false } : st)) } : body))
+  await openQ(bad.page, '1,288')
+  const said = await bad.page.locator('[data-evidence-panel] [data-ev-integrity]').innerText().catch(() => '')
+  const color = await bad.page.locator('[data-evidence-panel] [data-ev-integrity]').evaluate((el) => getComputedStyle(el).color).catch(() => '')
+  check('查询快照哈希对不上：用失败色写出来', said.includes('查询快照') && said.includes('哈希对不上')
+    && color === await tokenColor(bad.page, 'color', 'var(--st-failed)'), said)
+  check('……哈希对不上也不给「打开完整快照」', await bad.page.locator('[data-evidence-panel] [data-ev-snapshot]').count() === 0)
+  await bad.ctx.close()
+})
+
+await section('sources', '输入来源：与快照一致、模型报 X 快照是 Y、没查到记为空、代码节点、点标签跳到查询', async () => {
+  await openQ(page, '37.0元', { wait: '[data-ev-sources]' })
+  const src = (path) => panel(page).locator(`[data-ev-source="${path}"]`)
+  const gmv = await src('vars.kpi.gmv').innerText().catch(() => '')
+  check('agent 字段 verified：写「与快照一致」', gmv.includes('与快照一致')
+    && await src('vars.kpi.gmv').getAttribute('data-ev-source-status') === 'verified', gmv)
+  const ord = await src('vars.kpi.order_cnt').innerText().catch(() => '')
+  check('mismatch：写「模型报 1,240，快照是 1,234，已按快照取值」', ord.includes('模型报 1,240，快照是 1,234，已按快照取值'), ord)
+  check('写明从哪个节点的哪个字段、哪一格来', gmv.includes('fetch') && gmv.includes('Q1') && gmv.includes('第 1 行'), gmv)
+  await page.keyboard.press('Escape')
+
+  await openQ(page, '—', { wait: '[data-ev-sources]' })
+  const refund = await src('vars.kpi.refund_cnt').innerText().catch(() => '')
+  check('from 为 null（missing）：写「没查到，记为空，没有兜底成 0」', refund.includes('没查到，记为空，没有兜底成 0'), refund)
+  check('缺输入的指标照样给出输入来源，说得清缺的是哪一个', await panel(page).locator('[data-ev-missing]').count() === 1
+    && await panel(page).locator('[data-ev-sources] [data-ev-source]').count() === 2)
+  await page.keyboard.press('Escape')
+  await openQ(page, '—', { nth: 1, wait: '[data-ev-sources]' })
+  const nu = await src('vars.kpi.new_users').innerText().catch(() => '')
+  check('unresolved：同样写「没查到，记为空，没有兜底成 0」，并带原因', nu.includes('没查到，记为空，没有兜底成 0')
+    && nu.includes('没有列「new_users」'), nu)
+  await page.keyboard.press('Escape')
+
+  await openQ(page, '44,000.0元', { wait: '[data-ev-sources]' })
+  const compute = src('nodes.adjust.total')
+  const ct = await compute.innerText().catch(() => '')
+  check('来自 code 节点（计算）：写警示语，说要进口径卡', ct.includes('代码节点') && ct.includes('口径卡')
+    && await compute.getAttribute('data-ev-source-role') === 'compute', ct)
+  const computeColor = await compute.evaluate((el) => getComputedStyle(el).borderColor).catch(() => '')
+  await page.keyboard.press('Escape')
+  await openQ(page, '7.12', { wait: '[data-ev-sources]' })
+  const source = src('nodes.rate.value')
+  const st = await source.innerText().catch(() => '')
+  check('来自 code 节点（取数）：写明标为取数、核对不到快照', st.includes('取数') && st.includes('核对不到')
+    && await source.getAttribute('data-ev-source-role') === 'source', st)
+  const sourceColor = await source.evaluate((el) => getComputedStyle(el).borderColor).catch(() => '')
+  check('计算角色比取数角色醒目：失败色描边', computeColor === await tokenColor(page, 'borderColor', 'var(--st-failed)')
+    && sourceColor !== computeColor, `${computeColor} / ${sourceColor}`)
+  await page.keyboard.press('Escape')
+
+  await openQ(page, '8.7%', { wait: '[data-ev-sources]' })
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/evidence-sources-${theme}.png` })
+      await panel(page).evaluate((p) => { p.querySelector('.overflow-y-auto').scrollTop = 99999 })
+      await page.waitForTimeout(100)
+      await page.screenshot({ path: `${SHOTS}/evidence-sources-queries-${theme}.png` })
+      await panel(page).evaluate((p) => { p.querySelector('.overflow-y-auto').scrollTop = 0 })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const prev = qsteps('8.7%').find((q) => q.alias === 'Q4')
+  const chip = panel(page).locator(`button[data-ev-input="cell(nodes.pull, 0, 'gmv')"]`)
+  check('代入式里的输入标签是按钮', await chip.count() === 1)
+  await chip.click()
+  await page.waitForTimeout(200)
+  const landed = await page.evaluate((a) => {
+    const part = document.querySelector(`[data-evidence-panel] [data-ev-query="${a}"]`)
+    const css = part ? getComputedStyle(part) : null
+    return { inside: !!part?.contains(document.activeElement), flash: part?.hasAttribute('data-flash') ?? false,
+             style: css?.outlineStyle, width: css?.outlineWidth, color: css?.outlineColor }
+  }, prev?.artifact)
+  // 只有属性没有样式等于没描：目标步骤已经在视野里时，点完什么都看不出来变了
+  check('点输入标签：焦点跳到对应的查询步骤（Q4），并描一下（看得见的强调色描边）', landed.inside && landed.flash
+    && landed.style !== 'none' && parseFloat(landed.width) >= 1 && landed.color === await tokenColor(page, 'outlineColor', 'var(--accent)'),
+    JSON.stringify(landed))
+  // 键盘：焦点落在查询步骤的标题上，得有看得见的焦点框（WCAG 2.4.7）
+  await page.waitForTimeout(1700)
+  await page.keyboard.press('Shift')
+  await chip.focus()
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(150)
+  const ring = await page.evaluate(() => {
+    const el = document.activeElement
+    const css = el ? getComputedStyle(el) : null
+    return { head: el?.hasAttribute('data-ev-query-head') ?? false, style: css?.outlineStyle, width: css?.outlineWidth }
+  })
+  check('……键盘按回车跳过去：焦点落在查询步骤标题上，焦点框看得见', ring.head && ring.style !== 'none' && parseFloat(ring.width) >= 1,
+    JSON.stringify(ring))
+  const go = panel(page).locator('[data-ev-source="vars.kpi.gmv"] button[data-ev-goto]')
+  check('输入来源那一行也能跳到查询', await go.count() === 1)
+  await go.click()
+  await page.waitForTimeout(200)
+  check('……跳到 Q1 那一步', await page.evaluate((a) => !!document.querySelector(`[data-evidence-panel] [data-ev-query="${a}"]`)
+    ?.contains(document.activeElement), qsteps('8.7%').find((q) => q.alias === 'Q1')?.artifact))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('Esc 关掉面板，焦点回到原片段', await panel(page).count() === 0 && await active(page) === qseg('8.7%'), await active(page))
+})
+
+await section('table', '整表：每格是可点的片段，方向键按行列走，值和数同一套线型', async () => {
+  const cells = page.locator(`${Q} table td [data-seg]`)
+  check('整表每个数据格都是可点的片段（3 行 × 3 列）', await cells.count() === 9, String(await cells.count()))
+  check('表头不是片段', await page.locator(`${Q} table th [data-seg]`).count() === 0)
+  const [val, num] = await Promise.all([qseg('华东', 1), qseg('18,230.5', 1)].map((id) => page.locator(`${Q} [data-seg="${id}"]`)
+    .evaluate((el) => { const cs = getComputedStyle(el); return `${cs.textDecorationLine}/${cs.textDecorationStyle}/${cs.textDecorationColor}` })))
+  check('值片段（华东）和数字片段（18,230.5）同一套线型', val === num && val.includes('solid'), `${val} vs ${num}`)
+  await page.locator(`${Q} [data-seg="${qseg('18,230.5', 1)}"]`).focus()
+  const walk = []
+  for (const key of ['ArrowDown', 'ArrowDown', 'ArrowUp', 'ArrowRight', 'ArrowDown', 'ArrowDown']) {
+    await page.keyboard.press(key)
+    walk.push(await active(page))
+  }
+  const want = [qseg('12,004', 1), qseg('9,876'), qseg('12,004', 1), qseg('311'), qseg('298'), qseg('1,288')]
+  check('表格里 ↓/↑ 按列走到下一行 / 上一行，→ 走到右边一格，出了最后一行接着往下', walk.join(',') === want.join(','),
+    `${walk.join(',')} ≠ ${want.join(',')}`)
+  await page.locator(`${Q} [data-seg="${qseg('华东', 1)}"]`).focus()
+  await page.keyboard.press('ArrowUp')
+  check('第一行按 ↑ 回到表格前面那一句', await active(page) === qseg('华东', 0), await active(page))
+  await page.locator(`${Q} [data-seg="${qseg('311')}"]`).focus()
+  await page.keyboard.press('Enter')
+  await page.waitForSelector('[data-evidence-panel] [data-ev-query]', { timeout: 4000 }).catch(() => {})
+  const hl = await panel(page).locator('td[data-highlight="cell"]').innerText().catch(() => '')
+  check('回车打开这一格的查询步骤，高亮 311 这一格', hl === '311', hl)
+  await page.keyboard.press('Escape')
+  const stops = await page.locator(`${Q} [data-seg][tabindex="0"]`).count()
+  check('整份报告（含表格）仍只占一个 Tab 位', stops === 1, String(stops))
+})
+
+await section('caliber', '口径卡来源和升版处置', async () => {
+  await openQ(page, '45,678.5元', { wait: '[data-ev-caliber-from]' })
+  const from = await panel(page).locator('[data-ev-caliber-from]').innerText().catch(() => '')
+  check('指标步骤写「口径卡「周报口径」v3，来自「销售周报」v5」', from.includes('口径卡「周报口径」v3，来自「销售周报」v5'), from)
+  const up = await panel(page).locator('[data-ev-caliber-upgrade]').innerText().catch(() => '')
+  check('有升版处置时写「上游已有 v6，按『…』处置」', up.includes('上游已有 v6') && up.includes('并排双印新旧口径') && up.includes('处置'), up)
+  await page.keyboard.press('Escape')
+  // 方案第 5 节的写法（caliber_from）也认；没给工作流名、没给 policy_label 时不出 undefined
+  const bare = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'metric'
+    ? { ...st, source: undefined, caliber_from: { workflow_id: 'wf-demo-weekly', workflow_version: 5 },
+        caliber_upgrade: { policy: 'recompute', latest: 6 } } : st)) }))
+  await openQ(bare.page, '45,678.5元', { wait: '[data-ev-caliber-from]' })
+  const t = await bare.page.locator('[data-evidence-panel] [data-ev-metric]').innerText()
+  check('没给工作流名：退回工作流 id，不出 undefined', t.includes('来自') && t.includes('wf-demo') && !/undefined|null/.test(t), t.replace(/\s+/g, ' ').slice(0, 160))
+  check('没给 policy_label：按策略代码说人话', t.includes('用新口径回算历史'), t.replace(/\s+/g, ' ').slice(0, 200))
+  await bare.ctx.close()
+  const none = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'metric'
+    ? { ...st, source: null, caliber_from: undefined, caliber_upgrade: null } : st)) }))
+  await openQ(none.page, '45,678.5元', { wait: '[data-ev-expression]' })
+  check('本地定义的口径卡、没有升版：两行都不出', await none.page.locator('[data-evidence-panel] [data-ev-caliber-from], [data-evidence-panel] [data-ev-caliber-upgrade]').count() === 0)
+  await none.ctx.close()
+})
+
+await section('q-narrow', '查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
+  const overflow = () => page.evaluate((sel) => {
+    const el = document.querySelector(sel)
+    return { sw: el.scrollWidth, cw: el.clientWidth }
+  }, QN)
+  await openQ(page, '1,288', { box: QN })
+  const inline = await page.locator(`${QN} [data-evidence-panel="inline"] [data-ev-query]`).count()
+  const o = await overflow()
+  check('窄栏里查询步骤在栏内展开', inline === 1)
+  check('窄栏里没有横向滚动（表格自己在框里滚）', o.sw <= o.cw, JSON.stringify(o))
+  const hl = await page.locator(`${QN} td[data-highlight="cell"]`).evaluate((td) => {
+    const box = td.closest('.overflow-x-auto')
+    const a = td.getBoundingClientRect()
+    const b = box.getBoundingClientRect()
+    return a.left >= b.left - 1 && a.right <= b.right + 1
+  }).catch(() => false)
+  check('被引用的格滚到看得见的位置', hl)
+  await page.locator(`${QN} [data-evidence-panel] button`, { hasText: '回到正文' }).click()
+
+  const small = await open('/ui-harness.html?evidence=1', { w: 360, h: 780 })
+  await small.page.locator(`${Q} [data-seg="${qseg('1,288')}"]`).click()
+  await small.page.waitForSelector('[data-evidence-panel] [data-ev-query]', { timeout: 4000 }).catch(() => {})
+  const s = await small.page.evaluate(() => ({ sw: document.documentElement.scrollWidth, vw: innerWidth }))
+  check('360px 的屏幕：底部抽屉里有查询步骤', await small.page.locator('[data-evidence-panel="drawer"] [data-ev-query]').count() === 1)
+  check('360px 的屏幕：整页没有横向滚动', s.sw <= s.vw, JSON.stringify(s))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await small.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await small.page.waitForTimeout(250)
+      await small.page.screenshot({ path: `${SHOTS}/evidence-query-360-${theme}.png` })
+    }
+  }
+  check('没有运行时报错（360px）', small.errors.length === 0, small.errors.join(' | '))
+  await small.ctx.close()
+
+  const r = await open('/ui-harness.html?evidence=1', { reduced: true })
+  await r.page.locator(`${Q} [data-seg="${qseg('8.7%')}"]`).click()
+  await r.page.waitForSelector('[data-evidence-panel] [data-ev-sources]', { timeout: 4000 }).catch(() => {})
+  await r.page.locator(`[data-evidence-panel] button[data-ev-input="cell(nodes.pull, 0, 'gmv')"]`).click().catch(() => {})
+  await r.page.waitForTimeout(100)
+  const moving = await r.page.evaluate(() => [...(document.querySelector('[data-evidence-panel]')?.getAnimations({ subtree: true }) ?? [])]
+    .filter((a) => !(a instanceof CSSTransition && Number(a.effect?.getTiming().duration) <= 0.01)).length)
+  check('减少动效：面板和跳转都没有动画', moving === 0, String(moving))
+  await r.ctx.close()
+})
+
+await section('q-tolerant', '接口缺字段、取不到：降级显示，不白屏', async () => {
+  const miss = await probeQ(() => 404)
+  await openQ(miss.page, '1,288', { wait: '[data-ev-query-missing]' })
+  const t = await miss.page.locator('[data-evidence-panel]').innerText()
+  check('片段接口取不到：只显示文档里记的出处（Q3 · db_query__shop · 12 行），照实说取不到', t.includes('Q3')
+    && t.includes('db_query__shop') && t.includes('12 行') && t.includes('没取到'), t.replace(/\s+/g, ' ').slice(0, 200))
+  check('……没有假装高亮了什么', await miss.page.locator('[data-evidence-panel] [data-highlight]').count() === 0)
+  check('……没有运行时报错', miss.errors.length === 0, miss.errors.join(' | '))
+  await miss.ctx.close()
+  const thin = await probeQ((id, body) => ({ ...body, redacted: undefined,
+    chain: (body.chain ?? []).map((st) => (st.step === 'query' ? { step: 'query', alias: st.alias, columns: st.columns, rows: st.rows } : st)) }))
+  await openQ(thin.page, '1,288')
+  const part = thin.page.locator('[data-evidence-panel] [data-ev-query]')
+  check('查询步骤只有列和行（老形状）：照样画表，不高亮、不写窗口位置', await part.locator('tbody tr').count() === 5
+    && await part.locator('[data-highlight]').count() === 0 && !(await part.innerText()).includes('undefined'))
+  check('……没有工件 id 就不给「打开完整快照」', await part.locator('[data-ev-snapshot]').count() === 0)
+  const inRange = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, highlight: { rows: [2], cols: ['amount'] } } : st)) }))
+  await openQ(inRange.page, '1,288')
+  check('highlight 的行号落在窗口里时按窗口内下标认（row_offset 之前的号）', (await inRange.page.locator('[data-evidence-panel] td[data-highlight="cell"]').innerText().catch(() => '')) === '1288')
+  check('没有 mask_note 就不出那一句', await inRange.page.locator('[data-evidence-panel] [data-ev-query-mask-note]').count() === 0)
+  check('没有运行时报错（缺字段）', thin.errors.length === 0 && inRange.errors.length === 0, [...thin.errors, ...inRange.errors].join(' | '))
+  await thin.ctx.close()
+  await inRange.ctx.close()
+
+  // 查询之后数据源改名或删掉了（E2W-6）：后端按查询当时记下的遮罩处理，行照样给，另带一句 mask_note。
+  // 这句写在窗口说明那一行、琥珀色：现在的数据源设置已经管不到这份快照了
+  const MASK_NOTE = '数据源「shop」现在找不到了（改名或删掉了），按查询当时记下的遮罩处理'
+  const gone = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, mask_note: MASK_NOTE } : st)) }))
+  await openQ(gone.page, '1,288')
+  const goneNote = gone.page.locator('[data-evidence-panel] [data-ev-query] [data-ev-query-mask-note]')
+  const [goneText, goneColor, amber, sameLine] = await Promise.all([
+    goneNote.innerText().catch(() => ''),
+    goneNote.evaluate((el) => getComputedStyle(el).color).catch(() => ''),
+    tokenColor(gone.page, 'color', 'var(--st-waiting)'),
+    goneNote.evaluate((el) => el.parentElement === el.closest('[data-ev-query]')?.querySelector('[data-ev-window]')?.parentElement).catch(() => false),
+  ])
+  check('数据源找不到了：mask_note 原话写出来', goneText === MASK_NOTE, goneText)
+  check('……琥珀色（--st-waiting），和窗口说明同一行', goneColor === amber && sameLine, `${goneColor} / ${amber} · 同一行 ${sameLine}`)
+  check('……行照样画、按记下的遮罩照样写「已遮罩」', await gone.page.locator('[data-evidence-panel] [data-ev-query] tbody tr').count() === 5
+    && await gone.page.locator('[data-evidence-panel] [data-ev-query] td[data-masked]').count() === 5)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await gone.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await gone.page.waitForTimeout(200)
+      await gone.page.locator('[data-evidence-panel]').screenshot({ path: `${SHOTS}/evidence-mask-note-${theme}.png` }).catch(() => {})
+    }
+  }
+  check('没有运行时报错（mask_note）', gone.errors.length === 0, gone.errors.join(' | '))
+  await gone.ctx.close()
+
+  // 窗口被截到 50 行（window_truncated）：被引用的另一格（第 41 行）不在窗口里，窗口里那一格照样标
+  const cut = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, window_truncated: true, total_rows: 60,
+        highlight: { rows: [5, 40], cols: ['amount'], cells: [[5, 'amount'], [40, 'amount']] } } : st)) }))
+  await openQ(cut.page, '1,288')
+  const cutCells = await cut.page.locator('[data-evidence-panel] td[data-highlight="cell"]').allInnerTexts()
+  check('窗口截断、有的被引用行不在窗口里：窗口里的那一格照样高亮，不是一格都不标', cutCells.join(',') === '1288'
+    && await cut.page.locator('[data-evidence-panel] tr[data-highlight="row"]').count() === 1, cutCells.join(',') || '一格都没标')
+  const cutRows = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, window_truncated: true, highlight: { rows: [5, 40], cols: ['amount'] } } : st)) }))
+  await openQ(cutRows.page, '1,288')
+  check('……只给 rows × cols 时同样只标窗口里的那一行', (await cutRows.page.locator('[data-evidence-panel] td[data-highlight="cell"]').allInnerTexts()).join(',') === '1288')
+  await cut.ctx.close()
+  await cutRows.ctx.close()
+
+  // 解析不了的单元格引用（行越界）：后端不给链。上面已经说了原因，不能再摆一块「查询的行这一次没取到」
+  const REASON = 'Q3 要第 99 行，但这份查询结果只有 12 行（从 0 数）'
+  const broken = (seg) => ({ ...seg, text: '⟦?v:Q3.r99.amount⟧', state: 'none', issue: 'unresolved_ref', ref: 'v:Q3.r99.amount',
+    cite: { ref: 'Q3.r99.amount', alias: 'Q3', kind: 'cell', role: 'value', status: 'unresolved', reason: REASON } })
+  const target = qseg('1,288')
+  const bad = await probeQ((id, body) => (id === target
+    ? { ...body, segment: broken(body.segment), chain: [], note: `引用解析不了：${REASON}` } : body), {
+    patchQuery: (f) => {
+      for (const b of f.doc.blocks) for (const u of b.units ?? []) u.segments = (u.segments ?? []).map((sg) => (sg.id === target ? broken(sg) : sg))
+      return f
+    },
+  })
+  await bad.page.locator(`${Q} [data-seg="${target}"]`).click()
+  await bad.page.waitForSelector('[data-evidence-panel] [data-ev-reason]', { timeout: 4000 }).catch(() => {})
+  await bad.page.waitForTimeout(150)
+  const said = await bad.page.locator('[data-evidence-panel]').innerText().catch(() => '')
+  check('解析不了的单元格引用：说清原因（行越界）', said.includes(REASON), said.replace(/\s+/g, ' ').slice(0, 200))
+  check('……不再摆「查询 Q3 · 这一次没取到」，那像是接口出了错', await bad.page.locator('[data-evidence-panel] [data-ev-query-missing]').count() === 0
+    && !said.includes('没取到'), said.replace(/\s+/g, ' ').slice(0, 200))
+  check('没有运行时报错（截断、解析不了）', cut.errors.length === 0 && bad.errors.length === 0, [...cut.errors, ...bad.errors].join(' | '))
+  await bad.ctx.close()
+})
+
 await section('pinned', '没有 _evidence 的旧回答：和 Markdown.tsx 改动前逐字一样', async () => {
   // markdown-pinned.json 里的 html 是改动前（HEAD b418c0d）的 Markdown.tsx 渲染的。重新生成：把
   // `git show <旧提交>:frontend/src/run/Markdown.tsx` 临时放进 src/run/，另起一个页面逐个渲染
@@ -675,6 +1133,179 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
     }
   }
   check('没有运行时报错（画布）', errors.length === 0, errors.join(' | '))
+  await ctx.close()
+})
+
+await section('config', '配置项：agent 的 cite_fields、code 的证据角色、口径卡钉住上游（caliber_from + upgrade_policy）', async () => {
+  // 假的工作流和上游，读写都在浏览器层拦下：GET 回假的，写一律 409，不落库
+  const node = (id, type, x, label, config = {}) => ({ id, type, position: { x, y: 80 }, data: { label, config } })
+  const graph = {
+    nodes: [
+      node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+      node('fetch', 'agent', 240, '查数', { prompt: '查本周销售额', tools: ['db_query__shop'] }),
+      node('calc', 'code', 480, '换算', { language: 'python', code: 'print(1)' }),
+      node('caliber', 'metrics', 720, '周报口径', { caliber: '周报口径', caliber_version: 'v2',
+        metrics: [{ id: 'gmv', name: '销售额', unit: '元', expression: 'vars.kpi.gmv' }] }),
+      node('sub', 'subgraph', 960, '方法卡', { workflow_id: 'fx-weekly', input: {} }),
+    ],
+    edges: [['in', 'fetch'], ['fetch', 'calc'], ['calc', 'caliber'], ['caliber', 'sub']].map(([source, target]) => ({ id: `${source}-${target}`, source, target })),
+  }
+  const stamp = { tags: [], is_template: false, status: 'draft', published_version: null, run_count: 0,
+    created_at: '2026-09-26T00:00:00Z', updated_at: '2026-09-26T00:00:00Z', description: '' }
+  const wf = { id: 'fx-config', name: '配置项检查', graph, version: 1, ...stamp }
+  const upstream = { id: 'fx-weekly', name: '销售周报', graph: { nodes: [], edges: [] }, version: 6, ...stamp, status: 'published', published_version: 6 }
+  const pinnedGraph = { nodes: [
+    node('caliber', 'metrics', 0, '周报口径', { caliber: '周报口径', caliber_version: 'v3',
+      metrics: [{ id: 'gmv', name: '销售额', expression: 'vars.kpi.gmv' }, { id: 'aov', name: '客单价', expression: 'vars.kpi.gmv / vars.kpi.order_cnt' }] }),
+    node('write', 'report', 240, '写周报', {}),
+  ], edges: [] }
+  const versions = [5, 6].map((v) => ({ id: `v${v}`, version: v, note: v === 6 ? '改了客单价口径' : '', published: v === 6 }))
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+  const p = await ctx.newPage()
+  p.setDefaultTimeout(8000)
+  const errors = []
+  p.on('pageerror', (e) => errors.push(e.message))
+  const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+  await p.route(/\/api\/workflows(\?.*)?$/, (r) => (r.request().method() === 'GET' ? json(r, [wf, upstream]) : json(r, { detail: '检查脚本不写库' }, 409)))
+  await p.route(/\/api\/workflows\/fx-config(\/.*)?(\?.*)?$/, (r) =>
+    (r.request().method() === 'GET' && !new URL(r.request().url()).pathname.endsWith('/versions') ? json(r, wf) : json(r, [])))
+  await p.route(/\/api\/workflows\/fx-weekly\/versions(\/\d+)?$/, (r) => {
+    const m = new URL(r.request().url()).pathname.match(/\/versions\/(\d+)$/)
+    return m ? json(r, { ...versions.find((v) => v.version === Number(m[1])), workflow_id: 'fx-weekly', graph: pinnedGraph }) : json(r, versions)
+  })
+  await p.route(/\/api\/conversations(\/.*)?(\?.*)?$/, (r) =>
+    (r.request().method() === 'GET' ? json(r, []) : json(r, { id: 'fx-conv', kind: 'canvas', title: '', turns: [] })))
+  await p.route(/\/api\/runs(\/.*)?(\?.*)?$/, (r) => (r.request().method() === 'GET' ? r.continue() : json(r, { detail: '不发起运行' }, 409)))
+  await p.goto(`${WEB}/studio/fx-config`, { waitUntil: 'networkidle' })
+  await p.waitForFunction(() => window.__studio?.getState().workflow?.id === 'fx-config', null, { timeout: 15000 })
+  await p.waitForTimeout(500)
+  const cfg = (id) => p.evaluate((id) => window.__studio.getState().nodes.find((n) => n.id === id)?.data.config, id)
+  const advanced = async () => {
+    const t = p.getByRole('button', { name: /高级选项/ })
+    if ((await t.getAttribute('aria-expanded')) !== 'true') await t.click()
+  }
+
+  await p.evaluate(() => window.__studio.getState().select('fetch'))
+  await advanced()
+  const cite = p.locator('[data-field="cite_fields"]')
+  check('agent 有「按出处核对字段」开关，没写 Schema 时用不了并说清差什么', await cite.locator('input[type="checkbox"]').isDisabled()
+    && (await cite.innerText()).includes('先在上面写「结构化输出 Schema」'), (await cite.innerText()).replace(/\s+/g, ' ').slice(0, 120))
+  check('……说明会多一次抽取调用', (await cite.innerText()).includes('多一次抽取调用'))
+  check('output_schema 的说明写明要开 cite_fields 才生效', (await p.locator('[data-field="output_schema"]').innerText()).includes('按出处核对字段'))
+  await p.evaluate(() => {
+    const s = window.__studio.getState()
+    const n = s.nodes.find((x) => x.id === 'fetch')
+    s.updateNode('fetch', { config: { ...n.data.config, output_schema: { type: 'object', properties: { gmv: { type: 'number' } } } } })
+  })
+  await p.waitForTimeout(150)
+  check('写了 Schema：开关可用', !(await cite.locator('input[type="checkbox"]').isDisabled()) && await cite.locator('[id$="-off"]').count() === 0)
+  await cite.locator('input[type="checkbox"]').check()
+  check('……打开后写进 config.cite_fields', (await cfg('fetch'))?.cite_fields === true)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await p.waitForTimeout(200)
+      await p.screenshot({ path: `${SHOTS}/evidence-config-agent-${theme}.png` })
+    }
+  }
+  // 开着开关又把 Schema 清掉：不能锁死在「开」上，得还能关
+  await p.evaluate(() => {
+    const s = window.__studio.getState()
+    const { output_schema: _drop, ...rest } = s.nodes.find((x) => x.id === 'fetch').data.config
+    s.updateNode('fetch', { config: rest })
+  })
+  await p.waitForTimeout(150)
+  check('开着又清掉 Schema：开关不锁死，还能关', !(await cite.locator('input[type="checkbox"]').isDisabled())
+    && await cite.getAttribute('data-disabled') === null && await cite.locator('[id$="-off"]').count() === 0)
+  await cite.locator('input[type="checkbox"]').uncheck({ timeout: 2000 }).catch(() => {})
+  check('……关掉后 config.cite_fields 不再为真；关掉之后才锁上', !(await cfg('fetch'))?.cite_fields
+    && await cite.locator('input[type="checkbox"]').isDisabled())
+
+  await p.evaluate(() => window.__studio.getState().select('calc'))
+  await advanced()
+  const role = p.locator('[data-field="evidence_role"]')
+  const opts = await role.locator('option').allInnerTexts()
+  check('code 有「证据角色」下拉：计算（默认）/ 取数', opts.join('|') === '计算（默认）|取数', opts.join('|'))
+  check('……说明报告不能直接引用代码节点的产出', (await role.innerText()).includes('报告不能直接引用代码节点的产出'))
+  await role.locator('select').selectOption('source')
+  check('……选「取数」写进 config.evidence_role', (await cfg('calc'))?.evidence_role === 'source')
+
+  await p.evaluate(() => window.__studio.getState().select('caliber'))
+  const from = p.locator('[data-field="caliber_from"]')
+  check('口径卡默认「在这里定义」，本地的名称、版本、指标都在', await from.locator('[data-caliber-from="local"]').count() === 1
+    && await p.locator('[data-field="metrics"]').count() === 1 && await p.locator('[data-field="upgrade_policy"]').count() === 0)
+  await from.getByRole('radio', { name: '钉住别的工作流里的口径卡' }).click()
+  await p.waitForTimeout(150)
+  check('切到钉住：本地定义收起（后端也说它们不生效），升版处置出来', await p.locator('[data-field="metrics"]').count() === 0
+    && await p.locator('[data-field="caliber"]').count() === 0 && await p.locator('[data-field="upgrade_policy"]').count() === 1)
+  const wfOpts = await from.locator('select').first().locator('option').allInnerTexts()
+  check('工作流下拉复用目录，不列自己', wfOpts.some((o) => o.includes('销售周报')) && !wfOpts.some((o) => o.includes('配置项检查')), wfOpts.join('|'))
+  await from.locator('select').first().selectOption('fx-weekly')
+  await p.waitForSelector('[data-field="caliber_from"] select[id$="-version"] option[value="5"]', { timeout: 4000 }).catch(() => {})
+  await from.locator('select[id$="-version"]').selectOption('5')
+  await p.waitForSelector('[data-field="caliber_from"] [data-caliber-preview]', { timeout: 4000 }).catch(() => {})
+  const c = await cfg('caliber')
+  check('选了工作流和版本：那一版只有一张口径卡时直接钉上，写成 {workflow_id, workflow_version（数）, node_id}',
+    JSON.stringify(c?.caliber_from) === JSON.stringify({ workflow_id: 'fx-weekly', workflow_version: 5, node_id: 'caliber' }), JSON.stringify(c?.caliber_from))
+  check('……本地的 metrics、caliber 不留在配置里', !('metrics' in (c ?? {})) && !('caliber' in (c ?? {})), JSON.stringify(Object.keys(c ?? {})))
+  const preview = await from.locator('[data-caliber-preview]').innerText().catch(() => '')
+  check('……预览钉住的那张卡：口径、版本、几个指标', preview.includes('周报口径') && preview.includes('v3') && preview.includes('2 个指标')
+    && preview.includes('aov'), preview.replace(/\s+/g, ' '))
+  const newer = await from.locator('[data-caliber-newer]').innerText().catch(() => '')
+  check('上游已有更新的版本：提醒正式运行前要声明升版处置', newer.includes('上游已有 v6') && newer.includes('升版处置'), newer)
+  const pol = await p.locator('[data-field="upgrade_policy"] option').allInnerTexts()
+  check('升版处置三选一，和子工作流同一套说法', pol.length === 4 && pol[0].includes('挡住正式运行') && pol.some((o) => o.includes('并排双印新旧口径')), pol.join('|'))
+  await p.locator('[data-field="upgrade_policy"] select').selectOption('dual')
+  check('……写进 config.upgrade_policy', (await cfg('caliber'))?.upgrade_policy === 'dual')
+  const card = await p.locator('.react-flow__node[data-id="caliber"]').innerText().catch(() => '')
+  check('画布卡片写「钉住上游口径卡 v5」，不再写「0 个指标」', card.includes('钉住上游口径卡 v5') && !card.includes('0 个指标'), card.replace(/\s+/g, ' ').slice(0, 120))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await p.waitForTimeout(200)
+      await p.screenshot({ path: `${SHOTS}/evidence-config-caliber-${theme}.png` })
+    }
+  }
+  await from.getByRole('radio', { name: '在这里定义' }).click()
+  await p.waitForTimeout(150)
+  const back = await cfg('caliber')
+  check('切回「在这里定义」：去掉 caliber_from 和 upgrade_policy，给回一条空指标', !('caliber_from' in back) && !('upgrade_policy' in back)
+    && Array.isArray(back.metrics) && back.metrics.length === 1 && await p.locator('[data-field="metrics"]').count() === 1, JSON.stringify(back))
+
+  // 子工作流钉住版本后的升版处置（E2W-7）：和口径卡的是同一个下拉、同一套文案
+  await p.evaluate(() => window.__studio.getState().select('sub'))
+  await p.waitForTimeout(150)
+  check('子工作流没钉版本（跟随最新）：不出升版处置', await p.locator('[data-field="upgrade_policy"]').count() === 0)
+  const subVersion = p.locator('[data-field="workflow_id"] select[id$="-version"]')
+  await p.waitForSelector('[data-field="workflow_id"] select[id$="-version"] option[value="5"]', { timeout: 4000 }).catch(() => {})
+  await subVersion.selectOption('5')
+  await p.waitForSelector('[data-field="upgrade_policy"]', { timeout: 3000 }).catch(() => {})
+  const subPol = await p.locator('[data-field="upgrade_policy"] option').allInnerTexts()
+  check('钉了 v5：升版处置出来，选项和口径卡的那个一字不差', subPol.length === 4 && JSON.stringify(subPol) === JSON.stringify(pol), subPol.join('|'))
+  check('……紧跟在「工作流」后面', await p.evaluate(() => {
+    const fields = [...document.querySelectorAll('[data-field]')].map((el) => el.getAttribute('data-field'))
+    return fields[fields.indexOf('workflow_id') + 1] === 'upgrade_policy'
+  }))
+  const subHelp = await p.locator('[data-field="upgrade_policy"]').innerText()
+  check('……说明换成子工作流这一侧：和钉住别处的口径卡同一套规则', subHelp.includes('和钉住别处的口径卡是同一套规则')
+    && !subHelp.includes('和子工作流的升版处置'), subHelp.replace(/\s+/g, ' ').slice(0, 120))
+  const subNewer = await p.locator('[data-field="workflow_id"] [data-subgraph-newer]').innerText().catch(() => '')
+  check('上游已有 v6：提醒要声明升版处置，和口径卡同一句', subNewer === newer, subNewer)
+  await p.locator('[data-field="upgrade_policy"] select').selectOption('recompute')
+  check('……写进子工作流的 config.upgrade_policy', (await cfg('sub'))?.upgrade_policy === 'recompute')
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await p.waitForTimeout(200)
+      await p.screenshot({ path: `${SHOTS}/evidence-config-subgraph-${theme}.png` })
+    }
+  }
+  await subVersion.selectOption('')
+  await p.waitForTimeout(150)
+  const unpinned = await cfg('sub')
+  check('改回跟随最新：upgrade_policy 一起拿掉、下拉收起', !('upgrade_policy' in unpinned) && !('workflow_version' in unpinned)
+    && await p.locator('[data-field="upgrade_policy"]').count() === 0, JSON.stringify(unpinned))
+  check('没有运行时报错（配置项）', errors.length === 0, errors.join(' | '))
   await ctx.close()
 })
 

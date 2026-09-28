@@ -644,6 +644,9 @@ function queryTitle(sql: string, source: string): string {
   return clip(`查询 ${what}${how ? ` · ${how}` : ''}`)
 }
 
+/** agent 开了 cite_fields 时循环结束后那次结构化抽取 */
+const EXTRACT_TITLE = '按出处抽取字段'
+
 /** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
 const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
 
@@ -698,6 +701,34 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
       return {
         title: `报告${n ? `有 ${n} 处` : ''}没通过核对，已让模型按清单重写${round ? `（第 ${round} 次）` : ''}`,
         sub: message.match(/没通过核对（(.+?)）/)?.[1],
+      }
+    }
+    case 'agent_field_mismatch': {
+      // 「有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234」（llm.py _field_warnings）
+      const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
+      return {
+        title: `有${n ? ` ${n} 个` : ''}字段和查询快照对不上，已按快照取值`,
+        sub: message.match(/已按快照取值[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
+        next: '下游用的是查询快照里的值，不是模型报的。模型报的数多半是抄错、四舍五入或自己算的',
+      }
+    }
+    case 'agent_field_unverified': {
+      // 两种原话：「有 N 个字段核对不了出处，记为空值（没有兜底成 0）：a（原因）；b（原因）」；
+      // 抽取没成：「<原因>。N 个字段都记为空值（没有兜底成 0）」，原因是「结构化抽取没跑成：<调用的错>」
+      // 或者「抽取结果不是一个对象」（llm.py 的 failed）
+      const failed = message.match(/^(?:结构化抽取没跑成[：:])?([\s\S]+?)。\s*(\d+)\s*个字段都记为空值/)
+      if (failed) {
+        return {
+          title: `按出处抽取字段没跑成，${failed[2]} 个字段记为空值（没有兜底成 0）`,
+          sub: failed[1].trim() || undefined,
+          next: '这些字段交给下游的是空值；口径卡按缺输入处理。原因解决后重跑',
+        }
+      }
+      const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
+      return {
+        title: `有${n ? ` ${n} 个` : ''}字段核对不了出处，记为空值（没有兜底成 0）`,
+        sub: message.match(/没有兜底成 0）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
+        next: '模型说的出处在查询结果里找不到。让它先查到这些字段再交，查不到的就是空',
       }
     }
     case 'repair_invented': {
@@ -1356,9 +1387,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 一出现就成行：模型想的那几十秒里得有一行在走，而不是等 end 才冒出来。
         // 团队成员和调度者的调用没有 start（它们的 end 只用来记账），不会走到这
         closeLlm(nodeId, 'done', at)
+        // agent 开了 cite_fields：循环结束后多一次结构化抽取，按出处把字段交出来。它不是在「作答」
+        const extract = d.purpose === 'cite_fields'
         const step: Step = {
-          id: `llm-${seq}`, seq, kind: 'llm', title: '思考并作答',
+          id: `llm-${seq}`, seq, kind: 'llm', title: extract ? EXTRACT_TITLE : '思考并作答',
           status: 'running', nodeId, startedAt: at,
+          ...(extract ? { code: 'cite_fields' } : {}),
           ...(d.model ? { detail: `模型：${d.model}` } : {}),
         }
         pendingLlm.set(nodeId ?? '_', step)
@@ -1388,6 +1422,13 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         step.ms = num(d.duration_ms)
         step.meta = dur(step.ms)
         if (d.model && !step.detail) step.detail = `模型：${d.model}`
+        if (d.purpose === 'cite_fields' && d.error) {
+          // 抽取没跑成：agent 的结论还在，字段记空值、接着发警告——节点不失败，这一行是提醒。
+          // 状态记成做完（琥珀色）而不是 failed：failed 会把这一行和「执行」那一栏的标头都画成红的
+          step.level = 'warn'
+          step.title = `${EXTRACT_TITLE}没跑成`
+          step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
+        }
         pendingLlm.delete(nodeId ?? '_')
         break
       }

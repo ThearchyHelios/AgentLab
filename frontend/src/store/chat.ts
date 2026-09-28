@@ -4,7 +4,7 @@ import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { decodeRun } from '../run/decode'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
-import { explainRunError } from '../lib/explain'
+import { explainRunError, explainStartError } from '../lib/explain'
 import { parseServerTime } from '../lib/format'
 import { useCatalog } from './catalog'
 import { useConversations } from './conversations'
@@ -483,6 +483,27 @@ function runFailure(error: string | null | undefined, detail?: string | null): F
 }
 
 const lineOf = (f: Failure) => (f.reason ? `${f.title}：${f.reason}` : f.title)
+
+/**
+ * 发起运行那一下被拒（POST /runs 的 ApiError）的说明。绑定的工具在本机不存在（422 run_tool_missing）
+ * 按 lib/explain 讲，带上直达入口（数据源工具去数据页，自定义 / MCP 工具去工具页），和画布上
+ * 发起被拒（run/RunControl）同一套；这时还没有运行 id，流里的报错块不会再拿原话认一遍，
+ * 所以入口得在这里就记进 failure。别的照旧按一句报错拆
+ */
+function startFailure(e: unknown): Failure {
+  const x = explainStartError(e)
+  if (!x) return failureOf(e)
+  return {
+    title: x.title,
+    reason: x.reason,
+    hint: x.action,
+    detail: x.raw && x.raw !== x.title ? x.raw : undefined,
+    continuable: false,
+    ...(x.fix ? { fix: x.fix } : {}),
+    ...(x.fixTo ? { fixTo: x.fixTo } : {}),
+    ...(e instanceof ApiError ? { source: e.message } : {}),
+  }
+}
 
 /** 运行记录被删了：没有断点可续，也补不回完整答案 */
 const GONE: Failure = {
@@ -1437,7 +1458,7 @@ async function launch(
     // 在这里不成立——这一页没有谁会替它重发
     const failure: Failure = isNetworkError(e)
       ? { ...failureOf(e, { hint: '后端连上之后点「重跑这一轮」，搭好的工作流不用重来。' }), rerun: true }
-      : failureOf(e)
+      : startFailure(e)
     patch(() => ({
       phase: 'error', status: PHASE_TEXT.error, error: lineOf(failure), failure,
       cancel: null, endedAt: Date.now(),

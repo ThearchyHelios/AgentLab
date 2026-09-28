@@ -44,6 +44,7 @@ const ORDER = [
   'run-states',      // 节点卡的运行态
   'canvas-fx',       // 画布表层的运行态
   'studio',          // 编排页的编辑
+  'publish',         // 发布前检查与自动修复：发布弹窗、问题面板
   'chat',            // 问数据
   'runs',            // 记录
   'manage',          // 数据、工具、知识、设置
@@ -53,7 +54,7 @@ const ORDER = [
 // 新加的检查不在表里就按 60 秒算
 const ESTIMATE = {
   'run-states': 220, 'canvas-fx': 181, stream: 162, studio: 125, chat: 124, manage: 115, runs: 91,
-  shell: 84, 'ui-kit': 69, ui: 61, evidence: 21, guards: 10, 'canvas-layout': 4, tokens: 1, trace: 1, decode: 1,
+  shell: 84, 'ui-kit': 69, ui: 61, evidence: 56, publish: 31, guards: 10, 'canvas-layout': 4, tokens: 1, trace: 1, decode: 1,
 }
 // 量时间最多、以前并行最容易挂的：同一时刻最多跑其中一项
 const EXCLUSIVE = new Set(['run-states', 'canvas-fx'])
@@ -61,7 +62,7 @@ const TIMEOUT_MS = Number(process.env.CHECK_TIMEOUT_MS ?? 15 * 60_000)
 // 各检查只跑其中几段、只跑一套主题的开关。壳里留着一个 ONLY=… 就会让整套检查悄悄只跑一小截，
 // 却照样报「全部通过」，所以一律不传给子进程
 const FILTERS = ['CHECK_ONLY', 'ONLY', 'THEMES', 'FX_ONLY', 'STUDIO_ONLY', 'RUN_STATES_ONLY', 'UI_KIT_ONLY', 'CHECK_THEME',
-  'EVIDENCE_ONLY']
+  'EVIDENCE_ONLY', 'PUBLISH_ONLY']
 // 新加的 check-*.mjs 忘了写进 ORDER 就永远不会跑：列出来提醒
 const unlisted = readdirSync(HERE)
   .map((f) => f.match(/^check-(.+)\.mjs$/)?.[1])

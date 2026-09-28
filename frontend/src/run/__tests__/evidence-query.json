@@ -1,0 +1,5614 @@
+{
+ "_comment": "可点击证据第二期（查询链、单元格、整表、口径卡来源）的前端夹具。报告文档由后端 evidence.py 的 compose_doc 真跑生成（查询快照走 loader）；片段接口的答复照 api/evidence.py 的形状拼（row_index、highlight.cells、masked、source、caliber_upgrade）。snapshots.Q3 是「打开完整快照」取回的工件内容（遮罩列已替换）。只用通用示例名。",
+ "run_id": "run-evidence-query",
+ "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+ "doc": {
+  "schema": "agentlab.report/1",
+  "run_id": "run-evidence-query",
+  "node_id": "write",
+  "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。\n\n退款率 —，新客 —：这次都没查到。\n\n扣掉促销后的调整后销售额是 44,000.0元，按汇率 7.12 折算。\n\n## 分区域\n\n华东销售额最高，为 18,230.5，其次是华南（12,004）。\n\n| region | amount | order_cnt |\n| --- | --- | --- |\n| 华东 | 18,230.5 | 402 |\n| 华南 | 12,004 | 311 |\n| 华北 | 9,876 | 298 |\n\n## 明细\n\n单笔最大的一单金额是 1,288，来自华南。最大的一单比最后一单多 672.5元。",
+  "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[m:gmv]]，订单 [[m:orders]]，客单价 [[m:aov]]，环比 [[m:wow]]。[[see:m:gmv,m:orders,m:aov,m:wow]]\n\n退款率 [[m:refund_rate]]，新客 [[m:new_users]]：这次都没查到。\n\n扣掉促销后的调整后销售额是 [[m:adj]]，按汇率 [[m:fx]] 折算。\n\n## 分区域\n\n[[v:Q2.r0.region]]销售额最高，为 [[v:Q2.r0.amount]]，其次是[[v:Q2.r1.region]]（[[v:Q2.r1.amount]]）。[[see:Q2]]\n\n[[table:Q2 cols=region,amount,order_cnt rows=0-2]]\n\n## 明细\n\n单笔最大的一单金额是 [[v:Q3.r5.amount]]，来自[[v:Q3.r5.region]]。最大的一单比最后一单多 [[m:spread]]。",
+  "catalog": {
+   "m:gmv": {
+    "alias": "m:gmv",
+    "kind": "metric",
+    "eid": "ev:metric:8e9e5fdb2eddb7a0",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "gmv"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "销售额",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 45678.5,
+    "status": "ok",
+    "rendered": "45,678.5元",
+    "label": "销售额 = 45,678.5元"
+   },
+   "m:orders": {
+    "alias": "m:orders",
+    "kind": "metric",
+    "eid": "ev:metric:d7c6de7d408a70d2",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "orders"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "订单数",
+    "unit": "单",
+    "decimals": 0,
+    "format": "thousands",
+    "value": 1234,
+    "status": "ok",
+    "rendered": "1,234单",
+    "label": "订单数 = 1,234单"
+   },
+   "m:aov": {
+    "alias": "m:aov",
+    "kind": "metric",
+    "eid": "ev:metric:72d2a805ddf72604",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "aov"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "客单价",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 37.0,
+    "status": "ok",
+    "rendered": "37.0元",
+    "label": "客单价 = 37.0元"
+   },
+   "m:wow": {
+    "alias": "m:wow",
+    "kind": "metric",
+    "eid": "ev:metric:74c193598c403111",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "wow"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "环比增幅",
+    "unit": "%",
+    "decimals": 1,
+    "format": "plain",
+    "value": 8.7,
+    "status": "ok",
+    "rendered": "8.7%",
+    "label": "环比增幅 = 8.7%"
+   },
+   "m:refund_rate": {
+    "alias": "m:refund_rate",
+    "kind": "metric",
+    "eid": "ev:metric:1f7a71663ab15697",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "refund_rate"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "退款率",
+    "unit": "",
+    "decimals": 4,
+    "format": "percent_of_ratio",
+    "value": null,
+    "status": "missing_input",
+    "rendered": "—",
+    "label": "退款率 = —"
+   },
+   "m:new_users": {
+    "alias": "m:new_users",
+    "kind": "metric",
+    "eid": "ev:metric:4430c7b636713290",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "new_users"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "新客数",
+    "unit": "人",
+    "decimals": 0,
+    "format": "thousands",
+    "value": null,
+    "status": "missing_input",
+    "rendered": "—",
+    "label": "新客数 = —"
+   },
+   "m:adj": {
+    "alias": "m:adj",
+    "kind": "metric",
+    "eid": "ev:metric:b9c97d4b59a25a23",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "adj"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "调整后销售额",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 44000,
+    "status": "ok",
+    "rendered": "44,000.0元",
+    "label": "调整后销售额 = 44,000.0元"
+   },
+   "m:fx": {
+    "alias": "m:fx",
+    "kind": "metric",
+    "eid": "ev:metric:86539c1b7e4afa0e",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "fx"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "汇率",
+    "unit": "",
+    "decimals": 2,
+    "format": "plain",
+    "value": 7.12,
+    "status": "ok",
+    "rendered": "7.12",
+    "label": "汇率 = 7.12"
+   },
+   "m:spread": {
+    "alias": "m:spread",
+    "kind": "metric",
+    "eid": "ev:metric:dea437737bb0dfa8",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "locator": {
+     "metric": "spread"
+    },
+    "caliber": "周报口径",
+    "version": "v3",
+    "name": "最大一单比最后一单多",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 672.5,
+    "status": "ok",
+    "rendered": "672.5元",
+    "label": "最大一单比最后一单多 = 672.5元"
+   },
+   "Q1": {
+    "alias": "Q1",
+    "kind": "query",
+    "eid": "ev:query:925e2c675e777fe6",
+    "locator": {},
+    "node_id": "fetch",
+    "exec": 1,
+    "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+    "via": "3ac8020600f10936e15e0c96adddc451a119b32731970f259d71fe118e46d253",
+    "call_id": "toolu_01",
+    "tool": "db_query__shop",
+    "source": "shop",
+    "columns": [
+     "gmv",
+     "order_cnt",
+     "refund_cnt"
+    ],
+    "rows": 1,
+    "truncated": false,
+    "label": "db_query__shop · 1 行"
+   },
+   "Q2": {
+    "alias": "Q2",
+    "kind": "query",
+    "eid": "ev:query:c56e2ba849184526",
+    "locator": {},
+    "node_id": "fetch",
+    "exec": 1,
+    "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+    "via": "1ed3e0dd1a88c3ab6387e74e5d4fd0057ca4e46302537ef72baf2cd698a5204b",
+    "call_id": "toolu_02",
+    "tool": "db_query__shop",
+    "source": "shop",
+    "columns": [
+     "region",
+     "amount",
+     "order_cnt"
+    ],
+    "rows": 4,
+    "truncated": false,
+    "label": "db_query__shop · 4 行"
+   },
+   "Q3": {
+    "alias": "Q3",
+    "kind": "query",
+    "eid": "ev:query:a452d03387ba7d32",
+    "locator": {},
+    "node_id": "fetch",
+    "exec": 1,
+    "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+    "via": "3c97296442379baa383f841059c0671b39fefc0a8b84cbf4897eaed04e32af82",
+    "call_id": "toolu_03",
+    "tool": "db_query__shop",
+    "source": "shop",
+    "columns": [
+     "order_id",
+     "region",
+     "amount",
+     "phone"
+    ],
+    "rows": 12,
+    "truncated": false,
+    "label": "db_query__shop · 12 行"
+   },
+   "Q4": {
+    "alias": "Q4",
+    "kind": "query",
+    "eid": "ev:query:71bc8f01ba32cda2",
+    "locator": {},
+    "node_id": "pull",
+    "exec": 1,
+    "artifact": "30fe0bb2c76a873f0f3dc2bd244b6ba655d7af7a4f4e863630d353cfab42b3ad",
+    "via": "e5fdd7a1ca18dab9e579d1245df8a730a83b4e6e43a271ecb9378d0fc7dfb22a",
+    "tool": "db_query__shop",
+    "source": "shop",
+    "columns": [
+     "gmv"
+    ],
+    "rows": 1,
+    "truncated": false,
+    "label": "db_query__shop · 1 行"
+   },
+   "i:week": {
+    "alias": "i:week",
+    "kind": "input",
+    "eid": "ev:input:a398c5e60abfeedd",
+    "locator": {
+     "field": "week"
+    },
+    "value": "2026-W37",
+    "rendered": "2026-W37",
+    "label": "week = 2026-W37"
+   }
+  },
+  "blocks": [
+   {
+    "type": "heading",
+    "level": 2,
+    "units": [
+     {
+      "id": "u0",
+      "kind": "heading",
+      "span": [
+       3,
+       7
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "## ",
+        "state": "neutral",
+        "span": [
+         0,
+         3
+        ],
+        "id": "s0"
+       },
+       {
+        "kind": "text",
+        "text": "本周概览",
+        "state": "neutral",
+        "span": [
+         3,
+         7
+        ],
+        "id": "s1"
+       }
+      ]
+     }
+    ],
+    "id": "b0"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u1",
+      "kind": "claim",
+      "span": [
+       9,
+       63
+      ],
+      "cites": [
+       "i:week",
+       "m:gmv",
+       "m:orders",
+       "m:aov",
+       "m:wow"
+      ],
+      "see": [
+       {
+        "ref": "m:gmv",
+        "role": "support",
+        "alias": "m:gmv",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:8e9e5fdb2eddb7a0",
+        "locator": {
+         "metric": "gmv"
+        }
+       },
+       {
+        "ref": "m:orders",
+        "role": "support",
+        "alias": "m:orders",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:d7c6de7d408a70d2",
+        "locator": {
+         "metric": "orders"
+        }
+       },
+       {
+        "ref": "m:aov",
+        "role": "support",
+        "alias": "m:aov",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:72d2a805ddf72604",
+        "locator": {
+         "metric": "aov"
+        }
+       },
+       {
+        "ref": "m:wow",
+        "role": "support",
+        "alias": "m:wow",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:74c193598c403111",
+        "locator": {
+         "metric": "wow"
+        }
+       }
+      ],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         7,
+         9
+        ],
+        "id": "s2"
+       },
+       {
+        "kind": "text",
+        "text": "本周（",
+        "state": "neutral",
+        "span": [
+         9,
+         12
+        ],
+        "id": "s3"
+       },
+       {
+        "kind": "value",
+        "text": "2026-W37",
+        "ref": "i:week",
+        "cite": {
+         "ref": "week",
+         "alias": "i:week",
+         "locator": {
+          "field": "week"
+         },
+         "eid": "ev:input:a398c5e60abfeedd",
+         "kind": "input",
+         "role": "value",
+         "status": "resolved",
+         "value": "2026-W37",
+         "rendered": "2026-W37"
+        },
+        "state": "deterministic",
+        "span": [
+         12,
+         20
+        ],
+        "id": "s4"
+       },
+       {
+        "kind": "text",
+        "text": "）销售额 ",
+        "state": "neutral",
+        "span": [
+         20,
+         25
+        ],
+        "id": "s5"
+       },
+       {
+        "kind": "number",
+        "text": "45,678.5元",
+        "ref": "m:gmv",
+        "cite": {
+         "ref": "gmv",
+         "alias": "m:gmv",
+         "locator": {
+          "metric": "gmv"
+         },
+         "eid": "ev:metric:8e9e5fdb2eddb7a0",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 45678.5,
+         "rendered": "45,678.5元"
+        },
+        "state": "deterministic",
+        "span": [
+         25,
+         34
+        ],
+        "id": "s6"
+       },
+       {
+        "kind": "text",
+        "text": "，订单 ",
+        "state": "neutral",
+        "span": [
+         34,
+         38
+        ],
+        "id": "s7"
+       },
+       {
+        "kind": "number",
+        "text": "1,234单",
+        "ref": "m:orders",
+        "cite": {
+         "ref": "orders",
+         "alias": "m:orders",
+         "locator": {
+          "metric": "orders"
+         },
+         "eid": "ev:metric:d7c6de7d408a70d2",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 1234,
+         "rendered": "1,234单"
+        },
+        "state": "deterministic",
+        "span": [
+         38,
+         44
+        ],
+        "id": "s8"
+       },
+       {
+        "kind": "text",
+        "text": "，客单价 ",
+        "state": "neutral",
+        "span": [
+         44,
+         49
+        ],
+        "id": "s9"
+       },
+       {
+        "kind": "number",
+        "text": "37.0元",
+        "ref": "m:aov",
+        "cite": {
+         "ref": "aov",
+         "alias": "m:aov",
+         "locator": {
+          "metric": "aov"
+         },
+         "eid": "ev:metric:72d2a805ddf72604",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 37.0,
+         "rendered": "37.0元"
+        },
+        "state": "deterministic",
+        "span": [
+         49,
+         54
+        ],
+        "id": "s10"
+       },
+       {
+        "kind": "text",
+        "text": "，环比 ",
+        "state": "neutral",
+        "span": [
+         54,
+         58
+        ],
+        "id": "s11"
+       },
+       {
+        "kind": "number",
+        "text": "8.7%",
+        "ref": "m:wow",
+        "cite": {
+         "ref": "wow",
+         "alias": "m:wow",
+         "locator": {
+          "metric": "wow"
+         },
+         "eid": "ev:metric:74c193598c403111",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 8.7,
+         "rendered": "8.7%"
+        },
+        "state": "deterministic",
+        "span": [
+         58,
+         62
+        ],
+        "id": "s12"
+       },
+       {
+        "kind": "text",
+        "text": "。",
+        "state": "neutral",
+        "span": [
+         62,
+         63
+        ],
+        "id": "s13"
+       }
+      ]
+     }
+    ],
+    "id": "b1"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u2",
+      "kind": "claim",
+      "span": [
+       65,
+       83
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         63,
+         65
+        ],
+        "id": "s14"
+       },
+       {
+        "kind": "text",
+        "text": "退款率 ",
+        "state": "neutral",
+        "span": [
+         65,
+         69
+        ],
+        "id": "s15"
+       },
+       {
+        "kind": "number",
+        "text": "—",
+        "ref": "m:refund_rate",
+        "cite": {
+         "ref": "refund_rate",
+         "alias": "m:refund_rate",
+         "kind": "metric",
+         "role": "value",
+         "status": "unresolved",
+         "reason": "指标「退款率」这次没有值（缺输入），不能写进报告",
+         "rendered": "—"
+        },
+        "state": "none",
+        "issue": "unresolved_ref",
+        "span": [
+         69,
+         70
+        ],
+        "id": "s16"
+       },
+       {
+        "kind": "text",
+        "text": "，新客 ",
+        "state": "neutral",
+        "span": [
+         70,
+         74
+        ],
+        "id": "s17"
+       },
+       {
+        "kind": "number",
+        "text": "—",
+        "ref": "m:new_users",
+        "cite": {
+         "ref": "new_users",
+         "alias": "m:new_users",
+         "kind": "metric",
+         "role": "value",
+         "status": "unresolved",
+         "reason": "指标「新客数」这次没有值（缺输入），不能写进报告",
+         "rendered": "—"
+        },
+        "state": "none",
+        "issue": "unresolved_ref",
+        "span": [
+         74,
+         75
+        ],
+        "id": "s18"
+       },
+       {
+        "kind": "text",
+        "text": "：这次都没查到。",
+        "state": "neutral",
+        "span": [
+         75,
+         83
+        ],
+        "id": "s19"
+       }
+      ]
+     }
+    ],
+    "id": "b2"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u3",
+      "kind": "claim",
+      "span": [
+       85,
+       121
+      ],
+      "cites": [
+       "m:adj",
+       "m:fx"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         83,
+         85
+        ],
+        "id": "s20"
+       },
+       {
+        "kind": "text",
+        "text": "扣掉促销后的调整后销售额是 ",
+        "state": "neutral",
+        "span": [
+         85,
+         99
+        ],
+        "id": "s21"
+       },
+       {
+        "kind": "number",
+        "text": "44,000.0元",
+        "ref": "m:adj",
+        "cite": {
+         "ref": "adj",
+         "alias": "m:adj",
+         "locator": {
+          "metric": "adj"
+         },
+         "eid": "ev:metric:b9c97d4b59a25a23",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 44000,
+         "rendered": "44,000.0元"
+        },
+        "state": "deterministic",
+        "span": [
+         99,
+         108
+        ],
+        "id": "s22"
+       },
+       {
+        "kind": "text",
+        "text": "，按汇率 ",
+        "state": "neutral",
+        "span": [
+         108,
+         113
+        ],
+        "id": "s23"
+       },
+       {
+        "kind": "number",
+        "text": "7.12",
+        "ref": "m:fx",
+        "cite": {
+         "ref": "fx",
+         "alias": "m:fx",
+         "locator": {
+          "metric": "fx"
+         },
+         "eid": "ev:metric:86539c1b7e4afa0e",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 7.12,
+         "rendered": "7.12"
+        },
+        "state": "deterministic",
+        "span": [
+         113,
+         117
+        ],
+        "id": "s24"
+       },
+       {
+        "kind": "text",
+        "text": " 折算。",
+        "state": "neutral",
+        "span": [
+         117,
+         121
+        ],
+        "id": "s25"
+       }
+      ]
+     }
+    ],
+    "id": "b3"
+   },
+   {
+    "type": "heading",
+    "level": 2,
+    "units": [
+     {
+      "id": "u4",
+      "kind": "heading",
+      "span": [
+       126,
+       129
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n## ",
+        "state": "neutral",
+        "span": [
+         121,
+         126
+        ],
+        "id": "s26"
+       },
+       {
+        "kind": "text",
+        "text": "分区域",
+        "state": "neutral",
+        "span": [
+         126,
+         129
+        ],
+        "id": "s27"
+       }
+      ]
+     }
+    ],
+    "id": "b4"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u5",
+      "kind": "claim",
+      "span": [
+       131,
+       164
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [
+       {
+        "ref": "Q2",
+        "role": "support",
+        "alias": "Q2",
+        "kind": "query",
+        "status": "resolved",
+        "eid": "ev:query:c56e2ba849184526",
+        "locator": {}
+       }
+      ],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         129,
+         131
+        ],
+        "id": "s28"
+       },
+       {
+        "kind": "value",
+        "text": "华东",
+        "ref": "v:Q2.r0.region",
+        "cite": {
+         "ref": "Q2.r0.region",
+         "alias": "Q2",
+         "locator": {
+          "row": 0,
+          "column": "region"
+         },
+         "eid": "ev:cell:39caf88002d122ff",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华东",
+         "rendered": "华东"
+        },
+        "state": "deterministic",
+        "span": [
+         131,
+         133
+        ],
+        "id": "s29"
+       },
+       {
+        "kind": "text",
+        "text": "销售额最高，为 ",
+        "state": "neutral",
+        "span": [
+         133,
+         141
+        ],
+        "id": "s30"
+       },
+       {
+        "kind": "number",
+        "text": "18,230.5",
+        "ref": "v:Q2.r0.amount",
+        "cite": {
+         "ref": "Q2.r0.amount",
+         "alias": "Q2",
+         "locator": {
+          "row": 0,
+          "column": "amount"
+         },
+         "eid": "ev:cell:0803f091d4c868cd",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 18230.5,
+         "rendered": "18,230.5"
+        },
+        "state": "deterministic",
+        "span": [
+         141,
+         149
+        ],
+        "id": "s31"
+       },
+       {
+        "kind": "text",
+        "text": "，其次是",
+        "state": "neutral",
+        "span": [
+         149,
+         153
+        ],
+        "id": "s32"
+       },
+       {
+        "kind": "value",
+        "text": "华南",
+        "ref": "v:Q2.r1.region",
+        "cite": {
+         "ref": "Q2.r1.region",
+         "alias": "Q2",
+         "locator": {
+          "row": 1,
+          "column": "region"
+         },
+         "eid": "ev:cell:7a7cb1e58c599f14",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华南",
+         "rendered": "华南"
+        },
+        "state": "deterministic",
+        "span": [
+         153,
+         155
+        ],
+        "id": "s33"
+       },
+       {
+        "kind": "text",
+        "text": "（",
+        "state": "neutral",
+        "span": [
+         155,
+         156
+        ],
+        "id": "s34"
+       },
+       {
+        "kind": "number",
+        "text": "12,004",
+        "ref": "v:Q2.r1.amount",
+        "cite": {
+         "ref": "Q2.r1.amount",
+         "alias": "Q2",
+         "locator": {
+          "row": 1,
+          "column": "amount"
+         },
+         "eid": "ev:cell:85b22e06175c4c74",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 12004.0,
+         "rendered": "12,004"
+        },
+        "state": "deterministic",
+        "span": [
+         156,
+         162
+        ],
+        "id": "s35"
+       },
+       {
+        "kind": "text",
+        "text": "）。",
+        "state": "neutral",
+        "span": [
+         162,
+         164
+        ],
+        "id": "s36"
+       }
+      ]
+     }
+    ],
+    "id": "b5"
+   },
+   {
+    "type": "table",
+    "units": [
+     {
+      "id": "u6",
+      "kind": "connective",
+      "span": [
+       168,
+       174
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n| ",
+        "state": "neutral",
+        "span": [
+         164,
+         168
+        ],
+        "id": "s37"
+       },
+       {
+        "kind": "text",
+        "text": "region",
+        "state": "neutral",
+        "span": [
+         168,
+         174
+        ],
+        "id": "s38"
+       }
+      ],
+      "loc": {
+       "row": -1,
+       "col": 0
+      }
+     },
+     {
+      "id": "u7",
+      "kind": "connective",
+      "span": [
+       177,
+       183
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         174,
+         177
+        ],
+        "id": "s39"
+       },
+       {
+        "kind": "text",
+        "text": "amount",
+        "state": "neutral",
+        "span": [
+         177,
+         183
+        ],
+        "id": "s40"
+       }
+      ],
+      "loc": {
+       "row": -1,
+       "col": 1
+      }
+     },
+     {
+      "id": "u8",
+      "kind": "connective",
+      "span": [
+       186,
+       195
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         183,
+         186
+        ],
+        "id": "s41"
+       },
+       {
+        "kind": "text",
+        "text": "order_cnt",
+        "state": "neutral",
+        "span": [
+         186,
+         195
+        ],
+        "id": "s42"
+       }
+      ],
+      "loc": {
+       "row": -1,
+       "col": 2
+      }
+     },
+     {
+      "id": "u9",
+      "kind": "claim",
+      "span": [
+       220,
+       222
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n| --- | --- | --- |\n| ",
+        "state": "neutral",
+        "span": [
+         195,
+         220
+        ],
+        "id": "s43"
+       },
+       {
+        "kind": "value",
+        "text": "华东",
+        "ref": "v:Q2.r0.region",
+        "cite": {
+         "ref": "Q2.r0.region",
+         "alias": "Q2",
+         "locator": {
+          "row": 0,
+          "column": "region"
+         },
+         "eid": "ev:cell:39caf88002d122ff",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华东",
+         "rendered": "华东"
+        },
+        "state": "deterministic",
+        "span": [
+         220,
+         222
+        ],
+        "id": "s44"
+       }
+      ],
+      "loc": {
+       "row": 0,
+       "col": 0
+      }
+     },
+     {
+      "id": "u10",
+      "kind": "claim",
+      "span": [
+       225,
+       233
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         222,
+         225
+        ],
+        "id": "s45"
+       },
+       {
+        "kind": "number",
+        "text": "18,230.5",
+        "ref": "v:Q2.r0.amount",
+        "cite": {
+         "ref": "Q2.r0.amount",
+         "alias": "Q2",
+         "locator": {
+          "row": 0,
+          "column": "amount"
+         },
+         "eid": "ev:cell:0803f091d4c868cd",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 18230.5,
+         "rendered": "18,230.5"
+        },
+        "state": "deterministic",
+        "span": [
+         225,
+         233
+        ],
+        "id": "s46"
+       }
+      ],
+      "loc": {
+       "row": 0,
+       "col": 1
+      }
+     },
+     {
+      "id": "u11",
+      "kind": "claim",
+      "span": [
+       236,
+       239
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         233,
+         236
+        ],
+        "id": "s47"
+       },
+       {
+        "kind": "number",
+        "text": "402",
+        "ref": "v:Q2.r0.order_cnt",
+        "cite": {
+         "ref": "Q2.r0.order_cnt",
+         "alias": "Q2",
+         "locator": {
+          "row": 0,
+          "column": "order_cnt"
+         },
+         "eid": "ev:cell:c6ba44059fc49fa7",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 402,
+         "rendered": "402"
+        },
+        "state": "deterministic",
+        "span": [
+         236,
+         239
+        ],
+        "id": "s48"
+       }
+      ],
+      "loc": {
+       "row": 0,
+       "col": 2
+      }
+     },
+     {
+      "id": "u12",
+      "kind": "claim",
+      "span": [
+       244,
+       246
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n| ",
+        "state": "neutral",
+        "span": [
+         239,
+         244
+        ],
+        "id": "s49"
+       },
+       {
+        "kind": "value",
+        "text": "华南",
+        "ref": "v:Q2.r1.region",
+        "cite": {
+         "ref": "Q2.r1.region",
+         "alias": "Q2",
+         "locator": {
+          "row": 1,
+          "column": "region"
+         },
+         "eid": "ev:cell:7a7cb1e58c599f14",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华南",
+         "rendered": "华南"
+        },
+        "state": "deterministic",
+        "span": [
+         244,
+         246
+        ],
+        "id": "s50"
+       }
+      ],
+      "loc": {
+       "row": 1,
+       "col": 0
+      }
+     },
+     {
+      "id": "u13",
+      "kind": "claim",
+      "span": [
+       249,
+       255
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         246,
+         249
+        ],
+        "id": "s51"
+       },
+       {
+        "kind": "number",
+        "text": "12,004",
+        "ref": "v:Q2.r1.amount",
+        "cite": {
+         "ref": "Q2.r1.amount",
+         "alias": "Q2",
+         "locator": {
+          "row": 1,
+          "column": "amount"
+         },
+         "eid": "ev:cell:85b22e06175c4c74",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 12004.0,
+         "rendered": "12,004"
+        },
+        "state": "deterministic",
+        "span": [
+         249,
+         255
+        ],
+        "id": "s52"
+       }
+      ],
+      "loc": {
+       "row": 1,
+       "col": 1
+      }
+     },
+     {
+      "id": "u14",
+      "kind": "claim",
+      "span": [
+       258,
+       261
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         255,
+         258
+        ],
+        "id": "s53"
+       },
+       {
+        "kind": "number",
+        "text": "311",
+        "ref": "v:Q2.r1.order_cnt",
+        "cite": {
+         "ref": "Q2.r1.order_cnt",
+         "alias": "Q2",
+         "locator": {
+          "row": 1,
+          "column": "order_cnt"
+         },
+         "eid": "ev:cell:601c63ce11c38099",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 311,
+         "rendered": "311"
+        },
+        "state": "deterministic",
+        "span": [
+         258,
+         261
+        ],
+        "id": "s54"
+       }
+      ],
+      "loc": {
+       "row": 1,
+       "col": 2
+      }
+     },
+     {
+      "id": "u15",
+      "kind": "claim",
+      "span": [
+       266,
+       268
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n| ",
+        "state": "neutral",
+        "span": [
+         261,
+         266
+        ],
+        "id": "s55"
+       },
+       {
+        "kind": "value",
+        "text": "华北",
+        "ref": "v:Q2.r2.region",
+        "cite": {
+         "ref": "Q2.r2.region",
+         "alias": "Q2",
+         "locator": {
+          "row": 2,
+          "column": "region"
+         },
+         "eid": "ev:cell:f18c3397a51b4e54",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华北",
+         "rendered": "华北"
+        },
+        "state": "deterministic",
+        "span": [
+         266,
+         268
+        ],
+        "id": "s56"
+       }
+      ],
+      "loc": {
+       "row": 2,
+       "col": 0
+      }
+     },
+     {
+      "id": "u16",
+      "kind": "claim",
+      "span": [
+       271,
+       276
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         268,
+         271
+        ],
+        "id": "s57"
+       },
+       {
+        "kind": "number",
+        "text": "9,876",
+        "ref": "v:Q2.r2.amount",
+        "cite": {
+         "ref": "Q2.r2.amount",
+         "alias": "Q2",
+         "locator": {
+          "row": 2,
+          "column": "amount"
+         },
+         "eid": "ev:cell:715a614c0b0befe6",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 9876.0,
+         "rendered": "9,876"
+        },
+        "state": "deterministic",
+        "span": [
+         271,
+         276
+        ],
+        "id": "s58"
+       }
+      ],
+      "loc": {
+       "row": 2,
+       "col": 1
+      }
+     },
+     {
+      "id": "u17",
+      "kind": "claim",
+      "span": [
+       279,
+       282
+      ],
+      "cites": [
+       "Q2"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         276,
+         279
+        ],
+        "id": "s59"
+       },
+       {
+        "kind": "number",
+        "text": "298",
+        "ref": "v:Q2.r2.order_cnt",
+        "cite": {
+         "ref": "Q2.r2.order_cnt",
+         "alias": "Q2",
+         "locator": {
+          "row": 2,
+          "column": "order_cnt"
+         },
+         "eid": "ev:cell:f6f4e1d0de2b884d",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 298,
+         "rendered": "298"
+        },
+        "state": "deterministic",
+        "span": [
+         279,
+         282
+        ],
+        "id": "s60"
+       }
+      ],
+      "loc": {
+       "row": 2,
+       "col": 2
+      }
+     }
+    ],
+    "id": "b6"
+   },
+   {
+    "type": "heading",
+    "level": 2,
+    "units": [
+     {
+      "id": "u18",
+      "kind": "heading",
+      "span": [
+       289,
+       291
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n\n## ",
+        "state": "neutral",
+        "span": [
+         282,
+         289
+        ],
+        "id": "s61"
+       },
+       {
+        "kind": "text",
+        "text": "明细",
+        "state": "neutral",
+        "span": [
+         289,
+         291
+        ],
+        "id": "s62"
+       }
+      ]
+     }
+    ],
+    "id": "b7"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u19",
+      "kind": "claim",
+      "span": [
+       293,
+       315
+      ],
+      "cites": [
+       "Q3"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         291,
+         293
+        ],
+        "id": "s63"
+       },
+       {
+        "kind": "text",
+        "text": "单笔最大的一单金额是 ",
+        "state": "neutral",
+        "span": [
+         293,
+         304
+        ],
+        "id": "s64"
+       },
+       {
+        "kind": "number",
+        "text": "1,288",
+        "ref": "v:Q3.r5.amount",
+        "cite": {
+         "ref": "Q3.r5.amount",
+         "alias": "Q3",
+         "locator": {
+          "row": 5,
+          "column": "amount"
+         },
+         "eid": "ev:cell:751535b8b3533b12",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": 1288.0,
+         "rendered": "1,288"
+        },
+        "state": "deterministic",
+        "span": [
+         304,
+         309
+        ],
+        "id": "s65"
+       },
+       {
+        "kind": "text",
+        "text": "，来自",
+        "state": "neutral",
+        "span": [
+         309,
+         312
+        ],
+        "id": "s66"
+       },
+       {
+        "kind": "value",
+        "text": "华南",
+        "ref": "v:Q3.r5.region",
+        "cite": {
+         "ref": "Q3.r5.region",
+         "alias": "Q3",
+         "locator": {
+          "row": 5,
+          "column": "region"
+         },
+         "eid": "ev:cell:a38e95fc49a1db05",
+         "kind": "cell",
+         "role": "value",
+         "status": "resolved",
+         "value": "华南",
+         "rendered": "华南"
+        },
+        "state": "deterministic",
+        "span": [
+         312,
+         314
+        ],
+        "id": "s67"
+       },
+       {
+        "kind": "text",
+        "text": "。",
+        "state": "neutral",
+        "span": [
+         314,
+         315
+        ],
+        "id": "s68"
+       }
+      ]
+     },
+     {
+      "id": "u20",
+      "kind": "claim",
+      "span": [
+       315,
+       334
+      ],
+      "cites": [
+       "m:spread"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "text",
+        "text": "最大的一单比最后一单多 ",
+        "state": "neutral",
+        "span": [
+         315,
+         327
+        ],
+        "id": "s69"
+       },
+       {
+        "kind": "number",
+        "text": "672.5元",
+        "ref": "m:spread",
+        "cite": {
+         "ref": "spread",
+         "alias": "m:spread",
+         "locator": {
+          "metric": "spread"
+         },
+         "eid": "ev:metric:dea437737bb0dfa8",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 672.5,
+         "rendered": "672.5元"
+        },
+        "state": "deterministic",
+        "span": [
+         327,
+         333
+        ],
+        "id": "s70"
+       },
+       {
+        "kind": "text",
+        "text": "。",
+        "state": "neutral",
+        "span": [
+         333,
+         334
+        ],
+        "id": "s71"
+       }
+      ]
+     }
+    ],
+    "id": "b8"
+   }
+  ],
+  "stats": {
+   "units": 21,
+   "segments": 72,
+   "claims": 15,
+   "connective": 3,
+   "headings": 3,
+   "numbers": 18,
+   "numbers_cited": 16,
+   "values": 7,
+   "uncited_numbers": 0,
+   "unresolved": 2,
+   "see": 5,
+   "uncited_claims": 1,
+   "violations": 2
+  },
+  "violations": [
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+    "ref": "m:refund_rate",
+    "span": [
+     69,
+     70
+    ],
+    "text": "—",
+    "segment": "s16",
+    "unit": "u2"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+    "ref": "m:new_users",
+    "span": [
+     74,
+     75
+    ],
+    "text": "—",
+    "segment": "s18",
+    "unit": "u2"
+   }
+  ]
+ },
+ "graph": {
+  "run_id": "run-evidence-query",
+  "schema": "agentlab.evidence/1",
+  "mode": "cited",
+  "seal": {
+   "sealed": true,
+   "ok": true,
+   "manifest_seq": 64,
+   "legacy": false
+  },
+  "reports": [
+   {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+    "doc_sealed": true,
+    "hash_ok": true,
+    "ok": false,
+    "repairs": 0,
+    "fields": [
+     "answer"
+    ],
+    "stats": {
+     "units": 21,
+     "segments": 72,
+     "claims": 15,
+     "connective": 3,
+     "headings": 3,
+     "numbers": 18,
+     "numbers_cited": 16,
+     "values": 7,
+     "uncited_numbers": 0,
+     "unresolved": 2,
+     "see": 5,
+     "uncited_claims": 1,
+     "violations": 2
+    }
+   }
+  ],
+  "evidence": [
+   {
+    "alias": "m:gmv",
+    "eid": "ev:metric:8e9e5fdb2eddb7a0",
+    "kind": "metric",
+    "label": "销售额 = 45,678.5元",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:orders",
+    "eid": "ev:metric:d7c6de7d408a70d2",
+    "kind": "metric",
+    "label": "订单数 = 1,234单",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:aov",
+    "eid": "ev:metric:72d2a805ddf72604",
+    "kind": "metric",
+    "label": "客单价 = 37.0元",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:wow",
+    "eid": "ev:metric:74c193598c403111",
+    "kind": "metric",
+    "label": "环比增幅 = 8.7%",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:refund_rate",
+    "eid": "ev:metric:1f7a71663ab15697",
+    "kind": "metric",
+    "label": "退款率 = —",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:new_users",
+    "eid": "ev:metric:4430c7b636713290",
+    "kind": "metric",
+    "label": "新客数 = —",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:adj",
+    "eid": "ev:metric:b9c97d4b59a25a23",
+    "kind": "metric",
+    "label": "调整后销售额 = 44,000.0元",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:fx",
+    "eid": "ev:metric:86539c1b7e4afa0e",
+    "kind": "metric",
+    "label": "汇率 = 7.12",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "m:spread",
+    "eid": "ev:metric:dea437737bb0dfa8",
+    "kind": "metric",
+    "label": "最大一单比最后一单多 = 672.5元",
+    "node_id": "caliber",
+    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "Q1",
+    "eid": "ev:query:925e2c675e777fe6",
+    "kind": "query",
+    "label": "db_query__shop · 1 行",
+    "node_id": "fetch",
+    "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "Q2",
+    "eid": "ev:query:c56e2ba849184526",
+    "kind": "query",
+    "label": "db_query__shop · 4 行",
+    "node_id": "fetch",
+    "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "Q3",
+    "eid": "ev:query:a452d03387ba7d32",
+    "kind": "query",
+    "label": "db_query__shop · 12 行",
+    "node_id": "fetch",
+    "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "Q4",
+    "eid": "ev:query:71bc8f01ba32cda2",
+    "kind": "query",
+    "label": "db_query__shop · 1 行",
+    "node_id": "pull",
+    "artifact": "30fe0bb2c76a873f0f3dc2bd244b6ba655d7af7a4f4e863630d353cfab42b3ad",
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   },
+   {
+    "alias": "i:week",
+    "eid": "ev:input:a398c5e60abfeedd",
+    "kind": "input",
+    "label": "week = 2026-W37",
+    "node_id": null,
+    "artifact": null,
+    "sealed": true,
+    "cited_by": [],
+    "units": [],
+    "report": "write"
+   }
+  ],
+  "edges": []
+ },
+ "segments": {
+  "s4": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s4",
+    "text": "2026-W37",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     12,
+     20
+    ],
+    "unit": "u1",
+    "ref": "i:week",
+    "cite": {
+     "ref": "week",
+     "alias": "i:week",
+     "locator": {
+      "field": "week"
+     },
+     "eid": "ev:input:a398c5e60abfeedd",
+     "kind": "input",
+     "role": "value",
+     "status": "resolved",
+     "value": "2026-W37",
+     "rendered": "2026-W37"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。",
+    "span": [
+     9,
+     63
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:orders",
+     "m:aov",
+     "m:wow"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "run_input",
+     "alias": "i:week",
+     "field": "week",
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "eid_ok": true,
+     "node_id": "in",
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s6": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s6",
+    "text": "45,678.5元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     25,
+     34
+    ],
+    "unit": "u1",
+    "ref": "m:gmv",
+    "cite": {
+     "ref": "gmv",
+     "alias": "m:gmv",
+     "locator": {
+      "metric": "gmv"
+     },
+     "eid": "ev:metric:8e9e5fdb2eddb7a0",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 45678.5,
+     "rendered": "45,678.5元"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。",
+    "span": [
+     9,
+     63
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:orders",
+     "m:aov",
+     "m:wow"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:gmv",
+     "metric": "gmv",
+     "name": "销售额",
+     "value": 45678.5,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "45,678.5元",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "vars.kpi.gmv",
+     "substituted": "45678.5",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:8e9e5fdb2eddb7a0",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "gmv",
+     "status": "verified",
+     "ref": "Q1.r0.gmv",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "gmv"
+     },
+     "eid": "ev:cell:c8c89e05312eaba7",
+     "query": "Q1",
+     "cell": "Q1.r0.gmv"
+    },
+    {
+     "step": "query",
+     "alias": "Q1",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt, SUM(is_refund) AS refund_cnt\nFROM orders\nWHERE week = '2026-W37'",
+     "columns": [
+      "gmv",
+      "order_cnt",
+      "refund_cnt"
+     ],
+     "rows": [
+      [
+       45678.5,
+       1234,
+       29
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "gmv"
+      ],
+      "cells": [
+       [
+        0,
+        "gmv"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s8": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s8",
+    "text": "1,234单",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     38,
+     44
+    ],
+    "unit": "u1",
+    "ref": "m:orders",
+    "cite": {
+     "ref": "orders",
+     "alias": "m:orders",
+     "locator": {
+      "metric": "orders"
+     },
+     "eid": "ev:metric:d7c6de7d408a70d2",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 1234,
+     "rendered": "1,234单"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。",
+    "span": [
+     9,
+     63
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:orders",
+     "m:aov",
+     "m:wow"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:orders",
+     "metric": "orders",
+     "name": "订单数",
+     "value": 1234,
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "1,234单",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "vars.kpi.order_cnt",
+     "substituted": "1234",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:d7c6de7d408a70d2",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "order_cnt",
+     "status": "mismatch",
+     "ref": "Q1.r0.order_cnt",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:f39bedaf6a670641",
+     "model_value": 1240,
+     "query": "Q1",
+     "cell": "Q1.r0.order_cnt"
+    },
+    {
+     "step": "query",
+     "alias": "Q1",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt, SUM(is_refund) AS refund_cnt\nFROM orders\nWHERE week = '2026-W37'",
+     "columns": [
+      "gmv",
+      "order_cnt",
+      "refund_cnt"
+     ],
+     "rows": [
+      [
+       45678.5,
+       1234,
+       29
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        0,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s10": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s10",
+    "text": "37.0元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     49,
+     54
+    ],
+    "unit": "u1",
+    "ref": "m:aov",
+    "cite": {
+     "ref": "aov",
+     "alias": "m:aov",
+     "locator": {
+      "metric": "aov"
+     },
+     "eid": "ev:metric:72d2a805ddf72604",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 37.0,
+     "rendered": "37.0元"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。",
+    "span": [
+     9,
+     63
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:orders",
+     "m:aov",
+     "m:wow"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:aov",
+     "metric": "aov",
+     "name": "客单价",
+     "value": 37.0,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "37.0元",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "round(vars.kpi.gmv / vars.kpi.order_cnt, 1)",
+     "substituted": "round(45678.5 / 1234, 1)",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:72d2a805ddf72604",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "gmv",
+     "status": "verified",
+     "ref": "Q1.r0.gmv",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "gmv"
+     },
+     "eid": "ev:cell:c8c89e05312eaba7",
+     "query": "Q1",
+     "cell": "Q1.r0.gmv"
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "order_cnt",
+     "status": "mismatch",
+     "ref": "Q1.r0.order_cnt",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:f39bedaf6a670641",
+     "model_value": 1240,
+     "query": "Q1",
+     "cell": "Q1.r0.order_cnt"
+    },
+    {
+     "step": "query",
+     "alias": "Q1",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt, SUM(is_refund) AS refund_cnt\nFROM orders\nWHERE week = '2026-W37'",
+     "columns": [
+      "gmv",
+      "order_cnt",
+      "refund_cnt"
+     ],
+     "rows": [
+      [
+       45678.5,
+       1234,
+       29
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "gmv",
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        0,
+        "gmv"
+       ],
+       [
+        0,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s12": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s12",
+    "text": "8.7%",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     58,
+     62
+    ],
+    "unit": "u1",
+    "ref": "m:wow",
+    "cite": {
+     "ref": "wow",
+     "alias": "m:wow",
+     "locator": {
+      "metric": "wow"
+     },
+     "eid": "ev:metric:74c193598c403111",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 8.7,
+     "rendered": "8.7%"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。",
+    "span": [
+     9,
+     63
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:orders",
+     "m:aov",
+     "m:wow"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:wow",
+     "metric": "wow",
+     "name": "环比增幅",
+     "value": 8.7,
+     "unit": "%",
+     "decimals": 1,
+     "format": "plain",
+     "conv": null,
+     "rendered": "8.7%",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "round((vars.kpi.gmv - cell(nodes.pull, 0, 'gmv')) / cell(nodes.pull, 0, 'gmv') * 100, 1)",
+     "substituted": "round((45678.5 - 42010.0) / 42010.0 * 100, 1)",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:74c193598c403111",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "gmv",
+     "status": "verified",
+     "ref": "Q1.r0.gmv",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "gmv"
+     },
+     "eid": "ev:cell:c8c89e05312eaba7",
+     "query": "Q1",
+     "cell": "Q1.r0.gmv"
+    },
+    {
+     "step": "input",
+     "path": "cell(nodes.pull, 0, 'gmv')",
+     "value": 42010.0,
+     "node_id": "pull",
+     "via": "tool_cell",
+     "locator": {
+      "row": 0,
+      "column": "gmv"
+     },
+     "artifact": "30fe0bb2c76a873f0f3dc2bd244b6ba655d7af7a4f4e863630d353cfab42b3ad",
+     "eid": "ev:cell:d22c08cb7caec778",
+     "status": "verified",
+     "query": "Q4",
+     "cell": "Q4.r0.gmv"
+    },
+    {
+     "step": "query",
+     "alias": "Q1",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt, SUM(is_refund) AS refund_cnt\nFROM orders\nWHERE week = '2026-W37'",
+     "columns": [
+      "gmv",
+      "order_cnt",
+      "refund_cnt"
+     ],
+     "rows": [
+      [
+       45678.5,
+       1234,
+       29
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "gmv"
+      ],
+      "cells": [
+       [
+        0,
+        "gmv"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    },
+    {
+     "step": "query",
+     "alias": "Q4",
+     "artifact": "30fe0bb2c76a873f0f3dc2bd244b6ba655d7af7a4f4e863630d353cfab42b3ad",
+     "node_id": "pull",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv FROM orders WHERE week = '2026-W36'",
+     "columns": [
+      "gmv"
+     ],
+     "rows": [
+      [
+       42010.0
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "gmv"
+      ],
+      "cells": [
+       [
+        0,
+        "gmv"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s16": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s16",
+    "text": "—",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     69,
+     70
+    ],
+    "unit": "u2",
+    "ref": "m:refund_rate",
+    "issue": "unresolved_ref",
+    "cite": {
+     "ref": "refund_rate",
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "role": "value",
+     "status": "unresolved",
+     "reason": "指标「退款率」这次没有值（缺输入），不能写进报告",
+     "rendered": "—"
+    }
+   },
+   "unit": {
+    "id": "u2",
+    "kind": "claim",
+    "text": "退款率 —，新客 —：这次都没查到。",
+    "span": [
+     65,
+     83
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b2",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:refund_rate",
+     "metric": "refund_rate",
+     "name": "退款率",
+     "value": null,
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "conv": null,
+     "rendered": "—",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "vars.kpi.refund_cnt / vars.kpi.order_cnt",
+     "substituted": "vars.kpi.refund_cnt / 1234",
+     "recompute_ok": null,
+     "status": "missing_input",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:1f7a71663ab15697",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.refund_cnt",
+     "value": null,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "refund_cnt",
+     "status": "missing",
+     "ref": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "order_cnt",
+     "status": "mismatch",
+     "ref": "Q1.r0.order_cnt",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "locator": {
+      "row": 0,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:f39bedaf6a670641",
+     "model_value": 1240,
+     "query": "Q1",
+     "cell": "Q1.r0.order_cnt"
+    },
+    {
+     "step": "query",
+     "alias": "Q1",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt, SUM(is_refund) AS refund_cnt\nFROM orders\nWHERE week = '2026-W37'",
+     "columns": [
+      "gmv",
+      "order_cnt",
+      "refund_cnt"
+     ],
+     "rows": [
+      [
+       45678.5,
+       1234,
+       29
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0
+     ],
+     "total_rows": 1,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        0,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "引用解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+   "violations": [
+    {
+     "code": "unresolved_ref",
+     "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+     "ref": "m:refund_rate",
+     "span": [
+      69,
+      70
+     ],
+     "text": "—",
+     "segment": "s16",
+     "unit": "u2"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s18": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s18",
+    "text": "—",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     74,
+     75
+    ],
+    "unit": "u2",
+    "ref": "m:new_users",
+    "issue": "unresolved_ref",
+    "cite": {
+     "ref": "new_users",
+     "alias": "m:new_users",
+     "kind": "metric",
+     "role": "value",
+     "status": "unresolved",
+     "reason": "指标「新客数」这次没有值（缺输入），不能写进报告",
+     "rendered": "—"
+    }
+   },
+   "unit": {
+    "id": "u2",
+    "kind": "claim",
+    "text": "退款率 —，新客 —：这次都没查到。",
+    "span": [
+     65,
+     83
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b2",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:new_users",
+     "metric": "new_users",
+     "name": "新客数",
+     "value": null,
+     "unit": "人",
+     "decimals": 0,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "—",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "vars.kpi.new_users",
+     "substituted": "vars.kpi.new_users",
+     "recompute_ok": null,
+     "status": "missing_input",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:4430c7b636713290",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.new_users",
+     "value": null,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "new_users",
+     "status": "unresolved",
+     "ref": "Q1.r0.new_users",
+     "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
+     "reason": "Q1 没有列「new_users」，有：gmv、order_cnt、refund_cnt",
+     "query": "Q1"
+    }
+   ],
+   "note": "引用解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+   "violations": [
+    {
+     "code": "unresolved_ref",
+     "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+     "ref": "m:new_users",
+     "span": [
+      74,
+      75
+     ],
+     "text": "—",
+     "segment": "s18",
+     "unit": "u2"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s22": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s22",
+    "text": "44,000.0元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     99,
+     108
+    ],
+    "unit": "u3",
+    "ref": "m:adj",
+    "cite": {
+     "ref": "adj",
+     "alias": "m:adj",
+     "locator": {
+      "metric": "adj"
+     },
+     "eid": "ev:metric:b9c97d4b59a25a23",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 44000,
+     "rendered": "44,000.0元"
+    }
+   },
+   "unit": {
+    "id": "u3",
+    "kind": "claim",
+    "text": "扣掉促销后的调整后销售额是 44,000.0元，按汇率 7.12 折算。",
+    "span": [
+     85,
+     121
+    ],
+    "cites": [
+     "m:adj",
+     "m:fx"
+    ]
+   },
+   "block": {
+    "id": "b3",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:adj",
+     "metric": "adj",
+     "name": "调整后销售额",
+     "value": 44000,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "44,000.0元",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "nodes.adjust.total",
+     "substituted": "44000",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:b9c97d4b59a25a23",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "nodes.adjust.total",
+     "value": 44000,
+     "node_id": "adjust",
+     "via": "code",
+     "field": "total",
+     "role": "compute",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s24": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s24",
+    "text": "7.12",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     113,
+     117
+    ],
+    "unit": "u3",
+    "ref": "m:fx",
+    "cite": {
+     "ref": "fx",
+     "alias": "m:fx",
+     "locator": {
+      "metric": "fx"
+     },
+     "eid": "ev:metric:86539c1b7e4afa0e",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 7.12,
+     "rendered": "7.12"
+    }
+   },
+   "unit": {
+    "id": "u3",
+    "kind": "claim",
+    "text": "扣掉促销后的调整后销售额是 44,000.0元，按汇率 7.12 折算。",
+    "span": [
+     85,
+     121
+    ],
+    "cites": [
+     "m:adj",
+     "m:fx"
+    ]
+   },
+   "block": {
+    "id": "b3",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:fx",
+     "metric": "fx",
+     "name": "汇率",
+     "value": 7.12,
+     "unit": "",
+     "decimals": 2,
+     "format": "plain",
+     "conv": null,
+     "rendered": "7.12",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "nodes.rate.value",
+     "substituted": "7.12",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:86539c1b7e4afa0e",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "nodes.rate.value",
+     "value": 7.12,
+     "node_id": "rate",
+     "via": "code",
+     "field": "value",
+     "role": "source",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s29": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s29",
+    "text": "华东",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     131,
+     133
+    ],
+    "unit": "u5",
+    "ref": "v:Q2.r0.region",
+    "cite": {
+     "ref": "Q2.r0.region",
+     "alias": "Q2",
+     "locator": {
+      "row": 0,
+      "column": "region"
+     },
+     "eid": "ev:cell:39caf88002d122ff",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华东",
+     "rendered": "华东"
+    }
+   },
+   "unit": {
+    "id": "u5",
+    "kind": "claim",
+    "text": "华东销售额最高，为 18,230.5，其次是华南（12,004）。",
+    "span": [
+     131,
+     164
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b5",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        0,
+        "region"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s31": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s31",
+    "text": "18,230.5",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     141,
+     149
+    ],
+    "unit": "u5",
+    "ref": "v:Q2.r0.amount",
+    "cite": {
+     "ref": "Q2.r0.amount",
+     "alias": "Q2",
+     "locator": {
+      "row": 0,
+      "column": "amount"
+     },
+     "eid": "ev:cell:0803f091d4c868cd",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 18230.5,
+     "rendered": "18,230.5"
+    }
+   },
+   "unit": {
+    "id": "u5",
+    "kind": "claim",
+    "text": "华东销售额最高，为 18,230.5，其次是华南（12,004）。",
+    "span": [
+     131,
+     164
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b5",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        0,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s33": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s33",
+    "text": "华南",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     153,
+     155
+    ],
+    "unit": "u5",
+    "ref": "v:Q2.r1.region",
+    "cite": {
+     "ref": "Q2.r1.region",
+     "alias": "Q2",
+     "locator": {
+      "row": 1,
+      "column": "region"
+     },
+     "eid": "ev:cell:7a7cb1e58c599f14",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华南",
+     "rendered": "华南"
+    }
+   },
+   "unit": {
+    "id": "u5",
+    "kind": "claim",
+    "text": "华东销售额最高，为 18,230.5，其次是华南（12,004）。",
+    "span": [
+     131,
+     164
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b5",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       1
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        1,
+        "region"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s35": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s35",
+    "text": "12,004",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     156,
+     162
+    ],
+    "unit": "u5",
+    "ref": "v:Q2.r1.amount",
+    "cite": {
+     "ref": "Q2.r1.amount",
+     "alias": "Q2",
+     "locator": {
+      "row": 1,
+      "column": "amount"
+     },
+     "eid": "ev:cell:85b22e06175c4c74",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 12004.0,
+     "rendered": "12,004"
+    }
+   },
+   "unit": {
+    "id": "u5",
+    "kind": "claim",
+    "text": "华东销售额最高，为 18,230.5，其次是华南（12,004）。",
+    "span": [
+     131,
+     164
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b5",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       1
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        1,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s44": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s44",
+    "text": "华东",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     220,
+     222
+    ],
+    "unit": "u9",
+    "ref": "v:Q2.r0.region",
+    "cite": {
+     "ref": "Q2.r0.region",
+     "alias": "Q2",
+     "locator": {
+      "row": 0,
+      "column": "region"
+     },
+     "eid": "ev:cell:39caf88002d122ff",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华东",
+     "rendered": "华东"
+    }
+   },
+   "unit": {
+    "id": "u9",
+    "kind": "claim",
+    "text": "华东",
+    "span": [
+     220,
+     222
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        0,
+        "region"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s46": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s46",
+    "text": "18,230.5",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     225,
+     233
+    ],
+    "unit": "u10",
+    "ref": "v:Q2.r0.amount",
+    "cite": {
+     "ref": "Q2.r0.amount",
+     "alias": "Q2",
+     "locator": {
+      "row": 0,
+      "column": "amount"
+     },
+     "eid": "ev:cell:0803f091d4c868cd",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 18230.5,
+     "rendered": "18,230.5"
+    }
+   },
+   "unit": {
+    "id": "u10",
+    "kind": "claim",
+    "text": "18,230.5",
+    "span": [
+     225,
+     233
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        0,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s48": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s48",
+    "text": "402",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     236,
+     239
+    ],
+    "unit": "u11",
+    "ref": "v:Q2.r0.order_cnt",
+    "cite": {
+     "ref": "Q2.r0.order_cnt",
+     "alias": "Q2",
+     "locator": {
+      "row": 0,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:c6ba44059fc49fa7",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 402,
+     "rendered": "402"
+    }
+   },
+   "unit": {
+    "id": "u11",
+    "kind": "claim",
+    "text": "402",
+    "span": [
+     236,
+     239
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       0
+      ],
+      "cols": [
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        0,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s50": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s50",
+    "text": "华南",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     244,
+     246
+    ],
+    "unit": "u12",
+    "ref": "v:Q2.r1.region",
+    "cite": {
+     "ref": "Q2.r1.region",
+     "alias": "Q2",
+     "locator": {
+      "row": 1,
+      "column": "region"
+     },
+     "eid": "ev:cell:7a7cb1e58c599f14",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华南",
+     "rendered": "华南"
+    }
+   },
+   "unit": {
+    "id": "u12",
+    "kind": "claim",
+    "text": "华南",
+    "span": [
+     244,
+     246
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       1
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        1,
+        "region"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s52": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s52",
+    "text": "12,004",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     249,
+     255
+    ],
+    "unit": "u13",
+    "ref": "v:Q2.r1.amount",
+    "cite": {
+     "ref": "Q2.r1.amount",
+     "alias": "Q2",
+     "locator": {
+      "row": 1,
+      "column": "amount"
+     },
+     "eid": "ev:cell:85b22e06175c4c74",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 12004.0,
+     "rendered": "12,004"
+    }
+   },
+   "unit": {
+    "id": "u13",
+    "kind": "claim",
+    "text": "12,004",
+    "span": [
+     249,
+     255
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       1
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        1,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s54": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s54",
+    "text": "311",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     258,
+     261
+    ],
+    "unit": "u14",
+    "ref": "v:Q2.r1.order_cnt",
+    "cite": {
+     "ref": "Q2.r1.order_cnt",
+     "alias": "Q2",
+     "locator": {
+      "row": 1,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:601c63ce11c38099",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 311,
+     "rendered": "311"
+    }
+   },
+   "unit": {
+    "id": "u14",
+    "kind": "claim",
+    "text": "311",
+    "span": [
+     258,
+     261
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       1
+      ],
+      "cols": [
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        1,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s56": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s56",
+    "text": "华北",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     266,
+     268
+    ],
+    "unit": "u15",
+    "ref": "v:Q2.r2.region",
+    "cite": {
+     "ref": "Q2.r2.region",
+     "alias": "Q2",
+     "locator": {
+      "row": 2,
+      "column": "region"
+     },
+     "eid": "ev:cell:f18c3397a51b4e54",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华北",
+     "rendered": "华北"
+    }
+   },
+   "unit": {
+    "id": "u15",
+    "kind": "claim",
+    "text": "华北",
+    "span": [
+     266,
+     268
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       2
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        2,
+        "region"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s58": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s58",
+    "text": "9,876",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     271,
+     276
+    ],
+    "unit": "u16",
+    "ref": "v:Q2.r2.amount",
+    "cite": {
+     "ref": "Q2.r2.amount",
+     "alias": "Q2",
+     "locator": {
+      "row": 2,
+      "column": "amount"
+     },
+     "eid": "ev:cell:715a614c0b0befe6",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 9876.0,
+     "rendered": "9,876"
+    }
+   },
+   "unit": {
+    "id": "u16",
+    "kind": "claim",
+    "text": "9,876",
+    "span": [
+     271,
+     276
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       2
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        2,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s60": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s60",
+    "text": "298",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     279,
+     282
+    ],
+    "unit": "u17",
+    "ref": "v:Q2.r2.order_cnt",
+    "cite": {
+     "ref": "Q2.r2.order_cnt",
+     "alias": "Q2",
+     "locator": {
+      "row": 2,
+      "column": "order_cnt"
+     },
+     "eid": "ev:cell:f6f4e1d0de2b884d",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 298,
+     "rendered": "298"
+    }
+   },
+   "unit": {
+    "id": "u17",
+    "kind": "claim",
+    "text": "298",
+    "span": [
+     279,
+     282
+    ],
+    "cites": [
+     "Q2"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q2",
+     "artifact": "4f25cb3d0ef3155f54370d8f4e2f9c3673bc28a779db0b37602bd694c6726b32",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT region, SUM(amount) AS amount, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37'\nGROUP BY region\nORDER BY amount DESC",
+     "columns": [
+      "region",
+      "amount",
+      "order_cnt"
+     ],
+     "rows": [
+      [
+       "华东",
+       18230.5,
+       402
+      ],
+      [
+       "华南",
+       12004.0,
+       311
+      ],
+      [
+       "华北",
+       9876.0,
+       298
+      ],
+      [
+       "西南",
+       5568.0,
+       223
+      ]
+     ],
+     "row_offset": 0,
+     "row_index": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "total_rows": 4,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       2
+      ],
+      "cols": [
+       "order_cnt"
+      ],
+      "cells": [
+       [
+        2,
+        "order_cnt"
+       ]
+      ]
+     },
+     "masked": [],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s65": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s65",
+    "text": "1,288",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     304,
+     309
+    ],
+    "unit": "u19",
+    "ref": "v:Q3.r5.amount",
+    "cite": {
+     "ref": "Q3.r5.amount",
+     "alias": "Q3",
+     "locator": {
+      "row": 5,
+      "column": "amount"
+     },
+     "eid": "ev:cell:751535b8b3533b12",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": 1288.0,
+     "rendered": "1,288"
+    }
+   },
+   "unit": {
+    "id": "u19",
+    "kind": "claim",
+    "text": "单笔最大的一单金额是 1,288，来自华南。",
+    "span": [
+     293,
+     315
+    ],
+    "cites": [
+     "Q3"
+    ]
+   },
+   "block": {
+    "id": "b8",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q3",
+     "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT order_id, region, amount, phone\nFROM orders\nWHERE week = '2026-W37'\nORDER BY order_id",
+     "columns": [
+      "order_id",
+      "region",
+      "amount",
+      "phone"
+     ],
+     "rows": [
+      [
+       10004,
+       "西南",
+       129.9,
+       "已遮罩"
+      ],
+      [
+       10005,
+       "华东",
+       705.2,
+       "已遮罩"
+      ],
+      [
+       10006,
+       "华南",
+       1288.0,
+       "已遮罩"
+      ],
+      [
+       10007,
+       "华北",
+       56.0,
+       "已遮罩"
+      ],
+      [
+       10008,
+       "西南",
+       942.3,
+       "已遮罩"
+      ]
+     ],
+     "row_offset": 3,
+     "row_index": [
+      3,
+      4,
+      5,
+      6,
+      7
+     ],
+     "total_rows": 12,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       5
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        5,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [
+      "phone"
+     ],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": [
+     "phone"
+    ],
+    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+   }
+  },
+  "s67": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s67",
+    "text": "华南",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     312,
+     314
+    ],
+    "unit": "u19",
+    "ref": "v:Q3.r5.region",
+    "cite": {
+     "ref": "Q3.r5.region",
+     "alias": "Q3",
+     "locator": {
+      "row": 5,
+      "column": "region"
+     },
+     "eid": "ev:cell:a38e95fc49a1db05",
+     "kind": "cell",
+     "role": "value",
+     "status": "resolved",
+     "value": "华南",
+     "rendered": "华南"
+    }
+   },
+   "unit": {
+    "id": "u19",
+    "kind": "claim",
+    "text": "单笔最大的一单金额是 1,288，来自华南。",
+    "span": [
+     293,
+     315
+    ],
+    "cites": [
+     "Q3"
+    ]
+   },
+   "block": {
+    "id": "b8",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "query",
+     "alias": "Q3",
+     "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT order_id, region, amount, phone\nFROM orders\nWHERE week = '2026-W37'\nORDER BY order_id",
+     "columns": [
+      "order_id",
+      "region",
+      "amount",
+      "phone"
+     ],
+     "rows": [
+      [
+       10004,
+       "西南",
+       129.9,
+       "已遮罩"
+      ],
+      [
+       10005,
+       "华东",
+       705.2,
+       "已遮罩"
+      ],
+      [
+       10006,
+       "华南",
+       1288.0,
+       "已遮罩"
+      ],
+      [
+       10007,
+       "华北",
+       56.0,
+       "已遮罩"
+      ],
+      [
+       10008,
+       "西南",
+       942.3,
+       "已遮罩"
+      ]
+     ],
+     "row_offset": 3,
+     "row_index": [
+      3,
+      4,
+      5,
+      6,
+      7
+     ],
+     "total_rows": 12,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       5
+      ],
+      "cols": [
+       "region"
+      ],
+      "cells": [
+       [
+        5,
+        "region"
+       ]
+      ]
+     },
+     "masked": [
+      "phone"
+     ],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": [
+     "phone"
+    ],
+    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+   }
+  },
+  "s70": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+   },
+   "segment": {
+    "id": "s70",
+    "text": "672.5元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     327,
+     333
+    ],
+    "unit": "u20",
+    "ref": "m:spread",
+    "cite": {
+     "ref": "spread",
+     "alias": "m:spread",
+     "locator": {
+      "metric": "spread"
+     },
+     "eid": "ev:metric:dea437737bb0dfa8",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 672.5,
+     "rendered": "672.5元"
+    }
+   },
+   "unit": {
+    "id": "u20",
+    "kind": "claim",
+    "text": "最大的一单比最后一单多 672.5元。",
+    "span": [
+     315,
+     334
+    ],
+    "cites": [
+     "m:spread"
+    ]
+   },
+   "block": {
+    "id": "b8",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:spread",
+     "metric": "spread",
+     "name": "最大一单比最后一单多",
+     "value": 672.5,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "672.5元",
+     "caliber": "周报口径",
+     "version": "v3",
+     "expression": "round(vars.kpi.top - vars.kpi.last, 1)",
+     "substituted": "round(1288.0 - 615.5, 1)",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+     "eid": "ev:metric:dea437737bb0dfa8",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "source": {
+      "workflow_id": "wf-demo-weekly",
+      "workflow_version": 5,
+      "node_id": "caliber",
+      "workflow_name": "销售周报"
+     },
+     "caliber_upgrade": {
+      "workflow_id": "wf-demo-weekly",
+      "caliber_node": "caliber",
+      "pinned": 5,
+      "latest": 6,
+      "policy": "dual",
+      "policy_label": "并排双印新旧口径"
+     }
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.top",
+     "value": 1288.0,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "top",
+     "status": "verified",
+     "ref": "Q3.r5.amount",
+     "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+     "locator": {
+      "row": 5,
+      "column": "amount"
+     },
+     "eid": "ev:cell:751535b8b3533b12",
+     "query": "Q3",
+     "cell": "Q3.r5.amount"
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.last",
+     "value": 615.5,
+     "node_id": "fetch",
+     "via": "agent_field",
+     "field": "last",
+     "status": "verified",
+     "ref": "Q3.r11.amount",
+     "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+     "locator": {
+      "row": 11,
+      "column": "amount"
+     },
+     "eid": "ev:cell:f3f82a4172e8b244",
+     "query": "Q3",
+     "cell": "Q3.r11.amount"
+    },
+    {
+     "step": "query",
+     "alias": "Q3",
+     "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+     "node_id": "fetch",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "sql": "SELECT order_id, region, amount, phone\nFROM orders\nWHERE week = '2026-W37'\nORDER BY order_id",
+     "columns": [
+      "order_id",
+      "region",
+      "amount",
+      "phone"
+     ],
+     "rows": [
+      [
+       10004,
+       "西南",
+       129.9,
+       "已遮罩"
+      ],
+      [
+       10005,
+       "华东",
+       705.2,
+       "已遮罩"
+      ],
+      [
+       10006,
+       "华南",
+       1288.0,
+       "已遮罩"
+      ],
+      [
+       10007,
+       "华北",
+       56.0,
+       "已遮罩"
+      ],
+      [
+       10008,
+       "西南",
+       942.3,
+       "已遮罩"
+      ],
+      [
+       10010,
+       "华南",
+       401.0,
+       "已遮罩"
+      ],
+      [
+       10011,
+       "华北",
+       230.0,
+       "已遮罩"
+      ],
+      [
+       10012,
+       "西南",
+       615.5,
+       "已遮罩"
+      ]
+     ],
+     "row_offset": 3,
+     "row_index": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      11
+     ],
+     "total_rows": 12,
+     "truncated": false,
+     "highlight": {
+      "rows": [
+       5,
+       11
+      ],
+      "cols": [
+       "amount"
+      ],
+      "cells": [
+       [
+        5,
+        "amount"
+       ],
+       [
+        11,
+        "amount"
+       ]
+      ]
+     },
+     "masked": [
+      "phone"
+     ],
+     "hash_ok": true,
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": [
+     "phone"
+    ],
+    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+   }
+  }
+ },
+ "output": {
+  "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。\n\n退款率 —，新客 —：这次都没查到。\n\n扣掉促销后的调整后销售额是 44,000.0元，按汇率 7.12 折算。\n\n## 分区域\n\n华东销售额最高，为 18,230.5，其次是华南（12,004）。\n\n| region | amount | order_cnt |\n| --- | --- | --- |\n| 华东 | 18,230.5 | 402 |\n| 华南 | 12,004 | 311 |\n| 华北 | 9,876 | 298 |\n\n## 明细\n\n单笔最大的一单金额是 1,288，来自华南。最大的一单比最后一单多 672.5元。",
+  "_evidence": {
+   "report_node": "write",
+   "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+   "fields": [
+    "answer"
+   ]
+  }
+ },
+ "report_checked": {
+  "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+  "ok": false,
+  "stats": {
+   "units": 21,
+   "segments": 72,
+   "claims": 15,
+   "connective": 3,
+   "headings": 3,
+   "numbers": 18,
+   "numbers_cited": 16,
+   "values": 7,
+   "uncited_numbers": 0,
+   "unresolved": 2,
+   "see": 5,
+   "uncited_claims": 1,
+   "violations": 2
+  },
+  "violations": [
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+    "ref": "m:refund_rate",
+    "span": [
+     69,
+     70
+    ],
+    "text": "—",
+    "segment": "s16",
+    "unit": "u2"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+    "ref": "m:new_users",
+    "span": [
+     74,
+     75
+    ],
+    "text": "—",
+    "segment": "s18",
+    "unit": "u2"
+   }
+  ],
+  "repairs": 0
+ },
+ "snapshots": {
+  "Q3": {
+   "artifact": "5e63abde1c4e435eb447fd55b50f10cf82d0457838876fd25178f28bd5fcdef7",
+   "content": {
+    "columns": [
+     "order_id",
+     "region",
+     "amount",
+     "phone"
+    ],
+    "rows": [
+     [
+      10001,
+      "华东",
+      312.0,
+      "已遮罩"
+     ],
+     [
+      10002,
+      "华南",
+      88.5,
+      "已遮罩"
+     ],
+     [
+      10003,
+      "华北",
+      460.0,
+      "已遮罩"
+     ],
+     [
+      10004,
+      "西南",
+      129.9,
+      "已遮罩"
+     ],
+     [
+      10005,
+      "华东",
+      705.2,
+      "已遮罩"
+     ],
+     [
+      10006,
+      "华南",
+      1288.0,
+      "已遮罩"
+     ],
+     [
+      10007,
+      "华北",
+      56.0,
+      "已遮罩"
+     ],
+     [
+      10008,
+      "西南",
+      942.3,
+      "已遮罩"
+     ],
+     [
+      10009,
+      "华东",
+      77.7,
+      "已遮罩"
+     ],
+     [
+      10010,
+      "华南",
+      401.0,
+      "已遮罩"
+     ],
+     [
+      10011,
+      "华北",
+      230.0,
+      "已遮罩"
+     ],
+     [
+      10012,
+      "西南",
+      615.5,
+      "已遮罩"
+     ]
+    ],
+    "row_count": 12,
+    "truncated": false,
+    "elapsed_ms": 12,
+    "sql": "SELECT order_id, region, amount, phone\nFROM orders\nWHERE week = '2026-W37'\nORDER BY order_id",
+    "source": "shop"
+   }
+  }
+ }
+}

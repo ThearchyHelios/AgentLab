@@ -1,12 +1,16 @@
-import { useEffect, useRef } from 'react'
-import { AlertTriangle, CheckCircle2, CornerDownRight, Plus, RotateCw, Trash2, Unlink, Workflow, XCircle } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import {
+  AlertTriangle, CheckCircle2, CornerDownRight, ListChecks, Plus, RotateCw, ShieldCheck, Trash2, Unlink, Workflow, XCircle,
+} from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS } from './nodeDefs'
-import { unboundToolOf, withToolBound, type FieldRef, type Problem } from './issues'
+import { problemsOf, unboundToolOf, withToolBound, type FieldRef, type Problem } from './issues'
+import { PublishPreflightPane } from './PublishDialog'
 import { formatShortcut } from '../lib/keys'
+import { PUBLISH_FIX_TEXT } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { useEditLock, useStudio } from '../store/studio'
-import { Spinner } from '../components/ui'
+import { Spinner, useRadioGroup } from '../components/ui'
 
 /**
  * 问题面板：图级、节点、边上的 error 和 warning，一条一行，点一下定位。
@@ -17,6 +21,48 @@ import { Spinner } from '../components/ui'
  * 点一行选中节点、镜头对过去、检查器翻到出问题的那个字段。F8 / ⇧F8 在问题之间跳。
  */
 export function ProblemsPane({ problems, activeId, onLocate, onDeleteEdge }: {
+  problems: Problem[]
+  activeId: string | null
+  onLocate: (p: Problem) => void
+  onDeleteEdge: (edgeId: string) => void
+}) {
+  // 校验：画布上随改随查的那一份。发布前检查：按选定的发布等级另查一遍门禁，带修法——
+  // 在画布上就能提前发现、提前修，不用等到点发布那一刻
+  const [mode, setMode] = useState<'lint' | 'publish'>('lint')
+  const radio = useRadioGroup(MODES, mode, setMode)
+  const hasWorkflow = useStudio((s) => !!s.workflow)
+  const errors = problems.filter((p) => p.level === 'error').length
+  return (
+    <>
+      {hasWorkflow && (
+        <div className="flex shrink-0 items-center gap-1 px-2 pt-1.5" role="radiogroup" aria-label="问题面板看哪一份">
+          {MODES.map((m) => (
+            <button key={m} type="button" {...radio(m)} data-problems-mode={m}
+                    onClick={() => setMode(m)}
+                    className={clsx('flex items-center gap-1 rounded px-2 py-0.5 text-2xs transition-colors',
+                      mode === m ? 'bg-hover text-fg' : 'text-faint hover:text-dim')}>
+              {m === 'lint'
+                ? <><ListChecks size={11} aria-hidden /> {PUBLISH_FIX_TEXT.lint}
+                    {errors > 0 && <span className="tnum" style={{ color: 'var(--err)' }}>{errors}</span>}</>
+                : <><ShieldCheck size={11} aria-hidden /> {PUBLISH_FIX_TEXT.section}</>}
+            </button>
+          ))}
+        </div>
+      )}
+      {mode === 'publish' && hasWorkflow
+        ? <PublishPreflightPane onLocate={(issue) => {
+            const { nodes } = useStudio.getState()
+            const [p] = problemsOf([issue], nodes)
+            if (p) onLocate(p)
+          }} />
+        : <LintPane problems={problems} activeId={activeId} onLocate={onLocate} onDeleteEdge={onDeleteEdge} />}
+    </>
+  )
+}
+
+const MODES = ['lint', 'publish'] as const
+
+function LintPane({ problems, activeId, onLocate, onDeleteEdge }: {
   problems: Problem[]
   activeId: string | null
   onLocate: (p: Problem) => void

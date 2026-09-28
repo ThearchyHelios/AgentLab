@@ -36,6 +36,13 @@ export interface RunErrorExplain {
   fixFirst?: boolean
   /** fix 的站内地址，比笼统的「去工具库」更准：直接打开要改的那一项 */
   fixTo?: string
+  /** 入口上写什么（「去数据页接入」）。不给就按 fix 的默认说法 */
+  fixLabel?: string
+  /**
+   * 该去改的节点（名字）和出错的不是同一个：整形节点解析上游的文字失败，毛病在上游那个
+   * 模型节点，打开整形节点的设置什么也改不了
+   */
+  fixNode?: string
   /** 原文，放进「技术细节」 */
   raw: string
 }
@@ -59,6 +66,58 @@ export function stripClassPrefix(text: string): string {
   let s = text
   for (let i = 0; i < 4 && CLASS_PREFIX.test(s); i++) s = s.replace(CLASS_PREFIX, '')
   return s.trim()
+}
+
+/** 后端 io.TEMPLATE_HINT：模板渲染出来不是合法 JSON、又说不出是哪一处时的老说法 */
+const TEMPLATE_HINT = '检查模板里的引号、逗号，字符串值要用 | json 过滤器输出'
+
+/** 后端 app/api/runs.py 的 TOOL_MISSING：发起运行时发现绑定的工具在本机不存在 */
+export const RUN_TOOL_MISSING = 'run_tool_missing'
+const DATA_TOOL = /^db_(?:query|schema)__/
+
+/**
+ * 「绑定的工具在本机不存在：「X」（调用工具）绑的 db_query__nope；「团队」的成员「研究员」绑的 mcp:a/b。
+ * 去数据页接入，或在节点里重新选」。数据源工具（db_query__ / db_schema__）要去数据页接入，自定义和
+ * MCP 工具去工具页；两种都缺时入口按第一个缺的走，话里两边都说到
+ */
+function explainToolMissing(plain: string, raw: string, coded = false): RunErrorExplain | null {
+  const m = plain.match(/^绑定的工具在本机不存在[：:]\s*([\s\S]+)$/)
+  // 带着机读码、话却改了说法：照样按这一类讲，名字认不出就只给工具页
+  if (!m && !coded) return null
+  const body = (m ? m[1] : plain).trim()
+  const cut = body.lastIndexOf('。')
+  const list = (cut >= 0 ? body.slice(0, cut) : body).trim()
+  const advice = cut >= 0 ? body.slice(cut + 1).trim() : ''
+  // 超过 8 处时后端在最后一个名字后面接「等 N 处」：那个「等」不是名字的一部分
+  const names = [...list.matchAll(/绑的\s*([^\s；;，,。]+)/g)].map((x) => x[1].replace(/等$/, '')).filter(Boolean)
+  const first = names[0] ?? ''
+  const others = names.filter((n) => !DATA_TOOL.test(n))
+  const toData = DATA_TOOL.test(first) || (!names.length && /数据页/.test(advice))
+  const fixTo = toData ? '/data'
+    : !others.length ? '/tools'
+    : others.every((n) => n.startsWith('mcp:')) ? '/tools/mcp'
+    : others.every((n) => !n.startsWith('mcp:')) ? '/tools/custom' : '/tools'
+  return {
+    title: names.length === 1 ? `绑定的工具「${first}」在本机不存在` : '绑定的工具在本机不存在',
+    reason: `${endStop(list)}这次运行没有发起，前面的节点一个都没跑。`,
+    action: `${endStop(advice || (toData ? '去数据页接入，或在节点里重新选' : '去工具页接入，或在节点里重新选'))}接入之后重新运行。`,
+    continuable: false,
+    fix: 'tools',
+    fixTo,
+    fixLabel: toData ? '去数据页接入' : '去工具页接入',
+    raw,
+  }
+}
+
+/**
+ * 发起运行那一下被拒的报错（POST /runs 的 ApiError）。只认「绑定的工具在本机不存在」：认机读码
+ * run_tool_missing，老后端没码时认原话。别的交给 toast 的通用翻译，返回 null
+ */
+export function explainStartError(e: unknown): RunErrorExplain | null {
+  const code = e && typeof e === 'object' ? (e as { code?: unknown }).code : undefined
+  const text = e instanceof Error ? e.message : typeof e === 'string' ? e : ''
+  if (code !== RUN_TOOL_MISSING && !/^绑定的工具在本机不存在/.test(text)) return null
+  return explainToolMissing(stripClassPrefix(text), text, code === RUN_TOOL_MISSING)
 }
 
 /** 直达某个自定义工具的编辑框（工具页读 ?edit= 打开它）。fixTo 和工具库里的「去改」共用 */
@@ -135,6 +194,45 @@ export function explainRunError(error: string | null | undefined, detail?: strin
   if (!text) {
     return { title: '运行失败，但没有留下原因', action: '打开「原始事件」看最后几条记录。', continuable: true, raw }
   }
+  // 整形节点按 JSON 解析失败（后端 io._json_error）。两种原话：出错的位置落在上游模型写的文字里时
+  // 点名上游（模板没错，别让人去查模板）；否则是模板本身写错了。两种都是图的问题：原样接着跑
+  // 拿到的还是同一段文字、同一份模板，只会再失败一次，所以不给「接着跑」，指到画布上去改
+  // 标题、原因、怎么办都照原话切，不改写：展开区据此认出原话已经说完了，不再整段贴一遍。
+  // 放在最前：原话里带着用户起的节点名（「查询超时订单」「额度查询」），排在后面会被超时、限流、
+  // 连不上那几条按整句关键词抢走，又把「接着跑」给回来
+  const upstream = plain.match(/^(上游「([^」]+)」输出的不是合法 JSON（[^）]*）)[，,]\s*([^；;]*)[；;]\s*([\s\S]+)$/)
+  if (upstream) {
+    return {
+      title: upstream[1],
+      reason: `${endStop(upstream[3].trim())}模板本身没有写错。`,
+      action: `${endStop(upstream[4].trim())}原样接着跑拿到的还是同一段文字，会再失败一次。`,
+      continuable: false,
+      fix: 'canvas',
+      // 要改的是写出这段文字的上游，不是整形节点：入口指到上游去
+      fixNode: upstream[2],
+      raw,
+    }
+  }
+  const badJson = plain.match(/^(模板渲染出来的不是合法 JSON（[^）]*）)[。.]?\s*([\s\S]*)$/)
+  if (badJson) {
+    const hint = badJson[2].trim()
+    // 后端点名了模板里是哪一处、该怎么改（加 | json、去掉引号、取出来是空的）：照它说，
+    // 不再追加「改用 output_schema」——那句指的是另一条路，和它给的改法对不上。
+    // 只有老的笼统说法（或者什么都没说）才补这一句
+    const pointed = hint.startsWith('模板里 {{')
+    return {
+      title: badJson[1],
+      action: `${endStop(hint || TEMPLATE_HINT)}`
+        + (pointed ? '改完再运行。' : '模板里插的是 agent / 模型写的文字时，改用 output_schema + cite_fields 让它交结构化数据。改完再运行。'),
+      continuable: false,
+      fix: 'canvas',
+      raw,
+    }
+  }
+  // 发起就被拒：绑定的工具在本机不存在（POST /runs 422 run_tool_missing）。这次运行根本没开始，
+  // 谈不上接着跑；去接入，或者回画布重新选
+  const missingTool = explainToolMissing(plain, raw)
+  if (missingTool) return missingTool
   // 工具库里存着的坏参数定义。它不在这次运行的快照里：到工具页改好，回来原样接着跑
   // 就能过；不先改，接着跑还是同样的失败
   const broken = explainBrokenTools(plain, raw)

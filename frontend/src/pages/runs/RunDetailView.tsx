@@ -17,7 +17,7 @@ import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
 import { localActor } from '../../lib/actor'
-import { explainRunError } from '../../lib/explain'
+import { explainRunError, explainStartError } from '../../lib/explain'
 import { canLeave, leavePass } from '../../lib/leave'
 import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
 import {
@@ -299,7 +299,18 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       toast.ok(`已补上「${field}」重新发起运行`)
       navigate({ pathname: `/runs/${next.id}`, search })
     } catch (e) {
-      toast.error(e)
+      // 绑定的工具在本机不存在（422 run_tool_missing）：和画布上发起被拒（run/RunControl）同一套，
+      // 报错里给直达入口——数据源工具去数据页，自定义 / MCP 工具去工具页
+      const x = explainStartError(e)
+      const to = x?.fixTo
+      if (x && to) {
+        toast.error(`${x.title}：${x.reason ?? ''}${x.action ?? ''}`, {
+          detail: x.raw, key: 'runs:run-tool-missing',
+          action: { label: x.fixLabel ?? '去接入', onClick: () => navigate(to) },
+        })
+      } else {
+        toast.error(e)
+      }
     } finally {
       setBusy(null)
     }

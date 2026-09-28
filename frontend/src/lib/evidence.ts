@@ -11,10 +11,12 @@
  * 不存在）。其余几种先把外观定下，后续期接上时不用再各处补。
  */
 
-import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, evidenceTally } from './terms'
+import { EVIDENCE_KIND_LABEL, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, UPGRADE_POLICY_LABEL, evidenceTally } from './terms'
+import { NONE, formatNumber, shortId } from './format'
 import type {
-  EvidenceBlock, EvidenceDocData, EvidenceFieldRef, EvidenceGraph, EvidenceSeal, EvidenceSegment,
-  EvidenceSegmentDetail, EvidenceStep, EvidenceUnit, EvidenceViolation, ReviewResult,
+  EvidenceBlock, EvidenceCaliberSource, EvidenceCaliberUpgrade, EvidenceDocData, EvidenceFieldRef, EvidenceGraph,
+  EvidenceInput, EvidenceLocator, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit,
+  EvidenceViolation, ReviewResult,
 } from '../types'
 import type { MarkSpec } from '../run/Markdown'
 
@@ -54,7 +56,7 @@ export const EVIDENCE_STATE: Record<EvidenceStateCode, EvidenceStateMeta> = {
     code: 'deterministic', label: EVIDENCE_STATE_LABEL.deterministic, line: 'solid', glyph: '',
     color: 'var(--st-done)', decoration: mix('--st-done', 60), soft: 'var(--st-done-soft)',
     alert: false, phase: 1,
-    hint: '数字由系统从口径卡取值、按口径卡的格式渲染，不是模型写的',
+    hint: '由系统从证据（口径卡、查询快照、运行输入）里取值、按确定的规则渲染，不是模型写的',
   },
   supported: {
     code: 'supported', label: EVIDENCE_STATE_LABEL.supported, line: 'badge', glyph: '◆',
@@ -123,19 +125,210 @@ export function unitText(unit: Pick<EvidenceUnit, 'segments'>): string {
   return (unit.segments ?? []).filter((s) => s.kind !== 'structural').map((s) => s.text).join('')
 }
 
-/** 片段的来源说一句：「口径卡指标 环比增幅」「运行输入 week」 */
+/**
+ * 片段的来源说一句：「口径卡指标 环比增幅」「运行输入 week」「查询 Q3 · 第 6 行 · amount」。
+ * 单元格先看 cite 的种类：查询条目在目录里是 query，引用它的一格是 cell
+ */
 export function sourceOf(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'catalog'> | null): string {
   const cite = seg.cite
   if (!cite) return ''
   const entry = cite.alias ? doc?.catalog?.[cite.alias] : undefined
+  if (cite.kind === 'cell' || (cite.kind !== 'metric' && cite.kind !== 'input' && entry?.kind === 'query')) {
+    const where = locatorText(cite.locator)
+    return [EVIDENCE_TEXT.query(cite.alias ?? ''), where].filter(Boolean).join(' · ')
+  }
   if (cite.kind === 'metric' || entry?.kind === 'metric') {
     const name = entry?.name ?? cite.locator?.metric ?? cite.ref ?? ''
-    return name ? `口径卡指标 ${name}` : '口径卡指标'
+    return name ? `${EVIDENCE_KIND_LABEL.metric} ${name}` : EVIDENCE_KIND_LABEL.metric
   }
   if (cite.kind === 'input' || entry?.kind === 'input') {
-    return `运行输入 ${entry?.locator?.field ?? cite.locator?.field ?? cite.ref ?? ''}`.trim()
+    return `${EVIDENCE_KIND_LABEL.input} ${entry?.locator?.field ?? cite.locator?.field ?? cite.ref ?? ''}`.trim()
   }
-  return cite.alias ?? cite.ref ?? ''
+  const kind = cite.kind ? EVIDENCE_KIND_LABEL[cite.kind] : ''
+  return [kind, cite.alias ?? cite.ref].filter(Boolean).join(' ')
+}
+
+/**
+ * 查询快照里的位置怎么说：「第 6 行 · amount」「第 1–5 行 · amount」「第 1–5 行 · week、amount」。
+ * 行号给人看从 1 数（引用原文 Q3.r5 里的 r5 从 0 数，面板另把原文摆出来）
+ */
+export function locatorText(loc: EvidenceLocator | null | undefined): string {
+  if (!loc) return ''
+  const ints = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
+  let rows = ''
+  const row = ints(loc.row)
+  if (row != null) rows = `第 ${formatNumber(row + 1)} 行`
+  else if (Array.isArray(loc.rows) && loc.rows.length) {
+    const a = ints(loc.rows[0])
+    const b = ints(loc.rows[loc.rows.length - 1])
+    if (a != null && b != null) rows = a === b ? `第 ${formatNumber(a + 1)} 行` : `第 ${formatNumber(a + 1)}–${formatNumber(b + 1)} 行`
+  }
+  const cols = typeof loc.column === 'string' && loc.column ? loc.column
+    : loc.columns && typeof loc.columns === 'object' ? Object.values(loc.columns).filter((c) => typeof c === 'string').join('、')
+    : ''
+  return [rows, cols].filter(Boolean).join(' · ')
+}
+
+/** 证据里的值怎么写：数带千分位、不丢小数；布尔写是否；拿不到写「—」 */
+export function evidenceValue(v: unknown): string {
+  if (v == null || v === '') return NONE
+  if (typeof v === 'number') return Number.isFinite(v) ? v.toLocaleString('en-US', { maximumFractionDigits: 20 }) : String(v)
+  if (typeof v === 'boolean') return v ? '是' : '否'
+  if (typeof v === 'object') return JSON.stringify(v)
+  return String(v)
+}
+
+/**
+ * 查询步骤的窗口：接口只给被引用的行加前后各 2 行。
+ *
+ * - offset：rows[0] 在快照里是第几行；没给就当从 0 开始、也不说位置
+ * - marks：要高亮的行，换算成窗口里的下标。highlight.rows 按快照行号给（方案第 5 节）；
+ *   全都落在窗口里才这么认，否则看它们是不是本来就是窗口下标（row_offset 之前的号、老接口）
+ * - windowed：窗口没盖住整份快照，要说「仅显示被引用的行及前后各 2 行」
+ */
+export function queryWindow(step: Pick<EvidenceStep,
+  'rows' | 'columns' | 'row_offset' | 'row_index' | 'total_rows' | 'highlight'>): {
+  columns: string[]; rows: unknown[][]
+  /** 每一行在快照里是第几行（从 0 数）；不知道时是 null */
+  index: number[] | null
+  total: number | null
+  marks: number[]; cols: string[]
+  /** 精确到格的高亮：[窗口下标, 列名]；接口没给时 null，按 marks × cols 画 */
+  cells: [number, string][] | null
+  windowed: boolean
+  /** 「第 4–8、10–12 行」：窗口在快照里的位置，从 1 数；不知道时 '' */
+  span: string
+} {
+  const rows = Array.isArray(step.rows) ? step.rows.filter(Array.isArray) as unknown[][] : []
+  const columns = Array.isArray(step.columns) ? step.columns.map(String) : []
+  const int = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
+  const total = int(step.total_rows)
+  // 行号：row_index 一行一个（窗口可以不连续）最准；只有 row_offset 时按连续的算
+  const given = Array.isArray(step.row_index) ? step.row_index.map(int) : null
+  const offset = int(step.row_offset)
+  const index = given && given.length === rows.length && given.every((r) => r != null) ? given as number[]
+    : offset != null ? rows.map((_, i) => offset + i)
+    : null
+  const toWindow = (r: number): number => {
+    if (index) {
+      const at = index.indexOf(r)
+      if (at >= 0) return at
+    }
+    return -1
+  }
+  const inWindow = (r: number) => r >= 0 && r < rows.length
+  // 行号按快照认（方案第 5 节），认得出几个标几个：窗口被截到 MAX_WINDOW_ROWS 时后面几行不在窗口里，
+  // 不能因此一行都不标。一个都认不出、却都落在窗口里的，当成窗口下标（老接口）；认不出的是 -1
+  const place = (list: number[]): number[] | null => {
+    const hit = list.map(toWindow)
+    return hit.some((i) => i >= 0) ? hit : list.every(inWindow) ? list : null
+  }
+  const wanted = (Array.isArray(step.highlight?.rows) ? step.highlight.rows : []).map(int).filter((r): r is number => r != null)
+  const marks = ((wanted.length && place(wanted)) || []).filter((i) => i >= 0)
+  const cols = (Array.isArray(step.highlight?.cols) ? step.highlight.cols : []).map(String).filter((c) => columns.includes(c))
+  const rawCells = (Array.isArray(step.highlight?.cells) ? step.highlight.cells : [])
+    .filter((c) => Array.isArray(c) && int(c[0]) != null && columns.includes(String(c[1])))
+  const cellRows = rawCells.length ? place(rawCells.map((c) => c[0] as number)) : null
+  const placed = cellRows ? rawCells.map((c, i) => [cellRows[i], String(c[1])] as [number, string]).filter(([r]) => r >= 0) : []
+  const cells = placed.length ? placed : null
+  const windowed = !!index && total != null && index.length < total
+  return { columns, rows, index, total, marks, cols, cells, windowed, span: index ? spanText(index) : '' }
+}
+
+/** [3,4,5,6,7,9,10,11] → 「第 4–8、10–12 行」（从 1 数） */
+function spanText(index: number[]): string {
+  if (!index.length) return ''
+  const sorted = [...index].sort((a, b) => a - b)
+  const parts: string[] = []
+  let start = sorted[0]
+  let prev = sorted[0]
+  for (const r of [...sorted.slice(1), Number.NaN]) {
+    if (r === prev + 1) { prev = r; continue }
+    parts.push(start === prev ? formatNumber(start + 1) : `${formatNumber(start + 1)}–${formatNumber(prev + 1)}`)
+    start = r
+    prev = r
+  }
+  return `第 ${parts.join('、')} 行`
+}
+
+/**
+ * 这个输入对应链里的哪一个查询步骤：先按快照工件认，再按接口补的全局编号（input.query、
+ * input.cell 的前缀）认。agent 字段的 ref 是那个节点内部的编号，不拿它对。认不出返回 -1
+ */
+export function queryOf(
+  input: Pick<EvidenceInput, 'artifact' | 'query' | 'cell'>, queries: Pick<EvidenceStep, 'artifact' | 'alias'>[],
+): number {
+  if (input.artifact) {
+    const i = queries.findIndex((q) => q.artifact === input.artifact)
+    if (i >= 0) return i
+  }
+  const alias = input.query || (typeof input.cell === 'string' ? input.cell.split('.')[0] : '')
+  return alias ? queries.findIndex((q) => q.alias === alias) : -1
+}
+
+export type SourceTone = 'ok' | 'warn' | 'alert' | 'muted'
+
+/**
+ * 输入来源那一行说什么、多醒目。
+ *
+ * - agent 字段（开了 cite_fields）：与快照一致 / 模型报 X 快照是 Y 已按快照取值 / 没查到记为空；
+ *   unresolved 和 missing（模型写了 from: null）同一种说法：值都是空的，没有兜底成 0
+ * - cell() 取数：与快照一致 / 算的时候用的值和快照不一样（值没被换掉，照实说）/ 核对不到
+ * - 代码节点：取数角色提醒（核对不到快照），计算角色醒目（沙箱里的算术不该绕开口径卡）
+ * - 其余（运行输入、老运行）：一期的 ok / missing
+ */
+export function inputSource(input: EvidenceInput): { tone: SourceTone; text: string; reason?: string } {
+  const status = input.status ?? ''
+  if (input.via === 'agent_field') {
+    if (status === 'verified') return { tone: 'ok', text: EVIDENCE_TEXT.sourceVerified }
+    if (status === 'mismatch') {
+      return { tone: 'warn', text: EVIDENCE_TEXT.sourceMismatch(evidenceValue(input.model_value), evidenceValue(input.value)) }
+    }
+    return { tone: 'warn', text: EVIDENCE_TEXT.sourceEmpty, reason: input.reason || undefined }
+  }
+  if (input.via === 'tool_cell') {
+    if (status === 'verified') return { tone: 'ok', text: EVIDENCE_TEXT.sourceVerified }
+    if (status === 'mismatch') {
+      return { tone: 'warn', text: EVIDENCE_TEXT.cellMismatch(evidenceValue(input.value),
+        evidenceValue(input.snapshot_value !== undefined ? input.snapshot_value : input.value)) }
+    }
+    if (input.value == null) return { tone: 'warn', text: EVIDENCE_TEXT.sourceEmpty, reason: input.reason || undefined }
+    return { tone: 'warn', text: EVIDENCE_TEXT.cellUnresolved, reason: input.reason || undefined }
+  }
+  if (input.via === 'code') {
+    return input.role === 'source'
+      ? { tone: 'warn', text: EVIDENCE_TEXT.codeSource(input.node_id ?? '') }
+      : { tone: 'alert', text: EVIDENCE_TEXT.codeCompute(input.node_id ?? '') }
+  }
+  if (status === 'missing' || input.value == null) return { tone: 'warn', text: EVIDENCE_TEXT.inputMissing }
+  return { tone: 'muted', text: '' }
+}
+
+/** 值得在「输入来源」里单独列一行的输入：能核对到快照的、代码节点的、缺的 */
+export const notableInput = (input: EvidenceInput): boolean =>
+  input.via === 'agent_field' || input.via === 'tool_cell' || input.via === 'code'
+  || input.status === 'missing' || input.value == null
+
+/**
+ * 口径卡钉在哪：「口径卡「周报口径」v3，来自「销售周报」v5」。工作流名接口没给就按目录找，
+ * 再没有就写工作流 id 的前几位——不写 undefined
+ */
+export function caliberSourceText(
+  caliber: string | undefined, version: string | undefined,
+  from: EvidenceCaliberSource | null | undefined, workflowName?: string,
+): string | null {
+  if (!from || typeof from !== 'object' || (!from.workflow_id && !from.workflow_name)) return null
+  const wf = from.workflow_name || workflowName || (from.workflow_id ? shortId(from.workflow_id, 12) : NONE)
+  const v = from.workflow_version != null && from.workflow_version !== '' ? `v${String(from.workflow_version).replace(/^v/, '')}` : ''
+  return EVIDENCE_TEXT.caliberFrom(caliber ?? '', version ?? '', wf, v)
+}
+
+/** 升版处置那一句：「上游已有 v6，按「并排双印新旧口径」处置」。没有升版（null、没写 latest / policy）返回 null */
+export function caliberUpgradeText(up: EvidenceCaliberUpgrade | null | undefined): string | null {
+  if (!up || typeof up !== 'object' || (!up.policy && !up.policy_label)) return null
+  const latest = up.latest != null && String(up.latest) !== '' ? `v${String(up.latest).replace(/^v/, '')}` : null
+  const policy = up.policy_label || (up.policy ? UPGRADE_POLICY_LABEL[up.policy] ?? up.policy : '')
+  return EVIDENCE_TEXT.caliberUpgrade(latest, policy)
 }
 
 /** 无证据的原因：裸数字，还是引用解析不了（带后端给的人话原因） */

@@ -304,6 +304,64 @@ export interface ValidationIssue {
   message: string
   /** 出问题的是节点配置里的哪一项：'prompt'、'tools'、'cases[1].condition'。老后端不给 */
   field?: string | null
+  /** 机读编号（governed.agent_approval_never 这类），发布前检查按它认修复。老后端不给 */
+  code?: string | null
+  /** 这条问题对应的修复 id：publish-check 的 fixes 里同 id 的那一项。没有修复时为空 */
+  fix?: string | null
+}
+
+/** 发布等级：发布弹窗、问题面板的发布前检查共用 */
+export type PublishLevel = 'published' | 'governed'
+
+/**
+ * 发布前检查给的一项修复（POST /workflows/{id}/publish-check 的 fixes）。
+ * auto：答案唯一、不降低要求，预览后一键修；choice：要人拿主意，options 里挑（multiple 可多选）；
+ * assist：结构性的，交给 Copilot 试着改，产出同样只是预览
+ */
+export interface PublishFix {
+  id: string
+  code: string
+  kind: 'auto' | 'choice' | 'assist'
+  node_id?: string | null
+  label: string
+  preview?: { field?: string | null; before?: unknown; after?: unknown } | null
+  options?: { value: unknown; label: string; hint?: string | null }[]
+  multiple?: boolean
+  /** 建议值：界面上标「建议」，仍然要人选 */
+  default?: unknown
+}
+
+export interface PublishCheck {
+  level: PublishLevel
+  ok: boolean
+  issues: ValidationIssue[]
+  fixes: PublishFix[]
+}
+
+/** 自动修复预览里给人看的一项改动：「节点 · 字段：原值 → 新值」 */
+export interface AutofixChange {
+  fix_id: string
+  node_id?: string | null
+  node_title?: string | null
+  field?: string | null
+  before?: unknown
+  after?: unknown
+  label?: string | null
+}
+
+/** POST /workflows/{id}/autofix：只给预览，不改库、不发布 */
+export interface AutofixResult {
+  /** 修复后的整张图；人确认后前端走保存接口存成草稿 */
+  graph: GraphSpec | null
+  changes: AutofixChange[]
+  applied: string[]
+  rejected: { fix_id: string; reason: string }[]
+  /** 修复后仍然存在的问题（带 code 和 fix） */
+  remaining: ValidationIssue[]
+  /** 交给 Copilot 的那一段：它认为要人拿主意的放进 questions，不硬改 */
+  assist: { ok: boolean; summary?: string; questions?: string[] } | null
+  /** 修复后是否已经没有 error */
+  ok: boolean
 }
 
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
@@ -675,23 +733,79 @@ export interface EvidenceGraph {
   edges?: { from: string; to: string; rel: string }[]
 }
 
+/**
+ * 查询快照里的位置：单元格 {row, column}；agent 的数组字段按行映射时是 {rows: [首, 尾], column | columns}
+ * （columns 是「字段 → 列」）。行号从 0 数
+ */
+export interface EvidenceLocator {
+  row?: number
+  column?: string
+  rows?: [number, number] | number[]
+  columns?: Record<string, string>
+}
+
 /** 指标的一个输入：值从哪来 */
 export interface EvidenceInput {
   path?: string
   value?: unknown
   node_id?: string
+  /**
+   * 一期：input / transform / agent / code / tool / llm …（产出节点的类型）；
+   * 二期能追到查询快照那一格的两种：agent_field（agent 开了 cite_fields 的字段）、tool_cell（cell() 取数）
+   */
   via?: string
   field?: string
+  /** 只有 code 节点有：source 取数 / compute 计算（缺省） */
   role?: string
-  /** ok / missing */
+  /**
+   * 一期 ok / missing；agent_field、tool_cell 是核对状态：verified 与快照一致、mismatch 对不上、
+   * unresolved 核对不了、missing 模型照实说没查到（from 为 null）
+   */
   status?: string
+  /** agent 字段的出处，agent 节点内的编号（Q1.r0.gmv）。和报告目录的全局编号不是一回事，靠 artifact 对应 */
+  ref?: string | null
+  /** 查询快照的工件 id：跳到哪一个查询步骤按它认 */
+  artifact?: string
+  locator?: EvidenceLocator
+  eid?: string
+  /** agent_field mismatch：模型报的值（value 是快照里的） */
+  model_value?: unknown
+  /** tool_cell mismatch：快照里的值（value 是算的时候用的） */
+  snapshot_value?: unknown
+  /** unresolved 的原因（人话） */
+  reason?: string
+  /** 输入对到的查询在报告目录里的编号（Q3）：接口按工件补的全局编号 */
+  query?: string | null
+  /** 输入落在哪一格，全局编号（Q3.r5.amount） */
+  cell?: string
+}
+
+/** 口径卡钉在另一个已发布工作流某个版本里的口径卡上 */
+export interface EvidenceCaliberSource {
+  workflow_id?: string
+  workflow_version?: number | string
+  node_id?: string
+  /** 接口顺手给的工作流名；没给时前端按工作流目录找 */
+  workflow_name?: string
+}
+
+/** 口径卡上游有新版本时声明的处置（和子工作流的升版处置同一套） */
+export interface EvidenceCaliberUpgrade {
+  node_id?: string
+  workflow_id?: string
+  pinned?: number
+  latest?: number
+  /** recompute / dual / incomparable */
+  policy?: string
+  policy_label?: string
 }
 
 /**
- * 片段证据链的一步。本期有三种：metric（指标）、input（指标的一个输入，也可能挂在
- * metric.inputs 里）、run_input（报告直接引用的运行输入）
+ * 片段证据链的一步：metric（指标）、input（指标的一个输入，也可能挂在 metric.inputs 里）、
+ * run_input（报告直接引用的运行输入）、query（查询快照：被引用的行加前后各 2 行）。
+ * input 步骤同时带着 EvidenceInput 的字段（via、status、model_value、ref、locator、artifact）
  */
-export interface EvidenceStep {
+export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
   decimals?: number | null
@@ -720,9 +834,36 @@ export interface EvidenceStep {
   recompute_ok?: boolean | null
   status?: string
   inputs?: EvidenceInput[]
-  path?: string
-  field?: string
-  via?: string
+  /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
+  caliber_from?: EvidenceCaliberSource | null
+  /** 上游有新版本时的处置（metric）；没有升版是 null */
+  caliber_upgrade?: EvidenceCaliberUpgrade | null
+  // ---- query：查询快照的一个窗口 ----
+  tool?: string
+  /** query：数据源名；metric：口径卡钉住的来源 {workflow_id, workflow_version, node_id, workflow_name} */
+  source?: string | EvidenceCaliberSource | null
+  sql?: string
+  columns?: string[]
+  /** 只有被引用的行加前后各 2 行；遮罩列的值已经换成「已遮罩」 */
+  rows?: unknown[][]
+  /** rows[0] 在快照里是第几行（从 0 数） */
+  row_offset?: number
+  /** rows 里每一行在快照里是第几行：被引用的行隔得远时窗口不连续，按它认 */
+  row_index?: number[]
+  /** 快照一共几行 */
+  total_rows?: number | null
+  /** 查询撞了行数上限，库里还有更多 */
+  truncated?: boolean | null
+  /** 被引用的行太多，窗口只给了前面一截 */
+  window_truncated?: boolean
+  /** 被引用的行（快照里的行号）和列；cells 是精确到格的 [行, 列]，有它就只高亮这几格 */
+  highlight?: { rows?: number[]; cols?: string[]; cells?: [number, string][] }
+  /** 这一步里被遮罩的列 */
+  masked?: string[]
+  /** 这一步为什么没有行（快照不在封存范围里、哈希对不上、取不回来） */
+  note?: string
+  /** 数据源改名或删掉了、按查询当时记下的遮罩处理时的那句说明。行照样有 */
+  mask_note?: string
 }
 
 /** GET /runs/{id}/evidence/segments/{sid}：点开一个片段 */
@@ -737,4 +878,6 @@ export interface EvidenceSegmentDetail {
   /** 落在这个片段（或这一句、没有片段的）上的违规 */
   violations?: EvidenceViolation[]
   seal?: EvidenceSeal
+  /** 查询步骤里被遮罩的列（数据源 options.mask_columns）。遮罩只减少暴露，不是安全边界 */
+  redacted?: { columns?: string[] }
 }

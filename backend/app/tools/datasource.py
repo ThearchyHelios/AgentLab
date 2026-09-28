@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import introspect
-from app.data.engine import query_timeout, run_query
+from app.data.engine import masked_columns, query_timeout, run_query
 from app.data.guard import QueryLimits, SqlRejected, is_write
 from app.db.models import DataSource
 from app.tools.registry import ToolContext
@@ -148,8 +148,12 @@ def _make_query_tool(source: DataSource, ctx: ToolContext) -> StructuredTool:
         try:
             from app.core.artifact_store import put_json
 
+            # 查询当时数据源设的遮罩列一起记进快照：数据源事后改名、删掉，证据面板仍按当时的遮。
+            # 只进快照，不进交给模型的结果（模型看到的是原值，多个字段只会让它以为数据被遮了）；
+            # 没设遮罩的快照和原来一字不差
+            mask = masked_columns(source.options)
             payload["artifact"] = await put_json(
-                payload, kind="query_snapshot",
+                {**payload, "mask_columns": mask} if mask else payload, kind="query_snapshot",
                 run_id=ctx.run_id or "", node_id=ctx.node_id or "",
             )
         except Exception:  # noqa: BLE001 - 存不下不影响查询本身

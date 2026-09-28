@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -48,10 +49,18 @@ QUERY_TIMEOUT_OPTION = "query_timeout_s"
 MIN_QUERY_TIMEOUT_S = 1
 MAX_QUERY_TIMEOUT_S = 600
 
+#: 数据源 options 里要遮罩的列（列名列表，或者逗号分隔的一段文字）。证据面板展示原始行时，
+#: 这些列的值一律换成「已遮罩」。在有身份体系之前，遮罩只减少暴露，不是安全边界：
+#: 完整快照仍能按工件 id 取到，SQL 里给列起个别名也能绕开
+MASK_COLUMNS_OPTION = "mask_columns"
+
 # options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
 # schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
 # query_timeout_s：查询时限，由数据层按语句下发给数据库，见 _server_deadline
-_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION})
+# mask_columns：证据面板遮罩的列，驱动不认识它，拼进连接串会被当成未知参数拒掉
+_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION})
+
+_MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
 
 @dataclass
@@ -62,9 +71,11 @@ class QueryResult:
     truncated: bool
     elapsed_ms: int
     sql: str
+    #: 列名 → number / text / date / datetime / time / boolean。拿不准的列（全是空值、类型混着）不在里面
+    column_types: dict[str, str] | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "columns": self.columns,
             "rows": self.rows,
             "row_count": self.row_count,
@@ -72,6 +83,9 @@ class QueryResult:
             "elapsed_ms": self.elapsed_ms,
             "sql": self.sql,
         }
+        if self.column_types:
+            payload["column_types"] = self.column_types
+        return payload
 
 
 def build_url(source: Any, *, reveal: bool = False) -> str:
@@ -172,6 +186,23 @@ def query_timeout_problem(options: dict[str, Any] | None) -> str | None:
         return (f"查询时限要填 {MIN_QUERY_TIMEOUT_S} 到 {MAX_QUERY_TIMEOUT_S} 之间的秒数，"
                 f"比如 60；现在填的是「{value}」")
     return None
+
+
+def masked_columns(options: dict[str, Any] | None) -> list[str]:
+    """options.mask_columns → 列名列表（去空白、去重，保持顺序）。列表和「a, b」这样的文字都认。"""
+    raw = (options or {}).get(MASK_COLUMNS_OPTION)
+    items = _MASK_SPLIT.split(raw) if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    return list(dict.fromkeys(str(c).strip() for c in items if isinstance(c, (str, int)) and str(c).strip()))
+
+
+def mask_columns_problem(options: dict[str, Any] | None) -> str | None:
+    """保存数据源时查一下遮罩列填得对不对；没填、或者填对了返回 None。"""
+    raw = (options or {}).get(MASK_COLUMNS_OPTION)
+    if raw is None or raw == "" or raw == []:
+        return None
+    if isinstance(raw, str) or (isinstance(raw, list) and all(isinstance(c, str) for c in raw)):
+        return None
+    return f"遮罩的列要填列名，用逗号分开，比如「phone, email」；现在填的是「{raw}」"
 
 
 def query_timeout(source: Any) -> float:
@@ -477,23 +508,25 @@ async def run_query(
     if not source.readonly and is_write(statement):
         return await _run_write(engine, kind, statement, limits, started)
 
-    async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool]:
+    async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
         cursor = await conn.stream(text(statement))
         columns = list(cursor.keys())
         rows: list[list[Any]] = []
+        seen = _TypeTally(len(columns))
         truncated = False
         size = 0
         async for row in cursor:
             # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
+            seen.add(row)
             values = [_jsonable(v) for v in row]
             rows.append(values)
             size += len(json.dumps(values, ensure_ascii=False, default=str))
             if len(rows) >= limits.max_rows or size >= limits.max_bytes:
                 truncated = True
                 break
-        return columns, rows, truncated
+        return columns, rows, truncated, seen.types(columns)
 
-    columns, rows, truncated = await _bounded(
+    columns, rows, truncated, types = await _bounded(
         engine.connect, kind, limits,
         f"查询超过 {_seconds(limits.timeout_seconds)}s 被中断。加上 WHERE 条件或 LIMIT 缩小范围。",
         _read,
@@ -505,7 +538,53 @@ async def run_query(
         truncated=truncated,
         elapsed_ms=int((time.perf_counter() - started) * 1000),
         sql=statement,
+        column_types=types,
     )
+
+
+class _TypeTally:
+    """边读边记每列见过的值类型。只看驱动交回的原始值：_jsonable 之后 Decimal 就成了字符串，
+    小数位为 0 的 DECIMAL（"45678"）和文本列的 "2026" 再也分不开。"""
+
+    def __init__(self, width: int) -> None:
+        self._kinds: list[set[str]] = [set() for _ in range(width)]
+
+    def add(self, row: Any) -> None:
+        for kinds, value in zip(self._kinds, row):
+            if value is not None:
+                kinds.add(_value_kind(value))
+
+    def types(self, columns: list[str]) -> dict[str, str]:
+        return {str(name): kind for name, kinds in zip(columns, self._kinds)
+                if len(kinds) == 1 and (kind := next(iter(kinds))) != "other"}
+
+
+def _value_kind(value: Any) -> str:
+    from datetime import date, datetime, time as dtime
+    from decimal import Decimal
+
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float, Decimal)):
+        return "number"
+    if isinstance(value, datetime):
+        return "datetime"
+    if isinstance(value, date):
+        return "date"
+    if isinstance(value, dtime):
+        return "time"
+    return "text" if isinstance(value, str) else "other"
+
+
+def column_types(columns: list[str], rows: list[Any]) -> dict[str, str]:
+    """一批原始行里每列的类型：number / text / date / datetime / time / boolean。
+
+    全是空值、类型混着（同一列里有数也有文本）的列不记——拿不准就不说，下游照旧按值猜。
+    """
+    tally = _TypeTally(len(columns))
+    for row in rows:
+        tally.add(row)
+    return tally.types(columns)
 
 
 async def _run_write(

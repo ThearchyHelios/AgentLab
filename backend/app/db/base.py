@@ -150,6 +150,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("workflows", "published_version", "INTEGER"),
     ("workflows", "published_by", "VARCHAR(100)"),
     ("workflow_versions", "graph_hash", "VARCHAR(64)"),
+    # 存量版本回填成 NULL：不知道当时按哪一档发布的，正式运行照旧看工作流的 status
+    ("workflow_versions", "level", "VARCHAR(20)"),
     ("approvals", "resolved_by", "VARCHAR(100)"),
     # 存量向量没有这两列，回填成空串 / 0 —— 正好表示"不知道是谁建的"，
     # 检索侧会把它们当成对不上当前 embedder 处理

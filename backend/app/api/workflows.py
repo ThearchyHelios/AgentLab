@@ -12,12 +12,14 @@ from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
-from app.engine.governance import lint_for_publish
-from app.engine.schema import GraphSpec, validate_graph
+from app.engine.governance import publish_issues
+from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
 _GONE = "这个工作流不存在，可能已经被删了"
+_LEVELS = ("published", "governed")
+_BAD_LEVEL = "发布档位只能选「已发布」或「受管」"
 
 
 class WorkflowIn(BaseModel):
@@ -181,6 +183,8 @@ class VersionOut(BaseModel):
     version: int
     note: str
     created_at: Any = None
+    #: 这一版按哪一档发布的（published / governed）。没发布过、或者是记级别之前发布的为 null
+    level: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -238,7 +242,7 @@ async def get_version(
         id=snapshot.id, version=snapshot.version, note=snapshot.note,
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
         graph_hash=snapshot.graph_hash or graph_hash(graph), input_fields=fields,
-        published=workflow.published_version == snapshot.version,
+        published=workflow.published_version == snapshot.version, level=snapshot.level,
     )
 
 
@@ -297,8 +301,8 @@ async def publish_workflow(
     错误会挡住发布——这就是"必经检查点"落地的地方。
     返回 200 + ok/issues 而不是抛错，让前端能把问题列表渲染出来。
     """
-    if payload.level not in ("published", "governed"):
-        raise HTTPException(400, "发布档位只能选「已发布」或「受管」")
+    if payload.level not in _LEVELS:
+        raise HTTPException(400, _BAD_LEVEL)
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -320,13 +324,14 @@ async def publish_workflow(
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "issues": [{"level": "error", "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
 
-    issues = [i.model_dump() for i in validate_graph(spec).issues]
-    issues += [i.model_dump() for i in lint_for_publish(spec, level=payload.level).issues]
+    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level)]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
     if not snapshot.graph_hash:
         snapshot.graph_hash = graph_hash(snapshot.graph)
+    # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
+    snapshot.level = payload.level
     workflow.status = payload.level
     workflow.published_version = version
     workflow.published_by = actor_of(x_actor)
@@ -339,6 +344,130 @@ async def publish_workflow(
         "published_by": workflow.published_by,
         "issues": issues,  # 剩下的都是警告
     }
+
+
+# --------------------------------------------------------------------------
+# 发布前检查与自动修复：两个接口都只读，不改库、不发布
+# --------------------------------------------------------------------------
+
+class PublishCheckIn(BaseModel):
+    level: str = "published"
+    #: 画布上还没保存的图。不带就用库里当前的草稿
+    graph: dict[str, Any] | None = None
+
+
+class AutofixIn(PublishCheckIn):
+    #: 要应用的修复 id（publish-check 给的 fixes[].id）
+    apply: list[str] = Field(default_factory=list)
+    #: choice 类修复的选择：{fix_id: 值}，可以多选的给列表
+    choices: dict[str, Any] = Field(default_factory=dict)
+    #: 剩下的 error 交给 Copilot 试着修（结果同样只是预览）
+    assist: bool = False
+    provider: str | None = None
+    model: str | None = None
+
+
+async def _draft(session: AsyncSession, workflow_id: str, payload: PublishCheckIn) -> dict[str, Any]:
+    if payload.level not in _LEVELS:
+        raise HTTPException(400, _BAD_LEVEL)
+    workflow = await session.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(404, _GONE)
+    return payload.graph if payload.graph is not None else (workflow.graph or {})
+
+
+async def _gate_context(session: AsyncSession, spec: GraphSpec) -> tuple[dict[str, Any], dict[str, Any]]:
+    """修复要用、但门禁本身不查库的东西：子工作流当前的发布版本，钉在别处的口径卡有哪些指标。"""
+    versions: dict[str, Any] = {}
+    cards: dict[str, Any] = {}
+    for node in spec.nodes:
+        cfg = node.config
+        if node.type == NodeType.SUBGRAPH and cfg.get("workflow_id") and str(cfg["workflow_id"]) not in versions:
+            upstream = await session.get(Workflow, str(cfg["workflow_id"]))
+            versions[str(cfg["workflow_id"])] = upstream.published_version if upstream else None
+        elif node.type == NodeType.METRICS and isinstance(cfg.get("caliber_from"), dict):
+            ref = cfg["caliber_from"]
+            version = ref.get("workflow_version")
+            if not ref.get("workflow_id") or not str(version or "").isdigit():
+                continue
+            snapshot = (await session.execute(select(WorkflowVersion).where(
+                WorkflowVersion.workflow_id == str(ref["workflow_id"]),
+                WorkflowVersion.version == int(version)))).scalar_one_or_none()
+            card = next((n for n in ((snapshot.graph if snapshot else None) or {}).get("nodes") or []
+                         if isinstance(n, dict) and n.get("id") == ref.get("node_id")), None)
+            if card is not None:
+                cards[node.id] = ((card.get("data") or {}).get("config") or {}).get("metrics") or []
+    return versions, cards
+
+
+def _unreadable(level: str, e: Exception) -> dict[str, Any]:
+    return {"level": level, "ok": False, "fixes": [], "issues": [
+        {"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None, "fix": None,
+         "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+
+
+@router.post("/{workflow_id}/publish-check")
+async def publish_check(
+    workflow_id: str, payload: PublishCheckIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """发布前检查：和真正发布同一套口径（validate + 门禁）列出问题，以及能怎么修。
+
+    只读：不改库、不发布。发布弹窗一打开就调它，不用等点了发布才知道被拦。
+    """
+    from app.engine.autofix import check
+
+    graph = await _draft(session, workflow_id, payload)
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception as e:  # noqa: BLE001
+        return _unreadable(payload.level, e)
+    versions, cards = await _gate_context(session, spec)
+    return check(spec, level=payload.level, versions=versions, cards=cards)
+
+
+@router.post("/{workflow_id}/autofix")
+async def autofix(
+    workflow_id: str, payload: AutofixIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """应用选中的修复，返回修复后的整张图——只是预览。
+
+    不自动保存、不自动发布：人看过逐项变更再确认，前端走现有的保存接口存草稿，再检查、再发布。
+    每条修复都复核过（降低要求的、错误没变少或者冒出新错误的丢弃并写明原因）。assist 为真时，
+    剩下的 error 交给 Copilot，同一道复核通过才采纳。
+    """
+    from app.engine.autofix import apply_fixes, diff_changes
+
+    graph = await _draft(session, workflow_id, payload)
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception as e:  # noqa: BLE001
+        bad = _unreadable(payload.level, e)
+        return {"graph": graph, "changes": [], "ops": [], "applied": [], "rejected": [
+            {"fix_id": fid, "reason": "工作流的结构读不懂，没法应用修复"} for fid in payload.apply],
+            "remaining": bad["issues"], "fixes": [], "assist": None, "ok": False}
+    versions, cards = await _gate_context(session, spec)
+    out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards)
+    out["assist"] = None
+    if payload.assist:
+        if out["ok"]:
+            out["assist"] = {"ok": True, "summary": "修复之后已经没有挡住发布的错误，没有再交给 Copilot",
+                             "questions": []}
+            return out
+        from app.api.copilot import assist_publish_fix
+
+        helped = await assist_publish_fix(session, out["graph"], level=payload.level,
+                                          provider=payload.provider, model=payload.model)
+        out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"]}
+        if helped["accepted"]:
+            fixed = helped["graph"]
+            out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="Copilot 的修改")
+            out["ops"] += helped["ops"]
+            out["applied"].append("assist")
+            after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards)
+            out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
+        elif helped["reason"]:
+            out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
+    return out
 
 
 class ValidateIn(BaseModel):

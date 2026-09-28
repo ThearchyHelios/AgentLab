@@ -2,13 +2,13 @@ import {
   Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
 } from 'lucide-react'
-import { APPROVAL_POLICY_LABEL, NODE_TYPE_LABEL } from '../lib/terms'
+import { APPROVAL_POLICY_LABEL, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
 import type { NodeType } from '../types'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
-  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs'
+  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom'
 
 /**
  * 这个字段里写的是什么语法。
@@ -36,9 +36,28 @@ export interface FieldDef {
   step?: number
   /** 只在满足条件时显示，避免面板一次糊一屏用不上的选项 */
   when?: (config: Record<string, any>) => boolean
+  /**
+   * 看得见但暂时用不了：返回一句为什么（「先写 Schema 才能开」），返回 null 就能用。
+   * 和 when 的区别：藏起来的人不知道有这个选项，禁用的知道、也知道差什么
+   */
+  disabled?: (config: Record<string, any>) => string | null
   /** nodeRefs：只能选这一类的上游节点（报告的 metrics_from 只收口径卡） */
   refType?: NodeType
   advanced?: boolean
+}
+
+/**
+ * 写没写结构化输出 Schema：对象形状（type: object 或带 properties），画布里存成 JSON 文本的也认，
+ * 和后端 llm._output_schema 的认法一致
+ */
+export function hasOutputSchema(schema: unknown): boolean {
+  let value = schema
+  if (typeof value === 'string') {
+    if (!value.trim()) return false
+    try { value = JSON.parse(value) } catch { return false }
+  }
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && ((value as any).type === 'object' || 'properties' in (value as any))
 }
 
 /** 字段实际的语法：显式声明优先，否则按类型推 */
@@ -199,6 +218,18 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         help: '默认关闭：一轮只调一个工具，看到结果再想下一步。开启后一轮可发多个，更快，'
           + '但这一批中间没有新的思考',
       },
+      {
+        key: 'output_schema', label: '结构化输出 Schema', type: 'json', advanced: true,
+        help: '要把查到的数交给口径卡时写。写了还要开下面的「按出处核对字段」才生效；'
+          + '只写 Schema 不开，产出和以前一样只有文字',
+      },
+      {
+        key: 'cite_fields', label: '按出处核对字段', type: 'switch', advanced: true,
+        // 已经开着的不锁：开了之后又清掉 Schema，得还能把它关上
+        disabled: (c) => (c.cite_fields || hasOutputSchema(c.output_schema) ? null : '先在上面写「结构化输出 Schema」才能开'),
+        help: '结束后多一次抽取调用：模型为 Schema 里每个字段写出它来自哪次查询的哪一格，系统按查询快照取值、'
+          + '核对，对不上的以快照为准；查不到的记为空，不兜底成 0。下游口径卡用 vars.变量名.字段 读',
+      },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
     ],
@@ -294,6 +325,12 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         ],
       },
       { key: 'fail_fast', label: '执行失败即中断', type: 'switch', advanced: true },
+      {
+        key: 'evidence_role', label: '证据角色', type: 'select', advanced: true,
+        options: [{ value: '', label: '计算（默认）' }, { value: 'source', label: '取数' }],
+        help: '报告不能直接引用代码节点的产出，沙箱算出来的数要进口径卡。只是把外部数据原样取回来'
+          + '（调接口、读文件）的标「取数」；做了业务计算的留在「计算」，口径卡用它的数时会提醒',
+      },
       ...COMMON_TAIL,
     ],
     defaults: { language: 'python', code: 'print("hello")', timeout: 30, network: false, fail_fast: true },
@@ -532,9 +569,24 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     description: '受控指标集：所有算术在这里发生，叙述层只能引用',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
-      { key: 'caliber', label: '口径名称', type: 'text', syntax: 'template', placeholder: '周报口径' },
-      { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1' },
-      { key: 'metrics', label: '指标定义', type: 'metricsList' },
+      { key: 'caliber_from', label: '口径卡从哪来', type: 'caliberFrom' },
+      {
+        key: 'caliber', label: '口径名称', type: 'text', syntax: 'template', placeholder: '周报口径',
+        when: (c) => !c.caliber_from,
+      },
+      { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1', when: (c) => !c.caliber_from },
+      { key: 'metrics', label: '指标定义', type: 'metricsList', when: (c) => !c.caliber_from },
+      {
+        key: 'upgrade_policy', label: '上游发了新版本时', type: 'select', when: (c) => !!c.caliber_from,
+        options: [
+          { value: '', label: '没声明：上游有新版本时挡住正式运行' },
+          { value: 'recompute', label: `${UPGRADE_POLICY_LABEL.recompute}（recompute）` },
+          { value: 'dual', label: `${UPGRADE_POLICY_LABEL.dual}（dual）` },
+          { value: 'incomparable', label: `${UPGRADE_POLICY_LABEL.incomparable}（incomparable）` },
+        ],
+        help: '钉住的那一版之后上游又发了新版本，正式运行前必须声明怎么处置，和子工作流的升版处置是同一套规则；'
+          + '声明了就照它执行，并记进运行记录',
+      },
       {
         key: 'on_missing', label: '缺输入时', type: 'select', advanced: true,
         options: [{ value: '', label: '整个节点失败' }, { value: 'null', label: '记为空值，交给出具契约判档' }],

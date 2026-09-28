@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import operator
 import re
 from typing import Any
@@ -107,6 +108,10 @@ def render_deep(value: Any, ctx: dict[str, Any]) -> Any:
 # 安全表达式求值（分支条件用）
 # --------------------------------------------------------------------------
 
+class ExpressionError(ValueError):
+    pass
+
+
 # 幂运算的上界。`9**9**9**9` 只有 11 个 AST 节点，轻松过掉节点数护栏，
 # 却会让 CPython 无限期地算一个天文数字的大整数 —— 而求值是在事件循环里
 # 同步执行的（分支条件、transform、口径卡、每个节点的 skip_if 都走这里），
@@ -151,6 +156,135 @@ _CMP_OPS = {
 }
 _UNARY_OPS = {ast.Not: operator.not_, ast.USub: operator.neg, ast.UAdd: operator.pos}
 
+
+# --------------------------------------------------------------------------
+# 查询结果里的一格：cell(x, row, column)
+#
+# 口径卡直接从 tool 节点的查询结果取数时，以前只能写 vars.q.rows[0][2]：列的顺序一改，
+# 取到的就是另一列，而且报告点开只追得到这条路径。cell() 按列名取，来历能精确到
+# 那次查询的那一格。报告里的 [[v:Q1.r0.amount]] 用的也是这里的规则，两边取到的永远是同一个值。
+# --------------------------------------------------------------------------
+
+#: 数据源把 DECIMAL 一律落成 str(Decimal)（data/engine.py 的 _jsonable）："45678.50"；小数位为 0 的
+#: ——MySQL 对整数列 SUM()（包括 SUM(CASE WHEN … THEN 1 ELSE 0 END) 这种计数）、Postgres 的
+#: SUM(bigint)、NUMERIC(10,0)——是没有小数点的 "45678"；很小的写成 "1E-7"。这些都按数算。
+#: 带前导零的 "00123" 是编号，照文本。快照里没有列类型：文本列里的值恰好全是不带前导零的数字时，
+#: 同样会被当成数，要文本就写 str(cell(...))
+_NUMERIC_TEXT = re.compile(r"^\s*-?(?:0|[1-9]\d*)(?:\.\d+)?(?:E[+-]?\d+)?\s*$")
+#: 字段声明成数时，前导零、正号、小写 e 也按数读：写 schema 的人说了它是数
+_LOOSE_NUMERIC_TEXT = re.compile(r"^\s*[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*$")
+_INTEGER_TEXT = re.compile(r"^\s*[+-]?\d+\s*$")
+
+
+class CellError(ExpressionError):
+    """取不到那一格。消息是人话：第几行、有几行、有哪些列。口径卡、分支条件照接住
+    表达式错误的路子接住它。"""
+
+
+def numeric_text(raw: Any, *, loose: bool = False) -> int | float | None:
+    """数字文本 → 数；不是数字文本（或者根本不是文本）返回 None。
+
+    没有小数点、没有指数的给整数：不经 float，大整数不丢位，45678 也不会变成 45678.0。
+    loose=True 连前导零、正号也认，只在字段声明成数时用。
+    """
+    if not isinstance(raw, str) or not (_LOOSE_NUMERIC_TEXT if loose else _NUMERIC_TEXT).match(raw):
+        return None
+    try:
+        return int(raw) if _INTEGER_TEXT.match(raw) else float(raw)
+    except ValueError:      # 超过 Python 整数位数上限（4300 位）的：照文本，不让它在渲染、核对里炸开
+        return None
+
+
+def cell_value(raw: Any, kind: str | None = None) -> Any:
+    """快照里的一格 → 参与运算、比对的值：DECIMAL 落成的数字文本换成数，其余原样。
+
+    kind 是查询时从驱动的原始值记下的列类型（query_snapshot 的 column_types）：text 列原样是文本，
+    VARCHAR 的 "2026" 不会变成 2026。不给（老快照没记、口径卡表达式里的 cell()）就按值猜。
+    """
+    if kind == "text":
+        return raw
+    number = numeric_text(raw)
+    return raw if number is None else number
+
+
+def column_kind(table: Any, column: Any) -> str | None:
+    """查询时记下的这一列的类型：number / text / date / datetime / time / boolean。老快照没记，返回 None。"""
+    types = table.get("column_types") if isinstance(table, dict) else None
+    kind = types.get(column) if isinstance(types, dict) and isinstance(column, str) else None
+    return kind if isinstance(kind, str) else None
+
+
+def same_value(model: Any, truth: Any) -> bool:
+    """模型报的值和快照里的一格是不是一回事：数按数比（数字文本也算数，45678.0 和 "45678" 一致），
+    文本压成一行比。cite_fields 的核对和口径卡的来历用同一把尺子。"""
+    if model is None or truth is None:
+        return model is None and truth is None
+    m, t = cell_value(model), cell_value(truth)
+    if isinstance(m, bool) or isinstance(t, bool):
+        return m == t
+    if isinstance(m, (int, float)) and isinstance(t, (int, float)):
+        return math.isclose(float(m), float(t), rel_tol=1e-9, abs_tol=1e-9)
+    return re.sub(r"\s+", " ", str(m)).strip() == re.sub(r"\s+", " ", str(t)).strip()
+
+
+def _table_of(table: Any) -> dict[str, Any]:
+    data = table
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            # 查库失败时工具交回的是一句话（「查询失败：…」）：原话照搬，比「不是 JSON」有用
+            raise CellError(f"要的是查询结果，拿到的是「{data.strip()[:80]}」") from None
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        raise CellError("第一个参数要是查询结果：查询工具交回的 JSON 文本，或者 {columns, rows}")
+    return data
+
+
+def locate_cell(table: Any, row: Any, column: Any) -> tuple[Any, str]:
+    """(那一格的原值, 列名)。列号换成列名：按列名和按列号引用同一格，得到同一个 eid。"""
+    data = _table_of(table)
+    rows = data["rows"]
+    if isinstance(row, bool) or not isinstance(row, int):
+        raise CellError(f"行号要是从 0 数的整数，写的是 {row!r}")
+    if not rows:
+        raise CellError("这份查询结果是空的（0 行）")
+    if not 0 <= row < len(rows):
+        raise CellError(f"要第 {row} 行，但这份查询结果只有 {len(rows)} 行（从 0 数）")
+    record = rows[row]
+    columns = [str(c) for c in data.get("columns") or []]
+    if isinstance(record, dict):
+        columns = columns or [str(k) for k in record]
+    if isinstance(column, int) and not isinstance(column, bool):
+        if not 0 <= column < len(columns):
+            raise CellError(f"要第 {column} 列，但只有 {len(columns)} 列（从 0 数）")
+        column = columns[column]
+    elif not isinstance(column, str):
+        raise CellError(f"列要写列名，或者从 0 数的列号，写的是 {column!r}")
+    if isinstance(record, dict):
+        if column not in record:
+            raise CellError(f"没有列「{column}」，有：{'、'.join(columns[:12])}")
+        return record[column], column
+    if column not in columns:
+        raise CellError(f"没有列「{column}」，有：{'、'.join(columns[:12])}")
+    index = columns.index(column)
+    if not isinstance(record, (list, tuple)) or index >= len(record):
+        raise CellError(f"第 {row} 行没有「{column}」这一格")
+    return record[index], column
+
+
+def table_cell(table: Any, row: Any, column: Any) -> Any:
+    """表达式里的 cell(x, row, column)：x 是查询工具交回的 JSON 文本或 {columns, rows}。
+
+    不看列类型、照旧按值猜：口径卡是在算数，数字写成文本的列（CAST 成文本、VARCHAR 存的金额）多半
+    就是要拿来算的。要文本写 str(cell(...))。
+    """
+    try:
+        raw, _ = locate_cell(table, row, column)
+    except CellError as e:
+        raise CellError(f"cell() {e}") from None
+    return cell_value(raw)
+
+
 _SAFE_FUNCS: dict[str, Any] = {
     "len": len,
     "str": str,
@@ -172,6 +306,7 @@ _SAFE_FUNCS: dict[str, Any] = {
     "endswith": lambda s, p: str(s).endswith(p),
     "matches": lambda s, p: bool(re.search(p, str(s))),
     "get": lambda obj, key, default=None: (obj or {}).get(key, default),
+    "cell": table_cell,
 }
 
 _MAX_NODES = 200
@@ -197,8 +332,6 @@ _NODE_NAMES = {
 }
 
 
-class ExpressionError(ValueError):
-    pass
 
 
 class _Unbrace(ast.NodeTransformer):
@@ -292,7 +425,30 @@ def _chain_root(node: ast.AST) -> str | None:
     return None
 
 
+def _cell_call(node: ast.AST) -> bool:
+    """cell(<取值链>, row, column)：第一个参数是从根名字出发的取值链，整个调用算一个输入。"""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "cell"
+            and len(node.args) == 3 and not node.keywords and _chain_root(node.args[0]) is not None)
+
+
+def cell_parts(path: str) -> tuple[str, str, str] | None:
+    """leaf_refs 给出的 cell(...) 路径拆回三段源码：(取值链, 行, 列)。不是 cell 调用返回 None。"""
+    try:
+        body = ast.parse(path, mode="eval").body
+    except SyntaxError:
+        return None
+    if not _cell_call(body):
+        return None
+    return tuple(ast.unparse(a) for a in body.args)  # type: ignore[return-value]
+
+
 def _walk_refs(node: ast.AST, found: list[ast.AST]) -> None:
+    if _cell_call(node):
+        # 取哪一格由行、列决定，它们里面的引用是独立的输入；取值链本身只是这一格的来处
+        found.append(node)
+        for arg in node.args[1:]:
+            _walk_refs(arg, found)
+        return
     if isinstance(node, (ast.Attribute, ast.Subscript, ast.Name)) and _chain_root(node):
         found.append(node)
         # 链本身不再往里拆（vars.kpi 是 vars.kpi.gmv 的一部分），但下标里的表达式是
@@ -313,6 +469,7 @@ def leaf_refs(tree: ast.AST) -> list[str]:
     parse_expression 只告诉你「有没有不认识的名字」；口径卡要记来源，得知道
     round((vars.kpi.gmv - vars.kpi.gmv_prev) / …) 里用到的是 vars.kpi.gmv 和
     vars.kpi.gmv_prev 这两个值，而不是 vars、kpi 这些零件。
+    cell(nodes.fetch, 0, 'gmv') 整个调用算一个值：它的来历是那次查询的那一格。
     路径用 ast.unparse 的写法，substitute 按同样的写法认。
     """
     found: list[ast.AST] = []
@@ -361,6 +518,13 @@ class _Substitute(ast.NodeTransformer):
         return self.generic_visit(node)
 
     visit_Attribute = visit_Subscript = visit_Name = _replace
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if _cell_call(node):
+            path = ast.unparse(node)
+            if path in self.values and _inlinable(self.values[path]):
+                return ast.copy_location(_literal(self.values[path]), node)
+        return self.generic_visit(node)
 
 
 def substitute(tree: ast.AST, values: dict[str, Any]) -> str:

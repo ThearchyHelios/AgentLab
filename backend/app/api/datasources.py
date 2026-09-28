@@ -19,8 +19,8 @@ from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import introspect as introspect_mod
 from app.data.engine import (
-    MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, build_url, engine_args, engines,
-    query_timeout_problem,
+    MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, build_url, engine_args,
+    engines, mask_columns_problem, query_timeout_problem,
 )
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -155,8 +155,16 @@ _TIMEOUT_FIELD = {
 }
 
 
+#: 证据面板展示原始行时遮掉的列。每种库都有：遮罩只看查询结果的列名，和方言无关
+_MASK_FIELD = {
+    "key": MASK_COLUMNS_OPTION, "label": "遮罩的列", "placeholder": "phone, email",
+    "help": "证据面板展示查询结果的原始行时，这些列的值一律显示成「已遮罩」。在有身份体系之前，"
+            "遮罩只减少暴露，不是安全边界：完整快照仍能按工件取到，SQL 里给列起别名也能绕开",
+}
+
+
 def _refuse_bad_options(options: dict[str, Any] | None) -> None:
-    problem = query_timeout_problem(options)
+    problem = query_timeout_problem(options) or mask_columns_problem(options)
     if problem:
         raise HTTPException(422, problem)
 
@@ -175,11 +183,11 @@ async def list_kinds() -> dict[str, Any]:
              "needs": ["host", "database", "username", "password"],
              "hint": "字符集默认 utf8mb4，要换就在「高级连接参数」里加 charset",
              "advanced": [{"key": "charset", "label": "字符集", "placeholder": "utf8mb4"},
-                          _TIMEOUT_FIELD]},
+                          _TIMEOUT_FIELD, _MASK_FIELD]},
             {"value": "postgres", "label": "PostgreSQL", "default_port": 5432,
              "needs": ["host", "database", "username", "password"],
              "hint": "「schema」留空就用 public",
-             "advanced": [_TIMEOUT_FIELD]},
+             "advanced": [_TIMEOUT_FIELD, _MASK_FIELD]},
             {"value": "oracle", "label": "Oracle", "default_port": 1521,
              "needs": ["host", "username", "password"],
              "hint": "service_name 和 SID 二选一：一般填 service_name，老库只给了 SID 就切到 SID。"
@@ -191,10 +199,11 @@ async def list_kinds() -> dict[str, Any]:
                   "help": "和 SID 二选一"},
                  {"key": "sid", "label": "SID", "placeholder": "ORCL", "help": "和 service_name 二选一"},
                  _TIMEOUT_FIELD,
+                 _MASK_FIELD,
              ]},
             {"value": "sqlite", "label": "SQLite（文件）", "default_port": None,
              "needs": ["database"], "hint": "「数据库文件路径」填 .db 文件的绝对路径",
-             "advanced": [_TIMEOUT_FIELD]},
+             "advanced": [_TIMEOUT_FIELD, _MASK_FIELD]},
         ],
         "supported": list(SUPPORTED_KINDS),
     }

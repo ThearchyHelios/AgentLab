@@ -107,6 +107,20 @@ const GRAPH = {
   edges: [{ source: 'in', target: 'ag' }, { source: 'ag', target: 'out' }],
 }
 
+/**
+ * 问数据的答案（可点击证据第二期）：input → agent → report → output，报告直接引用 agent 查过的
+ * 单元格、整表。文档是 compose_doc 真跑出来的，片段接口的答复带查询步骤（窗口、高亮、遮罩）
+ */
+const EVQ = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-query.json', import.meta.url), 'utf8'))
+const EVQ_DOC = { ...EVQ.doc, run_id: 'run-evq' }
+/** 整形节点按 JSON 解析失败的两种原话（backend/app/engine/nodes/io.py 的 _json_error） */
+const JSON_TEMPLATE_ERROR = '模板渲染出来的不是合法 JSON（第 1 行第 934 列附近）。检查模板里的引号、逗号，字符串值要用 | json 过滤器输出'
+const JSON_UPSTREAM_ERROR = '上游「查数」输出的不是合法 JSON（第 934 列附近），常见原因是字符串里有没转义的英文引号；'
+  + '让模型交结构化数据请用 output_schema + cite_fields，别用整形节点解析它写的文字'
+/** 同一句上游说法，节点名里带着别的规则的关键词（超时）：不能被当成超时、又把「接着跑」给回来 */
+const JSON_SLOW_ERROR = JSON_UPSTREAM_ERROR.replace('上游「查数」', '上游「查询超时订单」')
+const EVQ_SEG = (text, nth = 0) => Object.values(EVQ.segments).filter((d) => d.segment.text === text)[nth]?.segment.id
+
 const CONVS = {
   busyA: conv('c0busya', '会话 A：跑得很久的那个', 0, TODAY_RECENT),
   idleB: conv('c0idleb', '会话 B：已经答完的那个', 1, 3),
@@ -165,7 +179,15 @@ const GUARD_CONVS = {
   steps: conv('c0gsteps', '护栏：写死 8 步、用满了', 1, 60 * 24 * 31),
   dflt: conv('c0gdflt', '护栏：跟随默认步数', 1, 60 * 24 * 32),
 }
+/** 只在「问数据的证据」那段出现：库里存着一轮带证据的答案，刷新后回运行取 _evidence */
+const ASK_CONVS = {
+  askZ: conv('c0askz', '问数据：各区域销售额和最大的一单', 1, 60 * 24 * 33),
+}
 const DETAIL = {
+  c0askz: [turn('tz9', '上周各区域的销售额，最大的一单是多少', {
+    answer: EVQ.output.answer, graph: GRAPH, run_id: 'run-evq',
+    meta: { v: 1, runId: 'run-evq', runClass: 'exploratory', runStatus: 'succeeded', evidence: true },
+  })],
   c0gstall: [guardTurn('tg1', GRAPH8, 'stall', 'agent 连续 3 步没有拿到新信息，收尾轮也没有给出结论。')],
   c0gsteps: [guardTurn('tg2', GRAPH8, 'steps', 'agent 用满了 8 步。收尾轮也没有给出结论。')],
   c0gdflt: [guardTurn('tg3', GRAPH, null, 'agent 用满了 12 步还没给出结论。')],
@@ -299,6 +321,7 @@ const DETAIL = {
 const EVIDENCE = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
 const RUNS = {
   'run-evid': { status: 'succeeded', output: EVIDENCE.output, error: null },
+  'run-evq': { status: 'succeeded', output: EVQ.output, error: null },
   'run-cancelled': { status: 'cancelled', output: {}, error: null },
   'run-failed': { status: 'failed', output: {}, error: '查询超时' },
   'run-rejected': { status: 'failed', output: {}, error: '人工驳回：数字对不上' },
@@ -337,6 +360,8 @@ const ctl = {
   trashMore: false,
   /** 列表里多摆「护栏」那段的三个会话（GUARD_CONVS） */
   guardConvs: false,
+  /** 列表里多摆「问数据的证据」那段的会话（ASK_CONVS） */
+  askConvs: false,
   /** 数据源列表取不回来 */
   sourcesFail: false,
   /** 数据源列表里多一个别处刚加的库 */
@@ -350,7 +375,7 @@ const resetDb = () => {
 }
 resetDb()
 const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
-  ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : [])]
+  ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : []), ...(ctl.askConvs ? Object.values(ASK_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
 let runSeq = 0
@@ -435,9 +460,9 @@ async function fakeApi(route) {
     const wait = ctl.reviewDelay[body().run_id]
     if (wait) await new Promise((r) => setTimeout(r, wait))
     // 老后端的复核不认 _evidence，照样回一次改写
-    if (body().run_id === 'run-evid') {
+    if (body().run_id === 'run-evid' || body().run_id === 'run-evq') {
       return json({ verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
-                    original: EVIDENCE.output['周报'], retry: false, severity: 'degraded',
+                    original: body().run_id === 'run-evq' ? EVQ.output.answer : EVIDENCE.output['周报'], retry: false, severity: 'degraded',
                     signals: [{ kind: 'retrieval_degraded', detail: '检索退回关键词', severity: 'degraded' }] })
     }
     return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [] })
@@ -447,7 +472,16 @@ async function fakeApi(route) {
     const conversation = String(b.input?.question ?? '')
     // 发起请求根本没到后端（网断了、后端正在重启）
     if (conversation.includes('启动失败') && ctl.launchFail) return route.abort('connectionrefused')
-    const id = conversation.includes('带证据') ? 'run-evid'
+    // 发起就被拒：绑定的工具在本机不存在（后端 runs.TOOL_MISSING，{detail, code} 的形状）
+    if (conversation.includes('工具不在')) {
+      return json({ detail: '绑定的工具在本机不存在：「查数」（调用工具）绑的 db_query__nope。去数据页接入，或在节点里重新选',
+        code: 'run_tool_missing' }, 422)
+    }
+    const id = conversation.includes('整形解析失败') ? (conversation.includes('节点名带超时') ? 'run-jsonslow'
+      : conversation.includes('上游') ? 'run-jsonup'
+      : conversation.includes('改写') ? 'run-jsonauth' : 'run-jsonerr')
+      : conversation.includes('问数据带证据') ? 'run-evq'
+      : conversation.includes('带证据') ? 'run-evid'
       : conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
       : conversation.includes('审批') ? 'run-wait'
       : conversation.includes('重启') ? 'run-restart'
@@ -509,6 +543,48 @@ function script(runId, after = 0) {
         ev(1, 'run.started', null, { nodes: 3 }),
         ev(2, 'node.finished', 'ag', { duration_ms: 900 }),
         ev(3, 'run.finished', null, { output: { answer: FULL.slice(0, 2000), note: '附注' }, output_truncated: true }),
+      ],
+      end: 'succeeded',
+    }
+  }
+  if (runId === 'run-jsonerr' || runId === 'run-jsonup' || runId === 'run-jsonauth' || runId === 'run-jsonslow') {
+    // 用户真实踩到的：整形节点按 JSON 解析上游的文字失败。旧说法（让人查模板）和新说法（点名上游）各一种；
+    // 对照：说法被改写过的（鉴权失败）原话还得留着
+    const error = runId === 'run-jsonerr' ? JSON_TEMPLATE_ERROR : runId === 'run-jsonup' ? JSON_UPSTREAM_ERROR
+      : runId === 'run-jsonslow' ? JSON_SLOW_ERROR
+      : 'AuthenticationError: Error code: 401 - invalid x-api-key'
+    const detail = "JSONDecodeError: Expecting ',' delimiter: line 1 column 934 (char 933)\n出错位置前后的原文：…\"gmv\": 45678.5, \"note\": \"含\"⟨此处⟩促销\"…"
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 3 }),
+        ev(2, 'node.started', 'ag', { node_type: 'agent', label: runId === 'run-jsonslow' ? '查询超时订单' : '查数' }),
+        ev(3, 'node.finished', 'ag', { duration_ms: 900 }),
+        ev(4, 'node.started', 'tf', { node_type: 'transform', label: '解析取数结果为变量' }),
+        ev(5, 'node.failed', 'tf', { error, detail, duration_ms: 3 }),
+        ev(6, 'run.failed', null, { error, detail }),
+      ],
+      end: 'failed',
+    }
+  }
+  if (runId === 'run-evq') {
+    // 问数据：agent 查库（新运行的 tool.end 多一个 query_artifact）→ 按出处抽取字段 → 报告核对 → 成果
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 4 }),
+        ev(2, 'node.started', 'ag', { node_type: 'agent', label: '查数' }),
+        ev(3, 'llm.start', 'ag', { model: 'm' }),
+        ev(4, 'tool.start', 'ag', { tool: 'db_query__shop', call_id: 'q1', args: { sql: 'SELECT region, SUM(amount) AS amount FROM orders GROUP BY region' } }),
+        ev(5, 'tool.end', 'ag', { tool: 'db_query__shop', call_id: 'q1', duration_ms: 30, artifact: 'tool-snap', query_artifact: 'query-snap', rows: 4 }),
+        ev(6, 'llm.end', 'ag', { model: 'm', duration_ms: 800 }),
+        ev(7, 'llm.start', 'ag', { model: 'm', structured: true, purpose: 'cite_fields', message_count: 6 }),
+        ev(8, 'llm.end', 'ag', { agent: '查数', model: 'm', purpose: 'cite_fields', duration_ms: 900 }),
+        ev(9, 'log', 'ag', { level: 'warn', code: 'agent_field_mismatch', fields: ['order_cnt'],
+          message: '有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234' }),
+        ev(10, 'node.finished', 'ag', { duration_ms: 2100 }),
+        ev(11, 'node.started', 'write', { node_type: 'report', label: '写答案' }),
+        ev(12, 'report.checked', 'write', EVQ.report_checked),
+        ev(13, 'node.finished', 'write', { duration_ms: 900 }),
+        ev(14, 'run.finished', null, { output: EVQ.output }),
       ],
       end: 'succeeded',
     }
@@ -952,6 +1028,149 @@ for (const theme of THEMES) {
     check('meta 记下这一轮有证据（刷新后回运行那里取标注）', saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
     check('落库的复核也不带改写', saved.filter((p) => p.body.review?.verdict).every((p) => !p.body.review.answer))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('askdata', '问数据的答案带逐段证据：实时、刷新后补回、复核守卫、窄屏抽屉（可点击证据第二期）', async () => {
+    const routeEvidence = async (page) => {
+      // 文档记着的运行要和成果的运行对得上（run-evq），片段按运行认
+      await page.route(/\/api\/artifacts\//, (route) => route.fulfill({ json: { id: EVQ.doc_artifact, content: EVQ_DOC } }))
+      await page.route(/\/api\/runs\/run-evq\/evidence(\/.*)?(\?.*)?$/, (route) => {
+        const m = new URL(route.request().url()).pathname.match(/\/segments\/([^/]+)$/)
+        if (!m) return route.fulfill({ json: EVQ.graph })
+        const body = EVQ.segments[decodeURIComponent(m[1])]
+        return body ? route.fulfill({ json: body }) : route.fulfill({ status: 404, json: { detail: '没有这个片段', code: 'evidence_segment_not_found' } })
+      })
+    }
+    {
+      const { page, ctx, errors } = await open(theme)
+      await routeEvidence(page)
+      const patchesBefore = log.patches.length
+      await goto(page, 'c0trunc')
+      await send(page, '问数据带证据：各区域销售额，最大的一单是多少')
+      check('答完了', await page.waitForFunction(
+        () => window.__chat.getState().byConversation.c0trunc?.at(-1)?.phase === 'done', null, { timeout: 10000 })
+        .then(() => true, () => false))
+      const t = (await chatState(page)).byConversation.c0trunc.at(-1)
+      check('复核的改写没落到答案上：成果还是报告原文和 _evidence', t.output?.answer === EVQ.output.answer && !!t.output?._evidence
+        && t.review?.answer === null, JSON.stringify({ keys: Object.keys(t.output ?? {}), review: t.review?.verdict }))
+      await page.waitForSelector('[data-evidence-doc] [data-seg]', { timeout: 6000 }).catch(() => {})
+      const turn = page.locator('[data-turn]').last()
+      check('答案是逐段可点的报告', await turn.locator('[data-evidence-doc] [data-seg]').count() > 10)
+      check('没有出具契约：文档自己给计数条', (await turn.locator('[data-evidence-tally]').innerText().catch(() => '')).includes('数字有出处'))
+      const text = await turn.innerText()
+      check('执行过程里有「按出处抽取字段」和字段对不上的提醒', text.includes('按出处抽取字段') && text.includes('有 1 个字段和查询快照对不上'),
+        text.replace(/\s+/g, ' ').slice(0, 200))
+      check('整表的每格都是可点的片段', await turn.locator('[data-evidence-doc] table td [data-seg]').count() === 9)
+      await turn.locator(`[data-seg="${EVQ_SEG('1,288')}"]`).click()
+      await page.waitForSelector('[data-evidence-panel] [data-ev-query]', { timeout: 5000 }).catch(() => {})
+      const panel = page.locator('[data-evidence-panel]')
+      check('宽屏：点开数字从侧边弹出，看得到查询步骤', await panel.getAttribute('data-evidence-panel') === 'side'
+        && await panel.locator('[data-ev-query]').count() === 1)
+      check('……被引用的格高亮，SQL 在，遮罩说明在', (await panel.locator('td[data-highlight="cell"]').innerText().catch(() => '')) === '1288'
+        && (await panel.locator('[data-ev-sql]').innerText().catch(() => '')).includes('FROM orders')
+        && (await panel.locator('[data-ev-mask-note]').innerText().catch(() => '')).includes('不是安全边界'))
+      await page.waitForTimeout(300)
+      await page.screenshot({ path: `${SHOTS}/askdata-evidence-${theme}.png` })
+      await page.keyboard.press('Escape')
+      await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
+      const saved = log.patches.slice(patchesBefore)
+      check('落库的是报告原文，meta 记下这一轮有证据', saved.filter((p) => typeof p.body.answer === 'string' && p.body.answer)
+        .every((p) => p.body.answer === EVQ.output.answer) && saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
+      check('没有运行时报错（实时）', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    }
+    resetDb()
+    ctl.askConvs = true
+    try {
+      const { page, ctx, errors } = await open(theme)
+      await routeEvidence(page)
+      const gets = log.runGets.length
+      await goto(page, 'c0askz')
+      await page.waitForSelector('[data-evidence-doc] [data-seg]', { timeout: 8000 }).catch(() => {})
+      check('刷新后补回：库里只有文字，回运行取回 _evidence，答案照样逐段可点',
+        log.runGets.slice(gets).includes('run-evq') && await page.locator('[data-evidence-doc] [data-seg]').count() > 10)
+      await page.locator(`[data-evidence-doc] [data-seg="${EVQ_SEG('8.7%')}"]`).click()
+      await page.waitForSelector('[data-evidence-panel] [data-ev-sources]', { timeout: 5000 }).catch(() => {})
+      const panel = page.locator('[data-evidence-panel]')
+      check('……点开指标：口径卡来源、输入来源、两次查询都在', (await panel.locator('[data-ev-caliber-from]').innerText().catch(() => '')).includes('销售周报')
+        && await panel.locator('[data-ev-source]').count() === 2 && await panel.locator('[data-ev-query]').count() === 2)
+      check('没有运行时报错（刷新后）', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+
+      const narrow = await open(theme, { width: 800, height: 900 })
+      await routeEvidence(narrow.page)
+      await goto(narrow.page, 'c0askz')
+      await narrow.page.waitForSelector('[data-evidence-doc] [data-seg]', { timeout: 8000 }).catch(() => {})
+      await narrow.page.locator(`[data-evidence-doc] [data-seg="${EVQ_SEG('1,288')}"]`).click()
+      await narrow.page.waitForSelector('[data-evidence-panel] [data-ev-query]', { timeout: 5000 }).catch(() => {})
+      const drawer = narrow.page.locator('[data-evidence-panel]')
+      const sc = await narrow.page.evaluate(() => ({ sw: document.documentElement.scrollWidth, vw: innerWidth }))
+      check('窄屏：面板从底部抽出，里面是查询步骤', await drawer.getAttribute('data-evidence-panel') === 'drawer'
+        && await drawer.locator('[data-ev-query]').count() === 1)
+      check('……整页没有横向滚动', sc.sw <= sc.vw, JSON.stringify(sc))
+      await narrow.page.waitForTimeout(300)
+      await narrow.page.screenshot({ path: `${SHOTS}/askdata-drawer-${theme}.png` })
+      await narrow.page.keyboard.press('Escape')
+      await narrow.page.waitForTimeout(200)
+      check('……Esc 收起抽屉', await narrow.page.locator('[data-evidence-panel]').count() === 0)
+      check('没有运行时报错（窄屏）', narrow.errors.length === 0, narrow.errors[0] ?? '')
+      await narrow.ctx.close()
+    } finally {
+      ctl.askConvs = false
+    }
+  })
+
+  await section('nodeerror', '节点报错说一遍：原因、怎么办不在展开区里再贴一遍原话（整形节点解析 JSON 失败）', async () => {
+    for (const [ask, said] of [['整形解析失败：旧说法', JSON_TEMPLATE_ERROR], ['整形解析失败：上游说法', JSON_UPSTREAM_ERROR],
+      ['整形解析失败：节点名带超时', JSON_SLOW_ERROR]]) {
+      const { page, ctx, errors } = await open(theme)
+      await goto(page, 'c0trunc')
+      await send(page, ask)
+      await page.waitForFunction(() => window.__chat.getState().byConversation.c0trunc?.at(-1)?.phase === 'error', null, { timeout: 10000 })
+        .catch(() => {})
+      const row = page.locator('[data-turn]').last().locator('[data-node-id="tf"][data-step-status="failed"]').first()
+      await row.locator('button[aria-expanded]').first().click()
+      await page.waitForTimeout(250)
+      const shown = await row.innerText()
+      const head = said.split(/[。；，]/)[0]
+      const times = shown.split(head).length - 1
+      check(`「${ask}」：节点那一行把报错说一遍，展开后不再整段贴一遍原话`, times === 1, `出现 ${times} 次：${shown.replace(/\s+/g, ' ').slice(0, 240)}`)
+      const tail = said.split(/[；]|。/).at(-1).slice(0, 12)
+      check(`「${ask}」：怎么办那半句照样在`, shown.includes(tail), tail)
+      const resume = await page.getByRole('button', { name: /^接着跑/ }).count()
+      const canvas = await page.getByRole('button', { name: '在画布里打开' }).count() + await page.locator('[data-fix="canvas"]').count()
+      check(`「${ask}」：原样接着跑只会再失败一次，不给「接着跑」，给去画布改的入口`, resume === 0 && canvas > 0,
+        `接着跑 ${resume} 个 · 画布入口 ${canvas} 个`)
+      await row.locator('summary', { hasText: '技术细节' }).click().catch(() => {})
+      check(`「${ask}」：原始异常和出错位置前后的原文收在技术细节里`, (await row.innerText()).includes('JSONDecodeError')
+        && (await row.innerText()).includes('出错位置前后的原文'))
+      if (said === JSON_UPSTREAM_ERROR) await page.screenshot({ path: `${SHOTS}/nodeerror-json-${theme}.png` })
+      check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    }
+    const { page, ctx } = await open(theme)
+    await goto(page, 'c0trunc')
+    // 节点名是用户起的，里面带着超时、额度、连不上这些别的规则的关键词：照样认作 JSON 解析失败
+    const named = await page.evaluate(async (said) => {
+      const { explainRunError } = await import('/src/lib/explain.ts')
+      return ['查询超时订单', '额度查询', '连不上的库', '服务器 500 统计'].map((t) => {
+        const x = explainRunError(said.replace('上游「查数」', `上游「${t}」`))
+        return { t, title: x.title, continuable: x.continuable, fix: x.fix }
+      })
+    }, JSON_UPSTREAM_ERROR)
+    check('节点名里带超时 / 额度 / 连不上 / 500：照样认作「上游输出的不是合法 JSON」，不给接着跑',
+      named.every((x) => x.title.startsWith(`上游「${x.t}」输出的不是合法 JSON`) && x.continuable === false && x.fix === 'canvas'),
+      JSON.stringify(named.filter((x) => x.continuable !== false)))
+    await send(page, '整形解析失败：改写过的说法')
+    await page.waitForFunction(() => window.__chat.getState().byConversation.c0trunc?.at(-1)?.phase === 'error', null, { timeout: 10000 })
+      .catch(() => {})
+    const row = page.locator('[data-turn]').last().locator('[data-node-id="tf"][data-step-status="failed"]').first()
+    await row.locator('button[aria-expanded]').first().click()
+    await page.waitForTimeout(250)
+    const t = await row.innerText()
+    check('对照：说法改写过（鉴权没通过）时，原话还在展开区里', t.includes('模型鉴权没通过') && t.includes('invalid x-api-key'),
+      t.replace(/\s+/g, ' ').slice(0, 200))
     await ctx.close()
   })
 
@@ -1592,6 +1811,31 @@ for (const theme of THEMES) {
       `${log.runStarts.length - startsBefore} 次发起 · ${log.gens.length - gensBefore} 次建图`)
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     ctl.launchFail = true
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('toolmissing', '发起就被拒（绑定的工具在本机不存在）：报错里给直达入口，不给接着跑', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0launu')
+    await send(page, '一个工具不在的问题')
+    const alert = page.locator('[data-turn] [data-turn-error]').first()
+    await alert.waitFor({ timeout: 8000 }).catch(() => {})
+    const text = await alert.innerText().catch(() => '')
+    check('标题点名那个工具', text.includes('绑定的工具「db_query__nope」在本机不存在'), text.replace(/\n/g, ' / '))
+    check('说清这次运行没有发起、怎么办', text.includes('没有发起') && text.includes('去数据页接入'), text.replace(/\n/g, ' / '))
+    const fix = alert.locator('a[data-fix="data"]')
+    check('报错里有直达入口「去数据页接入」（和画布上发起被拒同一套）', await fix.count() === 1
+      && (await fix.innerText().catch(() => '')).includes('去数据页接入'))
+    check('不给「接着跑」（原样接着跑还是缺这个工具）', await page.getByRole('button', { name: '接着跑' }).count() === 0)
+    // 这时还没有运行 id，流里的报错块不会再拿原话认一遍：入口得在 store 里就记进这一轮的 failure，
+    // 刷新之后（meta 里的 failure）照样有
+    const stored = await page.evaluate(() => (window.__chat.getState().byConversation.c0launu ?? []).at(-1)?.failure ?? null)
+    check('入口记进这一轮的 failure（fix / fixTo，不可接着跑）', stored?.fix === 'tools' && stored?.fixTo === '/data'
+      && stored?.continuable === false, JSON.stringify(stored))
+    await fix.click().catch(() => {})
+    await page.waitForURL((u) => u.pathname.startsWith('/data'), { timeout: 5000 }).catch(() => {})
+    check('点了去数据页', new URL(page.url()).pathname.startsWith('/data'), page.url())
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

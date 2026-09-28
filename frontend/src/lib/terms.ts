@@ -230,7 +230,135 @@ export const EVIDENCE_TEXT = {
   docMismatch: '成果字段和报告文档对不上，按普通文本显示',
   docOtherRun: '证据文档不是这次运行写的，按普通文本显示',
   ambiguous: (candidates: string[]) => `出处不唯一：候选 ${candidates.join('、')}`,
+
+  // ---- 第二期：查询步骤、输入来源、口径卡来源 ----
+  query: (alias: string) => `查询 ${alias}`.trim(),
+  copySql: '复制 SQL',
+  /** 窗口外的行：面板只拿到被引用的行加前后各 2 行 */
+  windowed: '仅显示被引用的行及前后各 2 行',
+  openSnapshot: '打开完整快照',
+  snapshotTitle: (alias: string) => `查询 ${alias} · 完整快照`,
+  masked: '已遮罩',
+  /** 面板底部：被遮罩的列 + 遮罩不是安全边界（用户拍板写明） */
+  maskNote: (cols: string[]) =>
+    `已遮罩的列：${cols.join('、')}。在有身份体系之前，遮罩只减少暴露，不是安全边界：完整快照、工件接口里仍是原值`,
+  queryMissing: '查询的行要从证据接口取，这一次没取到',
+  queryPending: '正在取查询的行…',
+  queryHash: '查询快照取回时哈希对不上，疑似被改过：这些行不能当证据',
+  truncatedSnapshot: '查询撞了行数上限，库里还有更多',
+  windowCut: (n: number) => `被引用的行太多，这里只列了前 ${formatNumber(n)} 行，其余看完整快照`,
+  sources: '输入来源',
+  gotoQuery: (alias: string) => `看查询 ${alias}`.trim(),
+  sourceVerified: '与快照一致',
+  sourceMismatch: (told: string, truth: string) => `模型报 ${told}，快照是 ${truth}，已按快照取值`,
+  /** cell() 取数：算的时候用的值和快照不一样，值没有被换掉，照实说上游改写过 */
+  cellMismatch: (used: string, truth: string) => `算的时候用的是 ${used}，快照里是 ${truth}：上游改写过这份结果`,
+  sourceEmpty: '没查到，记为空，没有兜底成 0',
+  cellUnresolved: '核对不到查询快照',
+  codeCompute: (node: string) =>
+    `代码节点${node ? `「${node}」` : ''}算出来的数（计算）：沙箱里的算术系统核对不了，业务计算要写进口径卡`,
+  codeSource: (node: string) =>
+    `来自代码节点${node ? `「${node}」` : ''}（标为取数）：沙箱跑出来的结果，系统核对不到查询快照`,
+  inputMissing: '缺：上游没给出这个值',
+  caliberFrom: (caliber: string, version: string, workflow: string, wfVersion: string) =>
+    `口径卡「${caliber || '—'}」${version}，来自「${workflow}」${wfVersion}`,
+  caliberUpgrade: (latest: string | null, policy: string) =>
+    `${latest ? `上游已有 ${latest}` : '上游有新版本'}，按「${policy}」处置`,
 } as const
+
+/**
+ * 口径升版的三种处置，和后端 governance.UPGRADE_POLICY_LABELS 同一套说法。子工作流和
+ * 钉版本的口径卡（caliber_from）共用
+ */
+export const UPGRADE_POLICY_LABEL: Record<string, string> = {
+  recompute: '用新口径回算历史',
+  dual: '并排双印新旧口径',
+  incomparable: '标注与历史不可比',
+}
+
+/**
+ * 子工作流钉住版本后的升版处置说明。选项和口径卡的那个下拉是同一份（检查器直接借用口径卡
+ * 的字段定义），这里只换掉说明里「和谁同一套」那半句
+ */
+export const SUBGRAPH_UPGRADE_HELP = '钉住的那一版之后，被嵌的工作流又发了新版本：正式运行前必须声明怎么处置，'
+  + '和钉住别处的口径卡是同一套规则；声明了就照它执行，并记进运行记录'
+
+/** 上游在钉住的那一版之后又发了版：子工作流和口径卡的提醒同一句 */
+export const upgradeNewerText = (latest: number, pinned: number) =>
+  `上游已有 v${latest}（钉的是 v${pinned}）：正式运行前要在下面声明升版处置，否则会被挡住`
+
+/**
+ * 发布前检查与自动修复：发布弹窗和问题面板的「发布前检查」共用一套说法。
+ * 原则写在话里：修复只出预览、人确认了才存草稿，永远不替人发布
+ */
+export const PUBLISH_FIX_TEXT = {
+  section: '发布前检查',
+  lint: '校验',
+  checking: '正在做发布前检查…',
+  unsupported: '这个后端还没有发布前检查：点「发布」时门禁照旧检查，拦下的问题会列在这里',
+  failed: '发布前检查没做成',
+  retry: '重试',
+  recheck: '重新检查',
+  run: '检查',
+  stale: '画布改过了，结果可能已经过时',
+  blocked: (n: number) => `发布前检查：会被门禁拦下 ${n} 处`,
+  gateBlocked: (n: number) => `门禁拦下了 ${n} 处，改完再发布`,
+  passed: '发布前检查通过：没有会被门禁拦下的问题',
+  warnings: (n: number) => `另有 ${n} 条提示`,
+  fixAll: (n: number) => `一键修复可自动修的 ${n} 处`,
+  fixOne: '修复',
+  fixHint: (label: string) => `先看预览：${label}`,
+  choose: '预览',
+  chooseFirst: '先选好再预览',
+  multiple: '可以多选',
+  suggested: '建议',
+  assist: '交给 Copilot',
+  assistHint: '让 Copilot 试着改剩下的问题。它改的同样只是预览，要人拿主意的会原样问你',
+  locked: (why: string) => `${why}。现在不能修复`,
+  previewing: '正在生成修复预览…',
+  assisting: 'Copilot 正在试着修，可能要几十秒…',
+  stop: '停下',
+  previewTitle: (n: number) => `修复预览 · ${n} 处改动`,
+  noChange: '这一次没有可以应用的改动',
+  rejected: '没有采用',
+  assistSaid: 'Copilot',
+  questions: 'Copilot 需要你拿主意',
+  afterOk: '应用后门禁不再拦',
+  afterLeft: (n: number) => `应用后还剩 ${n} 处会被拦下`,
+  apply: '应用并重新检查',
+  discard: '放弃',
+  applyNote: '应用后存成新的草稿版本，再重新检查一遍；不会自动发布',
+  dirtyNote: '画布上还有没保存的改动，应用时会一起存进草稿',
+  saving: '正在保存草稿…',
+  rechecking: '正在重新检查…',
+  saveFailed: '草稿没保存上',
+  saveFailedHint: '修复已经放到画布上（可以撤销）；保存成功之前不能发布',
+  retrySave: '重试保存',
+  stalePreview: '预览之后画布又改过了，这份预览对不上了：重新检查一次再修',
+  autofixMissing: '这个后端还不支持自动修复：照提示手动改，或者打开助手描述一遍',
+  autofixFailed: '修复预览没生成出来',
+  applied: (n: number, version?: number) => `已应用 ${n} 处修复${version != null ? `，存为 v${version}` : ''}`,
+  saveNote: (labels: string[]) => `发布前修复：${labels[0] ?? ''}${labels.length > 1 ? ` 等 ${labels.length} 处` : ''}`,
+  /** 撤销栈里这一步叫什么 */
+  undoLabel: (n: number) => `发布前修复（${n} 处）`,
+  pendingPreview: '先应用或放弃修复预览',
+  unsaved: '修复还没保存上',
+  whole: '整张工作流',
+} as const
+
+/** 证据的种类怎么叫：aria-label、面板标题、出处那一句 */
+export const EVIDENCE_KIND_LABEL: Record<string, string> = {
+  metric: '口径卡指标',
+  input: '运行输入',
+  cell: '查询结果',
+  query: '查询结果',
+  table: '整表',
+  retrieval: '知识库检索',
+  node_output: '代码节点的产出',
+  entity: '表或字段',
+  column: '字段',
+  quote: '引文',
+}
 
 /**
  * MCP / 自定义工具的信任档：工具页的三选一、工具徽标、审批卡的「始终允许」共用这一份。
