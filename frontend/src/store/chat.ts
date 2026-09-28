@@ -3,6 +3,7 @@ import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { decodeRun } from '../run/decode'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
+import { guardReview, hasEvidence } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { parseServerTime } from '../lib/format'
 import { useCatalog } from './catalog'
@@ -137,6 +138,11 @@ export interface TurnMeta {
   clipped?: 'partial' | 'lost'
   /** 这一问限定了只查哪些数据源 */
   scope?: ScopeSource[]
+  /**
+   * 成果里有逐段证据（报告撰写节点的文档）。库里只存答案的文字，证据的标注和字段名在
+   * 运行的成果里：有这个记号的轮次恢复时要回运行那里取一次
+   */
+  evidence?: boolean
   /**
    * 这份 meta 写下的时刻（本机时钟）。断在建图阶段的轮次按它和 created_at 里晚的那个算
    * 有多久没动静：后端按 updated_at 算，而重试一轮昨天的问题时 created_at 是昨天的
@@ -429,6 +435,7 @@ function buildMeta(t: ChatTurn): TurnMeta {
     queries: t.events.length ? countQueries(t.events) : t.meta?.queries,
     clipped: t.clipped,
     scope: t.scope?.length ? t.scope : undefined,
+    evidence: hasEvidence(t.output) || t.meta?.evidence || undefined,
     at: Date.now(),
   }
 }
@@ -665,6 +672,8 @@ function needsEagerHydrate(t: ChatTurn): boolean {
   if (t.phase === 'checking' || t.phase === 'suspended') return true
   // 「接着跑」给不给取决于运行现在的状态；老数据没存过
   if (t.phase === 'error' && !t.runStatus) return true
+  // 有逐段证据：标注在运行的成果里，库里那份答案只有文字
+  if (t.phase === 'done' && t.meta?.evidence && !hasEvidence(t.output) && !t.review?.answer) return true
   // 答案没取全：运行还在就把完整版补回来
   return t.phase === 'done' && !t.review?.answer
     && (t.clipped === 'partial' || (typeof t.output?.answer === 'string' && atClip(t.output.answer)))
@@ -1026,6 +1035,10 @@ export const useChat = create<ChatState>((set, get) => ({
     if (repaired) {
       patch(() => ({ output: run.output, clipped: undefined }))
       void persist(conversationId, turnId, { answer: full })
+    } else if (hasEvidence(run.output) && !hasEvidence(cur.output) && !cur.review?.answer) {
+      // 库里只存了答案的文字，逐段证据的标注（_evidence）和字段名都在运行的成果里：
+      // 换回运行那份，刷新之后报告里的数字照样能点开。复核改写过的不换（有证据的不会被改写）
+      patch(() => ({ output: run.output, clipped: undefined }))
     } else if (issuance && !cur.output?._issuance) {
       patch((t) => ({ output: t.output ? { ...t.output, _issuance: issuance } : t.output }))
     }
@@ -1683,6 +1696,9 @@ async function settle(
   // 复核期间用户点了停止或者重试：这一轮已经不归这次运行管了
   if (!flow.alive()) return
 
+  // 成果带逐段证据时复核只能加说明：改写会把成果整个换成 {answer}，报告文档的每个片段
+  // 就都对不上了。后端也拦，这里再拦一道，老后端回来的改写同样不落到界面和库里
+  result = guardReview(result, output)
   // 库里存完整结论（包括 verdict='ok'），store 里只留值得摆到界面上的那部分。
   // 两者分开，"这一轮没复核过"和"复核过、没发现问题"才是两件可区分的事——
   // 事后排查"它当时为什么没警告我"，靠的就是这个区别

@@ -63,6 +63,9 @@ class EventType(StrEnum):
     # 出具与口径治理
     ISSUANCE = "issuance"  # 出具契约的判定结果（档位 / 缺数据 / 未回指数字）
     CALIBER_UPGRADE = "caliber.upgrade"  # 钉住的方法卡有新版本，按声明的策略处置
+    # 报告撰写节点的自查结果：报告文档工件 id、统计、违规清单。落在封存范围内，
+    # 证据接口靠它找到文档——不去翻不受封存保护的 artifacts 表
+    REPORT_CHECKED = "report.checked"
 
     # 其他
     LOG = "log"

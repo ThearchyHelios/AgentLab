@@ -1648,6 +1648,53 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await ctx.close()
 })
 
+await section('逐段证据：带 _evidence 的成果（可点击证据第一期）', async () => {
+  // 报告文档和片段接口用夹具伪造（后端 compose_doc 真跑出来的，只用通用名），非 GET 一律拦掉
+  const { readFileSync } = await import('node:fs')
+  const fx = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
+  for (const [w, dense] of [[1100, false], [380, true]]) {
+    const page = await browser.newPage({ viewport: { width: w, height: 900 } })
+    const errors = []
+    page.on('pageerror', (e) => errors.push(e.message))
+    await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
+      const url = new URL(r.request().url())
+      if (r.request().method() !== 'GET') return r.abort()
+      const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+      if (seg) return r.fulfill({ json: fx.segments[seg[1]] ?? {} })
+      if (url.pathname === `/api/artifacts/${fx.doc_artifact}`) return r.fulfill({ json: { id: fx.doc_artifact, content: fx.doc } })
+      return r.continue()
+    })
+    const tag = dense ? '窄栏' : '宽栏'
+    await page.goto(`${WEB}/preview.html?syn=evidence${dense ? '&dense=1' : ''}`, { waitUntil: 'networkidle' })
+    await page.waitForSelector('[data-turn="evidence"] [data-evidence-doc]', { timeout: 6000 })
+    const turn = page.locator('[data-turn="evidence"]')
+    check(`${tag}：带证据的字段换成逐段文档，数字是可点的片段`, await turn.locator('[data-seg]').count() === 13)
+    check(`${tag}：出具横幅多一行计数`, (await turn.locator('[data-evidence-line]').innerText())
+      .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了'))
+    check(`${tag}：没有 _evidence 的那一轮不变`, await page.locator('[data-turn="evidence-legacy"] [data-seg]').count() === 0)
+    await turn.locator('[data-seg="s6"]').click()
+    await page.waitForSelector('[data-evidence-panel] [data-ev-substituted]')
+    const mode = await page.locator('[data-evidence-panel]').getAttribute('data-evidence-panel')
+    check(`${tag}：面板${dense ? '在栏内展开' : '从侧边弹出'}`, mode === (dense ? 'inline' : 'side'), mode)
+    const box = await page.evaluate(() => {
+      const el = document.querySelector('[data-stream-scroll]')
+      return { sw: el.scrollWidth, cw: el.clientWidth }
+    })
+    check(`${tag}：打开面板后流里没有横向滚动`, box.sw <= box.cw, JSON.stringify(box))
+    const copy = await turn.locator('button[aria-label="复制"]').count()
+    check(`${tag}：答案的复制 / 导出照常在`, copy > 0)
+    check(`${tag}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    if (SHOTS) {
+      for (const theme of ['dark', 'light']) {
+        await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await page.waitForTimeout(250)
+        await page.screenshot({ path: `${SHOTS}/stream-evidence-${dense ? 'dense' : 'wide'}-${theme}.png` })
+      }
+    }
+    await page.close()
+  }
+})
+
 await browser.close()
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 助手流渲染全部通过')
 process.exit(failed ? 1 : 0)

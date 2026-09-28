@@ -31,7 +31,7 @@
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-chat.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync } from 'node:fs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const CHROME = process.env.CHROME_PATH
@@ -273,7 +273,13 @@ const DETAIL = {
   // 要改的是工具库里的参数定义，不在这一轮的流程里：先去改，再接着跑（没记 fix 的老写法，按原话认）
   c0fixy: [turn('ty1', '查一下订单状态', { status: 'error', error: BROKEN_TOOL, graph: GRAPH, run_id: 'run-badtool' })],
 }
+/**
+ * 成果带逐段证据的一轮（报告撰写节点 + _evidence）。夹具是后端 compose_doc 真跑出来的，只用
+ * 通用名。复核回的是一次改写：有证据时复核只能加说明，答案不能被换掉
+ */
+const EVIDENCE = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
 const RUNS = {
+  'run-evid': { status: 'succeeded', output: EVIDENCE.output, error: null },
   'run-cancelled': { status: 'cancelled', output: {}, error: null },
   'run-failed': { status: 'failed', output: {}, error: '查询超时' },
   'run-rejected': { status: 'failed', output: {}, error: '人工驳回：数字对不上' },
@@ -406,6 +412,12 @@ async function fakeApi(route) {
   if (path === '/copilot/review' && method === 'POST') {
     const wait = ctl.reviewDelay[body().run_id]
     if (wait) await new Promise((r) => setTimeout(r, wait))
+    // 老后端的复核不认 _evidence，照样回一次改写
+    if (body().run_id === 'run-evid') {
+      return json({ verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
+                    original: EVIDENCE.output['周报'], retry: false, severity: 'degraded',
+                    signals: [{ kind: 'retrieval_degraded', detail: '检索退回关键词', severity: 'degraded' }] })
+    }
     return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [] })
   }
   if (path === '/runs' && method === 'POST') {
@@ -413,7 +425,8 @@ async function fakeApi(route) {
     const conversation = String(b.input?.question ?? '')
     // 发起请求根本没到后端（网断了、后端正在重启）
     if (conversation.includes('启动失败') && ctl.launchFail) return route.abort('connectionrefused')
-    const id = conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
+    const id = conversation.includes('带证据') ? 'run-evid'
+      : conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
       : conversation.includes('审批') ? 'run-wait'
       : conversation.includes('重启') ? 'run-restart'
       : conversation.includes('正在写') ? 'run-writing'
@@ -474,6 +487,18 @@ function script(runId, after = 0) {
         ev(1, 'run.started', null, { nodes: 3 }),
         ev(2, 'node.finished', 'ag', { duration_ms: 900 }),
         ev(3, 'run.finished', null, { output: { answer: FULL.slice(0, 2000), note: '附注' }, output_truncated: true }),
+      ],
+      end: 'succeeded',
+    }
+  }
+  if (runId === 'run-evid') {
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 3 }),
+        ev(2, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+        ev(3, 'report.checked', 'write', EVIDENCE.report_checked),
+        ev(4, 'node.finished', 'write', { duration_ms: 900 }),
+        ev(5, 'run.finished', null, { output: EVIDENCE.output }),
       ],
       end: 'succeeded',
     }
@@ -872,6 +897,37 @@ for (const theme of THEMES) {
     check('完整答案取到了，meta 里没有「没取全」', !meta?.clipped, JSON.stringify(meta?.clipped))
     await page.getByText('展开全部').first().click().catch(() => {})
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('evidence', '成果带逐段证据：复核只加说明，不改写答案（可点击证据第一期）', async () => {
+    const { page, ctx, errors } = await open(theme)
+    // 文档记着的运行要和成果的运行对得上（run-evid），不然前端按「别的运行写的」退回普通文本
+    await page.route(/\/api\/artifacts\//, (route) => route.fulfill({ json: { id: EVIDENCE.doc_artifact,
+      content: { ...EVIDENCE.doc, run_id: 'run-evid' } } }))
+    await page.route(/\/api\/runs\/run-evid\/evidence(\/.*)?(\?.*)?$/, (route) => route.fulfill({ json: EVIDENCE.graph }))
+    const patchesBefore = log.patches.length
+    await goto(page, 'c0trunc')
+    await send(page, '写一份带证据的周报')
+    check('答完了', await page.waitForFunction(
+      () => window.__chat.getState().byConversation.c0trunc?.at(-1)?.phase === 'done', null, { timeout: 10000 })
+      .then(() => true, () => false))
+    const t = (await chatState(page)).byConversation.c0trunc.at(-1)
+    check('复核的改写没有落到答案上：成果还是报告原文和它的证据标注',
+      t.output?.['周报'] === EVIDENCE.output['周报'] && !!t.output?._evidence && !t.output?.answer, JSON.stringify(Object.keys(t.output ?? {})))
+    check('复核的说明照样摆出来，改写的文字丢掉', t.review?.note?.includes('检索降级过') && t.review.answer === null
+      && t.review.verdict === 'annotated' && !t.rawOutput, JSON.stringify(t.review))
+    await page.waitForSelector('[data-evidence-doc]', { timeout: 5000 }).catch(() => {})
+    check('页面上是逐段可点的报告，不是改写后的文字', await page.locator('[data-evidence-doc] [data-seg]').count() > 0
+      && !(await shows(page, '改写后的答案')))
+    check('没有「复核改写过这个答案」的对照', await page.getByText('复核改写过这个答案').count() === 0)
+    await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
+    const saved = log.patches.slice(patchesBefore)
+    check('落库的是报告原文，不是改写', saved.filter((p) => typeof p.body.answer === 'string' && p.body.answer)
+      .every((p) => p.body.answer === EVIDENCE.output['周报']), saved.map((p) => String(p.body.answer ?? '').slice(0, 12)).join(' | '))
+    check('meta 记下这一轮有证据（刷新后回运行那里取标注）', saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
+    check('落库的复核也不带改写', saved.filter((p) => p.body.review?.verdict).every((p) => !p.body.review.answer))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

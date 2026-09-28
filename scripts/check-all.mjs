@@ -34,6 +34,7 @@ const ORDER = [
   'guards',          // 输入法、未知节点、错误边界
   'shell',           // 外壳：导航、徽标、命令面板、离开前确认、启动页
   'stream',          // 回答流的渲染
+  'evidence',        // 可点击证据：报告逐段渲染、证据面板、旧契约按位置标记
   'run-states',      // 节点卡的运行态
   'canvas-fx',       // 画布表层的运行态
   'studio',          // 编排页的编辑
@@ -45,7 +46,8 @@ const ORDER = [
 const TIMEOUT_MS = Number(process.env.CHECK_TIMEOUT_MS ?? 15 * 60_000)
 // 各检查只跑其中几段、只跑一套主题的开关。壳里留着一个 ONLY=… 就会让整套检查悄悄只跑一小截，
 // 却照样报「全部通过」，所以一律不传给子进程
-const FILTERS = ['CHECK_ONLY', 'ONLY', 'THEMES', 'FX_ONLY', 'STUDIO_ONLY', 'RUN_STATES_ONLY', 'UI_KIT_ONLY', 'CHECK_THEME']
+const FILTERS = ['CHECK_ONLY', 'ONLY', 'THEMES', 'FX_ONLY', 'STUDIO_ONLY', 'RUN_STATES_ONLY', 'UI_KIT_ONLY', 'CHECK_THEME',
+  'EVIDENCE_ONLY']
 // 新加的 check-*.mjs 忘了写进 ORDER 就永远不会跑：列出来提醒
 const unlisted = readdirSync(HERE)
   .map((f) => f.match(/^check-(.+)\.mjs$/)?.[1])

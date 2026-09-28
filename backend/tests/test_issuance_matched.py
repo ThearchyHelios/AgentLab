@@ -52,8 +52,9 @@ async def test_each_traced_number_names_its_metric_and_caliber():
                 break
     assert row.status == "succeeded", row.error
 
-    expected = [{"token": "120", "metric": "orders", "caliber": "销售口径 @ v2"},
-                {"token": "35.5", "metric": "aov", "caliber": "销售口径 @ v2"}]
+    # start / end 是 token 在叙述里的位置：同一个数出现两次时，界面按位置标，不再按字符串全局匹配
+    expected = [{"token": "120", "metric": "orders", "caliber": "销售口径 @ v2", "start": 5, "end": 8},
+                {"token": "35.5", "metric": "aov", "caliber": "销售口径 @ v2", "start": 15, "end": 19}]
     assert row.output["_issuance"]["matched"] == expected
     assert row.output["_issuance"]["matched_numbers"] == 2
     async with SessionLocal() as session:

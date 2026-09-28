@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 # --------------------------------------------------------------------------
 # 出具校验：叙述里的每个数字必须能回指到指标集
@@ -185,6 +185,11 @@ class NumberToken:
     #: 回指时允许的偏差。缺省按写出的小数位数算；中文数字、带万亿后缀的数有自己的书写精度
     tolerance: float | None = None
 
+    @property
+    def end(self) -> int:
+        """raw 在原文里的结束位置。raw 只去掉了右侧空白，开头就是 start。"""
+        return self.start + len(self.raw)
+
 
 @dataclass
 class TraceReport:
@@ -345,6 +350,27 @@ def _token_matches(token: NumberToken, metric_value: float) -> bool:
     return False
 
 
+def number_allowance(allow: list[Any] | None) -> Callable[[NumberToken], bool]:
+    """模板作者放行的字面量：写法相同，或者数值在这个 token 的书写精度内相等。
+
+    旧契约的回指和报告节点的裸数字检查共用这一条，两边放行的范围才一致。
+    """
+    allowed = {str(a).strip() for a in (allow or [])}
+    values = set()
+    for a in allowed:
+        try:
+            values.add(float(a.replace(",", "").rstrip("%％")))
+        except ValueError:
+            pass
+
+    def ok(token: NumberToken) -> bool:
+        if token.raw in allowed or token.raw.rstrip("%％").strip() in allowed:
+            return True
+        return any(_close(token.value, v, _tolerance(token)) for v in values)
+
+    return ok
+
+
 def trace_numbers(
     narrative: str,
     metrics: list[dict[str, Any]],
@@ -356,40 +382,28 @@ def trace_numbers(
     allow 是模板作者显式放行的字面量（比如报告标题里的期数）——
     白名单是配置的一部分，进版本、被审查，而不是校验器私藏的宽容。
     """
-    numeric_values = [
-        float(m["value"])
+    # 值和指标成对取：以前值列表排掉了布尔、指标列表没排，一个布尔指标就让后面的全错位
+    numeric = [
+        (m, float(m["value"]))
         for m in metrics
         if isinstance(m.get("value"), (int, float)) and not isinstance(m.get("value"), bool)
     ]
-    allowed = {str(a).strip() for a in (allow or [])}
-    allowed_values = set()
-    for a in allowed:
-        try:
-            allowed_values.add(float(a.replace(",", "").rstrip("%％")))
-        except ValueError:
-            pass
-
+    allowed = number_allowance(allow)
     report = TraceReport()
     for token in extract_numbers(narrative):
-        if token.raw in allowed or token.raw.rstrip("%％").strip() in allowed:
+        if allowed(token):
             continue
-        if any(_close(token.value, av, _tolerance(token)) for av in allowed_values):
-            continue
-        hit = next(
-            (
-                m
-                for m, mv in zip(
-                    [m for m in metrics if isinstance(m.get("value"), (int, float))],
-                    numeric_values,
-                )
-                if _token_matches(token, mv)
-            ),
-            None,
-        )
-        if hit is not None:
-            report.matched.append({"token": token.raw, "metric": hit.get("id")})
+        where = {"start": token.start, "end": token.end}
+        # 同一个值可能同时对得上好几个指标（最典型的是一排兜底出来的 0）。以前取第一个
+        # 命中的，界面上所有的 0 都标成「来自指标 A」——出处不唯一就照实说不唯一
+        hits = list(dict.fromkeys(m.get("id") for m, mv in numeric if _token_matches(token, mv)))
+        if len(hits) == 1:
+            report.matched.append({"token": token.raw, "metric": hits[0], **where})
+        elif hits:
+            report.matched.append({"token": token.raw, "metric": None, "candidates": hits,
+                                   "ambiguous": True, **where})
         else:
-            report.unmatched.append({"token": token.raw, "context": token.context})
+            report.unmatched.append({"token": token.raw, "context": token.context, **where})
     return report
 
 
@@ -400,6 +414,10 @@ def decide_tier(
     unmatched: list[dict[str, Any]],
     strict: bool,
     gaps: list[str] | None = None,
+    unresolved: list[Any] | None = None,
+    unsupported: list[Any] | int | None = None,
+    uncited_claims: list[Any] | int | None = None,
+    claims_policy: str | dict[str, Any] | None = None,
 ) -> str:
     """三档出具的判定。
 
@@ -413,11 +431,47 @@ def decide_tier(
     空串、metrics_from 指向不存在的节点，都会得到一模一样的空列表。
     校验没发生就盖 formal 章，比漏检某个数字更糟：它让整套机制看起来在工作。
     所以 gaps 用来承载"校验为什么不完整"，非空就不允许 formal。
+
+    引用模式另有几样：unresolved 是解析不了的引用（报告里写了 [[m:gmvx]]，目录里
+    没有），和未回指数字同等对待——那个位置上显示的不是一个有出处的数。
+    unsupported / uncited_claims 是结论句的判定，只在声明了 claims_policy 时才参与：
+    字符串（judge / require_citation）两样都按降档处理；对象形式可以分别写
+    on_unsupported / on_uncited 为 degrade、withhold 或 ignore。不声明就不管，
+    旧调用和没开结论检查的契约都不受影响。
     """
     if missing_required:
         return "withheld"
-    if strict and unmatched:
+    if strict and (unmatched or unresolved):
         return "withheld"
-    if missing_expected or unmatched or gaps:
+    claims = _claims_effect(claims_policy, unsupported, uncited_claims)
+    if claims == "withhold":
+        return "withheld"
+    if missing_expected or unmatched or unresolved or gaps or claims == "degrade":
         return "degraded"
     return "formal"
+
+
+def _claims_effect(
+    policy: str | dict[str, Any] | None,
+    unsupported: list[Any] | int | None,
+    uncited: list[Any] | int | None,
+) -> str | None:
+    """结论句对档位的影响：withhold / degrade / None。"""
+    if isinstance(policy, dict):
+        name = policy.get("policy")
+        on_unsupported = policy.get("on_unsupported") or "degrade"
+        on_uncited = policy.get("on_uncited") or "degrade"
+    else:
+        name, on_unsupported, on_uncited = policy, "degrade", "degrade"
+    if not name or name == "off":
+        return None
+
+    def count(value: list[Any] | int | None) -> int:
+        return value if isinstance(value, int) else len(value or [])
+
+    effects = [on for on, n in ((on_unsupported, count(unsupported)), (on_uncited, count(uncited))) if n]
+    if "withhold" in effects:
+        return "withhold"
+    if "degrade" in effects:
+        return "degrade"
+    return None

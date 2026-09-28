@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
-    artifacts, conversations, copilot, datasources, governance, knowledge, runs,
+    artifacts, conversations, copilot, datasources, evidence, governance, knowledge, runs,
     sandbox, settings as settings_api, tools, workflows,
 )
 from app.api.coded import CodedHTTPException, coded_handler
@@ -91,6 +91,7 @@ for router in (
     workflows.router,
     runs.router,
     runs.approvals_router,
+    evidence.router,
     settings_api.router,
     tools.router,
     tools.custom_router,

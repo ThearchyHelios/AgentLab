@@ -1049,6 +1049,82 @@ await section('分支、循环出口的说法（runfx-9、终验 NEW）', async 
   check('没有出口的节点不进表', labelOf('x', 'out') === undefined)
 })
 
+await section('报告核对 report.checked、口径卡的台账（可点击证据第一期）', async () => {
+  // 夹具由后端 evidence.py 的 compose_doc 真跑生成（只用通用名），report_checked 是报告节点发的那条事件的载荷
+  const evidence = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-doc.json`, 'utf8'))
+  const rc = evidence.report_checked
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  // 修复重写那条日志的原话：和 backend/app/engine/nodes/report.py 发的同一个格式（_named 用「、」
+  // 接着点名的字）。下面先核对后端源码里还是这个格式，免得这里的夹具自说自话
+  const REPAIR_MESSAGE = '报告里有 3 处没通过核对（「12」、「m:nope」、「3」），已要求写作者重写（第 1 次）'
+  const reportPy = readFileSync(`${root}backend/app/engine/nodes/report.py`, 'utf8')
+  check('后端发修复日志的格式还是夹具里这一种', reportPy.includes('code="report_repair"')
+    && reportPy.includes('处没通过核对（{_named(blocking)}），') && reportPy.includes('已要求写作者重写（第 {repairs} 次）')
+    && reportPy.includes('"、".join(f"「{n}」"'), '改了 report.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const card = evidence.doc.catalog['m:gmv'].artifact
+  const events = [
+    E(1, 'run.started', null, { total: 3 }),
+    E(2, 'node.started', 'caliber', { node_type: 'metrics', label: '周报口径' }),
+    // 口径卡的 node.finished 多了台账（evidence 数组），产出里多了 artifact 字符串：照常解码、不另起行
+    E(3, 'node.finished', 'caliber', { duration_ms: 12,
+      preview: { kind: 'metric_set', caliber: '周报口径', caliber_version: 'v2', artifact: card, text: '销售额 = 45,678.5元' },
+      evidence: [{ kind: 'metric_set', node_id: 'caliber', exec: 1, artifact: card, caliber: '周报口径', version: 'v2', metrics: ['gmv'] }] }),
+    E(4, 'node.started', 'write', { node_type: 'report' }),
+    // 后端 report.py 原样的说法：「报告里有 N 处没通过核对（点名的字），已要求写作者重写（第 N 次）」
+    E(5, 'log', 'write', { level: 'warn', code: 'report_repair', message: REPAIR_MESSAGE }),
+    E(6, 'report.checked', 'write', rc),
+    E(7, 'node.finished', 'write', { duration_ms: 2300, preview: { text: evidence.doc.markdown.slice(0, 40), doc_artifact: rc.doc_artifact } }),
+    E(8, 'run.finished', null, { output: {} }),
+  ]
+  const steps = mod.decodeRun(events)
+  const all = flatten(steps)
+  check('新事件都有翻译，没有「一条还没翻译的记录」', !all.some((s) => s.title === '一条还没翻译的记录'),
+    all.filter((s) => s.title === '一条还没翻译的记录').map((s) => s.detail?.split('\n')[0]).join('、'))
+  const node = steps.find((s) => s.nodeId === 'write' && s.kind === 'node')
+  check('没起名的报告节点叫「报告撰写」', node?.title === '报告撰写', node?.title)
+  const row = all.find((s) => s.code === 'report_checked')
+  check('report.checked 解码成一条步骤，挂在报告节点下面', !!row && !!node?.children?.includes(row), row?.title)
+  check('标题说几个数字有出处、几个没有（算得平：12 − 7 = 5），非数字引用另起一句（和横幅同一种说法）',
+    row?.title === '核对报告：7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了', row?.title)
+  check('有无证据的地方就是提醒，不是安静的一行', row?.level === 'warn', row?.level)
+  check('能下钻到报告文档', row?.artifact === rc.doc_artifact, row?.artifact)
+  check('违规清单放进展开区', !!row?.detail?.includes('数字「12」没有出处') && !!row.detail.includes('这种引用在后续版本支持'),
+    row?.detail?.slice(0, 80))
+  check('重写过几次写在行尾', row?.meta === '重写 1 次', row?.meta)
+  const repair = all.find((s) => s.code === 'report_repair')
+  check('修复重写说人话：几处没通过、第几次，原话留在展开区', repair?.title === '报告有 3 处没通过核对，已让模型按清单重写（第 1 次）'
+    && repair.detail === REPAIR_MESSAGE, `${repair?.title} / ${repair?.detail}`)
+  check('点名的字放进副标题（「12」「m:nope」这类）', repair?.sub === '「12」、「m:nope」、「3」', repair?.sub)
+  const oldSaying = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_repair', message: '报告要重写' })])).find((s) => s.code === 'report_repair')
+  check('别的说法（老后端）：标题照样说人话，不瞎填数', oldSaying?.title === '报告没通过核对，已让模型按清单重写'
+    && oldSaying.sub === undefined, `${oldSaying?.title} / ${oldSaying?.sub}`)
+  const caliber = steps.find((s) => s.nodeId === 'caliber')
+  check('口径卡带台账的 node.finished 照常收成完成', caliber?.status === 'done' && !caliber.children?.length,
+    `${caliber?.status} ${caliber?.children?.length ?? 0}`)
+
+  const clean = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写周报' }),
+    E(2, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 0,
+      stats: { numbers: 7, numbers_cited: 7, uncited_numbers: 0, unresolved: 0 }, violations: [] })]))
+    .find((s) => s.code === 'report_checked')
+  check('全都有出处：一句话说完，不是提醒', clean?.title === '核对报告：7 个数字都有出处' && clean.level !== 'warn'
+    && !clean.meta, `${clean?.title} ${clean?.level} ${clean?.meta}`)
+  const blocked = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写周报' }),
+    E(2, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 1, ok: false, on_violation: 'fail', failed: true,
+      stats: { numbers: 3, numbers_cited: 2, uncited_numbers: 1, unresolved: 0 },
+      violations: [{ code: 'uncited_number', message: '数字「45678」没有出处' }] })]))
+    .find((s) => s.code === 'report_checked')
+  check('fail 模式下仍不过：这一步画成失败，不是完成', blocked?.status === 'failed' && blocked.level === 'error',
+    `${blocked?.status} ${blocked?.level}`)
+  const flagged = flatten(mod.decodeRun([E(1, 'report.checked', 'w', { ok: false, on_violation: 'flag', failed: false,
+    stats: { numbers: 3, numbers_cited: 2, uncited_numbers: 1, unresolved: 0 }, violations: [] })]))
+    .find((s) => s.code === 'report_checked')
+  check('flag 模式照常产出：完成、提醒级', flagged?.status === 'done' && flagged.level === 'warn',
+    `${flagged?.status} ${flagged?.level}`)
+  const bare = flatten(mod.decodeRun([E(1, 'report.checked', null, {})])).find((s) => s.code === 'report_checked')
+  check('载荷缺字段也不崩，只说核对了报告', bare?.title === '核对报告' && !bare.artifact, bare?.title)
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

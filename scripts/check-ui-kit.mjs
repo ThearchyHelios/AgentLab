@@ -282,6 +282,114 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
   })) check(name, ok, detail)
 })
 
+await section('lib/evidence：证据状态的四通道元数据、报告节点的叫法、复核守卫', async () => {
+  for (const [name, ok, detail] of await page.evaluate(() => {
+    const { evidence: ev, terms: t } = window.__ui.lib
+    const out = []
+    const eq = (name, got, want) => out.push([name, got === want, got === want ? '' : `得到 ${JSON.stringify(got)}，应为 ${JSON.stringify(want)}`])
+    const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
+    const codes = ev.EVIDENCE_STATES
+    // 方案 6.1 的八种：确定性、概率性四种、无证据、连接性、旧运行候选
+    ok('八种状态一种不少', ['deterministic', 'supported', 'partial', 'unsupported', 'unjudged', 'none', 'connective', 'candidate']
+      .every((c) => codes.includes(c)) && codes.length === 8, codes.join(','))
+    const lines = new Set(['solid', 'dotted', 'badge', 'none'])
+    const bad = codes.filter((c) => {
+      const m = ev.EVIDENCE_STATE[c]
+      return !m || m.code !== c || !m.label || !lines.has(m.line) || typeof m.glyph !== 'string'
+        || !/^var\(--st-[\w-]+\)$/.test(m.color) || !m.decoration || !/^var\(--st-[\w-]+\)$/.test(m.soft) || !m.hint
+    })
+    ok('每种都有线型、字形、颜色、文字（颜色只用 --st-*）', !bad.length, bad.join(','))
+    ok('下划线颜色也只取 --st-*（或透明）', codes.every((c) => {
+      const d = ev.EVIDENCE_STATE[c].decoration
+      return d === 'transparent' || /var\(--st-[\w-]+\)/.test(d)
+    }), codes.map((c) => ev.EVIDENCE_STATE[c].decoration).join(' | '))
+    const pairs = codes.map((c) => `${ev.EVIDENCE_STATE[c].line}/${ev.EVIDENCE_STATE[c].glyph}`)
+    ok('去掉颜色也分得开：线型 + 字形两两不同', new Set(pairs).size === codes.length, pairs.join(' '))
+    const labels = codes.map((c) => ev.EVIDENCE_STATE[c].label)
+    ok('文字两两不同', new Set(labels).size === codes.length, labels.join(' '))
+    eq('确定性：细实线、有出处', `${ev.EVIDENCE_STATE.deterministic.line}/${ev.EVIDENCE_STATE.deterministic.label}`, 'solid/有出处')
+    eq('无证据：点状线、?、无证据', `${ev.EVIDENCE_STATE.none.line}/${ev.EVIDENCE_STATE.none.glyph}/${ev.EVIDENCE_STATE.none.label}`, 'dotted/?/无证据')
+    ok('概率性的「有依据」不用确定性的绿', ev.EVIDENCE_STATE.supported.color !== ev.EVIDENCE_STATE.deterministic.color)
+    eq('本期只会出现确定性和无证据', codes.filter((c) => ev.EVIDENCE_STATE[c].phase === 1).join(','), 'deterministic,none')
+    ok('只有异常态醒目（进 n / N 的跳转）', !ev.EVIDENCE_STATE.deterministic.alert && ev.EVIDENCE_STATE.none.alert)
+    eq('片段状态：deterministic', ev.segmentState({ kind: 'number', state: 'deterministic' }), 'deterministic')
+    eq('片段状态：结构片段不画', ev.segmentState({ kind: 'structural', state: 'none' }), null)
+    eq('片段状态：文字不画', ev.segmentState({ kind: 'text', state: 'neutral' }), null)
+    eq('片段状态：probabilistic 裁判前按未裁判画', ev.segmentState({ kind: 'text', state: 'probabilistic' }), 'unjudged')
+
+    eq('报告节点叫「报告撰写」', t.nodeTypeLabel('report'), '报告撰写')
+    eq('计数的说法：无证据 = 总数 − 有出处，算得平', t.evidenceTally(7, 12), '7/12 数字有出处 · 无证据 5')
+    eq('不是数字的解析不了的引用另起一句', t.evidenceTally(7, 12, 1), '7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了')
+    eq('数字全有出处', t.evidenceTally(1234, 1234, 0), '1,234 个数字都有出处')
+    eq('数字全有出处、另有引用解析不了', t.evidenceTally(3, 3, 2), '3 个数字都有出处 · 另有 2 处引用解析不了')
+    eq('一个数字都没有、只有解析不了的引用', t.evidenceTally(0, 0, 1), '1 处引用解析不了')
+    eq('什么都没有时给空串', t.evidenceTally(0, 0, 0), '')
+
+    const out1 = { 周报: 'x', _evidence: { report_node: 'write', doc_artifact: 'abc', fields: ['周报'],
+      others: [{ report_node: 'w2', doc_artifact: 'def', fields: ['附录'] }] } }
+    const f = ev.evidenceFields(out1)
+    ok('_evidence 的字段和 others 都认', f.get('周报')?.artifact === 'abc' && f.get('附录')?.report === 'w2', JSON.stringify([...f]))
+    eq('缺 doc_artifact 的标注当没有', ev.evidenceFields({ _evidence: { fields: ['a'] } }).size, 0)
+    const review = { verdict: 'rewritten', note: '有缺口', answer: '改写后的', original: '原文', retry: false, severity: 'degraded', signals: [] }
+    const guarded = ev.guardReview(review, out1)
+    ok('成果带证据：复核只加说明，不改写', guarded.answer === null && guarded.original === null && guarded.verdict === 'annotated'
+      && guarded.note === '有缺口', JSON.stringify(guarded))
+    ok('成果不带证据：复核照旧可以改写', ev.guardReview(review, { answer: 'x' }).answer === '改写后的')
+    eq('出处不唯一的说法', ev.matchedSource({ token: '0', metric: null, candidates: ['a', 'b'], ambiguous: true }).text, '出处不唯一：候选 a、b')
+    eq('出处唯一的照写指标', ev.matchedSource({ token: '12', metric: 'gmv' }).text, 'gmv')
+    const cp = ev.codePointIndex('📦 15 单')
+    eq('码点偏移换成 UTF-16：emoji 后面差一位', cp(2), 3)
+    eq('没有 emoji 时原样', ev.codePointIndex('abc')(2), 2)
+    const doc = window.__ui.evidenceFixture.doc
+    const tally = ev.docTally(doc)
+    const k = (x) => `${x.cited}/${x.total}/${x.none}/${x.other}/${x.hidden}/${x.structural}/${x.noSegment}`
+    eq('文档计数（有出处/总数/无证据/非数字引用/画不了线/其中结构/其中没对应字）', k(tally), '7/12/5/1/1/1/0')
+    const { stats: _s, ...bare } = doc
+    eq('没有 stats 时从片段和违规清单数，口径一样', k(ev.docTally(bare)), '7/12/5/1/1/1/0')
+    const { violations: _v, ...noList } = doc
+    eq('有 stats、没有违规清单：非数字引用由 stats 反推', `${ev.docTally(noList).none}/${ev.docTally(noList).other}`, '5/1')
+    eq('只有 stats（report.checked 的载荷）：同一种算法', JSON.stringify(ev.statsTally(doc.stats)),
+      JSON.stringify({ total: 12, cited: 7, none: 5, other: 1 }))
+    eq('载荷缺字段：不给计数', ev.statsTally({ uncited_numbers: 1 }), null)
+    // 句末依据里写错的引用：违规不指任何片段，和列表序号里的数字分开数、分开说
+    const withSee = { ...doc, stats: { ...doc.stats, unresolved: 4, violations: 7 },
+      violations: [...doc.violations, { code: 'unresolved_ref', message: '依据 [[see:m:nope]] 解析不了', ref: 'm:nope', unit: 'u1' }] }
+    const t2 = ev.docTally(withSee)
+    eq('句末依据的引用：算进非数字引用、算进「没对应字」', k(t2), '7/12/5/2/2/1/1')
+    const sum = ev.tallySummary(t2, true)
+    ok('读屏摘要：两种画不了线的分开说在哪', sum.includes('其中 1 个数字在列表序号') && sum.includes('1 处在正文里没有对应的字')
+      && sum.includes('句末依据'), sum)
+    ok('读屏摘要：只有结构片段时不提「句末依据」', !ev.tallySummary(tally, true).includes('句末依据'), ev.tallySummary(tally, true))
+
+    // 封存那一行：顺序是 正文不是封存那份 → 没拿到 → 没封存 → 核对失败 → 不在范围 → 通过
+    const sv = (seal, opts) => { const v = ev.sealVerdict(seal, opts); return `${v.status}:${v.label}` }
+    eq('封存被改过（covered 必然也是 false）：失败，不是「不在封存范围内」', sv({ sealed: true, ok: false, covered: false }),
+      'failed:已封存 · 核对不一致')
+    eq('没封存：灰「尚未封存」', sv({ sealed: false, ok: null, covered: false }), 'idle:尚未封存')
+    eq('封存完好、这件不在台账里：琥珀', sv({ sealed: true, ok: true, covered: false }), 'waiting:不在封存范围内')
+    eq('都过了：绿', sv({ sealed: true, ok: true, covered: true }), 'done:已封存 · 核对一致')
+    ok('正文不是封存的那份：再完好的封存也判失败', sv({ sealed: true, ok: true, covered: true }, { foreign: true }).startsWith('failed:'))
+    ok('没有证据的片段：落到报告文档上', sv({ sealed: true, ok: true, covered: true }, { docOnly: true }).includes('报告文档已封存'))
+    ok('链没取到、封存状态从证据图查的：只说文档封存了', sv({ sealed: true, ok: true }, { viaGraph: true }).includes('证据链这次没取到'))
+    eq('逐项复核：没封存时不报「不在封存范围内」', ev.integrityFailures({ sealed: false, hash_ok: true }, { sealed: false }).join(','), '')
+    eq('逐项复核：封存被改过时也不报', ev.integrityFailures({ sealed: false }, { sealed: true, ok: false }).join(','), '')
+    eq('逐项复核：封存完好时照报', ev.integrityFailures({ sealed: false, hash_ok: false }, { sealed: true, ok: true }).join(','), 'hash,sealed')
+
+    // 证据接口答的是不是正文这份
+    const seg = { id: 's8', text: '8.7%' }
+    const mine = { artifact: 'aaa', node: 'write', seg }
+    eq('同一份：不算外来', ev.docForeign({ report: { doc_artifact: 'aaa', node_id: 'write' }, segment: { id: 's8', text: '8.7%' } }, mine), null)
+    ok('文档工件 id 不同：外来', !!ev.docForeign({ report: { doc_artifact: 'bbb' }, segment: { id: 's8', text: '8.7%' } }, mine))
+    eq('这个位置的字不同：外来，并记下封存那份写的是什么',
+      ev.docForeign({ report: { doc_artifact: 'aaa' }, segment: { id: 's8', text: '9.9%' } }, mine)?.sealedText, '9.9%')
+    eq('接口没报文档 id（老后端）：只比字', ev.docForeign({ segment: { text: '8.7%' } }, mine), null)
+    eq('证据图兜底：封存的报告里有正文这份', ev.graphDoc({ reports: [{ doc_artifact: 'aaa' }] }, 'aaa'), 'ok')
+    eq('证据图兜底：没有正文这份', ev.graphDoc({ reports: [{ doc_artifact: 'bbb' }] }, 'aaa'), 'foreign')
+    eq('证据图兜底：有，但哈希对不上', ev.graphDoc({ reports: [{ doc_artifact: 'aaa', hash_ok: false }] }, 'aaa'), 'tampered')
+    return out
+  })) check(name, ok, detail)
+})
+
 await section('lib/actor：本机署名', async () => {
   for (const [name, ok, detail] of await page.evaluate(() => {
     const a = window.__ui.lib.actor

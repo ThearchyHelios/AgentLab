@@ -1,7 +1,8 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { TYPE_LABEL, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { TYPE_LABEL, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
@@ -673,6 +674,16 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         sub: [x?.reason, x?.never?.length ? `没派到：${x.never.join('、')}` : ''].filter(Boolean).join(' · ') || undefined,
         next: '交出去的是成员最后的原话，不能当结论用。到画布里看成员有没有绑定要用的工具，再调大「最多轮数」',
         fix: 'canvas',
+      }
+    }
+    case 'report_repair': {
+      // 「报告里有 3 处没通过核对（「12」「m:nope」），已要求写作者重写（第 1 次）」。没通过的
+      // 不只是裸数字，还有解析不了的引用（m:nope），标题不能只说「没写引用」
+      const n = message.match(/报告里有\s*(\d+)\s*处/)?.[1]
+      const round = message.match(/第\s*(\d+)\s*次/)?.[1]
+      return {
+        title: `报告${n ? `有 ${n} 处` : ''}没通过核对，已让模型按清单重写${round ? `（第 ${round} 次）` : ''}`,
+        sub: message.match(/没通过核对（(.+?)）/)?.[1],
       }
     }
     case 'repair_invented': {
@@ -1571,6 +1582,31 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           // 核对了几个指标、回指了几个数字放进展开区：横幅上有同样的数，窄栏的行尾放不下
           ...(gaps.length || checked ? { detail: [...gaps, checked].filter(Boolean).join('\n') } : {}),
         })
+        break
+      }
+
+      case 'report.checked': {
+        // 报告撰写节点核对完自己写的报告：几个数字有出处、哪些地方没有证据。说法和出具
+        // 横幅那一行同一种（evidenceTally）。载荷缺字段（别的版本的后端）就只说核对过
+        // 前半句只数数字（无证据 = 总数 − 有出处，算得平），不是数字的解析不了的引用另起一句
+        const counts = statsTally(d.stats && typeof d.stats === 'object' ? d.stats : null)
+        const none = counts ? counts.none + counts.other : 0
+        const violations: any[] = Array.isArray(d.violations) ? d.violations : []
+        const repairs = num(d.repairs) ?? 0
+        const tally = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
+        const listed = violations.slice(0, 8)
+          .map((v) => `· ${String(v?.message ?? v?.text ?? v?.code ?? '')}`).filter((x) => x.length > 2)
+        const more = violations.length > listed.length ? [`…另有 ${violations.length - listed.length} 处`] : []
+        // on_violation=fail 且重写后仍不过：节点接着就失败，这一步不能画成完成。老后端没有 failed 字段，照旧
+        const failed = d.failed === true
+        push({
+          id: `rc-${seq}`, seq, kind: 'issuance', nodeId, status: failed ? 'failed' : 'done', code: 'report_checked',
+          level: failed ? 'error' : none || violations.length ? 'warn' : 'info',
+          title: tally ? `核对报告：${tally}` : '核对报告',
+          ...(listed.length ? { detail: [...listed, ...more].join('\n') } : {}),
+          ...(repairs ? { meta: `重写 ${repairs} 次` } : {}),
+          ...(typeof d.doc_artifact === 'string' && d.doc_artifact ? { artifact: d.doc_artifact } : {}),
+        }, nodeId)
         break
       }
 

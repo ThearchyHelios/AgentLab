@@ -115,7 +115,7 @@ _EXPRESSION_FIELDS = ("expression", "condition", "skip_if")
 _BARE_REF_RE = re.compile(r"\b(?:vars|input|nodes)\.[A-Za-z_][\w.]*")
 
 
-def _iter_expressions(cfg: dict[str, Any]) -> list[tuple[str, str]]:
+def _iter_expressions(cfg: dict[str, Any], node_type: str = "") -> list[tuple[str, str]]:
     """节点配置里那些按表达式求值的字段。"""
     out: list[tuple[str, str]] = []
     for key in _EXPRESSION_FIELDS:
@@ -126,6 +126,13 @@ def _iter_expressions(cfg: dict[str, Any]) -> list[tuple[str, str]]:
         cond = (case or {}).get("condition")
         if isinstance(cond, str) and cond.strip():
             out.append((f"cases[{i}].condition", cond))
+    # 口径卡的每个指标都是一条表达式。以前不扫，于是口径卡引用了谁在变量表里看不见，
+    # 喂给它的 vars.kpi 还被报成「产出了但没有任何地方引用」
+    if node_type == "metrics":
+        for i, metric in enumerate(cfg.get("metrics") or []):
+            expr = metric.get("expression") if isinstance(metric, dict) else None
+            if isinstance(expr, str) and expr.strip():
+                out.append((f"metrics[{i}].expression", expr))
     return out
 
 
@@ -320,12 +327,14 @@ def analyze(spec: GraphSpec) -> VariableReport:
         # 只扫模板语法的话，模板⑦里 collect 那个
         # `(vars.collected or '') + str(vars.one)` 就一个引用都认不出来，
         # 于是 vars.one 被报成"产出了但没有任何地方引用"——而它明明在用。
-        for field, expr_text in _iter_expressions(cfg):
+        for field, expr_text in _iter_expressions(cfg, str(node.type)):
             for m in _BARE_REF_RE.finditer(expr_text):
                 path, root = _root_of(m.group(0))
                 if not path:
                     continue
-                target = index.get(path)
+                # vars.kpi.gmv 是在用 vars.kpi：和模板引用一样退到能枚举的那一层
+                target = index.get(path) or _resolve_fallback(
+                    path, index, input_is_closed=input_is_closed)
                 if target is not None:
                     target.refs.append(VarRef(
                         node_id=node.id, node_label=label, field=field, expr=m.group(0),

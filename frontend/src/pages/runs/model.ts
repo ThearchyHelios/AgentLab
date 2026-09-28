@@ -326,8 +326,25 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   tool_snapshot: '工具快照',
   retrieval_snapshot: '检索快照',
   node_output: '节点产出',
+  metric_set: '口径卡指标集',
+  report_doc: '报告文档',
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
+
+/** 工件行上的一句说明：这件工件里装的是什么 */
+export function artifactDescription(kind: string, meta?: Record<string, any> | null): string {
+  switch (kind) {
+    case 'query_snapshot': return '查询：SQL 和结果集'
+    case 'tool_snapshot': return '工具调用：参数和返回'
+    case 'retrieval_snapshot': return '知识检索：命中的片段'
+    case 'node_output': return '这一次执行的产出'
+    // 口径卡每跑一次落一件：哪张卡、哪一版（工件行的 meta 里有 {caliber, version}）
+    case 'metric_set': return meta?.caliber
+      ? `口径卡「${meta.caliber}」${meta.version ?? ''}` : '口径卡的指标、算式和输入'
+    case 'report_doc': return '报告：逐段的片段和每个数字的出处'
+    default: return '工件'
+  }
+}
 
 /** 证据：查询、工具、检索的快照。节点产出是过程里的中间值，一次循环就是几十件 */
 export const isEvidence = (kind: string): boolean => kind !== 'node_output'

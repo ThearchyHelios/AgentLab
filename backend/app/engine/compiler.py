@@ -11,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
-from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, tools
+from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, report, tools
 from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
 from app.engine.state import GraphState
 
@@ -35,6 +35,7 @@ RUNNERS: dict[NodeType, NodeRunner] = {
     NodeType.MEMORY: knowledge.run_memory,
     NodeType.METRICS: metrics.run_metrics,
     NodeType.RETRIEVE: knowledge.run_retrieve,
+    NodeType.REPORT: report.run_report,
 }
 
 # 这些节点的出边由"决定"路由，不能直接连死
@@ -111,6 +112,10 @@ def _wrap(
                     # 如实发出来，只多一个已截断的值，且只有真的赋了值的节点才有。
                     vars=_vars_preview(updates),
                     artifact=artifact_id,
+                    # 这一步新记进证据台账的条目（口径卡的指标集工件等）。事件在封存范围
+                    # 内，证据接口从这里出发找工件，不去读可以事后插行的 artifacts 表。
+                    # 没产出证据的节点不带这个键，事件和以前一字不差
+                    **({"evidence": updates["evidence"]} if updates.get("evidence") else {}),
                 )
                 trail = {
                     "node_id": node.id,

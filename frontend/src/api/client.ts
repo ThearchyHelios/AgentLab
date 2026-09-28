@@ -1,7 +1,7 @@
 import type {
-  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, GraphSpec,
-  KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus, Skill, ToolChange, ToolInfo,
-  ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
+  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
+  EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus,
+  Skill, ToolChange, ToolInfo, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
 import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
@@ -666,6 +666,22 @@ export const api = {
     clusters: () => get<any>('/governance/exploratory-clusters'),
   },
   artifact: (id: string) => get<{ id: string; content: any }>(`/artifacts/${id}`),
+
+  // ---- 可点击证据 ----
+  // 只认封存范围内的事件追得到的工件（后端 api/evidence.py）。老后端没有这两个接口，调用方按 404 降级
+  evidence: {
+    /** 整次运行的证据图：模式（cited / legacy_contract / none）、封存状态、报告和证据清单 */
+    graph: (runId: string, opts?: RequestOptions) =>
+      get<EvidenceGraph>(`/runs/${encodeURIComponent(runId)}/evidence`, opts),
+    /**
+     * 点开一个片段：所在的句子、指标步骤（原式、代入式、输入、复算）、封存状态。一次运行
+     * 里有好几份报告时 report 给报告节点 id（片段 id 每份文档各自从 s0 数起），不给取成果标注的那份
+     */
+    segment: (runId: string, segmentId: string, opts?: RequestOptions & { report?: string }) =>
+      get<EvidenceSegmentDetail>(
+        `/runs/${encodeURIComponent(runId)}/evidence/segments/${encodeURIComponent(segmentId)}${qs({ report: opts?.report })}`,
+        opts),
+  },
 
   // ---- 会话 ----
   conversations: {

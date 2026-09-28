@@ -5,7 +5,7 @@ import {
 import { Link } from 'react-router-dom'
 import {
   AlertCircle, AlertTriangle, ArrowDown, Brain, ChevronRight, CircleCheck, CircleDot, CornerDownRight,
-  Database, Download, ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, Play, Settings2,
+  Database, Download, ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, ListChecks, Play, Settings2,
   ShieldCheck, Sparkles, Table2, Terminal, UserX, Users, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -15,13 +15,16 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
   childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
   type TeamRun,
 } from './decode'
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
+import { EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
+import { docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
+import type { EvidenceDocData } from '../types'
 import { useRunClock } from './useRunClock'
 import type { ReviewResult } from '../types'
 
@@ -81,6 +84,11 @@ export interface StreamTurn {
    */
   queries?: number
   runId?: string
+  /**
+   * 成果出自哪次运行：成果里的报告点开片段时按它取证据链。不给就用 runId。运行页、画布
+   * 右栏的头上已经有运行号、不给 runId（给了会在轮次头再挂一个运行链接），就给它
+   */
+  outputRun?: string
   /** formal / exploratory。出具横幅要据此标注"不进正式归档" */
   runClass?: string
   /** 这一轮建出来的图，可展开看、可放到画布 */
@@ -510,7 +518,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
 
           {turn.output && (
             <Output output={turn.output} runClass={turn.runClass} broken={broken}
-                    question={turn.question} onFollowUp={onFollowUp} />
+                    question={turn.question} onFollowUp={onFollowUp} runId={turn.outputRun ?? turn.runId} />
           )}
 
           {turn.rawOutput && (
@@ -519,7 +527,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
                 复核改写过这个答案，看改写前的原文
               </summary>
               <div className="mt-1.5">
-                <Output output={turn.rawOutput} />
+                <Output output={turn.rawOutput} runId={turn.outputRun ?? turn.runId} />
               </div>
             </details>
           )}
@@ -1897,17 +1905,29 @@ function unwrapArtifact(content: unknown): { table: Table | null; text: string; 
 // 成果
 // -------------------------------------------------------------------------
 
-function Output({ output, runClass, broken, question, onFollowUp }: {
+function Output({ output, runClass, broken, question, onFollowUp, runId }: {
   output: Record<string, any>; runClass?: string; broken?: boolean
   question?: string; onFollowUp?: (text: string) => void
+  /** 这份成果出自哪次运行：带证据的字段点开片段时按它取证据链 */
+  runId?: string
 }) {
+  const { dense } = useContext(Ctx)
   // _issuance 这类下划线开头的是内部字段，不是给人看的成果。
   // 空值也要滤掉：output 里留一个 {"result": ""} 很常见（图跑通了但出口
   // 没接上），它会渲染出一条什么都没有的分隔线——用户只会以为界面坏了
   const entries = Object.entries(output)
     .filter(([k, v]) => !k.startsWith('_') && !isBlank(v))
   const issuance = (output as any)._issuance
-  const marks = useMemo(() => marksOf(issuance), [issuance])
+  const marks = useMemo(() => issuanceMarks(issuance), [issuance])
+  // 逐字等于报告撰写节点原文的字段：换成可逐段点开的文档，其余照旧。没有 _evidence 的
+  // 成果（旧运行、没有报告节点的图）一个字段都不会进这里，渲染和以前完全一样
+  const evidence = useMemo(() => evidenceFields(output), [output])
+  const firstEvidence = entries.find(([k, v]) => evidence.has(k) && typeof v === 'string')?.[0]
+  const docRef = useRef<EvidenceDocHandle>(null)
+  // 第一份报告文档取到之后，出具横幅多一行「N/N 数字有出处 · 无证据 M」
+  const [tallyDoc, setTallyDoc] = useState<EvidenceDocData | null>(null)
+  const tally = useMemo(() => (tallyDoc ? docTally(tallyDoc) : null), [tallyDoc])
+  const banner = !!issuance?.tier
   const follow = useMemo(() => (onFollowUp ? followUpsOf(entries.map(([, v]) => v)) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [output, onFollowUp])
@@ -1915,7 +1935,16 @@ function Output({ output, runClass, broken, question, onFollowUp }: {
 
   return (
     <div className="group/answer relative mt-2 space-y-2 border-t pt-2">
-      {issuance && <IssuanceBanner issuance={issuance} runClass={runClass} />}
+      {issuance && (
+        // 成果里有报告字段就告诉横幅：正文换成了报告文档，回指不上的数字不再是 Markdown 上的
+        // 虚线（列表序号里的画不了线），而是在报告的违规清单里。文档取到后再给计数和两个动作
+        <IssuanceBanner issuance={issuance} runClass={runClass}
+                        evidence={firstEvidence ? {
+                          counts: tally ?? undefined,
+                          onNext: tally ? () => docRef.current?.next() : undefined,
+                          onList: tallyDoc?.violations?.length ? () => docRef.current?.list() : undefined,
+                        } : undefined} />
+      )}
       {broken && (
         // 复核判了不可信：答案照常给（可能有参考价值），但先说清楚它不能当结论。
         // 不降透明度——那会让它更难读，而不是更不可信
@@ -1936,7 +1965,16 @@ function Output({ output, runClass, broken, question, onFollowUp }: {
               {entries.length > 1 && (
                 <div className="mb-0.5 text-2xs font-semibold text-dim">{key}</div>
               )}
-              <OutputValue value={value} marks={marks} label={key} />
+              {evidence.has(key) && typeof value === 'string'
+                ? (
+                  <EvidenceField
+                    ref={key === firstEvidence ? docRef : undefined}
+                    artifact={evidence.get(key)!.artifact} text={value} runId={runId} dense={dense} label={key}
+                    tally={!banner}
+                    onDoc={key === firstEvidence ? setTallyDoc : undefined}
+                  />
+                )
+                : <OutputValue value={value} marks={marks} label={key} />}
             </div>
           ))}
         </div>
@@ -2028,26 +2066,6 @@ function followUpsOf(values: unknown[]): string[] {
     return out.slice(0, 3)
   }
   return []
-}
-
-/** 出具里无法回指的数字，在正文原句上画出来 */
-function marksOf(issuance: any): MarkSpec[] | undefined {
-  const unmatched: any[] = issuance?.unmatched_numbers ?? []
-  const matched: any[] = Array.isArray(issuance?.matched) ? issuance.matched : []
-  const marks: MarkSpec[] = [
-    ...unmatched.map((u) => ({
-      token: String(u?.token ?? u),
-      tone: 'warn' as const,
-      title: `这个数字在口径卡里找不到来源${u?.context ? `：「${u.context}」` : ''}`,
-    })),
-    // 后端给了逐个数字的回指（matched: [{token, metric}]）就标出来源；目前只给计数
-    ...matched.map((m) => ({
-      token: String(m?.token ?? ''),
-      tone: 'ok' as const,
-      title: `来自口径卡指标「${m?.metric ?? ''}」${m?.caliber ? ` · ${m.caliber}` : ''}`,
-    })),
-  ].filter((m) => m.token)
-  return marks.length ? marks : undefined
 }
 
 const TEXT_CAP = 3000
@@ -2158,8 +2176,13 @@ const TIER_META: Record<string, { color: string; soft: string; hint: string }> =
  * 为空」「指标集为空」这类校验根本没跑起来的缺口（gaps）一条都不显示——横幅
  * 说「请对照下方声明」，下方什么都没有。
  */
-export function IssuanceBanner({ issuance, runClass }: {
+export function IssuanceBanner({ issuance, runClass, evidence }: {
   issuance: any; runClass?: string
+  /**
+   * 成果里有报告文档时给：它的计数（文档取到之后才有）、跳到下一处无证据、打开违规清单。
+   * 给了它，正文里带证据的字段就不是 Markdown 了，「正文里已用虚线标出」不再成立
+   */
+  evidence?: { counts?: EvidenceTally; onNext?: () => void; onList?: () => void }
 }) {
   const tier = String(issuance?.tier ?? '')
   if (!tier) return null
@@ -2195,6 +2218,20 @@ export function IssuanceBanner({ issuance, runClass }: {
         </span>
       </div>
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
+      {evidence?.counts && (evidence.counts.total > 0 || evidence.counts.other > 0) && (
+        // 逐段证据的计数：和报告核对那一行、证据条同一种说法。有无证据的地方才给「定位下一处」
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
+          <span className="tnum" style={{
+            color: evidence.counts.none || evidence.counts.other ? 'var(--st-waiting)' : 'var(--st-done)' }}>
+            {evidenceTally(evidence.counts.cited, evidence.counts.total, evidence.counts.other)}
+          </span>
+          {(evidence.counts.none > 0 || evidence.counts.other > 0) && evidence.onNext && (
+            <button type="button" className="btn btn-xs" data-evidence-next="" onClick={evidence.onNext}>
+              {EVIDENCE_TEXT.locateNext}
+            </button>
+          )}
+        </div>
+      )}
 
       {!!gaps.length && (
         <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
@@ -2216,13 +2253,24 @@ export function IssuanceBanner({ issuance, runClass }: {
       )}
       {!!unmatched.length && (
         <div className="mt-1 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
-          <span>无法回指的数字（正文里已用虚线标出）：</span>
+          {/* 带报告文档时正文是 EvidenceDoc：列表序号里的数字画不了线，逐条都在违规清单里；
+              文档还没取到（或取不到）时正文是不带标记的普通文本，什么都不许诺 */}
+          <span data-unmatched-note="">
+            {!evidence ? '无法回指的数字（正文里已用虚线标出）：'
+              : evidence.onList ? EVIDENCE_TEXT.unmatchedInDoc : EVIDENCE_TEXT.unmatchedPlain}
+          </span>
           {unmatched.map((u: any, i: number) => (
             <span key={i} className="mr-1.5 inline-block" title={u?.context ? `「${u.context}」` : undefined}>
               <span className="mono tnum">{u?.token ?? String(u)}</span>
               {u?.context && <span className="text-dim">（{String(u.context).slice(0, 24)}）</span>}
             </span>
           ))}
+          {evidence?.onList && (
+            <button type="button" className="btn btn-xs btn-ghost align-middle" data-evidence-list=""
+                    onClick={evidence.onList}>
+              <ListChecks size={11} aria-hidden /> {EVIDENCE_TEXT.violations}
+            </button>
+          )}
         </div>
       )}
       {!!calibers.length && (

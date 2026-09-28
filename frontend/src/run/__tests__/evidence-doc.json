@@ -1,0 +1,2784 @@
+{
+ "_comment": "可点击证据第一期的前端夹具。由后端 evidence.py 的 compose_doc 真跑生成，只用通用示例名。",
+ "run_id": "run-evidence-demo",
+ "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e",
+ "doc": {
+  "schema": "agentlab.report/1",
+  "run_id": "run-evidence-demo",
+  "node_id": "write",
+  "markdown": "## 本周概览 📊\n\n本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。\n\n增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。\n\n## 退款\n\n退款率 2.35%，统计口径是 `refunds` 表里本周发生的退款单。新增用户 —。\n\n- 华东区域销售额 ⟦?v:Q1.r0.amount⟧\n- 小额退款 ⟦?m:small_refund⟧\n  - 其余渠道合计 3 笔\n\n| 指标 | 本周 |\n|---|---|\n| 销售额 | 45,678.5元 |\n| 订单数 | 1,234单 |\n\n100. 附注：以上按周报口径统计",
+  "source": "## 本周概览 📊\n\n本周（[[i:week]]）销售额 [[m:gmv]]，环比 [[m:wow]]；订单 [[m:orders]]，客单价 **[[m:aov]]**。[[see:m:gmv,m:wow,m:orders,m:aov]]\n\n增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。\n\n## 退款\n\n退款率 [[m:refund_rate]]，统计口径是 `refunds` 表里本周发生的退款单。新增用户 [[m:new_users]]。\n\n- 华东区域销售额 [[v:Q1.r0.amount]]\n- 小额退款 [[m:small_refund]]\n  - 其余渠道合计 3 笔\n\n| 指标 | 本周 |\n|---|---|\n| 销售额 | [[m:gmv]] |\n| 订单数 | [[m:orders]] |\n\n100. 附注：以上按周报口径统计",
+  "catalog": {
+   "m:gmv": {
+    "alias": "m:gmv",
+    "kind": "metric",
+    "eid": "ev:metric:f60c701e9c49d5f9",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "gmv"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "销售额",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 45678.5,
+    "status": "ok",
+    "rendered": "45,678.5元",
+    "label": "销售额 = 45,678.5元"
+   },
+   "m:gmv_prev": {
+    "alias": "m:gmv_prev",
+    "kind": "metric",
+    "eid": "ev:metric:d9e9c062d3f1be97",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "gmv_prev"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "上周销售额",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 42010.0,
+    "status": "ok",
+    "rendered": "42,010.0元",
+    "label": "上周销售额 = 42,010.0元"
+   },
+   "m:wow": {
+    "alias": "m:wow",
+    "kind": "metric",
+    "eid": "ev:metric:ab46bcc0db93e4fb",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "wow"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "环比增幅",
+    "unit": "%",
+    "decimals": 1,
+    "format": "plain",
+    "value": 8.7,
+    "status": "ok",
+    "rendered": "8.7%",
+    "label": "环比增幅 = 8.7%"
+   },
+   "m:orders": {
+    "alias": "m:orders",
+    "kind": "metric",
+    "eid": "ev:metric:2f935b615dbc6381",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "orders"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "订单数",
+    "unit": "单",
+    "decimals": 0,
+    "format": "thousands",
+    "value": 1234,
+    "status": "ok",
+    "rendered": "1,234单",
+    "label": "订单数 = 1,234单"
+   },
+   "m:aov": {
+    "alias": "m:aov",
+    "kind": "metric",
+    "eid": "ev:metric:cdc765917d78ef4b",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "aov"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "客单价",
+    "unit": "元",
+    "decimals": 1,
+    "format": "thousands",
+    "value": 37.0,
+    "status": "ok",
+    "rendered": "37.0元",
+    "label": "客单价 = 37.0元"
+   },
+   "m:refund_rate": {
+    "alias": "m:refund_rate",
+    "kind": "metric",
+    "eid": "ev:metric:199853e026f412ca",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "refund_rate"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "退款率",
+    "unit": "",
+    "decimals": 4,
+    "format": "percent_of_ratio",
+    "value": 0.0235,
+    "status": "ok",
+    "rendered": "2.35%",
+    "label": "退款率 = 2.35%"
+   },
+   "m:new_users": {
+    "alias": "m:new_users",
+    "kind": "metric",
+    "eid": "ev:metric:e1bd2d529b6c2a6b",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "new_users"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "新增用户",
+    "unit": "人",
+    "decimals": 0,
+    "format": "thousands",
+    "value": null,
+    "status": "missing_input",
+    "rendered": "—",
+    "label": "新增用户 = —"
+   },
+   "m:small_refund": {
+    "alias": "m:small_refund",
+    "kind": "metric",
+    "eid": "ev:metric:9e2cf63ff0317f0c",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "locator": {
+     "metric": "small_refund"
+    },
+    "caliber": "周报口径",
+    "version": "v2",
+    "name": "小额退款",
+    "unit": "元",
+    "decimals": -2,
+    "format": "thousands",
+    "value": 29,
+    "status": "ok",
+    "rendered": "—",
+    "label": "小额退款 = —"
+   },
+   "i:week": {
+    "alias": "i:week",
+    "kind": "input",
+    "eid": "ev:input:a398c5e60abfeedd",
+    "locator": {
+     "field": "week"
+    },
+    "value": "2026-W37",
+    "rendered": "2026-W37",
+    "label": "week = 2026-W37"
+   }
+  },
+  "blocks": [
+   {
+    "type": "heading",
+    "level": 2,
+    "units": [
+     {
+      "id": "u0",
+      "kind": "heading",
+      "span": [
+       3,
+       9
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "## ",
+        "state": "neutral",
+        "span": [
+         0,
+         3
+        ],
+        "id": "s0"
+       },
+       {
+        "kind": "text",
+        "text": "本周概览 📊",
+        "state": "neutral",
+        "span": [
+         3,
+         9
+        ],
+        "id": "s1"
+       }
+      ]
+     }
+    ],
+    "id": "b0"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u1",
+      "kind": "claim",
+      "span": [
+       11,
+       65
+      ],
+      "cites": [
+       "i:week",
+       "m:gmv",
+       "m:wow",
+       "m:orders",
+       "m:aov"
+      ],
+      "see": [
+       {
+        "ref": "m:gmv",
+        "role": "support",
+        "alias": "m:gmv",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:f60c701e9c49d5f9",
+        "locator": {
+         "metric": "gmv"
+        }
+       },
+       {
+        "ref": "m:wow",
+        "role": "support",
+        "alias": "m:wow",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:ab46bcc0db93e4fb",
+        "locator": {
+         "metric": "wow"
+        }
+       },
+       {
+        "ref": "m:orders",
+        "role": "support",
+        "alias": "m:orders",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:2f935b615dbc6381",
+        "locator": {
+         "metric": "orders"
+        }
+       },
+       {
+        "ref": "m:aov",
+        "role": "support",
+        "alias": "m:aov",
+        "kind": "metric",
+        "status": "resolved",
+        "eid": "ev:metric:cdc765917d78ef4b",
+        "locator": {
+         "metric": "aov"
+        }
+       }
+      ],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         9,
+         11
+        ],
+        "id": "s2"
+       },
+       {
+        "kind": "text",
+        "text": "本周（",
+        "state": "neutral",
+        "span": [
+         11,
+         14
+        ],
+        "id": "s3"
+       },
+       {
+        "kind": "value",
+        "text": "2026-W37",
+        "ref": "i:week",
+        "cite": {
+         "ref": "week",
+         "alias": "i:week",
+         "locator": {
+          "field": "week"
+         },
+         "eid": "ev:input:a398c5e60abfeedd",
+         "kind": "input",
+         "role": "value",
+         "status": "resolved",
+         "value": "2026-W37",
+         "rendered": "2026-W37"
+        },
+        "state": "deterministic",
+        "span": [
+         14,
+         22
+        ],
+        "id": "s4"
+       },
+       {
+        "kind": "text",
+        "text": "）销售额 ",
+        "state": "neutral",
+        "span": [
+         22,
+         27
+        ],
+        "id": "s5"
+       },
+       {
+        "kind": "number",
+        "text": "45,678.5元",
+        "ref": "m:gmv",
+        "cite": {
+         "ref": "gmv",
+         "alias": "m:gmv",
+         "locator": {
+          "metric": "gmv"
+         },
+         "eid": "ev:metric:f60c701e9c49d5f9",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 45678.5,
+         "rendered": "45,678.5元"
+        },
+        "state": "deterministic",
+        "span": [
+         27,
+         36
+        ],
+        "id": "s6"
+       },
+       {
+        "kind": "text",
+        "text": "，环比 ",
+        "state": "neutral",
+        "span": [
+         36,
+         40
+        ],
+        "id": "s7"
+       },
+       {
+        "kind": "number",
+        "text": "8.7%",
+        "ref": "m:wow",
+        "cite": {
+         "ref": "wow",
+         "alias": "m:wow",
+         "locator": {
+          "metric": "wow"
+         },
+         "eid": "ev:metric:ab46bcc0db93e4fb",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 8.7,
+         "rendered": "8.7%"
+        },
+        "state": "deterministic",
+        "span": [
+         40,
+         44
+        ],
+        "id": "s8"
+       },
+       {
+        "kind": "text",
+        "text": "；订单 ",
+        "state": "neutral",
+        "span": [
+         44,
+         48
+        ],
+        "id": "s9"
+       },
+       {
+        "kind": "number",
+        "text": "1,234单",
+        "ref": "m:orders",
+        "cite": {
+         "ref": "orders",
+         "alias": "m:orders",
+         "locator": {
+          "metric": "orders"
+         },
+         "eid": "ev:metric:2f935b615dbc6381",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 1234,
+         "rendered": "1,234单"
+        },
+        "state": "deterministic",
+        "span": [
+         48,
+         54
+        ],
+        "id": "s10"
+       },
+       {
+        "kind": "text",
+        "text": "，客单价 ",
+        "state": "neutral",
+        "span": [
+         54,
+         59
+        ],
+        "id": "s11"
+       },
+       {
+        "kind": "number",
+        "text": "37.0元",
+        "ref": "m:aov",
+        "cite": {
+         "ref": "aov",
+         "alias": "m:aov",
+         "locator": {
+          "metric": "aov"
+         },
+         "eid": "ev:metric:cdc765917d78ef4b",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 37.0,
+         "rendered": "37.0元"
+        },
+        "state": "deterministic",
+        "strong": true,
+        "span": [
+         59,
+         64
+        ],
+        "id": "s12"
+       },
+       {
+        "kind": "text",
+        "text": "。",
+        "state": "neutral",
+        "span": [
+         64,
+         65
+        ],
+        "id": "s13"
+       }
+      ]
+     }
+    ],
+    "id": "b1"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u2",
+      "kind": "claim",
+      "span": [
+       67,
+       89
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         65,
+         67
+        ],
+        "id": "s14"
+       },
+       {
+        "kind": "text",
+        "text": "增长主要来自新客首单，新客贡献了 ",
+        "span": [
+         67,
+         84
+        ],
+        "state": "neutral",
+        "id": "s15"
+       },
+       {
+        "kind": "number",
+        "text": "12",
+        "span": [
+         84,
+         86
+        ],
+        "state": "none",
+        "issue": "uncited_number",
+        "id": "s16"
+       },
+       {
+        "kind": "text",
+        "text": " 单。",
+        "span": [
+         86,
+         89
+        ],
+        "state": "neutral",
+        "id": "s17"
+       }
+      ]
+     },
+     {
+      "id": "u3",
+      "kind": "connective",
+      "span": [
+       89,
+       97
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "text",
+        "text": "下面看退款情况。",
+        "state": "neutral",
+        "span": [
+         89,
+         97
+        ],
+        "id": "s18"
+       }
+      ]
+     }
+    ],
+    "id": "b2"
+   },
+   {
+    "type": "heading",
+    "level": 2,
+    "units": [
+     {
+      "id": "u4",
+      "kind": "heading",
+      "span": [
+       102,
+       104
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n## ",
+        "state": "neutral",
+        "span": [
+         97,
+         102
+        ],
+        "id": "s19"
+       },
+       {
+        "kind": "text",
+        "text": "退款",
+        "state": "neutral",
+        "span": [
+         102,
+         104
+        ],
+        "id": "s20"
+       }
+      ]
+     }
+    ],
+    "id": "b3"
+   },
+   {
+    "type": "paragraph",
+    "units": [
+     {
+      "id": "u5",
+      "kind": "claim",
+      "span": [
+       106,
+       143
+      ],
+      "cites": [
+       "m:refund_rate"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n",
+        "state": "neutral",
+        "span": [
+         104,
+         106
+        ],
+        "id": "s21"
+       },
+       {
+        "kind": "text",
+        "text": "退款率 ",
+        "state": "neutral",
+        "span": [
+         106,
+         110
+        ],
+        "id": "s22"
+       },
+       {
+        "kind": "number",
+        "text": "2.35%",
+        "ref": "m:refund_rate",
+        "cite": {
+         "ref": "refund_rate",
+         "alias": "m:refund_rate",
+         "locator": {
+          "metric": "refund_rate"
+         },
+         "eid": "ev:metric:199853e026f412ca",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 0.0235,
+         "rendered": "2.35%"
+        },
+        "state": "deterministic",
+        "span": [
+         110,
+         115
+        ],
+        "id": "s23"
+       },
+       {
+        "kind": "text",
+        "text": "，统计口径是 `refunds` 表里本周发生的退款单。",
+        "state": "neutral",
+        "span": [
+         115,
+         143
+        ],
+        "id": "s24"
+       }
+      ]
+     },
+     {
+      "id": "u6",
+      "kind": "claim",
+      "span": [
+       143,
+       150
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "text",
+        "text": "新增用户 ",
+        "state": "neutral",
+        "span": [
+         143,
+         148
+        ],
+        "id": "s25"
+       },
+       {
+        "kind": "number",
+        "text": "—",
+        "ref": "m:new_users",
+        "cite": {
+         "ref": "new_users",
+         "alias": "m:new_users",
+         "kind": "metric",
+         "role": "value",
+         "status": "unresolved",
+         "reason": "指标「新增用户」这次没有值（缺输入），不能写进报告",
+         "rendered": "—"
+        },
+        "state": "none",
+        "issue": "unresolved_ref",
+        "span": [
+         148,
+         149
+        ],
+        "id": "s26"
+       },
+       {
+        "kind": "text",
+        "text": "。",
+        "state": "neutral",
+        "span": [
+         149,
+         150
+        ],
+        "id": "s27"
+       }
+      ]
+     }
+    ],
+    "id": "b4"
+   },
+   {
+    "type": "list",
+    "ordered": false,
+    "units": [
+     {
+      "id": "u7",
+      "kind": "claim",
+      "span": [
+       154,
+       179
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n- ",
+        "state": "neutral",
+        "span": [
+         150,
+         154
+        ],
+        "id": "s28"
+       },
+       {
+        "kind": "text",
+        "text": "华东区域销售额 ",
+        "state": "neutral",
+        "span": [
+         154,
+         162
+        ],
+        "id": "s29"
+       },
+       {
+        "kind": "value",
+        "text": "⟦?v:Q1.r0.amount⟧",
+        "ref": "v:Q1.r0.amount",
+        "cite": {
+         "ref": "Q1.r0.amount",
+         "alias": "Q1",
+         "kind": "cell",
+         "role": "value",
+         "status": "unresolved",
+         "reason": "这种引用在后续版本支持",
+         "rendered": "⟦?v:Q1.r0.amount⟧"
+        },
+        "state": "none",
+        "issue": "unresolved_ref",
+        "span": [
+         162,
+         179
+        ],
+        "id": "s30"
+       }
+      ],
+      "depth": 0
+     },
+     {
+      "id": "u8",
+      "kind": "claim",
+      "span": [
+       182,
+       204
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n- ",
+        "state": "neutral",
+        "span": [
+         179,
+         182
+        ],
+        "id": "s31"
+       },
+       {
+        "kind": "text",
+        "text": "小额退款 ",
+        "state": "neutral",
+        "span": [
+         182,
+         187
+        ],
+        "id": "s32"
+       },
+       {
+        "kind": "number",
+        "text": "⟦?m:small_refund⟧",
+        "ref": "m:small_refund",
+        "cite": {
+         "ref": "small_refund",
+         "alias": "m:small_refund",
+         "kind": "metric",
+         "role": "value",
+         "status": "unresolved",
+         "reason": "29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+         "rendered": "⟦?m:small_refund⟧"
+        },
+        "state": "none",
+        "issue": "unresolved_ref",
+        "span": [
+         187,
+         204
+        ],
+        "id": "s33"
+       }
+      ],
+      "depth": 0
+     },
+     {
+      "id": "u9",
+      "kind": "claim",
+      "span": [
+       209,
+       219
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n  - ",
+        "state": "neutral",
+        "span": [
+         204,
+         209
+        ],
+        "id": "s34"
+       },
+       {
+        "kind": "text",
+        "text": "其余渠道合计 ",
+        "span": [
+         209,
+         216
+        ],
+        "state": "neutral",
+        "id": "s35"
+       },
+       {
+        "kind": "number",
+        "text": "3",
+        "span": [
+         216,
+         217
+        ],
+        "state": "none",
+        "issue": "uncited_number",
+        "id": "s36"
+       },
+       {
+        "kind": "text",
+        "text": " 笔",
+        "span": [
+         217,
+         219
+        ],
+        "state": "neutral",
+        "id": "s37"
+       }
+      ],
+      "depth": 1
+     }
+    ],
+    "id": "b5"
+   },
+   {
+    "type": "table",
+    "units": [
+     {
+      "id": "u10",
+      "kind": "connective",
+      "span": [
+       223,
+       225
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": "\n\n| ",
+        "state": "neutral",
+        "span": [
+         219,
+         223
+        ],
+        "id": "s38"
+       },
+       {
+        "kind": "text",
+        "text": "指标",
+        "state": "neutral",
+        "span": [
+         223,
+         225
+        ],
+        "id": "s39"
+       }
+      ],
+      "loc": {
+       "row": -1,
+       "col": 0
+      }
+     },
+     {
+      "id": "u11",
+      "kind": "connective",
+      "span": [
+       228,
+       230
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         225,
+         228
+        ],
+        "id": "s40"
+       },
+       {
+        "kind": "text",
+        "text": "本周",
+        "state": "neutral",
+        "span": [
+         228,
+         230
+        ],
+        "id": "s41"
+       }
+      ],
+      "loc": {
+       "row": -1,
+       "col": 1
+      }
+     },
+     {
+      "id": "u12",
+      "kind": "connective",
+      "span": [
+       245,
+       248
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n|---|---|\n| ",
+        "state": "neutral",
+        "span": [
+         230,
+         245
+        ],
+        "id": "s42"
+       },
+       {
+        "kind": "text",
+        "text": "销售额",
+        "state": "neutral",
+        "span": [
+         245,
+         248
+        ],
+        "id": "s43"
+       }
+      ],
+      "loc": {
+       "row": 0,
+       "col": 0
+      }
+     },
+     {
+      "id": "u13",
+      "kind": "claim",
+      "span": [
+       251,
+       260
+      ],
+      "cites": [
+       "m:gmv"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         248,
+         251
+        ],
+        "id": "s44"
+       },
+       {
+        "kind": "number",
+        "text": "45,678.5元",
+        "ref": "m:gmv",
+        "cite": {
+         "ref": "gmv",
+         "alias": "m:gmv",
+         "locator": {
+          "metric": "gmv"
+         },
+         "eid": "ev:metric:f60c701e9c49d5f9",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 45678.5,
+         "rendered": "45,678.5元"
+        },
+        "state": "deterministic",
+        "span": [
+         251,
+         260
+        ],
+        "id": "s45"
+       }
+      ],
+      "loc": {
+       "row": 0,
+       "col": 1
+      }
+     },
+     {
+      "id": "u14",
+      "kind": "connective",
+      "span": [
+       265,
+       268
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n| ",
+        "state": "neutral",
+        "span": [
+         260,
+         265
+        ],
+        "id": "s46"
+       },
+       {
+        "kind": "text",
+        "text": "订单数",
+        "state": "neutral",
+        "span": [
+         265,
+         268
+        ],
+        "id": "s47"
+       }
+      ],
+      "loc": {
+       "row": 1,
+       "col": 0
+      }
+     },
+     {
+      "id": "u15",
+      "kind": "claim",
+      "span": [
+       271,
+       277
+      ],
+      "cites": [
+       "m:orders"
+      ],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " | ",
+        "state": "neutral",
+        "span": [
+         268,
+         271
+        ],
+        "id": "s48"
+       },
+       {
+        "kind": "number",
+        "text": "1,234单",
+        "ref": "m:orders",
+        "cite": {
+         "ref": "orders",
+         "alias": "m:orders",
+         "locator": {
+          "metric": "orders"
+         },
+         "eid": "ev:metric:2f935b615dbc6381",
+         "kind": "metric",
+         "role": "value",
+         "status": "resolved",
+         "value": 1234,
+         "rendered": "1,234单"
+        },
+        "state": "deterministic",
+        "span": [
+         271,
+         277
+        ],
+        "id": "s49"
+       }
+      ],
+      "loc": {
+       "row": 1,
+       "col": 1
+      }
+     }
+    ],
+    "id": "b6"
+   },
+   {
+    "type": "list",
+    "ordered": true,
+    "start": 100,
+    "units": [
+     {
+      "id": "u16",
+      "kind": "connective",
+      "span": [
+       286,
+       298
+      ],
+      "cites": [],
+      "see": [],
+      "segments": [
+       {
+        "kind": "structural",
+        "text": " |\n\n100. ",
+        "state": "neutral",
+        "span": [
+         277,
+         286
+        ],
+        "id": "s50"
+       },
+       {
+        "kind": "text",
+        "text": "附注：以上按周报口径统计",
+        "state": "neutral",
+        "span": [
+         286,
+         298
+        ],
+        "id": "s51"
+       }
+      ],
+      "depth": 0
+     }
+    ],
+    "id": "b7"
+   }
+  ],
+  "stats": {
+   "units": 17,
+   "segments": 52,
+   "claims": 9,
+   "connective": 6,
+   "headings": 2,
+   "numbers": 12,
+   "numbers_cited": 7,
+   "values": 1,
+   "uncited_numbers": 3,
+   "unresolved": 3,
+   "see": 4,
+   "uncited_claims": 5,
+   "violations": 6
+  },
+  "violations": [
+   {
+    "code": "uncited_number",
+    "message": "数字「12」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     84,
+     86
+    ],
+    "text": "12",
+    "context": " 增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。  ## 退款",
+    "segment": "s16",
+    "unit": "u2"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:new_users]] 解析不了：指标「新增用户」这次没有值（缺输入），不能写进报告",
+    "ref": "m:new_users",
+    "span": [
+     148,
+     149
+    ],
+    "text": "—",
+    "segment": "s26",
+    "unit": "u6"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[v:Q1.r0.amount]] 解析不了：这种引用在后续版本支持",
+    "ref": "v:Q1.r0.amount",
+    "span": [
+     162,
+     179
+    ],
+    "text": "⟦?v:Q1.r0.amount⟧",
+    "segment": "s30",
+    "unit": "u7"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:small_refund]] 解析不了：29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+    "ref": "m:small_refund",
+    "span": [
+     187,
+     204
+    ],
+    "text": "⟦?m:small_refund⟧",
+    "segment": "s33",
+    "unit": "u8"
+   },
+   {
+    "code": "uncited_number",
+    "message": "数字「3」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     216,
+     217
+    ],
+    "text": "3",
+    "context": "efund⟧   - 其余渠道合计 3 笔  | 指标 | 本周 | |-",
+    "segment": "s36",
+    "unit": "u9"
+   },
+   {
+    "code": "uncited_number",
+    "message": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     281,
+     284
+    ],
+    "text": "100",
+    "context": "| 订单数 | 1,234单 |  100. 附注：以上按周报口径统计",
+    "segment": "s50",
+    "unit": "u16"
+   }
+  ]
+ },
+ "graph": {
+  "run_id": "run-evidence-demo",
+  "schema": "agentlab.evidence/1",
+  "mode": "cited",
+  "seal": {
+   "sealed": true,
+   "ok": true,
+   "manifest_seq": 48,
+   "legacy": false
+  },
+  "reports": [
+   {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e",
+    "doc_sealed": true,
+    "fields": [
+     "周报"
+    ],
+    "stats": {
+     "units": 17,
+     "segments": 52,
+     "claims": 9,
+     "connective": 6,
+     "headings": 2,
+     "numbers": 12,
+     "numbers_cited": 7,
+     "values": 1,
+     "uncited_numbers": 3,
+     "unresolved": 3,
+     "see": 4,
+     "uncited_claims": 5,
+     "violations": 6
+    }
+   }
+  ],
+  "evidence": [
+   {
+    "alias": "m:gmv",
+    "eid": "ev:metric:f60c701e9c49d5f9",
+    "kind": "metric",
+    "label": "销售额 = 45,678.5元",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s6",
+     "s45"
+    ]
+   },
+   {
+    "alias": "m:gmv_prev",
+    "eid": "ev:metric:d9e9c062d3f1be97",
+    "kind": "metric",
+    "label": "上周销售额 = 42,010.0元",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": []
+   },
+   {
+    "alias": "m:wow",
+    "eid": "ev:metric:ab46bcc0db93e4fb",
+    "kind": "metric",
+    "label": "环比增幅 = 8.7%",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s8"
+    ]
+   },
+   {
+    "alias": "m:orders",
+    "eid": "ev:metric:2f935b615dbc6381",
+    "kind": "metric",
+    "label": "订单数 = 1,234单",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s10",
+     "s49"
+    ]
+   },
+   {
+    "alias": "m:aov",
+    "eid": "ev:metric:cdc765917d78ef4b",
+    "kind": "metric",
+    "label": "客单价 = 37.0元",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s12"
+    ]
+   },
+   {
+    "alias": "m:refund_rate",
+    "eid": "ev:metric:199853e026f412ca",
+    "kind": "metric",
+    "label": "退款率 = 2.35%",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s23"
+    ]
+   },
+   {
+    "alias": "m:new_users",
+    "eid": "ev:metric:e1bd2d529b6c2a6b",
+    "kind": "metric",
+    "label": "新增用户 = —",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s26"
+    ]
+   },
+   {
+    "alias": "m:small_refund",
+    "eid": "ev:metric:9e2cf63ff0317f0c",
+    "kind": "metric",
+    "label": "小额退款 = —",
+    "node_id": "caliber",
+    "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+    "sealed": true,
+    "cited_by": [
+     "s33"
+    ]
+   },
+   {
+    "alias": "i:week",
+    "eid": "ev:input:a398c5e60abfeedd",
+    "kind": "input",
+    "label": "week = 2026-W37",
+    "node_id": null,
+    "artifact": null,
+    "sealed": true,
+    "cited_by": [
+     "s4"
+    ]
+   }
+  ],
+  "edges": []
+ },
+ "segments": {
+  "s4": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s4",
+    "text": "2026-W37",
+    "kind": "value",
+    "state": "deterministic",
+    "span": [
+     14,
+     22
+    ],
+    "unit": "u1",
+    "ref": "i:week",
+    "cite": {
+     "ref": "week",
+     "alias": "i:week",
+     "locator": {
+      "field": "week"
+     },
+     "eid": "ev:input:a398c5e60abfeedd",
+     "kind": "input",
+     "role": "value",
+     "status": "resolved",
+     "value": "2026-W37",
+     "rendered": "2026-W37"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。",
+    "span": [
+     11,
+     65
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:wow",
+     "m:orders",
+     "m:aov"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "run_input",
+     "alias": "i:week",
+     "field": "week",
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "eid_ok": true,
+     "node_id": "in",
+     "sealed": true
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s6": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s6",
+    "text": "45,678.5元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     27,
+     36
+    ],
+    "unit": "u1",
+    "ref": "m:gmv",
+    "cite": {
+     "ref": "gmv",
+     "alias": "m:gmv",
+     "locator": {
+      "metric": "gmv"
+     },
+     "eid": "ev:metric:f60c701e9c49d5f9",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 45678.5,
+     "rendered": "45,678.5元"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。",
+    "span": [
+     11,
+     65
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:wow",
+     "m:orders",
+     "m:aov"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:gmv",
+     "metric": "gmv",
+     "name": "销售额",
+     "value": 45678.5,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "45,678.5元",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "vars.kpi.gmv",
+     "substituted": "45678.5",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:f60c701e9c49d5f9",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s8": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s8",
+    "text": "8.7%",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     40,
+     44
+    ],
+    "unit": "u1",
+    "ref": "m:wow",
+    "cite": {
+     "ref": "wow",
+     "alias": "m:wow",
+     "locator": {
+      "metric": "wow"
+     },
+     "eid": "ev:metric:ab46bcc0db93e4fb",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 8.7,
+     "rendered": "8.7%"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。",
+    "span": [
+     11,
+     65
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:wow",
+     "m:orders",
+     "m:aov"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:wow",
+     "metric": "wow",
+     "name": "环比增幅",
+     "value": 8.7,
+     "unit": "%",
+     "decimals": 1,
+     "format": "plain",
+     "conv": null,
+     "rendered": "8.7%",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1)",
+     "substituted": "round((45678.5 - 42010.0) / 42010.0 * 100, 1)",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:ab46bcc0db93e4fb",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv_prev",
+     "value": 42010.0,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s10": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s10",
+    "text": "1,234单",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     48,
+     54
+    ],
+    "unit": "u1",
+    "ref": "m:orders",
+    "cite": {
+     "ref": "orders",
+     "alias": "m:orders",
+     "locator": {
+      "metric": "orders"
+     },
+     "eid": "ev:metric:2f935b615dbc6381",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 1234,
+     "rendered": "1,234单"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。",
+    "span": [
+     11,
+     65
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:wow",
+     "m:orders",
+     "m:aov"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:orders",
+     "metric": "orders",
+     "name": "订单数",
+     "value": 1234,
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "1,234单",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "vars.kpi.order_cnt",
+     "substituted": "1234",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:2f935b615dbc6381",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s12": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s12",
+    "text": "37.0元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     59,
+     64
+    ],
+    "unit": "u1",
+    "ref": "m:aov",
+    "strong": true,
+    "cite": {
+     "ref": "aov",
+     "alias": "m:aov",
+     "locator": {
+      "metric": "aov"
+     },
+     "eid": "ev:metric:cdc765917d78ef4b",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 37.0,
+     "rendered": "37.0元"
+    }
+   },
+   "unit": {
+    "id": "u1",
+    "kind": "claim",
+    "text": "本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。",
+    "span": [
+     11,
+     65
+    ],
+    "cites": [
+     "i:week",
+     "m:gmv",
+     "m:wow",
+     "m:orders",
+     "m:aov"
+    ]
+   },
+   "block": {
+    "id": "b1",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:aov",
+     "metric": "aov",
+     "name": "客单价",
+     "value": 37.0,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "37.0元",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "round(vars.kpi.gmv / vars.kpi.order_cnt, 1)",
+     "substituted": "round(45678.5 / 1234, 1)",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:cdc765917d78ef4b",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s16": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s16",
+    "text": "12",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     84,
+     86
+    ],
+    "unit": "u2",
+    "issue": "uncited_number"
+   },
+   "unit": {
+    "id": "u2",
+    "kind": "claim",
+    "text": "增长主要来自新客首单，新客贡献了 12 单。",
+    "span": [
+     67,
+     89
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b2",
+    "type": "paragraph"
+   },
+   "chain": [],
+   "note": "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它",
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「12」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      84,
+      86
+     ],
+     "text": "12",
+     "context": " 增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。  ## 退款",
+     "segment": "s16",
+     "unit": "u2"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s23": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s23",
+    "text": "2.35%",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     110,
+     115
+    ],
+    "unit": "u5",
+    "ref": "m:refund_rate",
+    "cite": {
+     "ref": "refund_rate",
+     "alias": "m:refund_rate",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "eid": "ev:metric:199853e026f412ca",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 0.0235,
+     "rendered": "2.35%"
+    }
+   },
+   "unit": {
+    "id": "u5",
+    "kind": "claim",
+    "text": "退款率 2.35%，统计口径是 `refunds` 表里本周发生的退款单。",
+    "span": [
+     106,
+     143
+    ],
+    "cites": [
+     "m:refund_rate"
+    ]
+   },
+   "block": {
+    "id": "b4",
+    "type": "paragraph"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:refund_rate",
+     "metric": "refund_rate",
+     "name": "退款率",
+     "value": 0.0235,
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "conv": null,
+     "rendered": "2.35%",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "vars.kpi.refund_cnt / vars.kpi.order_cnt",
+     "substituted": "29 / 1234",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:199853e026f412ca",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.refund_cnt",
+     "value": 29,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s26": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s26",
+    "text": "—",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     148,
+     149
+    ],
+    "unit": "u6",
+    "ref": "m:new_users",
+    "issue": "unresolved_ref",
+    "cite": {
+     "ref": "new_users",
+     "alias": "m:new_users",
+     "kind": "metric",
+     "role": "value",
+     "status": "unresolved",
+     "reason": "指标「新增用户」这次没有值（缺输入），不能写进报告",
+     "rendered": "—"
+    }
+   },
+   "unit": {
+    "id": "u6",
+    "kind": "claim",
+    "text": "新增用户 —。",
+    "span": [
+     143,
+     150
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b4",
+    "type": "paragraph"
+   },
+   "chain": [],
+   "note": "引用解析不了：指标「新增用户」这次没有值（缺输入），不能写进报告",
+   "violations": [
+    {
+     "code": "unresolved_ref",
+     "message": "引用 [[m:new_users]] 解析不了：指标「新增用户」这次没有值（缺输入），不能写进报告",
+     "ref": "m:new_users",
+     "span": [
+      148,
+      149
+     ],
+     "text": "—",
+     "segment": "s26",
+     "unit": "u6"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s30": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s30",
+    "text": "⟦?v:Q1.r0.amount⟧",
+    "kind": "value",
+    "state": "none",
+    "span": [
+     162,
+     179
+    ],
+    "unit": "u7",
+    "ref": "v:Q1.r0.amount",
+    "issue": "unresolved_ref",
+    "cite": {
+     "ref": "Q1.r0.amount",
+     "alias": "Q1",
+     "kind": "cell",
+     "role": "value",
+     "status": "unresolved",
+     "reason": "这种引用在后续版本支持",
+     "rendered": "⟦?v:Q1.r0.amount⟧"
+    }
+   },
+   "unit": {
+    "id": "u7",
+    "kind": "claim",
+    "text": "华东区域销售额 ⟦?v:Q1.r0.amount⟧",
+    "span": [
+     154,
+     179
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b5",
+    "type": "list"
+   },
+   "chain": [],
+   "note": "引用解析不了：这种引用在后续版本支持",
+   "violations": [
+    {
+     "code": "unresolved_ref",
+     "message": "引用 [[v:Q1.r0.amount]] 解析不了：这种引用在后续版本支持",
+     "ref": "v:Q1.r0.amount",
+     "span": [
+      162,
+      179
+     ],
+     "text": "⟦?v:Q1.r0.amount⟧",
+     "segment": "s30",
+     "unit": "u7"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s33": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s33",
+    "text": "⟦?m:small_refund⟧",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     187,
+     204
+    ],
+    "unit": "u8",
+    "ref": "m:small_refund",
+    "issue": "unresolved_ref",
+    "cite": {
+     "ref": "small_refund",
+     "alias": "m:small_refund",
+     "kind": "metric",
+     "role": "value",
+     "status": "unresolved",
+     "reason": "29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+     "rendered": "⟦?m:small_refund⟧"
+    }
+   },
+   "unit": {
+    "id": "u8",
+    "kind": "claim",
+    "text": "小额退款 ⟦?m:small_refund⟧",
+    "span": [
+     182,
+     204
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b5",
+    "type": "list"
+   },
+   "chain": [],
+   "note": "引用解析不了：29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+   "violations": [
+    {
+     "code": "unresolved_ref",
+     "message": "引用 [[m:small_refund]] 解析不了：29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+     "ref": "m:small_refund",
+     "span": [
+      187,
+      204
+     ],
+     "text": "⟦?m:small_refund⟧",
+     "segment": "s33",
+     "unit": "u8"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s36": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s36",
+    "text": "3",
+    "kind": "number",
+    "state": "none",
+    "span": [
+     216,
+     217
+    ],
+    "unit": "u9",
+    "issue": "uncited_number"
+   },
+   "unit": {
+    "id": "u9",
+    "kind": "claim",
+    "text": "其余渠道合计 3 笔",
+    "span": [
+     209,
+     219
+    ],
+    "cites": []
+   },
+   "block": {
+    "id": "b5",
+    "type": "list"
+   },
+   "chain": [],
+   "note": "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它",
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「3」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      216,
+      217
+     ],
+     "text": "3",
+     "context": "efund⟧   - 其余渠道合计 3 笔  | 指标 | 本周 | |-",
+     "segment": "s36",
+     "unit": "u9"
+    }
+   ],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s45": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s45",
+    "text": "45,678.5元",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     251,
+     260
+    ],
+    "unit": "u13",
+    "ref": "m:gmv",
+    "cite": {
+     "ref": "gmv",
+     "alias": "m:gmv",
+     "locator": {
+      "metric": "gmv"
+     },
+     "eid": "ev:metric:f60c701e9c49d5f9",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 45678.5,
+     "rendered": "45,678.5元"
+    }
+   },
+   "unit": {
+    "id": "u13",
+    "kind": "claim",
+    "text": "45,678.5元",
+    "span": [
+     251,
+     260
+    ],
+    "cites": [
+     "m:gmv"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:gmv",
+     "metric": "gmv",
+     "name": "销售额",
+     "value": 45678.5,
+     "unit": "元",
+     "decimals": 1,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "45,678.5元",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "vars.kpi.gmv",
+     "substituted": "45678.5",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:f60c701e9c49d5f9",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.gmv",
+     "value": 45678.5,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  },
+  "s49": {
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "segment": {
+    "id": "s49",
+    "text": "1,234单",
+    "kind": "number",
+    "state": "deterministic",
+    "span": [
+     271,
+     277
+    ],
+    "unit": "u15",
+    "ref": "m:orders",
+    "cite": {
+     "ref": "orders",
+     "alias": "m:orders",
+     "locator": {
+      "metric": "orders"
+     },
+     "eid": "ev:metric:2f935b615dbc6381",
+     "kind": "metric",
+     "role": "value",
+     "status": "resolved",
+     "value": 1234,
+     "rendered": "1,234单"
+    }
+   },
+   "unit": {
+    "id": "u15",
+    "kind": "claim",
+    "text": "1,234单",
+    "span": [
+     271,
+     277
+    ],
+    "cites": [
+     "m:orders"
+    ]
+   },
+   "block": {
+    "id": "b6",
+    "type": "table"
+   },
+   "chain": [
+    {
+     "step": "metric",
+     "alias": "m:orders",
+     "metric": "orders",
+     "name": "订单数",
+     "value": 1234,
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "conv": null,
+     "rendered": "1,234单",
+     "caliber": "周报口径",
+     "version": "v2",
+     "expression": "vars.kpi.order_cnt",
+     "substituted": "1234",
+     "recompute_ok": true,
+     "status": "ok",
+     "node_id": "caliber",
+     "artifact": "c47efd33fc1e8a54058138da73b4332abe7349442cf0b9cfc364054ccca85323",
+     "eid": "ev:metric:2f935b615dbc6381",
+     "eid_ok": true,
+     "hash_ok": true,
+     "render_ok": true,
+     "sealed": true,
+     "caliber_upgrade": null
+    },
+    {
+     "step": "input",
+     "path": "vars.kpi.order_cnt",
+     "value": 1234,
+     "node_id": "fetch",
+     "via": "tool",
+     "status": "ok"
+    }
+   ],
+   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "violations": [],
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "covered": true
+   },
+   "redacted": {
+    "columns": []
+   }
+  }
+ },
+ "output": {
+  "周报": "## 本周概览 📊\n\n本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单，客单价 37.0元。\n\n增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。\n\n## 退款\n\n退款率 2.35%，统计口径是 `refunds` 表里本周发生的退款单。新增用户 —。\n\n- 华东区域销售额 ⟦?v:Q1.r0.amount⟧\n- 小额退款 ⟦?m:small_refund⟧\n  - 其余渠道合计 3 笔\n\n| 指标 | 本周 |\n|---|---|\n| 销售额 | 45,678.5元 |\n| 订单数 | 1,234单 |\n\n100. 附注：以上按周报口径统计",
+  "_evidence": {
+   "report_node": "write",
+   "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e",
+   "fields": [
+    "周报"
+   ]
+  },
+  "_issuance": {
+   "mode": "citations",
+   "tier": "degraded",
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e"
+   },
+   "calibers": [
+    {
+     "node": "caliber",
+     "caliber": "周报口径",
+     "version": "v2"
+    }
+   ],
+   "metrics_checked": 8,
+   "missing_required": [],
+   "missing_expected": [],
+   "matched_numbers": 7,
+   "matched": [
+    {
+     "token": "45,678.5元",
+     "metric": "gmv",
+     "caliber": "周报口径 @ v2",
+     "start": 27,
+     "end": 36,
+     "segment": "s6",
+     "eid": "ev:metric:f60c701e9c49d5f9"
+    },
+    {
+     "token": "8.7%",
+     "metric": "wow",
+     "caliber": "周报口径 @ v2",
+     "start": 40,
+     "end": 44,
+     "segment": "s8",
+     "eid": "ev:metric:ab46bcc0db93e4fb"
+    },
+    {
+     "token": "1,234单",
+     "metric": "orders",
+     "caliber": "周报口径 @ v2",
+     "start": 48,
+     "end": 54,
+     "segment": "s10",
+     "eid": "ev:metric:2f935b615dbc6381"
+    },
+    {
+     "token": "37.0元",
+     "metric": "aov",
+     "caliber": "周报口径 @ v2",
+     "start": 59,
+     "end": 64,
+     "segment": "s12",
+     "eid": "ev:metric:cdc765917d78ef4b"
+    },
+    {
+     "token": "2.35%",
+     "metric": "refund_rate",
+     "caliber": "周报口径 @ v2",
+     "start": 110,
+     "end": 115,
+     "segment": "s23",
+     "eid": "ev:metric:199853e026f412ca"
+    },
+    {
+     "token": "45,678.5元",
+     "metric": "gmv",
+     "caliber": "周报口径 @ v2",
+     "start": 251,
+     "end": 260,
+     "segment": "s45",
+     "eid": "ev:metric:f60c701e9c49d5f9"
+    },
+    {
+     "token": "1,234单",
+     "metric": "orders",
+     "caliber": "周报口径 @ v2",
+     "start": 271,
+     "end": 277,
+     "segment": "s49",
+     "eid": "ev:metric:2f935b615dbc6381"
+    }
+   ],
+   "unmatched_numbers": [
+    {
+     "token": "12",
+     "context": " 增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。  ## 退款",
+     "start": 84,
+     "end": 86
+    },
+    {
+     "token": "3",
+     "context": "efund⟧   - 其余渠道合计 3 笔  | 指标 | 本周 | |-",
+     "start": 216,
+     "end": 217
+    },
+    {
+     "token": "100",
+     "context": "| 订单数 | 1,234单 |  100. 附注：以上按周报口径统计",
+     "start": 281,
+     "end": 284
+    }
+   ],
+   "unresolved": [
+    {
+     "ref": "m:new_users",
+     "text": "—",
+     "segment": "s26"
+    },
+    {
+     "ref": "v:Q1.r0.amount",
+     "text": "⟦?v:Q1.r0.amount⟧",
+     "segment": "s30"
+    },
+    {
+     "ref": "m:small_refund",
+     "text": "⟦?m:small_refund⟧",
+     "segment": "s33"
+    }
+   ],
+   "gaps": [],
+   "declared_at": "2026-09-27T03:00:00+00:00"
+  }
+ },
+ "legacy": {
+  "text": "📦 2026-09-15 这一周订单 1,234 单，新渠道来了 15 单。\n\n客单价 37.0 元，退款 0 单，补发 0 单。",
+  "matched": [
+   {
+    "token": "1,234",
+    "metric": "orders",
+    "start": 19,
+    "end": 24
+   },
+   {
+    "token": "37.0",
+    "metric": "aov",
+    "start": 44,
+    "end": 48
+   },
+   {
+    "token": "0",
+    "metric": null,
+    "candidates": [
+     "refund_cnt",
+     "reship_cnt"
+    ],
+    "ambiguous": true,
+    "start": 54,
+    "end": 55
+   },
+   {
+    "token": "0",
+    "metric": null,
+    "candidates": [
+     "refund_cnt",
+     "reship_cnt"
+    ],
+    "ambiguous": true,
+    "start": 61,
+    "end": 62
+   }
+  ],
+  "unmatched": [
+   {
+    "token": "15",
+    "context": "周订单 1,234 单，新渠道来了 15 单。  客单价 37.0 元，退款 ",
+    "start": 33,
+    "end": 35
+   }
+  ]
+ },
+ "report_checked": {
+  "doc_artifact": "70eaf9110d59baf9d290a1b8ec734a8aadf64f97f87b98349ac89a1f100eef3e",
+  "stats": {
+   "units": 17,
+   "segments": 52,
+   "claims": 9,
+   "connective": 6,
+   "headings": 2,
+   "numbers": 12,
+   "numbers_cited": 7,
+   "values": 1,
+   "uncited_numbers": 3,
+   "unresolved": 3,
+   "see": 4,
+   "uncited_claims": 5,
+   "violations": 6
+  },
+  "violations": [
+   {
+    "code": "uncited_number",
+    "message": "数字「12」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     84,
+     86
+    ],
+    "text": "12",
+    "context": " 增长主要来自新客首单，新客贡献了 12 单。下面看退款情况。  ## 退款",
+    "segment": "s16",
+    "unit": "u2"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:new_users]] 解析不了：指标「新增用户」这次没有值（缺输入），不能写进报告",
+    "ref": "m:new_users",
+    "span": [
+     148,
+     149
+    ],
+    "text": "—",
+    "segment": "s26",
+    "unit": "u6"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[v:Q1.r0.amount]] 解析不了：这种引用在后续版本支持",
+    "ref": "v:Q1.r0.amount",
+    "span": [
+     162,
+     179
+    ],
+    "text": "⟦?v:Q1.r0.amount⟧",
+    "segment": "s30",
+    "unit": "u7"
+   },
+   {
+    "code": "unresolved_ref",
+    "message": "引用 [[m:small_refund]] 解析不了：29 按口径卡的小数位（-2）显示为 0，精度不够：口径卡要多留几位小数",
+    "ref": "m:small_refund",
+    "span": [
+     187,
+     204
+    ],
+    "text": "⟦?m:small_refund⟧",
+    "segment": "s33",
+    "unit": "u8"
+   },
+   {
+    "code": "uncited_number",
+    "message": "数字「3」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     216,
+     217
+    ],
+    "text": "3",
+    "context": "efund⟧   - 其余渠道合计 3 笔  | 指标 | 本周 | |-",
+    "segment": "s36",
+    "unit": "u9"
+   },
+   {
+    "code": "uncited_number",
+    "message": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "span": [
+     281,
+     284
+    ],
+    "text": "100",
+    "context": "| 订单数 | 1,234单 |  100. 附注：以上按周报口径统计",
+    "segment": "s50",
+    "unit": "u16"
+   }
+  ],
+  "repairs": 1
+ }
+}

@@ -102,6 +102,53 @@ function ToolsInput({ id, single, value, invalid, aria, onChange }: {
 /** 不需要某张目录表的字段拿到的都是这一个空数组：选择器结果不变，就不重渲染 */
 const NO_ROWS: never[] = []
 
+/**
+ * 从上游某一类节点里多选（报告的 metrics_from 只收上游口径卡）。
+ *
+ * 只列上游的：下游的卡在报告跑的时候还没算，选了也是空的（后端 validate 会报 error）。
+ * 已经选了、后来被挪到下游或删掉的照样显示成芯片，好让人看见并移掉。
+ * 全部移掉写回 undefined 而不是 []：后端两者都当「全部上游」，配置里不留一个空数组
+ */
+function NodeRefsInput({ nodeId, type, value, onChange }: {
+  nodeId: string; type?: string; value: any; onChange: (v: any) => void
+}) {
+  const nodes = useStudio((s) => s.nodes)
+  const edges = useStudio((s) => s.edges)
+  const options = useMemo(() => {
+    const parents = new Map<string, string[]>()
+    for (const e of edges) parents.set(e.target, [...(parents.get(e.target) ?? []), e.source])
+    const seen = new Set<string>()
+    const stack = [...(parents.get(nodeId) ?? [])]
+    while (stack.length) {
+      const id = stack.pop()!
+      if (seen.has(id) || id === nodeId) continue
+      seen.add(id)
+      stack.push(...(parents.get(id) ?? []))
+    }
+    return nodes
+      .filter((n) => seen.has(n.id) && (!type || n.data?.nodeType === type))
+      .map((n) => {
+        const cfg = (n.data?.config ?? {}) as Record<string, any>
+        const label = String(n.data?.label || n.id)
+        const hint = type === 'metrics'
+          ? [cfg.caliber && `${cfg.caliber} ${cfg.caliber_version || ''}`.trim(), `${(cfg.metrics ?? []).length} 个指标`]
+            .filter(Boolean).join(' · ')
+          : undefined
+        return { value: n.id, label: label === n.id ? label : `${label}（${n.id}）`, hint }
+      })
+  }, [nodes, edges, nodeId, type])
+  const list: string[] = Array.isArray(value) ? value.map(String) : typeof value === 'string' && value ? [value] : []
+  return (
+    <MultiPick
+      options={options}
+      value={list}
+      onChange={(v) => onChange(v.length ? v : undefined)}
+      addLabel={type === 'metrics' ? '选择口径卡' : '选择节点'}
+      empty={type === 'metrics' ? '上游还没有口径卡：先在这个节点前面接一张口径卡' : '上游没有可选的节点'}
+    />
+  )
+}
+
 /** 属性面板。所有字段都由 nodeDefs 的声明驱动渲染，加节点类型不用改这里。 */
 export function Inspector() {
   const selectedId = useStudio((s) => s.selectedId)
@@ -523,6 +570,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 
     case 'metricsList':
       return <MetricList nodeId={nodeId} value={value ?? []} issues={issues} onChange={onChange} />
+
+    case 'nodeRefs':
+      return <NodeRefsInput nodeId={nodeId} type={field.refType} value={value} onChange={onChange} />
 
     case 'agents':
       return <AgentList value={value ?? []} issues={issues} config={config} onChange={onChange} />

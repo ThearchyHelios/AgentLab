@@ -32,6 +32,9 @@ class GraphState(TypedDict, total=False):
     - nodes：node_id -> 该节点的结构化输出，模板里用 {{ nodes.xxx.text }} 引用
     - vars：用户显式写入的变量池
     - output：output 节点收集的最终成果
+    - evidence：证据台账。能被报告引用的工件（口径卡的指标集、查询快照……）按产生
+      顺序记在这里，报告节点建目录时给它们统一编号。只追加不改写；旧 checkpoint 里
+      没有这个通道，续跑时 LangGraph 按空列表起步
     """
 
     messages: Annotated[list[AnyMessage], add_messages]
@@ -43,6 +46,7 @@ class GraphState(TypedDict, total=False):
     trail: Annotated[list[dict[str, Any]], operator.add]
     # 循环计数器：node_id -> 已迭代次数，防止无限循环
     loops: Annotated[dict[str, Any], merge_dict]
+    evidence: Annotated[list[dict[str, Any]], operator.add]
 
 
 def template_context(state: GraphState) -> dict[str, Any]:
