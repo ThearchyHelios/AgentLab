@@ -154,6 +154,11 @@ class ValidationIssue(BaseModel):
     #: 节点配置里出问题的那个字段：prompt、cases[1].condition、agents[0].system。
     #: 检查器靠它把问题落到具体的输入框下面；说不清是哪个字段的（连线、图级）为空
     field: str | None = None
+    #: 机器认的问题编号（governed.agent_approval_never、contract.required_missing…）。发布前自动修复
+    #: 靠它认出是哪一类问题；文案会改，编号不改。没有编号的问题只能人看着修
+    code: str | None = None
+    #: 这条问题对应的修复 id（engine/autofix.py 算出来的）。只在发布检查的结果里填
+    fix: str | None = None
 
 
 class ValidationResult(BaseModel):
@@ -161,10 +166,10 @@ class ValidationResult(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
     def add(self, message: str, *, level: str = "error", node_id: str | None = None,
-            edge_id: str | None = None, field: str | None = None) -> None:
+            edge_id: str | None = None, field: str | None = None, code: str | None = None) -> None:
         self.issues.append(
             ValidationIssue(level=level, message=message, node_id=node_id,  # type: ignore[arg-type]
-                            edge_id=edge_id, field=field)
+                            edge_id=edge_id, field=field, code=code)
         )
         if level == "error":
             self.ok = False
@@ -395,9 +400,10 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
         return      # 不写就取所有上游口径卡
     if isinstance(sources, str):
         sources = [sources]
+    code = "report.metrics_from_invalid"
     if not isinstance(sources, list) or not all(isinstance(s, str) and s for s in sources):
         result.add("「报告撰写」的 metrics_from 要写口径卡节点的 id 列表", node_id=node.id,
-                   field="metrics_from")
+                   field="metrics_from", code=code)
         return
     nodes = spec.node_map()
     upstream = _ancestors(spec, node.id)
@@ -405,36 +411,36 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
         target = nodes.get(src)
         if target is None:
             result.add(f"「报告撰写」的 metrics_from 指向 {src!r}，但工作流里不存在这个节点",
-                       node_id=node.id, field="metrics_from")
+                       node_id=node.id, field="metrics_from", code=code)
         elif target.type != NodeType.METRICS:
             result.add(f"「报告撰写」的 metrics_from 指向「{target.title}」（{src}），它不是「口径卡」"
                        f"节点，而是「{type_label(target.type)}」：报告里的指标只能从口径卡来",
-                       node_id=node.id, field="metrics_from")
+                       node_id=node.id, field="metrics_from", code=code)
         elif src not in upstream:
             result.add(f"「报告撰写」的 metrics_from 指向的口径卡「{target.title}」不在它的上游：报告跑的"
                        "时候那张卡还没算，目录里不会有它的指标。把口径卡连到报告前面",
-                       node_id=node.id, field="metrics_from")
+                       node_id=node.id, field="metrics_from", code=code)
 
 
 def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
                        result: ValidationResult) -> None:
     """引用模式的契约：report_from 必须是出口上游的报告撰写节点。"""
-    field = "contract.report_from"
+    field, code = "contract.report_from", "contract.report_from_invalid"
     if not isinstance(report_from, str):
-        result.add("出具契约的 report_from 要写「报告撰写」节点的 id", node_id=node.id, field=field)
+        result.add("出具契约的 report_from 要写「报告撰写」节点的 id", node_id=node.id, field=field, code=code)
         return
     target = spec.node_map().get(report_from)
     if target is None:
         result.add(f"出具契约的 report_from 指向 {report_from!r}，但工作流里不存在这个节点",
-                   node_id=node.id, field=field)
+                   node_id=node.id, field=field, code=code)
     elif target.type != NodeType.REPORT:
         result.add(f"出具契约的 report_from 指向「{target.title}」（{report_from}），它不是「报告撰写」"
                    f"节点，而是「{type_label(target.type)}」：引用模式只核对报告撰写节点产出的文档",
-                   node_id=node.id, field=field)
+                   node_id=node.id, field=field, code=code)
     elif report_from not in _ancestors(spec, node.id):
         result.add(f"出具契约的 report_from 指向的「{target.title}」不在这个出口的上游：出口核对的时候"
                    "那份报告还没写出来。把报告撰写节点连到出口前面",
-                   node_id=node.id, field=field)
+                   node_id=node.id, field=field, code=code)
 
 
 def validate_graph(spec: GraphSpec) -> ValidationResult:
@@ -491,7 +497,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 result.add("「结构校验」节点需要一个 JSON Schema", node_id=node.id, field="schema")
         elif node.type == NodeType.METRICS:
             defs = cfg.get("metrics") or []
-            if not defs:
+            # 钉住别的工作流里的口径卡时，指标定义运行时从那一版里取，本地不用再写
+            if not defs and not cfg.get("caliber_from"):
                 result.add("口径卡还没有定义指标", node_id=node.id, field="metrics")
             for i, d in enumerate(defs):
                 if not d.get("id") or not d.get("expression"):
@@ -501,16 +508,21 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             _check_report_sources(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
-            if contract and not contract.get("metrics_from"):
+            if contract and not isinstance(contract, dict):
+                # 字符串、列表、数字：后面的 .get 会崩，发布、发布检查、发起运行一起 500。
+                # 报成 error，两档发布和运行前都挡住
+                result.add("出具契约必须是一个 JSON 对象", node_id=node.id, field="contract",
+                           code="contract.not_object")
+            elif contract and not contract.get("metrics_from"):
                 result.add("出具契约缺 metrics_from（指标来自哪个「口径卡」节点）",
-                           node_id=node.id, field="contract.metrics_from")
+                           node_id=node.id, field="contract.metrics_from", code="contract.metrics_from_missing")
             if isinstance(contract, dict) and contract.get("report_from") not in (None, ""):
                 _check_report_from(node, contract["report_from"], spec, result)
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("「循环」节点没有循环体", node_id=node.id)
 
-        if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR):
+        if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR, NodeType.REPORT):
             if not (cfg.get("model") or spec.defaults.get("model")):
                 result.add(
                     "没有指定模型，将回退到默认 provider",
@@ -568,6 +580,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 )
 
     _check_named_tools(spec, result)
+    for issue in [*text_parse_issues(spec), *evidence_issues(spec)]:
+        result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field, code=issue.code)
 
     # 孤儿节点
     for node in spec.nodes:
@@ -786,3 +800,240 @@ def _check_named_tools(spec: GraphSpec, result: ValidationResult) -> None:
                     result.add(f"协作目标提到了「{tool}」，但没有哪个成员绑定了它：如果是要成员"
                                "调用它，谁都拿不到。需要就给负责的成员加上",
                                level="warning", node_id=node.id, field="goal")
+
+
+# --------------------------------------------------------------------------
+# 不按 JSON 解析模型写的文字
+#
+# 真实踩过的一张图：agent（自由文字）→ transform `{{ nodes.query_logs.text }}`（按 JSON
+# 解析）→ 口径卡。模型在 JSON 字符串里夹了没转义的英文引号，整形节点一解析就失败。模型写的
+# 文字不是数据：数要交给口径卡，就让 agent 按 output_schema 交结构化字段、开 cite_fields
+# 逐个标出处。这里只报 warning（旧工作流照跑）；Copilot 自查把它当成要打回的问题。
+# --------------------------------------------------------------------------
+
+_MODEL_TEXT_TYPES = (NodeType.AGENT, NodeType.LLM, NodeType.SUPERVISOR)
+_TEXT_REF = re.compile(
+    r"nodes\s*(?:\.\s*(?P<a>[\w-]+)|\[\s*['\"](?P<b>[^'\"]+)['\"]\s*\])"
+    r"\s*(?:\.\s*text(?![\w-])|\[\s*['\"]text['\"]\s*\])")
+_VAR_REF = re.compile(r"vars\s*(?:\.\s*(?P<a>[\w-]+)|\[\s*['\"](?P<b>[^'\"]+)['\"]\s*\])")
+
+
+def _writes_text(node: GraphNode) -> bool:
+    """这个节点的产出是不是模型写的文字（而不是系统序列化的结构化数据）。
+
+    llm 配了 output_schema 走原生结构化输出，text 是系统 json.dumps 的；agent 只有同时
+    开了 cite_fields，assign_to 才拿到核对过的 data——它的 .text 仍然是模型的原话。
+    """
+    if node.type == NodeType.LLM:
+        return not node.config.get("output_schema")
+    return node.type in _MODEL_TEXT_TYPES
+
+
+def _text_sources(text: str, spec: GraphSpec, *, template: bool) -> list[GraphNode]:
+    """一段模板（或表达式）读了哪些节点的模型原话。模板里过了 | json 的不算：那是合法的 JSON 字符串。"""
+    nodes = spec.node_map()
+    pieces = [m.group(0)[2:-2] for m in _TEMPLATE_SPAN.finditer(text)] if template else [text]
+    found: dict[str, GraphNode] = {}
+    for piece in pieces:
+        head, *filters = [p.strip() for p in piece.split("|")] if template else [piece]
+        if "json" in filters:
+            continue
+        for m in _TEXT_REF.finditer(head):
+            node = nodes.get(m.group("a") or m.group("b"))
+            if node is not None and _writes_text(node):
+                found.setdefault(node.id, node)
+        for m in _VAR_REF.finditer(head):
+            var = m.group("a") or m.group("b")
+            for node in spec.nodes:
+                if str(node.config.get("assign_to") or "").strip() != var or node.type not in _MODEL_TEXT_TYPES:
+                    continue
+                structured = (node.type == NodeType.LLM and node.config.get("output_schema")) or (
+                    node.type == NodeType.AGENT and node.config.get("output_schema")
+                    and node.config.get("cite_fields") is True)
+                if not structured:
+                    found.setdefault(node.id, node)
+    return list(found.values())
+
+
+def _descendants(spec: GraphSpec, node_id: str) -> set[str]:
+    children: dict[str, list[str]] = defaultdict(list)
+    for e in spec.edges:
+        children[e.source].append(e.target)
+    seen: set[str] = set()
+    stack = list(children[node_id])
+    while stack:
+        cur = stack.pop()
+        if cur not in seen:
+            seen.add(cur)
+            stack.extend(children[cur])
+    seen.discard(node_id)
+    return seen
+
+
+def _feeds_caliber(node: GraphNode, spec: GraphSpec) -> bool:
+    """下游有口径卡读了这个节点的产出（nodes.<id> 或 vars.<assign_to>）。"""
+    var = str(node.config.get("assign_to") or "").strip()
+    reads = [rf"nodes\s*(?:\.\s*{re.escape(node.id)}(?![\w-])|\[\s*['\"]{re.escape(node.id)}['\"]\s*\])"]
+    if var:
+        reads.append(rf"vars\s*(?:\.\s*{re.escape(var)}(?![\w-])|\[\s*['\"]{re.escape(var)}['\"]\s*\])")
+    pattern = re.compile("|".join(reads))
+    nodes = spec.node_map()
+    for nid in _descendants(spec, node.id):
+        card = nodes.get(nid)
+        if card is not None and card.type == NodeType.METRICS and any(
+                pattern.search(str((d or {}).get("expression") or "")) for d in card.config.get("metrics") or []):
+            return True
+    return False
+
+
+def _structured_fix(source: GraphNode) -> str:
+    if source.type == NodeType.AGENT:
+        var = str(source.config.get("assign_to") or "").strip() or "变量名"
+        return (f"给「{source.title}」配 output_schema 并开 cite_fields，口径卡直接读 vars.{var}.字段"
+                "（每个字段都核对到查询结果里的那一格）")
+    if source.type == NodeType.LLM:
+        return f"给「{source.title}」配 output_schema；数要进口径卡的，改用 agent 的 output_schema + cite_fields"
+    return "数要进口径卡的，改用 agent 的 output_schema + cite_fields"
+
+
+def _json_spans(template: str) -> list[tuple[str, bool]]:
+    """模板里每个 {{ }}：(里面的表达式, 它是不是落在 JSON 的引号里)。只数模板自己写的字，跳过 {{ }}。"""
+    out: list[tuple[str, bool]] = []
+    inside, last = False, 0
+    for m in _TEMPLATE_SPAN.finditer(template):
+        text, i = template[last:m.start()], 0
+        while i < len(text):
+            if inside and text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                inside = not inside
+            i += 1
+        out.append((m.group(0)[2:-2].strip(), inside))
+        last = m.end()
+    return out
+
+
+def text_parse_issues(spec: GraphSpec) -> list[ValidationIssue]:
+    """整形节点解析 agent / llm 写的文字、产出流向口径卡或按 JSON 解析：一个节点一条 warning。"""
+    out: list[ValidationIssue] = []
+    for node in spec.nodes:
+        if node.type != NodeType.TRANSFORM:
+            continue
+        mode = node.config.get("mode", "expression")
+        field = "expression" if mode == "expression" else "template"
+        sources = _text_sources(str(node.config.get(field) or ""), spec, template=field == "template")
+        if not sources:
+            continue
+        who = "、".join(f"「{s.title}」（{type_label(s.type)}）" for s in sources[:3])
+        spans = [(expr, quoted) for expr, quoted in _json_spans(str(node.config.get(field) or ""))
+                 if _text_sources(f"{{{{ {expr} }}}}", spec, template=True)] if mode == "json" else []
+        if spans and all(quoted for _, quoted in spans):
+            # 模型的文字放在模板的引号里：不是在解析它，是在拼字符串，少的是 | json
+            expr = spans[0][0]
+            message = (f"模板里 {{{{ {expr} }}}} 放在 JSON 的引号里：{who}写的文字只要带英文引号、换行，JSON 就被"
+                       f"撑破，整个节点失败。写成 {{{{ {expr} | json }}}}（外面不要再加引号）")
+        elif mode == "json":
+            message = (f"整形节点按 JSON 解析{who}写的文字：模型写的 JSON 常夹着没转义的英文引号，解析一失败"
+                       f"整个节点就失败。改成让它直接交结构化数据：{_structured_fix(sources[0])}")
+        elif _feeds_caliber(node, spec):
+            message = (f"口径卡的数要经这个整形节点从{who}写的文字里取：文字不是结构化数据，取不准，也核对不了出处。"
+                       f"{_structured_fix(sources[0])}")
+        else:
+            continue
+        out.append(ValidationIssue(level="warning", node_id=node.id, field=field, message=message))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 证据链相关的配置：agent 的结构化字段、沙箱代码的角色、钉住别处的口径卡
+# --------------------------------------------------------------------------
+
+EVIDENCE_ROLES = ("source", "compute")
+_REF_HEAD = re.compile(r"^(vars|nodes)\.([\w-]+)")
+
+
+def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNode]]:
+    """口径卡每个指标表达式里读到的节点：(指标下标, 产出它的节点)。"""
+    from app.engine.expressions import ExpressionError, leaf_refs, parse_expression
+
+    nodes = spec.node_map()
+    out: list[tuple[int, GraphNode]] = []
+    for i, d in enumerate(card.config.get("metrics") or []):
+        try:
+            tree, _, _ = parse_expression(str((d or {}).get("expression") or ""))
+        except ExpressionError:
+            continue
+        for path in leaf_refs(tree):
+            m = _REF_HEAD.match(path.split("cell(", 1)[-1].lstrip())
+            if not m:
+                continue
+            root, name = m.groups()
+            if root == "nodes":
+                producers = [nodes[name]] if name in nodes else []
+            else:
+                producers = [n for n in spec.nodes if str(n.config.get("assign_to") or "").strip() == name]
+            out.extend((i, n) for n in producers)
+    return out
+
+
+def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
+    from app.engine.governance import UPGRADE_POLICIES, UPGRADE_POLICY_LABELS
+
+    out: list[ValidationIssue] = []
+
+    def add(message: str, node: GraphNode, field: str, level: str = "warning") -> None:
+        out.append(ValidationIssue(level=level, node_id=node.id, field=field, message=message))  # type: ignore[arg-type]
+
+    for node in spec.nodes:
+        cfg = node.config
+        if node.type == NodeType.AGENT and cfg.get("output_schema") and cfg.get("cite_fields") is not True:
+            add("output_schema 要开 cite_fields 才生效，会多一次抽取调用：开了之后循环结束再按 Schema "
+                "抽一次字段，每个字段都核对到查询结果里的那一格；不开的话 assign_to 拿到的仍是自由文字",
+                node, "output_schema")
+        elif node.type == NodeType.CODE:
+            role = cfg.get("evidence_role")
+            if role not in (None, "") and role not in EVIDENCE_ROLES:
+                add(f"evidence_role 只能是 source（取数）或 compute（计算），写的是 {role!r}", node,
+                    "evidence_role", level="error")
+        elif node.type == NodeType.METRICS:
+            if cfg.get("caliber_from") not in (None, "", {}):
+                out.extend(_caliber_from_issues(node, UPGRADE_POLICIES, UPGRADE_POLICY_LABELS))
+            warned: set[str] = set()
+            for i, producer in _caliber_inputs(node, spec):
+                role = str(producer.config.get("evidence_role") or "compute")
+                if producer.type != NodeType.CODE or role == "source" or producer.id in warned:
+                    continue
+                warned.add(producer.id)
+                add(f"口径卡的输入来自沙箱代码「{producer.title}」，它的角色是计算（evidence_role 不是 source）："
+                    "沙箱里算出来的数核对不了出处。负责取数的代码节点把 evidence_role 标成 source；"
+                    "业务计算挪进口径卡的表达式", node, f"metrics[{i}].expression")
+    return out
+
+
+def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, str]) -> list[ValidationIssue]:
+    """钉住别的工作流里一张口径卡：{workflow_id, workflow_version, node_id} 三项都要写对。"""
+    cfg = node.config
+    ref = cfg.get("caliber_from")
+    out: list[ValidationIssue] = []
+
+    def add(message: str, field: str, level: str = "error") -> None:
+        out.append(ValidationIssue(level=level, node_id=node.id, field=field, message=message))  # type: ignore[arg-type]
+
+    if not isinstance(ref, dict) or not str(ref.get("workflow_id") or "").strip() \
+            or not str(ref.get("node_id") or "").strip():
+        add("caliber_from 要写 {workflow_id, workflow_version, node_id}：钉住哪个工作流的哪一版里的哪张口径卡",
+            "caliber_from")
+        return out
+    version = ref.get("workflow_version")
+    if isinstance(version, bool) or not (isinstance(version, int) or (isinstance(version, str) and version.isdigit())) \
+            or int(version) < 1:
+        add(f"caliber_from 的 workflow_version 要写具体的版本号（1、2…），写的是 {version!r}：不钉版本，口径会跟着"
+            "上游漂移", "caliber_from.workflow_version")
+    if cfg.get("metrics"):
+        add("写了 caliber_from 就按钉住的那张卡算，这里自己写的 metrics 不会生效", "metrics", level="warning")
+    policy = cfg.get("upgrade_policy")
+    if policy not in (None, "") and policy not in policies:
+        add("upgrade_policy 只能是 " + " / ".join(f"{k}（{v}）" for k, v in labels.items())
+            + f"，写的是 {policy!r}", "upgrade_policy")
+    return out

@@ -5,12 +5,18 @@
 
 - 报告文档：report.checked 事件里的 doc_artifact
 - 口径卡的指标集：口径卡节点 node.finished 事件里的 evidence 台账
+- 查询快照：tool.end 事件里的 query_artifact，或者 node.finished.evidence 里的 query 条目
 - 成果（哪些字段是报告原文）：出口节点 node.finished 事件里的 node_output 工件
 - 运行输入：入口节点 node.finished 事件里的 node_output 工件
 
 artifacts 表可以事后插行，run.output 是可以改写的一列，封存之后追加的事件不在
-核对范围里——这三样都不当来源。本期只解析数字层（口径卡指标、运行输入）的链；
-旧运行按旧契约的位置信息标出 matched（legacy_contract），不按数值猜来源。
+核对范围里——这三样都不当来源。解析数字层的链：口径卡指标 → 它的输入 → 查询快照里
+的那一格，或者单元格引用直接到查询快照；旧运行按旧契约的位置信息标出 matched
+（legacy_contract），不按数值猜来源。
+
+查询步骤只给被引用的行和前后各 2 行，完整快照仍走 /api/artifacts/{id}。数据源
+options.mask_columns 里的列换成「已遮罩」——在有身份体系之前，这只减少暴露，不是
+安全边界：知道工件 id 的人照样能取到整份快照。
 """
 from __future__ import annotations
 
@@ -22,8 +28,9 @@ from sqlalchemy import select
 
 from app.api.coded import CodedHTTPException
 from app.core.artifact_store import load
+from app.data.engine import masked_columns
 from app.db.base import SessionLocal
-from app.db.models import Run, RunEvent
+from app.db.models import DataSource, Run, RunEvent, Workflow
 from app.engine.evidence import (
     RenderError,
     find_segment,
@@ -47,6 +54,18 @@ LEGACY_NOTE = "旧版出具：按数值匹配，不是显式引用。同一个�
 NONE_NOTE = "这次运行没有报告文档，也没有出具契约，没有可以展示的证据"
 NO_DOC_NOTE = "这次运行的出具契约用的是引用模式，但报告没有产出可以核对的文档"
 
+MASKED = "已遮罩"
+MASK_NOTE = "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+#: 查询条目的数据源现在找不到了（改名或删掉了）：只能按快照里记下的、查询当时的遮罩来遮
+SOURCE_GONE = "数据源「{source}」现在找不到了（改名或删掉了），按查询当时记下的遮罩处理"
+#: 查询步骤给被引用的行前后各带几行
+WINDOW = 2
+#: 一个查询步骤最多给多少行：数组字段引用了一大段行时，窗口不能把整份快照搬过来
+MAX_WINDOW_ROWS = 50
+UNSEALED_QUERY = "这份查询快照不在封存范围内的任何事件里（没有哪次查询在封存前交回过它），不能当证据展示"
+TAMPERED_QUERY = "查询快照和它的哈希对不上，疑似被改过，不展示其中的行"
+MISSING_QUERY = "查询快照在工件库里取不回来"
+
 
 # --------------------------------------------------------------------------
 # 封存范围
@@ -63,6 +82,10 @@ class _Sealed:
     ledger: set[tuple[str, str]] = field(default_factory=set)
     #: 节点 id → 它最后一次 node.finished 的产出工件 id
     outputs: dict[str, str] = field(default_factory=dict)
+    #: 封存范围内交回过的查询快照：工件 id → {node_id, tool, source, via, call_id, exec}
+    queries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 口径卡节点 id → 封存范围内它的 caliber.upgrade 事件（升版处置）
+    upgrades: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def sealed(self) -> bool:
@@ -110,13 +133,24 @@ async def _sealed(run_id: str) -> _Sealed:
         "sealed": bool(verdict.get("sealed")), "ok": verdict.get("ok"), "manifest_seq": bound,
         "legacy": bool(verdict.get("legacy", False))})
     for _, etype, node_id, data in events:
-        if etype != "node.finished" or not node_id or not isinstance(data, dict):
+        if not node_id or not isinstance(data, dict):
+            continue
+        if etype == "tool.end" and data.get("query_artifact"):
+            out.queries.setdefault(str(data["query_artifact"]), {
+                "node_id": node_id, "tool": data.get("tool"), "via": data.get("artifact")})
+        elif etype == "caliber.upgrade":
+            out.upgrades[node_id] = data
+        if etype != "node.finished":
             continue
         if data.get("artifact"):
             out.outputs[node_id] = data["artifact"]
         for entry in data.get("evidence") or []:
             if isinstance(entry, dict) and entry.get("artifact"):
                 out.ledger.add((node_id, entry["artifact"]))
+                if entry.get("kind") == "query":
+                    out.queries[str(entry["artifact"])] = {
+                        "node_id": node_id, **{k: entry[k] for k in ("tool", "source", "via", "call_id", "exec")
+                                               if entry.get(k) is not None}}
     return out
 
 
@@ -243,23 +277,61 @@ def _graph_of(report: _Report, sealed: _Sealed, inputs: dict[str, Any]) -> tuple
 
     evidence = []
     cards: dict[str, dict[str, Any] | None] = {}
-    for alias, entry in (doc.get("catalog") or {}).items():
-        evidence.append({
+    catalog = doc.get("catalog") or {}
+    cells: list[str] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            if cite.get("kind") == "cell" and cite.get("status") == "resolved":
+                cells.append(_cell_name(cite.get("alias"), cite.get("locator") or {}))
+    for alias, entry in catalog.items():
+        item = {
             "alias": alias, "eid": entry.get("eid"), "kind": entry.get("kind"), "label": entry.get("label"),
             "node_id": entry.get("node_id"), "artifact": entry.get("artifact"),
             "sealed": _entry_sealed(sealed, entry, inputs), "cited_by": cited_by.get(alias, []),
             "units": units_of.get(alias, []), "report": report.node_id,
-        })
+        }
+        if entry.get("kind") in ("query", "retrieval"):
+            # 查询、检索条目带上是什么、有多大：图上不点开也看得出这是哪次取数
+            item.update({k: entry[k] for k in ("tool", "source", "columns", "rows", "truncated") if k in entry})
+        evidence.append(item)
         if entry.get("kind") != "metric" or not entry.get("artifact"):
             continue
         artifact = entry["artifact"]
         if artifact not in cards:
             cards[artifact] = _load_card(artifact)[0]
         metric = _metric_in(cards[artifact], (entry.get("locator") or {}).get("metric"))
-        for item in (metric or {}).get("inputs") or []:
-            edges.append({"from": alias, "to": item.get("path"), "rel": "input", "node_id": item.get("node_id"),
-                          "report": report.node_id})
+        for source in (metric or {}).get("inputs") or []:
+            edge = {"from": alias, "to": source.get("path"), "rel": "input", "node_id": source.get("node_id"),
+                    "report": report.node_id}
+            if cell := _input_cell(source, catalog):
+                edge["cell"] = cell
+                cells.append(cell)
+            edges.append(edge)
+    for cell in dict.fromkeys(c for c in cells if c):
+        edges.append({"from": cell, "to": cell.split(".", 1)[0], "rel": "cell_of", "report": report.node_id})
     return evidence, edges
+
+
+def _cell_name(alias: Any, locator: dict[str, Any]) -> str:
+    """Q1.r0.gmv：报告目录里的全局编号加行列，和 [[v:]] 的写法一致。"""
+    if not alias or not isinstance(locator.get("row"), int) or not locator.get("column"):
+        return ""
+    return f"{alias}.r{locator['row']}.{locator['column']}"
+
+
+def _query_alias(catalog: dict[str, Any], artifact: Any) -> str | None:
+    """这份快照在报告目录里的全局编号。agent 字段的 ref 是那个节点内部的编号，靠工件对上。"""
+    if not artifact:
+        return None
+    return next((alias for alias, e in catalog.items() if e.get("kind") == "query" and e.get("artifact") == artifact),
+                None)
+
+
+def _input_cell(item: dict[str, Any], catalog: dict[str, Any]) -> str:
+    """口径卡的一个输入落在哪一格（cell() 取的、或者 agent 字段核对到的），按全局编号写。"""
+    locator = item.get("locator") or {}
+    return _cell_name(_query_alias(catalog, item.get("artifact")), locator) if item.get("artifact") else ""
 
 
 def _load_card(artifact: str) -> tuple[dict[str, Any] | None, bool]:
@@ -312,7 +384,7 @@ def _legacy(sealed: _Sealed, issuance: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/{run_id}/evidence/segments/{segment_id}")
 async def evidence_segment(run_id: str, segment_id: str, report: str | None = None) -> dict[str, Any]:
-    """点开报告里的一个片段：片段、所在的句子、出处链（本期是指标步骤加它的输入）、封存状态。
+    """点开报告里的一个片段：片段、所在的句子、出处链（指标 → 输入 → 查询快照，或者单元格直接到查询快照）、封存状态。
 
     一次运行里有好几份报告时用 ?report=<节点 id> 指定；不指定取成果里标注的那一份。
     """
@@ -333,8 +405,9 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     doc = chosen.doc
     markdown = str(doc.get("markdown") or "")
     start, end = unit.get("span") or [0, 0]
-    chain = _chain(seg, doc, sealed)
+    chain = await _chain(seg, doc, sealed)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
+    masked = list(dict.fromkeys(c for step in chain if step.get("step") == "query" for c in step.get("masked") or []))
     return {
         "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact},
         "segment": {"id": seg["id"], "text": seg.get("text"), "kind": seg.get("kind"), "state": seg.get("state"),
@@ -348,8 +421,7 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
         "violations": [v for v in doc.get("violations") or []
                        if v.get("segment") == seg["id"] or (v.get("unit") == unit.get("id") and not v.get("segment"))],
         "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
-        # 本期没有查询快照的行，也就没有要遮的列；字段先占位，前端不用等二期再改
-        "redacted": {"columns": []},
+        "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []},
     }
 
 
@@ -363,11 +435,21 @@ def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Rep
     return next((r for r in reports if r.node_id == primary.get("report_node")), reports[0])
 
 
-def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed) -> list[dict[str, Any]]:
+async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed) -> list[dict[str, Any]]:
     cite = seg.get("cite") or {}
+    entry = (doc.get("catalog") or {}).get(cite.get("alias")) or {}
+    masks = _Masks()
+    if _missing_input(cite, entry):
+        # 指标在卡里、只是这次没有值（显示「—」）：照样给出指标、输入和查询步骤，面板才指得出是哪个
+        # 输入空了、那一格在哪次查询里。片段上没记定位和 eid，用目录条目的（它们指的是同一个指标）
+        return await _metric_chain(seg, {**cite, "locator": entry.get("locator") or {}, "eid": entry.get("eid")},
+                                   entry, doc, sealed, masks)
     if seg.get("state") != "deterministic" or cite.get("status") != "resolved":
         return []
-    entry = (doc.get("catalog") or {}).get(cite.get("alias")) or {}
+    if cite.get("kind") == "cell":
+        locator = cite.get("locator") or {}
+        return [await _query_step(str(entry.get("artifact") or ""), [(locator.get("row"), locator.get("column"))],
+                                  doc, sealed, masks)]
     if cite.get("kind") == "input":
         name = (cite.get("locator") or {}).get("field")
         inputs = _input_payloads(sealed)
@@ -378,11 +460,17 @@ def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed) -> list[di
                  "sealed": _entry_sealed(sealed, entry, inputs)}]
     if cite.get("kind") != "metric":
         return []
-    return _metric_chain(seg, cite, entry, sealed)
+    return await _metric_chain(seg, cite, entry, doc, sealed, masks)
 
 
-def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any],
-                  sealed: _Sealed) -> list[dict[str, Any]]:
+def _missing_input(cite: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """引用的指标存在，只是这次缺输入没有值。引用写错（目录里没有、同名指标有歧义）的不算。"""
+    return (cite.get("kind") == "metric" and cite.get("status") == "unresolved" and entry.get("kind") == "metric"
+            and entry.get("value") is None and entry.get("status") == "missing_input")
+
+
+async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], doc: dict[str, Any],
+                        sealed: _Sealed, masks: "_Masks") -> list[dict[str, Any]]:
     """指标步骤：从封存台账里那件 metric_set 工件取回整张卡，按 id 找到指标，再验三件事——
     eid 能由工件和定位重算出来、卡里的值按同样的格式渲染出来就是报告上的字、这件工件
     确实记在口径卡节点封存过的台账里。"""
@@ -409,10 +497,127 @@ def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, An
         "hash_ok": hash_ok and metric is not None,
         "render_ok": rendered_now is not None and rendered_now == seg.get("text"),
         "sealed": sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger,
-        # 口径卡的版本还没纳入升版处置（那一套目前只管钉了版本的子工作流）
-        "caliber_upgrade": None,
+        "source": await _caliber_source((card or {}).get("source")),
+        "caliber_upgrade": _caliber_upgrade(sealed.upgrades.get(str(entry.get("node_id") or ""))),
     }
-    return [step, *({"step": "input", **item} for item in (metric or {}).get("inputs") or [])]
+    catalog = doc.get("catalog") or {}
+    inputs: list[dict[str, Any]] = []
+    #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
+    wanted: dict[str, list[tuple[Any, Any]]] = {}
+    for item in (metric or {}).get("inputs") or []:
+        one = {"step": "input", **item}
+        artifact_of = item.get("artifact")
+        if artifact_of and item.get("via") in ("tool_cell", "agent_field"):
+            one["query"] = _query_alias(catalog, artifact_of)
+            if cell := _input_cell(item, catalog):
+                one["cell"] = cell
+            wanted.setdefault(str(artifact_of), []).extend(_located(item.get("locator") or {}))
+        inputs.append(one)
+    queries = [await _query_step(a, cells, doc, sealed, masks) for a, cells in wanted.items()]
+    return [step, *inputs, *queries]
+
+
+def _located(locator: dict[str, Any]) -> list[tuple[Any, Any]]:
+    """输入的定位 → 被引用的格。单个格 {row, column}；数组字段是一段行 {rows:[a,b], column | columns}。"""
+    if isinstance(locator.get("row"), int):
+        return [(locator["row"], locator.get("column"))]
+    rows = locator.get("rows")
+    if isinstance(rows, list) and len(rows) == 2 and all(isinstance(r, int) for r in rows):
+        cols = [locator["column"]] if locator.get("column") else list((locator.get("columns") or {}).values())
+        return [(r, c) for r in range(rows[0], rows[1] + 1) for c in cols]
+    return []
+
+
+async def _caliber_source(source: Any) -> dict[str, Any] | None:
+    """钉住别处口径卡（caliber_from）时，定义取自哪个工作流的哪一版；带上工作流现在的名字方便认。"""
+    if not isinstance(source, dict) or not source.get("workflow_id"):
+        return None
+    async with SessionLocal() as session:
+        workflow = await session.get(Workflow, str(source["workflow_id"]))
+    return {**source, "workflow_name": workflow.name if workflow else None}
+
+
+def _caliber_upgrade(event: dict[str, Any] | None) -> dict[str, Any] | None:
+    """这张口径卡在正式运行发起时的升版处置：钉在哪一版、上游最新是哪一版、怎么处置的。"""
+    if not isinstance(event, dict):
+        return None
+    return {k: event.get(k) for k in ("workflow_id", "caliber_node", "pinned", "latest", "policy", "policy_label")}
+
+
+class _Masks:
+    """一次请求里查过的数据源遮罩：数据源名 → (要遮的列（小写）, 数据源现在还在不在)。"""
+
+    def __init__(self) -> None:
+        self._memo: dict[str, tuple[set[str], bool]] = {}
+
+    async def of(self, source: Any) -> tuple[set[str], bool]:
+        name = str(source or "")
+        if not name:
+            return set(), True
+        if name not in self._memo:
+            async with SessionLocal() as session:
+                row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
+            self._memo[name] = ({c.lower() for c in masked_columns(row.options if row else None)}, row is not None)
+        return self._memo[name]
+
+
+async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
+                      masks: _Masks) -> dict[str, Any]:
+    """查询步骤：被引用的格所在的行加前后各 WINDOW 行，高亮那几格，遮掉数据源设了遮罩的列。
+
+    快照只认封存范围内的事件交回过的那些（tool.end.query_artifact、node.finished.evidence 的
+    query 条目）；目录里写着、事件里追不到的，照实说不认，一行都不给。
+    """
+    catalog = doc.get("catalog") or {}
+    alias = _query_alias(catalog, artifact)
+    entry = catalog.get(alias, {}) if alias else {}
+    info = sealed.queries.get(artifact) if artifact else None
+    rows_hit = sorted({r for r, _ in cells if isinstance(r, int)})
+    cols_hit = list(dict.fromkeys(str(c) for _, c in cells if c))
+    step: dict[str, Any] = {
+        "step": "query", "alias": alias, "artifact": artifact or None,
+        "node_id": (info or {}).get("node_id") or entry.get("node_id"),
+        "tool": (info or {}).get("tool") or entry.get("tool"),
+        "source": (info or {}).get("source") or entry.get("source"),
+        "sql": None, "columns": [], "rows": [], "row_offset": 0, "row_index": [], "total_rows": None,
+        "truncated": None,
+        "highlight": {"rows": rows_hit, "cols": cols_hit,
+                      "cells": [[r, str(c)] for r, c in dict.fromkeys(cells) if isinstance(r, int) and c]},
+        "masked": [], "hash_ok": None, "sealed": False,
+    }
+    if info is None:
+        return {**step, "note": UNSEALED_QUERY}
+    step["sealed"] = sealed.trusted
+    try:
+        snap = load(artifact)
+        step["hash_ok"] = True if snap is not None else None
+    except ValueError:
+        snap, step["hash_ok"] = None, False
+    if not isinstance(snap, dict) or not isinstance(snap.get("rows"), list):
+        return {**step, "note": TAMPERED_QUERY if step["hash_ok"] is False else MISSING_QUERY}
+    columns = [str(c) for c in snap.get("columns") or []]
+    rows = snap["rows"]
+    step["source"] = step["source"] or snap.get("source")
+    # 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、
+    # 删掉了也不会把当时遮着的列亮出来
+    hidden, found = await masks.of(step["source"])
+    recorded = snap.get("mask_columns")
+    hidden = hidden | ({str(c).lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set())
+    if not found:
+        step["mask_note"] = SOURCE_GONE.format(source=step["source"])
+    masked = {i for i, c in enumerate(columns) if c.lower() in hidden}
+    index = sorted({i for r in rows_hit for i in range(r - WINDOW, r + WINDOW + 1) if 0 <= i < len(rows)})
+    step.update(sql=snap.get("sql"), columns=columns, total_rows=len(rows), truncated=bool(snap.get("truncated")),
+                masked=[columns[i] for i in sorted(masked)],
+                # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
+                column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {})
+    if len(index) > MAX_WINDOW_ROWS:
+        index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
+    step["row_index"] = index
+    step["row_offset"] = index[0] if index else 0
+    step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
+                    else rows[r] for r in index]
+    return step
 
 
 def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
@@ -422,6 +627,8 @@ def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
         return "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它"
     if issue == "unresolved_ref":
         return f"引用解析不了：{(seg.get('cite') or {}).get('reason') or '证据目录里没有它'}"
+    if seg.get("state") == "deterministic" and (seg.get("cite") or {}).get("kind") == "cell":
+        return "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
     if seg.get("state") == "deterministic":
         return "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写"
     kind = seg.get("kind")

@@ -57,7 +57,12 @@ async def run_output(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     reports = _report_fields(result, mapping, state, ctx)
     contract = ctx.cfg("contract")
     if contract:
-        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports)
+        cells = True
+        if isinstance(contract, dict) and contract.get("report_from") not in (None, ""):
+            from app.engine.governance import cells_allowed, governed_formal
+
+            cells = cells_allowed(contract, governed=await governed_formal(ctx.run.run_id))
+        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports, cells=cells)
     evidence = _evidence_of(reports, contract)
     if evidence:
         result["_evidence"] = evidence
@@ -137,7 +142,7 @@ def _evidence_of(reports: list[dict[str, Any]], contract: Any) -> dict[str, Any]
 
 def _apply_contract(
     contract: dict[str, Any], state: GraphState, ctx: NodeContext,
-    *, reports: list[dict[str, Any]] | None = None,
+    *, reports: list[dict[str, Any]] | None = None, cells: bool = True,
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
@@ -190,7 +195,7 @@ def _apply_contract(
     trace = None
     cited: dict[str, Any] = {}
     if citations:
-        cited = _check_citations(str(report_from), contract, state, ctx, reports or [])
+        cited = _check_citations(str(report_from), contract, state, ctx, reports or [], cells=cells)
         gaps.extend(cited["gaps"])
         unmatched = cited["unmatched"]
     else:
@@ -284,13 +289,15 @@ _INTEGRITY = {"bad_schema", "segment_mismatch", "structural_text", "render_misma
 
 def _check_citations(
     report_from: str, contract: dict[str, Any], state: GraphState, ctx: NodeContext,
-    reports: list[dict[str, Any]],
+    reports: list[dict[str, Any]], *, cells: bool = True,
 ) -> dict[str, Any]:
     """独立复核报告文档：{matched, unmatched, unresolved, gaps, doc_artifact, stats}。
 
     不信报告节点自己的统计：文档按 id 从工件库取回（取回时复验哈希），目录按报告节点
     同一套参数从状态里重建（不用文档里存的那份），每个带引用的片段重新解析、重新渲染、
     逐字比对。一个配错的报告节点绕不过这里。
+
+    cells：受管级别的正式运行、契约没声明 cells 时为 False，单元格引用一律判解析不了。
     """
     from app.core.artifact_store import load
     from app.engine.evidence import iter_units, resolve_ref, verify_doc
@@ -325,7 +332,7 @@ def _check_citations(
         return out
 
     catalog = report_catalog(state, spec, node)
-    checked = verify_doc(doc, catalog, allow_numbers=contract.get("allow_numbers"))
+    checked = verify_doc(doc, catalog, allow_numbers=contract.get("allow_numbers"), cells_allowed=cells)
     out["stats"] = checked["stats"]
     broken: list[str] = []
     flagged: set[str] = set()
@@ -350,7 +357,7 @@ def _check_citations(
         for seg in unit.get("segments") or []:
             if seg.get("kind") != "number" or not seg.get("ref") or seg.get("id") in flagged:
                 continue
-            cite = resolve_ref(str(seg["ref"]), catalog)
+            cite = resolve_ref(str(seg["ref"]), catalog, cells_allowed=cells)
             if cite["status"] != "resolved" or cite["rendered"] != seg.get("text"):
                 continue
             entry = catalog.get(cite["alias"]) or {}
@@ -360,6 +367,9 @@ def _check_citations(
                 label = " @ ".join(str(v) for v in (entry.get("caliber"), entry.get("version")) if v)
                 if label:
                     hit["caliber"] = label
+            elif cite["kind"] == "cell":
+                # 查询单元格：Q1.r0.gmv（全局编号，和 doc.catalog 一致）
+                hit["cell"] = f"{cite['alias']}.r{cite['locator']['row']}.{cite['locator']['column']}"
             else:
                 hit["input"] = cite["locator"].get("field")
             out["matched"].append({**hit, "segment": seg["id"], "unit": unit["id"], "start": start, "end": end,
@@ -437,15 +447,12 @@ async def run_transform(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     elif mode == "template":
         output = ctx.render_str(ctx.cfg("template", ""), state)
     elif mode == "json":
-        rendered = ctx.render_str(ctx.cfg("template", "{}"), state)
+        template = ctx.cfg("template", "{}")
+        rendered = ctx.render_str(template, state)
         try:
             output = json.loads(rendered)
         except json.JSONDecodeError as e:
-            raise NodeError(
-                ctx.node.id,
-                f"模板渲染出来的不是合法 JSON（第 {e.lineno} 行第 {e.colno} 列附近）。"
-                "检查模板里的引号、逗号，字符串值要用 | json 过滤器输出",
-            ) from e
+            raise _json_error(e, str(template or ""), tctx, ctx) from e
     else:
         raise NodeError(ctx.node.id, f"未知的整形模式：{mode}")
 
@@ -454,3 +461,184 @@ async def run_transform(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: output}
     return updates
+
+
+# --------------------------------------------------------------------------
+# 按 JSON 解析失败：错在模板，还是错在上游模型写的文字
+# --------------------------------------------------------------------------
+
+#: 产出是模型写的文字的节点（llm 配了 output_schema 时 text 是系统序列化的，但那样也解析得了）
+_MODEL_TEXT = (NodeType.AGENT, NodeType.LLM, NodeType.SUPERVISOR)
+#: 技术细节里给出出错位置前后各多少个字
+_NEAR = 30
+_NODE_HEAD = re.compile(r"^nodes\s*(?:\.\s*([\w-]+)|\[\s*['\"]([^'\"]+)['\"]\s*\])")
+_VAR_HEAD = re.compile(r"^vars\s*(?:\.\s*([\w-]+)|\[\s*['\"]([^'\"]+)['\"]\s*\])")
+
+
+TEMPLATE_HINT = "检查模板里的引号、逗号，字符串值要用 | json 过滤器输出"
+#: 解析器在这一段的头一个字上要的是这些：前一个值在模板里已经写完了，缺的是模板里的标点
+_DELIMITED = ("Expecting ',' delimiter", "Expecting ':' delimiter", "Extra data")
+
+
+def _json_error(e: json.JSONDecodeError, template: str, tctx: dict[str, Any], ctx: NodeContext) -> NodeError:
+    """整形节点按 JSON 解析失败时的报错。
+
+    真实踩过：整个模板就是 {{ nodes.X.text }}，agent 在 JSON 字符串里夹了没转义的英文双引号，
+    报错却让人去检查模板、加 | json，把人引到了错的方向。反过来也不行：出错的位置落在模型
+    写的那一段里，不等于错在模型——模板把一句话原样放进值的位置、放进引号里，或者紧挨着它
+    漏了逗号，都是模板的错，而且改法就是那句老提示。所以分三种说（见 _diagnose）：
+
+    - 上游确实在写 JSON 而没写对：点名上游、按实情说原因、指向结构化输出；
+    - 模板少了 | json：点名是模板里哪一段，给出改好的写法；
+    - 其余：原来那句提示。
+
+    出错位置前后的原文只进技术细节（包在原异常里）：首行是给人看的一句话，不贴模型的原文。
+    """
+    doc, pos = e.doc, e.pos
+    near = (doc[max(0, pos - _NEAR):pos] + "⟨此处⟩" + doc[pos:pos + _NEAR]).replace("\n", "\\n")
+    e.args = (f"{e.args[0]}\n出错位置前后的原文：{near}",)
+    verdict = _diagnose(template, tctx, ctx, e)
+    if verdict is None or isinstance(verdict, str):
+        return NodeError(ctx.node.id, f"模板渲染出来的不是合法 JSON（第 {e.lineno} 行第 {e.colno} 列附近）。"
+                                      f"{verdict or TEMPLATE_HINT}")
+    node, text, offset, reason = verdict
+    line = text.count("\n", 0, offset) + 1
+    column = offset - (text.rfind("\n", 0, offset) + 1) + 1
+    where = f"第 {line} 行第 {column} 列" if line > 1 else f"第 {column} 列"
+    fix = ("让模型交结构化数据请给它配 output_schema；数要进口径卡的，改用 agent 的 output_schema + cite_fields"
+           if node.type == NodeType.LLM else
+           "让模型交结构化数据请用 output_schema + cite_fields，别用整形节点解析它写的文字")
+    return NodeError(ctx.node.id, f"上游「{node.title}」输出的不是合法 JSON（{where}附近），{reason}；{fix}")
+
+
+def _diagnose(template: str, tctx: dict[str, Any], ctx: NodeContext,
+              e: json.JSONDecodeError) -> tuple[GraphNode, str, int, str] | str | None:
+    """按 JSON 解析失败，错在谁。
+
+    返回 (上游节点, 它写的那段文字, 出错位置在文字里的偏移, 原因) 表示错在上游；返回一句话
+    表示错在模板、而且说得出是哪一段；返回 None 表示照原来那句提示。
+
+    只有上游确实在写 JSON（去掉开头空白后以 { 或 [ 开头，或者包在 ``` 代码块里）、而且这一段
+    不在模板的引号里，才算上游的错；整个模板就是这一段时，模板不可能写错，也算上游的。
+    解析器停在这一段末尾时（紧跟着的逗号漏了），只有它自己开了括号、引号没收尾才怪它。
+
+    每个 {{ }} 单独渲染一次再拼起来，和 render_template 的整段替换结果逐字相同。
+    """
+    from app.engine.expressions import _TEMPLATE_RE, render_template, resolve_path
+
+    doc, pos = e.doc, e.pos
+    at, last = 0, 0
+    for m in _TEMPLATE_RE.finditer(template):
+        at += m.start() - last
+        piece = render_template(m.group(0), tctx)
+        start, end = at, at + len(piece)
+        at, last = end, m.end()
+        expr = m.group(1).strip()
+        head, *filters = [p.strip() for p in expr.split("|")]
+        if not head or pos < start:
+            continue
+        # 解析器越过空白才报错：停在这一段后面、中间只隔着空白的，也是停在它末尾
+        at_end = pos >= end and not doc[end:pos].strip()
+        if not piece.strip():
+            # 取出来是空的，解析器正好在这里要一个值
+            if e.msg == "Expecting value" and not doc[start:pos].strip() and not _in_json_string(doc, start):
+                return f"模板里 {{{{ {expr} }}}} 取出来是空的，这里缺一个值：检查路径写对没有、前面的节点有没有产出"
+            continue
+        if pos > end and not at_end:
+            continue
+        quoted = _in_json_string(doc, start)
+        if "json" in filters:
+            # 过了 | json 就是一个合法的 JSON 值：错不在它的内容里，除非外面又套了一层引号
+            return (f"模板里 {{{{ {expr} }}}} 出来的已经是合法的 JSON（文字自带引号），外面不要再加引号"
+                    if quoted and not at_end else None)
+        value = resolve_path(tctx, head)
+        if not isinstance(value, str) or value != piece:
+            return None
+        node = _producer(head, ctx)
+        model = node is not None and node.type in _MODEL_TEXT
+        lead = start + len(piece) - len(piece.lstrip())
+        if pos == lead and e.msg.startswith(_DELIMITED):
+            return None                          # 前一个值在模板里就写完了，缺的是它前面的标点
+        if template.strip() == m.group(0):
+            return (node, piece, pos - start, _why(piece, at_end)) if model else None
+        if at_end and not _unclosed(piece):
+            return None                          # 这一段本身完整，缺的是它后面的标点
+        if quoted:
+            return _needs_json(expr, model)
+        if _writes_json(piece):
+            return (node, piece, pos - start, _why(piece, at_end)) if model else None
+        return _needs_json(expr, model)
+    return None
+
+
+def _needs_json(expr: str, model: bool) -> str:
+    what = "模型写的文字" if model else "一段文字"
+    return f"模板里 {{{{ {expr} }}}} 是{what}，放进 JSON 要写成 {{{{ {expr} | json }}}}（外面不要再加引号）"
+
+
+def _why(text: str, at_end: bool) -> str:
+    """上游写的 JSON 为什么解析不了，按看得出来的实情说。"""
+    body = text.lstrip()
+    if body.startswith("```"):
+        return "它把 JSON 包在了 ``` 代码块里"
+    if at_end and _unclosed(text):
+        return "它写的 JSON 没有收尾，可能写到一半被截断了"
+    if not body.startswith(("{", "[")):
+        return "它写的是一段文字，不是 JSON"
+    return "常见原因是字符串里有没转义的英文引号"
+
+
+def _writes_json(text: str) -> bool:
+    """这段文字看得出是想写 JSON：以 { 或 [ 开头，或者是包在 ``` 代码块里的 JSON。"""
+    body = text.lstrip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
+    return body.startswith(("{", "["))
+
+
+def _in_json_string(doc: str, index: int) -> bool:
+    """doc[:index] 结束时是不是在一个 JSON 字符串里。解析器已经越过了这里，这一段前缀是
+    合法的 JSON 开头，数引号（跳过转义）就数得准。"""
+    inside, i = False, 0
+    while i < index:
+        ch = doc[i]
+        if inside and ch == "\\":
+            i += 2
+            continue
+        if ch == '"':
+            inside = not inside
+        i += 1
+    return inside
+
+
+def _unclosed(text: str) -> bool:
+    """这段文字自己开了引号、括号却没收尾（单独看它，从字符串外面数起）。"""
+    depth, inside, i = 0, False, 0
+    while i < len(text):
+        ch = text[i]
+        if inside:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                inside = False
+        elif ch == '"':
+            inside = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        i += 1
+    return inside or depth > 0
+
+
+def _producer(path: str, ctx: NodeContext) -> GraphNode | None:
+    """模板路径取的是哪个节点的产出：nodes.X 就是 X；vars.Y 是 assign_to 为 Y 的节点。"""
+    nodes = ctx.run.spec.node_map()
+    if m := _NODE_HEAD.match(path):
+        return nodes.get(m.group(1) or m.group(2))
+    if m := _VAR_HEAD.match(path):
+        var = m.group(1) or m.group(2)
+        writers = [n for n in ctx.run.spec.nodes if str(n.config.get("assign_to") or "").strip() == var]
+        # 好几个节点写同一个变量时说不准是谁，宁可给原来的提示也不点错名
+        return writers[0] if len(writers) == 1 else None
+    return None

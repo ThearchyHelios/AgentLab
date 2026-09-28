@@ -65,8 +65,16 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return first(config.title) || '人工审批 · 未填标题'
     case 'validate':
       return 'JSON Schema 校验' + (config.repair_with_llm ? ' · 失败自动返工' : '')
-    case 'metrics':
+    case 'metrics': {
+      // 钉住别的工作流里的口径卡：本地那几项不生效，写「0 个指标」会让人以为卡是空的
+      const from = config.caliber_from
+      if (from && typeof from === 'object') {
+        return from.workflow_id && from.workflow_version && from.node_id
+          ? `钉住上游口径卡 v${from.workflow_version} · 节点 ${from.node_id}${config.upgrade_policy ? ` · 升版按 ${config.upgrade_policy}` : ''}`
+          : '钉住上游口径卡 · 还没选完'
+      }
       return `${config.caliber || '口径'}@${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
+    }
     case 'report': {
       const from = Array.isArray(config.metrics_from) ? config.metrics_from.length : 0
       return `${first(config.instructions) || '未填写作要求'} · ${from ? `${from} 张口径卡` : '上游全部口径卡'}`

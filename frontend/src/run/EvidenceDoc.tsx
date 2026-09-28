@@ -27,8 +27,9 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  * 句末挂「无证据」。
  *
  * 键盘：整份报告只占一个 Tab 位（roving tabindex）。←/→ 在有状态的片段间走，↑/↓ 按
- * 句子走，n / N 跳到下一处 / 上一处无证据，回车打开证据面板，Esc 关掉并留在原片段；
- * 面板开着时方向键走到哪、面板跟到哪，Tab 进面板。
+ * 句子走（表格里按列走到上一行 / 下一行，出了表格接着按句子走），n / N 跳到下一处 /
+ * 上一处无证据，回车打开证据面板，Esc 关掉并留在原片段；面板开着时方向键走到哪、面板
+ * 跟到哪，Tab 进面板。
  *
  * 长报告：事件都挂在容器上（片段只带 data-seg），块用 memo，外加
  * content-visibility: auto；超过 TEXT_CAP 的部分先折叠，跳转到折叠里的片段时自动展开。
@@ -56,6 +57,10 @@ interface Model {
   alerts: string[]
   /** 每块到它为止的累计字数（折叠用） */
   chars: number[]
+  /** 表格里的片段在第几行第几列（表头 row = -1 不进来）；↑/↓ 在表格里按列走 */
+  cell: Map<string, { block: number; row: number; col: number }>
+  /** `块:行:列` → 那一格里第一个可点的片段 */
+  grid: Map<string, string>
 }
 
 function buildModel(blocks: EvidenceBlock[]): Model {
@@ -66,10 +71,13 @@ function buildModel(blocks: EvidenceBlock[]): Model {
   const unitOf = new Map<string, number>()
   const alerts: string[] = []
   const chars: number[] = []
+  const cell = new Map<string, { block: number; row: number; col: number }>()
+  const grid = new Map<string, string>()
   let total = 0
   blocks.forEach((block, b) => {
     for (const unit of block.units ?? []) {
       let first = true
+      const loc = block.type === 'table' && unit.loc && unit.loc.row >= 0 ? unit.loc : null
       for (const s of unit.segments ?? []) {
         if (s.kind !== 'structural') total += s.text.length
         const state = segmentState(s)
@@ -80,11 +88,47 @@ function buildModel(blocks: EvidenceBlock[]): Model {
         if (first) { unitFirst.push(s.id); first = false }
         unitOf.set(s.id, unitFirst.length - 1)
         if (EVIDENCE_STATE[state].alert) alerts.push(s.id)
+        if (loc) {
+          cell.set(s.id, { block: b, row: loc.row, col: loc.col })
+          const key = `${b}:${loc.row}:${loc.col}`
+          if (!grid.has(key)) grid.set(key, s.id)
+        }
       }
     }
     chars.push(total)
   })
-  return { order, index, seg, unitFirst, unitOf, alerts, chars }
+  return { order, index, seg, unitFirst, unitOf, alerts, chars, cell, grid }
+}
+
+/**
+ * ↑/↓ 该去哪。表格里按列走：下一行同一列（那一格空着就找这一行离它最近的一格）；
+ * 走出表格的上下边，接着按句子走到表格前后那一句——不在表格里一格一格地横着挪
+ */
+function verticalTarget(model: Model, id: string, down: boolean): string | null {
+  const n = model.unitFirst.length
+  if (!n) return null
+  const at = model.cell.get(id)
+  if (at) {
+    const rows = [...new Set([...model.cell.values()].filter((c) => c.block === at.block).map((c) => c.row))].sort((a, b) => a - b)
+    const next = rows[rows.indexOf(at.row) + (down ? 1 : -1)]
+    if (next !== undefined) {
+      const same = model.grid.get(`${at.block}:${next}:${at.col}`)
+      if (same) return same
+      const near = [...model.cell.entries()].filter(([, c]) => c.block === at.block && c.row === next)
+        .sort((a, b) => Math.abs(a[1].col - at.col) - Math.abs(b[1].col - at.col))[0]
+      if (near) return near[0]
+    }
+    // 出了表格：往下找表格之后的第一句，往上找表格之前的最后一句
+    const u = model.unitOf.get(id) ?? 0
+    const list = down ? model.unitFirst.slice(u + 1) : model.unitFirst.slice(0, u).reverse()
+    const out = list.find((sid) => model.seg.get(sid)?.block !== at.block)
+    if (out) return out
+    // 表格就是整份报告的首尾：和句子一样首尾相接
+    const wrap = down ? model.unitFirst : [...model.unitFirst].reverse()
+    return wrap.find((sid) => model.seg.get(sid)?.block !== at.block) ?? null
+  }
+  const u = model.unitOf.get(id) ?? 0
+  return model.unitFirst[(u + (down ? 1 : -1) + n) % n] ?? null
 }
 
 /** 片段的外观：线型走 data 属性（CSS 里只管线型），颜色写成两个变量交给 index.css */
@@ -246,9 +290,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       const to = rovingTarget(e, i, model.order.length, 'horizontal')
       target = to >= 0 ? model.order[to] : null
     } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      const u = model.unitOf.get(id) ?? 0
-      const n = model.unitFirst.length
-      target = model.unitFirst[(u + (e.key === 'ArrowDown' ? 1 : -1) + n) % n] ?? null
+      target = verticalTarget(model, id, e.key === 'ArrowDown')
     } else if (e.key === 'n' || e.key === 'N') {
       target = step(model.alerts, id, e.shiftKey || e.key === 'N' ? -1 : 1)
       if (!target) return

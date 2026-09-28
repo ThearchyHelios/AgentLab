@@ -1,14 +1,36 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Any
 
+from app.core import artifact_store
 from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError
-from app.engine.evidence import DEFAULT_FORMAT, FORMATS, MISSING, RenderError, is_number, render_number
-from app.engine.expressions import ExpressionError, eval_expression, leaf_refs, parse_expression, substitute
+from app.engine.evidence import (
+    DEFAULT_FORMAT,
+    FORMATS,
+    MISSING,
+    RenderError,
+    cell_eid,
+    is_number,
+    next_exec,
+    render_number,
+)
+from app.engine.expressions import (
+    CellError,
+    ExpressionError,
+    cell_parts,
+    cell_value,
+    eval_expression,
+    leaf_refs,
+    locate_cell,
+    parse_expression,
+    same_value,
+    substitute,
+)
 from app.engine.state import GraphState, template_context
 
 
@@ -24,12 +46,18 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     数字点开，一路能追到这里。
     """
     definitions = ctx.cfg("metrics", []) or []
+    caliber_raw, caliber_version = ctx.cfg("caliber", "") or ctx.node.title, str(ctx.cfg("caliber_version", "") or "v1")
+    source: dict[str, Any] | None = None
+    if ctx.config.get("caliber_from") not in (None, "", {}):
+        # 钉住别的工作流某一版里的口径卡：名字、版本、指标定义都按那一版，本地写的不算
+        pinned, source = await _pinned_caliber(ctx)
+        definitions = pinned["metrics"]
+        caliber_raw, caliber_version = pinned["caliber"], pinned["caliber_version"]
     if not definitions:
         raise NodeError(ctx.node.id, "口径卡没有定义任何指标")
 
     tctx = template_context(state)
-    caliber = ctx.render_str(ctx.cfg("caliber", "") or ctx.node.title, state)
-    caliber_version = str(ctx.cfg("caliber_version", "") or "v1")
+    caliber = ctx.render_str(caliber_raw, state)
     # 缺输入时怎么办。默认 fail：和以前一样整张卡失败；null 则这个指标记为空值、
     # 交给出具契约的 required / expected 去判档
     on_missing = str(ctx.cfg("on_missing", "fail") or "fail")
@@ -98,7 +126,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "decimals": decimals,
                 "format": display["format"],
                 "rendered": _rendered(value, definition, display),
-                "inputs": [_input_of(path, values[path], state, ctx) for path in paths],
+                "inputs": [_input_of(path, values[path], state, ctx, tctx) for path in paths],
                 "substituted": substituted,
                 "recompute_ok": _recompute(substituted, tctx, value, decimals),
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
@@ -123,6 +151,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "caliber_version": caliber_version,
         "metrics": metrics,
     }
+    if source:
+        # 指标定义来自哪个工作流的哪一版：证据面板的指标步骤据此写出处，升版处置按它比版本
+        card["source"] = source
     artifact = await _store(card, caliber, caliber_version, ctx)
     result = {
         **card,
@@ -137,21 +168,74 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     if artifact:
         result["artifact"] = artifact
-        executed = sum(1 for t in state.get("trail") or []
-                       if t.get("node_id") == ctx.node.id and "error" not in t)
         updates["evidence"] = [{
             "kind": "metric_set",
             "node_id": ctx.node.id,
-            "exec": executed + 1,
+            "exec": next_exec(state, ctx.node.id),
             "artifact": artifact,
             "caliber": caliber,
             "version": caliber_version,
             "metrics": [m["id"] for m in metrics],
+            **({"source": source} if source else {}),
         }]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: result}
     return updates
+
+
+async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, Any]]:
+    """caliber_from 指向的那张口径卡：({caliber, caliber_version, metrics}, 来源)。
+
+    从那个工作流的 WorkflowVersion 快照里取——版本快照不可变，同一份引用每次取到的定义都一样，
+    审批恢复后节点重放也还是这一份。取不到就让节点失败并说清是哪一环断了：悄悄退回本地
+    定义，等于换了口径还照常出具。
+    """
+    from sqlalchemy import select
+
+    from app.db.base import SessionLocal
+    from app.db.models import Workflow, WorkflowVersion
+    from app.engine.schema import type_label
+
+    ref = ctx.config.get("caliber_from")
+    wf_id = str(ref.get("workflow_id") or "").strip() if isinstance(ref, dict) else ""
+    node_id = str(ref.get("node_id") or "").strip() if isinstance(ref, dict) else ""
+    version = _integer(ref.get("workflow_version")) if isinstance(ref, dict) else None
+    if not wf_id or not node_id or version is None or version < 1:
+        raise NodeError(ctx.node.id, "caliber_from 要写 {workflow_id, workflow_version, node_id}：钉住哪个工作流"
+                                     f"的哪一版里的哪张口径卡，写的是 {ref!r}")
+    async with SessionLocal() as session:
+        workflow = await session.get(Workflow, wf_id)
+        if workflow is None:
+            raise NodeError(ctx.node.id, f"caliber_from 钉住的工作流 {wf_id} 不存在（可能已经被删了）："
+                                         "在节点里重新选一张口径卡")
+        snapshot = (await session.execute(select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == wf_id, WorkflowVersion.version == version))).scalar_one_or_none()
+        name = workflow.name
+    if snapshot is None:
+        raise NodeError(ctx.node.id, f"caliber_from 钉住的「{name}」没有 v{version} 这个版本：在节点里重新选版本")
+    found = next((n for n in (snapshot.graph or {}).get("nodes") or []
+                  if isinstance(n, dict) and n.get("id") == node_id), None)
+    if found is None:
+        raise NodeError(ctx.node.id, f"「{name}」v{version} 里没有节点 {node_id}：在节点里重新选一张口径卡")
+    data = found.get("data") if isinstance(found.get("data"), dict) else {}
+    title = data.get("label") or node_id
+    if found.get("type") != "metrics":
+        raise NodeError(ctx.node.id, f"caliber_from 指向的「{name}」v{version} 里的「{title}」不是口径卡，"
+                                     f"是「{type_label(found.get('type'))}」")
+    cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+    origin = cfg.get("caliber_from")
+    if origin not in (None, "", {}):
+        root = origin.get("workflow_id") if isinstance(origin, dict) else None
+        async with SessionLocal() as session:
+            upstream = await session.get(Workflow, str(root)) if root else None
+        where = (f"「{upstream.name}」v{origin.get('workflow_version')} 的 {origin.get('node_id')}"
+                 if upstream is not None else f"{origin!r}")
+        raise NodeError(ctx.node.id, f"「{name}」v{version} 里的「{title}」自己也是钉住别处的口径卡（源头是 {where}）："
+                                     "直接钉住源头那张，升版处置才比得对版本")
+    source = {"workflow_id": wf_id, "workflow_version": version, "node_id": node_id}
+    return {"caliber": cfg.get("caliber") or title, "caliber_version": str(cfg.get("caliber_version") or "v1"),
+            "metrics": cfg.get("metrics") or []}, source
 
 
 #: 新写法的小数位范围。负数是取整到十位、百位（round(x, -2)）
@@ -248,12 +332,19 @@ _VIA = {"input": "input", "code": "code", "agent": "agent", "llm": "llm", "tool"
         "memory": "memory"}
 
 
-def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext) -> dict[str, Any]:
+def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
+              tctx: dict[str, Any] | None = None) -> dict[str, Any]:
     """一个输入的来历：{path, value, node_id, via, field?, role?, status}。
 
     vars.X 要反查是谁写的：assign_to 为 X 的节点里，按执行顺序最后跑的那一个——
     和状态里 vars 的覆盖顺序一致。入口节点把输入字段也写进 vars。
+
+    两种来历能追到查询快照里的那一格：
+    - cell(nodes.fetch, 0, 'gmv')：via tool_cell，带 locator、artifact、eid，按快照核对
+    - agent 开了 cite_fields 的字段：via agent_field，接上它的 data_evidence（eid、核对状态）
     """
+    if (parts := cell_parts(path)) is not None:
+        return _cell_input(path, value, parts, state, ctx, tctx or template_context(state))
     spec = ctx.run.spec
     nodes = spec.node_map()
     node_id: str | None = None
@@ -281,6 +372,136 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext) -> dic
         # 沙箱算出来的数喂给口径卡：记下它自认是「取数」还是「计算」，治理规则按它判
         entry["role"] = str(producer.config.get("evidence_role") or "compute")
     entry["status"] = "ok" if value is not None else "missing"
+    if producer is not None and str(producer.type) == "agent" and field:
+        cited = _agent_field(state, producer.id, root if head else "", field)
+        if cited is not None:
+            entry.update(cited)
+    return entry
+
+
+def _field_key(field: str) -> str:
+    """vars.kpi['gmv'] 和 vars.kpi.gmv 是同一个字段：下标写法换成点号。"""
+    return re.sub(r"\[\s*['\"]([^'\"\]]+)['\"]\s*\]", r".\1", field).strip(".")
+
+
+def _agent_field(state: GraphState, node_id: str, root: str, field: str) -> dict[str, Any] | None:
+    """agent 字段的出处：{via: agent_field, field, ref, artifact, locator, eid, status, model_value?, reason?}。
+
+    assign_to 写进 vars 的是 data 本身，nodes.<agent> 下要多走一层 data。没开 cite_fields
+    （或者是老运行）的 agent 没有 data_evidence，返回 None，来历照旧记成 agent。
+    """
+    output = (state.get("nodes") or {}).get(node_id)
+    evidence = output.get("data_evidence") if isinstance(output, dict) else None
+    if not isinstance(evidence, dict):
+        return None
+    key = _field_key(field)
+    if root == "nodes":
+        if not key.startswith("data."):
+            return None
+        key = key[len("data."):]
+    cited = evidence.get(key)
+    if not isinstance(cited, dict):
+        return _agent_element(evidence, key)
+    out: dict[str, Any] = {"via": "agent_field", "field": key, "status": cited.get("status") or "unresolved"}
+    for k in ("ref", "artifact", "locator", "eid", "model_value", "reason"):
+        if k in cited:
+            out[k] = cited[k]
+    return out
+
+
+_ELEMENT = re.compile(r"^(?P<base>[^\[\]]+)\[(?P<index>\d+)\](?:\.(?P<sub>[^\[\]]+))?$")
+
+
+def _agent_element(evidence: dict[str, Any], key: str) -> dict[str, Any] | None:
+    """数组字段里的一个元素（vars.kpi.weeks[1].amount）：按行映射落到快照里的一格。
+
+    数组的出处是一段行 rows=[a, b] 加列；第 k 个元素就是第 a+k 行。整组的核对状态说的是整组：
+    别的元素对不上，不等于这一个也对不上。所以这一个元素按它自己那一格再核一遍——模型报的是
+    model_value 里的第 k 个（整组 verified 时模型报的就是快照里的值），和快照里那一格比。
+    """
+    m = _ELEMENT.match(key)
+    cited = evidence.get(m.group("base")) if m else None
+    locator = cited.get("locator") if isinstance(cited, dict) else None
+    if not (isinstance(locator, dict) and isinstance(locator.get("rows"), list) and len(locator["rows"]) == 2):
+        return None
+    first, last = locator["rows"]
+    index, sub = int(m.group("index")), m.group("sub")
+    row = first + index
+    column = (locator.get("columns") or {}).get(sub) if sub else locator.get("column")
+    if row > last or not isinstance(column, str):
+        return None
+    call, artifact = str(cited.get("call") or ""), cited.get("artifact")
+    out: dict[str, Any] = {"via": "agent_field", "field": key, "ref": f"{call}.r{row}.{column}", "artifact": artifact,
+                           "locator": {"row": row, "column": column}, "eid": cell_eid(artifact, row, column)}
+    try:
+        truth, _ = locate_cell(artifact_store.load(artifact), row, column)
+    except (ValueError, CellError, OSError) as e:
+        out.update(status="unresolved", reason=f"查询快照取不回来或对不上：{e}")
+        return out
+    if cited.get("status") == "verified":
+        out["status"] = "verified"
+        return out
+    told = cited.get("model_value")
+    item = told[index] if isinstance(told, list) and index < len(told) else None
+    reported = isinstance(told, list) and index < len(told) and (not sub or (isinstance(item, dict) and sub in item))
+    element = (item[sub] if sub else item) if reported else None
+    if reported and same_value(element, truth):
+        out["status"] = "verified"
+    else:
+        # 模型没报这个元素（给的数组短了）就没有 model_value 可留
+        out.update(status="mismatch", **({"model_value": element} if reported else {}))
+    return out
+
+
+def _cell_input(path: str, value: Any, parts: tuple[str, str, str], state: GraphState, ctx: NodeContext,
+                tctx: dict[str, Any]) -> dict[str, Any]:
+    """cell() 取的那一格：它来自哪次查询（台账里的 query 条目）、第几行哪一列、快照里是不是这个值。
+
+    查询结果经 transform 解析过也认得出来：数据源工具交回的 JSON 里带着快照的工件 id。
+    取不到快照、或者快照里那一格和算的时候用的值不一样，status 如实写，不替它圆。
+    """
+    source, row_src, column_src = parts
+    entry: dict[str, Any] = {"path": path, "value": value if value is None or isinstance(value, (int, float, str, bool))
+                             else _brief(value), "node_id": None, "via": "tool_cell"}
+    table = _value_of(source, tctx)
+    row, column = _value_of(row_src, tctx), _value_of(column_src, tctx)
+    data = table
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    artifact = data.get("artifact") if isinstance(data, dict) else None
+    queries = [e for e in state.get("evidence") or [] if isinstance(e, dict) and e.get("kind") == "query"]
+    ledger = next((e for e in reversed(queries) if artifact and e.get("artifact") == artifact), None)
+    head = _REF_HEAD.match(source)
+    if ledger is None and head and head.group(1) == "nodes":
+        # 台账是按工件认的；工具交回的不是带工件 id 的 JSON 时，按取值链上的节点找它最后一次查询
+        ledger = next((e for e in reversed(queries) if e.get("node_id") == head.group(2)), None)
+    if ledger is None:
+        entry.update(node_id=head.group(2) if head and head.group(1) == "nodes" else None,
+                     status="unresolved", reason="找不到这份数据对应的查询快照：cell() 要取查询工具交回的结果")
+        return entry
+    entry["node_id"] = ledger.get("node_id")
+    artifact = ledger.get("artifact")
+    try:
+        raw, name = locate_cell(data if isinstance(data, dict) else table, row, column)
+    except CellError as e:
+        entry.update(status="unresolved", reason=f"cell() {e}", artifact=artifact)
+        return entry
+    locator = {"row": row, "column": name}
+    entry.update(locator=locator, artifact=artifact, eid=cell_eid(artifact, row, name))
+    try:
+        snapshot = artifact_store.load(artifact)
+        truth, _ = locate_cell(snapshot, row, name)
+    except (ValueError, CellError, OSError) as e:
+        entry.update(status="unresolved", reason=f"查询快照取不回来或对不上：{e}")
+        return entry
+    if cell_value(truth) != cell_value(raw):
+        # 算的时候用的值和快照不一样（上游改写过这份结果）：照实记下快照里的值
+        entry.update(status="mismatch", snapshot_value=cell_value(truth))
+        return entry
+    entry["status"] = "verified"
     return entry
 
 

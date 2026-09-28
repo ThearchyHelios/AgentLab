@@ -8,15 +8,20 @@
 整个模块是纯函数（不碰数据库、不调模型），报告节点自查、出口契约复核、证据接口
 共用这一份，免得三处各写一套规则、各判各的。
 
-标记语法（本期支持的四种）：
+标记语法：
 
-    [[m:<指标 id>]]          口径卡指标，渲染成「值+单位」
-    [[m:<指标 id>|万]]        换算显示：万 / 亿 / pct / int / .N（小数位），由渲染器完成
-    [[i:<输入字段>]]          运行输入
-    [[see:<ref>,<ref>…]]     依据：挂在句末，不渲染
+    [[m:<指标 id>]]                口径卡指标，渲染成「值+单位」
+    [[m:<指标 id>|万]]              换算显示：万 / 亿 / pct / int / .N（小数位），由渲染器完成
+    [[v:Q<n>.r<行>.<列>]]           查询快照里的一格（取回时复验哈希），也能加 |万 这类换算
+    [[table:Q<n> cols=a,b rows=0-4]] 整表：系统从快照生成 Markdown 表，每一格都是带出处的片段
+    [[i:<输入字段>]]                运行输入
+    [[see:<ref>,<ref>…]]           依据：挂在句末，不渲染
 
-`[[v:]]` `[[t:]]` `[[c:]]` `[[q:]]` `[[table:]]` 能解析，本期一律判为解析不了，
-原因写「这种引用在后续版本支持」。
+`[[t:]]` `[[c:]]` `[[q:]]` 能解析，本期一律判为解析不了，原因写「这种引用在后续版本支持」。
+沙箱代码节点的产出不能直接引用（`[[v:N:calc.x]]`），原因写「沙箱算出来的数要进口径卡」。
+
+单元格和整表要读快照：整个模块仍然不碰数据库、不调模型，快照经 loader 取（缺省是
+artifact_store.load，只读文件）。测试和接口可以换成自己的 loader。
 
 偏移一律按 Unicode 码点算（Python 的 str 下标）。前端的 JS 字符串按 UTF-16 计，
 碰到码点在 BMP 之外的字符（emoji）要自己换算。
@@ -25,12 +30,16 @@
 from __future__ import annotations
 
 import bisect
+import json
 import math
 import re
+from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
 from app.core.artifact_store import canonical_json, content_hash
+from app.core.artifact_store import load as load_artifact
+from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.issuance import extract_numbers, number_allowance
 
 DOC_SCHEMA = "agentlab.report/1"
@@ -57,6 +66,9 @@ class EvidenceEntry(TypedDict, total=False):
     caliber: str              # metric_set 专有：口径名、版本、指标 id 清单
     version: str
     metrics: list[str]
+    code_sha: str             # node_output（代码节点）专有：实际执行的代码的 sha256、
+    role: str                 # evidence_role（source / compute）、语言
+    language: str
 
 
 class Citation(TypedDict, total=False):
@@ -138,6 +150,56 @@ def input_eid(field: str, value: Any) -> str:
     目录条目里记着 value，拿它就能复算：make_eid("input", content_hash(canonical_json(value)), {"field": field})。
     """
     return make_eid("input", content_hash(canonical_json(value)), {"field": field})
+
+
+def cell_eid(artifact: str | None, row: int, column: str) -> str:
+    """查询快照里一格的 eid。报告的 [[v:]]、agent 字段的出处、口径卡的 cell() 都按它算，
+    同一格在三处是同一个标识。column 一律是列名（列号先换成列名）。"""
+    return make_eid("cell", artifact, {"row": row, "column": column})
+
+
+# --------------------------------------------------------------------------
+# 台账：节点执行器写条目时用的几件小事
+# --------------------------------------------------------------------------
+
+
+def ledger_enabled(run: Any) -> bool:
+    """这次运行记不记证据台账（以及二期的其他新行为）。
+
+    判断「升级前发起的运行」沿用护栏那次加的快照：agent_limits 为 None 的运行可能正停在
+    某个审批上，节点恢复时整个重放——多一个 task、给模型的消息多一行，checkpoint 里缓存
+    的结果就对错号。这类运行一律走旧逻辑，一个字都不加。
+    """
+    return getattr(run, "agent_limits", None) is not None
+
+
+def next_exec(state: Any, node_id: str) -> int:
+    """这个节点这是第几次成功执行（从 1 数，循环里会有多次），按 trail 算。"""
+    done = sum(1 for t in (state.get("trail") or []) if t.get("node_id") == node_id and "error" not in t)
+    return done + 1
+
+
+def query_entry_fields(payload: Any) -> dict[str, Any] | None:
+    """数据源查询工具交回的 JSON（文本或已解析的对象）→ 台账 query 条目要的字段。
+
+    不是一次成功的查询（「查询失败：…」这类原话、别的工具的返回、没落成快照的）返回 None。
+    rows 是快照里的行数：单元格按快照里的行号引用。
+    """
+    data = payload
+    if isinstance(data, str):
+        if not data.lstrip().startswith("{"):
+            return None
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    artifact, columns, rows = data.get("artifact"), data.get("columns"), data.get("rows")
+    if not (isinstance(artifact, str) and artifact and isinstance(columns, list) and isinstance(rows, list)):
+        return None
+    return {"artifact": artifact, "source": data.get("source"), "columns": [str(c) for c in columns],
+            "rows": len(rows), "truncated": bool(data.get("truncated"))}
 
 
 # --------------------------------------------------------------------------
@@ -307,6 +369,29 @@ def render_metric(metric: dict[str, Any], conv: str | None = None) -> str:
     )
 
 
+def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None) -> str:
+    """查询快照里的一格渲染成字。
+
+    - 数按千分位，小数位照值本来的样子（最多 10 位、去尾零）；DECIMAL 落盘后的数字文本
+      （"45678.50"，小数位为 0 的 "45678"，规则见 expressions.cell_value）按数算，用 Decimal
+      渲染，不经 float 丢精度
+    - kind 是这一列查询时记下的类型：text 列按文本，VARCHAR 的 "2026" 不渲染成「2,026」；
+      老快照没记类型就按值猜
+    - NULL 显示「—」：这是快照里的事实（那一格就是空的），不是缺值，更不是 0
+    - 文本压成一行，竖线换成 ¦：它常常落在表格里，原样的 | 会多切出一格
+    """
+    if isinstance(value, str) and cell_value(value, kind) is not value:
+        try:
+            return _render_numeric(Decimal(value.strip()), unit="", decimals=None, fmt=DEFAULT_FORMAT, conv=conv)
+        except RenderError:
+            raise
+        except (ArithmeticError, ValueError) as e:
+            raise RenderError(f"{value!r} 按规则渲染不出来（{type(e).__name__}）") from e
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    return render_number(value, fmt=DEFAULT_FORMAT, conv=conv).replace("|", "¦")
+
+
 # --------------------------------------------------------------------------
 # 标记语法
 # --------------------------------------------------------------------------
@@ -321,9 +406,18 @@ _MARKER_GUARD = rf"(?=[^\[\]\n]{{0,{MARKER_MAX - 4}}}\]\])"
 #: [[kind:body]]。body 里不许有方括号和换行——这样一个没闭合的 [[ 最多吞到行尾
 MARKER_RE = re.compile(
     r"\[\[" + _MARKER_GUARD + r"[ \t]*(?P<kind>[A-Za-z]+)[ \t]*:(?P<body>[^\[\]\n]*?)\]\]")
-SUPPORTED_KINDS = frozenset({"m", "i", "see"})
-LATER_KINDS = frozenset({"v", "t", "c", "q", "table"})
+SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table"})
+LATER_KINDS = frozenset({"t", "c", "q"})
 LATER_REASON = "这种引用在后续版本支持"
+#: 沙箱代码节点的产出不能直接引用：它能做任意计算，那种数要进口径卡、留下代入式
+CODE_REASON = "沙箱算出来的数要进口径卡"
+#: 受管级别的正式出具，契约里没写 "cells": true 时复核按这个原因拒掉单元格引用
+CELLS_REASON = "受管出具要在契约里声明 cells"
+NODE_FIELD_REASON = "节点字段引用在后续版本支持：数要从查询单元格 [[v:Q1.r0.列]] 或口径卡指标 [[m:…]] 来"
+#: 整表：不写 rows 时取前几行、最多几行、不写 cols 时最多几列
+TABLE_DEFAULT_ROWS = 5
+TABLE_MAX_ROWS = 20
+TABLE_MAX_COLS = 12
 _ROLE = {"t": "entity", "c": "entity", "q": "quote"}
 _SEG_KIND = {"t": "entity", "c": "entity", "q": "quote"}
 
@@ -410,6 +504,9 @@ def build_catalog(
 
     同一个指标 id 出现在两张卡里时不登记 m:<id>，只登记 m:<卡的节点 id>.<id>——
     按先来后到默认给一个，正是旧契约错配的那种错。
+
+    沙箱代码节点的台账条目登记成 N:<节点 id>（kind node_output，code: True）：不编号、不进
+    写作目录，只为了有人写 [[v:N:calc.x]] 时能说清为什么不行。
     """
     if not metrics_from:
         metrics_from = None
@@ -453,22 +550,34 @@ def build_catalog(
     for entry in entries:
         if allow is not None and entry.get("node_id") not in allow:
             continue
+        rows = entry.get("rows")
+        if entry.get("kind") == "node_output" and entry.get("code_sha"):
+            # 沙箱代码节点：登记下来只为了引用它时能说清为什么不行，不编号、不进写作目录
+            node_id = str(entry.get("node_id") or "")
+            catalog[f"N:{node_id}"] = {
+                "alias": f"N:{node_id}", "kind": "node_output", "eid": make_eid("node_output", entry.get("artifact"), {}),
+                "locator": {}, "code": True,
+                **{k: entry[k] for k in ("node_id", "exec", "artifact", "code_sha", "role", "language") if k in entry},
+                "label": f"沙箱代码 {node_id}（{entry.get('role') or 'compute'}）",
+            }
+            continue
         if entry.get("kind") == "query":
             queries += 1
             alias, kind = f"Q{queries}", "query"
+            label = f"{entry.get('tool') or entry.get('source') or kind}" + (f" · {rows} 行" if isinstance(rows, int) else "")
         elif entry.get("kind") == "retrieval":
             retrievals += 1
             alias, kind = f"K{retrievals}", "retrieval"
+            label = (f"知识库「{entry['source']}」" if entry.get("source") else "知识库检索") \
+                + (f" · {rows} 条" if isinstance(rows, int) else "")
         else:
             continue
-        rows = entry.get("rows")
         catalog[alias] = {
             "alias": alias, "kind": kind, "eid": make_eid(kind, entry.get("artifact"), {}),
             "locator": {},
             **{k: entry[k] for k in ("node_id", "exec", "artifact", "via", "call_id", "tool", "source",
                                      "columns", "rows", "truncated") if k in entry},
-            "label": f"{entry.get('tool') or entry.get('source') or kind}"
-                     + (f" · {rows} 行" if isinstance(rows, int) else ""),
+            "label": label,
         }
 
     for key, value in (inputs or {}).items():
@@ -508,17 +617,246 @@ def _metric_alias(ref: str, catalog: dict[str, Any]) -> tuple[str | None, str]:
     return None, f"目录里没有指标 {ref}（能用的指标见证据目录）"
 
 
-def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
-    """行内标记（m / i / v / t / c / q / table）→ Citation，带 rendered（正文里显示的字）。"""
+# --------------------------------------------------------------------------
+# 单元格与整表：值一律从查询快照取
+# --------------------------------------------------------------------------
+
+#: 取快照的函数：工件 id → 内容。取不到返回 None，哈希对不上抛 ValueError（artifact_store.load 的约定）
+Loader = Callable[[str], Any]
+
+
+class _Snapshots:
+    """这一次解析里取过的查询快照。
+
+    一张整表每一格都要读同一份快照，每格都读盘、复验一次哈希不值。缓存只活在这一次
+    compose / verify / 流式渲染里：出口复核是另一次调用，照样重新取、重新验。
+    """
+
+    def __init__(self, loader: Loader | None = None) -> None:
+        self.loader = loader or load_artifact
+        self.memo: dict[str, tuple[Any, str | None]] = {}
+
+    def get(self, alias: str, artifact: Any) -> tuple[Any, str | None]:
+        """(快照内容, 取不到的原因)。原因以 alias 开头，能直接当 unresolved 的 reason。"""
+        key = str(artifact or "")
+        if key not in self.memo:
+            self.memo[key] = self._fetch(key)
+        content, why = self.memo[key]
+        return content, (f"{alias} {why}" if why else None)
+
+    def _fetch(self, artifact: str) -> tuple[Any, str | None]:
+        if not artifact:
+            return None, "没有查询快照"
+        try:
+            content = self.loader(artifact)
+        except ValueError:
+            return None, "的查询快照和哈希对不上，疑似被改过"
+        except Exception as e:  # noqa: BLE001 - 取不回来就是解析不了，不能让整篇报告崩掉
+            return None, f"的查询快照取不回来（{type(e).__name__}）"
+        if content is None:
+            return None, f"的查询快照取不回来（工件 {artifact[:12]}… 不存在）"
+        if not isinstance(content, dict) or not isinstance(content.get("rows"), list):
+            return None, "的快照里没有表格数据"
+        return content, None
+
+
+def _snapshots(loader: Loader | _Snapshots | None) -> _Snapshots:
+    return loader if isinstance(loader, _Snapshots) else _Snapshots(loader)
+
+
+_CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
+_NODE_REF = re.compile(r"^N:(?P<node>[^.\s]+)(?:\.(?P<field>.+))?$")
+
+
+def parse_cell_ref(ref: str) -> dict[str, Any] | None:
+    """Q4.r0.amount → {alias: "Q4", row: 0, column: "amount"}；写法不对返回 None。"""
+    m = _CELL_REF.match((ref or "").strip())
+    return {"alias": m.group("alias"), "row": int(m.group("row")), "column": m.group("column")} if m else None
+
+
+def _query_entry(alias: str, catalog: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    entry = catalog.get(alias)
+    if entry is None:
+        return None, f"目录里没有 {alias}（能引用的查询见证据目录）"
+    if entry.get("kind") != "query":
+        return None, f"{alias} 不是查询结果，不能按单元格引用"
+    if entry.get("code"):
+        return None, CODE_REASON
+    return entry, ""
+
+
+def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
+                  cells_allowed: bool) -> dict[str, Any]:
+    ref = marker.get("ref") or ""
+    conv = marker.get("conv")
+    node = _NODE_REF.match(ref)
+    if node:
+        alias = f"N:{node.group('node')}"
+        entry = catalog.get(alias) or {}
+        return _unresolved(marker, alias, "node_field", CODE_REASON if entry.get("code") else NODE_FIELD_REASON)
+    parsed = parse_cell_ref(ref)
+    if parsed is None:
+        return _unresolved(marker, ref.split(".")[0], "cell",
+                           "单元格要写成 Q<编号>.r<行>.<列>（行号从 0 数），比如 [[v:Q1.r0.amount]]")
+    alias = parsed["alias"]
+    if not cells_allowed:
+        return _unresolved(marker, alias, "cell", CELLS_REASON)
+    entry, why = _query_entry(alias, catalog)
+    if entry is None:
+        return _unresolved(marker, alias, "cell", why)
+    snapshot, why = snaps.get(alias, entry.get("artifact"))
+    if why:
+        return _unresolved(marker, alias, "cell", why)
+    try:
+        raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
+        kind = column_kind(snapshot, column)
+        rendered = render_cell(raw, conv, kind=kind)
+    except CellError as e:
+        return _unresolved(marker, alias, "cell", f"{alias} {e}")
+    except RenderError as e:
+        return _unresolved(marker, alias, "cell", str(e))
+    locator = {"row": parsed["row"], "column": column}
+    cite = {"ref": ref, "alias": alias, "locator": locator, "eid": cell_eid(entry.get("artifact"), **locator),
+            "kind": "cell", "role": "value", "status": "resolved", "value": cell_value(raw, kind),
+            "rendered": rendered}
+    if conv:
+        cite["conv"] = conv
+    return cite
+
+
+_TABLE_OPTIONS = ("cols", "rows")
+_TABLE_ROWS = re.compile(r"^(\d+)(?:-(\d+))?$")
+#: 列名里有这些字就写不进 [[v:]] 标记，或者会把表格行切错
+_UNSAFE_COLUMN = re.compile(r"[\[\]\n|]")
+
+
+def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
+                cells_allowed: bool) -> tuple[str | None, dict[str, Any] | None]:
+    """整表标记 → (Markdown 表，每格是一个 [[v:]] 标记, None)，或者 (None, 解析不了的 Citation)。
+
+    表由系统生成，但每一格照样是单元格引用：切块、切片段、复核都走单元格那条路，
+    不用为整表另写一套核对规则。
+    """
+    alias = marker.get("ref") or ""
+
+    def fail(reason: str) -> tuple[None, dict[str, Any]]:
+        return None, _unresolved(marker, alias, "query", reason)
+
+    if not cells_allowed:
+        return fail(CELLS_REASON)
+    _, *rest = (marker.get("body") or "").split() or [""]
+    odd = [p for p in rest if p.partition("=")[0] not in _TABLE_OPTIONS or "=" not in p]
+    if odd:
+        return fail(f"不认识的选项 {odd[0]}：整表只支持 cols=列a,列b 和 rows=0-4")
+    options = marker.get("options") or {}
+    entry, why = _query_entry(alias, catalog)
+    if entry is None:
+        return fail(why)
+    snapshot, why = snaps.get(alias, entry.get("artifact"))
+    if why:
+        return fail(why)
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    rows = snapshot["rows"]
+    if "cols" in options:
+        wanted = [c.strip() for c in options["cols"].split(",") if c.strip()]
+        if not wanted:
+            return fail("cols= 后面要写列名，用逗号分开")
+        missing = [c for c in wanted if c not in columns]
+        if missing:
+            return fail(f"{alias} 没有列「{missing[0]}」，有：{'、'.join(columns[:12])}")
+        if len(wanted) > TABLE_MAX_COLS:
+            return fail(f"整表最多 {TABLE_MAX_COLS} 列，cols= 写了 {len(wanted)} 列")
+    else:
+        wanted = columns
+        if len(wanted) > TABLE_MAX_COLS:
+            return fail(f"{alias} 有 {len(columns)} 列，整表最多 {TABLE_MAX_COLS} 列：用 cols=列a,列b 挑出要的列")
+    if not wanted:
+        return fail(f"{alias} 没有列，列不出表")
+    if not rows:
+        return fail(f"{alias} 是空的（0 行），没有可以列的行")
+    if "rows" in options:
+        span = _TABLE_ROWS.match(options["rows"].strip())
+        first, last = (int(span.group(1)), int(span.group(2) or span.group(1))) if span else (1, 0)
+        if last < first:
+            return fail(f"rows 要写成 0-4 这样从小到大的行号范围（从 0 数），写的是 {options['rows']}")
+        if last - first + 1 > TABLE_MAX_ROWS:
+            return fail(f"整表最多 {TABLE_MAX_ROWS} 行，rows={options['rows']} 是 {last - first + 1} 行："
+                        "挑出要的行，或者分成几张表")
+        if last >= len(rows):
+            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {last} 行（从 0 数）")
+    else:
+        first, last = 0, min(TABLE_DEFAULT_ROWS, len(rows)) - 1
+    for c in wanted:
+        if not c.strip() or c != c.strip() or _UNSAFE_COLUMN.search(c) \
+                or len(f"[[v:{alias}.r{last}.{c}]]") > MARKER_MAX:
+            return fail(f"列名「{_clean(c)[:30]}」写不进表格（空的、首尾有空格、带方括号竖线换行，或者太长）："
+                        "在 SQL 里给它起个别名再查")
+    lines = ["| " + " | ".join(_clean(c) for c in wanted) + " |",
+             "| " + " | ".join("---" for _ in wanted) + " |"]
+    lines += ["| " + " | ".join(f"[[v:{alias}.r{r}.{c}]]" for c in wanted) + " |" for r in range(first, last + 1)]
+    return "\n".join(lines), None
+
+
+def _expand_tables(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
+                   prev: str = "") -> str:
+    """把能展开的整表标记换成 Markdown 表（每格一个 [[v:]]）。展开不了的原样留着，后面按解析不了处理。
+
+    表格要独占几行：标记前面的字不是换行就补一个，后面的字不是换行也补一个。这只取决于
+    紧挨着标记的那两个字——prev 是这段文本之前的那个字（流式渲染时在上一块里）。
+    """
+    out: list[str] = []
+    last = 0
+    for m in MARKER_RE.finditer(text):
+        if m.group("kind") != "table":
+            continue
+        body = m.group("body").strip()
+        table, _ = _table_plan({"kind": "table", "body": body, **_parse_body("table", body)}, catalog, snaps,
+                               cells_allowed)
+        if table is None:
+            continue
+        before = text[m.start() - 1] if m.start() > 0 else prev
+        after = text[m.end()] if m.end() < len(text) else ""
+        out.append(text[last:m.start()])
+        out.append(("" if before in ("", "\n") else "\n") + table + ("" if after in ("", "\n") else "\n"))
+        last = m.end()
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# 解析一个行内标记
+# --------------------------------------------------------------------------
+
+
+def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_allowed: bool = True,
+                   loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
+    """行内标记（m / i / v / t / c / q / table）→ Citation，带 rendered（正文里显示的字）。
+
+    cells_allowed=False 时单元格和整表一律解析不了，原因是 CELLS_REASON（受管出具没在契约里声明 cells）。
+    loader 是取查询快照的函数，缺省 artifact_store.load。
+    """
     kind = marker["kind"]
     ref = marker.get("ref") or ""
+    if kind == "v":
+        return _resolve_cell(marker, catalog, _snapshots(loader), cells_allowed)
+    if kind == "table":
+        snaps = _snapshots(loader)
+        table, bad = _table_plan(marker, catalog, snaps, cells_allowed)
+        if bad is not None:
+            return bad
+        # 整篇渲染时整表已经按上下文展开过了，走到这里的是复核一个片段：给出不带上下文的样子
+        return {"ref": ref, "alias": ref, "locator": {}, "eid": catalog[ref]["eid"], "kind": "query",
+                "role": "value", "status": "resolved", "rendered": _render(table or "", catalog, snaps, cells_allowed)}
     if kind in LATER_KINDS:
         alias = {"t": f"t:{ref}", "c": f"c:{ref}"}.get(kind, ref.split(".")[0])
-        ev_kind = {"v": "cell", "t": "table", "c": "column", "q": "quote", "table": "query"}[kind]
+        ev_kind = {"t": "table", "c": "column", "q": "quote"}[kind]
         return _unresolved(marker, alias, ev_kind, LATER_REASON)
     if kind not in ("m", "i"):
         return _unresolved(marker, f"{kind}:{ref}", kind,
-                           f"不认识的引用类型 {kind}：本期只支持 m（口径卡指标）、i（运行输入）、see（依据）")
+                           f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
+                           "i（运行输入）、see（依据）")
 
     conv = marker.get("conv")
     if kind == "m":
@@ -591,22 +929,29 @@ def resolve_support(ref: str, catalog: dict[str, Any]) -> dict[str, Any]:
             "locator": {**(entry.get("locator") or {}), **locator}}
 
 
-def resolve_ref(ref: str, catalog: dict[str, Any]) -> dict[str, Any]:
-    """片段上记的 ref（m:gmv|万、i:week）→ Citation。证据接口点开片段时用它重新解析。"""
-    return resolve_marker(_parse_ref(ref), catalog)
+def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True,
+                loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
+    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。"""
+    return resolve_marker(_parse_ref(ref), catalog, cells_allowed=cells_allowed, loader=loader)
 
 
-def render_markers(text: str, catalog: dict[str, Any]) -> str:
-    """把一段文本里的标记全部换成字：m / i 渲染成值，see 去掉，解析不了的换成占位。"""
+def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
+    text = _expand_tables(text, catalog, snaps, cells_allowed, prev)
     out: list[str] = []
     last = 0
     for marker in parse_markers(text):
         out.append(text[last:marker["start"]])
         if marker["kind"] != "see":
-            out.append(resolve_marker(marker, catalog)["rendered"])
+            out.append(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)["rendered"])
         last = marker["end"]
     out.append(text[last:])
     return "".join(out)
+
+
+def render_markers(text: str, catalog: dict[str, Any], *, cells_allowed: bool = True,
+                   loader: Loader | None = None) -> str:
+    """把一段文本里的标记全部换成字：m / i / v 渲染成值，整表展开成表，see 去掉，解析不了的换成占位。"""
+    return _render(text, catalog, _snapshots(loader), cells_allowed)
 
 
 # --------------------------------------------------------------------------
@@ -619,15 +964,23 @@ def _safe_cut(text: str) -> int:
     一个标记最长 MARKER_MAX 个字，所以没闭合的时候最多攒 MARKER_MAX - 1 = _HOLD_LIMIT 个字；
     超过了、或者碰到换行，它就不可能再是标记。末尾单独一个 [ 也要留着——下一块的
     开头可能是另一个 [。
+
+    整表标记闭合了也先不放：它展开时要看紧跟在后面的那个字（是不是换行），那个字还没到。
     """
+    cut = len(text)
     start = text.rfind("[[")
     if start != -1 and text.find("]]", start) == -1:
         tail = text[start:]
         if len(tail) <= _HOLD_LIMIT and "\n" not in tail:
-            return start
-    if text.endswith("["):
-        return len(text) - 1
-    return len(text)
+            cut = start
+    if cut == len(text) and text.endswith("["):
+        cut = len(text) - 1
+    while (start := text.rfind("[[", 0, cut)) != -1:
+        m = MARKER_RE.match(text, start)
+        if not (m and m.end() == cut and m.group("kind") == "table"):
+            break
+        cut = start
+    return cut
 
 
 class StreamRenderer:
@@ -641,22 +994,33 @@ class StreamRenderer:
             ctx.emit(EventType.LLM_TOKEN, delta=tail)
 
     所有 feed / flush 的输出拼起来，等于 render_markers(全文)，不论模型怎么分块：
-    整篇解析也只认 MARKER_MAX 以内的标记，超长的两边都原样当文字。
+    整篇解析也只认 MARKER_MAX 以内的标记，超长的两边都原样当文字；整表展开要看的
+    前一个字记在 prev 里，后一个字靠 _safe_cut 等它到了再放。
     """
 
-    def __init__(self, catalog: dict[str, Any]) -> None:
+    def __init__(self, catalog: dict[str, Any], *, cells_allowed: bool = True, loader: Loader | None = None) -> None:
         self.catalog = catalog
+        self.cells_allowed = cells_allowed
+        self.snaps = _Snapshots(loader)
         self.pending = ""
+        self.prev = ""
+
+    def _release(self, ready: str) -> str:
+        if not ready:
+            return ""
+        out = _render(ready, self.catalog, self.snaps, self.cells_allowed, self.prev)
+        self.prev = ready[-1]
+        return out
 
     def feed(self, delta: str) -> str:
         self.pending += delta or ""
         cut = _safe_cut(self.pending)
         ready, self.pending = self.pending[:cut], self.pending[cut:]
-        return render_markers(ready, self.catalog) if ready else ""
+        return self._release(ready)
 
     def flush(self) -> str:
         ready, self.pending = self.pending, ""
-        return render_markers(ready, self.catalog) if ready else ""
+        return self._release(ready)
 
 
 # --------------------------------------------------------------------------
@@ -1051,13 +1415,18 @@ def compose_doc(
     node_id: str = "",
     run_id: str | None = None,
     allow_numbers: list[Any] | None = None,
+    cells_allowed: bool = True,
+    loader: Loader | None = None,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
+    整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
+    doc["source"] 仍是模型的原文。
     """
     source = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    text, strong = _normalize_strong(source)
+    snaps = _Snapshots(loader)
+    text, strong = _normalize_strong(_expand_tables(source, catalog, snaps, cells_allowed))
     markers = parse_markers(text)
     for marker in markers:
         marker["strong"] = any(a <= marker["start"] and marker["end"] <= b for a, b in strong)
@@ -1118,7 +1487,7 @@ def compose_doc(
                         if marker["kind"] == "see":
                             see.extend(resolve_support(r, catalog) for r in marker["refs"])
                             continue
-                        cite = resolve_marker(marker, catalog)
+                        cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
                         ok = cite["status"] == "resolved"
                         seg = {
                             "kind": _SEG_KIND.get(marker["kind"])
@@ -1146,7 +1515,7 @@ def compose_doc(
 
     markdown = "".join(parts)
     # 裸数字单独切成片段：前端要在那几个字底下画「无出处」
-    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")]
+    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog)
     syntax = [tuple(s["span"]) for s in all_segments if s["kind"] == "structural"]
     bare = _bare_numbers(markdown, refs, allow_numbers, syntax)
     for block in out_blocks:
@@ -1179,9 +1548,31 @@ def compose_doc(
         "schema": DOC_SCHEMA, "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": catalog, "blocks": out_blocks,
     }
-    checked = verify_doc(doc, catalog, allow_numbers=allow_numbers)
+    checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
     doc["stats"], doc["violations"] = checked["stats"], checked["violations"]
     return doc
+
+
+def _header_masks(blocks: list[dict[str, Any]], catalog: dict[str, Any]) -> list[tuple[int, int]]:
+    """表头里恰好是某次查询的列名的格：整表的表头是系统照快照列名写的，「销售额2025」这种列名
+    里的数字不是结论数字，写作者也改不了它。只放过表头、只放过和列名一字不差的格。"""
+    names = {_clean(str(c)) for e in catalog.values() if e.get("kind") == "query" for c in e.get("columns") or []}
+    out: list[tuple[int, int]] = []
+    for block in blocks if names else []:
+        if not isinstance(block, dict) or block.get("type") != "table":
+            continue
+        for unit in block.get("units") or []:
+            if (unit.get("loc") or {}).get("row") != -1:
+                continue
+            body = [s for s in unit.get("segments") or [] if s.get("kind") != "structural"]
+            spans = [s.get("span") for s in body]
+            if not body or not all(isinstance(p, list) and len(p) == 2 and all(isinstance(x, int) for x in p)
+                                   for p in spans):
+                continue        # 片段的偏移坏了：复核会报 segment_mismatch，这里不替它兜
+            if all(s.get("kind") == "text" for s in body) \
+                    and "".join(str(s.get("text") or "") for s in body).strip() in names:
+                out.append((spans[0][0], spans[-1][1]))
+    return out
 
 
 def _split_bare(segments: list[dict[str, Any]], bare: list[Any]) -> list[dict[str, Any]]:
@@ -1260,8 +1651,13 @@ def verify_doc(
     catalog: dict[str, Any],
     *,
     allow_numbers: list[Any] | None = None,
+    cells_allowed: bool = True,
+    loader: Loader | _Snapshots | None = None,
 ) -> dict[str, Any]:
     """逐项复核一份报告文档：{ok, violations, stats}。
+
+    cells_allowed=False：单元格引用（含整表里的格）一律判解析不了，原因是 CELLS_REASON——
+    受管级别的正式出具，契约没声明 cells 时出口复核这样调。快照经 loader 重新取、复验哈希。
 
     报告节点自查用它（违规就让写作者重写），出口契约复核也用它（判档）——后者传的
     是自己从状态里重建的目录，不用文档里存的那份。复核什么：
@@ -1274,6 +1670,7 @@ def verify_doc(
       「100. 」「```45678」也在内）
     - 片段标的状态和核对结果一致（界面按状态画线，不能标着「有出处」其实没有）
     """
+    snaps = _snapshots(loader)
     violations: list[dict[str, Any]] = []
     stats = {"units": 0, "segments": 0, "claims": 0, "connective": 0, "headings": 0, "numbers": 0,
              "numbers_cited": 0, "values": 0, "uncited_numbers": 0, "unresolved": 0, "see": 0,
@@ -1323,7 +1720,7 @@ def verify_doc(
                                                  f"结构片段里夹带了内容「{text[:30]}」", **where))
             elif seg.get("ref"):
                 ref = str(seg["ref"])
-                cite = resolve_ref(ref, catalog)
+                cite = resolve_ref(ref, catalog, cells_allowed=cells_allowed, loader=snaps)
                 ok = cite["status"] == "resolved"
                 matches = cite["rendered"] == text
                 if intact:
@@ -1371,6 +1768,7 @@ def verify_doc(
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不在任何片段里：文档可能被改过"))
 
+    masks += _header_masks(list(doc.get("blocks") or []), catalog)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
         owner = next(((sid, uid) for s, e, sid, uid in owners if s <= token.start < e), (None, None))
         violations.append(_violation(
@@ -1398,9 +1796,67 @@ MARKER_RULES = """写作规则（系统会逐字核对）：
 4. 日期、ISO 周（2026-W37）、「前 3 名」「第 2 季度」这类序号可以直接写。
 5. 目录里没有的指标不要编造引用；标着「没有值」的指标不要写进报告。"""
 
+#: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
+#: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
+CELL_RULES = (
+    "查询结果（里面的数和指标一样只能用引用标记写，系统照快照换成真实数值、逐字核对）：\n"
+    "写法：一格写 [[v:Q1.r0.列名]]（行号从 0 数），换算同指标，比如 [[v:Q1.r0.列名|万]]；"
+    "要列出多行多列，单独一行写 [[table:Q1 cols=列a,列b rows=0-4]]，系统照快照生成表格"
+    f"（不写 rows 就是前 {TABLE_DEFAULT_ROWS} 行，最多 {TABLE_MAX_ROWS} 行）；"
+    "结论的依据可以写查询编号，比如 [[see:Q1]]。下面没有的查询、行、列不要编造。"
+)
 
-def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000) -> str:
-    """证据目录的文字版，放进写作者的 prompt。超过预算就截断，并照实说截断了。"""
+#: 写作目录里每次查询最多列出几行、几列。更多的行照样能按行号引用
+_PROMPT_ROWS = 20
+_PROMPT_COLS = 12
+
+
+def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
+    """一次查询在写作目录里的样子：编号、来源、列，以及能引用的行（行号 + 渲染后的值）。
+
+    值按 [[v:]] 的渲染规则写出来：写作者在这里看到的，就是引用之后报告里显示的字。
+    """
+    alias = entry["alias"]
+    cols = entry.get("columns") or []
+    lines = [f"- {alias}：{entry.get('label')}" + (f"，列 {', '.join(map(str, cols[:_PROMPT_COLS]))}" if cols else "")]
+    snapshot, why = snaps.get(alias, entry.get("artifact"))
+    if why:
+        return [*lines, f"  （{why}，不要引用）"]
+    if not cells_allowed:
+        return lines
+    columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
+    rows = snapshot["rows"]
+    example = None
+    for r, record in enumerate(rows[:_PROMPT_ROWS]):
+        cells = []
+        for c in columns:
+            try:
+                raw, _ = locate_cell(snapshot, r, c)
+                kind = column_kind(snapshot, c)
+                shown, numeric = render_cell(raw, kind=kind), is_number(cell_value(raw, kind))
+            except (CellError, RenderError):
+                shown, numeric = MISSING, False
+            cells.append(f"{c}={shown}")
+            if example is None and r == 0 and numeric:
+                example = c           # 示例挑第一行里第一个数，写作者最常引用的就是它
+        lines.append(f"  r{r}：" + "，".join(cells))
+    if not rows:
+        lines.append("  （0 行，没有可以引用的格）")
+    elif len(rows) > _PROMPT_ROWS:
+        lines.append(f"  …共 {len(rows)} 行，这里只列出前 {_PROMPT_ROWS} 行；后面的行也能按行号引用")
+    if rows and columns:
+        lines.append(f"  例：[[v:{alias}.r0.{example or columns[0]}]]")
+    return lines
+
+
+def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowed: bool = True,
+                   loader: Loader | None = None) -> str:
+    """证据目录的文字版，放进写作者的 prompt。超过预算就截断，并照实说截断了。
+
+    查询结果会列出能引用的行（要读快照）；cells_allowed=False 时只列编号，说明只能当依据。
+    沙箱代码节点不列：它的产出不能引用。
+    """
+    snaps = _Snapshots(loader)
     lines = ["可引用的证据（写数字只能用下面的引用标记，系统会换成真实数值）："]
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for entry in catalog.values():
@@ -1422,12 +1878,16 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000) -> str:
     if inputs:
         lines.append("\n运行输入：")
         lines.extend(f"- [[{e['alias']}]] = {e.get('rendered')}" for e in inputs)
-    others = [e for e in catalog.values() if e.get("kind") in ("query", "retrieval")]
-    if others:
-        lines.append("\n查询与检索（本期只能在 [[see:…]] 里当依据，不能直接引用其中的数）：")
-        for e in others:
-            cols = f"，列 {', '.join(map(str, e['columns'][:12]))}" if e.get("columns") else ""
-            lines.append(f"- {e['alias']}：{e.get('label')}{cols}")
+    queries = [e for e in catalog.values() if e.get("kind") == "query"]
+    if queries:
+        lines.append(f"\n{CELL_RULES}" if cells_allowed else
+                     "\n查询结果（这次出具不允许直接引用单元格，只能写在 [[see:Q1]] 这样的依据里）：")
+        for e in queries:
+            lines.extend(_query_prompt(e, snaps, cells_allowed))
+    retrievals = [e for e in catalog.values() if e.get("kind") == "retrieval"]
+    if retrievals:
+        lines.append("\n知识库检索（只能写在 [[see:K1]] 这样的依据里）：")
+        lines.extend(f"- {e['alias']}：{e.get('label')}" for e in retrievals)
     text = "\n".join(lines)
     if len(text) > budget:
         text = text[:budget].rsplit("\n", 1)[0] + "\n…（目录太长，后面的省略了）"

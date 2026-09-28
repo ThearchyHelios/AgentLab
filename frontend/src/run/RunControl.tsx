@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { ChevronDown, Play } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -8,12 +8,30 @@ import { hintOf } from '../canvas/shortcuts'
 import { isComposing, Kbd, Skeleton, Spinner, toast } from '../components/ui'
 import { useLocalActor } from '../lib/actor'
 import { errorMessage } from '../lib/errors'
+import { explainStartError } from '../lib/explain'
 import { matchShortcut } from '../lib/keys'
 import { runClassLabel } from '../lib/terms'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { ValidationIssue, WorkflowVersion } from '../types'
 import { ClassDot, escapeRun, RunCapsule } from './RunHud'
 import { isActivePhase } from './trace'
+
+/**
+ * 发起就被拒。绑定的工具在本机不存在（run_tool_missing）时给直达入口：数据源工具去数据页接入，
+ * 自定义、MCP 工具去工具页——这次运行还没开始，没有「接着跑」可给。别的照通用的出错提示
+ */
+function startFailed(e: unknown, navigate: (to: string) => void) {
+  const x = explainStartError(e)
+  if (!x?.fixTo) {
+    toast.error(e)
+    return
+  }
+  const to = x.fixTo
+  toast.error(`${x.title}：${x.reason ?? ''}${x.action ?? ''}`, {
+    detail: x.raw, key: 'studio:run-tool-missing',
+    action: { label: x.fixLabel ?? '去接入', onClick: () => navigate(to) },
+  })
+}
 
 /**
  * 工具栏上的运行控件。
@@ -154,13 +172,14 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
   const errors = issues.filter((i) => i.level === 'error')
   const blocked = !!errors.length || !nodes.length
 
+  const navigate = useNavigate()
   const launch = async () => {
     setBusy(true)
     try {
       await startRun(payloadOf(fields, values))
       setOpen(false)
     } catch (e) {
-      toast.error(e)
+      startFailed(e, navigate)
     } finally {
       setBusy(false)
     }
@@ -258,13 +277,14 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
   const ahead = dirty || (canvasVersion != null && canvasVersion !== version)
   const label = runClassLabel('formal', version)
 
+  const navigate = useNavigate()
   const launch = async () => {
     setBusy(true)
     try {
       await startFormalRun(payloadOf(fields ?? [], values))
       setOpen(false)
     } catch (e) {
-      toast.error(e)
+      startFailed(e, navigate)
     } finally {
       setBusy(false)
     }

@@ -9,13 +9,16 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from langgraph.func import task
 
+from app.core.artifact_store import canonical_json, content_hash
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.evidence import ledger_enabled, next_exec, query_entry_fields
 from app.engine.replay import ask, once
 from app.engine.state import GraphState
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
+from app.tools.datasource import QUERY_PREFIX
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -26,6 +29,12 @@ from app.tools.registry import (
     get_spec,
 )
 from app.tools.trust import ask_gate, asks_trustable, call_policy, node_task
+
+#: 数据源查询工具没查成时交回的话的开头（tools/datasource.py）。agent 里原话喂回模型让它改 SQL；
+#: tool 节点没有下一轮可改，照常往下走的话，下游拿到的是一句报错当查询结果
+QUERY_FAILED = ("查询失败：", "SQL 被拒绝：")
+#: code 节点在证据链里的角色：取数（产出本身就是源数据）还是计算。缺省按计算算
+EVIDENCE_ROLES = ("source", "compute")
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
@@ -146,6 +155,14 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         result = {"error": reason, "detail": raw_detail(e)}
 
     elapsed = int((time.perf_counter() - started) * 1000)
+    evidence_on = ledger_enabled(ctx.run)
+    if evidence_on and name.startswith(QUERY_PREFIX) and isinstance(result, str) and result.startswith(QUERY_FAILED):
+        # 没查成：原话就是报错（「查询失败：no such table: x」），照写，别再套一层
+        ctx.emit(EventType.TOOL_ERROR, tool=name, error=result[:2000], duration_ms=elapsed)
+        if ctx.cfg("fail_fast", True):
+            raise NodeError(ctx.node.id, f"工具 {name} 没查成——{result}。按这句话改节点里的 SQL 再跑")
+        result = {"error": result}
+
     # 取数快照：query（args）和结果集一起进工件库，完整出具时数字回指的就是它
     from app.core.artifact_store import put_json
 
@@ -156,11 +173,26 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001
         snapshot_id = None
+    # 只认数据源工具交回的查询：别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的
+    query = query_entry_fields(result) if evidence_on and name.startswith(QUERY_PREFIX) else None
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
-             artifact=snapshot_id)
+             artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}))
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
+    if evidence_on:
+        # 证据台账：工具快照一条；查库的再记一条查询快照（外面包着的是工具快照）。报告按台账编 Q1…
+        exec_no = next_exec(state, ctx.node.id)
+        entries: list[dict[str, Any]] = []
+        if snapshot_id:
+            entries.append({"kind": "tool", "node_id": ctx.node.id, "exec": exec_no, "artifact": snapshot_id,
+                            "tool": name})
+        if query:
+            entries.append({"kind": "query", "node_id": ctx.node.id, "exec": exec_no, "artifact": query["artifact"],
+                            **({"via": snapshot_id} if snapshot_id else {}), "tool": name, "source": query["source"],
+                            "columns": query["columns"], "rows": query["rows"], "truncated": query["truncated"]})
+        if entries:
+            updates["evidence"] = entries
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: result}
@@ -172,6 +204,10 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     code = ctx.render_str(ctx.cfg("code", ""), state)
     if not code.strip():
         raise NodeError(ctx.node.id, "代码节点是空的")
+    evidence_on = ledger_enabled(ctx.run)
+    role = str(ctx.cfg("evidence_role", "") or "compute")
+    if evidence_on and role not in EVIDENCE_ROLES:
+        raise NodeError(ctx.node.id, f"evidence_role 只能是 source（取数）或 compute（计算），写的是 {role!r}")
 
     language = ctx.cfg("language", "python")
     limits = SandboxLimits(
@@ -269,6 +305,14 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     payload["text"] = text
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: payload}}
+    if evidence_on:
+        # 实际送进沙箱的那份代码（渲染之后、审批改过之后）的指纹：同一张图两次运行算出不同的数，
+        # 先看这个就知道代码本身变没变
+        payload["code_sha"] = content_hash(code)
+        # 台账的工件就是节点产出工件：外层包装按同样的内容落盘，id 相同
+        updates["evidence"] = [{"kind": "node_output", "node_id": ctx.node.id, "exec": next_exec(state, ctx.node.id),
+                                "artifact": content_hash(canonical_json(payload)), "code_sha": payload["code_sha"],
+                                "role": role, "language": language}]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         # {{ vars.x }} 和 {{ nodes.x.text }} 必须是同一个值：两种写法给不同的

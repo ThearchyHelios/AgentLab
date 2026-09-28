@@ -144,6 +144,9 @@ class WorkflowVersion(Base, TimestampMixin):
     note: Mapped[str] = mapped_column(Text, default="")
     # 图内容的 sha256 指纹（剔除 viewport）。formal run 钉住的就是它。
     graph_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 这一版按哪一档发布的：published | governed。没发布过、或者是加这一列之前发布的为空。
+    # 正式运行按不按受管出具看它，而不是工作流的 status——status 说的是当前画布，改一笔就退回 draft
+    level: Mapped[str | None] = mapped_column(String(20), default=None)
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 

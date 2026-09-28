@@ -1,7 +1,8 @@
 import type {
-  Approval, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
-  EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, ReviewResult, Run, RunEvent, RunStatus,
-  Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
+  Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
+  EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
+  RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow,
+  WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
 import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
@@ -420,6 +421,18 @@ export const api = {
         `/workflows/${id}/publish`, { level, version }),
     validate: (graph: GraphSpec) =>
       post<{ ok: boolean; issues: ValidationIssue[] }>('/workflows/validate', { graph }),
+    /**
+     * 发布前检查：validate 和发布门禁的并集，和真正发布同一套口径，另给每条问题的修复。
+     * 只读。不带 graph 就查库里的草稿。老后端没有这个接口（404），调用方按「不支持」处理
+     */
+    publishCheck: (id: string, body: { level: PublishLevel; graph?: GraphSpec }, opts?: RequestOptions) =>
+      request<PublishCheck>(`/workflows/${id}/publish-check`,
+        { method: 'POST', body: JSON.stringify(body), ...opts }),
+    /** 按选中的修复出一份预览（整张图 + 逐项改动）。只读：不存草稿、不发布。assist 时会调模型，可能要几十秒 */
+    autofix: (id: string, body: {
+      level: PublishLevel; graph?: GraphSpec; apply: string[]; choices?: Record<string, unknown>; assist?: boolean
+    }, opts?: RequestOptions) =>
+      request<AutofixResult>(`/workflows/${id}/autofix`, { method: 'POST', body: JSON.stringify(body), ...opts }),
     /** 这张图里有哪些变量、谁产出、谁引用。纯静态分析，不需要跑过 */
     variables: (graph: GraphSpec) =>
       post<{ variables: Variable[]; issues: VarIssue[] }>('/workflows/variables', { graph }),

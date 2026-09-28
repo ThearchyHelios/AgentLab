@@ -915,6 +915,110 @@ await section('数据 · 数据库', async () => {
   await close()
 })
 
+await section('数据 · 遮罩列（证据面板的 mask_columns）', async () => {
+  // 假库：两张表，phone 已经遮上了。挑列从已探查的结构里读；写请求全部在浏览器里接住
+  const base = {
+    id: 'check-manage-mask', name: 'zz_mask', kind: 'postgres', host: '10.0.0.7', port: null, database: 'shop',
+    username: 'reader', options: { schema: 'sales', mask_columns: ['phone'] }, readonly: true, description: '检查脚本的假库',
+    enabled: true, password_masked: '', has_password: false, table_count: 2, schema_synced_at: ago(3600_000), cached_schema: 'sales',
+    schema_error: '', available_schemas: [], tools: ['db_query__zz_mask'],
+    last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null,
+  }
+  const upload = {
+    ...base, id: 'check-manage-upmask', name: 'zz_upload_mask', kind: 'sqlite', host: null, username: null,
+    database: '/tmp/agentlab/uploads/tables/zz_upload_mask.db', options: { query_timeout_s: '30' }, table_count: 1,
+    tools: ['db_query__zz_upload_mask'],
+  }
+  let cur = base
+  let up = upload
+  const columns = {
+    'sales.orders': ['order_id', 'amount', 'phone'],
+    'sales.customers': ['id', 'customer_id', 'email', 'phone'],
+    orders_upload: ['order_id', 'phone'],
+  }
+  const tableJson = (t) => ({ table: t, found: true, kind: 'table', comment: null, detail: '',
+    columns: (columns[t] ?? []).map((name) => ({ name, type: 'TEXT' })) })
+  const { page, sent, errors, natives, close } = await open('/data/databases', {
+    handlers: [
+      [/^GET \/datasources$/, (route) => json([...sources, cur, up])(route)],
+      [/^GET \/datasources\/check-manage-mask\/schema$/, (route, { url }) => json(url.searchParams.get('table')
+        ? tableJson(url.searchParams.get('table')) : { tables: ['sales.orders', 'sales.customers'], summary: '', synced_at: ago(0) })(route)],
+      [/^GET \/datasources\/check-manage-upmask\/schema$/, (route, { url }) => json(url.searchParams.get('table')
+        ? tableJson(url.searchParams.get('table')) : { tables: ['orders_upload'], summary: '', synced_at: ago(0) })(route)],
+      [/^POST \/datasources\/check-manage-mask\/test$/, delayed(200, { ok: true, elapsed_ms: 42, url: 'x' })],
+      [/^PATCH \/datasources\/check-manage-mask$/, (route, { body }) => { cur = { ...cur, ...body }; return json(cur)(route) }],
+      [/^PATCH \/datasources\/check-manage-upmask$/, (route, { body }) => { up = { ...up, ...body }; return json(up)(route) }],
+    ],
+  })
+  const card = page.locator(`[data-source="${base.name}"]`)
+  check('卡片上写着遮罩了几列', (await card.locator('[data-mask-columns]').innerText().catch(() => '')).includes('遮罩 1 列')
+    && await card.locator('[data-mask-columns]').getAttribute('data-mask-columns') === 'phone')
+  await card.getByRole('button', { name: /测连接/ }).click()
+  await until(() => card.locator('[data-health]').first().innerText().then((t) => /已连通/.test(t)), 5000)
+  await card.getByRole('button', { name: '编辑' }).click()
+  const ed = dialog(page)
+  const field = ed.locator('[data-field="mask_columns"]')
+  check('编辑框里有「遮罩的列」，已遮的 phone 是一个标签', await field.count() === 1
+    && await field.locator('[data-mask-chip="phone"]').count() === 1)
+  const boundary = await field.locator('[data-mask-boundary]').innerText().catch(() => '')
+  check('写明遮罩只减少暴露、不是安全边界', boundary.includes('遮罩只减少暴露，不是安全边界'), boundary)
+  check('高级连接参数里不再另摆一个遮罩的文本框（只有这一处）', await ed.locator('#ds-adv-mask_columns').count() === 0)
+  const before = sent.filter((r) => r.key === 'GET /datasources/check-manage-mask/schema').length
+  await ed.locator('#ds-mask-columns').focus()
+  const listed = await until(async () => {
+    const v = await ed.locator('#ds-mask-columns-list option').evaluateAll((els) => els.map((e) => e.value))
+    return v.length ? v : null
+  }, 5000)
+  const reads = sent.filter((r) => r.key === 'GET /datasources/check-manage-mask/schema').length - before
+  check('聚焦输入框才去读已探查的结构，候选是各表的列（已遮的 phone 不再列）', !!listed && listed.includes('email')
+    && listed.includes('amount') && !listed.includes('phone') && reads === 3, `${JSON.stringify(listed)} · ${reads} 个请求`)
+  const hint = await field.innerText()
+  check('……说清是从已探查的几张表里挑的', hint.includes('从已探查的 2 张表里挑'), hint.replace(/\s+/g, ' ').slice(0, 160))
+  await ed.locator('#ds-mask-columns').fill('email')
+  await ed.locator('#ds-mask-columns').press('Enter')
+  await ed.locator('#ds-mask-columns').pressSequentially('id_card')
+  check('逐字敲 id_card 途中碰上列名 id 不会提前加成标签', await field.locator('[data-mask-chip="id"]').count() === 0
+    && (await ed.locator('#ds-mask-columns').inputValue()) === 'id_card')
+  await ed.locator('#ds-mask-columns').press('Enter')
+  await ed.locator('#ds-mask-columns').fill('EMAIL')
+  await ed.locator('#ds-mask-columns').press('Enter')
+  await field.getByRole('button', { name: '不再遮罩 phone' }).click()
+  const chips = await field.locator('[data-mask-chip]').evaluateAll((els) => els.map((e) => e.getAttribute('data-mask-chip')))
+  check('回车加标签、× 去掉、大小写不同的同名列不重复加', chips.join(',') === 'email,id_card', chips.join(','))
+  if (SHOTS) await shot(page, 'datasource-mask-columns')
+  await ed.getByRole('button', { name: '保存' }).click()
+  await page.waitForTimeout(500)
+  const saved = sent.filter((r) => r.key === 'PATCH /datasources/check-manage-mask').at(-1)
+  check('保存：options.mask_columns 是列名列表，schema 原样带上', JSON.stringify(saved?.body?.options?.mask_columns) === '["email","id_card"]'
+    && saved?.body?.options?.schema === 'sales', JSON.stringify(saved?.body?.options ?? {}))
+  check('……改遮罩列不算改连接：刚测的结果还作数', /已连通/.test(await card.locator('[data-health]').first().innerText()))
+  check('……卡片跟着变成遮罩 2 列', (await card.locator('[data-mask-columns]').innerText().catch(() => '')).includes('遮罩 2 列'))
+  await card.getByRole('button', { name: '编辑' }).click()
+  await dialog(page).locator('[data-field="mask_columns"]').getByRole('button', { name: '不再遮罩 email' }).click()
+  await dialog(page).locator('[data-field="mask_columns"]').getByRole('button', { name: '不再遮罩 id_card' }).click()
+  await dialog(page).getByRole('button', { name: '保存' }).click()
+  await page.waitForTimeout(400)
+  const cleared = sent.filter((r) => r.key === 'PATCH /datasources/check-manage-mask').at(-1)
+  check('全部去掉：options 里不留 mask_columns 这个键', !!cleared && !('mask_columns' in (cleared.body?.options ?? {}))
+    && await card.locator('[data-mask-columns]').count() === 0, JSON.stringify(cleared?.body?.options ?? {}))
+
+  await goto(page, '/data/tables')
+  const uc = page.locator(`[data-source="${upload.name}"]`)
+  await uc.locator('[data-edit-mask]').click()
+  const ud = dialog(page)
+  await ud.locator('#ds-mask-columns').fill('phone')
+  await ud.locator('#ds-mask-columns').press('Enter')
+  await ud.getByRole('button', { name: '保存' }).click()
+  await page.waitForTimeout(400)
+  const upSaved = sent.filter((r) => r.key === 'PATCH /datasources/check-manage-upmask').at(-1)
+  check('传上来的表没有编辑框：卡片上「设遮罩列」单独改，其余 options 原样带上',
+    JSON.stringify(upSaved?.body) === JSON.stringify({ options: { query_timeout_s: '30', mask_columns: ['phone'] } }), JSON.stringify(upSaved?.body ?? {}))
+  check('……卡片写着遮罩 1 列', (await uc.locator('[data-mask-columns]').innerText().catch(() => '')).includes('遮罩 1 列'))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('数据 · 表格', async () => {
   const fake = {
     source: {

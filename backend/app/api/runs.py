@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from datetime import datetime
 from typing import Any
 from urllib.parse import unquote
@@ -13,15 +14,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select as _select
 
+from app.api.coded import CodedHTTPException
 from app.core.bus import bus
 from app.core import artifact_store
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent, Workflow, WorkflowVersion
-from app.engine.governance import unresolved_caliber_upgrades
+from app.engine.governance import governance_note, unresolved_caliber_upgrades
 from app.engine.runner import run_manager
-from app.engine.schema import GraphSpec
+from app.engine.schema import GraphSpec, NodeType, type_label
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+logger = logging.getLogger(__name__)
+
+#: 发起时发现绑定的工具在本机不存在（见 missing_tools）
+TOOL_MISSING = "run_tool_missing"
 
 
 def actor_of(header: str | None) -> str | None:
@@ -87,6 +93,7 @@ async def start_run(
     name = "未保存的工作流"
     version: int | None = None
     version_hash: str | None = None
+    governed = False
 
     if payload.run_class == "formal":
         # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
@@ -126,6 +133,8 @@ async def start_run(
         graph = snapshot.graph
         version_hash = snapshot.graph_hash or artifact_store.graph_hash(graph)
         name = workflow.name
+        # 按这一版发布时记下的级别；记级别之前发布的老版本没有，照旧看工作流现在的 status
+        governed = (snapshot.level == "governed") if snapshot.level else workflow.status == "governed"
 
         # 口径升版是被迫处置的事件：钉住的方法卡有新版本而未声明策略，拒绝启动
         spec = GraphSpec.model_validate(graph)
@@ -143,6 +152,7 @@ async def start_run(
             name = workflow.name
     if not graph:
         raise HTTPException(400, "没有要运行的内容：请求里既没有工作流 id，也没有工作流内容")
+    await _refuse_missing_tools(session, graph)
 
     from app.api.settings import resolve_run_scope
 
@@ -165,12 +175,105 @@ async def start_run(
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
+    if payload.run_class == "formal":
+        # 按不按受管出具在发起这一刻定下来、记进封存范围：status 反映的是当前画布，中途改图、
+        # 审批停下再恢复时再去读它，报告节点和出口复核可能各读到不同的值
+        await run_manager.note(run.id, "log", **governance_note(
+            governed=governed, workflow_name=name, version=version))
     # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
     for ev in upgrade_events:
         payload_ev = dict(ev)
         node = payload_ev.pop("node_id", None)
         await run_manager.note(run.id, "caliber.upgrade", node_id=node, **payload_ev)
     return run
+
+
+# --------------------------------------------------------------------------
+# 发起前检查绑定的工具
+# --------------------------------------------------------------------------
+
+
+def _bindings(spec: GraphSpec) -> list[tuple[str, str]]:
+    """图里每一处绑定的工具：(谁绑的, 工具名)。调用工具节点的 tool、Agent 的 tools、协作成员的 tools。"""
+    out: list[tuple[str, str]] = []
+    for node in spec.nodes:
+        who = f"「{node.title}」（{type_label(node.type)}）"
+        cfg = node.config
+        if node.type == NodeType.TOOL:
+            names = [cfg.get("tool")]
+            out.extend((who, n) for n in names if isinstance(n, str) and n.strip())
+        elif node.type == NodeType.AGENT:
+            out.extend((who, n) for n in cfg.get("tools") or [] if isinstance(n, str) and n.strip())
+        elif node.type == NodeType.SUPERVISOR:
+            for member in cfg.get("agents") or []:
+                if not isinstance(member, dict):
+                    continue
+                label = f"「{node.title}」的成员「{member.get('name') or '?'}」"
+                out.extend((label, n) for n in member.get("tools") or [] if isinstance(n, str) and n.strip())
+    # 模板拼出来的工具名（{{ vars.tool }}）发起时还不知道是谁，交给运行时
+    return [(who, name.strip()) for who, name in out if "{{" not in name]
+
+
+async def missing_tools(session: AsyncSession, spec: GraphSpec) -> list[tuple[str, str, str]]:
+    """本机不存在的绑定：(谁绑的, 工具名, 去哪接入：data / tools)。
+
+    解析和运行时 build_tools 一致：内置（静态注册）、mcp:<服务>/<工具>、db_query__ / db_schema__
+    <数据源>、其余按自定义工具。数据源和自定义工具只认启用着的——停用的运行时同样拿不到。
+    MCP 只看服务登记着、启用着没有：连不连得上、工具还在不在，要连一次才知道，发起时不去等它，
+    上次没连上或者工具清单里没有的只在日志里提一句。
+    """
+    from app.db.models import CustomTool, DataSource, McpServer
+    from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
+    from app.tools.registry import all_specs
+
+    bindings = _bindings(spec)
+    if not bindings:
+        return []
+    builtin = all_specs()
+    sources = {n for (n,) in await session.execute(select(DataSource.name).where(DataSource.enabled.is_(True)))}
+    custom = {n for (n,) in await session.execute(select(CustomTool.name).where(CustomTool.enabled.is_(True)))}
+    servers = {r.name: r for r in (await session.execute(select(McpServer))).scalars()}
+    missing: list[tuple[str, str, str]] = []
+    for who, name in bindings:
+        if name.startswith("mcp:"):
+            server, _, tool = name[4:].partition("/")
+            row = servers.get(server)
+            if row is None or not row.enabled:
+                missing.append((who, name, "tools"))
+            elif row.status == "error":
+                logger.warning("%s 绑的 %s：MCP 服务 %s 上次没连上，运行时可能拿不到这个工具", who, name, server)
+            elif tool not in ("", "*") and row.tools_cache and tool not in row.tools_cache:
+                logger.warning("%s 绑的 %s：MCP 服务 %s 上次交回的工具清单里没有 %s", who, name, server, tool)
+        elif name in builtin:
+            continue
+        elif name.startswith((QUERY_PREFIX, SCHEMA_PREFIX)):
+            source = name[len(QUERY_PREFIX):] if name.startswith(QUERY_PREFIX) else name[len(SCHEMA_PREFIX):]
+            if source not in sources:
+                missing.append((who, name, "data"))
+        elif name not in custom:
+            missing.append((who, name, "tools"))
+    return missing
+
+
+async def _refuse_missing_tools(session: AsyncSession, graph: dict[str, Any]) -> None:
+    """绑定的工具在本机不存在就不发起：以前要跑到那一步才失败，前面的步骤白跑、钱白花。"""
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception:  # noqa: BLE001 - 图本身不成形交给 run_manager.start 报
+        return
+    missing = await missing_tools(session, spec)
+    if not missing:
+        return
+    lines = "；".join(f"{who}绑的 {name}" for who, name, _ in missing[:8])
+    more = f"等 {len(missing)} 处" if len(missing) > 8 else ""
+    places = {where for _, _, where in missing}
+    if places == {"data"}:
+        fix = "去数据页接入，或在节点里重新选"
+    elif places == {"tools"}:
+        fix = "去工具页接入，或在节点里重新选"
+    else:
+        fix = "数据源工具去数据页接入、其他工具去工具页接入，或在节点里重新选"
+    raise CodedHTTPException(422, f"绑定的工具在本机不存在：{lines}{more}。{fix}", TOOL_MISSING)
 
 
 #: workflow_id 取这个值时只要没挂在任何工作流上的运行：画布上没保存就跑的临时图，

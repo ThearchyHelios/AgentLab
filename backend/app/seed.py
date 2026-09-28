@@ -181,8 +181,9 @@ TEMPLATES: list[dict[str, Any]] = [
         "nodes": [
             _n("start", "input", "周期", fields=[
                 {"name": "week", "default": "2026-W37", "description": "报告周期"}]),
+            # 取数节点：产出本身就是源数据（evidence_role=source），口径卡读它记得下出处
             _n("fetch", "code", "取数（数据底座）", language="python", network=False,
-               assign_to="agg",
+               assign_to="agg", evidence_role="source",
                code=(
                    "# 固定层：取数与汇总。真实场景换成对数据库/API 的查询，\n"
                    "# 结果会作为快照落工件库，出具溯源指回这里。\n"

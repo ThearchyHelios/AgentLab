@@ -830,6 +830,8 @@ interface Failure {
   fix?: FixKind | 'rerun'
   fixTo?: string
   fixFirst?: boolean
+  /** lib/explain 的 fixNode：该去改的是另一个节点（名字），比如整形节点失败、毛病在上游 */
+  fixNode?: string
 }
 
 /** 这一轮是不是一次运行。Copilot 建图、发起就失败的，不能按运行的失败去讲（「接着跑」无从谈起） */
@@ -851,7 +853,7 @@ function failureOf(turn: StreamTurn): Failure | null {
   if (!hint && isRunTurn(turn)) {
     const x = explainRunError(text, detail)
     return { title: x.title, reason: x.reason, action: x.action, fix: x.fix, fixTo: x.fixTo, fixFirst: x.fixFirst,
-             raw: x.raw && x.raw !== x.title ? x.raw : undefined }
+             fixNode: x.fixNode, raw: x.raw && x.raw !== x.title ? x.raw : undefined }
   }
   const h = humanizeError(hint || detail ? { error: text, hint, detail } : text)
   return { title: h.title, reason: h.reason, action: h.action, raw: h.raw && h.raw !== h.title ? h.raw : undefined }
@@ -881,9 +883,12 @@ function FixAction({ fix, nodeId, label, to, first }: {
     return <Link to={to ?? '/settings/providers'} className={cls} data-fix="settings"><Settings2 size={10} aria-hidden /> 去模型接入</Link>
   }
   if (fix === 'tools') {
+    // 数据源工具（db_query__ 这类）不在工具库里接入，在数据页
+    const data = !!to?.startsWith('/data')
     return (
-      <Link to={to ?? '/tools'} className={cls} data-fix="tools">
-        <Wrench size={10} aria-hidden /> {first ? '去改参数定义' : '去工具库'}
+      <Link to={to ?? '/tools'} className={cls} data-fix={data ? 'data' : 'tools'}>
+        {data ? <Database size={10} aria-hidden /> : <Wrench size={10} aria-hidden />}
+        {' '}{data ? '去数据页接入' : first ? '去改参数定义' : '去工具库'}
       </Link>
     )
   }
@@ -904,6 +909,11 @@ function TurnError({ turn }: { turn: StreamTurn }) {
   const node = findFirst(turn.steps, (s) => s.kind === 'node' && s.status === 'failed' && !!s.nodeId)
   const whereId = rf?.nodeId ?? node?.nodeId
   const whereLabel = rf?.sub?.replace(/^出错的节点：/, '') || node?.title
+  // 该改的是另一个节点（上游写坏了 JSON）：入口指到它；这一轮里找不到它就不给入口，不指错
+  const target = f.fixNode && f.fixNode !== whereLabel
+    ? findFirst(turn.steps, (s) => s.kind === 'node' && s.title === f.fixNode && !!s.nodeId) : null
+  const fixId = f.fixNode && f.fixNode !== whereLabel ? target?.nodeId : whereId
+  const fixLabel = f.fixNode && f.fixNode !== whereLabel ? f.fixNode : whereLabel
   return (
     <div role="alert" data-turn-error=""
          className="mt-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs"
@@ -930,7 +940,7 @@ function TurnError({ turn }: { turn: StreamTurn }) {
           </div>
         )}
         <div className="flex flex-wrap items-center gap-x-2">
-          <FixAction fix={f.fix} nodeId={whereId} label={whereLabel} to={f.fixTo} first={f.fixFirst} />
+          <FixAction fix={f.fix} nodeId={fixId} label={fixLabel} to={f.fixTo} first={f.fixFirst} />
         </div>
         {f.raw && <div className="mt-1"><TechDetails raw={f.raw} /></div>}
       </div>
@@ -1416,16 +1426,33 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
   )
 }
 
+/**
+ * 失败节点的原话是不是已经被上面的说法原样说完了：原话的每一句（按句号、分号断开，去掉标点和
+ * 空白比）都出现在「一句话 + 为什么 + 怎么办」里。说完了就不在展开区再贴一遍——用户真实踩到的：
+ * 「模板渲染出来的不是合法 JSON…」先按标题、怎么办各说一遍，底下又整段贴了一遍原话。
+ * 说法是改写过的（「模型鉴权没通过」之类）就还留着原话，它是唯一的原文
+ */
+function saidAlready(detail: string, parts: (string | undefined)[]): boolean {
+  const norm = (t: string) => t.replace(/[\s。．.，,；;：:！!？?、]/g, '')
+  const shown = norm(parts.filter(Boolean).join(''))
+  const sentences = detail.split(/[。；;\n]/).map(norm).filter(Boolean)
+  return !!shown && sentences.length > 0 && sentences.every((x) => shown.includes(x))
+}
+
 /** 展开区：跑的是什么（SQL、代码、参数）+ 跑出了什么 + 技术细节 + 完整证据 */
 function StepDetail({ step, table, explained }: {
   step: Step; table: Table | null
-  /** 失败节点按 lib/explain 讲的为什么、怎么办 */
-  explained?: { reason?: string; action?: string; fix?: FixKind | 'rerun'; fixTo?: string; fixFirst?: boolean } | null
+  /** 失败节点按 lib/explain 讲的为什么、怎么办（title 是收着时那一行已经说了的一句话） */
+  explained?: {
+    title?: string; reason?: string; action?: string; fix?: FixKind | 'rerun'; fixTo?: string; fixFirst?: boolean; fixNode?: string
+  } | null
 }) {
   const { openArtifact, dense } = useContext(Ctx)
   const pre = clsx('mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 leading-relaxed text-dim [overflow-wrap:anywhere]',
     dense ? 'text-[10.5px]' : 'text-2xs')
   const result = step.result
+  const detail = step.detail && explained && saidAlready(step.detail, [explained.title, explained.reason, explained.action])
+    ? undefined : step.detail
   return (
     <div className="mb-1 mt-1 space-y-1.5 pl-[18px]">
       {explained && (explained.reason || explained.action) && (
@@ -1437,13 +1464,14 @@ function StepDetail({ step, table, explained }: {
                 <CornerDownRight size={10} className="mt-[3px] shrink-0" aria-hidden />
                 <span className="min-w-0 [overflow-wrap:anywhere]">{explained.action}</span>
               </span>
-              <FixAction fix={explained.fix} nodeId={step.nodeId} label={step.title}
-                         to={explained.fixTo} first={explained.fixFirst} />
+              {/* 该改的是上游（fixNode）时这一行不给入口：它只认得自己这个节点，轮次顶上的报错会指到上游去 */}
+              <FixAction fix={explained.fix} nodeId={explained.fixNode && explained.fixNode !== step.title ? undefined : step.nodeId}
+                         label={step.title} to={explained.fixTo} first={explained.fixFirst} />
             </div>
           )}
         </div>
       )}
-      {step.detail && (
+      {detail && (
         <div className="group/detail relative">
           {step.kind === 'query' && (
             <div className="mb-0.5 flex items-center gap-2 text-2xs text-dim">
@@ -1454,7 +1482,7 @@ function StepDetail({ step, table, explained }: {
             </div>
           )}
           <pre className={pre}>
-            {step.detail}
+            {detail}
           </pre>
         </div>
       )}
@@ -1723,11 +1751,20 @@ function download(name: string, text: string, type: string) {
 
 const fileSafe = (s: string) => s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40) || '结果'
 
-/** 查询结果画成表格。一屏 JSON 谁也看不出名堂，表格能一眼看到形状。 */
-function ResultTable({ table, artifact, title, full = false }: {
+/**
+ * 查询结果画成表格。一屏 JSON 谁也看不出名堂，表格能一眼看到形状。
+ *
+ * 证据面板的查询步骤也用它：highlight 标出被引用的行和格（行是 table.rows 的下标），
+ * 加 data-highlight，颜色只用令牌；masked 列出被遮罩的列，那几列的值一律写「已遮罩」——
+ * 后端已经换过，这里再拦一道，老接口、别的入口回来的原值也不画出来
+ */
+export function ResultTable({ table, artifact, title, full = false, highlight, masked }: {
   table: Table; artifact?: string; title?: string
   /** 完整证据里：不截列、行数放宽 */
   full?: boolean
+  /** cells 精确到格（[行下标, 列名]）：有它就只标这几格，没有就标 rows × cols */
+  highlight?: { rows: number[]; cols: string[]; cells?: [number, string][] | null }
+  masked?: string[]
 }) {
   const { dense, openArtifact } = useContext(Ctx)
   const maxCols = full ? table.columns.length : dense ? 4 : 8
@@ -1736,6 +1773,10 @@ function ResultTable({ table, artifact, title, full = false }: {
   const hiddenCols = table.columns.length - cols.length
   const rows = table.rows.slice(0, maxRows)
   const numeric = cols.map((c, j) => isMetricColumn(c, rows, j))
+  const hlCells = highlight?.cells ? new Set(highlight.cells.map(([r, c]) => `${r}\u0000${c}`)) : null
+  const hlRows = new Set([...(highlight?.rows ?? []), ...(highlight?.cells ?? []).map(([r]) => r)])
+  const hlCols = new Set(highlight?.cols ?? [])
+  const hidden = new Set(masked ?? [])
 
   return (
     <div className="overflow-hidden rounded border">
@@ -1751,19 +1792,30 @@ function ResultTable({ table, artifact, title, full = false }: {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, i) => (
-              <tr key={i} className="border-b last:border-0">
-                {row.slice(0, maxCols).map((cell, j) => (
-                  <td key={j} className={clsx('mono max-w-[160px] truncate px-1.5 py-1 text-dim',
-                    numeric[j] && 'tnum text-right')}
-                      title={cell == null ? '' : String(cell)}>
-                    {cell == null ? <span className="opacity-40">null</span>
-                      : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}
-                  </td>
-                ))}
-                {hiddenCols > 0 && <td className="px-1.5 py-1 text-dim">…</td>}
-              </tr>
-            ))}
+            {rows.map((row, i) => {
+              const hit = hlRows.has(i)
+              return (
+                <tr key={i} className="border-b last:border-0" data-highlight={hit ? 'row' : undefined}
+                    style={hit ? { background: 'var(--st-done-soft)' } : undefined}>
+                  {row.slice(0, maxCols).map((cell, j) => {
+                    const mark = hit && (hlCells ? hlCells.has(`${i}\u0000${cols[j]}`) : hlCols.has(cols[j]))
+                    const mask = hidden.has(cols[j])
+                    return (
+                      <td key={j} className={clsx('mono max-w-[160px] truncate px-1.5 py-1',
+                        mark ? 'font-semibold' : 'text-dim', numeric[j] && 'tnum text-right')}
+                          data-highlight={mark ? 'cell' : undefined} data-masked={mask ? '' : undefined}
+                          style={mark ? { outline: '1px solid var(--st-done)', outlineOffset: -1, color: 'var(--text)' } : undefined}
+                          title={mask ? '已遮罩' : cell == null ? '' : String(cell)}>
+                        {mask ? <span className="font-sans italic text-faint">已遮罩</span>
+                          : cell == null ? <span className="opacity-40">null</span>
+                          : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}
+                      </td>
+                    )
+                  })}
+                  {hiddenCols > 0 && <td className="px-1.5 py-1 text-dim">…</td>}
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -1792,7 +1844,9 @@ function ResultTable({ table, artifact, title, full = false }: {
         <span className="flex-1" />
         <button type="button" className="inline-flex items-center gap-1 rounded px-1 transition-colors hover:bg-hover hover:text-fg"
                 title="导出为 CSV（Excel 可直接打开）"
-                onClick={() => download(`${fileSafe(title ?? '查询结果')}.csv`, toCsv(table.columns, table.rows), 'text/csv;charset=utf-8')}>
+                onClick={() => download(`${fileSafe(title ?? '查询结果')}.csv`, toCsv(table.columns, hidden.size
+                  ? table.rows.map((r) => r.map((v, j) => (hidden.has(table.columns[j]) ? '已遮罩' : v))) : table.rows),
+                'text/csv;charset=utf-8')}>
           <Download size={10} aria-hidden /> CSV
         </button>
         {artifact && !table.clipped && !full && (
@@ -1812,9 +1866,12 @@ function ResultTable({ table, artifact, title, full = false }: {
  *
  * 解码器早就给每一步记了工件 id，接口也一直在，界面从没渲染过——「每一步都有
  * 工件、数字可回指」这个区别于普通问数工具的卖点，以前在界面上看不见。
- * 导出给运行页的工件清单复用：id 为 null 时不渲染。
+ * 导出给运行页的工件清单复用：id 为 null 时不渲染。证据面板打开查询快照时带上 masked，
+ * 数据源设了遮罩的那几列同样写「已遮罩」。
  */
-export function ArtifactViewer({ id, title, onClose }: { id: string | null; title?: string; onClose: () => void }) {
+export function ArtifactViewer({ id, title, masked, onClose }: {
+  id: string | null; title?: string; masked?: string[]; onClose: () => void
+}) {
   const [state, setState] = useState<{ id: string; content?: unknown; error?: unknown } | null>(null)
   useEffect(() => {
     if (!id) return
@@ -1863,7 +1920,7 @@ export function ArtifactViewer({ id, title, onClose }: { id: string | null; titl
                 </pre>
               </div>
             )}
-            {body.table ? <ResultTable table={body.table} full artifact={id ?? undefined} title={title} />
+            {body.table ? <ResultTable table={body.table} full artifact={id ?? undefined} title={title} masked={masked} />
               : (
                 <div>
                   <div className="mb-1 flex justify-end"><CopyChip label="复制全文" text={() => body.text} /></div>

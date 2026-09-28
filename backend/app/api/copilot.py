@@ -18,7 +18,7 @@ from app.core.errors import explain as explain_error, graph_error, not_configure
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
-from app.engine.schema import GraphSpec, NodeType, ValidationIssue, validate_graph
+from app.engine.schema import GraphSpec, NodeType, ValidationIssue, text_parse_issues, validate_graph
 from app.engine.state import message_text
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 from app.tools.registry import all_specs
@@ -130,7 +130,11 @@ def _datasource_section(rows: list[Any]) -> str:
         "- 认准方言：Oracle 用 FETCH FIRST n ROWS ONLY，不是 LIMIT\n"
         "- 一次只写一条语句；分号拼接会被拒\n"
         "- 字段拿不准就在图里先放一个 db_schema 工具节点，别猜字段名\n"
-        "- 取数结果要进口径卡（metrics 节点）才能被报告撰写节点（report）引用，别让 llm 节点直接对数字做算术\n"
+        # 真实踩过：列名是照着业务说法猜的，跑到查库那一步才「no such column」
+        "- 列名只照上面结构里列出来的写；结构里只列了表名时先用 db_schema 查字段。搭完自查会拿 SQL 里的列名"
+        "去对结构，对不上会打回来让你改\n"
+        "- 比率、增幅、占比这类派生计算进口径卡（metrics 节点）；查询结果里原样的数，报告撰写节点（report）"
+        "可以直接用 [[v:Q1.r0.列名]] 引用。别让 llm 节点直接对数字做算术\n"
     )
 
 
@@ -139,7 +143,12 @@ NODE_REFERENCE = """\
 - input：入口。config.fields = [{name, required, default, description}]
 - output：出口，收集最终成果。config.fields = [{name, value}]，value 里写模板引用
 - llm：单次模型调用。config: {system, prompt, model, temperature, max_tokens, assign_to, output_schema}
-- agent：带工具循环的 agent。config: {system, prompt, tools:[工具名], approval, assign_to}
+- agent：带工具循环的 agent。config: {system, prompt, tools:[工具名], approval, assign_to, output_schema, cite_fields}
+  **agent 要把查到的数交给口径卡或报告时**，config 加 output_schema（JSON Schema，写要交的字段和类型）和
+  cite_fields: true：循环结束后系统按 Schema 抽一次字段，每个字段都核对到它查过的那一格——以查询快照为准，
+  查不到的记空值、不兜底成 0。assign_to 拿到的就是核对过的对象，口径卡直接写 vars.<assign_to>.字段。
+  只写 output_schema 不开 cite_fields 不生效。**不要用 transform 解析 agent / llm 的文字**：模型写的 JSON
+  常夹着没转义的引号，解析一失败整个节点就失败，也核对不了出处
   **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
   步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
   上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
@@ -154,6 +163,8 @@ NODE_REFERENCE = """\
   成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
+  evidence_role：source（取数：产出本身就是源数据）/ compute（计算，默认）。负责取数的代码写 source；
+  compute 的产出喂给口径卡会被提示「核对不了出处」——业务计算写进口径卡的表达式。
   assign_to 拿到的是 stdout（尾部的换行已去掉）。**stdout 是 JSON 时会解析成对象**，
   这时下游要用 {{ vars.x.字段 }} 取字段，拿它比字符串永远不成立。要判一个简单结论，
   就 print 一个短字符串（比如 print('ok')）并让下游比它。
@@ -172,26 +183,33 @@ NODE_REFERENCE = """\
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
 - metrics：口径卡。报告里要出现的数字、以及所有派生计算（比率、增幅、占比、差值）都登记在这里。
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
-  expression 是受限表达式（不是模板）：vars.q.rows[0][0]、round((vars.q.rows[0][0] - vars.q.rows[0][1]) / vars.q.rows[0][1] * 100, 1)
+  expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
+  round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1)
   format：thousands（默认，千分位）/ plain（不分组，年份编号这类）/ percent_of_ratio（值是 0.0235 这样的比率，显示成 2.35%）；
   decimals 写 -15 到 15 的整数；percent_of_ratio 的 decimals 按比率算：要显示两位百分比（2.35%）写 4，
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
-  db_query__* 返回的是 JSON 文本 {columns, rows}，口径卡取不到里面的字段：先接一个
-  transform（mode=json，template="{{ nodes.取数节点id }}"，assign_to="q"），口径卡再写 vars.q.rows[0][0]
+  取 tool 节点查库的结果用 cell(nodes.取数节点id, 行, '列名')（行号从 0 数，列按列名）：cell() 直接认查询工具
+  交回的结果，出处精确到快照里的那一格，不用再接 transform 解析。取 agent 的字段写 vars.<agent 的 assign_to>.字段
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], on_violation, max_repairs, assign_to}
-  **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游口径卡的指标和运行输入，
-  模型只能写 [[m:指标id]]、[[i:输入字段]] 这样的引用标记，数值由系统换成口径卡里的真实值；
-  模型自己写的数字会被打回重写。它只能引用口径卡指标和运行输入，所以报告里要出现的每个数都得先在口径卡里登记。
+  **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
+  （tool 节点和 agent 查过的库，按查询先后编成 Q1、Q2…）和运行输入，模型只能写引用标记，数值由系统从证据里
+  取出来渲染；模型自己写的数字会被打回重写：
+  - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用
+  - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
+  - [[table:Q1 cols=列a,列b rows=0-4]]：把查询结果的几行几列原样生成表格，每一格都点得开出处
+  - [[i:输入字段]]：运行输入
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
   required:[必需指标id], expected:[期望指标id], strict: true}。成果字段写 {{ nodes.报告节点id.text }}，
-  前后不要拼别的字——拼了就没法逐段对应证据，出具会降档
+  前后不要拼别的字——拼了就没法逐段对应证据，出具会降档。受管模板的报告要直接引用查询单元格
+  （[[v:]] / [[table:]]）的，契约里写 cells: true，否则这些引用按解析不了算
 
 搭图规则（有数字结论时必须遵守）：
-1. 取数（tool 节点查库，接 transform 解析）→ 口径卡 → report → output（配 report_from 契约）。
-   agent 的回答是自由文本，进不了口径卡：要出可追溯的报告，取数用 tool 节点
+1. 取数（tool 节点查库；或者 agent 查库并配 output_schema + cite_fields）→ 口径卡 → report → output
+   （要三档出具时配 report_from 契约）。没有比率、增幅这类派生计算时可以不要口径卡，report 直接引用查询单元格
 2. 能用 SUM / COUNT 做的聚合放在 SQL 里，口径卡只做标量运算
-3. 不要用 code 节点做业务计算；code 只做格式转换
+3. 不要用 code 节点做业务计算；code 只做格式转换（负责取数的 code 标 evidence_role: source）
+4. 不要用 transform 解析 agent / llm 的文字：口径卡读 cell(nodes.查库节点id, 行, '列名') 或 vars.<agent 的 assign_to>.字段
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -279,10 +297,16 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "- 涉及数据的问题必须用 db_query__* / db_schema__* 去真查，"
             "不要只对问题本身做文字加工（改写、摘要、分类都不是回答）\n"
             "- 出口节点给出的应当是这个问题的答案本身\n"
-            # 报告撰写节点只能引用口径卡里登记过的数。agent 查到的结论还进不了口径卡，
-            # 普通问数也套上 report 的话，答案里的数会全部被判成没有出处
-            "- 用户要的是报告、周报，或者要能核对每个数的出处时，按搭图规则走 tool 取数 → 口径卡 → "
-            "report → output（配 report_from 契约）；普通的问数照旧用 agent，不必加 report\n"
+            # 二期起报告能直接引用 agent 查过的单元格：答案里的每个数都点得开出处，不必为问数硬塞一张口径卡。
+            # 只问表结构、清单的没有数要核对，多一次写作调用只是多等十几秒
+            "- 答案里有数字时，搭 input → agent → report → output：agent 绑 db_query__ 去查，report 的 instructions 写"
+            "「回答：{{ input.question }}」（可以附上 {{ nodes.agent的id.text }} 当分析思路），数用 [[v:Q1.r0.列名]] "
+            "直接引用 agent 查过的单元格，不必经过口径卡；要比率、增幅再在 agent 和 report 之间加口径卡，agent 配 "
+            "output_schema + cite_fields，口径卡读 vars.<assign_to>.字段。出口字段写 {{ nodes.report的id.text }}\n"
+            "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
+            "- 用户要的是周报、要三档出具时，按搭图规则配口径卡和 report_from 契约\n"
+            "- 不要用 transform 解析 agent / llm 的文字：要把 agent 查到的数交给下游，就给它配 output_schema + "
+            "cite_fields\n"
             # 只把历史放进 prompt 是不够的：模型拿到上一轮的图，默认仍然会
             # 重新设计一张"更完整"的。而用户说"再按月份拆一下"时要的是上一张
             # 图改个 SQL——重建出来的那张经常接到另一张表上，答案对不上前一轮。
@@ -943,11 +967,19 @@ def _sse(obj: dict[str, Any]) -> str:
 
 def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
+    *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
+    level: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
     限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
     回答他，比跑不起来更糟——答案看起来是对的。
+
+    另有两类运行时不挡、但助手搭图时要打回的写法（authored_issues）：SQL 里的列在数据源
+    的结构里查不到、整形节点按 JSON 解析 agent / llm 写的文字。
+
+    level（published / governed）给了的话，那一档发布门禁的 error 也算进来：助手改完的图
+    能跑还不够，要能发布。不给就和以前一样只管能不能跑。
 
     每条是 ValidationIssue 的字典形状（node_id、field 都在），和 final.issues 一样：
     界面靠 node_id 定位卡片、靠 field 落到具体的输入框，不用从一行字里抠节点 id。
@@ -956,8 +988,178 @@ def _blocking_issues(
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
     except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
         return None
-    return ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
-            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope"))
+    out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
+           + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
+           + authored_issues(spec, sources or [], baseline))
+    if level:
+        from app.engine.governance import lint_for_publish
+
+        out += [i.model_dump() for i in lint_for_publish(spec, level=level).issues if i.level == "error"]
+    return out
+
+
+def _changed(spec: GraphSpec, baseline: list[dict[str, Any]] | None) -> set[str]:
+    """这一轮新加或改过配置的节点。改图时只查这些：用户自己写的、这一轮没碰的 SQL 不替他改。"""
+    before = {n.get("id"): (n.get("data") or {}).get("config") for n in baseline or [] if isinstance(n, dict)}
+    return {n.id for n in spec.nodes if n.id not in before or before[n.id] != n.config}
+
+
+def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str, Any]] | None = None,
+                    ) -> list[dict[str, Any]]:
+    """助手搭图时要打回、运行时却不挡的写法，按 error 交回模型改：
+
+    - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
+      猜的列名跑起来只会「no such column」，还白跑前面的步骤
+    - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
+    """
+    changed = _changed(spec, baseline)
+    out: list[dict[str, Any]] = []
+    for issue in text_parse_issues(spec):
+        if issue.node_id in changed:
+            # 模型的文字放在模板引号里的那种，改法是 | json，不是换结构化输出
+            tail = "。不要用整形节点解析 agent / llm 的文字" if "cite_fields" in issue.message else ""
+            out.append({**issue.model_dump(), "level": "error", "code": "parse_model_text",
+                        "message": issue.message + tail})
+    by_name = {getattr(r, "name", None): r for r in sources}
+    for node in spec.nodes:
+        if node.id not in changed or node.type != NodeType.TOOL:
+            continue
+        source = by_name.get(_source_of(str(node.config.get("tool") or "")) or "")
+        args = node.config.get("args")
+        sql = args.get("sql") if isinstance(args, dict) else None
+        if source is None or not str(node.config.get("tool") or "").startswith("db_query__") \
+                or not isinstance(sql, str):
+            continue
+        found = sql_unknown_columns(sql, source)
+        if not found:
+            continue
+        unknown, known = found
+        listed = "、".join(known[:20]) + (f" 等 {len(known)} 列" if len(known) > 20 else "")
+        out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": "args.sql",
+                    "code": "sql_unknown_column",
+                    "message": f"SQL 里的 {'、'.join(unknown[:5])} 在数据源「{source.name}」的结构里查不到（这几张表的列："
+                               f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
+                               "别凭空猜列名"})
+    return out
+
+
+# --------------------------------------------------------------------------
+# SQL 里的列名对照数据源结构
+#
+# 只做有把握的判断，宁可漏判不可误判：这条会把图打回去让模型改。CTE、FROM 里的子查询、
+# 引号括起来的标识符、结构里找不到的表、结构没探查过或者探查被截断的，一律不判。
+# --------------------------------------------------------------------------
+
+#: @ 开头的是变量（@region、@@session），: 开头的是参数，. 后面的是限定名
+_SQL_IDENT = re.compile(r"(?<![\w$#.:@])([A-Za-z_][A-Za-z0-9_$#]*)(?![\w$#])")
+_FROM_ITEMS = re.compile(
+    r"\b(?:from|join)\s+(.+?)(?=\bwhere\b|\bgroup\b|\border\b|\bhaving\b|\blimit\b|\bfetch\b|\boffset\b"
+    r"|\bunion\b|\bintersect\b|\bexcept\b|\bon\b|\busing\b|\b(?:left|right|inner|outer|full|cross|natural)\b"
+    r"|\bjoin\b|\bwindow\b|\)|$)", re.I | re.S)
+_TABLE_ITEM = re.compile(r"^\s*([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)(?:\s+(?:as\s+)?([A-Za-z_][\w$#]*))?\s*$",
+                         re.I)
+_ALIAS_AS = re.compile(r"\bas\s+([A-Za-z_][\w$#]*)", re.I)
+#: 不写 AS 的列别名：「SUM(amount) total,」「amount total FROM」
+_ALIAS_BARE = re.compile(r"(\)|\b[A-Za-z_][\w$#]*|\d)\s+([A-Za-z_][\w$#]*)\s*(?=,|\bfrom\b)", re.I)
+_QUALIFIED = re.compile(r"(?<![\w$#.])([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*|\*)(?!\s*\()")
+_SQL_WORDS = frozenset("""
+select distinct all from where and or not in is null like ilike between exists case when then else end as on using
+join inner left right outer full cross natural group by order having limit offset fetch first next rows row only
+union intersect except asc desc nulls last with over partition range preceding following unbounded current true
+false interval year month day hour minute second week quarter dow doy epoch date time timestamp datetime zone
+cast integer int bigint smallint tinyint decimal numeric real float double precision varchar char character text
+boolean bool signed unsigned binary top percent escape collate any some values current_date current_time
+current_timestamp localtime localtimestamp sysdate systimestamp rownum level dual unknown filter within
+at nocase rtrim glob regexp rlike similar to div mod xor isnull notnull minus prior connect start nocycle siblings
+grouping sets rollup cube ignore respect lateral apply qualify window exclude include ties others no groups
+for update of share nowait skip locked lock mode array sounds overlaps language query expansion separator
+charset utf8 utf8mb4 latin1 ascii unicode years months weeks days hours minutes seconds microsecond microseconds
+millisecond milliseconds year_month day_hour day_minute day_second hour_minute hour_second minute_second
+isodow isoyear century decade millennium julian timezone timezone_hour timezone_minute
+sql_calc_found_rows sql_no_cache sql_cache sql_small_result sql_big_result sql_buffer_result high_priority
+straight_join distinctrow unique recursive tablesample bernoulli sample repeatable pivot unpivot keep ordinality
+symmetric asymmetric leading trailing both placing force use index into default without local
+user current_user session_user system_user current_schema current_catalog current_role
+""".split())
+
+#: 后面跟的一定是操作数、不会是别名的词：「SELECT created_at FROM」里 created_at 是列。
+#: END、NULL、TRUE、CURRENT_DATE 这类「一个值到此为止」的词不在里面——「… END flag,」的 flag 是别名
+_OPERAND_BEFORE = frozenset("""
+select distinct distinctrow all unique by as and or not xor is in like ilike glob regexp rlike similar to between
+when then else case on where having exists div mod escape interval collate using any some from join
+sql_calc_found_rows sql_no_cache sql_cache sql_small_result sql_big_result sql_buffer_result high_priority
+straight_join
+""".split())
+#: 不是列的名字：排序规则名（COLLATE x）、字符集名（USING x、CHARSET x、CHARACTER SET x）
+_NAME_AFTER = re.compile(
+    r"\b(?:collate|charset|character\s+set|using(?!\s*\())\s+([A-Za-z_][\w$#]*)", re.I)
+#: DATEADD(dd, …)、DATEDIFF(wk, …) 的第一个参数是日期部分的缩写，不是列。只在这个位置放过：
+#: 放进关键字表的话，别处打错成 wk、dd 的列名就查不出来了
+_DATEPART_ARG = re.compile(
+    r"\b(?:dateadd|datediff|datediff_big|datepart|datename|datetrunc|date_bucket|timestampadd|timestampdiff)"
+    r"\s*\(\s*([A-Za-z_][\w$#]*)", re.I)
+#: 命名窗口：WINDOW w AS (…)、…, w2 AS (…)
+_WINDOW_NAME = re.compile(r"(?:\bwindow|,)\s*([A-Za-z_][\w$#]*)\s+as\s*\(", re.I)
+
+
+def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:
+    """SQL 里用到、数据源结构里查不到的列：(查不到的列, 这几张表的全部列)。判断不了、或者都查得到时返回 None。"""
+    from app.data import introspect as _introspect
+    from app.data.guard import _blank_quoted, first_verb, strip_comments
+
+    cache = getattr(source, "schema_cache", None) or {}
+    if not cache.get("tables") or cache.get("failed") or first_verb(sql) != "select":
+        return None
+    text = re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S)
+    if '"' in text.replace("''", "") and _blank_quoted(text) != _blank_quoted(text, identifiers=False):
+        return None                                   # 引号括起来的标识符：大小写、空格都可能，不猜
+    text = _blank_quoted(text)
+    if re.search(r"\bwith\b", text, re.I) or re.search(r"\b(?:from|join)\s*\(", text, re.I) or "`" in text \
+            or "[" in text:
+        return None                                   # [方括号] 标识符、数组下标：同样不猜
+    tables: dict[str, dict[str, Any]] = {}       # 表名、别名（小写）→ 表结构
+    spans: list[tuple[int, int]] = []
+    for m in _FROM_ITEMS.finditer(text):
+        spans.append(m.span(1))
+        for item in m.group(1).split(","):
+            parsed = _TABLE_ITEM.match(item)
+            if not parsed:
+                return None
+            name, alias = parsed.group(1), parsed.group(2)
+            meta = _introspect.find_table(source, name)
+            if meta is None:
+                return None                           # 结构里找不到的表（视图、同义词、截断了的结构）不判
+            tables[name.lower()] = tables[name.rsplit(".", 1)[-1].lower()] = meta
+            if alias and alias.lower() not in _SQL_WORDS:
+                tables[alias.lower()] = meta
+    if not tables:
+        return None
+    known = list(dict.fromkeys(c["name"] for meta in {id(m): m for m in tables.values()}.values()
+                               for c in meta.get("columns") or []))
+    columns = {c.lower() for c in known}
+    # 「SELECT created_at FROM」里 created_at 前面是关键字，它是列，不是别名
+    aliases = {a.lower() for a in _ALIAS_AS.findall(text)} | {
+        m.group(2).lower() for m in _ALIAS_BARE.finditer(text) if m.group(1).lower() not in _OPERAND_BEFORE} | {
+        a.lower() for a in _WINDOW_NAME.findall(text)}
+    names = {m.start(1) for pattern in (_NAME_AFTER, _DATEPART_ARG) for m in pattern.finditer(text)}
+    unknown: list[str] = []
+    for m in _QUALIFIED.finditer(text):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        meta = tables.get(m.group(1).lower())
+        col = m.group(2)
+        if meta is not None and col != "*" and col.lower() not in {c["name"].lower() for c in meta.get("columns") or []}:
+            unknown.append(f"{m.group(1)}.{col}")
+    for m in _SQL_IDENT.finditer(text):
+        word = m.group(1)
+        low = word.lower()
+        if any(a <= m.start() < b for a, b in spans) or low in _SQL_WORDS or low in columns or low in aliases \
+                or low in tables or m.start() in names or re.match(r"\s*[.(]", text[m.end():]) \
+                or text[m.end():m.end() + 1] == "'":      # N'…'、X'…'、_utf8mb4'…'：字面量的前缀
+            continue
+        unknown.append(word)
+    unknown = list(dict.fromkeys(unknown))
+    return (unknown, known) if unknown else None
 
 
 def _source_of(tool: str) -> str | None:
@@ -1322,7 +1524,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         repaired = 0
         for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
-            errors = _blocking_issues(nodes, edges, scope)
+            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
             if not errors:
                 break
             yield _sse({"op": "check", "status": "repairing", "round": round_no, "issues": errors})
@@ -1340,7 +1542,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                             "message": f"自查修正没跑成：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
-        remaining = _blocking_issues(nodes, edges, scope)
+        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1363,6 +1565,9 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             issues = [i.model_dump() for i in validate_graph(spec).issues]
             issues += _issue_dicts(scope_issues(list(nodes.values()), scope),
                                    "datasource_out_of_scope")
+            # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见
+            issues += [{**i, "level": "warning"} for i in authored_issues(spec, sources, baseline)
+                       if i["code"] == "sql_unknown_column"]
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -1391,6 +1596,148 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --------------------------------------------------------------------------
+# 发布前自动修复的兜底：确定性修复修不了的 error 交给 Copilot，产出同样只是预览
+# --------------------------------------------------------------------------
+
+_LEVEL_WORD = {"published": "已发布", "governed": "受管"}
+
+_ASSIST_RULES = """\
+硬性约定（违反任何一条，这次修改整个作废）：
+- 不许降低要求：不删节点、不删连线，add_node 不许用图里已有的节点 id（那等于把旧节点删了重建），也不换节点类型；
+  不删掉或清空出具契约，不删 required 里的指标，不把 strict 改成 false，不往 allow_numbers 里加数，不替人打开 cells；
+  审批策略只能往严里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行），不放宽、不删掉，更不改成 never；
+  不取消子工作流钉住的版本；发布级别不是你能改的。结构要动（比如换掉协作团队），输出 question 说明怎么拆，不要自己动手
+- 要人拿主意的，不替人选、不编：required 该包括哪些指标、几张口径卡该用哪张、钉哪个版本、协作团队拆成哪几个
+  固定步骤……每一处输出一行 {"op":"question","node_id":"节点 id","text":"要问的话，把候选列出来"}，那一处不改
+- 只修下面列出的问题，别的不要动
+- 可用操作只有 update_node（config 只写要改的字段，没写的原样保留）、add_node、add_edge 和 question；
+  不要输出 remove_node、remove_edge、reply
+- 第一行 plan，最后一行 done，done 的 explanation 用一两句话说清改了什么、为什么"""
+
+
+def _publish_fix_request(graph: dict[str, Any], errors: list[dict[str, Any]], level: str) -> str:
+    return (
+        "这是当前的工作流：\n"
+        f"{json.dumps(_slim(graph), ensure_ascii=False, indent=2)}\n\n"
+        f"它要发布成「{_LEVEL_WORD.get(level, level)}」级别，发布前检查（和真正发布同一套规则）还拦着下面这些问题：\n"
+        + "\n".join(f"- {_issue_line(i)}" for i in errors)
+        + f"\n\n{_ASSIST_RULES}"
+    )
+
+
+async def assist_publish_fix(
+    session: AsyncSession, graph: dict[str, Any], *, level: str,
+    provider: str | None = None, model: str | None = None,
+) -> dict[str, Any]:
+    """把挡住发布的 error 交给 Copilot 修。模型、工具目录、操作流协议都和画布上改图是同一套。
+
+    拿回的操作在副本上应用，再按同一套规则复核（_blocking_issues 带上发布级别：validate、门禁，
+    以及这一轮改过的节点里有没有凭空猜的列名）：error 变少、没有新 error、没有降低要求的改动
+    （autofix.forbidden_changes）才采纳，否则整个作废并写明原因。模型认为要人拿主意的，放进
+    questions 原样交给人，不硬改。
+
+    返回 {accepted, reason, summary, questions（一句一条的文字）, graph, ops}。不落库。
+    """
+    from app.engine.autofix import forbidden_changes, judge
+
+    sources = await _sources(session, None)
+    base = copy.deepcopy(graph)
+    before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
+    before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
+    baseline = list(copy.deepcopy(before_nodes).values())
+    errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level) or []
+    out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
+                           "ops": []}
+    if not errors:
+        out["summary"] = "没有挡住发布的错误，不用交给 Copilot"
+        return out
+    try:
+        spec_ = await copilot_model_spec(
+            session, GenerateIn(instruction="发布前自动修复", provider=provider, model=model))
+        chat, _ = await get_chat_model(session, spec_)
+    except ProviderNotConfigured as e:
+        out["summary"] = _unconfigured(e)
+        return out
+
+    system = (
+        "你是一个 agent 工作流编排专家。现在要做的是：让一张工作流过发布前检查，以操作流的方式输出修改。\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
+    )
+    nodes = copy.deepcopy(before_nodes)
+    edges = copy.deepcopy(before_edges)
+    tried: list[dict[str, Any]] = []
+    effective: list[dict[str, Any]] = []
+    plan = ""
+    try:
+        async for op in _iter_ops(chat, [("system", system), ("human", _publish_fix_request(base, errors, level))]):
+            kind = op.get("op")
+            if kind in ("thinking", "heartbeat"):
+                continue
+            if kind == "plan":
+                plan = str(op.get("summary") or "")
+            elif kind == "done":
+                out["summary"] = str(op.get("explanation") or "")
+            elif kind in ("question", "reply"):
+                text = str(op.get("text") or "").strip()
+                # 原样交给人看，前面标上是哪个节点的事（界面上认节点标题，不认 id）
+                where = before_nodes.get(str(op.get("node_id") or ""))
+                title = str((where.get("data") or {}).get("label") or where.get("id")) if where else ""
+                if text:
+                    out["questions"].append(f"「{title}」：{text}" if title and title not in text else text)
+            else:
+                tried.append(op)
+                if _apply_op(nodes, edges, op):
+                    effective.append(op)
+    except Exception as e:  # noqa: BLE001 - 修不成就照实说，确定性修复的结果照样交给人
+        out["summary"] = f"Copilot 这一轮没跑完：{explain_error(e)[0]}"
+        return out
+    out["summary"] = out["summary"] or plan
+    if not effective:
+        # 没动图：要么全是要人拿主意的问题，要么它没给出能用的修改。都不算「拒绝」
+        out["summary"] = out["summary"] or ("Copilot 认为这些问题要你来拿主意" if out["questions"]
+                                            else "Copilot 这一轮没有给出修改")
+        return out
+
+    proposed = _proposed_graph(base, nodes, edges)
+    reasons = forbidden_changes(base, proposed, tried)
+    after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
+                             baseline=baseline, level=level)
+    if reasons:
+        out["reason"] = "Copilot 的修改降低了要求，已作废：" + "；".join(reasons)
+    elif after is None:
+        out["reason"] = "Copilot 改完的图结构读不懂，已作废"
+    elif why := judge(errors, after):
+        out["reason"] = f"Copilot 的修改没有让图变得更好，已作废：{why}"
+    else:
+        out.update(accepted=True, graph=proposed, ops=effective)
+    return out
+
+
+def _nodes_by_id(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(n["id"]): n for n in graph.get("nodes") or [] if isinstance(n, dict) and n.get("id")}
+
+
+def _proposed_graph(base: dict[str, Any], nodes: dict[str, dict[str, Any]],
+                    edges: list[dict[str, Any]]) -> dict[str, Any]:
+    """Copilot 改完的整张图：原图里前端的东西（坐标、连线 id、视口）原样留着，新节点找空处摆。"""
+    out = copy.deepcopy(base)
+    out["nodes"] = list(nodes.values())
+    out["edges"] = edges
+    pinned = _pinned_positions(base)
+    fresh = [nid for nid in nodes if nid not in pinned]
+    if fresh:
+        try:
+            laid, _ = _layout_keeping(GraphSpec.model_validate({"nodes": out["nodes"], "edges": edges}), pinned)
+            where = {n.id: n.position.model_dump() for n in laid.nodes}
+            for nid in fresh:
+                nodes[nid]["position"] = where.get(nid, nodes[nid].get("position"))
+        except Exception:  # noqa: BLE001 - 摆不好就留在原点，复核那一步会报结构问题
+            pass
+    return out
 
 
 class FromRunIn(BaseModel):

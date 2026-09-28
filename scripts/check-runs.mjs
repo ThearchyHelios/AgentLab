@@ -498,6 +498,28 @@ await section('失败：指到节点、原因、下一步', async () => {
     check('跑的是这次运行时的图快照', Array.isArray(startBody?.graph?.nodes) && startBody.graph.nodes.length > 0 && !startBody.workflow_id)
     fakes.delete('POST /api/runs')
 
+    // 补上之后发起被拒：绑定的工具在本机不存在（422 run_tool_missing）。和画布上发起被拒同一套，
+    // 报错里给直达入口（数据源工具去数据页），不是只有一句 toast
+    await page.goto(`${WEB}/runs/${missingInput.id}`, { waitUntil: 'networkidle' })
+    await page.locator('[data-run-banner=failed] [data-action=rerun]').waitFor()
+    fakes.set('POST /api/runs', () => ({ status: 422, json: {
+      detail: '绑定的工具在本机不存在：「查数」（调用工具）绑的 db_query__nope。去数据页接入，或在节点里重新选', code: 'run_tool_missing' } }))
+    await page.locator('[data-run-banner=failed] [data-action=rerun]').click()
+    const refused = page.getByRole('dialog')
+    await refused.waitFor()
+    await refused.locator('input, textarea').first().fill('检查用的主题')
+    await refused.getByRole('button', { name: '重新运行' }).click()
+    const toData = page.getByRole('button', { name: '去数据页接入' })
+    await toData.waitFor({ timeout: 5000 }).catch(() => {})
+    check('补上重新运行被拒（工具不在本机）：报错里有「去数据页接入」', await toData.count() === 1)
+    const said = await page.getByText('绑定的工具「db_query__nope」在本机不存在').first().innerText().catch(() => '')
+    check('……点名那个工具，说清这次运行没有发起', said.includes('db_query__nope') && said.includes('没有发起'), said.slice(0, 120))
+    check('……人还在这条运行上', new URL(page.url()).pathname === `/runs/${missingInput.id}`, page.url())
+    await toData.click().catch(() => {})
+    await page.waitForURL((u) => u.pathname.startsWith('/data'), { timeout: 5000 }).catch(() => {})
+    check('……点了去数据页', new URL(page.url()).pathname.startsWith('/data'), page.url())
+    fakes.delete('POST /api/runs')
+
     // 正式运行缺输入：只能跑「当前」发布的版本。之后又发布过新版的话，带着原来
     // 的版本号会被后端 409（「vN 不是当前发布版本」），所以不带，并在弹窗里说清跑哪一版
     const published = (await getJson('/workflows')).find((w) => (w.published_version ?? 0) > 1)

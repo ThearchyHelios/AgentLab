@@ -25,12 +25,14 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import (
+    CELLS_REASON,
     MARKER_RULES,
     StreamRenderer,
     build_catalog,
     catalog_prompt,
     compose_doc,
     describe_violations,
+    ledger_enabled,
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
 from app.engine.schema import GraphNode, GraphSpec, NodeType, _ancestors
@@ -104,6 +106,36 @@ def report_allowance(spec: GraphSpec, node: GraphNode) -> list[Any]:
     return allowed
 
 
+def report_cells_allowed(spec: GraphSpec, node: GraphNode, *, governed: bool) -> bool:
+    """报告能不能直接引用查询单元格：出口契约的 report_from 指着它、而那份契约不允许的，写作时就不给。
+
+    出口复核按契约判（io.py），这里提前照同一条规则建目录：不然写作者照着提示写了单元格、自查
+    通过，到出口才整段判成解析不了——受管出具直接不予出具。
+    """
+    from app.engine.governance import cells_allowed
+
+    contracts = [other.config.get("contract") for other in spec.nodes if other.type == NodeType.OUTPUT]
+    return all(cells_allowed(c, governed=governed) for c in contracts
+               if isinstance(c, dict) and c.get("report_from") == node.id)
+
+
+#: 目录里能被报告引用的几种来源（沙箱代码节点的登记只为说清为什么不能引用，不算）
+_CITABLE = {"metric": "口径卡指标", "query": "查询结果", "retrieval": "知识库检索", "input": "运行输入"}
+
+
+def _no_evidence(catalog: dict[str, Any], cells: bool) -> str | None:
+    """目录里没有可引用的来源时给一句话，说清缺的是哪种；有就返回 None。"""
+    kinds = {entry.get("kind") for entry in catalog.values()}
+    if not kinds & set(_CITABLE):
+        return ("报告撰写节点的上游没有可引用的来源：" + "、".join(_CITABLE.values()) + "都没有，"
+                "报告里的数字都会被判为没有出处。在它前面接取数节点或口径卡，或者检查 metrics_from / evidence_from")
+    if not cells and not kinds & {"metric", "input"}:
+        # 只有查询和检索：单元格引用不了，检索片段本来就只能当依据，一个数都没处引
+        return (f"报告撰写节点的上游只有查询结果、没有口径卡指标，而这次{CELLS_REASON}：单元格引用不了，"
+                "报告里的数字都会被判为没有出处。在出口契约里写 \"cells\": true，或者把要写的数登记进口径卡")
+    return None
+
+
 # --------------------------------------------------------------------------
 # 执行器
 # --------------------------------------------------------------------------
@@ -116,10 +148,11 @@ class _RenderedStream:
     中间，StreamRenderer 攒到没有未闭合的 [[ 再放；调用结束时 flush 掉剩下的。
     """
 
-    def __init__(self, ctx: NodeContext, catalog: dict[str, Any]) -> None:
+    def __init__(self, ctx: NodeContext, catalog: dict[str, Any], cells: bool = True) -> None:
         self._ctx = ctx
         self._catalog = catalog
-        self._renderer = StreamRenderer(catalog)
+        self._cells = cells
+        self._renderer = StreamRenderer(catalog, cells_allowed=cells)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._ctx, name)
@@ -131,7 +164,7 @@ class _RenderedStream:
             return
         if event_type == EventType.LOG and data.get("code") == "stream_fallback":
             # 流断在半路、退回非流式重来：攒着的半截不再放出去，免得和重来的那份接在一起
-            self._renderer = StreamRenderer(self._catalog)
+            self._renderer = StreamRenderer(self._catalog, cells_allowed=self._cells)
         self._ctx.emit(event_type, **data)
 
     def flush(self) -> None:
@@ -183,14 +216,14 @@ def _repair_request(violations: list[dict[str, Any]]) -> str:
     )
 
 
-def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any]) -> list[BaseMessage]:
+def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cells: bool = True) -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
     return [
         SystemMessage(content="\n\n".join(p for p in (system, ROLE) if p)),
         HumanMessage(content=(
-            f"{instructions}\n\n{catalog_prompt(catalog)}\n\n{MARKER_RULES}\n\n"
+            f"{instructions}\n\n{catalog_prompt(catalog, cells_allowed=cells)}\n\n{MARKER_RULES}\n\n"
             "只输出报告正文（Markdown），不要写撰写说明。"
         )),
     ]
@@ -223,19 +256,23 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
     allow = report_allowance(spec, ctx.node)
-    if not any(entry.get("kind") == "metric" for entry in catalog.values()):
-        ctx.emit(EventType.LOG, level="warn", code="report_no_evidence",
-                 message="报告撰写节点的上游没有可引用的口径卡指标：报告里的数字都会被判为没有出处。"
-                         "在它前面接一张口径卡，或者检查 metrics_from")
+    cells = True
+    if ledger_enabled(ctx.run):
+        # 升级前发起的运行没有查询条目，单元格无从谈起，也就不多查这一次
+        from app.engine.governance import governed_formal
 
-    messages = _messages(ctx, state, catalog)
+        cells = report_cells_allowed(spec, ctx.node, governed=await governed_formal(ctx.run.run_id))
+    if warning := _no_evidence(catalog, cells):
+        ctx.emit(EventType.LOG, level="warn", code="report_no_evidence", message=warning)
+
+    messages = _messages(ctx, state, catalog, cells)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
 
     async def draft(payload: list[BaseMessage]) -> tuple[BaseMessage, str]:
         nonlocal nudged
-        stream = _RenderedStream(ctx, catalog)
+        stream = _RenderedStream(ctx, catalog, cells)
         began = time.perf_counter()
         response = await _invoke_streaming(model, payload, stream, model_id)  # type: ignore[arg-type]
         stream.flush()
@@ -255,7 +292,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         return response, text
 
     def compose(raw: str) -> dict[str, Any]:
-        return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow)
+        return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
+                           cells_allowed=cells)
 
     response, raw = await draft(messages)
     doc = compose(raw)

@@ -57,8 +57,23 @@ export function toFlow(graph: GraphSpec): { nodes: FlowNode[]; edges: Edge[] } {
   }
 }
 
+/**
+ * 图上节点和连线以外的部分（全图默认 defaults、viewport）。画布只管节点和连线，以前 toGraph
+ * 只拼这两样，保存时 PATCH 整张图，defaults 被整个抹掉——其中审批默认 always 会悄悄放宽成
+ * 全局设置。打开工作流时记下来，toGraph 原样带回去；和 savedSig 一样只属于当前这张图
+ */
+let graphExtras: Pick<GraphSpec, 'defaults' | 'viewport'> = {}
+
+const extrasOf = (graph: GraphSpec | null | undefined): Pick<GraphSpec, 'defaults' | 'viewport'> => {
+  const out: Pick<GraphSpec, 'defaults' | 'viewport'> = {}
+  if (graph?.defaults && Object.keys(graph.defaults).length) out.defaults = structuredClone(graph.defaults)
+  if (graph?.viewport && Object.keys(graph.viewport).length) out.viewport = structuredClone(graph.viewport)
+  return out
+}
+
 export function toGraph(nodes: FlowNode[], edges: Edge[]): GraphSpec {
   return {
+    ...structuredClone(graphExtras),
     nodes: nodes.map((n) => ({
       id: n.id,
       type: n.data.nodeType,
@@ -560,6 +575,11 @@ interface StudioState {
   load: (workflow: Workflow | null) => void
   /** 整张换掉（自动排版）。画布锁着时不换、返回 false：调用方别再报「已换好」 */
   setGraph: (graph: GraphSpec) => boolean
+  /**
+   * 发布前修复的预览落到画布上：记一步撤销（label），节点的位置和选中照旧、不重新取景——
+   * 改的只是几个配置项，镜头一跳人就找不到刚才在看的节点了。锁着时不落、返回 false
+   */
+  applyFixes: (graph: GraphSpec, label: string) => boolean
   onNodesChange: (changes: NodeChange[]) => void
   onEdgesChange: (changes: EdgeChange[]) => void
   onConnect: (conn: Connection) => void
@@ -1087,6 +1107,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     get().cancelCopilot?.()
     dragOrigin = null
     glideSeq++
+    graphExtras = extrasOf(workflow?.graph)
     savedSig = graphSig(nodes, edges)
     lastVarSignature = ''
     set({
@@ -1120,9 +1141,38 @@ export const useStudio = create<StudioState>((set, get) => ({
   setGraph: (graph) => {
     if (locked(get)) return false
     const { nodes, edges } = toFlow(graph)
+    // 整图替换（Copilot、导入）带了 defaults 才换；没带的不能当成「清空」
+    if (graph.defaults !== undefined) graphExtras = { ...graphExtras, ...extrasOf({ ...graph, viewport: undefined }) }
     glideSeq++
     commit(set, get, '替换整个画布')
     set({ nodes, edges, selectedId: null, dirty: true, fitRequest: get().fitRequest + 1 })
+    void get().validate()
+    return true
+  },
+
+  applyFixes: (graph, label) => {
+    if (locked(get)) return false
+    const next = toFlow(graph)
+    // 发布前修复可能改的是全图默认（比如把 defaults.approval 从 never 改成 dangerous）。
+    // 后端回来的整张图总带着 defaults，照它换；viewport 留着画布自己的
+    if (graph.defaults !== undefined) {
+      const { viewport } = graphExtras
+      graphExtras = { ...extrasOf({ ...graph, viewport: undefined }), ...(viewport ? { viewport } : {}) }
+    }
+    const { nodes: cur, selectedId } = get()
+    const byId = new Map(cur.map((n) => [n.id, n]))
+    // 已有的节点只换名字和配置：位置、量好的尺寸、选中都留着，React Flow 不用重新量一遍
+    const nodes = next.nodes.map((n) => {
+      const old = byId.get(n.id)
+      return old ? { ...old, data: { ...old.data, label: n.data.label, config: n.data.config } } : n
+    })
+    glideSeq++
+    commit(set, get, label)
+    set({
+      nodes, edges: next.edges,
+      selectedId: selectedId && nodes.some((n) => n.id === selectedId) ? selectedId : null,
+      dirty: graphSig(nodes, next.edges) !== savedSig,
+    })
     void get().validate()
     return true
   },

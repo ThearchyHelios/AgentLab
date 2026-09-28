@@ -245,6 +245,9 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
     }
     return route.fallback()
   })
+  // 发布前检查和自动修复是只读的 POST：这里按老后端（没有这两个接口）答，发布弹窗照原样。
+  // 这两个接口本身的行为在 check-publish 里查
+  await page.route(/\/api\/workflows\/st-[a-z]+\/(publish-check|autofix)$/, (route) => json(route, { detail: 'Not Found' }, 404))
   await page.route(/\/api\/conversations(\/.*)?(\?.*)?$/, (route) => {
     const req = route.request()
     const url = new URL(req.url())
@@ -2022,6 +2025,99 @@ await section('删掉眼前这张', async () => {
     && await solo.page.getByText('还没有工作流').count() === 1 && new URL(solo.page.url()).pathname === '/studio', JSON.stringify(e))
   check('卸空时不误报「不在了」', await solo.page.getByText('那张工作流不在了').count() === 0)
   await solo.ctx.close()
+})
+
+// ================================================================ E2W
+await section('发起就被拒（工具不存在）给修复入口；整形节点解析上游失败，入口指到上游（E2W-4/5）', async () => {
+  const { ctx, page, errors } = await open()
+  // lib/explain 的纯函数：按页面自己加载的那一份取
+  const x = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/lib/explain.ts')
+    const e = (msg, code) => Object.assign(new Error(msg), code ? { code } : {})
+    return {
+      data: m.explainRunError('绑定的工具在本机不存在：「查数」（调用工具）绑的 db_query__nope；「团队」的成员「研究员」绑的 db_schema__nope。去数据页接入，或在节点里重新选'),
+      custom: m.explainRunError('绑定的工具在本机不存在：「查数」（Agent）绑的 lookup_order。去工具页接入，或在节点里重新选'),
+      mcp: m.explainRunError('绑定的工具在本机不存在：「查数」（Agent）绑的 mcp:shop/query。去工具页接入，或在节点里重新选'),
+      coded: m.explainStartError(e('发起不了：这几个工具不在了', 'run_tool_missing')),
+      other: m.explainStartError(e('那张工作流不在了', 'workflow_gone')),
+      up: m.explainRunError('上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串里有没转义的英文引号；让模型交结构化数据请用 output_schema + cite_fields'),
+      pointed: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.result }} 是模型写的文字，放进 JSON 要写成 {{ vars.result | json }}（外面不要再加引号）'),
+      empty: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.x }} 取出来是空的，这里缺一个值：检查路径写对没有、前面的节点有没有产出'),
+      old: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。检查模板里的引号、逗号，字符串值要用 | json 过滤器输出'),
+    }
+  })
+  check('工具不存在：数据源工具（db_query__ / db_schema__）指向数据页，不给接着跑',
+    x.data.fixTo === '/data' && x.data.fixLabel === '去数据页接入' && x.data.continuable === false, JSON.stringify(x.data).slice(0, 160))
+  check('……自定义工具指向工具页的自定义工具，一个工具时标题点名', x.custom.fixTo === '/tools/custom' && x.custom.fixLabel === '去工具页接入'
+    && x.custom.continuable === false && x.custom.title === '绑定的工具「lookup_order」在本机不存在', `${x.custom.fixTo} ${x.custom.title}`)
+  check('……MCP 工具指向工具页的 MCP 接入', x.mcp.fixTo === '/tools/mcp', x.mcp.fixTo)
+  check('发起报错认机读码 run_tool_missing（话改了也认），别的码不认', x.coded?.continuable === false && x.coded?.fixTo === '/tools'
+    && x.other === null, JSON.stringify({ coded: x.coded?.fixTo, other: x.other }))
+  check('上游写坏了 JSON：入口指到上游「快速回答」（fixNode），不指整形节点', x.up.fixNode === '快速回答' && x.up.fix === 'canvas' && !x.up.continuable, x.up.fixNode)
+  check('模板里 {{ 开头（后端给了准确改法）：不再追加「改用 output_schema」', !x.pointed.action.includes('output_schema')
+    && x.pointed.action.includes('| json') && !x.empty.action.includes('output_schema'), `${x.pointed.action} ｜ ${x.empty.action}`)
+  check('……老的笼统说法照旧追加那一句', x.old.action.includes('output_schema + cite_fields'), x.old.action)
+
+  // 画布上发起：POST /runs 回 422 run_tool_missing，报错里给「去数据页接入」，点了就去
+  const DETAIL = '绑定的工具在本机不存在：「查询销量」（调用工具）绑的 db_query__nope。去数据页接入，或在节点里重新选'
+  await page.route(/\/api\/runs$/, (route) => (route.request().method() === 'POST'
+    ? route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ detail: DETAIL, code: 'run_tool_missing' }) })
+    : route.fallback()))
+  // 这张图有一处「还没选工具」会把运行按钮置灰：等校验落定后清掉，只看发起被拒这一步
+  await waitAnalysis(page)
+  await S(page, () => window.__studio.setState({ issues: [] }))
+  await page.waitForTimeout(150)
+  await page.locator('[data-run-control] button[aria-label="运行"]').click()
+  await page.locator('[role="dialog"][aria-label="探索运行"]').locator('textarea, input').first().fill('x')
+  await page.locator('[role="dialog"][aria-label="探索运行"] button.btn-primary').click()
+  const fixBtn = page.getByRole('button', { name: '去数据页接入' })
+  await fixBtn.waitFor({ timeout: 4000 }).catch(() => {})
+  check('发起被拒：报错里有「去数据页接入」', await fixBtn.count() === 1)
+  const toastText = await page.locator('text=绑定的工具「db_query__nope」在本机不存在').first().innerText().catch(() => '')
+  check('……标题点名那个工具，原因里说这次运行没有发起', toastText.includes('db_query__nope') && toastText.includes('没有发起'), toastText.slice(0, 120))
+  check('……没有「接着跑」', await page.getByRole('button', { name: '接着跑' }).count() === 0)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.screenshot({ path: `${SHOTS}/studio-run-tool-missing-${theme}.png`, clip: { x: 300, y: 40, width: 900, height: 240 } })
+    }
+  }
+  await fixBtn.click().catch(() => {})
+  await page.waitForTimeout(400)
+  check('……点了去数据页', new URL(page.url()).pathname.startsWith('/data'), page.url())
+  await ctx.close()
+
+  // 整形节点解析上游的文字失败：轮次顶上的入口打开上游「快速回答」的设置，不是「汇总」
+  const run = await open()
+  const UP = '上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串里有没转义的英文引号；让模型交结构化数据请用 output_schema + cite_fields'
+  await S(run.page, (msg) => {
+    const st = window.__studio
+    const t = Date.now() / 1000 - 5
+    st.setState({ run: { id: 'st-run-json', workflow_id: 'st-main', workflow_name: '__studio_check__', status: 'queued',
+      input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    // 真实的 node.started 带着节点名和类型：流里的步骤按名字认上游
+    const list = [['run.started', null, {}], ['node.started', 'answer', { label: '快速回答', node_type: 'llm' }],
+      ['node.finished', 'answer', { duration_ms: 3 }], ['node.started', 'sum', { label: '汇总', node_type: 'transform' }],
+      ['node.failed', 'sum', { error: msg, duration_ms: 2 }], ['run.failed', null, { error: msg, node_id: 'sum' }]]
+    list.forEach((e, i) => st.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 }))
+  }, UP)
+  const turnFix = run.page.locator('[data-turn-error] [data-fix="canvas"]')
+  await turnFix.waitFor({ timeout: 4000 }).catch(() => {})
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await run.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await run.page.waitForTimeout(200)
+      await run.page.locator('[data-turn-error]').first().screenshot({ path: `${SHOTS}/studio-upstream-json-fix-${theme}.png` }).catch(() => {})
+    }
+  }
+  const label = await turnFix.innerText().catch(() => '')
+  check('轮次报错的入口：打开上游「快速回答」的设置', label.includes('打开「快速回答」的设置'), label)
+  await turnFix.click().catch(() => {})
+  await run.page.waitForTimeout(300)
+  check('……点了选中上游节点（不是整形节点）', await S(run.page, () => window.__studio.getState().selectedId) === 'answer')
+  check('没有运行时报错', errors.length === 0 && run.errors.length === 0, [...errors, ...run.errors].slice(0, 2).join(' | '))
+  await run.ctx.close()
 })
 
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)

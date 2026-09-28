@@ -3,17 +3,18 @@ import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import { AlertTriangle, ChevronLeft, Copy, Lock, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
 import clsx from 'clsx'
-import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax } from './nodeDefs'
+import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax, type NodeDef } from './nodeDefs'
 import { fieldOfIssue, unboundToolOf, withToolBound, type FieldRef } from './issues'
 import { hintOf } from './shortcuts'
 import { isActivePhase } from '../run/trace'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { datasourceTools, modelOptions, useCatalog, useDatasources } from '../store/catalog'
 import { api } from '../api/client'
-import { IconButton, JsonInput, Modal, isComposing } from '../components/ui'
+import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
+import { SUBGRAPH_UPGRADE_HELP, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
-import type { ValidationIssue, WorkflowVersion } from '../types'
+import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
 
 /** 检查器里一条落到字段上的问题 */
 type FieldIssue = ValidationIssue & { at: FieldRef | null }
@@ -149,6 +150,26 @@ function NodeRefsInput({ nodeId, type, value, onChange }: {
   )
 }
 
+/**
+ * 子工作流钉住版本后的升版处置：和口径卡的是同一个下拉——直接借口径卡的字段定义，选项、
+ * 文案一字不差，只换说明里「和谁同一套」那半句。上游在钉住的那一版之后又发了版时，正式运行
+ * 前必须声明，否则挡住（后端 governance.unresolved_caliber_upgrades 两者同一套规则）
+ */
+const SUBGRAPH_POLICY: FieldDef | null = (() => {
+  const base = NODE_DEFS.metrics.fields.find((f) => f.key === 'upgrade_policy')
+  return base ? {
+    ...base, help: SUBGRAPH_UPGRADE_HELP,
+    when: (c: Record<string, any>) => !!c.workflow_id && c.workflow_version != null && c.workflow_version !== '',
+  } : null
+})()
+
+/** 这个节点要画哪些字段：子工作流在「工作流」后面插上升版处置，其余照 nodeDefs */
+function fieldsOf(type: NodeType, def: NodeDef): FieldDef[] {
+  if (type !== 'subgraph' || !SUBGRAPH_POLICY || def.fields.some((f) => f.key === 'upgrade_policy')) return def.fields
+  const at = def.fields.findIndex((f) => f.key === 'workflow_id')
+  return [...def.fields.slice(0, at + 1), SUBGRAPH_POLICY, ...def.fields.slice(at + 1)]
+}
+
 /** 属性面板。所有字段都由 nodeDefs 的声明驱动渲染，加节点类型不用改这里。 */
 export function Inspector() {
   const selectedId = useStudio((s) => s.selectedId)
@@ -197,7 +218,7 @@ export function Inspector() {
   const setConfig = (key: string, value: any) =>
     updateNode(node.id, { config: { ...config, [key]: value } })
 
-  const visible = def.fields.filter((f) => !f.when || f.when(config))
+  const visible = fieldsOf(node.data.nodeType, def).filter((f) => !f.when || f.when(config))
   const keys = new Set(visible.map((f) => f.key))
   const basic = visible.filter((f) => !f.advanced)
   const advanced = visible.filter((f) => f.advanced)
@@ -382,7 +403,7 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   const id = `f-${nodeId}-${field.key}`
   const syntax = syntaxOf(field)
   const composite = field.type === 'cases' || field.type === 'agents' || field.type === 'ioFields'
-    || field.type === 'metricsList'
+    || field.type === 'metricsList' || field.type === 'caliberFrom'
   // 复合字段自己把问题落到第几项；落不到具体某一项的，和普通字段一样挂在下面
   const own = composite ? issues.filter((i) => i.at?.index == null) : issues
   const bad = own.some((i) => i.level === 'error')
@@ -390,8 +411,10 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   // 长文本在 360px 宽的栏里没法写：提示词、代码可以展开到大编辑器里（同一份值，边写边存）
   const expandable = (field.type === 'prompt' || field.type === 'code' || field.type === 'textarea') && syntax !== 'plain'
   const [wide, setWide] = useState(false)
+  // 看得见、暂时用不了：说清差什么（比如先写 Schema 才能开 cite_fields）
+  const off = field.disabled?.(config) ?? null
   return (
-    <div className="mb-3" data-field={field.key}>
+    <div className="mb-3" data-field={field.key} data-disabled={off ? '' : undefined}>
       {field.type !== 'switch' && (
         <div className="mb-1 flex items-center gap-1.5">
           <label className="label mb-0 min-w-0 flex-1 truncate" htmlFor={composite ? undefined : id}>{field.label}</label>
@@ -413,10 +436,12 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
         document.body,
       )}
       <FieldInput field={field} id={id} nodeId={nodeId} syntax={syntax} value={value} config={config}
-                  invalid={bad} describedBy={errorId} issues={issues} onChange={onChange} />
+                  invalid={bad} describedBy={[errorId, off ? `${id}-off` : ''].filter(Boolean).join(' ') || undefined}
+                  disabled={!!off} issues={issues} onChange={onChange} />
       {field.help && field.type !== 'switch' && (
         <div className="mt-1 text-2xs leading-snug text-faint">{field.help}</div>
       )}
+      {off && <div id={`${id}-off`} className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }}>{off}</div>}
       {!!own.length && (
         <div id={errorId} className="mt-1 space-y-0.5">
           {own.map((i, k) => <IssueLine key={k} issue={i} action={bindFix(i, config, (c) => onChange(c[field.key]))} />)}
@@ -426,9 +451,11 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   )
 }
 
-function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describedBy, issues, onChange }: {
+function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describedBy, disabled, issues, onChange }: {
   field: FieldDef; id: string; nodeId: string; syntax: FieldSyntax; value: any
   config: Record<string, any>; invalid: boolean; describedBy?: string
+  /** 字段的 disabled 条件成立（原因写在字段下面，由 describedBy 接上） */
+  disabled?: boolean
   issues: FieldIssue[]; onChange: (v: any) => void
 }) {
   // 目录只按这个字段用得上的那一张订阅。以前每个字段都订阅整个 catalog：连接心跳、
@@ -500,9 +527,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 
     case 'switch':
       return (
-        <label className="flex cursor-pointer items-center gap-2 py-0.5">
-          <input id={id} type="checkbox" checked={!!value} onChange={(e) => onChange(e.target.checked)}
-                 className="accent-[var(--accent)]" />
+        <label className={clsx('flex items-center gap-2 py-0.5', disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer')}>
+          <input id={id} type="checkbox" checked={!!value} disabled={disabled} aria-describedby={describedBy}
+                 onChange={(e) => onChange(e.target.checked)} className="accent-[var(--accent)]" />
           <span className="text-xs">{field.label}</span>
           {field.help && <span className="text-2xs text-faint">· {field.help}</span>}
         </label>
@@ -573,6 +600,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 
     case 'nodeRefs':
       return <NodeRefsInput nodeId={nodeId} type={field.refType} value={value} onChange={onChange} />
+
+    case 'caliberFrom':
+      return <CaliberFromPicker id={id} value={value} invalid={invalid} describedBy={describedBy} />
 
     case 'agents':
       return <AgentList value={value ?? []} issues={issues} config={config} onChange={onChange} />
@@ -647,9 +677,15 @@ function SubgraphPicker({ id, value, version, invalid, describedBy, onChange }: 
     if (!node) return
     const config = { ...node.data.config }
     if (v) config.workflow_version = Number(v)
-    else delete config.workflow_version
+    else {
+      // 跟随最新就谈不上升版：处置跟着钉的版本走，不钉了一起拿掉（撤销能找回）
+      delete config.workflow_version
+      delete config.upgrade_policy
+    }
     updateNode(node.id, { config })
   }
+  const pinned = version != null && String(version) !== '' ? Number(version) : null
+  const latest = versions?.length ? Math.max(...versions.map((v) => v.version)) : null
   return (
     <div className="space-y-1.5">
       <select id={id} className="field" value={value ?? ''} aria-invalid={invalid || undefined} aria-describedby={describedBy}
@@ -670,11 +706,158 @@ function SubgraphPicker({ id, value, version, invalid, describedBy, onChange }: 
               <option key={v.id} value={v.version}>v{v.version}{v.note ? ` · ${v.note}` : ''}</option>
             ))}
           </select>
+          {latest != null && pinned != null && latest > pinned && (
+            <div className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }} data-subgraph-newer="">
+              {upgradeNewerText(latest, pinned)}
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
+
+/**
+ * 口径卡从哪来：在这里定义，或者钉住另一个工作流某一版里的口径卡（caliber_from）。
+ *
+ * 钉住时选工作流、版本、那一版图里的口径卡节点，写成 {workflow_id, workflow_version, node_id}；
+ * 本地的名称、版本、指标定义这时不生效（后端 validate 也这么说），切过去就清掉——撤销能找回。
+ * 版本必须钉：不钉的话口径会跟着上游漂移。上游在钉住的那一版之后又发了版，旁边就提醒
+ * 要在下面声明升版处置，否则挡住正式运行（和子工作流同一套）
+ */
+function CaliberFromPicker({ id, value, invalid, describedBy }: {
+  id: string; value: any; invalid: boolean; describedBy?: string
+}) {
+  const workflows = useCatalog((s) => s.workflows)
+  const self = useStudio((s) => s.workflow?.id)
+  const nodeId = useStudio((s) => s.selectedId)
+  const updateNode = useStudio((s) => s.updateNode)
+  const ref = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : null
+  const wfId: string = ref?.workflow_id ? String(ref.workflow_id) : ''
+  const version: number | null = ref?.workflow_version != null && String(ref.workflow_version) !== ''
+    ? Number(ref.workflow_version) : null
+  const [versions, setVersions] = useState<WorkflowVersion[] | null>(null)
+  const [graph, setGraph] = useState<{ key: string; nodes: any[] } | 'error' | null>(null)
+  useEffect(() => {
+    setVersions(null)
+    if (!wfId) return
+    let alive = true
+    api.workflows.versions(wfId).then((v) => { if (alive) setVersions(v) }).catch(() => { if (alive) setVersions([]) })
+    return () => { alive = false }
+  }, [wfId])
+  useEffect(() => {
+    setGraph(null)
+    if (!wfId || version == null || !Number.isFinite(version)) return
+    let alive = true
+    api.workflows.version(wfId, version).then(
+      (v) => { if (alive) setGraph({ key: `${wfId}@${version}`, nodes: Array.isArray(v?.graph?.nodes) ? v.graph!.nodes : [] }) },
+      () => { if (alive) setGraph('error') },
+    )
+    return () => { alive = false }
+  }, [wfId, version])
+
+  /** 改这个节点的配置：钉住的来源和本地定义是互斥的两套 */
+  const write = (patch: Record<string, any>, drop: string[] = []) => {
+    const node = nodeId ? useStudio.getState().nodes.find((n) => n.id === nodeId) : undefined
+    if (!node) return
+    const config = { ...node.data.config, ...patch }
+    for (const k of drop) delete config[k]
+    updateNode(node.id, { config })
+  }
+  const mode: 'local' | 'pinned' = ref ? 'pinned' : 'local'
+  const setMode = (m: 'local' | 'pinned') => {
+    if (m === mode) return
+    if (m === 'pinned') write({ caliber_from: {} }, ['caliber', 'caliber_version', 'metrics'])
+    else write({ caliber_version: 'v1', metrics: [{ id: 'total', name: '', unit: '', expression: '' }] },
+      ['caliber_from', 'upgrade_policy'])
+  }
+  const radio = useRadioGroup(CALIBER_MODES, mode, setMode)
+  const cards = graph && graph !== 'error' ? graph.nodes.filter((n) => (n?.type ?? n?.data?.nodeType) === 'metrics') : []
+  const cardOf = (n: any) => ({ id: String(n.id), label: n.data?.label || n.title || '', config: n.data?.config ?? n.config ?? {} })
+  const chosen = cards.map(cardOf).find((c) => c.id === ref?.node_id)
+  const latest = versions?.length ? Math.max(...versions.map((v) => v.version)) : null
+  // 那一版里只有一张口径卡：直接钉上，不让人多点一次
+  useEffect(() => {
+    if (!ref || ref.node_id || cards.length !== 1) return
+    const only = cardOf(cards[0])
+    if (!only.config.caliber_from) write({ caliber_from: { ...ref, node_id: only.id } })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph])
+
+  return (
+    <div className="space-y-1.5" data-caliber-from={mode}>
+      <div role="radiogroup" aria-label="口径卡从哪来" className="inline-flex rounded-md border p-px" aria-describedby={describedBy}>
+        {CALIBER_MODES.map((m) => (
+          <button key={m} type="button" {...radio(m)} onClick={() => setMode(m)}
+                  className={clsx('rounded px-2 py-0.5 text-2xs', mode === m ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}>
+            {m === 'local' ? '在这里定义' : '钉住别的工作流里的口径卡'}
+          </button>
+        ))}
+      </div>
+      {ref && (
+        <>
+          <select id={id} className="field" value={wfId} aria-label="钉住哪个工作流" aria-invalid={invalid || undefined}
+                  style={invalid && !wfId ? { borderColor: 'var(--err)' } : undefined}
+                  onChange={(e) => write({ caliber_from: e.target.value ? { workflow_id: e.target.value } : {} })}>
+            <option value="">— 选择工作流 —</option>
+            {workflows.filter((w) => w.id !== self).map((w) => (
+              <option key={w.id} value={w.id}>{w.name}{w.is_template ? '（模板）' : ''}</option>
+            ))}
+          </select>
+          {!!wfId && (
+            <div>
+              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-version`}>钉住版本（必须钉：不钉口径会跟着上游漂移）</label>
+              <select id={`${id}-version`} className="field" value={version ?? ''} disabled={!versions}
+                      onChange={(e) => write({ caliber_from: { workflow_id: wfId, ...(e.target.value ? { workflow_version: Number(e.target.value) } : {}) } })}>
+                <option value="">{versions ? (versions.length ? '— 选择版本 —' : '这个工作流还没有保存过版本') : '正在取版本…'}</option>
+                {(versions ?? []).map((v) => (
+                  <option key={v.id} value={v.version}>v{v.version}{v.published ? '（已发布）' : ''}{v.note ? ` · ${v.note}` : ''}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {!!wfId && version != null && (
+            <div>
+              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-node`}>那一版里的哪张口径卡</label>
+              <select id={`${id}-node`} className="field" value={ref.node_id ?? ''} disabled={!graph || graph === 'error'}
+                      onChange={(e) => write({ caliber_from: { workflow_id: wfId, workflow_version: version, ...(e.target.value ? { node_id: e.target.value } : {}) } })}>
+                <option value="">{graph === 'error' ? '这一版取不到' : !graph ? '正在取这一版的图…' : cards.length ? '— 选择口径卡 —' : '这一版里没有口径卡'}</option>
+                {cards.map(cardOf).map((c) => (
+                  // 它自己也是钉住别处的：定义不在这一版里，不能再往下钉
+                  <option key={c.id} value={c.id} disabled={!!c.config.caliber_from}>
+                    {c.label || c.id} · 口径「{c.config.caliber || '—'}」{c.config.caliber_version ?? ''}
+                    {c.config.caliber_from ? '（它也是钉住别处的，不能再钉）' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {chosen && (
+            <div className="rounded border bg-bg px-2 py-1.5 text-2xs leading-relaxed" data-caliber-preview="">
+              <div>
+                口径「{chosen.config.caliber || '—'}」<span className="mono">{chosen.config.caliber_version ?? ''}</span>
+                {' · '}{Array.isArray(chosen.config.metrics) ? chosen.config.metrics.length : 0} 个指标
+              </div>
+              {Array.isArray(chosen.config.metrics) && chosen.config.metrics.length > 0 && (
+                <div className="mono text-faint [overflow-wrap:anywhere]">
+                  {chosen.config.metrics.slice(0, 8).map((m: any) => m?.id).filter(Boolean).join('、')}
+                  {chosen.config.metrics.length > 8 ? ' …' : ''}
+                </div>
+              )}
+            </div>
+          )}
+          {latest != null && version != null && latest > version && (
+            <div className="text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }} data-caliber-newer="">
+              {upgradeNewerText(latest, version)}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+const CALIBER_MODES = ['local', 'pinned'] as const
 
 // -------------------------------------------------------------------------
 // 复合编辑器

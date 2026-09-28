@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ChevronRight, Database, FileSpreadsheet, Info, KeyRound, Lock, Plug, Plus, RefreshCw,
+  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, Info, KeyRound, Lock, Plug, Plus, RefreshCw,
   Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -40,6 +40,9 @@ export const isUploadedTable = (row: any): boolean =>
   row?.kind === 'sqlite' && /[\\/]uploads[\\/]tables[\\/][^\\/]+\.db$/.test(row?.database ?? '')
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
+
+/** 数据源 options 里的键：证据面板展示查询原始行时，这些列一律写「已遮罩」 */
+const MASK_KEY = 'mask_columns'
 
 /**
  * 增、删、改、传之后让全局的数据源目录跟上：检查器挑工具、问数据的范围、助手的数据源
@@ -222,6 +225,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   const uploaded = isUploadedTable(row)
   // 传上来的表通常只有一两张，直接摊开；库动辄几十上百个对象，默认收着
   const [open, setOpen] = useState(() => uploaded && row.table_count > 0 && row.table_count <= 3)
+  const [masking, setMasking] = useState(false)
+  const masks = maskList(row.options?.[MASK_KEY])
   const clock = useRunClock(!!busy)
   const busySince = useRef(0)
   useTicker(60_000)
@@ -419,8 +424,24 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 pb-2.5 pt-1.5 text-2xs text-faint">
         <Address row={row} meta={meta} uploaded={uploaded} />
         {row.options?.schema && <span className="chip">schema {row.options.schema}</span>}
+        {masks.length > 0 && (
+          <span className="chip" data-mask-columns={masks.join(',')} title={`证据面板里显示成「已遮罩」：${masks.join('、')}`}>
+            <EyeOff size={10} aria-hidden /> 遮罩 {formatNumber(masks.length)} 列
+          </span>
+        )}
+        {uploaded && (
+          // 传上来的表没有编辑框（只能重传），遮罩列在这里改
+          <button type="button" className="text-2xs underline decoration-dotted underline-offset-2 hover:text-dim"
+                  onClick={() => setMasking(true)} data-edit-mask="">
+            {masks.length ? '改遮罩列' : '设遮罩列'}
+          </button>
+        )}
         {!!row.tools?.length && <span className="mono">{row.tools.join(' · ')}</span>}
       </div>
+      {masking && (
+        <MaskColumnsDialog row={row} onClose={() => setMasking(false)}
+                           onSaved={(next) => { setMasking(false); onChange(next); syncCatalog() }} />
+      )}
 
       {failed && (
         <div className="px-3 pb-3">
@@ -747,11 +768,13 @@ interface SourceForm {
   oracleMode: 'service_name' | 'sid'
   serviceName: string
   sid: string
-  /** options 里除 schema / service_name / sid 之外的键，全部摊开可编辑 */
+  /** options.mask_columns：证据面板展示查询原始行时遮掉的列 */
+  maskColumns: string[]
+  /** options 里除 schema / service_name / sid / mask_columns 之外的键，全部摊开可编辑 */
   advanced: [string, string][]
 }
 
-const OWN_OPTION_KEYS = new Set(['schema', 'service_name', 'sid'])
+const OWN_OPTION_KEYS = new Set(['schema', 'service_name', 'sid', MASK_KEY])
 
 function toForm(source: any): SourceForm {
   const o = source.options ?? {}
@@ -772,6 +795,7 @@ function toForm(source: any): SourceForm {
     // 老数据把服务名存在 database 上：回显它，保存时后端会挪进 options
     serviceName: o.service_name ?? (oracle ? source.database ?? '' : ''),
     sid: o.sid ?? '',
+    maskColumns: maskList(o[MASK_KEY]),
     advanced: Object.entries(o)
       .filter(([k]) => !OWN_OPTION_KEYS.has(k))
       .map(([k, v]) => [k, String(v ?? '')]),
@@ -779,9 +803,10 @@ function toForm(source: any): SourceForm {
 }
 
 function toBody(form: SourceForm, isNew: boolean, wasOracle = true): any {
-  const options: Record<string, string> = {}
+  const options: Record<string, string | string[]> = {}
   for (const [k, v] of form.advanced) if (k.trim() && v.trim()) options[k.trim()] = v.trim()
   if (form.schema.trim()) options.schema = form.schema.trim()
+  if (form.maskColumns.length) options[MASK_KEY] = form.maskColumns
   const oracle = form.kind === 'oracle'
   if (oracle) {
     // 只写选中的那一个，另一个不带：两处都有值时引擎听 service_name，
@@ -824,10 +849,10 @@ const FIELD_LABEL: Record<string, string> = {
 
 /**
  * 决定连到哪个库的那几项（提交体里的）。schema 不在内：它只影响探查哪一片，不影响
- * 连不连得上，后端判断测连接结果还作不作数时同样不看它
+ * 连不连得上，后端判断测连接结果还作不作数时同样不看它；遮罩列只管面板上怎么显示，也不在内
  */
 function connectionOf(body: any): string {
-  const { schema: _schema, ...options } = body.options ?? {}
+  const { schema: _schema, [MASK_KEY]: _mask, ...options } = body.options ?? {}
   return JSON.stringify([
     body.kind, body.host ?? null, body.port ?? null, body.database ?? null, body.username ?? null,
     options, !!body.password,
@@ -1120,6 +1145,9 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
           )}
         </Field>
 
+        <MaskColumnsField sourceId={source.id} synced={!!source.table_count} value={form.maskColumns}
+                          onChange={(maskColumns) => set({ maskColumns })} />
+
         <label className="flex cursor-pointer items-start gap-2 rounded-lg border p-2.5"
                style={form.readonly ? undefined : { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
           <input type="checkbox" className="mt-0.5" checked={form.readonly}
@@ -1191,6 +1219,179 @@ function OracleTarget({ form, set }: { form: SourceForm; set: (patch: Partial<So
         {sid ? '老库只给了 SID 时用它；保存时只存 SID' : '一般填这个；保存时只存 service_name'}
       </div>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 遮罩列（options.mask_columns）
+// ---------------------------------------------------------------------------
+
+/** options.mask_columns → 列名列表。列表和「a, b」这样的文字都认（后端 masked_columns 同一个认法），按大小写不敏感去重 */
+function maskList(raw: unknown): string[] {
+  const items = typeof raw === 'string' ? raw.split(/[,，、\s]+/) : Array.isArray(raw) ? raw : []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of items) {
+    const name = typeof item === 'string' || typeof item === 'number' ? String(item).trim() : ''
+    if (!name || seen.has(name.toLowerCase())) continue
+    seen.add(name.toLowerCase())
+    out.push(name)
+  }
+  return out
+}
+
+/** 挑列时最多读几张表的列：库动辄上百张表，一张一个请求，挑列用不着全读 */
+const MASK_SCAN_TABLES = 40
+
+/**
+ * 从已探查的结构里收列名（列名 → 出现在哪几张表）。第一次聚焦输入框才取，同一个数据源取一次
+ */
+function useSchemaColumns(sourceId: string | undefined, active: boolean) {
+  const [state, setState] = useState<{ status: 'idle' | 'loading' | 'ok' | 'error'; columns: Map<string, string[]>; tables: number; scanned: number }>(
+    { status: 'idle', columns: new Map(), tables: 0, scanned: 0 })
+  // 取过就不再取（状态不进依赖：置成 loading 那一下会让 effect 重跑，把正在取的那次当成过期的丢掉）
+  const started = useRef<string | null>(null)
+  useEffect(() => {
+    if (!active || !sourceId || started.current === sourceId) return
+    started.current = sourceId
+    let alive = true
+    setState((s) => ({ ...s, status: 'loading' }))
+    void (async () => {
+      try {
+        const list: string[] = (await api.datasources.schema(sourceId))?.tables ?? []
+        const pick = list.slice(0, MASK_SCAN_TABLES)
+        const columns = new Map<string, string[]>()
+        for (let i = 0; i < pick.length; i += 6) {
+          const batch = await Promise.all(pick.slice(i, i + 6).map((t) => api.datasources.tableSchema(sourceId, t).catch(() => null)))
+          batch.forEach((detail, j) => {
+            for (const c of detail?.columns ?? []) {
+              const name = String(c?.name ?? '').trim()
+              if (!name) continue
+              columns.set(name, [...(columns.get(name) ?? []), pick[i + j]])
+            }
+          })
+        }
+        if (alive) setState({ status: 'ok', columns, tables: list.length, scanned: pick.length })
+      } catch {
+        if (alive) setState((s) => ({ ...s, status: 'error' }))
+      }
+    })()
+    return () => { alive = false; started.current = null }
+  }, [active, sourceId])
+  return state
+}
+
+/**
+ * 遮罩的列：列名一个个加成标签，可以从已探查的结构里挑，也可以直接输。
+ * 用户拍板写明：在有身份体系之前，遮罩只减少暴露，不是安全边界
+ */
+function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
+  id: string; sourceId?: string; synced: boolean; value: string[]; onChange: (v: string[]) => void
+}) {
+  const [draft, setDraft] = useState('')
+  const [touched, setTouched] = useState(false)
+  const known = useSchemaColumns(sourceId, touched && synced)
+  const add = (text: string) => {
+    const next = maskList([...value, ...maskList(text)])
+    if (next.length !== value.length) onChange(next)
+    setDraft('')
+  }
+  const has = new Set(value.map((v) => v.toLowerCase()))
+  const options = [...known.columns.entries()].filter(([c]) => !has.has(c.toLowerCase()))
+    .sort((a, b) => a[0].localeCompare(b[0]))
+  const state = !sourceId ? '保存并探查结构之后可以从列里挑；现在可以直接输列名'
+    : !synced ? '还没探查过结构：直接输列名'
+    : known.status === 'loading' ? '正在读已探查的结构…'
+    : known.status === 'error' ? '已探查的结构没取到：直接输列名'
+    : known.status === 'ok'
+      ? `从已探查的 ${formatNumber(known.scanned)} 张表里挑${known.tables > known.scanned ? `（共 ${formatNumber(known.tables)} 张，只读了前 ${formatNumber(known.scanned)} 张，别的直接输列名）` : ''}，或者直接输列名`
+      : '点输入框可以从已探查的列里挑'
+  return (
+    <div data-mask-input="">
+      {value.length > 0 && (
+        <div className="mb-1.5 flex flex-wrap gap-1" aria-label="已遮罩的列">
+          {value.map((c) => (
+            <span key={c} className="chip mono" style={{ color: 'var(--text)', borderColor: 'var(--border-strong)' }} data-mask-chip={c}>
+              <EyeOff size={10} aria-hidden /> {c}
+              <button type="button" className="ml-0.5 hover:opacity-60" aria-label={`不再遮罩 ${c}`}
+                      onClick={() => onChange(value.filter((v) => v !== c))}>
+                <X size={9} aria-hidden />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-1.5">
+        <input id={id} className="field mono min-w-0 flex-1" list={`${id}-list`} value={draft} autoComplete="off" spellCheck={false}
+               placeholder="phone, email" aria-describedby={`${id}-hint`}
+               onFocus={() => setTouched(true)}
+               onChange={(e) => {
+                 const v = e.target.value
+                 // 从候选里点中一项（浏览器报 insertReplacementText，不是逐字敲的）、或者敲了逗号：直接加成标签。
+                 // 逐字敲到恰好等于某个列名（敲 id_card 途中的 id）不算点中
+                 const kind = (e.nativeEvent as InputEvent).inputType
+                 const picked = (!kind || kind === 'insertReplacementText') && known.columns.has(v)
+                 if (/[,，、]/.test(v) || picked) add(v)
+                 else setDraft(v)
+               }}
+               onKeyDown={(e) => {
+                 if (e.key === 'Enter' && !e.nativeEvent.isComposing && draft.trim()) { e.preventDefault(); add(draft) }
+                 if (e.key === 'Backspace' && !draft && value.length) onChange(value.slice(0, -1))
+               }} />
+        <button type="button" className="btn btn-sm" disabled={!draft.trim()} onClick={() => add(draft)}>加上</button>
+      </div>
+      <datalist id={`${id}-list`}>
+        {options.slice(0, 300).map(([c, tables]) => (
+          <option key={c} value={c}>{tables.slice(0, 3).join('、')}{tables.length > 3 ? ` 等 ${tables.length} 张表` : ''}</option>
+        ))}
+      </datalist>
+      <div id={`${id}-hint`} className="mt-1 space-y-0.5 text-2xs leading-relaxed text-faint">
+        <div>证据面板展示查询结果的原始行时，这些列（不分大小写）一律显示成「已遮罩」。{state}</div>
+        <div style={{ color: 'var(--st-waiting)' }} data-mask-boundary="">
+          在有身份体系之前，遮罩只减少暴露，不是安全边界：完整快照仍能按工件取到，SQL 里给列起别名也能绕开
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MaskColumnsField(props: { sourceId?: string; synced: boolean; value: string[]; onChange: (v: string[]) => void }) {
+  return (
+    <div data-field="mask_columns">
+      <label className="label" htmlFor="ds-mask-columns">遮罩的列</label>
+      <MaskColumnsInput id="ds-mask-columns" {...props} />
+    </div>
+  )
+}
+
+/** 传上来的表没有编辑框：卡片上单独改遮罩列，options 其余的键原样带上 */
+function MaskColumnsDialog({ row, onClose, onSaved }: { row: any; onClose: () => void; onSaved: (row: any) => void }) {
+  const [initial] = useState(() => maskList(row.options?.[MASK_KEY]))
+  const [value, setValue] = useState(initial)
+  const [saving, setSaving] = useState(false)
+  const dirty = value.join('\u0000') !== initial.join('\u0000')
+  const save = async () => {
+    setSaving(true)
+    try {
+      const { [MASK_KEY]: _old, ...rest } = row.options ?? {}
+      onSaved(await api.datasources.update(row.id, { options: value.length ? { ...rest, [MASK_KEY]: value } : rest }))
+      toast.ok(value.length ? `「${row.name}」遮罩 ${value.length} 列` : `「${row.name}」不再遮罩任何列`)
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <Modal open onClose={onClose} dirty={dirty} width={520} title={`「${row.name}」的遮罩列`}
+           footer={<>
+             <button className="btn" onClick={onClose}>取消</button>
+             <button className="btn btn-primary" disabled={saving || !dirty} onClick={() => void save()}>
+               {saving ? <Spinner size={11} /> : null} 保存
+             </button>
+           </>}>
+      <MaskColumnsField sourceId={row.id} synced={!!row.table_count} value={value} onChange={setValue} />
+    </Modal>
   )
 }
 

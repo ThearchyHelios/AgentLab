@@ -1232,6 +1232,87 @@ await section('工具门控 tool.gated（工具信任三档）', async () => {
   check('……不是「一条还没翻译的记录」', !bare.some((s) => s.title === '一条还没翻译的记录'))
 })
 
+await section('agent 字段按出处核对（可点击证据第二期）：抽取调用单独成行、两个新警告码说人话', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  // 两条警告的原话：和 backend/app/engine/nodes/llm.py 的 _field_warnings 同一个格式。先核对后端源码还是这么说的
+  const MISMATCH = '有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234'
+  const UNVERIFIED = '有 2 个字段核对不了出处，记为空值（没有兜底成 0）：new_users（Q1 没有列「new_users」）；refund_cnt（快照取不回来）'
+  const FAILED = '结构化抽取没跑成：模型调用超时。3 个字段都记为空值（没有兜底成 0）'
+  // 抽取调用成了、但交回来的不是对象：同一句式，前面没有「结构化抽取没跑成：」
+  const NOT_OBJECT = '抽取结果不是一个对象。2 个字段都记为空值（没有兜底成 0）'
+  const llmPy = readFileSync(`${root}backend/app/engine/nodes/llm.py`, 'utf8')
+  check('后端发字段核对警告的格式还是夹具里这一种', llmPy.includes('"agent_field_mismatch"')
+    && llmPy.includes('个字段和查询快照对不上，已按快照取值：{detail}') && llmPy.includes('模型报 {_shown(e.get(\'model_value\'))}，快照是 ')
+    && llmPy.includes('个字段核对不了出处，记为空值（没有兜底成 0）：{detail}') && llmPy.includes('个字段都记为空值（没有兜底成 0）')
+    && llmPy.includes('purpose="cite_fields"') && llmPy.includes('"抽取结果不是一个对象"') && llmPy.includes('结构化抽取没跑成：{'),
+    '改了 llm.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const events = [
+    E(1, 'run.started', null, { total: 2 }),
+    E(2, 'node.started', 'fetch', { node_type: 'agent', label: '查数' }),
+    E(3, 'llm.start', 'fetch', { model: 'm1' }),
+    E(4, 'tool.start', 'fetch', { tool: 'db_query__shop', call_id: 'c1', args: { sql: 'SELECT SUM(amount) AS gmv FROM orders' } }),
+    // 新运行查库成功时 tool.end 多一个 query_artifact：照常解码成那一次查询，不另起行
+    E(5, 'tool.end', 'fetch', { tool: 'db_query__shop', call_id: 'c1', duration_ms: 40, artifact: 'tool-snap', query_artifact: 'query-snap',
+      preview: '{"columns":["gmv"],"rows":[[45678.5]]}' }),
+    E(6, 'llm.end', 'fetch', { model: 'm1', duration_ms: 900 }),
+    E(7, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5 }),
+    E(8, 'llm.end', 'fetch', { agent: '查数', model: 'm1', purpose: 'cite_fields', duration_ms: 1200, input_tokens: 900, output_tokens: 80 }),
+    E(9, 'log', 'fetch', { level: 'warn', code: 'agent_field_mismatch', message: MISMATCH, fields: ['order_cnt'] }),
+    E(10, 'log', 'fetch', { level: 'warn', code: 'agent_field_unverified', message: UNVERIFIED, fields: ['new_users', 'refund_cnt'] }),
+    E(11, 'node.finished', 'fetch', { duration_ms: 2400 }),
+  ]
+  const all = flatten(mod.decodeRun(events))
+  check('新事件都有翻译', !all.some((s) => s.title === '一条还没翻译的记录'))
+  const llms = all.filter((s) => s.kind === 'llm')
+  check('循环里那次照旧叫「思考并作答」，抽取那次单独起名「按出处抽取字段」', llms.map((s) => s.title).join('|') === '思考并作答|按出处抽取字段',
+    llms.map((s) => s.title).join('|'))
+  check('抽取那次跑完了、带耗时', llms[1]?.status === 'done' && llms[1]?.meta === '1.2 s', `${llms[1]?.status} ${llms[1]?.meta}`)
+  const q = all.filter((s) => s.kind === 'query')
+  check('tool.end 多了 query_artifact：照常是一次查询，工件仍是 tool 快照', q.length === 1 && q[0].status === 'done' && q[0].artifact === 'tool-snap',
+    JSON.stringify(q.map((s) => [s.status, s.artifact])))
+  const mm = all.find((s) => s.code === 'agent_field_mismatch')
+  check('agent_field_mismatch 说人话：几个字段对不上、已按快照取值', mm?.title === '有 1 个字段和查询快照对不上，已按快照取值', mm?.title)
+  check('……点名的字段和两边的值放副标题，原话留在展开区', mm?.sub === 'order_cnt 模型报 1240，快照是 1234' && mm?.detail === MISMATCH,
+    `${mm?.sub} / ${mm?.detail}`)
+  check('……是提醒（warn），并说下游用的是哪个值', mm?.level === 'warn' && !!mm?.next?.includes('快照'), `${mm?.level} ${mm?.next}`)
+  const un = all.find((s) => s.code === 'agent_field_unverified')
+  check('agent_field_unverified 说人话：几个字段核对不了、记为空、没有兜底成 0', un?.title === '有 2 个字段核对不了出处，记为空值（没有兜底成 0）', un?.title)
+  check('……原因放副标题', un?.sub === 'new_users（Q1 没有列「new_users」）；refund_cnt（快照取不回来）' && un?.level === 'warn', un?.sub)
+  check('……两条警告都挂在 agent 节点下面', all.find((s) => s.nodeId === 'fetch' && s.kind === 'node')?.children?.filter((c) => c.code?.startsWith('agent_field')).length === 2)
+
+  const failed = flatten(mod.decodeRun([
+    E(1, 'node.started', 'fetch', { node_type: 'agent' }),
+    E(2, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5 }),
+    E(3, 'llm.end', 'fetch', { agent: '查数', model: 'm1', purpose: 'cite_fields', duration_ms: 30000, error: 'TimeoutError: 模型调用超时' }),
+    E(4, 'log', 'fetch', { level: 'warn', code: 'agent_field_unverified', message: FAILED, fields: ['a', 'b', 'c'] }),
+    E(5, 'node.finished', 'fetch', { duration_ms: 31000 }),
+  ]))
+  const ex = failed.find((s) => s.kind === 'llm')
+  check('抽取调用失败：那一行说「没跑成」，原因放展开区，是提醒不是整个节点失败', ex?.title === '按出处抽取字段没跑成' && ex?.level === 'warn'
+    && !!ex?.detail?.includes('模型调用超时'), `${ex?.title} ${ex?.level} ${ex?.detail}`)
+  // status 是 failed 的话，这一行和「执行」那一栏的标头都画成红的失败，可节点、运行都成功了
+  check('……这一行是做完了的提醒（done + warn），不是 failed', ex?.status === 'done' && ex?.level === 'warn', `${ex?.status} ${ex?.level}`)
+  check('……节点本身照样成功', failed.find((s) => s.kind === 'node')?.status === 'done', failed.find((s) => s.kind === 'node')?.status)
+  const fu = failed.find((s) => s.code === 'agent_field_unverified')
+  check('……接着的警告说「抽取没跑成，N 个字段记为空值」', fu?.title === '按出处抽取字段没跑成，3 个字段记为空值（没有兜底成 0）'
+    && fu?.sub === '模型调用超时', `${fu?.title} / ${fu?.sub}`)
+  const notObject = flatten(mod.decodeRun([
+    E(1, 'node.started', 'fetch', { node_type: 'agent' }),
+    E(2, 'log', 'fetch', { level: 'warn', code: 'agent_field_unverified', message: NOT_OBJECT, fields: ['a', 'b'] }),
+    E(3, 'node.finished', 'fetch', { duration_ms: 10 }),
+  ])).find((s) => s.code === 'agent_field_unverified')
+  check('「抽取结果不是一个对象」：同样说「没跑成，N 个字段记为空值」，原因放副标题，不说「出处找不到」',
+    notObject?.title === '按出处抽取字段没跑成，2 个字段记为空值（没有兜底成 0）' && notObject?.sub === '抽取结果不是一个对象'
+    && !notObject?.next?.includes('出处在查询结果里找不到'), `${notObject?.title} / ${notObject?.sub} / ${notObject?.next}`)
+  const node = mod.decodeRun([E(1, 'node.started', 'fetch', { node_type: 'agent' }), E(2, 'node.finished', 'fetch', { duration_ms: 1 })])
+  check('对照：普通 agent 节点不多出任何行', flatten(node).filter((s) => s.kind !== 'node').length === 0)
+  const odd = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'agent' }),
+    E(2, 'log', 'x', { level: 'warn', code: 'agent_field_mismatch', message: '字段对不上' }),
+    E(3, 'log', 'x', { level: 'warn', code: 'agent_field_unverified' })]))
+  check('别的说法（缺字段）：标题照样说人话，不出 undefined、不瞎填数', odd.find((s) => s.code === 'agent_field_mismatch')?.title === '有字段和查询快照对不上，已按快照取值'
+    && !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}`)), odd.map((s) => s.title).join(' | '))
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

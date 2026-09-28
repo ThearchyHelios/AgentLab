@@ -6,6 +6,7 @@ from typing import Any
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine.context import NodeContext, NodeError
+from app.engine.evidence import ledger_enabled, next_exec
 from app.engine.state import GraphState, template_context
 from app.memory import kb, store
 
@@ -175,6 +176,10 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
+    if snapshot and ledger_enabled(ctx.run):
+        # 证据台账：报告目录按它编 K1…，[[see:K1]] 点开追得到这次检索命中了哪几段
+        updates["evidence"] = [{"kind": "retrieval", "node_id": ctx.node.id, "exec": next_exec(state, ctx.node.id),
+                                "artifact": snapshot, "source": collection, "rows": len(hits)}]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: context_text}
