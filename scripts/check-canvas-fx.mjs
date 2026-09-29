@@ -36,8 +36,10 @@ const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
 const CHROME = process.env.CHROME_PATH
   ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
-// FX_ONLY=九天,运行中点节点 只跑段名里含这些字的段（逗号分隔）
+// FX_ONLY=九天,运行中点节点 只跑段名里含这些字的段（逗号分隔）。FX_SKIP 反过来，跳过段名里含这些字的段：
+// check-all 把这个检查拆成几份分到不同的道上，最后一份用它兜住「其余全部」，以后新加的段不用改 check-all
 const ONLY = (process.env.FX_ONLY ?? '').split(',').filter(Boolean)
+const SKIP = (process.env.FX_SKIP ?? '').split(',').filter(Boolean)
 /**
  * 一节一节地跑：某一节里等待超时、元素找不到，只记成这一节失败，关掉它开的浏览器，
  * 接着跑下一节——不让一处卡住把后面几十项一起吞掉
@@ -45,6 +47,7 @@ const ONLY = (process.env.FX_ONLY ?? '').split(',').filter(Boolean)
 const opened = new Set()
 async function section(name, fn) {
   if (ONLY.length && !ONLY.some((k) => name.includes(k))) return
+  if (SKIP.some((k) => name.includes(k))) return
   console.log(`=== ${name} ===`)
   try {
     await fn()

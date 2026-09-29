@@ -35,9 +35,12 @@ const SHOTS = process.env.RUN_STATES_SHOTS ?? '/tmp/agentlab-run-states'
 // 截图的像素密度：要看清卡片里 11px 的字时设成 2
 const DSF = Number(process.env.RUN_STATES_DSF ?? 1) || 1
 mkdirSync(SHOTS, { recursive: true })
-// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, issues, exits, reduced），调样式时省时间
+// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, issues, exits, reduced），调样式时省时间。
+// RUN_STATES_SKIP 反过来，跳过这几段：check-all 把这个检查拆成几份分到不同的道上，最后一份用它
+// 兜住「其余全部」，以后新加的段不用改 check-all 也跑得到
 const ONLY = (process.env.RUN_STATES_ONLY ?? '').split(',').filter(Boolean)
-const want = (part) => !ONLY.length || ONLY.includes(part)
+const SKIP = (process.env.RUN_STATES_SKIP ?? '').split(',').filter(Boolean)
+const want = (part) => (!ONLY.length || ONLY.includes(part)) && !SKIP.includes(part)
 /**
  * 一段一段地跑：某一段里等待超时、元素找不到，只记成这一段失败，关掉它开的浏览器，
  * 接着跑下一段——不让一处卡住把后面几百项一起吞掉。段标题在各段自己里面打

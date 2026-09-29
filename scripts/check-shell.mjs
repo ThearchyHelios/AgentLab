@@ -166,7 +166,12 @@ await section('导航', '=== 导航 ===', async () => {
 
   await page.goto(`${WEB}/settings/datasources`)
   check('旧地址 /settings/datasources 重定向到 /data', await page.waitForURL(/\/data(\/|$)/, { timeout: 8000 }).then(() => true, () => false), page.url())
-  check('数据页点亮「数据」', (await nav(page).locator('a[aria-current="page"]').innerText()).startsWith('数据'))
+  // 地址先变、导航后亮：RouterProvider 把路由状态放在 startTransition 里提交，history 却是当场
+  // 改的，waitForURL 一返回就读，机器一挤读到的还是重定向前那一帧（「设置」亮着）。等它最多
+  // 3 秒再判，真没点亮照样判错
+  const lit = () => nav(page).locator('a[aria-current="page"]').innerText().catch(() => '')
+  for (const end = Date.now() + 3000; !(await lit()).startsWith('数据') && Date.now() < end;) await page.waitForTimeout(100)
+  check('数据页点亮「数据」', (await lit()).startsWith('数据'), await lit())
 
   // 矮窗口：导航按高度收紧，最底下的遥测点和署名不能被切掉
   const bottomFits = () => page.evaluate(() => {
