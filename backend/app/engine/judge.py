@@ -73,6 +73,8 @@ SQL_CHARS = 300
 EXCERPT_ROWS = 20
 EXCERPT_COLS = 12
 CHUNK_CHARS = 600
+#: 表名、字段名的摘录里附上它出现过的查询的 SQL，最多几次（「按会员号去重计数」这种句子，证据在 SQL 里）
+ENTITY_QUERIES = 3
 EXCERPT_HITS = 3
 #: 短句：看得见的字（不算标点、空白）少于这么多，又没挂依据、没有方向词的，不送裁判
 SHORT_CHARS = 6
@@ -359,7 +361,7 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
 
 
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
-             masked: dict[str, Any] | None) -> str | None:
+             masked: dict[str, Any] | None, catalog: dict[str, Any]) -> str | None:
     kind = entry.get("kind")
     if kind == "metric":
         return _metric_excerpt(alias, entry, fetch)
@@ -374,11 +376,44 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
         picked = [h for c in cands for a, h in c.hits if a == alias]
         return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
     if kind == "table":
-        return f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
+        head = f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
+        return "\n".join([head, *_entity_sql(entry, catalog, fetch)])
     if kind == "column":
         table = (entry.get("locator") or {}).get("table")
-        return f"【{alias}】字段 {f'{table}.' if table else ''}{(entry.get('locator') or {}).get('column') or entry.get('name')}"
+        head = f"【{alias}】字段 {f'{table}.' if table else ''}{(entry.get('locator') or {}).get('column') or entry.get('name')}"
+        return "\n".join([head, *_entity_sql(entry, catalog, fetch)])
     return None
+
+
+def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch) -> list[str]:
+    """表名、字段名出现过的查询的 SQL（每条截到 SQL_CHARS，最多 ENTITY_QUERIES 条）。
+
+    讲算法的句子（「按会员号去重计数得出」）证据在 SQL 里；只给名字，裁判只能判不支持。
+    查询用条目自己记的（表：SQL 里用到它；字段：它是结果列）。只在 SQL 里出现、不是结果列的字段自己没记：
+    有表条目就从它记的查询里找，没有（文档目录只留正文用到的实体）就看全部查询，都只留 SQL 里写了这个
+    字段名（有表名的还要写了表名）的。快照经 fetch 取：取不到（不在封存范围里）的不给。
+    """
+    locator = entry.get("locator") or {}
+    column = locator.get("column") if entry.get("kind") == "column" else None
+    table = locator.get("table")
+    aliases = [q for q in entry.get("queries") or [] if isinstance(catalog.get(q), dict)]
+    need = [str(column)] if column else []
+    if not aliases and column:
+        owner = catalog.get(f"t:{table}") if table else None
+        aliases = [q for q in (owner.get("queries") or []) if isinstance(catalog.get(q), dict)] \
+            if isinstance(owner, dict) else \
+            [a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"]
+        need += [str(table)] if table and not isinstance(owner, dict) else []
+    lines: list[str] = []
+    for q in aliases:
+        snapshot = fetch(catalog[q].get("artifact"))
+        sql = _clean(str(snapshot.get("sql") or "")) if isinstance(snapshot, dict) else ""
+        if not sql or any(not re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", sql, re.I) for n in need):
+            continue
+        lines.append(f"出现在查询 {q}：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}")
+        if len(lines) == ENTITY_QUERIES:
+            break
+    return lines
 
 
 def _tokens(text: str) -> int:
@@ -441,7 +476,7 @@ def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units
     excerpts: dict[str, str] = {}
     for alias in dict.fromkeys(a for c in cands for a in c.aliases):
         entry = catalog.get(alias)
-        if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked)):
+        if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog)):
             excerpts[alias] = text
     picked = {c.unit for c in cands}
     skipped: dict[str, str] = {}
