@@ -20,7 +20,7 @@ from app.db.base import SessionLocal
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import lint_for_publish, publish_issues
 from app.engine.runner import run_manager
-from app.engine.schema import CLAIMS_LATER, GraphSpec, validate_graph
+from app.engine.schema import GraphSpec, validate_graph
 from app.main import app
 from app.seed import TEMPLATES
 
@@ -281,10 +281,10 @@ def test_graph_defaults_count_like_they_do_at_run_time():
 
 
 def test_an_unsupported_claims_value_is_left_to_validate():
-    graph = traceable(report={**STRICT, "claims": "judge"})
+    graph = traceable(report={**STRICT, "claims": "sometimes"})
     assert by_code(graph, "governed.report_policy") == []
     [bad] = [i for i in validate_graph(GraphSpec.model_validate(graph)).issues if i.code == "report.claims_invalid"]
-    assert bad.level == "error" and CLAIMS_LATER in bad.message
+    assert bad.level == "error" and "off / require_citation" in bad.message
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +442,7 @@ async def test_an_already_governed_version_keeps_running_formally(client, engine
 
 
 # --------------------------------------------------------------------------
-# validate：报告撰写节点的 claims 只接受 off / require_citation
+# validate：报告撰写节点的 claims 只接受 off / require_citation / judge（四期放开 judge）
 # --------------------------------------------------------------------------
 
 
@@ -458,10 +458,9 @@ def test_supported_claims_values_pass(value):
     assert claims_issues(value) == []
 
 
-def test_judge_is_a_later_version():
-    [issue] = claims_issues("judge")
-    assert issue.level == "error" and issue.node_id == "write" and issue.field == "claims"
-    assert CLAIMS_LATER in issue.message and "off" in issue.message and "require_citation" in issue.message
+def test_judge_is_supported_now():
+    assert claims_issues("judge") == []
+    assert claims_issues("judge", on_defaults=True) == []
 
 
 @pytest.mark.parametrize("value", ["strict", "Require_Citation", 1, ["off"], {"policy": "judge"}])
@@ -471,5 +470,5 @@ def test_other_claims_values_are_errors(value):
 
 
 def test_claims_from_graph_defaults_are_checked_too():
-    [issue] = claims_issues("judge", on_defaults=True)
+    [issue] = claims_issues("sometimes", on_defaults=True)
     assert issue.node_id == "write"

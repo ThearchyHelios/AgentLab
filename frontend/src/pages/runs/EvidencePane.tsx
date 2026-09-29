@@ -143,7 +143,7 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                 </header>
                 {doc ? (
                   <EvidenceDoc ref={(h) => { handles.current.set(r.node_id!, h) }} doc={doc} artifact={r.doc_artifact}
-                               runId={run.id} label={r.fields?.join('、') || r.node_id} tally
+                               runId={run.id} runClass={run.run_class} label={r.fields?.join('、') || r.node_id} tally
                                panel={wide ? 'dock' : 'auto'} dock={dock} onView={(o) => onView(r.node_id!, o)} />
                 ) : slot?.status === 'error' ? (
                   <p className="text-2xs" style={{ color: 'var(--st-failed)' }}>{T.docGone(labelOf(r.node_id) ?? r.node_id ?? '')}</p>

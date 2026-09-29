@@ -8,7 +8,7 @@ import type { NodeType } from '../types'
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
-  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom'
+  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom' | 'judge'
 
 /**
  * 这个字段里写的是什么语法。
@@ -564,17 +564,24 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         help: '有违规时把清单交回去让模型重写。每次都是一整篇的调用，写不对的模型多给几次也大多写不对',
       },
       {
-        // 后端只认 off / require_citation（schema.REPORT_CLAIMS）；judge 是四期的模型裁判，写了会被校验拦下。
-        // 没写等于 off：select 显示第一项，正好是默认
+        // 后端认 off / require_citation / judge（schema.CLAIMS_VALUES）。没写等于 off：select 显示第一项，正好是默认
         key: 'claims', label: '没挂依据的结论句', type: 'select',
         options: [
           { value: 'off', label: '不管（默认）：不参与出具判档' },
           { value: 'require_citation', label: '计入缺口：出具按档位降档' },
+          { value: 'judge', label: '计入缺口，并请模型逐句判断证据支不支持' },
         ],
         help: '结论句是带数字、方向词或因果词的句子。选「计入缺口」时，写作提示要求每句结论挂上 [[see:…]] 依据，'
-          + '没挂的记为缺口、出具降档（系统自动链接的表名字段名不算依据）。受管级别发布必须显式选它。'
-          + '结论句裁判在后续版本支持',
-        unknownLabel: (v) => (v === 'judge' ? 'judge：结论句裁判在后续版本支持，现在不能用' : `${v}：不认识的值，只能选上面两项`),
+          + '没挂的记为缺口、出具降档（系统自动链接的表名字段名不算依据）。选「请模型逐句判断」时，另一个模型按证据'
+          + '判断每句结论：正式运行里当场判、结果随报告封存，探索运行点开哪句判哪句；判断是模型给的，不是系统核对。'
+          + '受管级别发布必须显式选后两项之一，选模型判断的还要在高级选项里写金额上限（或写不限）',
+        unknownLabel: (v) => `${v}：不认识的值，只能选上面三项`,
+      },
+      {
+        // claims 为 judge 时的子配置（schema.JUDGE_KEYS）。没写的上限用设置里「证据裁判」的默认值；写 null 是不限
+        key: 'judge', label: '结论句裁判', type: 'judge', advanced: true,
+        when: (c) => c.claims === 'judge' || (!!c.judge && typeof c.judge === 'object'),
+        help: '没写的上限用设置里「证据裁判」的默认值；勾「不限」写 null，只受其余上限约束。裁判模型建议和写报告的模型不同',
       },
       {
         // 后端只认 link / off（report.py 的 ENTITIES）

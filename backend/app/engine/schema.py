@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from enum import StrEnum
@@ -423,31 +424,101 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
 
 
 #: 报告撰写节点的结论句策略（claims）。off：结论句不参与判档（默认，保持以前的行为）；
-#: require_citation：没挂引用的结论句计入缺口、按出具档位降档。judge（模型裁判）是后续版本的
+#: require_citation：没挂引用的结论句计入缺口、按出具档位降档。这两档是确定性的（发布前自动修复
+#: 给人选的也只有这两档）
 REPORT_CLAIMS = ("off", "require_citation")
-CLAIMS_LATER = "结论句裁判在后续版本支持"
+#: judge：结论句由另一个模型按证据逐句判断（engine/judge.py），子配置写在节点的 judge 里
+CLAIMS_JUDGE = "judge"
+CLAIMS_VALUES = (*REPORT_CLAIMS, CLAIMS_JUDGE)
+#: judge 子配置能写的键。三个上限写 null 表示不限；没写的键运行时取设置里的默认（设置 → judge 一组）
+JUDGE_KEYS = ("provider", "model", "max_claims", "max_cost_usd", "timeout_s", "rewrite_once", "on_unsupported")
+#: 证据不支持时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
+JUDGE_ON_UNSUPPORTED = ("degrade", "withhold")
 
 
 def claims_problem(value: Any) -> str | None:
     """claims 的取值有什么问题，没问题返回 None。校验和报告撰写节点执行时报的是同一句话。"""
-    if value in (None, "") or (isinstance(value, str) and value in REPORT_CLAIMS):
+    if value in (None, "") or (isinstance(value, str) and value in CLAIMS_VALUES):
         return None
-    if value == "judge":
-        return f"claims 写的是 judge：{CLAIMS_LATER}，现在只能写 off 或 require_citation"
-    return f"claims 只能是 {' / '.join(REPORT_CLAIMS)}，写的是 {value!r}"
+    return f"claims 只能是 {' / '.join(CLAIMS_VALUES)}，写的是 {value!r}"
+
+
+def _positive(value: Any, *, integer: bool = False) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return False
+    return not integer or int(value) == value
+
+
+def judge_problems(value: Any) -> list[tuple[str, str]]:
+    """claims: judge 的子配置有什么问题：[(字段, 人话)]，没问题返回 []。校验和节点执行时报的是同一句话。
+
+    上限写 null 就是不限（和没写不一样：没写取设置里的默认）。键写错了也报：写成 max_cost 的预算会被
+    悄悄当成没写、按默认值花钱。
+    """
+    if value in (None, ""):
+        return []
+    if not isinstance(value, dict):
+        return [("judge", f'judge 要写成一个对象，比如 {{"max_cost_usd": 0.05, "max_claims": 40}}，写的是 {value!r}')]
+    out: list[tuple[str, str]] = []
+    for key, item in value.items():
+        field = f"judge.{key}"
+        if key not in JUDGE_KEYS:
+            out.append((field, f"judge 里不认识「{key}」：能写的是 {'、'.join(JUDGE_KEYS)}"))
+        elif key in ("provider", "model") and item is not None and not isinstance(item, str):
+            what = "模型接入的名字" if key == "provider" else "模型 id"
+            out.append((field, f"judge.{key} 要写{what}（字符串），不写或写 null 就用设置里的「证据裁判模型」，"
+                               f"写的是 {item!r}"))
+        elif key == "max_claims" and item is not None and not _positive(item, integer=True):
+            out.append((field, f"judge.max_claims 要写正整数（每份报告最多判几句），写 null 表示不限，写的是 {item!r}"))
+        elif key == "max_cost_usd" and item is not None and not _positive(item):
+            out.append((field, "judge.max_cost_usd 要写大于 0 的金额（美元，每份报告的裁判花费上限），"
+                               f"写 null 表示不限，写的是 {item!r}"))
+        elif key == "timeout_s" and item is not None and not _positive(item):
+            out.append((field, f"judge.timeout_s 要写大于 0 的秒数（每份报告的裁判时长上限），写 null 表示不限，"
+                               f"写的是 {item!r}"))
+        elif key == "rewrite_once" and not isinstance(item, bool):
+            out.append((field, f"judge.rewrite_once 只能是 true 或 false，写的是 {item!r}"))
+        elif key == "on_unsupported" and item not in JUDGE_ON_UNSUPPORTED:
+            out.append((field, f"judge.on_unsupported 只能是 {' / '.join(JUDGE_ON_UNSUPPORTED)}，写的是 {item!r}"))
+    return out
 
 
 def _check_report_claims(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
-    """claims 写错了（包括还不支持的 judge）挡住运行：执行时报告节点照样会报这一句，
-    与其跑完取数、算完口径卡才死在写报告那一步，不如在画图时说破。
+    """claims 写错了挡住运行：执行时报告节点照样会报这一句，与其跑完取数、算完口径卡才死在写报告
+    那一步，不如在画图时说破。claims 是 judge 时再查 judge 子配置的形状；裁判模型和写作模型写成
+    同一个的给警告——等于自己审自己。
 
     和运行时同一个取值规则：节点上没写就取图级 defaults（NodeContext.cfg）。
     """
-    value = node.config.get("claims")
-    if value in (None, ""):
-        value = spec.defaults.get("claims")
+    def effective(key: str) -> Any:
+        value = node.config.get(key)
+        return spec.defaults.get(key) if value in (None, "") else value
+
+    value = effective("claims")
     if problem := claims_problem(value):
         result.add(problem, node_id=node.id, field="claims", code="report.claims_invalid")
+    if value != CLAIMS_JUDGE:
+        return
+    judge = effective("judge")
+    for field, message in judge_problems(judge):
+        result.add(message, node_id=node.id, field=field, code="report.judge_invalid")
+    judge_model = judge.get("model") if isinstance(judge, dict) else None
+    if isinstance(judge_model, str) and judge_model and judge_model == effective("model"):
+        result.add(f"裁判模型和写作模型都是「{judge_model}」：等于自己审自己，模型写错的地方它多半也看不出来。"
+                   "给 judge.model 换一个不同的模型", level="warning", node_id=node.id, field="judge.model",
+                   code="report.judge_same_model")
+
+
+def contract_needs_metrics(contract: dict[str, Any]) -> bool:
+    """出具契约要不要写 metrics_from（指标来自哪几张口径卡）。
+
+    旧写法按数值回指叙述，没有口径卡就无从回指，一定要写。引用模式（report_from）下，数字回指靠
+    报告里的引用标记：只引查询单元格（cells）的问数据图根本没有口径卡，不该逼它写；契约里列了
+    required / expected 指标的，指标总得有个来处，照样要写。运行时 io.py 也是这么判的。
+    """
+    if contract.get("report_from") in (None, ""):
+        return True
+    return bool(contract.get("required") or contract.get("expected"))
 
 
 def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
@@ -542,7 +613,7 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 # 报成 error，两档发布和运行前都挡住
                 result.add("出具契约必须是一个 JSON 对象", node_id=node.id, field="contract",
                            code="contract.not_object")
-            elif contract and not contract.get("metrics_from"):
+            elif contract and not contract.get("metrics_from") and contract_needs_metrics(contract):
                 result.add("出具契约缺 metrics_from（指标来自哪个「口径卡」节点）",
                            node_id=node.id, field="contract.metrics_from", code="contract.metrics_from_missing")
             if isinstance(contract, dict) and contract.get("report_from") not in (None, ""):

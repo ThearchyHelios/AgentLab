@@ -8,13 +8,13 @@ import { ListChecks } from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
-  EVIDENCE_STATE, docTally, segmentKind, segmentLabel, segmentState, tallySummary, unitText, type EvidenceStateCode,
-  type EvidenceTally as Tally,
+  EVIDENCE_STATE, claimCounts, claimLabel, docTally, segmentKind, segmentLabel, segmentState, tallySummary, unitText,
+  isJudged, limitOf, unitVerdict, verdictState, withVerdicts, type EvidenceStateCode, type EvidenceTally as Tally,
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
-import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, evidenceTally } from '../lib/terms'
-import { useEvidence } from '../store/evidence'
-import type { EvidenceBlock, EvidenceDocData, EvidenceSegment, EvidenceUnit } from '../types'
+import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, JUDGE_TEXT, claimTally, evidenceTally, type ClaimTallyCounts } from '../lib/terms'
+import { useEvidence, useVerdicts } from '../store/evidence'
+import type { EvidenceBlock, EvidenceDocData, EvidenceSegment, EvidenceUnit, EvidenceVerdict } from '../types'
 import { EvidencePanel, type PanelMode, type PanelView } from './EvidencePanel'
 import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type InlineStyles } from './Markdown'
 
@@ -26,10 +26,13 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  * BlockView，和普通答案长得一模一样；有出处的数字画细实线，没有出处的画点状线、
  * 句末挂「无证据」。
  *
- * 键盘：整份报告只占一个 Tab 位（roving tabindex）。←/→ 在有状态的片段间走，↑/↓ 按
+ * 结论句的判定（四期）只在句末挂一枚小徽标（◆ ◇ ! ?），整句不画线；证据不支持的整句铺一层浅底。
+ * 徽标也是按钮：点开是这一句的「模型的解释」。判定是模型给的，颜色一律不用确定性的绿。
+ *
+ * 键盘：整份报告只占一个 Tab 位（roving tabindex）。←/→ 在有状态的片段、句末徽标间走，↑/↓ 按
  * 句子走（表格里按列走到上一行 / 下一行，出了表格接着按句子走），n / N 跳到下一处 /
- * 上一处无证据，回车打开证据面板，Esc 关掉并留在原片段；面板开着时方向键走到哪、面板
- * 跟到哪，Tab 进面板。
+ * 上一处无证据、证据不支持的地方，回车打开证据面板，Esc 关掉并留在原片段；面板开着时方向键走到哪、
+ * 面板跟到哪，Tab 进面板。
  *
  * 长报告：事件都挂在容器上（片段只带 data-seg），块用 memo，外加
  * content-visibility: auto；超过 TEXT_CAP 的部分先折叠，跳转到折叠里的片段时自动展开。
@@ -47,11 +50,19 @@ export interface EvidenceDocHandle {
 /** 和 AssistantStream 的长文本折叠同一个量级：先显示这么多字，后面的折起来 */
 const TEXT_CAP = 3000
 
+/** 句末徽标在键盘顺序里的键：片段 id 是 s0…，不会撞 */
+const badgeKey = (unit: string) => `claim:${unit}`
+const unitOfKey = (key: string) => (key.startsWith('claim:') ? key.slice(6) : null)
+
+interface Badge { unit: EvidenceUnit; block: number; verdict: EvidenceVerdict; state: EvidenceStateCode }
+
 interface Model {
-  /** 可点的片段，按正文顺序 */
+  /** 可点的片段和句末徽标，按正文顺序 */
   order: string[]
   index: Map<string, number>
   seg: Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>
+  /** 句末徽标：键是 claim:<unit>，带着这一句眼下的判定 */
+  badge: Map<string, Badge>
   /** 每个有可点片段的句子里第一个可点片段，按正文顺序（↑/↓ 用） */
   unitFirst: string[]
   unitOf: Map<string, number>
@@ -65,10 +76,11 @@ interface Model {
   grid: Map<string, string>
 }
 
-function buildModel(blocks: EvidenceBlock[]): Model {
+function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>): Model {
   const order: string[] = []
   const index = new Map<string, number>()
   const seg = new Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>()
+  const badge = new Map<string, Badge>()
   const unitFirst: string[] = []
   const unitOf = new Map<string, number>()
   const alerts: string[] = []
@@ -96,11 +108,27 @@ function buildModel(blocks: EvidenceBlock[]): Model {
           if (!grid.has(key)) grid.set(key, s.id)
         }
       }
+      // 句末徽标排在这一句的片段后面：←/→ 走到句尾就是它，证据不支持的也进 n / N
+      const verdict = unitVerdict(unit, overlay)
+      const state = verdictState(verdict)
+      if (verdict && state) {
+        const key = badgeKey(unit.id)
+        badge.set(key, { unit, block: b, verdict, state })
+        index.set(key, order.length)
+        order.push(key)
+        if (first) { unitFirst.push(key); first = false }
+        unitOf.set(key, unitFirst.length - 1)
+        if (EVIDENCE_STATE[state].alert) alerts.push(key)
+      }
     }
     chars.push(total)
   })
-  return { order, index, seg, unitFirst, unitOf, alerts, chars, cell, grid }
+  return { order, index, seg, badge, unitFirst, unitOf, alerts, chars, cell, grid }
 }
+
+/** 片段或徽标在第几块 */
+const blockOf = (model: Model, key: string | null | undefined): number =>
+  (key ? model.seg.get(key)?.block ?? model.badge.get(key)?.block : undefined) ?? -1
 
 /**
  * ↑/↓ 该去哪。表格里按列走：下一行同一列（那一格空着就找这一行离它最近的一格）；
@@ -123,11 +151,11 @@ function verticalTarget(model: Model, id: string, down: boolean): string | null 
     // 出了表格：往下找表格之后的第一句，往上找表格之前的最后一句
     const u = model.unitOf.get(id) ?? 0
     const list = down ? model.unitFirst.slice(u + 1) : model.unitFirst.slice(0, u).reverse()
-    const out = list.find((sid) => model.seg.get(sid)?.block !== at.block)
+    const out = list.find((sid) => blockOf(model, sid) !== at.block)
     if (out) return out
     // 表格就是整份报告的首尾：和句子一样首尾相接
     const wrap = down ? model.unitFirst : [...model.unitFirst].reverse()
-    return wrap.find((sid) => model.seg.get(sid)?.block !== at.block) ?? null
+    return wrap.find((sid) => blockOf(model, sid) !== at.block) ?? null
   }
   const u = model.unitOf.get(id) ?? 0
   return model.unitFirst[(u + (down ? 1 : -1) + n) % n] ?? null
@@ -168,10 +196,24 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   onView?: (open: boolean) => void
   /** 自己显示「N/N 数字有出处」那一条。上面已经有出具横幅（它会写这一行）时不用 */
   tally?: boolean
-}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false }, ref) {
+  /**
+   * 运行类别（formal / exploratory）：「请模型判断这句」只在探索运行里有。开了裁判的文档自己记着
+   * （on_demand / inline），没开的看这里，不给就按运行 id 取一次
+   */
+  runClass?: string
+}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false, runClass }, ref) {
   const blocks = useMemo(() => doc.blocks ?? [], [doc])
-  const model = useMemo(() => buildModel(blocks), [blocks])
+  const report = doc.node_id || undefined
+  // 封存之后按需追加的判定：盖过文档里的「未裁判 · 按需」。只换句末徽标，封存的文档一个字不改
+  const overlay = useVerdicts(runId, report)
+  const model = useMemo(() => buildModel(blocks, overlay), [blocks, overlay])
   const counts = useMemo(() => docTally(doc), [doc])
+  const claims = useMemo(() => claimCounts(doc, overlay), [doc, overlay])
+  // 探索运行的报告（开了裁判的按需文档，或调用方说了是探索运行）：证据图带着这次运行里之前按需判过的句子
+  // （reports[].post_seal_verdicts），取一次，重新打开页面时徽标还在。别的报告不多发这个请求
+  const loadGraph = useEvidence((s) => s.loadGraph)
+  const lateOnes = doc.judge?.mode === 'on_demand' || (runClass === 'exploratory' && doc.judge?.mode !== 'inline')
+  useEffect(() => { if (lateOnes && runId) void loadGraph(runId) }, [lateOnes, runId, loadGraph])
   const rootRef = useRef<HTMLDivElement>(null)
   const instance = useId()
   const panelId = `${instance}-panel`
@@ -183,11 +225,17 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   const pendingFocus = useRef<string | null>(null)
   const mode = usePanelMode(panel, dense)
 
-  // 换了一份文档：焦点位回到第一个片段，面板关掉
+  // 换了一份文档：焦点位回到第一个片段，面板关掉。只认文档本身——判定回来了（徽标变了）不算换文档，
+  // 面板正开着这一句的解释，不能因此收起
   useEffect(() => {
     setCurrent(model.order[0] ?? null)
     setView(null)
-  }, [model])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks])
+  // 拿着 Tab 位的徽标没了（判成「不是结论句」）：Tab 位交回第一个，整份报告不能一个 Tab 位都没有
+  useEffect(() => {
+    if (current && !model.index.has(current)) setCurrent(model.order[0] ?? null)
+  }, [model, current])
 
   // 同一时刻只开一个面板：另一份报告打开了自己的面板，这边的就收起
   const owner = useEvidence((s) => s.owner)
@@ -205,15 +253,18 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   const shownBlocks = expanded ? blocks.length : foldAt
   const totalChars = model.chars[model.chars.length - 1] ?? 0
 
-  const segEl = useCallback((id: string) =>
-    rootRef.current?.querySelector<HTMLElement>(`[data-seg="${CSS.escape(id)}"]`) ?? null, [])
+  const segEl = useCallback((id: string) => {
+    const unit = unitOfKey(id)
+    const sel = unit ? `[data-ev-claim="${CSS.escape(unit)}"]` : `[data-seg="${CSS.escape(id)}"]`
+    return rootRef.current?.querySelector<HTMLElement>(sel) ?? null
+  }, [])
 
-  /** 把焦点挪到某个片段上。在折叠里的先展开，渲染出来再聚焦 */
+  /** 把焦点挪到某个片段（或句末徽标）上。在折叠里的先展开，渲染出来再聚焦 */
   const focusSeg = useCallback((id: string, opts?: { flash?: boolean }) => {
-    const hit = model.seg.get(id)
-    if (!hit) return
+    const block = blockOf(model, id)
+    if (block < 0) return
     setCurrent(id)
-    if (hit.block >= shownBlocks) {
+    if (block >= shownBlocks) {
       pendingFocus.current = id
       setExpanded(true)
       return
@@ -233,6 +284,13 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   }, [expanded, segEl])
 
   const openSeg = useCallback((id: string) => {
+    const badge = model.badge.get(id)
+    if (badge) {
+      claim(instance)
+      setView({ kind: 'unit', id: badge.unit.id })
+      setAnnounce(`${JUDGE_TEXT.section}：${claimLabel(badge.unit, badge.verdict)}`)
+      return
+    }
     const hit = model.seg.get(id)
     if (!hit) return
     claim(instance)
@@ -247,7 +305,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   }, [claim, instance, doc])
 
   const close = useCallback((refocus = true) => {
-    const back = view?.kind === 'seg' ? view.id : current
+    const back = view?.kind === 'seg' ? view.id : view?.kind === 'unit' ? badgeKey(view.id) : current
     setView(null)
     setAnnounce('')
     if (refocus && back) requestAnimationFrame(() => segEl(back)?.focus())
@@ -265,16 +323,18 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   const open = !!view
   useEffect(() => { onView?.(open) }, [open, onView])
 
+  const viewKey = view?.kind === 'seg' ? view.id : view?.kind === 'unit' ? badgeKey(view.id) : null
+
   useImperativeHandle(ref, () => ({
     open: (id, opts) => {
-      if (!model.seg.has(id)) return false
+      if (!model.seg.has(id) && !model.badge.has(id)) return false
       if (opts?.focus) focusSeg(id, { flash: true })
       else setCurrent(id)
       openSeg(id)
       return true
     },
     next: (dir = 1) => {
-      const target = step(model.alerts, view?.kind === 'seg' ? view.id : current, dir)
+      const target = step(model.alerts, viewKey ?? current, dir)
       if (target) {
         focusSeg(target, { flash: true })
         openSeg(target)
@@ -288,19 +348,20 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       openViolations()
       return true
     },
-  }), [step, model, view, current, focusSeg, openSeg, openViolations, doc])
+  }), [step, model, viewKey, current, focusSeg, openSeg, openViolations, doc])
 
-  // 事件委托：片段只带 data-seg，点击和按键都在容器上认
+  // 事件委托：片段只带 data-seg、句末徽标只带 data-ev-claim，点击和按键都在容器上认
   const segOf = (target: EventTarget | null): string | null => {
-    const el = (target as HTMLElement | null)?.closest?.<HTMLElement>('[data-seg]')
-    return el && rootRef.current?.contains(el) ? el.dataset.seg ?? null : null
+    const el = (target as HTMLElement | null)?.closest?.<HTMLElement>('[data-seg], [data-ev-claim]')
+    if (!el || !rootRef.current?.contains(el)) return null
+    return el.dataset.seg ?? (el.dataset.evClaim ? badgeKey(el.dataset.evClaim) : null)
   }
   const onClick = (e: ReactMouseEvent) => {
     const id = segOf(e.target)
     if (!id) return
     e.preventDefault()
     setCurrent(id)
-    if (view?.kind === 'seg' && view.id === id) close(false)
+    if (viewKey === id) close(false)
     else openSeg(id)
   }
   const onFocus = (e: ReactFocusEvent) => {
@@ -341,9 +402,9 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     if (view) openSeg(target)
   }
 
-  const activeSeg = view?.kind === 'seg' ? view.id : null
-  const activeBlock = activeSeg ? model.seg.get(activeSeg)?.block ?? -1 : -1
-  const currentBlock = current ? model.seg.get(current)?.block ?? -1 : -1
+  const activeSeg = viewKey
+  const activeBlock = blockOf(model, activeSeg)
+  const currentBlock = blockOf(model, current)
   const visual = blocks.length > 40
 
   const panelNode = view && (
@@ -353,6 +414,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       doc={doc}
       artifact={artifact}
       runId={runId}
+      runClass={runClass}
       view={view}
       onClose={() => close()}
       onLocate={(id) => { focusSeg(id, { flash: true }); openSeg(id) }}
@@ -361,14 +423,14 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   )
 
   // 画不了线的两种分开说：列表序号、代码块标签里的数字，和正文里根本没有对应字的（句末依据里的引用）
-  const summary = tallySummary(counts, model.order.length > 0)
+  const summary = tallySummary({ ...counts, claims }, model.order.length > 0)
 
   return (
     <div ref={rootRef} data-evidence-doc="" className="min-w-0">
       <p id={summaryId} className="sr-only" data-evidence-summary="">{summary}</p>
       <div className="sr-only" aria-live="polite" aria-atomic="true">{announce}</div>
-      {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect) && (
-        <EvidenceTally counts={counts} onNext={() => {
+      {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect || !!claims?.total) && (
+        <EvidenceTally counts={{ ...counts, claims }} onNext={() => {
           const target = step(model.alerts, current, 1)
           if (target) { focusSeg(target, { flash: true }); openSeg(target) } else openViolations()
         }} onList={doc.violations?.length ? openViolations : undefined} />
@@ -388,7 +450,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
             <DocBlock block={block} dense={dense} doc={doc} visual={visual}
                       current={b === currentBlock ? current : null}
                       active={b === activeBlock ? activeSeg : null}
-                      panelId={panelId} />
+                      panelId={panelId} model={model} />
             {mode === 'inline' && b === activeBlock && panelNode}
           </Fragment>
         ))}
@@ -437,14 +499,18 @@ function usePanelMode(panel: 'auto' | PanelMode, dense: boolean): PanelMode {
   return wide ? 'side' : 'drawer'
 }
 
-/** 证据条：没有出具横幅时由文档自己说「7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了」 */
+/**
+ * 证据条：没有出具横幅时由文档自己说「7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了」，
+ * 有结论句判定时接着说「结论 4 句（支持 3 · 不支持 1）」
+ */
 export function EvidenceTally({ counts, onNext, onList }: {
-  counts: Pick<Tally, 'total' | 'cited' | 'none' | 'other' | 'suspect'>
+  counts: Pick<Tally, 'total' | 'cited' | 'none' | 'other' | 'suspect' | 'claims'>
   onNext?: () => void
   onList?: () => void
 }) {
   const suspect = counts.suspect ?? 0
-  const clean = !counts.none && !counts.other && !suspect
+  const claims = counts.claims
+  const clean = !counts.none && !counts.other && !suspect && !claims?.unsupported && !claims?.partial
   const numbers = evidenceTally(counts.cited, counts.total, counts.other)
   return (
     <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-evidence-tally="">
@@ -459,6 +525,7 @@ export function EvidenceTally({ counts, onNext, onList }: {
           {numbers ? '· ' : ''}{EVIDENCE_STATE.suspect.glyph} {EVIDENCE_TEXT.suspectTag} {formatNumber(suspect)}
         </span>
       )}
+      {claims && claims.total > 0 && <ClaimTally claims={claims} lead={!!numbers || suspect > 0} />}
       {!clean && onNext && (
         <button type="button" className="btn btn-xs" data-evidence-next="" onClick={onNext}>
           {EVIDENCE_TEXT.locateNext}
@@ -473,6 +540,22 @@ export function EvidenceTally({ counts, onNext, onList }: {
   )
 }
 
+/**
+ * 「结论 4 句（支持 3 · 不支持 1）」：和数字那一段同一种说法。判定是模型给的：全都支持也不用确定性的绿，
+ * 有不支持、部分支持、没挂依据的用提醒色，其余用暗字色（它是概率性的，不该和「有出处」一样笃定）
+ */
+export function ClaimTally({ claims, lead }: { claims: ClaimTallyCounts; lead: boolean }) {
+  const text = claimTally(claims)
+  if (!text) return null
+  const warn = claims.unsupported > 0 || claims.partial > 0 || claims.uncited > 0
+  return (
+    <span className="tnum" style={{ color: warn ? 'var(--st-waiting)' : 'var(--text-dim)' }} data-evidence-claims=""
+          title={JUDGE_TEXT.badge(null)}>
+      {lead ? '· ' : ''}{text}
+    </span>
+  )
+}
+
 // -------------------------------------------------------------------------
 // 块与片段
 // -------------------------------------------------------------------------
@@ -480,10 +563,12 @@ export function EvidenceTally({ counts, onNext, onList }: {
 /** 列表项的开头：结构片段里带着行首的 - / 1. 。列表项被分成几句时，后面几句接在同一项里 */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId }: {
+const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model }: {
   block: EvidenceBlock
   dense: boolean
   doc: EvidenceDocData
+  /** 句末徽标从这里取：这一句眼下的判定（封存后追加的盖过文档里的） */
+  model: Model
   /**
    * 长文档：块上加 content-visibility，屏幕外的块不排版不绘制。短文档不加：它自带 paint
    * containment，贴着块边的片段的焦点描边会被裁掉一截，而短文档本来就不慢
@@ -502,7 +587,7 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
   const unit = (u: EvidenceUnit, opts?: { code?: boolean; tag?: boolean }) => (
     <UnitView key={u.id} unit={u} doc={doc} current={current} active={active} panelId={panelId}
-              code={opts?.code} tag={opts?.tag ?? true} />
+              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))} />
   )
 
   switch (block.type) {
@@ -569,11 +654,12 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
 
 /**
  * 一句话：文字按行内 Markdown 渲染（整句算一次样式，跨片段的 `code`、**粗体** 不会
- * 被切坏），有状态的片段包成按钮。含无证据片段的句子末尾挂「? 无证据」
+ * 被切坏），有状态的片段包成按钮。含无证据片段的句子末尾挂「? 无证据」；有判定的结论句末尾挂
+ * 一枚徽标（也是按钮），证据不支持的整句铺浅底——字本身不画线
  */
-function UnitView({ unit, doc, current, active, panelId, code, tag }: {
+function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
-  code?: boolean; tag: boolean
+  code?: boolean; tag: boolean; badge?: Badge
 }) {
   const segs = (unit.segments ?? []).filter((s) => s.kind !== 'structural')
   const text = segs.map((s) => s.text).join('')
@@ -611,14 +697,41 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
       </button>
     )
   })
+  const key = badge ? badgeKey(unit.id) : ''
+  const meta = badge ? EVIDENCE_STATE[badge.state] : null
+  const open = !!badge && active === key
   return (
     <>
-      {nodes}
+      {badge?.state === 'unsupported'
+        // 证据不支持：整句铺一层浅底（折行时每行各自带圆角），字色、字重都不动，也不画线
+        ? <span className="ev-claim" data-ev-claim-shade={unit.id} style={{ '--ev-soft': meta!.soft } as CSSProperties}>{nodes}</span>
+        : nodes}
       {tag && [...alerts].map((state) => (
         <span key={state} className="ev-tag" aria-hidden="true" title={EVIDENCE_STATE[state].hint} data-ev-tag={state}>
           {EVIDENCE_STATE[state].glyph}{TAG_TEXT[state]}
         </span>
       ))}
+      {badge && meta && (
+        <button
+          type="button"
+          className="ev-badge"
+          data-ev-claim={unit.id}
+          data-ev-verdict={badge.state}
+          data-ev-post-seal={badge.verdict.post_seal ? '' : undefined}
+          tabIndex={current === key ? 0 : -1}
+          aria-label={claimLabel(unit, badge.verdict)}
+          aria-expanded={open}
+          aria-controls={open ? panelId : undefined}
+          // 模型判过的写明谁判的、非确定；模型没判过的（按需还没点、到上限、没跑成）只说这是什么状态——
+          // 到上限没判的也记着裁判模型，但不能写成「（模型 · 非确定）」，像是它判过一样
+          title={isJudged(badge.verdict)
+            ? `${meta.label}${badge.verdict.post_seal ? ` · ${JUDGE_TEXT.postSeal}` : ''}（${badge.verdict.judge || JUDGE_TEXT.judgeModel} · 非确定）`
+            : limitOf(badge.verdict) ? `${meta.label}：${JUDGE_TEXT.limitNotJudged}` : `${meta.label}：${meta.hint}`}
+          style={segStyle(badge.state)}
+        >
+          <span aria-hidden="true">{meta.glyph}</span>
+        </button>
+      )}
     </>
   )
 }
@@ -631,8 +744,10 @@ function UnitView({ unit, doc, current, active, panelId, code, tag }: {
  */
 export const EvidenceField = forwardRef<EvidenceDocHandle, {
   artifact: string; text: string; runId?: string; dense?: boolean; label?: string; tally?: boolean
+  /** 交给出具横幅数数的文档：封存之后按需追加的判定已经叠上去了（只给计数用，正文照样按封存的那份画） */
   onDoc?: (doc: EvidenceDocData | null) => void
-}>(function EvidenceField({ artifact, text, runId, dense, label, tally, onDoc }, ref) {
+  runClass?: string
+}>(function EvidenceField({ artifact, text, runId, dense, label, tally, onDoc, runClass }, ref) {
   const slot = useEvidence((s) => s.docs[artifact])
   const loadDoc = useEvidence((s) => s.loadDoc)
   useEffect(() => { void loadDoc(artifact) }, [artifact, loadDoc])
@@ -640,9 +755,12 @@ export const EvidenceField = forwardRef<EvidenceDocHandle, {
   const mismatch = !!doc && (typeof doc.markdown !== 'string' || doc.markdown.trim() !== text.trim())
   const otherRun = !!doc && !!runId && typeof doc.run_id === 'string' && !!doc.run_id && doc.run_id !== runId
   const usable = doc && !mismatch && !otherRun ? doc : null
-  useEffect(() => { onDoc?.(usable) }, [usable, onDoc])
+  const overlay = useVerdicts(runId, usable?.node_id || undefined)
+  const counted = useMemo(() => (usable ? withVerdicts(usable, overlay) : null), [usable, overlay])
+  useEffect(() => { onDoc?.(counted) }, [counted, onDoc])
   if (usable) {
-    return <EvidenceDoc ref={ref} doc={usable} artifact={artifact} runId={runId} dense={dense} label={label} tally={tally} />
+    return <EvidenceDoc ref={ref} doc={usable} artifact={artifact} runId={runId} dense={dense} label={label} tally={tally}
+                        runClass={runClass} />
   }
   const note = slot?.status === 'error' ? EVIDENCE_TEXT.docMissing
     : otherRun ? EVIDENCE_TEXT.docOtherRun : mismatch ? EVIDENCE_TEXT.docMismatch : ''

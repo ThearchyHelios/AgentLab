@@ -308,6 +308,8 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
         unknown_entities: 2, uncited_claims: 1 }, 'require_citation')), JSON.stringify({ cited: 10, none: 5 }))
     eq('……结论句策略是 off 时不算没挂依据的结论句', ev.stampCounts({ numbers: 4, numbers_cited: 3, uncited_numbers: 1, unresolved: 0,
       uncited_claims: 3 }, 'off')?.none, 1)
+    eq('……judge 在挂依据上和 require_citation 一样严：没挂依据的结论句也算', ev.stampCounts({ numbers: 4, numbers_cited: 3,
+      uncited_numbers: 1, unresolved: 0, uncited_claims: 3 }, 'judge')?.none, 4)
     eq('可疑实体的提示：目录键、{name, table} 都写成去掉前缀的名字，最多 3 个',
       ev.closestNames(['c:orders.amount', { alias: 't:refunds' }, { name: 'region', table: 'orders', kind: 'column' }, 'c:x']).join(','),
       'orders.amount,refunds,orders.region')
@@ -405,6 +407,90 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     eq('证据图兜底：封存的报告里有正文这份', ev.graphDoc({ reports: [{ doc_artifact: 'aaa' }] }, 'aaa'), 'ok')
     eq('证据图兜底：没有正文这份', ev.graphDoc({ reports: [{ doc_artifact: 'bbb' }] }, 'aaa'), 'foreign')
     eq('证据图兜底：有，但哈希对不上', ev.graphDoc({ reports: [{ doc_artifact: 'aaa', hash_ok: false }] }, 'aaa'), 'tampered')
+    return out
+  })) check(name, ok, detail)
+})
+
+await section('lib/evidence：结论句裁判（四期）——判定的徽标、计数、答复形状、改写一次', async () => {
+  for (const [name, ok, detail] of await page.evaluate(() => {
+    const { evidence: ev, terms: t } = window.__ui.lib
+    const fj = window.__ui.evidenceJudge
+    const out = []
+    const eq = (name, got, want) => out.push([name, got === want, got === want ? '' : `得到 ${JSON.stringify(got)}，应为 ${JSON.stringify(want)}`])
+    const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
+    const S = ev.EVIDENCE_STATE
+    ok('概率性四种都挂在句末徽标上（line=badge），字形 ◆ ◇ ! ?', ['supported', 'partial', 'unsupported', 'unjudged']
+      .map((c) => `${S[c].line}/${S[c].glyph}`).join(' ') === 'badge/◆ badge/◇ badge/! badge/?',
+      ['supported', 'partial', 'unsupported', 'unjudged'].map((c) => `${S[c].line}/${S[c].glyph}`).join(' '))
+    // 颜色令牌照方案 6.1：支持用强调色（--st-running 就是 --accent）、部分用 --st-waiting、不支持用 --st-failed、
+    // 未裁判用暗字色（--st-cancelled 就是 --text-dim）。四种都不是确定性的绿
+    eq('四种的颜色令牌', ['supported', 'partial', 'unsupported', 'unjudged'].map((c) => S[c].color).join(' '),
+      'var(--st-running) var(--st-waiting) var(--st-failed) var(--st-cancelled)')
+    ok('概率性四种都不用确定性的绿（--st-done）', ['supported', 'partial', 'unsupported', 'unjudged']
+      .every((c) => !S[c].color.includes('--st-done') && !S[c].soft.includes('--st-done')))
+    ok('证据不支持、部分支持醒目（进 n / N），有依据、未裁判安静', S.unsupported.alert && S.partial.alert && !S.supported.alert && !S.unjudged.alert)
+    eq('未裁判的叫法不说「有引用」（没挂依据的结论句也会没判）', S.unjudged.label, '未裁判')
+    eq('判定 → 徽标：不是结论句不挂', [ev.verdictState({ status: 'supported' }), ev.verdictState({ status: 'not_a_claim' }),
+      ev.verdictState({ status: 'unjudged' }), ev.verdictState({ status: 'maybe' }), ev.verdictState(undefined)].join(','),
+      'supported,,unjudged,,')
+    eq('封存后追加的判定盖过文档里的「未裁判 · 按需」', ev.unitVerdict({ id: 'u2', verdict: { status: 'unjudged', reason: 'on_demand' } },
+      { u2: { status: 'unsupported', post_seal: true } }).status, 'unsupported')
+    eq('没有追加的用文档里的', ev.unitVerdict({ id: 'u2', verdict: { status: 'partial' } }, { u9: { status: 'supported' } }).status, 'partial')
+    eq('到上限没判的认得出是哪个上限', ev.limitOf({ status: 'unjudged', reason: 'daily_max_usd' }), 'daily_max_usd')
+    eq('按需、出错不是上限', `${ev.limitOf({ status: 'unjudged', reason: 'on_demand' })}|${ev.limitOf({ status: 'unjudged', reason: 'error' })}`, 'null|null')
+    ok('判过的四种（不含未裁判）', ev.isJudged({ status: 'not_a_claim' }) && ev.isJudged({ status: 'partial' }) && !ev.isJudged({ status: 'unjudged' }))
+    const k = (c) => (c ? `${c.total}:${c.supported}/${c.partial}/${c.unsupported}/${c.unjudged}/${c.uncited}` : 'null')
+    eq('正式运行（节点里判好的）：不是结论句不算，4 句', k(ev.claimCounts(fj.formal.doc)), '4:1/1/1/1/0')
+    eq('探索运行按需：5 句都未裁判', k(ev.claimCounts(fj.explore.doc)), '5:0/0/0/5/0')
+    eq('没开裁判、也没按需判过：不数（横幅照旧）', k(ev.claimCounts(fj.plain.doc)), 'null')
+    // 开了裁判的文档里预筛放掉的结论句（没有判定、列在 judge.screened 里）不算进结论句，也不算「无证据」
+    eq('开了裁判：预筛放掉的结论句不数', k(ev.claimCounts({ judge: { mode: 'inline', screened: ['u9'] }, blocks: [{ type: 'paragraph',
+      units: [{ id: 'u9', kind: 'claim', cites: [], segments: [] }, { id: 'u1', kind: 'claim', cites: ['Q1'], segments: [],
+        verdict: { status: 'supported' } }] }] })), '1:1/0/0/0/0')
+    eq('没开裁判、按需判过一句：挂了依据的算未裁判，没挂的算无证据', k(ev.claimCounts(fj.plain.doc,
+      { [fj.plain.units.bad]: { status: 'unsupported', post_seal: true } })), '5:0/0/1/3/1')
+    eq('docTally 带上结论句计数', k(ev.docTally(fj.formal.doc).claims), '4:1/1/1/1/0')
+    // 问数据页、画布右栏的横幅走的是这条路：EvidenceField 把判定叠进文档（withVerdicts）交出去，Output 再
+    // docTally——这时没有单独的 overlay，判定写在 unit.verdict 上，也得认得出「按需判过」
+    eq('没开裁判、按需判过一句：叠好判定的文档交给 docTally 照样数（横幅的路径）',
+      k(ev.docTally(ev.withVerdicts(fj.plain.doc, { [fj.plain.units.bad]: { status: 'unsupported', post_seal: true } })).claims),
+      '5:0/0/1/3/1')
+    eq('叠上判定给横幅数：只换判过的那几句', k(ev.claimCounts(ev.withVerdicts(fj.explore.doc,
+      { [fj.explore.units.bad]: { status: 'unsupported', post_seal: true } }))), '5:0/0/1/4/0')
+    ok('叠上判定不改原文档', ev.withVerdicts(fj.explore.doc, { [fj.explore.units.bad]: { status: 'unsupported' } }) !== fj.explore.doc
+      && fj.explore.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fj.explore.units.bad).verdict.status === 'unjudged')
+    eq('计数的说法：和数字那一段同一种', t.claimTally({ total: 4, supported: 1, partial: 1, unsupported: 1, unjudged: 1, uncited: 0 }),
+      '结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）')
+    eq('……方案的例子', t.claimTally({ total: 4, supported: 3, partial: 0, unsupported: 0, unjudged: 0, uncited: 1 }), '结论 4 句（支持 3 · 无证据 1）')
+    eq('……没有结论句给空串', t.claimTally({ total: 0, supported: 0, partial: 0, unsupported: 0, unjudged: 0, uncited: 0 }), '')
+    const unit = fj.formal.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fj.formal.units.bad)
+    eq('句末徽标的 aria-label：句子、判定写全', ev.claimLabel(unit, unit.verdict), '结论句「增长主要来自新客首单，老客复购持平。」，模型判断：证据不支持')
+    ok('……封存后追加的另说', ev.claimLabel(unit, { ...unit.verdict, post_seal: true }).endsWith('，封存后追加'))
+    ok('……到上限没判的说「已到上限」', ev.claimLabel(unit, { status: 'unjudged', reason: 'max_cost_usd' }).endsWith('未裁判：已到上限'))
+    // 按需裁判接口的答复：evidence.judged 的载荷（{verdicts: {u: …}}），也认列表；缺 post_seal 的记 true，缺 judge 的补模型
+    const a = ev.judgedVerdicts({ verdicts: { u4: { status: 'supported', rationale: '对' } }, model: 'jm' })
+    ok('答复 {verdicts: {u: …}}：补上模型、记封存后追加', a.u4?.status === 'supported' && a.u4.judge === 'jm' && a.u4.post_seal === true,
+      JSON.stringify(a))
+    const b = ev.judgedVerdicts({ verdicts: [{ unit: 'u2', verdict: 'partial', judge: 'x', post_seal: false }, { unit: 'u3' }] })
+    ok('答复是列表、判定写在 verdict 里：照认；没有判定的丢掉；接口给了 post_seal 就照它', b.u2?.status === 'partial' && b.u2.post_seal === false
+      && !('u3' in b), JSON.stringify(b))
+    eq('认不出的答复给空表', Object.keys(ev.judgedVerdicts('oops')).length + Object.keys(ev.judgedVerdicts({ verdicts: 3 })).length, 0)
+    const g = ev.graphVerdicts({ reports: [{ node_id: 'w1', post_seal_verdicts: { u1: { status: 'supported' } } },
+      { node_id: 'w2', post_seal_verdicts: { u1: { status: 'unsupported' } } }] }, 'w2')
+    ok('证据图里按报告取封存后追加的判定（reports[].post_seal_verdicts）', g.u1?.status === 'unsupported' && g.u1.post_seal === true, JSON.stringify(g))
+    const applied = { judge: { rewrite: { applied: true, units: ['u1', null], sentences: ['原句甲', '原句乙'], changed: ['u5'], reason: null } } }
+    ok('改写一次采用了：changed 里的句子给出交回改写的原句（units 为 null 的那几句）',
+      JSON.stringify(ev.rewriteOf(applied, 'u5')) === JSON.stringify({ kind: 'changed', sentences: ['原句乙'] }), JSON.stringify(ev.rewriteOf(applied, 'u5')))
+    eq('……没改的句子不标', ev.rewriteOf(applied, 'u1'), null)
+    const rejected = { judge: { rewrite: { applied: false, units: ['u2'], sentences: ['原句'], changed: [], reason: '改写稿冒出 1 处原稿没有的问题' } } }
+    eq('改写稿没采用：交回过的句子写明原因', ev.rewriteOf(rejected, 'u2')?.kind, 'rejected')
+    eq('……没交回的不标', ev.rewriteOf(rejected, 'u3'), null)
+    // 设置页：设成不限时写明还受什么约束；别的也不限时照实少说
+    const all = { claims: true, cost: true, timeout: true, click: true, daily: true }
+    eq('不限的说法：每日', t.judgeUnlimitedText('daily', all), '不设上限，每日费用只受每份报告的金额上限和每次点击的金额上限约束')
+    eq('……每份报告的金额', t.judgeUnlimitedText('cost', all), '不设上限，费用只受句数上限、时长上限、每日上限约束')
+    ok('……每日、每份、每次都不限：说到底只受调用次数约束', t.judgeUnlimitedText('daily', { ...all, cost: false, click: false }).includes('调用次数'))
+    ok('……每日不限时每份报告的金额只剩句数、时长', !t.judgeUnlimitedText('cost', { ...all, daily: false }).includes('每日'))
     return out
   })) check(name, ok, detail)
 })

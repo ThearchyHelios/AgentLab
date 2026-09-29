@@ -326,3 +326,74 @@ async def test_the_report_node_and_the_exit_check_agree_when_the_status_changes_
     assert seen == [True, True], seen
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "withheld" and CELLS_REASON in issuance["unresolved"][0]["message"], issuance
+
+
+# --------------------------------------------------------------------------
+# 只引单元格、没有口径卡：契约不用写 metrics_from
+#
+# 问数据的典型图是 input → 取数 → 报告 → 出口，报告直接引用查过的单元格。受管级别在契约里
+# 写 cells: true 就够了（用户拍板的第 5 条），以前校验和门禁无条件要 metrics_from，
+# 这张图怎么都发不成受管，Copilot 补上契约也会被判「冒出新的问题」作废
+# --------------------------------------------------------------------------
+
+
+def cells_only(**contract):
+    contract = {"report_from": "write", "strict": True, "cells": True, **contract}
+    nodes = [
+        node("start", "input"),
+        node("fetch", "tool", tool="db_query__shop",
+             args={"sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS orders FROM orders"}),
+        node("write", "report", instructions="写周报", numbers="strict", on_violation="fail",
+             claims="require_citation"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}], contract=contract),
+    ]
+    return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+
+
+def contract_codes(graph: dict, level: str = "governed") -> tuple[list[str], list[str]]:
+    from app.engine.governance import lint_for_publish
+    from app.engine.schema import GraphSpec, validate_graph
+
+    spec = GraphSpec.model_validate(graph)
+    return ([i.code for i in validate_graph(spec).issues if i.level == "error"],
+            [i.code for i in lint_for_publish(spec, level=level).issues if i.level == "error"])
+
+
+def test_a_cells_only_contract_needs_no_metrics_from():
+    validate, gate = contract_codes(cells_only())
+    assert validate == [], validate
+    assert gate == [], gate                 # 受管门禁整张图一条 error 都没有
+
+
+def test_a_cited_contract_that_lists_required_metrics_still_needs_metrics_from():
+    validate, gate = contract_codes(cells_only(required=["gmv"]))
+    assert "contract.metrics_from_missing" in validate and "contract.metrics_from_missing" in gate
+    validate, gate = contract_codes(cells_only(expected=["gmv"]))
+    assert "contract.metrics_from_missing" in validate and "contract.metrics_from_missing" in gate
+
+
+def test_a_narrative_contract_still_needs_metrics_from():
+    graph = cells_only(report_from=None, narrative="{{ nodes.write.text }}")
+    graph["nodes"][-1]["data"]["config"]["contract"].pop("report_from")
+    validate, _ = contract_codes(graph, level="published")     # 受管级别不收 narrative，只看校验
+    assert "contract.metrics_from_missing" in validate
+
+
+async def test_a_governed_formal_run_over_cells_only_issues_formally(client, monkeypatch):
+    Writer(monkeypatch, text="本周销售额 [[v:Q1.r0.gmv]]。")
+    row = await formal(client, cells_only(), status="governed")
+    assert row.status == "succeeded", row.error
+    issuance = row.output["_issuance"]
+    assert issuance["mode"] == "citations" and issuance["tier"] == "formal", issuance
+    assert issuance["unresolved"] == [] and issuance["gaps"] == [], issuance
+    [cell] = [m for m in issuance["matched"] if m.get("cell")]
+    assert cell["cell"] == "Q1.r0.gmv" and cell["token"] == "300.5"
+
+
+def test_a_graph_with_a_caliber_card_still_needs_required_even_without_metrics_from():
+    graph = weekly(cells=True)
+    contract = graph["nodes"][-1]["data"]["config"]["contract"]
+    contract.pop("metrics_from"), contract.pop("required")
+    validate, gate = contract_codes(graph)
+    assert "contract.required_missing" in gate, gate       # 不写 metrics_from 绕不过必需指标
+    assert validate == [], validate

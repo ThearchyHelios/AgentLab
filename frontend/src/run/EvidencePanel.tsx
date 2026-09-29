@@ -3,22 +3,25 @@ import {
   type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowLeft, CornerDownRight, ListChecks, ShieldCheck, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { ArrowLeft, CornerDownRight, ListChecks, Scale, ShieldCheck, X } from 'lucide-react'
 import clsx from 'clsx'
-import { StatusBadge, isComposing } from '../components/ui'
+import { ApiError } from '../api/client'
+import { Spinner, StatusBadge, isComposing } from '../components/ui'
 import {
   EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, closestNames, docForeign, entitySources,
-  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, locatable, locatorText, notableInput,
-  queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, sealVerdict, segName, segmentKind, segmentState, sourceOf,
-  type SealStatus, type SourceTone,
+  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged, judgeable, limitOf,
+  locatable, locatorText, notableInput, queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, rewriteOf, sealVerdict,
+  segName, segmentKind, segmentState, sourceOf, unitText, unitVerdict, verdictState, type SealStatus, type SourceTone,
 } from '../lib/evidence'
+import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
-import { segmentKey, useEvidence } from '../store/evidence'
+import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  EvidenceDocData, EvidenceInput, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceStep, EvidenceUnit,
-  EvidenceViolation,
+  EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment,
+  EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { useEvidenceHost } from './evidenceHost'
@@ -46,21 +49,27 @@ import { CopyChip } from './Markdown'
  * 名字给出最接近的已知名字），逐字引文（原文所在的文档和片段，引文在原文里的位置高亮）。
  * 画布右栏里点开片段时，把证据路径交给画布（evidenceHost），节点名点一下就对准那个节点。
  *
+ * 四期多了「模型的解释」：只对结论句显示——裁判模型的判定、理由（斜体）、带「模型判断 · 模型名 · 非确定」
+ * 的徽标，封存之后按需追加的另写「封存后追加」。探索运行里还没判过的句子给「请模型判断这句」；到了上限
+ * 写明是哪个上限、到哪里调。点句末徽标打开的是整句（kind: 'unit'）：句子、模型的解释、挂的依据、封存。
+ *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
  * 都不是模态的：开着面板照样能在正文里走。
  */
 
 export type PanelMode = 'side' | 'drawer' | 'inline' | 'dock'
-export type PanelView = { kind: 'seg'; id: string } | { kind: 'violations' }
+export type PanelView = { kind: 'seg'; id: string } | { kind: 'unit'; id: string } | { kind: 'violations' }
 
-export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, onLocate, onViolations }: {
+export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, view, onClose, onLocate, onViolations }: {
   id: string
   mode: PanelMode
   doc: EvidenceDocData
   /** 正文这份文档的工件 id：和证据接口报的封存文档比对，不是同一份就不信接口给的链 */
   artifact?: string
   runId?: string
+  /** 运行类别：没开裁判的文档靠它认探索运行（「请模型判断这句」只在探索运行里有） */
+  runClass?: string
   view: PanelView
   onClose: () => void
   /** 跳到正文里的某个片段（违规清单里的「定位」） */
@@ -69,7 +78,11 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
 }) {
   const titleId = `${id}-title`
   const found = useMemo(() => (view.kind === 'seg' ? findSeg(doc, view.id) : null), [doc, view])
-  const state = found ? segmentState(found.seg) : null
+  const claimAt = useMemo(() => (view.kind === 'unit' ? findUnit(doc, view.id) : null), [doc, view])
+  const overlay = useVerdicts(runId, doc.node_id || undefined)
+  const claimVerdict = claimAt ? unitVerdict(claimAt.unit, overlay) : undefined
+  const claimState = verdictState(claimVerdict)
+  const state = found ? segmentState(found.seg) : claimState
   const meta = state ? EVIDENCE_STATE[state] : null
 
   const onKeyDown = (e: ReactKeyboardEvent) => {
@@ -81,7 +94,8 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
   }
 
   const title = view.kind === 'violations' ? EVIDENCE_TEXT.violations
-    : found ? segName(found.seg) : EVIDENCE_TEXT.panelTitle
+    : found ? segName(found.seg)
+    : claimAt ? unitText(claimAt.unit).trim() || JUDGE_TEXT.claim : EVIDENCE_TEXT.panelTitle
   // 有出处的实体、引文：徽标写得更具体（「有出处 · 逐字引文」），颜色和字形照同一套
   const kind = found && state === 'deterministic' ? segmentKind(found.seg) : null
   const badge = kind ? { ...meta!, label: EVIDENCE_KIND_STYLE[kind].label, glyph: EVIDENCE_KIND_STYLE[kind].glyph } : meta
@@ -110,7 +124,10 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
           </button>
         )}
         {badge && (
-          <span className="chip shrink-0" style={{ color: badge.color, borderColor: badge.color }} data-ev-badge={badge.code}>
+          // 概率性的判定（结论句）用虚线框：和系统核对过的「有出处」连框线都不一样
+          <span className="chip shrink-0"
+                style={{ color: badge.color, borderColor: badge.color, borderStyle: badge.line === 'badge' ? 'dashed' : undefined }}
+                data-ev-badge={badge.code}>
             {badge.glyph && <span aria-hidden>{badge.glyph}</span>}{badge.label}
           </span>
         )}
@@ -129,20 +146,31 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
         {view.kind === 'violations'
           ? <ViolationList doc={doc} onLocate={onLocate} />
           : found
-            ? <SegmentBody panelId={id} doc={doc} artifact={artifact} runId={runId} seg={found.seg} unit={found.unit}
-                           onViolations={onViolations} />
-            : <p className="text-dim">{NONE}</p>}
+            ? <SegmentBody panelId={id} doc={doc} artifact={artifact} runId={runId} runClass={runClass} seg={found.seg}
+                           unit={found.unit} block={found.block} onViolations={onViolations} />
+            : claimAt
+              ? <ClaimBody doc={doc} artifact={artifact} runId={runId} runClass={runClass} unit={claimAt.unit}
+                           block={claimAt.block} />
+              : <p className="text-dim">{NONE}</p>}
       </div>
     </section>
   )
 }
 
-function findSeg(doc: EvidenceDocData, id: string): { seg: EvidenceSegment; unit: EvidenceUnit } | null {
+function findSeg(doc: EvidenceDocData, id: string): { seg: EvidenceSegment; unit: EvidenceUnit; block: EvidenceBlock } | null {
   for (const block of doc.blocks ?? []) {
     for (const unit of block.units ?? []) {
       const seg = (unit.segments ?? []).find((s) => s.id === id)
-      if (seg) return { seg, unit }
+      if (seg) return { seg, unit, block }
     }
+  }
+  return null
+}
+
+function findUnit(doc: EvidenceDocData, id: string): { unit: EvidenceUnit; block: EvidenceBlock } | null {
+  for (const block of doc.blocks ?? []) {
+    const unit = (block.units ?? []).find((u) => u.id === id)
+    if (unit) return { unit, block }
   }
   return null
 }
@@ -163,9 +191,10 @@ function flashOnce(el: HTMLElement) {
   setTimeout(() => { if (el.dataset.flash === 'focus') delete el.dataset.flash }, 1600)
 }
 
-function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }: {
+function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block, onViolations }: {
   panelId: string
-  doc: EvidenceDocData; artifact?: string; runId?: string; seg: EvidenceSegment; unit: EvidenceUnit
+  doc: EvidenceDocData; artifact?: string; runId?: string; runClass?: string; seg: EvidenceSegment; unit: EvidenceUnit
+  block: EvidenceBlock
   onViolations: () => void
 }) {
   const report = doc.node_id || undefined
@@ -191,6 +220,7 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
   const inGraph = graphDoc(graphData, artifact)
   const docIssue: 'foreign' | 'tampered' | null = foreign || inGraph === 'foreign' ? 'foreign'
     : inGraph === 'tampered' ? 'tampered' : null
+  useLateVerdict(runId, report, docIssue ? undefined : detail?.unit, unit.id)
 
   const state = segmentState(seg)
   const cite = seg.cite
@@ -355,6 +385,9 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
         <p className="text-dim">{sourceOf(seg, doc) || detail?.note}</p>
       )}
 
+      <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
+                 onDemand={detail?.unit?.on_demand} pending={pending} />
+
       {host.onNode && (trace.producers.length > 0 || trace.consumers.length > 0) && (
         // 画布右栏：这段证据经过的节点，点一下在画布上选中并对准
         <Part title="画布上的节点" data-ev-nodes="">
@@ -384,6 +417,271 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
       )}
     </>
   )
+}
+
+/**
+ * 片段接口答的这一句带着封存之后追加的判定（后端按最新的 evidence.judged 叠上的）：记进缓存，正文的句末
+ * 徽标、横幅的计数跟着变。接口答的是另一份报告时调用方不传 unit
+ */
+function useLateVerdict(runId: string | undefined, report: string | undefined,
+  answered: { id?: string; verdict?: EvidenceVerdict } | undefined, unitId: string) {
+  const noteVerdicts = useEvidence((s) => s.noteVerdicts)
+  const late = answered?.verdict?.post_seal && (!answered.id || answered.id === unitId) ? answered.verdict : undefined
+  const sig = late ? JSON.stringify(late) : ''
+  useEffect(() => {
+    if (runId && late) noteVerdicts(runId, report, { [unitId]: late })
+    // 按内容比：同一条判定不重记
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, report, unitId, sig, noteVerdicts])
+}
+
+/**
+ * 点句末徽标打开的整句：句子、模型的解释、挂的依据、封存。封存状态和叠上的判定借这句第一个片段的
+ * 片段接口取（接口答的是另一份报告时一概不用）
+ */
+function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
+  doc: EvidenceDocData; artifact?: string; runId?: string; runClass?: string; unit: EvidenceUnit; block: EvidenceBlock
+}) {
+  const report = doc.node_id || undefined
+  const first = (unit.segments ?? []).find((s) => s.kind !== 'structural')
+  const key = runId && first ? segmentKey(runId, first.id, report) : ''
+  const slot = useEvidence((s) => (key ? s.segments[key] : undefined))
+  const loadSegment = useEvidence((s) => s.loadSegment)
+  useEffect(() => {
+    if (runId && first) void loadSegment(runId, first.id, report)
+  }, [runId, first, report, loadSegment])
+  const answered = slot?.status === 'ok' ? slot.data : undefined
+  const foreign = first ? docForeign(answered, { artifact, node: report, seg: first }) : null
+  useLateVerdict(runId, report, foreign ? undefined : answered?.unit, unit.id)
+  const overlay = useVerdicts(runId, report)
+  const verdict = unitVerdict(unit, overlay)
+  const seal = foreign ? undefined : answered?.seal
+  const late = !!verdict?.post_seal
+  const sealed = sealVerdict(seal, {
+    foreign: !!foreign, pending: !!runId && !seal && slot?.status === 'loading', noRun: !runId, docOnly: true,
+  })
+  // 一整句没有「这一段的证据」可言：封存核对通过时只说报告文档封存了，节点里当场判的判定跟着一起封存
+  const sealLabel = sealed.status !== 'done' ? sealed.label
+    : verdict && !late && isJudged(verdict) ? JUDGE_TEXT.sealedWithDoc : JUDGE_TEXT.sealedDoc
+  const cites = (unit.cites ?? []).map((alias) => ({ alias, label: doc.catalog?.[alias]?.label as string | undefined }))
+  return (
+    <>
+      {foreign && (
+        <IntegrityList code="doc" items={[EVIDENCE_TEXT.integrity.doc,
+          ...(foreign.sealedText != null ? [EVIDENCE_TEXT.integrity.sealedText(foreign.sealedText)] : [])]} />
+      )}
+      <Part title={JUDGE_TEXT.claim} data-ev-sentence="">
+        <Sentence unit={unit} active="" />
+      </Part>
+      <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
+                 onDemand={foreign ? undefined : answered?.unit?.on_demand}
+                 pending={!!runId && !!first && (!slot || slot.status === 'loading')} />
+      <Part title={JUDGE_TEXT.cites} data-ev-cites="">
+        {cites.length ? (
+          <ul className="space-y-0.5">
+            {cites.map((c) => (
+              <li key={c.alias} className="flex min-w-0 items-baseline gap-1.5">
+                <span className="mono shrink-0 font-medium">{c.alias}</span>
+                {c.label && <span className="min-w-0 truncate text-dim" title={c.label}>{c.label}</span>}
+              </li>
+            ))}
+          </ul>
+        ) : <p className="text-dim">{JUDGE_TEXT.noCites}</p>}
+      </Part>
+      <Part title={EVIDENCE_TEXT.seal} data-ev-seal="">
+        <SealLine status={sealed.status} label={sealLabel} />
+        {late && (
+          // 封存后追加的判定：报告文档封存着，这条判断不在封存范围里——两件事分开说
+          <p className="mt-1 flex items-center gap-1.5" data-ev-seal-late="">
+            <StatusBadge status="waiting" size={12} decorative animate={false} />
+            <span>{JUDGE_TEXT.postSeal}：{JUDGE_TEXT.postSealHint}</span>
+          </p>
+        )}
+      </Part>
+    </>
+  )
+}
+
+/**
+ * 模型的解释：只对结论句。判定、理由（斜体）、「模型判断 · 模型名 · 非确定」的徽标，封存之后按需追加的
+ * 另写「封存后追加」；到上限没判的写明哪个上限、到哪里调；改写过一次的写明原句。探索运行里还没判过的
+ * （没有判定、未裁判）给「请模型判断这句」。什么都说不上的（正式运行、没开裁判的文档）不画这一节
+ */
+function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
+  doc: EvidenceDocData; unit: EvidenceUnit; block: EvidenceBlock; runId?: string; runClass?: string
+  /**
+   * 片段接口答的「这句能不能请模型判断」：有它就照它（运行还没跑完封存、封存被改过这些前端认不出来）；
+   * 老后端没有时按运行类别和文档自己认
+   */
+  onDemand?: EvidenceOnDemand
+  /** 片段接口还在取：先不按运行类别另取一次 */
+  pending?: boolean
+}) {
+  const report = doc.node_id || undefined
+  const overlay = useVerdicts(runId, report)
+  const verdict = unitVerdict(unit, overlay)
+  const eligible = judgeable(unit, block)
+  const known = onDemand && typeof onDemand.available === 'boolean' ? onDemand : undefined
+  const explore = useExplore(doc, runId, runClass, eligible && !isJudged(verdict) && !known && !pending)
+  const ask = useEvidence((s) => (runId ? s.asks[askKey(runId, report, unit.id)] : undefined))
+  const judge = useEvidence((s) => s.judge)
+  const state = verdictState(verdict)
+  const meta = state ? EVIDENCE_STATE[state] : null
+  const limit = limitOf(verdict)
+  const late = !!verdict?.post_seal
+  const rewrite = rewriteOf(doc, unit.id)
+  const judgeDoc = !!doc.judge
+  const canAsk = !!runId && !isJudged(verdict) && (known ? !!known.available : eligible && explore === true)
+  // 探索运行里暂时判不了（还没跑完封存、封存被改过、升级前的运行）：照接口的原话说为什么没有按钮
+  const blocked = known && !known.available && BLOCKED.has(known.reason ?? '') ? known.message || '' : ''
+  // 这一次按需裁判的答复里没有这一句的判定：接口说了为什么（跳过了、触顶）就照说
+  const res = ask?.status === 'ok' ? ask.data : undefined
+  const skipped = res?.skipped?.[unit.id]
+  const resLimit = !verdict || verdict.status !== 'unjudged' ? null
+    : (Array.isArray(res?.limits_hit) && res.limits_hit.find((l) => typeof l === 'string')) || null
+  const shownLimit = limit ?? resLimit
+  const judged = isJudged(verdict)
+  // 这一次答复的那句话（message）：判定之外接口还想说的，照原话写出来。最要紧的是「运行已经接着跑了，这次的
+  // 判定没有记进运行记录」——判定照样交回来、也标着封存后追加，只看徽标会以为它记进去了。已经由别处说过的不重复：
+  // 跳过的那一行就是它、上限的那一框说的就是它、和判定里写的理由一字不差
+  const resMessage = typeof res?.message === 'string' ? res.message.trim() : ''
+  const showMessage = !!resMessage && !(skipped && !judged) && !(shownLimit && resMessage.startsWith(JUDGE_TEXT.limit))
+    && resMessage !== verdict?.rationale
+  // 只对结论句：表格单元格、代码、标题不是一句话，开了裁判的文档里也不画这一节
+  const show = !!verdict || (judgeDoc && eligible) || canAsk || !!blocked || ask?.status === 'error' || showMessage
+  if (!show) return null
+  const asking = ask?.status === 'loading'
+  const how = shownLimit ? JUDGE_TEXT.limitHow[late || explore ? 'click' : 'report'][shownLimit] : ''
+  return (
+    <Part title={JUDGE_TEXT.section} data-ev-judge={verdict?.status ?? 'none'}>
+      {verdict && judged && (
+        // 「模型判断 · 模型名 · 非确定」只挂在模型真判过的句子上：到上限、没跑成的未裁判也记着裁判模型，
+        // 但模型没看过这句，挂上这枚徽标就像它判过一样
+        <div className="mb-1 flex flex-wrap items-center gap-1">
+          <span className="chip max-w-full truncate" data-ev-judge-badge=""
+                style={{ color: 'var(--st-running)', borderColor: 'var(--st-running)', borderStyle: 'dashed' }}
+                title={late ? JUDGE_TEXT.postSealHint : JUDGE_TEXT.sealedHint}>
+            <Scale size={10} aria-hidden /> {JUDGE_TEXT.badge(verdict.judge)}
+          </span>
+          {late && (
+            <span className="chip" data-ev-post-seal="" style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)', borderStyle: 'dashed' }}
+                  title={JUDGE_TEXT.postSealHint}>
+              {JUDGE_TEXT.postSeal}
+            </span>
+          )}
+        </div>
+      )}
+      {verdict && (
+        <p className="font-medium" style={{ color: meta?.color ?? 'var(--text-dim)' }} data-ev-verdict={verdict.status}>
+          {meta?.glyph && <span aria-hidden className="mr-1">{meta.glyph}</span>}
+          {meta ? meta.label : JUDGE_TEXT.notClaim}
+        </p>
+      )}
+      {showMessage && (
+        <p className="mb-1 mt-0.5 text-2xs leading-relaxed" role="note" style={{ color: 'var(--st-waiting)' }} data-ev-judge-message="">
+          {resMessage}
+        </p>
+      )}
+      {verdict && !judged && verdict.judge && (
+        // 没判的句子只中性地说一句裁判模型是谁（到上限时知道是哪个模型的价钱、哪个模型没跑成）
+        <p className="mt-0.5 text-2xs text-faint" data-ev-judge-model="">{JUDGE_TEXT.notJudgedBy(verdict.judge)}</p>
+      )}
+      {verdict?.rationale && !shownLimit && (
+        // 理由是模型写的话：斜体，和系统给的说明分开
+        <p className="mt-0.5 italic text-dim" data-ev-rationale=""><em>{verdict.rationale}</em></p>
+      )}
+      {shownLimit && (
+        <div className="mt-1 rounded border px-2 py-1" role="note" data-ev-judge-limit={shownLimit}
+             style={{ borderColor: 'var(--st-waiting)', background: 'var(--st-waiting-soft)' }}>
+          <p><span className="font-medium" style={{ color: 'var(--st-waiting)' }}>{JUDGE_TEXT.limit}</span>
+            {limitWords(verdict?.rationale) ? `：${limitWords(verdict?.rationale)}` : ''}</p>
+          {how && (
+            <p className="mt-0.5 text-2xs text-dim" data-ev-judge-how="">
+              {how}
+              {how.startsWith('到「设置') && (
+                <> <Link to="/settings/prefs" className="text-[var(--accent)] underline-offset-2 hover:underline" data-ev-judge-settings="">去设置</Link></>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+      {verdict?.status === 'unjudged' && !shownLimit && verdict.reason !== 'on_demand' && verdict.rationale && (
+        <p className="mt-0.5 text-dim" data-ev-judge-why="">{verdict.rationale}</p>
+      )}
+      {!!verdict?.used?.length && judged && (
+        <p className="mono mt-0.5 text-2xs text-faint" data-ev-used="">{JUDGE_TEXT.used(verdict.used)}</p>
+      )}
+      {!verdict && judgeDoc && eligible && !canAsk && (
+        // 开了裁判的文档里没有判定的结论句：预筛放掉的照实说；探索运行里暂时判不了的由上面 blocked 说
+        <p className="text-dim" data-ev-judge-screened="">
+          {doc.judge?.screened?.includes(unit.id) || explore !== false ? JUDGE_TEXT.screened : JUDGE_TEXT.formalOnly}
+        </p>
+      )}
+      {rewrite?.kind === 'changed' && (
+        <div className="mt-1 text-2xs" data-ev-rewritten="">
+          <p style={{ color: 'var(--st-waiting)' }}>{JUDGE_TEXT.rewritten}</p>
+          {rewrite.sentences.length > 0 && (
+            <p className="mt-0.5 text-dim">{JUDGE_TEXT.rewriteFrom}：{rewrite.sentences.map((t) => `「${t}」`).join('')}</p>
+          )}
+        </div>
+      )}
+      {rewrite?.kind === 'rejected' && (
+        <p className="mt-1 text-2xs" style={{ color: 'var(--st-waiting)' }} data-ev-rewrite-rejected="">
+          {JUDGE_TEXT.rewriteRejected(rewrite.reason)}
+        </p>
+      )}
+      {verdict && !late && judged && (
+        // 封存后追加的那句说明放在「封存」一节（它说的是封存）；节点里当场判的在这里说一句随报告封存
+        <p className="mt-1 text-2xs text-faint" data-ev-judge-sealed="">{JUDGE_TEXT.sealedHint}</p>
+      )}
+      {skipped && !judged && (
+        <p className="mt-1 text-2xs text-dim" data-ev-judge-skipped={skipped}>
+          {res?.message || (skipped === 'not_a_claim' ? JUDGE_TEXT.notClaim : JUDGE_TEXT.notFound)}
+        </p>
+      )}
+      {blocked && !canAsk && (
+        <p className="mt-1 text-2xs text-dim" data-ev-judge-blocked={known?.reason ?? ''}>{blocked}</p>
+      )}
+      {ask?.status === 'error' && (
+        <p className="mt-1 text-2xs" style={{ color: 'var(--st-failed)' }} role="alert" data-ev-judge-error="">
+          {askError(ask.error)}
+        </p>
+      )}
+      {canAsk && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+          {!verdict || verdict.reason === 'on_demand' ? <span className="text-dim">{JUDGE_TEXT.notAsked}</span> : null}
+          <button type="button" className="btn btn-xs" data-ev-judge-ask="" disabled={asking} aria-busy={asking || undefined}
+                  onClick={() => { if (runId) void judge(runId, report, [unit.id]) }}>
+            {asking ? <Spinner size={10} /> : <Scale size={11} aria-hidden />}
+            {asking ? JUDGE_TEXT.asking : verdict && verdict.reason !== 'on_demand' ? JUDGE_TEXT.askAgain : JUDGE_TEXT.ask}
+          </button>
+          <span className="basis-full text-2xs text-faint">{JUDGE_TEXT.askHint}</span>
+        </div>
+      )}
+    </Part>
+  )
+}
+
+/** 「已到上限（这份报告的裁判金额上限 $0.05），这句没判」→「这份报告的裁判金额上限 $0.05，这句没判」 */
+function limitWords(rationale: string | undefined): string {
+  if (!rationale) return ''
+  const m = /^已到上限（(.+?)）[，,]?\s*(.*)$/.exec(rationale)
+  return m ? [m[1], m[2]].filter(Boolean).join('，') : rationale.replace(/^已到上限[：:]?/, '')
+}
+
+/** 接口说这句暂时判不了、值得告诉人为什么的几种（正式运行、判过了、不是结论句不用说） */
+const BLOCKED = new Set(['unsealed', 'seal_broken', 'legacy'])
+
+/**
+ * 按需裁判没成：409 是这次运行不让判（正式运行、还没跑完封存、封存被改过），照后端的原话；老后端没有这个
+ * 接口另有说法；其余按通用的错误说法
+ */
+function askError(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 409) return error.message || JUDGE_TEXT.formalOnly
+    if ((error.status === 404 || error.status === 405) && !error.code) return JUDGE_TEXT.oldBackend
+  }
+  return JUDGE_TEXT.failed(humanizeError(error).title)
 }
 
 type InputLink = { index: number; alias: string; go: () => void } | undefined

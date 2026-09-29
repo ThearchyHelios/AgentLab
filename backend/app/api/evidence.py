@@ -20,23 +20,30 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 查询步骤只给被引用的行和前后各 2 行，完整快照仍走 /api/artifacts/{id}。数据源
 options.mask_columns 里的列换成「已遮罩」——在有身份体系之前，这只减少暴露，不是
 安全边界：知道工件 id 的人照样能取到整份快照。
+
+结论句的判定（四期）是模型给的，不是证据：正式运行的判定在报告文档里、随文档封存；探索运行
+按需裁判（POST …/evidence/judge），判定作为 evidence.judged 事件追加在封存之后，只填补没判过的
+句子。交给裁判的摘录同样只取封存范围内的工件。
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api.coded import CodedHTTPException
 from app.core.artifact_store import load
+from app.core.events import EventType
 from app.data.engine import masked_columns
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
@@ -54,6 +61,7 @@ from app.engine.evidence import (
     guess_sources,
     input_eid,
     iter_units,
+    ledger_enabled,
     make_eid,
     normalize_quote,
     query_entry_fields,
@@ -61,6 +69,7 @@ from app.engine.evidence import (
     sql_tables,
     uncited_claims,
 )
+from app.engine.judge import JUDGED, VERDICTS, candidates
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -120,8 +129,17 @@ class _Sealed:
     retrievals: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存时记下的清单哈希（没封存的是 None）：旧答案的猜测按 (run_id, 它) 缓存
     manifest_hash: str | None = None
+    #: 运行记录上的 manifest_seq 原值（老运行是 None）：按需裁判追加判定前核对封存没换过
+    run_manifest_seq: int | None = None
     #: verify_manifest 的完整结论（审计表照实附上）
     verdict: dict[str, Any] = field(default_factory=dict)
+    #: 运行记录上的几样：按需裁判只给跑完、封存了的探索运行，升级前发起的不给
+    run_class: str | None = None
+    status: str | None = None
+    ledger_on: bool = False
+    #: 按需裁判的判定（evidence.judged 事件），按先后：(seq, 节点, 载荷)。不管落在封存前后都收——
+    #: 失败后接着跑的运行会把早先追加的判定封进新的清单里，它仍然是按需裁判的批注
+    judged: list[tuple[int, str | None, dict[str, Any]]] = field(default_factory=list)
 
     @property
     def sealed(self) -> bool:
@@ -161,14 +179,18 @@ async def _sealed(run_id: str) -> _Sealed:
             select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
             .where(RunEvent.run_id == run_id).order_by(RunEvent.seq))]
         graph = run.graph if isinstance(run.graph, dict) else {}
-        manifest = run.manifest_hash
+        manifest, manifest_seq = run.manifest_hash, run.manifest_seq
+        run_class, status, ledger_on = run.run_class, run.status, ledger_enabled(run)
     verdict = await verify_manifest(run_id)
     bound = verdict.get("sealed_at") if verdict.get("sealed") else None
     # 没封存（还在跑、停在审批）的运行没有「封存之后」：现有的事件都算，但每件证据都标未封存
     events = [r for r in rows if bound is None or r[0] <= bound]
     out = _Sealed(run_id=run_id, graph=graph, events=events, seal={
         "sealed": bool(verdict.get("sealed")), "ok": verdict.get("ok"), "manifest_seq": bound,
-        "legacy": bool(verdict.get("legacy", False))}, manifest_hash=manifest, verdict=verdict)
+        "legacy": bool(verdict.get("legacy", False))}, manifest_hash=manifest, run_manifest_seq=manifest_seq,
+        verdict=verdict, run_class=run_class, status=status, ledger_on=ledger_on,
+        judged=[(seq, nid, data) for seq, etype, nid, data in rows
+                if etype == EventType.EVIDENCE_JUDGED and isinstance(data, dict)])
     for _, etype, node_id, data in events:
         if not node_id or not isinstance(data, dict):
             continue
@@ -306,6 +328,7 @@ async def evidence_graph(run_id: str) -> dict[str, Any]:
             "node_id": report.node_id, "doc_artifact": report.doc_artifact,
             "doc_sealed": sealed.trusted, "hash_ok": report.hash_ok, "ok": report.ok,
             "repairs": report.repairs, "fields": report.fields, "stats": report.stats,
+            **_judgement_of(report, sealed),
         })
         if report.doc is not None:
             evidence, edges = _graph_of(report, sealed, inputs)
@@ -666,13 +689,16 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     chain = await _chain(seg, doc, sealed, chosen.node_id)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
     masked = list(dict.fromkeys(c for step in chain if step.get("step") == "query" for c in step.get("masked") or []))
+    verdict = _effective_verdicts(chosen, sealed)[0].get(str(unit.get("id")))
     return {
         "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact},
         "segment": {"id": seg["id"], "text": seg.get("text"), "kind": seg.get("kind"), "state": seg.get("state"),
                     "span": seg.get("span"), "unit": unit.get("id"),
                     **{k: seg[k] for k in ("ref", "issue", "strong", "cite") if k in seg}},
         "unit": {"id": unit.get("id"), "kind": unit.get("kind"), "text": markdown[start:end],
-                 "span": unit.get("span"), "cites": unit.get("cites") or []},
+                 "span": unit.get("span"), "cites": unit.get("cites") or [],
+                 **({"verdict": verdict} if verdict is not None else {}),
+                 "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict)},
         "block": {"id": block.get("id"), "type": block.get("type")},
         "chain": chain,
         "note": _note(seg, unit),
@@ -1151,8 +1177,304 @@ def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
     cites = [str(c) for c in unit.get("cites") or []]
     if cites:
         return (f"这是结论句里的文字，这句挂了依据：{'、'.join(cites[:4])}{' 等' if len(cites) > 4 else ''}。"
-                "依据支不支持这句话，要到后续版本由模型判断")
-    return "这是结论句里的文字，这句没有挂依据。句子本身有没有依据要到后续版本由模型判断"
+                "依据支不支持这句话，系统核对不了，只能由模型判断（模型的判断不是确定性的）")
+    return "这是结论句里的文字，这句没有挂依据。句子本身有没有依据，系统核对不了，只能由模型判断（模型的判断不是确定性的）"
+
+
+# --------------------------------------------------------------------------
+# 结论句的判定：封存内的（正式运行在节点里判的）和封存之后按需追加的
+# --------------------------------------------------------------------------
+
+JUDGE_FORMAL = "evidence_judge_formal"
+JUDGE_UNSEALED = "evidence_judge_unsealed"
+JUDGE_LEGACY = "evidence_judge_legacy"
+JUDGE_BAD_UNITS = "evidence_judge_bad_units"
+SEAL_BROKEN_CODE = "evidence_seal_broken"
+#: 一次最多点名几句。一份报告通常几十句，再多就是请求写错了
+JUDGE_MAX_UNITS = 200
+#: 跑完了的几种终态。还在跑、停在审批、正在接着跑的运行，追加的判定会被封进下一次的清单，不判
+_TERMINAL = ("succeeded", "failed", "cancelled")
+
+FORMAL_JUDGED = "正式运行的裁判在节点内完成（claims: judge），判定随报告文档一起封存，不能再按需裁判"
+UNSEALED_JUDGE = "运行还没跑完封存（还在跑、停在人工审批，或者正在接着跑），跑完再请模型判断"
+LEGACY_JUDGE = "这次运行发起于证据台账上线之前，不支持按需裁判"
+BROKEN_JUDGE = "封存核对没通过：封存之后有事件被改过、删过或插过，报告和证据都不能再当真，不再请模型判断"
+JUDGED_ALREADY = "这句已经判过了"
+#: 裁判期间运行被接着跑了（失败的运行可以继续），或者接着跑完重新封存了：判定照样交回，不记进运行记录
+NOT_RECORDED = "运行已经接着跑了，这次的判定没有记进运行记录（只在这里看得到，刷新就没了）；等它跑完封存，再请模型判断"
+NOT_A_CLAIM = "不是结论句（标题、连接性的话、表格单元格、代码），不需要模型判断"
+BAD_UNITS = f'units 要写成句子编号的列表，比如 {{"units": ["u4"]}}，一次最多 {JUDGE_MAX_UNITS} 句；report 要写报告节点的 id'
+#: 触顶时告诉人怎么调：设置页「证据裁判」一组的各项上限都能调高，也都能设成不限
+JUDGE_ADJUST = {
+    "max_cost_usd": "到设置 → 证据裁判里调高「每次点击」的金额上限，或者设成不限",
+    "daily_max_usd": "今天的裁判花费到了全局每日上限：到设置 → 证据裁判里调高「每日」上限或者设成不限，也可以明天再判",
+    "max_claims": "一次最多判这么多句：分几次点，或者到设置 → 证据裁判里调高「每份报告的句数」"
+                  "（报告节点上写了 judge.max_claims 的按节点，写 null 是不限）",
+    "timeout_s": "裁判超时了：到设置 → 证据裁判里调高「时长」上限或者设成不限，再点一次",
+}
+
+
+def _verdict_ok(verdict: Any) -> bool:
+    return isinstance(verdict, dict) and verdict.get("status") in VERDICTS
+
+
+def _effective_verdicts(report: _Report, sealed: _Sealed
+                        ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """这份报告每句的判定：(生效的, 其中封存之后按需追加的)。
+
+    文档里的判定随文档封存（正式运行在节点里判的；探索运行的候选句记「未裁判 · 按需」）。按需裁判的判定在
+    evidence.judged 事件里，只认指向这份文档、文档里确有其句的；它只填补没判过的句子——封存内判过的，后面
+    追加什么都盖不掉，一条追加的事件改写不了封存的结论。同一句按需判过几次（先触顶、后判成），判成的为准，
+    其次取最后一次。追加的判定一律标 post_seal。
+    """
+    doc = report.doc or {}
+    ids = {str(u.get("id")) for _, u in iter_units(doc)}
+    out = {str(u.get("id")): u["verdict"] for _, u in iter_units(doc) if _verdict_ok(u.get("verdict"))}
+    sealed_judged = {uid for uid, v in out.items() if v.get("status") in JUDGED}
+    later: dict[str, dict[str, Any]] = {}
+    for _, _, data in sealed.judged:
+        if data.get("report") != report.node_id or data.get("doc_artifact") != report.doc_artifact:
+            continue
+        verdicts = data.get("verdicts") if isinstance(data.get("verdicts"), dict) else {}
+        for uid, verdict in verdicts.items():
+            uid = str(uid)
+            if uid not in ids or uid in sealed_judged or not _verdict_ok(verdict):
+                continue
+            if later.get(uid, {}).get("status") in JUDGED and verdict.get("status") not in JUDGED:
+                continue
+            later[uid] = out[uid] = {**verdict, "post_seal": True}
+    return out, later
+
+
+def _judgement_of(report: _Report, sealed: _Sealed) -> dict[str, Any]:
+    """证据图、审计表里每份报告带的结论句情况：写作时的策略、封存的裁判摘要、封存之后按需追加的判定。"""
+    doc = report.doc or {}
+    return {"claims": report.claims, "judge": doc.get("judge") if isinstance(doc.get("judge"), dict) else None,
+            "post_seal_verdicts": _effective_verdicts(report, sealed)[1] if report.doc is not None else {}}
+
+
+def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None) -> dict[str, Any]:
+    """这句能不能「请模型判断」：{available, reason, message}。和 POST …/evidence/judge 同一套条件。"""
+    def no(reason: str, message: str) -> dict[str, Any]:
+        return {"available": False, "reason": reason, "message": message}
+
+    if sealed.run_class == "formal":
+        return no("formal", FORMAL_JUDGED)
+    if not sealed.ledger_on:
+        return no("legacy", LEGACY_JUDGE)
+    if not candidates(doc, [uid]):
+        return no("not_a_claim", NOT_A_CLAIM)
+    if isinstance(verdict, dict) and verdict.get("status") in JUDGED:
+        return no("judged", JUDGED_ALREADY)
+    if not sealed.sealed or sealed.status not in _TERMINAL:
+        return no("unsealed", UNSEALED_JUDGE)
+    if not sealed.trusted:
+        return no("seal_broken", BROKEN_JUDGE)
+    return {"available": True, "reason": None, "message": None}
+
+
+def _sealed_loader(sealed: _Sealed) -> Callable[[str], Any]:
+    """给裁判取证据的 loader：只认封存范围内的事件交回过的工件（查询、表结构、检索快照和台账里记过的），
+    取回时照旧复验哈希。别的一律当取不到——人为插进工件表的行、封存之后才追加的事件引用的快照，
+    都不能送进裁判的摘录。报告文档里的目录也不例外：目录写着哪件工件，不等于它在封存链上。"""
+    allowed = {*sealed.queries, *sealed.schemas, *sealed.retrievals, *(str(a) for _, a in sealed.ledger)}
+
+    def loader(artifact: str) -> Any:
+        return load(artifact) if sealed.trusted and str(artifact) in allowed else None
+    return loader
+
+
+def _node_judge(sealed: _Sealed, node_id: str) -> dict[str, Any]:
+    """这次运行的图上报告节点写的 judge（裁判模型、句数和时长上限）；图读不出来就当没写。"""
+    from app.engine.nodes.report import report_judge
+    from app.engine.schema import GraphSpec
+
+    try:
+        spec = GraphSpec.model_validate(sealed.graph)
+        node = spec.node_map().get(node_id)
+    except Exception:  # noqa: BLE001 - 老运行的图可能已经不合现在的格式
+        node = None
+    return report_judge(spec, node) if node is not None else {}
+
+
+class _RunLocks:
+    """每次运行一把锁：同一次运行的按需裁判排队，连点两下时后一下看得到前一下记下的判定，不重复花钱。"""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._users: dict[str, int] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(self, key: str):  # type: ignore[no-untyped-def]
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._users[key] = self._users.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._users[key] -= 1
+            if not self._users[key]:
+                del self._users[key], self._locks[key]
+
+
+_JUDGING = _RunLocks()
+
+
+def _judge_request(payload: Any, report: str | None) -> tuple[list[str], str | None]:
+    if not isinstance(payload, dict):
+        raise CodedHTTPException(422, BAD_UNITS, JUDGE_BAD_UNITS)
+    units = payload.get("units")
+    wanted = report if payload.get("report") is None else payload["report"]
+    if not isinstance(units, list) or not units or len(units) > JUDGE_MAX_UNITS \
+            or not all(isinstance(u, str) and u.strip() for u in units) \
+            or (wanted is not None and not isinstance(wanted, str)):
+        raise CodedHTTPException(422, BAD_UNITS, JUDGE_BAD_UNITS)
+    return list(dict.fromkeys(u.strip() for u in units)), wanted or None
+
+
+@router.post("/{run_id}/evidence/judge")
+async def judge_units(run_id: str, payload: Any = Body(None), report: str | None = None) -> dict[str, Any]:
+    """探索运行里按需裁判几句结论：请求体 {units: ["u4"], report?: 报告节点 id}。
+
+    判过的句子直接给已有的判定，不再调用；没判过的按设置里每次点击的金额上限、每份报告的句数和时长上限、
+    全局每日上限去判，触顶照实说「已到上限」，不是报错。问过模型的这一次记一条 evidence.judged 事件，
+    落在封存之后（post_seal: true）——封存核对只覆盖 manifest_seq 之前的事件，追加它 verify 照旧一致；
+    封存的报告文档一个字都不改。交给裁判的证据只取封存范围内的工件，数据源遮罩的列不给。
+    """
+    units, wanted = _judge_request(payload, report)
+    async with _JUDGING.hold(run_id):
+        sealed = await _sealed(run_id)
+        if sealed.run_class == "formal":
+            raise CodedHTTPException(409, FORMAL_JUDGED, JUDGE_FORMAL)
+        if not sealed.ledger_on:
+            raise CodedHTTPException(409, LEGACY_JUDGE, JUDGE_LEGACY)
+        if not sealed.sealed or sealed.status not in _TERMINAL:
+            raise CodedHTTPException(409, UNSEALED_JUDGE, JUDGE_UNSEALED)
+        if not sealed.trusted:
+            raise CodedHTTPException(409, BROKEN_JUDGE, SEAL_BROKEN_CODE)
+        reports = _reports(sealed)
+        if not reports:
+            raise CodedHTTPException(404, "这次运行没有封存的报告文档，没有可以判断的句子", REPORT_NOT_FOUND)
+        chosen = _choose(reports, wanted, sealed)
+        if chosen.hash_ok is False:
+            raise CodedHTTPException(409, "报告文档和它的哈希对不上，疑似被改过，不能再当证据展示", DOC_TAMPERED)
+        if chosen.doc is None:
+            raise CodedHTTPException(404, "报告文档在工件库里取不回来", DOC_MISSING)
+        return await _judge_now(sealed, chosen, units)
+
+
+async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict[str, Any]:
+    from app.engine import judge as judging
+
+    doc = report.doc or {}
+    catalog = doc.get("catalog") or {}
+    known = _effective_verdicts(report, sealed)[0]
+    reused = [u for u in units if known.get(u, {}).get("status") in JUDGED]
+    pending = [u for u in units if u not in reused]
+    verdicts = {u: known[u] for u in reused}
+    node_judge = _node_judge(sealed, report.node_id)
+    async with SessionLocal() as session:
+        settings = await judging.judge_settings(session)
+    budget = judging.click_budget(settings, node_judge)
+    outcome: dict[str, Any] | None = None
+    skipped: dict[str, str] = {}
+    event = None
+    lost = False
+    if pending:
+        loader = _sealed_loader(sealed)
+        masked = await judging.source_masks(catalog, loader=loader)
+        request = judging.prepare(doc, catalog, units=pending, loader=loader, masked=masked)
+        skipped = dict(request.skipped)
+        if request.cands:
+            async with SessionLocal() as session:
+                spec = await judging.judge_model_spec(session, node_judge, settings=settings)
+            outcome = await judging.run_request(request, spec=spec, budget=budget, post_seal=True, click=True)
+            verdicts.update(outcome["verdicts"])
+            if outcome["calls"] or outcome["cost_usd"]:
+                # 没问模型（触顶、模型没配好）就没有判定可记：说给点的人听，不往运行记录里追加
+                event = await _append_judged(sealed, report, pending, outcome)
+                lost = event is None
+    limits = list(outcome["limits_hit"]) if outcome else []
+    message = _judge_message(outcome, budget, skipped)
+    if lost:
+        message = "；".join(filter(None, [NOT_RECORDED, message]))
+    return {
+        "run_id": sealed.run_id, "report": {"node_id": report.node_id, "doc_artifact": report.doc_artifact},
+        "units": units, "verdicts": {u: verdicts[u] for u in units if u in verdicts}, "reused": reused,
+        "judged": [u for u in pending if (outcome or {}).get("verdicts", {}).get(u, {}).get("status") in JUDGED],
+        "skipped": skipped, "unjudged": dict(outcome["unjudged"]) if outcome else {},
+        "limits_hit": limits, "limited": bool(limits), "message": message,
+        "adjust": [JUDGE_ADJUST[r] for r in limits if r in JUDGE_ADJUST],
+        "gaps": list(outcome["gaps"]) if outcome else [], "notes": list(outcome["notes"]) if outcome else [],
+        "model": (outcome or {}).get("model"), "priced": (outcome or {}).get("priced"),
+        "cost_usd": (outcome or {}).get("cost_usd", 0.0), "calls": (outcome or {}).get("calls", 0),
+        "duration_ms": (outcome or {}).get("duration_ms", 0),
+        "budget": budget.as_dict() if outcome else None, "event": event, "post_seal": True,
+        "spend": {**await judging.daily_spend(), "daily_max_usd": settings.get("daily_max_usd")},
+    }
+
+
+def _judge_message(outcome: dict[str, Any] | None, budget: Any, skipped: dict[str, str]) -> str | None:
+    """这次点击的一句话结论：触顶、没跑成、点的不是结论句；判成了（或者全是判过的）就没什么要说的。"""
+    from app.engine.judge import _limit_label
+
+    if outcome and outcome["limits_hit"]:
+        labels = "、".join(_limit_label(r, budget, click=True) for r in outcome["limits_hit"])
+        n = sum(outcome["unjudged"].get(r, 0) for r in outcome["limits_hit"])
+        return f"已到上限（{labels}）：{n} 句没判，记为未裁判；已判的保留"
+    if outcome and outcome["gaps"]:
+        return "裁判没跑完：" + "；".join(outcome["gaps"])
+    parts = []
+    if others := [u for u, why in skipped.items() if why == "not_a_claim"]:
+        parts.append(f"{'、'.join(others)} {NOT_A_CLAIM}")
+    if missing := [u for u, why in skipped.items() if why == "not_found"]:
+        parts.append(f"报告里没有 {'、'.join(missing)}")
+    return "；".join(parts) or None
+
+
+async def _append_judged(sealed: _Sealed, report: _Report, units: list[str],
+                         outcome: dict[str, Any]) -> dict[str, Any] | None:
+    """记一条 evidence.judged：问过模型的这一次（连同没判成的句子），接在运行记录的最后一条后面。
+
+    只接在这次点击开始时的那份封存后面：裁判要花几秒（时长不限时更久），这中间有人点了「继续运行」
+    （失败的运行可以接着跑），再追加就落进一次活着的运行中间，还会被封进下一份清单；接着跑完、重新封存了
+    也一样，这次的判定依据的已经不是最新的封存。这两种都不记，返回 None（判定照样交回给点的人）。
+    核对和写入是同一个事务里的条件更新，和接着跑占住运行（runner._claim）抢的是同一行：谁先提交算谁的。
+    """
+    from app.core.bus import bus
+    from app.engine.runner import _stage, run_manager
+
+    same_seal = (Run.manifest_seq.is_(None) if sealed.run_manifest_seq is None
+                 else Run.manifest_seq == sealed.run_manifest_seq,
+                 Run.manifest_hash.is_(None) if sealed.manifest_hash is None
+                 else Run.manifest_hash == sealed.manifest_hash)
+    async with SessionLocal() as session:
+        run = await session.get(Run, sealed.run_id)
+        if run is None:
+            return None
+        # 进程重启过的话内存里的序号从 0 起：接在库里最后一条后面，不和已有的撞号
+        bus.set_seq(sealed.run_id, run.last_seq or 0)
+        event = run_manager._event(
+            sealed.run_id, EventType.EVIDENCE_JUDGED, node_id=report.node_id, data={
+                "report": report.node_id, "doc_artifact": report.doc_artifact, "units": units,
+                "verdicts": outcome["verdicts"],
+                "keys": {u: outcome["keys"][u] for u in outcome["verdicts"] if u in outcome["keys"]},
+                "model": outcome["model"], "priced": outcome["priced"], "cost_usd": outcome["cost_usd"],
+                "calls": outcome["calls"], "duration_ms": outcome["duration_ms"], "budget": outcome["budget"],
+                "limits_hit": outcome["limits_hit"], "unjudged": outcome["unjudged"], "gaps": outcome["gaps"],
+                "notes": outcome["notes"], "skipped": outcome["skipped"], "post_seal": True})
+        claimed = await session.execute(
+            update(Run).where(Run.id == sealed.run_id, Run.status.in_(_TERMINAL), *same_seal)
+            .values(last_seq=event.seq))
+        if claimed.rowcount != 1:
+            # 运行已经不是那份封存下的终态了。烧掉一个序号不要紧：不落库的事件（令牌流）本来就占序号，
+            # 序号只要求递增、不撞号
+            await session.rollback()
+            return None
+        await _stage(session, event, run)
+        await session.commit()
+    await bus.publish(event)
+    return {"seq": event.seq}
 
 
 # --------------------------------------------------------------------------
@@ -1172,6 +1494,11 @@ UNCITED_CLAIM_COUNTED = "这句结论没有挂依据：这份报告要求结论�
 UNCITED_CLAIM_WITHHELD = "这句结论没有挂依据：出具契约要求结论句挂依据，没挂的按契约不予出具（on_uncited: withhold）"
 UNCITED_CLAIM_REQUIRED = ("这句结论没有挂依据：这份报告要求结论句挂依据（claims: require_citation），不过没有出具契约"
                           "按它判档（没配契约，或者还没到出具那一步）")
+#: claims: judge 在挂依据这件事上和 require_citation 一样严（出口按 on_uncited 计入缺口）
+UNCITED_CLAIM_JUDGED = ("这句结论没有挂依据：这份报告的结论句由模型裁判（claims: judge），挂依据的要求和 "
+                        "require_citation 一样，出具时计入缺口")
+UNCITED_CLAIM_JUDGE_REQUIRED = ("这句结论没有挂依据：这份报告的结论句由模型裁判（claims: judge），要求结论句挂依据，"
+                                "不过没有出具契约按它判档（没配契约，或者还没到出具那一步）")
 LEGACY_UNMATCHED = "旧版出具里这个数字对不上任何指标"
 
 #: CSV 的列：(表头, 行里的键)
@@ -1239,7 +1566,7 @@ async def evidence_audit(run_id: str, fmt: str | None = Query(None, alias="forma
         "run_id": run_id, "schema": AUDIT_SCHEMA, "mode": mode,
         "seal": {**sealed.seal, "events": sealed.verdict.get("events"), "message": sealed.verdict.get("message")},
         "reports": [{"node_id": r.node_id, "doc_artifact": r.doc_artifact, "hash_ok": r.hash_ok,
-                     "doc_sealed": sealed.trusted, "fields": r.fields, "claims": r.claims, "stats": r.stats}
+                     "doc_sealed": sealed.trusted, "fields": r.fields, "stats": r.stats, **_judgement_of(r, sealed)}
                     for r in reports],
         "groups": grouped, "counts": {g["key"]: g["count"] for g in grouped},
         "total": sum(g["count"] for g in grouped),
@@ -1299,11 +1626,14 @@ def _claim_note(report: _Report, issuance: dict[str, Any] | None) -> str:
     if isinstance(issuance, dict) and issuance.get("mode") == "citations" \
             and (issuance.get("report") or {}).get("node_id") == report.node_id:
         claims = issuance.get("claims")
-        if not isinstance(claims, dict) or claims.get("policy") != "require_citation":
+        if not isinstance(claims, dict) or claims.get("policy") not in ("require_citation", "judge"):
             return UNCITED_CLAIM
         on_uncited = claims.get("on_uncited") or "degrade"
         return UNCITED_CLAIM_WITHHELD if on_uncited == "withhold" else \
-            UNCITED_CLAIM if on_uncited == "ignore" else UNCITED_CLAIM_COUNTED
+            UNCITED_CLAIM if on_uncited == "ignore" else \
+            UNCITED_CLAIM_JUDGED if claims.get("policy") == "judge" else UNCITED_CLAIM_COUNTED
+    if report.claims == "judge":
+        return UNCITED_CLAIM_JUDGE_REQUIRED
     return UNCITED_CLAIM_REQUIRED if report.claims == "require_citation" else UNCITED_CLAIM
 
 

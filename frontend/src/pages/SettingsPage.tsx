@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { Navigate, useParams } from 'react-router-dom'
 import {
   Check, Cpu, Download, KeyRound, Monitor, Moon, Plug, Plus, Settings as SettingsIcon, Sun, X,
@@ -7,7 +7,7 @@ import {
 import clsx from 'clsx'
 import { api } from '../api/client'
 import type { ProviderDraft } from '../api/client'
-import { useCatalog, useOnReconnect } from '../store/catalog'
+import { modelOptions, providerOfModel, useCatalog, useOnReconnect } from '../store/catalog'
 import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, isComposing, Modal, PageHeader,
   promptDialog, SectionBar, Skeleton, Spinner, TabPanel, Tabs, toast, useRadioGroup, useTabRoute,
@@ -22,7 +22,7 @@ import type { Provider } from '../types'
 import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
-import { AGENT_GUARD_TEXT, TOOL_GATE_TEXT } from '../lib/terms'
+import { AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, TOOL_GATE_TEXT, judgeByModelText, judgeUnlimitedText } from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
@@ -610,11 +610,17 @@ function PrefsTab() {
   const [draft, setDraft] = useState<{
     actor: string; scope: string; collection: string; confirm: boolean; gateProvider: string; gateModel: string
     steps: string; budgetTokens: string; budgetUsd: string
+    judgeProvider: string; judgeModel: string
+    // 证据裁判的五项上限：null 是不限（存 null），字符串是正在填的数
+    jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
   } | null>(null)
+  const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
   const [saveError, setSaveError] = useState<unknown>(null)
 
+  // 今天裁判花了多少：只读，放在每日上限旁边。老后端没有这个接口就不显示
+  const loadSpend = () => api.settings.judgeSpend().then(setSpend, () => setSpend(null))
   const load = async () => {
     try {
       setValues(await api.settings.get())
@@ -623,6 +629,7 @@ function PrefsTab() {
       setLoadError(e)
     }
     api.memory.scopes().then(setScopes, () => {})
+    void loadSpend()
   }
   useEffect(() => { void load() }, [])
   // 只在首次没拉到时重拉：重拉会覆盖正在编辑的表单
@@ -640,6 +647,14 @@ function PrefsTab() {
     steps: String(values?.run?.agent_max_steps ?? 100),
     budgetTokens: values?.run?.agent_budget_tokens == null ? '' : String(values.run.agent_budget_tokens),
     budgetUsd: values?.run?.agent_budget_usd == null ? '' : String(values.run.agent_budget_usd),
+    // 证据裁判（后端 engine/judge.py，GET 给的是引擎实际生效的样子：存坏了的显示默认，null 是不限）
+    judgeProvider: values?.judge?.provider ?? '',
+    judgeModel: values?.judge?.model ?? '',
+    jClaims: limitText(values?.judge, 'report_max_claims'),
+    jCost: limitText(values?.judge, 'report_max_cost_usd'),
+    jTimeout: limitText(values?.judge, 'report_timeout_s'),
+    jClick: limitText(values?.judge, 'click_max_cost_usd'),
+    jDaily: limitText(values?.judge, 'daily_max_usd'),
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -657,6 +672,21 @@ function PrefsTab() {
       ? undefined : '填大于 0 的金额，或者留空表示不限',
   }
   const guardInvalid = Object.values(guardErrors).some(Boolean)
+  // 裁判的上限同样只校验改过的；null（不限）总是对的
+  const judgeError = (key: 'jClaims' | 'jCost' | 'jTimeout' | 'jClick' | 'jDaily') => {
+    const v = cur[key]
+    if (v === saved[key] || v === null) return undefined
+    const n = Number(v.trim())
+    if (key === 'jClaims') return /^\d+$/.test(v.trim()) && n >= 1 ? undefined : '填正整数，或者勾「不限」'
+    if (key === 'jTimeout') return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '填大于 0 的秒数，或者勾「不限」'
+    return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '填大于 0 的金额，或者勾「不限」'
+  }
+  const judgeErrors = {
+    jClaims: judgeError('jClaims'), jCost: judgeError('jCost'), jTimeout: judgeError('jTimeout'),
+    jClick: judgeError('jClick'), jDaily: judgeError('jDaily'),
+  }
+  const judgeInvalid = Object.values(judgeErrors).some(Boolean)
+  const invalid = guardInvalid || judgeInvalid
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
   const dirty = values ? changed.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
@@ -678,7 +708,7 @@ function PrefsTab() {
    * 有改动才 PUT——只改了署名时不必碰服务端，断线时也存得上
    */
   const save = async () => {
-    if (!values || !dirty || guardInvalid) return
+    if (!values || !dirty || invalid) return
     setSaving(true)
     setSaveError(null)
     const actor = cur.actor.trim()
@@ -687,9 +717,20 @@ function PrefsTab() {
       setLocalActor(actor)
       savedActor.current = actor
     }
-    const runChanged = changed.some((k) => k !== 'actor')
+    const judgeChanged = changed.some((k) => JUDGE_DRAFT.has(k))
+    const runChanged = changed.some((k) => k !== 'actor' && !JUDGE_DRAFT.has(k))
     try {
-      if (runChanged) {
+      // 裁判一组整组写：后端对没给的键回落到默认值，只发改过的那一项会把别的项冲回默认
+      const judge = judgeChanged ? {
+        provider: cur.judgeProvider || null,
+        model: cur.judgeModel.trim() || null,
+        report_max_claims: parseLimit(cur.jClaims),
+        report_max_cost_usd: parseLimit(cur.jCost),
+        report_timeout_s: parseLimit(cur.jTimeout),
+        click_max_cost_usd: parseLimit(cur.jClick),
+        daily_max_usd: parseLimit(cur.jDaily),
+      } : null
+      if (runChanged || judge) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -701,8 +742,14 @@ function PrefsTab() {
           agent_budget_tokens: cur.budgetTokens.trim() === '' ? null : Number(cur.budgetTokens),
           agent_budget_usd: cur.budgetUsd.trim() === '' ? null : Number(cur.budgetUsd),
         }
-        const out = await api.settings.put({ run })
-        setValues((v) => ({ ...(v ?? {}), run: out?.run ?? run }))
+        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}) })
+        setValues((v) => ({
+          ...(v ?? {}),
+          ...(runChanged ? { run: out?.run ?? run } : {}),
+          ...(judge ? { judge: out?.judge ?? judge } : {}),
+        }))
+        // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
+        if (judge) void loadSpend()
       }
       setDraft(null)
       setSavedFlash(Date.now())
@@ -724,6 +771,29 @@ function PrefsTab() {
   const gateProvider = cur.gateProvider ? providers.find((p) => p.name === cur.gateProvider) : defaultProvider
   const gateProviderMissing = !!cur.gateProvider && providers.length > 0 && !gateProvider
   const gateModels = (gateProvider?.models ?? []).map((m) => m.id)
+  // 裁判模型的接入：接入和模型都留空时后端依次用 Copilot 的模型、默认接入（judge_model_spec）。只填了模型时
+  // 这一级写了就整组用这一级，按模型名找接入（resolve_provider）——不再跟随 Copilot，留空那一项不能还叫「跟随 Copilot」
+  const judgeProvider = cur.judgeProvider ? providers.find((p) => p.name === cur.judgeProvider) : undefined
+  const judgeProviderMissing = !!cur.judgeProvider && providers.length > 0 && !judgeProvider
+  const judgeModelName = cur.judgeModel.trim()
+  const judgeByModel = !cur.judgeProvider && !!judgeModelName
+  const judgeOwner = judgeByModel ? providerOfModel(providers, judgeModelName) : undefined
+  const judgeByModelHint = judgeByModel && providers.length > 0
+    ? judgeByModelText('settings', judgeModelName, judgeOwner && { name: judgeOwner.provider.name, enabled: judgeOwner.enabled },
+      defaultProvider?.name)
+    : ''
+  // 接入留空时按模型名找接入：所有启用接入的模型都能选；选了接入只列这一家的
+  const judgeModels = judgeProvider ? (judgeProvider.models ?? []).map((m) => m.id)
+    : [...new Set(modelOptions(providers).map((o) => o.value))]
+  const pickJudgeProvider = (name: string) => {
+    const next = name ? providers.find((p) => p.name === name) : undefined
+    const keep = !name || !cur.judgeModel || (next?.models ?? []).some((m) => m.id === cur.judgeModel) || next?.default_model === cur.judgeModel
+    edit({ judgeProvider: name, ...(keep ? {} : { judgeModel: '' }) })
+  }
+  const limitSet = {
+    claims: cur.jClaims !== null, cost: cur.jCost !== null, timeout: cur.jTimeout !== null,
+    click: cur.jClick !== null, daily: cur.jDaily !== null,
+  }
   const pickGateProvider = (name: string) => {
     // 换了接入，原来填的模型不在新接入的清单里就清掉：拿 A 家的模型名去调 B 家必然失败
     const next = name ? providers.find((p) => p.name === name) : defaultProvider
@@ -864,6 +934,85 @@ function PrefsTab() {
               </div>
             </div>
           </section>
+
+          {values.judge && (
+            <section data-judge-settings>
+              <SectionBar title={JUDGE_SETTING_TEXT.label} hint={JUDGE_SETTING_TEXT.hint} />
+              <div role="group" aria-labelledby="pref-judge-model-label" aria-describedby="pref-judge-model-hint" data-judge-model>
+                <div id="pref-judge-model-label" className="text-xs font-medium">裁判模型</div>
+                <p id="pref-judge-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.differ}</p>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label={JUDGE_SETTING_TEXT.provider} htmlFor="pref-judge-provider"
+                         error={judgeProviderMissing ? `「${cur.judgeProvider}」这个接入不存在：裁判调用会失败，结论句都记为未裁判` : undefined}
+                         hint={judgeByModelHint ? (
+                           <span data-judge-by-model={judgeOwner ? (judgeOwner.enabled ? 'found' : 'disabled') : 'default'}
+                                 style={judgeOwner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>{judgeByModelHint}</span>
+                         ) : undefined}>
+                    {(p) => (
+                      <select {...p} className="field" value={cur.judgeProvider} onChange={(e) => pickJudgeProvider(e.target.value)}>
+                        <option value="">{judgeByModel ? JUDGE_SETTING_TEXT.providerFromModel : JUDGE_SETTING_TEXT.providerDefault}</option>
+                        {judgeProviderMissing && <option value={cur.judgeProvider}>{cur.judgeProvider}（不存在）</option>}
+                        {providers.map((pv) => (
+                          <option key={pv.id} value={pv.name}>{pv.name}{pv.enabled ? '' : '（已停用）'}</option>
+                        ))}
+                      </select>
+                    )}
+                  </Field>
+                  <Field label={JUDGE_SETTING_TEXT.model} htmlFor="pref-judge-model"
+                         hint={judgeProvider?.default_model ? `留空就用 ${judgeProvider.default_model}` : undefined}>
+                    {(p) => (
+                      <>
+                        <input {...p} className="field mono text-xs" value={cur.judgeModel} list="pref-judge-models"
+                               placeholder={cur.judgeProvider ? JUDGE_SETTING_TEXT.modelDefault : JUDGE_SETTING_TEXT.modelFollow}
+                               spellCheck={false}
+                               onChange={(e) => edit({ judgeModel: e.target.value })} />
+                        <datalist id="pref-judge-models">
+                          {judgeModels.map((m) => <option key={m} value={m} />)}
+                        </datalist>
+                      </>
+                    )}
+                  </Field>
+                </div>
+              </div>
+              <div className="mt-4" role="group" aria-labelledby="pref-judge-limits-label" aria-describedby="pref-judge-limits-hint"
+                   data-judge-limits>
+                <div id="pref-judge-limits-label" className="text-xs font-medium">{JUDGE_SETTING_TEXT.limits}</div>
+                <p id="pref-judge-limits-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.nodeWins}</p>
+                <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
+                  <LimitField id="pref-judge-claims" dataKey="report_max_claims" label={JUDGE_SETTING_TEXT.reportClaims}
+                              value={cur.jClaims} fallback={JUDGE_FALLBACK.report_max_claims} integer
+                              error={judgeErrors.jClaims} unlimited={judgeUnlimitedText('claims', limitSet)}
+                              onChange={(v) => edit({ jClaims: v })} />
+                  <LimitField id="pref-judge-cost" dataKey="report_max_cost_usd" label={JUDGE_SETTING_TEXT.reportCost}
+                              value={cur.jCost} fallback={JUDGE_FALLBACK.report_max_cost_usd}
+                              error={judgeErrors.jCost} unlimited={judgeUnlimitedText('cost', limitSet)}
+                              onChange={(v) => edit({ jCost: v })} />
+                  <LimitField id="pref-judge-timeout" dataKey="report_timeout_s" label={JUDGE_SETTING_TEXT.reportTimeout}
+                              value={cur.jTimeout} fallback={JUDGE_FALLBACK.report_timeout_s}
+                              error={judgeErrors.jTimeout} unlimited={judgeUnlimitedText('timeout', limitSet)}
+                              onChange={(v) => edit({ jTimeout: v })} />
+                  <LimitField id="pref-judge-click" dataKey="click_max_cost_usd" label={JUDGE_SETTING_TEXT.clickCost}
+                              value={cur.jClick} fallback={JUDGE_FALLBACK.click_max_cost_usd}
+                              error={judgeErrors.jClick} unlimited={judgeUnlimitedText('click', limitSet)}
+                              onChange={(v) => edit({ jClick: v })} />
+                  <LimitField id="pref-judge-daily" dataKey="daily_max_usd" label={JUDGE_SETTING_TEXT.daily}
+                              value={cur.jDaily} fallback={JUDGE_FALLBACK.daily_max_usd}
+                              error={judgeErrors.jDaily} unlimited={judgeUnlimitedText('daily', limitSet)}
+                              onChange={(v) => edit({ jDaily: v })}
+                              extra={spend && (
+                                <div className="mt-1 text-2xs leading-relaxed text-dim" data-judge-spend="">
+                                  {spend.calls ? JUDGE_SETTING_TEXT.spend(formatSpend(spend.usd), spend.calls) : JUDGE_SETTING_TEXT.spendNone}
+                                  {!!spend.unpriced_calls && (
+                                    <span className="block" style={{ color: 'var(--st-waiting)' }} data-judge-unpriced="">
+                                      {JUDGE_SETTING_TEXT.unpriced(spend.unpriced_calls)}
+                                    </span>
+                                  )}
+                                </div>
+                              )} />
+                </div>
+              </div>
+            </section>
+          )}
         </>
       )}
 
@@ -884,6 +1033,9 @@ function PrefsTab() {
                     actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具的默认审批策略',
                     gateProvider: '门控模型的接入', gateModel: '门控模型',
                     steps: '默认最大步数', budgetTokens: '令牌预算', budgetUsd: '金额预算',
+                    judgeProvider: '裁判模型的接入', judgeModel: '裁判模型',
+                    jClaims: '每份报告最多判几句', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
+                    jClick: '每次点击的金额上限', jDaily: '每日金额上限',
                   })[k]).join('、')}
                 </span>
               </span>
@@ -893,8 +1045,9 @@ function PrefsTab() {
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
                       onClick={() => { setDraft(null); setSaveError(null) }}>放弃</button>
-              <button className="btn btn-sm btn-primary" disabled={saving || guardInvalid}
-                      title={guardInvalid ? '护栏那几项有没填对的，改好再保存' : undefined}
+              <button className="btn btn-sm btn-primary" disabled={saving || invalid}
+                      title={guardInvalid ? '护栏那几项有没填对的，改好再保存'
+                        : judgeInvalid ? '证据裁判的上限有没填对的，改好再保存' : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>
@@ -906,6 +1059,61 @@ function PrefsTab() {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** 裁判那一组在草稿里的键：它们改了才写 judge 一组 */
+const JUDGE_DRAFT = new Set<string>(['judgeProvider', 'judgeModel', 'jClaims', 'jCost', 'jTimeout', 'jClick', 'jDaily'])
+
+/** 勾掉「不限」时填回的数：同后端 JUDGE_DEFAULTS */
+const JUDGE_FALLBACK = {
+  report_max_claims: '40', report_max_cost_usd: '0.05', report_timeout_s: '30', click_max_cost_usd: '0.01', daily_max_usd: '2',
+}
+
+/** 设置里的一项上限 → 表单：null 是不限，没有这一项（老后端）当空串 */
+function limitText(group: Record<string, any> | undefined, key: string): string | null {
+  const v = group?.[key]
+  return v === null ? null : v === undefined ? '' : String(v)
+}
+
+/** 表单 → 存进去的值：不限存 null */
+const parseLimit = (v: string | null): number | null => (v === null ? null : Number(v.trim()))
+
+/** 今天花了多少美元：小额按分以下的精度写，不四舍五入成 0 */
+const formatSpend = (usd: number | undefined): string =>
+  usd == null || !Number.isFinite(usd) ? '0' : usd >= 1 ? usd.toFixed(2) : String(Number(usd.toFixed(4)))
+
+/**
+ * 一项裁判上限：数字框加「不限」。勾了不限，框变灰，下面写明不设上限之后费用还受什么约束——
+ * 不许悄悄生效；勾掉时填回之前的数（没有就填默认值）
+ */
+function LimitField({ id, dataKey, label, value, fallback, integer, error, unlimited, onChange, extra }: {
+  id: string; dataKey: string; label: string; value: string | null; fallback: string; integer?: boolean
+  error?: string; unlimited: string; onChange: (v: string | null) => void; extra?: ReactNode
+}) {
+  const last = useRef(value ?? fallback)
+  if (value !== null) last.current = value || last.current
+  const off = value === null
+  return (
+    <div className="min-w-0" data-judge-limit={dataKey} data-unlimited={off ? '' : undefined}>
+      <Field label={label} htmlFor={id} error={error}
+             hint={off ? <span style={{ color: 'var(--st-waiting)' }} data-judge-unlimited="">{unlimited}</span> : undefined}>
+        {(p) => (
+          <div className="flex items-center gap-2">
+            <input {...p} className="field tnum min-w-0 flex-1" inputMode={integer ? 'numeric' : 'decimal'}
+                   value={off ? '' : value} disabled={off} placeholder={off ? JUDGE_SETTING_TEXT.unlimited : undefined}
+                   onChange={(e) => onChange(e.target.value)} />
+            <label className="flex shrink-0 cursor-pointer items-center gap-1 text-xs">
+              <input type="checkbox" checked={off} aria-label={`${label}：${JUDGE_SETTING_TEXT.unlimited}`}
+                     aria-describedby={p['aria-describedby']} data-judge-unlimited-toggle=""
+                     onChange={(e) => onChange(e.target.checked ? null : last.current || fallback)} />
+              {JUDGE_SETTING_TEXT.unlimited}
+            </label>
+          </div>
+        )}
+      </Field>
+      {extra}
     </div>
   )
 }

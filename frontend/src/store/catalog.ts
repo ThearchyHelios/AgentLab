@@ -392,6 +392,21 @@ export function hasPendingApproval(approvals: Approval[], runId: string | null |
   return approvals.some((a) => a.run_id === runId && a.status === 'pending')
 }
 
+/**
+ * 只写了模型、没选接入时，后端按模型名找接入（providers/factory.resolve_provider）：启用的接入里模型清单有它的，
+ * 再看默认模型是它的；只有停用的接入认得它时后端直接报错（不会悄悄换一家）。都认不出返回 undefined——
+ * 后端这时用第一个启用的非 mock 接入去调
+ */
+export function providerOfModel(providers: Provider[], model: string):
+  { provider: Provider; enabled: boolean } | undefined {
+  const owns = (p: Provider) => (p.models ?? []).some((m) => m?.id === model)
+  const enabled = providers.filter((p) => p.enabled)
+  const hit = enabled.find(owns) ?? enabled.find((p) => p.default_model === model)
+  if (hit) return { provider: hit, enabled: true }
+  const off = providers.find((p) => !p.enabled && (owns(p) || p.default_model === model))
+  return off ? { provider: off, enabled: false } : undefined
+}
+
 /** 把所有 provider 的模型拉平成下拉选项。 */
 export function modelOptions(providers: Provider[]): { value: string; label: string; group: string }[] {
   const out: { value: string; label: string; group: string }[] = []

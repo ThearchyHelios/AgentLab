@@ -1,0 +1,4879 @@
+{
+ "_comment": "可点击证据第四期（结论句裁判）的夹具：/tmp/agentlab-fix/E4-front/gen_fixture.py 生成。文档由 compose_doc 真跑，候选句由 judge.prepare 真跑，判定是剧本（模拟裁判模型），经 judge 的 summarize / apply_judgement 写回。只用通用名",
+ "model": "judge-model-b",
+ "formal": {
+  "run_id": "run-evidence-judge",
+  "run_class": "formal",
+  "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4",
+  "doc": {
+   "schema": "agentlab.report/1",
+   "run_id": "run-evidence-judge",
+   "node_id": "write",
+   "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[v:Q1.r0.gmv]]，订单 [[v:Q1.r0.order_cnt]] 单。[[see:Q1]]\n\n增长主要来自新客首单，老客复购持平。[[see:Q1]]\n\n退款 [[v:Q2.r0.refund_cnt]] 单，其中大多数是部分退款。[[see:Q2]]\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。[[see:i:week]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:f0db81e2badfc3e2",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "2ed2edc8ed904c049d96eecddc209e88ff3d0ccde4f06c0d6ee6d05f955bf4fa",
+     "via": "7a81331ed15bd9a9910bc90cc54ea6eb8b9dd21b8136464a342c19a49cf7a7c9",
+     "call_id": "toolu_01",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:e483a806bd3a7ad9",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "79c1d7e581637df166e44a93e59b10f4eb0d94ba6f0fd5c76029a3b7c5e53853",
+     "via": "a61a900e68819eba5cc778d74e999759a3754a07ddcf9c5cf67b7856fb479f45",
+     "call_id": "toolu_02",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "i:week": {
+     "alias": "i:week",
+     "kind": "input",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "locator": {
+      "field": "week"
+     },
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "label": "week = 2026-W37"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        7
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "本周概览",
+         "state": "neutral",
+         "span": [
+          3,
+          7
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        9,
+        45
+       ],
+       "cites": [
+        "i:week",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          7,
+          9
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "本周（",
+         "state": "neutral",
+         "span": [
+          9,
+          12
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "value",
+         "text": "2026-W37",
+         "ref": "i:week",
+         "cite": {
+          "ref": "week",
+          "alias": "i:week",
+          "locator": {
+           "field": "week"
+          },
+          "eid": "ev:input:a398c5e60abfeedd",
+          "kind": "input",
+          "role": "value",
+          "status": "resolved",
+          "value": "2026-W37",
+          "rendered": "2026-W37"
+         },
+         "state": "deterministic",
+         "span": [
+          12,
+          20
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "）销售额 ",
+         "state": "neutral",
+         "span": [
+          20,
+          25
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "45,678.5",
+         "ref": "v:Q1.r0.gmv",
+         "cite": {
+          "ref": "Q1.r0.gmv",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gmv"
+          },
+          "eid": "ev:cell:dfba96352ac91db5",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 45678.5,
+          "rendered": "45,678.5"
+         },
+         "state": "deterministic",
+         "span": [
+          25,
+          33
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          33,
+          37
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,234",
+         "ref": "v:Q1.r0.order_cnt",
+         "cite": {
+          "ref": "Q1.r0.order_cnt",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "order_cnt"
+          },
+          "eid": "ev:cell:a12c4cd776db6371",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1234,
+          "rendered": "1,234"
+         },
+         "state": "deterministic",
+         "span": [
+          37,
+          42
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 单。",
+         "state": "neutral",
+         "span": [
+          42,
+          45
+         ],
+         "id": "s9"
+        }
+       ],
+       "verdict": {
+        "status": "supported",
+        "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1",
+         "i:week"
+        ]
+       }
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        47,
+        65
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          45,
+          47
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客首单，老客复购持平。",
+         "state": "neutral",
+         "span": [
+          47,
+          65
+         ],
+         "id": "s11"
+        }
+       ],
+       "verdict": {
+        "status": "unsupported",
+        "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1"
+        ]
+       }
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        67,
+        86
+       ],
+       "cites": [
+        "Q2"
+       ],
+       "see": [
+        {
+         "ref": "Q2",
+         "role": "support",
+         "alias": "Q2",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:e483a806bd3a7ad9",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          65,
+          67
+         ],
+         "id": "s12"
+        },
+        {
+         "kind": "text",
+         "text": "退款 ",
+         "state": "neutral",
+         "span": [
+          67,
+          70
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "number",
+         "text": "29",
+         "ref": "v:Q2.r0.refund_cnt",
+         "cite": {
+          "ref": "Q2.r0.refund_cnt",
+          "alias": "Q2",
+          "locator": {
+           "row": 0,
+           "column": "refund_cnt"
+          },
+          "eid": "ev:cell:e5d8f3b24016f3c9",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 29,
+          "rendered": "29"
+         },
+         "state": "deterministic",
+         "span": [
+          70,
+          72
+         ],
+         "id": "s14"
+        },
+        {
+         "kind": "text",
+         "text": " 单，其中大多数是部分退款。",
+         "state": "neutral",
+         "span": [
+          72,
+          86
+         ],
+         "id": "s15"
+        }
+       ],
+       "verdict": {
+        "status": "partial",
+        "rationale": "退款 29 单有依据；Q2 里部分退款 11 单，说不上「大多数」",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q2"
+        ]
+       }
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        88,
+        99
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          86,
+          88
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "text",
+         "text": "华东贡献了最多的增量。",
+         "state": "neutral",
+         "span": [
+          88,
+          99
+         ],
+         "id": "s17"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "已到上限（这份报告的裁判金额上限 $0.05），这句没判",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "reason": "max_cost_usd"
+       }
+      }
+     ],
+     "id": "b4"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u5",
+       "kind": "connective",
+       "span": [
+        101,
+        109
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          99,
+          101
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "text",
+         "text": "下面看退款情况。",
+         "state": "neutral",
+         "span": [
+          101,
+          109
+         ],
+         "id": "s19"
+        }
+       ]
+      }
+     ],
+     "id": "b5"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        111,
+        120
+       ],
+       "cites": [
+        "i:week"
+       ],
+       "see": [
+        {
+         "ref": "i:week",
+         "role": "support",
+         "alias": "i:week",
+         "kind": "input",
+         "status": "resolved",
+         "eid": "ev:input:a398c5e60abfeedd",
+         "locator": {
+          "field": "week"
+         }
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          109,
+          111
+         ],
+         "id": "s20"
+        },
+        {
+         "kind": "text",
+         "text": "周报按自然周统计。",
+         "state": "neutral",
+         "span": [
+          111,
+          120
+         ],
+         "id": "s21"
+        }
+       ],
+       "verdict": {
+        "status": "not_a_claim",
+        "rationale": "这句说的是统计口径，不陈述数据事实",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "i:week"
+        ]
+       }
+      }
+     ],
+     "id": "b6"
+    }
+   ],
+   "stats": {
+    "units": 7,
+    "segments": 22,
+    "claims": 5,
+    "connective": 1,
+    "headings": 1,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 4,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 1,
+    "partial": 1,
+    "unsupported": 1,
+    "not_a_claim": 1,
+    "unjudged": 1
+   },
+   "violations": [],
+   "judge": {
+    "mode": "inline",
+    "model": "judge-model-b",
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": {
+     "max_claims": 40,
+     "max_cost_usd": 0.05,
+     "timeout_s": 30,
+     "daily_max_usd": 2.0
+    },
+    "candidates": 5,
+    "screened": [],
+    "counts": {
+     "supported": 1,
+     "partial": 1,
+     "unsupported": 1,
+     "not_a_claim": 1,
+     "unjudged": 1
+    },
+    "unjudged": {
+     "max_cost_usd": 1
+    },
+    "limits_hit": [
+     "max_cost_usd"
+    ],
+    "complete": false,
+    "priced": true,
+    "cost_usd": 0.0412,
+    "calls": 1,
+    "reused": 0,
+    "duration_ms": 6120,
+    "gaps": [
+     "有 1 句结论没裁判：已到上限（这份报告的裁判金额上限 $0.05）"
+    ],
+    "notes": [],
+    "same_model": false,
+    "rewrite": null
+   }
+  },
+  "graph": {
+   "run_id": "run-evidence-judge",
+   "schema": "agentlab.evidence/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 64,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 7,
+      "segments": 22,
+      "claims": 5,
+      "connective": 1,
+      "headings": 1,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "see": 4,
+      "uncited_claims": 1,
+      "violations": 0,
+      "supported": 1,
+      "partial": 1,
+      "unsupported": 1,
+      "not_a_claim": 1,
+      "unjudged": 1
+     }
+    }
+   ],
+   "evidence": [],
+   "edges": []
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     },
+     "ref": "i:week"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:dfba96352ac91db5",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     },
+     "ref": "v:Q1.r0.gmv"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:a12c4cd776db6371",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     },
+     "ref": "v:Q1.r0.order_cnt"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      65
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      47,
+      65
+     ],
+     "verdict": {
+      "status": "unsupported",
+      "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      67,
+      70
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q2 里部分退款 11 单，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q2"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s14": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s14",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      70,
+      72
+     ],
+     "unit": "u3",
+     "cite": {
+      "ref": "Q2.r0.refund_cnt",
+      "alias": "Q2",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:e5d8f3b24016f3c9",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     },
+     "ref": "v:Q2.r0.refund_cnt"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q2 里部分退款 11 单，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q2"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s15",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      72,
+      86
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q2 里部分退款 11 单，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q2"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s17",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      88,
+      99
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      88,
+      99
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "已到上限（这份报告的裁判金额上限 $0.05），这句没判",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "reason": "max_cost_usd"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "下面看退款情况。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      101,
+      109
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "connective",
+     "text": "下面看退款情况。",
+     "span": [
+      101,
+      109
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      111,
+      120
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      111,
+      120
+     ],
+     "verdict": {
+      "status": "not_a_claim",
+      "rationale": "这句说的是统计口径，不陈述数据事实",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "i:week"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "units": {
+   "ok": "u1",
+   "bad": "u2",
+   "partial": "u3",
+   "limit": "u4",
+   "not": "u6"
+  },
+  "text_seg": {
+   "ok": "s3",
+   "bad": "s11",
+   "partial": "s13",
+   "limit": "s17",
+   "not": "s21"
+  },
+  "report_checked": {
+   "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4",
+   "ok": true,
+   "stats": {
+    "units": 7,
+    "segments": 22,
+    "claims": 5,
+    "connective": 1,
+    "headings": 1,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 4,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 1,
+    "partial": 1,
+    "unsupported": 1,
+    "not_a_claim": 1,
+    "unjudged": 1
+   },
+   "violations": [],
+   "repairs": 0,
+   "claims": "judge",
+   "judge": {
+    "mode": "inline",
+    "model": "judge-model-b",
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": {
+     "max_claims": 40,
+     "max_cost_usd": 0.05,
+     "timeout_s": 30,
+     "daily_max_usd": 2.0
+    },
+    "candidates": 5,
+    "screened": [],
+    "counts": {
+     "supported": 1,
+     "partial": 1,
+     "unsupported": 1,
+     "not_a_claim": 1,
+     "unjudged": 1
+    },
+    "unjudged": {
+     "max_cost_usd": 1
+    },
+    "limits_hit": [
+     "max_cost_usd"
+    ],
+    "complete": false,
+    "priced": true,
+    "cost_usd": 0.0412,
+    "calls": 1,
+    "reused": 0,
+    "duration_ms": 6120,
+    "gaps": [
+     "有 1 句结论没裁判：已到上限（这份报告的裁判金额上限 $0.05）"
+    ],
+    "notes": [],
+    "same_model": false,
+    "rewrite": null
+   }
+  },
+  "output": {
+   "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "_evidence": {
+    "report_node": "write",
+    "doc_artifact": "66cab12caafe4ddd98548bcb2fa28ba385e820e2f9ee8728afa92b438bc43fa4",
+    "fields": [
+     "answer"
+    ]
+   },
+   "_issuance": {
+    "tier": "degraded",
+    "matched_numbers": 3,
+    "metrics_checked": 0,
+    "claims": {
+     "policy": "judge",
+     "uncited_claims": 1,
+     "uncited": [
+      {
+       "unit": "u4",
+       "span": [
+        88,
+        99
+       ],
+       "text": "华东贡献了最多的增量。"
+      }
+     ],
+     "on_unsupported": "degrade",
+     "mode": "inline",
+     "counts": {
+      "supported": 1,
+      "partial": 1,
+      "unsupported": 1,
+      "not_a_claim": 1,
+      "unjudged": 1
+     },
+     "unsupported": [
+      {
+       "unit": "u2",
+       "span": [
+        47,
+        65
+       ],
+       "text": "增长主要来自新客首单，老客复购持平。",
+       "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少"
+      }
+     ],
+     "partial": [
+      {
+       "unit": "u3",
+       "span": [
+        67,
+        86
+       ],
+       "text": "退款 29 单，其中大多数是部分退款。",
+       "rationale": "退款 29 单有依据；Q2 里部分退款 11 单，说不上「大多数」"
+      }
+     ],
+     "unjudged": {
+      "max_cost_usd": 1
+     },
+     "limits_hit": [
+      "max_cost_usd"
+     ],
+     "complete": false,
+     "model": "judge-model-b"
+    },
+    "gaps": [
+     "有 1 句结论没裁判：已到上限（这份报告的裁判金额上限 $0.05）"
+    ]
+   }
+  }
+ },
+ "explore": {
+  "run_id": "run-evidence-judge-explore",
+  "run_class": "exploratory",
+  "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+  "doc": {
+   "schema": "agentlab.report/1",
+   "run_id": "run-evidence-judge-explore",
+   "node_id": "write",
+   "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[v:Q1.r0.gmv]]，订单 [[v:Q1.r0.order_cnt]] 单。[[see:Q1]]\n\n增长主要来自新客首单，老客复购持平。[[see:Q1]]\n\n退款 [[v:Q2.r0.refund_cnt]] 单，其中大多数是部分退款。[[see:Q2]]\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。[[see:i:week]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:f0db81e2badfc3e2",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "2ed2edc8ed904c049d96eecddc209e88ff3d0ccde4f06c0d6ee6d05f955bf4fa",
+     "via": "7a81331ed15bd9a9910bc90cc54ea6eb8b9dd21b8136464a342c19a49cf7a7c9",
+     "call_id": "toolu_01",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:e483a806bd3a7ad9",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "79c1d7e581637df166e44a93e59b10f4eb0d94ba6f0fd5c76029a3b7c5e53853",
+     "via": "a61a900e68819eba5cc778d74e999759a3754a07ddcf9c5cf67b7856fb479f45",
+     "call_id": "toolu_02",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "i:week": {
+     "alias": "i:week",
+     "kind": "input",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "locator": {
+      "field": "week"
+     },
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "label": "week = 2026-W37"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        7
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "本周概览",
+         "state": "neutral",
+         "span": [
+          3,
+          7
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        9,
+        45
+       ],
+       "cites": [
+        "i:week",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          7,
+          9
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "本周（",
+         "state": "neutral",
+         "span": [
+          9,
+          12
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "value",
+         "text": "2026-W37",
+         "ref": "i:week",
+         "cite": {
+          "ref": "week",
+          "alias": "i:week",
+          "locator": {
+           "field": "week"
+          },
+          "eid": "ev:input:a398c5e60abfeedd",
+          "kind": "input",
+          "role": "value",
+          "status": "resolved",
+          "value": "2026-W37",
+          "rendered": "2026-W37"
+         },
+         "state": "deterministic",
+         "span": [
+          12,
+          20
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "）销售额 ",
+         "state": "neutral",
+         "span": [
+          20,
+          25
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "45,678.5",
+         "ref": "v:Q1.r0.gmv",
+         "cite": {
+          "ref": "Q1.r0.gmv",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gmv"
+          },
+          "eid": "ev:cell:dfba96352ac91db5",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 45678.5,
+          "rendered": "45,678.5"
+         },
+         "state": "deterministic",
+         "span": [
+          25,
+          33
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          33,
+          37
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,234",
+         "ref": "v:Q1.r0.order_cnt",
+         "cite": {
+          "ref": "Q1.r0.order_cnt",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "order_cnt"
+          },
+          "eid": "ev:cell:a12c4cd776db6371",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1234,
+          "rendered": "1,234"
+         },
+         "state": "deterministic",
+         "span": [
+          37,
+          42
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 单。",
+         "state": "neutral",
+         "span": [
+          42,
+          45
+         ],
+         "id": "s9"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        47,
+        65
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          45,
+          47
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客首单，老客复购持平。",
+         "state": "neutral",
+         "span": [
+          47,
+          65
+         ],
+         "id": "s11"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        67,
+        86
+       ],
+       "cites": [
+        "Q2"
+       ],
+       "see": [
+        {
+         "ref": "Q2",
+         "role": "support",
+         "alias": "Q2",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:e483a806bd3a7ad9",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          65,
+          67
+         ],
+         "id": "s12"
+        },
+        {
+         "kind": "text",
+         "text": "退款 ",
+         "state": "neutral",
+         "span": [
+          67,
+          70
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "number",
+         "text": "29",
+         "ref": "v:Q2.r0.refund_cnt",
+         "cite": {
+          "ref": "Q2.r0.refund_cnt",
+          "alias": "Q2",
+          "locator": {
+           "row": 0,
+           "column": "refund_cnt"
+          },
+          "eid": "ev:cell:e5d8f3b24016f3c9",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 29,
+          "rendered": "29"
+         },
+         "state": "deterministic",
+         "span": [
+          70,
+          72
+         ],
+         "id": "s14"
+        },
+        {
+         "kind": "text",
+         "text": " 单，其中大多数是部分退款。",
+         "state": "neutral",
+         "span": [
+          72,
+          86
+         ],
+         "id": "s15"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        88,
+        99
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          86,
+          88
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "text",
+         "text": "华东贡献了最多的增量。",
+         "state": "neutral",
+         "span": [
+          88,
+          99
+         ],
+         "id": "s17"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b4"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u5",
+       "kind": "connective",
+       "span": [
+        101,
+        109
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          99,
+          101
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "text",
+         "text": "下面看退款情况。",
+         "state": "neutral",
+         "span": [
+          101,
+          109
+         ],
+         "id": "s19"
+        }
+       ]
+      }
+     ],
+     "id": "b5"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        111,
+        120
+       ],
+       "cites": [
+        "i:week"
+       ],
+       "see": [
+        {
+         "ref": "i:week",
+         "role": "support",
+         "alias": "i:week",
+         "kind": "input",
+         "status": "resolved",
+         "eid": "ev:input:a398c5e60abfeedd",
+         "locator": {
+          "field": "week"
+         }
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          109,
+          111
+         ],
+         "id": "s20"
+        },
+        {
+         "kind": "text",
+         "text": "周报按自然周统计。",
+         "state": "neutral",
+         "span": [
+          111,
+          120
+         ],
+         "id": "s21"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b6"
+    }
+   ],
+   "stats": {
+    "units": 7,
+    "segments": 22,
+    "claims": 5,
+    "connective": 1,
+    "headings": 1,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 4,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 0,
+    "partial": 0,
+    "unsupported": 0,
+    "not_a_claim": 0,
+    "unjudged": 5
+   },
+   "violations": [],
+   "judge": {
+    "mode": "on_demand",
+    "model": null,
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": null,
+    "candidates": 5,
+    "screened": [],
+    "counts": {
+     "supported": 0,
+     "partial": 0,
+     "unsupported": 0,
+     "not_a_claim": 0,
+     "unjudged": 5
+    },
+    "unjudged": {
+     "on_demand": 5
+    },
+    "limits_hit": [],
+    "complete": false,
+    "priced": null,
+    "cost_usd": 0.0,
+    "calls": 0,
+    "reused": 0,
+    "duration_ms": 0,
+    "gaps": [],
+    "notes": [],
+    "same_model": false,
+    "rewrite": null
+   }
+  },
+  "graph": {
+   "run_id": "run-evidence-judge-explore",
+   "schema": "agentlab.evidence/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 64,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 7,
+      "segments": 22,
+      "claims": 5,
+      "connective": 1,
+      "headings": 1,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "see": 4,
+      "uncited_claims": 1,
+      "violations": 0,
+      "supported": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "not_a_claim": 0,
+      "unjudged": 5
+     }
+    }
+   ],
+   "evidence": [],
+   "edges": []
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     },
+     "ref": "i:week"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:dfba96352ac91db5",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     },
+     "ref": "v:Q1.r0.gmv"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:a12c4cd776db6371",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     },
+     "ref": "v:Q1.r0.order_cnt"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      65
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      47,
+      65
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      67,
+      70
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s14": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s14",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      70,
+      72
+     ],
+     "unit": "u3",
+     "cite": {
+      "ref": "Q2.r0.refund_cnt",
+      "alias": "Q2",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:e5d8f3b24016f3c9",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     },
+     "ref": "v:Q2.r0.refund_cnt"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s15",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      72,
+      86
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s17",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      88,
+      99
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      88,
+      99
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "下面看退款情况。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      101,
+      109
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "connective",
+     "text": "下面看退款情况。",
+     "span": [
+      101,
+      109
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      111,
+      120
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      111,
+      120
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "segments_after": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     },
+     "ref": "i:week"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:dfba96352ac91db5",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     },
+     "ref": "v:Q1.r0.gmv"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:a12c4cd776db6371",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     },
+     "ref": "v:Q1.r0.order_cnt"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      65
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      47,
+      65
+     ],
+     "verdict": {
+      "status": "unsupported",
+      "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1"
+      ]
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      67,
+      70
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s14": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s14",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      70,
+      72
+     ],
+     "unit": "u3",
+     "cite": {
+      "ref": "Q2.r0.refund_cnt",
+      "alias": "Q2",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:e5d8f3b24016f3c9",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     },
+     "ref": "v:Q2.r0.refund_cnt"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s15",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      72,
+      86
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s17",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      88,
+      99
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      88,
+      99
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "下面看退款情况。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      101,
+      109
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "connective",
+     "text": "下面看退款情况。",
+     "span": [
+      101,
+      109
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      111,
+      120
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      111,
+      120
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句、请模型判断时才判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     }
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "units": {
+   "ok": "u1",
+   "bad": "u2",
+   "limit": "u4"
+  },
+  "text_seg": {
+   "ok": "s3",
+   "bad": "s11",
+   "limit": "s17"
+  },
+  "judge": {
+   "bad": {
+    "report": "write",
+    "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+    "verdicts": {
+     "u2": {
+      "status": "unsupported",
+      "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1"
+      ]
+     }
+    },
+    "keys": {
+     "u2": "0000000000000000"
+    },
+    "model": "judge-model-b",
+    "cost_usd": 0.0031,
+    "calls": 1,
+    "limits_hit": [],
+    "gaps": [],
+    "notes": [],
+    "skipped": {},
+    "post_seal": true
+   },
+   "ok": {
+    "report": "write",
+    "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+    "verdicts": {
+     "u1": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "i:week"
+      ]
+     }
+    },
+    "keys": {
+     "u1": "0000000000000000"
+    },
+    "model": "judge-model-b",
+    "cost_usd": 0.0031,
+    "calls": 1,
+    "limits_hit": [],
+    "gaps": [],
+    "notes": [],
+    "skipped": {},
+    "post_seal": true
+   },
+   "limit": {
+    "report": "write",
+    "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+    "verdicts": {
+     "u4": {
+      "status": "unjudged",
+      "rationale": "已到上限（这次点击的裁判金额上限 $0.01），这句没判",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "reason": "max_cost_usd"
+     }
+    },
+    "keys": {
+     "u4": "0000000000000000"
+    },
+    "model": "judge-model-b",
+    "cost_usd": 0.0,
+    "calls": 0,
+    "limits_hit": [
+     "max_cost_usd"
+    ],
+    "gaps": [],
+    "notes": [],
+    "skipped": {},
+    "post_seal": true
+   }
+  },
+  "output": {
+   "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "_evidence": {
+    "report_node": "write",
+    "doc_artifact": "ea710b3978d0f2c98a71ea3ce0d672bb0717a889d70b4f89cd3207c7190f5860",
+    "fields": [
+     "answer"
+    ]
+   },
+   "_issuance": {
+    "tier": "degraded",
+    "matched_numbers": 3,
+    "metrics_checked": 0
+   }
+  }
+ },
+ "plain": {
+  "run_id": "run-evidence-judge-plain",
+  "run_class": "exploratory",
+  "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5",
+  "doc": {
+   "schema": "agentlab.report/1",
+   "run_id": "run-evidence-judge-plain",
+   "node_id": "write",
+   "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[v:Q1.r0.gmv]]，订单 [[v:Q1.r0.order_cnt]] 单。[[see:Q1]]\n\n增长主要来自新客首单，老客复购持平。[[see:Q1]]\n\n退款 [[v:Q2.r0.refund_cnt]] 单，其中大多数是部分退款。[[see:Q2]]\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。[[see:i:week]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:f0db81e2badfc3e2",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "2ed2edc8ed904c049d96eecddc209e88ff3d0ccde4f06c0d6ee6d05f955bf4fa",
+     "via": "7a81331ed15bd9a9910bc90cc54ea6eb8b9dd21b8136464a342c19a49cf7a7c9",
+     "call_id": "toolu_01",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:e483a806bd3a7ad9",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "79c1d7e581637df166e44a93e59b10f4eb0d94ba6f0fd5c76029a3b7c5e53853",
+     "via": "a61a900e68819eba5cc778d74e999759a3754a07ddcf9c5cf67b7856fb479f45",
+     "call_id": "toolu_02",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "i:week": {
+     "alias": "i:week",
+     "kind": "input",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "locator": {
+      "field": "week"
+     },
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "label": "week = 2026-W37"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        7
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "本周概览",
+         "state": "neutral",
+         "span": [
+          3,
+          7
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        9,
+        45
+       ],
+       "cites": [
+        "i:week",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          7,
+          9
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "本周（",
+         "state": "neutral",
+         "span": [
+          9,
+          12
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "value",
+         "text": "2026-W37",
+         "ref": "i:week",
+         "cite": {
+          "ref": "week",
+          "alias": "i:week",
+          "locator": {
+           "field": "week"
+          },
+          "eid": "ev:input:a398c5e60abfeedd",
+          "kind": "input",
+          "role": "value",
+          "status": "resolved",
+          "value": "2026-W37",
+          "rendered": "2026-W37"
+         },
+         "state": "deterministic",
+         "span": [
+          12,
+          20
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "）销售额 ",
+         "state": "neutral",
+         "span": [
+          20,
+          25
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "45,678.5",
+         "ref": "v:Q1.r0.gmv",
+         "cite": {
+          "ref": "Q1.r0.gmv",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gmv"
+          },
+          "eid": "ev:cell:dfba96352ac91db5",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 45678.5,
+          "rendered": "45,678.5"
+         },
+         "state": "deterministic",
+         "span": [
+          25,
+          33
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          33,
+          37
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,234",
+         "ref": "v:Q1.r0.order_cnt",
+         "cite": {
+          "ref": "Q1.r0.order_cnt",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "order_cnt"
+          },
+          "eid": "ev:cell:a12c4cd776db6371",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1234,
+          "rendered": "1,234"
+         },
+         "state": "deterministic",
+         "span": [
+          37,
+          42
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 单。",
+         "state": "neutral",
+         "span": [
+          42,
+          45
+         ],
+         "id": "s9"
+        }
+       ]
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        47,
+        65
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f0db81e2badfc3e2",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          45,
+          47
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客首单，老客复购持平。",
+         "state": "neutral",
+         "span": [
+          47,
+          65
+         ],
+         "id": "s11"
+        }
+       ]
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        67,
+        86
+       ],
+       "cites": [
+        "Q2"
+       ],
+       "see": [
+        {
+         "ref": "Q2",
+         "role": "support",
+         "alias": "Q2",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:e483a806bd3a7ad9",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          65,
+          67
+         ],
+         "id": "s12"
+        },
+        {
+         "kind": "text",
+         "text": "退款 ",
+         "state": "neutral",
+         "span": [
+          67,
+          70
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "number",
+         "text": "29",
+         "ref": "v:Q2.r0.refund_cnt",
+         "cite": {
+          "ref": "Q2.r0.refund_cnt",
+          "alias": "Q2",
+          "locator": {
+           "row": 0,
+           "column": "refund_cnt"
+          },
+          "eid": "ev:cell:e5d8f3b24016f3c9",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 29,
+          "rendered": "29"
+         },
+         "state": "deterministic",
+         "span": [
+          70,
+          72
+         ],
+         "id": "s14"
+        },
+        {
+         "kind": "text",
+         "text": " 单，其中大多数是部分退款。",
+         "state": "neutral",
+         "span": [
+          72,
+          86
+         ],
+         "id": "s15"
+        }
+       ]
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        88,
+        99
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          86,
+          88
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "text",
+         "text": "华东贡献了最多的增量。",
+         "state": "neutral",
+         "span": [
+          88,
+          99
+         ],
+         "id": "s17"
+        }
+       ]
+      }
+     ],
+     "id": "b4"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u5",
+       "kind": "connective",
+       "span": [
+        101,
+        109
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          99,
+          101
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "text",
+         "text": "下面看退款情况。",
+         "state": "neutral",
+         "span": [
+          101,
+          109
+         ],
+         "id": "s19"
+        }
+       ]
+      }
+     ],
+     "id": "b5"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        111,
+        120
+       ],
+       "cites": [
+        "i:week"
+       ],
+       "see": [
+        {
+         "ref": "i:week",
+         "role": "support",
+         "alias": "i:week",
+         "kind": "input",
+         "status": "resolved",
+         "eid": "ev:input:a398c5e60abfeedd",
+         "locator": {
+          "field": "week"
+         }
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          109,
+          111
+         ],
+         "id": "s20"
+        },
+        {
+         "kind": "text",
+         "text": "周报按自然周统计。",
+         "state": "neutral",
+         "span": [
+          111,
+          120
+         ],
+         "id": "s21"
+        }
+       ]
+      }
+     ],
+     "id": "b6"
+    }
+   ],
+   "stats": {
+    "units": 7,
+    "segments": 22,
+    "claims": 5,
+    "connective": 1,
+    "headings": 1,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 4,
+    "uncited_claims": 1,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "graph": {
+   "run_id": "run-evidence-judge-plain",
+   "schema": "agentlab.evidence/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 64,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 7,
+      "segments": 22,
+      "claims": 5,
+      "connective": 1,
+      "headings": 1,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "see": 4,
+      "uncited_claims": 1,
+      "violations": 0
+     }
+    }
+   ],
+   "evidence": [],
+   "edges": []
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     },
+     "ref": "i:week"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:dfba96352ac91db5",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     },
+     "ref": "v:Q1.r0.gmv"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:a12c4cd776db6371",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     },
+     "ref": "v:Q1.r0.order_cnt"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      65
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      47,
+      65
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      67,
+      70
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s14": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s14",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      70,
+      72
+     ],
+     "unit": "u3",
+     "cite": {
+      "ref": "Q2.r0.refund_cnt",
+      "alias": "Q2",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:e5d8f3b24016f3c9",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     },
+     "ref": "v:Q2.r0.refund_cnt"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s15",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      72,
+      86
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      67,
+      86
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s17",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      88,
+      99
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      88,
+      99
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "下面看退款情况。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      101,
+      109
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "connective",
+     "text": "下面看退款情况。",
+     "span": [
+      101,
+      109
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      111,
+      120
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      111,
+      120
+     ]
+    },
+    "chain": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "units": {
+   "bad": "u2"
+  },
+  "text_seg": {
+   "bad": "s11"
+  },
+  "judge": {
+   "bad": {
+    "report": "write",
+    "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5",
+    "verdicts": {
+     "u2": {
+      "status": "unsupported",
+      "rationale": "Q1 只有总销售额和订单数，看不出新客、老客各贡献多少",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1"
+      ]
+     }
+    },
+    "keys": {
+     "u2": "0000000000000000"
+    },
+    "model": "judge-model-b",
+    "cost_usd": 0.0031,
+    "calls": 1,
+    "limits_hit": [],
+    "gaps": [],
+    "notes": [],
+    "skipped": {},
+    "post_seal": true
+   }
+  },
+  "output": {
+   "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n华东贡献了最多的增量。\n\n下面看退款情况。\n\n周报按自然周统计。",
+   "_evidence": {
+    "report_node": "write",
+    "doc_artifact": "a298926483566ca94190b676441c8e9ed914cb99d7ef1cbb2b40a10526e112d5",
+    "fields": [
+     "answer"
+    ]
+   },
+   "_issuance": {
+    "tier": "degraded",
+    "matched_numbers": 3,
+    "metrics_checked": 0,
+    "claims": {
+     "policy": "require_citation",
+     "uncited_claims": 1,
+     "uncited": [
+      {
+       "unit": "u4",
+       "span": [
+        88,
+        99
+       ],
+       "text": "华东贡献了最多的增量。"
+      }
+     ]
+    }
+   }
+  }
+ }
+}

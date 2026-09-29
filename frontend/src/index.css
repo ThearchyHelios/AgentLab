@@ -1639,6 +1639,39 @@
   vertical-align: 1px;
   color: var(--st-waiting);
 }
+/* 结论句的判定（四期）：句末上标的小字形，是按钮但不像按钮。颜色随判定（组件写成 --ev-glyph），
+   绝不用确定性的绿；整句的字不画线——判定是模型给的，不能长得像系统核对过的数字 */
+.ev-badge {
+  display: inline-block;
+  margin: 0 1px 0 2px;
+  padding: 0 3px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  font: inherit;
+  font-size: 0.72em;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: super;
+  color: var(--ev-glyph, currentColor);
+  text-decoration: none;
+  cursor: pointer;
+}
+.ev-badge:hover,
+.ev-badge[aria-expanded="true"] { background: var(--ev-soft, transparent); }
+.ev-badge:focus-visible,
+.ev-badge[data-flash] {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* 证据不支持：整句铺一层浅底，折行时每一行各自带圆角；不画线、不改字色 */
+.ev-claim {
+  background: var(--ev-soft, transparent);
+  border-radius: 2px;
+  text-decoration: none;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
 .ev-panel-side { animation: sheet-in var(--dur-base) var(--ease-out); }
 .ev-panel-rise { animation: fade-up var(--dur-base) var(--ease-out); }
 

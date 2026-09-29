@@ -23,8 +23,23 @@ from typing import Any, Callable
 
 from pydantic import BaseModel
 
-from app.engine.governance import REPORT_POLICY, exit_text_fields, publish_issues
-from app.engine.schema import REPORT_CLAIMS, GraphNode, GraphSpec, NodeType, _ancestors, claims_problem
+from app.engine.governance import (
+    JUDGE_UNLIMITED,
+    REPORT_POLICY,
+    REPORT_POLICY_ALSO,
+    exit_text_fields,
+    publish_issues,
+)
+from app.engine.schema import (
+    CLAIMS_JUDGE,
+    JUDGE_ON_UNSUPPORTED,
+    REPORT_CLAIMS,
+    GraphNode,
+    GraphSpec,
+    NodeType,
+    _ancestors,
+    claims_problem,
+)
 
 #: 被选中的修复按这个顺序应用：先补契约骨架，再补契约里的各项，最后是节点上的开关。
 #: 前面的修复可能改变后面的候选（metrics_from 决定 required 从哪几张卡里挑，report_from 决定
@@ -34,7 +49,7 @@ _ORDER = (
     "contract.report_from_missing", "contract.report_from_invalid", "governed.report_from_required",
     "governed.exit_text_source", "report.metrics_from_invalid",
     "contract.required_missing", "contract.strict_off", "contract.claims_ignored", "report.claims_invalid",
-    "governed.report_policy",
+    "governed.report_policy", "governed.judge_budget",
     "governed.caliber_agent_cite_fields", "governed.caliber_compute_input", "governed.agent_approval_never",
     "governed.default_approval_never", "governed.subgraph_unpinned", "governed.supervisor", "contract.not_object",
     "governed.text_bypass", "governed.caliber_agent_schema", "governed.caliber_model_input",
@@ -210,7 +225,8 @@ def _plan_exit_fields(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) 
 
 
 def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
-    """G3：报告撰写节点写明最严的三项。答案唯一，只往严里改；写了不支持的 claims 由 claims_invalid 管。"""
+    """G3：报告撰写节点写明最严的三项。答案唯一，只往严里改；写了不认识的 claims 由 claims_invalid 管。
+    已经写了更严的写法（claims: judge）的不动——改回 require_citation 就是替人放宽了。"""
     if node is None:
         return None
     writes: dict[str, Any] = {}
@@ -218,7 +234,9 @@ def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None
     for key, want, _ in REPORT_POLICY:
         value = node.config.get(key)
         effective = ctx.spec.defaults.get(key) if value in (None, "") else value
-        if effective != want and not (key == "claims" and claims_problem(effective)):
+        if effective in (want, *REPORT_POLICY_ALSO.get(key, ())):
+            continue
+        if not (key == "claims" and claims_problem(effective)):
             writes[key], before[key] = want, copy.deepcopy(value)
     if not writes:
         return None
@@ -230,18 +248,38 @@ def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None
 
 
 def _plan_claims(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
-    """claims 写了不支持的值。受管级别只认 require_citation，答案唯一；已发布级别 off 和 require_citation
-    都行，要人选——写的是 judge（还不支持的模型裁判）时建议 require_citation：它离裁判最近。"""
+    """claims 写了不认识的值。受管级别改成 require_citation：确定性的两档里只有它合规，答案唯一（judge 要花钱、
+    要写预算，不替人开）；已发布级别 off 和 require_citation 都行，要人选。"""
     if node is None:
         return None
     before = node.config.get("claims")
     if ctx.level == "governed":
-        return _auto(f"把「{node.title}」的 claims 改成 require_citation：受管出具要求每句结论挂引用"
-                     + ("（结论句裁判在后续版本支持）" if before == "judge" else ""), "claims", before, "require_citation")
+        return _auto(f"把「{node.title}」的 claims 改成 require_citation：受管出具要求每句结论挂引用", "claims",
+                     before, "require_citation")
     hints = {"off": "结论句不参与判档，和以前一样", "require_citation": "没挂引用的结论句计入缺口，按出具档位降档"}
     options = [{"value": v, "label": v, "hint": hints[v]} for v in REPORT_CLAIMS]
-    return _choice(f"选「{node.title}」的结论句策略（claims）", "claims", options,
-                   default="require_citation" if before == "judge" else None)
+    return _choice(f"选「{node.title}」的结论句策略（claims）", "claims", options)
+
+
+def _plan_judge_budget(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """G3：claims: judge 没写每份报告的裁判预算。写多少钱只有作者能定：候选是默认金额和「不限」，不替人选、
+    不给建议。judge 原来写在图级 defaults 里的，写到节点上时带上 defaults 那一整份——节点写了 judge 就整个
+    用节点的，只补一个 max_cost_usd 会把 defaults 里选的裁判模型、上限悄悄丢掉。"""
+    from app.engine.judge import JUDGE_DEFAULTS
+
+    if node is None:
+        return None
+    judge = node.config.get("judge")
+    if judge in (None, ""):
+        judge = ctx.spec.defaults.get("judge")
+    base = copy.deepcopy(judge) if isinstance(judge, dict) else {}
+    amount = JUDGE_DEFAULTS["report_max_cost_usd"]
+    options = [
+        {"value": amount, "label": f"每份报告最多 ${amount:g}", "hint": "系统默认的每份报告上限；写进节点以后，改设置不影响这份报告"},
+        {"value": None, "label": "不限（写 null）", "hint": JUDGE_UNLIMITED},
+    ]
+    return _choice(f"给「{node.title}」的结论句裁判写每份报告的预算（judge.max_cost_usd）", "judge.max_cost_usd",
+                   options, _judge=base)
 
 
 def _plan_compute_input(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
@@ -419,6 +457,7 @@ _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str
     "governed.text_bypass": _plan_text_bypass,
     "governed.report_policy": _plan_report_policy,
     "report.claims_invalid": _plan_claims,
+    "governed.judge_budget": _plan_judge_budget,
     "governed.caliber_compute_input": _plan_compute_input,
     "governed.caliber_agent_cite_fields": _plan_cite_fields,
     "governed.caliber_agent_schema": _plan_agent_schema,
@@ -580,12 +619,25 @@ def _edit_exit_fields(graph: dict[str, Any], fix: dict[str, Any], value: Any) ->
     return out
 
 
+def _edit_judge_budget(graph: dict[str, Any], fix: dict[str, Any], value: Any) -> list[tuple[str, str, Any, Any]]:
+    """G3 的裁判预算：节点的 judge 写成（原来生效的那份 judge + 选中的 max_cost_usd）。选「不限」写显式的 null，
+    和没写不是一回事。变更按整份 judge 记：前后都是 null 的 max_cost_usd 在预览里分不出写没写。"""
+    node = _node(graph, fix["node_id"])
+    if node is None:
+        return []
+    config = _config(node)
+    after = {**copy.deepcopy(fix.get("_judge") or {}), "max_cost_usd": value}
+    before = _write(config, "judge", after)
+    return [(str(node["id"]), "judge", before, copy.deepcopy(after))]
+
+
 #: 每类问题怎么改图。大多是同一种「按节点字段写值」，改全图默认、改成果字段的各走一格；留着这张表是为了
 #: 某类修复要特殊处理时只换它自己的那一格（测试里也借它模拟一条出错的修复规则）
 _EDITORS: dict[str, Callable[[dict[str, Any], dict[str, Any], Any], list[tuple[str | None, str, Any, Any]]]] = {
     code: (_edit_defaults if code in _GRAPH_FIXES else _edit) for code in _PLANNERS
 }
 _EDITORS["governed.exit_text_source"] = _edit_exit_fields
+_EDITORS["governed.judge_budget"] = _edit_judge_budget
 
 
 def _handoff(fix: dict[str, Any], value: Any) -> bool:
@@ -811,25 +863,34 @@ def _contract_loosened(name: str, prior: Any, contract: Any) -> list[str]:
     if contract.get("cells") is True and prior.get("cells") is not True:
         out.append(f"替你打开了「{name}」出具契约的 cells（允许报告直接引用查询单元格），这要你自己决定")
     was, now = _claims_rank(prior.get("claims")), _claims_rank(contract.get("claims"))
-    if was is not None and now is not None and now < was:
-        out.append(f"把「{name}」出具契约的 claims 往宽里改了（没挂依据的结论句{_CLAIMS_WORDS[was]} → "
-                   f"{_CLAIMS_WORDS[now]}）")
+    if was is not None and now is not None:
+        looser = [f"{what}{words[a]} → {words[b]}" for (what, words), a, b in zip(_CLAIMS_AXES, was, now) if b < a]
+        if looser:
+            out.append(f"把「{name}」出具契约的 claims 往宽里改了（{'；'.join(looser)}）")
     return out
 
 
-#: 契约 claims 的严格程度：不查 < 查了不算缺口（ignore）< 计入缺口降档（degrade）< 不予出具（withhold）
-_CLAIMS_WORDS = ("不检查", "只标出来", "计入缺口", "不予出具")
+#: 契约 claims 的严格程度分两样，各自从宽到严：没挂依据的结论句（不查 < 查了不算缺口 ignore < 计入缺口降档
+#: degrade < 不予出具 withhold），证据不支持的结论句（不裁判 < 裁判、降档 < 裁判、不予出具）。judge 两样都管：
+#: 挂依据的要求和 require_citation 一样，另外按裁判的判定判档
+_CLAIMS_AXES = (("没挂依据的结论句", ("不检查", "只标出来", "计入缺口", "不予出具")),
+                ("证据不支持的结论句", ("不裁判", "降档出具", "不予出具")))
 
 
-def _claims_rank(value: Any) -> int | None:
-    """契约里 claims 的严格程度，越大越严。judge 这类还不支持的写法不比较（validate 另报）。"""
+def _claims_rank(value: Any) -> tuple[int, int] | None:
+    """契约里 claims 的严格程度：(没挂依据的, 证据不支持的)，各自越大越严，任何一样变小都算放宽。
+    认不出的写法不比较（出口按缺口处理，不会因此放松）。"""
     name = value.get("policy") if isinstance(value, dict) else value
     if name in (None, "", "off"):
-        return 0
-    if name != "require_citation":
+        return 0, 0
+    if name not in ("require_citation", CLAIMS_JUDGE):
         return None
     on_uncited = value.get("on_uncited") if isinstance(value, dict) else None
-    return {"ignore": 1, "withhold": 3}.get(on_uncited, 2)
+    uncited = {"ignore": 1, "withhold": 3}.get(on_uncited, 2)
+    if name != CLAIMS_JUDGE:
+        return uncited, 0
+    on_unsupported = value.get("on_unsupported") if isinstance(value, dict) else None
+    return uncited, 2 if on_unsupported == "withhold" else 1
 
 
 def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
@@ -844,7 +905,8 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     - 审批策略往宽里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行）、删掉写明的审批策略，
       把审批写成（或新加一个）「全部自动放行」；全图默认同理
     - 取消子工作流钉住的版本
-    - 报告撰写节点的 numbers、on_violation、claims 往宽里改；关掉 agent 的 cite_fields
+    - 报告撰写节点的 numbers、on_violation、claims 往宽里改（claims 改成认不出的写法也算），claims 一直是
+      judge 时 judge.on_unsupported 从 withhold 退回去；关掉 agent 的 cite_fields
     - 替人把沙箱代码标成取数（evidence_role: source）：它在取数还是在算只有作者知道。chosen 里的
       (节点 id, 字段) 是人在 choice 里亲手选的，不算
     - 改发布级别——级别不在图里，修复接口也从不写工作流的 status，所以只可能以一个不认识的
@@ -928,12 +990,17 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
 #: 报告撰写节点三项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag）
 _REPORT_STRICT = {"numbers": ("strict", "strict"), "on_violation": ("fail", "flag"),
                   "claims": ("require_citation", "off")}
+#: claims 从宽到严：off < require_citation < judge（在挂引用之外再请模型逐句裁判，不支持的按 on_unsupported
+#: 判档）。不在这里的写法不比较（validate 报 report.claims_invalid）
+_CLAIMS_ORDER = ("off", "require_citation", CLAIMS_JUDGE)
 
 
 def _report_loosened(name: str, prev: dict[str, Any], cfg: dict[str, Any], old_defaults: Any,
                      new_defaults: Any) -> list[str]:
-    """报告撰写节点的三项设置有没有往宽里改：原来（按节点、再按全图默认）是最严的值，改完不是了。
-    claims 改成 judge 不算放宽——那是还不支持的更严的写法，validate 会报。"""
+    """报告撰写节点的三项设置有没有往宽里改：numbers、on_violation 原来（按节点、再按全图默认）是最严的值，
+    改完不是了；claims 按 off < require_citation < judge 排，往下走一格也算（require_citation → judge 是收紧），
+    从 require_citation、judge 改成认不出的写法也算（原来就认不出的不比较）。claims 前后都是 judge 的，
+    再看 judge.on_unsupported 有没有从 withhold 退回去。"""
     def effective(config: dict[str, Any], defaults: Any, key: str, fallback: str) -> Any:
         value = config.get(key)
         if value in (None, ""):
@@ -943,10 +1010,54 @@ def _report_loosened(name: str, prev: dict[str, Any], cfg: dict[str, Any], old_d
     out = []
     for key, (strict, fallback) in _REPORT_STRICT.items():
         was, now = effective(prev, old_defaults, key, fallback), effective(cfg, new_defaults, key, fallback)
-        if was == strict and now != strict and not (key == "claims" and now == "judge"):
-            out.append(f"把「{name}」的 {key} 从 {strict} 放宽成了 {now}"
-                       + ("（去掉了写明的值，运行时退回缺省）" if cfg.get(key) in (None, "") else ""))
+        if key == "claims":
+            if was not in _CLAIMS_ORDER or (was == "off" and now not in _CLAIMS_ORDER):
+                continue
+            if now not in _CLAIMS_ORDER:
+                out.append(f"把「{name}」的 claims 从 {was} 改成了不认识的 {now}")
+                continue
+            if _CLAIMS_ORDER.index(now) >= _CLAIMS_ORDER.index(was):
+                continue
+        elif not (was == strict and now != strict):
+            continue
+        out.append(f"把「{name}」的 {key} 从 {was} 放宽成了 {now}"
+                   + ("（去掉了写明的值，运行时退回缺省）" if cfg.get(key) in (None, "") else ""))
+    if effective(prev, old_defaults, "claims", "off") == effective(cfg, new_defaults, "claims", "off") \
+            == CLAIMS_JUDGE and (why := _judge_loosened(name, prev, cfg, old_defaults, new_defaults)):
+        out.append(why)
     return out
+
+
+def _judge_loosened(name: str, prev: dict[str, Any], cfg: dict[str, Any], old_defaults: Any,
+                    new_defaults: Any) -> str | None:
+    """claims 一直是 judge 时，judge.on_unsupported 从 withhold（证据不支持的结论句不予出具）退回 degrade
+    （只降档）。judge 和运行时（report.report_judge）同一个取法：节点上写了就整个用节点的，没写取图级
+    defaults；on_unsupported 没写、写了认不出的都按 degrade。所以补预算时把 judge 整个换成
+    {max_cost_usd: …}、节点另写一份不带 withhold 的 judge 盖掉全图默认，都算放宽。"""
+    def block(config: dict[str, Any], defaults: Any) -> tuple[Any, bool]:
+        own = config.get("judge")
+        if own not in (None, ""):
+            return own, False
+        return (defaults if isinstance(defaults, dict) else {}).get("judge"), True
+
+    def written(judge: Any) -> Any:
+        return judge.get("on_unsupported") if isinstance(judge, dict) else None
+
+    (old_block, old_inherited), (new_block, new_inherited) = block(prev, old_defaults), block(cfg, new_defaults)
+    if written(old_block) != "withhold" or (raw := written(new_block)) == "withhold":
+        return None
+    was = "withhold" + ("（跟随全图默认）" if old_inherited else "")
+    if raw in JUDGE_ON_UNSUPPORTED:
+        now = f"{raw}" + ("（跟随全图默认）" if new_inherited else "")
+    elif raw not in (None, ""):
+        now = f"认不出的 {raw}（运行时按 degrade）"
+    elif new_inherited:
+        now = "degrade（跟随全图默认，那里没写 on_unsupported，运行时退回缺省）"
+    elif old_inherited:
+        now = "degrade（节点上另写了 judge，整个用节点的、不再跟随全图默认，没写 on_unsupported 就退回缺省）"
+    else:
+        now = "degrade（去掉了写明的值，运行时退回缺省）"
+    return f"把「{name}」的 judge.on_unsupported 从 {was}{'' if old_inherited else ' '}放宽成了 {now}"
 
 
 def _type_word(node_type: Any, type_label: Callable[[Any], str]) -> str:

@@ -14,6 +14,9 @@ from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
 from app.db.models import Provider, Setting
+from app.engine.judge import JUDGE_DEFAULTS, SETTING_GROUP as JUDGE_GROUP, SPEND_KEY as JUDGE_SPEND
+from app.engine.judge import daily_spend, judge_settings
+from app.engine.judge import sanitize_settings as judge_values, settings_problem as judge_problem
 from app.providers import catalog
 from app.providers.factory import ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model
 
@@ -434,6 +437,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "max_agent_steps": app_settings.max_agent_steps,
         "max_run_seconds": app_settings.max_run_seconds,
     },
+    # 结论句裁判（engine/judge.py）：证据裁判模型和各项上限，上限存 null 表示不限。不放进 limits：
+    # 那一组是环境变量定的、只读，这一组是用户自己定的
+    JUDGE_GROUP: dict(JUDGE_DEFAULTS),
 }
 
 
@@ -482,7 +488,11 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # limits 是服务端配置（环境变量），只读：库里可能存着旧版设置页写进去的一份
     #（见过 max_agent_steps: 25），它从来不生效，却会盖住真实的上限，界面照着错的数许诺
     stored.pop("limits", None)
+    # 裁判的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
+    stored.pop(JUDGE_SPEND, None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
+    # 裁判设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
+    merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -498,10 +508,14 @@ async def put_settings(
 ) -> dict[str, Any]:
     from app.tools.trust import SETTING_KEY as TRUST_KEY
 
+    if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
+        # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
+        raise HTTPException(422, problem)
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits"):
+        if key in (TRUST_KEY, "limits", JUDGE_SPEND):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
-            # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效
+            # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效。
+            # 裁判的每日计数是引擎记的账，只有裁判自己写
             continue
         row = await session.get(Setting, key)
         if row:
@@ -510,6 +524,16 @@ async def put_settings(
             session.add(Setting(key=key, value=value))
     await session.commit()
     return await get_settings(session)
+
+
+@router.get("/settings/judge/spend")
+async def get_judge_spend(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """今天（本地日期）结论句裁判花了多少，设置页放在每日上限旁边。只读：计数只有裁判自己记。
+
+    {date, usd, calls, unpriced_calls, daily_max_usd}。unpriced_calls 是价格目录里没有的模型的调用次数，
+    这些调用估不出金额、没有算进 usd。daily_max_usd 为 null 表示不限。
+    """
+    return {**await daily_spend(), "daily_max_usd": (await judge_settings(session))["daily_max_usd"]}
 
 
 @router.get("/system")
