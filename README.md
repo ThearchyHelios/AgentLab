@@ -4,21 +4,21 @@
 并对产出施加可验证的约束。
 
 面向工业场景的**受限动态编排**：模板定义骨架，agent 只在被授权的关节处自由。
-所有算术下沉到受控指标集，叙述层无权创造数字；正式运行钉死在不可变版本上，
-每一次执行的完整证据落进内容寻址的工件库。
+所有算术下沉到受控指标集，叙述层无权创造数字——报告里的数字由系统照快照填值，
+每一个都点得开出处；正式运行钉死在不可变版本上，每一次执行的完整证据落进内容寻址的工件库。
 
 ![运行中的画布](docs/images/canvas-running.png)
 
-<sub>研究助手模板执行中：已完成的节点标绿、执行中的节点高亮并显示进度，
-右栏是同一份事件流驱动的实时时间线。</sub>
+<sub>研究助手模板用 Mock 执行中：跑完的节点打勾，执行中的节点显示耗时和流式输出；
+底部航迹是实时时间轴，右栏是同一份事件流驱动的运行步骤。</sub>
 
 ---
 
 ## 目录
 
 - [快速开始](#快速开始) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
-- [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构) · [关键设计决策](#关键设计决策)
-- [运行环境](#运行环境) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
+- [可点击证据](#可点击证据报告里的每个数都点得开出处) · [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构)
+- [关键设计决策](#关键设计决策) · [运行环境](#运行环境) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
 
 ---
 
@@ -39,12 +39,19 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 
 服务启动于 http://localhost:5273 。
 
+要让同一网络里的手机、别的电脑打开，用 `./scripts/dev.sh --host`：前端监听所有网卡，启动时打印局域网地址；
+后端仍只听 127.0.0.1，页面里的 `/api` 由前端开发服务器在本机转发。**AgentLab 没有登录**，同一网络里打得开
+页面的人都能用它——跑工作流、花你配的模型额度、读数据源、执行沙箱代码，只在信得过的网络里开。
+认不出的参数直接报错，`./scripts/dev.sh --help` 看用法。
+
 **无需配置 API Key 即可完整体验。** 内置 Mock provider 产出流式回复、工具调用与
 符合 schema 的结构化数据，编排链路（画布高亮、审批中断、沙箱执行）会完整走一遍。
 接入真实模型请在「设置 → 模型接入」配置。启动时若环境变量中存在
 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`，将自动导入为 provider。
+Mock 不会写引用标记：探索运行里报告撰写节点照样跑完，但里面的数字全标成「无证据」，
+要看到逐段可点的出处得接真实模型。
 
-内置 8 个模板，从「最小问答」到「周报（口径卡 + 三档出具）」，既可直接运行，
+内置 9 个模板，从「最小问答」到「可追溯周报」，既可直接运行，
 也是各类节点用法的可执行文档。
 
 ---
@@ -53,10 +60,11 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 
 | 领域 | 能力 |
 |---|---|
-| **可视化编排** | 16 种节点拖拽连线；运行时节点实时高亮、边上光点流动画、卡片内直接呈现流式 token；多 agent 节点在卡片里展开协作矩阵（谁在跑、几个人并行、省下多少） |
-| **对话式取数** | 「问数据」页：自然语言提问，系统自行接入数据源、生成工作流、执行并给出结论；对话持久化、可分享链接 |
+| **可视化编排** | 17 种节点拖拽连线；运行时节点实时高亮、边上光点流动画、卡片内直接呈现流式 token；底部航迹把各节点的起止和并行度排在一条时间轴上，实时和回放共用；多 agent 节点在卡片里展开协作矩阵（谁在跑、几个人并行、省下多少） |
+| **对话式取数** | 「问数据」页：自然语言提问，系统自行接入数据源、生成工作流、执行并给出结论；答案里有数字时经报告撰写节点输出、逐段点得开；对话持久化、可分享链接 |
 | **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama 等）+ Mock |
-| **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入 |
+| **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入；MCP 与自定义工具默认每次等审批，可逐个改成门控模型把关或始终允许 |
+| **Agent 护栏** | 同样的调用不重复执行、连续拿不到新信息就收尾、令牌与金额预算、上下文接近窗口先压缩再收尾；步数只留兜底（默认 100） |
 | **代码沙箱** | 双档隔离：系统沙箱（Seatbelt / bubblewrap，冷启动约 25ms）或 microVM（独立 Linux 内核，内存限额真实生效） |
 | **人工介入** | 执行暂停并落盘，人工批准 / 驳回 / 改稿后从断点继续；进程重启不丢状态 |
 | **断点续跑** | 失败的运行可从失败节点继续，已完成的节点不重复执行；允许修改节点配置，但拓扑必须一致 |
@@ -68,7 +76,9 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 | **结构化成果** | JSON Schema 校验，不合格时将错误回传模型自动返工 |
 | **产出复核** | 运行结束后规则扫描事件流，发现异常才调用模型复核；复核可重组答案但**不得引入原答案中不存在的数字** |
 | **追踪与成本** | 全量事件落库可回放；逐节点耗时、token 用量、按目录价折算的成本 |
-| **三档出具** | 口径卡（受控指标集）+ 出具契约：叙述中每个数字回指指标集，formal / degraded / withheld 三档判定 |
+| **三档出具** | 口径卡（受控指标集）+ 出具契约：叙述中每个数字回指指标集，或由报告撰写节点按引用逐段核对，formal / degraded / withheld 三档判定 |
+| **可点击证据** | 报告撰写节点只写引用标记，数字和表格由系统照快照填值；数字、表名字段名、知识库原话都点得开，一路指到查询结果里的那一格；结论句可要求挂依据或交给另一个模型裁判；证据清单可导出 |
+| **发布前检查** | 受管级别加证据门禁 G1–G5；问题给出一键修复 / 选项 / 交给 Copilot 三类修法，一律先预览、不许降低要求；老工作流一键升级为可追溯结构 |
 | **正式 / 探索分级** | 正式运行仅从已发布的不可变版本发起（按图哈希钉死）；画布试跑自动标记为探索性 |
 
 ---
@@ -92,7 +102,8 @@ flowchart LR
 
 - **模板层**　正式运行只认已发布的不可变版本。发布后修改画布不影响已发布版本。
   governed 级发布须通过治理 lint：禁用 supervisor（全动态归属探索层）、方法卡必须钉版本、
-  agent 不得关闭全部审批、output 必须配置出具契约。
+  agent 不得关闭全部审批、output 必须配置出具契约，另有证据门禁 G1–G5
+  （见[受管门禁与发布前修复](#受管门禁与发布前修复)）。
 - **关节层**　授权范围内的自由。工具白名单衰减报表（`/api/governance/tool-usage`）
   将「已授权但从未使用」的工具显性化，为收缩权限提供依据。
 - **探索层**　结果自动标记为探索性，不进正式归档。跑通的路径经「提取模板」沉淀为草稿
@@ -101,7 +112,9 @@ flowchart LR
 
 ### 出具链路
 
-模板⑧是完整示范。设计前提是**派生边界收死**：所有算术发生在口径卡节点内，叙述层只能引用。
+模板⑧是最小示范：叙述由模型调用节点写，出口按数值回指。模板⑨把叙述换成报告撰写节点，
+数字按引用填值（见[可点击证据](#可点击证据报告里的每个数都点得开出处)）。两者的设计前提都是
+**派生边界收死**：所有算术发生在口径卡节点内，叙述层只能引用。
 
 ```mermaid
 flowchart LR
@@ -135,6 +148,76 @@ flowchart LR
 每次运行的完整证据存于内容寻址的工件库（`data/artifacts/`，sha256 即地址，取回时复验哈希）；
 运行终态的事件清单哈希记录在 Run 上（封存到 `run.finished` 为止），事后修改流水将无法对齐。
 运行详情页一键核对，接口是 `GET /api/runs/{id}/verify`；封存之后追加的事件不在核对范围内。
+
+---
+
+## 可点击证据：报告里的每个数都点得开出处
+
+按数值回指只能在出口回头猜出处，同值的指标一多就猜错。可点击证据把核对挪到写的那一刻，
+出处直接写进报告的数据结构里。
+
+![证据面板](docs/images/evidence-panel.png)
+
+<sub>记录页的「证据」页签：点开「环比 8.7%」，右栏从口径卡的原式、代入式一路指到两次查询里被引用的那一格，
+末尾是封存核对；左下是证据清单。Mock 写不出带引用的报告，这次运行用前端测试夹具
+（`frontend/src/run/__tests__/evidence-query.json`，示例数据）伪造，列表里其余几条是 Mock 真跑的。</sub>
+
+**引用即渲染。** 报告撰写节点（`report`）里模型只写引用标记，数值由系统照快照填进去：
+
+```
+[[m:gmv]]  [[m:gmv|万]]                    口径卡指标；换算显示也由系统完成
+[[i:week]]                                 运行输入
+[[v:Q1.r0.gmv]]                            查询快照里的一格，取回时复验哈希
+[[table:Q1 cols=region,amount rows=0-4]]   系统照快照生成整张表，每一格都点得开
+[[t:orders]]  [[c:orders.week]]            表名、字段名；写在反引号里的名字同样核对
+[[q:K1|原话]]                              知识库原话，须在那次检索命中的片段里逐字出现
+[[see:m:gmv,Q1]]                           结论句的依据，挂在句末，不渲染
+```
+
+流式输出里看到的就是最终数字。裸数字、解析不了的引用当场判违规、交回去重写（`max_repairs`，默认 1 次），
+仍不过关时按 `on_violation` 让节点失败（正式运行默认）或把违规标在报告里（探索运行默认）。
+出具契约写了 `report_from` 就按引用核对：取回报告文档时复验哈希、独立重算一遍，全部带引用才判完整出具。
+
+**取数链路。** agent、工具节点、代码节点、知识检索取数时都记进证据台账，报告目录按台账编出 Q1… / K1…。
+口径卡表达式可以写 `cell(nodes.pull, 0, 'gmv')`，出处精确到单元格。agent 开 `cite_fields`（配合 `output_schema`）
+后，每个字段标出取自哪次查询的哪一格，再到快照里核对：对不上以快照为准并告警，查不到的记为空值，不兜底成 0。
+代码节点分 `evidence_role`：`source` 是取数，`compute`（默认）是计算——沙箱算出来的数不能被报告直接引用，
+要进口径卡。数据源可设 `mask_columns` 遮罩列（只减少暴露，不是安全边界）。
+
+**点开看到什么。** 数字：指标的原式、代入式和复算结果，输入与快照是否一致，查询的 SQL、被引用的行加前后
+各 2 行、高亮到格，最后是封存状态；只认封存范围内的事件交回过的工件。表名、字段名：出现在哪次查询、类型、
+所属的表。表结构快照、SQL、结果列里都没有的名字标成可疑实体（「可能是编造的名字」，附最接近的 3 个）；
+快照被截断、核对不了的只说核对不了，不冤枉成编造。
+
+**结论句。** 报告节点的 `claims`：`off`（默认）不管；`require_citation` 要求结论句挂依据，没挂的计入缺口；
+`judge` 再请另一个模型按证据逐句判为支持 / 部分支持 / 不支持 / 不是结论，只标注、不改写正文，裁判模型和
+写作模型相同时给警告。正式运行在节点内判，判定随报告一起封存，不支持的按 `on_unsupported` 降档或不予出具；
+探索运行点开哪句判哪句，判定作为封存之后追加的事件记下，封存核对照样一致。每份报告的句数、金额、时长，
+每次点击的金额，每天的总金额都有上限（默认 40 句、$0.05、30 秒，每次点击 $0.01，每天 $2），每一项都能设成不限。
+
+**审计与旧运行。** `GET /api/runs/{id}/evidence/audit` 按无证据 / 可疑实体 / 有出处 / 旧运行猜测分组，
+可导出 JSON 和 CSV。没有契约的旧答案按数值和已封存的查询单元格、口径卡值比对，每个数最多 3 个候选，
+默认折叠，写明「猜测的来源，不能当证据」。老工作流可以一键升级为可追溯结构：模型调用写的报告换成报告撰写节点，
+问数据的 input → agent → output 中间插一个报告撰写，配了 `output_schema` 的 agent 打开 `cite_fields`；
+沙箱代码喂口径卡的只建议标成 `source`，不替人改。升级只给预览，人确认后才保存。
+
+### 受管门禁与发布前修复
+
+受管级别在治理 lint 之外加了证据门禁，只看图和配置，让「每个数都点得开」在结构上成立：
+
+- **G1** 带契约的出口，成果字段的文字只能来自报告撰写节点
+- **G2** 模型写的文字不绕过报告撰写节点直接流进出口
+- **G3** 报告撰写节点写明 `numbers: strict`、`on_violation: fail`、`claims: require_citation`（或 `judge` 并写预算）
+- **G4** 口径卡的输入不来自计算角色的沙箱代码
+- **G5** 给口径卡供数的 agent 配 `output_schema` 并开 `cite_fields`
+
+受管级别下是错误、挡住发布；已发布级别只给警告；已经发布的版本照常运行，下次发布时按新规则检查。
+
+发布弹窗打开就先跑一遍发布前检查（`POST /api/workflows/{id}/publish-check`，和真正发布同一套口径），
+问题面板里平时也看得到。修复（`/autofix`）分三类：答案唯一的一键修复；要人拿主意的给选项、不替人选；
+结构性的交给 Copilot。一律先预览，不自动保存、不自动发布。删节点、删契约、放宽审批、关掉 strict、改级别
+这类降低要求的改动一律拒绝，Copilot 的方案也要过这一关；应用后重跑检查，错误必须变少、不能冒出新的。
+一键升级（`POST /api/copilot/upgrade-evidence`）过的也是这道检查。
 
 ---
 
@@ -186,7 +269,7 @@ flowchart LR
 | 分类 | 节点 | 说明 |
 |---|---|---|
 | 起止 | `input` `output` | 声明输入字段 / 收集结构化成果 |
-| 模型 | `llm` `agent` `supervisor` | 单次调用 / 带工具循环 / 多 agent 协作 |
+| 模型 | `llm` `agent` `supervisor` `report` | 单次调用 / 带工具循环 / 多 agent 协作 / 报告撰写（只写引用标记，数字由系统填） |
 | 执行 | `tool` `code` | 直接调用工具 / 沙箱内执行代码 |
 | 控制 | `branch` `loop` `subgraph` | 条件或语义分支 / 遍历与条件循环 / 嵌套工作流 |
 | 上下文 | `memory` `retrieve` `transform` | 长期记忆读写 / 知识检索 / 数据整形 |
@@ -201,11 +284,11 @@ flowchart TB
     subgraph FE["前端 · React 19 + React Flow + Zustand"]
         F1["画布编辑"]
         F2["问数据"]
-        F3["运行追踪"]
+        F3["运行追踪 · 证据面板"]
         F4["decode.ts<br/><i>事件 → 人类可读的唯一翻译层</i>"]
     end
     subgraph BE["后端 · FastAPI + LangGraph"]
-        B1["engine<br/>编译 · 调度 · 中断恢复"]
+        B1["engine<br/>编译 · 调度 · 中断恢复 · 出具与证据"]
         B2["providers<br/>多模型接入与成本估算"]
         B3["tools<br/>注册表 · MCP · 数据源"]
         B4["memory<br/>记忆 · 知识库 · 混合检索"]
@@ -227,23 +310,29 @@ backend/                  FastAPI + LangGraph
     compiler.py           编译：节点包装、事件、重试、条件路由
     runner.py             执行调度、事件总线、中断与恢复
     issuance.py           出具契约：数字回指与三档判定
+    evidence.py           可点击证据：证据台账、引用标记、报告文档的切块与核对（纯函数）
+    judge.py              结论句裁判：预筛、成本上限、判定写回
+    governance.py         发布门禁：受管 lint 与证据门禁 G1–G5
+    autofix.py            发布前自动修复；upgrade.py 一键升级为可追溯结构
+    guards.py             agent 护栏：重复调用、预算、上下文压缩
     review.py             产出复核：事件流规则扫描 + 模型复核
     expressions.py        模板插值 + AST 白名单表达式求值
-    nodes/                各类节点的执行器
+    nodes/                各类节点的执行器（report.py 是报告撰写）
   app/data/               数据源接入：连接、SQL 守卫、结构探查、表格导入
   app/providers/          多模型接入与成本估算
   app/sandbox/            microVM / Seatbelt / bubblewrap / 裸子进程四后端
   app/tools/              工具注册表、内置工具、MCP、自定义工具
   app/memory/             记忆、知识库、倒排索引、混合检索、文档解析
-  app/api/                REST + WebSocket
+  app/api/                REST + WebSocket（证据接口在 evidence.py）
 frontend/                 React 19 + React Flow + Zustand
   src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩均由其驱动
   src/canvas/routing.ts   连线走线：端口错开、走廊车道、长边绕行
   src/run/decode.ts       事件流 → 人类可读步骤的唯一翻译层
+  src/run/EvidenceDoc.tsx 报告逐段渲染：数字、名字、原话都是可点的片段；EvidencePanel.tsx 是出处链
   src/store/studio.ts     画布状态 + 事件流到高亮的映射
 environment.yml           conda 环境定义
 scripts/dev.sh            一键启动
-scripts/check-*.mjs       前端验证脚本
+scripts/check-all.mjs     前端检查的总入口：分道并行跑全部 check-*.mjs，汇总成一张表
 ```
 
 ---
@@ -286,6 +375,18 @@ scripts/check-*.mjs       前端验证脚本
 并行度。系统里关掉动效时（`prefers-reduced-motion`）光效整体不绘制而不是停住——
 停在最后一帧的光弧和堆在起点的光点看着像渲染坏了；静态下"谁在跑"由实心圆点和
 "进行中"三个字承担。
+
+### agent 的护栏取代固定步数
+
+以前 agent 节点一律「最多 12 步」。固定步数想挡的是四件事，每件都有更贴切的挡法（`engine/guards.py`）：
+
+- **循环不收敛**：同一个工具、同样的参数第二次不再执行，把上次的结果交还给它；连续 3 步拿不到新信息就收尾
+- **花费越滚越大**：每个节点记令牌预算（默认 200 万）和金额预算（默认不限），都可以在设置里改成不限
+- **上下文会满**：用到窗口的 60% 先压缩早期的工具结果，到 85% 就收尾
+- **真正失控**：步数只留兜底，默认 100，设置里可改，`AGENTLAB_MAX_AGENT_STEPS` 封顶
+
+临近任何一个上限先提醒模型一次。上限在运行发起时快照，恢复和接着跑沿用同一份——审批恢复时节点整个重放，
+上限一变，循环停的位置就和 checkpoint 对不上。下游结构化校验失败时，报错写明是上游哪个 agent 提前收了尾。
 
 ### 沙箱：双档隔离，以及必须声明的缺口
 
@@ -369,7 +470,7 @@ Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型�
 - 人工审批只认明确的批准（`true` / 同意 / approve），看不懂的回复一律按拒绝处理。
   危不危险逐次判定：同一个 `db_query__<源>`，查询直接执行，可写源上的写操作要先确认，
   确认后才提交。协作团队的成员停不下来等人，需要确认的调用不执行，会告诉成员换一种做法
-- MCP 与自定义工具平台看不出它做什么，默认每次调用都等审批。工具页可逐个改成「始终允许 · 门控把关」
+- MCP 与自定义工具平台看不出它做什么，默认每次调用都等审批（三档：`ask` / `gated` / `always`）。工具页可逐个改成「始终允许 · 门控把关」
   （每次调用先由门控模型审一遍参数，拿不准、出错、超时都交还给人）或「始终允许」；审批卡上的
   「始终允许」等于前者。档位在发起运行时快照，恢复和接着跑沿用同一份；正式运行不看档位，一律等审批
 - API Key 经 Fernet 加密落库，仅向前端返回掩码
@@ -392,13 +493,37 @@ auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
 
 1. Python 包：使用 `environment.yml` 创建环境时已包含（含 `[microvm]` extra）
 2. 运行时（约 50MB，落于 `~/.microsandbox`）：每台机器一次
-3. OCI 镜像（实测约 55 秒）：首次执行代码时自动拉取，每个镜像一次
+3. OCI 镜像（实测约 55 秒）：每个镜像一次
 
-仅第 2 项需手动执行：
+第 2、3 项手动执行，装完用 `doctor` 检查本机的虚拟化条件，再重启 `dev.sh`：
 
 ```bash
-conda run -n agentlab python -c "import asyncio,microsandbox as m; asyncio.run(m.install())"
+conda run -n agentlab python -c "exec('import asyncio, microsandbox as m\nasync def main():\n    await m.install()\nasyncio.run(main())')"
+conda run -n agentlab microsandbox pull python:3.12-slim   # 默认镜像，换了 AGENTLAB_MICROVM_IMAGE 就拉那个
+conda run -n agentlab microsandbox doctor
 ```
+
+镜像要先拉：auto 只选镜像已经缓存的 microVM（免得第一次跑代码卡一分钟），没缓存就跳过它，而镜像又只在
+microVM 里跑代码时才会拉——不手动拉，auto 永远选不到它。后端选定沙箱后整个进程都沿用，装好之后要重启 `dev.sh`
+才会重新选。不想等也可以显式指定 `AGENTLAB_SANDBOX_BACKEND=microvm`，第一次跑代码时再拉镜像。
+
+拉镜像报 `registry error: error sending request for url (https://index.docker.io/...)` 是连不上 Docker Hub。
+msb 认 `HTTPS_PROXY` / `ALL_PROXY`，给它指一个代理：`HTTPS_PROXY=http://<代理地址>:<端口> microsandbox pull python:3.12-slim`；
+或者从能连上的镜像源拉（写完整名字，如 `<镜像源>/library/python:3.12-slim`），再把 `AGENTLAB_MICROVM_IMAGE`
+设成同一个名字，让 AgentLab 用的正是拉下来的那一份。
+
+`install` 要在正在跑的事件循环里调用：写成 `asyncio.run(m.install())` 会先在循环外调用它，报
+`RuntimeError: no running event loop`，所以包了一层 `async def`。Linux 要有 `/dev/kvm`，当前用户还得有权限——
+doctor 报「/dev/kvm is not accessible by your user」时：
+
+```bash
+sudo usermod -aG kvm $USER               # 永久生效，重新登录后才算数
+sudo setfacl -m u:$USER:rw /dev/kvm      # 当前会话立即可用
+```
+
+也可以直接 `microsandbox doctor --fix`。改完再跑一次 doctor，应当全是 ✓。doctor 全绿不等于第 2 项装好了：
+它只查 wheel 里自带的 msb 和 libkrunfw，AgentLab 用 `microsandbox.is_installed()` 判断，看的是 `~/.microsandbox`，
+所以上面那条安装命令照样要跑。
 
 三项均落于磁盘，重启机器或重开终端无需重来。设置页「运行环境」中 `microvm` 条目的
 `warm` 为 true 即表示三项齐备，auto 将自动升级至 `microvm`。镜像可通过
@@ -478,26 +603,45 @@ agent 侧同样会收到实情，并被告知可直接查询 `information_schema
 loop 节点给它定轮数上限的环：用 loop 节点包住它。确实需要更多步，调大
 `AGENTLAB_MAX_GRAPH_STEPS`（默认 200）。
 
+**agent 没查完就收了尾。** 时间线里有一条提示写明原因：步数用满、连续几步拿不到新信息、令牌或金额预算用完、
+上下文接近窗口。按提示调节点上或设置里的步数、预算（预算可以设成不限），见
+[agent 的护栏](#agent-的护栏取代固定步数)。
+
 ---
 
 ## 开发与验证
 
 ```bash
-# 后端：470 个测试
-cd backend && pytest tests
+# 后端：约 2860 个测试，-n auto 并行约 16 秒
+cd backend && env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
+  python -m pytest -n auto
 
 # 前端类型检查
 cd frontend && npx tsc -b
 
-# 前端验证（需先启动 ./scripts/dev.sh）
-node scripts/check-decode.mjs        # 事件 → 步骤的翻译是否正确
-node scripts/check-stream.mjs        # 助手流组件渲染是否正确
-node scripts/check-ui.mjs            # 真浏览器端到端：URL 寻址、会话、运行详情
-node scripts/check-canvas-layout.mjs # 排版与连线几何：线有没有叠、有没有穿过卡片
-node scripts/check-canvas-fx.mjs     # 运行态动效：协作矩阵、并行度、命中的出口、关掉动效
-node scripts/check-guards.mjs        # 护栏：输入法回车、未知节点类型、页面级错误边界（不写库）
-node scripts/e2e-check.mjs           # 冒烟：打开画布 → 选模板 → 运行 → 观察高亮
+# 前端检查：17 项，默认 8 道并行，约 3.5 分钟。连 5273 / 8000，先起 ./scripts/dev.sh
+node scripts/check-all.mjs
+# 另起 2 套只给检查用的「后端 + vite」，各用一份数据拷贝，约 3 分钟；边改代码边跑也不被打断
+CHECK_DATA_SRC=<数据目录> node scripts/check-all.mjs --stacks 2 --lanes 12
+# 只跑某几项（名字去掉 check- 前缀）
+node scripts/check-all.mjs evidence publish
 ```
+
+pytest 前面的 `env -u` 不能省：没配 Key 的 provider 会退回环境变量里的密钥，启动时的 seed 也会拿它种一个
+provider——环境里留着真密钥，测试就可能真的去调接口。
+
+`check-all` 的 17 项按 `scripts/check-all.mjs` 里 `ORDER` 的顺序排：
+
+| 类别 | 检查 |
+|---|---|
+| 不开浏览器 | `tokens`（令牌静态扫描）`trace`（运行态内核的纯函数）`decode`（事件翻译层） |
+| 走线、组件与护栏 | `canvas-layout` `ui-kit` `guards` |
+| 外壳、回答流与运行态 | `shell` `stream` `evidence`（可点击证据）`run-states`（节点卡）`canvas-fx`（画布表层） |
+| 各页面 | `studio` `publish`（发布前检查与自动修复）`chat` `runs` `manage` `ui`（端到端，连真数据） |
+
+完整输出写进 `/tmp/agentlab-checks/<时间>/`，终端只给汇总；并行时没过的最后单独重跑一遍，重跑才过的单列成「偶发」。
+`--stacks` 每套拷一份数据、端口自动挑空闲的，后端不热重载、vite 不监听文件，跑完、出错或被中断都收干净。
+`scripts/e2e-check.mjs` 真发起一次运行（Mock，不花钱），会在库里留下记录，所以不在 check-all 里。
 
 三层前端验证的分工：`check-decode` 守「翻译对不对」，`check-stream` 守「画出来对不对」，
 `check-ui` 守「整条路走得通不通」。三者可各自通过而合起来是坏的——例如 Step 字段全部正确，
