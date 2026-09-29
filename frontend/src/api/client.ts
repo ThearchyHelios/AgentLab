@@ -1,6 +1,6 @@
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
-  EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
+  EvidenceAudit, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow,
   WorkflowVersion,
 } from '../types'
@@ -702,6 +702,31 @@ export const api = {
       get<EvidenceSegmentDetail>(
         `/runs/${encodeURIComponent(runId)}/evidence/segments/${encodeURIComponent(segmentId)}${qs({ report: opts?.report })}`,
         opts),
+    /**
+     * 审计表：每个有状态的片段按状态分组（有出处 / 无证据 / 可疑实体 / 旧运行猜测），附上封存核对的结果。
+     * groups 只要这几组（none、suspicious…）
+     */
+    audit: (runId: string, opts?: RequestOptions & { groups?: string[] }) =>
+      get<EvidenceAudit>(`/runs/${encodeURIComponent(runId)}/evidence/audit${qs({ groups: opts?.groups?.join(',') || undefined })}`, opts),
+    /**
+     * 导出审计表：?format=json / csv 作为附件下载。回来的是文件本身和后端给的文件名
+     * （Content-Disposition；没给就用 evidence-<运行号前 8 位>.<格式>）
+     */
+    auditExport: async (runId: string, format: 'json' | 'csv', groups?: string[]): Promise<{ blob: Blob; name: string }> => {
+      const path = `/runs/${encodeURIComponent(runId)}/evidence/audit${qs({ format, groups: groups?.join(',') || undefined })}`
+      let res: Response
+      try {
+        res = await fetch(BASE + path, { headers: actorHeader() })
+      } catch (e: any) {
+        const err = new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: `${e?.name ?? 'Error'}: ${e?.message ?? e}` })
+        report(false, err)
+        throw err
+      }
+      if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''), path)
+      report(true)
+      const named = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(res.headers.get('Content-Disposition') ?? '')?.[1]
+      return { blob: await res.blob(), name: named ? decodeURIComponent(named) : `evidence-${runId.slice(0, 8)}.${format}` }
+    },
   },
 
   // ---- 会话 ----

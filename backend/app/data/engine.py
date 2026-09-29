@@ -499,13 +499,14 @@ async def run_query(
     时限没指定时按数据源自己的配置（query_timeout），由数据库执行（_server_deadline）。
     """
     limits = limits or QueryLimits(timeout_seconds=query_timeout(source))
-    statement = check(sql, readonly=bool(source.readonly), source_name=source.name)
     kind = (source.kind or "").lower()
+    # 按数据源的方言扫：MySQL 的反斜杠转义、PG 的 $$ 字符串，守卫要和数据库读得一样
+    statement = check(sql, readonly=bool(source.readonly), source_name=source.name, dialect=kind)
 
     engine = await engines.get(source)
     started = time.perf_counter()
 
-    if not source.readonly and is_write(statement):
+    if not source.readonly and is_write(statement, dialect=kind):
         return await _run_write(engine, kind, statement, limits, started)
 
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:

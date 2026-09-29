@@ -422,6 +422,34 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
                        node_id=node.id, field="metrics_from", code=code)
 
 
+#: 报告撰写节点的结论句策略（claims）。off：结论句不参与判档（默认，保持以前的行为）；
+#: require_citation：没挂引用的结论句计入缺口、按出具档位降档。judge（模型裁判）是后续版本的
+REPORT_CLAIMS = ("off", "require_citation")
+CLAIMS_LATER = "结论句裁判在后续版本支持"
+
+
+def claims_problem(value: Any) -> str | None:
+    """claims 的取值有什么问题，没问题返回 None。校验和报告撰写节点执行时报的是同一句话。"""
+    if value in (None, "") or (isinstance(value, str) and value in REPORT_CLAIMS):
+        return None
+    if value == "judge":
+        return f"claims 写的是 judge：{CLAIMS_LATER}，现在只能写 off 或 require_citation"
+    return f"claims 只能是 {' / '.join(REPORT_CLAIMS)}，写的是 {value!r}"
+
+
+def _check_report_claims(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """claims 写错了（包括还不支持的 judge）挡住运行：执行时报告节点照样会报这一句，
+    与其跑完取数、算完口径卡才死在写报告那一步，不如在画图时说破。
+
+    和运行时同一个取值规则：节点上没写就取图级 defaults（NodeContext.cfg）。
+    """
+    value = node.config.get("claims")
+    if value in (None, ""):
+        value = spec.defaults.get("claims")
+    if problem := claims_problem(value):
+        result.add(problem, node_id=node.id, field="claims", code="report.claims_invalid")
+
+
 def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
                        result: ValidationResult) -> None:
     """引用模式的契约：report_from 必须是出口上游的报告撰写节点。"""
@@ -506,6 +534,7 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                                node_id=node.id, field=f"metrics[{i}]")
         elif node.type == NodeType.REPORT:
             _check_report_sources(node, spec, result)
+            _check_report_claims(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not isinstance(contract, dict):
@@ -982,15 +1011,16 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
 
     out: list[ValidationIssue] = []
 
-    def add(message: str, node: GraphNode, field: str, level: str = "warning") -> None:
-        out.append(ValidationIssue(level=level, node_id=node.id, field=field, message=message))  # type: ignore[arg-type]
+    def add(message: str, node: GraphNode, field: str, level: str = "warning", code: str | None = None) -> None:
+        out.append(ValidationIssue(level=level, node_id=node.id, field=field, message=message,  # type: ignore[arg-type]
+                                   code=code))
 
     for node in spec.nodes:
         cfg = node.config
         if node.type == NodeType.AGENT and cfg.get("output_schema") and cfg.get("cite_fields") is not True:
             add("output_schema 要开 cite_fields 才生效，会多一次抽取调用：开了之后循环结束再按 Schema "
                 "抽一次字段，每个字段都核对到查询结果里的那一格；不开的话 assign_to 拿到的仍是自由文字",
-                node, "output_schema")
+                node, "output_schema", code="evidence.cite_fields_off")
         elif node.type == NodeType.CODE:
             role = cfg.get("evidence_role")
             if role not in (None, "") and role not in EVIDENCE_ROLES:
@@ -1007,7 +1037,8 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
                 warned.add(producer.id)
                 add(f"口径卡的输入来自沙箱代码「{producer.title}」，它的角色是计算（evidence_role 不是 source）："
                     "沙箱里算出来的数核对不了出处。负责取数的代码节点把 evidence_role 标成 source；"
-                    "业务计算挪进口径卡的表达式", node, f"metrics[{i}].expression")
+                    "业务计算挪进口径卡的表达式", node, f"metrics[{i}].expression",
+                    code="evidence.caliber_compute_input")
     return out
 
 

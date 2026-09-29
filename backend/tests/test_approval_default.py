@@ -157,9 +157,11 @@ def _governable(tool: str):
         node("q", "tool", tool=tool, args={"sql": "DELETE FROM t WHERE x = 0"}),
         node("caliber", "metrics", caliber="删除口径", caliber_version="v1", assign_to="m",
              metrics=[{"id": "done", "name": "已执行", "unit": "次", "expression": "1"}]),
+        # 受管契约要核对报告撰写节点的文档（门禁 G1），叙述模式发不成受管
+        node("write", "report", instructions="写执行结果",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("out", "output", fields=[{"name": "结果", "value": "{{ nodes.q }}"}],
-             contract={"metrics_from": ["caliber"], "narrative": "执行了 {{ vars.m.done }} 次",
-                       "required": ["done"], "strict": True}),
+             contract={"metrics_from": ["caliber"], "report_from": "write", "required": ["done"], "strict": True}),
     )
 
 

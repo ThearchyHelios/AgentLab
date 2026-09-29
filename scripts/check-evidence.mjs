@@ -27,6 +27,11 @@ const fx = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-d
 // 第二期：报告直接引用查询单元格、整表，口径卡的输入核对到 agent 字段和查询快照。文档同样是
 // compose_doc 真跑出来的（查询快照走 loader），片段接口的答复按方案第 5 节和 NOTES-A2 的形状拼
 const fxq = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-query.json`, 'utf8'))
+// 第三期：表名字段名（反引号里的、标记的、自动链接的）、可疑实体、核对不了的名字、逐字引文，
+// 以及没有契约的旧运行按数值猜的候选。文档和猜测都是后端真跑出来的（compose_doc / guess_sources）
+const fxe = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-entity.json`, 'utf8'))
+/** 夹具里某段文字是哪个片段：检查按文字认片段，重新生成夹具时编号变了也不用改 */
+const segOf = (doc, text) => doc.blocks.flatMap((b) => b.units.flatMap((u) => u.segments)).find((s) => s.text === text)?.id
 
 let failed = 0
 const check = (name, cond, detail = '') => {
@@ -55,10 +60,10 @@ async function routed(page) {
     const url = new URL(req.url())
     if (req.method() !== 'GET') return r.abort()
     const seg = url.pathname.match(/\/api\/runs\/([^/]+)\/evidence\/segments\/([^/]+)$/)
-    // 按运行认夹具：第二期那份（查询链）和第一期那份各有自己的片段
-    const set = url.pathname.includes(`/runs/${fxq.run_id}/`) ? fxq : fx
+    // 按运行认夹具：第一期、第二期（查询链）、第三期（实体、引文）各有自己的片段
+    const set = url.pathname.includes(`/runs/${fxq.run_id}/`) ? fxq : url.pathname.includes(`/runs/${fxe.run_id}/`) ? fxe : fx
     if (seg) {
-      hits.push(`${set === fxq ? 'q:' : ''}${decodeURIComponent(seg[2])}`)
+      hits.push(`${set === fxq ? 'q:' : set === fxe ? 'e:' : ''}${decodeURIComponent(seg[2])}`)
       const body = set.segments[decodeURIComponent(seg[2])]
       return body ? r.fulfill({ json: body })
         : r.fulfill({ status: 404, json: { detail: '报告里没有这个片段', code: 'evidence_segment_not_found' } })
@@ -1125,6 +1130,48 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
   check('「指标来自」只列上游的口径卡（下游那张不列）', opts.length === 1 && opts[0].includes('周报口径'), opts.join(' | '))
   const onViolation = await p.locator('[data-field="on_violation"] option').allInnerTexts()
   check('违规时的默认写明按运行类别', onViolation[0]?.includes('探索运行照常产出'), onViolation.join(' | '))
+  // 三期：结论句策略 claims（off / require_citation，judge 是四期的，不出现在选项里）和表名字段名核对 entities
+  // 表名字段名核对收在「高级选项」里（很少要改），先展开
+  await p.locator('button[aria-expanded]', { hasText: '高级选项' }).click().catch(() => {})
+  await p.waitForTimeout(100)
+  const all = await p.evaluate(() => [...document.querySelectorAll('[data-field]')].map((el) => el.getAttribute('data-field')))
+  check('检查器有结论句策略、表名字段名核对（高级选项里）两项', fields.includes('claims') && all.includes('entities')
+    && !fields.includes('entities'), all.join(','))
+  const claimVals = await p.locator('[data-field="claims"] option').evaluateAll((els) => els.map((e) => e.value))
+  check('结论句策略只有 off / require_citation，没有 judge', claimVals.join(',') === 'off,require_citation', claimVals.join(','))
+  const claimsLabel = await p.locator('[data-field="claims"] label').first().innerText().catch(() => '')
+  check('结论句策略有中文标签（发布前修复的预览也用它）', /结论句/.test(claimsLabel) && !/claims/.test(claimsLabel), claimsLabel)
+  const claimsHelp = await p.locator('[data-field="claims"]').innerText()
+  check('……说明写明「结论句裁判在后续版本支持」、受管级别要显式选', claimsHelp.includes('结论句裁判在后续版本支持')
+    && claimsHelp.includes('受管'), claimsHelp.replace(/\s+/g, ' ').slice(0, 160))
+  check('没写 claims 时显示默认的 off', await p.locator('[data-field="claims"] select').inputValue() === 'off'
+    || (await p.locator('[data-field="claims"] select').evaluate((el) => el.options[el.selectedIndex]?.value)) === 'off')
+  const entityVals = await p.locator('[data-field="entities"] option').evaluateAll((els) => els.map((e) => e.value))
+  check('表名字段名核对：link / off', entityVals.join(',') === 'link,off', entityVals.join(','))
+  await p.locator('[data-field="claims"] select').selectOption('require_citation')
+  const cfgOf = () => p.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'write')?.data.config)
+  check('选「要求挂依据」写进 config.claims', (await cfgOf())?.claims === 'require_citation')
+  // 手写或别处写进来的 judge：不能悄悄显示成 off，要照实写出来并说后续版本支持
+  await p.evaluate(() => {
+    const st = window.__studio.getState()
+    const n = st.nodes.find((x) => x.id === 'write')
+    st.updateNode('write', { config: { ...n.data.config, claims: 'judge' } })
+  })
+  await p.waitForTimeout(150)
+  const shown = await p.locator('[data-field="claims"] select').evaluate((el) => el.options[el.selectedIndex]?.textContent ?? '')
+  check('config 里写着 judge：下拉照实显示 judge 并说后续版本支持，不装成 off', shown.includes('judge') && shown.includes('后续版本'), shown)
+  const fixLabel = await p.evaluate(async () => {
+    // 按页面自己加载时的地址 import：改过的模块地址带 ?t=，直接写 /src/… 会拿到另一份实例
+    const url = performance.getEntriesByType('resource').map((e) => e.name)
+      .find((n) => { try { return new URL(n).pathname === '/src/canvas/issues.ts' } catch { return false } })
+    const m = await import(url ?? '/src/canvas/issues.ts')
+    return [m.fixFieldLabel('claims', 'report'), m.fixFieldLabel('contract.claims.on_uncited', 'output'),
+            m.fixValueText('ignore', 'contract.claims.on_uncited'), m.fixValueText('degrade', 'contract.claims.on_uncited')]
+  }).catch((e) => [String(e)])
+  check('发布前修复预览里 claims 这个字段写中文名', fixLabel[0] === claimsLabel.trim() && !/claims/.test(fixLabel[0]), fixLabel[0])
+  check('契约 claims 的 on_uncited（ignore 改成 degrade 那条修复）：字段和值都写中文',
+    !/claims|on_uncited/.test(fixLabel[1] ?? 'claims') && fixLabel[2] === '只标出来，不算缺口' && fixLabel[3] === '计入缺口、出具降档',
+    JSON.stringify(fixLabel.slice(1)))
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {
       await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
@@ -1307,6 +1354,236 @@ await section('config', '配置项：agent 的 cite_fields、code 的证据角�
     && await p.locator('[data-field="upgrade_policy"]').count() === 0, JSON.stringify(unpinned))
   check('没有运行时报错（配置项）', errors.length === 0, errors.join(' | '))
   await ctx.close()
+})
+
+// ------------------------------------------------------------------ 第三期：实体、引文、旧运行的猜测
+
+const E = {
+  num: segOf(fxe.doc, '45,678.5'), orders: segOf(fxe.doc, 'orders'), week: segOf(fxe.doc, 'orders.week'),
+  refunds: segOf(fxe.doc, '`refunds`'), column: segOf(fxe.doc, '`refunds.refund_amount`'),
+  coupon: segOf(fxe.doc, '`orders.coupon_code`'), discount: segOf(fxe.doc, 'orders.discount'),
+  promo: segOf(fxe.doc, '`promo_events`'), customers: segOf(fxe.doc, 'customers'), bare: segOf(fxe.doc, '30'),
+  quote: segOf(fxe.doc, '退款金额以财务确认日为准，未确认的退款不计入当周'), miss: segOf(fxe.doc, '周报一律按自然周统计'),
+}
+const ent = '#evidence-entity'
+
+await section('entity', '三期：表名字段名、可疑实体、逐字引文——四通道分得开', async () => {
+  check('夹具里认得出每一种片段', Object.values(E).every(Boolean), JSON.stringify(E))
+  const look = await page.evaluate(([sel, E]) => Object.fromEntries(Object.entries(E).map(([k, id]) => {
+    const el = document.querySelector(`${sel} [data-seg="${id}"]`)
+    if (!el) return [k, null]
+    const cs = getComputedStyle(el)
+    return [k, { style: cs.textDecorationStyle, color: cs.textDecorationColor, state: el.getAttribute('data-ev-state'),
+                 kind: el.getAttribute('data-ev-kind'), label: el.getAttribute('aria-label') ?? '', text: el.innerText,
+                 code: !!el.querySelector('code'), before: getComputedStyle(el, '::before').content }]
+  })), [ent, E])
+  check('有出处的实体和数字同一套「有出处」线型：实线、同一个颜色', look.orders?.state === 'deterministic'
+    && look.orders.style === 'solid' && look.orders.color === look.num?.color, JSON.stringify([look.orders, look.num?.color]))
+  check('可疑实体用「无证据」的线型（点状），和有出处的实体线型不同', look.coupon?.state === 'suspect'
+    && look.coupon.style === 'dotted' && look.coupon.style !== look.orders?.style, JSON.stringify(look.coupon))
+  check('标记写的可疑实体（[[c:…]] 编造的字段）同样标成可疑', look.discount?.state === 'suspect' && look.discount.style === 'dotted',
+    JSON.stringify(look.discount))
+  check('可疑实体的 aria-label 写「可能是编造的名字」，名字不带反引号', look.coupon?.label.startsWith('orders.coupon_code，')
+    && look.coupon.label.includes('可能是编造的名字'), look.coupon?.label)
+  check('核对不了的名字：点状线、自己的说法，不说「编造」', look.promo?.state === 'unverified' && look.promo.style === 'dotted'
+    && look.promo.label.includes('核对不了') && !look.promo.label.includes('编造'), look.promo?.label)
+  check('核对不了和可疑实体颜色不同（它只是标注，不醒目）', look.promo?.color !== look.coupon?.color, `${look.promo?.color} / ${look.coupon?.color}`)
+  check('反引号里的实体按行内代码画，不露反引号', look.refunds?.code && !look.refunds.text.includes('`')
+    && look.column?.code, JSON.stringify([look.refunds, look.column?.text]))
+  check('自动链接的名字（正文里的已知表名）也是有出处的实体', look.customers?.state === 'deterministic' && look.customers.kind === 'entity')
+  check('aria-label：实体说清是表还是字段、出现在哪几次查询', look.orders?.label === 'orders，有出处：表 orders · 出现在查询 Q1、Q2',
+    look.orders?.label)
+  check('引文片段用引用样式：前面挂引号、实线', look.quote?.kind === 'quote' && look.quote.before.includes('“')
+    && look.quote.style === 'solid' && look.quote.state === 'deterministic', JSON.stringify(look.quote))
+  check('原话对不上的引文照样是引用样式，但线型换成点状（无证据）', look.miss?.kind === 'quote' && look.miss.before.includes('“')
+    && look.miss.style === 'dotted' && look.miss.state === 'none', JSON.stringify(look.miss))
+  check('引文的 aria-label 写出出处', look.quote?.label.includes('有出处') && look.quote.label.includes('运营手册 · 退款'), look.quote?.label)
+  const tags = await page.locator(`${ent} .ev-tag`).allInnerTexts()
+  check('句末小标签：可疑名字挂「?!可疑名字」，和「?无证据」分开', tags.includes('?!可疑名字') && tags.includes('?无证据'), tags.join('|'))
+  const tally = await page.locator(`${ent} [data-evidence-tally]`).innerText().catch(() => '')
+  check('证据条另说可疑名字的个数', tally.includes('可疑名字 2'), tally)
+  const summary = await page.locator(`${ent} [data-evidence-summary]`).innerText().catch(() => '')
+  check('读屏摘要写出可疑实体、核对不了的个数', summary.includes('2 个可能是编造的名字') && summary.includes('1 个名字核对不了'), summary)
+
+  // n / N：可疑实体进跳转（异常态），核对不了的不进（只是标注）
+  await page.locator(`${ent} [data-seg="${E.num}"]`).focus()
+  const jumps = []
+  for (let i = 0; i < 5; i++) {
+    await page.keyboard.press('n')
+    jumps.push(await active(page))
+  }
+  check('n 依次跳到裸数字、可疑实体、原话对不上的引文，跳过核对不了的名字',
+    jumps.join(',') === [E.bare, E.coupon, E.discount, E.miss, E.bare].join(','), jumps.join(','))
+})
+
+await section('e-panel', '三期：面板里的实体步骤、可疑实体的提示、引文步骤', async () => {
+  const p = panel(page)
+  await page.locator(`${ent} [data-seg="${E.week}"]`).click()
+  await page.waitForSelector('[data-evidence-panel] [data-ev-entity-type]', { timeout: 4000 }).catch(() => {})
+  check('面板标题是名字本身', (await p.locator('h3').innerText().catch(() => '')) === 'orders.week')
+  check('实体步骤写字段类型', (await p.locator('[data-ev-entity-type]').innerText().catch(() => '')).includes('VARCHAR(8)'))
+  check('实体步骤写表结构快照的同步时间', (await p.locator('[data-ev-entity-synced]').innerText().catch(() => '')).includes('2026-09-20'),
+    await p.locator('[data-ev-entity-synced]').innerText().catch(() => ''))
+  check('快照不全时照实说只存了一部分', (await p.innerText()).includes('只存了一部分'))
+  check('实体的来历：表结构快照', (await p.locator('[data-ev-entity-source]').allInnerTexts()).some((t) => t.includes('表结构快照')))
+  await page.locator(`${ent} [data-seg="${E.orders}"]`).click()
+  await page.waitForTimeout(250)
+  const queries = await p.locator('[data-ev-entity-queries]').innerText().catch(() => '')
+  check('表：出现在哪几次查询里', queries.includes('Q1') && queries.includes('Q2'), queries)
+  const srcs = await p.locator('[data-ev-entity-source]').allInnerTexts()
+  check('表的来历逐条列：表结构快照、查询 SQL', srcs.some((t) => t.includes('查询 Q2') && t.includes('SQL')), srcs.join(' | '))
+  check('实体步骤取自证据接口（按 runId:segId 取了一次）', harness.hits.includes(`e:${E.orders}`), harness.hits.filter((h) => h.startsWith('e:')).join(','))
+
+  await page.locator(`${ent} [data-seg="${E.discount}"]`).click()
+  // 提示要等片段接口回来（先显示「正在取」）：等到名字出来再读
+  await page.waitForSelector('[data-evidence-panel] [data-ev-closest-name]', { timeout: 4000 }).catch(() => {})
+  const reason = await p.locator('[data-ev-reason]').innerText().catch(() => '')
+  check('可疑实体说清为什么：本次运行里哪里都没有这个名字', reason.includes('可能是编造的名字'), reason.slice(0, 80))
+  const closest = await p.locator('[data-ev-closest-name]').allInnerTexts()
+  check('可疑实体给出最接近的已知名字（最多 3 个，不带 c: 前缀）', closest.length >= 1 && closest.length <= 3
+    && closest.includes('orders.amount') && closest.every((n) => !n.startsWith('c:')), closest.join(','))
+  check('可疑实体的面板徽标：?! 可能是编造的名字', (await p.locator('[data-ev-badge]').innerText().catch(() => '')).includes('可能是编造的名字'))
+
+  await page.locator(`${ent} [data-seg="${E.promo}"]`).click()
+  await page.waitForTimeout(250)
+  const promo = await p.innerText()
+  check('核对不了的名字：说快照不全、核对不了，不说编造', promo.includes('核对不了') && !promo.includes('编造'), promo.slice(0, 120))
+
+  await page.locator(`${ent} [data-seg="${E.quote}"]`).click()
+  await page.waitForSelector('[data-evidence-panel] [data-ev-quote-hit]', { timeout: 4000 }).catch(() => {})
+  const src = await p.locator('[data-ev-quote-source]').innerText().catch(() => '')
+  check('引文步骤：原文所在的文档和片段', src.includes('运营手册 · 退款') && src.includes('第 3 段'), src)
+  const hit = await p.locator('[data-ev-quote-hit]').innerText().catch(() => '')
+  check('引文在原文里的位置高亮出来，就是那句原话', hit === '退款金额以财务确认日为准，未确认的退款不计入当周', hit)
+  const ctx = await p.locator('[data-ev-quote]').innerText().catch(() => '')
+  check('高亮前后带着原文的上下文', ctx.includes('第三章 退款口径') && ctx.includes('部分退款'), ctx.slice(0, 80))
+  await page.locator(`${ent} [data-seg="${E.miss}"]`).click()
+  await page.waitForTimeout(250)
+  const miss = await p.innerText()
+  check('原话对不上的引文：说清找不到这句原话', miss.includes('找不到这句原话'), miss.slice(0, 120))
+  await page.keyboard.press('Escape')
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      for (const [name, id] of [['entity', E.orders], ['suspect', E.discount], ['quote', E.quote]]) {
+        await page.locator(`${ent} [data-seg="${id}"]`).click()
+        await page.waitForTimeout(350)
+        await page.screenshot({ path: `${SHOTS}/evidence3-${name}-${theme}.png` })
+      }
+      await page.keyboard.press('Escape')
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+})
+
+await section('e-narrow', '三期在 360px：栏内展开不横向滚动；减少动效', async () => {
+  const narrow = '#evidence-entity-narrow'
+  const overflow = () => page.evaluate((sel) => {
+    const el = document.querySelector(sel)
+    return { sw: el.scrollWidth, cw: el.clientWidth }
+  }, narrow)
+  for (const id of [E.quote, E.discount, E.orders]) {
+    await page.locator(`${narrow} [data-seg="${id}"]`).click()
+    await page.waitForSelector(`${narrow} [data-evidence-panel="inline"]`, { timeout: 4000 }).catch(() => {})
+    await page.waitForTimeout(250)
+    const o = await overflow()
+    check(`360px 栏内面板（${id}）不出横向滚动`, o.sw <= o.cw, JSON.stringify(o))
+  }
+  await page.keyboard.press('Escape')
+  const r = await open('/ui-harness.html?evidence=1', { reduced: true, w: 360, h: 780 })
+  const scroll = () => r.page.evaluate(() => ({ sw: document.documentElement.scrollWidth, vw: innerWidth }))
+  await r.page.locator(`${ent} [data-seg="${E.quote}"]`).click()
+  await r.page.waitForSelector('[data-evidence-panel] [data-ev-quote]', { timeout: 4000 }).catch(() => {})
+  const s1 = await scroll()
+  check('360px 屏幕：引文面板（底部抽屉）整页不横向滚动', s1.sw <= s1.vw, JSON.stringify(s1))
+  const anim = await r.page.evaluate(() => document.querySelector('[data-evidence-panel]')?.getAnimations({ subtree: true })
+    .filter((a) => !(a instanceof CSSTransition && Number(a.effect?.getTiming().duration) <= 0.01)).length ?? -1)
+  check('减少动效：引文面板没有动画', anim === 0, String(anim))
+  await r.page.keyboard.press('Escape')
+  await r.page.locator('#evidence-guess [data-ev-guess-toggle]').click().catch(() => {})
+  await r.page.waitForTimeout(150)
+  const s2 = await scroll()
+  check('360px 屏幕：展开猜测之后整页不横向滚动', s2.sw <= s2.vw
+    && await r.page.locator('#evidence-guess [data-ev-guess]').getAttribute('data-open').catch(() => null) === 'true', JSON.stringify(s2))
+  const guessAnim = await r.page.evaluate(() => document.querySelector('#evidence-guess [data-ev-guess]')?.getAnimations({ subtree: true })
+    .filter((a) => !(a instanceof CSSTransition && Number(a.effect?.getTiming().duration) <= 0.01)).length ?? -1)
+  check('减少动效：展开猜测没有动画', guessAnim === 0, String(guessAnim))
+  check('没有运行时报错（三期 360px）', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
+})
+
+await section('banner', '出具横幅那一行：数字都有出处时，可疑名字、没挂依据的结论句也写出来', async () => {
+  const at = (key) => page.locator(`#issuance-line [data-issuance-case="${key}"]`)
+  const line = await at('suspect').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('数字那半句照旧：3 个数字都有出处', line.includes('3 个数字都有出处'), line)
+  check('可疑名字另起一句：?! 可疑名字 2', await at('suspect').locator('[data-evidence-line-suspect]').count() === 1
+    && line.includes('?! 可疑名字 2'), line)
+  check('没挂依据的结论句另起一句：没挂依据的结论句 1', await at('suspect').locator('[data-evidence-line-claims]').count() === 1
+    && line.includes('没挂依据的结论句 1'), line)
+  const next = at('suspect').locator('[data-evidence-next]')
+  check('数字都有出处、只有可疑名字时也给「定位下一处」', await next.count() === 1)
+  await page.evaluate(() => { window.__issuanceNext = 0 })
+  await next.click()
+  check('点了它就去找下一处', await page.evaluate(() => window.__issuanceNext) === 1)
+  const clean = await at('clean').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('都干净的那一份：只有数字那半句，不给「定位下一处」', clean.includes('3 个数字都有出处')
+    && await at('clean').locator('[data-evidence-line-suspect], [data-evidence-line-claims], [data-evidence-next]').count() === 0, clean)
+  const names = await at('names').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('一个数字都没有、只有可疑名字：这一行照样出来，开头不带「·」，也给「定位下一处」',
+    names.trim().startsWith('?! 可疑名字 1') && await at('names').locator('[data-evidence-next]').count() === 1, names)
+})
+
+await section('guess', '旧运行按数值猜的候选：默认折叠，展开写明「猜测」，淡点状线', async () => {
+  const g = '#evidence-guess'
+  const box = page.locator(`${g} [data-ev-guess]`)
+  check('默认折叠', await box.getAttribute('data-open').catch(() => null) === 'false')
+  check('折叠时看不到候选（不在页面上，不只是藏起来）', await page.locator(`${g} [data-ev-state="candidate"]`).count() === 0)
+  const head = await page.locator(`${g} [data-ev-guess-toggle]`).innerText().catch(() => '')
+  check('折叠的标题就写明「猜测」', head.includes('猜测'), head)
+  const toggle = page.locator(`${g} [data-ev-guess-toggle]`)
+  check('展开按钮是 button，带 aria-expanded=false', await toggle.evaluate((el) => el.tagName).catch(() => '') === 'BUTTON'
+    && await toggle.getAttribute('aria-expanded').catch(() => null) === 'false')
+  const answer = await page.locator(`${g}`).innerText().catch(() => '')
+  check('折叠时答案本身照常显示', answer.includes('本周销售额 45,678.5 元'), answer.slice(0, 60))
+  await toggle.click()
+  await page.waitForTimeout(150)
+  check('展开后 aria-expanded=true', await toggle.getAttribute('aria-expanded').catch(() => null) === 'true')
+  const note = await page.locator(`${g} [data-ev-guess-note]`).innerText().catch(() => '')
+  check('展开后写明「猜测的来源，不能当证据」', note.includes('猜测的来源，不能当证据'), note)
+  const cands = await page.evaluate((sel) => [...document.querySelectorAll(`${sel} [data-ev-state="candidate"]`)].map((el) => {
+    const cs = getComputedStyle(el)
+    // 候选是 Markdown 里的行内标记（保留旧答案的版式），读屏靠标记里那句 sr-only 的「猜测的来源：…」
+    return { style: cs.textDecorationStyle, color: cs.textDecorationColor, line: el.getAttribute('data-ev-line'),
+             label: el.textContent ?? '', title: el.getAttribute('title') ?? '', text: el.firstChild?.textContent ?? '' }
+  }), g)
+  check('有候选的数字画成候选（4 个）', cands.length === 4, cands.map((c) => c.text).join(','))
+  check('候选用淡点状线，不用确定性的实线', cands.length > 0 && cands.every((c) => c.style === 'dotted' && c.line === 'dotted'),
+    JSON.stringify(cands[0]))
+  const detColor = await page.evaluate((sel) => {
+    const el = document.querySelector(`${sel} [data-ev-state="deterministic"]`)
+    return el ? getComputedStyle(el).textDecorationColor : ''
+  }, ent)
+  check('候选的线和「有出处」不是一个颜色', cands.length > 0 && cands.every((c) => c.color !== detColor), `${cands[0]?.color} / ${detColor}`)
+  check('候选给读屏写「猜测的来源」和候选出处，悬停也看得到', cands[0]?.label.includes('猜测的来源') && cands[0].label.includes('Q1')
+    && cands[0].title.includes('Q1'), cands[0]?.label)
+  const list = await page.locator(`${g} [data-ev-candidates]`).innerText().catch(() => '')
+  check('候选清单：每个数字可能来自哪一格', list.includes('查询 Q1') && list.includes('gmv'), list.slice(0, 120))
+  const plain = await page.evaluate((sel) => [...document.querySelectorAll(`${sel} [data-ev-guess-body] [data-ev-state]`)]
+    .map((el) => el.firstChild?.textContent ?? ''), g)
+  check('没猜到候选的数字不画线（40%、50,000）', !plain.includes('40%') && !plain.includes('50,000'), plain.join(','))
+  await toggle.click()
+  await page.waitForTimeout(100)
+  check('再点一次收起', await box.getAttribute('data-open').catch(() => null) === 'false')
+  if (SHOTS) {
+    await toggle.click()
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator(g).screenshot({ path: `${SHOTS}/evidence3-guess-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+    await toggle.click()
+  }
 })
 
 if (SHOTS) {

@@ -32,7 +32,8 @@ def weekly(**contract_overrides) -> dict:
         node("card", "metrics", "周报口径卡", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"},
             {"id": "orders", "name": "订单数", "unit": "单", "expression": "cell(nodes.fetch, 0, 'orders')"}]),
-        node("write", "report", "报告撰写", instructions="写周报"),
+        node("write", "report", "报告撰写", instructions="写周报",
+             numbers="strict", on_violation="fail", claims="require_citation"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={k: v for k, v in contract.items() if v is not None}),
     ]
@@ -70,7 +71,8 @@ def add_card(graph: dict, nid: str = "card2") -> dict:
 
 
 def add_report(graph: dict, nid: str = "write2") -> dict:
-    graph["nodes"].insert(4, node(nid, "report", "第二份报告", instructions="写月报"))
+    graph["nodes"].insert(4, node(nid, "report", "第二份报告", instructions="写月报",
+                                  numbers="strict", on_violation="fail", claims="require_citation"))
     graph["edges"] += [{"source": "card", "target": nid}, {"source": nid, "target": "done"}]
     return graph
 
@@ -174,17 +176,17 @@ def test_a_wrong_report_from_takes_the_only_upstream_report():
     assert out["ok"] is True and config(out["graph"], "done")["contract"]["report_from"] == "write"
 
 
-def test_without_a_report_node_the_narrative_is_a_choice_over_model_nodes():
+def test_without_a_report_node_report_from_goes_to_copilot():
+    # 以前这里让人在模型节点里选一段 narrative。受管级别的叙述模式过不了门禁 G1
+    # （governed.report_from_required），选了也发不出去：没有报告撰写节点就交给 Copilot 加一个
     graph = weekly(report_from=None)
     write = find(graph, "write")
     write.update(type="llm", data={"label": "写周报", "config": {"prompt": "写周报", "assign_to": "report"}})
     fid = "contract.report_from_missing:done"
     fix = plan(graph)[fid]
-    assert fix["kind"] == "choice" and fix["field"] == "contract.narrative"
-    assert [o["value"] for o in fix["options"]] == ["{{ nodes.write.text }}"]
+    assert fix["kind"] == "assist" and fix["field"] == "contract.report_from"
     out = apply_fixes(graph, [fid], {fid: "{{ nodes.write.text }}"}, level="governed")
-    assert config(out["graph"], "done")["contract"]["narrative"] == "{{ nodes.write.text }}"
-    assert "contract.report_from_missing" not in codes(out["remaining"])
+    assert out["applied"] == [] and "narrative" not in config(out["graph"], "done")["contract"]
 
 
 def test_strict_off_is_turned_on():

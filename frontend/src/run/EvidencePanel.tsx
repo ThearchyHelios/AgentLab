@@ -7,18 +7,21 @@ import { ArrowLeft, CornerDownRight, ListChecks, ShieldCheck, X } from 'lucide-r
 import clsx from 'clsx'
 import { StatusBadge, isComposing } from '../components/ui'
 import {
-  EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, docForeign, evidenceValue as valueText, graphDoc, inputSource,
-  integrityFailures, locatable, locatorText, notableInput, queryOf, queryWindow, reasonOf, sealVerdict, segmentState,
-  sourceOf, type SealStatus, type SourceTone,
+  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, closestNames, docForeign, entitySources,
+  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, locatable, locatorText, notableInput,
+  queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, sealVerdict, segName, segmentKind, segmentState, sourceOf,
+  type SealStatus, type SourceTone,
 } from '../lib/evidence'
-import { formatNumber, NONE, shortId } from '../lib/format'
+import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
 import { EVIDENCE_TEXT } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { segmentKey, useEvidence } from '../store/evidence'
 import type {
-  EvidenceDocData, EvidenceInput, EvidenceSeal, EvidenceSegment, EvidenceStep, EvidenceUnit, EvidenceViolation,
+  EvidenceDocData, EvidenceInput, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceStep, EvidenceUnit,
+  EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
+import { useEvidenceHost } from './evidenceHost'
 import { CopyChip } from './Markdown'
 
 /**
@@ -39,11 +42,16 @@ import { CopyChip } from './Markdown'
  * 事后插行），接口是从封存范围内的事件找的文档。两边不是同一份时，接口的封存状态和
  * 证据链说的是另一份报告——不能挂到正文上画成绿的，要醒目地说正文不是封存的那一份。
  *
- * 三种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
- * 画布右栏里直接栏内展开。都不是模态的：开着面板照样能在正文里走。
+ * 三期多了两种步骤：表或字段（出现在哪几次查询里、表结构快照的同步时间、字段类型；可疑的
+ * 名字给出最接近的已知名字），逐字引文（原文所在的文档和片段，引文在原文里的位置高亮）。
+ * 画布右栏里点开片段时，把证据路径交给画布（evidenceHost），节点名点一下就对准那个节点。
+ *
+ * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
+ * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
+ * 都不是模态的：开着面板照样能在正文里走。
  */
 
-export type PanelMode = 'side' | 'drawer' | 'inline'
+export type PanelMode = 'side' | 'drawer' | 'inline' | 'dock'
 export type PanelView = { kind: 'seg'; id: string } | { kind: 'violations' }
 
 export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, onLocate, onViolations }: {
@@ -72,12 +80,18 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
     onClose()
   }
 
-  const title = view.kind === 'violations' ? EVIDENCE_TEXT.violations : found?.seg.text ?? EVIDENCE_TEXT.panelTitle
+  const title = view.kind === 'violations' ? EVIDENCE_TEXT.violations
+    : found ? segName(found.seg) : EVIDENCE_TEXT.panelTitle
+  // 有出处的实体、引文：徽标写得更具体（「有出处 · 逐字引文」），颜色和字形照同一套
+  const kind = found && state === 'deterministic' ? segmentKind(found.seg) : null
+  const badge = kind ? { ...meta!, label: EVIDENCE_KIND_STYLE[kind].label, glyph: EVIDENCE_KIND_STYLE[kind].glyph } : meta
   const frame = mode === 'side'
     ? 'ev-panel-side fixed bottom-0 right-0 top-0 z-40 flex flex-col border-l bg-panel shadow-elev-3'
     : mode === 'drawer'
       ? 'ev-panel-rise fixed bottom-0 left-0 right-0 z-40 flex flex-col rounded-t-lg border-t bg-panel shadow-elev-3'
-      : 'ev-panel-rise my-2 flex flex-col rounded-lg border bg-panel'
+      : mode === 'dock'
+        ? 'flex h-full min-h-0 flex-col bg-panel'
+        : 'ev-panel-rise my-2 flex flex-col rounded-lg border bg-panel'
 
   return (
     <section
@@ -95,9 +109,9 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
             <ArrowLeft size={12} aria-hidden /> {EVIDENCE_TEXT.back}
           </button>
         )}
-        {meta && (
-          <span className="chip shrink-0" style={{ color: meta.color, borderColor: meta.color }} data-ev-badge={meta.code}>
-            {meta.glyph && <span aria-hidden>{meta.glyph}</span>}{meta.label}
+        {badge && (
+          <span className="chip shrink-0" style={{ color: badge.color, borderColor: badge.color }} data-ev-badge={badge.code}>
+            {badge.glyph && <span aria-hidden>{badge.glyph}</span>}{badge.label}
           </span>
         )}
         <h3 id={titleId} tabIndex={-1} className="mono min-w-0 flex-1 truncate text-sm font-semibold outline-none">
@@ -110,7 +124,8 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, view, onClose, o
           </button>
         )}
       </header>
-      <div className={clsx('space-y-3 px-3 py-2.5 leading-relaxed', mode !== 'inline' && 'min-h-0 flex-1 overflow-y-auto')}>
+      <div className={clsx('space-y-3 px-3 py-2.5 leading-relaxed', mode !== 'inline' && 'min-h-0 flex-1 overflow-y-auto')}
+           data-ev-body="">
         {view.kind === 'violations'
           ? <ViolationList doc={doc} onLocate={onLocate} />
           : found
@@ -180,14 +195,37 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
   const state = segmentState(seg)
   const cite = seg.cite
   const entry = cite?.alias ? doc.catalog?.[cite.alias] : undefined
-  const chain: EvidenceStep[] = Array.isArray(detail?.chain) ? detail.chain.filter((s) => s && typeof s === 'object') : []
+  const chain: EvidenceStep[] = useMemo(() => (Array.isArray(detail?.chain)
+    ? detail.chain.filter((s) => s && typeof s === 'object') : []), [detail])
   const metricStep = chain.find((s) => s.step === 'metric')
   const inputStep = chain.find((s) => s.step === 'run_input')
+  const entityStep = chain.find((s) => s.step === 'entity')
+  const quoteStep = chain.find((s) => s.step === 'quote')
   const queries = chain.filter((s) => s.step === 'query')
   const isMetric = cite?.kind === 'metric' || entry?.kind === 'metric' || !!metricStep
   const isInput = cite?.kind === 'input' || entry?.kind === 'input' || !!inputStep
+  // 三期：有出处的表名字段名、引文（原话对不上的引文也画这一节：说清原文在哪、对不上）
+  const isEntity = !isMetric && !isInput && seg.kind === 'entity' && state === 'deterministic'
+  const isQuote = !isMetric && !isInput && seg.kind === 'quote'
   // 报告直接引用的查询单元格（[[v:Q3.r5.amount]]、整表里的一格）：证据链就是那一次查询
-  const isCell = !isMetric && !isInput && (cite?.kind === 'cell' || entry?.kind === 'query' || !!queries.length)
+  const isCell = !isMetric && !isInput && !isEntity && !isQuote
+    && (cite?.kind === 'cell' || entry?.kind === 'query' || !!queries.length)
+  const bad = state === 'none' || state === 'suspect' || state === 'unverified'
+  const closest = closestNames(detail?.closest ?? entityStep?.closest)
+
+  // 画布右栏：点开片段时把证据路径交给画布（产出证据的节点实线、报告虚线），链取回来后再补全
+  const host = useEvidenceHost()
+  const onTrace = host.onTrace
+  const trace = useMemo(() => evidenceTrace(seg, doc, chain), [seg, doc, chain])
+  const traceKey = `${trace.producers.join(',')}|${trace.consumers.join(',')}`
+  useEffect(() => {
+    if (!onTrace) return
+    const text = segName(seg)
+    onTrace({ label: `证据 ${text.length > 16 ? `${text.slice(0, 15)}…` : text}`, ...trace })
+    return () => onTrace(null)
+    // trace 按内容比（traceKey）：同一条路径不重画
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onTrace, seg.id, traceKey])
   const inputs: EvidenceInput[] = metricStep?.inputs?.length
     ? metricStep.inputs
     : chain.filter((s) => s.step === 'input').map((s) => s as EvidenceInput)
@@ -218,6 +256,7 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
     docOnly: state !== 'deterministic',
     viaGraph: slot?.status === 'error',
   })
+  const pending = !!runId && !docIssue && (!slot || slot.status === 'loading')
   const chainFailed = !runId ? EVIDENCE_TEXT.noRun
     : docIssue ? EVIDENCE_TEXT.chainForeign
     : slot?.status === 'error' ? EVIDENCE_TEXT.chainMissing : ''
@@ -236,20 +275,49 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
         <Sentence unit={unit} active={seg.id} />
       </Part>
 
-      {state === 'none' && (
-        <Part title="为什么没有证据" data-ev-reason="">
-          <p style={{ color: 'var(--st-waiting)' }}>{reason}</p>
+      {bad && (
+        <Part title={state === 'suspect' ? '为什么标成可疑' : state === 'unverified' ? '为什么核对不了' : '为什么没有证据'}
+              data-ev-reason="">
+          <p style={{ color: state === 'unverified' ? 'var(--text-dim)' : 'var(--st-waiting)' }}>{reason}</p>
           {/* 违规的原话多半是「引用 … 解析不了：<原因>」，和上面那句重复的不再列；裸数字那条说的是怎么改，留着 */}
           {violations.filter((v) => v.message && !(reason && v.message.includes(reason))).map((v, i) => (
             <p key={i} className="mt-1 text-dim">{v.message}</p>
           ))}
           {seg.ref && <p className="mono mt-1 text-2xs text-faint">[[{seg.ref}]]</p>}
+          {(state === 'suspect' || state === 'unverified') && runId && !docIssue && (
+            // 可疑的名字：给最接近的已知名字，多半是写错了一个字（接口按封存的台账重建目录找的）
+            <div className="mt-1.5" data-ev-closest={closest.length ? '' : 'none'}>
+              <div className="mb-0.5 text-2xs text-faint">{EVIDENCE_TEXT.closest}</div>
+              {closest.length ? (
+                <ul className="flex flex-wrap gap-1">
+                  {closest.map((n) => <li key={n} className="chip mono" data-ev-closest-name="">{n}</li>)}
+                </ul>
+              ) : (
+                <p className="text-2xs text-dim">{pending ? EVIDENCE_TEXT.entityPending : EVIDENCE_TEXT.closestNone}</p>
+              )}
+              {entityStep?.checked && (
+                <p className="mt-1 text-2xs text-faint" data-ev-checked="">
+                  {EVIDENCE_TEXT.checked(entityStep.checked.schemas ?? 0, entityStep.checked.queries ?? 0)}
+                </p>
+              )}
+            </div>
+          )}
         </Part>
+      )}
+
+      {isEntity && (
+        <EntityPart step={entityStep} entry={entry} cite={cite} seal={seal} pending={pending}
+                    failed={chainFailed} catalog={doc.catalog} />
+      )}
+
+      {isQuote && (
+        <QuotePart step={quoteStep} cite={cite} quote={seg.text} resolved={state === 'deterministic'} seal={seal}
+                   pending={pending} failed={chainFailed} node={entry?.node_id} label={entry?.label} />
       )}
 
       {isMetric && (
         <MetricPart step={metricStep} entry={entry} inputs={inputs} runId={runId} seal={seal}
-                    pending={!!runId && !docIssue && (!slot || slot.status === 'loading')}
+                    pending={pending}
                     failed={chainFailed}
                     resolved={state === 'deterministic'}
                     linkOf={linkOf}
@@ -275,7 +343,7 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
         // 解析不了的单元格引用（行越界、没有这一列、受管没声明 cells）接口本来就不给链，上面已经说了原因，
         // 再摆一块「这一次没取到」就像是接口出了错
         <QueryFallback entry={entry} alias={cite?.alias} where={locatorText(cite?.locator)}
-                       pending={!!runId && !docIssue && (!slot || slot.status === 'loading')}
+                       pending={pending}
                        failed={chainFailed} />
       )}
 
@@ -283,8 +351,19 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
         <QueryPart key={`${q.artifact ?? ''}-${i}`} id={queryId(i)} step={q} seal={seal} masked={masked} />
       ))}
 
-      {state === 'deterministic' && !isMetric && !isInput && !isCell && (
+      {state === 'deterministic' && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
         <p className="text-dim">{sourceOf(seg, doc) || detail?.note}</p>
+      )}
+
+      {host.onNode && (trace.producers.length > 0 || trace.consumers.length > 0) && (
+        // 画布右栏：这段证据经过的节点，点一下在画布上选中并对准
+        <Part title="画布上的节点" data-ev-nodes="">
+          <div className="flex flex-wrap items-center gap-1">
+            {trace.producers.map((n) => <NodeChip key={n} id={n} />)}
+            {trace.consumers.length > 0 && trace.producers.length > 0 && <span className="text-faint" aria-hidden>→</span>}
+            {trace.consumers.map((n) => <NodeChip key={n} id={n} />)}
+          </div>
+        </Part>
       )}
 
       <Part title={EVIDENCE_TEXT.seal} data-ev-seal="">
@@ -309,6 +388,167 @@ function SegmentBody({ panelId, doc, artifact, runId, seg, unit, onViolations }:
 
 type InputLink = { index: number; alias: string; go: () => void } | undefined
 
+/**
+ * 面板里提到的节点。画布右栏里是按钮：点一下在画布上选中并对准它（画布上已经没有这个节点
+ * 时不给按钮，点了会落空）；别处照旧写节点 id
+ */
+function NodeChip({ id, prefix }: { id?: string | null; prefix?: string }) {
+  const host = useEvidenceHost()
+  if (!id) return null
+  const label = host.nodeLabel?.(id)
+  if (host.onNode && label !== undefined) {
+    return (
+      <button type="button" className="chip max-w-full truncate transition-colors hover:bg-hover" data-ev-node={id}
+              title={`在画布上选中并对准「${label || id}」`} onClick={() => host.onNode!(id)}>
+        {prefix}{label || id}
+      </button>
+    )
+  }
+  return <span className="mono" data-ev-node={id}>{prefix}{id}</span>
+}
+
+/**
+ * 表或字段：是什么、字段类型、出现在哪几次查询里、从哪来的（表结构快照、查询 SQL、查询结果列）、
+ * 表结构快照什么时候同步的。证据接口没取到时照文档目录里记着的来历写，缺的照实说
+ */
+function EntityPart({ step, entry, cite, seal, pending, failed, catalog }: {
+  step?: EvidenceStep
+  entry?: Record<string, any>
+  cite?: EvidenceSegment['cite']
+  seal?: EvidenceSeal
+  pending: boolean
+  failed: string
+  catalog?: EvidenceDocData['catalog']
+}) {
+  const kind = step?.kind ?? entry?.kind ?? cite?.kind
+  const table = step?.table ?? entry?.table ?? entry?.locator?.table ?? cite?.locator?.table
+  const column = step?.column ?? entry?.locator?.column ?? cite?.locator?.column
+  const name = kind === 'table' ? (step?.name ?? entry?.name ?? table ?? cite?.ref)
+    : table && column ? `${table}.${column}` : (step?.name ?? entry?.name ?? column ?? cite?.ref)
+  const queries: string[] = (Array.isArray(step?.queries) ? step.queries : Array.isArray(entry?.queries) ? entry.queries : [])
+    .map(String).filter(Boolean)
+  const sources = entitySources(step?.sources ?? entry?.sources)
+  const truncated = sources.some((s) => s.truncated) || step?.snapshot_truncated === true || (step as any)?.truncated === true
+  const owners: string[] = Array.isArray(step?.tables) ? step.tables : Array.isArray(entry?.tables) ? entry.tables : []
+  const nodes = [...new Set(queries.map((q) => catalog?.[q]?.node_id).filter((n): n is string => typeof n === 'string'))]
+  return (
+    <Part title={EVIDENCE_TEXT.entity} data-ev-entity={kind ?? ''}>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="chip shrink-0">{kind === 'table' ? EVIDENCE_TEXT.table : EVIDENCE_TEXT.column}</span>
+        <span className="mono min-w-0 font-medium [overflow-wrap:anywhere]">{name || NONE}</span>
+        {step?.type && (
+          <span className="mono text-2xs text-dim" data-ev-entity-type="">{EVIDENCE_TEXT.columnType} {step.type}</span>
+        )}
+        {kind === 'table' && typeof (step as any)?.columns === 'number' && (
+          <span className="text-2xs text-dim">{EVIDENCE_TEXT.tableColumns((step as any).columns, !!step?.is_view)}</span>
+        )}
+      </div>
+      {step?.comment && <p className="mt-0.5 text-2xs text-dim">{step.comment}</p>}
+      {owners.length > 1 && <p className="mt-0.5 text-2xs text-dim">{EVIDENCE_TEXT.ownerTables(owners)}</p>}
+      {step?.types && !step.type && Object.keys(step.types).length > 0 && (
+        <p className="mono mt-0.5 text-2xs text-dim" data-ev-entity-type="">{EVIDENCE_TEXT.columnTypes(step.types)}</p>
+      )}
+      <p className="mt-1" data-ev-entity-queries="">
+        {queries.length ? EVIDENCE_TEXT.entityQueries(queries) : EVIDENCE_TEXT.entityNoQuery}
+      </p>
+      {nodes.length > 0 && (
+        <div className="mt-0.5 flex flex-wrap items-center gap-1 text-2xs text-faint">
+          {nodes.map((n) => <NodeChip key={n} id={n} prefix="节点 " />)}
+        </div>
+      )}
+      {sources.length > 0 && (
+        <ul className="mt-1 space-y-0.5 text-2xs text-dim">
+          {sources.map((src) => <li key={src.text} data-ev-entity-source={src.kind}>· {src.text}</li>)}
+        </ul>
+      )}
+      {step?.synced_at && (
+        <p className="mt-1 text-2xs text-faint" data-ev-entity-synced="">{EVIDENCE_TEXT.syncedAt(formatDateTime(step.synced_at))}</p>
+      )}
+      {truncated && (
+        <p className="mt-0.5 text-2xs" style={{ color: 'var(--st-waiting)' }} data-ev-entity-partial="">{EVIDENCE_TEXT.snapshotPartial}</p>
+      )}
+      <Integrity step={step} seal={seal} />
+      {!step && (
+        <p className="mt-1.5 text-2xs text-faint" data-ev-chain={pending ? 'loading' : 'missing'}>
+          {pending ? EVIDENCE_TEXT.entityPending : failed && failed !== EVIDENCE_TEXT.chainMissing ? failed : EVIDENCE_TEXT.entityMissing}
+        </p>
+      )}
+    </Part>
+  )
+}
+
+/**
+ * 逐字引文：原文所在的文档和片段，引文在原文里的位置高亮（前后带一截上下文）。检索快照哈希对不上时
+ * 不摆原文——那一段不能当证据。原话对不上的引文也画这一节，只写目录里记着的是哪次检索
+ */
+function QuotePart({ step, cite, quote, resolved, seal, pending, failed, node, label }: {
+  step?: EvidenceStep
+  cite?: EvidenceSegment['cite']
+  quote: string
+  resolved: boolean
+  seal?: EvidenceSeal
+  pending: boolean
+  failed: string
+  node?: string
+  /** 目录里这次检索的说明：「知识库「运营手册」 · 2 条」 */
+  label?: string
+}) {
+  const source = (step?.source && typeof step.source === 'object' ? step.source as EvidenceQuoteSource : undefined)
+    ?? cite?.source
+  const where = quoteWhere(source)
+  const bad = integrityFailures(step, seal)
+  // 原文：接口给在 content 里（text 是引文本身）；content 为 null 是快照不在封存范围里、取不回来——不拿引文冒充原文
+  const original = step && 'content' in step ? step.content ?? undefined : step?.text
+  const loc = cite?.locator
+  const mismatch = step?.match_ok === false
+  const win = original && !bad.includes('hash') && !mismatch
+    ? quoteWindow(original, step?.match ?? (loc ? { start: loc.start, end: loc.end } : null), step?.quote ?? quote)
+    : null
+  const collection = step?.collection
+  return (
+    <Part title={EVIDENCE_TEXT.quote} data-ev-quote-step="">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5" data-ev-quote-source="">
+        <span className="mono font-medium">{step?.alias ?? cite?.alias ?? NONE}</span>
+        {where ? <span>{where}</span> : label && <span className="text-dim">{label}</span>}
+        {collection && where && <span className="text-2xs text-faint">{EVIDENCE_TEXT.quoteCollection(collection)}</span>}
+        {source?.document && (
+          <span className="mono text-2xs text-faint" title={`文档 ${source.document}${source.chunk ? ` · 片段 ${source.chunk}` : ''}`}>
+            {shortId(source.document, 12)}
+          </span>
+        )}
+        <NodeChip id={node ?? step?.node_id} prefix="节点 " />
+      </div>
+      {(bad.length > 0 || mismatch) && (
+        <IntegrityList code={[...bad.map((k) => (k === 'hash' ? 'quote-hash' : k)), ...(mismatch ? ['quote-match'] : [])].join(' ')}
+                       items={[...bad.map((k) => (k === 'hash' ? EVIDENCE_TEXT.quoteHash : EVIDENCE_TEXT.integrity[k])),
+                               ...(mismatch ? [EVIDENCE_TEXT.quoteBad] : [])]} />
+      )}
+      {win && (
+        <>
+          <blockquote className="mt-1 whitespace-pre-wrap rounded border-l-2 bg-bg px-2 py-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]"
+                      data-ev-quote="">
+            {win.cutBefore && '…'}{win.before}
+            <mark className="rounded-sm px-0.5" data-ev-quote-hit=""
+                  style={{ background: resolved ? 'var(--st-done-soft)' : 'var(--st-waiting-soft)', color: 'var(--text)' }}>
+              {win.hit}
+            </mark>
+            {win.after}{win.cutAfter && '…'}
+          </blockquote>
+          <p className="mt-0.5 text-2xs text-faint">{EVIDENCE_TEXT.quoteHit}</p>
+        </>
+      )}
+      {resolved && !win && !bad.length && !mismatch && (
+        // 接口说了为什么没有原文（不在封存范围里、取不回来）就照原话
+        <p className="mt-1.5 text-2xs text-faint" data-ev-chain={pending ? 'loading' : 'missing'}>
+          {pending ? EVIDENCE_TEXT.quotePending : step?.note
+            || (failed && failed !== EVIDENCE_TEXT.chainMissing ? failed : EVIDENCE_TEXT.quoteMissing)}
+        </p>
+      )}
+      {!resolved && <p className="mt-1 text-2xs" style={{ color: 'var(--st-waiting)' }}>{EVIDENCE_TEXT.quoteMiss}</p>}
+    </Part>
+  )
+}
+
 /** 口径卡钉住的上游工作流 id：方案写在 caliber_from，接口给在 source 上 */
 function pinnedWorkflow(step?: EvidenceStep): string | undefined {
   const from = step?.caliber_from ?? (step?.source && typeof step.source === 'object' ? step.source : undefined)
@@ -323,12 +563,14 @@ function Sentence({ unit, active }: { unit: EvidenceUnit; active: string }) {
         const state = segmentState(s)
         const on = s.id === active
         const number = s.kind === 'number' || s.kind === 'value'
+        // 反引号里的表名字段名照行内代码写，不露反引号
+        const code = s.kind === 'entity' && !!s.code
         return (
           <span key={s.id}
-                className={clsx(number && 'font-semibold tnum', on && 'rounded-sm px-0.5')}
+                className={clsx(number && 'font-semibold tnum', code && 'mono', on && 'rounded-sm px-0.5')}
                 style={on && state ? { background: EVIDENCE_STATE[state].soft, color: 'var(--text)' } : undefined}
                 data-ev-here={on ? '' : undefined}>
-            {s.text}
+            {code ? segName(s) : s.text}
           </span>
         )
       })}
@@ -354,6 +596,7 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   /** 钉住的上游工作流在目录里的名字（接口没给名字时用） */
   workflowName?: string
 }) {
+  const host = useEvidenceHost()
   const name = step?.name ?? entry?.name ?? step?.metric ?? entry?.locator?.metric ?? NONE
   const value = step?.value !== undefined ? step.value : entry?.value
   const rendered = step?.rendered ?? entry?.rendered
@@ -382,6 +625,7 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
             ? <span data-ev-caliber-from="">{from}</span>
             : (caliber || version) && <span>口径卡「{caliber || NONE}」<span className="mono">{version}</span></span>}
           {artifact && <span className="mono text-faint" title={`口径卡工件 ${artifact}`}>工件 {shortId(artifact)}</span>}
+          {host.onNode && <NodeChip id={step?.node_id ?? entry?.node_id} />}
         </div>
       )}
       {upgrade && (
@@ -508,7 +752,6 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
           // 那个节点内部的编号，和面板里的「查询 Qn」不是一回事，不拿来写
           const alias = link?.alias || inp.query || (typeof inp.cell === 'string' ? inp.cell.split('.')[0] : '')
           const where = [
-            inp.node_id && `节点 ${inp.node_id}`,
             inp.field && (inp.via === 'agent_field' ? `字段 ${inp.field}` : inp.field),
             [alias, locatorText(inp.locator)].filter(Boolean).join(' · '),
           ].filter(Boolean).join(' · ')
@@ -525,7 +768,12 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
                   </button>
                 )}
               </div>
-              {where && <div className="mono text-2xs text-faint [overflow-wrap:anywhere]">{where}</div>}
+              {(inp.node_id || where) && (
+                <div className="mono text-2xs text-faint [overflow-wrap:anywhere]">
+                  {inp.node_id && <NodeChip id={inp.node_id} prefix="节点 " />}
+                  {inp.node_id && where && ' · '}{where}
+                </div>
+              )}
               {said.text && <p className="mt-0.5" style={{ color: tone.color }}>{said.text}</p>}
               {said.reason && <p className="mt-0.5 text-2xs text-dim">{said.reason}</p>}
             </li>
@@ -544,6 +792,7 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
  * 这时候这些行不能当证据，比「有出处」重要得多
  */
 function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep; seal?: EvidenceSeal; masked: string[] }) {
+  const host = useEvidenceHost()
   const win = useMemo(() => queryWindow(step), [step])
   const [open, setOpen] = useState(false)
   const scroller = useRef<HTMLDivElement>(null)
@@ -580,6 +829,7 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
           {EVIDENCE_TEXT.query(alias)}
           {step.tool && <span className="mono ml-1.5 font-normal">{step.tool}</span>}
         </span>
+        {host.onNode && <NodeChip id={step.node_id} />}
         {step.sql && <CopyChip label={EVIDENCE_TEXT.copySql} text={() => step.sql ?? ''} />}
       </div>
       {step.sql && (
@@ -671,6 +921,8 @@ function SealLine({ status, label }: { status: SealStatus; label: string }) {
 const CODE_LABEL: Record<string, string> = {
   uncited_number: '裸数字',
   unresolved_ref: '引用解析不了',
+  unknown_entity: '可能是编造的名字',
+  unverified_entity: '核对不了的名字',
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */

@@ -7,6 +7,7 @@
 //
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-studio.mjs
+import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -100,6 +101,19 @@ const TEAM_BOUND = {
     ? { ...n, data: { ...n.data, config: { ...n.data.config, tools: [...QUERY_TOOLS] } } } : n)),
 }
 
+// 可疑实体、引文、表名字段名的报告（可点击证据三期）：夹具是后端真跑出来的，只用通用名
+const fxe = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-entity.json', import.meta.url), 'utf8'))
+const EV_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 200, '输入', { fields: [{ name: 'week', required: true }] }),
+    node('fetch', 'agent', 300, 120, '取数', { prompt: '查 {{ input.week }} 的订单', tools: ['db_query__shop'], assign_to: 'rows' }),
+    node('manual', 'retrieve', 300, 320, '查手册', { query: '退款口径', collection: 'ops', assign_to: 'manual' }),
+    node('write', 'report', 640, 200, '写周报', { instructions: '写本周周报', numbers: 'strict', claims: 'require_citation' }),
+    node('done', 'output', 980, 200, '成果', { fields: [{ name: 'answer', value: '{{ nodes.write.text }}' }] }),
+  ],
+  edges: [edge('start', 'fetch'), edge('start', 'manual'), edge('fetch', 'write'), edge('manual', 'write'), edge('write', 'done')],
+}
+
 const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
@@ -113,6 +127,7 @@ const FAKES = {
   'st-tpl': wf('st-tpl', { name: '__studio_check_tpl__', is_template: true, tags: ['extracted'] }),
   'st-team': wf('st-team', { name: '__studio_check_team__', graph: TEAM_BOUND, version: 2, published_version: 2, status: 'published' }),
   'st-lint': wf('st-lint', { name: '__studio_check_lint__', graph: TEAM_GRAPH, version: 1 }),
+  'st-ev': wf('st-ev', { name: '__studio_check_ev__', graph: EV_GRAPH, version: 2 }),
 }
 const VERSIONS = [
   { id: 'v3', version: 3, note: '', created_at: '2026-09-26T02:00:00Z' },
@@ -168,7 +183,7 @@ async function ready(page, fn, what, { arg = null, timeout = 15000, retry = true
  * only：目录里只放这几张伪造的（不混真实的），用来造「删完一张不剩」
  * platform：伪装成别的平台（'Windows'），看快捷键提示是不是跟着平台走
  */
-async function open({ width = 1440, height = 900, path = '/studio/st-main', prefs = {}, stream, only, platform, init } = {}) {
+async function open({ width = 1440, height = 900, path = '/studio/st-main', prefs = {}, stream, only, platform, init, before } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height } })
   opened.add(ctx)
   // init：[函数, 参数]，在页面脚本之前跑（比如装数渲染次数的钩子）
@@ -277,6 +292,8 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
     input: {}, output: {}, error: '', usage: {}, created_at: '2026-09-26T02:00:00Z',
   }))
 
+  // before：页面第一次加载之前再装几条路由（画布一打开就发的请求，比如报告节点卡去取最近一次运行）
+  if (before) await before(page)
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
   await ready(page, () => window.__studio?.getState().workflow != null, '画布的 store（window.__studio）')
   await page.waitForTimeout(500)
@@ -1779,9 +1796,14 @@ await section('自动排版：请求在路上时画布锁了或改了，不套�
   const okToast = page.locator('[role="status"] > div').filter({ hasText: '已重新排版' })
   const pos = () => S(page, () => JSON.stringify(window.__studio.getState().nodes.map((n) => [n.id, n.position.x, n.position.y])))
   const layoutBtn = page.getByRole('button', { name: '自动排版' })
+  // 等排版接口真的回来再看结果：固定等 1100ms 在四道并行、后端忙的时候不够（接口本身就压了 700ms）
+  const laidOut = () => page.waitForResponse((r) => new URL(r.url()).pathname.endsWith('/api/copilot/layout'),
+    { timeout: 15000 }).catch(() => null)
+  const settle = async (done) => { await done; await page.waitForTimeout(250) }
 
   const p0 = await pos()
   const past0 = (await st(page)).past
+  let done = laidOut()
   await layoutBtn.click()
   await page.waitForTimeout(150)
   await page.evaluate(() => window.__studio.setState((s) => ({
@@ -1789,7 +1811,7 @@ await section('自动排版：请求在路上时画布锁了或改了，不套�
       input: {}, output: {}, error: '', usage: {}, created_at: '2026-09-26T02:00:00Z' },
     runPhase: 'running', trace: { ...s.trace, phase: 'running', runClass: 'formal' },
   })))
-  await page.waitForTimeout(1100)
+  await settle(done)
   check('正式运行半路开始：排版不套用', await pos() === p0 && (await st(page)).past === past0)
   check('也不报「已重新排版」（撤销按钮会撤掉别的改动）', await okToast.count() === 0)
   check('说清为什么没排', await page.locator('[role="status"] > div').filter({ hasText: '正式运行进行中' }).count() === 1)
@@ -1798,17 +1820,19 @@ await section('自动排版：请求在路上时画布锁了或改了，不套�
     run: { ...s.run, status: 'succeeded' }, runPhase: 'succeeded', trace: { ...s.trace, phase: 'succeeded' },
   })))
   await page.waitForTimeout(150)
+  done = laidOut()
   await layoutBtn.click()
   await page.waitForTimeout(150)
   await S(page, () => window.__studio.getState().updateNode('lookup', { label: '背景检索（排版时改的）' }))
-  await page.waitForTimeout(1100)
+  await settle(done)
   const kept = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'lookup')?.data.label)
   check('排版期间又改了画布：不拿旧图的排版盖掉刚才的改动', kept === '背景检索（排版时改的）', kept)
   check('说清这次排版没套用', await okToast.count() === 0
     && await page.locator('[role="status"] > div').filter({ hasText: '排版期间画布又改过了' }).count() === 1)
 
+  done = laidOut()
   await layoutBtn.click()
-  await page.waitForTimeout(1100)
+  await settle(done)
   check('正常情况照样排版、给撤销', await okToast.count() === 1 && await okToast.locator('button:has-text("撤销")').count() === 1)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await ctx.close()
@@ -2118,6 +2142,212 @@ await section('发起就被拒（工具不存在）给修复入口；整形节�
   check('……点了选中上游节点（不是整形节点）', await S(run.page, () => window.__studio.getState().selectedId) === 'answer')
   check('没有运行时报错', errors.length === 0 && run.errors.length === 0, [...errors, ...run.errors].slice(0, 2).join(' | '))
   await run.ctx.close()
+})
+
+await section('证据路径：点开报告片段时画布高亮、节点名能对准；报告卡上的章', async () => {
+  // 运行号用夹具里文档记着的那个：成果字段取文档时核对「是不是这次运行写的」，对不上就按普通文本画
+  const EV_RUN = fxe.run_id
+  const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+  /** 伪造这张图的「最近一次运行」：latest 为 null 时一次都没跑过；传函数时每次请求现取（中途换成新跑的那次） */
+  const routes = (latest) => async (page) => {
+    await page.route((u) => { const x = new URL(u); return x.pathname === '/api/runs' && x.searchParams.get('workflow_id') === 'st-ev' },
+      (r) => {
+        const id = typeof latest === 'function' ? latest() : latest
+        return json(r, id ? [{ id, workflow_id: 'st-ev', status: 'succeeded', run_class: 'exploratory' }] : [])
+      })
+    await page.route(new RegExp(`/api/runs/${fxe.run_id}/evidence$`), (r) => json(r, fxe.graph))
+    await page.route(new RegExp(`/api/runs/${fxe.run_id}/evidence/audit(\\?.*)?$`), (r) => json(r, fxe.audit))
+    await page.route(new RegExp(`/api/runs/${fxe.dup.run_id}/evidence/audit(\\?.*)?$`), (r) => json(r, fxe.dup.audit))
+    await page.route(new RegExp(`/api/artifacts/${fxe.doc_artifact}$`), (r) => json(r, { id: fxe.doc_artifact, content: fxe.doc }))
+    await page.route(new RegExp(`/api/artifacts/${fxe.dup.doc_artifact}$`), (r) => json(r, { id: fxe.dup.doc_artifact, content: fxe.dup.doc }))
+    await page.route(new RegExp(`/api/runs/${fxe.run_id}/evidence/segments/`), (r) => {
+      const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
+      return fxe.segments[sid] ? json(r, fxe.segments[sid]) : json(r, { detail: '没有这个片段' }, 404)
+    })
+  }
+  const stamp = (page) => page.locator('.react-flow__node[data-id="write"] [data-report-stamp]')
+  const st = fxe.report_checked.stats
+  const cited = st.numbers_cited + st.values + st.entities + st.quotes
+  const none = (st.numbers - st.numbers_cited) + Math.max(0, st.uncited_numbers + st.unresolved - (st.numbers - st.numbers_cited))
+    + st.unknown_entities + st.uncited_claims
+  // 另一次运行（结论句策略 off）：章上的数照 stampCounts 的口径算
+  const sd = fxe.dup.report_checked.stats
+  const dupText = `引用 ${sd.numbers_cited + sd.values + (sd.entities ?? 0) + (sd.quotes ?? 0)} · 无证据 ${(sd.numbers - sd.numbers_cited)
+    + Math.max(0, sd.uncited_numbers + sd.unresolved - (sd.numbers - sd.numbers_cited)) + (sd.unknown_entities ?? 0)}`
+  /** 画布上把运行摘下来（RunHud「清除」）：等它重新去取这张图的最近一次运行（取回来、画完再读章） */
+  const clearAndRefetch = async (pg) => {
+    const refetch = pg.waitForRequest((r) => { const x = new URL(r.url()); return x.pathname === '/api/runs' && x.searchParams.get('workflow_id') === 'st-ev' },
+      { timeout: 3000 }).catch(() => null)
+    await S(pg, () => window.__studio.getState().clearRun())
+    const req = await refetch
+    await pg.waitForLoadState('networkidle').catch(() => {})
+    await pg.waitForTimeout(400)
+    return !!req
+  }
+
+  // 一次都没跑过：不画章
+  let latestRun = null
+  const { page, errors } = await open({ path: '/studio/st-ev', before: routes(() => latestRun) })
+  await page.waitForTimeout(400)
+  check('这张图没有运行：报告节点卡上不画章', await stamp(page).count() === 0)
+
+  // 挂上一次运行：report.checked 落下就盖章，数字取它的统计（结论句策略为 require_citation，没挂依据的结论句计入）
+  await S(page, ({ id, rc, output }) => {
+    const s = window.__studio
+    const t = Date.now() / 1000 - 5
+    s.setState({ run: { id, workflow_id: 'st-ev', workflow_name: '__studio_check_ev__', status: 'queued', input: { week: '2026-W37' },
+      output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    const list = [['run.started', null, {}], ['node.started', 'write', { label: '写周报', node_type: 'report' }],
+      ['report.checked', 'write', rc], ['node.finished', 'write', { duration_ms: 1200 }],
+      ['run.finished', null, { output, usage: {}, timing: { wall_ms: 1500, active_ms: 1500, wait_ms: 0 } }]]
+    list.forEach((e, i) => s.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 }))
+  }, { id: EV_RUN, rc: fxe.report_checked, output: fxe.output })
+  await stamp(page).waitFor({ timeout: 4000 }).catch(() => {})
+  const text = await stamp(page).innerText().catch(() => '')
+  check(`报告卡上盖章「引用 ${cited} · 无证据 ${none}」`, text === `引用 ${cited} · 无证据 ${none}`, text)
+  const title = await stamp(page).getAttribute('title').catch(() => '')
+  check('章的悬停说明写出可疑名字、没挂依据的结论句计入缺口', (title ?? '').includes('可能是编造的名字 2')
+    && (title ?? '').includes('计入缺口'), (title ?? '').replace(/\n/g, ' / '))
+  check('有缺口的章用提醒色，不是绿的', (await stamp(page).getAttribute('class')).includes('is-degraded'))
+  check('别的节点卡上没有章', await page.locator('[data-report-stamp]').count() === 1)
+
+  // 右栏的报告点开片段：证据路径画到画布上（LineageLayer 的 style[data-lineage]）
+  const doc = page.locator('[data-assistant-panel] [data-evidence-doc]')
+  await doc.waitFor({ timeout: 6000 }).catch(() => {})
+  check('右栏的成果是逐段可点的报告', await doc.locator('[data-seg]').count() > 5)
+  await doc.locator('[data-seg]', { hasText: /^orders$/ }).first().click()
+  await page.waitForSelector('[data-assistant-panel] [data-evidence-panel="inline"]', { timeout: 4000 }).catch(() => {})
+  await page.waitForTimeout(300)
+  const lineage = await page.evaluate(() => {
+    const el = document.querySelector('style[data-lineage]')
+    return el ? { var: el.getAttribute('data-lineage'), css: el.textContent } : null
+  })
+  check('点开片段：画布上画出证据路径（LineageLayer 的 data-lineage 是这段证据）', lineage?.var === '证据 orders', lineage?.var ?? '没有')
+  check('……产出证据的查询节点实线描边、报告节点虚线描边', !!lineage && /\[data-id="fetch"\][^{]*> \.nc \{\s*box-shadow/.test(lineage.css)
+    && /\[data-id="write"\][^{]*> \.nc \{\s*outline: 1\.5px dashed/.test(lineage.css), (lineage?.css ?? '').slice(0, 160))
+  const state = await S(page, () => window.__studio.getState().lineage)
+  check('……用的是 setLineage 的原形状 {var, producers, consumers}', JSON.stringify(state) === JSON.stringify({ var: '证据 orders', producers: ['fetch'], consumers: ['write'] }),
+    JSON.stringify(state))
+  await doc.locator('[data-seg]', { hasText: '退款金额以财务确认日为准' }).first().click()
+  await page.waitForTimeout(300)
+  const quote = await S(page, () => window.__studio.getState().lineage)
+  check('换一段（引文）：路径换成检索节点 → 报告', quote?.producers?.join(',') === 'manual' && quote?.consumers?.join(',') === 'write', JSON.stringify(quote))
+  // 面板里的节点名：点一下选中并对准画布上的节点
+  const chip = page.locator('[data-assistant-panel] [data-evidence-panel] button[data-ev-node="manual"]').first()
+  check('面板里的节点名是按钮，写画布上的节点名', (await chip.innerText().catch(() => '')).includes('查手册'))
+  await chip.click().catch(() => {})
+  await page.waitForTimeout(250)
+  const sel = await S(page, () => ({ selected: window.__studio.getState().selectedId, focus: window.__studio.getState().focusRequest?.id }))
+  check('点节点名：选中并对准画布上的那个节点', sel.selected === 'manual' && sel.focus === 'manual', JSON.stringify(sel))
+  await S(page, () => window.__studio.getState().select(null))
+  await page.waitForTimeout(250)
+  if (SHOTS) {
+    await doc.locator('[data-seg]', { hasText: /^orders$/ }).first().click()
+    await page.waitForTimeout(300)
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/studio-evidence-path-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  // 收起面板：只收回自己画的那条路径
+  const back = page.locator('[data-assistant-panel] [data-evidence-panel] button', { hasText: '回到正文' })
+  await back.click().catch(() => {})
+  await page.waitForTimeout(250)
+  check('收起面板：画布上的证据路径一起收掉', await page.locator('style[data-lineage]').count() === 0
+    && await S(page, () => window.__studio.getState().lineage) === null)
+  // 「清除」把刚才那次运行摘下来：打开画布时这张图还没跑过（取到的是空的），现在最近一次就是刚才那次——
+  // 章要跟着换，不能拿打开画布时的「没跑过」当最近一次
+  latestRun = EV_RUN
+  const refetched = await clearAndRefetch(page)
+  check('「清除」摘下运行：重新取这张图的最近一次运行', refetched)
+  check('……章取刚才那次（打开画布时还没跑过，不能照旧不画）', (await stamp(page).innerText().catch(() => '没有章')) === `引用 ${cited} · 无证据 ${none}`,
+    await stamp(page).innerText().catch(() => '没有章'))
+  check('没有运行时报错（证据路径）', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await page.context().close()
+
+  // 没挂运行、这张图最近一次运行有报告核对：章从那次运行的证据图取
+  let latestNow = fxe.run_id
+  const latest = await open({ path: '/studio/st-ev', before: routes(() => latestNow) })
+  await stamp(latest.page).waitFor({ timeout: 4000 }).catch(() => {})
+  check('没挂运行：章取这张图最近一次运行的核对统计（和挂着运行时一样，结论句策略也算上）',
+    (await stamp(latest.page).innerText().catch(() => '')) === `引用 ${cited} · 无证据 ${none}`,
+    await stamp(latest.page).innerText().catch(() => '没有章'))
+  if (SHOTS) {
+    // 取景到报告节点（可读的缩放），截卡片连同下沿的章，四周留一圈
+    await S(latest.page, () => window.__studio.getState().focusNode('write'))
+    await latest.page.waitForTimeout(600)
+    for (const theme of ['dark', 'light']) {
+      await latest.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await latest.page.waitForTimeout(250)
+      const box = await latest.page.locator('.react-flow__node[data-id="write"]').boundingBox()
+      if (box) {
+        await latest.page.screenshot({ path: `${SHOTS}/studio-report-stamp-${theme}.png`,
+          clip: { x: box.x - 40, y: box.y - 40, width: box.width + 80, height: box.height + 80 } }).catch(() => {})
+      }
+    }
+  }
+  // 在画布上又跑了一次（另一份报告），跑完「清除」：最近一次换成了这次，章不能还是打开画布时取的那份
+  await S(latest.page, ({ id, rc, output }) => {
+    const s = window.__studio
+    const t = Date.now() / 1000 - 3
+    s.setState({ run: { id, workflow_id: 'st-ev', workflow_name: '__studio_check_ev__', status: 'queued', input: {},
+      output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    const list = [['run.started', null, {}], ['node.started', 'write', { label: '写周报', node_type: 'report' }],
+      ['report.checked', 'write', rc], ['node.finished', 'write', { duration_ms: 900 }],
+      ['run.finished', null, { output, usage: {}, timing: { wall_ms: 1000, active_ms: 1000, wait_ms: 0 } }]]
+    list.forEach((e, i) => s.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 }))
+  }, { id: fxe.dup.run_id, rc: fxe.dup.report_checked, output: fxe.dup.output })
+  await latest.page.waitForTimeout(300)
+  check(`挂上新跑的一次：章跟着它（${dupText}）`, (await stamp(latest.page).innerText().catch(() => '')) === dupText,
+    await stamp(latest.page).innerText().catch(() => '没有章'))
+  latestNow = fxe.dup.run_id
+  const again = await clearAndRefetch(latest.page)
+  check('「清除」之后重新取最近一次运行（打开画布时取的那份作废）', again)
+  check(`……章换成新跑的那次（${dupText}），不是打开画布时的「引用 ${cited} · 无证据 ${none}」`,
+    (await stamp(latest.page).innerText().catch(() => '没有章')) === dupText, await stamp(latest.page).innerText().catch(() => '没有章'))
+  check('没有运行时报错（最近一次运行的章）', latest.errors.length === 0, latest.errors.slice(0, 2).join(' | '))
+  await latest.ctx.close()
+
+  // 取「最近一次运行」的请求还没回来，就在画布上跑完、清除了：先发的那次（那时还没跑过）晚回来，不能把后来
+  // 取到的那份盖掉。页面加载等网络静下来才算完，慢请求只能在加载后从 store 发（和报告卡发的是同一个 loadLatest）
+  let raceRun = null
+  let raceHits = 0
+  const race = await open({ path: '/studio/st-ev', before: async (pg) => {
+    await routes(() => raceRun)(pg)
+    await pg.route((u) => { const x = new URL(u); return x.pathname === '/api/runs' && x.searchParams.get('workflow_id') === 'st-ev' },
+      async (r) => {
+        if (raceHits++ !== 1) return r.fallback()
+        const body = raceRun ? [{ id: raceRun, workflow_id: 'st-ev', status: 'succeeded', run_class: 'exploratory' }] : []
+        await new Promise((res) => setTimeout(res, 1800))
+        return json(r, body).catch(() => {})
+      })
+  } })
+  await race.page.evaluate(async () => {
+    const { useEvidence } = await window.__appImport('/src/store/evidence.ts')
+    useEvidence.getState().dropLatest('st-ev')
+    void useEvidence.getState().loadLatest('st-ev')
+  })
+  await race.page.waitForTimeout(150)
+  await S(race.page, ({ id, rc, output }) => {
+    const s = window.__studio
+    const t = Date.now() / 1000 - 2
+    s.setState({ run: { id, workflow_id: 'st-ev', workflow_name: '__studio_check_ev__', status: 'queued', input: {},
+      output: {}, error: null, usage: {}, run_class: 'exploratory', version: null } })
+    const list = [['run.started', null, {}], ['report.checked', 'write', rc],
+      ['run.finished', null, { output, usage: {}, timing: { wall_ms: 1000, active_ms: 1000, wait_ms: 0 } }]]
+    list.forEach((e, i) => s.getState().applyEvent({ seq: i + 1, type: e[0], node_id: e[1], data: e[2], ts: t + i * 0.2 }))
+  }, { id: fxe.dup.run_id, rc: fxe.dup.report_checked, output: fxe.dup.output })
+  raceRun = fxe.dup.run_id
+  await race.page.waitForTimeout(150)
+  await S(race.page, () => window.__studio.getState().clearRun())
+  await race.page.waitForTimeout(2600)
+  check(`先发的请求晚回来（那时还没跑过）：章照旧是清除后取到的那次（${dupText}），没被盖成不画`,
+    raceHits >= 3 && (await stamp(race.page).innerText().catch(() => '没有章')) === dupText,
+    `${raceHits} 次请求，${await stamp(race.page).innerText().catch(() => '没有章')}`)
+  check('没有运行时报错（请求先后颠倒）', race.errors.length === 0, race.errors.slice(0, 2).join(' | '))
+  await race.ctx.close()
 })
 
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)

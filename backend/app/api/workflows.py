@@ -444,11 +444,12 @@ async def autofix(
         bad = _unreadable(payload.level, e)
         return {"graph": graph, "changes": [], "ops": [], "applied": [], "rejected": [
             {"fix_id": fid, "reason": "工作流的结构读不懂，没法应用修复"} for fid in payload.apply],
-            "remaining": bad["issues"], "fixes": [], "assist": None, "ok": False}
+            "remaining": bad["issues"], "fixes": [], "handoff": [], "assist": None, "ok": False}
     versions, cards = await _gate_context(session, spec)
     out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards)
     out["assist"] = None
-    if payload.assist:
+    # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
+    if payload.assist or out["handoff"]:
         if out["ok"]:
             out["assist"] = {"ok": True, "summary": "修复之后已经没有挡住发布的错误，没有再交给 Copilot",
                              "questions": []}

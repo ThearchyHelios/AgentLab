@@ -18,6 +18,7 @@ import { runClassLabel } from '../lib/terms'
 import type { RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
+import { EvidenceHostContext, type EvidenceHost } from './evidenceHost'
 import {
   copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
 } from './decode'
@@ -541,6 +542,39 @@ function useExitLabels() {
   ), [sig])
 }
 
+/**
+ * 画布右栏里的证据面板能做的两件事（evidenceHost）：
+ * - 点开片段时把证据路径交给血缘层（setLineage）：产出证据的节点（查询、口径卡、检索）实线描边、
+ *   报告虚线描边，两者之间的走线提亮。画布上已经没有的节点不交（对不到任何卡片）。面板关掉、换走时只
+ *   收回自己画的那一条——悬停变量画的血缘不去动它
+ * - 面板里的节点名点一下：选中并对准画布上的节点，和步骤行的「在画布上看」同一个动作
+ */
+function useCanvasEvidenceHost(): EvidenceHost {
+  const select = useStudio((s) => s.select)
+  const focusNode = useStudio((s) => s.focusNode)
+  const drawn = useRef<string | null>(null)
+  return useMemo<EvidenceHost>(() => {
+    const exists = (id: string) => useStudio.getState().nodes.some((n) => n.id === id)
+    return {
+      onTrace: (trace) => {
+        const s = useStudio.getState()
+        if (trace) {
+          drawn.current = trace.label
+          s.setLineage({ var: trace.label, producers: trace.producers.filter(exists), consumers: trace.consumers.filter(exists) })
+        } else if (drawn.current && s.lineage?.var === drawn.current) {
+          drawn.current = null
+          s.setLineage(null)
+        }
+      },
+      onNode: (id) => { select(id); focusNode(id) },
+      nodeLabel: (id) => {
+        const node = useStudio.getState().nodes.find((n) => n.id === id)
+        return node ? node.data.label || id : undefined
+      },
+    }
+  }, [select, focusNode])
+}
+
 function RunView({ onBack, reveal, onRevealed }: {
   onBack: () => void; reveal: Reveal | null; onRevealed: () => void
 }) {
@@ -563,6 +597,7 @@ function RunView({ onBack, reveal, onRevealed }: {
   const [stopping, setStopping] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
   const exitLabelOf = useExitLabels()
+  const evidenceHost = useCanvasEvidenceHost()
 
   const turns = useMemo<StreamTurn[]>(() => {
     const finished = [...events].reverse().find((e) => e.type === 'run.finished')
@@ -734,6 +769,8 @@ function RunView({ onBack, reveal, onRevealed }: {
 
       <div ref={bodyRef} className="min-h-0 flex-1">
         {raw ? <RawEvents /> : (
+          // 成果里的报告点开片段时：证据路径画到画布上，面板里的节点名点一下就对准那个节点
+          <EvidenceHostContext.Provider value={evidenceHost}>
           <AssistantStream
             turns={turns}
             dense
@@ -767,6 +804,7 @@ function RunView({ onBack, reveal, onRevealed }: {
               </div>
             ) : null)}
           />
+          </EvidenceHostContext.Provider>
         )}
       </div>
 

@@ -14,9 +14,10 @@ import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
 import { matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
-import { formatDuration, formatLapse, formatNumber, formatTokens, NONE } from '../lib/format'
+import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { issuanceLabel, RUN_CLASS_LABEL } from '../lib/terms'
+import { issuanceLabel, reportStampText, RUN_CLASS_LABEL } from '../lib/terms'
+import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
 import { useRunClock } from '../run/useRunClock'
@@ -185,6 +186,23 @@ function matchedLines(matched: unknown): string {
   if (!lines.length) return ''
   const more = matched.length > lines.length ? `\n  …另有 ${matched.length - lines.length} 个` : ''
   return `回指明细：\n${lines.join('\n')}${more}`
+}
+
+/** 报告节点章的悬停说明：两个数怎么来的，缺口里各有什么 */
+function reportStampTitle(r: ReportStamp): string {
+  const st = r.stats
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const uncited = n(st.uncited_claims)
+  return [
+    `报告核对（这张图最近一次运行${r.runId ? ` ${shortId(r.runId)}` : ''}）：${reportStampText(r.cited, r.none)}`,
+    typeof st.numbers === 'number' ? `数字 ${formatNumber(n(st.numbers_cited))}/${formatNumber(st.numbers)} 有出处` : '',
+    n(st.entities) || n(st.quotes) ? `表名字段名 ${formatNumber(n(st.entities))} 处、引文 ${formatNumber(n(st.quotes))} 处有出处` : '',
+    n(st.unresolved) ? `引用解析不了 ${formatNumber(n(st.unresolved))} 处` : '',
+    n(st.unknown_entities) ? `可能是编造的名字 ${formatNumber(n(st.unknown_entities))} 个` : '',
+    n(st.unverified_entities) ? `核对不了的名字 ${formatNumber(n(st.unverified_entities))} 个（只标注，不计入）` : '',
+    uncited ? `没挂依据的结论句 ${formatNumber(uncited)} 句${r.claims === 'require_citation' ? '（计入缺口）' : '（结论句策略不要求，不计入）'}` : '',
+    '完整清单在记录页这次运行的「证据」页签',
+  ].filter(Boolean).join('\n')
 }
 
 /**
@@ -724,6 +742,8 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const issuanceDetail = useStudio((s) =>
     (type === 'output' ? (s.run?.output as any)?._issuance as Record<string, any> | undefined
       ?? (issuanceOf(s.events).id === id ? issuanceOf(s.events).data : undefined) : undefined))
+  // 报告节点：这张图最近一次运行的核对统计，画成卡上的章（没有就不画）
+  const reportStamp = useReportStamp(id, type === 'report')
   // 只有排队中的卡片要知道自己有几路上游，别的卡片不必为改图重跑这一趟
   const fanIn = useStudio((s) => (state === 'queued' ? fanInOf(s.nodes, s.edges)[id] ?? 0 : 0))
 
@@ -1072,6 +1092,17 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
           <StatusBadge status={tier === 'formal' ? 'done' : tier === 'withheld' ? 'failed' : 'waiting'} size={11} animate={false} decorative />
           <span aria-hidden>{issuanceLabel(tier)}</span>
           {runClass === 'exploratory' && <small aria-hidden>{RUN_CLASS_LABEL.exploratory} · 不归档</small>}
+        </span>
+      )}
+
+      {/* 报告节点的章：「引用 N · 无证据 M」，这张图最近一次运行的 report.checked。回放时游标还没走到
+          那一刻不画。章不是按钮：完整清单在记录页的「证据」页签 */}
+      {reportStamp && (reportStamp.at == null || view.at == null || view.at >= reportStamp.at) && (
+        <span role="img" aria-label={reportStampTitle(reportStamp)} title={reportStampTitle(reportStamp)}
+              className={clsx('nc-stamp is-evidence', reportStamp.none ? 'is-degraded' : 'is-formal')}
+              data-report-stamp="" data-stamp-cited={reportStamp.cited} data-stamp-none={reportStamp.none}>
+          <StatusBadge status={reportStamp.none ? 'waiting' : 'done'} size={11} animate={false} decorative />
+          <span aria-hidden className="tnum">{reportStampText(reportStamp.cited, reportStamp.none)}</span>
         </span>
       )}
 

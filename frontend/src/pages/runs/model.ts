@@ -291,9 +291,12 @@ export function cancelReason(error: string | null | undefined): string | null {
 // 详情的几个视图
 // -------------------------------------------------------------------------
 
-/** stream：时间线（逐步的文字）；trace：航迹（按时间摊开、可回放）；artifacts：工件 */
-export type DetailView = 'stream' | 'trace' | 'artifacts'
-export const DETAIL_VIEWS: readonly DetailView[] = ['stream', 'trace', 'artifacts']
+/**
+ * stream：时间线（逐步的文字）；trace：航迹（按时间摊开、可回放）；evidence：证据（报告、常驻面板、
+ * 审计表）；artifacts：工件
+ */
+export type DetailView = 'stream' | 'trace' | 'evidence' | 'artifacts'
+export const DETAIL_VIEWS: readonly DetailView[] = ['stream', 'trace', 'evidence', 'artifacts']
 export const asView = (v: string | null | undefined): DetailView =>
   (DETAIL_VIEWS as readonly string[]).includes(v ?? '') ? (v as DetailView) : 'stream'
 
@@ -328,6 +331,7 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   node_output: '节点产出',
   metric_set: '口径卡指标集',
   report_doc: '报告文档',
+  schema_snapshot: '表结构快照',
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
 
@@ -342,6 +346,9 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
     case 'metric_set': return meta?.caliber
       ? `口径卡「${meta.caliber}」${meta.version ?? ''}` : '口径卡的指标、算式和输入'
     case 'report_doc': return '报告：逐段的片段和每个数字的出处'
+    // 查库时冻结的表结构（工件行的 meta 里有 {source, tables: 表数量}）：报告里的表名、字段名按它核对
+    case 'schema_snapshot': return meta?.source
+      ? `表结构：数据源「${meta.source}」${typeof meta.tables === 'number' ? ` · ${meta.tables} 张表` : ''}` : '查库时冻结的表结构'
     default: return '工件'
   }
 }

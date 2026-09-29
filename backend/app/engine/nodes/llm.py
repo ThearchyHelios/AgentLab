@@ -18,7 +18,14 @@ from app.db.base import SessionLocal
 from app.db.models import Skill
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
-from app.engine.evidence import cell_eid, ledger_enabled, make_eid, next_exec, query_entry_fields
+from app.engine.evidence import (
+    cell_eid,
+    ledger_enabled,
+    make_eid,
+    next_exec,
+    query_entry_fields,
+    schema_ledger_entry,
+)
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell, numeric_text, same_value
 from app.engine.guards import FALLBACK_CONTEXT, Guard, legacy_hint, node_limits
 from app.engine.replay import ask, once
@@ -503,6 +510,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             preview=content[:2000],
             artifact=snapshot_id,
             **({"query_artifact": query["artifact"]} if query else {}),
+            # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
+            **({"schema_artifact": query["schema_artifact"]} if query and query.get("schema_artifact") else {}),
             **extra,
         )
         outcome: dict[str, Any] = {"content": content, "ok": ok, "duration_ms": elapsed}
@@ -821,10 +830,17 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
         return content
     alias = f"Q{len(queries) + 1}"
     record.update(alias=alias, artifact=artifact)
+    # 表结构快照：同一件在本节点这次执行里只记一条 schema 条目。快照是内容寻址的，重放时读到的是同一份
+    schema = fields.get("schema_artifact")
+    seen = schema and any(e.get("kind") == "schema" and e.get("artifact") == schema for e in entries)
+    frozen = None if not schema or seen else schema_ledger_entry(schema, node_id=node_id, exec_no=exec_no)
+    shaped = {"schema_artifact": schema, "tables": fields["tables"]} if seen or frozen else {}
     entries.append({"kind": "query", "node_id": node_id, "exec": exec_no, "artifact": artifact,
                     **({"via": snapshot} if snapshot else {}), "call_id": call_id, "tool": name,
                     "source": fields["source"], "columns": fields["columns"], "rows": fields["rows"],
-                    "truncated": fields["truncated"]})
+                    "truncated": fields["truncated"], **shaped})
+    if frozen:
+        entries.append(frozen)
     queries.append({"alias": alias, "call_id": call_id, "tool": name, "sql": str(args.get("sql") or ""),
                     "artifact": artifact, "via": snapshot, "columns": fields["columns"],
                     "rows": data.get("rows") or [], "truncated": fields["truncated"]})

@@ -11,6 +11,12 @@
 5. 收尾：文档落成 report_doc 工件，report.checked 事件进封存；仍然违规时按
    on_violation 失败（fail）或者照常产出、把违规片段标出来（flag）
 
+三期起目录里还有表和字段（这次运行冻结的表结构）、知识库检索的原话。可疑实体（反引号里
+写了个哪里都找不到的名字）只标注：不重写、不失败，受管级别的正式出具按缺口降档；表结构快照
+不全时核对不了的名字（unverified_entity）只标注。entities: off 整层不管表名、字段名。
+结论句策略 claims：off（默认）不管；require_citation 在写作提示里要求结论句挂依据（自动链接的
+名字不算依据），没挂的计入缺口、出口降档；judge（模型裁判）是后续版本的事，现在写了直接报错。
+
 出口契约复核（io.py）用 report_catalog 按同一套参数重建目录、独立重算，不信这里的自查。
 """
 from __future__ import annotations
@@ -26,6 +32,8 @@ from app.db.base import SessionLocal
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import (
     CELLS_REASON,
+    CLAIMS_RULE,
+    ENTITY_KINDS,
     MARKER_RULES,
     StreamRenderer,
     build_catalog,
@@ -35,13 +43,20 @@ from app.engine.evidence import (
     ledger_enabled,
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
-from app.engine.schema import GraphNode, GraphSpec, NodeType, _ancestors
+from app.engine.schema import REPORT_CLAIMS, GraphNode, GraphSpec, NodeType, _ancestors, claims_problem
 from app.engine.state import GraphState, message_text, thinking_text
 from app.engine.toolcalls import leaked_markup, markup_warning
 from app.providers.factory import ProviderNotConfigured, get_chat_model
 
 ON_VIOLATION = ("fail", "flag")
 NUMBERS = ("strict", "off")
+#: 实体层：link（默认）核对表名、字段名并自动链接；off 整层不管（目录里不收表和字段）
+ENTITIES = ("link", "off")
+#: 结论句策略，和画布校验同一份（schema.REPORT_CLAIMS）；judge 是后续版本的事
+CLAIMS = REPORT_CLAIMS
+#: 只标注、不让写作者重写也不判失败的违规：可疑实体（受管的正式出具按缺口降档）、表结构快照不全时
+#: 核对不了的名字（出口只标注）
+SOFT = frozenset({"unknown_entity", "unverified_entity"})
 #: 重写一次就是多一次整篇的模型调用，写不对的模型多给几次也大多写不对
 MAX_REPAIRS = 3
 
@@ -79,16 +94,38 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(sources, str) and sources != "ancestors":
         sources = [sources]
     if isinstance(sources, list):
-        # evidence_from 只管查询、检索这类证据从哪几个节点来；指标从哪来由 metrics_from 管
+        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管
         keep = {str(s) for s in sources}
-        ledger = [e for e in ledger if e.get("kind") not in ("query", "retrieval") or e.get("node_id") in keep]
-    return build_catalog(
+        ledger = [e for e in ledger
+                  if e.get("kind") not in ("query", "retrieval", "schema") or e.get("node_id") in keep]
+    catalog = build_catalog(
         nodes=state.get("nodes") or {},
         ledger=ledger,
         inputs=state.get("input") or {},
         metrics_from=_setting(spec, node, "metrics_from") or None,
         allowed=_ancestors(spec, node.id),
     )
+    if report_entities(spec, node) == "off":
+        # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
+        catalog = {alias: e for alias, e in catalog.items() if e.get("kind") not in ENTITY_KINDS}
+    return catalog
+
+
+def report_entities(spec: GraphSpec, node: GraphNode) -> str:
+    """报告节点的实体层：link（默认）/ off。出口复核调 verify_doc 时传 entities=(这个值 == "link")。
+
+    写错的值执行时节点会报错，这里只把 off 当 off，别的一律按默认。
+    """
+    return "off" if _setting(spec, node, "entities", "link") == "off" else "link"
+
+
+def report_claims(spec: GraphSpec, node: GraphNode) -> str:
+    """报告节点的结论句策略：off / require_citation。出口判档按它（和节点执行时同一个取值规则）。
+
+    写错的值（包括 judge）画布校验就拦了，执行时节点也会报错，这里只把没写当成 off。
+    """
+    value = _setting(spec, node, "claims", "off")
+    return value if isinstance(value, str) and value in CLAIMS else "off"
 
 
 def report_allowance(spec: GraphSpec, node: GraphNode) -> list[Any]:
@@ -185,6 +222,12 @@ def _options(ctx: NodeContext) -> tuple[str, int]:
     numbers = str(ctx.cfg("numbers", "strict") or "strict")
     if numbers not in NUMBERS:
         raise NodeError(ctx.node.id, f"numbers 只能是 {' / '.join(NUMBERS)}，写的是 {numbers!r}")
+    # 画布校验也拦这两项；执行时再守一道，报的是同一句话，免得写错的值被悄悄当成默认
+    if problem := claims_problem(ctx.cfg("claims")):
+        raise NodeError(ctx.node.id, problem)
+    entities = ctx.cfg("entities", "link") or "link"
+    if entities not in ENTITIES:
+        raise NodeError(ctx.node.id, f"entities 只能是 {' / '.join(ENTITIES)}，写的是 {entities!r}")
     raw = ctx.cfg("max_repairs", 1)
     try:
         repairs = int(raw)
@@ -196,8 +239,13 @@ def _options(ctx: NodeContext) -> tuple[str, int]:
 
 
 def _blocking(violations: list[dict[str, Any]], numbers: str) -> list[dict[str, Any]]:
-    """要让写作者改的违规。numbers=off 时裸数字只记录不拦（文档和出口复核照样看得到）。"""
-    return [v for v in violations if not (numbers == "off" and v.get("code") == "uncited_number")]
+    """要让写作者改的违规。numbers=off 时裸数字只记录不拦（文档和出口复核照样看得到）。
+
+    可疑实体只标注（SOFT）：一个反引号里的业务词也可能被当成名字，为它整篇重写、判失败都不值；
+    它留在文档和出口复核里，受管的正式出具按缺口降档。表结构快照不全时核对不了的名字同样只标注。
+    """
+    return [v for v in violations if v.get("code") not in SOFT
+            and not (numbers == "off" and v.get("code") == "uncited_number")]
 
 
 def _named(violations: list[dict[str, Any]], limit: int = 3) -> str:
@@ -216,14 +264,16 @@ def _repair_request(violations: list[dict[str, Any]]) -> str:
     )
 
 
-def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cells: bool = True) -> list[BaseMessage]:
+def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cells: bool = True,
+              claims: str = "off") -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
+    rules = f"{MARKER_RULES}\n{CLAIMS_RULE}" if claims == "require_citation" else MARKER_RULES
     return [
         SystemMessage(content="\n\n".join(p for p in (system, ROLE) if p)),
         HumanMessage(content=(
-            f"{instructions}\n\n{catalog_prompt(catalog, cells_allowed=cells)}\n\n{MARKER_RULES}\n\n"
+            f"{instructions}\n\n{catalog_prompt(catalog, cells_allowed=cells)}\n\n{rules}\n\n"
             "只输出报告正文（Markdown），不要写撰写说明。"
         )),
     ]
@@ -257,7 +307,10 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     catalog = report_catalog(state, spec, ctx.node)
     allow = report_allowance(spec, ctx.node)
     cells = True
-    if ledger_enabled(ctx.run):
+    # 结论句策略只对升级后发起的运行生效：升级前的运行（图里也不会有 claims）事件、产出一个字不加
+    evidence_on = ledger_enabled(ctx.run)
+    claims = report_claims(spec, ctx.node) if evidence_on else "off"
+    if evidence_on:
         # 升级前发起的运行没有查询条目，单元格无从谈起，也就不多查这一次
         from app.engine.governance import governed_formal
 
@@ -265,7 +318,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if warning := _no_evidence(catalog, cells):
         ctx.emit(EventType.LOG, level="warn", code="report_no_evidence", message=warning)
 
-    messages = _messages(ctx, state, catalog, cells)
+    messages = _messages(ctx, state, catalog, cells, claims)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
@@ -291,9 +344,11 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                      message="模型只输出了思考内容，报告正文为空。把 max_tokens 调大，或把 thinking 设为 off。")
         return response, text
 
+    entities = report_entities(spec, ctx.node) == "link"
+
     def compose(raw: str) -> dict[str, Any]:
         return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
-                           cells_allowed=cells)
+                           cells_allowed=cells, entities=entities)
 
     response, raw = await draft(messages)
     doc = compose(raw)
@@ -310,7 +365,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
-             on_violation=on_violation, failed=bool(blocking) and on_violation == "fail")
+             on_violation=on_violation, failed=bool(blocking) and on_violation == "fail",
+             **({"claims": claims} if evidence_on else {}))
     if blocking and on_violation == "fail":
         head = "；".join(v["message"] for v in blocking[:5])
         more = f"；…另有 {len(blocking) - 5} 处" if len(blocking) > 5 else ""
@@ -331,6 +387,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "repairs": repairs,
         "model": model_id,
         "duration_ms": int((time.perf_counter() - started) * 1000),
+        **({"claims": claims} if evidence_on else {}),
     }
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "usage": usage}
     if ctx.cfg("emit_message", True):

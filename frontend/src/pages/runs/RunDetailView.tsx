@@ -24,6 +24,8 @@ import {
   asView, duplicateNames, graphShape, idTail, isLiveRun, runScope, type DetailView,
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
+import { EvidencePane } from './EvidencePane'
+import { EVIDENCE_AUDIT_TEXT } from '../../lib/terms'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
@@ -523,6 +525,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const viewTabs: TabItem<DetailView>[] = [
     { key: 'stream', label: '时间线', title: '逐步看每个节点做了什么、说了什么' },
     { key: 'trace', label: '航迹', title: '按时间摊开：慢在哪、卡在哪、谁和谁同时；拖到任意一刻回放' },
+    { key: 'evidence', label: EVIDENCE_AUDIT_TEXT.tab, title: EVIDENCE_AUDIT_TEXT.tabTitle },
     {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
       title: artifactCount == null ? '这次运行存下的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
@@ -649,6 +652,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
             <TracePane run={run} events={d.events} trace={d.trace} graph={d.graph} code={code}
                        replayAt={replayAt} onReplayAt={setReplayAt} selected={traceSelected} onSelect={pickTraceNode}
                        labelOf={labelOf} nodeHref={hrefFor} goneFromCanvas={goneFromCanvas} onRevealStep={revealStep} />
+          </div>
+        )}
+        {view === 'evidence' && (
+          <div className="absolute inset-0" data-view-pane="evidence">
+            <EvidencePane run={run} output={turn.output ?? null} labelOf={labelOf} refreshKey={artifactKey} />
           </div>
         )}
         {view === 'artifacts' && (

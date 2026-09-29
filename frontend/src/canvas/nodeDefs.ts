@@ -43,6 +43,11 @@ export interface FieldDef {
   disabled?: (config: Record<string, any>) => string | null
   /** nodeRefs：只能选这一类的上游节点（报告的 metrics_from 只收口径卡） */
   refType?: NodeType
+  /**
+   * select：config 里写着一个不在选项里的值（手写的、Copilot 写的、后续版本才支持的）时，
+   * 下拉里照实多列一项、写明为什么不认。不给的话浏览器会把它显示成第一个选项——看着像默认值
+   */
+  unknownLabel?: (value: string) => string
   advanced?: boolean
 }
 
@@ -557,6 +562,30 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       {
         key: 'max_repairs', label: '最多重写几次', type: 'number', min: 0, max: 3, placeholder: '1',
         help: '有违规时把清单交回去让模型重写。每次都是一整篇的调用，写不对的模型多给几次也大多写不对',
+      },
+      {
+        // 后端只认 off / require_citation（schema.REPORT_CLAIMS）；judge 是四期的模型裁判，写了会被校验拦下。
+        // 没写等于 off：select 显示第一项，正好是默认
+        key: 'claims', label: '没挂依据的结论句', type: 'select',
+        options: [
+          { value: 'off', label: '不管（默认）：不参与出具判档' },
+          { value: 'require_citation', label: '计入缺口：出具按档位降档' },
+        ],
+        help: '结论句是带数字、方向词或因果词的句子。选「计入缺口」时，写作提示要求每句结论挂上 [[see:…]] 依据，'
+          + '没挂的记为缺口、出具降档（系统自动链接的表名字段名不算依据）。受管级别发布必须显式选它。'
+          + '结论句裁判在后续版本支持',
+        unknownLabel: (v) => (v === 'judge' ? 'judge：结论句裁判在后续版本支持，现在不能用' : `${v}：不认识的值，只能选上面两项`),
+      },
+      {
+        // 后端只认 link / off（report.py 的 ENTITIES）
+        key: 'entities', label: '表名、字段名', type: 'select', advanced: true,
+        options: [
+          { value: 'link', label: '核对，对得上的可以点开（默认）' },
+          { value: 'off', label: '不核对' },
+        ],
+        help: '报告里写到的表名、字段名按本次运行的表结构快照和查询核对：对得上的能点开看出处，'
+          + '反引号里写了哪里都没有的名字标成「可能是编造的名字」',
+        unknownLabel: (v) => `${v}：不认识的值，只能选 link 或 off`,
       },
       ...MODEL_FIELDS,
       { key: 'system', label: '角色设定', type: 'textarea', advanced: true, placeholder: '你是…' },

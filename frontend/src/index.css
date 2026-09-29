@@ -976,6 +976,14 @@
   font-weight: 500;
   letter-spacing: 0;
 }
+/* 报告节点的章（引用 N · 无证据 M）放在卡片下沿：上沿左边是血缘标签（产出 / 引用），右边是校验角标 */
+.nc-stamp.is-evidence {
+  top: auto;
+  /* 只压住卡片下沿 4px：卡片最后一行（校验提示、耗时）不被章挡住 */
+  bottom: -17px;
+  right: 14px;
+  letter-spacing: 0;
+}
 .nc-stamp.is-formal { color: var(--st-done); }
 .nc-stamp.is-degraded { color: var(--st-waiting); }
 .nc-stamp.is-withheld { color: var(--st-failed); }
@@ -1596,6 +1604,25 @@
 .ev-seg[data-ev-line="solid"] { text-decoration-style: solid; }
 /* 点状线比实线细碎，同样 1px 在小字号下几乎看不见 */
 .ev-seg[data-ev-line="dotted"] { text-decoration-style: dotted; text-decoration-thickness: 1.5px; }
+/* 引文：前面挂一个引号（字形那一条通道），颜色随状态——有出处的绿、原话对不上的琥珀。
+   引号是装饰，读屏从 aria-label 里听到「引文」，这里的替代文字给空串 */
+.ev-seg[data-ev-kind="quote"]::before {
+  content: "“";
+  content: "“" / "";
+  margin-right: 1px;
+  color: var(--ev-glyph, currentColor);
+  font-weight: 600;
+}
+/* 旧运行的候选：比无证据的点状线更淡、更细，绝不像确定性的实线。正文里的候选是 Markdown 的标记（.ev-mark），
+   不是按钮：旧答案保留原来的版式，候选的明细在下面的清单里逐条列出 */
+.ev-seg[data-ev-state="candidate"] { text-decoration-thickness: 1px; }
+.ev-mark {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--ev-line, currentColor);
+  text-underline-offset: 3px;
+}
 .ev-seg:hover,
 .ev-seg[aria-expanded="true"] { background: var(--ev-soft, transparent); }
 .ev-seg:focus-visible,

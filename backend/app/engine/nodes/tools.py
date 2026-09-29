@@ -12,7 +12,7 @@ from langgraph.func import task
 from app.core.artifact_store import canonical_json, content_hash
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
-from app.engine.evidence import ledger_enabled, next_exec, query_entry_fields
+from app.engine.evidence import ledger_enabled, next_exec, query_entry_fields, schema_ledger_entry
 from app.engine.replay import ask, once
 from app.engine.state import GraphState
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
@@ -175,9 +175,11 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         snapshot_id = None
     # 只认数据源工具交回的查询：别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的
     query = query_entry_fields(result) if evidence_on and name.startswith(QUERY_PREFIX) else None
+    schema = query.get("schema_artifact") if query else None
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
-             artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}))
+             artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}),
+             **({"schema_artifact": schema} if schema else {}))
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     if evidence_on:
@@ -188,9 +190,14 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             entries.append({"kind": "tool", "node_id": ctx.node.id, "exec": exec_no, "artifact": snapshot_id,
                             "tool": name})
         if query:
+            # 查询当时的表结构快照另记一条 schema 条目；取不回来的话查询条目也不带它（不启用实体核对）
+            frozen = schema_ledger_entry(schema, node_id=ctx.node.id, exec_no=exec_no) if schema else None
             entries.append({"kind": "query", "node_id": ctx.node.id, "exec": exec_no, "artifact": query["artifact"],
                             **({"via": snapshot_id} if snapshot_id else {}), "tool": name, "source": query["source"],
-                            "columns": query["columns"], "rows": query["rows"], "truncated": query["truncated"]})
+                            "columns": query["columns"], "rows": query["rows"], "truncated": query["truncated"],
+                            **({"schema_artifact": schema, "tables": query["tables"]} if frozen else {})})
+            if frozen:
+                entries.append(frozen)
         if entries:
             updates["evidence"] = entries
     var_name = ctx.cfg("assign_to", "")

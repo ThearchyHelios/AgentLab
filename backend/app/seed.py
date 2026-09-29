@@ -233,7 +233,9 @@ TEMPLATES: list[dict[str, Any]] = [
         "description": "报告里的每个数都点得开出处：tool 节点查库、口径卡登记指标、报告撰写节点只写引用"
         "标记，数字由系统从口径卡取出来渲染，出口按引用逐段核对后三档出具。取数节点查的是示例数据源 "
         "shop 的 orders 表（week、amount、refunded 三列）：先接入你的库（或者上传一张表格、命名为 "
-        "shop），再把 SQL 换成你的口径。",
+        "shop），再把 SQL 换成你的口径。报告撰写节点按受管要求写明了 on_violation: fail 和 claims: "
+        "require_citation：探索运行里修不掉的数字违规也会让报告节点失败，而不只是标出来；正式运行里没挂引用"
+        "的结论句计入缺口、按档降级。",
         "tags": ["出具", "口径卡", "周报", "证据"],
         "nodes": [
             _n("start", "input", "周期", fields=[
@@ -265,7 +267,9 @@ TEMPLATES: list[dict[str, Any]] = [
                    {"id": "refund_rate", "name": "退款率", "decimals": 4, "format": "percent_of_ratio",
                     "expression": "vars.q.rows[0][3] / vars.q.rows[0][2] if vars.q.rows[0][2] else None"},
                ]),
+            # 受管出具要求报告撰写节点写明最严的三项（发布门禁 G3），模板照着写，拿来就能发布成受管
             _n("write", "report", "报告撰写", metrics_from=["caliber"],
+               numbers="strict", on_violation="fail", claims="require_citation",
                system="你是周报撰写人：结论先行，只写有数据支撑的判断。",
                instructions="为 {{ input.week }} 写一份简短的周报：先用一两句话总结本周，"
                             "再分点说销售额、订单、客单价和退款的变化。"),

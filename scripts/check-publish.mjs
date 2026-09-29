@@ -100,6 +100,23 @@ const DUP = {
   edges: chain('in', 'ask1', 'ask2', 'caliber', 'done'),
 }
 
+/**
+ * 两个 choice：沙箱代码喂口径卡（G4），候选里「交给 Copilot」那一项带 handoff 标记；成果字段接哪个报告
+ * （G1），唯一的候选是一个 id 恰好叫 copilot 的报告撰写节点——它只是普通候选，不是「交给 Copilot」
+ */
+const HANDOFF = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('calc', 'code', 240, '计算', { code: 'print(1)', assign_to: 'calc' }),
+    node('caliber', 'metrics', 480, '周报口径', { caliber: '周报口径', caliber_version: 'v1',
+      metrics: [{ id: 'ratio', name: '比例', expression: 'vars.calc.ratio' }] }),
+    node('copilot', 'report', 720, '报告撰写', { instructions: '写周报', numbers: 'strict', on_violation: 'fail', claims: 'require_citation' }),
+    node('done', 'output', 960, '成果', { fields: [{ name: 'report', value: '{{ vars.story }}' }],
+      contract: { report_from: 'copilot', metrics_from: ['caliber'], required: ['ratio'], strict: true } }),
+  ],
+  edges: chain('in', 'calc', 'caliber', 'copilot', 'done'),
+}
+
 const wf = (id, name, graph, extra = {}) => ({
   id, name, description: '检查脚本伪造的工作流', graph, tags: [], version: 3, is_template: false,
   status: 'draft', published_version: null, published_by: null, run_count: 0,
@@ -111,6 +128,7 @@ const FAKES = {
   'pf-lib': wf('pf-lib', '__publish_check_lib__', { nodes: [], edges: [] }, { status: 'published', published_version: 4 }),
   'pf-bare': wf('pf-bare', '__publish_check_bare__', BARE, { status: 'governed', published_version: 2 }),
   'pf-dup': wf('pf-dup', '__publish_check_dup__', DUP, { status: 'governed', published_version: 2 }),
+  'pf-handoff': wf('pf-handoff', '__publish_check_handoff__', HANDOFF, { status: 'governed', published_version: 2 }),
   // 带全图默认的图：画布只管节点和连线，保存、检查、修复都得把 defaults 原样带着
   'pf-defs': wf('pf-defs', '__publish_check_defaults__', { ...EASY, defaults: { approval: 'always', model: 'demo-model' } }),
 }
@@ -162,6 +180,19 @@ function lint(graph, level, { followsNever = false } = {}) {
       add(n, 'governed.subgraph_unpinned', `${who(n)}（子工作流）没有钉住版本，口径会随上游最新版漂移`,
         { kind: 'auto', label: '钉到它最新的已发布版本 v4', preview: { field: 'workflow_version', before: null, after: 4 } })
     }
+    if (n.type === 'code' && c.evidence_role !== 'source') {
+      add(n, 'governed.caliber_compute_input', `${who(n)}（沙箱代码）的产出喂给了口径卡，而它的角色是计算`, {
+        kind: 'choice', label: `${who(n)}的产出喂给了口径卡：它是在取数，还是在做计算？`,
+        options: [{ value: 'source', label: '它在取数：标成 source（取数）' },
+          { value: 'copilot', label: '它在做计算：交给 Copilot 把计算挪进口径卡', handoff: true }],
+      })
+    }
+    if (n.type === 'output' && c.contract?.report_from && !(c.fields ?? []).every((f) => f.value.includes(`nodes.${c.contract.report_from}.`))) {
+      add(n, 'governed.exit_text_source', `${who(n)}的成果字段取的不是报告撰写节点的正文`, {
+        kind: 'choice', label: '把成果字段改成取哪个报告撰写节点的正文',
+        options: graph.nodes.filter((r) => r.type === 'report').map((r) => ({ value: r.id, label: who(r), hint: '报告撰写' })),
+      })
+    }
     if (n.type === 'supervisor') {
       add(n, 'governed.supervisor', `${who(n)}（多 Agent 协作）：受管模板不允许全动态规划的节点`,
         { kind: 'assist', label: '换成固定编排是结构性的改动，交给 Copilot' })
@@ -202,6 +233,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
   const changes = []
   const rejected = []
   const applied = []
+  const handoff = []
   const byId = (id) => graph.nodes.find((n) => n.id === id)
   for (const id of body.apply ?? []) {
     const fix = before.fixes.find((f) => f.id === id)
@@ -230,6 +262,15 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
       if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: '要人选：没给选择' }); continue }
       const contract = { report_from: 'write', metrics_from: ['caliber'], strict: true, required: v }
       change('contract', null, contract); c.contract = contract
+    } else if (fix.code === 'governed.caliber_compute_input') {
+      const v = body.choices?.[id]
+      // 只认候选上的 handoff 标记，和后端 autofix._handoff 一样
+      if (fix.options.some((o) => o.handoff && o.value === v)) { handoff.push(id); continue }
+      change('evidence_role', c.evidence_role ?? null, v); c.evidence_role = v
+    } else if (fix.code === 'governed.exit_text_source') {
+      const v = body.choices?.[id]
+      const to = `{{ nodes.${v}.text }}`
+      change('fields[0].value', c.fields[0].value, to); c.fields[0].value = to
     } else if (fix.code === 'contract.required_missing') {
       const v = body.choices?.[id]
       if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: '要人选：没给选择' }); continue }
@@ -238,7 +279,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
     applied.push(id)
   }
   let assist = null
-  if (body.assist) {
+  if (body.assist || handoff.length) {
     const team = byId('team')
     if (team) {
       changes.push({ fix_id: 'assist', node_id: 'team', node_title: team.data.label, field: 'max_rounds', before: team.data.config.max_rounds, after: 2,
@@ -249,7 +290,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
       questions: ['复核团队要换成哪一个固定编排的 Agent？它现在只有一个成员 checker，保留它的职责吗？'] }
   }
   const remaining = lint(graph, body.level, { followsNever })
-  return { graph, changes, applied, rejected, remaining: remaining.issues, assist, ok: remaining.ok, ops: [] }
+  return { graph, changes, applied, rejected, handoff, remaining: remaining.issues, assist, ok: remaining.ok, ops: [] }
 }
 
 // ---------------------------------------------------------------- 浏览器
@@ -261,7 +302,7 @@ const writes = []
  * backend：'new'（两个接口都有）| 'old'（两个接口 404）| 'nofix'（有检查、没有 autofix）
  * save：'ok' | 'fail'（保存接口 500）| 'slow'（1.5 秒后才回，看保存进行中的样子）
  */
-async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new', save = 'ok', unpublished = false } = {}) {
+async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new', save = 'ok', unpublished = false, fixDelay = 0 } = {}) {
   const followsNever = id === 'pf-dup'
   const ctx = await browser.newContext({ viewport: { width, height } })
   opened.add(ctx)
@@ -316,6 +357,7 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
       const body = req.postDataJSON()
       state.autofixes.push(body)
       if (state.backend !== 'new') return json(route, { detail: 'Not Found' }, 404)
+      if (fixDelay) await new Promise((r) => setTimeout(r, fixDelay))
       return json(route, autofix(body, { unpublished, followsNever }))
     }
     if (method === 'POST' && sub === 'publish') {
@@ -791,6 +833,48 @@ await section('全图默认不会被画布弄丢：保存、发布前检查、�
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await ctx.close()
   void first
+})
+
+await section('choice 里选「交给 Copilot」：请求带 assist、等待时说 Copilot 在修；id 叫 copilot 的报告只是普通候选', async () => {
+  const { page, state, errors } = await open({ id: 'pf-handoff', fixDelay: 1200 })
+  await openDialog(page)
+  const g4 = dialog(page).locator('[data-fix-choice="governed.caliber_compute_input:calc"]')
+  const g1 = dialog(page).locator('[data-fix-choice="governed.exit_text_source:done"]')
+  await g4.waitFor()
+  check('两个 choice 都画出来了', await g1.count() === 1)
+  check('没选之前，按钮不是「交给 Copilot」的样子', await g4.locator('[data-fix-handoff]').count() === 0)
+  await g4.getByText('它在做计算', { exact: false }).click()
+  const button = g4.locator('[data-fix-action="choice"]')
+  check('选了「交给 Copilot」那一项，按钮换成「交给 Copilot」', await button.getAttribute('data-fix-handoff') === ''
+    && (await button.innerText()).includes('交给 Copilot'), await button.innerText())
+  await button.click()
+  const loading = dialog(page).locator('[data-fix-preview="loading"]')
+  await loading.waitFor()
+  check('等待时写「Copilot 正在试着修」，不是「正在生成修复预览」', (await loading.innerText()).includes('Copilot 正在试着修'), await loading.innerText())
+  const body = state.autofixes.at(-1)
+  check('请求带 assist: true，选的值原样带上', body?.assist === true && body?.choices?.['governed.caliber_compute_input:calc'] === 'copilot'
+    && JSON.stringify(body?.apply) === JSON.stringify(['governed.caliber_compute_input:calc']), JSON.stringify(body))
+  await dialog(page).locator('[data-fix-preview="ready"], [data-fix-preview]:not([data-fix-preview="loading"])').first().waitFor()
+  check('Copilot 的总结摆出来了', await waitFor(page, async () => (await dialog(page).locator('[data-fix-assist]').count()) > 0))
+  await shoot(page, 'publish-dialog-handoff', dialog(page))
+
+  // 另一个 choice：唯一的候选是 id 叫 copilot 的报告撰写节点——普通候选，不交给 Copilot
+  const { page: page2, state: state2, errors: errors2 } = await open({ id: 'pf-handoff', fixDelay: 1200 })
+  await openDialog(page2)
+  const exit = dialog(page2).locator('[data-fix-choice="governed.exit_text_source:done"]')
+  await exit.waitFor()
+  await exit.locator('input[type="radio"]').first().check()
+  const pick = exit.locator('[data-fix-action="choice"]')
+  check('选了 id 叫 copilot 的报告：按钮不变成「交给 Copilot」', await pick.getAttribute('data-fix-handoff') === null
+    && !(await pick.innerText()).includes('交给 Copilot'), await pick.innerText())
+  await pick.click()
+  const wait2 = dialog(page2).locator('[data-fix-preview="loading"]')
+  await wait2.waitFor()
+  check('等待时写「正在生成修复预览」', (await wait2.innerText()).includes('正在生成修复预览'), await wait2.innerText())
+  const body2 = state2.autofixes.at(-1)
+  check('请求不带 assist，选的值是 copilot（节点 id）', !body2?.assist && body2?.choices?.['governed.exit_text_source:done'] === 'copilot',
+    JSON.stringify(body2))
+  check('没有页面错误', !errors.length && !errors2.length, [...errors, ...errors2].join(' | '))
 })
 
 await section('360px 下不横向滚动', async () => {

@@ -289,9 +289,28 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     const eq = (name, got, want) => out.push([name, got === want, got === want ? '' : `得到 ${JSON.stringify(got)}，应为 ${JSON.stringify(want)}`])
     const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
     const codes = ev.EVIDENCE_STATES
-    // 方案 6.1 的八种：确定性、概率性四种、无证据、连接性、旧运行候选
-    ok('八种状态一种不少', ['deterministic', 'supported', 'partial', 'unsupported', 'unjudged', 'none', 'connective', 'candidate']
-      .every((c) => codes.includes(c)) && codes.length === 8, codes.join(','))
+    // 方案 6.1 的八种（确定性、概率性四种、无证据、连接性、旧运行候选），加三期无证据的两个变体：
+    // 可疑实体（可能是编造的名字）、核对不了（表结构快照不全）
+    ok('十种状态一种不少', ['deterministic', 'supported', 'partial', 'unsupported', 'unjudged', 'none', 'connective', 'candidate',
+      'suspect', 'unverified'].every((c) => codes.includes(c)) && codes.length === 10, codes.join(','))
+    eq('可疑实体：点状线（同无证据）、?!、可能是编造的名字', `${ev.EVIDENCE_STATE.suspect.line}/${ev.EVIDENCE_STATE.suspect.glyph}/${ev.EVIDENCE_STATE.suspect.label}`,
+      'dotted/?!/可能是编造的名字')
+    ok('可疑实体醒目（进 n / N），核对不了只是标注', ev.EVIDENCE_STATE.suspect.alert && !ev.EVIDENCE_STATE.unverified.alert)
+    eq('片段状态：issue 为 unknown_entity 的是可疑实体', ev.segmentState({ kind: 'entity', state: 'none', issue: 'unknown_entity' }), 'suspect')
+    eq('片段状态：[[t:编造]] 的 cite 带 unknown 也是可疑实体', ev.segmentState({ kind: 'entity', state: 'none', cite: { unknown: true } }), 'suspect')
+    eq('片段状态：unverified_entity 是核对不了', ev.segmentState({ kind: 'entity', state: 'none', issue: 'unverified_entity' }), 'unverified')
+    eq('片段状态：原话对不上的引文仍是无证据', ev.segmentState({ kind: 'quote', state: 'none', issue: 'unresolved_ref' }), 'none')
+    ok('实体、引文另有字形和说法，线型颜色同「有出处」', ev.EVIDENCE_KIND_STYLE.entity.line === 'solid' && ev.EVIDENCE_KIND_STYLE.quote.line === 'solid'
+      && ev.EVIDENCE_KIND_STYLE.quote.glyph === '“' && ev.EVIDENCE_KIND_STYLE.entity.color === ev.EVIDENCE_STATE.deterministic.color
+      && /^var\(--st-[\w-]+\)$/.test(ev.EVIDENCE_KIND_STYLE.quote.color))
+    eq('章的两个数：引用 = 有出处的数字、值、实体、引文；无证据含可疑实体，require_citation 时加没挂依据的结论句',
+      JSON.stringify(ev.stampCounts({ numbers: 4, numbers_cited: 3, values: 1, entities: 5, quotes: 1, uncited_numbers: 1, unresolved: 1,
+        unknown_entities: 2, uncited_claims: 1 }, 'require_citation')), JSON.stringify({ cited: 10, none: 5 }))
+    eq('……结论句策略是 off 时不算没挂依据的结论句', ev.stampCounts({ numbers: 4, numbers_cited: 3, uncited_numbers: 1, unresolved: 0,
+      uncited_claims: 3 }, 'off')?.none, 1)
+    eq('可疑实体的提示：目录键、{name, table} 都写成去掉前缀的名字，最多 3 个',
+      ev.closestNames(['c:orders.amount', { alias: 't:refunds' }, { name: 'region', table: 'orders', kind: 'column' }, 'c:x']).join(','),
+      'orders.amount,refunds,orders.region')
     const lines = new Set(['solid', 'dotted', 'badge', 'none'])
     const bad = codes.filter((c) => {
       const m = ev.EVIDENCE_STATE[c]

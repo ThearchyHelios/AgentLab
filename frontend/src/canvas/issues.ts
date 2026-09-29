@@ -220,7 +220,8 @@ function normalizeFix(raw: any): PublishFix | null {
   if (!kind) return null
   const options = asArray<any>(raw.options)
     .filter((o) => o && typeof o === 'object' && 'value' in o)
-    .map((o) => ({ value: o.value, label: asText(o.label ?? o.value), hint: o.hint ? asText(o.hint) : null }))
+    .map((o) => ({ value: o.value, label: asText(o.label ?? o.value), hint: o.hint ? asText(o.hint) : null,
+      ...(o.handoff === true ? { handoff: true } : {}) }))
   // 选项类没有候选就没法选：不给控件，比给一个空下拉强
   if (kind === 'choice' && !options.length) return null
   return {
@@ -353,7 +354,13 @@ const EXTRA_FIELDS: Record<string, string> = {
   workflow_version: '钉住版本', upgrade_policy: '上游发了新版本时', defaults: '全图默认',
 }
 /** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略 */
-const SUB_KEYS: Record<string, string> = { ...CONTRACT_KEYS, approval: '审批策略' }
+const SUB_KEYS: Record<string, string> = {
+  ...CONTRACT_KEYS, approval: '审批策略', claims: '没挂依据的结论句', on_uncited: '没挂依据时',
+}
+/** 契约 claims 的 on_uncited：没挂依据的结论句怎么算 */
+const ON_UNCITED_LABEL: Record<string, string> = {
+  ignore: '只标出来，不算缺口', degrade: '计入缺口、出具降档', withhold: '不予出具',
+}
 
 /** 值是节点 id 的几个键（报告、契约的 metrics_from，契约的 report_from）：预览里写节点名，不写 id */
 const NODE_REF_KEYS = new Set(['metrics_from', 'report_from'])
@@ -386,6 +393,7 @@ export function fixValueText(value: unknown, field?: string | null, nameOf?: Nod
     return APPROVAL_POLICY_LABEL[value as keyof typeof APPROVAL_POLICY_LABEL]
   }
   if (typeof value === 'boolean') return value ? '是' : '否'
+  if (key === 'on_uncited' && typeof value === 'string' && value in ON_UNCITED_LABEL) return ON_UNCITED_LABEL[value]
   if (key === 'workflow_version' && (typeof value === 'number' || /^\d+$/.test(String(value)))) return `v${value}`
   if (key && NODE_REF_KEYS.has(key)) {
     const ids = Array.isArray(value) ? value : [value]

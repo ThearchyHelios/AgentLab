@@ -144,6 +144,8 @@ export const EVIDENCE_STATE_LABEL = {
   none: '无证据',
   connective: '连接性文字',
   candidate: '猜测的来源',
+  suspect: '可能是编造的名字',
+  unverified: '核对不了',
 } as const
 
 /**
@@ -188,9 +190,9 @@ export const EVIDENCE_TEXT = {
   input: '运行输入',
   seal: '封存',
   sealOk: '已封存 · 核对一致',
-  sealDocOk: '报告文档已封存 · 核对一致（这个数字本身没有证据可封存）',
-  /** 片段接口取不到、封存状态是从整次运行的证据图查的：只核对了文档在封存范围内，这个数的链没逐项核对 */
-  sealDocChain: '报告文档已封存 · 核对一致（这个数字的证据链这次没取到，没有逐项核对）',
+  sealDocOk: '报告文档已封存 · 核对一致（这一段本身没有证据可封存）',
+  /** 片段接口取不到、封存状态是从整次运行的证据图查的：只核对了文档在封存范围内，这一段的链没逐项核对 */
+  sealDocChain: '报告文档已封存 · 核对一致（这一段的证据链这次没取到，没有逐项核对）',
   sealBad: '已封存 · 核对不一致',
   sealOpen: '尚未封存',
   sealOutside: '不在封存范围内',
@@ -264,7 +266,113 @@ export const EVIDENCE_TEXT = {
     `口径卡「${caliber || '—'}」${version}，来自「${workflow}」${wfVersion}`,
   caliberUpgrade: (latest: string | null, policy: string) =>
     `${latest ? `上游已有 ${latest}` : '上游有新版本'}，按「${policy}」处置`,
+
+  // ---- 第三期：表名字段名、逐字引文、旧运行的猜测 ----
+  entity: '表结构',
+  table: '表',
+  column: '字段',
+  entityQueries: (aliases: string[]) => `出现在查询 ${aliases.join('、')}`,
+  entityNoQuery: '这次的查询里没有用到它，只在表结构快照里',
+  syncedAt: (at: string) => `表结构快照同步于 ${at}`,
+  snapshotPartial: '库里的表太多，表结构快照只存了一部分',
+  columnType: '字段类型',
+  ownerTables: (tables: string[]) => `好几张表都有这个字段：${tables.join('、')}`,
+  entitySource: { schema: '表结构快照', sql: '查询 SQL 用到的表', result: '查询结果列' } as Record<string, string>,
+  entityPending: '正在取表结构…',
+  entityMissing: '字段类型、同步时间要从证据接口取，这一次没取到',
+  /** 反引号里写了个名字，哪里都没有（没有 cite 时的原因；有 cite 的用后端给的原话） */
+  suspect: '本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字',
+  unverified: '表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在',
+  suspectTag: '可疑名字',
+  /** 出具横幅那一行：报告要求结论句挂依据（claims: require_citation）时，没挂的有几句 */
+  uncitedClaimsTag: '没挂依据的结论句',
+  closest: '最接近的已知名字',
+  checked: (schemas: number, queries: number) =>
+    `查过 ${formatNumber(schemas)} 份表结构快照、${formatNumber(queries)} 次查询`,
+  tableColumns: (n: number, view: boolean) => `${view ? '视图' : '表'} · ${formatNumber(n)} 个字段`,
+  columnTypes: (types: Record<string, string>) =>
+    `各表的类型：${Object.entries(types).map(([t, v]) => `${t} ${v}`).join('、')}`,
+  quoteBad: '按记下的位置从原文里切出来，和这句引文对不上：原文可能被改过',
+  quoteCollection: (c: string) => `知识库「${c}」`,
+  closestNone: '没有相近的已知名字',
+  quote: '逐字引文',
+  quoteFrom: (title: string) => `出自「${title}」`,
+  quoteChunk: (n: number) => `第 ${formatNumber(n)} 段`,
+  quoteHit: '引文在原文里的位置（高亮）',
+  quotePending: '正在取原文…',
+  quoteMissing: '原文要从证据接口取，这一次没取到',
+  quoteMiss: '原文里找不到这句话：写作者写的不是一字不差的原话',
+  quoteHash: '检索快照取回时哈希对不上，疑似被改过：原文不能当证据',
+  /** 旧运行：按数值猜的候选 */
+  guessTitle: '猜测的来源',
+  guessNote: '猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多',
+  guessCount: (guessed: number, numbers: number) =>
+    numbers ? `${formatNumber(numbers)} 个数字里 ${formatNumber(guessed)} 个找到了可能的来源` : '答案里没有数字',
+  guessNone: '没找到数值相同的格子',
+  guessDiff: (d: string) => `相差 ${d}`,
+  guessCandidates: '可能来自',
 } as const
+
+/**
+ * 记录页「证据」页签：报告、常驻面板、审计表。审计表按状态分组，四组的说法和片段状态同一套
+ */
+export const EVIDENCE_AUDIT_TEXT = {
+  tab: '证据',
+  tabTitle: '报告里每一段的出处：左边报告、右边证据、下面整张清单，可以只看有问题的、导出',
+  title: '证据清单',
+  groups: {
+    none: '无证据',
+    suspicious: '可疑实体',
+    cited: '有出处',
+    candidate: '旧运行猜测',
+  } as Record<string, string>,
+  groupHint: {
+    none: '裸数字、解析不了的引用、没挂依据的结论句',
+    suspicious: '表名、字段名在本次运行的表结构和查询里找不到',
+    cited: '系统从证据里取值、核对过的片段',
+    candidate: '按数值猜的可能来源，不能当证据，默认收起',
+  } as Record<string, string>,
+  filterLabel: '清单筛选',
+  filterAll: '全部',
+  filterProblems: '只看无证据 / 可疑实体',
+  cols: { text: '片段', state: '状态', source: '出处 / 原因', sentence: '所在的句子', report: '报告', seal: '封存' },
+  sealIn: '在封存范围内',
+  sealOut: '不在封存范围内',
+  sealNa: '—',
+  exportJson: '导出 JSON',
+  exportCsv: '导出 CSV',
+  exported: (name: string) => `已导出 ${name}`,
+  exportLocal: '后端没有导出接口：按页面上这张清单导出（没有经过后端的封存核对）',
+  fallbackUnsupported: '后端还没有审计接口：清单按页面上的报告拼出来，每行的封存状态取自证据图',
+  fallbackError: (why: string) => `审计接口没取到（${why}）：清单按页面上的报告拼出来`,
+  empty: '这一组没有片段',
+  emptyProblems: '没有无证据、可疑实体的片段',
+  hidden: '正文里画不了线，只在这里列出',
+  hiddenWhy: '这一处在列表序号、代码块标签、粗体或链接里，或者在句末依据里：正文里没有能画线、能点开的片段，只在这张清单里列出',
+  keys: '在清单里用上下方向键逐行走，回车在右边打开这一段的证据',
+  panelIdle: '点报告里的片段，或清单里的一行，这里显示它的出处',
+  sealTitle: '封存核对',
+  sealOk: (seq?: number) => `已封存 · 核对一致${seq != null ? `（封存到第 ${formatNumber(seq)} 条事件）` : ''}`,
+  sealBad: '已封存 · 核对不一致：封存之后有事件被改过、删过或插过',
+  sealOpen: '尚未封存：运行还没收尾，证据还可能变',
+  sealUnknown: '封存状态拿不到',
+  docOk: (node: string) => `报告「${node}」的文档哈希一致`,
+  docBad: (node: string) => `报告「${node}」的文档和哈希对不上，疑似被改过`,
+  docGone: (node: string) => `报告「${node}」的文档在工件库里取不回来`,
+  mode: {
+    none: '这次运行没有报告文档，也没有出具契约：没有可以逐段展示的证据',
+    legacy_contract: '旧版出具：按数值匹配口径卡，不是显式引用。同一个值对得上好几个指标时，出处不唯一',
+    legacy_text: '这次运行没有出具契约：下面是按数值猜的可能来源，默认收起',
+  } as Record<string, string>,
+  modeLabel: { cited: '逐段引用', none: '没有证据', legacy_contract: '旧版出具', legacy_text: '没有契约的旧运行' } as Record<string, string>,
+  legacyMatched: (n: number) => `按数值回指上 ${formatNumber(n)} 个数字`,
+  legacyUnmatched: (n: number) => `${formatNumber(n)} 个回指不上`,
+  legacyNoField: '回指的位置对不上成果里的任何一个字段，只列出数字，不在正文上标',
+} as const
+
+/** 报告节点卡上的章：这张图最近一次运行的报告核对统计 */
+export const reportStampText = (cited: number, none: number) =>
+  `引用 ${formatNumber(cited)} · 无证据 ${formatNumber(none)}`
 
 /**
  * 口径升版的三种处置，和后端 governance.UPGRADE_POLICY_LABELS 同一套说法。子工作流和
