@@ -11,10 +11,13 @@
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import { ApiError } from '../api/client'
-import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL } from '../lib/terms'
+import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, nodeTypeLabel } from '../lib/terms'
 import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
-import type { AutofixResult, GraphSpec, PublishCheck, PublishFix, PublishLevel, ValidationIssue } from '../types'
+import type {
+  AutofixResult, GraphEdge, GraphNode, GraphSpec, PublishCheck, PublishFix, PublishLevel, UpgradeChange, UpgradeNote, UpgradeResult,
+  ValidationIssue,
+} from '../types'
 
 export interface FieldRef {
   /** 顶层配置键：prompt、cases、fields… 'label' 表示节点名称 */
@@ -171,9 +174,12 @@ export function problemsOf(
   issues: ValidationIssue[], nodes: FlowNode[], rank?: Record<string, number>,
 ): Problem[] {
   const byId = new Map(nodes.map((n, i) => [n.id, { n, i }]))
-  const list: Problem[] = issues.map((issue, i) => {
+  // info 是建议（可以升级为可追溯结构），不是问题：不进清单、不占 F8 的跳转。编号按原下标，
+  // 过滤前后同一条问题的 id 不变
+  const list: Problem[] = issues.flatMap((issue, i) => {
+    if (issue.level === 'info') return []
     const hit = issue.node_id ? byId.get(issue.node_id) : undefined
-    return {
+    return [{
       id: `${issue.node_id ?? issue.edge_id ?? 'graph'}:${i}`,
       level: issue.level,
       message: issue.message,
@@ -181,7 +187,7 @@ export function problemsOf(
       nodeId: issue.node_id ?? undefined,
       edgeId: issue.edge_id ?? undefined,
       field: hit ? fieldOfIssue(issue, hit.n) : null,
-    }
+    }]
   })
   const order = (p: Problem) => {
     if (p.scope !== 'node') return -1
@@ -203,6 +209,8 @@ const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? 
 
 function normalizeIssue(raw: any): ValidationIssue | null {
   if (!raw || typeof raw !== 'object' || !raw.message) return null
+  // 建议（info，比如「可以升级为可追溯结构」）不会让发布被拦，也不是要修的提示：不算进「另有 N 条提示」
+  if (raw.level === 'info') return null
   return {
     level: raw.level === 'error' ? 'error' : 'warning',
     message: asText(raw.message),
@@ -353,9 +361,10 @@ const CONTRACT_KEYS: Record<string, string> = {
 const EXTRA_FIELDS: Record<string, string> = {
   workflow_version: '钉住版本', upgrade_policy: '上游发了新版本时', defaults: '全图默认',
 }
-/** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略 */
+/** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略，列表项里的名称、取值、表达式 */
 const SUB_KEYS: Record<string, string> = {
   ...CONTRACT_KEYS, approval: '审批策略', claims: '没挂依据的结论句', on_uncited: '没挂依据时',
+  name: '名称', value: '取值', expression: '表达式',
 }
 /** 契约 claims 的 on_uncited：没挂依据的结论句怎么算 */
 const ON_UNCITED_LABEL: Record<string, string> = {
@@ -370,15 +379,24 @@ export type NodeNameOf = (id: string) => string | undefined
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
-/** 修复改的是哪个字段：顶层键用节点定义里的叫法，契约里的键另有一张表，结论句裁判（judge.*）另一张，其余原样 */
-export function fixFieldLabel(field: string | null | undefined, nodeType?: string): string {
+/**
+ * 修复改的是哪个字段：顶层键用节点定义里的叫法，契约里的键另有一张表，结论句裁判（judge.*）另一张，其余原样。
+ * 列表里的某一项（fields[0].value）写成「成果字段 · 「answer」 · 取值」：给了节点配置就认那一项的名字，
+ * 没给写「第 1 项」
+ */
+export function fixFieldLabel(field: string | null | undefined, nodeType?: string, config?: Record<string, any>): string {
   if (!field) return ''
   const [head, ...rest] = field.split('.')
   if (head === 'label') return '节点名称'
+  const at = /^([^[]+)\[(\d+)\]$/.exec(head)
+  const key = at ? at[1] : head
   const def = nodeType ? NODE_DEFS[nodeType as keyof typeof NODE_DEFS] : undefined
-  const base = def?.fields.find((f) => f.key === head)?.label ?? EXTRA_FIELDS[head] ?? head
+  const base = def?.fields.find((f) => f.key === key)?.label ?? EXTRA_FIELDS[key] ?? key
+  const item = at ? config?.[key]?.[Number(at[2])] : undefined
+  const name = item && typeof item === 'object' ? item.name ?? item.id ?? item.key : undefined
+  const which = at ? [typeof name === 'string' && name ? `「${name}」` : `第 ${Number(at[2]) + 1} 项`] : []
   const sub = head === 'judge' ? JUDGE_FIELD_LABEL : SUB_KEYS
-  return [base, ...rest.map((k) => sub[k] ?? k)].join(' · ')
+  return [base, ...which, ...rest.map((k) => sub[k] ?? k)].join(' · ')
 }
 
 /** judge 里写 null 表示不限的三项上限：预览里 null 写「不限」，不写「（空）」——没写和不限是两回事 */
@@ -445,6 +463,10 @@ export function fixValueLines(value: unknown, field?: string | null, nameOf?: No
       return (x < 0 ? order.length : x) - (y < 0 ? order.length : y)
     }).map((k) => `${JUDGE_FIELD_LABEL[k] ?? k}：${fixValueText(value[k], `judge.${k}`, nameOf)}`)
   }
+  // 成果 / 输入字段整列（一键升级把成果字段改取报告的正文）：一项一行，「answer：{{ nodes.write.text }}」
+  if (field === 'fields' && Array.isArray(value) && value.length && value.every((f) => isRecord(f) && 'name' in f)) {
+    return value.map((f) => `${asText(f.name) || '（没名字）'}：${fixValueText(f.value)}`)
+  }
   if (field !== 'contract' || !isRecord(value) || !Object.keys(value).length) return null
   const order = Object.keys(CONTRACT_KEYS)
   const keys = Object.keys(value).sort((a, b) => {
@@ -452,4 +474,179 @@ export function fixValueLines(value: unknown, field?: string | null, nameOf?: No
     return (x < 0 ? order.length : x) - (y < 0 ? order.length : y)
   })
   return keys.map((k) => `${CONTRACT_KEYS[k] ?? k}：${fixValueText(value[k], `contract.${k}`, nameOf)}`)
+}
+
+// -------------------------------------------------------------------------
+// 一键升级为可追溯结构（POST /copilot/upgrade-evidence）
+//
+// 和发布前修复同一套收法：回来的东西收成确定的形状，缺字段就当没有。改动逐项给人看，
+// 另认三种自动修复里没有的：节点类型的变化、新插入的节点、改接的连线。
+// -------------------------------------------------------------------------
+
+/** validate 给的那条建议：旧结构（符合 R1–R4 任一条），可以升级 */
+export const UPGRADE_ADVICE = 'evidence.upgrade_available'
+export const isUpgradeAdvice = (issue: Pick<ValidationIssue, 'code'>): boolean => issue.code === UPGRADE_ADVICE
+
+function normalizeNote(raw: any): UpgradeNote | null {
+  if (typeof raw === 'string') return raw.trim() ? { text: raw } : null
+  if (!isRecord(raw)) return null
+  const text = asText(raw.text ?? raw.message ?? raw.note)
+  if (!text) return null
+  return {
+    text, node_id: typeof raw.node_id === 'string' ? raw.node_id : null,
+    rule: raw.rule ? asText(raw.rule) : null, level: raw.level === 'warning' ? 'warning' : 'info',
+  }
+}
+
+export function normalizeUpgrade(raw: any): UpgradeResult {
+  const graph = raw?.graph && typeof raw.graph === 'object' && Array.isArray(raw.graph.nodes) ? raw.graph as GraphSpec : null
+  const assist = isRecord(raw?.assist)
+    ? {
+        ok: !!raw.assist.ok, summary: asText(raw.assist.summary),
+        questions: asArray(raw.assist.questions).map(asText).filter(Boolean),
+        warnings: asArray(raw.assist.warnings).map(asText).filter(Boolean),
+      }
+    : null
+  return {
+    graph,
+    changes: asArray<any>(raw?.changes).filter(isRecord).map((c) => ({
+      fix_id: asText(c.fix_id ?? c.rule), rule: c.rule ? asText(c.rule) : null,
+      node_id: typeof c.node_id === 'string' ? c.node_id : null, node_title: c.node_title ? asText(c.node_title) : null,
+      field: typeof c.field === 'string' ? c.field : null, before: c.before, after: c.after, label: c.label ? asText(c.label) : null,
+    })),
+    notes: asArray(raw?.notes).map(normalizeNote).filter((n): n is UpgradeNote => !!n),
+    issues: asArray(raw?.issues).map(normalizeIssue).filter((i): i is ValidationIssue => !!i),
+    rejected: asArray<any>(raw?.rejected).filter(isRecord)
+      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '没说原因' })),
+    assist,
+  }
+}
+
+const isNodeLike = (v: unknown): v is Partial<GraphNode> =>
+  isRecord(v) && typeof v.type === 'string' && (typeof v.id === 'string' || isRecord(v.data))
+const isEdgeLike = (v: unknown): v is Pick<GraphEdge, 'source' | 'target'> =>
+  isRecord(v) && typeof v.source === 'string' && typeof v.target === 'string'
+
+/** 一项改动是哪一种：换了节点类型、新插入的节点、改接的连线，其余是改了某个配置 */
+export type UpgradeChangeKind = 'type' | 'node' | 'edge' | 'value'
+
+export function upgradeChangeKind(c: UpgradeChange): UpgradeChangeKind {
+  const f = c.field ?? ''
+  if (f === 'type' || f === 'node_type') return 'type'
+  if (f === 'node' || (!f && c.before == null && isNodeLike(c.after))) return 'node'
+  if (f === 'edge' || f === 'edges' || isEdgeLike(c.after) || isEdgeLike(c.before)) return 'edge'
+  return 'value'
+}
+
+/** 节点类型写界面上的叫法：「模型调用」「报告撰写」；认不出的照写原码 */
+export const upgradeTypeText = (type: unknown): string => (typeof type === 'string' && type ? nodeTypeLabel(type) : '（空）')
+
+/** 新插入的节点：「「写报告」（报告撰写）」。后端的节点可能是图里的形状（data.label），也可能是操作流的（label） */
+export function upgradeNodeText(node: unknown): string {
+  if (!isNodeLike(node)) return fixValueText(node)
+  const label = asText((node as { label?: unknown }).label) || asText(node.data?.label) || asText(node.id)
+  return `「${label}」（${upgradeTypeText(node.type)}）`
+}
+
+/** 改写规则在界面上的叫法：R1–R5 照写，Copilot 那一段写 Copilot */
+export const upgradeRuleText = (rule?: string | null): string => (rule === 'assist' ? 'Copilot' : rule ?? '')
+
+/**
+ * 逐项改动按「哪一步」分组：同一步（同一个 fix_id，比如把「写周报」换成报告撰写）的几项改动放在一起，
+ * 这一步的说明只写一次。后端没给 fix_id 的（前端按两张图自己列的）各自一组、没有说明
+ */
+export function upgradeGroups(changes: UpgradeChange[]): { key: string; rule: string | null; label: string | null; items: UpgradeChange[] }[] {
+  const out: { key: string; rule: string | null; label: string | null; items: UpgradeChange[] }[] = []
+  changes.forEach((c, i) => {
+    const key = c.fix_id || `#${i}`
+    const last = out[out.length - 1]
+    if (last && c.fix_id && last.key === key) {
+      last.items.push(c)
+      return
+    }
+    out.push({ key, rule: c.rule ?? null, label: c.label ?? null, items: [c] })
+  })
+  return out
+}
+
+/**
+ * 没采用的那一步是谁：「R1 · 「写周报」」「Copilot」。后端的 fix_id 是「规则:节点 id」，
+ * 认不出的照写
+ */
+export function upgradeStepText(fixId: string, nameOf?: NodeNameOf): string {
+  if (!fixId || fixId === 'assist') return 'Copilot'
+  const m = /^(R\d+):(.+)$/.exec(fixId)
+  return m ? `${m[1]} · 「${nameOf?.(m[2]) ?? m[2]}」` : fixId
+}
+
+/** 一条连线：「「取数」→「写报告」」。两头的节点名先在画布上找，再在升级后的图里找 */
+export function upgradeEdgeText(edge: unknown, nameOf?: NodeNameOf): string {
+  if (!isEdgeLike(edge)) return fixValueText(edge)
+  const name = (id: string) => `「${nameOf?.(id) ?? id}」`
+  return `${name(edge.source)} → ${name(edge.target)}`
+}
+
+const edgeKey = (e: Pick<GraphEdge, 'source' | 'target' | 'sourceHandle'>) => `${e.source}\u0000${e.target}\u0000${e.sourceHandle ?? ''}`
+
+/**
+ * 后端没给逐项改动（或者老一点的形状只给了图）时，按前后两张图自己列：新插入的节点、换了类型的节点、
+ * 改了的名字和每个顶层配置、加上和去掉的连线。和后端给的一样逐项写，不替它编原因
+ */
+export function upgradeChangesFromDiff(before: GraphSpec, after: GraphSpec): UpgradeChange[] {
+  const out: UpgradeChange[] = []
+  const old = new Map((before.nodes ?? []).map((n) => [n.id, n]))
+  for (const n of after.nodes ?? []) {
+    const o = old.get(n.id)
+    const title = n.data?.label ?? o?.data?.label ?? n.id
+    if (!o) {
+      out.push({ fix_id: '', node_id: n.id, node_title: title, field: 'node', before: null, after: n })
+      continue
+    }
+    if (o.type !== n.type) out.push({ fix_id: '', node_id: n.id, node_title: title, field: 'type', before: o.type, after: n.type })
+    if ((o.data?.label ?? '') !== (n.data?.label ?? '')) {
+      out.push({ fix_id: '', node_id: n.id, node_title: title, field: 'label', before: o.data?.label, after: n.data?.label })
+    }
+    const a = o.data?.config ?? {}
+    const b = n.data?.config ?? {}
+    for (const key of [...new Set([...Object.keys(a), ...Object.keys(b)])]) {
+      if (JSON.stringify(a[key]) !== JSON.stringify(b[key])) {
+        out.push({ fix_id: '', node_id: n.id, node_title: title, field: key, before: a[key], after: b[key] })
+      }
+    }
+  }
+  const was = new Set((before.edges ?? []).map(edgeKey))
+  const now = new Set((after.edges ?? []).map(edgeKey))
+  for (const e of before.edges ?? []) {
+    if (!now.has(edgeKey(e))) out.push({ fix_id: '', node_id: null, field: 'edge', before: { source: e.source, target: e.target }, after: null })
+  }
+  for (const e of after.edges ?? []) {
+    if (!was.has(edgeKey(e))) out.push({ fix_id: '', node_id: null, field: 'edge', before: null, after: { source: e.source, target: e.target } })
+  }
+  return out
+}
+
+/** 升级前后差在哪，合成一句：「新增 1 个节点、1 个节点换了类型、改了 2 个节点的配置、连线变动 2 处」 */
+export function upgradeSummary(before: GraphSpec, after: GraphSpec): string[] {
+  const old = new Map((before.nodes ?? []).map((n) => [n.id, n]))
+  let added = 0
+  let typed = 0
+  let changed = 0
+  for (const n of after.nodes ?? []) {
+    const o = old.get(n.id)
+    if (!o) { added += 1; continue }
+    if (o.type !== n.type) typed += 1
+    else if ((o.data?.label ?? '') !== (n.data?.label ?? '')
+      || JSON.stringify(o.data?.config ?? {}) !== JSON.stringify(n.data?.config ?? {})) changed += 1
+  }
+  const removed = (before.nodes ?? []).filter((n) => !(after.nodes ?? []).some((x) => x.id === n.id)).length
+  const was = new Set((before.edges ?? []).map(edgeKey))
+  const now = new Set((after.edges ?? []).map(edgeKey))
+  const edges = [...now].filter((k) => !was.has(k)).length + [...was].filter((k) => !now.has(k)).length
+  return [
+    added && `新增 ${added} 个节点`,
+    typed && `${typed} 个节点换了类型`,
+    changed && `改了 ${changed} 个节点的配置`,
+    removed && `删掉 ${removed} 个节点`,
+    edges && `连线变动 ${edges} 处`,
+  ].filter((x): x is string => !!x)
 }

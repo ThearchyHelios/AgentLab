@@ -88,7 +88,7 @@ const PHASE_TEXT: Record<string, string> = {
 
 export function StudioPage() {
   const { workflowId } = useParams()
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
   // 逐个取：整个 catalog 订阅下来，连接心跳、待审批轮询每跳一次整页（连同检查器里每个字段）都要重渲染
@@ -275,6 +275,25 @@ export function StudioPage() {
       }
     })()
   }, [workflow, workflowId, runParam, focusParam, attachRun, focusNode])
+
+  // ?upgrade=1：记录页「这次的报告没有逐段证据 → 升级这张图」跳过来的。图打开之后打开问题面板、
+  // 要一份升级预览（只读，要人点应用才存）。读完就摘掉：留着的话刷新、后退回来都会再要一次，
+  // 应用过之后再要，回来的是「没有需要升级的地方」。画布锁着（正式运行在跑、助手在改）不要，说清为什么
+  const upgradeParam = params.get('upgrade')
+  const upgraded = useRef<string | null>(null)
+  useEffect(() => {
+    if (!upgradeParam || !workflow || workflow.id !== workflowId) return
+    // 同一次跳转只要一次（开发模式下 effect 会被连跑两遍，摘参数的那次替换还没落地）
+    if (upgraded.current === location.key) return
+    upgraded.current = location.key
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('upgrade')
+      return next
+    }, { replace: true })
+    setDock('problems')
+    void useStudio.getState().previewUpgrade()
+  }, [upgradeParam, workflow, workflowId, setParams, location.key])
 
   // 开始跑图或生成时，属性面板让开——不然进展发生在一块被盖住的地方。
   // （选中节点即滑出属性面板，取消选中即收起，不再需要手动切 tab）

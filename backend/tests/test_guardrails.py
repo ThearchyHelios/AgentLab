@@ -60,7 +60,10 @@ async def _run(graph, *, timeout=20.0) -> Run:
     while asyncio.get_event_loop().time() < deadline:
         async with SessionLocal() as session:
             row = await session.get(Run, run.id)
-            if row and row.status in ("succeeded", "failed", "cancelled", "interrupted"):
+            # 终态先落库、清单随后另一个事务封上（runner._finalize）：只等状态的话，负载一高就会
+            # 读到「跑完了但还没封」的那一瞬。中断态不封存
+            if row and (row.status == "interrupted"
+                        or row.status in ("succeeded", "failed", "cancelled") and row.manifest_seq is not None):
                 return row
         await asyncio.sleep(0.05)
     raise AssertionError("运行没有按时结束")

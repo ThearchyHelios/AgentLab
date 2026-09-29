@@ -5,10 +5,12 @@ import {
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
 import { copilotReceipt, mergeNodeConfig, toolChangesOf } from '../canvas/copilotMerge'
+import { contentSig, isMissingEndpoint, normalizeUpgrade } from '../canvas/issues'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
+import { UPGRADE_TEXT } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
 import { endingOf, reduceTeam, settleTeam } from '../run/decode'
 import { activeEdgesOf, applyDerived } from '../run/derive'
@@ -18,7 +20,7 @@ import {
 } from '../run/trace'
 import type {
   ConversationTurn, CopilotCheckEntry, CopilotCheckIssue, CopilotCheckOp, GraphEdge, GraphSpec, NodeRuntime, NodeType, Run,
-  RunEvent, ToolChange, ValidationIssue, VarIssue, Variable, Workflow,
+  RunEvent, ToolChange, UpgradeResult, ValidationIssue, VarIssue, Variable, Workflow,
 } from '../types'
 
 export type FlowNode = Node<{ nodeType: NodeType; label: string; config: Record<string, any> }>
@@ -209,6 +211,30 @@ export const EDIT_LOCK_TEXT: Record<Exclude<EditLock, null>, string> = {
 
 /** 组件里订阅锁：只在锁的原因变了时重渲染 */
 export const useEditLock = (): EditLock => useStudio(editLockOf)
+
+/**
+ * 一键升级为可追溯结构：预览摆着之后「应用」的那一段。saving 存草稿中；stale 预览之后画布又改过；
+ * locked 画布锁着没落下去（unsaved：已经落到画布上、要存时锁着）；failed 落到画布上了、没存上
+ */
+export type UpgradeApply =
+  | { status: 'saving' | 'stale' }
+  | { status: 'locked'; why: string; unsaved?: boolean }
+  | { status: 'failed'; error: unknown }
+
+/** 升级已经落到画布上、没存上：存失败，或者要存时画布锁着。面板给「重试保存」「放弃」，平常的保存存上了就清掉 */
+export function upgradeUnsaved(a: UpgradeApply | undefined): boolean {
+  return a?.status === 'failed' || (a?.status === 'locked' && !!a.unsaved)
+}
+
+/**
+ * 升级预览的状态。seq 是第几次请求：面板据此认出「又开了一次预览」（切回校验页、滚到眼前）。
+ * base 是发请求那一刻的图（后端没给逐项改动时按它和升级后的图自己列），sig 是它的内容签名
+ */
+export type UpgradeFlow =
+  | { status: 'loading'; assist: boolean; seq: number }
+  | { status: 'ready'; assist: boolean; seq: number; result: UpgradeResult; sig: string; base: GraphSpec; apply?: UpgradeApply }
+  | { status: 'error'; assist: boolean; seq: number; error: unknown }
+  | { status: 'unsupported'; assist: boolean; seq: number }
 
 /** 两张图差在哪。只看节点的名字和配置，挪位置不算改动 */
 export interface GraphDiff {
@@ -480,7 +506,15 @@ interface StudioState {
   edges: Edge[]
   selectedId: string | null
   dirty: boolean
+  /** 校验出来的 error / warning。info 级的建议不在这里，在 advice */
   issues: ValidationIssue[]
+  /**
+   * 校验给的建议（info 级，比如 evidence.upgrade_available「可以升级为可追溯结构」）。它们不是问题：
+   * 不点亮节点卡、不算进工具栏的计数，只在问题面板里给一个快速修复
+   */
+  advice: ValidationIssue[]
+  /** 一键升级的预览和应用。换图时清掉 */
+  upgrade: UpgradeFlow | null
   /** 这张图里有哪些变量：谁产出、谁引用。结构不变就不重新请求 */
   variables: Variable[]
   /** 变量层面的提示（含"产出了没人用"这类 info，不进 issues） */
@@ -580,6 +614,19 @@ interface StudioState {
    * 改的只是几个配置项，镜头一跳人就找不到刚才在看的节点了。锁着时不落、返回 false
    */
   applyFixes: (graph: GraphSpec, label: string) => boolean
+  /**
+   * 一键升级：拿画布上此刻的图（连同全图默认）去要一份预览，只读。画布锁着时不要、说清为什么。
+   * assist 时后端再交给 Copilot 改语义层
+   */
+  previewUpgrade: (opts?: { assist?: boolean }) => Promise<void>
+  /**
+   * 应用预览：预览之后画布没改过才落（applyFixes，记一步撤销、全图默认照带），再走现有的保存存成草稿。
+   * 返回存上了没有
+   */
+  applyUpgrade: () => Promise<boolean>
+  /** 升级已经落到画布上、没存上（存失败、或者要存时画布锁着）：再存一次 */
+  retryUpgradeSave: () => Promise<boolean>
+  discardUpgrade: () => void
   onNodesChange: (changes: NodeChange[]) => void
   onEdgesChange: (changes: EdgeChange[]) => void
   onConnect: (conn: Connection) => void
@@ -879,7 +926,7 @@ async function runAnalysis(
 ): Promise<void> {
   const { nodes, edges } = get()
   if (!nodes.length) {
-    set({ issues: [], variables: [], varIssues: [], analysis: 'ok', analysisError: null })
+    set({ issues: [], advice: [], variables: [], varIssues: [], analysis: 'ok', analysisError: null })
     return
   }
   const epoch = ++analyzeEpoch
@@ -895,7 +942,12 @@ async function runAnalysis(
     // 图在请求飞行期间又改了，这份结果已经不对应眼前的图——丢掉，
     // 别用旧答案覆盖新答案（校验结果闪回是最难查的那种 UI bug）
     if (epoch !== analyzeEpoch) return
-    set({ issues: validation.issues ?? [], analysis: 'ok', analysisError: null })
+    // 建议（info）另放：节点卡、检查器、运行按钮只认 error / warning，混进来会被当成提示点亮
+    const all = validation.issues ?? []
+    set({
+      issues: all.filter((i) => i.level !== 'info'), advice: all.filter((i) => i.level === 'info'),
+      analysis: 'ok', analysisError: null,
+    })
     if (vars) {
       lastVarSignature = signature
       set({ variables: vars.variables ?? [], varIssues: vars.issues ?? [] })
@@ -952,6 +1004,42 @@ function afterJump(set: SetFn, get: () => StudioState, nodes: FlowNode[], edges:
     dirty: graphSig(nodes, edges) !== savedSig,
   })
   void get().validate()
+}
+
+/** 在途的升级预览请求：换图、放弃、再开一次时掐掉 */
+let upgradeCtl: AbortController | null = null
+let upgradeSeq = 0
+
+/**
+ * 升级已经落到画布上，存草稿。和页面自己的保存同一套规矩：画布锁着（助手在改、正式运行在跑）不存；
+ * 恢复旧版本留下的「回滚到 vN」不能被这一句盖掉，两句接着写
+ */
+async function saveUpgrade(set: SetFn, get: () => StudioState): Promise<boolean> {
+  const u = get().upgrade
+  if (u?.status !== 'ready') return false
+  const lock = editLockOf(get())
+  if (lock) {
+    set({ upgrade: { ...u, apply: { status: 'locked', why: EDIT_LOCK_TEXT[lock], unsaved: true } } })
+    return false
+  }
+  // 还没存成工作流的画布（问数据页「在画布里打开」的草稿）没有地方存：落到画布上就算完，照实说还没保存
+  if (!get().workflow) {
+    set({ upgrade: null })
+    toast.info(UPGRADE_TEXT.appliedDraft, { key: 'studio:upgrade' })
+    return false
+  }
+  set({ upgrade: { ...u, apply: { status: 'saving' } } })
+  const pending = get().pendingNote.trim()
+  try {
+    await get().save(pending ? `${pending}；${UPGRADE_TEXT.saveNote}` : UPGRADE_TEXT.saveNote)
+  } catch (error) {
+    const cur = get().upgrade
+    if (cur?.status === 'ready' && cur.seq === u.seq) set({ upgrade: { ...cur, apply: { status: 'failed', error } } })
+    return false
+  }
+  if (get().upgrade?.seq === u.seq) set({ upgrade: null })
+  toast.ok(UPGRADE_TEXT.applied(get().workflow?.version), { key: 'studio:upgrade' })
+  return true
 }
 
 /** 上次保存（或打开）时的图。撤销回这个样子时「未保存」要消失 */
@@ -1065,6 +1153,8 @@ export const useStudio = create<StudioState>((set, get) => ({
   selectedId: null,
   dirty: false,
   issues: [],
+  advice: [],
+  upgrade: null,
   variables: [],
   varIssues: [],
   run: null,
@@ -1110,8 +1200,11 @@ export const useStudio = create<StudioState>((set, get) => ({
     graphExtras = extrasOf(workflow?.graph)
     savedSig = graphSig(nodes, edges)
     lastVarSignature = ''
+    // 上一张图的升级预览：套到这张图上就错了
+    upgradeCtl?.abort()
+    upgradeCtl = null
     set({
-      workflow, nodes, edges, selectedId: null, dirty: false, issues: [],
+      workflow, nodes, edges, selectedId: null, dirty: false, issues: [], advice: [], upgrade: null,
       // 变量表也清掉：不清的话切图后抽屉会先显示上一张图的变量
       variables: [], varIssues: [], analysis: workflow ? 'pending' : 'idle', analysisError: null,
       ...runReset(), run: null, streaming: false, unsubscribe: null,
@@ -1161,10 +1254,13 @@ export const useStudio = create<StudioState>((set, get) => ({
     }
     const { nodes: cur, selectedId } = get()
     const byId = new Map(cur.map((n) => [n.id, n]))
-    // 已有的节点只换名字和配置：位置、量好的尺寸、选中都留着，React Flow 不用重新量一遍
+    // 已有的节点只换类型、名字和配置：位置、量好的尺寸、选中都留着，React Flow 不用重新量一遍。
+    // 类型也得跟着换——一键升级会把模型调用换成报告撰写，只换配置的话卡片还是模型调用，存下去的也是
     const nodes = next.nodes.map((n) => {
       const old = byId.get(n.id)
-      return old ? { ...old, data: { ...old.data, label: n.data.label, config: n.data.config } } : n
+      return old
+        ? { ...old, data: { ...old.data, nodeType: n.data.nodeType, label: n.data.label, config: n.data.config } }
+        : n
     })
     glideSeq++
     commit(set, get, label)
@@ -1175,6 +1271,69 @@ export const useStudio = create<StudioState>((set, get) => ({
     })
     void get().validate()
     return true
+  },
+
+  previewUpgrade: async ({ assist = false } = {}) => {
+    const lock = editLockOf(get())
+    if (lock) {
+      toast.warn(EDIT_LOCK_TEXT[lock], { key: 'studio:readonly' })
+      return
+    }
+    upgradeCtl?.abort()
+    const ctl = new AbortController()
+    upgradeCtl = ctl
+    const seq = ++upgradeSeq
+    const { nodes, edges, workflow } = get()
+    const graph = toGraph(nodes, edges)
+    // 受管的图升级完还要按受管重新发布：新写出来的报告节点直接按受管门禁的要求配
+    const level = workflow?.status === 'governed' ? 'governed' : 'published'
+    set({ upgrade: { status: 'loading', assist, seq } })
+    try {
+      const raw = await api.copilot.upgradeEvidence({ graph, level, ...(assist ? { assist: true } : {}) }, { signal: ctl.signal })
+      if (ctl.signal.aborted || get().upgrade?.seq !== seq) return
+      set({ upgrade: { status: 'ready', assist, seq, result: normalizeUpgrade(raw), sig: contentSig(graph), base: graph } })
+    } catch (e) {
+      if (ctl.signal.aborted || get().upgrade?.seq !== seq || (e as { name?: string } | null)?.name === 'AbortError') return
+      set({ upgrade: isMissingEndpoint(e) ? { status: 'unsupported', assist, seq } : { status: 'error', assist, seq, error: e } })
+    }
+  },
+
+  applyUpgrade: async () => {
+    const u = get().upgrade
+    if (u?.status !== 'ready' || !u.result.graph || u.apply?.status === 'saving') return false
+    const { nodes, edges } = get()
+    // 预览是按发请求那一刻的画布算的：之后又改过的话，套上去会把那几下盖掉
+    if (contentSig(toGraph(nodes, edges)) !== u.sig) {
+      set({ upgrade: { ...u, apply: { status: 'stale' } } })
+      return false
+    }
+    if (!get().applyFixes(u.result.graph, UPGRADE_TEXT.undoLabel)) {
+      const lock = editLockOf(get())
+      set({ upgrade: { ...u, apply: { status: 'locked', why: EDIT_LOCK_TEXT[lock ?? 'formal'] } } })
+      return false
+    }
+    return saveUpgrade(set, get)
+  },
+
+  retryUpgradeSave: async () => {
+    const u = get().upgrade
+    if (u?.status !== 'ready' || !upgradeUnsaved(u.apply) || !u.result.graph) return false
+    // 画布上得还是升级完的样子才替它存：撤销过升级、或者之后又改过，再存下去的就不是这次升级了，
+    // 版本说明却还写着「升级为可追溯结构」。对不上就说这份预览过时了，要存按平常的保存来
+    const { nodes, edges } = get()
+    // 升级后的图按 applyFixes 落画布的同一套换算一遍再比（没写名字的节点会补上默认名）
+    const applied = toFlow(u.result.graph)
+    if (contentSig(toGraph(nodes, edges)) !== contentSig(toGraph(applied.nodes, applied.edges))) {
+      set({ upgrade: { ...u, apply: { status: 'stale' } } })
+      return false
+    }
+    return saveUpgrade(set, get)
+  },
+
+  discardUpgrade: () => {
+    upgradeCtl?.abort()
+    upgradeCtl = null
+    set({ upgrade: null })
   },
 
   onNodesChange: (changes) => {
@@ -1440,6 +1599,11 @@ export const useStudio = create<StudioState>((set, get) => ({
     savedSig = JSON.stringify(graph)
     // 请求在途时又改了的话，那部分还没存：不能把「未保存」清掉
     set({ workflow: updated, dirty: graphSig(get().nodes, get().edges) !== savedSig, pendingNote: '' })
+    // 升级落到画布上之后没存上（存失败、要存时锁着），这回平常的保存（⌘S、工具栏）存上了：画布上是什么就存了什么，
+    // 升级要么跟着存进去了、要么已经撤销掉了，「草稿没保存上」都不再是真的。留着的话再点「重试保存」
+    // 会多存一版，版本说明还写着「升级为可追溯结构」
+    const u = get().upgrade
+    if (u?.status === 'ready' && upgradeUnsaved(u.apply)) set({ upgrade: null })
   },
 
   /**
@@ -1456,7 +1620,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   validate: async () => {
     const { nodes, analysis } = get()
     if (!nodes.length) {
-      set({ issues: [], variables: [], varIssues: [], analysis: 'ok', analysisError: null })
+      set({ issues: [], advice: [], variables: [], varIssues: [], analysis: 'ok', analysisError: null })
       return
     }
     // 已经有一份结论时不翻回「校验中」：连续打字会让工具栏的标签一直闪。

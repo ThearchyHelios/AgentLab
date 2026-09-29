@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -738,7 +739,7 @@ async def generate(
     return GenerateOut(
         graph=out,
         explanation=str(raw.get("explanation", "")),
-        issues=[i.model_dump() for i in report.issues]
+        issues=[i.model_dump() for i in report.issues if i.level != "info"]
         + _issue_dicts(scope_issues(out["nodes"], scope), "datasource_out_of_scope")
         + dropped_tool_warnings(changes, payload.instruction),
         layout=layout,
@@ -1033,6 +1034,62 @@ def _changed(spec: GraphSpec, baseline: list[dict[str, Any]] | None) -> set[str]
     return {n.id for n in spec.nodes if n.id not in before or before[n.id] != n.config}
 
 
+_NUMERIC_TYPES = ("number", "integer", "float")
+
+
+def _numeric_input(field: Any) -> bool:
+    """入口的这个字段看得出是数：写了数值类型，或者默认值是数（画布上填的默认值是字符串，能读成数的也算）。"""
+    if not isinstance(field, dict) or not str(field.get("name") or "").strip():
+        return False
+    if str(field.get("type") or "").strip().lower() in _NUMERIC_TYPES:
+        return True
+    default = field.get("default")
+    if isinstance(default, bool):
+        return False
+    if isinstance(default, (int, float)):
+        return math.isfinite(default)
+    if isinstance(default, str) and default.strip():
+        try:
+            return math.isfinite(float(default.strip().replace(",", "")))
+        except ValueError:
+            return False
+    return False
+
+
+def _evidence_source(node: Any) -> bool:
+    """报告撰写能从这个节点拿到可引用的证据：口径卡、调用工具、配了工具的 agent、知识检索，以及声明了数值字段的
+    入口（运行输入进证据目录，报告用 [[i:字段]] 引用）。子工作流、协作团队里面是什么看不见，一律算有——这条会把图
+    打回去让模型改，宁可漏判不可误判。
+
+    入口只声明了文字字段的（问题、主题）不算：报告能照引的只有问题本身，要写的数照样没有出处。画布上的入口字段
+    不写类型，没写默认值的字段看不出是不是数，也不算——提示里说明了怎么声明（写数值默认值）。"""
+    if node.type == NodeType.AGENT:
+        return bool(node.config.get("tools"))
+    if node.type == NodeType.INPUT:
+        fields = node.config.get("fields")
+        return isinstance(fields, list) and any(_numeric_input(f) for f in fields)
+    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.RETRIEVE, NodeType.SUBGRAPH, NodeType.SUPERVISOR)
+
+
+def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
+    """这一轮新加或改过的报告撰写节点，上游一个证据来源都没有：运行时只给一条警告，报告里的数全被判成没有出处。"""
+    from app.engine.schema import _ancestors
+
+    nodes = spec.node_map()
+    out = []
+    for node in spec.nodes:
+        if node.id not in changed or node.type != NodeType.REPORT:
+            continue
+        if any(_evidence_source(nodes[a]) for a in _ancestors(spec, node.id) if a in nodes):
+            continue
+        out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": None, "code": "report_no_source",
+                    "message": f"「{node.title}」（报告撰写）的上游没有能引用数字的证据来源：没有口径卡、查库的 Agent 或调用工具、"
+                               "知识检索，入口也没有看得出是数的字段，报告里写的数都会被判成没有出处。在它前面接取数的节点"
+                               "（要算比率、增幅再加口径卡），连线连到它；要写的数本来就是运行输入的话，在入口字段上写明数值默认值，"
+                               "报告用 [[i:字段名]] 引用"})
+    return out
+
+
 def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str, Any]] | None = None,
                     ) -> list[dict[str, Any]]:
     """助手搭图时要打回、运行时却不挡的写法，按 error 交回模型改：
@@ -1040,9 +1097,12 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
       猜的列名跑起来只会「no such column」，还白跑前面的步骤
     - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
+    - report_no_source：报告撰写节点的上游没有任何证据来源（运行时只给一条警告，报告里的数全没有出处）。
+      metrics_from 指向不是口径卡的节点，validate 本来就报 error，自查照样交回去
     """
     changed = _changed(spec, baseline)
     out: list[dict[str, Any]] = []
+    out += _unsourced_reports(spec, changed)
     for issue in text_parse_issues(spec):
         if issue.node_id in changed:
             # 模型的文字放在模板引号里的那种，改法是 | json，不是换结构化输出
@@ -1591,7 +1651,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             spec, layout = _layout_keeping(
                 GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges}), pinned,
             )
-            issues = [i.model_dump() for i in validate_graph(spec).issues]
+            # 建议（info，比如「可以升级为可追溯结构」）不进这一轮的问题清单：图刚按规则搭好，画布自己的校验会列出来
+            issues = [i.model_dump() for i in validate_graph(spec).issues if i.level != "info"]
             issues += _issue_dicts(scope_issues(list(nodes.values()), scope),
                                    "datasource_out_of_scope")
             # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见
@@ -1633,8 +1694,12 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
 
 _LEVEL_WORD = {"published": "已发布", "governed": "受管"}
 
-_ASSIST_RULES = """\
+#: 发布前修复和一键升级共用的硬性约定。拆开写是为了升级的兜底换掉「只修下面列出的问题」那一条，
+#: 其余的（不许降低要求、要人拿主意的不替人选、只许用哪几种操作）一字不差
+_RULES_HEAD = """\
 硬性约定（违反任何一条，这次修改整个作废）：
+"""
+_NO_LOWERING = """\
 - 不许降低要求：不删节点、不删连线，add_node 不许用图里已有的节点 id（那等于把旧节点删了重建），也不换节点类型；
   不删掉或清空出具契约，不删 required 里的指标，不把 strict 改成 false，不往 allow_numbers 里加数，不替人打开 cells；
   审批策略只能往严里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行），不放宽、不删掉，更不改成 never；
@@ -1645,13 +1710,23 @@ _ASSIST_RULES = """\
   judge.on_unsupported 是 withhold 的不改回 degrade、不删掉；update_node 会把 judge 整个换掉，补预算时把原来的
   judge（包括从全图默认继承来的）整份带上，只加 max_cost_usd；契约里的 claims 也一样；
   不关 agent 的 cite_fields，不删它的 output_schema
+"""
+_ASK_HUMAN = """\
 - 要人拿主意的，不替人选、不编：required 该包括哪些指标、几张口径卡该用哪张、钉哪个版本、协作团队拆成哪几个
   固定步骤、沙箱代码节点是在取数还是在计算（不许自己把 evidence_role 设成 source）……每一处输出一行
   {"op":"question","node_id":"节点 id","text":"要问的话，把候选列出来"}，那一处不改
+"""
+_ONLY_LISTED = """\
 - 只修下面列出的问题，别的不要动
+"""
+_OPS_ONLY = """\
 - 可用操作只有 update_node（config 只写要改的字段，没写的原样保留）、add_node、add_edge 和 question；
   不要输出 remove_node、remove_edge、reply
+"""
+_PLAN_DONE = """\
 - 第一行 plan，最后一行 done，done 的 explanation 用一两句话说清改了什么、为什么"""
+
+_ASSIST_RULES = _RULES_HEAD + _NO_LOWERING + _ASK_HUMAN + _ONLY_LISTED + _OPS_ONLY + _PLAN_DONE
 
 
 def _publish_fix_request(graph: dict[str, Any], errors: list[dict[str, Any]], level: str) -> str:
@@ -1774,6 +1849,246 @@ def _proposed_graph(base: dict[str, Any], nodes: dict[str, dict[str, Any]],
                 nodes[nid]["position"] = where.get(nid, nodes[nid].get("position"))
         except Exception:  # noqa: BLE001 - 摆不好就留在原点，复核那一步会报结构问题
             pass
+    return out
+
+
+# --------------------------------------------------------------------------
+# 一键升级为可追溯结构：先按确定的规则改写（engine/upgrade.py），assist 时再请 Copilot 把纯算术的沙箱代码
+# 改写成口径卡表达式。和发布前修复一样只给预览：不改库、不保存，人确认后前端走现有的保存
+# --------------------------------------------------------------------------
+
+
+class UpgradeIn(BaseModel):
+    graph: dict[str, Any]
+    #: 确定性改写之后，再请 Copilot 做语义层面的改写（纯算术的沙箱代码改成口径卡表达式），同样只是预览
+    assist: bool = False
+    #: 复核门禁用的发布级别。受管级别下新写出来的报告撰写节点另写明门禁 G3 要的三项
+    level: Literal["published", "governed"] = "published"
+    provider: str | None = None
+    model: str | None = None
+
+
+_UPGRADE_TASK = """\
+逐个判断上面这些沙箱代码节点：
+- 代码只是对上游已有的数做纯算术（加减乘除、round、min / max、比较、按条件取值），没有查库、调接口、读写文件，
+  也不用随机数、当前时间：把口径卡里读它的那几个指标的 expression 改成直接用上游的值算——上游是查库的调用工具
+  节点就写 cell(nodes.查库节点id, 行, '列名')，是开了 cite_fields 的 agent 就写 vars.<它的 assign_to>.字段。
+  改完口径卡不再读这个代码节点；代码节点本身留在图上（不删节点、不删连线，要不要删由人决定）
+- 不是纯算术的（在取数、调接口、解析文件、用了随机数或时间……）保留原样，输出一行 question 说明为什么没改，
+  并请人确认它是不是在取数
+"""
+
+
+def _upgrade_assist_request(graph: dict[str, Any], spec: GraphSpec, feeders: list[Any]) -> str:
+    from app.engine.upgrade import metric_feeders
+
+    lines = []
+    for code, cards in feeders:
+        # 和 compute_feeders 同一条追法：指标读的是整形、校验节点的，追到头是这段代码也要列出来
+        reads = [f"口径卡「{card.title}」（{card.id}）的指标 {card.config['metrics'][i].get('id')}："
+                 f"{card.config['metrics'][i].get('expression')}"
+                 for card in cards for i, producer in metric_feeders(spec, card) if producer.id == code.id]
+        lines.append(f"- 「{code.title}」（{code.id}）被这些指标读到：" + "；".join(dict.fromkeys(reads)))
+    return (
+        "这是一张已经按确定的规则升级成可追溯结构的工作流：\n"
+        f"{json.dumps(_slim(graph), ensure_ascii=False, indent=2)}\n\n"
+        "口径卡读的是下面这些沙箱代码节点的产出（evidence_role 不是 source）：沙箱里算出来的数核对不了出处。\n"
+        + "\n".join(lines) + f"\n\n{_UPGRADE_TASK}\n"
+        + _RULES_HEAD + _NO_LOWERING + _ASK_HUMAN
+        + "- 只改上面这些口径卡指标的 expression，别的不要动\n" + _OPS_ONLY + _PLAN_DONE
+    )
+
+
+def _kept_code(spec: GraphSpec) -> list[str]:
+    """assist 之后仍然喂着口径卡的计算角色沙箱代码：不是纯算术、或者 Copilot 拿不准的，保留原样并警告。"""
+    from app.engine.upgrade import compute_feeders
+
+    return [f"「{code.title}」（沙箱代码）没有改写成口径卡表达式，保留原样：口径卡"
+            + "、".join(f"「{c.title}」" for c in cards)
+            + "读到的数核对不了出处。它在取数的话，把 evidence_role 标成 source；在做计算的话，把计算写进口径卡"
+            for code, cards in compute_feeders(spec)]
+
+
+async def assist_upgrade(
+    session: AsyncSession, graph: dict[str, Any], *, level: str,
+    provider: str | None = None, model: str | None = None,
+) -> dict[str, Any]:
+    """升级的语义层：请 Copilot 把喂口径卡的纯算术沙箱代码改写成口径卡表达式，不是纯算术的保留并警告。
+
+    模型、工具目录、操作流协议都和画布上改图是同一套；改完按搭图时同一套自查循环修正（只把这一轮冒出来的
+    error 交回去，图上原来就有的不算），最后复核：没有降低要求的改动（autofix.forbidden_changes，这里没有例外：
+    Copilot 不换类型、不删连线）、没有比确定性改写的结果更糟（autofix.worse）才采纳，否则整个作废并写明原因。
+
+    返回 {ok, accepted, reason, summary, questions, warnings, graph, ops}。不落库。
+    """
+    from app.engine.autofix import _sig, forbidden_changes, worse
+    from app.engine.upgrade import compute_feeders
+
+    base = copy.deepcopy(graph)
+    spec = GraphSpec.model_validate(base)
+    out: dict[str, Any] = {"ok": True, "accepted": False, "reason": None, "summary": "", "questions": [],
+                           "warnings": [], "graph": graph, "ops": []}
+    feeders = compute_feeders(spec)
+    if not feeders:
+        out["summary"] = "口径卡的输入都不来自做计算的沙箱代码，没有要交给 Copilot 改写的"
+        return out
+    sources = await _sources(session, None)
+    before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
+    before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
+    baseline = list(copy.deepcopy(before_nodes).values())
+    defaults = base.get("defaults")
+    base_errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
+                                   defaults=defaults) or []
+    known = {_sig(e) for e in base_errors}
+    out["warnings"] = _kept_code(spec)
+    try:
+        spec_ = await copilot_model_spec(
+            session, GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model))
+        chat, _ = await get_chat_model(session, spec_)
+    except ProviderNotConfigured as e:
+        out.update(ok=False, summary=_unconfigured(e))
+        return out
+
+    system = (
+        "你是一个 agent 工作流编排专家。现在要做的是：把一张工作流里喂给口径卡的纯算术沙箱代码改写成口径卡表达式，"
+        "以操作流的方式输出修改。\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
+    )
+    nodes = copy.deepcopy(before_nodes)
+    edges = copy.deepcopy(before_edges)
+    tried: list[dict[str, Any]] = []
+    effective: list[dict[str, Any]] = []
+    plan = ""
+
+    async def collect(request: str, *, first: bool) -> None:
+        nonlocal plan
+        async for op in _iter_ops(chat, [("system", system), ("human", request)]):
+            kind = op.get("op")
+            if kind in ("thinking", "heartbeat"):
+                continue
+            if kind in ("plan", "done"):
+                # 修补轮的开场和收尾不是新方案，不覆盖第一轮的说明
+                if first and kind == "plan":
+                    plan = str(op.get("summary") or "")
+                elif first:
+                    out["summary"] = str(op.get("explanation") or "")
+            elif kind in ("question", "reply"):
+                text = str(op.get("text") or "").strip()
+                where = before_nodes.get(str(op.get("node_id") or ""))
+                title = str((where.get("data") or {}).get("label") or where.get("id")) if where else ""
+                if text:
+                    out["questions"].append(f"「{title}」：{text}" if title and title not in text else text)
+            else:
+                tried.append(op)
+                if _apply_op(nodes, edges, op):
+                    effective.append(op)
+
+    try:
+        await collect(_upgrade_assist_request(base, spec, feeders), first=True)
+        # 自查：和搭图同一套规则，只把这一轮冒出来的 error 交回去改（原来就有的不归这一轮管）
+        for _ in range(_SELF_CHECK_ROUNDS):
+            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults)
+            fresh = [e for e in now or [] if _sig(e) not in known]
+            if not effective or not fresh:
+                break
+            await collect(_repair_request(nodes, edges, fresh), first=False)
+    except Exception as e:  # noqa: BLE001 - 改不成就照实说，确定性改写的结果照样交给人
+        out.update(ok=False, summary=f"Copilot 这一轮没跑完：{explain_error(e)[0]}")
+        return out
+    out["summary"] = out["summary"] or plan
+    if not effective:
+        out["summary"] = out["summary"] or ("Copilot 认为这些代码不是纯算术，都保留原样" if out["questions"]
+                                            else "Copilot 这一轮没有给出修改")
+        return out
+
+    proposed = _proposed_graph(base, nodes, edges)
+    reasons = forbidden_changes(base, proposed, tried)
+    after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
+    if reasons:
+        out["reason"] = "Copilot 的修改降低了要求，已作废：" + "；".join(reasons)
+    elif after is None:
+        out["reason"] = "Copilot 改完的图结构读不懂，已作废"
+    elif why := worse(base_errors, after):
+        out["reason"] = f"Copilot 的修改让图变糟了，已作废：{why}"
+    else:
+        out.update(accepted=True, graph=proposed, ops=effective, warnings=_kept_code(GraphSpec.model_validate(proposed)))
+    out["ok"] = out["reason"] is None
+    return out
+
+
+def _placed(base: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+    """升级新插进来的节点找空处摆，原有节点一个都不挪（坐标常带着业务上的分区）。"""
+    known = {n.get("id") for n in base.get("nodes") or [] if isinstance(n, dict)}
+    fresh = {n["id"] for n in graph.get("nodes") or [] if isinstance(n, dict) and n.get("id") not in known}
+    if not fresh:
+        return graph
+    out = copy.deepcopy(graph)
+    try:
+        laid, _ = _layout_keeping(GraphSpec.model_validate(out), _pinned_positions(base))
+    except Exception:  # noqa: BLE001 - 摆不好就留在规则给的位置上
+        return out
+    where = {n.id: n.position.model_dump() for n in laid.nodes}
+    for n in out["nodes"]:
+        if n.get("id") in fresh:
+            n["position"] = where.get(n["id"], n.get("position"))
+    return out
+
+
+def _node_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copilot 那一段的逐项变更和确定性改写同一个形状：新加的节点记成 field 为 node、after 是整个节点。"""
+    out = []
+    for c in changes:
+        if c.get("field") is None and isinstance(c.get("after"), dict):
+            c = {**c, "field": "node", "after": {"id": c["node_id"], "label": c["node_title"], **c["after"]}}
+        out.append({**c, "rule": "assist"})
+    return out
+
+
+@router.post("/upgrade-evidence")
+async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """一键升级为可追溯结构（证据五期）：返回升级后的整张图和逐项变更——只是预览，不改库、不保存。
+
+    返回 {graph, changes, ops, notes, issues, applied, rejected, assist, ok}：changes / notes / rejected 的形状见
+    engine/upgrade.upgrade_for_evidence；issues 是升级后的图按 level 重跑 validate 和门禁的结果（和发布同一套口径）；
+    assist 只在请求带 assist: true 时有：{ok, summary, questions, warnings}，warnings 是保留没改的沙箱代码。
+    """
+    from app.engine.autofix import diff_changes
+    from app.engine.governance import publish_issues
+    from app.engine.upgrade import upgrade_for_evidence
+
+    try:
+        GraphSpec.model_validate(payload.graph)
+    except Exception as e:  # noqa: BLE001
+        return {"graph": payload.graph, "changes": [], "ops": [], "notes": [], "applied": [], "rejected": [],
+                "assist": None, "ok": False,
+                "issues": [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None,
+                            "fix": None, "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+    out = upgrade_for_evidence(payload.graph, level=payload.level)
+    out["graph"] = _placed(payload.graph, out["graph"])
+    out["assist"] = None
+    if payload.assist:
+        helped = await assist_upgrade(session, out["graph"], level=payload.level, provider=payload.provider,
+                                      model=payload.model)
+        out["assist"] = {"ok": helped["ok"], "summary": helped["summary"], "questions": helped["questions"],
+                         "warnings": helped["warnings"]}
+        if helped["accepted"]:
+            from app.engine.upgrade import compute_feeders
+
+            out["changes"] += _node_changes(
+                diff_changes(out["graph"], helped["graph"], fix_id="assist", label="Copilot 的修改"))
+            out["ops"] += helped["ops"]
+            out["applied"].append("assist")
+            out["graph"] = helped["graph"]
+            # R5 的建议是改写之前给的：口径卡已经不读的那几个代码节点，不再建议人去标 source
+            still = {code.id for code, _ in compute_feeders(GraphSpec.model_validate(out["graph"]))}
+            out["notes"] = [n for n in out["notes"] if n["rule"] != "R5" or n["node_id"] in still]
+        elif helped["reason"]:
+            out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
+    issues = publish_issues(GraphSpec.model_validate(out["graph"]), level=payload.level)
+    out["issues"] = [i.model_dump() for i in issues]
+    out["ok"] = not any(i.level == "error" for i in issues)
     return out
 
 

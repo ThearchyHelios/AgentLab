@@ -298,7 +298,11 @@ export interface KbDocument {
 }
 
 export interface ValidationIssue {
-  level: 'error' | 'warning'
+  /**
+   * info 是建议，不是问题（比如 evidence.upgrade_available「可以升级为可追溯结构」）：store 在校验回来时
+   * 就把它分到 advice 里，issues 里只有 error / warning——节点卡、检查器、运行按钮都只认这两档
+   */
+  level: 'error' | 'warning' | 'info'
   node_id?: string | null
   edge_id?: string | null
   message: string
@@ -364,6 +368,38 @@ export interface AutofixResult {
   assist: { ok: boolean; summary?: string; questions?: string[] } | null
   /** 修复后是否已经没有 error */
   ok: boolean
+}
+
+/**
+ * 一键升级预览里的一项改动。形状同自动修复的 AutofixChange，另认这几种：
+ * field 为 type 是节点类型的变化（llm → report）；field 为 node 是新插入的节点（after 是节点）；
+ * field 为 edge 是连线的改接（before / after 是 {source, target}）。rule 是命中的改写规则（R1–R4；Copilot 那一段是 assist）。
+ * 同一步（同一个 fix_id）的几项改动共用一句 label
+ */
+export interface UpgradeChange extends AutofixChange {
+  rule?: string | null
+}
+
+/** 升级给的说明：不改、只建议的（R5：代码节点要不要标成 source），原样给人看 */
+export interface UpgradeNote {
+  text: string
+  node_id?: string | null
+  rule?: string | null
+  level?: 'info' | 'warning'
+}
+
+/** POST /copilot/upgrade-evidence：只给预览，不自动保存 */
+export interface UpgradeResult {
+  /** 升级后的整张图；人确认后走现有的保存 */
+  graph: GraphSpec | null
+  changes: UpgradeChange[]
+  notes: UpgradeNote[]
+  /** 升级后的图重跑 validate 和门禁剩下的问题 */
+  issues: ValidationIssue[]
+  /** 没有采用的改动（Copilot 的改写冒出新问题、碰了禁止规则），写明原因 */
+  rejected: { fix_id: string; reason: string }[]
+  /** assist 时 Copilot 的那一段：非纯算术、保留没改的代码节点在 warnings 里 */
+  assist: { ok: boolean; summary?: string; questions?: string[]; warnings?: string[] } | null
 }
 
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
