@@ -1,21 +1,25 @@
 import {
   useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
-import { ChevronRight, Download, FileText } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { ArrowRight, ChevronRight, Download, FileText, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
+import { isUpgradeAdvice } from '../../canvas/issues'
 import { ErrorState, Skeleton, Spinner, StatusBadge, rovingTarget, toast, useRadioGroup } from '../../components/ui'
 import {
   EVIDENCE_STATE, PROBLEM_GROUPS, auditCsv, auditFromApi, auditRows, groupRows, guessRows, guessesOf, issuanceMarks,
   segmentState, type AuditFilter, type AuditGroup, type AuditRow,
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
-import { EVIDENCE_AUDIT_TEXT as T } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { Markdown, inlineStyles } from '../../run/Markdown'
 import { useEvidence } from '../../store/evidence'
-import type { EvidenceAudit, EvidenceDocData, EvidenceGraph, Run } from '../../types'
+import { useCatalog } from '../../store/catalog'
+import { EDIT_LOCK_TEXT, editLockOf, useStudio } from '../../store/studio'
+import type { EvidenceAudit, EvidenceDocData, EvidenceGraph, GraphSpec, Run } from '../../types'
 
 /**
  * 记录页的「证据」页签（方案 6.4）：左边报告，右边常驻的证据面板，报告下面是整张审计表。
@@ -129,6 +133,7 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
         <div className="space-y-4 px-4 py-3">
           <SummaryBar mode={mode} seal={seal} message={audit.data?.seal?.message}
                       reports={graph.reports ?? []} labelOf={labelOf} />
+          <UpgradeBanner run={run} mode={mode} />
 
           {mode === 'cited' && reports.map((r) => {
             const doc = docOf(r.node_id)
@@ -180,6 +185,72 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
         </aside>
       )}
     </div>
+  )
+}
+
+/** 已经收尾的运行：还在跑、停在审批上的，报告可能还没写，说「这次的报告没有逐段证据」太早 */
+const SETTLED = new Set(['succeeded', 'failed', 'cancelled'])
+
+/**
+ * 工作流现在的图能不能一键升级：拿它去校验，看有没有 evidence.upgrade_available 这条建议。老后端不给
+ * 这条建议，横幅也就不出现（它也没有升级接口）。按工作流 id 和版本记住答案：同一张图的几条运行不重复问；
+ * 问失败了不记，下次打开再问
+ */
+const upgradable = new Map<string, Promise<boolean>>()
+function useUpgradable(workflowId: string | null, version: number | undefined, graph: GraphSpec | undefined, enabled: boolean) {
+  const [yes, setYes] = useState(false)
+  useEffect(() => {
+    setYes(false)
+    if (!enabled || !workflowId || !graph?.nodes?.length) return
+    let alive = true
+    const key = `${workflowId}@${version ?? ''}`
+    let ask = upgradable.get(key)
+    if (!ask) {
+      ask = api.workflows.validate(graph).then((r) => (r.issues ?? []).some(isUpgradeAdvice))
+      ask.catch(() => { if (upgradable.get(key) === ask) upgradable.delete(key) })
+      upgradable.set(key, ask)
+    }
+    ask.then((v) => { if (alive) setYes(v) }, () => undefined)
+    return () => { alive = false }
+    // graph 跟着版本走：同一个版本的图不会变
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflowId, version, enabled])
+  return yes
+}
+
+/**
+ * 没有逐段证据的运行（none、旧版出具、没有契约的旧运行）：工作流现在的图可以升级的，给一条横幅，
+ * 跳到编排页打开升级预览。画布正锁着这张工作流（正式运行在跑、助手在改）时不给入口，说清为什么
+ */
+function UpgradeBanner({ run, mode }: { run: Run; mode?: string }) {
+  const wf = useCatalog((s) => (run.workflow_id ? s.workflows.find((w) => w.id === run.workflow_id) : undefined))
+  const legacy = mode === 'none' || !!mode?.startsWith('legacy')
+  const yes = useUpgradable(wf?.id ?? null, wf?.version, wf?.graph, legacy && SETTLED.has(run.status))
+  const lock = useStudio((s) => (wf && s.workflow?.id === wf.id ? editLockOf(s) : null))
+  if (!yes || !wf) return null
+  return (
+    <section className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border px-3 py-2" data-upgrade-banner=""
+             aria-label={UPGRADE_TEXT.runBanner}
+             style={{ borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))',
+                      background: 'color-mix(in srgb, var(--accent) 5%, var(--bg-panel))' }}>
+      <Sparkles size={13} className="shrink-0" style={{ color: 'var(--accent)' }} aria-hidden />
+      <span className="min-w-0 flex-1 text-xs">
+        <span className="font-medium text-fg">{UPGRADE_TEXT.runBanner}</span>
+        <span className="mt-0.5 block text-2xs leading-relaxed text-faint">
+          {UPGRADE_TEXT.runHint}{run.run_class === 'formal' ? `。${UPGRADE_TEXT.runFormal}` : ''}
+        </span>
+      </span>
+      {lock ? (
+        <span className="text-2xs" style={{ color: 'var(--st-waiting)' }} data-upgrade-banner-locked="">
+          {UPGRADE_TEXT.runLocked(EDIT_LOCK_TEXT[lock])}
+        </span>
+      ) : (
+        <Link className="btn btn-sm shrink-0" to={`/studio/${encodeURIComponent(wf.id)}?upgrade=1`} data-upgrade-link=""
+              title={UPGRADE_TEXT.runHint}>
+          <ArrowRight size={11} aria-hidden /> {UPGRADE_TEXT.runAction}
+        </Link>
+      )}
+    </section>
   )
 }
 

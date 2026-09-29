@@ -397,3 +397,83 @@ def test_a_graph_with_a_caliber_card_still_needs_required_even_without_metrics_f
     validate, gate = contract_codes(graph)
     assert "contract.required_missing" in gate, gate       # 不写 metrics_from 绕不过必需指标
     assert validate == [], validate
+
+
+# --------------------------------------------------------------------------
+# 没有口径卡、又没写 cells: true：受管门禁要拦下，发布弹窗里一键选
+#
+# 放开 metrics_from / required 之后留下的口子：这种契约以前被 metrics_from 挡着，现在能过门禁，
+# 可受管正式运行里单元格引用一律不认，报告撰写节点（numbers strict、on_violation fail）每次都失败。
+# 写不写 cells 要作者定（模型不许替人打开），所以修复是 choice：写 cells: true，或交给 Copilot 改成口径卡
+# --------------------------------------------------------------------------
+
+
+def _plan(graph: dict, level: str = "governed") -> dict[str, dict]:
+    from app.engine.autofix import plan_fixes
+    from app.engine.governance import publish_issues
+    from app.engine.schema import GraphSpec
+
+    spec = GraphSpec.model_validate(graph)
+    return {f["id"]: f for f in plan_fixes(spec, publish_issues(spec, level=level), level=level)}
+
+
+def test_a_governed_graph_without_cards_must_declare_cells():
+    graph = cells_only()
+    graph["nodes"][-1]["data"]["config"]["contract"].pop("cells")
+    _, gate = contract_codes(graph)
+    assert gate == ["contract.cells_undeclared"], gate
+    _, gate = contract_codes(cells_only(cells=False))
+    assert gate == ["contract.cells_undeclared"], gate
+    _, gate = contract_codes(graph, level="published")      # 已发布级别照样允许直接引用单元格
+    assert "contract.cells_undeclared" not in gate
+
+
+def test_a_graph_with_a_caliber_card_does_not_need_cells():
+    _, gate = contract_codes(weekly())                       # 有口径卡：数可以走 [[m:]]，cells 是可选的
+    assert "contract.cells_undeclared" not in gate, gate
+
+
+def test_the_fix_is_a_choice_and_picking_cells_is_not_loosening():
+    from app.engine.autofix import HANDOFF, apply_fixes
+
+    graph = cells_only()
+    graph["nodes"][-1]["data"]["config"]["contract"].pop("cells")
+    fid = "contract.cells_undeclared:out"
+    fix = _plan(graph)[fid]
+    assert fix["kind"] == "choice" and fix["field"] == "contract.cells"
+    assert [o["value"] for o in fix["options"]] == [True, HANDOFF]
+    assert [o.get("handoff") is True for o in fix["options"]] == [False, True]
+    assert apply_fixes(graph, [fid], level="governed")["applied"] == []      # 不替人选
+    out = apply_fixes(graph, [fid], {fid: True}, level="governed")
+    assert out["applied"] == [fid] and out["rejected"] == [], out["rejected"]
+    assert out["graph"]["nodes"][-1]["data"]["config"]["contract"]["cells"] is True and out["ok"] is True
+    out = apply_fixes(graph, [fid], {fid: HANDOFF}, level="governed")
+    assert out["handoff"] == [fid] and out["applied"] == []
+
+
+def test_turning_cells_on_unasked_is_still_loosening():
+    from app.engine.autofix import forbidden_changes
+
+    before = cells_only()
+    before["nodes"][-1]["data"]["config"]["contract"].pop("cells")
+    after = cells_only()
+    [why] = forbidden_changes(before, after)
+    assert "cells" in why
+    assert forbidden_changes(before, after, chosen={("out", "contract.cells")}) == []
+
+
+def test_only_a_newly_raised_human_choice_error_is_let_through():
+    from app.engine.autofix import judge, worse
+
+    no_contract = {"level": "error", "code": "governed.no_contract", "node_id": "out", "message": "没有契约"}
+    cells = {"level": "error", "code": "contract.cells_undeclared", "node_id": "out", "field": "contract.cells",
+             "message": "要写 cells"}
+    other = {"level": "error", "code": "contract.strict_off", "node_id": "out", "message": "strict 关了"}
+    assert judge([no_contract], [cells]) is None                  # 补上契约、cells 留给人：算更好
+    assert worse([], [cells]) is None
+    assert "冒出新的问题" in (judge([no_contract], [other]) or "")  # 别的新 error 照样作废
+    assert judge([no_contract], [cells, other]) is not None
+    # 原来就有的 cells 照常计数：修它的那一步，改完还在就是没修好
+    assert "还在" in (judge([cells], [cells], target=("contract.cells_undeclared", "out")) or "")
+    assert judge([cells], [], target=("contract.cells_undeclared", "out")) is None
+    assert judge([cells], [cells]) == "改完错误没有变少"             # 原来就有、改完还在：Copilot 兜底不算修好

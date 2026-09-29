@@ -189,6 +189,14 @@ def _lint_contract(
             "受管模板的出具契约必须声明 required（必需指标），否则「不予出具」这一档永远触发不了",
             code="contract.required_missing", node_id=node_id, hard=True, field="contract.required",
         )
+    # 没有口径卡的图，报告里的数只能直接引用查询单元格；受管正式运行不认没声明的单元格引用，
+    # 报告撰写节点（numbers strict、on_violation fail）每次都会失败。写不写要作者定：修复给选项
+    if strict and cells_only and contract.get("cells") is not True:
+        flag(
+            "这张图没有口径卡，报告里的数只能直接引用查询单元格：受管出具要在契约里写 cells: true，"
+            "否则正式运行里一个数都引用不了，报告撰写节点每次都会失败（也可以加一张口径卡，把数登记成指标）",
+            code="contract.cells_undeclared", node_id=node_id, hard=True, field="contract.cells",
+        )
     if strict and not contract.get("strict"):
         flag(
             "受管模板建议把出具契约设为 strict：非 strict 下未回指的数字只降档不拦截",

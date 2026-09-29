@@ -1994,10 +1994,118 @@ await section('证据页签：没有报告的运行照实说明（none / 旧运�
   fakes.delete(`GET /api/artifacts/${fxe.doc_artifact}`)
 })
 
+// ------------------------------------------------------------------ 没有逐段证据 → 升级这张图（可点击证据五期）
+
+await section('证据页签：没有逐段证据的运行给升级横幅，跳到编排页打开升级预览', async () => {
+  const UP = 'fake0evupgrade000000000000000'
+  const UP_OLD = 'fake0evupgradeold00000000000'
+  const UP_LEGACY = 'fake0evupgradelegacy00000000'
+  const UP_NOWF = 'fake0evupgradenowf0000000000'
+  const node = (id, type, x, label, config = {}) => ({ id, type, position: { x, y: 120 }, data: { label, config } })
+  const wfOf = (id, name, graph) => ({ id, name, description: '检查脚本伪造的工作流', graph, tags: [], version: 5, is_template: false,
+    status: 'published', published_version: 5, published_by: null, run_count: 1,
+    created_at: '2026-09-20T02:00:00Z', updated_at: '2026-09-26T02:00:00Z' })
+  // 旧结构：模型调用写的文字进了成果（可以升级）；另一张已经是报告撰写（校验不给建议）
+  const legacyGraph = { nodes: [node('in', 'input', 0, '入口'), node('fetch', 'agent', 240, '取数', { tools: ['db_query__shop'] }),
+    node('story', 'llm', 480, '写周报', { prompt: '写周报' }), node('done', 'output', 720, '成果', { fields: [{ name: 'report', value: '{{ nodes.story.text }}' }] })],
+  edges: [{ id: 'e1', source: 'in', target: 'fetch' }, { id: 'e2', source: 'fetch', target: 'story' }, { id: 'e3', source: 'story', target: 'done' }] }
+  const cleanGraph = { ...legacyGraph, nodes: legacyGraph.nodes.map((n) => (n.id === 'story' ? { ...n, type: 'report', data: { label: '写周报', config: { instructions: '写周报' } } } : n)) }
+  const WF = wfOf('fake-wf-upgrade', '升级检查', legacyGraph)
+  const WF_CLEAN = wfOf('fake-wf-upgraded', '升级检查（已升级）', cleanGraph)
+  const real = await getJson('/workflows').catch(() => [])
+  fakes.set('GET /api/workflows', () => ({ status: 200, json: [...real, WF, WF_CLEAN] }))
+  fakes.set(`GET /api/workflows/${WF.id}`, () => ({ status: 200, json: WF }))
+  fakes.set('GET /api/conversations', () => ({ status: 200, json: [{ id: 'fake-conv-upgrade', title: '', kind: 'canvas', archived: false, turn_count: 0 }] }))
+  const validated = []
+  fakes.set('POST /api/workflows/validate', (url, r) => {
+    const graph = r.postDataJSON()?.graph ?? { nodes: [] }
+    validated.push(graph.nodes.map((n) => n.id).join(','))
+    const old = graph.nodes.some((n) => n.type === 'llm')
+    return { status: 200, json: { ok: true, issues: old ? [{ level: 'info', code: 'evidence.upgrade_available', node_id: null, field: null, message: '可以升级为可追溯结构' }] : [] } }
+  })
+  fakes.set('POST /api/workflows/variables', () => ({ status: 200, json: { variables: [], issues: [] } }))
+  const upgrades = []
+  fakes.set('POST /api/copilot/upgrade-evidence', (url, r) => {
+    const body = r.postDataJSON()
+    upgrades.push(body)
+    const graph = JSON.parse(JSON.stringify(body.graph))
+    const story = graph.nodes.find((n) => n.id === 'story')
+    if (story) { story.type = 'report'; story.data.config = { instructions: '写周报' } }
+    return { status: 200, json: { graph, ops: [], notes: [], issues: [], applied: ['R2:story'], rejected: [], assist: null, ok: true,
+      changes: [{ fix_id: 'R2:story', rule: 'R2', label: '把「写周报」换成报告撰写', node_id: 'story', node_title: '写周报', field: 'type', before: 'llm', after: 'report' }] } }
+  })
+  const none = { schema: 'agentlab.evidence/1', mode: 'none', note: '', seal: { sealed: true, ok: true }, reports: [], evidence: [], edges: [] }
+  const noneAudit = { schema: 'agentlab.evidence.audit/1', mode: 'none', seal: { sealed: true, ok: true }, reports: [], groups: [], counts: {}, total: 0 }
+  const wire = (id, wf, graph) => {
+    evFakes(id, { output: { report: '本周销售额 45678' }, report: false, graph, audit: { ...noneAudit, mode: graph.mode } })
+    fakes.set(`GET /api/runs/${id}`, () => ({ status: 200, json: { ...evRun(id, { report: '本周销售额 45678' }), workflow_id: wf.id, workflow_name: wf.name } }))
+  }
+  wire(UP, WF, none)
+  wire(UP_OLD, WF_CLEAN, none)
+  wire(UP_LEGACY, WF, { ...none, mode: 'legacy_text', legacy: { note: '猜测', fields: [] } })
+  evFakes(UP_NOWF, { output: { report: '本周销售额 45678' }, report: false, graph: none, audit: noneAudit })
+  const banner = () => page.locator('[data-view-pane=evidence] [data-upgrade-banner]')
+
+  await openEvidence(UP)
+  await banner().waitFor({ timeout: 5000 }).catch(() => {})
+  const text = await banner().innerText().catch(() => '')
+  check('没有逐段证据（none）、图能升级：横幅「这次的报告没有逐段证据 → 升级这张图」', text.includes('这次的报告没有逐段证据')
+    && (await banner().locator('[data-upgrade-link]').innerText().catch(() => '')).trim() === '升级这张图', text)
+  check('……拿工作流现在的图去校验、按那条建议认', validated.includes('in,fetch,story,done'), validated.join(' | '))
+  check('……正式运行：说清升级之后要重新发布', text.includes('要重新发布'), text)
+  const href = await banner().locator('[data-upgrade-link]').getAttribute('href').catch(() => '')
+  check('跳转地址：编排页，带 upgrade=1', href === `/studio/${WF.id}?upgrade=1`, href)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.screenshot({ path: `${SHOTS}/runs-upgrade-banner-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  }
+  // 画布正锁着这张工作流（正式运行在跑）：不给入口，说清为什么
+  await page.evaluate((wf) => {
+    const s = window.__studio.getState()
+    window.__studio.setState({ workflow: wf, runPhase: 'running', trace: { ...s.trace, runClass: 'formal' } })
+  }, WF)
+  await page.waitForTimeout(200)
+  check('画布锁着这张工作流：横幅不给跳转，说清为什么', await banner().locator('[data-upgrade-link]').count() === 0
+    && (await banner().locator('[data-upgrade-banner-locked]').innerText().catch(() => '')).includes('正式运行进行中'))
+
+  await openEvidence(UP_LEGACY)
+  await banner().waitFor({ timeout: 5000 }).catch(() => {})
+  check('旧运行猜测（legacy_*）也给横幅', await banner().count() === 1)
+
+  const before = validated.length
+  await openEvidence(UP_OLD)
+  await page.waitForTimeout(500)
+  check('图已经是可追溯结构（校验不给建议，老后端同样不给）：没有横幅', await banner().count() === 0 && validated.length === before + 1)
+
+  await openEvidence(UP_NOWF)
+  await page.waitForTimeout(400)
+  check('没有工作流的运行（未保存的图）：没有横幅，也不去校验', await banner().count() === 0 && validated.length === before + 1)
+
+  await openEvidence(UP)
+  await banner().locator('[data-upgrade-link]').click()
+  await page.waitForURL((u) => u.pathname === `/studio/${WF.id}`, { timeout: 8000 }).catch(() => {})
+  await page.locator('#dock-problems [data-upgrade-preview="ready"]').waitFor({ timeout: 8000 }).catch(() => {})
+  check('跳到编排页：打开问题面板、升级预览摆着', await page.locator('#dock-problems [data-upgrade-preview="ready"]').count() === 1
+    && (await page.locator('#dock-problems [data-upgrade-change="type"]').innerText().catch(() => '')).includes('报告撰写'))
+  check('……请求的是这张工作流的图，地址摘掉了 upgrade', upgrades.length === 1 && upgrades[0]?.graph?.nodes?.length === 4
+    && new URL(page.url()).search === '', `${upgrades.length} 次 · ${page.url()}`)
+  check('……只出预览，没保存', !writes.some((w) => w.startsWith('PATCH ')))
+
+  for (const k of [...fakes.keys()]) {
+    if ([UP, UP_OLD, UP_LEGACY, UP_NOWF].some((id) => k.includes(id)) || k.includes(WF.id)) fakes.delete(k)
+  }
+  for (const k of ['GET /api/workflows', 'GET /api/conversations', 'POST /api/workflows/validate', 'POST /api/workflows/variables',
+    'POST /api/copilot/upgrade-evidence']) fakes.delete(k)
+})
+
 await section('收尾', async () => {
   // 提取模板之后会跳进画布：画布一打开就拿图去做校验、变量分析，这两个是带图的只读 POST
   // （同样被探针拦下，不落库）。赶上它们发出来之前就离开了画布的话就没有
-  check('只有伪造过的写请求', writes.every((w) => /\/continue$|\/cancel$|\/copilot\/from-run$|DELETE \/api\/runs\/fake0|^POST \/api\/runs$|^POST \/api\/workflows\/(validate|variables)$/.test(w)),
+  check('只有伪造过的写请求', writes.every((w) => /\/continue$|\/cancel$|\/copilot\/from-run$|DELETE \/api\/runs\/fake0|^POST \/api\/runs$|^POST \/api\/workflows\/(validate|variables)$|^POST \/api\/copilot\/upgrade-evidence$/.test(w)),
     writes.join(', '))
   check('没有未捕获的运行时错误', errors.length === 0, errors[0] ?? '')
 })

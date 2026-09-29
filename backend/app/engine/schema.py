@@ -148,7 +148,9 @@ class GraphSpec(BaseModel):
 
 
 class ValidationIssue(BaseModel):
-    level: Literal["error", "warning"] = "error"
+    #: info 是建议、不是问题（evidence.upgrade_available「可以升级为可追溯结构」）：不挡运行、不挡发布，
+    #: 自查、门禁、修复复核都只数 error
+    level: Literal["error", "warning", "info"] = "error"
     node_id: str | None = None
     edge_id: str | None = None
     message: str
@@ -682,6 +684,13 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
     _check_named_tools(spec, result)
     for issue in [*text_parse_issues(spec), *evidence_issues(spec)]:
         result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field, code=issue.code)
+
+    # 旧结构（报告是模型调用写的、问数据的答案是 agent 的原话…）能一键升级成可追溯的：只给一条建议，
+    # 画布上的快速修复据此打开升级预览。放在函数里导入：upgrade 反过来要用这里的 GraphSpec
+    from app.engine.upgrade import HINT_CODE, upgrade_hint
+
+    if hint := upgrade_hint(spec):
+        result.add(hint, level="info", code=HINT_CODE)
 
     # 孤儿节点
     for node in spec.nodes:

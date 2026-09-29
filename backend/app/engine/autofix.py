@@ -48,7 +48,7 @@ _ORDER = (
     "governed.no_contract", "contract.metrics_from_missing", "contract.metrics_from_invalid",
     "contract.report_from_missing", "contract.report_from_invalid", "governed.report_from_required",
     "governed.exit_text_source", "report.metrics_from_invalid",
-    "contract.required_missing", "contract.strict_off", "contract.claims_ignored", "report.claims_invalid",
+    "contract.required_missing", "contract.cells_undeclared", "contract.strict_off", "contract.claims_ignored", "report.claims_invalid",
     "governed.report_policy", "governed.judge_budget",
     "governed.caliber_agent_cite_fields", "governed.caliber_compute_input", "governed.agent_approval_never",
     "governed.default_approval_never", "governed.subgraph_unpinned", "governed.supervisor", "contract.not_object",
@@ -282,6 +282,21 @@ def _plan_judge_budget(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None)
                    options, _judge=base)
 
 
+def _plan_cells_undeclared(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """没有口径卡的受管图没写 cells：报告里的数要么直接引用查询单元格（写 cells: true），要么登记成口径卡
+    指标（交给 Copilot 加卡、改引用）。受管级别打开 cells 要作者显式决定，所以只给选项，不替人选。"""
+    if node is None:
+        return None
+    options = [
+        {"value": True, "label": "写 cells: true（保留单元格引用）",
+         "hint": "报告里的数直接点得开查询结果里的那一格，每一格都对照快照核对"},
+        {"value": HANDOFF, "label": "交给 Copilot：加一张口径卡，把数登记成指标",
+         "hint": "Copilot 改的同样只是预览，要人拿主意的会原样问你", "handoff": True},
+    ]
+    return _choice(f"「{node.title}」的报告只能引用查询单元格：写 cells: true，还是改成口径卡指标？",
+                   "contract.cells", options)
+
+
 def _plan_compute_input(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
     """G4：沙箱代码到底是在取数还是在算，只有作者知道。取数的标成 source；在算的交给 Copilot 把计算
     挪进口径卡——两样都不替人选，也不给建议。"""
@@ -458,6 +473,7 @@ _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str
     "governed.report_policy": _plan_report_policy,
     "report.claims_invalid": _plan_claims,
     "governed.judge_budget": _plan_judge_budget,
+    "contract.cells_undeclared": _plan_cells_undeclared,
     "governed.caliber_compute_input": _plan_compute_input,
     "governed.caliber_agent_cite_fields": _plan_cite_fields,
     "governed.caliber_agent_schema": _plan_agent_schema,
@@ -752,22 +768,48 @@ def _sig(issue: dict[str, Any]) -> tuple[Any, ...]:
     return head if issue.get("code") else (*head, issue.get("message"))
 
 
-def judge(before: list[Any], after: list[Any], *, target: tuple[str, str | None] | None = None) -> str | None:
-    """改完是不是更好了：不能冒出新的 error，error 不能变多；要修的那一处必须没了。
+#: 只有人能拍板、修复和 Copilot 都不许代做的 error（受管级别打开 cells）。改动让它冒出来不算更糟：它有自己的
+#: choice 修复，发布弹窗里一键选。拿它判作废的话，Copilot 能做的最好的一步（补上契约、把 cells 留给人问）
+#: 反而会被拒掉——用户就撞过这个死局。原来就有的照常计数
+HUMAN_CHOICE = frozenset({"contract.cells_undeclared"})
 
-    target 是 (问题编号, 节点 id)：修的是一条警告（strict）时，error 不增加、那条警告消失就算更好；
-    修的是 error，或者不指定 target（Copilot 兜底），error 必须变少。返回 None 表示更好，否则是原因。
+
+def _errors(before: list[Any], after: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """改动前后的 error；改完新冒出来的 HUMAN_CHOICE 不算进改完的那份。"""
+    b_err = [i for i in map(_as_dict, before) if i.get("level") == "error"]
+    seen = {_sig(i) for i in b_err}
+    a_err = [i for i in map(_as_dict, after) if i.get("level") == "error"
+             and not (i.get("code") in HUMAN_CHOICE and _sig(i) not in seen)]
+    return b_err, a_err
+
+
+def worse(before: list[Any], after: list[Any]) -> str | None:
+    """改完是不是更糟了：冒出新的 error，或者 error 变多了。返回原因，没有就是 None。
+
+    judge 在这之上还要求「修的那一处没了、错误变少」；一键升级（engine/upgrade.py）只要求不更糟——
+    升级换的是结构，本来就不一定消掉哪条 error。
     """
-    b = [_as_dict(i) for i in before]
-    a = [_as_dict(i) for i in after]
-    b_err = [i for i in b if i.get("level") == "error"]
-    a_err = [i for i in a if i.get("level") == "error"]
+    b_err, a_err = _errors(before, after)
     seen = {_sig(i) for i in b_err}
     new = [i for i in a_err if _sig(i) not in seen]
     if new:
         return f"改完会冒出新的问题：{new[0].get('message')}"
     if len(a_err) > len(b_err):
         return f"改完错误反而变多了（{len(b_err)} → {len(a_err)}）"
+    return None
+
+
+def judge(before: list[Any], after: list[Any], *, target: tuple[str, str | None] | None = None) -> str | None:
+    """改完是不是更好了：不能冒出新的 error，error 不能变多；要修的那一处必须没了。
+
+    target 是 (问题编号, 节点 id)：修的是一条警告（strict）时，error 不增加、那条警告消失就算更好；
+    修的是 error，或者不指定 target（Copilot 兜底），error 必须变少。返回 None 表示更好，否则是原因。
+    """
+    if why := worse(before, after):
+        return why
+    b = [_as_dict(i) for i in before]
+    a = [_as_dict(i) for i in after]
+    b_err, a_err = _errors(before, after)
     if target is not None:
         code, node_id = target
 
@@ -849,9 +891,10 @@ def _numbers(value: Any) -> list[str]:
     return [str(v).strip() for v in _as_list(value) if str(v).strip()]
 
 
-def _contract_loosened(name: str, prior: Any, contract: Any) -> list[str]:
+def _contract_loosened(name: str, prior: Any, contract: Any, *, cells_chosen: bool = False) -> list[str]:
     """出具契约里替作者放宽口子的改动：allow_numbers 多出来的数（白名单里的数不用引用也能过），
-    cells 从没开变成开（受管级别要作者显式声明，不由模型替人打开）。原来没有契约也一样查。"""
+    cells 从没开变成开（受管级别要作者显式声明，不由模型替人打开；cells_chosen 是人在 choice 里亲手选的，
+    不算）。原来没有契约也一样查。"""
     if not isinstance(contract, dict):
         return []
     prior = prior if isinstance(prior, dict) else {}
@@ -860,7 +903,7 @@ def _contract_loosened(name: str, prior: Any, contract: Any) -> list[str]:
     extra = [n for n in dict.fromkeys(_numbers(contract.get("allow_numbers"))) if n not in had]
     if extra:
         out.append(f"往「{name}」出具契约的 allow_numbers 里加了 {'、'.join(extra)}（不带出处也能放行的数）")
-    if contract.get("cells") is True and prior.get("cells") is not True:
+    if contract.get("cells") is True and prior.get("cells") is not True and not cells_chosen:
         out.append(f"替你打开了「{name}」出具契约的 cells（允许报告直接引用查询单元格），这要你自己决定")
     was, now = _claims_rank(prior.get("claims")), _claims_rank(contract.get("claims"))
     if was is not None and now is not None:
@@ -895,13 +938,15 @@ def _claims_rank(value: Any) -> tuple[int, int] | None:
 
 def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
                       ops: list[dict[str, Any]] | None = None, *,
-                      chosen: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset()) -> list[str]:
+                      chosen: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+                      retyped: set[tuple[str, str, str]] | frozenset[tuple[str, str, str]] = frozenset(),
+                      rewired: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset()) -> list[str]:
     """降低要求的改动，一条一句。空列表表示没有。确定性修复和 Copilot 兜底过的是同一道检查。
 
     禁止：
     - 删节点、删连线；用 add_node 覆盖已有的节点、把节点换成别的类型（等于删了重建）
     - 删掉或清空出具契约、删掉 required 里的指标、把 strict 改成 false；
-      往 allow_numbers 里加数、替人打开 cells
+      往 allow_numbers 里加数、替人打开 cells（chosen 里有 (出口 id, "contract.cells") 的是人在 choice 里亲手选的，不算）
     - 审批策略往宽里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行）、删掉写明的审批策略，
       把审批写成（或新加一个）「全部自动放行」；全图默认同理
     - 取消子工作流钉住的版本
@@ -911,6 +956,10 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
       (节点 id, 字段) 是人在 choice 里亲手选的，不算
     - 改发布级别——级别不在图里，修复接口也从不写工作流的 status，所以只可能以一个不认识的
       操作出现，按不认识的操作拒掉
+
+    一键升级（engine/upgrade.py）走同一道检查，只多两个由升级自己点名的例外：retyped 里的
+    (节点 id, 原类型, 新类型) 允许换类型（模型调用换成报告撰写，这是升级的核心）；rewired 里的
+    (source, target) 允许删掉那条连线（中间插了报告撰写节点、改接的那一条）。发布前修复不传，照旧全拦。
     """
     old, new = _nodes_of(before), _nodes_of(after)
     reasons: list[str] = []
@@ -932,14 +981,15 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     kept = {_edge_key(e) for e in after.get("edges") or [] if isinstance(e, dict)}
     reasons += [f"删了连线 {s} → {t}" for s, t, _ in
                 dict.fromkeys(_edge_key(e) for e in before.get("edges") or [] if isinstance(e, dict))
-                if (s, t, _) not in kept]
+                if (s, t, _) not in kept and (s, t) not in rewired]
     old_default = _approval((before.get("defaults") or {}).get("approval"))
     new_default = _approval((after.get("defaults") or {}).get("approval"))
     for nid, node in new.items():
         was = old.get(nid)
         cfg, prev = _cfg(node), _cfg(was) if was else {}
         name = _name(node)
-        if was is not None and was.get("type") != node.get("type"):
+        if was is not None and was.get("type") != node.get("type") \
+                and (nid, str(was.get("type")), str(node.get("type"))) not in retyped:
             from app.engine.schema import type_label
 
             reasons.append(f"把「{_name(was)}」从{_type_word(was.get('type'), type_label)}换成了"
@@ -952,7 +1002,7 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
                                       fallback=new_default):
             reasons.append(why)
         contract, prior = cfg.get("contract"), prev.get("contract")
-        reasons += _contract_loosened(name, prior, contract)
+        reasons += _contract_loosened(name, prior, contract, cells_chosen=(nid, "contract.cells") in chosen)
         if node.get("type") == "code" and cfg.get("evidence_role") == "source" \
                 and prev.get("evidence_role") != "source" and (nid, "evidence_role") not in chosen:
             reasons.append((f"替你把「{name}」标成了取数（evidence_role: source）" if was

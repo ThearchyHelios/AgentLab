@@ -1,7 +1,7 @@
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
   EvidenceAudit, EvidenceJudgeResult, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
-  RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow,
+  RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, ValidationIssue, VarIssue, Variable, Workflow,
   WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
@@ -786,6 +786,13 @@ export const api = {
     /** 跑完之后复核一次。干净的运行后端直接返回 verdict='ok'，不调模型 */
     review: (body: { run_id: string; question: string }) =>
       post<ReviewResult>('/copilot/review', body),
+    /**
+     * 一键升级为可追溯结构：先按确定的规则改写（llm 换成报告撰写、问数据的图插入报告节点……），
+     * assist 时再交给 Copilot 改语义层。level 是复核门禁用的发布级别（受管的图，新写出的报告节点按受管的要求配）。
+     * 只给预览，不改库。老后端没有这个接口（404），调用方按「不支持」处理
+     */
+    upgradeEvidence: (body: { graph: GraphSpec; assist?: boolean; level?: PublishLevel }, opts?: RequestOptions) =>
+      request<UpgradeResult>('/copilot/upgrade-evidence', { method: 'POST', body: JSON.stringify(body), ...opts }),
   },
 }
 

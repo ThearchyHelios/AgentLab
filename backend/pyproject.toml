@@ -38,7 +38,7 @@ dependencies = [
 # environment.yml 里已经带上了；单独装用 `pip install 'agentlab-backend[microvm]'`。
 microvm = ["microsandbox>=0.6"]
 # 测试：conda 环境默认不装，跑测试前 pip install 'agentlab-backend[dev]'
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.6"]
 # 文档解析。PDF 和 Word 的解析库加起来几十兆，只用纯文本的人不该为此
 # 付出安装时间——和 microvm、db 一样做成可选。HTML 用已在依赖里的 bs4。
 docs = ["pypdf>=5.0", "python-docx>=1.1", "python-pptx>=1.0", "openpyxl>=3.1"]

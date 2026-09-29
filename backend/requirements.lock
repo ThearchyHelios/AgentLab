@@ -56,6 +56,8 @@ docstring-parser==0.18.0
     # via anthropic
 et-xmlfile==2.0.0
     # via openpyxl
+execnet==2.1.2
+    # via pytest-xdist
 fastapi==0.141.1
     # via agentlab-backend (pyproject.toml)
 greenlet==3.5.5
@@ -210,7 +212,10 @@ pytest==9.1.1
     # via
     #   agentlab-backend (pyproject.toml)
     #   pytest-asyncio
+    #   pytest-xdist
 pytest-asyncio==1.4.0
+    # via agentlab-backend (pyproject.toml)
+pytest-xdist==3.8.0
     # via agentlab-backend (pyproject.toml)
 python-docx==1.2.0
     # via agentlab-backend (pyproject.toml)

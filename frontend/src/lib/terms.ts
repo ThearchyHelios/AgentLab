@@ -636,6 +636,52 @@ export const PUBLISH_FIX_TEXT = {
   whole: '整张工作流',
 } as const
 
+/**
+ * 一键升级为可追溯结构（问题面板的快速修复、记录页的横幅）。和发布前修复同一套规矩：
+ * 只出预览，人点「应用」才走现有的保存存成草稿；不发布
+ */
+export const UPGRADE_TEXT = {
+  advice: '可以升级为可追溯结构',
+  adviceHint: '报告会改由「报告撰写」节点来写，每个数字、表名都能点开看出处。先看预览，确认了才改',
+  action: '升级为可追溯结构（预览改动）',
+  previewing: '正在算升级要改哪些地方…',
+  assisting: 'Copilot 正在改语义层，可能要几十秒…',
+  title: (n: number) => `升级预览 · ${n} 处改动`,
+  noChange: '这张工作流没有需要升级的地方',
+  summary: (parts: string[]) => `合计：${parts.join('、')}`,
+  added: '新增节点',
+  edge: '连线',
+  rewired: '改接为',
+  addedEdge: '新连线',
+  removedEdge: '去掉的连线',
+  typeField: '节点类型',
+  notes: '需要你确认的',
+  assist: '再交给 Copilot 改语义层',
+  assistHint: '把只做加减乘除的代码节点改写成口径卡的表达式；不是纯算术的保留原样并给出警告。它改的同样只是预览；会调用模型，可能要几十秒',
+  assistWarnings: '保留没改的',
+  rejected: '没有采用',
+  afterOk: '升级后校验和门禁都没有新的错误',
+  afterLeft: (n: number) => `升级后还有 ${n} 处错误，应用之后在问题面板里接着改`,
+  apply: '应用并保存',
+  applyNote: '应用后存成新的草稿版本；不会发布，正式运行要重新发布之后才用上',
+  saveFailedHint: '升级已经放到画布上（可以撤销），还没存进草稿',
+  discardUnsavedHint: '只收起这份预览：已经放到画布上的升级留着，要退回就撤销；之后按平常的保存来存',
+  stale: '预览之后画布又改过了，这份预览对不上了：按现在的画布重新预览一次',
+  again: '重新预览',
+  applied: (version?: number) => `已升级为可追溯结构${version != null ? `，存为草稿 v${version}` : ''}`,
+  appliedDraft: '已升级为可追溯结构：画布还没存成工作流，保存之后才算数',
+  saveNote: '升级为可追溯结构',
+  undoLabel: '升级为可追溯结构',
+  unsupported: '这个后端还不支持一键升级：打开助手描述一遍，或者照提示手动改',
+  failed: '升级预览没算出来',
+  locked: (why: string) => `${why}。现在不能升级`,
+  runBanner: '这次的报告没有逐段证据',
+  runAction: '升级这张图',
+  runHint: '打开编排页，先看升级要改哪些地方；确认了才改，改的是草稿',
+  runFormal: '正式运行跑的是已发布的版本：升级之后要重新发布，下一次正式运行才用得上',
+  runLocked: (why: string) => `${why}。现在不能升级这张图`,
+} as const
+
 /** 证据的种类怎么叫：aria-label、面板标题、出处那一句 */
 export const EVIDENCE_KIND_LABEL: Record<string, string> = {
   metric: '口径卡指标',
