@@ -2,6 +2,27 @@
 # 一条命令把前后端都拉起来。Ctrl-C 一起退出。
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+用法：./scripts/dev.sh [--host]
+
+  --host   前端也在局域网上监听（同一网络里的手机、别的电脑能打开）。后端仍只听 127.0.0.1：
+           页面里的 /api 由前端开发服务器在本机转发，局域网里的设备不需要、也不该直连后端。
+           注意：AgentLab 没有登录，同一网络里打得开页面的人都能用它——跑工作流、花你配的
+           模型额度、读数据源、执行沙箱代码。只在信得过的网络里开。
+USAGE
+}
+
+# 参数先认完再干活：以前不读参数，--host 这类写了也被悄悄忽略
+WEB_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --host) WEB_ARGS+=(--host) ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "认不出的参数：$arg"; echo; usage; exit 2 ;;
+  esac
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_PORT="${AGENTLAB_PORT:-8000}"
 WEB_PORT="${AGENTLAB_WEB_PORT:-5273}"
@@ -70,11 +91,16 @@ done
 [ -n "$ready" ] || { echo "后端 30s 内没就绪（或 $API_PORT 上答话的不是 agentlab）"; exit 1; }
 
 echo "==> 前端 http://localhost:$WEB_PORT"
-(cd "$ROOT/frontend" && pnpm dev --port "$WEB_PORT") &
+(cd "$ROOT/frontend" && pnpm dev --port "$WEB_PORT" ${WEB_ARGS[@]+"${WEB_ARGS[@]}"}) &
 WEB_PID=$!
 
 echo
 echo "  界面   http://localhost:$WEB_PORT"
+if [ ${#WEB_ARGS[@]} -gt 0 ]; then
+  # 本机在局域网里的地址：macOS 取 en0 / en1，Linux 取 hostname -I 的第一个
+  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  echo "  局域网 http://${LAN_IP:-<本机 IP>}:$WEB_PORT   （没有登录：同一网络里打得开页面的人都能用它）"
+fi
 echo "  接口   http://127.0.0.1:$API_PORT/docs"
 echo
 wait
