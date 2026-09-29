@@ -30,6 +30,10 @@ const fxq = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-
 // 第三期：表名字段名（反引号里的、标记的、自动链接的）、可疑实体、核对不了的名字、逐字引文，
 // 以及没有契约的旧运行按数值猜的候选。文档和猜测都是后端真跑出来的（compose_doc / guess_sources）
 const fxe = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-entity.json`, 'utf8'))
+// 第四期：结论句裁判。文档由 compose_doc 真跑，候选句由 judge.prepare 真跑，判定是剧本（模拟裁判模型），
+// 经 judge 的 summarize / apply_judgement 写回：正式运行（节点里判好的）、探索运行（按需）、没开裁判的探索运行
+const fxj = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-judge.json`, 'utf8'))
+const JUDGE_SETS = [fxj.formal, fxj.explore, fxj.plain]
 /** 夹具里某段文字是哪个片段：检查按文字认片段，重新生成夹具时编号变了也不用改 */
 const segOf = (doc, text) => doc.blocks.flatMap((b) => b.units.flatMap((u) => u.segments)).find((s) => s.text === text)?.id
 
@@ -52,13 +56,60 @@ async function section(key, name, fn) {
 
 const browser = await chromium.launch({ executablePath: CHROME })
 
-/** 伪造证据相关的 GET；片段请求记账（缓存：同一个片段点两次只取一次） */
-async function routed(page) {
+/**
+ * 按需裁判的伪造答复：evidence.judged 的载荷形状（NOTES-A4 §8、E4-node 的 POST …/evidence/judge）。
+ * 夹具里按句子备好了答复的用夹具的；别的句子给一条「有依据」。正式运行回 409
+ */
+function judgeReply(set, body) {
+  if (set === fxj.formal) return { status: 409, json: { detail: '正式运行的裁判在节点内完成（claims: judge），判定随报告文档一起封存，不能再按需裁判', code: 'evidence_judge_formal' } }
+  const unit = body?.units?.[0]
+  const named = Object.entries(set.units).find(([, u]) => u === unit)?.[0]
+  if (named && set.judge?.[named]) return { json: set.judge[named] }
+  return { json: { report: { node_id: 'write', doc_artifact: set.doc_artifact }, verdicts: { [unit]: { status: 'supported',
+    rationale: '引用的证据支持这句话', judge: fxj.model, post_seal: true, used: [] } }, model: fxj.model, limits_hit: [], post_seal: true } }
+}
+
+/**
+ * 伪造证据相关的 GET；片段请求记账（缓存：同一个片段点两次只取一次）。四期：按需裁判的 POST 也在这里认
+ * （记进 hits 的 judge:<运行>:<句子>），别的非 GET 一律拦掉。judge 给了就用它答（改坏验证、触顶、出错）；
+ * segPatch 给了就改片段接口的答复（比如 on_demand 说运行还没封存）
+ */
+async function routed(page, { judge = null, segPatch = null } = {}) {
   const hits = []
+  const judged = new Set()
   await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
     const req = r.request()
     const url = new URL(req.url())
+    const jset = JUDGE_SETS.find((x) => url.pathname.includes(`/runs/${x.run_id}/`) || url.pathname.endsWith(`/runs/${x.run_id}`))
+    if (jset && req.method() === 'POST' && /\/evidence\/judge$/.test(url.pathname)) {
+      const body = req.postDataJSON()
+      hits.push(`judge:${jset.run_id}:${(body?.units ?? []).join(',')}:${body?.report ?? ''}`)
+      const reply = judge ? judge(jset, body) : judgeReply(jset, body)
+      if (reply.status == null || reply.status < 300) for (const u of body?.units ?? []) judged.add(`${jset.run_id}:${u}`)
+      return r.fulfill({ status: reply.status ?? 200, json: reply.json })
+    }
     if (req.method() !== 'GET') return r.abort()
+    // 四期的报告工件：问数据页的答案（Output → EvidenceField）按工件 id 取文档
+    const jart = JUDGE_SETS.find((x) => url.pathname === `/api/artifacts/${x.doc_artifact}`)
+    if (jart) return r.fulfill({ json: { id: jart.doc_artifact, content: jart.doc } })
+    if (jset) {
+      const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+      if (seg) {
+        const id = decodeURIComponent(seg[1])
+        hits.push(`j:${id}`)
+        // 判过之后片段接口按最新的 evidence.judged 叠上判定（封存后追加）：夹具里备着判过那一句的答复
+        const after = jset.segments_after && judged.has(`${jset.run_id}:${jset.units.bad}`) ? jset.segments_after : jset.segments
+        let body = structuredClone(after[id])
+        if (body && segPatch) body = segPatch(jset, body)
+        return body ? r.fulfill({ json: body })
+          : r.fulfill({ status: 404, json: { detail: '报告里没有这个片段', code: 'evidence_segment_not_found' } })
+      }
+      if (/\/evidence$/.test(url.pathname)) return r.fulfill({ json: jset.graph })
+      if (url.pathname.endsWith(`/runs/${jset.run_id}`)) {
+        hits.push(`run:${jset.run_id}`)
+        return r.fulfill({ json: { id: jset.run_id, run_class: jset.run_class, status: 'succeeded' } })
+      }
+    }
     const seg = url.pathname.match(/\/api\/runs\/([^/]+)\/evidence\/segments\/([^/]+)$/)
     // 按运行认夹具：第一期、第二期（查询链）、第三期（实体、引文）各有自己的片段
     const set = url.pathname.includes(`/runs/${fxq.run_id}/`) ? fxq : url.pathname.includes(`/runs/${fxe.run_id}/`) ? fxe : fx
@@ -83,14 +134,14 @@ async function routed(page) {
   return hits
 }
 
-async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null } = {}) {
+async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null, judge = null, segPatch = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width: w, height: h }, ...(reduced ? { reducedMotion: 'reduce' } : {}) })
   const page = await ctx.newPage()
   // 找不到元素时 8 秒就报，不等默认的 30 秒：改坏验证时一节里十几处都找不到
   page.setDefaultTimeout(8000)
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
-  const hits = await routed(page)
+  const hits = await routed(page, { judge, segPatch })
   // 预览页直接 import 第二期夹具（vite 把 JSON 当模块给）：要一份改过的文档时把那个模块换掉
   if (patchQuery) {
     await page.route((u) => new URL(u).pathname.endsWith('/run/__tests__/evidence-query.json'), (r) =>
@@ -1130,7 +1181,7 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
   check('「指标来自」只列上游的口径卡（下游那张不列）', opts.length === 1 && opts[0].includes('周报口径'), opts.join(' | '))
   const onViolation = await p.locator('[data-field="on_violation"] option').allInnerTexts()
   check('违规时的默认写明按运行类别', onViolation[0]?.includes('探索运行照常产出'), onViolation.join(' | '))
-  // 三期：结论句策略 claims（off / require_citation，judge 是四期的，不出现在选项里）和表名字段名核对 entities
+  // 结论句策略 claims（off / require_citation / judge，四期放开了 judge）和表名字段名核对 entities
   // 表名字段名核对收在「高级选项」里（很少要改），先展开
   await p.locator('button[aria-expanded]', { hasText: '高级选项' }).click().catch(() => {})
   await p.waitForTimeout(100)
@@ -1138,12 +1189,14 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
   check('检查器有结论句策略、表名字段名核对（高级选项里）两项', fields.includes('claims') && all.includes('entities')
     && !fields.includes('entities'), all.join(','))
   const claimVals = await p.locator('[data-field="claims"] option').evaluateAll((els) => els.map((e) => e.value))
-  check('结论句策略只有 off / require_citation，没有 judge', claimVals.join(',') === 'off,require_citation', claimVals.join(','))
+  check('结论句策略三档：off / require_citation / judge（四期放开了模型裁判）', claimVals.join(',') === 'off,require_citation,judge',
+    claimVals.join(','))
   const claimsLabel = await p.locator('[data-field="claims"] label').first().innerText().catch(() => '')
   check('结论句策略有中文标签（发布前修复的预览也用它）', /结论句/.test(claimsLabel) && !/claims/.test(claimsLabel), claimsLabel)
   const claimsHelp = await p.locator('[data-field="claims"]').innerText()
-  check('……说明写明「结论句裁判在后续版本支持」、受管级别要显式选', claimsHelp.includes('结论句裁判在后续版本支持')
-    && claimsHelp.includes('受管'), claimsHelp.replace(/\s+/g, ' ').slice(0, 160))
+  check('……说明写明模型逐句判断、受管级别要显式选并写金额上限，不再说「后续版本」', claimsHelp.includes('请模型逐句判断')
+    && claimsHelp.includes('受管') && claimsHelp.includes('金额上限') && !claimsHelp.includes('后续版本'),
+    claimsHelp.replace(/\s+/g, ' ').slice(0, 200))
   check('没写 claims 时显示默认的 off', await p.locator('[data-field="claims"] select').inputValue() === 'off'
     || (await p.locator('[data-field="claims"] select').evaluate((el) => el.options[el.selectedIndex]?.value)) === 'off')
   const entityVals = await p.locator('[data-field="entities"] option').evaluateAll((els) => els.map((e) => e.value))
@@ -1151,15 +1204,89 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
   await p.locator('[data-field="claims"] select').selectOption('require_citation')
   const cfgOf = () => p.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'write')?.data.config)
   check('选「要求挂依据」写进 config.claims', (await cfgOf())?.claims === 'require_citation')
-  // 手写或别处写进来的 judge：不能悄悄显示成 off，要照实写出来并说后续版本支持
+  // 手写或别处写进来的不认识的值：不能悄悄显示成 off，要照实写出来
   await p.evaluate(() => {
     const st = window.__studio.getState()
     const n = st.nodes.find((x) => x.id === 'write')
-    st.updateNode('write', { config: { ...n.data.config, claims: 'judge' } })
+    st.updateNode('write', { config: { ...n.data.config, claims: 'sometimes' } })
   })
   await p.waitForTimeout(150)
   const shown = await p.locator('[data-field="claims"] select').evaluate((el) => el.options[el.selectedIndex]?.textContent ?? '')
-  check('config 里写着 judge：下拉照实显示 judge 并说后续版本支持，不装成 off', shown.includes('judge') && shown.includes('后续版本'), shown)
+  check('config 里写着不认识的值：下拉照实显示，不装成 off', shown.includes('sometimes') && shown.includes('不认识'), shown)
+
+  // 四期：选模型裁判，高级选项里出现结论句裁判的子配置（裁判模型、三项上限各自能设不限、改写一次、证据不支持时）
+  check('没选模型裁判时不出结论句裁判那一组', await p.locator('[data-field="judge"]').count() === 0)
+  await p.locator('[data-field="claims"] select').selectOption('judge')
+  check('选「请模型逐句判断」写进 config.claims = judge', (await cfgOf())?.claims === 'judge')
+  await p.waitForSelector('[data-field="judge"]', { timeout: 3000 }).catch(() => {})
+  const jf = p.locator('[data-field="judge"]')
+  const jlabel = await jf.locator('label').first().innerText().catch(() => '')
+  check('高级选项里出现「结论句裁判」一组（中文标签）', await jf.count() === 1 && jlabel.includes('结论句裁判'), jlabel)
+  const keys = await jf.locator('[data-judge-key]').evaluateAll((els) => els.map((e) => e.getAttribute('data-judge-key')))
+  check('……裁判模型、三项上限、改写一次、证据不支持时', keys.join(',') === 'model,max_claims,max_cost_usd,timeout_s,rewrite_once,on_unsupported',
+    keys.join(','))
+  const labels = await jf.innerText()
+  // 细节只报缺了哪几个：整段文字里有沙箱的接入名（下拉的选项），日志常被贴进报告
+  const missingLabels = ['裁判模型', '最多判几句', '金额上限（美元）', '时长上限（秒）', '交回改写一次', '证据不支持时'].filter((t) => !labels.includes(t))
+  check('……每一项都有中文标签', !missingLabels.length, `缺：${missingLabels.join('、')}`)
+  check('……没写的上限说明跟着设置里的默认值', (await jf.locator('[data-judge-key="max_cost_usd"] [data-judge-note]').innerText()).includes('默认值'))
+  const cost = jf.locator('[data-judge-key="max_cost_usd"]')
+  await cost.locator('input[type="checkbox"]').click()
+  check('金额上限勾「不限」：写 null（不是删掉，也不是 0）', (await cfgOf())?.judge && (await cfgOf()).judge.max_cost_usd === null
+    && 'max_cost_usd' in (await cfgOf()).judge, JSON.stringify((await cfgOf())?.judge))
+  const off = await cost.locator('[data-judge-note]').innerText().catch(() => '')
+  check('……写明「不设上限，费用只受……约束」，数字框变灰', off.includes('不设上限') && off.includes('约束')
+    && await cost.locator('input[type="number"]').isDisabled(), off)
+  await cost.locator('input[type="checkbox"]').click()
+  check('勾掉「不限」：回到没写（跟着设置里的默认值）', !((await cfgOf())?.judge && 'max_cost_usd' in (await cfgOf()).judge),
+    JSON.stringify((await cfgOf())?.judge))
+  await cost.locator('input[type="number"]').fill('0.2')
+  await jf.locator('[data-judge-key="max_claims"] input[type="number"]').fill('20')
+  await jf.locator('[data-judge-key="timeout_s"] input[type="checkbox"]').click()
+  await jf.locator('[data-judge-key="rewrite_once"] input[type="checkbox"]').click()
+  await jf.locator('[data-judge-key="on_unsupported"] select').selectOption('withhold')
+  const j = (await cfgOf())?.judge ?? {}
+  check('写数就是数、时长不限写 null、改写一次写 true、不支持时写 withhold',
+    j.max_cost_usd === 0.2 && j.max_claims === 20 && j.timeout_s === null && j.rewrite_once === true && j.on_unsupported === 'withhold',
+    JSON.stringify(j))
+  const provFirst = () => jf.locator('[data-judge-key="model"] select').evaluate((el) => el.options[0]?.textContent ?? '').catch(() => '')
+  check('接入和模型都没写：接入留空那一项叫「跟随设置」', await provFirst() === '跟随设置' && await jf.locator('[data-judge-by-model]').count() === 0)
+  await jf.locator('[data-judge-key="model"] input').fill('judge-model-b')
+  check('裁判模型写进 judge.model', (await cfgOf())?.judge?.model === 'judge-model-b')
+  // 节点上只写了模型：节点这一级整组生效（judge_model_spec 不跨级拼），按模型名找接入——已经不是「跟随设置」
+  const pf = await provFirst()
+  check('只写了模型：接入留空那一项不再叫「跟随设置」，改叫「按模型名找接入」', pf === '按模型名找接入', pf)
+  const byModel = jf.locator('[data-judge-by-model]')
+  const byText = await byModel.innerText().catch(() => '')
+  // 说明里有沙箱的接入名：细节只报认没认出来，不打印原文
+  check('……写明按模型名找接入、认不出就去调默认接入，两项都没写才跟随设置', await byModel.getAttribute('data-judge-by-model').catch(() => '') === 'default'
+    && byText.includes('只填了模型') && byText.includes('默认接入') && byText.includes('接入和模型都没写时才跟随设置'),
+    `data-judge-by-model=${await byModel.getAttribute('data-judge-by-model').catch(() => '（没有）')}`)
+  await jf.locator('[data-judge-key="model"] input').fill('')
+  check('……模型清空：又回到「跟随设置」，说明也收起', await provFirst() === '跟随设置' && await byModel.count() === 0
+    && !('model' in ((await cfgOf())?.judge ?? {})))
+  await jf.locator('[data-judge-key="model"] input').fill('judge-model-b')
+  const previews = await p.evaluate(async () => {
+    const url = performance.getEntriesByType('resource').map((e) => e.name)
+      .find((n) => { try { return new URL(n).pathname === '/src/canvas/issues.ts' } catch { return false } })
+    const m = await import(url ?? '/src/canvas/issues.ts')
+    return [m.fixFieldLabel('judge.max_cost_usd', 'report'), m.fixValueText(null, 'judge.max_cost_usd'),
+            m.fixValueText(0.05, 'judge.max_cost_usd'), (m.fixValueLines({ max_cost_usd: null, model: 'x' }, 'judge') ?? []).join('；'),
+            m.fixValueText('withhold', 'judge.on_unsupported'), m.fixFieldLabel('defaults.model', 'report')]
+  }).catch((e) => [String(e)])
+  check('发布前修复的预览：judge.max_cost_usd 写成「结论句裁判 · 金额上限（美元）」', previews[0] === '结论句裁判 · 金额上限（美元）', previews[0])
+  check('……null 写「不限」（没写才是「（空）」）、金额带 $', previews[1] === '不限' && previews[2] === '$0.05', JSON.stringify(previews.slice(1, 3)))
+  check('……补预算按整份 judge 记时一键一行', previews[3] === '裁判模型：x；金额上限（美元）：不限', previews[3])
+  check('……证据不支持时写选项文字', previews[4] === '不予出具', previews[4])
+  check('……别处的 model 不借用裁判的叫法', previews[5] === '全图默认 · model', previews[5])
+  if (SHOTS) {
+    await jf.scrollIntoViewIfNeeded()
+    for (const theme of ['dark', 'light']) {
+      await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await p.waitForTimeout(250)
+      await p.screenshot({ path: `${SHOTS}/evidence4-inspector-judge-${theme}.png` })
+    }
+  }
   const fixLabel = await p.evaluate(async () => {
     // 按页面自己加载时的地址 import：改过的模块地址带 ?t=，直接写 /src/… 会拿到另一份实例
     const url = performance.getEntriesByType('resource').map((e) => e.name)
@@ -1584,6 +1711,401 @@ await section('guess', '旧运行按数值猜的候选：默认折叠，展开�
     await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
     await toggle.click()
   }
+})
+
+// ---------------------------------------------------------------------------
+// 第四期：结论句裁判
+// ---------------------------------------------------------------------------
+
+const J = '#evidence-judge'
+const JX = '#evidence-judge-explore'
+const JP = '#evidence-judge-plain'
+const badge = (pg, sel, unit) => pg.locator(`${sel} [data-ev-claim="${unit}"]`)
+/** 令牌算出来的颜色（借查询步骤那节的 tokenColor 探针），和徽标的计算色比 */
+const colorOf = (pg, token) => tokenColor(pg, 'color', `var(${token})`)
+const activeKey = (pg) => pg.evaluate(() => document.activeElement?.getAttribute('data-seg')
+  ?? (document.activeElement?.getAttribute('data-ev-claim') ? `claim:${document.activeElement.getAttribute('data-ev-claim')}` : null)
+  ?? (document.activeElement?.closest('[data-evidence-panel]') ? 'panel' : document.activeElement?.tagName ?? null))
+
+await section('judge', '四期：结论句的句末徽标——四通道、不用确定性的绿、整句不画线、n / N 也跳到证据不支持的句子', async () => {
+  const u = fxj.formal.units
+  const look = await page.evaluate(({ sel, units }) => Object.fromEntries(Object.entries(units).map(([k, id]) => {
+    const el = document.querySelector(`${sel} [data-ev-claim="${id}"]`)
+    if (!el) return [k, null]
+    const cs = getComputedStyle(el)
+    return [k, { verdict: el.getAttribute('data-ev-verdict'), glyph: el.textContent, color: cs.color, tag: el.tagName,
+                 type: el.getAttribute('type'), label: el.getAttribute('aria-label'), deco: cs.textDecorationLine,
+                 align: cs.verticalAlign }]
+  })), { sel: J, units: u })
+  check('有判定的结论句句末都挂徽标（有依据、证据不支持、部分有依据、未裁判）',
+    look.ok?.verdict === 'supported' && look.bad?.verdict === 'unsupported' && look.partial?.verdict === 'partial'
+    && look.limit?.verdict === 'unjudged', JSON.stringify(Object.fromEntries(Object.entries(look).map(([k, v]) => [k, v?.verdict]))))
+  check('判成「不是结论句」的不挂徽标', look.not === null)
+  check('字形：◆ 有依据、◇ 部分、! 不支持、? 未裁判', [look.ok, look.partial, look.bad, look.limit].map((x) => x?.glyph).join('') === '◆◇!?',
+    [look.ok, look.partial, look.bad, look.limit].map((x) => x?.glyph).join(''))
+  const [accent, waiting, failed, dim, done] = await Promise.all(['--accent', '--st-waiting', '--st-failed', '--text-dim', '--st-done']
+    .map((t) => colorOf(page, t)))
+  check('颜色令牌：有依据 --accent、部分 --st-waiting、不支持 --st-failed、未裁判 --text-dim',
+    look.ok?.color === accent && look.partial?.color === waiting && look.bad?.color === failed && look.limit?.color === dim,
+    JSON.stringify({ got: [look.ok?.color, look.partial?.color, look.bad?.color, look.limit?.color], want: [accent, waiting, failed, dim] }))
+  check('概率性的判定一个都不用确定性的绿', [look.ok, look.partial, look.bad, look.limit].every((x) => x && x.color !== done), done)
+  check('徽标是原生 button type=button、上标、不画线', [look.ok, look.bad].every((x) => x?.tag === 'BUTTON' && x.type === 'button'
+    && x.align === 'super' && x.deco === 'none'), JSON.stringify(look.ok))
+  check('aria-label 写全：句子和判定', look.bad?.label === '结论句「增长主要来自新客首单，老客复购持平。」，模型判断：证据不支持', look.bad?.label)
+  check('……未裁判（到上限）的说「已到上限」', look.limit?.label?.endsWith('未裁判：已到上限'), look.limit?.label)
+  const titles = await page.evaluate(({ a, b, c }) => [document.querySelector(a)?.getAttribute('title') ?? '',
+    document.querySelector(b)?.getAttribute('title') ?? '', document.querySelector(c)?.getAttribute('title') ?? ''],
+  { a: `${J} [data-ev-claim="${u.bad}"]`, b: `${JX} [data-ev-claim="${fxj.explore.units.ok}"]`, c: `${J} [data-ev-claim="${u.limit}"]` })
+  check('悬停说明：模型判过的写明谁判的、非确定', titles[0] === `模型判断：证据不支持（${fxj.model} · 非确定）`, titles[0])
+  check('……还没有模型判过的（探索运行按需）不说谁判的，只说还没判', !titles[1].includes('非确定') && titles[1].startsWith('未裁判'),
+    titles[1])
+  check('……到上限没判的（记着裁判模型）也不写成「（模型 · 非确定）」，说已到上限、这句没判',
+    titles[2].startsWith('未裁判：已到上限') && !titles[2].includes('非确定') && !titles[2].includes(fxj.model), titles[2])
+  const shade = await page.evaluate(({ sel, bad, ok }) => {
+    const box = document.querySelector(`${sel} [data-ev-claim-shade="${bad}"]`)
+    const other = document.querySelector(`${sel} [data-ev-claim-shade="${ok}"]`)
+    const probe = document.createElement('span')
+    probe.style.background = 'var(--st-failed-soft)'
+    document.body.appendChild(probe)
+    const soft = getComputedStyle(probe).backgroundColor
+    probe.remove()
+    if (!box) return { found: false }
+    const texts = [...box.querySelectorAll('span')].map((el) => getComputedStyle(el).textDecorationLine)
+    return { found: true, bg: getComputedStyle(box).backgroundColor, soft, deco: getComputedStyle(box).textDecorationLine,
+             texts, other: !!other, text: box.textContent }
+  }, { sel: J, bad: u.bad, ok: u.ok })
+  check('证据不支持的整句铺浅底（--st-failed-soft）', shade.found && shade.bg === shade.soft && shade.bg !== 'rgba(0, 0, 0, 0)',
+    JSON.stringify(shade))
+  check('……只有不支持的那句铺底', shade.found && !shade.other)
+  check('整句的文字不画下划线（浅底里的字、别的结论句的字都没有线）', shade.found && shade.deco === 'none'
+    && shade.texts.every((d) => d === 'none'), JSON.stringify(shade.texts))
+  const plainText = await page.evaluate(({ sel }) => {
+    const b = document.querySelector(`${sel} [data-ev-claim]`)
+    const sentence = b?.previousElementSibling
+    return sentence ? getComputedStyle(sentence).textDecorationLine : ''
+  }, { sel: J })
+  check('……有依据的那句同样不画线（只有数字自己的线）', plainText === 'none' || plainText === '', plainText)
+
+  // 键盘：徽标在 roving 顺序里，句尾就是它；n / N 跳到证据不支持、部分有依据的句子
+  const stops = await page.locator(`${J} [data-seg][tabindex="0"], ${J} [data-ev-claim][tabindex="0"]`).count()
+  check('整份报告仍只有一个 Tab 位（徽标也在 roving 里）', stops === 1, String(stops))
+  const firstNum = fxj.formal.doc.blocks.flatMap((b) => b.units).find((x) => x.id === u.ok).segments.filter((s) => s.kind === 'number').at(-1).id
+  await page.locator(`${J} [data-seg="${firstNum}"]`).focus()
+  await page.keyboard.press('ArrowRight')
+  check('→ 从句子最后一个片段走到句末徽标', await activeKey(page) === `claim:${u.ok}`, await activeKey(page))
+  const jumps = []
+  for (const key of ['n', 'n', 'N']) {
+    await page.keyboard.press(key)
+    jumps.push(await activeKey(page))
+  }
+  check('n 跳到证据不支持、再到部分有依据的句子，N 回来', jumps.join(',') === `claim:${u.bad},claim:${u.partial},claim:${u.bad}`, jumps.join(','))
+  check('只是走动不打开面板', await panel(page).count() === 0)
+  await page.keyboard.press('Enter')
+  await page.waitForSelector('[data-evidence-panel] [data-ev-judge]', { timeout: 4000 })
+  check('回车打开这一句的「模型的解释」', (await panel(page).locator('[data-ev-judge]').getAttribute('data-ev-judge')) === 'unsupported')
+  check('徽标标着展开了面板', await badge(page, J, u.bad).getAttribute('aria-expanded') === 'true')
+  check('读屏从 live region 听到这一句的判定', (await page.locator(`${J} [aria-live="polite"]`).innerText()).includes('模型判断：证据不支持'))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('Esc 关掉，焦点回到徽标', await panel(page).count() === 0 && await activeKey(page) === `claim:${u.bad}`, await activeKey(page))
+  const tally = await page.locator(`${J} [data-evidence-claims]`).innerText().catch(() => '')
+  check('证据条接着数结论句，和数字那一段同一种说法', tally.includes('结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）'), tally)
+  const summary = await page.locator(`${J} [data-evidence-summary]`).innerText()
+  check('读屏摘要也说结论句（写明是模型判断）', summary.includes('结论 4 句') && summary.includes('模型判断'), summary)
+  check('对照：一期的报告（没有判定）一个徽标都不挂', await page.locator(`${wide} [data-ev-claim], ${wide} [data-ev-claim-shade]`).count() === 0)
+})
+
+await section('j-panel', '四期：面板里「模型的解释」、「请模型判断这句」只在探索运行没判过时出现、触顶、封存后追加', async () => {
+  const r = await open('/ui-harness.html?evidence=1')
+  const pg = r.page
+  const p = pg.locator('[data-evidence-panel]')
+  const u = fxj.formal.units
+  await badge(pg, J, u.bad).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge="unsupported"]')
+  const chip = await p.locator('[data-ev-judge-badge]').innerText().catch(() => '')
+  check('带「模型判断 · 模型名 · 非确定」徽标', chip.trim() === `模型判断 · ${fxj.model} · 非确定`, chip)
+  const why = await p.locator('[data-ev-rationale]').evaluate((el) => ({ text: el.textContent, style: getComputedStyle(el).fontStyle }))
+    .catch(() => null)
+  check('理由用斜体', why?.style === 'italic' && why.text.includes('看不出新客、老客'), JSON.stringify(why))
+  const head = await p.locator('header [data-ev-badge]').evaluate((el) => ({ code: el.getAttribute('data-ev-badge'),
+    style: getComputedStyle(el).borderTopStyle, text: el.textContent })).catch(() => null)
+  check('面板标题的徽标：证据不支持、虚线框（概率性）', head?.code === 'unsupported' && head.style === 'dashed', JSON.stringify(head))
+  check('正式运行节点里判的：不写「封存后追加」，写明随报告封存', await p.locator('[data-ev-post-seal]').count() === 0
+    && (await p.locator('[data-ev-judge-sealed]').innerText().catch(() => '')).includes('和报告一起封存'))
+  check('正式运行：没有「请模型判断这句」', await p.locator('[data-ev-judge-ask]').count() === 0)
+  const cites = await p.locator('[data-ev-cites]').innerText().catch(() => '')
+  check('整句的面板列出挂的依据', cites.includes('Q1') && cites.includes('db_query__shop'), cites)
+  await badge(pg, J, u.limit).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-limit]')
+  const lim = await p.locator('[data-ev-judge-limit]').innerText()
+  check('到上限没判：写明「已到上限」和是哪个上限', lim.includes('已到上限') && lim.includes('这份报告的裁判金额上限 $0.05'), lim)
+  check('……写明怎么调（正式运行：报告撰写节点的结论句裁判，可以设成不限）', lim.includes('报告撰写节点') && lim.includes('设成不限'), lim)
+  check('……正式运行也不给按钮', await p.locator('[data-ev-judge-ask]').count() === 0)
+  // 到上限没判的句子也记着裁判模型（judge 字段），但模型没看过它：不能画成「模型判断 · 模型名 · 非确定」
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-seal-state="done"]', { timeout: 3000 }).catch(() => {})
+  check('……模型没看过这句：不挂「模型判断 · 模型名 · 非确定」', await p.locator('[data-ev-judge-badge]').count() === 0)
+  check('……也不说这条判断「和报告一起封存」', await p.locator('[data-ev-judge-sealed]').count() === 0)
+  const limSeal = await p.locator('[data-ev-seal]').innerText().catch(() => '')
+  check('……封存那一节只说报告文档封存了', limSeal.includes('报告文档已封存') && !limSeal.includes('这条判断随报告一起封存'), limSeal)
+  const limModel = await p.locator('[data-ev-judge-model]').innerText().catch(() => '')
+  check('……中性地说一句裁判模型是谁、没判这句', limModel.includes(fxj.model) && limModel.includes('没有判这句'), limModel)
+  // 点开结论句里的一个数字：片段面板里也有「模型的解释」（只对结论句）
+  const num = fxj.formal.doc.blocks.flatMap((b) => b.units).find((x) => x.id === u.ok).segments.find((s) => s.kind === 'number').id
+  await pg.locator(`${J} [data-seg="${num}"]`).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge="supported"]')
+  check('结论句里的片段：面板里有这一句的模型的解释', (await p.locator('[data-ev-verdict]').innerText()).includes('模型判断：有依据'))
+  // 一期的报告：没有判定、没开裁判、不知道运行类别也取不到——不画这一节
+  await pg.locator(`${wide} [data-seg="s8"]`).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-substituted]')
+  await pg.waitForTimeout(300)
+  check('对照：没有判定的老报告不画「模型的解释」', await p.locator('[data-ev-judge]').count() === 0)
+  await pg.keyboard.press('Escape')
+
+  // 探索运行、开了裁判（按需）：还没判过的句子给按钮
+  const x = fxj.explore.units
+  await badge(pg, JX, x.bad).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-ask]')
+  check('探索运行、还没判过：有「请模型判断这句」', (await p.locator('[data-ev-judge-ask]').innerText()).includes('请模型判断这句'))
+  check('……还没判过：没有模型徽标（还没有模型判过）', await p.locator('[data-ev-judge-badge]').count() === 0)
+  await p.locator('[data-ev-judge-ask]').click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge="unsupported"]').catch(() => {})
+  const sent = r.hits.filter((h) => h.startsWith(`judge:${fxj.explore.run_id}:`))
+  check('请求体带着句子和报告节点', sent.length === 1 && sent[0].endsWith(`:${x.bad}:write`), sent.join(' | '))
+  check('判完：写「封存后追加」', (await p.locator('[data-ev-post-seal]').innerText().catch(() => '')).trim() === '封存后追加')
+  check('……答复没带话（判成了）：不多写一行', await p.locator('[data-ev-judge-message]').count() === 0)
+  check('……封存那一节也写明封存后追加（报告文档仍是封存的）', (await p.locator('[data-ev-seal-late]').innerText().catch(() => '')).includes('封存后追加')
+    && (await p.locator('[data-ev-seal]').innerText()).includes('报告文档已封存'))
+  check('……判过了就不再给按钮', await p.locator('[data-ev-judge-ask]').count() === 0)
+  const after = await badge(pg, JX, x.bad).evaluate((el) => ({ v: el.getAttribute('data-ev-verdict'), late: el.hasAttribute('data-ev-post-seal') }))
+  check('正文的句末徽标跟着变：证据不支持、标着封存后追加', after.v === 'unsupported' && after.late, JSON.stringify(after))
+  check('同一份报告在窄栏里的那份也跟着变（按运行和报告记）',
+    await badge(pg, '#evidence-judge-explore-narrow', x.bad).getAttribute('data-ev-verdict') === 'unsupported')
+  check('证据条的结论句计数跟着变', (await pg.locator(`${JX} [data-evidence-claims]`).innerText()).includes('不支持 1'))
+  await badge(pg, JX, x.bad).click()
+  await pg.waitForTimeout(100)
+  await badge(pg, JX, x.bad).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge="unsupported"]')
+  check('同一句再点开：直接用已有的判定，不再请求', r.hits.filter((h) => h.startsWith(`judge:${fxj.explore.run_id}:`)).length === 1)
+  // 触顶：不报错，说明「已到上限」和怎么调（每次点击的上限），还能再点一次
+  await badge(pg, JX, x.limit).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-ask]')
+  await p.locator('[data-ev-judge-ask]').click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-limit]')
+  const top = await p.locator('[data-ev-judge-limit]').innerText()
+  check('按需裁判触顶：写「已到上限」和这次点击的上限', top.includes('已到上限') && top.includes('这次点击的裁判金额上限 $0.01'), top)
+  check('……写明怎么调：设置里「每次点击的金额上限」、可以设成不限', top.includes('每次点击的金额上限') && top.includes('设成不限')
+    && await p.locator('[data-ev-judge-settings]').count() === 1, top)
+  check('……不是报错', await p.locator('[data-ev-judge-error]').count() === 0)
+  check('……还能再请模型判断一次', (await p.locator('[data-ev-judge-ask]').innerText().catch(() => '')).includes('再请模型判断一次'))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await pg.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await badge(pg, JX, x.bad).click()
+      await pg.waitForTimeout(100)
+      if (await p.count() === 0) await badge(pg, JX, x.bad).click()
+      await pg.waitForSelector('[data-evidence-panel] [data-ev-judge="unsupported"]')
+      await pg.waitForTimeout(250)
+      await pg.screenshot({ path: `${SHOTS}/evidence4-explore-judged-${theme}.png` })
+      await badge(pg, J, u.limit).click()
+      await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-limit]')
+      await pg.waitForTimeout(250)
+      await pg.screenshot({ path: `${SHOTS}/evidence4-formal-limit-${theme}.png` })
+      await pg.keyboard.press('Escape')
+    }
+    await pg.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+
+  // 没开裁判的探索运行：文档里不记运行类别，面板按运行 id 取一次；结论句照样能请模型判断
+  const pu = fxj.plain.doc.blocks.flatMap((b) => b.units).find((x2) => x2.id === 'u3')
+  const pnum = pu.segments.find((s) => s.kind === 'number').id
+  await pg.locator(`${JP} [data-seg="${pnum}"]`).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-judge-ask]').catch(() => {})
+  check('没开裁判的报告：按运行 id 认出是探索运行，给按钮', r.hits.includes(`run:${fxj.plain.run_id}`)
+    && await p.locator('[data-ev-judge-ask]').count() === 1)
+  check('……判之前正文没有徽标', await pg.locator(`${JP} [data-ev-claim]`).count() === 0)
+  await p.locator('[data-ev-judge-ask]').click().catch(() => {})
+  await pg.waitForSelector(`${JP} [data-ev-claim="u3"]`).catch(() => {})
+  check('……判完正文挂上徽标（封存后追加）', await badge(pg, JP, 'u3').getAttribute('data-ev-verdict') === 'supported'
+    && await badge(pg, JP, 'u3').getAttribute('data-ev-post-seal') === '')
+  const ptally = await pg.locator(`${JP} [data-evidence-claims]`).innerText().catch(() => '')
+  check('……证据条多出结论句：挂了依据没判的算未裁判、没挂的算无证据', ptally.includes('结论 5 句（支持 1 · 未裁判 3 · 无证据 1）'), ptally)
+  check('没有运行时报错（裁判面板）', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
+
+  // 片段接口说暂时判不了（运行还没跑完封存）：不给按钮，照原话说为什么
+  const un = await open('/ui-harness.html?evidence=1', { segPatch: (set, body) => (set === fxj.explore
+    ? { ...body, unit: { ...body.unit, on_demand: { available: false, reason: 'unsealed', message: '运行还没跑完封存，跑完再请模型判断' } } } : body) })
+  const tnum = fxj.explore.doc.blocks.flatMap((b) => b.units).find((x2) => x2.id === x.ok).segments.find((s) => s.kind === 'number').id
+  await un.page.locator(`${JX} [data-seg="${tnum}"]`).click()
+  await un.page.waitForSelector('[data-evidence-panel] [data-ev-judge]')
+  await un.page.waitForTimeout(300)
+  check('接口说运行还没封存：不给按钮，照原话说', await un.page.locator('[data-ev-judge-ask]').count() === 0
+    && (await un.page.locator('[data-ev-judge-blocked]').innerText()).includes('跑完再请模型判断'))
+  await un.ctx.close()
+  // 接口 409（正式运行、封存被改过）：不白屏，照后端原话说
+  const e409 = await open('/ui-harness.html?evidence=1', { judge: () => ({ status: 409, json: { detail: '封存核对没通过：不再请模型判断', code: 'evidence_seal_broken' } }) })
+  await badge(e409.page, JX, x.bad).click()
+  await e409.page.locator('[data-ev-judge-ask]').click()
+  await e409.page.waitForSelector('[data-evidence-panel] [data-ev-judge-error]')
+  check('按需裁判回 409：照后端原话说，不白屏', (await e409.page.locator('[data-ev-judge-error]').innerText()).includes('封存核对没通过'))
+  check('……徽标还是未裁判', await badge(e409.page, JX, x.bad).getAttribute('data-ev-verdict') === 'unjudged')
+  await e409.ctx.close()
+  // 答复里的那句话（message）：判定照样交回来，但运行已经接着跑了、没记进运行记录——得照原话写出来，
+  // 不能只挂一枚「封存后追加」让人以为记进去了。触顶的那句已经由上限那一框说了，不重复
+  const lostText = '运行已经接着跑了，这次的判定没有记进运行记录（只在这里看得到，刷新就没了）；等它跑完封存，再请模型判断'
+  const lost = await open('/ui-harness.html?evidence=1', { judge: (set, body) => {
+    const unit = body?.units?.[0]
+    if (set === fxj.explore && unit === x.limit) {
+      return { json: { ...fxj.explore.judge.limit, message: '已到上限（这次点击的裁判金额上限 $0.01）：1 句没判，记为未裁判；已判的保留' } }
+    }
+    return { json: { report: { node_id: 'write', doc_artifact: set.doc_artifact }, model: fxj.model, limits_hit: [], post_seal: true,
+      message: lostText, event: null, calls: 1,
+      verdicts: { [unit]: { status: 'supported', rationale: '引用的证据支持这句话', judge: fxj.model, post_seal: true, used: [] } } } }
+  } })
+  const lp = lost.page.locator('[data-evidence-panel]')
+  await badge(lost.page, JX, x.ok).click()
+  await lp.locator('[data-ev-judge-ask]').click().catch(() => {})
+  await lost.page.waitForSelector('[data-evidence-panel] [data-ev-judge="supported"]').catch(() => {})
+  const lostMsg = await lp.locator('[data-ev-judge-message]').innerText().catch(() => '')
+  check('答复带着「没有记进运行记录」：照原话写在判定下面', lostMsg.includes('没有记进运行记录') && lostMsg.includes('刷新就没了'), lostMsg || '（没写）')
+  check('……判定照样显示（有依据）', (await lp.locator('[data-ev-verdict]').innerText().catch(() => '')).includes('模型判断：有依据'))
+  await badge(lost.page, JX, x.limit).click()
+  await lp.locator('[data-ev-judge-ask]').click().catch(() => {})
+  await lost.page.waitForSelector('[data-evidence-panel] [data-ev-judge-limit]').catch(() => {})
+  check('触顶那句话已经由上限那一框说了：不再另写一遍', await lp.locator('[data-ev-judge-limit]').count() === 1
+    && await lp.locator('[data-ev-judge-message]').count() === 0)
+  check('没有运行时报错（答复里的那句话）', lost.errors.length === 0, lost.errors.join(' | '))
+  await lost.ctx.close()
+})
+
+await section('j-narrow', '四期在 360px：徽标和「模型的解释」栏内展开不横向滚动；减少动效', async () => {
+  const narrow = '#evidence-judge-narrow'
+  const overflow = () => page.evaluate((sel) => {
+    const el = document.querySelector(sel)
+    return { sw: el.scrollWidth, cw: el.clientWidth, w: el.getBoundingClientRect().width }
+  }, narrow)
+  const before = await overflow()
+  await badge(page, narrow, fxj.formal.units.bad).click()
+  await page.waitForSelector(`${narrow} [data-evidence-panel="inline"] [data-ev-judge]`)
+  const after = await overflow()
+  check('窄栏里徽标照样挂在句末', await page.locator(`${narrow} [data-ev-claim]`).count() === 4)
+  check('窄栏里没有横向滚动（面板打开前后）', Math.round(before.w) === 360 && before.sw <= before.cw && after.sw <= after.cw,
+    JSON.stringify({ before, after }))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator(narrow).screenshot({ path: `${SHOTS}/evidence4-360-inline-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await page.locator(`${narrow} [data-evidence-panel] button`, { hasText: '回到正文' }).click()
+  await page.waitForTimeout(150)
+  const small = await open('/ui-harness.html?evidence=1', { w: 360, h: 780 })
+  const scroll = () => small.page.evaluate(() => ({ sw: document.documentElement.scrollWidth, vw: innerWidth }))
+  const a = await scroll()
+  await badge(small.page, J, fxj.formal.units.bad).click()
+  await small.page.waitForSelector('[data-evidence-panel] [data-ev-judge]')
+  const b = await scroll()
+  check('360px 宽的屏幕：整句的面板从底部抽出、整页没有横向滚动',
+    await small.page.locator('[data-evidence-panel]').getAttribute('data-evidence-panel') === 'drawer' && a.sw <= a.vw && b.sw <= b.vw,
+    JSON.stringify({ a, b }))
+  await small.ctx.close()
+  const r = await open('/ui-harness.html?evidence=1', { reduced: true })
+  await badge(r.page, J, fxj.formal.units.bad).click()
+  await r.page.waitForSelector('[data-evidence-panel] [data-ev-judge]').catch(() => {})
+  const still = await r.page.evaluate(() => {
+    const p = document.querySelector('[data-evidence-panel]')
+    return { n: p ? p.getAnimations({ subtree: true })
+      .filter((a2) => !(a2 instanceof CSSTransition && Number(a2.effect?.getTiming().duration) <= 0.01)).length : -1,
+             name: p ? getComputedStyle(p).animationName : '' }
+  })
+  check('减少动效时整句的面板没有任何动画', still.n === 0 && still.name === 'none', JSON.stringify(still))
+  await r.ctx.close()
+})
+
+await section('j-banner', '四期：出具横幅多一段「结论 N 句（支持 a · 无证据 b）」', async () => {
+  const at = (key) => page.locator(`#issuance-claims [data-issuance-case="${key}"]`)
+  const judged = await at('judged').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('结论句那一段：和数字那一段同一种说法', judged.includes('3 个数字都有出处') && judged.includes('结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）'), judged)
+  check('有证据不支持的结论句：给「定位下一处」', await at('judged').locator('[data-evidence-next]').count() === 1)
+  await page.evaluate(() => { window.__claimsNext = 0 })
+  await at('judged').locator('[data-evidence-next]').click()
+  check('……点了就去找下一处', await page.evaluate(() => window.__claimsNext) === 1)
+  const cited = await at('cited').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('方案的例子：结论 4 句（支持 3 · 无证据 1）', cited.includes('结论 4 句（支持 3 · 无证据 1）'), cited)
+  check('……没挂依据的算进「无证据」，不再另起「没挂依据的结论句」', await at('cited').locator('[data-evidence-line-claims]').count() === 0)
+  const all = at('all').locator('[data-evidence-claims]')
+  const [color, done] = [await all.evaluate((el) => getComputedStyle(el).color).catch(() => ''), await colorOf(page, '--st-done')]
+  check('全都支持：不给「定位下一处」，也不用确定性的绿', await at('all').locator('[data-evidence-next]').count() === 0 && !!color && color !== done,
+    `${color} / ${done}`)
+  check('对照：三期那一份（没有判定）照旧写「没挂依据的结论句」', await page.locator('#issuance-line [data-issuance-case="suspect"] [data-evidence-line-claims]').count() === 1)
+  // 开了裁判的文档：没挂依据的那句送了裁判、按判定数进了「支持 3」，出具照样按没挂依据记 1 句——不能被吞掉
+  const ju = await at('judge-uncited').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('开了裁判、出具还记着没挂依据的结论句：结论句那一段旁边另起「没挂依据的结论句 1」',
+    ju.includes('结论 3 句（支持 3）') && await at('judge-uncited').locator('[data-evidence-line-claims]').count() === 1
+    && ju.includes('· 没挂依据的结论句 1'), ju)
+  const juTitle = await at('judge-uncited').locator('[data-evidence-line-claims]').getAttribute('title').catch(() => '')
+  check('……悬停说明：判定代替不了依据，出具照样计缺口', !!juTitle && juTitle.includes('代替不了依据') && juTitle.includes('缺口'), juTitle ?? '')
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('#issuance-claims').screenshot({ path: `${SHOTS}/evidence4-banner-${theme}.png` })
+      await page.locator(J).screenshot({ path: `${SHOTS}/evidence4-doc-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+})
+
+await section('j-stream', '四期：问数据页、画布右栏的横幅（Output 这条路）——按需判过的结论句数进横幅，开了裁判的报告没挂依据的照样写出来', async () => {
+  // 按需裁判把「退款 29 单，其中大多数是部分退款」判成证据不支持（这句有数字，点得开）
+  const pu = fxj.plain.doc.blocks.flatMap((b) => b.units).find((x2) => x2.id === 'u3')
+  const pnum = pu.segments.find((x2) => x2.kind === 'number').id
+  const s = await open('/preview.html?syn=evidence-judge', { judge: (set, body) => (set === fxj.plain ? { json: {
+    report: { node_id: 'write', doc_artifact: set.doc_artifact }, model: fxj.model, limits_hit: [], post_seal: true,
+    verdicts: { [body.units[0]]: { status: 'unsupported', rationale: 'Q2 里部分退款 11 单，说不上「大多数」', judge: fxj.model, post_seal: true, used: ['Q2'] } },
+  } } : judgeReply(set, body)) })
+  const p = s.page
+  const turn = (id) => p.locator(`[data-turn="${id}"]`)
+  await p.waitForSelector('[data-turn="judge-plain"] [data-evidence-line]', { timeout: 6000 }).catch(() => {})
+  await p.waitForSelector('[data-turn="judge-formal"] [data-evidence-line]', { timeout: 6000 }).catch(() => {})
+  const plainLine = () => turn('judge-plain').locator('[data-evidence-line]').innerText().catch(() => '')
+  const before = await plainLine()
+  check('没开裁判、还没判过：横幅照旧写「没挂依据的结论句 1」，没有结论句那一段',
+    before.includes('没挂依据的结论句 1') && await turn('judge-plain').locator('[data-evidence-claims]').count() === 0, before)
+  // 点开那一句的数字，请模型判断（Output 没给运行类别：按运行 id 认出探索运行）
+  await turn('judge-plain').locator(`[data-seg="${pnum}"]`).click().catch(() => {})
+  const ask = p.locator('[data-evidence-panel] [data-ev-judge-ask]')
+  await ask.waitFor({ timeout: 6000 }).catch(() => {})
+  await ask.click().catch(() => {})
+  await p.waitForSelector('[data-turn="judge-plain"] [data-ev-claim="u3"]', { timeout: 6000 }).catch(() => {})
+  await p.waitForSelector('[data-turn="judge-plain"] [data-evidence-line] [data-evidence-claims]', { timeout: 3000 }).catch(() => {})
+  check('……请模型判断那一下发出去了（按运行、报告、句子）', s.hits.includes(`judge:${fxj.plain.run_id}:u3:write`),
+    s.hits.filter((h) => h.startsWith('judge:')).join(' '))
+  const claims = await turn('judge-plain').locator('[data-evidence-line] [data-evidence-claims]').innerText().catch(() => '')
+  check('按需判过一句：横幅多出结论句那一段（EvidenceField 叠好判定交出的文档，docTally 照样数）',
+    claims.includes('结论 5 句（不支持 1 · 未裁判 3 · 无证据 1）'), claims || '（没有这一段）')
+  const after = await plainLine()
+  check('……没挂依据的那句已经数在「无证据」里，不再另起一句', !!claims && await turn('judge-plain').locator('[data-evidence-line-claims]').count() === 0, after)
+  check('……有证据不支持的句子：横幅给「定位下一处」', !!claims && await turn('judge-plain').locator('[data-evidence-line] [data-evidence-next]').count() === 1, after)
+  await p.keyboard.press('Escape')
+  const formal = await turn('judge-formal').locator('[data-evidence-line]').innerText().catch(() => '')
+  check('开了裁判的正式运行：结论句那一段照节点里的判定数', formal.includes('结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）'), formal)
+  check('……没挂依据的那句（送了裁判、到上限没判）出具照样计缺口：另起「没挂依据的结论句 1」',
+    await turn('judge-formal').locator('[data-evidence-line-claims]').count() === 1 && formal.includes('没挂依据的结论句 1'), formal)
+  check('没有运行时报错（问数据页 · 结论句裁判）', s.errors.length === 0, s.errors.join(' | '))
+  if (SHOTS) {
+    // 侧面板还开着会压住横幅的右半边：先关掉
+    await p.locator('[data-evidence-panel] button[aria-label="关闭证据"]').click().catch(() => {})
+    for (const theme of ['dark', 'light']) {
+      await p.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await p.waitForTimeout(200)
+      await turn('judge-plain').locator('[data-issuance-banner]').screenshot({ path: `${SHOTS}/evidence4-stream-plain-${theme}.png` })
+      await turn('judge-formal').locator('[data-issuance-banner]').screenshot({ path: `${SHOTS}/evidence4-stream-formal-${theme}.png` })
+    }
+  }
+  await s.ctx.close()
 })
 
 if (SHOTS) {

@@ -237,6 +237,7 @@ def _apply_contract(
         strict=bool(contract.get("strict")),
         gaps=gaps,
         unresolved=cited.get("unresolved"),
+        unsupported=cited.get("unsupported"),
         uncited_claims=cited.get("uncited"),
         claims_policy=cited.get("claims_policy"),
     )
@@ -298,7 +299,7 @@ def _check_citations(
     reports: list[dict[str, Any]], *, cells: bool = True, governed: bool = False,
 ) -> dict[str, Any]:
     """独立复核报告文档：{matched, unmatched, unresolved, gaps, doc_artifact, stats, claims_policy, uncited,
-    claims, entities}。
+    unsupported, claims, entities}。
 
     不信报告节点自己的统计：文档按 id 从工件库取回（取回时复验哈希），目录按报告节点
     同一套参数从状态里重建（不用文档里存的那份），每个带引用的片段重新解析、重新渲染、
@@ -313,7 +314,7 @@ def _check_citations(
 
     out: dict[str, Any] = {"matched": [], "unmatched": [], "unresolved": [], "gaps": [],
                            "doc_artifact": None, "stats": None, "claims_policy": None, "uncited": None,
-                           "claims": None, "entities": None}
+                           "unsupported": None, "claims": None, "entities": None}
     gaps = out["gaps"]
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
@@ -403,7 +404,7 @@ def _check_citations(
                                    "span": [start, end], "eid": cite["eid"]})
 
     _claims(out, contract, payload, evidence_on=ledger_enabled(ctx.run), governed=governed,
-            uncited=checked.get("uncited") or [])
+            uncited=checked.get("uncited") or [], doc=doc, title=node.title)
 
     mine = next((r for r in reports if r["node"].id == report_from), None)
     edited = mine["edited"] if mine else []
@@ -416,20 +417,29 @@ def _check_citations(
 
 #: 没挂依据的结论句怎么处置，从松到严。认不出的写法按 degrade 算：写错一个词不能让缺口悄悄消失
 _ON_UNCITED = ("ignore", "degrade", "withhold")
+#: 证据不支持的结论句怎么处置（claims: judge），从松到严。认不出的写法同样按 degrade 算
+_ON_UNSUPPORTED = ("degrade", "withhold")
+#: 要求结论句挂依据的策略：judge 在这一点上和 require_citation 一样严，另外再按裁判的判定判档
+_CITING = ("require_citation", "judge")
 
 
 def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, Any], *, evidence_on: bool,
-            governed: bool = False, uncited: list[dict[str, Any]]) -> None:
-    """结论句策略：没挂依据的结论句按 claims_policy 交给 decide_tier 判档。
+            governed: bool = False, uncited: list[dict[str, Any]], doc: dict[str, Any] | None = None,
+            title: str = "") -> None:
+    """结论句策略：没挂依据的、裁判判为证据不支持的结论句按 claims_policy 交给 decide_tier 判档。
 
     两处可以要求挂依据：报告节点写作时记下的 claims（节点产出里的，写作提示按它要求过），和契约自己写的
-    require_citation（对象形式可以另写 on_uncited）。两处都写了取更严的那个——契约只能收紧、不能放松：
+    require_citation / judge（对象形式可以另写 on_uncited）。两处都写了取更严的那个——契约只能收紧、不能放松：
     报告节点要求了，契约写 ignore 或 off 也照旧计入缺口，写 withhold 就收紧成不予出具。受管级别的正式运行
     里 ignore 一律当 degrade：没有哪道门禁查契约里的 claims，不能让它把用户要的底线拉低。
 
+    报告节点写的是 judge 时，判定在文档里（按哈希取回的那份：判定是模型给的，出口复算不了，只能信封存的
+    文档）。正式运行在节点里判过：证据不支持的按 on_unsupported 判档（报告节点和契约取更严的），没判完的
+    （裁判没跑成、触顶）把裁判摘要里的缺口照抄进来——不能判完整出具，也不当成「不支持」。探索运行按需裁判，
+    这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
+
     数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
-    包括跨着升级还没跑完的运行）一律不管，契约写了也照旧记「这一版还不支持」。judge（裁判模型）是后续版本
-    的事，契约写了照实记缺口。
+    包括跨着升级还没跑完的运行）一律不管，契约写了也照旧记「这一版还不支持」。
     """
     written = payload.get("claims") if isinstance(payload, dict) else None
     # 报告节点升级后才在产出里记 claims（off 也记）：没有这个键就是升级前写的报告
@@ -437,23 +447,66 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     declared = contract.get("claims")
     name = declared.get("policy") if isinstance(declared, dict) else declared
     asks: list[str] = []
-    if upgraded and written == "require_citation":
+    if upgraded and written in _CITING:
         asks.append("degrade")
-    if upgraded and name == "require_citation":
+    if upgraded and name in _CITING:
         wanted = declared.get("on_uncited") if isinstance(declared, dict) else None
         asks.append(wanted if wanted in _ON_UNCITED else "degrade")
     elif name not in (None, "", "off"):
         out["gaps"].append("契约声明了结论句检查（claims），这一版还不支持，结论句没有核对")
+    judged = upgraded and written == "judge"
+    if upgraded and name == "judge" and not judged:
+        out["gaps"].append(f"契约要求结论句由模型裁判（claims: judge），报告「{title}」没有开 claims: judge，"
+                           "结论句没有裁判")
     if not asks:
         return
     on_uncited = max(asks, key=_ON_UNCITED.index)
     if governed and on_uncited == "ignore":
         on_uncited = "degrade"
-    policy: Any = "require_citation" if on_uncited == "degrade" else \
-        {"policy": "require_citation", "on_uncited": on_uncited}
-    out["claims_policy"], out["uncited"] = policy, uncited
-    out["claims"] = {"policy": "require_citation", "uncited_claims": len(uncited), "uncited": uncited[:_LISTED],
-                     **({"on_uncited": on_uncited} if on_uncited != "degrade" else {})}
+    extra = {"on_uncited": on_uncited} if on_uncited != "degrade" else {}
+    if not judged:
+        policy: Any = "require_citation" if on_uncited == "degrade" else \
+            {"policy": "require_citation", "on_uncited": on_uncited}
+        out["claims_policy"], out["uncited"] = policy, uncited
+        out["claims"] = {"policy": "require_citation", "uncited_claims": len(uncited), "uncited": uncited[:_LISTED],
+                         **extra}
+        return
+
+    from app.engine.evidence import iter_units
+
+    summary = (doc or {}).get("judge")
+    if not isinstance(summary, dict):
+        # 报告节点开了 judge、文档里却没有裁判摘要（不该发生）：当作没判，不能判完整出具
+        summary = {"mode": "inline", "counts": {}, "unjudged": {}, "limits_hit": [], "complete": False,
+                   "gaps": ["开了 claims: judge，文档里却没有裁判结果，结论句没有裁判"]}
+    asked = [summary.get("on_unsupported")]
+    if name == "judge" and isinstance(declared, dict):
+        asked.append(declared.get("on_unsupported"))
+    on_unsupported = max((a if a in _ON_UNSUPPORTED else "degrade" for a in asked), key=_ON_UNSUPPORTED.index)
+    inline = summary.get("mode") == "inline"
+    flagged: dict[str, list[dict[str, Any]]] = {"unsupported": [], "partial": []}
+    if inline:
+        # 探索运行按需裁判的判定不在文档里（在封存之后追加的 evidence.judged 事件里），这里只数正式运行的
+        markdown = str((doc or {}).get("markdown") or "")
+        for _, unit in iter_units(doc or {}):
+            verdict = unit.get("verdict")
+            status = verdict.get("status") if isinstance(verdict, dict) else None
+            if status in flagged:
+                span = unit.get("span") or [0, 0]
+                flagged[status].append({"unit": unit.get("id"), "span": span, "text": markdown[span[0]:span[1]],
+                                        "rationale": verdict.get("rationale") or ""})
+        out["gaps"].extend(f"报告「{title}」{gap}" for gap in summary.get("gaps") or [])
+    counts = {k: int((summary.get("counts") or {}).get(k) or 0)
+              for k in ("supported", "partial", "unsupported", "not_a_claim", "unjudged")}
+    out["claims_policy"] = {"policy": "judge", "on_unsupported": on_unsupported, "on_uncited": on_uncited}
+    out["uncited"], out["unsupported"] = uncited, flagged["unsupported"]
+    out["claims"] = {
+        "policy": "judge", "uncited_claims": len(uncited), "uncited": uncited[:_LISTED], **extra,
+        "on_unsupported": on_unsupported, "mode": "inline" if inline else "on_demand", "counts": counts,
+        "unsupported": flagged["unsupported"][:_LISTED], "partial": flagged["partial"][:_LISTED],
+        "unjudged": dict(summary.get("unjudged") or {}), "limits_hit": list(summary.get("limits_hit") or []),
+        "complete": bool(summary.get("complete")), "model": summary.get("model"),
+    }
 
 
 def _declare_citations(
@@ -497,8 +550,10 @@ def _declare_citations(
         metrics_checked=len(metrics),
         matched_numbers=len(cited["matched"]),
         matched=cited["matched"][:50],
-        # on_uncited 只在不是默认的 degrade 时才有（收紧成 withhold、探索运行的契约写了 ignore）
-        **({"claims": {k: cited["claims"][k] for k in ("policy", "uncited_claims", "on_uncited")
+        # on_uncited 只在不是默认的 degrade 时才有（收紧成 withhold、探索运行的契约写了 ignore）；
+        # judge 另带不支持时怎么判档、在哪判的和各判定的句数（名单只在出具声明里）
+        **({"claims": {k: cited["claims"][k] for k in ("policy", "uncited_claims", "on_uncited", "on_unsupported",
+                                                        "mode", "counts")
                        if k in cited["claims"]}} if cited.get("claims") else {}),
         # 计数取复核的统计（声明里的名单最多列 _LISTED 个）
         **({"entities": {"unknown": (cited["stats"] or {}).get("unknown_entities", len(entities["unknown"])),

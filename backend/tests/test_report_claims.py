@@ -1,10 +1,10 @@
 """报告节点的结论句策略 claims：off（默认，和以前一样）/ require_citation（没挂依据的结论句计入缺口）。
 
-结论句要靠裁判模型判断支不支持，那是后续版本的事；这一版只做确定性的一半：
+这里测确定性的一半（模型裁判 judge 见 test_report_judge.py）：
 - require_citation 时写作提示明确要求每句结论挂 [[see:…]]；没挂的照常产出、计数，
   出口按出具档位降档（io.py），报告节点自己不为它失败、不为它重写
 - report.checked 事件和节点产出都带上 claims，出口据此判档
-- 写 judge 时节点直接报错「结论句裁判在后续版本支持」，不能悄悄当成 off
+- 写了不认识的值节点直接报错，不能悄悄当成 off
 - 升级前发起的运行一个字都不变
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from app.db.models import Run, RunEvent
 from app.engine import runner as runner_mod
 from app.engine.evidence import CLAIMS_RULE, build_catalog, compose_doc, uncited_claims
 from app.engine.runner import run_manager
-from app.engine.schema import CLAIMS_LATER, REPORT_CLAIMS, claims_problem
+from app.engine.schema import CLAIMS_VALUES, claims_problem
 
 
 @pytest.fixture(autouse=True)
@@ -131,14 +131,14 @@ async def test_require_citation_asks_for_support_but_does_not_block(monkeypatch)
     assert flagged["text"] == "增长主要来自新客。" and doc["markdown"][slice(*flagged["span"])] == flagged["text"]
 
 
-async def test_judge_is_refused_until_it_exists(monkeypatch):
+async def test_a_bad_value_is_refused_before_any_model_call(monkeypatch):
     seen = script(monkeypatch)
-    with pytest.raises(ValueError) as info:            # 画布校验先拦（E3-gov 的 validate）
-        await run_manager.start(graph=weekly(claims="judge"), input_payload={})
-    assert CLAIMS_LATER in str(info.value)
+    with pytest.raises(ValueError) as info:            # 画布校验先拦
+        await run_manager.start(graph=weekly(claims="sometimes"), input_payload={})
+    assert claims_problem("sometimes") in str(info.value)
     lenient(monkeypatch)
-    row = await finish(weekly(claims="judge"))
-    assert row.status == "failed" and claims_problem("judge") in (row.error or ""), row.error
+    row = await finish(weekly(claims="sometimes"))
+    assert row.status == "failed" and claims_problem("sometimes") in (row.error or ""), row.error
     assert seen == [], "不支持的策略不该先花一次模型调用"
 
 
@@ -173,7 +173,7 @@ def test_the_supported_policies_match_the_validator():
     from app.engine.nodes.report import CLAIMS, report_claims
     from app.engine.schema import GraphSpec
 
-    assert CLAIMS == REPORT_CLAIMS == ("off", "require_citation")
+    assert CLAIMS == CLAIMS_VALUES == ("off", "require_citation", "judge")
     spec = GraphSpec.model_validate(weekly(claims="require_citation"))
     assert report_claims(spec, spec.node_map()["write"]) == "require_citation"
     spec = GraphSpec.model_validate(weekly())

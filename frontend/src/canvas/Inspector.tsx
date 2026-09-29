@@ -8,11 +8,11 @@ import { fieldOfIssue, unboundToolOf, withToolBound, type FieldRef } from './iss
 import { hintOf } from './shortcuts'
 import { isActivePhase } from '../run/trace'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
-import { datasourceTools, modelOptions, useCatalog, useDatasources } from '../store/catalog'
+import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasources } from '../store/catalog'
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { SUBGRAPH_UPGRADE_HELP, upgradeNewerText } from '../lib/terms'
+import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
 
@@ -403,9 +403,10 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   const id = `f-${nodeId}-${field.key}`
   const syntax = syntaxOf(field)
   const composite = field.type === 'cases' || field.type === 'agents' || field.type === 'ioFields'
-    || field.type === 'metricsList' || field.type === 'caliberFrom'
-  // 复合字段自己把问题落到第几项；落不到具体某一项的，和普通字段一样挂在下面
-  const own = composite ? issues.filter((i) => i.at?.index == null) : issues
+    || field.type === 'metricsList' || field.type === 'caliberFrom' || field.type === 'judge'
+  // 复合字段自己把问题落到第几项；落不到具体某一项的，和普通字段一样挂在下面。结论句裁判按子键（judge.max_cost_usd）落
+  const own = field.type === 'judge' ? issues.filter((i) => !i.at?.sub || !JUDGE_SUB_KEYS.has(i.at.sub))
+    : composite ? issues.filter((i) => i.at?.index == null) : issues
   const bad = own.some((i) => i.level === 'error')
   const errorId = own.length ? `${id}-issues` : undefined
   // 长文本在 360px 宽的栏里没法写：提示词、代码可以展开到大编辑器里（同一份值，边写边存）
@@ -608,12 +609,166 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
     case 'caliberFrom':
       return <CaliberFromPicker id={id} value={value} invalid={invalid} describedBy={describedBy} />
 
+    case 'judge':
+      return <JudgeConfig id={id} value={value} config={config} issues={issues} onChange={onChange} />
+
     case 'agents':
       return <AgentList value={value ?? []} issues={issues} config={config} onChange={onChange} />
 
     default:
       return <input id={id} className="field" value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
   }
+}
+
+/** judge 子配置里各有自己一行的键：落在这些键上的问题挂在那一行下面 */
+const JUDGE_SUB_KEYS = new Set(['provider', 'model', 'max_claims', 'max_cost_usd', 'timeout_s', 'rewrite_once', 'on_unsupported'])
+
+/**
+ * 结论句裁判（claims: judge）的子配置：裁判模型、三项上限（各自可以设成不限）、改写一次、证据不支持时怎么判档。
+ *
+ * 上限有三种写法，得分得清：没写（跟随设置里「证据裁判」的默认值）、写数、写 null（不限）。勾「不限」写 null，
+ * 清空数字框回到没写。全都没写时整个 judge 去掉，不留一个空对象。受管级别发布要求写了 max_cost_usd（数或 null）
+ */
+function JudgeConfig({ id, value, config, issues, onChange }: {
+  id: string; value: any; config: Record<string, any>; issues: FieldIssue[]; onChange: (v: any) => void
+}) {
+  const providers = useCatalog((s) => s.providers)
+  const judge: Record<string, any> = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const set = (key: string, v: unknown) => {
+    const next = { ...judge }
+    if (v === undefined) delete next[key]
+    else next[key] = v
+    onChange(Object.keys(next).length ? next : undefined)
+  }
+  const issuesOf = (key: string) => issues.filter((i) => i.at?.sub === key)
+  const lines = (key: string) => issuesOf(key).map((i, k) => <IssueLine key={k} issue={i} />)
+  const provider = typeof judge.provider === 'string' ? judge.provider : ''
+  const pv = provider ? providers.find((p) => p.name === provider) : undefined
+  const model = typeof judge.model === 'string' ? judge.model : ''
+  // 和写报告的模型是同一个：等于自己审自己。校验也会报（report.judge_same_model），报了就不重复说
+  const same = !!model && model === config.model && !issuesOf('model').length
+  // 节点上只写了模型：这一级写了就整组用节点上的（judge_model_spec 不跨级拼），后端按模型名找接入——
+  // 不再跟随设置，接入留空那一项不能还叫「跟随设置」
+  const byModel = !provider && !!model.trim()
+  const owner = byModel ? providerOfModel(providers, model.trim()) : undefined
+  const enabled = providers.filter((p) => p.enabled)
+  const fallback = enabled.find((p) => p.kind !== 'mock') ?? enabled[0]
+  const byModelHint = byModel && providers.length > 0
+    ? judgeByModelText('node', model.trim(), owner && { name: owner.provider.name, enabled: owner.enabled }, fallback?.name)
+    : ''
+  const models = pv ? (pv.models ?? []).map((m) => m.id) : [...new Set(modelOptions(providers).map((o) => o.value))]
+  return (
+    <div className="space-y-2.5 rounded border px-2.5 py-2" data-judge-config="">
+      <div data-judge-key="model">
+        <div className="grid grid-cols-2 gap-2">
+          <div className="min-w-0">
+            <label className="label" htmlFor={`${id}-provider`}>{JUDGE_FIELD_LABEL.provider}</label>
+            <select id={`${id}-provider`} className="field" value={provider}
+                    onChange={(e) => set('provider', e.target.value || undefined)}>
+              <option value="">{byModel ? JUDGE_SETTING_TEXT.providerFromModel : '跟随设置'}</option>
+              {provider && !pv && providers.length > 0 && <option value={provider}>{provider}（不存在）</option>}
+              {providers.map((p) => <option key={p.id} value={p.name}>{p.name}{p.enabled ? '' : '（已停用）'}</option>)}
+            </select>
+          </div>
+          <div className="min-w-0">
+            <label className="label" htmlFor={`${id}-model`}>{JUDGE_FIELD_LABEL.model}</label>
+            <input id={`${id}-model`} className="field mono text-xs" list={`${id}-models`} value={model} spellCheck={false}
+                   placeholder={provider ? '留空：接入的默认模型' : '跟随设置'}
+                   onChange={(e) => set('model', e.target.value.trim() ? e.target.value : undefined)} />
+            <datalist id={`${id}-models`}>{models.map((m) => <option key={m} value={m} />)}</datalist>
+          </div>
+        </div>
+        <div className="mt-1 text-2xs leading-snug text-faint">
+          接入和模型都没写就用设置里的「证据裁判模型」；写了哪一项就整组用节点上的，不和设置拼。建议和写报告的模型不同：同一个模型审自己写的，写错的地方它多半也看不出来
+        </div>
+        {byModelHint && (
+          <div className="mt-1 text-2xs leading-snug" data-judge-by-model={owner ? (owner.enabled ? 'found' : 'disabled') : 'default'}
+               style={owner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>
+            <span className={owner?.enabled ? 'text-faint' : undefined}>{byModelHint}</span>
+          </div>
+        )}
+        {same && (
+          <div className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }} data-judge-same="">
+            裁判模型和写报告的模型都是「{model}」：等于自己审自己
+          </div>
+        )}
+        {lines('provider')}{lines('model')}
+      </div>
+      {(['max_claims', 'max_cost_usd', 'timeout_s'] as const).map((key) => (
+        <JudgeLimit key={key} id={`${id}-${key}`} name={key} value={judge[key]} issues={lines(key)}
+                    onChange={(v) => set(key, v)} />
+      ))}
+      <div data-judge-key="rewrite_once">
+        <label className="flex cursor-pointer items-start gap-2 text-xs">
+          <input type="checkbox" className="mt-0.5 accent-[var(--accent)]" checked={judge.rewrite_once === true}
+                 onChange={(e) => set('rewrite_once', e.target.checked ? true : undefined)} />
+          <span>
+            {JUDGE_FIELD_LABEL.rewrite_once}
+            <span className="mt-0.5 block text-2xs leading-snug text-faint">
+              默认关。打开后裁判认为证据不支持的句子连同理由交回写作者只改这几句，再判一次，最多一轮；多一次写作和裁判的花费，
+              改写稿冒出原稿没有的问题就不采用
+            </span>
+          </span>
+        </label>
+        {lines('rewrite_once')}
+      </div>
+      <div data-judge-key="on_unsupported">
+        <label className="label" htmlFor={`${id}-on_unsupported`}>{JUDGE_FIELD_LABEL.on_unsupported}</label>
+        <select id={`${id}-on_unsupported`} className="field" value={judge.on_unsupported ?? ''}
+                onChange={(e) => set('on_unsupported', e.target.value || undefined)}>
+          <option value="">默认：{JUDGE_ON_UNSUPPORTED_LABEL.degrade}</option>
+          <option value="degrade">{JUDGE_ON_UNSUPPORTED_LABEL.degrade}（degrade）</option>
+          <option value="withhold">{JUDGE_ON_UNSUPPORTED_LABEL.withhold}（withhold）</option>
+          {typeof judge.on_unsupported === 'string' && judge.on_unsupported
+            && !(judge.on_unsupported in JUDGE_ON_UNSUPPORTED_LABEL) && (
+            <option value={judge.on_unsupported} disabled>{judge.on_unsupported}：不认识的值，只能选上面两项</option>
+          )}
+        </select>
+        <div className="mt-1 text-2xs leading-snug text-faint">只管正式运行；探索运行只标注，不拦</div>
+        {lines('on_unsupported')}
+      </div>
+    </div>
+  )
+}
+
+/** 一项裁判上限：数字框加「不限」。没写、写数、写 null（不限）三种各有一句说明 */
+function JudgeLimit({ id, name, value, issues, onChange }: {
+  id: string; name: 'max_claims' | 'max_cost_usd' | 'timeout_s'; value: unknown; issues: React.ReactNode
+  onChange: (v: number | null | undefined) => void
+}) {
+  const off = value === null
+  const shown = typeof value === 'number' || typeof value === 'string' ? String(value) : ''
+  const note = off ? JUDGE_LIMIT_OFF[name]
+    : value === undefined ? '没写：用设置里「证据裁判」的默认值' : ''
+  return (
+    <div data-judge-key={name} data-judge-unlimited={off ? '' : undefined}>
+      <label className="label" htmlFor={id}>{JUDGE_FIELD_LABEL[name]}</label>
+      <div className="flex items-center gap-2">
+        <input id={id} className="field tnum min-w-0 flex-1" type="number" min={0} step={name === 'max_claims' ? 1 : 'any'}
+               value={off ? '' : shown} disabled={off} placeholder={off ? '不限' : '跟随设置'}
+               onChange={(e) => onChange(e.target.value === '' ? undefined : Number(e.target.value))} />
+        <label className="flex shrink-0 cursor-pointer items-center gap-1 text-xs">
+          <input type="checkbox" className="accent-[var(--accent)]" checked={off} aria-label={`${JUDGE_FIELD_LABEL[name]}：不限`}
+                 onChange={(e) => onChange(e.target.checked ? null : undefined)} />
+          不限
+        </label>
+      </div>
+      {note && (
+        <div className="mt-1 text-2xs leading-snug" style={off ? { color: 'var(--st-waiting)' } : undefined}
+             data-judge-note={off ? 'unlimited' : 'default'}>
+          <span className={off ? undefined : 'text-faint'}>{note}</span>
+        </div>
+      )}
+      {issues}
+    </div>
+  )
+}
+
+/** 节点上某项设成不限时写明：费用还受什么约束（同设置页，节点上的只说这一份报告） */
+const JUDGE_LIMIT_OFF: Record<'max_claims' | 'max_cost_usd' | 'timeout_s', string> = {
+  max_claims: '不设上限，句数只受报告里结论句多少约束',
+  max_cost_usd: '不设上限，这份报告的裁判费用只受句数、时长上限和每日上限约束',
+  timeout_s: '不设上限，时长只受模型接口自身的超时约束',
 }
 
 /**

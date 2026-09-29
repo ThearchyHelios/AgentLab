@@ -706,6 +706,95 @@ export interface EvidenceUnit {
   loc?: { row: number; col: number }
   /** 列表项的缩进层级 */
   depth?: number
+  /**
+   * 结论句裁判的判定（四期）：只有送了裁判的候选句有。正式运行里节点当场判的进封存（post_seal false）；
+   * 探索运行里候选句先标 unjudged + reason on_demand，点开再判
+   */
+  verdict?: EvidenceVerdict
+}
+
+/**
+ * 模型对一句结论的判定。是模型的判断，不是证据，不能被引用。
+ * status 为 unjudged 时 reason 写明为什么没判：四个上限（max_claims / max_cost_usd / daily_max_usd /
+ * timeout_s，rationale 以「已到上限（…）」开头）、error、format、missing、on_demand（探索运行按需）
+ */
+export interface EvidenceVerdict {
+  status: 'supported' | 'partial' | 'unsupported' | 'not_a_claim' | 'unjudged' | string
+  /** 理由，最多 60 字 */
+  rationale?: string
+  /** 裁判模型 id；探索运行还没判的是 null */
+  judge?: string | null
+  /** 封存之后按需追加的（evidence.judged 事件） */
+  post_seal?: boolean
+  /** 裁判看过、摘录里真有的证据编号 */
+  used?: string[]
+  reason?: string
+  cost_usd?: number
+}
+
+/** 文档（和 report.checked、节点产出）里的裁判摘要：键的顺序同后端 judge.SUMMARY_KEYS */
+export interface EvidenceJudgeSummary {
+  /** inline：正式运行节点里当场判；on_demand：探索运行按需 */
+  mode?: 'inline' | 'on_demand' | string
+  model?: string | null
+  on_unsupported?: 'degrade' | 'withhold' | string
+  rewrite_once?: boolean
+  limits?: { max_claims?: number | null; max_cost_usd?: number | null; timeout_s?: number | null
+             daily_max_usd?: number | null } | null
+  candidates?: number
+  /** 预筛放掉、没送裁判的结论句 */
+  screened?: string[]
+  counts?: Partial<Record<'supported' | 'partial' | 'unsupported' | 'not_a_claim' | 'unjudged', number>>
+  unjudged?: Record<string, number>
+  limits_hit?: string[]
+  complete?: boolean
+  priced?: boolean | null
+  cost_usd?: number
+  calls?: number
+  reused?: number
+  duration_ms?: number
+  gaps?: string[]
+  notes?: string[]
+  same_model?: boolean
+  /**
+   * 不支持的句子交回写作者改写一次（rewrite_once）。units：交回的句子在封存文档里的编号（采用了改写稿时，
+   * 改掉的句子是 null）；sentences：交回的原句；changed：改写稿里新写的句子的编号（没采用时为空）；
+   * reason：没采用的原因
+   */
+  rewrite?: { units?: (string | null)[]; sentences?: string[]; applied?: boolean; reason?: string | null
+              changed?: string[] } | null
+}
+
+/**
+ * POST /runs/{id}/evidence/judge 的答复：evidence.judged 事件的载荷（NOTES-A4 §8）。前端对缺字段宽容：
+ * verdicts 也认成 [{unit, …}] 的列表
+ */
+export interface EvidenceJudgeResult {
+  /** 判的是哪份报告：{node_id, doc_artifact}（事件载荷里是节点 id 字符串） */
+  report?: string | { node_id?: string; doc_artifact?: string }
+  doc_artifact?: string
+  verdicts?: Record<string, EvidenceVerdict> | (EvidenceVerdict & { unit?: string })[]
+  model?: string | null
+  cost_usd?: number
+  calls?: number
+  limits_hit?: string[]
+  gaps?: string[]
+  notes?: string[]
+  skipped?: Record<string, string>
+  post_seal?: boolean
+  /** 触顶、没跑成、点的不是结论句时的一句话；判成了是 null */
+  message?: string | null
+  /** 触顶时怎么调，一个上限一句 */
+  adjust?: string[]
+  [key: string]: unknown
+}
+
+/** 这句能不能「请模型判断」：片段接口按运行的实际情况答（和按需裁判接口同一套条件） */
+export interface EvidenceOnDemand {
+  available?: boolean
+  /** formal / legacy / not_a_claim / judged / unsealed / seal_broken */
+  reason?: string | null
+  message?: string | null
 }
 
 export interface EvidenceBlock {
@@ -750,6 +839,12 @@ export interface EvidenceStats {
   quotes?: number
   unknown_entities?: number
   unverified_entities?: number
+  /** 四期：claims 为 judge 时追加，候选句按判定的句数 */
+  supported?: number
+  partial?: number
+  unsupported?: number
+  not_a_claim?: number
+  unjudged?: number
 }
 
 /** report_doc 工件的内容 */
@@ -764,6 +859,8 @@ export interface EvidenceDocData {
   blocks: EvidenceBlock[]
   stats?: EvidenceStats
   violations?: EvidenceViolation[]
+  /** 四期：写作时结论句策略是 judge 才有 */
+  judge?: EvidenceJudgeSummary
 }
 
 /**
@@ -807,7 +904,14 @@ export interface EvidenceGraph {
               /** 文档取回时哈希复验：false 对不上（或不是这次运行这个节点写的），null 文件不在了 */
               hash_ok?: boolean | null
               /** 写这份报告时的结论句策略（report.checked 里记的；老后端、升级前的运行没有） */
-              claims?: string | null }[]
+              claims?: string | null
+              /**
+               * 四期：封存之后按需追加的判定（evidence.judged 叠在一起），{unit: 判定}。后端没给时前端只认
+               * 点开时片段接口、按需裁判接口答的那几句
+               */
+              post_seal_verdicts?: Record<string, EvidenceVerdict> | null
+              /** 封存的裁判摘要（文档的 judge） */
+              judge?: EvidenceJudgeSummary | null }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
@@ -1042,7 +1146,11 @@ export interface EvidenceAudit {
 export interface EvidenceSegmentDetail {
   report?: { node_id?: string; doc_artifact?: string }
   segment?: Partial<EvidenceSegment> & { unit?: string }
-  unit?: { id?: string; kind?: string; text?: string; span?: [number, number]; cites?: string[] }
+  unit?: { id?: string; kind?: string; text?: string; span?: [number, number]; cites?: string[]
+          /** 这一句的判定：封存的文档里的，或者按最新的 evidence.judged 叠上的（post_seal） */
+          verdict?: EvidenceVerdict
+          /** 这一句能不能请模型判断、不能的话为什么 */
+          on_demand?: EvidenceOnDemand }
   block?: { id?: string; type?: string }
   chain?: EvidenceStep[]
   /** 片段为什么是现在这个状态，一句人话 */

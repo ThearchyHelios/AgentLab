@@ -95,6 +95,16 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # （记成空值，不兜底成 0）。答案能用，缺口要说清是哪一种
     "agent_field_mismatch": ("agent_field_mismatch", DEGRADED),
     "agent_field_unverified": ("agent_field_unverified", DEGRADED),
+    # 结论句裁判（claims: judge）：触顶、没跑成的句子记为未裁判，出具不能判完整——是缺口，要说明
+    "judge_limit": ("judge_limit", DEGRADED),
+    "judge_failed": ("judge_failed", DEGRADED),
+    # 证据不支持的句子交回写作者改过一次（和 report_repair 一样只记缺口）；改写稿冒出新问题没采用的，
+    # 原稿里那几句仍是证据不支持
+    "report_rewrite": ("report_rewrite", DEGRADED),
+    "report_rewrite_rejected": ("report_rewrite_rejected", DEGRADED),
+    # 估不出裁判的金额、裁判和写作是同一个模型：配置上的提醒，答案本身没受影响
+    "judge_unpriced": ("judge_unpriced", BENIGN),
+    "judge_same_model": ("judge_same_model", BENIGN),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。

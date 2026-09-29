@@ -609,6 +609,95 @@ await section('设置 · 智能体护栏', async () => {
   await t.close()
 })
 
+await section('设置 · 证据裁判', async () => {
+  // 结论句裁判的模型和各项上限（后端 engine/judge.py）：每一项都能设成不限（存 null），不限时写明还受什么约束。
+  // 读写照运行默认值：GET 读、PUT 整组写。写请求在浏览器层拦下，不落库
+  let stored = await get('/settings')
+  stored = { ...stored, judge: { provider: null, model: null, report_max_claims: 40, report_max_cost_usd: null, report_timeout_s: 30,
+    click_max_cost_usd: 0.01, daily_max_usd: 2 } }
+  let spendGets = 0
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => { stored = { ...stored, ...body.values }; return json(stored)(route) }],
+      [/^GET \/settings\/judge\/spend$/, (route) => { spendGets += 1; return json({ date: '2026-09-29', usd: 0.0123, calls: 7, unpriced_calls: 2, daily_max_usd: 2 })(route) }],
+    ],
+  })
+  const box = page.locator('[data-judge-settings]')
+  const all = (await box.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('偏好里有「证据裁判」一组，写明判断是模型给的、不是系统核对', all.includes('证据裁判') && all.includes('非确定'), all.slice(0, 80))
+  check('裁判模型：接入和模型，提示建议和写作模型不同', await page.locator('#pref-judge-provider').count() === 1
+    && await page.locator('#pref-judge-model').count() === 1 && all.includes('建议和写报告的模型不同'))
+  check('……接入留空时跟随 Copilot 的模型', (await page.locator('#pref-judge-provider option').first().innerText()).includes('跟随 Copilot'))
+  const val = (id) => page.locator(`#${id}`).inputValue()
+  check('读回各项上限：40 句、30 秒、每次点击 $0.01、每日 $2', await val('pref-judge-claims') === '40' && await val('pref-judge-timeout') === '30'
+    && await val('pref-judge-click') === '0.01' && await val('pref-judge-daily') === '2')
+  const cost = page.locator('[data-judge-limit="report_max_cost_usd"]')
+  check('存着 null 的每份报告金额：勾着「不限」、框变灰', await cost.locator('[data-judge-unlimited-toggle]').isChecked()
+    && await page.locator('#pref-judge-cost').isDisabled())
+  const costNote = await cost.locator('[data-judge-unlimited]').innerText().catch(() => '')
+  check('……写明「不设上限，费用只受……约束」', costNote === '不设上限，费用只受句数上限、时长上限、每日上限约束', costNote)
+  const spend = await page.locator('[data-judge-spend]').innerText().catch(() => '')
+  check('每日上限旁边写今天花了多少', spend.includes('今天已花 $0.0123（7 次调用）'), spend)
+  check('……估不出金额的调用另说', spend.includes('另有 2 次调用估不出金额') && await page.locator('[data-judge-unpriced]').count() === 1, spend)
+
+  const daily = page.locator('[data-judge-limit="daily_max_usd"]')
+  await daily.locator('[data-judge-unlimited-toggle]').check()
+  const dailyNote = await daily.locator('[data-judge-unlimited]').innerText().catch(() => '')
+  check('每日上限设成不限：写明每日费用还受什么约束', dailyNote.startsWith('不设上限，每日费用只受') && dailyNote.includes('每次点击的金额上限'), dailyNote)
+  const costNote2 = await cost.locator('[data-judge-unlimited]').innerText().catch(() => '')
+  check('……每日也不限了：每份报告金额那句不再说「每日上限」', !costNote2.includes('每日') && costNote2.startsWith('不设上限'), costNote2)
+  await page.locator('#pref-judge-click').fill('0')
+  const save = page.getByRole('button', { name: /保存设置/ })
+  check('每次点击填 0：标红、保存按钮不可用', await save.isDisabled()
+    && (await page.locator('[data-judge-limit="click_max_cost_usd"]').innerText()).includes('填大于 0 的金额，或者勾「不限」'))
+  await page.locator('#pref-judge-click').fill('0.02')
+  check('……接入留空时模型框的占位也写跟随 Copilot', await page.locator('#pref-judge-model').getAttribute('placeholder') === '留空：跟随 Copilot 的模型')
+  await page.locator('#pref-judge-model').fill('judge-model-b')
+  // 只填了模型：设置这一级整组生效（judge_model_spec 不跨级拼），后端按模型名找接入——已经不跟随 Copilot
+  const provFirst = await page.locator('#pref-judge-provider option').first().innerText().catch(() => '')
+  check('只填了模型：接入留空那一项不再叫「跟随 Copilot」，改叫「按模型名找接入」', provFirst === '按模型名找接入', provFirst)
+  const byModel = page.locator('[data-judge-by-model]')
+  const byText = await byModel.innerText().catch(() => '')
+  // 说明里有沙箱的接入名：细节只报认没认出来，不打印原文
+  check('……写明按模型名找接入（认不出就去调默认接入），「跟随 Copilot」只在两项都留空时生效',
+    await byModel.getAttribute('data-judge-by-model').catch(() => '') === 'default' && byText.includes('只填了模型')
+    && byText.includes('默认接入') && byText.includes('「跟随 Copilot」只在接入和模型都留空时生效'),
+    `data-judge-by-model=${await byModel.getAttribute('data-judge-by-model').catch(() => '（没有）')}`)
+  const bar = (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('保存条写明改了哪几项', bar.includes('有 3 项未保存') && bar.includes('每日金额上限') && bar.includes('每次点击的金额上限')
+    && bar.includes('裁判模型'), bar)
+  const gets = spendGets
+  await save.click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)?.body?.values ?? {}
+  const j = put.judge ?? {}
+  check('保存：整组写 judge（七项都在），不限存 null', Object.keys(j).sort().join(',')
+    === 'click_max_cost_usd,daily_max_usd,model,provider,report_max_claims,report_max_cost_usd,report_timeout_s'
+    && j.daily_max_usd === null && j.report_max_cost_usd === null && j.click_max_cost_usd === 0.02 && j.report_max_claims === 40
+    && j.report_timeout_s === 30 && j.model === 'judge-model-b' && j.provider === null, JSON.stringify(j))
+  check('……只改了裁判：不碰运行默认值那一组', !('run' in put), Object.keys(put).join(','))
+  check('……存完再取一次今天的花费（每日上限变了）', spendGets > gets, `${gets} → ${spendGets}`)
+  check('……存完显示「已保存」', (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).includes('已保存'))
+  await daily.locator('[data-judge-unlimited-toggle]').uncheck()
+  check('勾掉「不限」：填回原来的数', await val('pref-judge-daily') === '2')
+  await daily.locator('[data-judge-unlimited-toggle]').check()
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  if (SHOTS) {
+    await box.scrollIntoViewIfNeeded()
+    await page.waitForTimeout(200)
+    await box.screenshot({ path: `${SHOTS}/prefs-judge-${THEME}.png` })
+  }
+  await close()
+
+  // 老后端没有 judge 这一组：不显示，也不写
+  const legacy = { ...stored }
+  delete legacy.judge
+  const old = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(legacy)(route)]] })
+  check('老后端没有裁判设置：这一组不出现', await old.page.locator('[data-judge-settings]').count() === 0)
+  await old.close()
+})
+
 await section('数据 · 数据库', async () => {
   const dbs = sources.filter((s) => !/[\\/]uploads[\\/]tables[\\/]/.test(s.database ?? ''))
   const first = dbs.find((s) => s.table_count > 0) ?? dbs[0]
@@ -1441,8 +1530,10 @@ await section('工具', async () => {
     check('……详情区写明原因和「绑了它的节点一定失败」', (await alert.innerText().catch(() => '')).includes('一定失败'))
     await shot(page, 'tool-broken-detail')
     await alert.getByRole('button', { name: '去改参数定义' }).click()
-    await page.waitForTimeout(700)
     const ed0 = page.getByRole('dialog', { name: '编辑工具「broken_demo」' })
+    // 等编辑框真的出来再判：并行跑时固定等 700ms 不够，编辑框还没挂上就判成没打开（check-all 里偶发过）
+    await ed0.waitFor({ timeout: 5000 }).catch(() => {})
+    await page.waitForTimeout(200)
     check('……「去改参数定义」直接打开它的编辑框（/tools/custom?edit=）', await ed0.count() === 1, page.url())
     check('……读完 ?edit= 就从地址里摘掉', !page.url().includes('edit='), page.url())
     const perr = await ed0.locator('[data-params-field]').innerText().catch(() => '')

@@ -16,7 +16,7 @@ import { matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { issuanceLabel, reportStampText, RUN_CLASS_LABEL } from '../lib/terms'
+import { claimTally, issuanceLabel, reportStampText, RUN_CLASS_LABEL } from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
@@ -188,6 +188,13 @@ function matchedLines(matched: unknown): string {
   return `回指明细：\n${lines.join('\n')}${more}`
 }
 
+/** stats 里的裁判句数（claims 为 judge 时才有）→「结论 4 句（支持 1 · 不支持 1 · 未裁判 2）」 */
+function claimsLine(st: ReportStamp['stats']): string {
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const c = { supported: n(st.supported), partial: n(st.partial), unsupported: n(st.unsupported), unjudged: n(st.unjudged), uncited: 0 }
+  return claimTally({ ...c, total: c.supported + c.partial + c.unsupported + c.unjudged })
+}
+
 /** 报告节点章的悬停说明：两个数怎么来的，缺口里各有什么 */
 function reportStampTitle(r: ReportStamp): string {
   const st = r.stats
@@ -200,7 +207,10 @@ function reportStampTitle(r: ReportStamp): string {
     n(st.unresolved) ? `引用解析不了 ${formatNumber(n(st.unresolved))} 处` : '',
     n(st.unknown_entities) ? `可能是编造的名字 ${formatNumber(n(st.unknown_entities))} 个` : '',
     n(st.unverified_entities) ? `核对不了的名字 ${formatNumber(n(st.unverified_entities))} 个（只标注，不计入）` : '',
-    uncited ? `没挂依据的结论句 ${formatNumber(uncited)} 句${r.claims === 'require_citation' ? '（计入缺口）' : '（结论句策略不要求，不计入）'}` : '',
+    uncited ? `没挂依据的结论句 ${formatNumber(uncited)} 句${r.claims === 'require_citation' || r.claims === 'judge'
+      ? '（计入缺口）' : '（结论句策略不要求，不计入）'}` : '',
+    // 结论句裁判（四期）：模型的判断，不计入章上的两个数
+    r.claims === 'judge' && claimsLine(st) ? `${claimsLine(st)}（模型判断，非确定，不计入）` : '',
     '完整清单在记录页这次运行的「证据」页签',
   ].filter(Boolean).join('\n')
 }

@@ -1313,6 +1313,103 @@ await section('agent 字段按出处核对（可点击证据第二期）：抽�
     && !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}`)), odd.map((s) => s.title).join(' | '))
 })
 
+await section('结论句裁判（可点击证据第四期）：裁判调用单独成行、几条警告说人话、封存后按需裁判有记录', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  // 原话和后端同一个格式：engine/judge.py 的 run_request、engine/nodes/report.py 的改写一次。先核对后端源码还是这么说的
+  const judgePy = readFileSync(`${root}backend/app/engine/judge.py`, 'utf8')
+  const reportPy = readFileSync(`${root}backend/app/engine/nodes/report.py`, 'utf8')
+  check('后端发裁判事件的格式还是夹具里这一种', judgePy.includes('purpose="judge"') && judgePy.includes('code="judge_limit"')
+    && judgePy.includes('结论句裁判已到上限（{labels}）：{n} 句没判，记为未裁判；已判的保留')
+    && judgePy.includes('"结论句裁判没跑完：" + "；".join(failed)') && judgePy.includes('code="judge_unpriced"')
+    && judgePy.includes('不在价格目录里，按令牌估不出金额：') && reportPy.includes('code="judge_same_model"')
+    && reportPy.includes('：等于自己审自己') && reportPy.includes('code="report_rewrite"') && reportPy.includes('句结论证据不支持（')
+    && reportPy.includes('已交回写作者只改这几句') && reportPy.includes('改写稿冒出 {len(fresh)} 处原稿没有的问题（')
+    && reportPy.includes('没有采用，') && reportPy.includes('保留原稿和原来的判定'),
+    '改了 judge.py / report.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const LIMIT = '结论句裁判已到上限（这份报告的裁判金额上限 $0.05）：3 句没判，记为未裁判；已判的保留'
+  const FAILED = '结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（ConnectError: 连不上）'
+  const UNPRICED = '模型「jm-x」不在价格目录里，按令牌估不出金额：金额上限（每份报告、每次点击、每日）对它不起作用，费用只受句数、时长上限约束'
+  const SAME = '裁判模型和写作模型都是「wm-1」：等于自己审自己，模型写错的地方它多半也看不出来。到设置里选一个不同的「证据裁判模型」，或者在节点的 judge.model 里指定'
+  const REWRITE = '裁判认为 2 句结论证据不支持（「增长主要来自新客」「退款多数是部分退款」），已交回写作者只改这几句'
+  const REJECTED = '改写稿冒出 1 处原稿没有的问题（「12」），没有采用，保留原稿和原来的判定'
+  const events = [
+    E(1, 'run.started', null, { total: 1 }),
+    E(2, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+    E(3, 'llm.start', 'write', { model: 'wm-1' }),
+    E(4, 'llm.end', 'write', { model: 'wm-1', duration_ms: 900 }),
+    E(5, 'llm.start', 'write', { model: 'jm-x', structured: true, purpose: 'judge', message_count: 2, units: 4 }),
+    E(6, 'llm.end', 'write', { model: 'jm-x', purpose: 'judge', duration_ms: 2100, input_tokens: 900, output_tokens: 300, units: 4 }),
+    E(7, 'log', 'write', { level: 'warn', code: 'judge_unpriced', message: UNPRICED }),
+    E(8, 'log', 'write', { level: 'warn', code: 'judge_same_model', message: SAME }),
+    E(9, 'log', 'write', { level: 'warn', code: 'judge_limit', limits: ['max_cost_usd'], unjudged: 3, message: LIMIT }),
+    E(10, 'log', 'write', { level: 'warn', code: 'judge_failed', message: FAILED }),
+    E(11, 'log', 'write', { level: 'warn', code: 'report_rewrite', message: REWRITE }),
+    E(12, 'log', 'write', { level: 'warn', code: 'report_rewrite_rejected', message: REJECTED }),
+    E(13, 'report.checked', 'write', { doc_artifact: 'doc-1', stats: { numbers: 3, numbers_cited: 3, uncited_numbers: 0, unresolved: 0 },
+      violations: [], repairs: 0, claims: 'judge',
+      judge: { mode: 'inline', counts: { supported: 1, partial: 1, unsupported: 1, not_a_claim: 1, unjudged: 1 } } }),
+    E(14, 'node.finished', 'write', { duration_ms: 4000 }),
+    E(15, 'run.finished', null, { status: 'succeeded' }),
+    // 探索运行跑完之后有人点开结论句请模型判断：判定追加在封存之后
+    E(16, 'evidence.judged', 'write', { report: 'write', doc_artifact: 'doc-1', units: ['u2'], model: 'jm-x',
+      verdicts: { u2: { status: 'unsupported', rationale: '看不出', judge: 'jm-x', post_seal: true } }, limits_hit: [], gaps: [],
+      post_seal: true }),
+  ]
+  const all = flatten(mod.decodeRun(events))
+  check('新事件都有翻译', !all.some((s) => s.title === '一条还没翻译的记录'), all.filter((s) => s.title === '一条还没翻译的记录').map((s) => s.raw?.type).join(','))
+  const llms = all.filter((s) => s.kind === 'llm')
+  check('写作照旧叫「思考并作答」，裁判那次单独起名、说判几句', llms.map((s) => s.title).join('|') === '思考并作答|请裁判模型判断 4 句结论',
+    llms.map((s) => s.title).join('|'))
+  check('……裁判那次跑完了、带耗时和模型', llms[1]?.status === 'done' && llms[1]?.meta === '2.1 s' && llms[1]?.code === 'judge'
+    && llms[1]?.detail === '模型：jm-x', `${llms[1]?.status} ${llms[1]?.meta} ${llms[1]?.code} ${llms[1]?.detail}`)
+  const by = (code) => all.find((s) => s.code === code)
+  check('judge_limit：几句没判、哪个上限、怎么调', by('judge_limit')?.title === '结论句裁判已到上限，3 句没判（记为未裁判，已判的保留）'
+    && by('judge_limit')?.sub === '这份报告的裁判金额上限 $0.05' && !!by('judge_limit')?.next?.includes('不限'),
+    `${by('judge_limit')?.title} / ${by('judge_limit')?.sub} / ${by('judge_limit')?.next}`)
+  check('judge_failed：没跑完、原因放副标题', by('judge_failed')?.title === '结论句裁判没跑完，没判的记为未裁判'
+    && by('judge_failed')?.sub === '有 2 句结论没裁判：裁判调用失败（ConnectError: 连不上）', `${by('judge_failed')?.title} / ${by('judge_failed')?.sub}`)
+  check('judge_unpriced：点名模型、金额上限不起作用', by('judge_unpriced')?.title === '裁判模型「jm-x」估不出金额，金额上限对它不起作用',
+    by('judge_unpriced')?.title)
+  check('judge_same_model：自己审自己、怎么改', by('judge_same_model')?.title === '裁判模型和写作模型都是「wm-1」：等于自己审自己'
+    && !!by('judge_same_model')?.next?.includes('证据裁判'), `${by('judge_same_model')?.title} / ${by('judge_same_model')?.next}`)
+  check('report_rewrite：几句不支持、交回改写，句子放副标题', by('report_rewrite')?.title === '裁判认为 2 句结论证据不支持，已交回写作者只改这几句'
+    && by('report_rewrite')?.sub === '「增长主要来自新客」「退款多数是部分退款」', `${by('report_rewrite')?.title} / ${by('report_rewrite')?.sub}`)
+  check('report_rewrite_rejected：冒出几处新问题、没有采用', by('report_rewrite_rejected')?.title === '改写稿冒出 1 处原稿没有的问题，没有采用'
+    && by('report_rewrite_rejected')?.sub === '「12」' && by('report_rewrite_rejected')?.next === '保留的是原稿和原来的判定',
+    `${by('report_rewrite_rejected')?.title} / ${by('report_rewrite_rejected')?.sub}`)
+  check('几条警告都是提醒（warn），原话留在展开区', ['judge_limit', 'judge_failed', 'judge_unpriced', 'judge_same_model', 'report_rewrite',
+    'report_rewrite_rejected'].every((c) => by(c)?.level === 'warn' && by(c)?.detail))
+  const rc = all.find((s) => s.code === 'report_checked')
+  check('报告核对那一行也数结论句，和出具横幅同一种说法（不是结论句的不算）',
+    rc?.title === '核对报告：3 个数字都有出处 · 结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）', rc?.title)
+  const ej = by('evidence_judged')
+  check('封存后按需裁判：单独一行，写明封存后追加、模型判断非确定', ej?.title === '封存后按需裁判了 1 句结论'
+    && ej?.sub === '封存后追加 · 模型判断，非确定' && ej?.level === 'info', `${ej?.title} / ${ej?.sub} / ${ej?.level}`)
+
+  const failed = flatten(mod.decodeRun([
+    E(1, 'node.started', 'write', { node_type: 'report' }),
+    E(2, 'llm.start', 'write', { model: 'jm-x', structured: true, purpose: 'judge', message_count: 2, units: 2 }),
+    E(3, 'llm.end', 'write', { model: 'jm-x', purpose: 'judge', duration_ms: 30000, units: 2, error: '已到上限（裁判时长上限 30 秒），这句没判' }),
+    E(4, 'node.finished', 'write', { duration_ms: 31000 }),
+    E(5, 'evidence.judged', 'write', { verdicts: { u4: { status: 'unjudged', reason: 'max_cost_usd' } }, limits_hit: ['max_cost_usd'] }),
+  ]))
+  const jx = failed.find((s) => s.kind === 'llm')
+  check('裁判调用没跑成：那一行说「没跑成」，是提醒不是失败，原因放展开区', jx?.title === '结论句裁判没跑成' && jx?.status === 'done'
+    && jx?.level === 'warn' && !!jx?.detail?.includes('裁判时长上限'), `${jx?.title} ${jx?.status} ${jx?.level}`)
+  check('……报告节点照样成功', failed.find((s) => s.kind === 'node')?.status === 'done')
+  const late = failed.find((s) => s.code === 'evidence_judged')
+  check('按需裁判触顶：写明有的到了上限没判（提醒）', late?.title === '封存后按需裁判了 0 句结论，有的到了上限没判' && late?.level === 'warn',
+    `${late?.title} ${late?.level}`)
+  const odd = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'judge_limit', message: '到上限了' }),
+    E(3, 'log', 'w', { level: 'warn', code: 'report_rewrite' }),
+    E(4, 'report.checked', 'w', { stats: { numbers: 1, numbers_cited: 1 }, judge: { counts: 'x' } })]))
+  check('别的说法（缺字段）：标题照样说人话，不出 undefined、不瞎填数', odd.find((s) => s.code === 'judge_limit')?.title === '结论句裁判已到上限（记为未裁判，已判的保留）'
+    && !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}`)), odd.map((s) => s.title).join(' | '))
+  check('……裁判摘要认不出时报告核对那一行只数数字', odd.find((s) => s.code === 'report_checked')?.title === '核对报告：1 个数字都有出处',
+    odd.find((s) => s.code === 'report_checked')?.title)
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

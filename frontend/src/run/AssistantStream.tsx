@@ -15,14 +15,14 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { EVIDENCE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
   childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
   type TeamRun,
 } from './decode'
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
-import { EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
+import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
 import { EVIDENCE_STATE, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
 import type { EvidenceDocData } from '../types'
 import { useRunClock } from './useRunClock'
@@ -2027,7 +2027,7 @@ function Output({ output, runClass, broken, question, onFollowUp, runId }: {
                   <EvidenceField
                     ref={key === firstEvidence ? docRef : undefined}
                     artifact={evidence.get(key)!.artifact} text={value} runId={runId} dense={dense} label={key}
-                    tally={!banner}
+                    tally={!banner} runClass={runClass}
                     onDoc={key === firstEvidence ? setTallyDoc : undefined}
                   />
                 )
@@ -2262,6 +2262,12 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   const uncitedClaims = Number(issuance?.claims?.uncited_claims ?? 0) || 0
   const numbers = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
   const numbersOk = !counts?.none && !counts?.other
+  // 四期：结论句有判定（开了裁判，或探索运行里按需判过）时多一段「结论 4 句（支持 3 · 无证据 1）」。
+  // 没开裁判的文档里没挂依据的都数在这一段的「无证据」里，不再另起一句；开了裁判的文档里，没挂依据却送了
+  // 裁判的句子按判定数、预筛放掉的不数——出具照样按没挂依据计缺口（require_citation、judge 都是），这时
+  // 结论句那一段盖不全，照出具的数另起「没挂依据的结论句 N」，不能让花了档位的缺口从横幅上消失
+  const claims = counts?.claims?.total ? counts.claims : null
+  const uncitedLine = uncitedClaims > (claims?.uncited ?? 0)
 
   return (
     // data-issuance-banner：画布上成果节点的出具印章据此滚过来；tabIndex 让「去看出具」能把焦点带到这里
@@ -2281,9 +2287,10 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         </span>
       </div>
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
-      {counts && (counts.total > 0 || counts.other > 0 || suspect > 0 || uncitedClaims > 0) && (
+      {counts && (counts.total > 0 || counts.other > 0 || suspect > 0 || uncitedClaims > 0 || !!claims) && (
         // 逐段证据的计数：和报告核对那一行、证据条同一种说法。可疑名字、没挂依据的结论句不是数字，
-        // 各自另起一句。有无证据的数字、可疑名字时才给「定位下一处」（结论句不是片段，定位不到）
+        // 各自另起一句。有无证据的数字、可疑名字、证据不支持（或部分支持）的结论句时才给「定位下一处」——
+        // 结论句靠句末徽标定位；只是没挂依据的结论句没有徽标，定位不到
         <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
           {numbers && (
             <span className="tnum" style={{ color: numbersOk ? 'var(--st-done)' : 'var(--st-waiting)' }}>{numbers}</span>
@@ -2293,12 +2300,14 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
               {numbers ? '· ' : ''}{EVIDENCE_STATE.suspect.glyph} {EVIDENCE_TEXT.suspectTag} {formatNumber(suspect)}
             </span>
           )}
-          {uncitedClaims > 0 && (
-            <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-claims="">
-              {numbers || suspect > 0 ? '· ' : ''}{EVIDENCE_TEXT.uncitedClaimsTag} {formatNumber(uncitedClaims)}
+          {claims && <ClaimTally claims={claims} lead={!!numbers || suspect > 0} />}
+          {uncitedLine && (
+            <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-claims=""
+                  title={claims ? JUDGE_TEXT.uncitedBesides : undefined}>
+              {numbers || suspect > 0 || claims ? '· ' : ''}{EVIDENCE_TEXT.uncitedClaimsTag} {formatNumber(uncitedClaims)}
             </span>
           )}
-          {(counts.none > 0 || counts.other > 0 || suspect > 0) && evidence?.onNext && (
+          {(counts.none > 0 || counts.other > 0 || suspect > 0 || !!claims?.unsupported || !!claims?.partial) && evidence?.onNext && (
             <button type="button" className="btn btn-xs" data-evidence-next="" onClick={evidence.onNext}>
               {EVIDENCE_TEXT.locateNext}
             </button>

@@ -118,22 +118,21 @@ def test_published_level_warnings_get_no_fix():
 # --------------------------------------------------------------------------
 
 
-def test_judge_becomes_require_citation_under_governed():
-    graph = traceable(report={**STRICT, "claims": "judge"})
+def test_an_invalid_claims_value_becomes_require_citation_under_governed():
+    graph = traceable(report={**STRICT, "claims": "sometimes"})
     fid = "report.claims_invalid:write"
     fix = plan(graph)[fid]
-    assert fix["kind"] == "auto" and fix["preview"] == {"field": "claims", "before": "judge",
+    assert fix["kind"] == "auto" and fix["preview"] == {"field": "claims", "before": "sometimes",
                                                         "after": "require_citation"}
     out = apply_fixes(graph, [fid], level="governed")
     assert out["ok"] is True and config(out["graph"], "write")["claims"] == "require_citation"
 
 
 def test_an_invalid_claims_value_is_a_choice_under_published():
-    graph = traceable(report={"claims": "judge"})
+    graph = traceable(report={"claims": "sometimes"})
     fid = "report.claims_invalid:write"
     fix = plan(graph, "published")[fid]
     assert fix["kind"] == "choice" and [o["value"] for o in fix["options"]] == ["off", "require_citation"]
-    assert fix["default"] == "require_citation"       # 离裁判最近的是「每句结论挂引用」，仍然要人确认
     assert apply_fixes(graph, [fid], level="published")["applied"] == []
     out = apply_fixes(graph, [fid], {fid: "off"}, level="published")
     assert out["applied"] == [fid] and config(out["graph"], "write")["claims"] == "off" and out["ok"] is True

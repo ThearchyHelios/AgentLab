@@ -1,7 +1,7 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { TYPE_LABEL, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import { statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
@@ -646,6 +646,23 @@ function queryTitle(sql: string, source: string): string {
 
 /** agent 开了 cite_fields 时循环结束后那次结构化抽取 */
 const EXTRACT_TITLE = '按出处抽取字段'
+/**
+ * report.checked 带的裁判摘要 → 「结论 4 句（支持 1 · 不支持 1 · 未裁判 2）」，和出具横幅同一种说法。
+ * 「不是结论句」不算；没有摘要（没开裁判、老后端）返回空串
+ */
+function judgeTally(judge: unknown): string {
+  const c = judge && typeof judge === 'object' ? (judge as { counts?: Record<string, unknown> }).counts : undefined
+  if (!c || typeof c !== 'object') return ''
+  const n = (k: string) => (typeof c[k] === 'number' && Number.isFinite(c[k] as number) ? c[k] as number : 0)
+  const counts = { supported: n('supported'), partial: n('partial'), unsupported: n('unsupported'), unjudged: n('unjudged'),
+                   uncited: 0 }
+  return claimTally({ ...counts, total: counts.supported + counts.partial + counts.unsupported + counts.unjudged })
+}
+
+/** 报告撰写节点请裁判模型判断结论句（四期，claims: judge）：units 是这一批几句 */
+const judgeTitle = (units: unknown) =>
+  `请裁判模型判断${typeof units === 'number' && units > 0 ? ` ${formatNumber(units)} 句` : ''}结论`
+const JUDGE_FAILED_TITLE = '结论句裁判没跑成'
 
 /** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
 const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
@@ -729,6 +746,59 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         title: `有${n ? ` ${n} 个` : ''}字段核对不了出处，记为空值（没有兜底成 0）`,
         sub: message.match(/没有兜底成 0）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
         next: '模型说的出处在查询结果里找不到。让它先查到这些字段再交，查不到的就是空',
+      }
+    }
+    case 'judge_limit': {
+      // 「结论句裁判已到上限（这份报告的裁判金额上限 $0.05）：3 句没判，记为未裁判；已判的保留」（judge.py run_request）
+      const n = message.match(/[：:]\s*(\d+)\s*句没判/)?.[1]
+      return {
+        title: `结论句裁判已到上限${n ? `，${n} 句没判` : ''}（记为未裁判，已判的保留）`,
+        sub: message.match(/已到上限（(.+?)）/)?.[1],
+        next: '没判的结论句不能算完整出具。到报告撰写节点的「结论句裁判」调高上限（也可以设成不限），或到设置 → 证据裁判改默认值',
+        fix: 'canvas',
+      }
+    }
+    case 'judge_failed': {
+      // 「结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（…）」
+      return {
+        title: '结论句裁判没跑完，没判的记为未裁判',
+        sub: message.replace(/^结论句裁判没跑完[：:]\s*/, '') || undefined,
+        next: '没判的结论句记一条缺口，出具不能算完整。先看裁判模型的接入（设置 → 证据裁判）能不能用，再重跑',
+      }
+    }
+    case 'judge_unpriced': {
+      // 「模型「x」不在价格目录里，按令牌估不出金额：金额上限（每份报告、每次点击、每日）对它不起作用，…」
+      const model = message.match(/模型「(.+?)」/)?.[1]
+      return {
+        title: `裁判模型${model ? `「${model}」` : ''}估不出金额，金额上限对它不起作用`,
+        sub: message.split(/[：:]/).slice(1).join('：').trim() || undefined,
+        next: '费用只受句数、时长上限约束。要按金额控住，换一个价格目录里有的裁判模型',
+      }
+    }
+    case 'judge_same_model': {
+      // 「裁判模型和写作模型都是「x」：等于自己审自己，…。到设置里选一个不同的「证据裁判模型」…」
+      const model = message.match(/都是「(.+?)」/)?.[1]
+      return {
+        title: `裁判模型和写作模型都是${model ? `「${model}」` : '同一个'}：等于自己审自己`,
+        next: '到设置 → 证据裁判选一个不同的模型，或者在报告撰写节点的「结论句裁判」里指定裁判模型',
+        fix: 'canvas',
+      }
+    }
+    case 'report_rewrite': {
+      // 「裁判认为 2 句结论证据不支持（「…」「…」），已交回写作者只改这几句」
+      const n = message.match(/裁判认为\s*(\d+)\s*句/)?.[1]
+      return {
+        title: `裁判认为${n ? ` ${n} 句` : ''}结论证据不支持，已交回写作者只改这几句`,
+        sub: message.match(/证据不支持（(.+)）/)?.[1],
+      }
+    }
+    case 'report_rewrite_rejected': {
+      // 「改写稿冒出 1 处原稿没有的问题（「…」），没有采用，保留原稿和原来的判定」
+      const n = message.match(/冒出\s*(\d+)\s*处/)?.[1]
+      return {
+        title: `改写稿冒出${n ? ` ${n} 处` : ''}原稿没有的问题，没有采用`,
+        sub: message.match(/问题（(.+)）/)?.[1],
+        next: '保留的是原稿和原来的判定',
       }
     }
     case 'repair_invented': {
@@ -1387,12 +1457,15 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 一出现就成行：模型想的那几十秒里得有一行在走，而不是等 end 才冒出来。
         // 团队成员和调度者的调用没有 start（它们的 end 只用来记账），不会走到这
         closeLlm(nodeId, 'done', at)
-        // agent 开了 cite_fields：循环结束后多一次结构化抽取，按出处把字段交出来。它不是在「作答」
+        // agent 开了 cite_fields：循环结束后多一次结构化抽取，按出处把字段交出来。它不是在「作答」。
+        // 报告撰写节点请裁判模型判断结论句（purpose judge）同理，另起名字
         const extract = d.purpose === 'cite_fields'
+        const judging = d.purpose === 'judge'
         const step: Step = {
-          id: `llm-${seq}`, seq, kind: 'llm', title: extract ? EXTRACT_TITLE : '思考并作答',
+          id: `llm-${seq}`, seq, kind: 'llm',
+          title: extract ? EXTRACT_TITLE : judging ? judgeTitle(d.units) : '思考并作答',
           status: 'running', nodeId, startedAt: at,
-          ...(extract ? { code: 'cite_fields' } : {}),
+          ...(extract ? { code: 'cite_fields' } : judging ? { code: 'judge' } : {}),
           ...(d.model ? { detail: `模型：${d.model}` } : {}),
         }
         pendingLlm.set(nodeId ?? '_', step)
@@ -1427,6 +1500,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           // 状态记成做完（琥珀色）而不是 failed：failed 会把这一行和「执行」那一栏的标头都画成红的
           step.level = 'warn'
           step.title = `${EXTRACT_TITLE}没跑成`
+          step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
+        }
+        if (d.purpose === 'judge' && d.error) {
+          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败
+          step.level = 'warn'
+          step.title = JUDGE_FAILED_TITLE
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         pendingLlm.delete(nodeId ?? '_')
@@ -1684,7 +1763,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const none = counts ? counts.none + counts.other : 0
         const violations: any[] = Array.isArray(d.violations) ? d.violations : []
         const repairs = num(d.repairs) ?? 0
-        const tally = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
+        const tally = [counts ? evidenceTally(counts.cited, counts.total, counts.other) : '', judgeTally(d.judge)]
+          .filter(Boolean).join(' · ')
         const listed = violations.slice(0, 8)
           .map((v) => `· ${String(v?.message ?? v?.text ?? v?.code ?? '')}`).filter((x) => x.length > 2)
         const more = violations.length > listed.length ? [`…另有 ${violations.length - listed.length} 处`] : []
@@ -1697,6 +1777,21 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           ...(listed.length ? { detail: [...listed, ...more].join('\n') } : {}),
           ...(repairs ? { meta: `重写 ${repairs} 次` } : {}),
           ...(typeof d.doc_artifact === 'string' && d.doc_artifact ? { artifact: d.doc_artifact } : {}),
+        }, nodeId)
+        break
+      }
+
+      case 'evidence.judged': {
+        // 探索运行跑完、封存之后，有人点开结论句请模型判断：判定追加在封存之后，不改封存的报告
+        const verdicts = d.verdicts && typeof d.verdicts === 'object' ? Object.values(d.verdicts as Record<string, any>) : []
+        const judged = verdicts.filter((v) => ['supported', 'partial', 'unsupported', 'not_a_claim'].includes(v?.status)).length
+        const hit: string[] = Array.isArray(d.limits_hit) ? d.limits_hit : []
+        push({
+          id: `ej-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: 'evidence_judged',
+          level: hit.length || (Array.isArray(d.gaps) && d.gaps.length) ? 'warn' : 'info',
+          title: `封存后按需裁判了 ${formatNumber(judged)} 句结论${hit.length ? '，有的到了上限没判' : ''}`,
+          sub: '封存后追加 · 模型判断，非确定',
+          ...(d.model ? { detail: [`模型：${d.model}`, ...(Array.isArray(d.gaps) ? d.gaps.map(String) : [])].join('\n') } : {}),
         }, nodeId)
         break
       }

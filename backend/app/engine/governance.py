@@ -8,12 +8,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.engine.schema import (
+    CLAIMS_JUDGE,
     GraphNode,
     GraphSpec,
     NodeType,
     ValidationResult,
     _caliber_inputs,
     claims_problem,
+    contract_needs_metrics,
+    judge_problems,
     type_label,
     validate_graph,
 )
@@ -158,7 +161,7 @@ def _lint_contract(
     if isinstance(sources, str):
         sources = [sources]
 
-    if not sources:
+    if not sources and contract_needs_metrics(contract):
         flag("出具契约没有声明 metrics_from（指标来自哪个「口径卡」节点），叙述里的数字无从回指",
              code="contract.metrics_from_missing", node_id=node_id, hard=True, field="contract.metrics_from")
     for src in sources:
@@ -177,7 +180,11 @@ def _lint_contract(
              "（叙述），数字回指校验不会执行", code="contract.report_from_missing", node_id=node_id, hard=True,
              field="contract.report_from")
 
-    if strict and not (contract.get("required") or []):
+    # 引用模式下整张图没有口径卡（只引查询单元格的问数据图）：没有指标可列，strict + cells 已经保证
+    # 每个数点得开出处、对不上就不予出具（用户 2026-09-29 拍板）。有口径卡的照旧要列必需指标——
+    # 按图里有没有口径卡判，不按契约写没写 metrics_from，免得不写 metrics_from 就绕过去
+    cells_only = contract.get("report_from") not in (None, "") and not metric_nodes
+    if strict and not (contract.get("required") or []) and not cells_only:
         flag(
             "受管模板的出具契约必须声明 required（必需指标），否则「不予出具」这一档永远触发不了",
             code="contract.required_missing", node_id=node_id, hard=True, field="contract.required",
@@ -202,7 +209,7 @@ def _lint_contract(
 #
 # G1 带契约的出口核对报告撰写节点的文档，成果字段的文字只能来自报告撰写节点
 # G2 模型写的文字不绕过报告撰写节点直接流进出口（从图上追）
-# G3 报告撰写节点写明 numbers: strict、on_violation: fail、claims: require_citation
+# G3 报告撰写节点写明 numbers: strict、on_violation: fail、claims: require_citation（或 judge，带上预算）
 # G4 口径卡的输入不来自计算角色的沙箱代码
 # G5 给口径卡供数的 agent 配 output_schema 并开 cite_fields（模型调用节点不能给口径卡供数）
 #
@@ -216,6 +223,11 @@ REPORT_POLICY = (
     ("on_violation", "fail", "重写之后还违规就让节点失败，不带着问题出具"),
     ("claims", "require_citation", "没挂引用的结论句计入缺口，按出具档位降档"),
 )
+#: 除了 REPORT_POLICY 里写的那个值，还认的更严的写法。claims: judge 在挂引用之外再请另一个模型按证据逐句
+#: 裁判，不支持的按 on_unsupported 判档——比 require_citation 严，但要写预算（见 judge_budget_missing）
+REPORT_POLICY_ALSO: dict[str, tuple[str, ...]] = {"claims": (CLAIMS_JUDGE,)}
+#: 不限的写法：judge.max_cost_usd 写 null。说给人听的时候照 engine/judge 设置项的说法
+JUDGE_UNLIMITED = "不设上限，费用只受句数、时长上限和每日上限约束"
 
 #: 产出本身就是证据、或者由系统确定地算出来的节点。成果字段取它们的值，不算「别的节点写的字」
 _TRACEABLE = (NodeType.REPORT, NodeType.METRICS, NodeType.INPUT, NodeType.TOOL, NodeType.RETRIEVE)
@@ -287,6 +299,21 @@ def _effective(spec: GraphSpec, node: GraphNode, key: str, default: Any = None) 
     """和运行时 NodeContext.cfg 同一个规则：节点上没写就取图级 defaults。"""
     value = node.config.get(key)
     return spec.defaults.get(key, default) if value in (None, "") else value
+
+
+def judge_budget_missing(spec: GraphSpec, node: GraphNode) -> bool:
+    """claims 是 judge、生效的 judge 配置里却没有 max_cost_usd 这个键（G3）。
+
+    写 null 是显式的不限，算写了；没写的键运行时取设置里的默认——受管出具要作者自己定。judge 本身写坏了
+    （不是对象、max_cost_usd 写成了别的东西）由 validate 的 report.judge_invalid 报，这里不重复。
+    judge 和 claims 一样按运行时的规则取：节点上写了就整个用节点的，不和图级 defaults 拼。
+    """
+    if _effective(spec, node, "claims") != CLAIMS_JUDGE:
+        return False
+    judge = _effective(spec, node, "judge")
+    if any(field in ("judge", "judge.max_cost_usd") for field, _ in judge_problems(judge)):
+        return False
+    return not (isinstance(judge, dict) and "max_cost_usd" in judge)
 
 
 class _Graph:
@@ -489,13 +516,20 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
         for key, want, why in REPORT_POLICY:
             value = _effective(spec, node, key)
             if key == "claims" and claims_problem(value):
-                continue        # 写了不支持的值（比如 judge），validate 的 report.claims_invalid 报
-            if value != want:
+                continue        # 写了不认识的值，validate 的 report.claims_invalid 报
+            also = REPORT_POLICY_ALSO.get(key, ())
+            if value != want and value not in also:
                 now = "现在没写" if value in (None, "") else f"现在是 {value}"
-                loose.append((key, f"{key}: {want}（{why}；{now}）"))
+                more = "".join(f"，或者更严的 {v}" for v in also)
+                loose.append((key, f"{key}: {want}（{why}{more}；{now}）"))
         if loose:
             flag(f"{_who(node)}要写明 {'；'.join(text for _, text in loose)}。受管模板的报告撰写节点按最严的规则自查",
                  code="governed.report_policy", node_id=node.id, hard=True, field=loose[0][0])
+        if judge_budget_missing(spec, node):
+            flag(f"{_who(node)}的结论句由模型裁判（claims: judge），却没有写每份报告的裁判预算：在 judge 里写 "
+                 "max_cost_usd——写一个金额（美元），或者显式写 null 表示不限（" + JUDGE_UNLIMITED + "）。"
+                 "受管出具不让裁判的花费悄悄按设置里的默认值走",
+                 code="governed.judge_budget", node_id=node.id, hard=True, field="judge.max_cost_usd")
 
     # G4、G5
     feeders: dict[str, tuple[GraphNode, list[str]]] = {}

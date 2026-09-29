@@ -207,14 +207,21 @@ NODE_REFERENCE = """\
   - 句末的 [[see:m:指标id,Q1,K1]]：这句结论的依据，不显示
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
   numbers 默认 strict（裸数字算违规）。claims 是结论句策略：off（默认，不管）/ require_citation（每句结论都要
-  挂引用，没挂的计入缺口、出具降档）；judge（模型裁判）在后续版本支持，现在写了整张图跑不起来。entities 默认 link
+  挂引用，没挂的计入缺口、出具降档）/ judge（在 require_citation 之外，再请另一个模型按每句挂的依据判断支不支持：
+  正式运行在节点里判，证据不支持的按 judge.on_unsupported 处置——degrade 降档（默认）或 withhold 不予出具；
+  探索运行不在节点里花钱，读的人点开哪句再按需判哪句，只标注）。judge 的子配置写在节点的 judge 里：judge.model、
+  judge.provider 指定裁判模型（建议和写作模型不同，同一个模型等于自己审自己；不写就用设置里的「证据裁判模型」）；
+  judge.max_cost_usd、judge.max_claims、judge.timeout_s 是每份报告的裁判金额、句数、时长上限，写 null 表示不限，
+  不写取设置里的默认；judge.rewrite_once 默认 false，打开后把证据不支持的句子交回写作者只改一次。entities 默认 link
   （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
   required:[必需指标id], expected:[期望指标id], strict: true}。成果字段写 {{ nodes.报告节点id.text }}，
   前后不要拼别的字——拼了就没法逐段对应证据，出具会降档。受管模板的报告要直接引用查询单元格
-  （[[v:]] / [[table:]]）的，契约里写 cells: true，否则这些引用按解析不了算
+  （[[v:]] / [[table:]]）的，契约里写 cells: true，否则这些引用按解析不了算；只引单元格、图里没有口径卡的
+  （问数据的典型图），契约不写 metrics_from，也不写 required / expected
   要按受管级别发布的模板（发布前检查不过就发不出去）：报告节点写明 numbers: "strict"、on_violation: "fail"、
-  claims: "require_citation"；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
+  claims: "require_citation"（或者更严的 claims: "judge"，这时 judge 里必须写 judge.max_cost_usd——写一个金额，或者
+  写 null 表示不限，预算要用户定，拿不准就问）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
   供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
   否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
 
@@ -321,7 +328,7 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             # 三期起报告会核对写出来的表名、字段名：instructions 里让它「列出用到的表」时，编出来的名字会被标出来
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]] 或放进反引号，只写 agent 真查过的名字，"
             "编造的会被标出来；要引用知识库原话就在 report 前接 retrieve，用 [[q:K1|原话]] 逐字引用。问数是探索运行，"
-            "report 的 claims 不用写\n"
+            "report 的 claims 不用写：结论句支不支持，由读答案的人点开时按需请模型判断\n"
             "- 用户要的是周报、要三档出具时，按搭图规则配口径卡和 report_from 契约\n"
             "- 不要用 transform 解析 agent / llm 的文字：要把 agent 查到的数交给下游，就给它配 output_schema + "
             "cite_fields\n"
@@ -1633,7 +1640,11 @@ _ASSIST_RULES = """\
   审批策略只能往严里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行），不放宽、不删掉，更不改成 never；
   不取消子工作流钉住的版本；发布级别不是你能改的。结构要动（比如换掉协作团队），输出 question 说明怎么拆，不要自己动手；
   报告撰写节点的 numbers、on_violation、claims 只能往严里改（numbers: strict、on_violation: fail、
-  claims: require_citation），不放宽、不删掉；契约里的 claims 也一样；不关 agent 的 cite_fields，不删它的 output_schema
+  claims: require_citation），不放宽、不删掉；claims 从宽到严是 off < require_citation < judge，已经是 judge 的不改回
+  require_citation；judge 缺预算（judge.max_cost_usd）时输出 question 问写多少、还是写 null 不限，不替人定；
+  judge.on_unsupported 是 withhold 的不改回 degrade、不删掉；update_node 会把 judge 整个换掉，补预算时把原来的
+  judge（包括从全图默认继承来的）整份带上，只加 max_cost_usd；契约里的 claims 也一样；
+  不关 agent 的 cite_fields，不删它的 output_schema
 - 要人拿主意的，不替人选、不编：required 该包括哪些指标、几张口径卡该用哪张、钉哪个版本、协作团队拆成哪几个
   固定步骤、沙箱代码节点是在取数还是在计算（不许自己把 evidence_role 设成 source）……每一处输出一行
   {"op":"question","node_id":"节点 id","text":"要问的话，把候选列出来"}，那一处不改

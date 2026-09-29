@@ -69,6 +69,9 @@ class EventType(StrEnum):
     # 报告撰写节点的自查结果：报告文档工件 id、统计、违规清单。落在封存范围内，
     # 证据接口靠它找到文档——不去翻不受封存保护的 artifacts 表
     REPORT_CHECKED = "report.checked"
+    # 探索运行里按需裁判的结论句判定：点开哪句才判哪句，追加在封存之后（post_seal），是批注不是证据。
+    # 封存核对只覆盖 manifest_seq 之前的事件，追加它不影响 verify；封存的报告文档一个字都不改
+    EVIDENCE_JUDGED = "evidence.judged"
 
     # 其他
     LOG = "log"

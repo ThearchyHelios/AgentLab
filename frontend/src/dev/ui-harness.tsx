@@ -27,6 +27,7 @@ import { Markdown } from '../run/Markdown'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceQuery from '../run/__tests__/evidence-query.json'
 import evidenceEntity from '../run/__tests__/evidence-entity.json'
+import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import { EvidenceGuessView } from '../run/EvidenceGuess'
 import { IssuanceBanner } from '../run/AssistantStream'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
@@ -194,6 +195,10 @@ const EV_QUERY = evidenceQuery.doc as unknown as EvidenceDocData
 const EV_LEGACY = evidenceFixture.legacy
 /** 第三期：表名字段名、可疑实体、核对不了的名字、逐字引文（evidence-entity.json，compose_doc 真跑出来的） */
 const EV_ENTITY = evidenceEntity.doc as unknown as EvidenceDocData
+/** 第四期：结论句裁判。正式运行节点里判好的（inline）、探索运行按需判的（on_demand）、没开裁判的探索运行 */
+const EV_JUDGE = evidenceJudge.formal.doc as unknown as EvidenceDocData
+const EV_JUDGE_EXPLORE = evidenceJudge.explore.doc as unknown as EvidenceDocData
+const EV_JUDGE_PLAIN = evidenceJudge.plain.doc as unknown as EvidenceDocData
 /** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
 const LEGACY_LOOSE = {
   matched: EV_LEGACY.matched.map(({ start: _s, end: _e, ...m }) => m),
@@ -301,6 +306,60 @@ function EvidenceOnly() {
                   evidence={{
                     counts: { total, cited: total, none: 0, other: 0, hidden: 0, structural: 0, noSegment: 0, suspect, unverified: 0 },
                     onNext: () => { const w = window as any; w.__issuanceNext = (w.__issuanceNext ?? 0) + 1 },
+                  }} />
+              </div>
+            ))}
+          </div>
+        </div>
+        {/*
+          第四期：结论句裁判。片段接口、按需裁判接口由 check-evidence 用 page.route 伪造（按 runId 认出夹具）。
+          探索运行没开裁判的那份不给运行类别：面板按运行 id 取一次
+        */}
+        <div className="flex flex-col gap-4" id="evidence-judge-demo">
+          <div id="evidence-judge" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">正式运行 · 节点里当场判的结论句（进封存）</div>
+            <EvidenceDoc doc={EV_JUDGE} artifact={evidenceJudge.formal.doc_artifact} runId={evidenceJudge.formal.run_id}
+                         runClass="formal" label="answer" tally />
+          </div>
+          <div id="evidence-judge-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_JUDGE} artifact={evidenceJudge.formal.doc_artifact} runId={evidenceJudge.formal.run_id}
+                         runClass="formal" label="answer" dense tally />
+          </div>
+          <div id="evidence-judge-explore" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">探索运行 · 按需裁判（点开哪句判哪句，封存后追加）</div>
+            <EvidenceDoc doc={EV_JUDGE_EXPLORE} artifact={evidenceJudge.explore.doc_artifact} runId={evidenceJudge.explore.run_id}
+                         label="answer" tally />
+          </div>
+          <div id="evidence-judge-explore-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_JUDGE_EXPLORE} artifact={evidenceJudge.explore.doc_artifact} runId={evidenceJudge.explore.run_id}
+                         label="answer" dense tally />
+          </div>
+          <div id="evidence-judge-plain" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">探索运行 · 没开裁判的报告（照样能点开结论句请模型判断）</div>
+            <EvidenceDoc doc={EV_JUDGE_PLAIN} artifact={evidenceJudge.plain.doc_artifact} runId={evidenceJudge.plain.run_id}
+                         label="answer" tally />
+          </div>
+          {/* 出具横幅那一行多一段结论句：「结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）」 */}
+          <div id="issuance-claims" className="flex flex-col gap-2 rounded-lg border p-3">
+            {/*
+              judge-uncited：开了裁判的文档，没挂依据的那句送了裁判、按判定数在「支持 3」里（或预筛放掉了不数），
+              出具（io.py）照样按没挂依据记 1 句——横幅得另起「没挂依据的结论句 1」，不能被结论句那一段吞掉
+            */}
+            {([
+              ['judged', { total: 4, supported: 1, partial: 1, unsupported: 1, unjudged: 1, uncited: 0 }, null],
+              ['cited', { total: 4, supported: 3, partial: 0, unsupported: 0, unjudged: 0, uncited: 1 }, null],
+              ['all', { total: 2, supported: 2, partial: 0, unsupported: 0, unjudged: 0, uncited: 0 }, null],
+              ['judge-uncited', { total: 3, supported: 3, partial: 0, unsupported: 0, unjudged: 0, uncited: 0 },
+                { policy: 'judge', uncited_claims: 1 }],
+            ] as const).map(([key, claims, issued]) => (
+              <div key={key} data-issuance-case={key}>
+                <IssuanceBanner
+                  issuance={{ tier: 'degraded', matched_numbers: 3, metrics_checked: 0,
+                              claims: issued ?? { policy: 'require_citation', uncited_claims: claims.uncited } }}
+                  evidence={{
+                    counts: { total: 3, cited: 3, none: 0, other: 0, hidden: 0, structural: 0, noSegment: 0, suspect: 0,
+                              unverified: 0, claims },
+                    onNext: () => { const w = window as any; w.__claimsNext = (w.__claimsNext ?? 0) + 1 },
                   }} />
               </div>
             ))}
@@ -599,6 +658,7 @@ function Harness() {
   evidenceFixture,
   evidenceQuery,
   evidenceEntity,
+  evidenceJudge,
 }
 
 createRoot(document.getElementById('root')!).render(

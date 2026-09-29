@@ -11,7 +11,7 @@
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import { ApiError } from '../api/client'
-import { APPROVAL_POLICY_LABEL } from '../lib/terms'
+import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL } from '../lib/terms'
 import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
 import type { AutofixResult, GraphSpec, PublishCheck, PublishFix, PublishLevel, ValidationIssue } from '../types'
@@ -370,14 +370,33 @@ export type NodeNameOf = (id: string) => string | undefined
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
-/** 修复改的是哪个字段：顶层键用节点定义里的叫法，契约里的键另有一张表，其余原样 */
+/** 修复改的是哪个字段：顶层键用节点定义里的叫法，契约里的键另有一张表，结论句裁判（judge.*）另一张，其余原样 */
 export function fixFieldLabel(field: string | null | undefined, nodeType?: string): string {
   if (!field) return ''
   const [head, ...rest] = field.split('.')
   if (head === 'label') return '节点名称'
   const def = nodeType ? NODE_DEFS[nodeType as keyof typeof NODE_DEFS] : undefined
   const base = def?.fields.find((f) => f.key === head)?.label ?? EXTRA_FIELDS[head] ?? head
-  return [base, ...rest.map((k) => SUB_KEYS[k] ?? k)].join(' · ')
+  const sub = head === 'judge' ? JUDGE_FIELD_LABEL : SUB_KEYS
+  return [base, ...rest.map((k) => sub[k] ?? k)].join(' · ')
+}
+
+/** judge 里写 null 表示不限的三项上限：预览里 null 写「不限」，不写「（空）」——没写和不限是两回事 */
+const JUDGE_LIMITS = new Set(['max_claims', 'max_cost_usd', 'timeout_s'])
+
+/** judge.* 一项的值怎么写：上限带单位，null 是不限，判档写选项文字。不是 judge 的键返回 null */
+function judgeValueText(value: unknown, key: string): string | null {
+  if (JUDGE_LIMITS.has(key)) {
+    if (value === null) return '不限'
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return key === 'max_cost_usd' ? `$${value}` : key === 'timeout_s' ? `${value} 秒` : `${value} 句`
+    }
+    return null
+  }
+  if (key === 'on_unsupported' && typeof value === 'string' && value in JUDGE_ON_UNSUPPORTED_LABEL) {
+    return JUDGE_ON_UNSUPPORTED_LABEL[value]
+  }
+  return null
 }
 
 /**
@@ -386,6 +405,10 @@ export function fixFieldLabel(field: string | null | undefined, nodeType?: strin
  * 其余压成一行
  */
 export function fixValueText(value: unknown, field?: string | null, nameOf?: NodeNameOf): string {
+  if (field?.startsWith('judge.')) {
+    const said = judgeValueText(value, field.slice(6))
+    if (said != null) return said
+  }
   if (value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length)
     || (isRecord(value) && !Object.keys(value).length)) return '（空）'
   const key = field?.split('.').pop()
@@ -414,6 +437,14 @@ export function fixValueText(value: unknown, field?: string | null, nameOf?: Nod
  * 不是整份契约的返回 null
  */
 export function fixValueLines(value: unknown, field?: string | null, nameOf?: NodeNameOf): string[] | null {
+  // 整份结论句裁判（补预算那条修复按整份 judge 记）：一键一行，「金额上限（美元）：不限」
+  if (field === 'judge' && isRecord(value) && Object.keys(value).length) {
+    const order = Object.keys(JUDGE_FIELD_LABEL)
+    return Object.keys(value).sort((a, b) => {
+      const [x, y] = [order.indexOf(a), order.indexOf(b)]
+      return (x < 0 ? order.length : x) - (y < 0 ? order.length : y)
+    }).map((k) => `${JUDGE_FIELD_LABEL[k] ?? k}：${fixValueText(value[k], `judge.${k}`, nameOf)}`)
+  }
   if (field !== 'contract' || !isRecord(value) || !Object.keys(value).length) return null
   const order = Object.keys(CONTRACT_KEYS)
   const keys = Object.keys(value).sort((a, b) => {

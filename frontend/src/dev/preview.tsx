@@ -11,6 +11,7 @@ import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
 import mdSamples from '../run/__tests__/markdown-samples.json'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
+import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
   CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
@@ -234,11 +235,29 @@ function evidenceTurns(): StreamTurn[] {
   ]
 }
 
+/**
+ * 四期：结论句裁判走问数据页、画布右栏同一条路（Output → EvidenceField → 出具横幅）。
+ * - judge-plain：探索运行、报告没开裁判（require_citation）。点开结论句请模型判断之后，横幅得多出「结论 N 句」那一段；
+ * - judge-formal：正式运行、报告 claims=judge，节点里判好了。没挂依据的那句送了裁判（到上限没判），出具照样按没挂依据记缺口。
+ * 报告工件、片段接口、按需裁判的 POST 由 check-evidence 用 page.route 伪造（夹具 evidence-judge.json）
+ */
+function evidenceJudgeTurns(): StreamTurn[] {
+  const { plain, formal } = evidenceJudge
+  return [
+    { id: 'judge-plain', question: '写一份本周周报', phase: 'done', status: '已完成', runClass: 'exploratory',
+      steps: [], output: plain.output, runId: plain.run_id },
+    { id: 'judge-formal', question: '写一份本周周报（受管模板）', phase: 'done', status: '已完成', runClass: 'formal',
+      steps: [], output: formal.output, runId: formal.run_id },
+  ]
+}
+
 /** 合成场景：新后端才有的事件，老库里导不出来 */
 function synthetic(name: string): StreamTurn[] {
   switch (name) {
     case 'evidence':
       return evidenceTurns()
+    case 'evidence-judge':
+      return evidenceJudgeTurns()
     case 'team-live': {
       const ev = rebase(teamRun('members'))
       return [{ id: 'team-live', question: '比较三家供应商的交期风险', phase: 'running', status: '运行中',

@@ -132,15 +132,15 @@ export const APPROVAL_POLICY_LABEL: Record<'dangerous' | 'always' | 'never', str
  * 可点击证据：片段状态的叫法。正文里片段的 aria-label、面板标题、图例都用这一份。
  * 外观（线型、字形、颜色）在 lib/evidence.ts，和这里一一对应。
  *
- * 本期（数字层）实际只会出现「有出处」和「无证据」；其余几种是后续期的，先把叫法定下，
- * 免得到时候各处各起一个名字。
+ * 概率性的四种（四期的结论句裁判）挂在句末的徽标上：有依据、部分有依据、证据不支持都是模型的判断，
+ * 叫法里写明「模型判断」；未裁判不带「有引用」——没挂依据、只有方向词的结论句也会送裁判、也会没判。
  */
 export const EVIDENCE_STATE_LABEL = {
   deterministic: '有出处',
   supported: '模型判断：有依据',
   partial: '模型判断：部分有依据',
   unsupported: '模型判断：证据不支持',
-  unjudged: '有引用，未裁判',
+  unjudged: '未裁判',
   none: '无证据',
   connective: '连接性文字',
   candidate: '猜测的来源',
@@ -312,6 +312,188 @@ export const EVIDENCE_TEXT = {
   guessDiff: (d: string) => `相差 ${d}`,
   guessCandidates: '可能来自',
 } as const
+
+/** 结论句按裁判结论分成的几堆（lib/evidence 的 claimCounts 数出来的） */
+export interface ClaimTallyCounts {
+  /** 结论句总数：模型判为「不是结论句」的不算 */
+  total: number
+  supported: number
+  partial: number
+  unsupported: number
+  /** 送了裁判、没判成（到上限、调用失败）或还没请模型判断的 */
+  unjudged: number
+  /** 没有判定、也没挂依据的结论句 */
+  uncited: number
+}
+
+/**
+ * 「结论 4 句（支持 3 · 无证据 1）」：出具横幅、证据条、报告核对那一行共用，和数字那一段同一种说法——
+ * 先说总数，括号里按状态分，为 0 的不写。没有结论句时返回空串
+ */
+export function claimTally(c: ClaimTallyCounts): string {
+  if (!c.total) return ''
+  const parts = [
+    ['支持', c.supported], ['部分支持', c.partial], ['不支持', c.unsupported], ['未裁判', c.unjudged], ['无证据', c.uncited],
+  ].filter(([, n]) => (n as number) > 0).map(([k, n]) => `${k} ${formatNumber(n as number)}`)
+  return `结论 ${formatNumber(c.total)} 句${parts.length ? `（${parts.join(' · ')}）` : ''}`
+}
+
+/**
+ * 结论句裁判（四期）在证据面板、句末徽标里的说法。判断是模型给的：一律写明「模型判断」「非确定」，
+ * 封存之后按需追加的另写「封存后追加」
+ */
+export const JUDGE_TEXT = {
+  section: '模型的解释',
+  claim: '结论句',
+  /** 读屏摘要末尾的操作说明：有证据不支持、部分支持的结论句时 n 也跳到它们的句末徽标 */
+  keysHint: '用左右方向键逐个查看，上下键按句子走，n 跳到下一处无证据或证据不支持的句子，回车打开证据，Esc 关闭',
+  /** 面板里判断的徽标：谁判的、而且不是确定的 */
+  badge: (model: string | null | undefined) => `模型判断 · ${model || '裁判模型'} · 非确定`,
+  postSeal: '封存后追加',
+  /** 判定里没记模型名时的叫法 */
+  judgeModel: '裁判模型',
+  /** 句末徽标的悬停说明：到上限没判的 */
+  limitNotJudged: '已到上限，这句没判（模型没有看过这句）',
+  /** 没判的句子（到上限、没跑成）记着的裁判模型：中性地说，不挂「模型判断」的徽标 */
+  notJudgedBy: (model: string) => `裁判模型 ${model} 没有判这句`,
+  sealedDoc: '报告文档已封存 · 核对一致',
+  sealedWithDoc: '报告文档已封存 · 核对一致，这条判断随报告一起封存',
+  postSealHint: '运行封存之后按需追加的判断：不在封存范围内，封存核对照样一致。它是模型的解释，不是证据',
+  sealedHint: '正式运行里报告撰写节点当场判的，和报告一起封存。它是模型的解释，不是证据',
+  used: (aliases: string[]) => `裁判看过的证据：${aliases.join('、')}`,
+  cites: '挂的依据',
+  noCites: '这句没挂依据（只有方向词、因果词）：裁判看不到任何证据摘录',
+  notClaim: '模型判断：不是结论句',
+  ask: '请模型判断这句',
+  askAgain: '再请模型判断一次',
+  asking: '正在请模型判断…',
+  askHint: '探索运行按需裁判：点一次判这一句，花费计入每次点击和每日的上限',
+  notAsked: '还没请模型判断这句',
+  screened: '预筛认为这句不陈述数据事实（短句、只有过渡的话），没有送裁判',
+  noPrice: '裁判模型不在价格目录里，按令牌估不出金额：金额上限对它不起作用',
+  limit: '已到上限',
+  /** 触顶之后怎么调。按需裁判（每次点击）和正式运行（每份报告）调的地方不一样 */
+  limitHow: {
+    click: {
+      max_cost_usd: '到「设置 → 偏好设置 → 证据裁判」调高「每次点击的金额上限」，或者设成不限，再点一次',
+      daily_max_usd: '到「设置 → 偏好设置 → 证据裁判」调高「每日金额上限」或设成不限；也可以等到明天（按本地日期重新计）',
+      max_claims: '到「设置 → 偏好设置 → 证据裁判」调高「每份报告最多判几句」（报告撰写节点里写了的以节点为准）',
+      timeout_s: '到「设置 → 偏好设置 → 证据裁判」调高「每份报告的时长上限」或设成不限，再点一次',
+    } as Record<string, string>,
+    report: {
+      max_cost_usd: '到报告撰写节点的「结论句裁判」调高金额上限（没写就是设置里「证据裁判」的默认值），也可以设成不限，再发起一次运行',
+      daily_max_usd: '到「设置 → 偏好设置 → 证据裁判」调高「每日金额上限」或设成不限，再发起一次运行',
+      max_claims: '到报告撰写节点的「结论句裁判」调高最多判几句（或设置里的默认值），也可以设成不限，再发起一次运行',
+      timeout_s: '到报告撰写节点的「结论句裁判」调高时长上限（或设置里的默认值），也可以设成不限，再发起一次运行',
+    } as Record<string, string>,
+  },
+  failed: (why: string) => `没判成：${why}`,
+  oldBackend: '这个后端还不支持按需裁判',
+  notFound: '报告里没有这一句',
+  formalOnly: '正式运行的裁判在报告撰写节点里当场完成，不能按需追加',
+  rewritten: '这句是按裁判的意见改写过的（改写一次）',
+  rewriteFrom: '交回改写的原句',
+  rewriteRejected: (reason: string) => `这句交回写作者改写过一次，改写稿没有采用：${reason}`,
+  /**
+   * 横幅上结论句那一段之外另起的「没挂依据的结论句 N」：开了裁判的文档里，没挂依据的句子按判定数（或预筛
+   * 放掉了不数），出具却照样按没挂依据计缺口——悬停时说清这两件事不冲突
+   */
+  uncitedBesides: '没写依据（[[see:]]）的结论句：出具照样计入缺口。模型判过的也算在里面——判定是模型的解释，代替不了依据',
+  /** 句末徽标的 aria-label：「结论句「增长主要来自新客首单」，模型判断：证据不支持，封存后追加」 */
+  badgeLabel: (sentence: string, state: string, postSeal: boolean) =>
+    `结论句「${sentence}」，${state}${postSeal ? '，封存后追加' : ''}`,
+} as const
+
+/**
+ * 报告撰写节点的 judge 子配置（claims 为 judge 时生效）：检查器、发布前修复的预览（「结论句裁判 · 金额上限」）
+ * 共用这份叫法。键同后端 schema.JUDGE_KEYS
+ */
+export const JUDGE_FIELD_LABEL: Record<string, string> = {
+  provider: '裁判模型 · 接入',
+  model: '裁判模型',
+  max_claims: '最多判几句',
+  max_cost_usd: '金额上限（美元）',
+  timeout_s: '时长上限（秒）',
+  rewrite_once: '证据不支持的句子交回改写一次',
+  on_unsupported: '证据不支持时',
+}
+/** judge.on_unsupported：正式运行里证据不支持的结论句怎么判档（探索运行只标注） */
+export const JUDGE_ON_UNSUPPORTED_LABEL: Record<string, string> = {
+  degrade: '出具降档',
+  withhold: '不予出具',
+}
+
+/** 设置页「证据裁判」一组（后端 engine/judge.py 的 JUDGE_DEFAULTS） */
+export const JUDGE_SETTING_TEXT = {
+  label: '证据裁判',
+  hint: '报告里的结论句（「增长主要来自新客首单」这类）由另一个模型按证据逐句判断：正式运行在报告撰写节点里当场判，探索运行点开哪句才判哪句。判断是模型给的，不是系统核对，界面上一律标「非确定」。',
+  provider: '裁判模型 · 接入',
+  model: '裁判模型 · 模型',
+  /** 接入留空、模型也留空：后端依次用 Copilot 的模型、默认接入（judge_model_spec）。只有这时才叫「跟随 Copilot」 */
+  providerDefault: '跟随 Copilot 的模型',
+  /** 接入留空、模型填了：这一级写了就整组用这一级，后端按模型名找接入——不再跟随 Copilot */
+  providerFromModel: '按模型名找接入',
+  modelDefault: '留空：用接入的默认模型',
+  modelFollow: '留空：跟随 Copilot 的模型',
+  differ: '建议和写报告的模型不同：同一个模型审自己写的，写错的地方它多半也看不出来',
+  limits: '上限（每一项都可以设成不限）',
+  reportClaims: '每份报告最多判几句',
+  reportCost: '每份报告的金额上限（美元）',
+  reportTimeout: '每份报告的时长上限（秒）',
+  clickCost: '每次点击的金额上限（美元）',
+  daily: '每日金额上限（美元）',
+  unlimited: '不限',
+  nodeWins: '报告撰写节点的「结论句裁判」里写了的上限以节点为准',
+  spend: (usd: string, calls: number) => `今天已花 $${usd}（${formatNumber(calls)} 次调用）`,
+  unpriced: (n: number) => `另有 ${formatNumber(n)} 次调用估不出金额（模型不在价格目录里），没算进去`,
+  spendNone: '今天还没有裁判调用',
+} as const
+
+/**
+ * 只填了裁判模型、接入留空时实际用哪个接入（后端 judge_model_spec：哪一级写了就整组用哪一级，不跨级拼；
+ * 再由 resolve_provider 按模型名找接入）。scope：设置页（上一级是 Copilot 的模型）还是报告撰写节点（上一级是设置）。
+ * found：按模型名找到的接入；fallback：认不出时后端去调的默认接入
+ */
+export function judgeByModelText(
+  scope: 'settings' | 'node', model: string, found: { name: string; enabled: boolean } | null | undefined,
+  fallback: string | null | undefined,
+): string {
+  const follow = scope === 'settings' ? '「跟随 Copilot」只在接入和模型都留空时生效'
+    : '接入和模型都没写时才跟随设置里的「证据裁判模型」'
+  if (found && !found.enabled) {
+    return `只填了模型：「${model}」属于已停用的接入「${found.name}」，裁判调用会失败、结论句都记为未裁判；启用它或选别的接入`
+  }
+  if (found) return `只填了模型：按模型名用接入「${found.name}」。${follow}`
+  return `只填了模型：没有哪个接入的模型清单里有「${model}」，会拿它去调默认接入${fallback ? `「${fallback}」` : ''}，`
+    + `调不通时结论句都记为未裁判；不是这家的模型请选上接入。${follow}`
+}
+
+/**
+ * 某项上限设成不限时写明它还受什么约束——不要悄悄生效。别的上限也不限时照实少说几样，全不限时
+ * 说到底只受调用次数（结论句的多少）约束。set：各项眼下是不是有上限
+ */
+export function judgeUnlimitedText(
+  key: 'claims' | 'cost' | 'timeout' | 'click' | 'daily',
+  set: { claims: boolean; cost: boolean; timeout: boolean; click: boolean; daily: boolean },
+): string {
+  const list = (items: [boolean, string][]) => items.filter(([on]) => on).map(([, t]) => t)
+  switch (key) {
+    case 'claims': return '不设上限，句数只受报告里结论句多少约束'
+    case 'timeout': return '不设上限，时长只受模型接口自身的超时约束'
+    case 'cost': {
+      const by = list([[set.claims, '句数上限'], [set.timeout, '时长上限'], [set.daily, '每日上限']])
+      return by.length ? `不设上限，费用只受${by.join('、')}约束` : '不设上限，费用只受报告里结论句的多少约束（句数、时长、每日也都不限）'
+    }
+    case 'click': {
+      const by = list([[set.claims, '句数上限'], [set.timeout, '时长上限'], [set.daily, '每日上限']])
+      return by.length ? `不设上限，每次点击只受${by.join('、')}约束` : '不设上限，每次点击只受点开的句数约束（句数、时长、每日也都不限）'
+    }
+    case 'daily': {
+      const by = list([[set.cost, '每份报告的金额上限'], [set.click, '每次点击的金额上限']])
+      return by.length ? `不设上限，每日费用只受${by.join('和')}约束` : '不设上限，每日费用只受模型调用次数约束（每份报告、每次点击也都不限）'
+    }
+  }
+}
 
 /**
  * 记录页「证据」页签：报告、常驻面板、审计表。审计表按状态分组，四组的说法和片段状态同一套

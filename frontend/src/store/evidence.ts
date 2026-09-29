@@ -1,6 +1,10 @@
+import { useEffect, useMemo } from 'react'
 import { create } from 'zustand'
 import { ApiError, api } from '../api/client'
-import type { EvidenceDocData, EvidenceGraph, EvidenceSegmentDetail, EvidenceStats } from '../types'
+import { graphVerdicts, judgedVerdicts } from '../lib/evidence'
+import type {
+  EvidenceDocData, EvidenceGraph, EvidenceJudgeResult, EvidenceSegmentDetail, EvidenceStats, EvidenceVerdict,
+} from '../types'
 
 /**
  * 可点击证据的缓存：报告文档、证据图、点开过的片段。
@@ -12,6 +16,10 @@ import type { EvidenceDocData, EvidenceGraph, EvidenceSegmentDetail, EvidenceSta
  *
  * 出错的不缓存成定论：下次点开再取一次（后端刚重启、接口还没部署到这个版本都会是
  * 一时的）。正在取的不重复发。
+ *
+ * 四期：封存之后按需追加的结论句判定按 `runId@报告` 记在 judged 里（按需裁判接口、片段接口叠上的
+ * 判定都记进来），正文的句末徽标、横幅的结论句计数据此盖过文档里的「未裁判 · 按需」。封存的文档本身
+ * 一个字不改。同一句正在判的不重复发；判过的（判定不是未裁判）不再给按钮，也就不会再发
  */
 
 export interface Slot<T> {
@@ -49,7 +57,22 @@ interface EvidenceState {
    * 不一定还是最近的。清掉以后，运行摘下来（「清除」、换一张图再回来）时 loadLatest 重新取
    */
   dropLatest: (workflowId: string) => void
+  /** 封存之后追加的判定：`runId@报告` → {unit: 判定} */
+  judged: Record<string, Record<string, EvidenceVerdict>>
+  /** 按需裁判的请求：`runId@报告:unit` → 这一次的答复（触顶、失败说什么靠它） */
+  asks: Record<string, Slot<EvidenceJudgeResult>>
+  /** 运行类别（formal / exploratory）：没开裁判的文档靠它认探索运行，按需取一次 */
+  runClasses: Record<string, Slot<string | null>>
+  /** 记下几句封存后追加的判定（片段接口叠上的、证据图带来的） */
+  noteVerdicts: (runId: string, report: string | undefined, verdicts: Record<string, EvidenceVerdict>) => void
+  /** 请模型判断这几句（探索运行）。判定记进 judged；答复（含触顶、出错）记进 asks */
+  judge: (runId: string, report: string | undefined, units: string[]) => Promise<void>
+  loadRunClass: (runId: string) => Promise<void>
 }
+
+/** 封存后追加的判定按哪份报告记：一次运行里有好几份报告时 unit id 会撞（每份都从 u0 数起） */
+export const docKey = (runId: string, report?: string) => `${runId}@${report ?? ''}`
+export const askKey = (runId: string, report: string | undefined, unit: string) => `${docKey(runId, report)}:${unit}`
 
 /**
  * 片段的缓存键：`runId:segId`。一次运行里有好几份报告时片段 id 会撞（每份都从 s0 数起），
@@ -134,5 +157,73 @@ export const useEvidence = create<EvidenceState>((set, get) => {
         return { latest }
       })
     },
+    judged: {},
+    asks: {},
+    runClasses: {},
+    noteVerdicts: (runId, report, verdicts) => {
+      const key = docKey(runId, report)
+      const cur = get().judged[key] ?? {}
+      // 内容一样就不换引用：正文按它重算徽标，片段接口每次答同样的判定不该让整份报告重渲染
+      const fresh = Object.entries(verdicts).filter(([u, v]) => JSON.stringify(cur[u]) !== JSON.stringify(v))
+      if (!fresh.length) return
+      set((s) => ({ judged: { ...s.judged, [key]: { ...(s.judged[key] ?? {}), ...Object.fromEntries(fresh) } } }))
+    },
+    judge: async (runId, report, units) => {
+      const keys = units.map((u) => askKey(runId, report, u))
+      if (!units.length || keys.some((k) => get().asks[k]?.status === 'loading')) return
+      const mark = (slot: Slot<EvidenceJudgeResult>) =>
+        set((s) => ({ asks: { ...s.asks, ...Object.fromEntries(keys.map((k) => [k, slot])) } }))
+      mark({ status: 'loading' })
+      try {
+        const res = await api.evidence.judge(runId, { units, ...(report ? { report } : {}) })
+        get().noteVerdicts(runId, report, judgedVerdicts(res))
+        mark({ status: 'ok', data: res })
+      } catch (error) {
+        mark({ status: 'error', error })
+      }
+    },
+    loadRunClass: (runId) => {
+      const cur = get().runClasses[runId]
+      if (cur && cur.status !== 'error') return Promise.resolve()
+      set((s) => ({ runClasses: { ...s.runClasses, [runId]: { status: 'loading' } } }))
+      return api.runs.get(runId).then(
+        (run) => set((s) => ({ runClasses: { ...s.runClasses, [runId]: { status: 'ok', data: run?.run_class ?? null } } })),
+        (error) => set((s) => ({ runClasses: { ...s.runClasses, [runId]: { status: 'error', error } } })),
+      )
+    },
   }
 })
+
+/**
+ * 一份报告封存之后追加的判定：证据图带来的（reports[].judged），叠上这一页里按需判的、片段接口答的
+ * （后者新）。没有运行、什么都没有时是 undefined
+ */
+export function useVerdicts(runId: string | undefined, report: string | undefined):
+  Record<string, EvidenceVerdict> | undefined {
+  const own = useEvidence((s) => (runId ? s.judged[docKey(runId, report)] : undefined))
+  const graph = useEvidence((s) => (runId ? s.graphs[runId]?.data : undefined))
+  return useMemo(() => {
+    const fromGraph = graphVerdicts(graph, report)
+    if (!own && !Object.keys(fromGraph).length) return undefined
+    return { ...fromGraph, ...(own ?? {}) }
+  }, [own, graph, report])
+}
+
+/**
+ * 这份报告出自探索运行吗（按需裁判只在探索运行里有）。开了裁判的文档自己记着：on_demand 是探索运行、
+ * inline 是正式运行；没开裁判的看调用方给的运行类别，再没有就按运行 id 取一次（enabled 时才取）。
+ * 还不知道时是 null：按钮先不出，免得在正式运行里闪一下
+ */
+export function useExplore(doc: Pick<EvidenceDocData, 'judge'>, runId: string | undefined, runClass: string | undefined,
+  enabled: boolean): boolean | null {
+  const mode = doc.judge?.mode
+  const known = mode === 'on_demand' ? true : mode === 'inline' ? false
+    : runClass ? runClass === 'exploratory' : undefined
+  const slot = useEvidence((s) => (runId ? s.runClasses[runId] : undefined))
+  const loadRunClass = useEvidence((s) => s.loadRunClass)
+  const need = known === undefined && enabled && !!runId
+  useEffect(() => { if (need && runId) void loadRunClass(runId) }, [need, runId, loadRunClass])
+  if (known !== undefined) return known
+  if (!runId) return false
+  return slot?.status === 'ok' ? slot.data === 'exploratory' : null
+}

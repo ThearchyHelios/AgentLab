@@ -1,6 +1,6 @@
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
-  EvidenceAudit, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
+  EvidenceAudit, EvidenceJudgeResult, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, ValidationIssue, VarIssue, Variable, Workflow,
   WorkflowVersion,
 } from '../types'
@@ -545,6 +545,9 @@ export const api = {
   settings: {
     get: () => get<Record<string, any>>('/settings'),
     put: (values: Record<string, any>) => put<Record<string, any>>('/settings', { values }),
+    /** 今天（本地日期）结论句裁判花了多少：设置页放在每日上限旁边。只读，计数只有裁判自己记 */
+    judgeSpend: () => get<{ date?: string; usd?: number; calls?: number; unpriced_calls?: number
+                            daily_max_usd?: number | null }>('/settings/judge/spend'),
   },
 
   // ---- 工具 ----
@@ -708,6 +711,13 @@ export const api = {
      */
     audit: (runId: string, opts?: RequestOptions & { groups?: string[] }) =>
       get<EvidenceAudit>(`/runs/${encodeURIComponent(runId)}/evidence/audit${qs({ groups: opts?.groups?.join(',') || undefined })}`, opts),
+    /**
+     * 按需裁判（四期，只在探索运行里有）：请模型判断这几句结论。答复是 evidence.judged 事件的载荷
+     * （判定、花费、触顶的上限），判定标 post_seal：落在封存之后，不改封存的文档。正式运行回 409。
+     * 一次运行里有好几份报告时 report 给报告节点 id
+     */
+    judge: (runId: string, body: { units: string[]; report?: string }) =>
+      post<EvidenceJudgeResult>(`/runs/${encodeURIComponent(runId)}/evidence/judge`, body),
     /**
      * 导出审计表：?format=json / csv 作为附件下载。回来的是文件本身和后端给的文件名
      * （Content-Disposition；没给就用 evidence-<运行号前 8 位>.<格式>）
