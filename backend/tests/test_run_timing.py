@@ -123,6 +123,37 @@ async def test_resumed_run_keeps_its_start_and_sums_every_segment(slow_transform
     }
 
 
+async def test_bookkeeping_after_the_pause_is_not_counted_twice(slow_transforms, monkeypatch):
+    """停在审批上之后的收尾（写审批记录、发 run.interrupted）不算执行时长。
+
+    以前这一段的执行一直计到 _drive 的 finally，等待又从 run.interrupted 算起：收尾那一截两边都算，
+    active + wait 比墙钟还长。平时只差几毫秒，机器一忙就超出容差（全量并行测试里偶发）。
+    这里把收尾拖慢 0.4 秒，不靠机器忙不忙碰运气。
+    """
+    original = run_manager._handle_updates
+
+    async def slow(run_id, chunk):
+        hit = await original(run_id, chunk)
+        if hit:
+            await asyncio.sleep(0.4)                # 审批卡已经发出去了，引擎也不在执行
+        return hit
+
+    monkeypatch.setattr(run_manager, "_handle_updates", slow)
+    run = await run_manager.start(graph=APPROVAL_GRAPH, input_payload={"question": "q"})
+    paused = await _wait(run.id, ("interrupted", "failed"))
+    assert paused.status == "interrupted", paused.error
+    await asyncio.sleep(WAIT)
+    await run_manager.resume(run.id, {"approved": True})
+    done = await _wait(run.id, ("succeeded", "failed"))
+    assert done.status == "succeeded", done.error
+
+    usage = done.usage
+    # 执行、等待、墙钟严格对得上账：取整各丢不到 1 毫秒
+    assert usage["wall_ms"] >= usage["active_ms"] + usage["wait_ms"] - 2, usage
+    # 0.4 秒的收尾没有算进执行（两段各 SEGMENT 秒，其余开销远小于 0.4 秒）
+    assert usage["active_ms"] < 2 * SEGMENT * 1000 + 400, usage
+
+
 @pytest.fixture
 def fails_once(monkeypatch):
     original = compiler.RUNNERS[NodeType.TRANSFORM]

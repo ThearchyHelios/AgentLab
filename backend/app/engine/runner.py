@@ -591,6 +591,10 @@ class RunManager:
         error_node: str | None = None
 
         deadline: asyncio.Timeout | None = None
+        # 停在审批上的那一刻：这一段的执行算到这里为止。后面写审批记录、发 run.interrupted 是收尾，
+        # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
+        # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
+        paused: float | None = None
         async with self._semaphore:
             try:
                 async with SessionLocal() as session:
@@ -655,8 +659,11 @@ class RunManager:
                         if mode == "custom":
                             await self._handle_custom(run_id, chunk)
                         elif mode == "updates":
+                            # LangGraph 这一轮的节点都跑完了才发出中断：此刻引擎已经停下
+                            at = time.perf_counter()
                             if await self._handle_updates(run_id, chunk):
                                 interrupted = True
+                                paused = at if paused is None else paused
 
                 snapshot = await app.aget_state(config)
                 final_state = dict(snapshot.values or {})
@@ -710,7 +717,8 @@ class RunManager:
                 error_node = terminal[1].get("node_id")
                 logger.exception("run %s 失败", run_id)
             finally:
-                elapsed = int((time.perf_counter() - started) * 1000)
+                stop = paused if status == "interrupted" and paused is not None else time.perf_counter()
+                elapsed = int((stop - started) * 1000)
                 self._finalizing.add(run_id)
                 try:
                     await self._finalize(run_id, status, error, final_state, elapsed,
