@@ -86,7 +86,7 @@ async def test_metrics_from_pointing_at_a_non_card_is_sent_back(client, monkeypa
     events = await generate(client, monkeypatch, model)
     sent = issues_of(events, "repairing")
     assert any(i["code"] == "report.metrics_from_invalid" and i["node_id"] == "write" for i in sent), sent
-    assert "不是「口径卡」" in model.calls[1]
+    assert "不是口径卡" in model.calls[1]
     assert [e["status"] for e in events if e["op"] == "check"] == ["repairing", "passed"]
 
 
@@ -262,4 +262,4 @@ async def test_the_copilot_still_may_not_switch_cells_on_by_itself(client, monke
                                                                    "cells": True}}},
         {"op": "done", "explanation": "补上契约并打开 cells"}])
     [rejected] = [r for r in out["rejected"] if r["fix_id"] == "assist"]
-    assert "cells" in rejected["reason"] and out["ok"] is False
+    assert "单元格引用" in rejected["reason"] and out["ok"] is False

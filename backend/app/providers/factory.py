@@ -29,7 +29,15 @@ class ModelSpec(BaseModel):
 
 
 class ProviderNotConfigured(RuntimeError):
-    pass
+    """模型接入没配好。reason 说缺了什么，hint 说去哪里补；str(e) 是两句连起来的整句，
+    运行失败原因直接用它。设置页的测试弹窗本来就在接入的编辑框里，只取 reason、另给自己的 hint。
+    code 给调用方按类别分支：disabled / no_model / missing_key / missing_base_url。"""
+
+    def __init__(self, reason: str, hint: str = "", code: str = "") -> None:
+        super().__init__(f"{reason}。{hint}" if hint else reason)
+        self.reason = reason
+        self.hint = hint
+        self.code = code
 
 
 async def list_providers(session: AsyncSession) -> list[Provider]:
@@ -70,8 +78,8 @@ async def resolve_provider(
                 or p.default_model == model
             ):
                 raise ProviderNotConfigured(
-                    f"模型 {model!r} 属于 provider {p.name!r}，但它已被停用。"
-                    f"请在设置里启用它，或给节点换一个模型。"
+                    f"模型「{model}」所属的模型接入「{p.name}」已停用",
+                    "请在「设置 → 模型接入」中启用它，或为节点换一个模型", code="disabled",
                 )
         # 认不出来的模型名就放行：用户可能手填了一个目录里还没有的新模型
 
@@ -102,7 +110,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
     """
     model = spec.model or provider.default_model or ""
     if not model:
-        raise ProviderNotConfigured(f"provider {provider.name!r} 没有可用的模型")
+        raise ProviderNotConfigured(f"模型接入「{provider.name}」没有可用的模型",
+                                    "请在「设置 → 模型接入」中添加可选模型，或设置默认模型", code="no_model")
 
     kwargs: dict[str, Any] = {"model": model}
     if spec.max_tokens:
@@ -127,7 +136,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
 
         base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL") or None
         if not api_key:
-            raise ProviderNotConfigured(f"provider {provider.name!r} 缺少 API Key")
+            raise ProviderNotConfigured(f"模型接入「{provider.name}」缺少 API Key",
+                                        "请在「设置 → 模型接入」中填写", code="missing_key")
 
         bearer = extra.get("auth_style") == "bearer"
         kwargs["api_key"] = "placeholder-replaced-below" if bearer else api_key
@@ -203,7 +213,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
 
     # openai 与 openai 兼容走同一个类，区别只在 base_url
     if provider.kind == "openai_compatible" and not base_url:
-        raise ProviderNotConfigured(f"provider {provider.name!r} 需要填 base_url")
+        raise ProviderNotConfigured(f"模型接入「{provider.name}」需要填写 Base URL",
+                                    "请在「设置 → 模型接入」中填写", code="missing_base_url")
     # 很多本地服务（Ollama、vLLM）不校验 key，但 SDK 要求非空
     kwargs["api_key"] = api_key or "not-needed"
     if base_url:

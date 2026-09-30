@@ -199,7 +199,7 @@ await section('导航', '=== 导航 ===', async () => {
   await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-telemetry') === 'ok', null, { timeout: 10000 }).catch(() => {})
   check('底部遥测点显示在线和延迟', /\d+ms/.test(await telemetry.innerText()), await telemetry.innerText())
   await telemetry.click()
-  const panel = page.getByRole('dialog', { name: '后端连接' })
+  const panel = page.getByRole('dialog', { name: '服务端连接' })
   check('点开遥测点：地址、延迟、加载清单', (await panel.isVisible()) && /\/api/.test(await panel.innerText()) && /模型接入/.test(await panel.innerText()))
   await page.keyboard.press('Escape')
   check('Esc 关掉遥测浮层', await panel.waitFor({ state: 'detached', timeout: 3000 }).then(() => true, () => false))
@@ -234,7 +234,7 @@ await section('待审批徽标', '\n=== 待审批徽标 ===', async () => {
       check('徽标是链接，指向 /runs?tab=approvals', (await badge.getAttribute('href')) === '/runs?tab=approvals')
       check('导航项「记录」本身仍然进 /runs', (await nav(page).locator('a[aria-keyshortcuts]').nth(2).getAttribute('href')) === '/runs')
       const label = await badge.getAttribute('aria-label')
-      check('徽标读屏文字：条数 + 最久等了多久', /2 项待审批/.test(label) && /最久已等 8 天/.test(label), label)
+      check('徽标读屏文字：条数 + 最久等了多久', /2 项待审批/.test(label) && /最久已等待 8 天/.test(label), label)
       check('徽标至少 16×16', b.width >= 16 && b.height >= 16, `${b.width}×${b.height}`)
       check('徽标数字等宽', /tabular-nums/.test(nums), nums)
       check('徽标挂在图标右上角外侧，不压图标主体', b.x + b.width / 2 > icon.x + icon.width && b.y < icon.y,
@@ -246,7 +246,7 @@ await section('待审批徽标', '\n=== 待审批徽标 ===', async () => {
       await badge.hover()
       await page.waitForTimeout(400)
       const tip = badge.locator('span[aria-hidden]')
-      check('悬停徽标有提示', (await tip.isVisible()) && /最久已等/.test(await tip.innerText()))
+      check('悬停徽标有提示', (await tip.isVisible()) && /最久已等待/.test(await tip.innerText()))
       await badge.click()
       check('点徽标进待审批页签', await page.waitForURL(/\/runs\?tab=approvals/, { timeout: 5000 }).then(() => true, () => false), page.url())
     }
@@ -263,8 +263,8 @@ await section('404', '\n=== 404 ===', async () => {
   check('未知地址给出说明而不是白板', await page.getByText('这个地址不存在').waitFor({ timeout: 8000 }).then(() => true, () => false))
   check('写出了打错的那个地址', (await page.locator('main').innerText()).includes('/does-not-exist/at-all'))
   check('标题是「页面不存在 — AgentLab」', (await page.title()) === '页面不存在 — AgentLab', await page.title())
-  check('给了 ⌘K 入口', await page.getByRole('button', { name: /搜索去处/ }).isVisible())
-  await page.getByRole('button', { name: /搜索去处/ }).click()
+  check('给了 ⌘K 入口', await page.getByRole('button', { name: /搜索页面/ }).isVisible())
+  await page.getByRole('button', { name: /搜索页面/ }).click()
   check('404 上点搜索打开命令面板', await page.getByRole('dialog', { name: '命令面板' }).isVisible())
   await page.keyboard.press('Escape')
   await page.getByRole('link', { name: '回到问数据' }).click()
@@ -325,7 +325,7 @@ await section('标签页标题', '\n=== 标签页标题、favicon、后台提醒
     // 只认外壳自己的前缀；前面若还挂着别的（比如以后画布自己加的计时），不算错
     check('有运行在跑：标题加「● 运行中 n/N」', /(^|\s)● 运行中 \d+\/\d+ · 编排/.test(await page.title()), masked(await page.title()))
     check('有运行在跑：favicon 蓝点', (await favicon()).status === 'running')
-    check('有运行在跑：品牌标起点节点亮起', /有运行在跑/.test(await nav(page).locator('a[href="/"]').getAttribute('aria-label')))
+    check('有运行在跑：品牌标起点节点亮起', /有运行正在进行/.test(await nav(page).locator('a[href="/"]').getAttribute('aria-label')))
 
     // 切到后台，运行失败
     await page.evaluate(() => {
@@ -701,7 +701,7 @@ await section('离开前确认 · 面板开着时后退', '\n=== 离开前确认
   check('焦点在确认框里', await inside(), await page.evaluate(() => document.activeElement?.outerHTML.slice(0, 80)))
   await page.keyboard.press('Tab')
   check('Tab 之后焦点还在确认框里', await inside())
-  await confirm.getByRole('button', { name: '留下来保存' }).click()
+  await confirm.getByRole('button', { name: '返回保存' }).click()
   await page.waitForTimeout(300)
   check('选「留下」：还在偏好设置，改动还在', new URL(page.url()).pathname === '/settings/prefs'
     && (await actor.inputValue()).endsWith('x'), page.url())
@@ -717,14 +717,14 @@ await section('离线横幅', '\n=== 离线横幅 ===', async () => {
   await waitNav(page)
   await page.waitForTimeout(500)
   state.offline = true
-  // 导航遥测点的悬停提示里也有这四个字（隐藏着），只认主区里的横幅
-  const banner = page.locator('main').getByText('后端未连接')
+  // 导航遥测点的悬停提示里也有这几个字（隐藏着），只认主区里的横幅
+  const banner = page.locator('main').getByText('服务端未连接')
   check('断网后出横幅', await banner.waitFor({ timeout: 15000 }).then(() => true, () => false))
   check('横幅是主区第一个孩子（toast 才会跟着下移）',
     // role=alert 只包不变的那几句（整块重念会把倒计时也念一遍），外层认 data-offline-banner
     await page.evaluate(() => document.querySelector('main')?.firstElementChild?.hasAttribute('data-offline-banner') === true))
   const alertText = await page.evaluate(() => document.querySelector('[data-offline-banner] [role="alert"]')?.textContent ?? null)
-  check('横幅的播报区只有不变的那几句：倒计时不在里面', alertText != null && alertText.includes('后端未连接') && !/秒后/.test(alertText)
+  check('横幅的播报区只有不变的那几句：倒计时不在里面', alertText != null && alertText.includes('服务端未连接') && !/秒后/.test(alertText)
     && /秒后自动重试/.test(await page.locator('[data-offline-banner]').innerText()), alertText ?? '没有 role=alert')
   check('遥测点变成离线', /离线/.test(await nav(page).locator('[data-telemetry]').innerText()))
   state.offline = false
@@ -753,11 +753,11 @@ await section('启动页', '\n=== 启动页 ===', async () => {
     const state = { approvals: [], offline: true, writes: [] }
     const { ctx, page } = await open({ theme, state })
     await page.goto(`${WEB}/chat`)
-    const down = await page.getByText('连不上后端服务').first().waitFor({ timeout: 10000 }).then(() => true, () => false)
+    const down = await page.getByText('无法连接服务').first().waitFor({ timeout: 10000 }).then(() => true, () => false)
     if (theme === 'dark') {
       check('后端没起：启动页说清原因，不再一直「正在连接」', down)
-      check('给了重试和先进去两条路', await page.getByRole('button', { name: '立即重试' }).isVisible()
-        && await page.getByRole('button', { name: '先进去看看' }).isVisible())
+      check('给了重试和直接进入两条路', await page.getByRole('button', { name: '立即重试' }).isVisible()
+        && await page.getByRole('button', { name: '直接进入' }).isVisible())
       check('清单逐项写出失败', (await page.locator('[data-check][data-state="error"]').count()) >= 6)
       const live = await bootLiveRegions(page)
       check('读屏只播标题那一句：倒计时不在播报区里', live.ok, JSON.stringify(live))
@@ -767,8 +767,8 @@ await section('启动页', '\n=== 启动页 ===', async () => {
     } else {
       const bootBg = await page.evaluate(() => getComputedStyle(document.querySelector('[data-boot]')).backgroundColor)
       check('浅色主题下启动页也是浅色', bootBg === 'rgb(246, 247, 249)', bootBg)
-      await page.getByRole('button', { name: '先进去看看' }).click()
-      check('「先进去看看」进离线模式，横幅挂着', await page.locator('main').getByText('后端未连接').waitFor({ timeout: 5000 }).then(() => true, () => false))
+      await page.getByRole('button', { name: '直接进入' }).click()
+      check('「直接进入」进离线模式，横幅挂着', await page.locator('main').getByText('服务端未连接').waitFor({ timeout: 5000 }).then(() => true, () => false))
     }
     await ctx.close()
   }
@@ -780,7 +780,7 @@ await section('启动页', '', async () => {
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
   await waitNav(page)
-  const warn = page.getByText(/有 1 项没加载成功（Skill 500）/)
+  const warn = page.getByText(/有 1 项加载失败（Skill 500）/)
   const warned = await warn.waitFor({ timeout: 5000 }).then(() => true, () => false)
   check('部分请求报错：照常进页面，并说出哪一项没加载', warned)
   const tone = await nav(page).locator('[data-telemetry]').getAttribute('data-tone')
@@ -789,17 +789,17 @@ await section('启动页', '', async () => {
   await page.waitForTimeout(4500)
   check('提示常驻，直到那张表取回来', await warn.isVisible())
   state.broken = null
-  await page.locator('[role="status"] > div', { hasText: '没加载成功' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
+  await page.locator('[role="status"] > div', { hasText: '加载失败' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
   check('重试取回来：提示撤掉', await warn.waitFor({ state: 'detached', timeout: 5000 }).then(() => true, () => false))
   await ctx.close()
 })
 
 await section('启动页', '', async () => {
-  // 后端连得上、请求却卡着不回：「先进去看看」之后不能是一片绿加一屏「还没有工作流」
+  // 后端连得上、请求却卡着不回：「直接进入」之后不能是一片绿加一屏「还没有工作流」
   const state = { approvals: [], offline: false, writes: [], hang: true }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/studio`)
-  const enter = page.getByRole('button', { name: '先进去看看' })
+  const enter = page.getByRole('button', { name: '直接进入' })
   const slow = await enter.waitFor({ timeout: 12000 }).then(() => true, () => false)
   check('请求卡住：启动页到点改说「比平时慢」', slow && (await page.locator('[data-boot] [role="status"]').innerText()).includes('比平时慢'))
   const live = await bootLiveRegions(page)
@@ -808,23 +808,23 @@ await section('启动页', '', async () => {
   await enter.click()
   await waitNav(page)
   const telemetry = nav(page).locator('[data-telemetry]')
-  // 这一路唯一的 /health 探活和「先进去看看」同时出现，按钮点得快时它还在路上
+  // 这一路唯一的 /health 探活和「直接进入」同时出现，按钮点得快时它还在路上
   await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-telemetry') !== 'checking', null, { timeout: 5000 })
     .catch(() => {})
   const tone = await telemetry.getAttribute('data-tone')
   check('进去以后遥测点不是「在线」，而是「加载中」', tone === '加载中', `${tone} / ${await telemetry.innerText()}`)
-  const warn = page.getByText(/没取回来.*先别新建/)
-  check('常驻提示点名还没回来的几项，劝先别新建', await warn.waitFor({ timeout: 3000 }).then(() => true, () => false)
+  const warn = page.getByText(/未加载完成.*建议加载完成后再新建/)
+  check('常驻提示点名还没回来的几项，劝加载完成后再新建', await warn.waitFor({ timeout: 3000 }).then(() => true, () => false)
     && /工作流/.test(await warn.innerText()), await warn.innerText().catch(() => ''))
   await page.waitForTimeout(4500)
   check('提示是常驻的，不会自己消失', await warn.isVisible())
   await telemetry.click()
-  const panel = page.getByRole('dialog', { name: '后端连接' })
-  check('遥测浮层里写出哪几项还没回来', /还没回来/.test(await panel.innerText()))
+  const panel = page.getByRole('dialog', { name: '服务端连接' })
+  check('遥测浮层里写出哪几项还没回来', /尚未返回/.test(await panel.innerText()))
   await page.keyboard.press('Escape')
 
   state.hang = false
-  await page.locator('[role="status"] > div', { hasText: '先别新建' }).getByRole('button', { name: '重试' }).click()
+  await page.locator('[role="status"] > div', { hasText: '建议加载完成后再新建' }).getByRole('button', { name: '重试' }).click()
   const settled = await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-tone') === '在线', null, { timeout: 8000 })
     .then(() => true, () => false)
   check('重试后全部回来：遥测点回到「在线」', settled, await telemetry.getAttribute('data-tone'))
@@ -835,27 +835,27 @@ await section('启动页', '', async () => {
 
 await section('启动页', '', async () => {
   // 只有一张表卡住（后端连着）：每个请求最多等 15 秒，到点记成出错。遥测点从「加载中」
-  // 转成「降级」，提示也得跟着改口说「没加载成功」，而不是悄悄撤掉——那张表还是空的
+  // 转成「降级」，提示也得跟着改口说「加载失败」，而不是悄悄撤掉——那张表还是空的
   const state = { approvals: [], offline: false, writes: [], hangPath: '/api/tools' }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
   // 第一次全量加载要等那一项超时才算落定，启动页到点自己放人进来
   const entered = await nav(page).waitFor({ timeout: 25000 }).then(() => true, () => false)
   check('卡住的那一项超时后，启动页自己放人进来', entered)
-  const warn = page.getByText(/有 1 项没加载成功（工具 超时）.*先别新建/)
-  check('超时的那一项：进门就说它没加载成功，劝先别新建', await warn.waitFor({ timeout: 5000 }).then(() => true, () => false),
+  const warn = page.getByText(/有 1 项加载失败（工具 超时）.*建议加载完成后再新建/)
+  check('超时的那一项：进门就说它加载失败，劝加载完成后再新建', await warn.waitFor({ timeout: 5000 }).then(() => true, () => false),
     await warn.innerText().catch(() => '没有这条提示'))
   const telemetry = nav(page).locator('[data-telemetry]')
   check('遥测点记为「降级」', (await telemetry.getAttribute('data-tone')) === '降级', await telemetry.getAttribute('data-tone'))
   await telemetry.click()
-  const row = page.getByRole('dialog', { name: '后端连接' }).locator('[data-check="tools"]')
+  const row = page.getByRole('dialog', { name: '服务端连接' }).locator('[data-check="tools"]')
   const rowText = (await row.innerText()).replace(/\s+/g, ' ')
   check('加载清单里那一项写「超时」，不写「连不上」', /超时/.test(rowText), rowText)
   await page.keyboard.press('Escape')
   await page.waitForTimeout(4500)
   check('提示常驻，不会自己消失', await warn.isVisible())
   state.hangPath = null
-  await page.locator('[role="status"] > div', { hasText: '没加载成功' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
+  await page.locator('[role="status"] > div', { hasText: '加载失败' }).getByRole('button', { name: '重试' }).click({ timeout: 5000 }).catch(() => {})
   check('重试取回来：提示撤掉', await warn.waitFor({ state: 'detached', timeout: 5000 }).then(() => true, () => false))
   check('遥测点回到「在线」', await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-tone') === '在线', null, { timeout: 8000 })
     .then(() => true, () => false), await telemetry.getAttribute('data-tone'))
@@ -865,7 +865,7 @@ await section('启动页', '', async () => {
 
 await section('启动页', '', async () => {
   // 取回来过的表，后来的刷新卡住了：手上的列表是真的（失败不清空），遥测点说「加载中」
-  // 就够了，不能再弹「列表可能不全，先别新建」吓人
+  // 就够了，不能再弹「列表可能不完整，建议加载完成后再新建」吓人
   const state = { approvals: [], offline: false, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
@@ -874,7 +874,7 @@ await section('启动页', '', async () => {
   await page.waitForFunction(() => document.querySelector('[data-telemetry]')?.getAttribute('data-tone') === '在线', null, { timeout: 10000 }).catch(() => {})
   state.hangPath = '/api/tools'
   await telemetry.click()
-  const panel = page.getByRole('dialog', { name: '后端连接' })
+  const panel = page.getByRole('dialog', { name: '服务端连接' })
   await panel.getByRole('button', { name: '重新检测' }).click()
   // 按钮进忙碌态是下一帧的事。以前按钮一 disabled，焦点就被甩到 body 上，Esc 再也到不了
   // 浮层——点完立刻按 Esc 抢在前头才过得去，机器一忙就卡住。等两帧再按，测的就是忙着的时候
@@ -887,11 +887,11 @@ await section('启动页', '', async () => {
   if (!closed) await telemetry.click()
   await page.waitForTimeout(3800)
   check('刷新卡住：遥测点说「加载中」', (await telemetry.getAttribute('data-tone')) === '加载中', await telemetry.getAttribute('data-tone'))
-  check('……但不弹「先别新建」：那张表之前取回来过', (await page.getByText(/先别新建/).count()) === 0)
+  check('……但不弹「建议加载完成后再新建」：那张表之前取回来过', (await page.getByText(/建议加载完成后再新建/).count()) === 0)
   await telemetry.click()
   await panel.waitFor({ timeout: 3000 })
   const panelText = await panel.innerText()
-  check('遥测浮层照样写出哪一项还没回来，但不劝别新建', /工具还没回来/.test(panelText) && !/先别急着新建/.test(panelText),
+  check('遥测浮层照样写出哪一项还没回来，但不劝别新建', /工具尚未返回/.test(panelText) && !/建议暂缓新建/.test(panelText),
     panelText.replace(/\n/g, ' '))
   await page.keyboard.press('Escape')
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
@@ -903,15 +903,15 @@ await section('启动页', '', async () => {
   const state = { approvals: [], offline: true, writes: [] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/chat`)
-  await page.getByRole('button', { name: '先进去看看' }).click({ timeout: 12000 })
+  await page.getByRole('button', { name: '直接进入' }).click({ timeout: 12000 })
   await waitNav(page)
   await nav(page).getByRole('button', { name: /切换到.+主题/ }).click()
   const theme = () => page.evaluate(() => document.documentElement.getAttribute('data-theme'))
   check('离线时也能换主题（深色 → 浅色）', (await theme()) === 'light')
-  check('提示说清楚：先在本机生效，连上后自动存', await page.getByText(/连上后端后自动存进设置/).waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('提示说清楚：先在本机生效，连上后自动存', await page.getByText(/连接服务端后将自动保存到设置/).waitFor({ timeout: 3000 }).then(() => true, () => false))
   state.offline = false
   await page.locator('main').getByRole('button', { name: '立即重试' }).first().click()
-  await page.locator('main').getByText('后端未连接').waitFor({ state: 'detached', timeout: 8000 }).catch(() => {})
+  await page.locator('main').getByText('服务端未连接').waitFor({ state: 'detached', timeout: 8000 }).catch(() => {})
   await page.waitForTimeout(2500)
   check('重连后主题没被服务端的旧值翻回去', (await theme()) === 'light', await theme())
   const put = state.writes.filter((w) => w.method === 'PUT' && w.path === '/api/settings').at(-1)

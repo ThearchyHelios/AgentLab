@@ -125,14 +125,14 @@ async def test_a_metric_missing_its_input_still_opens_its_chain(client, monkeypa
     assert query["step"] == "query" and query["artifact"] == end.data["query_artifact"]
     assert query["highlight"]["cells"] == [[0, "refunds"], [0, "orders"]]
     assert query["rows"] == [[300.5, 2, None]]
-    # 片段本身的说法不变：引用解析不了，缺输入
-    assert "缺输入" in body["note"] and body["segment"]["cite"]["status"] == "unresolved"
+    # 片段本身的说法不变：引用无法解析，缺少输入
+    assert "缺少输入" in body["note"] and body["segment"]["cite"]["status"] == "unresolved"
 
 
 async def test_a_wrong_reference_still_has_no_chain(client, monkeypatch):
     row, doc = await run_weekly(monkeypatch)
     body = await segment(client, row.id, seg_by_ref(doc, "m:nope")["id"])
-    assert body["chain"] == [] and "目录里没有指标" in body["note"]
+    assert body["chain"] == [] and "引用的指标「nope」不存在" in body["note"]
 
 
 async def test_resolved_metrics_are_unchanged(client, monkeypatch):

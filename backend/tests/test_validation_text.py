@@ -100,7 +100,7 @@ def test_governance_speaks_the_ui_vocabulary():
     for internal in ("supervisor", "approval=never", "llm 节点", "contract"):
         assert internal not in text, f"门禁文案里还有内部词 {internal!r}：{text}"
     assert "「协作团队」" in text and "多 Agent 协作" in text
-    assert "审批策略" in text and "全部自动放行" in text
+    assert "审批策略" in text and "全部无需审批" in text
     assert "模型调用" in text
     assert "出具契约" in text
 

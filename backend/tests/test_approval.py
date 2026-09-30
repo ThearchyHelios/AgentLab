@@ -140,7 +140,7 @@ async def test_tool_node_takes_a_refusal_as_a_refusal():
     await run_manager.resume(run_id, "拒绝")
     run = await _wait(run_id, ("failed", "succeeded"))
 
-    assert run.status == "failed" and "拒绝" in (run.error or "")
+    assert run.status == "failed" and "驳回" in (run.error or "")
     assert not [e for e in await _events(run_id) if e.type == "tool.start"], "被拒绝的工具执行了"
 
 

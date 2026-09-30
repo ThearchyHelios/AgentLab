@@ -137,8 +137,8 @@ export function TracePane({
     return (
       <EmptyState
         icon={<ListTree size={22} />}
-        title="这次运行没有节点执行的记录"
-        body="还没开始就停下了，或者是没有事件的老数据：航迹要靠节点开始、结束的事件摊开。"
+        title="本次运行没有节点执行记录"
+        body="运行在开始前就已停止，或该记录缺少节点事件：航迹需要节点的开始和结束事件才能展开。"
         className="h-full"
       />
     )
@@ -220,7 +220,7 @@ function Readout({
          data-more={more ? '' : undefined}>
       <div className="runs-trace-grid border-b">
         {/* 实时、回放、终态写在标签那一行：数值那一行要留给跨天的时刻 */}
-        <Metric label="游标" data="at" title={trace.timed ? formatDateTime(at) : '老数据没有时间戳：只能按先后顺序回放'}
+        <Metric label="游标" data="at" title={trace.timed ? formatDateTime(at) : '该记录没有时间戳，只能按先后顺序回放'}
                 tag={<span className={clsx(!live && 'text-[var(--accent)]')} data-readout-mode="">{mode}</span>}>
           {offset != null ? `T+${formatOffset(offset)}` : NONE}
         </Metric>
@@ -228,9 +228,9 @@ function Readout({
           {/* 格子窄，两种挂起写短名（「已挂起 · 可续跑」会被截成「已挂起 · 可续…」）；全称在详情头 */}
           <StatusPill status={phase} short={phase === 'held' || phase === 'suspended'} className="-ml-1.5" />
         </Metric>
-        <Metric label="墙钟" data="wall" title="从第一次开始到游标那一刻">{span(proj.elapsedMs, trace.timed)}</Metric>
-        <Metric label="执行" data="active" title="到游标那一刻为止，各段执行之和">{span(proj.activeMs, true)}</Metric>
-        <Metric label="等人" data="wait" title="到游标那一刻为止，挂在人工审批上的时长"
+        <Metric label="总时长" data="wall" title="从首次开始到游标所在时刻的总时长">{span(proj.elapsedMs, trace.timed)}</Metric>
+        <Metric label="执行时长" data="active" title="截至游标所在时刻，各段执行时长之和">{span(proj.activeMs, true)}</Metric>
+        <Metric label="等待审批" data="wait" title="截至游标所在时刻，等待人工审批的时长"
                 tone={proj.phase === 'waiting' ? 'var(--st-waiting)' : undefined}>
           {span(proj.waitMs, trace.timed)}
         </Metric>
@@ -239,10 +239,10 @@ function Readout({
           {proj.nodesTotal ? <>{proj.nodesDone}<span className="text-faint">/{proj.nodesTotal}</span></> : NONE}
         </Metric>
         <Metric label="用量" data="tokens"
-                title={!metered ? '这次运行没有调用过模型'
-                  : tokens == null ? '各次模型调用加起来对不上后端的总数（老后端的部分调用不回报用量），这一刻的读数不可信，不拿终值冒充'
-                  : '到游标那一刻为止的 tokens'}
-                sub={tokens ? `入 ${formatNumber(proj.tokensIn)} · 出 ${formatNumber(proj.tokensOut)}` : undefined}>
+                title={!metered ? '本次运行未调用模型'
+                  : tokens == null ? '各次模型调用的用量之和与服务端总数不一致（部分调用未上报用量），无法给出此刻的准确读数'
+                  : '截至游标所在时刻的 token 用量'}
+                sub={tokens ? `输入 ${formatNumber(proj.tokensIn)} · 输出 ${formatNumber(proj.tokensOut)}` : undefined}>
           {tokens == null ? NONE : formatTokens(tokens, { compact: true })}
         </Metric>
         <Metric label="成本" data="cost">{!metered || proj.costUsd == null ? NONE : formatCost(proj.costUsd)}</Metric>
@@ -306,16 +306,16 @@ function NowList({ trace, proj, at, order, stateOf, labelOf, hovered, onHover, s
   let empty: ReactNode = null
   if (!running.length && !waiting.length) {
     if (proj.phase === 'idle' || proj.phase === 'queued' || (trace.startedAt != null && at < trace.startedAt)) {
-      empty = '还没开始'
+      empty = '尚未开始'
     } else if (settled) {
       const tally = new Map<NodeState, number>()
       for (const id of order) tally.set(stateOf(id), (tally.get(stateOf(id)) ?? 0) + 1)
       const parts = ([['done', '完成'], ['failed', '失败'], ['skipped', '跳过'], ['blocked', '阻断'], ['unreached', '未到达'],
         ['cancelled', '取消']] as [NodeState, string][])
         .filter(([s]) => tally.get(s)).map(([s, l]) => `${l} ${tally.get(s)}`)
-      empty = `已经停下：${parts.join(' · ') || '没有节点跑过'}`
+      empty = `已停止：${parts.join(' · ') || '没有节点执行'}`
     } else {
-      empty = '此刻没有节点在执行：两步之间，或者在等下游汇合'
+      empty = '此刻没有节点在执行：处于两步之间，或正在等待下游汇合'
     }
   }
 
@@ -344,17 +344,17 @@ function NowList({ trace, proj, at, order, stateOf, labelOf, hovered, onHover, s
 
   return (
     // 标题和内容写在同一行：多半只有一两个节点或一句话，单占一行的标题白占高度
-    <section className="runs-trace-now min-w-0 px-4 py-2" aria-label="游标那一刻" data-trace-now="">
+    <section className="runs-trace-now min-w-0 px-4 py-2" aria-label="游标所在时刻" data-trace-now="">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <h4 className="text-2xs font-medium text-faint">此刻</h4>
         {empty
           ? <p className="text-xs text-dim">{empty}</p>
           : (
             <>
-              {running.map((id) => chip(id, 'running', `已跑 ${formatSpan(proj.nodes[id]?.elapsedMs)}`))}
+              {running.map((id) => chip(id, 'running', `已执行 ${formatSpan(proj.nodes[id]?.elapsedMs)}`))}
               {waiting.map((id) => {
                 const w = waitedMs(trace, id, at)
-                return chip(id, 'waiting', w != null ? `等审批 ${formatSpan(w)}` : '等审批')
+                return chip(id, 'waiting', w != null ? `等待审批 ${formatSpan(w)}` : '等待审批')
               })}
             </>
           )}
@@ -402,7 +402,7 @@ function momentsOf(
     const lastFail = n.segments.reduce((k, s, i) => (s.kind === 'run' && s.status === 'failed' ? i : k), -1)
     n.segments.forEach((s, i) => {
       if (s.kind === 'wait') {
-        out.push({ key: `${id}:w${i}`, at: s.start, status: 'waiting', text: `${name(id)}停下等审批`, nodeId: id })
+        out.push({ key: `${id}:w${i}`, at: s.start, status: 'waiting', text: `${name(id)}等待审批`, nodeId: id })
         // 以放弃、挂起收场的等待，结局那一条会说
         if (s.end != null && s.status !== 'cancelled' && s.status !== 'suspended') {
           out.push({
@@ -430,16 +430,16 @@ function momentsOf(
         key: i === all.length - 1 ? `${id}:${tag}` : `${id}:${tag}${i}`, at: m.at, status: 'warn', nodeId: id, ...say(m),
       }))
     each(f?.markups, 'markup', (m) => (m.settle
-      ? { text: `${name(id)}收尾轮仍想调用工具`, sub: '交出来的可能不完整' }
-      : { text: `${name(id)}把工具调用写成了文字`, sub: '提醒之后重答了' }))
-    each(f?.exhausts, 'exhausted', () => ({ text: `${name(id)}协作轮数用完，降档交付` }))
-    each(f?.inventions, 'invented', () => ({ text: `${name(id)}校验修复编了原文没有的值` }))
+      ? { text: `${name(id)}收尾时仍试图调用工具`, sub: '结果可能不完整' }
+      : { text: `${name(id)}以文本形式输出了工具调用`, sub: '已提醒并重新作答' }))
+    each(f?.exhausts, 'exhausted', () => ({ text: `${name(id)}协作轮数已用完，降档交付` }))
+    each(f?.inventions, 'invented', () => ({ text: `${name(id)}校验修复时生成了原文中不存在的值` }))
   }
   // 失败、挂起之后又跑起来：接着跑。等审批之后的恢复已经由「审批已处理」说了
   let prev: RunPhase | null = null
   trace.phases.forEach(([at, phase], i) => {
     if (phase === 'running' && (prev === 'failed' || prev === 'suspended')) {
-      out.push({ key: `go${i}`, at, status: 'running', text: prev === 'failed' ? '从失败处接着跑' : '从断点接着跑' })
+      out.push({ key: `go${i}`, at, status: 'running', text: prev === 'failed' ? '从失败处继续运行' : '从断点继续运行' })
     }
     prev = phase
   })
@@ -482,7 +482,7 @@ function Moments({ moments, at, live, t0, onHover, onJump }: {
     <section className="runs-trace-moments min-w-0 px-4 py-2.5" aria-label="关键时刻" data-trace-moments="">
       <h4 className="mb-1 flex items-center gap-2 text-2xs font-medium text-faint">
         关键时刻
-        <span className="font-normal">· 点一下，游标跳到那一刻</span>
+        <span className="font-normal">· 点击可将游标定位到该时刻</span>
       </h4>
       <ol className="runs-moments -mx-1">
         {shown.map((m) => {
@@ -500,7 +500,7 @@ function Moments({ moments, at, live, t0, onHover, onJump }: {
                 onClick={() => onJump(m)}
                 onMouseEnter={() => m.nodeId && onHover(m.nodeId)}
                 onMouseLeave={() => m.nodeId && onHover(null)}
-                title={m.end ? '回到终态' : '游标跳到这一刻'}
+                title={m.end ? '回到终态' : '将游标定位到该时刻'}
                 data-moment={m.key}
               >
                 <span className={clsx('mono tnum text-2xs', here ? 'text-fg' : 'text-faint')} data-moment-at="">
@@ -518,7 +518,7 @@ function Moments({ moments, at, live, t0, onHover, onJump }: {
           )
         })}
       </ol>
-      {hidden > 0 && <p className="mt-1 px-1 text-2xs text-faint">另有 {hidden} 个时刻没列出：在下面的航迹上拖游标看</p>}
+      {hidden > 0 && <p className="mt-1 px-1 text-2xs text-faint">另有 {hidden} 个时刻未列出，可在下方航迹上拖动游标查看</p>}
     </section>
   )
 }
@@ -546,8 +546,8 @@ function Slowest({ trace, order, labelOf, activeMs, onHover, onPick }: {
   return (
     <section className="runs-trace-side min-w-0 px-4 py-2.5" aria-label="最耗时的节点" data-trace-slowest="">
       <h4 className="mb-1.5 flex items-center gap-2 text-2xs font-medium text-faint">
-        整次运行里最耗时的
-        <span className="font-normal">· 点一条泳道看那个节点在游标那一刻的样子</span>
+        本次运行中最耗时的节点
+        <span className="font-normal">· 点击泳道可查看该节点在游标所在时刻的状态</span>
       </h4>
       {!rows.length ? <p className="text-xs text-dim">没有节点执行过</p> : (
         <div className="space-y-1">
@@ -615,11 +615,11 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
   const call = state === 'running' ? openCall(facts, at, since) : undefined
   if (call) {
     const since = (at ?? Date.now() - (trace.skewMs ?? 0)) - call.start
-    rows.push(['在调', (
+    rows.push(['调用中', (
       <span data-node-field="call">
         <span className="mono">{call.tool}</span>
         {call.agent && <span className="text-faint">（{call.agent}）</span>}
-        <span className="tnum text-faint"> · 已 {formatSpan(Math.max(0, since))}{call.limitS ? ` / 上限 ${call.limitS} s` : ''}</span>
+        <span className="tnum text-faint"> · 已 {formatSpan(Math.max(0, since))}{call.limitS ? ` / 上限 ${call.limitS} 秒` : ''}</span>
       </span>
     )])
   }
@@ -628,9 +628,9 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
   // 重答了（成果是重答的那一次）。一律说「没有真正调用工具」，对重答成功的情况不准
   const markup = lastIn(facts?.markups, at, since)
   const warns = [
-    markup && (markup.settle ? '收尾轮仍想调用工具，交出来的可能不完整' : '模型把工具调用写成了文字，提醒之后重答了'),
-    lastIn(facts?.exhausts, at, since) && '协作轮数用完仍未完成，按降档交付',
-    lastIn(facts?.inventions, at, since) && '校验修复时出现了原文没有的值，修复被拒',
+    markup && (markup.settle ? '收尾时仍试图调用工具，结果可能不完整' : '模型以文本形式输出了工具调用，已提醒并重新作答'),
+    lastIn(facts?.exhausts, at, since) && '协作轮数已用完仍未完成，按降档交付',
+    lastIn(facts?.inventions, at, since) && '校验修复时生成了原文中不存在的值，修复已作废',
   ].filter((w): w is string => !!w)
 
   return (
@@ -653,7 +653,7 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
           {p?.elapsedMs != null ? formatSpan(p.elapsedMs) : NONE}
         </Fact>
         <Fact label="用量" data="tokens"
-              sub={metered && tokens ? `入 ${formatNumber(p?.tokensIn)} · 出 ${formatNumber(p?.tokensOut)}` : undefined}>
+              sub={metered && tokens ? `输入 ${formatNumber(p?.tokensIn)} · 输出 ${formatNumber(p?.tokensOut)}` : undefined}>
           {metered ? formatTokens(tokens, { compact: true }) : NONE}
         </Fact>
         <Fact label="成本" data="cost">{metered && p ? formatCost(p.costUsd) : NONE}</Fact>
@@ -682,17 +682,17 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
       )}
       <div className="mt-1.5 flex flex-wrap gap-1.5">
         <button type="button" className="btn btn-xs" onClick={() => onRevealStep(id)} data-action="node-stream"
-                title="切回时间线，把这个节点的那几步描出来">
-          <ListTree size={11} aria-hidden /> 在时间线里看
+                title="切换到时间线，并高亮该节点的相关步骤">
+          <ListTree size={11} aria-hidden /> 在时间线中查看
         </button>
         {href ? (
-          <Link className="btn btn-xs" to={href} data-action="node-canvas" title="打开这张工作流，回放这次运行，并对准这个节点">
-            <Crosshair size={11} aria-hidden /> 在画布中看这一步
+          <Link className="btn btn-xs" to={href} data-action="node-canvas" title="打开该工作流回放本次运行，并定位到该节点">
+            <Crosshair size={11} aria-hidden /> 在画布中查看此步骤
           </Link>
         ) : gone && (
           <span className="self-center text-2xs text-faint" data-node-gone=""
-                title="工作流在这次运行之后改过结构，现在的工作流里已经没有这个节点：画布上看不到它，当时的样子就在这里">
-            画布上已没有这个节点
+                title="工作流在本次运行后修改过结构，当前工作流中已没有该节点，画布上无法显示；此处为运行当时的状态">
+            画布上已没有该节点
           </span>
         )}
       </div>

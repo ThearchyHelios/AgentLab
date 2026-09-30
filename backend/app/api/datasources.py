@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
-from app.core.errors import explain, first_line, raw
+from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, first_line, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import introspect as introspect_mod
@@ -138,7 +138,7 @@ def _probe_record(result: dict[str, Any]) -> dict[str, Any]:
 async def _get_or_404(session: AsyncSession, source_id: str) -> DataSource:
     row = await session.get(DataSource, source_id)
     if not row:
-        raise HTTPException(404, "这个数据源不存在，可能已经被删了")
+        raise HTTPException(404, "数据源不存在，可能已被删除")
     return row
 
 
@@ -151,15 +151,15 @@ async def list_sources(session: AsyncSession = Depends(get_session)) -> list[Dat
 #: 每种库都有的「查询时限」。数据库按它自己停下语句，不只是后端不再等
 _TIMEOUT_FIELD = {
     "key": QUERY_TIMEOUT_OPTION, "label": "查询时限（秒）", "placeholder": "30",
-    "help": f"一条查询最多跑多久，到点由数据库自己停下；留空是 30 秒，最多 {MAX_QUERY_TIMEOUT_S} 秒",
+    "help": f"单条查询的最长执行时间，超时后由数据库终止；留空为 30 秒，最多 {MAX_QUERY_TIMEOUT_S} 秒",
 }
 
 
 #: 证据面板展示原始行时遮掉的列。每种库都有：遮罩只看查询结果的列名，和方言无关
 _MASK_FIELD = {
     "key": MASK_COLUMNS_OPTION, "label": "遮罩的列", "placeholder": "phone, email",
-    "help": "证据面板展示查询结果的原始行时，这些列的值一律显示成「已遮罩」。在有身份体系之前，"
-            "遮罩只减少暴露，不是安全边界：完整快照仍能按工件取到，SQL 里给列起别名也能绕开",
+    "help": "证据面板展示查询结果的原始行时，这些列显示为「已遮罩」。"
+            "遮罩只减少暴露，不是安全边界：完整快照仍可通过工件获取，SQL 中给列起别名也可绕过",
 }
 
 
@@ -181,28 +181,26 @@ async def list_kinds() -> dict[str, Any]:
         "kinds": [
             {"value": "mysql", "label": "MySQL / MariaDB", "default_port": 3306,
              "needs": ["host", "database", "username", "password"],
-             "hint": "字符集默认 utf8mb4，要换就在「高级连接参数」里加 charset",
+             "hint": "字符集默认为 utf8mb4；如需更改，请在「高级连接参数」中添加 charset",
              "advanced": [{"key": "charset", "label": "字符集", "placeholder": "utf8mb4"},
                           _TIMEOUT_FIELD, _MASK_FIELD]},
             {"value": "postgres", "label": "PostgreSQL", "default_port": 5432,
              "needs": ["host", "database", "username", "password"],
-             "hint": "「schema」留空就用 public",
+             "hint": "「schema」留空时使用 public",
              "advanced": [_TIMEOUT_FIELD, _MASK_FIELD]},
             {"value": "oracle", "label": "Oracle", "default_port": 1521,
              "needs": ["host", "username", "password"],
-             "hint": "service_name 和 SID 二选一：一般填 service_name，老库只给了 SID 就切到 SID。"
-                     "驱动走 thin 模式，不需要装 Instant Client。"
-                     "只读账号名下通常没有对象——数据在别的 schema 里，"
-                     "把它填进「schema」（如 ANALYTICS），否则探查结果是空的",
+             "hint": "service_name 与 SID 二选一，通常填写 service_name；无需安装 Instant Client。"
+                     "若只读账号名下没有对象，请在「schema」中填写数据所在的 schema（如 ANALYTICS）",
              "advanced": [
                  {"key": "service_name", "label": "service_name", "placeholder": "ORCLPDB1",
-                  "help": "和 SID 二选一"},
-                 {"key": "sid", "label": "SID", "placeholder": "ORCL", "help": "和 service_name 二选一"},
+                  "help": "与 SID 二选一"},
+                 {"key": "sid", "label": "SID", "placeholder": "ORCL", "help": "与 service_name 二选一"},
                  _TIMEOUT_FIELD,
                  _MASK_FIELD,
              ]},
             {"value": "sqlite", "label": "SQLite（文件）", "default_port": None,
-             "needs": ["database"], "hint": "「数据库文件路径」填 .db 文件的绝对路径",
+             "needs": ["database"], "hint": "「数据库文件路径」请填写 .db 文件的绝对路径",
              "advanced": [_TIMEOUT_FIELD, _MASK_FIELD]},
         ],
         "supported": list(SUPPORTED_KINDS),
@@ -244,12 +242,12 @@ async def create_source(
     payload: DataSourceIn, session: AsyncSession = Depends(get_session)
 ) -> DataSourceOut:
     if payload.kind not in SUPPORTED_KINDS:
-        raise HTTPException(400, f"不支持「{payload.kind}」这种数据库，支持：{'、'.join(SUPPORTED_KINDS)}")
+        raise HTTPException(400, f"不支持「{payload.kind}」类型的数据库，目前支持：{'、'.join(SUPPORTED_KINDS)}")
     exists = (await session.execute(
         select(DataSource).where(DataSource.name == payload.name)
     )).scalar_one_or_none()
     if exists:
-        raise HTTPException(409, f"已经有叫「{payload.name}」的数据源了，换个标识")
+        raise HTTPException(409, f"已存在名为「{payload.name}」的数据源，请换一个标识")
     _refuse_bad_options(payload.options)
 
     row = DataSource(
@@ -305,34 +303,44 @@ async def delete_source(source_id: str, session: AsyncSession = Depends(get_sess
 _TEST_TIMEOUT = 15
 
 
+_WRONG_PASSWORD = ("用户名或密码错误", "请核对「用户名」和「密码」；编辑时密码留空表示沿用已保存的密码")
+_CHECK_HOST = "请检查「主机」和「端口」；内网数据库请确认本机可以访问（防火墙、VPN）"
+
+
 def _explain_connect(e: BaseException, kind: str) -> tuple[str, str]:
     """连库失败的常见原因。驱动的原文九成能定位问题，但得先翻译成表单上的说法。"""
     low = str(e).lower()
     if any(s in low for s in ("password authentication failed", "access denied", "ora-01017",
                               "invalid username/password", "(1045")):
-        return "账号或密码不对", "核对「用户名」和「密码」；编辑时密码留空表示沿用已保存的那个"
+        return _WRONG_PASSWORD
     if "ora-12514" in low:
-        return "Oracle 不认识这个 service_name", "核对 service_name；老库可能只给了 SID，切到 SID 再试"
+        return "Oracle 无法识别该 service_name", "请核对 service_name；部分旧版数据库只提供 SID，可改用 SID 后重试"
     if "ora-12505" in low:
-        return "Oracle 不认识这个 SID", "核对 SID，或者改用 service_name"
+        return "Oracle 无法识别该 SID", "请核对 SID，或改用 service_name"
     if "service_name 或 sid" in low:
-        return "没填 service_name 或 SID", "在「service_name」一栏填上，或者切到 SID"
+        return "未填写 service_name 或 SID", "请在「service_name」中填写，或改用 SID"
     if "unknown database" in low or "(1049" in low or (
         "does not exist" in low and "database" in low
     ):
-        return "服务器上没有这个库", "核对「数据库」一栏"
+        return "服务器上不存在该数据库", "请核对「数据库」一栏"
     if "unable to open database file" in low:
-        return "打不开这个数据库文件", "核对路径是不是绝对路径、文件在不在，以及后端进程有没有读权限"
+        return "无法打开该数据库文件", "请确认路径是绝对路径、文件存在，且服务端进程有读取权限"
     if "file is not a database" in low:
-        return "这个文件不是 SQLite 数据库", "核对路径指的是不是 .db 文件"
+        return "该文件不是 SQLite 数据库", "请确认路径指向的是 .db 文件"
     if "no module named" in low:
-        return "后端没装这种数据库的驱动", "pip install 'agentlab-backend[db]' 之后重启后端"
+        return "服务端未安装该数据库的驱动", "请执行 pip install 'agentlab-backend[db]'，然后重启服务端"
+    # 下面按错误类别换成数据库的说法：通用的那几句说的是 API（API Key、Base URL），这里是数据库。
+    # 按类别判断，不比较 explain 的文字——那句话改一个字，这里就再也对不上
+    category = classify(e)
+    if category == AUTH:
+        return _WRONG_PASSWORD
+    if category == NETWORK:
+        return "网络不通，或数据库服务未启动", _CHECK_HOST
+    if category == TIMEOUT:
+        return "数据库长时间没有响应", _CHECK_HOST
     reason, hint = explain(e)
-    if reason in ("等了太久没有响应", "连不上对方的服务"):
-        # 通用那句说的是 API，这里是数据库：多半是主机、端口或者网络不通
-        hint = "核对「主机」和「端口」；内网库要确认这台机器访问得到它（防火墙、VPN）"
-    elif kind == "sqlite" and not hint:
-        hint = "核对数据库文件的路径"
+    if kind == "sqlite" and not hint:
+        hint = "请检查数据库文件的路径"
     return reason, hint
 
 
@@ -356,11 +364,11 @@ def _missing_sqlite_file(source: Any) -> tuple[str, str, str] | None:
         return None
     path = source.database or ""
     if not path.strip():
-        return "没填数据库文件路径", "在「数据库文件路径」里填 .db 文件的绝对路径", "database 为空"
+        return "未填写数据库文件路径", "请在「数据库文件路径」中填写 .db 文件的绝对路径", "database 为空"
     if path == ":memory:" or Path(path).is_file():
         return None
-    return ("打不开这个数据库文件",
-            "这个路径上没有文件。核对路径是不是绝对路径、文件在不在（~ 不会被展开）",
+    return ("无法打开该数据库文件",
+            "该路径下没有文件。请确认路径是绝对路径且文件存在（~ 不会被展开）",
             f"文件不存在：{path}")
 
 
@@ -378,7 +386,7 @@ async def _probe(source: Any, *, cached: bool) -> dict[str, Any]:
     missing = _missing_sqlite_file(source)
     if missing:
         reason, hint, detail = missing
-        return {"ok": False, "error": f"连不上：{reason}", "hint": hint, "detail": detail,
+        return {"ok": False, "error": f"连接失败：{reason}", "hint": hint, "detail": detail,
                 "elapsed_ms": 0, "url": _safe_url(source)}
     engine = None
     try:
@@ -400,7 +408,7 @@ async def _probe(source: Any, *, cached: bool) -> dict[str, Any]:
         reason, hint = _explain_connect(e, (source.kind or "").lower())
         return {
             "ok": False,
-            "error": f"连不上：{reason}",
+            "error": f"连接失败：{reason}",
             "hint": hint,
             "detail": raw(e),
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
@@ -454,8 +462,8 @@ async def test_draft(
     接内网 Oracle 这类填错一个字段就连不上的东西，来回四五趟。
     """
     if payload.kind not in SUPPORTED_KINDS:
-        return {"ok": False, "error": f"不支持「{payload.kind}」这种数据库",
-                "hint": f"支持：{'、'.join(SUPPORTED_KINDS)}", "detail": "", "elapsed_ms": 0, "url": ""}
+        return {"ok": False, "error": f"不支持「{payload.kind}」类型的数据库",
+                "hint": f"目前支持：{'、'.join(SUPPORTED_KINDS)}", "detail": "", "elapsed_ms": 0, "url": ""}
     saved = await session.get(DataSource, payload.id) if payload.id else None
     draft = _draft_source(payload, saved)
     result = await _probe(draft, cached=False)
@@ -586,7 +594,7 @@ async def upload_table(
 
     if not _re.match(_NAME_PATTERN, name or ""):
         raise HTTPException(
-            400, "名字只能用小写字母开头的字母数字下划线——它会成为工具名的一部分"
+            400, "名称必须以小写字母开头，只能包含字母、数字和下划线（名称会成为工具名的一部分）"
         )
 
     # 边读边数，超了立刻停。和知识库上传同一套：那个检查拦的是"入库"，
@@ -597,7 +605,7 @@ async def upload_table(
     while piece := await file.read(1024 * 1024):
         total += len(piece)
         if total > limit:
-            raise HTTPException(413, f"文件超过 {settings.max_upload_mb}MB")
+            raise HTTPException(413, f"文件超过 {settings.max_upload_mb} MB")
         pieces.append(piece)
     raw = b"".join(pieces)
 
@@ -612,7 +620,7 @@ async def upload_table(
     )).scalar_one_or_none()
     if existing and existing.kind != "sqlite":
         raise HTTPException(
-            409, f"已经有一个叫 {name} 的数据源了，而且它不是上传来的表格。换个名字。"
+            409, f"已存在名为「{name}」的数据源（非上传表格），请换一个名称"
         )
 
     try:
@@ -622,7 +630,7 @@ async def upload_table(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             400, f"导入失败：{first_line(e) if isinstance(e, ValueError) else explain(e)[0]}。"
-                 "确认文件是 Excel 或 CSV、没有加密，表头行号填得对",
+                 "请确认文件是未加密的 Excel 或 CSV，且表头行号填写正确",
         ) from e
 
     row = existing

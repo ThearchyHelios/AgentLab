@@ -99,16 +99,16 @@ async def start_run(
         # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
         # 传裸 graph、或工作流还没发布过，都进不了 formal。
         if not payload.workflow_id:
-            raise HTTPException(400, "正式运行要从一个已保存的工作流发起：请求里没有指定工作流")
+            raise HTTPException(400, "正式运行需要从已保存的工作流发起：请求中没有指定工作流")
         if payload.graph is not None:
-            raise HTTPException(400, "正式运行只跑已发布的版本，不接受画布上没发布的改动——先保存并发布")
+            raise HTTPException(400, "正式运行只能使用已发布的版本，画布上未发布的修改不会生效。请先保存并发布")
         workflow = await session.get(Workflow, payload.workflow_id)
         if not workflow:
-            raise HTTPException(404, "找不到这个工作流，可能已经被删除了")
+            raise HTTPException(404, "工作流不存在，可能已被删除")
         # 只看 published_version：status 反映的是当前画布（改过图就退回 draft），
         # 而 formal 跑的是已发布的那一版，两者本来就可以不一致
         if not workflow.published_version:
-            raise HTTPException(409, f"「{workflow.name}」还没有发布版本，先在编排页发布")
+            raise HTTPException(409, f"「{workflow.name}」还没有发布版本，请先在编排页发布")
         version = payload.version or workflow.published_version
         # "不可变"和"过过闸"是两件事。快照确实不可变，但 PATCH 保存出来的
         # 草稿版本同样有快照——只认 version 存不存在的话，工作流只要发布过
@@ -118,7 +118,7 @@ async def start_run(
             raise HTTPException(
                 409,
                 f"v{version} 不是当前发布版本（v{workflow.published_version}）。"
-                "正式运行只能引用发布过的版本——要跑这一版就先发布它。",
+                "正式运行只能使用当前发布版本；如需运行这一版，请先发布它。",
             )
         snapshot = (
             await session.execute(
@@ -147,11 +147,11 @@ async def start_run(
         if payload.workflow_id:
             workflow = await session.get(Workflow, payload.workflow_id)
             if not workflow:
-                raise HTTPException(404, "找不到这个工作流，可能已经被删除了")
+                raise HTTPException(404, "工作流不存在，可能已被删除")
             graph = graph or workflow.graph
             name = workflow.name
     if not graph:
-        raise HTTPException(400, "没有要运行的内容：请求里既没有工作流 id，也没有工作流内容")
+        raise HTTPException(400, "没有要运行的内容：请求中既没有工作流 ID，也没有工作流内容")
     await _refuse_missing_tools(session, graph)
 
     from app.api.settings import resolve_run_scope
@@ -264,16 +264,16 @@ async def _refuse_missing_tools(session: AsyncSession, graph: dict[str, Any]) ->
     missing = await missing_tools(session, spec)
     if not missing:
         return
-    lines = "；".join(f"{who}绑的 {name}" for who, name, _ in missing[:8])
+    lines = "；".join(f"{who}绑定的 {name}" for who, name, _ in missing[:8])
     more = f"等 {len(missing)} 处" if len(missing) > 8 else ""
     places = {where for _, _, where in missing}
     if places == {"data"}:
-        fix = "去数据页接入，或在节点里重新选"
+        fix = "请到「数据」页接入，或在节点中重新选择"
     elif places == {"tools"}:
-        fix = "去工具页接入，或在节点里重新选"
+        fix = "请到「工具」页接入，或在节点中重新选择"
     else:
-        fix = "数据源工具去数据页接入、其他工具去工具页接入，或在节点里重新选"
-    raise CodedHTTPException(422, f"绑定的工具在本机不存在：{lines}{more}。{fix}", TOOL_MISSING)
+        fix = "数据源工具请到「数据」页接入，其他工具请到「工具」页接入，或在节点中重新选择"
+    raise CodedHTTPException(422, f"绑定的工具不存在：{lines}{more}。{fix}", TOOL_MISSING)
 
 
 #: workflow_id 取这个值时只要没挂在任何工作流上的运行：画布上没保存就跑的临时图，
@@ -410,9 +410,9 @@ async def cancel_run(run_id: str, x_actor: str | None = Header(default=None)) ->
 def _cannot_cancel(status: str) -> str:
     return {
         "succeeded": "这次运行已完成，没有要停止的。",
-        "failed": "这次运行已经失败结束了，没有要停止的；要继续请用「接着跑」。",
-        "cancelled": "这次运行已经取消了。",
-    }.get(status, "这次运行已经不在执行中（可能刚结束，或者服务重启过），不需要再停止。刷新看看最新状态")
+        "failed": "这次运行已失败结束，没有要停止的；如需继续，请点「继续运行」。",
+        "cancelled": "这次运行已取消。",
+    }.get(status, "这次运行已不在执行中（可能刚结束，或服务重启过），无需停止。请刷新页面查看最新状态")
 
 
 class ResumeIn(BaseModel):
@@ -421,7 +421,7 @@ class ResumeIn(BaseModel):
 
 
 def _missing(e: KeyError) -> HTTPException:
-    # str(KeyError) 会带上 repr 的引号，界面上就成了 "'找不到运行 x'"
+    # str(KeyError) 会带上 repr 的引号，界面上就成了 "'运行记录不存在'"
     return HTTPException(404, str(e.args[0]) if e.args else "运行记录不存在")
 
 
@@ -557,12 +557,12 @@ async def delete_run(
     if not run:
         raise HTTPException(404, "运行记录不存在")
     if run.status in ("queued", "running") or run_manager.is_active(run_id):
-        raise HTTPException(409, "这次运行还在进行，现在删除会留下没人管的任务。先停止它，再删除")
+        raise HTTPException(409, "这次运行仍在进行，现在删除会留下无人管理的后台任务。请先停止运行，再删除")
     if run.run_class == "formal" and run.manifest_hash and not force:
         raise HTTPException(
             409,
-            "这是一次已封存的正式运行，是出具结果的追溯凭证。删除后它的事件和工件会一并删掉，"
-            "封存清单再也无法核对。确认要删的话请再确认一次（强制删除）",
+            "这是一次已封存的正式运行，是出具结果的追溯凭证。删除后其事件和工件将一并删除，"
+            "封存清单无法再核对。如仍要删除，请选择「强制删除」",
         )
     await session.delete(run)
     await session.commit()
@@ -754,9 +754,9 @@ async def decide(
 ) -> Run:
     approval = await session.get(Approval, approval_id)
     if not approval:
-        raise HTTPException(404, "找不到这条审批，所属的运行可能已经被删除了")
+        raise HTTPException(404, "审批记录不存在，所属的运行可能已被删除")
     if approval.status != "pending":
-        raise HTTPException(409, "这条审批已经处理过了，刷新看看最新状态")
+        raise HTTPException(409, "这条审批已处理过，请刷新页面查看最新状态")
 
     # 责任归属先落库再恢复执行——恢复失败也要留下"谁试图批的"
     approval.resolved_by = actor_of(x_actor)

@@ -197,7 +197,7 @@ async def test_a_newer_upstream_blocks_formal_runs_without_a_policy(client):
     res = await formal(client, weekly({"workflow_id": lib, "workflow_version": 1, "node_id": "caliber"}))
     assert res.status_code == 409, res.text
     detail = res.json()["detail"]
-    assert "「本地口径卡」" in detail and "v1" in detail and "v2" in detail and "upgrade_policy" in detail
+    assert "「本地口径卡」" in detail and "v1" in detail and "v2" in detail and "「上游发布新版本时」" in detail
 
 
 async def test_a_declared_policy_is_recorded(client):
@@ -211,7 +211,7 @@ async def test_a_declared_policy_is_recorded(client):
     assert event.node_id == "card"
     assert {k: event.data.get(k) for k in ("workflow_id", "pinned", "latest", "policy", "policy_label",
                                             "caliber_node")} == {
-        "workflow_id": lib, "pinned": 1, "latest": 2, "policy": "dual", "policy_label": "并排双印新旧口径",
+        "workflow_id": lib, "pinned": 1, "latest": 2, "policy": "dual", "policy_label": "新旧口径并列展示",
         "caliber_node": "caliber"}
 
 
@@ -257,4 +257,4 @@ async def test_subgraphs_keep_the_same_upgrade_rule(client):
                   node("sub", "subgraph", "方法卡", workflow_id=lib, workflow_version=1),
                   node("out", "output", fields=[{"name": "r", "value": "{{ nodes.sub.text }}"}]))
     res = await formal(client, graph)
-    assert res.status_code == 409 and "「方法卡」（子工作流）钉在 v1，但上游已有 v2" in res.json()["detail"]
+    assert res.status_code == 409 and "「方法卡」（子工作流）固定在 v1，但上游已有 v2" in res.json()["detail"]

@@ -20,7 +20,7 @@ import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import { EvidenceHostContext, type EvidenceHost } from './evidenceHost'
 import {
-  copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
+  COPILOT_PHASE_TEXT, copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
 } from './decode'
 import { ApprovalCard } from './RunPanel'
 import { useRunGlance } from './RunHud'
@@ -119,15 +119,6 @@ interface Reveal {
 // 对话：和 Copilot 说话的地方
 // -------------------------------------------------------------------------
 
-const PHASE_TEXT: Record<string, string> = {
-  connecting: '正在连接模型',
-  planning: '正在理解需求、规划步骤',
-  building: '正在搭建工作流',
-  wiring: '正在连接数据流',
-  finalizing: '正在排版和校验',
-  repairing: '正在按自查结果修正',
-}
-
 /**
  * 一轮 Copilot 的卡片标题。只看 phase 的话，只回了一句话、自查没修好、少放了
  * 一步，全都写「流程已更新到画布」——而这几种的下一步完全不同
@@ -162,37 +153,37 @@ function copilotTurn(
   if (running) {
     status = live.lastOp
       || (live.phase === 'repairing' && out.repairing
-        ? `${PHASE_TEXT.repairing}（第 ${out.repairing}/${SELF_CHECK_ROUNDS} 轮）`
-        : PHASE_TEXT[live.phase] ?? '正在生成…')
+        ? `${COPILOT_PHASE_TEXT.repairing}（第 ${out.repairing}/${SELF_CHECK_ROUNDS} 轮）`
+        : COPILOT_PHASE_TEXT[live.phase] ?? '正在生成…')
   } else if (t.outcome === 'reverted') {
-    status = '已撤回，画布回到了这一轮之前'
+    status = '已撤回，画布已恢复到本轮之前'
     statusCode = 'cancelled'
   } else if (t.phase === 'error' || errorOp) {
-    status = '这一轮没能完成'
+    status = '本轮未能完成'
   } else if (reply && out.kind !== 'built') {
-    status = '已回答（没有改动画布）'
+    status = '已回答（未修改画布）'
   } else if (out.kind === 'built') {
     if (out.check?.status === 'failed') {
       status = unchanged
-        ? `画布没有改动，但还有 ${out.check.issues.length} 处问题要你处理`
-        : `已放到画布，但还有 ${out.check.issues.length} 处问题要你处理`
+        ? `画布未修改，仍有 ${out.check.issues.length} 处问题待处理`
+        : `已应用到画布，仍有 ${out.check.issues.length} 处问题待处理`
       tone = 'warn'
     } else if (out.skipped.length) {
       // 模型只加了认不出类型的节点、全被跳过时画布一处没变：说「已放到画布」是在报一个没发生的改动
       status = unchanged
-        ? `画布没有改动：有 ${out.skipped.length} 步没放上`
-        : `已放到画布，但有 ${out.skipped.length} 步没放上`
+        ? `画布未修改：有 ${out.skipped.length} 个步骤未能添加`
+        : `已应用到画布，但有 ${out.skipped.length} 个步骤未能添加`
       tone = 'warn'
     } else if (unasked.length) {
       // 360px 的卡头放不下长句：要紧的「没让删」放前面，逐项说明在下面的工具清单里
-      status = `${updated} · 没让删却少了 ${unasked.length} 处工具`
+      status = `${updated} · 未经要求移除了 ${unasked.length} 处工具`
       tone = 'warn'
     } else if (unchanged) {
       // 收到了 final，但一处都没变：说「已更新画布」是在报一个没发生的改动
-      status = '看过了，画布没有需要改的地方'
+      status = '已检查，画布无需修改'
     } else if (out.check?.status === 'passed' && out.check.repaired) {
       // 修了几处只有「交回去改」那一条带着数；没有它（一次就修好）时不硬凑「几 处」
-      status = `${updated} · ${foundN ? `自查发现 ${foundN} 处问题，已自动修好` : '自查发现的问题已自动修好'}`
+      status = `${updated} · ${foundN ? `自查发现 ${foundN} 处问题，已自动修正` : '自查发现的问题已自动修正'}`
     } else if (out.check?.status === 'passed') {
       status = `${updated} · 自查通过`
     } else {
@@ -200,7 +191,7 @@ function copilotTurn(
     }
   } else {
     // 流正常收尾，却既没有交回图也没有回话（停止了，或者模型什么都没给）
-    status = '没有改动画布'
+    status = '未修改画布'
     statusCode = 'cancelled'
   }
 
@@ -251,7 +242,7 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
     id: `past-${t.id}`,
     question: t.question,
     phase: t.status === 'error' ? 'error' : 'done',
-    status: t.status === 'error' ? '这一轮没能完成' : t.graph ? '改过画布' : '已回答',
+    status: t.status === 'error' ? '本轮未能完成' : t.graph ? '已修改画布' : '已回答',
     steps: [],
     output: t.answer ? { 回答: t.answer } : t.explanation ? { 说明: t.explanation } : null,
     error: t.status === 'error' ? t.error || undefined : undefined,
@@ -318,7 +309,7 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
           {repairable && (
             <button type="button" className="btn btn-xs btn-primary"
                     onClick={() => repairWithCopilot(source.id)}>
-              <Wand2 size={11} aria-hidden /> {issues.length ? '让助手再修' : '让助手补上'}
+              <Wand2 size={11} aria-hidden /> {issues.length ? '让助手继续修正' : '让助手补全'}
             </button>
           )}
           {undo && (
@@ -340,13 +331,13 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
           <span className="text-2xs font-semibold">助手</span>
           {memory.turns > 0 && (
             <span className="chip tnum text-2xs"
-                  title={`下一条指令会带上最近 ${memory.turns} 轮对话和上一轮的工作流，模型据此理解"刚才那个"指的是什么`}>
+                  title={`下一条指令会附带最近 ${memory.turns} 轮对话和上一轮的工作流，模型据此理解「刚才那个」指的是什么`}>
               参考前 {memory.turns} 轮
             </span>
           )}
           <span className="flex-1" />
           <IconButton
-            label="开始新对话（不影响画布；模型不再参考之前的对话，旧对话保留）"
+            label="开始新对话（不影响画布，旧对话保留）"
             onClick={() => void newCopilotConversation()}
           >
             <MessageSquarePlus size={12} aria-hidden />
@@ -401,7 +392,7 @@ function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (x:
           {x.nodeId && (
             <button type="button"
                     className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
-                    title={x.field ? '打开这个节点的设置，翻到出问题的那一项' : '在画布上定位这个节点'}
+                    title={x.field ? '打开该节点的设置，定位到出问题的配置项' : '在画布上定位这个节点'}
                     onClick={() => onLocate(x)}>
               <Crosshair size={10} aria-hidden /> 定位
             </button>
@@ -427,7 +418,7 @@ function ToolLossList({ unasked, asked, onLocate }: {
            style={warn ? { borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))', background: 'var(--st-waiting-soft)' }
              : undefined}>
         <div className={warn ? 'font-medium text-fg' : 'text-dim'}>
-          {warn ? '这一轮没让删，确认一下是不是改漏了：' : '按要求去掉的：'}
+          {warn ? '本轮未要求删除以下工具，请确认是否误删：' : '按要求去掉的：'}
         </div>
         <ul className="space-y-0.5">
           {changes.map((c) => (
@@ -436,12 +427,12 @@ function ToolLossList({ unasked, asked, onLocate }: {
               <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
                 「{c.label}」{c.member ? `的成员「${c.member}」` : ''}去掉了{' '}
                 <span className="mono">{c.removed.join('、')}</span>
-                {c.after.length ? `，还剩 ${c.after.join('、')}` : '，现在一个工具都没有'}
+                {c.after.length ? `，剩余 ${c.after.join('、')}` : '，当前没有任何工具'}
               </span>
               {c.node_id && (
                 <button type="button"
                         className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
-                        title="打开这个节点的设置，光标放在工具那一栏的「添加」上"
+                        title="打开该节点的设置，并定位到工具配置项的「添加」"
                         onClick={() => onLocate(c)}>
                   <Crosshair size={10} aria-hidden /> 定位
                 </button>
@@ -484,7 +475,7 @@ function RunStrip({ onClick }: { onClick: () => void }) {
       data-run-strip={phase}
       className="flex w-full shrink-0 items-center gap-2 border-t px-2.5 py-1.5 text-left text-2xs transition-colors hover:bg-hover"
       style={waiting ? { background: 'var(--st-waiting-soft)' } : undefined}
-      title="看这次运行的完整过程" onClick={onClick}
+      title="查看本次运行的完整过程" onClick={onClick}
     >
       {phase === 'idle'
         ? <Play size={10} className="shrink-0 text-faint" fill="currentColor" aria-hidden />
@@ -667,11 +658,11 @@ function RunView({ onBack, reveal, onRevealed }: {
     const ok = await confirmDialog({
       title: '放弃这次运行？',
       body: phase === 'suspended'
-        ? '运行在服务重启时挂起了。放弃之后它记为已取消，不能再从断点接着跑。'
-        : '运行停在审批上。放弃之后它记为已取消，不能再接着跑。',
+        ? '运行在服务重启时已挂起。放弃后将记为已取消，且无法从断点继续运行。'
+        : '运行正在等待审批。放弃后将记为已取消，且无法继续运行。',
       consequences: [
-        ...(pending.length ? [`这次运行的 ${pending.length} 条待审批一并关闭，留痕里写上是谁放弃的`] : []),
-        '已经跑完的节点结果照样留在记录里',
+        ...(pending.length ? [`本次运行的 ${pending.length} 条待审批将一并关闭，操作记录中会写明放弃人`] : []),
+        '已完成节点的结果仍保留在记录中',
       ],
       confirmLabel: '放弃这次运行',
       danger: true,
@@ -797,10 +788,10 @@ function RunView({ onBack, reveal, onRevealed }: {
                    style={{ borderColor: 'var(--st-waiting)' }}>
                 {looked === run.id ? (
                   <>
-                    没找到这次运行的待审批卡，可能已经在别处处理过了 ·{' '}
-                    <Link to={`/runs/${run.id}`} className="underline underline-offset-2 hover:text-fg">看运行记录</Link>
+                    未找到本次运行的待审批卡，可能已在别处处理 ·{' '}
+                    <Link to={`/runs/${run.id}`} className="underline underline-offset-2 hover:text-fg">查看运行记录</Link>
                   </>
-                ) : '正在取审批卡…'}
+                ) : '正在加载审批卡…'}
               </div>
             ) : null)}
           />
@@ -852,18 +843,18 @@ function RunFooter() {
         {runClassLabel(run.run_class ?? 'exploratory', run.version)}
       </span>
       <span className="flex-1" />
-      <span title="执行时长：各段执行之和，不含等人审批的时间">
+      <span title="执行时长：各段执行时长之和，不含等待审批的时间">
         执行 <span className="mono text-fg">
           {activeMs == null ? NONE : ticking ? formatLapse(activeMs) : formatSpan(activeMs)}
         </span>
       </span>
       {(waitMs ?? 0) > 0 && (
-        <span title="等人审批的总时长" style={phase === 'waiting' ? { color: 'var(--st-waiting)' } : undefined}>
-          等人 <span className="mono">{ticking ? formatLapse(waitMs!) : formatSpan(waitMs!)}</span>
+        <span title="等待审批的总时长" style={phase === 'waiting' ? { color: 'var(--st-waiting)' } : undefined}>
+          等待审批 <span className="mono">{ticking ? formatLapse(waitMs!) : formatSpan(waitMs!)}</span>
         </span>
       )}
-      <span title={approx ? '运行中实时累加，可能偏少；跑完以后端累计为准' : '后端累计'}>
-        <span className="mono">{approx && tokens ? '≥' : ''}{tokens ? formatTokens(tokens, { compact: true }) : `${NONE} tok`}</span>
+      <span title={approx ? '运行中实时累加，可能偏少；运行结束后以服务端统计为准' : '服务端统计'}>
+        <span className="mono">{approx && tokens ? '≥' : ''}{tokens ? formatTokens(tokens, { compact: true }) : `${NONE} token`}</span>
       </span>
       <span className="mono">{approx && cost ? '≥' : ''}{cost != null && (cost > 0 || settled) ? formatCost(cost) : NONE}</span>
     </div>
@@ -883,7 +874,7 @@ function RawEvents() {
   if (!events.length) {
     return (
       <div className="flex h-full items-center justify-center text-2xs text-dim">
-        还没有事件
+        暂无事件
       </div>
     )
   }

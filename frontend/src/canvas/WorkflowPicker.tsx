@@ -54,7 +54,7 @@ export async function confirmDiscard(): Promise<boolean> {
   return confirmDialog({
     // 可能是在别的页上问的（记录页打开另一张工作流）：说出是哪一张的改动
     title: workflow ? `放弃「${workflow.name}」未保存的改动？` : '放弃画布上未保存的改动？',
-    consequences: ['切换之后这些改动和撤销记录都会丢失', `要留着的话，先取消，回到画布按 ${formatShortcut('Mod+S')} 保存`],
+    consequences: ['切换后，这些修改和撤销记录都将丢失', `如需保留，请先取消，回到画布按 ${formatShortcut('Mod+S')} 保存`],
     confirmLabel: '放弃并切换',
     danger: true,
   })
@@ -126,11 +126,11 @@ export async function createWorkflow(
   const names = new Set(useCatalog.getState().workflows.map((w) => w.name))
   const name = await promptDialog({
     title: from ? `用「${from.name}」新建工作流` : '新建工作流',
-    body: from ? '复制这张模板的节点和配置，改成你自己的。模板本身不受影响。' : '从「输入 → 成果」两个节点开始。',
+    body: from ? '将复制该模板的节点和配置，你可以在此基础上修改。模板本身不受影响。' : '从「输入 → 成果」两个节点开始。',
     label: '名称',
     initial: from ? `${from.name.replace(/^[①-⑳]\s*/, '')} ${stamp()}` : defaultWorkflowName(),
     confirmLabel: '新建并打开',
-    validate: (v) => (names.has(v) ? '已经有一张同名的工作流了，换个名字好认' : null),
+    validate: (v) => (names.has(v) ? '已存在同名工作流，请使用其他名称' : null),
   })
   if (!name) return false
   if (!(await confirmDiscard())) return false
@@ -169,7 +169,7 @@ function StatusChip({ w }: { w: Workflow }) {
     <>
       <span className="chip shrink-0">{WORKFLOW_STATUS_LABEL.draft}</span>
       {p != null && (
-        <span className="chip tnum shrink-0 text-faint" title={`正式运行跑的是${pub}的 v${p}`}>{pub} v{p}</span>
+        <span className="chip tnum shrink-0 text-faint" title={`正式运行使用${pub}的 v${p}`}>{pub} v{p}</span>
       )}
     </>
   )
@@ -222,8 +222,8 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
     const ok = await confirmDialog({
       title: `删除工作流「${w.name}」？`,
       consequences: [
-        '工作流和它的全部版本一起删除，不可恢复',
-        w.run_count ? `${w.run_count} 条运行记录会保留，但不再关联到它` : '它还没有运行记录',
+        '工作流及其全部版本将被删除，且无法恢复',
+        w.run_count ? `${w.run_count} 条运行记录将保留，但不再关联到该工作流` : '该工作流尚无运行记录',
       ],
       confirmLabel: '删除工作流',
       danger: true,
@@ -268,7 +268,7 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
   return (
     <Modal open={open} onClose={onClose} title="工作流" width={720}
            footer={<>
-             <span className="mr-auto self-center text-2xs text-faint">↑↓ 选择 · {formatShortcut('Enter')} 打开 · Esc 关掉</span>
+             <span className="mr-auto self-center text-2xs text-faint">↑↓ 选择 · {formatShortcut('Enter')} 打开 · Esc 关闭</span>
              <button className="btn btn-primary" onClick={async () => { if (await createWorkflow(navigate, refresh)) onClose() }}>
                <Plus size={12} /> 新建空白工作流
              </button>
@@ -305,7 +305,7 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
 
       {!shown.length ? (
         <EmptyState offline={false} icon={<WorkflowIcon size={20} />} title="没有匹配的工作流"
-                    body={query ? `没有名字或说明里带「${query}」的` : undefined}
+                    body={query ? `没有名称或说明包含「${query}」的工作流` : undefined}
                     action={query ? <button className="btn btn-sm" onClick={() => setQuery('')}>清除搜索</button> : undefined} />
       ) : (
         <ul ref={listRef} className="max-h-[52vh] space-y-1 overflow-y-auto pr-0.5" role="listbox" aria-label="工作流">
@@ -326,7 +326,7 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
               >
                 {here && (
                   <span className="absolute right-1.5 top-1.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent-solid text-on-accent"
-                        title="当前打开的">
+                        title="当前已打开">
                     <Check size={9} strokeWidth={3} />
                   </span>
                 )}
@@ -340,23 +340,23 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
                     ))}
                   </div>
                   <div className="mt-0.5 truncate text-2xs text-faint">
-                    {w.description || '（没有说明）'}
+                    {w.description || '（无说明）'}
                   </div>
                 </div>
                 <div className="tnum shrink-0 text-right text-2xs leading-relaxed text-faint">
                   <div title={w.updated_at ? formatDateTime(w.updated_at) : undefined}>
                     {w.updated_at ? `${formatTime(w.updated_at)} 更新` : '—'}
                   </div>
-                  <div>{w.graph?.nodes?.length ?? 0} 节点 · v{w.version}{w.run_count ? ` · 跑过 ${w.run_count} 次` : ''}</div>
+                  <div>{w.graph?.nodes?.length ?? 0} 个节点 · v{w.version}{w.run_count ? ` · 运行 ${w.run_count} 次` : ''}</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
                   {w.is_template && (
                     <button type="button" className="btn btn-sm"
                             onClick={async () => { if (await createWorkflow(navigate, refresh, w)) onClose() }}>
-                      <Plus size={11} /> 用它新建
+                      <Plus size={11} /> 以此模板新建
                     </button>
                   )}
-                  <IconButton label={`复制「${w.name}」`} title="复制一份"
+                  <IconButton label={`复制「${w.name}」`} title="复制"
                               className="text-faint group-hover:text-dim"
                               onClick={() => void duplicate(w)} icon={<Copy size={11} />} />
                   <IconButton label={`删除「${w.name}」`} title="删除"

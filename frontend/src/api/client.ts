@@ -15,7 +15,7 @@ const BASE = '/api'
  */
 export type ApiErrorKind = 'network' | 'http'
 
-export const NETWORK_MESSAGE = '连不上后端服务（可能没启动或正在重启），稍后重试'
+export const NETWORK_MESSAGE = '无法连接服务（服务端可能未启动或正在重启），请稍后重试'
 
 export class ApiError extends Error {
   kind: ApiErrorKind
@@ -78,7 +78,8 @@ function actorHeader(): Record<string, string> {
 function describeDetail(detail: unknown, path?: string): string {
   if (typeof detail === 'string') return detail
   if (Array.isArray(detail)) return `${VALIDATION_TITLE}：${describeValidation(detail, path).join('；')}`
-  try { return JSON.stringify(detail) } catch { return String(detail) }
+  // 对象形态的 detail 原样 JSON 化只会把一串花括号摆到提示里：界面只说无法识别，原文在调用方的 raw 里
+  return '请求失败，服务端返回了无法识别的错误信息'
 }
 
 /**
@@ -89,6 +90,29 @@ function isGatewayFailure(status: number, bodyText: string, isJson: boolean): bo
   if (isJson) return false
   if (status === 502 || status === 503 || status === 504) return true
   return status === 500 && !bodyText.trim()
+}
+
+/**
+ * 后端交回模型用的改写指令：报告核对的 violations、助手自查的问题条目里带着 for_model。那是写给模型的
+ * 原话（「单元格要写成 Q<编号>.r<行>.<列>」这类），界面只显示给人看的 message。前端没有任何地方读它，
+ * 就在数据进来的地方去掉——原始事件、工件原文、展开详情这些直接显示 JSON 的地方也就不会露出来。
+ */
+const MODEL_NOTE = 'for_model'
+
+function dropModelNotes(v: unknown): void {
+  if (Array.isArray(v)) {
+    for (const x of v) dropModelNotes(x)
+  } else if (v && typeof v === 'object') {
+    delete (v as Record<string, unknown>)[MODEL_NOTE]
+    for (const x of Object.values(v)) dropModelNotes(x)
+  }
+}
+
+/** 解析响应体；带 for_model 的（先按原文粗筛，不带的不走一遍）去掉它 */
+export function parseBody(text: string): any {
+  const body = JSON.parse(text)
+  if (text.includes(`"${MODEL_NOTE}"`)) dropModelNotes(body)
+  return body
 }
 
 async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
@@ -117,7 +141,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
     })
   } catch (e: any) {
     if (timedOut) {
-      const err = new ApiError(0, `后端 ${Math.round(timeoutMs! / 1000)} 秒没有响应，稍后重试`,
+      const err = new ApiError(0, `服务端 ${Math.round(timeoutMs! / 1000)} 秒未响应，请稍后重试`,
         { kind: 'network', raw: `timeout after ${timeoutMs}ms: ${path}`, timeoutMs })
       report(false, err)
       throw err
@@ -134,7 +158,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''), path)
   report(true)
   if (res.status === 204) return undefined as T
-  return res.json()
+  return parseBody(await res.text())
 }
 
 /** 后端 {detail, code} 里的机读码；没有就是 undefined */
@@ -164,8 +188,8 @@ function failure(status: number, statusText: string, text: string, path?: string
     })
   }
   const message = status >= 500
-    ? `后端出错了（${status}），详情看服务日志`
-    : `请求没有成功（${status} ${statusText}）`
+    ? `服务端错误（${status}），详情请查看服务日志`
+    : `请求失败（HTTP ${status}）`
   return new ApiError(status, message, { raw: `${status} ${statusText}\n${text.slice(0, 2000)}` })
 }
 
@@ -219,9 +243,9 @@ function upload<T>(path: string, form: FormData, opts?: UploadOptions): Promise<
       report(true)
       if (xhr.status === 204 || !xhr.responseText) { resolve(undefined as T); return }
       try {
-        resolve(JSON.parse(xhr.responseText))
+        resolve(parseBody(xhr.responseText))
       } catch {
-        reject(new ApiError(xhr.status, '后端回的内容读不懂', { raw: xhr.responseText.slice(0, 2000) }))
+        reject(new ApiError(xhr.status, '无法解析服务端返回的内容', { raw: xhr.responseText.slice(0, 2000) }))
       }
     }
     xhr.onerror = () => {
@@ -839,8 +863,8 @@ export function streamCopilot(
         }
         report(true)
         onEnd(isJson ? describeDetail(body?.detail ?? body, '/copilot/generate-stream')
-          : res.status >= 500 ? `后端出错了（${res.status}），详情看服务日志`
-          : `请求没有成功（${res.status} ${res.statusText}）`, { status: res.status, code: isJson ? codeOf(body) : undefined })
+          : res.status >= 500 ? `服务端错误（${res.status}），详情请查看服务日志`
+          : `请求失败（HTTP ${res.status}）`, { status: res.status, code: isJson ? codeOf(body) : undefined })
         return
       }
       report(true)
@@ -857,7 +881,7 @@ export function streamCopilot(
           buffer = buffer.slice(idx + 2)
           if (!frame.startsWith('data: ')) continue
           try {
-            onOp(JSON.parse(frame.slice(6)))
+            onOp(parseBody(frame.slice(6)))
           } catch { /* 半截帧，忽略 */ }
         }
       }
@@ -870,7 +894,7 @@ export function streamCopilot(
         onEnd(NETWORK_MESSAGE)
         return
       }
-      onEnd(e?.message ?? '连接中断')
+      onEnd(e?.message ?? '连接中断，请重试')
     }
   })()
   return () => controller.abort()
@@ -905,7 +929,7 @@ export function streamRun(
     socket = new WebSocket(`${proto}://${location.host}/api/runs/${runId}/stream?after=${lastSeq}`)
 
     socket.onmessage = (ev) => {
-      const event = JSON.parse(ev.data) as RunEvent & { type: string; status?: string }
+      const event = parseBody(ev.data) as RunEvent & { type: string; status?: string }
       if (event.type === 'stream.end') {
         closed = true
         socket?.close()

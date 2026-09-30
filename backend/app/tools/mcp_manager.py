@@ -198,9 +198,9 @@ def _reason(e: BaseException, command: str | None = None) -> str:
     if isinstance(e, FileNotFoundError):
         # stdio 客户端抛的这个异常常常不带文件名，只剩「找不到命令 」半句：补上配置的命令
         missing = e.filename or command or ""
-        return f"启动不了：找不到命令 {missing}。确认它已安装、并且在后端的 PATH 里"
+        return f"无法启动：找不到命令 {missing}。请确认已安装，且位于服务端的 PATH 中"
     if isinstance(e, asyncio.TimeoutError):
-        return "连上了但 30 秒内没有应答：确认这个命令启动的是 MCP 服务，参数有没有写错"
+        return "已连接，但 30 秒内没有响应：请确认该命令启动的是 MCP 服务，并检查参数"
     reason, hint = explain(e)
     return f"{reason}。{hint}" if hint else reason
 

@@ -78,7 +78,7 @@ export const STATUS: Record<StatusCode, StatusMeta> = {
   },
   queued: {
     code: 'queued', label: '排队中', short: '排队', shape: 'dashed-ring', alert: false, terminal: false,
-    hint: '上游已经交付，等同一步里别的节点跑完', ...tok('queued', 'var(--text-dim)'),
+    hint: '上游已完成，等待同一步中的其他节点完成', ...tok('queued', 'var(--text-dim)'),
   },
   running: {
     code: 'running', label: '运行中', short: '运行中', shape: 'ring', alert: false, terminal: false,
@@ -86,7 +86,7 @@ export const STATUS: Record<StatusCode, StatusMeta> = {
   },
   waiting: {
     code: 'waiting', label: '等待审批', short: '待审批', shape: 'diamond', alert: true, terminal: false,
-    hint: '停在人工审批上，处理之后接着跑', ...tok('waiting', 'var(--warn)'),
+    hint: '停在人工审批处，处理后继续运行', ...tok('waiting', 'var(--warn)'),
   },
   done: {
     code: 'done', label: '已完成', short: '完成', shape: 'square', alert: false, terminal: true,
@@ -94,7 +94,7 @@ export const STATUS: Record<StatusCode, StatusMeta> = {
   },
   succeeded: {
     code: 'succeeded', label: '已完成', short: '完成', shape: 'square', alert: false, terminal: true,
-    hint: '执行层面跑完了。结论是否可用看出具档位和复核', ...tok('done', 'var(--ok)'),
+    hint: '执行已完成。结论是否可用，请查看出具档位和复核结果', ...tok('done', 'var(--ok)'),
   },
   failed: {
     code: 'failed', label: '失败', short: '失败', shape: 'triangle', alert: true, terminal: true,
@@ -106,24 +106,24 @@ export const STATUS: Record<StatusCode, StatusMeta> = {
   },
   suspended: {
     code: 'suspended', label: '已中断（服务重启）', short: '已中断', shape: 'pause', alert: true, terminal: true,
-    hint: '服务重启时这次运行还没结束，已从断点挂起，可以接着跑', ...tok('suspended', 'var(--warn)'),
+    hint: '服务重启时本次运行尚未结束，已在断点处挂起，可继续运行', ...tok('suspended', 'var(--warn)'),
   },
   held: {
-    code: 'held', label: '已挂起 · 可续跑', short: '已挂起', shape: 'pause', alert: true, terminal: true,
-    hint: '运行停在断点上，但没有待处理的审批——多半是服务重启打断的，可以接着跑',
+    code: 'held', label: '已挂起 · 可继续运行', short: '已挂起', shape: 'pause', alert: true, terminal: true,
+    hint: '运行停在断点处，且没有待处理的审批，通常是服务重启所致，可继续运行',
     ...tok('suspended', 'var(--warn)'),
   },
   skipped: {
     code: 'skipped', label: '已跳过', short: '跳过', shape: 'slashed', alert: false, terminal: true,
-    hint: '跳过条件成立，这一步没有执行', ...tok('skipped', 'var(--text-faint)'),
+    hint: '跳过条件成立，本步骤未执行', ...tok('skipped', 'var(--text-faint)'),
   },
   blocked: {
     code: 'blocked', label: '已阻断', short: '阻断', shape: 'dashed-x', alert: true, terminal: true,
-    derived: true, hint: '推导：上游失败，这次运行再也走不到这里', ...tok('blocked', 'var(--err)'),
+    derived: true, hint: '推导：上游节点失败，本次运行不会执行到此处', ...tok('blocked', 'var(--err)'),
   },
   unreached: {
     code: 'unreached', label: '未到达', short: '未到达', shape: 'bar', alert: false, terminal: true,
-    derived: true, hint: '推导：运行结束时一次都没轮到，比如分支没走的那一侧', ...tok('unreached', 'var(--text-faint)'),
+    derived: true, hint: '推导：运行结束时未执行到此节点，例如未命中的条件分支', ...tok('unreached', 'var(--text-faint)'),
   },
 }
 

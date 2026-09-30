@@ -38,7 +38,7 @@ SQL = "SELECT region, SUM(amount) AS gmv, COUNT(*) AS order_cnt FROM orders GROU
 #: 和裸数字、没挂依据；第三句是没挂依据的结论
 WRITE = ('`orders` 里东区最多, 达 [[v:Q1.r0.gmv]] "含税"。[[see:Q1]]`refund_log` 另算，另有 999 笔待核。'
          "增长主要来自新客。")
-HEADER = ["分组", "报告节点", "成果字段", "片段", "句子编号", "种类", "原文", "状态", "问题", "引用", "证据",
+HEADER = ["分组", "报告节点", "成果字段", "片段编号", "句子编号", "种类", "原文", "状态", "问题", "引用", "证据",
           "证据种类", "证据编号", "工件", "来源节点", "已封存", "句子", "说明", "封存核对"]
 
 
@@ -192,7 +192,7 @@ async def test_the_audit_groups_every_stateful_piece(client, warehouse, monkeypa
     body = (await client.get(f"/api/runs/{row.id}/evidence/audit")).json()
     assert body["run_id"] == row.id and body["schema"] == "agentlab.evidence.audit/1" and body["mode"] == "cited"
     assert [g["key"] for g in body["groups"]] == ["cited", "none", "suspicious", "candidate"]
-    assert [g["label"] for g in body["groups"]] == ["有出处", "无证据", "可疑实体", "旧运行猜测"]
+    assert [g["label"] for g in body["groups"]] == ["有出处", "无证据", "可疑名称", "按数值猜测"]
     assert body["counts"] == {g["key"]: len(g["rows"]) for g in body["groups"]}
     assert body["total"] == sum(body["counts"].values())
 
@@ -214,12 +214,12 @@ async def test_the_audit_groups_every_stateful_piece(client, warehouse, monkeypa
 
     [fake] = rows_of(body, "suspicious")
     assert fake["kind"] == "entity" and fake["issue"] == "unknown_entity" and fake["text"] == "`refund_log`"
-    assert "可能是编造的名字" in fake["note"]
+    assert "疑似不存在的名称" in fake["note"]
     assert rows_of(body, "candidate") == []
 
     seal = body["seal"]
     assert seal["sealed"] is True and seal["ok"] is True and seal["manifest_seq"] == row.manifest_seq
-    assert seal["events"] > 0 and seal["message"] == "事件流与封存时一致"
+    assert seal["events"] > 0 and seal["message"] == "事件记录与封存时一致"
     [report] = body["reports"]
     assert report["node_id"] == "write" and report["hash_ok"] is True and report["doc_sealed"] is True
     assert report["claims"] == "off" and report["stats"]["unknown_entities"] == 1
@@ -231,7 +231,7 @@ async def test_violations_without_a_row_of_their_own_are_listed(client, warehous
     body = (await client.get(f"/api/runs/{row.id}/evidence/audit")).json()
     [fake] = rows_of(body, "suspicious")
     assert (fake["kind"], fake["issue"], fake["text"]) == ("violation", "unknown_entity", "refund_log")
-    assert fake["segment"] and "可能是编造的名字" in fake["note"]
+    assert fake["segment"] and "疑似不存在的名称" in fake["note"]
     [bare] = rows_of(body, "none")
     assert (bare["kind"], bare["issue"], bare["text"]) == ("violation", "uncited_number", "100")
     assert [r["text"] for r in rows_of(body, "cited")] == ["400.5"]
@@ -269,8 +269,8 @@ async def test_the_audit_exports_json_and_csv(client, warehouse, monkeypatch):
     assert cell[0] == "有出处" and cell[7] == "有出处" and cell[15] == "是" and cell[10] == "Q1.r0.gmv"
     # 句子里的 ASCII 逗号和双引号原样读回来
     assert cell[16] == '`orders` 里东区最多, 达 400.5 "含税"。'
-    fake = next(line for line in table[1:] if line[8] == "可能是编造的名字")
-    assert fake[0] == "可疑实体" and fake[6] == "`refund_log`"
+    fake = next(line for line in table[1:] if line[8] == "疑似不存在的名称")
+    assert fake[0] == "可疑名称" and fake[6] == "`refund_log`"
     # 存下来的文件自己带着封存核对的结果（响应头离了浏览器就没了）
     assert {line[18] for line in table[1:]} == {f"封存核对通过（封存于第 {row.manifest_seq} 条事件）"}
 
@@ -305,13 +305,13 @@ async def test_a_broken_seal_marks_every_row_unsealed(client, warehouse, monkeyp
         started.data = {**(started.data or {}), "note": "事后改过"}
         await session.commit()
     body = (await client.get(f"/api/runs/{row.id}/evidence/audit")).json()
-    assert body["seal"]["ok"] is False and "对不上" in body["seal"]["message"]
+    assert body["seal"]["ok"] is False and "不一致" in body["seal"]["message"]
     assert all(r["sealed"] is False for r in rows_of(body, "cited"))
     as_csv = await client.get(f"/api/runs/{row.id}/evidence/audit", params={"format": "csv"})
     assert as_csv.headers["x-evidence-seal"] == "broken"
     table = list(csv.reader(io.StringIO(as_csv.content.decode("utf-8")[1:])))
     assert {line[15] for line in table[1:] if line[0] == "有出处"} == {"否"}
-    assert {line[18] for line in table[1:]} == {"封存核对没通过：封存之后有事件被改过、删过或插过"}
+    assert {line[18] for line in table[1:]} == {"封存核对未通过：封存后有事件被修改、删除或插入"}
 
 
 async def test_a_run_waiting_for_approval_is_audited_as_unsealed(client, warehouse, monkeypatch):
@@ -334,7 +334,7 @@ async def test_a_run_waiting_for_approval_is_audited_as_unsealed(client, warehou
     as_csv = await client.get(f"/api/runs/{run.id}/evidence/audit", params={"format": "csv"})
     assert as_csv.headers["x-evidence-seal"] == "unsealed"
     table = list(csv.reader(io.StringIO(as_csv.content.decode("utf-8")[1:])))
-    assert len(table) > 1 and {line[18] for line in table[1:]} == {"未封存：运行还没跑完，或者停在人工审批"}
+    assert len(table) > 1 and {line[18] for line in table[1:]} == {"未封存：运行尚未结束，或正停在人工审批"}
 
 
 CLAIMED = "`orders` 里东区最多，达 [[m:gmv]]。[[see:m:gmv]]增长主要来自新客。"

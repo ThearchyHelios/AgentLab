@@ -85,7 +85,7 @@ def test_judge_without_a_budget_is_an_error_at_governed(judge):
     graph = traceable(report=report)
     [issue] = by_code(graph, BUDGET)
     assert issue.level == "error" and issue.node_id == "write" and issue.field == "judge.max_cost_usd"
-    assert "max_cost_usd" in issue.message and "不限" in issue.message and "null" in issue.message
+    assert "「金额上限（美元）」" in issue.message and "不限" in issue.message and "「结论句裁判」" in issue.message
     assert by_code(graph, "governed.report_policy") == [], "judge 本身合规，只缺预算"
     assert [i.level for i in by_code(graph, BUDGET, "published")] == ["warning"]
 
@@ -114,7 +114,8 @@ def test_a_malformed_budget_is_left_to_validate():
 def test_a_loose_claims_setting_names_both_accepted_values(claims):
     report = {"numbers": "strict", "on_violation": "fail", **({"claims": claims} if claims else {})}
     [issue] = by_code(traceable(report=report), "governed.report_policy")
-    assert issue.field == "claims" and "claims: require_citation" in issue.message and "judge" in issue.message
+    assert issue.field == "claims" and "「未附依据的结论句」设为「计入缺口」" in issue.message \
+        and "「计入缺口并由模型逐句判断」" in issue.message
 
 
 def test_judge_needs_no_other_report_policy_fix():
@@ -181,7 +182,7 @@ def test_a_choice_outside_the_options_is_refused():
     graph = traceable(report={**STRICT, "claims": "judge"})
     fid = f"{BUDGET}:write"
     out = apply_fixes(graph, [fid], {fid: 99}, level="governed")
-    assert out["applied"] == [] and "不在候选里" in out["rejected"][0]["reason"]
+    assert out["applied"] == [] and "不在候选项中" in out["rejected"][0]["reason"]
 
 
 def test_published_level_budget_warnings_get_no_fix():
@@ -222,13 +223,13 @@ def test_moving_up_to_judge_is_not_loosening():
 def test_moving_down_from_judge_is_loosening(after):
     report_after = None if after is None else {**JUDGED, "claims": after}
     [reason] = _changed(JUDGED, report_after)
-    assert "「报告撰写」" in reason and "claims" in reason and "judge" in reason
+    assert "「报告撰写」" in reason and "「未附依据的结论句」" in reason and "「计入缺口并由模型逐句判断」" in reason
 
 
 def test_dropping_a_judge_set_in_the_graph_defaults_is_loosening():
     [reason] = _changed({"numbers": "strict", "on_violation": "fail"}, {**STRICT, "claims": "off"},
                         defaults={"claims": "judge", "judge": {"max_cost_usd": 0.05}})
-    assert "claims" in reason and "judge" in reason
+    assert "「未附依据的结论句」" in reason and "「计入缺口并由模型逐句判断」" in reason
 
 
 def test_changing_the_budget_is_not_loosening():
@@ -248,16 +249,16 @@ WITHHOLD = {**JUDGED, "judge": {"max_cost_usd": 0.05, "on_unsupported": "withhol
 ])
 def test_relaxing_on_unsupported_on_the_node_is_loosening(judge, dropped):
     [reason] = _changed(WITHHOLD, {**WITHHOLD, "judge": judge})
-    assert "「报告撰写」" in reason and "judge.on_unsupported" in reason
-    assert "withhold" in reason and "degrade" in reason
-    assert ("去掉了写明的值" in reason) is dropped, reason
+    assert "「报告撰写」" in reason and "「结论句裁判 · 证据不支持时」" in reason
+    assert "「不予出具」" in reason and "「出具降档」" in reason
+    assert ("删除了已设置的值" in reason) is dropped, reason
 
 
 def test_replacing_the_whole_judge_block_to_add_a_budget_is_loosening():
     """补预算把 judge 整个换成 {max_cost_usd}：连同裁判模型、withhold 一起丢了。"""
     before = {**STRICT, "claims": "judge", "judge": {"model": "judge-model", "on_unsupported": "withhold"}}
     [reason] = _changed(before, {**before, "judge": {"max_cost_usd": 0.05}})
-    assert "judge.on_unsupported" in reason and "withhold" in reason
+    assert "「结论句裁判 · 证据不支持时」" in reason and "「不予出具」" in reason
     assert _changed(before, {**before, "judge": {**before["judge"], "max_cost_usd": 0.05}}) == [], \
         "带着原来的键补预算不算放宽"
 
@@ -267,8 +268,8 @@ def test_a_withhold_from_the_graph_defaults_lost_by_a_node_judge_is_loosening():
     defaults = {"judge": {"on_unsupported": "withhold", "max_cost_usd": 0.05}}
     report = {**STRICT, "claims": "judge"}
     [reason] = _changed(report, {**report, "judge": {"max_cost_usd": 0.05}}, defaults=defaults)
-    assert "judge.on_unsupported" in reason and "从 withhold（跟随全图默认）" in reason, reason
-    assert "不再跟随全图默认" in reason, "说清楚为什么全图默认里的 withhold 不生效了"
+    assert "「结论句裁判 · 证据不支持时」" in reason and "从「不予出具」（跟随工作流默认设置）" in reason, reason
+    assert "不再跟随工作流默认设置" in reason, "说清楚为什么全图默认里的 withhold 不生效了"
     assert _changed(report, {**report, "judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}},
                     defaults=defaults) == []
 
@@ -279,7 +280,7 @@ def test_relaxing_on_unsupported_in_the_graph_defaults_is_loosening():
     new = copy.deepcopy(old)
     new["defaults"]["judge"]["on_unsupported"] = "degrade"
     [reason] = forbidden_changes(old, new)
-    assert "「报告撰写」" in reason and "judge.on_unsupported" in reason
+    assert "「报告撰写」" in reason and "「结论句裁判 · 证据不支持时」" in reason
 
 
 @pytest.mark.parametrize("before, after", [
@@ -296,7 +297,7 @@ def test_tightening_or_keeping_on_unsupported_is_fine(before, after):
 def test_dropping_withhold_along_with_judge_is_one_reason():
     """从 judge 退回 require_citation：claims 那一条已经说了，不再为 on_unsupported 另记一条。"""
     [reason] = _changed(WITHHOLD, {**STRICT, "judge": {"max_cost_usd": 0.05}})
-    assert "claims" in reason and "on_unsupported" not in reason
+    assert "「未附依据的结论句」" in reason and "证据不支持时" not in reason
 
 
 @pytest.mark.parametrize("before", ["require_citation", "judge"])
@@ -305,7 +306,10 @@ def test_moving_claims_to_an_unknown_value_is_loosening(before):
     「没让图变好」。原来就认不出的不比较。"""
     report = {**STRICT, "claims": before, **({"judge": {"max_cost_usd": 0.05}} if before == "judge" else {})}
     [reason] = _changed(report, {**report, "claims": "sometimes"})
-    assert "「报告撰写」" in reason and before in reason and "sometimes" in reason and "不认识" in reason
+    from app.engine.labels import option_label
+
+    assert "「报告撰写」" in reason and f"「{option_label('claims', before)}」" in reason and "sometimes" in reason \
+        and "无法识别" in reason
     assert _changed({**STRICT, "claims": "sometimes"}, {**STRICT, "claims": "off"}) == []
     assert _changed({**STRICT, "claims": "off"}, {**STRICT, "claims": "sometimes"}) == []
 
@@ -331,7 +335,7 @@ def _contract_changed(before, after) -> list[str]:
 ])
 def test_loosening_a_judge_contract_is_refused(before, after):
     [reason] = _contract_changed(before, after)
-    assert "「出具」" in reason and "claims" in reason
+    assert "「出具」" in reason and "对结论句的要求" in reason
 
 
 @pytest.mark.parametrize("before, after", [

@@ -408,7 +408,7 @@ async def test_each_kind_of_bad_reply_says_which_kind() -> None:
     cases = {
         '': 'token',                                   # 空回复
         '随便说点什么': 'scores',                        # 找不到 scores
-        '{"scores": [1, 2]}': '对不上',                  # 个数不符
+        '{"scores": [1, 2]}': '数量不一致',              # 个数不符
         '{"scores": ["高", "低", "中"]}': '非数字',       # 类型不对
     }
     for reply, want in cases.items():

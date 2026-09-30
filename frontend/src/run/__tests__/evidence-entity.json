@@ -1,7 +1,7 @@
 {
  "_comment": "可点击证据第三期（表名字段名、可疑实体、逐字引文、旧运行的猜测来源）的前端夹具。报告文档由后端 evidence.py 的 compose_doc 真跑生成（表结构快照被截断、检索快照走 loader），猜测由 guess_sources 真跑；片段接口的实体、引文步骤照 E3-node 任务包的形状拼。只用通用示例名。",
  "run_id": "run-evidence-entity",
- "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351",
+ "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0",
  "doc": {
   "schema": "agentlab.report/1",
   "run_id": "run-evidence-entity",
@@ -705,7 +705,7 @@
          "kind": "column",
          "role": "entity",
          "status": "unresolved",
-         "reason": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+         "reason": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
          "rendered": "orders.discount",
          "unknown": true
         },
@@ -971,7 +971,7 @@
          "kind": "quote",
          "role": "quote",
          "status": "unresolved",
-         "reason": "K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+         "reason": "在 K1 的检索结果中找不到这段引文的原文",
          "rendered": "周报一律按自然周统计"
         },
         "state": "none",
@@ -1020,7 +1020,8 @@
   "violations": [
    {
     "code": "uncited_number",
-    "message": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "message": "数字「30」没有出处：报告中直接写出了数字，系统无法核对",
+    "for_model": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
     "span": [
      139,
      141
@@ -1032,7 +1033,8 @@
    },
    {
     "code": "unknown_entity",
-    "message": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+    "message": "「orders.coupon_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+    "for_model": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
     "span": [
      158,
      176
@@ -1044,7 +1046,8 @@
    },
    {
     "code": "unknown_entity",
-    "message": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+    "message": "「orders.discount」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+    "for_model": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
     "ref": "c:orders.discount",
     "span": [
      182,
@@ -1056,7 +1059,7 @@
    },
    {
     "code": "unverified_entity",
-    "message": "「promo_events」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+    "message": "「promo_events」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
     "span": [
      208,
      220
@@ -1068,7 +1071,8 @@
    },
    {
     "code": "unresolved_ref",
-    "message": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+    "message": "引用 [[q:K1|周报一律按自然周统计]] 无法解析：在 K1 的检索结果中找不到这段引文的原文",
+    "for_model": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
     "ref": "q:K1|周报一律按自然周统计",
     "span": [
      289,
@@ -1093,7 +1097,7 @@
   "reports": [
    {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351",
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0",
     "doc_sealed": true,
     "hash_ok": true,
     "ok": false,
@@ -1488,7 +1492,7 @@
   "s4": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s4",
@@ -1547,7 +1551,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -1561,7 +1565,7 @@
   "s6": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s6",
@@ -1653,7 +1657,7 @@
      "column_types": {}
     }
    ],
-   "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写",
+   "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -1667,7 +1671,7 @@
   "s8": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s8",
@@ -1759,7 +1763,7 @@
      "column_types": {}
     }
    ],
-   "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写",
+   "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -1773,7 +1777,7 @@
   "s10": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s10",
@@ -1872,7 +1876,7 @@
      "comment": "订单"
     }
    ],
-   "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义",
+   "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -1886,7 +1890,7 @@
   "s12": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s12",
@@ -1966,7 +1970,7 @@
      "primary_key": false
     }
    ],
-   "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义",
+   "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -1980,7 +1984,7 @@
   "s16": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s16",
@@ -2070,7 +2074,7 @@
      "comment": "退款单"
     }
    ],
-   "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义",
+   "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2084,7 +2088,7 @@
   "s18": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s18",
@@ -2165,7 +2169,7 @@
      "primary_key": false
     }
    ],
-   "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义",
+   "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2179,7 +2183,7 @@
   "s20": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s20",
@@ -2268,7 +2272,7 @@
      "column_types": {}
     }
    ],
-   "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写",
+   "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2282,7 +2286,7 @@
   "s22": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s22",
@@ -2313,11 +2317,12 @@
     "type": "paragraph"
    },
    "chain": [],
-   "note": "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它",
+   "note": "这个数字没有出处：报告中直接写出了数字，而不是引用标记，系统无法核对",
    "violations": [
     {
      "code": "uncited_number",
-     "message": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "message": "数字「30」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
      "span": [
       139,
       141
@@ -2340,7 +2345,7 @@
   "s26": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s26",
@@ -2375,7 +2380,7 @@
      "step": "entity",
      "status": "unknown",
      "name": "orders.coupon_code",
-     "reason": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+     "reason": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
      "closest": [
       {
        "alias": "c:orders.amount",
@@ -2396,11 +2401,12 @@
      }
     }
    ],
-   "note": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+   "note": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
    "violations": [
     {
      "code": "unknown_entity",
-     "message": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.coupon_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "span": [
       158,
       176
@@ -2423,7 +2429,7 @@
   "s28": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s28",
@@ -2443,7 +2449,7 @@
      "kind": "column",
      "role": "entity",
      "status": "unresolved",
-     "reason": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+     "reason": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
      "rendered": "orders.discount",
      "unknown": true
     }
@@ -2468,7 +2474,7 @@
      "status": "unknown",
      "name": "orders.discount",
      "kind": "column",
-     "reason": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+     "reason": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
      "closest": [
       {
        "alias": "c:orders.amount",
@@ -2495,11 +2501,12 @@
      }
     }
    ],
-   "note": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字",
+   "note": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
    "violations": [
     {
      "code": "unknown_entity",
-     "message": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.discount」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "ref": "c:orders.discount",
      "span": [
       182,
@@ -2522,7 +2529,7 @@
   "s30": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s30",
@@ -2557,7 +2564,7 @@
      "step": "entity",
      "status": "unverified",
      "name": "promo_events",
-     "reason": "这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "reason": "表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "closest": [],
      "checked": {
       "schemas": 1,
@@ -2565,11 +2572,11 @@
      }
     }
    ],
-   "note": "核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+   "note": "无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
    "violations": [
     {
      "code": "unverified_entity",
-     "message": "「promo_events」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "message": "「promo_events」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "span": [
       208,
       220
@@ -2592,7 +2599,7 @@
   "s33": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s33",
@@ -2666,7 +2673,7 @@
      "is_view": false
     }
    ],
-   "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义",
+   "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2680,7 +2687,7 @@
   "s39": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s39",
@@ -2760,7 +2767,7 @@
      "sealed": true
     }
    ],
-   "note": "这段原话在知识库检索命中的片段里逐字出现（空白归一化后比对），由系统核对过",
+   "note": "这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2774,7 +2781,7 @@
   "s42": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351"
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0"
    },
    "segment": {
     "id": "s42",
@@ -2794,7 +2801,7 @@
      "kind": "quote",
      "role": "quote",
      "status": "unresolved",
-     "reason": "K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+     "reason": "在 K1 的检索结果中找不到这段引文的原文",
      "rendered": "周报一律按自然周统计"
     }
    },
@@ -2815,11 +2822,12 @@
     "type": "paragraph"
    },
    "chain": [],
-   "note": "引用解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+   "note": "引用无法解析：在 K1 的检索结果中找不到这段引文的原文",
    "violations": [
     {
      "code": "unresolved_ref",
-     "message": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+     "message": "引用 [[q:K1|周报一律按自然周统计]] 无法解析：在 K1 的检索结果中找不到这段引文的原文",
+     "for_model": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
      "ref": "q:K1|周报一律按自然周统计",
      "span": [
       289,
@@ -2844,14 +2852,14 @@
   "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\n\n退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。\n\n另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。新客名单另见 customers 表。\n\n## 口径说明\n\n按运营手册：退款金额以财务确认日为准，未确认的退款不计入当周。手册还说周报一律按自然周统计。",
   "_evidence": {
    "report_node": "write",
-   "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351",
+   "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0",
    "fields": [
     "answer"
    ]
   }
  },
  "report_checked": {
-  "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351",
+  "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0",
   "ok": false,
   "stats": {
    "units": 8,
@@ -2875,7 +2883,8 @@
   "violations": [
    {
     "code": "uncited_number",
-    "message": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+    "message": "数字「30」没有出处：报告中直接写出了数字，系统无法核对",
+    "for_model": "数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
     "span": [
      139,
      141
@@ -2887,7 +2896,8 @@
    },
    {
     "code": "unknown_entity",
-    "message": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+    "message": "「orders.coupon_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+    "for_model": "「orders.coupon_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
     "span": [
      158,
      176
@@ -2899,7 +2909,8 @@
    },
    {
     "code": "unknown_entity",
-    "message": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+    "message": "「orders.discount」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+    "for_model": "「orders.discount」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
     "ref": "c:orders.discount",
     "span": [
      182,
@@ -2911,7 +2922,7 @@
    },
    {
     "code": "unverified_entity",
-    "message": "「promo_events」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+    "message": "「promo_events」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
     "span": [
      208,
      220
@@ -2923,7 +2934,8 @@
    },
    {
     "code": "unresolved_ref",
-    "message": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
+    "message": "引用 [[q:K1|周报一律按自然周统计]] 无法解析：在 K1 的检索结果中找不到这段引文的原文",
+    "for_model": "引用 [[q:K1|周报一律按自然周统计]] 解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文",
     "ref": "q:K1|周报一律按自然周统计",
     "span": [
      289,
@@ -2952,7 +2964,7 @@
   "reports": [
    {
     "node_id": "write",
-    "doc_artifact": "cf9d05ee2dcae5cae7811ed531c908981595db8a0588bec6c12e42c096b5d351",
+    "doc_artifact": "d0ffbc76d1768785e338e14c845e98673dca4343c8d352ea138c87940b42dab0",
     "hash_ok": true,
     "doc_sealed": true,
     "fields": [
@@ -3009,7 +3021,7 @@
        20
       ],
       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。",
-      "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写"
+      "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写"
      },
      {
       "group": "cited",
@@ -3034,7 +3046,7 @@
        33
       ],
       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。",
-      "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
+      "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
      },
      {
       "group": "cited",
@@ -3059,7 +3071,7 @@
        42
       ],
       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。",
-      "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
+      "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
      },
      {
       "group": "cited",
@@ -3084,7 +3096,7 @@
        55
       ],
       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。",
-      "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义"
+      "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
      },
      {
       "group": "cited",
@@ -3109,7 +3121,7 @@
        70
       ],
       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。",
-      "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义"
+      "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
      },
      {
       "group": "cited",
@@ -3134,7 +3146,7 @@
        95
       ],
       "sentence": "退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。",
-      "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义"
+      "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
      },
      {
       "group": "cited",
@@ -3159,7 +3171,7 @@
        123
       ],
       "sentence": "退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。",
-      "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义"
+      "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
      },
      {
       "group": "cited",
@@ -3184,7 +3196,7 @@
        134
       ],
       "sentence": "退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。",
-      "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
+      "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
      },
      {
       "group": "cited",
@@ -3209,7 +3221,7 @@
        240
       ],
       "sentence": "新客名单另见 customers 表。",
-      "note": "系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义"
+      "note": "系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
      },
      {
       "group": "cited",
@@ -3234,7 +3246,7 @@
        284
       ],
       "sentence": "按运营手册：退款金额以财务确认日为准，未确认的退款不计入当周。",
-      "note": "这段原话在知识库检索命中的片段里逐字出现（空白归一化后比对），由系统核对过"
+      "note": "这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对"
      }
     ]
    },
@@ -3266,7 +3278,7 @@
        141
       ],
       "sentence": "退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。",
-      "note": "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它"
+      "note": "这个数字没有出处：报告中直接写出了数字，而不是引用标记，系统无法核对"
      },
      {
       "group": "none",
@@ -3291,7 +3303,7 @@
        224
       ],
       "sentence": "另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。",
-      "note": "这句结论没有挂依据：这份报告要求结论句挂依据（claims: require_citation），不过没有出具契约按它判档（没配契约，或者还没到出具那一步）"
+      "note": "这句结论没有附依据。本报告要求结论句附依据，但目前没有出具契约据此判档（未配置契约，或尚未到出具步骤）"
      },
      {
       "group": "none",
@@ -3316,13 +3328,13 @@
        299
       ],
       "sentence": "手册还说周报一律按自然周统计。",
-      "note": "引用解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文"
+      "note": "引用无法解析：在 K1 的检索结果中找不到这段引文的原文"
      }
     ]
    },
    {
     "key": "suspicious",
-    "label": "可疑实体",
+    "label": "可疑名称",
     "count": 3,
     "rows": [
      {
@@ -3348,7 +3360,7 @@
        177
       ],
       "sentence": "另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。",
-      "note": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字"
+      "note": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称"
      },
      {
       "group": "suspicious",
@@ -3373,7 +3385,7 @@
        197
       ],
       "sentence": "另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。",
-      "note": "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字"
+      "note": "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称"
      },
      {
       "group": "suspicious",
@@ -3398,13 +3410,13 @@
        221
       ],
       "sentence": "另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。",
-      "note": "核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在"
+      "note": "无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在"
      }
     ]
    },
    {
     "key": "candidate",
-    "label": "旧运行猜测",
+    "label": "按数值猜测",
     "count": 0,
     "rows": []
    }
@@ -3417,7 +3429,7 @@
   },
   "total": 16
  },
- "audit_csv": "﻿分组,报告节点,成果字段,片段,句子编号,种类,原文,状态,问题,引用,证据,证据种类,证据编号,工件,来源节点,已封存,句子,说明,封存核对\r\n有出处,write,answer,s4,u1,值,2026-W37,有出处,,i:week,week = 2026-W37,运行输入,ev:input:a398c5e60abfeedd,,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s6,u1,数字,\"45,678.5\",有出处,,v:Q1.r0.gmv,Q1.r0.gmv,查询单元格,ev:cell:46d35558dd8dff62,27625f6d541df0205daee1dd0b61ee5f585965c38ee90c6b803d886b36e71957,fetch,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s8,u1,数字,\"1,234\",有出处,,v:Q1.r0.order_cnt,Q1.r0.order_cnt,查询单元格,ev:cell:07eb966e771d1997,27625f6d541df0205daee1dd0b61ee5f585965c38ee90c6b803d886b36e71957,fetch,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s10,u1,表名、字段名,orders,有出处,,t:orders,表 orders,表,ev:table:26259b62f70e6596,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s12,u1,表名、字段名,orders.week,有出处,,c:orders.week,字段 orders.week,字段,ev:column:c7c52020b74488ba,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s16,u2,表名、字段名,`refunds`,有出处,,t:refunds,表 refunds,表,ev:table:4f2a208992beb805,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s18,u2,表名、字段名,`refunds.refund_amount`,有出处,,c:refunds.refund_amount,字段 refunds.refund_amount,字段,ev:column:147fc1cccd5e6f7a,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s20,u2,数字,29,有出处,,v:Q2.r0.refund_cnt,Q2.r0.refund_cnt,查询单元格,ev:cell:9c752fde21b13c23,fe8fc0ee30d533b9ab3e72b4f16cea11ced684680fe79e8c4db765131dc93727,fetch,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s33,u4,表名、字段名,customers,有出处,,t:customers,表 customers,表,ev:table:77343f2c2d29efd3,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,新客名单另见 customers 表。,系统在正文里认出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。只核对它存在、这次用过，不核对它的业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s39,u6,引文,退款金额以财务确认日为准，未确认的退款不计入当周,有出处,,q:K1|退款金额以财务确认日为准，未确认的退款不计入当周,K1 · 运营手册 · 退款,知识库原话,ev:quote:6609bc7f3f52c1de,3b95d2336a6ab74e80117568235c0820b39421e22dcfae5d7967d3e8b9c6d334,manual,是,按运营手册：退款金额以财务确认日为准，未确认的退款不计入当周。,这段原话在知识库检索命中的片段里逐字出现（空白归一化后比对），由系统核对过,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,s22,u2,数字,30,无证据,没有出处的数字,,,,,,,—,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,,u3,结论句,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,无证据,结论句没挂依据,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,这句结论没有挂依据：这份报告要求结论句挂依据（claims: require_citation），不过没有出具契约按它判档（没配契约，或者还没到出具那一步）,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,s42,u7,引文,周报一律按自然周统计,无证据,引用解析不了,q:K1|周报一律按自然周统计,,知识库原话,,,,—,手册还说周报一律按自然周统计。,引用解析不了：K1 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文,封存核对通过（封存于第 88 条事件）\r\n可疑实体,write,answer,s26,u3,表名、字段名,`orders.coupon_code`,无证据,可能是编造的名字,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字,封存核对通过（封存于第 88 条事件）\r\n可疑实体,write,answer,s28,u3,表名、字段名,orders.discount,无证据,可能是编造的名字,c:orders.discount,,字段,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字,封存核对通过（封存于第 88 条事件）\r\n可疑实体,write,answer,s30,u3,表名、字段名,`promo_events`,无证据,核对不了,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在,封存核对通过（封存于第 88 条事件）\r\n",
+ "audit_csv": "﻿分组,报告节点,成果字段,片段编号,句子编号,种类,原文,状态,问题,引用,证据,证据种类,证据编号,工件,来源节点,已封存,句子,说明,封存核对\r\n有出处,write,answer,s4,u1,值,2026-W37,有出处,,i:week,week = 2026-W37,运行输入,ev:input:a398c5e60abfeedd,,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",数字由系统从证据中取出、按口径卡的格式显示，未经模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s6,u1,数字,\"45,678.5\",有出处,,v:Q1.r0.gmv,Q1.r0.gmv,查询单元格,ev:cell:46d35558dd8dff62,27625f6d541df0205daee1dd0b61ee5f585965c38ee90c6b803d886b36e71957,fetch,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",该值由系统从查询快照中取出、按固定规则显示，未经模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s8,u1,数字,\"1,234\",有出处,,v:Q1.r0.order_cnt,Q1.r0.order_cnt,查询单元格,ev:cell:07eb966e771d1997,27625f6d541df0205daee1dd0b61ee5f585965c38ee90c6b803d886b36e71957,fetch,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",该值由系统从查询快照中取出、按固定规则显示，未经模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s10,u1,表名、字段名,orders,有出处,,t:orders,表 orders,表,ev:table:26259b62f70e6596,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s12,u1,表名、字段名,orders.week,有出处,,c:orders.week,字段 orders.week,字段,ev:column:c7c52020b74488ba,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,\"本周（2026-W37）销售额 45,678.5，订单 1,234 单，口径是 orders 表里 orders.week 等于本周的订单。\",这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s16,u2,表名、字段名,`refunds`,有出处,,t:refunds,表 refunds,表,ev:table:4f2a208992beb805,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s18,u2,表名、字段名,`refunds.refund_amount`,有出处,,c:refunds.refund_amount,字段 refunds.refund_amount,字段,ev:column:147fc1cccd5e6f7a,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s20,u2,数字,29,有出处,,v:Q2.r0.refund_cnt,Q2.r0.refund_cnt,查询单元格,ev:cell:9c752fde21b13c23,fe8fc0ee30d533b9ab3e72b4f16cea11ced684680fe79e8c4db765131dc93727,fetch,是,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,该值由系统从查询快照中取出、按固定规则显示，未经模型转写,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s33,u4,表名、字段名,customers,有出处,,t:customers,表 customers,表,ev:table:77343f2c2d29efd3,f7bea31b3f8b44868f43bd128b7c3628c6fec0fd8a7bbd687f6aba3dbef39855,,是,新客名单另见 customers 表。,系统在正文中识别出的表名、字段名：这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义,封存核对通过（封存于第 88 条事件）\r\n有出处,write,answer,s39,u6,引文,退款金额以财务确认日为准，未确认的退款不计入当周,有出处,,q:K1|退款金额以财务确认日为准，未确认的退款不计入当周,K1 · 运营手册 · 退款,知识库原话,ev:quote:6609bc7f3f52c1de,3b95d2336a6ab74e80117568235c0820b39421e22dcfae5d7967d3e8b9c6d334,manual,是,按运营手册：退款金额以财务确认日为准，未确认的退款不计入当周。,这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,s22,u2,数字,30,无证据,没有出处的数字,,,,,,,—,退款来自 `refunds` 表，按 `refunds.refund_amount` 汇总，本周退款 29 单、约 30 单是部分退款。,这个数字没有出处：报告中直接写出了数字，而不是引用标记，系统无法核对,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,,u3,结论句,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,无证据,结论句未附依据,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,这句结论没有附依据。本报告要求结论句附依据，但目前没有出具契约据此判档（未配置契约，或尚未到出具步骤）,封存核对通过（封存于第 88 条事件）\r\n无证据,write,answer,s42,u7,引文,周报一律按自然周统计,无证据,引用无法解析,q:K1|周报一律按自然周统计,,知识库原话,,,,—,手册还说周报一律按自然周统计。,引用无法解析：在 K1 的检索结果中找不到这段引文的原文,封存核对通过（封存于第 88 条事件）\r\n可疑名称,write,answer,s26,u3,表名、字段名,`orders.coupon_code`,无证据,疑似不存在的名称,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称,封存核对通过（封存于第 88 条事件）\r\n可疑名称,write,answer,s28,u3,表名、字段名,orders.discount,无证据,疑似不存在的名称,c:orders.discount,,字段,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称,封存核对通过（封存于第 88 条事件）\r\n可疑名称,write,answer,s30,u3,表名、字段名,`promo_events`,无证据,无法核实,,,,,,,—,另外参考了 `orders.coupon_code` 字段和 orders.discount，大促期间的数据在 `promo_events` 表。,无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在,封存核对通过（封存于第 88 条事件）\r\n",
  "legacy": {
   "run_id": "run-evidence-guess",
   "graph": {
@@ -3436,7 +3448,7 @@
    "legacy": {
     "schema": "agentlab.guess/1",
     "mode": "legacy_text",
-    "note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+    "note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
     "fields": [
      {
       "field": "answer",
@@ -3714,7 +3726,7 @@
         63
        ],
        "sentence": ",073.2 元。华东贡献最多，约 40%。下周目标 50,000 元。",
-       "note": "旧答案里的这个数，在这次运行封存的查询结果和口径卡里没有找到相同的值",
+       "note": "旧版答案中的这个数字，在本次运行封存的查询结果和口径卡中没有找到相同的值",
        "candidates": []
       },
       {
@@ -3740,20 +3752,20 @@
         75
        ],
        "sentence": "华东贡献最多，约 40%。下周目标 50,000 元。",
-       "note": "旧答案里的这个数，在这次运行封存的查询结果和口径卡里没有找到相同的值",
+       "note": "旧版答案中的这个数字，在本次运行封存的查询结果和口径卡中没有找到相同的值",
        "candidates": []
       }
      ]
     },
     {
      "key": "suspicious",
-     "label": "可疑实体",
+     "label": "可疑名称",
      "count": 0,
      "rows": []
     },
     {
      "key": "candidate",
-     "label": "旧运行猜测",
+     "label": "按数值猜测",
      "count": 4,
      "rows": [
       {
@@ -3779,7 +3791,7 @@
         14
        ],
        "sentence": "本周销售额 45,678.5 元，订单 1,234 单，退款 2",
-       "note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+       "note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
        "candidates": [
         {
          "kind": "cell",
@@ -3822,7 +3834,7 @@
         25
        ],
        "sentence": "销售额 45,678.5 元，订单 1,234 单，退款 29 单，退款金额 1,",
-       "note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+       "note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
        "candidates": [
         {
          "kind": "cell",
@@ -3865,7 +3877,7 @@
         33
        ],
        "sentence": "5 元，订单 1,234 单，退款 29 单，退款金额 1,073.2 元。",
-       "note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+       "note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
        "candidates": [
         {
          "kind": "cell",
@@ -3908,7 +3920,7 @@
         48
        ],
        "sentence": "34 单，退款 29 单，退款金额 1,073.2 元。华东贡献最多，约 40%。下周",
-       "note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+       "note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
        "candidates": [
         {
          "kind": "cell",
@@ -3931,7 +3943,7 @@
      ]
     }
    ],
-   "legacy_note": "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多",
+   "legacy_note": "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多",
    "counts": {
     "cited": 0,
     "none": 2,
@@ -3946,7 +3958,7 @@
  },
  "dup": {
   "run_id": "run-evidence-dup",
-  "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9",
+  "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169",
   "doc": {
    "schema": "agentlab.report/1",
    "run_id": "run-evidence-dup",
@@ -4211,7 +4223,8 @@
    "violations": [
     {
      "code": "unknown_entity",
-     "message": "「orders.coupon_id」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.coupon_id」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.coupon_id」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "span": [
       22,
       38
@@ -4223,7 +4236,8 @@
     },
     {
      "code": "unknown_entity",
-     "message": "「orders.promo_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.promo_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.promo_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "span": [
       43,
       60
@@ -4235,7 +4249,7 @@
     },
     {
      "code": "unverified_entity",
-     "message": "「campaign_tags」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "message": "「campaign_tags」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "span": [
       76,
       89
@@ -4247,7 +4261,7 @@
     },
     {
      "code": "unverified_entity",
-     "message": "「promo_rules」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "message": "「promo_rules」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "span": [
       95,
       106
@@ -4259,7 +4273,8 @@
     },
     {
      "code": "uncited_number",
-     "message": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "message": "数字「100」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
      "span": [
       150,
       153
@@ -4284,7 +4299,7 @@
    "reports": [
     {
      "node_id": "write",
-     "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9",
+     "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169",
      "doc_sealed": true,
      "hash_ok": true,
      "ok": false,
@@ -4415,7 +4430,7 @@
    "reports": [
     {
      "node_id": "write",
-     "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9",
+     "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169",
      "hash_ok": true,
      "doc_sealed": true,
      "fields": [
@@ -4472,7 +4487,7 @@
         14
        ],
        "sentence": "本周销售额 45,678.5。",
-       "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
+       "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
       }
      ]
     },
@@ -4504,13 +4519,13 @@
         153
        ],
        "sentence": "第一百项",
-       "note": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字"
+       "note": "数字「100」没有出处：报告中直接写出了数字，系统无法核对"
       }
      ]
     },
     {
      "key": "suspicious",
-     "label": "可疑实体",
+     "label": "可疑名称",
      "count": 4,
      "rows": [
       {
@@ -4536,7 +4551,7 @@
         38
        ],
        "sentence": "另外看 **`orders.coupon_id` 和 `orders.promo_code`** 这几个字段，还有 **`campaign_tags`**、[`promo_rules`](https://example.com/docs) 这几张表。",
-       "note": "「orders.coupon_id」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名"
+       "note": "「orders.coupon_id」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称"
       },
       {
        "group": "suspicious",
@@ -4561,7 +4576,7 @@
         60
        ],
        "sentence": "另外看 **`orders.coupon_id` 和 `orders.promo_code`** 这几个字段，还有 **`campaign_tags`**、[`promo_rules`](https://example.com/docs) 这几张表。",
-       "note": "「orders.promo_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名"
+       "note": "「orders.promo_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称"
       },
       {
        "group": "suspicious",
@@ -4586,7 +4601,7 @@
         89
        ],
        "sentence": "另外看 **`orders.coupon_id` 和 `orders.promo_code`** 这几个字段，还有 **`campaign_tags`**、[`promo_rules`](https://example.com/docs) 这几张表。",
-       "note": "「campaign_tags」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在"
+       "note": "「campaign_tags」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在"
       },
       {
        "group": "suspicious",
@@ -4611,13 +4626,13 @@
         106
        ],
        "sentence": "另外看 **`orders.coupon_id` 和 `orders.promo_code`** 这几个字段，还有 **`campaign_tags`**、[`promo_rules`](https://example.com/docs) 这几张表。",
-       "note": "「promo_rules」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在"
+       "note": "「promo_rules」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在"
       }
      ]
     },
     {
      "key": "candidate",
-     "label": "旧运行猜测",
+     "label": "按数值猜测",
      "count": 0,
      "rows": []
     }
@@ -4634,7 +4649,7 @@
    "s1": {
     "report": {
      "node_id": "write",
-     "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9"
+     "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169"
     },
     "segment": {
      "id": "s1",
@@ -4723,7 +4738,7 @@
       "column_types": {}
      }
     ],
-    "note": "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写",
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
     "violations": [],
     "seal": {
      "sealed": true,
@@ -4739,14 +4754,14 @@
    "answer": "本周销售额 45,678.5。另外看 **`orders.coupon_id` 和 `orders.promo_code`** 这几个字段，还有 **`campaign_tags`**、[`promo_rules`](https://example.com/docs) 这几张表。\n\n1. 第一项\n\n100. 第一百项",
    "_evidence": {
     "report_node": "write",
-    "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9",
+    "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169",
     "fields": [
      "answer"
     ]
    }
   },
   "report_checked": {
-   "doc_artifact": "5745a918acd9dee605ae712b14285c997bd3b24aa9dd0f80bcd9de569291d0a9",
+   "doc_artifact": "ee8ee51d00029156ed9d0a6d277b84b2e48b506fa8c7eeb10106c604b046a169",
    "ok": false,
    "stats": {
     "units": 4,
@@ -4770,7 +4785,8 @@
    "violations": [
     {
      "code": "unknown_entity",
-     "message": "「orders.coupon_id」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.coupon_id」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.coupon_id」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "span": [
       22,
       38
@@ -4782,7 +4798,8 @@
     },
     {
      "code": "unknown_entity",
-     "message": "「orders.promo_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
+     "message": "「orders.promo_code」疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称",
+     "for_model": "「orders.promo_code」本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字：只写本次运行的表结构、查询里真实存在的表名和字段名",
      "span": [
       43,
       60
@@ -4794,7 +4811,7 @@
     },
     {
      "code": "unverified_entity",
-     "message": "「campaign_tags」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "message": "「campaign_tags」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "span": [
       76,
       89
@@ -4806,7 +4823,7 @@
     },
     {
      "code": "unverified_entity",
-     "message": "「promo_rules」核对不了：这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，核对不了它存不存在",
+     "message": "「promo_rules」无法核实：表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在",
      "span": [
       95,
       106
@@ -4818,7 +4835,8 @@
     },
     {
      "code": "uncited_number",
-     "message": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "message": "数字「100」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「100」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
      "span": [
       150,
       153

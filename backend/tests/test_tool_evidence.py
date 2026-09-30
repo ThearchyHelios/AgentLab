@@ -127,7 +127,7 @@ def test_cell_reads_json_text_and_objects():
     ((PAYLOAD, 2, "gmv"), "只有 2 行"),
     ((PAYLOAD, 0, "amount"), "没有列「amount」"),
     ((PAYLOAD, 0, 5), "只有 2 列"),
-    ((PAYLOAD, -1, "gmv"), "从 0 数"),
+    ((PAYLOAD, -1, "gmv"), "从 0 开始"),
     ((PAYLOAD, True, "gmv"), "整数"),
     (("查询失败：no such table: orders", 0, "gmv"), "查询失败：no such table: orders"),
     (({"columns": ["gmv"], "rows": []}, 0, "gmv"), "0 行"),
@@ -372,7 +372,7 @@ async def test_cell_out_of_range_fails_the_card_readably(engine_up, shop):
     card = node("card", "metrics", metrics=[{"id": "x", "expression": "cell(nodes.fetch, 3, 'gmv')"}])
     row = await finish(fetch_graph(card))
     assert row.status == "failed"
-    assert "cell() 要第 3 行，但这份查询结果只有 1 行" in (row.error or ""), row.error
+    assert "cell() 请求第 3 行，但查询结果只有 1 行" in (row.error or ""), row.error
 
 
 # --------------------------------------------------------------------------

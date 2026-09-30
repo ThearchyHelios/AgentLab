@@ -42,22 +42,22 @@ def _parse_scores(text: str, n: int) -> list[float]:
         # 实测 deepseek-v4-pro：失败那次 out_tokens 正好等于 max_tokens，
         # 输出预算被耗光后正文什么都不剩。报"解析不出来"会把人引去查 JSON 格式，
         # 而该调的是 max_tokens——llm.py 里对同一个现象也是这么说的
-        raise Unusable("模型没有输出正文，多半是输出 token 预算用完了。把节点上的最大输出 token 调大")
+        raise Unusable("模型没有输出正文，可能是输出 token 预算已用完。请调大节点的「最大输出 token」")
     match = re.search(r"\{[^{}]*\"scores\"\s*:\s*\[[^\]]*\][^{}]*\}", text, re.S)
     if not match:
-        raise Unusable(f"模型回复里找不到 scores：{text.strip()[:80]}")
+        raise Unusable(f"模型回复中找不到 scores：{text.strip()[:80]}")
     try:
         scores = json.loads(match.group(0)).get("scores")
     except json.JSONDecodeError as e:
         raise Unusable(f"scores 不是合法 JSON：{e}") from e
     if not isinstance(scores, list) or len(scores) != n:
         # 个数对不上就没法一一对应，硬凑只会把顺序搅乱
-        raise Unusable(f"给了 {len(scores) if isinstance(scores, list) else '?'} 个分数，"
-                       f"候选有 {n} 个，对不上")
+        raise Unusable(f"模型给出 {len(scores) if isinstance(scores, list) else '?'} 个分数，"
+                       f"候选有 {n} 个，数量不一致")
     out: list[float] = []
     for s in scores:
         if not isinstance(s, (int, float)):
-            raise Unusable(f"分数里混了非数字：{s!r}")
+            raise Unusable(f"分数中含有非数字：「{s}」")
         out.append(float(s))
     return out
 
@@ -92,13 +92,13 @@ async def rerank(
         scores = _parse_scores(str(text), len(hits))
     except Unusable as e:
         if on_note:
-            on_note(f"重排没用上，按初筛顺序返回：{e}")
+            on_note(f"重排不可用，已按初筛顺序返回：{e}")
         return hits[:top_n]
     except Exception as e:  # noqa: BLE001
         if on_note:
             from app.core.errors import explain
 
-            on_note(f"重排失败，按初筛顺序返回：{explain(e)[0]}")
+            on_note(f"重排失败，已按初筛顺序返回：{explain(e)[0]}")
         return hits[:top_n]
 
     ranked = sorted(zip(hits, scores), key=lambda t: t[1], reverse=True)

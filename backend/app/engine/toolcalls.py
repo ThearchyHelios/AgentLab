@@ -92,10 +92,10 @@ class ToolTimeout(TimeoutError):
         self.limit = limit
         seconds = _seconds(limit.seconds)
         if limit.kind == "query":
-            text = (f"查询超过 {seconds}s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台"
-                    "收回）。加上 WHERE 条件或 LIMIT 缩小范围再查")
+            text = (f"查询超过 {seconds} 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台"
+                    "回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试")
         else:
-            text = f"工具 {name} 超过 {seconds}s 没有返回，已放弃等待"
+            text = f"工具 {name} 超过 {seconds} 秒没有返回，已停止等待"
         super().__init__(text)
 
 
@@ -148,9 +148,9 @@ _SQL_KEY = re.compile(r'"sql"\s*:')
 _PRETEND = re.compile(r"假设(?:调用|使用|执行)了?(?:工具|查询)|假装调用|模拟调用(?:了)?工具")
 
 TOOL_MARKUP_ERROR = (
-    "模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。"
-    "常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。"
-    "到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型"
+    "模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。"
+    "常见原因：节点未绑定工具，或模型、服务不支持工具调用。"
+    "请在画布中为该节点绑定所需工具；如已绑定仍出现此问题，请换用支持工具调用的模型"
 )
 
 TOOL_MARKUP_NUDGE = (
@@ -172,4 +172,4 @@ def leaked_markup(text: str | None) -> str | None:
 
 
 def markup_warning(snippet: str, who: str = "模型") -> str:
-    return f"{who}把工具调用写成了文字（{snippet[:40]}…），没有真正调用工具"
+    return f"{who}以文本形式输出了工具调用（{snippet[:40]}…），未实际调用工具"

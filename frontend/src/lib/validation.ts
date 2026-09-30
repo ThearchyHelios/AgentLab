@@ -104,57 +104,57 @@ function describeOne(d: ValidationItem, path?: string): string {
   const ctx = d.ctx ?? {}
   if (type === 'json_invalid') return '提交的内容不是合法的 JSON'
   const field = fieldOf(Array.isArray(d.loc) ? d.loc : [], path)
-  if (!field && type === 'missing') return '没有收到提交的内容'
+  if (!field && type === 'missing') return '未收到提交的内容'
   const f = field || '提交的内容'
   switch (type) {
     case 'missing':
-      return `${f}没有填`
+      return `${f}为必填项`
     case 'string_too_short':
-      return Number(ctx.min_length) <= 1 ? `${f}不能为空` : `${f}太短，至少 ${num(ctx.min_length)} 个字符`
+      return Number(ctx.min_length) <= 1 ? `${f}不能为空` : `${f}过短，至少 ${num(ctx.min_length)} 个字符`
     case 'string_too_long':
-      return `${f}太长，最多 ${num(ctx.max_length)} 个字符`
+      return `${f}过长，最多 ${num(ctx.max_length)} 个字符`
     case 'too_short':
-      return `${f}至少要 ${num(ctx.min_length)} 项`
+      return `${f}至少需要 ${num(ctx.min_length)} 项`
     case 'too_long':
       return `${f}最多 ${num(ctx.max_length)} 项`
     case 'string_pattern_mismatch':
-      return `${f}格式不对`
+      return `${f}格式不正确`
     case 'string_type':
-      return `${f}要填文字`
+      return `${f}应为文本`
     case 'int_parsing':
     case 'int_type':
     case 'int_from_float':
-      return `${f}要填整数`
+      return `${f}应为整数`
     case 'float_parsing':
     case 'float_type':
     case 'decimal_parsing':
     case 'decimal_type':
-      return `${f}要填数字`
+      return `${f}应为数字`
     case 'bool_parsing':
     case 'bool_type':
       return `${f}只能是「是」或「否」`
     case 'greater_than':
-      return `${f}要大于 ${num(ctx.gt)}`
+      return `${f}应大于 ${num(ctx.gt)}`
     case 'greater_than_equal':
       return `${f}不能小于 ${num(ctx.ge)}`
     case 'less_than':
-      return `${f}要小于 ${num(ctx.lt)}`
+      return `${f}应小于 ${num(ctx.lt)}`
     case 'less_than_equal':
       return `${f}不能大于 ${num(ctx.le)}`
     case 'literal_error':
     case 'enum': {
       const xs = choicesOf(ctx.expected)
       // 列太长就不列了：一长串内部枚举值对填表的人没有帮助
-      return xs.length && xs.length <= 6 ? `${f}只能取 ${joinChoices(xs)}` : `${f}不在允许的取值里`
+      return xs.length && xs.length <= 6 ? `${f}只能取 ${joinChoices(xs)}` : `${f}不在允许的取值范围内`
     }
     case 'list_type':
     case 'tuple_type':
     case 'set_type':
-      return `${f}要是一个列表`
+      return `${f}应为列表`
     case 'dict_type':
     case 'model_type':
     case 'model_attributes_type':
-      return `${f}格式不对，要是一组键值`
+      return `${f}应为键值对象`
     case 'url_parsing':
     case 'url_type':
     case 'url_scheme':
@@ -166,11 +166,11 @@ function describeOne(d: ValidationItem, path?: string): string {
     case 'time_parsing':
       return `${f}不是合法的日期或时间`
     case 'extra_forbidden':
-      return `${f}是多余的，后端不认识这一项`
+      return `${f}不是可接受的字段`
     case 'value_error':
     case 'assertion_error': {
       const said = customMessage(d.msg)
-      return said ? (field ? `${field}：${said}` : said) : `${f}取值不对`
+      return said ? (field ? `${field}：${said}` : said) : `${f}取值无效`
     }
     default:
       return `${f}不符合要求`

@@ -6,7 +6,7 @@ import { Link } from 'react-router-dom'
 import {
   AlertCircle, AlertTriangle, ArrowDown, Brain, ChevronRight, CircleCheck, CircleDot, CornerDownRight,
   Database, Download, ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, ListChecks, Play, Settings2,
-  ShieldCheck, Sparkles, Table2, Terminal, UserX, Users, Wrench, XCircle,
+  Scale, ShieldCheck, Sparkles, Table2, Terminal, UserX, Users, Wrench, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -17,7 +17,7 @@ import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib
 import { statusLabel } from '../lib/status'
 import { EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
-  childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
+  ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
   type TeamRun,
 } from './decode'
@@ -508,7 +508,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
           {turn.noQuery && (
             <div className="mt-2 flex items-start gap-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed text-dim">
               <Info size={11} className="mt-[2px] shrink-0" aria-hidden />
-              <span>这一条没有查库，是根据前面几轮的结果说的</span>
+              <span>本条未查询数据库，基于前几轮的结果作答</span>
             </div>
           )}
 
@@ -524,7 +524,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
           {turn.rawOutput && (
             <details className="mt-1.5">
               <summary className="cursor-pointer text-2xs text-dim hover:text-fg">
-                复核改写过这个答案，看改写前的原文
+                复核改写过此答案，查看改写前的原文
               </summary>
               <div className="mt-1.5">
                 <Output output={turn.rawOutput} runId={turn.outputRun ?? turn.runId} />
@@ -566,8 +566,8 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
   // 跑完了但复核说结论不能用：头部不能还是一个安静的「完成」
   const base = turn.status || statusLabel(turn.statusCode ?? code)
   const verdict = turn.phase === 'done' && review === 'broken' ? '结论不可用'
-    : turn.phase === 'done' && review === 'degraded' ? '有缺口'
-    : turn.phase === 'done' && teamShort ? '协作团队没做完' : ''
+    : turn.phase === 'done' && review === 'degraded' ? '存在缺口'
+    : turn.phase === 'done' && teamShort ? '协作团队未完成' : ''
   // 复核结论说的是答案，不是运行：运行确实跑完了，徽标和「已完成」照常，红 / 琥珀只
   // 落在结论那几个字上。把完成的勾染成红色，形状说成功、颜色说失败，两头打架
   const tone = turn.tone === 'failed' ? 'var(--st-failed)'
@@ -666,7 +666,7 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
             // 还没轮到的画成空心格：一格一格数得清还剩几步。填成 --bg-hover 的话和栏底
             // 只差 1.1:1，5 个节点跑到第 3 个看着像一共 4 格；填成未运行色又和「已跳过」撞色
             return (
-              <span key={n?.id ?? `todo-${i}`} title={n ? `${n.title} · ${statusLabel(n.status)}` : '还没轮到'}
+              <span key={n?.id ?? `todo-${i}`} title={n ? `${n.title} · ${statusLabel(n.status)}` : '尚未开始'}
                     className="h-[3px] min-w-0 flex-1 rounded-full"
                     style={n ? { background: RAIL_COLOR[n.status] ?? 'var(--st-done)' }
                       : { boxShadow: 'inset 0 0 0 1px var(--st-idle)' }} />
@@ -888,7 +888,7 @@ function FixAction({ fix, nodeId, label, to, first }: {
     return (
       <Link to={to ?? '/tools'} className={cls} data-fix={data ? 'data' : 'tools'}>
         {data ? <Database size={10} aria-hidden /> : <Wrench size={10} aria-hidden />}
-        {' '}{data ? '去数据页接入' : first ? '去改参数定义' : '去工具库'}
+        {' '}{data ? '前往「数据」页接入' : first ? '去改参数定义' : '去工具库'}
       </Link>
     )
   }
@@ -1107,7 +1107,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
         onClick={toggle}
         disabled={!expandable && !(step.nodeId && onFocus)}
         aria-expanded={expandable ? open : undefined}
-        title={linked ? '点一下在画布上定位这个节点' : undefined}
+        title={linked ? '点击在画布上定位该节点' : undefined}
       >
         <span className={clsx('shrink-0', dense ? 'mt-[3px]' : 'mt-[4px]')}>
           {badge
@@ -1234,8 +1234,8 @@ function LiveClock({ since, label, limitS }: { since: number; label?: string; li
   return (
     <span className={clsx('mono tnum mt-[1px] shrink-0', dense ? 'text-[10px]' : 'text-2xs')}
           style={{ color: over ? 'var(--st-waiting)' : 'var(--st-running)' }}
-          {...(over ? { 'data-over-limit': '', title: `这一步的时限是 ${formatNumber(limitS!)} s，到点会放弃等待` } : {})}>
-      {over ? `已超出 ${formatNumber(limitS!)} s 上限 · ` : label ? `${label} · ` : ''}{formatClock(ms)}
+          {...(over ? { 'data-over-limit': '', title: `此步骤时限为 ${formatNumber(limitS!)} 秒，超时将停止等待` } : {})}>
+      {over ? `已超出 ${formatNumber(limitS!)} 秒上限 · ` : label ? `${label} · ` : ''}{formatClock(ms)}
     </span>
   )
 }
@@ -1349,13 +1349,13 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
                       }}>
                 <ChevronRight size={10} aria-hidden className="shrink-0 transition-transform"
                               style={{ transform: all ? 'rotate(90deg)' : 'none' }} />
-                <span className="truncate">{all ? '收起，只看要紧的几轮' : `另外 ${hiddenNow} 轮`}</span>
+                <span className="truncate">{all ? '收起，只显示重点轮次' : `另外 ${hiddenNow} 轮`}</span>
               </button>
               {warned.length > 0 && (
                 <button type="button" aria-pressed={namedOn(warned)}
                         className="shrink-0 rounded px-0.5 underline-offset-2 transition-colors hover:bg-hover hover:underline"
                         style={{ color: 'var(--st-waiting)' }}
-                        title={namedOn(warned) ? '收回这几轮' : '把有提醒的几轮列出来'}
+                        title={namedOn(warned) ? '收起这几轮' : '列出有提醒的轮次'}
                         onClick={() => toggleNamed(warned)}>
                   · {warned.length} 轮有提醒
                 </button>
@@ -1366,7 +1366,7 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
                 {st.median != null && st.median >= 10 && <span className="shrink-0">中位 {formatDuration(st.median)} ·&nbsp;</span>}
                 <button type="button" aria-pressed={namedOn([slowest])}
                         className="truncate rounded px-0.5 text-left underline-offset-2 transition-colors hover:bg-hover hover:text-fg hover:underline"
-                        title={namedOn([slowest]) ? '收回这一轮' : '把这一轮列出来'}
+                        title={namedOn([slowest]) ? '收起这一轮' : '列出这一轮'}
                         onClick={() => toggleNamed([slowest])}>
                   最慢 {formatDuration(st.max)}（第 {slowest} 次）
                 </button>
@@ -1380,7 +1380,7 @@ function ExecGroups({ step, turnMs }: { step: Step; turnMs?: number }) {
         if (r.kind === 'more') {
           return (
             <div key="more" data-exec-more="" className="flex flex-wrap items-center gap-x-2 py-0.5 pl-[18px] text-2xs text-dim">
-              <span className="tnum">还有 {r.left} 轮没列出</span>
+              <span className="tnum">还有 {r.left} 轮未列出</span>
               <button type="button" className="rounded px-0.5 underline-offset-2 transition-colors hover:bg-hover hover:text-fg hover:underline"
                       onClick={() => setLimit((l) => l + LIST_HEAD)}>
                 再列 {Math.min(LIST_HEAD, r.left)} 轮
@@ -1497,7 +1497,7 @@ function StepDetail({ step, table, explained }: {
         <button type="button"
                 className="flex items-center gap-1 text-2xs text-dim transition-colors hover:text-fg"
                 onClick={() => openArtifact(step.artifact!, step.title)}>
-          <ShieldCheck size={10} aria-hidden /> 看完整证据 {shortId(step.artifact, 8)}
+          <ShieldCheck size={10} aria-hidden /> 查看完整证据 {shortId(step.artifact, 8)}
           <ExternalLink size={9} aria-hidden />
         </button>
       )}
@@ -1563,7 +1563,7 @@ function TeamLanes({ team }: { team: TeamRun }) {
       ? { text: '轮数用完 · 调度者判定：未完成', color: 'var(--st-waiting)' }
     // 还在判定。运行在这时停了（取消、失败）团队会被收成 finished，就不再说「在判定」
     : verdict?.closing && !team.finished
-      ? { text: '轮数用完 · 调度者在判定…', color: 'var(--st-running)' }
+      ? { text: '轮数用完 · 调度者正在判定…', color: 'var(--st-running)' }
     : null
   const laneLabel = clsx('shrink-0 truncate text-2xs text-dim', dense ? 'w-14' : 'w-20')
 
@@ -1575,17 +1575,17 @@ function TeamLanes({ team }: { team: TeamRun }) {
         </span>
         {liveRound && (
           <span style={{ color: 'var(--st-running)' }}>
-            第 {liveRound.round + 1} 轮 · {liveRound.parallel > 1 ? `本轮 ${liveRound.parallel} 人并行中` : '进行中'}
+            第 {liveRound.round + 1} 轮 · {liveRound.parallel > 1 ? `本轮 ${liveRound.parallel} 名成员并行中` : '进行中'}
           </span>
         )}
         {team.savedMs > 0 && (
           <span className="tnum" style={{ color: 'var(--st-done)' }}>
-            并行省下 {formatDuration(team.savedMs)}（{parallelRounds} 轮并行）
+            并行节省 {formatDuration(team.savedMs)}（{parallelRounds} 轮并行）
           </span>
         )}
         {parallelRounds === 0 && team.finished && !verdict?.outcome && (
           // 全程串行不是故障，但值得说一句——任务本来就互相依赖时它就该是串行的
-          <span title="调度者每轮只派了一个人：后一步依赖前一步的结论">全程串行</span>
+          <span title="调度者每轮只分派一名成员：后一步依赖前一步的结论">全程串行</span>
         )}
       </div>
       {ending && (
@@ -1649,13 +1649,13 @@ function TeamLanes({ team }: { team: TeamRun }) {
 
         {never.map((name) => (
           <div key={`never-${name}`} className="flex items-center gap-1.5" data-never-dispatched={name}>
-            <div className={clsx(laneLabel, 'text-faint line-through decoration-dotted')} title={`${name}：一次都没被派到`}>
+            <div className={clsx(laneLabel, 'text-faint line-through decoration-dotted')} title={`${name}：未被分派任务`}>
               {name}
             </div>
             <div className="flex h-4 min-w-0 flex-1 items-center gap-1 rounded-sm border border-dashed px-1.5 text-2xs text-dim"
                  style={{ borderColor: 'var(--border-strong, var(--border))' }}>
               <UserX size={10} aria-hidden className="shrink-0" />
-              <span className="truncate">没派到：{rounds} 轮里调度者一次都没派给它</span>
+              <span className="truncate">未分派：{rounds} 轮中调度者均未向该成员分派任务</span>
             </div>
           </div>
         ))}
@@ -1675,7 +1675,7 @@ function TeamLanes({ team }: { team: TeamRun }) {
                   {/* 窄栏放不下完整措辞，但"并2"这种缩写没人看得懂，
                       宁可只留轮次和耗时，并行与否看上面那行条形本来就一目了然 */}
                   {`第${r.round + 1}轮`}
-                  {r.parallel > 1 && !dense ? ` · ${r.parallel} 人并行` : ''}
+                  {r.parallel > 1 && !dense ? ` · ${r.parallel} 名成员并行` : ''}
                   {' · '}{live ? '进行中'
                     : stopped ? statusLabel(stopped.status, { short: true })
                     : r.wallMs > 0 ? formatDuration(r.wallMs) : NONE}
@@ -1703,7 +1703,7 @@ function TeamLanes({ team }: { team: TeamRun }) {
               <div className="mb-1.5 text-dim">任务：{m.instruction}</div>
             )}
             {m.error && (
-              <div className="mb-1.5 [overflow-wrap:anywhere]" style={{ color: 'var(--st-failed)' }}>为什么失败：{m.error}</div>
+              <div className="mb-1.5 [overflow-wrap:anywhere]" style={{ color: 'var(--st-failed)' }}>失败原因：{m.error}</div>
             )}
             {m.result && (
               <pre className="mono max-h-36 overflow-auto whitespace-pre-wrap text-dim">
@@ -1831,16 +1831,16 @@ export function ResultTable({ table, artifact, title, full = false, highlight, m
         {/* 两种"不全"性质不同：一个是 guard 主动限的，一个是存预览时切的。
             混成一句"已截断"，用户没法判断该去调查询还是去看完整工件。 */}
         {table.truncated && (
-          <span style={{ color: 'var(--st-waiting)' }}>查询撞了行数上限，库里还有更多</span>
+          <span style={{ color: 'var(--st-waiting)' }}>查询已达行数上限，数据库中还有更多数据</span>
         )}
         {table.clipped && (artifact
           ? (
             <button type="button" className="underline decoration-dotted underline-offset-2 hover:text-fg"
                     onClick={() => openArtifact(artifact, title)}>
-              这里只是预览，打开完整结果
+              此处仅为预览，打开完整结果
             </button>
           )
-          : <span>这里只是预览，实际取回的行数更多</span>)}
+          : <span>此处仅为预览，实际返回的行数更多</span>)}
         <span className="flex-1" />
         <button type="button" className="inline-flex items-center gap-1 rounded px-1 transition-colors hover:bg-hover hover:text-fg"
                 title="导出为 CSV（Excel 可直接打开）"
@@ -1896,8 +1896,8 @@ export function ArtifactViewer({ id, title, masked, onClose }: {
                {id && <span className="mono shrink-0 text-2xs text-dim">证据 {shortId(id, 8)}</span>}
                {content !== undefined && (
                  <span className="inline-flex shrink-0 items-center gap-1 text-2xs" style={{ color: 'var(--st-done)' }}
-                       title="取回时按内容哈希复验过，和运行时记录的一致">
-                   <ShieldCheck size={11} aria-hidden /> 哈希已校验
+                       title="加载时已按内容校验值重新校验，与运行时记录一致">
+                   <ShieldCheck size={11} aria-hidden /> 校验通过
                  </span>
                )}
              </span>
@@ -2006,7 +2006,7 @@ function Output({ output, runClass, broken, question, onFollowUp, runId }: {
         // 复核判了不可信：答案照常给（可能有参考价值），但先说清楚它不能当结论。
         // 不降透明度——那会让它更难读，而不是更不可信
         <div className="flex items-center gap-1.5 text-2xs font-medium" style={{ color: 'var(--st-failed)' }}>
-          <AlertTriangle size={11} aria-hidden /> 以下内容不能当结论用
+          <AlertTriangle size={11} aria-hidden /> 以下内容不可作为结论使用
         </div>
       )}
       {/* 复制 / 导出贴着正文浮出，不贴着整块：上面有出具横幅时，贴整块的右上角会
@@ -2038,7 +2038,7 @@ function Output({ output, runClass, broken, question, onFollowUp, runId }: {
       </div>
       {follow.length > 0 && onFollowUp && (
         <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-          <span className="text-2xs text-dim">接着问</span>
+          <span className="text-2xs text-dim">继续提问</span>
           {follow.map((f) => (
             <button key={f} type="button" className="chip transition-colors hover:bg-hover hover:text-fg"
                     onClick={() => onFollowUp(f)}>
@@ -2118,8 +2118,8 @@ function followUpsOf(values: unknown[]): string[] {
     const several = table.rows.length >= 2
     const out: string[] = []
     if (several && cat >= 0 && table.rows[0][cat] != null) out.push(`只看「${String(table.rows[0][cat]).slice(0, 16)}」的明细`)
-    if (time >= 0) out.push('按月拆分看趋势')
-    if (several && metric >= 0 && cat >= 0) out.push(`按 ${table.columns[metric]} 从高到低排`)
+    if (time >= 0) out.push('按月拆分查看趋势')
+    if (several && metric >= 0 && cat >= 0) out.push(`按 ${table.columns[metric]} 从高到低排序`)
     return out.slice(0, 3)
   }
   return []
@@ -2203,7 +2203,7 @@ function OutputValue({ value, marks, label }: { value: unknown; marks?: MarkSpec
           {!full && (
             // 光有一个"展开"按钮不够：用户看到的是一份读起来完整的报告，
             // 不会想到它下面还有。得先说"这里断了"
-            <span className="text-dim">…后面还有，这里先折叠了</span>
+            <span className="text-dim">…以下内容已折叠</span>
           )}
           <button type="button" className="text-[var(--accent)] hover:underline"
                   onClick={() => setFull((v) => !v)}>
@@ -2216,9 +2216,9 @@ function OutputValue({ value, marks, label }: { value: unknown; marks?: MarkSpec
 }
 
 const TIER_META: Record<string, { color: string; soft: string; hint: string }> = {
-  formal: { color: 'var(--st-done)', soft: 'var(--st-done-soft)', hint: '指标齐全，叙述中所有数字均可回指口径卡' },
-  degraded: { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: '存在缺口，结论请对照下方声明使用' },
-  withheld: { color: 'var(--st-failed)', soft: 'var(--st-failed-soft)', hint: '必需指标缺失或数字无法溯源，本期结论不作数' },
+  formal: { color: 'var(--st-done)', soft: 'var(--st-done-soft)', hint: ISSUANCE_HINT.formal },
+  degraded: { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: ISSUANCE_HINT.degraded },
+  withheld: { color: 'var(--st-failed)', soft: 'var(--st-failed-soft)', hint: ISSUANCE_HINT.withheld },
 }
 
 /**
@@ -2276,14 +2276,14 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
     <div className="scroll-mt-14 rounded-lg border p-2 outline-none data-[flash]:outline data-[flash]:outline-solid data-[flash]:outline-2 data-[flash]:outline-offset-1 data-[flash=focus]:outline-[color:var(--accent)]"
          style={{ borderColor: meta.color }} data-issuance-banner={tier} tabIndex={-1}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="rounded px-1.5 py-px text-xs font-semibold" style={{ color: meta.color, background: meta.soft }}>
-          ⚖ {issuanceLabel(tier)}
+        <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-xs font-semibold" style={{ color: meta.color, background: meta.soft }}>
+          <Scale size={11} aria-hidden /> {issuanceLabel(tier)}
         </span>
         {runClass === 'exploratory' && (
           <span className="chip" style={{ color: 'var(--st-waiting)' }}>探索运行 · 不进正式归档</span>
         )}
         <span className="tnum ml-auto text-2xs text-dim">
-          回指 {formatNumber(matched)} 个数字 · 核对 {formatNumber(issuance.metrics_checked ?? 0)} 个指标
+          可追溯 {formatNumber(matched)} 个数字 · 核对 {formatNumber(issuance.metrics_checked ?? 0)} 个指标
         </span>
       </div>
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
@@ -2317,7 +2317,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
 
       {!!gaps.length && (
         <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
-          <div className="font-medium">校验没跑全：</div>
+          <div className="font-medium">校验未全部完成：</div>
           <ul className="mt-0.5 space-y-0.5 pl-2">
             {gaps.map((g) => <li key={g}>· {g}</li>)}
           </ul>
@@ -2325,12 +2325,12 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
       )}
       {!!issuance.missing_required?.length && (
         <div className="mt-1 text-2xs" style={{ color: 'var(--st-failed)' }}>
-          缺必需指标：{issuance.missing_required.join('、')}
+          缺少必需指标：{issuance.missing_required.join('、')}
         </div>
       )}
       {!!issuance.missing_expected?.length && (
         <div className="mt-1 text-2xs" style={{ color: 'var(--st-waiting)' }}>
-          缺数据声明：{issuance.missing_expected.join('、')} 本期缺失
+          缺少期望指标：{issuance.missing_expected.join('、')}（本期无数据）
         </div>
       )}
       {!!unmatched.length && (
@@ -2338,7 +2338,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
           {/* 带报告文档时正文是 EvidenceDoc：列表序号里的数字画不了线，逐条都在违规清单里；
               文档还没取到（或取不到）时正文是不带标记的普通文本，什么都不许诺 */}
           <span data-unmatched-note="">
-            {!evidence ? '无法回指的数字（正文里已用虚线标出）：'
+            {!evidence ? '无法追溯的数字（正文中已用虚线标出）：'
               : evidence.onList ? EVIDENCE_TEXT.unmatchedInDoc : EVIDENCE_TEXT.unmatchedPlain}
           </span>
           {unmatched.map((u: any, i: number) => (
@@ -2367,8 +2367,8 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
                 <FileCode size={10} aria-hidden className="shrink-0" />
                 <span>口径卡「{c.caliber}」<span className="mono">{c.version}</span></span>
                 {calibers.length === 1 && matched > 0 && (hits == null || hits === matched)
-                  ? <span data-caliber-hits={matched} style={{ color: 'var(--st-done)' }}>· 回指上的 {matched} 个数字都来自这张卡</span>
-                  : hits != null && <span data-caliber-hits={hits} className="tnum" style={{ color: 'var(--st-done)' }}>· 回指 {hits} 个数字</span>}
+                  ? <span data-caliber-hits={matched} style={{ color: 'var(--st-done)' }}>· 可追溯的 {matched} 个数字均来自此口径卡</span>
+                  : hits != null && <span data-caliber-hits={hits} className="tnum" style={{ color: 'var(--st-done)' }}>· 可追溯 {hits} 个数字</span>}
               </div>
             )
           })}
@@ -2393,12 +2393,12 @@ function GraphPeek({ graph, note, onOpen }: {
                 aria-expanded={open} onClick={() => setOpen((v) => !v)}>
           <ChevronRight size={10} aria-hidden
             style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
-          它是怎么做的（{nodes.length} 步）
+          执行过程（{nodes.length} 步）
         </button>
         <span className="flex-1" />
         {onOpen && (
           <button type="button" className="btn btn-sm btn-ghost text-2xs"
-                  title="把这个工作流放到画布上继续改" onClick={() => onOpen(graph)}>
+                  title="在画布中打开此工作流继续修改" onClick={() => onOpen(graph)}>
             在画布里打开
           </button>
         )}

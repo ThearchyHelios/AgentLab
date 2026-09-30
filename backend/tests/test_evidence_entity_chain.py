@@ -237,7 +237,7 @@ async def test_a_made_up_name_explains_itself_and_suggests_real_ones(client, war
     assert 0 < len(step["closest"]) <= 3
     assert step["closest"][0] == {"alias": "t:refunds", "kind": "table", "name": "refunds"}
     assert step["checked"] == {"schemas": 1, "queries": 1}
-    assert "可能是编造的名字" in body["note"]
+    assert "疑似不存在的名称" in body["note"]
     assert [v["code"] for v in body["violations"]] == ["unknown_entity"]
 
 
@@ -255,7 +255,7 @@ async def test_a_name_a_partial_snapshot_cannot_check_is_not_called_made_up(clie
     body = await opened(client, row.id, seg_where(doc, kind="entity", issue="unverified_entity"))
     [step] = body["chain"]
     assert step["status"] == "unverified" and step["name"] == "refund_log"
-    assert step["reason"] == UNVERIFIED_ENTITY_REASON and "编造" not in body["note"] and "核对不了" in body["note"]
+    assert step["reason"] == UNVERIFIED_ENTITY_REASON and "疑似不存在" not in body["note"] and "无法核实" in body["note"]
     table = await opened(client, row.id, seg_where(doc, kind="entity", ref="t:orders"))
     assert table["chain"][0]["snapshot_truncated"] is True
     assert {s["kind"]: s for s in table["chain"][0]["sources"]}["schema"]["truncated"] is True
@@ -365,4 +365,4 @@ async def test_an_unmatched_quote_has_no_chain(client, monkeypatch):
     seg = seg_where(doc, kind="quote")
     assert seg["state"] == "none"
     body = await opened(client, row.id, seg)
-    assert body["chain"] == [] and "找不到这句原话" in body["note"]
+    assert body["chain"] == [] and "找不到这段引文的原文" in body["note"]

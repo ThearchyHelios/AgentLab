@@ -433,9 +433,9 @@ async def test_claims_over_max_claims_are_unjudged(monkeypatch, stored):
     assert sorted(judge.judged[0]) == sorted([ids[CITED], ids[CITED2]]), "先判挂了依据的"
     for text in (CAUSAL, NUMBER):
         v = status_of(outcome, doc, text)
-        assert (v["status"], v["reason"]) == ("unjudged", "max_claims") and "已到上限" in v["rationale"]
+        assert (v["status"], v["reason"]) == ("unjudged", "max_claims") and "已达上限" in v["rationale"]
     assert outcome["limits_hit"] == ["max_claims"] and outcome["unjudged"] == {"max_claims": 2}
-    assert outcome["gaps"] and "已到上限" in outcome["gaps"][0]
+    assert outcome["gaps"] and "已达上限" in outcome["gaps"][0]
 
 
 async def test_cost_truncation_follows_priority(monkeypatch, stored):
@@ -521,9 +521,9 @@ async def test_a_model_without_a_price_ignores_money_limits(monkeypatch, stored)
                               budget=Budget(max_claims=None, max_cost_usd=1e-9, timeout_s=None, daily_max_usd=1e-9),
                               emit=lambda kind, **data: events.append((str(kind), data)))
     assert len(judge.calls) == 1 and outcome["counts"]["unjudged"] == 0
-    assert outcome["priced"] is False and any("按令牌估不出金额" in n for n in outcome["notes"])
+    assert outcome["priced"] is False and any("无法按 token 数估算金额" in n for n in outcome["notes"])
     [log] = [d for k, d in events if k == EventType.LOG and d.get("code") == "judge_unpriced"]
-    assert "按令牌估不出金额" in log["message"]
+    assert "无法按 token 数估算金额" in log["message"]
 
 
 # --------------------------------------------------------------------------

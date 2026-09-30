@@ -40,7 +40,7 @@ export function EvidenceGuessView({ guesses, dense = false, defaultOpen = false 
           <span aria-hidden>{EVIDENCE_STATE.candidate.glyph} </span>{EVIDENCE_TEXT.guessTitle}
         </span>
         <span className="min-w-0 truncate text-faint">
-          · {EVIDENCE_TEXT.guessCount(stats.guessed, stats.numbers)} · 不能当证据
+          · {EVIDENCE_TEXT.guessCount(stats.guessed, stats.numbers)} · 不可作为证据
         </span>
       </button>
       <div id={bodyId} className="mt-1.5 space-y-3" data-ev-guess-body={open ? '' : undefined}>

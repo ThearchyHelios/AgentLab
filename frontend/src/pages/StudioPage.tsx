@@ -17,6 +17,7 @@ import { WorkflowPicker, confirmDiscard, createWorkflow, takeDiscarded } from '.
 import { problemsOf, type Problem } from '../canvas/issues'
 import { STUDIO_SHORTCUTS, hintOf, studioShortcut, type StudioShortcutId } from '../canvas/shortcuts'
 import { AssistantPanel } from '../run/AssistantPanel'
+import { copilotProgress } from '../run/Composer'
 import { RunControl } from '../run/RunControl'
 import { useRunClock } from '../run/useRunClock'
 import { topology } from '../run/derive'
@@ -76,15 +77,6 @@ function matches(e: KeyboardEvent, combo: string): boolean {
 
 /** 改图的快捷键。正式运行期间按了要说为什么没反应，不能安静地什么都不做 */
 const EDIT_SHORTCUTS = new Set<StudioShortcutId>(['undo', 'redo', 'paste', 'duplicate', 'layout'])
-
-const PHASE_TEXT: Record<string, string> = {
-  connecting: '正在连接模型',
-  planning: '正在理解需求、规划步骤',
-  building: '正在往画布上搭',
-  wiring: '正在连线',
-  finalizing: '排版、校验',
-  repairing: '自查发现问题，正在修',
-}
 
 export function StudioPage() {
   const { workflowId } = useParams()
@@ -206,7 +198,7 @@ export function StudioPage() {
         setLoadError({ id, error: e })
         return
       }
-      toast.info('那张工作流不在了，可能已经被删了')
+      toast.info('该工作流不存在，可能已被删除')
       navigate('/studio', { replace: true })
     })
   }, [load, navigate])
@@ -329,10 +321,10 @@ export function StudioPage() {
   const saveWithNote = useCallback(async () => {
     const note = await promptDialog({
       title: '保存并写版本说明',
-      body: '说明会跟着这一版留在版本历史里，以后回头找「是哪一版改坏的」就靠它。',
-      label: '这一版改了什么',
+      body: '版本说明会随此版本保存在版本历史中，便于日后追溯各版本的改动。',
+      label: '本版本的改动',
       initial: useStudio.getState().pendingNote,
-      placeholder: '例如：叙述 prompt 禁止元话语数字',
+      placeholder: '例如：调整报告节点的系统提示，要求数字注明出处',
       confirmLabel: '保存',
     })
     if (note != null) await doSave(note)
@@ -356,7 +348,7 @@ export function StudioPage() {
         return
       }
       if (JSON.stringify(toGraph(now.nodes, now.edges)) !== sig) {
-        toast.info('排版期间画布又改过了，这次排版没套用：再排一次', { key: 'studio:layout-stale' })
+        toast.info('排版期间画布已被修改，本次排版未应用，请重新排版', { key: 'studio:layout-stale' })
         return
       }
       if (setGraph(laid)) {
@@ -393,7 +385,7 @@ export function StudioPage() {
     const nav = problems.filter((p) => p.scope === 'node')
     if (!nav.length) {
       if (problems.length) setDock('problems')
-      else toast.info(analysis === 'failed' ? '分析失败，看不到问题清单' : '没有发现问题', { key: 'studio:problems' })
+      else toast.info(analysis === 'failed' ? '分析失败，无法显示问题清单' : '未发现问题', { key: 'studio:problems' })
       return
     }
     setDock('problems')
@@ -482,7 +474,7 @@ export function StudioPage() {
         className="h-full"
         source="workflows"
         title="还没有工作流"
-        body="新建一张空白工作流，从模板开始，或者在右边用助手直接把想法生成出来。"
+        body="新建一个空白工作流、从模板开始，或者在右侧用助手直接生成。"
         action={<button className="btn btn-primary" onClick={() => void createWorkflow(navigate, refresh)}>
           <Plus size={12} /> 新建工作流
         </button>}
@@ -532,7 +524,7 @@ export function StudioPage() {
           <span className="h-4 w-px shrink-0" style={{ background: 'var(--border)' }} />
           <button
             className="btn shrink-0 @max-[880px]:hidden"
-            title={formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流（Copilot）'}
+            title={formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流'}
             disabled={formalLock}
             onClick={openCopilot}
           >
@@ -541,7 +533,7 @@ export function StudioPage() {
           <button
             className={clsx('btn shrink-0 @max-[880px]:hidden', dock === 'variables' && 'border-[var(--border-strong)] bg-hover')}
             aria-pressed={dock === 'variables'}
-            title={hintOf('看这张工作流里有哪些变量、谁产出、谁引用', 'variables')}
+            title={hintOf('查看工作流中的变量及其产出和引用节点', 'variables')}
             onClick={toggleVariables}
           >
             <Variable size={12} /> <span className="@max-[1000px]:hidden">变量</span>
@@ -555,7 +547,7 @@ export function StudioPage() {
                       onClick={() => void relayout()} icon={<LayoutGrid size={12} />} />
           <MoreMenu items={[
             { id: 'copilot', label: '助手', icon: <Wand2 size={12} />, disabled: formalLock,
-              title: formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流（Copilot）', onSelect: openCopilot },
+              title: formalLock ? EDIT_LOCK_TEXT.formal : '用自然语言生成或修改工作流', onSelect: openCopilot },
             { id: 'variables', label: '变量', icon: <Variable size={12} />, shortcut: 'variables', checked: dock === 'variables',
               onSelect: toggleVariables },
             { id: 'history', label: '版本历史', icon: <History size={12} />, shortcut: 'history', checked: history,
@@ -564,10 +556,10 @@ export function StudioPage() {
               disabled: !nodeCount || formalLock, title: formalLock ? EDIT_LOCK_TEXT.formal : undefined,
               onSelect: () => void relayout() },
             { id: 'publish', label: '发布…', icon: <ShieldCheck size={12} />, disabled: !workflow || dirty,
-              title: dirty ? '先保存再发布' : '把当前版本立为已发布版本，正式运行只认它', onSelect: () => setPublishing(true) },
+              title: dirty ? '请先保存再发布' : '将当前版本设为已发布版本，正式运行仅使用该版本', onSelect: () => setPublishing(true) },
           ]} />
           <button className="btn shrink-0 @max-[880px]:hidden" onClick={() => setPublishing(true)} disabled={!workflow || dirty}
-                  title={dirty ? '先保存再发布' : '把当前版本立为已发布版本，正式运行只认它'}>
+                  title={dirty ? '请先保存再发布' : '将当前版本设为已发布版本，正式运行仅使用该版本'}>
             <ShieldCheck size={12} /> <span className="@max-[1000px]:hidden">发布</span>
           </button>
           <button className="btn shrink-0" onClick={() => void doSave()} disabled={saving || !dirty}
@@ -764,9 +756,9 @@ function VersionLabel({ workflow: w }: { workflow: Workflow }) {
   const pubWord = WORKFLOW_STATUS_LABEL[w.status === 'governed' ? 'governed' : 'published']
   const pubText = p != null ? `${pubWord} v${p}` : ''
   const title = [
-    live ? `画布就是${pubText}` : `画布是草稿 v${w.version}`,
-    p != null && !live ? `正式运行跑的是已发布的 v${p}${ahead > 0 ? `，画布比它新 ${ahead} 版` : ''}` : '',
-    p == null ? '还没发布过：只能发起探索运行' : '',
+    live ? `画布与${pubText}一致` : `画布是草稿 v${w.version}`,
+    p != null && !live ? `正式运行使用已发布的 v${p}${ahead > 0 ? `，画布领先 ${ahead} 版` : ''}` : '',
+    p == null ? '尚未发布，只能发起探索运行' : '',
     w.published_by ? `发布人：${w.published_by}` : '',
   ].filter(Boolean).join('\n')
   return (
@@ -797,7 +789,7 @@ function AnalysisChip({ analysis, errors, warnings, open, onClick, onRetry }: {
     return (
       <button type="button" className="chip shrink-0 cursor-pointer hover:bg-hover" onClick={onRetry}
               style={{ color: 'var(--warn)', borderColor: 'var(--warn)' }}
-              title="校验和变量分析的请求没有成功，现在说不清这个工作流能不能运行。点一下重试">
+              title="校验和变量分析请求失败，暂时无法判断该工作流能否运行。点击重试">
         <RotateCw size={9} /> 分析失败 · 重试
       </button>
     )
@@ -812,7 +804,7 @@ function AnalysisChip({ analysis, errors, warnings, open, onClick, onRetry }: {
       className={clsx('chip shrink-0 cursor-pointer transition-colors hover:bg-hover', open && 'bg-hover')}
       style={{ color: tone, borderColor: errors ? 'var(--err)' : undefined }}
       aria-expanded={open}
-      title={hintOf(errors || warnings ? '打开问题面板，点一条定位到节点' : '打开问题面板', 'problems')}
+      title={hintOf(errors || warnings ? '打开问题面板，点击条目可定位到节点' : '打开问题面板', 'problems')}
       onClick={onClick}
     >
       {/* 工具栏窄了只留图标和数字：「错」「提示」两个字给读屏，数字和图标的颜色、形状照样分得开 */}
@@ -844,7 +836,7 @@ function BuildingBar() {
   const stopCopilot = useStudio((s) => s.stopCopilot)
   const now = useRunClock(true)
   const started = useRef(Date.now())
-  const text = copilot.lastOp || PHASE_TEXT[copilot.phase] || '正在起草…'
+  const text = copilotProgress(copilot.lastOp, copilot.phase)
   return (
     <div className="pointer-events-none absolute inset-x-0 top-3 z-20 flex justify-center px-3">
       <div className="fade-up pointer-events-auto flex max-w-full items-center gap-2.5 rounded-full border bg-panel py-1 pl-3 pr-1 text-2xs shadow-elev-2"
@@ -852,13 +844,13 @@ function BuildingBar() {
         <Wand2 size={12} className="shrink-0" style={{ color: 'var(--copilot)' }} />
         {/* 播报区只圈住阶段文字：计时器 100ms 一跳，圈进来读屏就会一直念秒数 */}
         <span role="status" aria-live="polite" className="flex min-w-0 items-center gap-2.5">
-          <span className="shrink-0 font-medium">助手正在改这张工作流</span>
+          <span className="shrink-0 font-medium">助手正在修改工作流</span>
           <span className="min-w-0 truncate text-dim">{text}</span>
         </span>
         <span className="mono tnum shrink-0 text-faint" aria-hidden>{formatClock(now - started.current)}</span>
         <span className="shrink-0 text-faint">· 画布已锁定</span>
         <button type="button" className="btn btn-xs shrink-0 rounded-full" onClick={stopCopilot}
-                title="停下这一轮：画布退回这一轮之前，做了一半的可以用重做找回">
+                title="停止本轮：画布恢复到本轮开始前的状态，已完成的部分可通过重做找回">
           <Square size={9} fill="currentColor" /> 停止
         </button>
       </div>

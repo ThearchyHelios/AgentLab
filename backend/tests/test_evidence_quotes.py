@@ -21,7 +21,8 @@ from app.core import artifact_store
 from app.db.base import SessionLocal
 from app.db.models import Run, RunEvent
 from app.engine.evidence import (
-    LATER_REASON,
+    LEGACY_LATER_REASON,
+    PHASE_TWO_REASON,
     StreamRenderer,
     build_catalog,
     catalog_prompt,
@@ -83,7 +84,7 @@ def test_one_changed_character_is_not_a_quote(catalog):
     [seg] = quotes(doc)
     # 正文照样显示引文本身，只是标成没有出处
     assert seg["text"] == "退款主要集中在西区" and seg["state"] == "none" and seg["issue"] == "unresolved_ref"
-    assert "逐字" in seg["cite"]["reason"]
+    assert "找不到这段引文的原文" in seg["cite"]["reason"]
     assert [v["code"] for v in doc["violations"]] == ["unresolved_ref"]
     assert doc["stats"]["quotes"] == 0
 
@@ -115,8 +116,8 @@ def test_numbers_inside_a_verified_quote_are_not_bare(catalog):
 
 
 @pytest.mark.parametrize("text, words", [
-    ("[[q:K9|退款主要集中在东区]]", "目录里没有 K9"),
-    ("[[q:K1|]]", "引文是空的"),
+    ("[[q:K9|退款主要集中在东区]]", "检索结果 K9 不存在"),
+    ("[[q:K1|]]", "引文为空"),
     ("[[q:K1|东区]]", "太短"),
 ])
 def test_quotes_that_cannot_be_checked(catalog, text, words):
@@ -149,11 +150,11 @@ def test_exit_check_rereads_the_snapshot(catalog):
 
 
 def phase_two(doc):
-    """把文档改回二期组装的样子：那时 q / t / c 一律判为解析不了，正文是占位，原因是 LATER_REASON。
+    """把文档改回二期组装的样子：那时 q / t / c 一律判为解析不了，正文是占位，原因是 LEGACY_LATER_REASON。
     占位的字和现在「目录里没有 K9」时一样，只有记下的原因不同。"""
     for seg in iter_segments(doc):
         if seg.get("issue") == "unresolved_ref" and seg["ref"][:2] in ("q:", "t:", "c:"):
-            seg["cite"]["reason"] = LATER_REASON
+            seg["cite"]["reason"] = LEGACY_LATER_REASON
     return doc
 
 
@@ -165,7 +166,7 @@ def test_quotes_from_before_the_upgrade_are_rechecked_the_old_way(catalog):
     assert seg["text"] == "⟦?q:K1|退款主要集中在东区⟧"
     checked = verify_doc(doc, catalog, loader=LOAD)
     assert [v["code"] for v in checked["violations"]] == ["unresolved_ref"]
-    assert LATER_REASON in checked["violations"][0]["message"]
+    assert PHASE_TWO_REASON in checked["violations"][0]["message"]
     # 只认占位：正文被改成了引文本身、又自称是二期的，照样按现在的规矩查
     seg["text"] = "退款主要集中在东区"
     doc["markdown"] = "售后说退款主要集中在东区。"

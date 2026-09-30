@@ -175,7 +175,7 @@ async def test_a_failed_settle_round_falls_back_and_keeps_what_was_found(
     assert "step_limit" in codes(events)
     assert "step_limit_settled" not in codes(events)
     # 已有成果还在，末尾挂着说明
-    assert MIDWAY in text and "用满了" in text, text
+    assert MIDWAY in text and "已用完" in text, text
 
 
 def test_max_steps_is_clamped_by_the_hard_cap() -> None:

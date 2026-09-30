@@ -220,7 +220,7 @@ def describe_args(
     字段说明取 Field(description=...)，各工具定义里本来就写了，这里只是搬到报错里
     ——模型拿到这句话就能在下一步自己改对，不用人工介入。
 
-    返回的永远是一句完整的话（"参数不对：…。它接受：…"），调用方直接拼在
+    返回的永远是一句完整的话（"参数有误：…。可用参数：…"），调用方直接拼在
     工具名后面即可，不用猜这次会不会缺个主语。
     """
     js = schema.model_json_schema()
@@ -232,14 +232,14 @@ def describe_args(
         tag = "必填" if key in required else "可选"
         desc = str(prop.get("description") or "").strip()
         fields.append(f"{key}（{tag}，{_type_label(prop)}）" + (f" — {desc}" if desc else ""))
-    tail = "它接受：" + "；".join(fields) if fields else "它不接受任何参数。"
+    tail = "可用参数：" + "；".join(fields) if fields else "该工具不接受任何参数。"
 
     got = dict(got or {})
     unknown = [k for k in got if k not in props]
     missing = [k for k in required if k not in got]
     problems: list[str] = []
     if unknown:
-        problems.append(f"{'、'.join(unknown)} 不是它的参数")
+        problems.append(f"{'、'.join(unknown)} 不是该工具的参数")
     if missing:
         problems.append(f"缺少必填参数 {'、'.join(missing)}")
     for err in error.errors() if error else ():
@@ -253,7 +253,7 @@ def describe_args(
             else f"{loc} 的值不合法（{err.get('msg', '')}）"
         )
 
-    head = "参数不对：" + "；".join(problems) + "。" if problems else "参数不对。"
+    head = "参数有误：" + "；".join(problems) + "。" if problems else "参数有误。"
     return f"{head}{tail}"
 
 
@@ -331,7 +331,7 @@ async def call_tool(
 
     tools = await build_tools([name], ctx, session=session)
     if not tools:
-        raise KeyError(f"找不到工具 {name!r}")
+        raise KeyError(f"找不到工具 {name}")
     tool = tools[0]
 
     model = args_model_of(tool)

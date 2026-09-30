@@ -291,7 +291,7 @@ async def search(
             total_stale = await stale_count(session, collection)
             on_degrade(
                 f"{collection or '全部集合'}里有 {total_stale} 条向量由"
-                f"「{'、'.join(names)}」建立，和当前的「{embedder_id()}」对不上，"
+                f"「{'、'.join(names)}」建立，与当前的「{embedder_id()}」不一致，"
                 f"本次已退回纯关键词检索。重建索引后恢复。"
             )
         alpha = 0.0   # 纯关键词

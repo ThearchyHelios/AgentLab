@@ -118,7 +118,7 @@ async def test_a_name_public_dns_does_not_know_is_blocked(monkeypatch):
     DoH({"doh-a.test:A": {"Status": 3}, "doh-a.test:AAAA": {"Status": 3}}).install(monkeypatch)
     with pytest.raises(UnsafeUrlError) as e:
         await assert_safe_url("http://build-server.internal/")
-    assert "查不到" in str(e.value)
+    assert "无法解析" in str(e.value)
 
 
 async def test_when_no_resolver_answers_it_fails_closed(monkeypatch):

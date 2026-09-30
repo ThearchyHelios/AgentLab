@@ -73,9 +73,9 @@ export class ErrorBoundary extends Component<
            className={clsx('flex flex-col items-center justify-center gap-3 p-8 text-center', shell ? 'h-screen bg-[var(--bg)]' : 'h-full')}>
         <AlertCircle size={22} className="text-[var(--err)]" aria-hidden />
         <div role="alert" className="flex flex-col items-center gap-3">
-          <div className="text-sm font-medium">{this.props.title ?? (shell ? '界面出错了' : '这一页出错了')}</div>
+          <div className="text-sm font-medium">{this.props.title ?? (shell ? '界面发生错误' : '页面发生错误')}</div>
           <div className="text-xs text-dim">
-            {shell ? '导航和页面都停了。' : ''}没保存的编辑还在内存里：先点「重试」，恢复了就尽快保存。
+            {shell ? '导航和页面已停止响应。' : ''}未保存的编辑仍保留在内存中：请先点击「重试」，恢复后尽快保存。
           </div>
         </div>
         <div className="flex gap-2">
@@ -567,7 +567,7 @@ export function Modal({
             style={{ background: 'color-mix(in srgb, var(--warn) 10%, transparent)' }}
           >
             <AlertTriangle size={13} className="shrink-0 text-[var(--warn)]" aria-hidden />
-            <span className="flex-1">有未保存的修改，关掉就没了。</span>
+            <span className="flex-1">有未保存的修改，关闭后将丢失。</span>
             <button className="btn btn-sm btn-danger" onClick={() => { setAsking(false); onCloseRef.current() }}>
               放弃修改
             </button>
@@ -829,11 +829,11 @@ export function EmptyState({ icon, title, body, action, offline = 'auto', source
         data-empty-unknown={list}
       >
         <div className="text-faint">{loading ? <Spinner size={20} /> : <AlertCircle size={22} aria-hidden />}</div>
-        <div className="text-sm text-dim">{loading ? `正在读取${label}` : `${label}没取回来`}</div>
+        <div className="text-sm text-dim">{loading ? `正在读取${label}` : `${label}加载失败`}</div>
         <div className="max-w-sm text-xs leading-relaxed text-faint">
           {loading
-            ? '后端连着，这份列表还在路上。取回来之前，空着不代表没有。'
-            : <>{listError ? `${humanizeError(listError).title.replace(/[。.！!]$/, '')}。` : ''}这里显示为空不代表没有数据。</>}
+            ? '正在从服务端加载列表。加载完成前，列表为空不代表没有数据。'
+            : <>{listError ? `${humanizeError(listError).title.replace(/[。.！!]$/, '')}。` : ''}此处显示为空不代表没有数据。</>}
         </div>
         {!loading && (
           <button className="btn btn-sm mt-2" onClick={() => void useCatalog.getState().refresh()}>
@@ -847,11 +847,11 @@ export function EmptyState({ icon, title, body, action, offline = 'auto', source
     return (
       <div className={clsx('flex flex-col items-center justify-center gap-2 px-6 py-14 text-center', className)}>
         <div className="text-faint"><CloudOff size={22} aria-hidden /></div>
-        <div className="text-sm text-dim">暂时拿不到数据</div>
+        <div className="text-sm text-dim">暂时无法获取数据</div>
         {/* 不写「连上后会自动刷新」：页面自己拉的列表要接了 useOnReconnect 才会重拉，
             这句话对没接的页面是假的 */}
         <div className="max-w-sm text-xs leading-relaxed text-faint">
-          后端没连上。这里显示为空不代表没有数据。
+          未连接到服务端。此处显示为空不代表没有数据。
         </div>
         <button className="btn btn-sm mt-2" onClick={() => void checkBackend()}>
           <RotateCw size={12} aria-hidden /> 立即重试
@@ -1000,8 +1000,8 @@ export function OfflineBanner({ className }: { className?: string }) {
           读屏就一秒念一遍整条横幅 */}
       <span role="alert" className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
         <CloudOff size={13} className="shrink-0" aria-hidden />
-        <span className="font-medium">后端未连接</span>
-        <span className="text-dim">当前看到的空列表不代表数据丢失</span>
+        <span className="font-medium">服务端未连接</span>
+        <span className="text-dim">当前显示的空列表不代表数据丢失</span>
         {lastOkAt && (
           <span className="text-faint tabular-nums" title={formatDateTime(lastOkAt)}>· 最后连通 {formatTime(lastOkAt)}</span>
         )}
@@ -1527,7 +1527,7 @@ export function JsonInput({ value, onChange, rows = 5, placeholder, id, 'aria-de
         }}
         onBlur={() => { touched.current = false }}
       />
-      {bad && <div id={badId} className="mt-1 text-2xs text-[var(--err)]">JSON 格式不对，还没保存</div>}
+      {bad && <div id={badId} className="mt-1 text-2xs text-[var(--err)]">JSON 格式有误，尚未保存</div>}
     </div>
   )
 }
@@ -1541,7 +1541,7 @@ export function CopyButton({ text }: { text: string }) {
         void navigator.clipboard?.writeText(text).then(() => {
           setDone(true)
           setTimeout(() => setDone(false), 1200)
-        }, () => toast.error('复制失败：浏览器没有给剪贴板权限'))
+        }, () => toast.error('复制失败：浏览器未授予剪贴板权限'))
       }}
     >
       {done ? '已复制' : '复制'}
@@ -1630,37 +1630,37 @@ export function HealthPill({ record, checkingSince, labels, className, stale }: 
     lastAt.current = at
   }, [record?.at])
 
-  // at 为 0：后端记的上次结果，不知道是什么时候测的，就不写时间。带个「测」字：
-  // 这是上次测的时刻，不是此刻的状态
+  // at 为 0：后端记的上次结果，不知道是什么时候测的，就不写时间。带个「测试」：
+  // 这是上次测试的时刻，不是此刻的状态
   const rel = record?.at ? formatRelative(record.at) : ''
-  const when = !rel ? '' : rel === '刚刚' ? '刚测过' : /前$/.test(rel) ? `${rel}测` : `${rel} 测`
+  const when = !rel ? '' : rel === '刚刚' ? '刚刚测试' : /前$/.test(rel) ? `${rel}测试` : `测试于 ${rel}`
   const text = state === 'checking'
-    ? `${labels?.checking ?? '正在测'} · ${formatDuration(Math.max(0, clock - (checkingSince ?? clock)))}`
+    ? `${labels?.checking ?? '正在测试'} · ${formatDuration(Math.max(0, clock - (checkingSince ?? clock)))}`
     : state === 'idle'
       ? (labels?.idle ?? '未测试')
       : state === 'ok'
-        ? [labels?.ok ?? '已连通', record?.ms != null ? formatDuration(record.ms) : null, when].filter(Boolean).join(' · ')
-        : [labels?.fail ?? '连不上', when].filter(Boolean).join(' · ')
+        ? [labels?.ok ?? '连接成功', record?.ms != null ? formatDuration(record.ms) : null, when].filter(Boolean).join(' · ')
+        : [labels?.fail ?? '连接失败', when].filter(Boolean).join(' · ')
   const tip = record
     ? [
-        record.at ? `${formatDateTime(record.at)} 测的` : '上次探测的结果',
+        record.at ? `测试于 ${formatDateTime(record.at)}` : '上次测试的结果',
         record.ok ? record.note : record.error,
-        stale ? '配置改过了，这个结果不代表眼前这份，重测一次' : null,
+        stale ? '配置已修改，此结果可能已失效，请重新测试' : null,
       ].filter(Boolean).join('\n')
     : undefined
   // 念给读屏的那一句只在状态切换时变：看得见的那句里有 100ms 一跳的计时和
   // 「3 分钟前」，放进播报区的话测连接期间会一直念、之后每分钟每张卡再念一遍。
   // 时刻写成钟点，不写相对时间
   const spoken = state === 'checking'
-    ? '正在测连接'
+    ? '正在测试连接'
     : state === 'idle' || !record
       ? ''
       : [
           record.ok
-            ? [labels?.ok ?? '已连通', record.ms != null ? formatDuration(record.ms) : null].filter(Boolean).join(' ')
-            : `${labels?.fail ?? '连不上'}${record.error ? `：${record.error}` : ''}`,
-          record.at ? `${formatTime(record.at)} 测的` : null,
-          stale ? '配置改过了，这个结果不代表眼前这份' : null,
+            ? [labels?.ok ?? '连接成功', record.ms != null ? formatDuration(record.ms) : null].filter(Boolean).join(' ')
+            : `${labels?.fail ?? '连接失败'}${record.error ? `：${record.error}` : ''}`,
+          record.at ? `测试于 ${formatTime(record.at)}` : null,
+          stale ? '配置已修改，此结果可能已失效' : null,
         ].filter(Boolean).join('，')
 
   return (
@@ -1684,7 +1684,7 @@ export function HealthPill({ record, checkingSince, labels, className, stale }: 
           <StatusBadge status={status} size={12} decorative />
         </span>
         {text}
-        {stale && state !== 'checking' && <span className="text-faint">· 配置改过了</span>}
+        {stale && state !== 'checking' && <span className="text-faint">· 配置已修改</span>}
       </span>
       <span role="status" className="sr-only">{spoken}</span>
     </>
@@ -1755,7 +1755,7 @@ export function deferDelete({ what, url, hide, restore, commit, done }: {
     } catch (e) {
       putBack()
       const h = humanizeError(e)
-      toast.error(`没删掉${what}：${h.reason ? `${h.title}，${h.reason}` : h.title}`, { detail: h.raw })
+      toast.error(`删除${what}失败：${h.reason ? `${h.title}，${h.reason}` : h.title}`, { detail: h.raw })
     }
   }, UNDO_MS)
   const toastId = toast(`已删除${what}`, 'info', {

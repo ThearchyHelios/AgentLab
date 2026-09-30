@@ -125,12 +125,12 @@ class SandboxManager:
             # auto 模式额外要求"开箱即用"：microVM 镜像没拉过就先跳过
             warm = getattr(impl, "image_ready", None)
             if warm is not None and not warm():
-                self._resolved_from = f"{name} 可用但镜像未缓存，auto 先跳过"
+                self._resolved_from = f"{name} 可用但镜像未缓存，自动选择时暂不使用"
                 continue
             self._resolved_from = f"自动选择 {name}（{_why(name)}）"
             return impl()
 
-        self._resolved_from = "没有可用的隔离后端，降级到本地子进程"
+        self._resolved_from = "没有可用的隔离方式，已降级为本地子进程"
         return LocalSandbox()
 
     async def run(

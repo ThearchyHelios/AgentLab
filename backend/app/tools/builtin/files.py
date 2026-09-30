@@ -45,7 +45,7 @@ async def file_read(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
     if not target.exists():
         return {"error": f"文件不存在：{args.path}"}
     if target.is_dir():
-        return {"error": f"{args.path} 是目录，用 file_list"}
+        return {"error": f"{args.path} 是目录，请使用 file_list"}
     data = target.read_bytes()[:_MAX_READ]
     return {
         "path": args.path,

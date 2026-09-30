@@ -59,7 +59,7 @@ def test_a_well_formed_report_graph_has_no_new_errors():
 
 @pytest.mark.parametrize("metrics_from, words", [
     (["nope"], ["nope", "不存在"]),
-    (["fetch"], ["fetch", "不是「口径卡」"]),
+    (["fetch"], ["「fetch」", "不是口径卡"]),
 ])
 def test_metrics_from_must_name_a_caliber(metrics_from, words):
     found = issues(report_graph(metrics_from), "metrics_from")

@@ -66,63 +66,63 @@ export const EVIDENCE_STATE: Record<EvidenceStateCode, EvidenceStateMeta> = {
     code: 'deterministic', label: EVIDENCE_STATE_LABEL.deterministic, line: 'solid', glyph: '',
     color: 'var(--st-done)', decoration: mix('--st-done', 60), soft: 'var(--st-done-soft)',
     alert: false, phase: 1,
-    hint: '由系统从证据（口径卡、查询快照、运行输入）里取值、按确定的规则渲染，不是模型写的',
+    hint: '由系统从证据（口径卡、查询快照、运行输入）中取值，按确定的规则渲染，不是模型生成的',
   },
   supported: {
     code: 'supported', label: EVIDENCE_STATE_LABEL.supported, line: 'badge', glyph: '◆',
     color: 'var(--st-running)', decoration: 'transparent', soft: 'var(--st-running-soft)',
     alert: false, phase: 4,
-    hint: '裁判模型认为引用的证据支持这句话。这是模型的判断，不是系统核对',
+    hint: '裁判模型认为引用的证据支持本句。这是模型的判断，不是系统核对',
   },
   partial: {
     code: 'partial', label: EVIDENCE_STATE_LABEL.partial, line: 'badge', glyph: '◇',
     color: 'var(--st-waiting)', decoration: 'transparent', soft: 'var(--st-waiting-soft)',
     alert: true, phase: 4,
-    hint: '裁判模型认为证据只支持这句话的一部分',
+    hint: '裁判模型认为证据仅支持本句的一部分',
   },
   unsupported: {
     code: 'unsupported', label: EVIDENCE_STATE_LABEL.unsupported, line: 'badge', glyph: '!',
     color: 'var(--st-failed)', decoration: 'transparent', soft: 'var(--st-failed-soft)',
     alert: true, phase: 4,
-    hint: '裁判模型认为引用的证据不支持这句话',
+    hint: '裁判模型认为引用的证据不支持本句',
   },
   unjudged: {
     code: 'unjudged', label: EVIDENCE_STATE_LABEL.unjudged, line: 'badge', glyph: '?',
     color: 'var(--st-cancelled)', decoration: 'transparent', soft: 'var(--st-cancelled-soft)',
     alert: false, phase: 4,
-    hint: '还没请模型判断证据支不支持这句话：探索运行点开再判，或者到了上限没判',
+    hint: '尚未由模型判断证据是否支持本句：探索运行中点击后裁判，或已达裁判上限',
   },
   none: {
     code: 'none', label: EVIDENCE_STATE_LABEL.none, line: 'dotted', glyph: '?',
     color: 'var(--st-waiting)', decoration: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)',
     alert: true, phase: 1,
-    hint: '没写成引用标记的数字，或者引用解析不了：系统核对不到它从哪来',
+    hint: '未使用引用标记的数字，或无法解析的引用：系统无法核对其来源',
   },
   connective: {
     code: 'connective', label: EVIDENCE_STATE_LABEL.connective, line: 'none', glyph: '',
     color: 'var(--st-idle)', decoration: 'transparent', soft: 'var(--st-idle-soft)',
     alert: false, phase: 4,
-    hint: '过渡、组织结构的话，不陈述数据事实，所以不需要证据',
+    hint: '过渡或组织结构的文字，不陈述数据事实，因此不需要证据',
   },
   candidate: {
     code: 'candidate', label: EVIDENCE_STATE_LABEL.candidate, line: 'dotted', glyph: '~',
     color: 'var(--st-idle)', decoration: mix('--st-idle', 70), soft: 'var(--st-idle-soft)',
     alert: false, phase: 3,
-    hint: '旧运行按数值猜的可能来源，不能当证据',
+    hint: '按数值猜测的可能来源，不能作为证据',
   },
   // 可疑实体：线型同无证据（点状），字形和文字另起，一眼分得出「没写出处」和「名字可能是编的」
   suspect: {
     code: 'suspect', label: EVIDENCE_STATE_LABEL.suspect, line: 'dotted', glyph: '?!',
     color: 'var(--st-waiting)', decoration: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)',
     alert: true, phase: 3,
-    hint: '本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的',
+    hint: '本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称，疑似不存在',
   },
   // 核对不了：表结构快照不全，找不到不等于不存在。只是标注，不进 n / N 的跳转，颜色压低
   unverified: {
     code: 'unverified', label: EVIDENCE_STATE_LABEL.unverified, line: 'dotted', glyph: '…',
     color: 'var(--st-cancelled)', decoration: mix('--st-cancelled', 80), soft: 'var(--st-cancelled-soft)',
     alert: false, phase: 3,
-    hint: '这个数据源的表太多，表结构快照只存了一部分：找不到这个名字，也说不准它不存在',
+    hint: '该数据源的表数量较多，表结构快照仅包含部分表：未找到该名称，不能确定它不存在',
   },
 }
 
@@ -166,11 +166,11 @@ export interface EvidenceKindStyle {
 export const EVIDENCE_KIND_STYLE: Record<EvidenceKindCode, EvidenceKindStyle> = {
   entity: {
     code: 'entity', line: 'solid', glyph: '', color: 'var(--st-done)', label: '有出处 · 表或字段',
-    hint: '本次运行的表结构快照、查询用到的表或查询结果列里真实存在的名字',
+    hint: '本次运行的表结构快照、查询用到的表或查询结果列中确实存在的名称',
   },
   quote: {
     code: 'quote', line: 'solid', glyph: '“', color: 'var(--st-done)', label: '有出处 · 逐字引文',
-    hint: '在知识库检索命中的原文里逐字出现（空白归一化后比对）',
+    hint: '与知识库检索命中的原文逐字一致（忽略空白差异）',
   },
 }
 
@@ -408,7 +408,7 @@ export function caliberSourceText(
   return EVIDENCE_TEXT.caliberFrom(caliber ?? '', version ?? '', wf, v)
 }
 
-/** 升版处置那一句：「上游已有 v6，按「并排双印新旧口径」处置」。没有升版（null、没写 latest / policy）返回 null */
+/** 升版处置那一句：「上游已有 v6，按「新旧口径并列展示」处置」。没有升版（null、没写 latest / policy）返回 null */
 export function caliberUpgradeText(up: EvidenceCaliberUpgrade | null | undefined): string | null {
   if (!up || typeof up !== 'object' || (!up.policy && !up.policy_label)) return null
   const latest = up.latest != null && String(up.latest) !== '' ? `v${String(up.latest).replace(/^v/, '')}` : null
@@ -425,8 +425,11 @@ export function reasonOf(seg: EvidenceSegment): string {
   if (seg.cite?.reason) return seg.cite.reason
   if (seg.issue === 'unknown_entity') return EVIDENCE_TEXT.suspect
   if (seg.issue === 'unverified_entity') return EVIDENCE_TEXT.unverified
-  return seg.ref ? `引用 ${seg.ref} 解析不了` : ''
+  return seg.ref ? `引用 ${seg.ref} 无法解析` : ''
 }
+
+/** 整改前后端给可疑实体的原因以这几个字收尾（报告文档里存的是当时的原话），也算带着状态名 */
+const LEGACY_SUSPECT = '可能是编造的名字'
 
 /**
  * 片段的 aria-label：字、状态、出处都写全。「8.7%，有出处：口径卡指标 环比增幅」
@@ -436,8 +439,10 @@ export function segmentLabel(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, '
   const state = segmentState(seg)
   if (!state) return seg.text
   const why = state === 'none' || state === 'suspect' || state === 'unverified' ? reasonOf(seg) : sourceOf(seg, doc)
-  // 可疑实体的原话本身就以「可能是编造的名字」收尾，状态那几个字不再重复一遍
-  const label = state === 'suspect' && why.includes(EVIDENCE_STATE.suspect.label) ? '' : EVIDENCE_STATE[state].label
+  // 可疑实体的原话本身就带着状态名（「疑似不存在的名称：…」；后端 UNKNOWN_ENTITY_REASON 的旧说法以「可能是编造的名字」收尾），
+  // 状态那几个字不再重复一遍
+  const label = state === 'suspect' && (why.includes(EVIDENCE_STATE.suspect.label) || why.includes(LEGACY_SUSPECT))
+    ? '' : EVIDENCE_STATE[state].label
   return `${segName(seg)}，${[label, why].filter(Boolean).join('：')}`
 }
 
@@ -535,7 +540,7 @@ export function tallySummary(t: EvidenceTally, keys: boolean): string {
     evidenceTally(t.cited, t.total, t.other),
     t.claims?.total ? `${claimTally(t.claims)}（模型判断，非确定）` : '',
     t.suspect ? `${formatNumber(t.suspect)} 个${EVIDENCE_STATE.suspect.label}` : '',
-    t.unverified ? `${formatNumber(t.unverified)} 个名字${EVIDENCE_STATE.unverified.label}` : '',
+    t.unverified ? `${formatNumber(t.unverified)} 个名称${EVIDENCE_STATE.unverified.label}` : '',
     t.structural ? EVIDENCE_TEXT.structuralCount(t.structural) : '',
     t.noSegment ? EVIDENCE_TEXT.noSegmentCount(t.noSegment) : '',
     keys ? (t.claims?.unsupported || t.claims?.partial ? JUDGE_TEXT.keysHint : EVIDENCE_TEXT.keysHint) : '',
@@ -688,7 +693,7 @@ export function issuanceMarks(issuance: any): MarkSpec[] | undefined {
     ...unmatched.map((u) => ({
       token: String(u?.token ?? u),
       tone: 'warn' as const,
-      title: `这个数字在口径卡里找不到来源${u?.context ? `：「${u.context}」` : ''}`,
+      title: `口径卡中找不到该数字的来源${u?.context ? `：「${u.context}」` : ''}`,
       ...where(u),
     })),
     ...matched.map((m) => {
@@ -1203,10 +1208,33 @@ export function auditCsv(rows: AuditRow[]): string {
     return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t
   }
   const c = EVIDENCE_AUDIT_TEXT.cols
-  const head = ['分组', c.report, '片段', c.text, c.state, c.source, '引用', c.sentence, c.seal]
+  const head = ['分组', c.report, '片段编号', c.text, c.state, c.source, '引用', c.sentence, c.seal]
   const seal = (v: boolean | null) => (v == null ? '' : v ? '是' : '否')
   return [head, ...rows.map((r) => [
     EVIDENCE_AUDIT_TEXT.groups[r.group], r.report, r.seg ?? '', r.text, EVIDENCE_STATE[r.state].label, r.source,
     r.ref ?? '', r.sentence, seal(r.sealed),
   ])].map((r) => r.map(cell).join(',')).join('\r\n')
+}
+
+/**
+ * 裁判触顶的说法。后端现在写「已达上限（…），这句未裁判」，以前写「已到上限（…），这句没判」：
+ * 运行记录里存着的裁判理由两种都有，都要认。
+ */
+const JUDGE_LIMIT = /^已[到达]上限/
+
+/** 接口回的这句话是不是在说触顶（触顶那一框已经说过，不再重复写这句） */
+export function isJudgeLimit(message: string): boolean {
+  return JUDGE_LIMIT.test(message.trim())
+}
+
+/** 「已达上限（这份报告的裁判金额上限 $0.05），这句未裁判」→「这份报告的裁判金额上限 $0.05，这句未裁判」 */
+export function judgeLimitWords(rationale: string | undefined): string {
+  if (!rationale) return ''
+  const m = /^已[到达]上限（(.+?)）[，,]?\s*(.*)$/.exec(rationale)
+  return m ? [m[1], m[2]].filter(Boolean).join('，') : rationale.replace(/^已[到达]上限[：:]?/, '')
+}
+
+/** 触顶后怎么调（JUDGE_TEXT.limitHow）指向设置页的，给一个直达入口 */
+export function pointsToSettings(how: string): boolean {
+  return /^(?:到|前往)「设置/.test(how)
 }

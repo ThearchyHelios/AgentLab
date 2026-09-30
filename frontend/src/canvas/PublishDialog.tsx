@@ -21,9 +21,9 @@ import {
 import type { AutofixResult, PublishCheck, PublishFix, PublishLevel, ValidationIssue, Workflow } from '../types'
 
 const LEVEL_DETAIL: Record<PublishLevel, string> = {
-  published: '基础校验通过即可。正式运行从这一版发起，之后画布上继续改不影响它',
-  governed: '另过治理门禁：不许有「多 Agent 协作」这类全动态规划节点；子工作流要钉住版本；'
-    + '至少一个「成果」节点声明出具契约；Agent 的危险工具至少要人工审批',
+  published: '只需通过基础校验。正式运行将基于此版本发起，之后在画布上的修改不影响该版本',
+  governed: '还需通过治理门禁：不得包含「多 Agent 协作」等全动态规划节点；子工作流须固定版本；'
+    + '至少一个「成果」节点须声明出具契约；Agent 的危险工具须经人工审批',
 }
 
 /**
@@ -98,7 +98,7 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
         onDone()
       } else {
         setGate(normalizeCheck({ issues: res.issues }, level).issues)
-        toast.warn('发布被门禁拦下：下面列了要改的地方，点一条定位到节点')
+        toast.warn('发布未通过门禁检查。请查看下方问题清单，点击条目可定位到对应节点')
       }
     } catch (e) {
       toast.error(e)
@@ -161,20 +161,20 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
         <div className="mb-3 flex items-start gap-1.5 rounded-md border px-2.5 py-2 text-2xs leading-relaxed"
              style={{ borderColor: 'var(--warn)', color: 'var(--warn)', background: 'var(--st-waiting-soft)' }}>
           <AlertTriangle size={12} className="mt-px shrink-0" />
-          它现在是受管工作流。发布为「已发布」会降级：以后的正式运行不再受治理门禁约束。
+          当前为受管工作流。以「已发布」等级发布将降级，此后的正式运行不再受治理门禁约束。
         </div>
       )}
 
       <dl className="space-y-1.5 rounded-md border px-3 py-2 text-2xs">
         <div className="flex gap-2">
-          <dt className="w-14 shrink-0 text-faint">这一版</dt>
+          <dt className="w-14 shrink-0 text-faint">当前版本</dt>
           <dd className="min-w-0 flex-1">
             v{workflow.version}
             {published != null && (
               <span className="text-faint">
-                {published === workflow.version ? ' · 就是当前已发布的这一版（重新发布只改等级）'
-                  : delta ? ` · 比已发布的 v${published}：${describe(delta)}`
-                  : ` · 已发布的是 v${published}`}
+                {published === workflow.version ? ' · 即当前已发布版本（重新发布仅变更等级）'
+                  : delta ? ` · 相比已发布的 v${published}：${describe(delta)}`
+                  : ` · 当前已发布版本为 v${published}`}
               </span>
             )}
             {workflow.published_by && published != null && (
@@ -186,21 +186,21 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
           <dt className="w-14 shrink-0 pt-px text-faint">署名</dt>
           <dd className="min-w-0 flex-1">
             {actor ? (
-              <span>将以「<b className="font-semibold">{actor}</b>」的名义发布，写进发布记录
-                <Link to="/settings/prefs" className="ml-1.5 text-faint underline-offset-2 hover:underline">改署名</Link>
+              <span>将以「<b className="font-semibold">{actor}</b>」的名义发布，并记入发布记录
+                <Link to="/settings/prefs" className="ml-1.5 text-faint underline-offset-2 hover:underline">修改署名</Link>
               </span>
             ) : (
               <div>
-                <div style={{ color: 'var(--warn)' }}>未署名：这次发布不会记录发布人</div>
+                <div style={{ color: 'var(--warn)' }}>未署名：本次发布不会记录发布人</div>
                 <div className="mt-1 flex items-center gap-1.5">
-                  <input className="field h-7 py-0 text-xs" placeholder="写上你的名字，例如 张工" value={signing}
+                  <input className="field h-7 py-0 text-xs" placeholder="填写发布人姓名" value={signing}
                          aria-label="署名" onChange={(e) => setSigning(e.target.value)}
                          onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); sign() } }} />
                   <button type="button" className="btn btn-sm shrink-0" disabled={!signing.trim()} onClick={sign}>
                     <PenLine size={11} /> 署名
                   </button>
                 </div>
-                <div className="mt-1 text-faint">只存在这台浏览器里，和审批、正式运行共用；也可以去「设置 · 偏好设置」改</div>
+                <div className="mt-1 text-faint">署名仅保存在当前浏览器中，审批和正式运行共用；也可在「设置 → 偏好设置」中修改</div>
               </div>
             )}
           </dd>
@@ -215,11 +215,11 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
 }
 
 function describe(d: GraphDiff): string {
-  if (!d.total) return '只挪了位置'
+  if (!d.total) return '仅调整了节点位置'
   const parts = [
     d.added.length && `新增 ${d.added.length} 个节点`,
-    d.removed.length && `删掉 ${d.removed.length} 个节点`,
-    d.changed.length && `改了 ${d.changed.length} 个节点的配置`,
+    d.removed.length && `删除 ${d.removed.length} 个节点`,
+    d.changed.length && `修改了 ${d.changed.length} 个节点的配置`,
     (d.edgesAdded || d.edgesRemoved) && `连线变动 ${d.edgesAdded + d.edgesRemoved} 处`,
   ].filter(Boolean)
   return parts.join('、')
@@ -558,7 +558,7 @@ function PreflightRow({ issue, others, fix, where, pf, onLocate }: {
         className={clsx('flex w-full items-start gap-1.5 rounded px-1.5 py-1 text-left leading-snug',
           issue.node_id && 'hover:bg-hover')}
         // 合成一行的那几条的其他说法：悬停看得到，不在清单里重复一遍
-        title={[issue.node_id ? '定位到这个节点' : '', ...others].filter(Boolean).join('\n') || undefined}
+        title={[issue.node_id ? '定位到该节点' : '', ...others].filter(Boolean).join('\n') || undefined}
       >
         <Icon size={11} className="mt-px shrink-0" style={{ color: err ? 'var(--err)' : 'var(--warn)' }}
               aria-label={err ? '错误' : '提示'} />
@@ -682,7 +682,7 @@ function FixPreview({ pf, labelOf, nameOf, typeOf }: {
                 <span className="[overflow-wrap:anywhere]">
                   <b className="font-semibold">「{where}」</b>{field && ` · ${field}`}：
                   <FixValue value={c.before} field={c.field} nameOf={nameOf} className="text-faint line-through" data-fix-before="" />
-                  <ArrowRight size={10} className="mx-1 inline align-[-1px] text-faint" aria-label="改成" />
+                  <ArrowRight size={10} className="mx-1 inline align-[-1px] text-faint" aria-label="改为" />
                   <FixValue value={c.after} field={c.field} nameOf={nameOf} className="font-medium" data-fix-after="" />
                 </span>
                 {c.label && <span className="block text-faint">{c.label}</span>}
@@ -816,7 +816,7 @@ export function PublishPreflightPane({ onLocate }: { onLocate: (issue: Validatio
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2" data-preflight="panel">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-2xs">
-        <div role="radiogroup" aria-label="按哪一档检查" className="inline-flex rounded-md border p-px">
+        <div role="radiogroup" aria-label="检查等级" className="inline-flex rounded-md border p-px">
           {LEVELS.map((l) => (
             <button key={l} type="button" {...radio(l)} onClick={() => pick(l)} disabled={pf.working}
                     className={clsx('rounded px-2 py-0.5 disabled:cursor-not-allowed disabled:opacity-60',

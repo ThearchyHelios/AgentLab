@@ -87,8 +87,8 @@ for (const code of RUN_STATUS_ORDER) {
 addWord(STATUS.suspended.label, ['held'])
 for (const [word, codes] of [
   ['完成', ['succeeded']], ['成功', ['succeeded']], ['success', ['succeeded']],
-  ['待审批', ['waiting']], ['等待', ['waiting']], ['审批', ['waiting']], ['等人', ['waiting']],
-  ['挂起', ['held']], ['中断', ['held']], ['已中断', ['held']], ['可续跑', ['held']],
+  ['待审批', ['waiting']], ['等待', ['waiting']], ['审批', ['waiting']], ['等待审批', ['waiting']],
+  ['挂起', ['held']], ['中断', ['held']], ['已中断', ['held']], ['可继续运行', ['held']],
   ['interrupted', ['waiting', 'held']],
   ['取消', ['cancelled']], ['canceled', ['cancelled']],
   ['出错', ['failed']], ['报错', ['failed']], ['error', ['failed']],
@@ -96,7 +96,7 @@ for (const [word, codes] of [
 ] as [string, StatusCode[]][]) addWord(word, codes)
 
 /** 搜索框里被认成状态的词不再当名称去搜；说明给占位符和提示用 */
-export const SEARCH_PLACEHOLDER = '搜工作流名称，或输入状态（如 失败）'
+export const SEARCH_PLACEHOLDER = '搜索工作流名称或状态（如「失败」）'
 
 export interface ParsedQuery {
   /** 从文字里认出来的状态（显示码），没有就是空 */
@@ -234,7 +234,7 @@ export function runShape(
 ): RunShape {
   const now = opts.now ?? Date.now()
   if (code === 'running' || code === 'queued') {
-    return { segs: [{ kind: 'live', frac: 1 }], end: null, title: code === 'queued' ? '排队中' : '运行中：跑完才分得出执行和等人' }
+    return { segs: [{ kind: 'live', frac: 1 }], end: null, title: code === 'queued' ? '排队中' : '运行中：结束后才能区分执行时长与等待审批时长' }
   }
   const t = runTiming(run)
   const pieces =(wall: number, active: number | null, wait: number, openWait = 0) => {
@@ -260,7 +260,7 @@ export function runShape(
     return {
       segs: pieces(wall, active, before, open),
       end: null,
-      title: `墙钟 ${formatSpan(wall)}（至今） · 执行 ${formatSpan(active)} · 等人 ${formatSpan(before + open)}（还在等）`,
+      title: `总时长 ${formatSpan(wall)}（至今） · 执行时长 ${formatSpan(active)} · 等待审批 ${formatSpan(before + open)}（仍在等待）`,
     }
   }
 
@@ -341,14 +341,14 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
     case 'query_snapshot': return '查询：SQL 和结果集'
     case 'tool_snapshot': return '工具调用：参数和返回'
     case 'retrieval_snapshot': return '知识检索：命中的片段'
-    case 'node_output': return '这一次执行的产出'
+    case 'node_output': return '本次执行的产出'
     // 口径卡每跑一次落一件：哪张卡、哪一版（工件行的 meta 里有 {caliber, version}）
     case 'metric_set': return meta?.caliber
       ? `口径卡「${meta.caliber}」${meta.version ?? ''}` : '口径卡的指标、算式和输入'
     case 'report_doc': return '报告：逐段的片段和每个数字的出处'
     // 查库时冻结的表结构（工件行的 meta 里有 {source, tables: 表数量}）：报告里的表名、字段名按它核对
     case 'schema_snapshot': return meta?.source
-      ? `表结构：数据源「${meta.source}」${typeof meta.tables === 'number' ? ` · ${meta.tables} 张表` : ''}` : '查库时冻结的表结构'
+      ? `表结构：数据源「${meta.source}」${typeof meta.tables === 'number' ? ` · ${meta.tables} 张表` : ''}` : '查询时保存的表结构'
     default: return '工件'
   }
 }
@@ -356,17 +356,17 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
 /** 证据：查询、工具、检索的快照。节点产出是过程里的中间值，一次循环就是几十件 */
 export const isEvidence = (kind: string): boolean => kind !== 'node_output'
 
-/** 三种时长写进 title：「墙钟 1 分 27 秒 · 执行 7.6 s · 等人 1 分 14 秒」 */
+/** 三种时长写进 title：「总时长 1 分 27 秒 · 执行时长 7.6 s · 等待审批 1 分 14 秒」 */
 export function timingTitle(t: RunTiming): string {
   const parts = [
-    `墙钟 ${formatSpan(t.wallMs)}`,
-    `执行 ${formatSpan(t.activeMs)}`,
-    `等人 ${formatSpan(t.waitMs)}`,
+    `总时长 ${formatSpan(t.wallMs)}`,
+    `执行时长 ${formatSpan(t.activeMs)}`,
+    `等待审批 ${formatSpan(t.waitMs)}`,
   ]
   const note = t.source === 'stamps'
-    ? '（老数据：墙钟按创建和结束时间推算，没有分段计时）'
+    ? '（总时长按创建与结束时间推算，无分段计时）'
     : t.source === 'last'
-      ? '（老数据：只记了最后一段执行时长）'
+      ? '（仅记录了最后一段执行时长）'
       : ''
   return parts.join(' · ') + note
 }

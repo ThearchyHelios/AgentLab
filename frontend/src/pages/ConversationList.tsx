@@ -132,8 +132,8 @@ export function ConversationList() {
           <input
             type="search"
             className="field h-7 w-full pl-7 text-xs"
-            placeholder="找对话…"
-            aria-label="按标题或问过的话找对话"
+            placeholder="搜索对话…"
+            aria-label="按标题或提问内容搜索对话"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Escape' && !isComposing(e)) setQuery('') }}
@@ -145,7 +145,7 @@ export function ConversationList() {
         {!list.length && loading && <Skeleton rows={6} height={30} gap={8} className="px-1.5 pt-1" />}
         {!list.length && !loading && !!error && (
           <div className="px-2 py-4 text-2xs leading-relaxed text-faint" role="alert">
-            <div className="text-xs text-dim">对话列表没取回来</div>
+            <div className="text-xs text-dim">对话列表加载失败</div>
             <div className="mt-0.5">{humanizeError(error).title}</div>
             <button className="btn btn-xs mt-2" onClick={() => void load()}>
               <RotateCw size={11} /> 重试
@@ -153,11 +153,11 @@ export function ConversationList() {
           </div>
         )}
         {!list.length && !loading && !error && !query && (
-          <p className="px-2 py-4 text-2xs text-faint">还没有对话。在右边问第一句，就会出现在这里。</p>
+          <p className="px-2 py-4 text-2xs text-faint">暂无对话。在右侧提出第一个问题后，对话会显示在这里。</p>
         )}
         {!shown.length && !!query.trim() && (
           <p className="px-2 py-4 text-2xs leading-relaxed text-faint">
-            没有标题或问题里带「{query.trim()}」的对话
+            没有标题或问题中包含「{query.trim()}」的对话
           </p>
         )}
         {groups.map((g) => (
@@ -207,7 +207,7 @@ export function ConversationList() {
                         </div>
                         <div className="mt-px truncate text-2xs text-faint">
                           {live && <StatusText code={live} tail={c.turn_count > 0} />}
-                          {c.turn_count > 0 ? `${c.turn_count} 轮` : live ? '' : '还没问过'}
+                          {c.turn_count > 0 ? `${c.turn_count} 轮` : live ? '' : '尚未提问'}
                         </div>
                       </button>
                       {/* 操作浮在右侧，悬停或键盘聚焦时才出现，不占标题的宽度 */}
@@ -216,7 +216,7 @@ export function ConversationList() {
                                     icon={<Pencil size={11} />} onClick={() => setEditing(c.id)} />
                         {/* 正在跑的不给删：底下还挂着一条事件流和一个真在跑、在计费的运行 */}
                         <IconButton size="md" className="btn-xs" label={`删除「${c.title}」`}
-                                    title={running ? RUNNING_NO_DELETE : '删除（先放进回收站）'}
+                                    title={running ? RUNNING_NO_DELETE : '删除（移至回收站）'}
                                     disabled={running} icon={<Trash2 size={11} />} onClick={() => void drop(c)} />
                       </RowActions>
                     </>
@@ -231,7 +231,7 @@ export function ConversationList() {
       <div className="shrink-0 border-t px-1.5 py-1.5">
         <button
           className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-faint transition-colors hover:bg-hover hover:text-dim"
-          title="删掉的对话在这里，可以恢复"
+          title="已删除的对话，可在此恢复"
           aria-label={`打开回收站${trash.length ? `（${trash.length} 个对话）` : ''}`}
           onClick={() => setShowTrash(true)}
         >
@@ -331,11 +331,11 @@ function TrashView({ items, currentId, onBack }: {
     const rounds = first.doomed.reduce((n, c) => n + (c.turn_count || 0), 0)
     const ok = await confirmDialog({
       title: '清空回收站？',
-      body: `里面的 ${first.doomed.length} 个对话会被彻底删除，删除后找不回来。`,
+      body: `其中的 ${first.doomed.length} 个对话将被彻底删除，删除后无法恢复。`,
       consequences: [
-        ...(rounds ? [`一共 ${rounds} 轮问答和它们的结论`] : []),
-        ...(first.kept.length ? [`${titles(first.kept)}正在运行，这次不删，留在回收站里`] : []),
-        '跑过的运行记录不受影响，还在「记录」页',
+        ...(rounds ? [`共 ${rounds} 轮问答及其结论`] : []),
+        ...(first.kept.length ? [`${titles(first.kept)}正在运行，本次不删除，保留在回收站中`] : []),
+        '已有的运行记录不受影响，仍可在「记录」页查看',
       ],
       confirmLabel: '全部删除',
       danger: true,
@@ -347,9 +347,9 @@ function TrashView({ items, currentId, onBack }: {
     const left = new Set(useConversations.getState().trash.map((c) => c.id))
     for (const id of ids) if (!left.has(id)) useChat.getState().forget(id)
     if (currentId && ids.includes(currentId) && !left.has(currentId)) navigate('/chat', { replace: true })
-    if (failed) toast.error(`有 ${failed} 个对话没删掉，稍后再试一次`)
-    else if (kept.length) toast.info(`删掉了 ${ids.length} 个；${titles(kept)}正在运行，留在回收站里，停下来之后再删`)
-    else toast.ok('回收站清空了')
+    if (failed) toast.error(`有 ${failed} 个对话删除失败，请稍后重试`)
+    else if (kept.length) toast.info(`已删除 ${ids.length} 个；${titles(kept)}正在运行，暂留在回收站中，停止后可删除`)
+    else toast.ok('回收站已清空')
   }
 
   return (
@@ -359,18 +359,18 @@ function TrashView({ items, currentId, onBack }: {
         <h2 className="min-w-0 flex-1 truncate text-xs font-semibold">回收站</h2>
         {items.length > 0 && (
           <button className="btn btn-xs btn-ghost text-[var(--err)]" aria-label="清空回收站"
-                  disabled={!idle.length} title={idle.length ? undefined : '回收站里的对话正在运行，先停下来再删'}
+                  disabled={!idle.length} title={idle.length ? undefined : '回收站中的对话正在运行，请先停止再删除'}
                   onClick={() => void emptyAll()}>
             清空
           </button>
         )}
       </div>
       <p className="px-3 pb-1 pt-2 text-2xs leading-relaxed text-faint">
-        删掉的对话先放在这里。恢复后回到列表；彻底删除后就找不回来了。
+        已删除的对话暂存在这里。恢复后回到列表；彻底删除后无法恢复。
       </p>
       <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
         {!items.length && (
-          <p className="px-2 py-4 text-2xs leading-relaxed text-faint">回收站是空的。</p>
+          <p className="px-2 py-4 text-2xs leading-relaxed text-faint">回收站为空。</p>
         )}
         {sorted.map((c) => {
           const active = c.id === currentId
@@ -397,7 +397,7 @@ function TrashView({ items, currentId, onBack }: {
                 </div>
                 <div className="mt-px truncate text-2xs text-faint">
                   {live && <StatusText code={live} tail={c.turn_count > 0} />}
-                  {c.turn_count > 0 ? `${c.turn_count} 轮` : live ? '' : '还没问过'}
+                  {c.turn_count > 0 ? `${c.turn_count} 轮` : live ? '' : '尚未提问'}
                 </div>
               </button>
               <RowActions>
@@ -443,14 +443,14 @@ export async function restoreConversation(c: Conversation, navigate: NavigateFun
 export async function purgeConversation(c: Conversation, navigate: NavigateFunction): Promise<boolean> {
   const title = c.title || '新对话'
   const running = () => stillRunning(c, useChat.getState().byConversation[c.id])
-  const refuse = () => { toast.info(`「${title}」正在运行，先停下来再删`); return false }
+  const refuse = () => { toast.info(`「${title}」正在运行，请先停止再删除`); return false }
   if (running()) return refuse()
   const ok = await confirmDialog({
     title: `彻底删除「${title}」？`,
-    body: '删除后找不回来。',
+    body: '删除后无法恢复。',
     consequences: [
-      ...(c.turn_count ? [`${c.turn_count} 轮问答和它们的结论一起删除`] : []),
-      '跑过的运行记录不受影响，还在「记录」页',
+      ...(c.turn_count ? [`${c.turn_count} 轮问答及其结论将一并删除`] : []),
+      '已有的运行记录不受影响，仍可在「记录」页查看',
     ],
     confirmLabel: '彻底删除',
     danger: true,
@@ -499,7 +499,7 @@ export function stillRunning(c: Conversation, turns: ChatTurn[] | undefined): bo
   return turns ? !!busyTurn(turns) : c.last_status === 'running'
 }
 
-export const RUNNING_NO_DELETE = '这个对话正在运行，先停下来再删'
+export const RUNNING_NO_DELETE = '该对话正在运行，请先停止再删除'
 
 const titles = (list: Conversation[]) => list.map((c) => `「${c.title || '新对话'}」`).join('、')
 

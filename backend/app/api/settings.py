@@ -155,7 +155,7 @@ async def create_provider(
         await session.execute(select(Provider).where(Provider.name == payload.name))
     ).scalar_one_or_none()
     if exists:
-        raise HTTPException(409, f"已经有叫「{payload.name}」的模型接入了，换个名字")
+        raise HTTPException(409, f"已存在名为「{payload.name}」的模型接入，请换一个名称")
 
     row = Provider(
         name=payload.name,
@@ -181,7 +181,7 @@ async def update_provider(
 ) -> ProviderOut:
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
+        raise HTTPException(404, "模型接入不存在，可能已被删除")
 
     data = payload.model_dump(exclude_unset=True)
     before, last = _connection(row), (row.extra or {}).get(LAST_CHECK)
@@ -210,7 +210,7 @@ async def delete_provider(
 ) -> None:
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
+        raise HTTPException(404, "模型接入不存在，可能已被删除")
     await session.delete(row)
     await session.commit()
 
@@ -223,9 +223,9 @@ class TestIn(BaseModel):
 def _config_problem(kind: str, base_url: str | None) -> str | None:
     """保存或测试前就能看出来的配置错误。"""
     if kind not in {k["kind"] for k in catalog.PROVIDER_KINDS}:
-        return f"不认识「{kind}」这种接入类型"
+        return f"不支持「{kind}」接入类型"
     if kind == "openai_compatible" and not (base_url or "").strip():
-        return "「OpenAI 兼容」必须填 Base URL，例如 https://api.deepseek.com/v1"
+        return "「OpenAI 兼容」必须填写 Base URL，例如 https://api.deepseek.com/v1"
     return None
 
 
@@ -243,16 +243,16 @@ async def _try_model(provider: Provider, model: str | None, prompt: str) -> dict
 
     model = model or provider.default_model
     if not model:
-        return {"ok": False, "error": "还没有可测的模型",
-                "hint": "先在「可选模型」里加一个，或者填上默认模型", "detail": ""}
+        return {"ok": False, "error": "没有可测试的模型",
+                "hint": "请先在「可选模型」中添加一个，或填写默认模型", "detail": ""}
     try:
         chat = build_chat_model(provider, ModelSpec(model=model, max_tokens=256,
                                                     timeout=_TEST_TIMEOUT))
     except ProviderNotConfigured as e:
-        if "API Key" in str(e):
-            return {"ok": False, "error": "还没有填 API Key",
-                    "hint": "填上 Key 再测；也可以在后端的环境变量里配", "detail": str(e)}
-        return {"ok": False, "error": not_configured(e), "hint": "", "detail": str(e)}
+        if e.code == "missing_key":
+            return {"ok": False, "error": "尚未填写 API Key",
+                    "hint": "请填写 API Key 后再测试，也可在服务端的环境变量中配置", "detail": str(e)}
+        return {"ok": False, "error": not_configured(e, with_hint=False), "hint": "", "detail": str(e)}
 
     started = time.perf_counter()
     try:
@@ -260,7 +260,7 @@ async def _try_model(provider: Provider, model: str | None, prompt: str) -> dict
             reply = await chat.ainvoke(prompt)
     except Exception as e:  # noqa: BLE001
         reason, hint = explain(e)
-        return {"ok": False, "error": f"测试没通过：{reason}", "hint": hint, "detail": raw(e),
+        return {"ok": False, "error": f"测试未通过：{reason}", "hint": hint, "detail": raw(e),
                 "model": model}
 
     usage = getattr(reply, "usage_metadata", None) or {}
@@ -280,7 +280,7 @@ async def test_provider(
     """真发一次请求验证配置。设置页的"测试连接"按钮调它。"""
     row = await session.get(Provider, provider_id)
     if not row:
-        raise HTTPException(404, "这个模型接入不存在，可能已经被删了")
+        raise HTTPException(404, "模型接入不存在，可能已被删除")
     result = await _try_model(row, payload.model, payload.prompt)
     # 只记默认模型的结果：拿别的模型测出 invalid_model，不等于这个接入连不上
     if (payload.model or row.default_model) == row.default_model:
@@ -406,7 +406,7 @@ async def probe_provider_models(
             data = resp.json()
     except Exception as e:  # noqa: BLE001
         reason, hint = explain(e)
-        return {"ok": False, "error": f"没拿到模型列表：{reason}", "hint": hint,
+        return {"ok": False, "error": f"未能获取模型列表：{reason}", "hint": hint,
                 "detail": raw(e), "models": [], "url": url}
     models = [m.get("id", "") for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")]
     return {"ok": True, "models": models, "url": url}

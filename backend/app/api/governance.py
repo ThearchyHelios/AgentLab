@@ -29,7 +29,7 @@ async def tool_usage(
     """
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
-        raise HTTPException(404, "这个工作流不存在，可能已经被删了")
+        raise HTTPException(404, "工作流不存在，可能已被删除")
     spec = GraphSpec.model_validate(workflow.graph)
 
     # 各节点声明的白名单
@@ -83,7 +83,7 @@ async def tool_usage(
         "workflow_id": workflow_id,
         "runs_considered": len(run_ids),
         "nodes": report,
-        "hint": "授权了却很多轮都没用过的工具，是白名单在慢慢放宽的信号，考虑从节点里摘掉",
+        "hint": "授权后多次运行都未使用的工具说明授权范围偏宽，建议从节点中移除",
     }
 
 
@@ -147,5 +147,5 @@ async def exploratory_clusters(
     return {
         "clusters": out,
         "considered": len(items),
-        "hint": "标为晋升候选的问题反复出现，考虑用「提取模板」把它固定成工作流里的一步",
+        "hint": "被标记为可固化的问题反复出现，建议用「提取模板」把它固定为工作流中的一步",
     }

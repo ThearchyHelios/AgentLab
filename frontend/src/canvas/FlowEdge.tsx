@@ -112,7 +112,7 @@ export function FlowEdge({
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
               ...(loopBadge ? {} : labelStyle),
             }}
-            title={loopBadge ? '回边：循环体跑完一轮，回到循环头' : undefined}
+            title={loopBadge ? '循环回路：循环体每执行完一轮后返回循环起点' : undefined}
           >
             {loopBadge ? <>↺{view?.loops ? ` ×${view.loops}` : ''}</> : label}
           </div>

@@ -51,10 +51,10 @@ export interface PageDef {
 // ⌥ + 数字切页：不和浏览器的 ⌘1–9（切标签页，页面拦不住）撞，也不和画布上的
 // Backspace / Delete 以及各处输入框打架——「g c」这类两键序列就是栽在这上面
 export const PAGES: PageDef[] = [
-  { to: '/chat', label: '问数据', hint: '说需求，自动接数据源、搭工作流、跑出结论', icon: MessageSquare, shortcut: 'Alt+1', keywords: 'chat ask 对话 提问 首页' },
-  { to: '/studio', label: '编排', hint: '在画布上搭工作流、调试、发布', icon: FlaskConical, shortcut: 'Alt+2', keywords: 'studio canvas 画布 工作流 workflow' },
+  { to: '/chat', label: '问数据', hint: '描述需求，自动接入数据源、构建工作流并给出结论', icon: MessageSquare, shortcut: 'Alt+1', keywords: 'chat ask 对话 提问 首页' },
+  { to: '/studio', label: '编排', hint: '在画布上构建、调试和发布工作流', icon: FlaskConical, shortcut: 'Alt+2', keywords: 'studio canvas 画布 工作流 workflow' },
   { to: '/runs', label: '记录', hint: '每次运行的过程、成果和待审批', icon: History, shortcut: 'Alt+3', keywords: 'runs history 运行 运行记录 历史 审批' },
-  { to: '/data', label: '数据', hint: '接入数据库和表格，问数据和工作流从这里取数', icon: Database, shortcut: 'Alt+4', keywords: 'data datasource 数据源 数据库 表格 excel csv' },
+  { to: '/data', label: '数据', hint: '接入数据库和表格，供问数据和工作流查询', icon: Database, shortcut: 'Alt+4', keywords: 'data datasource 数据源 数据库 表格 excel csv' },
   { to: '/tools', label: '工具', hint: '工具库、沙箱试验台、自定义工具、MCP', icon: Wrench, shortcut: 'Alt+5', keywords: 'tools mcp sandbox 沙箱 函数' },
   { to: '/knowledge', label: '知识', hint: '知识库、长期记忆、方法论 Skill', icon: BookOpen, shortcut: 'Alt+6', keywords: 'knowledge kb memory skill 知识库 记忆 文档' },
   { to: '/settings', label: '设置', hint: '模型接入、偏好、运行环境', icon: Settings, shortcut: 'Alt+7', keywords: 'settings provider 模型 署名 主题 偏好' },
@@ -116,7 +116,7 @@ export async function setThemePref(pref: ThemePref): Promise<void> {
   } catch (e) {
     const offline = e instanceof ApiError && e.kind === 'network'
     toast.warn(
-      offline ? '主题先在这台设备上生效：连上后端后自动存进设置' : '主题只在这台设备上生效：没能存进设置',
+      offline ? '主题已在本设备生效，连接服务端后将自动保存到设置' : '主题仅在本设备生效，未能保存到设置',
       { detail: errorMessage(e), key: 'theme-save' },
     )
   }
@@ -156,13 +156,13 @@ export async function toggleNotify(): Promise<void> {
     return
   }
   const permission = await enableNotify()
-  if (permission === 'granted') toast.ok('后台提醒已开启：标签页在后台时，运行结束、失败或来了新的待审批会发系统通知')
+  if (permission === 'granted') toast.ok('后台提醒已开启：标签页在后台时，运行结束、失败或有新的待审批将发送系统通知')
   else if (permission === 'denied') {
-    toast.warn('浏览器拒绝了通知权限', {
-      detail: '在地址栏左侧的站点设置里把「通知」改成允许，再回来打开这个开关。',
+    toast.warn('浏览器已拒绝通知权限', {
+      detail: '请在地址栏左侧的站点设置中将「通知」改为允许，然后重新打开此开关。',
       key: 'notify-denied',
     })
-  } else if (permission === 'unsupported') toast.warn('这个浏览器不支持系统通知')
+  } else if (permission === 'unsupported') toast.warn('当前浏览器不支持系统通知')
 }
 
 export async function newConversation(navigate: NavigateFunction): Promise<void> {
@@ -205,7 +205,7 @@ const GROUPS: { key: GroupKey; label: string; idle: number }[] = [
   { key: 'approvals', label: '待审批', idle: 3 },
   { key: 'pages', label: '页面', idle: 9 },
   { key: 'actions', label: '动作', idle: 6 },
-  { key: 'conversations', label: '最近会话', idle: 4 },
+  { key: 'conversations', label: '最近对话', idle: 4 },
   { key: 'runs', label: '最近运行', idle: 4 },
   { key: 'workflows', label: '工作流', idle: 6 },
 ]
@@ -333,7 +333,7 @@ function PaletteView() {
         hint: [a.workflow_name && runName(a), a.node_label, shortId(a.run_id)].filter(Boolean).join(' · '),
         keywords: `审批 approval 待办 ${a.run_id}`,
         icon: <Hourglass size={14} />,
-        meta: waited && <span title={formatDateTime(a.created_at)}>已等 {waited}</span>,
+        meta: waited && <span title={formatDateTime(a.created_at)}>已等待 {waited}</span>,
         run: go(`/runs/${a.run_id}`),
       })
     }
@@ -346,7 +346,7 @@ function PaletteView() {
       if (p.to === '/runs' && pending.length) {
         list.push({
           id: 'page:approvals', group: 'pages', label: `待审批（${pending.length}）`,
-          hint: '所有等人处理的审批卡', keywords: 'approvals 审批 待办 记录',
+          hint: '所有待处理的审批卡', keywords: 'approvals 审批 待办 记录',
           icon: <Hourglass size={14} />, run: go('/runs?tab=approvals'),
         })
       }
@@ -354,12 +354,12 @@ function PaletteView() {
 
     list.push(
       {
-        id: 'act:new-chat', group: 'actions', label: '新对话', hint: '在问数据里从头开始问',
+        id: 'act:new-chat', group: 'actions', label: '新对话', hint: '在问数据中开始新的对话',
         keywords: 'new chat conversation 会话 对话 新建', icon: <MessageSquarePlus size={14} />,
         run: () => void newConversation(navigate),
       },
       {
-        id: 'act:new-workflow', group: 'actions', label: '新建工作流', hint: '起手是一个输入、一个成果',
+        id: 'act:new-workflow', group: 'actions', label: '新建工作流', hint: '初始包含一个输入节点和一个成果节点',
         keywords: 'new workflow 画布 编排 创建', icon: <Plus size={14} />,
         run: () => void newWorkflow(navigate),
       },
@@ -385,7 +385,7 @@ function PaletteView() {
     if (notifySupported()) {
       list.push({
         id: 'act:notify', group: 'actions', label: notify ? '关闭后台提醒' : '开启后台提醒',
-        hint: '标签页在后台时，运行结束、失败或来了新的待审批就发系统通知',
+        hint: '标签页在后台时，运行结束、失败或有新的待审批将发送系统通知',
         keywords: 'notification 通知 提醒 后台', icon: notify ? <BellOff size={14} /> : <Bell size={14} />,
         run: () => void toggleNotify(),
       })
@@ -508,8 +508,8 @@ function PaletteView() {
             aria-controls={listId}
             aria-autocomplete="list"
             aria-activedescendant={flat.length ? optionId(current) : undefined}
-            aria-label="搜索页面、工作流、运行、会话或命令"
-            placeholder="去哪、做什么……搜页面、工作流、运行、会话"
+            aria-label="搜索页面、工作流、运行、对话或命令"
+            placeholder="搜索页面、工作流、运行、对话或命令"
             className="h-full min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -577,7 +577,7 @@ function PaletteView() {
           {!flat.length && (
             <div className="px-4 py-10 text-center">
               <div className="text-sm text-dim">没有匹配「{query.trim()}」的结果</div>
-              <div className="mt-1 text-xs text-faint">试试页面名、工作流名，或者「主题」「快捷键」「新对话」</div>
+              <div className="mt-1 text-xs text-faint">可搜索页面名称、工作流名称，或输入「主题」「快捷键」「新对话」</div>
             </div>
           )}
         </div>
@@ -644,9 +644,9 @@ function studioShortcuts(): { rows: ShortcutRow[]; fromStudio: boolean } {
 }
 
 const GLOBAL_ROWS: ShortcutRow[] = [
-  { keys: ['Mod+K'], label: '命令面板：跳页面、打开工作流 / 运行 / 会话' },
-  { keys: ['?'], label: '快捷键说明（就是这里）' },
-  ...PAGES.map((p) => ({ keys: [p.shortcut], label: `去「${p.label}」` })),
+  { keys: ['Mod+K'], label: '命令面板：切换页面，打开工作流、运行或对话' },
+  { keys: ['?'], label: '快捷键说明' },
+  ...PAGES.map((p) => ({ keys: [p.shortcut], label: `前往「${p.label}」` })),
   { keys: ['Esc'], label: '关闭弹窗和浮层' },
 ]
 
@@ -712,7 +712,7 @@ export function ShortcutHelp() {
       title="编排页"
       rows={studio.rows}
       here={onStudio}
-      note={studio.fromStudio ? undefined : '画布上的快捷键以按钮提示为准；这里列的是编排页目前已经支持的。'}
+      note={studio.fromStudio ? undefined : '画布上的快捷键以按钮提示为准；此处列出编排页当前支持的快捷键。'}
     />
   )
   return (
@@ -729,7 +729,7 @@ export function ShortcutHelp() {
         <ShortcutSection title="问数据" rows={CHAT_ROWS} here={onChat} />
       </div>
       <p className="mt-5 border-t border-hairline pt-3 text-2xs leading-relaxed text-faint">
-        按 {isMac ? 'macOS' : 'Windows / Linux'} 的键位显示。焦点在输入框里时，除了 <Kbd combo="Mod+K" /> 之外的快捷键都让给打字。
+        按 {isMac ? 'macOS' : 'Windows / Linux'} 的键位显示。焦点在输入框中时，除 <Kbd combo="Mod+K" /> 外的快捷键均不生效。
       </p>
     </Modal>
   )

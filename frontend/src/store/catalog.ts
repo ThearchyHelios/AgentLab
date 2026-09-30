@@ -7,7 +7,7 @@ import type { Approval, DataSource, Provider, Skill, ToolInfo, Workflow } from '
  * 后端连没连上。
  *
  * 之前 refresh 对每个请求 `.catch(() => [])`，然后照样 loaded:true——后端挂了，
- * 整站显示「还没有工作流 / 还没有接入数据源」并引导新建。在工业场景里这等于告诉
+ * 整站显示「还没有工作流 / 还没有接入数据源」并引导新建。这等于告诉
  * 用户"你的数据没了"，还会诱发重复配置。空和断必须分得开。
  */
 export type BackendState = 'checking' | 'ok' | 'down'

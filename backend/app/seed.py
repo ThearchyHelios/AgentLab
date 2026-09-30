@@ -38,7 +38,7 @@ def _e(source: str, target: str, handle: str | None = None) -> dict[str, Any]:
 TEMPLATES: list[dict[str, Any]] = [
     {
         "name": "① 最小问答",
-        "description": "一个模型节点跑通全流程。先从这个开始改。",
+        "description": "用一个「模型调用」节点完成从输入到成果的完整流程，适合作为起点。",
         "tags": ["入门"],
         "nodes": [
             _n("start", "input", "提问", fields=[{"name": "question", "required": True,
@@ -51,8 +51,8 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "② 研究助手（Agent + 工具）",
-        "description": "Agent 自主决定搜什么、抓哪篇，再汇总成带出处的简报。",
-        "tags": ["agent", "工具"],
+        "description": "Agent 自主决定搜索和抓取哪些网页，再汇总成带出处的简报。",
+        "tags": ["Agent", "工具"],
         "nodes": [
             _n("start", "input", "研究主题", fields=[{"name": "topic", "required": True}]),
             _n("research", "agent", "调研 Agent",
@@ -73,15 +73,15 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "③ 带人工审批的发布流",
-        "description": "起草 → 人工把关 → 通过就发布、驳回就改写。演示中断与断点恢复。",
+        "description": "起草 → 人工审批 → 批准即发布、驳回则改写。演示运行中断与断点恢复。",
         "tags": ["人工审批", "分支"],
         "nodes": [
             _n("start", "input", "主题", fields=[{"name": "topic", "required": True}]),
             _n("draft", "llm", "起草", system="你是品牌文案。",
                prompt="为「{{ input.topic }}」写一条 100 字以内的对外公告。",
                assign_to="draft"),
-            _n("review", "human", "人工把关", mode="approve",
-               title="这条公告可以发吗？",
+            _n("review", "human", "人工审批", mode="approve",
+               title="是否批准发布这条公告？",
                message="草稿：\n\n{{ vars.draft }}"),
             _n("publish", "transform", "标记发布", mode="template",
                template="✅ 已批准发布\n\n{{ vars.draft }}", assign_to="final"),
@@ -100,14 +100,14 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "④ 知识库问答（RAG）",
-        "description": "先检索再回答，检索不到就明说。需要先在知识库页上传文档。",
+        "description": "先检索再回答，检索不到时明确告知。使用前请在知识库页上传文档。",
         "tags": ["RAG", "知识库"],
         "nodes": [
             _n("start", "input", "提问", fields=[{"name": "question", "required": True},
                 {"name": "collection", "default": "default"}]),
             _n("search", "retrieve", "检索知识库", query="{{ input.question }}",
                collection="{{ input.collection }}", limit=5, alpha=0.5, assign_to="context"),
-            _n("gate", "branch", "检索到东西了吗", mode="expression",
+            _n("gate", "branch", "是否检索到内容", mode="expression",
                cases=[{"key": "hit", "condition": "nodes.search.count > 0", "label": "有命中"}]),
             _n("answer", "llm", "基于资料回答",
                system="只根据提供的资料回答，每句话后面用 [编号] 标注依据。资料不足就直接说不确定。",
@@ -127,8 +127,8 @@ TEMPLATES: list[dict[str, Any]] = [
         ],
     },
     {
-        "name": "⑤ 写代码跑数据（沙箱 + 校验）",
-        "description": "模型写 Python，沙箱里真跑，输出还要过 JSON Schema 校验，不合格自动返工。",
+        "name": "⑤ 代码数据处理（沙箱 + 校验）",
+        "description": "模型编写 Python 代码并在沙箱中执行，输出经 JSON Schema 校验，不合格时自动重试。",
         "tags": ["沙箱", "结构化"],
         "nodes": [
             _n("start", "input", "分析需求", fields=[
@@ -152,7 +152,7 @@ TEMPLATES: list[dict[str, Any]] = [
     {
         "name": "⑥ 多 Agent 协作",
         "description": "调度者按进展分派任务给研究员、批评家和写手，直到目标达成。",
-        "tags": ["多agent"],
+        "tags": ["多 Agent"],
         "nodes": [
             _n("start", "input", "目标", fields=[{"name": "goal", "required": True}]),
             _n("team", "supervisor", "协作团队", goal="{{ input.goal }}", max_rounds=6,
@@ -175,8 +175,8 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "⑧ 周报（口径卡 + 三档出具）",
-        "description": "模板定骨架、agent 填关节的完整示范：取数固定、口径卡算数、"
-        "叙述只许引用清单里的数、出具时逐数回指——现编的数字会被点名并降档。",
+        "description": "用口径卡计算指标、按出具契约三档出具的示例：取数固定，报告只能引用指标清单中的数字，"
+        "出具时逐一核对，无法核对的数字会被标出并降档出具。",
         "tags": ["出具", "口径卡", "周报"],
         "nodes": [
             _n("start", "input", "周期", fields=[
@@ -230,12 +230,9 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "⑨ 可追溯周报",
-        "description": "报告里的每个数都点得开出处：tool 节点查库、口径卡登记指标、报告撰写节点只写引用"
-        "标记，数字由系统从口径卡取出来渲染，出口按引用逐段核对后三档出具。取数节点查的是示例数据源 "
-        "shop 的 orders 表（week、amount、refunded 三列）：先接入你的库（或者上传一张表格、命名为 "
-        "shop），再把 SQL 换成你的口径。报告撰写节点按受管要求写明了 on_violation: fail 和 claims: "
-        "require_citation：探索运行里修不掉的数字违规也会让报告节点失败，而不只是标出来；正式运行里没挂引用"
-        "的结论句计入缺口、按档降级。",
+        "description": "报告中的每个数字都可追溯出处：「调用工具」节点查询数据，口径卡登记指标，报告撰写节点只写"
+        "引用标记，数字由系统填入，成果节点按引用逐段核对后三档出具。使用前请接入名为 shop 的数据源（含 orders "
+        "表的 week、amount、refunded 列），或上传同名表格，再按你的口径修改 SQL。报告撰写节点已按受管级别设置核对规则。",
         "tags": ["出具", "口径卡", "周报", "证据"],
         "nodes": [
             _n("start", "input", "周期", fields=[
@@ -290,7 +287,7 @@ TEMPLATES: list[dict[str, Any]] = [
     },
     {
         "name": "⑦ 批量处理（循环）",
-        "description": "对列表逐项处理再汇总。演示 loop 节点的 body / done 两个出口怎么接。",
+        "description": "对列表逐项处理后汇总，演示「循环」节点「循环体」和「结束」两个出口的连法。",
         "tags": ["循环"],
         "nodes": [
             _n("start", "input", "条目列表", fields=[
@@ -333,7 +330,7 @@ SKILLS: list[dict[str, Any]] = [
     },
     {
         "name": "批判性审阅",
-        "description": "挑毛病而不是夸奖",
+        "description": "只指出问题，不复述优点",
         "instructions": (
             "审阅内容时：\n"
             "1. 只指出问题，不要复述优点\n"
@@ -345,7 +342,7 @@ SKILLS: list[dict[str, Any]] = [
     },
     {
         "name": "中文写作",
-        "description": "干净、不翻译腔的中文",
+        "description": "简洁自然、避免翻译腔的中文",
         "instructions": (
             "写中文时：\n"
             "1. 不用「进行」「作出」这类空动词，直接用实义动词\n"
@@ -369,7 +366,7 @@ async def seed_defaults() -> None:
         if count == 0:
             session.add(
                 Provider(
-                    name="Mock（无需 Key）",
+                    name="演示模型（无需 API Key）",
                     kind="mock",
                     models=catalog.MOCK_MODELS,
                     default_model="mock-fast",

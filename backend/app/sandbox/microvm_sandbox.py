@@ -141,15 +141,15 @@ class MicroVMSandbox(Sandbox):
                 "network": "partial",
             },
             "limits_note": (
-                "内存/CPU/进程表由内核边界强制执行（超限进程被 OOM killer 杀掉，VM 存活）。"
-                "网络只能算部分生效：HTTP/HTTPS 与域名解析可断，但 UDP/53 拦不住，"
-                "DNS 隧道外泄通道仍然开着。"
+                "内存、CPU、进程表由内核边界强制限制（超限进程会被 OOM killer 终止，VM 保持运行）。"
+                "网络隔离仅部分生效：可切断 HTTP/HTTPS 与域名解析，但无法拦截 UDP/53，"
+                "存在经 DNS 隧道外泄数据的风险。"
             ),
             "image": self._image,
             "image_cached": cached,
             "live_vms": len(self._leases),
-            **({} if installed else {"error": "运行时未就绪（await microsandbox.install()，约 50MB）"}),
-            **({} if cached else {"first_run_cost": "镜像未缓存，首次启动需拉取（本机实测约 55s）"}),
+            **({} if installed else {"error": "运行时未就绪（await microsandbox.install()，约 50 MB）"}),
+            **({} if cached else {"first_run_cost": "镜像未缓存，首次启动需要拉取镜像（约 55 秒）"}),
         }
 
     # ---------------- 会话（长驻 VM）----------------
@@ -279,8 +279,8 @@ class MicroVMSandbox(Sandbox):
             return ExecResult(
                 ok=False, backend=self.name, timed_out=True,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"microVM 启动超过 {settings.microvm_boot_timeout}s"
-                      + ("" if self.image_ready() else "（镜像未缓存，首次需拉取约 55s）"),
+                error=f"microVM 启动超过 {settings.microvm_boot_timeout} 秒"
+                      + ("" if self.image_ready() else "（镜像未缓存，首次启动需要拉取镜像，约 55 秒）"),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("microVM 启动失败：%s", raw(e))
@@ -299,7 +299,7 @@ class MicroVMSandbox(Sandbox):
                     return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
                 data = content.encode()
                 if len(data) > _MAX_FILE_BYTES:
-                    return ExecResult(ok=False, backend=self.name, error=f"{rel} 超过 8MB 上限")
+                    return ExecResult(ok=False, backend=self.name, error=f"{rel} 超过 8 MB 上限")
                 target = f"{_WORKDIR}/{rel}"
                 if "/" in rel:
                     try:
@@ -328,7 +328,7 @@ class MicroVMSandbox(Sandbox):
                 ok=False, backend=self.name, timed_out=True, exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 session_reset=not killed,
-                error=f"执行超过 {limits.timeout}s 被终止"
+                error=f"执行超过 {limits.timeout} 秒，已终止"
                       + ("" if killed else "；VM 已重置，该会话之前写的文件已丢失"),
             )
         except Exception as e:  # noqa: BLE001
@@ -336,7 +336,7 @@ class MicroVMSandbox(Sandbox):
             return ExecResult(
                 ok=False, backend=self.name,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"microVM 里的执行中断了：{describe_exception(e)}",
+                error=f"microVM 中的执行意外中断：{describe_exception(e)}",
             )
         finally:
             if ephemeral:
@@ -359,7 +359,7 @@ class MicroVMSandbox(Sandbox):
         error = None
         if exit_code < 0 and not stderr.strip():
             error = (f"进程被内核终止（退出码 {exit_code}），"
-                     f"最常见的原因是超过了 {limits.memory_mb}MB 内存上限")
+                     f"最常见的原因是超过了 {limits.memory_mb} MB 内存上限")
 
         written: list[str] = []
         if not ephemeral:

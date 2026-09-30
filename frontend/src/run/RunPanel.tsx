@@ -87,8 +87,8 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         always && trustKey
           ? TOOL_TRUST_TEXT.alwaysDone(trustKey)
           : approved
-          ? '已放行，运行继续'
-          : approveMode ? '已驳回，走驳回那条出口' : '已驳回，本次运行终止',
+          ? '已批准，运行继续'
+          : approveMode ? '已驳回，转入驳回分支' : '已驳回，本次运行终止',
         'ok',
       )
     } catch (e) {
@@ -103,7 +103,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
     <div className="fade-up border-b p-3 last:border-b-0" data-approval={approval.id}
          style={{ background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
       <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold" style={{ color: 'var(--warn)' }}>
-        <Hand size={13} aria-hidden /> {approval.title || '需要你确认'}
+        <Hand size={13} aria-hidden /> {approval.title || '待审批'}
       </div>
       <div className="tnum mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs text-dim">
         <span>人工审批</span>
@@ -165,14 +165,14 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
       <input
         className="field mb-2"
         aria-label="备注"
-        placeholder="备注（会传给后续节点）"
+        placeholder="备注（将传递给后续节点）"
         value={note}
         onChange={(e) => setNote(e.target.value)}
       />
 
       <div className="flex gap-2">
         <button className="btn btn-primary flex-1 justify-center" disabled={busy} onClick={() => decide(true)}>
-          <Check size={12} aria-hidden /> {approveMode ? '通过' : '提交'}
+          <Check size={12} aria-hidden /> {approveMode ? '批准' : '提交'}
         </button>
         {trustKey && (
           <button className="btn flex-1 justify-center" disabled={busy} data-approval-always
@@ -188,22 +188,22 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
       {/* 批了会怎样，常显而不是藏在 hover 里：审批人得在按下去之前知道 */}
       <div className="mt-1.5 text-2xs leading-relaxed text-dim">
         {approveMode
-          ? '通过 → 接着往下跑；驳回 → 走「驳回」那条出口'
-          : '提交 → 用你填的内容接着跑；驳回 → 这次运行到此终止'}
+          ? '批准：继续运行；驳回：转入「驳回」分支'
+          : '提交：以你填写的内容继续运行；驳回：终止本次运行'}
       </div>
       {trustKey && (
         <div id={`approval-always-${approval.id}`} className="mt-0.5 text-2xs leading-relaxed text-dim">
-          {TOOL_TRUST_TEXT.alwaysButton} → {TOOL_TRUST_TEXT.alwaysHint(trustKey)}
+          {TOOL_TRUST_TEXT.alwaysButton}：{TOOL_TRUST_TEXT.alwaysHint(trustKey)}
         </div>
       )}
       <div className="mt-1 flex items-center gap-1 text-2xs leading-relaxed"
            style={actor ? { color: 'var(--text-dim)' } : { color: 'var(--st-waiting)' }}>
         <PenLine size={10} aria-hidden className="shrink-0" />
         {actor
-          ? <span>将以「{actor}」签批，写进审批留痕</span>
+          ? <span>将以「{actor}」签批，并记入审批留痕</span>
           : (
             <span>
-              未署名：这次签批不会记录审批人 ·{' '}
+              未署名：本次签批不会记录审批人 ·{' '}
               <Link to="/settings/prefs" className="underline underline-offset-2 hover:text-fg">去设置署名</Link>
             </span>
           )}

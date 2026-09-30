@@ -100,20 +100,20 @@ class RunToolIn(BaseModel):
 
 def _builtin_effect(name: str, args: dict[str, Any]) -> str:
     if name == "file_write":
-        path = args.get("path") or "（没填路径）"
+        path = args.get("path") or "（未填写路径）"
         if args.get("append"):
-            return f"会往 playground 工作目录里的「{path}」追加内容"
-        return f"会在 playground 工作目录里写入「{path}」，同名文件会被覆盖"
+            return f"将向工作目录中的「{path}」追加内容"
+        return f"将在工作目录中写入「{path}」，同名文件会被覆盖"
     if name == "http_request":
-        return (f"会向 {args.get('url') or '（没填地址）'} 发一个 {args.get('method') or 'GET'} 请求"
+        return (f"将向 {args.get('url') or '（未填写地址）'} 发送 {args.get('method') or 'GET'} 请求"
                 "（内网和回环地址会被拦截）")
     if name == "shell_exec":
-        return f"会在沙箱里执行命令：{str(args.get('command') or '')[:120]}"
+        return f"将在沙箱中执行命令：{str(args.get('command') or '')[:120]}"
     if name == "python_exec":
-        return "会在沙箱里执行这段 Python 代码"
+        return "将在沙箱中执行这段 Python 代码"
     if name == "run_code":
         lang = args.get("language") or "python"
-        return f"会在沙箱里执行这段 {lang} 代码" + ("，并且允许联网" if args.get("network") else "")
+        return f"将在沙箱中执行这段 {lang} 代码" + ("，且允许联网" if args.get("network") else "")
     return f"「{name}」有副作用"
 
 
@@ -124,22 +124,22 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
         return _builtin_effect(name, args) if spec.dangerous else None
     if name.startswith("mcp:"):
         server, _, tool = name[4:].partition("/")
-        return (f"会调用 MCP 服务「{server}」上的工具「{tool}」。它是外部进程，"
-                "会做什么由它自己决定，这里预知不了")
+        return (f"将调用 MCP 服务「{server}」上的工具「{tool}」。该工具由外部进程提供，"
+                "具体行为无法预先确定")
     row = (await session.execute(
         select(CustomTool).where(CustomTool.name == name)
     )).scalar_one_or_none()
     if row is not None:
         cfg = row.config or {}
         if row.kind == "http":
-            return (f"会调用自定义接口「{name}」"
-                    f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（没填地址）'}）")
-        return f"会在沙箱里执行自定义工具「{name}」的代码"
+            return (f"将调用自定义接口「{name}」"
+                    f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（未填写地址）'}）")
+        return f"将在沙箱中执行自定义工具「{name}」的代码"
     # 数据源工具：只读源上的查询没有副作用，可写源上的写操作有
     tools = await build_tools([name], ToolContext(run_id="playground", node_id="playground"),
                               session=session)
     if tools and call_is_dangerous(tools[0], name, args):
-        return f"会在可写数据源上执行写操作：{str(args.get('sql') or '')[:120]}"
+        return f"将在可写数据源上执行写操作：{str(args.get('sql') or '')[:120]}"
     return None
 
 
@@ -161,7 +161,7 @@ async def run_tool(
         if effect:
             # 只说后果，不说怎么确认：弹窗还是再点一次是界面的事，写死在这里
             # 放进确认框里读起来就不对
-            raise HTTPException(409, f"{effect}。在工具库里执行不经过审批，确认后才会执行。")
+            raise HTTPException(409, f"{effect}。在工具库中执行不经过审批，确认后才会执行。")
 
     ctx = ToolContext(run_id="playground", node_id="playground",
                       sandbox_session=payload.sandbox_session)
@@ -245,9 +245,9 @@ async def create_custom(
     payload: CustomToolIn, session: AsyncSession = Depends(get_session)
 ) -> CustomToolOut:
     if (await session.execute(select(CustomTool).where(CustomTool.name == payload.name))).scalar_one_or_none():
-        raise HTTPException(409, f"已经有叫「{payload.name}」的工具了，换个名字")
+        raise HTTPException(409, f"已存在名为「{payload.name}」的工具，请换一个名称")
     if payload.name in all_specs():
-        raise HTTPException(409, f"「{payload.name}」和内置工具重名了，换个名字")
+        raise HTTPException(409, f"「{payload.name}」与内置工具重名，请换一个名称")
     _refuse_bad_schema(payload.parameters)
     row = CustomTool(**payload.model_dump())
     session.add(row)
@@ -262,7 +262,7 @@ async def update_custom(
 ) -> CustomToolOut:
     row = await session.get(CustomTool, tool_id)
     if not row:
-        raise HTTPException(404, "这个工具不存在，可能已经被删了")
+        raise HTTPException(404, "工具不存在，可能已被删除")
     _refuse_bad_schema(payload.parameters)
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
@@ -275,7 +275,7 @@ async def update_custom(
 async def delete_custom(tool_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await session.get(CustomTool, tool_id)
     if not row:
-        raise HTTPException(404, "这个工具不存在，可能已经被删了")
+        raise HTTPException(404, "工具不存在，可能已被删除")
     await session.delete(row)
     await session.commit()
 
@@ -295,7 +295,7 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
     if problem:
         # 手写的参数定义写坏了：是配置的事，不是「后端内部出错」
         return {"ok": False, "error": problem,
-                "hint": '参数定义是 JSON Schema，写成 {"type": "object", "properties": '
+                "hint": '参数定义是 JSON Schema，格式如 {"type": "object", "properties": '
                         '{"n": {"type": "integer", "description": "…"}}, "required": ["n"]}',
                 "detail": "", "duration_ms": 0}
     try:
@@ -312,10 +312,10 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(result, ToolFailure):
         detail = str(result.get("error") or "")
         if "exit_code" in result:
-            error = f"代码运行出错（退出码 {result['exit_code']}）"
-            hint = "看下面的报错改代码；调用时传的参数在 args 变量里（一个 dict）"
+            error = f"代码执行出错（退出码 {result['exit_code']}）"
+            hint = "请根据下方报错修改代码；调用时传入的参数在 args 变量中（一个 dict）"
         else:
-            error = f"工具执行失败：{detail.splitlines()[0] if detail else '没有说明'}"
+            error = f"工具执行失败：{detail.splitlines()[0] if detail else '未提供说明'}"
             hint = "HTTP 工具只能访问公网地址，内网、回环地址会被拦截" if "拦截" in detail else ""
         return {"ok": False, "error": error, "hint": hint,
                 "detail": json.dumps(dict(result), ensure_ascii=False), "duration_ms": took(),
@@ -335,11 +335,11 @@ class CustomToolDraftIn(BaseModel):
 
 def _draft_problem(kind: str, config: dict[str, Any]) -> str | None:
     if kind not in ("http", "python"):
-        return f"不认识「{kind}」这种工具类型：只有 http 和 python 两种"
+        return f"不支持「{kind}」工具类型：仅支持 http 和 python"
     if kind == "http" and not str(config.get("url") or "").strip():
-        return "还没填接口地址"
+        return "尚未填写接口地址"
     if kind == "python" and not str(config.get("code") or "").strip():
-        return "还没写代码"
+        return "尚未填写代码"
     return None
 
 
@@ -364,7 +364,7 @@ async def test_custom(
 ) -> dict[str, Any]:
     row = await session.get(CustomTool, tool_id)
     if not row:
-        raise HTTPException(404, "这个工具不存在，可能已经被删了")
+        raise HTTPException(404, "工具不存在，可能已被删除")
     return await _trial(row, payload.args)
 
 
@@ -421,7 +421,7 @@ async def create_server(
     payload: McpIn, session: AsyncSession = Depends(get_session)
 ) -> McpOut:
     if (await session.execute(select(McpServer).where(McpServer.name == payload.name))).scalar_one_or_none():
-        raise HTTPException(409, f"已经有叫「{payload.name}」的 MCP 服务了，换个名字")
+        raise HTTPException(409, f"已存在名为「{payload.name}」的 MCP 服务，请换一个名称")
     row = McpServer(**payload.model_dump())
     session.add(row)
     await session.commit()
@@ -435,7 +435,7 @@ async def update_server(
 ) -> McpOut:
     row = await session.get(McpServer, server_id)
     if not row:
-        raise HTTPException(404, "这个 MCP 服务不存在，可能已经被删了")
+        raise HTTPException(404, "MCP 服务不存在，可能已被删除")
     before, old_name, was_enabled = _mcp_connection(row), row.name, row.enabled
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
@@ -454,7 +454,7 @@ async def update_server(
 async def delete_server(server_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await session.get(McpServer, server_id)
     if not row:
-        raise HTTPException(404, "这个 MCP 服务不存在，可能已经被删了")
+        raise HTTPException(404, "MCP 服务不存在，可能已被删除")
     await session.delete(row)
     await session.commit()
     mcp_manager.invalidate(row.name)
@@ -466,7 +466,7 @@ async def probe_server(
 ) -> dict[str, Any]:
     row = await session.get(McpServer, server_id)
     if not row:
-        raise HTTPException(404, "这个 MCP 服务不存在，可能已经被删了")
+        raise HTTPException(404, "MCP 服务不存在，可能已被删除")
     import time
 
     started = time.perf_counter()

@@ -86,7 +86,7 @@ def test_without_report_from_or_narrative_the_gate_still_asks(level, expected):
     del contract_of(graph)["report_from"]
     [issue] = [i for i in lint(graph, level) if i.code == "contract.report_from_missing"]
     assert issue.level == expected and issue.node_id == "done"
-    assert "report_from" in issue.message and "narrative" in issue.message
+    assert "「报告来自」" in issue.message and "「叙述」" in issue.message
 
 
 def test_an_empty_report_from_counts_as_missing():

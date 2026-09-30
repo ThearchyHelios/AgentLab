@@ -134,7 +134,7 @@ const REVIEW_BROKEN_TURN: StreamTurn = {
     signals: [
       { kind: "tool_error", severity: "broken",
         detail: "工具 db_query__shop 调用失败：no such table: merchant_account" },
-      { kind: "step_limit", severity: "broken", detail: "agent 用满了 8 步还没给出结论" },
+      { kind: "step_limit", severity: "broken", detail: "Agent 已用完 8 步上限，仍未给出结论" },
     ],
   },
   output: { answer: "大约 5 个左右。" },
@@ -150,7 +150,7 @@ const REVIEW_DEGRADED_TURN: StreamTurn = {
     answer: null,
     signals: [
       { kind: "retrieve_degraded", severity: "degraded",
-        detail: "重排结果解析不出来，按初筛顺序返回" },
+        detail: "重排失败，已按初筛顺序返回" },
     ],
   },
   output: { answer: "只有平台管理员可以修改他人权限，且需要走角色变更流程。" },
@@ -339,7 +339,7 @@ function synthetic(name: string): StreamTurn[] {
     }
     case 'copilot':
       return [{ id: 'copilot', question: '做一个每天的出勤日报', phase: 'done',
-                status: '已放到画布，但还有 2 处问题要你处理',
+                status: '已应用到画布，仍有 2 处问题待处理',
                 steps: decodeCopilot(COPILOT_STUCK, { context: 'canvas' }) }]
     case 'codes':
       // 编号、分组长得像数：'1063'、'001'。它们不该右对齐，也不该出「按 attribute_group 从高到低排」
@@ -368,7 +368,7 @@ function synthetic(name: string): StreamTurn[] {
                 output: { 结论: ev[ev.length - 1].data.output.结论, _issuance: {
                   tier: 'degraded', calibers: [], metrics_checked: 0, matched_numbers: 0, unmatched_numbers: [],
                   missing_required: [], missing_expected: [],
-                  gaps: ['协作团队「销售分析团队」用完 2 轮仍未完成，交来的是成员最后的原话'] } },
+                  gaps: ['协作团队「销售分析团队」用完 2 轮仍未完成，交付的是成员最后的回复'] } },
                 runId: 'syn-exhausted-degrade', runClass: 'exploratory' }]
     }
     case 'exhausted-closing': {
@@ -384,14 +384,14 @@ function synthetic(name: string): StreamTurn[] {
     }
     case 'timeout':
       return [{ id: 'timeout', question: '把订单明细全拉出来', phase: 'error', steps: decodeRun(timeoutRun('done')),
-                runId: 'syn-timeout', error: { error: '查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查' } }]
+                runId: 'syn-timeout', error: { error: '查询超过 30 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试' } }]
     case 'abandoned':
       return [{ id: 'abandoned', question: '把这份报表发出去', phase: 'done', statusCode: 'cancelled',
                 steps: decodeRun(abandonedRun()), runId: 'syn-abandoned' }]
     case 'structured':
       // 页面已经把报错拆好了（问数据页的 Failure）：照原样画，不再翻译一遍
       return [{ id: 'structured', question: '上周各区域订单数', phase: 'error', steps: [],
-                error: { title: '操作超时', reason: '查询超时：数据库 90 秒没有返回', hint: '缩小时间范围后点「重试这一轮」',
+                error: { title: '操作超时', reason: '查询超时：数据库 90 秒没有返回', hint: '缩小时间范围后点击「重试本轮」',
                          detail: 'OperationalError: (3024) maximum statement execution time exceeded' } }]
     case 'restored':
       // 从库里恢复的一轮：没有事件，查询次数由页面从落库的 meta 带过来
@@ -488,8 +488,8 @@ function Preview() {
   const empty = (
     <StreamEmpty
       icon={<MessageSquare size={22} />}
-      title="问点什么"
-      hint="它会自己接数据源、写查询、跑完给结论——你不用碰画布"
+      title="问你的数据"
+      hint="用一句话描述需求，助手会自动连接数据源、编写查询并给出结论，无需操作画布"
     />
   )
 
@@ -514,7 +514,7 @@ function Preview() {
         onStepHover={params.get('link') === '1' ? (id) => { (window as any).__hovered = id } : undefined}
         onStepFocus={params.get('link') === '1' ? (id) => { linked.push(id) } : undefined}
         renderTurnActions={(t) => (t.phase === 'error'
-          ? <button type="button" className="btn btn-xs"><RotateCw size={11} aria-hidden /> 重试这一轮</button>
+          ? <button type="button" className="btn btn-xs"><RotateCw size={11} aria-hidden /> 重试本轮</button>
           : null)}
         onFollowUp={(q) => { (window as any).__followUp = q }}
       />

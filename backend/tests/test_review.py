@@ -110,8 +110,8 @@ def test_benign_warns_do_not_trigger_review():
     与结论无关的告警。轨迹里有记录就够了。
     """
     events = [
-        warn("流式失败，回退非流式：connection reset", "stream_fallback"),
-        warn("节点要求 strict 隔离，但 microVM 未就绪，实际用了 seatbelt", "isolation_fallback"),
+        warn("流式输出失败，已改用非流式调用：connection reset", "stream_fallback"),
+        warn("节点要求 strict 隔离，但 microVM 未就绪，实际使用了 seatbelt", "isolation_fallback"),
     ]
     assert rv.scan(events, OK_OUTPUT) == []
 

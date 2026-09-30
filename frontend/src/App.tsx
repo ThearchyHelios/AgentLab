@@ -244,13 +244,13 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
         to="/"
-        aria-label={live ? 'AgentLab 首页（有运行在跑）' : 'AgentLab 首页'}
+        aria-label={live ? 'AgentLab 首页（有运行正在进行）' : 'AgentLab 首页'}
         className="group relative mx-auto mb-2 mt-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:600px)]:mb-1 [@media(max-height:600px)]:mt-2 [@media(max-height:600px)]:h-9"
       >
         <Logo size={22} live={live} className="text-accent" title="" />
         <Tip>
           <span className="font-semibold">AgentLab</span>
-          <span className="text-faint">受限动态编排{live ? ' · 有运行在跑' : ''}</span>
+          <span className="text-faint">受限动态编排{live ? ' · 有运行正在进行' : ''}</span>
         </Tip>
       </Link>
       <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:600px)]:mb-1" />
@@ -314,7 +314,7 @@ function ApprovalBadge() {
   if (!pending.length) return null
   const oldest = pending.reduce((a, b) => ((a.created_at ?? '') <= (b.created_at ?? '') ? a : b))
   const waited = waitedFor(oldest.created_at)
-  const text = `${pending.length} 项待审批${waited ? `，最久已等 ${waited}` : ''}`
+  const text = `${pending.length} 项待审批${waited ? `，最久已等待 ${waited}` : ''}`
   return (
     <Link
       to="/runs?tab=approvals"
@@ -330,7 +330,7 @@ function ApprovalBadge() {
       {pending.length > 99 ? '99+' : pending.length}
       <Tip badge>
         <span className="font-medium">{text}</span>
-        <span className="text-faint">点开去处理</span>
+        <span className="text-faint">点击处理</span>
       </Tip>
     </Link>
   )
@@ -342,10 +342,10 @@ function NotifyToggle() {
   if (!notifySupported()) return null
   const Icon = notify ? Bell : BellOff
   const tip = notify
-    ? '后台提醒：开 · 运行结束、失败或来了新的待审批会发系统通知'
+    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批时发送系统通知'
     : permission === 'denied'
-      ? '后台提醒：浏览器拒绝了通知权限，要先在站点设置里允许'
-      : '后台提醒：关 · 点开后浏览器会询问通知权限'
+      ? '后台提醒：浏览器已拒绝通知权限，请在站点设置中允许'
+      : '后台提醒：已关闭 · 开启时浏览器将请求通知权限'
   return (
     <button
       type="button"
@@ -394,7 +394,7 @@ function ActorButton() {
   return (
     <Link
       to="/settings/prefs"
-      aria-label={actor ? `署名：${actor}。去设置修改` : '还没有署名。去设置填写'}
+      aria-label={actor ? `署名：${actor}。前往设置修改` : '尚未署名。前往设置填写'}
       className={clsx(
         'group relative flex h-7 w-7 items-center justify-center rounded-full border text-xs font-semibold outline-none',
         'hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
@@ -404,7 +404,7 @@ function ActorButton() {
       {initial || <UserRound size={13} aria-hidden />}
       <Tip>
         {actor ? <span>署名 <span className="font-medium">{actor}</span></span> : <span>未署名</span>}
-        <span className="text-faint">发布、审批、正式运行记在这个名下 · 点开修改</span>
+        <span className="text-faint">发布、审批和正式运行以此署名记录 · 点击修改</span>
       </Tip>
     </Link>
   )
@@ -421,21 +421,21 @@ interface Tone { color: string; text: string; label: string; word: string }
  * 的下拉和列表是空的，不说就像"没有"
  */
 function backendTone(backend: string, latency: number | null, failing: number, stalled: number): Tone {
-  if (backend === 'down') return { color: 'var(--st-failed)', text: '离线', label: '后端未连接', word: '未连接' }
-  if (backend === 'checking') return { color: 'var(--text-faint)', text: '检测中', label: '正在检测后端', word: '检测中' }
+  if (backend === 'down') return { color: 'var(--st-failed)', text: '离线', label: '服务端未连接', word: '未连接' }
+  if (backend === 'checking') return { color: 'var(--text-faint)', text: '检测中', label: '正在检测服务端', word: '检测中' }
   if (stalled > 0) {
-    return { color: 'var(--st-waiting)', text: '加载中', label: `后端在线，但还有 ${stalled} 项没取回来`, word: '加载中' }
+    return { color: 'var(--st-waiting)', text: '加载中', label: `服务端在线，但仍有 ${stalled} 项未加载完成`, word: '加载中' }
   }
   if (failing > 0) {
-    return { color: 'var(--st-waiting)', text: '降级', label: `后端在线，但有 ${failing} 项没加载成功`, word: '降级' }
+    return { color: 'var(--st-waiting)', text: '降级', label: `服务端在线，但有 ${failing} 项加载失败`, word: '降级' }
   }
   if (latency != null && latency >= SLOW_MS) {
-    return { color: 'var(--st-waiting)', text: `${latency}ms`, label: `后端响应慢，延迟 ${latency} 毫秒`, word: '偏慢' }
+    return { color: 'var(--st-waiting)', text: `${latency}ms`, label: `服务端响应慢，延迟 ${latency} 毫秒`, word: '偏慢' }
   }
   return {
     color: 'var(--st-done)',
     text: latency != null ? `${latency}ms` : '在线',
-    label: latency != null ? `后端在线，延迟 ${latency} 毫秒` : '后端在线',
+    label: latency != null ? `服务端在线，延迟 ${latency} 毫秒` : '服务端在线',
     word: '在线',
   }
 }
@@ -472,7 +472,7 @@ function useStalledChecks(): CatalogCheck[] {
 /** 失败的那一项怎么说：回了错误码写码；等满 CATALOG_TIMEOUT_MS 才断的是超时；其余是够不着 */
 function failWord(c: CatalogCheck): string {
   if (c.status) return String(c.status)
-  return c.ms != null && c.ms >= CATALOG_TIMEOUT_MS ? '超时' : '连不上'
+  return c.ms != null && c.ms >= CATALOG_TIMEOUT_MS ? '超时' : '连接失败'
 }
 
 /**
@@ -498,16 +498,16 @@ function useCatalogWarning(stalled: CatalogCheck[], enabled: boolean) {
     const w = pick(waiting)
     const f = pick(failed)
     const text = [
-      w.length ? `还有 ${w.length} 项没取回来（${w.map((c) => c.label).join('、')}）` : '',
-      f.length ? `${w.length ? '' : '有 '}${f.length} 项没加载成功（${f.map((c) => `${c.label} ${failWord(c)}`).join('、')}）` : '',
+      w.length ? `仍有 ${w.length} 项未加载完成（${w.map((c) => c.label).join('、')}）` : '',
+      f.length ? `${w.length ? '' : '有 '}${f.length} 项加载失败（${f.map((c) => `${c.label} ${failWord(c)}`).join('、')}）` : '',
     ].filter(Boolean).join('，')
     const detail = [
-      w.length ? '后端连得上，但这几个请求发出去好几秒了还没回来。' : '',
+      w.length ? '服务端可以连接，但这些请求已等待数秒仍未返回。' : '',
       ...f.map((c) => `${c.label}：${c.error ?? failWord(c)}`),
-      '在它们取回来之前，对应的列表和下拉可能是空的，不代表数据没了。导航最底下的连接指示灯里能看到每一项的情况。',
+      '加载完成前，相关列表和下拉选项可能为空，不代表数据丢失。可在导航底部的连接指示灯中查看各项状态。',
     ].filter(Boolean).join('\n')
     // 键跟着「是哪几张表」走：同一个键的提示只会累计次数，不会换字
-    const id = toast.warn(`${text}：列表可能不全，先别新建`, {
+    const id = toast.warn(`${text}：列表可能不完整，建议加载完成后再新建`, {
       sticky: true,
       key: `catalog-unknown:${waiting}|${failed}`,
       detail,
@@ -544,7 +544,7 @@ function Telemetry({ stalled }: { stalled: CatalogCheck[] }) {
       >
         <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone.color }} />
         <span className="mono tnum">{tone.text}</span>
-        {!open && <Tip>{tone.label}<span className="text-faint">点开看详情</span></Tip>}
+        {!open && <Tip>{tone.label}<span className="text-faint">点击查看详情</span></Tip>}
       </button>
       {open && (
         <TelemetryPanel
@@ -604,7 +604,7 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
     <div
       ref={ref}
       role="dialog"
-      aria-label="后端连接"
+      aria-label="服务端连接"
       tabIndex={-1}
       onKeyDown={(e) => {
         if (e.key === 'Escape' && !isComposing(e)) {
@@ -615,7 +615,7 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
       className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-80 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none"
     >
       <div className="flex items-center justify-between border-b px-3 py-2">
-        <span className="font-semibold text-fg">后端连接</span>
+        <span className="font-semibold text-fg">服务端连接</span>
         <span className="flex items-center gap-1.5" style={{ color: tone.color }}>
           <span aria-hidden className="h-1.5 w-1.5 rounded-full" style={{ background: tone.color }} />
           {tone.word}
@@ -647,11 +647,11 @@ function TelemetryPanel({ onClose, anchor, stalled }: {
       {stalled.length > 0 && (
         <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
              style={{ borderColor: 'color-mix(in srgb, var(--warn) 35%, var(--border))', background: 'var(--st-waiting-soft)' }}>
-          <div className="text-[var(--st-waiting)]">{stalled.map((c) => c.label).join('、')}还没回来</div>
+          <div className="text-[var(--st-waiting)]">{stalled.map((c) => c.label).join('、')}尚未返回</div>
           <div className="mt-0.5 text-dim">
             {unknown
-              ? '在那之前各页的列表可能不全，不代表数据没了，先别急着新建。'
-              : '页面上是上次取回来的列表，回来之后自动换新。'}
+              ? '加载完成前各页面的列表可能不完整，不代表数据丢失，建议暂缓新建。'
+              : '页面显示的是上次加载的列表，加载完成后将自动更新。'}
           </div>
         </div>
       )}
@@ -685,7 +685,7 @@ function CheckList({ checks, lead }: { checks: CatalogCheck[]; lead?: ReactNode 
           <span className="mono ml-auto tnum text-2xs" style={{ color: c.state === 'error' ? 'var(--st-failed)' : 'var(--text-faint)' }}
                 title={c.error}>
             {/* 勾叉是装饰图形，读屏靠这一个词分辨成败 */}
-            <span className="sr-only">{c.state === 'pending' ? '还在等' : c.state === 'ok' ? '已取回 ' : '失败 '}</span>
+            <span className="sr-only">{c.state === 'pending' ? '等待中' : c.state === 'ok' ? '已加载 ' : '失败 '}</span>
             {c.state === 'pending'
               ? <span aria-hidden>…</span>
               : c.state === 'ok' ? `${c.ms ?? '—'} ms` : failWord(c)}
@@ -700,7 +700,7 @@ function CheckList({ checks, lead }: { checks: CatalogCheck[]; lead?: ReactNode 
 function bootProgress(checks: CatalogCheck[]): string | null {
   const waiting = checks.filter((c) => c.state === 'pending').map((c) => c.label)
   const failed = checks.filter((c) => c.state === 'error').map((c) => c.label)
-  return [waiting.length && `还在等${waiting.join('、')}`, failed.length && `${failed.join('、')}没取回来`]
+  return [waiting.length && `正在等待${waiting.join('、')}`, failed.length && `${failed.join('、')}加载失败`]
     .filter(Boolean).join('；') || null
 }
 
@@ -758,7 +758,7 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
   const done = checks.filter((c) => c.state !== 'pending').length
   const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
   const h = down ? humanizeError(new ApiError(0, backendError || NETWORK_MESSAGE, { kind: 'network' })) : null
-  const headline = down ? '连不上后端服务' : slow ? '比平时慢' : '正在连接后端'
+  const headline = down ? '无法连接服务' : slow ? '比平时慢' : '正在连接服务'
   // 读屏只播这一句：阶段变了（连接中 → 比平时慢 → 连不上）、慢的时候哪几项回来了。
   // 计时器和倒计时一秒一跳，放进播报区就是一秒念一遍
   const spoken = down ? h?.reason : slow ? bootProgress(checks) : null
@@ -801,9 +801,9 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
                   {backend === 'checking'
                     ? <span className="flex w-3.5 justify-center text-faint"><Spinner size={11} /></span>
                     : <StatusBadge status={down ? 'failed' : 'done'} size={13} decorative animate={false} />}
-                  <span className={down ? 'text-fg' : 'text-dim'}>后端服务</span>
+                  <span className={down ? 'text-fg' : 'text-dim'}>服务端</span>
                   <span className="mono ml-auto text-2xs tnum" style={{ color: down ? 'var(--st-failed)' : 'var(--text-faint)' }}>
-                    {down ? '连不上' : backend === 'ok' && latency != null ? `${latency} ms` : '/api'}
+                    {down ? '连接失败' : backend === 'ok' && latency != null ? `${latency} ms` : '/api'}
                   </span>
                 </li>
               }
@@ -814,30 +814,30 @@ function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
             <div className="border-t px-3 py-3 text-xs leading-relaxed">
               {down ? (
                 <>
-                  <div className="text-fg">{h?.reason ?? backendError ?? '请求没有到达后端'}</div>
+                  <div className="text-fg">{h?.reason ?? backendError ?? '请求未到达服务端'}</div>
                   <div className="mt-1 text-dim">
-                    确认后端已经启动（开发环境用 <span className="mono">./scripts/dev.sh</span>），并且前端代理的端口和它一致。
+                    请确认服务端已启动；如问题持续，请联系管理员。
                   </div>
                   <div className="mono mt-1 break-all text-2xs text-faint">
-                    {window.location.origin}/api
+                    {window.location.origin}/api · 开发环境：./scripts/dev.sh
                     {backendError && backendError !== NETWORK_MESSAGE && <> · {backendError}</>}
                   </div>
                 </>
               ) : (
                 <>
                   <div className="text-dim">
-                    请求已经发出 {Math.floor(elapsed / 1000)} 秒还没全部回来：后端可能正在启动，或者卡在某个请求上。
+                    请求已发出 {Math.floor(elapsed / 1000)} 秒，仍有部分未返回：服务端可能正在启动，或某个请求处理缓慢。
                   </div>
                   {/* 后端连得上时「先进去」也还是一条路：一个请求卡死就把人永远关在门外更糟。
                       但进去之前先说清楚代价，进去以后遥测点和提示会接着说 */}
-                  <div className="mt-1 text-faint">先进去的话，没回来的那几项在页面上会是空的，不代表没有数据。</div>
+                  <div className="mt-1 text-faint">直接进入时，未返回的数据在页面上将显示为空，不代表没有数据。</div>
                 </>
               )}
               <div className="mt-3 flex items-center gap-2">
                 <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={() => void retry()}>
                   {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} 立即重试
                 </button>
-                <button type="button" className="btn btn-sm btn-ghost" onClick={onEnterOffline}>先进去看看</button>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={onEnterOffline}>直接进入</button>
                 {secs != null && !busy && <span className="ml-auto text-2xs text-faint tnum">{secs} 秒后自动重试</span>}
               </div>
             </div>
@@ -905,7 +905,7 @@ function watchStudio(go: Go): () => void {
       const wall = t.timing?.wallMs ?? (t.startedAt && t.endedAt ? t.endedAt - t.startedAt : null)
       report(go, {
         attention: { tone: 'ok', text: '✓ 运行完成' }, title: `「${name}」运行完成`,
-        body: wall != null ? `用时 ${formatDuration(wall)}` : undefined, to, tag,
+        body: wall != null ? `总时长 ${formatDuration(wall)}` : undefined, to, tag,
       })
     } else if (s.runPhase === 'failed') {
       const nodeId = s.trace.failedNodeId
@@ -917,8 +917,8 @@ function watchStudio(go: Go): () => void {
       })
     } else if (s.runPhase === 'suspended') {
       report(go, {
-        attention: { tone: 'warn', text: '‖ 运行中断' }, title: `「${name}」运行被中断`,
-        body: '服务重启打断了这次运行，可以从断点接着跑', to, tag,
+        attention: { tone: 'warn', text: '‖ 运行中断' }, title: `「${name}」运行已中断`,
+        body: '服务重启中断了本次运行，可从断点继续运行', to, tag,
       })
     }
   })
@@ -942,9 +942,9 @@ function watchChat(go: Go): () => void {
         const to = window.location.pathname === `/chat/${cid}` ? null : `/chat/${cid}`
         const question = t.question.length > 60 ? `${t.question.slice(0, 60)}…` : t.question
         if (t.phase === 'done') {
-          report(go, { attention: { tone: 'ok', text: '✓ 回答好了' }, title: '问数据：回答好了', body: question, to, tag: `turn:${t.id}` })
+          report(go, { attention: { tone: 'ok', text: '✓ 已回答' }, title: '问数据：回答已生成', body: question, to, tag: `turn:${t.id}` })
         } else if (t.phase === 'error') {
-          report(go, { attention: { tone: 'err', text: '✕ 出错了' }, title: '问数据：这一问出错了', body: question, to, tag: `turn:${t.id}` })
+          report(go, { attention: { tone: 'err', text: '✕ 回答失败' }, title: '问数据：本次提问失败', body: question, to, tag: `turn:${t.id}` })
         }
       }
     }
@@ -968,7 +968,7 @@ function watchApprovals(go: Go): () => void {
     fresh.forEach((a) => seen!.add(a.id))
     for (const a of fresh) {
       notifyInBackground({
-        title: `新的待审批：${a.title || '有一步在等你处理'}`,
+        title: `新的待审批：${a.title || '有步骤等待处理'}`,
         body: [a.workflow_name && runName(a), a.node_label].filter(Boolean).join(' · ') || undefined,
         tag: `approval:${a.id}`,
         onClick: () => go(`/runs/${a.run_id}`),

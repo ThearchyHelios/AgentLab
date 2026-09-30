@@ -59,7 +59,7 @@ export function FailedBanner({
     : explain.fix === 'tools'
       ? (
         <Link className={fixCls} to={explain.fixTo ?? '/tools'} data-action="tools"
-              title={explain.fixTo ? '打开要改的那个工具的编辑框' : undefined}>
+              title={explain.fixTo ? '打开需要修改的工具的编辑框' : undefined}>
           <Wrench size={11} aria-hidden /> {fixFirst ? '去改参数定义' : '去工具库'}
         </Link>
       )
@@ -90,16 +90,16 @@ export function FailedBanner({
             {fixFirst && fixLink}
             {explain.continuable && (
               <button type="button" className={`btn btn-sm${fixFirst ? '' : ' btn-primary'}`} disabled={busy} onClick={onContinue}
-                      title={fixFirst ? '先把上面说的改好再接着跑：原样接着跑还会在同一处失败。前面跑完的节点不重跑'
-                        : '从失败的节点接着跑，前面跑完的不重跑。要改节点配置请到画布'}
+                      title={fixFirst ? '请先按上面的提示修改，再继续运行：原样继续运行仍会在同一处失败。已完成的节点不会重新执行'
+                        : '从失败的节点继续运行，已完成的节点不会重新执行。如需修改节点配置，请前往画布'}
                       data-action="continue">
-                {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 接着跑
+                {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 继续运行
               </button>
             )}
             {explain.fix === 'rerun' && explain.missingInput && onRerun && (
               <button type="button" className="btn btn-sm btn-primary" disabled={busy}
                       onClick={() => onRerun(explain.missingInput!)} data-action="rerun"
-                      title="用这次运行时的工作流快照和其余输入，补上这一项，发起一次新的运行；这条失败记录保留">
+                      title="使用本次运行时的工作流快照和其余输入，补上这一项后发起新的运行；这条失败记录会保留">
                 {busy ? <Spinner size={11} /> : <RotateCcw size={11} aria-hidden />} 补上「{explain.missingInput}」重新运行
               </button>
             )}
@@ -108,14 +108,14 @@ export function FailedBanner({
               // 这里接着跑过不去、得回画布改的，定位就是主路
               <Link className={`btn btn-sm${!explain.continuable && explain.fix === 'canvas' ? ' btn-primary' : ''}`}
                     to={canvasHref} data-action="locate"
-                    title={nodeId ? '打开这张工作流，并把画布对准失败的节点' : '打开这张工作流'}>
+                    title={nodeId ? '打开该工作流，并将画布定位到失败的节点' : '打开该工作流'}>
                 <Crosshair size={11} aria-hidden /> 在画布中定位
               </Link>
             )}
             {!canvasHref && onShowInTrace && (
               <button type="button" className="btn btn-sm" onClick={onShowInTrace} data-action="locate-trace"
-                      title={'工作流在这次运行之后改过结构，现在的工作流里已经没有这个节点，画布上定位不到它。\n航迹用的是运行时的快照，能看到它当时的样子'}>
-                <ChartGantt size={11} aria-hidden /> 在航迹中看
+                      title={'工作流在本次运行后修改过结构，当前工作流中已没有该节点，无法在画布上定位。\n航迹使用运行时的快照，可查看该节点当时的状态'}>
+                <ChartGantt size={11} aria-hidden /> 在航迹中查看
               </button>
             )}
             <button type="button" className="btn btn-sm btn-ghost" data-action="copy-error"
@@ -156,12 +156,12 @@ export function HeldBanner({ reason, onContinue, onAbandon, busy }: {
       <div className="flex items-center gap-2.5 text-xs">
         <StatusBadge status="held" size={15} />
         <span className="min-w-0 flex-1">
-          <span className="font-medium text-fg">已挂起，可以接着跑</span>
-          <span className="text-dim"> · {reason || '这次运行停在断点上，没有待处理的审批'}。前面跑完的节点不会重跑。</span>
+          <span className="font-medium text-fg">已挂起，可继续运行</span>
+          <span className="text-dim"> · {reason || '本次运行停在断点上，没有待处理的审批'}。已完成的节点不会重新执行。</span>
         </span>
         <AbandonButton onClick={onAbandon} disabled={busy} />
         <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={onContinue} data-action="resume">
-          {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 接着跑
+          {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} 继续运行
         </button>
       </div>
     </Shell>
@@ -172,7 +172,7 @@ export function HeldBanner({ reason, onContinue, onAbandon, busy }: {
 function AbandonButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
   return (
     <button type="button" className="btn btn-sm btn-ghost shrink-0" disabled={disabled} onClick={onClick}
-            data-action="abandon" title="不再往下跑：记为已取消，待审批一并关闭；已经跑完的节点和产出保留">
+            data-action="abandon" title="终止运行并记为已取消，待审批一并关闭；已完成的节点和产出保留">
       <Ban size={11} aria-hidden /> 放弃这次运行
     </button>
   )
@@ -198,10 +198,10 @@ export function WaitingBanner({ approvals, labelOf, onJump, onAbandon, busy, now
       <div className="flex items-center gap-2.5 text-xs">
         <StatusBadge status="waiting" size={15} />
         <span className="min-w-0 flex-1 truncate">
-          <span className="font-medium text-fg">停在「{first.node_label ?? labelOf(first.node_id)}」等审批</span>
+          <span className="font-medium text-fg">在「{first.node_label ?? labelOf(first.node_id)}」等待审批</span>
           {waited != null && (
             <span className="tnum" style={{ color: long ? 'var(--st-waiting)' : undefined }}>
-              {' '}· 已等 {formatSpan(waited, { coarse: true })}
+              {' '}· 已等待 {formatSpan(waited, { coarse: true })}
             </span>
           )}
           <span className="text-faint" title={formatDateTime(first.created_at ?? null)}>
@@ -234,23 +234,23 @@ export function FeedbackStrip({ feedback, onDismiss }: { feedback: Feedback; onD
   let text: ReactNode
   let color = 'var(--st-done)'
   if (feedback.kind === 'decided') {
-    const verb = feedback.approved === false ? '驳回了' : '放行了'
+    const verb = feedback.approved === false ? '驳回了' : '批准了'
     if (feedback.approved === false) color = 'var(--text-dim)'
     text = (
       <>
         <span className="font-medium">{feedback.by || '未署名'}</span> {verb}「{feedback.node}」
         {feedback.at && <span className="tnum text-faint"> · {formatTime(feedback.at)}</span>}
         <span className="text-dim">
-          {' '}· {feedback.approved === false && feedback.terminates ? '本次运行终止' : '运行继续，下面的时间线会接着长'}
+          {' '}· {feedback.approved === false && feedback.terminates ? '本次运行终止' : '运行已继续，时间线将持续更新'}
         </span>
       </>
     )
   } else {
     text = (
       <>
-        <span className="font-medium">已{feedback.resume ? '从断点' : feedback.from ? `从「${feedback.from}」` : ''}接着跑</span>
+        <span className="font-medium">已{feedback.resume ? '从断点' : feedback.from ? `从「${feedback.from}」` : ''}继续运行</span>
         <span className="tnum text-faint"> · {formatTime(feedback.at)}</span>
-        <span className="text-dim"> · 前面跑完的节点不会重跑</span>
+        <span className="text-dim"> · 已完成的节点不会重新执行</span>
       </>
     )
   }

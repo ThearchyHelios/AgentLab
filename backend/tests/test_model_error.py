@@ -31,7 +31,7 @@ def test_invalid_model_says_model_not_key() -> None:
 
     assert "deepseek-chat" in msg, "必须说清是哪个模型，否则没法排查"
     assert "不存在" in msg
-    assert "设置" in msg and "供应商" in msg, "要给出下一步去哪儿改"
+    assert "「设置 → 模型接入」" in msg, "要给出下一步去哪儿改：设置页里这一组叫「模型接入」"
     # 别把用户往换 key 的方向带
     assert "401" not in msg
     assert "Authentication" not in msg

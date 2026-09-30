@@ -67,11 +67,11 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """直接调用一个工具。参数里的 {{ }} 会先用当前状态渲染。"""
     name = ctx.cfg("tool", "")
     if not name:
-        raise NodeError(ctx.node.id, "工具节点没有选择工具")
+        raise NodeError(ctx.node.id, "「调用工具」节点尚未选择工具")
 
     args = ctx.render(ctx.cfg("args", {}) or {}, state)
     if not isinstance(args, dict):
-        raise NodeError(ctx.node.id, "工具参数必须是对象")
+        raise NodeError(ctx.node.id, "工具参数必须是 JSON 对象")
 
     # 审批通过后节点会整个重放、再算一遍要不要问人，所以这里只能取决于 name 和 args。
     # 节点没配时取全局设置（「危险工具默认需要人工确认」），见 NodeContext.approval_mode
@@ -104,7 +104,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved,
                    note=decision.note, actor=ctx.actor(), **({"always": True} if always else {}))
         if not decision.approved:
-            raise NodeError(ctx.node.id, f"用户拒绝执行工具 {name}"
+            raise NodeError(ctx.node.id, f"工具 {name} 的调用已被驳回"
                             + (f"：{decision.note}" if decision.note else ""))
 
     limit = limit_of(tool, name, args)
@@ -115,7 +115,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 替它跑通了这一次，但节点配置里那个错的参数名原封不动，下次还会踩。
         # 所以纠正必须留一条看得见的痕迹，而不是安静地把事办了
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"工具 {name}：{note}。请到节点里改正。", code="tool_args_fixed")
+                 message=f"工具 {name}：{note}。请在节点中改正。", code="tool_args_fixed")
 
     async def _call() -> Any:
         async with SessionLocal() as session:
@@ -128,13 +128,13 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         elapsed = int((time.perf_counter() - started) * 1000)
         ctx.emit(EventType.TOOL_ERROR, tool=name, error=str(e), timed_out=True, duration_ms=elapsed)
         if ctx.cfg("fail_fast", True):
-            raise NodeError(ctx.node.id, f"{e}。数据量大就在参数里缩小范围；对方偶尔卡住的话，"
-                                         "稍后「接着跑」即可") from e
+            raise NodeError(ctx.node.id, f"{e}。数据量较大时请在参数中缩小范围；如为服务暂时无响应，"
+                                         "可稍后点「继续运行」") from e
         result = {"error": str(e), "timed_out": True}
     except KeyError as e:
         # str(KeyError) 是带引号的 repr，直接拼会多出一对引号
-        reason = e.args[0] if e.args else f"找不到工具 {name!r}"
-        raise NodeError(ctx.node.id, f"{reason}。工具可能被删除或改了名字，在节点里重新选一个") from e
+        reason = e.args[0] if e.args else f"找不到工具 {name}"
+        raise NodeError(ctx.node.id, f"{reason}。工具可能已被删除或重命名，请在节点中重新选择") from e
     except ToolArgsError as e:
         # 参数对不上且没有唯一候选可纠。报错里已经写清楚该填什么，
         # 不要再套一层 "执行失败：" 把它推远
@@ -149,8 +149,8 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if ctx.cfg("fail_fast", True):
             raise NodeError(
                 ctx.node.id,
-                f"工具 {name} 执行失败：{reason}。检查节点里填的参数；参数没问题的话，"
-                "是这个工具本身出了错，换一个工具或联系管理员",
+                f"工具 {name} 执行失败：{reason}。请检查节点中填写的参数；如参数无误，"
+                "则是该工具本身出错，请换一个工具或联系管理员",
             ) from e
         result = {"error": reason, "detail": raw_detail(e)}
 
@@ -160,7 +160,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 没查成：原话就是报错（「查询失败：no such table: x」），照写，别再套一层
         ctx.emit(EventType.TOOL_ERROR, tool=name, error=result[:2000], duration_ms=elapsed)
         if ctx.cfg("fail_fast", True):
-            raise NodeError(ctx.node.id, f"工具 {name} 没查成——{result}。按这句话改节点里的 SQL 再跑")
+            raise NodeError(ctx.node.id, f"工具 {name} 查询失败：{result}。请据此修改节点中的 SQL 后重新运行")
         result = {"error": result}
 
     # 取数快照：query（args）和结果集一起进工件库，完整出具时数字回指的就是它
@@ -210,11 +210,11 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """沙箱代码节点。代码本身支持模板插值，可以把上游结果直接嵌进去。"""
     code = ctx.render_str(ctx.cfg("code", ""), state)
     if not code.strip():
-        raise NodeError(ctx.node.id, "代码节点是空的")
+        raise NodeError(ctx.node.id, "「沙箱代码」节点的代码为空")
     evidence_on = ledger_enabled(ctx.run)
     role = str(ctx.cfg("evidence_role", "") or "compute")
     if evidence_on and role not in EVIDENCE_ROLES:
-        raise NodeError(ctx.node.id, f"evidence_role 只能是 source（取数）或 compute（计算），写的是 {role!r}")
+        raise NodeError(ctx.node.id, f"「证据角色」只能是「取数」或「计算」，当前为「{role}」")
 
     language = ctx.cfg("language", "python")
     limits = SandboxLimits(
@@ -235,7 +235,7 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         await once(ctx, EventType.HUMAN_RESOLVED, approved=decision.approved, note=decision.note,
                    actor=ctx.actor())
         if not decision.approved:
-            raise NodeError(ctx.node.id, "用户拒绝执行代码"
+            raise NodeError(ctx.node.id, "代码执行已被驳回"
                             + (f"：{decision.note}" if decision.note else ""))
 
     # 隔离档位：strict 要硬件级（microVM），fast 要低延迟（Seatbelt/bwrap），
@@ -261,7 +261,7 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if isolation == "strict" and result.backend != "microvm":
         # 要了硬件隔离却没拿到，必须说出来——否则用户以为自己在 VM 里跑
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"节点要求 strict 隔离，但 microVM 未就绪，实际用了 {result.backend}",
+                 message=f"节点要求 strict 隔离，但 microVM 未就绪，实际使用了 {result.backend}",
                  code="isolation_fallback")
     if result.session_reset:
         # 会话工作区被清空了。同一会话的下游节点会突然读不到自己写的文件，
@@ -283,7 +283,7 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not result.ok and ctx.cfg("fail_fast", True):
         raise NodeError(
             ctx.node.id,
-            f"代码执行失败（exit={result.exit_code}）：{result.error or result.stderr[:500]}",
+            f"代码执行失败（退出码 {result.exit_code}）：{result.error or result.stderr[:500]}",
         )
 
     payload = result.model_dump()

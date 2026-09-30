@@ -236,7 +236,7 @@ await section('待审批页签', async () => {
 
     // 别处批掉，剩下的几步在下一轮轮询之前就跑完了（审批靠近末尾的都这样）：
     // 重查时运行已经是已完成。头上跟着变不够，别处发生的事件要补进时间线——
-    // 原来只在「还在跑」时接流，这种就停在审批卡上，连「放行」那一行都没有
+    // 原来只在「还在跑」时接流，这种就停在审批卡上，连「批准」那一行都没有
     const other = pending[1] ?? pending[0]
     const otherRun = await getJson(`/runs/${other.run_id}`)
     const otherEvents = await getJson(`/runs/${other.run_id}/events`)
@@ -272,7 +272,7 @@ await section('待审批页签', async () => {
     check('跑完之前没有闪成「已挂起」', !fastCodes.includes('held'), fastCodes.join(' → '))
     const fastStream = (await page.locator('[data-run-detail] > div').nth(0).innerText()).replace(/\s+/g, ' ')
     // 时间线里是沙箱真实运行的内容（节点名、SQL、预览），只报字数，不打原文
-    check('别处发生的事件补进了时间线（「张工 放行了」）', fastStream.includes('张工 放行了'), `时间线 ${fastStream.length} 字`)
+    check('别处发生的事件补进了时间线（「张工 已批准」）', fastStream.includes('张工 已批准'), `时间线 ${fastStream.length} 字`)
     const fastCount = (await page.locator('[data-run-detail] > header').innerText()).match(/([\d,]+) 条事件/)?.[1]
     check('详情头的事件数跟着补齐', fastCount === (otherEvents.length + tail.length).toLocaleString('en-US'),
       `${fastCount} / 应为 ${otherEvents.length + tail.length}`)
@@ -407,7 +407,7 @@ await section('失败：指到节点、原因、下一步', async () => {
     await page.locator('[data-run-banner=failed]').waitFor()
     check('横幅指到失败的节点', await page.locator(`[data-failed-node="${full.error_node_id}"]`).count() === 1, full.error_node_id)
     check('原始异常翻成人话', (await page.locator('[data-failed-title]').innerText()).includes('鉴权'))
-    check('有「接着跑」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 1)
+    check('有「继续运行」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 1)
     check('有「去模型接入」', await page.locator('[data-run-banner=failed] [data-action=settings]').count() === 1)
     check('有「复制错误」', await page.locator('[data-run-banner=failed] [data-action=copy-error]').count() === 1)
     // 时间线里的报错照原样画横幅那份拆好的失败（3C REQ-14）：以前只交一个标题字符串，流里拿它
@@ -452,14 +452,14 @@ await section('失败：指到节点、原因、下一步', async () => {
         headText.includes('在画布中回放') && headHref === canvasBase, headHref ?? '没有这个按钮')
     }
 
-    // 接着跑：POST 伪造成功，实时流在上面已经伪造好
+    // 继续运行：POST 伪造成功，实时流在上面已经伪造好
     fakes.set(`POST /api/runs/${authFail.id}/continue`, () => ({
       status: 200, json: { ...full, status: 'running', error: null, finished_at: null },
     }))
     await page.locator('[data-run-banner=failed] [data-action=continue]').click()
     await page.locator('[data-run-feedback=continued]').waitFor({ timeout: 5000 }).catch(() => {})
-    check('接着跑发的是 POST /continue', writes.includes(`POST /api/runs/${authFail.id}/continue`))
-    check('接着跑之后留下回执', await page.locator('[data-run-feedback=continued]').count() === 1)
+    check('继续运行发的是 POST /continue', writes.includes(`POST /api/runs/${authFail.id}/continue`))
+    check('继续运行之后留下回执', await page.locator('[data-run-feedback=continued]').count() === 1)
     const flipped = await page.waitForFunction(
       () => document.querySelector('[data-run-detail]')?.getAttribute('data-run-code') === 'running',
       null, { timeout: 5000 },
@@ -474,7 +474,7 @@ await section('失败：指到节点、原因、下一步', async () => {
   if (missingInput) {
     await page.goto(`${WEB}/runs/${missingInput.id}`, { waitUntil: 'networkidle' })
     await page.locator('[data-run-banner=failed]').waitFor()
-    check('缺输入的失败不给「接着跑」（原样接着跑还会失败）',
+    check('缺输入的失败不给「继续运行」（原样继续运行还会失败）',
       await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 0)
     check('未保存的工作流不给「在画布中定位」', await page.locator('[data-action=locate]').count() === 0)
 
@@ -504,22 +504,22 @@ await section('失败：指到节点、原因、下一步', async () => {
     check('跑的是这次运行时的图快照', Array.isArray(startBody?.graph?.nodes) && startBody.graph.nodes.length > 0 && !startBody.workflow_id)
     fakes.delete('POST /api/runs')
 
-    // 补上之后发起被拒：绑定的工具在本机不存在（422 run_tool_missing）。和画布上发起被拒同一套，
+    // 补上之后发起被拒：绑定的工具不存在（422 run_tool_missing）。和画布上发起被拒同一套，
     // 报错里给直达入口（数据源工具去数据页），不是只有一句 toast
     await page.goto(`${WEB}/runs/${missingInput.id}`, { waitUntil: 'networkidle' })
     await page.locator('[data-run-banner=failed] [data-action=rerun]').waitFor()
     fakes.set('POST /api/runs', () => ({ status: 422, json: {
-      detail: '绑定的工具在本机不存在：「查数」（调用工具）绑的 db_query__nope。去数据页接入，或在节点里重新选', code: 'run_tool_missing' } }))
+      detail: '绑定的工具不存在：「查数」（调用工具）绑定的 db_query__nope。请到「数据」页接入，或在节点中重新选择', code: 'run_tool_missing' } }))
     await page.locator('[data-run-banner=failed] [data-action=rerun]').click()
     const refused = page.getByRole('dialog')
     await refused.waitFor()
     await refused.locator('input, textarea').first().fill('检查用的主题')
     await refused.getByRole('button', { name: '重新运行' }).click()
-    const toData = page.getByRole('button', { name: '去数据页接入' })
+    const toData = page.getByRole('button', { name: '前往「数据」页接入' })
     await toData.waitFor({ timeout: 5000 }).catch(() => {})
-    check('补上重新运行被拒（工具不在本机）：报错里有「去数据页接入」', await toData.count() === 1)
-    const said = await page.getByText('绑定的工具「db_query__nope」在本机不存在').first().innerText().catch(() => '')
-    check('……点名那个工具，说清这次运行没有发起', said.includes('db_query__nope') && said.includes('没有发起'), said.slice(0, 120))
+    check('补上重新运行被拒（工具不在本机）：报错里有「前往「数据」页接入」', await toData.count() === 1)
+    const said = await page.getByText('绑定的工具「db_query__nope」不存在').first().innerText().catch(() => '')
+    check('……点名那个工具，说清这次运行没有发起', said.includes('db_query__nope') && said.includes('本次运行未启动'), said.slice(0, 120))
     check('……人还在这条运行上', new URL(page.url()).pathname === `/runs/${missingInput.id}`, page.url())
     await toData.click().catch(() => {})
     await page.waitForURL((u) => u.pathname.startsWith('/data'), { timeout: 5000 }).catch(() => {})
@@ -568,13 +568,13 @@ await section('失败：指到节点、原因、下一步', async () => {
     }
   }
 
-  // 条件表达式写错了：这一页的接着跑不带图，跑的还是那条写错的条件，只会再失败
-  // 一次。不给接着跑，回画布定位是主路
+  // 条件表达式写错了：这一页的继续运行不带图，跑的还是那条写错的条件，只会再失败
+  // 一次。不给继续运行，回画布定位是主路
   const syntaxFail = failedRuns.find((r) => /表达式语法错误|invalid syntax/.test(r.error ?? '') && r.workflow_id)
   if (syntaxFail) {
     await page.goto(`${WEB}/runs/${syntaxFail.id}`, { waitUntil: 'networkidle' })
     await page.locator('[data-run-banner=failed]').waitFor()
-    check('表达式写错的失败不给「接着跑」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 0)
+    check('表达式写错的失败不给「继续运行」', await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 0)
     const locate = page.locator('[data-run-banner=failed] [data-action=locate]')
     // 失败的节点在工作流现在的图里没了的话，定位落空，主路改成去航迹看（定位作主按钮的
     // 情形由后面「模型没有真正调用工具」的夹具测）
@@ -599,8 +599,8 @@ await section('失败：指到节点、原因、下一步', async () => {
     await page.locator('[data-run-detail]').waitFor()
     await page.waitForTimeout(500)
     check('显示「已挂起」而不是「等待审批」', await page.locator('[data-run-detail]').getAttribute('data-run-code') === 'held')
-    check('挂起横幅带「接着跑」', await page.locator('[data-run-banner=held] [data-action=resume]').count() === 1)
-    // 挂起的没人会再去接：不放弃的话它在记录里永远挂着「可续跑」
+    check('挂起横幅带「继续运行」', await page.locator('[data-run-banner=held] [data-action=resume]').count() === 1)
+    // 挂起的没人会再去接：不放弃的话它在记录里永远挂着「可继续运行」
     check('挂起横幅也能放弃这次运行', await page.locator('[data-run-banner=held] [data-action=abandon]').count() === 1)
   }
 })
@@ -637,9 +637,9 @@ await section('三种时长', async () => {
     const wall = await page.locator('[data-telemetry=wall]').innerText()
     const active = await page.locator('[data-telemetry=active]').innerText()
     const wait = await page.locator('[data-telemetry=wait]').innerText()
-    check('墙钟、执行、等人三项都有数', ![wall, active, wait].includes('—'), `${wall} / ${active} / ${wait}`)
+    check('总时长、执行时长、等待审批三项都有数', ![wall, active, wait].includes('—'), `${wall} / ${active} / ${wait}`)
     check('列表那一行的 title 分项写了三种时长',
-      /墙钟 .+ · 执行 .+ · 等人 .+/.test(await page.locator(`[data-run-id="${timed.id}"] [data-run-duration]`).getAttribute('title') ?? ''))
+      /总时长 .+ · 执行时长 .+ · 等待审批 .+/.test(await page.locator(`[data-run-id="${timed.id}"] [data-run-duration]`).getAttribute('title') ?? ''))
   }
 })
 
@@ -728,7 +728,7 @@ await section('运行中：实时接流、停止、不能删', async () => {
   const clockA = await page.locator('[data-telemetry=wall]').innerText()
   await page.waitForTimeout(700)
   const clockB = await page.locator('[data-telemetry=wall]').innerText()
-  check('墙钟在走（mm:ss.s）', /^\d\d:\d\d\.\d$/.test(clockB) && clockA !== clockB, `${clockA} → ${clockB}`)
+  check('总时长在走（mm:ss.s）', /^\d\d:\d\d\.\d$/.test(clockB) && clockA !== clockB, `${clockA} → ${clockB}`)
   check('状态格写着当前节点', (await page.locator('[data-run-telemetry]').innerText()).includes('当前「总结」'))
   // 在跑的运行看航迹：游标跟着现在走，「此刻」列出在跑的节点
   await page.locator('[data-run-detail] [role=tab][data-tab=trace]').click()
@@ -808,7 +808,7 @@ await section('等了几天的审批批掉之后：计时读得懂', async () =>
   check('接上了实时流', longSocket != null)
   const HMS = /\d+:\d\d:\d\d\.\d/
   const longWall = await page.locator('[data-telemetry=wall]').innerText()
-  check('墙钟写跨度（8 天），不是秒表', /8 天/.test(longWall) && !HMS.test(longWall), longWall)
+  check('总时长写跨度（8 天），不是秒表', /8 天/.test(longWall) && !HMS.test(longWall), longWall)
   const activeA = await page.locator('[data-telemetry=active]').innerText()
   await page.waitForTimeout(500)
   const activeB = await page.locator('[data-telemetry=active]').innerText()
@@ -835,7 +835,7 @@ await section('删除保护', async () => {
     deleteCalls.push(url.search)
     return url.searchParams.get('force') === 'true'
       ? { status: 204, body: '' }
-      : { status: 409, json: { detail: '这是一次已封存的正式运行，是出具结果的追溯凭证。删除后它的事件和工件会一并删掉，封存清单再也无法核对。确认要删的话请再确认一次（强制删除）' } }
+      : { status: 409, json: { detail: '这是一次已封存的正式运行，是出具结果的追溯凭证。删除后其事件和工件将一并删除，封存清单无法再核对。如仍要删除，请选择「强制删除」' } }
   })
   await page.goto(`${WEB}/runs/${FORMAL}`, { waitUntil: 'networkidle' })
   await page.locator('[data-run-detail]').waitFor()
@@ -863,13 +863,13 @@ await section('删除保护', async () => {
   const BUSY = 'fake0busy0000000000000000000000'
   fakes.set(`GET /api/runs/${BUSY}`, () => ({ status: 200, json: { ...base, id: BUSY } }))
   fakes.set(`GET /api/runs/${BUSY}/events`, () => ({ status: 200, json: liveEvents.slice(0, 3) }))
-  fakes.set(`DELETE /api/runs/${BUSY}`, () => ({ status: 409, json: { detail: '这次运行还在进行，现在删除会留下没人管的任务。先停止它，再删除' } }))
+  fakes.set(`DELETE /api/runs/${BUSY}`, () => ({ status: 409, json: { detail: '这次运行仍在进行，现在删除会留下无人管理的后台任务。请先停止运行，再删除' } }))
   await page.goto(`${WEB}/runs/${BUSY}`, { waitUntil: 'networkidle' })
   await page.locator('[data-run-detail]').waitFor()
   await page.getByRole('button', { name: '更多操作' }).click()
   await page.locator('[data-menu=delete]').click()
   await page.getByRole('dialog').getByRole('button', { name: '删除记录' }).click()
-  check('409 时把后端的话原样告诉人', await page.getByText('先停止它，再删除').first().waitFor({ timeout: 4000 }).then(() => true, () => false))
+  check('409 时把后端的话原样告诉人', await page.getByText('请先停止运行，再删除').first().waitFor({ timeout: 4000 }).then(() => true, () => false))
   check('409 时停在原地', new URL(page.url()).pathname === `/runs/${BUSY}`)
 })
 
@@ -967,7 +967,7 @@ await section('航迹：按时间摊开，拖到哪一刻读到哪一刻', async
   check('点「航迹」地址记下 ?view=trace', new URL(page.url()).searchParams.get('view') === 'trace')
   const lanes = await page.locator('[data-run-trace] [data-lane]').evaluateAll((els) => els.map((e) => e.getAttribute('data-lane')))
   check('每个节点一条泳道，按执行顺序排', lanes.join(',') === 'in,query,gate,sum', lanes.join(',') || '没有泳道')
-  check('没拖游标时读的是终态：已完成、2.8k tok',
+  check('没拖游标时读的是终态：已完成、2.8k token',
     (await readout('phase')).includes('已完成') && (await readout('tokens')).includes('2.8k'),
     `${await readout('phase')} / ${await readout('tokens')}`)
   check('没选节点时列出最耗时的节点（慢在哪）',
@@ -1019,8 +1019,8 @@ await section('航迹：按时间摊开，拖到哪一刻读到哪一刻', async
   // 关键时刻：长时间等人的空档被压缩了，拖游标很难正好停在那一下
   const moments = page.locator('[data-trace-moments] [data-moment]')
   const momentText = (await moments.allInnerTexts().catch(() => [])).map((t) => t.replace(/\s+/g, ' '))
-  check('列出关键时刻：开始、停下等审批、审批已处理（等了多久）、结局',
-    momentText.length === 4 && momentText[0].includes('开始运行') && momentText[1].includes('「人工审批」停下等审批')
+  check('列出关键时刻：开始、等待审批、审批已处理（等了多久）、结局',
+    momentText.length === 4 && momentText[0].includes('开始运行') && momentText[1].includes('「人工审批」等待审批')
       && momentText[2].includes('审批已处理') && momentText[2].includes('5 分 00 秒') && momentText[3].includes('运行完成'),
     momentText.join(' | '))
   check('没拖游标时，当前落在结局那一条', await moments.nth(3).getAttribute('aria-current').catch(() => null) === 'step')
@@ -1067,6 +1067,8 @@ await section('航迹：按时间摊开，拖到哪一刻读到哪一刻', async
 // 模型把工具调用写成了文字、一次都没真正查（引擎判失败）：结局是失败，而且说得出为什么
 await section('航迹：模型没有真正调用工具', async () => {
   const LEAK = 'fake0leak000000000000000000000'
+  // run.error 和下面那条日志是老后端的原话（库里老运行存的就是这样），留作「前端认得旧原文」的样本；
+  // 后端现在的原文（toolcalls.TOOL_MARKUP_ERROR）在 check-ui-kit 的 explain 单元核对里
   const LEAK_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
   fakes.set(`GET /api/runs/${LEAK}`, () => ({ status: 200, json: {
     ...traceRun(LEAK), status: 'failed', output: null, error: LEAK_ERROR, error_node_id: 'query',
@@ -1090,20 +1092,20 @@ await section('航迹：模型没有真正调用工具', async () => {
   await page.goto(`${WEB}/runs/${LEAK}?view=trace`, { waitUntil: 'networkidle' })
   await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
   const leakBanner = (await page.locator('[data-run-banner=failed]').innerText().catch(() => '')).replace(/\s+/g, ' ')
-  check('失败横幅说清是模型没有真正调用工具', leakBanner.includes('没有真正调用工具'), leakBanner.slice(0, 60))
+  check('失败横幅说清是模型没有真正调用工具', leakBanner.includes('模型未实际调用工具'), leakBanner.slice(0, 60))
   const leakLocate = page.locator('[data-run-banner=failed] [data-action=locate]')
-  check('失败的节点还在工作流现在的图里：「在画布中定位」对准它；接着跑过不去，它就是主按钮',
+  check('失败的节点还在工作流现在的图里：「在画布中定位」对准它；继续运行过不去，它就是主按钮',
     await leakLocate.getAttribute('href').catch(() => null) === `/studio/${wfHost.id}?run=${LEAK}&focus=query`
       && /\bbtn-primary\b/.test(await leakLocate.getAttribute('class').catch(() => '') ?? '')
       && await page.locator('[data-run-banner=failed] [data-action=locate-trace]').count() === 0)
   const leakMoments = (await page.locator('[data-trace-moments] [data-moment]').allInnerTexts().catch(() => [])).map((t) => t.replace(/\s+/g, ' '))
   check('关键时刻里有那一下警告，结局写失败于哪个节点',
-    leakMoments.some((t) => t.includes('「查询订单」把工具调用写成了文字'))
-      && (leakMoments.at(-1) ?? '').includes('失败于「查询订单」') && (leakMoments.at(-1) ?? '').includes('没有真正调用工具'),
+    leakMoments.some((t) => t.includes('「查询订单」以文本形式输出了工具调用'))
+      && (leakMoments.at(-1) ?? '').includes('失败于「查询订单」') && (leakMoments.at(-1) ?? '').includes('模型未实际调用工具'),
     leakMoments.join(' | '))
   const leakCard = (await page.locator('[data-trace-node=query]').innerText().catch(() => '')).replace(/\s+/g, ' ')
   check('失败的节点默认选中，卡片上写着警告和原因',
-    leakCard.includes('把工具调用写成了文字') && leakCard.includes('没有真正调用工具') && leakCard.includes('失败'),
+    leakCard.includes('以文本形式输出了工具调用') && leakCard.includes('模型未实际调用工具') && leakCard.includes('失败'),
     leakCard.slice(0, 80))
   await page.locator('[data-trace-moments] [data-moment="query:markup"]').click().catch(() => {})
   await page.waitForTimeout(150)
@@ -1116,6 +1118,7 @@ await section('航迹：模型没有真正调用工具', async () => {
 // 人先点它，同样的错再来一遍；「去工具库」只到列表，还得自己找是哪一个（3C REQ-1 / REQ-5）
 await section('失败：自定义工具的参数定义写坏了，先去改', async () => {
   const BROKEN = 'fake0brokentool000000000000000'
+  // 老后端的原话（库里老运行的 run.error 存的是它），留作「前端认得旧原文」的样本；这一节末尾再用后端现在的原文走一遍
   const BROKEN_ERROR = '自定义工具「lookup_order」的参数定义格式不对：参数 store 要写成 {"type": "string"} 这样的对象，不能直接写 "string"。到「工具」页把它的参数定义改好再运行'
     + '；自定义工具「fetch_rate」的参数定义格式不对：类型「int」认不出来，是不是想写 integer；只能是 string、number、integer、boolean、array、object。到「工具」页把它的参数定义改好再运行'
   fakes.set(`GET /api/runs/${BROKEN}`, () => ({ status: 200, json: {
@@ -1136,13 +1139,13 @@ await section('失败：自定义工具的参数定义写坏了，先去改', as
   const brokenFix = page.locator('[data-run-banner=failed] [data-action=tools]')
   const brokenGo = page.locator('[data-run-banner=failed] [data-action=continue]')
   check('标题说有几个工具坏了，不只认第一个',
-    (await page.locator('[data-failed-title]').innerText().catch(() => '')).trim() === '2 个自定义工具的参数定义写坏了')
+    (await page.locator('[data-failed-title]').innerText().catch(() => '')).trim() === '2 个自定义工具的参数定义有误')
   check('主按钮是「去改参数定义」，直达第一个坏工具的编辑框',
     (await brokenFix.innerText().catch(() => '')).includes('去改参数定义')
       && /\bbtn-primary\b/.test(await brokenFix.getAttribute('class').catch(() => '') ?? '')
       && await brokenFix.getAttribute('href').catch(() => null) === '/tools/custom?edit=lookup_order',
     await brokenFix.getAttribute('href').catch(() => '没有这个按钮') ?? '')
-  check('「接着跑」还在（改好之后接着跑能过），但退成次要、排在后面',
+  check('「继续运行」还在（改好之后继续运行能过），但退成次要、排在后面',
     await brokenGo.count() === 1 && !/\bbtn-primary\b/.test(await brokenGo.getAttribute('class').catch(() => '') ?? '')
       && await page.evaluate(() => {
         const fix = document.querySelector('[data-run-banner=failed] [data-action=tools]')
@@ -1157,6 +1160,36 @@ await section('失败：自定义工具的参数定义写坏了，先去改', as
   await brokenFix.click().catch(() => {})
   await page.waitForURL((u) => u.pathname === '/tools/custom', { timeout: 5000 }).catch(() => {})
   check('点了打开工具页的自定义工具', new URL(page.url()).pathname === '/tools/custom')
+
+  // 后端现在的原文（tools/custom.py：前缀「格式有误」、结尾「到「工具」页修改参数定义后再运行」，几个坏工具仍用「；」连成一句）
+  const BROKEN_NOW = 'fake0brokennow0000000000000000'
+  const BROKEN_NOW_ERROR = '自定义工具「lookup_order」的参数定义格式有误：参数 store 应写成 {"type": "string"} 这样的对象，不能直接写 "string"。到「工具」页修改参数定义后再运行'
+    + '；自定义工具「fetch_rate」的参数定义格式有误：无法识别参数 n 的类型「int」，是否应为 integer；只能是 string、integer、number、boolean、array、object 中的一个。到「工具」页修改参数定义后再运行'
+  fakes.set(`GET /api/runs/${BROKEN_NOW}`, () => ({ status: 200, json: {
+    ...traceRun(BROKEN_NOW), status: 'failed', output: null, error: BROKEN_NOW_ERROR, error_node_id: 'query',
+    usage: { input_tokens: 0, output_tokens: 0, cost_usd: 0, duration_ms: 400, wall_ms: 400, active_ms: 400, wait_ms: 0 },
+    finished_at: iso(tt + 0.4),
+  } }))
+  fakes.set(`GET /api/runs/${BROKEN_NOW}/events`, () => ({ status: 200, json: [
+    ...traceEvents().slice(0, 4),
+    { seq: 5, type: 'node.failed', node_id: 'query', ts: tt + 0.35, data: { error: BROKEN_NOW_ERROR, duration_ms: 50 } },
+    { seq: 6, type: 'run.failed', node_id: null, ts: tt + 0.4, data: {
+      error: BROKEN_NOW_ERROR, node_id: 'query', timing: { wall_ms: 400, active_ms: 400, wait_ms: 0 } } },
+  ] }))
+  fakes.set(`GET /api/runs/${BROKEN_NOW}/graph`, () => ({ status: 200, json: { graph: traceGraph, workflow_id: wfHost.id, version: null } }))
+  fakes.set(`GET /api/runs/${BROKEN_NOW}/artifacts`, () => ({ status: 200, json: [] }))
+  await page.goto(`${WEB}/runs/${BROKEN_NOW}?view=stream`, { waitUntil: 'networkidle' })
+  await page.locator('[data-run-banner=failed]').waitFor({ timeout: 5000 }).catch(() => {})
+  const nowFix = page.locator('[data-run-banner=failed] [data-action=tools]')
+  check('后端现在的说法：标题同样说有几个工具有误',
+    (await page.locator('[data-failed-title]').innerText().catch(() => '')).trim() === '2 个自定义工具的参数定义有误')
+  check('……主按钮同样是「去改参数定义」，直达第一个坏工具的编辑框，「继续运行」退成次要',
+    (await nowFix.innerText().catch(() => '')).includes('去改参数定义')
+      && /\bbtn-primary\b/.test(await nowFix.getAttribute('class').catch(() => '') ?? '')
+      && await nowFix.getAttribute('href').catch(() => null) === '/tools/custom?edit=lookup_order'
+      && await page.locator('[data-run-banner=failed] [data-action=continue]').count() === 1,
+    await nowFix.getAttribute('href').catch(() => '没有这个按钮') ?? '')
+  for (const k of ['', '/events', '/graph', '/artifacts']) fakes.delete(`GET /api/runs/${BROKEN_NOW}${k}`)
 
   // 归不了类的失败：标题就是原话。时间线里的报错不再在「技术细节」里把同一句重复一遍（3C REQ-25）
   const PLAIN = 'fake0plainfail0000000000000000'
@@ -1287,6 +1320,7 @@ await section('航迹：节点卡片按这一次执行说事（3C REQ-13）', as
     usage: { input_tokens: 900, output_tokens: 400, cost_usd: 0.002, duration_ms: 3200, wall_ms: 3200, active_ms: 3200, wait_ms: 0 },
     finished_at: iso(tt + 3.2),
   } }))
+  // 两条 tool_markup_leak 日志是老后端的原话（库里老运行存的是它们），留作「前端认得旧原文」的样本
   fakes.set(`GET /api/runs/${REEXEC}/events`, () => ({ status: 200, json: [
     ...traceEvents().slice(0, 4),
     { seq: 5, type: 'log', node_id: 'query', ts: tt + 1.0, data: {
@@ -1311,14 +1345,14 @@ await section('航迹：节点卡片按这一次执行说事（3C REQ-13）', as
   const warnsOf = async () => (await page.locator('[data-trace-node=query] [data-node-warn]').allInnerTexts().catch(() => [])).join(' | ')
   const firstExec = await warnsOf()
   check('回放到第一次执行：说它被提醒后重答了，看不到第二次才有的收尾轮那件事',
-    firstExec.includes('提醒之后重答了') && !firstExec.includes('收尾轮'), firstExec || '（没有提醒）')
+    firstExec.includes('已提醒并重新作答') && !firstExec.includes('收尾时'), firstExec || '（没有提醒）')
   await page.goto(`${WEB}/runs/${REEXEC}?view=trace&at=2700`, { waitUntil: 'networkidle' })
   await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
   await page.locator('[data-trace-now] [data-now-node=query]').click({ timeout: 5000 }).catch(() => {})
   await page.waitForTimeout(150)
   const secondExec = await warnsOf()
-  check('回放到第二次执行：说收尾轮还想调工具、交出来的可能不完整，不说「重答」',
-    secondExec.includes('收尾轮仍想调用工具') && !secondExec.includes('重答'), secondExec || '（没有提醒）')
+  check('回放到第二次执行：说收尾轮还想调工具、交出来的可能不完整，不说「重新作答」',
+    secondExec.includes('收尾时仍试图调用工具') && !secondExec.includes('重新作答'), secondExec || '（没有提醒）')
   await page.locator('[data-run-trace] [role=slider]').focus().catch(() => {})
   await page.keyboard.press('End')
   await page.waitForTimeout(150)
@@ -1326,16 +1360,16 @@ await section('航迹：节点卡片按这一次执行说事（3C REQ-13）', as
     await mode() === '终态' && await page.locator('[data-trace-node=query]').count() === 1 && !(await warnsOf()),
     `${await mode()} ${await warnsOf() || '（没有提醒）'}`)
   // 关键时刻和节点卡同一个说法：两次执行各一个时刻，各用各的措辞。以前只取整次运行最后一次，
-  // 第一次那下从列表里消失，收尾轮那下又被写成「把工具调用写成了文字」（3C REQ-23）
+  // 第一次那下从列表里消失，收尾轮那下又被写成「以文本形式输出了工具调用」（3C REQ-23）
   const reMoments = await page.locator('[data-trace-moments] [data-moment*=":markup"]').evaluateAll((els) =>
     els.map((e) => ({ key: e.getAttribute('data-moment'), text: (e.textContent ?? '').replace(/\s+/g, ' ') })))
   const nudgeM = reMoments.find((m) => m.key === 'query:markup0')
   const settleM = reMoments.find((m) => m.key === 'query:markup')
   check('两次执行各有一个时刻：前一次带序号，最后一次沿用 query:markup', reMoments.length === 2 && !!nudgeM && !!settleM,
     reMoments.map((m) => m.key).join(', '))
-  check('第一次写「把工具调用写成了文字、提醒之后重答了」，第二次写「收尾轮仍想调用工具」',
-    !!nudgeM?.text.includes('把工具调用写成了文字') && !!nudgeM?.text.includes('重答') && !nudgeM?.text.includes('收尾轮')
-      && !!settleM?.text.includes('收尾轮仍想调用工具') && !settleM?.text.includes('写成了文字'),
+  check('第一次写「以文本形式输出了工具调用、已提醒并重新作答」，第二次写「收尾时仍试图调用工具」',
+    !!nudgeM?.text.includes('以文本形式输出了工具调用') && !!nudgeM?.text.includes('重新作答') && !nudgeM?.text.includes('收尾时')
+      && !!settleM?.text.includes('收尾时仍试图调用工具') && !settleM?.text.includes('以文本形式输出'),
     reMoments.map((m) => m.text).join(' | '))
 })
 
@@ -1362,7 +1396,7 @@ await section('失败的节点在工作流现在的图里已经没了', async ()
   const goneHead = page.locator('[data-run-detail] > header [data-action=open-canvas]')
   check('详情头照样能在画布中回放，只是不带对不上的 focus',
     await goneHead.getAttribute('href').catch(() => null) === `/studio/${wfHost.id}?run=${GONE}`
-      && !/对准/.test(await goneHead.getAttribute('title').catch(() => '') ?? ''),
+      && !/定位到/.test(await goneHead.getAttribute('title').catch(() => '') ?? ''),
     await goneHead.getAttribute('href').catch(() => '没有这个按钮') ?? '')
   await page.locator('[data-run-banner=failed] [data-action=locate-trace]').click().catch(() => {})
   await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
@@ -1432,7 +1466,7 @@ await section('列表：每行一条缩略条', async () => {
   const CANCEL_ROW = 'fake0cancelrow0000000000000000'
   const failedRow = { ...traceRun(FAILED_ROW), status: 'failed', error: '节点「汇总」失败：模型服务出错了（HTTP 500）', error_node_id: 'sum',
     usage: { wall_ms: 4000, active_ms: 4000, wait_ms: 0, duration_ms: 4000 }, finished_at: iso(tt + 4) }
-  const cancelRow = { ...traceRun(CANCEL_ROW), status: 'cancelled', error: '用户取消：在等审批时放弃了这次运行',
+  const cancelRow = { ...traceRun(CANCEL_ROW), status: 'cancelled', error: '用户取消：等待审批时放弃了这次运行',
     usage: { wall_ms: 90000, active_ms: 3000, wait_ms: 87000, duration_ms: 3000 }, finished_at: iso(tt + 90) }
   fakes.set('GET /api/runs', () => ({ status: 200, json: [traceRun(TRACE), failedRow, cancelRow, ...listTop] }))
   await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
@@ -1441,12 +1475,12 @@ await section('列表：每行一条缩略条', async () => {
   check('每一行都有一条缩略条', shapeCount === await rowsOf().count() && shapeCount > 0, `${shapeCount} 条`)
   const waitFrac = await page.locator(`[data-run-id="${TRACE}"] [data-shape-seg=wait]`).evaluate(
     (el) => el.getBoundingClientRect().width / el.parentElement.getBoundingClientRect().width).catch(() => 0)
-  check('等人占了九成八的墙钟，缩略条上等人那段也占大半', waitFrac > 0.9, waitFrac.toFixed(2))
+  check('等待审批占了九成八的总时长，缩略条上等待那段也占大半', waitFrac > 0.9, waitFrac.toFixed(2))
   check('失败的那一行收在失败色上', await page.locator(`[data-run-id="${FAILED_ROW}"] [data-shape-end=failed]`).count() === 1)
-  check('缩略条的 title 写着执行和等人',
-    /执行 .+ · 等人 .+/.test(await page.locator(`[data-run-id="${TRACE}"] [data-run-shape]`).getAttribute('title').catch(() => '') ?? ''))
+  check('缩略条的 title 写着执行时长和等待审批',
+    /执行时长 .+ · 等待审批 .+/.test(await page.locator(`[data-run-id="${TRACE}"] [data-run-shape]`).getAttribute('title').catch(() => '') ?? ''))
   const cancelText = (await page.locator(`[data-run-id="${CANCEL_ROW}"]`).innerText().catch(() => '')).replace(/\s+/g, ' ')
-  const cancelWhy = cancelText.includes('在等审批时放弃了这次运行')
+  const cancelWhy = cancelText.includes('等待审批时放弃了这次运行')
   const cancelDup = cancelText.includes('用户取消')
   // 这一行的工作流名借的是沙箱里的真实工作流，只报两项判断
   check('已取消写原因，不重复「用户取消」', cancelWhy && !cancelDup, `原因 ${cancelWhy ? '在' : '缺'} · 「用户取消」${cancelDup ? '重复了' : '没重复'}`)
@@ -1487,7 +1521,7 @@ await section('工作流筛选：未保存的工作流', async () => {
       check('放弃前要确认，并写清待审批一并关闭', (await ask.innerText().catch(() => '')).includes('待审批'))
       const tc = Date.now() / 1000
       fakes.set(`GET /api/runs/${target.run_id}`, () => ({ status: 200, json: {
-        ...full, status: 'cancelled', error: '用户取消：在等审批时放弃了这次运行', finished_at: iso(tc),
+        ...full, status: 'cancelled', error: '用户取消：等待审批时放弃了这次运行', finished_at: iso(tc),
       } }))
       fakes.set(`GET /api/runs/${target.run_id}/events`, () => ({ status: 200, json: [...evs, {
         seq: (evs.at(-1)?.seq ?? 0) + 1, type: 'run.cancelled', node_id: null, ts: tc,
@@ -1545,7 +1579,7 @@ await section('等了几天的审批、1024 宽', async () => {
     await page.goto(`${WEB}/runs/${STALE}?view=trace`, { waitUntil: 'networkidle' })
     await page.locator('[data-trace-readout]').waitFor({ timeout: 5000 }).catch(() => {})
     const waitRead = await readout('wait')
-    check(`${w} 宽：等人写成跨天的跨度（10 天 05 小时），不被截断`,
+    check(`${w} 宽：等待审批写成跨天的跨度（10 天 05 小时），不被截断`,
       waitRead.startsWith('10 天 05 小时') && await fits('[data-trace-readout] [data-readout=wait]'), waitRead)
     const atRead = (await readout('at')).trim()
     check(`${w} 宽：游标写成跨天的时刻（T+10 天 05:30:xx），不被截断`,
@@ -1798,26 +1832,26 @@ await section('证据页签：左边报告、右边常驻面板、下方审计�
   check('显示封存核对的结果', await page.locator('[data-evidence-seal]').getAttribute('data-evidence-seal') === 'done'
     && seal.includes('已封存 · 核对一致') && seal.includes('88'), seal)
   check('……也说报告文档的哈希一致', (await page.locator('[data-evidence-doc-hash=ok]').innerText().catch(() => '')).includes('写周报'))
-  check('审计表按状态分组：无证据、可疑实体在前，有出处在后', (await auditGroups()).join(',') === 'none,suspicious,cited',
+  check('审计表按状态分组：无证据、可疑名称在前，有出处在后', (await auditGroups()).join(',') === 'none,suspicious,cited',
     (await auditGroups()).join(','))
   const counts = await page.locator('[data-audit-group-toggle]').allInnerTexts()
-  check('每组写着条数（无证据 3、可疑实体 3、有出处 10）', counts.join('|').includes('无证据\n3') || (counts[0].includes('3') && counts[1].includes('3') && counts[2].includes('10')),
+  check('每组写着条数（无证据 3、可疑名称 3、有出处 10）', counts.join('|').includes('无证据\n3') || (counts[0].includes('3') && counts[1].includes('3') && counts[2].includes('10')),
     counts.join(' | ').replace(/\n/g, ' '))
   check('一共 16 行', await auditRowsShown() === 16, String(await auditRowsShown()))
   // 这张图的出口没有出具契约：后端说「要求了，但没有契约按它判档」，不说「出具时计入缺口」。表里照后端的原话写
   const claim = page.locator('[data-audit-table] tbody[data-audit-group=none] tr[data-audit-row]', { hasText: '另外参考了' })
   const claimNote = fxe.audit.groups.find((g) => g.key === 'none')?.rows.find((r) => r.kind === 'claim')?.note ?? '（夹具里没有结论句那行）'
-  check('没挂依据的结论句也列在无证据里，原因照后端的原话（claims: require_citation、没有出具契约）', await claim.count() === 1
-    && claimNote.includes('require_citation') && (await claim.innerText()).includes(claimNote), claimNote)
-  check('可疑实体那组有「可能是编造的名字」和「核对不了」', (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText())
-    .includes('可能是编造的名字') && (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText()).includes('核对不了'))
+  check('没挂依据的结论句也列在无证据里，原因照后端的原话（要求结论句附依据、没有出具契约据此判档）', await claim.count() === 1
+    && claimNote.includes('要求结论句附依据') && claimNote.includes('没有出具契约据此判档') && (await claim.innerText()).includes(claimNote), claimNote)
+  check('可疑名称那组有「疑似不存在的名称」和「无法核实」', (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText())
+    .includes('疑似不存在的名称') && (await page.locator('[data-audit-table] tbody[data-audit-group=suspicious]').innerText()).includes('无法核实'))
   check('有出处的行写着在封存范围内', await page.locator('[data-audit-table] tbody[data-audit-group=cited] [data-audit-sealed=yes]').count() === 10)
   check('反引号里的名字在表里不带反引号', !(await page.locator('[data-audit-table]').innerText()).includes('`'))
 
-  // 只看无证据 / 可疑实体
+  // 只看无证据 / 可疑名称
   await page.locator('[data-audit-filter-option=problems]').click()
   await page.waitForTimeout(200)
-  check('筛选「只看无证据 / 可疑实体」：只剩这两组', (await auditGroups()).join(',') === 'none,suspicious' && await auditRowsShown() === 6,
+  check('筛选「只看无证据 / 可疑名称」：只剩这两组', (await auditGroups()).join(',') === 'none,suspicious' && await auditRowsShown() === 6,
     `${(await auditGroups()).join(',')} ${await auditRowsShown()}`)
   check('筛选是一组单选（radio），选中的那项 aria-checked', await page.locator('[data-audit-filter-option=problems]').getAttribute('aria-checked') === 'true')
 
@@ -1930,7 +1964,7 @@ await section('证据页签：同一段文字里好几条同样的违规、正�
     check('只有正文里点得开的片段画成按钮（文字片段、结构片段上的违规不是）', openers.join(',') === 's1', openers.join(',') || '一个都没有')
     const hidden = page.locator('[data-audit-table] tr[data-audit-row]:has([data-audit-hidden])')
     check('……点不开的五行都说清只在表里列出', await hidden.count() === 5
-      && (await hidden.first().innerText()).includes('只在这里列出'), String(await hidden.count()))
+      && (await hidden.first().innerText()).includes('仅在此处列出'), String(await hidden.count()))
     const deadKey = keys.find((k, i) => texts[i] === 'orders.promo_code')
     await page.locator(`[data-audit-table] [data-audit-focus="${deadKey}"]`).focus()
     await page.keyboard.press('Enter')
@@ -1953,7 +1987,7 @@ await section('证据页签：没有报告的运行照实说明（none / 旧运�
   check('没有契约的旧运行：mode 是 legacy_text，照实说', await page.locator('[data-evidence-pane=legacy_text]').count() === 1
     && (await page.locator('[data-evidence-mode-note=legacy_text]').innerText()).includes('没有出具契约'))
   check('猜测默认收起', await page.locator('[data-evidence-legacy-text] [data-ev-guess]').getAttribute('data-open') === 'false')
-  check('审计表里「旧运行猜测」那组默认收起', await page.locator('tbody[data-audit-group=candidate]').getAttribute('data-audit-collapsed') === '1'
+  check('审计表里「按数值猜测」那组默认收起', await page.locator('tbody[data-audit-group=candidate]').getAttribute('data-audit-collapsed') === '1'
     && await page.locator('tbody[data-audit-group=candidate] tr[data-audit-row]').count() === 0)
   await page.locator('[data-evidence-legacy-text] [data-ev-guess-toggle]').click()
   check('展开猜测写明「猜测的来源，不能当证据」', (await page.locator('[data-evidence-legacy-text] [data-ev-guess-note]').innerText().catch(() => ''))
@@ -1971,7 +2005,7 @@ await section('证据页签：没有报告的运行照实说明（none / 旧运�
   }
 
   evFakes(EV_NONE, { output: { answer: '这次没有数字' }, report: false,
-    graph: { schema: 'agentlab.evidence/1', mode: 'none', note: '这次运行没有报告文档，也没有出具契约，没有可以展示的证据', seal: { sealed: true, ok: true },
+    graph: { schema: 'agentlab.evidence/1', mode: 'none', note: '本次运行没有报告文档，也没有出具契约，没有可展示的证据', seal: { sealed: true, ok: true },
              reports: [], evidence: [], edges: [] },
     audit: { schema: 'agentlab.evidence.audit/1', mode: 'none', seal: { sealed: true, ok: true }, reports: [], groups: [], counts: {}, total: 0 } })
   await openEvidence(EV_NONE)
@@ -1987,7 +2021,7 @@ await section('证据页签：没有报告的运行照实说明（none / 旧运�
   const dl = page.waitForEvent('download', { timeout: 5000 }).catch(() => null)
   await page.locator('[data-audit-export=csv]').click()
   const d = await dl
-  check('……导出退回按页面上的清单，也照实说', !!d && (await page.locator('[data-toast], [role=status], [role=alert]').allInnerTexts()).join(' ').includes('后端没有导出接口'))
+  check('……导出退回按页面上的清单，也照实说', !!d && (await page.locator('[data-toast], [role=status], [role=alert]').allInnerTexts()).join(' ').includes('当前服务版本不支持导出'))
   for (const id of [EV, EV_LEGACY, EV_NONE, EV_OLD]) {
     for (const k of [...fakes.keys()]) if (k.includes(id)) fakes.delete(k)
   }
@@ -2049,10 +2083,10 @@ await section('证据页签：没有逐段证据的运行给升级横幅，跳�
   await openEvidence(UP)
   await banner().waitFor({ timeout: 5000 }).catch(() => {})
   const text = await banner().innerText().catch(() => '')
-  check('没有逐段证据（none）、图能升级：横幅「这次的报告没有逐段证据 → 升级这张图」', text.includes('这次的报告没有逐段证据')
-    && (await banner().locator('[data-upgrade-link]').innerText().catch(() => '')).trim() === '升级这张图', text)
+  check('没有逐段证据（none）、图能升级：横幅「本次报告没有逐段证据 → 升级此工作流」', text.includes('本次报告没有逐段证据')
+    && (await banner().locator('[data-upgrade-link]').innerText().catch(() => '')).trim() === '升级此工作流', text)
   check('……拿工作流现在的图去校验、按那条建议认', validated.includes('in,fetch,story,done'), validated.join(' | '))
-  check('……正式运行：说清升级之后要重新发布', text.includes('要重新发布'), text)
+  check('……正式运行：说清升级之后要重新发布', text.includes('需要重新发布'), text)
   const href = await banner().locator('[data-upgrade-link]').getAttribute('href').catch(() => '')
   check('跳转地址：编排页，带 upgrade=1', href === `/studio/${WF.id}?upgrade=1`, href)
   if (SHOTS) {

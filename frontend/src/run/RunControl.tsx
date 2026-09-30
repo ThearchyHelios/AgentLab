@@ -129,8 +129,8 @@ function blockedTitle(errors: ValidationIssue[], nodes: FlowNode[]): string {
   const node = first.node_id ? nodes.find((n) => n.id === first.node_id) : undefined
   const name = node ? node.data.label || NODE_DEFS[node.data.nodeType]?.label || node.id : ''
   const text = name && !first.message.includes(`「${name}」`) ? `「${name}」· ${first.message}` : first.message
-  const head = errors.length > 1 ? `${errors.length} 个问题会阻止运行，第一个：` : '这个问题会阻止运行：'
-  return `${head}${text}。${hintOf('全部列在问题面板里，点一条定位到节点', 'problems')}`
+  const head = errors.length > 1 ? `${errors.length} 个问题会阻止运行，第一个：` : '此问题会阻止运行：'
+  return `${head}${text}。${hintOf('所有问题均列在问题面板中，点击可定位到节点', 'problems')}`
 }
 
 /** 点外面、按 Esc 关掉浮层。浮层不能只靠再点一次按钮关——那是很容易漏掉的死路 */
@@ -194,8 +194,8 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
         aria-label="运行"
         aria-expanded={fields.length ? open : undefined}
         title={blocked
-          ? (errors.length ? blockedTitle(errors, nodes) : '画布是空的')
-          : `用画布当前内容发起一次${runClassLabel('exploratory')}`}
+          ? (errors.length ? blockedTitle(errors, nodes) : '画布为空')
+          : `使用画布当前内容发起一次${runClassLabel('exploratory')}`}
         onClick={() => {
           // 没有输入字段就没什么可填的，多弹一层只是多一次点击
           if (!fields.length) void launch()
@@ -215,7 +215,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
           <div className="sf-pop-head">
             <ClassDot formal={false} />
             <span>{runClassLabel('exploratory')}</span>
-            <span className="sf-dim">· 用画布当前内容，结果不归档</span>
+            <span className="sf-dim">· 使用画布当前内容，结果不归档</span>
           </div>
           <FieldsForm fields={fields} values={values} onChange={setValues} onSubmit={() => void launch()} />
           <button type="button" className="btn btn-primary w-full justify-center" disabled={busy}
@@ -223,7 +223,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
             {busy ? <Spinner size={11} /> : <Play size={11} fill="currentColor" />} {runClassLabel('exploratory')}
           </button>
           <div className="mt-1.5 flex items-center gap-1 text-2xs text-faint">
-            <Kbd combo="Mod+Enter" /> 在输入框里直接{runClassLabel('exploratory')}
+            <Kbd combo="Mod+Enter" /> 在输入框中直接发起{runClassLabel('exploratory')}
           </div>
         </div>
       )}
@@ -318,13 +318,13 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           </div>
           {ahead && (
             <div className="sf-pop-note">
-              不含画布改动：{dirty ? '画布上有未保存的改动' : `画布是 v${canvasVersion}，还没发布`}，这次运行的是 v{version}。
+              不含画布改动：{dirty ? '画布上有未保存的改动' : `画布为 v${canvasVersion}，尚未发布`}，本次运行使用 v{version}。
             </div>
           )}
           {fields == null && !loadError && <Skeleton rows={2} height={28} className="mb-2.5" />}
           {loadError != null && (
             <div className="sf-pop-note is-err">
-              取不到 v{version} 的输入字段：{errorMessage(loadError)}。
+              无法获取 v{version} 的输入字段：{errorMessage(loadError)}。
               <button type="button" className="underline" onClick={() => { setLoadError(null); setOpen(false); setTimeout(() => setOpen(true)) }}>
                 重试
               </button>
@@ -338,11 +338,11 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           )}
           {actor ? (
             <div className="sf-pop-sign" data-signer="signed">
-              将以「<b>{actor}</b>」的名义发起，写进运行记录
+              将以「<b>{actor}</b>」的名义发起，并记入运行记录
             </div>
           ) : (
             <div className="sf-pop-sign is-unsigned" data-signer="unsigned">
-              未署名：这次运行不会记录发起人 · <Link to="/settings/prefs">去设置署名</Link>
+              未署名：本次运行不会记录发起人 · <Link to="/settings/prefs">去设置署名</Link>
             </div>
           )}
           <button type="button" className="btn w-full justify-center sf-formal-go"
@@ -351,7 +351,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           </button>
           {!!fields?.length && (
             <div className="mt-1.5 flex items-center gap-1 text-2xs text-faint">
-              <Kbd combo="Mod+Enter" /> 在输入框里直接{runClassLabel('formal')}
+              <Kbd combo="Mod+Enter" /> 在输入框中直接发起{runClassLabel('formal')}
             </div>
           )}
         </div>

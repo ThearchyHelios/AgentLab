@@ -308,7 +308,7 @@ function foldFacts(map: Record<string, NodeFacts>, e: RunEvent, clock: number): 
     case 'log': {
       const message = String(d.message ?? '')
       if (d.code === 'tool_markup_leak') {
-        const mark = { at, message, settle: /收尾轮/.test(message) }
+        const mark = { at, message, settle: /收尾/.test(message) }
         next = { ...cur, markup: mark, markups: [...cur.markups, mark] }
       } else if (d.code === 'team_exhausted') {
         next = { ...cur, exhausted: { at, message }, exhausts: [...cur.exhausts, { at, message }] }
@@ -336,7 +336,7 @@ function foldFacts(map: Record<string, NodeFacts>, e: RunEvent, clock: number): 
     case 'agent.step.end':
       if (d.failed || d.error) {
         const agent = String(d.agent ?? '')
-        const error = typeof d.error === 'string' && d.error.trim() ? d.error.trim() : '这一步失败了，没有给出原因'
+        const error = typeof d.error === 'string' && d.error.trim() ? d.error.trim() : '此步骤失败，未返回原因'
         next = { ...cur, memberErrors: [...cur.memberErrors, { at, agent, error }] }
       }
       break

@@ -35,7 +35,7 @@ from sqlalchemy import select
 
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
-from app.core.errors import describe_exception
+from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Setting
@@ -556,16 +556,27 @@ def _limit_words(key: str) -> str:
 def settings_problem(value: Any) -> str | None:
     """设置页写进来的 judge 这一组有什么问题，没问题返回 None。"""
     if not isinstance(value, dict):
-        return f"裁判设置（judge）要写成一个对象，写的是 {value!r}"
+        return f"「证据裁判」设置格式有误，需要是一个对象，当前为「{value}」"
     for key, item in value.items():
         if key not in JUDGE_DEFAULTS:
-            return f"裁判设置里不认识「{key}」：能写的是 {'、'.join(JUDGE_DEFAULTS)}"
+            return (f"「证据裁判」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{SETTING_LABEL.get(k, k)}」" for k in JUDGE_DEFAULTS))
+        label = SETTING_LABEL.get(key, key)
         if key in ("provider", "model"):
             if item is not None and not isinstance(item, str):
-                return f"{key} 要写模型接入的名字 / 模型 id（字符串），写 null 表示不指定，写的是 {item!r}"
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示不指定，当前为「{item}」"
         elif not _limit_ok(key, item):
-            return f"{key} 要写{_limit_words(key)}，写 null 表示不限，写的是 {item!r}"
+            return f"「{label}」需要填写{_limit_words(key)}，留空表示不限，当前为「{item}」"
     return None
+
+
+#: 设置页「证据裁判」一组各项的叫法（前端 lib/terms.ts 的 JUDGE_SETTING_TEXT）
+SETTING_LABEL = {
+    "provider": "裁判模型 · 接入", "model": "裁判模型 · 模型",
+    "report_max_claims": "每份报告最多裁判句数", "report_max_cost_usd": "每份报告的金额上限（美元）",
+    "report_timeout_s": "每份报告的时长上限（秒）", "click_max_cost_usd": "每次点击的金额上限（美元）",
+    "daily_max_usd": "每日金额上限（美元）",
+}
 
 
 def sanitize_settings(stored: Any) -> dict[str, Any]:
@@ -801,24 +812,30 @@ def _unjudged(reason: str, rationale: str, *, judge: str | None, post_seal: bool
 
 def _limit_label(reason: str, budget: Budget, *, click: bool = False) -> str:
     if reason == "max_claims":
-        return f"每{'次' if click else '份报告'}最多判 {budget.max_claims} 句"
+        return f"每{'次点击' if click else '份报告'}最多裁判 {budget.max_claims} 句"
     if reason == "max_cost_usd":
-        return f"{'这次点击' if click else '这份报告'}的裁判金额上限 ${budget.max_cost_usd:g}"
+        return f"{'这次点击' if click else '这份报告'}的裁判金额上限 {_usd(budget.max_cost_usd)}"
     if reason == "daily_max_usd":
-        return f"全局每日裁判金额上限 ${budget.daily_max_usd:g}"
+        return f"全局每日裁判金额上限 {_usd(budget.daily_max_usd)}"
     return f"裁判时长上限 {budget.timeout_s:g} 秒"
+
+
+def _usd(amount: Any) -> str:
+    """金额写两位小数（$0.05）；比一分钱还细的上限照实写，不四舍五入成别的数。"""
+    value = float(amount or 0)
+    return f"${value:.2f}" if round(value, 2) == value else f"${value:g}"
 
 
 def _why_unjudged(reason: str, budget: Budget, detail: str = "", *, click: bool = False) -> str:
     if reason in LIMITS:
-        return f"已到上限（{_limit_label(reason, budget, click=click)}），这句没判"
+        return f"已达上限（{_limit_label(reason, budget, click=click)}），这句未裁判"
     if reason == "error":
-        return f"裁判没跑成：{detail}"[:120]
+        return f"裁判失败：{detail}"[:120]
     if reason == "format":
-        return detail or "裁判给的结果格式不对，这句没判"
+        return detail or "裁判返回的结果格式有误，这句未裁判"
     if reason == "missing":
-        return "裁判没有给这句判定"
-    return "探索运行按需裁判：点开这句、请模型判断时才判"
+        return "裁判未对这句给出判定"
+    return "探索运行按需裁判：点开这句并请模型判断后才会裁判"
 
 
 async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget, known: dict[str, Any] | None = None,
@@ -850,8 +867,8 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(session, spec)
     except Exception as e:  # noqa: BLE001 - 裁判模型没配好：这回判不了，报告照常
-        why = str(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
-        details["error"] = f"裁判模型用不了（{why}）"
+        why = not_configured(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
+        details["error"] = f"裁判模型不可用（{why}）"
     judge = model_id or None
     priced = model is not None and pricing.find_pricing(model_id) is not None
     keys = {c.unit: request.unit_key(c, model_id) for c in request.cands}
@@ -878,8 +895,8 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         stop(pending, "error", details["error"])
         pending = []
     elif pending and not priced and (budget.max_cost_usd is not None or budget.daily_max_usd is not None):
-        note = (f"模型「{model_id}」不在价格目录里，按令牌估不出金额：金额上限（每份报告、每次点击、每日）对它不起作用，"
-                "费用只受句数、时长上限约束")
+        note = (f"模型「{model_id}」不在价格目录中，无法按 token 数估算金额：金额上限（每份报告、每次点击、每日）"
+                "对其无效，费用只受句数和时长上限约束")
         notes.append(note)
         emit(EventType.LOG, level="warn", code="judge_unpriced", message=note)
 
@@ -974,9 +991,9 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         labels = "、".join(_limit_label(r, label, click=click) for r in hit)
         n = sum(outcome["unjudged"].get(r, 0) for r in hit)
         emit(EventType.LOG, level="warn", code="judge_limit", limits=hit, unjudged=n,
-             message=f"结论句裁判已到上限（{labels}）：{n} 句没判，记为未裁判；已判的保留")
+             message=f"结论句裁判已达上限（{labels}）：{n} 句未裁判，已裁判的结果保留")
     if failed := [g for r, g in outcome["_gaps"] if r not in LIMITS]:
-        emit(EventType.LOG, level="warn", code="judge_failed", message="结论句裁判没跑完：" + "；".join(failed))
+        emit(EventType.LOG, level="warn", code="judge_failed", message="结论句裁判未完成：" + "；".join(failed))
     outcome.pop("_gaps")
     return outcome
 
@@ -995,7 +1012,7 @@ def _take(items: list[Any], batch: list[Candidate], request: JudgeRequest, verdi
             continue
         status = str(item.get("verdict") or "").strip().lower()
         if status not in JUDGED:
-            verdicts[uid] = _unjudged("format", f"裁判给的判定「{str(item.get('verdict'))[:20]}」不认识，这句没判",
+            verdicts[uid] = _unjudged("format", f"裁判返回的判定「{str(item.get('verdict'))[:20]}」无法识别，这句未裁判",
                                       judge=judge, post_seal=post_seal)
             continue
         used = item.get("used") if isinstance(item.get("used"), list) else []
@@ -1022,13 +1039,13 @@ def _outcome(request: JudgeRequest, verdicts: dict[str, dict[str, Any]], budget:
         if not n or reason == "on_demand":
             continue
         if reason in LIMITS:
-            text = f"有 {n} 句结论没裁判：已到上限（{_limit_label(reason, label, click=click)}）"
+            text = f"有 {n} 句结论未裁判：已达上限（{_limit_label(reason, label, click=click)}）"
         elif reason == "error":
-            text = f"有 {n} 句结论没裁判：裁判调用失败（{details.get('error') or '原因不明'}）"
+            text = f"有 {n} 句结论未裁判：裁判调用失败（{details.get('error') or '原因不明'}）"
         elif reason == "format":
-            text = f"有 {n} 句结论没裁判：裁判给的结果格式不对"
+            text = f"有 {n} 句结论未裁判：裁判返回的结果格式有误"
         else:
-            text = f"有 {n} 句结论裁判漏判了"
+            text = f"有 {n} 句结论未获得裁判结果"
         gaps.append((reason, text))
     return {
         "verdicts": {c.unit: verdicts[c.unit] for c in sorted(request.cands, key=lambda c: c.order)},

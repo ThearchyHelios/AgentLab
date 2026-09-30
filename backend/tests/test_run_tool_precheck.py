@@ -79,7 +79,7 @@ async def test_a_missing_datasource_tool_is_refused_and_named(client):
     body = res.json()
     assert body["code"] == "run_tool_missing"
     assert "「取数」" in body["detail"] and "db_query__nope" in body["detail"]
-    assert "去数据页接入，或在节点里重新选" in body["detail"]
+    assert "请到「数据」页接入，或在节点中重新选择" in body["detail"]
 
 
 async def test_every_missing_binding_is_listed(client):

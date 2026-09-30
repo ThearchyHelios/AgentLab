@@ -234,9 +234,9 @@ def _table_of(table: Any) -> dict[str, Any]:
             data = json.loads(data)
         except ValueError:
             # 查库失败时工具交回的是一句话（「查询失败：…」）：原话照搬，比「不是 JSON」有用
-            raise CellError(f"要的是查询结果，拿到的是「{data.strip()[:80]}」") from None
+            raise CellError(f"需要查询结果，实际得到的是「{data.strip()[:80]}」") from None
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
-        raise CellError("第一个参数要是查询结果：查询工具交回的 JSON 文本，或者 {columns, rows}")
+        raise CellError("第一个参数需要是查询结果：查询工具返回的 JSON 文本，或 {columns, rows} 结构")
     return data
 
 
@@ -245,30 +245,30 @@ def locate_cell(table: Any, row: Any, column: Any) -> tuple[Any, str]:
     data = _table_of(table)
     rows = data["rows"]
     if isinstance(row, bool) or not isinstance(row, int):
-        raise CellError(f"行号要是从 0 数的整数，写的是 {row!r}")
+        raise CellError(f"行号需为从 0 开始的整数，当前为「{row}」")
     if not rows:
-        raise CellError("这份查询结果是空的（0 行）")
+        raise CellError("查询结果为空（0 行）")
     if not 0 <= row < len(rows):
-        raise CellError(f"要第 {row} 行，但这份查询结果只有 {len(rows)} 行（从 0 数）")
+        raise CellError(f"请求第 {row} 行，但查询结果只有 {len(rows)} 行（行号从 0 开始）")
     record = rows[row]
     columns = [str(c) for c in data.get("columns") or []]
     if isinstance(record, dict):
         columns = columns or [str(k) for k in record]
     if isinstance(column, int) and not isinstance(column, bool):
         if not 0 <= column < len(columns):
-            raise CellError(f"要第 {column} 列，但只有 {len(columns)} 列（从 0 数）")
+            raise CellError(f"请求第 {column} 列，但查询结果只有 {len(columns)} 列（列号从 0 开始）")
         column = columns[column]
     elif not isinstance(column, str):
-        raise CellError(f"列要写列名，或者从 0 数的列号，写的是 {column!r}")
+        raise CellError(f"列需填写列名或从 0 开始的列号，当前为「{column}」")
     if isinstance(record, dict):
         if column not in record:
-            raise CellError(f"没有列「{column}」，有：{'、'.join(columns[:12])}")
+            raise CellError(f"没有列「{column}」，可用的列：{'、'.join(columns[:12])}")
         return record[column], column
     if column not in columns:
-        raise CellError(f"没有列「{column}」，有：{'、'.join(columns[:12])}")
+        raise CellError(f"没有列「{column}」，可用的列：{'、'.join(columns[:12])}")
     index = columns.index(column)
     if not isinstance(record, (list, tuple)) or index >= len(record):
-        raise CellError(f"第 {row} 行没有「{column}」这一格")
+        raise CellError(f"第 {row} 行中没有「{column}」对应的单元格")
     return record[index], column
 
 
@@ -329,7 +329,19 @@ _NODE_NAMES = {
     "ListComp": "列表推导式", "SetComp": "集合推导式", "DictComp": "字典推导式",
     "GeneratorExp": "生成器表达式", "Lambda": "lambda", "JoinedStr": "f-string",
     "NamedExpr": ":=", "Slice": "切片 a[i:j]", "Starred": "* 展开", "Await": "await",
+    "Set": "集合写法",
 }
+#: 不支持的运算符给人看的写法：报错里写符号，不写 Python 的类名（BitOr）
+_OP_SYMBOLS = {
+    "BitOr": "|", "BitAnd": "&", "BitXor": "^", "LShift": "<<", "RShift": ">>", "MatMult": "@",
+    "Invert": "~",
+}
+
+
+def _unsupported(name: str) -> str:
+    """「表达式中不支持列表推导式」「表达式中不支持 lambda」：英文写法前面空一格。"""
+    label = _NODE_NAMES.get(name, name)
+    return f"表达式中不支持{' ' if label[:1].isascii() else ''}{label}"
 
 
 
@@ -365,24 +377,24 @@ def _check_static(tree: ast.Expression) -> list[str]:
         if isinstance(node, ast.BinOp) and type(node.op) not in _BIN_OPS:
             if isinstance(node.op, ast.BitOr):
                 raise ExpressionError(
-                    "表达式里没有 | 过滤器（那是模板的写法）：取长度写 len(x)，大小写写 upper(x) / lower(x)"
+                    "表达式中不支持 | 过滤器（那是模板的写法）：取长度请写 len(x)，转换大小写请写 upper(x) / lower(x)"
                 )
-            raise ExpressionError(f"不支持的运算符 {type(node.op).__name__}")
+            op_name = type(node.op).__name__
+            raise ExpressionError(f"不支持运算符 {_OP_SYMBOLS.get(op_name, op_name)}")
         if not isinstance(node, _ALLOWED_NODES):
             if isinstance(node, ast.Set):
-                raise ExpressionError("表达式里不支持集合 {…}：要判断是不是其中之一，用列表 x in ['a', 'b']")
-            name = type(node).__name__
-            raise ExpressionError(f"表达式里不允许出现 {_NODE_NAMES.get(name, name)}")
+                raise ExpressionError("表达式中不支持集合写法 {…}：如需判断是否属于其中之一，请使用列表，例如 x in ['a', 'b']")
+            raise ExpressionError(_unsupported(type(node).__name__))
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCS:
                 called = node.func.id if isinstance(node.func, ast.Name) else ast.unparse(node.func)
-                raise ExpressionError(f"不认识的函数 {called}()，能用的只有：{'、'.join(_SAFE_FUNCS)}")
+                raise ExpressionError(f"不支持函数 {called}()，可用的函数：{'、'.join(_SAFE_FUNCS)}")
         elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise ExpressionError("不允许访问私有属性")
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
               and _TEMPLATE_RE.search(node.value)):
             raise ExpressionError(
-                f"字符串 {node.value!r} 里的 {{{{ }}}} 不会被渲染——表达式不过模板，直接写路径，比如 vars.x"
+                f"字符串「{node.value}」中的 {{{{ }}}} 不会被渲染：表达式不经过模板渲染，请直接写路径，例如 vars.x"
             )
         elif (isinstance(node, ast.Name) and node.id not in EXPRESSION_ROOTS
               and node.id not in _SAFE_FUNCS and node.id not in _LITERAL_NAMES):
@@ -400,12 +412,12 @@ def parse_expression(expr: str) -> tuple[ast.Expression, list[str], list[str]]:
     try:
         tree = ast.parse(text, mode="eval")
     except SyntaxError as e:
-        hint = "（判断相等要写 ==）" if re.search(r"(?<![=!<>])=(?!=)", text) else ""
+        hint = "（判断相等请写 ==）" if re.search(r"(?<![=!<>])=(?!=)", text) else ""
         raise ExpressionError(f"表达式语法错误：{e.msg}{hint}") from e
     unbrace = _Unbrace()
     tree = ast.fix_missing_locations(unbrace.visit(tree))
     if sum(1 for _ in ast.walk(tree)) > _MAX_NODES:
-        raise ExpressionError("表达式太复杂")
+        raise ExpressionError("表达式过于复杂")
     unknown = _check_static(tree)
     return tree, unbrace.found, unknown
 
@@ -620,7 +632,7 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
             return _eval(node.body) if _eval(node.test) else _eval(node.orelse)
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCS:
-                raise ExpressionError("只能调用白名单函数")
+                raise ExpressionError("只能调用允许的函数")
             args = [_eval(a) for a in node.args]
             kwargs = {kw.arg: _eval(kw.value) for kw in node.keywords if kw.arg}
             return _SAFE_FUNCS[node.func.id](*args, **kwargs)
@@ -632,7 +644,7 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
                 for k, v in zip(node.keys, node.values)
                 if k is not None
             }
-        raise ExpressionError(f"表达式里不允许出现 {type(node).__name__}")
+        raise ExpressionError(_unsupported(type(node).__name__))
 
     return _eval(tree)
 

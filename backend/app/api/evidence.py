@@ -82,24 +82,24 @@ SEGMENT_NOT_FOUND = "evidence_segment_not_found"
 DOC_MISSING = "evidence_doc_missing"
 DOC_TAMPERED = "evidence_doc_tampered"
 
-LEGACY_NOTE = "旧版出具：按数值匹配，不是显式引用。同一个值对得上好几个指标时，出处不唯一"
-NONE_NOTE = "这次运行没有报告文档，也没有出具契约，没有可以展示的证据"
-NO_DOC_NOTE = "这次运行的出具契约用的是引用模式，但报告没有产出可以核对的文档"
+LEGACY_NOTE = "旧版出具：按数值匹配，不是显式引用。同一个值与多个指标相符时，出处不唯一"
+NONE_NOTE = "本次运行没有报告文档，也没有出具契约，没有可展示的证据"
+NO_DOC_NOTE = "本次运行的出具契约采用引用模式核对，但报告没有产出可核对的文档"
 
 MASKED = "已遮罩"
-MASK_NOTE = "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+MASK_NOTE = "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
 #: 查询条目的数据源现在找不到了（改名或删掉了）：只能按快照里记下的、查询当时的遮罩来遮
-SOURCE_GONE = "数据源「{source}」现在找不到了（改名或删掉了），按查询当时记下的遮罩处理"
+SOURCE_GONE = "数据源「{source}」已不存在（可能已改名或删除），按查询时记录的遮罩处理"
 #: 查询步骤给被引用的行前后各带几行
 WINDOW = 2
 #: 一个查询步骤最多给多少行：数组字段引用了一大段行时，窗口不能把整份快照搬过来
 MAX_WINDOW_ROWS = 50
-UNSEALED_QUERY = "这份查询快照不在封存范围内的任何事件里（没有哪次查询在封存前交回过它），不能当证据展示"
-TAMPERED_QUERY = "查询快照和它的哈希对不上，疑似被改过，不展示其中的行"
-MISSING_QUERY = "查询快照在工件库里取不回来"
-UNSEALED_RETRIEVAL = "这份检索快照不在封存范围内的任何事件里（没有哪次检索在封存前交回过它），不能当证据展示"
-TAMPERED_RETRIEVAL = "检索快照和它的哈希对不上，疑似被改过，不展示原文"
-MISSING_RETRIEVAL = "检索快照在工件库里取不回来，或者里面没有这条命中"
+UNSEALED_QUERY = "这份查询快照不属于封存范围内的任何事件（封存前没有任何查询返回过它），不能作为证据展示"
+TAMPERED_QUERY = "查询快照与哈希不一致，疑似被修改，不展示其中的行"
+MISSING_QUERY = "无法读取查询快照"
+UNSEALED_RETRIEVAL = "这份检索快照不属于封存范围内的任何事件（封存前没有任何检索返回过它），不能作为证据展示"
+TAMPERED_RETRIEVAL = "检索快照与哈希不一致，疑似被修改，不展示原文"
+MISSING_RETRIEVAL = "无法读取检索快照，或其中没有这条命中"
 
 
 # --------------------------------------------------------------------------
@@ -554,7 +554,7 @@ def _metric_sources(sealed: _Sealed, nodes: list[Any]) -> dict[str, list[dict[st
 #: 只缓存封存完好的运行：还在跑、停在审批的运行事件还会变，封存链断了的运行不该被一份旧结果盖住
 GUESS_CACHE_SIZE = 64
 _guess_cache: OrderedDict[tuple[Any, ...], dict[str, Any] | None] = OrderedDict()
-NO_CANDIDATE = "旧答案里的这个数，在这次运行封存的查询结果和口径卡里没有找到相同的值"
+NO_CANDIDATE = "旧版答案中的这个数字，在本次运行封存的查询结果和口径卡中没有找到相同的值"
 
 
 async def _mask_fingerprint() -> dict[str, list[str]]:
@@ -672,15 +672,15 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     sealed = await _sealed(run_id)
     reports = _reports(sealed)
     if not reports:
-        raise CodedHTTPException(404, "这次运行没有封存的报告文档，没有可以点开的片段", REPORT_NOT_FOUND)
+        raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
     chosen = _choose(reports, report, sealed)
     if chosen.hash_ok is False:
-        raise CodedHTTPException(409, "报告文档和它的哈希对不上，疑似被改过，不能再当证据展示", DOC_TAMPERED)
+        raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
     if chosen.doc is None:
-        raise CodedHTTPException(404, "报告文档在工件库里取不回来", DOC_MISSING)
+        raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
     found = find_segment(chosen.doc, segment_id)
     if found is None:
-        raise CodedHTTPException(404, f"报告里没有片段 {segment_id}", SEGMENT_NOT_FOUND)
+        raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
 
     block, unit, seg = found
     doc = chosen.doc
@@ -713,7 +713,7 @@ def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Rep
     if wanted:
         chosen = next((r for r in reports if r.node_id == wanted), None)
         if chosen is None:
-            raise CodedHTTPException(404, f"这次运行里没有报告节点 {wanted} 的文档", REPORT_NOT_FOUND)
+            raise CodedHTTPException(404, "本次运行中没有所选报告撰写节点的文档", REPORT_NOT_FOUND)
         return chosen
     primary = next(iter(_output_evidence(sealed)), {})
     return next((r for r in reports if r.node_id == primary.get("report_node")), reports[0])
@@ -1150,35 +1150,35 @@ def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
     issue = seg.get("issue")
     cite = seg.get("cite") or {}
     if issue == "uncited_number":
-        return "这个数字没有出处：写作者直接写了数字，没有用引用标记，系统没法核对它"
+        return "这个数字没有出处：报告中直接写出了数字，而不是引用标记，系统无法核对"
     if issue == "unresolved_ref":
-        return f"引用解析不了：{cite.get('reason') or '证据目录里没有它'}"
+        return f"引用无法解析：{cite.get('reason') or '本次运行的证据中没有它'}"
     if issue == "unknown_entity":
         return UNKNOWN_ENTITY_REASON
     if issue == "unverified_entity":
-        return f"核对不了：{UNVERIFIED_ENTITY_REASON}"
+        return f"无法核实：{UNVERIFIED_ENTITY_REASON}"
     if seg.get("state") == "deterministic" and seg.get("kind") == "entity":
-        lead = "系统在正文里认出的表名、字段名：" if seg.get("auto") else ""
-        return (f"{lead}这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列里确实存在。"
-                "只核对它存在、这次用过，不核对它的业务含义")
+        lead = "系统在正文中识别出的表名、字段名：" if seg.get("auto") else ""
+        return (f"{lead}这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。"
+                "仅核对它存在且本次用到，不核对其业务含义")
     if seg.get("state") == "deterministic" and seg.get("kind") == "quote":
-        return "这段原话在知识库检索命中的片段里逐字出现（空白归一化后比对），由系统核对过"
+        return "这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对"
     if seg.get("state") == "deterministic" and cite.get("kind") == "cell":
-        return "这个值由系统从查询快照里取出、按固定规则渲染，没有经过模型转写"
+        return "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
     if seg.get("state") == "deterministic":
-        return "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写"
+        return "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写"
     kind = seg.get("kind")
     if kind == "structural":
-        return "这是 Markdown 的版式符号"
+        return "这是排版符号"
     if unit.get("kind") == "heading":
         return "这是标题"
     if unit.get("kind") == "connective":
-        return "这是连接性文字，不陈述数据事实，所以不需要证据"
+        return "这是连接性文字，不陈述数据事实，无需证据"
     cites = [str(c) for c in unit.get("cites") or []]
     if cites:
-        return (f"这是结论句里的文字，这句挂了依据：{'、'.join(cites[:4])}{' 等' if len(cites) > 4 else ''}。"
-                "依据支不支持这句话，系统核对不了，只能由模型判断（模型的判断不是确定性的）")
-    return "这是结论句里的文字，这句没有挂依据。句子本身有没有依据，系统核对不了，只能由模型判断（模型的判断不是确定性的）"
+        return (f"这是结论句中的文字，这句附有依据：{'、'.join(cites[:4])}{' 等' if len(cites) > 4 else ''}。"
+                "依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）")
+    return "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）"
 
 
 # --------------------------------------------------------------------------
@@ -1195,22 +1195,24 @@ JUDGE_MAX_UNITS = 200
 #: 跑完了的几种终态。还在跑、停在审批、正在接着跑的运行，追加的判定会被封进下一次的清单，不判
 _TERMINAL = ("succeeded", "failed", "cancelled")
 
-FORMAL_JUDGED = "正式运行的裁判在节点内完成（claims: judge），判定随报告文档一起封存，不能再按需裁判"
-UNSEALED_JUDGE = "运行还没跑完封存（还在跑、停在人工审批，或者正在接着跑），跑完再请模型判断"
-LEGACY_JUDGE = "这次运行发起于证据台账上线之前，不支持按需裁判"
-BROKEN_JUDGE = "封存核对没通过：封存之后有事件被改过、删过或插过，报告和证据都不能再当真，不再请模型判断"
-JUDGED_ALREADY = "这句已经判过了"
+FORMAL_JUDGED = "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+UNSEALED_JUDGE = "运行尚未结束并封存（仍在运行、停在人工审批或正在继续运行），请在运行结束后再请模型裁判"
+LEGACY_JUDGE = "这次运行发起时系统尚未记录证据，不支持按需裁判"
+BROKEN_JUDGE = "封存核对未通过：封存后有事件被修改、删除或插入，报告和证据已不可信，无法再请模型裁判"
+JUDGED_ALREADY = "这句已裁判"
 #: 裁判期间运行被接着跑了（失败的运行可以继续），或者接着跑完重新封存了：判定照样交回，不记进运行记录
-NOT_RECORDED = "运行已经接着跑了，这次的判定没有记进运行记录（只在这里看得到，刷新就没了）；等它跑完封存，再请模型判断"
-NOT_A_CLAIM = "不是结论句（标题、连接性的话、表格单元格、代码），不需要模型判断"
-BAD_UNITS = f'units 要写成句子编号的列表，比如 {{"units": ["u4"]}}，一次最多 {JUDGE_MAX_UNITS} 句；report 要写报告节点的 id'
+NOT_RECORDED = "运行已继续执行，本次裁判结果未写入运行记录，刷新后将不再显示。请在运行结束并封存后重新裁判"
+NOT_A_CLAIM = "不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+BAD_UNITS = (f'请求格式有误：units 应为句子编号列表，例如 {{"units": ["u4"]}}，一次最多 {JUDGE_MAX_UNITS} 句；'
+             "report 应为报告撰写节点的 ID")
 #: 触顶时告诉人怎么调：设置页「证据裁判」一组的各项上限都能调高，也都能设成不限
 JUDGE_ADJUST = {
-    "max_cost_usd": "到设置 → 证据裁判里调高「每次点击」的金额上限，或者设成不限",
-    "daily_max_usd": "今天的裁判花费到了全局每日上限：到设置 → 证据裁判里调高「每日」上限或者设成不限，也可以明天再判",
-    "max_claims": "一次最多判这么多句：分几次点，或者到设置 → 证据裁判里调高「每份报告的句数」"
-                  "（报告节点上写了 judge.max_claims 的按节点，写 null 是不限）",
-    "timeout_s": "裁判超时了：到设置 → 证据裁判里调高「时长」上限或者设成不限，再点一次",
+    "max_cost_usd": "请前往「设置 → 偏好设置 → 证据裁判」调高「每次点击的金额上限」，或设为不限",
+    "daily_max_usd": "今日裁判费用已达每日上限：请前往「设置 → 偏好设置 → 证据裁判」调高「每日金额上限」或设为不限，"
+                     "也可次日再裁判",
+    "max_claims": "单次裁判的句数已达上限：请分几次点击，或前往「设置 → 偏好设置 → 证据裁判」调高「每份报告最多裁判句数」"
+                  "（报告撰写节点的「结论句裁判」中已设置的，以节点为准）",
+    "timeout_s": "裁判超时：请前往「设置 → 偏好设置 → 证据裁判」调高「每份报告的时长上限」或设为不限，然后再次点击",
 }
 
 
@@ -1263,7 +1265,7 @@ def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str
     if not sealed.ledger_on:
         return no("legacy", LEGACY_JUDGE)
     if not candidates(doc, [uid]):
-        return no("not_a_claim", NOT_A_CLAIM)
+        return no("not_a_claim", f"这句{NOT_A_CLAIM}")
     if isinstance(verdict, dict) and verdict.get("status") in JUDGED:
         return no("judged", JUDGED_ALREADY)
     if not sealed.sealed or sealed.status not in _TERMINAL:
@@ -1357,9 +1359,9 @@ async def judge_units(run_id: str, payload: Any = Body(None), report: str | None
             raise CodedHTTPException(404, "这次运行没有封存的报告文档，没有可以判断的句子", REPORT_NOT_FOUND)
         chosen = _choose(reports, wanted, sealed)
         if chosen.hash_ok is False:
-            raise CodedHTTPException(409, "报告文档和它的哈希对不上，疑似被改过，不能再当证据展示", DOC_TAMPERED)
+            raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
         if chosen.doc is None:
-            raise CodedHTTPException(404, "报告文档在工件库里取不回来", DOC_MISSING)
+            raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
         return await _judge_now(sealed, chosen, units)
 
 
@@ -1421,14 +1423,14 @@ def _judge_message(outcome: dict[str, Any] | None, budget: Any, skipped: dict[st
     if outcome and outcome["limits_hit"]:
         labels = "、".join(_limit_label(r, budget, click=True) for r in outcome["limits_hit"])
         n = sum(outcome["unjudged"].get(r, 0) for r in outcome["limits_hit"])
-        return f"已到上限（{labels}）：{n} 句没判，记为未裁判；已判的保留"
+        return f"已达上限（{labels}）：{n} 句未裁判，已裁判的结果保留"
     if outcome and outcome["gaps"]:
-        return "裁判没跑完：" + "；".join(outcome["gaps"])
+        return "结论句裁判未完成：" + "；".join(outcome["gaps"])
     parts = []
     if others := [u for u, why in skipped.items() if why == "not_a_claim"]:
-        parts.append(f"{'、'.join(others)} {NOT_A_CLAIM}")
+        parts.append(f"所选句子中有 {len(others)} 句{NOT_A_CLAIM}")
     if missing := [u for u, why in skipped.items() if why == "not_found"]:
-        parts.append(f"报告里没有 {'、'.join(missing)}")
+        parts.append(f"报告中没有所选的 {len(missing)} 句")
     return "；".join(parts) or None
 
 
@@ -1484,26 +1486,25 @@ async def _append_judged(sealed: _Sealed, report: _Report, units: list[str],
 AUDIT_SCHEMA = "agentlab.evidence.audit/1"
 BAD_FORMAT = "evidence_bad_format"
 BAD_GROUP = "evidence_bad_group"
-#: 分组的顺序固定：有出处 / 无证据 / 可疑实体 / 旧运行猜测
-GROUPS = (("cited", "有出处"), ("none", "无证据"), ("suspicious", "可疑实体"), ("candidate", "旧运行猜测"))
+#: 分组的顺序固定：有出处 / 无证据 / 可疑名称 / 按数值猜测（叫法同前端 lib/terms.ts 的 EVIDENCE_AUDIT_TEXT.groups）
+GROUPS = (("cited", "有出处"), ("none", "无证据"), ("suspicious", "可疑名称"), ("candidate", "按数值猜测"))
 #: 文档本身对不上的违规：不管落在哪个片段上都单独列一行，不能被那个片段「有出处」的行盖住
 _INTEGRITY = frozenset({"bad_schema", "segment_mismatch", "structural_text", "render_mismatch", "eid_mismatch",
                         "state_mismatch"})
-UNCITED_CLAIM = "这句结论没有挂依据（没有引用标记，也没有 [[see:]]）"
-UNCITED_CLAIM_COUNTED = "这句结论没有挂依据：这份报告要求结论句挂依据（claims: require_citation），出具时计入缺口"
-UNCITED_CLAIM_WITHHELD = "这句结论没有挂依据：出具契约要求结论句挂依据，没挂的按契约不予出具（on_uncited: withhold）"
-UNCITED_CLAIM_REQUIRED = ("这句结论没有挂依据：这份报告要求结论句挂依据（claims: require_citation），不过没有出具契约"
-                          "按它判档（没配契约，或者还没到出具那一步）")
+UNCITED_CLAIM = "这句结论没有附依据（既没有引用，也没有注明依据）"
+UNCITED_CLAIM_COUNTED = "这句结论没有附依据。本报告要求结论句附依据，出具时计入缺口"
+UNCITED_CLAIM_WITHHELD = "这句结论没有附依据，按出具契约不予出具"
+UNCITED_CLAIM_REQUIRED = ("这句结论没有附依据。本报告要求结论句附依据，但目前没有出具契约据此判档"
+                          "（未配置契约，或尚未到出具步骤）")
 #: claims: judge 在挂依据这件事上和 require_citation 一样严（出口按 on_uncited 计入缺口）
-UNCITED_CLAIM_JUDGED = ("这句结论没有挂依据：这份报告的结论句由模型裁判（claims: judge），挂依据的要求和 "
-                        "require_citation 一样，出具时计入缺口")
-UNCITED_CLAIM_JUDGE_REQUIRED = ("这句结论没有挂依据：这份报告的结论句由模型裁判（claims: judge），要求结论句挂依据，"
-                                "不过没有出具契约按它判档（没配契约，或者还没到出具那一步）")
-LEGACY_UNMATCHED = "旧版出具里这个数字对不上任何指标"
+UNCITED_CLAIM_JUDGED = "这句结论没有附依据。本报告的结论句由模型裁判，同样要求附依据，出具时计入缺口"
+UNCITED_CLAIM_JUDGE_REQUIRED = ("这句结论没有附依据。本报告的结论句由模型裁判，同样要求附依据，但目前没有出具契约"
+                                "据此判档（未配置契约，或尚未到出具步骤）")
+LEGACY_UNMATCHED = "旧版出具中这个数字与任何指标都不相符"
 
 #: CSV 的列：(表头, 行里的键)
 CSV_COLUMNS = (
-    ("分组", "group"), ("报告节点", "report"), ("成果字段", "field"), ("片段", "segment"), ("句子编号", "unit"),
+    ("分组", "group"), ("报告节点", "report"), ("成果字段", "field"), ("片段编号", "segment"), ("句子编号", "unit"),
     ("种类", "kind"), ("原文", "text"), ("状态", "state"), ("问题", "issue"), ("引用", "ref"), ("证据", "evidence"),
     ("证据种类", "evidence_kind"), ("证据编号", "eid"), ("工件", "artifact"), ("来源节点", "node_id"),
     ("已封存", "sealed"), ("句子", "sentence"), ("说明", "note"),
@@ -1511,16 +1512,16 @@ CSV_COLUMNS = (
     ("封存核对", "seal"),
 )
 SEAL_OK = "封存核对通过（封存于第 {seq} 条事件）"
-SEAL_BROKEN = "封存核对没通过：封存之后有事件被改过、删过或插过"
-SEAL_NONE = "未封存：运行还没跑完，或者停在人工审批"
+SEAL_BROKEN = "封存核对未通过：封存后有事件被修改、删除或插入"
+SEAL_NONE = "未封存：运行尚未结束，或正停在人工审批"
 _CSV_LABELS: dict[str, dict[Any, str]] = {
     "group": dict(GROUPS),
     "kind": {"number": "数字", "value": "值", "entity": "表名、字段名", "quote": "引文", "claim": "结论句",
              "violation": "违规"},
     "state": {"deterministic": "有出处", "none": "无证据", "candidate": "候选"},
-    "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用解析不了", "unknown_entity": "可能是编造的名字",
-              "unverified_entity": "核对不了", "uncited_claim": "结论句没挂依据", "no_candidate": "没找到候选",
-              **{code: "文档对不上" for code in _INTEGRITY}},
+    "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
+              "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
+              **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
                       "quote": "知识库原话", "query": "查询结果"},
     "sealed": {True: "是", False: "否", None: "—"},
@@ -1541,7 +1542,7 @@ async def evidence_audit(run_id: str, fmt: str | None = Query(None, alias="forma
     """
     wanted = _wanted_groups(groups)
     if fmt not in (None, "", "json", "csv"):
-        raise CodedHTTPException(422, f"导出格式只能是 json 或 csv，写的是 {fmt!r}", BAD_FORMAT)
+        raise CodedHTTPException(422, f"导出格式只能是 json 或 csv，当前为「{fmt}」", BAD_FORMAT)
     sealed = await _sealed(run_id)
     reports = _reports(sealed)
     mode, extra = await _mode_of(sealed, reports)
@@ -1592,7 +1593,7 @@ def _wanted_groups(raw: str | None) -> set[str]:
         return set(known)
     picked = {part.strip() for part in raw.split(",") if part.strip()}
     if unknown := picked - set(known):
-        raise CodedHTTPException(422, f"分组只能是 {' / '.join(known)}，写的是 {'、'.join(sorted(unknown))}", BAD_GROUP)
+        raise CodedHTTPException(422, f"分组只能是 {' / '.join(known)}，当前为「{'、'.join(sorted(unknown))}」", BAD_GROUP)
     return picked
 
 

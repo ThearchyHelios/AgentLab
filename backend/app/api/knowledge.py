@@ -61,7 +61,7 @@ class MemoryOut(BaseModel):
 def _content(text: str) -> str:
     """只有空白的内容和空串是一回事——存下去就是一条什么都召回不到的空记忆。"""
     if not text.strip():
-        raise HTTPException(422, "记忆内容是空的：写上要记住的那句话再保存")
+        raise HTTPException(422, "记忆内容为空，请填写要记住的内容后再保存")
     return text
 
 
@@ -149,7 +149,7 @@ async def update_memory(
         kind=payload.kind, importance=payload.importance,
     )
     if item is None:
-        raise HTTPException(404, "这条记忆不存在，可能已经被删了")
+        raise HTTPException(404, "记忆不存在，可能已被删除")
     return (await _with_source(session, [item]))[0]
 
 
@@ -170,7 +170,7 @@ async def delete_memory(
     memory_id: str, session: AsyncSession = Depends(get_session)
 ) -> None:
     if not await store.forget(session, memory_id):
-        raise HTTPException(404, "这条记忆不存在，可能已经被删了")
+        raise HTTPException(404, "记忆不存在，可能已被删除")
 
 
 @memory_router.delete("/scope/{scope}")
@@ -261,7 +261,7 @@ async def upload(
     while piece := await file.read(1024 * 1024):
         total += len(piece)
         if total > limit:
-            raise HTTPException(413, f"文件超过 {settings.max_upload_mb}MB")
+            raise HTTPException(413, f"文件超过 {settings.max_upload_mb} MB")
         chunks.append(piece)
     raw = b"".join(chunks)
 
@@ -307,7 +307,7 @@ async def _process_in_background(doc_id: str) -> None:
             if doc:
                 reason, hint = explain(e)
                 doc.status = "failed"
-                doc.error = (f"切块或算向量时出错：{reason}" + (f"。{hint}" if hint else ""))[:500]
+                doc.error = (f"文档分块或生成向量时出错：{reason}" + (f"。{hint}" if hint else ""))[:500]
                 await session.commit()
 
 
@@ -428,7 +428,7 @@ async def probe_embedding(base_url: str) -> dict[str, Any]:
             data = (await client.get(url)).json()
     except Exception as e:  # noqa: BLE001
         reason, hint = explain(e)
-        raise HTTPException(400, f"问不到 {url} 上有哪些模型：{reason}" + (f"。{hint}" if hint else "")) from e
+        raise HTTPException(400, f"无法获取 {url} 上的模型列表：{reason}" + (f"。{hint}" if hint else "")) from e
     models = [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
     return {"base_url": base_url, "models": models}
 
@@ -496,7 +496,7 @@ async def _run_reindex(job: _ReindexJob) -> None:
     except Exception as e:  # noqa: BLE001 - 失败要落到任务状态上，不能只进日志
         logger.warning("重建索引失败：%s", raw(e))
         reason, hint = explain(e)
-        job.state, job.error, job.hint = "failed", f"重建索引没做完：{reason}", hint or None
+        job.state, job.error, job.hint = "failed", f"重建索引未完成：{reason}", hint or None
     finally:
         job.finished_at = utcnow()
 
@@ -535,8 +535,8 @@ async def reindex(
     if _REINDEX is not None and _REINDEX.state == "running":
         running = _REINDEX.view()
         raise HTTPException(
-            409, f"已经在重建索引了（{_REINDEX.collection or '全部集合'}，"
-                 f"已完成 {running['done']}/{running['total']}），等它做完再点",
+            409, f"正在重建索引（{_REINDEX.collection or '全部集合'}，"
+                 f"已完成 {running['done']}/{running['total']}），请等待完成后再操作",
         )
     job = _REINDEX = _ReindexJob(collection, chunks, memories)
     if background:
@@ -577,7 +577,7 @@ async def get_document(
 
     doc = await session.get(Document, doc_id)
     if not doc:
-        raise HTTPException(404, "这份文档不存在，可能已经被删了")
+        raise HTTPException(404, "文档不存在，可能已被删除")
 
     rows = list((await session.execute(
         select(Chunk).where(Chunk.document_id == doc_id).order_by(Chunk.ordinal)
@@ -606,7 +606,7 @@ async def get_document(
 @kb_router.delete("/documents/{doc_id}", status_code=204)
 async def delete_document(doc_id: str, session: AsyncSession = Depends(get_session)) -> None:
     if not await kb.delete_document(session, doc_id):
-        raise HTTPException(404, "这份文档不存在，可能已经被删了")
+        raise HTTPException(404, "文档不存在，可能已被删除")
 
 
 # --------------------------------------------------------------------------
@@ -655,7 +655,7 @@ async def update_skill(
 ) -> Skill:
     row = await session.get(Skill, skill_id)
     if not row:
-        raise HTTPException(404, "这个 Skill 不存在，可能已经被删了")
+        raise HTTPException(404, "Skill 不存在，可能已被删除")
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
     await session.commit()
@@ -667,6 +667,6 @@ async def update_skill(
 async def delete_skill(skill_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await session.get(Skill, skill_id)
     if not row:
-        raise HTTPException(404, "这个 Skill 不存在，可能已经被删了")
+        raise HTTPException(404, "Skill 不存在，可能已被删除")
     await session.delete(row)
     await session.commit()

@@ -244,7 +244,7 @@ async def test_masks_recorded_at_query_time_survive_a_renamed_source(client, mon
     email = step["columns"].index("email")
     assert {r[email] for r in step["rows"]} == {"已遮罩"} and step["masked"] == ["email"], step
     assert body["redacted"]["columns"] == ["email"]
-    assert "「shop」" in step["mask_note"] and "查询当时" in step["mask_note"], step
+    assert "「shop」" in step["mask_note"] and "按查询时记录的遮罩" in step["mask_note"], step
 
 
 async def test_masks_added_after_the_query_still_apply(client, monkeypatch, shop):

@@ -1,0 +1,59 @@
+{
+  "说明": "scripts/check-copy.mjs 的白名单。每条：file 文件（相对仓库根）、text 命中的那段字符串里的一个片段（按包含匹配，不按行号，免得挪行就失效）、rule 规则 id（见 check-copy.mjs 的 RULES）、reason 为什么保留。对不上任何命中的条目会报失效，要删掉。",
+  "entries": [
+    {
+      "file": "frontend/src/canvas/nodeDefs.ts",
+      "text": "metrics_from（口径卡节点 ID）",
+      "rule": "键名",
+      "reason": "出具契约是 JSON 配置框，用户要照着键名手写 JSON；帮助文字在字段旁边列出可写的键，每个键后面都附了中文说明（配置界面允许附键名）"
+    },
+    {
+      "file": "frontend/src/canvas/nodeDefs.ts",
+      "text": "allow_numbers（允许无出处的数字）",
+      "rule": "键名",
+      "reason": "同上：出具契约 JSON 可写的键，附中文说明"
+    },
+    {
+      "file": "frontend/src/pages/ToolsPage.tsx",
+      "text": "mcp:服务名/工具名",
+      "rule": "半角标点",
+      "reason": "MCP 工具的引用写法（mcp:<服务名>/<工具名>），冒号是语法的一部分，用户要照原样写进节点"
+    },
+    {
+      "file": "frontend/src/pages/ToolsPage.tsx",
+      "text": "mcp:名称/工具名",
+      "rule": "半角标点",
+      "reason": "同上：MCP 工具的引用写法"
+    },
+    {
+      "file": "frontend/src/canvas/InspectorSheet.tsx",
+      "text": "aria-label^=\"移除\"",
+      "rule": "半角标点",
+      "reason": "CSS 选择器（querySelector 用），不是界面文案；引号是选择器语法，「移除」「删除」是按读屏名排除按钮"
+    },
+    {
+      "file": "frontend/src/canvas/LineageLayer.tsx",
+      "text": "content: \"引用\"",
+      "rule": "半角标点",
+      "reason": "注入的 CSS 规则，::after 的 content 必须用 CSS 引号；界面上显示的只是「引用」两个字"
+    },
+    {
+      "file": "frontend/src/pages/ChatPage.tsx",
+      "text": "5 家供应商",
+      "rule": "供应商",
+      "reason": "按用户数据源描述里的业务词（采购、供应商）造的示例问法，这里的「供应商」是采购供应商，不是模型接入"
+    },
+    {
+      "file": "backend/app/seed.py",
+      "text": "print(json.dumps(...))",
+      "rule": "半角标点",
+      "reason": "模板里「写代码」节点的系统提示（写给模型），print(json.dumps(...)) 是代码示例，半角括号和省略号是 Python 语法"
+    },
+    {
+      "file": "backend/app/api/copilot.py",
+      "text": "报告按 [[i:字段名]]",
+      "rule": "半角标点",
+      "reason": "[[i:字段名]] 是报告里引用运行输入的标记写法，冒号是语法的一部分，提示用户照原样写"
+    }
+  ]
+}

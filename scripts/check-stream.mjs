@@ -140,7 +140,7 @@ await section('长报告的折叠', async () => {
   await page.waitForTimeout(300)
 
   const folded = await page.locator('body').innerText()
-  check('折叠时说破了"后面还有"', folded.includes('后面还有'))
+  check('折叠时说明「以下内容已折叠」', folded.includes('以下内容已折叠'))
   check('给得出展开入口', folded.includes('展开全部'))
   // 关键一条：折叠后不能留下没渲染成表格的原始 markdown 行
   const rawRow = folded.split('\n').find((l) => /^\s*\|.*\|/.test(l))
@@ -162,10 +162,10 @@ await section('没查库的那一轮', async () => {
   await page.goto(`${WEB}/preview.html?noquery=1`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(300)
   const body = await page.locator('body').innerText()
-  check('说破了这一条没有查库', body.includes('没有查库'))
+  check('说明本条未查询数据库', body.includes('未查询数据库'))
   check('声明排在结论前面',
-        body.indexOf('没有查库') < body.indexOf('role.level'),
-        `声明@${body.indexOf('没有查库')} 结论@${body.indexOf('role.level')}`)
+        body.indexOf('未查询数据库') < body.indexOf('role.level'),
+        `声明@${body.indexOf('未查询数据库')} 结论@${body.indexOf('role.level')}`)
   check('答案本身照常渲染', body.includes('口径'))
   await page.close()
 })
@@ -196,7 +196,7 @@ await section('复核说明', async () => {
   check('两档复核长得不一样', new Set(colors.hit).size > 1, colors.hit.join(' / '))
 
   // 改写是有损的，原件得留着能对照
-  check('改写前的原文可以展开', body.includes('看改写前的原文'))
+  check('改写前的原文可以展开', body.includes('查看改写前的原文'))
   check('原文默认不占地方', !body.includes('平台管理员可以修改他人权限。\n'))
 
   const overflow = await page.evaluate(() =>
@@ -243,8 +243,8 @@ await section('协作团队的泳道', async () => {
     check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
     check(`${label}：三个人各占一行`,
           ['researcher', 'analyst', 'writer'].every((n) => body.includes(n)))
-    // 说法和画布上的协作矩阵同一套：「并行省下 X」
-    check(`${label}：说清楚并行省了多少`, /并行省下 11\.8 s（2 轮并行）/.test(body),
+    // 说法和画布上的协作矩阵同一套：「并行节省 X」
+    check(`${label}：说清并行节省了多少`, /并行节省 11\.8 s（2 轮并行）/.test(body),
           body.slice(0, 90).replace(/\n/g, ' '))
     const overflow = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth)
@@ -322,7 +322,7 @@ await section('空态', async () => {
   await page.goto(`${WEB}/preview.html?case=__none__`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(250)
   const text = await page.locator('body').innerText()
-  check('没有内容时给的是空态而不是白屏', text.includes('问点什么'))
+  check('没有内容时给的是空态而不是白屏', text.includes('问你的数据'))
   await page.close()
 
 })
@@ -406,16 +406,16 @@ await section('回看历史运行：停在失败处', async () => {
   check('定位到的那一行描了一下边，用失败色', where.flash === 'failed' && where.outline === where.want,
     `${where.flash} ${where.outline}`)
   const body = await page.locator('body').innerText()
-  check('报错写全，不截成一行', body.includes('推送失败：企业微信机器人地址没配'))
+  check('报错写全，不截成一行', body.includes('推送失败：通知机器人地址为空'))
   check('技术细节默认收着', !body.includes('ConnectError') && body.includes('技术细节'))
-  check('动作槽渲染出页面给的按钮', body.includes('重试这一轮'))
-  check('跳过的节点在时间线上留痕', body.includes('跳过「背景检索」') && body.includes('skip_if 成立'))
+  check('动作槽渲染出页面给的按钮', body.includes('重试本轮'))
+  check('跳过的节点在时间线上留痕', body.includes('跳过「背景检索」') && body.includes('满足跳过条件'))
   check('#runId 可以点去运行记录', await page.locator('a[href="/runs/syn-mixed"]').count() === 1)
   // 「开始运行」「完成」和头部说的是同一件事，不再单列；「继续运行」是分段线，
   // 失败的运行里它以前是一个红叉，读起来像续跑本身出了错
   check('和头部重复的生命周期行不再单列', !body.includes('开始运行（6 个节点）'))
   const mark = await page.locator('[data-phase-mark]').allInnerTexts()
-  check('续跑是一条分段线，说清谁发起的', mark.some((t) => t.includes('继续运行') && t.includes('张工')), mark.join(' | '))
+  check('继续运行是一条分段线，说清谁发起的', mark.some((t) => t.includes('继续运行') && t.includes('张工')), mark.join(' | '))
   check('分段线不画成失败', await page.locator('[data-phase-mark] [data-status="failed"]').count() === 0)
   const live = await page.locator('[role="status"][aria-live="polite"]').allInnerTexts()
   check('状态变化有读屏播报区', live.some((t) => t.includes('失败')), live.join(' | '))
@@ -437,8 +437,8 @@ await section('运行中的时间感', async () => {
   // 节点轨：一格一个节点，按状态着色；还没轮到的是空格，不猜
   const rail = await page.evaluate(() => [...document.querySelectorAll('[data-node-rail] > span')].map((e) => e.title))
   check('节点轨一格一个节点', rail.length === 6, rail.join(' | '))
-  check('节点轨标出跳过的、正在跑的、还没轮到的',
-    rail.some((t) => t.includes('已跳过')) && rail.some((t) => t.includes('运行中')) && rail.includes('还没轮到'),
+  check('节点轨标出已跳过、运行中、尚未开始的',
+    rail.some((t) => t.includes('已跳过')) && rail.some((t) => t.includes('运行中')) && rail.includes('尚未开始'),
     rail.join(' | '))
   // 还没轮到的格子以前填 --bg-hover，和栏底只差 1.1:1：5 格的轨看着像 4 格。亮暗两套都量
   for (const theme of ['dark', 'light']) {
@@ -452,7 +452,7 @@ await section('运行中的时间感', async () => {
         })
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
       }
-      const cell = [...document.querySelectorAll('[data-node-rail] > span')].find((e) => e.title === '还没轮到')
+      const cell = [...document.querySelectorAll('[data-node-rail] > span')].find((e) => e.title === '尚未开始')
       if (!cell) return null
       const cs = getComputedStyle(cell)
       const mark = cs.backgroundColor !== 'rgba(0, 0, 0, 0)' ? cs.backgroundColor : (cs.boxShadow.match(/rgba?\([^)]+\)/) ?? [''])[0]
@@ -462,7 +462,7 @@ await section('运行中的时间感', async () => {
       const [a, b] = [lum(mark), lum(bg)].sort((x, y) => y - x)
       return { mark, bg, ratio: +((a + 0.05) / (b + 0.05)).toFixed(2) }
     })
-    check(`${theme}：还没轮到的格子看得见（≥ 3:1）`, !!pend && pend.ratio >= 3, JSON.stringify(pend))
+    check(`${theme}：尚未开始的格子看得见（≥ 3:1）`, !!pend && pend.ratio >= 3, JSON.stringify(pend))
   }
   await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
   check('进行中的行标了 aria-busy', await page.locator('[aria-busy="true"]').count() > 0)
@@ -523,7 +523,7 @@ await section('长运行：按轮折叠', async () => {
   const paged = await execs()
   check('展开全部后最后一轮、第 37 次、第 30 次都还在', [145, 37, 30].every((n) => paged.includes(n)), JSON.stringify(paged))
   const more = await box.locator('[data-exec-more]').innerText().catch(() => '')
-  check('没列出的那一截说清还有多少、怎么继续', /还有 \d+ 轮没列出/.test(more) && more.includes('再列') && more.includes('全部列出'),
+  check('没列出的那一截说清还有多少、怎么继续', /还有 \d+ 轮未列出/.test(more) && more.includes('再列') && more.includes('全部列出'),
     more.replace(/\n/g, ' '))
   check('不再说「已在上面展开」的假话', !(await page.locator('body').innerText()).includes('已在上面展开'))
   await box.locator('[data-exec-more] button', { hasText: '全部列出' }).click()
@@ -547,15 +547,15 @@ await section('几轮审批：分轮但不收起', async () => {
 await section('协作团队：运行中的说法', async () => {
   const { page } = await open('syn=team-live&dense=1', { w: 380, h: 760, name: 'team-live' })
   const body = await page.locator('body').innerText()
-  check('运行中写「N 人并行中」', body.includes('3 人并行中'))
-  check('运行中不报「省下 0」', !/省下 0/.test(body))
+  check('运行中写「N 名成员并行中」', body.includes('3 名成员并行中'))
+  check('运行中不报「节省 0」', !/节省 0/.test(body))
   check('进行中的轮次不写 0 ms', body.includes('进行中') && !/第1轮 · 0/.test(body))
   check('调度这一行说人话', body.includes('第 1 轮：交给 采购员、质检员、物流员（并行）'))
-  check('运行中的说法和协作矩阵一致（本轮 N 人并行中）', body.includes('本轮 3 人并行中'))
+  check('运行中的说法和协作矩阵一致（本轮 N 名成员并行）', body.includes('本轮 3 名成员并行中'))
   check('没有原始事件名', !/agent\.(route|step)/.test(body))
   await page.close()
   const r = await open('syn=team-routing&dense=1', { w: 380, h: 760, name: 'team-routing' })
-  check('调度者在想时有一行进行中', (await r.page.locator('body').innerText()).includes('调度者在想下一步'))
+  check('调度者规划下一步时有一行进行中', (await r.page.locator('body').innerText()).includes('调度者正在规划下一步'))
   await r.page.close()
   // 一轮里三人都还在跑时被取消（runfx-17 终验）：那一轮不知道本来要多久，不写「0 ms」
   for (const [w, dense] of [[380, '1'], [1100, '0']]) {
@@ -571,17 +571,17 @@ await section('出具横幅、答案操作、证据下钻', async () => {
   const { page } = await open('syn=issued', { w: 1100, h: 900, name: 'issued' })
   const body = await page.locator('body').innerText()
   // gaps 以前一条都不显示：横幅说「请对照下方声明」，下方什么都没有
-  check('横幅列出校验没跑全的原因', body.includes('校验没跑全') && body.includes('叙述模板渲染为空'))
-  check('无法回指的数字带上下文', body.includes('晚班比上周低 6 个百分点'))
+  check('横幅列出校验未全部完成的原因', body.includes('校验未全部完成') && body.includes('叙述模板渲染为空'))
+  check('无法追溯的数字带上下文', body.includes('晚班比上周低 6 个百分点'))
   check('正文里画出了那个数字', await page.locator('[data-mark="warn"]').count() === 1
     && (await page.locator('[data-mark="warn"]').innerText()) === '6')
-  check('说清数字回指到哪张口径卡', body.includes('回指上的 2 个数字都来自这张卡'))
+  check('说清数字追溯到哪张口径卡', body.includes('可追溯的 2 个数字均来自此口径卡'))
   check('探索运行标注不进正式归档', body.includes('探索运行 · 不进正式归档'))
-  check('头部和复核结论一致', body.includes('有缺口'))
+  check('头部和复核结论一致', body.includes('存在缺口'))
   check('吸顶的头上挂着出具档位', (await page.locator('[data-turn] .sticky').first().innerText()).includes('降档出具'))
   await page.locator('.group\\/answer').first().hover()
   check('答案可以复制', await page.locator('button[aria-label="复制"]').count() > 0)
-  // 复制 / 导出以前贴着整块的右上角浮出，正好压在横幅的「回指 N 个数字」上
+  // 复制 / 导出以前贴着整块的右上角浮出，正好压在横幅的「可追溯 N 个数字」上
   const clash = await page.evaluate(() => {
     const a = document.querySelector('.group\\/answer')
     const act = a?.querySelector('button[aria-label="复制"]')?.parentElement
@@ -625,7 +625,7 @@ await section('出具横幅、答案操作、证据下钻', async () => {
       check('打开完整结果，结果集画成表', modal.includes('班次29')
         && await p2.locator('[role="dialog"] table').count() === 1, modal.slice(0, 60))
       check('证据连着问的是哪条 SQL', modal.includes('FROM v_device_kpi'))
-      check('说明哈希已校验', modal.includes('哈希已校验'))
+      check('说明已校验通过', modal.includes('校验通过'))
       check('完整结果可以导出 CSV', modal.includes('CSV'))
     }
     if (SHOTS) await p2.screenshot({ path: `${SHOTS}/stream-artifact-${theme}.png` })
@@ -657,7 +657,7 @@ await section('复核判了不可信', async () => {
   })
   check('结论不可用时徽标不染红', head.badge !== head.failed && head.badge === head.done, JSON.stringify(head))
   check('红色落在结论上', head.verdict === head.failed, head.verdict)
-  check('答案上方固定一句「不能当结论用」', body.includes('以下内容不能当结论用'))
+  check('答案上方固定一句「不可作为结论使用」', body.includes('以下内容不可作为结论使用'))
   const faint = await page.evaluate(() => {
     const el = [...document.querySelectorAll('summary')].find((x) => x.textContent?.includes('处异常'))
     return el ? getComputedStyle(el).fontSize : ''
@@ -675,8 +675,8 @@ await section('长表名、Copilot 结局、问数据的分段', async () => {
 
   const c = await open('syn=copilot&dense=1', { w: 380, h: 800, name: 'copilot' })
   const body = await c.page.locator('body').innerText()
-  check('自查没修好的说法是画布语境', body.includes('没能自动修好') && !body.includes('没有自动运行'))
-  check('少了一步说出来', body.includes('少了一步') && body.includes('excel_export'))
+  check('自查没修好的说法是画布语境', body.includes('未能自动修正') && !body.includes('未自动运行'))
+  check('跳过的步骤说出来', body.includes('已跳过一个步骤') && body.includes('excel_export'))
   check('修正写明第几轮', body.includes('第 1/2 轮'))
   check('收尾后的阶段行不再是「正在…」', !body.includes('正在理解需求'))
   check('收尾后没有还在跑的行', await c.page.locator('[aria-busy="true"]').count() === 0)
@@ -688,7 +688,7 @@ await section('长表名、Copilot 结局、问数据的分段', async () => {
   await q.page.locator('button', { hasText: '规划' }).first().click()
   await q.page.waitForTimeout(200)
   check('点开能看规划过程', (await q.page.locator('body').innerText()).includes('取数 → 汇总 → 出结论'))
-  check('给出追问', before.includes('接着问'))
+  check('给出追问', before.includes('继续提问'))
   await q.page.locator('button.chip').first().click()
   check('点追问把话交给页面', !!(await q.page.evaluate(() => window.__followUp)))
   await q.page.close()
@@ -715,7 +715,7 @@ await section('审批卡的上下文', async () => {
   const body = await page.locator('body').innerText()
   check('说出挂在哪个节点', body.includes('节点「班长复核」'))
   check('说出等了多久', body.includes('已等待 8 天'))
-  check('常显批了会怎样', body.includes('驳回 → 走「驳回」那条出口'))
+  check('常显批了会怎样', body.includes('驳回：转入「驳回」分支'))
   check('没署名时提醒并给去处', body.includes('未署名') && await page.locator('a[href="/settings/prefs"]').count() === 1)
   await page.close()
   const s = await open('approval=1&actor=张工', { w: 820, h: 500, name: 'approval-signed' })
@@ -770,7 +770,7 @@ await section('画布右栏：运行视图', async () => {
     if (req.method() === 'GET' && req.url().includes(RUN)) {
       return json(route, { id: RUN, workflow_id: WF_ID, status: pending ? 'interrupted' : 'running', input: {}, output: {}, error: null, usage: {}, run_class: 'exploratory' })
     }
-    return req.method() === 'GET' ? route.continue() : json(route, { detail: '这次运行已经不在执行中' }, 409)
+    return req.method() === 'GET' ? route.continue() : json(route, { detail: '这次运行已不在执行中（可能刚结束，或服务重启过），无需停止。请刷新页面查看最新状态' }, 409)
   })
   await page.goto(`${WEB}/studio/${WF_ID}`, { waitUntil: 'networkidle' })
   await page.waitForFunction((id) => window.__studio?.getState().workflow?.id === id, WF_ID, { timeout: 15000 })
@@ -817,7 +817,7 @@ await section('画布右栏：运行视图', async () => {
   check('运行中：栏头有停止', await panel.getByRole('button', { name: '停止这次运行' }).count() === 1)
   check('运行中：轮次头写「运行中」并走秒表', /运行中[\s\S]*\d\d:\d\d\.\d/.test(await head()), (await head()).replace(/\n/g, ' '))
   check('运行中：调度者和成员的 llm.end 算进用量（≥ 实时数）',
-    /≥\s?916 tok|≥916 tok/.test(await panel.locator('[aria-label="这次运行的用量"]').innerText()),
+    /≥\s?916 token|≥916 token/.test(await panel.locator('[aria-label="这次运行的用量"]').innerText()),
     await panel.locator('[aria-label="这次运行的用量"]').innerText())
   check('#runId 可以点去运行记录', await panel.locator(`a[href="/runs/${RUN}"]`).count() === 1)
 
@@ -846,16 +846,18 @@ await section('画布右栏：运行视图', async () => {
   await feed(WAIT)
   await page.waitForTimeout(500)
   const waitingHead = await head()
-  // 以前 streaming 优先：等人时标题写「正在执行…」，工具栏还给一个点了必然 409 的「停止」
-  check('等人：标题写「等待审批」，不写「正在执行」', waitingHead.includes('等待审批') && !waitingHead.includes('执行'), waitingHead.replace(/\n/g, ' '))
-  check('等人：不给停止，给「去审批」', await panel.getByRole('button', { name: '停止这次运行' }).count() === 0
+  // 以前 streaming 优先：等人时标题写「正在执行…」，工具栏还给一个点了必然 409 的「停止」。
+  // 运行中的标题现在写「运行中」，只拦「执行」的话，退回 streaming 优先也拦不住，两个都拦
+  check('等待审批时：标题写「等待审批」，不写「正在执行」「运行中」', waitingHead.includes('等待审批') && !waitingHead.includes('执行')
+    && !waitingHead.includes('运行中'), waitingHead.replace(/\n/g, ' '))
+  check('等待审批时：不给停止，给「去审批」', await panel.getByRole('button', { name: '停止这次运行' }).count() === 0
     && await panel.getByRole('button', { name: '去审批' }).count() === 1)
   // 审批列表 4 秒才轮询一次：卡片得是 run.interrupted 一到就去取的，不能碰运气等下一拍
   const fetched = approvalHits.filter((t) => t >= fedAt && t - fedAt < 300)
-  check('等人：一停下来就去取审批卡（不等 4 秒轮询）', fetched.length > 0 && await panel.locator('[data-approval]').count() === 1,
+  check('等待审批时：一停下来就去取审批卡（不等 4 秒轮询）', fetched.length > 0 && await panel.locator('[data-approval]').count() === 1,
     `停下后 ${fetched.map((t) => t - fedAt).join(',') || '—'} ms 取过`)
-  check('等人：卡上写明将以谁的名义签批', (await panel.locator('[data-approval]').innerText()).includes('将以「张工」签批'))
-  check('等人：没有还在转的步骤', await panel.locator('[aria-busy="true"]').count() === 0)
+  check('等待审批时：卡上写明将以谁的名义签批', (await panel.locator('[data-approval]').innerText()).includes('将以「张工」签批'))
+  check('等待审批时：没有还在转的步骤', await panel.locator('[aria-busy="true"]').count() === 0)
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/stream-panel-waiting-dark.png` })
 
   pending = false
@@ -863,13 +865,13 @@ await section('画布右栏：运行视图', async () => {
   await page.waitForTimeout(600)
   const doneHead = await head()
   const footer = await panel.locator('[aria-label="这次运行的用量"]').innerText()
-  check('跑完：头部写已完成和执行时长', doneHead.includes('已完成') && doneHead.includes('11.0 s'), doneHead.replace(/\n/g, ' '))
-  check('跑完：底栏换成后端累计，不带 ≥', footer.includes('5.4k tok') && footer.includes('$0.032') && !footer.includes('≥'), footer.replace(/\n/g, ' '))
-  check('跑完：执行和等人分开写', footer.includes('执行 11.0 s') && footer.includes('等人 9.5 s'), footer.replace(/\n/g, ' '))
+  check('运行结束：头部写已完成和执行时长', doneHead.includes('已完成') && doneHead.includes('11.0 s'), doneHead.replace(/\n/g, ' '))
+  check('运行结束：底栏换成服务端累计，不带 ≥', footer.includes('5.4k token') && footer.includes('$0.032') && !footer.includes('≥'), footer.replace(/\n/g, ' '))
+  check('运行结束：执行时长和等待审批分开写', footer.includes('执行 11.0 s') && footer.includes('等待审批 9.5 s'), footer.replace(/\n/g, ' '))
   // 审批列表 4 秒才轮询一次：跑完了卡片不能还挂在那儿等人点
-  check('跑完：审批卡不再挂着', await panel.locator('[data-approval]').count() === 0)
-  check('续跑是谁发起的写在分段线上', (await panel.locator('[data-phase-mark]').allInnerTexts()).some((t) => t.includes('张工')))
-  check('审批留痕写签批人，不写「你」', (await panel.innerText()).includes('→ 张工 放行了'))
+  check('运行结束：审批卡不再挂着', await panel.locator('[data-approval]').count() === 0)
+  check('继续运行是谁发起的写在分段线上', (await panel.locator('[data-phase-mark]').allInnerTexts()).some((t) => t.includes('张工')))
+  check('审批留痕写签批人，不写「你」', (await panel.innerText()).includes('→ 张工 已批准'))
 
   // 老后端的历史运行（runfx-3 终验）：usage 里没有 active_ms，duration_ms 只记了审批恢复后的
   // 最后一段。栏头、底栏得和航迹一样按事件算执行时长，不写「22 ms」
@@ -980,7 +982,7 @@ await section('编号列、追问、CSV', async () => {
   // 「按 attribute_group 从高到低排」这种说不通的追问
   const { page } = await open('syn=codes', { w: 1100, h: 500, name: 'codes' })
   const chips = await page.$$eval('button.chip', (b) => b.map((x) => x.innerText))
-  check('追问拿"量"排序，不拿编号 / 分组', chips.some((c) => c.includes('按 output_qty 从高到低排'))
+  check('追问拿"量"排序，不拿编号 / 分组', chips.some((c) => c.includes('按 output_qty 从高到低排序'))
     && !chips.some((c) => /attribute_group|factory_code/.test(c)), chips.join(' | '))
   const align = await page.evaluate(() =>
     Object.fromEntries([...document.querySelectorAll('th')].map((th) => [th.innerText, getComputedStyle(th).textAlign])))
@@ -1012,7 +1014,7 @@ await section('协作团队用完轮数：泳道、头部、报错（NI-5、REQ-
     const body = await page.locator('body').innerText()
     const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
     check(`${label}：泳道头说「用完 2 轮仍未完成」`, lanes.includes('用完 2 轮仍未完成'), lanes.split('\n')[0])
-    check(`${label}：泳道点出从没派到的成员`, lanes.includes('汇总员') && lanes.includes('没派到'), lanes.replace(/\n/g, ' ').slice(0, 120))
+    check(`${label}：泳道点出未分派的成员`, lanes.includes('汇总员') && lanes.includes('未分派'), lanes.replace(/\n/g, ' ').slice(0, 120))
     check(`${label}：最后那次判定不画成第 3 轮`, !/第\s?3\s?轮/.test(lanes), lanes.replace(/\n/g, ' ').slice(0, 160))
     const cell = await page.evaluate(() => {
       const b = document.querySelector('[data-team-lanes] button[aria-label^="取数员 第 1 轮"]')
@@ -1032,19 +1034,19 @@ await section('协作团队用完轮数：泳道、头部、报错（NI-5、REQ-
   {
     const { page } = await open('syn=exhausted-degrade', { w: 1100, h: 900, name: 'exhausted-degrade' })
     const head = await page.locator('[data-turn] .sticky').first().innerText()
-    check('降档交付：头部不是一个安静的「已完成」', head.includes('协作团队没做完'), head.replace(/\n/g, ' '))
+    check('降档交付：头部不是一个安静的「已完成」', head.includes('协作团队未完成'), head.replace(/\n/g, ' '))
     const lanes = await page.locator('[data-team-lanes]').innerText().catch(() => '')
     check('降档交付：泳道头说按降档交付', lanes.includes('按降档交付'), lanes.split('\n')[0])
     const body = await page.locator('body').innerText()
     check('降档交付：团队那一行说清是降档', body.includes('用完 2 轮仍未完成，按降档交付'))
-    check('降档交付：提醒行给出下一步', body.includes('不能当结论用'))
+    check('降档交付：提醒行给出下一步', body.includes('不可作为结论使用'))
     await page.close()
     const r = await open('syn=exhausted-closing&dense=1', { w: 380, h: 800, name: 'exhausted-closing' })
     const rb = await r.page.locator('body').innerText()
-    check('最后那次判定进行中：写「调度者在做最后判定」', rb.includes('轮数用完 · 调度者在做最后判定'))
+    check('最后那次判定进行中：写「调度者正在做最后判定」', rb.includes('轮数用完 · 调度者正在做最后判定'))
     check('最后那次判定进行中：不写「第 3 轮」', !rb.includes('第 3 轮'))
     const rl = await r.page.locator('[data-team-lanes]').innerText().catch(() => '')
-    check('最后那次判定进行中：泳道也说在判定', rl.includes('轮数用完 · 调度者在判定'), rl.split('\n').slice(0, 2).join(' '))
+    check('最后那次判定进行中：泳道也说正在判定', rl.includes('轮数用完 · 调度者正在判定'), rl.split('\n').slice(0, 2).join(' '))
     await r.page.close()
   }
 })
@@ -1053,14 +1055,14 @@ await section('模型把工具调用写成文字、修复凑数、工具超时�
   const { page, errors } = await open('syn=markup&dense=1', { w: 380, h: 900, name: 'markup' })
   const body = await page.locator('body').innerText()
   const alert = await page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
-  check('报错标题：模型没有真正调用工具', alert.startsWith('模型没有真正调用工具'), alert.split('\n')[0])
-  check('报错说原因和怎么办', alert.includes('当成文字') && alert.includes('绑定'), alert.replace(/\n/g, ' '))
+  check('报错标题：模型未实际调用工具', alert.startsWith('模型未实际调用工具'), alert.split('\n')[0])
+  check('报错说原因和怎么办', alert.includes('以文本形式输出了工具调用') && alert.includes('绑定'), alert.replace(/\n/g, ' '))
   check('原始标记不出现在正文里', !body.includes('DSML'))
   const row = await page.locator('[data-node-id="query"][data-step-status="failed"]').first().innerText().catch(() => '')
-  check('失败的节点行说人话', row.includes('模型没有真正调用工具'), row.replace(/\n/g, ' '))
+  check('失败的节点行说人话', row.includes('模型未实际调用工具'), row.replace(/\n/g, ' '))
   const warn = page.locator('[data-step-code="tool_markup_leak"]').first()
   const warnText = await warn.innerText().catch(() => '')
-  check('提醒行说人话', warnText.includes('模型把工具调用写成了文字，没有真正执行'), warnText.replace(/\n/g, ' '))
+  check('提醒行说人话', warnText.includes('模型以文本形式输出了工具调用，未实际执行'), warnText.replace(/\n/g, ' '))
   check('下一步不用展开就看得到', await warn.locator('[data-step-next]').count() === 1
     && (await warn.locator('[data-step-next]').innerText()).includes('绑定'))
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
@@ -1072,7 +1074,7 @@ await section('模型把工具调用写成文字、修复凑数、工具超时�
   check('每次修复都算上、说出凑出来的值', rbody.includes('让模型修复格式') && /×2/.test(rbody) && rbody.includes('total_count=0'),
     rbody.split('\n').filter((l) => l.includes('修复') || l.includes('×')).join(' | '))
   const ralert = await rp.page.locator('[data-turn] [role="alert"]').first().innerText().catch(() => '')
-  check('报错：校验修复被拒绝', ralert.startsWith('校验修复被拒绝'), ralert.split('\n')[0])
+  check('报错：校验修复未采用', ralert.startsWith('校验修复未采用'), ralert.split('\n')[0])
   await rp.page.close()
 
   const tl = await open('syn=timeout-live&dense=1', { w: 380, h: 700, name: 'timeout-live' })
@@ -1081,11 +1083,11 @@ await section('模型把工具调用写成文字、修复凑数、工具超时�
     const clock = row?.querySelector('[data-over-limit]')
     return { text: clock?.textContent ?? '', color: clock ? getComputedStyle(clock).color : '' }
   })
-  check('进行中的查询越过时限要说破', over.text.includes('已超出 30 s 上限'), over.text)
+  check('进行中的查询越过时限要说破', over.text.includes('已超出 30 秒上限'), over.text)
   check('越过时限的秒表是提醒色', over.color === await colorOf(tl.page, 'var(--st-waiting)'), over.color)
   await tl.page.close()
   const td = await open('syn=timeout', { w: 1100, h: 700 })
-  check('超时的查询写明超了多少上限', (await td.page.locator('body').innerText()).includes('超过 30 s 上限，已放弃等待'))
+  check('超时的查询写明超了多少上限', (await td.page.locator('body').innerText()).includes('超过 30 秒上限，已停止等待'))
   await td.page.close()
 })
 
@@ -1117,24 +1119,24 @@ await section('放弃、结构化的报错、恢复的轮次、出具横幅（RE
 
   const c = await open('syn=tools-dropped&dense=1', { w: 380, h: 700, name: 'tools-dropped' })
   const cb = await c.page.locator('body').innerText()
-  check('改图时工具被清空要单独说', cb.includes('「数据查询」的工具被清空了'))
-  check('自查通过但工具被去掉，自查那行不是安静的通过', cb.includes('自查通过，但有 1 处工具被去掉了'))
+  check('改图时工具被全部移除要单独说', cb.includes('「数据查询」的工具已全部移除'))
+  check('自查通过但工具被移除，自查那行不是安静的通过', cb.includes('自查通过，但有 1 处工具被移除'))
   await c.page.close()
 
   // 按口径卡清点回指的数字（3C REQ-10）：出处是 matched[].caliber「口径名 @ 版本」，和后端 io.py
-  // 同一种拼法。拼法一变，横幅就悄悄只剩「回指 3 个数字」，说不出哪个来自哪张卡
+  // 同一种拼法。拼法一变，横幅就悄悄只剩「可追溯 3 个数字」，说不出哪个来自哪张卡
   const k = await open('syn=calibers', { w: 1100, h: 800, name: 'calibers' })
   const rows = await k.page.locator('[data-issuance-banner] [data-caliber]').evaluateAll((els) =>
     els.map((e) => [e.getAttribute('data-caliber'), e.textContent.replace(/\s+/g, ' ')]))
-  check('两张口径卡各数各的：订单口径回指 2 个、退款口径回指 1 个',
-    rows.length === 2 && rows[0][0] === '订单口径' && rows[0][1].includes('回指 2 个数字')
-      && rows[1][0] === '退款口径' && rows[1][1].includes('回指 1 个数字'), JSON.stringify(rows))
-  check('两张卡时不说「都来自这张卡」', !rows.some(([, t]) => t.includes('都来自这张卡')))
+  check('两张口径卡各数各的：订单口径可追溯 2 个、退款口径可追溯 1 个',
+    rows.length === 2 && rows[0][0] === '订单口径' && rows[0][1].includes('可追溯 2 个数字')
+      && rows[1][0] === '退款口径' && rows[1][1].includes('可追溯 1 个数字'), JSON.stringify(rows))
+  check('两张卡时不说「均来自此口径卡」', !rows.some(([, t]) => t.includes('均来自此口径卡')))
   await k.page.close()
   const one = await open('syn=caliber-one', { w: 1100, h: 800 })
   const oneRow = await one.page.locator('[data-issuance-banner] [data-caliber]').allInnerTexts()
-  check('只有一张卡、逐个出处都指向它：写「都来自这张卡」', oneRow.length === 1
-    && oneRow[0].includes('回指上的 2 个数字都来自这张卡'), oneRow.join(' | '))
+  check('只有一张卡、逐个出处都指向它：写「均来自此口径卡」', oneRow.length === 1
+    && oneRow[0].includes('可追溯的 2 个数字均来自此口径卡'), oneRow.join(' | '))
   await one.page.close()
 })
 
@@ -1224,7 +1226,7 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await feed(WAIT)
   await page.waitForTimeout(600)
   const panel = page.locator('.sheet-in').first()
-  check('等人：栏头「去审批」旁边有「放弃这次运行」', await panel.getByRole('button', { name: '放弃这次运行' }).count() === 1)
+  check('等待审批时：栏头「去审批」旁边有「放弃这次运行」', await panel.getByRole('button', { name: '放弃这次运行' }).count() === 1)
 
   // 胶囊的「去审批」在右栏处于对话层时派发 agentlab:goto-approval：右栏得自己切过去、把焦点放进审批卡
   await panel.getByRole('button', { name: /助手/ }).first().click()
@@ -1263,7 +1265,7 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await page.locator('.sheet-in').first().getByRole('button', { name: '放弃这次运行' }).click()
   await page.waitForTimeout(300)
   const dialog = await page.locator('[role="dialog"]').innerText().catch(() => '')
-  check('放弃前先确认，说清后果', dialog.includes('待审批') && dialog.includes('不能再接着跑'), dialog.replace(/\n/g, ' ').slice(0, 160))
+  check('放弃前先确认，说清后果', dialog.includes('待审批') && dialog.includes('无法继续运行'), dialog.replace(/\n/g, ' ').slice(0, 160))
   await page.locator('[role="dialog"]').getByRole('button', { name: '放弃这次运行' }).click()
   await page.waitForTimeout(400)
   check('放弃：调了 cancel，带着署名', cancels.length === 1 && decodeURIComponent(cancels[0]) === '张工', JSON.stringify(cancels))
@@ -1354,21 +1356,21 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   })
   await page.waitForTimeout(400)
   const turns = await page.locator('[data-turn]').allInnerTexts()
-  check('unchanged：说「看过了，画布没有需要改的地方」', turns[0]?.includes('看过了，画布没有需要改的地方')
+  check('unchanged：说「已检查，画布无需修改」', turns[0]?.includes('已检查，画布无需修改')
     && !turns[0]?.includes('已更新画布'), turns[0]?.split('\n').slice(0, 3).join(' '))
-  check('修过但数不出几处：不写「几 处」', turns[1]?.includes('自查发现的问题已自动修好') && !turns[1]?.includes('几 处'),
+  check('修过但数不出几处：不写「几 处」', turns[1]?.includes('自查发现的问题已自动修正') && !turns[1]?.includes('几 处'),
     turns[1]?.split('\n').slice(0, 3).join(' '))
-  // 只加了认不出类型的节点、全被跳过：画布一处没变，不能说「已放到画布」（3C REQ-9）
+  // 只加了认不出类型的节点、全被跳过：画布一处没变，不能说「已应用到画布」（3C REQ-9）
   const skippedHead = await page.locator('[data-turn="u4"] .sticky').innerText().catch(() => '')
-  check('全被跳过的轮次：写「画布没有改动：有 1 步没放上」', skippedHead.includes('画布没有改动：有 1 步没放上')
-    && !skippedHead.includes('已放到画布'), skippedHead.replace(/\n/g, ' '))
+  check('全被跳过的轮次：写「画布未修改：有 1 个步骤未能添加」', skippedHead.includes('画布未修改：有 1 个步骤未能添加')
+    && !skippedHead.includes('已应用到画布'), skippedHead.replace(/\n/g, ' '))
   // 画布一处没变就没有可撤的：给了「撤销这次生成」，撤掉的是这一轮之前的那一步
   check('画布没变的轮次不给「撤销这次生成」', await page.getByRole('button', { name: '撤销这次生成' }).count() === 0
-    && await page.getByRole('button', { name: /让助手补上/ }).count() === 1)
+    && await page.getByRole('button', { name: /让助手补全/ }).count() === 1)
 
   // 改图时模型漏写了 tools：回执逐项列出去掉了什么；自查是通过的，「让助手再修」不管用，撤销是首选
   const dropped = { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
-    message: '「数据查询」的工具从 db_query__shop 变成了空：这一轮的要求里没有提到去掉工具' }
+    message: '「数据查询」的工具从 db_query__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果' }
   await page.evaluate((warn) => {
     window.__studio.setState({ copilotTurns: [{ explanation: '', error: '', phase: 'done', id: 'u3', instruction: '只查上月的数据',
       outcome: 'applied', diff: { added: [], changed: ['query'], removed: [], total: 1 },
@@ -1379,10 +1381,10 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   }, dropped)
   await page.waitForTimeout(400)
   const loss = await page.locator('[data-tool-changes]').innerText().catch(() => '')
-  check('回执逐项列出被去掉的工具', loss.includes('「数据查询」去掉了') && loss.includes('db_query__shop') && loss.includes('一个工具都没有'),
+  check('回执逐项列出被去掉的工具', loss.includes('「数据查询」去掉了') && loss.includes('db_query__shop') && loss.includes('当前没有任何工具'),
     loss.replace(/\n/g, ' '))
   const head3 = await page.locator('[data-turn="u3"] .sticky').innerText().catch(() => '')
-  check('回执头部是提醒，写清几处工具被去掉', head3.includes('没让删却少了 1 处工具'), head3.replace(/\n/g, ' '))
+  check('回执头部是提醒，写清几处工具被移除', head3.includes('未经要求移除了 1 处工具'), head3.replace(/\n/g, ' '))
   check('只丢了工具时不给「让助手再修」，撤销是主按钮',
     await page.getByRole('button', { name: /让助手/ }).count() === 0
     && await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
@@ -1414,7 +1416,7 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   // 同一轮里一处是没让删的（后端点了名）、一处是按要求删的：卡片和改图回执一样分两组，
   // 卡头只为没让删的那处提醒（3C REQ-10）
   const unaskedWarn = { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
-    message: '这一轮的要求里没有提到去掉 db_query__shop，确认一下是不是改漏了' }
+    message: '「数据查询」的工具从 db_query__shop 变为无。本轮要求中没有提到移除 db_query__shop，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果' }
   const splitTurn = (id, warnings, changes) => ({ explanation: '', error: '', phase: 'done', id, instruction: '汇总那一步别再查库了',
     outcome: 'applied', diff: { added: [], changed: changes.map((c) => c.node_id), removed: [], total: changes.length },
     ops: [{ op: 'update_node', id: 'query', config: { system: '只查上月' } },
@@ -1427,29 +1429,29 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   const head5 = await page.locator('[data-turn="u5"] .sticky').innerText().catch(() => '')
   const unaskedText = await page.locator('[data-tool-loss="unasked"]').innerText().catch(() => '')
   const askedText = await page.locator('[data-tool-loss="asked"]').innerText().catch(() => '')
-  check('卡头只数没让删的那处', head5.includes('没让删却少了 1 处工具') && !head5.includes('2 处'), head5.replace(/\n/g, ' '))
-  // 360px 的卡头放得下「没让删」这几个字；万一截断了，悬停也读得到整句（3C 返工 D5）
+  check('卡头只数未经要求移除的那处', head5.includes('未经要求移除了 1 处工具') && !head5.includes('2 处'), head5.replace(/\n/g, ' '))
+  // 360px 的卡头放得下「未经要求移除」这几个字；万一截断了，悬停也读得到整句（3C 返工 D5）
   const status5 = await page.locator('[data-turn="u5"] [data-turn-status]').evaluate((el) => {
-    // 「没让删」最后一个字的右缘在框内：截断的省略号只能落在它后面
+    // 「未经要求移除」最后一个字的右缘在框内：截断的省略号只能落在它后面
     const node = el.firstChild
-    const at = node?.textContent?.indexOf('没让删') ?? -1
+    const at = node?.textContent?.indexOf('未经要求移除') ?? -1
     let right = Infinity
     if (at >= 0) {
       const r = document.createRange()
-      r.setStart(node, at + 2)
-      r.setEnd(node, at + 3)
+      r.setStart(node, at + 5)
+      r.setEnd(node, at + 6)
       right = r.getBoundingClientRect().right
     }
     const box = el.getBoundingClientRect()
     return { title: el.getAttribute('title') ?? '', visible: right <= box.right + 0.5, width: Math.round(box.width) }
   }).catch(() => ({ title: '', visible: false, width: 0 }))
-  check('卡头的「没让删」在 360px 里看得见，整句在悬停里', status5.visible && status5.title.includes('没让删却少了 1 处工具'),
+  check('卡头的「未经要求移除」在 360px 里看得见，整句在悬停里', status5.visible && status5.title.includes('未经要求移除了 1 处工具'),
     JSON.stringify(status5))
-  check('没让删的一组在前，写明确认是不是改漏了', unaskedText.includes('没让删') && unaskedText.includes('「数据查询」')
+  check('未经要求删除的一组在前，写明请确认是否误删', unaskedText.includes('未要求删除') && unaskedText.includes('「数据查询」')
     && !unaskedText.includes('「汇总」'), unaskedText.replace(/\n/g, ' '))
   check('按要求删的另列一组', askedText.includes('按要求') && askedText.includes('「汇总」') && !askedText.includes('「数据查询」'),
     askedText.replace(/\n/g, ' '))
-  check('有没让删的：撤销仍是主按钮', await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
+  check('有未经要求移除的：撤销仍是主按钮', await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 1)
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {
       await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
@@ -1462,7 +1464,7 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await page.evaluate((t) => window.__studio.setState({ copilotTurns: [t] }), splitTurn('u6', [], [lossSum]))
   await page.waitForTimeout(400)
   const head6 = await page.locator('[data-turn="u6"] .sticky').innerText().catch(() => '')
-  check('全是按要求删的：卡头不说「没让删」，只列在「按要求」底下', !head6.includes('没让删')
+  check('全是按要求删的：卡头不说「未经要求移除」，只列在「按要求」底下', !head6.includes('未经要求移除')
     && await page.locator('[data-tool-loss="asked"]').count() === 1 && await page.locator('[data-tool-loss="unasked"]').count() === 0,
     head6.replace(/\n/g, ' '))
   check('全是按要求删的：撤销不是主按钮', await page.locator('button.btn-primary', { hasText: '撤销这次生成' }).count() === 0
@@ -1489,7 +1491,7 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await page.waitForTimeout(200)
 
   // 模型把工具调用写成文字、判失败：报错和提醒行给「打开『数据查询』的设置」，点了就是那个节点的属性面板
-  const MARKUP_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
+  const MARKUP_ERROR = '模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。常见原因：节点未绑定工具，或模型、服务不支持工具调用。请在画布中为该节点绑定所需工具；如已绑定仍出现此问题，请换用支持工具调用的模型'
   await page.evaluate((run) => {
     window.__studio.setState({ copilotTurns: [] })
     window.__studio.setState({ run: { id: run, workflow_id: 'fx-stream3', status: 'running', input: {}, output: {}, error: null,
@@ -1498,13 +1500,13 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await feed([ev(1, 'run.started', null, { nodes: 4 }, 0), ev(2, 'node.started', 'query', { node_type: 'agent', label: '数据查询' }, 0.1),
     ev(3, 'llm.start', 'query', { model: 'demo-chat' }, 0.2),
     ev(4, 'llm.end', 'query', { model: 'demo-chat', duration_ms: 1800, input_tokens: 800, output_tokens: 90, cost_usd: 0.001 }, 2),
-    ev(5, 'log', 'query', { level: 'warn', code: 'tool_markup_leak', message: '模型把工具调用写成了文字（<｜｜DSML｜｜invoke name="db_query__shop">…），没有真正调用工具，已提醒它重试一次' }, 2.1),
+    ev(5, 'log', 'query', { level: 'warn', code: 'tool_markup_leak', message: '模型以文本形式输出了工具调用（<｜｜DSML｜｜invoke name="db_query__shop">…），未实际调用工具，已要求模型重试一次' }, 2.1),
     ev(6, 'node.failed', 'query', { error: MARKUP_ERROR, duration_ms: 3900 }, 4),
     ev(7, 'run.failed', null, { error: MARKUP_ERROR, node_id: 'query', label: '数据查询', timing: { wall_ms: 4000, active_ms: 4000, wait_ms: 0 } }, 4)])
   await page.waitForTimeout(500)
   const runPanel = page.locator('.sheet-in').first()
   const alertText = await runPanel.locator('[data-turn-error]').innerText().catch(() => '')
-  check('右栏报错说人话：模型没有真正调用工具', alertText.startsWith('模型没有真正调用工具') && !alertText.includes('DSML'),
+  check('右栏报错说人话：模型未实际调用工具', alertText.startsWith('模型未实际调用工具') && !alertText.includes('DSML'),
     alertText.split('\n')[0])
   check('提醒行的下一步也给直达入口', await runPanel.locator('[data-step-code="tool_markup_leak"] [data-fix="canvas"]').count() === 1)
   if (SHOTS) {
@@ -1676,7 +1678,7 @@ await section('逐段证据：带 _evidence 的成果（可点击证据第一期
     const turn = page.locator('[data-turn="evidence"]')
     check(`${tag}：带证据的字段换成逐段文档，数字是可点的片段`, await turn.locator('[data-seg]').count() === 13)
     check(`${tag}：出具横幅多一行计数`, (await turn.locator('[data-evidence-line]').innerText())
-      .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了'))
+      .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用无法解析'))
     check(`${tag}：没有 _evidence 的那一轮不变`, await page.locator('[data-turn="evidence-legacy"] [data-seg]').count() === 0)
     await turn.locator('[data-seg="s6"]').click()
     await page.waitForSelector('[data-evidence-panel] [data-ev-substituted]')
@@ -1702,7 +1704,7 @@ await section('逐段证据：带 _evidence 的成果（可点击证据第一期
 })
 
 await section('审批卡：始终允许（工具信任三档）', async () => {
-  // 探索运行里 MCP / 自定义工具的审批带 trust_key：「通过」旁边多一个「始终允许」，回复走
+  // 探索运行里 MCP / 自定义工具的审批带 trust_key：「批准」旁边多一个「始终允许」，回复走
   // POST /runs/{id}/resume，response 多带 always。不带 trust_key 的审批和以前一模一样。
   // 真页面、真 store，工作流、审批、运行全用 page.route 伪造，写请求只记下来不落库
   const WF_ID = 'fx-trust'
@@ -1717,7 +1719,7 @@ await section('审批卡：始终允许（工具信任三档）', async () => {
   }
   const WF = { id: WF_ID, name: '信任检查', description: '', graph: GRAPH, tags: [], version: 1, status: 'draft',
     published_version: null, run_count: 0, created_at: '2026-09-28T00:00:00Z', updated_at: '2026-09-28T00:00:00Z' }
-  const approvalOf = (tool, trustKey) => ({ id: `ap-${tool}`, run_id: RUN, node_id: 'query', mode: 'approve', title: `Agent 想调用工具 ${tool}`,
+  const approvalOf = (tool, trustKey) => ({ id: `ap-${tool}`, run_id: RUN, node_id: 'query', mode: 'approve', title: `Agent 请求调用工具 ${tool}`,
     payload: { kind: 'tool_approval', node_id: 'query', tool, args: { id: 'C-1' }, title: `是否允许调用 ${tool}？`,
       ...(trustKey ? { trust_key: trustKey } : {}) },
     status: 'pending', response: {}, created_at: new Date(Date.now() - 30_000).toISOString(),
@@ -1778,7 +1780,7 @@ await section('审批卡：始终允许（工具信任三档）', async () => {
       ev(4, 'node.started', 'query', { node_type: 'agent', label: '查档案' }, 0.3),
       ...(approval.payload.trust_key
         ? [ev(5, 'tool.gated', 'query', { tool, verdict: 'escalate', reason: '要导出整张客户表', model: 'tiny-1', duration_ms: 640 }, 0.9)] : []),
-      ev(6, 'human.requested', 'query', { mode: 'approve', tool, args: { id: 'C-1' }, title: `Agent 想调用工具 ${tool}`,
+      ev(6, 'human.requested', 'query', { mode: 'approve', tool, args: { id: 'C-1' }, title: `Agent 请求调用工具 ${tool}`,
         ...(approval.payload.trust_key ? { trust_key: approval.payload.trust_key } : {}) }, 1.0),
       ev(7, 'run.interrupted', 'query', { payload: approval.payload }, 1.1),
     ]
@@ -1792,14 +1794,14 @@ await section('审批卡：始终允许（工具信任三档）', async () => {
   {
     const { ctx, page, errors, writes, toolHits, card } = await setup(approvalOf('crm_lookup', 'crm_lookup'))
     const buttons = await card.locator('button').allInnerTexts()
-    check('带 trust_key：「通过」旁边有「始终允许」', buttons.map((b) => b.trim()).join('|').includes('通过|始终允许|驳回'), buttons.join(' | '))
+    check('带 trust_key：「批准」旁边有「始终允许」', buttons.map((b) => b.trim()).join('|').includes('批准|始终允许|驳回'), buttons.join(' | '))
     const always = card.getByRole('button', { name: '始终允许' })
     const title = await always.getAttribute('title')
-    check('……悬停说明：批准这次，并把工具设为「始终允许 · 门控把关」，可以在工具页改回',
-      !!title?.includes('批准这次，并把 crm_lookup 设为「始终允许 · 门控把关」') && title.includes('由门控模型逐次把关') && title.includes('可以在工具页改回'), title)
+    check('……悬停说明：批准本次调用，并将工具设为「始终允许 · 门控把关」，可在「工具」页修改',
+      !!title?.includes('批准本次调用，并将「crm_lookup」设为「始终允许 · 门控把关」') && title.includes('由门控模型逐次把关') && title.includes('可在「工具」页修改'), title)
     const note = await card.innerText()
-    check('……卡上常显同一句旁注，不只藏在悬停里', note.includes('始终允许 → 批准这次') && note.includes('以后的运行不再问你'))
-    check('……时间线上写着门控为什么拦下', (await page.locator('.sheet-in').first().innerText()).includes('门控拦下 crm_lookup，交给人工审批：要导出整张客户表'))
+    check('……卡上常显同一句旁注，不只藏在悬停里', note.includes('始终允许：批准本次调用') && note.includes('之后的运行将不再请求审批'))
+    check('……时间线上写着门控为什么拦截', (await page.locator('.sheet-in').first().innerText()).includes('门控拦截 crm_lookup，转交人工审批：要导出整张客户表'))
     if (SHOTS) {
       for (const theme of ['dark', 'light']) {
         await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
@@ -1821,7 +1823,7 @@ await section('审批卡：始终允许（工具信任三档）', async () => {
     check('……带着署名，不另走 /approvals/…/decide', decodeURIComponent(resume?.actor ?? '') === '张工'
       && !writes.some((w) => w.url.includes('/decide')), writes.map((w) => w.url).join(', '))
     const toastText = await page.locator('[aria-live]').allInnerTexts().then((t) => t.join(' ')).catch(() => '')
-    check('……回执说运行继续、以后由门控模型把关', toastText.includes('以后由门控模型把关'), toastText.replace(/\s+/g, ' ').slice(0, 120))
+    check('……回执说运行继续、之后由门控模型把关', toastText.includes('之后由门控模型把关'), toastText.replace(/\s+/g, ' ').slice(0, 120))
     check('……工具目录重拉了一次（工具页跟着显示门控把关）', toolHits.length > hitsBefore, `${hitsBefore} → ${toolHits.length}`)
     check('……审批卡收起来了', await page.locator('.sheet-in [data-approval]').count() === 0)
     check('没有运行时报错', errors.length === 0, errors.join(' | '))
@@ -1832,14 +1834,14 @@ await section('审批卡：始终允许（工具信任三档）', async () => {
     // 内置工具的审批（不带 trust_key）：和以前一模一样
     const { ctx, errors, writes, card } = await setup(approvalOf('file_write', null))
     const buttons = (await card.locator('button').allInnerTexts()).map((b) => b.trim())
-    check('不带 trust_key：没有「始终允许」，按钮还是通过 / 驳回', buttons.join('|').includes('通过|驳回') && !buttons.includes('始终允许'), buttons.join(' | '))
+    check('不带 trust_key：没有「始终允许」，按钮还是批准 / 驳回', buttons.join('|').includes('批准|驳回') && !buttons.includes('始终允许'), buttons.join(' | '))
     const text = await card.innerText()
     check('……卡上不提始终允许和门控', !text.includes('始终允许') && !text.includes('门控'), text.replace(/\s+/g, ' ').slice(0, 160))
-    check('……批了会怎样还是原来那句', text.includes('通过 → 接着往下跑；驳回 → 走「驳回」那条出口'))
-    await card.getByRole('button', { name: '通过' }).click()
+    check('……批了会怎样还是原来那句', text.includes('批准：继续运行；驳回：转入「驳回」分支'))
+    await card.getByRole('button', { name: '批准' }).click()
     await ctx.pages()[0].waitForTimeout(400)
     const decide = writes.find((w) => w.url.includes('/decide'))
-    check('……「通过」照旧走 /approvals/…/decide，请求体里没有 always', !!decide && decide.body?.approved === true && !('always' in (decide.body ?? {}))
+    check('……「批准」照旧走 /approvals/…/decide，请求体里没有 always', !!decide && decide.body?.approved === true && !('always' in (decide.body ?? {}))
       && !writes.some((w) => w.url.endsWith('/resume')), JSON.stringify(decide?.body ?? writes.map((w) => w.url)))
     check('没有运行时报错', errors.length === 0, errors.join(' | '))
     await ctx.close()

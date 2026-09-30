@@ -225,7 +225,7 @@ def test_r3_inserts_a_report_between_the_agent_and_the_exit():
     rewire = next(ch for ch in out["changes"] if ch["field"] == "edge" and ch["before"])
     assert rewire["before"] == {"source": "ask", "target": "out"} and rewire["after"] == {"source": rid, "target": "out"}
     assert "contract" not in cfg(g, "out")                         # 契约（和 cells）要人拿主意，不替人加
-    assert any("cells" in n["text"] for n in out["notes"])
+    assert any("单元格引用" in n["text"] for n in out["notes"])
 
 
 def test_r3_skips_agents_that_only_read_table_structures():
@@ -247,7 +247,7 @@ def test_r5_only_suggests_marking_the_code_node_as_a_source():
     out = upgrade_for_evidence(before)
     assert out["graph"] == before and out["changes"] == []
     [note] = [n for n in out["notes"] if n["rule"] == "R5"]
-    assert note["node_id"] == "calc" and "source" in note["text"]
+    assert note["node_id"] == "calc" and "「取数」" in note["text"]
     assert infos(before) == []                                     # 只有 R5 的不算「旧结构」
 
 
@@ -364,7 +364,7 @@ def test_r3_rewires_the_direct_exit_and_explains_the_indirect_one_whatever_the_n
     assert cfg(g, "out")["fields"] == [{"name": "answer", "value": f"{{{{ nodes.{rid}.text }}}}"}]
     assert cfg(g, "out2") == cfg(graph, "out2")                    # 经过别的节点的出口不替人改
     [skipped] = [n for n in out["notes"] if n["rule"] == "R3" and n["level"] == "warning"]
-    assert "转述" in skipped["text"] and "经过别的节点" in skipped["text"]
+    assert "转述" in skipped["text"] and "经过其他节点" in skipped["text"]
     assert infos(graph) and infos(g) == []
     again = upgrade_for_evidence(g)
     assert again["changes"] == [] and again["graph"] == g
@@ -404,7 +404,7 @@ def test_an_unset_report_from_is_dropped_when_r3_converts_the_narrative():
 
 
 def cells_notes(out: dict) -> list:
-    return [n for n in out["notes"] if n["rule"] == "R3" and "cells: true" in n["text"]]
+    return [n for n in out["notes"] if n["rule"] == "R3" and "「单元格引用」" in n["text"]]
 
 
 def test_r3_warns_that_governed_formal_runs_fail_without_cells():
@@ -450,7 +450,7 @@ def test_deleting_a_node_is_refused():
     before = narrative_graph()
     after = copy.deepcopy(before)
     after["nodes"] = [n for n in after["nodes"] if n["id"] != "fetch"]
-    assert any("删了节点" in r for r in forbidden(before, after))
+    assert any("删除了节点" in r for r in forbidden(before, after))
 
 
 def test_llm_to_report_is_allowed_only_for_the_node_the_upgrade_names():
@@ -469,14 +469,14 @@ def test_only_the_rewired_edge_may_go():
     after = copy.deepcopy(before)
     after["edges"] = [e for e in after["edges"] if (e["source"], e["target"]) != ("ask", "out")]
     assert forbidden(before, after, rewired={("ask", "out")}) == []
-    assert any("删了连线" in r for r in forbidden(before, after))
+    assert any("删除了连线" in r for r in forbidden(before, after))
     after["edges"] = []
-    assert any("start → ask" in r for r in forbidden(before, after, rewired={("ask", "out")}))
+    assert any("「问题」→「查数作答」" in r for r in forbidden(before, after, rewired={("ask", "out")}))
 
 
 @pytest.mark.parametrize("damage, word", [
     (lambda g: cfg(g, "done").pop("contract"), "契约"),
-    (lambda g: cfg(g, "done")["contract"].update(required=[]), "required"),
+    (lambda g: cfg(g, "done")["contract"].update(required=[]), "必需指标"),
     (lambda g: cfg(g, "done")["contract"].update(strict=True), None),
 ])
 def test_contract_rules_are_the_publish_fix_rules(damage, word):
@@ -497,7 +497,7 @@ def test_strict_off_and_looser_approval_are_refused():
     cfg(after, "ask")["approval"] = "never"
     cfg(after, "fin")["contract"]["strict"] = False
     reasons = forbidden(before, after)
-    assert any("全部自动放行" in r for r in reasons) and any("strict" in r for r in reasons)
+    assert any("全部无需审批" in r for r in reasons) and any("严格模式" in r for r in reasons)
 
 
 # --------------------------------------------------------------------------
@@ -582,7 +582,7 @@ async def test_the_endpoint_explains_an_unreadable_graph(client):
     r = await client.post("/api/copilot/upgrade-evidence", json={"graph": {"nodes": [{"id": "bad id!", "type": "llm"}]}})
     assert r.status_code == 200
     body = r.json()
-    assert body["changes"] == [] and body["issues"][0]["level"] == "error" and "读不懂" in body["issues"][0]["message"]
+    assert body["changes"] == [] and body["issues"][0]["level"] == "error" and "无法解析" in body["issues"][0]["message"]
 
 
 async def test_the_endpoint_rejects_an_unknown_level(client):

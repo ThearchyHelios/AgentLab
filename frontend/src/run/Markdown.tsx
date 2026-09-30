@@ -713,11 +713,11 @@ export function CopyChip({ label, text, className }: {
       onClick={(e) => {
         e.stopPropagation()
         const value = text()
-        if (!navigator.clipboard) { toast.error('复制失败：浏览器没有给剪贴板权限'); return }
+        if (!navigator.clipboard) { toast.error('复制失败：浏览器未授予剪贴板权限'); return }
         void navigator.clipboard.writeText(value).then(() => {
           setDone(true)
           setTimeout(() => setDone(false), 1500)
-        }, () => toast.error('复制失败：浏览器没有给剪贴板权限'))
+        }, () => toast.error('复制失败：浏览器未授予剪贴板权限'))
       }}
     >
       {done ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}

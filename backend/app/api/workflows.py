@@ -17,9 +17,9 @@ from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
-_GONE = "这个工作流不存在，可能已经被删了"
+_GONE = "工作流不存在，可能已被删除"
 _LEVELS = ("published", "governed")
-_BAD_LEVEL = "发布档位只能选「已发布」或「受管」"
+_BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
 
 
 class WorkflowIn(BaseModel):
@@ -154,7 +154,7 @@ async def delete_workflow(
         )
     )
     if live:
-        raise HTTPException(409, f"这个工作流还有 {live} 次运行在进行，现在删除它们会失去归属。先停止运行，再删除")
+        raise HTTPException(409, f"该工作流还有 {live} 次运行正在进行，现在删除会使这些运行失去所属工作流。请先停止运行，再删除")
     await session.delete(workflow)
     await session.commit()
 
@@ -228,7 +228,7 @@ async def get_version(
         )
     ).scalar_one_or_none()
     if not snapshot:
-        raise HTTPException(404, f"「{workflow.name}」没有 v{version} 这个版本")
+        raise HTTPException(404, f"「{workflow.name}」不存在 v{version} 版本")
 
     graph = snapshot.graph or {}
     fields: list[dict[str, Any]] = []
@@ -262,7 +262,7 @@ async def restore_version(
         )
     ).scalar_one_or_none()
     if not snapshot:
-        raise HTTPException(404, f"没有 v{version} 这个版本")
+        raise HTTPException(404, f"不存在 v{version} 版本")
 
     workflow.graph = snapshot.graph
     workflow.version += 1
@@ -317,12 +317,12 @@ async def publish_workflow(
         )
     ).scalar_one_or_none()
     if not snapshot:
-        raise HTTPException(404, f"没有 v{version} 这个版本：画布上的改动还没保存，先保存一次再发布")
+        raise HTTPException(404, f"不存在 v{version} 版本：画布上的修改还没有保存，请先保存再发布")
 
     try:
         spec = GraphSpec.model_validate(snapshot.graph)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "issues": [{"level": "error", "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+        return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
     issues = [i.model_dump() for i in publish_issues(spec, level=payload.level)]
     if any(i["level"] == "error" for i in issues):
@@ -403,7 +403,7 @@ async def _gate_context(session: AsyncSession, spec: GraphSpec) -> tuple[dict[st
 def _unreadable(level: str, e: Exception) -> dict[str, Any]:
     return {"level": level, "ok": False, "fixes": [], "issues": [
         {"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None, "fix": None,
-         "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+         "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
 
 @router.post("/{workflow_id}/publish-check")
@@ -443,7 +443,7 @@ async def autofix(
     except Exception as e:  # noqa: BLE001
         bad = _unreadable(payload.level, e)
         return {"graph": graph, "changes": [], "ops": [], "applied": [], "rejected": [
-            {"fix_id": fid, "reason": "工作流的结构读不懂，没法应用修复"} for fid in payload.apply],
+            {"fix_id": fid, "reason": "无法解析工作流结构，不能应用修复"} for fid in payload.apply],
             "remaining": bad["issues"], "fixes": [], "handoff": [], "assist": None, "ok": False}
     versions, cards = await _gate_context(session, spec)
     out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards)
@@ -451,7 +451,7 @@ async def autofix(
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
         if out["ok"]:
-            out["assist"] = {"ok": True, "summary": "修复之后已经没有挡住发布的错误，没有再交给 Copilot",
+            out["assist"] = {"ok": True, "summary": "修复后已没有阻止发布的错误，未再交给助手",
                              "questions": []}
             return out
         from app.api.copilot import assist_publish_fix
@@ -461,7 +461,7 @@ async def autofix(
         out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"]}
         if helped["accepted"]:
             fixed = helped["graph"]
-            out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="Copilot 的修改")
+            out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
             after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards)
@@ -481,7 +481,7 @@ async def validate(payload: ValidateIn) -> dict[str, Any]:
     try:
         spec = GraphSpec.model_validate(payload.graph)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "issues": [{"level": "error", "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+        return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
     result = validate_graph(spec)
     return result.model_dump()
 
@@ -498,5 +498,5 @@ async def variables(payload: ValidateIn) -> dict[str, Any]:
     try:
         spec = GraphSpec.model_validate(payload.graph)
     except Exception as e:  # noqa: BLE001
-        return {"variables": [], "issues": [{"level": "error", "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+        return {"variables": [], "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
     return analyze(spec).model_dump()

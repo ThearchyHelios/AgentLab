@@ -19,7 +19,7 @@ async def run_branch(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """条件分支。两种模式：表达式判断，或让模型做语义分类。"""
     cases = ctx.cfg("cases", []) or []
     if not cases:
-        raise NodeError(ctx.node.id, "分支节点没有配置任何条件")
+        raise NodeError(ctx.node.id, "「条件分支」节点没有配置任何条件")
 
     mode = ctx.cfg("mode", "expression")
     tctx = template_context(state)
@@ -39,9 +39,9 @@ async def run_branch(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     chosen, reason = key, f"命中条件：{expr}"
                     break
             except ExpressionError as e:
-                raise NodeError(ctx.node.id, f"分支条件写错了（{expr}）：{e}") from e
+                raise NodeError(ctx.node.id, f"分支条件有误（{expr}）：{e}") from e
         else:
-            reason = "所有条件都不满足，走 default"
+            reason = "所有条件都不满足，走「其他」出口"
 
     ctx.emit(EventType.EDGE_TAKEN, branch=chosen, reason=reason, mode=mode)
     return {
@@ -155,13 +155,13 @@ async def run_loop(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             try:
                 keep_going = eval_condition(condition, tctx)
             except ExpressionError as e:
-                raise NodeError(ctx.node.id, f"循环条件写错了：{e}") from e
+                raise NodeError(ctx.node.id, f"循环条件有误：{e}") from e
 
     hit_limit = cursor >= max_iter
     if hit_limit:
         ctx.emit(
             EventType.LOG, level="warn",
-            message=f"循环达到上限 {max_iter} 次，强制退出", code="loop_limit",
+            message=f"循环已达上限 {max_iter} 次，已强制结束", code="loop_limit",
         )
 
     decision = "body" if keep_going else "done"

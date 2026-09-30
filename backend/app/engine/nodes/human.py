@@ -26,7 +26,7 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "kind": "human_node",
         "node_id": ctx.node.id,
         "mode": mode,
-        "title": ctx.render_str(ctx.cfg("title", "需要你确认"), state),
+        "title": ctx.render_str(ctx.cfg("title", "待审批"), state),
         "message": ctx.render_str(ctx.cfg("message", ""), state),
         "schema": ctx.cfg("schema") or {},
         "context": ctx.render(ctx.cfg("context", {}) or {}, state),
@@ -47,7 +47,7 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "__decision__": "approved" if approved else "rejected",
         }
         if not approved and ctx.cfg("stop_on_reject", False):
-            raise NodeError(ctx.node.id, f"人工拒绝：{result['note'] or '未说明原因'}")
+            raise NodeError(ctx.node.id, f"人工驳回：{result['note'] or '未说明原因'}")
     else:  # edit / input
         # 驳回在这两种模式下以前是个摆设：__decision__ 硬编码成 approved，
         # approved 字段看都不看。界面上按钮在、toast 说"已驳回"，运行却照常
@@ -86,7 +86,7 @@ async def run_validate(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     schema = ctx.cfg("schema")
     if not schema:
-        raise NodeError(ctx.node.id, "校验节点需要一个 JSON Schema")
+        raise NodeError(ctx.node.id, "「结构校验」节点需要填写 JSON Schema")
 
     source_cfg = ctx.cfg("source", "{{ last_message }}")
     original = ctx.render(source_cfg, state) if not isinstance(source_cfg, str) else ctx.render_str(source_cfg, state)
@@ -123,7 +123,7 @@ async def run_validate(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     updates["vars"] = {var_name: value}
                 return updates
             except jsonschema.ValidationError as e:
-                path = "/".join(str(p) for p in e.absolute_path) or "(根)"
+                path = "/".join(str(p) for p in e.absolute_path) or "（根）"
                 errors = [f"{path}: {e.message}"]
 
         if not invented:
@@ -137,7 +137,7 @@ async def run_validate(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     result = {"valid": False, "data": value, "attempts": attempt, "errors": errors}
     if ctx.cfg("fail_fast", True):
-        raise NodeError(ctx.node.id, f"结构化校验未通过：{'; '.join(errors)}{_upstream_cut_short(state, ctx)}")
+        raise NodeError(ctx.node.id, f"结构化校验未通过：{'；'.join(errors)}{_upstream_cut_short(state, ctx)}")
     return {"nodes": {ctx.node.id: result}, **({"usage": usage} if usage else {})}
 
 
@@ -151,14 +151,14 @@ def _upstream_cut_short(state: GraphState, ctx: NodeContext) -> str:
 
     nodes = ctx.run.spec.node_map()
     cut = [
-        f"「{nodes[nid].title if nid in nodes else nid}」{LIMITED_LABEL.get(out['limited'], '提前收了尾')}"
+        f"「{nodes[nid].title if nid in nodes else nid}」因{LIMITED_LABEL.get(out['limited'], '达到上限')}"
         for nid, out in (state.get("nodes") or {}).items()
         if isinstance(out, dict) and out.get("limited")
     ]
     if not cut:
         return ""
-    return (f"。上游{'、'.join(cut)}，没等查全就收了尾，缺的字段多半出在这里："
-            "看它的收尾提示，把对应的上限调大或者缩小它要查的范围")
+    return (f"。上游{'、'.join(cut)}提前结束，缺失的字段很可能源于此。"
+            "请查看其结束提示，调大相应上限或缩小查询范围")
 
 
 def _coerce_json(raw: Any) -> tuple[Any, str | None]:
@@ -312,19 +312,19 @@ def _invented(value: Any, original: Any, schema: dict[str, Any]) -> list[str]:
             return
         elif isinstance(node, (int, float)):
             if not known_number(float(node)):
-                found.append(f"{path or '(根)'}={node}")
+                found.append(f"{path or '（根）'}={node}")
         elif isinstance(node, str):
             s = node.strip()
             if not s:
                 if '""' not in text:
-                    found.append(f'{path or "(根)"}=""')
+                    found.append(f'{path or "（根）"}=""')
                 return
             if s in allowed:
                 return
             if _NUMBER.fullmatch(s):
                 # 写成字符串的数字照数字查："0" 不能因为 SQL 里有个 > 0 就算有出处
                 if not known_number(float(s.replace(",", ""))):
-                    found.append(f"{path or '(根)'}={s[:40]}")
+                    found.append(f"{path or '（根）'}={s[:40]}")
                 return
             if s.lower() in lowered:
                 return
@@ -333,7 +333,7 @@ def _invented(value: Any, original: Any, schema: dict[str, Any]) -> list[str]:
                 known_number(float(p)) if p[0].isdigit() else p.lower() in lowered for p in pieces
             )
             if not ok:
-                found.append(f"{path or '(根)'}={s[:40]}")
+                found.append(f"{path or '（根）'}={s[:40]}")
 
     walk(value, "")
     return found

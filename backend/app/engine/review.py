@@ -161,9 +161,13 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     # 不区分的话，参数自动纠正这条路每修一次就报一次「答案不可信」。
     recovered: set[str] = set()
     failed_at: dict[str, int] = {}
+    #: 节点名：node.started 带着画布上的名字，报失败时写名字，不写节点 id
+    titles: dict[str, str] = {}
     for i, e in enumerate(rows):
         etype = str(_event_field(e, "type", ""))
         data = _event_field(e, "data") or {}
+        if etype == EventType.NODE_STARTED and data.get("label"):
+            titles.setdefault(str(_event_field(e, "node_id") or ""), str(data["label"]))
         tool = str(data.get("tool") or "")
         if etype == EventType.TOOL_ERROR and tool:
             failed_at.setdefault(tool, i)
@@ -185,7 +189,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
 
         elif etype == EventType.NODE_FAILED:
             err = str(data.get("error") or "").strip()[:200]
-            add("node_failed", f"节点 {node_id} 执行失败：{err}", BROKEN)
+            add("node_failed", f"节点「{titles.get(node_id) or node_id}」执行失败：{err}", BROKEN)
 
         elif etype == EventType.RUN_FAILED:
             err = str(data.get("error") or "").strip()[:200]
@@ -196,7 +200,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
                 # knowledge.py 在这条事件**之前**已经把每条具体原因发成了 warn
                 #（"重排结果解析不出来"、"多少条向量对不上"）。两边都收就是同一件事
                 # 报两遍，一条含糊一条具体——这里只兜没有 warn 的情形
-                add("retrieve_degraded", "知识库检索能力降级，可能漏掉换了说法的内容", DEGRADED)
+                add("retrieve_degraded", "知识库检索能力降级，可能遗漏表述不同的内容", DEGRADED)
             if not data.get("count"):
                 q = str(data.get("query") or "").strip()[:60]
                 add("retrieve_empty", f"知识库里没有检索到与「{q}」相关的内容", BROKEN)
@@ -213,10 +217,10 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     if not text:
         add("empty_output", "这次运行没有产出任何成果内容", BROKEN)
     elif any(mark in text for mark in _PLACEHOLDER_MARKS):
-        add("placeholder_output", "交出来的是一句内部流程说明，不是对问题的回答", BROKEN)
+        add("placeholder_output", "交付的是一句内部流程说明，而不是对问题的回答", BROKEN)
     elif leaked_markup(text):
         # 老运行、或者绕过了节点检查的路径：成果本身就是一段没执行的工具调用标记
-        add("markup_output", "交出来的是一段没有执行的工具调用标记，不是对问题的回答", BROKEN)
+        add("markup_output", "交付的是一段未执行的工具调用标记，而不是对问题的回答", BROKEN)
 
     return signals
 

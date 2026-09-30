@@ -305,7 +305,7 @@ async def test_reminder_before_the_budget_runs_out(lookup, monkeypatch):
     seen = script(monkeypatch, lambda i, _: f"店{i}" if i < 5 else None, usage=per_call(1000))
     row, _ = await run(graph(budget_tokens=5000))
     notes = [m.content for call in seen for m in call if isinstance(m, HumanMessage) and "系统提醒" in m.content]
-    assert notes and "令牌预算已用 80%" in notes[0]
+    assert notes and "token 预算已用 80%" in notes[0]
     assert len(set(notes)) == 1, "同一种提醒只该说一次"
 
 
@@ -361,7 +361,7 @@ async def test_validation_failure_names_the_agent_that_was_cut_short(lookup, mon
     g["edges"][1] = {"source": "work", "target": "check"}
     row, _ = await run(g)
     assert row.status == "failed"
-    assert "上游「查数」用满了步数" in (row.error or ""), row.error
+    assert "上游「查数」因步数用完" in (row.error or ""), row.error
 
 
 async def test_runs_from_before_the_upgrade_keep_the_old_rules(lookup, monkeypatch):
@@ -377,7 +377,7 @@ async def test_runs_from_before_the_upgrade_keep_the_old_rules(lookup, monkeypat
     assert row.status == "succeeded", row.error
     assert len(calls) == 12
     [settled] = logs(events, "step_limit_settled")
-    assert "reason" not in settled and "用满了 12 步" in settled["message"]
+    assert "reason" not in settled and "已用完 12 步" in settled["message"]
     assert not logs(events, "tool_repeat")
 
 

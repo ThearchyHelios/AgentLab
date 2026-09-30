@@ -66,38 +66,38 @@ def schema_problem(schema: Any) -> str | None:
     字符串——前者会被说成「后端内部出错了」，后者试跑通过、到了模型那边类型不对。
     """
     if not isinstance(schema, dict):
-        return "参数定义要是一个 JSON 对象"
+        return "参数定义必须是一个 JSON 对象"
     props = schema.get("properties")
     if props is not None and not isinstance(props, dict):
-        return '参数定义格式不对：properties 要是一个对象，每个参数一项，比如 {"n": {"type": "integer"}}'
+        return '参数定义格式有误：properties 必须是一个对象，每个参数一项，例如 {"n": {"type": "integer"}}'
     for key, spec in (props or {}).items():
         if not str(key).strip():
-            return "参数定义格式不对：有一个参数名是空的，给它起个名字"
+            return "参数定义格式有误：存在空的参数名，请为其命名"
         if str(key).startswith("_"):
-            return (f"参数定义格式不对：参数名 {key} 不能以下划线开头，"
-                    f"换成 {str(key).lstrip('_') or 'value'} 这样的名字")
+            return (f"参数定义格式有误：参数名 {key} 不能以下划线开头，"
+                    f"请改为 {str(key).lstrip('_') or 'value'} 这样的名称")
         if str(key).startswith("model_") and hasattr(BaseModel, str(key)):
-            return f"参数定义格式不对：参数名 {key} 和内部保留的名字冲突，换一个名字"
+            return f"参数定义格式有误：参数名 {key} 与内部保留的名称冲突，请换一个名称"
         if not isinstance(spec, dict):
             # 示例照着他写的那个类型给，照抄就能改好：写了 "string" 却让人改成 integer 只会添乱
             shown = json.dumps(spec, ensure_ascii=False)
             meant = _type_guess(spec) or "string"
-            return (f'参数定义格式不对：参数 {key} 要写成 {{"type": "{meant}"}} 这样的对象，'
+            return (f'参数定义格式有误：参数 {key} 应写成 {{"type": "{meant}"}} 这样的对象，'
                     f"不能直接写 {shown}")
         kind = spec.get("type", "string")
         if not isinstance(kind, str) or kind not in _TYPES:
             shown = kind if isinstance(kind, str) else json.dumps(kind, ensure_ascii=False)
             meant = _type_guess(kind)
-            guess = f"，是不是想写 {meant}" if meant else ""
-            return (f"参数定义格式不对：参数 {key} 的类型「{shown}」认不出来{guess}；"
-                    f"只能是 {'、'.join(_TYPES)} 里的一个")
+            guess = f"，是否应为 {meant}" if meant else ""
+            return (f"参数定义格式有误：无法识别参数 {key} 的类型「{shown}」{guess}；"
+                    f"只能是 {'、'.join(_TYPES)} 中的一个")
         if not isinstance(spec.get("description", ""), str):
-            return f"参数定义格式不对：参数 {key} 的 description 要是一段文字"
+            return f"参数定义格式有误：参数 {key} 的 description 必须是文字"
     required = schema.get("required")
     if required is not None and (
         not isinstance(required, list) or not all(isinstance(k, str) for k in required)
     ):
-        return '参数定义格式不对：required 要是参数名的列表，比如 ["n"]'
+        return '参数定义格式有误：required 必须是参数名的列表，例如 ["n"]'
     # 上面没认出来的写法，最后按运行时同一个转换真建一次：放行的一定建得出来
     import warnings
 
@@ -106,13 +106,13 @@ def schema_problem(schema: Any) -> str | None:
             warnings.simplefilter("ignore")   # 和 BaseModel 同名的参数（json、copy）只是警告，照样能用
             schema_to_model("probe", schema)
     except Exception:  # noqa: BLE001
-        return "参数定义格式不对：按它建不出工具的参数表，检查参数名和每个参数的 type"
+        return "参数定义格式有误：无法据此生成工具的参数表，请检查参数名和每个参数的 type"
     return None
 
 
 def broken_tool_message(name: str, problem: str) -> str:
     """库里存着的坏工具被节点绑上时的报错：哪个工具、坏在哪、去哪里改。"""
-    return f"自定义工具「{name}」的{problem}。到「工具」页把它的参数定义改好再运行"
+    return f"自定义工具「{name}」的{problem}。到「工具」页修改参数定义后再运行"
 
 
 class ToolFailure(dict):

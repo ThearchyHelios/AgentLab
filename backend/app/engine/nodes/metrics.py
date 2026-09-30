@@ -31,6 +31,7 @@ from app.engine.expressions import (
     same_value,
     substitute,
 )
+from app.engine.labels import field_label
 from app.engine.state import GraphState, template_context
 
 
@@ -62,7 +63,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 交给出具契约的 required / expected 去判档
     on_missing = str(ctx.cfg("on_missing", "fail") or "fail")
     if on_missing not in ("fail", "null"):
-        raise NodeError(ctx.node.id, f"on_missing 只能是 fail 或 null，写的是 {on_missing!r}")
+        raise NodeError(ctx.node.id, f"「缺输入时」只能是「整个节点失败」或「记为空值」，当前为「{on_missing}」")
 
     metrics: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -70,16 +71,16 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
         if not metric_id or not expr:
-            errors.append(f"指标定义不完整：{definition}")
+            errors.append(f"指标定义不完整（缺少 ID 或计算表达式）：{definition}")
             continue
         display, problem = _display_of(definition)
         if problem:
-            errors.append(f"{metric_id}: {problem}")
+            errors.append(f"指标「{metric_id}」：{problem}")
             continue
         try:
             tree, _, _ = parse_expression(expr)
         except ExpressionError as e:
-            errors.append(f"{metric_id}: 表达式错误（{e}）")
+            errors.append(f"指标「{metric_id}」：表达式有误（{e}）")
             continue
         paths = leaf_refs(tree)
         values = {path: _value_of(path, tctx) for path in paths}
@@ -89,28 +90,28 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         try:
             value = eval_expression(expr, tctx)
         except ExpressionError as e:
-            errors.append(f"{metric_id}: 表达式错误（{e}）")
+            errors.append(f"指标「{metric_id}」：表达式有误（{e}）")
             continue
         except ZeroDivisionError:
-            errors.append(f"{metric_id}: 除以零")
+            errors.append(f"指标「{metric_id}」：除以零")
             continue
         except Exception as e:  # noqa: BLE001 - 求值器之外的运算错误（None 参与算术、类型不对）要说人话
             if missing or "NoneType" in str(e):
                 if on_missing != "null":
-                    errors.append(f"{metric_id}: " + _missing_reason(missing))
+                    errors.append(f"指标「{metric_id}」：" + _missing_reason(missing))
                     continue
                 value = None
             elif isinstance(e, TypeError):
-                errors.append(f"{metric_id}: 输入的类型不对，算不出来——" + _type_hint(paths, values))
+                errors.append(f"指标「{metric_id}」：输入的类型不正确，无法计算——" + _type_hint(paths, values))
                 continue
             else:
-                errors.append(f"{metric_id}: 算不出来（{describe_exception(e)}）")
+                errors.append(f"指标「{metric_id}」：无法计算（{describe_exception(e)}）")
                 continue
 
         if display["bad_decimals"] and isinstance(value, float):
             # 旧写法里 int() 认不得的 decimals：以前走到 round(value, int(decimals)) 就崩，
             # 现在照样算失败，只是说人话。值不是小数时以前根本用不到它，照旧忽略
-            errors.append(f"{metric_id}: decimals 要写整数，写的是 {definition.get('decimals')!r}")
+            errors.append(f"指标「{metric_id}」：小数位（decimals）需要填写整数，当前为「{definition.get('decimals')}」")
             continue
         decimals = display["decimals"]
         if isinstance(value, float) and decimals is not None:
@@ -142,7 +143,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
         f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
-        else f"- {m['id']}（{m['name']}）= {MISSING}（缺输入，没有值）"
+        else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）"
         for m in metrics
     ]
     card = {
@@ -202,27 +203,27 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
     node_id = str(ref.get("node_id") or "").strip() if isinstance(ref, dict) else ""
     version = _integer(ref.get("workflow_version")) if isinstance(ref, dict) else None
     if not wf_id or not node_id or version is None or version < 1:
-        raise NodeError(ctx.node.id, "caliber_from 要写 {workflow_id, workflow_version, node_id}：钉住哪个工作流"
-                                     f"的哪一版里的哪张口径卡，写的是 {ref!r}")
+        raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」格式有误：需要指定工作流、版本和其中的口径卡，"
+                                     f"当前为「{ref}」")
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, wf_id)
         if workflow is None:
-            raise NodeError(ctx.node.id, f"caliber_from 钉住的工作流 {wf_id} 不存在（可能已经被删了）："
-                                         "在节点里重新选一张口径卡")
+            raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」固定的工作流（{wf_id}）不存在，可能已被删除，"
+                                         "请在节点中重新选择口径卡")
         snapshot = (await session.execute(select(WorkflowVersion).where(
             WorkflowVersion.workflow_id == wf_id, WorkflowVersion.version == version))).scalar_one_or_none()
         name = workflow.name
     if snapshot is None:
-        raise NodeError(ctx.node.id, f"caliber_from 钉住的「{name}」没有 v{version} 这个版本：在节点里重新选版本")
+        raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」固定的「{name}」不存在 v{version} 版本，请在节点中重新选择版本")
     found = next((n for n in (snapshot.graph or {}).get("nodes") or []
                   if isinstance(n, dict) and n.get("id") == node_id), None)
     if found is None:
-        raise NodeError(ctx.node.id, f"「{name}」v{version} 里没有节点 {node_id}：在节点里重新选一张口径卡")
+        raise NodeError(ctx.node.id, f"「{name}」v{version} 中没有节点 {node_id}，请在节点中重新选择口径卡")
     data = found.get("data") if isinstance(found.get("data"), dict) else {}
     title = data.get("label") or node_id
     if found.get("type") != "metrics":
-        raise NodeError(ctx.node.id, f"caliber_from 指向的「{name}」v{version} 里的「{title}」不是口径卡，"
-                                     f"是「{type_label(found.get('type'))}」")
+        raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」指向的「{name}」v{version} 中的「{title}」不是口径卡，"
+                                     f"而是「{type_label(found.get('type'))}」")
     cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
     origin = cfg.get("caliber_from")
     if origin not in (None, "", {}):
@@ -230,9 +231,9 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
         async with SessionLocal() as session:
             upstream = await session.get(Workflow, str(root)) if root else None
         where = (f"「{upstream.name}」v{origin.get('workflow_version')} 的 {origin.get('node_id')}"
-                 if upstream is not None else f"{origin!r}")
-        raise NodeError(ctx.node.id, f"「{name}」v{version} 里的「{title}」自己也是钉住别处的口径卡（源头是 {where}）："
-                                     "直接钉住源头那张，升版处置才比得对版本")
+                 if upstream is not None else str(origin))
+        raise NodeError(ctx.node.id, f"「{name}」v{version} 中的「{title}」本身也引用自其他工作流的口径卡（源头是 {where}）。"
+                                     "请直接固定到源头的口径卡，否则升版时无法正确比对版本")
     source = {"workflow_id": wf_id, "workflow_version": version, "node_id": node_id}
     return {"caliber": cfg.get("caliber") or title, "caliber_version": str(cfg.get("caliber_version") or "v1"),
             "metrics": cfg.get("metrics") or []}, source
@@ -255,15 +256,15 @@ def _display_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]
     strict = definition.get("format") not in (None, "")
     fmt = definition.get("format") or DEFAULT_FORMAT
     if fmt not in FORMATS:
-        return {}, f"format 只能是 {' / '.join(FORMATS)}，写的是 {fmt!r}"
+        return {}, f"显示格式（format）只能是 {' / '.join(FORMATS)}，当前为「{fmt}」"
     display: dict[str, Any] = {"decimals": None, "format": fmt, "bad_decimals": False}
     if raw in (None, ""):
         return display, None
     if strict:
         decimals = _integer(raw)
         if decimals is None or not -_DECIMALS_RANGE <= decimals <= _DECIMALS_RANGE:
-            return {}, (f"decimals 要写 -{_DECIMALS_RANGE} 到 {_DECIMALS_RANGE} 的整数"
-                        f"（负数表示取整到十位、百位），写的是 {raw!r}")
+            return {}, (f"小数位（decimals）需要填写 -{_DECIMALS_RANGE} 到 {_DECIMALS_RANGE} 的整数"
+                        f"（负数表示取整到十位、百位），当前为「{raw}」")
         display["decimals"] = decimals
         return display, None
     try:
@@ -306,8 +307,8 @@ def _value_of(path: str, tctx: dict[str, Any]) -> Any:
 
 def _missing_reason(missing: list[str]) -> str:
     if not missing:
-        return "有输入是空值，算不出来（检查上游有没有产出这些字段）"
-    return f"输入 {'、'.join(missing[:4])} 没有值，算不出来（上游没有产出这个字段，或者路径写错了）"
+        return "有输入为空值，无法计算（请检查上游是否产出了这些字段）"
+    return f"输入 {'、'.join(missing[:4])} 没有值，无法计算（上游没有产出该字段，或路径有误）"
 
 
 def _type_hint(paths: list[str], values: dict[str, Any]) -> str:
@@ -321,7 +322,7 @@ def _type_hint(paths: list[str], values: dict[str, Any]) -> str:
         sample = f"「{str(value)[:20]}」" if isinstance(value, str) else ""
         parts.append(f"{path} 是{label}{sample}")
     if not parts:
-        return "参与运算的值不是数"
+        return "参与运算的值不是数值"
     return "、".join(parts[:4]) + "，不能参与数值运算"
 
 
@@ -436,7 +437,7 @@ def _agent_element(evidence: dict[str, Any], key: str) -> dict[str, Any] | None:
     try:
         truth, _ = locate_cell(artifact_store.load(artifact), row, column)
     except (ValueError, CellError, OSError) as e:
-        out.update(status="unresolved", reason=f"查询快照取不回来或对不上：{e}")
+        out.update(status="unresolved", reason=f"查询快照无法读取或与哈希不一致：{e}")
         return out
     if cited.get("status") == "verified":
         out["status"] = "verified"
@@ -480,7 +481,7 @@ def _cell_input(path: str, value: Any, parts: tuple[str, str, str], state: Graph
         ledger = next((e for e in reversed(queries) if e.get("node_id") == head.group(2)), None)
     if ledger is None:
         entry.update(node_id=head.group(2) if head and head.group(1) == "nodes" else None,
-                     status="unresolved", reason="找不到这份数据对应的查询快照：cell() 要取查询工具交回的结果")
+                     status="unresolved", reason="找不到这份数据对应的查询快照：cell() 需要读取查询工具返回的结果")
         return entry
     entry["node_id"] = ledger.get("node_id")
     artifact = ledger.get("artifact")
@@ -495,7 +496,7 @@ def _cell_input(path: str, value: Any, parts: tuple[str, str, str], state: Graph
         snapshot = artifact_store.load(artifact)
         truth, _ = locate_cell(snapshot, row, name)
     except (ValueError, CellError, OSError) as e:
-        entry.update(status="unresolved", reason=f"查询快照取不回来或对不上：{e}")
+        entry.update(status="unresolved", reason=f"查询快照无法读取或与哈希不一致：{e}")
         return entry
     if cell_value(truth) != cell_value(raw):
         # 算的时候用的值和快照不一样（上游改写过这份结果）：照实记下快照里的值
@@ -563,5 +564,5 @@ async def _store(card: dict[str, Any], caliber: str, version: str, ctx: NodeCont
                               meta={"caliber": caliber, "version": version})
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
-                 message=f"口径卡的指标集没能落进工件库（{describe_exception(e)}），报告里没法引用它的指标")
+                 message=f"口径卡的指标保存失败（{describe_exception(e)}），报告将无法引用这些指标")
         return None

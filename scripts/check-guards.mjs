@@ -84,7 +84,7 @@ await section('画布：未知节点类型不再白屏', async () => {
       data: { nodeType: 'no_such_type', label: '幽灵节点', config: {} } }] })
     window.__studio.getState().select('ghost')
   })
-  check('属性面板说清楚是未知类型', await shows('不认识的节点类型'))
+  check('属性面板说清楚是未知类型', await shows('无法识别的节点类型'))
   check('画布还在（没有白屏）', (await page.locator('body').innerText()).includes('幽灵节点'))
   check('没有未捕获的运行时错误', errors.length === 0, errors[0] ?? '')
 })
@@ -95,12 +95,12 @@ await section('错误边界：渲染真出错时只坏这一页', async () => {
     const s = window.__studio.getState()
     window.__studio.setState({ nodes: [...s.nodes, { id: 'broken', type: 'card', position: { x: 0, y: 0 }, data: null }] })
   })
-  check('出错时给出错误页而不是白屏', await shows('这一页出错了'))
+  check('出错时给出错误页而不是白屏', await shows('页面发生错误'))
   check('错误页标明是页面这一层', await page.locator('[data-error-scope="page"]').count() === 1)
   // 读屏只该把标题和那句说明当警报念：按钮、技术细节（堆栈摘要）不在 role=alert 里
   const alertBox = page.locator('[data-error-scope="page"] [role="alert"]')
   check('role=alert 只包标题和说明，不含按钮和技术细节', (await page.locator('[data-error-scope="page"]').getAttribute('role')) === null
-    && await alertBox.count() === 1 && (await alertBox.innerText()).includes('这一页出错了')
+    && await alertBox.count() === 1 && (await alertBox.innerText()).includes('页面发生错误')
     && await alertBox.locator('button, details').count() === 0)
   const after = await page.locator('body').innerText()
   check('导航栏还在', after.includes('问数据') && after.includes('编排'))
@@ -110,7 +110,7 @@ await section('错误边界：渲染真出错时只坏这一页', async () => {
   })
   await page.getByText('问数据', { exact: true }).first().click()
   await page.waitForURL(/\/chat/)
-  check('换一页就恢复', await page.getByText('这一页出错了').waitFor({ state: 'detached', timeout: 8000 })
+  check('换一页就恢复', await page.getByText('页面发生错误').waitFor({ state: 'detached', timeout: 8000 })
     .then(() => true, () => false))
 })
 
@@ -122,8 +122,8 @@ await section('外壳自己出错：落在中文错误页，不是路由库的�
     window.__savedTrace = window.__studio.getState().trace
     window.__studio.setState({ runPhase: 'running', trace: null })
   })
-  check('给出中文的错误页，说的是整个界面而不是「这一页」', await shows('界面出错了')
-    && (await page.getByText('这一页出错了').count()) === 0)
+  check('给出中文的错误页，说的是整个界面而不是「这一页」', await shows('界面发生错误')
+    && (await page.getByText('页面发生错误').count()) === 0)
   check('错误页标明是外壳这一层', await page.locator('[data-error-scope="shell"]').count() === 1)
   check('不是 react-router 的英文报错页', !(await page.locator('body').innerText()).includes('Unexpected Application Error'))
   await page.evaluate(() => window.__studio.setState({ runPhase: 'idle', trace: window.__savedTrace }))

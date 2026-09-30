@@ -96,20 +96,20 @@ def call_key(name: str, args: dict[str, Any]) -> str:
 #: 收尾的原因 → (给模型的一句话, 给人看的提示)
 REASONS: dict[str, tuple[str, str]] = {
     "steps": ("步数上限用完了（{max_steps} 步）",
-              "agent 用满了 {max_steps} 步。要跑全就把节点上的「最大步数」或设置里的默认步数调大；"
-              "如果它大部分步数花在逐张表查结构上，也可以在提示词里点明该查哪几张表。"),
+              "Agent 已用完 {max_steps} 步上限。如需完整结果，请调大节点的「最大步数」或设置中的默认步数；"
+              "如果大部分步数用于逐张表查询结构，可在提示词中指明要查的表。"),
     "stall": ("连续 {stall} 步没有拿到新信息（重复的调用，或者调用都失败了）",
-              "agent 连续 {stall} 步没有拿到新信息，已按查到的部分收尾。多半是提示词里的目标它查不到，"
-              "或者工具的参数一直写不对：看一眼它最后几次调用。"),
-    "budget_tokens": ("这个节点的令牌预算用完了（已用 {used_tokens:,} / 上限 {budget_tokens:,}）",
-                      "agent 用完了令牌预算（{budget_tokens:,}），已按查到的部分收尾。要跑全就把节点上的"
-                      "「令牌预算」或设置里的默认预算调大，设置里也可以改成不限。"),
+              "Agent 连续 {stall} 步没有获得新信息，已根据已查到的内容收尾。可能是提示词中的目标无法查到，"
+              "或工具参数持续有误，请检查 Agent 最后几次的工具调用。"),
+    "budget_tokens": ("这个节点的 token 预算用完了（已用 {used_tokens:,} / 上限 {budget_tokens:,}）",
+                      "Agent 已用完 token 预算（{budget_tokens:,}），已根据已查到的内容收尾。如需完整结果，"
+                      "请调大节点的「token 预算」或设置中的默认预算，也可在设置中改为不限。"),
     "budget_usd": ("这个节点的金额预算用完了（已用 ${used_usd:.4f} / 上限 ${budget_usd:.4f}）",
-                   "agent 用完了金额预算（${budget_usd:.4f}），已按查到的部分收尾。要跑全就把节点上的"
-                   "「金额预算」或设置里的默认预算调大，设置里也可以改成不限。"),
+                   "Agent 已用完金额预算（${budget_usd:.2f}），已根据已查到的内容收尾。如需完整结果，"
+                   "请调大节点的「金额预算（美元）」或设置中的默认预算，也可在设置中改为不限。"),
     "context": ("对话已经接近模型的上下文上限（约 {used_context:,} / {window:,} token）",
-                "agent 的对话接近模型上下文上限，早期工具结果压缩过仍然不够，已按查到的部分收尾。"
-                "让它每次查更小的范围（比如 SQL 里加 LIMIT、只选需要的列），或者换一个窗口更大的模型。"),
+                "Agent 的对话已接近模型上下文上限，压缩早期工具结果后仍不够，已根据已查到的内容收尾。"
+                "请缩小每次查询的范围（如在 SQL 中加 LIMIT、只选需要的列），或换用上下文窗口更大的模型。"),
 }
 
 
@@ -201,7 +201,7 @@ class Guard:
         if self.limits.budget_tokens and used_tokens >= self.limits.budget_tokens * 0.8 \
                 and "budget" not in self.reminded:
             self.reminded.add("budget")
-            notes.append(f"令牌预算已用 {used_tokens * 100 // self.limits.budget_tokens}%")
+            notes.append(f"token 预算已用 {used_tokens * 100 // self.limits.budget_tokens}%")
         if self.limits.budget_usd and float(usage.get("cost_usd") or 0) >= self.limits.budget_usd * 0.8 \
                 and "budget_usd" not in self.reminded:
             self.reminded.add("budget_usd")
@@ -230,18 +230,17 @@ _SQUEEZED_TAIL = "⁣"   # 不可见的记号：压缩过的不再压第二遍
 
 
 def legacy_hint(max_steps: int, settled: bool) -> str:
-    """升级前的运行用的老说法（和以前一字不差）。"""
+    """升级前（没有护栏快照）的运行用的说法：只有步数这一种收尾原因。"""
     if settled:
-        return (f"agent 用满了 {max_steps} 步，这个结论是基于已经查到的部分给出的。"
-                "要跑全请把节点上的「最大步数」调大；如果它大部分步数花在逐张表"
-                "查结构上，也可以在提示词里点明该查哪几张表。")
-    return (f"agent 用满了 {max_steps} 步还没给出结论。"
-            "把节点上的「最大步数」调大；如果它大部分步数花在逐张表查结构上，"
-            "也可以在提示词里点明该查哪几张表。")
+        return (f"Agent 已用完 {max_steps} 步上限，以上结论基于已查到的部分。"
+                "如需完整结果，请调大节点的「最大步数」；如果大部分步数用于逐张表查询结构，"
+                "可在提示词中指明要查的表。")
+    return (f"Agent 已用完 {max_steps} 步上限，仍未给出结论。"
+            "请调大节点的「最大步数」；如果大部分步数用于逐张表查询结构，可在提示词中指明要查的表。")
 
 
 #: 结果里 limited 字段的说法，下游校验失败时拿来说明根源
 LIMITED_LABEL = {
-    "steps": "用满了步数", "stall": "连续几步没拿到新信息", "budget_tokens": "用完了令牌预算",
-    "budget_usd": "用完了金额预算", "context": "对话接近上下文上限",
+    "steps": "步数用完", "stall": "连续多步没有获得新信息", "budget_tokens": "token 预算用完",
+    "budget_usd": "金额预算用完", "context": "对话接近上下文上限",
 }

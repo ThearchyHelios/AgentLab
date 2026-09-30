@@ -41,11 +41,11 @@ def test_common_failures_are_put_in_plain_words():
     from app.core.errors import explain, graph_error, raw
 
     reason, hint = explain(httpx.ConnectError("[Errno 61] Connection refused"))
-    assert "连不上" in reason and hint
+    assert "无法连接服务" in reason and hint
 
     req = httpx.Request("GET", "https://x/v1/models")
     denied = httpx.HTTPStatusError("401", request=req, response=httpx.Response(401, request=req))
-    assert "密钥" in explain(denied)[0]
+    assert "API Key" in explain(denied)[0]
 
     reason, hint = explain(TypeError("_run() got an unexpected keyword argument 'query'"))
     _clean(reason)
@@ -59,6 +59,29 @@ def test_common_failures_are_put_in_plain_words():
     text = graph_error(e.value)
     _clean(text)
     assert "第 1 个节点" in text and "nope" in text
+
+
+def test_errors_carry_a_category_for_scene_specific_hints():
+    """要按场景换说法的调用方（测数据库连接）按类别判断，不比较 explain 的文字。"""
+    import asyncio
+
+    import httpx
+
+    from app.core import errors
+
+    req = httpx.Request("GET", "https://x/v1/models")
+    cases = [
+        (httpx.ConnectError("[Errno 61] Connection refused"), errors.NETWORK),
+        (ConnectionRefusedError(61, "Connection refused"), errors.NETWORK),
+        (asyncio.TimeoutError(), errors.TIMEOUT),
+        (httpx.HTTPStatusError("401", request=req, response=httpx.Response(401, request=req)), errors.AUTH),
+        (httpx.HTTPStatusError("429", request=req, response=httpx.Response(429, request=req)), errors.RATE_LIMIT),
+        (httpx.HTTPStatusError("502", request=req, response=httpx.Response(502, request=req)), errors.SERVER),
+        (TypeError("x() got an unexpected keyword argument 'q'"), errors.BUG),
+        (RuntimeError("upstream closed"), None),
+    ]
+    for exc, want in cases:
+        assert errors.classify(exc) == want, (exc, errors.classify(exc))
 
 
 # --------------------------------------------------------------------------
@@ -79,7 +102,7 @@ async def test_a_failing_provider_test_explains_itself(client, monkeypatch):
     body = (await client.post("/api/providers/test", json={"kind": "mock", "default_model": "m"})).json()
     assert body["ok"] is False
     _clean(body["error"])
-    assert "连不上" in body["error"] and body["hint"]
+    assert "无法连接服务" in body["error"] and body["hint"]
     assert "ConnectError" in body["detail"], "技术细节里要留着原始异常"
 
 
@@ -129,7 +152,7 @@ async def test_graph_validation_points_at_the_node(client):
                               json={"graph": {"nodes": [{"id": "a", "type": "nope"}]}})).json()
     message = body["issues"][0]["message"]
     _clean(message)
-    assert "第 1 个节点的类型「nope」不认识" in message
+    assert "第 1 个节点的类型「nope」无法识别" in message
 
 
 async def test_publish_level_uses_ui_words(client):
@@ -235,7 +258,7 @@ async def test_an_unconfigured_copilot_model_uses_settings_words(client, monkeyp
 
 async def test_a_missing_item_says_it_may_have_been_deleted(client):
     """404 多半是别的标签页里删掉了，或者链接过期了。只说「不存在」，人会以为
-    是自己输错了什么；统一说一句「可能已经被删了」，下一步就清楚了。"""
+    是自己输错了什么；统一说一句「可能已被删除」，下一步就清楚了。"""
     gone = "no-such-id"
     calls = [
         ("get", f"/api/workflows/{gone}", None),
@@ -261,5 +284,65 @@ async def test_a_missing_item_says_it_may_have_been_deleted(client):
         r = await client.request(method.upper(), url, **kwargs)
         assert r.status_code == 404, (method, url, r.status_code, r.text)
         detail = r.json()["detail"]
-        assert "可能已经被删了" in detail, (method, url, detail)
+        assert "可能已被删除" in detail, (method, url, detail)
         assert gone not in detail, f"把 id 原样念给用户听没用：{detail}"
+
+
+async def test_an_unconfigured_provider_on_the_run_path_uses_settings_words(monkeypatch):
+    """运行路径上的「缺少 API Key」「接入已停用」和助手、设置页一样经过统一的翻译：写「模型接入」、
+    写去「设置 → 模型接入」哪里补，不露 provider、base_url 和英文单引号。以前运行失败原因里原样是
+    「provider 'x' 缺少 API Key」。"""
+    import asyncio
+
+    from app.core.crypto import encrypt
+    from app.db.base import SessionLocal
+    from app.db.models import Provider, Run
+    from app.engine.runner import run_manager
+
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    def graph(model: str) -> dict:
+        nodes = [
+            {"id": "start", "type": "input", "data": {"config": {"fields": [{"name": "q"}]}}},
+            {"id": "ask", "type": "llm", "data": {"label": "提问", "config": {"model": model, "prompt": "hi"}}},
+            {"id": "out", "type": "output", "data": {"config": {"fields": [{"name": "结果", "value": "{{ last_message }}"}]}}},
+        ]
+        return {"nodes": nodes, "edges": [{"source": "start", "target": "ask"}, {"source": "ask", "target": "out"}]}
+
+    async def error_of(model: str) -> str:
+        run = await run_manager.start(graph=graph(model), input_payload={"q": "x"})
+        for _ in range(400):
+            async with SessionLocal() as session:
+                row = await session.get(Run, run.id)
+                if row and row.status in ("failed", "succeeded", "cancelled"):
+                    assert row.status == "failed", row.status
+                    return row.error or ""
+            await asyncio.sleep(0.05)
+        raise AssertionError("运行没有按时结束")
+
+    async with SessionLocal() as session:
+        keyless = Provider(name="无钥接入", kind="anthropic", api_key=None, models=[{"id": "claude-nokey"}],
+                           default_model="claude-nokey", enabled=True, extra={})
+        disabled = Provider(name="停用接入", kind="openai", api_key=encrypt("k"), models=[{"id": "gpt-off"}],
+                            default_model="gpt-off", enabled=False, extra={})
+        session.add_all([keyless, disabled])
+        await session.commit()
+        ids = [keyless.id, disabled.id]
+    await run_manager.setup()
+    try:
+        error = await error_of("claude-nokey")
+        assert "模型接入「无钥接入」缺少 API Key" in error and "「设置 → 模型接入」" in error, error
+        error = await error_of("gpt-off")
+        assert "模型「gpt-off」所属的模型接入「停用接入」已停用" in error, error
+        assert "「设置 → 模型接入」中启用" in error, error
+        for text in (error,):
+            assert "provider" not in text and "'" not in text, text
+    finally:
+        await run_manager.shutdown()
+        async with SessionLocal() as session:
+            for pid in ids:
+                row = await session.get(Provider, pid)
+                if row is not None:
+                    await session.delete(row)
+            await session.commit()

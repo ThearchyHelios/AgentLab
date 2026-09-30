@@ -36,6 +36,7 @@ from app.engine.governance import (
     _refs,
     publish_issues,
 )
+from app.engine.labels import field_label, option_label
 from app.engine.schema import GraphNode, GraphSpec, NodeType, _ancestors, _feeds_caliber, innermost_loops
 
 #: 会改图的规则，按这个顺序应用：先换写字的节点，再插报告，最后开 cite_fields（R3 要先把出口从 agent 的
@@ -149,12 +150,12 @@ def _llm_blocked(spec: GraphSpec, node: GraphNode, loops: dict[str, str]) -> str
     """这个模型调用节点能不能原样换成报告撰写；不能的说清为什么。"""
     who = f"「{node.title}」（模型调用）"
     if node.config.get("output_schema"):
-        return f"{who}配了 output_schema，交的是结构化数据、不是给人看的文字，没有换成报告撰写"
+        return f"{who}配置了「结构化输出 Schema」，输出的是结构化数据而不是给人看的文字，因此没有换成报告撰写"
     if node.id in loops:
-        return f"{who}在循环体里，换成报告撰写就是每一轮写一份报告：循环怎么改要你来定，升级没有动它"
+        return f"{who}位于循环体中，换成报告撰写会导致每一轮都写一份报告：循环结构需要由你调整，升级未作修改"
     if _feeds_caliber(node, spec):
-        return (f"{who}写的数还喂给了口径卡：换成报告撰写，口径卡就读不到它了。先把取数改由 Agent（配 output_schema、"
-                "开 cite_fields）或「调用工具」节点来做，再升级")
+        return (f"{who}写的数字还提供给了口径卡：换成报告撰写后，口径卡将无法读取这些数字。请先改由 Agent（配置"
+                "「结构化输出 Schema」、开启「按出处核对字段」）或「调用工具」节点取数，再升级")
     return None
 
 
@@ -191,14 +192,14 @@ def upgrade_candidates(spec: GraphSpec) -> list[Match]:
         if len(writers) > 1:
             # 叙述拼了几个节点写的文字：换哪一个都会让其余的文字悄悄离开契约的核对。拼进来的每个模型调用都不换，
             # 哪怕它另有一个只读它的出口——不然结果要看两个出口在画布上谁排前面
-            why = (f"「{exit_node.title}」的出具契约 narrative 拼了{_names(writers)}几个节点写的文字，该换哪一个说不准，"
-                   "没有升级：让一个节点写完整篇（其余的内容交给它当素材），再升级")
+            why = (f"「{exit_node.title}」的出具契约「叙述」拼接了{_names(writers)}等多个节点的文字，无法确定应替换"
+                   "哪一个，因此没有升级。请由一个节点撰写全文（其余内容作为它的素材），再升级")
             for llm in llms:
                 _add(found, Match("R1", llm.id, blocked=why))
         elif llms:
             llm = llms[0]
             _add(found, Match("R1", llm.id, (exit_node.id,),
-                              f"「{llm.title}」（模型调用）写的叙述换成报告撰写，出具契约改为核对它的文档",
+                              f"把「{llm.title}」（模型调用）写的叙述换成报告撰写，出具契约改为核对它的文档",
                               _llm_blocked(spec, llm, loops)))
 
     r1 = {m.node_id for m in found.values()}
@@ -209,7 +210,7 @@ def upgrade_candidates(spec: GraphSpec) -> list[Match]:
             if llm.id in r1 or not any(_fetches(nodes[a]) for a in _ancestors(spec, llm.id) if a in nodes):
                 continue
             _add(found, Match("R2", llm.id, (exit_node.id,),
-                              f"「{llm.title}」（模型调用）写的文字直接进了出口，换成报告撰写",
+                              f"「{llm.title}」（模型调用）写的文字直接进入了成果节点，换成报告撰写",
                               _llm_blocked(spec, llm, loops)))
 
     for exit_node in outputs:
@@ -229,15 +230,15 @@ def upgrade_candidates(spec: GraphSpec) -> list[Match]:
             # 说不准的只跳过这个出口：同一个 agent 直连的出口照样插报告撰写，结果不看出口在画布上的顺序
             if agent.id in loops:
                 _add(found, Match("R3", agent.id, blocked=(
-                    f"「{agent.title}」在循环体里，升级不替你改循环结构，没有插入报告撰写")))
+                    f"「{agent.title}」位于循环体中，升级不会修改循环结构，因此没有插入报告撰写")))
             elif not any(e.source == agent.id and e.target == exit_node.id for e in spec.edges):
                 _add(found, Match("R3", agent.id, skipped=(
-                    f"「{agent.title}」的原话要经过别的节点才到「{exit_node.title}」，升级不替你改接中间的连线：在它后面"
-                    f"接一个报告撰写，「{exit_node.title}」改取报告的正文",)))
+                    f"「{agent.title}」的原话要经过其他节点才到达「{exit_node.title}」，升级不会改接中间的连线：请在它"
+                    f"后面接一个报告撰写节点，「{exit_node.title}」改为取报告的正文",)))
             elif agent.id in {n.id for n in narrated} and len(narrated) > 1:
                 _add(found, Match("R3", agent.id, skipped=(
-                    f"「{exit_node.title}」的出具契约 narrative 拼了{_names(narrated)}几个节点写的文字，改成核对报告撰写的"
-                    "文档，其余的文字就悄悄离开了核对：这个出口升级没有动。让一个节点写完整篇，再升级",)))
+                    f"「{exit_node.title}」的出具契约「叙述」拼接了{_names(narrated)}等多个节点的文字，改为核对报告撰写"
+                    "的文档后，其余文字将不再受核对，因此没有升级这个成果节点。请由一个节点撰写全文后再升级",)))
             else:
                 _add(found, Match("R3", agent.id, (exit_node.id,)))
 
@@ -247,13 +248,13 @@ def upgrade_candidates(spec: GraphSpec) -> list[Match]:
         agent = nodes[m.node_id]
         if m.exits:
             found[key] = replace(m, summary=f"在「{agent.title}」和{_names([nodes[x] for x in m.exits])}之间插入报告撰写，"
-                                            "答案里的数逐个点得开出处")
+                                            "答案中的数字均可查看出处")
         elif not m.blocked:
             found[key] = replace(m, blocked="；".join(m.skipped), skipped=())
 
     for n in spec.nodes:
         if n.type == NodeType.AGENT and n.config.get("output_schema") and n.config.get("cite_fields") is not True:
-            _add(found, Match("R4", n.id, (), f"打开「{n.title}」的 cite_fields，output_schema 才生效"))
+            _add(found, Match("R4", n.id, (), f"开启「{n.title}」的「按出处核对字段」，「结构化输出 Schema」才会生效"))
 
     return sorted(found.values(), key=lambda m: (RULES.index(m.rule), order.get(m.node_id, len(order))))
 
@@ -267,7 +268,7 @@ def upgrade_hint(spec: GraphSpec) -> str | None:
     if not ready:
         return None
     parts = [m.summary for m in ready[:3]] + ([f"另有 {len(ready) - 3} 处"] if len(ready) > 3 else [])
-    return f"{HINT}：{'；'.join(parts)}。先预览改动，确认了才保存"
+    return f"{HINT}：{'；'.join(parts)}。请先预览改动，确认后再保存"
 
 
 # --------------------------------------------------------------------------
@@ -352,8 +353,8 @@ def _retype(graph: dict[str, Any], spec: GraphSpec, match: Match, level: str) ->
     raw["type"] = NodeType.REPORT.value
     raw["data"]["config"] = after
     title = node.title
-    step = _Step(label=(f"把「{title}」换成报告撰写，出具契约改为核对它的文档" if match.rule == "R1"
-                        else f"把「{title}」换成报告撰写"),
+    step = _Step(label=(f"将「{title}」换成报告撰写，出具契约改为核对它的文档" if match.rule == "R1"
+                        else f"将「{title}」换成报告撰写"),
                  retyped={(node.id, NodeType.LLM.value, NodeType.REPORT.value)}, created=True)
     step.changes = [_change(node.id, title, "type", NodeType.LLM.value, NodeType.REPORT.value),
                     *_config_changes(node.id, title, before, after)]
@@ -363,15 +364,17 @@ def _retype(graph: dict[str, Any], spec: GraphSpec, match: Match, level: str) ->
     dropped = [k for k in _LLM_ONLY if k not in ("prompt", "system") and before.get(k) not in (None, "", [], {})]
     if before.get("skills"):
         skills = before["skills"] if isinstance(before["skills"], list) else [before["skills"]]
-        step.notes.append(_note(f"「{title}」挂的技能 {'、'.join(f'「{s}」' for s in skills)} 不会再加载：报告撰写不挂技能，"
-                                "其中的写作要求要保留的话，写进 instructions", match.rule, node.id, "warning"))
+        step.notes.append(_note(f"「{title}」挂载的 Skill {'、'.join(f'「{s}」' for s in skills)} 将不再加载：报告撰写节点"
+                                f"不挂载 Skill，其中的写作要求如需保留，请写入「{field_label('instructions')}」",
+                                match.rule, node.id, "warning"))
     if other := [k for k in dropped if k != "skills"]:
-        step.notes.append(_note(f"「{title}」的 {'、'.join(other)} 报告撰写用不上，已去掉", match.rule, node.id))
+        named = "、".join(f"「{field_label(k, NodeType.LLM.value)}」" for k in other)
+        step.notes.append(_note(f"「{title}」的{named}在报告撰写节点中不适用，已去掉", match.rule, node.id))
     if echoed := _echoed_evidence(_Graph(spec), node.id, text):
         step.notes.append(_note(
-            f"「{title}」的 instructions 里照搬了 {'、'.join(echoed)}：报告撰写会自己收集上游的口径卡指标和查询结果，数字由"
-            "系统渲染；直接塞进指令的这段文字里的数，模型容易照抄成不带出处的裸数字（会被打回重写）。确认用不上就删掉，"
-            "升级没有替你删", match.rule, node.id))
+            f"「{title}」的「{field_label('instructions')}」中照搬了 {'、'.join(echoed)}：报告撰写节点会自行收集上游的"
+            "口径卡指标和查询结果，数字由系统填入；直接写在要求中的数字，模型容易照抄成不带出处的数字（会被要求重写）。"
+            "如确认不需要，请删除；升级未作删除", match.rule, node.id))
     if match.rule == "R1":
         for exit_id in match.exits:
             exit_raw = _raw(graph, exit_id)
@@ -444,7 +447,7 @@ def _insert(graph: dict[str, Any], spec: GraphSpec, match: Match, level: str) ->
            "data": {"label": "报告撰写", "config": config}}
     graph["nodes"].insert(graph["nodes"].index(raw_agent) + 1, new)
     exits = [nodes[x] for x in match.exits]
-    step = _Step(label=f"在「{agent.title}」和{_names(exits)}之间插入报告撰写，出口改取报告的正文",
+    step = _Step(label=f"在「{agent.title}」和{_names(exits)}之间插入报告撰写，成果节点改为取报告的正文",
                  rewired={(agent.id, x.id) for x in exits}, created=True)
     step.changes.append(_change(rid, "报告撰写", "node", None,
                                 {"id": rid, "type": NodeType.REPORT.value, "label": "报告撰写", "config": config}))
@@ -481,8 +484,8 @@ def _insert(graph: dict[str, Any], spec: GraphSpec, match: Match, level: str) ->
                          if isinstance(f, dict) and f != old and f.get("value", "").strip() != exact]
                 if mixed:
                     step.notes.append(_note(
-                        f"「{x.title}」的成果字段{'、'.join(f'「{n}」' for n in mixed)}在报告正文前后还拼了别的内容：这样没法"
-                        f"逐段对应证据。要每个数都点得开，字段里只放 {exact}", "R3", x.id))
+                        f"「{x.title}」的成果字段{'、'.join(f'「{n}」' for n in mixed)}在报告正文前后还拼接了其他内容，"
+                        f"无法逐段对应证据。如需每个数字都可查看出处，字段中只放 {exact}", "R3", x.id))
         contract = cfg.get("contract")
         narrative = contract.get("narrative") if isinstance(contract, dict) else None
         if isinstance(narrative, str) and agent.id in {
@@ -507,16 +510,18 @@ def _cells_note(spec: GraphSpec, exits: list[GraphNode], converted: list[dict[st
     if converted and all(c.get("cells") is True for c in converted):
         return None
     where = _names(exits)
-    choose = (f"二选一：在{where}的出具契约里写 cells: true；或者改走口径卡，把要写的数登记成指标，报告只引用 "
-              "[[m:指标id]]。选哪条要你拿主意，升级没有替你写")
+    choose = (f"二选一：在{where}的出具契约中开启「单元格引用」；或改用口径卡，把要写的数字登记为指标，报告只引用"
+              "指标。选择哪一种需要由你决定，升级未作修改")
     cards = any(n.type == NodeType.METRICS for n in spec.nodes)
     if level == "governed" or (converted and not cards):
-        lead = "按受管级别" if level == "governed" else "现在（已发布级别）照常；以后按受管级别发布的话"
-        return (f"报告会直接引用查询单元格（[[v:Q1.r0.列]]），{lead}，正式运行只在出口的出具契约写了 cells: true 时才认单元格"
-                "引用：不写的话报告里的数一个都引用不了，报告节点（numbers: strict、on_violation: fail）每次正式运行都会失败。"
+        lead = "按受管级别" if level == "governed" else "当前（已发布级别）不受影响；今后按受管级别发布时"
+        numbers = f"「{field_label('numbers')}」为「{option_label('numbers', 'strict')}」"
+        violation = f"「{field_label('on_violation')}」为「{option_label('on_violation', 'fail')}」"
+        return (f"报告会直接引用查询单元格，{lead}，正式运行只在成果节点的出具契约开启「单元格引用」时才接受单元格引用："
+                f"未开启时报告中的数字都无法引用，报告撰写节点（{numbers}、{violation}）每次正式运行都会失败。"
                 + choose, "warning")
-    return ("报告会直接引用查询单元格（[[v:Q1.r0.列]]）。探索运行和已发布级别照常；要按受管级别正式出具，得在出口的出具契约里写 "
-            "cells: true，或者改走口径卡：把要写的数登记成指标，报告只引用 [[m:指标id]]。选哪条要你拿主意，升级没有替你加契约",
+    return ("报告会直接引用查询单元格。探索运行和已发布级别不受影响；如需按受管级别正式出具，请在成果节点的出具契约中开启"
+            "「单元格引用」，或改用口径卡：把要写的数字登记为指标，报告只引用指标。选择哪一种需要由你决定，升级未添加出具契约",
             "info")
 
 
@@ -549,14 +554,14 @@ def _cite(graph: dict[str, Any], spec: GraphSpec, match: Match, level: str) -> _
     cfg = _config(_raw(graph, agent.id))
     before = cfg.get("cite_fields")
     cfg["cite_fields"] = True
-    step = _Step(label=f"打开「{agent.title}」的 cite_fields：每个字段都核对到查询结果里的那一格")
+    step = _Step(label=f"开启「{agent.title}」的「按出处核对字段」：每个字段都核对到查询结果中的对应单元格")
     step.changes = [_change(agent.id, agent.title, "cite_fields", before, True)]
     step.ops = [{"op": "update_node", "id": agent.id, "config": {"cite_fields": True}}]
     var = str(agent.config.get("assign_to") or "").strip()
     for reader, span in _whole_var_readers(spec, var) if var else []:
         step.notes.append(_note(
-            f"「{agent.title}」开了 cite_fields 以后，vars.{var} 拿到的是核对过的对象，不再是文字：「{reader.title}」里的 "
-            f"{span} 会显示成对象。要原话就改成 {{{{ nodes.{agent.id}.text }}}}", "R4", reader.id, "warning"))
+            f"「{agent.title}」开启「按出处核对字段」后，vars.{var} 得到的是核对过的对象，而不再是文字：「{reader.title}」中的 "
+            f"{span} 会显示为对象。如需原话，请改为 {{{{ nodes.{agent.id}.text }}}}", "R4", reader.id, "warning"))
     return step
 
 
@@ -593,9 +598,9 @@ def metric_feeders(spec: GraphSpec, card: GraphNode) -> list[tuple[int, GraphNod
 
 def _r5_notes(spec: GraphSpec) -> list[dict[str, Any]]:
     return [_note(
-        f"「{code.title}」（沙箱代码）的产出喂给了口径卡{_names(cards)}：它如果是在取数（查库、调接口、读文件），把 "
-        "evidence_role 标成 source，口径卡读它时记得下出处；如果是在做计算，把计算挪进口径卡的表达式（交给 Copilot "
-        "可以请它把纯算术的代码改写成口径卡表达式）。它在取数还是在算只有你知道，升级没有替你改", "R5", code.id)
+        f"「{code.title}」（沙箱代码）的产出提供给了口径卡{_names(cards)}：若它负责取数（查库、调用接口、读文件），"
+        "请把「证据角色」设为「取数」，口径卡读取时会记录出处；若负责计算，请把计算移到口径卡的表达式中（可交给助手"
+        "把纯算术的代码改写为口径卡表达式）。它负责取数还是计算需要由你确认，升级未作修改", "R5", code.id)
         for code, cards in compute_feeders(spec)]
 
 
@@ -625,7 +630,7 @@ def upgrade_for_evidence(graph: dict[str, Any] | GraphSpec, *, level: str = "pub
     - applied：采用的 "R1:<节点 id>"…；rejected：[{fix_id, reason}]，碰了禁止规则或者会冒出新 error 的
     """
     if level not in LEVELS:
-        raise ValueError(f"level 只能是 {' / '.join(LEVELS)}，写的是 {level!r}")
+        raise ValueError(f"发布级别只能是「已发布」或「受管」，当前为「{level}」")
     raw = graph.model_dump(mode="json") if isinstance(graph, GraphSpec) else graph
     current = copy.deepcopy(raw)
     spec = GraphSpec.model_validate(current)
@@ -656,14 +661,14 @@ def upgrade_for_evidence(graph: dict[str, Any] | GraphSpec, *, level: str = "pub
             try:
                 trial_spec = GraphSpec.model_validate(trial)
             except Exception:  # noqa: BLE001 - 规则把图改坏了：丢弃，不交给人一张存不回去的图
-                rejected.append({"fix_id": fix_id, "reason": "改完的图结构读不懂，这一步没有采用"})
+                rejected.append({"fix_id": fix_id, "reason": "修改后的工作流结构无法解析，这一步未采用"})
                 continue
             trial_issues = publish_issues(trial_spec, level=level)
             why = "；".join(forbidden(current, trial, retyped=step.retyped, rewired=step.rewired)) \
                 or worse(issues, trial_issues)
             if why:
                 rejected.append({"fix_id": fix_id, "reason": why})
-                notes.append(_note(f"{step.label}：没有采用，{why}", rule, match.node_id, "warning"))
+                notes.append(_note(f"{step.label}：未采用，{why}", rule, match.node_id, "warning"))
                 continue
             current, spec, issues = trial, trial_spec, trial_issues
             applied.append(fix_id)
@@ -674,6 +679,7 @@ def upgrade_for_evidence(graph: dict[str, Any] | GraphSpec, *, level: str = "pub
     notes += _r5_notes(spec)
     if created and level != "governed":
         notes.append(_note(
-            "报告撰写重写之后仍有没出处的数字时：探索运行照常产出、把问题标在报告里；正式运行里 on_violation 缺省是 fail，节点"
-            "会失败。想先标注着看，把 on_violation 设成 flag", created, None))
+            f"报告撰写节点重写后仍有无出处的数字时：探索运行正常产出，并在报告中标注；正式运行中「{field_label('on_violation')}」"
+            f"默认为「{option_label('on_violation', 'fail')}」，节点会失败。如需先查看标注，请将「{field_label('on_violation')}」"
+            f"设为「{option_label('on_violation', 'flag')}」", created, None))
     return {"graph": current, "changes": changes, "ops": ops, "notes": notes, "applied": applied, "rejected": rejected}

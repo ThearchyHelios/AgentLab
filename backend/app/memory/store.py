@@ -116,7 +116,7 @@ async def recall(
             names = sorted({r.embed_model or "未知模型" for r in stale})
             on_degrade(
                 f"记忆域「{scope}」里有 {len(stale)}/{len(rows)} 条向量由"
-                f"「{'、'.join(names)}」建立，和当前的「{embedder_id()}」对不上，"
+                f"「{'、'.join(names)}」建立，与当前的「{embedder_id()}」不一致，"
                 f"本次已退回纯关键词召回。重建索引后恢复。"
             )
         vectors: list[Any] = [None] * len(rows)

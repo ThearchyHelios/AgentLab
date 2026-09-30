@@ -85,7 +85,7 @@ async def test_a_run_past_its_time_limit_is_stopped(monkeypatch):
     started = time.perf_counter()
     run = await _run(SIMPLE)
     assert run.status == "failed"
-    assert "1 秒的上限" in (run.error or "")
+    assert "1 秒的时长上限" in (run.error or "")
     assert time.perf_counter() - started < 10, "上限没起作用，等到了节点自己结束"
 
 

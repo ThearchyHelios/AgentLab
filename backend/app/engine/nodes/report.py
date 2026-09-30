@@ -37,11 +37,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.func import task
 
-from app.core.errors import describe_exception
+from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
+from app.engine.labels import field_label, option_label
 from app.engine.evidence import (
     CELLS_REASON,
     CLAIMS_RULE,
@@ -87,8 +88,9 @@ ROLE = ("你是报告撰写人。报告里的每个数字都由系统从证据�
 
 MARKUP_NUDGE = ("你上一条回复把工具调用写成了文字。报告撰写不调用任何工具：能用的数据都在上面的"
                 "证据目录里，直接用引用标记写报告正文。")
-MARKUP_ERROR = ("模型输出了工具调用的原始标记，而报告撰写节点不调用工具——数据已经在证据目录里。"
-                "换一个模型再试")
+#: 节点失败原因（给人看）。给模型的那句是上面的 MARKUP_NUDGE，「证据目录」是模型那边的说法
+MARKUP_ERROR = ("模型输出了工具调用的原始标记，而报告撰写节点不调用工具，数据已由系统提供。"
+                "请换一个模型重试")
 #: 接着跑时 checkpoint 里缓存的判定最多翻几条去找这一稿的（每条都是先前某一稿的，对不上就往后翻）
 _STALE_LIMIT = 16
 
@@ -200,12 +202,12 @@ def _no_evidence(catalog: dict[str, Any], cells: bool) -> str | None:
     """目录里没有可引用的来源时给一句话，说清缺的是哪种；有就返回 None。"""
     kinds = {entry.get("kind") for entry in catalog.values()}
     if not kinds & set(_CITABLE):
-        return ("报告撰写节点的上游没有可引用的来源：" + "、".join(_CITABLE.values()) + "都没有，"
-                "报告里的数字都会被判为没有出处。在它前面接取数节点或口径卡，或者检查 metrics_from / evidence_from")
+        return ("报告撰写节点的上游没有可引用的来源（" + "、".join(_CITABLE.values()) + "都没有），"
+                f"报告中的数字都会被判为没有出处。请在它前面接入取数节点或口径卡，或检查「{field_label('metrics_from')}」")
     if not cells and not kinds & {"metric", "input"}:
         # 只有查询和检索：单元格引用不了，检索片段本来就只能当依据，一个数都没处引
-        return (f"报告撰写节点的上游只有查询结果、没有口径卡指标，而这次{CELLS_REASON}：单元格引用不了，"
-                "报告里的数字都会被判为没有出处。在出口契约里写 \"cells\": true，或者把要写的数登记进口径卡")
+        return (f"报告撰写节点的上游只有查询结果，没有口径卡指标，而{CELLS_REASON}，当前无法引用单元格，"
+                "报告中的数字都会被判为没有出处。请在出具契约中开启「单元格引用」，或把要写的数字登记到口径卡")
     return None
 
 
@@ -262,7 +264,7 @@ async def _default_on_violation(run_id: str) -> str:
 def _options(ctx: NodeContext) -> tuple[str, int]:
     numbers = str(ctx.cfg("numbers", "strict") or "strict")
     if numbers not in NUMBERS:
-        raise NodeError(ctx.node.id, f"numbers 只能是 {' / '.join(NUMBERS)}，写的是 {numbers!r}")
+        raise NodeError(ctx.node.id, _only("numbers", NUMBERS, numbers))
     # 画布校验也拦这两项；执行时再守一道，报的是同一句话，免得写错的值被悄悄当成默认
     if problem := claims_problem(ctx.cfg("claims")):
         raise NodeError(ctx.node.id, problem)
@@ -270,15 +272,26 @@ def _options(ctx: NodeContext) -> tuple[str, int]:
         raise NodeError(ctx.node.id, "；".join(message for _, message in problems))
     entities = ctx.cfg("entities", "link") or "link"
     if entities not in ENTITIES:
-        raise NodeError(ctx.node.id, f"entities 只能是 {' / '.join(ENTITIES)}，写的是 {entities!r}")
+        raise NodeError(ctx.node.id, _only("entities", ENTITIES, entities))
     raw = ctx.cfg("max_repairs", 1)
     try:
         repairs = int(raw)
     except (TypeError, ValueError):
-        raise NodeError(ctx.node.id, f"max_repairs 要写 0 到 {MAX_REPAIRS} 的整数，写的是 {raw!r}") from None
+        raise NodeError(ctx.node.id, _repairs_problem(raw)) from None
     if isinstance(raw, bool) or not 0 <= repairs <= MAX_REPAIRS:
-        raise NodeError(ctx.node.id, f"max_repairs 要写 0 到 {MAX_REPAIRS} 的整数，写的是 {raw!r}")
+        raise NodeError(ctx.node.id, _repairs_problem(raw))
     return numbers, repairs
+
+
+def _only(key: str, allowed: tuple[str, ...], got: Any) -> str:
+    """「「表名、字段名」只能是「核对」或「不核对」，当前为「x」」：写界面上的叫法，不写键名和枚举值。"""
+    names = [f"「{option_label(key, v)}」" for v in allowed]
+    listed = "或".join(names) if len(names) <= 2 else "、".join(names[:-1]) + "或" + names[-1]
+    return f"「{field_label(key, 'report')}」只能是{listed}，当前为「{got}」"
+
+
+def _repairs_problem(raw: Any) -> str:
+    return f"「{field_label('max_repairs', 'report')}」需要填写 0 到 {MAX_REPAIRS} 的整数，当前为「{raw}」"
 
 
 def _blocking(violations: list[dict[str, Any]], numbers: str) -> list[dict[str, Any]]:
@@ -356,7 +369,7 @@ async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
                               meta={"stats": doc.get("stats") or {}})
     except Exception as e:  # noqa: BLE001 - 工件写失败不毁掉运行，只是这份报告点不开证据
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
-                 message=f"报告文档没能落进工件库（{describe_exception(e)}），报告里的数字点不开证据")
+                 message=f"报告文档保存失败（{describe_exception(e)}），报告中的数字将无法查看证据")
         return None
 
 
@@ -364,13 +377,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     numbers, max_repairs = _options(ctx)
     on_violation = str(ctx.cfg("on_violation", "") or "") or await _default_on_violation(ctx.run.run_id)
     if on_violation not in ON_VIOLATION:
-        raise NodeError(ctx.node.id, f"on_violation 只能是 {' / '.join(ON_VIOLATION)}，写的是 {on_violation!r}")
+        raise NodeError(ctx.node.id, _only("on_violation", ("flag", "fail"), on_violation))
 
     async with SessionLocal() as session:
         try:
             model, model_id = await get_chat_model(session, _model_spec(ctx))
         except ProviderNotConfigured as e:
-            raise NodeError(ctx.node.id, str(e)) from e
+            raise NodeError(ctx.node.id, not_configured(e)) from e
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
@@ -406,11 +419,11 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 raise NodeError(ctx.node.id, MARKUP_ERROR)
             nudged = True
             ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
-                     message=f"{markup_warning(snippet)}，已提醒它重试一次")
+                     message=f"{markup_warning(snippet)}，已要求模型重试一次")
             return await draft([*payload, response, HumanMessage(content=MARKUP_NUDGE)])
         if not text and thinking_text(response):
             ctx.emit(EventType.LOG, level="warn", code="empty_completion",
-                     message="模型只输出了思考内容，报告正文为空。把 max_tokens 调大，或把 thinking 设为 off。")
+                     message="模型只输出了思考内容，报告正文为空。请调大「最大输出 token」，或关闭「思考模式」。")
         return response, text
 
     entities = report_entities(spec, ctx.node) == "link"
@@ -425,8 +438,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs:
         repairs += 1
         ctx.emit(EventType.LOG, level="warn", code="report_repair",
-                 message=f"报告里有 {len(blocking)} 处没通过核对（{_named(blocking)}），"
-                         f"已要求写作者重写（第 {repairs} 次）")
+                 message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
+                         f"已要求模型重写（第 {repairs} 次）")
         messages = [*messages, response, HumanMessage(content=_repair_request(blocking))]
         response, raw = await draft(messages)
         doc = compose(raw)
@@ -456,8 +469,9 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         more = f"；…另有 {len(blocking) - 5} 处" if len(blocking) > 5 else ""
         raise NodeError(
             ctx.node.id,
-            f"报告有 {len(blocking)} 处没通过核对（已要求重写 {repairs} 次）：{head}{more}。"
-            "换一个遵从度更高的模型，或者先把 on_violation 设成 flag，把问题标注在报告里再看",
+            f"报告有 {len(blocking)} 处未通过核对（已要求重写 {repairs} 次）：{head}{more}。"
+            f"请换用指令遵循能力更强的模型，或先将「{field_label('on_violation')}」设为"
+            f"「{option_label('on_violation', 'flag')}」，查看标注后再调整",
         )
 
     usage = {key: sum(one[key] for one in spent) for key in spent[0]}
@@ -476,7 +490,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "usage": usage}
     if ctx.cfg("emit_message", True):
-        updates["messages"] = [AIMessage(content=text or "(空)")]
+        updates["messages"] = [AIMessage(content=text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: text}
@@ -545,8 +559,9 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
         if first and outcome.get("model") and outcome["model"] == model_id:
             outcome["same_model"] = True
             ctx.emit(EventType.LOG, level="warn", code="judge_same_model",
-                     message=f"裁判模型和写作模型都是「{model_id}」：等于自己审自己，模型写错的地方它多半也看不出来。"
-                             "到设置里选一个不同的「证据裁判模型」，或者在节点的 judge.model 里指定")
+                     message=f"裁判模型与写作模型相同（「{model_id}」），难以发现写作模型自身的错误。"
+                             "请在「设置 → 偏好设置 → 证据裁判」中选择另一个模型，"
+                             f"或在节点的「{field_label('judge')}」中指定裁判模型")
         return {**outcome, "key": key}
 
     async def judge_round(round_doc: dict[str, Any], limits: judging.Budget, known: dict[str, Any],
@@ -573,7 +588,7 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
         sentences = [(texts.get(uid, ""), outcome["verdicts"][uid].get("rationale") or "") for uid in bad]
         ctx.emit(EventType.LOG, level="warn", code="report_rewrite",
                  message=f"裁判认为 {len(bad)} 句结论证据不支持（{_named([{'text': t} for t, _ in sentences])}），"
-                         "已交回写作者只改这几句")
+                         "已退回写作模型仅修改这几句")
         again, raw = await draft([*messages, HumanMessage(content=_rewrite_request(sentences))])
         rewritten = compose(raw)
         worse = _blocking(rewritten["violations"], numbers)
@@ -581,8 +596,8 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
         rewrite = {"units": bad, "sentences": [t for t, _ in sentences], "applied": False, "reason": None,
                    "changed": []}
         if fresh:
-            rewrite["reason"] = (f"改写稿冒出 {len(fresh)} 处原稿没有的问题（{_named(fresh)}），没有采用，"
-                                 "保留原稿和原来的判定")
+            rewrite["reason"] = (f"改写稿新增了 {len(fresh)} 处原稿没有的问题（{_named(fresh)}），未予采用，"
+                                 "已保留原稿及原有判定")
             ctx.emit(EventType.LOG, level="warn", code="report_rewrite_rejected", message=rewrite["reason"])
         else:
             known = {outcome["keys"][u]: v for u, v in outcome["verdicts"].items() if v["status"] in judging.JUDGED}

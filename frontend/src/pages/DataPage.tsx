@@ -24,7 +24,7 @@ export function DataPage() {
       <PageHeader
         icon={<Database size={13} />}
         title="数据"
-        subtitle="数据源都在这里：接进来的库和传上来的表，助手编排时看得见结构，agent 运行时能直接查"
+        subtitle="管理已接入的数据库和已上传的表格。助手编排时可读取表结构，Agent 运行时可直接查询"
       />
       <Tabs tabs={TABS} active={tab} onChange={setTab} label="数据" idPrefix="data" />
       <TabPanel idPrefix="data" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">

@@ -99,16 +99,16 @@ COMPATIBLE_PRESETS: list[dict[str, Any]] = [
         "base_url": "http://localhost:11434/v1",
         "api_key_optional": True,
         "models": [
-            {"id": "qwen3:8b", "label": "Qwen3 8B (本地)", "context": 32_000,
+            {"id": "qwen3:8b", "label": "Qwen3 8B（本地）", "context": 32_000,
              "pricing": {"input": 0.0, "output": 0.0}},
-            {"id": "llama3.2", "label": "Llama 3.2 (本地)", "context": 128_000,
+            {"id": "llama3.2", "label": "Llama 3.2（本地）", "context": 128_000,
              "pricing": {"input": 0.0, "output": 0.0}},
         ],
     },
 ]
 
 MOCK_MODELS: list[dict[str, Any]] = [
-    {"id": "mock-fast", "label": "Mock（不花钱，用来试编排）", "context": 128_000,
+    {"id": "mock-fast", "label": "演示模型（无需 API Key）", "context": 128_000,
      "pricing": {"input": 0.0, "output": 0.0}},
 ]
 
@@ -116,14 +116,14 @@ PROVIDER_KINDS = [
     {
         "kind": "anthropic",
         "label": "Anthropic",
-        "base_url_hint": "留空走官方；填了就是自定义网关（读 ANTHROPIC_BASE_URL）",
+        "base_url_hint": "留空使用官方地址；填写后使用自定义网关（默认读取 ANTHROPIC_BASE_URL）",
         "models": ANTHROPIC_MODELS,
         "default_model": "claude-opus-5",
     },
     {
         "kind": "openai",
         "label": "OpenAI",
-        "base_url_hint": "留空走官方",
+        "base_url_hint": "留空使用官方地址",
         "models": OPENAI_MODELS,
         "default_model": "gpt-5.2",
     },
@@ -137,7 +137,7 @@ PROVIDER_KINDS = [
     },
     {
         "kind": "mock",
-        "label": "Mock（无需 API Key）",
+        "label": "演示模型（无需 API Key）",
         "base_url_hint": "",
         "models": MOCK_MODELS,
         "default_model": "mock-fast",

@@ -97,7 +97,7 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
                         : 'cursor-grab hover:border-[var(--border)] hover:bg-hover active:cursor-grabbing',
                       q && category === defs[0]?.category && i === 0 && 'border-[var(--border)] bg-hover',
                     )}
-                    title={lock ? `${def.label}：${EDIT_LOCK_TEXT[lock]}` : `${def.description}\n点一下放在视野中间，或拖到画布上`}
+                    title={lock ? `${def.label}：${EDIT_LOCK_TEXT[lock]}` : `${def.description}\n点击添加到视图中央，或拖到画布上`}
                   >
                     <TypeIcon def={def} />
                     <div className="min-w-0">
@@ -123,7 +123,7 @@ export function Palette({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         </div>
       ) : (
         <div className="border-t px-3 py-2 text-2xs leading-relaxed text-faint">
-          拖到画布，或点击放在视野中间。<br />
+          拖到画布，或点击添加到视图中央。<br />
           从节点右侧圆点拖到另一个节点左侧即可连线。
         </div>
       )}
@@ -210,7 +210,7 @@ function Rail({ onToggle, onAdd, lock }: {
                 <span>{EDIT_LOCK_TEXT[lock]}</span>
               </div>
             ) : (
-              <div className="mt-1 text-2xs text-faint">点一下放在视野中间 · 或拖到画布上</div>
+              <div className="mt-1 text-2xs text-faint">点击添加到视图中央 · 或拖到画布上</div>
             )}
           </div>
         </div>,

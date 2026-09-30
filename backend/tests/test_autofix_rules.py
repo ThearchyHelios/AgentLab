@@ -291,7 +291,7 @@ def test_structural_problems_go_to_copilot():
     graph["nodes"].insert(1, node("team", "supervisor", "协作团队", goal="查数", agents=[{"name": "a"}]))
     graph["edges"] += [{"source": "start", "target": "team"}, {"source": "team", "target": "fetch"}]
     fix = plan(graph)["governed.supervisor:team"]
-    assert fix["kind"] == "assist" and "固定编排" in fix["label"] and fix["node_id"] == "team"
+    assert fix["kind"] == "assist" and "配置固定" in fix["label"] and fix["node_id"] == "team"
     out = apply_fixes(graph, ["governed.supervisor:team"], level="governed")
     assert out["applied"] == [] and out["rejected"][0]["fix_id"] == "governed.supervisor:team"
 
@@ -388,23 +388,23 @@ def raised(default: str = "dangerous") -> dict:
     (lambda g: g["edges"].pop(0), "连线"),
     (lambda g: config(g, "done").pop("contract"), "契约"),
     (lambda g: config(g, "done").update(contract={}), "契约"),
-    (lambda g: config(g, "done")["contract"].update(strict=False), "strict"),
-    (lambda g: config(g, "done")["contract"].update(required=[]), "required"),
-    (lambda g: config(g, "write").update(approval="never"), "全部自动放行"),
-    (lambda g: g.setdefault("defaults", {}).update(approval="never"), "全部自动放行"),
+    (lambda g: config(g, "done")["contract"].update(strict=False), "严格模式"),
+    (lambda g: config(g, "done")["contract"].update(required=[]), "必需指标"),
+    (lambda g: config(g, "write").update(approval="never"), "全部无需审批"),
+    (lambda g: g.setdefault("defaults", {}).update(approval="never"), "全部无需审批"),
     # 审批按「每次调用都审批 > 仅危险工具需要审批 > 全部自动放行」排，往宽里改、删掉都算降低要求
     (lambda g: config(g, "fetch").update(approval="dangerous"), "放宽"),
-    (lambda g: config(g, "fetch").update(approval="Always"), "不认识"),
+    (lambda g: config(g, "fetch").update(approval="Always"), "无法识别"),
     # 删掉写明的审批，运行时退回全图默认（这里是仅危险工具需要审批），比原来的每次调用都审批宽
-    (lambda g: config(g, "fetch").pop("approval"), "去掉了"),
-    (lambda g: config(g, "fetch").update(approval=None), "去掉了"),
-    (lambda g: config(g, "fetch").update(approval=""), "去掉了"),
+    (lambda g: config(g, "fetch").pop("approval"), "删除了"),
+    (lambda g: config(g, "fetch").update(approval=None), "删除了"),
+    (lambda g: config(g, "fetch").update(approval=""), "删除了"),
     # 全图默认删掉，退回全局设置：可能是全部自动放行
-    (lambda g: g["defaults"].pop("approval"), "全图默认"),
+    (lambda g: g["defaults"].pop("approval"), "工作流默认设置"),
     # 白名单里的数字不用引用也能过；cells 要作者显式声明，不由模型替人打开
-    (lambda g: config(g, "done")["contract"]["allow_numbers"].append("120"), "allow_numbers"),
-    (lambda g: config(g, "done")["contract"].update(allow_numbers=["7", "37"]), "allow_numbers"),
-    (lambda g: config(g, "done")["contract"].update(cells=True), "cells"),
+    (lambda g: config(g, "done")["contract"]["allow_numbers"].append("120"), "允许无出处的数字"),
+    (lambda g: config(g, "done")["contract"].update(allow_numbers=["7", "37"]), "允许无出处的数字"),
+    (lambda g: config(g, "done")["contract"].update(cells=True), "单元格引用"),
     # 同一个 id 换了类型：等于删了重建
     (lambda g: find(g, "write").update(type="llm"), "换成"),
 ])
@@ -432,8 +432,8 @@ def test_forbidden_ops_are_named(op):
 
 
 @pytest.mark.parametrize("mutate, word", [
-    (lambda g: config(g, "card").update(approval="dangerous"), "跟随全图默认"),   # 原来跟全图默认：每次调用都审批
-    (lambda g: g["defaults"].update(approval="dangerous"), "全图默认"),
+    (lambda g: config(g, "card").update(approval="dangerous"), "跟随工作流默认设置"),   # 原来跟全图默认：每次调用都审批
+    (lambda g: g["defaults"].update(approval="dangerous"), "工作流默认设置"),
     (lambda g: (g["defaults"].pop("approval"), config(g, "card").update(approval="dangerous")), "放宽"),
 ])
 def test_lowering_a_strict_graph_default_is_forbidden(mutate, word):
@@ -462,10 +462,10 @@ def test_a_new_contract_cannot_open_cells_or_whitelist_numbers():
     assert forbidden_changes(before, after) == []
     config(after, "done")["contract"].update(cells=True, allow_numbers=["2026"])
     reasons = forbidden_changes(before, after)
-    assert any("cells" in r for r in reasons) and any("allow_numbers" in r for r in reasons), reasons
+    assert any("单元格引用" in r for r in reasons) and any("允许无出处的数字" in r for r in reasons), reasons
     fresh = copy.deepcopy(before)
     fresh["nodes"].append(node("extra", "output", "另一个出口", contract={**skeleton, "cells": True}))
-    assert any("cells" in r for r in forbidden_changes(before, fresh))
+    assert any("单元格引用" in r for r in forbidden_changes(before, fresh))
 
 
 def test_overwriting_an_existing_node_is_forbidden():
@@ -478,7 +478,7 @@ def test_overwriting_an_existing_node_is_forbidden():
     after = copy.deepcopy(before)
     find(after, "write")["type"] = "llm"
     [reason] = forbidden_changes(before, after)
-    assert "报告撰写" in reason and "换成" in reason and "删了重建" in reason, reason
+    assert "报告撰写" in reason and "换成" in reason and "删除后重建" in reason, reason
 
 
 def test_a_type_change_shows_in_the_preview():

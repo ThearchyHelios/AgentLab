@@ -261,7 +261,7 @@ async def test_an_old_pause_after_tools_ran_is_refused(monkeypatch):
     assert len(CALLS) == 1
 
     _upgrade(monkeypatch)
-    with pytest.raises(ValueError, match="再执行一次"):
+    with pytest.raises(ValueError, match="重复执行"):
         await run_manager.resume(run.id, {"approved": True})
     assert len(CALLS) == 1
     async with SessionLocal() as session:
@@ -312,6 +312,6 @@ async def test_continuing_an_old_failure_after_tools_ran_is_refused(monkeypatch)
     await run_manager.wait_idle(run.id)
 
     _upgrade(monkeypatch)
-    with pytest.raises(ValueError, match="再执行一次"):
+    with pytest.raises(ValueError, match="重复执行"):
         await run_manager.continue_failed(run.id)
     assert len(CALLS) == 1

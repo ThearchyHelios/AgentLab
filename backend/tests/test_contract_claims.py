@@ -292,14 +292,14 @@ def test_the_effective_claims_policy_is_the_stricter_one(written, declared, gove
 
 
 def test_a_run_in_flight_across_the_upgrade_keeps_the_old_gap():
-    """升级前写的报告（产出里没有 claims）碰上写了 require_citation 的契约：照旧记「这一版还不支持」，不判档。"""
+    """升级前写的报告（产出里没有 claims）碰上写了 require_citation 的契约：照旧只记一条缺口，不判档。"""
     from app.engine.nodes.io import _claims
 
     out = {"gaps": [], "claims_policy": None, "uncited": None, "claims": None}
     _claims(out, {"claims": "require_citation"}, {"text": "x"}, evidence_on=True, governed=False,
             uncited=[{"unit": "u1", "span": [0, 4], "text": "增长很快"}])
     assert out["claims_policy"] is None and out["claims"] is None
-    assert len(out["gaps"]) == 1 and "这一版还不支持" in out["gaps"][0]
+    assert len(out["gaps"]) == 1 and "生成于系统升级前" in out["gaps"][0]
 
 
 # --------------------------------------------------------------------------

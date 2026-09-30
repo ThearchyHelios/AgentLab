@@ -204,7 +204,7 @@ def test_always_button_only_where_it_takes_effect():
 @pytest.mark.parametrize("text, expected", [
     ('{"verdict": "allow", "reason": "只读"}', (True, "只读")),
     ('好的：{"verdict":"escalate","reason":"要删数据"}', (False, "要删数据")),
-    ('{"verdict": "allow"}', (True, "（门控没写理由）")),
+    ('{"verdict": "allow"}', (True, "（门控未说明理由）")),
     ('{"verdict": "yes"}', None),
     ("放行", None),
     ("", None),
@@ -326,7 +326,7 @@ async def test_gate_that_crashes_hands_over_to_a_person(crm, monkeypatch):
     run = await wait(await start(agent_graph()))
     assert run.status == "interrupted"
     [gated] = await events(run.id, "tool.gated")
-    assert gated.data["verdict"] == "escalate" and "门控模型没答上来" in gated.data["reason"]
+    assert gated.data["verdict"] == "escalate" and "门控模型未给出判断" in gated.data["reason"]
 
 
 async def test_gate_verdict_is_not_asked_again_when_the_node_replays(crm, monkeypatch):
@@ -488,7 +488,7 @@ async def test_team_member_gate_escalation_is_not_executed(crm, monkeypatch):
     assert run.status == "succeeded", run.error
     assert crm == []
     ends = [e.data.get("preview", "") for e in await events(run.id, "tool.end")]
-    assert any("门控模型没有放行（拿不准）" in p for p in ends), ends
+    assert any("门控模型未批准（拿不准）" in p for p in ends), ends
 
 
 async def _set(key: str, level: str) -> None:

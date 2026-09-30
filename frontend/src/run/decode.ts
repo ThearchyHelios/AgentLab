@@ -333,9 +333,9 @@ const LOOP_EXIT: Record<string, string> = { body: '循环体', done: '结束' }
 function loopDoneNote(ran: number, total: number | undefined): string {
   if (total != null) {
     if (total === 0) return '（没有要处理的项）'
-    return ran >= total ? `（共 ${total} 项）` : `（跑了 ${ran} 轮，共 ${total} 项）`
+    return ran >= total ? `（共 ${total} 项）` : `（执行了 ${ran} 轮，共 ${total} 项）`
   }
-  return ran === 0 ? '（一轮都没跑）' : `（跑了 ${ran} 轮）`
+  return ran === 0 ? '（未执行）' : `（执行了 ${ran} 轮）`
 }
 
 /**
@@ -662,7 +662,7 @@ function judgeTally(judge: unknown): string {
 /** 报告撰写节点请裁判模型判断结论句（四期，claims: judge）：units 是这一批几句 */
 const judgeTitle = (units: unknown) =>
   `请裁判模型判断${typeof units === 'number' && units > 0 ? ` ${formatNumber(units)} 句` : ''}结论`
-const JUDGE_FAILED_TITLE = '结论句裁判没跑成'
+const JUDGE_FAILED_TITLE = '结论句裁判未能执行'
 
 /** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
 const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
@@ -673,8 +673,8 @@ const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
  */
 function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason: string): string {
   const what = tool ? ` ${tool}` : '一次工具调用'
-  const head = verdict === 'allow' ? `门控放行${what}`
-    : `门控拦下${what}，${verdict === 'team' ? '协作团队里不执行' : '交给人工审批'}`
+  const head = verdict === 'allow' ? `门控通过${what}`
+    : `门控拦截${what}，${verdict === 'team' ? '协作团队中不执行' : '转交人工审批'}`
   return reason ? `${head}：${reason}` : head
 }
 
@@ -687,100 +687,100 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
   switch (code) {
     case 'tool_markup_leak': {
       // 「数据查询把工具调用写成了文字（<｜｜DSML｜｜…），没有真正调用工具，已提醒它重试一次」
-      const who = message.match(/^(.+?)把工具调用写成了文字/)?.[1]?.trim() || '模型'
+      const who = message.match(/^(.+?)(?:把工具调用写成了文字|以文本形式输出了工具调用)/)?.[1]?.trim() || '模型'
       // 收尾轮那种是真调过工具、只是步数用完了还想接着查：不是没绑工具，节点也照常完成，
       // 说成「没有真正执行」会让人去查一个并不存在的故障
-      const settle = message.includes('收尾轮')
+      const settle = message.includes('收尾')
       return {
-        title: settle ? `${who === '模型' ? '' : `${who}：`}步数用完了，收尾时还想接着查`
-          : `${who}把工具调用写成了文字，没有真正执行`,
-        sub: settle ? '收尾那一轮的调用没有执行，结论只基于之前查到的部分'
-          : message.includes('重试') ? '已提醒它重试一次' : undefined,
-        next: settle ? '到画布里调大这一步的「最多步数」，或者把问题问得更具体'
-          : `常见原因：${who === '模型' ? '这个节点' : `成员「${who}」`}没有绑定工具，或者模型不支持工具调用。到画布里给它绑定要用的工具`,
+        title: settle ? `${who === '模型' ? '' : `${who}：`}已达步数上限，收尾时仍试图调用工具`
+          : `${who}以文本形式输出了工具调用，未实际执行`,
+        sub: settle ? '收尾时的工具调用未执行，结论仅基于此前的查询结果'
+          : message.includes('重试') ? '已要求模型重试一次' : undefined,
+        next: settle ? '请在画布中调大该步骤的「最大步数」，或将问题描述得更具体'
+          : `常见原因：${who === '模型' ? '该节点' : `成员「${who}」`}未绑定工具，或模型不支持工具调用。请在画布中为其绑定所需工具`,
         fix: 'canvas',
       }
     }
     case 'team_exhausted': {
       const x = exhaustedOf(message)
       return {
-        title: `协作团队${x?.rounds != null ? `用完 ${x.rounds} 轮` : '用完了轮数'}仍未完成 · 按降档交付`,
-        sub: [x?.reason, x?.never?.length ? `没派到：${x.never.join('、')}` : ''].filter(Boolean).join(' · ') || undefined,
-        next: '交出去的是成员最后的原话，不能当结论用。到画布里看成员有没有绑定要用的工具，再调大「最多轮数」',
+        title: `协作团队${x?.rounds != null ? `已用完 ${x.rounds} 轮` : '已用完轮数'}仍未完成 · 按降档交付`,
+        sub: [x?.reason, x?.never?.length ? `未分派：${x.never.join('、')}` : ''].filter(Boolean).join(' · ') || undefined,
+        next: '交付的是成员最后一次回复，不可作为结论使用。请在画布中检查成员是否绑定了所需工具，再调大「最多轮数」',
         fix: 'canvas',
       }
     }
     case 'report_repair': {
       // 「报告里有 3 处没通过核对（「12」「m:nope」），已要求写作者重写（第 1 次）」。没通过的
       // 不只是裸数字，还有解析不了的引用（m:nope），标题不能只说「没写引用」
-      const n = message.match(/报告里有\s*(\d+)\s*处/)?.[1]
+      const n = message.match(/报告里?有\s*(\d+)\s*处/)?.[1]
       const round = message.match(/第\s*(\d+)\s*次/)?.[1]
       return {
-        title: `报告${n ? `有 ${n} 处` : ''}没通过核对，已让模型按清单重写${round ? `（第 ${round} 次）` : ''}`,
-        sub: message.match(/没通过核对（(.+?)）/)?.[1],
+        title: `报告${n ? `有 ${n} 处` : ''}未通过核对，已要求模型按清单重写${round ? `（第 ${round} 次）` : ''}`,
+        sub: message.match(/(?:没|未)通过核对（(.+?)）/)?.[1],
       }
     }
     case 'agent_field_mismatch': {
       // 「有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234」（llm.py _field_warnings）
       const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
       return {
-        title: `有${n ? ` ${n} 个` : ''}字段和查询快照对不上，已按快照取值`,
+        title: `有${n ? ` ${n} 个` : ''}字段与查询快照不一致，已按快照取值`,
         sub: message.match(/已按快照取值[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
-        next: '下游用的是查询快照里的值，不是模型报的。模型报的数多半是抄错、四舍五入或自己算的',
+        next: '下游使用查询快照中的值，而非模型给出的值。模型给出的数值可能存在抄录错误、四舍五入或自行计算的情况',
       }
     }
     case 'agent_field_unverified': {
       // 两种原话：「有 N 个字段核对不了出处，记为空值（没有兜底成 0）：a（原因）；b（原因）」；
       // 抽取没成：「<原因>。N 个字段都记为空值（没有兜底成 0）」，原因是「结构化抽取没跑成：<调用的错>」
       // 或者「抽取结果不是一个对象」（llm.py 的 failed）
-      const failed = message.match(/^(?:结构化抽取没跑成[：:])?([\s\S]+?)。\s*(\d+)\s*个字段都记为空值/)
+      const failed = message.match(/^(?:结构化抽取(?:没跑成|失败)[：:])?([\s\S]+?)。\s*(\d+)\s*个字段都?记为空值/)
       if (failed) {
         return {
-          title: `按出处抽取字段没跑成，${failed[2]} 个字段记为空值（没有兜底成 0）`,
+          title: `按出处抽取字段失败，${failed[2]} 个字段记为空值（未以 0 代替）`,
           sub: failed[1].trim() || undefined,
-          next: '这些字段交给下游的是空值；口径卡按缺输入处理。原因解决后重跑',
+          next: '这些字段以空值传给下游，口径卡按缺少输入处理。问题解决后请重新运行',
         }
       }
       const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
       return {
-        title: `有${n ? ` ${n} 个` : ''}字段核对不了出处，记为空值（没有兜底成 0）`,
-        sub: message.match(/没有兜底成 0）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
-        next: '模型说的出处在查询结果里找不到。让它先查到这些字段再交，查不到的就是空',
+        title: `有${n ? ` ${n} 个` : ''}字段无法核对出处，记为空值（未以 0 代替）`,
+        sub: message.match(/记为空值（[^）]*）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
+        next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
       }
     }
     case 'judge_limit': {
       // 「结论句裁判已到上限（这份报告的裁判金额上限 $0.05）：3 句没判，记为未裁判；已判的保留」（judge.py run_request）
-      const n = message.match(/[：:]\s*(\d+)\s*句没判/)?.[1]
+      const n = message.match(/[：:]\s*(\d+)\s*句(?:没判|未裁判)/)?.[1]
       return {
-        title: `结论句裁判已到上限${n ? `，${n} 句没判` : ''}（记为未裁判，已判的保留）`,
-        sub: message.match(/已到上限（(.+?)）/)?.[1],
-        next: '没判的结论句不能算完整出具。到报告撰写节点的「结论句裁判」调高上限（也可以设成不限），或到设置 → 证据裁判改默认值',
+        title: `结论句裁判已达上限${n ? `，${n} 句未裁判` : ''}（已裁判的结果保留）`,
+        sub: message.match(/已[到达]上限（(.+?)）/)?.[1],
+        next: '存在未裁判的结论句时不能完整出具。请在报告撰写节点的「结论句裁判」中调高上限（或设为不限），或在「设置 → 偏好设置 → 证据裁判」中修改默认值',
         fix: 'canvas',
       }
     }
     case 'judge_failed': {
       // 「结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（…）」
       return {
-        title: '结论句裁判没跑完，没判的记为未裁判',
-        sub: message.replace(/^结论句裁判没跑完[：:]\s*/, '') || undefined,
-        next: '没判的结论句记一条缺口，出具不能算完整。先看裁判模型的接入（设置 → 证据裁判）能不能用，再重跑',
+        title: '结论句裁判未完成，未判定的结论句记为未裁判',
+        sub: message.replace(/^结论句裁判(?:没跑完|未完成)[：:]\s*/, '') || undefined,
+        next: '未裁判的结论句记为缺口，不能完整出具。请先检查裁判模型的接入（设置 → 偏好设置 → 证据裁判）是否可用，再重新运行',
       }
     }
     case 'judge_unpriced': {
       // 「模型「x」不在价格目录里，按令牌估不出金额：金额上限（每份报告、每次点击、每日）对它不起作用，…」
       const model = message.match(/模型「(.+?)」/)?.[1]
       return {
-        title: `裁判模型${model ? `「${model}」` : ''}估不出金额，金额上限对它不起作用`,
+        title: `裁判模型${model ? `「${model}」` : ''}无法估算金额，金额上限对其无效`,
         sub: message.split(/[：:]/).slice(1).join('：').trim() || undefined,
-        next: '费用只受句数、时长上限约束。要按金额控住，换一个价格目录里有的裁判模型',
+        next: '费用仅受句数和时长上限约束。如需按金额控制，请换用价格目录中已有的裁判模型',
       }
     }
     case 'judge_same_model': {
       // 「裁判模型和写作模型都是「x」：等于自己审自己，…。到设置里选一个不同的「证据裁判模型」…」
-      const model = message.match(/都是「(.+?)」/)?.[1]
+      const model = message.match(/「(.+?)」/)?.[1]
       return {
-        title: `裁判模型和写作模型都是${model ? `「${model}」` : '同一个'}：等于自己审自己`,
-        next: '到设置 → 证据裁判选一个不同的模型，或者在报告撰写节点的「结论句裁判」里指定裁判模型',
+        title: model ? `裁判模型与写作模型同为「${model}」，审查缺乏独立性` : '裁判模型与写作模型相同，审查缺乏独立性',
+        next: '请在「设置 → 偏好设置 → 证据裁判」中选择其他模型，或在报告撰写节点的「结论句裁判」中指定裁判模型',
         fix: 'canvas',
       }
     }
@@ -788,27 +788,27 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
       // 「裁判认为 2 句结论证据不支持（「…」「…」），已交回写作者只改这几句」
       const n = message.match(/裁判认为\s*(\d+)\s*句/)?.[1]
       return {
-        title: `裁判认为${n ? ` ${n} 句` : ''}结论证据不支持，已交回写作者只改这几句`,
-        sub: message.match(/证据不支持（(.+)）/)?.[1],
+        title: `裁判认为${n ? ` ${n} 句` : ''}结论缺乏证据支持，已退回写作模型仅修改这几句`,
+        sub: message.match(/证据(?:不支持|支持不足)（(.+)）/)?.[1],
       }
     }
     case 'report_rewrite_rejected': {
       // 「改写稿冒出 1 处原稿没有的问题（「…」），没有采用，保留原稿和原来的判定」
-      const n = message.match(/冒出\s*(\d+)\s*处/)?.[1]
+      const n = message.match(/(?:冒出|出现了?|新增了?)\s*(\d+)\s*处/)?.[1]
       return {
-        title: `改写稿冒出${n ? ` ${n} 处` : ''}原稿没有的问题，没有采用`,
+        title: `改写稿新增了${n ? ` ${n} 处` : ''}原稿没有的问题，未予采用`,
         sub: message.match(/问题（(.+)）/)?.[1],
-        next: '保留的是原稿和原来的判定',
+        next: '已保留原稿及原有判定',
       }
     }
     case 'repair_invented': {
       // 「第 1 次修复作废：修复时出现了原文没有的值：total_count=0」
-      const values = message.match(/原文没有的值[：:]\s*(.+)$/)?.[1]?.trim()
+      const values = message.match(/原文中?(?:没有|不存在)的值[：:]\s*(.+)$/)?.[1]?.trim()
       const what = values ? `（${values}）` : ''
       return {
-        title: clip(`修复被作废：出现了原文没有的值${what}`),
-        sub: `结果里有原文没有的值${what}，已作废`,
-        next: '修复只许改格式、不许补数据。先看上游节点为什么没拿到数据（常见是没有绑定查询工具）',
+        title: clip(`修复已作废：出现了原文中不存在的值${what}`),
+        sub: `结果中包含原文不存在的值${what}，已作废`,
+        next: '修复只能调整格式，不能补充数据。请先检查上游节点为何未获取到数据（常见原因是未绑定查询工具）',
         fix: 'canvas',
       }
     }
@@ -925,10 +925,11 @@ function groupConcurrent(
 /**
  * 「协作团队用完 N 轮仍未完成：<理由>。一次都没被派到的成员：A、B。…」里的几样东西。
  * 判失败的报错和降档的那条日志是同一个开头；产出里的 never_dispatched 进事件时被
- * 缩成了「[1 项]」，成员名只能从这句话里认
+ * 缩成了「[1 项]」，成员名只能从这句话里认。canvas/NodeCard 也用它（更早的后端写「还未完成」，一并认）。
+ * 这几个锚点是后端 multi.py 有意保留的，改后端那句话时要同步这里
  */
-function exhaustedOf(text: string): Pick<TeamVerdict, 'rounds' | 'reason' | 'never'> | null {
-  const m = text.match(/用完\s*(\d+)\s*轮仍未完成[：:]\s*([\s\S]*?)(?:。一次都没被派到的成员|。先看成员|。按降档交付|$)/)
+export function exhaustedOf(text: string): Pick<TeamVerdict, 'rounds' | 'reason' | 'never'> | null {
+  const m = text.match(/用完\s*(\d+)\s*轮(?:仍|还)?未完成[：:]\s*([\s\S]*?)(?:。一次都没被派到的成员|。先看成员|。按降档交付|$)/)
   if (!m) return null
   const never = text.match(/一次都没被派到的成员[：:]\s*([^。]+)/)?.[1]
     .split('、').map((s) => s.trim()).filter(Boolean) ?? []
@@ -1210,8 +1211,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
    */
   const verdict = (approved: unknown, actor: unknown): string => {
     const who = typeof actor === 'string' && actor.trim() ? actor.trim() : ''
-    const what = approved === false ? '驳回了' : '放行了'
-    return who ? `${who} ${what}` : `已${what.slice(0, 2)}`
+    const what = approved === false ? '驳回' : '批准'
+    return who ? `${who} 已${what}` : `已${what}`
   }
   const closeInterrupt = (key: string, approved: unknown, note: string, actor?: unknown, always = false): boolean => {
     const step = openInterrupts.get(key)
@@ -1284,7 +1285,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const who = typeof d.actor === 'string' && d.actor.trim() ? d.actor.trim() : ''
         out.push({
           id: `s-${seq}`, seq, kind: 'lifecycle', status: 'running', startedAt: at,
-          title: resumed ? '继续运行' : `开始运行（${d.nodes ?? '?'} 个节点）`,
+          title: resumed ? '继续运行' : num(d.nodes) != null ? `开始运行（${d.nodes} 个节点）` : '开始运行',
           ...(num(d.nodes) != null && !resumed ? { total: d.nodes } : {}),
           // 「从「X」接着跑，保留了前面 3 个节点」——从哪接、谁点的，续跑才对得上账
           ...(resumed && (d.message || who)
@@ -1349,7 +1350,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 条件跳过"和"根本没轮到"，受限编排做过的这个决定在时间线上没有痕迹
         const label = String(d.label ?? '')
         const name = (label && label !== nodeId ? label : TYPE_LABEL[String(d.node_type ?? '')])
-          || nodeId || '这一步'
+          || nodeId || '此步骤'
         const reason = String(d.reason ?? '')
         const existing = nodeId ? nodeSteps.get(nodeId) : undefined
         if (existing) {
@@ -1424,7 +1425,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (step && d.preview && typeof d.preview === 'object' && d.preview.exhausted) {
           step.level = 'warn'
           const rounds = teamVerdictOf(teams.get(nodeId ?? ''))?.rounds
-          step.sub = `${rounds != null ? `用完 ${rounds} 轮` : '用完了轮数'}仍未完成，按降档交付`
+          step.sub = `${rounds != null ? `已用完 ${rounds} 轮` : '已用完轮数'}仍未完成，按降档交付`
         }
         break
       }
@@ -1447,7 +1448,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           step.meta = dur(ms)
         } else {
           push({ id: `e-${seq}`, seq, kind: 'error', level: 'error', status: 'failed',
-                 title: String(d.error ?? '这一步失败了'), nodeId, raw }, nodeId)
+                 title: String(d.error ?? '此步骤失败'), nodeId, raw }, nodeId)
         }
         trackTeam(event)
         break
@@ -1499,7 +1500,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           // 抽取没跑成：agent 的结论还在，字段记空值、接着发警告——节点不失败，这一行是提醒。
           // 状态记成做完（琥珀色）而不是 failed：failed 会把这一行和「执行」那一栏的标头都画成红的
           step.level = 'warn'
-          step.title = `${EXTRACT_TITLE}没跑成`
+          step.title = `${EXTRACT_TITLE}失败`
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         if (d.purpose === 'judge' && d.error) {
@@ -1569,8 +1570,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           if (d.timed_out) {
             // 到点被放弃的：数据库那边可能还在跑，这里只是不等了。上限写出来，才知道
             // 该缩小查询范围还是去调时限
-            const limit = step.limitS ?? num(Number(preview.match(/超过\s*(\d+(?:\.\d+)?)\s*s/)?.[1]))
-            const why = limit != null ? `超过 ${formatNumber(limit)} s 上限，已放弃等待` : '超过时限，已放弃等待'
+            const limit = step.limitS ?? num(Number(preview.match(/超过\s*(\d+(?:\.\d+)?)\s*(?:s|秒)/)?.[1]))
+            const why = limit != null ? `超过 ${formatNumber(limit)} 秒上限，已停止等待` : '超过时限，已停止等待'
             step.sub = d.agent ? `${why} · ${d.agent} 调用` : why
           }
           // tool.error 只有 {tool,error}，没有 duration_ms/preview——不能假设统一形状
@@ -1650,7 +1651,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           // result 是"跑出了什么"。塞进同一个字段的话，报错时最需要的两样
           // 东西——实际代码和 traceback——只能看见一样
           step.result = body || (d.ok ? '（无输出）'
-            : num(d.exit_code) != null ? `退出码 ${d.exit_code}` : '沙箱没有返回退出码')
+            : num(d.exit_code) != null ? `退出码 ${d.exit_code}` : '沙箱未返回退出码')
           if (!step.detail) step.detail = step.result
           pendingTools.delete(`sandbox-${nodeId ?? seq}`)
         }
@@ -1665,7 +1666,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           || (loop ? LOOP_EXIT[key] : key === 'default' ? '其他' : undefined) || key
         push({
           id: `br-${seq}`, seq, kind: 'branch', nodeId, status: 'done',
-          title: `走「${name}」这条路`
+          title: `转入「${name}」分支`
             + (ran == null ? '' : key === 'done' ? loopDoneNote(ran, num(d.total)) : `（第 ${ran + 1} 轮）`),
           detail: d.reason ? String(d.reason) : undefined,
         }, nodeId)
@@ -1691,7 +1692,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const step: Step = {
           id: `hm-${seq}`, seq, kind: 'human', nodeId, status: 'waiting', level: 'warn',
           startedAt: at,
-          title: String(payload.title || d.title || '等你确认'),
+          title: String(payload.title || d.title || '待审批'),
           detail: [payload.message, payload.tool ? `工具：${payload.tool}` : '']
             .filter(Boolean).join('\n') || undefined,
         }
@@ -1734,16 +1735,16 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const tier = String(d.tier ?? '')
         const label = issuanceLabel(tier)
         const gaps: string[] = []
-        if (d.missing_required?.length) gaps.push(`缺必需指标 ${d.missing_required.join('、')}`)
-        if (d.missing_expected?.length) gaps.push(`缺期望指标 ${d.missing_expected.join('、')}`)
-        if (num(d.unmatched)) gaps.push(`${d.unmatched} 个数字无法回指指标集`)
+        if (d.missing_required?.length) gaps.push(`缺少必需指标：${d.missing_required.join('、')}`)
+        if (d.missing_expected?.length) gaps.push(`缺少期望指标：${d.missing_expected.join('、')}`)
+        if (num(d.unmatched)) gaps.push(`${d.unmatched} 个数字无法追溯到指标集`)
         // 校验本身没跑全（叙述渲染为空、指标集为空）也会降档。不写出来的话，
         // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字
         const notRun: string[] = Array.isArray(d.gaps) ? d.gaps.map(String) : []
         if (notRun.length) gaps.push(`校验不完整：${notRun.join('；')}`)
         const checked = [
           num(d.metrics_checked) != null ? `核对 ${d.metrics_checked} 个指标` : '',
-          num(d.matched_numbers) != null ? `回指 ${d.matched_numbers} 个数字` : '',
+          num(d.matched_numbers) != null ? `可追溯 ${d.matched_numbers} 个数字` : '',
         ].filter(Boolean).join(' · ')
         out.push({
           id: `is-${seq}`, seq, kind: 'issuance', status: 'done', ...(tier ? { tier } : {}),
@@ -1789,7 +1790,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         push({
           id: `ej-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: 'evidence_judged',
           level: hit.length || (Array.isArray(d.gaps) && d.gaps.length) ? 'warn' : 'info',
-          title: `封存后按需裁判了 ${formatNumber(judged)} 句结论${hit.length ? '，有的到了上限没判' : ''}`,
+          title: `封存后按需裁判了 ${formatNumber(judged)} 句结论${hit.length ? '，部分因达到上限未裁判' : ''}`,
           sub: '封存后追加 · 模型判断，非确定',
           ...(d.model ? { detail: [`模型：${d.model}`, ...(Array.isArray(d.gaps) ? d.gaps.map(String) : [])].join('\n') } : {}),
         }, nodeId)
@@ -1811,7 +1812,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           id: `rs-${seq}`, seq, kind: 'branch', nodeId, status: 'running', startedAt: at,
           // 轮数用完后补的那一次只判定、不派活。它的 round 是「派过几轮」，写成「第 N+1 轮」
           // 读起来像还有新的一轮
-          title: d.closing ? '轮数用完 · 调度者在做最后判定…' : `第 ${round + 1} 轮：调度者在想下一步…`,
+          title: d.closing ? '轮数用完 · 调度者正在做最后判定…' : `第 ${round + 1} 轮：调度者正在规划下一步…`,
         }
         pendingRoutes.set(`${nodeId}|${round}`, step)
         push(step, nodeId)
@@ -1871,8 +1872,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const why = String(d.error ?? '')
         const failure: Partial<Step> = d.failed
           ? { status: 'failed', level: 'error',
-              sub: /没有真正调用工具|工具调用的原始标记/.test(why) ? '模型没有真正调用工具，这一步什么都没查到'
-                : clip(why || '这一步失败了', 80) }
+              sub: /没有真正调用工具|未实际调用工具|工具调用的原始标记/.test(why) ? '模型未实际调用工具，此步骤未查询到任何数据'
+                : clip(why || '此步骤失败', 80) }
           : { status: 'done' }
         if (step) {
           Object.assign(step, failure)
@@ -2010,7 +2011,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 说法和画布胶囊的那一句一致：「张工 放弃了这次运行，1 条待审批一并关闭」
         const who = typeof d.actor === 'string' && d.actor.trim() ? d.actor.trim() : ''
         const said = String(d.message ?? '').trim()
-        const sub = said ? `${who ? `${who} ` : ''}${said}` : who ? `${who} 取消了这次运行` : ''
+        const sub = said ? `${who ? `${who} ` : ''}${said}` : who ? `${who} 取消了本次运行` : ''
         out.push({ id: `rc-${seq}`, seq, kind: 'lifecycle', status: 'cancelled', title: '已取消',
                    ...(sub ? { sub } : {}) })
         break
@@ -2029,7 +2030,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           title: '完成', ms: active,
           // 等人的时间单独说：审批停了三分钟的运行，"执行 1.2 s"和"用了 3 分钟"
           // 都对，混成一个数就哪个都不对了
-          meta: [dur(active), wait ? `等人 ${formatDuration(wait)}` : ''].filter(Boolean).join(' · ')
+          meta: [dur(active), wait ? `等待审批 ${formatDuration(wait)}` : ''].filter(Boolean).join(' · ')
             || undefined,
         })
         break
@@ -2051,8 +2052,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (action === 'write') {
           push({
             id: `mw-${seq}`, seq, kind: 'note', nodeId, status: 'done',
-            title: content ? `记住了：${content.slice(0, 40)}${content.length > 40 ? '…' : ''}`
-                           : '写入了一条记忆',
+            title: content ? `已写入记忆：${content.slice(0, 40)}${content.length > 40 ? '…' : ''}`
+                           : '已写入一条记忆',
             detail: content || undefined,
           }, nodeId)
           break
@@ -2060,7 +2061,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (action === 'clear') {
           push({
             id: `mc-${seq}`, seq, kind: 'note', nodeId, status: 'done', level: 'warn',
-            title: `清空了记忆域「${String(d.scope ?? '')}」的 ${count} 条`,
+            title: `已清空记忆域「${String(d.scope ?? '')}」中的 ${count} 条记忆`,
           }, nodeId)
           break
         }
@@ -2068,7 +2069,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           id: `mr-${seq}`, seq, kind: 'schema', nodeId,
           status: count ? 'done' : 'failed',
           level: count ? undefined : 'warn',
-          title: count ? `想起 ${count} 条相关记忆` : '没有想起相关的记忆',
+          title: count ? `召回 ${count} 条相关记忆` : '未召回相关记忆',
         }, nodeId)
         break
       }
@@ -2084,13 +2085,13 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           status: count ? 'done' : 'failed',
           level: d.degraded ? 'warn' : count ? undefined : 'warn',
           title: count
-            ? `在「${collection}」里检索到 ${count} 段`
-            : `在「${collection}」里没检索到内容`,
+            ? `在「${collection}」中检索到 ${count} 段`
+            : `在「${collection}」中未检索到内容`,
           detail: String(d.query ?? '') || undefined,
           meta: [
             top != null ? `最高分 ${top}` : '',
             // 退回关键词是"少了一半能力"，不标出来用户只会觉得最近搜得不准
-            d.degraded ? '已退回关键词' : '',
+            d.degraded ? '已回退为关键词检索' : '',
           ].filter(Boolean).join(' · ') || undefined,
           artifact: d.artifact,
         }, nodeId)
@@ -2103,7 +2104,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 标题、副标题都不放，收进展开区给排查的人认。加了新事件记得回来补映射
         push({
           id: `x-${seq}`, seq, kind: 'note', nodeId, status: 'done',
-          title: '一条还没翻译的记录',
+          title: '未识别的事件',
           detail: `事件类型：${type}\n${JSON.stringify(d, null, 2).slice(0, 1000)}`,
         }, nodeId)
     }
@@ -2308,13 +2309,28 @@ function thinkingHeadline(text: string, live: boolean): string {
   return line.length > 60 ? '…' + line.slice(-60) : line
 }
 
-const PHASE_LABEL: Record<string, string> = {
+/**
+ * 助手生成工作流的阶段文案。全站唯一一份：画布顶部的锁定条、输入框下的进度行、
+ * 助手栏的轮次状态、助手时间线的阶段行都从这里取，不要再各写一份
+ */
+export const COPILOT_PHASE_TEXT: Record<string, string> = {
   connecting: '正在连接模型',
   planning: '正在理解需求、规划步骤',
   building: '正在搭建工作流',
   wiring: '正在连接数据流',
   finalizing: '正在排版和校验',
+  // 以「正在」开头：收尾时去掉「正在」就是完成态（按自查结果修正）
   repairing: '正在按自查结果修正',
+}
+
+/**
+ * 出具档位的说明（悬停提示、横幅副标题）。全站唯一一份：运行记录的档位芯片和
+ * 出具横幅都从这里取。档位名本身在 lib/terms 的 ISSUANCE_LABEL
+ */
+export const ISSUANCE_HINT: Record<'formal' | 'degraded' | 'withheld', string> = {
+  formal: '指标齐全，叙述中的数字均可追溯到口径卡',
+  degraded: '存在缺口，请对照声明使用结论',
+  withheld: '必需指标缺失或数字无法追溯，本期结论不予采用',
 }
 
 /** 自查最多修几轮。和后端 copilot._SELF_CHECK_ROUNDS 一致，check 事件只带当前第几轮 */
@@ -2378,7 +2394,7 @@ function labelsOf(ops: CopilotOp[], fallback?: (id: string) => string | undefine
 }
 
 /** 用了限定范围之外的数据源：自查交回模型改也改不掉时，人要知道是范围的事，不是图写错了 */
-const OUT_OF_SCOPE_NEXT = '这一轮限定了只查某几个数据源，工作流里用了范围之外的库。去掉限定再问，或者把要查的库加进范围'
+const OUT_OF_SCOPE_NEXT = '本轮限定了查询的数据源，但工作流使用了范围之外的数据库。请取消限定后重新提问，或将所需数据库加入查询范围'
 
 /**
  * Copilot 的操作流解码。
@@ -2463,8 +2479,8 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         // 心跳只更新"还活着"的那一条阶段行，不该每 3 秒堆一行，也不该插在
         // 思考中间把一段思考切成两截
         const label = op.phase === 'repairing' && repairRound
-          ? `${PHASE_LABEL.repairing}（第 ${repairRound}/${SELF_CHECK_ROUNDS} 轮）`
-          : PHASE_LABEL[String(op.phase)] ?? '正在处理'
+          ? `${COPILOT_PHASE_TEXT.repairing}（第 ${repairRound}/${SELF_CHECK_ROUNDS} 轮）`
+          : COPILOT_PHASE_TEXT[String(op.phase)] ?? '正在处理'
         const elapsed = num(op.elapsed_ms)
         const phaseRow = [...out].reverse().find((s) => s.kind === 'lifecycle' && s.status === 'running')
         if (phaseRow) {
@@ -2483,7 +2499,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
       }
       case 'plan':
         add({ id: `cp-${i}`, seq: i, kind: 'note', status: 'done',
-              title: clip(String(op.summary ?? '想好了怎么做'), 120) })
+              title: clip(String(op.summary ?? '已完成规划'), 120) })
         break
       case 'add_node':
         nodeCount += 1
@@ -2502,7 +2518,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         break
       case 'remove_node':
         add({ id: `cr-${i}`, seq: i, kind: 'note', status: 'done',
-              title: clip(`去掉了「${labels(String(op.id)) ?? op.id}」`) })
+              title: clip(`移除了「${labels(String(op.id)) ?? op.id}」`) })
         break
       // 连线不单独成行：用户关心有哪些步骤，不关心箭头
       case 'add_edge':
@@ -2512,7 +2528,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         // 心跳那条"正在理解需求…"要收尾，否则生成完了它还在转圈
         settleAll('done')
         add({ id: `cd-${i}`, seq: i, kind: 'lifecycle', status: 'done',
-              title: `工作流搭好了，加了 ${nodeCount} 步`,
+              title: `工作流已搭建完成，新增 ${nodeCount} 个步骤`,
               detail: String(op.explanation ?? '') || undefined })
         break
       case 'check': {
@@ -2524,7 +2540,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         if (op.status === 'repairing') {
           repairRound = num(op.round) ?? repairRound + 1
           add({ id: `ck-${i}`, seq: i, kind: 'note', status: 'done', level: 'warn',
-                title: `自查发现 ${issues.length} 处问题，交回去改（第 ${repairRound}/${SELF_CHECK_ROUNDS} 轮）`,
+                title: `自查发现 ${issues.length} 处问题，已交回模型修正（第 ${repairRound}/${SELF_CHECK_ROUNDS} 轮）`,
                 detail: lines.join('\n') || undefined })
         } else if (op.status === 'passed') {
           settleAll('done')
@@ -2532,8 +2548,8 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
           // 一句安静的「自查通过」能交代的，图照样能跑，只是跑起来什么都查不到
           const dropped = droppedOf(op)
           add({ id: `ck-${i}`, seq: i, kind: 'note', status: 'done',
-                title: `${op.repaired ? '自查通过：问题已经改好' : '自查通过'}${dropped.length
-                  ? `，但有 ${dropped.length} 处工具被去掉了` : ''}`,
+                title: `${op.repaired ? '自查通过：问题已修正' : '自查通过'}${dropped.length
+                  ? `，但有 ${dropped.length} 处工具被移除` : ''}`,
                 ...(dropped.length ? { level: 'warn' as const, code: 'tools_dropped',
                                        detail: dropped.map((x) => x.message).join('\n') } : {}) })
         } else {
@@ -2542,9 +2558,9 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
           add({ id: `ck-${i}`, seq: i, kind: 'error', level: 'error', status: 'failed',
                 title: op.status === 'failed'
                   ? canvas
-                    ? `自查后还有 ${issues.length} 处问题没能自动修好`
-                    : `自查后还有 ${issues.length} 处问题，没有自动运行`
-                  : String(op.message ?? '自查没能完成'),
+                    ? `自查后仍有 ${issues.length} 处问题未能自动修正`
+                    : `自查后仍有 ${issues.length} 处问题，未自动运行`
+                  : String(op.message ?? '自查未能完成'),
                 detail: [...lines, ...droppedOf(op).map((x) => x.message)].join('\n') || undefined,
                 ...(outOfScope ? { next: OUT_OF_SCOPE_NEXT, code: 'datasource_out_of_scope' } : {}),
                 ...(typeof op.detail === 'string' && op.detail ? { raw: op.detail } : {}) })
@@ -2561,17 +2577,17 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         const built = [...out].reverse().find((s) => s.id.startsWith('cd-'))
           ?? (last?.kind === 'lifecycle' ? last : undefined)
         if (total && built) {
-          built.title = opts?.unchanged ? `看过了，没有改动（整个工作流共 ${total} 步）`
+          built.title = opts?.unchanged ? `已检查，无需改动（工作流共 ${total} 个步骤）`
             : nodeCount && nodeCount < total
-              ? `工作流搭好了，加了 ${nodeCount} 步，整个工作流共 ${total} 步`
-              : `工作流搭好了，共 ${total} 步`
+              ? `工作流已搭建完成，新增 ${nodeCount} 个步骤，共 ${total} 个步骤`
+              : `工作流已搭建完成，共 ${total} 个步骤`
         }
         settleAll('done')
         // 模型写了不存在的节点类型：那一步被跳过了。不说出来的话"共 N 步"是
         // 一句不完整的真话，用户要到运行结果不对才发现少了一步
         for (const t of skippedTypes(op)) {
           add({ id: `cm-${i}-${t}`, seq: i, kind: 'note', status: 'done', level: 'warn',
-                title: clip(`少了一步：模型用了不存在的节点类型「${t}」，已跳过`, 80) })
+                title: clip(`已跳过一个步骤：节点类型「${t}」不存在`, 80) })
         }
         // 工具绑定变化单独成一行：改图回执以前只说「修改 1」，模型改提示词时漏写 tools、
         // 把查库的工具整个抹掉，要到运行结果不对才发现
@@ -2583,10 +2599,10 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
             id: `cg-${i}`, seq: i, kind: 'tool', status: 'done', code: 'tool_changes',
             ...(lost.length ? { level: 'warn' as const } : {}),
             title: clip(one
-              ? one.removed.length && !one.after.length ? `${changeWho(one)}的工具被清空了`
-                : one.removed.length ? `${changeWho(one)}少了 ${one.removed.length} 个工具`
-                : `${changeWho(one)}的工具变了`
-              : `${changes.length} 处工具绑定变了${lost.length ? `，${lost.length} 处少了工具` : ''}`, 80),
+              ? one.removed.length && !one.after.length ? `${changeWho(one)}的工具已全部移除`
+                : one.removed.length ? `${changeWho(one)}移除了 ${one.removed.length} 个工具`
+                : `${changeWho(one)}的工具绑定已变更`
+              : `${changes.length} 处工具绑定已变更${lost.length ? `，其中 ${lost.length} 处移除了工具` : ''}`, 80),
             detail: changes.map((c) => `${changeWho(c)}：${c.before.join('、') || '（空）'} → ${c.after.join('、') || '（空）'}`)
               .join('\n'),
           })

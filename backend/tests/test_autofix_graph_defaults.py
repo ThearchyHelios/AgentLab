@@ -75,7 +75,7 @@ def test_an_agent_following_a_never_default_is_blocked_on_the_governed_level():
     assert len(found) == 1
     issue = found[0]
     assert issue.level == "error" and issue.node_id == "ask" and issue.field == "approval"
-    assert "跟随全图默认" in issue.message and "全部自动放行" in issue.message and "「查数员」" in issue.message
+    assert "跟随工作流默认设置" in issue.message and "全部无需审批" in issue.message and "「查数员」" in issue.message
     # 已发布档照旧只给警告
     assert [i.level for i in issues_of(weekly(), level="published")] == ["warning"]
 
@@ -123,7 +123,7 @@ def test_one_graph_level_auto_fix_serves_every_follower():
     fix = fixes[FIX]
     assert fix["kind"] == "auto" and fix["node_id"] is None and fix["code"] == CODE
     assert fix["preview"] == {"field": "defaults.approval", "before": "never", "after": "dangerous"}
-    assert "全图默认" in fix["label"] and "「查数员」" in fix["label"] and "「复核员」" in fix["label"]
+    assert "工作流默认设置" in fix["label"] and "「查数员」" in fix["label"] and "「复核员」" in fix["label"]
     # 两条问题都挂上同一个修复 id（问题在节点上，修复不在）
     out = check(spec, level="governed")
     assert {i["node_id"]: i["fix"] for i in out["issues"] if i["code"] == CODE} == {"ask": FIX, "ask2": FIX}
@@ -178,14 +178,14 @@ def test_a_rule_that_does_not_really_fix_it_is_rejected(monkeypatch):
     monkeypatch.setitem(autofix._EDITORS, CODE, lambda graph, fix, value: [])
     out = apply_fixes(weekly(), [FIX], level="governed")
     assert out["applied"] == [] and out["rejected"][0]["fix_id"] == FIX
-    assert "还在" in out["rejected"][0]["reason"]
+    assert "仍然存在" in out["rejected"][0]["reason"]
 
 
 @pytest.mark.parametrize("prev, now, word", [
-    ("dangerous", "never", "全部自动放行"),
-    ("always", "never", "全部自动放行"),
+    ("dangerous", "never", "全部无需审批"),
+    ("always", "never", "全部无需审批"),
     ("always", "dangerous", "放宽"),
-    ("dangerous", None, "全图默认"),
+    ("dangerous", None, "工作流默认设置"),
 ])
 def test_loosening_the_graph_default_is_still_forbidden(prev, now, word):
     before = weekly(default=prev)

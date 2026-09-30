@@ -1,7 +1,7 @@
 {
  "_comment": "可点击证据第二期（查询链、单元格、整表、口径卡来源）的前端夹具。报告文档由后端 evidence.py 的 compose_doc 真跑生成（查询快照走 loader）；片段接口的答复照 api/evidence.py 的形状拼（row_index、highlight.cells、masked、source、caliber_upgrade）。snapshots.Q3 是「打开完整快照」取回的工件内容（遮罩列已替换）。只用通用示例名。",
  "run_id": "run-evidence-query",
- "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+ "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a",
  "doc": {
   "schema": "agentlab.report/1",
   "run_id": "run-evidence-query",
@@ -12,9 +12,9 @@
    "m:gmv": {
     "alias": "m:gmv",
     "kind": "metric",
-    "eid": "ev:metric:8e9e5fdb2eddb7a0",
+    "eid": "ev:metric:2997620b9982b6f5",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "gmv"
     },
@@ -32,9 +32,9 @@
    "m:orders": {
     "alias": "m:orders",
     "kind": "metric",
-    "eid": "ev:metric:d7c6de7d408a70d2",
+    "eid": "ev:metric:bdd6632bb8127e31",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "orders"
     },
@@ -52,9 +52,9 @@
    "m:aov": {
     "alias": "m:aov",
     "kind": "metric",
-    "eid": "ev:metric:72d2a805ddf72604",
+    "eid": "ev:metric:d18421c8d8d4b456",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "aov"
     },
@@ -72,9 +72,9 @@
    "m:wow": {
     "alias": "m:wow",
     "kind": "metric",
-    "eid": "ev:metric:74c193598c403111",
+    "eid": "ev:metric:f26dc242deffc901",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "wow"
     },
@@ -92,9 +92,9 @@
    "m:refund_rate": {
     "alias": "m:refund_rate",
     "kind": "metric",
-    "eid": "ev:metric:1f7a71663ab15697",
+    "eid": "ev:metric:6e2b728640683049",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "refund_rate"
     },
@@ -112,9 +112,9 @@
    "m:new_users": {
     "alias": "m:new_users",
     "kind": "metric",
-    "eid": "ev:metric:4430c7b636713290",
+    "eid": "ev:metric:8cb61c93fc7872ad",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "new_users"
     },
@@ -132,9 +132,9 @@
    "m:adj": {
     "alias": "m:adj",
     "kind": "metric",
-    "eid": "ev:metric:b9c97d4b59a25a23",
+    "eid": "ev:metric:8717ea40c19c7c8b",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "adj"
     },
@@ -152,9 +152,9 @@
    "m:fx": {
     "alias": "m:fx",
     "kind": "metric",
-    "eid": "ev:metric:86539c1b7e4afa0e",
+    "eid": "ev:metric:655b5a210c72f5a1",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "fx"
     },
@@ -172,9 +172,9 @@
    "m:spread": {
     "alias": "m:spread",
     "kind": "metric",
-    "eid": "ev:metric:dea437737bb0dfa8",
+    "eid": "ev:metric:a185e34c3b738f87",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "locator": {
      "metric": "spread"
     },
@@ -347,7 +347,7 @@
         "alias": "m:gmv",
         "kind": "metric",
         "status": "resolved",
-        "eid": "ev:metric:8e9e5fdb2eddb7a0",
+        "eid": "ev:metric:2997620b9982b6f5",
         "locator": {
          "metric": "gmv"
         }
@@ -358,7 +358,7 @@
         "alias": "m:orders",
         "kind": "metric",
         "status": "resolved",
-        "eid": "ev:metric:d7c6de7d408a70d2",
+        "eid": "ev:metric:bdd6632bb8127e31",
         "locator": {
          "metric": "orders"
         }
@@ -369,7 +369,7 @@
         "alias": "m:aov",
         "kind": "metric",
         "status": "resolved",
-        "eid": "ev:metric:72d2a805ddf72604",
+        "eid": "ev:metric:d18421c8d8d4b456",
         "locator": {
          "metric": "aov"
         }
@@ -380,7 +380,7 @@
         "alias": "m:wow",
         "kind": "metric",
         "status": "resolved",
-        "eid": "ev:metric:74c193598c403111",
+        "eid": "ev:metric:f26dc242deffc901",
         "locator": {
          "metric": "wow"
         }
@@ -451,7 +451,7 @@
          "locator": {
           "metric": "gmv"
          },
-         "eid": "ev:metric:8e9e5fdb2eddb7a0",
+         "eid": "ev:metric:2997620b9982b6f5",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -485,7 +485,7 @@
          "locator": {
           "metric": "orders"
          },
-         "eid": "ev:metric:d7c6de7d408a70d2",
+         "eid": "ev:metric:bdd6632bb8127e31",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -519,7 +519,7 @@
          "locator": {
           "metric": "aov"
          },
-         "eid": "ev:metric:72d2a805ddf72604",
+         "eid": "ev:metric:d18421c8d8d4b456",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -553,7 +553,7 @@
          "locator": {
           "metric": "wow"
          },
-         "eid": "ev:metric:74c193598c403111",
+         "eid": "ev:metric:f26dc242deffc901",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -625,7 +625,7 @@
          "kind": "metric",
          "role": "value",
          "status": "unresolved",
-         "reason": "指标「退款率」这次没有值（缺输入），不能写进报告",
+         "reason": "指标「退款率」本次没有值（缺少输入），无法写入报告",
          "rendered": "—"
         },
         "state": "none",
@@ -656,7 +656,7 @@
          "kind": "metric",
          "role": "value",
          "status": "unresolved",
-         "reason": "指标「新客数」这次没有值（缺输入），不能写进报告",
+         "reason": "指标「新客数」本次没有值（缺少输入），无法写入报告",
          "rendered": "—"
         },
         "state": "none",
@@ -728,7 +728,7 @@
          "locator": {
           "metric": "adj"
          },
-         "eid": "ev:metric:b9c97d4b59a25a23",
+         "eid": "ev:metric:8717ea40c19c7c8b",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -762,7 +762,7 @@
          "locator": {
           "metric": "fx"
          },
-         "eid": "ev:metric:86539c1b7e4afa0e",
+         "eid": "ev:metric:655b5a210c72f5a1",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -1779,7 +1779,7 @@
          "locator": {
           "metric": "spread"
          },
-         "eid": "ev:metric:dea437737bb0dfa8",
+         "eid": "ev:metric:a185e34c3b738f87",
          "kind": "metric",
          "role": "value",
          "status": "resolved",
@@ -1827,7 +1827,7 @@
   "violations": [
    {
     "code": "unresolved_ref",
-    "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+    "message": "引用 [[m:refund_rate]] 无法解析：指标「退款率」本次没有值（缺少输入），无法写入报告",
     "ref": "m:refund_rate",
     "span": [
      69,
@@ -1839,7 +1839,7 @@
    },
    {
     "code": "unresolved_ref",
-    "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+    "message": "引用 [[m:new_users]] 无法解析：指标「新客数」本次没有值（缺少输入），无法写入报告",
     "ref": "m:new_users",
     "span": [
      74,
@@ -1864,7 +1864,7 @@
   "reports": [
    {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a",
     "doc_sealed": true,
     "hash_ok": true,
     "ok": false,
@@ -1892,11 +1892,11 @@
   "evidence": [
    {
     "alias": "m:gmv",
-    "eid": "ev:metric:8e9e5fdb2eddb7a0",
+    "eid": "ev:metric:2997620b9982b6f5",
     "kind": "metric",
     "label": "销售额 = 45,678.5元",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1904,11 +1904,11 @@
    },
    {
     "alias": "m:orders",
-    "eid": "ev:metric:d7c6de7d408a70d2",
+    "eid": "ev:metric:bdd6632bb8127e31",
     "kind": "metric",
     "label": "订单数 = 1,234单",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1916,11 +1916,11 @@
    },
    {
     "alias": "m:aov",
-    "eid": "ev:metric:72d2a805ddf72604",
+    "eid": "ev:metric:d18421c8d8d4b456",
     "kind": "metric",
     "label": "客单价 = 37.0元",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1928,11 +1928,11 @@
    },
    {
     "alias": "m:wow",
-    "eid": "ev:metric:74c193598c403111",
+    "eid": "ev:metric:f26dc242deffc901",
     "kind": "metric",
     "label": "环比增幅 = 8.7%",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1940,11 +1940,11 @@
    },
    {
     "alias": "m:refund_rate",
-    "eid": "ev:metric:1f7a71663ab15697",
+    "eid": "ev:metric:6e2b728640683049",
     "kind": "metric",
     "label": "退款率 = —",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1952,11 +1952,11 @@
    },
    {
     "alias": "m:new_users",
-    "eid": "ev:metric:4430c7b636713290",
+    "eid": "ev:metric:8cb61c93fc7872ad",
     "kind": "metric",
     "label": "新客数 = —",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1964,11 +1964,11 @@
    },
    {
     "alias": "m:adj",
-    "eid": "ev:metric:b9c97d4b59a25a23",
+    "eid": "ev:metric:8717ea40c19c7c8b",
     "kind": "metric",
     "label": "调整后销售额 = 44,000.0元",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1976,11 +1976,11 @@
    },
    {
     "alias": "m:fx",
-    "eid": "ev:metric:86539c1b7e4afa0e",
+    "eid": "ev:metric:655b5a210c72f5a1",
     "kind": "metric",
     "label": "汇率 = 7.12",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -1988,11 +1988,11 @@
    },
    {
     "alias": "m:spread",
-    "eid": "ev:metric:dea437737bb0dfa8",
+    "eid": "ev:metric:a185e34c3b738f87",
     "kind": "metric",
     "label": "最大一单比最后一单多 = 672.5元",
     "node_id": "caliber",
-    "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
+    "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
     "sealed": true,
     "cited_by": [],
     "units": [],
@@ -2065,7 +2065,7 @@
   "s4": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s4",
@@ -2125,7 +2125,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2139,7 +2139,7 @@
   "s6": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s6",
@@ -2158,7 +2158,7 @@
      "locator": {
       "metric": "gmv"
      },
-     "eid": "ev:metric:8e9e5fdb2eddb7a0",
+     "eid": "ev:metric:2997620b9982b6f5",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -2205,8 +2205,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:8e9e5fdb2eddb7a0",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:2997620b9982b6f5",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -2223,7 +2223,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -2289,7 +2289,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2303,7 +2303,7 @@
   "s8": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s8",
@@ -2322,7 +2322,7 @@
      "locator": {
       "metric": "orders"
      },
-     "eid": "ev:metric:d7c6de7d408a70d2",
+     "eid": "ev:metric:bdd6632bb8127e31",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -2369,8 +2369,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:d7c6de7d408a70d2",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:bdd6632bb8127e31",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -2387,7 +2387,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -2454,7 +2454,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2468,7 +2468,7 @@
   "s10": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s10",
@@ -2487,7 +2487,7 @@
      "locator": {
       "metric": "aov"
      },
-     "eid": "ev:metric:72d2a805ddf72604",
+     "eid": "ev:metric:d18421c8d8d4b456",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -2534,8 +2534,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:72d2a805ddf72604",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:d18421c8d8d4b456",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -2552,7 +2552,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -2642,7 +2642,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2656,7 +2656,7 @@
   "s12": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s12",
@@ -2675,7 +2675,7 @@
      "locator": {
       "metric": "wow"
      },
-     "eid": "ev:metric:74c193598c403111",
+     "eid": "ev:metric:f26dc242deffc901",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -2722,8 +2722,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:74c193598c403111",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:f26dc242deffc901",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -2740,7 +2740,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -2862,7 +2862,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -2876,7 +2876,7 @@
   "s16": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s16",
@@ -2896,7 +2896,7 @@
      "kind": "metric",
      "role": "value",
      "status": "unresolved",
-     "reason": "指标「退款率」这次没有值（缺输入），不能写进报告",
+     "reason": "指标「退款率」本次没有值（缺少输入），无法写入报告",
      "rendered": "—"
     }
    },
@@ -2933,8 +2933,8 @@
      "recompute_ok": null,
      "status": "missing_input",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:1f7a71663ab15697",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:6e2b728640683049",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -2951,7 +2951,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -3028,11 +3028,11 @@
      "sealed": true
     }
    ],
-   "note": "引用解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+   "note": "引用无法解析：指标「退款率」本次没有值（缺少输入），无法写入报告",
    "violations": [
     {
      "code": "unresolved_ref",
-     "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+     "message": "引用 [[m:refund_rate]] 无法解析：指标「退款率」本次没有值（缺少输入），无法写入报告",
      "ref": "m:refund_rate",
      "span": [
       69,
@@ -3055,7 +3055,7 @@
   "s18": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s18",
@@ -3075,7 +3075,7 @@
      "kind": "metric",
      "role": "value",
      "status": "unresolved",
-     "reason": "指标「新客数」这次没有值（缺输入），不能写进报告",
+     "reason": "指标「新客数」本次没有值（缺少输入），无法写入报告",
      "rendered": "—"
     }
    },
@@ -3112,8 +3112,8 @@
      "recompute_ok": null,
      "status": "missing_input",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:4430c7b636713290",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:8cb61c93fc7872ad",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -3130,7 +3130,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -3143,15 +3143,15 @@
      "status": "unresolved",
      "ref": "Q1.r0.new_users",
      "artifact": "175b086d4701b620222f4b4178cee1275139cf081da12550a30ff99fd6de26e5",
-     "reason": "Q1 没有列「new_users」，有：gmv、order_cnt、refund_cnt",
+     "reason": "Q1 没有列「new_users」，可用的列：gmv、order_cnt、refund_cnt",
      "query": "Q1"
     }
    ],
-   "note": "引用解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+   "note": "引用无法解析：指标「新客数」本次没有值（缺少输入），无法写入报告",
    "violations": [
     {
      "code": "unresolved_ref",
-     "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+     "message": "引用 [[m:new_users]] 无法解析：指标「新客数」本次没有值（缺少输入），无法写入报告",
      "ref": "m:new_users",
      "span": [
       74,
@@ -3174,7 +3174,7 @@
   "s22": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s22",
@@ -3193,7 +3193,7 @@
      "locator": {
       "metric": "adj"
      },
-     "eid": "ev:metric:b9c97d4b59a25a23",
+     "eid": "ev:metric:8717ea40c19c7c8b",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -3237,8 +3237,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:b9c97d4b59a25a23",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:8717ea40c19c7c8b",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -3255,7 +3255,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -3269,7 +3269,7 @@
      "status": "ok"
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3283,7 +3283,7 @@
   "s24": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s24",
@@ -3302,7 +3302,7 @@
      "locator": {
       "metric": "fx"
      },
-     "eid": "ev:metric:86539c1b7e4afa0e",
+     "eid": "ev:metric:655b5a210c72f5a1",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -3346,8 +3346,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:86539c1b7e4afa0e",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:655b5a210c72f5a1",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -3364,7 +3364,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -3378,7 +3378,7 @@
      "status": "ok"
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3392,7 +3392,7 @@
   "s29": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s29",
@@ -3494,7 +3494,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3508,7 +3508,7 @@
   "s31": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s31",
@@ -3610,7 +3610,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3624,7 +3624,7 @@
   "s33": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s33",
@@ -3732,7 +3732,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3746,7 +3746,7 @@
   "s35": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s35",
@@ -3854,7 +3854,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3868,7 +3868,7 @@
   "s44": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s44",
@@ -3970,7 +3970,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -3984,7 +3984,7 @@
   "s46": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s46",
@@ -4086,7 +4086,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4100,7 +4100,7 @@
   "s48": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s48",
@@ -4202,7 +4202,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4216,7 +4216,7 @@
   "s50": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s50",
@@ -4324,7 +4324,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4338,7 +4338,7 @@
   "s52": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s52",
@@ -4446,7 +4446,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4460,7 +4460,7 @@
   "s54": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s54",
@@ -4568,7 +4568,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4582,7 +4582,7 @@
   "s56": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s56",
@@ -4690,7 +4690,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4704,7 +4704,7 @@
   "s58": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s58",
@@ -4812,7 +4812,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4826,7 +4826,7 @@
   "s60": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s60",
@@ -4934,7 +4934,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -4948,7 +4948,7 @@
   "s65": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s65",
@@ -5070,7 +5070,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -5081,13 +5081,13 @@
     "columns": [
      "phone"
     ],
-    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+    "note": "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
    }
   },
   "s67": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s67",
@@ -5209,7 +5209,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -5220,13 +5220,13 @@
     "columns": [
      "phone"
     ],
-    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+    "note": "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
    }
   },
   "s70": {
    "report": {
     "node_id": "write",
-    "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb"
+    "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a"
    },
    "segment": {
     "id": "s70",
@@ -5245,7 +5245,7 @@
      "locator": {
       "metric": "spread"
      },
-     "eid": "ev:metric:dea437737bb0dfa8",
+     "eid": "ev:metric:a185e34c3b738f87",
      "kind": "metric",
      "role": "value",
      "status": "resolved",
@@ -5288,8 +5288,8 @@
      "recompute_ok": true,
      "status": "ok",
      "node_id": "caliber",
-     "artifact": "85c4b5948c7e4cfab4472c5f250183e44a64d9139e342bbcdf52f14881b03d55",
-     "eid": "ev:metric:dea437737bb0dfa8",
+     "artifact": "8cf0b7da19fcae788ffd629f36212b96817e39ce022f1a54aca4277262486738",
+     "eid": "ev:metric:a185e34c3b738f87",
      "eid_ok": true,
      "hash_ok": true,
      "render_ok": true,
@@ -5306,7 +5306,7 @@
       "pinned": 5,
       "latest": 6,
       "policy": "dual",
-      "policy_label": "并排双印新旧口径"
+      "policy_label": "新旧口径并列展示"
      }
     },
     {
@@ -5448,7 +5448,7 @@
      "sealed": true
     }
    ],
-   "note": "数字由系统从证据里取出、按口径卡的格式渲染，没有经过模型转写",
+   "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
    "violations": [],
    "seal": {
     "sealed": true,
@@ -5459,7 +5459,7 @@
     "columns": [
      "phone"
     ],
-    "note": "这些列在数据源里设了遮罩，面板上不显示原值。在有身份体系之前，遮罩只减少暴露，不是安全边界"
+    "note": "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
    }
   }
  },
@@ -5467,14 +5467,14 @@
   "answer": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5元，订单 1,234单，客单价 37.0元，环比 8.7%。\n\n退款率 —，新客 —：这次都没查到。\n\n扣掉促销后的调整后销售额是 44,000.0元，按汇率 7.12 折算。\n\n## 分区域\n\n华东销售额最高，为 18,230.5，其次是华南（12,004）。\n\n| region | amount | order_cnt |\n| --- | --- | --- |\n| 华东 | 18,230.5 | 402 |\n| 华南 | 12,004 | 311 |\n| 华北 | 9,876 | 298 |\n\n## 明细\n\n单笔最大的一单金额是 1,288，来自华南。最大的一单比最后一单多 672.5元。",
   "_evidence": {
    "report_node": "write",
-   "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+   "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a",
    "fields": [
     "answer"
    ]
   }
  },
  "report_checked": {
-  "doc_artifact": "18e1dbb10ace41fa26d4b70ee72e8da461cf3b2e4b181672dda59f65fd924ddb",
+  "doc_artifact": "78f5ccfda6bf4a9c74813ef0797677d8159e3a672feb187fcafe25595dd4f56a",
   "ok": false,
   "stats": {
    "units": 21,
@@ -5494,7 +5494,7 @@
   "violations": [
    {
     "code": "unresolved_ref",
-    "message": "引用 [[m:refund_rate]] 解析不了：指标「退款率」这次没有值（缺输入），不能写进报告",
+    "message": "引用 [[m:refund_rate]] 无法解析：指标「退款率」本次没有值（缺少输入），无法写入报告",
     "ref": "m:refund_rate",
     "span": [
      69,
@@ -5506,7 +5506,7 @@
    },
    {
     "code": "unresolved_ref",
-    "message": "引用 [[m:new_users]] 解析不了：指标「新客数」这次没有值（缺输入），不能写进报告",
+    "message": "引用 [[m:new_users]] 无法解析：指标「新客数」本次没有值（缺少输入），无法写入报告",
     "ref": "m:new_users",
     "span": [
      74,

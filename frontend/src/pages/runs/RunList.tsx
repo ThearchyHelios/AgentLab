@@ -253,7 +253,7 @@ export function RunRows({
             {list.loadingMore && <Spinner size={11} />} 加载更多
           </button>
         )}
-        {!list.hasMore && rows.length > 0 && <span>· 到底了</span>}
+        {!list.hasMore && rows.length > 0 && <span>· 已全部加载</span>}
       </div>
     </div>
   )
@@ -360,7 +360,7 @@ function RunRow({ run, code, approval, selected, dup, flash, now, onOpen }: {
         <span className="tnum min-w-0 truncate" title={timingTitle(timing)} data-run-duration="">
           {live ? <LiveElapsed since={run.started_at ?? run.created_at} prefix="" /> : formatSpan(headlineMs(timing))}
           {timing.source === 'usage' && (timing.waitMs ?? 0) > 0 && (
-            <span className="text-faint"> · 含等人 {formatSpan(timing.waitMs, { coarse: (timing.waitMs ?? 0) >= 3_600_000 })}</span>
+            <span className="text-faint"> · 含等待审批 {formatSpan(timing.waitMs, { coarse: (timing.waitMs ?? 0) >= 3_600_000 })}</span>
           )}
         </span>
         <ShapeBar run={run} code={code} waitingSince={approval?.created_at} now={now} />
@@ -414,8 +414,8 @@ function RowContext({ run, code, approval, now }: {
       const long = age != null && age >= LONG_WAIT_MS
       return (
         <div className={line} style={{ color: 'var(--st-waiting)' }} title={approval?.title}>
-          {approval ? <>等「{approval.node_label ?? approval.node_id}」审批</> : '等人工审批'}
-          {age != null && <span className={clsx('tnum', long && 'font-medium')}> · 已等 {formatSpan(age, { coarse: true })}</span>}
+          {approval ? <>等待「{approval.node_label ?? approval.node_id}」审批</> : '等待人工审批'}
+          {age != null && <span className={clsx('tnum', long && 'font-medium')}> · 已等待 {formatSpan(age, { coarse: true })}</span>}
           {approval?.title && <span className="text-faint"> · {approval.title}</span>}
         </div>
       )
@@ -424,7 +424,7 @@ function RowContext({ run, code, approval, now }: {
     case 'suspended':
       return (
         <div className={line} style={{ color: 'var(--st-suspended)' }} title={run.error ?? undefined}>
-          已挂起，可接着跑{run.error ? <span className="text-faint"> · {run.error}</span> : null}
+          已挂起，可继续运行{run.error ? <span className="text-faint"> · {run.error}</span> : null}
         </div>
       )
     case 'running':
@@ -452,9 +452,9 @@ function RowContext({ run, code, approval, now }: {
 // -------------------------------------------------------------------------
 
 const MODE_ASK: Record<string, string> = {
-  approve: '要你决定：通过或驳回',
-  input: '要你补一段输入',
-  edit: '要你改定一份草稿',
+  approve: '需要你决定批准或驳回',
+  input: '需要你补充输入',
+  edit: '需要你修改并确认草稿',
 }
 
 /**
@@ -483,7 +483,7 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
       <EmptyState
         icon={<Inbox size={22} />}
         title={queue.items.length ? '没有匹配的待审批' : '没有待处理的审批'}
-        body={queue.items.length ? '换个筛选条件试试' : '停在人工审批上的运行会出现在这里，处理完就会离开这个列表。'}
+        body={queue.items.length ? '请尝试其他筛选条件' : '等待人工审批的运行会显示在这里，处理后将从列表中移除。'}
       />
     )
   }
@@ -520,7 +520,7 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
                 title={`${formatDateTime(a.created_at ?? null)} 发起`}
                 data-approval-age=""
               >
-                已等 {formatSpan(age, { coarse: true })}
+                已等待 {formatSpan(age, { coarse: true })}
               </span>
             </div>
             <div className="min-w-0 truncate text-2xs text-dim">

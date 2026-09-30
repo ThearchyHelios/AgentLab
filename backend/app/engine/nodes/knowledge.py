@@ -37,7 +37,7 @@ async def run_memory(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         elif action == "write":
             content = ctx.render_str(ctx.cfg("content", ""), state)
             if not content.strip():
-                raise NodeError(ctx.node.id, "记忆写入节点没有内容")
+                raise NodeError(ctx.node.id, "「长期记忆」节点没有填写要记住的内容")
             item = await store.remember(
                 session,
                 scope=scope,
@@ -51,7 +51,7 @@ async def run_memory(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             removed = await store.clear_scope(session, scope)
             result = {"cleared": removed, "scope": scope}
         else:
-            raise NodeError(ctx.node.id, f"未知的记忆操作：{action}")
+            raise NodeError(ctx.node.id, f"不支持的记忆操作：{action}")
 
     # 写入必须看得见：这是往长期记忆里存东西，会影响以后每一次对话。
     # 以前发的是 info 日志，而解码层丢弃所有 info，等于系统背着用户记了东西
@@ -75,7 +75,7 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """知识库检索节点。输出既有结构化命中列表，也有拼好的上下文文本。"""
     query = ctx.render_str(ctx.cfg("query", "{{ last_message }}"), state)
     if not query.strip():
-        raise NodeError(ctx.node.id, "检索节点没有查询内容")
+        raise NodeError(ctx.node.id, "「知识检索」节点没有填写检索问题")
 
     collection = ctx.render_str(ctx.cfg("collection", "") or ctx.run.collection, state)
     limit = int(ctx.cfg("limit", 5) or 5)
@@ -117,7 +117,9 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             async with SessionLocal() as session:
                 model, _ = await get_chat_model(session, spec)
         except ProviderNotConfigured as e:
-            degraded.append(f"重排用不了：{e}")
+            from app.core.errors import not_configured
+
+            degraded.append(f"重排不可用：{not_configured(e)}")
             model = None
         hits = await rerank(model, query, hits, top_n=limit, on_note=degraded.append)
     else:

@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'
 import { AlertTriangle, ChevronLeft, Copy, Lock, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax, type NodeDef } from './nodeDefs'
-import { fieldOfIssue, unboundToolOf, withToolBound, type FieldRef } from './issues'
+import { fieldOfIssue, isCaseKeyIssue, unboundToolOf, withToolBound, type FieldRef } from './issues'
 import { hintOf } from './shortcuts'
 import { isActivePhase } from '../run/trace'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
@@ -90,7 +90,7 @@ function ToolsInput({ id, single, value, invalid, aria, onChange }: {
         {[...new Set(options.map((o) => o.group))].map((g) => (
           <optgroup key={g} label={g}>
             {options.filter((o) => o.group === g).map((o) => (
-              <option key={o.value} value={o.value}>{o.label}{o.danger ? ' ⚠' : ''}</option>
+              <option key={o.value} value={o.value}>{o.label}{o.danger ? '（需审批）' : ''}</option>
             ))}
           </optgroup>
         ))}
@@ -145,7 +145,7 @@ function NodeRefsInput({ nodeId, type, value, onChange }: {
       value={list}
       onChange={(v) => onChange(v.length ? v : undefined)}
       addLabel={type === 'metrics' ? '选择口径卡' : '选择节点'}
-      empty={type === 'metrics' ? '上游还没有口径卡：先在这个节点前面接一张口径卡' : '上游没有可选的节点'}
+      empty={type === 'metrics' ? '上游没有口径卡，请先在本节点之前连接一个口径卡节点' : '上游没有可选的节点'}
     />
   )
 }
@@ -207,9 +207,9 @@ export function Inspector() {
       <div className="flex h-full flex-col">
         <Header onBack={() => select(null)} />
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-          <div className="text-xs">不认识的节点类型「{node.data.nodeType}」</div>
-          <div className="text-2xs text-faint">这个版本的界面编辑不了它，运行时后端也会拒绝这张工作流。</div>
-          <button className="btn btn-sm" onClick={() => removeNode(node.id)}>删除这个节点</button>
+          <div className="text-xs">无法识别的节点类型「{node.data.nodeType}」</div>
+          <div className="text-2xs text-faint">当前版本无法编辑该节点，包含该节点的工作流也无法运行。</div>
+          <button className="btn btn-sm" onClick={() => removeNode(node.id)}>删除该节点</button>
         </div>
       </div>
     )
@@ -233,10 +233,10 @@ export function Inspector() {
       <Header onBack={() => select(null)}>
         <def.icon size={13} style={{ color: 'var(--nt)' }} className={`nt-${node.data.nodeType} shrink-0`} />
         <span className="min-w-0 flex-1 truncate text-xs font-semibold">{def.label}</span>
-        <IconButton label="复制节点" title={hintOf('复制一份', 'duplicate')} disabled={locked}
+        <IconButton label="复制节点" title={hintOf('复制节点', 'duplicate')} disabled={locked}
                     onClick={() => duplicateNode(node.id)} icon={<Copy size={12} />} />
         <IconButton label="删除节点" disabled={locked || running}
-                    title={running && !locked ? '运行中不能删节点：等它结束或者先停下' : `${hintOf('删除节点', 'delete')} · 可撤销`}
+                    title={running && !locked ? '运行期间无法删除节点，请等待运行结束或先停止运行' : `${hintOf('删除节点', 'delete')} · 可撤销`}
                     onClick={() => removeNode(node.id)} icon={<Trash2 size={12} className="text-[var(--err)]" />} />
       </Header>
 
@@ -248,7 +248,7 @@ export function Inspector() {
                role="note" style={{ borderColor: 'var(--border-strong)', background: 'var(--bg-hover)' }}>
             <Lock size={11} className="mt-px shrink-0 text-dim" aria-hidden />
             <span className="min-w-0 flex-1">
-              <span className="font-medium">只能看，不能改</span>
+              <span className="font-medium">只读</span>
               <span className="text-dim"> · {EDIT_LOCK_TEXT[lock]}</span>
             </span>
           </div>
@@ -387,8 +387,8 @@ function SyntaxBadge({ syntax }: { syntax: FieldSyntax }) {
       className="mono inline-flex shrink-0 items-center gap-1 rounded border px-1 text-2xs leading-4 text-faint"
       style={{ borderColor: 'var(--hairline)' }}
       title={template
-        ? '模板：用 {{ vars.x }} 引用上游。取不到值会渲染成空字符串、不报错，所以用补全别手敲'
-        : '表达式：直接写 vars.x == 1 这样的裸路径，不要加 {{ }}'}
+        ? '模板：用 {{ vars.x }} 引用上游数据。引用的值不存在时会渲染为空字符串且不报错，建议通过自动补全输入'
+        : '表达式：直接写 vars.x == 1 这样的变量路径，无需加 {{ }}'}
     >
       {template ? '{{ }}' : 'ƒx'}
       <span className="font-sans">{template ? '模板' : '表达式'}</span>
@@ -432,7 +432,7 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
           <TemplateText id={`${id}-wide`} nodeId={nodeId} syntax="template" spellCheck={false}
                         className={clsx(field.type !== 'textarea' && 'mono', 'text-xs')} rows={22}
                         value={value ?? ''} placeholder={field.placeholder} onChange={onChange} />
-          <div className="mt-2 text-2xs text-faint">改动直接写进画布，{formatShortcut('Mod+Z')} 可以撤回；打 {'{{'} 弹出这一步能取到的变量</div>
+          <div className="mt-2 text-2xs text-faint">修改会直接写入画布，按 {formatShortcut('Mod+Z')} 可撤销；输入 {'{{'} 可查看当前步骤可引用的变量</div>
         </Modal>,
         document.body,
       )}
@@ -551,7 +551,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
       const groups = [...new Set(options.map((o) => o.group))]
       return (
         <select id={id} className="field" value={value ?? ''} {...aria} onChange={(e) => onChange(e.target.value)}>
-          <option value="">默认（用第一个可用 provider）</option>
+          <option value="">默认（使用第一个可用的模型接入）</option>
           {groups.map((g) => (
             <optgroup key={g} label={g}>
               {options.filter((o) => o.group === g).map((o) => (
@@ -584,8 +584,8 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
           value={Array.isArray(value) ? value : []}
           onChange={onChange}
           addLabel="添加 Skill"
-          empty={<>还没有可用的 Skill。<Link to="/knowledge/skills" className="underline underline-offset-2 hover:text-fg">
-            去「知识 → 方法论 Skill」创建</Link></>}
+          empty={<>暂无可用的 Skill。<Link to="/knowledge/skills" className="underline underline-offset-2 hover:text-fg">
+            前往「知识 → 方法论 Skill」创建</Link></>}
         />
       )
 
@@ -673,13 +673,13 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
           <div className="min-w-0">
             <label className="label" htmlFor={`${id}-model`}>{JUDGE_FIELD_LABEL.model}</label>
             <input id={`${id}-model`} className="field mono text-xs" list={`${id}-models`} value={model} spellCheck={false}
-                   placeholder={provider ? '留空：接入的默认模型' : '跟随设置'}
+                   placeholder={provider ? '留空则使用该接入的默认模型' : '跟随设置'}
                    onChange={(e) => set('model', e.target.value.trim() ? e.target.value : undefined)} />
             <datalist id={`${id}-models`}>{models.map((m) => <option key={m} value={m} />)}</datalist>
           </div>
         </div>
         <div className="mt-1 text-2xs leading-snug text-faint">
-          接入和模型都没写就用设置里的「证据裁判模型」；写了哪一项就整组用节点上的，不和设置拼。建议和写报告的模型不同：同一个模型审自己写的，写错的地方它多半也看不出来
+          接入和模型均未填写时，使用设置中的「证据裁判模型」；填写任一项后，整组以节点配置为准，不与设置合并。建议裁判模型与撰写报告的模型不同，同一模型较难发现自身的错误
         </div>
         {byModelHint && (
           <div className="mt-1 text-2xs leading-snug" data-judge-by-model={owner ? (owner.enabled ? 'found' : 'disabled') : 'default'}
@@ -689,7 +689,7 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
         )}
         {same && (
           <div className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }} data-judge-same="">
-            裁判模型和写报告的模型都是「{model}」：等于自己审自己
+            裁判模型与撰写报告的模型相同（「{model}」），审核效果有限
           </div>
         )}
         {lines('provider')}{lines('model')}
@@ -705,8 +705,8 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
           <span>
             {JUDGE_FIELD_LABEL.rewrite_once}
             <span className="mt-0.5 block text-2xs leading-snug text-faint">
-              默认关。打开后裁判认为证据不支持的句子连同理由交回写作者只改这几句，再判一次，最多一轮；多一次写作和裁判的花费，
-              改写稿冒出原稿没有的问题就不采用
+              默认关闭。开启后，裁判判定为证据不支持的句子会连同理由交回撰写模型，仅改写这些句子并重新判断一次，最多一轮。
+              会额外产生一次撰写和裁判的费用；改写稿如出现原稿没有的问题，则不予采用
             </span>
           </span>
         </label>
@@ -717,14 +717,14 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
         <select id={`${id}-on_unsupported`} className="field" value={judge.on_unsupported ?? ''}
                 onChange={(e) => set('on_unsupported', e.target.value || undefined)}>
           <option value="">默认：{JUDGE_ON_UNSUPPORTED_LABEL.degrade}</option>
-          <option value="degrade">{JUDGE_ON_UNSUPPORTED_LABEL.degrade}（degrade）</option>
-          <option value="withhold">{JUDGE_ON_UNSUPPORTED_LABEL.withhold}（withhold）</option>
+          <option value="degrade">{JUDGE_ON_UNSUPPORTED_LABEL.degrade}</option>
+          <option value="withhold">{JUDGE_ON_UNSUPPORTED_LABEL.withhold}</option>
           {typeof judge.on_unsupported === 'string' && judge.on_unsupported
             && !(judge.on_unsupported in JUDGE_ON_UNSUPPORTED_LABEL) && (
-            <option value={judge.on_unsupported} disabled>{judge.on_unsupported}：不认识的值，只能选上面两项</option>
+            <option value={judge.on_unsupported} disabled>{judge.on_unsupported}：无法识别的值，请从上方选项中选择</option>
           )}
         </select>
-        <div className="mt-1 text-2xs leading-snug text-faint">只管正式运行；探索运行只标注，不拦</div>
+        <div className="mt-1 text-2xs leading-snug text-faint">仅对正式运行生效；探索运行只做标注，不拦截</div>
         {lines('on_unsupported')}
       </div>
     </div>
@@ -739,7 +739,7 @@ function JudgeLimit({ id, name, value, issues, onChange }: {
   const off = value === null
   const shown = typeof value === 'number' || typeof value === 'string' ? String(value) : ''
   const note = off ? JUDGE_LIMIT_OFF[name]
-    : value === undefined ? '没写：用设置里「证据裁判」的默认值' : ''
+    : value === undefined ? '未填写：使用「设置 → 证据裁判」中的默认值' : ''
   return (
     <div data-judge-key={name} data-judge-unlimited={off ? '' : undefined}>
       <label className="label" htmlFor={id}>{JUDGE_FIELD_LABEL[name]}</label>
@@ -766,9 +766,9 @@ function JudgeLimit({ id, name, value, issues, onChange }: {
 
 /** 节点上某项设成不限时写明：费用还受什么约束（同设置页，节点上的只说这一份报告） */
 const JUDGE_LIMIT_OFF: Record<'max_claims' | 'max_cost_usd' | 'timeout_s', string> = {
-  max_claims: '不设上限，句数只受报告里结论句多少约束',
-  max_cost_usd: '不设上限，这份报告的裁判费用只受句数、时长上限和每日上限约束',
-  timeout_s: '不设上限，时长只受模型接口自身的超时约束',
+  max_claims: '不设上限，句数仅受报告中结论句数量限制',
+  max_cost_usd: '不设上限，本报告的裁判费用仅受句数、时长上限和每日上限约束',
+  timeout_s: '不设上限，时长仅受模型接口自身的超时限制',
 }
 
 /**
@@ -803,7 +803,7 @@ function JsonTemplateInput({ id, nodeId, value, placeholder, invalid, describedB
           }
         }}
       />
-      {bad && <div className="mt-1 text-2xs text-[var(--err)]">JSON 格式不对，还没保存</div>}
+      {bad && <div className="mt-1 text-2xs text-[var(--err)]">JSON 格式有误，修改尚未保存</div>}
     </div>
   )
 }
@@ -857,7 +857,7 @@ function SubgraphPicker({ id, value, version, invalid, describedBy, onChange }: 
       </select>
       {!!value && (
         <div>
-          <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-version`}>钉住版本</label>
+          <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-version`}>固定版本</label>
           <select id={`${id}-version`} className="field" value={version ?? ''} disabled={!versions}
                   onChange={(e) => setVersion(e.target.value)}>
             <option value="">跟随最新（受管工作流不允许）</option>
@@ -945,17 +945,17 @@ function CaliberFromPicker({ id, value, invalid, describedBy }: {
 
   return (
     <div className="space-y-1.5" data-caliber-from={mode}>
-      <div role="radiogroup" aria-label="口径卡从哪来" className="inline-flex rounded-md border p-px" aria-describedby={describedBy}>
+      <div role="radiogroup" aria-label="口径卡来源" className="inline-flex rounded-md border p-px" aria-describedby={describedBy}>
         {CALIBER_MODES.map((m) => (
           <button key={m} type="button" {...radio(m)} onClick={() => setMode(m)}
                   className={clsx('rounded px-2 py-0.5 text-2xs', mode === m ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}>
-            {m === 'local' ? '在这里定义' : '钉住别的工作流里的口径卡'}
+            {m === 'local' ? '在此定义' : '引用其他工作流的口径卡'}
           </button>
         ))}
       </div>
       {ref && (
         <>
-          <select id={id} className="field" value={wfId} aria-label="钉住哪个工作流" aria-invalid={invalid || undefined}
+          <select id={id} className="field" value={wfId} aria-label="来源工作流" aria-invalid={invalid || undefined}
                   style={invalid && !wfId ? { borderColor: 'var(--err)' } : undefined}
                   onChange={(e) => write({ caliber_from: e.target.value ? { workflow_id: e.target.value } : {} })}>
             <option value="">— 选择工作流 —</option>
@@ -965,10 +965,10 @@ function CaliberFromPicker({ id, value, invalid, describedBy }: {
           </select>
           {!!wfId && (
             <div>
-              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-version`}>钉住版本（必须钉：不钉口径会跟着上游漂移）</label>
+              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-version`}>固定版本（必填：否则口径会随上游版本变化）</label>
               <select id={`${id}-version`} className="field" value={version ?? ''} disabled={!versions}
                       onChange={(e) => write({ caliber_from: { workflow_id: wfId, ...(e.target.value ? { workflow_version: Number(e.target.value) } : {}) } })}>
-                <option value="">{versions ? (versions.length ? '— 选择版本 —' : '这个工作流还没有保存过版本') : '正在取版本…'}</option>
+                <option value="">{versions ? (versions.length ? '— 选择版本 —' : '该工作流尚未保存过版本') : '正在加载版本…'}</option>
                 {(versions ?? []).map((v) => (
                   <option key={v.id} value={v.version}>v{v.version}{v.published ? '（已发布）' : ''}{v.note ? ` · ${v.note}` : ''}</option>
                 ))}
@@ -977,15 +977,15 @@ function CaliberFromPicker({ id, value, invalid, describedBy }: {
           )}
           {!!wfId && version != null && (
             <div>
-              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-node`}>那一版里的哪张口径卡</label>
+              <label className="mb-0.5 block text-2xs text-faint" htmlFor={`${id}-node`}>选择该版本中的口径卡</label>
               <select id={`${id}-node`} className="field" value={ref.node_id ?? ''} disabled={!graph || graph === 'error'}
                       onChange={(e) => write({ caliber_from: { workflow_id: wfId, workflow_version: version, ...(e.target.value ? { node_id: e.target.value } : {}) } })}>
-                <option value="">{graph === 'error' ? '这一版取不到' : !graph ? '正在取这一版的图…' : cards.length ? '— 选择口径卡 —' : '这一版里没有口径卡'}</option>
+                <option value="">{graph === 'error' ? '无法加载该版本' : !graph ? '正在加载该版本…' : cards.length ? '— 选择口径卡 —' : '该版本中没有口径卡'}</option>
                 {cards.map(cardOf).map((c) => (
                   // 它自己也是钉住别处的：定义不在这一版里，不能再往下钉
                   <option key={c.id} value={c.id} disabled={!!c.config.caliber_from}>
                     {c.label || c.id} · 口径「{c.config.caliber || '—'}」{c.config.caliber_version ?? ''}
-                    {c.config.caliber_from ? '（它也是钉住别处的，不能再钉）' : ''}
+                    {c.config.caliber_from ? '（该口径卡本身引用自其他工作流，不能再次引用）' : ''}
                   </option>
                 ))}
               </select>
@@ -1064,7 +1064,7 @@ function MultiPick({ options, value, onChange, empty, addLabel = '添加工具' 
           <div className="max-h-52 overflow-y-auto p-1">
             {!filtered.length && (
               <div className="px-2 py-3 text-center text-2xs text-faint">
-                {options.length ? `没有匹配「${query.trim()}」的` : empty}
+                {options.length ? `没有与「${query.trim()}」匹配的结果` : empty}
               </div>
             )}
             {filtered.map((o) => (
@@ -1197,21 +1197,21 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
  */
 function caseKeyIssue(value: any[], i: number): { level: 'error' | 'warning'; message: string } | null {
   const key = String(value[i]?.key ?? '').trim()
-  if (!key) return { level: 'error', message: '还没填标识：连不出边，也走不到它' }
+  if (!key) return { level: 'error', message: '请填写标识：未填写标识的分支无法连线，也不会被执行' }
   const first = value.findIndex((c) => String(c?.key ?? '').trim() === key)
-  if (first !== i) return { level: 'error', message: `和第 ${first + 1} 个分支的标识重复：路由只认标识，这一个永远轮不到` }
+  if (first !== i) return { level: 'error', message: `与第 ${first + 1} 个分支的标识重复：分支按标识路由，此分支不会被执行` }
   if (key === 'default') {
-    return { level: 'warning', message: 'default 是「其他」兜底出口的保留名：这个分支会和兜底合并成一个出口，跑完分不清走的是哪条' }
+    return { level: 'warning', message: 'default 是「其他」默认出口的保留标识：此分支将与默认出口合并，运行后无法区分实际走了哪一条' }
   }
   return null
 }
 
 /** 新写的标识能不能落进画布。空、default、和别的分支重名都不行 */
 function keyRefusal(value: any[], i: number, key: string): string | null {
-  if (!key) return '标识不能为空：连不出边，也走不到它'
-  if (key === 'default') return 'default 是「其他」兜底出口的保留名，不能拿来当分支标识'
+  if (!key) return '标识不能为空：未填写标识的分支无法连线，也不会被执行'
+  if (key === 'default') return 'default 是「其他」默认出口的保留标识，不能用作分支标识'
   const other = value.findIndex((c, j) => j !== i && String(c?.key ?? '').trim() === key)
-  if (other >= 0) return `和第 ${other + 1} 个分支的标识重复：路由只认标识，这一个永远轮不到`
+  if (other >= 0) return `与第 ${other + 1} 个分支的标识重复：分支按标识路由，此分支不会被执行`
   return null
 }
 
@@ -1247,7 +1247,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
     setDraft(null)
     if (key === String(value[i]?.key ?? '').trim()) return
     const why = keyRefusal(value, i, key)
-    if (why) setRefused({ i, text: `没有改成「${key || '空'}」：${why}` })
+    if (why) setRefused({ i, text: `未能修改为「${key || '空'}」：${why}` })
     else update(i, { key })
   }
   return (
@@ -1260,7 +1260,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
         const keyIssue = editing || note ? null : caseKeyIssue(value, i)
         // 标识的问题前端即时判（上面这套和后端同口径），后端那几条就不重复列了
         const own = issues.filter((x) => x.at?.index === i && x.at?.sub !== 'key'
-          && !/标识/.test(x.message))
+          && !isCaseKeyIssue(x.message))
         const keyBad = !!live || !!note || keyIssue?.level === 'error'
         const tone = keyBad || own.some((x) => x.level === 'error') ? 'error'
           : keyIssue || own.length ? 'warning' : undefined
@@ -1287,7 +1287,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
                          }
                        }} />
               </Sub>
-              <Sub label={byModel ? '类别说明（给模型看）' : '说明'} htmlFor={`${uid}-${i}-label`} className="min-w-0 flex-1" sub="label">
+              <Sub label={byModel ? '类别说明（供模型参考）' : '说明'} htmlFor={`${uid}-${i}-label`} className="min-w-0 flex-1" sub="label">
                 <input id={`${uid}-${i}-label`} className="field" value={c.label ?? ''}
                        onChange={(e) => update(i, { label: e.target.value })} />
               </Sub>
@@ -1299,7 +1299,7 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
                 {String(c.key ?? '').trim() === 'default' && (
                   <button type="button" className="btn btn-xs shrink-0"
                           onClick={() => update(i, { key: freeKey() })}>
-                    改成 {freeKey()}
+                    改为 {freeKey()}
                   </button>
                 )}
               </div>
@@ -1321,8 +1321,8 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
         <Plus size={11} /> 添加分支
       </button>
       <div className="mt-1.5 text-2xs leading-snug text-faint">
-        {byModel ? '模型按「类别说明」分类；' : '从上往下判断，第一个成立的条件胜出；'}
-        都不满足时走「其他」出口，记得给它连一条。标识改完按回车或点别处才生效
+        {byModel ? '模型按「类别说明」分类；' : '按从上到下的顺序判断，采用第一个成立的条件；'}
+        均不满足时走「其他」出口，请为该出口连线。修改标识后，按回车或点击其他位置生效
       </div>
     </div>
   )
@@ -1343,7 +1343,7 @@ function MetricList({ nodeId, value, issues, onChange }: {
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
                onRemove={() => onChange(value.filter((_, idx) => idx !== i))}>
             <div className="flex gap-1.5">
-              <Sub label="指标 id（英文）" htmlFor={`${uid}-${i}-id`} className="min-w-0 flex-1" sub="id">
+              <Sub label="指标 ID（英文）" htmlFor={`${uid}-${i}-id`} className="min-w-0 flex-1" sub="id">
                 <input id={`${uid}-${i}-id`} className="field mono text-xs" value={m.id ?? ''}
                        onChange={(e) => update(i, { id: e.target.value })} />
               </Sub>
@@ -1370,8 +1370,8 @@ function MetricList({ nodeId, value, issues, onChange }: {
         <Plus size={11} /> 添加指标
       </button>
       <div className="mt-1.5 text-2xs leading-snug text-faint">
-        所有算术都发生在这里（确定性、可复算）。叙述节点只许引用这份清单里的数，
-        出具时会逐个数字回指校验。
+        指标按表达式确定性计算，结果可复算。报告撰写节点引用本清单中的指标，
+        出具时会逐一校验报告中数字的来源。
       </div>
     </div>
   )
@@ -1404,7 +1404,7 @@ function AgentList({ value, issues, config, onChange }: {
                 <input id={`${uid}-${i}-name`} className="field mono text-xs" placeholder="researcher"
                        value={agent.name ?? ''} onChange={(e) => update(i, { name: e.target.value })} />
               </Sub>
-              <Sub label="最多几步" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0" sub="max_steps">
+              <Sub label="最大步数" htmlFor={`${uid}-${i}-steps`} className="w-20 shrink-0" sub="max_steps">
                 <input id={`${uid}-${i}-steps`} className="field tnum" type="number" min={1} max={30} placeholder="4"
                        value={agent.max_steps ?? ''}
                        onChange={(e) => update(i, { max_steps: e.target.value === '' ? undefined : Number(e.target.value) })} />
@@ -1416,7 +1416,7 @@ function AgentList({ value, issues, config, onChange }: {
             </Sub>
             {/* 成员的 system 后端直接取值、不过模板渲染：这里不挂补全，免得教人写 {{ }} */}
             <div data-sub="system">
-              <Sub label="角色设定（system，原样发给模型）" htmlFor={`${uid}-${i}-sys`}>
+              <Sub label="系统提示（原样发送给模型）" htmlFor={`${uid}-${i}-sys`}>
                 <textarea id={`${uid}-${i}-sys`} className="field" rows={2}
                           value={agent.system ?? ''} onChange={(e) => update(i, { system: e.target.value })} />
               </Sub>

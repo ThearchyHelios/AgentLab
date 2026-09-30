@@ -166,7 +166,7 @@ def test_a_missing_schema_is_not_invented():
     graph = feeding_agent()
     fid = "governed.caliber_agent_schema:ask"
     fix = plan(graph)[fid]
-    assert fix["kind"] == "assist" and "output_schema" in fix["label"]
+    assert fix["kind"] == "assist" and "「结构化输出 Schema」" in fix["label"]
     out = apply_fixes(graph, [fid], level="governed")
     assert out["applied"] == [] and out["rejected"][0]["fix_id"] == fid
     assert "output_schema" not in config(out["graph"], "ask") and out["graph"] == graph
@@ -225,7 +225,7 @@ def test_copilot_may_not_mark_a_code_node_as_source_on_its_own():
     after = copy.deepcopy(before)
     config(after, "calc")["evidence_role"] = "source"
     [reason] = forbidden_changes(before, after)
-    assert "「计算」" in reason and "source" in reason
+    assert "「计算」" in reason and "「取数」" in reason
     # 新加的沙箱代码直接标成取数也一样
     after = copy.deepcopy(before)
     after["nodes"].append(node("raw", "code", "取原始数据", code="print(2)", evidence_role="source"))
@@ -378,8 +378,10 @@ def test_loosening_the_report_policy_is_refused(key, before, after):
         config(new, "write").pop(key)
     else:
         config(new, "write")[key] = after
+    from app.engine.labels import field_label
+
     [reason] = forbidden_changes(old, new)
-    assert "「报告撰写」" in reason and key in reason
+    assert "「报告撰写」" in reason and f"「{field_label(key)}」" in reason
 
 
 def test_turning_cite_fields_off_is_refused():
@@ -387,7 +389,7 @@ def test_turning_cite_fields_off_is_refused():
     new = copy.deepcopy(old)
     config(new, "ask")["cite_fields"] = False
     [reason] = forbidden_changes(old, new)
-    assert "「查数员」" in reason and "cite_fields" in reason
+    assert "「查数员」" in reason and "「按出处核对字段」" in reason
 
 
 def test_tightening_is_not_refused():
@@ -479,9 +481,9 @@ async def test_choosing_copilot_in_the_choice_runs_the_assist(client, monkeypatc
 
 
 @pytest.mark.parametrize("ops, word", [
-    ([{"op": "update_node", "id": "calc", "config": {"evidence_role": "source"}}], "evidence_role"),
+    ([{"op": "update_node", "id": "calc", "config": {"evidence_role": "source"}}], "「证据角色」"),
     ([{"op": "update_node", "id": "write", "config": {"numbers": "off"}},
-      {"op": "update_node", "id": "calc", "config": {"evidence_role": "source"}}], "numbers"),
+      {"op": "update_node", "id": "calc", "config": {"evidence_role": "source"}}], "「未引用的数字」"),
 ])
 async def test_copilot_cannot_decide_for_the_author_or_loosen_the_report(client, monkeypatch, ops, word):
     script(monkeypatch, ops)

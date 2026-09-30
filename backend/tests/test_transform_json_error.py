@@ -24,7 +24,7 @@ from app.engine.schema import GraphSpec, validate_graph
 
 #: 「他说"好的"」：字符串里的英文引号没转义，json.loads 在「好」那里要逗号
 BAD = '{"summary": "他说"好的"然后走了", "count": 3}'
-TEMPLATE_HINT = "检查模板里的引号、逗号，字符串值要用 | json 过滤器输出"
+TEMPLATE_HINT = "请检查模板中的引号和逗号，字符串值需使用 | json 过滤器输出"
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +91,7 @@ async def test_unescaped_quotes_in_model_text_blame_the_upstream(monkeypatch, te
 
     assert error.startswith("上游「查询日志」输出的不是合法 JSON"), error
     assert "第 17 列附近" in error, error              # 在上游那段文字里的位置，不是在整段模板里的
-    assert "没转义的英文引号" in error and "output_schema + cite_fields" in error
+    assert "未转义的英文引号" in error and "「按出处核对字段」" in error
     assert TEMPLATE_HINT not in error and "| json" not in error
     # 原文只进技术细节：首行不带模型写的内容
     assert "他说" not in error
@@ -179,14 +179,14 @@ async def test_a_missing_comma_next_to_valid_model_json_keeps_the_template_hint(
 async def test_a_json_filtered_value_wrapped_in_quotes_says_to_drop_the_quotes(monkeypatch):
     script(monkeypatch, "好的")
     error = template_error(await failure(weekly('{"summary": "{{ nodes.query_logs.text | json }}"}')))
-    assert "{{ nodes.query_logs.text | json }} 出来的已经是合法的 JSON（文字自带引号）" in error, error
+    assert "{{ nodes.query_logs.text | json }} 的结果已是合法的 JSON（文字自带引号）" in error, error
     assert error.endswith("外面不要再加引号"), error
 
 
 async def test_an_empty_value_in_a_value_slot_names_the_span(monkeypatch):
     script(monkeypatch, "好的")
     error = template_error(await failure(weekly('{"summary": {{ input.missing }} , "n": 1}')))
-    assert "{{ input.missing }} 取出来是空的" in error, error
+    assert "{{ input.missing }} 的取值为空" in error, error
 
 
 async def test_plain_text_that_is_not_from_a_model_also_gets_the_json_filter_hint(monkeypatch):
@@ -196,7 +196,7 @@ async def test_plain_text_that_is_not_from_a_model_also_gets_the_json_filter_hin
 
 
 @pytest.mark.parametrize("text, reason", [
-    ('{"week": "2026-W37", "rows": [1, 2', "没有收尾"),
+    ('{"week": "2026-W37", "rows": [1, 2', "不完整"),
     ('```json\n{"gmv": 1}\n```', "代码块"),
     ("好的，本周销售额是 5 万", "一段文字"),
 ])
@@ -205,7 +205,7 @@ async def test_model_text_parsed_as_a_whole_says_what_is_wrong_with_it(monkeypat
     script(monkeypatch, text)
     error = (await failure(weekly("{{ nodes.query_logs.text }}"))).data["error"]
     assert error.startswith("上游「查询日志」输出的不是合法 JSON"), error
-    assert reason in error and "没转义的英文引号" not in error and "output_schema" in error, error
+    assert reason in error and "未转义的英文引号" not in error and "「结构化输出 Schema」" in error, error
 
 
 # --------------------------------------------------------------------------
@@ -215,7 +215,7 @@ async def test_model_text_parsed_as_a_whole_says_what_is_wrong_with_it(monkeypat
 
 def warnings_of(graph, node_id="parse"):
     return [i for i in validate_graph(GraphSpec.model_validate(graph)).issues
-            if i.node_id == node_id and "cite_fields" in i.message]
+            if i.node_id == node_id and "按出处核对字段" in i.message]
 
 
 CARD = node("card", "metrics", "口径卡", caliber="周报口径", metrics=[{"id": "gmv", "expression": "vars.q.gmv"}])
@@ -236,7 +236,7 @@ def agent_graph(template, *, parse_mode="json", after=(CARD,), **agent):
 def test_validate_warns_when_a_transform_parses_agent_text_into_a_caliber():
     [issue] = warnings_of(agent_graph("{{ nodes.query_logs.text }}"))
     assert issue.level == "warning" and issue.field == "template"
-    assert "「查询日志」" in issue.message and "output_schema" in issue.message
+    assert "「查询日志」" in issue.message and "「结构化输出 Schema」" in issue.message
     # 按 JSON 解析的，不经过口径卡也要说
     assert warnings_of(agent_graph("{{ vars.answer }}", after=()))
     # 表达式模式读文字、流向口径卡
@@ -266,6 +266,6 @@ def test_validate_points_quoted_model_text_at_the_json_filter():
                if i.node_id == "parse" and "| json" in i.message]
     assert issue.level == "warning" and issue.field == "template"
     assert "{{ nodes.query_logs.text | json }}" in issue.message and "外面不要再加引号" in issue.message
-    assert "cite_fields" not in issue.message and "「查询日志」" in issue.message
+    assert "按出处核对字段" not in issue.message and "「查询日志」" in issue.message
     # 值的位置、整段解析：仍然指向结构化输出
     assert warnings_of(agent_graph('{"summary": {{ nodes.query_logs.text }}}', after=()))

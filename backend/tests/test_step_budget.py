@@ -116,7 +116,7 @@ async def test_an_unguarded_cycle_still_stops_and_says_why(engine_up, monkeypatc
                   edge("br", "out", "default")],
     })
     assert row.status == "failed"
-    assert "走满了 12 步" in row.error and "loop 节点" in row.error, row.error
+    assert "已执行 12 步" in row.error and "「循环」节点" in row.error, row.error
     assert "recursion_limit" not in row.error
 
 
@@ -160,5 +160,5 @@ async def test_an_unguarded_cycle_inside_a_subgraph_says_which_one(engine_up, mo
     }
     row = await _finish(await _parent_of(spinning, "空转的子图"))
     assert row.status == "failed"
-    assert "子图「空转的子图」走满了 12 步" in row.error, row.error
+    assert "子工作流「空转的子图」已执行 12 步" in row.error, row.error
     assert "recursion_limit" not in row.error

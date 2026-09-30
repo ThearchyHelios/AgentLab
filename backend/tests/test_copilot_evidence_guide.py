@@ -101,7 +101,8 @@ def test_sql_columns_missing_from_the_schema_are_sent_back():
     [issue] = authored_issues(spec, [shop])
     assert issue["level"] == "error" and issue["code"] == "sql_unknown_column"
     assert issue["node_id"] == "fetch" and issue["field"] == "args.sql"
-    assert "amt、wk" in issue["message"] and "amount" in issue["message"] and "db_schema__shop" in issue["message"]
+    assert "amt、wk" in issue["message"] and "amount" in issue["message"] and "db_schema__shop" in issue["for_model"]
+    assert "db_schema__" not in issue["message"] and "别凭空猜" not in issue["message"], "给模型的指令不上界面"
 
     good = _node("fetch", "tool", tool="db_query__shop",
                  args={"sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS n FROM orders WHERE week = '{{ input.week }}' "
@@ -135,7 +136,7 @@ def test_parsing_agent_text_is_sent_back():
     )
     [issue] = authored_issues(spec, [])
     assert issue["code"] == "parse_model_text" and issue["level"] == "error" and issue["node_id"] == "parse"
-    assert "cite_fields" in issue["message"] and "不要用整形节点解析 agent / llm 的文字" in issue["message"]
+    assert "按出处核对字段" in issue["message"] and "不要用整形节点解析 agent / llm 的文字" in issue["for_model"]
 
 
 # --------------------------------------------------------------------------
@@ -239,6 +240,7 @@ def test_model_text_inside_template_quotes_is_sent_back_with_the_json_filter_fix
     assert issue["code"] == "parse_model_text" and issue["level"] == "error"
     assert "{{ nodes.query_logs.text | json }}" in issue["message"]
     assert "cite_fields" not in issue["message"] and "不要用整形节点解析" not in issue["message"]
+    assert "不要用整形节点解析" not in issue.get("for_model", "")
 
 
 #: 都是能跑的 SQL：关键字、运算符、排序规则名、窗口名、表达式后面不写 AS 的别名，都不是列

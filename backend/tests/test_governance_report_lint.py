@@ -126,7 +126,7 @@ async def test_a_governed_contract_without_report_from_is_refused(client):
     graph = traceable(report_from=None, narrative="{{ nodes.write.text }}")
     [issue] = by_code(graph, "governed.report_from_required")
     assert issue.level == "error" and issue.node_id == "done" and issue.field == "contract.report_from"
-    assert "report_from" in issue.message and "narrative" in issue.message
+    assert "「报告来自」" in issue.message and "「叙述」" in issue.message
     body = await publish(client, graph)
     assert body["ok"] is False
     assert "governed.report_from_required" in {i["code"] for i in body["issues"] if i["level"] == "error"}
@@ -258,7 +258,8 @@ def test_a_report_node_must_spell_out_the_strict_settings():
     graph = traceable(report={})
     [issue] = by_code(graph, "governed.report_policy")
     assert issue.level == "error" and issue.node_id == "write" and issue.field == "numbers"
-    for piece in ("numbers: strict", "on_violation: fail", "claims: require_citation"):
+    for piece in ("「未引用的数字」设为「计为违规，要求重写」", "「重写后仍有违规时」设为「判为失败」",
+                  "「未附依据的结论句」设为「计入缺口」"):
         assert piece in issue.message
     assert [i.level for i in by_code(graph, "governed.report_policy", "published")] == ["warning"]
 
@@ -267,9 +268,11 @@ def test_a_report_node_must_spell_out_the_strict_settings():
 def test_a_looser_setting_is_named(key, value):
     graph = traceable(report={**STRICT, key: value})
     [issue] = by_code(graph, "governed.report_policy")
-    assert issue.field == key and f"现在是 {value}" in issue.message
+    from app.engine.labels import field_label, option_label
+
+    assert issue.field == key and f"当前为「{option_label(key, value)}」" in issue.message
     for other in set(STRICT) - {key}:
-        assert f"{other}:" not in issue.message
+        assert f"「{field_label(other)}」" not in issue.message
 
 
 def test_graph_defaults_count_like_they_do_at_run_time():
@@ -284,7 +287,7 @@ def test_an_unsupported_claims_value_is_left_to_validate():
     graph = traceable(report={**STRICT, "claims": "sometimes"})
     assert by_code(graph, "governed.report_policy") == []
     [bad] = [i for i in validate_graph(GraphSpec.model_validate(graph)).issues if i.code == "report.claims_invalid"]
-    assert bad.level == "error" and "off / require_citation" in bad.message
+    assert bad.level == "error" and "「不参与出具判档」、「计入缺口」" in bad.message
 
 
 # --------------------------------------------------------------------------
@@ -301,7 +304,7 @@ def test_compute_code_feeding_a_caliber_card_is_refused(role):
     config(graph, "card")["metrics"].append({"id": "ratio", "expression": "vars.calc.ratio"})
     [issue] = by_code(graph, "governed.caliber_compute_input")
     assert issue.level == "error" and issue.node_id == "calc" and issue.field == "evidence_role"
-    assert "「周报口径卡」" in issue.message and "source" in issue.message
+    assert "「周报口径卡」" in issue.message and "「取数」" in issue.message
     assert [i.level for i in by_code(graph, "governed.caliber_compute_input", "published")] == ["warning"]
     config(graph, "calc")["evidence_role"] = "source"
     assert by_code(graph, "governed.caliber_compute_input") == []
@@ -466,7 +469,7 @@ def test_judge_is_supported_now():
 @pytest.mark.parametrize("value", ["strict", "Require_Citation", 1, ["off"], {"policy": "judge"}])
 def test_other_claims_values_are_errors(value):
     [issue] = claims_issues(value)
-    assert issue.level == "error" and "off / require_citation" in issue.message and repr(value) in issue.message
+    assert issue.level == "error" and "「不参与出具判档」、「计入缺口」" in issue.message and f"「{value}」" in issue.message
 
 
 def test_claims_from_graph_defaults_are_checked_too():
