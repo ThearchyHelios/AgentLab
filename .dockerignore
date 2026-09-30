@@ -1,0 +1,42 @@
+# 构建上下文里只该有源码。这个文件的头等任务：绝不能把 .env（密钥）和 data/（开发库）打进镜像。
+# Dockerfile 也只按需 COPY 具体目录，两道都守着。
+
+# 密钥与运行期数据
+.env
+.env.*
+**/.env
+**/.env.*
+data/
+**/data/*.db
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite3
+**/.secret_key
+
+# 版本库、依赖、构建产物、缓存
+.git
+.gitignore
+**/node_modules
+frontend/dist
+**/__pycache__
+**/*.py[cod]
+backend/.venv
+**/.venv
+**/.pytest_cache
+**/.ruff_cache
+**/*.tsbuildinfo
+**/.vite
+**/.vite-*
+
+# 打包产物和不进镜像的东西
+release/
+docs/
+scripts/
+deploy/
+backend/tests/
+.claude/
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/

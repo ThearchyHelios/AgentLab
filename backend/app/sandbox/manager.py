@@ -127,7 +127,12 @@ class SandboxManager:
             if warm is not None and not warm():
                 self._resolved_from = f"{name} 可用但镜像未缓存，自动选择时暂不使用"
                 continue
-            self._resolved_from = f"自动选择 {name}（{_why(name)}）"
+            why = _why(name)
+            if name == "local" and BubblewrapSandbox.probe_failure():
+                # 装了 bwrap 却建不起隔离环境（容器默认权限下就是这样）要说清楚，
+                # 不然看着装了 bwrap 却退到本地子进程，没人知道为什么
+                why = "已安装 bwrap，但无法创建隔离环境，已降级为本地子进程"
+            self._resolved_from = f"自动选择 {name}（{why}）"
             return impl()
 
         self._resolved_from = "没有可用的隔离方式，已降级为本地子进程"

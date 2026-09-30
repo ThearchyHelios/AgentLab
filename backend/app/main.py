@@ -120,3 +120,11 @@ async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "agentlab"}
+
+
+# 生产部署：前端构建产物由服务端一并托管（见 app/web.py）。页面回退是通配路由，
+# 必须在所有 /api 路由之后注册。没设 AGENTLAB_WEB_DIST 时什么都不挂，开发模式照旧
+if settings.web_dist is not None:
+    from app.web import mount_web
+
+    mount_web(app, settings.web_dist)

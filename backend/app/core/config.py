@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # --- 存储 ---
     data_dir: Path = PROJECT_DIR / "data"
 
+    # --- 前端构建产物（生产部署用）---
+    # 设了就由服务端一并托管页面（见 app/web.py），页面和接口同源、只起一个进程。
+    # 不设（开发模式）什么都不变：页面由 Vite 开发服务器提供。相对路径按仓库根目录算
+    web_dist: Path | None = None
+
     # --- 密钥加密 ---
     # 用于加密落库的 provider api key。留空则自动生成并存到 data_dir/.secret_key。
     secret_key: str = ""
@@ -111,6 +116,21 @@ class Settings(BaseSettings):
                 return json.loads(text)
             return [part.strip() for part in text.split(",") if part.strip()]
         return value
+
+    @field_validator("web_dist", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        # AGENTLAB_WEB_DIST= 写成空值等于没设，别变成 Path("") 也就是当前目录
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("web_dist")
+    @classmethod
+    def _relative_to_project(cls, value: Path | None) -> Path | None:
+        if value is None or value.is_absolute():
+            return value
+        return PROJECT_DIR / value
 
     @field_validator("http_tool_fake_ip_ranges")
     @classmethod
