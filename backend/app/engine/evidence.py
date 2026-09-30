@@ -1639,8 +1639,76 @@ def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True
     return resolve_marker(_parse_ref(ref), catalog, cells_allowed=cells_allowed, loader=loader)
 
 
+#: 数字标记后面重复写的单位：最多隔几个空格、单位最长几个字。流式渲染放出一个数字标记之前，
+#: 要等到它后面至少有 UNIT_LOOKAHEAD 个字（或者一个换行）才能判断，多出来的 1 是单位后面那个字
+_UNIT_GAP = 2
+_UNIT_MAX = 10
+UNIT_LOOKAHEAD = _UNIT_GAP + _UNIT_MAX + 1
+_UNIT_KINDS = frozenset({"m", "i", "v"})
+#: 渲染结果末尾的单位：最后一个数字后面的字（12,345人次 → 人次，4.57万元 → 万元，12.5% → %）
+_UNIT_TAIL = re.compile(r"\d([^\d\s][^\d]*)$")
+_BLANK = " \t\u3000"
+_SEE_RUN = re.compile(r"\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\]"
+                      r"(?:[" + _BLANK + r"]*\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\])*")
+
+
+def _rendered_unit(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
+                   cells_allowed: bool) -> str:
+    cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
+    if cite["status"] != "resolved" or not is_number(cite.get("value")):
+        return ""
+    tail = _UNIT_TAIL.search(str(cite.get("rendered") or ""))
+    return tail.group(1) if tail and len(tail.group(1)) <= _UNIT_MAX else ""
+
+
+def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
+    """渲染前收拾两处排版，数和引用都不动：
+
+    - 数字标记后面重复写的单位去掉。[[m:visits]] 渲染出来已经带单位（12,345人次），写作者常常
+      还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
+      不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
+    - [[see:…]] 前面的空白去掉。see 渲染成空，「最高月份 [[see:Q2]]。」会剩下「最高月份 。」。
+      see 后面紧跟着字、要靠这个空白隔开的（「A [[see:Q1]]B」）留着；行首的缩进不动。
+
+    prev 是这段文字前面那个字（流式渲染分块时用），判断空白是不是在行首。
+    """
+    cuts: list[tuple[int, int]] = []
+    for marker in parse_markers(text):
+        if marker["kind"] not in _UNIT_KINDS:
+            continue
+        unit = _rendered_unit(marker, catalog, snaps, cells_allowed)
+        if not unit:
+            continue
+        hit = re.compile(f"[{_BLANK}]{{0,{_UNIT_GAP}}}" + re.escape(unit)).match(text, marker["end"])
+        if hit:
+            after = text[hit.end():hit.end() + 1]
+            if len(unit) > 1 or not after.isalnum():
+                cuts.append((marker["end"], hit.end()))
+    for run in _SEE_RUN.finditer(text):
+        start = run.start()
+        while start > 0 and text[start - 1] in _BLANK:
+            start -= 1
+        before = text[start - 1] if start > 0 else prev
+        after = text[run.end():run.end() + 1]
+        # 几个 see 之间的空白也一样渲染成多余的空格
+        parts = list(MARKER_RE.finditer(text, run.start(), run.end()))
+        cuts.extend((m.end(), n.start()) for m, n in zip(parts, parts[1:]) if m.end() < n.start())
+        if start < run.start() and before not in ("", "\n") and not (after.isalnum() or after == "["):
+            cuts.append((start, run.start()))
+    if not cuts:
+        return text
+    out, last = [], 0
+    for a, b in sorted(cuts):
+        if a < last:
+            continue
+        out.append(text[last:a])
+        last = b
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
-    text = _expand_tables(text, catalog, snaps, cells_allowed, prev)
+    text = _tidy(_expand_tables(text, catalog, snaps, cells_allowed, prev), catalog, snaps, cells_allowed, prev)
     out: list[str] = []
     last = 0
     for marker in parse_markers(text):
@@ -1662,7 +1730,11 @@ def render_markers(text: str, catalog: dict[str, Any], *, cells_allowed: bool = 
 # 流式渲染：让 llm.token 里出现的就是最终的数字
 # --------------------------------------------------------------------------
 
-def _safe_cut(text: str) -> int:
+#: 文字末尾的空白和 [[see:…]]：流式渲染先攒着，等后面的字来了再一起交给 _tidy
+_TRAILING_SEE = re.compile(r"(?:[" + _BLANK + r"]|\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\])+$")
+
+
+def _safe_cut(text: str, has_unit: Callable[[dict[str, Any]], bool] | None = None) -> int:
     """能放出去的前缀有多长：最后一个还可能长成标记的 [[ 之前都能放。
 
     一个标记最长 MARKER_MAX 个字，所以没闭合的时候最多攒 MARKER_MAX - 1 = _HOLD_LIMIT 个字；
@@ -1670,6 +1742,9 @@ def _safe_cut(text: str) -> int:
     开头可能是另一个 [。
 
     整表标记闭合了也先不放：它展开时要看紧跟在后面的那个字（是不是换行），那个字还没到。
+    _tidy 要往后看的也先不放：末尾的空白和 [[see:…]]（后面来的字决定空白去不去掉），
+    以及后面还没攒够 UNIT_LOOKAHEAD 个字的数字标记（后面可能是重复的单位）。has_unit 判断一个
+    标记渲染出来带不带单位，不带的（运行输入里的周次、没有单位的格）不用攒；不给就都攒。
     """
     cut = len(text)
     start = text.rfind("[[")
@@ -1679,12 +1754,23 @@ def _safe_cut(text: str) -> int:
             cut = start
     if cut == len(text) and text.endswith("["):
         cut = len(text) - 1
-    while (start := text.rfind("[[", 0, cut)) != -1:
-        m = MARKER_RE.match(text, start)
-        if not (m and m.end() == cut and m.group("kind") == "table"):
-            break
-        cut = start
-    return cut
+    while True:
+        held = cut
+        start = text.rfind("[[", 0, held)
+        m = MARKER_RE.match(text, start) if start != -1 else None
+        if m and m.end() == held and m.group("kind") == "table":
+            held = start
+        if (trail := _TRAILING_SEE.search(text, 0, held)) and trail.start() < held:
+            held = trail.start()
+        numeric = [m for m in MARKER_RE.finditer(text, 0, held) if m.group("kind") in _UNIT_KINDS
+                   and (has_unit is None or has_unit(parse_markers(m.group(0))[0]))]
+        if numeric and len(text[numeric[-1].end():held]) < UNIT_LOOKAHEAD \
+                and "\n" not in text[numeric[-1].end():held]:
+            held = numeric[-1].start()
+        if held == cut:
+            return cut
+        cut = held
+
 
 
 class StreamRenderer:
@@ -1709,6 +1795,9 @@ class StreamRenderer:
         self.pending = ""
         self.prev = ""
 
+    def _has_unit(self, marker: dict[str, Any]) -> bool:
+        return bool(_rendered_unit(marker, self.catalog, self.snaps, self.cells_allowed))
+
     def _release(self, ready: str) -> str:
         if not ready:
             return ""
@@ -1718,7 +1807,7 @@ class StreamRenderer:
 
     def feed(self, delta: str) -> str:
         self.pending += delta or ""
-        cut = _safe_cut(self.pending)
+        cut = _safe_cut(self.pending, self._has_unit)
         ready, self.pending = self.pending[:cut], self.pending[cut:]
         return self._release(ready)
 
@@ -2070,10 +2159,19 @@ def _context(text: str, start: int, end: int) -> str:
 
 #: 粗体：**…** 或 __…__，里面可以有标记（标记里的下划线不算收尾，[[m:refund_rate]] 很常见）
 _BOLD = re.compile(r"(\*\*|__)(?P<inner>(?:\[\[" + _MARKER_GUARD + r"[^\[\]\n]*?\]\]|(?!\1)[^\n])+?)\1")
+#: 方向词、因果词：没有数字也没有引用的句子，含这些词才算结论。「同比」「环比」不在里面：它们只说明
+#: 跟谁比，本身不是涨跌；真正的比较结论还会带「增长」「下降」或者数字
 _DIRECTIONAL = re.compile(
     r"增长|增加|上升|提升|提高|上涨|下降|下滑|减少|降低|回落|下跌|反弹|超过|高于|低于|领先|落后|最高|最低"
-    r"|最多|最少|来自|导致|因为|由于|带动|拉动|拖累|驱动|原因|归因|贡献|占比|环比|同比|翻倍|持平|波动"
+    r"|最多|最少|来自|导致|因为|由于|带动|拉动|拖累|驱动|原因|归因|贡献|占比|翻倍|持平|波动"
     r"|(?<![A-Za-z])(?:increase|decrease|grow|growth|decline|drop|rise|due to|because|driven)(?![A-Za-z])",
+    re.I)
+#: 定义句：「同比是将本期与上年同月对比」「增长率是指……」。解释一个概念怎么算，不是对数据下结论
+_DEFINITION = re.compile(r"是将|是指|指的是|定义为|的定义是|含义是|计算方[式法][为是]|计算公式[为是]")
+#: 定义句里出现这些词就不按定义算：「增长主要是将促销提前带来的」说的是原因
+_CAUSAL = re.compile(
+    r"导致|因为|由于|带动|拉动|拖累|驱动|原因|归因|贡献|带来|所致|造成|引起|使得"
+    r"|(?<![A-Za-z])(?:due to|because|driven)(?![A-Za-z])",
     re.I)
 
 
@@ -2211,12 +2309,16 @@ def _classify(kind: str | None, segments: list[dict[str, Any]], see: list[dict[s
     因果词的算结论；其余的是连接性的话。
 
     自动链接的名字按文字算：它只是把正文重新切了一刀，句子算不算结论和开没开实体层无关。
+
+    没有数字、没有引用的定义句（「环比是将本期与上月对比，反映短期波动」）也算连接性的话：
+    它在解释概念，方向词只是定义的一部分。带因果词的不算定义句，照旧是结论。
     """
     if kind:
         return kind
     if see or any(s["kind"] not in ("text", "structural") and not _auto_entity(s) for s in segments):
         return "claim"
-    if any((s["kind"] == "text" or _auto_entity(s)) and _DIRECTIONAL.search(s["text"]) for s in segments):
+    words = "".join(s["text"] for s in segments if s["kind"] == "text" or _auto_entity(s))
+    if _DIRECTIONAL.search(words) and not (_DEFINITION.search(words) and not _CAUSAL.search(words)):
         return "claim"
     return "connective"
 
@@ -2243,7 +2345,8 @@ def compose_doc(
     """
     source = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     snaps = _Snapshots(loader, entities=entities)
-    text, strong = _normalize_strong(_expand_tables(source, catalog, snaps, cells_allowed))
+    text, strong = _normalize_strong(_tidy(_expand_tables(source, catalog, snaps, cells_allowed),
+                                           catalog, snaps, cells_allowed))
     markers = parse_markers(text)
     for marker in markers:
         marker["strong"] = any(a <= marker["start"] and marker["end"] <= b for a, b in strong)
