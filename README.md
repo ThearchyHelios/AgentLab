@@ -16,7 +16,7 @@
 
 ## 目录
 
-- [快速开始](#快速开始) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
+- [快速开始](#快速开始) · [生产部署](#生产部署) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
 - [可点击证据](#可点击证据报告里的每个数都点得开出处) · [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构)
 - [关键设计决策](#关键设计决策) · [运行环境](#运行环境) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
 
@@ -53,6 +53,21 @@ Mock 不会写引用标记：探索运行里报告撰写节点照样跑完，但
 
 内置 9 个模板，从「最小问答」到「可追溯周报」，既可直接运行，
 也是各类节点用法的可执行文档。
+
+---
+
+## 生产部署
+
+**不用 Docker：** `./scripts/prod.sh` 构建前端并由后端一并托管页面，单进程、不热重载，启动于
+http://127.0.0.1:8000 。前端产物不存在或比源码旧时才重新构建，`--build` / `--no-build` 强制构建或跳过。
+`--port`（或 `AGENTLAB_PORT`）改端口；`--host` 监听所有网卡，同样**没有登录**，只在信得过的网络里开。
+数据目录默认为仓库下的 `data/`，`AGENTLAB_DATA_DIR` 可改。只能单进程运行：运行管理器在进程内、数据库是 SQLite。
+
+**Docker 离线包：** `./scripts/package-docker.sh` 构建 Linux 镜像（默认取本机架构，目标机不同时用
+`--platform linux/arm64` 或 `linux/amd64`），连同一键部署脚本、配置模板和部署说明打成
+`release/agentlab-<版本>-linux-<arch>.tar`。拷到只装了 Docker Engine 的离线机器上，解包、按需修改
+`agentlab.env`、运行 `./deploy.sh` 即可，不需要 docker compose。安装、升级、备份、沙箱权限与常见问题见
+[deploy/README.md](deploy/README.md)。容器默认权限下代码沙箱退回本地子进程，隔离边界只有容器本身。
 
 ---
 
@@ -483,8 +498,9 @@ Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型�
 
 设置页「运行环境」列出全部候选及其可用性，并标注当前选中项。安装 microVM 依赖且镜像已缓存时
 auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
-（`apt install bubblewrap`）后使用 `bubblewrap`；均不可用时降级至 `local`——**该路径不含任何
-访问控制**，界面明确标红。可通过 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
+（`apt install bubblewrap`）后使用 `bubblewrap`。装了 `bwrap` 还要能真正创建命名空间才算可用：
+启动后首次选择时实际起一次 `bwrap` 探测，Docker 默认权限、Ubuntu 24.04 的 AppArmor 限制下会失败并跳过，
+「选择原因」写明。均不可用时降级至 `local`——**该路径不含任何访问控制**，界面明确标红。可通过 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
 亦可在代码节点上单独选择隔离档位（strict = microVM，fast = 系统沙箱）。
 
 ### 启用 microVM

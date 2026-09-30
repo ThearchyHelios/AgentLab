@@ -27,3 +27,6 @@ dist/
 
 # 已迁到 conda，不再用 uv
 uv.lock
+
+# 离线打包产物（scripts/package-docker.sh）
+/release/

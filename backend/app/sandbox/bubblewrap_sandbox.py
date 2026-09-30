@@ -5,8 +5,10 @@ import logging
 import os
 import resource
 import shutil
+import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from app.core.config import settings, sanitize_session
@@ -30,6 +32,37 @@ _LANG = {
 _RO_BINDS = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc/alternatives", "/etc/ssl"]
 
 
+def _on_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+@lru_cache(maxsize=4)
+def _probe(bwrap: str) -> str:
+    """真起一次 bwrap，返回失败原因；空串表示能用。
+
+    装了 bwrap 不等于建得了隔离环境：Docker 默认的 seccomp 配置不许非特权进程建
+    user namespace，Ubuntu 24.04 的 AppArmor 默认也限制它。以前 available() 只看
+    二进制在不在，于是容器里 auto 选中 bubblewrap，每次执行都报 "No permissions to
+    create a new namespace"——而本地子进程明明能用。
+
+    探测带上执行时同样要用的命名空间、/proc 和 /dev，任何一样建不起来都算不可用。
+    结果缓存：内核和容器权限在进程生命周期里不会变。
+    """
+    argv = [
+        bwrap, "--unshare-all", "--die-with-parent", "--new-session",
+        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+        "--", shutil.which("true") or "/bin/true",
+    ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return raw(e)
+    if proc.returncode == 0:
+        return ""
+    lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+    return lines[-1] if lines else f"退出码 {proc.returncode}"
+
+
 class BubblewrapSandbox(Sandbox):
     """Linux 上的对等方案：bubblewrap（Flatpak 的沙箱内核）。
 
@@ -46,7 +79,23 @@ class BubblewrapSandbox(Sandbox):
 
     @staticmethod
     def available() -> bool:
-        return sys.platform.startswith("linux") and shutil.which("bwrap") is not None
+        if not _on_linux():
+            return False
+        bwrap = shutil.which("bwrap")
+        return bwrap is not None and not _probe(bwrap)
+
+    @staticmethod
+    def probe_failure() -> str:
+        """装了 bwrap 却建不起隔离环境时的原因；没装或者能用都返回空串。"""
+        bwrap = shutil.which("bwrap") if _on_linux() else None
+        return _probe(bwrap) if bwrap else ""
+
+    @classmethod
+    def unavailable_reason(cls) -> str:
+        failure = cls.probe_failure()
+        if failure:
+            return f"已安装 bwrap，但无法创建隔离环境（容器默认权限或系统策略不允许）：{failure}"
+        return "未找到 bwrap，可执行 apt install bubblewrap 安装"
 
     async def health(self) -> dict[str, object]:
         ok = self.available()
@@ -59,7 +108,7 @@ class BubblewrapSandbox(Sandbox):
             "enforced": {"timeout": True, "cpu": True, "memory": True, "network": True, "fsize": True},
             "root": str(self._root),
             "interpreter": interpreter.describe(),
-            **({} if ok else {"error": "未找到 bwrap，可执行 apt install bubblewrap 安装"}),
+            **({} if ok else {"error": self.unavailable_reason()}),
         }
 
     def _session_dir(self, session_id: str) -> Path:
@@ -119,7 +168,7 @@ class BubblewrapSandbox(Sandbox):
         if language not in _LANG:
             return ExecResult(ok=False, backend=self.name, error=f"不支持的语言：{language}")
         if not self.available():
-            return ExecResult(ok=False, backend=self.name, error="bwrap 不可用")
+            return ExecResult(ok=False, backend=self.name, error=self.unavailable_reason())
 
         ext, cmd_prefix = _LANG[language]
         # python 的命令前缀运行时才定：要挑一个看不见后端依赖的解释器
