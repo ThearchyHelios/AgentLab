@@ -5,15 +5,21 @@
 
 1. 预筛（claim_priority）：只把结论句送去判。挂了依据的排第一，有方向词、因果词的排第二，其余有数字、
    实体这类实质内容的排第三；标题、表格单元格、代码、连接性的话、只有过渡词的、短句不送
-2. 证据摘录（prepare）：句子挂的每件证据摘一段。指标写「名称 = 值」加原式；查询给 SQL 前 300 字和被
-   引用的行（最多 20 行，数据源遮罩的列不给；宽表先给被引用的列，再补满 12 列）；知识库片段最多 600 字。
-   规则里写明数字已经由系统核对过
+2. 证据摘录（prepare）：句子挂的每件证据摘一段。指标写「名称 = 值」加原式，再附上输入取自哪次查询、
+   哪一格和那次查询的 SQL；查询给 SQL 前 300 字和被引用的行（最多 20 行，数据源遮罩的列不给；宽表先给
+   被引用的列，再补满 12 列）；表附上字段清单和类型（最多 60 个，遮罩的列不列，快照不完整要注明），
+   字段附上类型和所属的表，两样都附上出现过的查询 SQL；知识库片段最多 600 字。快照一律经 loader 取
+   （按需裁判传只认封存工件的那个）。规则里写明数字已经由系统核对过
 3. 调用（judge_doc）：一份报告合并成一次调用，超过每批的句数就分批；结构化输出失败退回 JSON 解析，
    再失败就记未裁判。thinking 关掉，max_tokens 4096
 4. 预算：每份报告的句数、金额、时长和全局每日金额，每一项都能是 None（不限）。调用前按目录价估算，
    超了按优先级截断；触顶就停，已判的保留，没判的记未裁判并说明是哪个上限——不报错
 5. 每日计数落在设置表（SPEND_KEY），按本地日期滚动。目录里没有价格的模型估不出金额，金额上限对它
    不起作用，照实说「按令牌估不出金额」
+
+判定五选一：supported、partial、contradicted（证据和句子冲突）、insufficient（证据里没有判断所需的
+信息，missing 写缺什么）、not_a_claim。旧数据里的 unsupported（当时没分矛盾和不足）原样保留，判档当
+contradicted；新判的不再产出它。
 
 判定只标注、不改写正文。报告节点在正式运行里调它（结果写进文档、随文档封存）；探索运行按需裁判的
 接口也调它（post_seal=True，结果落在封存之后）。所有模型调用都经 get_chat_model，测试换成剧本。
@@ -41,6 +47,7 @@ from app.db.base import SessionLocal
 from app.db.models import Setting
 from app.engine.evidence import (
     _DIRECTIONAL,
+    ENTITY_KINDS,
     MISSING,
     RenderError,
     _auto_entity,
@@ -48,6 +55,9 @@ from app.engine.evidence import (
     _mask_names,
     iter_units,
     render_cell,
+    schema_column,
+    schema_table,
+    table_fields,
 )
 from app.engine.expressions import CellError, column_kind, locate_cell
 from app.engine.nodes.llm import _split_structured, _usage_of
@@ -59,11 +69,27 @@ from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_mod
 # 常量
 # --------------------------------------------------------------------------
 
-#: 模型给的四种判定；unjudged 是系统记的（没判成），不是模型说的
-JUDGED = ("supported", "partial", "unsupported", "not_a_claim")
-VERDICTS = (*JUDGED, "unjudged")
-#: 模型的理由最多几个字
-RATIONALE_MAX = 60
+#: 模型给的五种判定；unjudged 是系统记的（没判成），不是模型说的
+JUDGED = ("supported", "partial", "contradicted", "insufficient", "not_a_claim")
+#: 旧的判定「证据不支持」：当时没分「证据相矛盾」和「证据不足」。已封存的文档、已有的事件里原样保留，
+#: 判档照旧当 contradicted；新判的一律用新取值（模型照旧写了的，按 contradicted 收下）
+UNSUPPORTED = "unsupported"
+#: 读已有的判定时算「判过」的：新的五种加旧的 unsupported
+SETTLED = (*JUDGED, UNSUPPORTED)
+#: 判档按「证据相矛盾」处置的（on_unsupported：降档或不予出具）
+CONTRADICTED = ("contradicted", UNSUPPORTED)
+#: 判定对象里 status 的全部取值
+VERDICTS = (*SETTLED, "unjudged")
+#: 各判定的句数（stats、counts、出具横幅、审计导出都用这组键）。unsupported 保留给旧数据，新判的恒为 0
+COUNT_KEYS = ("supported", "partial", "contradicted", "insufficient", "not_a_claim", "unjudged", UNSUPPORTED)
+#: 模型的理由最多几个字（超长在句子边界截断加「…」）；裁判规则里要求的字数
+RATIONALE_MAX = 120
+RATIONALE_ASK = 80
+#: insufficient 时「缺的是什么」最多几个字
+MISSING_MAX = 30
+#: 判定的规则版本：新判的判定带着它（rule_version），也进 request_key。报告节点的断点里换了规则的旧判定不复用；
+#: 按需裁判遇到早于当前规则的判定（没有版本、版本更小、旧取值 unsupported）重判一次
+RULES_VERSION = 2
 #: 一次调用最多判几句：再多，4096 个输出令牌装不下每句一条判定加理由
 BATCH_SIZE = 40
 MAX_TOKENS = 4096
@@ -73,13 +99,17 @@ SQL_CHARS = 300
 EXCERPT_ROWS = 20
 EXCERPT_COLS = 12
 CHUNK_CHARS = 600
-#: 表名、字段名的摘录里附上它出现过的查询的 SQL，最多几次（「按会员号去重计数」这种句子，证据在 SQL 里）
+#: 表名、字段名的摘录里附上它出现过的查询的 SQL，最多几次（「按会员号去重计数」这种句子，证据在 SQL 里）；
+#: 口径卡指标的输入取自的查询也按这个数给 SQL
 ENTITY_QUERIES = 3
 EXCERPT_HITS = 3
+#: 表的摘录里最多列几个字段（多出来的注明另有几个）；指标的摘录里最多列几个输入
+FIELDS_MAX = 60
+METRIC_INPUTS = 8
 #: 短句：看得见的字（不算标点、空白）少于这么多，又没挂依据、没有方向词的，不送裁判
 SHORT_CHARS = 6
-#: 估算输出令牌：每句一条判定（理由 60 字上下，加上 JSON 的键）
-_OUT_PER_UNIT = 90
+#: 估算输出 token：每句一条判定（理由 80 字上下、缺什么，加上 JSON 的键）
+_OUT_PER_UNIT = 120
 _OUT_BASE = 20
 
 #: 未裁判的原因。前四个是上限，报告里写「已到上限」
@@ -88,17 +118,21 @@ REASONS = (*LIMITS, "error", "format", "missing", "on_demand")
 
 JUDGE_ROLE = "你是报告核查员：逐句判断报告里的话，能不能被它挂的证据支持。你不写报告，也不改报告。"
 
-JUDGE_RULES = """判定（verdict）四选一：
+JUDGE_RULES = f"""判定（verdict）五选一：
 - supported：证据足以支持这句话的说法——方向、比较、范围、因果都对得上
 - partial：一部分说法有证据支持，另一部分（原因、范围、程度）证据里没有
-- unsupported：证据不支持、和证据矛盾，或者这句在陈述数据事实却没有任何证据
+- contradicted：证据和这句话冲突——证据里的方向、比较、范围、排名，或者 SQL 的算法、字段，和句子说的对不上
+- insufficient：证据里没有判断这句话所需的信息（比如摘录里没有 SQL、没有字段清单、没有取数的查询），或者这句在陈述数据事实却没有挂任何证据
 - not_a_claim：这句不陈述数据事实（过渡、背景、建议、计划），不需要证据
 规则：
 1. 数字已经由系统核对过，不要复算：每个数都是系统从证据里取出来、按固定规则渲染的，不要因为数字本身或它的格式质疑这句话；你只判断句子的说法有没有证据支持。
 2. 只看下面给的证据摘录，不用常识、行业经验或外部知识补证据；摘录里没有的就是没有。
-3. rationale 用中文写，不超过 60 个字，说清依据是什么，或者缺了什么。
-4. used 写你实际用到的证据编号（摘录里【】中的那个，比如 m:gmv、Q1），没用到就写空数组。
-5. 每句都要给判定，unit 照抄句子前面方括号里的编号。"""
+3. 只有证据和句子冲突时才判 contradicted；证据里没有相关信息判 insufficient——「没有」不等于「矛盾」。
+4. 摘录注明「表结构快照不完整」时，「某张表、某个字段不存在」这类说法只能判 insufficient。
+5. rationale 用中文写，不超过 {RATIONALE_ASK} 个字，说清依据是什么，或者缺了什么。
+6. 判 insufficient 时 missing 写缺的是什么，越短越好，比如「SQL」「字段清单」「取数的查询」；其余判定 missing 写空字符串。
+7. used 写你实际用到的证据编号（摘录里【】中的那个，比如 m:gmv、Q1），没用到就写空数组。
+8. 每句都要给判定，unit 照抄句子前面方括号里的编号。"""
 
 #: 报告节点 claims 为 judge 时拼在写作规则后面：写作者要知道还有一道按证据的核对
 JUDGE_RULE = ("这份报告的结论句还会由另一个模型逐句核对：它只看你挂的依据，判断这句话站不站得住。"
@@ -114,10 +148,12 @@ JUDGE_SCHEMA: dict[str, Any] = {
         "properties": {
             "unit": {"type": "string", "description": "句子编号，照抄 [u3] 里的 u3"},
             "verdict": {"type": "string", "enum": list(JUDGED)},
-            "rationale": {"type": "string", "description": f"判定的理由，中文，不超过 {RATIONALE_MAX} 个字"},
+            "rationale": {"type": "string", "description": f"判定的理由，中文，不超过 {RATIONALE_ASK} 个字"},
+            "missing": {"type": "string",
+                        "description": "判 insufficient 时写缺的是什么（比如 SQL、字段清单、取数的查询），其余判定写空字符串"},
             "used": {"type": "array", "items": {"type": "string"}, "description": "实际用到的证据编号"},
         },
-        "required": ["unit", "verdict", "rationale", "used"],
+        "required": ["unit", "verdict", "rationale", "missing", "used"],
     }}},
     "required": ["items"],
 }
@@ -324,7 +360,90 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     return "\n".join(lines)
 
 
-def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch) -> str:
+def _sql_line(label: str, sql: str) -> str:
+    return f"{label}：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"
+
+
+def _source_hidden(source: Any, catalog: dict[str, Any], fetch: _Fetch, masked: dict[str, Any] | None) -> set[str]:
+    """一个数据源要遮的列（小写）：数据源现在设的，加上这次运行里它的查询快照当时记下的（数据源改名、删掉了
+    也照遮）。说不清是哪个数据源的，所有遮罩都算上：宁可多遮，不能露。"""
+    name = str(source or "")
+    names: set[str] = set()
+    for key, cols in (masked or {}).items():
+        if not name or str(key) == name:
+            names |= _mask_names(cols)
+    for entry in catalog.values():
+        if not isinstance(entry, dict) or entry.get("kind") != "query":
+            continue
+        snapshot = fetch(entry.get("artifact"))
+        if isinstance(snapshot, dict) and (not name or str(entry.get("source") or snapshot.get("source") or "") == name):
+            names |= _mask_names(snapshot.get("mask_columns"))
+    return names
+
+
+def _query_alias(catalog: dict[str, Any], artifact: Any) -> str | None:
+    """这份查询快照在报告目录里的编号（Q1）：口径卡输入记的是工件，靠它对上。"""
+    return next((a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"
+                 and artifact and e.get("artifact") == artifact), None)
+
+
+def _cell_words(locator: dict[str, Any], hidden: set[str]) -> str:
+    """输入落在哪一格：「r0 行 gmv 列」，数组字段是一段行「r0–r4 行 amount 列」。遮罩的列不写列名。"""
+    rows = locator.get("rows")
+    if isinstance(locator.get("row"), int):
+        where = f"r{locator['row']} 行"
+    elif isinstance(rows, list) and len(rows) == 2 and all(isinstance(r, int) for r in rows):
+        where = f"r{rows[0]}–r{rows[1]} 行"
+    else:
+        where = ""
+    cols = [locator["column"]] if locator.get("column") else list((locator.get("columns") or {}).values())
+    cols = [str(c) for c in cols if c not in (None, "")]
+    shown = [c for c in cols if c.lower() not in hidden]
+    parts = [where] if where else []
+    if shown:
+        parts.append("、".join(shown) + " 列")
+    if len(shown) < len(cols):
+        parts.append("（所在的列按数据源的设置遮罩，不写列名）")
+    return " ".join(parts) or "某一格"
+
+
+def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
+                   masked: dict[str, Any] | None) -> list[str]:
+    """指标的输入取自哪次查询、哪一格，再附上那次查询的 SQL（截到 SQL_CHARS，最多 ENTITY_QUERIES 次）。
+
+    「活跃用户按会员号去重」这种讲口径的句子，证据在取数的 SQL 里；只给原式，裁判只能判证据不足。
+    位置来自封存的口径卡；SQL 经 fetch 取，取不到（不在封存范围里）的不给。没追到查询的输入照实写。
+    """
+    items = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
+    lines: list[str] = []
+    sqls: list[str] = []
+    seen: set[str] = set()
+    for item in items[:METRIC_INPUTS]:
+        path = _clean(str(item.get("path") or item.get("field") or "")) or "（未命名）"
+        artifact = item.get("artifact") if item.get("via") in ("tool_cell", "agent_field") else None
+        if not artifact:
+            origin = f"（来自节点 {item['node_id']}）" if item.get("node_id") else ""
+            lines.append(f"输入 {path}：未追溯到查询{origin}")
+            continue
+        alias = _query_alias(catalog, artifact)
+        snapshot = fetch(artifact)
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        source = (catalog.get(alias) or {}).get("source") if alias else None
+        hidden = _source_hidden(source or snap.get("source"), catalog, fetch, masked) \
+            | _mask_names(snap.get("mask_columns"))
+        label = f"查询 {alias} " if alias else "一次查询（不在这份报告的证据目录中）"
+        lines.append(f"输入 {path}：取自{label}的 {_cell_words(item.get('locator') or {}, hidden)}")
+        sql = _clean(str(snap.get("sql") or ""))
+        if sql and str(artifact) not in seen and len(seen) < ENTITY_QUERIES:
+            seen.add(str(artifact))
+            sqls.append(_sql_line(f"查询 {alias} 的 SQL" if alias else "这次查询的 SQL", sql))
+    if len(items) > METRIC_INPUTS:
+        lines.append(f"…另有 {len(items) - METRIC_INPUTS} 个输入")
+    return lines + sqls
+
+
+def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
+                    masked: dict[str, Any] | None) -> str:
     name = entry.get("name") or (entry.get("locator") or {}).get("metric") or alias
     rendered = entry.get("rendered")
     where = " ".join(v for v in (f"口径「{entry['caliber']}」" if entry.get("caliber") else "",
@@ -334,11 +453,81 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch) -> str:
     lines = [f"【{alias}】口径卡指标：{value}" + (f"（{where}）" if where else "")]
     card = fetch(entry.get("artifact"))
     wanted = (entry.get("locator") or {}).get("metric")
-    for metric in (card.get("metrics") if isinstance(card, dict) else None) or []:
-        if isinstance(metric, dict) and metric.get("id") == wanted and metric.get("expression"):
+    metric = next((m for m in (card.get("metrics") if isinstance(card, dict) else None) or []
+                   if isinstance(m, dict) and m.get("id") == wanted), None)
+    if metric is not None:
+        if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
-            break
+        lines.extend(_metric_inputs(metric, fetch, catalog, masked))
     return "\n".join(lines)
+
+
+def _table_lines(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch,
+                 masked: dict[str, Any] | None) -> list[str]:
+    """表的字段清单和类型：取自封存范围内（经 fetch）的表结构快照，最多 FIELDS_MAX 个，遮罩的列不列。
+
+    讲表结构的句子（「订单表按会员号记录」）只给表名，裁判只能判证据不足。快照不完整（数据源的表太多、
+    只存了一部分）要注明：这时「某字段不存在」这类说法只能判 insufficient。
+    """
+    name = entry.get("name") or (entry.get("locator") or {}).get("table")
+    origins = [o for o in entry.get("sources") or [] if isinstance(o, dict) and o.get("kind") == "schema"
+               and o.get("artifact")]
+    truncated = any(o.get("truncated") for o in origins)
+    info: dict[str, Any] | None = None
+    snapshot: dict[str, Any] = {}
+    readable = False
+    for origin in origins:
+        content = fetch(origin["artifact"])
+        readable = readable or isinstance(content, dict)
+        if (found := schema_table(content, name)) is not None:
+            info, snapshot = found, content
+            break
+    lines: list[str] = []
+    if info is None:
+        lines.append("字段清单：没有（" + ("本次运行的表结构快照中没有这张表" if readable or not origins
+                                       else "无法读取这张表所在的表结构快照") + "）")
+    else:
+        truncated = truncated or bool(snapshot.get("truncated"))
+        hidden = _source_hidden(entry.get("source") or snapshot.get("source"), catalog, fetch, masked)
+        fields, more, masked_any = table_fields(info, hidden, limit=FIELDS_MAX)
+        listed = " | ".join(f"{f['name']} {f['type']}".strip() for f in fields) or "无"
+        lines.append(f"字段清单（名称 类型，共 {len(fields) + more} 个）：{listed}"
+                     + (f" | …另有 {more} 个字段" if more else ""))
+        if masked_any:
+            lines.append("（有的字段按数据源的设置遮罩了，没有列出）")
+    if truncated:
+        lines.append("注意：表结构快照不完整（数据源的表太多，只保存了一部分），不能据此断定某张表或某个字段不存在")
+    return lines
+
+
+def _column_lines(entry: dict[str, Any], fetch: _Fetch) -> list[str]:
+    """字段所属的表和类型。类型只从封存范围内的表结构快照取；表结构里没有的列（聚合的别名）才取查询快照
+    记下的列类型——和证据面板同一个口径。"""
+    locator = entry.get("locator") or {}
+    table, column = locator.get("table"), locator.get("column") or entry.get("name")
+    owners = [str(table)] if table else [str(t) for t in entry.get("tables") or []]
+    origins = [o for o in entry.get("sources") or [] if isinstance(o, dict) and o.get("artifact")]
+    types: dict[str, str] = {}
+    for origin in origins:
+        if origin.get("kind") != "schema":
+            continue
+        content = fetch(origin["artifact"])
+        for owner in owners:
+            if (col := schema_column(schema_table(content, owner), column)) is not None and col.get("type"):
+                types.setdefault(owner, str(col["type"]))
+    lines = ["所属的表：" + "、".join(owners)] if owners else []
+    if len(set(types.values())) == 1:
+        lines.append(f"类型：{next(iter(types.values()))}（取自表结构快照）")
+    elif types:
+        lines.append("类型：" + "；".join(f"{t} 表中为 {k}" for t, k in types.items()) + "（取自表结构快照）")
+    elif not any(o.get("kind") == "schema" for o in origins):
+        for origin in origins:
+            content = fetch(origin["artifact"]) if origin.get("kind") == "result" else None
+            kinds = content.get("column_types") if isinstance(content, dict) else None
+            if isinstance(kinds, dict) and isinstance(kinds.get(str(column)), str):
+                lines.append(f"类型：{kinds[str(column)]}（取自查询结果）")
+                break
+    return lines
 
 
 def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], whole: bool, fetch: _Fetch) -> str | None:
@@ -364,7 +553,7 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
              masked: dict[str, Any] | None, catalog: dict[str, Any]) -> str | None:
     kind = entry.get("kind")
     if kind == "metric":
-        return _metric_excerpt(alias, entry, fetch)
+        return _metric_excerpt(alias, entry, fetch, catalog, masked)
     if kind == "input":
         field_name = (entry.get("locator") or {}).get("field") or alias
         return f"【{alias}】运行输入：{field_name} = {entry.get('rendered')}"
@@ -377,11 +566,11 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
         return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
     if kind == "table":
         head = f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
-        return "\n".join([head, *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_table_lines(entry, catalog, fetch, masked), *_entity_sql(entry, catalog, fetch)])
     if kind == "column":
         table = (entry.get("locator") or {}).get("table")
         head = f"【{alias}】字段 {f'{table}.' if table else ''}{(entry.get('locator') or {}).get('column') or entry.get('name')}"
-        return "\n".join([head, *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_column_lines(entry, fetch), *_entity_sql(entry, catalog, fetch)])
     return None
 
 
@@ -445,7 +634,8 @@ class JudgeRequest:
             HumanMessage(content=(
                 f"证据摘录（【】里是编号，判定时 used 写它）：\n{evidence}\n\n"
                 "要判断的句子（每句都要给判定）：\n" + "\n".join(self.unit_line(c) for c in ordered) + "\n\n"
-                '只输出 JSON：{"items": [{"unit": "u1", "verdict": "supported", "rationale": "…", "used": ["m:gmv"]}]}'
+                '只输出 JSON：{"items": [{"unit": "u1", "verdict": "supported", "rationale": "…", "missing": "", '
+                '"used": ["m:gmv"]}]}'
             )),
         ]
 
@@ -498,7 +688,7 @@ def request_key(request: JudgeRequest, spec: ModelSpec, budget: Budget, known: d
     return content_hash(canonical_json({
         "units": [[c.unit, c.priority, c.text, c.section, list(c.aliases)] for c in request.cands],
         "excerpts": request.excerpts, "model": [spec.provider, spec.model], "budget": budget.as_dict(),
-        "known": sorted(known or {}),
+        "known": sorted(known or {}), "rules": RULES_VERSION,
     }))
 
 
@@ -650,25 +840,41 @@ async def judge_model_spec(session: Any, node_judge: dict[str, Any] | None = Non
 
 async def source_masks(catalog: dict[str, Any], *, loader: Callable[[str], Any] | None = None
                        ) -> dict[str, list[str]]:
-    """目录里的查询来自的数据源现在设的遮罩：{数据源名: 列名}。和证据面板同一个口径。
+    """目录里的证据来自的数据源现在设的遮罩：{数据源名: 列名}。和证据面板同一个口径。
 
-    旧形状的台账条目没记数据源的，按快照自己记的数据源查（快照经 loader 取，缺省读工件库；
-    按需裁判的接口要传只认封存工件的 loader，和 prepare 同一个）。
+    查的数据源：查询条目的；表、字段条目的（字段清单里遮罩的列不列）；口径卡指标的输入取自的查询快照的。
+    条目没记数据源的，按快照自己记的数据源查（快照经 loader 取，缺省读工件库；按需裁判的接口要传只认
+    封存工件的 loader，和 prepare 同一个）。
     """
     from app.data.engine import masked_columns
     from app.db.models import DataSource
 
     fetch = _Fetch(loader)
     found: set[str] = set()
+
+    def source_of(artifact: Any) -> Any:
+        snapshot = fetch(artifact)
+        return snapshot.get("source") if isinstance(snapshot, dict) else None
+
     for entry in catalog.values():
-        if not isinstance(entry, dict) or entry.get("kind") != "query":
+        if not isinstance(entry, dict):
             continue
-        source = entry.get("source")
-        if not source:
-            snapshot = fetch(entry.get("artifact"))
-            source = snapshot.get("source") if isinstance(snapshot, dict) else None
-        if source:
-            found.add(str(source))
+        kind = entry.get("kind")
+        sources: list[Any] = []
+        if kind == "query":
+            sources.append(entry.get("source") or source_of(entry.get("artifact")))
+        elif kind in ENTITY_KINDS:
+            sources.append(entry.get("source") or next(
+                (source_of(o.get("artifact")) for o in entry.get("sources") or []
+                 if isinstance(o, dict) and o.get("kind") == "schema"), None))
+        elif kind == "metric":
+            card = fetch(entry.get("artifact"))
+            wanted = (entry.get("locator") or {}).get("metric")
+            for metric in (card.get("metrics") if isinstance(card, dict) else None) or []:
+                if isinstance(metric, dict) and metric.get("id") == wanted:
+                    sources.extend(source_of(i.get("artifact")) for i in metric.get("inputs") or []
+                                   if isinstance(i, dict) and i.get("artifact"))
+        found.update(str(s) for s in sources if s)
     names = sorted(found)
     if not names:
         return {}
@@ -885,7 +1091,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     pending: list[Candidate] = []
     for c in ranked:
         hit = (known or {}).get(keys[c.unit])
-        if isinstance(hit, dict) and hit.get("status") in JUDGED:
+        if isinstance(hit, dict) and hit.get("status") in SETTLED:
             verdicts[c.unit] = dict(hit)
             reused += 1
         else:
@@ -998,10 +1204,38 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     return outcome
 
 
+#: 截理由时认的句子边界（全角、半角都认）
+_BOUNDARY = "。；，;,！？!?"
+
+
+def clip_text(text: str, limit: int = RATIONALE_MAX) -> str:
+    """超过 limit 个字时截短：在句子边界（。；，）截断加「…」，总长不超过 limit。
+
+    边界离开头太近（不到三分之一）就不按它截——只剩几个字的理由没用；这时退到词的边界（不把一个英文词、
+    一个数截成两半）。没超长的原样返回。
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit - 1]
+    cut = max(head.rfind(ch) for ch in _BOUNDARY)
+    if cut < limit // 3:
+        cut = len(head)
+        while cut > 0 and head[cut - 1].isascii() and head[cut - 1].isalnum() and text[cut].isascii() \
+                and text[cut].isalnum():
+            cut -= 1
+        if cut < limit // 3:
+            cut = len(head)
+    return head[:cut].rstrip(" ，,；;、") + "…"
+
+
 def _take(items: list[Any], batch: list[Candidate], request: JudgeRequest, verdicts: dict[str, dict[str, Any]], *,
           judge: str | None, post_seal: bool) -> None:
-    """模型给的判定逐条收下：不在这一批的编号不认，判定不认识的记格式不对，理由截到 60 字，
-    used 只留这一批摘录里真有的编号。"""
+    """模型给的判定逐条收下：不在这一批的编号不认，判定不认识的记格式不对，理由在句子边界截到 RATIONALE_MAX 字，
+    used 只留这一批摘录里真有的编号。判 insufficient 的另记 missing（缺的是什么，模型没写就不编）。
+
+    模型照旧写 unsupported 的按 contradicted 收下：新判的不再产出旧取值，而 contradicted 的处置和原来的
+    unsupported 一样（不能因为模型用了旧词就放过这一句）。"""
     ids = {c.unit for c in batch}
     aliases = {a for c in batch for a in c.aliases if a in request.excerpts}
     for item in items:
@@ -1011,26 +1245,43 @@ def _take(items: list[Any], batch: list[Candidate], request: JudgeRequest, verdi
         if uid not in ids or uid in verdicts:
             continue
         status = str(item.get("verdict") or "").strip().lower()
+        if status == UNSUPPORTED:
+            status = "contradicted"
         if status not in JUDGED:
             verdicts[uid] = _unjudged("format", f"裁判返回的判定「{str(item.get('verdict'))[:20]}」无法识别，这句未裁判",
                                       judge=judge, post_seal=post_seal)
             continue
         used = item.get("used") if isinstance(item.get("used"), list) else []
-        verdicts[uid] = {"status": status, "rationale": _clean(str(item.get("rationale") or ""))[:RATIONALE_MAX],
-                         "judge": judge, "post_seal": post_seal,
-                         "used": list(dict.fromkeys(u.strip() for u in used if isinstance(u, str)
-                                                    and u.strip() in aliases))}
+        verdict: dict[str, Any] = {
+            "status": status, "rationale": clip_text(_clean(str(item.get("rationale") or ""))),
+            "judge": judge, "post_seal": post_seal,
+            "used": list(dict.fromkeys(u.strip() for u in used if isinstance(u, str) and u.strip() in aliases))}
+        missing = item.get("missing")
+        if status == "insufficient" and isinstance(missing, str) and (missing := clip_text(_clean(missing), MISSING_MAX)):
+            verdict["missing"] = missing
+        verdict["rule_version"] = RULES_VERSION
+        verdicts[uid] = verdict
+
+
+def outdated(verdict: Any) -> bool:
+    """这条判过的判定早于当前规则：没有规则版本（改造前判的）、版本更小，或者是旧取值 unsupported。
+    没判成的（unjudged）谈不上新旧，返回 False。"""
+    if not isinstance(verdict, dict) or verdict.get("status") not in SETTLED:
+        return False
+    version = verdict.get("rule_version")
+    return verdict.get("status") == UNSUPPORTED or isinstance(version, bool) or not isinstance(version, int) \
+        or version < RULES_VERSION
 
 
 def _outcome(request: JudgeRequest, verdicts: dict[str, dict[str, Any]], budget: Budget, details: dict[str, str], *,
              click: bool = False, shown: Budget | None = None) -> dict[str, Any]:
     """汇总判定。outcome.budget 是这一轮实际用的上限；缺口里写的上限按 shown（缺省同 budget）。"""
     label = shown or budget
-    counts = {s: 0 for s in VERDICTS}
+    counts = {s: 0 for s in COUNT_KEYS}
     why: dict[str, int] = {}
     for c in request.cands:
         v = verdicts[c.unit]
-        counts[v["status"]] += 1
+        counts[v["status"]] = counts.get(v["status"], 0) + 1
         if v["status"] == "unjudged":
             why[v["reason"]] = why.get(v["reason"], 0) + 1
     gaps: list[tuple[str, str]] = []
@@ -1073,13 +1324,18 @@ async def judge_doc(doc: dict[str, Any], catalog: dict[str, Any] | None = None, 
 #: 文档的 judge 摘要里、report.checked 和节点产出的 judge 里都有的键
 SUMMARY_KEYS = ("mode", "model", "on_unsupported", "rewrite_once", "limits", "candidates", "screened", "counts",
                 "unjudged", "limits_hit", "complete", "priced", "cost_usd", "calls", "reused", "duration_ms",
-                "gaps", "notes", "same_model", "rewrite")
+                "gaps", "notes", "same_model", "rewrite", "writer_model")
 
 
 def summarize(outcome: dict[str, Any], *, mode: str, on_unsupported: str = "degrade", rewrite_once: bool = False,
-              same_model: bool = False, rewrite: dict[str, Any] | None = None) -> dict[str, Any]:
-    """裁判摘要：写进文档的 judge，也原样放进 report.checked 和节点产出。"""
-    counts = outcome["counts"]
+              same_model: bool = False, rewrite: dict[str, Any] | None = None,
+              writer_model: str | None = None) -> dict[str, Any]:
+    """裁判摘要：写进文档的 judge，也原样放进 report.checked 和节点产出。
+
+    counts 补齐 COUNT_KEYS 的每个键（断点里缓存的旧判定只有旧的几个键）；writer_model 是这份报告的写作模型，
+    same_model 是裁判模型和它相同。"""
+    raw = outcome["counts"]
+    counts = {k: int(raw.get(k) or 0) for k in COUNT_KEYS}
     return {
         "mode": mode, "model": outcome.get("model"), "on_unsupported": on_unsupported, "rewrite_once": rewrite_once,
         "limits": outcome.get("budget"), "candidates": outcome["candidates"], "screened": outcome["screened"],
@@ -1088,7 +1344,7 @@ def summarize(outcome: dict[str, Any], *, mode: str, on_unsupported: str = "degr
         "priced": outcome.get("priced"), "cost_usd": outcome.get("cost_usd", 0.0), "calls": outcome.get("calls", 0),
         "reused": outcome.get("reused", 0), "duration_ms": outcome.get("duration_ms", 0),
         "gaps": outcome["gaps"] if mode == "inline" else [], "notes": outcome.get("notes") or [],
-        "same_model": same_model, "rewrite": rewrite,
+        "same_model": same_model, "rewrite": rewrite, "writer_model": writer_model,
     }
 
 
@@ -1103,8 +1359,11 @@ def apply_judgement(doc: dict[str, Any], outcome: dict[str, Any], summary: dict[
     return doc
 
 
-def on_demand(doc: dict[str, Any], *, on_unsupported: str = "degrade", rewrite_once: bool = False) -> dict[str, Any]:
-    """探索运行：节点里不花这笔钱。候选句标「未裁判 · 按需」，点开哪句再判哪句。返回摘要（已写进文档）。"""
+def on_demand(doc: dict[str, Any], *, on_unsupported: str = "degrade", rewrite_once: bool = False,
+              writer_model: str | None = None) -> dict[str, Any]:
+    """探索运行：节点里不花这笔钱。候选句标「未裁判 · 按需」，点开哪句再判哪句。返回摘要（已写进文档）。
+
+    writer_model 记进摘要：按需裁判时拿它判断裁判模型是不是和写作模型相同。"""
     request = prepare(doc, {})
     budget = Budget()
     verdicts = {c.unit: _unjudged("on_demand", _why_unjudged("on_demand", budget), judge=None, post_seal=False)
@@ -1112,6 +1371,7 @@ def on_demand(doc: dict[str, Any], *, on_unsupported: str = "degrade", rewrite_o
     outcome = _outcome(request, verdicts, budget, {})
     outcome.pop("_gaps")
     outcome["budget"] = None
-    summary = summarize(outcome, mode="on_demand", on_unsupported=on_unsupported, rewrite_once=rewrite_once)
+    summary = summarize(outcome, mode="on_demand", on_unsupported=on_unsupported, rewrite_once=rewrite_once,
+                        writer_model=writer_model)
     apply_judgement(doc, outcome, summary)
     return summary

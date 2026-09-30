@@ -4,16 +4,17 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
-import { ArrowLeft, CornerDownRight, ListChecks, Scale, ShieldCheck, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, CornerDownRight, ListChecks, Scale, ShieldCheck, X } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError } from '../api/client'
 import { Spinner, StatusBadge, isComposing } from '../components/ui'
 import {
-  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, closestNames, docForeign, entitySources,
-  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged, isJudgeLimit, judgeLimitWords,
-  judgeable, limitOf, pointsToSettings,
+  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, claimBasis, closestNames, docForeign,
+  entitySources, evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged,
+  isJudgeLimit, judgeFlags, judgeLimitWords, judgeable, judgedVerdicts, limitOf, pointsToSettings,
   locatable, locatorText, notableInput, queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, rewriteOf, sealVerdict,
-  segName, segmentKind, segmentState, sourceOf, unitText, unitVerdict, verdictState, type SealStatus, type SourceTone,
+  segName, segmentKind, segmentState, sourceOf, unitText, unitVerdict, verdictMissing, verdictState, type ClaimBasis as Basis,
+  type SealStatus, type SourceTone,
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
@@ -53,6 +54,9 @@ import { CopyChip } from './Markdown'
  * 四期多了「模型的解释」：只对结论句显示——裁判模型的判定、理由（斜体）、带「模型判断 · 模型名 · 非确定」
  * 的徽标，封存之后按需追加的另写「封存后追加」。探索运行里还没判过的句子给「请模型判断这句」；到了上限
  * 写明是哪个上限、到哪里调。点句末徽标打开的是整句（kind: 'unit'）：句子、模型的解释、挂的依据、封存。
+ *
+ * 裁判拆档（JR）：证据不足的写明缺什么；裁判模型和写作模型相同、模型不在价格表里时在「模型的解释」下提醒；
+ * 表名实体步骤列出字段清单；讲方法、讲结构的句子在「挂的依据」下直接列出 SQL 和字段清单。
  *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
@@ -387,7 +391,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       )}
 
       <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
-                 onDemand={detail?.unit?.on_demand} pending={pending} />
+                 onDemand={detail?.unit?.on_demand} answered={detail?.unit?.verdict} pending={pending} />
 
       {host.onNode && (trace.producers.length > 0 || trace.consumers.length > 0) && (
         // 画布右栏：这段证据经过的节点，点一下在画布上选中并对准
@@ -465,6 +469,8 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
   const sealLabel = sealed.status !== 'done' ? sealed.label
     : verdict && !late && isJudged(verdict) ? JUDGE_TEXT.sealedWithDoc : JUDGE_TEXT.sealedDoc
   const cites = (unit.cites ?? []).map((alias) => ({ alias, label: doc.catalog?.[alias]?.label as string | undefined }))
+  // 讲方法、讲结构的句子：SQL 和字段清单直接列在挂的依据下面。正文不是封存的那份时不列（链是另一份报告的）
+  const basis = useMemo(() => (foreign ? null : claimBasis(unit, doc)), [foreign, unit, doc])
   return (
     <>
       {foreign && (
@@ -476,6 +482,7 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
       </Part>
       <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
                  onDemand={foreign ? undefined : answered?.unit?.on_demand}
+                 answered={foreign ? undefined : answered?.unit?.verdict}
                  pending={!!runId && !!first && (!slot || slot.status === 'loading')} />
       <Part title={JUDGE_TEXT.cites} data-ev-cites="">
         {cites.length ? (
@@ -488,6 +495,7 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
             ))}
           </ul>
         ) : <p className="text-dim">{JUDGE_TEXT.noCites}</p>}
+        {basis && <BasisPart basis={basis} doc={doc} runId={runId} />}
       </Part>
       <Part title={EVIDENCE_TEXT.seal} data-ev-seal="">
         <SealLine status={sealed.status} label={sealLabel} />
@@ -508,13 +516,15 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
  * 另写「封存后追加」；到上限没判的写明哪个上限、到哪里调；改写过一次的写明原句。探索运行里还没判过的
  * （没有判定、未裁判）给「请模型判断这句」。什么都说不上的（正式运行、没开裁判的文档）不画这一节
  */
-function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
+function JudgePart({ doc, unit, block, runId, runClass, onDemand, answered, pending }: {
   doc: EvidenceDocData; unit: EvidenceUnit; block: EvidenceBlock; runId?: string; runClass?: string
   /**
    * 片段接口答的「这句能不能请模型判断」：有它就照它（运行还没跑完封存、封存被改过这些前端认不出来）；
    * 老后端没有时按运行类别和文档自己认
    */
   onDemand?: EvidenceOnDemand
+  /** 片段接口答这句时的判定：接口说它「早于当前规则」（outdated），指的就是这一条 */
+  answered?: EvidenceVerdict
   /** 片段接口还在取：先不按运行类别另取一次 */
   pending?: boolean
 }) {
@@ -532,7 +542,10 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
   const late = !!verdict?.post_seal
   const rewrite = rewriteOf(doc, unit.id)
   const judgeDoc = !!doc.judge
-  const canAsk = !!runId && !isJudged(verdict) && (known ? !!known.available : eligible && explore === true)
+  // 片段接口说这句封存后追加的判定早于当前的裁判规则（旧取值、改造前判的）：照常给按钮，旧判定旁边注明「按旧规则判定」。
+  // 这一页里已经按当前规则重判过（眼前的判定不再是接口答的那一条）就不算了；重判没判成时答复交回的还是那条旧判定
+  const outdated = known?.reason === 'outdated' && !!known.available && isJudged(verdict) && sameVerdict(verdict, answered)
+  const canAsk = !!runId && (outdated || (!isJudged(verdict) && (known ? !!known.available : eligible && explore === true)))
   // 探索运行里暂时判不了（还没跑完封存、封存被改过、升级前的运行）：照接口的原话说为什么没有按钮
   const blocked = known && !known.available && BLOCKED.has(known.reason ?? '') ? known.message || '' : ''
   // 这一次按需裁判的答复里没有这一句的判定：接口说了为什么（跳过了、触顶）就照说
@@ -542,6 +555,16 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
     : (Array.isArray(res?.limits_hit) && res.limits_hit.find((l) => typeof l === 'string')) || null
   const shownLimit = limit ?? resLimit
   const judged = isJudged(verdict)
+  const missing = verdictMissing(verdict)
+  // 裁判模型的两条提醒（和写作模型相同、不在价格表里）：封存后追加的看这一次的答复（答复里有这一句时）、再看证据图里
+  // 最近一次按需裁判；节点里当场判的看文档的裁判摘要
+  const replied = res && judgedVerdicts(res)[unit.id] ? res : null
+  const graph = useEvidence((s) => (runId ? s.graphs[runId] : undefined))
+  const loadGraph = useEvidence((s) => s.loadGraph)
+  const needMeta = !!runId && judged && late && !replied && !graph
+  useEffect(() => { if (needMeta && runId) void loadGraph(runId) }, [needMeta, runId, loadGraph])
+  const meta0 = (graph?.data?.reports ?? []).find((r) => !report || !r?.node_id || r.node_id === report)?.judge_meta
+  const flags = judgeFlags(verdict, { doc: doc.judge, reply: replied, meta: meta0 })
   // 这一次答复的那句话（message）：判定之外接口还想说的，照原话写出来。最要紧的是「运行已经接着跑了，这次的
   // 判定没有记进运行记录」——判定照样交回来、也标着封存后追加，只看徽标会以为它记进去了。已经由别处说过的不重复：
   // 跳过的那一行就是它、上限的那一框说的就是它、和判定里写的理由一字不差
@@ -573,10 +596,42 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
         </div>
       )}
       {verdict && (
-        <p className="font-medium" style={{ color: meta?.color ?? 'var(--text-dim)' }} data-ev-verdict={verdict.status}>
-          {meta?.glyph && <span aria-hidden className="mr-1">{meta.glyph}</span>}
-          {meta ? meta.label : JUDGE_TEXT.notClaim}
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+          <p className="font-medium" style={{ color: meta?.color ?? 'var(--text-dim)' }} data-ev-verdict={verdict.status}>
+            {meta?.glyph && <span aria-hidden className="mr-1">{meta.glyph}</span>}
+            {meta ? meta.label : JUDGE_TEXT.notClaim}
+          </p>
+          {outdated && (
+            <span className="chip text-2xs text-faint" data-ev-judge-outdated="" title={known?.message ?? undefined}>
+              {JUDGE_TEXT.outdated}
+            </span>
+          )}
+        </div>
+      )}
+      {missing && (
+        // 证据不足：裁判写明缺的是什么（「SQL」「字段清单」）。说的是证据，不是结论错了：中性字色
+        <p className="mt-0.5 [overflow-wrap:anywhere]" data-ev-missing="">
+          <span className="text-faint">{JUDGE_TEXT.missingLead}</span>{missing}
         </p>
+      )}
+      {(flags.sameModel || flags.unpriced) && (
+        // 判定照常给出，但读的人要知道它的分量：左侧一道提醒色的竖线加图标，字用正文色——醒目，不刺眼
+        <div className="mt-1 space-y-0.5 border-l-2 py-px pl-2 text-2xs leading-relaxed" role="note" data-ev-judge-caution=""
+             style={{ borderColor: 'var(--st-waiting)' }}>
+          {flags.sameModel && (
+            <p className="flex items-start gap-1" data-ev-judge-same=""
+               title={flags.model ? JUDGE_TEXT.sameModelTitle(flags.writer ?? flags.model) : undefined}>
+              <AlertTriangle size={11} aria-hidden className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} />
+              <span>{JUDGE_TEXT.sameModel}</span>
+            </p>
+          )}
+          {flags.unpriced && (
+            <p className="flex items-start gap-1" data-ev-judge-unpriced="" title={JUDGE_TEXT.noPriceTitle}>
+              <AlertTriangle size={11} aria-hidden className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} />
+              <span>{JUDGE_TEXT.noPrice}</span>
+            </p>
+          )}
+        </div>
       )}
       {showMessage && (
         <p className="mb-1 mt-0.5 text-2xs leading-relaxed" role="note" style={{ color: 'var(--st-waiting)' }} data-ev-judge-message="">
@@ -588,8 +643,9 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
         <p className="mt-0.5 text-2xs text-faint" data-ev-judge-model="">{JUDGE_TEXT.notJudgedBy(verdict.judge)}</p>
       )}
       {verdict?.rationale && !shownLimit && (
-        // 理由是模型写的话：斜体，和系统给的说明分开
-        <p className="mt-0.5 italic text-dim" data-ev-rationale=""><em>{verdict.rationale}</em></p>
+        // 理由是模型写的话：斜体，和系统给的说明分开。最长 120 字、可能夹着 SQL 片段和长的字段名：照原样折行，
+        // 不截断，长串也在栏内断开
+        <p className="mt-0.5 whitespace-pre-line italic text-dim [overflow-wrap:anywhere]" data-ev-rationale=""><em>{verdict.rationale}</em></p>
       )}
       {shownLimit && (
         <div className="mt-1 rounded border px-2 py-1" role="note" data-ev-judge-limit={shownLimit}
@@ -656,11 +712,21 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
             {asking ? <Spinner size={10} /> : <Scale size={11} aria-hidden />}
             {asking ? JUDGE_TEXT.asking : verdict && verdict.reason !== 'on_demand' ? JUDGE_TEXT.askAgain : JUDGE_TEXT.ask}
           </button>
+          {outdated && known?.message && (
+            <span className="basis-full text-2xs text-dim" data-ev-judge-outdated-why="">{known.message}</span>
+          )}
           <span className="basis-full text-2xs text-faint">{JUDGE_TEXT.askHint}</span>
         </div>
       )}
     </Part>
   )
+}
+
+/** 两条判定是不是同一条（片段接口答的、页面上叠着的）：按取值、理由、裁判模型、规则版本比，不按对象引用 */
+function sameVerdict(a: EvidenceVerdict | undefined, b: EvidenceVerdict | undefined): boolean {
+  if (!a || !b) return false
+  const sig = (v: EvidenceVerdict) => [v.status, v.rationale ?? '', v.judge ?? '', v.rule_version ?? ''].join('\u0001')
+  return sig(a) === sig(b)
 }
 
 /** 接口说这句暂时判不了、值得告诉人为什么的几种（正式运行、判过了、不是结论句不用说） */
@@ -735,6 +801,9 @@ function EntityPart({ step, entry, cite, seal, pending, failed, catalog }: {
           <span className="text-2xs text-dim">{EVIDENCE_TEXT.tableColumns((step as any).columns, !!step?.is_view)}</span>
         )}
       </div>
+      {kind === 'table' && !!step?.fields?.length && (
+        <FieldList fields={step.fields} more={step.fields_more} masked={step.fields_masked === true} />
+      )}
       {step?.comment && <p className="mt-0.5 text-2xs text-dim">{step.comment}</p>}
       {owners.length > 1 && <p className="mt-0.5 text-2xs text-dim">{EVIDENCE_TEXT.ownerTables(owners)}</p>}
       {step?.types && !step.type && Object.keys(step.types).length > 0 && (
@@ -766,6 +835,125 @@ function EntityPart({ step, entry, cite, seal, pending, failed, catalog }: {
         </p>
       )}
     </Part>
+  )
+}
+
+/**
+ * 表的字段清单：证据接口给的 fields（封存范围内的表结构快照，最多 60 个，遮罩的列不列入），多出来的写「另有 N 个」，
+ * 快照只存了部分表时注明（partial，实体步骤那一节另有这句时不重复）。长名字、长类型都在栏内折行，不截断
+ */
+function FieldList({ fields, more, partial, masked, label }: {
+  fields: NonNullable<EvidenceStep['fields']>; more?: number; partial?: boolean; masked?: boolean; label?: (n: number) => string
+}) {
+  const list = fields.filter((f) => f && typeof f.name === 'string' && f.name)
+  const extra = typeof more === 'number' && Number.isFinite(more) && more > 0 ? more : 0
+  const total = list.length + extra
+  return (
+    <div className="mt-1.5" data-ev-fields="">
+      <div className="mb-0.5 text-2xs font-medium text-faint">{label ? label(total) : EVIDENCE_TEXT.fields(total)}</div>
+      <ul className="grid max-h-44 grid-cols-[repeat(auto-fill,minmax(8.5rem,1fr))] gap-x-3 gap-y-px overflow-y-auto rounded bg-bg px-1.5 py-1 text-2xs">
+        {list.map((f) => (
+          <li key={f.name} className="min-w-0 [overflow-wrap:anywhere]" data-ev-field={f.name}>
+            <span className="mono">{f.name}</span>
+            {f.type && <>{' '}<span className="mono ml-1 text-faint" data-ev-field-type="">{f.type}</span></>}
+          </li>
+        ))}
+      </ul>
+      {extra > 0 && <p className="mt-0.5 text-2xs text-dim" data-ev-fields-more="">{EVIDENCE_TEXT.fieldsMore(extra)}</p>}
+      {masked && <p className="mt-0.5 text-2xs text-dim" data-ev-fields-masked="">{EVIDENCE_TEXT.fieldsMasked}</p>}
+      {partial && (
+        <p className="mt-0.5 text-2xs" style={{ color: 'var(--st-waiting)' }} data-ev-fields-partial="">{EVIDENCE_TEXT.snapshotPartial}</p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 讲方法、讲结构的句子挂的依据：表的字段清单、字段的类型（取句中那个名字片段的证据链：封存范围内的表结构快照）、
+ * 对应的 SQL（查询快照工件，取回时后端复验哈希）。直接摆出来，不用再点开句中的名字
+ */
+function BasisPart({ basis, doc, runId }: { basis: Basis; doc: EvidenceDocData; runId?: string }) {
+  const report = doc.node_id || undefined
+  const segments = useEvidence((s) => s.segments)
+  const sqls = useEvidence((s) => s.sqls)
+  const loadSegment = useEvidence((s) => s.loadSegment)
+  const loadSql = useEvidence((s) => s.loadSql)
+  const entities = [...basis.tables, ...basis.columns]
+  const artifacts = basis.queries.map((q) => {
+    const a = doc.catalog?.[q]?.artifact
+    return typeof a === 'string' && a ? a : ''
+  })
+  const segKey = entities.map((e) => e.seg ?? '').join(',')
+  const artKey = artifacts.join(',')
+  useEffect(() => {
+    if (!runId) return
+    for (const e of entities) if (e.seg) void loadSegment(runId, e.seg, report)
+    for (const a of artifacts) if (a) void loadSql(a)
+    // 按内容比：同一句不重复取
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, report, segKey, artKey, loadSegment, loadSql])
+  if (!runId) return <p className="mt-1.5 text-2xs text-faint" data-ev-basis="none">{JUDGE_TEXT.basisNoRun}</p>
+  const stepOf = (seg?: string) => {
+    const slot = seg ? segments[segmentKey(runId, seg, report)] : undefined
+    const step = slot?.status === 'ok' ? (slot.data?.chain ?? []).find((c) => c?.step === 'entity') : undefined
+    return { step, pending: !!seg && (!slot || slot.status === 'loading') }
+  }
+  return (
+    <div className="mt-2 space-y-2 border-t pt-2" data-ev-basis="">
+      {basis.tables.map((t) => {
+        const { step, pending } = stepOf(t.seg)
+        return (
+          <div key={t.alias} data-ev-basis-table={t.alias}>
+            {step?.fields?.length ? (
+              <FieldList fields={step.fields} more={step.fields_more} partial={step.snapshot_truncated === true}
+                         masked={step.fields_masked === true} label={(n) => JUDGE_TEXT.basisFieldsCount(t.name, n)} />
+            ) : (
+              <p className="text-2xs text-faint">
+                {JUDGE_TEXT.basisFields(t.name)}：{pending ? JUDGE_TEXT.basisPending : JUDGE_TEXT.fieldsMissing}
+              </p>
+            )}
+          </div>
+        )
+      })}
+      {basis.columns.length > 0 && (
+        <div data-ev-basis-columns="">
+          <div className="mb-0.5 text-2xs font-medium text-faint">{JUDGE_TEXT.basisColumns}</div>
+          <ul className="space-y-px text-2xs">
+            {basis.columns.map((c) => {
+              const { step, pending } = stepOf(c.seg)
+              const type = step?.type ?? (step?.types ? Object.values(step.types)[0] : undefined)
+              return (
+                <li key={c.alias} className="min-w-0 [overflow-wrap:anywhere]" data-ev-basis-column={c.alias}>
+                  <span className="mono">{c.name}</span>{' '}
+                  <span className="mono ml-1 text-faint">{type || (pending ? '…' : NONE)}</span>
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      )}
+      {basis.queries.map((q, i) => {
+        const slot = artifacts[i] ? sqls[artifacts[i]] : undefined
+        const sql = slot?.status === 'ok' ? slot.data?.sql ?? null : null
+        return (
+          <div key={q} data-ev-basis-sql={q}>
+            <div className="mb-0.5 flex items-center gap-2">
+              <span className="min-w-0 flex-1 text-2xs font-medium text-faint">{JUDGE_TEXT.basisSql(q)}</span>
+              {sql && <CopyChip label={EVIDENCE_TEXT.copySql} text={() => sql} />}
+            </div>
+            {sql ? (
+              <pre className="mono max-h-28 overflow-auto whitespace-pre-wrap rounded bg-bg px-1.5 py-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]"
+                   data-ev-sql="">
+                {sql}
+              </pre>
+            ) : (
+              <p className="text-2xs text-faint">{artifacts[i] && (!slot || slot.status === 'loading') ? JUDGE_TEXT.basisPending : JUDGE_TEXT.sqlMissing}</p>
+            )}
+          </div>
+        )
+      })}
+      {basis.more > 0 && <p className="text-2xs text-faint" data-ev-basis-more="">{JUDGE_TEXT.basisMoreQueries(basis.more)}</p>}
+    </div>
   )
 }
 

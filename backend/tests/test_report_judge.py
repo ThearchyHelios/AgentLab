@@ -26,7 +26,7 @@ from app.engine import judge as judge_mod
 from app.engine import replay
 from app.engine import runner as runner_mod
 from app.engine.evidence import CLAIMS_RULE, iter_units
-from app.engine.judge import JUDGE_ROLE, JUDGE_RULE, SPEND_KEY, SUMMARY_KEYS, daily_spend
+from app.engine.judge import COUNT_KEYS, JUDGE_ROLE, JUDGE_RULE, SPEND_KEY, SUMMARY_KEYS, daily_spend
 from app.engine.nodes import report as report_mod
 from app.engine.runner import run_manager, verify_manifest
 from app.providers.mock_model import MockChatModel
@@ -167,7 +167,7 @@ async def judge_ends(run_id: str) -> list[dict]:
 
 
 async def test_a_formal_run_judges_inside_the_node_and_seals_the_verdicts(monkeypatch):
-    models = Models(monkeypatch, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge", judge={"on_unsupported": "withhold"}))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 1 and len(models.judges) == 1
@@ -176,18 +176,19 @@ async def test_a_formal_run_judges_inside_the_node_and_seals_the_verdicts(monkey
     got = verdicts(doc)
     assert got[CITED]["status"] == "supported" and got[CITED]["judge"] == PRICED
     assert got[CITED]["post_seal"] is False and got[CITED]["rationale"]
-    assert got[CAUSAL]["status"] == "unsupported"
+    assert got[CAUSAL]["status"] == "contradicted"
     assert got[LINK] is None, "连接性的话不送裁判"
     assert CITED in models.judges[0] and CAUSAL in models.judges[0] and LINK not in models.judges[0]
 
     summary = checked["judge"]
     assert tuple(summary) == SUMMARY_KEYS, "B 段照着这份键读：不能悄悄少一个、多一个"
     assert summary["mode"] == "inline" and summary["model"] == PRICED and summary["on_unsupported"] == "withhold"
-    assert summary["counts"] == {"supported": 1, "partial": 0, "unsupported": 1, "not_a_claim": 0, "unjudged": 0}
+    assert summary["counts"] == {"supported": 1, "partial": 0, "contradicted": 1, "insufficient": 0, "not_a_claim": 0,
+                                 "unjudged": 0, "unsupported": 0}
     assert summary["complete"] is True and summary["gaps"] == []
     assert checked["claims"] == output["claims"] == "judge" and output["judge"] == summary
     assert doc["judge"]["mode"] == "inline" and doc["judge"]["counts"] == summary["counts"]
-    assert {k: doc["stats"][k] for k in ("supported", "partial", "unsupported", "not_a_claim", "unjudged")} \
+    assert {k: doc["stats"][k] for k in COUNT_KEYS} \
         == summary["counts"]
 
     [end] = await judge_ends(row.id)
@@ -277,7 +278,7 @@ REWRITTEN = "本周销售额 [[m:gmv]]。[[see:m:gmv]]新客首单的贡献要�
 
 async def test_rewrite_once_hands_back_only_the_unsupported_sentences(monkeypatch):
     models = Models(monkeypatch, writer=(TEXT, REWRITTEN),
-                    verdicts={"主要来自新客": "unsupported", "要等新客维度": "not_a_claim"})
+                    verdicts={"主要来自新客": "contradicted", "要等新客维度": "not_a_claim"})
     row = await finish(weekly(claims="judge", judge={"rewrite_once": True}))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 2 and len(models.judges) == 2
@@ -305,23 +306,23 @@ async def test_rewrite_once_hands_back_only_the_unsupported_sentences(monkeypatc
 
 
 async def test_rewrite_once_is_off_by_default(monkeypatch):
-    models = Models(monkeypatch, writer=(TEXT, REWRITTEN), verdicts={"主要来自新客": "unsupported"})
+    models = Models(monkeypatch, writer=(TEXT, REWRITTEN), verdicts={"主要来自新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 1 and len(models.judges) == 1
     checked, doc, _ = await report_of(row.id)
-    assert verdicts(doc)[CAUSAL]["status"] == "unsupported" and checked["judge"].get("rewrite") is None
+    assert verdicts(doc)[CAUSAL]["status"] == "contradicted" and checked["judge"].get("rewrite") is None
 
 
 async def test_a_rewrite_that_breaks_the_numbers_is_not_used(monkeypatch):
     models = Models(monkeypatch, writer=(TEXT, "本周销售额 [[m:gmv]]。[[see:m:gmv]]新客贡献了 45678 元。下面看细节。"),
-                    verdicts={"主要来自新客": "unsupported"})
+                    verdicts={"主要来自新客": "contradicted"})
     row = await finish(weekly(claims="judge", judge={"rewrite_once": True}))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 2 and len(models.judges) == 1, "改坏了的那一稿不再花钱判"
     checked, doc, output = await report_of(row.id)
     assert CAUSAL in doc["markdown"] and "45678" not in doc["markdown"]
-    assert verdicts(doc)[CAUSAL]["status"] == "unsupported"
+    assert verdicts(doc)[CAUSAL]["status"] == "contradicted"
     rewrite = checked["judge"]["rewrite"]
     assert rewrite["applied"] is False and "45678" in rewrite["reason"]
     # 封存的是原稿：units 就是原稿（也就是封存文档）里的编号
@@ -346,7 +347,7 @@ async def test_a_rewrite_that_makes_up_a_name_is_not_used(monkeypatch):
     with_schema(monkeypatch)
     models = Models(monkeypatch, writer=(TEXT, "本周销售额 [[m:gmv]]。[[see:m:gmv]]新客首单的贡献要看 `refund_detail` 表。"
                                                "下面看细节。"),
-                    verdicts={"主要来自新客": "unsupported"})
+                    verdicts={"主要来自新客": "contradicted"})
     row = await finish(weekly(claims="judge", judge={"rewrite_once": True}))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 2 and len(models.judges) == 1
@@ -362,7 +363,7 @@ async def test_a_rewrite_that_trades_one_violation_for_another_is_not_used(monke
     """去掉一处违规、又冒出另一处：总数没变，可冒出来的是原稿没有的，一样不采用。"""
     draft = "本周销售额 [[m:gmv]]。[[see:m:gmv]]增长主要来自新客首单，共 1200 单。下面看细节。"
     swapped = "本周销售额 [[m:gmv]]。[[see:m:gmv]]新客首单约占 3500 单。下面看细节。"
-    models = Models(monkeypatch, writer=(draft, draft, swapped), verdicts={"主要来自新客": "unsupported"})
+    models = Models(monkeypatch, writer=(draft, draft, swapped), verdicts={"主要来自新客": "contradicted"})
     row = await finish(weekly(claims="judge", on_violation="flag", max_repairs=1, judge={"rewrite_once": True}))
     assert row.status == "succeeded", row.error
     assert len(models.writes) == 3 and len(models.judges) == 1
@@ -385,7 +386,7 @@ def test_new_violations_are_counted_one_by_one():
 
 async def test_a_second_round_that_hits_a_limit_names_the_configured_limit(monkeypatch):
     """第二轮用的是第一轮剩下的钱，可说给人看的上限是节点上配的那个数，不是剩下的零头。"""
-    Models(monkeypatch, writer=(TEXT, REWRITTEN), verdicts={"主要来自新客": "unsupported"})
+    Models(monkeypatch, writer=(TEXT, REWRITTEN), verdicts={"主要来自新客": "contradicted"})
     # 每句估 1 分钱、回复不带用量（实际就按估算记）：第一轮两句花掉 2 分，第二轮只剩半分，一句也装不下
     monkeypatch.setattr(judge_mod.JudgeRequest, "cost", lambda self, model_id, units: 0.01 * len(units))
     monkeypatch.setattr(judge_mod, "_usage_of", lambda message, model_id: {"input_tokens": 0, "output_tokens": 0})

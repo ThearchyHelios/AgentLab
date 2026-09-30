@@ -249,7 +249,7 @@ WITHHOLD = {**JUDGED, "judge": {"max_cost_usd": 0.05, "on_unsupported": "withhol
 ])
 def test_relaxing_on_unsupported_on_the_node_is_loosening(judge, dropped):
     [reason] = _changed(WITHHOLD, {**WITHHOLD, "judge": judge})
-    assert "「报告撰写」" in reason and "「结论句裁判 · 证据不支持时」" in reason
+    assert "「报告撰写」" in reason and "「结论句裁判 · 证据相矛盾时」" in reason
     assert "「不予出具」" in reason and "「出具降档」" in reason
     assert ("删除了已设置的值" in reason) is dropped, reason
 
@@ -258,7 +258,7 @@ def test_replacing_the_whole_judge_block_to_add_a_budget_is_loosening():
     """补预算把 judge 整个换成 {max_cost_usd}：连同裁判模型、withhold 一起丢了。"""
     before = {**STRICT, "claims": "judge", "judge": {"model": "judge-model", "on_unsupported": "withhold"}}
     [reason] = _changed(before, {**before, "judge": {"max_cost_usd": 0.05}})
-    assert "「结论句裁判 · 证据不支持时」" in reason and "「不予出具」" in reason
+    assert "「结论句裁判 · 证据相矛盾时」" in reason and "「不予出具」" in reason
     assert _changed(before, {**before, "judge": {**before["judge"], "max_cost_usd": 0.05}}) == [], \
         "带着原来的键补预算不算放宽"
 
@@ -268,7 +268,7 @@ def test_a_withhold_from_the_graph_defaults_lost_by_a_node_judge_is_loosening():
     defaults = {"judge": {"on_unsupported": "withhold", "max_cost_usd": 0.05}}
     report = {**STRICT, "claims": "judge"}
     [reason] = _changed(report, {**report, "judge": {"max_cost_usd": 0.05}}, defaults=defaults)
-    assert "「结论句裁判 · 证据不支持时」" in reason and "从「不予出具」（跟随工作流默认设置）" in reason, reason
+    assert "「结论句裁判 · 证据相矛盾时」" in reason and "从「不予出具」（跟随工作流默认设置）" in reason, reason
     assert "不再跟随工作流默认设置" in reason, "说清楚为什么全图默认里的 withhold 不生效了"
     assert _changed(report, {**report, "judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}},
                     defaults=defaults) == []
@@ -280,7 +280,7 @@ def test_relaxing_on_unsupported_in_the_graph_defaults_is_loosening():
     new = copy.deepcopy(old)
     new["defaults"]["judge"]["on_unsupported"] = "degrade"
     [reason] = forbidden_changes(old, new)
-    assert "「报告撰写」" in reason and "「结论句裁判 · 证据不支持时」" in reason
+    assert "「报告撰写」" in reason and "「结论句裁判 · 证据相矛盾时」" in reason
 
 
 @pytest.mark.parametrize("before, after", [
@@ -297,7 +297,7 @@ def test_tightening_or_keeping_on_unsupported_is_fine(before, after):
 def test_dropping_withhold_along_with_judge_is_one_reason():
     """从 judge 退回 require_citation：claims 那一条已经说了，不再为 on_unsupported 另记一条。"""
     [reason] = _changed(WITHHOLD, {**STRICT, "judge": {"max_cost_usd": 0.05}})
-    assert "「未附依据的结论句」" in reason and "证据不支持时" not in reason
+    assert "「未附依据的结论句」" in reason and "证据相矛盾时" not in reason
 
 
 @pytest.mark.parametrize("before", ["require_citation", "judge"])

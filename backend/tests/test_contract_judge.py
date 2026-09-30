@@ -152,24 +152,25 @@ async def test_every_claim_supported_is_a_full_issuance(monkeypatch):
     assert issuance["tier"] == "formal" and issuance["gaps"] == [], issuance
     claims = issuance["claims"]
     assert claims["policy"] == "judge" and claims["mode"] == "inline" and claims["complete"] is True
-    assert claims["counts"] == {"supported": 2, "partial": 0, "unsupported": 0, "not_a_claim": 0, "unjudged": 0}
+    assert claims["counts"] == {"supported": 2, "partial": 0, "contradicted": 0, "insufficient": 0, "not_a_claim": 0,
+                                "unjudged": 0, "unsupported": 0}
     assert claims["on_unsupported"] == "degrade" and claims["uncited_claims"] == 0
-    assert claims["unsupported"] == [] and claims["model"] == JUDGE_MODEL
+    assert claims["contradicted"] == [] and claims["insufficient"] == [] and claims["model"] == JUDGE_MODEL
 
 
-async def test_an_unsupported_claim_degrades_by_default(monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+async def test_a_contradicted_claim_degrades_by_default(monkeypatch):
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly())
     assert issuance["tier"] == "degraded", "不支持按缺口降档，不是不予出具（契约是 strict 的）"
     assert issuance["gaps"] == [], "判了就不是「没核」：档位来自判定，不来自缺口"
-    [flagged] = issuance["claims"]["unsupported"]
+    [flagged] = issuance["claims"]["contradicted"]
     assert flagged["text"] == "增长主要来自新客首单。" and flagged["rationale"] == "证据里没有新客维度"
     assert flagged["unit"] and len(flagged["span"]) == 2
-    assert issuance["claims"]["counts"]["unsupported"] == 1
+    assert issuance["claims"]["counts"]["contradicted"] == 1
 
 
 async def test_withhold_withholds(monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly(report={"judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}}))
     assert issuance["tier"] == "withheld" and issuance["claims"]["on_unsupported"] == "withhold"
 
@@ -209,23 +210,24 @@ async def test_an_uncited_claim_still_counts_under_judge(monkeypatch):
 
 
 async def test_the_issuance_event_carries_the_counts(monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     run = await run_manager.start(graph=weekly(), input_payload={}, run_class="formal")
     row = await wait(run.id)
     event = await issuance_event(row.id)
     assert event["tier"] == "degraded"
     assert event["claims"] == {"policy": "judge", "uncited_claims": 0, "on_unsupported": "degrade",
-                               "mode": "inline", "counts": {"supported": 1, "partial": 0, "unsupported": 1,
+                               "mode": "inline", "counts": {"supported": 1, "partial": 0, "contradicted": 1,
+                                                            "insufficient": 0, "unsupported": 0,
                                                             "not_a_claim": 0, "unjudged": 0}}
 
 
 async def test_a_governed_formal_run_grades_by_the_verdicts(client, monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     graph = weekly(report={"numbers": "strict", "on_violation": "fail",
                            "judge": {"max_cost_usd": None, "on_unsupported": "withhold"}})
     row = await governed(client, graph)
     issuance = row.output["_issuance"]
-    assert issuance["tier"] == "withheld" and issuance["claims"]["unsupported"][0]["text"] == "增长主要来自新客首单。"
+    assert issuance["tier"] == "withheld" and issuance["claims"]["contradicted"][0]["text"] == "增长主要来自新客首单。"
 
 
 # --------------------------------------------------------------------------
@@ -234,7 +236,7 @@ async def test_a_governed_formal_run_grades_by_the_verdicts(client, monkeypatch)
 
 
 async def test_explore_runs_only_annotate(monkeypatch):
-    models = Models(monkeypatch, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly(report={"judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}}),
                             run_class="exploratory")
     assert models.judges == [], "探索运行节点里不花这笔钱"
@@ -242,7 +244,7 @@ async def test_explore_runs_only_annotate(monkeypatch):
     claims = issuance["claims"]
     assert claims["mode"] == "on_demand" and claims["complete"] is False
     assert claims["counts"]["unjudged"] == 2 and claims["unjudged"] == {"on_demand": 2}
-    assert claims["unsupported"] == []
+    assert claims["contradicted"] == [] and claims["insufficient"] == []
 
 
 async def test_explore_runs_still_count_uncited_claims(monkeypatch):
@@ -257,14 +259,14 @@ async def test_explore_runs_still_count_uncited_claims(monkeypatch):
 
 
 async def test_the_contract_can_tighten_on_unsupported(monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly(contract={"claims": {"policy": "judge", "on_unsupported": "withhold"}}))
     assert issuance["tier"] == "withheld" and issuance["claims"]["on_unsupported"] == "withhold"
     assert not any("不支持" in g and "这一版" in g for g in issuance["gaps"])
 
 
 async def test_the_contract_cannot_loosen_on_unsupported(monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly(report={"judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}},
                                    contract={"claims": {"policy": "judge", "on_unsupported": "degrade"}}))
     assert issuance["tier"] == "withheld"
@@ -295,7 +297,7 @@ async def test_runs_from_before_the_upgrade_ignore_judge(monkeypatch):
         return None
 
     monkeypatch.setattr(runner_mod, "_agent_limits", no_snapshot)
-    models = Models(monkeypatch, text=UNCITED, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, text=UNCITED, verdicts={"新客": "contradicted"})
     issuance = await issued(weekly())
     assert models.judges == [] and issuance["tier"] == "formal" and "claims" not in issuance
 

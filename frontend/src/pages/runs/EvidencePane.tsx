@@ -8,8 +8,8 @@ import { ApiError, api } from '../../api/client'
 import { isUpgradeAdvice } from '../../canvas/issues'
 import { ErrorState, Skeleton, Spinner, StatusBadge, rovingTarget, toast, useRadioGroup } from '../../components/ui'
 import {
-  EVIDENCE_STATE, PROBLEM_GROUPS, auditCsv, auditFromApi, auditRows, groupRows, guessRows, guessesOf, issuanceMarks,
-  segmentState, type AuditFilter, type AuditGroup, type AuditRow,
+  EVIDENCE_STATE, PROBLEM_GROUPS, auditCsv, auditFromApi, auditRows, graphVerdicts, groupRows, guessRows, guessesOf,
+  issuanceMarks, segmentState, unitVerdict, verdictState, type AuditFilter, type AuditGroup, type AuditRow,
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
 import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
@@ -87,20 +87,28 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
 
   // 哪些行能在正文里打开：`报告:片段` 的集合，一份文档算一次（长报告几千个片段，不能每行各扫一遍）。
   // 只收有状态的片段，和 EvidenceDoc 能打开的是同一批：违规行指着的文字片段（粗体、链接里的可疑名字）、
-  // 结构片段（列表序号 100. 里的数字）在正文里没有能点的地方，画成按钮就是点了没反应
+  // 结构片段（列表序号 100. 里的数字）在正文里没有能点的地方，画成按钮就是点了没反应。
+  // 结论句的行（证据相矛盾、证据不足……）打开的是这一句的句末徽标（`报告:claim:句子`）：句子有判定（封存的、
+  // 证据图里封存后追加的）才有徽标
   const openable = useMemo(() => {
     const keys = new Set<string>()
     for (const r of reports) {
       const doc = docOf(r.node_id)
-      for (const b of doc?.blocks ?? []) for (const u of b.units ?? []) for (const seg of u.segments ?? []) {
-        if (segmentState(seg)) keys.add(`${r.node_id}:${seg.id}`)
+      const late = graphVerdicts(graph, r.node_id)
+      for (const b of doc?.blocks ?? []) for (const u of b.units ?? []) {
+        for (const seg of u.segments ?? []) if (segmentState(seg)) keys.add(`${r.node_id}:${seg.id}`)
+        if (verdictState(unitVerdict(u, late))) keys.add(`${r.node_id}:claim:${u.id}`)
       }
     }
     return keys
-  }, [reports, docOf])
-  const canOpen = useCallback((row: AuditRow) => !!row.seg && openable.has(`${row.report}:${row.seg}`), [openable])
+  }, [reports, docOf, graph])
+  const canOpen = useCallback((row: AuditRow) => {
+    const key = openKey(row)
+    return !!key && openable.has(`${row.report}:${key}`)
+  }, [openable])
   const openRow = useCallback((row: AuditRow) => {
-    if (row.seg) handles.current.get(row.report)?.open(row.seg)
+    const key = openKey(row)
+    if (key) handles.current.get(row.report)?.open(key)
   }, [])
 
   const onView = useCallback((report: string, open: boolean) => {
@@ -187,6 +195,10 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
     </div>
   )
 }
+
+/** 审计行在正文里打开什么：片段的行是那个片段，结论句的行是那一句的句末徽标（EvidenceDoc 认 claim:<句子>） */
+const openKey = (row: AuditRow): string | undefined =>
+  row.seg ?? (row.kind === 'claim' && row.unit ? `claim:${row.unit}` : undefined)
 
 /** 已经收尾的运行：还在跑、停在审批上的，报告可能还没写，说「这次的报告没有逐段证据」太早 */
 const SETTLED = new Set(['succeeded', 'failed', 'cancelled'])
@@ -558,7 +570,7 @@ function AuditLine({ row, current, openable, multiReport, labelOf, onOpen, onFoc
         data-audit-seg={row.seg ?? ''}>
       <td className="px-3 py-1.5">
         {openable ? (
-          <button type="button" {...common} aria-label={label} title={label} onClick={onOpen} data-audit-open={row.seg}
+          <button type="button" {...common} aria-label={label} title={label} onClick={onOpen} data-audit-open={openKey(row)}
                   className={clsx(common.className, 'block underline decoration-dotted underline-offset-2 hover:text-[var(--accent)]')}>
             {text}
           </button>

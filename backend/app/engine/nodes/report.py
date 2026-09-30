@@ -20,7 +20,7 @@
 - 正式运行在节点里判：写完、核对完之后判，判定写进文档的 unit.verdict，随文档一起封存。判定只标注、
   不改写正文；裁判没跑成、触顶了照样产出，没判的记未裁判并留下缺口，出口按 on_unsupported 判档
 - 探索运行不在节点里花这笔钱：候选句标「未裁判 · 按需」，点开哪句再判哪句（证据接口）
-- rewrite_once（默认关）：证据不支持的句子连同理由交回写作者只改这几句，再判一次，最多一轮；
+- rewrite_once（默认关）：证据相矛盾、证据不足的句子连同理由交回写作者只改这几句，再判一次，最多一轮；
   改写稿冒出原稿没有的违规（只标注的可疑实体也算）就不采用
 - 裁判调用包在 @task 里，排在节点所有已有调用之后：「接着跑」时直接取 checkpoint 里的判定，
   不重复调用、不重复计费。写作调用不进 checkpoint，接着跑时会重写一稿——所以判定带着输入指纹，
@@ -450,7 +450,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if await _run_class(ctx.run.run_id) != "formal":
             # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱
             judgement = judging.on_demand(doc, on_unsupported=judge_cfg["on_unsupported"],
-                                          rewrite_once=judge_cfg["rewrite_once"])
+                                          rewrite_once=judge_cfg["rewrite_once"], writer_model=model_id)
         elif not (blocking and on_violation == "fail"):
             # 反正要判失败的报告不值得再花钱判（节点紧接着就报错）
             doc, response, blocking, judgement, usages = await _judge_inline(
@@ -505,11 +505,19 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 def _rewrite_request(sentences: list[tuple[str, str]]) -> str:
     listed = "\n".join(f"{i}.「{text}」——{why or '证据不支持这句话'}" for i, (text, why) in enumerate(sentences, 1))
     return (
-        "另一个模型按证据逐句核对了你的报告，下面这几句它认为证据不支持：\n"
+        "另一个模型按证据逐句核对了你的报告，下面这几句它认为证据不支持（和证据相矛盾，或者证据不足）：\n"
         f"{listed}\n\n"
         "请只改这几句：补上证据目录里真有的依据 [[see:…]]，或者把说法收窄到证据能支持的程度，或者删掉；"
         "其余部分一字不改。数字仍然只能用引用标记写。不要解释改了什么，只输出改好的整篇报告正文。"
     )
+
+
+def _rewrite_reason(verdict: dict[str, Any]) -> str:
+    """交回写作者的理由：裁判的理由，证据不足的再写上缺的是什么。"""
+    why = str(verdict.get("rationale") or "")
+    if verdict.get("status") == "insufficient" and verdict.get("missing"):
+        why = f"{why}（缺少：{verdict['missing']}）" if why else f"证据不足，缺少：{verdict['missing']}"
+    return why
 
 
 def _merge(first: dict[str, Any], second: dict[str, Any], budget: judging.Budget) -> dict[str, Any]:
@@ -582,10 +590,11 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
     usages = [outcome["usage"]]
     response = messages[-1]
     rewrite: dict[str, Any] | None = None
-    bad = [uid for uid, v in outcome["verdicts"].items() if v["status"] == "unsupported"]
+    # 交回改写的：证据相矛盾的（含旧取值 unsupported）和证据不足的——两样原来都判作「证据不支持」
+    bad = [uid for uid, v in outcome["verdicts"].items() if v["status"] in (*judging.CONTRADICTED, "insufficient")]
     if judge_cfg["rewrite_once"] and bad:
         texts = judging.unit_texts(doc)
-        sentences = [(texts.get(uid, ""), outcome["verdicts"][uid].get("rationale") or "") for uid in bad]
+        sentences = [(texts.get(uid, ""), _rewrite_reason(outcome["verdicts"][uid])) for uid in bad]
         ctx.emit(EventType.LOG, level="warn", code="report_rewrite",
                  message=f"裁判认为 {len(bad)} 句结论证据不支持（{_named([{'text': t} for t, _ in sentences])}），"
                          "已退回写作模型仅修改这几句")
@@ -620,7 +629,8 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
             rewrite.update(applied=True, units=[at.get(texts.get(uid, "")) for uid in bad],
                            changed=[uid for uid, text in now.items() if text not in before])
     summary = judging.summarize(outcome, mode="inline", on_unsupported=judge_cfg["on_unsupported"],
-                                rewrite_once=judge_cfg["rewrite_once"], same_model=same_model, rewrite=rewrite)
+                                rewrite_once=judge_cfg["rewrite_once"], same_model=same_model, rewrite=rewrite,
+                                writer_model=model_id)
     judging.apply_judgement(doc, outcome, summary)
     return doc, response, blocking, summary, usages
 

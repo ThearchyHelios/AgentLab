@@ -425,7 +425,7 @@ CLAIMS_JUDGE = "judge"
 CLAIMS_VALUES = (*REPORT_CLAIMS, CLAIMS_JUDGE)
 #: judge 子配置能写的键。三个上限写 null 表示不限；没写的键运行时取设置里的默认（设置 → judge 一组）
 JUDGE_KEYS = ("provider", "model", "max_claims", "max_cost_usd", "timeout_s", "rewrite_once", "on_unsupported")
-#: 证据不支持时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
+#: 证据相矛盾时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
 JUDGE_ON_UNSUPPORTED = ("degrade", "withhold")
 
 

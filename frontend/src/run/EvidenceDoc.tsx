@@ -8,8 +8,9 @@ import { ListChecks } from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
-  EVIDENCE_STATE, claimCounts, claimLabel, docTally, segmentKind, segmentLabel, segmentState, tallySummary, unitText,
-  isJudged, limitOf, unitVerdict, verdictState, withVerdicts, type EvidenceStateCode, type EvidenceTally as Tally,
+  EVIDENCE_STATE, alertTier, claimCounts, claimLabel, claimProblems, conflicting, docTally, segmentKind, segmentLabel,
+  segmentState, tallySummary, unitText, isJudged, limitOf, unitVerdict, verdictMissing, verdictState, withVerdicts,
+  type EvidenceStateCode, type EvidenceTally as Tally,
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
 import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, JUDGE_TEXT, claimTally, evidenceTally, type ClaimTallyCounts } from '../lib/terms'
@@ -26,13 +27,13 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  * BlockView，和普通答案长得一模一样；有出处的数字画细实线，没有出处的画点状线、
  * 句末挂「无证据」。
  *
- * 结论句的判定（四期）只在句末挂一枚小徽标（◆ ◇ ! ?），整句不画线；证据不支持的整句铺一层浅底。
- * 徽标也是按钮：点开是这一句的「模型的解释」。判定是模型给的，颜色一律不用确定性的绿。
+ * 结论句的判定（四期）只在句末挂一枚小徽标（◆ ◇ ! ○ ?），整句不画线；证据相矛盾（和旧的证据不支持）的整句
+ * 铺一层浅底。徽标也是按钮：点开是这一句的「模型的解释」。判定是模型给的，颜色一律不用确定性的绿。
  *
  * 键盘：整份报告只占一个 Tab 位（roving tabindex）。←/→ 在有状态的片段、句末徽标间走，↑/↓ 按
  * 句子走（表格里按列走到上一行 / 下一行，出了表格接着按句子走），n / N 跳到下一处 /
- * 上一处无证据、证据不支持的地方，回车打开证据面板，Esc 关掉并留在原片段；面板开着时方向键走到哪、
- * 面板跟到哪，Tab 进面板。
+ * 上一处有问题的地方（无证据、可疑名称、证据相矛盾、部分有依据；证据不足的排在这些之后），回车打开证据面板，
+ * Esc 关掉并留在原片段；面板开着时方向键走到哪、面板跟到哪，Tab 进面板。
  *
  * 长报告：事件都挂在容器上（片段只带 data-seg），块用 memo，外加
  * content-visibility: auto；超过 TEXT_CAP 的部分先折叠，跳转到折叠里的片段时自动展开。
@@ -66,8 +67,13 @@ interface Model {
   /** 每个有可点片段的句子里第一个可点片段，按正文顺序（↑/↓ 用） */
   unitFirst: string[]
   unitOf: Map<string, number>
-  /** 无证据的片段，按正文顺序（n / N 用） */
+  /**
+   * 有问题的片段和句末徽标（n / N 用）：先第 1 轮（无证据、可疑名称、证据相矛盾、部分有依据），再第 2 轮
+   * （证据不足），每一轮里按正文顺序
+   */
   alerts: string[]
+  /** alerts 里每一处在第几轮 */
+  tier: Map<string, 1 | 2>
   /** 每块到它为止的累计字数（折叠用） */
   chars: number[]
   /** 表格里的片段在第几行第几列（表头 row = -1 不进来）；↑/↓ 在表格里按列走 */
@@ -83,7 +89,7 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
   const badge = new Map<string, Badge>()
   const unitFirst: string[] = []
   const unitOf = new Map<string, number>()
-  const alerts: string[] = []
+  const tiered: [string, 1 | 2][] = []
   const chars: number[] = []
   const cell = new Map<string, { block: number; row: number; col: number }>()
   const grid = new Map<string, string>()
@@ -101,14 +107,15 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
         order.push(s.id)
         if (first) { unitFirst.push(s.id); first = false }
         unitOf.set(s.id, unitFirst.length - 1)
-        if (EVIDENCE_STATE[state].alert) alerts.push(s.id)
+        const t = alertTier(state)
+        if (t) tiered.push([s.id, t])
         if (loc) {
           cell.set(s.id, { block: b, row: loc.row, col: loc.col })
           const key = `${b}:${loc.row}:${loc.col}`
           if (!grid.has(key)) grid.set(key, s.id)
         }
       }
-      // 句末徽标排在这一句的片段后面：←/→ 走到句尾就是它，证据不支持的也进 n / N
+      // 句末徽标排在这一句的片段后面：←/→ 走到句尾就是它，证据相矛盾、部分有依据、证据不足的也进 n / N
       const verdict = unitVerdict(unit, overlay)
       const state = verdictState(verdict)
       if (verdict && state) {
@@ -118,12 +125,16 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
         order.push(key)
         if (first) { unitFirst.push(key); first = false }
         unitOf.set(key, unitFirst.length - 1)
-        if (EVIDENCE_STATE[state].alert) alerts.push(key)
+        const t = alertTier(state)
+        if (t) tiered.push([key, t])
       }
     }
     chars.push(total)
   })
-  return { order, index, seg, badge, unitFirst, unitOf, alerts, chars, cell, grid }
+  // 按（轮次、正文顺序）排：tiered 本来就是正文顺序，稳定排序只按轮次挪
+  const sorted = [...tiered].sort((a, b) => a[1] - b[1])
+  return { order, index, seg, badge, unitFirst, unitOf, alerts: sorted.map(([k]) => k), tier: new Map(sorted), chars, cell,
+           grid }
 }
 
 /** 片段或徽标在第几块 */
@@ -311,11 +322,17 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     if (refocus && back) requestAnimationFrame(() => segEl(back)?.focus())
   }, [view, current, segEl])
 
+  /**
+   * n / N 的下一处：按（轮次、正文位置）排的一圈，走到头接回开头。当前位置不是问题（普通片段、有依据的徽标）时
+   * 按第 1 轮算——第 1 轮里它后面没有了，就接着走第 2 轮（证据不足）
+   */
   const step = useCallback((list: string[], from: string | null, dir: 1 | -1): string | null => {
     if (!list.length) return null
-    const pos = from ? model.index.get(from) ?? -1 : -1
-    if (dir > 0) return list.find((id) => (model.index.get(id) ?? 0) > pos) ?? list[0]
-    for (let i = list.length - 1; i >= 0; i--) if ((model.index.get(list[i]) ?? 0) < pos) return list[i]
+    const rank = (id: string | null): [number, number] => [id ? model.tier.get(id) ?? 1 : 1, id ? model.index.get(id) ?? -1 : -1]
+    const cmp = (a: [number, number], b: [number, number]) => a[0] - b[0] || a[1] - b[1]
+    const cur = rank(from)
+    if (dir > 0) return list.find((id) => cmp(rank(id), cur) > 0) ?? list[0]
+    for (let i = list.length - 1; i >= 0; i--) if (cmp(rank(list[i]), cur) < 0) return list[i]
     return list[list.length - 1]
   }, [model])
 
@@ -510,7 +527,7 @@ export function EvidenceTally({ counts, onNext, onList }: {
 }) {
   const suspect = counts.suspect ?? 0
   const claims = counts.claims
-  const clean = !counts.none && !counts.other && !suspect && !claims?.unsupported && !claims?.partial
+  const clean = !counts.none && !counts.other && !suspect && !claimProblems(claims)
   const numbers = evidenceTally(counts.cited, counts.total, counts.other)
   return (
     <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-evidence-tally="">
@@ -541,13 +558,14 @@ export function EvidenceTally({ counts, onNext, onList }: {
 }
 
 /**
- * 「结论 4 句（支持 3 · 不支持 1）」：和数字那一段同一种说法。判定是模型给的：全都支持也不用确定性的绿，
- * 有不支持、部分支持、没挂依据的用提醒色，其余用暗字色（它是概率性的，不该和「有出处」一样笃定）
+ * 「结论 4 句（有依据 3 · 证据相矛盾 1）」：和数字那一段同一种说法。判定是模型给的：全都支持也不用确定性的绿，
+ * 有问题（证据相矛盾、旧的证据不支持、部分有依据、证据不足）、没挂依据的用提醒色，其余用暗字色（它是概率性的，
+ * 不该和「有出处」一样笃定）
  */
 export function ClaimTally({ claims, lead }: { claims: ClaimTallyCounts; lead: boolean }) {
   const text = claimTally(claims)
   if (!text) return null
-  const warn = claims.unsupported > 0 || claims.partial > 0 || claims.uncited > 0
+  const warn = claimProblems(claims) > 0 || claims.uncited > 0
   return (
     <span className="tnum" style={{ color: warn ? 'var(--st-waiting)' : 'var(--text-dim)' }} data-evidence-claims=""
           title={JUDGE_TEXT.badge(null)}>
@@ -655,7 +673,7 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
 /**
  * 一句话：文字按行内 Markdown 渲染（整句算一次样式，跨片段的 `code`、**粗体** 不会
  * 被切坏），有状态的片段包成按钮。含无证据片段的句子末尾挂「? 无证据」；有判定的结论句末尾挂
- * 一枚徽标（也是按钮），证据不支持的整句铺浅底——字本身不画线
+ * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线
  */
 function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
@@ -702,8 +720,8 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
   const open = !!badge && active === key
   return (
     <>
-      {badge?.state === 'unsupported'
-        // 证据不支持：整句铺一层浅底（折行时每行各自带圆角），字色、字重都不动，也不画线
+      {conflicting(badge?.state)
+        // 证据相矛盾（和旧的证据不支持）：整句铺一层浅底（折行时每行各自带圆角），字色、字重都不动，也不画线
         ? <span className="ev-claim" data-ev-claim-shade={unit.id} style={{ '--ev-soft': meta!.soft } as CSSProperties}>{nodes}</span>
         : nodes}
       {tag && [...alerts].map((state) => (
@@ -722,10 +740,11 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
           aria-label={claimLabel(unit, badge.verdict)}
           aria-expanded={open}
           aria-controls={open ? panelId : undefined}
-          // 模型判过的写明谁判的、非确定；模型没判过的（按需还没点、到上限、没跑成）只说这是什么状态——
-          // 到上限没判的也记着裁判模型，但不能写成「（模型 · 非确定）」，像是它判过一样
+          // 模型判过的写明谁判的、非确定（证据不足的接着写缺什么）；模型没判过的（按需还没点、到上限、没跑成）只说
+          // 这是什么状态——到上限没判的也记着裁判模型，但不能写成「（模型 · 非确定）」，像是它判过一样
           title={isJudged(badge.verdict)
-            ? `${meta.label}${badge.verdict.post_seal ? ` · ${JUDGE_TEXT.postSeal}` : ''}（${badge.verdict.judge || JUDGE_TEXT.judgeModel} · 非确定）`
+            ? `${meta.label}${badge.verdict.post_seal ? ` · ${JUDGE_TEXT.postSeal}` : ''}（${badge.verdict.judge || JUDGE_TEXT.judgeModel} · 非确定）${
+              verdictMissing(badge.verdict) ? `。${JUDGE_TEXT.missing(verdictMissing(badge.verdict))}` : ''}`
             : limitOf(badge.verdict) ? `${meta.label}：${JUDGE_TEXT.limitNotJudged}` : `${meta.label}：${meta.hint}`}
           style={segStyle(badge.state)}
         >

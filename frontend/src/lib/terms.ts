@@ -155,13 +155,16 @@ export const APPROVAL_POLICY_LABEL: Record<'dangerous' | 'always' | 'never', str
  * 可点击证据：片段状态的叫法。正文里片段的 aria-label、面板标题、图例都用这一份。
  * 外观（线型、字形、颜色）在 lib/evidence.ts，和这里一一对应。
  *
- * 概率性的四种（四期的结论句裁判）挂在句末的徽标上：有依据、部分有依据、证据不支持都是模型的判断，
+ * 概率性的几种（四期的结论句裁判）挂在句末的徽标上：有依据、部分有依据、证据相矛盾、证据不足都是模型的判断，
  * 叫法里写明「模型判断」；未裁判不带「有引用」——没挂依据、只有方向词的结论句也会送裁判、也会没判。
+ * 证据不支持是裁判拆档之前的取值：已封存的文档、已有的事件里保留原样，照旧这样叫（新判的不再出现）。
  */
 export const EVIDENCE_STATE_LABEL = {
   deterministic: '有出处',
   supported: '模型判断：有依据',
   partial: '模型判断：部分有依据',
+  contradicted: '模型判断：证据相矛盾',
+  insufficient: '模型判断：证据不足',
   unsupported: '模型判断：证据不支持',
   unjudged: '未裁判',
   none: '无证据',
@@ -313,6 +316,10 @@ export const EVIDENCE_TEXT = {
   checked: (schemas: number, queries: number) =>
     `已核对 ${formatNumber(schemas)} 份表结构快照、${formatNumber(queries)} 次查询`,
   tableColumns: (n: number, view: boolean) => `${view ? '视图' : '表'} · ${formatNumber(n)} 个字段`,
+  /** 表名实体步骤的字段清单（来自封存范围内的表结构快照，最多列 60 个，遮罩的列不列入） */
+  fields: (n: number) => `字段清单（${formatNumber(n)} 个）`,
+  fieldsMore: (n: number) => `另有 ${formatNumber(n)} 个字段未列出`,
+  fieldsMasked: '部分字段已按数据源的遮罩设置隐藏，未列出',
   columnTypes: (types: Record<string, string>) =>
     `各表的类型：${Object.entries(types).map(([t, v]) => `${t} ${v}`).join('、')}`,
   quoteBad: '按记录的位置从原文中截取的内容与这句引文不一致：原文可能已被修改',
@@ -342,6 +349,11 @@ export interface ClaimTallyCounts {
   total: number
   supported: number
   partial: number
+  /** 证据和原句冲突 */
+  contradicted: number
+  /** 证据里没有判断所需的信息 */
+  insufficient: number
+  /** 拆档之前的取值（旧文档、旧事件），照旧计入 */
   unsupported: number
   /** 送了裁判、没判成（到上限、调用失败）或还没请模型判断的 */
   unjudged: number
@@ -356,8 +368,9 @@ export interface ClaimTallyCounts {
 export function claimTally(c: ClaimTallyCounts): string {
   if (!c.total) return ''
   const parts = [
-    ['有依据', c.supported], ['部分有依据', c.partial], ['证据不支持', c.unsupported], ['未裁判', c.unjudged], ['无证据', c.uncited],
-  ].filter(([, n]) => (n as number) > 0).map(([k, n]) => `${k} ${formatNumber(n as number)}`)
+    ['有依据', c.supported], ['部分有依据', c.partial], ['证据相矛盾', c.contradicted], ['证据不支持', c.unsupported],
+    ['证据不足', c.insufficient], ['未裁判', c.unjudged], ['无证据', c.uncited],
+  ].filter(([, n]) => typeof n === 'number' && n > 0).map(([k, n]) => `${k} ${formatNumber(n as number)}`)
   return `结论 ${formatNumber(c.total)} 句${parts.length ? `（${parts.join(' · ')}）` : ''}`
 }
 
@@ -368,8 +381,11 @@ export function claimTally(c: ClaimTallyCounts): string {
 export const JUDGE_TEXT = {
   section: '模型的解释',
   claim: '结论句',
-  /** 读屏摘要末尾的操作说明：有证据不支持、部分支持的结论句时 n 也跳到它们的句末徽标 */
-  keysHint: '用左右方向键逐个查看，上下方向键按句切换，n 跳到下一处无证据或证据不支持的句子，回车打开证据，Esc 关闭',
+  /**
+   * 读屏摘要末尾的操作说明：结论句有问题（证据相矛盾、部分有依据、证据不足）时 n 也跳到它们的句末徽标。
+   * 证据不足的排在其余问题之后
+   */
+  keysHint: '用左右方向键逐个查看，上下方向键按句切换，n 跳到下一处无证据或证据有问题的句子（证据不足的排在最后），回车打开证据，Esc 关闭',
   /** 面板里判断的徽标：谁判的、而且不是确定的 */
   badge: (model: string | null | undefined) => `模型判断 · ${model || '裁判模型'} · 非确定`,
   postSeal: '封存后追加',
@@ -389,11 +405,30 @@ export const JUDGE_TEXT = {
   notClaim: '模型判断：不是结论句',
   ask: '请模型判断本句',
   askAgain: '再次请模型判断',
+  /** 封存后追加的判定早于当前的裁判规则（片段接口的 on_demand.reason 为 outdated）：旁边注明，按钮照常给 */
+  outdated: '按旧规则判定',
   asking: '正在请模型判断…',
   askHint: '探索运行按需裁判：每次点击裁判一句，费用计入单次点击上限和每日上限',
   notAsked: '尚未请模型判断本句',
   screened: '预筛判定本句不陈述数据事实（短句或过渡语），未送裁判',
-  noPrice: '裁判模型不在价格目录中，无法按 token 数估算金额：金额上限对其不生效',
+  /** 证据不足时缺的是什么（裁判给的，如「SQL」「字段清单」）：面板、句末徽标的悬停说明和读屏都写 */
+  missingLead: '缺少：',
+  missing: (what: string) => `缺少：${what}`,
+  /** 裁判模型的两条提醒：判定照常给出，读的人要知道分量 */
+  sameModel: '裁判模型和写作模型相同，结果仅供参考',
+  sameModelTitle: (model: string) => `裁判模型与撰写这份报告的模型都是 ${model}：同一模型较难发现自身的错误`,
+  noPrice: '该模型不在价格表中，金额上限不生效',
+  noPriceTitle: '无法按 token 数估算这个模型的费用，裁判的金额上限（每份报告、每次点击、每日）对它不起作用；句数和时长上限照常生效',
+  /** 讲方法、讲结构的句子（只挂了表名、字段名、整份查询）：「挂的依据」下直接列出 SQL 和字段清单 */
+  basisSql: (alias: string) => `查询 ${alias} 的 SQL`,
+  basisFields: (table: string) => `表 ${table} 的字段清单`,
+  basisFieldsCount: (table: string, n: number) => `表 ${table} 的字段清单（${formatNumber(n)} 个）`,
+  basisColumns: '字段类型',
+  basisPending: '正在加载 SQL 和字段清单…',
+  sqlMissing: '未能获取这次查询的 SQL',
+  fieldsMissing: '未能获取字段清单',
+  basisNoRun: '这份报告不属于任何运行，无法获取 SQL 和字段清单',
+  basisMoreQueries: (n: number) => `另有 ${formatNumber(n)} 次查询，点开句中的表名查看`,
   limit: '已达上限',
   /** 触顶之后怎么调。按需裁判（每次点击）和正式运行（每份报告）调的地方不一样 */
   limitHow: {
@@ -437,10 +472,14 @@ export const JUDGE_FIELD_LABEL: Record<string, string> = {
   max_claims: '最多裁判句数',
   max_cost_usd: '金额上限（美元）',
   timeout_s: '时长上限（秒）',
-  rewrite_once: '证据不支持的句子退回改写一次',
-  on_unsupported: '证据不支持时',
+  rewrite_once: '证据相矛盾或不足的句子退回改写一次',
+  // 键名仍是 on_unsupported（兼容已有配置）；裁判拆档后它管的是「证据相矛盾」（旧取值证据不支持照旧按它判），
+  // 证据不足的句子最多降档
+  on_unsupported: '证据相矛盾时',
 }
-/** judge.on_unsupported：正式运行里证据不支持的结论句怎么判档（探索运行只标注） */
+/** judge.on_unsupported 的说明：检查器里选项下面那一行 */
+export const JUDGE_ON_UNSUPPORTED_HINT = '仅对正式运行生效；证据不足的句子最多降档，不会因此不予出具。探索运行只做标注，不拦截'
+/** judge.on_unsupported：正式运行里证据相矛盾的结论句怎么判档（探索运行只标注） */
 export const JUDGE_ON_UNSUPPORTED_LABEL: Record<string, string> = {
   degrade: '出具降档',
   withhold: '不予出具',
@@ -459,6 +498,9 @@ export const JUDGE_SETTING_TEXT = {
   modelDefault: '留空：用接入的默认模型',
   modelFollow: '留空：跟随助手的模型',
   differ: '建议与撰写报告的模型不同：由同一模型审核自身输出，不易发现其中的错误',
+  /** 接入和模型都没填：后端依次用助手的模型、默认接入。醒目地说一句，并给出建议 */
+  notSet: '未单独配置，将使用助手的模型',
+  notSetAdvice: '建议配置一个与撰写报告的模型不同、能力更强的模型：同一模型审核自身输出时，结果仅供参考',
   limits: '上限（每一项都可以设成不限）',
   reportClaims: '每份报告最多裁判句数',
   reportCost: '每份报告的金额上限（美元）',
@@ -532,7 +574,7 @@ export const EVIDENCE_AUDIT_TEXT = {
     candidate: '按数值猜测',
   } as Record<string, string>,
   groupHint: {
-    none: '裸数字、无法解析的引用、未附依据的结论句',
+    none: '裸数字、无法解析的引用、未附依据或模型判为证据有问题的结论句',
     suspicious: '表名、字段名在本次运行的表结构和查询中找不到',
     cited: '系统从证据中取值并核对过的片段',
     candidate: '按数值猜测的可能来源，不能作为证据，默认收起',

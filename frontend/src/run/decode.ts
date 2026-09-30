@@ -1,8 +1,8 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
-import { statsTally } from '../lib/evidence'
+import { JUDGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
@@ -647,16 +647,13 @@ function queryTitle(sql: string, source: string): string {
 /** agent 开了 cite_fields 时循环结束后那次结构化抽取 */
 const EXTRACT_TITLE = '按出处抽取字段'
 /**
- * report.checked 带的裁判摘要 → 「结论 4 句（支持 1 · 不支持 1 · 未裁判 2）」，和出具横幅同一种说法。
- * 「不是结论句」不算；没有摘要（没开裁判、老后端）返回空串
+ * report.checked 带的裁判摘要 → 「结论 4 句（有依据 1 · 证据相矛盾 1 · 未裁判 2）」，和出具横幅同一种说法。
+ * 「不是结论句」不算，旧数据的 unsupported 照样计入；没有摘要（没开裁判、老后端）返回空串
  */
 function judgeTally(judge: unknown): string {
   const c = judge && typeof judge === 'object' ? (judge as { counts?: Record<string, unknown> }).counts : undefined
   if (!c || typeof c !== 'object') return ''
-  const n = (k: string) => (typeof c[k] === 'number' && Number.isFinite(c[k] as number) ? c[k] as number : 0)
-  const counts = { supported: n('supported'), partial: n('partial'), unsupported: n('unsupported'), unjudged: n('unjudged'),
-                   uncited: 0 }
-  return claimTally({ ...counts, total: counts.supported + counts.partial + counts.unsupported + counts.unjudged })
+  return claimTally(claimCountsOf(c))
 }
 
 /** 报告撰写节点请裁判模型判断结论句（四期，claims: judge）：units 是这一批几句 */
@@ -1785,14 +1782,17 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
       case 'evidence.judged': {
         // 探索运行跑完、封存之后，有人点开结论句请模型判断：判定追加在封存之后，不改封存的报告
         const verdicts = d.verdicts && typeof d.verdicts === 'object' ? Object.values(d.verdicts as Record<string, any>) : []
-        const judged = verdicts.filter((v) => ['supported', 'partial', 'unsupported', 'not_a_claim'].includes(v?.status)).length
+        const judged = verdicts.filter((v) => isJudged(v)).length
         const hit: string[] = Array.isArray(d.limits_hit) ? d.limits_hit : []
         push({
           id: `ej-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: 'evidence_judged',
           level: hit.length || (Array.isArray(d.gaps) && d.gaps.length) ? 'warn' : 'info',
           title: `封存后按需裁判了 ${formatNumber(judged)} 句结论${hit.length ? '，部分因达到上限未裁判' : ''}`,
           sub: '封存后追加 · 模型判断，非确定',
-          ...(d.model ? { detail: [`模型：${d.model}`, ...(Array.isArray(d.gaps) ? d.gaps.map(String) : [])].join('\n') } : {}),
+          // 裁判模型和写作模型相同、模型不在价格表里：和证据面板「模型的解释」同样的两句提醒
+          ...(d.model ? { detail: [`模型：${d.model}`, ...(d.same_model === true ? [JUDGE_TEXT.sameModel] : []),
+            ...(d.priced === false ? [JUDGE_TEXT.noPrice] : []),
+            ...(Array.isArray(d.gaps) ? d.gaps.map(String) : [])].join('\n') } : {}),
         }, nodeId)
         break
       }

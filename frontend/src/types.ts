@@ -755,9 +755,20 @@ export interface EvidenceUnit {
  * timeout_s，rationale 以「已到上限（…）」开头）、error、format、missing、on_demand（探索运行按需）
  */
 export interface EvidenceVerdict {
-  status: 'supported' | 'partial' | 'unsupported' | 'not_a_claim' | 'unjudged' | string
-  /** 理由，最多 60 字 */
+  /**
+   * contradicted：证据和原句冲突；insufficient：证据里没有相关信息（missing 写缺的是什么）。
+   * unsupported 是拆档之前的取值：旧文档、旧事件里保留原样，界面上照旧写「证据不支持」
+   */
+  status: 'supported' | 'partial' | 'contradicted' | 'insufficient' | 'unsupported' | 'not_a_claim' | 'unjudged' | string
+  /** 理由，最多 120 字（后端在句子边界截断，加「…」） */
   rationale?: string
+  /** insufficient 时缺的是什么：「SQL」「字段清单」「取数的查询」…，由裁判给出 */
+  missing?: string
+  /** 按哪一版裁判规则判的（新判的都带；拆档之前判的没有） */
+  rule_version?: number
+  /** 判定自己带着的模型提醒（有的话盖过报告、答复、证据图里的） */
+  same_model?: boolean
+  priced?: boolean | null
   /** 裁判模型 id；探索运行还没判的是 null */
   judge?: string | null
   /** 封存之后按需追加的（evidence.judged 事件） */
@@ -780,7 +791,8 @@ export interface EvidenceJudgeSummary {
   candidates?: number
   /** 预筛放掉、没送裁判的结论句 */
   screened?: string[]
-  counts?: Partial<Record<'supported' | 'partial' | 'unsupported' | 'not_a_claim' | 'unjudged', number>>
+  counts?: Partial<Record<'supported' | 'partial' | 'contradicted' | 'insufficient' | 'unsupported' | 'not_a_claim'
+    | 'unjudged', number>>
   unjudged?: Record<string, number>
   limits_hit?: string[]
   complete?: boolean
@@ -792,6 +804,8 @@ export interface EvidenceJudgeSummary {
   gaps?: string[]
   notes?: string[]
   same_model?: boolean
+  /** 撰写这份报告实际用的模型 id（裁判模型和它相同时 same_model 为真） */
+  writer_model?: string | null
   /**
    * 不支持的句子交回写作者改写一次（rewrite_once）。units：交回的句子在封存文档里的编号（采用了改写稿时，
    * 改掉的句子是 null）；sentences：交回的原句；changed：改写稿里新写的句子的编号（没采用时为空）；
@@ -822,13 +836,28 @@ export interface EvidenceJudgeResult {
   message?: string | null
   /** 触顶时怎么调，一个上限一句 */
   adjust?: string[]
+  /** 这一次裁判模型和写作模型相同、模型在不在价格表里、写作模型 id */
+  same_model?: boolean
+  priced?: boolean | null
+  writer_model?: string | null
   [key: string]: unknown
+}
+
+/** 证据图 reports[].judge_meta：这份报告最近一次按需裁判用的模型 */
+export interface EvidenceJudgeMeta {
+  model?: string | null
+  same_model?: boolean
+  priced?: boolean | null
+  writer_model?: string | null
 }
 
 /** 这句能不能「请模型判断」：片段接口按运行的实际情况答（和按需裁判接口同一套条件） */
 export interface EvidenceOnDemand {
   available?: boolean
-  /** formal / legacy / not_a_claim / judged / unsealed / seal_broken */
+  /**
+   * formal / legacy / not_a_claim / judged / unsealed / seal_broken；outdated 是封存后追加的判定早于当前的裁判规则
+   * （available 为真，照常给按钮）
+   */
   reason?: string | null
   message?: string | null
 }
@@ -875,9 +904,11 @@ export interface EvidenceStats {
   quotes?: number
   unknown_entities?: number
   unverified_entities?: number
-  /** 四期：claims 为 judge 时追加，候选句按判定的句数 */
+  /** 四期：claims 为 judge 时追加，候选句按判定的句数（unsupported 是拆档之前的取值，旧文档里才有） */
   supported?: number
   partial?: number
+  contradicted?: number
+  insufficient?: number
   unsupported?: number
   not_a_claim?: number
   unjudged?: number
@@ -947,7 +978,9 @@ export interface EvidenceGraph {
                */
               post_seal_verdicts?: Record<string, EvidenceVerdict> | null
               /** 封存的裁判摘要（文档的 judge） */
-              judge?: EvidenceJudgeSummary | null }[]
+              judge?: EvidenceJudgeSummary | null
+              /** 最近一次按需裁判用的模型：和写作模型相同没有、在不在价格表里 */
+              judge_meta?: EvidenceJudgeMeta | null }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
@@ -1107,6 +1140,11 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   snapshot_truncated?: boolean
   /** 好几张表都有的同名字段：各表的类型 */
   types?: Record<string, string>
+  /** 表：字段清单和类型（封存范围内的表结构快照，最多 60 个，遮罩的列不列入）；多出来的个数 */
+  fields?: { name?: string; type?: string | null }[]
+  fields_more?: number
+  /** 有列按遮罩没列进字段清单 */
+  fields_masked?: boolean
   /** 表：几个字段、是不是视图；表或字段的注释 */
   is_view?: boolean
   comment?: string

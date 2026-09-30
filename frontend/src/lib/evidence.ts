@@ -14,8 +14,12 @@
  * 按数值猜的候选用最淡的点状线。
  *
  * 四期接上了概率性的几种：结论句的判定是模型给的，只在句末挂一枚小徽标（◆ 有依据、◇ 部分有依据、
- * ! 证据不支持且整句浅底、? 未裁判），整句的字不画线。判定有两个来源：封存的文档里节点当场判的，
+ * ! 证据相矛盾且整句浅底、○ 证据不足、? 未裁判），整句的字不画线。判定有两个来源：封存的文档里节点当场判的，
  * 和探索运行里点开再判、封存之后追加的（后者盖过前者，另写「封存后追加」）。
+ *
+ * 裁判拆档（JR）：原来的「证据不支持」拆成证据相矛盾（证据和原句冲突）和证据不足（证据里没有相关信息，
+ * 裁判写明缺什么）。证据不足是中性的：不用红，字形用 ○，和未裁判的 ? 分得开。旧文档、旧事件里的
+ * unsupported 原样保留，外观同证据相矛盾，叫法照旧「证据不支持」。
  */
 
 import {
@@ -25,8 +29,9 @@ import {
 import { NONE, formatNumber, shortId } from './format'
 import type {
   EvidenceBlock, EvidenceCaliberSource, EvidenceCaliberUpgrade, EvidenceCandidate, EvidenceDocData, EvidenceFieldRef,
-  EvidenceGraph, EvidenceGuess, EvidenceInput, EvidenceLocator, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail,
-  EvidenceStats, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation, ReviewResult,
+  EvidenceGraph, EvidenceGuess, EvidenceInput, EvidenceJudgeMeta, EvidenceJudgeSummary, EvidenceLocator, EvidenceSeal,
+  EvidenceSegment, EvidenceSegmentDetail, EvidenceStats, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
+  ReviewResult,
 } from '../types'
 import type { MarkSpec } from '../run/Markdown'
 
@@ -80,6 +85,21 @@ export const EVIDENCE_STATE: Record<EvidenceStateCode, EvidenceStateMeta> = {
     alert: true, phase: 4,
     hint: '裁判模型认为证据仅支持本句的一部分',
   },
+  contradicted: {
+    code: 'contradicted', label: EVIDENCE_STATE_LABEL.contradicted, line: 'badge', glyph: '!',
+    color: 'var(--st-failed)', decoration: 'transparent', soft: 'var(--st-failed-soft)',
+    alert: true, phase: 4,
+    hint: '裁判模型认为附带的证据与本句相冲突',
+  },
+  // 证据不足：中性，不用红（不是证据说它错了，是摘录里没有能判断的信息）。字形用 ○，不和未裁判的 ? 混；
+  // 仍算问题（进 n / N），排在证据相矛盾、部分有依据之后
+  insufficient: {
+    code: 'insufficient', label: EVIDENCE_STATE_LABEL.insufficient, line: 'badge', glyph: '○',
+    color: 'var(--st-cancelled)', decoration: 'transparent', soft: 'var(--st-cancelled-soft)',
+    alert: true, phase: 4,
+    hint: '裁判模型认为附带的证据中没有判断本句所需的信息，既不能证实也不能否定',
+  },
+  // 拆档之前的取值：旧文档、旧事件里保留原样。外观同证据相矛盾
   unsupported: {
     code: 'unsupported', label: EVIDENCE_STATE_LABEL.unsupported, line: 'badge', glyph: '!',
     color: 'var(--st-failed)', decoration: 'transparent', soft: 'var(--st-failed-soft)',
@@ -128,6 +148,19 @@ export const EVIDENCE_STATE: Record<EvidenceStateCode, EvidenceStateMeta> = {
 
 /** 图例、检查脚本按这个顺序列 */
 export const EVIDENCE_STATES = Object.keys(EVIDENCE_STATE) as EvidenceStateCode[]
+
+/**
+ * n / N 跳转按两轮走：先走第 1 轮（无证据、可疑名称、证据相矛盾、旧的证据不支持、部分有依据），再走第 2 轮
+ * （证据不足），每一轮里按正文顺序。不进跳转的是 0
+ */
+export function alertTier(state: EvidenceStateCode | null | undefined): 0 | 1 | 2 {
+  if (!state || !EVIDENCE_STATE[state].alert) return 0
+  return state === 'insufficient' ? 2 : 1
+}
+
+/** 证据和原句冲突的两种（新取值、拆档之前的旧取值）：整句铺浅底 */
+export const conflicting = (state: EvidenceStateCode | null | undefined): boolean =>
+  state === 'contradicted' || state === 'unsupported'
 
 /**
  * 片段在正文里的状态。文字、结构片段（行首符号、表格竖线）是 null：不画线、不进键盘顺序。
@@ -543,7 +576,7 @@ export function tallySummary(t: EvidenceTally, keys: boolean): string {
     t.unverified ? `${formatNumber(t.unverified)} 个名称${EVIDENCE_STATE.unverified.label}` : '',
     t.structural ? EVIDENCE_TEXT.structuralCount(t.structural) : '',
     t.noSegment ? EVIDENCE_TEXT.noSegmentCount(t.noSegment) : '',
-    keys ? (t.claims?.unsupported || t.claims?.partial ? JUDGE_TEXT.keysHint : EVIDENCE_TEXT.keysHint) : '',
+    keys ? (claimProblems(t.claims) ? JUDGE_TEXT.keysHint : EVIDENCE_TEXT.keysHint) : '',
   ].filter(Boolean).join('。')
 }
 
@@ -843,8 +876,11 @@ export function stampCounts(stats: EvidenceStats | null | undefined, claims?: st
 // 四期：结论句裁判
 // -------------------------------------------------------------------------
 
-/** 判过了的四种（不含未裁判）：同后端 judge.JUDGED。判过的不再给「请模型判断这句」 */
-const JUDGED = new Set(['supported', 'partial', 'unsupported', 'not_a_claim'])
+/**
+ * 判过了的几种（不含未裁判）：同后端 judge.JUDGED，另加拆档之前的 unsupported（旧文档、旧事件里还有）。
+ * 判过的不再给「请模型判断这句」
+ */
+const JUDGED = new Set(['supported', 'partial', 'contradicted', 'insufficient', 'unsupported', 'not_a_claim'])
 /** 触顶的四个上限：同后端 judge.LIMITS，这几种没判的写「已到上限」和怎么调 */
 export const JUDGE_LIMITS: readonly string[] = ['max_claims', 'max_cost_usd', 'daily_max_usd', 'timeout_s']
 
@@ -862,9 +898,70 @@ export function verdictState(v: Pick<EvidenceVerdict, 'status'> | null | undefin
   switch (v?.status) {
     case 'supported': return 'supported'
     case 'partial': return 'partial'
+    case 'contradicted': return 'contradicted'
+    case 'insufficient': return 'insufficient'
     case 'unsupported': return 'unsupported'
     case 'unjudged': return 'unjudged'
     default: return null
+  }
+}
+
+/** 证据不足时缺的是什么（裁判给的）；别的判定、没写的是空串 */
+export function verdictMissing(v: Pick<EvidenceVerdict, 'status' | 'missing'> | null | undefined): string {
+  return v?.status === 'insufficient' && typeof v.missing === 'string' ? v.missing.trim() : ''
+}
+
+/** 结论句的计数里有没有要提醒的：证据相矛盾、旧的证据不支持、部分有依据、证据不足（横幅、证据条的「定位下一处」） */
+export function claimProblems(c: ClaimTallyCounts | null | undefined): number {
+  if (!c) return 0
+  return (c.contradicted ?? 0) + (c.unsupported ?? 0) + (c.partial ?? 0) + (c.insufficient ?? 0)
+}
+
+/** 计数表里认的几种判定（「不是结论句」不算进总数） */
+const COUNTED = ['supported', 'partial', 'contradicted', 'insufficient', 'unsupported', 'unjudged'] as const
+
+/**
+ * 按判定分好的句数（report.checked 的 judge.counts、文档 stats 里裁判那几个键、出具的 claims.counts）→ 横幅那种
+ * 计数：总数不算「不是结论句」，旧数据的 unsupported 照样计入。一个判定都没有时总数是 0
+ */
+export function claimCountsOf(counts: Record<string, unknown> | null | undefined): ClaimTallyCounts {
+  const n = (k: string) => {
+    const v = counts?.[k]
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
+  }
+  const c: ClaimTallyCounts = { total: 0, supported: 0, partial: 0, contradicted: 0, insufficient: 0, unsupported: 0,
+                                unjudged: 0, uncited: 0 }
+  for (const k of COUNTED) {
+    c[k] = n(k)
+    c.total += c[k]
+  }
+  return c
+}
+
+/**
+ * 这条判定该带的两条提醒：裁判模型和写作模型相同、模型不在价格表里（金额上限对它不生效）。只对模型判过的判定。
+ * 按从近到远取：判定自己带着的 → 封存之后追加的看这一次按需裁判的答复、再看证据图里最近一次按需裁判
+ * （reports[].judge_meta）；节点里当场判的看报告文档的 judge。都没说的不提醒
+ */
+export function judgeFlags(v: EvidenceVerdict | null | undefined, from: {
+  doc?: Pick<EvidenceJudgeSummary, 'same_model' | 'priced' | 'writer_model' | 'model'> | null
+  reply?: { same_model?: unknown; priced?: unknown; writer_model?: unknown; model?: unknown } | null
+  meta?: EvidenceJudgeMeta | null
+} = {}): { sameModel: boolean; unpriced: boolean; writer: string | null; model: string | null } {
+  const none = { sameModel: false, unpriced: false, writer: null, model: null }
+  if (!v || !isJudged(v)) return none
+  const layers = (v.post_seal ? [v, from.reply, from.meta] : [v, from.doc]).filter(Boolean) as Record<string, unknown>[]
+  const pick = <T,>(key: string, ok: (x: unknown) => x is T): T | undefined => {
+    for (const l of layers) if (ok(l[key])) return l[key] as T
+    return undefined
+  }
+  const isBool = (x: unknown): x is boolean => typeof x === 'boolean'
+  const isText = (x: unknown): x is string => typeof x === 'string' && !!x
+  return {
+    sameModel: pick('same_model', isBool) === true,
+    unpriced: pick('priced', isBool) === false,
+    writer: pick('writer_model', isText) ?? null,
+    model: (isText(v.judge) ? v.judge : pick('model', isText)) ?? null,
   }
 }
 
@@ -891,15 +988,17 @@ export function claimCounts(
   doc: Pick<EvidenceDocData, 'blocks' | 'judge'>, overlay?: Record<string, EvidenceVerdict> | null,
 ): ClaimTallyCounts | null {
   const judged = !!doc.judge && typeof doc.judge === 'object'
-  const c: ClaimTallyCounts = { total: 0, supported: 0, partial: 0, unsupported: 0, unjudged: 0, uncited: 0 }
+  const c: ClaimTallyCounts = { total: 0, supported: 0, partial: 0, contradicted: 0, insufficient: 0, unsupported: 0,
+                                unjudged: 0, uncited: 0 }
   let seen = judged
   for (const block of doc.blocks ?? []) {
     for (const unit of block.units ?? []) {
       const v = unitVerdict(unit, overlay)
       if (v) seen = true
       if (v) {
-        if (v.status === 'supported' || v.status === 'partial' || v.status === 'unsupported' || v.status === 'unjudged') {
-          c[v.status] += 1
+        const k = (COUNTED as readonly string[]).includes(v.status) ? v.status as typeof COUNTED[number] : null
+        if (k) {
+          c[k] += 1
           c.total += 1
         }
         continue
@@ -932,12 +1031,13 @@ const clip = (text: string, n = 40) => (text.length > n ? `${text.slice(0, n - 1
 
 /**
  * 句末徽标的 aria-label：句子、判定都写全，封存后追加的另说。「结论句「增长主要来自新客首单…」，
- * 模型判断：证据不支持」；到上限没判的说「未裁判：已到上限」
+ * 模型判断：证据相矛盾」；证据不足的接着说缺什么；到上限没判的说「未裁判：已到上限」
  */
 export function claimLabel(unit: Pick<EvidenceUnit, 'segments'>, v: EvidenceVerdict): string {
   const state = verdictState(v)
   const said = state ? EVIDENCE_STATE[state].label : JUDGE_TEXT.notClaim
-  const why = limitOf(v) ? `${said}：${JUDGE_TEXT.limit}` : said
+  const missing = verdictMissing(v)
+  const why = limitOf(v) ? `${said}：${JUDGE_TEXT.limit}` : missing ? `${said}，${JUDGE_TEXT.missing(missing)}` : said
   return JUDGE_TEXT.badgeLabel(clip(unitText(unit).trim()), why, !!v.post_seal)
 }
 
@@ -954,6 +1054,7 @@ function asVerdict(v: unknown, fallback: { model?: unknown; postSeal: boolean })
     post_seal: typeof o.post_seal === 'boolean' ? o.post_seal : fallback.postSeal,
     used: Array.isArray(o.used) ? o.used.map(String) : undefined,
     reason: typeof o.reason === 'string' ? o.reason : undefined,
+    missing: typeof o.missing === 'string' && o.missing.trim() ? o.missing : undefined,
   }
 }
 
@@ -1005,6 +1106,68 @@ export function rewriteOf(doc: Pick<EvidenceDocData, 'judge'>, uid: string):
   }
   if (!r.applied && typeof r.reason === 'string' && r.reason && units.includes(uid)) return { kind: 'rejected', reason: r.reason }
   return null
+}
+
+/**
+ * 讲方法、讲结构的句子（JR 第 3 条）：写作者只挂了表名、字段名或整份查询（[[see:Qn]]），没挂数字、值、口径卡、
+ * 引文。这类句子的「挂的依据」下直接列出对应的 SQL 和字段清单——裁判看的就是这些，读的人也该看得到。
+ *
+ * 返回要列的东西：表（字段清单）、字段（类型）各自在句中的片段（字段清单、类型从这个片段的证据链取），
+ * 要列 SQL 的查询（直接挂的在前，再补表名字段名出现过的查询，最多 BASIS_QUERIES 个，多的只写个数）。
+ * 挂了别的依据、或者一个表名字段名和查询都没挂的，返回 null（照旧只列编号）
+ */
+export const BASIS_QUERIES = 3
+export interface ClaimBasis {
+  tables: { alias: string; name: string; seg?: string }[]
+  columns: { alias: string; name: string; seg?: string }[]
+  queries: string[]
+  more: number
+}
+export function claimBasis(
+  unit: Pick<EvidenceUnit, 'cites' | 'see' | 'segments'>, doc: Pick<EvidenceDocData, 'catalog' | 'blocks'>,
+): ClaimBasis | null {
+  const catalog = doc.catalog ?? {}
+  const cites = (unit.cites ?? []).filter((a): a is string => typeof a === 'string' && !!a)
+  if (!cites.length) return null
+  const entity = (kind: unknown) => kind === 'table' || kind === 'column'
+  // 句中写作者标的引用（自动链接的名字不算依据）：数字、值、单元格、口径卡、引文都算「挂了数据」
+  if ((unit.segments ?? []).some((s) => s.cite && !s.auto && s.cite.status === 'resolved' && !entity(s.cite.kind))) return null
+  if ((unit.see ?? []).some((c) => c?.status === 'resolved' && !entity(c.kind) && c.kind !== 'query')) return null
+  const out: ClaimBasis = { tables: [], columns: [], queries: [], more: 0 }
+  const segOf = (alias: string): string | undefined => {
+    const hit = (u: Pick<EvidenceUnit, 'segments'>) =>
+      (u.segments ?? []).find((s) => s.cite?.alias === alias && s.state === 'deterministic')?.id
+    return hit(unit) ?? (doc.blocks ?? []).flatMap((b) => b.units ?? []).map(hit).find(Boolean)
+  }
+  const nameOf = (alias: string, entry: Record<string, any> | undefined) => {
+    const loc = entry?.locator ?? {}
+    if (entry?.kind === 'column' && loc.table && loc.column) return `${loc.table}.${loc.column}`
+    return typeof entry?.name === 'string' && entry.name ? entry.name : alias.replace(/^[tc]:/, '')
+  }
+  const queries: string[] = []
+  for (const alias of cites) {
+    const entry = catalog[alias]
+    if (entry?.kind === 'table') out.tables.push({ alias, name: nameOf(alias, entry), seg: segOf(alias) })
+    else if (entry?.kind === 'column') out.columns.push({ alias, name: nameOf(alias, entry), seg: segOf(alias) })
+    else if (entry?.kind === 'query') queries.push(alias)
+    else return null
+  }
+  for (const e of [...out.tables, ...out.columns]) {
+    for (const q of Array.isArray(catalog[e.alias]?.queries) ? catalog[e.alias].queries : []) {
+      if (typeof q === 'string' && catalog[q]?.kind === 'query' && !queries.includes(q)) queries.push(q)
+    }
+  }
+  out.queries = queries.slice(0, BASIS_QUERIES)
+  out.more = Math.max(0, queries.length - BASIS_QUERIES)
+  return out
+}
+
+/** 查询快照工件里的 SQL：快照本身带 sql；工具调用的快照（{tool, args, result}）在 args 或 result 里 */
+export function sqlOf(content: unknown): string | null {
+  if (!content || typeof content !== 'object') return null
+  const o = content as { sql?: unknown; args?: { sql?: unknown }; result?: { sql?: unknown } }
+  const sql = [o.sql, o.args?.sql, o.result?.sql].find((x) => typeof x === 'string' && x.trim())
+  return typeof sql === 'string' ? sql : null
 }
 
 // -------------------------------------------------------------------------
@@ -1082,11 +1245,22 @@ export interface AuditRow {
   sentence: string
   /** 这件证据在不在封存范围内（封存核对也通过）；没有证据的是 null */
   sealed: boolean | null
+  /** 结论句那几行：是哪一句（正文里有句末徽标时点这一行打开它的「模型的解释」） */
+  unit?: string
 }
 
 const GROUP_OF: Record<EvidenceStateCode, AuditGroup> = {
   deterministic: 'cited', none: 'none', suspect: 'suspicious', unverified: 'suspicious', candidate: 'candidate',
-  supported: 'cited', partial: 'none', unsupported: 'none', unjudged: 'cited', connective: 'cited',
+  supported: 'cited', partial: 'none', contradicted: 'none', insufficient: 'none', unsupported: 'none', unjudged: 'cited',
+  connective: 'cited',
+}
+/** 审计行带的判定 → 行的状态：有问题的几种才有自己的行，认不出的交给后面按 state 认 */
+const claimRowState = (status: unknown): EvidenceStateCode | undefined =>
+  status === 'contradicted' || status === 'insufficient' || status === 'unsupported' || status === 'partial' ? status : undefined
+/** 审计行的 issue → 结论句的判定（后端按约定给证据相矛盾、证据不足的结论句各一行；旧取值也认） */
+const CLAIM_ISSUE: Record<string, EvidenceStateCode> = {
+  contradicted_claim: 'contradicted', insufficient_claim: 'insufficient', unsupported_claim: 'unsupported',
+  partial_claim: 'partial',
 }
 const AUDIT_GROUP_SET = new Set<string>(['cited', 'none', 'suspicious', 'candidate'])
 
@@ -1111,7 +1285,10 @@ export function auditFromApi(body: unknown): AuditRow[] {
     for (const [ri, r] of (Array.isArray(g?.rows) ? g.rows : []).entries()) {
       if (!r || typeof r !== 'object') continue
       const kind = String(r.kind ?? '')
-      const state = segmentState({ kind, state: r.state ?? 'none', issue: r.issue ?? undefined })
+      // 结论句的判定行：按 issue 认成对应的判定（外观、叫法同句末徽标）；issue 认不出时看行上带的 verdict
+      const state = (kind === 'claim' && typeof r.issue === 'string' ? CLAIM_ISSUE[r.issue] : undefined)
+        ?? (kind === 'claim' && r.verdict && typeof r.verdict === 'object' ? claimRowState(r.verdict.status) : undefined)
+        ?? segmentState({ kind, state: r.state ?? 'none', issue: r.issue ?? undefined })
         ?? (r.group === 'candidate' ? 'candidate' : 'none')
       const group: AuditGroup = AUDIT_GROUP_SET.has(r.group) ? r.group : AUDIT_GROUP_SET.has(g?.key) ? g.key : GROUP_OF[state]
       const report = String(r.report ?? r.field ?? '')
@@ -1126,6 +1303,7 @@ export function auditFromApi(body: unknown): AuditRow[] {
         ref: typeof r.ref === 'string' ? r.ref : undefined,
         sentence: String(r.sentence ?? '').trim(),
         sealed: typeof r.sealed === 'boolean' ? r.sealed : null,
+        ...(kind === 'claim' && typeof r.unit === 'string' && r.unit ? { unit: r.unit } : {}),
       })
     }
   })

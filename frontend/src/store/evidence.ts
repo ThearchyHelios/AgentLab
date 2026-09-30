@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
 import { create } from 'zustand'
 import { ApiError, api } from '../api/client'
-import { graphVerdicts, judgedVerdicts } from '../lib/evidence'
+import { graphVerdicts, judgedVerdicts, sqlOf } from '../lib/evidence'
 import type {
   EvidenceDocData, EvidenceGraph, EvidenceJudgeResult, EvidenceSegmentDetail, EvidenceStats, EvidenceVerdict,
 } from '../types'
@@ -44,6 +44,12 @@ interface EvidenceState {
   docs: Record<string, Slot<EvidenceDocData>>
   graphs: Record<string, Slot<EvidenceGraph>>
   segments: Record<string, Slot<EvidenceSegmentDetail>>
+  /**
+   * 查询快照里的 SQL，按工件 id 缓存（内容寻址，永久）：讲方法、讲结构的句子在「挂的依据」下直接列出。
+   * 只留 SQL，不留整份快照的行
+   */
+  sqls: Record<string, Slot<{ sql: string | null }>>
+  loadSql: (artifact: string) => Promise<void>
   /** 按工作流：最近一次运行的报告统计。画布没挂着运行时，报告节点卡的章从这里取 */
   latest: Record<string, Slot<LatestReports>>
   loadDoc: (artifact: string) => Promise<void>
@@ -100,7 +106,7 @@ export const useEvidence = create<EvidenceState>((set, get) => {
    * 取一次、记进 table[key]；正在取或已经取到的不再发。取的途中这一格被清掉或换了（dropLatest 之后
    * 又起了一次），回来的结果作废：不能让早先发出的请求把后来那份盖掉
    */
-  async function fill<K extends 'docs' | 'graphs' | 'segments' | 'latest'>(
+  async function fill<K extends 'docs' | 'graphs' | 'segments' | 'latest' | 'sqls'>(
     table: K, key: string, fetcher: () => Promise<NonNullable<EvidenceState[K][string]['data']>>, force = false,
   ) {
     const cur = get()[table][key]
@@ -124,6 +130,8 @@ export const useEvidence = create<EvidenceState>((set, get) => {
     graphs: {},
     segments: {},
     latest: {},
+    sqls: {},
+    loadSql: (artifact) => fill('sqls', artifact, async () => ({ sql: sqlOf((await api.artifact(artifact))?.content) })),
     loadDoc: (artifact) => fill('docs', artifact, async () => {
       const res = await api.artifact(artifact)
       const doc = asDoc(res?.content)

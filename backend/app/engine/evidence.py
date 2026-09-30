@@ -413,6 +413,37 @@ def schema_entry_fields(content: Any) -> dict[str, Any] | None:
     return fields
 
 
+def schema_table(content: Any, name: Any) -> dict[str, Any] | None:
+    """表结构快照里的一张表：表名一字不差的优先，其次不分大小写、全名（schema.表）也认。"""
+    tables = content.get("tables") if isinstance(content, dict) else None
+    if not isinstance(tables, dict) or not name:
+        return None
+    if isinstance(tables.get(name), dict):
+        return tables[name]
+    lowered = str(name).lower()
+    return next((t for key, t in tables.items() if isinstance(t, dict)
+                 and lowered in (str(key).lower(), str(t.get("qualified") or "").lower())), None)
+
+
+def schema_column(table: dict[str, Any] | None, name: Any) -> dict[str, Any] | None:
+    """表结构快照里一张表的一个字段：名字一字不差的优先，其次不分大小写。"""
+    columns = [c for c in (table or {}).get("columns") or [] if isinstance(c, dict)]
+    return next((c for c in columns if c.get("name") == name), None) \
+        or next((c for c in columns if str(c.get("name") or "").lower() == str(name or "").lower()), None)
+
+
+def table_fields(table: dict[str, Any] | None, hidden: set[str] | frozenset[str] = frozenset(), *,
+                 limit: int = 60) -> tuple[list[dict[str, str]], int, bool]:
+    """一张表的字段清单：([{name, type}] 最多 limit 个, 另有几个没列, 有没有字段按遮罩没列)。
+
+    hidden 是要遮的列（小写）：遮罩的字段不列，也不计入「另有几个」。证据面板和裁判的摘录同一个口径。
+    """
+    columns = [c for c in (table or {}).get("columns") or [] if isinstance(c, dict) and c.get("name")]
+    shown = [c for c in columns if str(c["name"]).lower() not in hidden]
+    fields = [{"name": str(c["name"]), "type": str(c.get("type") or "")} for c in shown[:limit]]
+    return fields, max(0, len(shown) - limit), len(shown) < len(columns)
+
+
 def schema_ledger_entry(artifact: str, *, node_id: str, exec_no: int,
                         loader: Callable[[str], Any] | None = None) -> dict[str, Any] | None:
     """一件表结构快照 → 台账的 schema 条目。快照取不回来（或者哈希对不上）返回 None。

@@ -175,7 +175,7 @@ async def save_setting(key: str, value) -> None:
 
 
 async def test_an_on_demand_verdict_lands_after_the_seal_and_the_seal_still_holds(client, monkeypatch):
-    models = Models(monkeypatch, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
     assert row.status == "succeeded" and models.judges == [], "探索运行节点里不判"
     doc = doc_of(row)
@@ -185,7 +185,7 @@ async def test_an_on_demand_verdict_lands_after_the_seal_and_the_seal_still_hold
     assert res.status_code == 200, res.text
     body = res.json()
     verdict = body["verdicts"][ids[CAUSAL]]
-    assert verdict["status"] == "unsupported" and verdict["post_seal"] is True and verdict["judge"] == PRICED
+    assert verdict["status"] == "contradicted" and verdict["post_seal"] is True and verdict["judge"] == PRICED
     assert verdict["rationale"] and body["judged"] == [ids[CAUSAL]] and body["reused"] == []
     assert body["report"] == {"node_id": "write", "doc_artifact": row.output["_evidence"]["doc_artifact"]}
     assert body["post_seal"] is True and body["limited"] is False and body["calls"] == 1
@@ -276,9 +276,9 @@ async def test_a_failed_attempt_can_be_retried(client, monkeypatch):
     failed = (await judge(client, row.id, [uid])).json()
     assert failed["verdicts"][uid]["status"] == "unjudged" and failed["verdicts"][uid]["reason"] == "error"
     assert "网关 502" in failed["message"] and failed["limited"] is False
-    models = Models(monkeypatch, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, verdicts={"新客": "contradicted"})
     retried = (await judge(client, row.id, [uid])).json()
-    assert retried["verdicts"][uid]["status"] == "unsupported" and retried["reused"] == [] and len(models.judges) == 1
+    assert retried["verdicts"][uid]["status"] == "contradicted" and retried["reused"] == [] and len(models.judges) == 1
 
 
 # --------------------------------------------------------------------------
@@ -414,7 +414,7 @@ async def test_a_broken_seal_is_not_judged(client, monkeypatch):
 async def test_a_run_continued_during_the_judge_call_records_no_event(client, monkeypatch, meanwhile):
     """判定只接在点击开始时的那份封存后面。运行在裁判期间被接着跑了，再追加就落进一次活着的运行中间，
     还会被封进下一份清单：不记进运行记录，判定照样交回给点的人，并说明为什么没记。"""
-    models = Models(monkeypatch, verdicts={"新客": "unsupported"})
+    models = Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
     uid = unit_ids(doc_of(row))[CAUSAL]
     ask_model = judge_mod.get_chat_model
@@ -430,7 +430,7 @@ async def test_a_run_continued_during_the_judge_call_records_no_event(client, mo
     assert res.status_code == 200, res.text
     body = res.json()
     assert len(models.judges) == 1 and body["calls"] == 1, "模型问过了"
-    assert body["verdicts"][uid]["status"] == "unsupported" and body["judged"] == [uid], "判定照样交回"
+    assert body["verdicts"][uid]["status"] == "contradicted" and body["judged"] == [uid], "判定照样交回"
     assert body["event"] is None and "运行已继续执行" in body["message"] and "未写入运行记录" in body["message"]
     assert await judged_events(row.id) == []
     async with SessionLocal() as session:
@@ -444,7 +444,7 @@ async def test_a_continue_that_wins_the_row_between_check_and_write_gets_no_even
     from app.core.bus import bus
     from app.core.config import settings
 
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
     uid = unit_ids(doc_of(row))[CAUSAL]
     set_seq = bus.set_seq
@@ -462,7 +462,7 @@ async def test_a_continue_that_wins_the_row_between_check_and_write_gets_no_even
 
     monkeypatch.setattr(bus, "set_seq", claimed_in_between)
     body = (await judge(client, row.id, [uid])).json()
-    assert body["verdicts"][uid]["status"] == "unsupported" and body["event"] is None
+    assert body["verdicts"][uid]["status"] == "contradicted" and body["event"] is None
     assert "未写入运行记录" in body["message"] and await judged_events(row.id) == []
     async with SessionLocal() as session:
         after = await session.get(Run, row.id)
@@ -503,7 +503,7 @@ async def test_sentences_that_are_not_claims_are_skipped(client, monkeypatch):
 
 
 async def test_the_segment_shows_the_verdict_and_whether_it_can_still_be_asked(client, monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
     doc = doc_of(row)
     ids = unit_ids(doc)
@@ -513,7 +513,7 @@ async def test_the_segment_shows_the_verdict_and_whether_it_can_still_be_asked(c
 
     await judge(client, row.id, [ids[CAUSAL]])
     after = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, ids[CAUSAL])}")).json()
-    assert after["unit"]["verdict"]["status"] == "unsupported" and after["unit"]["verdict"]["post_seal"] is True
+    assert after["unit"]["verdict"]["status"] == "contradicted" and after["unit"]["verdict"]["post_seal"] is True
     assert after["unit"]["on_demand"]["available"] is False and after["unit"]["on_demand"]["reason"] == "judged"
     assert "模型" in after["note"] and "后续版本" not in after["note"]
     other = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, ids[CITED])}")).json()
@@ -531,11 +531,11 @@ async def test_the_segment_shows_the_verdict_and_whether_it_can_still_be_asked(c
 
 
 async def test_sealed_verdicts_of_a_formal_run_are_shown_as_sealed(client, monkeypatch):
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge", judge={"max_cost_usd": 0.05}), run_class="formal")
     doc = doc_of(row)
     body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, unit_ids(doc)[CAUSAL])}")).json()
-    assert body["unit"]["verdict"]["status"] == "unsupported" and body["unit"]["verdict"]["post_seal"] is False
+    assert body["unit"]["verdict"]["status"] == "contradicted" and body["unit"]["verdict"]["post_seal"] is False
     assert body["unit"]["on_demand"]["reason"] == "formal"
     graph = (await client.get(f"/api/runs/{row.id}/evidence")).json()
     assert graph["reports"][0]["post_seal_verdicts"] == {} and graph["reports"][0]["judge"]["mode"] == "inline"
@@ -543,7 +543,7 @@ async def test_sealed_verdicts_of_a_formal_run_are_shown_as_sealed(client, monke
 
 async def test_a_forged_event_cannot_overwrite_a_sealed_verdict(client, monkeypatch):
     """封存后追加的判定只填补没判过的句子：封存内判过的，后面追加什么都盖不掉。"""
-    Models(monkeypatch, verdicts={"新客": "unsupported"})
+    Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge", judge={"max_cost_usd": 0.05}), run_class="formal")
     doc = doc_of(row)
     uid = unit_ids(doc)[CAUSAL]
@@ -552,7 +552,7 @@ async def test_a_forged_event_cannot_overwrite_a_sealed_verdict(client, monkeypa
                            doc_artifact=doc_artifact, post_seal=True,
                            verdicts={uid: {"status": "supported", "rationale": "改好了", "judge": "x", "post_seal": True}})
     body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, uid)}")).json()
-    assert body["unit"]["verdict"]["status"] == "unsupported"
+    assert body["unit"]["verdict"]["status"] == "contradicted"
 
 
 async def test_appended_verdicts_always_read_as_post_seal(client, monkeypatch):

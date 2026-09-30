@@ -23,7 +23,7 @@ import {
 } from './decode'
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
-import { EVIDENCE_STATE, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
+import { EVIDENCE_STATE, claimProblems, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
 import type { EvidenceDocData } from '../types'
 import { useRunClock } from './useRunClock'
 import type { ReviewResult } from '../types'
@@ -2289,7 +2289,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
       {counts && (counts.total > 0 || counts.other > 0 || suspect > 0 || uncitedClaims > 0 || !!claims) && (
         // 逐段证据的计数：和报告核对那一行、证据条同一种说法。可疑名字、没挂依据的结论句不是数字，
-        // 各自另起一句。有无证据的数字、可疑名字、证据不支持（或部分支持）的结论句时才给「定位下一处」——
+        // 各自另起一句。有无证据的数字、可疑名字、证据有问题（相矛盾、部分有依据、证据不足）的结论句时才给「定位下一处」——
         // 结论句靠句末徽标定位；只是没挂依据的结论句没有徽标，定位不到
         <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
           {numbers && (
@@ -2307,7 +2307,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
               {numbers || suspect > 0 || claims ? '· ' : ''}{EVIDENCE_TEXT.uncitedClaimsTag} {formatNumber(uncitedClaims)}
             </span>
           )}
-          {(counts.none > 0 || counts.other > 0 || suspect > 0 || !!claims?.unsupported || !!claims?.partial) && evidence?.onNext && (
+          {(counts.none > 0 || counts.other > 0 || suspect > 0 || claimProblems(claims) > 0) && evidence?.onNext && (
             <button type="button" className="btn btn-xs" data-evidence-next="" onClick={evidence.onNext}>
               {EVIDENCE_TEXT.locateNext}
             </button>
