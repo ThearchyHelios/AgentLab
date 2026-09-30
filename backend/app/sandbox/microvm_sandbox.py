@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +36,29 @@ _LANG = {
 
 _MAX_FILE_BYTES = 8 * 1024 * 1024
 _MANIFEST_CACHE = Path.home() / ".microsandbox" / "cache" / "manifests"
+_KVM_DEVICE = Path("/dev/kvm")
+
+
+def _on_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def kvm_problem() -> str:
+    """Linux 上 microVM 靠 KVM 启动：拿不到 /dev/kvm 时返回原因，能用（或不在 Linux 上）返回空串。
+
+    macOS 走 Hypervisor.framework，不查。以前 available() 只看运行时装没装，
+    运行时和镜像打进 Docker 镜像以后，没有 KVM 的机器上 auto 会选中 microVM，
+    之后每次执行代码都启动失败。
+    """
+    if not _on_linux():
+        return ""
+    if not _KVM_DEVICE.exists():
+        return ("这台机器没有 KVM（找不到 /dev/kvm）。"
+                "在容器里运行时，宿主机要支持 KVM，并把 /dev/kvm 挂进容器")
+    if not os.access(_KVM_DEVICE, os.R_OK | os.W_OK):
+        return ("当前用户没有读写 /dev/kvm 的权限。把运行服务的用户加入 kvm 组；"
+                "在容器里运行时，要把宿主机上 /dev/kvm 所属的组加给容器")
+    return ""
 
 
 @dataclass
@@ -86,8 +111,7 @@ class MicroVMSandbox(Sandbox):
     # ---------------- 可用性 ----------------
 
     @staticmethod
-    def available() -> bool:
-        """SDK 装了、运行时也装好了才算可用。"""
+    def _runtime_installed() -> bool:
         try:
             import microsandbox as ms
         except ImportError:
@@ -96,6 +120,22 @@ class MicroVMSandbox(Sandbox):
             return bool(ms.is_installed())
         except Exception:  # noqa: BLE001
             return False
+
+    @classmethod
+    def available(cls) -> bool:
+        """SDK 和运行时都装好、Linux 上还拿得到 KVM，才算可用。"""
+        return cls._runtime_installed() and not kvm_problem()
+
+    @classmethod
+    def unavailable_reason(cls) -> str:
+        """不可用的原因；可用时返回空串。"""
+        try:
+            import microsandbox  # noqa: F401
+        except ImportError:
+            return "未安装 microsandbox（pip install 'agentlab-backend[microvm]'）"
+        if not cls._runtime_installed():
+            return "运行时未就绪（await microsandbox.install()，约 50 MB）"
+        return kvm_problem()
 
     @staticmethod
     def image_ready() -> bool:
@@ -112,7 +152,7 @@ class MicroVMSandbox(Sandbox):
 
     async def health(self) -> dict[str, Any]:
         try:
-            import microsandbox as ms
+            import microsandbox  # noqa: F401
         except ImportError:
             return {
                 "backend": self.name,
@@ -120,17 +160,13 @@ class MicroVMSandbox(Sandbox):
                 "isolated": True,
                 "error": "未安装 microsandbox（pip install 'agentlab-backend[microvm]'）",
             }
-        installed = False
-        try:
-            installed = bool(ms.is_installed())
-        except Exception:  # noqa: BLE001
-            pass
+        reason = self.unavailable_reason()
         cached = self.image_ready()
         return {
             "backend": self.name,
-            "available": installed,
+            "available": not reason,
             "isolated": True,
-            "isolation": "microVM：独立内核 + 独立内存 + 独立进程表（libkrun / Hypervisor.framework）",
+            "isolation": "microVM：独立内核 + 独立内存 + 独立进程表（libkrun；Linux 上用 KVM，macOS 上用 Hypervisor.framework）",
             # 只有 network 不是真的——别的都由虚拟化边界强制执行
             "enforced": {
                 "timeout": True,
@@ -148,7 +184,7 @@ class MicroVMSandbox(Sandbox):
             "image": self._image,
             "image_cached": cached,
             "live_vms": len(self._leases),
-            **({} if installed else {"error": "运行时未就绪（await microsandbox.install()，约 50 MB）"}),
+            **({"error": reason} if reason else {}),
             **({} if cached else {"first_run_cost": "镜像未缓存，首次启动需要拉取镜像（约 55 秒）"}),
         }
 
@@ -261,10 +297,8 @@ class MicroVMSandbox(Sandbox):
         if language not in _LANG:
             return ExecResult(ok=False, backend=self.name, error=f"不支持的语言：{language}")
         if not self.available():
-            return ExecResult(
-                ok=False, backend=self.name,
-                error="microVM 运行时未就绪：pip install 'agentlab-backend[microvm]' 后执行一次 install",
-            )
+            reason = self.unavailable_reason() or "运行时未就绪"
+            return ExecResult(ok=False, backend=self.name, error=f"microVM 不可用：{reason}")
 
         ext, cmd = _LANG[language]
         entry = entry_name(ext)

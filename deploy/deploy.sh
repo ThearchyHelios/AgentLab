@@ -21,10 +21,11 @@ usage() {
 
   install            部署（默认）：导入镜像、创建数据目录、启动容器，等健康检查通过后打印访问地址。
                      已经有同名容器的，先停掉再换成新的，数据保留。改了 agentlab.env 也用它让配置生效。
+                     本机有 KVM 时会先试着启动一台 microVM，起得来才让代码在 microVM 里执行（见 agentlab.env）。
   upgrade            用这个包里的镜像替换正在用的容器，数据保留。旧镜像留着，方便回退。
   start | stop | restart
                      启动 / 停止 / 重启容器。
-  status             查看容器状态、健康检查、数据目录和访问地址。
+  status             查看容器状态、健康检查、数据目录、代码沙箱和访问地址。
   logs [-f] [--tail N]
                      查看日志（默认最后 200 行），-f 持续跟随。
   uninstall [--purge-image]
@@ -104,6 +105,7 @@ BIND_ADDR="0.0.0.0"
 DATA_DIR="./data"
 CONTAINER_NAME="agentlab"
 ENABLE_BWRAP="0"
+ENABLE_MICROVM="auto"
 
 read_env() {
   [ -f "$ENV_FILE" ] || die "找不到 ${ENV_FILE}，它应该和 deploy.sh 在同一个目录"
@@ -118,7 +120,7 @@ read_env() {
     key="$(trim "${line%%=*}")"
     val="${line#*=}"
     case "$key" in
-      HOST_PORT|BIND_ADDR|DATA_DIR|CONTAINER_NAME|ENABLE_BWRAP)
+      HOST_PORT|BIND_ADDR|DATA_DIR|CONTAINER_NAME|ENABLE_BWRAP|ENABLE_MICROVM)
         printf -v "$key" '%s' "$(unquote "$(trim "$val")")" ;;
       AGENTLAB_DATA_DIR|AGENTLAB_WEB_DIST|AGENTLAB_PORT|AGENTLAB_HOST)
         die "agentlab.env 第 $n 行：不要设 ${key}。容器里的路径和端口是固定的，改宿主机这边用 DATA_DIR、HOST_PORT、BIND_ADDR" ;;
@@ -137,6 +139,7 @@ read_env() {
     ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) die "CONTAINER_NAME 只能用字母、数字和 _ . -，并以字母或数字开头：$CONTAINER_NAME" ;;
   esac
   case "$ENABLE_BWRAP" in 0|1) ;; *) die "ENABLE_BWRAP 只能是 0 或 1：$ENABLE_BWRAP" ;; esac
+  case "$ENABLE_MICROVM" in auto|0|1) ;; *) die "ENABLE_MICROVM 只能是 auto、0 或 1：$ENABLE_MICROVM" ;; esac
 
   # 相对路径以 deploy.sh 所在的目录为准，和从哪里运行无关
   # 下面比较的就是字面上的 ~，不需要展开
@@ -274,6 +277,79 @@ fix_data_owner() {
 }
 
 # ---------------------------------------------------------------------------
+# microVM：本机有 KVM、镜像里带了运行时，就先用一个临时容器真起一台 VM，起得来才把 /dev/kvm
+# 交给正式容器。只看设备在不在不够：系统调用过滤、嵌套虚拟化没开，都可能让 VM 起不来。
+# 起不来还把设备交出去，服务端会选中 microVM，之后每次执行代码都失败
+# ---------------------------------------------------------------------------
+KVM_OPTS=()
+MICROVM_OPTS=()
+
+kvm_opts() {
+  # 容器里的服务以 uid 10001 运行，要靠 /dev/kvm 所属的组才能读写它；其他用户本来就能读写的不用加组
+  local perm gid
+  perm="$(ls -lL /dev/kvm | cut -c1-10)"
+  gid="$(ls -nL /dev/kvm | awk '{print $4}')"
+  KVM_OPTS=(--device /dev/kvm)
+  case "$perm" in
+    ???????rw*) ;;
+    *) KVM_OPTS+=(--group-add "$gid") ;;
+  esac
+}
+
+microvm_selftest() {
+  # 和正式容器一样的配置和权限，只是不挂数据目录、不开端口。只取最后一行：结论，或者报错的最后一句
+  local extra=()
+  [ "$ENABLE_BWRAP" = 1 ] && extra=("${BWRAP_OPTS[@]}")
+  docker run --rm \
+    --env-file "$ENV_FILE" \
+    -e AGENTLAB_MICROVM_BOOT_TIMEOUT=120 \
+    "${KVM_OPTS[@]}" ${extra[@]+"${extra[@]}"} \
+    --entrypoint python "$IMAGE" -m app.sandbox.selftest 2>&1 | tail -n 1
+}
+
+decide_microvm() {
+  MICROVM_OPTS=()
+  [ "$ENABLE_MICROVM" != 0 ] || return 0
+  local baked out
+  baked="$(docker image inspect -f '{{index .Config.Labels "agentlab.microvm"}}' "$IMAGE" 2>/dev/null || true)"
+  if [ "$baked" != 1 ]; then
+    [ "$ENABLE_MICROVM" = auto ] || die "ENABLE_MICROVM=1，但这个包打的时候没有带 microVM 运行时（用了 --no-microvm）。
+换一个默认方式打出来的包，或者把 ENABLE_MICROVM 改成 auto"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ]; then
+    if [ "$ENABLE_MICROVM" = 1 ]; then
+      die "ENABLE_MICROVM=1，但这台机器没有 /dev/kvm，启动不了 microVM。
+  - 物理机：确认 CPU 支持虚拟化、BIOS 里已打开，并已加载 kvm 模块（ls -l /dev/kvm 能看到它）；
+  - 云主机：要选支持嵌套虚拟化的机型并打开这项功能；
+  - 不需要 microVM 的话，把 ENABLE_MICROVM 改成 auto 或 0。"
+    fi
+    say "这台机器没有 KVM（/dev/kvm），不启用 microVM"
+    return 0
+  fi
+  kvm_opts
+  say "检测到 /dev/kvm，试着启动一台 microVM（第一次要十几秒到一分钟）"
+  if out="$(microvm_selftest)"; then
+    MICROVM_OPTS=("${KVM_OPTS[@]}")
+    say "$out"
+    return 0
+  fi
+  [ "$ENABLE_MICROVM" = auto ] || die "ENABLE_MICROVM=1，但 microVM 启动不了：${out:-没有输出}
+常见原因见 README 的常见问题。不需要 microVM 的话，把 ENABLE_MICROVM 改成 auto 或 0"
+  warn "microVM 启动不了，这次不启用，代码仍按原来的方式执行。原因：${out:-没有输出}"
+}
+
+# 服务端实际选中的沙箱。镜像里没有 curl，用 python 从容器里问
+sandbox_summary() {
+  docker exec "$CONTAINER_NAME" python -c '
+import json, urllib.request as u
+r = u.build_opener(u.ProxyHandler({})).open("http://127.0.0.1:8000/api/sandbox/health", timeout=5)
+d = json.load(r)
+print(d.get("selected_because") or d.get("backend") or "未知")
+' 2>/dev/null || echo "查不到"
+}
+
+# ---------------------------------------------------------------------------
 # 容器
 # ---------------------------------------------------------------------------
 container_exists() { docker container inspect "$1" >/dev/null 2>&1; }
@@ -318,6 +394,7 @@ run_container() {
     -v "$DATA_ABS:/data" \
     --log-opt max-size=10m --log-opt max-file=3 \
     ${extra[@]+"${extra[@]}"} \
+    ${MICROVM_OPTS[@]+"${MICROVM_OPTS[@]}"} \
     "$IMAGE" >/dev/null
 }
 
@@ -397,6 +474,7 @@ deploy_container() {
   if wait_healthy "$CONTAINER_NAME"; then
     [ -z "$had_old" ] || docker rm "$prev" >/dev/null 2>&1 || true
     say "AgentLab $VERSION 已就绪，数据目录 $DATA_ABS"
+    say "代码沙箱：$(sandbox_summary)"
     print_access
     return 0
   fi
@@ -420,6 +498,7 @@ cmd_install() {
   prepare_data
   check_existing
   fix_data_owner
+  decide_microvm
   deploy_container
 }
 
@@ -440,6 +519,7 @@ cmd_upgrade() {
   prepare_data
   check_existing
   fix_data_owner
+  decide_microvm
   deploy_container
   if [ "$old_image" != "$IMAGE" ] && docker image inspect "$old_image" >/dev/null 2>&1; then
     echo "旧镜像 $old_image 还留着，方便回退。确认新版本没问题后可以删：docker rmi $old_image"
@@ -492,6 +572,7 @@ cmd_status() {
   echo "镜像      $image"
   echo "端口      $(docker port "$CONTAINER_NAME" 8000/tcp 2>/dev/null | tr '\n' ' ')"
   echo "数据目录  ${src:-（未挂载）}"
+  [ "$state" != running ] || echo "代码沙箱  $(sandbox_summary)"
   echo "这个包    $IMAGE"
   if [ "$state" = running ]; then print_access; fi
 }
