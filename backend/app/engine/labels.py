@@ -92,7 +92,7 @@ CONTRACT_KEY_LABEL: dict[str, str] = {
 JUDGE_FIELD_LABEL: dict[str, str] = {
     "provider": "裁判模型 · 接入", "model": "裁判模型", "max_claims": "最多裁判句数",
     "max_cost_usd": "金额上限（美元）", "timeout_s": "时长上限（秒）",
-    "rewrite_once": "证据不支持的句子退回改写一次", "on_unsupported": "证据不支持时",
+    "rewrite_once": "证据相矛盾或不足的句子退回改写一次", "on_unsupported": "证据相矛盾时",
 }
 
 #: 取值的短说法：键 → {值: 叫法}。前端下拉的选项文字去掉后半句的用途说明

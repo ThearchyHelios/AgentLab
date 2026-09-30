@@ -3,7 +3,8 @@
 数字、实体是确定性的，系统自己能核对；「增长主要来自华东」这种话说得对不对，只能交给另一个模型按
 证据判断。这是概率性的判断，所以每一步都要留余地、说实话：
 
-- 一份报告合并成一次调用（超过每批的句数就分批），每句给 supported / partial / unsupported / not_a_claim
+- 一份报告合并成一次调用（超过每批的句数就分批），每句给 supported / partial / contradicted / insufficient /
+  not_a_claim
 - 模型不支持结构化输出、或者给的不是合法结构时退回 JSON 解析，再失败就记「未裁判」，不编判定
 - 裁判模型关掉 thinking，max_tokens 4096
 - 预算（每份报告的句数、金额、时长，全局每日金额）每一项都能写 null 表示不限；触顶就停、已判的保留、
@@ -183,7 +184,7 @@ def status_of(outcome, doc, text):
 
 
 async def test_one_call_for_the_whole_report_and_the_verdict_shape(monkeypatch, stored):
-    judge = Judge(monkeypatch, {"u3": "unsupported"})
+    judge = Judge(monkeypatch, {"u3": "contradicted"})
     catalog = make_catalog(stored)
     doc = compose_doc(RAW, catalog)
     outcome = await judge_doc(doc, catalog, spec=SPEC, budget=UNLIMITED)
@@ -192,7 +193,8 @@ async def test_one_call_for_the_whole_report_and_the_verdict_shape(monkeypatch, 
     v = status_of(outcome, doc, CITED)
     assert v["status"] == "supported" and v["judge"] == PRICED and v["post_seal"] is False
     assert v["rationale"] and v["used"] == ["m:gmv"]
-    assert outcome["counts"] == {"supported": 3, "partial": 0, "unsupported": 1, "not_a_claim": 0, "unjudged": 0}
+    assert outcome["counts"] == {"supported": 3, "partial": 0, "contradicted": 1, "insufficient": 0, "not_a_claim": 0,
+                                 "unjudged": 0, "unsupported": 0}
     assert outcome["model"] == PRICED and outcome["calls"] == 1 and outcome["gaps"] == []
     assert units_of(doc)["下面看细节。"] not in outcome["verdicts"], "连接性的话不送裁判"
 
@@ -226,7 +228,7 @@ async def test_structured_output_failure_falls_back_to_json(monkeypatch, stored)
 async def test_an_array_written_as_json_text_is_still_read(monkeypatch, stored):
     """有的模型走工具调用时把嵌套的数组写成一段 JSON 文本（{"items": "[…]"}）：照样认，不为它再花一次调用。"""
     def stringified(units):
-        items = [{"unit": u, "verdict": "unsupported", "rationale": "对不上", "used": []} for u in units]
+        items = [{"unit": u, "verdict": "contradicted", "rationale": "对不上", "used": []} for u in units]
         return json.dumps({"items": json.dumps(items, ensure_ascii=False)}, ensure_ascii=False)
 
     judge = Judge(monkeypatch, structured=stringified)
@@ -234,7 +236,7 @@ async def test_an_array_written_as_json_text_is_still_read(monkeypatch, stored):
     doc = compose_doc(RAW, catalog)
     outcome = await judge_doc(doc, catalog, spec=SPEC, budget=UNLIMITED)
     assert [c["kind"] for c in judge.calls] == ["structured"]
-    assert {v["status"] for v in outcome["verdicts"].values()} == {"unsupported"}
+    assert {v["status"] for v in outcome["verdicts"].values()} == {"contradicted"}
 
 
 async def test_a_broken_provider_is_not_called_batch_after_batch(monkeypatch, stored):
@@ -266,18 +268,18 @@ async def test_bad_items_are_not_trusted(monkeypatch, stored):
 
     def messy(units):
         return json.dumps({"items": [
-            {"unit": ids[CITED], "verdict": "supported", "rationale": "长" * 100, "used": ["m:gmv", "m:nope", "Q9"]},
+            {"unit": ids[CITED], "verdict": "supported", "rationale": "长" * 200, "used": ["m:gmv", "m:nope", "Q9"]},
             {"unit": ids[CITED2], "verdict": "maybe", "rationale": "不认识的判定", "used": []},
-            {"unit": ids[CAUSAL], "verdict": "unsupported", "rationale": "没有新客维度", "used": []},
+            {"unit": ids[CAUSAL], "verdict": "contradicted", "rationale": "没有新客维度", "used": []},
             {"unit": "u999", "verdict": "supported", "rationale": "不存在的句子", "used": []},
         ]}, ensure_ascii=False)
 
     Judge(monkeypatch, structured=messy)
     outcome = await judge_doc(doc, catalog, spec=SPEC, budget=UNLIMITED)
     v = outcome["verdicts"]
-    assert v[ids[CITED]]["rationale"] == "长" * RATIONALE_MAX and v[ids[CITED]]["used"] == ["m:gmv"]
+    assert v[ids[CITED]]["rationale"] == "长" * (RATIONALE_MAX - 1) + "…" and v[ids[CITED]]["used"] == ["m:gmv"]
     assert (v[ids[CITED2]]["status"], v[ids[CITED2]]["reason"]) == ("unjudged", "format")
-    assert v[ids[CAUSAL]]["status"] == "unsupported"
+    assert v[ids[CAUSAL]]["status"] == "contradicted"
     assert (v[ids[NUMBER]]["status"], v[ids[NUMBER]]["reason"]) == ("unjudged", "missing")
     assert "u999" not in v
 
@@ -532,7 +534,7 @@ async def test_a_model_without_a_price_ignores_money_limits(monkeypatch, stored)
 
 
 async def test_known_sentences_are_not_judged_again(monkeypatch, stored):
-    judge = Judge(monkeypatch, {"u2": "unsupported"})
+    judge = Judge(monkeypatch, {"u2": "contradicted"})
     catalog = make_catalog(stored)
     doc = compose_doc(RAW, catalog)
     first = await judge_doc(doc, catalog, spec=SPEC, budget=UNLIMITED)

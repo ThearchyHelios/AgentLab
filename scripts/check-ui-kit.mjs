@@ -458,9 +458,9 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
     const codes = ev.EVIDENCE_STATES
     // 方案 6.1 的八种（确定性、概率性四种、无证据、连接性、旧运行候选），加三期无证据的两个变体：
-    // 可疑实体（疑似不存在的名称）、无法核实（表结构快照不全）
-    ok('十种状态一种不少', ['deterministic', 'supported', 'partial', 'unsupported', 'unjudged', 'none', 'connective', 'candidate',
-      'suspect', 'unverified'].every((c) => codes.includes(c)) && codes.length === 10, codes.join(','))
+    // 可疑实体（疑似不存在的名称）、无法核实（表结构快照不全），加裁判拆档的两种：证据相矛盾、证据不足
+    ok('十二种状态一种不少', ['deterministic', 'supported', 'partial', 'contradicted', 'insufficient', 'unsupported', 'unjudged', 'none',
+      'connective', 'candidate', 'suspect', 'unverified'].every((c) => codes.includes(c)) && codes.length === 12, codes.join(','))
     eq('可疑实体：点状线（同无证据）、?!、疑似不存在的名称', `${ev.EVIDENCE_STATE.suspect.line}/${ev.EVIDENCE_STATE.suspect.glyph}/${ev.EVIDENCE_STATE.suspect.label}`,
       'dotted/?!/疑似不存在的名称')
     ok('可疑实体醒目（进 n / N），核对不了只是标注', ev.EVIDENCE_STATE.suspect.alert && !ev.EVIDENCE_STATE.unverified.alert)
@@ -492,8 +492,12 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
       const d = ev.EVIDENCE_STATE[c].decoration
       return d === 'transparent' || /var\(--st-[\w-]+\)/.test(d)
     }), codes.map((c) => ev.EVIDENCE_STATE[c].decoration).join(' | '))
-    const pairs = codes.map((c) => `${ev.EVIDENCE_STATE[c].line}/${ev.EVIDENCE_STATE[c].glyph}`)
-    ok('去掉颜色也分得开：线型 + 字形两两不同', new Set(pairs).size === codes.length, pairs.join(' '))
+    // 裁判拆档：旧取值「证据不支持」按规格和证据相矛盾长得一样（同一类判定，拆档前后的叫法不同，文字仍不同），
+    // 除它之外线型 + 字形两两不同
+    const pairOf = (c) => `${ev.EVIDENCE_STATE[c].line}/${ev.EVIDENCE_STATE[c].glyph}`
+    const pairs = codes.filter((c) => c !== 'unsupported').map(pairOf)
+    ok('去掉颜色也分得开：线型 + 字形两两不同（旧的证据不支持同证据相矛盾）', new Set(pairs).size === codes.length - 1
+      && pairOf('unsupported') === pairOf('contradicted'), codes.map(pairOf).join(' '))
     const labels = codes.map((c) => ev.EVIDENCE_STATE[c].label)
     ok('文字两两不同', new Set(labels).size === codes.length, labels.join(' '))
     eq('确定性：细实线、有出处', `${ev.EVIDENCE_STATE.deterministic.line}/${ev.EVIDENCE_STATE.deterministic.label}`, 'solid/有出处')
@@ -659,6 +663,94 @@ await section('lib/evidence：结论句裁判（四期）——判定的徽标�
     eq('……每份报告的金额', t.judgeUnlimitedText('cost', all), '不设上限，费用仅受句数上限、时长上限、每日上限约束')
     ok('……每日、每份、每次都不限：说到底只受调用次数约束', t.judgeUnlimitedText('daily', { ...all, cost: false, click: false }).includes('调用次数'))
     ok('……每日不限时每份报告的金额只剩句数、时长', !t.judgeUnlimitedText('cost', { ...all, daily: false }).includes('每日'))
+    return out
+  })) check(name, ok, detail)
+})
+
+await section('lib/evidence：裁判拆档（JR）——证据相矛盾、证据不足、计数、跳转轮次、模型提醒、审计行、讲方法的句子', async () => {
+  for (const [name, ok, detail] of await page.evaluate(() => {
+    const { evidence: ev, terms: t } = window.__ui.lib
+    const fv = window.__ui.evidenceVerdict
+    const out = []
+    const eq = (name, got, want) => out.push([name, got === want, got === want ? '' : `得到 ${JSON.stringify(got)}，应为 ${JSON.stringify(want)}`])
+    const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
+    const S = ev.EVIDENCE_STATE
+    eq('证据相矛盾、证据不足：句末徽标、字形 ! ○', ['contradicted', 'insufficient'].map((c) => `${S[c].line}/${S[c].glyph}`).join(' '),
+      'badge/! badge/○')
+    eq('……颜色令牌：证据相矛盾同原来的证据不支持（--st-failed），证据不足中性（--st-cancelled）',
+      ['contradicted', 'insufficient', 'unsupported'].map((c) => S[c].color).join(' '), 'var(--st-failed) var(--st-cancelled) var(--st-failed)')
+    ok('……证据不足不用红、不用提醒色，字形不和未裁判的 ? 撞', !/--st-(failed|waiting|done)/.test(S.insufficient.color + S.insufficient.soft)
+      && S.insufficient.glyph !== S.unjudged.glyph, JSON.stringify(S.insufficient))
+    eq('叫法：证据相矛盾、证据不足；旧取值照旧叫证据不支持', [S.contradicted.label, S.insufficient.label, S.unsupported.label].join(' / '),
+      '模型判断：证据相矛盾 / 模型判断：证据不足 / 模型判断：证据不支持')
+    eq('判定 → 徽标：新取值各是各的', [ev.verdictState({ status: 'contradicted' }), ev.verdictState({ status: 'insufficient' }),
+      ev.verdictState({ status: 'unsupported' })].join(','), 'contradicted,insufficient,unsupported')
+    ok('判过的算上新取值（不再给「请模型判断」）', ev.isJudged({ status: 'contradicted' }) && ev.isJudged({ status: 'insufficient' }))
+    eq('n / N 的轮次：证据相矛盾、旧的证据不支持、部分有依据、无证据在第 1 轮，证据不足在第 2 轮，有依据、未裁判不进',
+      ['contradicted', 'unsupported', 'partial', 'none', 'suspect', 'insufficient', 'supported', 'unjudged'].map((c) => ev.alertTier(c)).join(''),
+      '11111200')
+    ok('整句铺浅底的是证据相矛盾和旧的证据不支持', ev.conflicting('contradicted') && ev.conflicting('unsupported')
+      && !ev.conflicting('insufficient') && !ev.conflicting('partial'))
+    eq('证据不足缺什么：只认 insufficient 的 missing', [ev.verdictMissing({ status: 'insufficient', missing: ' SQL ' }),
+      ev.verdictMissing({ status: 'contradicted', missing: 'SQL' }), ev.verdictMissing({ status: 'insufficient' })].join('|'), 'SQL||')
+    const k = (c) => (c ? `${c.total}:${c.supported}/${c.partial}/${c.contradicted}/${c.unsupported}/${c.insufficient}/${c.unjudged}/${c.uncited}` : 'null')
+    eq('文档计数：证据相矛盾 2、证据不足 1，不是结论句不算', k(ev.claimCounts(fv.formal.doc)), '6:1/1/2/0/1/1/0')
+    eq('……叠上封存后追加的判定（旧取值 unsupported 照样计入）', k(ev.claimCounts(fv.explore.doc,
+      ev.graphVerdicts(fv.explore.graph, 'write'))), '7:0/0/0/1/1/5/0')
+    eq('stats / counts → 计数（report.checked、报告节点的章）：旧数据的 unsupported 照样计入，不是结论句不算',
+      k(ev.claimCountsOf({ supported: 1, partial: 1, contradicted: 2, insufficient: 1, unsupported: 1, not_a_claim: 3, unjudged: 1,
+        numbers: 9 })), '7:1/1/2/1/1/1/0')
+    eq('……缺键、不是数的当 0', k(ev.claimCountsOf({ supported: 2, unsupported: 'x' })), '2:2/0/0/0/0/0/0')
+    eq('计数的说法：证据相矛盾、证据不支持、证据不足各写各的', t.claimTally(ev.claimCountsOf({ supported: 1, contradicted: 2, unsupported: 1,
+      insufficient: 1, unjudged: 1 })), '结论 6 句（有依据 1 · 证据相矛盾 2 · 证据不支持 1 · 证据不足 1 · 未裁判 1）')
+    eq('……旧的计数对象（没有新键）照旧能说', t.claimTally({ total: 2, supported: 1, partial: 0, unsupported: 1, unjudged: 0, uncited: 0 }),
+      '结论 2 句（有依据 1 · 证据不支持 1）')
+    eq('有问题的句数（横幅、证据条的「定位下一处」）：证据相矛盾、旧的证据不支持、部分有依据、证据不足', ev.claimProblems(ev.claimCountsOf(
+      { supported: 5, contradicted: 1, unsupported: 1, partial: 1, insufficient: 1, unjudged: 3 })), 4)
+    const unit = fv.formal.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fv.formal.units.insuff)
+    eq('读屏名：证据不足接着说缺什么', ev.claimLabel(unit, unit.verdict),
+      `结论句「增长主要来自新客首单，老客复购持平。」，模型判断：证据不足，缺少：${fv.missing}`)
+    const sealed = fv.formal.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fv.formal.units.contra).verdict
+    const f1 = ev.judgeFlags(sealed, { doc: fv.formal.doc.judge })
+    ok('模型提醒：节点里当场判的看报告文档的 judge（same_model 真、priced 假）', f1.sameModel && f1.unpriced && f1.writer === fv.model, JSON.stringify(f1))
+    const late = { status: 'insufficient', post_seal: true, judge: 'm' }
+    const f2 = ev.judgeFlags(late, { doc: { same_model: true, priced: false }, meta: { same_model: false, priced: true } })
+    ok('……封存后追加的不看报告文档，看证据图里最近一次按需裁判（judge_meta）', !f2.sameModel && !f2.unpriced, JSON.stringify(f2))
+    const f3 = ev.judgeFlags(late, { reply: { same_model: true, priced: false }, meta: { same_model: false, priced: true } })
+    ok('……这一次的答复盖过证据图', f3.sameModel && f3.unpriced, JSON.stringify(f3))
+    const f4 = ev.judgeFlags({ ...late, same_model: false }, { reply: { same_model: true, priced: false } })
+    ok('……判定自己带着的盖过答复', !f4.sameModel && f4.unpriced, JSON.stringify(f4))
+    const f5 = ev.judgeFlags({ status: 'unjudged', reason: 'max_claims' }, { doc: { same_model: true, priced: false } })
+    ok('……没判的句子不提醒；priced 为 null（不知道）也不提醒', !f5.sameModel && !f5.unpriced
+      && !ev.judgeFlags(sealed, { doc: { priced: null } }).unpriced, JSON.stringify(f5))
+    const rows = ev.auditFromApi(fv.formal.audit)
+    const claim = (issue) => rows.find((r) => r.kind === 'claim' && fv.formal.audit.groups.flatMap((g) => g.rows)
+      .some((x) => x.issue === issue && x.unit === r.unit))
+    const c1 = claim('contradicted_claim')
+    const c2 = claim('insufficient_claim')
+    ok('审计行：issue 为 contradicted_claim 的结论句认成证据相矛盾，insufficient_claim 认成证据不足，带着是哪一句',
+      c1?.state === 'contradicted' && c2?.state === 'insufficient' && c2.unit === fv.formal.units.insuff && c1.group === 'none',
+      JSON.stringify([c1, c2].map((r) => r && { state: r.state, unit: r.unit, group: r.group })))
+    ok('……旧取值 unsupported_claim 认成证据不支持；没挂依据的结论句照旧是无证据',
+      ev.auditFromApi({ groups: [{ key: 'none', rows: [{ kind: 'claim', issue: 'unsupported_claim', unit: 'u2', text: 'x', group: 'none' },
+        { kind: 'claim', issue: 'uncited_claim', unit: 'u7', text: 'y', group: 'none', state: 'none' }] }] }).map((r) => r.state).join(',')
+        === 'unsupported,none')
+    const doc = fv.formal.doc
+    const units = Object.fromEntries(doc.blocks.flatMap((b) => b.units).map((u) => [u.id, u]))
+    const b = ev.claimBasis(units[fv.formal.units.method], doc)
+    ok('讲方法的句子（只挂了表名、字段名、整份查询）：列表、字段、要列 SQL 的查询（直接挂的在前，再补表名出现过的）',
+      !!b && b.tables.map((x) => `${x.alias}=${x.name}@${x.seg}`).join() === `t:orders=orders@${fv.formal.segs.orders}`
+      && b.columns.map((x) => x.name).join() === 'orders.status,orders.created_at' && b.queries.join() === 'Q1,Q2' && b.more === 0, JSON.stringify(b))
+    eq('……只挂了整份查询的句子也算', ev.claimBasis(units[fv.formal.units.insuff], doc)?.queries.join(), 'Q1')
+    eq('……挂了数字（单元格）的句子不算', ev.claimBasis(units[fv.formal.units.ok], doc), null)
+    eq('……挂了运行输入的句子不算', ev.claimBasis(units[fv.formal.units.not], doc), null)
+    eq('……一个依据都没挂的不算', ev.claimBasis(units[fv.formal.units.limit], doc), null)
+    const many = { catalog: { 't:a': { kind: 'table', name: 'a', queries: ['Q1', 'Q2', 'Q3', 'Q4', 'Q5'] },
+      ...Object.fromEntries(['Q1', 'Q2', 'Q3', 'Q4', 'Q5'].map((q) => [q, { kind: 'query' }])) }, blocks: [] }
+    const bm = ev.claimBasis({ cites: ['t:a'], segments: [] }, many)
+    ok('……查询多于 3 次：只列前 3 次的 SQL，其余写个数', bm?.queries.join() === 'Q1,Q2,Q3' && bm.more === 2, JSON.stringify(bm))
+    eq('查询快照里的 SQL：快照本身、工具调用快照的 args / result 都认', [ev.sqlOf({ sql: 'A' }), ev.sqlOf({ tool: 'x', args: { sql: 'B' }, result: {} }),
+      ev.sqlOf({ result: { sql: 'C' } }), ev.sqlOf({ rows: [] }), ev.sqlOf(null)].join('|'), 'A|B|C||')
     return out
   })) check(name, ok, detail)
 })

@@ -12,7 +12,7 @@ import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasour
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
+import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
 
@@ -624,7 +624,8 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 const JUDGE_SUB_KEYS = new Set(['provider', 'model', 'max_claims', 'max_cost_usd', 'timeout_s', 'rewrite_once', 'on_unsupported'])
 
 /**
- * 结论句裁判（claims: judge）的子配置：裁判模型、三项上限（各自可以设成不限）、改写一次、证据不支持时怎么判档。
+ * 结论句裁判（claims: judge）的子配置：裁判模型、三项上限（各自可以设成不限）、改写一次、证据相矛盾时怎么判档
+ * （键名仍是 on_unsupported；证据不足的句子最多降档）。
  *
  * 上限有三种写法，得分得清：没写（跟随设置里「证据裁判」的默认值）、写数、写 null（不限）。勾「不限」写 null，
  * 清空数字框回到没写。全都没写时整个 judge 去掉，不留一个空对象。受管级别发布要求写了 max_cost_usd（数或 null）
@@ -705,7 +706,7 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
           <span>
             {JUDGE_FIELD_LABEL.rewrite_once}
             <span className="mt-0.5 block text-2xs leading-snug text-faint">
-              默认关闭。开启后，裁判判定为证据不支持的句子会连同理由交回撰写模型，仅改写这些句子并重新判断一次，最多一轮。
+              默认关闭。开启后，裁判判定为证据相矛盾或证据不足的句子会连同理由交回撰写模型，仅改写这些句子并重新判断一次，最多一轮。
               会额外产生一次撰写和裁判的费用；改写稿如出现原稿没有的问题，则不予采用
             </span>
           </span>
@@ -724,7 +725,7 @@ function JudgeConfig({ id, value, config, issues, onChange }: {
             <option value={judge.on_unsupported} disabled>{judge.on_unsupported}：无法识别的值，请从上方选项中选择</option>
           )}
         </select>
-        <div className="mt-1 text-2xs leading-snug text-faint">仅对正式运行生效；探索运行只做标注，不拦截</div>
+        <div className="mt-1 text-2xs leading-snug text-faint" data-judge-hint="on_unsupported">{JUDGE_ON_UNSUPPORTED_HINT}</div>
         {lines('on_unsupported')}
       </div>
     </div>

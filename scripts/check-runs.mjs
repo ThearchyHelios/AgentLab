@@ -651,6 +651,9 @@ await section('提取模板', async () => {
   fakes.set('POST /api/copilot/from-run', () => ({
     status: 200, json: { workflow_id: wfs[0].id, name: '检查用草稿', nodes: 3, edges: 2, dropped_nodes: 1, source_run: timed?.id },
   }))
+  // 跳进画布后，画布先找这张图的助手对话，没有就建一条（POST，会被探针拦下、算成没伪造的写请求）。
+  // 沙箱里 wfs[0] 有没有对话要看之前谁跑过什么：给一条现成的，和升级横幅那一节同一个做法
+  fakes.set('GET /api/conversations', () => ({ status: 200, json: [{ id: 'fake-conv-extract', title: '', kind: 'canvas', archived: false, turn_count: 0 }] }))
   // 画布上还有没保存的改动（store 里的画布离开编排页也还在）：先问要不要放弃，再建草稿。
   // 以前建完才问，点了「取消」库里就多出一张没人要的草稿（3C REQ-15）
   const extractPosts = () => writes.filter((w) => w === 'POST /api/copilot/from-run').length
@@ -684,6 +687,7 @@ await section('提取模板', async () => {
     && new URL(page.url()).pathname === `/studio/${wfs[0].id}`, `提取 ${extractPosts() - postsBefore} 次 · 问了 ${asks} 遍`)
   check('提取成功后跳到新草稿', new URL(page.url()).pathname === `/studio/${wfs[0].id}`)
   fakes.delete('POST /api/copilot/from-run')
+  fakes.delete('GET /api/conversations')
 })
 
 // ------------------------------------------------------------------ 运行中：接流、停止、不能删
@@ -1978,6 +1982,54 @@ await section('证据页签：同一段文字里好几条同样的违规、正�
     page.off('console', onConsole)
     for (const k of [...fakes.keys()]) if (k.includes(EV_DUP)) fakes.delete(k)
     fakes.delete(`GET /api/artifacts/${dup.doc_artifact}`)
+  }
+})
+
+await section('证据页签：裁判拆档——证据相矛盾、证据不足的结论句各一行，点开是这一句的「模型的解释」', async () => {
+  // 夹具是后端（JR-back 之后）真算的：审计行由 api/evidence.py 的 _audit_doc 给出，判定行 issue 为
+  // contradicted_claim / insufficient_claim，带着 unit 和 verdict
+  const fxv = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-verdict.json', import.meta.url), 'utf8'))
+  const v = fxv.formal
+  const EV_V = 'fake0evverdict000000000000000'
+  const output = { answer: v.doc.markdown, _evidence: { report_node: 'write', doc_artifact: v.doc_artifact, fields: ['answer'] } }
+  evFakes(EV_V, { output, graph: v.graph, audit: v.audit })
+  fakes.set(`GET /api/artifacts/${v.doc_artifact}`, () => ({ status: 200, json: { id: v.doc_artifact, content: v.doc } }))
+  for (const snap of Object.values(fxv.snapshots)) {
+    fakes.set(`GET /api/artifacts/${snap.artifact}`, () => ({ status: 200, json: { id: snap.artifact, content: snap.content } }))
+  }
+  await page.route(new RegExp(`/api/runs/${EV_V}/evidence/segments/`), (r) => {
+    const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
+    return v.segments[sid] ? r.fulfill({ json: v.segments[sid] }) : r.fulfill({ status: 404, json: { detail: '没有这个片段' } })
+  })
+  try {
+    await openEvidence(EV_V)
+    await page.locator('[data-audit-table]').waitFor({ timeout: 5000 }).catch(() => {})
+    const claimRows = await page.locator('[data-audit-table] tbody[data-audit-group=none] tr[data-audit-row]').evaluateAll((els) =>
+      els.map((e) => ({ state: e.getAttribute('data-audit-state'), open: e.querySelector('[data-audit-open]')?.getAttribute('data-audit-open') ?? null,
+                        stateText: e.children[1]?.textContent ?? '', source: e.querySelector('[data-audit-source]')?.textContent ?? '' })))
+    const byState = (st) => claimRows.filter((r) => r.state === st)
+    check('审计表：证据相矛盾的结论句两行、证据不足一行，列在「无证据」一组', byState('contradicted').length === 2 && byState('insufficient').length === 1,
+      JSON.stringify(claimRows.map((r) => r.state)))
+    check('……状态照句末徽标的字形和叫法写', byState('contradicted').every((r) => r.stateText === '!模型判断：证据相矛盾')
+      && byState('insufficient')[0]?.stateText === '○模型判断：证据不足', JSON.stringify(claimRows.map((r) => r.stateText)))
+    const note = v.audit.groups.flatMap((g) => g.rows).find((r) => r.issue === 'insufficient_claim')?.note ?? '（夹具里没有这一行）'
+    check('……原因照后端的原话（缺什么、理由）', byState('insufficient')[0]?.source === note && note.includes(`缺少：${fxv.missing}`), note)
+    check('……判定行点得开，打开的是这一句的句末徽标（claim:<句子>）', byState('insufficient')[0]?.open === `claim:${v.units.insuff}`
+      && byState('contradicted').map((r) => r.open).join(',') === [v.units.contra, v.units.method].map((u) => `claim:${u}`).join(','),
+    JSON.stringify(claimRows.map((r) => r.open)))
+    await page.locator(`[data-audit-table] [data-audit-open="claim:${v.units.insuff}"]`).click()
+    await page.locator('[data-evidence-dock] [data-evidence-panel] [data-ev-judge="insufficient"]').waitFor({ timeout: 5000 }).catch(() => {})
+    const dock = page.locator('[data-evidence-dock] [data-evidence-panel]')
+    check('点开证据不足那一行：右边打开这一句的「模型的解释」，写明缺什么', (await dock.locator('[data-ev-missing]').innerText().catch(() => ''))
+      === `缺少：${fxv.missing}`)
+    check('……裁判模型和写作模型相同、不在价格表里：两条提醒都在', await dock.locator('[data-ev-judge-same]').count() === 1
+      && await dock.locator('[data-ev-judge-unpriced]').count() === 1)
+    const tally = await page.locator(`[data-evidence-report=write] [data-evidence-claims]`).innerText().catch(() => '')
+    check('报告上方的证据条：结论句计数带上证据相矛盾、证据不足', tally.includes('结论 6 句（有依据 1 · 部分有依据 1 · 证据相矛盾 2 · 证据不足 1 · 未裁判 1）'), tally)
+    await page.keyboard.press('Escape')
+  } finally {
+    for (const k of [...fakes.keys()]) if (k.includes(EV_V) || k.includes(v.doc_artifact)) fakes.delete(k)
+    for (const snap of Object.values(fxv.snapshots)) fakes.delete(`GET /api/artifacts/${snap.artifact}`)
   }
 })
 

@@ -66,10 +66,13 @@ from app.engine.evidence import (
     normalize_quote,
     query_entry_fields,
     render_metric,
+    schema_column,
+    schema_table,
     sql_tables,
+    table_fields,
     uncited_claims,
 )
-from app.engine.judge import JUDGED, VERDICTS, candidates
+from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -727,7 +730,8 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
     if seg.get("kind") == "entity" and seg.get("issue") in SUSPICIOUS:
         return [_suspicious_step(seg, cite, sealed, report_node)]
     if seg.get("kind") == "entity" and seg.get("state") == "deterministic" and cite.get("status") == "resolved":
-        return [_entity_step(seg, cite, entry, sealed)]
+        hidden = await _entity_hidden(entry, sealed, masks) if entry.get("kind") == "table" else set()
+        return [_entity_step(seg, cite, entry, sealed, hidden=hidden)]
     if seg.get("kind") == "quote" and seg.get("state") == "deterministic" and cite.get("status") == "resolved":
         return [_quote_step(seg, cite, entry, sealed)]
     if _missing_input(cite, entry):
@@ -928,22 +932,10 @@ def _fetch(artifact: str) -> tuple[Any, bool | None]:
     return content, (True if content is not None else None)
 
 
-def _schema_table(content: Any, name: Any) -> dict[str, Any] | None:
-    """表结构快照里的一张表：表名一字不差的优先，其次不分大小写、全名（schema.表）也认。"""
-    tables = content.get("tables") if isinstance(content, dict) else None
-    if not isinstance(tables, dict) or not name:
-        return None
-    if isinstance(tables.get(name), dict):
-        return tables[name]
-    lowered = str(name).lower()
-    return next((t for key, t in tables.items() if isinstance(t, dict)
-                 and lowered in (str(key).lower(), str(t.get("qualified") or "").lower())), None)
-
-
-def _schema_column(table: dict[str, Any] | None, name: Any) -> dict[str, Any] | None:
-    columns = [c for c in (table or {}).get("columns") or [] if isinstance(c, dict)]
-    return next((c for c in columns if c.get("name") == name), None) \
-        or next((c for c in columns if str(c.get("name") or "").lower() == str(name or "").lower()), None)
+#: 表结构快照里找表、找字段：和裁判的摘录同一套（engine/evidence.py）。表名实体步骤的字段清单也和裁判的
+#: 摘录同一个上限（judge.FIELDS_MAX）
+_schema_table = schema_table
+_schema_column = schema_column
 
 
 def _entity_present(content: Any, kind: str, name: str, table: Any, column: Any, tables: list[Any]) -> bool:
@@ -963,12 +955,34 @@ def _query_present(content: Any, kind: str, name: str, column: Any) -> bool:
     return str(column) in [str(c) for c in content.get("columns") or []]
 
 
-def _entity_step(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], sealed: _Sealed) -> dict[str, Any]:
+async def _entity_hidden(entry: dict[str, Any], sealed: _Sealed, masks: _Masks) -> set[str]:
+    """表的字段清单要遮的列（小写）：数据源现在设的，加上这次运行封存的查询快照里、同一个数据源当时记下的
+    （数据源改名、删掉了也照遮，和查询步骤同一个口径）。"""
+    source = str(entry.get("source") or "")
+    hidden, _ = await masks.of(source) if source else (set(), True)
+    hidden = set(hidden)
+    for artifact, info in sealed.queries.items():
+        if not sealed.trusted:
+            break
+        snap, ok = _fetch(artifact)
+        if ok is not True or not isinstance(snap, dict):
+            continue
+        if not source or str(info.get("source") or snap.get("source") or "") == source:
+            recorded = snap.get("mask_columns")
+            hidden |= {str(c).lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
+    return hidden
+
+
+def _entity_step(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], sealed: _Sealed, *,
+                 hidden: set[str] | frozenset[str] = frozenset()) -> dict[str, Any]:
     """实体步骤：这个名字出现在哪几次查询里（SQL 用到的表、结果的列）、表结构快照什么时候同步的、字段类型。
 
     来源（entry.sources）逐个核对：表结构快照要出现在封存范围内的 tool.end.schema_artifact 或 schema 台账
     条目里，查询快照要是封存范围内交回过的那几件。类型、同步时间只从核对过、复验过哈希的表结构快照取，
     取不到就不给。eid 背后的那件工件核对通过、名字确实在里面，这一步才算已封存。
+
+    表另带字段清单 fields: [{name, type}]（同一份核对过的快照，最多 FIELDS_MAX 个，多出来的记 fields_more）：
+    讲表结构的句子，读的人在「挂的依据」下直接看得到有哪些字段。hidden 里的列（遮罩）不列。
     """
     kind = str(cite.get("kind") or entry.get("kind") or "")
     locator = dict(entry.get("locator") or cite.get("locator") or {})
@@ -1022,7 +1036,8 @@ def _entity_step(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any
         step["sources"].append(item)
     step["sealed"] = sealed.trusted and backed and step["eid_ok"]
     if snapshots:
-        _describe_entity(step, snapshots[0], kind, name, table, column, list(entry.get("tables") or []))
+        _describe_entity(step, snapshots[0], kind, name, table, column, list(entry.get("tables") or []),
+                         hidden=hidden)
     if kind == "column" and not any(o.get("kind") == "schema" for o in step["sources"]):
         # 聚合的别名这类只在结果里出现的列：类型取查询时从驱动的原始值记下的列类型。表结构里有的列
         # 只认表结构快照的类型，快照核对不过就不给——不拿结果列的类型顶上
@@ -1033,8 +1048,8 @@ def _entity_step(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any
 
 
 def _describe_entity(step: dict[str, Any], snap: dict[str, Any], kind: str, name: str, table: Any, column: Any,
-                     tables: list[Any]) -> None:
-    """从表结构快照里补上同步时间、表的概况、字段的类型。"""
+                     tables: list[Any], *, hidden: set[str] | frozenset[str] = frozenset()) -> None:
+    """从表结构快照里补上同步时间、表的概况（含字段清单）、字段的类型。"""
     if snap.get("synced_at"):
         step["synced_at"] = snap["synced_at"]
     if snap.get("truncated"):
@@ -1045,6 +1060,12 @@ def _describe_entity(step: dict[str, Any], snap: dict[str, Any], kind: str, name
         step["is_view"] = bool(info.get("is_view"))
         if info.get("comment"):
             step["comment"] = info["comment"]
+        fields, more, masked = table_fields(info, hidden, limit=FIELDS_MAX)
+        step["fields"] = fields
+        if more:
+            step["fields_more"] = more
+        if masked:
+            step["fields_masked"] = True
         return
     owners = [table] if table else tables
     found = {str(t): (tinfo, _schema_column(tinfo, column)) for t in owners
@@ -1200,6 +1221,8 @@ UNSEALED_JUDGE = "运行尚未结束并封存（仍在运行、停在人工审�
 LEGACY_JUDGE = "这次运行发起时系统尚未记录证据，不支持按需裁判"
 BROKEN_JUDGE = "封存核对未通过：封存后有事件被修改、删除或插入，报告和证据已不可信，无法再请模型裁判"
 JUDGED_ALREADY = "这句已裁判"
+#: 这句封存后按需判过，但那次早于当前的裁判规则（没有规则版本，或者是旧取值「证据不支持」）：可以按当前规则重判
+OUTDATED_JUDGE = "这句的判定早于当前的裁判规则，可以请模型按当前规则重新判断"
 #: 裁判期间运行被接着跑了（失败的运行可以继续），或者接着跑完重新封存了：判定照样交回，不记进运行记录
 NOT_RECORDED = "运行已继续执行，本次裁判结果未写入运行记录，刷新后将不再显示。请在运行结束并封存后重新裁判"
 NOT_A_CLAIM = "不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
@@ -1232,7 +1255,8 @@ def _effective_verdicts(report: _Report, sealed: _Sealed
     doc = report.doc or {}
     ids = {str(u.get("id")) for _, u in iter_units(doc)}
     out = {str(u.get("id")): u["verdict"] for _, u in iter_units(doc) if _verdict_ok(u.get("verdict"))}
-    sealed_judged = {uid for uid, v in out.items() if v.get("status") in JUDGED}
+    # 旧数据里的 unsupported 同样算判过（SETTLED）：封存的判定用什么取值，都不能被追加的判定盖掉
+    sealed_judged = {uid for uid, v in out.items() if v.get("status") in SETTLED}
     later: dict[str, dict[str, Any]] = {}
     for _, _, data in sealed.judged:
         if data.get("report") != report.node_id or data.get("doc_artifact") != report.doc_artifact:
@@ -1242,17 +1266,48 @@ def _effective_verdicts(report: _Report, sealed: _Sealed
             uid = str(uid)
             if uid not in ids or uid in sealed_judged or not _verdict_ok(verdict):
                 continue
-            if later.get(uid, {}).get("status") in JUDGED and verdict.get("status") not in JUDGED:
+            if later.get(uid, {}).get("status") in SETTLED and verdict.get("status") not in SETTLED:
                 continue
             later[uid] = out[uid] = {**verdict, "post_seal": True}
     return out, later
 
 
 def _judgement_of(report: _Report, sealed: _Sealed) -> dict[str, Any]:
-    """证据图、审计表里每份报告带的结论句情况：写作时的策略、封存的裁判摘要、封存之后按需追加的判定。"""
+    """证据图、审计表里每份报告带的结论句情况：写作时的策略、封存的裁判摘要、封存之后按需追加的判定，
+    和最近一次按需裁判用的模型（judge_meta，没按需裁判过是 None）。"""
     doc = report.doc or {}
     return {"claims": report.claims, "judge": doc.get("judge") if isinstance(doc.get("judge"), dict) else None,
-            "post_seal_verdicts": _effective_verdicts(report, sealed)[1] if report.doc is not None else {}}
+            "post_seal_verdicts": _effective_verdicts(report, sealed)[1] if report.doc is not None else {},
+            "judge_meta": _judge_meta(report, sealed)}
+
+
+def _writer_model(sealed: _Sealed, report: _Report) -> str | None:
+    """这份报告的写作模型：文档的裁判摘要里记的（写作时当场记下），没有就取报告撰写节点封存的产出里的 model
+    （实际用的模型 id，老文档也有）。都取不到是 None。"""
+    judge = (report.doc or {}).get("judge")
+    if isinstance(judge, dict) and isinstance(judge.get("writer_model"), str) and judge["writer_model"]:
+        return judge["writer_model"]
+    payload = sealed.payload_of([report.node_id]) or {}
+    model = payload.get("model")
+    return model if isinstance(model, str) and model else None
+
+
+def _same_model(model: Any, writer: str | None) -> bool:
+    return bool(model) and bool(writer) and model == writer
+
+
+def _judge_meta(report: _Report, sealed: _Sealed) -> dict[str, Any] | None:
+    """最近一次按需裁判（evidence.judged，指向这份文档的）用的模型：{model, same_model, priced, writer_model}。
+
+    事件里没记 same_model、writer_model 的（改造前追加的），按这份报告的写作模型补上。"""
+    data = next((d for _, _, d in reversed(sealed.judged)
+                 if d.get("report") == report.node_id and d.get("doc_artifact") == report.doc_artifact), None)
+    if data is None:
+        return None
+    writer = data.get("writer_model") if "writer_model" in data else _writer_model(sealed, report)
+    same = data.get("same_model") if isinstance(data.get("same_model"), bool) else _same_model(data.get("model"), writer)
+    return {"model": data.get("model"), "same_model": same,
+            "priced": data.get("priced") if isinstance(data.get("priced"), bool) else None, "writer_model": writer}
 
 
 def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None) -> dict[str, Any]:
@@ -1266,13 +1321,23 @@ def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str
         return no("legacy", LEGACY_JUDGE)
     if not candidates(doc, [uid]):
         return no("not_a_claim", f"这句{NOT_A_CLAIM}")
-    if isinstance(verdict, dict) and verdict.get("status") in JUDGED:
+    stale = _stale(verdict)
+    if isinstance(verdict, dict) and verdict.get("status") in SETTLED and not stale:
         return no("judged", JUDGED_ALREADY)
     if not sealed.sealed or sealed.status not in _TERMINAL:
         return no("unsealed", UNSEALED_JUDGE)
     if not sealed.trusted:
         return no("seal_broken", BROKEN_JUDGE)
+    if stale:
+        return {"available": True, "reason": "outdated", "message": OUTDATED_JUDGE}
     return {"available": True, "reason": None, "message": None}
+
+
+def _stale(verdict: Any) -> bool:
+    """封存之后按需追加的判定早于当前规则：按需裁判当它还没按当前规则判过，重判一次（不按摘录内容判断）。
+
+    封存的判定（文档里的，post_seal 为 False）不在此列：追加的判定盖不掉它，版本再旧也不重开。"""
+    return isinstance(verdict, dict) and bool(verdict.get("post_seal")) and outdated(verdict)
 
 
 def _sealed_loader(sealed: _Sealed) -> Callable[[str], Any]:
@@ -1371,13 +1436,15 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
     doc = report.doc or {}
     catalog = doc.get("catalog") or {}
     known = _effective_verdicts(report, sealed)[0]
-    reused = [u for u in units if known.get(u, {}).get("status") in JUDGED]
+    # 当前规则下判过的直接给；早于当前规则的（封存之后追加的旧判定）重判一次，和片段接口的 outdated 同一条件
+    reused = [u for u in units if known.get(u, {}).get("status") in SETTLED and not _stale(known.get(u))]
     pending = [u for u in units if u not in reused]
     verdicts = {u: known[u] for u in reused}
     node_judge = _node_judge(sealed, report.node_id)
     async with SessionLocal() as session:
         settings = await judging.judge_settings(session)
     budget = judging.click_budget(settings, node_judge)
+    writer = _writer_model(sealed, report)
     outcome: dict[str, Any] | None = None
     skipped: dict[str, str] = {}
     event = None
@@ -1391,7 +1458,13 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
             async with SessionLocal() as session:
                 spec = await judging.judge_model_spec(session, node_judge, settings=settings)
             outcome = await judging.run_request(request, spec=spec, budget=budget, post_seal=True, click=True)
-            verdicts.update(outcome["verdicts"])
+            for uid, verdict in outcome["verdicts"].items():
+                # 重判没判成（触顶、模型不可用）：旧判定照旧生效，和证据图、片段接口说的一样
+                older = known.get(uid)
+                keep = verdict.get("status") not in SETTLED and isinstance(older, dict) and older.get("status") in SETTLED
+                verdicts[uid] = older if keep else verdict
+            outcome["writer_model"] = writer
+            outcome["same_model"] = _same_model(outcome.get("model"), writer)
             if outcome["calls"] or outcome["cost_usd"]:
                 # 没问模型（触顶、模型没配好）就没有判定可记：说给点的人听，不往运行记录里追加
                 event = await _append_judged(sealed, report, pending, outcome)
@@ -1403,12 +1476,14 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
     return {
         "run_id": sealed.run_id, "report": {"node_id": report.node_id, "doc_artifact": report.doc_artifact},
         "units": units, "verdicts": {u: verdicts[u] for u in units if u in verdicts}, "reused": reused,
-        "judged": [u for u in pending if (outcome or {}).get("verdicts", {}).get(u, {}).get("status") in JUDGED],
+        "judged": [u for u in pending if (outcome or {}).get("verdicts", {}).get(u, {}).get("status") in SETTLED],
         "skipped": skipped, "unjudged": dict(outcome["unjudged"]) if outcome else {},
         "limits_hit": limits, "limited": bool(limits), "message": message,
         "adjust": [JUDGE_ADJUST[r] for r in limits if r in JUDGE_ADJUST],
         "gaps": list(outcome["gaps"]) if outcome else [], "notes": list(outcome["notes"]) if outcome else [],
         "model": (outcome or {}).get("model"), "priced": (outcome or {}).get("priced"),
+        # 裁判模型和这份报告的写作模型相同：判定照常出，界面上标出来（审查缺乏独立性）
+        "same_model": bool((outcome or {}).get("same_model")), "writer_model": writer,
         "cost_usd": (outcome or {}).get("cost_usd", 0.0), "calls": (outcome or {}).get("calls", 0),
         "duration_ms": (outcome or {}).get("duration_ms", 0),
         "budget": budget.as_dict() if outcome else None, "event": event, "post_seal": True,
@@ -1461,7 +1536,8 @@ async def _append_judged(sealed: _Sealed, report: _Report, units: list[str],
                 "report": report.node_id, "doc_artifact": report.doc_artifact, "units": units,
                 "verdicts": outcome["verdicts"],
                 "keys": {u: outcome["keys"][u] for u in outcome["verdicts"] if u in outcome["keys"]},
-                "model": outcome["model"], "priced": outcome["priced"], "cost_usd": outcome["cost_usd"],
+                "model": outcome["model"], "priced": outcome["priced"], "same_model": outcome["same_model"],
+                "writer_model": outcome["writer_model"], "cost_usd": outcome["cost_usd"],
                 "calls": outcome["calls"], "duration_ms": outcome["duration_ms"], "budget": outcome["budget"],
                 "limits_hit": outcome["limits_hit"], "unjudged": outcome["unjudged"], "gaps": outcome["gaps"],
                 "notes": outcome["notes"], "skipped": outcome["skipped"], "post_seal": True})
@@ -1501,6 +1577,13 @@ UNCITED_CLAIM_JUDGED = "这句结论没有附依据。本报告的结论句由�
 UNCITED_CLAIM_JUDGE_REQUIRED = ("这句结论没有附依据。本报告的结论句由模型裁判，同样要求附依据，但目前没有出具契约"
                                 "据此判档（未配置契约，或尚未到出具步骤）")
 LEGACY_UNMATCHED = "旧版出具中这个数字与任何指标都不相符"
+#: 模型判定有问题的结论句各一行（生效的判定：封存的，没有就是封存后按需追加的）：判定 → 审计行的 issue。
+#: 旧数据里的 unsupported（当时没分矛盾和不足）记 unsupported_claim，说法照旧是「证据不支持」
+CLAIM_ISSUE = {"contradicted": "contradicted_claim", "insufficient": "insufficient_claim",
+               UNSUPPORTED: "unsupported_claim"}
+CLAIM_VERDICT_NOTE = {"contradicted": "模型判断：证据与这句结论相矛盾", "insufficient": "模型判断：证据不足，无法判断这句结论",
+                      UNSUPPORTED: "模型判断：证据不支持这句结论"}
+CLAIM_POST_SEAL = "该判定为封存后按需追加，不在封存范围内"
 
 #: CSV 的列：(表头, 行里的键)
 CSV_COLUMNS = (
@@ -1521,6 +1604,7 @@ _CSV_LABELS: dict[str, dict[Any, str]] = {
     "state": {"deterministic": "有出处", "none": "无证据", "candidate": "候选"},
     "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
               "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
+              "contradicted_claim": "证据相矛盾", "insufficient_claim": "证据不足", "unsupported_claim": "证据不支持",
               **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
                       "quote": "知识库原话", "query": "查询结果"},
@@ -1670,6 +1754,7 @@ def _audit_doc(report: _Report, sealed: _Sealed, inputs: dict[str, Any],
                      "issue": "uncited_claim", "ref": None, "alias": None, "evidence_kind": None, "evidence": None,
                      "eid": None, "artifact": None, "node_id": None, "sealed": None, "span": claim["span"],
                      "sentence": claim["text"], "note": claim_note})
+    rows.extend(_verdict_rows(report, sealed, field_name, markdown))
     for v in doc.get("violations") or []:
         if not isinstance(v, dict) or (str(v.get("segment")) in listed and v.get("code") not in _INTEGRITY):
             continue
@@ -1680,6 +1765,32 @@ def _audit_doc(report: _Report, sealed: _Sealed, inputs: dict[str, Any],
                      "artifact": None, "node_id": None, "sealed": None, "span": v.get("span"),
                      "sentence": sentences.get(str(v.get("unit")), v.get("context") or ""), "note": v.get("message")})
     rows.sort(key=lambda r: ((r["span"] or [len(markdown)])[0], r["kind"] != "claim"))
+    return rows
+
+
+def _verdict_rows(report: _Report, sealed: _Sealed, field_name: str | None, markdown: str) -> list[dict[str, Any]]:
+    """模型判定证据相矛盾、证据不足（旧数据里的证据不支持）的结论句，各一行，进「无证据」一组（问题）。
+
+    判定是模型的判断，不是证据：sealed 为 None，说明里写明是模型判断；封存后按需追加的另外注明。"""
+    effective, _ = _effective_verdicts(report, sealed)
+    units = {str(u.get("id")): u for _, u in iter_units(report.doc or {})}
+    rows = []
+    for uid, verdict in effective.items():
+        status = verdict.get("status")
+        if status not in CLAIM_ISSUE or uid not in units:
+            continue
+        span = units[uid].get("span") or [0, 0]
+        text = markdown[span[0]:span[1]]
+        missing = verdict.get("missing") if status == "insufficient" and isinstance(verdict.get("missing"), str) else ""
+        rationale = str(verdict.get("rationale") or "").rstrip("。")
+        note = CLAIM_VERDICT_NOTE[status] + (f"（缺少：{missing}）" if missing else "") \
+            + (f"。理由：{rationale}" if rationale else "") + (f"。{CLAIM_POST_SEAL}" if verdict.get("post_seal") else "")
+        rows.append({"group": "none", "report": report.node_id, "field": field_name, "segment": None, "unit": uid,
+                     "kind": "claim", "text": text, "state": "none", "issue": CLAIM_ISSUE[status], "ref": None,
+                     "alias": None, "evidence_kind": None, "evidence": None, "eid": None, "artifact": None,
+                     "node_id": None, "sealed": None, "span": span, "sentence": text, "note": note,
+                     "verdict": {k: verdict[k] for k in ("status", "rationale", "missing", "judge", "post_seal")
+                                 if k in verdict}})
     return rows
 
 

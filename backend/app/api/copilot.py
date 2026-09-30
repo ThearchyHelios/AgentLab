@@ -209,11 +209,13 @@ NODE_REFERENCE = """\
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
   numbers 默认 strict（裸数字算违规）。claims 是结论句策略：off（默认，不管）/ require_citation（每句结论都要
   挂引用，没挂的计入缺口、出具降档）/ judge（在 require_citation 之外，再请另一个模型按每句挂的依据判断支不支持：
-  正式运行在节点里判，证据不支持的按 judge.on_unsupported 处置——degrade 降档（默认）或 withhold 不予出具；
+  正式运行在节点里判，证据相矛盾的按 judge.on_unsupported 处置——degrade 降档（默认）或 withhold 不予出具，
+  证据不足的（摘录里没有判断所需的信息）只降档；
   探索运行不在节点里花钱，读的人点开哪句再按需判哪句，只标注）。judge 的子配置写在节点的 judge 里：judge.model、
   judge.provider 指定裁判模型（建议和写作模型不同，同一个模型等于自己审自己；不写就用设置里的「证据裁判模型」）；
   judge.max_cost_usd、judge.max_claims、judge.timeout_s 是每份报告的裁判金额、句数、时长上限，写 null 表示不限，
-  不写取设置里的默认；judge.rewrite_once 默认 false，打开后把证据不支持的句子交回写作者只改一次。entities 默认 link
+  不写取设置里的默认；judge.rewrite_once 默认 false，打开后把证据相矛盾、证据不足的句子交回写作者只改一次。
+  entities 默认 link
   （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
   required:[必需指标id], expected:[期望指标id], strict: true}。成果字段写 {{ nodes.报告节点id.text }}，

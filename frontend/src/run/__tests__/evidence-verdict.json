@@ -1,0 +1,8660 @@
+{
+ "_comment": "结论句裁判改造（JR）的前端夹具：/tmp/agentlab-fix/judge-rework/gen_fixture.py 生成。文档由 compose_doc 真跑，判定写回、摘要由 judge 的 _outcome / summarize / apply_judgement 真跑（判定本身是剧本）；片段接口（含表名实体步骤的 fields、on_demand）、证据图的 post_seal_verdicts / judge_meta、审计行都由 api/evidence.py 的真实函数算出（封存范围在内存里拼，数据源遮罩为空）。explore 有一条拆档之前追加的旧取值 unsupported。只用通用名",
+ "model": "judge-model-b",
+ "writer": "writer-model-a",
+ "long_rationale": "Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录。",
+ "missing": "按新客、老客拆分的订单数",
+ "snapshots": {
+  "Q1": {
+   "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+   "content": {
+    "columns": [
+     "gmv",
+     "order_cnt"
+    ],
+    "rows": [
+     [
+      45678.5,
+      1234
+     ]
+    ],
+    "row_count": 1,
+    "truncated": false,
+    "elapsed_ms": 9,
+    "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+    "source": "shop",
+    "schema_artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760"
+   }
+  },
+  "Q2": {
+   "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+   "content": {
+    "columns": [
+     "channel",
+     "order_cnt"
+    ],
+    "rows": [
+     [
+      "app",
+      800
+     ],
+     [
+      "web",
+      300
+     ],
+     [
+      "store",
+      130
+     ]
+    ],
+    "row_count": 3,
+    "truncated": false,
+    "elapsed_ms": 9,
+    "sql": "SELECT channel, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'\nGROUP BY channel\nORDER BY order_cnt DESC",
+    "source": "shop",
+    "schema_artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760"
+   }
+  },
+  "Q3": {
+   "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+   "content": {
+    "columns": [
+     "refund_cnt",
+     "partial_cnt"
+    ],
+    "rows": [
+     [
+      29,
+      11
+     ]
+    ],
+    "row_count": 1,
+    "truncated": false,
+    "elapsed_ms": 9,
+    "sql": "SELECT COUNT(*) AS refund_cnt, SUM(partial) AS partial_cnt\nFROM refunds\nWHERE week = '2026-W37'",
+    "source": "shop",
+    "schema_artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760"
+   }
+  }
+ },
+ "formal": {
+  "run_id": "run-evidence-verdict",
+  "run_class": "formal",
+  "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9",
+  "doc": {
+   "schema": "agentlab.report/1",
+   "run_id": "run-evidence-verdict",
+   "node_id": "write",
+   "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n各渠道的订单数相加与总订单数一致。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n## 口径说明\n\n订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。\n\n华东贡献了最多的增量。\n\n周报按自然周统计。",
+   "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[v:Q1.r0.gmv]]，订单 [[v:Q1.r0.order_cnt]] 单。[[see:Q1]]\n\n各渠道的订单数相加与总订单数一致。[[see:Q1]][[see:Q2]]\n\n增长主要来自新客首单，老客复购持平。[[see:Q1]]\n\n退款 [[v:Q3.r0.refund_cnt]] 单，其中大多数是部分退款。[[see:Q3]]\n\n## 口径说明\n\n订单取自 [[t:orders]] 表，按 [[c:orders.status]] 为已支付、[[c:orders.created_at]] 落在本周筛选。[[see:Q1]]\n\n华东贡献了最多的增量。\n\n周报按自然周统计。[[see:i:week]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:a0beaf9e1d4f2444",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+     "via": "663ddd04f31da329c96488c48db06b3ff0af7f15e8e7c32bb008c012a2e47d56",
+     "call_id": "toolu_01",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:f84a3bb6b6ffe924",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+     "via": "71c521b3453ba322f3faee7e76eb62722d377374f28ed711838b52548e116afd",
+     "call_id": "toolu_02",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "channel",
+      "order_cnt"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__shop · 3 行"
+    },
+    "Q3": {
+     "alias": "Q3",
+     "kind": "query",
+     "eid": "ev:query:ade648b75fa5aca1",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+     "via": "27e5441e5914d6717922d6a34b4cbf9649218834659ac7652b876f2fc13afaa6",
+     "call_id": "toolu_03",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "t:orders": {
+     "alias": "t:orders",
+     "kind": "table",
+     "eid": "ev:table:f27c2a4e42555c46",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders"
+     },
+     "name": "orders",
+     "qualified": "public.orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      },
+      {
+       "kind": "sql",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "alias": "Q1",
+       "source": "shop"
+      },
+      {
+       "kind": "sql",
+       "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+       "alias": "Q2",
+       "source": "shop"
+      }
+     ],
+     "queries": [
+      "Q1",
+      "Q2"
+     ],
+     "label": "表 orders"
+    },
+    "c:orders.status": {
+     "alias": "c:orders.status",
+     "kind": "column",
+     "eid": "ev:column:3def93cf584fc715",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders",
+      "column": "status"
+     },
+     "name": "status",
+     "table": "orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      }
+     ],
+     "queries": [],
+     "label": "字段 orders.status"
+    },
+    "c:orders.created_at": {
+     "alias": "c:orders.created_at",
+     "kind": "column",
+     "eid": "ev:column:afb22335517801e6",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders",
+      "column": "created_at"
+     },
+     "name": "created_at",
+     "table": "orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      }
+     ],
+     "queries": [],
+     "label": "字段 orders.created_at"
+    },
+    "i:week": {
+     "alias": "i:week",
+     "kind": "input",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "locator": {
+      "field": "week"
+     },
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "label": "week = 2026-W37"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        7
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "本周概览",
+         "state": "neutral",
+         "span": [
+          3,
+          7
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        9,
+        45
+       ],
+       "cites": [
+        "i:week",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          7,
+          9
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "本周（",
+         "state": "neutral",
+         "span": [
+          9,
+          12
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "value",
+         "text": "2026-W37",
+         "ref": "i:week",
+         "cite": {
+          "ref": "week",
+          "alias": "i:week",
+          "locator": {
+           "field": "week"
+          },
+          "eid": "ev:input:a398c5e60abfeedd",
+          "kind": "input",
+          "role": "value",
+          "status": "resolved",
+          "value": "2026-W37",
+          "rendered": "2026-W37"
+         },
+         "state": "deterministic",
+         "span": [
+          12,
+          20
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "）销售额 ",
+         "state": "neutral",
+         "span": [
+          20,
+          25
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "45,678.5",
+         "ref": "v:Q1.r0.gmv",
+         "cite": {
+          "ref": "Q1.r0.gmv",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gmv"
+          },
+          "eid": "ev:cell:2c11308ddb6fcc9d",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 45678.5,
+          "rendered": "45,678.5"
+         },
+         "state": "deterministic",
+         "span": [
+          25,
+          33
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          33,
+          37
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,234",
+         "ref": "v:Q1.r0.order_cnt",
+         "cite": {
+          "ref": "Q1.r0.order_cnt",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "order_cnt"
+          },
+          "eid": "ev:cell:7bf8c94a219f95dc",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1234,
+          "rendered": "1,234"
+         },
+         "state": "deterministic",
+         "span": [
+          37,
+          42
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 单。",
+         "state": "neutral",
+         "span": [
+          42,
+          45
+         ],
+         "id": "s9"
+        }
+       ],
+       "verdict": {
+        "status": "supported",
+        "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1",
+         "i:week"
+        ],
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        47,
+        64
+       ],
+       "cites": [
+        "Q1",
+        "Q2"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        },
+        {
+         "ref": "Q2",
+         "role": "support",
+         "alias": "Q2",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f84a3bb6b6ffe924",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          45,
+          47
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "text",
+         "text": "各渠道的订单数相加与总订单数一致。",
+         "state": "neutral",
+         "span": [
+          47,
+          64
+         ],
+         "id": "s11"
+        }
+       ],
+       "verdict": {
+        "status": "contradicted",
+        "rationale": "Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录。",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1",
+         "Q2"
+        ],
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        66,
+        84
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          64,
+          66
+         ],
+         "id": "s12"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客首单，老客复购持平。",
+         "state": "neutral",
+         "span": [
+          66,
+          84
+         ],
+         "id": "s13"
+        }
+       ],
+       "verdict": {
+        "status": "insufficient",
+        "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1"
+        ],
+        "missing": "按新客、老客拆分的订单数",
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        86,
+        105
+       ],
+       "cites": [
+        "Q3"
+       ],
+       "see": [
+        {
+         "ref": "Q3",
+         "role": "support",
+         "alias": "Q3",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:ade648b75fa5aca1",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          84,
+          86
+         ],
+         "id": "s14"
+        },
+        {
+         "kind": "text",
+         "text": "退款 ",
+         "state": "neutral",
+         "span": [
+          86,
+          89
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "number",
+         "text": "29",
+         "ref": "v:Q3.r0.refund_cnt",
+         "cite": {
+          "ref": "Q3.r0.refund_cnt",
+          "alias": "Q3",
+          "locator": {
+           "row": 0,
+           "column": "refund_cnt"
+          },
+          "eid": "ev:cell:c8a13668eaa52e86",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 29,
+          "rendered": "29"
+         },
+         "state": "deterministic",
+         "span": [
+          89,
+          91
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "text",
+         "text": " 单，其中大多数是部分退款。",
+         "state": "neutral",
+         "span": [
+          91,
+          105
+         ],
+         "id": "s17"
+        }
+       ],
+       "verdict": {
+        "status": "partial",
+        "rationale": "退款 29 单有依据；Q3 里部分退款 11 单，不到一半，说不上「大多数」",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q3"
+        ],
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b4"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u5",
+       "kind": "heading",
+       "span": [
+        110,
+        114
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n## ",
+         "state": "neutral",
+         "span": [
+          105,
+          110
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "text",
+         "text": "口径说明",
+         "state": "neutral",
+         "span": [
+          110,
+          114
+         ],
+         "id": "s19"
+        }
+       ]
+      }
+     ],
+     "id": "b5"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        116,
+        176
+       ],
+       "cites": [
+        "t:orders",
+        "c:orders.status",
+        "c:orders.created_at",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          114,
+          116
+         ],
+         "id": "s20"
+        },
+        {
+         "kind": "text",
+         "text": "订单取自 ",
+         "state": "neutral",
+         "span": [
+          116,
+          121
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "entity",
+         "text": "orders",
+         "ref": "t:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "t:orders",
+          "locator": {
+           "table": "orders"
+          },
+          "eid": "ev:table:f27c2a4e42555c46",
+          "kind": "table",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders"
+         },
+         "state": "deterministic",
+         "span": [
+          121,
+          127
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 表，按 ",
+         "state": "neutral",
+         "span": [
+          127,
+          132
+         ],
+         "id": "s23"
+        },
+        {
+         "kind": "entity",
+         "text": "orders.status",
+         "ref": "c:orders.status",
+         "cite": {
+          "ref": "orders.status",
+          "alias": "c:orders.status",
+          "locator": {
+           "table": "orders",
+           "column": "status"
+          },
+          "eid": "ev:column:3def93cf584fc715",
+          "kind": "column",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders.status"
+         },
+         "state": "deterministic",
+         "span": [
+          132,
+          145
+         ],
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": " 为已支付、",
+         "state": "neutral",
+         "span": [
+          145,
+          151
+         ],
+         "id": "s25"
+        },
+        {
+         "kind": "entity",
+         "text": "orders.created_at",
+         "ref": "c:orders.created_at",
+         "cite": {
+          "ref": "orders.created_at",
+          "alias": "c:orders.created_at",
+          "locator": {
+           "table": "orders",
+           "column": "created_at"
+          },
+          "eid": "ev:column:afb22335517801e6",
+          "kind": "column",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders.created_at"
+         },
+         "state": "deterministic",
+         "span": [
+          151,
+          168
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": " 落在本周筛选。",
+         "state": "neutral",
+         "span": [
+          168,
+          176
+         ],
+         "id": "s27"
+        }
+       ],
+       "verdict": {
+        "status": "contradicted",
+        "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "Q1",
+         "t:orders",
+         "c:orders.created_at"
+        ],
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b6"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        178,
+        189
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          176,
+          178
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "华东贡献了最多的增量。",
+         "state": "neutral",
+         "span": [
+          178,
+          189
+         ],
+         "id": "s29"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "已达上限（每份报告最多裁判 6 句），这句未裁判",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "reason": "max_claims"
+       }
+      }
+     ],
+     "id": "b7"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u8",
+       "kind": "claim",
+       "span": [
+        191,
+        200
+       ],
+       "cites": [
+        "i:week"
+       ],
+       "see": [
+        {
+         "ref": "i:week",
+         "role": "support",
+         "alias": "i:week",
+         "kind": "input",
+         "status": "resolved",
+         "eid": "ev:input:a398c5e60abfeedd",
+         "locator": {
+          "field": "week"
+         }
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          189,
+          191
+         ],
+         "id": "s30"
+        },
+        {
+         "kind": "text",
+         "text": "周报按自然周统计。",
+         "state": "neutral",
+         "span": [
+          191,
+          200
+         ],
+         "id": "s31"
+        }
+       ],
+       "verdict": {
+        "status": "not_a_claim",
+        "rationale": "这句说的是统计口径，不陈述数据事实",
+        "judge": "judge-model-b",
+        "post_seal": false,
+        "used": [
+         "i:week"
+        ],
+        "rule_version": 2
+       }
+      }
+     ],
+     "id": "b8"
+    }
+   ],
+   "stats": {
+    "units": 9,
+    "segments": 32,
+    "claims": 7,
+    "connective": 0,
+    "headings": 2,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "entities": 3,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 7,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 1,
+    "partial": 1,
+    "contradicted": 2,
+    "insufficient": 1,
+    "not_a_claim": 1,
+    "unjudged": 1,
+    "unsupported": 0
+   },
+   "violations": [],
+   "judge": {
+    "mode": "inline",
+    "model": "judge-model-b",
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": {
+     "max_claims": 6,
+     "max_cost_usd": 0.05,
+     "timeout_s": 30,
+     "daily_max_usd": 2.0
+    },
+    "candidates": 7,
+    "screened": [],
+    "counts": {
+     "supported": 1,
+     "partial": 1,
+     "contradicted": 2,
+     "insufficient": 1,
+     "not_a_claim": 1,
+     "unjudged": 1,
+     "unsupported": 0
+    },
+    "unjudged": {
+     "max_claims": 1
+    },
+    "limits_hit": [
+     "max_claims"
+    ],
+    "complete": false,
+    "priced": false,
+    "cost_usd": 0.0,
+    "calls": 1,
+    "reused": 0,
+    "duration_ms": 5400,
+    "gaps": [
+     "有 1 句结论未裁判：已达上限（每份报告最多裁判 6 句）"
+    ],
+    "notes": [],
+    "same_model": true,
+    "rewrite": null,
+    "writer_model": "judge-model-b"
+   }
+  },
+  "graph": {
+   "run_id": "run-evidence-verdict",
+   "schema": "agentlab.evidence/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 72,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "ok": true,
+     "repairs": 0,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 9,
+      "segments": 32,
+      "claims": 7,
+      "connective": 0,
+      "headings": 2,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "entities": 3,
+      "quotes": 0,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "unknown_entities": 0,
+      "unverified_entities": 0,
+      "see": 7,
+      "uncited_claims": 1,
+      "violations": 0,
+      "supported": 1,
+      "partial": 1,
+      "contradicted": 2,
+      "insufficient": 1,
+      "not_a_claim": 1,
+      "unjudged": 1,
+      "unsupported": 0
+     },
+     "claims": "judge",
+     "judge": {
+      "mode": "inline",
+      "model": "judge-model-b",
+      "on_unsupported": "degrade",
+      "rewrite_once": false,
+      "limits": {
+       "max_claims": 6,
+       "max_cost_usd": 0.05,
+       "timeout_s": 30,
+       "daily_max_usd": 2.0
+      },
+      "candidates": 7,
+      "screened": [],
+      "counts": {
+       "supported": 1,
+       "partial": 1,
+       "contradicted": 2,
+       "insufficient": 1,
+       "not_a_claim": 1,
+       "unjudged": 1,
+       "unsupported": 0
+      },
+      "unjudged": {
+       "max_claims": 1
+      },
+      "limits_hit": [
+       "max_claims"
+      ],
+      "complete": false,
+      "priced": false,
+      "cost_usd": 0.0,
+      "calls": 1,
+      "reused": 0,
+      "duration_ms": 5400,
+      "gaps": [
+       "有 1 句结论未裁判：已达上限（每份报告最多裁判 6 句）"
+      ],
+      "notes": [],
+      "same_model": true,
+      "rewrite": null,
+      "writer_model": "judge-model-b"
+     },
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "evidence": [
+    {
+     "alias": "Q1",
+     "eid": "ev:query:a0beaf9e1d4f2444",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "fetch",
+     "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+     "sealed": true,
+     "cited_by": [
+      "s6",
+      "s8"
+     ],
+     "units": [
+      "u1",
+      "u2",
+      "u3",
+      "u6"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "Q2",
+     "eid": "ev:query:f84a3bb6b6ffe924",
+     "kind": "query",
+     "label": "db_query__shop · 3 行",
+     "node_id": "fetch",
+     "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+     "sealed": true,
+     "cited_by": [],
+     "units": [
+      "u2"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "channel",
+      "order_cnt"
+     ],
+     "rows": 3,
+     "truncated": false
+    },
+    {
+     "alias": "Q3",
+     "eid": "ev:query:ade648b75fa5aca1",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "fetch",
+     "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+     "sealed": true,
+     "cited_by": [
+      "s16"
+     ],
+     "units": [
+      "u4"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "t:orders",
+     "eid": "ev:table:f27c2a4e42555c46",
+     "kind": "table",
+     "label": "表 orders",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s22"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "orders",
+     "qualified": "public.orders",
+     "source": "shop",
+     "queries": [
+      "Q1",
+      "Q2"
+     ],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      },
+      {
+       "kind": "sql",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "alias": "Q1",
+       "source": "shop",
+       "sealed": true
+      },
+      {
+       "kind": "sql",
+       "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+       "alias": "Q2",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "c:orders.status",
+     "eid": "ev:column:3def93cf584fc715",
+     "kind": "column",
+     "label": "字段 orders.status",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s24"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "status",
+     "table": "orders",
+     "source": "shop",
+     "queries": [],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "c:orders.created_at",
+     "eid": "ev:column:afb22335517801e6",
+     "kind": "column",
+     "label": "字段 orders.created_at",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s26"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "created_at",
+     "table": "orders",
+     "source": "shop",
+     "queries": [],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "i:week",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "kind": "input",
+     "label": "week = 2026-W37",
+     "node_id": null,
+     "artifact": null,
+     "sealed": true,
+     "cited_by": [
+      "s4"
+     ],
+     "units": [
+      "u1",
+      "u8"
+     ],
+     "report": "write"
+    }
+   ],
+   "edges": [
+    {
+     "from": "s4",
+     "to": "i:week",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s6",
+     "to": "Q1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s8",
+     "to": "Q1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u1",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u2",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u2",
+     "to": "Q2",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u3",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s16",
+     "to": "Q3",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u4",
+     "to": "Q3",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s22",
+     "to": "t:orders",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s24",
+     "to": "c:orders.status",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s26",
+     "to": "c:orders.created_at",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u6",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u8",
+     "to": "i:week",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "t:orders",
+     "to": "Q1",
+     "rel": "appears_in",
+     "report": "write"
+    },
+    {
+     "from": "t:orders",
+     "to": "Q2",
+     "rel": "appears_in",
+     "report": "write"
+    },
+    {
+     "from": "Q1.r0.gmv",
+     "to": "Q1",
+     "rel": "cell_of",
+     "report": "write"
+    },
+    {
+     "from": "Q1.r0.order_cnt",
+     "to": "Q1",
+     "rel": "cell_of",
+     "report": "write"
+    },
+    {
+     "from": "Q3.r0.refund_cnt",
+     "to": "Q3",
+     "rel": "cell_of",
+     "report": "write"
+    }
+   ]
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b0",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "ref": "i:week",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "run_input",
+      "alias": "i:week",
+      "field": "week",
+      "value": "2026-W37",
+      "rendered": "2026-W37",
+      "eid": "ev:input:a398c5e60abfeedd",
+      "eid_ok": true,
+      "node_id": "in",
+      "sealed": true
+     }
+    ],
+    "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.gmv",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:2c11308ddb6fcc9d",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.order_cnt",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:7bf8c94a219f95dc",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "order_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "order_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "supported",
+      "rationale": "Q1 第 1 行的 gmv 和 order_cnt 正是这两个数，说的是同一周",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      64
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "span": [
+      47,
+      64
+     ],
+     "cites": [
+      "Q1",
+      "Q2"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录。",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "Q2"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1、Q2。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      66,
+      84
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      66,
+      84
+     ],
+     "cites": [
+      "Q1"
+     ],
+     "verdict": {
+      "status": "insufficient",
+      "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1"
+      ],
+      "missing": "按新客、老客拆分的订单数",
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b3",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s15",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      86,
+      89
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q3 里部分退款 11 单，不到一半，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q3"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s16": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s16",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      89,
+      91
+     ],
+     "unit": "u4",
+     "ref": "v:Q3.r0.refund_cnt",
+     "cite": {
+      "ref": "Q3.r0.refund_cnt",
+      "alias": "Q3",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:c8a13668eaa52e86",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     }
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q3 里部分退款 11 单，不到一半，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q3"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q3",
+      "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT COUNT(*) AS refund_cnt, SUM(partial) AS partial_cnt\nFROM refunds\nWHERE week = '2026-W37'",
+      "columns": [
+       "refund_cnt",
+       "partial_cnt"
+      ],
+      "rows": [
+       [
+        29,
+        11
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "refund_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "refund_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s17",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      91,
+      105
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "partial",
+      "rationale": "退款 29 单有依据；Q3 里部分退款 11 单，不到一半，说不上「大多数」",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q3"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "口径说明",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      110,
+      114
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "heading",
+     "text": "口径说明",
+     "span": [
+      110,
+      114
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b5",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "订单取自 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      116,
+      121
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s22": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s22",
+     "text": "orders",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      121,
+      127
+     ],
+     "unit": "u6",
+     "ref": "t:orders",
+     "cite": {
+      "ref": "orders",
+      "alias": "t:orders",
+      "locator": {
+       "table": "orders"
+      },
+      "eid": "ev:table:f27c2a4e42555c46",
+      "kind": "table",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "table",
+      "alias": "t:orders",
+      "name": "orders",
+      "table": "orders",
+      "qualified": "public.orders",
+      "source": "shop",
+      "queries": [
+       "Q1",
+       "Q2"
+      ],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+        "alias": "Q1",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+        "alias": "Q2",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:table:f27c2a4e42555c46",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "columns": 8,
+      "is_view": false,
+      "comment": "订单",
+      "fields": [
+       {
+        "name": "order_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "customer_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "channel",
+        "type": "VARCHAR(16)"
+       },
+       {
+        "name": "status",
+        "type": "VARCHAR(12)"
+       },
+       {
+        "name": "amount",
+        "type": "DECIMAL(12,2)"
+       },
+       {
+        "name": "week",
+        "type": "VARCHAR(8)"
+       },
+       {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+       },
+       {
+        "name": "region",
+        "type": "VARCHAR(16)"
+       }
+      ]
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s23": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s23",
+     "text": " 表，按 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      127,
+      132
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s24": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s24",
+     "text": "orders.status",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      132,
+      145
+     ],
+     "unit": "u6",
+     "ref": "c:orders.status",
+     "cite": {
+      "ref": "orders.status",
+      "alias": "c:orders.status",
+      "locator": {
+       "table": "orders",
+       "column": "status"
+      },
+      "eid": "ev:column:3def93cf584fc715",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.status"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.status",
+      "name": "status",
+      "table": "orders",
+      "column": "status",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:3def93cf584fc715",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "VARCHAR(12)",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false,
+      "comment": "paid / refunded / cancelled"
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s25": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s25",
+     "text": " 为已支付、",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      145,
+      151
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s26": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s26",
+     "text": "orders.created_at",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      151,
+      168
+     ],
+     "unit": "u6",
+     "ref": "c:orders.created_at",
+     "cite": {
+      "ref": "orders.created_at",
+      "alias": "c:orders.created_at",
+      "locator": {
+       "table": "orders",
+       "column": "created_at"
+      },
+      "eid": "ev:column:afb22335517801e6",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.created_at"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.created_at",
+      "name": "created_at",
+      "table": "orders",
+      "column": "created_at",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:afb22335517801e6",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "TIMESTAMP",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s27": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s27",
+     "text": " 落在本周筛选。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      168,
+      176
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s29": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s29",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      178,
+      189
+     ],
+     "unit": "u7"
+    },
+    "unit": {
+     "id": "u7",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      178,
+      189
+     ],
+     "cites": [],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "已达上限（每份报告最多裁判 6 句），这句未裁判",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "reason": "max_claims"
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b7",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s31": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9"
+    },
+    "segment": {
+     "id": "s31",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      191,
+      200
+     ],
+     "unit": "u8"
+    },
+    "unit": {
+     "id": "u8",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      191,
+      200
+     ],
+     "cites": [
+      "i:week"
+     ],
+     "verdict": {
+      "status": "not_a_claim",
+      "rationale": "这句说的是统计口径，不陈述数据事实",
+      "judge": "judge-model-b",
+      "post_seal": false,
+      "used": [
+       "i:week"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "formal",
+      "message": "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+     }
+    },
+    "block": {
+     "id": "b8",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "units": {
+   "ok": "u1",
+   "contra": "u2",
+   "insuff": "u3",
+   "partial": "u4",
+   "method": "u6",
+   "limit": "u7",
+   "not": "u8"
+  },
+  "segs": {
+   "orders": "s22",
+   "status": "s24",
+   "gmv": "s6"
+  },
+  "audit": {
+   "run_id": "run-evidence-verdict",
+   "schema": "agentlab.evidence.audit/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 72,
+    "legacy": false,
+    "events": 72,
+    "message": "封存清单核对一致"
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9",
+     "hash_ok": true,
+     "doc_sealed": true,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 9,
+      "segments": 32,
+      "claims": 7,
+      "connective": 0,
+      "headings": 2,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "entities": 3,
+      "quotes": 0,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "unknown_entities": 0,
+      "unverified_entities": 0,
+      "see": 7,
+      "uncited_claims": 1,
+      "violations": 0,
+      "supported": 1,
+      "partial": 1,
+      "contradicted": 2,
+      "insufficient": 1,
+      "not_a_claim": 1,
+      "unjudged": 1,
+      "unsupported": 0
+     },
+     "claims": "judge",
+     "judge": {
+      "mode": "inline",
+      "model": "judge-model-b",
+      "on_unsupported": "degrade",
+      "rewrite_once": false,
+      "limits": {
+       "max_claims": 6,
+       "max_cost_usd": 0.05,
+       "timeout_s": 30,
+       "daily_max_usd": 2.0
+      },
+      "candidates": 7,
+      "screened": [],
+      "counts": {
+       "supported": 1,
+       "partial": 1,
+       "contradicted": 2,
+       "insufficient": 1,
+       "not_a_claim": 1,
+       "unjudged": 1,
+       "unsupported": 0
+      },
+      "unjudged": {
+       "max_claims": 1
+      },
+      "limits_hit": [
+       "max_claims"
+      ],
+      "complete": false,
+      "priced": false,
+      "cost_usd": 0.0,
+      "calls": 1,
+      "reused": 0,
+      "duration_ms": 5400,
+      "gaps": [
+       "有 1 句结论未裁判：已达上限（每份报告最多裁判 6 句）"
+      ],
+      "notes": [],
+      "same_model": true,
+      "rewrite": null,
+      "writer_model": "judge-model-b"
+     },
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "groups": [
+    {
+     "key": "cited",
+     "label": "有出处",
+     "count": 7,
+     "rows": [
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s4",
+       "unit": "u1",
+       "kind": "value",
+       "text": "2026-W37",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "i:week",
+       "alias": "i:week",
+       "evidence_kind": "input",
+       "evidence": "week = 2026-W37",
+       "eid": "ev:input:a398c5e60abfeedd",
+       "artifact": null,
+       "node_id": null,
+       "sealed": true,
+       "span": [
+        12,
+        20
+       ],
+       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+       "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s6",
+       "unit": "u1",
+       "kind": "number",
+       "text": "45,678.5",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:Q1.r0.gmv",
+       "alias": "Q1",
+       "evidence_kind": "cell",
+       "evidence": "Q1.r0.gmv",
+       "eid": "ev:cell:2c11308ddb6fcc9d",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "node_id": "fetch",
+       "sealed": true,
+       "span": [
+        25,
+        33
+       ],
+       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+       "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s8",
+       "unit": "u1",
+       "kind": "number",
+       "text": "1,234",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:Q1.r0.order_cnt",
+       "alias": "Q1",
+       "evidence_kind": "cell",
+       "evidence": "Q1.r0.order_cnt",
+       "eid": "ev:cell:7bf8c94a219f95dc",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "node_id": "fetch",
+       "sealed": true,
+       "span": [
+        37,
+        42
+       ],
+       "sentence": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+       "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s16",
+       "unit": "u4",
+       "kind": "number",
+       "text": "29",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:Q3.r0.refund_cnt",
+       "alias": "Q3",
+       "evidence_kind": "cell",
+       "evidence": "Q3.r0.refund_cnt",
+       "eid": "ev:cell:c8a13668eaa52e86",
+       "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+       "node_id": "fetch",
+       "sealed": true,
+       "span": [
+        89,
+        91
+       ],
+       "sentence": "退款 29 单，其中大多数是部分退款。",
+       "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s22",
+       "unit": "u6",
+       "kind": "entity",
+       "text": "orders",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "t:orders",
+       "alias": "t:orders",
+       "evidence_kind": "table",
+       "evidence": "表 orders",
+       "eid": "ev:table:f27c2a4e42555c46",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "node_id": null,
+       "sealed": true,
+       "span": [
+        121,
+        127
+       ],
+       "sentence": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+       "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s24",
+       "unit": "u6",
+       "kind": "entity",
+       "text": "orders.status",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "c:orders.status",
+       "alias": "c:orders.status",
+       "evidence_kind": "column",
+       "evidence": "字段 orders.status",
+       "eid": "ev:column:3def93cf584fc715",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "node_id": null,
+       "sealed": true,
+       "span": [
+        132,
+        145
+       ],
+       "sentence": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+       "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "answer",
+       "segment": "s26",
+       "unit": "u6",
+       "kind": "entity",
+       "text": "orders.created_at",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "c:orders.created_at",
+       "alias": "c:orders.created_at",
+       "evidence_kind": "column",
+       "evidence": "字段 orders.created_at",
+       "eid": "ev:column:afb22335517801e6",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "node_id": null,
+       "sealed": true,
+       "span": [
+        151,
+        168
+       ],
+       "sentence": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+       "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义"
+      }
+     ]
+    },
+    {
+     "key": "none",
+     "label": "无证据",
+     "count": 4,
+     "rows": [
+      {
+       "group": "none",
+       "report": "write",
+       "field": "answer",
+       "segment": null,
+       "unit": "u2",
+       "kind": "claim",
+       "text": "各渠道的订单数相加与总订单数一致。",
+       "state": "none",
+       "issue": "contradicted_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        47,
+        64
+       ],
+       "sentence": "各渠道的订单数相加与总订单数一致。",
+       "note": "模型判断：证据与这句结论相矛盾。理由：Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录",
+       "verdict": {
+        "status": "contradicted",
+        "rationale": "Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录。",
+        "judge": "judge-model-b",
+        "post_seal": false
+       }
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "answer",
+       "segment": null,
+       "unit": "u3",
+       "kind": "claim",
+       "text": "增长主要来自新客首单，老客复购持平。",
+       "state": "none",
+       "issue": "insufficient_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        66,
+        84
+       ],
+       "sentence": "增长主要来自新客首单，老客复购持平。",
+       "note": "模型判断：证据不足，无法判断这句结论（缺少：按新客、老客拆分的订单数）。理由：摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+       "verdict": {
+        "status": "insufficient",
+        "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+        "missing": "按新客、老客拆分的订单数",
+        "judge": "judge-model-b",
+        "post_seal": false
+       }
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "answer",
+       "segment": null,
+       "unit": "u6",
+       "kind": "claim",
+       "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+       "state": "none",
+       "issue": "contradicted_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        116,
+        176
+       ],
+       "sentence": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+       "note": "模型判断：证据与这句结论相矛盾。理由：Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+       "verdict": {
+        "status": "contradicted",
+        "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+        "judge": "judge-model-b",
+        "post_seal": false
+       }
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "answer",
+       "segment": null,
+       "unit": "u7",
+       "kind": "claim",
+       "text": "华东贡献了最多的增量。",
+       "state": "none",
+       "issue": "uncited_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        178,
+        189
+       ],
+       "sentence": "华东贡献了最多的增量。",
+       "note": "这句结论没有附依据。本报告的结论句由模型裁判，同样要求附依据，但目前没有出具契约据此判档（未配置契约，或尚未到出具步骤）"
+      }
+     ]
+    },
+    {
+     "key": "suspicious",
+     "label": "可疑名称",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "candidate",
+     "label": "按数值猜测",
+     "count": 0,
+     "rows": []
+    }
+   ],
+   "counts": {
+    "cited": 7,
+    "none": 4,
+    "suspicious": 0,
+    "candidate": 0
+   },
+   "total": 11
+  },
+  "report_checked": {
+   "doc_artifact": "20bd23719390775d1b69cb5431aadc19a2bf56a98e2593858157eadd90562ab9",
+   "ok": true,
+   "stats": {
+    "units": 9,
+    "segments": 32,
+    "claims": 7,
+    "connective": 0,
+    "headings": 2,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "entities": 3,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 7,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 1,
+    "partial": 1,
+    "contradicted": 2,
+    "insufficient": 1,
+    "not_a_claim": 1,
+    "unjudged": 1,
+    "unsupported": 0
+   },
+   "violations": [],
+   "repairs": 0,
+   "claims": "judge",
+   "judge": {
+    "mode": "inline",
+    "model": "judge-model-b",
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": {
+     "max_claims": 6,
+     "max_cost_usd": 0.05,
+     "timeout_s": 30,
+     "daily_max_usd": 2.0
+    },
+    "candidates": 7,
+    "screened": [],
+    "counts": {
+     "supported": 1,
+     "partial": 1,
+     "contradicted": 2,
+     "insufficient": 1,
+     "not_a_claim": 1,
+     "unjudged": 1,
+     "unsupported": 0
+    },
+    "unjudged": {
+     "max_claims": 1
+    },
+    "limits_hit": [
+     "max_claims"
+    ],
+    "complete": false,
+    "priced": false,
+    "cost_usd": 0.0,
+    "calls": 1,
+    "reused": 0,
+    "duration_ms": 5400,
+    "gaps": [
+     "有 1 句结论未裁判：已达上限（每份报告最多裁判 6 句）"
+    ],
+    "notes": [],
+    "same_model": true,
+    "rewrite": null,
+    "writer_model": "judge-model-b"
+   }
+  }
+ },
+ "explore": {
+  "run_id": "run-evidence-verdict-explore",
+  "run_class": "exploratory",
+  "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4",
+  "doc": {
+   "schema": "agentlab.report/1",
+   "run_id": "run-evidence-verdict-explore",
+   "node_id": "write",
+   "markdown": "## 本周概览\n\n本周（2026-W37）销售额 45,678.5，订单 1,234 单。\n\n各渠道的订单数相加与总订单数一致。\n\n增长主要来自新客首单，老客复购持平。\n\n退款 29 单，其中大多数是部分退款。\n\n## 口径说明\n\n订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。\n\n华东贡献了最多的增量。\n\n周报按自然周统计。",
+   "source": "## 本周概览\n\n本周（[[i:week]]）销售额 [[v:Q1.r0.gmv]]，订单 [[v:Q1.r0.order_cnt]] 单。[[see:Q1]]\n\n各渠道的订单数相加与总订单数一致。[[see:Q1]][[see:Q2]]\n\n增长主要来自新客首单，老客复购持平。[[see:Q1]]\n\n退款 [[v:Q3.r0.refund_cnt]] 单，其中大多数是部分退款。[[see:Q3]]\n\n## 口径说明\n\n订单取自 [[t:orders]] 表，按 [[c:orders.status]] 为已支付、[[c:orders.created_at]] 落在本周筛选。[[see:Q1]]\n\n华东贡献了最多的增量。\n\n周报按自然周统计。[[see:i:week]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:a0beaf9e1d4f2444",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+     "via": "663ddd04f31da329c96488c48db06b3ff0af7f15e8e7c32bb008c012a2e47d56",
+     "call_id": "toolu_01",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:f84a3bb6b6ffe924",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+     "via": "71c521b3453ba322f3faee7e76eb62722d377374f28ed711838b52548e116afd",
+     "call_id": "toolu_02",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "channel",
+      "order_cnt"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__shop · 3 行"
+    },
+    "Q3": {
+     "alias": "Q3",
+     "kind": "query",
+     "eid": "ev:query:ade648b75fa5aca1",
+     "locator": {},
+     "node_id": "fetch",
+     "exec": 1,
+     "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+     "via": "27e5441e5914d6717922d6a34b4cbf9649218834659ac7652b876f2fc13afaa6",
+     "call_id": "toolu_03",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__shop · 1 行"
+    },
+    "t:orders": {
+     "alias": "t:orders",
+     "kind": "table",
+     "eid": "ev:table:f27c2a4e42555c46",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders"
+     },
+     "name": "orders",
+     "qualified": "public.orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      },
+      {
+       "kind": "sql",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "alias": "Q1",
+       "source": "shop"
+      },
+      {
+       "kind": "sql",
+       "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+       "alias": "Q2",
+       "source": "shop"
+      }
+     ],
+     "queries": [
+      "Q1",
+      "Q2"
+     ],
+     "label": "表 orders"
+    },
+    "c:orders.status": {
+     "alias": "c:orders.status",
+     "kind": "column",
+     "eid": "ev:column:3def93cf584fc715",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders",
+      "column": "status"
+     },
+     "name": "status",
+     "table": "orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      }
+     ],
+     "queries": [],
+     "label": "字段 orders.status"
+    },
+    "c:orders.created_at": {
+     "alias": "c:orders.created_at",
+     "kind": "column",
+     "eid": "ev:column:afb22335517801e6",
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "locator": {
+      "table": "orders",
+      "column": "created_at"
+     },
+     "name": "created_at",
+     "table": "orders",
+     "source": "shop",
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop"
+      }
+     ],
+     "queries": [],
+     "label": "字段 orders.created_at"
+    },
+    "i:week": {
+     "alias": "i:week",
+     "kind": "input",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "locator": {
+      "field": "week"
+     },
+     "value": "2026-W37",
+     "rendered": "2026-W37",
+     "label": "week = 2026-W37"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        7
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "本周概览",
+         "state": "neutral",
+         "span": [
+          3,
+          7
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        9,
+        45
+       ],
+       "cites": [
+        "i:week",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          7,
+          9
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "本周（",
+         "state": "neutral",
+         "span": [
+          9,
+          12
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "value",
+         "text": "2026-W37",
+         "ref": "i:week",
+         "cite": {
+          "ref": "week",
+          "alias": "i:week",
+          "locator": {
+           "field": "week"
+          },
+          "eid": "ev:input:a398c5e60abfeedd",
+          "kind": "input",
+          "role": "value",
+          "status": "resolved",
+          "value": "2026-W37",
+          "rendered": "2026-W37"
+         },
+         "state": "deterministic",
+         "span": [
+          12,
+          20
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "）销售额 ",
+         "state": "neutral",
+         "span": [
+          20,
+          25
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "45,678.5",
+         "ref": "v:Q1.r0.gmv",
+         "cite": {
+          "ref": "Q1.r0.gmv",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gmv"
+          },
+          "eid": "ev:cell:2c11308ddb6fcc9d",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 45678.5,
+          "rendered": "45,678.5"
+         },
+         "state": "deterministic",
+         "span": [
+          25,
+          33
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          33,
+          37
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,234",
+         "ref": "v:Q1.r0.order_cnt",
+         "cite": {
+          "ref": "Q1.r0.order_cnt",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "order_cnt"
+          },
+          "eid": "ev:cell:7bf8c94a219f95dc",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1234,
+          "rendered": "1,234"
+         },
+         "state": "deterministic",
+         "span": [
+          37,
+          42
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 单。",
+         "state": "neutral",
+         "span": [
+          42,
+          45
+         ],
+         "id": "s9"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        47,
+        64
+       ],
+       "cites": [
+        "Q1",
+        "Q2"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        },
+        {
+         "ref": "Q2",
+         "role": "support",
+         "alias": "Q2",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:f84a3bb6b6ffe924",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          45,
+          47
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "text",
+         "text": "各渠道的订单数相加与总订单数一致。",
+         "state": "neutral",
+         "span": [
+          47,
+          64
+         ],
+         "id": "s11"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        66,
+        84
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          64,
+          66
+         ],
+         "id": "s12"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客首单，老客复购持平。",
+         "state": "neutral",
+         "span": [
+          66,
+          84
+         ],
+         "id": "s13"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        86,
+        105
+       ],
+       "cites": [
+        "Q3"
+       ],
+       "see": [
+        {
+         "ref": "Q3",
+         "role": "support",
+         "alias": "Q3",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:ade648b75fa5aca1",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          84,
+          86
+         ],
+         "id": "s14"
+        },
+        {
+         "kind": "text",
+         "text": "退款 ",
+         "state": "neutral",
+         "span": [
+          86,
+          89
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "number",
+         "text": "29",
+         "ref": "v:Q3.r0.refund_cnt",
+         "cite": {
+          "ref": "Q3.r0.refund_cnt",
+          "alias": "Q3",
+          "locator": {
+           "row": 0,
+           "column": "refund_cnt"
+          },
+          "eid": "ev:cell:c8a13668eaa52e86",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 29,
+          "rendered": "29"
+         },
+         "state": "deterministic",
+         "span": [
+          89,
+          91
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "text",
+         "text": " 单，其中大多数是部分退款。",
+         "state": "neutral",
+         "span": [
+          91,
+          105
+         ],
+         "id": "s17"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b4"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u5",
+       "kind": "heading",
+       "span": [
+        110,
+        114
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n## ",
+         "state": "neutral",
+         "span": [
+          105,
+          110
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "text",
+         "text": "口径说明",
+         "state": "neutral",
+         "span": [
+          110,
+          114
+         ],
+         "id": "s19"
+        }
+       ]
+      }
+     ],
+     "id": "b5"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        116,
+        176
+       ],
+       "cites": [
+        "t:orders",
+        "c:orders.status",
+        "c:orders.created_at",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:a0beaf9e1d4f2444",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          114,
+          116
+         ],
+         "id": "s20"
+        },
+        {
+         "kind": "text",
+         "text": "订单取自 ",
+         "state": "neutral",
+         "span": [
+          116,
+          121
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "entity",
+         "text": "orders",
+         "ref": "t:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "t:orders",
+          "locator": {
+           "table": "orders"
+          },
+          "eid": "ev:table:f27c2a4e42555c46",
+          "kind": "table",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders"
+         },
+         "state": "deterministic",
+         "span": [
+          121,
+          127
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 表，按 ",
+         "state": "neutral",
+         "span": [
+          127,
+          132
+         ],
+         "id": "s23"
+        },
+        {
+         "kind": "entity",
+         "text": "orders.status",
+         "ref": "c:orders.status",
+         "cite": {
+          "ref": "orders.status",
+          "alias": "c:orders.status",
+          "locator": {
+           "table": "orders",
+           "column": "status"
+          },
+          "eid": "ev:column:3def93cf584fc715",
+          "kind": "column",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders.status"
+         },
+         "state": "deterministic",
+         "span": [
+          132,
+          145
+         ],
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": " 为已支付、",
+         "state": "neutral",
+         "span": [
+          145,
+          151
+         ],
+         "id": "s25"
+        },
+        {
+         "kind": "entity",
+         "text": "orders.created_at",
+         "ref": "c:orders.created_at",
+         "cite": {
+          "ref": "orders.created_at",
+          "alias": "c:orders.created_at",
+          "locator": {
+           "table": "orders",
+           "column": "created_at"
+          },
+          "eid": "ev:column:afb22335517801e6",
+          "kind": "column",
+          "role": "entity",
+          "status": "resolved",
+          "rendered": "orders.created_at"
+         },
+         "state": "deterministic",
+         "span": [
+          151,
+          168
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": " 落在本周筛选。",
+         "state": "neutral",
+         "span": [
+          168,
+          176
+         ],
+         "id": "s27"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b6"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        178,
+        189
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          176,
+          178
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "华东贡献了最多的增量。",
+         "state": "neutral",
+         "span": [
+          178,
+          189
+         ],
+         "id": "s29"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b7"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u8",
+       "kind": "claim",
+       "span": [
+        191,
+        200
+       ],
+       "cites": [
+        "i:week"
+       ],
+       "see": [
+        {
+         "ref": "i:week",
+         "role": "support",
+         "alias": "i:week",
+         "kind": "input",
+         "status": "resolved",
+         "eid": "ev:input:a398c5e60abfeedd",
+         "locator": {
+          "field": "week"
+         }
+        }
+       ],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          189,
+          191
+         ],
+         "id": "s30"
+        },
+        {
+         "kind": "text",
+         "text": "周报按自然周统计。",
+         "state": "neutral",
+         "span": [
+          191,
+          200
+         ],
+         "id": "s31"
+        }
+       ],
+       "verdict": {
+        "status": "unjudged",
+        "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+        "judge": null,
+        "post_seal": false,
+        "reason": "on_demand"
+       }
+      }
+     ],
+     "id": "b8"
+    }
+   ],
+   "stats": {
+    "units": 9,
+    "segments": 32,
+    "claims": 7,
+    "connective": 0,
+    "headings": 2,
+    "numbers": 3,
+    "numbers_cited": 3,
+    "values": 1,
+    "entities": 3,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 7,
+    "uncited_claims": 1,
+    "violations": 0,
+    "supported": 0,
+    "partial": 0,
+    "contradicted": 0,
+    "insufficient": 0,
+    "not_a_claim": 0,
+    "unjudged": 7,
+    "unsupported": 0
+   },
+   "violations": [],
+   "judge": {
+    "mode": "on_demand",
+    "model": null,
+    "on_unsupported": "degrade",
+    "rewrite_once": false,
+    "limits": null,
+    "candidates": 7,
+    "screened": [],
+    "counts": {
+     "supported": 0,
+     "partial": 0,
+     "contradicted": 0,
+     "insufficient": 0,
+     "not_a_claim": 0,
+     "unjudged": 7,
+     "unsupported": 0
+    },
+    "unjudged": {
+     "on_demand": 7
+    },
+    "limits_hit": [],
+    "complete": false,
+    "priced": null,
+    "cost_usd": 0.0,
+    "calls": 0,
+    "reused": 0,
+    "duration_ms": 0,
+    "gaps": [],
+    "notes": [],
+    "same_model": false,
+    "rewrite": null,
+    "writer_model": "writer-model-a"
+   }
+  },
+  "graph": {
+   "run_id": "run-evidence-verdict-explore",
+   "schema": "agentlab.evidence/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 72,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "ok": true,
+     "repairs": 0,
+     "fields": [
+      "answer"
+     ],
+     "stats": {
+      "units": 9,
+      "segments": 32,
+      "claims": 7,
+      "connective": 0,
+      "headings": 2,
+      "numbers": 3,
+      "numbers_cited": 3,
+      "values": 1,
+      "entities": 3,
+      "quotes": 0,
+      "uncited_numbers": 0,
+      "unresolved": 0,
+      "unknown_entities": 0,
+      "unverified_entities": 0,
+      "see": 7,
+      "uncited_claims": 1,
+      "violations": 0,
+      "supported": 0,
+      "partial": 0,
+      "contradicted": 0,
+      "insufficient": 0,
+      "not_a_claim": 0,
+      "unjudged": 7,
+      "unsupported": 0
+     },
+     "claims": "judge",
+     "judge": {
+      "mode": "on_demand",
+      "model": null,
+      "on_unsupported": "degrade",
+      "rewrite_once": false,
+      "limits": null,
+      "candidates": 7,
+      "screened": [],
+      "counts": {
+       "supported": 0,
+       "partial": 0,
+       "contradicted": 0,
+       "insufficient": 0,
+       "not_a_claim": 0,
+       "unjudged": 7,
+       "unsupported": 0
+      },
+      "unjudged": {
+       "on_demand": 7
+      },
+      "limits_hit": [],
+      "complete": false,
+      "priced": null,
+      "cost_usd": 0.0,
+      "calls": 0,
+      "reused": 0,
+      "duration_ms": 0,
+      "gaps": [],
+      "notes": [],
+      "same_model": false,
+      "rewrite": null,
+      "writer_model": "writer-model-a"
+     },
+     "post_seal_verdicts": {
+      "u2": {
+       "status": "unsupported",
+       "rationale": "Q2 各渠道相加 1,230 单，和 Q1 的 1,234 单对不上",
+       "judge": "judge-model-b",
+       "post_seal": true,
+       "used": [
+        "Q1",
+        "Q2"
+       ]
+      },
+      "u3": {
+       "status": "insufficient",
+       "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+       "judge": "judge-model-b",
+       "post_seal": true,
+       "used": [
+        "Q1"
+       ],
+       "missing": "按新客、老客拆分的订单数",
+       "rule_version": 2
+      }
+     },
+     "judge_meta": {
+      "model": "judge-model-b",
+      "same_model": false,
+      "priced": true,
+      "writer_model": "writer-model-a"
+     }
+    }
+   ],
+   "evidence": [
+    {
+     "alias": "Q1",
+     "eid": "ev:query:a0beaf9e1d4f2444",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "fetch",
+     "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+     "sealed": true,
+     "cited_by": [
+      "s6",
+      "s8"
+     ],
+     "units": [
+      "u1",
+      "u2",
+      "u3",
+      "u6"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv",
+      "order_cnt"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "Q2",
+     "eid": "ev:query:f84a3bb6b6ffe924",
+     "kind": "query",
+     "label": "db_query__shop · 3 行",
+     "node_id": "fetch",
+     "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+     "sealed": true,
+     "cited_by": [],
+     "units": [
+      "u2"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "channel",
+      "order_cnt"
+     ],
+     "rows": 3,
+     "truncated": false
+    },
+    {
+     "alias": "Q3",
+     "eid": "ev:query:ade648b75fa5aca1",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "fetch",
+     "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+     "sealed": true,
+     "cited_by": [
+      "s16"
+     ],
+     "units": [
+      "u4"
+     ],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "refund_cnt",
+      "partial_cnt"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "t:orders",
+     "eid": "ev:table:f27c2a4e42555c46",
+     "kind": "table",
+     "label": "表 orders",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s22"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "orders",
+     "qualified": "public.orders",
+     "source": "shop",
+     "queries": [
+      "Q1",
+      "Q2"
+     ],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      },
+      {
+       "kind": "sql",
+       "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+       "alias": "Q1",
+       "source": "shop",
+       "sealed": true
+      },
+      {
+       "kind": "sql",
+       "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+       "alias": "Q2",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "c:orders.status",
+     "eid": "ev:column:3def93cf584fc715",
+     "kind": "column",
+     "label": "字段 orders.status",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s24"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "status",
+     "table": "orders",
+     "source": "shop",
+     "queries": [],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "c:orders.created_at",
+     "eid": "ev:column:afb22335517801e6",
+     "kind": "column",
+     "label": "字段 orders.created_at",
+     "node_id": null,
+     "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+     "sealed": true,
+     "cited_by": [
+      "s26"
+     ],
+     "units": [
+      "u6"
+     ],
+     "report": "write",
+     "name": "created_at",
+     "table": "orders",
+     "source": "shop",
+     "queries": [],
+     "sources": [
+      {
+       "kind": "schema",
+       "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+       "source": "shop",
+       "sealed": true
+      }
+     ]
+    },
+    {
+     "alias": "i:week",
+     "eid": "ev:input:a398c5e60abfeedd",
+     "kind": "input",
+     "label": "week = 2026-W37",
+     "node_id": null,
+     "artifact": null,
+     "sealed": true,
+     "cited_by": [
+      "s4"
+     ],
+     "units": [
+      "u1",
+      "u8"
+     ],
+     "report": "write"
+    }
+   ],
+   "edges": [
+    {
+     "from": "s4",
+     "to": "i:week",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s6",
+     "to": "Q1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s8",
+     "to": "Q1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u1",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u2",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u2",
+     "to": "Q2",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u3",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s16",
+     "to": "Q3",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u4",
+     "to": "Q3",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s22",
+     "to": "t:orders",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s24",
+     "to": "c:orders.status",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s26",
+     "to": "c:orders.created_at",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u6",
+     "to": "Q1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "u8",
+     "to": "i:week",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "t:orders",
+     "to": "Q1",
+     "rel": "appears_in",
+     "report": "write"
+    },
+    {
+     "from": "t:orders",
+     "to": "Q2",
+     "rel": "appears_in",
+     "report": "write"
+    },
+    {
+     "from": "Q1.r0.gmv",
+     "to": "Q1",
+     "rel": "cell_of",
+     "report": "write"
+    },
+    {
+     "from": "Q1.r0.order_cnt",
+     "to": "Q1",
+     "rel": "cell_of",
+     "report": "write"
+    },
+    {
+     "from": "Q3.r0.refund_cnt",
+     "to": "Q3",
+     "rel": "cell_of",
+     "report": "write"
+    }
+   ]
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "not_a_claim",
+      "message": "这句不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+     }
+    },
+    "block": {
+     "id": "b0",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "ref": "i:week",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "run_input",
+      "alias": "i:week",
+      "field": "week",
+      "value": "2026-W37",
+      "rendered": "2026-W37",
+      "eid": "ev:input:a398c5e60abfeedd",
+      "eid_ok": true,
+      "node_id": "in",
+      "sealed": true
+     }
+    ],
+    "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.gmv",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:2c11308ddb6fcc9d",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.order_cnt",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:7bf8c94a219f95dc",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "order_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "order_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      64
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "span": [
+      47,
+      64
+     ],
+     "cites": [
+      "Q1",
+      "Q2"
+     ],
+     "verdict": {
+      "status": "unsupported",
+      "rationale": "Q2 各渠道相加 1,230 单，和 Q1 的 1,234 单对不上",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "Q2"
+      ]
+     },
+     "on_demand": {
+      "available": true,
+      "reason": "outdated",
+      "message": "这句的判定早于当前的裁判规则，可以请模型按当前规则重新判断"
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1、Q2。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      66,
+      84
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      66,
+      84
+     ],
+     "cites": [
+      "Q1"
+     ],
+     "verdict": {
+      "status": "insufficient",
+      "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1"
+      ],
+      "missing": "按新客、老客拆分的订单数",
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b3",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s15",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      86,
+      89
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s16": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s16",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      89,
+      91
+     ],
+     "unit": "u4",
+     "ref": "v:Q3.r0.refund_cnt",
+     "cite": {
+      "ref": "Q3.r0.refund_cnt",
+      "alias": "Q3",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:c8a13668eaa52e86",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     }
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q3",
+      "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT COUNT(*) AS refund_cnt, SUM(partial) AS partial_cnt\nFROM refunds\nWHERE week = '2026-W37'",
+      "columns": [
+       "refund_cnt",
+       "partial_cnt"
+      ],
+      "rows": [
+       [
+        29,
+        11
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "refund_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "refund_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s17",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      91,
+      105
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "口径说明",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      110,
+      114
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "heading",
+     "text": "口径说明",
+     "span": [
+      110,
+      114
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "not_a_claim",
+      "message": "这句不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+     }
+    },
+    "block": {
+     "id": "b5",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "订单取自 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      116,
+      121
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s22": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s22",
+     "text": "orders",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      121,
+      127
+     ],
+     "unit": "u6",
+     "ref": "t:orders",
+     "cite": {
+      "ref": "orders",
+      "alias": "t:orders",
+      "locator": {
+       "table": "orders"
+      },
+      "eid": "ev:table:f27c2a4e42555c46",
+      "kind": "table",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "table",
+      "alias": "t:orders",
+      "name": "orders",
+      "table": "orders",
+      "qualified": "public.orders",
+      "source": "shop",
+      "queries": [
+       "Q1",
+       "Q2"
+      ],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+        "alias": "Q1",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+        "alias": "Q2",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:table:f27c2a4e42555c46",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "columns": 8,
+      "is_view": false,
+      "comment": "订单",
+      "fields": [
+       {
+        "name": "order_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "customer_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "channel",
+        "type": "VARCHAR(16)"
+       },
+       {
+        "name": "status",
+        "type": "VARCHAR(12)"
+       },
+       {
+        "name": "amount",
+        "type": "DECIMAL(12,2)"
+       },
+       {
+        "name": "week",
+        "type": "VARCHAR(8)"
+       },
+       {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+       },
+       {
+        "name": "region",
+        "type": "VARCHAR(16)"
+       }
+      ]
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s23": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s23",
+     "text": " 表，按 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      127,
+      132
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s24": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s24",
+     "text": "orders.status",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      132,
+      145
+     ],
+     "unit": "u6",
+     "ref": "c:orders.status",
+     "cite": {
+      "ref": "orders.status",
+      "alias": "c:orders.status",
+      "locator": {
+       "table": "orders",
+       "column": "status"
+      },
+      "eid": "ev:column:3def93cf584fc715",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.status"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.status",
+      "name": "status",
+      "table": "orders",
+      "column": "status",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:3def93cf584fc715",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "VARCHAR(12)",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false,
+      "comment": "paid / refunded / cancelled"
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s25": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s25",
+     "text": " 为已支付、",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      145,
+      151
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s26": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s26",
+     "text": "orders.created_at",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      151,
+      168
+     ],
+     "unit": "u6",
+     "ref": "c:orders.created_at",
+     "cite": {
+      "ref": "orders.created_at",
+      "alias": "c:orders.created_at",
+      "locator": {
+       "table": "orders",
+       "column": "created_at"
+      },
+      "eid": "ev:column:afb22335517801e6",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.created_at"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.created_at",
+      "name": "created_at",
+      "table": "orders",
+      "column": "created_at",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:afb22335517801e6",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "TIMESTAMP",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s27": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s27",
+     "text": " 落在本周筛选。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      168,
+      176
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s29": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s29",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      178,
+      189
+     ],
+     "unit": "u7"
+    },
+    "unit": {
+     "id": "u7",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      178,
+      189
+     ],
+     "cites": [],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b7",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s31": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s31",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      191,
+      200
+     ],
+     "unit": "u8"
+    },
+    "unit": {
+     "id": "u8",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      191,
+      200
+     ],
+     "cites": [
+      "i:week"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b8",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "segments_after": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "本周概览",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      3,
+      7
+     ],
+     "unit": "u0"
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "heading",
+     "text": "本周概览",
+     "span": [
+      3,
+      7
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "not_a_claim",
+      "message": "这句不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+     }
+    },
+    "block": {
+     "id": "b0",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "本周（",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      9,
+      12
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s4": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s4",
+     "text": "2026-W37",
+     "kind": "value",
+     "state": "deterministic",
+     "span": [
+      12,
+      20
+     ],
+     "unit": "u1",
+     "ref": "i:week",
+     "cite": {
+      "ref": "week",
+      "alias": "i:week",
+      "locator": {
+       "field": "week"
+      },
+      "eid": "ev:input:a398c5e60abfeedd",
+      "kind": "input",
+      "role": "value",
+      "status": "resolved",
+      "value": "2026-W37",
+      "rendered": "2026-W37"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "run_input",
+      "alias": "i:week",
+      "field": "week",
+      "value": "2026-W37",
+      "rendered": "2026-W37",
+      "eid": "ev:input:a398c5e60abfeedd",
+      "eid_ok": true,
+      "node_id": "in",
+      "sealed": true
+     }
+    ],
+    "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s5": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s5",
+     "text": "）销售额 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      20,
+      25
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "45,678.5",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      25,
+      33
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.gmv",
+     "cite": {
+      "ref": "Q1.r0.gmv",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "gmv"
+      },
+      "eid": "ev:cell:2c11308ddb6fcc9d",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 45678.5,
+      "rendered": "45,678.5"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "，订单 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      33,
+      37
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s8": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s8",
+     "text": "1,234",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      37,
+      42
+     ],
+     "unit": "u1",
+     "ref": "v:Q1.r0.order_cnt",
+     "cite": {
+      "ref": "Q1.r0.order_cnt",
+      "alias": "Q1",
+      "locator": {
+       "row": 0,
+       "column": "order_cnt"
+      },
+      "eid": "ev:cell:7bf8c94a219f95dc",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 1234,
+      "rendered": "1,234"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS order_cnt\nFROM orders\nWHERE week = '2026-W37' AND status = 'paid'",
+      "columns": [
+       "gmv",
+       "order_cnt"
+      ],
+      "rows": [
+       [
+        45678.5,
+        1234
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "order_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "order_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s9",
+     "text": " 单。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      42,
+      45
+     ],
+     "unit": "u1"
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "本周（2026-W37）销售额 45,678.5，订单 1,234 单。",
+     "span": [
+      9,
+      45
+     ],
+     "cites": [
+      "i:week",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s11": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s11",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      47,
+      64
+     ],
+     "unit": "u2"
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "各渠道的订单数相加与总订单数一致。",
+     "span": [
+      47,
+      64
+     ],
+     "cites": [
+      "Q1",
+      "Q2"
+     ],
+     "verdict": {
+      "status": "unsupported",
+      "rationale": "Q2 各渠道相加 1,230 单，和 Q1 的 1,234 单对不上",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "Q2"
+      ]
+     },
+     "on_demand": {
+      "available": true,
+      "reason": "outdated",
+      "message": "这句的判定早于当前的裁判规则，可以请模型按当前规则重新判断"
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1、Q2。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s13": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s13",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      66,
+      84
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "增长主要来自新客首单，老客复购持平。",
+     "span": [
+      66,
+      84
+     ],
+     "cites": [
+      "Q1"
+     ],
+     "verdict": {
+      "status": "insufficient",
+      "rationale": "摘录里只有 Q1 的总销售额和订单数，没有按新客、老客拆分的数据，无法判断增长来自哪一类客户",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1"
+      ],
+      "missing": "按新客、老客拆分的订单数",
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b3",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s15": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s15",
+     "text": "退款 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      86,
+      89
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s16": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s16",
+     "text": "29",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      89,
+      91
+     ],
+     "unit": "u4",
+     "ref": "v:Q3.r0.refund_cnt",
+     "cite": {
+      "ref": "Q3.r0.refund_cnt",
+      "alias": "Q3",
+      "locator": {
+       "row": 0,
+       "column": "refund_cnt"
+      },
+      "eid": "ev:cell:c8a13668eaa52e86",
+      "kind": "cell",
+      "role": "value",
+      "status": "resolved",
+      "value": 29,
+      "rendered": "29"
+     }
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "query",
+      "alias": "Q3",
+      "artifact": "2c795f15ba1ad31d0a02e9ccb188eee4802dac8586d5e305f36e4241d538bf9d",
+      "node_id": "fetch",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT COUNT(*) AS refund_cnt, SUM(partial) AS partial_cnt\nFROM refunds\nWHERE week = '2026-W37'",
+      "columns": [
+       "refund_cnt",
+       "partial_cnt"
+      ],
+      "rows": [
+       [
+        29,
+        11
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "refund_cnt"
+       ],
+       "cells": [
+        [
+         0,
+         "refund_cnt"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {}
+     }
+    ],
+    "note": "该值由系统从查询快照中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s17": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s17",
+     "text": " 单，其中大多数是部分退款。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      91,
+      105
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "退款 29 单，其中大多数是部分退款。",
+     "span": [
+      86,
+      105
+     ],
+     "cites": [
+      "Q3"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：Q3。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s19": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s19",
+     "text": "口径说明",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      110,
+      114
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "heading",
+     "text": "口径说明",
+     "span": [
+      110,
+      114
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": false,
+      "reason": "not_a_claim",
+      "message": "这句不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+     }
+    },
+    "block": {
+     "id": "b5",
+     "type": "heading"
+    },
+    "chain": [],
+    "note": "这是标题",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s21": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s21",
+     "text": "订单取自 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      116,
+      121
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s22": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s22",
+     "text": "orders",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      121,
+      127
+     ],
+     "unit": "u6",
+     "ref": "t:orders",
+     "cite": {
+      "ref": "orders",
+      "alias": "t:orders",
+      "locator": {
+       "table": "orders"
+      },
+      "eid": "ev:table:f27c2a4e42555c46",
+      "kind": "table",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "table",
+      "alias": "t:orders",
+      "name": "orders",
+      "table": "orders",
+      "qualified": "public.orders",
+      "source": "shop",
+      "queries": [
+       "Q1",
+       "Q2"
+      ],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "66fe22af47605b554a1c6dbd8763c3aa078453720475ad7d14ee6e66feb6409f",
+        "alias": "Q1",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       },
+       {
+        "kind": "sql",
+        "artifact": "0d1f89a91f258701b51df92faf47f79da7abc160bc4a8fce95d8ae24a24bd6d3",
+        "alias": "Q2",
+        "source": "shop",
+        "node_id": "fetch",
+        "tool": "db_query__shop",
+        "sealed": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:table:f27c2a4e42555c46",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "columns": 8,
+      "is_view": false,
+      "comment": "订单",
+      "fields": [
+       {
+        "name": "order_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "customer_id",
+        "type": "BIGINT"
+       },
+       {
+        "name": "channel",
+        "type": "VARCHAR(16)"
+       },
+       {
+        "name": "status",
+        "type": "VARCHAR(12)"
+       },
+       {
+        "name": "amount",
+        "type": "DECIMAL(12,2)"
+       },
+       {
+        "name": "week",
+        "type": "VARCHAR(8)"
+       },
+       {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+       },
+       {
+        "name": "region",
+        "type": "VARCHAR(16)"
+       }
+      ]
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s23": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s23",
+     "text": " 表，按 ",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      127,
+      132
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s24": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s24",
+     "text": "orders.status",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      132,
+      145
+     ],
+     "unit": "u6",
+     "ref": "c:orders.status",
+     "cite": {
+      "ref": "orders.status",
+      "alias": "c:orders.status",
+      "locator": {
+       "table": "orders",
+       "column": "status"
+      },
+      "eid": "ev:column:3def93cf584fc715",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.status"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.status",
+      "name": "status",
+      "table": "orders",
+      "column": "status",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:3def93cf584fc715",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "VARCHAR(12)",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false,
+      "comment": "paid / refunded / cancelled"
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s25": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s25",
+     "text": " 为已支付、",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      145,
+      151
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s26": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s26",
+     "text": "orders.created_at",
+     "kind": "entity",
+     "state": "deterministic",
+     "span": [
+      151,
+      168
+     ],
+     "unit": "u6",
+     "ref": "c:orders.created_at",
+     "cite": {
+      "ref": "orders.created_at",
+      "alias": "c:orders.created_at",
+      "locator": {
+       "table": "orders",
+       "column": "created_at"
+      },
+      "eid": "ev:column:afb22335517801e6",
+      "kind": "column",
+      "role": "entity",
+      "status": "resolved",
+      "rendered": "orders.created_at"
+     }
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "entity",
+      "status": "resolved",
+      "kind": "column",
+      "alias": "c:orders.created_at",
+      "name": "created_at",
+      "table": "orders",
+      "column": "created_at",
+      "source": "shop",
+      "queries": [],
+      "sources": [
+       {
+        "kind": "schema",
+        "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+        "source": "shop",
+        "sealed": true,
+        "hash_ok": true,
+        "present": true
+       }
+      ],
+      "artifact": "2f8fe3ddd017ba61a1234a8aa987e4d6121dc6a7ec41711d0cd2d1668b85a760",
+      "eid": "ev:column:afb22335517801e6",
+      "eid_ok": true,
+      "sealed": true,
+      "synced_at": "2026-09-20T08:30:00Z",
+      "type": "TIMESTAMP",
+      "type_source": "schema",
+      "nullable": true,
+      "primary_key": false
+     }
+    ],
+    "note": "这个名字在本次运行冻结的表结构快照、查询用到的表或查询结果列中确实存在。仅核对它存在且本次用到，不核对其业务含义",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s27": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s27",
+     "text": " 落在本周筛选。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      168,
+      176
+     ],
+     "unit": "u6"
+    },
+    "unit": {
+     "id": "u6",
+     "kind": "claim",
+     "text": "订单取自 orders 表，按 orders.status 为已支付、orders.created_at 落在本周筛选。",
+     "span": [
+      116,
+      176
+     ],
+     "cites": [
+      "t:orders",
+      "c:orders.status",
+      "c:orders.created_at",
+      "Q1"
+     ],
+     "verdict": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     },
+     "on_demand": {
+      "available": false,
+      "reason": "judged",
+      "message": "这句已裁判"
+     }
+    },
+    "block": {
+     "id": "b6",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：t:orders、c:orders.status、c:orders.created_at、Q1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s29": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s29",
+     "text": "华东贡献了最多的增量。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      178,
+      189
+     ],
+     "unit": "u7"
+    },
+    "unit": {
+     "id": "u7",
+     "kind": "claim",
+     "text": "华东贡献了最多的增量。",
+     "span": [
+      178,
+      189
+     ],
+     "cites": [],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b7",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s31": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "segment": {
+     "id": "s31",
+     "text": "周报按自然周统计。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      191,
+      200
+     ],
+     "unit": "u8"
+    },
+    "unit": {
+     "id": "u8",
+     "kind": "claim",
+     "text": "周报按自然周统计。",
+     "span": [
+      191,
+      200
+     ],
+     "cites": [
+      "i:week"
+     ],
+     "verdict": {
+      "status": "unjudged",
+      "rationale": "探索运行按需裁判：点开这句并请模型判断后才会裁判",
+      "judge": null,
+      "post_seal": false,
+      "reason": "on_demand"
+     },
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b8",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：i:week。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "units": {
+   "ok": "u1",
+   "contra": "u2",
+   "insuff": "u3",
+   "partial": "u4",
+   "method": "u6",
+   "limit": "u7"
+  },
+  "segs": {
+   "orders": "s22"
+  },
+  "judge": {
+   "method": {
+    "run_id": "run-evidence-verdict-explore",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "units": [
+     "u6"
+    ],
+    "verdicts": {
+     "u6": {
+      "status": "contradicted",
+      "rationale": "Q1 的 SQL 按 week = '2026-W37' 筛选本周，没有用到 created_at 字段，与句中说的筛选方式相矛盾",
+      "judge": "writer-model-a",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "t:orders",
+       "c:orders.created_at"
+      ],
+      "rule_version": 2
+     }
+    },
+    "reused": [],
+    "judged": [
+     "u6"
+    ],
+    "skipped": {},
+    "unjudged": {},
+    "limits_hit": [],
+    "limited": false,
+    "message": null,
+    "adjust": [],
+    "gaps": [],
+    "notes": [],
+    "cost_usd": 0.0,
+    "calls": 1,
+    "duration_ms": 2100,
+    "event": {
+     "seq": 82
+    },
+    "post_seal": true,
+    "model": "writer-model-a",
+    "priced": false,
+    "same_model": true,
+    "writer_model": "writer-model-a"
+   },
+   "contra": {
+    "run_id": "run-evidence-verdict-explore",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "7760105768d9ca9dd9da0d478f29c1c4c682cbf4e767854e7c99a66170a22dc4"
+    },
+    "units": [
+     "u2"
+    ],
+    "verdicts": {
+     "u2": {
+      "status": "contradicted",
+      "rationale": "Q2 各渠道订单数为 app 800、web 300、store 130，相加是 1,230 单；Q1 的总订单数是 1,234 单，两者相差 4 单，与「相加一致」相矛盾。差额可能来自未填写渠道的订单，请核对 channel 为空的记录。",
+      "judge": "judge-model-b",
+      "post_seal": true,
+      "used": [
+       "Q1",
+       "Q2"
+      ],
+      "rule_version": 2
+     }
+    },
+    "reused": [],
+    "judged": [
+     "u2"
+    ],
+    "skipped": {},
+    "unjudged": {},
+    "limits_hit": [],
+    "limited": false,
+    "message": null,
+    "adjust": [],
+    "gaps": [],
+    "notes": [],
+    "cost_usd": 0.0,
+    "calls": 1,
+    "duration_ms": 2100,
+    "event": {
+     "seq": 82
+    },
+    "post_seal": true,
+    "model": "judge-model-b",
+    "priced": true,
+    "same_model": false,
+    "writer_model": "writer-model-a"
+   }
+  }
+ }
+}

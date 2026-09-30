@@ -13,7 +13,7 @@ import { edgeKey, topology } from '../run/derive'
 import { exhaustedOf } from '../run/decode'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
-import { matchedSource } from '../lib/evidence'
+import { claimCountsOf, matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
@@ -189,11 +189,12 @@ function matchedLines(matched: unknown): string {
   return `追溯明细：\n${lines.join('\n')}${more}`
 }
 
-/** stats 里的裁判句数（claims 为 judge 时才有）→「结论 4 句（支持 1 · 不支持 1 · 未裁判 2）」 */
+/**
+ * stats 里的裁判句数（claims 为 judge 时才有）→「结论 5 句（有依据 1 · 证据相矛盾 1 · 证据不足 1 · 未裁判 2）」。
+ * 旧文档的 stats 里是 unsupported（拆档之前的取值），照样计入、照旧叫「证据不支持」
+ */
 function claimsLine(st: ReportStamp['stats']): string {
-  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
-  const c = { supported: n(st.supported), partial: n(st.partial), unsupported: n(st.unsupported), unjudged: n(st.unjudged), uncited: 0 }
-  return claimTally({ ...c, total: c.supported + c.partial + c.unsupported + c.unjudged })
+  return claimTally(claimCountsOf(st as Record<string, unknown>))
 }
 
 /** 报告节点章的悬停说明：两个数怎么来的，缺口里各有什么 */

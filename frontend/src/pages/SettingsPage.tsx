@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { Navigate, useParams } from 'react-router-dom'
 import {
-  Check, Cpu, Download, KeyRound, Monitor, Moon, Plug, Plus, Settings as SettingsIcon, Sun, X,
+  AlertTriangle, Check, Cpu, Download, KeyRound, Monitor, Moon, Plug, Plus, Settings as SettingsIcon, Sun, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -777,6 +777,8 @@ function PrefsTab() {
   const judgeProviderMissing = !!cur.judgeProvider && providers.length > 0 && !judgeProvider
   const judgeModelName = cur.judgeModel.trim()
   const judgeByModel = !cur.judgeProvider && !!judgeModelName
+  // 裁判模型没有单独配置（接入、模型都留空）：后端依次用助手的模型、默认接入
+  const judgeNotSet = !cur.judgeProvider && !judgeModelName
   const judgeOwner = judgeByModel ? providerOfModel(providers, judgeModelName) : undefined
   const judgeByModelHint = judgeByModel && providers.length > 0
     ? judgeByModelText('settings', judgeModelName, judgeOwner && { name: judgeOwner.provider.name, enabled: judgeOwner.enabled },
@@ -940,7 +942,21 @@ function PrefsTab() {
               <SectionBar title={JUDGE_SETTING_TEXT.label} hint={JUDGE_SETTING_TEXT.hint} />
               <div role="group" aria-labelledby="pref-judge-model-label" aria-describedby="pref-judge-model-hint" data-judge-model>
                 <div id="pref-judge-model-label" className="text-xs font-medium">裁判模型</div>
-                <p id="pref-judge-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.differ}</p>
+                {judgeNotSet ? (
+                  // 接入和模型都没填：裁判会用助手的模型（往往就是写报告的那个）。醒目地说，并给出建议；
+                  // 填了任何一项就换回平常那句建议
+                  <div id="pref-judge-model-hint" role="note" data-judge-not-set=""
+                       className="mb-2 mt-1 flex items-start gap-1.5 rounded border-l-2 py-0.5 pl-2 text-2xs leading-relaxed"
+                       style={{ borderColor: 'var(--st-waiting)' }}>
+                    <AlertTriangle size={12} aria-hidden className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} />
+                    <span>
+                      <span className="font-medium" data-judge-not-set-text="">{JUDGE_SETTING_TEXT.notSet}</span>
+                      <span className="block text-dim" data-judge-not-set-advice="">{JUDGE_SETTING_TEXT.notSetAdvice}</span>
+                    </span>
+                  </div>
+                ) : (
+                  <p id="pref-judge-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.differ}</p>
+                )}
                 <div className="grid grid-cols-2 gap-3">
                   <Field label={JUDGE_SETTING_TEXT.provider} htmlFor="pref-judge-provider"
                          error={judgeProviderMissing ? `模型接入「${cur.judgeProvider}」不存在：裁判调用将失败，所有结论句记为未裁判` : undefined}

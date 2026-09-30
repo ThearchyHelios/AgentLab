@@ -417,7 +417,7 @@ def _check_citations(
 
 #: 没挂依据的结论句怎么处置，从松到严。认不出的写法按 degrade 算：写错一个词不能让缺口悄悄消失
 _ON_UNCITED = ("ignore", "degrade", "withhold")
-#: 证据不支持的结论句怎么处置（claims: judge），从松到严。认不出的写法同样按 degrade 算
+#: 证据相矛盾的结论句怎么处置（claims: judge 的 on_unsupported），从松到严。认不出的写法同样按 degrade 算
 _ON_UNSUPPORTED = ("degrade", "withhold")
 #: 要求结论句挂依据的策略：judge 在这一点上和 require_citation 一样严，另外再按裁判的判定判档
 _CITING = ("require_citation", "judge")
@@ -434,9 +434,10 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     里 ignore 一律当 degrade：没有哪道门禁查契约里的 claims，不能让它把用户要的底线拉低。
 
     报告节点写的是 judge 时，判定在文档里（按哈希取回的那份：判定是模型给的，出口复算不了，只能信封存的
-    文档）。正式运行在节点里判过：证据不支持的按 on_unsupported 判档（报告节点和契约取更严的），没判完的
-    （裁判没跑成、触顶）把裁判摘要里的缺口照抄进来——不能判完整出具，也不当成「不支持」。探索运行按需裁判，
-    这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
+    文档）。正式运行在节点里判过：证据相矛盾的（contradicted，旧文档里的 unsupported 同样算）按 on_unsupported
+    判档（报告节点和契约取更严的）；证据不足的（insufficient）记一条缺口——最多降档，不会不予出具，也不会
+    完整出具；没判完的（裁判没跑成、触顶）把裁判摘要里的缺口照抄进来——不能判完整出具，也不当成「矛盾」。
+    探索运行按需裁判，这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
 
     数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
     包括跨着升级还没跑完的运行）一律不管，契约写了也只记一条缺口：报告生成于升级前，结论句未核对。
@@ -472,6 +473,7 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         return
 
     from app.engine.evidence import iter_units
+    from app.engine.judge import COUNT_KEYS, UNSUPPORTED
 
     summary = (doc or {}).get("judge")
     if not isinstance(summary, dict):
@@ -483,7 +485,7 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         asked.append(declared.get("on_unsupported"))
     on_unsupported = max((a if a in _ON_UNSUPPORTED else "degrade" for a in asked), key=_ON_UNSUPPORTED.index)
     inline = summary.get("mode") == "inline"
-    flagged: dict[str, list[dict[str, Any]]] = {"unsupported": [], "partial": []}
+    flagged: dict[str, list[dict[str, Any]]] = {s: [] for s in ("contradicted", "insufficient", UNSUPPORTED, "partial")}
     if inline:
         # 探索运行按需裁判的判定不在文档里（在封存之后追加的 evidence.judged 事件里），这里只数正式运行的
         markdown = str((doc or {}).get("markdown") or "")
@@ -493,16 +495,26 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
             if status in flagged:
                 span = unit.get("span") or [0, 0]
                 flagged[status].append({"unit": unit.get("id"), "span": span, "text": markdown[span[0]:span[1]],
-                                        "rationale": verdict.get("rationale") or ""})
+                                        "rationale": verdict.get("rationale") or "",
+                                        **({"missing": verdict["missing"]} if status == "insufficient"
+                                           and verdict.get("missing") else {})})
         out["gaps"].extend(f"报告「{title}」{gap}" for gap in summary.get("gaps") or [])
-    counts = {k: int((summary.get("counts") or {}).get(k) or 0)
-              for k in ("supported", "partial", "unsupported", "not_a_claim", "unjudged")}
+        if lacking := flagged["insufficient"]:
+            # 证据不足按缺口处理：最多降档，不因 on_unsupported 不予出具，也不能完整出具
+            missing = list(dict.fromkeys(i["missing"] for i in lacking if i.get("missing")))
+            what = f"（缺少：{'、'.join(missing[:5])}{'等' if len(missing) > 5 else ''}）" if missing else ""
+            out["gaps"].append(f"报告「{title}」有 {len(lacking)} 句结论证据不足{what}：裁判未能在证据中找到判断所需的"
+                               "信息，这些结论未经核实")
+    counts = {k: int((summary.get("counts") or {}).get(k) or 0) for k in COUNT_KEYS}
+    # 证据相矛盾的按 on_unsupported 判档；旧文档里的 unsupported（当时没分矛盾和不足）照旧当 contradicted
+    contradicted = [*flagged["contradicted"], *flagged[UNSUPPORTED]]
     out["claims_policy"] = {"policy": "judge", "on_unsupported": on_unsupported, "on_uncited": on_uncited}
-    out["uncited"], out["unsupported"] = uncited, flagged["unsupported"]
+    out["uncited"], out["unsupported"] = uncited, contradicted
     out["claims"] = {
         "policy": "judge", "uncited_claims": len(uncited), "uncited": uncited[:_LISTED], **extra,
         "on_unsupported": on_unsupported, "mode": "inline" if inline else "on_demand", "counts": counts,
-        "unsupported": flagged["unsupported"][:_LISTED], "partial": flagged["partial"][:_LISTED],
+        "contradicted": flagged["contradicted"][:_LISTED], "insufficient": flagged["insufficient"][:_LISTED],
+        "unsupported": flagged[UNSUPPORTED][:_LISTED], "partial": flagged["partial"][:_LISTED],
         "unjudged": dict(summary.get("unjudged") or {}), "limits_hit": list(summary.get("limits_hit") or []),
         "complete": bool(summary.get("complete")), "model": summary.get("model"),
     }

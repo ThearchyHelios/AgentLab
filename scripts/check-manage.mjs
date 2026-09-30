@@ -626,9 +626,34 @@ await section('设置 · 证据裁判', async () => {
   const box = page.locator('[data-judge-settings]')
   const all = (await box.innerText().catch(() => '')).replace(/\s+/g, ' ')
   check('偏好里有「证据裁判」一组，写明判断是模型给的、不是系统核对', all.includes('证据裁判') && all.includes('非确定'), all.slice(0, 80))
+  // 裁判拆档：接入和模型都没填时，平常那句建议换成醒目的「未单独配置」提示（建议写在提示里）；填了再换回来（见下）
   check('裁判模型：接入和模型，提示建议和写作模型不同', await page.locator('#pref-judge-provider').count() === 1
-    && await page.locator('#pref-judge-model').count() === 1 && all.includes('建议与撰写报告的模型不同'))
+    && await page.locator('#pref-judge-model').count() === 1 && all.includes('建议配置一个与撰写报告的模型不同、能力更强的模型'))
   check('……接入留空时跟随助手的模型', (await page.locator('#pref-judge-provider option').first().innerText()).includes('跟随助手的模型'))
+  const notSet = page.locator('[data-judge-model] [data-judge-not-set]')
+  check('没配裁判模型（接入、模型都是 null）：提示「未单独配置，将使用助手的模型」',
+    (await notSet.locator('[data-judge-not-set-text]').innerText().catch(() => '')) === '未单独配置，将使用助手的模型',
+    await notSet.innerText().catch(() => '（没有这条提示）'))
+  const advice = await notSet.locator('[data-judge-not-set-advice]').innerText().catch(() => '')
+  check('……并建议配一个和写作模型不同、能力更强的模型', advice.includes('与撰写报告的模型不同') && advice.includes('能力更强'), advice)
+  const noteLook = await notSet.evaluate((el) => {
+    const probe = document.createElement('span')
+    probe.style.color = 'var(--st-waiting)'
+    document.body.appendChild(probe)
+    const waiting = getComputedStyle(probe).color
+    probe.remove()
+    const cs = getComputedStyle(el)
+    return { border: cs.borderLeftColor, width: cs.borderLeftWidth, icon: getComputedStyle(el.querySelector('svg')).color, waiting,
+             described: document.getElementById(el.closest('[data-judge-model]').getAttribute('aria-describedby'))?.hasAttribute('data-judge-not-set') }
+  }).catch(() => null)
+  check('……醒目：左侧提醒色竖线、提醒色图标', !!noteLook && noteLook.border === noteLook.waiting && noteLook.width === '2px'
+    && noteLook.icon === noteLook.waiting, JSON.stringify(noteLook))
+  check('……读屏：模型那一组的说明就是这条提示（aria-describedby）', noteLook?.described === true)
+  if (SHOTS) {
+    await box.scrollIntoViewIfNeeded()
+    await page.waitForTimeout(200)
+    await box.screenshot({ path: `${SHOTS}/prefs-judge-not-set-${THEME}.png` })
+  }
   const val = (id) => page.locator(`#${id}`).inputValue()
   check('读回各项上限：40 句、30 秒、每次点击 $0.01、每日 $2', await val('pref-judge-claims') === '40' && await val('pref-judge-timeout') === '30'
     && await val('pref-judge-click') === '0.01' && await val('pref-judge-daily') === '2')
@@ -654,6 +679,8 @@ await section('设置 · 证据裁判', async () => {
   await page.locator('#pref-judge-click').fill('0.02')
   check('……接入留空时模型框的占位也写跟随助手的模型', await page.locator('#pref-judge-model').getAttribute('placeholder') === '留空：跟随助手的模型')
   await page.locator('#pref-judge-model').fill('judge-model-b')
+  check('填了裁判模型：「未单独配置」的提示收起，换回平常那句建议', await notSet.count() === 0
+    && (await box.innerText().catch(() => '')).includes('建议与撰写报告的模型不同'))
   // 只填了模型：设置这一级整组生效（judge_model_spec 不跨级拼），后端按模型名找接入——已经不跟随助手的模型
   const provFirst = await page.locator('#pref-judge-provider option').first().innerText().catch(() => '')
   check('只填了模型：接入留空那一项不再叫「跟随助手的模型」，改叫「按模型名找接入」', provFirst === '按模型名找接入', provFirst)
@@ -689,6 +716,15 @@ await section('设置 · 证据裁判', async () => {
     await box.screenshot({ path: `${SHOTS}/prefs-judge-${THEME}.png` })
   }
   await close()
+
+  // 只填了接入（模型留空）：也算单独配置了，不提示「未单独配置」
+  const byProvider = { ...stored, judge: { ...stored.judge, provider: 'judge-provider-x', model: null } }
+  const pv = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(byProvider)(route)],
+    [/^GET \/settings\/judge\/spend$/, (route) => json({ date: '2026-09-29', usd: 0, calls: 0, unpriced_calls: 0 })(route)]] })
+  await pv.page.waitForSelector('[data-judge-settings]', { timeout: 6000 }).catch(() => {})
+  check('只填了接入：不提示「未单独配置」', await pv.page.locator('[data-judge-settings]').count() === 1
+    && await pv.page.locator('[data-judge-not-set]').count() === 0)
+  await pv.close()
 
   // 老后端没有 judge 这一组：不显示，也不写
   const legacy = { ...stored }

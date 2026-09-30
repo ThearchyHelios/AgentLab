@@ -712,6 +712,8 @@ await section('保存失败、接口不存在、画布改过：都有明确状�
   bad.state.save = 'ok'
   await dialog(bad.page).getByRole('button', { name: '重试保存' }).click()
   await waitFor(bad.page, async () => bad.state.checks.length === 2)
+  // 重查的请求发出去了，按钮的可用状态要等答复回来、界面更新之后才变：并行跑的时候机器挤，直接读会抢在前面
+  await waitFor(bad.page, async () => submit(bad.page).isEnabled())
   check('重试保存成功后重新检查、发布可用', bad.state.patches.length === 2 && await submit(bad.page).isEnabled())
 
   const nofix = await open({ backend: 'nofix' })
