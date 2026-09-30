@@ -278,3 +278,25 @@ async def test_renaming_a_node_while_fixing_another_error_is_adopted(client, mon
     assert "复核团队（待拆成固定步骤）" in out["remaining"][0]["message"] or any(
         "复核团队（待拆成固定步骤）" in i["message"] for i in out["remaining"])
     assert {(c["node_id"], c["field"]) for c in out["changes"]} == {("team", "label"), ("done", "contract")}
+
+
+async def test_a_fix_cut_off_at_the_output_limit_is_not_adopted(client, monkeypatch):
+    """修正写到一半额度用完（finish_reason=length）：哪怕已经写出来的那几条能让 error 变少，也不采纳半截修改。"""
+    from langchain_core.messages import AIMessageChunk
+
+    model = script(monkeypatch, [{"op": "plan", "summary": "给出具节点补契约"},
+                                 {"op": "update_node", "id": "done", "config": {"contract": CONTRACT}}])
+    lines = model.lines
+
+    async def cut_off(messages):
+        model.calls.append(messages)
+        for line in lines:
+            yield AIMessageChunk(content=line + "\n")
+        yield AIMessageChunk(content="", response_metadata={"finish_reason": "length"})
+
+    model.astream = cut_off
+    wf = await create(client, two_exits())
+    out = await assist(client, wf)
+    assert out["assist"]["ok"] is False and "assist" not in out["applied"]
+    assert out["assist"]["summary"].startswith("助手本轮未完成：") and "长度上限" in out["assist"]["summary"]
+    assert out["graph"] == two_exits()

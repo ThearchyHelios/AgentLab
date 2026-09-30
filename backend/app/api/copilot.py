@@ -756,6 +756,8 @@ async def generate(
 _STREAM_PROTOCOL = """\
 输出格式（严格遵守）：
 - 每行一个完整的 JSON 对象，除此之外不输出任何东西——不要 markdown 围栏、不要解释文字、不要空行注释
+- 思考和输出共用同一份长度额度：思考里只定方案（加哪些节点、怎么连、每个节点干什么），
+  不要在思考里把 JSON、提示词、表达式先写一遍——那些直接写进输出。额度用完时还没输出的改动就全丢了
 - 可用操作：
   {"op":"plan","summary":"一句话说明打算怎么搭"}          ← 第一行
   {"op":"add_node","node":{"id":"...","type":"...","label":"中文标签","config":{...}}}
@@ -913,6 +915,73 @@ def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op:
     return False
 
 
+class CopilotIncomplete(Exception):
+    """模型这一轮没说完：输出被截断，或者一个操作都没给。画布不能按「无需修改」交付。"""
+
+    def __init__(self, reason: str, *, hint: str = "", detail: str = "") -> None:
+        super().__init__(reason)
+        self.hint = hint or "画布未修改。可以重试，或把需求拆成几步分别提出"
+        self.detail = detail
+
+
+def _cut_off(chunk: Any) -> str:
+    """这一块是不是在说「额度用完了」：OpenAI 系是 finish_reason=length，Anthropic 是 stop_reason=max_tokens。"""
+    meta = getattr(chunk, "response_metadata", None) or {}
+    reason = meta.get("finish_reason") or meta.get("stop_reason")
+    return str(reason) if reason in ("length", "max_tokens") else ""
+
+
+#: 流式改图的输出额度。会思考的模型（DeepSeek、Claude 的 adaptive thinking）思考也算在里面：
+#: 8192 时复杂的改图常常想完就没额度了，正文一个字没写（2026-09 部署实例上同类请求 5 轮坏了 4 轮）
+COPILOT_MAX_TOKENS = 32768
+#: 服务方不收大额度时退回这个（原来的默认值）
+_FALLBACK_MAX_TOKENS = 8192
+#: 服务方嫌额度太大时报错里会出现的字样：超过模型的输出上限（DeepSeek chat 系只到 8K），
+#: 或者输入加额度超过上下文长度（本地 vLLM）
+_BUDGET_WORDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length")
+
+
+def _budget_rejected(e: BaseException) -> bool:
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    return status in (400, 422) and any(w in str(e).lower() for w in _BUDGET_WORDS)
+
+
+class _BudgetFallback:
+    """先按大额度调；服务方一开口就嫌额度太大时按原来的额度重来，之后的调用（自查修正轮）都用小的。
+
+    只在还没吐出任何东西时重来：这类拒绝都发生在请求刚发出去的时候，重来不会重复输出。
+    """
+
+    def __init__(self, big: Any, small: Any) -> None:
+        self.model, self._small = big, small
+
+    @property
+    def max_tokens(self) -> Any:
+        return getattr(self.model, "max_tokens", None)
+
+    async def astream(self, messages: list[Any]):
+        started = False
+        try:
+            async for chunk in self.model.astream(messages):
+                started = True
+                yield chunk
+            return
+        except Exception as e:
+            if started or self.model is self._small or not _budget_rejected(e):
+                raise
+            self.model = self._small
+        async for chunk in self.model.astream(messages):
+            yield chunk
+
+
+async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, str]:
+    """按操作流改图用的模型：额度见 COPILOT_MAX_TOKENS。"""
+    spec = await copilot_model_spec(session, payload, max_tokens=COPILOT_MAX_TOKENS)
+    big, model_id = await get_chat_model(session, spec)
+    small, _ = await get_chat_model(session, spec.model_copy(update={"max_tokens": _FALLBACK_MAX_TOKENS}))
+    return _BudgetFallback(big, small), model_id
+
+
 async def _iter_ops(model: Any, messages: list[Any]):
     """流式读模型输出，按行切出操作。done 之后即停——后面就算有闲话也不要了。
 
@@ -923,11 +992,15 @@ async def _iter_ops(model: Any, messages: list[Any]):
     思考走 thinking_text()（Claude 4.6+ 的 thinking 块），不是"把非 JSON 行
     当成思考"：后者会把模型的 markdown 注释、协议跑偏时的乱输出一并当作思考
     展示出来，反而误导。不支持 thinking 的模型就只有心跳，不硬凑。
+
+    没等到 done 就因为额度用完停下的，抛 CopilotIncomplete：截断之前的操作照常转出去，
+    由调用方决定整轮作废。
     """
     from app.engine.state import message_text as _text
     from app.engine.state import thinking_text
 
     buffer = ""
+    cut = ""
     async for chunk in model.astream(messages):
         reasoning = thinking_text(chunk)
         if reasoning:
@@ -941,9 +1014,19 @@ async def _iter_ops(model: Any, messages: list[Any]):
                 yield op
                 if op.get("op") == "done":
                     return
+        cut = _cut_off(chunk) or cut
     op = _parse_op_line(buffer)
     if op:
         yield op
+        if op.get("op") == "done":
+            return
+    if cut:
+        # 截断的流和说完了的流读起来一模一样：不在这里拦下，上面就会拿原图（或半张图）
+        # 去自查、交付，界面上写「无需修改」
+        limit = getattr(model, "max_tokens", None)
+        raise CopilotIncomplete(
+            "模型的输出超出了长度上限，修改没有写完",
+            detail=f"finish_reason={cut}" + (f"，本轮输出上限 {limit} token" if limit else ""))
 
 
 # 多久没动静就补一拍心跳。3 秒是"用户开始怀疑是不是卡了"的量级。
@@ -1553,8 +1636,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         user = _user_message(payload, patch=False)
 
     try:
-        spec_ = await copilot_model_spec(session, payload)
-        model, model_id = await get_chat_model(session, spec_)
+        model, model_id = await _op_model(session, payload)
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
 
@@ -1598,6 +1680,14 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                         skipped_types.append(str(bad_type))
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+            # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
+            # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
+            if all(o.get("op") == "plan" for o in seen_ops):
+                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
+                                        hint="画布未修改。可以重试，或把需求描述得更具体")
+        except CopilotIncomplete as e:
+            yield _sse({"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail})
+            return
         except Exception as e:  # noqa: BLE001
             reason, hint = explain_error(e)
             yield _sse({"op": "error", "message": f"助手本轮未完成：{reason}",
@@ -1784,9 +1874,8 @@ async def assist_publish_fix(
         out["summary"] = "没有阻止发布的错误，无需交给助手"
         return out
     try:
-        spec_ = await copilot_model_spec(
+        chat, _ = await _op_model(
             session, GenerateIn(instruction="发布前自动修复", provider=provider, model=model))
-        chat, _ = await get_chat_model(session, spec_)
     except ProviderNotConfigured as e:
         out["summary"] = _unconfigured(e)
         return out
@@ -1959,9 +2048,8 @@ async def assist_upgrade(
     known = {_sig(e) for e in base_errors}
     out["warnings"] = _kept_code(spec)
     try:
-        spec_ = await copilot_model_spec(
+        chat, _ = await _op_model(
             session, GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model))
-        chat, _ = await get_chat_model(session, spec_)
     except ProviderNotConfigured as e:
         out.update(ok=False, summary=_unconfigured(e))
         return out
