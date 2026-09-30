@@ -67,7 +67,11 @@ http://127.0.0.1:8000 。前端产物不存在或比源码旧时才重新构建�
 `--platform linux/arm64` 或 `linux/amd64`），连同一键部署脚本、配置模板和部署说明打成
 `release/agentlab-<版本>-linux-<arch>.tar`。拷到只装了 Docker Engine 的离线机器上，解包、按需修改
 `agentlab.env`、运行 `./deploy.sh` 即可，不需要 docker compose。安装、升级、备份、沙箱权限与常见问题见
-[deploy/README.md](deploy/README.md)。容器默认权限下代码沙箱退回本地子进程，隔离边界只有容器本身。
+[deploy/README.md](deploy/README.md)。
+
+镜像里默认带 microVM 的运行时和沙箱镜像（约 150 MB，`--no-microvm` 可不带）。目标机有 KVM 时，deploy.sh
+先用临时容器试启动一台 microVM，起得来就把 `/dev/kvm` 交给容器，代码在 microVM 里执行，部署时不用联网。
+没有 KVM（Mac、Windows 上的 Docker Desktop，多数云主机）时，默认权限下代码沙箱退回本地子进程，隔离边界只有容器本身。
 
 ---
 
@@ -496,8 +500,8 @@ Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型�
 
 ### 沙箱后端选择
 
-设置页「运行环境」列出全部候选及其可用性，并标注当前选中项。安装 microVM 依赖且镜像已缓存时
-auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
+设置页「运行环境」列出全部候选及其可用性，并标注当前选中项。安装 microVM 依赖、镜像已缓存，
+Linux 上还要拿得到 `/dev/kvm` 时，auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
 （`apt install bubblewrap`）后使用 `bubblewrap`。装了 `bwrap` 还要能真正创建命名空间才算可用：
 启动后首次选择时实际起一次 `bwrap` 探测，Docker 默认权限、Ubuntu 24.04 的 AppArmor 限制下会失败并跳过，
 「选择原因」写明。均不可用时降级至 `local`——**该路径不含任何访问控制**，界面明确标红。可通过 `AGENTLAB_SANDBOX_BACKEND` 强制指定，

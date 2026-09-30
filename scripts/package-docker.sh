@@ -5,17 +5,19 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-用法：./scripts/package-docker.sh [--platform linux/arm64|linux/amd64] [--version <版本>] [--out <目录>] [--gzip]
+用法：./scripts/package-docker.sh [--platform linux/arm64|linux/amd64] [--version <版本>] [--out <目录>] [--gzip] [--no-microvm]
 
   --platform <平台>  目标机的平台。默认按本机架构取 linux/<arch>。64 位系统的 ARM 单板机是 linux/arm64，
                      普通 PC 和服务器是 linux/amd64。和本机架构不同时 docker 用模拟构建，会慢很多。
   --version <版本>   镜像标签和包名里的版本。默认 git describe --tags --always --dirty，拿不到就用短哈希加日期。
   --out <目录>       产物放哪里，默认仓库下的 release/。
   --gzip             另外再产出一份 .tar.gz。docker 用 containerd 镜像存储时镜像层本身已经压缩过，.tar.gz 小不了多少。
+  --no-microvm       不在镜像里带 microVM 运行时和沙箱镜像，镜像小约 150 MB。目标机没有 KVM 时用不上它们。
+                     默认带上：目标机有 KVM 时，deploy.sh 会自动启用 microVM，而且不用联网。
   -h, --help         显示这段说明。
 
 产物：<out>/agentlab-<版本>-linux-<arch>.tar，里面有 image.tar、deploy.sh、agentlab.env、README.md、SHA256SUMS。
-构建需要联网（拉基础镜像、装依赖）；部署不需要。镜像只留在本机，不会推到任何仓库。
+构建需要联网（拉基础镜像、装依赖、拉 microVM 的沙箱镜像）；部署不需要。镜像只留在本机，不会推到任何仓库。
 USAGE
 }
 
@@ -25,6 +27,7 @@ PLATFORM=""
 VERSION=""
 OUT="$ROOT/release"
 GZIP=""
+WITH_MICROVM=1
 need_value() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 后面要跟一个值"; echo; usage; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
     --out) need_value "$@"; OUT="$2"; shift ;;
     --out=*) OUT="${1#--out=}" ;;
     --gzip) GZIP=1 ;;
+    --no-microvm) WITH_MICROVM=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "认不出的参数：$1"; echo; usage; exit 2 ;;
   esac
@@ -86,7 +90,8 @@ OUT="$(cd "$OUT" && pwd)"
 STAGE="$OUT/$NAME"
 TAR="$OUT/$NAME.tar"
 
-echo "==> 版本 $VERSION · 平台 $PLATFORM · 产物 $TAR"
+if [ "$WITH_MICROVM" = 1 ]; then MICROVM_NOTE="带 microVM"; else MICROVM_NOTE="不带 microVM"; fi
+echo "==> 版本 $VERSION · 平台 $PLATFORM · $MICROVM_NOTE · 产物 $TAR"
 
 # ---- 1. 构建 ----
 # 不带 provenance / SBOM：它们会让导出的镜像多出几份附加清单，老版本的 docker load 认不全
@@ -95,6 +100,7 @@ docker buildx build \
   --platform "$PLATFORM" \
   --provenance=false --sbom=false \
   --build-arg VERSION="$VERSION" \
+  --build-arg WITH_MICROVM="$WITH_MICROVM" \
   --load \
   -t "$IMAGE" \
   "$ROOT"
@@ -150,7 +156,7 @@ echo
 echo "完成："
 echo "  $TAR  ($(size "$TAR"))"
 [ -z "$GZIP" ] || echo "  $TAR.gz  ($(size "$TAR.gz"))"
-echo "  镜像 $IMAGE 留在本机（没有推送到任何仓库）"
+echo "  镜像 $IMAGE 留在本机（没有推送到任何仓库），$MICROVM_NOTE"
 echo
 echo "下一步："
 echo "  1. 把 $NAME.tar 拷到目标机（scp、U 盘都行）"

@@ -21,7 +21,8 @@
 - **架构要一致**：这个包是 `linux/__AGENTLAB_ARCH__`。在目标机上运行 `uname -m`：
   `aarch64` 对应 arm64（ARM 单板机要装 64 位系统），`x86_64` 对应 amd64。不一致的镜像跑不起来，
   deploy.sh 会在导入前就报出来；
-- 磁盘：镜像导入后约 0.6～0.8 GB（看 Docker 用的存储方式），另留数据目录的空间；
+- 磁盘：镜像导入后约 0.8～1 GB（看 Docker 用的存储方式），另留数据目录的空间；
+- 可选：宿主机支持 KVM（有 `/dev/kvm`）时，代码会在 microVM 里执行，隔离最强，见下面的「代码沙箱」；
 - 当前用户能用 docker（在 `docker` 组里），或者用 `sudo` 运行 deploy.sh。
 
 ## 三步部署
@@ -90,7 +91,7 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 ## 查看状态和日志
 
 ```bash
-./deploy.sh status        # 容器状态、健康检查、数据目录、访问地址
+./deploy.sh status        # 容器状态、健康检查、数据目录、代码沙箱、访问地址
 ./deploy.sh logs          # 最后 200 行
 ./deploy.sh logs -f       # 持续跟随，Ctrl-C 退出
 ./deploy.sh logs --tail 1000
@@ -123,25 +124,42 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 
 ## 代码沙箱
 
-工作流里的代码节点、界面上的沙箱都在服务端执行代码。容器里能用哪种隔离，实测结果如下：
+工作流里的代码节点、界面上的沙箱都在服务端执行代码。AgentLab 按下表从上往下，挑第一种能用的：
 
-| 容器权限 | 实际使用的沙箱 | 隔离效果 |
+| 沙箱 | 条件 | 隔离效果 |
 | --- | --- | --- |
-| 默认（`ENABLE_BWRAP=0`） | local：容器里的普通子进程 | 隔离边界只有容器本身。代码伤不到宿主机，但和 AgentLab 同一个容器、同一个用户，读得到数据目录里的数据库和加密密钥、读得到传进容器的 API Key、能联网 |
-| `ENABLE_BWRAP=1` | bubblewrap | 代码看不到数据目录、看不到别的进程，默认断网 |
+| microVM | 宿主机有 KVM（默认 `ENABLE_MICROVM=auto`，自动检测） | 每段代码在独立内核的虚拟机里执行：看不到数据目录、密钥和别的进程，内存上限真正生效 |
+| bubblewrap | `ENABLE_BWRAP=1` | 共享内核的隔离环境：看不到数据目录和别的进程，默认断网 |
+| local | 前两种都用不了 | 容器里的普通子进程。隔离边界只有容器本身：代码伤不到宿主机，但和 AgentLab 同一个容器、同一个用户，读得到数据目录里的数据库和加密密钥、读得到传进容器的 API Key、能联网 |
 
-默认权限下 bubblewrap 无法创建命名空间（Docker 默认的系统调用过滤不允许），AgentLab 会自动退回 local，
-「设置 → 运行环境」里的「选择原因」会写明。只运行你信得过的工作流；完全不需要执行代码的话，
-在 `agentlab.env` 里设 `AGENTLAB_SANDBOX_BACKEND=off`。
+实际用的是哪一种，deploy.sh 部署完会打印「代码沙箱：……」，`./deploy.sh status` 和界面「设置 → 运行环境」里
+也看得到。只运行你信得过的工作流；完全不需要执行代码的话，在 `agentlab.env` 里设 `AGENTLAB_SANDBOX_BACKEND=off`。
 
-要用 bubblewrap：把 `agentlab.env` 里的 `ENABLE_BWRAP` 改成 `1`，运行 `./deploy.sh install`。
+### microVM
+
+要宿主机是支持 KVM 的 Linux：物理机、树莓派 5 这类 64 位 ARM 单板机、开了嵌套虚拟化的云主机。
+Mac、Windows 上的 Docker Desktop 和多数云主机没有 KVM，用不了。检查：`ls -l /dev/kvm` 能看到这个设备就行。
+
+运行时和沙箱镜像（`python:3.12-slim`）已经打在镜像里，部署时不用联网。`./deploy.sh install` 会这样处理：
+
+1. 本机没有 `/dev/kvm`：不启用，照常部署；
+2. 有 `/dev/kvm`：先用一个临时容器真起一台 microVM、执行一行代码。起得来，就给正式容器加上
+   `--device /dev/kvm` 和 `/dev/kvm` 所属的组（容器里的服务以 uid 10001 运行，要靠这个组读写它）；
+   起不来，打印原因，照常部署但不启用。
+
+`agentlab.env` 里的 `ENABLE_MICROVM`：`auto` 按上面处理（默认），`1` 起不来就报错停下，`0` 不启用。
+
+已知缺口：代码节点关掉网络时，HTTP/HTTPS 和域名解析都会断，但 UDP/53 仍然放行，存在经 DNS 外泄数据的可能。
+
+### bubblewrap
+
+把 `agentlab.env` 里的 `ENABLE_BWRAP` 改成 `1`，运行 `./deploy.sh install`。microVM 已经启用时用不上它。
+Docker 默认权限下 bubblewrap 无法创建命名空间（默认的系统调用过滤不允许），所以
 deploy.sh 会给容器加 `--security-opt seccomp=unconfined`、`--security-opt systempaths=unconfined`、
 `--security-opt apparmor=unconfined`。代价是整个容器少了系统调用过滤和对 `/proc`、`/sys` 部分路径的遮蔽，
 内核暴露给容器的面变大（AgentLab 自己仍以非 root 运行）。这组权限在 Docker Desktop（arm64）上实测生效。
 Ubuntu 24.04 默认还限制非特权 user namespace：开了之后「设置 → 运行环境」里仍显示 local 的话，
 要在宿主机上执行 `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`，这会放宽整台机器的限制，自行权衡。
-
-microVM（独立内核）需要 `/dev/kvm` 和额外下载的运行时与镜像，离线包默认不支持。
 
 ## 常见问题
 
@@ -165,3 +183,13 @@ microVM（独立内核）需要 `/dev/kvm` 和额外下载的运行时与镜像�
 - `agentlab.env` 里的值带了引号、或者注释写在了值后面：去掉。
 
 **`sha256sum -c` 报 image.tar FAILED。** 包在拷贝中损坏了，重新拷一份。
+
+**有 `/dev/kvm`，microVM 却没启用。** deploy.sh 会打印试启动失败的原因。常见的几种：
+
+- 权限类报错（`Permission denied`、`Operation not permitted`）：先确认 `ls -l /dev/kvm` 的属组是 `kvm` 之类的普通组。
+  仍然不行的话，可能是 Docker 默认的系统调用过滤拦住了，可以试 `ENABLE_BWRAP=1`（它会放开这项过滤）再 `./deploy.sh install`；
+- 云主机上报虚拟化相关的错：机型不支持或没打开嵌套虚拟化，这种情况用不了 microVM；
+- 想让它起不来就停下、而不是悄悄不用：把 `ENABLE_MICROVM` 设成 `1`。
+
+**启用 microVM 后，机器重启时容器没起来。** 容器启动时要用到 `/dev/kvm`，开机时 kvm 模块没加载，
+Docker 就启动不了这个容器。`ls -l /dev/kvm` 确认设备在，再运行 `./deploy.sh install`，它会重新检测。
