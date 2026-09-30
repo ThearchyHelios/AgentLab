@@ -39,7 +39,7 @@ class CurrentTimeArgs(BaseModel):
 @register(
     name="current_time",
     category="数据",
-    description="获取当前日期时间。模型不知道此刻是什么时候，需要时间信息时用这个。",
+    description="获取当前日期和时间。需要时间信息时使用。",
     args_schema=CurrentTimeArgs,
 )
 async def current_time(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
@@ -66,7 +66,7 @@ class JsonQueryArgs(BaseModel):
 @register(
     name="json_query",
     category="数据",
-    description="从 JSON 里按路径取值，避免让模型自己在长 JSON 里数括号。",
+    description="按路径从 JSON 中取值，适合处理较长的 JSON。",
     args_schema=JsonQueryArgs,
 )
 async def json_query(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:

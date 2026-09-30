@@ -161,7 +161,7 @@ async def _duckduckgo(query: str, n: int) -> list[dict[str, str]]:
 @register(
     name="web_search",
     category="网络",
-    description="搜索互联网。配了 TAVILY_API_KEY 就走 Tavily，否则退回 DuckDuckGo。",
+    description="搜索互联网。已配置 TAVILY_API_KEY 时使用 Tavily，否则使用 DuckDuckGo。",
     args_schema=WebSearchArgs,
 )
 async def web_search(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:

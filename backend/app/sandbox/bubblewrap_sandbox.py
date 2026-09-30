@@ -157,7 +157,7 @@ class BubblewrapSandbox(Sandbox):
             return ExecResult(
                 ok=False, backend=self.name, timed_out=True, exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout}s 被终止",
+                error=f"执行超过 {limits.timeout} 秒，已终止",
             )
         except Exception as e:  # noqa: BLE001
             # 起进程和收输出在同一个 try 里。首行只说原因，类名和 errno 这些留给日志

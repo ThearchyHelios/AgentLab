@@ -81,7 +81,7 @@ async def test_summary_is_compact_enough_for_a_prompt(source):
 
 async def test_summary_says_so_when_never_introspected(source):
     """没探查过就明说，别让 Copilot 对着空气编表名。"""
-    assert "还没有探查过" in summary(source)
+    assert "尚未探查结构" in summary(source)
 
 
 async def test_describe_table_accepts_qualified_name(source):
@@ -250,4 +250,4 @@ def test_why_empty_tells_the_two_cases_apart():
 
     assert "失败" in why_empty(_FailedCache.schema_cache)
     assert "Lost connection" in why_empty(_FailedCache.schema_cache)
-    assert why_empty({}) == "还没有探查过结构"
+    assert why_empty({}) == "尚未探查结构"

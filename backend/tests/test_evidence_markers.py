@@ -254,7 +254,7 @@ def test_unresolved_references(catalog):
     reasons = {v["ref"]: v["message"] for v in bad}
     assert "gmvx" in reasons["m:gmvx"]
     assert "没有值" in reasons["m:gone"]
-    assert "目录里没有 Q4" in reasons["v:Q4.r0.amount"]      # 单元格二期起支持，这份目录里没有 Q4
+    assert "查询结果 Q4 不存在" in reasons["v:Q4.r0.amount"]      # 单元格二期起支持，这份目录里没有 Q4
     assert "百分数" in reasons["m:wow|pct"]
     for s in iter_segments(doc):
         if s.get("ref"):

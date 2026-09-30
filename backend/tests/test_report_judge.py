@@ -243,7 +243,7 @@ async def test_hitting_a_limit_is_reported_not_raised(monkeypatch):
     checked, doc, _ = await report_of(row.id)
     assert verdicts(doc)[CITED]["status"] == "supported", "先判挂了依据的"
     assert (verdicts(doc)[CAUSAL]["status"], verdicts(doc)[CAUSAL]["reason"]) == ("unjudged", "max_claims")
-    assert checked["judge"]["limits_hit"] == ["max_claims"] and "已到上限" in checked["judge"]["gaps"][0]
+    assert checked["judge"]["limits_hit"] == ["max_claims"] and "已达上限" in checked["judge"]["gaps"][0]
     assert CAUSAL not in models.judges[0]
 
 
@@ -265,7 +265,7 @@ async def test_judging_yourself_is_called_out(monkeypatch):
     row = await finish(weekly(claims="judge"))
     assert row.status == "succeeded", row.error
     [warn] = [e.data for e in await events(row.id, "log") if e.data.get("code") == "judge_same_model"]
-    assert "mock-fast" in warn["message"] and "自己审自己" in warn["message"]
+    assert "mock-fast" in warn["message"] and "难以发现写作模型自身的错误" in warn["message"]
 
 
 # --------------------------------------------------------------------------

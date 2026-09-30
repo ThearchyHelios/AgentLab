@@ -185,7 +185,7 @@ def _apply_contract(
             # 不能当作"这次没有指标要查"
             unresolved.append(source)
     if unresolved:
-        gaps.append(f"指标源未解析：{', '.join(unresolved[:5])}")
+        gaps.append(f"指标来源未解析：{'、'.join(unresolved[:5])}")
 
     # 引用模式下，缺输入记成空值的指标（口径卡 on_missing=null）就是缺：报告里引用不了它，
     # 也不能因为 id 在清单里就算「齐了」。旧模式照旧只看 id，行为不变
@@ -207,9 +207,9 @@ def _apply_contract(
         # 模板取不到路径时 render 出来是空串，所以"声明了叙述但渲染成空"必须单独识别：
         # 节点改名、vars 写错都会让回指校验静默变成空操作
         if declared_narrative.strip() and not narrative.strip():
-            gaps.append("叙述模板渲染为空（路径可能写错了）")
+            gaps.append("叙述模板渲染为空（路径可能有误）")
         elif not declared_narrative.strip():
-            gaps.append("契约没有声明叙述，数字回指未执行")
+            gaps.append("出具契约未设置「叙述」，未执行数字追溯")
 
         trace = (
             trace_numbers(narrative, metrics, allow=contract.get("allow_numbers"))
@@ -220,7 +220,7 @@ def _apply_contract(
 
     # 声明了 metrics_from 却一个指标都没收到，同样是"没查成"
     if sources and not metrics:
-        gaps.append("指标集为空，叙述里的数字无从回指")
+        gaps.append("指标集为空，叙述中的数字无法追溯")
 
     # 上游有协作团队用完轮数、按降档交付的：叙述里的话不是调度者认可的结论，
     # 数字全都对得上也不能盖「完整出具」
@@ -228,7 +228,7 @@ def _apply_contract(
     for node_id, payload in nodes.items():
         if isinstance(payload, dict) and payload.get("exhausted"):
             gaps.append(f"协作团队「{titles.get(node_id, node_id)}」用完 {payload.get('rounds', '?')} "
-                        "轮仍未完成，交来的是成员最后的原话")
+                        "轮仍未完成，交付的是成员最后的回复")
 
     tier = decide_tier(
         missing_required=missing_required,
@@ -319,26 +319,26 @@ def _check_citations(
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
     if node is None or node.type != NodeType.REPORT:
-        gaps.append(f"契约的 report_from 指向的「{report_from}」不是报告撰写节点，引用核对未执行")
+        gaps.append(f"出具契约的「报告来自」指向的「{report_from}」不是报告撰写节点，未执行引用核对")
         return out
     payload = (state.get("nodes") or {}).get(report_from)
     doc_artifact = payload.get("doc_artifact") if isinstance(payload, dict) else None
     if not doc_artifact:
-        gaps.append(f"报告撰写节点「{node.title}」没有产出报告文档（没跑到、被跳过或者失败了），"
-                    "引用核对未执行")
+        gaps.append(f"报告撰写节点「{node.title}」没有产出报告文档（未执行、被跳过或失败），"
+                    "未执行引用核对")
         return out
     out["doc_artifact"] = doc_artifact
     try:
         doc = load(doc_artifact)
     except ValueError:
-        gaps.append(f"报告「{node.title}」的文档和它的哈希对不上，疑似被改过，引用核对未执行")
+        gaps.append(f"报告「{node.title}」的文档与其哈希不一致，可能已被修改，未执行引用核对")
         return out
     if not isinstance(doc, dict):
-        gaps.append(f"报告「{node.title}」的文档在工件库里取不回来，引用核对未执行")
+        gaps.append(f"无法读取报告「{node.title}」的文档，未执行引用核对")
         return out
     if doc.get("node_id") != report_from or doc.get("run_id") != ctx.run.run_id \
             or doc.get("markdown") != payload.get("text"):
-        gaps.append(f"报告「{node.title}」的文档和这次运行里它的产出对不上，引用核对未执行")
+        gaps.append(f"报告「{node.title}」的文档与本次运行中的产出不一致，未执行引用核对")
         return out
 
     catalog = report_catalog(state, spec, node)
@@ -366,15 +366,15 @@ def _check_citations(
             broken.append(v["message"])
     if broken:
         more = f"等 {len(broken)} 处" if len(broken) > 1 else ""
-        gaps.append(f"报告「{node.title}」的文档没通过复核：{broken[0]}{more}")
+        gaps.append(f"报告「{node.title}」的文档未通过复核：{broken[0]}{more}")
     unknown, unverified = suspicious["unknown_entity"], suspicious["unverified_entity"]
     if unknown and governed:
         # 用户拍板：可疑实体在受管级别的正式出具里按「有缺口」降档，不拦截——反引号里的一个业务词
         # 也可能被当成名字，为它不予出具太重；探索运行、已发布级别只标注
         names = "".join(f"「{n}」" for n in dict.fromkeys(u["name"] for u in unknown[:5]))
         more = "等" if len(unknown) > 5 else ""
-        gaps.append(f"报告「{node.title}」里有 {len(unknown)} 处可疑实体（{names}{more}）：本次运行的表结构、查询、"
-                    "结果列里都没有这些名字，可能是编造的")
+        gaps.append(f"报告「{node.title}」中有 {len(unknown)} 处可疑实体（{names}{more}）：本次运行的表结构、查询和"
+                    "结果列中都没有这些名字，可能是编造的")
     if unknown or unverified:
         # 表结构快照不全时核对不了的名字（unverified）在哪个级别都只标注
         out["entities"] = {"unknown": unknown[:_LISTED], "unverified": unverified[:_LISTED],
@@ -411,7 +411,7 @@ def _check_citations(
     for name in edited:
         gaps.append(f"成果字段「{name}」改动了报告，无法逐段对应")
     if not (mine and mine["verbatim"]) and not edited:
-        gaps.append(f"成果里没有哪个字段是报告「{node.title}」的原文：读者看到的内容没有经过引用核对")
+        gaps.append(f"成果中没有任何字段是报告「{node.title}」的原文：读者看到的内容未经过引用核对")
     return out
 
 
@@ -439,7 +439,7 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
 
     数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
-    包括跨着升级还没跑完的运行）一律不管，契约写了也照旧记「这一版还不支持」。
+    包括跨着升级还没跑完的运行）一律不管，契约写了也只记一条缺口：报告生成于升级前，结论句未核对。
     """
     written = payload.get("claims") if isinstance(payload, dict) else None
     # 报告节点升级后才在产出里记 claims（off 也记）：没有这个键就是升级前写的报告
@@ -453,11 +453,10 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         wanted = declared.get("on_uncited") if isinstance(declared, dict) else None
         asks.append(wanted if wanted in _ON_UNCITED else "degrade")
     elif name not in (None, "", "off"):
-        out["gaps"].append("契约声明了结论句检查（claims），这一版还不支持，结论句没有核对")
+        out["gaps"].append("出具契约要求核对结论句，但这份报告生成于系统升级前，没有结论句核对记录，结论句未核对")
     judged = upgraded and written == "judge"
     if upgraded and name == "judge" and not judged:
-        out["gaps"].append(f"契约要求结论句由模型裁判（claims: judge），报告「{title}」没有开 claims: judge，"
-                           "结论句没有裁判")
+        out["gaps"].append(f"出具契约要求结论句由模型裁判，但报告「{title}」未开启模型裁判，结论句未裁判")
     if not asks:
         return
     on_uncited = max(asks, key=_ON_UNCITED.index)
@@ -478,7 +477,7 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     if not isinstance(summary, dict):
         # 报告节点开了 judge、文档里却没有裁判摘要（不该发生）：当作没判，不能判完整出具
         summary = {"mode": "inline", "counts": {}, "unjudged": {}, "limits_hit": [], "complete": False,
-                   "gaps": ["开了 claims: judge，文档里却没有裁判结果，结论句没有裁判"]}
+                   "gaps": ["已开启模型裁判，但文档中没有裁判结果，结论句未裁判"]}
     asked = [summary.get("on_unsupported")]
     if name == "judge" and isinstance(declared, dict):
         asked.append(declared.get("on_unsupported"))
@@ -572,11 +571,11 @@ async def run_transform(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if mode == "expression":
         expr = ctx.cfg("expression", "")
         if not expr:
-            raise NodeError(ctx.node.id, "整形节点没有填表达式")
+            raise NodeError(ctx.node.id, "「数据整形」节点还没有填写表达式")
         try:
             output = eval_expression(expr, tctx)
         except ExpressionError as e:
-            raise NodeError(ctx.node.id, f"表达式错误：{e}") from e
+            raise NodeError(ctx.node.id, f"表达式有误：{e}") from e
     elif mode == "template":
         output = ctx.render_str(ctx.cfg("template", ""), state)
     elif mode == "json":
@@ -587,7 +586,7 @@ async def run_transform(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             raise _json_error(e, str(template or ""), tctx, ctx) from e
     else:
-        raise NodeError(ctx.node.id, f"未知的整形模式：{mode}")
+        raise NodeError(ctx.node.id, f"不支持的整形方式：{mode}")
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: output}}
     var_name = ctx.cfg("assign_to", "")
@@ -608,7 +607,7 @@ _NODE_HEAD = re.compile(r"^nodes\s*(?:\.\s*([\w-]+)|\[\s*['\"]([^'\"]+)['\"]\s*\
 _VAR_HEAD = re.compile(r"^vars\s*(?:\.\s*([\w-]+)|\[\s*['\"]([^'\"]+)['\"]\s*\])")
 
 
-TEMPLATE_HINT = "检查模板里的引号、逗号，字符串值要用 | json 过滤器输出"
+TEMPLATE_HINT = "请检查模板中的引号和逗号，字符串值需使用 | json 过滤器输出"
 #: 解析器在这一段的头一个字上要的是这些：前一个值在模板里已经写完了，缺的是模板里的标点
 _DELIMITED = ("Expecting ',' delimiter", "Expecting ':' delimiter", "Extra data")
 
@@ -638,9 +637,11 @@ def _json_error(e: json.JSONDecodeError, template: str, tctx: dict[str, Any], ct
     line = text.count("\n", 0, offset) + 1
     column = offset - (text.rfind("\n", 0, offset) + 1) + 1
     where = f"第 {line} 行第 {column} 列" if line > 1 else f"第 {column} 列"
-    fix = ("让模型交结构化数据请给它配 output_schema；数要进口径卡的，改用 agent 的 output_schema + cite_fields"
+    fix = ("如需模型输出结构化数据，请为其配置「结构化输出 Schema」；数字需要进入口径卡时，"
+           "请改用 Agent 并开启「按出处核对字段」"
            if node.type == NodeType.LLM else
-           "让模型交结构化数据请用 output_schema + cite_fields，别用整形节点解析它写的文字")
+           "如需模型输出结构化数据，请配置「结构化输出 Schema」并开启「按出处核对字段」，"
+           "不要用「数据整形」节点解析模型写的文字")
     return NodeError(ctx.node.id, f"上游「{node.title}」输出的不是合法 JSON（{where}附近），{reason}；{fix}")
 
 
@@ -675,14 +676,14 @@ def _diagnose(template: str, tctx: dict[str, Any], ctx: NodeContext,
         if not piece.strip():
             # 取出来是空的，解析器正好在这里要一个值
             if e.msg == "Expecting value" and not doc[start:pos].strip() and not _in_json_string(doc, start):
-                return f"模板里 {{{{ {expr} }}}} 取出来是空的，这里缺一个值：检查路径写对没有、前面的节点有没有产出"
+                return f"模板里 {{{{ {expr} }}}} 的取值为空，此处缺少一个值：请检查路径是否正确、前面的节点是否有产出"
             continue
         if pos > end and not at_end:
             continue
         quoted = _in_json_string(doc, start)
         if "json" in filters:
             # 过了 | json 就是一个合法的 JSON 值：错不在它的内容里，除非外面又套了一层引号
-            return (f"模板里 {{{{ {expr} }}}} 出来的已经是合法的 JSON（文字自带引号），外面不要再加引号"
+            return (f"模板里 {{{{ {expr} }}}} 的结果已是合法的 JSON（文字自带引号），外面不要再加引号"
                     if quoted and not at_end else None)
         value = resolve_path(tctx, head)
         if not isinstance(value, str) or value != piece:
@@ -706,19 +707,19 @@ def _diagnose(template: str, tctx: dict[str, Any], ctx: NodeContext,
 
 def _needs_json(expr: str, model: bool) -> str:
     what = "模型写的文字" if model else "一段文字"
-    return f"模板里 {{{{ {expr} }}}} 是{what}，放进 JSON 要写成 {{{{ {expr} | json }}}}（外面不要再加引号）"
+    return f"模板里 {{{{ {expr} }}}} 是{what}，放入 JSON 时请写成 {{{{ {expr} | json }}}}（外面不要再加引号）"
 
 
 def _why(text: str, at_end: bool) -> str:
     """上游写的 JSON 为什么解析不了，按看得出来的实情说。"""
     body = text.lstrip()
     if body.startswith("```"):
-        return "它把 JSON 包在了 ``` 代码块里"
+        return "模型把 JSON 包在了 ``` 代码块中"
     if at_end and _unclosed(text):
-        return "它写的 JSON 没有收尾，可能写到一半被截断了"
+        return "模型输出的 JSON 不完整，可能在中途被截断"
     if not body.startswith(("{", "[")):
-        return "它写的是一段文字，不是 JSON"
-    return "常见原因是字符串里有没转义的英文引号"
+        return "模型输出的是一段文字，而不是 JSON"
+    return "常见原因是字符串中有未转义的英文引号"
 
 
 def _writes_json(text: str) -> bool:

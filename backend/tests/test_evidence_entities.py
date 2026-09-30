@@ -175,7 +175,7 @@ def test_unknown_marker_is_suspicious_not_unresolved(catalog):
     doc = compose_doc("退款看 [[t:refund_log]]。字段写错 [[t:amount]]。", catalog)
     fake, wrong = entity_segments(doc)
     assert fake["text"] == "refund_log" and fake["state"] == "none" and fake["issue"] == "unknown_entity"
-    assert "可能是编造的名字" in fake["cite"]["reason"]
+    assert "疑似不存在的名称" in fake["cite"]["reason"]
     # 字段当表写：名字是真的，写法错了——这是解析不了，要重写
     assert wrong["issue"] == "unresolved_ref" and wrong["text"].startswith("⟦?t:")
     assert codes(doc) == ["unknown_entity", "unresolved_ref"]
@@ -305,7 +305,7 @@ def test_a_truncated_schema_cannot_call_a_name_made_up(catalog):
     assert segs[1]["cite"]["unverified"] is True and "unknown" not in segs[1]["cite"]
     # 违规按位置排：句末依据 [[see:]] 的位置记的是整句，排在最前
     assert codes(doc) == ["unverified_entity", "unverified_entity", "unverified_entity", "unknown_entity"]
-    assert "核对不了" in doc["violations"][0]["message"] and "编造" not in doc["violations"][0]["message"]
+    assert "无法核实" in doc["violations"][0]["message"] and "疑似不存在" not in doc["violations"][0]["message"]
     assert doc["stats"]["unverified_entities"] == 3 and doc["stats"]["unknown_entities"] == 1
     checked = verify_doc(doc, cut)
     assert checked["violations"] == doc["violations"] and checked["stats"] == doc["stats"]
@@ -618,7 +618,7 @@ async def test_report_with_a_bad_entities_value_fails(engine_up, warehouse, monk
     monkeypatch.setattr(mock_model.MockChatModel, "_decide", lambda self, messages: seen.append(1) or AIMessage("x"))
     row = await finish(tool_graph(node("write", "report", instructions="写一句", entities="bogus")))
     assert row.status == "failed"
-    assert "entities 只能是 link / off，写的是 'bogus'" in (row.error or ""), row.error
+    assert "「表名、字段名」只能是「核对」或「不核对」，当前为「bogus」" in (row.error or ""), row.error
     assert seen == [], "写错的配置不该先花一次模型调用"
 
 

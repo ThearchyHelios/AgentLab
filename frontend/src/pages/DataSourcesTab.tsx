@@ -101,14 +101,14 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
       {tables ? (
         <SectionBar
           title="表格"
-          hint="传 Excel / CSV，每个工作表变成一张可以用 SQL 查的表——数字是算出来的，查得到出处。同名重传就地替换，工具名不变。"
+          hint="上传 Excel / CSV 文件，每个工作表会转为一张可用 SQL 查询的表，数字可计算、可溯源。同名文件重新上传会直接替换数据，工具名不变。"
         >
           <button className="btn btn-primary btn-sm" onClick={() => setUploading({})}>
-            <Upload size={12} /> 传表格
+            <Upload size={12} /> 上传表格
           </button>
         </SectionBar>
       ) : (
-        <SectionBar title="数据库" hint="接入后助手编排时看得见这些库的结构，agent 运行时能直接查。卡片右侧是上次测连接的结果和测的时间。">
+        <SectionBar title="数据库" hint="接入后，助手编排时可读取这些数据库的结构，Agent 运行时可直接查询。卡片右侧显示上次测试连接的结果和时间。">
           <button className="btn btn-primary btn-sm"
                   onClick={() => setEditing({ kind: 'mysql', readonly: true, enabled: true, options: {} })}>
             <Plus size={12} /> 接入数据库
@@ -124,15 +124,15 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
         tables ? (
           <EmptyState
             icon={<FileSpreadsheet size={22} />}
-            title="还没有传过表格"
-            body="Excel（.xlsx）或 CSV / TSV。传上来之后在「问数据」里直接提问，不用自己写 SQL。"
-            action={<button className="btn btn-primary btn-sm" onClick={() => setUploading({})}><Upload size={12} /> 传表格</button>}
+            title="还没有上传表格"
+            body="支持 Excel（.xlsx）和 CSV / TSV。上传后可在「问数据」中直接提问，无需编写 SQL。"
+            action={<button className="btn btn-primary btn-sm" onClick={() => setUploading({})}><Upload size={12} /> 上传表格</button>}
           />
         ) : (
           <EmptyState
             icon={<Database size={22} />}
             title="还没有接入数据库"
-            body="MySQL / PostgreSQL / Oracle / SQLite 都行。只有 Excel？去「表格」标签传上来。"
+            body="支持 MySQL、PostgreSQL、Oracle、SQLite。如只有 Excel 文件，可在「表格」标签页上传。"
             action={
               <div className="flex gap-2">
                 <button className="btn btn-primary btn-sm"
@@ -140,7 +140,7 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
                   <Plus size={12} /> 接入数据库
                 </button>
                 <button className="btn btn-sm" onClick={() => navigate('/data/tables')}>
-                  <FileSpreadsheet size={12} /> 传表格
+                  <FileSpreadsheet size={12} /> 上传表格
                 </button>
               </div>
             }
@@ -179,7 +179,7 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
             if (tested) setHealth(`datasource:${row.id}`, tested)
             else if (reconnected) forgetHealth(`datasource:${row.id}`)
             if (isNew) {
-              toast.ok(`已接入「${row.name}」。下一步：探查结构，助手靠它写 SQL`, {
+              toast.ok(`已接入「${row.name}」。下一步：探查结构，助手将据此编写 SQL`, {
                 action: { label: '探查结构', onClick: () => setKick({ id: row.id, seq: Date.now() }) },
               })
             } else {
@@ -252,11 +252,11 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
       const next = await api.datasources.introspect(row.id)
       onChange(next)
       if (next.table_count) {
-        toast.ok(`「${row.name}」探到 ${formatNumber(next.table_count)} 个对象`)
+        toast.ok(`「${row.name}」探查到 ${formatNumber(next.table_count)} 个对象`)
       } else if (!next.schema_error) {
         // 连得上、也没报错，就是这个 schema 下真的没有对象。探查失败的红字
         // 卡片自己会显示，不再叠一条 toast
-        toast.warn('连得上，但这个 schema 下没有对象，多半是 schema 填的不对')
+        toast.warn('连接成功，但该 schema 下没有对象，请检查 schema 名称是否正确')
       }
     } catch (e) {
       toast.error(e)
@@ -286,21 +286,21 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
       setBusy('')
     }
     if (preview.schema_error) {
-      toast.warn(`「${schema}」探不出来：${preview.schema_error}`, { detail: '只是看看：配置和缓存都没动' })
+      toast.warn(`「${schema}」探查失败：${preview.schema_error}`, { detail: '仅预览，未修改配置和缓存' })
       return
     }
     if (!preview.table_count) {
-      toast.info(`「${schema}」下没有对象。只是看看，配置和缓存都没动`)
+      toast.info(`「${schema}」下没有对象。仅预览，未修改配置和缓存`)
       return
     }
     const total = Math.max(preview.table_count, preview.total ?? 0)
     const sample = preview.tables.slice(0, 6).map((t) => t.slice(t.lastIndexOf('.') + 1))
     const ok = await confirmDialog({
       title: `把 schema 改成「${schema}」？`,
-      body: `「${schema}」下有 ${formatNumber(total)} 个对象${sample.length ? `，比如 ${sample.join('、')}${total > sample.length ? ' 等' : ''}` : ''}。`,
+      body: `「${schema}」下有 ${formatNumber(total)} 个对象${sample.length ? `，例如 ${sample.join('、')}${total > sample.length ? ' 等' : ''}` : ''}。`,
       consequences: [
-        `改：写进这个数据源的配置并重新探查，以后助手写 SQL 都用 ${schema}`,
-        `不改：什么都不动。刚才只是看看，助手看到的还是「${configuredLabel}」的结构`,
+        `改：写入该数据源的配置并重新探查，之后助手编写 SQL 时均使用 ${schema}`,
+        `不改：不做任何变更。刚才仅为预览，助手读取的仍是「${configuredLabel}」的结构`,
       ],
       confirmLabel: `改成 ${schema}`,
       cancelLabel: '不改',
@@ -313,18 +313,18 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
       onChange(await api.datasources.update(row.id, { options: { ...(row.options ?? {}), schema } }))
     } catch (e) {
       const h = humanizeError(e)
-      toast.error(`没改成（${h.title}）：配置还是「${configuredLabel}」，缓存也没动`, { detail: h.raw })
+      toast.error(`修改失败（${h.title}）：配置仍为「${configuredLabel}」，缓存未变更`, { detail: h.raw })
       setBusy('')
       return
     }
     try {
       const next = await api.datasources.introspect(row.id)
       onChange(next)
-      toast.ok(`已把「${row.name}」的 schema 改成 ${schema}，探到 ${formatNumber(next.table_count ?? 0)} 个对象`)
+      toast.ok(`已将「${row.name}」的 schema 改为 ${schema}，探查到 ${formatNumber(next.table_count ?? 0)} 个对象`)
     } catch (e) {
       // 配置已经改了、缓存还是旧的：卡片上那行「结构和配置对不上」会一直提醒
       const h = humanizeError(e)
-      toast.error(`schema 已改成 ${schema}，但重新探查没成功（${h.title}）：助手眼下看到的还是原来的结构。再点一次「探查结构」`, { detail: h.raw })
+      toast.error(`schema 已改为 ${schema}，但重新探查失败（${h.title}）：助手读取的仍是原来的结构。请再次点击「探查结构」`, { detail: h.raw })
     } finally {
       setBusy('')
     }
@@ -340,12 +340,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   const introspectOther = async () => {
     const others = otherSchemas.slice(0, 8)
     const schema = await promptDialog({
-      title: '看看哪个 schema？',
-      body: `只看不存：缓存和配置都不动，探到对象再问要不要写进配置。${others.length ? `这台服务器上还有：${others.join('、')}` : ''}`,
+      title: '预览哪个 schema？',
+      body: `仅预览，不保存：不修改缓存和配置；探查到对象后再确认是否写入配置。${others.length ? `该服务器上还有：${others.join('、')}` : ''}`,
       label: 'schema',
       placeholder: others[0] ?? (row.kind === 'postgres' ? 'public' : row.kind === 'oracle' ? 'ANALYTICS' : row.database || ''),
-      confirmLabel: '看看',
-      validate: (v) => (!v ? '填一个 schema 名' : v === configured ? `「${v}」就是配置里的，点「探查结构」就行` : null),
+      confirmLabel: '预览',
+      validate: (v) => (!v ? '请填写 schema 名称' : v === configured ? `「${v}」即当前配置的 schema，请直接点击「探查结构」` : null),
     })
     if (schema) await probeOther(schema)
   }
@@ -356,12 +356,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
       title: `删除数据源「${row.name}」？`,
       danger: true,
       consequences: [
-        row.tools?.length ? `工具 ${row.tools.join('、')} 跟着消失` : '',
+        row.tools?.length ? `工具 ${row.tools.join('、')} 将一并删除` : '',
         using.length
-          ? `${workflowList(using)}用到了这些工具，运行到那一步会失败`
-          : '眼下没有工作流直接引用它的工具',
-        '助手和「问数据」都看不到这个库了',
-        uploaded ? '传上来的这几张表不能再查了，要用得重新传' : '连接信息（含密码）一并删除，不可恢复',
+          ? `${workflowList(using)}使用了这些工具，运行到相应步骤时会失败`
+          : '目前没有工作流直接引用该数据源的工具',
+        '助手和「问数据」将无法再访问该数据库',
+        uploaded ? '已上传的表将无法再查询，如需使用须重新上传' : '连接信息（含密码）一并删除，不可恢复',
       ].filter(Boolean),
       requireText: row.name,
       confirmLabel: '删除数据源',
@@ -394,26 +394,26 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
         <span className="mono text-sm font-medium">{row.name}</span>
         {!uploaded && <span className="chip">{shortLabel(meta?.label) || row.kind}</span>}
         {row.readonly
-          ? <span className="chip" title="只能 SELECT，模型写的 UPDATE / DELETE 会被拦下"><Lock size={10} aria-hidden /> 只读</span>
+          ? <span className="chip" title="仅允许 SELECT，模型生成的 UPDATE / DELETE 会被拦截"><Lock size={10} aria-hidden /> 只读</span>
           : <span className="chip" style={{ color: 'var(--warn)', borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}
-                  title="模型生成的 UPDATE / DELETE 会真的执行">
+                  title="模型生成的 UPDATE / DELETE 会被实际执行">
               <AlertTriangle size={10} aria-hidden /> 可写
             </span>}
-        {!row.enabled && <span className="chip" title="助手和 agent 都看不到它">已停用</span>}
+        {!row.enabled && <span className="chip" title="助手和 Agent 均无法访问该数据源">已停用</span>}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
           <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}>
-            <Plug size={11} aria-hidden /> 测连接
+            <Plug size={11} aria-hidden /> 测试连接
           </button>
           <button className="btn btn-sm tnum" disabled={!!busy} onClick={() => void introspect()}
-                  title="读取表结构并缓存，助手靠它写 SQL">
+                  title="读取表结构并缓存，助手据此编写 SQL">
             {busy === 'introspect'
               ? <><Spinner size={11} /> 探查中 {formatDuration(clock - busySince.current)}</>
               : <><RefreshCw size={11} aria-hidden /> 探查结构</>}
           </button>
           {uploaded
-            ? <button className="btn btn-sm btn-ghost" onClick={onReupload} title="同名重传：就地替换里面的数据，工具名不变">重传</button>
+            ? <button className="btn btn-sm btn-ghost" onClick={onReupload} title="同名重新上传：直接替换其中的数据，工具名不变">重新上传</button>
             : <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>}
           <DeleteButton label={`删除数据源 ${row.name}`} onClick={() => void remove()} />
         </div>
@@ -425,7 +425,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
         <Address row={row} meta={meta} uploaded={uploaded} />
         {row.options?.schema && <span className="chip">schema {row.options.schema}</span>}
         {masks.length > 0 && (
-          <span className="chip" data-mask-columns={masks.join(',')} title={`证据面板里显示成「已遮罩」：${masks.join('、')}`}>
+          <span className="chip" data-mask-columns={masks.join(',')} title={`在证据面板中显示为「已遮罩」：${masks.join('、')}`}>
             <EyeOff size={10} aria-hidden /> 遮罩 {formatNumber(masks.length)} 列
           </span>
         )}
@@ -433,7 +433,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           // 传上来的表没有编辑框（只能重传），遮罩列在这里改
           <button type="button" className="text-2xs underline decoration-dotted underline-offset-2 hover:text-dim"
                   onClick={() => setMasking(true)} data-edit-mask="">
-            {masks.length ? '改遮罩列' : '设遮罩列'}
+            {masks.length ? '修改遮罩列' : '设置遮罩列'}
           </button>
         )}
         {!!row.tools?.length && <span className="mono">{row.tools.join(' · ')}</span>}
@@ -463,13 +463,13 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           {!!otherSchemas.length && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <span className="text-faint">
-                当前是「{row.options?.schema || row.database || '默认'}」。这台服务器上还有，点一个看看（只看不存）：
+                当前为「{row.options?.schema || row.database || '默认'}」。该服务器上还有以下 schema，点击可预览（不保存）：
               </span>
               {otherSchemas.map((s: string) => (
                 <button key={s} className="chip hover:border-[var(--accent)] hover:text-fg" disabled={!!busy}
                         onClick={() => void probeOther(s)}>
                   {busy === `schema:${s}` ? <Spinner size={10} /> : <Search size={10} aria-hidden />}
-                  看看 {s}
+                  预览 {s}
                 </button>
               ))}
             </div>
@@ -489,9 +489,9 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           <AlertTriangle size={12} className="shrink-0 text-[var(--warn)]" aria-hidden />
           <span className="min-w-0 flex-1">
             <span className="text-[var(--warn)]">
-              助手看到的结构是按「{cachedSchema || '默认 schema'}」探的，配置里写的是「{configuredLabel}」
+              助手读取的结构按「{cachedSchema || '默认 schema'}」探查，配置中为「{configuredLabel}」
             </span>
-            <span className="text-dim">：它写 SQL 用的表可能不在配置的 schema 里。</span>
+            <span className="text-dim">：助手编写 SQL 时使用的表可能不在配置的 schema 中。</span>
           </span>
           <button className="btn btn-xs" disabled={!!busy} onClick={() => void introspect()}>
             <RefreshCw size={11} aria-hidden /> 按配置重新探查
@@ -517,23 +517,23 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           // "还没探查"和"探查失败了"是两回事：前者点一下按钮就行，后者点了
           // 也没用。以前两者显示成同一句，没有一处说的是真话
           // 红字上面那块已经说了，这里只说后果，不再叠一道红
-          <span className="text-faint">结构不可用：助手看不到这个库有哪些表</span>
+          <span className="text-faint">结构不可用：助手无法获取该数据库的表清单</span>
         ) : (
-          <span className="text-[var(--warn)]">结构还没探查 · 助手看不到有哪些表</span>
+          <span className="text-[var(--warn)]">尚未探查结构 · 助手无法获取表清单</span>
         )}
         {canProbeOther && (
           <button className="tnum inline-flex items-center gap-1 rounded px-1 py-0.5 text-faint hover:bg-hover hover:text-fg disabled:opacity-50"
                   disabled={!!busy} onClick={() => void introspectOther()} data-probe-schema
-                  title="指定一个 schema 看看有哪些对象：只看不存，缓存和配置都不动；探到了再决定要不要写进配置">
+                  title="指定 schema 预览其中的对象：不保存，不修改缓存和配置；探查到对象后再决定是否写入配置">
             {busy.startsWith('schema:')
-              ? <><Spinner size={10} /> 在看「{busy.slice(7)}」 {formatDuration(clock - busySince.current)}</>
-              : <><Search size={10} aria-hidden /> 换个 schema 看看…</>}
+              ? <><Spinner size={10} /> 正在预览「{busy.slice(7)}」 {formatDuration(clock - busySince.current)}</>
+              : <><Search size={10} aria-hidden /> 预览其他 schema…</>}
           </button>
         )}
         <span className="flex-1" />
         {synced > 0 && (
           <span className={clsx('tnum', staleSchema ? 'text-[var(--warn)]' : 'text-faint')}
-                title={`${formatDateTime(row.schema_synced_at)} 同步${staleSchema ? '。库表可能变过了，点「探查结构」重新同步' : ''}`}>
+                title={`${formatDateTime(row.schema_synced_at)} 同步${staleSchema ? '。库表可能已变更，请点击「探查结构」重新同步' : ''}`}>
             {staleSchema && <AlertTriangle size={10} className="mr-1 inline" aria-hidden />}
             结构同步于 {formatRelative(row.schema_synced_at)}
           </span>
@@ -559,7 +559,7 @@ function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: bool
       {row.username ? `${row.username}@` : ''}{row.host ?? ''}
       {row.port
         ? `:${row.port}`
-        : meta?.default_port ? <span className="opacity-60" title="没填端口，用默认端口">:{meta.default_port}</span> : null}
+        : meta?.default_port ? <span className="opacity-60" title="未填写端口，使用默认端口">:{meta.default_port}</span> : null}
       {target}
     </span>
   )
@@ -638,7 +638,7 @@ function SchemaBrowser({ row }: { row: any }) {
           <Search size={12} className="text-faint" aria-hidden />
           <input
             className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-faint"
-            placeholder={`在 ${tables.length} 个对象里找…`}
+            placeholder={`在 ${tables.length} 个对象中查找…`}
             aria-label="过滤表名"
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -682,7 +682,7 @@ function SchemaBrowser({ row }: { row: any }) {
         ))}
         {filtered.length > SCHEMA_ROWS && (
           <div className="px-1 py-1.5 text-2xs text-faint">
-            还有 {formatNumber(filtered.length - SCHEMA_ROWS)} 个没列出来，输入关键字缩小范围
+            另有 {formatNumber(filtered.length - SCHEMA_ROWS)} 个未列出，请输入关键字缩小范围
           </div>
         )}
       </div>
@@ -700,7 +700,7 @@ function ColumnList({ detail }: { detail?: ColumnsState }) {
     // 只认明确的 false：老后端的响应里根本没有 found，得往下走到原文显示
     return (
       <div className="mb-1.5 ml-5 text-2xs text-faint">
-        缓存里没有这张表的结构了，多半是刚重新探查过。收起再展开，或者点「探查结构」
+        缓存中已没有这张表的结构，可能刚重新探查过。请收起后再展开，或点击「探查结构」。
       </div>
     )
   }
@@ -718,7 +718,7 @@ function ColumnList({ detail }: { detail?: ColumnsState }) {
         </div>
       )}
       {!detail.columns.length ? (
-        <div className="px-2 py-1.5 text-2xs text-faint">探查时没读到列信息</div>
+        <div className="px-2 py-1.5 text-2xs text-faint">探查时未获取到列信息</div>
       ) : (
         <table className="w-full text-2xs">
           <thead className="text-faint">
@@ -883,7 +883,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   const sqlite = form.kind === 'sqlite'
   const needs: string[] = meta?.needs ?? []
   const nameError = isNew && form.name && !NAME_RE.test(form.name)
-    ? '只能用小写字母开头的小写字母、数字、下划线（它会成为工具名 db_query__<标识>）'
+    ? '须以小写字母开头，只能包含小写字母、数字和下划线（将用作工具名 db_query__<标识>）'
     : null
 
   const missing: string[] = []
@@ -970,7 +970,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       <summary className="cursor-pointer select-none px-2.5 py-1.5 text-xs text-dim hover:text-fg">
         高级连接参数{advancedCount ? `（${advancedCount}）` : ''}
         <span className="ml-1.5 text-2xs text-faint">
-          {sqlite ? '查询时限这类，没特殊需要不用填' : '对应连接串里的 options，没特殊需要不用填'}
+          {sqlite ? '如查询时限等，一般无需填写' : '对应连接串中的 options，一般无需填写'}
         </span>
       </summary>
       <div className="space-y-2.5 border-t px-2.5 py-2.5">
@@ -993,13 +993,13 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                    onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [e.target.value, kv[1]] : kv)) }))} />
             <input className="field mono flex-1" value={v} placeholder="值" aria-label={`参数 ${k || '（未命名）'} 的值`}
                    onChange={(e) => setForm((f) => ({ ...f, advanced: f.advanced.map((kv, j) => (j === i ? [kv[0], e.target.value] : kv)) }))} />
-            <IconButton label={`去掉参数 ${k || '（未命名）'}`} icon={<X size={12} />}
+            <IconButton label={`移除参数 ${k || '（未命名）'}`} icon={<X size={12} />}
                         onClick={() => setForm((f) => ({ ...f, advanced: f.advanced.filter((_, j) => j !== i) }))} />
           </div>
         ))}
         {!sqlite && (
           <button className="btn btn-sm btn-ghost" onClick={() => setForm((f) => ({ ...f, advanced: [...f.advanced, ['', '']] }))}>
-            <Plus size={11} aria-hidden /> 加一项
+            <Plus size={11} aria-hidden /> 添加参数
           </button>
         )}
       </div>
@@ -1021,17 +1021,17 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                 record={test.result}
                 checkingSince={test.since}
                 stale={!!test.result && !testFresh}
-                labels={{ ok: '连得上', fail: '连不上' }}
+                labels={{ ok: '连接成功', fail: '连接失败' }}
               />
             )}
           </div>
           <button className="btn" onClick={onClose}>取消</button>
           <button className="btn" disabled={!!test.since || blocked} onClick={() => void runTest()}
-                  title={blocked ? `还缺：${missing.join('、') || '标识格式'}` : '用眼前这份配置连一下，不保存'}>
+                  title={blocked ? `缺少必填项：${missing.join('、') || '标识格式'}` : '使用当前配置测试连接，不保存'}>
             {test.since ? <Spinner size={11} /> : <Plug size={12} aria-hidden />} 测试连接
           </button>
           <button className="btn btn-primary" disabled={saving || blocked} onClick={() => void save()}
-                  title={blocked ? `还缺：${missing.join('、') || '标识格式'}` : undefined}>
+                  title={blocked ? `缺少必填项：${missing.join('、') || '标识格式'}` : undefined}>
             {saving ? <Spinner size={11} /> : null} 保存
           </button>
         </>
@@ -1040,7 +1040,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       <div className="space-y-3">
         <div className="grid grid-cols-2 gap-3">
           <Field label="标识" required={isNew} error={nameError}
-                 hint={isNew ? `会成为工具名 db_query__${form.name || 'xxx'}；建好不能改` : '标识进了工具名，不能改'}>
+                 hint={isNew ? `将用作工具名 db_query__${form.name || 'xxx'}；创建后不可修改` : '标识已用于工具名，不可修改'}>
             {(p) => (
               <input {...p} className="field mono" value={form.name} disabled={!isNew} placeholder="sales"
                      autoComplete="off" spellCheck={false}
@@ -1090,7 +1090,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                          onChange={(e) => set({ host: e.target.value })} />
                 )}
               </Field>
-              <Field label="端口" hint={meta?.default_port ? `留空用 ${meta.default_port}` : undefined}>
+              <Field label="端口" hint={meta?.default_port ? `留空则使用 ${meta.default_port}` : undefined}>
                 {(p) => (
                   <input {...p} className="field mono" type="number" value={form.port ?? ''}
                          placeholder={String(meta?.default_port ?? '')}
@@ -1109,10 +1109,10 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                   )}
                 </Field>
               )}
-              <Field label="schema" hint="只读账号名下常常没有对象，数据在别的 schema 里">
+              <Field label="schema" hint="只读账号名下通常没有对象，数据位于其他 schema 中">
                 {(p) => (
                   <input {...p} className="field mono" value={form.schema}
-                         placeholder={oracle ? '如 ANALYTICS' : form.kind === 'postgres' ? '留空用 public' : '留空用默认'}
+                         placeholder={oracle ? '如 ANALYTICS' : form.kind === 'postgres' ? '留空则使用 public' : '留空则使用默认值'}
                          onChange={(e) => set({ schema: e.target.value })} />
                 )}
               </Field>
@@ -1124,7 +1124,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                          onChange={(e) => set({ username: e.target.value })} />
                 )}
               </Field>
-              <Field label="密码" hint={noPassword ? '没填密码：只有免密登录的库才能这样连' : undefined}>
+              <Field label="密码" hint={noPassword ? '未填写密码：仅适用于免密登录的数据库' : undefined}>
                 {(p) => (
                   <input {...p} className="field mono" type="password" autoComplete="new-password"
                          placeholder={source.has_password ? '已保存，留空则不改' : ''}
@@ -1138,7 +1138,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
           </>
         )}
 
-        <Field label="说明" hint="这句话会给助手看，它据此判断该查哪个库——写清楚里面有什么">
+        <Field label="说明" hint="供助手判断应查询哪个数据库，请写清其中包含的数据">
           {(p) => (
             <input {...p} className="field" value={form.description} placeholder="销售库：订单、客户、产品"
                    onChange={(e) => set({ description: e.target.value })} />
@@ -1155,19 +1155,19 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
           <span className="text-xs">
             只读
             <span className="ml-1.5 text-2xs leading-relaxed text-faint">
-              强烈建议保持勾选。这里的 SQL 由模型生成，关掉之后 UPDATE / DELETE
-              会真的执行（DROP / TRUNCATE 任何情况下都不允许）
+              强烈建议保持勾选。此处的 SQL 由模型生成，取消勾选后 UPDATE / DELETE
+              会被实际执行（DROP / TRUNCATE 在任何情况下都不允许）
             </span>
           </span>
         </label>
 
         <label className="flex cursor-pointer items-center gap-2 text-xs">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-          启用<span className="text-2xs text-faint">停用后助手和 agent 都看不到它</span>
+          启用<span className="text-2xs text-faint">停用后助手和 Agent 均无法访问该数据源</span>
         </label>
 
         {missing.length > 0 && (
-          <p className="text-2xs text-faint">还缺：{missing.join('、')}</p>
+          <p className="text-2xs text-faint">缺少必填项：{missing.join('、')}</p>
         )}
 
         {test.result && !test.result.ok && (
@@ -1197,7 +1197,7 @@ function OracleTarget({ form, set }: { form: SourceForm; set: (patch: Partial<So
         <label className="label !mb-0" htmlFor="ds-oracle-target">
           {sid ? 'SID' : 'service_name'}<span className="ml-0.5 text-[var(--err)]" aria-hidden>*</span>
         </label>
-        <span role="radiogroup" aria-label="Oracle 用 service_name 还是 SID 连接" className="ml-auto inline-flex rounded-md border p-px">
+        <span role="radiogroup" aria-label="Oracle 连接方式：service_name 或 SID" className="ml-auto inline-flex rounded-md border p-px">
           {ORACLE_MODES.map((m) => (
             <button key={m} type="button" {...radio(m)}
                     className={clsx('rounded px-1.5 text-2xs leading-4', form.oracleMode === m ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
@@ -1216,7 +1216,7 @@ function OracleTarget({ form, set }: { form: SourceForm; set: (patch: Partial<So
         onChange={(e) => set(sid ? { sid: e.target.value } : { serviceName: e.target.value })}
       />
       <div id="ds-oracle-target-hint" className="mt-1 text-2xs leading-relaxed text-faint">
-        {sid ? '老库只给了 SID 时用它；保存时只存 SID' : '一般填这个；保存时只存 service_name'}
+        {sid ? '仅提供 SID 的旧版数据库使用此项；保存时只保存 SID' : '通常填写此项；保存时只保存 service_name'}
       </div>
     </div>
   )
@@ -1299,13 +1299,13 @@ function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
   const has = new Set(value.map((v) => v.toLowerCase()))
   const options = [...known.columns.entries()].filter(([c]) => !has.has(c.toLowerCase()))
     .sort((a, b) => a[0].localeCompare(b[0]))
-  const state = !sourceId ? '保存并探查结构之后可以从列里挑；现在可以直接输列名'
-    : !synced ? '还没探查过结构：直接输列名'
-    : known.status === 'loading' ? '正在读已探查的结构…'
-    : known.status === 'error' ? '已探查的结构没取到：直接输列名'
+  const state = !sourceId ? '保存并探查结构后可从列中选择；当前可直接输入列名'
+    : !synced ? '尚未探查结构：请直接输入列名'
+    : known.status === 'loading' ? '正在读取已探查的结构…'
+    : known.status === 'error' ? '已探查的结构获取失败：请直接输入列名'
     : known.status === 'ok'
-      ? `从已探查的 ${formatNumber(known.scanned)} 张表里挑${known.tables > known.scanned ? `（共 ${formatNumber(known.tables)} 张，只读了前 ${formatNumber(known.scanned)} 张，别的直接输列名）` : ''}，或者直接输列名`
-      : '点输入框可以从已探查的列里挑'
+      ? `从已探查的 ${formatNumber(known.scanned)} 张表中选择${known.tables > known.scanned ? `（共 ${formatNumber(known.tables)} 张，仅读取了前 ${formatNumber(known.scanned)} 张，其余请直接输入列名）` : ''}，或直接输入列名`
+      : '点击输入框可从已探查的列中选择'
   return (
     <div data-mask-input="">
       {value.length > 0 && (
@@ -1338,7 +1338,7 @@ function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
                  if (e.key === 'Enter' && !e.nativeEvent.isComposing && draft.trim()) { e.preventDefault(); add(draft) }
                  if (e.key === 'Backspace' && !draft && value.length) onChange(value.slice(0, -1))
                }} />
-        <button type="button" className="btn btn-sm" disabled={!draft.trim()} onClick={() => add(draft)}>加上</button>
+        <button type="button" className="btn btn-sm" disabled={!draft.trim()} onClick={() => add(draft)}>添加</button>
       </div>
       <datalist id={`${id}-list`}>
         {options.slice(0, 300).map(([c, tables]) => (
@@ -1346,9 +1346,9 @@ function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
         ))}
       </datalist>
       <div id={`${id}-hint`} className="mt-1 space-y-0.5 text-2xs leading-relaxed text-faint">
-        <div>证据面板展示查询结果的原始行时，这些列（不分大小写）一律显示成「已遮罩」。{state}</div>
+        <div>证据面板展示查询结果的原始行时，这些列（不区分大小写）一律显示为「已遮罩」。{state}</div>
         <div style={{ color: 'var(--st-waiting)' }} data-mask-boundary="">
-          在有身份体系之前，遮罩只减少暴露，不是安全边界：完整快照仍能按工件取到，SQL 里给列起别名也能绕开
+          遮罩只减少暴露，不是安全边界：完整快照仍可通过工件获取，在 SQL 中为列设置别名也可绕过
         </div>
       </div>
     </div>
@@ -1434,11 +1434,11 @@ export function UploadMeter({ progress, startedAt, sentAt, processing, now }: {
   processing: string
   now: number
 }) {
-  if (!startedAt) return <span className="text-faint">排队中，前面的传完就轮到它</span>
+  if (!startedAt) return <span className="text-faint">排队中，等待前面的文件上传完成</span>
   if (progress?.sent) {
     return (
       <span className="inline-flex items-center gap-1.5 text-dim" data-upload-phase="processing">
-        <Spinner size={10} /> 传完了，{processing} · <span className="tnum">{formatDuration(now - (sentAt ?? now))}</span>
+        <Spinner size={10} /> 上传完成，{processing} · <span className="tnum">{formatDuration(now - (sentAt ?? now))}</span>
       </span>
     )
   }
@@ -1515,8 +1515,8 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
   }
 
   const nameError = name && !NAME_RE.test(name)
-    ? '只能用小写字母开头的小写字母、数字、下划线'
-    : taken.includes(name) ? `「${name}」已经是一个数据库的标识了，换个名字` : null
+    ? '须以小写字母开头，只能包含小写字母、数字和下划线'
+    : taken.includes(name) ? `「${name}」已被其他数据库用作标识，请更换名称` : null
 
   const submit = async () => {
     if (!file || !name || nameError) return
@@ -1537,7 +1537,7 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       setResult(out)
       onImported(out.source)
     } catch (e) {
-      if (isAbort(e)) toast.info(`没传完就取消了，「${name}」没有建也没有改`)
+      if (isAbort(e)) toast.info(`上传已取消，「${name}」未创建或修改`)
       else toast.error(e)
     } finally {
       if (upload.current === handle) upload.current = null
@@ -1561,28 +1561,28 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
         open
         onClose={onClose}
         width={640}
-        title={result.replaced ? `已替换「${name}」里的数据` : `已建好数据源「${name}」`}
+        title={result.replaced ? `已替换「${name}」里的数据` : `已创建数据源「${name}」`}
         footer={
           <>
-            <button className="btn" onClick={retry}>表头不对 · 改行号重传</button>
+            <button className="btn" onClick={retry}>表头有误 · 修改行号后重新上传</button>
             <button className="btn btn-primary" onClick={onClose} data-autofocus>
-              列名对了 · 完成
+              列名无误 · 完成
             </button>
           </>
         }
       >
         <div className="space-y-3" data-upload-result>
           <p className="text-xs leading-relaxed text-dim">
-            {result.tables.length} 张表，表头取的是第 {headerRow} 行。对一眼列名和类型：列名要是变成了一行数据，
-            说明表头行号不对。
+            共 {result.tables.length} 张表，表头取自第 {headerRow} 行。请核对列名和类型：如果列名显示为一行数据，
+            说明表头行号设置有误。
           </p>
           {anyFlagged && (
             <div role="alert" className="flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed"
                  style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 8%, transparent)' }}>
               <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
               <span>
-                标黄的列名看起来像数据（纯数字、日期、空的或重复的）。表头多半不在第 {headerRow} 行，
-                试试改成第 {headerRow + 1} 行重传。
+                标黄的列名看起来像数据（纯数字、日期、空值或重复值）。表头可能不在第 {headerRow} 行，
+                可尝试改为第 {headerRow + 1} 行后重新上传。
               </span>
             </div>
           )}
@@ -1599,7 +1599,7 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
                   return (
                     <span key={`${c.name}-${j}`} className="chip" data-suspicious={bad || undefined}
                           style={bad ? { color: 'var(--warn)', borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)' } : undefined}
-                          title={bad ? '这个列名看起来像一行数据' : undefined}>
+                          title={bad ? '该列名看起来像一行数据' : undefined}>
                       <span className="mono">{c.name || '（空）'}</span>
                       <span className="mono text-faint">{c.type}</span>
                     </span>
@@ -1618,18 +1618,18 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       open
       onClose={onClose}
       dirty={!!file && !busy}
-      title="传表格"
+      title="上传表格"
       footer={
         <>
           {busy && !sent ? (
             <button className="btn" onClick={() => upload.current?.abort()}>取消上传</button>
           ) : (
             <button className="btn" onClick={onClose} disabled={busy}
-                    title={busy ? '文件已经传完，后端正在建表，等它做完' : undefined}>取消</button>
+                    title={busy ? '文件已上传完成，正在建表，请稍候' : undefined}>取消</button>
           )}
           <button className="btn btn-primary tnum" onClick={() => void submit()}
                   disabled={busy || !file || !name || !!nameError}
-                  title={!file ? '先选一个文件' : !name ? '给数据源起个名' : undefined}>
+                  title={!file ? '请先选择文件' : !name ? '请填写数据源名' : undefined}>
             {busy ? <><Spinner size={11} /> 导入中 {formatDuration(clock - busySince.current)}</> : <><Upload size={12} aria-hidden /> 导入</>}
           </button>
         </>
@@ -1650,9 +1650,9 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
           {file ? (
             <span className="text-xs"><span className="mono">{file.name}</span> <span className="tnum text-faint">· {formatBytes(file.size)}</span></span>
           ) : (
-            <span className="text-xs text-dim">拖一个文件进来，或点这里选</span>
+            <span className="text-xs text-dim">拖入文件，或点击选择</span>
           )}
-          <span className="text-2xs text-faint">Excel（.xlsx）或 CSV / TSV，每个工作表变成一张表。.xls 是老格式，先另存为 .xlsx</span>
+          <span className="text-2xs text-faint">支持 Excel（.xlsx）和 CSV / TSV，每个工作表会转为一张表。不支持 .xls 格式，请先另存为 .xlsx</span>
           <input type="file" className="sr-only" accept=".xlsx,.xlsm,.csv,.tsv" aria-label="选择表格文件" disabled={busy}
                  onChange={(e) => pick(e.target.files?.[0] ?? null)} />
         </label>
@@ -1666,7 +1666,7 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
 
         <div className="grid grid-cols-[1fr_120px] gap-3">
           <Field label="数据源名" required error={nameError}
-                 hint={`会成为工具名的一部分（db_query__${name || 'sales'}）；同名重传就地替换`}>
+                 hint={`将用作工具名的一部分（db_query__${name || 'sales'}）；同名重新上传会直接替换`}>
             {(p) => (
               <input {...p} className="field mono" value={name} placeholder="sales" autoComplete="off" spellCheck={false}
                      style={nameError ? { borderColor: 'var(--err)' } : undefined}
@@ -1681,7 +1681,7 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
           </Field>
         </div>
 
-        <Field label="说明（给助手看）">
+        <Field label="说明（供助手参考）">
           {(p) => (
             <input {...p} className="field" value={description} placeholder="2026 年各月销售明细"
                    onChange={(e) => setDescription(e.target.value)} />

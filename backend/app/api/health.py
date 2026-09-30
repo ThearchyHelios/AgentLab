@@ -28,7 +28,7 @@ def record(ok: bool, latency_ms: int | None, error: str | None = None) -> dict[s
         "at": utcnow().isoformat(),
         "ok": bool(ok),
         "latency_ms": None if latency_ms is None else int(latency_ms),
-        "error": None if ok else (error or "连不上"),
+        "error": None if ok else (error or "无法连接"),
     }
 
 

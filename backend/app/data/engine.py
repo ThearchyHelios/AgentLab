@@ -125,7 +125,7 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
         service = options.pop("service_name", None) or source.database
         sid = options.pop("sid", None)
         if not service and not sid:
-            raise ValueError("Oracle 需要在 options 里给 service_name 或 sid（也可以填在库名里）")
+            raise ValueError("Oracle 需要填写 service_name 或 SID（也可填在「数据库」中）")
         tail = f"?service_name={service}" if service else f"?sid={sid}"
         query = "&".join(f"{k}={v}" for k, v in options.items())
         return f"{driver}://{auth}{host}/{tail}{('&' + query) if query else ''}"
@@ -183,8 +183,8 @@ def query_timeout_problem(options: dict[str, Any] | None) -> str | None:
     if value is None or str(value).strip() == "":
         return None
     if _timeout_value(value) is None:
-        return (f"查询时限要填 {MIN_QUERY_TIMEOUT_S} 到 {MAX_QUERY_TIMEOUT_S} 之间的秒数，"
-                f"比如 60；现在填的是「{value}」")
+        return (f"查询时限需要填写 {MIN_QUERY_TIMEOUT_S} 到 {MAX_QUERY_TIMEOUT_S} 之间的秒数，"
+                f"例如 60；当前为「{value}」")
     return None
 
 
@@ -202,7 +202,7 @@ def mask_columns_problem(options: dict[str, Any] | None) -> str | None:
         return None
     if isinstance(raw, str) or (isinstance(raw, list) and all(isinstance(c, str) for c in raw)):
         return None
-    return f"遮罩的列要填列名，用逗号分开，比如「phone, email」；现在填的是「{raw}」"
+    return f"遮罩的列需要填写列名，用逗号分隔，例如「phone, email」；当前为「{raw}」"
 
 
 def query_timeout(source: Any) -> float:
@@ -529,7 +529,7 @@ async def run_query(
 
     columns, rows, truncated, types = await _bounded(
         engine.connect, kind, limits,
-        f"查询超过 {_seconds(limits.timeout_seconds)}s 被中断。加上 WHERE 条件或 LIMIT 缩小范围。",
+        f"查询超过 {_seconds(limits.timeout_seconds)} 秒被中断。请添加 WHERE 条件或 LIMIT 缩小范围。",
         _read,
     )
     return QueryResult(
@@ -609,7 +609,7 @@ async def _run_write(
     # engine.begin()：正常退出提交，出错（包括数据库按时限停下）回滚
     columns, rows = await _bounded(
         engine.begin, kind, limits,
-        f"写操作超过 {_seconds(limits.timeout_seconds)}s 被中断，已回滚。", _write,
+        f"写操作超过 {_seconds(limits.timeout_seconds)} 秒被中断，已回滚。", _write,
     )
     return QueryResult(
         columns=columns,

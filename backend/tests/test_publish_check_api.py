@@ -203,10 +203,10 @@ async def test_bad_requests(client):
     assert r.status_code == 404
     body = (await client.post(f"/api/workflows/{wf}/publish-check",
                               json={"level": "governed", "graph": {"nodes": [{"id": "a", "type": "nope"}]}})).json()
-    assert body["ok"] is False and body["fixes"] == [] and "读不懂" in body["issues"][0]["message"]
+    assert body["ok"] is False and body["fixes"] == [] and "无法解析" in body["issues"][0]["message"]
     body = (await client.post(f"/api/workflows/{wf}/autofix", json={
         "level": "governed", "graph": {"nodes": [{"id": "a", "type": "nope"}]}, "apply": ["x:y"]})).json()
-    assert body["ok"] is False and body["applied"] == [] and "读不懂" in body["remaining"][0]["message"]
+    assert body["ok"] is False and body["applied"] == [] and "无法解析" in body["remaining"][0]["message"]
 
 
 async def test_the_draft_in_the_database_is_the_default(client):

@@ -307,4 +307,4 @@ async def test_schedule_is_reported_for_the_ui(runner, monkeypatch):
 
     # 调度决策本身也要在事件流里，否则界面上这个节点就是个跑了 N 秒的黑盒
     dispatches = [d["message"] for d in steps(events, "log") if d.get("round") is not None]
-    assert any("同时进行" in m for m in dispatches), dispatches
+    assert any("同时执行" in m for m in dispatches), dispatches

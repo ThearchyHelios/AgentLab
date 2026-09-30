@@ -42,26 +42,26 @@ export const STUDIO_SHORTCUTS: StudioShortcut[] = [
   // Ctrl+Y 是 Windows 上的习惯；Mac 上 ⌘Y 是浏览器的「历史记录」，不抢
   { id: 'redo', combo: 'Mod+Shift+Z', alt: isMac ? [] : ['Mod+Y'], label: '重做', group: '编辑' },
   { id: 'copy', combo: 'Mod+C', label: '复制选中的节点', group: '编辑' },
-  { id: 'paste', combo: 'Mod+V', label: '粘贴节点（落在视野中间）', group: '编辑' },
-  { id: 'duplicate', combo: 'Mod+D', label: '原地复制一份', group: '编辑' },
+  { id: 'paste', combo: 'Mod+V', label: '粘贴节点（放在视图中央）', group: '编辑' },
+  { id: 'duplicate', combo: 'Mod+D', label: '复制节点', group: '编辑' },
   { id: 'selectAll', combo: 'Mod+A', label: '选中全部节点', group: '编辑' },
   { id: 'delete', combo: 'Backspace', alt: ['Delete'], label: '删除选中的节点或连线', group: '编辑', passive: true },
 
-  { id: 'focus', combo: 'F', label: '镜头对准选中的节点（运行中没有选中时：逐个对准要处理的节点）', group: '画布' },
+  { id: 'focus', combo: 'F', label: '定位到选中的节点（运行中未选中节点时，依次定位待处理的节点）', group: '画布' },
   // 它回到打开时的取景（从入口看起，缩放不低于可读下限），不是「看全所有节点」：大图上
   // 看全要把卡片缩到读不清。真要看全，用画布左下角的「适配全图」
-  { id: 'fit', combo: 'Shift+1', label: '重新取景（回到打开时的视角，从入口看起）', group: '画布' },
+  { id: 'fit', combo: 'Shift+1', label: '重置视图（回到打开时的视角）', group: '画布' },
   { id: 'layout', combo: 'Shift+L', label: '自动排版', group: '画布' },
   { id: 'search', combo: '/', label: '搜索节点库', group: '画布' },
   { id: 'nextProblem', combo: 'F8', label: '跳到下一个问题', group: '画布' },
   { id: 'prevProblem', combo: 'Shift+F8', label: '跳到上一个问题', group: '画布' },
 
   { id: 'problems', combo: 'Alt+P', label: '问题面板', group: '面板' },
-  { id: 'variables', combo: 'Alt+V', label: '变量抽屉', group: '面板' },
+  { id: 'variables', combo: 'Alt+V', label: '变量面板', group: '面板' },
   { id: 'history', combo: 'Alt+H', label: '版本历史', group: '面板' },
   { id: 'palette', combo: 'Alt+N', label: '收起 / 展开节点库', group: '面板' },
   { id: 'assistant', combo: 'Alt+A', label: '收起 / 展开助手栏', group: '面板' },
-  { id: 'close', combo: 'Esc', label: '关掉属性面板', group: '面板', passive: true },
+  { id: 'close', combo: 'Esc', label: '关闭属性面板', group: '面板', passive: true },
 ]
 
 export const STUDIO_SHORTCUT_GROUPS: StudioShortcut['group'][] = ['文件', '编辑', '画布', '面板']

@@ -124,9 +124,9 @@ def _make(kind: str, model: str, base_url: str = "", *,
             # 而实际拿到的是哈希词袋——搜不出同义表达时完全无从怀疑到这里
             where = base_url or "api.openai.com"
             raise EmbedderUnavailable(
-                f"用不了 {where} 上的 embedding 模型 "
+                f"无法使用 {where} 上的向量模型 "
                 f"{model or 'text-embedding-3-small'}：{_why(e)}。"
-                f"检查服务在不在、模型名对不对；走官方接口还要看 OPENAI_API_KEY。"
+                f"请检查服务是否可用、模型名是否正确；使用官方接口时还需检查 OPENAI_API_KEY。"
             ) from e
         return _local
 

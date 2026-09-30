@@ -140,9 +140,9 @@ _ALL_READINGS: tuple[_Reading, ...] = (_GENERIC, *dict.fromkeys(
     r for readings in _READINGS.values() for r in readings))
 
 _AMBIGUOUS = (
-    "这条 SQL 里的引号、反斜杠或注释，在数据库的不同设置下会读成不同的语句"
-    "（比如 MySQL 的 NO_BACKSLASH_ESCAPES、ANSI_QUOTES）。"
-    "字符串里的单引号写成两个单引号 ''，不要用反斜杠转义；注释删掉再试"
+    "这条 SQL 中的引号、反斜杠或注释，在数据库的不同设置下会被解析成不同的语句"
+    "（例如 MySQL 的 NO_BACKSLASH_ESCAPES、ANSI_QUOTES）。"
+    "字符串中的单引号请写成两个单引号 ''，不要用反斜杠转义；请删除注释后重试"
 )
 
 _DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
@@ -350,15 +350,15 @@ def _blank_quoted(sql: str, *, identifiers: bool = True, dialect: str | None = N
 def _pragma_write_reason(stmt: str, reading: _Reading = _GENERIC) -> str | None:
     match = _PRAGMA.match(_joined(_tokens(stmt, reading)).strip())
     if not match:
-        return "看不出这条 PRAGMA 读的是什么"
+        return "无法判断这条 PRAGMA 读取的内容"
     name, rest = match.group(1).lower(), match.group(2).strip()
     if rest.startswith("="):
         return f"PRAGMA {name} = … 会改数据库设置"
     if name in _PRAGMA_READ_WITH_ARG or (name in _PRAGMA_READ_NO_ARG and not rest):
         return None
     return (
-        f"PRAGMA {name}{' ' + rest if rest else ''} 不在只读白名单里"
-        "（看表结构用 table_info / index_list / foreign_key_list）"
+        f"PRAGMA {name}{' ' + rest if rest else ''} 不在允许的只读语句范围内"
+        "（查看表结构请用 table_info / index_list / foreign_key_list）"
     )
 
 
@@ -381,7 +381,7 @@ def _write_reason(stmt: str, reading: _Reading = _GENERIC) -> str | None:
         hidden = _HIDDEN_WRITE.search(_blanked(tokens, identifiers=True))
         if hidden:
             word = " ".join(hidden.group(1).split()).upper()
-            return f"语句里有 {word}——以查询开头的语句也能写数据"
+            return f"语句中包含 {word}：以查询开头的语句也可能写入数据"
         call = _SIDE_EFFECT_CALL.search(_blanked(tokens, identifiers=False))
         if call:
             return f"{call.group(1)}() 有副作用"
@@ -394,7 +394,7 @@ def _write_reason_any(stmt: str, readings: tuple[_Reading, ...]) -> str | None:
     if reasons[0]:
         return reasons[0]
     other = next((r for r in reasons[1:] if r), None)
-    return f"数据库换一种设置来读的话，{other}。{_AMBIGUOUS}" if other else None
+    return f"在数据库的其他设置下，{other}。{_AMBIGUOUS}" if other else None
 
 
 def _one_view(sql: str, readings: tuple[_Reading, ...]) -> list[str] | None:
@@ -413,18 +413,18 @@ def check(sql: str, *, readonly: bool, source_name: str = "", dialect: str | Non
     不知道的话按所有方言、所有设置的读法各判一遍，任何一种读法不过都拒。
     """
     if not sql or not sql.strip():
-        raise SqlRejected("SQL 是空的")
+        raise SqlRejected("SQL 为空")
 
     readings = _readings(dialect)
     statements = _one_view(sql, readings)
     if statements is None:
         raise SqlRejected(_AMBIGUOUS)
     if not statements:
-        raise SqlRejected("SQL 里没有可执行的语句")
+        raise SqlRejected("SQL 中没有可执行的语句")
     if len(statements) > 1:
         raise SqlRejected(
             f"一次只能执行一条语句，这里有 {len(statements)} 条。"
-            "拆成多次调用——分号拼接的语句不会被执行。"
+            "请拆成多次调用，分号拼接的语句不会被执行。"
         )
 
     stmt = statements[0]
@@ -434,12 +434,12 @@ def check(sql: str, *, readonly: bool, source_name: str = "", dialect: str | Non
 
     verb = first_verb(stmt, dialect=dialect)
     if not verb:
-        raise SqlRejected("看不出这条 SQL 要做什么（没有识别到关键字）")
+        raise SqlRejected("无法识别这条 SQL 的操作类型（未识别到关键字）")
 
     if verb in _ALWAYS_DENIED:
         raise SqlRejected(
             f"{verb.upper()} 属于结构变更或权限操作，任何数据源上都不允许。"
-            "这类操作请在数据库客户端里人工执行。"
+            "这类操作请在数据库客户端中手动执行。"
         )
 
     if readonly:
@@ -449,7 +449,7 @@ def check(sql: str, *, readonly: bool, source_name: str = "", dialect: str | Non
             raise SqlRejected(
                 f"{where}是只读的：{reason}，不被允许。"
                 "只能执行不改数据的 SELECT / WITH / SHOW / DESCRIBE / EXPLAIN。"
-                "确实需要写入的话，请在设置里另建一个关闭了只读的数据源。"
+                "如确需写入，请在「数据」页另建一个未勾选「只读」的数据源。"
             )
 
     return stmt

@@ -119,7 +119,7 @@ async def test_a_pure_arithmetic_rewrite_is_adopted_as_a_preview(client, monkeyp
     assert [c for c in body["changes"] if c["rule"] == "assist"] == [
         {"fix_id": "assist", "rule": "assist", "node_id": "card", "node_title": "口径卡", "field": "metrics",
          "before": graph()["nodes"][3]["data"]["config"]["metrics"], "after": REWRITE["config"]["metrics"],
-         "label": "Copilot 的修改"}]
+         "label": "助手的修改"}]
     assert body["ops"][-1] == REWRITE
     assert not [n for n in body["notes"] if n["rule"] == "R5"]                 # 口径卡不再读它，建议随之作废
     assert await rows() == before                                              # 只是预览
@@ -165,7 +165,7 @@ async def test_non_arithmetic_code_is_kept_with_a_warning(client, monkeypatch):
     assert body["assist"]["ok"] is True and body["applied"] == []
     assert body["assist"]["questions"] == ["「算比率」：它读了一个文件，像是在取数，请确认"]
     [warning] = body["assist"]["warnings"]
-    assert "算比率" in warning and "evidence_role" in warning and "口径卡" in warning
+    assert "算比率" in warning and "「证据角色」" in warning and "口径卡" in warning
     assert body["graph"] == graph()
     assert [n["node_id"] for n in body["notes"] if n["rule"] == "R5"] == ["calc"]
 
@@ -176,7 +176,7 @@ async def test_nothing_to_rewrite_means_no_model_call(client, monkeypatch):
     model = script(monkeypatch, wrap(REWRITE))
     body = await upgrade(client, g)
     assert model.calls == [] and body["assist"]["ok"] is True and body["assist"]["warnings"] == []
-    assert "没有要交给 Copilot 改写的" in body["assist"]["summary"]
+    assert "无需交给助手改写" in body["assist"]["summary"]
 
 
 async def test_a_new_error_is_sent_back_once_and_fixed(client, monkeypatch):
@@ -199,7 +199,7 @@ async def test_a_rewrite_that_stays_broken_is_refused(client, monkeypatch):
     assert len(model.calls) == 3                                               # 最多交回去改两轮
     assert body["assist"]["ok"] is False and "assist" not in body["applied"]
     [rejected] = [r for r in body["rejected"] if r["fix_id"] == "assist"]
-    assert "变糟" in rejected["reason"]
+    assert "未能改善工作流" in rejected["reason"]
     assert by_id(body["graph"])["card"]["data"]["config"]["metrics"][0]["expression"] == "vars.calc.ratio"
 
 
@@ -207,7 +207,7 @@ async def test_marking_the_code_as_a_source_is_not_the_copilots_call(client, mon
     script(monkeypatch, wrap({"op": "update_node", "id": "calc", "config": {"evidence_role": "source"}}))
     body = await upgrade(client, graph())
     [rejected] = [r for r in body["rejected"] if r["fix_id"] == "assist"]
-    assert "source" in rejected["reason"] and body["graph"] == graph()
+    assert "「取数」" in rejected["reason"] and body["graph"] == graph()
 
 
 async def test_without_assist_there_is_no_model_call(client, monkeypatch):

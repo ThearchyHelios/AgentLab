@@ -168,11 +168,13 @@ const FAKES = {
 
 const clone = (x) => JSON.parse(JSON.stringify(x))
 const who = (n) => `「${n.data.label}」`
+/** 指标候选的写法照后端 autofix._metric_options：「名称（id）」，提示写来自哪个口径卡 */
+const metricOptions = (m) => m.data.config.metrics.map((x) => ({ value: x.id, label: `${x.name}（${x.id}）`, hint: `口径卡「${m.data.label}」` }))
 
 /**
  * 伪造的门禁：按请求里的图现算，形状照 PF-SPEC（issues 带 code 和 fix，fixes 列修法）。
  * 已发布档只给提示，受管档有错。修法的 id 是 code:节点（图级的是 code:graph）。
- * followsNever：当作这张图的全图默认是「全部自动放行」（画布上不带 defaults，按工作流认）
+ * followsNever：当作这张图的工作流默认设置是「全部无需审批」（画布上不带 defaults，按工作流认）
  */
 function lint(graph, level, { followsNever = false } = {}) {
   const hard = level === 'governed'
@@ -188,47 +190,58 @@ function lint(graph, level, { followsNever = false } = {}) {
   // 图级：唯一的出口没有契约。问题不挂节点，修复落在那个出口上（和后端 autofix._target 一样）
   if (hard && outputs.length === 1 && !outputs[0].data.config?.contract) {
     const id = `governed.no_contract:${outputs[0].id}`
+    const report = graph.nodes.find((r) => r.type === 'report')
     issues.push({ level: 'error', node_id: null, code: 'governed.no_contract', fix: id, field: null,
-      message: '受管模板至少要有一个「成果 / 出具」节点声明出具契约' })
+      message: '受管级别要求至少一个「成果」节点声明出具契约，否则无法判定出具档位' })
     fixes.push({ id, code: 'governed.no_contract', node_id: outputs[0].id, kind: 'choice', multiple: true,
-      label: `给${who(outputs[0])}生成出具契约，再选出必需的指标`,
-      options: cards.flatMap((m) => m.data.config.metrics.map((x) => ({ value: x.id, label: `${x.id} · ${x.name}` }))) })
+      label: `为${who(outputs[0])}生成出具契约：核对${report ? who(report) : '「报告撰写」'}的文档，指标来自${who(cards[0])}，再选择「必需指标」`,
+      options: cards.flatMap(metricOptions) })
   }
   for (const n of graph.nodes) {
     const c = n.data.config ?? {}
     if (followsNever && n.type === 'agent' && !c.approval && (c.tools ?? []).length) {
       const id = 'governed.default_approval_never:graph'
       issues.push({ level: hard ? 'error' : 'warning', node_id: n.id, code: 'governed.default_approval_never', fix: id, field: 'approval',
-        message: `${who(n)}（Agent）没写自己的审批策略，跟随全图默认的「全部自动放行」` })
+        message: `${who(n)}（Agent）没有设置审批策略，跟随工作流默认设置中的「全部无需审批」；受管级别要求危险工具至少经过人工审批。`
+          + '请将工作流默认设置中的审批策略改为「仅危险工具需要审批」，或在该节点上单独设置' })
       if (!fixes.some((f) => f.id === id)) {
-        fixes.push({ id, code: 'governed.default_approval_never', node_id: null, kind: 'auto', label: '把全图默认的审批策略改成「仅危险工具需要审批」',
+        const followers = graph.nodes.filter((x) => x.type === 'agent' && !x.data.config?.approval && (x.data.config?.tools ?? []).length)
+        fixes.push({ id, code: 'governed.default_approval_never', node_id: null, kind: 'auto',
+          label: `将工作流默认设置中的审批策略改为「仅危险工具需要审批」（${followers.map(who).join('、')}一并生效）`,
           preview: { field: 'defaults.approval', before: 'never', after: 'dangerous' } })
       }
     }
     if (n.type === 'agent' && c.approval === 'never' && (c.tools ?? []).length) {
-      add(n, 'governed.agent_approval_never', `${who(n)}（Agent）的审批策略是「全部自动放行」，受管模板要求危险工具至少人工审批`,
-        { kind: 'auto', label: '把审批策略改成「仅危险工具需要审批」', preview: { field: 'approval', before: 'never', after: 'dangerous' } })
+      add(n, 'governed.agent_approval_never', `${who(n)}（Agent）的审批策略是「全部无需审批」，受管级别要求危险工具至少经过人工审批。请改为「仅危险工具需要审批」`,
+        { kind: 'auto', label: `将${who(n)}的审批策略改为「仅危险工具需要审批」`, preview: { field: 'approval', before: 'never', after: 'dangerous' } })
     }
     if (n.type === 'subgraph' && !c.workflow_version) {
-      add(n, 'governed.subgraph_unpinned', `${who(n)}（子工作流）没有钉住版本，口径会随上游最新版漂移`,
-        { kind: 'auto', label: '钉到它最新的已发布版本 v4', preview: { field: 'workflow_version', before: null, after: 4 } })
+      add(n, 'governed.subgraph_unpinned', `${who(n)}（子工作流）没有固定版本，口径会随上游最新版本变化。请在节点中选定一个版本`,
+        { kind: 'auto', label: `将${who(n)}固定到上游当前的发布版本 v4`, preview: { field: 'workflow_version', before: null, after: 4 } })
     }
     if (n.type === 'code' && c.evidence_role !== 'source') {
-      add(n, 'governed.caliber_compute_input', `${who(n)}（沙箱代码）的产出喂给了口径卡，而它的角色是计算`, {
-        kind: 'choice', label: `${who(n)}的产出喂给了口径卡：它是在取数，还是在做计算？`,
-        options: [{ value: 'source', label: '它在取数：标成 source（取数）' },
-          { value: 'copilot', label: '它在做计算：交给 Copilot 把计算挪进口径卡', handoff: true }],
+      const to = graph.edges.filter((e) => e.source === n.id).map((e) => graph.nodes.find((x) => x.id === e.target))
+        .filter((x) => x?.type === 'metrics').map(who).join('、')
+      add(n, 'governed.caliber_compute_input', `${who(n)}（沙箱代码）的产出提供给了口径卡${to}，但它的「证据角色」是「计算」`
+        + `${c.evidence_role ? '' : '（未设置时默认为「计算」）'}：沙箱中计算出的数字无法追溯出处。`
+        + '若该节点负责取数，请将「证据角色」设为「取数」；若负责计算，请把计算移到口径卡的表达式中', {
+        kind: 'choice', label: `${who(n)}的产出提供给了口径卡：它负责取数，还是负责计算？`,
+        options: [{ value: 'source', label: '负责取数：将「证据角色」设为「取数」', hint: '口径卡读取它时会记录出处' },
+          { value: 'copilot', label: '负责计算：交给助手把计算移到口径卡', hint: '助手的修改同样只是预览，需要你决定的事项会交给你确认', handoff: true }],
       })
     }
     if (n.type === 'output' && c.contract?.report_from && !(c.fields ?? []).every((f) => f.value.includes(`nodes.${c.contract.report_from}.`))) {
-      add(n, 'governed.exit_text_source', `${who(n)}的成果字段取的不是报告撰写节点的正文`, {
-        kind: 'choice', label: '把成果字段改成取哪个报告撰写节点的正文',
-        options: graph.nodes.filter((r) => r.type === 'report').map((r) => ({ value: r.id, label: who(r), hint: '报告撰写' })),
+      const name = c.fields?.[0]?.name
+      add(n, 'governed.exit_text_source', `${who(n)}（成果）的成果字段「${name}」取自其他节点的产出：受管级别出具时，给人看的文字只能来自`
+        + '「报告撰写」节点，其他节点写的文字无法追溯出处。请改为取报告撰写节点的正文', {
+        kind: 'choice', label: `把成果字段「${name}」改为取哪个报告撰写节点的正文`,
+        options: graph.nodes.filter((r) => r.type === 'report').map((r) => ({ value: r.id, label: who(r), hint: `报告撰写 · {{ nodes.${r.id}.text }}` })),
       })
     }
     if (n.type === 'supervisor') {
-      add(n, 'governed.supervisor', `${who(n)}（多 Agent 协作）：受管模板不允许全动态规划的节点`,
-        { kind: 'assist', label: '换成固定编排是结构性的改动，交给 Copilot' })
+      add(n, 'governed.supervisor', `${who(n)}（多 Agent 协作）：受管级别不允许使用全动态规划的节点，其分工和轮数由模型在运行时决定，`
+        + '无法事先审核。请改用配置固定的 Agent 或「模型调用」节点',
+        { kind: 'assist', label: `${who(n)}需要改为配置固定的 Agent 或「模型调用」节点：修复不能删除节点，助手只会给出拆分建议，替换需要由你完成` })
     }
     if (n.type === 'output' && c.contract) {
       const k = c.contract
@@ -236,23 +249,24 @@ function lint(graph, level, { followsNever = false } = {}) {
         // 真后端 validate 和门禁各报一条（同 code、同节点，说法不同），指向同一个修复；validate 的排在最前
         if (followsNever) {
           issues.unshift({ level: 'error', node_id: n.id, code: 'contract.metrics_from_missing', fix: `contract.metrics_from_missing:${n.id}`,
-            field: 'contract.metrics_from', message: '出具契约缺 metrics_from（指标来自哪个「口径卡」节点）' })
+            field: 'contract.metrics_from', message: '出具契约缺少「指标来自」（提供指标的口径卡）' })
         }
-        add(n, 'contract.metrics_from_missing', '出具契约没有声明 metrics_from（指标来自哪个「口径卡」节点）', {
-          kind: 'choice', label: '指标来自哪张口径卡', default: cards[0]?.id,
-          options: cards.map((m) => ({ value: m.id, label: m.data.label, hint: `${m.data.config.metrics.length} 个指标` })),
+        // 后端这里是多选（「从哪几个口径卡取指标」）；伪造成单选，专门看 radio 这一种控件
+        add(n, 'contract.metrics_from_missing', '出具契约没有设置「指标来自」（提供指标的口径卡），叙述中的数字无法对应到指标', {
+          kind: 'choice', label: '选择出具契约的「指标来自」：从哪个口径卡取指标', default: cards[0]?.id,
+          options: cards.map((m) => ({ value: m.id, label: m.data.label, hint: '口径卡' })),
         })
       }
       if (hard && !(k.required ?? []).length) {
         const from = (k.metrics_from ?? []).length ? cards.filter((m) => k.metrics_from.includes(m.id)) : cards
-        add(n, 'contract.required_missing', '受管模板的出具契约必须声明 required（必需指标）', {
-          kind: 'choice', multiple: true, label: '哪些指标缺了就不该出具',
-          options: from.flatMap((m) => m.data.config.metrics.map((x) => ({ value: x.id, label: `${x.id} · ${x.name}` }))),
+        add(n, 'contract.required_missing', '受管级别的出具契约必须设置「必需指标」，否则「不予出具」这一档无法触发', {
+          kind: 'choice', multiple: true, label: '选择受管级别出具的「必需指标」：缺少其中任何一个都将不予出具',
+          options: from.flatMap(metricOptions),
         })
       }
       if (hard && !k.strict) {
-        add(n, 'contract.strict_off', '受管模板建议把出具契约设为 strict：非 strict 下未回指的数字只降档不拦截',
-          { kind: 'auto', label: '把出具契约设为 strict', preview: { field: 'contract.strict', before: false, after: true } }, false)
+        add(n, 'contract.strict_off', '受管级别建议开启出具契约的「严格模式」：未开启时，无法追溯出处的数字只会使出具降档，不会被拦截',
+          { kind: 'auto', label: '开启出具契约的「严格模式」：没有出处的数字直接拦截，而不只是降档', preview: { field: 'contract.strict', before: false, after: true } }, false)
       }
     }
   }
@@ -270,7 +284,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
   const byId = (id) => graph.nodes.find((n) => n.id === id)
   for (const id of body.apply ?? []) {
     const fix = before.fixes.find((f) => f.id === id)
-    if (!fix) { rejected.push({ fix_id: id, reason: '这条问题已经不在了' }); continue }
+    if (!fix) { rejected.push({ fix_id: id, reason: '这一处问题已不存在，请重新检查' }); continue }
     if (fix.code === 'governed.default_approval_never') {
       // 图级：改的是全图默认，不落在任何节点上
       graph.defaults = { ...(graph.defaults ?? {}), approval: 'dangerous' }
@@ -283,16 +297,16 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
     const change = (field, from, to) => changes.push({ fix_id: id, node_id: n.id, node_title: n.data.label, field, before: from, after: to, label: fix.label })
     if (fix.code === 'governed.agent_approval_never') { change('approval', c.approval, 'dangerous'); c.approval = 'dangerous' }
     else if (fix.code === 'governed.subgraph_unpinned') {
-      if (unpublished) { rejected.push({ fix_id: id, reason: '嵌的工作流还没有发布过版本，钉不上：先去发布它，或者交给人选' }); continue }
+      if (unpublished) { rejected.push({ fix_id: id, reason: `${who(n)}嵌套的工作流还没有发布版本，无法自动固定版本。请先发布该工作流，或交给助手处理` }); continue }
       change('workflow_version', c.workflow_version ?? null, 4); c.workflow_version = 4
     } else if (fix.code === 'contract.strict_off') { change('contract.strict', !!c.contract.strict, true); c.contract.strict = true }
     else if (fix.code === 'contract.metrics_from_missing') {
       const v = body.choices?.[id]
-      if (v === undefined) { rejected.push({ fix_id: id, reason: '要人选：没给选择' }); continue }
+      if (v === undefined) { rejected.push({ fix_id: id, reason: `这一处需要你选择：${fix.label}` }); continue }
       change('contract.metrics_from', c.contract.metrics_from ?? null, [v]); c.contract.metrics_from = [v]
     } else if (fix.code === 'governed.no_contract') {
       const v = body.choices?.[id]
-      if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: '要人选：没给选择' }); continue }
+      if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: `这一处需要你选择：${fix.label}` }); continue }
       const contract = { report_from: 'write', metrics_from: ['caliber'], strict: true, required: v }
       change('contract', null, contract); c.contract = contract
     } else if (fix.code === 'governed.caliber_compute_input') {
@@ -306,9 +320,9 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
       change('fields[0].value', c.fields[0].value, to); c.fields[0].value = to
     } else if (fix.code === 'contract.required_missing') {
       const v = body.choices?.[id]
-      if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: '要人选：没给选择' }); continue }
+      if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: `这一处需要你选择：${fix.label}` }); continue }
       change('contract.required', c.contract.required ?? null, v); c.contract.required = v
-    } else { rejected.push({ fix_id: id, reason: '这一条不能直接修' }); continue }
+    } else { rejected.push({ fix_id: id, reason: '这一处属于结构性问题，需要交给助手处理' }); continue }
     applied.push(id)
   }
   let assist = null
@@ -316,7 +330,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
     const team = byId('team')
     if (team) {
       changes.push({ fix_id: 'assist', node_id: 'team', node_title: team.data.label, field: 'max_rounds', before: team.data.config.max_rounds, after: 2,
-        label: 'Copilot：先把协作轮数收紧' })
+        label: '助手的修改' })
       team.data.config.max_rounds = 2
     }
     assist = { ok: true, summary: '把复核团队的轮数收紧到 2 轮；换成固定编排要删节点，按规矩没动它',
@@ -338,8 +352,10 @@ function upgradeAdvice(graph) {
 }
 
 /** R5、R3 的说明原文：原样显示，检查逐字比对 */
-const R5_NOTE = '「计算」的产出被口径卡引用：它要是只在取数、不做计算，可以标成 source（取数）；标不标由你确认，这次没有改它'
-const R3_NOTE = '报告会直接引用查询单元格。要按受管级别正式出具，得在出具契约里写 cells: true，或者改走口径卡：选哪条要你拿主意，升级没有替你加契约'
+const R5_NOTE = '「计算」（沙箱代码）的产出提供给了口径卡「周报口径」：若它负责取数（查库、调用接口、读文件），请把「证据角色」设为「取数」，'
+  + '口径卡读取时会记录出处；若负责计算，请把计算移到口径卡的表达式中（可交给助手把纯算术的代码改写为口径卡表达式）。它负责取数还是计算需要由你确认，升级未作修改'
+const R3_NOTE = '报告会直接引用查询单元格。探索运行和已发布级别不受影响；如需按受管级别正式出具，请在成果节点的出具契约中开启「单元格引用」，'
+  + '或改用口径卡：把要写的数字登记为指标，报告只引用指标。选择哪一种需要由你决定，升级未添加出具契约'
 
 /**
  * 伪造的升级接口，形状照 E5-back 的 engine/upgrade.py：一步（fix_id = 规则:节点）的几项改动共用一句 label；
@@ -362,7 +378,7 @@ function upgradeFake(body, { bare = false } = {}) {
     const done = at('done')
     const before = clone(done.data.config.contract)
     done.data.config.contract = { metrics_from: ['caliber'], report_from: 'story', required: ['gmv'], strict: true }
-    step('R1', 'story', '把「写周报」换成报告撰写，出具契约改为核对它的文档', [
+    step('R1', 'story', '将「写周报」换成报告撰写，出具契约改为核对它的文档', [
       { node_id: 'story', node_title: '写周报', field: 'type', before: 'llm', after: 'report' },
       { node_id: 'story', node_title: '写周报', field: 'instructions', before: null, after: instructions },
       { node_id: 'story', node_title: '写周报', field: 'system', before: c.system, after: null },
@@ -380,7 +396,7 @@ function upgradeFake(body, { bare = false } = {}) {
     graph.edges.push({ id: 'fetch:->report', source: 'fetch', target: 'report' }, { id: 'report:->done', source: 'report', target: 'done' })
     const was = clone(done.data.config.fields)
     done.data.config.fields = was.map((f) => ({ ...f, value: '{{ nodes.report.text }}' }))
-    step('R3', 'fetch', '在「取数」和「成果」之间插入报告撰写，出口改取报告的正文', [
+    step('R3', 'fetch', '在「取数」和「成果」之间插入报告撰写，成果节点改为取报告的正文', [
       { node_id: 'report', node_title: '报告撰写', field: 'node', before: null, after: { id: 'report', type: 'report', label: '报告撰写', config } },
       { node_id: null, node_title: '', field: 'edge', before: null, after: { source: 'fetch', target: 'report' } },
       { node_id: null, node_title: '', field: 'edge', before: { source: 'fetch', target: 'done' }, after: { source: 'report', target: 'done' } },
@@ -390,7 +406,7 @@ function upgradeFake(body, { bare = false } = {}) {
   }
   if (fetch?.data.config.output_schema && !fetch.data.config.cite_fields) {
     fetch.data.config.cite_fields = true
-    step('R4', 'fetch', '打开「取数」的按出处核对字段', [
+    step('R4', 'fetch', '开启「取数」的「按出处核对字段」：每个字段都核对到查询结果中的对应单元格', [
       { node_id: 'fetch', node_title: '取数', field: 'cite_fields', before: null, after: true }])
   }
   if (at('calc')) notes.push({ rule: 'R5', node_id: 'calc', level: 'info', text: R5_NOTE })
@@ -444,7 +460,7 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
   // 一键升级的两张图：校验按图现算那条建议（真后端怎么说不影响这几段）
   if (id === 'pf-legacy' || id === 'pf-ask') {
     await page.route(/\/api\/workflows\/validate$/, (route) => state.validate === 'fail'
-      ? json(route, { detail: '校验服务暂时连不上' }, 500)
+      ? json(route, { detail: '校验服务暂时无法连接' }, 500)
       : json(route, { ok: true, issues: advice ? upgradeAdvice(route.request().postDataJSON()?.graph ?? { nodes: [], edges: [] }) : [] }))
   }
   await page.route(/\/api\/copilot\/upgrade-evidence$/, async (route) => {
@@ -470,7 +486,7 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
     if (method === 'PATCH' && !sub && wid === id) {
       const body = req.postDataJSON()
       state.patches.push(body)
-      if (state.save === 'fail') return json(route, { detail: '数据库锁住了，稍后再试' }, 500)
+      if (state.save === 'fail') return json(route, { detail: '数据库已锁定，请稍后重试' }, 500)
       if (state.save === 'slow') await new Promise((r) => setTimeout(r, 1500))
       state.version += 1
       state.graph = body.graph
@@ -551,13 +567,13 @@ await section('打开弹窗就列出问题，每条按修法给控件', async ()
   const rows = await dialog(page).locator('[data-preflight-issue]').count()
   check('问题先列出来，一条一行', rows === 6, `${rows} 行`)
   const summary = await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')
-  check('结论一句：会被拦下 5 处，另有 1 条提示', summary.includes('会被门禁拦下 5 处') && summary.includes('1 条提示'), summary)
+  check('结论一句：5 处问题将被门禁拦截，另有 1 条提示', summary.includes('5 处问题将被门禁拦截') && summary.includes('1 条提示'), summary)
   check('auto 类有「修复」', await dialog(page).locator('[data-fix-kind="auto"] [data-fix-action="auto"]').count() === 3)
   check('choice 类是选择控件：单选用 radio（两张口径卡）、多选用 checkbox（三个指标）', await dialog(page).locator('[data-fix-choice="contract.metrics_from_missing:done"] input[type="radio"]').count() === 2
     && await dialog(page).locator('[data-fix-choice="contract.required_missing:done"] input[type="checkbox"]').count() === 3)
-  check('assist 类有「交给 Copilot」', (await dialog(page).locator('[data-fix-kind="assist"] [data-fix-action="assist"]').innerText()).includes('交给 Copilot'))
+  check('assist 类有「交给助手」', (await dialog(page).locator('[data-fix-kind="assist"] [data-fix-action="assist"]').innerText()).includes('交给助手'))
   const all = await dialog(page).locator('[data-fix-all]').innerText().catch(() => '')
-  check('顶部「一键修复可自动修的 3 处」', all.includes('一键修复可自动修的 3 处'), all)
+  check('顶部「一键修复可自动修复的 3 处」', all.includes('一键修复可自动修复的 3 处'), all)
   check('多选不给默认全选：一个都没勾', await dialog(page).locator('[data-fix-choice="contract.required_missing:done"] input:checked').count() === 0)
   check('单选的建议值只标「建议」，不替人选', await dialog(page).locator('[data-fix-choice="contract.metrics_from_missing:done"] input:checked').count() === 0
     && (await dialog(page).locator('[data-fix-choice="contract.metrics_from_missing:done"]').innerText()).includes('建议'))
@@ -577,11 +593,11 @@ await section('auto：预览逐项写「节点 · 字段：原值 → 新值」�
     ['contract.strict_off:done', 'governed.agent_approval_never:fetch', 'governed.subgraph_unpinned:sub']) && !req?.assist, JSON.stringify(req?.apply))
   const lines = await dialog(page).locator('[data-fix-change]').allInnerTexts()
   const approval = lines.find((l) => l.includes('取数')) ?? ''
-  check('预览：「取数」· 审批策略：全部自动放行 → 仅危险工具需要审批', /「取数」\s*·\s*审批策略：\s*全部自动放行\s*仅危险工具需要审批/.test(approval.replace(/\n.*$/s, '')), approval)
+  check('预览：「取数」· 审批策略：全部无需审批 → 仅危险工具需要审批', /「取数」\s*·\s*审批策略：\s*全部无需审批\s*仅危险工具需要审批/.test(approval.replace(/\n.*$/s, '')), approval)
   const strict = lines.find((l) => l.includes('严格模式')) ?? ''
   check('预览：契约里的键用界面叫法（出具契约 · 严格模式：否 → 是）', /出具契约 · 严格模式：\s*否\s*是/.test(strict), strict)
   const rejected = await dialog(page).locator('[data-fix-rejected]').innerText().catch(() => '')
-  check('没采用的写出原因', rejected.includes('钉不上') && rejected.includes('钉到它最新的已发布版本'), rejected)
+  check('没采用的写出原因', rejected.includes('无法自动固定版本') && rejected.includes('固定到上游当前的发布版本'), rejected)
   check('预览期间发布按钮不可用（先应用或放弃）', await submit(page).isDisabled())
   check('预览不改画布、不保存', state.patches.length === 0
     && await page.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'fetch').data.config.approval) === 'never')
@@ -614,7 +630,7 @@ await section('auto：修完没有错了，发布按钮才可用；发布只在�
   await dialog(page).locator('[data-fix-all]').click()
   await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
   const after = await dialog(page).locator('[data-fix-after-check]').innerText().catch(() => '')
-  check('预览写明应用后门禁不再拦', after.includes('不再拦'), after)
+  check('预览写明应用后可通过门禁', after.includes('应用后可通过门禁'), after)
   check('预览期间发布不可用', await submit(page).isDisabled())
   await dialog(page).locator('[data-fix-apply]').click()
   await waitFor(page, async () => state.checks.length === 3 && await dialog(page).locator('[data-fix-preview]').count() === 0)
@@ -632,7 +648,7 @@ await section('choice：没选之前不能应用；选了之后载荷里是选�
   await openDialog(page)
   const req = dialog(page).locator('[data-fix-choice="contract.required_missing:done"]')
   await req.waitFor()
-  check('没选时「预览」不可用，并说先选', await req.locator('[data-fix-action="choice"]').isDisabled() && (await req.innerText()).includes('先选好再预览'))
+  check('没选时「预览」不可用，并说先选', await req.locator('[data-fix-action="choice"]').isDisabled() && (await req.innerText()).includes('请先选择再预览'))
   await req.locator('label:has-text("gmv") input').check()
   await req.locator('label:has-text("orders") input').check()
   check('选了之后可以预览', await req.locator('[data-fix-action="choice"]').isEnabled())
@@ -690,7 +706,7 @@ await section('保存失败、接口不存在、画布改过：都有明确状�
   await dialog(bad.page).locator('[data-fix-apply]').click()
   await dialog(bad.page).locator('[data-fix-save-failed]').waitFor()
   const msg = await dialog(bad.page).locator('[data-fix-save-failed]').innerText()
-  check('保存失败：说清没存上、修复已在画布上', msg.includes('草稿没保存上') && msg.includes('数据库锁住了') && msg.includes('保存成功之前不能发布'), msg)
+  check('保存失败：说清没存上、修复已在画布上', msg.includes('草稿保存失败') && msg.includes('数据库已锁定') && msg.includes('保存成功前无法发布'), msg)
   check('……发布按钮不可用（不能把没修的那一版发出去）', await submit(bad.page).isDisabled())
   check('……不重查', bad.state.checks.length === 1)
   bad.state.save = 'ok'
@@ -702,7 +718,7 @@ await section('保存失败、接口不存在、画布改过：都有明确状�
   await openDialog(nofix.page)
   await dialog(nofix.page).locator('[data-fix-all]').click()
   await dialog(nofix.page).locator('[data-fix-preview="unsupported"]').waitFor()
-  check('autofix 不存在：说这个后端还不支持自动修复', (await dialog(nofix.page).locator('[data-fix-preview]').innerText()).includes('还不支持自动修复'))
+  check('autofix 不存在：说当前服务版本不支持自动修复', (await dialog(nofix.page).locator('[data-fix-preview]').innerText()).includes('当前服务版本不支持自动修复'))
   check('……发布按钮照旧可用', await submit(nofix.page).isEnabled())
 
   const moved = await open({ id: 'pf-easy' })
@@ -713,7 +729,7 @@ await section('保存失败、接口不存在、画布改过：都有明确状�
   await dialog(moved.page).locator('[data-fix-apply]').click()
   await moved.page.waitForTimeout(300)
   check('预览之后画布内容又改过：不套用、说要重查', moved.state.patches.length === 0
-    && (await dialog(moved.page).locator('[data-fix-preview]').innerText()).includes('对不上了'))
+    && (await dialog(moved.page).locator('[data-fix-preview]').innerText()).includes('此预览已失效'))
 })
 
 await section('正式运行编辑锁定时不给修复按钮', async () => {
@@ -735,12 +751,12 @@ await section('老后端（两个接口 404）：界面和现在一样', async (
   await waitFor(page, async () => state.checks.length === 1)
   await page.waitForTimeout(300)
   check('打开时不列问题、不给修复控件', await dialog(page).locator('[data-preflight-issue], [data-fix-action], [data-fix-all]').count() === 0)
-  check('只一句安静的说明：点发布时门禁照旧检查', (await dialog(page).locator('[data-preflight-unsupported]').innerText().catch(() => '')).includes('门禁照旧检查'))
+  check('只一句安静的说明：点发布时仍会执行门禁检查', (await dialog(page).locator('[data-preflight-unsupported]').innerText().catch(() => '')).includes('仍会执行门禁检查'))
   check('发布按钮可用', await submit(page).isEnabled())
   await submit(page).click()
   await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue]').count()) > 0)
   const summary = await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')
-  check('点了发布被拦：照旧列出门禁拦下的问题', summary.includes('门禁拦下了 5 处') && await dialog(page).locator('[data-preflight-issue]').count() === 6, summary)
+  check('点了发布被拦：照旧列出门禁拦截的问题', summary.includes('门禁拦截了 5 处问题') && await dialog(page).locator('[data-preflight-issue]').count() === 6, summary)
   check('……仍然没有修复控件', await dialog(page).locator('[data-fix-action], [data-fix-all]').count() === 0)
   await dialog(page).locator('[data-preflight-issue]').filter({ hasText: '取数' }).locator('button').first().click()
   await page.waitForTimeout(300)
@@ -796,7 +812,7 @@ await section('同一个修复只画一次：validate 和门禁各报一条、�
   check('同 code、同节点的两条合成一行', rows === 3
     && await dialog(page).locator('[data-preflight-issue="contract.metrics_from_missing"]').count() === 1, `${rows} 行`)
   const summary = await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')
-  check('……结论按一处算：会被门禁拦下 3 处', summary.includes('会被门禁拦下 3 处'), summary)
+  check('……结论按一处算：3 处问题将被门禁拦截', summary.includes('3 处问题将被门禁拦截'), summary)
   const choice = dialog(page).locator('[data-fix-choice="contract.metrics_from_missing:done"]')
   check('契约那一处只有一组选项、一个「预览」', await choice.count() === 1 && await choice.locator('[data-fix-action]').count() === 1)
   const follow = dialog(page).locator('[data-preflight-issue="governed.default_approval_never"]')
@@ -807,15 +823,15 @@ await section('同一个修复只画一次：validate 和门禁各报一条、�
   await dialog(page).locator('[data-fix-all]').click()
   await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
   const line = await dialog(page).locator('[data-fix-change]').first().innerText().catch(() => '')
-  check('图级改动的预览：「整张工作流」 · 全图默认 · 审批策略：全部自动放行 → 仅危险工具需要审批',
-    /「整张工作流」\s*·\s*全图默认 · 审批策略：\s*全部自动放行\s*仅危险工具需要审批/.test(line), line)
+  check('图级改动的预览：「整个工作流」 · 工作流默认设置 · 审批策略：全部无需审批 → 仅危险工具需要审批',
+    /「整个工作流」\s*·\s*工作流默认设置 · 审批策略：\s*全部无需审批\s*仅危险工具需要审批/.test(line), line)
   await dialog(page).getByRole('button', { name: '放弃', exact: true }).click()
   // 真点了发布被拦：/publish 的回包只有 code 没有 fix。图级修复按 code 认回来，照样只画一次
   await submit(page).click()
   await waitFor(page, async () => state.publishes.length === 1
-    && (await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')).includes('门禁拦下了'))
+    && (await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')).includes('门禁拦截了'))
   const gateSummary = await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')
-  check('被拦之后：照样合成一行（门禁拦下了 3 处）', gateSummary.includes('门禁拦下了 3 处')
+  check('被拦之后：照样合成一行（门禁拦截了 3 处问题）', gateSummary.includes('门禁拦截了 3 处问题')
     && await dialog(page).locator('[data-preflight-issue]').count() === 3, gateSummary)
   check('……图级修复（回包里没有 fix）照样挂在第一条上，只画一次', await follow.nth(0).locator('[data-fix-action="auto"]').count() === 1
     && await dialog(page).locator('[data-fix-action="auto"]').count() === 1)
@@ -841,7 +857,7 @@ await section('图级问题：契约骨架按键写节点名；发布被拦之�
   await dialog(page).getByRole('button', { name: '放弃', exact: true }).click()
   await submit(page).click()
   await waitFor(page, async () => state.publishes.length === 1
-    && (await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')).includes('门禁拦下了'))
+    && (await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')).includes('门禁拦截了'))
   const gate = dialog(page).locator('[data-preflight-issue="governed.no_contract"]')
   check('发布被拦（回包只有 code 没有 fix）：图级问题旁边照样有生成契约骨架的选项', state.publishes.length === 1
     && await gate.locator('[data-fix-choice="governed.no_contract:done"]').count() === 1)
@@ -887,10 +903,10 @@ await section('保存进行中不能换等级；存失败之后换了等级也�
   await waitFor(bad.page, async () => bad.state.checks.length === 2)
   await bad.page.waitForTimeout(250)
   check('存失败之后换了等级：说明和「重试保存」都还在', await dialog(bad.page).locator('[data-fix-save-failed]').count() === 1
-    && (await dialog(bad.page).locator('[data-fix-save-failed]').innerText().catch(() => '')).includes('草稿没保存上')
+    && (await dialog(bad.page).locator('[data-fix-save-failed]').innerText().catch(() => '')).includes('草稿保存失败')
     && await dialog(bad.page).getByRole('button', { name: '重试保存' }).count() === 1)
-  check('……发布照旧不可用，说的是修复还没保存上', await submit(bad.page).isDisabled()
-    && await submit(bad.page).getAttribute('title') === '修复还没保存上', await submit(bad.page).getAttribute('title'))
+  check('……发布照旧不可用，说的是修复尚未保存', await submit(bad.page).isDisabled()
+    && await submit(bad.page).getAttribute('title') === '修复尚未保存', await submit(bad.page).getAttribute('title'))
   bad.state.save = 'ok'
   await dialog(bad.page).getByRole('button', { name: '重试保存' }).click()
   await waitFor(bad.page, async () => bad.state.checks.length === 3 && await submit(bad.page).isEnabled())
@@ -900,13 +916,13 @@ await section('保存进行中不能换等级；存失败之后换了等级也�
 
 await section('保存和页面自己的保存同一套规矩：回滚说明保留、画布锁着不存', async () => {
   const { page, state } = await open({ id: 'pf-easy' })
-  // 刚从版本历史恢复了旧版本：页面自己的保存会把「回滚到 v2」写进版本说明
-  await page.evaluate(() => window.__studio.setState({ pendingNote: '回滚到 v2' }))
+  // 刚从版本历史恢复了旧版本：页面自己的保存会把「恢复到 v2」写进版本说明
+  await page.evaluate(() => window.__studio.setState({ pendingNote: '恢复到 v2' }))
   await openDialog(page)
   await dialog(page).locator('[data-fix-all]').click()
   await dialog(page).locator('[data-fix-apply]').click()
   await waitFor(page, async () => state.patches.length === 1)
-  check('版本说明保留「回滚到 v2」，后面接着写发布前修复', /^回滚到 v2；发布前修复：/.test(state.patches[0]?.note ?? ''), state.patches[0]?.note)
+  check('版本说明保留「恢复到 v2」，后面接着写发布前修复', /^恢复到 v2；发布前修复：/.test(state.patches[0]?.note ?? ''), state.patches[0]?.note)
 
   const bad = await open({ id: 'pf-easy', save: 'fail' })
   await openDialog(bad.page)
@@ -976,31 +992,32 @@ await section('choice 里选「交给 Copilot」：请求带 assist、等待时�
   const g1 = dialog(page).locator('[data-fix-choice="governed.exit_text_source:done"]')
   await g4.waitFor()
   check('两个 choice 都画出来了', await g1.count() === 1)
-  check('没选之前，按钮不是「交给 Copilot」的样子', await g4.locator('[data-fix-handoff]').count() === 0)
-  await g4.getByText('它在做计算', { exact: false }).click()
+  check('没选之前，按钮不是「交给助手」的样子', await g4.locator('[data-fix-handoff]').count() === 0)
+  // 问句（「它负责取数，还是负责计算？」）里也有「负责计算」：带上冒号，只认候选那一项
+  await g4.getByText('负责计算：', { exact: false }).click()
   const button = g4.locator('[data-fix-action="choice"]')
-  check('选了「交给 Copilot」那一项，按钮换成「交给 Copilot」', await button.getAttribute('data-fix-handoff') === ''
-    && (await button.innerText()).includes('交给 Copilot'), await button.innerText())
+  check('选了「交给助手」那一项，按钮换成「交给助手」', await button.getAttribute('data-fix-handoff') === ''
+    && (await button.innerText()).includes('交给助手'), await button.innerText())
   await button.click()
   const loading = dialog(page).locator('[data-fix-preview="loading"]')
   await loading.waitFor()
-  check('等待时写「Copilot 正在试着修」，不是「正在生成修复预览」', (await loading.innerText()).includes('Copilot 正在试着修'), await loading.innerText())
+  check('等待时写「助手正在尝试修复」，不是「正在生成修复预览」', (await loading.innerText()).includes('助手正在尝试修复'), await loading.innerText())
   const body = state.autofixes.at(-1)
   check('请求带 assist: true，选的值原样带上', body?.assist === true && body?.choices?.['governed.caliber_compute_input:calc'] === 'copilot'
     && JSON.stringify(body?.apply) === JSON.stringify(['governed.caliber_compute_input:calc']), JSON.stringify(body))
   await dialog(page).locator('[data-fix-preview="ready"], [data-fix-preview]:not([data-fix-preview="loading"])').first().waitFor()
-  check('Copilot 的总结摆出来了', await waitFor(page, async () => (await dialog(page).locator('[data-fix-assist]').count()) > 0))
+  check('助手的总结摆出来了', await waitFor(page, async () => (await dialog(page).locator('[data-fix-assist]').count()) > 0))
   await shoot(page, 'publish-dialog-handoff', dialog(page))
 
-  // 另一个 choice：唯一的候选是 id 叫 copilot 的报告撰写节点——普通候选，不交给 Copilot
+  // 另一个 choice：唯一的候选是 id 叫 copilot 的报告撰写节点——普通候选，不交给助手
   const { page: page2, state: state2, errors: errors2 } = await open({ id: 'pf-handoff', fixDelay: 1200 })
   await openDialog(page2)
   const exit = dialog(page2).locator('[data-fix-choice="governed.exit_text_source:done"]')
   await exit.waitFor()
   await exit.locator('input[type="radio"]').first().check()
   const pick = exit.locator('[data-fix-action="choice"]')
-  check('选了 id 叫 copilot 的报告：按钮不变成「交给 Copilot」', await pick.getAttribute('data-fix-handoff') === null
-    && !(await pick.innerText()).includes('交给 Copilot'), await pick.innerText())
+  check('选了 id 叫 copilot 的报告：按钮不变成「交给助手」', await pick.getAttribute('data-fix-handoff') === null
+    && !(await pick.innerText()).includes('交给助手'), await pick.innerText())
   await pick.click()
   const wait2 = dialog(page2).locator('[data-fix-preview="loading"]')
   await wait2.waitFor()
@@ -1047,7 +1064,7 @@ await section('升级：建议不算问题，问题面板给快速修复；预�
   const action = upgradeBox(page).locator('[data-upgrade-action]')
   check('快速修复写「升级为可追溯结构（预览改动）」', flat(await action.innerText().catch(() => '')) === '升级为可追溯结构（预览改动）',
     await action.innerText().catch(() => ''))
-  check('……「没有发现问题」照样说', (await dock(page).innerText()).includes('没有发现问题'))
+  check('……「未发现问题」照样说', (await dock(page).innerText()).includes('未发现问题'))
   check('还没点之前不请求升级接口', state.upgrades.length === 0)
   await action.click()
   await page.locator('#dock-problems [data-upgrade-preview="ready"]').waitFor()
@@ -1060,7 +1077,7 @@ await section('升级：建议不算问题，问题面板给快速修复；预�
     && flat(await preview(page).locator('[data-upgrade-change="type"] [data-upgrade-before]').innerText()) === '模型调用'
     && flat(await preview(page).locator('[data-upgrade-change="type"] [data-upgrade-after]').innerText()) === '报告撰写', typeRow)
   const r1 = flat(await preview(page).locator('[data-upgrade-step="R1"] [data-upgrade-step-label]').innerText().catch(() => ''))
-  check('同一步的几项改动放在一组，规则（R1）和这一步的说明只写一次', r1 === 'R1 把「写周报」换成报告撰写，出具契约改为核对它的文档'
+  check('同一步的几项改动放在一组，规则（R1）和这一步的说明只写一次', r1 === 'R1 将「写周报」换成报告撰写，出具契约改为核对它的文档'
     && await preview(page).locator('[data-upgrade-step="R1"] [data-upgrade-change]').count() === 5
     && !(await preview(page).locator('[data-upgrade-step="R1"] ul').innerText()).includes('出具契约改为核对它的文档'), r1)
   const rows = (await preview(page).locator('[data-upgrade-change]').allInnerTexts()).map(flat)
@@ -1074,11 +1091,11 @@ await section('升级：建议不算问题，问题面板给快速修复；预�
   const prompt = rows.find((r) => r.includes('按口径写本周周报') && !r.includes('写作要求')) ?? ''
   check('……换掉类型时去掉的，按原来的叫法念（用户提示：… → （空））', /「写周报」 · 用户提示：\s*按口径写本周周报\s*（空）/.test(prompt), prompt)
   check('一共 6 处改动，标题写着', flat(await preview(page).locator('.font-medium').first().innerText()) === '升级预览 · 6 处改动')
-  check('合计：1 个节点换了类型、改了 2 个节点的配置', flat(await preview(page).locator('[data-upgrade-summary]').innerText().catch(() => ''))
-    === '合计：1 个节点换了类型、改了 2 个节点的配置')
+  check('合计：1 个节点变更了类型、修改了 2 个节点的配置', flat(await preview(page).locator('[data-upgrade-summary]').innerText().catch(() => ''))
+    === '合计：1 个节点变更了类型、修改了 2 个节点的配置')
   const note = await preview(page).locator('[data-upgrade-note="R5"] [data-upgrade-note-text]').innerText().catch(() => '')
   check('说明原样显示（R5：代码节点要不要标 source，等人确认）', note === R5_NOTE && await preview(page).locator('[data-upgrade-note]').count() === 1, note)
-  check('升级后没有新的错误：照实说', flat(await preview(page).locator('[data-upgrade-after-check]').innerText().catch(() => '')) === '升级后校验和门禁都没有新的错误')
+  check('升级后没有新的错误：照实说', flat(await preview(page).locator('[data-upgrade-after-check]').innerText().catch(() => '')) === '升级后校验和门禁均无新的错误')
   check('预览不改画布、不保存', state.patches.length === 0
     && await page.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'story').data.nodeType) === 'llm')
   check('预览开着时快速修复按钮收起（不重复开）', await upgradeBox(page).locator('[data-upgrade-action]').count() === 0)
@@ -1098,7 +1115,7 @@ await section('升级：建议不算问题，问题面板给快速修复；预�
 
 await section('升级：应用走现有的保存，全图默认不丢，节点类型真的换了', async () => {
   const { page, state, errors } = await open({ id: 'pf-legacy' })
-  await page.evaluate(() => window.__studio.setState({ pendingNote: '回滚到 v2' }))
+  await page.evaluate(() => window.__studio.setState({ pendingNote: '恢复到 v2' }))
   await openProblems(page)
   await upgradeBox(page).locator('[data-upgrade-action]').click()
   await page.locator('[data-upgrade-preview="ready"]').waitFor()
@@ -1113,7 +1130,7 @@ await section('升级：应用走现有的保存，全图默认不丢，节点�
   check('……全图默认原样带着（画布只管节点和连线，保存照样不能丢）', JSON.stringify(saved?.defaults) === JSON.stringify(LEGACY.defaults),
     JSON.stringify(saved?.defaults ?? null))
   check('……节点和连线一个没少', saved?.nodes?.length === LEGACY.nodes.length && saved?.edges?.length === LEGACY.edges.length)
-  check('版本说明：「回滚到 v2」保留，后面接着写升级', state.patches[0]?.note === '回滚到 v2；升级为可追溯结构', state.patches[0]?.note)
+  check('版本说明：「恢复到 v2」保留，后面接着写升级', state.patches[0]?.note === '恢复到 v2；升级为可追溯结构', state.patches[0]?.note)
   const st = await page.evaluate(() => {
     const s = window.__studio.getState()
     return { type: s.nodes.find((n) => n.id === 'story').data.nodeType, dirty: s.dirty, label: s.past.at(-1)?.label, v: s.workflow.version,
@@ -1125,7 +1142,7 @@ await section('升级：应用走现有的保存，全图默认不丢，节点�
   check('重新校验之后建议没了，入口跟着收起', await upgradeBox(page).count() === 0)
   check('只存了一次，没有发布', state.patches.length === 1 && state.publishes.length === 0)
   const toasts = (await page.locator('[data-toast], [role=status]').allInnerTexts()).join(' ')
-  check('提示存成了哪一版', toasts.includes('已升级为可追溯结构，存为草稿 v4'), toasts.slice(0, 160))
+  check('提示存成了哪一版', toasts.includes('已升级为可追溯结构，保存为草稿 v4'), toasts.slice(0, 160))
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 
@@ -1145,8 +1162,8 @@ await section('升级：问数据的图插入报告节点、改接连线；后�
   check('成果字段整列改：一项一行（answer：… → answer：{{ nodes.report.text }}）', /^「成果」 · 成果字段：\s*answer：\{\{ nodes\.fetch\.text \}\}\s*answer：\{\{ nodes\.report\.text \}\}$/.test(field), field)
   const note = await preview(page).locator('[data-upgrade-note="R3"] [data-upgrade-note-text]').innerText().catch(() => '')
   check('R3 的说明（契约要不要写 cells 由人定）原样显示', note === R3_NOTE, note)
-  check('合计：新增 1 个节点、改了 1 个节点的配置、连线变动 3 处', flat(await preview(page).locator('[data-upgrade-summary]').innerText().catch(() => ''))
-    === '合计：新增 1 个节点、改了 1 个节点的配置、连线变动 3 处')
+  check('合计：新增 1 个节点、修改了 1 个节点的配置、连线变动 3 处', flat(await preview(page).locator('[data-upgrade-summary]').innerText().catch(() => ''))
+    === '合计：新增 1 个节点、修改了 1 个节点的配置、连线变动 3 处')
   await shoot(page, 'upgrade-preview-ask', page.locator('section[aria-label="问题"]'))
   await preview(page).locator('[data-upgrade-apply]').click()
   await waitFor(page, async () => state.patches.length === 1)
@@ -1185,9 +1202,9 @@ await section('升级：画布锁着不给入口；预览摆着时锁上，应�
   await page.locator('[data-upgrade-preview="ready"]').waitFor()
   await page.evaluate(() => window.__studio.setState({ copilot: { ...window.__studio.getState().copilot, active: true } }))
   await page.waitForTimeout(200)
-  check('助手在改时：预览还在，但没有「应用」和「交给 Copilot」', await preview(page).count() === 1
+  check('助手在改时：预览还在，但没有「应用」和「交给助手改写计算逻辑」', await preview(page).count() === 1
     && await preview(page).locator('[data-upgrade-apply], [data-upgrade-assist]').count() === 0
-    && flat(await upgradeBox(page).locator('[data-upgrade-locked]').innerText().catch(() => '')).includes('助手正在改'))
+    && flat(await upgradeBox(page).locator('[data-upgrade-locked]').innerText().catch(() => '')).includes('助手正在修改此工作流'))
   const ok = await page.evaluate(() => window.__studio.getState().applyUpgrade())
   check('锁着时直接调应用也落不下去、不保存', ok === false && state.patches.length === 0
     && await page.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'story').data.nodeType) === 'llm')
@@ -1197,15 +1214,15 @@ await section('升级：老后端（校验不给这条建议）不给入口；�
   const { page, state } = await open({ id: 'pf-legacy', advice: false })
   await openProblems(page)
   await page.waitForTimeout(600)
-  check('没有这条建议：问题面板里没有升级入口', await upgradeBox(page).count() === 0 && (await dock(page).innerText()).includes('没有发现问题'))
+  check('没有这条建议：问题面板里没有升级入口', await upgradeBox(page).count() === 0 && (await dock(page).innerText()).includes('未发现问题'))
   check('……也不去请求升级接口', state.upgrades.length === 0)
 
   const old = await open({ id: 'pf-legacy', upgrade: 'old' })
   await openProblems(old.page)
   await upgradeBox(old.page).locator('[data-upgrade-action]').click()
   await old.page.locator('#dock-problems [data-upgrade-preview]:not([data-upgrade-preview="loading"])').waitFor()
-  check('升级接口不存在（404）：照实说这个后端还不支持', await preview(old.page).getAttribute('data-upgrade-preview') === 'unsupported'
-    && flat(await preview(old.page).innerText()).includes('这个后端还不支持一键升级'), await preview(old.page).innerText())
+  check('升级接口不存在（404）：照实说当前服务版本不支持', await preview(old.page).getAttribute('data-upgrade-preview') === 'unsupported'
+    && flat(await preview(old.page).innerText()).includes('当前服务版本不支持一键升级'), await preview(old.page).innerText())
   check('……没有应用按钮、不保存', await preview(old.page).locator('[data-upgrade-apply]').count() === 0 && old.state.patches.length === 0)
 })
 
@@ -1215,20 +1232,20 @@ await section('升级：再交给 Copilot 改语义层：请求带 assist，保�
   await upgradeBox(page).locator('[data-upgrade-action]').click()
   await page.locator('[data-upgrade-preview="ready"]').waitFor()
   const btn = preview(page).locator('[data-upgrade-assist]')
-  check('预览里有「再交给 Copilot 改语义层」，悬停说清它改什么、要调模型', flat(await btn.innerText()) === '再交给 Copilot 改语义层'
+  check('预览里有「交给助手改写计算逻辑」，悬停说清它改什么、要调模型', flat(await btn.innerText()) === '交给助手改写计算逻辑'
     && (await btn.getAttribute('title') ?? '').includes('纯算术'))
   await btn.click()
   const loading = page.locator('[data-upgrade-preview="loading"]')
   await loading.waitFor()
-  check('等待时说 Copilot 在改', flat(await loading.innerText()).includes('Copilot 正在改语义层'))
+  check('等待时说助手在改', flat(await loading.innerText()).includes('助手正在把代码节点中的计算改写为口径卡表达式'))
   check('请求带复核用的发布级别：已发布的图按「已发布」', state.upgrades[0]?.level === 'published', JSON.stringify(state.upgrades[0]?.level))
   check('第二次请求带 assist: true、带的还是画布上的原图', state.upgrades.length === 2 && state.upgrades[1]?.assist === true
     && state.upgrades[1]?.graph?.nodes?.find((n) => n.id === 'story')?.type === 'llm', JSON.stringify(state.upgrades.map((u) => u.assist ?? null)))
   await page.locator('[data-upgrade-preview="ready"]').waitFor()
   const said = flat(await preview(page).locator('[data-upgrade-assist-said]').innerText().catch(() => ''))
-  check('Copilot 的总结和保留没改的代码节点写出来', said.includes('不是纯算术') && said.includes('保留没改的')
+  check('助手的总结和未修改的代码节点写出来', said.includes('不是纯算术') && said.includes('未修改的节点')
     && said.includes('没有改成口径卡表达式'), said)
-  check('已经是 Copilot 的结果：不再给「再交给 Copilot」', await preview(page).locator('[data-upgrade-assist]').count() === 0)
+  check('已经是助手的结果：不再给「交给助手改写计算逻辑」', await preview(page).locator('[data-upgrade-assist]').count() === 0)
   await preview(page).locator('[data-upgrade-assist-said]').scrollIntoViewIfNeeded().catch(() => {})
   await shoot(page, 'upgrade-preview-assist', page.locator('section[aria-label="问题"]'))
   // 受管的图：新写出来的报告节点要直接按受管门禁的要求配，请求带 governed
@@ -1262,8 +1279,8 @@ await section('升级：预览之后画布又改过就不套用；存失败给�
   await preview(bad.page).locator('[data-upgrade-apply]').click()
   await preview(bad.page).locator('[data-upgrade-save-failed]').waitFor().catch(() => {})
   const why = flat(await preview(bad.page).locator('[data-upgrade-save-failed]').innerText({ timeout: 1000 }).catch(() => ''))
-  check('存失败：说清没存上、升级已经在画布上，给「重试保存」', why.includes('草稿没保存上') && why.includes('数据库锁住了')
-    && why.includes('已经放到画布上') && await bad.page.evaluate(() => window.__studio.getState().dirty), why)
+  check('存失败：说清没存上、升级已经在画布上，给「重试保存」', why.includes('草稿保存失败') && why.includes('数据库已锁定')
+    && why.includes('已应用到画布') && await bad.page.evaluate(() => window.__studio.getState().dirty), why)
   bad.state.save = 'ok'
   await preview(bad.page).getByRole('button', { name: '重试保存' }).click({ timeout: 2000 }).catch(() => {})
   await waitFor(bad.page, async () => bad.state.patches.length === 2 && await preview(bad.page).count() === 0)
@@ -1291,14 +1308,14 @@ await section('升级：没存上之后——平常的保存存上了就收起�
 
   // 一、平常的保存（⌘S、工具栏的「保存」都走 studio.save）
   const a = await failedApply()
-  check('起点：存失败，面板写着「草稿没保存上」', await preview(a.page).locator('[data-upgrade-save-failed]').count() === 1 && a.state.patches.length === 1,
+  check('起点：存失败，面板写着「草稿保存失败」', await preview(a.page).locator('[data-upgrade-save-failed]').count() === 1 && a.state.patches.length === 1,
     `${await upOf(a.page)} patches=${a.state.patches.length}`)
   const saved = await a.page.evaluate(async () => {
     window.__p5up = window.__studio.getState().upgrade
     try { await window.__studio.getState().save(); return 'ok' } catch (e) { return String(e) }
   })
   await waitFor(a.page, async () => await dock(a.page).locator('[data-upgrade-save-failed]').count() === 0, 3000)
-  check('平常的保存存上了：「草稿没保存上」收起，升级的状态清掉', saved === 'ok' && a.state.patches.length === 2
+  check('平常的保存存上了：「草稿保存失败」收起，升级的状态清掉', saved === 'ok' && a.state.patches.length === 2
     && await dock(a.page).locator('[data-upgrade-save-failed]').count() === 0 && await upOf(a.page) === null,
   `${saved} ${await upOf(a.page)} patches=${a.state.patches.length}`)
   check('……存的是画布上升级完的图，版本说明没冒充「升级为可追溯结构」', a.state.patches[1]?.graph?.nodes?.find((n) => n.id === 'story')?.type === 'report'
@@ -1306,7 +1323,7 @@ await section('升级：没存上之后——平常的保存存上了就收起�
   const variants = await a.page.evaluate(async () => {
     const st = window.__studio
     const base = window.__p5up
-    st.setState({ upgrade: { ...base, apply: { status: 'locked', why: '助手正在改这张工作流', unsaved: true } } })
+    st.setState({ upgrade: { ...base, apply: { status: 'locked', why: '助手正在修改此工作流，请等待完成或先停止助手', unsaved: true } } })
     await st.getState().save()
     const locked = st.getState().upgrade
     st.setState({ upgrade: { ...base, apply: undefined } })
@@ -1325,7 +1342,7 @@ await section('升级：没存上之后——平常的保存存上了就收起�
   await preview(b.page).getByRole('button', { name: '重试保存' }).click({ timeout: 2000 }).catch(() => {})
   await b.page.waitForTimeout(500)
   check('画布内容和升级结果对不上：点「重试保存」不发保存请求', b.state.patches.length === 1, `patches=${b.state.patches.length}`)
-  check('……改说这份预览对不上了（给「重新预览」），不再说「草稿没保存上」', await preview(b.page).locator('[data-upgrade-stale]').count() === 1
+  check('……改说此预览已失效（给「重新预览」），不再说「草稿保存失败」', await preview(b.page).locator('[data-upgrade-stale]').count() === 1
     && await preview(b.page).locator('[data-upgrade-save-failed]').count() === 0, String(await upOf(b.page)))
   // 重做回升级完的样子、再改一处：画布上有升级，但也有升级之外的改动，同样不替它存
   const direct = await b.page.evaluate(async () => {
@@ -1347,7 +1364,7 @@ await section('升级：没存上之后——平常的保存存上了就收起�
     && await preview(c.page).locator('[data-upgrade-save-failed]').getByRole('button', { name: '重试保存' }).count() === 1)
   await c.page.evaluate(() => {
     const u = window.__studio.getState().upgrade
-    window.__studio.setState({ upgrade: { ...u, apply: { status: 'locked', why: '助手正在改这张工作流', unsaved: true } } })
+    window.__studio.setState({ upgrade: { ...u, apply: { status: 'locked', why: '助手正在修改此工作流，请等待完成或先停止助手', unsaved: true } } })
   })
   check('……锁着没存上时同样有「放弃」', await preview(c.page).locator('[data-upgrade-save-failed="locked"] [data-upgrade-discard]').count() === 1)
   await drop.click({ timeout: 2000 }).catch(() => {})
@@ -1383,7 +1400,7 @@ await section('升级：校验接口失败时升级块照样在（后端断开�
   await preview(page).locator('[data-upgrade-apply]').click()
   await preview(page).locator('[data-upgrade-save-failed]').waitFor({ timeout: 3000 }).catch(() => {})
   await waitFor(page, async () => page.evaluate(() => window.__studio.getState().analysis === 'failed'), 3000)
-  check('保存和校验一起失败：「草稿没保存上」「重试保存」「放弃」照样在', await page.evaluate(() => window.__studio.getState().analysis) === 'failed'
+  check('保存和校验一起失败：「草稿保存失败」「重试保存」「放弃」照样在', await page.evaluate(() => window.__studio.getState().analysis) === 'failed'
     && await preview(page).locator('[data-upgrade-save-failed]').count() === 1
     && await preview(page).locator('[data-upgrade-save-failed]').getByRole('button', { name: '重试保存' }).count() === 1
     && await preview(page).locator('[data-upgrade-save-failed] [data-upgrade-discard]').count() === 1

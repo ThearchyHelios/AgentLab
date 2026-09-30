@@ -144,7 +144,7 @@ const PARALLEL = [
   ev(3, 'node.finished', 'start', { duration_ms: 12, preview: { q: 'x' } }, 0.3),
   ev(4, 'node.started', 'team', { node_type: 'supervisor' }, 0.5),
   ev(5, 'log', 'team', { level: 'info', round: 0, agents: ['检索员', '分析员', '撰写员'], done: false,
-    parallel: 3, reason: '三个方向互不依赖', message: '调度 → 检索员、分析员、撰写员 · 3 人同时进行' }, 3),
+    parallel: 3, reason: '三个方向互不依赖', message: '调度 → 检索员、分析员、撰写员 · 3 名成员同时执行' }, 3),
   ev(6, 'agent.step.start', 'team', { agent: '检索员', instruction: '把资料找全', round: 0, parallel: 3 }, 3.1),
   ev(7, 'agent.step.start', 'team', { agent: '分析员', instruction: '交叉验证', round: 0, parallel: 3 }, 3.2),
   ev(8, 'agent.step.start', 'team', { agent: '撰写员', instruction: '写成结论', round: 0, parallel: 3 }, 3.3),
@@ -479,8 +479,8 @@ await section('等人：入边闸门，不流光点；去审批代替停止', as
   // 描边、滚动都不能拿来判断——右栏接手时自己也描同一圈、滚到同一张卡
   await page.waitForTimeout(600)
   const lookups = await page.evaluate(() => { window.__restoreQuery(); return window.__slotLookups })
-  check('右栏接手之后胶囊不再自己找卡片、不报「还没出现」', lookups === 0
-    && !(await page.locator('[aria-live]').allInnerTexts()).join('').includes('审批卡还没出现'), `整页找了 ${lookups} 次`)
+  check('右栏接手之后胶囊不再自己找卡片、不报「尚未显示」', lookups === 0
+    && !(await page.locator('[aria-live]').allInnerTexts()).join('').includes('审批卡尚未显示'), `整页找了 ${lookups} 次`)
 
   // F：在需要处理的队列里逐个定位
   await page.evaluate(() => window.__studio.setState({ focusRequest: null }))
@@ -502,7 +502,7 @@ await section('等人：入边闸门，不流光点；去审批代替停止', as
   const ask = page.getByRole('dialog').filter({ hasText: '放弃这次运行？' })
   await ask.waitFor({ timeout: 3000 }).catch(() => {})
   const askText = (await ask.innerText().catch(() => '')).replace(/\s+/g, ' ')
-  check('放弃之前先问一句，写清后果', askText.includes('审批卡一并关闭') && cancels === 0, askText.slice(0, 80))
+  check('放弃之前先问一句，写清后果', askText.includes('审批卡将一并关闭') && cancels === 0, askText.slice(0, 80))
   await ask.getByRole('button', { name: '放弃这次运行' }).click().catch(() => {})
   await until(async () => cancels === 1, { timeout: 2000 })
   check('确认后才调 /cancel', cancels === 1, String(cancels))
@@ -538,8 +538,8 @@ await section('等人：同一刻的等待时长各处同一个数', async () =>
       header: txt(document.querySelector('.tl-alert.is-warn')),
       headline: txt(document.querySelector('.sf-hud-line')),
       queue: txt(document.querySelector('.sf-queue-item.is-waiting .sf-dim')),
-      metric: find('.sf-metric-s', '等人'),
-      runBar: find('.tl-run .tl-bar em', '等人'),
+      metric: find('.sf-metric-s', '等待审批 '),
+      runBar: find('.tl-run .tl-bar em', '等待 '),
       lane: find('.tl-lane[data-node-id="review"] .tl-bar em', '等待审批'),
       sum: txt(document.querySelector('.tl-run .tl-sum')),
     }
@@ -547,9 +547,9 @@ await section('等人：同一刻的等待时长各处同一个数', async () =>
     const val = (k, s) => {
       let m = /(\d+):(\d\d)\.(\d)/.exec(s)
       if (m) return Number(m[1]) * 600 + Number(m[2]) * 10 + Number(m[3])
-      m = /等 (\d+)\.(\d) s/.exec(s)
+      m = /等待 (\d+)\.(\d) s/.exec(s)
       if (m) return Number(m[1]) * 10 + Number(m[2])
-      m = /等 (\d+):(\d\d)/.exec(s)
+      m = /等待 (\d+):(\d\d)/.exec(s)
       return m ? { secs: Number(m[1]) * 60 + Number(m[2]) } : null
     }
     return { raw, vals: Object.fromEntries(Object.entries(raw).map(([k, s]) => [k, val(k, s)])) }
@@ -557,7 +557,7 @@ await section('等人：同一刻的等待时长各处同一个数', async () =>
   const base = waits.vals.header
   const same = typeof base === 'number' && Object.values(waits.vals).every((v) =>
     v === base || (v && typeof v === 'object' && v.secs === Math.floor(base / 10)))
-  check('坞头、面板标题、需要处理、等人合计、运行行、泳道、右边合计：同一个数', same, JSON.stringify(waits.raw))
+  check('坞头、面板标题、需要处理、等待审批合计、运行行、泳道、右边合计：同一个数', same, JSON.stringify(waits.raw))
   check('等了几秒而不是 0', typeof base === 'number' && base >= 30, String(base))
   await browser.close()
 })
@@ -580,7 +580,7 @@ await section('等了九天：跨天的读数按天、小时写，各处同一�
       header: txt(document.querySelector('.tl-alert.is-warn')),
       headline: txt(document.querySelector('.sf-hud-line')),
       queue: txt(document.querySelector('.sf-queue-item.is-waiting .sf-dim')),
-      metric: find('.sf-metric-s', '等人'),
+      metric: find('.sf-metric-s', '等待审批 '),
       sum: txt(document.querySelector('.tl-run .tl-sum')),
       sumTitle: document.querySelector('.tl-run .tl-sum')?.getAttribute('title') ?? '',
       lane: txt(document.querySelector('.tl-lane[data-node-id="review"] .tl-sum')),
@@ -596,10 +596,10 @@ await section('等了九天：跨天的读数按天、小时写，各处同一�
   })
   const r = await read()
   const spans = ['header', 'headline', 'queue', 'metric', 'card', 'sumTitle', 'laneTitle']
-  check('等了多久：坞头、面板、需要处理、等人合计、卡片、摘要的悬停都写「9 天 01 小时」',
+  check('等了多久：坞头、面板、需要处理、等待审批合计、卡片、摘要的悬停都写「9 天 01 小时」',
     spans.every((k) => r[k].includes('9 天 01 小时')), JSON.stringify(Object.fromEntries(spans.map((k) => [k, r[k]]))))
   // 摘要那一列只有 116px：只写最大的单位，不被截成「等 9 天 0…」
-  check('泳道和运行行的摘要写「等 9 天」，一列都没被截断', r.sum.endsWith('等 9 天') && r.lane.endsWith('等 9 天')
+  check('泳道和运行行的摘要写「等待 9 天」，一列都没被截断', r.sum.endsWith('等待 9 天') && r.lane.endsWith('等待 9 天')
     && !r.clipped.length, `${r.sum} | ${r.lane}${r.clipped.length ? ` · 截断：${r.clipped.join(' / ')}` : ''}`)
   check('面板的墙钟过了一天写「T+9 天」，读数都放得下（不压到旁边那一格）', r.wall === 'T+9 天' && !r.wallOver.length, `${r.wall} ${r.wallOver.join(' / ')}`)
   check('相对开始的时刻（胶囊计时、游标）写「9 天 01:00:xx」', /^9 天 01:00:\d\d$/.test(r.clock)
@@ -611,7 +611,7 @@ await section('等了九天：跨天的读数按天、小时写，各处同一�
   await page.waitForTimeout(400)
   const panelUsage = await page.evaluate(() =>
     document.querySelector('[data-assistant-panel] [aria-label="这次运行的用量"]')?.textContent?.replace(/\s+/g, ' ').trim() ?? '')
-  check('右栏用量行的等人也写「9 天 01 小时」', /等人 9 天 01 小时/.test(panelUsage) && !/\d{3}:\d\d/.test(panelUsage), panelUsage)
+  check('右栏用量行的等待审批也写「9 天 01 小时」', /等待审批 9 天 01 小时/.test(panelUsage) && !/\d{3}:\d\d/.test(panelUsage), panelUsage)
   check('没有一处写成「217:…」这种得自己除 24 的钟面', !Object.values(r).flat().some((v) => /\d{3}:\d\d/.test(v)),
     Object.values(r).flat().filter((v) => /\d{3}:\d\d/.test(v)).join(' | '))
   // 不压缩空档时九天摊开：刻度按天排，不能挤成一团
@@ -650,10 +650,10 @@ const settleCase = async (label, tail, expect) => {
 }
 
 await settleCase('失败：接着跑、定位，下游阻断', [
-  ev(9, 'node.failed', 'team', { error: '401 模型 id 不存在，改成可用的模型再接着跑', duration_ms: 6000 }, 9.5),
+  ev(9, 'node.failed', 'team', { error: '401 模型 ID 不存在，改成可用的模型后继续运行', duration_ms: 6000 }, 9.5),
   ev(10, 'run.failed', null, { error: '「研究协作团队」失败', node_id: 'team', timing: { wall_ms: 9600, active_ms: 9600, wait_ms: 0 } }, 9.6),
 ], {
-  text: '失败', actions: ['接着跑', '定位'],
+  text: '失败', actions: ['继续运行', '定位'],
   more: async (page) => {
     check('下游的边画成阻断（sf-e-cut）', await count(page, '.react-flow__edge.sf-e-cut') > 0,
       `${await count(page, '.react-flow__edge.sf-e-cut')} 条`)
@@ -707,9 +707,9 @@ await settleCase('取消：清除、回放', [
 ], { text: '已取消', actions: ['清除', '回放'] })
 
 await settleCase('服务重启挂起：接着跑', [
-  ev(9, 'log', null, { level: 'warn', code: 'server_shutdown', message: '服务关停时这次运行还在跑，已挂起' }, 9),
+  ev(9, 'log', null, { level: 'warn', code: 'server_shutdown', message: '服务关闭时这次运行仍在进行，已挂起；重启后可从断点继续运行' }, 9),
 ], {
-  text: '已中断', actions: ['接着跑'],
+  text: '已中断', actions: ['继续运行'],
   more: async (page) => {
     await capsule(page).locator('.sf-cap-main').click()
     await page.waitForTimeout(200)
@@ -752,7 +752,7 @@ await section('跑完：执行路径、回边、回放、清除', async () => {
   check('没有常驻的光点', await count(page, '.edge-packet') === 0)
   await capsule(page).locator('.sf-cap-main').click()
   const hud = (await page.locator('.sf-hud').innerText()).replace(/\s+/g, ' ')
-  check('用量按后端累计校正（2,040 tokens）', /2\.0k tok/.test(hud) && hud.includes('$0.012'), hud.match(/用量[^时]*/)?.[0])
+  check('用量按后端累计校正（2,040 token）', /2\.0k token/.test(hud) && hud.includes('$0.012'), hud.match(/用量[^时]*/)?.[0])
   check('结束后节点数写「经过」', /6\/7 经过/.test(hud), hud.match(/节点 [^ ]+ [^ ]+/)?.[0])
   await page.keyboard.press('Escape')
 
@@ -1028,7 +1028,7 @@ await section('打开宽图：以入口为左锚，缩放不低于可读下限',
   check('没有常驻的航迹坞（没有运行）', await count(page, '.tl') === 0)
   const zoomText = await page.locator('.sf-zoom-btn').innerText()
   check('控件里有缩放读数', zoomText.trim() === `${Math.round(view.zoom * 100)}%`, zoomText)
-  check('控件是中文的（适配全图）', await page.getByRole('button', { name: '适配全图' }).count() === 1)
+  check('控件是中文的（适应画布）', await page.getByRole('button', { name: '适应画布' }).count() === 1)
 
   // 跟随执行：视口外的节点开跑时镜头平移过去；人手动拖过画布之后让出 10 秒
   const inView = (id) => page.evaluate((nid) => {
@@ -1219,15 +1219,15 @@ await section('回放：回边的 ×N 和面板的用量都是那一刻的', asy
   await capsule(page).locator('.sf-cap-main').click()
   const usageOf = async () => (await page.locator('.sf-metric', { hasText: '用量' }).innerText().catch(() => '')).replace(/\s+/g, ' ')
   const mid = await usageOf()
-  check('回放：面板的用量是那一刻的（800 tok），不是终值', /800 tok/.test(mid) && !/1\.4k/.test(mid), mid)
+  check('回放：面板的用量是那一刻的（800 token），不是终值', /800 token/.test(mid) && !/1\.4k/.test(mid), mid)
   const side = await page.locator('.react-flow__node[data-id="team"] .nc-tele-side').innerText().catch(() => '')
-  check('回放：卡片上的 token 也是那一刻的', /800 tok/.test(side), side)
+  check('回放：卡片上的 token 也是那一刻的', /800 token/.test(side), side)
   await page.keyboard.press('Escape')
   await page.evaluate(() => window.__studio.getState().setReplayAt(null))
   await page.waitForTimeout(250)
   await capsule(page).locator('.sf-cap-main').click()
   const live = await usageOf()
-  check('回到实时：用量是整次运行的（1.4k tok）', /1\.4k tok/.test(live), live)
+  check('回到实时：用量是整次运行的（1.4k token）', /1\.4k token/.test(live), live)
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await browser.close()
 })
@@ -1436,7 +1436,7 @@ await section('打开取景：1024 宽助手栏收着、画布够宽就用可读
 await section('循环体底框：框套框、按列圈、写上限，跑起来写第几轮', async () => {
   for (const theme of ['dark', 'light']) {
     const { browser, page, errors } = await openStudio({ id: LOOPS_ID, theme })
-    await page.getByRole('button', { name: '适配全图' }).click()
+    await page.getByRole('button', { name: '适应画布' }).click()
     await page.waitForTimeout(500)
     const read = () => page.evaluate(() => {
       const frames = [...document.querySelectorAll('.sf-loop-frame')]
@@ -1563,7 +1563,7 @@ await section('系统关了动效', async () => {
   check('静态下边的运行态还在', (await edgeClass(page, 'e-start-team')).includes('sf-e-flow'))
   check('静态下胶囊照样写着运行中', (await capText(page)).includes('运行中'))
 
-  // 「适配全图」也不做动画：点完下一帧就到位
+  // 「适应画布」也不做动画：点完下一帧就到位
   const vp = () => page.evaluate(() => document.querySelector('.react-flow__viewport').style.transform)
   const pane = await page.locator('.react-flow__pane').boundingBox()
   await page.mouse.move(pane.x + 300, pane.y + 300)
@@ -1572,12 +1572,12 @@ await section('系统关了动效', async () => {
   await page.mouse.up()
   await page.waitForTimeout(200)
   const moved = await vp()
-  await page.getByRole('button', { name: '适配全图' }).click()
+  await page.getByRole('button', { name: '适应画布' }).click()
   await page.waitForTimeout(40)
   const soon = await vp()
   await page.waitForTimeout(400)
   const later = await vp()
-  check('减少动效时「适配全图」直接到位', soon !== moved && soon === later, `${moved} → ${soon} → ${later}`)
+  check('减少动效时「适应画布」直接到位', soon !== moved && soon === later, `${moved} → ${soon} → ${later}`)
   await browser.close()
 })
 

@@ -181,7 +181,7 @@ async def test_continue_refuses_a_graph_that_fails_validation():
         GraphSpec.model_validate(graph_with(condition=BROKEN))
     ), "这个用例的前提是骨架不变"
 
-    with pytest.raises(ValueError, match="没有通过校验"):
+    with pytest.raises(ValueError, match="未通过校验"):
         await run_manager.continue_failed(run_id, graph=bad)
 
 
@@ -227,4 +227,4 @@ async def test_continue_through_the_api(client):
     resumed = [r for r in rows if r["type"] == "run.resumed"]
     assert resumed, "接着跑必须在时间线上留下痕迹"
     msg = resumed[-1]["data"].get("message", "")
-    assert "接着跑" in msg and "保留" in msg, msg
+    assert "继续运行" in msg and "保留" in msg, msg

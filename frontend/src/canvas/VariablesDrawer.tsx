@@ -59,13 +59,13 @@ export function VarIssueChips({ issues }: { issues: VarIssue[] }) {
     <>
       {errors > 0 && (
         <span className="chip" style={{ color: 'var(--err)', borderColor: 'var(--err)' }}>
-          <AlertTriangle size={9} /> {errors} 个引用不到
+          <AlertTriangle size={9} /> {errors} 个引用无法解析
         </span>
       )}
       {warns > 0 && (
-        <span className="chip" style={{ color: 'var(--warn)' }}>{warns} 个取值时机不对</span>
+        <span className="chip" style={{ color: 'var(--warn)' }}>{warns} 个取值时机有误</span>
       )}
-      {infos > 0 && <span className="chip text-faint">{infos} 个没人用</span>}
+      {infos > 0 && <span className="chip text-faint">{infos} 个未被引用</span>}
     </>
   )
 }
@@ -92,7 +92,7 @@ function VarTable({ variables, picked, onPick, onHover }: {
     // 三种空各说各的：以前分析请求失败时也写「画布上还没有节点」，而画布上明明有 8 个
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-2xs text-faint">
-        {!nodeCount ? '画布上还没有节点'
+        {!nodeCount ? '画布上暂无节点'
           : analysis === 'failed' ? (
             <>
               <span style={{ color: 'var(--warn)' }}>变量分析失败{analysisError ? `：${analysisError}` : ''}</span>
@@ -189,7 +189,7 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
       )}
 
       {variable.produced_by && (
-        <Section title="谁产出">
+        <Section title="产出节点">
           <button type="button" className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-2xs text-dim hover:bg-hover"
                   title="在画布上定位" onClick={() => go(variable.produced_by!)}>
             <Crosshair size={10} className="shrink-0 text-faint" />
@@ -209,7 +209,7 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
           </button>
         )) : (
           <div className="px-1 py-1 text-2xs text-faint">
-            没有任何地方引用它。工作流改了一半的话这很正常
+            该变量尚未被引用。工作流仍在编辑时属于正常情况
           </div>
         )}
       </Section>
@@ -217,7 +217,7 @@ function VarDetail({ variable, onClose }: { variable: Variable; onClose: () => v
       <Section title="最近一次运行的值">
         {value === undefined ? (
           <div className="px-1 text-2xs leading-relaxed text-faint">
-            这次运行里没有它的记录。跑一次就能看到
+            本次运行中没有该变量的记录，运行工作流后即可查看
           </div>
         ) : (
           <pre className="mono max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim">

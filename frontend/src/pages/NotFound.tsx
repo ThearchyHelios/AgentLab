@@ -21,7 +21,7 @@ export function NotFound() {
         <BrokenRoute />
         <div className="mono mt-5 text-2xs tracking-[0.2em] text-faint">404 · NOT FOUND</div>
         <h1 className="mt-1.5 text-xl font-semibold text-fg">这个地址不存在</h1>
-        <p className="mt-2 text-sm leading-relaxed text-dim">链接可能已经过期，或者地址打错了。</p>
+        <p className="mt-2 text-sm leading-relaxed text-dim">链接可能已失效，或地址有误。</p>
         <code
           className="mono mt-3 max-w-full truncate rounded-md border bg-elev px-2 py-1 text-xs text-dim"
           title={pathname + search}
@@ -31,7 +31,7 @@ export function NotFound() {
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
           <Link to="/chat" className="btn btn-primary">回到问数据</Link>
           <button type="button" className="btn" onClick={openCommandPalette}>
-            <Search size={13} aria-hidden /> 搜索去处 <Kbd combo="Mod+K" className="ml-1" />
+            <Search size={13} aria-hidden /> 搜索页面 <Kbd combo="Mod+K" className="ml-1" />
           </button>
           {canGoBack && (
             <button type="button" className="btn btn-ghost" onClick={() => navigate(-1)}>

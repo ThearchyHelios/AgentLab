@@ -99,8 +99,8 @@ def describe() -> dict[str, object]:
         "python": exe,
         "clean": clean,
         "note": (
-            "解释器本身看不到后端依赖"
+            "解释器无法访问服务端的依赖包"
             if clean else
-            "没找到干净的解释器，改用 -S 关掉 site-packages（标准库仍可用，第三方包不可见）"
+            "未找到独立的解释器，已改用 -S 关闭 site-packages（标准库仍可用，第三方包不可见）"
         ),
     }

@@ -439,7 +439,7 @@ await section('分支出口：保留名 default、重复标识', async () => {
     }
   })
   check('key=default 的 case 和「其他」合并成一个出口', r.merged.length === 2
-    && r.merged[1] === 'default:协作（兜底）', r.merged.join('、'))
+    && r.merged[1] === 'default:协作（默认）', r.merged.join('、'))
   check('重复的 key 只出一个出口', r.dup.join(',') === 'a,b,default', r.dup.join(','))
   check('普通分支照常追加「其他」出口', r.plain.join(',') === 'yes,default', r.plain.join(','))
   check('出口颜色是中性的（ok 色只留给状态）', r.colors.every((c) => !c.includes('--ok')), r.colors.join('、'))

@@ -253,7 +253,7 @@ async def test_nobody_delivering_is_not_a_finished_team(monkeypatch):
     row, events = await _finish(_graph())
     assert row.status == "failed", f"失败说明被当成了成果：{row.output}"
     assert row.error_node_id == "team"
-    assert "没有交出结论" in row.error and "查不到了，先这样" in row.error, row.error
+    assert "未交出结论" in row.error and "查不到了，先这样" in row.error, row.error
     # 失败的原因一起带上：界面照它说「模型没有真正调用工具」、指到画布上去绑工具
     assert "工具调用的原始标记" in row.error, row.error
     assert "撰稿员" in row.error, "从没被派过的成员要点出来"
@@ -265,7 +265,7 @@ async def test_nobody_delivering_fails_even_when_set_to_degrade(monkeypatch):
     _gives_up_after(monkeypatch, "核对员", writes={"复核": DSML, "结论": "不该轮到我"})
     row, events = await _finish(_graph(on_exhausted="degrade"))
     assert row.status == "failed", f"失败说明被当成了成果：{row.output}"
-    assert "没有交出结论" in row.error and "用完" not in row.error, row.error
+    assert "未交出结论" in row.error and "用完" not in row.error, row.error
     assert not [e for e in events if e.data.get("code") == "team_exhausted"]
 
 

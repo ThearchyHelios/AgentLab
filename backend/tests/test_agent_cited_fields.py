@@ -195,7 +195,7 @@ async def test_fields_are_checked_against_the_snapshot(monkeypatch):
     evts = await events(row.id)
     [mismatch] = logs(evts, "agent_field_mismatch")
     assert mismatch["level"] == "warn" and mismatch["fields"] == ["orders"]
-    assert "模型报 30" in mismatch["message"] and "快照是 3" in mismatch["message"]
+    assert "模型给出 30" in mismatch["message"] and "快照为 3" in mismatch["message"]
     [unverified] = logs(evts, "agent_field_unverified")
     assert unverified["level"] == "warn" and unverified["fields"] == ["region"]
 

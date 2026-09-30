@@ -386,7 +386,7 @@ async def test_numbers_the_contract_allows_are_not_repaired(monkeypatch):
 async def test_bad_on_violation_is_rejected(monkeypatch, value):
     script(monkeypatch, CLEAN)
     row = await finish(weekly({"on_violation": value}))
-    assert row.status == "failed" and "on_violation" in row.error
+    assert row.status == "failed" and "「重写后仍有违规时」" in row.error
 
 
 async def test_tool_markup_is_nudged_once(monkeypatch):

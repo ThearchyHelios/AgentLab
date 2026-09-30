@@ -73,7 +73,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
   const restore = () => {
     if (!graph || picked == null) return
     restoreVersion(picked, graph)
-    toast(`已把 v${picked} 放上画布，保存后才生效`, 'ok', {
+    toast(`已将 v${picked} 恢复到画布，保存后生效`, 'ok', {
       key: 'studio:restore', duration: 8000, action: { label: '撤销', onClick: () => undo() },
     })
     onClose()
@@ -94,7 +94,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
         <span className="mx-0.5 h-3.5 w-px shrink-0" style={{ background: 'var(--border)' }} />
         <History size={13} className="shrink-0 text-faint" />
         <span className="flex-1 truncate text-xs font-semibold" title={hintOf('版本历史', 'history')}>版本历史</span>
-        <span className="tnum text-2xs text-faint">{list ? `${list.length} 版` : ''}</span>
+        <span className="tnum text-2xs text-faint">{list ? `共 ${list.length} 个版本` : ''}</span>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -118,11 +118,11 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                       <span className="mono tnum mt-px w-7 shrink-0 text-xs font-semibold">v{v.version}</span>
                       <span className="min-w-0 flex-1">
                         <span className={clsx('block truncate text-xs', v.note ? 'text-fg' : 'text-faint')}>
-                          {v.note || '（没写说明）'}
+                          {v.note || '（无说明）'}
                         </span>
                         <span className="mt-0.5 flex flex-wrap items-center gap-1 text-2xs text-faint">
                           <span title={formatDateTime(v.created_at)}>{formatTime(v.created_at)}</span>
-                          {current && <span className="chip">{dirty ? '画布基于这一版' : '画布上就是这一版'}</span>}
+                          {current && <span className="chip">{dirty ? '画布基于此版本' : '当前画布版本'}</span>}
                           {published && (
                             <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>
                               <ShieldCheck size={9} />
@@ -149,8 +149,8 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
           )}
       </div>
       <div className="border-t px-3 py-2 text-2xs leading-relaxed text-faint">
-        恢复只是把旧版放上画布，可以撤销；保存之后才会成为新的一版。
-        {workflow.published_version != null && '已发布的版本不受影响，正式运行照旧跑它。'}
+        恢复操作仅将旧版本载入画布，可撤销；保存后才会生成新版本。
+        {workflow.published_version != null && '已发布的版本不受影响，正式运行仍使用该版本。'}
       </div>
     </div>
   )
@@ -172,10 +172,10 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
     <div>
       <MiniGraph target={target} current={current} diff={diff} />
       {same ? (
-        <div className="mt-2 text-2xs text-faint">和画布上的一样（位置可能不同）</div>
+        <div className="mt-2 text-2xs text-faint">与当前画布相同（节点位置可能不同）</div>
       ) : (
         <>
-          <div className="mt-2 text-2xs text-dim">恢复后，和画布相比：</div>
+          <div className="mt-2 text-2xs text-dim">恢复后与当前画布相比：</div>
           <ul className="mt-1 space-y-0.5 text-2xs">
             {lines.slice(0, 8).map((l, i) => (
               <li key={i} className="flex items-center gap-1.5">
@@ -183,7 +183,7 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
                   {l.kind === 'add' ? '+' : l.kind === 'del' ? '−' : '~'}
                 </span>
                 <span className="min-w-0 flex-1 truncate">{l.text}</span>
-                <span className="shrink-0 text-faint">{l.kind === 'add' ? '回来' : l.kind === 'del' ? '拿掉' : '配置不同'}</span>
+                <span className="shrink-0 text-faint">{l.kind === 'add' ? '将恢复' : l.kind === 'del' ? '将移除' : '配置不同'}</span>
               </li>
             ))}
             {lines.length > 8 && <li className="text-faint">还有 {lines.length - 8} 处…</li>}
@@ -216,7 +216,7 @@ function MiniGraph({ target, current, diff }: {
   const H = 120
   const ghosts = current.filter((n) => diff.removed.includes(n.id))
   const all = [...target.nodes, ...ghosts]
-  if (!all.length) return <div className="py-4 text-center text-2xs text-faint">这一版是空的</div>
+  if (!all.length) return <div className="py-4 text-center text-2xs text-faint">此版本为空</div>
   const nw = 238
   const nh = 80
   const x0 = Math.min(...all.map((n) => n.position.x))
@@ -265,7 +265,7 @@ function MiniGraph({ target, current, diff }: {
         return (
           <rect key={`g-${n.id}`} x={p.x} y={p.y} width={nw * k} height={nh * k} rx={2}
                 fill="none" strokeWidth={1.2} strokeDasharray="3 2" style={{ stroke: DIFF_COLOR.del }}>
-            <title>{`恢复后会拿掉：${n.data.label || n.id}`}</title>
+            <title>{`恢复后将移除：${n.data.label || n.id}`}</title>
           </rect>
         )
       })}

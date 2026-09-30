@@ -167,7 +167,7 @@ function LiveStripBody({ onBack }: { onBack: () => void }) {
       type="button"
       className="fade-up flex w-full shrink-0 items-center gap-2 border-t px-2.5 py-1.5 text-left text-2xs transition-colors hover:bg-hover"
       style={alert ? { background: meta.soft } : undefined}
-      title={`${g.label} · ${g.headline}\n回到助手看完整过程`}
+      title={`${g.label} · ${g.headline}\n返回助手查看完整过程`}
       data-run-phase={g.phase}
       onClick={onBack}
     >

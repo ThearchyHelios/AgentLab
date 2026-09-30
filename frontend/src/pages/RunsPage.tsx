@@ -180,7 +180,7 @@ export function RunsPage() {
       return {
         key, label: TAB_LABEL[key], count: queueItems.length, tone: 'alert',
         title: queueItems.length
-          ? `${queueItems.length} 条待审批${oldest != null ? `，最久已等 ${formatSpan(oldest, { coarse: true })}` : ''}`
+          ? `${queueItems.length} 条待审批${oldest != null ? `，最久已等待 ${formatSpan(oldest, { coarse: true })}` : ''}`
           : '没有待审批',
       }
     }
@@ -246,8 +246,8 @@ export function RunsPage() {
                 selectedId={runId}
                 onOpen={open}
                 dupNames={dupNames}
-                emptyTitle={tab === 'running' ? '现在没有在跑的运行' : tab === 'failed' ? '没有失败的运行' : '还没有运行记录'}
-                emptyBody={tab === 'all' ? '在问数据或画布上发起一次运行，完整轨迹会记在这里。' : undefined}
+                emptyTitle={tab === 'running' ? '当前没有运行中的记录' : tab === 'failed' ? '没有失败的运行' : '还没有运行记录'}
+                emptyBody={tab === 'all' ? '在问数据或画布中发起运行后，完整轨迹会记录在这里。' : undefined}
                 filtered={filterNote}
                 onClear={clearFilters}
               />
@@ -315,11 +315,11 @@ function Overview({ pending, oldest, running, failed, plus, onTab }: {
   const tiles: { key: RunsTab; code: StatusCode; label: string; value: string; sub: string; alert: boolean }[] = [
     {
       key: 'approvals', code: 'waiting', label: '待审批', value: String(pending),
-      sub: pending ? `最久已等 ${formatSpan(oldest, { coarse: true })}` : '没有要处理的',
+      sub: pending ? `最久已等待 ${formatSpan(oldest, { coarse: true })}` : '暂无待处理',
       alert: pending > 0,
     },
-    { key: 'running', code: 'running', label: '运行中', value: `${running}${running ? plus : ''}`, sub: running ? '实时看、随时停' : '现在没有在跑的', alert: false },
-    { key: 'failed', code: 'failed', label: '失败', value: `${failed}${failed ? plus : ''}`, sub: failed ? '看原因、从断点接着跑' : '没有失败的', alert: false },
+    { key: 'running', code: 'running', label: '运行中', value: `${running}${running ? plus : ''}`, sub: running ? '可实时查看、随时停止' : '当前无运行中', alert: false },
+    { key: 'failed', code: 'failed', label: '失败', value: `${failed}${failed ? plus : ''}`, sub: failed ? '查看原因，可从断点继续运行' : '暂无失败', alert: false },
   ]
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-6 px-8" data-runs-overview="">
@@ -345,8 +345,8 @@ function Overview({ pending, oldest, running, failed, plus, onTab }: {
       </div>
       <EmptyState
         icon={<Inbox size={22} />}
-        title="选一条运行记录"
-        body="左侧点开一条，可以看完整的执行轨迹、三种时长、封存凭证；失败的能从断点接着跑，等审批的就地处理。"
+        title="选择一条运行记录"
+        body="在左侧选择一条记录，可查看完整的执行轨迹、总时长、执行时长、等待审批时长和封存凭证；失败的运行可从断点继续，待审批的可就地处理。"
         className="py-0"
       />
     </div>

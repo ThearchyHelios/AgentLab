@@ -112,10 +112,10 @@ function compact(n: number): string {
   return `${m.toFixed(1)}M`
 }
 
-/** tokens：「56,034 tokens」；紧凑场景「56.0k tok」 */
+/** token 数：「56,034 token」；紧凑场景「56.0k token」（术语表：单位一律写 token，不写 tokens、tok） */
 export function formatTokens(n: number | null | undefined, opts?: { compact?: boolean }): string {
   if (!isNum(n)) return NONE
-  return opts?.compact ? `${compact(n)} tok` : `${formatNumber(n)} tokens`
+  return opts?.compact ? `${compact(n)} token` : `${formatNumber(n)} token`
 }
 
 /**

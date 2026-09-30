@@ -329,7 +329,7 @@ function summarize(n: NodeTrace | undefined, state: NodeState, at: number, token
   if (n.count > 1) parts.push(`×${n.count}`)
   const measured = measuredOf(n, at)
   if (run > 0 || state === 'done') parts.push(brief(measured ?? (run || n.lastDurationMs), full))
-  if (wait > 0) parts.push(`等 ${wait >= HOUR ? brief(wait, full) : formatLapse(wait, false)}`)
+  if (wait > 0) parts.push(`等待 ${wait >= HOUR ? brief(wait, full) : formatLapse(wait, false)}`)
   const tok = tokens ?? n.tokensIn + n.tokensOut
   if (tok > 0 && parts.length < 3) parts.push(formatTokens(tok, { compact: true }))
   return parts.join(' · ') || NONE
@@ -371,8 +371,8 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
       rows.push({
         key: `${id}::dispatch`, kind: 'dispatch', nodeId: id, label: '调度者',
         segs: dispatch, state, count: dispatch.length,
-        summary: `${brief(total, false)}${estimated ? ' · 推算' : ''}`,
-        detail: `${formatSpan(total)}${estimated ? ' · 推算：由事件间隙推出，不是测量值' : ''}`,
+        summary: `${brief(total, false)}${estimated ? ' · 估算' : ''}`,
+        detail: `${formatSpan(total)}${estimated ? ' · 估算：根据事件间隔推算，非实测值' : ''}`,
         name: `${label} · 调度者`, top, height: SUB_H,
       })
       top += SUB_H
@@ -470,7 +470,7 @@ function segClass(s: Segment): string {
 function segTitle(row: Row, s: Segment, t0: number, at: number): string {
   const end = s.end ?? at
   const what = s.kind === 'wait' ? '等待审批'
-    : s.kind === 'dispatch' ? (s.estimated ? '调度决策（推算：由事件间隙推出，不是测量值）' : '调度决策')
+    : s.kind === 'dispatch' ? (s.estimated ? '调度决策（估算：根据事件间隔推算，非实测值）' : '调度决策')
       : s.kind === 'retry' ? '重试'
         : statusMeta(s.status).label
   return [
@@ -701,7 +701,7 @@ export function RunTimeline({
   const drive = trace.drives[trace.drives.length - 1]
   const wait = trace.waits[trace.waits.length - 1]
   const runSum = proj.waitMs > 0
-    ? `${span(proj.activeMs, liveRun && !!drive && drive[1] == null)} · 等 ${span(proj.waitMs, liveRun && !!wait && wait[1] == null)}`
+    ? `${span(proj.activeMs, liveRun && !!drive && drive[1] == null)} · 等待 ${span(proj.waitMs, liveRun && !!wait && wait[1] == null)}`
     : liveRun ? formatLapse(proj.activeMs) : formatSpan(proj.activeMs)
   // 停在哪个节点、已经等了多久：和胶囊、面板、泳道、运行那一行同一个数（见 waitedMs）
   const waitedNow = trace.phase === 'waiting' && trace.waitingNodeId
@@ -757,7 +757,7 @@ export function RunTimeline({
             <Radio size={11} /> 实时
           </button>
           <button type="button" className={clsx(!live && 'is-on')} aria-pressed={!live} onClick={enterReplay}
-                  title="从头回放：画布回到那一刻的样子（Home）">
+                  title="从头回放：画布恢复到对应时刻的状态（Home）">
             回放
           </button>
         </div>
@@ -768,7 +768,7 @@ export function RunTimeline({
         <button type="button" className="btn btn-ghost btn-xs tnum" onClick={cycleSpeed} title="回放倍速">
           {ui.speed}×
         </button>
-        <label className="tl-toggle" title="超过 2 分钟没有事件的空档压成一小段，斜纹里写着真实时长">
+        <label className="tl-toggle" title="将超过 2 分钟无事件的空闲时段压缩显示，斜纹处标注实际时长">
           <input type="checkbox" checked={ui.compress} aria-label="压缩空闲"
                  onChange={(e) => patch({ compress: e.target.checked })} />
           <FoldHorizontal size={11} /> <span className="tl-tt">压缩空闲</span>
@@ -777,22 +777,22 @@ export function RunTimeline({
         <span className="flex-1" />
         {failed && trace.failedNodeId && (
           <button type="button" className="tl-alert" onClick={() => onFocusNode?.(trace.failedNodeId!)}
-                  title="画布取景到失败的节点">
+                  title="在画布上定位到失败的节点">
             <StatusBadge status="failed" size={11} animate={false} decorative />
             <span className="min-w-0 truncate">失败于「{labels.get(trace.failedNodeId) ?? trace.failedNodeId}」</span>
           </button>
         )}
         {trace.phase === 'waiting' && trace.waitingNodeId && (
           <button type="button" className="tl-alert is-warn" onClick={() => onFocusNode?.(trace.waitingNodeId!)}
-                  title="画布取景到等审批的节点">
+                  title="在画布上定位到等待审批的节点">
             <StatusBadge status="waiting" size={11} animate={false} decorative />
             <span className="min-w-0 truncate">
               停在「{labels.get(trace.waitingNodeId) ?? trace.waitingNodeId}」
-              {waitedNow != null && <> · 已等 <span className="tnum">{formatLapse(waitedNow)}</span></>}
+              {waitedNow != null && <> · 已等待 <span className="tnum">{formatLapse(waitedNow)}</span></>}
             </span>
           </button>
         )}
-        {!trace.timed && <span className="tl-note" title="这条运行的事件没有时间戳，段按先后顺序排、宽度只来自耗时">老数据 · 无时间戳</span>}
+        {!trace.timed && <span className="tl-note" title="本次运行的事件没有时间戳，各段按先后顺序排列，宽度仅反映耗时">无时间戳</span>}
         <button type="button" className="btn btn-ghost btn-xs" onClick={() => patch({ open: false, playing: false })}
                 title="收起航迹" aria-label="收起航迹">
           <span className="tl-tt">收起</span> <ChevronDown size={11} />
@@ -804,7 +804,7 @@ export function RunTimeline({
           {/* 刻度 + 并行度 + 运行本身：拖这三行就是拖游标 */}
           <div className="tl-sticky">
             <div className="tl-row tl-axis" style={{ height: AXIS_H }}>
-              <div className="tl-label tl-dim">墙钟{scale.folds.length ? ' · 折叠处跳变' : ''}</div>
+              <div className="tl-label tl-dim">实际时间{scale.folds.length ? ' · 折叠处时间不连续' : ''}</div>
               <div className="tl-track tl-scrub" onPointerDown={onScrubDown} onPointerMove={onScrubMove}
                    onPointerUp={onScrubUp} onPointerCancel={onScrubUp}>
                 {scale.ticks.map((tk) => (
@@ -813,7 +813,7 @@ export function RunTimeline({
                 ))}
                 {scale.folds.map((f) => (
                   <span key={f.a} className="tl-fold-tag tnum" style={{ left: f.x0, width: f.x1 - f.x0 }}
-                        title={`这 ${formatSpan(f.b - f.a)} 里没有任何事件，已压缩`}>
+                        title={`此 ${formatSpan(f.b - f.a)} 内没有事件，已压缩显示`}>
                     {foldLabel(f.b - f.a)}
                   </span>
                 ))}
@@ -865,8 +865,8 @@ export function RunTimeline({
                   const text = b == null && liveRun ? formatLapse(liveNow - a) : formatSpan((b ?? drawAt) - a)
                   return (
                     <span key={`w${i}`} className="tl-bar tl-s-waiting tl-hatch" style={{ left: x0, width: w }}
-                          title={`等人审批 ${text}`}>
-                      {w > 70 && <em className="tnum">等人 {text}</em>}
+                          title={`等待审批 ${text}`}>
+                      {w > 70 && <em className="tnum">等待 {text}</em>}
                     </span>
                   )
                 })}
@@ -875,7 +875,7 @@ export function RunTimeline({
                         title={`${phaseMeta.label} · T+${formatOffset(trace.endedAt - t0)}`} />
                 )}
               </div>
-              <div className="tl-sum tnum" title={`执行 ${formatSpan(proj.activeMs)}${proj.waitMs > 0 ? ` · 等人 ${formatSpan(proj.waitMs)}` : ''}`}>
+              <div className="tl-sum tnum" title={`执行 ${formatSpan(proj.activeMs)}${proj.waitMs > 0 ? ` · 等待审批 ${formatSpan(proj.waitMs)}` : ''}`}>
                 {runSum}
               </div>
             </div>
@@ -986,7 +986,7 @@ function Lane({ row, scale, at, t0, hovered, tabbable, waitNow, onHover, onPick,
           const text = s.kind === 'wait'
             ? `等待审批 ${s.end == null && waitNow != null ? formatLapse(waitNow) : formatLapse(end - s.start, false)}`
             : s.kind === 'dispatch'
-              ? `调度 ${formatSpan(end - s.start)}${s.estimated ? ' · 推算' : ''}`
+              ? `调度 ${formatSpan(end - s.start)}${s.estimated ? ' · 估算' : ''}`
               : `${s.iteration != null && row.kind === 'node' ? `#${s.iteration} · ` : ''}${formatSpan(ms)}`
           return (
             <span key={i} className={clsx('tl-bar', segClass(s), s.end == null && 'is-open')}

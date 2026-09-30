@@ -272,7 +272,7 @@ def test_no_false_ordering_warning_inside_the_loop_body() -> None:
     而那正是循环最正常的写法。
     """
     report = analyze(_loop_graph())
-    assert not [i for i in report.issues if "在这之后才跑" in i.message], \
+    assert not [i for i in report.issues if "在这之后才执行" in i.message], \
         [i.message for i in report.issues]
 
 

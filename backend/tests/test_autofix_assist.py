@@ -115,7 +115,7 @@ async def test_a_sound_fix_is_adopted_as_a_preview(client, monkeypatch):
     assert await rows(wf) == before                           # 只是预览
     # 交给模型的请求里有剩下的问题和不许降低要求、不许替人选的约定
     human = next(text for role, text in model.calls[0] if role == "human")
-    assert "受管模板至少要有一个「成果 / 出具」节点声明出具契约" in human
+    assert "受管级别要求至少一个「成果」节点声明出具契约" in human
     assert "不许降低要求" in human and "不替人选" in human and "question" in human
 
 
@@ -141,7 +141,7 @@ async def test_a_fix_that_makes_errors_grow_is_refused(client, monkeypatch):
     out = await assist(client, wf)
     assert out["assist"]["ok"] is False
     [rejected] = [r for r in out["rejected"] if r["fix_id"] == "assist"]
-    assert "新的问题" in rejected["reason"] and "expression" in rejected["reason"]
+    assert "新的问题" in rejected["reason"] and "表达式" in rejected["reason"]
     assert out["graph"] == two_exits()
 
 
@@ -182,7 +182,7 @@ async def test_deterministic_fixes_run_first_and_copilot_sees_what_is_left(clien
     out = await assist(client, wf, apply=["governed.agent_approval_never:ask"])
     assert out["applied"] == ["governed.agent_approval_never:ask", "assist"] and out["ok"] is True
     human = next(text for role, text in model.calls[0] if role == "human")
-    assert "的审批策略是「全部自动放行」" not in human and '"approval": "dangerous"' in human
+    assert "的审批策略是「全部无需审批」" not in human and '"approval": "dangerous"' in human
 
 
 async def test_nothing_left_means_no_model_call(client, monkeypatch):

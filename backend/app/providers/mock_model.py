@@ -121,7 +121,7 @@ class MockChatModel(BaseChatModel):
             if not isinstance(args, dict):
                 args = {}
             return AIMessage(
-                content=f"我需要先调用 `{tool['name']}` 来获取信息。",
+                content=f"需要先调用 `{tool['name']}` 获取信息。",
                 tool_calls=[
                     {"name": tool["name"], "args": args, "id": f"call_{rng.randrange(1 << 30):08x}"}
                 ],
@@ -132,10 +132,10 @@ class MockChatModel(BaseChatModel):
         )
         topic = re.sub(r"\s+", " ", last_user).strip()[:60] or "这个问题"
         body = (
-            f"（Mock 回复）关于「{topic}」，我的结论分三点：\n\n"
-            f"1. 这是一个由 mock provider 生成的假响应，用来验证编排链路。\n"
-            f"2. 当前节点接收到 {len(messages)} 条消息，工具 {len(self.tools)} 个。\n"
-            f"3. 在设置页配一个真实 provider，把节点的模型换掉就能拿到真实结果。"
+            f"（演示模型的回复）关于「{topic}」，示例内容分三点：\n\n"
+            f"1. 这是演示模型生成的示例内容，用于验证工作流能否正常运行。\n"
+            f"2. 当前节点收到 {len(messages)} 条消息、{len(self.tools)} 个工具。\n"
+            f"3. 如需真实结果，请在「设置 → 模型接入」中添加模型接入，并为节点换用对应模型。"
         )
         return AIMessage(content=body)
 

@@ -40,7 +40,7 @@ export function teamRun(upto: 'routing' | 'members' | 'done' = 'done'): RunEvent
   ev('agent.route.start', 'team', { round: 0 })
   ev('llm.end', 'team', { agent: '调度者', model: 'claude-sonnet-4', duration_ms: 2400, input_tokens: 820, output_tokens: 96, cost_usd: 0.0039 }, 2.4)
   ev('agent.route.end', 'team', { round: 0, duration_ms: 2400, agents: ['采购员', '质检员', '物流员'], parallel: 3, done: false, reason: '三方面数据互不依赖，可以同时查' })
-  ev('log', 'team', { level: 'info', round: 0, parallel: 3, agents: ['采购员', '质检员', '物流员'], done: false, reason: '三方面数据互不依赖，可以同时查', message: '调度 → 采购员、质检员、物流员（三方面数据互不依赖，可以同时查） · 3 人同时进行' })
+  ev('log', 'team', { level: 'info', round: 0, parallel: 3, agents: ['采购员', '质检员', '物流员'], done: false, reason: '三方面数据互不依赖，可以同时查', message: '调度 → 采购员、质检员、物流员（三方面数据互不依赖，可以同时查） · 3 名成员同时执行' })
   for (const [name, task] of [['采购员', '查近 90 天各供应商的交期'], ['质检员', '查来料不良率'], ['物流员', '查在途延误']]) {
     ev('agent.step.start', 'team', { agent: name, instruction: task, round: 0, parallel: 3 }, 0.001)
   }
@@ -115,7 +115,7 @@ export function mixedRun(): RunEvent[] {
   ev('run.started', null, { nodes: 6, resumed: false })
   ev('node.started', 'in', { node_type: 'input', label: '统计区间' })
   ev('node.finished', 'in', { duration_ms: 2, attempt: 1, preview: { day: '2026-09-19' } })
-  ev('node.skipped', 'kb', { reason: 'skip_if 成立：{{ inputs.day }} 是单日，不需要背景检索', node_type: 'retrieve', label: '背景检索' })
+  ev('node.skipped', 'kb', { reason: '满足跳过条件：{{ inputs.day }} 是单日，不需要背景检索', node_type: 'retrieve', label: '背景检索' })
   ev('node.started', 'agent', { node_type: 'agent', label: '出勤分析' })
   ev('llm.start', 'agent', { model: 'claude-sonnet-4', message_count: 2 })
   ev('llm.thinking', 'agent', { text: '先看一下考勤相关的表有哪些，再按班次汇总出勤率。' }, 1.2)
@@ -139,11 +139,11 @@ export function mixedRun(): RunEvent[] {
   ev('human.resolved', 'review', { response: { approved: true, note: '晚班偏低要跟进' }, actor: '张工' })
   ev('node.finished', 'review', { duration_ms: 0, attempt: 1, preview: { approved: true } })
   ev('node.started', 'report', { node_type: 'output', label: '日报出具' })
-  ev('issuance', 'report', { tier: 'degraded', missing_required: [], missing_expected: [], unmatched: 0, calibers: [{ node: 'kpi', caliber: '出勤率口径', version: 'v3' }], gaps: ['叙述模板渲染为空（路径可能写错了）'], metrics_checked: 2, matched_numbers: 0 })
+  ev('issuance', 'report', { tier: 'degraded', missing_required: [], missing_expected: [], unmatched: 0, calibers: [{ node: 'kpi', caliber: '出勤率口径', version: 'v3' }], gaps: ['叙述模板渲染为空（路径可能有误）'], metrics_checked: 2, matched_numbers: 0 })
   ev('node.finished', 'report', { duration_ms: 3, attempt: 1, preview: {} })
-  ev('node.started', 'notify', { node_type: 'tool', label: '推送企业微信' })
-  ev('node.failed', 'notify', { error: '推送失败：企业微信机器人地址没配', duration_ms: 120, detail: 'httpx.ConnectError: [Errno 8] nodename nor servname provided, or not known' })
-  ev('run.failed', null, { error: '推送失败：企业微信机器人地址没配', node_id: 'notify', label: '推送企业微信', detail: 'httpx.ConnectError: [Errno 8] nodename nor servname provided, or not known', timing: { wall_ms: 290000, active_ms: 110000, wait_ms: 180000 } })
+  ev('node.started', 'notify', { node_type: 'tool', label: '推送通知' })
+  ev('node.failed', 'notify', { error: '推送失败：通知机器人地址为空', duration_ms: 120, detail: 'httpx.ConnectError: [Errno 8] nodename nor servname provided, or not known' })
+  ev('run.failed', null, { error: '推送失败：通知机器人地址为空', node_id: 'notify', label: '推送通知', detail: 'httpx.ConnectError: [Errno 8] nodename nor servname provided, or not known', timing: { wall_ms: 290000, active_ms: 110000, wait_ms: 180000 } })
   return out
 }
 
@@ -158,7 +158,7 @@ export const MIXED_OUTPUT = {
     missing_expected: [],
     unmatched_numbers: [{ token: '6', context: '晚班比上周低 6 个百分点' }],
     matched_numbers: 2,
-    gaps: ['叙述模板渲染为空（路径可能写错了）'],
+    gaps: ['叙述模板渲染为空（路径可能有误）'],
   },
 }
 
@@ -241,11 +241,11 @@ export function cancelledRun(): RunEvent[] {
 // ---------------------------------------------------------------------------
 
 const MARKUP = '<｜｜DSML｜｜invoke name="db_query__shop">'
-const MEMBER_MARKUP_FAILED = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步什么都没查到'
-  + '（常见原因：这个成员没有绑定工具，或者模型、服务不支持工具调用）'
-export const TOOL_MARKUP_ERROR = '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。'
-  + '常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。'
-  + '到画布里给这个节点绑定要用的工具；绑定了还这样，就换一个支持工具调用的模型'
+const MEMBER_MARKUP_FAILED = '模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据'
+  + '（常见原因：该成员未绑定工具，或模型、服务不支持工具调用）'
+export const TOOL_MARKUP_ERROR = '模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。'
+  + '常见原因：节点未绑定工具，或模型、服务不支持工具调用。'
+  + '请在画布中为该节点绑定所需工具；如已绑定仍出现此问题，请换用支持工具调用的模型'
 
 /**
  * 两轮就用完的协作团队：取数员每轮都把工具调用写成文字（成员失败），汇总员一次都没派到。
@@ -264,10 +264,10 @@ export function exhaustedTeam(mode: 'fail' | 'degrade' | 'judged' | 'closing' = 
     if (!ok) {
       ev('llm.end', 'team', { agent: name, model: 'demo-chat', duration_ms: 1800, input_tokens: 500, output_tokens: 90, cost_usd: 0.001 }, 1.8)
       ev('log', 'team', { level: 'warn', code: 'tool_markup_leak',
-        message: `${name}把工具调用写成了文字（${MARKUP}…），没有真正调用工具，已提醒它重试一次` })
+        message: `${name}以文本形式输出了工具调用（${MARKUP}…），未实际调用工具，已要求模型重试一次` })
       ev('llm.end', 'team', { agent: name, model: 'demo-chat', duration_ms: 1500, input_tokens: 620, output_tokens: 80, cost_usd: 0.001 }, 1.5)
       ev('agent.step.end', 'team', { agent: name, duration_ms: 3300, round, parallel,
-        preview: `（${name} 这一步失败：${MEMBER_MARKUP_FAILED}）`, failed: true, error: MEMBER_MARKUP_FAILED })
+        preview: `（${name} 这一步执行失败：${MEMBER_MARKUP_FAILED}）`, failed: true, error: MEMBER_MARKUP_FAILED })
     } else {
       ev('llm.end', 'team', { agent: name, model: 'demo-chat', duration_ms: 2100, input_tokens: 480, output_tokens: 150, cost_usd: 0.001 }, 2.1)
       ev('agent.step.end', 'team', { agent: name, duration_ms: 2100, round, parallel, preview: '没有数据可分析，等取数员交回订单明细' })
@@ -281,7 +281,7 @@ export function exhaustedTeam(mode: 'fail' | 'degrade' | 'judged' | 'closing' = 
   ev('agent.route.start', 'team', { round: 1 })
   ev('llm.end', 'team', { agent: '调度者', model: 'demo-chat', duration_ms: 1100, input_tokens: 700, output_tokens: 60, cost_usd: 0.0009 }, 1.1)
   ev('agent.route.end', 'team', { round: 1, duration_ms: 1100, agents: ['取数员', '分析员'], parallel: 2, done: false, reason: '取数员再试一次，分析员先准备口径' })
-  ev('log', 'team', { level: 'info', round: 1, parallel: 2, agents: ['取数员', '分析员'], done: false, reason: '取数员再试一次，分析员先准备口径', message: '调度 → 取数员、分析员（取数员再试一次，分析员先准备口径） · 2 人同时进行' })
+  ev('log', 'team', { level: 'info', round: 1, parallel: 2, agents: ['取数员', '分析员'], done: false, reason: '取数员再试一次，分析员先准备口径', message: '调度 → 取数员、分析员（取数员再试一次，分析员先准备口径） · 2 名成员同时执行' })
   member(1, 2, '分析员', '准备各区域订单额的对比口径', true)
   member(1, 2, '取数员', '再查一次上月 orders 表', false)
   // 两轮都派过了、调度者一次都没说完成：补一次只判定、不派活的决定
@@ -300,19 +300,19 @@ export function exhaustedTeam(mode: 'fail' | 'degrade' | 'judged' | 'closing' = 
   }
   const summary = `协作团队用完 2 轮仍未完成：${reason}。一次都没被派到的成员：汇总员`
   if (mode === 'fail') {
-    const error = `${summary}。先看成员有没有绑定要用的工具，再调大「最多轮数」；也可以把「用完轮数时」改成降档交付`
+    const error = `${summary}。先看成员是否绑定了所需工具，再调大「最多轮数」；也可将「用完轮数时」改为「降档交付」`
     ev('node.failed', 'team', { error, duration_ms: 9800, detail: null })
     ev('run.failed', null, { error, node_id: 'team', label: '销售分析团队', timing: { wall_ms: 10000, active_ms: 10000, wait_ms: 0 } })
     return out
   }
-  ev('log', 'team', { level: 'warn', code: 'team_exhausted', message: `${summary}。按降档交付：成果是成员最后的原话，不是调度者认可的结论` })
+  ev('log', 'team', { level: 'warn', code: 'team_exhausted', message: `${summary}。按降档交付：成果取自成员最后的回复，并非调度者认可的结论` })
   ev('node.finished', 'team', { duration_ms: 9800, attempt: 1, preview: {
-    text: `（取数员 这一步失败：${MEMBER_MARKUP_FAILED}）`, rounds: 2, exhausted: true, exhausted_reason: reason, never_dispatched: '[1 项]' } })
+    text: `（取数员 这一步执行失败：${MEMBER_MARKUP_FAILED}）`, rounds: 2, exhausted: true, exhausted_reason: reason, never_dispatched: '[1 项]' } })
   ev('node.started', 'out', { node_type: 'output', label: '成果' })
   ev('issuance', 'out', { tier: 'degraded', missing_required: [], missing_expected: [], unmatched: 0, calibers: [],
-    gaps: ['协作团队「销售分析团队」用完 2 轮仍未完成，交来的是成员最后的原话'], metrics_checked: 0, matched_numbers: 0, matched: [] })
+    gaps: ['协作团队「销售分析团队」用完 2 轮仍未完成，交付的是成员最后的回复'], metrics_checked: 0, matched_numbers: 0, matched: [] })
   ev('node.finished', 'out', { duration_ms: 2, attempt: 1, preview: {} })
-  ev('run.finished', null, { output: { 结论: `（取数员 这一步失败：${MEMBER_MARKUP_FAILED}）` },
+  ev('run.finished', null, { output: { 结论: `（取数员 这一步执行失败：${MEMBER_MARKUP_FAILED}）` },
     usage: { input_tokens: 4600, output_tokens: 620, cost_usd: 0.008 }, duration_ms: 10000, timing: { wall_ms: 10000, active_ms: 10000, wait_ms: 0 } })
   return out
 }
@@ -327,7 +327,7 @@ export function markupRun(): RunEvent[] {
   ev('llm.start', 'query', { model: 'demo-chat', message_count: 2 })
   ev('llm.end', 'query', { agent: '数据查询', model: 'demo-chat', duration_ms: 2200, input_tokens: 900, output_tokens: 140, total_tokens: 1040, cost_usd: 0.002, calls: 1 }, 2.2)
   ev('log', 'query', { level: 'warn', code: 'tool_markup_leak',
-    message: `模型把工具调用写成了文字（${MARKUP}…），没有真正调用工具，已提醒它重试一次` })
+    message: `模型以文本形式输出了工具调用（${MARKUP}…），未实际调用工具，已要求模型重试一次` })
   ev('llm.start', 'query', { model: 'demo-chat', message_count: 4 })
   ev('llm.end', 'query', { agent: '数据查询', model: 'demo-chat', duration_ms: 1900, input_tokens: 1100, output_tokens: 120, total_tokens: 1220, cost_usd: 0.002, calls: 1 }, 1.9)
   ev('node.failed', 'query', { error: TOOL_MARKUP_ERROR, duration_ms: 4200, detail: null })
@@ -361,8 +361,8 @@ export function timeoutRun(upto: 'live' | 'done' = 'done'): RunEvent[] {
   ev('tool.start', 'query', { tool: 'db_query__shop', timeout_s: 30, args: { sql: 'SELECT * FROM orders' } })
   if (upto === 'live') return out
   ev('tool.error', 'query', { tool: 'db_query__shop', timed_out: true, duration_ms: 31000,
-    error: '查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查' }, 31)
-  ev('node.failed', 'query', { error: '查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查。数据量大就在参数里缩小范围；对方偶尔卡住的话，稍后「接着跑」即可', duration_ms: 31000 })
+    error: '查询超过 30 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试' }, 31)
+  ev('node.failed', 'query', { error: '查询超过 30 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试。数据量较大时请在参数中缩小范围；如为服务暂时无响应，可稍后点「继续运行」', duration_ms: 31000 })
   return out
 }
 
@@ -384,14 +384,14 @@ export const COPILOT_TOOLS_DROPPED = [
   { op: 'done', explanation: '改了提示词' },
   { op: 'check', status: 'passed', repaired: 0, warnings: [
     { level: 'warning', node_id: 'query', edge_id: null, code: 'tools_dropped', field: 'tools',
-      message: '「数据查询」的工具从 db_query__shop、db_schema__shop 变成了空：这一轮的要求里没有提到去掉工具' },
+      message: '「数据查询」的工具从 db_query__shop、db_schema__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果' },
   ] },
   { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'query' }, { id: 'out' }] }, tool_changes: [
     { node_id: 'query', label: '数据查询', member: null, field: 'tools',
       before: ['db_query__shop', 'db_schema__shop'], after: [], added: [], removed: ['db_query__shop', 'db_schema__shop'] },
   ], issues: [
     { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
-      message: '「数据查询」的工具从 db_query__shop、db_schema__shop 变成了空：这一轮的要求里没有提到去掉工具' },
+      message: '「数据查询」的工具从 db_query__shop、db_schema__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果' },
   ] },
 ]
 
@@ -407,13 +407,13 @@ export const COPILOT_STUCK = [
   { op: 'add_node', node: { id: 'q', type: 'tool', label: '取数' } },
   { op: 'add_node', node: { id: 'lp', type: 'loop', label: '逐日循环' } },
   { op: 'done', explanation: '三步走' },
-  { op: 'check', status: 'repairing', round: 1, issues: ['「lp」循环条件写错了：表达式里没有 | 过滤器'] },
+  { op: 'check', status: 'repairing', round: 1, issues: ['「lp」循环条件有误：表达式中不支持 | 过滤器'] },
   { op: 'heartbeat', phase: 'repairing', elapsed_ms: 12000 },
   { op: 'update_node', id: 'lp' },
-  { op: 'check', status: 'failed', issues: ['「lp」循环条件写错了：表达式里没有 | 过滤器', '「q」没有选数据源'] },
+  { op: 'check', status: 'failed', issues: ['「lp」循环条件有误：表达式中不支持 | 过滤器', '「q」没有选数据源'] },
   { op: 'final', graph: { nodes: [{ id: 'q' }, { id: 'lp' }] }, issues: [
-    { level: 'error', node_id: 'lp', message: '循环条件写错了' },
-    { level: 'warning', node_id: null, code: 'unknown_node_type', type: 'excel_export', message: '模型写了一个不存在的节点类型「excel_export」，这一步已跳过' },
+    { level: 'error', node_id: 'lp', message: '循环条件有误' },
+    { level: 'warning', node_id: null, code: 'unknown_node_type', type: 'excel_export', message: '模型使用了不存在的节点类型「excel_export」，已跳过这一步' },
   ] },
 ]
 
@@ -440,11 +440,11 @@ export function rerunTeam(mode: 'rerun' | 'loop' | 'approval'): RunEvent[] {
     member(0, '检索员', '没查到')
     route(1, ['检索员'], false, '再试一次')
     member(1, '检索员', '还是没查到')
-    const error = '协作团队用完 2 轮仍未完成：还没有查到订单。一次都没被派到的成员：定稿员。先看成员有没有绑定要用的工具，再调大「最多轮数」'
+    const error = '协作团队用完 2 轮仍未完成：还没有查到订单。一次都没被派到的成员：定稿员。先看成员是否绑定了所需工具，再调大「最多轮数」；也可将「用完轮数时」改为「降档交付」'
     ev('node.failed', 'team', { error, duration_ms: 4000 })
     ev('run.failed', null, { error, node_id: 'team', label: '复盘小组', timing: { wall_ms: 4200, active_ms: 4200, wait_ms: 0 } })
     // 真实的接着跑顺序：run.resumed → run.started{resumed} → node.started{resumed:true}
-    ev('run.resumed', null, { from: 'team', message: '从「复盘小组」接着跑…', actor: null }, 5)
+    ev('run.resumed', null, { from: 'team', message: '从「复盘小组」继续运行', actor: null }, 5)
     ev('run.started', null, { nodes: 3, resumed: true, replay_protocol: 2 })
     ev('node.started', 'team', { node_type: 'supervisor', label: '复盘小组', resumed: true })
     route(0, ['检索员'], false, '查订单')
@@ -466,7 +466,7 @@ export function rerunTeam(mode: 'rerun' | 'loop' | 'approval'): RunEvent[] {
         ev('agent.route.start', 'team', { round: 2, closing: true })
         ev('agent.route.end', 'team', { round: 2, duration_ms: 600, agents: [], parallel: 0, done: false, reason: '数据不全', closing: true })
         ev('log', 'team', { level: 'warn', code: 'team_exhausted',
-          message: '协作团队用完 2 轮仍未完成：数据不全。按降档交付：成果是成员最后的原话，不是调度者认可的结论' })
+          message: '协作团队用完 2 轮仍未完成：数据不全。按降档交付：成果取自成员最后的回复，并非调度者认可的结论' })
         ev('node.finished', 'team', { duration_ms: 3000, attempt: 1,
           preview: { text: '还是原话', exhausted: true, exhausted_reason: '数据不全', never_dispatched: '[0 项]' } })
       } else {
@@ -500,11 +500,11 @@ export const COPILOT_OBJECT_ISSUES = [
   { op: 'add_node', node: { id: 'ask', type: 'agent', label: '订单查询' } },
   { op: 'done', explanation: '两步' },
   { op: 'check', status: 'repairing', round: 1, issues: [
-    { level: 'error', node_id: 'lp', edge_id: null, field: 'condition', message: '循环条件写错了：表达式里没有 | 过滤器' },
+    { level: 'error', node_id: 'lp', edge_id: null, field: 'condition', message: '循环条件有误：表达式中不支持 | 过滤器' },
   ] },
   { op: 'check', status: 'failed', issues: [
     { level: 'error', node_id: 'ask', edge_id: null, field: 'tools', code: 'datasource_out_of_scope',
-      message: '用了限定范围之外的数据源 sales_daily：这一轮只查 orders' },
+      message: '使用了限定范围之外的数据源 sales_daily：本轮只允许使用 orders' },
     { level: 'error', node_id: 'gone', edge_id: null, field: null, message: '这个节点不在这一轮的操作里' },
   ] },
   { op: 'remove_node', id: 'old' },

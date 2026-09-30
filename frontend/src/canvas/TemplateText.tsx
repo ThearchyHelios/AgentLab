@@ -260,7 +260,7 @@ export function TemplateText({
       {syntax === 'expression' && bracesHint && /\{\{/.test(value ?? '') && (
         <div className="mt-1 flex items-start gap-1.5 text-2xs leading-snug" style={{ color: 'var(--warn)' }}>
           <span className="mono shrink-0">ƒx</span>
-          <span>这里是表达式，不需要 {'{{ }}'}：直接写 <code className="mono">vars.x == 1</code></span>
+          <span>此处为表达式，无需 {'{{ }}'}，直接写 <code className="mono">vars.x == 1</code></span>
         </div>
       )}
 
@@ -291,7 +291,7 @@ export function TemplateText({
             <div className="border-t" style={{ borderColor: 'var(--hairline)' }}>
               {blocked.map(({ v, why }) => (
                 <div key={v.path} className="flex items-center gap-2 px-2 py-1 opacity-60"
-                     title="这一步还取不到它：运行到这里时它是空的">
+                     title="当前步骤无法引用该变量：执行到此处时尚无值">
                   <span className="mono shrink-0 text-2xs text-faint line-through">{v.path}</span>
                   <span className="min-w-0 flex-1 truncate text-2xs text-faint">{BLOCKED_TEXT[why](v)}</span>
                 </div>
@@ -299,7 +299,7 @@ export function TemplateText({
             </div>
           )}
           <div className="border-t px-2 py-1 text-2xs text-faint">
-            {matches.length ? `↑↓ 选择 · ${formatShortcut('Enter')} 插入 · Esc 关掉` : '这一步能取到的变量里没有匹配的'}
+            {matches.length ? `↑↓ 选择 · ${formatShortcut('Enter')} 插入 · Esc 关闭` : '当前步骤可引用的变量中没有匹配项'}
           </div>
         </div>
       )}
@@ -338,9 +338,9 @@ const CHIP: Record<'ok' | 'error' | 'late', React.CSSProperties> = {
 type Why = 'ok' | 'self' | 'later' | 'outside'
 
 const BLOCKED_TEXT: Record<Exclude<Why, 'ok'>, (v: Variable) => string> = {
-  self: () => '这一步自己的产出，这里还取不到',
-  later: (v) => `这里还取不到：「${v.produced_by_label ?? '?'}」不在这一步的上游`,
-  outside: (v) => `只在「${v.produced_by_label ?? '循环'}」的循环体里有值`,
+  self: () => '本步骤自身的输出，此处尚无法引用',
+  later: (v) => `此处无法引用：「${v.produced_by_label ?? '?'}」不在本步骤的上游`,
+  outside: (v) => `仅在「${v.produced_by_label ?? '循环'}」的循环体内有值`,
 }
 
 /** 一个节点能看到谁：它的全部上游，和它所在的循环体 */

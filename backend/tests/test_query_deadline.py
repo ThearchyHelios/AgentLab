@@ -105,7 +105,7 @@ async def test_sqlite_stops_a_runaway_query_at_the_limit(sqlite_source):
         run_query(source, RUNAWAY, limits=QueryLimits(timeout_seconds=1)), 6)
     assert back, "查询时限到了，语句还在数据库里跑，调用一直没回来"
     assert isinstance(outcome, SqlRejected), outcome
-    assert "1s" in str(outcome) and "被中断" in str(outcome)
+    assert "1 秒" in str(outcome) and "被中断" in str(outcome)
     assert took < 3, f"1s 的时限等了 {took:.1f}s"
     engine = await engines.get(source)
     assert engine.sync_engine.pool.checkedout() == 0, "被中断的查询还占着连接"
@@ -144,7 +144,7 @@ async def test_a_source_can_set_its_own_limit(sqlite_source):
     source = await sqlite_source(query_timeout_s="1")
     back, outcome, took = await _within(run_query(source, RUNAWAY), 6)
     assert back and isinstance(outcome, SqlRejected), outcome
-    assert "1s" in str(outcome) and took < 3
+    assert "1 秒" in str(outcome) and took < 3
 
 
 def test_the_limit_is_read_from_options_and_defaults_otherwise(shop_db):
@@ -183,7 +183,7 @@ async def test_the_query_tool_declares_the_limit(sqlite_source, monkeypatch):
     assert limit.seconds == 1 and limit.kind == "query" and limit.self_timed
 
     back, outcome, took = await _within(tool.coroutine(sql=RUNAWAY), 6)
-    assert back and "1s" in str(outcome) and took < 3, (outcome, took)
+    assert back and "1 秒" in str(outcome) and took < 3, (outcome, took)
 
 
 # --------------------------------------------------------------------------
@@ -320,7 +320,7 @@ async def test_a_query_stopped_by_the_database_reads_as_a_timeout(monkeypatch, k
     _fake(monkeypatch, mariadb=kind == "mariadb", fail=RuntimeError(driver_error))
     with pytest.raises(SqlRejected) as caught:
         await run_query(_remote(kind), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
-    assert "查询超过 5s 被中断" in str(caught.value), caught.value
+    assert "查询超过 5 秒被中断" in str(caught.value), caught.value
 
 
 class _PgCanceled(Exception):
@@ -348,7 +348,7 @@ async def test_a_localized_timeout_is_recognised_by_its_code(monkeypatch, kind, 
     _fake(monkeypatch, mariadb=kind == "mariadb", fail=error)
     with pytest.raises(SqlRejected) as caught:
         await run_query(_remote(kind), "SELECT 1", limits=QueryLimits(timeout_seconds=5))
-    assert "查询超过 5s 被中断" in str(caught.value), caught.value
+    assert "查询超过 5 秒被中断" in str(caught.value), caught.value
 
 
 async def test_other_errors_are_not_mistaken_for_a_timeout(monkeypatch):
@@ -420,7 +420,7 @@ async def test_a_slow_connection_does_not_let_the_backstop_beat_the_database(mon
     assert 0 < sent < 1000, f"数据库拿到的该是剩下的预算，实际是 {sent}ms"
     assert not isinstance(caught.value.__cause__, TimeoutError), \
         "该是数据库按时限停下的那条路（deadline.stopped），不是后端兜底的 TimeoutError"
-    assert "查询超过 1s 被中断" in str(caught.value)
+    assert "查询超过 1 秒被中断" in str(caught.value)
 
 
 async def test_a_budget_spent_waiting_for_a_connection_sends_nothing(monkeypatch):
@@ -429,7 +429,7 @@ async def test_a_budget_spent_waiting_for_a_connection_sends_nothing(monkeypatch
     with pytest.raises(SqlRejected) as caught:
         await run_query(_remote("postgres"), "SELECT 1", limits=QueryLimits(timeout_seconds=0.3))
     assert pool.log == [], pool.log
-    assert "查询超过 0.3s 被中断" in str(caught.value)
+    assert "查询超过 0.3 秒被中断" in str(caught.value)
 
 
 # --------------------------------------------------------------------------

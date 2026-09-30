@@ -29,7 +29,7 @@ _TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
 _BUILTIN_ROOTS = {
     "input": "工作流的入口输入",
     "nodes": "各节点的输出",
-    "vars": "节点用 assign_to 写入的变量",
+    "vars": "节点通过「结果存为变量」写入的变量",
     "output": "已收集的成果",
     "loops": "循环的当前项和轮次",
     "usage": "token 与成本累计",
@@ -364,7 +364,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                                 level="warning", node_id=node.id, path=path, field=field,
                                 message=f"{{{{ {path} }}}} 是「{target.produced_by_label}」"
                                         f"每轮的循环变量，只在循环体内部有值；"
-                                        f"这一步不在循环体里，取到的会是空值",
+                                        f"这一步不在循环体内，取到的将是空值",
                             ))
                         continue
 
@@ -377,7 +377,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                         report.issues.append(VarIssue(
                             level="warning", node_id=node.id, path=path, field=field,
                             message=f"{{{{ {path} }}}} 由「{target.produced_by_label}」产出，"
-                                    f"但那一步在这之后才跑，这里取到的会是空值",
+                                    f"但那一步在这之后才执行，这里取到的将是空值",
                         ))
                     continue
 
@@ -397,10 +397,10 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     node_id=node.id, path=path, field=field,
                     message=(
                         f"{{{{ {path} }}}} 没有任何节点产出，"
-                        f"是不是想写 {{{{ {hint} }}}}？取不到值会渲染成空字符串，不报错"
+                        f"是否应为 {{{{ {hint} }}}}？无法取值时会渲染为空字符串，不会报错"
                         if hint else
                         f"{{{{ {path} }}}} 没有任何节点产出。"
-                        f"取不到值会渲染成空字符串，不报错"
+                        f"无法取值时会渲染为空字符串，不会报错"
                     ),
                 ))
 
@@ -420,7 +420,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
         if not var.refs and var.produced_by and not auto_provided:
             report.issues.append(VarIssue(
                 level="info", node_id=var.produced_by, path=var.path,
-                message=f"{{{{ {var.path} }}}} 产出了但没有任何地方引用",
+                message=f"{{{{ {var.path} }}}} 已产出，但没有任何地方引用",
             ))
 
     report.variables = sorted(

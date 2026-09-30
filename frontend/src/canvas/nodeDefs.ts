@@ -92,7 +92,7 @@ export interface NodeDef {
 }
 
 const MODEL_FIELDS: FieldDef[] = [
-  { key: 'model', label: '模型', type: 'model', help: '留空则用默认 provider' },
+  { key: 'model', label: '模型', type: 'model', help: '留空则使用默认模型接入' },
   {
     key: 'thinking', label: '思考模式', type: 'select', advanced: true,
     options: [
@@ -101,19 +101,19 @@ const MODEL_FIELDS: FieldDef[] = [
       { value: 'adaptive', label: '开启但不显示' },
       { value: 'off', label: '关闭' },
     ],
-    help: 'Claude 4.6+ 默认会先思考再回答，思考也消耗 token',
+    help: 'Claude 4.6 及以上版本默认先思考再回答，思考也会消耗 token',
   },
   {
     key: 'effort', label: '投入程度', type: 'select', advanced: true,
     options: [
-      { value: '', label: '默认' }, { value: 'low', label: 'low' },
-      { value: 'medium', label: 'medium' }, { value: 'high', label: 'high' },
-      { value: 'xhigh', label: 'xhigh' }, { value: 'max', label: 'max' },
+      { value: '', label: '默认' }, { value: 'low', label: '低' },
+      { value: 'medium', label: '中' }, { value: 'high', label: '高' },
+      { value: 'xhigh', label: '很高' }, { value: 'max', label: '最高' },
     ],
   },
   {
     key: 'temperature', label: '温度', type: 'number', min: 0, max: 2, step: 0.1, advanced: true,
-    help: 'Claude 4.6 之后的模型不支持，填了也会被自动忽略',
+    help: 'Claude 4.6 之后的模型不支持此项，填写后将被自动忽略',
   },
   { key: 'max_tokens', label: '最大输出 token', type: 'number', min: 1, advanced: true },
 ]
@@ -159,15 +159,15 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   output: {
     type: 'output', label: NODE_TYPE_LABEL.output, category: '起止', icon: FileOutput,
-    description: '收集结构化成果；配出具契约后升级为三档出具（完整 / 降档 / 不予出具）',
+    description: '收集结构化成果；配置出具契约后按三档出具（完整 / 降档 / 不予出具）',
     hasTarget: true, sources: [],
     fields: [
       { key: 'fields', label: '成果字段', type: 'ioFields' },
       {
         key: 'contract', label: '出具契约', type: 'json', syntax: 'template', advanced: true,
-        help: '{"metrics_from":["口径卡节点id"],"narrative":"{{ vars.report }}",'
-          + '"required":[…],"expected":[…],"allow_numbers":[…],"strict":false}。'
-          + '配了之后叙述里的每个数字必须能回指指标集，否则降档或不予出具',
+        help: '用 JSON 声明，可包含 metrics_from（口径卡节点 ID）、narrative（叙述）、required（必需指标）、'
+          + 'expected（期望指标）、allow_numbers（允许无出处的数字）、strict（严格模式）。'
+          + '配置后，叙述中的每个数字都必须能追溯到指标集，否则降档或不予出具',
       },
     ],
     defaults: { fields: [{ name: '结果', value: '{{ last_message }}' }] },
@@ -183,7 +183,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...MODEL_FIELDS,
       {
         key: 'output_schema', label: '结构化输出 Schema', type: 'json', advanced: true,
-        help: '填了就强制模型按此 JSON Schema 返回',
+        help: '填写后，模型必须按此 JSON Schema 返回',
       },
       { key: 'use_history', label: '带上对话历史', type: 'switch', advanced: true },
       ...COMMON_TAIL,
@@ -192,48 +192,49 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   agent: {
     type: 'agent', label: NODE_TYPE_LABEL.agent, category: '模型', icon: Bot,
-    description: '带工具循环，自己决定调什么工具',
+    description: '循环调用工具，由模型自主决定调用哪些工具',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
-      { key: 'system', label: '角色设定', type: 'textarea' },
+      { key: 'system', label: '系统提示', type: 'textarea' },
       { key: 'prompt', label: '任务', type: 'prompt' },
       { key: 'tools', label: '可用工具', type: 'tools' },
       { key: 'skills', label: '挂载 Skill', type: 'skills' },
       {
         key: 'max_steps', label: '最大步数', type: 'number', min: 1, max: 100, placeholder: '跟随设置',
-        help: '只是兜底。重复调用、连续几步没拿到新信息、预算用完、上下文快满时，它会先按查到的部分收尾。'
-          + '留空跟随「设置 → 运行默认值」；以前默认写进来的 12 也按留空处理',
+        // 早期界面新建的 Agent 节点在 defaults 里写死了 max_steps: 12，后端把 12 当成留空处理（跟随运行默认值）
+        help: '步数上限仅作保护。出现重复调用、连续多步没有新信息、预算用尽或上下文将满时，'
+          + 'Agent 会基于已获取的信息提前收尾。留空则使用「设置 → 运行默认值」',
       },
       {
-        key: 'budget_tokens', label: '令牌预算', type: 'number', min: 1000, step: 10000, advanced: true,
+        key: 'budget_tokens', label: 'token 预算', type: 'number', min: 1000, step: 10000, advanced: true,
         placeholder: '跟随设置',
-        help: '这个节点最多用多少令牌（输入加输出），用完就按查到的部分收尾。留空跟随设置，设置里可以改成不限',
+        help: '本节点最多使用的 token 数（输入加输出），用尽后按已获取的信息收尾。留空则使用设置中的值，设置中可改为不限',
       },
       {
         key: 'budget_usd', label: '金额预算（美元）', type: 'number', min: 0.01, step: 0.1, advanced: true,
         placeholder: '跟随设置',
-        help: '按模型目录里的价格估算。目录里没有价格的模型估不出金额，只能靠令牌预算',
+        help: '按模型目录中的价格估算。目录中未收录价格的模型无法估算金额，只能依靠 token 预算',
       },
       {
         key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS,
-        help: '需要审批时运行会暂停，等你在运行面板或记录页的审批卡上处理',
+        help: '需要审批时运行将暂停，请在运行面板或记录页的审批卡上处理',
       },
       {
         key: 'parallel_tools', label: '并行执行工具', type: 'switch', advanced: true,
-        help: '默认关闭：一轮只调一个工具，看到结果再想下一步。开启后一轮可发多个，更快，'
-          + '但这一批中间没有新的思考',
+        help: '默认关闭：每轮只调用一个工具，根据结果决定下一步。开启后每轮可同时调用多个工具，速度更快，'
+          + '但同一批调用之间不会重新推理',
       },
       {
         key: 'output_schema', label: '结构化输出 Schema', type: 'json', advanced: true,
-        help: '要把查到的数交给口径卡时写。写了还要开下面的「按出处核对字段」才生效；'
-          + '只写 Schema 不开，产出和以前一样只有文字',
+        help: '需要将查询结果交给口径卡时填写。填写后还需开启下方的「按出处核对字段」才会生效；'
+          + '只填写 Schema 而不开启时，输出仍为纯文本',
       },
       {
         key: 'cite_fields', label: '按出处核对字段', type: 'switch', advanced: true,
         // 已经开着的不锁：开了之后又清掉 Schema，得还能把它关上
-        disabled: (c) => (c.cite_fields || hasOutputSchema(c.output_schema) ? null : '先在上面写「结构化输出 Schema」才能开'),
-        help: '结束后多一次抽取调用：模型为 Schema 里每个字段写出它来自哪次查询的哪一格，系统按查询快照取值、'
-          + '核对，对不上的以快照为准；查不到的记为空，不兜底成 0。下游口径卡用 vars.变量名.字段 读',
+        disabled: (c) => (c.cite_fields || hasOutputSchema(c.output_schema) ? null : '需先填写上方的「结构化输出 Schema」'),
+        help: '运行结束后额外进行一次抽取调用：模型为 Schema 中的每个字段标注来源查询及单元格，系统按查询快照取值并核对，'
+          + '不一致时以快照为准；无法取得的记为空值，不以 0 代替。下游口径卡通过 vars.变量名.字段 读取',
       },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
@@ -242,7 +243,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   supervisor: {
     type: 'supervisor', label: NODE_TYPE_LABEL.supervisor, category: '模型', icon: Users,
-    description: '调度者按进展把任务分派给多个专家',
+    description: '调度者按进展将任务分派给多个团队成员',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'goal', label: '团队目标', type: 'prompt' },
@@ -258,25 +259,25 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           { value: 'fail', label: '判为失败（默认）' },
           { value: 'degrade', label: '降档交付' },
         ],
-        help: '最后一轮调度者仍没判定完成时怎么收场。判为失败：节点报错、运行停下，并点出一次都没'
-          + '被派到的成员；降档交付：把成员最后的原话交给下游，标上「未完成」，出具和复核随之降档。'
-          + '要出数、要出报告的，留在判为失败',
+        help: '最后一轮结束时调度者仍未判定完成的处理方式。判为失败：节点报错并停止运行，同时列出从未被分派任务的成员；'
+          + '降档交付：将成员最后的输出交给下游并标记「未完成」，出具和复核随之降档。'
+          + '需要产出数据或报告的工作流，建议保留「判为失败」',
       },
       {
-        key: 'max_parallel', label: '每轮最多同时派几人', type: 'number', min: 1, max: 6,
-        help: '互不依赖的任务调度者可以放在同一轮同时执行，总耗时按最慢的那个算。'
-          + '设为 1 即退回严格串行——并发的成员看到的是同一份进展快照，'
-          + '任务其实有依赖却被同时派出去，两个人会基于一样的旧信息重复劳动',
+        key: 'max_parallel', label: '每轮最大并行成员数', type: 'number', min: 1, max: 6,
+        help: '调度者可将互不依赖的任务放在同一轮并行执行，本轮耗时取决于最慢的成员。设为 1 则严格串行。'
+          + '同一轮的成员看到的是同一份进展快照，有依赖关系的任务若被同时分派，'
+          + '成员会基于相同的旧信息重复工作',
       },
       {
         key: 'approval', label: '审批策略', type: 'select', advanced: true,
         options: [
           APPROVAL_FOLLOW,
-          { value: 'dangerous', label: '需要审批的调用直接拦下' },
+          { value: 'dangerous', label: '直接拦截需要审批的调用' },
           { value: 'never', label: APPROVAL_POLICY_LABEL.never },
         ],
-        help: '成员们并行跑在一个节点里，停不下来等人审批。默认把危险工具和可写库上的写操作'
-          + '挡下来，并告诉成员换一种做法；需要逐次审批的事交给团队外的 agent 节点',
+        help: '团队成员在同一节点内并行执行，无法暂停等待审批。默认拦截危险工具及可写数据源上的写操作，'
+          + '并提示成员改用其他方式；需要逐次审批的操作请交给团队外的 Agent 节点',
       },
       ...MODEL_FIELDS,
       ...COMMON_TAIL,
@@ -289,7 +290,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'tool', label: '工具', type: 'tools', help: '只能选一个' },
-      { key: 'args', label: '参数', type: 'json', syntax: 'template', help: '值里可以用 {{ }} 引用上游' },
+      { key: 'args', label: '参数', type: 'json', syntax: 'template', help: '值中可用 {{ }} 引用上游数据' },
       { key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS },
       ...COMMON_TAIL,
     ],
@@ -297,7 +298,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   code: {
     type: 'code', label: NODE_TYPE_LABEL.code, category: '执行', icon: Code2,
-    description: '在隔离容器里执行代码',
+    description: '在 microVM 或系统沙箱中执行代码',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       {
@@ -307,34 +308,34 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           { value: 'node', label: 'Node.js' },
         ],
       },
-      { key: 'code', label: '代码', type: 'code', help: '代码里可以用 {{ }} 插值' },
+      { key: 'code', label: '代码', type: 'code', help: '代码中可用 {{ }} 插入变量' },
       { key: 'timeout', label: '超时（秒）', type: 'number', min: 1, max: 300 },
-      { key: 'memory_mb', label: '内存上限 MB', type: 'number', min: 64, max: 4096, advanced: true },
-      { key: 'network', label: '允许联网', type: 'switch', help: '默认断网' },
+      { key: 'memory_mb', label: '内存上限（MB）', type: 'number', min: 64, max: 4096, advanced: true },
+      { key: 'network', label: '允许联网', type: 'switch', help: '默认禁止联网' },
       {
         key: 'isolation', label: '隔离档位', type: 'select',
         options: [
-          { value: '', label: '跟随整机默认' },
-          { value: 'strict', label: 'strict：microVM（独立内核，内存真限得住）' },
-          { value: 'fast', label: 'fast：系统沙箱（低延迟，内存限不住）' },
+          { value: '', label: '跟随系统默认' },
+          { value: 'strict', label: '严格：microVM（独立内核，可严格限制内存）' },
+          { value: 'fast', label: '快速：系统沙箱（延迟低，无法限制内存）' },
         ],
-        help: '不可信代码用 strict；自己写的、已审核的用 fast。两档都拦不住 DNS 出网，'
-          + '真要防数据外泄得靠网络层。要的档位不可用时会退回默认并在时间线上告警',
+        help: '不可信代码请使用「严格」；自行编写或已审核的代码可使用「快速」。两档均无法阻止 DNS 出站请求，'
+          + '防止数据外泄需依靠网络层隔离。所选档位不可用时将回退到默认档位，并在时间线上告警',
       },
       {
         key: 'approval', label: '审批策略', type: 'select', advanced: true,
         // 代码节点不跟全局设置走（后端缺省就是 never），所以没有「跟随全局」
         options: [
           { value: 'never', label: APPROVAL_POLICY_LABEL.never },
-          { value: 'always', label: `${APPROVAL_POLICY_LABEL.always}（审批时可改代码）` },
+          { value: 'always', label: `${APPROVAL_POLICY_LABEL.always}（审批时可修改代码）` },
         ],
       },
       { key: 'fail_fast', label: '执行失败即中断', type: 'switch', advanced: true },
       {
         key: 'evidence_role', label: '证据角色', type: 'select', advanced: true,
         options: [{ value: '', label: '计算（默认）' }, { value: 'source', label: '取数' }],
-        help: '报告不能直接引用代码节点的产出，沙箱算出来的数要进口径卡。只是把外部数据原样取回来'
-          + '（调接口、读文件）的标「取数」；做了业务计算的留在「计算」，口径卡用它的数时会提醒',
+        help: '报告不能直接引用代码节点的输出，沙箱中计算的数值需经口径卡引用。仅原样获取外部数据'
+          + '（调用接口、读取文件）的，选择「取数」；包含业务计算的保留「计算」，口径卡引用其数值时会给出提醒',
       },
       ...COMMON_TAIL,
     ],
@@ -342,7 +343,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   branch: {
     type: 'branch', label: NODE_TYPE_LABEL.branch, category: '控制', icon: GitBranch,
-    description: '按条件或语义分类走不同的路',
+    description: '按条件表达式或模型分类进入不同分支',
     hasTarget: true, sources: null,
     fields: [
       {
@@ -393,7 +394,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   subgraph: {
     type: 'subgraph', label: NODE_TYPE_LABEL.subgraph, category: '控制', icon: Braces,
-    description: '把另一张工作流当成一个节点嵌进来',
+    description: '将另一个工作流作为单个节点嵌入',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'workflow_id', label: '工作流', type: 'select', options: [] },
@@ -417,9 +418,9 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       },
       {
         key: 'scope', label: '作用域', type: 'text', syntax: 'template',
-        help: '留空 = 跟随这次运行的默认作用域（设置 · 运行默认值）',
+        help: '留空则使用本次运行的默认作用域（「设置 → 运行默认值」）',
       },
-      { key: 'query', label: '回忆什么', type: 'prompt', when: (c) => c.action !== 'write' && c.action !== 'clear' },
+      { key: 'query', label: '检索内容', type: 'prompt', when: (c) => c.action !== 'write' && c.action !== 'clear' },
       { key: 'limit', label: '返回条数', type: 'number', min: 1, max: 20, when: (c) => c.action !== 'write' },
       { key: 'content', label: '记住的内容', type: 'prompt', when: (c) => c.action === 'write' },
       {
@@ -444,21 +445,21 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'query', label: '检索问题', type: 'prompt' },
       {
         key: 'collection', label: '知识库', type: 'collection',
-        help: '留空 = 跟随这次运行的默认知识库（设置 · 运行默认值）',
+        help: '留空则使用本次运行的默认知识库（「设置 → 运行默认值」）',
       },
       { key: 'limit', label: '返回片段数', type: 'number', min: 1, max: 20 },
       {
         key: 'rerank', label: '重排', type: 'select', advanced: true,
         options: [
           { value: 'off', label: '不重排' },
-          { value: 'model', label: '让模型重排（更准，多一次调用）' },
+          { value: 'model', label: '让模型重排（更准确，增加一次调用）' },
         ],
-        help: '开了会先多捞一些候选，再让模型按"对回答这个问题有多大帮助"重新排序',
+        help: '开启后先召回更多候选片段，再由模型按「对回答问题的帮助程度」重新排序',
       },
       {
-        key: 'alpha', label: '向量 vs 关键词', type: 'number', min: 0, max: 1, step: 0.1,
-        help: '1 = 纯语义相似，0 = 纯关键词匹配。留空则跟着向量模型的能力走'
-          + '——本地哈希向量没有语义泛化，给它权重反而会让命中率下降',
+        key: 'alpha', label: '向量与关键词权重', type: 'number', min: 0, max: 1, step: 0.1,
+        help: '1 表示纯语义相似，0 表示纯关键词匹配。留空则根据向量模型的能力自动选择；'
+          + '向量模型不具备语义能力时，提高该值反而会降低命中率',
       },
       { key: 'min_score', label: '最低分数', type: 'number', min: 0, max: 1, step: 0.05, advanced: true },
       ...COMMON_TAIL,
@@ -470,7 +471,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   transform: {
     type: 'transform', label: NODE_TYPE_LABEL.transform, category: '上下文', icon: Shuffle,
-    description: '不调模型，直接把数据揉成下游要的形状',
+    description: '不调用模型，直接将数据转换为下游所需的格式',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       {
@@ -492,7 +493,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   human: {
     type: 'human', label: NODE_TYPE_LABEL.human, category: '把关', icon: Hand,
-    description: '暂停运行，等人审批、补充信息或改草稿',
+    description: '暂停运行，等待人工审批、补充信息或修改草稿',
     hasTarget: true, sources: null,
     fields: [
       {
@@ -504,16 +505,16 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         ],
       },
       { key: 'title', label: '标题', type: 'text', syntax: 'template' },
-      { key: 'message', label: '给人看的内容', type: 'prompt' },
+      { key: 'message', label: '展示给审批人的内容', type: 'prompt' },
       { key: 'draft', label: '草稿内容', type: 'prompt', when: (c) => c.mode === 'edit' },
       { key: 'stop_on_reject', label: '驳回即终止运行', type: 'switch', when: (c) => c.mode === 'approve' },
       ...COMMON_TAIL,
     ],
-    defaults: { mode: 'approve', title: '需要你审批', message: '{{ last_message }}' },
+    defaults: { mode: 'approve', title: '待审批', message: '{{ last_message }}' },
   },
   validate: {
     type: 'validate', label: NODE_TYPE_LABEL.validate, category: '把关', icon: CheckCircle2,
-    description: '按 JSON Schema 校验，不合格可让模型自动返工',
+    description: '按 JSON Schema 校验，不合格时可由模型自动返工',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       { key: 'source', label: '待校验内容', type: 'prompt', placeholder: '{{ last_message }}' },
@@ -530,82 +531,82 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   report: {
     type: 'report', label: NODE_TYPE_LABEL.report, category: '模型', icon: FileText,
-    description: '带引用的报告：模型只写引用标记，数字由系统从口径卡取出来渲染，每个数字都能点开看出处',
+    description: '生成带引用的报告：模型写引用标记，系统从口径卡取值渲染，引用的数字可查看出处',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
       {
         key: 'instructions', label: '写作要求', type: 'prompt', placeholder: '为 {{ input.week }} 写周报，先总后分',
-        help: '写什么、怎么写。上游口径卡的指标和运行输入会自动整理成证据目录交给模型，不用在这里手抄',
+        help: '写作内容与要求。上游口径卡的指标和运行输入会自动整理成证据目录交给模型，无需在此手动填写',
       },
       {
         key: 'metrics_from', label: '指标来自', type: 'nodeRefs', refType: 'metrics',
-        help: '留空 = 用上游全部口径卡。报告里的数字只能引用这些卡里的指标',
+        help: '留空则使用上游全部口径卡。报告中的数字只能引用这些口径卡中的指标',
       },
       {
         // 后端只认 strict / off（report.py 的 NUMBERS）
-        key: 'numbers', label: '没写引用的数字', type: 'select',
+        key: 'numbers', label: '未引用的数字', type: 'select',
         options: [
-          { value: 'strict', label: '算违规，要求重写（默认）' },
-          { value: 'off', label: '只标出来，不要求重写' },
+          { value: 'strict', label: '计为违规，要求重写（默认）' },
+          { value: 'off', label: '仅标注，不要求重写' },
         ],
-        help: '报告里每个数字都该写成引用标记，由系统取值渲染。模型自己写的数字核对不到出处',
+        help: '报告中的每个数字都应写成引用标记，由系统取值渲染。模型自行写出的数字无法核对出处',
       },
       {
         // 留空不是「不处理」：后端按运行类别取默认，探索运行照常产出、正式运行判失败
         key: 'on_violation', label: '重写后仍有违规时', type: 'select',
         options: [
-          { value: '', label: '按运行类别：探索运行照常产出，正式运行判失败' },
-          { value: 'flag', label: '照常产出，把违规的地方标出来' },
-          { value: 'fail', label: '判为失败，报告不往下交' },
+          { value: '', label: '按运行类别：探索运行正常产出，正式运行判为失败' },
+          { value: 'flag', label: '正常产出，并标注违规之处' },
+          { value: 'fail', label: '判为失败，报告不再交给下游' },
         ],
       },
       {
-        key: 'max_repairs', label: '最多重写几次', type: 'number', min: 0, max: 3, placeholder: '1',
-        help: '有违规时把清单交回去让模型重写。每次都是一整篇的调用，写不对的模型多给几次也大多写不对',
+        key: 'max_repairs', label: '最多重写次数', type: 'number', min: 0, max: 3, placeholder: '1',
+        help: '存在违规时，将违规清单交回模型重写。每次重写都会重新生成全文，增加次数通常难以明显改善结果',
       },
       {
         // 后端认 off / require_citation / judge（schema.CLAIMS_VALUES）。没写等于 off：select 显示第一项，正好是默认
-        key: 'claims', label: '没挂依据的结论句', type: 'select',
+        key: 'claims', label: '未附依据的结论句', type: 'select',
         options: [
-          { value: 'off', label: '不管（默认）：不参与出具判档' },
+          { value: 'off', label: '不处理（默认）：不参与出具判档' },
           { value: 'require_citation', label: '计入缺口：出具按档位降档' },
-          { value: 'judge', label: '计入缺口，并请模型逐句判断证据支不支持' },
+          { value: 'judge', label: '计入缺口，并由模型逐句判断证据是否支持' },
         ],
-        help: '结论句是带数字、方向词或因果词的句子。选「计入缺口」时，写作提示要求每句结论挂上 [[see:…]] 依据，'
-          + '没挂的记为缺口、出具降档（系统自动链接的表名字段名不算依据）。选「请模型逐句判断」时，另一个模型按证据'
-          + '判断每句结论：正式运行里当场判、结果随报告封存，探索运行点开哪句判哪句；判断是模型给的，不是系统核对。'
-          + '受管级别发布必须显式选后两项之一，选模型判断的还要在高级选项里写金额上限（或写不限）',
-        unknownLabel: (v) => `${v}：不认识的值，只能选上面三项`,
+        help: '结论句指含数字、趋势词或因果词的句子。选择「计入缺口」时，未附依据的结论句计为缺口，出具随之降档'
+          + '（系统自动链接的表名、字段名不算依据）。选择「由模型逐句判断」时，另一个模型按证据判断每句结论：'
+          + '正式运行中当场判断并随报告封存，探索运行中按需逐句判断；结果为模型判断，并非系统核对。'
+          + '受管级别发布须选择后两项之一；选择由模型逐句判断时，还需在高级选项中填写金额上限（或选择不限）',
+        unknownLabel: (v) => `${v}：无法识别的值，请从上方选项中选择`,
       },
       {
         // claims 为 judge 时的子配置（schema.JUDGE_KEYS）。没写的上限用设置里「证据裁判」的默认值；写 null 是不限
         key: 'judge', label: '结论句裁判', type: 'judge', advanced: true,
         when: (c) => c.claims === 'judge' || (!!c.judge && typeof c.judge === 'object'),
-        help: '没写的上限用设置里「证据裁判」的默认值；勾「不限」写 null，只受其余上限约束。裁判模型建议和写报告的模型不同',
+        help: '未填写的上限使用「设置 → 证据裁判」中的默认值；勾选「不限」表示该项不设上限，仅受其余上限约束。建议裁判模型与撰写报告的模型不同',
       },
       {
         // 后端只认 link / off（report.py 的 ENTITIES）
         key: 'entities', label: '表名、字段名', type: 'select', advanced: true,
         options: [
-          { value: 'link', label: '核对，对得上的可以点开（默认）' },
+          { value: 'link', label: '核对并链接匹配的名称（默认）' },
           { value: 'off', label: '不核对' },
         ],
-        help: '报告里写到的表名、字段名按本次运行的表结构快照和查询核对：对得上的能点开看出处，'
-          + '反引号里写了哪里都没有的名字标成「可能是编造的名字」',
-        unknownLabel: (v) => `${v}：不认识的值，只能选 link 或 off`,
+        help: '报告中的表名、字段名按本次运行的表结构快照和查询核对：匹配的名称可点击查看出处，'
+          + '反引号中无从核对的名称标为「疑似不存在的名称」',
+        unknownLabel: (v) => `${v}：无法识别的值，请从上方选项中选择`,
       },
       ...MODEL_FIELDS,
-      { key: 'system', label: '角色设定', type: 'textarea', advanced: true, placeholder: '你是…' },
+      { key: 'system', label: '系统提示', type: 'textarea', advanced: true, placeholder: '你是…' },
       ...COMMON_TAIL,
     ],
     defaults: { instructions: '', numbers: 'strict', max_repairs: 1 },
   },
   metrics: {
     type: 'metrics', label: NODE_TYPE_LABEL.metrics, category: '把关', icon: Gauge,
-    description: '受控指标集：所有算术在这里发生，叙述层只能引用',
+    description: '受控指标集：用确定性表达式计算指标，结果可复算，供报告引用',
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [
-      { key: 'caliber_from', label: '口径卡从哪来', type: 'caliberFrom' },
+      { key: 'caliber_from', label: '口径卡来源', type: 'caliberFrom' },
       {
         key: 'caliber', label: '口径名称', type: 'text', syntax: 'template', placeholder: '周报口径',
         when: (c) => !c.caliber_from,
@@ -613,24 +614,24 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1', when: (c) => !c.caliber_from },
       { key: 'metrics', label: '指标定义', type: 'metricsList', when: (c) => !c.caliber_from },
       {
-        key: 'upgrade_policy', label: '上游发了新版本时', type: 'select', when: (c) => !!c.caliber_from,
+        key: 'upgrade_policy', label: '上游发布新版本时', type: 'select', when: (c) => !!c.caliber_from,
         options: [
-          { value: '', label: '没声明：上游有新版本时挡住正式运行' },
-          { value: 'recompute', label: `${UPGRADE_POLICY_LABEL.recompute}（recompute）` },
-          { value: 'dual', label: `${UPGRADE_POLICY_LABEL.dual}（dual）` },
-          { value: 'incomparable', label: `${UPGRADE_POLICY_LABEL.incomparable}（incomparable）` },
+          { value: '', label: '未声明：上游有新版本时阻止正式运行' },
+          { value: 'recompute', label: UPGRADE_POLICY_LABEL.recompute },
+          { value: 'dual', label: UPGRADE_POLICY_LABEL.dual },
+          { value: 'incomparable', label: UPGRADE_POLICY_LABEL.incomparable },
         ],
-        help: '钉住的那一版之后上游又发了新版本，正式运行前必须声明怎么处置，和子工作流的升版处置是同一套规则；'
-          + '声明了就照它执行，并记进运行记录',
+        help: '所固定的版本之后上游又发布了新版本时，正式运行前必须声明处置方式，规则与子工作流的升版处置相同；'
+          + '声明后按声明执行，并记入运行记录',
       },
       {
         key: 'on_missing', label: '缺输入时', type: 'select', advanced: true,
         options: [{ value: '', label: '整个节点失败' }, { value: 'null', label: '记为空值，交给出具契约判档' }],
-        help: '上游没给出某个指标要的数时怎么办。记为空值的指标在报告里显示「—」，出具契约按必需 / 期望项降档',
+        help: '上游未提供某个指标所需的数值时的处理方式。记为空值的指标在报告中显示「—」，出具契约按必需 / 期望项降档',
       },
       {
         key: 'assign_to', label: '结果存为变量', type: 'text',
-        help: '叙述节点用 {{ nodes.节点id.text }} 引用指标清单',
+        help: '报告撰写节点可用 {{ nodes.节点ID.text }} 引用指标清单',
       },
     ],
     defaults: {
@@ -662,7 +663,7 @@ export function sourceHandles(type: NodeType, config: Record<string, any>): Hand
       if (!key || seen.has(key)) continue
       seen.add(key)
       handles.push(key === 'default'
-        ? { id: 'default', label: `${c.label || '其他'}（兜底）`, color: 'var(--text-dim)' }
+        ? { id: 'default', label: `${c.label || '其他'}（默认）`, color: 'var(--text-dim)' }
         : { id: key, label: c.label || key, color: 'var(--text-dim)' })
     }
     if (!seen.has('default')) handles.push({ id: 'default', label: '其他', color: 'var(--text-faint)' })
@@ -677,7 +678,7 @@ export function sourceHandles(type: NodeType, config: Record<string, any>): Hand
   if (type === 'human') {
     if (config.mode === 'approve') {
       return [
-        { id: 'approved', label: '通过', color: 'var(--ok)' },
+        { id: 'approved', label: '批准', color: 'var(--ok)' },
         { id: 'rejected', label: '驳回', color: 'var(--err)' },
       ]
     }

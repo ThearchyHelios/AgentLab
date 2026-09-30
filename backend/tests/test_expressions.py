@@ -52,7 +52,7 @@ def test_braces_inside_a_string_literal_are_left_alone():
 @pytest.mark.parametrize("expr, hint", [
     ("{{ vars.items | length }} > 0", "len(x)"),         # 模板过滤器
     ("vars.gate in {'ok', 'fail'}", "用列表"),           # 集合写法
-    ("foo(vars.gate)", "能用的只有"),                    # 不认识的函数
+    ("foo(vars.gate)", "可用的函数"),                    # 不认识的函数
     ("'{{ vars.gate }}' == 'ok'", "不会被渲染"),         # 引号里的模板永远不成立
     ("vars.gate = 'ok'", "=="),                         # 赋值当比较
     ("[x for x in vars.items]", "列表推导式"),
@@ -103,7 +103,7 @@ def issues_of(*nodes):
 
 def test_a_broken_loop_condition_blocks_the_run():
     found = issues_of(node("lp", "loop", mode="while", condition="{{ vars.items | length }} > 0"))
-    assert any(level == "error" and "循环条件写错了" in msg and "len(x)" in msg for level, msg in found), found
+    assert any(level == "error" and "循环条件有误" in msg and "len(x)" in msg for level, msg in found), found
 
 
 def test_braces_are_a_warning_not_an_error():
@@ -121,26 +121,26 @@ def test_fields_that_are_not_evaluated_in_this_mode_are_not_checked():
         node("lp", "loop", mode="foreach", items="[1]", condition="这不是表达式 >>>"),
         node("t", "transform", mode="template", template="x", expression="这也不是 >>>"),
     )
-    assert not [m for lv, m in found if "写错了" in m], found
+    assert not [m for lv, m in found if "有误" in m], found
 
 
 def test_branch_in_llm_mode_is_not_checked_either():
     found = issues_of(node("br", "branch", mode="llm", cases=[{"key": "a", "condition": "随便写的描述"}]))
-    assert not [m for lv, m in found if "写错了" in m], found
+    assert not [m for lv, m in found if "有误" in m], found
 
 
 def test_skip_if_and_metrics_are_checked():
     found = issues_of(node("t", "transform", expression="1", skip_if="vars.x = 1"))
-    assert any("跳过条件写错了" in m for _, m in found), found
+    assert any("跳过条件有误" in m for _, m in found), found
     found = issues_of(node("m", "metrics", metrics=[{"id": "r", "expression": "foo(1)"}]))
-    assert any("指标「r」的表达式写错了" in m for _, m in found), found
+    assert any("指标「r」的表达式有误" in m for _, m in found), found
 
 
 def test_empty_while_condition_and_empty_transform_expression():
     found = issues_of(node("lp", "loop", mode="while", condition=""))
-    assert any(lv == "warning" and "一次都不会跑" in m for lv, m in found), found
+    assert any(lv == "warning" and "循环体不会执行" in m for lv, m in found), found
     found = issues_of(node("t", "transform", mode="expression", expression=""))
-    assert any(lv == "error" and "没有填表达式" in m for lv, m in found), found
+    assert any(lv == "error" and "还没有填写表达式" in m for lv, m in found), found
 
 
 # --------------------------------------------------------------------------

@@ -301,4 +301,4 @@ async def test_node_skipped_says_which_node_by_name_not_just_id():
     assert skipped.node_id == "bg"
     assert skipped.data.get("label") == "整理结果"
     assert skipped.data.get("node_type") == "transform"
-    assert "skip_if 成立" in skipped.data.get("reason", "")
+    assert "满足跳过条件" in skipped.data.get("reason", "")

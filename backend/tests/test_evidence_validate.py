@@ -29,15 +29,15 @@ SCHEMA = {"type": "object", "properties": {"gmv": {"type": "number"}}}
 
 def test_output_schema_without_cite_fields_warns():
     bot = node("bot", "agent", prompt="查", tools=["db_query__shop"], output_schema=SCHEMA, model="m")
-    [issue] = [i for i in issues(START, bot, OUT, node_id="bot") if "cite_fields" in i.message]
+    [issue] = [i for i in issues(START, bot, OUT, node_id="bot") if "按出处核对字段" in i.message]
     assert issue.level == "warning" and issue.field == "output_schema"
-    assert issue.message.startswith("output_schema 要开 cite_fields 才生效，会多一次抽取调用")
+    assert issue.message.startswith("「结构化输出 Schema」需要同时开启「按出处核对字段」才会生效（会多一次抽取调用）")
 
     cited = node("bot", "agent", prompt="查", tools=["db_query__shop"], output_schema=SCHEMA, cite_fields=True,
                  model="m")
-    assert not [i for i in issues(START, cited, OUT, node_id="bot") if "cite_fields" in i.message]
+    assert not [i for i in issues(START, cited, OUT, node_id="bot") if "按出处核对字段" in i.message]
     plain = node("bot", "agent", prompt="查", tools=["db_query__shop"], model="m")
-    assert not [i for i in issues(START, plain, OUT, node_id="bot") if "cite_fields" in i.message]
+    assert not [i for i in issues(START, plain, OUT, node_id="bot") if "按出处核对字段" in i.message]
 
 
 def test_caliber_fed_by_a_compute_code_node_warns():
@@ -47,17 +47,17 @@ def test_caliber_fed_by_a_compute_code_node_warns():
             {"id": "gmv", "expression": "vars.agg.gmv"}, {"id": "gmv2", "expression": "nodes.fetch.gmv * 2"}])
         return issues(START, fetch, card, OUT, node_id="card")
 
-    [issue] = [i for i in graph() if "evidence_role" in i.message]
+    [issue] = [i for i in graph() if "「证据角色」" in i.message]
     assert issue.level == "warning" and issue.field == "metrics[0].expression"
-    assert "「取数脚本」" in issue.message and "source" in issue.message
-    assert [i for i in graph(evidence_role="compute") if "evidence_role" in i.message]
-    assert not [i for i in graph(evidence_role="source") if "evidence_role" in i.message]
+    assert "「取数脚本」" in issue.message and "「取数」" in issue.message
+    assert [i for i in graph(evidence_role="compute") if "「证据角色」" in i.message]
+    assert not [i for i in graph(evidence_role="source") if "「证据角色」" in i.message]
 
 
 def test_evidence_role_must_be_source_or_compute():
     fetch = node("fetch", "code", code="print(1)", evidence_role="取数")
     [issue] = [i for i in issues(START, fetch, OUT, node_id="fetch") if i.field == "evidence_role"]
-    assert issue.level == "error" and "source" in issue.message and "compute" in issue.message
+    assert issue.level == "error" and "「取数」" in issue.message and "「计算」" in issue.message
 
 
 def test_report_without_a_model_gets_the_same_warning_as_llm():
@@ -86,7 +86,7 @@ def test_caliber_from_replaces_local_metrics():
 
     policy = node("card", "metrics", caliber_from=pinned, upgrade_policy="auto")
     [issue] = [i for i in issues(START, policy, OUT, node_id="card") if i.field == "upgrade_policy"]
-    assert issue.level == "error" and "recompute" in issue.message
+    assert issue.level == "error" and "「用新口径回算历史」" in issue.message
     ok = node("card", "metrics", caliber_from=pinned, upgrade_policy="dual")
     assert not [i for i in issues(START, ok, OUT, node_id="card") if i.level == "error"]
 

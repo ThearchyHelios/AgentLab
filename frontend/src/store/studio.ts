@@ -205,8 +205,8 @@ export function editLockOf(s: Pick<StudioState, 'copilot' | 'runPhase' | 'trace'
 
 /** 改图入口被拦下时说的话。检查器、节点库、快捷键都用这一份 */
 export const EDIT_LOCK_TEXT: Record<Exclude<EditLock, null>, string> = {
-  copilot: '助手正在改这张工作流：等它做完，或者先停下',
-  formal: '正式运行进行中，画布只读：它跑的是已发布的不可变版本，结束后再改',
+  copilot: '助手正在修改此工作流，请等待完成或先停止助手',
+  formal: '正式运行进行中，画布为只读：本次运行使用已发布的固定版本，请在运行结束后编辑',
 }
 
 /** 组件里订阅锁：只在锁的原因变了时重渲染 */
@@ -1673,7 +1673,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       // 恢复不直接调后端的 restore：那个接口不会把受管 / 已发布退回草稿，一张受管
       // 工作流恢复成未过闸的旧图后，工具栏仍会显示「受管」。走普通保存（PATCH）
       // 就会按规矩退回草稿，版本说明里写清是从哪一版回来的
-      pendingNote: `回滚到 v${version}`,
+      pendingNote: `恢复到 v${version}`,
     })
     void get().validate()
   },
@@ -1748,7 +1748,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       for (const type of dropped) {
         if (issues.some((i) => i.code === 'unknown_node_type' && i.type === type)) continue
         issues.push({ level: 'warning', node_id: null, code: 'unknown_node_type', type,
-                      message: `模型写了一个不存在的节点类型「${type}」，这一步已跳过` })
+                      message: `模型生成了不存在的节点类型「${type}」，已跳过该步骤` })
       }
       return issues
     }
@@ -1820,7 +1820,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       set({
         past, copilotNew: [],
         future: [...s.future, {
-          id: ++historySeq, label: '助手没做完的半成品', nodes: s.nodes, edges: s.edges, at: Date.now(),
+          id: ++historySeq, label: '助手未完成的修改', nodes: s.nodes, edges: s.edges, at: Date.now(),
         }],
       })
       afterJump(set, get, before.nodes, before.edges)
@@ -1913,8 +1913,8 @@ export const useStudio = create<StudioState>((set, get) => ({
               lastOp: c.status === 'repairing'
                 ? `第 ${c.round ?? 1} 轮修正：自查发现 ${issues.length} 处问题`
                 : c.status === 'passed'
-                  ? (c.repaired ? `自查发现的问题已修好（${c.repaired} 轮）` : '自查通过')
-                  : c.status === 'failed' ? `自查后还有 ${issues.length} 处问题` : '自查修正没跑成' } })
+                  ? (c.repaired ? `自查发现的问题已修复（${c.repaired} 轮）` : '自查通过')
+                  : c.status === 'failed' ? `自查后仍有 ${issues.length} 处问题` : '自查修正未完成' } })
             break
           }
           case 'reply': {
@@ -2124,7 +2124,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         // 否则侧栏会永远转圈，而后台其实什么都不会再来了。改了一半的画布退回去
         finished = true
         const outcome = revert()
-        const message = error ?? (outcome === 'reverted' ? '这一轮没收尾就断了，画布已退回这一轮之前' : '')
+        const message = error ?? (outcome === 'reverted' ? '本轮连接中断，画布已恢复到本轮之前的状态' : '')
         settle(message ? { phase: 'error', error: message, outcome } : { phase: 'done', outcome })
         finish({ error: message })
       },
@@ -2184,7 +2184,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     } catch (e) {
       // 建不成就不带会话：下一条指令没有历史，而不是悄悄带着旧的
       set({ copilotConversationId: null })
-      toast.error(e, { detail: '新对话没建成，下一条指令会不带任何历史发出' })
+      toast.error(e, { detail: '新对话创建失败，下一条指令将不带历史记录发送' })
     }
   },
 
@@ -2195,7 +2195,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     if (turn?.check && turn.check.status !== 'passed') lines.push(...turn.check.issues)
     for (const i of turn?.issues ?? []) {
       if (i.code === 'unknown_node_type') {
-        lines.push(`上一轮少了一步：用了不存在的节点类型「${i.type ?? '?'}」，请换成现有的节点类型把这一步补上`)
+        lines.push(`上一轮缺少一步：使用了不存在的节点类型「${i.type ?? '?'}」，请换用现有的节点类型补上这一步`)
       } else if (i.level === 'error') {
         lines.push(i.message)
       }
@@ -2208,11 +2208,11 @@ export const useStudio = create<StudioState>((set, get) => ({
       }
     }
     if (!lines.length) {
-      toast.info('没有需要修的问题')
+      toast.info('没有需要修复的问题')
       return
     }
     const unique = [...new Set(lines)]
-    const instruction = '修正这张工作流里的下列问题，只改有问题的地方，其他节点保持原样：\n'
+    const instruction = '修正此工作流中的下列问题，只修改有问题的地方，其他节点保持不变：\n'
       + unique.map((l, i) => `${i + 1}. ${l}`).join('\n')
     get().runCopilot(instruction, true, s.copilot.model || null)
   },
@@ -2227,7 +2227,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       return false
     }
     if (!turn?.checkpoint || !top || top.id !== turn.checkpoint || s.copilot.active) {
-      toast.warn(`这一轮之后画布又改过了，不能单独撤掉它。用 ${formatShortcut('Mod+Z')} 逐步撤回，或者在版本历史里找回`)
+      toast.warn(`本轮之后画布已有其他修改，无法单独撤销本轮。请使用 ${formatShortcut('Mod+Z')} 逐步撤销，或从版本历史中恢复`)
       return false
     }
     get().undo()

@@ -122,7 +122,7 @@ function cancelNote(events: RunEvent[]): string {
     if (e.type === 'run.cancelled') {
       const who = typeof e.data?.actor === 'string' ? e.data.actor.trim() : ''
       const what = typeof e.data?.message === 'string' ? e.data.message.trim() : ''
-      note = what ? `${who ? `${who} ` : ''}${what}` : who ? `${who} 取消了这次运行` : ''
+      note = what ? `${who ? `${who} ` : ''}${what}` : who ? `${who} 取消了本次运行` : ''
     }
     break
   }
@@ -135,27 +135,27 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
   const running = Object.keys(states).filter((id) => states[id] === 'running')
   switch (phase) {
     case 'queued':
-      return '排队中：等空出运行名额'
+      return '排队中：等待空闲的运行名额'
     case 'running': {
       const exec = running.filter((id) => !t.nodes[id]?.looping)
       if (!exec.length) {
         const loop = running.find((id) => t.nodes[id]?.looping)
-        return loop ? `「${label(loop)}」第 ${t.nodes[loop]?.iteration ?? 1} 轮之间` : '调度下一步…'
+        return loop ? `「${label(loop)}」第 ${t.nodes[loop]?.iteration ?? 1} 轮之间` : '正在调度下一步…'
       }
       // 协作团队：几个人同时在干
       const team = exec.map((id) => {
         const members = t.nodes[id]?.segments.filter((s) => s.kind === 'member' && s.start <= at
           && (s.end == null || s.end > at)).length ?? 0
-        return members > 1 ? `${label(id)} · ${members} 人并行` : label(id)
+        return members > 1 ? `${label(id)} · ${members} 名成员并行` : label(id)
       })
-      return team.slice(0, 2).join(' // ') + (team.length > 2 ? ` 等 ${team.length} 个` : '')
+      return team.slice(0, 2).join('、') + (team.length > 2 ? ` 等 ${team.length} 个` : '')
     }
     case 'waiting': {
       // 相位已经写着「等待审批」，这一句说停在谁、等了多久（和坞头、泳道同一个数，见 waitedMs）
       const id = t.waitingNodeId ?? Object.keys(states).find((k) => states[k] === 'waiting')
-      if (!id) return '等人处理审批卡'
+      if (!id) return '等待处理审批'
       const waited = waitedMs(t, id, at)
-      return `停在「${label(id)}」${waited != null ? ` · 已等 ${formatLapse(waited)}` : ''}`
+      return `停在「${label(id)}」${waited != null ? ` · 已等待 ${formatLapse(waited)}` : ''}`
     }
     case 'failed': {
       const id = t.failedNodeId
@@ -170,7 +170,7 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
       return cancelled ? `${cancelled} · ${where}` : where
     }
     case 'suspended':
-      return '服务重启时挂起，可从断点接着跑'
+      return '服务重启时挂起，可从断点继续运行'
     default:
       return ''
   }
@@ -236,14 +236,14 @@ export function useRunGlance(active: boolean): RunGlance {
     const waited = waitedMs(trace, c.id, at)
     attention.push({
       kind: 'waiting', nodeId: c.id, title: `等待审批 · ${c.label}`,
-      detail: waited != null ? `已等 ${formatLapse(waited)}` : undefined,
+      detail: waited != null ? `已等待 ${formatLapse(waited)}` : undefined,
     })
   }
   if (remainingMs != null && limitMs != null && remainingMs < Math.max(60_000, limitMs * 0.2)) {
     const running = cells.find((c) => c.state === 'running')
     attention.push({
       kind: 'budget', nodeId: running?.id, title: '时限将尽',
-      detail: `这一段执行还剩 ${formatLapse(remainingMs, false)}，上限 ${formatDuration(limitMs)}`,
+      detail: `本段执行剩余 ${formatLapse(remainingMs, false)}，上限 ${formatDuration(limitMs)}`,
     })
   }
 
@@ -283,7 +283,7 @@ export function gotoApproval(nodeId: string | undefined): void {
     if (!slot) {
       if (tries++ < 12) requestAnimationFrame(find)
       // 审批列表几秒轮询一次：刚停下来时卡片可能还没到，说实话，别让按钮像是坏了
-      else toast.info('审批卡还没出现在右栏：审批列表每几秒刷新一次，稍等再点', { key: 'hud:approval' })
+      else toast.info('审批卡尚未显示在右栏（审批列表每隔几秒刷新），请稍后再试', { key: 'hud:approval' })
       return
     }
     const card = slot.querySelector<HTMLElement>('[data-approval]') ?? slot
@@ -313,8 +313,8 @@ async function stop(): Promise<void> {
 async function abandon(): Promise<void> {
   const ok = await confirmDialog({
     title: '放弃这次运行？',
-    body: '运行停在审批上，放弃之后它记为已取消，不能再接着跑。',
-    consequences: ['等着处理的审批卡一并关闭，留痕里写上是谁放弃的', '已经跑完的节点结果照样留在记录里'],
+    body: '运行正在等待审批。放弃后将记为已取消，且无法继续运行。',
+    consequences: ['待处理的审批卡将一并关闭，操作记录中会写明放弃人', '已完成节点的结果仍保留在记录中'],
     confirmLabel: '放弃这次运行',
     danger: true,
   })
@@ -347,8 +347,8 @@ function useResume(phase: RunPhase) {
   )
   const structureChanged = structure != null && snapshot !== structure
   const blockedBy = structureChanged
-    ? '增删过节点或连线：接着跑只接受结构没变的工作流，需要重新运行'
-    : phase === 'failed' && errors ? `画布上有 ${errors} 个问题要先改掉` : ''
+    ? '工作流结构已变更（增删过节点或连线），无法从断点继续，请重新运行'
+    : phase === 'failed' && errors ? `请先修正画布上的 ${errors} 个问题` : ''
   const resume = async () => {
     setBusy(true)
     try {
@@ -359,7 +359,7 @@ function useResume(phase: RunPhase) {
       } else {
         await s.continueRun()
       }
-      toast.ok('从断点接着跑，前面跑过的节点不重来')
+      toast.ok('已从断点继续运行，已完成的节点不会重新执行')
     } catch (e) {
       toast.error(e)
     } finally {
@@ -508,7 +508,7 @@ export function RunCapsule() {
   const actions = (compact: boolean) => {
     if (g.replay) {
       return (
-        <Act icon={<Radio size={11} />} text="回到实时" title="游标回到现在"
+        <Act icon={<Radio size={11} />} text="回到实时" title="游标回到当前时刻"
              onClick={() => { useDock.getState().set({ playing: false }); useStudio.getState().setReplayAt(null) }} />
       )
     }
@@ -527,7 +527,7 @@ export function RunCapsule() {
                  onClick={() => gotoApproval(g.waitingNodeId ?? g.attention.find((a) => a.kind === 'waiting')?.nodeId)} />
             {/* 次级动作：胶囊里只留图标，面板里写全名 */}
             <Act className="btn-ghost sf-btn-abandon" icon={<Ban size={11} />} text="放弃这次运行" iconOnly={compact}
-                 title="不批了：这次运行记为已取消，待审批一并关闭" onClick={() => void abandon()} />
+                 title="放弃审批：本次运行记为已取消，待审批事项一并关闭" onClick={() => void abandon()} />
           </>
         )
       case 'failed':
@@ -535,11 +535,11 @@ export function RunCapsule() {
           <>
             {g.failedNodeId && (
               <Act icon={<LocateFixed size={11} />} text="定位" iconOnly={compact}
-                   title="画布取景到失败的节点" onClick={() => focus(g.failedNodeId)} />
+                   title="在画布上定位失败的节点" onClick={() => focus(g.failedNodeId)} />
             )}
-            <Act className="btn-primary" disabled={busy || !!blockedBy} text="接着跑"
+            <Act className="btn-primary" disabled={busy || !!blockedBy} text="继续运行"
                  icon={busy ? <Spinner size={10} /> : <RotateCw size={11} />}
-                 title={blockedBy || '从失败的那个节点接着跑，前面跑过的节点不重来。只能改节点配置'}
+                 title={blockedBy || '从失败的节点继续运行，已完成的节点不会重新执行。仅可修改节点配置'}
                  onClick={() => void resume()} />
             {!compact && <ClearButton kbd />}
           </>
@@ -547,9 +547,9 @@ export function RunCapsule() {
       case 'suspended':
         return (
           <>
-            <Act className="btn-primary" disabled={busy} text="接着跑"
+            <Act className="btn-primary" disabled={busy} text="继续运行"
                  icon={busy ? <Spinner size={10} /> : <RotateCw size={11} />}
-                 title="服务重启打断了这次运行，checkpoint 完好，从断点恢复"
+                 title="服务重启中断了本次运行，断点数据完好，可从断点继续运行"
                  onClick={() => void resume()} />
             {!compact && <ClearButton kbd />}
           </>
@@ -576,7 +576,7 @@ export function RunCapsule() {
       <div className={clsx('sf-capsule', alert && 'is-alert')} data-phase={g.phase} data-replay={g.replay ? '1' : undefined}>
         <button type="button" className="sf-cap-main" onClick={() => setOpen((v) => !v)}
                 aria-expanded={open} aria-haspopup="dialog"
-                title={open ? '收起运行遥测' : `${g.label} · ${g.headline}\n点开看遥测`}>
+                title={open ? '收起运行遥测' : `${g.label} · ${g.headline}\n点击查看运行遥测`}>
           <StatusBadge status={g.code} size={14} animate={g.executing} decorative />
           <span className="sf-cap-label">{g.replay ? `回放 · ${g.label}` : g.label}</span>
           {/* 结束之后工具栏还要放发起按钮：窄屏上计时收进面板和航迹里 */}
@@ -626,7 +626,7 @@ export function RunCapsule() {
 
           <div className="sf-hud-grid">
             <div className="sf-metric">
-              <div className="sf-metric-k">墙钟</div>
+              <div className="sf-metric-k">总时长</div>
               {/* 过了一天只写「T+9 天」：这一格窄，「T+9 天 03:30:45」会压到旁边的节点数上。
                   完整的在悬停里，跳秒的读数在胶囊和航迹游标上，下面两行是执行、等人各多久 */}
               <div className="sf-metric-v tnum" title={`T+${formatOffset(g.elapsedMs)}`}>
@@ -635,7 +635,7 @@ export function RunCapsule() {
               {/* 执行和等人分两行：挤在一行时后半截被截掉，恰好是等人那段 */}
               <div className="sf-metric-s tnum">执行 {formatLapse(g.activeMs)}</div>
               {(g.waitMs > 0 || g.phase === 'waiting') && (
-                <div className={clsx('sf-metric-s tnum', g.phase === 'waiting' && 'sf-warn')}>等人 {formatLapse(g.waitMs)}</div>
+                <div className={clsx('sf-metric-s tnum', g.phase === 'waiting' && 'sf-warn')}>等待审批 {formatLapse(g.waitMs)}</div>
               )}
             </div>
             <div className="sf-metric sf-metric-wide">
@@ -665,15 +665,15 @@ export function RunCapsule() {
                     <Budget remaining={g.remainingMs} limit={g.limitMs} />
                     余 {formatLapse(g.remainingMs, false)}
                   </div>
-                  <div className="sf-metric-s" title="每一段执行各算各的：审批恢复、接着跑之后重新计">
+                  <div className="sf-metric-s" title="每段执行单独计时：审批恢复或继续运行后重新计时">
                     上限 {formatDuration(g.limitMs)}
                   </div>
                 </>
               ) : (
                 <>
                   <div className="sf-metric-v">{g.phase === 'waiting' ? '暂停计时' : NONE}</div>
-                  <div className="sf-metric-s" title={g.phase === 'waiting' ? '等人审批不算执行时间，时限不走' : undefined}>
-                    {g.phase === 'waiting' ? '等人不计时' : g.limitMs ? `上限 ${formatDuration(g.limitMs)}` : ''}
+                  <div className="sf-metric-s" title={g.phase === 'waiting' ? '等待审批不计入执行时间，时限暂停' : undefined}>
+                    {g.phase === 'waiting' ? '等待审批不计时' : g.limitMs ? `上限 ${formatDuration(g.limitMs)}` : ''}
                   </div>
                 </>
               )}
@@ -686,7 +686,7 @@ export function RunCapsule() {
               if (!ids.length) return null
               const meta = statusMeta(st)
               return (
-                <button key={st} type="button" className="sf-count" title={`${meta.label} ${ids.length} 个 · 点一下逐个定位`}
+                <button key={st} type="button" className="sf-count" title={`${meta.label} ${ids.length} 个 · 点击逐个定位`}
                         onClick={() => { focus(ids[cycle.current % ids.length]); cycle.current += 1 }}>
                   <StatusBadge status={st} size={12} animate={false} decorative />
                   <span className="tnum">{ids.length}</span>

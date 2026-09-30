@@ -239,9 +239,9 @@ def why_empty(cache: dict[str, Any]) -> str:
     要先解决超时或换 schema。以前两者说的是同一句话。
     """
     if not cache.get("failed"):
-        return "还没有探查过结构"
+        return "尚未探查结构"
     err = str(cache.get("error") or "").strip()
-    return f"结构探查失败了：{err[:200]}" if err else "结构探查失败了"
+    return f"结构探查失败：{err[:200]}" if err else "结构探查失败"
 
 
 def _empty_summary(source: Any, cache: dict[str, Any]) -> str:
@@ -325,13 +325,13 @@ def describe_table(source: Any, table: str) -> str:
             # "没有 X。现有的对象：（还没探查过结构）"，白花一整步
             return (
                 f"数据源「{source.name}」的结构信息不可用（{why_empty(cache)}），"
-                "所以无法判断有没有这张表。请直接查数据字典"
+                "因此无法判断是否存在这张表。请直接查询数据字典"
                 "（information_schema.tables / columns，SQLite 用 sqlite_master）。"
             )
         available = "、".join(
             m.get("qualified", n) for n, m in list(tables.items())[:30]
         )
-        return f"数据源「{source.name}」里没有 {table}。现有的对象：{available}"
+        return f"数据源「{source.name}」中没有 {table}。现有的对象：{available}"
 
     head = f"{'视图' if meta.get('is_view') else '表'} {meta.get('qualified', table)}"
     if meta.get("comment"):

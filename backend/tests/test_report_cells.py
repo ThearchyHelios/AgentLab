@@ -176,13 +176,13 @@ def test_integer_decimal_text_renders_as_a_number():
 @pytest.mark.parametrize("marker, words", [
     ("[[v:Q1.r7.amount]]", "只有 7 行"),
     ("[[v:Q1.r0.gmv]]", "没有列「gmv」"),
-    ("[[v:Q9.r0.amount]]", "目录里没有 Q9"),
+    ("[[v:Q9.r0.amount]]", "查询结果 Q9 不存在"),
     ("[[v:K1.r0.amount]]", "不是查询结果"),
-    ("[[v:Q1.amount]]", "Q<编号>.r<行>.<列>"),
-    ("[[v:Q2.r0.amount]]", "取不回来"),
+    ("[[v:Q1.amount]]", "单元格引用格式无法识别"),
+    ("[[v:Q2.r0.amount]]", "无法读取"),
     ("[[v:Q1.r0.region|万]]", "不是数"),
     ("[[v:N:calc.total]]", CODE_REASON),
-    ("[[v:N:fetch.total]]", "后续版本"),
+    ("[[v:N:fetch.total]]", "不支持引用节点字段"),
 ])
 def test_unresolvable_cells_say_why(catalog, marker, words):
     doc = compose_doc(f"值 {marker}。", catalog)
@@ -190,6 +190,24 @@ def test_unresolvable_cells_say_why(catalog, marker, words):
     assert ref == marker[2:-2] and words in message, message
     [seg] = [s for s in segs(doc) if s.get("ref")]
     assert seg["state"] == "none" and seg["issue"] == "unresolved_ref" and seg["text"].startswith("⟦?v:")
+
+
+def test_reasons_for_people_and_rewrite_instructions_for_the_writer_are_separate(catalog):
+    """解析不了的原因给人看（证据面板、出具横幅、节点报错），写法指令只交回写作者（模型）改写：
+    「单元格要写成 Q<编号>.r<行>.<列>」这类话不上界面，也不存进文档。"""
+    from app.engine.evidence import describe_violations
+
+    doc = compose_doc("值 [[v:Q1.amount]]，另见 [[v:Q9.r0.amount]]。", catalog)
+    by_ref = {v["ref"]: v for v in doc["violations"] if v["code"] == "unresolved_ref"}
+    shape, missing = by_ref["v:Q1.amount"], by_ref["v:Q9.r0.amount"]
+    assert shape["message"] == "引用 [[v:Q1.amount]] 无法解析：单元格引用格式无法识别"
+    assert "Q<编号>.r<行>.<列>" in shape["for_model"] and "Q<编号>" not in shape["message"]
+    assert "查询结果 Q9 不存在" in missing["message"] and "证据目录" in missing["for_model"]
+    for seg in segs(doc):
+        assert "for_model" not in (seg.get("cite") or {}), "文档里只存给人看的原因"
+        assert "Q<编号>" not in str((seg.get("cite") or {}).get("reason") or "")
+    written = describe_violations(doc["violations"])
+    assert "Q<编号>.r<行>.<列>" in written and "目录里没有 Q9" in written and "单元格引用格式无法识别" not in written
 
 
 def test_tampered_snapshot_is_refused(stored, tmp_path):
@@ -200,7 +218,7 @@ def test_tampered_snapshot_is_refused(stored, tmp_path):
         path.write_text(original.replace("18230.5", "99999.5"), encoding="utf-8")
         catalog = build_catalog(nodes={}, ledger=[_query(stored["snap"], SNAP)])
         doc = compose_doc("值 [[v:Q1.r0.amount]]", catalog)
-        assert "对不上" in bad(doc)["v:Q1.r0.amount"]
+        assert "与哈希不一致" in bad(doc)["v:Q1.r0.amount"]
         assert "99,999.5" not in doc["markdown"]
     finally:
         path.write_text(original, encoding="utf-8")
@@ -252,10 +270,10 @@ def test_table_defaults_to_the_first_five_rows_and_all_columns(catalog):
     ("[[table:Q1 rows=5-9]]", "只有 7 行"),
     ("[[table:Q1 rows=3-1]]", "rows"),
     ("[[table:Q1 cols=region,gmv]]", "没有列「gmv」"),
-    ("[[table:Q1 limit=3]]", "不认识的选项"),
-    ("[[table:Q4]]", "cols="),
+    ("[[table:Q1 limit=3]]", "无法识别的选项"),
+    ("[[table:Q4]]", "超过整表上限"),
     ("[[table:Q5]]", "0 行"),
-    ("[[table:Q2]]", "取不回来"),
+    ("[[table:Q2]]", "无法读取"),
     ("[[table:K1]]", "不是查询结果"),
 ])
 def test_table_problems_are_violations(catalog, marker, words):
@@ -394,7 +412,7 @@ def test_catalog_prompt_shows_query_rows_and_how_to_cite(catalog):
     assert "Q1" in prompt and "region, amount, orders, note" in prompt
     assert "[[v:Q1.r0.amount]]" in prompt and "[[table:Q1" in prompt
     assert "r0" in prompt and "华东" in prompt and "18,230.5" in prompt
-    assert "Q2" in prompt and "取不回来" in prompt
+    assert "Q2" in prompt and "无法读取" in prompt
     refused = catalog_prompt(catalog, cells_allowed=False)
     assert "[[v:" not in refused and "[[see:Q1]]" in refused
 

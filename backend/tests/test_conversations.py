@@ -279,7 +279,7 @@ async def test_the_first_turn_has_nothing_to_fall_back_on(client, monkeypatch) -
     ])
     assert final["op"] == "final"
     assert final["graph"]["nodes"] == []
-    assert any("空" in str(i.get("message", "")) for i in final["issues"]), final["issues"]
+    assert any("还没有节点" in str(i.get("message", "")) for i in final["issues"]), final["issues"]
 
 
 # --------------------------------------------------------------------------

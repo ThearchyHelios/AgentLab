@@ -64,7 +64,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
 
   useEffect(() => {
     if (d.state !== 'missing') return
-    toast.info('这条运行记录不在了，可能已经被删除')
+    toast.info('该运行记录不存在，可能已被删除')
     navigate({ pathname: '/runs', search }, { replace: true })
   }, [d.state, navigate, search])
 
@@ -203,7 +203,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     setBusy('stop')
     try {
       await api.runs.cancel(run.id)
-      toast.info('已发出停止，正在收尾…')
+      toast.info('已发送停止请求，正在收尾…')
     } catch (e) {
       toast.error(e)
     } finally {
@@ -218,11 +218,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     const ok = await confirmDialog({
       title: '放弃这次运行？',
       body: code === 'waiting'
-        ? `「${runName(run)}」停在审批上。放弃之后它不会再往下跑，也不能再恢复。`
-        : `「${runName(run)}」挂起在断点上。放弃之后不能再接着跑。`,
+        ? `「${runName(run)}」正在等待审批。放弃后运行将终止，且无法恢复。`
+        : `「${runName(run)}」已在断点处挂起。放弃后将无法继续运行。`,
       consequences: [
-        ...(n ? [`${n} 条待审批一并关闭，${actor ? `留痕署名「${actor}」` : '留痕记为未署名（署名在 设置 → 偏好设置 里填）'}`] : []),
-        '运行记为已取消；已经跑完的节点、产出和事件照样保留',
+        ...(n ? [`${n} 条待审批一并关闭，${actor ? `留痕署名「${actor}」` : '留痕记为未署名（可在「设置 → 偏好设置」中填写署名）'}`] : []),
+        '运行记为已取消；已完成的节点、产出和事件仍会保留',
       ],
       danger: true,
       confirmLabel: '放弃这次运行',
@@ -265,7 +265,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     const formal = run.run_class === 'formal' && !!run.workflow_id && !workflowGone
     const wf = formal ? workflows.find((w) => w.id === run.workflow_id) : undefined
     if (wf && !wf.published_version) {
-      toast.error(`「${wf.name}」现在没有发布版本，正式运行发不起来：先到画布发布`, {
+      toast.error(`「${wf.name}」尚无发布版本，无法发起正式运行，请先在画布中发布`, {
         action: canvasHref ? { label: '去画布', onClick: () => navigate(canvasHref) } : undefined,
       })
       return
@@ -274,14 +274,14 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     const value = await promptDialog({
       title: `补上「${field}」，重新运行`,
       body: formal
-        ? `正式运行只跑当前发布的版本${published ? `：这次跑 v${published}${run.version && run.version !== published ? `，不是原来那次的 v${run.version}` : ''}` : ''}。其余输入照旧，发起一次新的运行；这条失败的记录保留。`
+        ? `正式运行只使用当前发布的版本${published ? `：本次使用 v${published}${run.version && run.version !== published ? `，而非原运行的 v${run.version}` : ''}` : ''}。其余输入不变，将发起一次新的运行；这条失败记录会保留。`
         : run.run_class === 'formal'
-          ? '工作流已经删除，正式运行发不起来：这次按探索运行，用这次运行时的工作流快照，其余输入照旧；这条失败的记录保留。'
-          : '用这次运行时的工作流快照，其余输入照旧，发起一次新的运行；这条失败的记录保留。',
+          ? '工作流已删除，无法发起正式运行。本次将以探索运行方式，使用原运行时的工作流快照，其余输入不变；这条失败记录会保留。'
+          : '使用原运行时的工作流快照，其余输入不变，发起一次新的运行；这条失败记录会保留。',
       label: field,
       placeholder: `填写 ${field}`,
       confirmLabel: '重新运行',
-      validate: (v) => (v.trim() ? null : '这一项是必填的'),
+      validate: (v) => (v.trim() ? null : '此项为必填项'),
     })
     if (value == null) return
     setBusy('rerun')
@@ -298,7 +298,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
           graph, input, ...scope,
         })
       }
-      toast.ok(`已补上「${field}」重新发起运行`)
+      toast.ok(`已补上「${field}」并重新发起运行`)
       navigate({ pathname: `/runs/${next.id}`, search })
     } catch (e) {
       // 绑定的工具在本机不存在（422 run_tool_missing）：和画布上发起被拒（run/RunControl）同一套，
@@ -368,7 +368,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const revealStep = (nodeId: string) => inStream(() => {
     const rows = [...(streamBox.current?.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(nodeId)}"]`) ?? [])]
     if (!rows.length) {
-      toast.info(`时间线里没有「${labelOf(nodeId) ?? nodeId}」的步骤：它没有执行过`)
+      toast.info(`时间线中没有「${labelOf(nodeId) ?? nodeId}」的步骤：该节点未执行`)
       return
     }
     rows[0].scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'center' })
@@ -398,7 +398,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       const res = await api.copilot.fromRun(run.id)
       void refreshCatalog()
       toast.ok(
-        `已提取为草稿「${res.name}」：${res.nodes} 个节点${res.dropped_nodes ? `，剪掉 ${res.dropped_nodes} 个没走到的` : ''}`,
+        `已提取为草稿「${res.name}」：${res.nodes} 个节点${res.dropped_nodes ? `，已移除 ${res.dropped_nodes} 个未执行的节点` : ''}`,
       )
       // 提取出来的草稿接下来一定要去画布审改，直接带过去。上面已经问过，这一跳不再问
       navigate(`/studio/${res.workflow_id}`, leavePass())
@@ -417,7 +417,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       consequences: [
         '事件流、产出工件和审批留痕一起删除，不可恢复',
         ...(sealed ? ['封存清单再也无法核对，这条运行不能再作为追溯凭证'] : []),
-        ...(code === 'waiting' ? ['停在审批上的那一步也随之作废'] : []),
+        ...(code === 'waiting' ? ['正在等待审批的步骤也将随之作废'] : []),
       ],
       danger: true,
       confirmLabel: '删除记录',
@@ -434,7 +434,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
           const forced = await confirmDialog({
             title: '强制删除已封存的正式运行？',
             body: e.message,
-            consequences: ['删除之后任何人都无法再核对这次出具的来源'],
+            consequences: ['删除后将无法再核对本次出具的来源'],
             danger: true,
             requireText: run.id.slice(0, 6),
             confirmLabel: '强制删除',
@@ -463,7 +463,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     {
       key: 'delete', label: '删除记录…', icon: <Trash2 size={12} />, danger: true, onSelect: () => void remove(),
       disabled: live || busy === 'delete',
-      hint: live ? '运行中不能删除：先停止它' : undefined,
+      hint: live ? '运行中无法删除，请先停止运行' : undefined,
     },
   ]
 
@@ -523,12 +523,12 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const unsaved = isUnsaved(run)
   const artifactCount = artifacts.items?.length
   const viewTabs: TabItem<DetailView>[] = [
-    { key: 'stream', label: '时间线', title: '逐步看每个节点做了什么、说了什么' },
-    { key: 'trace', label: '航迹', title: '按时间摊开：慢在哪、卡在哪、谁和谁同时；拖到任意一刻回放' },
+    { key: 'stream', label: '时间线', title: '逐步查看每个节点的执行过程和输出' },
+    { key: 'trace', label: '航迹', title: '按时间展开各节点，查看耗时、阻塞和并行情况；可拖动到任意时刻回放' },
     { key: 'evidence', label: EVIDENCE_AUDIT_TEXT.tab, title: EVIDENCE_AUDIT_TEXT.tabTitle },
     {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
-      title: artifactCount == null ? '这次运行存下的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
+      title: artifactCount == null ? '本次运行保存的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
     },
   ]
 
@@ -553,7 +553,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                 {formatTime(run.created_at ?? null, new Date(now))}
               </time>
               <span>·</span>
-              <span title={run.started_by ? undefined : '发起时设置里没有署名'}>
+              <span title={run.started_by ? undefined : '发起时未设置署名'}>
                 {run.started_by || '未署名'} 发起
               </span>
               <span>·</span>
@@ -564,7 +564,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
           <div className="flex shrink-0 items-center gap-1">
             {(code === 'running' || code === 'queued') && (
               <button type="button" className="btn btn-sm btn-danger" disabled={busy === 'stop'} onClick={() => void stop()}
-                      data-action="stop" title="停止这次运行：已经跑完的节点保留，正在跑的收尾为已取消">
+                      data-action="stop" title="停止本次运行：已完成的节点保留，执行中的节点记为已取消">
                 {busy === 'stop' ? <Spinner size={11} /> : <Square size={10} aria-hidden fill="currentColor" />} 停止
               </button>
             )}
@@ -573,9 +573,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                     data-canvas-mode={replayable ? 'replay' : 'live'} data-graph-drift={drift ? '1' : undefined}
                     title={[
                       replayable
-                        ? `在画布上回放这次运行：拖底部的航迹，卡片回到那一刻${aimed ? '；对准失败的节点' : ''}`
-                        : code === 'waiting' && aimed ? '打开这张工作流，并对准等审批的节点' : '在画布里打开这张工作流，接着看这次运行',
-                      drift ? '注意：工作流在这次运行之后改过结构，画布上是现在的工作流，对不上的节点不会亮起来；当时的全貌看「航迹」' : '',
+                        ? `在画布上回放本次运行：拖动底部的航迹，节点卡片会回到对应时刻${aimed ? '；并定位到失败的节点' : ''}`
+                        : code === 'waiting' && aimed ? '打开该工作流，并定位到等待审批的节点' : '在画布中打开该工作流，继续查看本次运行',
+                      drift ? '注意：工作流在本次运行后修改过结构，画布显示的是当前工作流，已变更的节点不会高亮；运行当时的全貌请查看「航迹」' : '',
                     ].filter(Boolean).join('\n')}>
                 {replayable ? <Rewind size={11} aria-hidden /> : <SquareArrowOutUpRight size={11} aria-hidden />}
                 {replayable ? '在画布中回放' : '在画布中打开'}
@@ -587,8 +587,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
             )}
             {code === 'succeeded' && run.run_class !== 'formal' && (
               <button type="button" className="btn btn-sm" disabled={busy === 'extract'} onClick={() => void extract()}
-                      data-action="extract" title="把这次实际走过的路径提取成草稿工作流（剪掉没走到的节点），提取后到画布里审改">
-                {busy === 'extract' ? <Spinner size={11} /> : <GitFork size={11} aria-hidden />} 提取模板
+                      data-action="extract" title="将本次实际执行的路径提取为草稿工作流（移除未执行的节点），提取后可在画布中审阅修改">
+                {busy === 'extract' ? <Spinner size={11} /> : <GitFork size={11} aria-hidden />} 提取为草稿
               </button>
             )}
             <MoreMenu items={menu} />
@@ -618,7 +618,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                    className="min-w-0 flex-1" />
           {view === 'stream' && (
             <IconButton
-              label={raw ? '回到可读视图' : `看原始事件（${d.events.length} 条）`}
+              label={raw ? '回到可读视图' : `查看原始事件（${d.events.length} 条）`}
               aria-pressed={raw}
               className={clsx(raw && 'text-[var(--accent)]')}
               onClick={() => setRaw((v) => !v)}

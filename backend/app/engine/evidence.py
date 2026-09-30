@@ -51,6 +51,7 @@ from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.issuance import _tolerance, extract_numbers, number_allowance
+from app.engine.labels import option_label
 
 DOC_SCHEMA = "agentlab.report/1"
 
@@ -460,7 +461,7 @@ def is_number(value: Any) -> bool:
 def _decimal(value: int | float) -> Decimal:
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise RenderError(f"{value} 不是一个有限的数")
+            raise RenderError(f"{value} 不是有限的数值")
         return Decimal(repr(value))
     return Decimal(value)
 
@@ -490,7 +491,7 @@ def _digits(d: Decimal, places: int | None, *, group: bool, strip: bool = False,
     ctx = _ctx(d, -exp)
     q = d.quantize(Decimal(1).scaleb(exp), context=ctx)
     if q.is_zero() and not d.is_zero():
-        raise RenderError(zero or f"{_shown(d)} 按 {-exp} 位小数显示为 0，看不出真实的值")
+        raise RenderError(zero or f"{_shown(d)} 按 {-exp} 位小数显示为 0，无法看出真实的值")
     if places is None or strip:
         q = q.normalize(context=ctx)
     if q.is_zero():
@@ -527,43 +528,43 @@ def render_number(
     """
     fmt = fmt or DEFAULT_FORMAT
     if fmt not in FORMATS:
-        raise RenderError(f"format 只能是 {' / '.join(FORMATS)}，写的是 {fmt!r}")
+        raise RenderError(f"显示格式只能是 {' / '.join(FORMATS)}，当前为「{fmt}」")
     if value is None:
         return MISSING
     if not is_number(value):
         if conv:
-            raise RenderError(f"「{_clean(str(value))[:40]}」不是数，不能换算成 {conv}")
+            raise RenderError(f"「{_clean(str(value))[:40]}」不是数值，不能换算为「{conv}」")
         if isinstance(value, bool):
             return "是" if value else "否"
         return _clean(str(value))
     if decimals is not None and (isinstance(decimals, bool) or not isinstance(decimals, int)
                                  or not -MAX_PLACES <= decimals <= MAX_PLACES):
-        raise RenderError(f"小数位要是 -{MAX_PLACES} 到 {MAX_PLACES} 的整数，写的是 {decimals!r}")
+        raise RenderError(f"小数位需要是 -{MAX_PLACES} 到 {MAX_PLACES} 的整数，当前为「{decimals}」")
     try:
         return _render_numeric(_decimal(value), unit=unit, decimals=decimals, fmt=fmt, conv=conv)
     except RenderError:
         raise
     except (ArithmeticError, ValueError) as e:       # decimal 的 InvalidOperation 也在这里
-        raise RenderError(f"{value!r} 按规则渲染不出来（{type(e).__name__}）") from e
+        raise RenderError(f"「{value}」无法按规则显示") from e
 
 
 def _render_numeric(d: Decimal, *, unit: str, decimals: int | None, fmt: str, conv: str | None) -> str:
     if d.adjusted() >= _MAX_DIGITS:
-        raise RenderError(f"这个数有 {d.adjusted() + 1} 位，太大了，没法按规则显示")
+        raise RenderError(f"该数值有 {d.adjusted() + 1} 位，超出可显示的范围")
     ratio = fmt == "percent_of_ratio"
     group = fmt != "plain"
     shown = _shown(d)
     if conv in _CONV_SCALE:
         if ratio:
-            raise RenderError(f"这个指标是比率，不能换算成 {conv}")
+            raise RenderError(f"该指标是比率，不能换算为「{conv}」")
         scaled = _ctx(d).divide(d, _CONV_SCALE[conv])
         return _digits(scaled, 2, group=True, strip=True,
-                       zero=f"{shown} 换算成「{conv}」后显示为 0，精度不够：去掉换算，或者换小一级的单位"
+                       zero=f"{shown} 换算为「{conv}」后显示为 0，精度不够：请去掉换算，或换用小一级的单位"
                        ) + conv + unit
-    rounded = f"{shown} 按 |{conv} 显示为 0，精度不够：去掉换算，或者换成 |.N 多留几位小数"
+    rounded = f"{shown} 按 |{conv} 显示为 0，精度不够：请去掉换算，或改用 |.N 多保留几位小数"
     if conv == "pct":
         if "%" in unit or "％" in unit:
-            raise RenderError("这个指标本身就是百分数（单位是 %），不能再换算成 pct")
+            raise RenderError("该指标本身是百分数（单位为 %），不能再换算为 pct")
         places = max(decimals - 2, 0) if decimals is not None else 1
         return _digits(_ctx(d).multiply(d, 100), places, group=group, zero=rounded) + "%"
 
@@ -572,11 +573,11 @@ def _render_numeric(d: Decimal, *, unit: str, decimals: int | None, fmt: str, co
     elif conv and (m := _CONV_PLACES.match(conv)):
         places = int(m.group(1))
     elif conv:
-        raise RenderError(f"不认识的换算 |{conv}，只支持 万 / 亿 / pct / int / .N（N 为 0–6）")
+        raise RenderError(f"无法识别的换算 |{conv}，只支持 万 / 亿 / pct / int / .N（N 为 0–6）")
     else:
-        rounded = (f"{shown} 按口径卡的小数位（{decimals}）显示为 0，精度不够：口径卡要多留几位小数"
+        rounded = (f"{shown} 按口径卡的小数位（{decimals}）显示为 0，精度不够：请在口径卡中增加小数位"
                    if decimals is not None else
-                   f"{shown} 太小：不写小数位时最多留 10 位小数，显示为 0。口径卡要写 decimals")
+                   f"{shown} 太小：未设置小数位时最多保留 10 位小数，显示为 0。请在口径卡中设置小数位")
         places = (max(decimals - 2, 0) if ratio else decimals) if decimals is not None else None
     if ratio:
         return _digits(_ctx(d).multiply(d, 100), places, group=group, zero=rounded) + "%"
@@ -611,7 +612,7 @@ def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None)
         except RenderError:
             raise
         except (ArithmeticError, ValueError) as e:
-            raise RenderError(f"{value!r} 按规则渲染不出来（{type(e).__name__}）") from e
+            raise RenderError(f"「{value}」无法按规则显示") from e
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False, default=str)
     return render_number(value, fmt=DEFAULT_FORMAT, conv=conv).replace("|", "¦")
@@ -634,13 +635,43 @@ MARKER_RE = re.compile(
 SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q"})
 #: 三期起没有「以后才支持」的标记了；留着这个名字给老代码 import
 LATER_KINDS: frozenset[str] = frozenset()
-#: 这次运行没冻结表结构（没查过库、升级前的运行）时，t / c 仍按一期判为解析不了，原因还是这一句
-LATER_REASON = "这种引用在后续版本支持"
+#: 这次运行没冻结表结构（没查过库、升级前的运行）时，t / c 仍按一期判为解析不了，原因是这一句
+LATER_REASON = "本次运行没有记录表结构，无法核对表名和字段名"
+#: 升级前（二期）组装的文档里存的原因原文。只拿来认出那样的老文档（_phase_two_cite），不再显示给人：
+#: 它说的是「以后才支持」，而那份文档真正的情况是生成于升级前
+LEGACY_LATER_REASON = "这种引用在后续版本支持"
+#: 认出二期文档后显示的原因
+PHASE_TWO_REASON = "这份报告生成于系统升级前，当时不解析这类引用"
 #: 沙箱代码节点的产出不能直接引用：它能做任意计算，那种数要进口径卡、留下代入式
-CODE_REASON = "沙箱算出来的数要进口径卡"
+CODE_REASON = "沙箱代码计算出的数字不能直接引用，需先登记到口径卡"
 #: 受管级别的正式出具，契约里没写 "cells": true 时复核按这个原因拒掉单元格引用
-CELLS_REASON = "受管出具要在契约里声明 cells"
-NODE_FIELD_REASON = "节点字段引用在后续版本支持：数要从查询单元格 [[v:Q1.r0.列]] 或口径卡指标 [[m:…]] 来"
+CELLS_REASON = "受管级别出具需要在出具契约中开启「单元格引用」"
+#: 节点字段引用：给人看的原因，和交回写作者改写时的指令（_Reason 的 fix）
+NODE_FIELD_REASON = "不支持引用节点字段：数字需来自查询单元格或口径卡指标"
+NODE_FIELD_FIX = "节点字段引用在后续版本支持：数要从查询单元格 [[v:Q1.r0.列]] 或口径卡指标 [[m:…]] 来"
+
+
+class _Reason(str):
+    """解析不了的原因、核对出的问题：字面是给人看的一句话（证据面板、出具横幅、节点报错都显示它），
+    fix 是交回写作者（模型）改写时用的指令，照旧写明标记该怎么写（存成 for_model，describe_violations 用它）。
+
+    两者共用一个字段时，写给模型的「单元格要写成 Q<编号>.r<行>.<列>」「别凭空猜」原样显示在界面上。
+    用 str 的子类，是为了让原来传字符串的地方（_unresolved、_violation 的 message）不用改签名。
+    """
+
+    fix: str
+
+    def __new__(cls, text: str, fix: str) -> "_Reason":
+        obj = super().__new__(cls, text)
+        obj.fix = fix
+        return obj
+
+
+def _fix_of(reason: Any) -> dict[str, str]:
+    """{"for_model": 给模型的指令}；原因本身就是给模型的那句（没有另写）时为空。键不叫 fix：前端的问题条目里
+    fix 是修复 id。"""
+    fix = getattr(reason, "fix", None)
+    return {"for_model": fix} if fix and fix != str(reason) else {}
 #: 整表：不写 rows 时取前几行、最多几行、不写 cols 时最多几列
 TABLE_DEFAULT_ROWS = 5
 TABLE_MAX_ROWS = 20
@@ -794,7 +825,7 @@ def build_catalog(
                 "alias": f"N:{node_id}", "kind": "node_output", "eid": make_eid("node_output", entry.get("artifact"), {}),
                 "locator": {}, "code": True,
                 **{k: entry[k] for k in ("node_id", "exec", "artifact", "code_sha", "role", "language") if k in entry},
-                "label": f"沙箱代码 {node_id}（{entry.get('role') or 'compute'}）",
+                "label": f"沙箱代码 {node_id}（{option_label('evidence_role', entry.get('role') or 'compute')}）",
             }
             continue
         if entry.get("kind") == "query":
@@ -837,12 +868,14 @@ def build_catalog(
 # --------------------------------------------------------------------------
 
 ENTITY_KINDS = frozenset({"table", "column"})
-UNKNOWN_ENTITY_REASON = "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字"
+UNKNOWN_ENTITY_REASON = "疑似不存在的名称：本次运行的表结构快照、查询用到的表和查询结果列中都没有这个名称"
+#: 交回写作者（模型）改写时说的那句，保留原来给模型的写法
+_UNKNOWN_ENTITY_FOR_MODEL = "本次运行的表结构快照、查询用到的表、查询结果列里都没有这个名字，可能是编造的名字"
 #: 表结构快照不全（库里的表太多、只存了一部分）时找不到的名字：可能在没存下来的表里，只能说核对不了
-UNVERIFIED_ENTITY_REASON = ("这个数据源的表太多，表结构快照只存了一部分，查询用到的表、查询结果列里也没有这个名字，"
-                            "核对不了它存不存在")
+UNVERIFIED_ENTITY_REASON = "表结构快照仅包含部分表，查询用到的表和查询结果列中也没有这个名称，无法核实它是否存在"
 #: 报告节点写了 entities: off：作者有意关掉了表名、字段名核对
-ENTITIES_OFF_REASON = "这个报告节点关掉了表名、字段名核对（entities: off），[[t:]] / [[c:]] 不解析：直接写名字就行"
+ENTITIES_OFF_REASON = "该报告节点已关闭表名、字段名核对，相关标记不会解析"
+ENTITIES_OFF_FIX = "这个报告节点关掉了表名、字段名核对（entities: off），[[t:]] / [[c:]] 不解析：直接写名字就行"
 
 
 def _add_origin(entry: dict[str, Any], origin: dict[str, Any]) -> None:
@@ -1064,10 +1097,11 @@ def closest_entities(name: str, catalog: dict[str, Any], *, limit: int = 3) -> l
 
 def _unresolved(marker: dict[str, Any], alias: str, ev_kind: str, reason: str, *,
                 rendered: str | None = None) -> dict[str, Any]:
-    """解析不了的引用。rendered 是正文里显示的字：缺值显示「—」，其余是占位 ⟦?m:gmvx⟧。"""
+    """解析不了的引用。rendered 是正文里显示的字：缺值显示「—」，其余是占位 ⟦?m:gmvx⟧。
+    reason 是 _Reason 时另记 for_model（给模型的改写指令）；存进文档前去掉（_stored）。"""
     kind, body = marker["kind"], marker.get("body", "")
     return {"ref": marker.get("ref") or "", "alias": alias, "kind": ev_kind,
-            "role": _ROLE.get(kind, "value"), "status": "unresolved", "reason": reason,
+            "role": _ROLE.get(kind, "value"), "status": "unresolved", "reason": str(reason), **_fix_of(reason),
             "rendered": rendered if rendered is not None else placeholder(kind, body)}
 
 
@@ -1077,9 +1111,10 @@ def _metric_alias(ref: str, catalog: dict[str, Any]) -> tuple[str | None, str]:
         return alias, ""
     doubles = sorted(a for a in catalog if a.startswith("m:") and a.endswith(f".{ref}"))
     if doubles:
-        return None, (f"指标 {ref} 同时出现在好几张口径卡里，要写成带卡名的形式："
-                      + "、".join(f"[[{a}]]" for a in doubles[:4]))
-    return None, f"目录里没有指标 {ref}（能用的指标见证据目录）"
+        return None, _Reason(f"指标「{ref}」同时出现在多张口径卡中，无法确定引用的是哪一个",
+                             f"指标 {ref} 同时出现在好几张口径卡里，要写成带卡名的形式："
+                             + "、".join(f"[[{a}]]" for a in doubles[:4]))
+    return None, _Reason(f"引用的指标「{ref}」不存在", f"目录里没有指标 {ref}（能用的指标见证据目录）")
 
 
 # --------------------------------------------------------------------------
@@ -1135,10 +1170,10 @@ class _Snapshots:
         if problem == "missing":
             return None, f"没有{noun}"
         if problem == "tampered":
-            return None, f"的{noun}和哈希对不上，疑似被改过"
+            return None, f"的{noun}与哈希不一致，疑似被修改"
         if problem == "absent":
-            return None, f"的{noun}取不回来（工件 {key[:12]}… 不存在）"
-        return None, f"的{noun}取不回来（{problem}）"
+            return None, f"的{noun}已不存在，无法读取"
+        return None, f"的{noun}无法读取"
 
     def _load(self, artifact: str) -> tuple[Any, str | None]:
         if not artifact:
@@ -1169,7 +1204,7 @@ def parse_cell_ref(ref: str) -> dict[str, Any] | None:
 def _query_entry(alias: str, catalog: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     entry = catalog.get(alias)
     if entry is None:
-        return None, f"目录里没有 {alias}（能引用的查询见证据目录）"
+        return None, _Reason(f"引用的查询结果 {alias} 不存在", f"目录里没有 {alias}（能引用的查询见证据目录）")
     if entry.get("kind") != "query":
         return None, f"{alias} 不是查询结果，不能按单元格引用"
     if entry.get("code"):
@@ -1185,11 +1220,12 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
     if node:
         alias = f"N:{node.group('node')}"
         entry = catalog.get(alias) or {}
-        return _unresolved(marker, alias, "node_field", CODE_REASON if entry.get("code") else NODE_FIELD_REASON)
+        return _unresolved(marker, alias, "node_field",
+                           CODE_REASON if entry.get("code") else _Reason(NODE_FIELD_REASON, NODE_FIELD_FIX))
     parsed = parse_cell_ref(ref)
     if parsed is None:
-        return _unresolved(marker, ref.split(".")[0], "cell",
-                           "单元格要写成 Q<编号>.r<行>.<列>（行号从 0 数），比如 [[v:Q1.r0.amount]]")
+        return _unresolved(marker, ref.split(".")[0], "cell", _Reason(
+            "单元格引用格式无法识别", "单元格要写成 Q<编号>.r<行>.<列>（行号从 0 数），比如 [[v:Q1.r0.amount]]"))
     alias = parsed["alias"]
     if not cells_allowed:
         return _unresolved(marker, alias, "cell", CELLS_REASON)
@@ -1231,15 +1267,15 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
     """
     alias = marker.get("ref") or ""
 
-    def fail(reason: str) -> tuple[None, dict[str, Any]]:
-        return None, _unresolved(marker, alias, "query", reason)
+    def fail(reason: str, fix: str | None = None) -> tuple[None, dict[str, Any]]:
+        return None, _unresolved(marker, alias, "query", _Reason(reason, fix) if fix else reason)
 
     if not cells_allowed:
         return fail(CELLS_REASON)
     _, *rest = (marker.get("body") or "").split() or [""]
     odd = [p for p in rest if p.partition("=")[0] not in _TABLE_OPTIONS or "=" not in p]
     if odd:
-        return fail(f"不认识的选项 {odd[0]}：整表只支持 cols=列a,列b 和 rows=0-4")
+        return fail(f"整表引用中有无法识别的选项「{odd[0]}」", f"不认识的选项 {odd[0]}：整表只支持 cols=列a,列b 和 rows=0-4")
     options = marker.get("options") or {}
     entry, why = _query_entry(alias, catalog)
     if entry is None:
@@ -1252,36 +1288,42 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
     if "cols" in options:
         wanted = [c.strip() for c in options["cols"].split(",") if c.strip()]
         if not wanted:
-            return fail("cols= 后面要写列名，用逗号分开")
+            return fail("整表引用的 cols 没有写列名", "cols= 后面要写列名，用逗号分开")
         missing = [c for c in wanted if c not in columns]
         if missing:
-            return fail(f"{alias} 没有列「{missing[0]}」，有：{'、'.join(columns[:12])}")
+            return fail(f"引用的查询结果 {alias} 中没有列「{missing[0]}」",
+                        f"{alias} 没有列「{missing[0]}」，有：{'、'.join(columns[:12])}")
         if len(wanted) > TABLE_MAX_COLS:
-            return fail(f"整表最多 {TABLE_MAX_COLS} 列，cols= 写了 {len(wanted)} 列")
+            return fail(f"整表最多 {TABLE_MAX_COLS} 列，当前选了 {len(wanted)} 列",
+                        f"整表最多 {TABLE_MAX_COLS} 列，cols= 写了 {len(wanted)} 列")
     else:
         wanted = columns
         if len(wanted) > TABLE_MAX_COLS:
-            return fail(f"{alias} 有 {len(columns)} 列，整表最多 {TABLE_MAX_COLS} 列：用 cols=列a,列b 挑出要的列")
+            return fail(f"{alias} 有 {len(columns)} 列，超过整表上限 {TABLE_MAX_COLS} 列",
+                        f"{alias} 有 {len(columns)} 列，整表最多 {TABLE_MAX_COLS} 列：用 cols=列a,列b 挑出要的列")
     if not wanted:
-        return fail(f"{alias} 没有列，列不出表")
+        return fail(f"{alias} 没有列，无法生成表格")
     if not rows:
-        return fail(f"{alias} 是空的（0 行），没有可以列的行")
+        return fail(f"{alias} 为空（0 行），无法生成表格")
     if "rows" in options:
         span = _TABLE_ROWS.match(options["rows"].strip())
         first, last = (int(span.group(1)), int(span.group(2) or span.group(1))) if span else (1, 0)
         if last < first:
-            return fail(f"rows 要写成 0-4 这样从小到大的行号范围（从 0 数），写的是 {options['rows']}")
+            return fail(f"整表引用的行号范围格式有误，当前为「{options['rows']}」",
+                        f"rows 要写成 0-4 这样从小到大的行号范围（从 0 数），写的是 {options['rows']}")
         if last - first + 1 > TABLE_MAX_ROWS:
-            return fail(f"整表最多 {TABLE_MAX_ROWS} 行，rows={options['rows']} 是 {last - first + 1} 行："
+            return fail(f"整表最多 {TABLE_MAX_ROWS} 行，当前选了 {last - first + 1} 行",
+                        f"整表最多 {TABLE_MAX_ROWS} 行，rows={options['rows']} 是 {last - first + 1} 行："
                         "挑出要的行，或者分成几张表")
         if last >= len(rows):
-            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {last} 行（从 0 数）")
+            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {last} 行（行号从 0 开始）")
     else:
         first, last = 0, min(TABLE_DEFAULT_ROWS, len(rows)) - 1
     for c in wanted:
         if not c.strip() or c != c.strip() or _UNSAFE_COLUMN.search(c) \
                 or len(f"[[v:{alias}.r{last}.{c}]]") > MARKER_MAX:
-            return fail(f"列名「{_clean(c)[:30]}」写不进表格（空的、首尾有空格、带方括号竖线换行，或者太长）："
+            return fail(f"列名「{_clean(c)[:30]}」无法放进表格（为空、首尾有空格、含方括号 / 竖线 / 换行，或过长）",
+                        f"列名「{_clean(c)[:30]}」写不进表格（空的、首尾有空格、带方括号竖线换行，或者太长）："
                         "在 SQL 里给它起个别名再查")
     lines = ["| " + " | ".join(_clean(c) for c in wanted) + " |",
              "| " + " | ".join("---" for _ in wanted) + " |"]
@@ -1346,9 +1388,10 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
     if kind == "q":
         return _resolve_quote(marker, catalog, _snapshots(loader))
     if kind not in ("m", "i"):
-        return _unresolved(marker, f"{kind}:{ref}", kind,
-                           f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
-                           "i（运行输入）、t / c（表 / 字段）、q（引文）、see（依据）")
+        return _unresolved(marker, f"{kind}:{ref}", kind, _Reason(
+            f"引用类型「{kind}」无法识别",
+            f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
+            "i（运行输入）、t / c（表 / 字段）、q（引文）、see（依据）"))
 
     conv = marker.get("conv")
     if kind == "m":
@@ -1358,8 +1401,8 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
             return _unresolved(marker, f"m:{ref}", ev_kind, why)
         entry = catalog[alias]
         if entry.get("value") is None:
-            return _unresolved(marker, alias, ev_kind, f"指标「{entry.get('name') or ref}」这次没有值（缺输入），"
-                               "不能写进报告", rendered=MISSING)
+            return _unresolved(marker, alias, ev_kind, f"指标「{entry.get('name') or ref}」本次没有值（缺少输入），"
+                               "无法写入报告", rendered=MISSING)
         try:
             rendered = render_metric(entry, conv)
         except RenderError as e:
@@ -1368,9 +1411,9 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
         ev_kind, alias = "input", f"i:{ref}"
         entry = catalog.get(alias)
         if entry is None:
-            return _unresolved(marker, alias, ev_kind, f"运行输入里没有 {ref}")
+            return _unresolved(marker, alias, ev_kind, f"运行输入中没有「{ref}」")
         if entry.get("value") in (None, ""):
-            return _unresolved(marker, alias, ev_kind, f"运行输入 {ref} 是空的", rendered=MISSING)
+            return _unresolved(marker, alias, ev_kind, f"运行输入「{ref}」为空", rendered=MISSING)
         try:
             rendered = render_number(entry["value"], fmt="plain", conv=conv)
         except RenderError as e:
@@ -1395,18 +1438,20 @@ def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     alias = f"{kind}:{ref}"
     index = snaps.entities(catalog)
     if not snaps.entities_on:
-        return _unresolved(marker, alias, ev_kind, ENTITIES_OFF_REASON)
+        return _unresolved(marker, alias, ev_kind, _Reason(ENTITIES_OFF_REASON, ENTITIES_OFF_FIX))
     if not index.active:
         return _unresolved(marker, alias, ev_kind, LATER_REASON)
     if not ref or not _IDENTIFIER.match(ref):
-        return _unresolved(marker, alias, ev_kind, "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，"
-                           "名字是字母或下划线开头的标识符")
+        return _unresolved(marker, alias, ev_kind, _Reason(
+            "表名、字段名引用格式无法识别",
+            "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，名字是字母或下划线开头的标识符"))
     hit = index.find(ref, ev_kind)
     if hit is None:
         if index.find(ref, other):
             right = "c" if kind == "t" else "t"
-            return _unresolved(marker, alias, ev_kind, f"{ref} 是{'字段' if kind == 't' else '表'}，"
-                               f"不是{'表' if kind == 't' else '字段'}：写成 [[{right}:{ref}]]")
+            return _unresolved(marker, alias, ev_kind, _Reason(
+                f"「{ref}」是{'字段' if kind == 't' else '表'}，不是{'表' if kind == 't' else '字段'}",
+                f"{ref} 是{'字段' if kind == 't' else '表'}，不是{'表' if kind == 't' else '字段'}：写成 [[{right}:{ref}]]"))
         if index.unsure(ref):
             cite = _unresolved(marker, alias, ev_kind, UNVERIFIED_ENTITY_REASON, rendered=ref)
             cite["unverified"] = True
@@ -1486,21 +1531,23 @@ def _resolve_quote(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snap
     quote = _clean(str(marker.get("quote") or ""))
     entry = catalog.get(alias)
     if entry is None:
-        return _unresolved(marker, alias, "quote", f"目录里没有 {alias}（能引原话的知识库检索见证据目录）")
+        return _unresolved(marker, alias, "quote", _Reason(
+            f"引用的检索结果 {alias} 不存在", f"目录里没有 {alias}（能引原话的知识库检索见证据目录）"))
     if entry.get("kind") != "retrieval":
-        return _unresolved(marker, alias, "quote", f"{alias} 不是知识库检索：引文只能引检索命中的原文")
+        return _unresolved(marker, alias, "quote", f"{alias} 不是知识库检索结果，引文只能引用检索命中的原文")
     if not quote:
-        return _unresolved(marker, alias, "quote", "引文是空的：写成 [[q:K1|原话]]")
+        return _unresolved(marker, alias, "quote", _Reason("引文为空", "引文是空的：写成 [[q:K1|原话]]"))
     hits, why = snaps.hits(alias, entry.get("artifact"))
     if why:
         return _unresolved(marker, alias, "quote", why)
     if len(normalize_quote(quote)) < QUOTE_MIN:
-        return _unresolved(marker, alias, "quote", f"引文太短（至少 {QUOTE_MIN} 个字），看不出是不是原话",
+        return _unresolved(marker, alias, "quote", f"引文太短（至少 {QUOTE_MIN} 个字），无法确认是否为原文",
                            rendered=quote)
     found = find_quote(quote, hits)
     if found is None:
-        return _unresolved(marker, alias, "quote", f"{alias} 的命中片段里找不到这句原话（空白归一化后逐字比对）："
-                           "引文要一字不差地抄原文", rendered=quote)
+        return _unresolved(marker, alias, "quote", _Reason(
+            f"在 {alias} 的检索结果中找不到这段引文的原文",
+            f"{alias} 的命中片段里找不到这句原话（空白归一化后逐字比对）：引文要一字不差地抄原文"), rendered=quote)
     at, start, end = found
     hit = hits[at]
     locator = {"hit": at, "start": start, "end": end}
@@ -1521,34 +1568,35 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
     base = {"ref": ref, "role": "support"}
     if sep and kind in ("t", "c"):
         cite = _resolve_entity({"kind": kind, "ref": body, "body": body}, catalog, _snapshots(loader))
-        return {**base, **{k: cite[k] for k in ("alias", "kind", "status", "eid", "locator", "reason", "unknown",
-                                                "unverified") if k in cite}}
+        return {**base, **{k: cite[k] for k in ("alias", "kind", "status", "eid", "locator", "reason", "for_model",
+                                                "unknown", "unverified") if k in cite}}
     if sep and kind == "q":
         return {**base, "alias": ref, "kind": "quote", "status": "unresolved",
-                "reason": "引文不能当依据：依据写那次检索的编号，比如 [[see:K1]]"}
+                "reason": "引文不能作为依据，依据应引用检索结果的编号",
+                "for_model": "引文不能当依据：依据写那次检索的编号，比如 [[see:K1]]"}
     alias: str | None = None
     locator: dict[str, Any] = {}
-    why = f"目录里没有 {ref}"
+    why: str = _Reason(f"引用的依据「{ref}」不存在", f"目录里没有 {ref}")
     if sep and kind == "m":
         alias, why = _metric_alias(body, catalog)
     elif sep and kind == "i":
         alias = ref if ref in catalog else None
-        why = f"运行输入里没有 {body}"
+        why = f"运行输入中没有「{body}」"
     elif sep:
-        why = f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 这样的编号"
+        why = _Reason(f"依据「{ref}」的写法无法识别", f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 这样的编号")
     elif m := _ROW_REF.match(ref):
         alias = m.group("alias") if m.group("alias") in catalog else None
         if alias and m.group("row") is not None:
             row, total = int(m.group("row")), catalog[alias].get("rows")
             if isinstance(total, int) and row >= total:
-                alias, why = None, f"{m.group('alias')} 只有 {total} 行，没有第 {row} 行（从 0 数）"
+                alias, why = None, f"{m.group('alias')} 只有 {total} 行，没有第 {row} 行（行号从 0 开始）"
             else:
                 locator = {"row": row}
     elif f"m:{ref}" in catalog:
         alias = f"m:{ref}"          # 漏写了 m: 前缀的指标 id，意思没有歧义
     if alias is None:
         return {**base, "alias": ref, "kind": kind if sep else "unknown", "status": "unresolved",
-                "reason": why}
+                "reason": str(why), **_fix_of(why)}
     entry = catalog[alias]
     return {**base, "alias": alias, "kind": entry["kind"], "status": "resolved", "eid": entry["eid"],
             "locator": {**(entry.get("locator") or {}), **locator}}
@@ -2056,6 +2104,12 @@ def _bare_link(name: str, catalog: dict[str, Any], index: _EntityIndex) -> tuple
     return None
 
 
+def _stored(cite: dict[str, Any]) -> dict[str, Any]:
+    """存进文档的样子：去掉 for_model。那是交回写作者改写时用的指令，复核时按目录重新解析会再得到，
+    文档里只留给人看的 reason。"""
+    return {k: v for k, v in cite.items() if k != "for_model"} if "for_model" in cite else cite
+
+
 def _entity_segment(name: str, hit: tuple[str, str], catalog: dict[str, Any], *, code: bool) -> dict[str, Any]:
     kind, alias = hit
     entry = catalog[alias]
@@ -2217,9 +2271,9 @@ def compose_doc(
                             plain(cursor, marker["start"])
                         cursor = marker["end"]
                         if marker["kind"] == "see":
-                            see.extend(resolve_support(r, catalog, loader=snaps) for r in marker["refs"])
+                            see.extend(_stored(resolve_support(r, catalog, loader=snaps)) for r in marker["refs"])
                             continue
-                        cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
+                        cite = _stored(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps))
                         ok = cite["status"] == "resolved"
                         seg = {
                             "kind": _SEG_KIND.get(marker["kind"])
@@ -2395,7 +2449,15 @@ def find_segment(doc: dict[str, Any], segment_id: str) -> tuple[dict, dict, dict
 
 
 def _violation(code: str, message: str, **extra: Any) -> dict[str, Any]:
-    return {"code": code, "message": message, **{k: v for k, v in extra.items() if v is not None}}
+    """一处问题。message 给人看；message 是 _Reason 时另记 for_model，交回写作者改写时用（describe_violations）。"""
+    return {"code": code, "message": str(message), **_fix_of(message),
+            **{k: v for k, v in extra.items() if v is not None}}
+
+
+def _unresolved_message(label: str, ref: str, cite: dict[str, Any]) -> str:
+    """「引用 [[m:gmv]] 无法解析：…」。cite 带 for_model 的，给模型的那句照旧写原来的说法。"""
+    text = f"{label} [[{ref}]] 无法解析：{cite['reason']}"
+    return _Reason(text, f"{label} [[{ref}]] 解析不了：{cite['for_model']}") if cite.get("for_model") else text
 
 
 def verify_doc(
@@ -2445,10 +2507,10 @@ def verify_doc(
              **({"unknown_entities": 0, "unverified_entities": 0} if layered else {}),
              "see": 0, "uncited_claims": 0, "violations": 0}
     if not isinstance(doc, dict):
-        violations.append(_violation("bad_schema", "报告文档不是一个对象"))
+        violations.append(_violation("bad_schema", "报告文档格式有误"))
         return {"ok": False, "violations": violations, "stats": stats, "uncited": uncited}
     if doc.get("schema") != DOC_SCHEMA:
-        violations.append(_violation("bad_schema", f"不认识的报告文档格式 {doc.get('schema')!r}"))
+        violations.append(_violation("bad_schema", f"报告文档格式「{doc.get('schema')}」无法识别"))
 
     markdown = str(doc.get("markdown") or "")
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
@@ -2471,7 +2533,7 @@ def verify_doc(
             if tiled and (not intact or span[0] != pos):
                 tiled = False
                 violations.append(_violation("segment_mismatch",
-                                             f"片段 {seg.get('id')} 和正文对不上：文档可能被改过",
+                                             f"报告的第 {stats['segments']} 个片段与正文不一致，文档可能被修改过",
                                              segment=seg.get("id"), unit=unit.get("id")))
             if intact:
                 pos = span[1]
@@ -2486,7 +2548,7 @@ def verify_doc(
                     syntax.append((span[0], span[1]))
                 else:
                     violations.append(_violation("structural_text",
-                                                 f"结构片段里夹带了内容「{text[:30]}」", **where))
+                                                 f"排版片段中混入了正文内容「{text[:30]}」", **where))
             elif seg.get("ref"):
                 ref = str(seg["ref"])
                 cite = _phase_two_cite(seg, ref, text) \
@@ -2504,15 +2566,15 @@ def verify_doc(
                     violations.append(_violation("unverified_entity", _unverified_message(cite.get("ref") or ref),
                                                  ref=ref, **where))
                 elif not ok:
-                    violations.append(_violation("unresolved_ref", f"引用 [[{ref}]] 解析不了：{cite['reason']}",
+                    violations.append(_violation("unresolved_ref", _unresolved_message("引用", ref, cite),
                                                  ref=ref, **where))
                 elif not matches:
                     violations.append(_violation(
-                        "render_mismatch", f"片段「{text}」和引用 [[{ref}]] 重新渲染出来的「{shown}」"
-                        "对不上", ref=ref, **where))
+                        "render_mismatch", f"片段「{text}」与引用 [[{ref}]] 重新渲染的结果「{shown}」"
+                        "不一致", ref=ref, **where))
                 elif (seg.get("cite") or {}).get("eid") not in (None, cite["eid"]):
-                    violations.append(_violation("eid_mismatch", f"引用 [[{ref}]] 记的证据标识和目录里的不一致，"
-                                                 "文档可能被改过", ref=ref, **where))
+                    violations.append(_violation("eid_mismatch", f"引用 [[{ref}]] 记录的证据标识与本次运行的证据"
+                                                 "不一致，文档可能被修改过", ref=ref, **where))
                 good = ok and matches
                 expected = "deterministic" if good else "none"
                 if seg.get("kind") == "number":
@@ -2546,7 +2608,7 @@ def verify_doc(
             # 已经为这一段报过别的问题，状态不对是它的推论，不再重复
             if expected is not None and state != expected and len(violations) == found:
                 violations.append(_violation("state_mismatch",
-                                             f"片段「{text[:30]}」标的状态是 {state}，核对下来应该是 {expected}",
+                                             f"片段「{text[:30]}」记录的核对状态与重新核对的结果不一致，文档可能被修改过",
                                              **where))
         for support in unit.get("see") or []:
             stats["see"] += 1
@@ -2562,7 +2624,7 @@ def verify_doc(
                                              span=list(unit.get("span") or []) or None))
             else:
                 violations.append(_violation("unresolved_ref",
-                                             f"依据 [[see:{again['ref']}]] 解析不了：{again['reason']}",
+                                             _unresolved_message("依据", f"see:{again['ref']}", again),
                                              ref=again["ref"], unit=unit.get("id"),
                                              span=list(unit.get("span") or []) or None))
         if kind == "claim" and not cited:
@@ -2572,13 +2634,14 @@ def verify_doc(
             uncited.append({"unit": unit.get("id"), "span": list(where) if ok_span else None,
                             "text": markdown[where[0]:where[1]] if ok_span else ""})
     if tiled and pos != len(markdown):
-        violations.append(_violation("segment_mismatch", "正文末尾有一段不在任何片段里：文档可能被改过"))
+        violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
 
     masks += _header_masks(list(doc.get("blocks") or []), catalog)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
         owner = next(((sid, uid) for s, e, sid, uid in owners if s <= token.start < e), (None, None))
         violations.append(_violation(
-            "uncited_number", f"数字「{token.raw}」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+            "uncited_number", _Reason(f"数字「{token.raw}」没有出处：报告中直接写出了数字，系统无法核对",
+                                      f"数字「{token.raw}」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字"),
             span=[token.start, token.end], text=token.raw, context=_context(markdown, token.start, token.end),
             segment=owner[0], unit=owner[1]))
 
@@ -2595,28 +2658,32 @@ def verify_doc(
 
 
 def _phase_two_cite(seg: dict[str, Any], ref: str, text: str) -> dict[str, Any] | None:
-    """升级前（二期）组装的文档里的 t / c / q：那时一律判为解析不了，正文是占位，原因是 LATER_REASON。
+    """升级前（二期）组装的文档里的 t / c / q：那时一律判为解析不了，正文是占位，原因是 LEGACY_LATER_REASON。
 
     这样的文档升级后才被复核（运行停在报告和出口之间）时，按当时的规矩查：正文确实是占位、确实
     没有出处，记解析不了——不能因为今天解析得了，就把它判成「渲染对不上」（完整性问题，出口记缺口）。
-    只认「原因是 LATER_REASON 并且正文恰好是占位」的片段：自称二期却显示了别的字的，照现在的规矩查。
+    只认「原因是 LEGACY_LATER_REASON（或现在的 LATER_REASON）并且正文恰好是占位」的片段：自称二期却显示了
+    别的字的，照现在的规矩查。
     """
     kind, _, body = ref.partition(":")
     stored = seg.get("cite")
-    if kind not in ("t", "c", "q") or not isinstance(stored, dict) or stored.get("reason") != LATER_REASON \
+    said = stored.get("reason") if isinstance(stored, dict) else None
+    if kind not in ("t", "c", "q") or said not in (LATER_REASON, LEGACY_LATER_REASON) \
             or text != placeholder(kind, body):
         return None
     alias = stored.get("alias") if isinstance(stored.get("alias"), str) else ref
+    reason = PHASE_TWO_REASON if said == LEGACY_LATER_REASON else LATER_REASON
     return {"ref": body, "alias": alias, "kind": stored.get("kind") or kind, "role": _ROLE.get(kind, "value"),
-            "status": "unresolved", "reason": LATER_REASON, "rendered": text}
+            "status": "unresolved", "reason": reason, "rendered": text}
 
 
 def _unknown_message(name: str) -> str:
-    return f"「{name}」{UNKNOWN_ENTITY_REASON}：只写本次运行的表结构、查询里真实存在的表名和字段名"
+    return _Reason(f"「{name}」{UNKNOWN_ENTITY_REASON}",
+                   f"「{name}」{_UNKNOWN_ENTITY_FOR_MODEL}：只写本次运行的表结构、查询里真实存在的表名和字段名")
 
 
 def _unverified_message(name: str) -> str:
-    return f"「{name}」核对不了：{UNVERIFIED_ENTITY_REASON}"
+    return f"「{name}」无法核实：{UNVERIFIED_ENTITY_REASON}"
 
 
 def uncited_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2820,11 +2887,12 @@ def _retrieval_prompt(entry: dict[str, Any], snaps: _Snapshots) -> list[str]:
 
 
 def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) -> str:
-    """违规清单的文字版：给写作者的修复指令、给节点的报错，都用这一份。"""
+    """违规清单的文字版，交回写作者（模型）改写用：有 for_model（给模型的改写指令）的用它，
+    没有的用 message。给人看的报错直接用 message，不经过这里。"""
     lines = []
     for v in violations[:limit]:
         where = f"（…{v['context']}…）" if v.get("context") else ""
-        lines.append(f"- {v['message']}{where}")
+        lines.append(f"- {v.get('for_model') or v['message']}{where}")
     if len(violations) > limit:
         lines.append(f"- …另有 {len(violations) - limit} 处")
     return "\n".join(lines)
@@ -2839,7 +2907,7 @@ def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) ->
 # --------------------------------------------------------------------------
 
 GUESS_SCHEMA = "agentlab.guess/1"
-GUESS_NOTE = "猜测的来源，不能当证据：按数值在这次运行已封存的查询结果和口径卡里找相同的值，同值的巧合很多"
+GUESS_NOTE = "猜测的来源，不能当证据：按数值在本次运行已封存的查询结果和口径卡中查找相同的值，数值相同的巧合很多"
 #: 每个数字最多给几个候选
 MAX_CANDIDATES = 3
 

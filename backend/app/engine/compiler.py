@@ -55,7 +55,7 @@ def _wrap(
 
     async def _execute(state: GraphState) -> dict[str, Any]:
         if runner is None:
-            raise NodeError(node.id, f"没有实现的节点类型：{node.type}")
+            raise NodeError(node.id, f"不支持的节点类型：{node.type}")
 
         # 允许节点配置跳过条件，不用为了"有时不执行"专门加一个分支节点
         skip_if = node.config.get("skip_if")
@@ -65,7 +65,7 @@ def _wrap(
 
             if eval_condition(skip_if, template_context(state)):
                 ctx.emit(EventType.NODE_SKIPPED, node_type=str(node.type), label=node.title,
-                         reason=f"skip_if 成立：{skip_if}")
+                         reason=f"满足跳过条件：{skip_if}")
                 return {"nodes": {node.id: {"skipped": True}}}
 
         retries = int(node.config.get("retries", 0) or 0)
@@ -141,7 +141,7 @@ def _wrap(
                     ctx.emit(
                         EventType.LOG,
                         level="warn",
-                        message=f"第 {attempt + 1} 次失败（{_describe(e)}），准备重试",
+                        message=f"第 {attempt + 1} 次执行失败（{_describe(e)}），即将重试",
                         code="node_retry",
                     )
                     await asyncio.sleep(backoff * (2**attempt))
@@ -325,7 +325,7 @@ def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
     # 入口
     entries = spec.entry_nodes()
     if not entries:
-        raise ValueError("这个工作流没有入口节点")
+        raise ValueError("工作流没有起始节点")
     for node in entries:
         builder.add_edge(START, node.id)
 

@@ -10,13 +10,14 @@ import { NODE_DEFS, sourceHandles } from './nodeDefs'
 import { DENSE_EXITS, NODE_WIDTH } from './routing'
 import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from './TeamMatrix'
 import { edgeKey, topology } from '../run/derive'
+import { exhaustedOf } from '../run/decode'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
 import { matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { claimTally, issuanceLabel, reportStampText, RUN_CLASS_LABEL } from '../lib/terms'
+import { claimTally, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
@@ -37,22 +38,22 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return (config.fields ?? []).map((f: any) => f.name).filter(Boolean).join(' · ') || '未定义输入'
     case 'output': {
       const names = (config.fields ?? []).map((f: any) => f.name).filter(Boolean).join(' · ')
-      return (config.contract ? '⚖ 出具契约 · ' : '') + (names || '未定义成果')
+      return (config.contract ? '出具契约 · ' : '') + (names || '未定义成果')
     }
     case 'llm':
-      return first(config.prompt, config.system) || '未填提示'
+      return first(config.prompt, config.system) || '未填写提示'
     case 'agent': {
       const tools = (config.tools ?? []).length
-      return `${first(config.prompt, config.system) || '未填任务'}${tools ? ` · ${tools} 个工具` : ''}`
+      return `${first(config.prompt, config.system) || '未填写任务'}${tools ? ` · ${tools} 个工具` : ''}`
     }
     case 'supervisor':
-      return `${(config.agents ?? []).map((a: any) => a.name).join(' / ') || '未配成员'}`
+      return `${(config.agents ?? []).map((a: any) => a.name).join(' / ') || '未配置成员'}`
     case 'tool':
-      return config.tool ? `${config.tool}()` : '未选择工具'
+      return config.tool ? String(config.tool) : '未选择工具'
     case 'code':
       return `${config.language ?? 'python'} · ${(config.code ?? '').split('\n')[0].slice(0, 48) || '空'}`
     case 'branch':
-      return (config.cases ?? []).map((c: any) => c.key).filter(Boolean).join(' / ') || '未配分支'
+      return (config.cases ?? []).map((c: any) => c.key).filter(Boolean).join(' / ') || '未配置分支'
     case 'loop':
       return config.mode === 'while'
         ? `当 ${config.condition || '?'} 时重复`
@@ -60,10 +61,10 @@ function summarize(type: NodeType, config: Record<string, any>): string {
     case 'retrieve':
       return `${config.collection || 'default'} · 取 ${config.limit ?? 5} 条`
     case 'memory':
-      return `${{ recall: '回忆', write: '记住', clear: '清空' }[config.action as string] ?? ''} @ ${config.scope || 'default'}`
+      return `${{ recall: '召回', write: '写入', clear: '清空' }[config.action as string] ?? ''} · 作用域 ${config.scope || 'default'}`
     case 'human':
       // 兜底不写「等待人工」：挂在还没跑的卡上读着像一个状态
-      return first(config.title) || '人工审批 · 未填标题'
+      return first(config.title) || '人工审批 · 未填写标题'
     case 'validate':
       return 'JSON Schema 校验' + (config.repair_with_llm ? ' · 失败自动返工' : '')
     case 'metrics': {
@@ -71,10 +72,10 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       const from = config.caliber_from
       if (from && typeof from === 'object') {
         return from.workflow_id && from.workflow_version && from.node_id
-          ? `钉住上游口径卡 v${from.workflow_version} · 节点 ${from.node_id}${config.upgrade_policy ? ` · 升版按 ${config.upgrade_policy}` : ''}`
-          : '钉住上游口径卡 · 还没选完'
+          ? `引用上游口径卡 v${from.workflow_version} · 节点 ${from.node_id}${config.upgrade_policy ? ` · 升版：${UPGRADE_POLICY_LABEL[config.upgrade_policy] ?? config.upgrade_policy}` : ''}`
+          : '引用上游口径卡 · 尚未选择完整'
       }
-      return `${config.caliber || '口径'}@${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
+      return `${config.caliber || '口径'} ${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
     }
     case 'report': {
       const from = Array.isArray(config.metrics_from) ? config.metrics_from.length : 0
@@ -165,7 +166,7 @@ function gotoIssuance(runId: string | undefined): void {
       return
     }
     if (tries++ < 12) requestAnimationFrame(find)
-    else toast.info('右栏收起来了：展开助手栏，在运行视图的成果区看完整判定', { key: 'card:issuance' })
+    else toast.info('右栏已收起。请展开助手栏，在运行视图的成果区查看完整判定', { key: 'card:issuance' })
   }
   requestAnimationFrame(find)
 }
@@ -185,7 +186,7 @@ function matchedLines(matched: unknown): string {
   }).filter(Boolean)
   if (!lines.length) return ''
   const more = matched.length > lines.length ? `\n  …另有 ${matched.length - lines.length} 个` : ''
-  return `回指明细：\n${lines.join('\n')}${more}`
+  return `追溯明细：\n${lines.join('\n')}${more}`
 }
 
 /** stats 里的裁判句数（claims 为 judge 时才有）→「结论 4 句（支持 1 · 不支持 1 · 未裁判 2）」 */
@@ -201,17 +202,17 @@ function reportStampTitle(r: ReportStamp): string {
   const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
   const uncited = n(st.uncited_claims)
   return [
-    `报告核对（这张图最近一次运行${r.runId ? ` ${shortId(r.runId)}` : ''}）：${reportStampText(r.cited, r.none)}`,
+    `报告核对（此工作流最近一次运行${r.runId ? ` ${shortId(r.runId)}` : ''}）：${reportStampText(r.cited, r.none)}`,
     typeof st.numbers === 'number' ? `数字 ${formatNumber(n(st.numbers_cited))}/${formatNumber(st.numbers)} 有出处` : '',
     n(st.entities) || n(st.quotes) ? `表名字段名 ${formatNumber(n(st.entities))} 处、引文 ${formatNumber(n(st.quotes))} 处有出处` : '',
-    n(st.unresolved) ? `引用解析不了 ${formatNumber(n(st.unresolved))} 处` : '',
-    n(st.unknown_entities) ? `可能是编造的名字 ${formatNumber(n(st.unknown_entities))} 个` : '',
-    n(st.unverified_entities) ? `核对不了的名字 ${formatNumber(n(st.unverified_entities))} 个（只标注，不计入）` : '',
-    uncited ? `没挂依据的结论句 ${formatNumber(uncited)} 句${r.claims === 'require_citation' || r.claims === 'judge'
+    n(st.unresolved) ? `无法解析的引用 ${formatNumber(n(st.unresolved))} 处` : '',
+    n(st.unknown_entities) ? `疑似不存在的名称 ${formatNumber(n(st.unknown_entities))} 个` : '',
+    n(st.unverified_entities) ? `无法核实的名称 ${formatNumber(n(st.unverified_entities))} 个（仅标注，不计入）` : '',
+    uncited ? `未附依据的结论句 ${formatNumber(uncited)} 句${r.claims === 'require_citation' || r.claims === 'judge'
       ? '（计入缺口）' : '（结论句策略不要求，不计入）'}` : '',
     // 结论句裁判（四期）：模型的判断，不计入章上的两个数
     r.claims === 'judge' && claimsLine(st) ? `${claimsLine(st)}（模型判断，非确定，不计入）` : '',
-    '完整清单在记录页这次运行的「证据」页签',
+    '完整清单见记录页中本次运行的「证据」页签',
   ].filter(Boolean).join('\n')
 }
 
@@ -259,12 +260,12 @@ function takenAt(n: NodeTrace | undefined, at: number): string | undefined {
  * 再归一次类会把「工艺员 30 秒没有回应」这种具体的话抹成「等待超时」
  */
 function failureOf(error: string): { note: string; title: string } {
-  if (!error) return { note: '没有给出原因', title: '' }
+  if (!error) return { note: '未提供原因', title: '' }
   const ex = explainRunError(error)
   if (ex.continuable || ex.fix !== 'canvas') return { note: firstSentence(error), title: error }
   return {
     note: ex.title,
-    title: [ex.title, ex.reason, ex.action ? `怎么办：${ex.action}` : ''].filter(Boolean).join('\n'),
+    title: [ex.title, ex.reason, ex.action ? `处理建议：${ex.action}` : ''].filter(Boolean).join('\n'),
   }
 }
 
@@ -273,16 +274,12 @@ const EXHAUSTED_ERROR = /用完\s*\d+\s*轮(?:仍|还)?未完成/
 
 /**
  * 「协作团队用完 N 轮仍未完成：<理由>。一次都没被派到的成员：A、B。…」里的轮数、理由
- * 和没派到的人。判失败的报错和降档的那条日志是同一个开头；产出里的 never_dispatched
- * 进事件时被缩成了「[1 项]」，成员名只能从这句话里认。只认这一次执行的那句话——
+ * 和没派到的人，和时间线同一个解析（run/decode 的 exhaustedOf）。只认这一次执行的那句话——
  * 右栏泳道那份结局是整次运行攒下来的，接着跑成功之后还留着上一次的
  */
 function exhaustedText(text: string): { rounds?: number; reason?: string; never: string[] } | undefined {
-  const m = text.match(/用完\s*(\d+)\s*轮(?:仍|还)?未完成[：:]\s*([\s\S]*?)(?:。一次都没被派到的成员|。先看成员|。按降档交付|$)/)
-  if (!m) return undefined
-  const never = text.match(/一次都没被派到的成员[：:]\s*([^。]+)/)?.[1]
-    .split('、').map((s) => s.trim()).filter(Boolean) ?? []
-  return { rounds: Number(m[1]) || undefined, reason: m[2].trim() || undefined, never }
+  const x = exhaustedOf(text)
+  return x ? { rounds: x.rounds || undefined, reason: x.reason, never: x.never ?? [] } : undefined
 }
 
 /** 完成之后的产出量：模型出了多少 token、查到几行、取回几条 */
@@ -404,8 +401,8 @@ const ToolName = ({ tool }: { tool: string }) => <><span className="nc-tool-name
 /** 工具明细（放悬停）：谁调的（成员首字）、调了什么、成没成、有没有超时 */
 function toolLines(calls: { tool: string; agent?: string; ok?: boolean; timedOut?: boolean; limitS?: number }[]): string {
   return calls.slice(-8).map((c) => `${c.agent ? `[${c.agent.slice(0, 1)}] ` : ''}${c.tool} ${
-    c.timedOut ? `⏱ 超时${c.limitS ? `（上限 ${c.limitS}s）` : ''}`
-      : c.ok === false ? '✗ 失败' : c.ok ? '✓' : `⋯ 进行中${c.limitS ? `（上限 ${c.limitS}s）` : ''}`}`).join('\n')
+    c.timedOut ? `超时${c.limitS ? `（上限 ${c.limitS} 秒）` : ''}`
+      : c.ok === false ? '失败' : c.ok ? '成功' : `进行中${c.limitS ? `（上限 ${c.limitS} 秒）` : ''}`}`).join('\n')
 }
 
 /**
@@ -421,9 +418,9 @@ function doneNote(type: NodeType, u: NodeUsage, preview: any, facts: NodeFacts |
     return {
       note: `用完 ${rounds} 轮未完成 · 降档交付`,
       noteTitle: [
-        `协作团队用完 ${rounds} 轮，调度者始终没有判定完成`,
+        `协作团队用完 ${rounds} 轮，调度者始终未判定完成`,
         ending.reason ? `理由：${ending.reason}` : '',
-        '按降档交付：成果是成员最后的原话，不是调度者认可的结论。下游的复核、出具会跟着降档',
+        '降档交付：成果为成员最后的输出，并非调度者认可的结论；下游的复核和出具随之降档',
       ].filter(Boolean).join('\n'),
       noteWarn: true,
     }
@@ -432,8 +429,8 @@ function doneNote(type: NodeType, u: NodeUsage, preview: any, facts: NodeFacts |
   const settle = marks.filter((m) => m.settle).pop()
   if (settle) {
     return {
-      note: '收尾时仍想调用工具',
-      noteTitle: `${settle.message}\n步数用完之后模型还在要工具：交出来的是它前面写的内容，可能不完整`,
+      note: '步数用尽时仍在请求调用工具',
+      noteTitle: `${settle.message}\n步数已用尽，模型仍在请求调用工具。当前输出为此前已生成的内容，可能不完整`,
       noteWarn: true,
     }
   }
@@ -446,7 +443,7 @@ function doneNote(type: NodeType, u: NodeUsage, preview: any, facts: NodeFacts |
       note: nudged.length > 1 ? `纠正过 ${nudged.length} 次工具调用` : '纠正过一次工具调用',
       noteTitle: [
         ...nudged.slice(-3).map((m) => m.message),
-        `${type === 'supervisor' ? '成员' : '模型'}把工具调用写成了文字，提醒之后重答了，成果是重答的那一次；复核按降档算`,
+        `${type === 'supervisor' ? '成员' : '模型'}将工具调用以文本形式输出，经提醒后已重新作答，成果取自重新作答的结果；复核按降档处理`,
       ].join('\n'),
       noteWarn: true,
     }
@@ -458,8 +455,8 @@ function doneNote(type: NodeType, u: NodeUsage, preview: any, facts: NodeFacts |
     return {
       note: `修复 ${repairs} 次后通过`,
       noteTitle: invented
-        ? `第一次没过校验。其中一次修复出现了原文没有的值，已作废：${invented.message}\n最后通过的那次只调整了格式，复核按降档算`
-        : '第一次没过校验，模型只调整了格式，没有补数据',
+        ? `首次校验未通过。其中一次修复引入了原文中不存在的值，已作废：${invented.message}\n最终通过的版本仅调整了格式，复核按降档处理`
+        : '首次校验未通过，模型仅调整了格式，未补充数据',
       noteWarn: !!invented,
     }
   }
@@ -495,7 +492,7 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
   const side = (
     <>
       {tokens > 0 && (
-        <span className="tnum" title={`输入 ${formatNumber(u.tokensIn)} · 输出 ${formatNumber(u.tokensOut)} tokens`}>
+        <span className="tnum" title={`输入 ${formatNumber(u.tokensIn)} · 输出 ${formatNumber(u.tokensOut)} token`}>
           {formatTokens(tokens, { compact: true })}
         </span>
       )}
@@ -523,7 +520,7 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
       }
       return { main: clock(openSince(n, 'run', at)), side }
     case 'waiting':
-      return { main: <>已等 {clock(openSince(n, 'wait', at), true)}</> }
+      return { main: <>已等待 {clock(openSince(n, 'wait', at), true)}</> }
     case 'done':
       if (type === 'loop') {
         return { main: loop('done'), side: <span className="tnum">{formatDuration(timed ? loopSpan(n, at) ?? n?.lastDurationMs : n?.lastDurationMs)}</span> }
@@ -550,11 +547,11 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
       }
     }
     case 'queued':
-      return { main: '', note: fanIn > 1 ? '等其余上游汇合' : '上游已交付，等待开始' }
+      return { main: '', note: fanIn > 1 ? '等待其余上游完成' : '上游已交付，等待开始' }
     case 'skipped':
       return { main: '', note: n?.skippedReason || '跳过条件成立', noteTitle: n?.skippedReason }
     case 'blocked':
-      return { main: '', note: '上游失败，走不到这里' }
+      return { main: '', note: '上游失败，未执行' }
     case 'unreached':
       return { main: '', note: '本次未执行' }
     case 'cancelled':
@@ -563,12 +560,12 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
         return { main: loop('stopped'), side: <span className="tnum">{formatDuration(timed ? loopSpan(n, at) : undefined)}</span> }
       }
       return {
-        main: n?.startedAt != null && n.endedAt != null && timed ? `停在 ${formatLapse(n.endedAt - n.startedAt)}` : '',
-        note: n?.count ? '' : '没有开始',
+        main: n?.startedAt != null && n.endedAt != null && timed ? `执行 ${formatLapse(n.endedAt - n.startedAt)} 后停止` : '',
+        note: n?.count ? '' : '未开始',
       }
     case 'suspended':
-      if (type === 'loop') return { main: loop('stopped'), note: '可接着跑' }
-      return { main: '', note: '服务重启打断，可接着跑' }
+      if (type === 'loop') return { main: loop('stopped'), note: '可继续运行' }
+      return { main: '', note: '因服务重启中断，可继续运行' }
     default:
       return { main: '' }
   }
@@ -715,7 +712,7 @@ function ApprovalPopover({ id, nodeId, runId, anchor, returnTo, onClose }: {
         <ApprovalCard approval={approval} showWorkflow={false} />
       ) : (
         <div className="p-3 text-xs text-dim">
-          {approval === null ? '没找到这一步的待审批，可能已经处理过了' : '正在取审批卡…'}
+          {approval === null ? '未找到此步骤的待审批事项，可能已被处理' : '正在加载审批卡…'}
         </div>
       )}
     </div>,
@@ -877,7 +874,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const teleTitle = !editing && nt ? [
     nt.model ? `模型 ${nt.model}` : '',
     view.usage.tokensIn + view.usage.tokensOut > 0
-      ? `输入 ${formatNumber(view.usage.tokensIn)} · 输出 ${formatNumber(view.usage.tokensOut)} tokens` : '',
+      ? `输入 ${formatNumber(view.usage.tokensIn)} · 输出 ${formatNumber(view.usage.tokensOut)} token` : '',
     retries > 0 ? `失败后重试了 ${retries} 次` : '',
   ].filter(Boolean).join('\n') || undefined : undefined
 
@@ -888,19 +885,19 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const gaps: string[] = Array.isArray(detail?.gaps) ? detail.gaps.map(String) : []
   const stampTitle = tier ? [
     `出具判定：${issuanceLabel(tier)}`,
-    detail ? `回指 ${detail.matched_numbers ?? 0} 个数字 / 核对 ${detail.metrics_checked ?? 0} 个指标` : '',
+    detail ? `可追溯 ${detail.matched_numbers ?? 0} 个数字 / 核对 ${detail.metrics_checked ?? 0} 个指标` : '',
     // 降档常常不是数字对不上，而是校验根本没跑全（叙述模板渲染为空、指标集为空）：
     // 不写出来，悬停在一个「降档出具」上看不到任何理由
-    gaps.length ? `校验没跑全：${gaps.join('；')}` : '',
+    gaps.length ? `校验未全部完成：${gaps.join('；')}` : '',
     (detail?.missing_required ?? issuance?.missingRequired ?? []).length
-      ? `缺必需指标：${(detail?.missing_required ?? issuance?.missingRequired).join('、')}` : '',
+      ? `缺少必需指标：${(detail?.missing_required ?? issuance?.missingRequired).join('、')}` : '',
     (detail?.unmatched_numbers ?? issuance?.unmatched ?? []).length
-      ? `无法回指的数字：${(detail?.unmatched_numbers ?? issuance?.unmatched).map((u: any) => u?.token ?? u).join('、')}`
-      : issuance?.unmatchedCount ? `无法回指的数字 ${issuance.unmatchedCount} 个` : '',
-    (detail?.missing_expected ?? []).length ? `缺数据声明：${detail!.missing_expected.join('、')} 本期缺失` : '',
+      ? `无法追溯的数字：${(detail?.unmatched_numbers ?? issuance?.unmatched).map((u: any) => u?.token ?? u).join('、')}`
+      : issuance?.unmatchedCount ? `无法追溯的数字 ${issuance.unmatchedCount} 个` : '',
+    (detail?.missing_expected ?? []).length ? `缺少期望指标：${detail!.missing_expected.join('、')}（本期无数据）` : '',
     matchedLines(detail?.matched),
     runClass === 'exploratory' ? '探索运行的结论不进正式归档' : '',
-    '完整判定在右栏运行视图的成果区',
+    '完整判定见右栏运行视图的成果区',
   ].filter(Boolean).join('\n') : ''
 
   const rank = typeof (data as any).rank === 'number' ? (data as any).rank : undefined
@@ -957,16 +954,16 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
           <div className="nc-icon"><Icon size={12} /></div>
           <div className="nc-title">{data.label || def?.label}</div>
           {stale && (
-            <span className="nc-chip" title="画布上的配置在这次运行之后改过，这张卡上的结果来自改动前的配置">旧配置</span>
+            <span className="nc-chip" title="画布上的配置在本次运行之后有修改，此节点显示的是修改前配置的运行结果">旧配置</span>
           )}
           {count > 1 && (
-            <span className="nc-chip tnum" title={`这次运行里执行了 ${count} 次`}>×{count}</span>
+            <span className="nc-chip tnum" title={`本次运行中执行了 ${count} 次`}>×{count}</span>
           )}
           {retries > 0 && (
             <span className="nc-chip nc-chip-warn tnum" title={`失败后重试了 ${retries} 次`}>↻{retries}</span>
           )}
           {ending?.exhausted === 'degrade' && (
-            <span className="nc-chip nc-chip-warn" title="轮数用完仍未完成，按降档交付">降档</span>
+            <span className="nc-chip nc-chip-warn" title="轮数已用完仍未完成，已降档交付">降档</span>
           )}
           {(runActive || state !== 'idle') && (
             <StatusBadge status={state} size={14} animate={executing} className="nc-badge" />

@@ -99,7 +99,7 @@ export function ChatPage() {
     // 列表里还挂着它，说明列表是过时的（别的标签页删掉了）：顺手刷新
     if (list.some((c) => c.id === conversationId)) void useConversations.getState().load()
     const next = list.find((c) => c.id !== conversationId)
-    toast.info(next ? '那个对话不在了，已经带你回到最近一个' : '那个对话不在了')
+    toast.info(next ? '该对话不存在，已为你打开最近的对话' : '该对话不存在')
     navigate(next ? `/chat/${next.id}` : '/chat', { replace: true })
   }, [conversationId, listLoading, list, navigate, missing])
 
@@ -128,8 +128,8 @@ export function ChatPage() {
     if (!gone.length) return
     const left = scope.filter((s) => alive.has(s.id))
     setScope(scopeKey, left)
-    toast.info(`数据源「${gone.map((s) => s.name).join('、')}」已经删掉或停用了，`
-      + (left.length ? '已经从这个对话的范围里拿掉' : '这个对话改回不限数据源'))
+    toast.info(`数据源「${gone.map((s) => s.name).join('、')}」已删除或停用，`
+      + (left.length ? '已从本对话的查询范围中移除' : '本对话已恢复为不限数据源'))
   }, [sources.state, usable, scope, scopeKey, setScope])
 
   const busy = busyTurn(turns)
@@ -145,10 +145,10 @@ export function ChatPage() {
     return null
   }, [byConversation, currentId, list])
 
-  const blocked = loadState === 'loading' ? '正在取回这个对话的历史…'
-    : loadState === 'error' ? '历史没取回来，先点上面的「重试」'
-    : trashed ? '这个对话在回收站里，恢复之后才能接着问'
-    : backend === 'down' ? '后端没连上，这会儿发不出去'
+  const blocked = loadState === 'loading' ? '正在加载对话历史…'
+    : loadState === 'error' ? '对话历史加载失败，请点击上方的「重试」'
+    : trashed ? '该对话在回收站中，恢复后才能继续提问'
+    : backend === 'down' ? '无法连接服务，暂时不能发送'
     : null
 
   const send = async (text?: string) => {
@@ -179,7 +179,7 @@ export function ChatPage() {
   /** 「换个说法」：原问题填回来，光标放到末尾，让人改而不是重打 */
   const rephrase = (question: string) => {
     setDraft(question)
-    setTip('换个说法：写明查哪个库、什么时间范围、要什么指标，更容易一次查对')
+    setTip('换个说法：写明要查询的数据库、时间范围和指标，更容易一次查询准确')
     requestAnimationFrame(() => {
       const el = inputRef.current
       if (!el) return
@@ -210,7 +210,7 @@ export function ChatPage() {
   // 没东西可摆时它自己不画
   const picker = usable.length > 0 || scope.length > 0 || sources.state !== 'ready'
     ? <ScopePicker sources={usable} scope={scope} onChange={pickScope}
-                   unconfirmed={sources.state === 'loading' ? '正在确认' : sources.state === 'error' ? '没取到状态' : undefined} />
+                   unconfirmed={sources.state === 'loading' ? '正在确认' : sources.state === 'error' ? '状态获取失败' : undefined} />
     : undefined
 
   const dock = (
@@ -223,7 +223,7 @@ export function ChatPage() {
               对话「{elsewhere.title}」正在运行，这里可以照常提问
             </span>
             <Link to={`/chat/${elsewhere.id}`} className="shrink-0 text-[var(--accent)] hover:underline">
-              去看看
+              查看
             </Link>
           </div>
         )}
@@ -239,7 +239,7 @@ export function ChatPage() {
           stopLabel="停止这一轮"
           blocked={blocked}
           label="向数据提问"
-          placeholder="问点什么…"
+          placeholder="输入你的问题…"
           leading={picker}
         />
       </div>
@@ -306,7 +306,7 @@ export function ChatPage() {
             const created = await api.workflows.create({ name, graph })
             void refreshCatalog()
             navigate(`/studio/${created.id}`, leavePass())
-            toast.ok('已放到画布：新建了一个工作流，画布上原来的工作流不受影响')
+            toast.ok('已在画布中新建工作流，原有工作流不受影响')
           } catch (e) {
             toast.error(e)
           }
@@ -322,13 +322,13 @@ export function ChatPage() {
       <ConversationList />
       <div className="flex min-w-0 flex-1 flex-col">
         <PageHeader icon={<MessageSquare size={14} />} title="问数据"
-                    subtitle="说需求，它自己接数据源、搭工作流、跑完给结论" />
+                    subtitle="描述需求，助手会自动连接数据源、搭建工作流并给出结论" />
         {trashed && (
           // 输入框那里也写着为什么发不出去；这里给出路，免得人再回左栏的回收站里找它
           <div data-trash-banner="" role="status"
                className="flex shrink-0 items-center gap-2 border-b bg-elev px-4 py-1.5 text-xs">
             <Trash2 size={13} className="shrink-0 text-faint" aria-hidden />
-            <span className="min-w-0 flex-1 text-dim">这个对话在回收站里。可以翻看，恢复之后才能接着问。</span>
+            <span className="min-w-0 flex-1 text-dim">该对话在回收站中，可以查看，恢复后才能继续提问。</span>
             <button className="btn btn-xs btn-primary" onClick={() => void restoreConversation(trashed, navigate)}>
               恢复
             </button>
@@ -489,16 +489,16 @@ function TurnExtras({ turnId, readOnly }: {
       {scoped && (
         <div className="mt-2 flex items-center gap-1 text-2xs text-faint" data-turn-scope="">
           <Database size={11} className="shrink-0" aria-hidden />
-          <span className="min-w-0 truncate">这一问只查 {turn.scope!.map((s) => s.name).join('、')}</span>
+          <span className="min-w-0 truncate">本轮只查 {turn.scope!.map((s) => s.name).join('、')}</span>
         </div>
       )}
       {(turn.pendingRun || canSteps) && (
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {turn.pendingRun && (
             <button className="btn btn-xs btn-primary" disabled={busy || readOnly}
-                    title={readOnly ? IN_TRASH : busy ? '这个对话还有一轮在跑' : '按搭好的工作流运行一次'}
+                    title={readOnly ? IN_TRASH : busy ? '本对话仍有一轮在运行' : '按已搭建的工作流运行一次'}
                     onClick={() => runNow(conversationId, turn.id)}>
-              <Play size={11} /> 跑一下
+              <Play size={11} /> 运行
             </button>
           )}
           {canSteps && (
@@ -506,7 +506,7 @@ function TurnExtras({ turnId, readOnly }: {
                     disabled={turn.steps === 'loading'}
                     onClick={() => void toggleSteps(conversationId, turn.id)}>
               {turn.steps === 'loading' ? <Spinner size={11} /> : <ListTree size={11} />}
-              {turn.steps === 'loading' ? '正在取执行过程…' : stepsVisible(turn) ? '收起执行过程' : '看执行过程'}
+              {turn.steps === 'loading' ? '正在加载执行过程…' : stepsVisible(turn) ? '收起执行过程' : '查看执行过程'}
             </button>
           )}
         </div>
@@ -515,7 +515,7 @@ function TurnExtras({ turnId, readOnly }: {
       {!!pending.length && readOnly && (
         <div className="mt-2 flex items-center gap-1.5 text-2xs text-faint" data-pending-approval="">
           <StatusBadge status="waiting" size={11} decorative />
-          <span className="min-w-0 flex-1">这一轮停在审批上。恢复这个对话之后在这里处理，或者到「记录」的待审批里处理。</span>
+          <span className="min-w-0 flex-1">本轮正在等待审批。恢复对话后可在此处理，也可以在「记录」的「待审批」中处理。</span>
           <Link to="/runs?tab=approvals" className="shrink-0 text-[var(--accent)] hover:underline">去审批</Link>
         </div>
       )}
@@ -533,7 +533,7 @@ function TurnExtras({ turnId, readOnly }: {
 
 const BUSY = new Set(['planning', 'building', 'running', 'checking'])
 
-const IN_TRASH = '这个对话在回收站里，恢复之后才能接着跑'
+const IN_TRASH = '该对话在回收站中，恢复后才能运行'
 
 /**
  * 补救动作，排在这一轮的卡片下面。
@@ -582,7 +582,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   const target = current && cap ? Math.min(cap, Math.max(current * 2, current + 8)) : null
   const canContinue = !!turn.run?.id && (kind === 'suspended'
     || (kind === 'failed' && turn.runStatus === 'failed' && turn.failure?.continuable !== false))
-  const offNote = readOnly ? IN_TRASH : busy ? '这个对话还有一轮在跑，等它结束' : undefined
+  const offNote = readOnly ? IN_TRASH : busy ? '本对话仍有一轮在运行，请等待其结束' : undefined
   const off = busy || readOnly
   // 异常态醒目、正常态安静：失败、中断、不可用的第一个动作是实心的
   const alarm = kind === 'failed' || kind === 'suspended' || kind === 'unusable'
@@ -605,7 +605,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   const again = (opts?: { maxSteps?: number; rerun?: boolean; scope?: ScopeSource[] }) => {
     if (last) retryTurn(conversationId, turn.id, opts)
     else if (ask(conversationId, turn.question, opts?.scope ? { scope: opts.scope } : undefined)) {
-      toast.info('已经在对话末尾用同一个问题再问了一次')
+      toast.info('已在对话末尾用同一问题重新提问')
     }
   }
 
@@ -613,7 +613,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   if (kind === 'unknown') {
     buttons.push(
       <button key="recheck" className="btn btn-xs" onClick={() => void recheck(conversationId, turn.id)}
-              title="再去后端查一次这一轮的运行现在怎样了">
+              title="重新查询本轮运行的当前状态">
         <RotateCw size={11} /> 重新核对
       </button>,
     )
@@ -622,7 +622,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
     buttons.push(fx.fix === 'tools'
       ? (
         <Link key="fix" className="btn btn-xs btn-primary" to={fx.fixTo ?? '/tools'} data-remedy-fix="tools"
-              title={fx.fixTo ? '打开要改的那个工具的编辑框；改好保存，回来接着跑' : '到工具库把它改好，回来接着跑'}>
+              title={fx.fixTo ? '打开需要修改的工具的编辑框；修改并保存后返回继续运行' : '到工具库修改该工具，保存后返回继续运行'}>
           <Wrench size={11} /> 去改参数定义
         </Link>
       )
@@ -635,23 +635,23 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   if (canContinue) {
     buttons.push(
       <button key="continue" className={clsx('btn btn-xs', !fixFirst && 'btn-primary')} disabled={off || resuming}
-              title={offNote ?? '从断点接着跑：前面跑过的步骤不重来。要改配置请到画布上改'}
+              title={offNote ?? '从断点继续运行，已完成的步骤不会重新执行。如需修改配置，请在画布中修改'}
               onClick={() => void resume()}>
-        {resuming ? <Spinner size={11} /> : <StepForward size={11} />} 接着跑
+        {resuming ? <Spinner size={11} /> : <StepForward size={11} />} 继续运行
       </button>,
     )
   }
   if (kind && kind !== 'unknown') {
     const scopeGone = !!turn.failure?.scopeGone
     const plain = (kind === 'cancelled' || kind === 'suspended' || !!turn.failure?.rerun) && graphful
-    const label = scopeGone ? '不限数据源重试' : !last ? '重新问一次' : plain ? '重跑这一轮' : '重试这一轮'
+    const label = scopeGone ? '不限数据源重试' : !last ? '重新问一次' : plain ? '重新运行本轮' : '重试本轮'
     buttons.push(
       <button key="retry" className={clsx('btn btn-xs', alarm && !canContinue && !fixFirst && 'btn-primary')}
               disabled={off}
-              title={offNote ?? (scopeGone ? '去掉数据源限定，由它自己挑库，再问一次'
-                : !last ? '在对话末尾用同一个问题再问一次'
-                : plain ? '按原来的工作流从头再运行一次，上一次留档可以对照'
-                : '带着上一次的原因重来，它会先调整工作流；上一次留档可以对照')}
+              title={offNote ?? (scopeGone ? '取消数据源限定，由助手自动选择数据库后重新提问'
+                : !last ? '在对话末尾用同一问题重新提问'
+                : plain ? '按原工作流从头重新运行，上一次的结果会保留以供对照'
+                : '结合上一次的失败原因重试，助手会先调整工作流；上一次的结果会保留以供对照')}
               onClick={() => {
                 if (!scopeGone) return again(plain ? { rerun: true } : undefined)
                 // 输入框左边的范围也一起放开，不然下一问又撞上同一个 400
@@ -665,16 +665,16 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   if (stepSignal && last && graphful && current && target && target > current) {
     buttons.push(
       <button key="steps" className="btn btn-xs" disabled={off}
-              title={offNote ?? `把 agent 的步数上限从 ${current} 调到 ${target}（全局上限 ${cap} 步，在设置里改），工作流不变，重跑一次`}
+              title={offNote ?? `将 Agent 的步数上限从 ${current} 调整为 ${target}（全局上限 ${cap} 步，可在设置中修改），工作流不变，重新运行一次`}
               onClick={() => again({ maxSteps: target })}>
-        <ArrowRight size={11} /> 放宽步数重跑（{current} → {target} 步）
+        <ArrowRight size={11} /> 放宽步数后重新运行（{current} → {target} 步）
       </button>,
     )
   }
   if (kind && kind !== 'unknown') {
     buttons.push(
       <button key="rephrase" className="btn btn-xs btn-ghost" onClick={() => onRephrase(turn.question)}
-              title="把这个问题填回输入框，改一改再问">
+              title="将该问题填回输入框，修改后重新提问">
         <PenLine size={11} /> 换个说法
       </button>,
     )
@@ -682,7 +682,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
 
   // 中断、取消、没核对上在流里不出红框（它们不是故障），为什么停、停了意味着什么在这里说
   const note = kind === 'suspended' || kind === 'unknown' ? turn.failure
-    : kind === 'cancelled' ? { title: '', reason: turn.run ? '你停下了这一轮，后端的运行也一并取消了。' : '你在搭工作流时停下了这一轮。' }
+    : kind === 'cancelled' ? { title: '', reason: turn.run ? '你已停止本轮，对应的运行也已一并取消。' : '你在搭建工作流时停止了本轮。' }
     : null
 
   return (
@@ -691,8 +691,8 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
         <div className="mb-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed text-dim"
              style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 40%, var(--border))' }} role="note">
           {turn.clipped === 'lost'
-            ? '这份答案在旧版本保存时被截在了 2000 字，对应的运行记录已经删掉，补不回后面的部分。'
-            : '答案比较长，这里只收到了前一部分；完整版在运行记录里，刷新后会自动补全。'}
+            ? '该答案保存时被截断为 2000 字，且对应的运行记录已删除，无法恢复完整内容。'
+            : '答案较长，此处仅显示前一部分；完整内容保存在运行记录中，刷新后将自动补全。'}
         </div>
       )}
       {note && (note.reason || note.hint) && (
@@ -825,10 +825,10 @@ function LoadFailed({ error, onRetry }: { error: unknown; onRetry: () => void })
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6">
       <div role="alert" className="max-w-md text-center">
         <Icon size={22} className="mx-auto text-[var(--st-failed)]" aria-hidden />
-        <div className="mt-2 text-sm font-medium">这个对话的历史没取回来</div>
+        <div className="mt-2 text-sm font-medium">对话历史加载失败</div>
         <div className="mt-1 text-xs leading-relaxed text-dim">{h.reason ? `${h.title}：${h.reason}` : h.title}</div>
         <div className="mt-1 text-xs leading-relaxed text-faint">
-          取回来之前先不能在这里提问，免得新问题把历史盖掉。已经打好的字会留着。
+          加载完成前暂时不能在此提问，以免新问题覆盖历史记录。已输入的内容会保留。
         </div>
         <button className="btn btn-sm mt-3" onClick={onRetry}><RotateCw size={12} /> 重试</button>
         {h.raw && h.raw !== h.title && <div className="mt-2 text-left"><TechDetails raw={h.raw} /></div>}
@@ -898,7 +898,7 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
             <Database size={20} />
           </div>
           <h2 className="text-xl font-semibold">问你的数据</h2>
-          <p className="mt-1 text-xs text-faint">说一句话，它自己接数据源、写查询、跑完给结论——不用碰画布</p>
+          <p className="mt-1 text-xs text-faint">用一句话描述需求，助手会自动连接数据源、编写查询并给出结论，无需操作画布</p>
         </div>
 
         <PromptBox
@@ -911,16 +911,16 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
           onSubmit={onSend}
           blocked={blocked}
           label="向数据提问"
-          placeholder="问点什么…"
+          placeholder="输入你的问题…"
           leading={picker}
         />
 
         <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5 text-2xs">
           <Capability to="/data" icon={<Database size={11} />}
             text={sources.state === 'loading' ? '数据源 —'
-              : sources.state === 'error' ? '数据源没取回来'
+              : sources.state === 'error' ? '数据源加载失败'
               : list.length ? `${list.length} 个数据源`
-              : '还没有数据源'} />
+              : '暂无数据源'} />
           <Capability to="/knowledge" icon={<BookOpen size={11} />}
             text={countLine('知识库', collections.length, collectionsState)} />
           <Capability to="/tools" icon={<Wrench size={11} />} text={countLine('工具', tools.length, toolsState)} />
@@ -931,12 +931,12 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
         {usable.length > 0 && (
           <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5 text-2xs"
                role="group" aria-label="限定只查哪些数据源">
-            <span className="text-faint">{scope.length ? '只查' : '点一个，只查它'}</span>
+            <span className="text-faint">{scope.length ? '只查' : '点击可限定只查该数据源'}</span>
             {usable.slice(0, HERO_CHIPS).map((s) => {
               const on = scope.some((x) => x.id === s.id)
               return (
                 <button key={s.id} type="button" data-scope-chip={s.id} aria-pressed={on}
-                        title={on ? `只查 ${s.name}。再点一下取消` : `这一问只查 ${s.name}`}
+                        title={on ? `只查 ${s.name}，再次点击可取消` : `本轮只查 ${s.name}`}
                         className={clsx('inline-flex items-center gap-1 rounded-full border px-2 py-0.5 transition-colors',
                           on ? 'border-[var(--accent)] bg-accent-soft text-[var(--accent)]'
                             : 'text-dim hover:border-[var(--border-strong)] hover:text-fg')}
@@ -948,14 +948,14 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
               )
             })}
             {usable.length > HERO_CHIPS && (
-              <span className="text-faint">另外 {usable.length - HERO_CHIPS} 个在输入框左边选</span>
+              <span className="text-faint">其余 {usable.length - HERO_CHIPS} 个可在输入框左侧选择</span>
             )}
           </div>
         )}
 
         {none && (
           <div className="mt-6 rounded-lg border bg-panel px-4 py-3 text-center text-xs leading-relaxed text-dim">
-            还没有接入数据源。接一个数据库或者传一张表，就能直接问它问题了。
+            尚未接入数据源。接入数据库或上传表格后，即可直接提问。
             <div className="mt-2">
               <Link to="/data" className="btn btn-sm btn-primary">
                 <Database size={12} /> 接入数据源
@@ -965,10 +965,10 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
         )}
 
         {!!suggestions.length && (
-          <SuggestionGroup title="试试这样问" items={suggestions} onPick={onPick} offset={0} />
+          <SuggestionGroup title="示例问题" items={suggestions} onPick={onPick} offset={0} />
         )}
         {!!recent.length && (
-          <SuggestionGroup title="最近问过，再问一次" icon={<History size={11} />} items={recent}
+          <SuggestionGroup title="最近的问题" icon={<History size={11} />} items={recent}
                            onPick={onPick} offset={suggestions.length} />
         )}
       </div>
@@ -1035,7 +1035,7 @@ function ScopePicker({ sources, scope, onChange, unconfirmed }: {
            close()
          }}>
       <button ref={button} type="button" aria-haspopup="dialog" aria-expanded={open}
-              aria-label={`数据源范围：${text}`} title="限定这一问只查哪些数据源"
+              aria-label={`数据源范围：${text}`} title="限定本轮只查哪些数据源"
               className={clsx('flex min-w-0 max-w-[16rem] items-center gap-1 rounded-md px-1.5 py-1 text-2xs transition-colors hover:bg-hover',
                 scope.length ? 'text-[var(--accent)]' : 'text-faint hover:text-dim')}
               onClick={() => {
@@ -1051,7 +1051,7 @@ function ScopePicker({ sources, scope, onChange, unconfirmed }: {
         <div role="dialog" aria-label="数据源范围"
              className="fade-up absolute bottom-full left-0 z-20 mb-1.5 w-64 rounded-lg border bg-panel p-1.5 shadow-elev-2">
           <div className="px-1.5 pb-1 pt-0.5 text-2xs leading-relaxed text-faint">
-            这一问只查勾上的库；都不勾就由它自己挑
+            本轮只查勾选的库；不勾选则由助手自动选择
           </div>
           <div className="max-h-56 overflow-y-auto">
             {sources.map((s, i) => (
@@ -1077,7 +1077,7 @@ function ScopePicker({ sources, scope, onChange, unconfirmed }: {
               不限，全部数据源
             </button>
             <span className="flex-1" />
-            <button type="button" className="btn btn-xs" onClick={close}>好了</button>
+            <button type="button" className="btn btn-xs" onClick={close}>完成</button>
           </div>
         </div>
       )}
@@ -1091,7 +1091,7 @@ function ScopePicker({ sources, scope, onChange, unconfirmed }: {
  */
 function countLine(what: string, n: number, state: CatalogListState): string {
   if (state === 'ok') return `${what} ${n} 个`
-  return state === 'loading' ? `${what} —` : `${what}没取回来`
+  return state === 'loading' ? `${what} —` : `${what}加载失败`
 }
 
 function Capability({ to, icon, text }: { to: string; icon: ReactNode; text: string }) {
@@ -1113,7 +1113,7 @@ function SuggestionGroup({ title, icon, items, onPick, offset }: {
           <button key={q}
             className="rise-in rounded-lg border bg-panel px-3 py-2 text-left text-xs leading-relaxed text-dim transition-colors hover:border-[var(--accent)] hover:text-fg"
             style={{ '--i': offset + i + 1 } as CSSProperties}
-            title="填进输入框，改一改再发"
+            title="填入输入框，修改后发送"
             onClick={() => onPick(q)}>
             {q}
           </button>
@@ -1149,7 +1149,7 @@ const DOMAIN_QUESTIONS: [RegExp, string][] = [
   [/设备|IOT|停机/i, '最近 7 天停机次数最多的设备'],
   [/财务|凭证|科目/, '本月凭证金额按科目汇总'],
   [/订单|销售/, '各地区的订单金额排名'],
-  [/商品|产品/, '卖得最好的 5 个商品'],
+  [/商品|产品/, '销量最高的 5 个商品'],
   [/用户|会员|客户/, '最近 7 天新增了多少用户'],
   [/出勤|考勤|人员/, '本周各部门的出勤率'],
 ]
@@ -1166,7 +1166,7 @@ function suggestFrom(sources: Source[]): string[] {
     const table = tables.find((t) => ENTITY.test(t.split('.').pop() ?? t)) ?? tables[0]
     return table
       ? [`${s.name} 的 ${table.split('.').pop()} 表一共多少条？最近一条是什么时候`]
-      : [`${s.name} 里都有哪些业务数据？挑最大的一张表说说`]
+      : [`${s.name} 里有哪些业务数据？数据量最大的是哪张表`]
   })
   // 各个库轮流取，别让第一个库把四个位置占满
   const out: string[] = []

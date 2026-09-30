@@ -258,7 +258,7 @@ async def test_testing_a_mistyped_sqlite_path_does_not_create_the_file(client, t
                                                         "readonly": False})
     body = r.json()
     assert body["ok"] is False, body
-    assert "打不开这个数据库文件" in body["error"] and body["hint"] and body["detail"]
+    assert "无法打开该数据库文件" in body["error"] and body["hint"] and body["detail"]
     assert not missing.exists(), "测连接把一个空库建出来了"
 
     r = await client.post("/api/datasources/test", json={"kind": "sqlite", "database": "", "readonly": False})
@@ -273,6 +273,45 @@ async def test_testing_a_mistyped_sqlite_path_does_not_create_the_file(client, t
         assert body["ok"] is False and not missing.exists()
     finally:
         await client.delete(f"/api/datasources/{saved['id']}")
+
+
+async def test_database_connect_failures_get_database_hints(client):
+    """连不上、等超时、密码错这几类，按错误类别换成数据库的说法：说主机和端口、用户名和密码，
+    不说 API Key、Base URL。以前按报错文字全等比较，通用那句多了半句就永远比不上，数据库的提示从不出现；
+    前缀「连不上：」还和原因「连不上对方的服务」叠成同一句话说两遍。"""
+    import asyncio
+    import socket
+
+    from app.api.datasources import _explain_connect
+
+    # 真连一个没人监听的端口：驱动抛的是自己的异常类，走的是类别判断，不是字面匹配
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    r = await client.post("/api/datasources/test", json={"kind": "postgres", "host": "127.0.0.1", "port": port,
+                                                        "database": "x", "username": "u", "password": "p"})
+    body = r.json()
+    assert body["ok"] is False, body
+    if "驱动" not in body["error"]:          # 没装 asyncpg 的环境只能测到「没装驱动」
+        assert body["error"] == "连接失败：网络不通，或数据库服务未启动", body
+        assert "「主机」" in body["hint"] and "「端口」" in body["hint"], body
+        assert "API" not in body["hint"] and "Base URL" not in body["hint"], body
+
+    reason, hint = _explain_connect(ConnectionRefusedError(61, "Connection refused"), "mysql")
+    assert (reason, "「主机」" in hint) == ("网络不通，或数据库服务未启动", True)
+    reason, hint = _explain_connect(asyncio.TimeoutError(), "postgres")
+    assert reason == "数据库长时间没有响应" and "「端口」" in hint
+
+    class InvalidAuthorizationSpecificationError(Exception):
+        """asyncpg 的鉴权异常：原文不一定带 password 字样，按类名认"""
+
+    reason, hint = _explain_connect(InvalidAuthorizationSpecificationError("role \"u\" is not permitted"), "postgres")
+    assert reason == "用户名或密码错误" and "「用户名」" in hint and "API Key" not in hint
+
+    # 测连接的错误不能把同一句话说两遍
+    for e in (ConnectionRefusedError(61, "Connection refused"), asyncio.TimeoutError()):
+        reason, _ = _explain_connect(e, "postgres")
+        assert "连不上" not in f"连接失败：{reason}" and "连接" not in reason
 
 
 async def test_draft_test_of_an_existing_source_keeps_the_saved_password(client, shop_db):
@@ -495,7 +534,7 @@ async def test_a_csv_upload_is_pointed_at_datasources(client):
     r = await client.post("/api/kb/upload", files={"file": ("sales.csv", b"a,b\n1,2", "text/csv")})
     assert r.status_code == 415
     detail = r.json()["detail"]
-    assert "数据源" in detail and "传表格" in detail, detail
+    assert "「数据」页" in detail and "上传表格" in detail, detail
 
 
 # --------------------------------------------------------------------------
@@ -546,7 +585,7 @@ async def test_only_a_succeeded_run_can_become_a_template(client):
     for status in ("failed", "cancelled", "interrupted", "running"):
         r = await client.post("/api/copilot/from-run", json={"run_id": await _run_with(status)})
         assert r.status_code == 409, (status, r.text)
-        assert "没有跑完" in r.json()["detail"]
+        assert "未成功结束" in r.json()["detail"]
 
     before = await _count(Workflow)
     r = await client.post("/api/copilot/from-run", json={"run_id": await _run_with("succeeded")})

@@ -105,12 +105,12 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   } else if (code === 'queued') {
     sub = '等待开始'
   } else if (code === 'waiting' && waitingId) {
-    sub = `等「${labelOf(waitingId)}」${waitedMs != null ? ` · 已等 ${formatSpan(waitedMs, { coarse: true })}` : ''}`
+    sub = `等待「${labelOf(waitingId)}」${waitedMs != null ? ` · 已等待 ${formatSpan(waitedMs, { coarse: true })}` : ''}`
   } else if (code === 'failed') {
     const id = run.error_node_id ?? trace.failedNodeId
-    sub = id ? `失败于「${labelOf(id)}」` : '没定位到节点'
+    sub = id ? `失败于「${labelOf(id)}」` : '未定位到节点'
   } else if (code === 'held' || code === 'suspended') {
-    sub = '断点还在，可接着跑'
+    sub = '断点完好，可继续运行'
   } else if (code === 'cancelled') {
     sub = cancelNote(run.error, cancelled)
   }
@@ -129,20 +129,20 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
         <StatusPill status={code} className="-ml-1.5 self-start" />
         {sub && <Sub title={sub}>{sub}</Sub>}
       </Cell>
-      <Cell label="墙钟" title="从第一次开始到结束（或此刻）">
+      <Cell label="总时长" title="从开始到结束（或此刻）的总时长">
         <Value data="wall">{wallTicks ? formatClock(wall) : <Span ms={wall} />}</Value>
         <Sub>
-          {executing ? (waits ? '至今，含等人' : '计时中')
-            : phase === 'waiting' ? '至今，还在等审批'
+          {executing ? (waits ? '至今，含等待审批' : '计时中')
+            : phase === 'waiting' ? '至今，仍在等待审批'
             : code === 'held' || code === 'suspended' ? '到挂起为止'
             : source === 'stamps' ? '按起止时间推算' : '发起到结束'}
         </Sub>
       </Cell>
-      <Cell label="执行" title="各段执行时长之和：审批恢复、接着跑的每一段都算">
+      <Cell label="执行时长" title="各段执行时长之和，包括审批后恢复和继续运行的每一段">
         <Value data="active">{activeTicks ? formatClock(active) : <Span ms={active} />}</Value>
         <Sub>{drives > 1 ? `分 ${drives} 段执行` : ' '}</Sub>
       </Cell>
-      <Cell label="等人" title="挂在人工审批上的总时长">
+      <Cell label="等待审批" title="等待人工审批的总时长">
         <Value data="wait" tone={phase === 'waiting' && (waitedMs ?? 0) >= LONG_WAIT_MS ? 'var(--st-waiting)' : undefined}>
           <Span ms={wait} />
         </Value>
@@ -152,7 +152,7 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
         <Value data="nodes">{nodesTotal ? <>{proj!.nodesDone}<span className="text-faint">/{nodesTotal}</span></> : NONE}</Value>
         <Sub>{executing && proj && proj.parallelNow > 1 ? `${proj.parallelNow} 个并行` : ' '}</Sub>
       </Cell>
-      <Cell label="用量" title={approx ? '进行中：只含已经回报的调用，跑完后换成后端的权威总数' : 'tokens 与成本'}>
+      <Cell label="用量" title={approx ? '运行中：仅统计已上报的调用，运行结束后以服务端统计为准' : 'token 用量与成本'}>
         <Value data="tokens">
           {tokens ? <>{approx && '≥ '}{formatTokens(tokens, { compact: true })}</> : NONE}
         </Value>
@@ -273,10 +273,10 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
   }
 
   const unsealedWhy = phase === 'running' || phase === 'queued'
-    ? '跑完才封存清单'
+    ? '运行结束后封存清单'
     : phase === 'waiting'
-      ? '停在审批上，跑完才封存'
-      : '这次运行没有封存清单'
+      ? '等待审批中，运行结束后封存'
+      : '本次运行没有封存清单'
 
   // 扫描线的时长按事件条数估：重算的就是这些事件
   const scanMs = Math.min(2400, Math.max(600, eventCount * 0.8))
@@ -314,7 +314,7 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
         {sealed && <VerifyState verify={verify} verifying={verifying} fresh={fresh} />}
         {sealed && (
           <button type="button" className="btn btn-xs btn-ghost" disabled={verifying} onClick={() => void doVerify()}
-                  title="重算封存范围内的事件哈希，和封存时记下的清单对一下" data-verify-btn="">
+                  title="重新计算封存范围内事件的校验值，并与封存清单比对" data-verify-btn="">
             {verify ? '重新核对' : '核对'}
           </button>
         )}
@@ -340,7 +340,7 @@ function VerifyState({ verify, verifying, fresh }: { verify: VerifyResult | null
   if (verifying) {
     return <span className="text-dim" role="status" data-verify="running">核对中…</span>
   }
-  if (!verify) return <span className="text-faint" data-verify="none">还没核对过</span>
+  if (!verify) return <span className="text-faint" data-verify="none">尚未核对</span>
   const good = verify.ok === true
   const Icon = good ? ShieldCheck : ShieldAlert
   return (
@@ -348,11 +348,11 @@ function VerifyState({ verify, verifying, fresh }: { verify: VerifyResult | null
       role="status"
       className="flex min-w-0 items-center gap-1"
       style={{ color: good ? 'var(--st-done)' : 'var(--st-failed)' }}
-      title={`${verify.message}（${formatDateTime(verify.at)} 核对${verify.legacy ? '，按老口径还原封存范围' : ''}）`}
+      title={`${verify.message}（${formatDateTime(verify.at)} 核对${verify.legacy ? '，封存范围按结束事件推算' : ''}）`}
       data-verify={good ? 'ok' : 'mismatch'}
     >
       <Icon size={12} className={fresh ? 'runs-stamp' : undefined} aria-hidden />
-      <span className="font-medium">{good ? '已核验' : '不一致'}</span>
+      <span className="font-medium">{good ? '已核对' : '不一致'}</span>
       <span className="tnum truncate opacity-80">
         {formatTime(verify.at)}
         {good && isNum(verify.events) ? ` · ${formatNumber(verify.events)} 条事件与清单一致` : ` · ${verify.message}`}
@@ -379,12 +379,12 @@ function ProvenanceDetail({ id, run, verify, eventCount }: {
     ['清单哈希', run.manifest_hash ? <CopyValue value={run.manifest_hash} label="清单哈希" /> : <span className="text-faint">未封存</span>],
     ['封存范围', run.manifest_seq != null
       ? <span className="tnum">第 1–{formatNumber(run.manifest_seq)} 条事件（现有 {formatNumber(eventCount)} 条）</span>
-      : <span className="tnum text-faint">{run.manifest_hash ? '老运行：封存时没记范围，核对时按当时口径还原' : NONE}（现有 {formatNumber(eventCount)} 条）</span>],
+      : <span className="tnum text-faint">{run.manifest_hash ? '封存时未记录范围，核对时按结束事件推算' : NONE}（现有 {formatNumber(eventCount)} 条）</span>],
     ['核对', verify
       ? <span style={{ color: verify.ok ? 'var(--st-done)' : 'var(--st-failed)' }}>
-          {verify.message} · {formatDateTime(verify.at)}{verify.legacy ? ' · 老口径' : ''}
+          {verify.message} · {formatDateTime(verify.at)}{verify.legacy ? ' · 范围为推算' : ''}
         </span>
-      : <span className="text-faint">还没核对过</span>],
+      : <span className="text-faint">尚未核对</span>],
     ['记忆域 / 知识库', <span className="mono">{runScope(run).memory_scope ?? NONE} / {runScope(run).collection ?? NONE}</span>],
     ['发起', <span className="tnum">{formatDateTime(run.created_at ?? null)} · {run.started_by || '未署名'}</span>],
     ['开始 / 结束', <span className="tnum">{formatDateTime(run.started_at ?? null)} → {formatDateTime(run.finished_at ?? null)}</span>],

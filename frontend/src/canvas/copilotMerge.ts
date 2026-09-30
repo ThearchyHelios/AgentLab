@@ -176,15 +176,15 @@ export function copilotReceipt(r: {
 }): { text: string; kind: 'ok' | 'warn'; sticky: boolean; detail?: string } {
   const { unasked, asked } = splitShrunk(r.toolChanges, r.toolWarnings)
   const shrunk = [...unasked, ...asked]
-  const head = r.left ? `已放到画布，但还有 ${r.left} 处问题要你处理`
-    : r.missing ? `已应用 ${r.total} 处改动，但有 ${r.missing} 步没放上`
+  const head = r.left ? `已应用到画布，仍有 ${r.left} 处问题需要处理`
+    : r.missing ? `已应用 ${r.total} 处改动，另有 ${r.missing} 步未能应用`
     : `已应用 ${r.total} 处改动`
   const lines = [
-    ...(unasked.length ? ['工具绑定变少了，这一轮没让删，确认一下是不是改漏了：', ...unasked.map(describeToolChange)] : []),
-    ...(asked.length ? ['工具绑定变少了（按要求）：', ...asked.map(describeToolChange)] : []),
+    ...(unasked.length ? ['以下工具绑定被移除，但本轮并未要求删除，请确认是否遗漏：', ...unasked.map(describeToolChange)] : []),
+    ...(asked.length ? ['已按要求移除以下工具绑定：', ...asked.map(describeToolChange)] : []),
   ]
   return {
-    text: [r.toolChanges.length && !shrunk.length ? `${head} · 工具绑定变了 ${r.toolChanges.length} 处` : head, ...lines].join('\n'),
+    text: [r.toolChanges.length && !shrunk.length ? `${head} · 工具绑定变更 ${r.toolChanges.length} 处` : head, ...lines].join('\n'),
     kind: r.left || r.missing || unasked.length ? 'warn' : 'ok',
     sticky: unasked.length > 0,
     // 加了、换了的那些不在正文里：放进详情

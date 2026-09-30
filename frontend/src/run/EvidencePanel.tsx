@@ -10,13 +10,14 @@ import { ApiError } from '../api/client'
 import { Spinner, StatusBadge, isComposing } from '../components/ui'
 import {
   EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, closestNames, docForeign, entitySources,
-  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged, judgeable, limitOf,
+  evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged, isJudgeLimit, judgeLimitWords,
+  judgeable, limitOf, pointsToSettings,
   locatable, locatorText, notableInput, queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, rewriteOf, sealVerdict,
   segName, segmentKind, segmentState, sourceOf, unitText, unitVerdict, verdictState, type SealStatus, type SourceTone,
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT, JUDGE_TEXT } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, nodeTypeLabel } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
@@ -306,7 +307,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       </Part>
 
       {bad && (
-        <Part title={state === 'suspect' ? '为什么标成可疑' : state === 'unverified' ? '为什么核对不了' : '为什么没有证据'}
+        <Part title={state === 'suspect' ? '标记为可疑的原因' : state === 'unverified' ? '无法核实的原因' : '无证据的原因'}
               data-ev-reason="">
           <p style={{ color: state === 'unverified' ? 'var(--text-dim)' : 'var(--st-waiting)' }}>{reason}</p>
           {/* 违规的原话多半是「引用 … 解析不了：<原因>」，和上面那句重复的不再列；裸数字那条说的是怎么改，留着 */}
@@ -545,7 +546,7 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
   // 判定没有记进运行记录」——判定照样交回来、也标着封存后追加，只看徽标会以为它记进去了。已经由别处说过的不重复：
   // 跳过的那一行就是它、上限的那一框说的就是它、和判定里写的理由一字不差
   const resMessage = typeof res?.message === 'string' ? res.message.trim() : ''
-  const showMessage = !!resMessage && !(skipped && !judged) && !(shownLimit && resMessage.startsWith(JUDGE_TEXT.limit))
+  const showMessage = !!resMessage && !(skipped && !judged) && !(shownLimit && isJudgeLimit(resMessage))
     && resMessage !== verdict?.rationale
   // 只对结论句：表格单元格、代码、标题不是一句话，开了裁判的文档里也不画这一节
   const show = !!verdict || (judgeDoc && eligible) || canAsk || !!blocked || ask?.status === 'error' || showMessage
@@ -594,11 +595,11 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
         <div className="mt-1 rounded border px-2 py-1" role="note" data-ev-judge-limit={shownLimit}
              style={{ borderColor: 'var(--st-waiting)', background: 'var(--st-waiting-soft)' }}>
           <p><span className="font-medium" style={{ color: 'var(--st-waiting)' }}>{JUDGE_TEXT.limit}</span>
-            {limitWords(verdict?.rationale) ? `：${limitWords(verdict?.rationale)}` : ''}</p>
+            {judgeLimitWords(verdict?.rationale) ? `：${judgeLimitWords(verdict?.rationale)}` : ''}</p>
           {how && (
             <p className="mt-0.5 text-2xs text-dim" data-ev-judge-how="">
               {how}
-              {how.startsWith('到「设置') && (
+              {pointsToSettings(how) && (
                 <> <Link to="/settings/prefs" className="text-[var(--accent)] underline-offset-2 hover:underline" data-ev-judge-settings="">去设置</Link></>
               )}
             </p>
@@ -660,13 +661,6 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, pending }: {
       )}
     </Part>
   )
-}
-
-/** 「已到上限（这份报告的裁判金额上限 $0.05），这句没判」→「这份报告的裁判金额上限 $0.05，这句没判」 */
-function limitWords(rationale: string | undefined): string {
-  if (!rationale) return ''
-  const m = /^已到上限（(.+?)）[，,]?\s*(.*)$/.exec(rationale)
-  return m ? [m[1], m[2]].filter(Boolean).join('，') : rationale.replace(/^已到上限[：:]?/, '')
 }
 
 /** 接口说这句暂时判不了、值得告诉人为什么的几种（正式运行、判过了、不是结论句不用说） */
@@ -1003,11 +997,14 @@ function IntegrityList({ code, items }: { code: string; items: string[] }) {
  * 能对到链里某一次查询的（agent 字段、cell() 取数）是按钮：点一下跳到那个查询步骤
  */
 function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) {
+  const host = useEvidenceHost()
   const missing = input.status === 'missing' || input.value == null
-  const from = [input.node_id && `来自节点 ${input.node_id}`, input.via && `（${input.via}）`, input.role && ` · ${input.role}`]
+  const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
+  const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
+  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`]
     .filter(Boolean).join('')
   const style = missing ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
-  const body = <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺）' : ''}</span>
+  const body = <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : ''}</span>
   return (
     <li className="max-w-full">
       {link ? (
@@ -1025,6 +1022,11 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
     </li>
   )
 }
+
+/** 取值来源的方式：能追到快照的两种写中文，其余是产出节点的类型 */
+const VIA_TEXT: Record<string, string> = { agent_field: 'Agent 字段', tool_cell: '单元格取数' }
+/** 代码节点输入的角色 */
+const ROLE_TEXT: Record<string, string> = { source: '取数', compute: '计算' }
 
 const TONE: Record<SourceTone, { color: string; border: string; background?: string }> = {
   ok: { color: 'var(--st-done)', border: 'var(--border)' },
@@ -1217,10 +1219,10 @@ function SealLine({ status, label }: { status: SealStatus; label: string }) {
 }
 
 const CODE_LABEL: Record<string, string> = {
-  uncited_number: '裸数字',
-  unresolved_ref: '引用解析不了',
-  unknown_entity: '可能是编造的名字',
-  unverified_entity: '核对不了的名字',
+  uncited_number: '无出处数字',
+  unresolved_ref: '引用无法解析',
+  unknown_entity: '疑似不存在的名称',
+  unverified_entity: '无法核实的名称',
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */
@@ -1238,7 +1240,7 @@ function ViolationList({ doc, onLocate }: { doc: EvidenceDocData; onLocate: (seg
                 data-ev-locatable={seg ? 'yes' : 'no'}>
               <div className="flex items-center gap-2">
                 <span className="mono font-semibold">{v.text ?? (v.ref ? `[[${v.ref}]]` : NONE)}</span>
-                <span className="chip" style={{ color: 'var(--st-waiting)' }}>{CODE_LABEL[v.code] ?? '文档核对没通过'}</span>
+                <span className="chip" style={{ color: 'var(--st-waiting)' }}>{CODE_LABEL[v.code] ?? '文档核对未通过'}</span>
                 <span className="flex-1" />
                 {seg && (
                   <button type="button" className="btn btn-xs" onClick={() => onLocate(seg.id)}>定位</button>

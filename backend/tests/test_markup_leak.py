@@ -115,7 +115,7 @@ async def test_an_agent_that_keeps_writing_markup_fails(monkeypatch):
         node("out", "output", fields=[{"name": "r", "value": "{{ nodes.query.text }}"}]),
     ))
     assert row.status == "failed", f"一堆标记被当成了答案：{row.output}"
-    assert "工具调用的原始标记" in (row.error or "") and "没有真正调用工具" in (row.error or "")
+    assert "工具调用的原始标记" in (row.error or "") and "未实际调用工具" in (row.error or "")
     assert row.error_node_id == "query"
     assert "tool_markup_leak" in [e.data.get("code") for e in events if e.type == "log"]
 
@@ -187,9 +187,9 @@ async def test_markup_in_the_settle_round_keeps_what_the_agent_found(monkeypatch
     assert row.status == "succeeded", row.error
     assert [e.type for e in events].count("tool.end") == 2
     assert "<｜｜DSML" not in row.output["r"]
-    assert "先算第 2 步。" in row.output["r"] and "用满了 2 步" in row.output["r"], row.output
+    assert "先算第 2 步。" in row.output["r"] and "已用完 2 步" in row.output["r"], row.output
     leak = [e.data for e in events if e.type == "log" and e.data.get("code") == "tool_markup_leak"]
-    assert leak and "收尾轮" in leak[0]["message"], leak
+    assert leak and "收尾时" in leak[0]["message"], leak
 
 
 async def test_markup_to_the_very_end_without_any_real_call_still_fails(monkeypatch):

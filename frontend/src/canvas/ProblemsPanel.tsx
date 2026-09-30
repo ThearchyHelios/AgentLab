@@ -6,7 +6,7 @@ import {
 import clsx from 'clsx'
 import { NODE_DEFS } from './nodeDefs'
 import {
-  fixFieldLabel, fixValueLines, fixValueText, isUpgradeAdvice, problemsOf, unboundToolOf, upgradeChangeKind,
+  fixFieldLabel, fixValueLines, fixValueText, isBareUpgradeAdvice, isUpgradeAdvice, problemsOf, unboundToolOf, upgradeChangeKind,
   upgradeChangesFromDiff, upgradeEdgeText, upgradeGroups, upgradeNodeText, upgradeRuleText, upgradeStepText, upgradeSummary,
   upgradeTypeText, withToolBound, type FieldRef, type NodeNameOf, type Problem,
 } from './issues'
@@ -45,7 +45,7 @@ export function ProblemsPane({ problems, activeId, onLocate, onDeleteEdge }: {
   return (
     <>
       {hasWorkflow && (
-        <div className="flex shrink-0 items-center gap-1 px-2 pt-1.5" role="radiogroup" aria-label="问题面板看哪一份">
+        <div className="flex shrink-0 items-center gap-1 px-2 pt-1.5" role="radiogroup" aria-label="问题面板视图">
           {MODES.map((m) => (
             <button key={m} type="button" {...radio(m)} data-problems-mode={m}
                     onClick={() => setMode(m)}
@@ -98,13 +98,13 @@ function LintPane({ problems, activeId, onLocate, onDeleteEdge }: {
 
   // 只有后端整个断了，恢复连接时才会自动重跑（useOnReconnect）；校验接口自己报错
   // 不会有人替你再试，这时候承诺「会自动重新校验」就是在让人干等
-  const retryHint = offline ? '连上后端之后会自动重新校验' : '点「重试」再校验一次'
+  const retryHint = offline ? '与服务端恢复连接后将自动重新校验' : '点击「重试」重新校验'
   if (analysis === 'failed' && !problems.length) {
     const failed = (
       <div className={clsx('flex flex-col items-center justify-center gap-2 px-6 text-center text-2xs', upgrade ? 'py-3' : 'flex-1')}
            data-analysis-failed="">
         <span style={{ color: 'var(--warn)' }}>分析失败{analysisError ? `：${analysisError}` : ''}</span>
-        <span className="text-faint">问题清单暂时拿不到，画布照常能编辑。{retryHint}</span>
+        <span className="text-faint">暂时无法获取问题清单，画布仍可正常编辑。{retryHint}</span>
         <button type="button" className="btn btn-sm" onClick={() => void analyzeNow()}>
           <RotateCw size={11} /> 重试
         </button>
@@ -124,7 +124,7 @@ function LintPane({ problems, activeId, onLocate, onDeleteEdge }: {
       <div className={clsx('flex items-center justify-center gap-1.5 text-2xs text-faint', upgrade ? 'py-3' : 'flex-1')}>
         {analysis === 'pending'
           ? <><Spinner size={11} /> 正在校验…</>
-          : <><CheckCircle2 size={12} style={{ color: 'var(--ok)' }} /> 没有发现问题</>}
+          : <><CheckCircle2 size={12} style={{ color: 'var(--ok)' }} /> 未发现问题</>}
       </div>
     )
     if (!upgrade) return idle
@@ -147,7 +147,7 @@ function LintPane({ problems, activeId, onLocate, onDeleteEdge }: {
       g = {
         key,
         title: p.scope === 'graph'
-          ? <><Workflow size={11} className="shrink-0 text-faint" /> 整张工作流</>
+          ? <><Workflow size={11} className="shrink-0 text-faint" /> 整个工作流</>
           : p.scope === 'edge'
             ? <><Unlink size={11} className="shrink-0 text-faint" /> 连线</>
             : <>
@@ -173,7 +173,7 @@ function LintPane({ problems, activeId, onLocate, onDeleteEdge }: {
           <AlertTriangle size={11} className="shrink-0" style={{ color: 'var(--warn)' }} aria-hidden />
           <span className="min-w-0 flex-1">
             <span style={{ color: 'var(--warn)' }}>分析失败{analysisError ? `：${analysisError}` : ''}</span>
-            <span className="text-faint"> · 下面是上一次校验的结果，可能已经过时。{retryHint}</span>
+            <span className="text-faint"> · 以下为上一次校验的结果，可能已过时。{retryHint}</span>
           </span>
           <button type="button" className="btn btn-xs shrink-0" onClick={() => void analyzeNow()}>
             <RotateCw size={10} /> 重试
@@ -224,7 +224,7 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
         type="button"
         disabled={!locatable}
         onClick={onLocate}
-        title={locatable ? '选中这个节点并定位到出问题的地方' : undefined}
+        title={locatable ? '选中该节点并定位到问题位置' : undefined}
         className={clsx('flex min-w-0 flex-1 items-start gap-2 rounded py-1 text-left text-2xs leading-snug',
           locatable ? 'cursor-pointer hover:text-fg' : 'cursor-default')}
       >
@@ -239,7 +239,7 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
       </button>
       {bound && tool && (
         <button type="button" className="btn btn-xs my-0.5 shrink-0" disabled={locked}
-                title={`把 ${tool} 加进${where || '这个节点的工具'}`}
+                title={`将 ${tool} 添加到${where || '该节点的工具'}`}
                 onClick={() => updateNode(node!.id, { config: bound })}>
           <Plus size={10} aria-hidden /> 绑定 {tool}
         </button>
@@ -247,7 +247,7 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
       {/* 悬空边（指向不存在的节点）：React Flow 不画它，画布上看不见、点不到，只能在这儿删 */}
       {p.scope === 'edge' && p.edgeId && (
         <button type="button" className="btn btn-xs my-0.5 shrink-0" onClick={() => onDeleteEdge(p.edgeId!)}>
-          <Trash2 size={10} /> 删除这条悬空边
+          <Trash2 size={10} /> 删除这条无效连线
         </button>
       )}
     </div>
@@ -284,7 +284,7 @@ function UpgradeBlock({ advice }: { advice?: ValidationIssue }) {
         <span className="min-w-0 flex-1 leading-snug">
           <span className="text-fg" data-upgrade-advice="">{advice?.message || UPGRADE_TEXT.advice}</span>
           {/* 后端的建议多半已经说了要改哪里、先预览；只有一句光秃秃的标题时才补这句说明 */}
-          {(!advice?.message || advice.message === UPGRADE_TEXT.advice) && (
+          {(!advice?.message || isBareUpgradeAdvice(advice.message)) && (
             <span className="block text-faint">{UPGRADE_TEXT.adviceHint}</span>
           )}
         </span>
@@ -557,7 +557,7 @@ function UpgradeChangeRow({ change: c, names, showRule, showLabel }: {
   const kind = upgradeChangeKind(c)
   const T = UPGRADE_TEXT
   const where = c.node_title || (c.node_id ? nameOf(c.node_id) ?? c.node_id : '') || PUBLISH_FIX_TEXT.whole
-  const arrow = <ArrowRight size={10} className="mx-1 inline align-[-1px] text-faint" aria-label="改成" />
+  const arrow = <ArrowRight size={10} className="mx-1 inline align-[-1px] text-faint" aria-label="改为" />
   let body: React.ReactNode
   if (kind === 'type') {
     body = (
@@ -615,7 +615,7 @@ function UpgradeValue({ value, field, nameOf, className, ...data }: {
   )
 }
 
-const SUB_LABEL: Record<string, string> = { condition: '的条件', key: '的标识', tools: '的工具', system: '的角色设定' }
+const SUB_LABEL: Record<string, string> = { condition: '的条件', key: '的标识', tools: '的工具', system: '的系统提示' }
 
 function fieldLabel(field: FieldRef | null | undefined, type?: string, config?: Record<string, any>): string {
   if (!field) return ''

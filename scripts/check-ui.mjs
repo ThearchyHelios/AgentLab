@@ -126,7 +126,7 @@ await section('画布助手栏', async () => {
     !body.includes('时间线') && !body.includes('原始事件'))
 
   // 用户的原话："没有一个很好的地方引导用户写问题"。空态下输入区就该是主体
-  check('空态给出了明确的邀请', body.includes('想让它做什么'))
+  check('空态给出了明确的邀请', body.includes('需要助手做什么'))
   check('说清楚它能够到什么', /\d+ 个工具/.test(body), body.match(/\d+ 个工具/)?.[0])
   const examples = await page.locator('aside button').filter({ hasText: /。|，/ }).count()
   check('例句是完整句子而不是截断的 chip', examples >= 2, `${examples} 条`)
@@ -295,7 +295,7 @@ await section('问数据', async () => {
 
 await section('向量模型设置', async () => {
   // 以前这里只有三个写死的选项（本地 / OpenAI 3-small / 3-large），接不了
-  // 本机起的服务。而本地哈希向量没有语义能力这件事，界面上也得说出来。
+  // 本机起的服务。而本地哈希向量不支持语义检索这件事，界面上也得说出来。
   const { page, errors } = await visit('/knowledge')
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
 
@@ -303,16 +303,16 @@ await section('向量模型设置', async () => {
   check('显示当前用的是什么、几维', /·\s*\d+\s*维/.test(body),
         body.match(/[\w:.-]+ · \d+ 维/)?.[0])
   if (body.includes('local-hashing')) {
-    check('本地哈希要标出没有语义能力', body.includes('没有语义能力'))
+    check('本地哈希要标出不支持语义检索', body.includes('不支持语义检索'))
   }
 
-  await page.getByRole('button', { name: '换一个' }).first().click()
+  await page.getByRole('button', { name: '更换' }).first().click()
   await page.waitForTimeout(400)
   body = await page.locator('body').innerText()
   check('能配自定义端点', body.includes('自定义端点'))
   check('也留着本地那一项', body.includes('本地哈希向量'))
   // 模型名手填太容易错，必须能探
-  check('给得出探测入口', body.includes('看看有哪些模型'))
+  check('给得出探测入口', body.includes('获取模型列表'))
 
   const overflow = await overflowOf(page)
   check('页面不横向溢出', overflow <= 0, `${overflow}px`)
@@ -351,8 +351,8 @@ await section('向量模型：配了语义模型却退回本地', async () => {
     model: 'text-embedding-qwen3-embedding-4b', base_url: 'http://127.0.0.1:1234/v1',
     stale_chunks: 68, stale_memories: 5, unindexed_chunks: 0,
     has_semantics: false, default_alpha: 0, fallback: true,
-    fallback_reason: '用不了 http://127.0.0.1:1234/v1 上的 embedding 模型 '
-      + 'text-embedding-qwen3-embedding-4b：APIConnectionError: Connection error.。检查服务在不在',
+    fallback_reason: '无法使用 http://127.0.0.1:1234/v1 上的向量模型 '
+      + 'text-embedding-qwen3-embedding-4b：APIConnectionError: Connection error.。请检查服务是否可用、模型名是否正确；使用官方接口时还需检查 OPENAI_API_KEY。',
   }
   const up = {
     ...down, embedder: 'openai:text-embedding-qwen3-embedding-4b', dim: 2560,
@@ -362,13 +362,13 @@ await section('向量模型：配了语义模型却退回本地', async () => {
 
   const a = await embeddingPage(down, () => up)
   let body = await a.body()
-  check('退回本地时标出没有语义能力', body.includes('没有语义能力'))
+  check('退回本地时标出不支持语义检索', body.includes('不支持语义检索'))
   check('说清配的是哪个、为什么没用上',
-        body.includes('text-embedding-qwen3-embedding-4b') && body.includes('没连上'))
+        body.includes('text-embedding-qwen3-embedding-4b') && body.includes('但连接失败'))
   check('没连上的原因原样给出来', body.includes('APIConnectionError'))
   check('不再劝人重建（会把建好的向量覆盖掉）',
         await a.page.getByRole('button', { name: /重建索引/ }).count() === 0)
-  check('存量提示改口成先别重建', body.includes('先别重建'))
+  check('存量提示改口成暂缓重建', body.includes('请暂缓重建'))
 
   const reconnect = a.page.getByRole('button', { name: '重新连接' })
   check('给得出「重新连接」', await reconnect.count() === 1)
@@ -381,18 +381,18 @@ await section('向量模型：配了语义模型却退回本地', async () => {
         req?.kind === 'openai' && req.model === down.model && req.base_url === down.base_url,
         JSON.stringify(req))
   body = await a.body()
-  check('连上了说一声', body.includes('已重新连上'))
-  check('连上之后提示消失', !body.includes('没有语义能力') && !body.includes('没连上'))
+  check('连上了说一声', body.includes('已重新连接'))
+  check('连上之后提示消失', !body.includes('不支持语义检索') && !body.includes('连接失败'))
   check('没有运行时报错', !a.errors.some((e) => e.startsWith('pageerror')), a.errors.slice(0, 2).join(' | '))
   await a.page.close()
 
-  // 明确选了本地哈希是正常情况：照旧标没有语义能力，重建按钮也还在
+  // 明确选了本地哈希是正常情况：照旧标不支持语义检索，重建按钮也还在
   const b = await embeddingPage(
     { ...down, kind: 'local', model: '', base_url: '', fallback: false, fallback_reason: '' },
     (s) => s)
   body = await b.body()
-  check('明确选了本地哈希：照旧标没有语义能力', body.includes('没有语义能力'))
-  check('……不冒出"没连上"', !body.includes('没连上'))
+  check('明确选了本地哈希：照旧标不支持语义检索', body.includes('不支持语义检索'))
+  check('……不冒出"连接失败"', !body.includes('连接失败'))
   check('……重建按钮还在，正常情况别一起藏了',
         await b.page.getByRole('button', { name: /重建索引/ }).count() === 1)
 })
@@ -469,8 +469,8 @@ await section('URL 指得到', async () => {
     // 一个都没有就回首屏
     const { page } = await newPage()
     await page.goto(`${WEB}/chat/这个id根本不存在`)
-    // 认整句提示，不认"不在了"三个字——会话标题里碰巧有这仨字就会把它蒙对
-    const times = await countNotice(page, '那个对话不在了')
+    // 认整句提示，不认"不存在"三个字——会话标题里碰巧有这仨字就会把它蒙对
+    const times = await countNotice(page, '该对话不存在')
     await page.waitForURL((u) => !u.pathname.includes(encodeURIComponent('这个id')), { timeout: 5000 }).catch(() => {})
     const landed = new URL(page.url()).pathname
     const body = await page.locator('body').innerText()
@@ -525,7 +525,7 @@ await section('URL 指得到', async () => {
     const { page } = await newPage()
     await page.goto(`${WEB}/studio/根本没这张图`)
     // 说一次就够。这里真弹过三次——effect 在请求回来之前又跑了两遍
-    const times = await countNotice(page, '那张工作流不在了')
+    const times = await countNotice(page, '该工作流不存在')
     await page.waitForURL(/\/studio\/[0-9a-f]{8,}$/, { timeout: 5000 }).catch(() => {})
     check('指向不存在的图时说一次并让开', times === 1 && /\/studio\/[0-9a-f]{8,}$/.test(page.url()),
           `提示 ${times} 次，落在 ${page.url()}`)
@@ -615,7 +615,7 @@ await section('URL 指得到', async () => {
 
       const gone = await visit('/knowledge/kb/根本没这份文档')
       const goneBody = await gone.page.locator('body').innerText()
-      check('文档不在了要说出来而不是白屏', goneBody.includes('不在了'),
+      check('文档不在了要说出来而不是白屏', goneBody.includes('该文档不存在'),
             goneBody.slice(-120).replace(/\n/g, ' '))
       await gone.page.close()
     } else {
@@ -732,7 +732,7 @@ await section('三处讲的是同一个故事', async () => {
   // 宽栏和窄栏各渲染一遍，所以是 3×2
   check('宽窄两栏各三轮审批，一轮不少', asks === 6, `${asks} 处`)
   check('决定折进了同一行而不是另起一行',
-    !/^你放行了$/m.test(wide) && !/^你驳回了$/m.test(wide))
+    !/^已批准$/m.test(wide) && !/^已驳回$/m.test(wide))
 })
 
 await browser.close()

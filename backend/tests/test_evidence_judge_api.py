@@ -296,7 +296,7 @@ async def test_hitting_the_click_limit_is_a_result_not_an_error(client, monkeypa
     body = res.json()
     assert body["limited"] is True and body["limits_hit"] == ["max_cost_usd"]
     assert body["unjudged"] == {"max_cost_usd": 1}
-    assert body["message"].startswith("已到上限") and "这次点击" in body["message"]
+    assert body["message"].startswith("已达上限") and "这次点击" in body["message"]
     assert any("设置" in how and "不限" in how for how in body["adjust"])
     verdict = body["verdicts"][uid]
     assert verdict["status"] == "unjudged" and verdict["reason"] == "max_cost_usd" and verdict["post_seal"] is True
@@ -369,7 +369,7 @@ async def test_formal_runs_are_judged_inside_the_node_not_on_demand(client, monk
     calls = len(models.judges)
     res = await judge(client, row.id, [unit_ids(doc_of(row))[CAUSAL]])
     assert res.status_code == 409 and res.json()["code"] == "evidence_judge_formal"
-    assert "正式运行的裁判在节点内完成" in res.json()["detail"]
+    assert "正式运行的结论句已在报告撰写节点内完成裁判" in res.json()["detail"]
     assert len(models.judges) == calls and await judged_events(row.id) == []
 
 
@@ -431,7 +431,7 @@ async def test_a_run_continued_during_the_judge_call_records_no_event(client, mo
     body = res.json()
     assert len(models.judges) == 1 and body["calls"] == 1, "模型问过了"
     assert body["verdicts"][uid]["status"] == "unsupported" and body["judged"] == [uid], "判定照样交回"
-    assert body["event"] is None and "接着跑" in body["message"] and "没有记进运行记录" in body["message"]
+    assert body["event"] is None and "运行已继续执行" in body["message"] and "未写入运行记录" in body["message"]
     assert await judged_events(row.id) == []
     async with SessionLocal() as session:
         after = await session.get(Run, row.id)
@@ -463,7 +463,7 @@ async def test_a_continue_that_wins_the_row_between_check_and_write_gets_no_even
     monkeypatch.setattr(bus, "set_seq", claimed_in_between)
     body = (await judge(client, row.id, [uid])).json()
     assert body["verdicts"][uid]["status"] == "unsupported" and body["event"] is None
-    assert "没有记进运行记录" in body["message"] and await judged_events(row.id) == []
+    assert "未写入运行记录" in body["message"] and await judged_events(row.id) == []
     async with SessionLocal() as session:
         after = await session.get(Run, row.id)
     assert after.status == "running" and after.last_seq == row.last_seq
@@ -518,7 +518,7 @@ async def test_the_segment_shows_the_verdict_and_whether_it_can_still_be_asked(c
     assert "模型" in after["note"] and "后续版本" not in after["note"]
     other = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, ids[CITED])}")).json()
     assert other["unit"]["on_demand"]["available"] is True
-    assert "挂了依据" in other["note"] and "模型" in other["note"] and "后续版本" not in other["note"]
+    assert "附有依据" in other["note"] and "模型" in other["note"] and "后续版本" not in other["note"]
     link = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg_in(doc, ids[LINK])}")).json()
     assert link["unit"]["on_demand"]["reason"] == "not_a_claim" and "verdict" not in link["unit"]
 

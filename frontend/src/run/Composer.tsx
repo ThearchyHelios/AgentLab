@@ -7,6 +7,7 @@ import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { isComposing, Spinner, TechDetails, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
 import type { DataSource } from '../types'
+import { COPILOT_PHASE_TEXT } from './decode'
 
 /**
  * Copilot 的输入。
@@ -127,18 +128,18 @@ export function Composer({ hero, onFocusChange }: {
         busy={copilot.active}
         onStop={stopCopilot}
         stopLabel="停止生成"
-        label="告诉助手要画什么工作流"
+        label="描述要生成或修改的工作流"
         placeholder={nodes.length
-          ? '告诉它这个工作流要改成什么样…'
-          : '描述你想要的工作流，它会直接画到左边'}
+          ? '描述要如何修改这个工作流…'
+          : '描述你需要的工作流，助手会在左侧画布生成'}
         onFocusChange={onFocusChange}
         leading={
           <>
             <button
               className={clsx('rounded-md p-1.5 transition-colors hover:bg-hover',
                 opts ? 'text-[var(--accent)]' : 'text-faint')}
-              title="助手用哪个模型"
-              aria-label="助手用哪个模型"
+              title="助手使用的模型"
+              aria-label="助手使用的模型"
               aria-expanded={opts}
               onClick={() => setOpts((v) => !v)}
             >
@@ -153,8 +154,8 @@ export function Composer({ hero, onFocusChange }: {
                   <button key={m} type="button" {...mode(m)}
                           className={clsx('rounded px-1.5 text-2xs leading-5 transition-colors',
                             (m === 'base') === useBase ? 'bg-accent-soft text-fg' : 'text-faint hover:text-dim')}
-                          title={m === 'base' ? '把画布上现在的工作流交给助手，在它上面改'
-                            : `不看画布上现有的工作流，重新画一张；之前几轮对话（连同上一轮的工作流）它仍会参考。原来的可以撤销（${formatShortcut('Mod+Z')}）找回`}
+                          title={m === 'base' ? '将画布上现有的工作流交给助手，在此基础上修改'
+                            : `忽略画布上的现有工作流，重新生成（仍参考之前几轮对话）；原工作流可通过撤销（${formatShortcut('Mod+Z')}）找回`}
                           onClick={() => setUseBase(m === 'base')}>
                     {m === 'base' ? '在现有工作流上改' : '从头生成'}
                   </button>
@@ -168,7 +169,7 @@ export function Composer({ hero, onFocusChange }: {
       {opts && (
         <div className="fade-up mt-2 space-y-2 rounded-lg border bg-panel p-2.5">
           <div>
-            <label className="label" htmlFor="copilot-model">助手用哪个模型</label>
+            <label className="label" htmlFor="copilot-model">助手使用的模型</label>
             <select id="copilot-model" className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
               <option value="">跟随默认{effective ? `（当前：${effective}）` : ''}</option>
               {groups.map((g) => (
@@ -180,8 +181,8 @@ export function Composer({ hero, onFocusChange }: {
               ))}
             </select>
             <div className="mt-1 text-2xs leading-snug text-faint">
-              只影响助手自己，不改节点上的模型。它要按协议逐行输出操作，
-              指令遵循弱的模型生成不出东西。
+              仅影响助手，不改变节点使用的模型。助手需要严格按格式输出，
+              指令遵循能力较弱的模型可能无法生成工作流。
             </div>
           </div>
         </div>
@@ -191,7 +192,7 @@ export function Composer({ hero, onFocusChange }: {
         <div className="fade-up mt-2 flex items-center gap-1.5 text-2xs text-faint">
           <Spinner size={10} />
           <span className="min-w-0 flex-1 truncate">
-            {copilot.lastOp || PHASE_TEXT[copilot.phase] || '正在起草…'}
+            {copilotProgress(copilot.lastOp, copilot.phase)}
           </span>
           {copilot.model && <span className="truncate">{copilot.model}</span>}
           {copilot.elapsedMs > 0 && (
@@ -354,14 +355,14 @@ function HeroHeader({ sources, toolCount }: { sources: DataSource[]; toolCount: 
            style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
         <Sparkles size={18} style={{ color: 'var(--accent)' }} />
       </div>
-      <div className="text-[13.5px] font-semibold">想让它做什么？</div>
+      <div className="text-[13.5px] font-semibold">需要助手做什么？</div>
       <div className="mt-1 text-2xs leading-relaxed text-faint">
-        说一句话，它把工作流画到左边的画布上
+        用一句话描述需求，助手会在左侧画布生成工作流
       </div>
       <div className="mt-2 flex items-center justify-center gap-3 text-2xs text-faint">
         <span className="flex items-center gap-1">
           <Database size={10} />
-          {sources.length ? `${sources.length} 个数据源` : '未接数据源'}
+          {sources.length ? `${sources.length} 个数据源` : '未接入数据源'}
         </span>
         <span className="flex items-center gap-1"><Wrench size={10} />{toolCount} 个工具</span>
       </div>
@@ -380,30 +381,26 @@ function HeroHeader({ sources, toolCount }: { sources: DataSource[]; toolCount: 
 function exampleFor(nodeCount: number, sources: DataSource[]): string[] {
   if (nodeCount) {
     return [
-      '在最后加一步人工审核，通过了才输出',
-      '中间那步改成 agent，让它自己决定要不要查数据库',
-      '出错的时候重试两次，还不行就走另一条分支',
+      '在最后加一步人工审批，批准后才输出',
+      '把中间那一步改成 Agent，由它自行决定是否查询数据库',
+      '出错时重试两次，仍然失败则转入另一条分支',
     ]
   }
   const name = sources[0]?.name
   return [
     name
-      ? `从 ${name} 里取上季度的数据，算出同比，写一段中文分析`
-      : '读取用户的问题，先查知识库，查到就基于资料回答并标注出处，查不到就联网搜索',
+      ? `从 ${name} 中读取上季度的数据，计算同比，并撰写一段中文分析`
+      : '读取用户的问题，先检索知识库：检索到则基于资料回答并标注出处，否则联网搜索',
     '把一段长文本拆成要点，逐条用模型打分，低分的让模型重写一次，最后汇总成表格',
-    '写代码分析数据，在沙箱里跑，出错就把报错喂回去让模型修，最多修三次',
+    '编写代码分析数据并在沙箱中执行，出错时将报错交给模型修复，最多三次',
   ]
 }
 
 const MODES = ['base', 'fresh'] as const
 
 // 从提交到第一个节点落地中间有 5~30 秒。阶段会变本身就是"它还活着"的信号，
-// 恒定的"正在起草…"让人分不清是在想还是已经卡死
-export const PHASE_TEXT: Record<string, string> = {
-  connecting: '正在连接模型…',
-  planning: '正在理解需求、规划结构…',
-  building: '正在放置节点…',
-  wiring: '正在连接数据流…',
-  finalizing: '正在排版和校验…',
-  repairing: '自查发现问题，正在修正…',
+// 恒定的"正在起草…"让人分不清是在想还是已经卡死。阶段文案本身在 decode.ts
+export function copilotProgress(lastOp: string | undefined, phase: string): string {
+  const text = COPILOT_PHASE_TEXT[phase]
+  return lastOp || (text ? `${text}…` : '正在起草…')
 }

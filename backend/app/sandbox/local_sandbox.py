@@ -46,7 +46,7 @@ class LocalSandbox(Sandbox):
             "backend": self.name,
             "available": True,
             "isolated": False,
-            "warning": "裸子进程执行，无访问控制，不要跑不信任的代码",
+            "warning": "以本地子进程执行，无访问控制，请勿运行不可信的代码",
             "enforced": {"timeout": True, "cpu": True,
                          "memory": not sys.platform == "darwin", "network": False, "fsize": True},
             "root": str(self._root),
@@ -103,7 +103,7 @@ class LocalSandbox(Sandbox):
         argv = [*cmd, entry]
         if shutil.which(argv[0]) is None and argv[0] != sys.executable:
             return ExecResult(
-                ok=False, backend=self.name, error=f"宿主机上找不到 {argv[0]}"
+                ok=False, backend=self.name, error=f"本机找不到 {argv[0]}"
             )
 
         workdir = self._session_dir(session_id or f"tmp-{int(time.time()*1000)}")
@@ -137,7 +137,7 @@ class LocalSandbox(Sandbox):
         except Exception as e:  # noqa: BLE001
             # 首行只说原因，类名和 errno 这些留给日志
             logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
-            return ExecResult(ok=False, backend=self.name, error=f"没能启动进程：{describe_exception(e)}")
+            return ExecResult(ok=False, backend=self.name, error=f"无法启动进程：{describe_exception(e)}")
 
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
@@ -153,7 +153,7 @@ class LocalSandbox(Sandbox):
                 timed_out=True,
                 exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout}s 被终止",
+                error=f"执行超过 {limits.timeout} 秒，已终止",
             )
 
         stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)

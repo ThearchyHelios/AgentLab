@@ -63,9 +63,9 @@ export function SettingsPage() {
 
 const confirmLeave = (n: number) => confirmDialog({
   title: `有 ${n} 项设置还没保存`,
-  body: '离开这一屏，这些改动就丢了。',
+  body: '离开此页面将丢失这些改动。',
   confirmLabel: '放弃修改',
-  cancelLabel: '留下来保存',
+  cancelLabel: '返回保存',
   danger: true,
 })
 
@@ -95,9 +95,9 @@ function ProvidersTab() {
       danger: true,
       consequences: [
         using.length
-          ? `${workflowList(using)}的节点点名用了它的模型，运行时会找不到模型`
-          : '眼下没有工作流点名用它的模型',
-        lastEnabled ? '这是唯一启用的模型接入：删掉后没指定模型的节点都跑不起来' : '',
+          ? `${workflowList(using)}的节点指定使用了该接入的模型，删除后运行时将找不到模型`
+          : '目前没有工作流指定使用该接入的模型',
+        lastEnabled ? '这是唯一启用的模型接入：删除后，未指定模型的节点将无法运行' : '',
         p.has_key ? 'API Key 一并删除，不可恢复' : '',
       ].filter(Boolean),
       confirmLabel: '删除接入',
@@ -115,7 +115,7 @@ function ProvidersTab() {
 
   return (
     <div>
-      <SectionBar title="模型接入" hint="API Key 加密后存在本地 SQLite，不会回传给浏览器。圆点说的是上次测连接的结果，启用与否另外标。">
+      <SectionBar title="模型接入" hint="API Key 加密保存在本地，不会返回给浏览器。状态圆点表示上次连接测试的结果，与是否启用无关。">
         <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
           <Plus size={12} aria-hidden /> 添加接入
         </button>
@@ -128,7 +128,7 @@ function ProvidersTab() {
           icon={<KeyRound size={22} />}
           title="还没有配置模型"
           source="providers"
-          body="接一个 Anthropic、OpenAI，或任何 OpenAI 兼容的服务（DeepSeek、通义、本机 Ollama…），agent 才跑得起来。"
+          body="接入 Anthropic、OpenAI 或任何 OpenAI 兼容的服务（DeepSeek、通义、本机 Ollama…）后，Agent 才能运行。"
           action={<button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>}
         />
       ) : (
@@ -170,7 +170,7 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
     const r = await api.providers.test(p.id, { model: p.default_model ?? undefined })
     return {
       ok: !!r.ok, ms: r.latency_ms ?? null, error: r.error, hint: r.hint, detail: r.detail,
-      note: r.ok ? `${r.model ?? p.default_model ?? ''} 回：${String(r.reply ?? '').slice(0, 120)}` : undefined,
+      note: r.ok ? `${r.model ?? p.default_model ?? ''} 回复：${String(r.reply ?? '').slice(0, 120)}` : undefined,
     }
   })
 
@@ -186,8 +186,8 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
         <HealthPill record={record} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
           <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}
-                  title={`用 ${p.default_model || '默认模型'} 发一句话试试`}>
-            <Plug size={11} aria-hidden /> 测试
+                  title={`向 ${p.default_model || '默认模型'} 发送一条测试消息`}>
+            <Plug size={11} aria-hidden /> 测试连接
           </button>
           <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
           <DeleteButton label={`删除模型接入 ${p.name}`} onClick={onRemove} />
@@ -326,7 +326,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
         sig,
         result: {
           ok: !!r.ok, ms: r.latency_ms ?? null, at: Date.now(), error: r.error, hint: r.hint, detail: r.detail,
-          note: r.ok ? `${r.model ?? form.default_model} 回：${String(r.reply ?? '').slice(0, 120)}` : undefined,
+          note: r.ok ? `${r.model ?? form.default_model} 回复：${String(r.reply ?? '').slice(0, 120)}` : undefined,
         },
       })
       if (!r.ok) requestAnimationFrame(() => resultRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))
@@ -342,7 +342,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
       const r = await api.providers.models(draft)
       if (r.ok) {
         setFetched({ models: r.models })
-        if (!r.models.length) toast.warn('这个地址上没有列出任何模型')
+        if (!r.models.length) toast.warn('该地址未返回任何模型')
       } else {
         setFetched({ error: r })
       }
@@ -389,12 +389,12 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
           <div className="mr-auto flex min-w-0 items-center">
             {(test.since || test.result) && (
               <HealthPill record={test.result} checkingSince={test.since} stale={!!test.result && !testFresh}
-                          labels={{ ok: '通了', fail: '没通过' }} />
+                          labels={{ ok: '连接成功', fail: '连接失败' }} />
             )}
           </div>
           <button className="btn" onClick={onClose}>取消</button>
           <button className="btn" onClick={() => void runTest()} disabled={!!test.since || blocked}
-                  title={blockedTip ?? `用 ${form.default_model || '默认模型'} 发一句话，不保存`}>
+                  title={blockedTip ?? `向 ${form.default_model || '默认模型'} 发送一条测试消息，不保存`}>
             {test.since ? <Spinner size={11} /> : <Plug size={12} aria-hidden />} 测试连接
           </button>
           <button className="btn btn-primary" onClick={() => void submit()} disabled={busy || blocked} title={blockedTip}>
@@ -451,7 +451,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
 
         <Field label="名称" required>
           {(p) => (
-            <input {...p} className="field" value={form.name} placeholder="比如 DeepSeek（公司网关）"
+            <input {...p} className="field" value={form.name} placeholder="例如：DeepSeek（公司网关）"
                    onChange={(e) => { setNameTouched(true); set({ name: e.target.value }) }} />
           )}
         </Field>
@@ -461,13 +461,13 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
             <Field label="Base URL" required={urlRequired} hint={urlHint || undefined}>
               {(p) => (
                 <input {...p} className="field mono text-xs" value={form.base_url}
-                       placeholder={urlExample ?? (urlRequired ? 'https://…/v1' : '留空走官方地址')}
+                       placeholder={urlExample ?? (urlRequired ? 'https://…/v1' : '留空则使用官方地址')}
                        onChange={(e) => set({ base_url: e.target.value })} />
               )}
             </Field>
 
             <Field label="API Key" required={keyRequired}
-                   hint={envKey && !provider?.has_key ? '留空就用服务端环境变量里的 Key' : undefined}>
+                   hint={envKey && !provider?.has_key ? '留空则使用服务端环境变量中的 Key' : undefined}>
               {(p) => (
                 <input
                   {...p}
@@ -487,13 +487,13 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
                   onChange={(e) => set({ extra: { ...form.extra, auth_style: e.target.checked ? 'bearer' : undefined } })}
                 />
                 用 Authorization: Bearer 认证
-                <span className="text-2xs text-faint">（部分中转网关需要，官方 API 不用勾）</span>
+                <span className="text-2xs text-faint">（部分中转网关需要，官方 API 无需勾选）</span>
               </label>
             )}
           </>
         )}
 
-        <Field label="默认模型" hint="测试连接和没指定模型的节点都用它">
+        <Field label="默认模型" hint="测试连接和未指定模型的节点均使用此模型">
           {(p) => (
             <>
               <input {...p} className="field mono text-xs" value={form.default_model} list="provider-model-list"
@@ -511,7 +511,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
             {form.kind !== 'mock' && (
               <button type="button" className="btn btn-xs ml-auto" onClick={() => void fetchModels()}
                       disabled={!!fetched?.busy || (urlRequired && !form.base_url.trim())}
-                      title={urlRequired && !form.base_url.trim() ? '先填 Base URL' : '带上 Key 调一次 /v1/models，省得手敲模型 id'}>
+                      title={urlRequired && !form.base_url.trim() ? '请先填写 Base URL' : '用当前 Key 调用 /v1/models 获取模型列表，无需手动输入'}>
                 {fetched?.busy ? <Spinner size={11} /> : <Download size={11} aria-hidden />} 从端点拉取模型
               </button>
             )}
@@ -526,7 +526,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
                 </button>
               </span>
             ))}
-            {!form.models.length && <span className="text-2xs text-faint">还没有，拉取或手动添加</span>}
+            {!form.models.length && <span className="text-2xs text-faint">暂无模型，可从端点拉取或手动添加</span>}
           </div>
           {fetched?.error != null && (
             <ErrorState compact error={fetched.error} onRetry={() => void fetchModels()} className="mt-2" />
@@ -534,7 +534,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
           {fetched?.models && fetched.models.length > 0 && (
             <div className="mt-2 rounded-lg border bg-bg p-2" data-fetched-models>
               <div className="mb-1.5 flex items-center gap-2 text-2xs text-faint">
-                端点上有 <span className="tnum">{fetched.models.length}</span> 个模型，点一下加入 / 去掉
+                端点提供 <span className="tnum">{fetched.models.length}</span> 个模型，点击可加入或移除
                 <button type="button" className="btn btn-xs ml-auto"
                         onClick={() => setForm((f) => {
                           const add = (fetched.models ?? []).filter((id) => !f.models.some((m) => m.id === id))
@@ -557,7 +557,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
             </div>
           )}
           <input
-            className="field mono mt-1.5 text-xs" placeholder="手动添加：模型 id，回车加入"
+            className="field mono mt-1.5 text-xs" placeholder="手动添加模型 id，按回车加入"
             aria-label="手动添加模型 id"
             onKeyDown={(e: ReactKeyboardEvent<HTMLInputElement>) => {
               if (e.key !== 'Enter' || isComposing(e)) return
@@ -572,7 +572,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
 
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-          启用<span className="text-2xs text-faint">停用后它的模型不出现在节点的模型下拉里</span>
+          启用<span className="text-2xs text-faint">停用后，该接入的模型不会出现在节点的模型下拉列表中</span>
         </label>
 
         {blocked && <p className="text-2xs text-faint">还缺：{missing.join('、')}</p>}
@@ -663,13 +663,13 @@ function PrefsTab() {
   const guardErrors = {
     steps: cur.steps === saved.steps
       || (/^\d+$/.test(cur.steps.trim()) && Number(cur.steps) >= 1 && Number(cur.steps) <= stepCap)
-      ? undefined : `填 1 到 ${stepCap} 的整数（${stepCap} 是服务端的硬上限，由环境变量 AGENTLAB_MAX_AGENT_STEPS 定）`,
+      ? undefined : `请填写 1 到 ${stepCap} 之间的整数（${stepCap} 为服务端上限）`,
     budgetTokens: cur.budgetTokens === saved.budgetTokens || cur.budgetTokens.trim() === ''
       || (/^\d+$/.test(cur.budgetTokens.trim()) && Number(cur.budgetTokens) >= 1000)
-      ? undefined : '填不少于 1000 的整数，或者留空表示不限',
+      ? undefined : '请填写不小于 1000 的整数，或留空表示不限',
     budgetUsd: cur.budgetUsd === saved.budgetUsd || cur.budgetUsd.trim() === ''
       || (Number(cur.budgetUsd) > 0 && Number.isFinite(Number(cur.budgetUsd)))
-      ? undefined : '填大于 0 的金额，或者留空表示不限',
+      ? undefined : '请填写大于 0 的金额，或留空表示不限',
   }
   const guardInvalid = Object.values(guardErrors).some(Boolean)
   // 裁判的上限同样只校验改过的；null（不限）总是对的
@@ -677,9 +677,9 @@ function PrefsTab() {
     const v = cur[key]
     if (v === saved[key] || v === null) return undefined
     const n = Number(v.trim())
-    if (key === 'jClaims') return /^\d+$/.test(v.trim()) && n >= 1 ? undefined : '填正整数，或者勾「不限」'
-    if (key === 'jTimeout') return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '填大于 0 的秒数，或者勾「不限」'
-    return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '填大于 0 的金额，或者勾「不限」'
+    if (key === 'jClaims') return /^\d+$/.test(v.trim()) && n >= 1 ? undefined : '请填写正整数，或勾选「不限」'
+    if (key === 'jTimeout') return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '请填写大于 0 的秒数，或勾选「不限」'
+    return v.trim() !== '' && Number.isFinite(n) && n > 0 ? undefined : '请填写大于 0 的金额，或勾选「不限」'
   }
   const judgeErrors = {
     jClaims: judgeError('jClaims'), jCost: judgeError('jCost'), jTimeout: judgeError('jTimeout'),
@@ -813,40 +813,40 @@ function PrefsTab() {
       ) : (
         <>
           <section>
-            <SectionBar title="操作者署名" hint="只存在这台浏览器里，换台电脑要重新填。" />
+            <SectionBar title="操作者署名" hint="仅保存在当前浏览器中，更换设备后需重新填写。" />
             <Field label="名字" htmlFor="pref-actor"
-                   hint="发布、审批、发起正式运行会记到这个名下，随请求头 X-Actor 发送。这是归属记录不是身份认证——多人环境需要真正的登录体系。">
-              <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如 王工"
+                   hint="发布、审批和发起正式运行时会记录此署名。仅用于标注操作人，不作为身份认证。">
+              <input id="pref-actor" className="field max-w-60" value={cur.actor} placeholder="例如：张三"
                      aria-describedby="pref-actor-hint"
                      onChange={(e) => edit({ actor: e.target.value })} />
             </Field>
           </section>
 
           <section>
-            <SectionBar title="运行默认值" hint="存在服务端，所有人共用。发起运行时没单独指定，就用这里的。" />
+            <SectionBar title="运行默认值" hint="保存在服务端，所有用户共用。发起运行时未单独指定的项使用此处的设置。" />
             <div className="grid grid-cols-2 gap-3">
-              <Field label="默认记忆作用域" htmlFor="pref-scope" hint="agent 读写长期记忆用哪一格">
+              <Field label="默认记忆作用域" htmlFor="pref-scope" hint="Agent 读写长期记忆时使用的作用域">
                 <select id="pref-scope" className="field" value={cur.scope}
                         aria-describedby="pref-scope-hint"
                         onChange={async (e) => {
                           if (e.target.value !== '__new__') { edit({ scope: e.target.value }); return }
                           const name = await promptDialog({
-                            title: '新的记忆作用域', label: '作用域名', placeholder: '比如 quality',
-                            validate: (v) => (/^[\w.-]{1,64}$/.test(v) ? null : '只用字母、数字、下划线、点和短横'),
-                            confirmLabel: '用这个',
+                            title: '新的记忆作用域', label: '作用域名', placeholder: '例如：sales',
+                            validate: (v) => (/^[\w.-]{1,64}$/.test(v) ? null : '只能包含字母、数字、下划线、点和短横线'),
+                            confirmLabel: '创建',
                           })
                           if (name) edit({ scope: name })
                         }}>
                   {scopeOptions.map((s) => {
                     const n = scopes.find((x) => x.scope === s)?.count
-                    return <option key={s} value={s}>{s}{n != null ? ` · ${formatNumber(n)} 条` : ' · 还没有记忆'}</option>
+                    return <option key={s} value={s}>{s}{n != null ? ` · ${formatNumber(n)} 条` : ' · 暂无记忆'}</option>
                   })}
-                  <option value="__new__">新建一个作用域…</option>
+                  <option value="__new__">新建作用域…</option>
                 </select>
               </Field>
               <Field label="默认知识库" htmlFor="pref-collection"
-                     error={collectionMissing ? `「${cur.collection}」这个知识库不存在：检索会落到空库上` : undefined}
-                     hint="检索节点没指定知识库时查它">
+                     error={collectionMissing ? `知识库「${cur.collection}」不存在：检索将返回空结果` : undefined}
+                     hint="检索节点未指定知识库时使用此知识库">
                 <select id="pref-collection" className="field" value={cur.collection}
                         aria-describedby={collectionMissing ? 'pref-collection-error' : 'pref-collection-hint'}
                         aria-invalid={collectionMissing || undefined}
@@ -867,7 +867,7 @@ function PrefsTab() {
               <span>
                 危险工具默认需要人工审批
                 <span id="pref-confirm-hint" className="mt-0.5 block text-2xs leading-relaxed text-faint">
-                  只影响探索运行里没单独配置审批策略的节点；正式运行始终至少审批危险工具。受管工作流的发布门禁另外生效。
+                  只影响探索运行中未单独配置审批策略的节点；正式运行始终至少审批危险工具。受管工作流的发布门禁另行生效。
                 </span>
               </span>
             </label>
@@ -876,11 +876,11 @@ function PrefsTab() {
               <p id="pref-gate-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{TOOL_GATE_TEXT.hint}</p>
               <div className="grid grid-cols-2 gap-3">
                 <Field label={TOOL_GATE_TEXT.provider} htmlFor="pref-gate-provider"
-                       error={gateProviderMissing ? `「${cur.gateProvider}」这个接入不存在：门控模型答不上来，每次调用都会交给你审批` : undefined}>
+                       error={gateProviderMissing ? `模型接入「${cur.gateProvider}」不存在：门控模型无法调用，所有工具调用将转为人工审批` : undefined}>
                   {(p) => (
                     <select {...p} className="field" value={cur.gateProvider} onChange={(e) => pickGateProvider(e.target.value)}>
                       <option value="">
-                        {TOOL_GATE_TEXT.providerDefault}{defaultProvider ? `（现在是 ${defaultProvider.name}）` : ''}
+                        {TOOL_GATE_TEXT.providerDefault}{defaultProvider ? `（当前为 ${defaultProvider.name}）` : ''}
                       </option>
                       {gateProviderMissing && <option value={cur.gateProvider}>{cur.gateProvider}（不存在）</option>}
                       {providers.map((pv) => (
@@ -890,7 +890,7 @@ function PrefsTab() {
                   )}
                 </Field>
                 <Field label={TOOL_GATE_TEXT.model} htmlFor="pref-gate-model"
-                       hint={gateProvider?.default_model ? `留空就用 ${gateProvider.default_model}` : undefined}>
+                       hint={gateProvider?.default_model ? `留空则使用 ${gateProvider.default_model}` : undefined}>
                   {(p) => (
                     <>
                       <input {...p} className="field mono text-xs" value={cur.gateModel} list="pref-gate-models"
@@ -943,7 +943,7 @@ function PrefsTab() {
                 <p id="pref-judge-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.differ}</p>
                 <div className="grid grid-cols-2 gap-3">
                   <Field label={JUDGE_SETTING_TEXT.provider} htmlFor="pref-judge-provider"
-                         error={judgeProviderMissing ? `「${cur.judgeProvider}」这个接入不存在：裁判调用会失败，结论句都记为未裁判` : undefined}
+                         error={judgeProviderMissing ? `模型接入「${cur.judgeProvider}」不存在：裁判调用将失败，所有结论句记为未裁判` : undefined}
                          hint={judgeByModelHint ? (
                            <span data-judge-by-model={judgeOwner ? (judgeOwner.enabled ? 'found' : 'disabled') : 'default'}
                                  style={judgeOwner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>{judgeByModelHint}</span>
@@ -959,7 +959,7 @@ function PrefsTab() {
                     )}
                   </Field>
                   <Field label={JUDGE_SETTING_TEXT.model} htmlFor="pref-judge-model"
-                         hint={judgeProvider?.default_model ? `留空就用 ${judgeProvider.default_model}` : undefined}>
+                         hint={judgeProvider?.default_model ? `留空则使用 ${judgeProvider.default_model}` : undefined}>
                     {(p) => (
                       <>
                         <input {...p} className="field mono text-xs" value={cur.judgeModel} list="pref-judge-models"
@@ -1032,22 +1032,22 @@ function PrefsTab() {
                   {changed.map((k) => ({
                     actor: '署名', scope: '记忆作用域', collection: '知识库', confirm: '危险工具的默认审批策略',
                     gateProvider: '门控模型的接入', gateModel: '门控模型',
-                    steps: '默认最大步数', budgetTokens: '令牌预算', budgetUsd: '金额预算',
+                    steps: '默认最大步数', budgetTokens: 'token 预算', budgetUsd: '金额预算',
                     judgeProvider: '裁判模型的接入', judgeModel: '裁判模型',
-                    jClaims: '每份报告最多判几句', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
+                    jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
                   })[k]).join('、')}
                 </span>
               </span>
               {saveError != null && (
-                <span className="text-2xs text-[var(--err)]" role="alert">没存上：{humanizeError(saveError).title}</span>
+                <span className="text-2xs text-[var(--err)]" role="alert">保存失败：{humanizeError(saveError).title}</span>
               )}
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
                       onClick={() => { setDraft(null); setSaveError(null) }}>放弃</button>
               <button className="btn btn-sm btn-primary" disabled={saving || invalid}
-                      title={guardInvalid ? '护栏那几项有没填对的，改好再保存'
-                        : judgeInvalid ? '证据裁判的上限有没填对的，改好再保存' : undefined}
+                      title={guardInvalid ? '护栏设置中有无效值，请修正后再保存'
+                        : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存' : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>
@@ -1150,7 +1150,7 @@ function ThemeSection() {
 
   return (
     <section>
-      <SectionBar title="界面" hint="选中就生效、就保存，所有设备共用。" />
+      <SectionBar title="界面" hint="选择后立即生效并保存，所有设备共用。" />
       <div className="flex flex-wrap items-center gap-3">
         <ThemeChoice value={pref} onChange={(v) => void pick(v)} />
         <span className="text-2xs" aria-live="polite" data-theme-save={receipt ?? undefined}>
@@ -1215,7 +1215,7 @@ function SystemTab() {
           <Cpu size={13} aria-hidden /> 沙箱
         </h2>
         <div className="space-y-1.5 text-xs">
-          <Row label="后端" value={
+          <Row label="类型" value={
             <span className="inline-flex items-center gap-1.5">
               <span className="mono">{sandbox.backend}</span>
               <span className="chip" style={{ color: sandbox.available ? 'var(--st-done)' : 'var(--st-failed)' }}>
@@ -1227,7 +1227,7 @@ function SystemTab() {
           {sandbox.isolation && <Row label="隔离方式" value={sandbox.isolation} />}
           {sandbox.limits_note && <Row label="限额说明" value={sandbox.limits_note} />}
           {!!sandbox.candidates?.length && (
-            <Row label="可用后端" value={
+            <Row label="可选类型" value={
               <span className="flex flex-wrap gap-1.5">
                 {sandbox.candidates.map((c: any) => (
                   <span key={c.name} className={clsx('chip mono', !c.available && 'opacity-50')}
@@ -1248,11 +1248,11 @@ function SystemTab() {
           {sandbox.defaults && (
             <Row label="默认限额" value={
               <span className="flex flex-wrap items-center gap-2">
-                <Limit on={enforced(sandbox, 'timeout')} text={`${sandbox.defaults.timeout}s 超时`} />
-                <Limit on={enforced(sandbox, 'memory')} text={`${sandbox.defaults.memory_mb}MB 内存`} />
+                <Limit on={enforced(sandbox, 'timeout')} text={`超时 ${sandbox.defaults.timeout} 秒`} />
+                <Limit on={enforced(sandbox, 'memory')} text={`内存 ${sandbox.defaults.memory_mb} MB`} />
                 <Limit on={enforced(sandbox, 'cpu')} text={`${sandbox.defaults.cpus} CPU`} />
                 <Limit on={enforced(sandbox, 'network')} text={sandbox.defaults.network ? '联网' : '断网'}
-                       note="HTTP/HTTPS 与域名解析可断，但 UDP/53 拦不住" />
+                       note="可阻断 HTTP/HTTPS 与域名解析，但无法阻断 UDP 53 端口" />
               </span>
             } />
           )}
@@ -1289,7 +1289,7 @@ function enforced(sandbox: any, key: string): boolean | 'partial' {
 function Limit({ on, text, note }: { on: boolean | 'partial'; text: string; note?: string }) {
   if (on === 'partial') {
     return (
-      <span className="chip" title={note || '这项限额只部分生效'}
+      <span className="chip" title={note || '该限额仅部分生效'}
             style={{ color: 'var(--warn)', borderColor: 'color-mix(in srgb, var(--warn) 40%, transparent)' }}>
         {text} · 部分生效
       </span>
@@ -1300,7 +1300,7 @@ function Limit({ on, text, note }: { on: boolean | 'partial'; text: string; note
       {text}
     </span>
   ) : (
-    <span className="chip line-through opacity-60" title="当前后端不支持这项限额">
+    <span className="chip line-through opacity-60" title="当前沙箱不支持该限额">
       {text} · 不生效
     </span>
   )

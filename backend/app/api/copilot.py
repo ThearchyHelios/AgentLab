@@ -46,8 +46,8 @@ async def _sources(session: AsyncSession, scope: list[str] | None) -> list[Any]:
     picked = [r for r in rows if r.id in wanted or r.name in wanted]
     if not picked:
         raise CodedHTTPException(
-            400, "限定的数据源都不在了：可能已经被删掉或停用。去掉限定再问，"
-                 "或者到「数据」页确认它还在、而且是启用的",
+            400, "限定的数据源都已不可用，可能已被删除或停用。请取消限定后重试，"
+                 "或到「数据」页确认数据源存在且已启用",
             DATASOURCE_SCOPE_EMPTY,
         )
     return picked
@@ -497,7 +497,7 @@ async def set_copilot_model(
 
 
 def _unconfigured(e: ProviderNotConfigured) -> str:
-    return f"助手用的模型还没配好：{not_configured(e)}。到「设置 → 模型接入」检查一下"
+    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
 
 
 class GenerateOut(BaseModel):
@@ -701,8 +701,8 @@ async def generate(
         except Exception as e:  # noqa: BLE001
             reason, _ = explain_error(e)
             raise HTTPException(
-                502, f"模型这次没交回能用的工作流（{reason}）。换个说法再试一次；"
-                     "总是这样的话，到设置里给助手换一个更听指令的模型",
+                502, f"模型未返回可用的工作流（{reason}）。请换一种描述重试；如反复出现，"
+                     "请在输入框的「助手使用的模型」中换用指令遵循能力更强的模型",
             ) from e
 
     graph = {
@@ -729,7 +729,7 @@ async def generate(
         spec = GraphSpec.model_validate(graph)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
-            502, f"模型交回的工作流结构不对：{graph_error(e)}。再试一次，或者把需求说得更具体些",
+            502, f"模型返回的工作流结构有误：{graph_error(e)}。请重试，或把需求描述得更具体",
         ) from e
 
     spec, layout = _layout_keeping(spec, _pinned_positions(payload.base_graph))
@@ -1083,10 +1083,14 @@ def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any
         if any(_evidence_source(nodes[a]) for a in _ancestors(spec, node.id) if a in nodes):
             continue
         out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": None, "code": "report_no_source",
-                    "message": f"「{node.title}」（报告撰写）的上游没有能引用数字的证据来源：没有口径卡、查库的 Agent 或调用工具、"
-                               "知识检索，入口也没有看得出是数的字段，报告里写的数都会被判成没有出处。在它前面接取数的节点"
-                               "（要算比率、增幅再加口径卡），连线连到它；要写的数本来就是运行输入的话，在入口字段上写明数值默认值，"
-                               "报告用 [[i:字段名]] 引用"})
+                    "message": f"「{node.title}」（报告撰写）的上游没有可引用数字的证据来源（口径卡、查询数据的 Agent、"
+                               "调用工具、知识检索，或声明了数值的输入字段），报告中的数字都将被判为没有出处。请在它前面接入"
+                               "取数的节点并连线（需要计算比率、增幅时再添加口径卡）；如果要写的数字来自运行输入，请在输入字段"
+                               "上填写数值默认值，报告按 [[i:字段名]] 引用",
+                    "for_model": f"「{node.title}」（报告撰写）的上游没有能引用数字的证据来源：没有口径卡、查库的 Agent 或调用工具、"
+                                 "知识检索，入口也没有看得出是数的字段，报告里写的数都会被判成没有出处。在它前面接取数的节点"
+                                 "（要算比率、增幅再加口径卡），连线连到它；要写的数本来就是运行输入的话，在入口字段上写明数值"
+                                 "默认值，报告用 [[i:字段名]] 引用"})
     return out
 
 
@@ -1106,9 +1110,10 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     for issue in text_parse_issues(spec):
         if issue.node_id in changed:
             # 模型的文字放在模板引号里的那种，改法是 | json，不是换结构化输出
-            tail = "。不要用整形节点解析 agent / llm 的文字" if "cite_fields" in issue.message else ""
+            # 给人看的是 validate 那句原话；交回模型改时再补一句该怎么做（for_model）
+            tail = "。不要用整形节点解析 agent / llm 的文字" if "按出处核对字段" in issue.message else ""
             out.append({**issue.model_dump(), "level": "error", "code": "parse_model_text",
-                        "message": issue.message + tail})
+                        **({"for_model": issue.message + tail} if tail else {})})
     by_name = {getattr(r, "name", None): r for r in sources}
     for node in spec.nodes:
         if node.id not in changed or node.type != NodeType.TOOL:
@@ -1126,9 +1131,11 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
         listed = "、".join(known[:20]) + (f" 等 {len(known)} 列" if len(known) > 20 else "")
         out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": "args.sql",
                     "code": "sql_unknown_column",
-                    "message": f"SQL 里的 {'、'.join(unknown[:5])} 在数据源「{source.name}」的结构里查不到（这几张表的列："
-                               f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
-                               "别凭空猜列名"})
+                    "message": f"SQL 中的列 {'、'.join(unknown[:5])} 在数据源「{source.name}」的表结构中不存在（相关表的列："
+                               f"{listed}）。请按表结构修改列名，不确定时可先查看表结构",
+                    "for_model": f"SQL 里的 {'、'.join(unknown[:5])} 在数据源「{source.name}」的结构里查不到（这几张表的列："
+                                 f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
+                                 "别凭空猜列名"})
     return out
 
 
@@ -1275,19 +1282,27 @@ def scope_issues(nodes: list[dict[str, Any]], scope: set[str] | None) -> list[Va
         if outside:
             out.append(ValidationIssue(
                 level="error", node_id=node.get("id"),
-                message=f"用了限定范围之外的数据源 {'、'.join(outside)}：这一轮只查 "
-                        f"{'、'.join(sorted(scope))}，改用它们的 db_query__ / db_schema__ 工具",
+                message=f"使用了限定范围之外的数据源 {'、'.join(outside)}：本轮只允许使用 {'、'.join(sorted(scope))}",
             ))
     return out
 
 
+#: 交回模型改时补在问题后面的一句「该怎么做」，按问题代码。界面上只显示问题本身（message）
+_FIX_TAIL = {"datasource_out_of_scope": "，改用它们的 db_query__ / db_schema__ 工具"}
+
+
 def _issue_dicts(issues: list[ValidationIssue], code: str) -> list[dict[str, Any]]:
-    return [{**i.model_dump(), "code": code} for i in issues]
+    tail = _FIX_TAIL.get(code)
+    return [{**i.model_dump(), "code": code, **({"for_model": i.message + tail} if tail else {})} for i in issues]
 
 
 def _issue_line(issue: dict[str, Any]) -> str:
-    """交回模型的修正请求里，一条问题一行，节点 id 在前。"""
-    return f"「{issue['node_id']}」{issue['message']}" if issue.get("node_id") else issue["message"]
+    """交回模型的修正请求里，一条问题一行，节点 id 在前。
+
+    写给模型的改法（for_model：「照结构里的列名改；拿不准就先用 db_schema__x 查」这类）和给人看的问题（message）
+    分开存：界面只显示 message，交回模型时有 for_model 用它。键不叫 fix：前端的问题条目里 fix 是修复 id。"""
+    text = issue.get("for_model") or issue["message"]
+    return f"「{issue['node_id']}」{text}" if issue.get("node_id") else text
 
 
 # --------------------------------------------------------------------------
@@ -1460,16 +1475,16 @@ def dropped_tool_warnings(changes: list[dict[str, Any]], instruction: str) -> li
         if not unasked:
             continue
         who = f"「{c['label']}」" + (f"的成员「{c['member']}」" if c["member"] else "")
-        now = f" {'、'.join(c['after'])}" if c["after"] else "空"
-        said = ("这一轮的要求里没有提到去掉工具" if len(unasked) == len(c["removed"])
-                else f"这一轮的要求里没有提到去掉 {'、'.join(unasked)}")
-        cost = ("没有绑定工具，它只能「假设」调用，查不了库" if not c["after"]
-                else f"{'、'.join(unasked)} 它就调不到了")
+        now = f" {'、'.join(c['after'])}" if c["after"] else "无"
+        said = ("本轮要求中没有提到移除工具" if len(unasked) == len(c["removed"])
+                else f"本轮要求中没有提到移除 {'、'.join(unasked)}")
+        cost = ("没有绑定工具时，它无法查询数据库，只能假设调用结果" if not c["after"]
+                else f"{'、'.join(unasked)} 将无法调用")
         out.append({
             "level": "warning", "node_id": c["node_id"], "edge_id": None,
             "code": "tools_dropped", "field": c["field"],
-            "message": f"{who}的工具从 {'、'.join(c['before'])} 变成了{now}。"
-                       f"{said}，确认一下是不是改漏了：{cost}",
+            "message": f"{who}的工具从 {'、'.join(c['before'])} 变为{now}。"
+                       f"{said}，请确认是否误删：{cost}",
         })
     return out
 
@@ -1583,7 +1598,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
             reason, hint = explain_error(e)
-            yield _sse({"op": "error", "message": f"助手这一轮没跑完：{reason}",
+            yield _sse({"op": "error", "message": f"助手本轮未完成：{reason}",
                         "hint": hint, "detail": raw_error(e)})
             return
 
@@ -1628,7 +1643,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                         yield _sse(op)
             except Exception as e:  # noqa: BLE001 - 修不成就照实交付，下面列出剩下的问题
                 yield _sse({"op": "check", "status": "error",
-                            "message": f"自查修正没跑成：{explain_error(e)[0]}", "detail": raw_error(e)})
+                            "message": f"自查修正失败：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
@@ -1663,7 +1678,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             issues += [
                 {"level": "warning", "node_id": None, "edge_id": None,
                  "code": "unknown_node_type", "type": t,
-                 "message": f"模型写了一个不存在的节点类型「{t}」，这一步已跳过"}
+                 "message": f"模型使用了不存在的节点类型「{t}」，已跳过这一步"}
                 for t in dict.fromkeys(skipped_types)
             ]
             final = {
@@ -1677,8 +1692,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 "tool_changes": changes,
             }
         except Exception as e:  # noqa: BLE001
-            final = {"op": "error", "message": f"模型交回的工作流结构不对：{graph_error(e)}",
-                     "hint": "再试一次，或者把需求说得更具体些", "detail": raw_error(e)}
+            final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
+                     "hint": "请重试，或把需求描述得更具体", "detail": raw_error(e)}
         yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -1764,7 +1779,7 @@ async def assist_publish_fix(
     out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
                            "ops": []}
     if not errors:
-        out["summary"] = "没有挡住发布的错误，不用交给 Copilot"
+        out["summary"] = "没有阻止发布的错误，无需交给助手"
         return out
     try:
         spec_ = await copilot_model_spec(
@@ -1805,13 +1820,13 @@ async def assist_publish_fix(
                 if _apply_op(nodes, edges, op):
                     effective.append(op)
     except Exception as e:  # noqa: BLE001 - 修不成就照实说，确定性修复的结果照样交给人
-        out["summary"] = f"Copilot 这一轮没跑完：{explain_error(e)[0]}"
+        out["summary"] = f"助手本轮未完成：{explain_error(e)[0]}"
         return out
     out["summary"] = out["summary"] or plan
     if not effective:
         # 没动图：要么全是要人拿主意的问题，要么它没给出能用的修改。都不算「拒绝」
-        out["summary"] = out["summary"] or ("Copilot 认为这些问题要你来拿主意" if out["questions"]
-                                            else "Copilot 这一轮没有给出修改")
+        out["summary"] = out["summary"] or ("助手认为这些问题需要由你决定" if out["questions"]
+                                            else "助手本轮没有给出修改")
         return out
 
     proposed = _proposed_graph(base, nodes, edges)
@@ -1819,11 +1834,11 @@ async def assist_publish_fix(
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
                              baseline=baseline, level=level, defaults=proposed.get("defaults"))
     if reasons:
-        out["reason"] = "Copilot 的修改降低了要求，已作废：" + "；".join(reasons)
+        out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:
-        out["reason"] = "Copilot 改完的图结构读不懂，已作废"
+        out["reason"] = "助手修改后的工作流结构无法解析，已作废"
     elif why := judge(errors, after):
-        out["reason"] = f"Copilot 的修改没有让图变得更好，已作废：{why}"
+        out["reason"] = f"助手的修改未能改善工作流，已作废：{why}"
     else:
         out.update(accepted=True, graph=proposed, ops=effective)
     return out
@@ -1903,9 +1918,9 @@ def _kept_code(spec: GraphSpec) -> list[str]:
     """assist 之后仍然喂着口径卡的计算角色沙箱代码：不是纯算术、或者 Copilot 拿不准的，保留原样并警告。"""
     from app.engine.upgrade import compute_feeders
 
-    return [f"「{code.title}」（沙箱代码）没有改写成口径卡表达式，保留原样：口径卡"
+    return [f"「{code.title}」（沙箱代码）未改写为口径卡表达式，已保留原样：口径卡"
             + "、".join(f"「{c.title}」" for c in cards)
-            + "读到的数核对不了出处。它在取数的话，把 evidence_role 标成 source；在做计算的话，把计算写进口径卡"
+            + "读取的数字无法追溯出处。若该节点负责取数，请将「证据角色」设为「取数」；若负责计算，请把计算移到口径卡的表达式中"
             for code, cards in compute_feeders(spec)]
 
 
@@ -1930,7 +1945,7 @@ async def assist_upgrade(
                            "warnings": [], "graph": graph, "ops": []}
     feeders = compute_feeders(spec)
     if not feeders:
-        out["summary"] = "口径卡的输入都不来自做计算的沙箱代码，没有要交给 Copilot 改写的"
+        out["summary"] = "口径卡的输入均不来自负责计算的沙箱代码，无需交给助手改写"
         return out
     sources = await _sources(session, None)
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
@@ -1994,12 +2009,12 @@ async def assist_upgrade(
                 break
             await collect(_repair_request(nodes, edges, fresh), first=False)
     except Exception as e:  # noqa: BLE001 - 改不成就照实说，确定性改写的结果照样交给人
-        out.update(ok=False, summary=f"Copilot 这一轮没跑完：{explain_error(e)[0]}")
+        out.update(ok=False, summary=f"助手本轮未完成：{explain_error(e)[0]}")
         return out
     out["summary"] = out["summary"] or plan
     if not effective:
-        out["summary"] = out["summary"] or ("Copilot 认为这些代码不是纯算术，都保留原样" if out["questions"]
-                                            else "Copilot 这一轮没有给出修改")
+        out["summary"] = out["summary"] or ("助手认为这些代码不是纯算术，均保留原样" if out["questions"]
+                                            else "助手本轮没有给出修改")
         return out
 
     proposed = _proposed_graph(base, nodes, edges)
@@ -2007,11 +2022,11 @@ async def assist_upgrade(
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
                              baseline=baseline, level=level, defaults=proposed.get("defaults"))
     if reasons:
-        out["reason"] = "Copilot 的修改降低了要求，已作废：" + "；".join(reasons)
+        out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:
-        out["reason"] = "Copilot 改完的图结构读不懂，已作废"
+        out["reason"] = "助手修改后的工作流结构无法解析，已作废"
     elif why := worse(base_errors, after):
-        out["reason"] = f"Copilot 的修改让图变糟了，已作废：{why}"
+        out["reason"] = f"助手的修改未能改善工作流，已作废：{why}"
     else:
         out.update(accepted=True, graph=proposed, ops=effective, warnings=_kept_code(GraphSpec.model_validate(proposed)))
     out["ok"] = out["reason"] is None
@@ -2064,7 +2079,7 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
         return {"graph": payload.graph, "changes": [], "ops": [], "notes": [], "applied": [], "rejected": [],
                 "assist": None, "ok": False,
                 "issues": [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None,
-                            "fix": None, "message": f"工作流的结构读不懂：{graph_error(e)}"}]}
+                            "fix": None, "message": f"无法解析工作流结构：{graph_error(e)}"}]}
     out = upgrade_for_evidence(payload.graph, level=payload.level)
     out["graph"] = _placed(payload.graph, out["graph"])
     out["assist"] = None
@@ -2077,7 +2092,7 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
             from app.engine.upgrade import compute_feeders
 
             out["changes"] += _node_changes(
-                diff_changes(out["graph"], helped["graph"], fix_id="assist", label="Copilot 的修改"))
+                diff_changes(out["graph"], helped["graph"], fix_id="assist", label="助手的修改"))
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
             out["graph"] = helped["graph"]
@@ -2115,13 +2130,13 @@ async def extract_template(
 
     run = await session.get(Run, payload.run_id)
     if not run:
-        raise HTTPException(404, "这次运行的记录不存在，可能已经被删了")
+        raise HTTPException(404, "运行记录不存在，可能已被删除")
     # 没跑通的路径提出来是半截骨架：失败节点之后的步骤一步都不在里面，
     # 人拿去审改时却看不出它缺了什么
     if run.status != "succeeded":
         raise HTTPException(
-            409, "这次运行没有跑完（没有成功结束），提取出来的只是半截路径。"
-                 "先让它跑成功一次，再从那次运行提取",
+            409, "这次运行未成功结束，提取出的执行路径不完整。"
+                 "请先让它成功运行一次，再从该次运行提取",
         )
     if not run.graph.get("nodes"):
         raise HTTPException(400, "这次运行没有保存工作流快照，无法提取")
@@ -2140,7 +2155,7 @@ async def extract_template(
         if e.type == "edge.taken" and e.node_id
     }
     if not executed:
-        raise HTTPException(400, "事件流里没有节点执行记录")
+        raise HTTPException(400, "这次运行没有节点执行记录")
 
     spec = GraphSpec.model_validate(run.graph)
     kept_nodes = [n for n in spec.nodes if n.id in executed]
@@ -2169,8 +2184,8 @@ async def extract_template(
     )
     graph = draft_spec.model_dump(mode="json")
     workflow = Workflow(
-        name=payload.name or f"{run.workflow_name or '探索'}·提取模板",
-        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{len(kept_nodes)} 节点），待人审后发布",
+        name=payload.name or f"{run.workflow_name or '探索'}（提取的模板）",
+        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{len(kept_nodes)} 个节点），经人工审核后发布",
         graph=graph,
         tags=["extracted"],
         status="draft",
@@ -2180,7 +2195,7 @@ async def extract_template(
     session.add(
         WorkflowVersion(
             workflow_id=workflow.id, version=1, graph=graph,
-            graph_hash=graph_hash(graph), note=f"自运行 {run.id} 提取",
+            graph_hash=graph_hash(graph), note=f"从运行 {run.id} 提取",
         )
     )
     await session.commit()
@@ -2298,7 +2313,7 @@ async def review_run(
 
     run = await session.get(Run, payload.run_id)
     if not run:
-        raise HTTPException(404, "这次运行的记录不存在，可能已经被删了")
+        raise HTTPException(404, "运行记录不存在，可能已被删除")
 
     rows = list((await session.execute(
         select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)

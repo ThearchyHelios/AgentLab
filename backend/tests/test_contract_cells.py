@@ -458,7 +458,7 @@ def test_turning_cells_on_unasked_is_still_loosening():
     before["nodes"][-1]["data"]["config"]["contract"].pop("cells")
     after = cells_only()
     [why] = forbidden_changes(before, after)
-    assert "cells" in why
+    assert "单元格引用" in why
     assert forbidden_changes(before, after, chosen={("out", "contract.cells")}) == []
 
 
@@ -471,9 +471,9 @@ def test_only_a_newly_raised_human_choice_error_is_let_through():
     other = {"level": "error", "code": "contract.strict_off", "node_id": "out", "message": "strict 关了"}
     assert judge([no_contract], [cells]) is None                  # 补上契约、cells 留给人：算更好
     assert worse([], [cells]) is None
-    assert "冒出新的问题" in (judge([no_contract], [other]) or "")  # 别的新 error 照样作废
+    assert "出现了新的问题" in (judge([no_contract], [other]) or "")  # 别的新 error 照样作废
     assert judge([no_contract], [cells, other]) is not None
     # 原来就有的 cells 照常计数：修它的那一步，改完还在就是没修好
-    assert "还在" in (judge([cells], [cells], target=("contract.cells_undeclared", "out")) or "")
+    assert "仍然存在" in (judge([cells], [cells], target=("contract.cells_undeclared", "out")) or "")
     assert judge([cells], [], target=("contract.cells_undeclared", "out")) is None
-    assert judge([cells], [cells]) == "改完错误没有变少"             # 原来就有、改完还在：Copilot 兜底不算修好
+    assert judge([cells], [cells]) == "修改后错误没有减少"             # 原来就有、改完还在：Copilot 兜底不算修好

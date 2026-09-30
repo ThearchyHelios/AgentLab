@@ -42,8 +42,8 @@ _MAX_DEPTH = 3
 COORDINATOR = "调度者"
 
 #: 成员把工具调用写成文字、纠正之后还是这样时，交给调度者的那句话
-MEMBER_MARKUP_FAILED = ("模型输出了工具调用的原始标记，但没有真正调用工具，这一步什么都没查到"
-                        "（常见原因：这个成员没有绑定工具，或者模型、服务不支持工具调用）")
+MEMBER_MARKUP_FAILED = ("模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据"
+                        "（常见原因：该成员未绑定工具，或模型、服务不支持工具调用）")
 
 
 # --------------------------------------------------------------------------
@@ -60,7 +60,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """
     agents = ctx.cfg("agents", []) or []
     if not agents:
-        raise NodeError(ctx.node.id, "supervisor 节点至少要配一个 agent")
+        raise NodeError(ctx.node.id, "「多 Agent 协作」节点未配置团队成员，至少需要一个")
 
     names = [a.get("name") or f"agent{i}" for i, a in enumerate(agents)]
     agent_map = {n: a for n, a in zip(names, agents)}
@@ -235,7 +235,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 EventType.LOG, level="info", round=round_no, parallel=len(batch),
                 agents=[n for n, _ in batch], done=False, reason=reason,
                 message=(f"调度 → {who}" + (f"（{reason}）" if reason else "")
-                         + (f" · {len(batch)} 人同时进行" if len(batch) > 1 else "")),
+                         + (f" · {len(batch)} 名成员同时执行" if len(batch) > 1 else "")),
             )
         return {"decision": value, "usage": spent}
 
@@ -285,7 +285,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             text = f"（{name} 执行失败：{why}）"
             out = {"text": text, "tool_calls": [], "failed": True, "error": why}
             ctx.emit(EventType.LOG, level="warn", round=round_no,
-                     message=f"{name} 这一轮失败了：{text}")
+                     message=f"{name} 本轮执行失败：{text}")
         each_ms = int((time.perf_counter() - t0) * 1000)
         # failed / error 让矩阵把这一格画成失败，而不是一个"完成"的格子里写着失败原因
         failure = {"failed": True, "error": out.get("error") or ""} if out.get("failed") else {}
@@ -340,11 +340,11 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 把工具调用写成了文字：这一步什么都没查到。纠正一次，还这样就记为失败，
                 # 原因交给调度者——以前这段标记会被当成这个成员的结论交上去
                 if nudged:
-                    return {"text": f"（{name} 这一步失败：{MEMBER_MARKUP_FAILED}）",
+                    return {"text": f"（{name} 这一步执行失败：{MEMBER_MARKUP_FAILED}）",
                             "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
                 nudged = True
                 ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
-                         message=f"{markup_warning(snippet, name)}，已提醒它重试一次")
+                         message=f"{markup_warning(snippet, name)}，已要求模型重试一次")
                 messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
                 continue
             for call in tool_calls:
@@ -397,14 +397,14 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                         # shell_exec / file_write / 可写库上的 DELETE 照跑不误——
                         # agent 节点守着的那道门，在这里是敞开的。现在是不跑，并说清原因
                         content = (
-                            (f"门控模型没有放行（{gate_reason}）。" if gate_reason else "")
-                            + f"没有执行：{tname} 这次调用需要人工确认，而协作团队里的成员"
+                            (f"门控模型未批准（{gate_reason}）。" if gate_reason else "")
+                            + f"没有执行：{tname} 这次调用需要人工审批，而协作团队里的成员"
                             "不能停下来等人。换一种不需要它的做法；实在需要，交给团队外"
-                            "的 agent 节点去做（那里可以逐次审批）。"
+                            "的 Agent 节点去做（那里可以逐次审批）。"
                         )
                         ctx.emit(EventType.LOG, level="warn", code="tool_needs_approval", tool=tname,
                                  agent=name, call_id=cid,
-                                 message=f"{name} 想调用 {tname}，需要人工确认，协作节点里不执行")
+                                 message=f"{name} 请求调用 {tname}，该调用需要人工审批，协作节点内不执行")
                     else:
                         try:
                             raw = await run_bounded(tool_map[tname].ainvoke(targs), limit, tname)
@@ -438,23 +438,23 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             text = message_text(settled).strip()
         except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有的过程一起赔进去
             ctx.emit(EventType.LOG, level="warn", code="settle_failed",
-                     message=f"{name} 的收尾轮没跑成：{describe_exception(e)}")
+                     message=f"{name} 收尾失败：{describe_exception(e)}")
             text = next((t for m in reversed(messages)
                          if isinstance(m, AIMessage) and (t := message_text(m).strip())
                          and not leaked_markup(t)), "")
         if snippet := leaked_markup(text):
             if not calls:
-                return {"text": f"（{name} 这一步失败：{MEMBER_MARKUP_FAILED}）",
+                return {"text": f"（{name} 这一步执行失败：{MEMBER_MARKUP_FAILED}）",
                         "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
             # 真调过工具，只是收尾轮还想接着查：取它之前说过的话，和 agent 节点一样
             ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
-                     message=f"{markup_warning(snippet, name)}：步数用完后的收尾轮仍想调用工具")
+                     message=f"{markup_warning(snippet, name)}：已达步数上限，收尾时仍试图调用工具")
             text = next((t for m in reversed(messages)
                          if isinstance(m, AIMessage) and (t := message_text(m).strip())
                          and not leaked_markup(t)), "")
         ctx.emit(EventType.LOG, level="warn", code="step_limit_settled",
-                 message=f"{name} 用满了 {max_steps} 步，结论基于已经查到的部分")
-        return {"text": text or f"（{name} 用满了 {max_steps} 步，没有给出结论）", "tool_calls": calls}
+                 message=f"{name} 已用完 {max_steps} 步上限，结论基于已查到的部分")
+        return {"text": text or f"（{name} 已用完 {max_steps} 步上限，未给出结论）", "tool_calls": calls}
 
     progress_lines: list[str] = []
     final_text = ""
@@ -539,34 +539,35 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             late = "、".join(dict.fromkeys(t["agent"] for t in failed
                                            if t["round"] == transcript[-1]["round"]))
             ctx.emit(EventType.LOG, level="warn", code="team_last_failed",
-                     message=f"{late} 最后一轮没有交回结果，团队成果取自{delivered[-1][0]}的产出")
+                     message=f"{late} 最后一轮未交回结果，团队成果取自{delivered[-1][0]}的产出")
     elif finished and transcript:
         # 调度者说完成了，派出去的成员却一个都没交回结果，手上只有失败说明。以前最后
         # 那段失败说明就被当成团队的结论交出去：一条数据都没查到，运行照样是已完成。
         # 不看 on_exhausted：那是「用完轮数时」的收场方式，降档交的是成员原话；这里
         # 连原话都没有，交下去的只能是失败说明，界面还会把它说成「用完 N 轮」
         why = "；".join(f"{who}：{err[:200]}" for who, err in dict.fromkeys(
-            (t["agent"], t.get("error") or "没有说明原因") for t in failed))
-        summary = (f"协作团队没有交出结论：派出去的成员都没能交回结果，调度者仍判定完成"
-                   f"（{last_reason or '没有给出理由'}）。{why}")
+            (t["agent"], t.get("error") or "未说明原因") for t in failed))
+        summary = (f"协作团队未交出结论：所有被分派的成员都未能交回结果，调度者仍判定完成"
+                   f"（{last_reason or '未给出理由'}）。{why}")
         if never:
             summary += f"。一次都没被派到的成员：{'、'.join(never)}"
-        raise NodeError(ctx.node.id, f"{summary}。按各成员的失败原因改好配置，再运行")
+        raise NodeError(ctx.node.id, f"{summary}。请根据各成员的失败原因修改配置后重新运行")
     elif not finished:
         # 轮数用完，调度者一次都没说「完成」。这时手上只有最后一个成员的原话——
         # 以前它就被当作团队的结论交了出去：真实运行里是一段没执行的工具调用标记，
         # 而负责定稿的成员一次都没被派到
         summary = (f"协作团队用完 {max_rounds} 轮仍未完成："
-                   f"{last_reason or '调度者没有给出理由'}")
+                   f"{last_reason or '调度者未给出理由'}")
         if never:
             summary += f"。一次都没被派到的成员：{'、'.join(never)}"
         if on_exhausted == "fail":
-            raise NodeError(ctx.node.id, f"{summary}。先看成员有没有绑定要用的工具，再调大「最多"
-                                         "轮数」；也可以把「用完轮数时」改成降档交付")
+            # 「。先看成员」是前端切分这句话的锚点（decode.ts exhaustedOf、NodeCard、explain.ts），不要改
+            raise NodeError(ctx.node.id, f"{summary}。先看成员是否绑定了所需工具，再调大「最多"
+                                         "轮数」；也可将「用完轮数时」改为「降档交付」")
         exhausted = {"exhausted": True, "exhausted_reason": last_reason,
                      "never_dispatched": never}
         ctx.emit(EventType.LOG, level="warn", code="team_exhausted",
-                 message=f"{summary}。按降档交付：成果是成员最后的原话，不是调度者认可的结论")
+                 message=f"{summary}。按降档交付：成果取自成员最后的回复，并非调度者认可的结论")
 
     usage_total["total_tokens"] = usage_total["input_tokens"] + usage_total["output_tokens"]
     # 并行省下的时间：各轮"串行本该花的"减去"实际花的"。只有并发过才有差值
@@ -586,7 +587,7 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "usage": usage_total,
     }
     if ctx.cfg("emit_message", True):
-        updates["messages"] = [AIMessage(content=final_text or "(空)")]
+        updates["messages"] = [AIMessage(content=final_text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: final_text}
@@ -609,11 +610,11 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     if ctx.run.depth >= _MAX_DEPTH:
         raise NodeError(ctx.node.id, f"子工作流嵌套超过 {_MAX_DEPTH} 层，已阻止。"
-                                     "多半是几张工作流互相引用了，检查「子工作流」节点选的是哪一张")
+                                     "可能是多个工作流相互引用，请检查「子工作流」节点选择的工作流")
 
     workflow_id = ctx.cfg("workflow_id")
     if not workflow_id:
-        raise NodeError(ctx.node.id, "「子工作流」节点还没选要嵌套的工作流")
+        raise NodeError(ctx.node.id, "「子工作流」节点尚未选择要嵌套的工作流")
 
     # 版本钉死：这就是"方法卡"的机制核心。钉了 workflow_version 就永远
     # 执行那个不可变快照，上游改了方法卡也不会让这里的口径悄悄漂移；
@@ -622,8 +623,8 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, workflow_id)
         if not workflow:
-            raise NodeError(ctx.node.id, f"「子工作流」引用的工作流（{workflow_id}）已经不在了，"
-                                         "可能被删除了。在节点里重新选一张")
+            raise NodeError(ctx.node.id, f"「子工作流」引用的工作流（{workflow_id}）已不存在，"
+                                         "可能已被删除，请在节点中重新选择")
         if pinned:
             from sqlalchemy import select
 
@@ -639,7 +640,7 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             ).scalar_one_or_none()
             if not snapshot:
                 raise NodeError(
-                    ctx.node.id, f"工作流「{workflow.name}」没有 v{pinned} 这个版本"
+                    ctx.node.id, f"工作流「{workflow.name}」不存在 v{pinned} 版本"
                 )
             sub_graph = snapshot.graph
             used_version = int(pinned)
@@ -693,8 +694,8 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 不接住的话，外层包装成 NodeError 时带的是 LangGraph 的英文原文
         raise NodeError(
             ctx.node.id,
-            f"子图「{workflow.name}」走满了 {limit} 步还没跑完，已中止。多半是子图里有个环"
-            "在空转：分支连回了上游、却没有 loop 节点给它定轮数上限",
+            f"子工作流「{workflow.name}」已执行 {limit} 步仍未结束，已中止。可能存在没有轮数上限的环路，"
+            "请在子工作流中用「循环」节点限制轮数",
         ) from e
 
     output = result_state.get("output") or {}

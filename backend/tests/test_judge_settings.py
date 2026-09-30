@@ -97,7 +97,10 @@ async def test_bad_values_are_refused_with_a_reason(key, value):
             await c.put("/api/settings", content='{"values": {"judge": {"%s": NaN}}}' % key,
                         headers={"content-type": "application/json"})
         assert r.status_code == 422, r.text
-        assert key in r.json()["detail"]
+        # 报错写设置页上的叫法（「每日金额上限（美元）」），不写键名；认不出的键原样点名
+        from app.engine.judge import SETTING_LABEL
+
+        assert SETTING_LABEL.get(key, key) in r.json()["detail"]
         assert (await c.get("/api/settings")).json()["judge"] == JUDGE_DEFAULTS, "整组都没写进去"
 
 
@@ -224,23 +227,23 @@ def test_every_limit_can_be_unlimited():
 
 @pytest.mark.parametrize("judge,field,words", [
     ("fast", "judge", "对象"),
-    ({"max_cost": 1}, "judge.max_cost", "max_cost_usd"),
+    ({"max_cost": 1}, "judge.max_cost", "「金额上限（美元）」"),
     ({"max_claims": 0}, "judge.max_claims", "正整数"),
     ({"max_claims": 2.5}, "judge.max_claims", "正整数"),
     ({"max_claims": True}, "judge.max_claims", "正整数"),
     ({"max_cost_usd": -1}, "judge.max_cost_usd", "大于 0"),
     ({"max_cost_usd": "0.05"}, "judge.max_cost_usd", "大于 0"),
     ({"timeout_s": 0}, "judge.timeout_s", "大于 0"),
-    ({"rewrite_once": "yes"}, "judge.rewrite_once", "true 或 false"),
-    ({"on_unsupported": "ignore"}, "judge.on_unsupported", "degrade / withhold"),
-    ({"model": 3}, "judge.model", "模型 id"),
+    ({"rewrite_once": "yes"}, "judge.rewrite_once", "开启或关闭"),
+    ({"on_unsupported": "ignore"}, "judge.on_unsupported", "「出具降档」或「不予出具」"),
+    ({"model": 3}, "judge.model", "模型 ID"),
 ])
 def test_a_malformed_judge_block_is_an_error(judge, field, words):
     [issue] = issues(graph({"claims": "judge", "judge": judge}), "report.judge_invalid")
     assert issue.level == "error" and issue.node_id == "write" and issue.field == field
     assert words in issue.message, issue.message
     if field in ("judge.max_claims", "judge.max_cost_usd", "judge.timeout_s", "judge.model"):
-        assert "null" in issue.message, "上限、模型都说清写 null 是什么意思"
+        assert ("留空" if field == "judge.model" else "不限") in issue.message, "上限、模型都说清不填是什么意思"
 
 
 def test_graph_defaults_are_checked_like_at_run_time():
@@ -256,7 +259,7 @@ def test_judging_with_the_writing_model_is_a_warning():
     [warn] = [i for i in validate_graph(GraphSpec.model_validate(graph(
         {"claims": "judge", "model": "writer-x", "judge": {"model": "writer-x"}}))).issues
         if i.code == "report.judge_same_model"]
-    assert warn.level == "warning" and warn.field == "judge.model" and "自己审自己" in warn.message
+    assert warn.level == "warning" and warn.field == "judge.model" and "裁判模型与写作模型相同" in warn.message
     assert not [i for i in validate_graph(GraphSpec.model_validate(graph(
         {"claims": "judge", "model": "writer-x", "judge": {"model": "judge-y"}}))).issues
         if i.code == "report.judge_same_model"]

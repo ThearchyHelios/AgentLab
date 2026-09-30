@@ -51,10 +51,10 @@ class ExecResult(BaseModel):
 
     def summary(self) -> str:
         if self.timed_out:
-            return f"执行超时（>{'?'}s）"
+            return "执行超时"
         if self.error:
             return self.error
-        return self.stdout or self.stderr or "(无输出)"
+        return self.stdout or self.stderr or "（无输出）"
 
 
 class Sandbox(abc.ABC):

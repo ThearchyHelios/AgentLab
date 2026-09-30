@@ -90,21 +90,21 @@ def test_a_near_miss_type_gets_a_suggestion(kind, guess):
     from app.tools.custom import schema_problem
 
     problem = schema_problem({"type": "object", "properties": {"n": {"type": kind}}})
-    assert problem and f"是不是想写 {guess}" in problem, problem
+    assert problem and f"是否应为 {guess}" in problem, problem
 
 
 def test_an_unrecognisable_type_gets_no_guess():
     from app.tools.custom import schema_problem
 
     problem = schema_problem({"type": "object", "properties": {"n": {"type": "timestamp"}}})
-    assert problem and "「timestamp」" in problem and "是不是想写" not in problem, problem
+    assert problem and "「timestamp」" in problem and "是否应为" not in problem, problem
 
 
 async def test_parameters_that_are_not_an_object_are_refused_in_words_too(client):
     r = await client.post("/api/custom-tools", json={
         "name": _name(), "kind": "http", "parameters": ["city"], "config": {}})
     assert r.status_code == 422
-    assert r.json()["detail"] == "参数定义要是一个 JSON 对象"
+    assert r.json()["detail"] == "参数定义必须是一个 JSON 对象"
 
 
 async def test_editing_a_tool_into_a_broken_schema_is_refused_and_nothing_changes(client):

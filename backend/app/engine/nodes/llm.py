@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from app.core import artifact_store
 from app.core.config import settings
-from app.core.errors import describe_exception, raw_detail
+from app.core.errors import describe_exception, not_configured, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Skill
@@ -131,7 +131,10 @@ async def _build_messages(state: GraphState, ctx: NodeContext) -> list[BaseMessa
     if prompt:
         messages.append(HumanMessage(content=prompt))
     if not messages:
-        raise NodeError(ctx.node.id, "没有可发送的内容：system 和 prompt 都是空的")
+        from app.engine.labels import field_label
+
+        raise NodeError(ctx.node.id, f"没有可发送给模型的内容：「{field_label('system', ctx.node.type)}」"
+                                     f"和「{field_label('prompt', ctx.node.type)}」都为空")
     return messages
 
 
@@ -167,14 +170,14 @@ def explain_model_error(exc: Exception, model_id: str) -> str:
     text = str(exc)
     if "invalid_model" in text or "model does not exist" in text.lower():
         return (
-            f"模型「{model_id}」在这个供应商上不存在，或者当前 key 没有它的权限。"
-            f"去「设置 → 供应商」把模型列表改成它真正提供的 id，"
-            f"或者在节点上换一个模型。"
+            f"模型「{model_id}」在当前模型接入中不存在，或当前 API Key 无权使用该模型。"
+            f"请在「设置 → 模型接入」中把可选模型改为服务实际提供的模型 ID，"
+            f"或在节点上换一个模型。"
         )
     if "insufficient" in text.lower() or "quota" in text.lower():
-        return f"模型「{model_id}」的额度用完了：{text[:200]}"
+        return f"模型「{model_id}」的额度已用完：{text[:200]}"
     return (f"调用模型「{model_id}」失败：{describe_exception(exc)}。"
-            "稍后重试；反复失败就去「设置 → 模型接入」测一下这个模型")
+            "请稍后重试；如持续失败，请到「设置 → 模型接入」测试该模型")
 
 
 async def _invoke_streaming(
@@ -205,7 +208,7 @@ async def _invoke_streaming(
         response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn",
-                 message=f"流式失败，回退非流式：{explain_model_error(e, model_id)}",
+                 message=f"流式输出失败，已改用非流式调用：{explain_model_error(e, model_id)}",
                  code="stream_fallback")
         try:
             response = await model.ainvoke(messages)
@@ -245,7 +248,7 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         try:
             model, model_id = await get_chat_model(session, spec)
         except ProviderNotConfigured as e:
-            raise NodeError(ctx.node.id, str(e)) from e
+            raise NodeError(ctx.node.id, not_configured(e)) from e
 
     messages = await _build_messages(state, ctx)
     schema = ctx.cfg("output_schema")
@@ -269,8 +272,8 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 raise NodeError(ctx.node.id, explain_model_error(e, model_id)) from e
             raise NodeError(
                 ctx.node.id,
-                f"模型没能按「结构化输出 Schema」给出结果：{describe_exception(e)}。"
-                "检查 Schema 是否写对，或者换一个支持结构化输出的模型",
+                f"模型未能按「结构化输出 Schema」给出结果：{describe_exception(e)}。"
+                "请检查 Schema 是否正确，或换用支持结构化输出的模型",
             ) from e
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -284,7 +287,7 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 模型把工具调用当正文写了出来：这个节点压根没有工具，那段"调用"什么都没查到。
             # 带一句纠正再问一次；还这样就判失败，别让一堆标记当答案往下游走
             ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
-                     message=f"{markup_warning(snippet)}，已提醒它重试一次")
+                     message=f"{markup_warning(snippet)}，已要求模型重试一次")
             retried = time.perf_counter()
             response = await _invoke_streaming(
                 model, [*messages, response, HumanMessage(content=TOOL_MARKUP_NUDGE)], ctx, model_id)
@@ -296,7 +299,7 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if not text and reasoning:
             # 思考型模型把额度全花在推理上了，正文是空的 —— 说清楚而不是抛个空结果给下游
             ctx.emit(EventType.LOG, level="warn",
-                     message="模型只输出了思考内容，正文为空。把 max_tokens 调大，或把 thinking 设为 off。",
+                     message="模型只输出了思考内容，正文为空。请调大「最大输出 token」，或关闭「思考模式」。",
                      code="empty_completion")
         output = {"text": text, "thinking": reasoning}
 
@@ -407,7 +410,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         try:
             base_model, model_id = await get_chat_model(session, model_spec)
         except ProviderNotConfigured as e:
-            raise NodeError(ctx.node.id, str(e)) from e
+            raise NodeError(ctx.node.id, not_configured(e)) from e
 
     tools = await _resolve_tools(ctx, state)
     tool_map = {t.name: t for t in tools}
@@ -545,7 +548,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
                      duration_ms=int((time.perf_counter() - started) * 1000), error=describe_exception(e))
-            return {"error": f"结构化抽取没跑成：{explain_model_error(e, model_id)}"}
+            return {"error": f"结构化抽取失败：{explain_model_error(e, model_id)}"}
         raw, parsed = _split_structured(got)
         usage = _usage_of(raw if raw is not None else AIMessage(content=""), model_id)
         ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
@@ -577,7 +580,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     raise NodeError(ctx.node.id, TOOL_MARKUP_ERROR)
                 nudged = True
                 await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
-                           message=f"{markup_warning(snippet)}，已提醒它重试一次")
+                           message=f"{markup_warning(snippet)}，已要求模型重试一次")
                 messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
                 final_text = ""
                 continue
@@ -620,7 +623,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             if guard and (again := guard.repeat(name, args)) is not None:
                 # 同样的调用已经成功跑过：不再执行（也就不用再审批），把上次的结果交还给它
                 await once(ctx, EventType.LOG, level="info", code="tool_repeat",
-                           message=f"{name} 用同样的参数又调了一次，没有再执行，把上次的结果交还给它")
+                           message=f"{name} 被以相同参数重复调用，已跳过执行并返回上次的结果")
                 messages.append(ToolMessage(content=again, tool_call_id=call_id))
                 transcript.append({"tool": name, "args": args, "repeat": True})
                 continue
@@ -640,7 +643,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     ctx,
                     {"kind": "tool_approval", "node_id": ctx.node.id, "tool": name, "args": args,
                      "title": f"是否允许调用 {name}？", **trustable},
-                    mode="approve", tool=name, args=args, title=f"Agent 想调用工具 {name}", **trustable,
+                    mode="approve", tool=name, args=args, title=f"Agent 请求调用工具 {name}", **trustable,
                 )
                 verdict = read_decision(decision)
                 note = verdict.note
@@ -652,7 +655,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 if not verdict.approved:
                     messages.append(
                         ToolMessage(
-                            content=f"用户拒绝了这次调用。原因：{note or '未说明'}。请换一种方式。",
+                            content=f"用户驳回了这次调用。原因：{note or '未说明'}。请换一种方式。",
                             tool_call_id=call_id,
                         )
                     )
@@ -687,7 +690,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             squeezed = guard.compress(messages)
             if squeezed:
                 await once(ctx, EventType.LOG, level="info", code="context_compressed",
-                           message=f"对话用到上下文窗口的 {guard.last_input * 100 // guard.window}%，"
+                           message=f"对话已占用上下文窗口的 {guard.last_input * 100 // guard.window}%，"
                                    f"已压缩 {squeezed} 条早期的工具结果")
             # 刚压缩过的这一步不按上下文收尾：压缩的效果要到下一次调用才看得出来
             if settle_reason := guard.stop_reason(total_usage, context=not squeezed):
@@ -719,7 +722,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             settled = message_text(response).strip()
         except Exception as e:  # noqa: BLE001 - 收尾失败不能把已有成果一起赔进去
             await once(ctx, EventType.LOG, level="warn",
-                       message=f"收尾轮没跑成：{describe_exception(e)}", code="settle_failed")
+                       message=f"收尾失败：{describe_exception(e)}", code="settle_failed")
 
         if snippet := leaked_markup(settled):
             if not any(isinstance(m, AIMessage) and getattr(m, "tool_calls", None) for m in messages):
@@ -729,14 +732,14 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 这不是「节点没绑工具」（前面的步数里工具是真调过的），不能套 TOOL_MARKUP_ERROR
             # 判失败、把已经查到的一起丢掉——按收尾轮没说出话处理，取它之前说过的话
             await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
-                       message=f"{markup_warning(snippet)}：步数用完后的收尾轮仍想调用工具，"
-                               "没能给出结论")
+                       message=f"{markup_warning(snippet)}：已达步数上限，收尾时仍试图调用工具，"
+                               "未能给出结论")
             settled = ""
 
         limited = {"reason": settle_reason} if guard else {}
         if settled:
             final_text = settled
-            hint = f"{to_user}这个结论是基于已经查到的部分给出的。" if guard else legacy_hint(max_steps, True)
+            hint = f"{to_user}以上结论基于已查到的部分。" if guard else legacy_hint(max_steps, True)
             # 和 step_limit 分开发：库里那些老事件的含义确实是"硬截断"，
             # 复用同一个 code 会把历史运行重新解释成另一回事
             ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit_settled", **limited)
@@ -751,7 +754,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  and not leaked_markup(text)),
                 "",
             )
-            hint = f"{to_user}收尾轮也没有给出结论。" if guard else legacy_hint(max_steps, False)
+            hint = f"{to_user}收尾时仍未给出结论。" if guard else legacy_hint(max_steps, False)
             # 一步一工具时步数消耗得比并行快得多，这里不说清楚，用户只会看到
             # 一个没头没尾的答案，而不知道是被步数掐断的
             final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
@@ -762,7 +765,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if schema is not None and (fields := cited_fields(schema)):
         # 结构化抽取只能追加在循环之后：循环里的 task 按调用位置从 checkpoint 取回，插一个进去，
         # 停在审批上的运行恢复时位置就错开了
-        extracted: dict[str, Any] = {"error": "这个节点没有查成功的库，没有可以核对出处的数据"}
+        extracted: dict[str, Any] = {"error": "该节点没有成功的查询，没有可核对出处的数据"}
         if queries:
             extracted = await extract_step(_extract_messages(final_text, queries, fields), cited_schema(schema))
             for key in ("input_tokens", "output_tokens", "calls"):
@@ -790,7 +793,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if entries:
         updates["evidence"] = entries
     if ctx.cfg("emit_message", True):
-        updates["messages"] = [AIMessage(content=final_text or "(空)")]
+        updates["messages"] = [AIMessage(content=final_text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         # 开了 cite_fields 的，变量里是核对过的 data（值以快照为准），下游口径卡按字段取
@@ -1048,13 +1051,13 @@ def verify_cited_fields(extracted: dict[str, Any], fields: list[tuple[str, dict[
         if q["artifact"] not in snapshots:
             try:
                 content = load(q["artifact"])
-                snapshots[q["artifact"]] = (content, None if content is not None else "查询快照取不回来")
+                snapshots[q["artifact"]] = (content, None if content is not None else "查询快照无法读取")
             except ValueError:
-                snapshots[q["artifact"]] = (None, "查询快照和哈希对不上，疑似被改过")
+                snapshots[q["artifact"]] = (None, "查询快照与哈希不一致，可能已被修改")
         return snapshots[q["artifact"]]
 
     parsed = extracted.get("parsed")
-    failed = extracted.get("error") or (None if isinstance(parsed, dict) else "抽取结果不是一个对象")
+    failed = extracted.get("error") or (None if isinstance(parsed, dict) else "抽取结果格式有误（不是对象）")
     data: dict[str, Any] = {}
     evidence: dict[str, Any] = {}
     for path, sub in fields:
@@ -1064,7 +1067,7 @@ def verify_cited_fields(extracted: dict[str, Any], fields: list[tuple[str, dict[
             continue
         node = _dig(parsed, path)
         if not isinstance(node, dict) or "from" not in node:
-            evidence[path] = {"status": "unresolved", "reason": "抽取结果里没有按 {value, from} 写出这个字段"}
+            evidence[path] = {"status": "unresolved", "reason": "抽取结果中没有写出该字段的值和出处"}
             continue
         told, source = node.get("value"), node.get("from")
         if source is None:
@@ -1085,8 +1088,8 @@ def verify_cited_fields(extracted: dict[str, Any], fields: list[tuple[str, dict[
         q = by_alias.get(call)
         if q is None:
             evidence[path] = {"ref": ref, "call": call, "status": "unresolved",
-                              "reason": f"本节点没有 {call or '（空）'} 这次查询，能用的是 "
-                                        + ("、".join(by_alias) or "（没有）")}
+                              "reason": f"本节点没有编号为 {call or '（空）'} 的查询，可用的查询："
+                                        + ("、".join(by_alias) or "（无）")}
             continue
         base = {"ref": ref, "call": call, "artifact": q["artifact"], "via": q["via"]}
         content, why = snapshot_of(q)
@@ -1118,22 +1121,22 @@ def _verify_rows(schema: dict[str, Any], told: Any, source: Any, by_alias: dict[
                  snapshot_of: Any) -> tuple[Any, dict[str, Any]]:
     """数组字段：按 from 的行范围和列从快照里取出整组值，以快照为准。返回 (值, 出处)。"""
     if not isinstance(source, dict):
-        return None, {"status": "unresolved", "reason": "数组的 from 要写成 {call, rows, column（或 columns）}"}
+        return None, {"status": "unresolved", "reason": "数组字段的出处格式有误：缺少查询编号、行号范围或列名"}
     call = str(source.get("call") or "").strip()
     span = _ROWS.match(str(source.get("rows") or ""))
     fields = _row_columns(schema)
     wanted = source.get("columns") if fields is not None else source.get("column")
     if fields is not None and not (isinstance(wanted, dict) and all(isinstance(wanted.get(f), str) for f in fields)):
-        return None, {"call": call, "status": "unresolved", "reason": "对象数组要写 columns：每个字段取自哪一列"}
+        return None, {"call": call, "status": "unresolved", "reason": "对象数组的出处缺少各字段对应的列"}
     if fields is None and not isinstance(wanted, str):
-        return None, {"call": call, "status": "unresolved", "reason": "数组要写 column：这组值取自哪一列"}
+        return None, {"call": call, "status": "unresolved", "reason": "数组字段的出处缺少列名"}
     if span is None:
-        return None, {"call": call, "status": "unresolved", "reason": "rows 要写成 0-4 这样的行号范围（从 0 数）"}
+        return None, {"call": call, "status": "unresolved", "reason": "行号范围格式有误，应写成 0-4 这样的范围（从 0 开始）"}
     first, last = int(span.group(1)), int(span.group(2) or span.group(1))
     q = by_alias.get(call)
     if q is None or last < first:
-        reason = (f"rows 要从小到大写，写的是 {source.get('rows')}" if q is not None else
-                  f"本节点没有 {call or '（空）'} 这次查询，能用的是 " + ("、".join(by_alias) or "（没有）"))
+        reason = (f"行号范围需从小到大，当前为「{source.get('rows')}」" if q is not None else
+                  f"本节点没有编号为 {call or '（空）'} 的查询，可用的查询：" + ("、".join(by_alias) or "（无）"))
         return None, {"call": call, "status": "unresolved", "reason": reason}
     base = {"call": call, "artifact": q["artifact"], "via": q["via"]}
     content, why = snapshot_of(q)
@@ -1177,16 +1180,16 @@ def _field_warnings(data: dict[str, Any], evidence: dict[str, Any],
     out: list[tuple[str, str, list[str]]] = []
     mismatched = [(p, e) for p, e in evidence.items() if e.get("status") == "mismatch"]
     if mismatched:
-        detail = "；".join(f"{p} 模型报 {_shown(e.get('model_value'))}，快照是 {_shown(_dig(data, p))}"
+        detail = "；".join(f"{p} 模型给出 {_shown(e.get('model_value'))}，快照为 {_shown(_dig(data, p))}"
                           for p, e in mismatched[:6])
         out.append(("agent_field_mismatch",
-                    f"有 {len(mismatched)} 个字段和查询快照对不上，已按快照取值：{detail}", [p for p, _ in mismatched]))
+                    f"有 {len(mismatched)} 个字段与查询快照不一致，已按快照取值：{detail}", [p for p, _ in mismatched]))
     unresolved = [(p, e) for p, e in evidence.items() if e.get("status") == "unresolved"]
     if unresolved:
         if failed:
-            message = f"{failed}。{len(unresolved)} 个字段都记为空值（没有兜底成 0）"
+            message = f"{failed}。{len(unresolved)} 个字段都记为空值（未以 0 代替）"
         else:
             detail = "；".join(f"{p}（{e.get('reason')}）" for p, e in unresolved[:6])
-            message = f"有 {len(unresolved)} 个字段核对不了出处，记为空值（没有兜底成 0）：{detail}"
+            message = f"有 {len(unresolved)} 个字段无法核对出处，记为空值（未以 0 代替）：{detail}"
         out.append(("agent_field_unverified", message, [p for p, _ in unresolved]))
     return out

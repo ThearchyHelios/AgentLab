@@ -78,7 +78,7 @@ def test_unknown_role_is_refused(monkeypatch):
     ctx, sandbox = _ctx(monkeypatch, limits={}, evidence_role="fetch")
     with pytest.raises(NodeError) as info:
         _run(ctx)
-    assert "evidence_role" in str(info.value) and "source" in str(info.value)
+    assert "「证据角色」" in str(info.value) and "「取数」" in str(info.value)
     assert sandbox.calls == [], "角色写错了还去跑沙箱"
 
 

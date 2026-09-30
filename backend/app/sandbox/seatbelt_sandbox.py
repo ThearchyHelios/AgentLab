@@ -246,7 +246,7 @@ class SeatbeltSandbox(Sandbox):
                 timed_out=True,
                 exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout}s 被终止",
+                error=f"执行超过 {limits.timeout} 秒，已终止",
             )
 
         stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)

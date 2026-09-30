@@ -146,7 +146,7 @@ def test_removing_the_schema_of_a_cited_agent_is_refused():
     after = copy.deepcopy(before)
     config(after, "ask").pop("output_schema")
     [reason] = forbidden_changes(before, after)
-    assert "「查数助手」" in reason and "output_schema" in reason
+    assert "「查数助手」" in reason and "「结构化输出 Schema」" in reason
     config(after, "ask")["output_schema"] = {}
     assert forbidden_changes(before, after)
 
@@ -175,7 +175,7 @@ async def test_copilot_self_check_still_sees_report_policy_without_defaults(clie
     wf = await create(client, graph)
     await client.post(f"/api/workflows/{wf}/autofix", json={"level": "governed", "apply": [], "assist": True})
     human = next(text for role, text in model.calls[0] if role == "human")
-    assert "要写明" in human
+    assert "需要调整核对规则" in human
 
 
 def test_the_assist_rules_forbid_marking_sources_and_loosening_reports():

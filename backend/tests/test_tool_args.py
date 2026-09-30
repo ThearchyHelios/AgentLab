@@ -116,7 +116,7 @@ def test_every_problem_is_reported_at_once() -> None:
     with pytest.raises(ToolArgsError) as e:
         prepare_args(_QueryLike, {"query": "SELECT 1", "limit": "很多"})
     text = str(e.value)
-    assert "query 不是它的参数" in text
+    assert "query 不是该工具的参数" in text
     assert "limit 的值不合法" in text
 
 
@@ -125,7 +125,7 @@ def test_the_message_is_a_whole_sentence() -> None:
     for args in ({}, {"foo": 1, "bar": 2}, {"sql": "SELECT 1", "limit": "很多"}):
         with pytest.raises(ToolArgsError) as e:
             prepare_args(_QueryLike, args)
-        assert str(e.value).startswith("参数不对：")
+        assert str(e.value).startswith("参数有误：")
 
 
 # --------------------------------------------------------------------------

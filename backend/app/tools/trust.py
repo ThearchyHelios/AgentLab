@@ -92,7 +92,7 @@ async def set_trust(session: AsyncSession, key: str, level: str) -> None:
     from app.db.models import Setting
 
     if level not in TRUST_LEVELS:
-        raise ValueError(f"信任档位只能是 {'、'.join(TRUST_LEVELS)}，收到的是 {level!r}")
+        raise ValueError(f"信任档位只能是 {'、'.join(TRUST_LEVELS)}，当前为「{level}」")
     row = await session.get(Setting, SETTING_KEY)
     tools = dict(((row.value if row else None) or {}).get("tools") or {})
     if level == "ask":
@@ -165,7 +165,7 @@ def parse_verdict(text: str) -> tuple[bool, str] | None:
     if not isinstance(data, dict) or data.get("verdict") not in ("allow", "escalate"):
         return None
     reason = str(data.get("reason") or "").strip()[:300]
-    return data["verdict"] == "allow", reason or "（门控没写理由）"
+    return data["verdict"] == "allow", reason or "（门控未说明理由）"
 
 
 async def ask_gate(*, tool: BaseTool, args: dict[str, Any], node_title: str, task: str) -> GateVerdict:
@@ -197,9 +197,9 @@ async def ask_gate(*, tool: BaseTool, args: dict[str, Any], node_title: str, tas
             HumanMessage(content=gate_prompt(tool=tool, args=args, node_title=node_title, task=task)),
         ]), timeout=GATE_TIMEOUT_S)
     except asyncio.TimeoutError:
-        return done(False, f"门控模型没答上来：{GATE_TIMEOUT_S} 秒内没有回复")
+        return done(False, f"门控模型未给出判断：{GATE_TIMEOUT_S} 秒内没有回复")
     except Exception as e:  # noqa: BLE001 - 门控出任何错都不能变成放行
-        return done(False, f"门控模型没答上来：{describe_exception(e)}")
+        return done(False, f"门控模型未给出判断：{describe_exception(e)}")
 
     from app.providers import catalog
 
@@ -210,7 +210,7 @@ async def ask_gate(*, tool: BaseTool, args: dict[str, Any], node_title: str, tas
     content = reply.content if isinstance(reply.content, str) else json.dumps(reply.content, ensure_ascii=False)
     parsed = parse_verdict(content)
     if parsed is None:
-        return done(False, "门控模型没答上来：回复不是约定的 JSON 格式")
+        return done(False, "门控模型未给出判断：回复不是约定的 JSON 格式")
     return done(*parsed)
 
 

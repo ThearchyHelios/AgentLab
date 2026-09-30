@@ -62,6 +62,7 @@ const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 // 先跑快的、不开浏览器的，再按页面从外壳往里跑；最后是连真数据的两项
 const ORDER = [
   'tokens',          // 令牌、别名、原生对话框：纯静态扫源码
+  'copy',            // 界面文案的禁用写法：纯静态扫前后端源码
   'trace',           // 运行态内核的纯函数
   'decode',          // 事件翻译层
   'canvas-layout',   // 走线
@@ -83,7 +84,7 @@ const ORDER = [
 // 拆开的两项看 SPLIT 里各份的 est。2026-09-29 八道并行、关浏览器不干等之后的实测
 const ESTIMATE = {
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
-  evidence: 75, 'ui-kit': 67, ui: 61, guards: 8, 'canvas-layout': 2, tokens: 1, trace: 1, decode: 1,
+  evidence: 75, 'ui-kit': 67, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。
@@ -135,7 +136,9 @@ if (unknown.length) {
   process.exit(2)
 }
 const names = picked.length ? ORDER.filter((n) => picked.includes(n)) : ORDER
-const needsServers = names.some((n) => n !== 'tokens')
+// 纯静态的几项不用起服务
+const STATIC = new Set(['tokens', 'copy'])
+const needsServers = names.some((n) => !STATIC.has(n))
 
 // ---------------------------------------------------------------- 收尾
 //

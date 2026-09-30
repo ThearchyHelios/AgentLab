@@ -55,7 +55,7 @@ def supported_formats() -> dict[str, list[str]]:
 def _why(e: BaseException) -> str:
     """解析库的原话，去掉类名。它们常常是英文，但比"读不开"多一点线索。"""
     text = str(e).strip()
-    return (text.splitlines()[0][:120] if text else "") or "没有更多说明"
+    return (text.splitlines()[0][:120] if text else "") or "无更多说明"
 
 
 def _ext(filename: str) -> str:
@@ -68,14 +68,14 @@ def _from_pdf(raw: bytes) -> str:
         from pypdf import PdfReader
     except ImportError as e:
         raise UnsupportedDocument(
-            "要读 PDF 得先装解析库：pip install 'agentlab-backend[docs]'"
+            "解析 PDF 需要安装解析库：pip install 'agentlab-backend[docs]'"
         ) from e
     try:
         reader = PdfReader(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
         raise UnsupportedDocument(
-            f"这个 PDF 读不开：文件可能损坏、加了密码，或者其实不是 PDF（{_why(e)}）。"
-            "用原软件打开另存一份再传"
+            f"无法打开该 PDF：文件可能已损坏、设置了密码或并非 PDF（{_why(e)}）。"
+            "请用原软件另存后重新上传"
         ) from e
 
     # 按页拼，页与页之间留空行——切块是按段落切的，页边界正好是天然的段落边界
@@ -95,8 +95,8 @@ def _from_pdf(raw: bytes) -> str:
     text = "\n\n".join(cleaned)
     if not text.strip():
         raise UnsupportedDocument(
-            "这个 PDF 里没有可提取的文字——多半是扫描件。"
-            "扫描件要先过 OCR，这里不做图像识别。"
+            "该 PDF 中没有可提取的文字，可能是扫描件。"
+            "扫描件需要先进行 OCR 识别，这里不做图像识别。"
         )
     return text
 
@@ -106,14 +106,14 @@ def _from_docx(raw: bytes) -> str:
         import docx
     except ImportError as e:
         raise UnsupportedDocument(
-            "要读 Word 得先装解析库：pip install 'agentlab-backend[docs]'"
+            "解析 Word 需要安装解析库：pip install 'agentlab-backend[docs]'"
         ) from e
     try:
         doc = docx.Document(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
         raise UnsupportedDocument(
-            f"这个 Word 文档读不开：文件可能损坏、加了密码，或者其实不是 Word（{_why(e)}）。"
-            "用原软件打开另存一份再传"
+            f"无法打开该 Word 文档：文件可能已损坏、设置了密码或并非 Word（{_why(e)}）。"
+            "请用原软件另存后重新上传"
         ) from e
 
     parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
@@ -126,7 +126,7 @@ def _from_docx(raw: bytes) -> str:
                 parts.append(" | ".join(cells))
     text = "\n\n".join(parts)
     if not text.strip():
-        raise UnsupportedDocument("这个 Word 文档里没有文字内容")
+        raise UnsupportedDocument("该 Word 文档中没有文字内容")
     return text
 
 
@@ -135,14 +135,14 @@ def _from_pptx(raw: bytes) -> str:
         from pptx import Presentation
     except ImportError as e:
         raise UnsupportedDocument(
-            "要读 PowerPoint 得先装解析库：pip install 'agentlab-backend[docs]'"
+            "解析 PowerPoint 需要安装解析库：pip install 'agentlab-backend[docs]'"
         ) from e
     try:
         deck = Presentation(io.BytesIO(raw))
     except Exception as e:  # noqa: BLE001
         raise UnsupportedDocument(
-            f"这个 PowerPoint 读不开：文件可能损坏、加了密码，或者其实不是 PowerPoint（{_why(e)}）。"
-            "用原软件打开另存一份再传"
+            f"无法打开该 PowerPoint：文件可能已损坏、设置了密码或并非 PowerPoint（{_why(e)}）。"
+            "请用原软件另存后重新上传"
         ) from e
 
     slides: list[str] = []
@@ -168,8 +168,8 @@ def _from_pptx(raw: bytes) -> str:
     text = "\n\n".join(slides)
     if not text.strip():
         raise UnsupportedDocument(
-            "这个 PowerPoint 里没有可提取的文字——多半整页都是图片。"
-            "图里的字要先过 OCR，这里不做图像识别。"
+            "该 PowerPoint 中没有可提取的文字，可能整页都是图片。"
+            "图片中的文字需要先进行 OCR 识别，这里不做图像识别。"
         )
     return text
 
@@ -198,21 +198,21 @@ def extract(raw: bytes, filename: str, mime: str = "") -> str:
         return _from_html(raw)
     if ext in _TABULAR:
         raise UnsupportedDocument(
-            f"「{filename}」是表格，知识库不收表格。请到「数据源」点「传表格」导入："
-            "它会变成一张能用 SQL 查的表，数字是算出来的、查得到出自哪条查询。"
-            "放进知识库只能按文字检索，数字靠模型去读，容易读错，也追不到来源。"
+            f"「{filename}」是表格，知识库不接收表格。请到「数据」页的「表格」中点击「上传表格」导入："
+            "导入后会成为可用 SQL 查询的表，数字由查询计算得出，可追溯到具体查询。"
+            "放进知识库只能按文字检索，数字要由模型读取，容易读错，也无法追溯来源。"
         )
     if ext in _LEGACY_OFFICE:
         # 认出来再拒，而不是让它掉进下面那个"不是 UTF-8"的兜底——
         # 后者对着一个 .ppt 说"不是文本"，用户根本不知道该怎么办
         raise UnsupportedDocument(
-            f"读不了 {filename}：{_LEGACY_OFFICE[ext]} 的老二进制格式（{ext}）需要"
-            f"外部转换器才能解析。请在 Office 里另存为 {ext}x 再传。"
+            f"无法读取 {filename}：{_LEGACY_OFFICE[ext]} 的旧版二进制格式（{ext}）需要"
+            f"外部转换器才能解析。请在 Office 中另存为 {ext}x 后重新上传。"
         )
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as e:
         raise UnsupportedDocument(
-            f"读不了 {filename or '这个文件'}：它不是 UTF-8 文本，"
-            f"也不是认得出的 PDF / Word / PowerPoint / HTML。"
+            f"无法读取 {filename or '该文件'}：它不是 UTF-8 文本，"
+            f"也不是可识别的 PDF / Word / PowerPoint / HTML。"
         ) from e

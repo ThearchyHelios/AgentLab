@@ -309,7 +309,7 @@ async def test_dropping_tools_without_being_asked_is_called_out(client, monkeypa
     assert {i["node_id"] for i in dropped} == {"query_data", "review_team"}
     assert all(i["level"] == "warning" for i in dropped)
     text = next(i["message"] for i in dropped if i["node_id"] == "query_data")
-    assert "数据查询" in text and "db_query__shop、db_schema__shop" in text and "变成了空" in text
+    assert "数据查询" in text and "db_query__shop、db_schema__shop" in text and "变为无" in text
     text = next(i["message"] for i in dropped if i["node_id"] == "review_team")
     assert "取数员" in text and "db_query__shop" in text
 

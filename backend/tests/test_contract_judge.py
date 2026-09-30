@@ -7,7 +7,7 @@
 - judge 在挂引用这件事上和 require_citation 一样严：没挂依据的结论句照样计入缺口
 - 探索运行按需裁判：出口只标注（候选句都是「未裁判 · 按需」），不因判定改档位
 - 契约也能写 claims: judge：只能收紧（on_unsupported 取更严的）；报告节点没开 judge 的，照实记缺口
-- 升级前的运行照旧：契约写了也记「这一版还不支持」
+- 升级前的运行照旧：契约写了也只记一条缺口「报告生成于系统升级前，结论句未核对」
 """
 from __future__ import annotations
 
@@ -187,7 +187,7 @@ async def test_a_failed_judge_is_a_gap_not_a_withheld_report(monkeypatch):
     issuance = await issued(weekly(report={"judge": {"max_cost_usd": 0.05, "on_unsupported": "withhold"}}))
     assert issuance["tier"] == "degraded", "没判成不能盖完整出具，也不能当成「不支持」不予出具"
     [gap] = [g for g in issuance["gaps"] if "裁判" in g]
-    assert gap.startswith("报告「write」") and "没裁判" in gap and "网关 502" in gap
+    assert gap.startswith("报告「write」") and "未裁判" in gap and "网关 502" in gap
     assert issuance["claims"]["complete"] is False and issuance["claims"]["counts"]["unjudged"] == 2
 
 
@@ -196,7 +196,7 @@ async def test_hitting_a_limit_is_a_gap(monkeypatch):
     issuance = await issued(weekly(report={"judge": {"max_cost_usd": 0.05, "max_claims": 1}}))
     assert issuance["tier"] == "degraded"
     [gap] = [g for g in issuance["gaps"] if "裁判" in g]
-    assert "已到上限" in gap and "1 句" in gap
+    assert "已达上限" in gap and "1 句" in gap
     assert issuance["claims"]["limits_hit"] == ["max_claims"] and issuance["claims"]["counts"]["unjudged"] == 1
 
 
@@ -274,20 +274,20 @@ async def test_a_contract_asking_for_judge_on_a_report_without_it_is_a_gap(monke
     Models(monkeypatch)
     issuance = await issued(weekly(report={"claims": "require_citation"}, contract={"claims": "judge"}))
     assert issuance["tier"] == "degraded"
-    [gap] = [g for g in issuance["gaps"] if "judge" in g]
-    assert "「write」" in gap and "没有开" in gap and "这一版" not in gap
+    [gap] = [g for g in issuance["gaps"] if "模型裁判" in g]
+    assert "「write」" in gap and "未开启" in gap and "这一版" not in gap
     assert issuance["claims"]["policy"] == "require_citation"
 
 
 def test_a_run_in_flight_across_the_upgrade_keeps_the_old_gap():
-    """升级前写的报告（产出里没有 claims）碰上写了 judge 的契约：照旧记「这一版还不支持」，不判档。"""
+    """升级前写的报告（产出里没有 claims）碰上写了 judge 的契约：照旧只记一条缺口，不判档。"""
     from app.engine.nodes.io import _claims
 
     out = {"gaps": [], "claims_policy": None, "uncited": None, "claims": None, "unsupported": None}
     _claims(out, {"claims": {"policy": "judge", "on_unsupported": "withhold"}}, {"text": "x"}, evidence_on=True,
             uncited=[{"unit": "u1", "span": [0, 4], "text": "增长很快"}])
     assert out["claims_policy"] is None and out["claims"] is None and out["unsupported"] is None
-    assert len(out["gaps"]) == 1 and "这一版还不支持" in out["gaps"][0]
+    assert len(out["gaps"]) == 1 and "生成于系统升级前" in out["gaps"][0]
 
 
 async def test_runs_from_before_the_upgrade_ignore_judge(monkeypatch):

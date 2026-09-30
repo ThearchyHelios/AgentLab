@@ -36,7 +36,7 @@ export function ToolsPage() {
       <PageHeader
         icon={<Wrench size={13} />}
         title="工具"
-        subtitle="不用搭工作流就能单独试跑工具；自定义工具和 MCP 接进来后，节点里就能用"
+        subtitle="无需搭建工作流即可单独执行工具；接入自定义工具和 MCP 服务后，可在节点中直接使用"
       />
       <Tabs tabs={TABS} active={tab} onChange={setTab} label="工具" idPrefix="tools" />
       <TabPanel idPrefix="tools" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
@@ -82,10 +82,10 @@ function sampleOf(spec: any): any {
 
 /** 在工具库里直接执行时，它的副作用落在哪里。说实话：内置工具有围栏，外接的没有 */
 function sideEffectNote(tool: ToolInfo): string {
-  if (tool.source !== 'builtin') return '自定义 / MCP 工具的副作用由它自己决定，这里拦不住：它会真的发请求、真的改外部系统。'
-  if (tool.category === '文件') return '文件读写锁在 playground 工作目录里，碰不到别处。'
-  if (tool.category === '网络') return '内网、回环和云元数据地址会被拦下，公网请求会真的发出去。'
-  if (tool.category === '沙箱') return '代码在沙箱里跑，受沙箱的超时、内存和联网限制。'
+  if (tool.source !== 'builtin') return '自定义工具和 MCP 工具的副作用由工具自身决定，此处无法拦截：请求会实际发出，并可能修改外部系统。'
+  if (tool.category === '文件') return '文件读写限定在工作目录内，无法访问其他位置。'
+  if (tool.category === '网络') return '内网、回环和云元数据地址会被拦截，公网请求会实际发出。'
+  if (tool.category === '沙箱') return '代码在沙箱中执行，受沙箱的超时、内存和联网限制。'
   return ''
 }
 
@@ -194,8 +194,8 @@ function ToolLibrary() {
 
       <div className="min-w-0 flex-1 overflow-y-auto p-4">
         {!picked && (
-          <EmptyState icon={<Wrench size={22} />} title="选一个工具试试"
-                      body="不用搭工作流就能单独调用工具，验证参数和返回格式。" />
+          <EmptyState icon={<Wrench size={22} />} title="选择一个工具"
+                      body="无需搭建工作流即可单独执行工具，验证参数和返回格式。" />
         )}
         {picked && (
           <div className="max-w-2xl">
@@ -222,7 +222,7 @@ function ToolLibrary() {
                 <StatusBadge status="failed" size={13} decorative className="mt-0.5 shrink-0" />
                 <span className="min-w-0 flex-1">
                   <span className="font-medium" style={{ color: 'var(--st-failed)' }}>{picked.problem}</span>
-                  <span className="block text-dim">绑了它的节点运行时一定失败。先把参数定义改好，再在这里试。</span>
+                  <span className="block text-dim">绑定该工具的节点运行时一定失败。请先修正参数定义，再回到此处执行。</span>
                 </span>
                 <button className="btn btn-sm shrink-0" onClick={() => navigate(customToolEditPath(picked.name))}>去改参数定义</button>
               </div>
@@ -233,7 +233,7 @@ function ToolLibrary() {
                    style={{ borderColor: 'color-mix(in srgb, var(--warn) 40%, var(--border))', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
                 <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
                 <span>
-                  这里直接执行，不经审批：执行前会先说明它要做什么，确认后才跑。{sideEffectNote(picked)}
+                  此处直接执行，不经审批：执行前会先说明具体操作，确认后才会执行。{sideEffectNote(picked)}
                 </span>
               </div>
             )}
@@ -285,9 +285,9 @@ function ToolLibrary() {
  */
 function ProblemChip({ problem }: { problem: string }) {
   return (
-    <span className="chip shrink-0" data-tool-problem title={problem} aria-label={`参数定义写坏了：${problem}`}
+    <span className="chip shrink-0" data-tool-problem title={problem} aria-label={`参数定义有误：${problem}`}
           style={{ color: 'var(--st-failed)', borderColor: 'color-mix(in srgb, var(--st-failed) 45%, transparent)', background: 'var(--st-failed-soft)' }}>
-      <StatusBadge status="failed" size={10} decorative />参数定义写坏了
+      <StatusBadge status="failed" size={10} decorative />参数定义有误
     </span>
   )
 }
@@ -314,7 +314,7 @@ function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean })
     return (
       <span className="chip shrink-0" style={{ color: 'var(--st-waiting)', borderColor: 'color-mix(in srgb, var(--st-waiting) 40%, transparent)' }}
             data-trust-badge={trust ? 'ask' : undefined}
-            title="在工作流里跑到它会停下来等人工审批（审批策略为「危险工具」时）。在工具库里直接执行不经审批，执行前会先说明它要做什么。">
+            title="工作流运行到该工具时会暂停，等待人工审批（审批策略为「危险工具」时）。在工具库中直接执行不经审批。">
         <StatusBadge status="waiting" size={10} decorative />{TOOL_TRUST_TEXT.badgeAsk}
       </span>
     )
@@ -322,8 +322,8 @@ function ApprovalTag({ tool, long = false }: { tool: ToolInfo; long?: boolean })
   if (tool.source !== 'builtin') {
     return (
       <span className="chip shrink-0 border-dashed"
-            title="自定义工具和 MCP 工具在工作流里运行时不会停下来等审批：审批关卡还认不出它们。有副作用的话在节点上另行把关。">
-        运行时不审批{long ? ' · 副作用自负' : ''}
+            title="自定义工具和 MCP 工具在工作流中执行时不会暂停等待审批：审批机制目前无法识别这类工具。如有副作用，请在节点上另行控制。">
+        运行时不审批{long ? ' · 副作用需自行把控' : ''}
       </span>
     )
   }
@@ -413,7 +413,7 @@ function ToolResult({ result, stale = false }: { result: any; stale?: boolean })
         <StatusBadge status={failed ? 'failed' : 'done'} size={12} decorative />
         <span style={{ color: failed ? 'var(--err)' : 'var(--text-dim)' }}>{failed ? '失败' : '成功'}</span>
         {result.duration_ms != null && <span className="tnum text-faint">· {formatDuration(result.duration_ms)}</span>}
-        {stale && <span className="text-faint">· 配置或参数改过了，这是改之前的结果</span>}
+        {stale && <span className="text-faint">· 配置或参数已修改，这是修改前的结果</span>}
       </div>
       {result.note && (
         <div className="mb-1.5 flex items-start gap-1.5 rounded-md border px-2 py-1.5 text-xs leading-relaxed" data-tool-note
@@ -421,7 +421,7 @@ function ToolResult({ result, stale = false }: { result: any; stale?: boolean })
           <AlertTriangle size={12} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
           <span>
             <span className="text-[var(--warn)]">{String(result.note).replace(/[。.]\s*$/, '')}</span>
-            <span className="text-dim">。这次按纠正后的名字跑了，往工作流里抄参数前先把名字改对</span>
+            <span className="text-dim">。本次已按纠正后的名称执行；在工作流中使用前，请先修正参数名称</span>
           </span>
         </div>
       )}
@@ -473,10 +473,10 @@ function SandboxLab() {
   }
 
   // 没有退出码就是请求没到沙箱，别拼出「exit undefined」
-  const headline = !result ? '' : result.thrown ? '请求没到沙箱'
+  const headline = !result ? '' : result.thrown ? '请求未送达沙箱'
     : result.ok ? '成功'
     : result.timed_out ? `超过 ${sentTimeout.current} 秒被终止`
-    : result.exit_code == null ? '请求没到沙箱'
+    : result.exit_code == null ? '请求未送达沙箱'
     : `失败 · 退出码 ${result.exit_code}`
 
   return (
@@ -553,7 +553,7 @@ function SandboxLab() {
 /** 新建工具时参数的起手式：一个必填的字符串参数，URL 模板里正好能插它 */
 const PARAMS_EXAMPLE = {
   type: 'object',
-  properties: { query: { type: 'string', description: '要查的关键词' } },
+  properties: { query: { type: 'string', description: '查询关键词' } },
   required: ['query'],
 }
 const PARAMS_NONE = { type: 'object', properties: {}, required: [] }
@@ -576,7 +576,7 @@ function CustomTools() {
     if (!wanted || !rows) return
     const row = rows.find((r) => r.name === wanted)
     if (row) setEditing(row)
-    else toast.warn(`没有叫「${wanted}」的自定义工具，可能已经被删了或改了名`)
+    else toast.warn(`未找到名为「${wanted}」的自定义工具，可能已被删除或重命名`)
     setParams((p) => { p.delete('edit'); return p }, { replace: true })
   }, [wanted, rows])
 
@@ -606,7 +606,7 @@ function CustomTools() {
 
   return (
     <div className="mx-auto max-w-4xl p-4">
-      <SectionBar title="自定义工具" hint="HTTP 模板，或跑在沙箱里的一段 Python。启用后出现在工具库，节点里按名字引用。">
+      <SectionBar title="自定义工具" hint="HTTP 模板，或在沙箱中执行的 Python 代码。启用后出现在工具库，节点中按名称引用。">
         <button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 新建工具</button>
       </SectionBar>
 
@@ -616,7 +616,7 @@ function CustomTools() {
         <EmptyState
           icon={<Wrench size={22} />}
           title="还没有自定义工具"
-          body="把 MES、ERP 的查询接口包成工具，模型就能按需调用。写好参数说明，不用先保存就能试跑。"
+          body="把业务系统的查询接口封装成工具，模型即可按需调用。写好参数说明，无需保存即可试运行。"
           action={<button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 新建工具</button>}
         />
       ) : (
@@ -637,13 +637,13 @@ function CustomTools() {
                 </div>
                 {row.problem
                   ? <div className="truncate text-xs" style={{ color: 'var(--st-failed)' }} title={row.problem}>{row.problem}</div>
-                  : <div className="truncate text-xs text-faint">{row.description || '没写描述：模型不知道什么时候该用它'}</div>}
+                  : <div className="truncate text-xs text-faint">{row.description || '未填写描述：模型无法判断何时调用该工具'}</div>}
               </div>
               <TrustControl tool={trustOf(row)} />
               <button className="btn btn-sm" disabled={!row.enabled}
-                      title={row.enabled ? '去工具库里带参数试跑' : '停用的工具不在工具库里'}
+                      title={row.enabled ? '到工具库中带参数试运行' : '已停用的工具不在工具库中'}
                       onClick={() => navigate(`/tools/library/${row.name}`)}>
-                <Play size={11} aria-hidden /> 试跑
+                <Play size={11} aria-hidden /> 试运行
               </button>
               <button className="btn btn-sm btn-ghost" onClick={() => setEditing(row)}>编辑</button>
               <DeleteButton label={`删除自定义工具 ${row.name}`} onClick={() => remove(row)} />
@@ -701,7 +701,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
     })
   }
 
-  const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能用英文字母、数字、下划线，不能以数字开头' : null
+  const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能包含英文字母、数字和下划线，且不能以数字开头' : null
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
   const missingConfig = [form.kind === 'http' && !form.config.url && 'URL', form.kind === 'python' && !form.config.code && '代码']
     .filter(Boolean) as string[]
@@ -757,9 +757,9 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
            </>}>
       <div className="space-y-3">
         <div className="grid grid-cols-[1fr_180px] gap-3">
-          <Field label="名称" required error={nameError} hint="英文，模型按这个名字调用">
+          <Field label="名称" required error={nameError} hint="英文名称，模型按此名称调用">
             {(p) => (
-              <input {...p} className="field mono" value={form.name} placeholder="query_mes_order" spellCheck={false}
+              <input {...p} className="field mono" value={form.name} placeholder="query_order_status" spellCheck={false}
                      onChange={(e) => setForm({ ...form, name: e.target.value })} />
             )}
           </Field>
@@ -772,22 +772,22 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
             )}
           </Field>
         </div>
-        <Field label="描述" hint="模型据此决定什么时候用它，写清楚很重要">
+        <Field label="描述" hint="模型据此判断何时调用，请写清楚">
           {(p) => (
             <textarea {...p} className="field" rows={2} value={form.description}
-                      placeholder="按订单号查 MES 里的生产进度，返回工序和完成数量"
+                      placeholder="按订单号查询订单状态，返回当前环节和更新时间"
                       onChange={(e) => setForm({ ...form, description: e.target.value })} />
           )}
         </Field>
         <div ref={paramsRef} data-params-field>
-        <Field label="参数 JSON Schema" hint="每个参数写清 description：模型照着它填值" error={paramsError}>
+        <Field label="参数 JSON Schema" hint="为每个参数写清 description，模型据此填值" error={paramsError}>
           {(p) => (
             <>
               <JsonInput key={paramsKey} {...p} value={form.parameters} rows={7}
                          onChange={(v) => { setParamsError(null); setForm((f: any) => ({ ...f, parameters: v })) }} />
               {noParams && (
                 <div className="mt-1 flex items-center gap-2 text-2xs text-faint">
-                  <span>现在不收参数：模型调用它时什么都不传</span>
+                  <span>当前无参数：模型调用时不传入任何参数</span>
                   <button type="button" className="btn btn-xs"
                           onClick={() => { setParamsError(null); setForm((f: any) => ({ ...f, parameters: PARAMS_EXAMPLE })); setParamsKey((k) => k + 1) }}>
                     <Wand2 size={11} aria-hidden /> 插入示例参数
@@ -810,7 +810,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
                   </select>
                 )}
               </Field>
-              <Field label={<>URL <span className="font-normal text-faint">（可以用 {'{{ 参数名 }}'} 插值）</span></>} required>
+              <Field label={<>URL <span className="font-normal text-faint">（可用 {'{{ 参数名 }}'} 插值）</span></>} required>
                 {(p) => (
                   <input {...p} className="field mono text-xs" value={form.config.url ?? ''}
                          placeholder="https://api.example.com/search?q={{ query }}"
@@ -821,7 +821,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
             <label className="flex items-center gap-1.5 text-xs">
               <input type="checkbox" checked={!!form.config.parse_json}
                      onChange={(e) => setConfig({ parse_json: e.target.checked })} />
-              把响应按 JSON 解析
+              按 JSON 解析响应
             </label>
             <Field label="请求头">
               {(p) => <JsonInput id={p.id} value={form.config.headers ?? {}} rows={3} onChange={(v) => setConfig({ headers: v })} />}
@@ -831,7 +831,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
             </Field>
           </>
         ) : (
-          <Field label="Python 代码" required hint="参数在 args 变量里，用 print 输出结果">
+          <Field label="Python 代码" required hint="参数位于 args 变量中，用 print 输出结果">
             {(p) => (
               <textarea {...p} className="field mono text-xs" rows={10} spellCheck={false}
                         value={form.config.code ?? ''}
@@ -848,24 +848,24 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
 
         <div className="rounded-lg border bg-bg p-2.5" data-tool-trial>
           <div className="mb-1.5 flex items-center gap-2">
-            <span className="text-xs font-medium">试跑</span>
+            <span className="text-xs font-medium">试运行</span>
             <span className="text-2xs text-faint">
               {!row.id
-                ? '用眼前这份配置跑一次，不用先保存'
-                : dirty ? '跑的是眼前这份（含没保存的改动），已保存的版本不受影响' : '带上参数跑一次，看返回的样子'}
+                ? '使用当前配置试运行，无需先保存'
+                : dirty ? '使用当前配置（含未保存的改动），已保存的版本不受影响' : '传入参数试运行，查看返回结果'}
             </span>
             <button className="btn btn-xs ml-auto" onClick={() => setArgs(exampleArgs(form.parameters, true))}
-                    title="按参数 Schema 重新填示例">
-              <Wand2 size={11} aria-hidden /> 按 Schema 填
+                    title="按参数 Schema 重新填充示例">
+              <Wand2 size={11} aria-hidden /> 按 Schema 填充示例
             </button>
           </div>
           <JsonInput value={args} onChange={setArgs} rows={3} placeholder="{}" />
           <button className="btn btn-sm tnum mt-2" disabled={!!trial?.since || missingConfig.length > 0}
-                  title={missingConfig.length ? `还缺：${missingConfig.join('、')}` : '用眼前这份配置和参数跑一次，不保存'}
+                  title={missingConfig.length ? `还缺：${missingConfig.join('、')}` : '使用当前配置和参数试运行，不保存'}
                   onClick={() => void tryIt()}>
             {trial?.since
-              ? <><Spinner size={11} /> 试跑中 {formatDuration(clock - trial.since)}</>
-              : <><Play size={11} aria-hidden /> 试跑</>}
+              ? <><Spinner size={11} /> 试运行中 {formatDuration(clock - trial.since)}</>
+              : <><Play size={11} aria-hidden /> 试运行</>}
           </button>
           {trial?.result && <ToolResult result={trial.result} stale={trial.sig !== trialSig} />}
         </div>
@@ -933,8 +933,8 @@ function McpServers() {
       title: `删除 MCP 服务「${row.name}」？`,
       danger: true,
       consequences: [
-        row.tools_cache?.length ? `它的 ${row.tools_cache.length} 个工具从工具库消失` : '',
-        using.length ? `${workflowList(using)}用到了它的工具，运行到那一步会失败` : '眼下没有工作流用到它的工具',
+        row.tools_cache?.length ? `该服务的 ${row.tools_cache.length} 个工具将从工具库移除` : '',
+        using.length ? `${workflowList(using)}使用了该服务的工具，运行到相应步骤时会失败` : '目前没有工作流使用该服务的工具',
       ].filter(Boolean),
       confirmLabel: '删除服务',
     })
@@ -959,7 +959,7 @@ function McpServers() {
         hint={<>接入后工具出现在工具库，节点里用 <code className="mono">mcp:服务名/工具名</code> 引用。</>}
       >
         <button className="btn btn-sm" onClick={() => void reloadAll()} disabled={reloading}
-                title="重连所有启用的服务，刷新它们的工具清单">
+                title="重新连接所有已启用的服务，并刷新工具清单">
           {reloading ? <Spinner size={11} /> : <RefreshCw size={12} aria-hidden />} 重新加载
         </button>
         <button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 添加服务</button>
@@ -971,7 +971,7 @@ function McpServers() {
         <EmptyState
           icon={<Plug size={22} />}
           title="还没有接入 MCP 服务"
-          body="文件系统、数据库、浏览器自动化这类现成的 MCP server，接进来就是一组新工具。"
+          body="接入文件系统、数据库、浏览器自动化等现成的 MCP 服务，即可获得一组新工具。"
           action={<button className="btn btn-primary btn-sm" onClick={create}><Plus size={12} aria-hidden /> 添加服务</button>}
         />
       ) : (
@@ -1035,7 +1035,7 @@ function McpCard({ row, onEdit, onRemove, onProbed }: {
         <HealthPill record={shown} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
           <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void probe()}>
-            <Plug size={11} aria-hidden /> 测试
+            <Plug size={11} aria-hidden /> 测试连接
           </button>
           <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
           <DeleteButton label={`删除 MCP 服务 ${row.name}`} onClick={onRemove} />

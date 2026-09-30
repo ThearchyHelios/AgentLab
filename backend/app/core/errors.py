@@ -10,7 +10,7 @@
 运行记录里是两句话。现在认异常的规则只有下面这一张表，两个入口只在一件事上分叉：
 TypeError、KeyError 这类「程序自己的毛病」——
 
-- 接口里冒出来的，是后端的 bug，原文里全是内部符号，说「后端内部出错了」；
+- 接口里冒出来的，是后端的 bug，原文里全是内部符号，说「服务端内部错误」；
 - 节点里冒出来的，多半是工具被传错了参数、用户代码取错了字段，说清是哪个参数、
   哪个字段，模型和人才知道该改什么。
 
@@ -81,8 +81,16 @@ def _scrub(text: str) -> str:
     return " ".join(text.split())[:240]
 
 
-def _known(e: BaseException, *, sniff: bool) -> tuple[str, str] | None:
-    """两种场景说法一样的那些：鉴权、找不到、限流、对方故障、超时、网络、格式、文件。
+#: classify() 的返回值：错误属于哪一类。调用方按类别给场景专用的说法（比如测数据库连接时，
+#: 网络不通要说主机和端口，不说 API），不要拿 explain() 返回的文字做比较——文字会改，类别不会
+AUTH, NOT_FOUND, RATE_LIMIT, SERVER, TIMEOUT, NETWORK = "auth", "not_found", "rate_limit", "server", "timeout", "network"
+BAD_JSON, VALIDATION, PERMISSION, FILE_MISSING, OVERFLOW, BUG = (
+    "bad_json", "validation", "permission", "file_missing", "overflow", "bug")
+
+
+def _known(e: BaseException, *, sniff: bool) -> tuple[str, str, str] | None:
+    """两种场景说法一样的那些：鉴权、找不到、限流、服务方故障、超时、网络、格式、文件。
+    返回 (类别, 原因, 怎么办)。
 
     sniff：类名认不出时要不要按原文字面猜。SDK 抛出来的裸异常要猜（原文就是
     "Connection refused"）；执行层的异常常常是已经拼好的一句话、里头套着具体原因，
@@ -94,42 +102,52 @@ def _known(e: BaseException, *, sniff: bool) -> tuple[str, str] | None:
 
     if status in (401, 403) or names & _AUTH or "invalid api key" in low or "unauthorized" in low:
         code = f"（{status}）" if status else ""
-        return (f"鉴权没通过{code}：对方拒绝了这把密钥",
-                "核对 API Key 有没有填错、过期，或者这个账号有没有这个模型的权限")
+        return (AUTH, f"鉴权失败{code}：服务方拒绝了当前 API Key",
+                "请检查 API Key 是否填写正确、是否过期，以及该账号是否有权使用此模型")
     if status == 404 or "NotFoundError" in names:
-        return "对方说找不到（404）", "核对地址的路径（常见的是少了或多了 /v1）和模型名"
+        return (NOT_FOUND, "请求的地址或模型不存在（404）",
+                "请检查地址路径（常见问题是多了或少了 /v1）和模型名")
     if status == 429 or "RateLimitError" in names:
-        return "请求太频繁，或者额度用完了（429）", "等一会儿再试；频繁出现就检查账号额度"
+        return RATE_LIMIT, "请求过于频繁或额度已用完（429）", "请稍后重试；频繁出现时请检查账号额度"
     if isinstance(status, int) and status >= 500:
-        return f"对方服务出错了（HTTP {status}）", "这是对方的问题，多半是暂时的，稍后再试"
+        return SERVER, f"服务方内部错误（HTTP {status}）", "通常是暂时性故障，请稍后重试"
     if isinstance(e, TimeoutError) or names & _TIMEOUT or "timed out" in low:
-        return ("等待超时：对方没有在限定时间内响应",
-                "对方可能很忙或者网络不稳，稍后再试；一直超时就检查地址和网络")
+        return (TIMEOUT, "等待超时：服务方未在限定时间内响应",
+                "服务方可能繁忙或网络不稳定，请稍后重试；持续超时请检查地址和网络")
     if isinstance(e, ConnectionError) or names & _NETWORK or any(s in low for s in _UNREACHABLE):
-        return ("连不上对方的服务：网络不通，或者服务没有启动",
-                "核对地址和端口，确认服务已经启动、这台机器访问得到它")
+        return (NETWORK, "无法连接服务：网络不通或服务未启动",
+                "请检查地址和端口，确认服务已启动且本机可以访问")
     if isinstance(e, json.JSONDecodeError):
-        return "返回的内容不是合法的 JSON", "地址多半指到了网页而不是 API，核对 Base URL"
+        return BAD_JSON, "返回内容不是合法的 JSON", "地址可能指向了网页而非 API，请检查 Base URL"
     if "ValidationError" in names and callable(getattr(e, "errors", None)):
-        return f"参数不对：{_first_validation(e)}", ""
+        return VALIDATION, f"参数有误：{_first_validation(e)}", ""
     if isinstance(e, PermissionError):
-        return "没有权限访问需要的文件或资源", ""
+        return PERMISSION, "没有权限访问所需的文件或资源", ""
     if isinstance(e, FileNotFoundError):
-        return f"找不到文件{'「' + str(e.filename) + '」' if e.filename else ''}", ""
+        return FILE_MISSING, f"找不到文件{'「' + str(e.filename) + '」' if e.filename else ''}", ""
     if isinstance(e, (OverflowError, MemoryError)):
         text = str(e).strip()
-        return f"数据超出了能处理的范围{'：' + _scrub(text) if text else ''}", ""
+        return OVERFLOW, f"数据超出了可处理的范围{'：' + _scrub(text) if text else ''}", ""
     return None
 
 
-def explain(e: BaseException) -> tuple[str, str]:
-    """接口层：(原因, 怎么办)。原因是一句人话；说不出怎么办时第二项是空串。"""
+def classify(e: BaseException) -> str | None:
+    """错误属于哪一类（上面那组常量），认不出返回 None。和 explain() 的判断是同一套规则。"""
     known = _known(e, sniff=True)
     if known:
-        return known
+        return known[0]
+    return BUG if _names(e) & _BUG else None
+
+
+def explain(e: BaseException) -> tuple[str, str]:
+    """接口层：(原因, 怎么办)。原因是一句人话；说不出怎么办时第二项是空串。
+    要按错误类别换说法的，用 classify() 拿类别，不要比较这里返回的文字。"""
+    known = _known(e, sniff=True)
+    if known:
+        return known[1], known[2]
     if _names(e) & _BUG:
-        return "后端内部出错了", "这不是你操作的问题；把技术细节发给维护者"
-    return first_line(e) or "出了一个没有说明的错误", ""
+        return "服务端内部错误", "与你的操作无关，请将技术细节提供给维护者"
+    return first_line(e) or "发生了未说明原因的错误", ""
 
 
 def describe_exception(e: BaseException) -> str:
@@ -137,7 +155,7 @@ def describe_exception(e: BaseException) -> str:
     text = str(e).strip()
     if isinstance(e, TypeError):
         if m := re.search(r"unexpected keyword argument '(\w+)'", text):
-            return f"参数对不上：它不接受名为「{m.group(1)}」的参数"
+            return f"参数不匹配：不接受名为「{m.group(1)}」的参数"
         if m := re.search(r"missing \d+ required (?:positional |keyword-only )?arguments?: (.+)$", text):
             wanted = "、".join(re.findall(r"'(\w+)'", m.group(1))) or m.group(1)
             return f"缺少必填参数「{wanted}」"
@@ -145,8 +163,8 @@ def describe_exception(e: BaseException) -> str:
         return f"缺少字段「{e.args[0] if e.args else '?'}」"
     known = _known(e, sniff=False)
     if known:
-        return known[0]
-    return _scrub(text) or "没有给出原因的内部错误"
+        return known[1]
+    return _scrub(text) or "内部错误（未提供原因）"
 
 
 def message(e: BaseException, lead: str = "") -> str:
@@ -162,9 +180,14 @@ def payload(e: BaseException, lead: str = "") -> dict[str, Any]:
     return {"ok": False, "error": f"{lead}{reason}", "hint": hint, "detail": raw(e)}
 
 
-def not_configured(e: BaseException) -> str:
-    """模型接入没配好时的原话用的是内部叫法（provider 'x'、base_url），换成设置页上的说法。"""
-    text = re.sub(r"provider '([^']*)'", r"模型接入「\1」", str(e))
+def not_configured(e: BaseException, *, with_hint: bool = True) -> str:
+    """模型接入没配好（ProviderNotConfigured）给用户看的那句话。运行失败原因、助手、设置页都经过这里。
+
+    with_hint=False 只要「缺了什么」、不要「去哪里补」：设置页的测试弹窗本来就在接入的编辑框里，
+    助手那边自己另说去哪里。别处抛的同类异常（没有 reason 字段）原话里可能还是内部叫法
+    （provider 'x'、base_url），一并换成设置页上的说法。"""
+    text = str(e) if with_hint else str(getattr(e, "reason", "") or e)
+    text = re.sub(r"provider '([^']*)'", r"模型接入「\1」", text)
     text = re.sub(r"模型 '([^']*)'", r"模型「\1」", text)
     return text.replace("base_url", "Base URL").rstrip("。")
 
@@ -179,7 +202,9 @@ def _first_validation(e: Any) -> str:
     msg = str(err.get("msg") or "").removeprefix("Value error, ")
     if _has_cjk(msg):
         return msg
-    return f"「{loc}」{'缺了' if err.get('type') == 'missing' else '格式不对'}" if loc else "格式不对"
+    if not loc:
+        return "格式有误"
+    return f"缺少「{loc}」" if err.get("type") == "missing" else f"「{loc}」格式有误"
 
 
 def graph_error(e: BaseException) -> str:
@@ -200,12 +225,12 @@ def graph_error(e: BaseException) -> str:
         where = f"第 {loc[1] + 1} 个{'节点' if loc[0] == 'nodes' else '连线'}"
         field = str(loc[2]) if len(loc) > 2 else ""
         if err.get("type") == "enum" and field == "type":
-            return f"{where}的类型「{err.get('input')}」不认识{more}"
+            return f"{where}的类型「{err.get('input')}」无法识别{more}"
         if err.get("type") == "missing":
-            return f"{where}缺了「{field}」{more}"
+            return f"{where}缺少「{field}」{more}"
         if _has_cjk(msg):
             return f"{where}：{msg}{more}"
-        return f"{where}的「{field or '内容'}」格式不对{more}"
+        return f"{where}的「{field or '内容'}」格式有误{more}"
     if _has_cjk(msg):
         return msg + more
-    return f"「{'.'.join(str(p) for p in loc) or '整体'}」格式不对{more}"
+    return f"「{'.'.join(str(p) for p in loc) or '整体'}」格式有误{more}"

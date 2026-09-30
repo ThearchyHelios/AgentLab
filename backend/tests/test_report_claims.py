@@ -148,7 +148,7 @@ async def test_other_values_are_refused(monkeypatch, value):
     lenient(monkeypatch)
     row = await finish(weekly(claims=value))
     assert row.status == "failed", row.error
-    assert claims_problem(value) in row.error and "require_citation" in row.error
+    assert claims_problem(value) in row.error and "「计入缺口」" in row.error
 
 
 async def test_runs_from_before_the_upgrade_are_untouched(monkeypatch):

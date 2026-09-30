@@ -91,8 +91,8 @@ async def _real_ips(host: str) -> tuple[str, ...]:
             if nxdomain:
                 break
     if nxdomain:
-        raise UnsafeUrlError(f"{host} 在公共 DNS 里查不到（本机只解析到代理的 fake-ip 假地址），已拦截")
-    raise UnsafeUrlError(f"{host} 解析到代理的 fake-ip 假地址，而且没能向公共 DNS 核实真实地址，已拦截")
+        raise UnsafeUrlError(f"{host} 在公共 DNS 中无法解析（本机只解析到代理分配的虚拟地址），已拦截")
+    raise UnsafeUrlError(f"{host} 解析到代理分配的虚拟地址，且未能向公共 DNS 核实真实地址，已拦截")
 
 
 async def assert_safe_url(url: str) -> str:
@@ -108,17 +108,17 @@ async def assert_safe_url(url: str) -> str:
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise UnsafeUrlError(f"只支持 http/https，收到 {parsed.scheme!r}")
+        raise UnsafeUrlError(f"只支持 http/https，当前为「{parsed.scheme}」")
     host = parsed.hostname
     if not host:
-        raise UnsafeUrlError("URL 里没有主机名")
+        raise UnsafeUrlError("URL 中没有主机名")
     if parsed.port in _BLOCKED_PORTS:
         raise UnsafeUrlError(f"端口 {parsed.port} 不允许访问")
 
     allowlist = settings.http_tool_allowlist
     if allowlist:
         if not any(host == d or host.endswith("." + d) for d in allowlist):
-            raise UnsafeUrlError(f"{host} 不在白名单里（AGENTLAB_HTTP_TOOL_ALLOWLIST）")
+            raise UnsafeUrlError(f"{host} 不在允许访问的域名列表中（AGENTLAB_HTTP_TOOL_ALLOWLIST）")
 
     # 逐个解析结果都要查：一个域名可能同时解析到公网和内网地址
     try:
@@ -142,9 +142,9 @@ async def assert_safe_url(url: str) -> str:
         if _is_private(ip):
             hint = ""
             if not fake and _in(ip, [_COMMON_FAKE_IP]):
-                hint = ("。198.18.x.x 通常是本机代理 fake-ip 模式给的假地址：可以设置 "
-                        "AGENTLAB_HTTP_TOOL_FAKE_IP_RANGES=198.18.0.0/15 让它向公共 DNS 核实真实地址，"
-                        "或者把代理的 DNS 改成 redir-host、把这个域名加进 fake-ip-filter")
+                hint = ("。198.18.x.x 通常是本机代理 fake-ip 模式分配的虚拟地址：可设置 "
+                        "AGENTLAB_HTTP_TOOL_FAKE_IP_RANGES=198.18.0.0/15，改为向公共 DNS 核实真实地址；"
+                        "或将代理的 DNS 改为 redir-host，并把该域名加入 fake-ip-filter")
             raise UnsafeUrlError(f"{host} 解析到内网地址 {ip}，已拦截{hint}")
 
     if needs_check:

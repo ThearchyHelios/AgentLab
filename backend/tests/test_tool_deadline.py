@@ -148,7 +148,7 @@ async def test_an_agent_gets_control_back_when_the_limit_is_reached(monkeypatch)
         f"时限 {LIMIT}s，却等到了驱动收尾：{end['duration_ms']}ms"
     assert end.get("timed_out") is True, end
     # 模型要知道是超时、超了多久，才会去缩小查询范围
-    assert seen and "0.3" in seen[0] and "放弃" in seen[0], seen
+    assert seen and "0.3" in seen[0] and "停止等待" in seen[0], seen
 
 
 async def test_a_tool_node_reports_the_real_limit(monkeypatch):
@@ -160,7 +160,7 @@ async def test_a_tool_node_reports_the_real_limit(monkeypatch):
         node("out", "output", fields=[]),
     ))
     assert row.status == "failed"
-    assert "0.3" in (row.error or "") and "放弃" in (row.error or ""), row.error
+    assert "0.3" in (row.error or "") and "停止等待" in (row.error or ""), row.error
     start = next(e.data for e in events if e.type == "tool.start")
     assert start["timeout_s"] == LIMIT
     err = next(e.data for e in events if e.type == "tool.error")
@@ -245,7 +245,7 @@ async def test_a_slow_query_is_abandoned_on_time(slow_source, monkeypatch):
     assert start["timeout_s"] == 1, start
     end = next(e.data for e in events if e.type in ("tool.end", "tool.error"))
     assert end["duration_ms"] < 3000, f"1s 的查询时限等了 {end['duration_ms']}ms"
-    assert "1s" in end["preview"], end
+    assert "1 秒" in end["preview"], end
 
 
 def test_where_each_limit_comes_from():

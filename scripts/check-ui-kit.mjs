@@ -17,6 +17,7 @@
 // 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000。对别的实例（比如一份
 // 沙箱拷贝）跑时带上地址：
 //   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-ui-kit.mjs
+import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -115,9 +116,9 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     eq('0 是 0 ms 不是 —', f.formatDuration(0), '0 ms')
     eq('计时器 mm:ss.s', f.formatClock(74_310), '01:14.3')
     eq('计时器过小时', f.formatClock(3_723_400), '1:02:03.4')
-    eq('tokens 千分位', f.formatTokens(56034), '56,034 tokens')
-    eq('tokens 紧凑', f.formatTokens(56034, { compact: true }), '56.0k tok')
-    eq('tokens 紧凑进位到 M', f.formatTokens(999_950, { compact: true }), '1.0M tok')
+    eq('token 千分位', f.formatTokens(56034), '56,034 token')
+    eq('token 紧凑', f.formatTokens(56034, { compact: true }), '56.0k token')
+    eq('token 紧凑进位到 M', f.formatTokens(999_950, { compact: true }), '1.0M token')
     eq('成本', f.formatCost(0.0312), '$0.031')
     eq('成本不足 0.001', f.formatCost(0.0004), '<$0.001')
     eq('成本为 0', f.formatCost(0), '$0')
@@ -149,7 +150,7 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     // 状态
     eq('succeeded = 已完成', st.statusLabel('succeeded'), '已完成')
     eq('interrupted + 有审批 = 等待审批', st.statusLabel('interrupted', { pendingApproval: true }), '等待审批')
-    eq('interrupted + 没审批 = 已挂起', st.statusLabel('interrupted', { pendingApproval: false }), '已挂起 · 可续跑')
+    eq('interrupted + 没审批 = 已挂起', st.statusLabel('interrupted', { pendingApproval: false }), '已挂起 · 可继续运行')
     eq('suspended', st.statusLabel('suspended'), '已中断（服务重启）')
     eq('未知状态原样写', st.statusLabel('weird'), 'weird')
     const shapes = new Set(['running', 'queued', 'done', 'waiting', 'failed', 'skipped', 'cancelled', 'blocked', 'unreached'].map((s) => st.statusMeta(s).shape))
@@ -185,24 +186,29 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     eq('挂在工作流上的，名字叫临时图也照写', t.runName?.({ workflow_id: 'w1', workflow_name: '临时图' }), '临时图')
 
     // 报错
-    const net = e.humanizeError(new ApiError(0, '连不上后端服务（可能没启动或正在重启），稍后重试', { kind: 'network', raw: 'TypeError: Failed to fetch' }))
-    ok('网络失败：连不上后端服务 + 怎么办', net.title === '连不上后端服务' && net.kind === 'network' && net.action, JSON.stringify(net))
-    eq('TypeError: Failed to fetch 翻成人话', e.humanizeError(new TypeError('Failed to fetch')).title, '连不上后端服务')
+    const net = e.humanizeError(new ApiError(0, '无法连接服务（服务端可能未启动或正在重启），请稍后重试', { kind: 'network', raw: 'TypeError: Failed to fetch' }))
+    ok('网络失败：无法连接服务 + 怎么办', net.title === '无法连接服务' && net.kind === 'network' && net.action, JSON.stringify(net))
+    eq('TypeError: Failed to fetch 翻成人话', e.humanizeError(new TypeError('Failed to fetch')).title, '无法连接服务')
     ok('errorMessage 不露 Failed to fetch', !e.errorMessage(new TypeError('Failed to fetch')).includes('Failed to fetch'))
-    eq('exit undefined', e.humanizeError('✕ 失败 (exit undefined)').title, '请求没到沙箱')
+    eq('exit undefined', e.humanizeError('✕ 失败 (exit undefined)').title, '请求未到达沙箱')
     const pyd = e.humanizeError("2 validation errors for GraphSpec\nnodes.1.type\n  Input should be 'input'")
-    ok('pydantic 原文翻成人话，原文进 raw', pyd.title === '生成的工作流里有节点类型不认识' && pyd.raw.includes('GraphSpec'), pyd.title)
+    ok('pydantic 原文翻成人话，原文进 raw', pyd.title === '生成的工作流包含无法识别的节点类型' && pyd.raw.includes('GraphSpec'), pyd.title)
     ok('Python 异常类名不进标题', !e.humanizeError("KeyError: 'rows'").title.includes('KeyError'))
+    // 老后端的原话（库里的老记录还是这样写的），留着
     const obj = e.humanizeError({ ok: false, error: '连不上对方的服务', hint: '核对地址和端口', detail: 'ConnectError: [Errno 61]' })
     ok('{error, hint, detail}', obj.title === '连不上对方的服务' && obj.action === '核对地址和端口' && obj.raw === 'ConnectError: [Errno 61]', JSON.stringify(obj))
-    eq('超时和连不上分开说', e.humanizeError(new ApiError(0, 'x', { kind: 'network', timeoutMs: 5000 })).title, '后端没有响应')
+    // 后端现在的原话（core/errors.py 的 NETWORK 一类）
+    const objNow = e.humanizeError({ ok: false, error: '无法连接服务：网络不通或服务未启动', hint: '请检查地址和端口，确认服务已启动且本机可以访问', detail: 'ConnectError: [Errno 61]' })
+    ok('{error, hint, detail}：后端现在的说法', objNow.title === '无法连接服务：网络不通或服务未启动' && objNow.action === '请检查地址和端口，确认服务已启动且本机可以访问'
+      && objNow.raw === 'ConnectError: [Errno 61]' && objNow.kind !== 'network', JSON.stringify(objNow))
+    eq('超时和连不上分开说', e.humanizeError(new ApiError(0, 'x', { kind: 'network', timeoutMs: 5000 })).title, '服务端无响应')
     eq('取消不是错误', e.humanizeError(new DOMException('aborted', 'AbortError')).title, '已取消')
     // 后端回了话，话里提到 fetch failed，说的是它够不着的下游，不是我们连不上它
     const down = e.humanizeError(new ApiError(502, '模型服务连不上：httpx.ConnectError: fetch failed'))
-    ok('HTTP 错误里的网络字眼不算连不上后端', down.kind === 'http' && down.title !== '连不上后端服务' && down.status === 502, JSON.stringify(down))
+    ok('HTTP 错误里的网络字眼不算连不上服务端', down.kind === 'http' && down.title !== '无法连接服务' && down.status === 502, JSON.stringify(down))
     ok('isNetworkError 对 HTTP 错误为假', !e.isNetworkError(new ApiError(500, 'NetworkError when attempting to fetch resource')))
-    ok('测连接结果里的 ECONNREFUSED 不算连不上后端',
-      e.humanizeError({ ok: false, error: 'connect ECONNREFUSED 10.0.0.5:5432' }).title !== '连不上后端服务')
+    ok('测连接结果里的 ECONNREFUSED 不算连不上服务端',
+      e.humanizeError({ ok: false, error: 'connect ECONNREFUSED 10.0.0.5:5432' }).title !== '无法连接服务')
     // 已经是「标题：原因」的中文人话，不再套一个「操作超时」、把整句当原因（标题说两遍）
     const zh = e.humanizeError(new ApiError(504, '数据库查询超时：超过 30 秒没有返回，已中断。缩小查询范围后重试。'))
     ok('中文人话里的「超时」不套「操作超时」', zh.title !== '操作超时' && !(zh.reason ?? '').includes('操作超时')
@@ -212,19 +218,33 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
 
     // 失败说明（lib/explain）：记录页、助手流、问数据页共用一份
     const x = window.__ui.lib.explain
+    // 下面喂给 explain 的后端原文分两组：老说法是「老运行」样本（库里历史运行的 run.error 存的是它们），
+    // 前端要继续认得；紧跟着的「后端现在的说法」取自后端源码当前的原文，两组都得认出来
     const leak = x.explainRunError('模型输出了工具调用的原始标记，但没有真正调用工具。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。')
-    ok('工具调用标记泄漏：说人话、不给接着跑、指到画布', leak.title === '模型没有真正调用工具' && !leak.continuable && leak.fix === 'canvas', JSON.stringify(leak))
+    ok('工具调用标记泄漏：说人话、不给接着跑、指到画布', leak.title === '模型未实际调用工具' && !leak.continuable && leak.fix === 'canvas', JSON.stringify(leak))
+    // 后端现在的说法（engine/toolcalls.py TOOL_MARKUP_ERROR）
+    const leakNow = x.explainRunError('模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。'
+      + '常见原因：节点未绑定工具，或模型、服务不支持工具调用。请在画布中为该节点绑定所需工具；如已绑定仍出现此问题，请换用支持工具调用的模型')
+    ok('工具调用标记泄漏（后端现在的说法）：同样认得', leakNow.title === '模型未实际调用工具' && !leakNow.continuable && leakNow.fix === 'canvas', JSON.stringify(leakNow))
     const tired = x.explainRunError('NodeError: 协作团队用完 4 轮仍未完成：还缺汇总员的结论')
     ok('团队轮数用完：标题带轮数，原因是调度者最后的理由', tired.title === '协作团队用完 4 轮仍未完成'
       && tired.reason === '还缺汇总员的结论' && !tired.continuable, JSON.stringify(tired))
     const made = x.explainRunError('校验修复无效：修复时出现了原文没有的值：total_count=0')
     ok('校验修复编造数值：点出是哪个值、不给接着跑', made.reason.includes('total_count=0') && !made.continuable, JSON.stringify(made))
     eq('提示词点名的工具没绑定', x.explainRunError('提示词要求用 db_query__shop，但节点没有绑定它').title,
-      '提示词要求用「db_query__shop」，但节点没有绑定它')
-    eq('老运行的鉴权失败', x.explainRunError('NodeError: AuthenticationError: Error code: 401 - invalid_api_key').title, '模型鉴权没通过')
+      '提示词要求使用「db_query__shop」，但节点未绑定此工具')
+    // 后端现在的说法（engine/schema.py：带「」、成员一种另说）
+    eq('提示词点名的工具没绑定（后端现在的说法）', x.explainRunError('提示词要求用「db_query__shop」，但节点没有绑定它').title,
+      '提示词要求使用「db_query__shop」，但节点未绑定此工具')
+    eq('……成员的提示词点名的工具没绑定', x.explainRunError('成员「研究员」的提示词要求用「db_query__shop」，但没有给这个成员绑定它').title,
+      '成员「研究员」的提示词要求使用「db_query__shop」，但该成员未绑定此工具')
+    eq('老运行的鉴权失败', x.explainRunError('NodeError: AuthenticationError: Error code: 401 - invalid_api_key').title, '模型鉴权失败')
+    // 后端现在的说法（core/errors.py 的 AUTH 一类）
+    const authNow = x.explainRunError('鉴权失败（401）：服务方拒绝了当前 API Key')
+    ok('鉴权失败（后端现在的说法）：同样认得、给设置入口', authNow.title === '模型鉴权失败' && authNow.fix === 'settings' && authNow.continuable, JSON.stringify(authNow))
     const miss = x.explainRunError('缺少必填输入：region')
     ok('缺必填输入：给出是哪一项、重新发起', miss.missingInput === 'region' && miss.fix === 'rerun' && !miss.continuable)
-    eq('没留原因', x.explainRunError(null).title, '运行失败，但没有留下原因')
+    eq('没留原因', x.explainRunError(null).title, '运行失败，未记录原因')
     ok('兜底：句中的异常类名也去掉', !/ValueError/.test(x.explainRunError('结构不对：ValueError: bad').title))
     // 团队轮数用完：后端原话把「先看成员…调大最多轮数」也写进了冒号后面，原因只要理由和
     // 没派到的成员，建议交给 action——否则同样的话在报错里说两遍
@@ -234,6 +254,14 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     ok('……action 里有最多轮数，原因里没有', /最多轮数/.test(tiredFull.action) && !/最多轮数|降档交付/.test(tiredFull.reason), JSON.stringify(tiredFull))
     eq('团队按降档交付的原话：原因在「。按降档交付」处截断',
       x.explainRunError('协作团队用完 3 轮仍未完成：还缺结论。按降档交付：成果是成员最后的原话，不是调度者认可的结论').reason, '还缺结论')
+    // 后端现在的说法（engine/nodes/multi.py：「。先看成员」「。按降档交付」两个锚点没变，后半句改了）
+    const tiredNow = x.explainRunError('NodeError: 协作团队用完 4 轮仍未完成：还没有查到任何订单数据。一次都没被派到的成员：汇总员。'
+      + '先看成员是否绑定了所需工具，再调大「最多轮数」；也可将「用完轮数时」改为「降档交付」')
+    eq('团队轮数用完（后端现在的说法）：原因在「。先看成员」处截断', tiredNow.reason, '还没有查到任何订单数据。一次都没被派到的成员：汇总员')
+    ok('……action 里有最多轮数，原因里没有', /最多轮数/.test(tiredNow.action) && !/最多轮数|降档交付/.test(tiredNow.reason) && !tiredNow.continuable,
+      JSON.stringify(tiredNow))
+    eq('团队按降档交付（后端现在的说法）：原因在「。按降档交付」处截断',
+      x.explainRunError('协作团队用完 3 轮仍未完成：还缺结论。按降档交付：成果取自成员最后的回复，并非调度者认可的结论').reason, '还缺结论')
     // 超时：后端已经给了具体原因和建议的中文原话，不能换成笼统的「下游服务没在限定时间内响应」
     const qto = x.explainRunError('KeyError: 查询超时，数据库没有在 30 秒内返回')
     ok('中文超时原话：原因照原样留下', qto.reason === '查询超时，数据库没有在 30 秒内返回'
@@ -241,9 +269,17 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     const qlong = x.explainRunError('查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查')
     ok('中文超时原话：后端的建议进 action，原因里不再重复', /WHERE 条件或 LIMIT/.test(qlong.action ?? '')
       && /查询超过 30s 没有返回/.test(qlong.reason ?? '') && !/WHERE/.test(qlong.reason ?? ''), JSON.stringify(qlong))
+    // 后端现在的说法（engine/toolcalls.py ToolTimeout）
+    const qlongNow = x.explainRunError('查询超过 30 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试')
+    ok('中文超时原话（后端现在的说法）：建议进 action，原因里不再重复', /WHERE 条件或 LIMIT/.test(qlongNow.action ?? '')
+      && /查询超过 30 秒没有返回/.test(qlongNow.reason ?? '') && !/WHERE/.test(qlongNow.reason ?? '') && qlongNow.continuable, JSON.stringify(qlongNow))
     const unified = x.explainRunError('等待超时：对方没有在限定时间内响应')
     ok('「标题：原因」式的中文超时：拆成标题和原因', unified.title === '等待超时' && unified.reason === '对方没有在限定时间内响应'
       && unified.continuable, JSON.stringify(unified))
+    // 后端现在的说法（core/errors.py 的 TIMEOUT 一类）
+    const unifiedNow = x.explainRunError('等待超时：服务方未在限定时间内响应')
+    ok('「标题：原因」式的中文超时（后端现在的说法）：拆成标题和原因', unifiedNow.title === '等待超时' && unifiedNow.reason === '服务方未在限定时间内响应'
+      && unifiedNow.continuable, JSON.stringify(unifiedNow))
     const en = x.explainRunError('ReadTimeout: timed out')
     ok('英文超时原文照旧给通用说法', en.title === '等待超时' && /限定时间/.test(en.reason ?? '') && !/ReadTimeout/.test(en.reason ?? ''), JSON.stringify(en))
     // 自定义工具的参数定义写坏了：先去工具页改好（直达那一项），改好之后接着跑能过
@@ -263,13 +299,26 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
       JSON.stringify(brokenOne))
     const brokenTwo = x.explainRunError(`ToolBuildError: 自定义工具「lookup_order」的参数定义要是一个 JSON 对象。到「工具」页把它的参数定义改好再运行；`
       + `自定义工具「sales_daily_api」的${typeProblem}。到「工具」页把它的参数定义改好再运行`)
-    ok('两个坏工具：标题说有几个，不只认第一个', brokenTwo.title === '2 个自定义工具的参数定义写坏了', JSON.stringify(brokenTwo))
+    ok('两个坏工具：标题说有几个，不只认第一个', brokenTwo.title === '2 个自定义工具的参数定义有误', JSON.stringify(brokenTwo))
     ok('……原因里两个都点名，各自的原因都在', /lookup_order/.test(brokenTwo.reason ?? '') && /sales_daily_api/.test(brokenTwo.reason ?? '')
       && /JSON 对象/.test(brokenTwo.reason ?? '') && /只能是 string/.test(brokenTwo.reason ?? '') && !/到「工具」页/.test(brokenTwo.reason ?? ''),
       JSON.stringify(brokenTwo))
     ok('……怎么办里也点名两个，直达第一个的编辑', /lookup_order/.test(brokenTwo.action ?? '') && /sales_daily_api/.test(brokenTwo.action ?? '')
       && brokenTwo.fixTo === '/tools/custom?edit=lookup_order' && brokenTwo.fix === 'tools' && brokenTwo.fixFirst === true && brokenTwo.continuable,
       JSON.stringify(brokenTwo))
+    // 后端现在的说法（tools/custom.py：前缀「格式有误」、结尾「到「工具」页修改参数定义后再运行」，几个坏工具仍用「；」连成一句）
+    const brokenNow = x.explainRunError('自定义工具「lookup_order」的参数定义格式有误：参数 store 应写成 {"type": "string"} 这样的对象，'
+      + '不能直接写 "string"。到「工具」页修改参数定义后再运行')
+    ok('坏参数定义（后端现在的说法）：点名是哪个工具、fix 指到工具页、主按钮先去修', brokenNow.fix === 'tools' && brokenNow.title === '自定义工具「lookup_order」的参数定义有误'
+      && /参数 store/.test(brokenNow.reason ?? '') && !/到「工具」页/.test(brokenNow.reason ?? '') && brokenNow.fixFirst === true && brokenNow.continuable
+      && brokenNow.fixTo === '/tools/custom?edit=lookup_order', JSON.stringify(brokenNow))
+    const typeProblemNow = '参数定义格式有误：无法识别参数 n 的类型「int」，是否应为 integer；只能是 string、integer、number、boolean、array、object 中的一个'
+    const brokenTwoNow = x.explainRunError('ToolBuildError: 自定义工具「lookup_order」的参数定义必须是一个 JSON 对象。到「工具」页修改参数定义后再运行；'
+      + `自定义工具「sales_daily_api」的${typeProblemNow}。到「工具」页修改参数定义后再运行`)
+    ok('两个坏工具（后端现在的说法）：标题说有几个，两个的原因都在、原因里自带的「；」不切丢', brokenTwoNow.title === '2 个自定义工具的参数定义有误'
+      && /lookup_order/.test(brokenTwoNow.reason ?? '') && /sales_daily_api/.test(brokenTwoNow.reason ?? '') && /JSON 对象/.test(brokenTwoNow.reason ?? '')
+      && /只能是 string/.test(brokenTwoNow.reason ?? '') && !/到「工具」页/.test(brokenTwoNow.reason ?? '')
+      && brokenTwoNow.fixTo === '/tools/custom?edit=lookup_order' && brokenTwoNow.fixFirst === true, JSON.stringify(brokenTwoNow))
     // 超时原话按「；」拆开时，原因的末尾不能挂着半个分号
     const semi = x.explainRunError('调用模型超时（60 秒），对方没有响应；换个时段再试')
     ok('中文超时按「；」拆：原因以句号收尾，不挂「；」', semi.reason === '调用模型超时（60 秒），对方没有响应。' && semi.action === '换个时段再试。',
@@ -282,6 +331,125 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
   })) check(name, ok, detail)
 })
 
+await section('按后端原文匹配的地方：失败归类认得新旧两种原文，给模型的 for_model 不进界面（文案整改第二轮）', async () => {
+  // lib/explain 按 run.error 的原文把失败归类（run.error 没有错误码）。开发库里历史运行存的是整改前的文字，
+  // 新运行是整改后的：两种各喂一遍，归类（标题、能不能继续运行、修复入口）要一样。
+  // 「新」样本和 backend/app 现在的写法一致（先核对源码片段）；「旧」样本是整改前（提交 68fb353）的原话，
+  // 只用来证明旧文字仍认得，不要跟着后端改
+  const src = (f) => readFileSync(new URL(`../backend/app/${f}`, import.meta.url), 'utf8')
+  const SOURCE = [
+    ['api/runs.py', 'f"绑定的工具不存在：{lines}{more}。{fix}"'],
+    ['engine/toolcalls.py', '秒没有返回，已停止等待'],
+    ['data/engine.py', '秒被中断。请添加 WHERE 条件或 LIMIT 缩小范围。'],
+    ['core/errors.py', '"等待超时：服务方未在限定时间内响应"'],
+    ['tools/custom.py', '参数定义格式有误：'],
+    ['tools/custom.py', '。到「工具」页修改参数定义后再运行'],
+    ['engine/nodes/io.py', '输出的不是合法 JSON（{where}附近），{reason}；{fix}'],
+    ['engine/nodes/io.py', '是{what}，放入 JSON 时请写成 {{{{ {expr} | json }}}}（外面不要再加引号）'],
+    ['engine/toolcalls.py', '模型以文本形式输出了工具调用的原始标记，未实际调用工具'],
+    ['engine/nodes/multi.py', '协作团队用完 {max_rounds} 轮仍未完成：'],
+    ['engine/nodes/human.py', '修复时出现了原文没有的值：'],
+    ['engine/nodes/human.py', 'f"人工驳回：'],
+    ['core/errors.py', '鉴权失败{code}：服务方拒绝了当前 API Key'],
+    ['core/errors.py', '"请求过于频繁或额度已用完（429）"'],
+    ['core/errors.py', '"无法连接服务：网络不通或服务未启动"'],
+    ['core/errors.py', 'f"服务方内部错误（HTTP {status}）"'],
+    ['core/errors.py', 'f"参数不匹配：不接受名为「{m.group(1)}」的参数"'],
+    ['tools/registry.py', 'f"找不到工具 {name}"'],
+    ['engine/schema.py', '至少需要配置一个分支条件'],
+    ['engine/runner.py', '"服务重启，运行已挂起，可从断点继续运行"'],
+  ]
+  const gone = SOURCE.filter(([f, frag]) => !src(f).includes(frag))
+  check('「新」样本的片段在后端源码里都还在（后端改了说法就同步这里的样本和 lib/explain 的正则）', gone.length === 0,
+    gone.map(([f, frag]) => `${f}：${frag}`).join(' ｜ '))
+
+  // [说明, 后端现在的原文, 整改前的原文, 期望标题, 能否继续运行, 修复入口]
+  const PAIRS = [
+    ['绑定的工具不存在（发起时就被拒）',
+      '绑定的工具不存在：「取数」绑定的 db_query__erp。请到「数据」页接入，或在节点中重新选择',
+      '绑定的工具在本机不存在：「取数」绑的 db_query__erp。去数据页接入，或在节点里重新选',
+      '绑定的工具「db_query__erp」不存在', false, 'tools'],
+    ['查询到点放弃',
+      '查询超过 30 秒没有返回，已停止等待（数据库可能仍在执行，连接会在后台回收）。请添加 WHERE 条件或 LIMIT 缩小范围后重试',
+      '查询超过 30s 没有返回，已放弃等待（数据库那边可能还在跑，连接会在后台收回）。加上 WHERE 条件或 LIMIT 缩小范围再查',
+      '查询超时', true, undefined],
+    ['数据库按时限停下语句',
+      '查询超过 30 秒被中断。请添加 WHERE 条件或 LIMIT 缩小范围。',
+      '查询超过 30s 被中断。加上 WHERE 条件或 LIMIT 缩小范围。',
+      '查询超时', true, undefined],
+    ['等待超时（统一的翻译层）', '等待超时：服务方未在限定时间内响应', '等待超时：对方没有在限定时间内响应', '等待超时', true, undefined],
+    ['自定义工具的参数定义有误',
+      '自定义工具「lookup_order」的参数定义格式有误：参数 store 应写成 {"type": "string"} 这样的对象，不能直接写 "string"。到「工具」页修改参数定义后再运行',
+      '自定义工具「lookup_order」的参数定义格式不对：参数 store 要写成 {"type": "string"} 这样的对象，不能直接写 "string"。到「工具」页把它的参数定义改好再运行',
+      '自定义工具「lookup_order」的参数定义有误', true, 'tools'],
+    ['上游模型写的 JSON 解析失败',
+      '上游「写摘要」输出的不是合法 JSON（第 12 列附近），模型写的文字中包含未转义的英文引号；如需模型输出结构化数据，请配置「结构化输出 Schema」并开启「按出处核对字段」，不要用「数据整形」节点解析模型写的文字',
+      '上游「写摘要」输出的不是合法 JSON（第 12 列附近），它写的文字里有没转义的英文引号；要模型给结构化数据就配「结构化输出 Schema」并打开「按出处核对字段」，别用整形节点解析模型写的文字',
+      '上游「写摘要」输出的不是合法 JSON（第 12 列附近）', false, 'canvas'],
+    ['模板渲染出的 JSON 有误、后端点名了那一处',
+      '模板渲染出来的不是合法 JSON（第 1 行第 12 列附近）。模板里 {{ nodes.a.text }} 是模型写的文字，放入 JSON 时请写成 {{ nodes.a.text | json }}（外面不要再加引号）',
+      '模板渲染出来的不是合法 JSON（第 1 行第 12 列附近）。模板里 {{ nodes.a.text }} 是模型写的文字，放进 JSON 要写成 {{ nodes.a.text | json }}（外面不要再加引号）',
+      '模板渲染出来的不是合法 JSON（第 1 行第 12 列附近）', false, 'canvas'],
+    ['模型没真调工具',
+      '模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。常见原因：节点未绑定工具，或模型、服务不支持工具调用。',
+      '模型输出了工具调用的原始标记，但没有真正调用工具，这一步一次都没查到数据。常见原因：节点没有绑定工具，或者模型、服务不支持工具调用。',
+      '模型未实际调用工具', false, 'canvas'],
+    ['协作团队用完轮数',
+      '协作团队用完 3 轮仍未完成：调度者未给出理由。一次都没被派到的成员：汇总员。先看成员是否绑定了所需工具，再调大「最多轮数」；也可将「用完轮数时」改为「降档交付」',
+      '协作团队用完 3 轮仍未完成：调度者没有给出理由。一次都没被派到的成员：汇总员。先看成员有没有绑定要用的工具，再调大「最多轮数」；也可以把「用完轮数时」改成降档交付',
+      '协作团队用完 3 轮仍未完成', false, 'canvas'],
+    ['校验修复编出了原文没有的值',
+      '结构化校验未通过：修复时出现了原文没有的值：total_count=0', '结构化校验没通过：修复时出现了原文没有的值：total_count=0',
+      '校验修复未采用：修复结果中出现了原文没有的值', false, 'canvas'],
+    ['人工驳回（整改前有一条路径写「人工拒绝」）', '人工驳回：数字对不上', '人工拒绝：数字对不上', '人工审批驳回，运行终止', false, undefined],
+    ['模型鉴权失败', '鉴权失败（401）：服务方拒绝了当前 API Key', '鉴权没通过（401）：对方拒绝了这把密钥', '模型鉴权失败', true, 'settings'],
+    ['限流或额度用完', '请求过于频繁或额度已用完（429）', '请求太频繁，或者额度用完了（429）', '请求过于频繁，或额度已用完', true, undefined],
+    ['连不上外部服务', '无法连接服务：网络不通或服务未启动', '连不上对方的服务：网络不通，或者服务没有启动', '无法连接外部服务', true, undefined],
+    ['外部服务 5xx', '服务方内部错误（HTTP 502）', '对方服务出错了（HTTP 502）', '外部服务返回错误', true, undefined],
+    ['工具参数对不上', '参数不匹配：不接受名为「store」的参数', '参数对不上：它不接受名为「store」的参数', '工具参数不匹配', true, 'canvas'],
+    ['找不到工具', '找不到工具 lookup_order', "找不到工具 'lookup_order'", '找不到工具「lookup_order」', true, 'tools'],
+    ['节点配置不完整', '「条件分支」至少需要配置一个分支条件', '「条件分支」至少要配一个分支条件', '节点配置不完整', false, 'canvas'],
+    ['服务重启挂起', '服务重启，运行已挂起，可从断点继续运行', '服务重启，运行已挂起，可从断点恢复', '服务重启中断了本次运行', true, undefined],
+  ]
+  const got = await page.evaluate(async (pairs) => {
+    const x = window.__ui.lib.explain
+    const pick = (t) => { const r = x.explainRunError(t); return [r.title, r.continuable, r.fix ?? null] }
+    const at = (path) => performance.getEntriesByType('resource').map((e) => e.name)
+      .find((n) => { try { return new URL(n).pathname === path } catch { return false } }) ?? path
+    const client = await import(at('/src/api/client.ts'))
+    const body = client.parseBody(JSON.stringify({
+      type: 'report.checked',
+      data: { violations: [{ code: 'uncited_number', message: '数字「30」没有出处：报告中直接写出了数字，系统无法核对',
+        for_model: '数字「30」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字' }] },
+      issues: [{ level: 'error', message: '报告撰写的上游没有可引用数字的证据来源', for_model: '给模型的改法' }],
+    }))
+    return {
+      pairs: pairs.map(([, now, before]) => [pick(now), pick(before)]),
+      restart: pick('这次运行没有可恢复的断点，可能在服务重启前尚未开始执行。请重新发起运行。'),
+      pointed: [
+        '模板渲染出来的不是合法 JSON（第 1 行第 12 列附近）。模板里 {{ nodes.a.text }} 是模型写的文字，放入 JSON 时请写成 {{ nodes.a.text | json }}（外面不要再加引号）',
+        '模板渲染出来的不是合法 JSON（第 1 行第 12 列附近）。模板中的 {{ nodes.a.text }} 位于 JSON 引号内：请改写为 {{ nodes.a.text | json }}（外面不要再加引号）',
+      ].map((t) => x.explainRunError(t).action),
+      body: JSON.stringify(body),
+      plain: JSON.stringify(client.parseBody('{"a":[1,{"b":"c"}]}')),
+    }
+  }, PAIRS.map(([what, now, before]) => [what, now, before])).catch((e) => ({ error: String(e) }))
+  if (got.error) { check('lib/explain、api/client 拿得到', false, got.error); return }
+  PAIRS.forEach(([what, , , title, continuable, fix], i) => {
+    const want = JSON.stringify([title, continuable, fix ?? null])
+    const [now, before] = got.pairs[i].map((r) => JSON.stringify(r))
+    check(`失败归类：${what}（后端现在的原文）`, now === want, now)
+    check(`失败归类：${what}（整改前的原文）`, before === want, before)
+  })
+  check('模板 JSON 有误、后端点名了那一处（运行时「模板里 {{」、校验「模板中的 {{」）：照后端说，不再追加改用结构化输出那句',
+    got.pointed.every((a) => a.endsWith('修改后重新运行。') && !a.includes('结构化输出 Schema')), JSON.stringify(got.pointed))
+  check('「没有可恢复的断点」虽然提到服务重启，但不归到「可从断点继续运行」', got.restart[0] !== '服务重启中断了本次运行',
+    JSON.stringify(got.restart))
+  check('响应里给模型的 for_model 在进前端时就去掉，给人看的 message 留着', !got.body.includes('for_model')
+    && !got.body.includes('给模型的改法') && got.body.includes('报告中直接写出了数字，系统无法核对') && got.body.includes('证据来源'), got.body)
+  check('……没有 for_model 的响应原样解析', got.plain === '{"a":[1,{"b":"c"}]}', got.plain)
+})
+
 await section('lib/evidence：证据状态的四通道元数据、报告节点的叫法、复核守卫', async () => {
   for (const [name, ok, detail] of await page.evaluate(() => {
     const { evidence: ev, terms: t } = window.__ui.lib
@@ -290,11 +458,11 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     const ok = (name, cond, detail = '') => out.push([name, !!cond, cond ? '' : detail])
     const codes = ev.EVIDENCE_STATES
     // 方案 6.1 的八种（确定性、概率性四种、无证据、连接性、旧运行候选），加三期无证据的两个变体：
-    // 可疑实体（可能是编造的名字）、核对不了（表结构快照不全）
+    // 可疑实体（疑似不存在的名称）、无法核实（表结构快照不全）
     ok('十种状态一种不少', ['deterministic', 'supported', 'partial', 'unsupported', 'unjudged', 'none', 'connective', 'candidate',
       'suspect', 'unverified'].every((c) => codes.includes(c)) && codes.length === 10, codes.join(','))
-    eq('可疑实体：点状线（同无证据）、?!、可能是编造的名字', `${ev.EVIDENCE_STATE.suspect.line}/${ev.EVIDENCE_STATE.suspect.glyph}/${ev.EVIDENCE_STATE.suspect.label}`,
-      'dotted/?!/可能是编造的名字')
+    eq('可疑实体：点状线（同无证据）、?!、疑似不存在的名称', `${ev.EVIDENCE_STATE.suspect.line}/${ev.EVIDENCE_STATE.suspect.glyph}/${ev.EVIDENCE_STATE.suspect.label}`,
+      'dotted/?!/疑似不存在的名称')
     ok('可疑实体醒目（进 n / N），核对不了只是标注', ev.EVIDENCE_STATE.suspect.alert && !ev.EVIDENCE_STATE.unverified.alert)
     eq('片段状态：issue 为 unknown_entity 的是可疑实体', ev.segmentState({ kind: 'entity', state: 'none', issue: 'unknown_entity' }), 'suspect')
     eq('片段状态：[[t:编造]] 的 cite 带 unknown 也是可疑实体', ev.segmentState({ kind: 'entity', state: 'none', cite: { unknown: true } }), 'suspect')
@@ -340,10 +508,10 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
 
     eq('报告节点叫「报告撰写」', t.nodeTypeLabel('report'), '报告撰写')
     eq('计数的说法：无证据 = 总数 − 有出处，算得平', t.evidenceTally(7, 12), '7/12 数字有出处 · 无证据 5')
-    eq('不是数字的解析不了的引用另起一句', t.evidenceTally(7, 12, 1), '7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了')
+    eq('不是数字的无法解析的引用另起一句', t.evidenceTally(7, 12, 1), '7/12 数字有出处 · 无证据 5 · 另有 1 处引用无法解析')
     eq('数字全有出处', t.evidenceTally(1234, 1234, 0), '1,234 个数字都有出处')
-    eq('数字全有出处、另有引用解析不了', t.evidenceTally(3, 3, 2), '3 个数字都有出处 · 另有 2 处引用解析不了')
-    eq('一个数字都没有、只有解析不了的引用', t.evidenceTally(0, 0, 1), '1 处引用解析不了')
+    eq('数字全有出处、另有引用无法解析', t.evidenceTally(3, 3, 2), '3 个数字都有出处 · 另有 2 处引用无法解析')
+    eq('一个数字都没有、只有无法解析的引用', t.evidenceTally(0, 0, 1), '1 处引用无法解析')
     eq('什么都没有时给空串', t.evidenceTally(0, 0, 0), '')
 
     const out1 = { 周报: 'x', _evidence: { report_node: 'write', doc_artifact: 'abc', fields: ['周报'],
@@ -374,11 +542,11 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     eq('载荷缺字段：不给计数', ev.statsTally({ uncited_numbers: 1 }), null)
     // 句末依据里写错的引用：违规不指任何片段，和列表序号里的数字分开数、分开说
     const withSee = { ...doc, stats: { ...doc.stats, unresolved: 4, violations: 7 },
-      violations: [...doc.violations, { code: 'unresolved_ref', message: '依据 [[see:m:nope]] 解析不了', ref: 'm:nope', unit: 'u1' }] }
+      violations: [...doc.violations, { code: 'unresolved_ref', message: '依据 [[see:m:nope]] 无法解析', ref: 'm:nope', unit: 'u1' }] }
     const t2 = ev.docTally(withSee)
     eq('句末依据的引用：算进非数字引用、算进「没对应字」', k(t2), '7/12/5/2/2/1/1')
     const sum = ev.tallySummary(t2, true)
-    ok('读屏摘要：两种画不了线的分开说在哪', sum.includes('其中 1 个数字在列表序号') && sum.includes('1 处在正文里没有对应的字')
+    ok('读屏摘要：两种画不了线的分开说在哪', sum.includes('其中 1 个数字位于列表序号') && sum.includes('1 处在正文中没有对应文本')
       && sum.includes('句末依据'), sum)
     ok('读屏摘要：只有结构片段时不提「句末依据」', !ev.tallySummary(tally, true).includes('句末依据'), ev.tallySummary(tally, true))
 
@@ -391,7 +559,7 @@ await section('lib/evidence：证据状态的四通道元数据、报告节点�
     eq('都过了：绿', sv({ sealed: true, ok: true, covered: true }), 'done:已封存 · 核对一致')
     ok('正文不是封存的那份：再完好的封存也判失败', sv({ sealed: true, ok: true, covered: true }, { foreign: true }).startsWith('failed:'))
     ok('没有证据的片段：落到报告文档上', sv({ sealed: true, ok: true, covered: true }, { docOnly: true }).includes('报告文档已封存'))
-    ok('链没取到、封存状态从证据图查的：只说文档封存了', sv({ sealed: true, ok: true }, { viaGraph: true }).includes('证据链这次没取到'))
+    ok('链没取到、封存状态从证据图查的：只说文档封存了', sv({ sealed: true, ok: true }, { viaGraph: true }).includes('未能获取本段的证据链'))
     eq('逐项复核：没封存时不报「不在封存范围内」', ev.integrityFailures({ sealed: false, hash_ok: true }, { sealed: false }).join(','), '')
     eq('逐项复核：封存被改过时也不报', ev.integrityFailures({ sealed: false }, { sealed: true, ok: false }).join(','), '')
     eq('逐项复核：封存完好时照报', ev.integrityFailures({ sealed: false, hash_ok: false }, { sealed: true, ok: true }).join(','), 'hash,sealed')
@@ -460,13 +628,13 @@ await section('lib/evidence：结论句裁判（四期）——判定的徽标�
     ok('叠上判定不改原文档', ev.withVerdicts(fj.explore.doc, { [fj.explore.units.bad]: { status: 'unsupported' } }) !== fj.explore.doc
       && fj.explore.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fj.explore.units.bad).verdict.status === 'unjudged')
     eq('计数的说法：和数字那一段同一种', t.claimTally({ total: 4, supported: 1, partial: 1, unsupported: 1, unjudged: 1, uncited: 0 }),
-      '结论 4 句（支持 1 · 部分支持 1 · 不支持 1 · 未裁判 1）')
-    eq('……方案的例子', t.claimTally({ total: 4, supported: 3, partial: 0, unsupported: 0, unjudged: 0, uncited: 1 }), '结论 4 句（支持 3 · 无证据 1）')
+      '结论 4 句（有依据 1 · 部分有依据 1 · 证据不支持 1 · 未裁判 1）')
+    eq('……方案的例子', t.claimTally({ total: 4, supported: 3, partial: 0, unsupported: 0, unjudged: 0, uncited: 1 }), '结论 4 句（有依据 3 · 无证据 1）')
     eq('……没有结论句给空串', t.claimTally({ total: 0, supported: 0, partial: 0, unsupported: 0, unjudged: 0, uncited: 0 }), '')
     const unit = fj.formal.doc.blocks.flatMap((b) => b.units).find((u) => u.id === fj.formal.units.bad)
     eq('句末徽标的 aria-label：句子、判定写全', ev.claimLabel(unit, unit.verdict), '结论句「增长主要来自新客首单，老客复购持平。」，模型判断：证据不支持')
     ok('……封存后追加的另说', ev.claimLabel(unit, { ...unit.verdict, post_seal: true }).endsWith('，封存后追加'))
-    ok('……到上限没判的说「已到上限」', ev.claimLabel(unit, { status: 'unjudged', reason: 'max_cost_usd' }).endsWith('未裁判：已到上限'))
+    ok('……到上限没判的说「已达上限」', ev.claimLabel(unit, { status: 'unjudged', reason: 'max_cost_usd' }).endsWith('未裁判：已达上限'))
     // 按需裁判接口的答复：evidence.judged 的载荷（{verdicts: {u: …}}），也认列表；缺 post_seal 的记 true，缺 judge 的补模型
     const a = ev.judgedVerdicts({ verdicts: { u4: { status: 'supported', rationale: '对' } }, model: 'jm' })
     ok('答复 {verdicts: {u: …}}：补上模型、记封存后追加', a.u4?.status === 'supported' && a.u4.judge === 'jm' && a.u4.post_seal === true,
@@ -482,13 +650,13 @@ await section('lib/evidence：结论句裁判（四期）——判定的徽标�
     ok('改写一次采用了：changed 里的句子给出交回改写的原句（units 为 null 的那几句）',
       JSON.stringify(ev.rewriteOf(applied, 'u5')) === JSON.stringify({ kind: 'changed', sentences: ['原句乙'] }), JSON.stringify(ev.rewriteOf(applied, 'u5')))
     eq('……没改的句子不标', ev.rewriteOf(applied, 'u1'), null)
-    const rejected = { judge: { rewrite: { applied: false, units: ['u2'], sentences: ['原句'], changed: [], reason: '改写稿冒出 1 处原稿没有的问题' } } }
+    const rejected = { judge: { rewrite: { applied: false, units: ['u2'], sentences: ['原句'], changed: [], reason: '改写稿新增了 1 处原稿没有的问题（无出处数字），未予采用' } } }
     eq('改写稿没采用：交回过的句子写明原因', ev.rewriteOf(rejected, 'u2')?.kind, 'rejected')
     eq('……没交回的不标', ev.rewriteOf(rejected, 'u3'), null)
     // 设置页：设成不限时写明还受什么约束；别的也不限时照实少说
     const all = { claims: true, cost: true, timeout: true, click: true, daily: true }
-    eq('不限的说法：每日', t.judgeUnlimitedText('daily', all), '不设上限，每日费用只受每份报告的金额上限和每次点击的金额上限约束')
-    eq('……每份报告的金额', t.judgeUnlimitedText('cost', all), '不设上限，费用只受句数上限、时长上限、每日上限约束')
+    eq('不限的说法：每日', t.judgeUnlimitedText('daily', all), '不设上限，每日费用仅受每份报告的金额上限和每次点击的金额上限约束')
+    eq('……每份报告的金额', t.judgeUnlimitedText('cost', all), '不设上限，费用仅受句数上限、时长上限、每日上限约束')
     ok('……每日、每份、每次都不限：说到底只受调用次数约束', t.judgeUnlimitedText('daily', { ...all, cost: false, click: false }).includes('调用次数'))
     ok('……每日不限时每份报告的金额只剩句数、时长', !t.judgeUnlimitedText('cost', { ...all, daily: false }).includes('每日'))
     return out
@@ -698,7 +866,7 @@ await section('toast', async () => {
   await page.click('#toast-network')
   await page.waitForTimeout(80)
   const netText = await page.locator('[role="alert"][aria-live="assertive"]').innerText()
-  check('网络错误不露 Failed to fetch', netText.includes('连不上后端服务') && !netText.includes('Failed to fetch'), netText.replace(/\n/g, ' | '))
+  check('网络错误不露 Failed to fetch', netText.includes('无法连接服务') && !netText.includes('Failed to fetch'), netText.replace(/\n/g, ' | '))
   await page.getByRole('button', { name: '叠 6 条' }).click()
   await page.waitForTimeout(80)
   check('最多露 3 条，其余收起', (await page.getByText(/还有 \d+ 条/).count()) === 1)
@@ -709,11 +877,11 @@ await section('离线：横幅、空态', async () => {
   const emptyBlock = page.locator('[data-block="空态 EmptyState（模拟离线时会变）"]')
   await page.click('#toggle-offline')
   await page.waitForTimeout(100)
-  check('横幅出现', (await page.getByText('后端未连接').count()) === 1)
+  check('横幅出现', (await page.getByText('服务端未连接').count()) === 1)
   // 横幅早就挂着（连着时什么都不画），计时器是这一刻才走起来的：头一个数得按此刻算
-  const firstSecs = Number((await page.getByText(/秒后自动重试/).innerText()).match(/\d+/)?.[0])
+  const firstSecs = Number((await page.getByText(/\d+ 秒后自动重试/).innerText()).match(/\d+/)?.[0])
   check('刚断开时倒计时从此刻算（8 秒）', firstSecs === 8 || firstSecs === 7, `横幅 ${firstSecs} 秒`)
-  check('空态改说拿不到数据', (await emptyBlock.getByText('暂时拿不到数据').count()) >= 1)
+  check('空态改说无法获取数据', (await emptyBlock.getByText('暂时无法获取数据').count()) >= 1)
   check('离线空态不许诺「会自动刷新」', (await emptyBlock.getByText(/自动刷新/).count()) === 0)
   check('离线时收起「新建」', (await page.getByRole('button', { name: '新建工作流' }).count()) === 0)
   check('本地空态不受影响', (await page.getByText('没有匹配的工具').count()) === 1)
@@ -721,9 +889,9 @@ await section('离线：横幅、空态', async () => {
   const bannerAlert = page.locator('[data-offline-banner] [role="alert"]')
   check('横幅外层不是 role=alert', (await page.locator('[data-offline-banner]').getAttribute('role')) === null)
   check('横幅的播报区只有不变的那几句', (await bannerAlert.count()) === 1
-    && (await bannerAlert.innerText()).includes('后端未连接') && !/秒后自动重试/.test(await bannerAlert.innerText()),
+    && (await bannerAlert.innerText()).includes('服务端未连接') && !/秒后自动重试/.test(await bannerAlert.innerText()),
     await bannerAlert.innerText().catch(() => ''))
-  check('倒计时对读屏隐藏', (await page.getByText(/秒后自动重试/).getAttribute('aria-hidden')) === 'true')
+  check('倒计时对读屏隐藏', (await page.getByText(/\d+ 秒后自动重试/).getAttribute('aria-hidden')) === 'true')
   // 横幅把工具栏往下推了多少，toast 就跟着让多少
   await page.click('#toast-error')
   await page.waitForTimeout(80)
@@ -751,11 +919,11 @@ await section('管理页共用件：页头、连通胶囊、单选组、删除�
   check('页头 48px 高', Math.round((await page.locator('#page-header-demo header').boundingBox()).height) === 48)
   const pills = await page.locator('#health-demo [data-health]').evaluateAll((els) => els.map((el) => el.textContent))
   // 「3 分钟前」是从预览页挂载时算的，跑到这里可能已经过了一分钟
-  check('连通胶囊五种说法', pills[0] === '未测试' && /^正在测 · /.test(pills[1]) && /^已连通 · 42 ms · [34] 分钟前测$/.test(pills[2])
-    && pills[3] === '连不上 · 1 小时前测' && /已连通 · 380 ms.*配置改过了/.test(pills[4]), pills.join(' | '))
-  check('不知道测的时刻：不留一个悬空的「 · 」', pills[5] === '连不上', JSON.stringify(pills[5]))
+  check('连通胶囊五种说法', pills[0] === '未测试' && /^正在测试 · /.test(pills[1]) && /^连接成功 · 42 ms · [34] 分钟前测试$/.test(pills[2])
+    && pills[3] === '连接失败 · 1 小时前测试' && /连接成功 · 380 ms.*配置已修改/.test(pills[4]), pills.join(' | '))
+  check('不知道测的时刻：不留一个悬空的「 · 」', pills[5] === '连接失败', JSON.stringify(pills[5]))
   const spoken = await page.locator('#health-demo [role="status"]').evaluateAll((els) => els.map((el) => el.textContent))
-  check('读屏那一句不带跳动的计时和相对时间', spoken[1] === '正在测连接' && /^已连通 42 ms，\d\d:\d\d 测的$/.test(spoken[2]), spoken.join(' | '))
+  check('读屏那一句不带跳动的计时和相对时间', spoken[1] === '正在测试连接' && /^连接成功 42 ms，测试于 \d\d:\d\d$/.test(spoken[2]), spoken.join(' | '))
 
   const radios = page.locator('#radio-demo [role="radio"]')
   check('单选组只占一个 Tab 位', JSON.stringify(await radios.evaluateAll((els) => els.map((el) => el.tabIndex))) === '[0,-1,-1]')
@@ -812,11 +980,11 @@ await section('空态：catalog 的表没取回来时不说「还没有」', asy
     && (await sourceEmpty.locator('#empty-source-action').count()) === 0
     && (await sourceEmpty.locator('[data-empty-unknown="loading"]').getAttribute('role')) === 'status')
   await page.evaluate(() => window.__ui.useCatalog.setState({
-    checks: [{ key: 'workflows', label: '工作流', state: 'error', error: '后端 15 秒没有响应，稍后重试' }],
+    checks: [{ key: 'workflows', label: '工作流', state: 'error', error: '服务端 15 秒未响应，请稍后重试' }],
   }))
   await page.waitForTimeout(50)
-  check('超时或报错：说「工作流没取回来」和原因、给重新读取', (await sourceEmpty.getByText('工作流没取回来').count()) === 1
-    && (await sourceEmpty.getByText(/15 秒没有响应.*这里显示为空不代表没有数据/).count()) === 1
+  check('超时或报错：说「工作流加载失败」和原因、给重新读取', (await sourceEmpty.getByText('工作流加载失败').count()) === 1
+    && (await sourceEmpty.getByText(/15 秒未响应.*此处显示为空不代表没有数据/).count()) === 1
     && (await sourceEmpty.getByRole('button', { name: '重新读取' }).count()) === 1
     && (await sourceEmpty.locator('#empty-source-action').count()) === 0)
   await page.evaluate((c) => window.__ui.useCatalog.setState(c), realCatalog)
@@ -946,13 +1114,13 @@ await section('后端的机读码跟着 ApiError 走', async () => {
   // {detail, code}：detail 是给人看的话、随时会改写，按种类分支要认 code（3C REQ-20）。伪造响应，不碰后端
   const isGen = (u) => new URL(u).pathname === '/api/copilot/generate'
   await page.route(isGen, (r) => r.fulfill({ status: 400, contentType: 'application/json',
-    body: JSON.stringify({ detail: '这一轮圈定的库一个也找不到了', code: 'datasource_scope_empty' }) }))
+    body: JSON.stringify({ detail: '限定的数据源都已不可用，可能已被删除或停用。请取消限定后重试，或到「数据」页确认数据源存在且已启用', code: 'datasource_scope_empty' }) }))
   const coded = await page.evaluate(async () => {
     try { await window.__ui.api.copilot.generate({ instruction: '探针', datasource_ids: ['__gone__'] }); return null }
     catch (e) { return { isApi: e instanceof window.__ui.ApiError, status: e.status, code: e.code ?? null, message: e.message } }
   })
   check('ApiError 带上后端的 code，message 仍是那句话', coded?.isApi && coded.status === 400 && coded.code === 'datasource_scope_empty'
-    && coded.message === '这一轮圈定的库一个也找不到了', JSON.stringify(coded))
+    && coded.message === '限定的数据源都已不可用，可能已被删除或停用。请取消限定后重试，或到「数据」页确认数据源存在且已启用', JSON.stringify(coded))
   await page.unroute(isGen)
 })
 
@@ -1000,12 +1168,12 @@ await section('FastAPI 422：校验错误说中文，英文原文收进详情', 
   // 英文原文里的词（Field required、String should…、Input should…）一个都不能出现在给人看的话里
   const english = /Field required|should|Input|valid|String|Something|went wrong/
   const p = got.provider
-  check('缺必填：字段按表单叫法、说「没有填」', p?.message === '提交的内容不符合要求：「名称」没有填', JSON.stringify(p?.message))
+  check('缺必填：字段按表单叫法、说「为必填项」', p?.message === '提交的内容不符合要求：「名称」为必填项', JSON.stringify(p?.message))
   check('……humanizeError 拆成标题和原因，英文原文进 raw（「详情」里看得到）',
-    p?.title === '提交的内容不符合要求' && p.reason === '「名称」没有填' && /Field required/.test(p.hraw) && p.arr, JSON.stringify(p))
+    p?.title === '提交的内容不符合要求' && p.reason === '「名称」为必填项' && /Field required/.test(p.hraw) && p.arr, JSON.stringify(p))
   const s = got.source
-  check('同一个键在不同表单上叫法不同：数据源的 name 是「标识」；格式不对、要填整数逐条说',
-    s?.message === '提交的内容不符合要求：「标识」格式不对；「端口」要填整数', JSON.stringify(s?.message))
+  check('同一个键在不同表单上叫法不同：数据源的 name 是「标识」；格式不正确、应为整数逐条说',
+    s?.message === '提交的内容不符合要求：「标识」格式不正确；「端口」应为整数', JSON.stringify(s?.message))
   check('数值上限：不能大于 1（1.0 不写成 1.0）', got.memory?.message === '提交的内容不符合要求：「重要度」不能大于 1', JSON.stringify(got.memory?.message))
   check('只能取几个值之一：把可选值列出来', got.conv?.message === '提交的内容不符合要求：「类型」只能取 chat 或 canvas', JSON.stringify(got.conv?.message))
   const w = got.wf
@@ -1029,7 +1197,7 @@ await section('FastAPI 422：校验错误说中文，英文原文收进详情', 
       pathParam: one(d('missing', ['path', 'run_id']), '/runs/x'),
       json: one(d('json_invalid', ['body', 1], { ctx: { error: 'Expecting value' } }), '/providers'),
       bodyMissing: one(d('missing', ['body']), '/providers'),
-      zhValue: one(d('value_error', ['body', 'graph'], { msg: 'Value error, 节点 id 只能包含字母数字、下划线和连字符' }), '/workflows'),
+      zhValue: one(d('value_error', ['body', 'graph'], { msg: 'Value error, 节点 ID 只能包含字母、数字、下划线和连字符，当前为「node 1」' }), '/workflows'),
       enValue: one(d('value_error', ['body', 'name'], { msg: 'Value error, bad name' }), '/providers'),
       tooLong: one(d('string_too_long', ['body', 'name'], { ctx: { max_length: 100 } }), '/skills'),
       listItem: one(d('dict_type', ['body', 'examples', 0]), '/skills'),
@@ -1043,19 +1211,19 @@ await section('FastAPI 422：校验错误说中文，英文原文收进详情', 
   check('lib/validation 挂在预览页上', !!unit)
   if (unit) {
     const want = {
-      query: '参数「limit」要填整数',
-      pathParam: '地址里的「run_id」没有填',
+      query: '参数「limit」应为整数',
+      pathParam: '地址里的「run_id」为必填项',
       json: '提交的内容不是合法的 JSON',
-      bodyMissing: '没有收到提交的内容',
-      zhValue: '「工作流」：节点 id 只能包含字母数字、下划线和连字符',
-      enValue: '「名称」取值不对',
-      tooLong: '「名称」太长，最多 100 个字符',
-      listItem: '「示例」第 1 项格式不对，要是一组键值',
-      gt: '「重要度」要大于 0',
-      manyChoices: '「运行类别」不在允许的取值里',
+      bodyMissing: '未收到提交的内容',
+      zhValue: '「工作流」：节点 ID 只能包含字母、数字、下划线和连字符，当前为「node 1」',
+      enValue: '「名称」取值无效',
+      tooLong: '「名称」过长，最多 100 个字符',
+      listItem: '「示例」第 1 项应为键值对象',
+      gt: '「重要度」应大于 0',
+      manyChoices: '「运行类别」不在允许的取值范围内',
       enumInts: '「level」只能取 1、2 或 3',
       bool: '「只读」只能是「是」或「否」',
-      unknownPath: '「foo_bar」没有填',
+      unknownPath: '「foo_bar」为必填项',
     }
     for (const [k, w] of Object.entries(want)) {
       check(`describeValidation · ${k}：${w}`, unit[k] === w, unit[k] === w ? '' : `得到 ${JSON.stringify(unit[k])}`)
@@ -1139,7 +1307,7 @@ await section('连接状态：心跳、退避、恢复', async () => {
   s = await state()
   check('第二次重试在 8 秒后', s.backend === 'down' && s.retryIn > 5500 && s.retryIn <= 8100 && probes === 2, `${s.retryIn}ms，探了 ${probes} 次`)
   // 横幅每秒刷一次，读到的可能是上一秒的数
-  const shown = Number((await page.getByText(/秒后自动重试/).innerText()).match(/\d+/)?.[0])
+  const shown = Number((await page.getByText(/\d+ 秒后自动重试/).innerText()).match(/\d+/)?.[0])
   const secs = Math.ceil(s.retryIn / 1000)
   check('横幅倒计时和实际重试一致', shown === secs || shown === secs + 1, `横幅 ${shown} 秒，实际 ${secs} 秒`)
   await page.waitForTimeout(s.retryIn + 700)
@@ -1159,7 +1327,7 @@ await section('连接状态：心跳、退避、恢复', async () => {
   if (expectRuns != null) {
     check('页面自己的列表不再是假的空', (await count()) === String(expectRuns), `${await count()} 条，后端有 ${expectRuns} 条`)
   }
-  check('横幅消失', (await page.getByText('后端未连接').count()) === 0)
+  check('横幅消失', (await page.getByText('服务端未连接').count()) === 0)
   await page.evaluate(() => window.__ui.useCatalog.getState().refresh())
   check('连着时再 refresh 不算重连', (await state()).reconnects === reconnects0 + 1)
 

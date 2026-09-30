@@ -239,7 +239,7 @@ async def test_a_report_nobody_sees_is_a_gap(monkeypatch):
                               fields=[{"name": "周期", "value": "{{ input.week }}"}]))
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "degraded"
-    assert any("没有哪个字段" in g for g in issuance["gaps"]), issuance["gaps"]
+    assert any("没有任何字段" in g for g in issuance["gaps"]), issuance["gaps"]
 
 
 async def test_rebuilds_the_catalog_with_the_report_nodes_own_parameters(monkeypatch):

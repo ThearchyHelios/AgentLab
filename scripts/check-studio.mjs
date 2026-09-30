@@ -248,7 +248,7 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
       return json(route, { ...VERSIONS.find((x) => x.version === n), workflow_id: id,
         graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2 })
     }
-    if (method === 'GET' && !sub) return state.deleted.has(id) ? json(route, { detail: '不在了' }, 404) : json(route, FAKES[id])
+    if (method === 'GET' && !sub) return state.deleted.has(id) ? json(route, { detail: '工作流不存在，可能已被删除' }, 404) : json(route, FAKES[id])
     if (method === 'DELETE' && !sub) {
       state.deleted.add(id)
       return route.fulfill({ status: 204, body: '' })
@@ -396,23 +396,23 @@ await section('工具栏：版本标签、校验结论、问题面板定位', as
   const issues = await S(page, () => window.__studio.getState().issues.length)
   check('每条问题一行', rows === issues, `${rows} 行 / ${issues} 条`)
 
-  await page.locator('[data-problem]').filter({ hasText: '还没选工具' }).locator('button').first().click()
+  await page.locator('[data-problem]').filter({ hasText: '还没有选择工具' }).locator('button').first().click()
   await page.waitForTimeout(400)
   const s = await S(page, () => ({ sel: window.__studio.getState().selectedId, focus: window.__studio.getState().focusRequest?.id }))
   check('点一条问题：选中那个节点', s.sel === 'call', s.sel)
   check('点一条问题：请画布取景到它', s.focus === 'call', s.focus)
   const fieldMsg = await page.locator('[data-field="tool"]').innerText().catch(() => '')
-  check('字段级错误落在「工具」输入框下面', fieldMsg.includes('还没选工具'), fieldMsg.slice(0, 40))
+  check('字段级错误落在「工具」输入框下面', fieldMsg.includes('还没有选择工具'), fieldMsg.slice(0, 40))
   const ring = await S(page, () => window.__studio.getState().nodes.filter((n) => n.selected).map((n) => n.id).join(','))
   check('React Flow 的选中和检查器一致', ring === 'call', ring)
 
-  // 图级和悬空边：注入和后端同形的 issues
+  // 图级和无效连线：注入和后端同形的 issues
   await S(page, () => window.__studio.setState((s) => ({ issues: [...s.issues,
-    { level: 'error', node_id: null, edge_id: null, message: '找不到入口：每个节点都有入边，工作流里有环且没有起点' },
-    { level: 'error', node_id: null, edge_id: 'ghost', message: "边指向了不存在的目标节点 'nope'" }] })))
+    { level: 'error', node_id: null, edge_id: null, message: '找不到起始节点：每个节点都有上游连线，工作流中存在环路且没有起点' },
+    { level: 'error', node_id: null, edge_id: 'ghost', message: '连线的终点节点「nope」不存在' }] })))
   await page.waitForTimeout(200)
-  check('图级问题有自己的分组', (await page.locator('[role="list"][aria-label="问题"]').innerText()).includes('整张工作流'))
-  check('悬空边给出「删除这条悬空边」', await count(page, 'button:has-text("删除这条悬空边")') === 1)
+  check('图级问题有自己的分组', (await page.locator('[role="list"][aria-label="问题"]').innerText()).includes('整个工作流'))
+  check('无效连线给出「删除这条无效连线」', await count(page, 'button:has-text("删除这条无效连线")') === 1)
 
   // F8 在节点上的问题之间跳（图级、边上的没有节点可定位，列在面板顶上）
   await blur(page)
@@ -432,7 +432,7 @@ await section('工具栏：版本标签、校验结论、问题面板定位', as
   await S(page, () => window.__studio.getState().select('answer'))
   await page.waitForTimeout(400)
   const promptMsg = await page.locator('[data-field="prompt"]').innerText().catch(() => '')
-  check('下游变量的 warning 落在「用户提示」下面', /之后才跑|取到的会是空值/.test(promptMsg), promptMsg.slice(0, 50))
+  check('下游变量的 warning 落在「用户提示」下面', /之后才执行|取到的将是空值/.test(promptMsg), promptMsg.slice(0, 50))
   check('高亮层把下游变量标成琥珀', await count(page, '[data-field="prompt"] [data-path="vars.summary"][data-tone="late"]') === 1)
   check('能取到的变量是普通胶囊', await count(page, '[data-field="prompt"] [data-path="vars.knowledge"][data-tone="ok"]') === 1)
   check('字段旁标着「模板」', (await page.locator('[data-field="prompt"]').innerText()).includes('模板'))
@@ -445,7 +445,7 @@ await section('工具栏：版本标签、校验结论、问题面板定位', as
   await page.waitForTimeout(200)
   const list = await page.locator('[data-field="prompt"] [role="listbox"]').innerText().catch(() => '')
   check('补全给出上游的 vars.knowledge', list.includes('vars.knowledge'), list.replace(/\s+/g, ' ').slice(0, 80))
-  check('下游的 vars.summary 置灰、写明取不到', /vars\.summary[\s\S]*这里还取不到/.test(list))
+  check('下游的 vars.summary 置灰、写明取不到', /vars\.summary[\s\S]*无法引用/.test(list))
   await page.keyboard.press('Escape')
 
   // 表达式字段敲 {{ 就地提示
@@ -456,7 +456,7 @@ await section('工具栏：版本标签、校验结论、问题面板定位', as
   await page.keyboard.press('End')
   await page.keyboard.type(' {{')
   await page.waitForTimeout(150)
-  check('表达式里敲 {{ 就地提示不需要', (await page.locator('[data-field="cases"]').innerText()).includes('这里是表达式'))
+  check('表达式里敲 {{ 就地提示不需要', (await page.locator('[data-field="cases"]').innerText()).includes('此处为表达式'))
   check('条件字段标着「表达式」', (await page.locator('[data-field="cases"]').innerText()).includes('表达式'))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await ctx.close()
@@ -470,9 +470,9 @@ await section('分支 case：default 拦截、重复标识、出口去重', asyn
   const handles = () => count(page, '.react-flow__node[data-id="gate"] .react-flow__handle.source')
   check('key=default 和兜底出口合并成一个（2 个出口）', await handles() === 2, `${await handles()} 个`)
   const text = await page.locator('[data-field="cases"]').innerText()
-  check('行内说破 default 是保留名', text.includes('兜底出口的保留名'))
+  check('行内说破 default 是保留标识', text.includes('默认出口的保留标识'))
   check('case 表单每个框都有标签', /标识（连线出口）/.test(text) && /说明/.test(text) && /条件/.test(text))
-  await page.locator('[data-field="cases"] button:has-text("改成 team")').click()
+  await page.locator('[data-field="cases"] button:has-text("改为 team")').click()
   await page.waitForTimeout(250)
   const key = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'gate').data.config.cases[1].key)
   check('一键改名为 team', key === 'team', key)
@@ -496,13 +496,13 @@ await section('分支 case：default 拦截、重复标识、出口去重', asyn
   await keyInput.press('Enter')
   await page.waitForTimeout(200)
   check('重复标识落不进画布，退回原来的', await caseKey() === 'crew' && await gateEdge() === 'crew', `${await caseKey()}`)
-  check('说明为什么没改', (await page.locator('[data-field="cases"]').innerText()).includes('没有改成「fast」'))
+  check('说明为什么没改', (await page.locator('[data-field="cases"]').innerText()).includes('未能修改为「fast」'))
   check('重复标识不产生同 id 的两个出口', await count(page, '.react-flow__node[data-id="gate"] .react-flow__handle[data-handleid="fast"]') === 1)
 
   // 禁用 default
   await keyInput.fill('default')
   await page.waitForTimeout(150)
-  check('新写 default 当场拦下', (await page.locator('[data-field="cases"]').innerText()).includes('保留名'))
+  check('新写 default 当场拦下', (await page.locator('[data-field="cases"]').innerText()).includes('保留标识'))
   // 焦点挪到别的输入框上（点画布空白会连检查器一起收起）
   await page.locator('input[id^="node-gate-label"]').click()
   await page.waitForTimeout(200)
@@ -852,8 +852,8 @@ await section('窄屏：次要按钮收进「更多」、助手栏默认收起�
   })
   await page.waitForTimeout(400)
   const worst = await toolbarLayout(page)
-  check('768 宽、失败的运行 + 未保存 + 有错有提示：仍不压、不伸出视口，接着跑露在外面',
-    worst.overlaps.length === 0 && worst.right <= worst.vw && worst.names.includes('接着跑'),
+  check('768 宽、失败的运行 + 未保存 + 有错有提示：仍不压、不伸出视口，继续运行露在外面',
+    worst.overlaps.length === 0 && worst.right <= worst.vw && worst.names.includes('继续运行'),
     `${worst.overlaps.join('、')} right=${worst.right} ${worst.names.join(' ')}`)
   const ver = await page.locator('span[title*="画布是草稿"]').innerText().catch(() => '')
   check('最窄的工具栏里版本标签只留「草稿 vN」（已发布的版本号在正式运行按钮上）', /草稿 v3/.test(ver) && !/已发布/.test(ver), ver)
@@ -880,7 +880,7 @@ await section('文案：运行被拦时点名节点、人工审批兜底摘要�
   const { ctx, page, errors } = await open()
   await waitAnalysis(page)
   const runTitle = await page.locator('[data-run-control] button[aria-label="运行"]').getAttribute('title')
-  check('运行被拦：提示前面点出是哪个节点', /「查询销量」/.test(runTitle ?? '') && /还没选工具/.test(runTitle ?? ''), runTitle)
+  check('运行被拦：提示前面点出是哪个节点', /「查询销量」/.test(runTitle ?? '') && /还没有选择工具/.test(runTitle ?? ''), runTitle)
   check('运行被拦：指向问题面板', /问题面板/.test(runTitle ?? ''), runTitle)
 
   await S(page, () => {
@@ -894,7 +894,7 @@ await section('文案：运行被拦时点名节点、人工审批兜底摘要�
     const n = window.__studio.getState().nodes.find((x) => x.data.nodeType === 'human')
     return document.querySelector(`.react-flow__node[data-id="${CSS.escape(n.id)}"] .nc-summary`)?.textContent ?? ''
   })
-  check('没填标题的人工审批：摘要不写成像状态的「等待人工」', humanSummary === '人工审批 · 未填标题', humanSummary)
+  check('没填标题的人工审批：摘要不写成像状态的「等待人工」', humanSummary === '人工审批 · 未填写标题', humanSummary)
   await S(page, () => { window.__studio.getState().undo(); window.__studio.getState().undo() })
 
   // Skill 目录是空的：空提示给一条去创建的链接
@@ -960,12 +960,12 @@ await section('分析失败不静默', async () => {
   const dockText = await page.locator('#dock-problems').innerText()
   const staleRows = await count(page, '#dock-problems [data-problem]')
   check('分析失败时照样列出上一次的问题，并说明可能过时', staleRows > 0 && dockText.includes('上一次校验'), `${staleRows} 行`)
-  check('校验接口报错（后端没断）不承诺会自动重试', dockText.includes('点「重试」') && !dockText.includes('自动重新校验'))
+  check('校验接口报错（后端没断）不承诺会自动重试', dockText.includes('点击「重试」') && !dockText.includes('自动重新校验'))
   const kept = await S(page, () => window.__studio.getState().issues)
   await S(page, () => window.__studio.setState({ issues: [] }))
   await page.waitForTimeout(100)
-  check('没有旧清单可列时不说「下面列的」', (await page.locator('#dock-problems').innerText()).includes('问题清单暂时拿不到')
-    && !(await page.locator('#dock-problems').innerText()).includes('下面'))
+  check('没有旧清单可列时不说「以下为」', (await page.locator('#dock-problems').innerText()).includes('暂时无法获取问题清单')
+    && !(await page.locator('#dock-problems').innerText()).includes('以下'))
   await page.evaluate((v) => window.__studio.setState({ issues: v }), kept)
   down = false
   await chip.click()
@@ -986,7 +986,7 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   await page.locator('ol[aria-label="版本"] > li').nth(2).locator('button').first().click()
   await page.waitForTimeout(500)
   check('选一版给出缩略图预览', await count(page, 'svg[aria-label^="缩略图"]') === 1)
-  check('预览列出恢复后会拿掉的节点', (await page.locator('[role="dialog"][aria-label="版本历史"]').innerText()).includes('拿掉'))
+  check('预览列出恢复后将移除的节点', (await page.locator('[role="dialog"][aria-label="版本历史"]').innerText()).includes('将移除'))
   const before = await st(page)
   await page.locator('button:has-text("恢复 v1 到画布")').click()
   await page.waitForTimeout(300)
@@ -994,7 +994,7 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   const note = await S(page, () => window.__studio.getState().pendingNote)
   check('恢复：画布换成 v1', after.nodes.length === V1.nodes.length, `${after.nodes.length} 个节点`)
   check('恢复不调后端 restore（受管不会被悄悄保留）', !writes.some((w) => w.includes('/restore')))
-  check('保存时写「回滚到 v1」', note === '回滚到 v1', note)
+  check('保存时写「恢复到 v1」', note === '恢复到 v1', note)
   await blur(page)
   await page.keyboard.press(`${MOD}+z`)
   await page.waitForTimeout(200)
@@ -1002,7 +1002,7 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   await page.keyboard.press(`${MOD}+Shift+z`)
   await page.keyboard.press(`${MOD}+s`)
   await page.waitForTimeout(400)
-  check('保存带上版本说明', state.patches[0]?.note === '回滚到 v1', JSON.stringify(state.patches[0] ?? {}).slice(0, 60))
+  check('保存带上版本说明', state.patches[0]?.note === '恢复到 v1', JSON.stringify(state.patches[0] ?? {}).slice(0, 60))
   await ctx.close()
 })
 
@@ -1033,7 +1033,7 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
     { op: 'check', status: 'passed', repaired: 0 },
     { op: 'final', graph: finalGraph, explanation: '加了润色', layout: { mode: 'keep', placed: ['polish'] },
       issues: [{ level: 'warning', node_id: null, code: 'unknown_node_type', type: 'magic',
-        message: '模型写了一个不存在的节点类型「magic」，这一步已跳过' }] },
+        message: '模型使用了不存在的节点类型「magic」，已跳过这一步' }] },
   ]
   const past0 = (await st(page)).past
   const began = await S(page, () => window.__studio.getState().runCopilot('给快速回答后面加一步润色', true))
@@ -1089,7 +1089,7 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   state.stream = [
     { op: 'model', model: 'fake-model' },
     { op: 'add_node', node: { id: 'x1', type: 'llm', label: '半截', config: {} } },
-    { op: 'error', message: '助手这一轮没跑完：模型超时' },
+    { op: 'error', message: '助手本轮未完成：等待超时：服务方未在限定时间内响应' },
   ]
   const b3 = await st(page)
   await S(page, () => window.__studio.getState().runCopilot('重新设计', false))
@@ -1105,9 +1105,9 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   state.stream = 'hang'
   await S(page, () => window.__studio.getState().runCopilot('慢慢想', true))
   await page.waitForTimeout(300)
-  const bar = page.locator('div:has(> [role="status"]:has-text("助手正在改这张工作流"))')
+  const bar = page.locator('div:has(> [role="status"]:has-text("助手正在修改工作流"))')
   check('生成中画布上方有进度条和停止', await bar.locator('button:has-text("停止")').count() === 1)
-  const spoken = await page.locator('[role="status"]:has-text("助手正在改这张工作流")').innerText()
+  const spoken = await page.locator('[role="status"]:has-text("助手正在修改工作流")').innerText()
   check('播报区只圈阶段文字，不带 100ms 一跳的计时', !/\d\d:\d\d/.test(spoken)
     && /\d\d:\d\d/.test(await bar.innerText()), spoken)
   const n4 = (await st(page)).nodes.length
@@ -1122,7 +1122,7 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   // 5) 让助手再修一次：把剩下的问题拼成指令，在现有的图上改
   state.stream = [
     { op: 'model', model: 'fake-model' },
-    { op: 'check', status: 'failed', issues: ['「查询销量」：「调用工具」节点还没选工具'] },
+    { op: 'check', status: 'failed', issues: ['「查询销量」：「调用工具」节点还没有选择工具'] },
     { op: 'final', graph: GRAPH, explanation: '', layout: { mode: 'keep', placed: [] }, issues: [] },
   ]
   await S(page, () => window.__studio.getState().runCopilot('检查一下', true))
@@ -1132,7 +1132,7 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   await S(page, (id) => window.__studio.getState().repairWithCopilot(id), turnId)
   await page.waitForTimeout(400)
   const lastBody = state.bodies.at(-1)
-  check('再修一次：指令里带着剩下的问题', lastBody?.instruction?.includes('还没选工具') && !!lastBody?.base_graph,
+  check('再修一次：指令里带着剩下的问题', lastBody?.instruction?.includes('还没有选择工具') && !!lastBody?.base_graph,
     (lastBody?.instruction ?? '').slice(0, 40))
 
   // 6) 开始新对话：换会话，记忆清零
@@ -1160,7 +1160,7 @@ await section('入口：?run=&focus=、选择器、发布弹窗', async () => {
   const rows = await count(page, '[role="listbox"][aria-label="工作流"] > li')
   check('选择器能搜索', rows === Object.keys(FAKES).length, `${rows} 条`)
   check('当前工作流有底色和勾', await count(page, 'li[aria-selected="true"] .bg-accent-solid') === 1)
-  check('模板行常驻「用它新建」', await count(page, 'li:has-text("__studio_check_tpl__") button:has-text("用它新建")') === 1)
+  check('模板行常驻「以此模板新建」', await count(page, 'li:has-text("__studio_check_tpl__") button:has-text("以此模板新建")') === 1)
   check('标签本地化（extracted → 从运行提取）', await count(page, 'li:has-text("__studio_check_tpl__") :text("从运行提取")') === 1)
   const mainRow = page.locator('li[role="option"]', { has: page.locator('span.truncate', { hasText: /^__studio_check__$/ }) })
   const chips = await mainRow.locator('.chip').allInnerTexts()
@@ -1214,7 +1214,7 @@ await section('入口：?run=&focus=、选择器、发布弹窗', async () => {
   check('选项用统一术语（已发布 — 可发起正式运行）', await gov.page.getByText('已发布 — 可发起正式运行').count() === 1)
   check('写明以谁的名义发布', await gov.page.getByText('检查脚本').count() >= 1)
   await gov.page.locator('[role="dialog"] [role="radio"]:has-text("已发布")').click()
-  check('从受管降级要说出来', await gov.page.getByText(/会降级/).count() === 1)
+  check('从受管降级要说出来', await gov.page.getByText(/将降级/).count() === 1)
   await gov.ctx.close()
 })
 
@@ -1233,7 +1233,7 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
       { name: 'checker', description: '复核口径', tools: ['db_schema__shop'], system: null },
     ] } },
     { op: 'update_node', id: 'fetch', config: { max_steps: null } },
-    { op: 'error', message: '助手这一轮没跑完：等待超时', hint: '换一个响应快的模型再试', detail: 'ReadTimeout: 120s' },
+    { op: 'error', message: '助手本轮未完成：等待超时：服务方未在限定时间内响应', hint: '服务方可能繁忙或网络不稳定，请稍后重试；持续超时请检查地址和网络', detail: 'ReadTimeout: 120s' },
   ]
   await S(page, () => window.__studio.getState().runCopilot('按月份拆一下', true))
   await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
@@ -1260,8 +1260,8 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
     JSON.stringify(checker))
   check('团队没写的顶层键保留', half.team?.max_rounds === 4 && half.team?.goal === '核对按月的订单数')
   const cp = await S(page, () => window.__studio.getState().copilot)
-  check('出错时保留「怎么办」和技术细节（Composer 的错误条要用）',
-    cp.error.includes('等待超时') && cp.errorHint === '换一个响应快的模型再试' && cp.errorDetail === 'ReadTimeout: 120s',
+  check('出错时保留处理建议和技术细节（Composer 的错误条要用）',
+    cp.error.includes('等待超时') && cp.errorHint === '服务方可能繁忙或网络不稳定，请稍后重试；持续超时请检查地址和网络' && cp.errorDetail === 'ReadTimeout: 120s',
     JSON.stringify({ hint: cp.errorHint, detail: cp.errorDetail }))
   const t0 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
   check('这一轮记下开始时刻（助手流头部的实时计时用）', typeof t0.startedAt === 'number'
@@ -1290,8 +1290,8 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
   }
   const warn = (id, field, message) => ({ level: 'warning', node_id: id, edge_id: null, code: 'tools_dropped', field, message })
   const warnings = [
-    warn('fetch', 'tools', '「数据查询」的工具从 db_query__shop、db_schema__shop 变成了空。这一轮的要求里没有提到去掉工具，确认一下是不是改漏了'),
-    warn('team', 'agents[0].tools', '「复核团队」的成员「fetcher」的工具从 db_query__shop 变成了空。这一轮的要求里没有提到去掉工具，确认一下是不是改漏了'),
+    warn('fetch', 'tools', '「数据查询」的工具从 db_query__shop、db_schema__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果'),
+    warn('team', 'agents[0].tools', '「复核团队」的成员「fetcher」的工具从 db_query__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果'),
   ]
   const changes = [
     { node_id: 'fetch', label: '数据查询', member: null, field: 'tools', before: QUERY_TOOLS, after: [], added: [], removed: QUERY_TOOLS },
@@ -1317,7 +1317,7 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
   check('自查那一步也带着这两条提醒', t1.check?.warnings?.length === 2, JSON.stringify(t1.check?.warnings))
   check('记下的 final 操作带着 tool_changes（右栏回执从它解码）',
     t1.ops.find((o) => o.op === 'final')?.tool_changes?.length === 2)
-  const toastBox = page.locator('[role="status"] > div').filter({ hasText: '工具绑定变少了' })
+  const toastBox = page.locator('[role="status"] > div').filter({ hasText: '以下工具绑定被移除' })
   const toastText = (await toastBox.first().innerText().catch(() => '')).replace(/\s+/g, ' ')
   check('工具集合变小：回执是 warn 色，逐条列出前后', await toastBox.count() === 1
     && toastText.includes('「数据查询」') && toastText.includes('db_query__shop、db_schema__shop → 空')
@@ -1353,11 +1353,11 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
   ]
   await S(page, () => window.__studio.getState().runCopilot('把「数据查询」的查库工具去掉', true))
   await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
-  const mixedToast = page.locator('[role="status"] > div').filter({ hasText: '（按要求）' })
+  const mixedToast = page.locator('[role="status"] > div').filter({ hasText: '已按要求移除' })
   const mixedText = await mixedToast.first().innerText({ timeout: 2000 }).catch(() => '')
   const lines = mixedText.split('\n').map((l) => l.trim()).filter(Boolean)
-  const unaskedAt = lines.findIndex((l) => l.includes('这一轮没让删'))
-  const askedAt = lines.findIndex((l) => l.includes('工具绑定变少了（按要求）'))
+  const unaskedAt = lines.findIndex((l) => l.includes('本轮并未要求删除'))
+  const askedAt = lines.findIndex((l) => l.includes('已按要求移除以下工具绑定'))
   const lineOf = (needle) => lines.findIndex((l) => l.includes(needle))
   check('回执分两组：没让删的列在「确认一下」底下，按要求删的另列', unaskedAt >= 0 && askedAt > unaskedAt
     && lineOf('的成员「fetcher」') > unaskedAt && lineOf('的成员「fetcher」') < askedAt
@@ -1380,11 +1380,11 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
     return { mixed: none, asked: none, unasked: none, legacy: none }
   })
   check('有没让删的：warn 色、常驻到人看过', receipt.mixed.kind === 'warn' && receipt.mixed.sticky === true
-    && receipt.unasked.sticky === true && !receipt.unasked.text.includes('（按要求）'), JSON.stringify(receipt.unasked).slice(0, 120))
+    && receipt.unasked.sticky === true && !receipt.unasked.text.includes('已按要求移除'), JSON.stringify(receipt.unasked).slice(0, 120))
   check('全是按要求删的：不常驻、不标 warn，也不说「改漏了」', receipt.asked.sticky === false && receipt.asked.kind === 'ok'
-    && receipt.asked.text.includes('（按要求）') && !receipt.asked.text.includes('没让删'), receipt.asked.text.replace(/\n/g, ' / '))
+    && receipt.asked.text.includes('已按要求移除') && !receipt.asked.text.includes('本轮并未要求删除'), receipt.asked.text.replace(/\n/g, ' / '))
   check('提醒不带 field 时按节点认', receipt.legacy.sticky && receipt.legacy.text.indexOf('fetcher')
-    < receipt.legacy.text.indexOf('（按要求）'), receipt.legacy.text.replace(/\n/g, ' / '))
+    < receipt.legacy.text.indexOf('已按要求移除'), receipt.legacy.text.replace(/\n/g, ' / '))
 
   // 自查的问题：后端现在给对象 {level, node_id, edge_id, message, field, code}。拼好的一行字
   // 给「再修一次」用，原样的对象留着给「定位」落到检查器里那一栏（循环的条件、成员的工具）
@@ -1392,17 +1392,17 @@ await section('助手改节点是合并，不是整体替换（NI-1）；出错�
     { op: 'model', model: 'fake-model' },
     { op: 'check', status: 'repairing', round: 1, issues: [
       { level: 'error', node_id: 'team', edge_id: null, field: 'agents[1].tools', message: '成员「writer」的提示词要求用「python_exec」，但没有给这个成员绑定它' },
-      '「查询销量」：「调用工具」节点还没选工具',
+      '「查询销量」：「调用工具」节点还没有选择工具',
     ] },
     { op: 'check', status: 'failed', issues: [
-      { level: 'error', node_id: 'fetch', edge_id: null, field: 'prompt', code: 'datasource_out_of_scope', message: '用了限定范围之外的数据源 archive_db：这一轮只查 shop' },
+      { level: 'error', node_id: 'fetch', edge_id: null, field: 'prompt', code: 'datasource_out_of_scope', message: '使用了限定范围之外的数据源 archive_db：本轮只允许使用 shop' },
     ] },
     { op: 'final', graph: TEAM_BOUND, explanation: '', layout: { mode: 'keep', placed: [] }, issues: [] },
   ]
   await S(page, () => window.__studio.getState().runCopilot('按门店拆一下', true))
   await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
   const ck = await S(page, () => window.__studio.getState().copilotTurns.at(-1).check)
-  check('自查问题留着拼好的一行字（带节点名）', ck?.issues?.[0]?.startsWith('「数据查询」：用了限定范围之外的数据源'), JSON.stringify(ck?.issues))
+  check('自查问题留着拼好的一行字（带节点名）', ck?.issues?.[0]?.startsWith('「数据查询」：使用了限定范围之外的数据源'), JSON.stringify(ck?.issues))
   check('也留着原样的 {node_id, field, code}', ck?.items?.length === 1 && ck.items[0].node_id === 'fetch'
     && ck.items[0].field === 'prompt' && ck.items[0].code === 'datasource_out_of_scope' && ck.items[0].level === 'error',
     JSON.stringify(ck?.items))
@@ -1515,14 +1515,14 @@ await section('正式运行期间画布只读：调色板、粘贴、复制、�
   await clearToasts()
   await S(page, () => window.__studio.getState().addNode('llm'))
   check('store 这一层也拦着（直接调 addNode 不生效）', (await st(page)).nodes.length === s0.nodes.length)
-  // 收起的图标轨：悬停 / 聚焦的说明换成锁的原因，不再劝人「点一下放在视野中间」
+  // 收起的图标轨：悬停 / 聚焦的说明换成锁的原因，不再劝人「点击添加到视图中央」
   await page.getByRole('button', { name: '收起节点库' }).click({ timeout: 2000 }).catch(() => {})
   await page.waitForTimeout(200)
   const railBtn = page.locator('[aria-label="节点库（已收起）"] button[data-node-type]').first()
   await railBtn.focus({ timeout: 2000 }).catch(() => {})
   await page.waitForTimeout(150)
   const railTip = await page.locator('[role="tooltip"]').innerText().catch(() => '')
-  check('图标轨聚焦时说明锁的原因', railTip.includes('只读') && !railTip.includes('放在视野中间')
+  check('图标轨聚焦时说明锁的原因', railTip.includes('只读') && !railTip.includes('添加到视图中央')
     && await railBtn.getAttribute('aria-disabled') === 'true', railTip.replace(/\s+/g, ' ').slice(0, 60))
   await page.keyboard.press('Enter')
   await page.waitForTimeout(200)
@@ -1556,7 +1556,7 @@ await section('正式运行期间画布只读：调色板、粘贴、复制、�
   await S(page, () => window.__studio.getState().select('fetch'))
   await page.waitForTimeout(300)
   check('检查器整块只读，并说明原因', await count(page, 'fieldset[disabled]:has([data-field="prompt"])') === 1
-    && await page.getByText('只能看，不能改').count() === 1)
+    && await page.getByText('只读', { exact: true }).count() === 1)
   await S(page, () => window.__studio.getState().updateNode('fetch', { label: '改不动' }))
   check('store 这一层也拦着（直接调 updateNode 不生效）',
     (await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'fetch').data.label)) === '数据查询')
@@ -1577,7 +1577,7 @@ await section('正式运行期间画布只读：调色板、粘贴、复制、�
     return el ? { text: el.textContent ?? '', cut: el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1,
                   size: parseFloat(getComputedStyle(el).fontSize), title: el.getAttribute('title') } : null
   })
-  check('输入框下写全锁的原因（换行不截断，字不小于 11px）', !!lockHint && lockHint.text.includes('结束后再改') && !lockHint.cut
+  check('输入框下写全锁的原因（换行不截断，字不小于 11px）', !!lockHint && lockHint.text.includes('请在运行结束后编辑') && !lockHint.cut
     && lockHint.size >= 11, JSON.stringify(lockHint))
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {
@@ -1596,7 +1596,7 @@ await section('正式运行期间画布只读：调色板、粘贴、复制、�
 
   // Shift+1 的名字要和它做的事一致：它回到打开时的取景（从入口看起），不是「看全所有节点」
   const fit = await page.evaluate(async () => (await import('/src/canvas/shortcuts.ts')).studioShortcut('fit').label)
-  check('Shift+1 叫「重新取景」', fit.startsWith('重新取景') && !fit.includes('看全'), fit)
+  check('Shift+1 叫「重置视图」', fit.startsWith('重置视图') && !/看全|适应画布/.test(fit), fit)
   await ctx.close()
 })
 
@@ -1828,7 +1828,7 @@ await section('自动排版：请求在路上时画布锁了或改了，不套�
   const kept = await S(page, () => window.__studio.getState().nodes.find((n) => n.id === 'lookup')?.data.label)
   check('排版期间又改了画布：不拿旧图的排版盖掉刚才的改动', kept === '背景检索（排版时改的）', kept)
   check('说清这次排版没套用', await okToast.count() === 0
-    && await page.locator('[role="status"] > div').filter({ hasText: '排版期间画布又改过了' }).count() === 1)
+    && await page.locator('[role="status"] > div').filter({ hasText: '排版期间画布已被修改' }).count() === 1)
 
   done = laidOut()
   await layoutBtn.click()
@@ -2009,11 +2009,11 @@ await section('工作流目录没取回来：不劝人新建（EmptyState source
         : route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本伪造的 500' }) })
     })
     await page.goto(`${WEB}/studio`, { waitUntil: 'domcontentloaded' })
-    // 目录一直不回来时，启动屏 5 秒后给「先进去看看」：进去之后才轮到编排页说话
-    if (mode === 'loading') await page.getByRole('button', { name: '先进去看看' }).click({ timeout: 12000 }).catch(() => {})
+    // 目录一直不回来时，启动屏 5 秒后给「直接进入」：进去之后才轮到编排页说话
+    if (mode === 'loading') await page.getByRole('button', { name: '直接进入' }).click({ timeout: 12000 }).catch(() => {})
     const hit = await page.waitForSelector(`[data-empty-unknown="${mode}"]`, { timeout: 8000 }).then(() => true).catch(() => false)
-    check(mode === 'loading' ? '目录还在读：说「正在读取」' : '目录没取回来：说没取回来、给重新读取', hit
-      && (mode === 'loading' ? /正在读取/ : /没取回来/).test(await page.locator('[data-empty-unknown]').innerText()))
+    check(mode === 'loading' ? '目录还在读：说「正在读取」' : '目录没取回来：说加载失败、给重新读取', hit
+      && (mode === 'loading' ? /正在读取/ : /加载失败/).test(await page.locator('[data-empty-unknown]').innerText()))
     check(mode === 'loading' ? '读的时候不劝人新建' : '读失败时不劝人新建',
       await page.getByRole('button', { name: /新建工作流/ }).count() === 0)
     await ctx.close()
@@ -2047,7 +2047,7 @@ await section('删掉眼前这张', async () => {
   const e = await S(solo.page, () => ({ wf: window.__studio.getState().workflow?.id ?? null, nodes: window.__studio.getState().nodes.length }))
   check('一张不剩：画布卸空，回到「还没有工作流」', e.wf === null && e.nodes === 0
     && await solo.page.getByText('还没有工作流').count() === 1 && new URL(solo.page.url()).pathname === '/studio', JSON.stringify(e))
-  check('卸空时不误报「不在了」', await solo.page.getByText('那张工作流不在了').count() === 0)
+  check('卸空时不误报「不存在」', await solo.page.getByText('该工作流不存在').count() === 0)
   await solo.ctx.close()
 })
 
@@ -2059,47 +2059,50 @@ await section('发起就被拒（工具不存在）给修复入口；整形节�
     const m = await window.__appImport('/src/lib/explain.ts')
     const e = (msg, code) => Object.assign(new Error(msg), code ? { code } : {})
     return {
+      // 工具不存在的三条喂的是旧原文（「在本机不存在」「绑的」「去数据页接入」）：历史运行里存的是这种说法，
+      // 证明它仍认得；后端现在的原文见下面画布上发起被拒那段（DETAIL）
       data: m.explainRunError('绑定的工具在本机不存在：「查数」（调用工具）绑的 db_query__nope；「团队」的成员「研究员」绑的 db_schema__nope。去数据页接入，或在节点里重新选'),
       custom: m.explainRunError('绑定的工具在本机不存在：「查数」（Agent）绑的 lookup_order。去工具页接入，或在节点里重新选'),
       mcp: m.explainRunError('绑定的工具在本机不存在：「查数」（Agent）绑的 mcp:shop/query。去工具页接入，或在节点里重新选'),
-      coded: m.explainStartError(e('发起不了：这几个工具不在了', 'run_tool_missing')),
-      other: m.explainStartError(e('那张工作流不在了', 'workflow_gone')),
-      up: m.explainRunError('上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串里有没转义的英文引号；让模型交结构化数据请用 output_schema + cite_fields'),
-      pointed: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.result }} 是模型写的文字，放进 JSON 要写成 {{ vars.result | json }}（外面不要再加引号）'),
-      empty: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.x }} 取出来是空的，这里缺一个值：检查路径写对没有、前面的节点有没有产出'),
-      old: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。检查模板里的引号、逗号，字符串值要用 | json 过滤器输出'),
+      // 话故意不是「绑定的工具不存在」：看的是只认机读码
+      coded: m.explainStartError(e('无法发起：部分工具不存在', 'run_tool_missing')),
+      other: m.explainStartError(e('工作流不存在，可能已被删除', 'workflow_gone')),
+      up: m.explainRunError('上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串中有未转义的英文引号；如需模型输出结构化数据，请为其配置「结构化输出 Schema」；数字需要进入口径卡时，请改用 Agent 并开启「按出处核对字段」'),
+      pointed: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.result }} 是模型写的文字，放入 JSON 时请写成 {{ vars.result | json }}（外面不要再加引号）'),
+      empty: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。模板里 {{ vars.x }} 的取值为空，此处缺少一个值：请检查路径是否正确、前面的节点是否有产出'),
+      old: m.explainRunError('模板渲染出来的不是合法 JSON（第 1 行第 20 列附近）。请检查模板中的引号和逗号，字符串值需使用 | json 过滤器输出'),
     }
   })
-  check('工具不存在：数据源工具（db_query__ / db_schema__）指向数据页，不给接着跑',
-    x.data.fixTo === '/data' && x.data.fixLabel === '去数据页接入' && x.data.continuable === false, JSON.stringify(x.data).slice(0, 160))
-  check('……自定义工具指向工具页的自定义工具，一个工具时标题点名', x.custom.fixTo === '/tools/custom' && x.custom.fixLabel === '去工具页接入'
-    && x.custom.continuable === false && x.custom.title === '绑定的工具「lookup_order」在本机不存在', `${x.custom.fixTo} ${x.custom.title}`)
+  check('工具不存在：数据源工具（db_query__ / db_schema__）指向数据页，不给继续运行',
+    x.data.fixTo === '/data' && x.data.fixLabel === '前往「数据」页接入' && x.data.continuable === false, JSON.stringify(x.data).slice(0, 160))
+  check('……自定义工具指向工具页的自定义工具，一个工具时标题点名', x.custom.fixTo === '/tools/custom' && x.custom.fixLabel === '前往「工具」页接入'
+    && x.custom.continuable === false && x.custom.title === '绑定的工具「lookup_order」不存在', `${x.custom.fixTo} ${x.custom.title}`)
   check('……MCP 工具指向工具页的 MCP 接入', x.mcp.fixTo === '/tools/mcp', x.mcp.fixTo)
   check('发起报错认机读码 run_tool_missing（话改了也认），别的码不认', x.coded?.continuable === false && x.coded?.fixTo === '/tools'
     && x.other === null, JSON.stringify({ coded: x.coded?.fixTo, other: x.other }))
   check('上游写坏了 JSON：入口指到上游「快速回答」（fixNode），不指整形节点', x.up.fixNode === '快速回答' && x.up.fix === 'canvas' && !x.up.continuable, x.up.fixNode)
-  check('模板里 {{ 开头（后端给了准确改法）：不再追加「改用 output_schema」', !x.pointed.action.includes('output_schema')
-    && x.pointed.action.includes('| json') && !x.empty.action.includes('output_schema'), `${x.pointed.action} ｜ ${x.empty.action}`)
-  check('……老的笼统说法照旧追加那一句', x.old.action.includes('output_schema + cite_fields'), x.old.action)
+  check('模板里 {{ 开头（后端给了准确改法）：不再追加「改用结构化输出 Schema」', !x.pointed.action.includes('结构化输出 Schema')
+    && x.pointed.action.includes('| json') && !x.empty.action.includes('结构化输出 Schema'), `${x.pointed.action} ｜ ${x.empty.action}`)
+  check('……笼统的说法照旧追加那一句', x.old.action.includes('「结构化输出 Schema」和「按出处核对字段」'), x.old.action)
 
-  // 画布上发起：POST /runs 回 422 run_tool_missing，报错里给「去数据页接入」，点了就去
-  const DETAIL = '绑定的工具在本机不存在：「查询销量」（调用工具）绑的 db_query__nope。去数据页接入，或在节点里重新选'
+  // 画布上发起：POST /runs 回 422 run_tool_missing，报错里给「前往「数据」页接入」，点了就去
+  const DETAIL = '绑定的工具不存在：「查询销量」（调用工具）绑定的 db_query__nope。请到「数据」页接入，或在节点中重新选择'
   await page.route(/\/api\/runs$/, (route) => (route.request().method() === 'POST'
     ? route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ detail: DETAIL, code: 'run_tool_missing' }) })
     : route.fallback()))
-  // 这张图有一处「还没选工具」会把运行按钮置灰：等校验落定后清掉，只看发起被拒这一步
+  // 这张图有一处「还没有选择工具」会把运行按钮置灰：等校验落定后清掉，只看发起被拒这一步
   await waitAnalysis(page)
   await S(page, () => window.__studio.setState({ issues: [] }))
   await page.waitForTimeout(150)
   await page.locator('[data-run-control] button[aria-label="运行"]').click()
   await page.locator('[role="dialog"][aria-label="探索运行"]').locator('textarea, input').first().fill('x')
   await page.locator('[role="dialog"][aria-label="探索运行"] button.btn-primary').click()
-  const fixBtn = page.getByRole('button', { name: '去数据页接入' })
+  const fixBtn = page.getByRole('button', { name: '前往「数据」页接入' })
   await fixBtn.waitFor({ timeout: 4000 }).catch(() => {})
-  check('发起被拒：报错里有「去数据页接入」', await fixBtn.count() === 1)
-  const toastText = await page.locator('text=绑定的工具「db_query__nope」在本机不存在').first().innerText().catch(() => '')
-  check('……标题点名那个工具，原因里说这次运行没有发起', toastText.includes('db_query__nope') && toastText.includes('没有发起'), toastText.slice(0, 120))
-  check('……没有「接着跑」', await page.getByRole('button', { name: '接着跑' }).count() === 0)
+  check('发起被拒：报错里有「前往「数据」页接入」', await fixBtn.count() === 1)
+  const toastText = await page.locator('text=绑定的工具「db_query__nope」不存在').first().innerText().catch(() => '')
+  check('……标题点名那个工具，原因里说本次运行未启动', toastText.includes('db_query__nope') && toastText.includes('本次运行未启动'), toastText.slice(0, 120))
+  check('……没有「继续运行」', await page.getByRole('button', { name: '继续运行' }).count() === 0)
   if (SHOTS) {
     for (const theme of ['dark', 'light']) {
       await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
@@ -2114,7 +2117,7 @@ await section('发起就被拒（工具不存在）给修复入口；整形节�
 
   // 整形节点解析上游的文字失败：轮次顶上的入口打开上游「快速回答」的设置，不是「汇总」
   const run = await open()
-  const UP = '上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串里有没转义的英文引号；让模型交结构化数据请用 output_schema + cite_fields'
+  const UP = '上游「快速回答」输出的不是合法 JSON（第 12 列附近），常见原因是字符串中有未转义的英文引号；如需模型输出结构化数据，请为其配置「结构化输出 Schema」；数字需要进入口径卡时，请改用 Agent 并开启「按出处核对字段」'
   await S(run.page, (msg) => {
     const st = window.__studio
     const t = Date.now() / 1000 - 5
@@ -2172,7 +2175,7 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
     + st.unknown_entities + st.uncited_claims
   // 另一次运行（结论句策略 off）：章上的数照 stampCounts 的口径算
   const sd = fxe.dup.report_checked.stats
-  const dupText = `引用 ${sd.numbers_cited + sd.values + (sd.entities ?? 0) + (sd.quotes ?? 0)} · 无证据 ${(sd.numbers - sd.numbers_cited)
+  const dupText = `有出处 ${sd.numbers_cited + sd.values + (sd.entities ?? 0) + (sd.quotes ?? 0)} · 无证据 ${(sd.numbers - sd.numbers_cited)
     + Math.max(0, sd.uncited_numbers + sd.unresolved - (sd.numbers - sd.numbers_cited)) + (sd.unknown_entities ?? 0)}`
   /** 画布上把运行摘下来（RunHud「清除」）：等它重新去取这张图的最近一次运行（取回来、画完再读章） */
   const clearAndRefetch = async (pg) => {
@@ -2204,9 +2207,9 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
   }, { id: EV_RUN, rc: fxe.report_checked, output: fxe.output })
   await stamp(page).waitFor({ timeout: 4000 }).catch(() => {})
   const text = await stamp(page).innerText().catch(() => '')
-  check(`报告卡上盖章「引用 ${cited} · 无证据 ${none}」`, text === `引用 ${cited} · 无证据 ${none}`, text)
+  check(`报告卡上盖章「有出处 ${cited} · 无证据 ${none}」`, text === `有出处 ${cited} · 无证据 ${none}`, text)
   const title = await stamp(page).getAttribute('title').catch(() => '')
-  check('章的悬停说明写出可疑名字、没挂依据的结论句计入缺口', (title ?? '').includes('可能是编造的名字 2')
+  check('章的悬停说明写出可疑名字、没挂依据的结论句计入缺口', (title ?? '').includes('疑似不存在的名称 2')
     && (title ?? '').includes('计入缺口'), (title ?? '').replace(/\n/g, ' / '))
   check('有缺口的章用提醒色，不是绿的', (await stamp(page).getAttribute('class')).includes('is-degraded'))
   check('别的节点卡上没有章', await page.locator('[data-report-stamp]').count() === 1)
@@ -2262,7 +2265,7 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
   latestRun = EV_RUN
   const refetched = await clearAndRefetch(page)
   check('「清除」摘下运行：重新取这张图的最近一次运行', refetched)
-  check('……章取刚才那次（打开画布时还没跑过，不能照旧不画）', (await stamp(page).innerText().catch(() => '没有章')) === `引用 ${cited} · 无证据 ${none}`,
+  check('……章取刚才那次（打开画布时还没跑过，不能照旧不画）', (await stamp(page).innerText().catch(() => '没有章')) === `有出处 ${cited} · 无证据 ${none}`,
     await stamp(page).innerText().catch(() => '没有章'))
   check('没有运行时报错（证据路径）', errors.length === 0, errors.slice(0, 2).join(' | '))
   await page.context().close()
@@ -2272,7 +2275,7 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
   const latest = await open({ path: '/studio/st-ev', before: routes(() => latestNow) })
   await stamp(latest.page).waitFor({ timeout: 4000 }).catch(() => {})
   check('没挂运行：章取这张图最近一次运行的核对统计（和挂着运行时一样，结论句策略也算上）',
-    (await stamp(latest.page).innerText().catch(() => '')) === `引用 ${cited} · 无证据 ${none}`,
+    (await stamp(latest.page).innerText().catch(() => '')) === `有出处 ${cited} · 无证据 ${none}`,
     await stamp(latest.page).innerText().catch(() => '没有章'))
   if (SHOTS) {
     // 取景到报告节点（可读的缩放），截卡片连同下沿的章，四周留一圈
@@ -2305,7 +2308,7 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
   latestNow = fxe.dup.run_id
   const again = await clearAndRefetch(latest.page)
   check('「清除」之后重新取最近一次运行（打开画布时取的那份作废）', again)
-  check(`……章换成新跑的那次（${dupText}），不是打开画布时的「引用 ${cited} · 无证据 ${none}」`,
+  check(`……章换成新跑的那次（${dupText}），不是打开画布时的「有出处 ${cited} · 无证据 ${none}」`,
     (await stamp(latest.page).innerText().catch(() => '没有章')) === dupText, await stamp(latest.page).innerText().catch(() => '没有章'))
   check('没有运行时报错（最近一次运行的章）', latest.errors.length === 0, latest.errors.slice(0, 2).join(' | '))
   await latest.ctx.close()

@@ -458,7 +458,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       </div>
       {shownBlocks < blocks.length && (
         <div className="mt-1 flex items-center gap-2 text-2xs">
-          <span className="text-dim">…后面还有，这里先折叠了</span>
+          <span className="text-dim">…以下内容已折叠</span>
           <button type="button" className="text-[var(--accent)] hover:underline" onClick={() => setExpanded(true)}>
             展开全部（{formatNumber(totalChars)} 字）
           </button>

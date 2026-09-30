@@ -7,6 +7,7 @@ from typing import Any, Callable
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.engine.labels import contract_label, field_label, judge_label, option_label, q
 from app.engine.schema import (
     CLAIMS_JUDGE,
     GraphNode,
@@ -25,11 +26,7 @@ from app.engine.schema import (
 # 就是"上周和这周的数其实不可比，但报表看起来一切正常"。
 UPGRADE_POLICIES = {"recompute", "dual", "incomparable"}
 
-UPGRADE_POLICY_LABELS = {
-    "recompute": "用新口径回算历史",
-    "dual": "并排双印新旧口径",
-    "incomparable": "标注与历史不可比",
-}
+UPGRADE_POLICY_LABELS = {k: option_label("upgrade_policy", k) for k in ("recompute", "dual", "incomparable")}
 
 
 def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
@@ -58,38 +55,38 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
         if node.type == NodeType.SUPERVISOR:
             # 全动态规划属于探索层。受管模板里出现它，等于把 XAgent 搬上了生产线。
             flag(
-                f"{who}：受管模板不允许全动态规划的节点——谁来做、做几轮都由模型临场"
-                "决定，属于探索层。改用固定编排的 Agent 或「模型调用」节点",
+                f"{who}：受管级别不允许使用全动态规划的节点，其分工和轮数由模型在运行时决定，"
+                "无法事先审核。请改用配置固定的 Agent 或「模型调用」节点",
                 code="governed.supervisor", node_id=node.id, hard=True,
             )
         elif node.type == NodeType.SUBGRAPH:
             if not cfg.get("workflow_version"):
                 flag(
-                    f"{who}没有钉住版本，口径会随上游最新版漂移。在节点里选定一个版本",
+                    f"{who}没有固定版本，口径会随上游最新版本变化。请在节点中选定一个版本",
                     code="governed.subgraph_unpinned", node_id=node.id, hard=True, field="workflow_version",
                 )
         elif node.type == NodeType.AGENT:
             tools = cfg.get("tools") or []
             if cfg.get("approval") == "never" and tools:
                 flag(
-                    f"{who}的审批策略是「全部自动放行」，受管模板要求危险工具至少人工确认。"
-                    "改成「仅危险工具需要审批」",
+                    f"{who}的审批策略是「{option_label('approval', 'never')}」，受管级别要求危险工具至少经过人工审批。"
+                    f"请改为「{option_label('approval', 'dangerous')}」",
                     code="governed.agent_approval_never", node_id=node.id, hard=True, field="approval",
                 )
             elif cfg.get("approval") in (None, "") and spec.defaults.get("approval") == "never" and tools:
                 # 节点自己没写，运行时跟随全图默认（context.approval_mode：节点 > 图级 defaults > 全局）。
                 # 全图默认写着全部自动放行，这个 agent 就是全部自动放行，只是没写在它自己身上
                 flag(
-                    f"{who}没写自己的审批策略，跟随全图默认的「全部自动放行」，受管模板要求危险工具至少"
-                    "人工确认。把全图默认改成「仅危险工具需要审批」，或者在这个节点上单独设置",
+                    f"{who}没有设置审批策略，跟随{field_label('defaults')}中的「{option_label('approval', 'never')}」；受管级别要求危险工具至少"
+                    f"经过人工审批。请将{field_label('defaults')}中的审批策略改为「{option_label('approval', 'dangerous')}」，或在该节点上单独设置",
                     code="governed.default_approval_never", node_id=node.id, hard=True, field="approval",
                 )
             if not tools:
-                flag(f"{who}没有配任何可用工具，通常意味着它该是个「模型调用」节点",
+                flag(f"{who}没有配置可用工具，建议改用「模型调用」节点",
                      code="governed.agent_no_tools", node_id=node.id, field="tools")
             elif len(tools) > 10:
                 flag(
-                    f"{who}的可用工具有 {len(tools)} 个，边界过宽（白名单衰减的前兆）",
+                    f"{who}的可用工具有 {len(tools)} 个，授权范围过宽，建议只保留完成任务所需的工具",
                     code="governed.agent_tools_wide", node_id=node.id, field="tools",
                 )
         elif node.type == NodeType.OUTPUT:
@@ -99,14 +96,14 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
                 _lint_contract(contract, node_id=node.id, spec=spec, flag=flag, strict=strict)
         elif node.type == NodeType.CODE:
             if cfg.get("network"):
-                flag(f"{who}打开了「允许联网」：受管模板建议把取数收敛到「调用工具」节点"
-                     "（那里有取数快照）", code="governed.code_network", node_id=node.id, field="network")
+                flag(f"{who}开启了「允许联网」：受管级别建议把取数集中到「调用工具」节点"
+                     "（那里会保存取数快照）", code="governed.code_network", node_id=node.id, field="network")
 
     _lint_evidence(spec, flag, strict=strict)
 
     if strict and not has_contract_output:
         result.add(
-            "受管模板至少要有一个「成果 / 出具」节点声明出具契约，否则三档出具无从谈起",
+            "受管级别要求至少一个「成果」节点声明出具契约，否则无法判定出具档位",
             level="error", code="governed.no_contract",
         )
     return result
@@ -162,13 +159,13 @@ def _lint_contract(
         sources = [sources]
 
     if not sources and contract_needs_metrics(contract):
-        flag("出具契约没有声明 metrics_from（指标来自哪个「口径卡」节点），叙述里的数字无从回指",
+        flag("出具契约没有设置「指标来自」（提供指标的口径卡），叙述中的数字无法对应到指标",
              code="contract.metrics_from_missing", node_id=node_id, hard=True, field="contract.metrics_from")
     for src in sources:
         if src not in metric_nodes:
             flag(
-                f"出具契约的 metrics_from 指向 {src!r}，但工作流里没有这个「口径卡」节点"
-                "（写错了，或者那个节点还没建）",
+                f"出具契约的「指标来自」选择了{q(src)}，但工作流中没有这个口径卡节点"
+                "（可能填写有误，或该节点尚未创建）",
                 code="contract.metrics_from_invalid", node_id=node_id, hard=True, field="contract.metrics_from",
             )
 
@@ -176,8 +173,8 @@ def _lint_contract(
     # 用不上 narrative。report_from 指错了（不是报告撰写节点、不在出口上游）由 validate_graph
     # 报 error（contract.report_from_invalid），发布时两者一起过，照样挡住
     if contract.get("report_from") in (None, "") and not str(contract.get("narrative") or "").strip():
-        flag("出具契约既没有声明 report_from（核对哪个「报告撰写」节点的文档），也没有声明 narrative"
-             "（叙述），数字回指校验不会执行", code="contract.report_from_missing", node_id=node_id, hard=True,
+        flag("出具契约既没有设置「报告来自」（核对哪个「报告撰写」节点的文档），也没有填写「叙述」，"
+             "不会执行数字核对", code="contract.report_from_missing", node_id=node_id, hard=True,
              field="contract.report_from")
 
     # 引用模式下整张图没有口径卡（只引查询单元格的问数据图）：没有指标可列，strict + cells 已经保证
@@ -186,28 +183,29 @@ def _lint_contract(
     cells_only = contract.get("report_from") not in (None, "") and not metric_nodes
     if strict and not (contract.get("required") or []) and not cells_only:
         flag(
-            "受管模板的出具契约必须声明 required（必需指标），否则「不予出具」这一档永远触发不了",
+            "受管级别的出具契约必须设置「必需指标」，否则「不予出具」这一档无法触发",
             code="contract.required_missing", node_id=node_id, hard=True, field="contract.required",
         )
     # 没有口径卡的图，报告里的数只能直接引用查询单元格；受管正式运行不认没声明的单元格引用，
     # 报告撰写节点（numbers strict、on_violation fail）每次都会失败。写不写要作者定：修复给选项
     if strict and cells_only and contract.get("cells") is not True:
         flag(
-            "这张图没有口径卡，报告里的数只能直接引用查询单元格：受管出具要在契约里写 cells: true，"
-            "否则正式运行里一个数都引用不了，报告撰写节点每次都会失败（也可以加一张口径卡，把数登记成指标）",
+            "工作流中没有口径卡，报告中的数字只能直接引用查询单元格。受管级别需要在出具契约中开启「单元格引用」，"
+            "否则正式运行时报告撰写节点无法引用任何数字而失败；也可以添加口径卡，把数字登记为指标",
             code="contract.cells_undeclared", node_id=node_id, hard=True, field="contract.cells",
         )
     if strict and not contract.get("strict"):
         flag(
-            "受管模板建议把出具契约设为 strict：非 strict 下未回指的数字只降档不拦截",
+            "受管级别建议开启出具契约的「严格模式」：未开启时，无法追溯出处的数字只会使出具降档，不会被拦截",
             code="contract.strict_off", node_id=node_id, field="contract.strict",
         )
     claims = contract.get("claims")
     if strict and isinstance(claims, dict) and claims.get("on_uncited") == "ignore":
         # 受管级别的正式运行把 ignore 当 degrade（io._claims），要求没有降低；只是写法看上去像放宽了
         flag(
-            "出具契约的 claims 写了 on_uncited: ignore，但受管级别的正式运行里没挂依据的结论句照样计入缺口"
-            "（按 degrade 处理），这个写法不会生效。改成 degrade，或者更严的 withhold",
+            f"出具契约中「{contract_label('on_uncited')}」设为「{option_label('on_uncited', 'ignore')}」，但受管级别的"
+            "正式运行仍会把未附依据的结论句计入缺口，这项设置不会生效。"
+            f"请改为「{option_label('on_uncited', 'degrade')}」或「{option_label('on_uncited', 'withhold')}」",
             code="contract.claims_ignored", node_id=node_id, field="contract.claims",
         )
 
@@ -225,11 +223,12 @@ def _lint_contract(
 # 下次发布才按这些规则查。受管级别挡住发布，已发布级别只给警告。
 # --------------------------------------------------------------------------
 
-#: 报告撰写节点在受管模板里要写明的三项：(配置键, 要求的值, 为什么)
+#: 报告撰写节点在受管级别里要写明的三项：(配置键, 要求的值, 为什么)。给人看的时候键和值都换成
+#: labels 里的界面叫法
 REPORT_POLICY = (
-    ("numbers", "strict", "没有出处的裸数字判为违规"),
-    ("on_violation", "fail", "重写之后还违规就让节点失败，不带着问题出具"),
-    ("claims", "require_citation", "没挂引用的结论句计入缺口，按出具档位降档"),
+    ("numbers", "strict", "没有出处的数字判为违规"),
+    ("on_violation", "fail", "重写后仍有违规时节点失败，不带着问题出具"),
+    ("claims", "require_citation", "未附依据的结论句计入缺口，出具按档位降档"),
 )
 #: 除了 REPORT_POLICY 里写的那个值，还认的更严的写法。claims: judge 在挂引用之外再请另一个模型按证据逐句
 #: 裁判，不支持的按 on_unsupported 判档——比 require_citation 严，但要写预算（见 judge_budget_missing）
@@ -413,9 +412,9 @@ def _untraceable_sources(graph: _Graph, exit_id: str, refs: list[Ref]) -> list[s
     for ref in refs:
         root, name, _ = ref
         if root in ("output", "loops") or (root in ("nodes", "vars") and not name):
-            out.append(f"{root} 里的值（说不准来自哪个节点）")
+            out.append(f"{q(root)}中的值（无法确定来自哪个节点）")
         elif root in ("last_message", "messages"):
-            out += [f"最后一条消息（{_who(w)}写的）" for w in graph.last_writers(exit_id) if w.type != NodeType.REPORT]
+            out += [f"最后一条消息（由{_who(w)}写出）" for w in graph.last_writers(exit_id) if w.type != NodeType.REPORT]
         else:
             # 开了 cite_fields 的 agent 交的字段逐格核对过，是数据不是模型写的话——和 G2（_model_text）同一口径
             out += [_who(p) for p in graph.producers(root, name)
@@ -490,15 +489,15 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
         contract = node.config["contract"]
         # 两样都没写的由 contract.report_from_missing 报，这里只管「写了叙述、没写 report_from」
         if contract.get("report_from") in (None, "") and str(contract.get("narrative") or "").strip():
-            flag(f"{_who(node)}的出具契约用的是旧的叙述模式（narrative），没有声明 report_from：数字只能按数值"
-                 "回头匹配，出处可能不唯一。受管出具核对「报告撰写」节点产出的文档，每个数都有唯一的出处——把 "
-                 "report_from 指向出口上游的报告撰写节点",
+            flag(f"{_who(node)}的出具契约使用「叙述」核对，没有设置「报告来自」：数字只能按数值匹配，出处可能不唯一。"
+                 "受管级别要求核对「报告撰写」节点产出的文档，每个数字都有唯一的出处。"
+                 "请把「报告来自」设为成果节点上游的报告撰写节点",
                  code="governed.report_from_required", node_id=node.id, hard=True, field="contract.report_from")
         for field, name, bad in exit_text_fields(spec, node, graph):
-            head = (f"{_who(node)}的成果字段「{name}」取的是{'、'.join(bad)}的产出" if name is not None
-                    else f"{_who(node)}没有配成果字段，交出去的是{'、'.join(bad)}")
-            flag(f"{head}：受管出具里给人看的文字只能来自「报告撰写」节点，别的节点写的字核对不了出处。"
-                 + ("把它改成取报告撰写节点的正文" if name is not None else "给出口配一个字段，取报告撰写节点的正文"),
+            head = (f"{_who(node)}的成果字段「{name}」取自{'、'.join(bad)}的产出" if name is not None
+                    else f"{_who(node)}没有配置成果字段，输出的是{'、'.join(bad)}")
+            flag(f"{head}：受管级别出具时，给人看的文字只能来自「报告撰写」节点，其他节点写的文字无法追溯出处。"
+                 + ("请改为取报告撰写节点的正文" if name is not None else "请为成果节点添加一个字段，取报告撰写节点的正文"),
                  code="governed.exit_text_source", node_id=node.id, hard=True, field=field)
 
     # G2：每个出口都算。受管级别是 error，已发布级别是警告——和别的 G 规则一样，级别只管轻重，不管范围
@@ -511,9 +510,9 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
                 continue
             flagged.add(writer.id)
             via = f"（经过{'、'.join(f'「{t}」' for t in indirect[0])}）" if indirect else ""
-            flag(f"{_who(writer)}写的文字没经过「报告撰写」节点，就流进了出口「{node.title}」{via}：模型写的话不算"
-                 "证据，里面的数字、表名都核对不了出处。改由报告撰写节点来写（它只写引用标记，数字由系统渲染），"
-                 "出口取报告的正文",
+            flag(f"{_who(writer)}写的文字未经「报告撰写」节点，就进入了成果节点「{node.title}」{via}：模型写的文字不能"
+                 "作为证据，其中的数字和表名都无法追溯出处。请改由报告撰写节点撰写（它只写引用标记，数字由系统填入），"
+                 "成果节点改为取报告的正文",
                  code="governed.text_bypass", node_id=writer.id, hard=True)
 
     # G3
@@ -527,16 +526,17 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
                 continue        # 写了不认识的值，validate 的 report.claims_invalid 报
             also = REPORT_POLICY_ALSO.get(key, ())
             if value != want and value not in also:
-                now = "现在没写" if value in (None, "") else f"现在是 {value}"
-                more = "".join(f"，或者更严的 {v}" for v in also)
-                loose.append((key, f"{key}: {want}（{why}{more}；{now}）"))
+                now = "当前未设置" if value in (None, "") else f"当前为「{option_label(key, value)}」"
+                more = "".join(f"或更严格的「{option_label(key, v)}」" for v in also)
+                loose.append((key, f"「{field_label(key)}」设为「{option_label(key, want)}」{more}（{now}）"))
         if loose:
-            flag(f"{_who(node)}要写明 {'；'.join(text for _, text in loose)}。受管模板的报告撰写节点按最严的规则自查",
+            flag(f"{_who(node)}需要调整核对规则：{'；'.join(text for _, text in loose)}。"
+                 "受管级别要求报告撰写节点使用最严格的核对规则",
                  code="governed.report_policy", node_id=node.id, hard=True, field=loose[0][0])
         if judge_budget_missing(spec, node):
-            flag(f"{_who(node)}的结论句由模型裁判（claims: judge），却没有写每份报告的裁判预算：在 judge 里写 "
-                 "max_cost_usd——写一个金额（美元），或者显式写 null 表示不限（" + JUDGE_UNLIMITED + "）。"
-                 "受管出具不让裁判的花费悄悄按设置里的默认值走",
+            flag(f"{_who(node)}的结论句由模型裁判，但没有设置每份报告的裁判金额上限。请在「{field_label('judge')}」中"
+                 f"填写「{judge_label('max_cost_usd')}」，或明确选择不限（{JUDGE_UNLIMITED}）。"
+                 "受管级别不允许裁判费用沿用设置中的默认值",
                  code="governed.judge_budget", node_id=node.id, hard=True, field="judge.max_cost_usd")
 
     # G4、G5
@@ -549,21 +549,22 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
         to = f"口径卡{'、'.join(dict.fromkeys(cards))}"
         cfg = feeder.config
         if feeder.type == NodeType.CODE and cfg.get("evidence_role") != "source":
-            role = "是 compute" if cfg.get("evidence_role") else "没写，按计算算"
-            flag(f"{_who(feeder)}的产出喂给了{to}，而它的角色是计算（evidence_role {role}）：沙箱里算出来的数核对"
-                 "不了出处。它其实是在取数的话，把 evidence_role 标成 source；是在做计算的话，把计算挪进口径卡的表达式",
+            role = "" if cfg.get("evidence_role") else "（未设置时默认为「计算」）"
+            flag(f"{_who(feeder)}的产出提供给了{to}，但它的「证据角色」是「计算」{role}：沙箱中计算出的数字无法追溯出处。"
+                 "若该节点负责取数，请将「证据角色」设为「取数」；若负责计算，请把计算移到口径卡的表达式中",
                  code="governed.caliber_compute_input", node_id=feeder.id, hard=True, field="evidence_role")
         elif feeder.type == NodeType.AGENT and not cfg.get("output_schema"):
-            flag(f"{_who(feeder)}给{to}供数，却没有配 output_schema：它交出来的是一段自由文字，口径卡读到的数核对不了"
-                 "出处。给它配 output_schema 并开 cite_fields，每个字段都核对到查询结果里的那一格",
+            flag(f"{_who(feeder)}为{to}提供数据，但未配置「结构化输出 Schema」，交出的是自由文本，口径卡读取的数字"
+                 "无法追溯出处。请配置「结构化输出 Schema」并开启「按出处核对字段」，使每个字段都核对到查询结果中的"
+                 "对应单元格",
                  code="governed.caliber_agent_schema", node_id=feeder.id, hard=True, field="output_schema")
         elif feeder.type == NodeType.AGENT and cfg.get("cite_fields") is not True:
-            flag(f"{_who(feeder)}给{to}供数，配了 output_schema 却没开 cite_fields：字段没有逐个核对到查询结果，"
-                 "口径卡读到的仍是模型报的数。打开 cite_fields",
+            flag(f"{_who(feeder)}为{to}提供数据，已配置「结构化输出 Schema」，但未开启「按出处核对字段」：字段没有"
+                 "逐一核对到查询结果，口径卡读取的仍是模型给出的数字。请开启「按出处核对字段」",
                  code="governed.caliber_agent_cite_fields", node_id=feeder.id, hard=True, field="cite_fields")
         elif feeder.type == NodeType.LLM:
-            flag(f"{_who(feeder)}给{to}供数：模型调用节点不调工具，写出来的数没有出处。改由 Agent（配 output_schema "
-                 "并开 cite_fields）或「调用工具」节点取数",
+            flag(f"{_who(feeder)}为{to}提供数据：「模型调用」节点不调用工具，写出的数字没有出处。请改由 Agent"
+                 "（配置「结构化输出 Schema」并开启「按出处核对字段」）或「调用工具」节点取数",
                  code="governed.caliber_model_input", node_id=feeder.id, hard=True)
 
 
@@ -585,12 +586,12 @@ async def unresolved_caliber_upgrades(
         if node.type == NodeType.SUBGRAPH:
             pinned = node.config.get("workflow_version")
             wf_id = node.config.get("workflow_id")
-            what = f"「{node.title}」（子工作流）钉在 v{pinned}"
+            what = f"「{node.title}」（子工作流）固定在 v{pinned}"
         elif node.type == NodeType.METRICS and isinstance(node.config.get("caliber_from"), dict):
             ref = node.config["caliber_from"]
             pinned, wf_id = ref.get("workflow_version"), ref.get("workflow_id")
             extra = {"caliber_node": ref.get("node_id")}
-            what = f"「{node.title}」（口径卡）钉住的口径卡在 v{pinned}"
+            what = f"「{node.title}」（口径卡）引用的口径卡固定在 v{pinned}"
         else:
             continue
         if not pinned or not wf_id or not str(pinned).isdigit():
@@ -608,8 +609,8 @@ async def unresolved_caliber_upgrades(
         if policy not in UPGRADE_POLICIES:
             errors.append(
                 f"{what}，但上游已有 v{latest}。"
-                f"正式运行前必须在节点上声明升版策略（upgrade_policy）："
-                + " / ".join(f"{k}（{v}）" for k, v in UPGRADE_POLICY_LABELS.items())
+                f"发起正式运行前，请在节点的「{field_label('upgrade_policy')}」中选择一种处置："
+                + _either(UPGRADE_POLICY_LABELS.values())
             )
         else:
             events.append(
@@ -626,6 +627,12 @@ async def unresolved_caliber_upgrades(
     return errors, events
 
 
+def _either(labels: Any) -> str:
+    """「甲」、「乙」或「丙」。"""
+    items = [f"「{v}」" for v in labels]
+    return items[0] if len(items) == 1 else "、".join(items[:-1]) + "或" + items[-1]
+
+
 #: 发起正式运行时记下「这次按不按受管出具」的那条事件（log · info，不进主流程）
 GOVERNANCE_CODE = "run_governance"
 
@@ -637,9 +644,9 @@ def governance_note(*, governed: bool, workflow_name: str, version: int | None =
     看工作流当时的 status。
     """
     which = f"「{workflow_name}」v{version}" if version else f"「{workflow_name}」"
-    message = (f"这次正式运行按受管级别出具：{which}是按受管级别发布的，之后改图、改级别都不影响这次"
+    message = (f"本次正式运行按受管级别出具：{which}以受管级别发布，之后修改工作流或发布级别不影响本次运行"
                if governed else
-               f"这次正式运行按已发布级别出具：{which}不是按受管级别发布的")
+               f"本次正式运行按已发布级别出具：{which}未以受管级别发布")
     return {"level": "info", "code": GOVERNANCE_CODE, "governed": governed, "message": message}
 
 

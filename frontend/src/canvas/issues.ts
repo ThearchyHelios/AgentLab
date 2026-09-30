@@ -11,7 +11,7 @@
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import { ApiError } from '../api/client'
-import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, nodeTypeLabel } from '../lib/terms'
+import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, UPGRADE_TEXT, nodeTypeLabel } from '../lib/terms'
 import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
 import type {
@@ -114,20 +114,38 @@ export function withToolBound(
   return null
 }
 
-/** 后端 schema.py 的固定说法 → 字段。顺序有讲究：具体的在前 */
+/**
+ * 后端 schema.py 的固定说法 → 字段。顺序有讲究：具体的在前。
+ * 后端现在的说法和以前的说法都要认（开发库里历史运行、旧版本存下的问题还是旧文字），
+ * 例如「条件循环没有设置「继续条件」」和旧的「while 循环没有写条件」
+ */
 const RULES: [RegExp, string][] = [
   [/^跳过条件/, 'skip_if'],
   [/分支|「其他」出口/, 'cases'],
-  [/^循环条件|while 循环没有写条件/, 'condition'],
-  [/^整形表达式|整形节点没有填表达式/, 'expression'],
+  [/^循环条件|while 循环没有写条件|条件循环没有设置/, 'condition'],
+  [/^整形表达式|整形节点没有填表达式|「数据整形」节点还没有填写表达式/, 'expression'],
   [/^指标|口径卡还没有定义指标/, 'metrics'],
-  [/还没选工具/, 'tool'],
-  [/还没选要嵌套的工作流/, 'workflow_id'],
+  [/还没选工具|还没有选择工具/, 'tool'],
+  [/(?:还没选|还没有选择|尚未选择)要嵌套的工作流/, 'workflow_id'],
   [/JSON Schema/, 'schema'],
   [/出具契约/, 'contract'],
   [/没有指定模型/, 'model'],
   [/代码把输出交给/, 'code'],
 ]
+
+/**
+ * 校验给的「可以升级为可追溯结构」是不是只有一句标题（后端 upgrade.py 的 HINT，有意保留原话，前端和脚本按它认）。
+ * 界面上的同一句（UPGRADE_TEXT.advice）已改为「可升级为可追溯结构」：两种都算，只有标题时才补一句说明
+ */
+export function isBareUpgradeAdvice(message: string): boolean {
+  const m = message.trim()
+  return m === UPGRADE_TEXT.advice || m === '可以升级为可追溯结构'
+}
+
+/** 后端说的是分支「标识」的问题（保留名、重复）。检查器里标识由前端即时判，后端这几条不重复列 */
+export function isCaseKeyIssue(message: string): boolean {
+  return /标识/.test(message)
+}
 
 export function fieldOfIssue(issue: ValidationIssue, node: FlowNode | undefined): FieldRef | null {
   const binding = node ? toolBindingOf(issue, node) : null
@@ -144,16 +162,18 @@ export function fieldOfIssue(issue: ValidationIssue, node: FlowNode | undefined)
     if (path) return parseFieldPath(path)
   }
 
-  // 分支某一项：「分支「协作模式」的条件写错了」「分支 'fail' 没有连出去的边」
+  // 分支某一项：「分支「协作模式」的条件有误」「分支 'fail' 没有连出去的边」「有两个分支的标识都是「x」」
+  // （重复标识以前写成英文单引号 'x'，现在写成「x」，两种都认）
   const cases: any[] = Array.isArray(config.cases) ? config.cases : []
-  const named = /分支「([^」]+)」|分支 '([^']+)'|标识都是 '([^']+)'/.exec(msg)
+  const named = /分支「([^」]+)」|分支 '([^']+)'|标识都是 '([^']+)'|标识都是「([^」]+)」/.exec(msg)
   if (named && cases.length) {
-    const name = named[1] ?? named[2] ?? named[3]
+    const dup = named[3] ?? named[4]
+    const name = named[1] ?? named[2] ?? dup
     const idxs = cases.map((c, i) => ((c?.label || c?.key) === name || c?.key === name ? i : -1)).filter((i) => i >= 0)
     // 重复标识指的是后一个：前一个是正常的那个
-    const index = named[3] ? idxs[idxs.length - 1] : idxs[0]
+    const index = dup ? idxs[idxs.length - 1] : idxs[0]
     if (index != null && index >= 0) {
-      const sub = /的条件/.test(msg) ? 'condition' : /标识/.test(msg) ? 'key' : undefined
+      const sub = /的条件/.test(msg) ? 'condition' : isCaseKeyIssue(msg) ? 'key' : undefined
       return { key: 'cases', index, ...(sub ? { sub } : {}) }
     }
   }
@@ -270,7 +290,7 @@ export function normalizeAutofix(raw: any): AutofixResult {
     })),
     applied: asArray(raw?.applied).map(asText).filter(Boolean),
     rejected: asArray<any>(raw?.rejected).filter((r) => r && typeof r === 'object')
-      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '没说原因' })),
+      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '未提供原因' })),
     remaining,
     assist,
     ok: typeof raw?.ok === 'boolean' ? raw.ok : !remaining.some((i) => i.level === 'error'),
@@ -354,21 +374,37 @@ export function contentSig(graph: GraphSpec): string {
 /** 出具契约里的几个键在界面上的叫法。拆成几行写契约骨架时也按这个顺序 */
 const CONTRACT_KEYS: Record<string, string> = {
   metrics_from: '指标来自', report_from: '报告来自', required: '必需指标', expected: '期望指标',
-  strict: '严格模式', narrative: '叙述', cells: '单元格引用', allow_numbers: '允许不带出处的数',
+  strict: '严格模式', narrative: '叙述', cells: '单元格引用', allow_numbers: '允许无出处的数字',
 }
 
 /** 不在节点定义的字段表里、由检查器自己画的几项（子工作流钉的版本、升版处置），以及图级的全图默认 */
 const EXTRA_FIELDS: Record<string, string> = {
-  workflow_version: '钉住版本', upgrade_policy: '上游发了新版本时', defaults: '全图默认',
+  workflow_version: '固定版本', upgrade_policy: '上游发布新版本时', defaults: '工作流默认设置',
 }
 /** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略，列表项里的名称、取值、表达式 */
 const SUB_KEYS: Record<string, string> = {
-  ...CONTRACT_KEYS, approval: '审批策略', claims: '没挂依据的结论句', on_uncited: '没挂依据时',
+  ...CONTRACT_KEYS, approval: '审批策略', claims: '未附依据的结论句', on_uncited: '未附依据时',
   name: '名称', value: '取值', expression: '表达式',
 }
 /** 契约 claims 的 on_uncited：没挂依据的结论句怎么算 */
 const ON_UNCITED_LABEL: Record<string, string> = {
-  ignore: '只标出来，不算缺口', degrade: '计入缺口、出具降档', withhold: '不予出具',
+  ignore: '仅标注，不计入缺口', degrade: '计入缺口、出具降档', withhold: '不予出具',
+}
+
+/**
+ * 只在一类节点上出现的下拉字段（顶层键）：修复预览里写检查器下拉的选项文字，不写 off、require_citation
+ * 这类枚举值。同一个键在不同节点上含义不同的（mode 等）不在这里，照写原值
+ */
+const OPTION_OWNER: Record<string, keyof typeof NODE_DEFS> = {
+  claims: 'report', numbers: 'report', entities: 'report', on_violation: 'report',
+  on_exhausted: 'supervisor', isolation: 'code', evidence_role: 'code',
+  on_missing: 'metrics', upgrade_policy: 'metrics', rerank: 'retrieve', thinking: 'llm', effort: 'llm',
+}
+
+function optionText(key: string, value: unknown): string | null {
+  const owner = OPTION_OWNER[key]
+  if (!owner || typeof value !== 'string') return null
+  return NODE_DEFS[owner].fields.find((f) => f.key === key)?.options?.find((o) => o.value === value)?.label ?? null
 }
 
 /** 值是节点 id 的几个键（报告、契约的 metrics_from，契约的 report_from）：预览里写节点名，不写 id */
@@ -407,7 +443,7 @@ function judgeValueText(value: unknown, key: string): string | null {
   if (JUDGE_LIMITS.has(key)) {
     if (value === null) return '不限'
     if (typeof value === 'number' && Number.isFinite(value)) {
-      return key === 'max_cost_usd' ? `$${value}` : key === 'timeout_s' ? `${value} 秒` : `${value} 句`
+      return key === 'max_cost_usd' ? `${value} 美元` : key === 'timeout_s' ? `${value} 秒` : `${value} 句`
     }
     return null
   }
@@ -434,6 +470,10 @@ export function fixValueText(value: unknown, field?: string | null, nameOf?: Nod
     return APPROVAL_POLICY_LABEL[value as keyof typeof APPROVAL_POLICY_LABEL]
   }
   if (typeof value === 'boolean') return value ? '是' : '否'
+  if (key && field === key) {
+    const said = optionText(key, value)
+    if (said != null) return said
+  }
   if (key === 'on_uncited' && typeof value === 'string' && value in ON_UNCITED_LABEL) return ON_UNCITED_LABEL[value]
   if (key === 'workflow_version' && (typeof value === 'number' || /^\d+$/.test(String(value)))) return `v${value}`
   if (key && NODE_REF_KEYS.has(key)) {
@@ -465,7 +505,7 @@ export function fixValueLines(value: unknown, field?: string | null, nameOf?: No
   }
   // 成果 / 输入字段整列（一键升级把成果字段改取报告的正文）：一项一行，「answer：{{ nodes.write.text }}」
   if (field === 'fields' && Array.isArray(value) && value.length && value.every((f) => isRecord(f) && 'name' in f)) {
-    return value.map((f) => `${asText(f.name) || '（没名字）'}：${fixValueText(f.value)}`)
+    return value.map((f) => `${asText(f.name) || '（未命名）'}：${fixValueText(f.value)}`)
   }
   if (field !== 'contract' || !isRecord(value) || !Object.keys(value).length) return null
   const order = Object.keys(CONTRACT_KEYS)
@@ -517,7 +557,7 @@ export function normalizeUpgrade(raw: any): UpgradeResult {
     notes: asArray(raw?.notes).map(normalizeNote).filter((n): n is UpgradeNote => !!n),
     issues: asArray(raw?.issues).map(normalizeIssue).filter((i): i is ValidationIssue => !!i),
     rejected: asArray<any>(raw?.rejected).filter(isRecord)
-      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '没说原因' })),
+      .map((r) => ({ fix_id: asText(r.fix_id), reason: asText(r.reason) || '未提供原因' })),
     assist,
   }
 }
@@ -549,7 +589,7 @@ export function upgradeNodeText(node: unknown): string {
 }
 
 /** 改写规则在界面上的叫法：R1–R5 照写，Copilot 那一段写 Copilot */
-export const upgradeRuleText = (rule?: string | null): string => (rule === 'assist' ? 'Copilot' : rule ?? '')
+export const upgradeRuleText = (rule?: string | null): string => (rule === 'assist' ? '助手' : rule ?? '')
 
 /**
  * 逐项改动按「哪一步」分组：同一步（同一个 fix_id，比如把「写周报」换成报告撰写）的几项改动放在一起，
@@ -574,7 +614,7 @@ export function upgradeGroups(changes: UpgradeChange[]): { key: string; rule: st
  * 认不出的照写
  */
 export function upgradeStepText(fixId: string, nameOf?: NodeNameOf): string {
-  if (!fixId || fixId === 'assist') return 'Copilot'
+  if (!fixId || fixId === 'assist') return '助手'
   const m = /^(R\d+):(.+)$/.exec(fixId)
   return m ? `${m[1]} · 「${nameOf?.(m[2]) ?? m[2]}」` : fixId
 }
@@ -644,9 +684,9 @@ export function upgradeSummary(before: GraphSpec, after: GraphSpec): string[] {
   const edges = [...now].filter((k) => !was.has(k)).length + [...was].filter((k) => !now.has(k)).length
   return [
     added && `新增 ${added} 个节点`,
-    typed && `${typed} 个节点换了类型`,
-    changed && `改了 ${changed} 个节点的配置`,
-    removed && `删掉 ${removed} 个节点`,
+    typed && `${typed} 个节点变更了类型`,
+    changed && `修改了 ${changed} 个节点的配置`,
+    removed && `删除 ${removed} 个节点`,
     edges && `连线变动 ${edges} 处`,
   ].filter((x): x is string => !!x)
 }

@@ -242,7 +242,7 @@ def _read_excel(raw: bytes, *, header_row: int) -> list[tuple[str, list[list[Any
         from openpyxl import load_workbook
     except ImportError as e:
         raise UnsupportedTable(
-            "要读 Excel 得先装解析库：pip install 'agentlab-backend[docs]'"
+            "读取 Excel 需要安装解析库：pip install 'agentlab-backend[docs]'"
         ) from e
     try:
         # read_only 走流式，几十万行也不会把整个工作簿读进内存；
@@ -250,9 +250,9 @@ def _read_excel(raw: bytes, *, header_row: int) -> list[tuple[str, list[list[Any
         book = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     except Exception as e:  # noqa: BLE001
         # 这句话原样进上传的 400：异常类名留在日志（from e），界面上只说能照着做的
-        reason = "文件不是有效的 .xlsx（可能损坏，或者只是改了扩展名）" if isinstance(e, zipfile.BadZipFile) \
+        reason = "文件不是有效的 .xlsx（可能已损坏，或只是修改了扩展名）" if isinstance(e, zipfile.BadZipFile) \
             else describe_exception(e)
-        raise UnsupportedTable(f"这个 Excel 读不开：{reason}。在 Excel 里另存为 .xlsx 或 .csv 再传") from e
+        raise UnsupportedTable(f"无法打开该 Excel 文件：{reason}。请在 Excel 中另存为 .xlsx 或 .csv 后重新上传") from e
 
     out: list[tuple[str, list[list[Any]]]] = []
     for sheet in book.worksheets:
@@ -262,7 +262,7 @@ def _read_excel(raw: bytes, *, header_row: int) -> list[tuple[str, list[list[Any
             out.append((sheet.title, rows))
     book.close()
     if not out:
-        raise UnsupportedTable("这个 Excel 里没有任何有内容的工作表")
+        raise UnsupportedTable("该 Excel 文件中没有包含内容的工作表")
     return out
 
 
@@ -279,11 +279,11 @@ def read_tables(
         return _read_csv(raw, filename, header_row=header_row)
     if ext in _LEGACY_EXCEL:
         raise UnsupportedTable(
-            f"读不了 {filename}：.xls 是老的二进制格式，需要外部转换器。"
-            "请在 Excel 里另存为 .xlsx 或 .csv 再传。"
+            f"无法读取 {filename}：.xls 是旧版二进制格式，需要外部转换器。"
+            "请在 Excel 中另存为 .xlsx 或 .csv 后重新上传。"
         )
     raise UnsupportedTable(
-        f"读不了 {filename}：只认 Excel（.xlsx）和 CSV / TSV。"
+        f"无法读取 {filename}：仅支持 Excel（.xlsx）和 CSV / TSV。"
     )
 
 
@@ -345,5 +345,5 @@ def load_into(
         conn.close()
 
     if not report.tables:
-        raise UnsupportedTable("文件里没有读到任何数据行")
+        raise UnsupportedTable("文件中没有数据行")
     return report

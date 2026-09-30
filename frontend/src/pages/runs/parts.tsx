@@ -5,6 +5,7 @@ import { rovingTarget, toast, useTicker } from '../../components/ui'
 import { formatClock, formatSpan, parseServerTime } from '../../lib/format'
 import { ISSUANCE_LABEL, runClassLabel } from '../../lib/terms'
 import { useRunClock } from '../../run/useRunClock'
+import { ISSUANCE_HINT } from '../../run/decode'
 
 // -------------------------------------------------------------------------
 // 页签
@@ -101,16 +102,16 @@ export function ClassChip({ runClass, version, always = false }: {
   }
   return (
     <span className="chip shrink-0 text-fg" style={{ borderColor: 'var(--border-strong)' }}
-          title="正式运行：跑的是已发布的不可变版本，结果进正式归档">
+          title="正式运行：使用已发布的不可变版本，结果计入正式归档">
       <ShieldCheck size={10} aria-hidden /> {runClassLabel('formal', version)}
     </span>
   )
 }
 
 const TIER_TONE: Record<string, { color: string; soft: boolean; hint: string }> = {
-  formal: { color: 'var(--st-done)', soft: false, hint: '指标齐全，叙述里的数字都能回指口径卡' },
-  degraded: { color: 'var(--st-waiting)', soft: true, hint: '有缺口，结论要对照声明使用' },
-  withheld: { color: 'var(--st-failed)', soft: true, hint: '必需指标缺失或数字无法溯源，这次结论不作数' },
+  formal: { color: 'var(--st-done)', soft: false, hint: ISSUANCE_HINT.formal },
+  degraded: { color: 'var(--st-waiting)', soft: true, hint: ISSUANCE_HINT.degraded },
+  withheld: { color: 'var(--st-failed)', soft: true, hint: ISSUANCE_HINT.withheld },
 }
 
 /** 出具档位。完整出具安静（只有字色），降档和不予才铺底色 */
@@ -166,7 +167,7 @@ export async function copyText(text: string, what: string): Promise<void> {
     await navigator.clipboard.writeText(text)
     toast.ok(`已复制${what}`)
   } catch {
-    toast.error('复制失败：浏览器没有给剪贴板权限')
+    toast.error('复制失败：浏览器未授予剪贴板权限')
   }
 }
 
@@ -185,7 +186,7 @@ export function CopyValue({ value, label, display, className }: {
         void navigator.clipboard?.writeText(value).then(() => {
           setDone(true)
           setTimeout(() => setDone(false), 1200)
-        }, () => toast.error('复制失败：浏览器没有给剪贴板权限'))
+        }, () => toast.error('复制失败：浏览器未授予剪贴板权限'))
       }}
     >
       <span className="mono min-w-0 truncate">{display ?? value}</span>

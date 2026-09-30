@@ -90,7 +90,7 @@ export function asDoc(content: unknown): EvidenceDocData | null {
 
 export class NotADocError extends Error {
   constructor() {
-    super('这件工件不是报告文档')
+    super('该工件不是报告文档')
     this.name = 'NotADocError'
   }
 }

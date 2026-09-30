@@ -66,12 +66,12 @@ class RunManager:
             await session.execute(
                 update(Run)
                 .where(Run.status == "running")
-                .values(status="interrupted", error="服务重启，运行已挂起，可从断点恢复")
+                .values(status="interrupted", error="服务重启，运行已挂起，可从断点继续运行")
             )
             await session.execute(
                 update(Run)
                 .where(Run.status == "queued")
-                .values(status="failed", error="服务重启时这次运行还在排队，没有可恢复的进度，请重新发起")
+                .values(status="failed", error="服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行")
             )
             await session.commit()
         # 进程被强杀时连 server_shutdown 日志都来不及发，事件流停在半路。补上这一条，
@@ -80,7 +80,7 @@ class RunManager:
             bus.set_seq(run_id, last_seq or 0)
             await self._emit(run_id, EventType.LOG, data={
                 "level": "warn", "code": "server_shutdown",
-                "message": "服务上次没有正常关停，这次运行停在了半路；可以从断点接着跑",
+                "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
             })
 
     async def shutdown(self) -> None:
@@ -181,7 +181,7 @@ class RunManager:
         report = validate_graph(spec)
         if not report.ok:
             raise ValueError(
-                "工作流没有通过校验，先在画布上修好标红的节点再运行："
+                "工作流未通过校验，请先在画布上修正标红的节点再运行："
                 + "；".join(i.message for i in report.issues if i.level == "error")
             )
         if approval_default is None:
@@ -248,7 +248,7 @@ class RunManager:
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if not run:
-                raise KeyError(f"找不到运行 {run_id}")
+                raise KeyError("运行记录不存在")
             if run.status not in ("interrupted",):
                 raise ValueError(_cannot_resume(run.status))
             spec = GraphSpec.model_validate(run.graph)
@@ -265,13 +265,12 @@ class RunManager:
         if not waiting and not getattr(snapshot, "next", None):
             # 没有断点可续。多半是重启时被标成 interrupted 的 queued 运行。
             raise ValueError(
-                "这次运行没有可恢复的断点（很可能重启前还没真正开始跑）。"
-                "请重新发起一次运行，而不是恢复——继续下去只会用默认值跑出一份假结果。"
+                "这次运行没有可恢复的断点，可能在服务重启前尚未开始执行。请重新发起运行。"
             )
         if stale := await _stale_replay(run_id, spec, snapshot):
             raise ValueError(
-                f"这次运行是升级前停在「{stale}」上的，引擎记录断点的方式已经变了：现在恢复，"
-                f"「{stale}」里已经执行过的工具会再执行一次。请放弃这次运行，重新发起"
+                f"这次运行停在「{stale}」时系统已升级，断点格式不再兼容，继续会让「{stale}」中"
+                f"已执行的工具重复执行。请放弃这次运行并重新发起"
             )
 
         answers: dict[str, Any] = {}
@@ -289,13 +288,13 @@ class RunManager:
             if approval_id:
                 target = next((a for a in pending if a.id == approval_id), None)
                 if target is None:
-                    raise ValueError("这条审批已经处理过了，或者不属于这次运行。刷新看看最新状态")
+                    raise ValueError("这条审批已处理过，或不属于这次运行。请刷新页面查看最新状态")
             elif len(pending) == 1:
                 target = pending[0]
             elif len(pending) > 1:
                 raise ValueError(
                     f"这次运行有 {len(pending)} 条待处理的审批，"
-                    "得说明回复的是哪一条（approval_id），请在对应的审批卡上操作"
+                    "无法确定本次回复对应哪一条，请在对应的审批卡上操作"
                 )
 
             now = datetime.now(timezone.utc)
@@ -314,7 +313,7 @@ class RunManager:
                 )
                 if marked.rowcount != 1:
                     await session.rollback()
-                    raise ValueError("这条审批已经处理过了，或者这次运行已经放弃了。刷新看看最新状态")
+                    raise ValueError("这条审批已处理过，或这次运行已被放弃。请刷新页面查看最新状态")
                 await session.commit()
                 # 审批卡上点的是「始终允许」：这个工具以后改由门控把关。只有带 trust_key 的
                 # 审批才有这个按钮（MCP / 自定义工具、探索运行），别的审批带了 always 也不理。
@@ -390,7 +389,7 @@ class RunManager:
         else:
             command = Command(resume=answers)
         await self._emit(run_id, EventType.RUN_RESUMED, data=(
-            {"message": "服务重启时中断的运行，从断点接着跑", "actor": actor} if command is None
+            {"message": "服务重启时中断的运行，从断点继续运行", "actor": actor} if command is None
             else {"response": _safe(response), "actor": actor}
         ))
         self._tasks[run_id] = asyncio.create_task(
@@ -420,7 +419,7 @@ class RunManager:
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if not run:
-                raise KeyError(f"找不到运行 {run_id}")
+                raise KeyError("运行记录不存在")
             has_pending = run.status == "interrupted" and (await session.execute(
                 select(Approval.id).where(
                     Approval.run_id == run_id, Approval.status.in_(["pending", "answered"])
@@ -437,14 +436,13 @@ class RunManager:
             revised = GraphSpec.model_validate(graph)
             if topology_of(revised) != topology_of(spec):
                 raise ValueError(
-                    "接着跑只能改节点配置，不能增删节点或改连线——"
-                    "断点是按节点名存的，结构变了就对不上了。"
-                    "要改结构请重新发起一次运行。"
+                    "继续运行时只能修改节点配置，不能增删节点或修改连线。"
+                    "如需修改结构，请重新发起运行。"
                 )
             report = validate_graph(revised)
             if not report.ok:
                 first = next((i.message for i in report.issues if i.level == "error"), "")
-                raise ValueError(f"改过的图没有通过校验：{first}")
+                raise ValueError(f"修改后的工作流未通过校验：{first}")
             spec = revised
 
         # 先问引擎到底停在哪。没有待跑的节点就不是"能接着跑"的情形——
@@ -456,13 +454,12 @@ class RunManager:
         pending = [str(n) for n in (getattr(snapshot, "next", None) or [])]
         if not pending:
             raise ValueError(
-                "这次运行没有留下可以接着跑的断点（多半是还没跑到第一个节点就挂了）。"
-                "请重新发起一次运行——继续下去只会从头跑一遍，还看不出来。"
+                "这次运行没有可继续的断点，可能在执行第一个节点前就已中断。请重新发起运行。"
             )
         if stale := await _stale_replay(run_id, spec, snapshot):
             raise ValueError(
-                f"这次运行是升级前停在「{stale}」上的，引擎记录断点的方式已经变了：现在接着跑，"
-                f"「{stale}」里已经执行过的工具会再执行一次。请重新发起一次运行"
+                f"这次运行停在「{stale}」时系统已升级，断点格式不再兼容，继续运行会让「{stale}」中"
+                f"已执行的工具重复执行。请重新发起运行"
             )
 
         done = [n for n in (snapshot.values or {}).get("nodes", {}) if n not in pending]
@@ -485,8 +482,8 @@ class RunManager:
                 "from": pending,
                 # 说清楚"哪些没重来"——否则用户看到时间线又动起来，
                 # 分不清这次是接着跑还是整张图又跑了一遍
-                "message": f"从「{labels.get(pending[0], pending[0])}」接着跑"
-                           + (f"，前面 {len(done)} 个节点的结果保留" if done else ""),
+                "message": f"从「{labels.get(pending[0], pending[0])}」继续运行"
+                           + (f"，保留前面 {len(done)} 个节点的结果" if done else ""),
                 "actor": actor,
             },
         )
@@ -534,7 +531,7 @@ class RunManager:
             run = await session.get(Run, run_id)
             timing = await _timing(session, run, 0, now)
             run.usage = {**(run.usage or {}), "duration_ms": timing["active_ms"], **timing}
-            run.error = "用户取消：在等审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
+            run.error = "用户取消：等待审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
             bus.set_seq(run_id, run.last_seq or 0)
             # 和状态同一个事务提交，理由同 _finalize
             event = self._event(run_id, EventType.RUN_CANCELLED, data={
@@ -678,10 +675,10 @@ class RunManager:
                     # checkpoint 完好，记成中断、重启后从断点接着跑——和强杀后启动
                     # 扫描的处理一致。以前一律记"用户取消"，resume 和 continue 都拒绝它
                     status = "interrupted"
-                    error = "服务重启，运行已挂起，可从断点恢复"
+                    error = "服务重启，运行已挂起，可从断点继续运行"
                     await self._emit(run_id, EventType.LOG, data={
                         "level": "warn", "code": "server_shutdown",
-                        "message": "服务关停时这次运行还在跑，已挂起；重启后可以从断点接着跑",
+                        "message": "服务关闭时这次运行仍在进行，已挂起；重启后可从断点继续运行",
                     })
                 else:
                     status = "cancelled"
@@ -692,8 +689,9 @@ class RunManager:
                 status = "failed"
                 if deadline is not None and deadline.expired():
                     error = (
-                        f"这次执行超过了 {settings.max_run_seconds} 秒的上限，已中止。"
-                        "跑得慢的多半是模型或工具没有响应；确实需要更久，调大 AGENTLAB_MAX_RUN_SECONDS"
+                        f"本次运行超过 {settings.max_run_seconds} 秒的时长上限，已中止。"
+                        "通常是模型或工具长时间未响应；如确需更长时间，请联系管理员调大时长上限"
+                        "（AGENTLAB_MAX_RUN_SECONDS）"
                     )
                     terminal = (EventType.RUN_FAILED, {"error": error})
                 else:   # 别处抛的超时，不是这道上限——按普通失败说
@@ -704,11 +702,12 @@ class RunManager:
                 # LangGraph 的原文是英文，还叫人去调 recursion_limit——用户碰不到那个键。
                 # 循环的轮数已经另算了预算，走到这里的多半是不归 loop 节点管的环
                 error = (
-                    f"走满了 {settings.max_graph_steps + extra_steps} 步还没跑完，已中止"
-                    f"（图最大步数 {settings.max_graph_steps}"
-                    + (f"，另按循环轮数预留了 {extra_steps} 步" if extra_steps else "") + "）。"
-                    "多半是有个环在空转：分支连回了上游、却没有 loop 节点给它定轮数上限。"
-                    "用 loop 节点包住它；确实需要这么多步，调大 AGENTLAB_MAX_GRAPH_STEPS"
+                    f"运行已执行 {settings.max_graph_steps + extra_steps} 步仍未结束，已中止"
+                    f"（工作流步数上限为 {settings.max_graph_steps}"
+                    + (f"，另为循环预留 {extra_steps} 步" if extra_steps else "") + "）。"
+                    "可能存在没有轮数上限的环路：某个分支连回了上游，但没有用「循环」节点限制轮数。"
+                    "请用「循环」节点包住这段环路；如确需更多步数，请联系管理员调大步数上限"
+                    "（AGENTLAB_MAX_GRAPH_STEPS）"
                 )
                 terminal = (EventType.RUN_FAILED, {"error": error})
             except Exception as e:  # noqa: BLE001
@@ -781,7 +780,7 @@ class RunManager:
                             node_id=str(payload.get("node_id") or ""),
                             interrupt_id=interrupt_id,
                             mode=str(payload.get("mode") or "approve"),
-                            title=str(payload.get("title") or "需要你确认"),
+                            title=str(payload.get("title") or "待审批"),
                             payload=payload,
                             schema_=payload.get("schema") or {},
                         )
@@ -909,10 +908,10 @@ async def verify_manifest(run_id: str) -> dict[str, Any]:
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:
-            raise KeyError(f"找不到运行 {run_id}")
+            raise KeyError("运行记录不存在")
         if not run.manifest_hash:
             return {"sealed": False, "ok": None,
-                    "message": "这次运行还没有封存（没跑完，或者停在人工审批）"}
+                    "message": "这次运行尚未封存（尚未结束，或正停在人工审批）"}
         rows = [tuple(r) for r in await session.execute(
             select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
             .where(RunEvent.run_id == run_id)
@@ -933,7 +932,7 @@ async def verify_manifest(run_id: str) -> dict[str, Any]:
     ok = _manifest(covered) == expected
     return {
         "sealed": True, "ok": ok, "events": len(covered), "sealed_at": sealed_at, "legacy": legacy,
-        "message": "事件流与封存时一致" if ok else "事件流和封存时对不上：封存之后有事件被改过、删过或插过",
+        "message": "事件记录与封存时一致" if ok else "事件记录与封存时不一致：封存后有事件被修改、删除或插入",
     }
 
 
@@ -962,20 +961,20 @@ def _clip(value: Any, limit: int = 4000) -> tuple[Any, bool]:
 
 
 _STATUS_TEXT = {
-    "queued": "还在排队", "running": "正在运行", "interrupted": "停在断点上",
-    "succeeded": "已完成", "failed": "失败了", "cancelled": "已取消",
+    "queued": "仍在排队", "running": "正在运行", "interrupted": "停在断点上",
+    "succeeded": "已完成", "failed": "已失败", "cancelled": "已取消",
 }
 
 
 def _cannot_resume(status: str) -> str:
     hint = {
-        "running": "它还在跑，不需要恢复。",
-        "queued": "它还没开始跑。",
-        "succeeded": "要再跑一次，请重新发起运行。",
-        "failed": "失败的运行用「接着跑」从出错的节点继续。",
+        "running": "运行仍在进行，无需恢复。",
+        "queued": "运行尚未开始。",
+        "succeeded": "如需再次运行，请重新发起。",
+        "failed": "失败的运行可点「继续运行」从出错的节点继续。",
         "cancelled": "已取消的运行请重新发起。",
     }.get(status, "")
-    return f"这次运行{_STATUS_TEXT.get(status, status)}，没有在等审批，不能恢复。{hint}"
+    return f"这次运行{_STATUS_TEXT.get(status, status)}，没有待处理的审批，无法恢复。{hint}"
 
 
 def _cannot_continue(status: str, has_pending: bool) -> str:
@@ -985,15 +984,15 @@ def _cannot_continue(status: str, has_pending: bool) -> str:
     在等审批，还让人去一张不存在的审批卡上处理；已取消的只说不行，不说该怎么办。
     """
     if status == "interrupted" and has_pending:
-        return "这次运行在等审批，不是失败了，不用接着跑。在审批卡上放行或驳回，它会自己往下走。"
+        return "这次运行正在等待审批，无需继续运行。在审批卡上批准或驳回后，运行会自动继续。"
     return {
-        "cancelled": "这次运行已取消，不能接着跑。要继续，请重新发起一次运行。",
-        "succeeded": "这次运行已完成，没有要接着跑的——只有失败的运行或被服务重启打断的运行"
-                     "能接着跑。要再跑一次，请重新发起运行。",
-        "running": "这次运行正在运行，不需要接着跑。",
-        "queued": "这次运行还在排队，还没开始跑，不需要接着跑。",
+        "cancelled": "这次运行已取消，无法继续运行。如需继续，请重新发起运行。",
+        "succeeded": "这次运行已完成，无需继续运行：只有失败的运行或被服务重启打断的运行"
+                     "可以继续运行。如需再次运行，请重新发起。",
+        "running": "这次运行正在进行，无需继续运行。",
+        "queued": "这次运行仍在排队，尚未开始，无需继续运行。",
     }.get(status, f"这次运行{_STATUS_TEXT.get(status, status)}，"
-                  "只有失败的运行或被服务重启打断的运行能接着跑。")
+                  "只有失败的运行或被服务重启打断的运行可以继续运行。")
 
 
 def _carried(run: Run) -> dict[str, Any]:
@@ -1031,8 +1030,8 @@ def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType,
         detail = raw_detail(exc.__cause__) if exc.__cause__ is not None else None
         node_id: str | None = exc.node_id
     else:
-        message = (f"运行出错：{describe_exception(exc)}。技术细节已记在服务日志里；"
-                   "可以点「接着跑」重试，仍然失败请把运行编号反馈给维护者")
+        message = (f"运行出错：{describe_exception(exc)}。技术细节已记录在服务日志中；"
+                   "可点「继续运行」重试，如仍失败，请将运行编号反馈给维护者")
         detail = raw_detail(exc)
         node_id = None
     data: dict[str, Any] = {"error": message}

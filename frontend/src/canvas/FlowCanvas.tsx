@@ -25,7 +25,7 @@ import {
   isActivePhase, isTerminal, type NodeState, type NodeTrace, type RunPhase, type Trace,
 } from '../run/trace'
 import { replayTraceCached } from '../run/useNodeView'
-import { useStudio, type FlowNode } from '../store/studio'
+import { EDIT_LOCK_TEXT, useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
 
 const nodeTypes = { card: NodeCard }
@@ -93,15 +93,15 @@ useStudio.subscribe((s, prev) => {
 
 /** React Flow 自带控件和读屏描述默认是英文 */
 const ARIA: Partial<AriaLabelConfig> = {
-  'node.a11yDescription.default': '按回车或空格选中节点，按删除键删掉，Esc 取消。',
-  'node.a11yDescription.keyboardDisabled': '按回车或空格选中节点，再用方向键移动，按删除键删掉，Esc 取消。',
+  'node.a11yDescription.default': '按回车或空格选中节点，按 Delete 键删除，Esc 取消。',
+  'node.a11yDescription.keyboardDisabled': '按回车或空格选中节点，再用方向键移动，按 Delete 键删除，Esc 取消。',
   'node.a11yDescription.ariaLiveMessage': ({ x, y }: { direction: string; x: number; y: number }) =>
     `已移动选中的节点，新位置 x ${x}，y ${y}`,
-  'edge.a11yDescription.default': '按回车或空格选中连线，再按删除键删掉，Esc 取消。',
+  'edge.a11yDescription.default': '按回车或空格选中连线，再按 Delete 键删除，Esc 取消。',
   'controls.ariaLabel': '画布控件',
   'controls.zoomIn.ariaLabel': '放大',
   'controls.zoomOut.ariaLabel': '缩小',
-  'controls.fitView.ariaLabel': '适配全图',
+  'controls.fitView.ariaLabel': '适应画布',
   'minimap.ariaLabel': '小地图',
   'handle.ariaLabel': '连接点',
 }
@@ -392,7 +392,7 @@ function QuickAdd({ x, y, bounds, onPick, onClose }: {
         <input
           autoFocus
           value={query}
-          placeholder="添加节点：搜名字或用途"
+          placeholder="添加节点：搜索名称或用途"
           role="combobox"
           aria-expanded
           aria-controls={listId}
@@ -416,9 +416,9 @@ function QuickAdd({ x, y, bounds, onPick, onClose }: {
             </div>
           )
         })}
-        {!defs.length && <div className="sf-quick-empty">没有叫「{query.trim()}」的节点</div>}
+        {!defs.length && <div className="sf-quick-empty">没有与「{query.trim()}」匹配的节点</div>}
       </div>
-      <div className="sf-quick-foot">↑↓ 选择 · ↵ 放在这里 · Esc 关闭</div>
+      <div className="sf-quick-foot">↑↓ 选择 · ↵ 添加到此处 · Esc 关闭</div>
     </div>
   )
 }
@@ -854,7 +854,7 @@ function CanvasInner() {
       const type = event.dataTransfer.getData('application/agentlab-node') as NodeType
       if (!type) return
       if (formalLock) {
-        toast.warn('正式运行进行中，画布只读。等它结束再改')
+        toast.warn(EDIT_LOCK_TEXT.formal)
         return
       }
       actions.addNode(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }))
@@ -870,11 +870,11 @@ function CanvasInner() {
   const onPaneDoubleClick = (e: React.MouseEvent) => {
     if (!(e.target as Element).classList?.contains('react-flow__pane')) return
     if (formalLock) {
-      toast.warn('正式运行进行中，画布只读。等它结束再改')
+      toast.warn(EDIT_LOCK_TEXT.formal)
       return
     }
     if (useStudio.getState().copilot.active) {
-      toast.info('助手正在改画布，等这一轮结束再加节点')
+      toast.info(EDIT_LOCK_TEXT.copilot)
       return
     }
     const r = box.current?.getBoundingClientRect()
@@ -992,7 +992,7 @@ function CanvasInner() {
               <Controls showInteractive={false} fitViewOptions={fitAll}>
                 <ControlButton className="sf-zoom-btn"
                                onClick={() => void zoomTo(1, { duration: reduced ? 0 : 240, interpolate: LINEAR })}
-                               title="当前缩放 · 点一下回到 100%" aria-label="回到 100% 缩放">
+                               title="当前缩放比例 · 点击恢复为 100%" aria-label="恢复为 100% 缩放">
                   <span ref={zoomText} className="tnum" />
                 </ControlButton>
               </Controls>
@@ -1045,7 +1045,7 @@ function CanvasInner() {
           )}
           {peekId && (
             <button type="button" className="sf-peek" onClick={() => openInspector(peekId)}
-                    title="属性面板会盖住右栏的运行视图，底部那一条点一下就回来。双击节点也能打开">
+                    title="属性面板会覆盖右栏的运行视图，点击底部横条即可返回；也可双击节点打开">
               <PanelRightOpen size={11} aria-hidden />
               <span className="sf-peek-name">{peekLabel}</span>
               <span>的配置</span>
@@ -1055,7 +1055,7 @@ function CanvasInner() {
             <div className="sf-banner" role="status">
               <Lock size={12} />
               <span className="sf-banner-main">{runClassLabel('formal', runVersion)} 进行中 · 画布只读</span>
-              <span className="sf-banner-dim">跑的是已发布的不可变版本，结束后可以继续编辑</span>
+              <span className="sf-banner-dim">当前运行的是已发布的不可变版本，运行结束后可继续编辑</span>
             </div>
           )}
         </div>
@@ -1119,7 +1119,7 @@ function RunDock() {
             </label>
           )}
           {isTerminal(runPhase) && (
-            <label className="tl-toggle" title="把这次没走到的节点和边压暗，只留执行路径">
+            <label className="tl-toggle" title="调暗本次未执行的节点和连线，只突出执行路径">
               <input type="checkbox" checked={pathOnly} aria-label="只看执行路径"
                      onChange={(e) => setDock({ pathOnly: e.target.checked })} />
               <RouteIcon size={11} /> <span className="tl-tt">只看执行路径</span>

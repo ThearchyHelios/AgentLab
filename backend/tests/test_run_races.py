@@ -276,7 +276,7 @@ async def test_an_approval_closed_just_before_it_is_marked_answered(slow, monkey
 
     event.listen(engine.sync_engine, "before_cursor_execute", abandon_first)
     try:
-        with pytest.raises(ValueError, match="已经处理过了|放弃"):
+        with pytest.raises(ValueError, match="已处理过|放弃"):
             await run_manager.resume(run.id, {"approved": True})
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", abandon_first)

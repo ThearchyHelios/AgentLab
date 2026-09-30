@@ -128,8 +128,8 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
     return (
       <EmptyState
         icon={<FileBox size={22} />}
-        title="这次运行没有工件"
-        body="节点每执行一次的产出、查询和工具调用的原始结果，都会按内容哈希存成工件；一个节点都还没跑完的运行没有。"
+        title="本次运行没有工件"
+        body="节点每次执行的产出、查询和工具调用的原始结果，都会按内容校验值存为工件；尚无节点执行完成的运行没有工件。"
         className="h-full"
       />
     )
@@ -162,8 +162,8 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
           ))}
         </div>
         <span className="flex-1" />
-        <span className="tnum" title="按内容哈希存放：打开时重算一遍，和运行时记下的对得上才显示">
-          合计 {formatBytes(bytes)} · 打开时按哈希复验
+        <span className="tnum" title="按内容校验值存放：打开时重新计算，与运行时记录的一致才会显示">
+          合计 {formatBytes(bytes)} · 打开时重新校验
         </span>
       </div>
 
@@ -179,7 +179,7 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
         })}
         {!all && hidden > 0 && (
           <div className="flex items-center justify-center gap-2 px-4 py-3 text-2xs text-faint">
-            <span className="tnum">还有 {formatNumber(hidden)} 件没列出</span>
+            <span className="tnum">还有 {formatNumber(hidden)} 件未列出</span>
             <button type="button" className="btn btn-sm" onClick={() => setAll(true)}>全部列出</button>
           </div>
         )}
@@ -236,7 +236,7 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
               type="button"
               className="flex min-w-0 flex-1 items-center gap-2 rounded py-0.5 text-left outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)]"
               onClick={() => onOpen({ id: a.id, title })}
-              title={`打开${kind}（取回时按内容哈希复验）`}
+              title={`打开${kind}（读取时按内容校验值重新校验）`}
               data-action="artifact-open"
             >
               <span className={clsx('chip shrink-0', isEvidence(a.kind) && 'text-fg')}
@@ -249,13 +249,13 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
                 {attempt > 1 && <span className="text-faint"> · 第 {attempt} 次尝试</span>}
               </span>
               <span className="flex-1" />
-              <span className="mono shrink-0 text-2xs text-faint" title={`内容哈希 ${a.id}`}>{a.id.slice(0, 8)}</span>
+              <span className="mono shrink-0 text-2xs text-faint" title={`内容校验值 ${a.id}`}>{a.id.slice(0, 8)}</span>
               <span className="tnum w-16 shrink-0 text-right text-2xs text-faint">{formatBytes(a.size)}</span>
             </button>
             {at != null && onMoment ? (
               <button type="button" className="btn btn-xs btn-ghost tnum w-[86px] shrink-0 justify-end"
                       onClick={() => onMoment(at, a.node_id)} data-action="artifact-moment"
-                      title={`在航迹里看它产出的那一刻（${formatDateTime(a.created_at ?? null)}）`}>
+                      title={`在航迹中查看其产出时刻（${formatDateTime(a.created_at ?? null)}）`}>
                 <History size={11} aria-hidden /> T+{formatClock(Math.round(at - t0!))}
               </button>
             ) : (

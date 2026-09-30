@@ -136,7 +136,7 @@ const isClosing = (seg: Segment | undefined, verdict: TeamEnding['verdict']): bo
 /** 收尾判定的一句话。reason 太长的放悬停，表头只放得下结论 */
 export function verdictText(v: TeamEnding['verdict'], full = false): string {
   if (!v) return ''
-  if (v.open) return '轮数用完 · 调度者在判定'
+  if (v.open) return '轮数用完 · 调度者正在判定'
   if (v.done) return full ? '轮数用完 · 调度者判定：已完成' : '轮数用完 · 判定已完成'
   const why = v.reason.trim()
   return full ? `轮数用完 · 调度者判定：未完成${why ? `（${why}）` : ''}` : '轮数用完 · 判定未完成'
@@ -222,19 +222,19 @@ export function teamBrief(team: TeamRun | undefined, trace: NodeTrace | undefine
     if (thinking) return isClosing(dispatch, verdict) ? '轮数用完 · 收尾判定中' : `调度中 · ${no}`
     const running = round?.members.filter((m) => m.status === 'running').length ?? 0
     const size = round?.members.length ?? 0
-    if (running) return `${running}/${size} 在跑 · ${no}`
+    if (running) return `${running}/${size} 执行中 · ${no}`
     // 人都交回了、下一次调度还没开始（老后端没有 route 事件时这段能有十几秒）
-    return widthOf(round) > 1 ? `${size} 人已交回 · ${no}` : `等调度者 · ${no}`
+    return widthOf(round) > 1 ? `${size} 名成员已交回 · ${no}` : `等待调度者 · ${no}`
   }
   const total = `共 ${team.rounds.length} 轮`
-  if (team.savedMs > 0) return `${total} · 并行省下 ${formatDuration(team.savedMs)}`
+  if (team.savedMs > 0) return `${total} · 并行节省 ${formatDuration(team.savedMs)}`
   return team.finished && !team.rounds.some((r) => widthOf(r) > 1) ? `${total} · 全程串行` : total
 }
 
 /** 这一轮没交齐时怎么说：有人失败、被取消、被服务重启打断 */
 function unsettledNote(members: TeamMember[]): string {
   const failed = members.filter((m) => m.status === 'failed').length
-  if (failed) return `${failed} 人失败`
+  if (failed) return `${failed} 名成员失败`
   const stuck = members.find((m) => m.status !== 'done' && m.status !== 'running')
   return stuck ? statusMeta(stuck.status).label : ''
 }
@@ -305,7 +305,7 @@ function TeamMatrixImpl({
   const closing = isClosing(dispatch, verdict)
   const dispatchRound = team?.rounds.find((r) => r.round === (dispatch?.iteration ?? 0) - 1)
   const dispatchNote = dispatch && !thinking
-    ? closing ? '收尾判定' : dispatchRound?.members.length ? `派 ${dispatchRound.members.length} 人` : '收尾'
+    ? closing ? '收尾判定' : dispatchRound?.members.length ? `分派 ${dispatchRound.members.length} 名成员` : '收尾'
     : ''
   // 用完了几轮：以报错、日志原话为准，配置里的数可能在运行之后改过
   const usedUp = ending?.rounds ?? (maxRounds || team?.rounds.length)
@@ -322,8 +322,8 @@ function TeamMatrixImpl({
   if (live) {
     headRight = thinking ? closing ? verdictText({ done: false, reason: '', open: true }) : '调度中'
       : !started ? idle
-      : width > 1 ? runningNow ? `本轮 ${width} 人并行 · ${runningNow} 人在跑` : `本轮 ${width} 人已交回`
-        : runningNow ? '串行推进' : '等调度者'
+      : width > 1 ? runningNow ? `本轮 ${width} 名成员并行 · ${runningNow} 名执行中` : `本轮 ${width} 名成员已交回`
+        : runningNow ? '串行推进' : '等待调度者'
   } else if (ending?.exhausted) {
     headRight = `用完 ${usedUp} 轮 · 未完成`
     headTone = ending.exhausted === 'fail' ? 'err' : 'warn'
@@ -335,16 +335,16 @@ function TeamMatrixImpl({
   } else {
     headRight = unsettledNote(rows.filter((r) => r.active && r.member)
       .map((r) => ({ ...r.member!, status: r.status! })))
-      || (width > 1 ? `${width} 人并行完成` : team.finished ? '已收尾' : '')
+      || (width > 1 ? `${width} 名成员并行完成` : team.finished ? '已收尾' : '')
   }
   const reason = ending?.reason || verdict?.reason || ''
   const headTitle = ending?.exhausted || verdict
     ? [
         verdict ? verdictText(verdict, true) : `协作团队用完 ${usedUp} 轮仍未完成`,
-        ending?.exhausted === 'degrade' ? '按降档交付：成果是成员最后的原话，不是调度者认可的结论' : '',
-        ending?.exhausted === 'fail' ? '节点判为失败。可以调大「最多轮数」，或把「用完轮数时」改成降档交付' : '',
+        ending?.exhausted === 'degrade' ? '降档交付：成果为成员最后的输出，并非调度者认可的结论' : '',
+        ending?.exhausted === 'fail' ? '节点判为失败。可调大「最多轮数」，或将「用完轮数时」改为「降档交付」' : '',
         reason && !(verdict && !verdict.done && !verdict.open) ? `理由：${reason}` : '',
-        neverNamed.length ? `一次都没被派到：${neverNamed.join('、')}` : '',
+        neverNamed.length ? `从未被分派任务的成员：${neverNamed.join('、')}` : '',
       ].filter(Boolean).join('\n')
     : undefined
   // 省下多少只算整轮交齐的；有并行过但没交齐（失败、取消）的不能说成"全程串行"
@@ -356,7 +356,7 @@ function TeamMatrixImpl({
         <span className="tnum">
           {team?.rounds.length
             ? `第 ${(round?.round ?? 0) + 1} 轮${maxRounds ? ` / 上限 ${maxRounds}` : ''}`
-            : `花名册${maxRounds ? ` · 上限 ${maxRounds} 轮` : ''}`}
+            : `成员列表${maxRounds ? ` · 上限 ${maxRounds} 轮` : ''}`}
         </span>
         <span className="team-head-rule" />
         <span className={clsx('team-head-right', headTone && `is-${headTone}`)}>{headRight}</span>
@@ -365,10 +365,10 @@ function TeamMatrixImpl({
       <div
         className={clsx('team-row team-row-dispatch', thinking && 'team-row-running', !dispatch && 'team-row-idle')}
         title={[
-          '调度者：决定下一轮派谁、几个人同时做',
+          '调度者：决定下一轮分派哪些成员以及同时执行的人数',
           closing && verdict ? verdictText(verdict, true)
             : round?.reason ? `理由：${round.reason}` : '',
-          dispatch?.estimated ? '耗时由事件间隔推算' : '',
+          dispatch?.estimated ? '估算：根据事件间隔推算，非实测值' : '',
         ].filter(Boolean).join('\n')}
       >
         <StatusBadge status={thinking ? 'running' : dispatch ? 'done' : 'idle'} size={9} decorative />
@@ -408,10 +408,10 @@ function TeamMatrixImpl({
             data-member-status={unused ? 'never' : status ?? 'idle'}
             title={[
               hint,
-              running && member?.instruction ? `在做：${member.instruction}` : '',
+              running && member?.instruction ? `当前任务：${member.instruction}` : '',
               member ? `第 ${roundNo + 1} 轮 · ${memberText(member, status)}` : '',
               failed && error ? `原因：${error}` : '',
-              unused ? `用完 ${usedUp} 轮，一次都没被派到` : '',
+              unused ? `用完 ${usedUp} 轮，该成员从未被分派任务` : '',
             ].filter(Boolean).join('\n') || name}
           >
             <StatusBadge status={status ?? 'idle'} size={9} decorative />
@@ -431,7 +431,7 @@ function TeamMatrixImpl({
               {running && open && open.end == null && ticking
                 ? <LiveClock from={open.start} skewMs={skewMs} coarse />
                 : running && open && at != null ? stillClock(at - open.start)
-                : unused ? '未派到' : memberText(member, status)}
+                : unused ? '未分派' : memberText(member, status)}
             </span>
           </div>
         )
@@ -444,7 +444,7 @@ function TeamMatrixImpl({
             并行到底省了多少。一轮都还没整轮交回时写「—」——"省下 0 ms"是在报
             一个还没发生的收益；跑完了一次都没并发过就直说串行 */}
         <span className={clsx('tnum', team && team.savedMs > 0 && 'team-saved')}>
-          {team && team.savedMs > 0 ? `并行省下 ${formatDuration(team.savedMs)}`
+          {team && team.savedMs > 0 ? `并行节省 ${formatDuration(team.savedMs)}`
             : serialOnly && !live ? '全程串行' : NONE}
         </span>
       </div>
