@@ -257,8 +257,9 @@ async def test_a_stream_that_breaks_mid_marker_leaks_nothing(monkeypatch):
     assert [e.data["code"] for e in await events(row.id, "log") if e.data.get("code") == "stream_fallback"] \
         == ["stream_fallback"]
     streamed = "".join(t.data["delta"] for t in tokens if t.node_id == "write")
-    # 断之前放出去的是渲染好的字；半截标记一个字符都不能出去
-    assert streamed == "本周（2026-W37）销售额 ", streamed
+    # 断之前放出去的是渲染好的字；半截标记一个字符都不能出去。末尾的空格也先攒着：
+    # 后面要是 [[see:…]]，渲染时这个空格要去掉
+    assert streamed == "本周（2026-W37）销售额", streamed
     checked, doc = await report_of(row.id)
     assert checked["ok"] is True and checked["repairs"] == 0
     assert doc["markdown"] == "## 本周概览\n\n本周（2026-W37）销售额 45,678.5元，环比 8.7%；订单 1,234单。"
