@@ -268,6 +268,29 @@ def test_drift_case_builds_with_the_intended_change(code):
         assert case.rows == (days, 17 * days, 3 * days)
 
 
+def test_d24w_hour_labels_are_fullwidth():
+    """期 3 的 D24w（P3-SPEC 11.1）：时段标签用全角数字和全角减号，规范写法仍是「7-8」；其余与 D01 相同。"""
+    from app.data import recipe_parsers as P
+
+    raw, name = flow_workbook(SEP, 30, variant="D24w")
+    base, base_name = flow_workbook(SEP, 30)
+    assert name == base_name
+    ws, plain = _sheet(raw), _sheet(base)
+    hours = [*range(10, 21), *range(22, 28)]
+    assert [ws[f"B{r}"].value for r in (10, 13, 27)] == ["７－８", "１０－１１", "２３－２４"]
+    for r in hours:
+        label = ws[f"B{r}"].value
+        assert all(not ("0" <= ch <= "9") and ch != "-" for ch in label), label
+        assert "－" in label and P.hour_range(label).canonical == plain[f"B{r}"].value
+    # 只改了时段标签：其余格（数字、合计标签、公式、统计期）与 D01 逐格相同
+    changed = _diff(cells(base), cells(raw))
+    assert changed == {f"B{r}" for r in hours}
+    assert _diff(cells(base, data_only=True), cells(raw, data_only=True)) == changed
+    assert ws["B28"].value == "18-22 时合计" and not has_full_calc(raw)
+    assert flow_workbook(SEP, 30, variant="D24w")[0] == raw
+    xlsx_scan.scan(raw)
+
+
 def test_noperiod_variant_drops_b2_only():
     raw, _ = flow_workbook(SEP, 30, variant="noperiod")
     ws = _sheet(raw)
@@ -362,7 +385,7 @@ def _all(raw: bytes) -> dict[tuple[str, str], object]:
 LAB_CASES = ([("c01", v, lab.c01(v)) for v in lab.C01_VARIANTS] + [("c04", "", lab.c04())]
              + [("c05", v, lab.c05(v)) for v in lab.C05_VARIANTS] + [("c06", "", lab.c06())]
              + [("c08", v, lab.c08(v)) for v in lab.C08_VARIANTS] + [("c10", m, lab.c10(m)) for m in lab.C10_MONTHS]
-             + [("kv", "", lab.kv_form())])
+             + [("kv", "", lab.kv_form()), ("c01", "shift", lab.c01("literal", shift=(3, 2)))])
 
 
 @pytest.mark.parametrize("name,variant,built", LAB_CASES, ids=[f"{n}-{v}" for n, v, _ in LAB_CASES])
@@ -392,6 +415,40 @@ def test_lab_c01():
         assert not has_full_calc(raw)
     with pytest.raises(ValueError):
         lab.c01("nope")
+
+
+def test_lab_c01_shift():
+    """期 3 的 c01 挪位（P3-SPEC 4.6 第 2 条、11.1）：整张表往下 3 行、往右 2 列，表头落在 E8，上方另加两行
+    不含数字的说明；shift=(0, 0) 与不传参数逐字节相同。"""
+    for variant in lab.C01_VARIANTS:
+        assert lab.c01(variant, shift=(0, 0)) == lab.c01(variant)
+    for variant in lab.C01_VARIANTS:
+        raw, name = lab.c01(variant, shift=(3, 2))
+        assert name == f"c01_{variant}_shifted.xlsx"
+        ws, cached = book(raw)["月报"], book(raw, data_only=True)["月报"]
+        assert [ws.cell(8, c).value for c in range(5, 9)] == ["地区", "产品", "销量", "金额"]
+        assert [ws.cell(9, c).value for c in range(5, 9)] == ["分区甲", "产品甲", 10, 100]
+        assert ws["E4"].value == "2026年8月 销售月报" and {str(m) for m in ws.merged_cells.ranges} == {"E4:H4"}
+        assert (ws["E5"].value, ws["E12"].value, ws["E14"].value) == ("单位：万元", "合计", "注：数据来源于业务系统，金额含税。")
+        assert [ws["E1"].value, ws["E2"].value] == list(lab.C01_SHIFT_NOTES) and ws["E3"].value is None
+        # 原来的位置都空了：C 列、第 5 行左侧没有任何格
+        assert all(ws.cell(r, c).value is None for r in range(1, 16) for c in (1, 2, 3, 4))
+        texts = {ref: ws[ref].value for ref in ("E1", "E2", "E4", "E5", "E6", "E14", "E15")}
+        assert [ref for ref, v in texts.items() if any(ch.isdigit() for ch in v)] == ["E4", "E6"]
+        if variant == "literal":
+            assert (ws["G12"].value, ws["H12"].value) == (45, 300)
+        else:
+            assert (ws["G12"].value, ws["H12"].value) == ("=SUM(G9:G11)", "=SUM(H9:H11)")
+            want = (45, 300) if variant == "cached" else (None, None)
+            assert (cached["G12"].value, cached["H12"].value) == want
+        assert not has_full_calc(raw)
+        assert lab.c01(variant, shift=(3, 2))[0] == raw
+    # 挪位只改坐标：非空格的值（公式里的引用除外）与原表一一对应
+    plain = sorted(str(v) for v in cells(lab.c01("literal")[0], "月报").values())
+    moved = cells(lab.c01("literal", shift=(3, 2))[0], "月报")
+    assert sorted(str(v) for v in moved.values() if v not in lab.C01_SHIFT_NOTES) == plain
+    with pytest.raises(ValueError):
+        lab.c01("literal", shift=(-1, 0))
 
 
 def test_lab_c04_merges():

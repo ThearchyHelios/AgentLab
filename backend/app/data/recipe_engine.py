@@ -26,6 +26,19 @@ pk_duplicate 同时出现）。块级的定位失败（找不到日期表头、�
 
 建库连接用 engine.open_checked_sqlite（关 DQS，和核对模块同一个入口）。建表语句不经 SQL 守卫
 （同 tabular.py 开头的理由：导入是我们自己发起的可信操作）。
+
+**期 3（P3-SPEC 9.2、3.1、3.2、第 8 节遗留项 4）在这里加了四件事，没用新字段的配方写出的库与期 2 逐字节相同：**
+- 三种忽略规则（ignore_rows / ignore_columns / ignore_outside）：都按文件里的文字认，锚点在某一期没出现就什么也
+  不忽略、也不报错；被忽略的格去向是 ignored（按表头忽略的列沿用 ignored_column），不再报「没有去处」「区域外
+  数字」。
+- 修复按钮的参数 Problem.fix_args：构造补丁要的标签、表头、分段标题、锚点原文和坐标，**不含数据格的数值**
+  （修复按钮直接把它写进配方，混进数值就等于把本期的数写死在配方里）。fix 和 fix_args 同时有或同时没有：拿不出
+  参数的问题（合并成「另有 N 处」的那条、列表找不到标题、标签不是文字的 row_unclaimed）不给修复按钮，界面也就
+  不会放一个点了没用的按钮。
+- 区域标记带块 id，按（去向、块、列段）合矩形：框选的重放比对按块过滤，网格按块描边，相邻两块的格不再合进同一
+  个矩形。
+- 回执里的「排除的行」rows_excluded（H2：排除的行要写进回执）：隐藏行、列表跳过的空行、按规则忽略的行、
+  停止之后没导入的文字行、只核对不另存的合计行。
 """
 from __future__ import annotations
 
@@ -47,12 +60,12 @@ from app.data import tabular, xlsx_cells
 from app.data.names import canon
 from app.data.recipe_parsers import (
     AxisDate, HourRange, HourTotal, Period, classify_outside, cn_date_range, cn_year_month, filename_period,
-    hour_range, hour_range_total, is_pure_period_cell, match_key, month_day_or_date, period_residue,
-    text_label, thousands_number,
+    hour_range, hour_range_total, is_pure_period_cell, looks_numeric_text, match_key, month_day_or_date,
+    period_residue, text_label, thousands_number,
 )
 from app.data.recipe_types import (
     AxisOut, CanonEntry, CheckResult, ColumnOut, ContextSpec, CrosstabBlock, DerivedItem, DimensionSegment,
-    Extraction, Grid, GridCell, LedgerSheet, ListBlock, MeasuresSegment, OutsideText,
+    ExcludedRows, Extraction, Grid, GridCell, LedgerSheet, ListBlock, MeasuresSegment, OutsideText,
     PeriodInput, PeriodOut, Problem, Recipe, RegionMark, SegmentLabels, SheetRecipe, TableOut, TableSpec,
     derive_tables,
 )
@@ -96,12 +109,22 @@ PROBLEM_CODES: dict[str, str] = {
     "pk_duplicate": "structure",
 }
 
-#: 期 3 修复按钮的种类（契约 Problem.fix）。期 2 只透传
+#: 修复按钮的种类（契约 Problem.fix，取值见 FIX_KINDS）。参数 fix_args 的形状见 P3-SPEC 3.2，由报问题的地方随问题
+#: 一起填（合并类问题在 _Engine._fix_args 里补）。期 3 相对期 2 的改动（3.1）：
+#: - row_unclaimed 改为 ignore_cells（按行标签忽略）：分段是连续的数据行，隔了空行的那一行把标签加进分段也认领
+#:   不到，加标签只会再多报一条 label_missing；
+#: - cell_unclaimed 不给：数据行里单独一格没有能泛化的锚点（同一行的标签会把整行忽略掉），只能改文件或框选；
+#: - rows_after_stop 不给：它是需确认类，勾选即可启用，列表的按行忽略不在期 3 范围内；
+#: - column_extra（列表）给 ignore_cells（按表头忽略）、hidden_rows / hidden_cols 给 declare_hidden、
+#:   sheet_missing 给 rename_sheet。
+#: edit_members 不来自执行器（来自静态校验的 fact_claim_mismatch），rename_sheet 另有不是问题的触发
+#: （Extraction.sheets.renamed），都不在这里。
 PROBLEM_FIX: dict[str, str] = {
     "label_missing": "remove_label", "label_unexpected": "add_label", "title_not_found": "rename_title",
-    "axis_extra_cells": "ignore_cells", "outside_number": "ignore_cells", "cell_unclaimed": "ignore_cells",
-    "row_unclaimed": "add_label", "label_unparsed": "declare_total", "rows_after_stop": "ignore_cells",
-    "value_not_number": "declare_placeholder",
+    "label_unparsed": "declare_total", "value_not_number": "declare_placeholder",
+    "axis_extra_cells": "ignore_cells", "column_extra": "ignore_cells", "row_unclaimed": "ignore_cells",
+    "outside_number": "ignore_cells",
+    "hidden_rows": "declare_hidden", "hidden_cols": "declare_hidden", "sheet_missing": "rename_sheet",
 }
 
 #: 列表找表头的窗口：从 after_title 的下一行（或已用区域首行）起往下这么多行
@@ -114,6 +137,13 @@ CELLS_MAX = 20
 PER_CODE_MAX = 50
 #: 规范写法对照最多几条
 CANON_MAX = 500
+#: declare_placeholder 的 fix_args.texts 最多几种（P3-SPEC 3.2 ⑦）；_Issue 多收一种，才知道是不是超了
+PLACEHOLDER_TEXTS_MAX = 8
+#: 能当占位符提议的文字最长几个字（canon 之后）。更长的多半是备注、说明，不是「无数据」的记号
+PLACEHOLDER_TEXT_LEN = 8
+#: 排除的行在回执里的顺序（同一工作表内按原因、块、锚点、首行排）
+_EXCLUDED_ORDER = ("hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop",
+                   "total_not_kept")
 #: 公式区域展开的上限：更大的区域不可能全落在基表里，直接判「引用了基表之外的格」
 REF_CELLS_MAX = 200_000
 
@@ -123,6 +153,11 @@ _BLOCK_ROLES = frozenset({"value", "derived_value", "derived_label", "col_header
 #: 块级定位失败的工作表上不再报的「区域外 / 没有去处」类问题（根因已经报了）
 _NOISE_CODES = frozenset({"outside_number", "outside_digits", "cell_unclaimed", "row_unclaimed",
                           "row_without_label", "rows_after_stop"})
+#: 像表下说明的开头（按 canon 之后比）。跳过空行的列表里，空行之后只有首列一格文字的行一律当表的下边界（与起草器
+#: 一致，_ListRun._note_after_blank）；以这些开头的只记进回执（rows_excluded、区域外文字），其余的另出 rows_after_stop
+#: 要人确认：它也可能是表尾一条只填了首列的数据行，静默移出去就少了一条记录（WP-8 评审意见 4）
+_NOTE_PREFIXES = tuple(canon(x) for x in ("注", "说明", "备注", "制表", "填表", "填报", "来源", "数据来源", "单位",
+                                          "审核"))
 #: after_title 最长 40 字，算上空白和全角写法，比这更长的格不可能是它
 _TITLE_SCAN_MAX = 200
 _PARSER_NAME = {
@@ -175,6 +210,28 @@ def _rows_text(rows: list[int], limit: int = 10) -> str:
         else:
             spans.append([r, r])
     return _join([str(a) if a == b else f"{a}–{b}" for a, b in spans], limit)
+
+
+def _anchor_text(value: Any) -> str | None:
+    """能写进 fix_args 当锚点的文字（表头、行标签、区域外文字、候选标题）：只认文字格，原样返回；空白、不是文字、
+    像一个数（「1,234」「12.5%」）的一律 None。
+
+    为什么要拦「像数的」：fix_args 不许带数据格的数值（契约 Problem.fix_args），而表头位置上的「987654」、标签列上
+    的「2,345」其实就是数，写进配方的忽略规则还等于把本期的数写死。拦下之后界面给不出这条提议，提示改文件。"""
+    if not isinstance(value, str) or not value.strip() or looks_numeric_text(value.strip()):
+        return None
+    return value
+
+
+def _spans_of(rows: list[list[int]]) -> list[list[int]]:
+    """[[起, 止], …]（可能乱序、重叠、相接）→ 升序、不重叠、相接的合成一段。"""
+    out: list[list[int]] = []
+    for a, b in sorted(rows):
+        if out and a <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
 
 
 def _in_spans(spans: list[tuple[int, int]], starts: list[int], x: int) -> bool:
@@ -281,26 +338,33 @@ class _Runs:
         return [[start, sheet, cell_ref(r, c), n, way] for start, sheet, r, c, n, way in self.runs]
 
 
-def _row_spans(cells: list[tuple[int, GridCell]], claims: dict[int, str],
-               layout: list[tuple[int, int, str]] | None) -> list[tuple[int, int, str]]:
-    """一行的区域段 [(起列, 止列, 去向)]。
+#: 一行里的一个区域段：(起列, 止列, 去向, 块 id)。区域外文字、统计期、按区域外锚点忽略的格块 id 为 None
+Span = tuple[int, int, str, "str | None"]
+
+
+def _row_spans(cells: list[tuple[int, GridCell]], claims: dict[int, str], layout: list[Span] | None,
+               blocks: dict[int, str] | str | None) -> list[Span]:
+    """一行的区域段 [(起列, 止列, 去向, 块)]。blocks：已认领格所在的块（按列给，或者整行同一个块）。
 
     块登记了这一行的固定列段（layout：列表数据行是本块的列范围，交叉表数据行是标签列和日期列）时，按固定列段
     出段，不看这一行哪几格碰巧是空的：末列常空的「备注」、隔行为空的金额，否则每行的段都不一样，20 万行的表会
-    出 20 万个矩形（4.9「区域标记按矩形」）。固定列段里有去向对不上的格（块之间认领重叠）时退回按格出段。
-    其余的格：同一去向的相邻已认领格合成一段（中间的空格一并覆盖，着色无妨），没有认领的格把段隔开（未认领的格
-    不在区域标记里，由问题的 cells 指出）。"""
-    items: list[tuple[int, int, str | None]] = []
+    出 20 万个矩形（4.9「区域标记按矩形」）。固定列段里有去向或块对不上的格（块之间认领重叠）时退回按格出段。
+    其余的格：同一去向、同一块的相邻已认领格合成一段（中间的空格一并覆盖，着色无妨），没有认领的格把段隔开
+    （未认领的格不在区域标记里，由问题的 cells 指出）。不同块的格不合段（期 3：框选的重放比对按块过滤区域，
+    并排的两张列表的值区合成一个矩形就分不出各自的范围了）。"""
+    block_of: Callable[[int], str | None] = (blocks.get if isinstance(blocks, dict)  # type: ignore[assignment]
+                                             else (lambda c: blocks))
+    items: list[tuple[int, int, str | None, str | None]] = []
     if layout:
-        fixed = sorted(layout)
+        fixed = sorted(layout, key=lambda x: (x[0], x[1]))
         for c, _ in cells:
-            for a, b, role in fixed:
+            for a, b, role, blk in fixed:
                 if a <= c <= b:
-                    if claims.get(c) != role:
+                    if claims.get(c) != role or block_of(c) != blk:
                         layout = None
                     break
             else:
-                items.append((c, c, claims.get(c)))
+                items.append((c, c, claims.get(c), block_of(c)))
             if layout is None:
                 items = []
                 break
@@ -308,60 +372,61 @@ def _row_spans(cells: list[tuple[int, GridCell]], claims: dict[int, str],
             items.extend(fixed)
             items.sort(key=lambda x: x[0])
     if not layout:
-        items = [(c, c, claims.get(c)) for c, _ in cells]
+        items = [(c, c, claims.get(c), block_of(c)) for c, _ in cells]
     out: list[list[Any]] = []
     broken = True
-    for a, b, role in items:
+    for a, b, role, blk in items:
         if role is None:
             broken = True
             continue
-        if out and not broken and out[-1][2] == role:
+        if out and not broken and out[-1][2] == role and out[-1][3] == blk:
             out[-1][1] = max(out[-1][1], b)
         else:
-            out.append([a, b, role])
+            out.append([a, b, role, blk])
         broken = False
-    return [(a, b, role) for a, b, role in out]
+    return [(a, b, role, blk) for a, b, role, blk in out]
 
 
 class _Regions:
-    """按行喂入区域段，同一去向、同一列范围、行相接的合成矩形（给网格着色，契约 RegionMark）。
+    """按行喂入区域段，同一去向、同一块、同一列范围、行相接的合成矩形（给网格着色，契约 RegionMark）。
 
     行内怎么分段见 _row_spans。喂入不必全局按行有序：乱序的只是多出几个小矩形，覆盖不受影响（区域外文字要等
     统计期定下来才分类，喂得晚）。"""
 
     def __init__(self, sheet: str) -> None:
         self.sheet = sheet
-        self.open: dict[tuple[str, int, int], list[int]] = {}
-        self.closed: list[tuple[int, int, int, int, str]] = []
+        self.open: dict[tuple[str, str | None, int, int], list[int]] = {}
+        self.closed: list[tuple[int, int, int, int, str, str | None]] = []
 
     def feed_row(self, r: int, cells: list[tuple[int, str]]) -> None:
-        """单独几格（区域外文字、统计期）：同一去向的相邻格合成一段。"""
-        spans: list[tuple[int, int, str]] = []
+        """单独几格（区域外文字、统计期、按区域外锚点忽略的数字）：不属于任何块，同一去向的相邻格合成一段。"""
+        spans: list[Span] = []
         for c, role in cells:
             if spans and spans[-1][2] == role:
-                spans[-1] = (spans[-1][0], c, role)
+                spans[-1] = (spans[-1][0], c, role, None)
             else:
-                spans.append((c, c, role))
+                spans.append((c, c, role, None))
         self.feed_spans(r, spans)
 
-    def feed_spans(self, r: int, spans: list[tuple[int, int, str]]) -> None:
-        for c1, c2, role in spans:
-            key = (role, c1, c2)
+    def feed_spans(self, r: int, spans: list[Span]) -> None:
+        for c1, c2, role, block in spans:
+            key = (role, block, c1, c2)
             rect = self.open.get(key)
             if rect is not None and rect[1] == r - 1:
                 rect[1] = r
                 continue
             if rect is not None:
-                self.closed.append((rect[0], c1, rect[1], c2, role))
+                self.closed.append((rect[0], c1, rect[1], c2, role, block))
             self.open[key] = [r, r]
 
     def marks(self) -> list[RegionMark]:
-        rects = list(self.closed) + [(r1, c1, r2, c2, role) for (role, c1, c2), (r1, r2) in self.open.items()]
-        rects.sort(key=lambda x: (x[0], x[1], x[4]))
+        rects = list(self.closed) + [(r1, c1, r2, c2, role, block)
+                                     for (role, block, c1, c2), (r1, r2) in self.open.items()]
+        rects.sort(key=lambda x: (x[0], x[1], x[4], x[5] or ""))
         out = []
-        for r1, c1, r2, c2, role in rects:
+        for r1, c1, r2, c2, role, block in rects:
             ref = cell_ref(r1, c1) if (r1, c1) == (r2, c2) else f"{cell_ref(r1, c1)}:{cell_ref(r2, c2)}"
-            out.append(RegionMark(self.sheet, role, ref))  # type: ignore[arg-type]
+            out.append(RegionMark(self.sheet, role, ref, block))  # type: ignore[arg-type]
         return out
 
 
@@ -434,6 +499,11 @@ class _Issue:
     count: int = 0
     cells: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
+    #: 期 3 修复参数要的位置：所在块（value_not_number）、所在行（outside_number 按行合并，一行一条）
+    block: str | None = None
+    row: int | None = None
+    #: value_not_number：能当占位符提议的文字（canon 后）→ 格数，最多收 PLACEHOLDER_TEXTS_MAX + 1 种
+    texts: Counter[str] = field(default_factory=Counter)
 
 
 #: 合并类问题的说明：code → (原因（{n} 是个数）, 下一步)。下一步写配方面板上的「字段」和「选项」原文
@@ -470,44 +540,59 @@ class _Problems:
         self._over: Counter[tuple[str, str | None]] = Counter()
 
     def add(self, code: str, message: str, model_message: str, cells: list[str] | tuple[str, ...] = (), *,
-            sheet: str | None = None) -> None:
+            sheet: str | None = None, fix_args: dict[str, Any] | None = None) -> Problem | None:
+        """记一条问题，返回它（超过 PER_CODE_MAX 合进「另有 N 处」时返回 None）。
+
+        fix 只在 fix_args 也给了时才填：修复补丁全靠 fix_args 构造，没有参数的修复按钮点了也没用（P3-SPEC 3.1）。
+        title_not_found 的候选标题要等所有块认领完才知道，调用方拿返回的 Problem 之后再补（_Crosstab.post_claims）。"""
         key = (code, sheet)
         self._per[key] += 1
         if self._per[key] > PER_CODE_MAX:
             self._over[key] += 1
-            return
-        self.items.append((sheet, Problem(code=code, category=PROBLEM_CODES[code], message=message,  # type: ignore[arg-type]
-                                          cells=list(cells)[:CELLS_MAX], model_message=model_message,
-                                          fix=PROBLEM_FIX.get(code))))
+            return None
+        fix = PROBLEM_FIX.get(code) if fix_args is not None else None
+        p = Problem(code=code, category=PROBLEM_CODES[code], message=message,  # type: ignore[arg-type]
+                    cells=list(cells)[:CELLS_MAX], model_message=model_message, fix=fix,
+                    fix_args=fix_args if fix is not None else None)
+        self.items.append((sheet, p))
+        return p
 
     def issue(self, code: str, sheet: str | None, where: str, cell: str | list[str], example: str | None = None, *,
-              text: tuple[str, str] | None = None, group: str = "") -> None:
-        """记一处同类问题；cell 可以是几个坐标（主键重复要列出两处）。"""
+              text: tuple[str, str] | None = None, group: str = "", block: str | None = None,
+              row: int | None = None, sample: str | None = None) -> None:
+        """记一处同类问题；cell 可以是几个坐标（主键重复要列出两处）。block、row、sample 是修复参数要的：
+        sample 是 value_not_number 那一格的文字（canon 后），能当占位符提议的才收进 texts。"""
         key = (code, sheet, where + "\x00" + group)
         it = self.issues.get(key)
         if it is None:
             reason, tail = text or _ISSUE_TEXT[code]
-            it = self.issues[key] = _Issue(code, sheet, where, reason, tail)
+            it = self.issues[key] = _Issue(code, sheet, where, reason, tail, block=block, row=row)
         it.count += 1
         for one in ([cell] if isinstance(cell, str) else cell):
             if len(it.cells) < CELLS_MAX and one not in it.cells:
                 it.cells.append(one)
         if example is not None and len(it.examples) < 3:
             it.examples.append(example)
+        if sample is not None and (sample in it.texts or len(it.texts) <= PLACEHOLDER_TEXTS_MAX):
+            it.texts[sample] += 1
 
-    def finish(self, failed_sheets: set[str]) -> list[Problem]:
+    def finish(self, failed_sheets: set[str],
+               args_for: Callable[[_Issue], dict[str, Any] | None] | None = None) -> list[Problem]:
+        """合并类问题出成 Problem；args_for 给有修复按钮的合并类问题（outside_number、value_not_number）算 fix_args。
+        「另有 N 处」那一条没有坐标和参数，不给修复按钮。"""
         for it in self.issues.values():
             reason = it.reason.format(n=it.count)
             shown = [c.split("!")[-1] for c in it.cells]
             ex = f"（如 {'；'.join(it.examples)}）" if it.examples else f"（{_join(shown, 5)}）"
             model_ex = f"（{_join(shown, 5)}）"
+            args = args_for(it) if args_for is not None and it.code in PROBLEM_FIX else None
             self.add(it.code, f"{it.where}：{reason}{ex}{it.tail}", f"{it.where}：{reason}{model_ex}", it.cells,
-                     sheet=it.sheet)
+                     sheet=it.sheet, fix_args=args)
         for (code, sheet), n in self._over.items():
             where = f"工作表「{sheet}」" if sheet else "本文件"
             text = f"{where}另有 {n} 处同类问题未逐一列出"
             self.items.append((sheet, Problem(code=code, category=PROBLEM_CODES[code], message=text,  # type: ignore[arg-type]
-                                              model_message=text, fix=PROBLEM_FIX.get(code))))
+                                              model_message=text)))
         return [p for sheet, p in self.items if not (sheet in failed_sheets and p.code in _NOISE_CODES)]
 
     def blocking(self) -> bool:
@@ -626,6 +711,18 @@ class _Stopped:
     closed: bool = False
     rows: list[int] = field(default_factory=list)
     cells: list[str] = field(default_factory=list)
+    #: 这些行在本块列范围内的非空格数（rows_excluded 的 after_stop 用；cells 只留前 CELLS_MAX 个坐标）
+    n: int = 0
+    #: 跳过空行的列表按「表下说明」收尾时（_ListRun._note_after_blank，WP-8 修补 3）：说明那一行的行号、坐标、文字
+    #: （去了首尾空白），以及它像不像说明（_note_like）。stop 模式碰到空行收尾时都是 None
+    note_row: int | None = None
+    note_cell: str | None = None
+    note_text: str | None = None
+    note_like: bool = True
+    #: 按表下说明收尾时，说明之下本块列范围内有字、但不到 need 格的行（第二行说明、单独一格的落款）和它们的格数：
+    #: 修补 3 之前这些行都会读成数据，现在交给了区域外，同样记进 rows_excluded（after_stop），不另出问题
+    tail: list[int] = field(default_factory=list)
+    tail_n: int = 0
 
 
 class _Sheet:
@@ -641,6 +738,9 @@ class _Sheet:
         self.truncated = False
         self.claims: dict[tuple[int, int], str] = {}
         self.owners: dict[tuple[int, int], str] = {}
+        #: 格 → 认领它的块 id（区域标记按块合矩形）。owners 里交叉表的格记的是分段 id（重叠报错要写分段名），
+        #: 这里统一换算成块 id
+        self.cell_block: dict[tuple[int, int], str] = {}
         self.overlaps: set[tuple[str, str]] = set()
         self.data_rows: set[int] = set()
         self.suppressed: set[tuple[int, int]] = set()
@@ -652,7 +752,16 @@ class _Sheet:
         self.recon: _Reconciler | None = None
         self.stopped: list[_Stopped] = []
         #: 行 → 块登记的固定列段（_row_spans）：格子账收尾那一行时取走，流式路径里同时只有一两行
-        self.layouts: dict[int, list[tuple[int, int, str]]] = {}
+        self.layouts: dict[int, list[Span]] = {}
+        #: 排除的行：(原因, 块, 锚点) → [[[起, 止], …], 格数]，_phase4 收尾时出成 ExcludedRows
+        self.excluded: dict[tuple[str, str | None, str | None], list[Any]] = {}
+        #: ignore_outside 的锚点：[(match_key, 配方里的原文)]，按配方顺序
+        self.outside_rules: list[tuple[str, str]] = [(k, x.anchor) for x in sr.ignore_outside
+                                                     if (k := match_key(x.anchor))]
+        #: 有 ignore_outside 时，区域外的数字格先压着，等同一行的区域外文字都分类完再定忽略还是报问题
+        self.held: list[tuple[int, int, Any]] = []
+        #: 行 → 这一行区域外的文字格 [(列, 原文)]（不含统计期来源）：ignore_outside 的锚点、outside_number 的修复参数
+        self.outside_texts: dict[int, list[tuple[int, str]]] = {}
         self.order: list[tuple[int, str]] = []
         self.hidden_claimed_rows: set[int] = set()
         self.hidden_claimed_cols: set[int] = set()
@@ -673,7 +782,7 @@ class _Sheet:
     def coord(self, r: int, c: int) -> str:
         return _coord(self.name, r, c)
 
-    def layout(self, r: int, spans: list[tuple[int, int, str]]) -> None:
+    def layout(self, r: int, spans: list[Span]) -> None:
         """登记这一行的固定列段（区域标记按它出矩形，见 _row_spans）。"""
         got = self.layouts.get(r)
         if got is None:
@@ -681,15 +790,30 @@ class _Sheet:
         else:
             got.extend(spans)
 
-    def claim(self, r: int, c: int, role: str, owner: str) -> bool:
-        """认领一格（只认领网格里的非空格）。被别的块认领过就记重叠、不改。"""
+    def claim(self, r: int, c: int, role: str, owner: str, block: str | None = None) -> bool:
+        """认领一格（只认领网格里的非空格）。被别的块认领过就记重叠、不改。block 缺省时就是 owner（列表块、
+        交叉表的表头行用块 id 认领；交叉表分段里的格 owner 是分段 id，另传块 id）。"""
         prev = self.owners.get((r, c))
         if prev is not None and prev != owner:
             self.overlaps.add((min(prev, owner), max(prev, owner)))
             return False
         self.claims[(r, c)] = role
         self.owners[(r, c)] = owner
+        self.cell_block[(r, c)] = block or owner
         return True
+
+    def exclude(self, reason: str, first: int, last: int, cells: int, *, block: str | None = None,
+                anchor: str | None = None) -> None:
+        """记一段排除的行（rows_excluded）。同一原因、同一块、同一锚点的合成一项。"""
+        got = self.excluded.setdefault((reason, block, anchor), [[], 0])
+        got[0].append([first, last])
+        got[1] += cells
+
+    def excluded_rows(self) -> list[ExcludedRows]:
+        out = [ExcludedRows(self.name, reason, _spans_of(rows), n, anchor=anchor, block=block)  # type: ignore[arg-type]
+               for (reason, block, anchor), (rows, n) in self.excluded.items()]
+        out.sort(key=lambda x: (_EXCLUDED_ORDER.index(x.reason), x.block or "", x.anchor or "", x.rows[0][0]))
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -769,6 +893,16 @@ class _Crosstab:
         self.excluded: set[tuple[int, int]] = set()
         self.cell_index: dict[tuple[int, int], tuple[str, int]] = {}
         self.exclude_hidden = sh.sr.hidden.rows == "exclude"
+        #: 期 3 忽略规则：match_key → 配方里的原文（同一键取第一条；同键重复是静态校验的 ignore_duplicate）
+        self.ignore_rows: dict[str, str] = {}
+        for rule in block.ignore_rows:
+            if (k := match_key(rule.label)):
+                self.ignore_rows.setdefault(k, rule.label)
+        self.ignore_cols = {k for rule in block.ignore_columns if (k := match_key(rule.header))}
+        #: 按表头忽略的列（轴行右侧）
+        self.ignored_cols: list[int] = []
+        #: 本块报出的 title_not_found（候选标题要等所有块认领完，在 post_claims 里补进 fix_args）
+        self.title_missing: list[Problem] = []
 
     # ---------------- 定位 ----------------
 
@@ -821,6 +955,10 @@ class _Crosstab:
             return
         self.axis_cells = dates
         extra = [c for c, _ in row if c > self.last_c]
+        # 期 3：表头命中 ignore_columns 的列按表头忽略，不报 axis_extra_cells；其余照期 2
+        self.ignored_cols = [c for c in extra if self.ignore_cols
+                             and match_key(_text(grid.get(r, c).value)) in self.ignore_cols]  # type: ignore[union-attr]
+        extra = [c for c in extra if c not in self.ignored_cols]
         if extra:
             self.extra_cols = set(extra)
             shown = [f"{cell_ref(r, c)}「{_shown(grid.get(r, c).value)}」" for c in extra]
@@ -828,7 +966,10 @@ class _Crosstab:
                 "axis_extra_cells",
                 f"{self.where}：日期表头（第 {r} 行）最后一个日期右边还有内容：{_join(shown)}。请删除这些列，或调整配方",
                 f"{self.where}：日期表头（第 {r} 行）最后一个日期右边还有内容：{_join([cell_ref(r, c) for c in extra])}",
-                [sh.coord(r, c) for c in extra], sheet=sh.name)
+                [sh.coord(r, c) for c in extra], sheet=sh.name,
+                fix_args={"block": block.id, "how": "columns",
+                          "headers": [{"raw": _anchor_text(grid.get(r, c).value), "cell": sh.coord(r, c)}  # type: ignore[union-attr]
+                                      for c in extra]})
             for (rr, cc) in grid.cells:
                 if rr >= r and cc in self.extra_cols:
                     sh.suppressed.add((rr, cc))
@@ -839,6 +980,26 @@ class _Crosstab:
             sh.claim(r, c, "col_header", block.id)
         self._classify_rows()
         self._locate_segments()
+
+    def _claim_ignored_cols(self, bottom: int) -> None:
+        """按表头忽略的列：从轴行到本块数据区底部（bottom，本块最后一个数据行，post_claims 算）的格，去向
+        ignored_column；表头记进 Extraction.ignored_columns[块]。数据区之下的格不归这条规则管（照常算区域外），
+        免得表下的备注、落款被一并吞掉。
+
+        为什么放在 post_claims、底部只按本块自己的行算：kinds 覆盖轴行以下整张工作表，表下另有一张列表时，列表的
+        行同样「标签列有字、日期列有值」。按整张表的 data 行取底部、又在列表认领之前先认领，被忽略的这一列会一直
+        认领到列表的最后一行，列表再认领同一批格就成了 segment_overlap（结构类、没有修复按钮）：用户按了
+        「按表头忽略」，换来一条看不懂的结构错误。已归别的块的格照样跳过，与期 2 多出的列（axis_extra_cells 只
+        压掉、不认领）对别的块的效果一致。"""
+        if not self.ignored_cols:
+            return
+        grid, sh, r = self.grid, self.sh, self.axis_row
+        for rr in range(r, bottom + 1):
+            for cc in self.ignored_cols:
+                if grid.get(rr, cc) is not None and (rr, cc) not in sh.owners:
+                    sh.claim(rr, cc, "ignored_column", self.block.id)
+        self.eng.ex.ignored_columns[self.block.id] = [_text(grid.get(r, c).value).strip()  # type: ignore[union-attr]
+                                                      for c in self.ignored_cols]
 
     def _label(self, r: int) -> GridCell | None:
         return self.grid.get(r, self.label_c)
@@ -909,7 +1070,10 @@ class _Crosstab:
                 self.failed.add(seg.id)
                 if not self._missing_ok():
                     msg = f"{where}：没有找到分段标题「{seg.locate.title}」"
-                    eng.problems.add("title_not_found", msg, msg, sheet=sh.name)
+                    p = eng.problems.add("title_not_found", msg, msg, sheet=sh.name,
+                                         fix_args={"segment": seg.id, "title": seg.locate.title, "candidates": []})
+                    if p is not None:
+                        self.title_missing.append(p)
                 return
             if len(hits) > 1:
                 self.failed.add(seg.id)
@@ -1001,15 +1165,24 @@ class _Crosstab:
             cells = [sh.coord(r, lc) for r in unparsed]
             shown = [f"{cell_ref(r, lc)}「{_shown(self._label(r).value)}」" for r in unparsed]  # type: ignore[union-attr]
             name = _PARSER_NAME[spec.parser]
-            eng.problems.add("label_unparsed", f"{where}：{_join(shown)}的标签无法按{name}解析",
-                             f"{where}：{_join([cell_ref(r, lc) for r in unparsed])} 的标签无法按{name}解析",
-                             cells, sheet=sh.name)
+            # declare_total 的前提之一：解析不了的行都在分段末尾、连成一段（P3-SPEC 3.2 ⑤）
+            at_end = unparsed == loc.rows[len(loc.rows) - len(unparsed):]
+            eng.problems.add(
+                "label_unparsed", f"{where}：{_join(shown)}的标签无法按{name}解析",
+                f"{where}：{_join([cell_ref(r, lc) for r in unparsed])} 的标签无法按{name}解析", cells, sheet=sh.name,
+                fix_args={"segment": seg.id, "role": spec.role, "at_end": at_end,
+                          "labels": [{"raw": _text(self._label(r).value), "cell": sh.coord(r, lc),  # type: ignore[union-attr]
+                                      "total": hour_range_total(self._label(r).value) is not None}  # type: ignore[union-attr]
+                                     for r in unparsed]})
         if unexpected:
             cells = [sh.coord(r, lc) for r in unexpected]
             shown = [f"{cell_ref(r, lc)}「{_shown(self._label(r).value)}」" for r in unexpected]  # type: ignore[union-attr]
-            eng.problems.add("label_unexpected", f"{where}：{_join(shown)}的标签不在期望的标签中",
-                             f"{where}：{_join([cell_ref(r, lc) for r in unexpected])} 的标签不在期望的标签中",
-                             cells, sheet=sh.name)
+            eng.problems.add(
+                "label_unexpected", f"{where}：{_join(shown)}的标签不在期望的标签中",
+                f"{where}：{_join([cell_ref(r, lc) for r in unexpected])} 的标签不在期望的标签中", cells, sheet=sh.name,
+                fix_args={"segment": seg.id, "role": spec.role,
+                          "labels": [{"raw": _text(self._label(r).value), "cell": sh.coord(r, lc)}  # type: ignore[union-attr]
+                                     for r in unexpected]})
         if dup:
             cells = [sh.coord(r, lc) for r in dup]
             pairs = [f"{cell_ref(loc.first[canonical[loc.rows.index(r)]], lc)} 与 {cell_ref(r, lc)}" for r in dup]
@@ -1022,54 +1195,78 @@ class _Crosstab:
             cells = [sh.coord(loc.rows[0], lc)] if loc.rows else (
                 [sh.coord(loc.title_row, lc)] if loc.title_row else [])
             msg = f"{where}：期望的标签{_quoted(missing)}没有找到"
-            eng.problems.add("label_missing", msg, msg, cells, sheet=sh.name)
+            eng.problems.add("label_missing", msg, msg, cells, sheet=sh.name,
+                             fix_args={"segment": seg.id, "labels": list(missing)})
 
     def _claim(self, loc: _SegLoc) -> None:
-        sh, grid, seg = self.sh, self.grid, loc.spec.seg
+        sh, grid, seg, bid = self.sh, self.grid, loc.spec.seg, self.block.id
         derived = loc.spec.role == "derived"
+        # 只核对、不另存的合计行（keep_as 为空）：参与核对，但不进任何表，记进「排除的行」（遗留项 4 的 total_not_kept）
+        not_kept = derived and seg.keep_as is None
         if loc.title_row is not None:
-            sh.claim(loc.title_row, self.label_c, "section_title", seg.id)
+            sh.claim(loc.title_row, self.label_c, "section_title", seg.id, bid)
         for r in loc.rows:
             sh.data_rows.add(r)
             excluded = self.exclude_hidden and sh.hidden_row(r)
             label_role = "hidden_excluded" if excluded else ("derived_label" if derived else "row_label")
             value_role = "hidden_excluded" if excluded else ("derived_value" if derived else "value")
             # 区域按标签列和整段日期列出（某天是空格的行不另起矩形）
-            sh.layout(r, [(self.label_c, self.label_c, label_role), (self.first_c, self.last_c, value_role)])
-            sh.claim(r, self.label_c, label_role, seg.id)
+            sh.layout(r, [(self.label_c, self.label_c, label_role, bid), (self.first_c, self.last_c, value_role, bid)])
+            n = int(sh.claim(r, self.label_c, label_role, seg.id, bid))
             for c, _ in grid.row(r):
                 if self.first_c <= c <= self.last_c:
-                    sh.claim(r, c, value_role, seg.id)
+                    n += sh.claim(r, c, value_role, seg.id, bid)
                     if excluded:
                         self.excluded.add((r, c))
+            if not_kept and not excluded and n:
+                sh.exclude("total_not_kept", r, r, n, block=bid)
 
     def post_claims(self) -> None:
         """所有块都认领完之后：没有分段认领的数据行、没有标签的行、数据区的合并单元格。"""
         if not self.located:
             return
         sh, grid, eng = self.sh, self.grid, self.eng
-        lc = self.label_c
+        lc, bid = self.label_c, self.block.id
+        # 本块的数据行（按表头忽略的列认领到哪一行为止）：分段认领的行，加上下面没有分段认领、又不归别的块的
+        # 数据行（按 ignore_rows 忽略的、报 row_unclaimed 的、分段没定位到而压掉的），都是本块要负责的行
+        own = set(self.row_owner)
         for r, kind in sorted(self.kinds.items()):
             if kind == "title" or r in self.row_owner:
                 continue
             row = grid.row(r)
-            if any((r, c) in sh.owners and sh.owners[(r, c)] != self.block.id for c, _ in row):
+            if any((r, c) in sh.owners and sh.owners[(r, c)] != bid for c, _ in row):
                 continue                    # 别的块（列表）认领了这一行
+            if kind == "data":
+                own.add(r)
+            if kind == "data" and self.ignore_rows and self._ignore_row(r, row):
+                continue
             for c, _ in row:
                 sh.suppressed.add((r, c))
             if kind == "data":
                 if self.failed:
                     continue                # 有分段没定位到：这些行多半就是它的，不再逐行报
                 coord = sh.coord(r, lc)
+                label = self._label(r).value  # type: ignore[union-attr]
+                # 修复按钮只有「按行标签忽略」（3.1：把标签加进分段认领不到隔了空行的这一行）。标签不是文字（数、
+                # 像数的文字）时没有能写进 ignore_rows 的锚点，不给按钮（fix_args 为空，fix 随之为空），提示也不提
+                # 按标签忽略；框选成分段同样要按标签文字认，也不提
+                text = _anchor_text(label)
+                if text is None:
+                    hint = "它的标签不是文字（例如是一个数），无法按标签忽略。请删除这一行，或把标签改成文字后重新上传"
+                    args = None
+                else:
+                    hint = "请删除这一行，或按行标签忽略这一行；也可以在网格上把它框选为新的分段"
+                    args = {"block": bid, "how": "rows", "labels": [{"raw": text, "cell": coord}]}
                 eng.problems.add(
                     "row_unclaimed",
-                    f"工作表「{sh.name}」第 {r} 行（{cell_ref(r, lc)}「{_shown(self._label(r).value)}」）有数据，"  # type: ignore[union-attr]
-                    "但没有分段认领这一行。请在配方面板中把它的标签添加到某个分段，或删除这一行",
+                    f"工作表「{sh.name}」第 {r} 行（{cell_ref(r, lc)}「{_shown(label)}」）有数据，"
+                    f"但没有分段认领这一行。{hint}",
                     f"工作表「{sh.name}」第 {r} 行有数据，但没有分段认领这一行（标签在 {cell_ref(r, lc)}）",
-                    [coord] + [sh.coord(r, c) for c, _ in row if c != lc], sheet=sh.name)
+                    [coord] + [sh.coord(r, c) for c, _ in row if c != lc], sheet=sh.name, fix_args=args)
             else:
                 msg = f"工作表「{sh.name}」第 {r} 行有数据，但标签列 {cell_ref(r, lc)} 是空的"
                 eng.problems.add("row_without_label", msg, msg, [sh.coord(r, c) for c, _ in row], sheet=sh.name)
+        self._claim_ignored_cols(max(own, default=self.axis_row))
         data = {r for r, k in self.kinds.items() if k == "data"}
         for r1, c1, r2, c2 in grid.merges:
             if c2 < self.first_c or c1 > self.last_c:
@@ -1077,6 +1274,36 @@ class _Crosstab:
             if any(r in data for r in range(max(r1, self.axis_row + 1), r2 + 1)):
                 ref = cell_ref(r1, c1) if (r1, c1) == (r2, c2) else f"{cell_ref(r1, c1)}:{cell_ref(r2, c2)}"
                 eng.problems.issue("merged_in_values", sh.name, self.where, sh.coord(r1, c1), ref)
+        if self.title_missing:
+            # rename_title 的候选：本块里像分段标题、又没被任何块认领的行（按行号升序）。要等所有块都认领完：
+            # 后面的分段、列表块可能还会认领标题行（P3-SPEC 3.2 ④）
+            cands = []
+            for r, kind in sorted(self.kinds.items()):
+                if kind != "title" or (r, lc) in sh.owners:
+                    continue
+                text = _anchor_text(self._label(r).value)  # type: ignore[union-attr]
+                if text is not None and len(cands) < CELLS_MAX:
+                    cands.append({"cell": sh.coord(r, lc), "text": text})
+            for p in self.title_missing:
+                p.fix_args["candidates"] = list(cands)  # type: ignore[index]
+
+    def _ignore_row(self, r: int, row: list[tuple[int, GridCell]]) -> bool:
+        """没有分段认领的数据行，标签命中 ignore_rows 时按配方忽略：标签格和日期列上的格去向 ignored，不报
+        row_unclaimed，记进「排除的行」。这一行别处的格（标签左边、轴行右侧没有表头的列）不归这条规则管，照常
+        算区域外：规则只说了忽略这一行的数据。ignored 不算块认领的格（不在 _BLOCK_ROLES）：这一行即使隐藏了
+        也不报 hidden_rows，反正不导入。"""
+        sh, bid = self.sh, self.block.id
+        rule = self.ignore_rows.get(match_key(_text(self._label(r).value)))  # type: ignore[union-attr]
+        if rule is None:
+            return False
+        n = 0
+        for c, _ in row:
+            if c == self.label_c or self.first_c <= c <= self.last_c:
+                n += sh.claim(r, c, "ignored", bid)
+        sh.layout(r, [(self.label_c, self.label_c, "ignored", bid), (self.first_c, self.last_c, "ignored", bid)])
+        if n:
+            sh.exclude("ignored_rows", r, r, n, block=bid, anchor=rule)
+        return True
 
     # ---------------- 年份与断言 ----------------
 
@@ -1372,6 +1599,9 @@ class _ListRun:
         self.last_row = 0
         self.done = False
         self.stop: tuple[str, int | None] | None = None
+        #: skip 模式下，上一条数据行之后已经按空行跳过的几段（起、止）：随后判定表已结束（表下的说明文字）时要撤回
+        #: 计数和排除的行，那几行不是「数据中间的空行」，而是表的下边界
+        self.blank_run: list[tuple[int, int]] = []
         self.row_rowid: dict[int, int] = {}
         self.rowid_first: int | None = None
         self.rowid_last: int | None = None
@@ -1386,6 +1616,8 @@ class _ListRun:
         spec = eng.specs.get(block.table)
         self.grain = set(spec.grain) if spec else set()
         self.sink = eng.sinks[block.table]
+        #: 期 3：按表头忽略的列（ignore_columns）的 match_key。只管命中的列，其余多出的列照 extra_columns
+        self.ignore_keys = {k for rule in block.ignore_columns if (k := match_key(rule.header))}
         total = block.rows.total_row
         self.total_idx = next((i for i, c in enumerate(self.cols) if total and c.name == total.label_column), None)
 
@@ -1592,14 +1824,22 @@ class _ListRun:
                 eng.problems.add("header_ambiguous", msg, msg, [sh.coord(hb, c) for c in cs], sheet=sh.name)
             bad = True
         if extra:
-            if self.block.extra_columns == "ignore":
-                self.ignored = set(extra)
-                eng.ex.ignored_columns[self.block.id] = [composed[c] for c in extra]
-            else:
-                shown = [f"「{composed[c]}」（{cell_ref(hb, c)}）" for c in extra]
+            # 期 3：表头命中 ignore_columns 的列按期 2 extra_columns=ignore 的方式忽略；其余多出的列照 extra_columns
+            ignored = [c for c in extra if self.ignore_keys and match_key(composed[c]) in self.ignore_keys]
+            rest = [c for c in extra if c not in ignored]
+            if rest and self.block.extra_columns == "ignore":
+                ignored, rest = extra, []
+            if ignored:
+                self.ignored = set(ignored)
+                eng.ex.ignored_columns[self.block.id] = [composed[c] for c in ignored]
+            if rest:
+                shown = [f"「{composed[c]}」（{cell_ref(hb, c)}）" for c in rest]
                 eng.problems.add("column_extra", f"{self.where}：表头多出了列{_join(shown)}",
-                                 f"{self.where}：表头多出了 {_join([cell_ref(hb, c) for c in extra])} 这几列",
-                                 [sh.coord(hb, c) for c in extra], sheet=sh.name)
+                                 f"{self.where}：表头多出了 {_join([cell_ref(hb, c) for c in rest])} 这几列",
+                                 [sh.coord(hb, c) for c in rest], sheet=sh.name,
+                                 fix_args={"block": self.block.id, "how": "columns",
+                                           "headers": [{"raw": _anchor_text(composed[c]), "cell": sh.coord(hb, c)}
+                                                       for c in rest]})
                 bad = True
         if bad:
             self._fail()
@@ -1608,15 +1848,16 @@ class _ListRun:
         self.state = "data"
         self.last_row = hb
         # 数据行的固定列段：映射列是 value、忽略的列是 ignored_column，按列相邻合段（区域标记用，_row_spans）
-        layout: list[tuple[int, int, str]] = []
+        bid = self.block.id
+        layout: list[Span] = []
         for c in range(self.c1, self.c2 + 1):
             role = "ignored_column" if c in self.ignored else "value"
             if layout and layout[-1][2] == role:
-                layout[-1] = (layout[-1][0], c, role)
+                layout[-1] = (layout[-1][0], c, role, bid)
             else:
-                layout.append((c, c, role))
+                layout.append((c, c, role, bid))
         self.layout_data = layout
-        self.layout_hidden = [(self.c1, self.c2, "hidden_excluded")]
+        self.layout_hidden: list[Span] = [(self.c1, self.c2, "hidden_excluded", bid)]
         self.sink.sources.append(f"{sh.sr.id}/{self.block.id}")
         self.merges = _MergeSweep(sh.merges, self.c1, self.c2)
         sh.order.append((t, self.block.id))
@@ -1658,10 +1899,65 @@ class _ListRun:
 
     # ---------------- 数据行 ----------------
 
-    def _stop_blank(self, row: int) -> None:
+    def _stop_blank(self, row: int, note: tuple[int, GridCell] | None = None) -> _Stopped:
+        """列表到 row 之前为止（row 是收尾的那一段空行的第一行）。note：按表下说明收尾时说明那一行（行号, 那一格），
+        记进 _Stopped，_phase4 据此写排除的行、判要不要人确认。"""
         self.done = True
         self.stop = ("blank", row)
-        self.sh.stopped.append(_Stopped(self.block.id, row, self.c1, self.c2, min(2, self.c2 - self.c1 + 1)))
+        st = _Stopped(self.block.id, row, self.c1, self.c2, min(2, self.c2 - self.c1 + 1))
+        if note is not None:
+            r, cell = note
+            st.note_row, st.note_cell = r, self.sh.coord(r, self.c1)
+            st.note_text = _text(cell.value).strip()
+            st.note_like = canon(st.note_text).startswith(_NOTE_PREFIXES)
+        self.sh.stopped.append(st)
+        return st
+
+    def _skip_blank(self, first: int, last: int) -> None:
+        """skip 模式下按空行跳过 first..last：计数、记排除的行（blank_skipped，整行没有要导入的格，格数为 0），
+        并记进 blank_run，随后若判定表已到下边界（_note_after_blank）就撤回。"""
+        self.eng.ex.blank_rows_skipped += last - first + 1
+        self.sh.exclude("blank_skipped", first, last, 0, block=self.block.id)
+        self.blank_run.append((first, last))
+
+    def _unskip_blanks(self) -> int:
+        """撤回 blank_run 里记的空行（它们其实是表的下边界，不是数据中间的空行），返回第一行。"""
+        first = self.blank_run[0][0]
+        got = self.sh.excluded.get(("blank_skipped", self.block.id, None))
+        for a, b in self.blank_run:
+            self.eng.ex.blank_rows_skipped -= b - a + 1
+            if got is not None and [a, b] in got[0]:
+                got[0].remove([a, b])
+        if got is not None and not got[0]:
+            del self.sh.excluded[("blank_skipped", self.block.id, None)]
+        self.blank_run = []
+        return first
+
+    def _note_after_blank(self, inb: dict[int, GridCell]) -> bool:
+        """skip 模式下，空行之后这一行在本块列范围内只有首列一格文字、其余列全空：是表下隔着空行的说明文字
+        （「注：……」「制表人：……」），不是数据行（WP-8 修补，P3-SPEC 1.5 留给 WP-8 的那一条）。
+
+        起草器本来就这么认（recipe_suggest._compatible：空行之后要有两格以上、类型对得上才算同一张表），执行器却把
+        空行之后的任何一行都当数据读：说明文字静默成了一条首列是「注：……」、其余全为空值的记录，回执里只多一行，
+        区域外文字里也看不到它（H2）。这里按同一条规则把它判为表的下边界：这一行和下面的行交给区域外，文字照常进
+        回执，数字照常报 outside_number。首列是数、日期，或者正是合计行的标签时不算（那是缺数的数据行或合计行）；
+        只有一列的块分不出来，照旧当数据。
+
+        判成下边界不等于静默（WP-8 评审意见 4）：这一行和其下交给区域外的行都记进排除的行（after_stop，锚点是这格
+        文字）；文字不像说明（_NOTE_PREFIXES）时另出 rows_after_stop 要人确认，见 _Engine._phase4。"""
+        if self.c2 <= self.c1 or len(inb) != 1 or self.c1 not in inb:
+            return False
+        cell = inb[self.c1]
+        if cell.formula is not None or not isinstance(cell.value, str):
+            return False
+        text = cell.value.strip()
+        if not text or looks_numeric_text(text) or month_day_or_date(text) is not None:
+            return False
+        total = self.block.rows.total_row
+        if (total is not None and self.total_idx is not None and self.colmap.get(self.total_idx) == self.c1
+                and match_key(text).startswith(match_key(total.pick))):
+            return False
+        return True
 
     def _data_row(self, r: int, cells: list[tuple[int, GridCell]]) -> None:
         if self.done:
@@ -1669,25 +1965,34 @@ class _ListRun:
             return
         block, eng = self.block, self.eng
         gap = r - (self.last_row + 1)
-        if gap > 0:
-            if block.rows.blank_rows == "stop":
-                self._stop_blank(self.last_row + 1)
-                self.emit(r, cells, {}, False)
-                return
-            eng.ex.blank_rows_skipped += gap
-        self.last_row = r
         inb = {c: cell for c, cell in cells if self.c1 <= c <= self.c2}
         if inb and self.ignored and all(c in self.ignored for c in inb):
             # 只有忽略的列有字（表下紧跟的「注：以上为初步统计」写在备注列）：这一行没有一格要导入，按空行处理，
             # 格子交给区域外（文字进回执、数字照常报）。当成数据行会凭空写进一条全是空值的记录
             inb = {}
+        if (block.rows.blank_rows == "skip" and inb and self.data_rows and (gap > 0 or self.blank_run)
+                and self._note_after_blank(inb)):
+            # 表下隔着空行的说明文字：列表到上一条数据行为止，和 stop 模式碰到空行一样收尾（之后的行交给区域外）
+            self._stop_blank(self._unskip_blanks() if self.blank_run else self.last_row + 1,
+                             note=(r, inb[self.c1]))
+            self.emit(r, cells, {}, False)
+            return
+        if gap > 0:
+            if block.rows.blank_rows == "stop":
+                self._stop_blank(self.last_row + 1)
+                self.emit(r, cells, {}, False)
+                return
+            self._skip_blank(self.last_row + 1, r - 1)
+        self.last_row = r
         if not inb:
             if block.rows.blank_rows == "stop":
                 self._stop_blank(r)
             else:
-                eng.ex.blank_rows_skipped += 1
+                # 这一行的格都交给区域外照常记账，不算被排除
+                self._skip_blank(r, r)
             self.emit(r, cells, {}, False)
             return
+        self.blank_run = []
         fills = self._merges_at(r, inb)
         if self.sh.hidden_row(r):
             self.hidden_seen = True
@@ -1823,6 +2128,11 @@ class _ListRun:
             lin = [(col.name, r, self.colmap[i]) for i, col in enumerate(self.cols) if col.type in ("INTEGER", "REAL")]
             ks.add([canon(label_raw), *keep_values], sheet=sh.name, at=(r, self.colmap[self.total_idx]),  # type: ignore[index]
                    cells=lin, fails=True)
+        elif not total.keep_as:
+            # 只核对、不另存的合计行：参与核对，但不进任何表，记进「排除的行」（遗留项 4 的 total_not_kept）
+            n = sum(1 for role in claims.values() if role in ("total_label", "total_value"))
+            if n:
+                sh.exclude("total_not_kept", r, r, n, block=block.id)
         self.done = True
         self.stop = ("total", r)
         self.emit(r, cells, claims, True)
@@ -1841,6 +2151,15 @@ class _ListRun:
 # --------------------------------------------------------------------------
 # 执行
 # --------------------------------------------------------------------------
+
+
+def _placeholder_sample(key: str) -> str | None:
+    """value_not_number 的这一格能不能当占位符提议（P3-SPEC 3.2 ⑦）：canon 之后不超过 PLACEHOLDER_TEXT_LEN 个字、
+    不像一个数，而且**不含数字**。规格只要求前两条；多拦「含数字」是因为 fix_args 不许带数据格的数值，「约987654」
+    「9876.5万」这种写法不像一个数，却正是本期的数（含数字的占位符本来也没有意义：「—」「无」「/」才是）。"""
+    if not key or len(key) > PLACEHOLDER_TEXT_LEN or looks_numeric_text(key) or any(ch.isdigit() for ch in key):
+        return None
+    return key
 
 
 class _Engine:
@@ -1864,6 +2183,8 @@ class _Engine:
         self.canon_log: dict[tuple[str, str, str, str], CanonEntry] = {}
         #: 每个块自己的占位符（canon 后 → 配方里的原文）：别的块声明的占位符不能在这里放过
         self._ph: dict[int, dict[str, str]] = {}
+        #: 块的取值规则对象 → 块 id：值的转换只拿到取值规则，declare_placeholder 的 fix_args 要写块 id
+        self._pol_block: dict[int, str] = {id(b.values): b.id for s in recipe.sheets for b in s.blocks}
         self.books = xlsx_cells.Workbooks(raw)
         self.sheets: list[_Sheet] = []
 
@@ -1924,8 +2245,10 @@ class _Engine:
         """非原生数字的值（文本、bool、日期……）。pk：主键列，占位符和空白文本都会变成空值，一律拒收。"""
         p = self.problems
 
-        def bad(code: str) -> Any:
-            p.issue(code, sheet, where, _coord(sheet, r, c), f"{cell_ref(r, c)}「{_shown(v)}」")
+        def bad(code: str, sample: str | None = None) -> Any:
+            block = self._pol_block.get(id(pol)) if code == "value_not_number" else None
+            p.issue(code, sheet, where, _coord(sheet, r, c), f"{cell_ref(r, c)}「{_shown(v)}」", block=block,
+                    sample=sample)
             return _FAIL
 
         if isinstance(v, bool):
@@ -1963,6 +2286,7 @@ class _Engine:
                 if pol.text_number != "parse_thousands":
                     return bad("value_text_number")
                 return self._number(num, vtype, pol, sheet, where, r, c, pk)
+            return bad("value_not_number", _placeholder_sample(key))
         return bad("value_not_number")
 
     def convert_list(self, cell: GridCell | None, col: Any, is_pk: bool, pol: Any, sheet: str, where: str,
@@ -2041,12 +2365,14 @@ class _Engine:
     # ---------------- 格子账 ----------------
 
     def finish_row(self, sh: _Sheet, r: int, cells: list[tuple[int, GridCell]], claims: dict[int, str],
-                   data_row: bool) -> None:
+                   data_row: bool, blocks: dict[int, str] | str | None = None) -> None:
+        """格子账的一行。blocks：已认领格所在的块（网格路径按格给，流式路径整行是同一个列表块）。"""
         sh.read_count += len(cells)
         if sh.recon is not None:
             sh.recon.feed(r, len(cells))
         layout = sh.layouts.pop(r, None) if sh.layouts else None
         unclaimed: list[int] = []
+        hidden_excluded = 0
         for c, cell in cells:
             role = claims.get(c)
             if role is not None:
@@ -2056,6 +2382,8 @@ class _Engine:
                         sh.hidden_claimed_rows.add(r)
                     if sh.hidden_col(c):
                         sh.hidden_claimed_cols.add(c)
+                    if role == "hidden_excluded":
+                        hidden_excluded += 1
                 continue
             if (r, c) in sh.suppressed:
                 continue
@@ -2070,12 +2398,17 @@ class _Engine:
                 self._outside_number(sh, r, c, cell.value)
             else:
                 self._outside_text(sh, r, c, _text(cell.value), kind)
+        if hidden_excluded:
+            # 排除的隐藏行按工作表记（契约 ExcludedRows.block：hidden_excluded 为 None），各块的合成一项
+            sh.exclude("hidden_excluded", r, r, hidden_excluded)
         if claims or layout:
-            sh.regions.feed_spans(r, _row_spans(cells, claims, layout))
+            sh.regions.feed_spans(r, _row_spans(cells, claims, layout, blocks))
         for c in unclaimed:
             self.problems.issue("cell_unclaimed", sh.name, f"工作表「{sh.name}」第 {r} 行", sh.coord(r, c))
         for st in sh.stopped:
-            if st.closed or r <= st.stop_row:
+            # 按表下说明收尾的：说明那一行由 _phase4 单独记，它和上面那段空行都不在这里看。空行里可能有只写在忽略列
+            # 的字，网格路径收尾时 _Stopped 已经在了、流式路径还没有，看了两条路径的结果就不一样
+            if st.closed or r <= st.stop_row or (st.note_row is not None and r <= st.note_row):
                 continue
             if claims:
                 st.closed = True           # 到了别的块的认领区域
@@ -2083,11 +2416,59 @@ class _Engine:
             inside = [c for c, _ in cells if st.c1 <= c <= st.c2]
             if len(inside) >= st.need:
                 st.rows.append(r)
+                st.n += len(inside)
                 st.cells.extend(sh.coord(r, c) for c in inside[:CELLS_MAX - len(st.cells)])
+            elif inside and st.note_row is not None:
+                st.tail.append(r)
+                st.tail_n += len(inside)
 
     def _outside_number(self, sh: _Sheet, r: int, c: int, value: Any) -> None:
+        """区域外的数字格。配了 ignore_outside 的工作表先压着：同一行有没有锚点文字，要等区域外的文字都分类完
+        （_phase4）才知道。没配的照期 2 当场记问题，问题的先后顺序不变。"""
+        if sh.outside_rules:
+            sh.held.append((r, c, value))
+            return
+        self._report_outside_number(sh, r, c, value)
+
+    def _report_outside_number(self, sh: _Sheet, r: int, c: int, value: Any) -> None:
         self.problems.issue("outside_number", sh.name, f"工作表「{sh.name}」第 {r} 行", sh.coord(r, c),
-                            f"{cell_ref(r, c)}「{_shown(value)}」")
+                            f"{cell_ref(r, c)}「{_shown(value)}」", row=r)
+
+    def _ignore_outside(self, sh: _Sheet) -> None:
+        """ignore_outside：区域外的数字格所在行，如果有区域外文字格的 match_key 等于某条锚点，这些数字格去向
+        ignored，记进「排除的行」；锚点格本身照常是区域外文字（已记录、照常比对）。一行命中几条锚点时取配方里
+        排在前面的那条。没命中的照常报 outside_number。"""
+        keys = {r: {match_key(t) for _, t in items} for r, items in sh.outside_texts.items()}
+        for r, c, value in sorted(sh.held, key=lambda x: (x[0], x[1])):
+            row_keys = keys.get(r)
+            hit = next((raw for key, raw in sh.outside_rules if key in row_keys), None) if row_keys else None
+            if hit is None:
+                self._report_outside_number(sh, r, c, value)
+                continue
+            sh.roles["ignored"] += 1
+            sh.regions.feed_row(r, [(c, "ignored")])
+            sh.exclude("ignored_outside", r, r, 1, anchor=hit)
+        sh.held = []
+
+    def _fix_args(self, it: _Issue) -> dict[str, Any] | None:
+        """合并类问题的修复参数（P3-SPEC 3.2 ⑥ outside、⑦），在所有工作表收尾之后算：区域外文字要等统计期定下来
+        才分类，锚点那时才齐。"""
+        if it.code == "value_not_number":
+            if it.block is None:
+                return None
+            texts = list(it.texts)[:PLACEHOLDER_TEXTS_MAX]
+            return {"block": it.block, "texts": texts, "other": it.count - sum(it.texts[t] for t in texts)}
+        if it.code == "outside_number" and it.row is not None:
+            sh = next((x for x in self.sheets if x.name == it.sheet), None)
+            if sh is None:
+                return None
+            # 锚点：这一行区域外的文字格，优先取不含数字的（含数字的锚点下一期多半对不上，修复按钮不会采用）
+            items = [(c, t) for c, t in sorted(sh.outside_texts.get(it.row, [])) if _anchor_text(t) is not None]
+            pick = next(((c, t) for c, t in items if not any(ch.isdigit() for ch in t)), items[0] if items else None)
+            return {"sheet": sh.name, "sheet_id": sh.sr.id, "how": "outside",
+                    "rows": [{"row": it.row, "anchor": pick[1] if pick else None,
+                              "anchor_cell": sh.coord(it.row, pick[0]) if pick else None, "cells": list(it.cells)}]}
+        return None
 
     def _outside_text(self, sh: _Sheet, r: int, c: int, text: str, kind: str, *, period_source: bool = False,
                       role: str = "outside_text") -> None:
@@ -2245,8 +2626,12 @@ class _Engine:
             # 块级定位失败的工作表：区域都不知道在哪，「区域外文字」只是噪声（统计期来源照留）
             self.ex.outside_text = [o for o in self.ex.outside_text
                                     if o.period_source or o.sheet not in failed_sheets]
+        if failed_sheets:
+            # 同理：区域外按锚点忽略的格、列表停止之后的文字行，在区域定不下来的工作表上也只是噪声
+            self.ex.rows_excluded = [x for x in self.ex.rows_excluded if not (
+                x.sheet in failed_sheets and x.reason in ("ignored_outside", "after_stop"))]
         blocking = self.problems.blocking()
-        self.ex.problems = self.problems.finish(failed_sheets)
+        self.ex.problems = self.problems.finish(failed_sheets, self._fix_args)
         t4 = time.perf_counter()
         if self.conn is not None:
             if blocking:
@@ -2308,26 +2693,31 @@ class _Engine:
     def _match_sheets(self) -> None:
         visible = [s for s in self.scan.sheets if s.state == "visible" and s.nonempty > 0]
         used: set[str] = set()
+        #: 找不到的工作表先记下，等全部认完再报：rename_sheet 的候选是「配方里其他工作表没认走的」可见工作表
+        #: （P3-SPEC 6.1），认完之前算不出来。这一段只报 sheet_missing，挪到循环之后问题的先后顺序不变
+        missing: list[tuple[SheetRecipe, str]] = []
         for si, sr in enumerate(self.recipe.sheets):
             key = match_key(sr.match.name)
             hit = next((s for s in self.scan.sheets if match_key(s.name) == key), None)
             renamed = False
             if hit is not None and hit.state != "visible":
-                msg = f"工作表「{hit.name}」是隐藏的工作表，不读取（配方中的工作表「{sr.match.name}」）"
-                self.problems.add("sheet_missing", msg, msg)
+                missing.append((sr, f"工作表「{hit.name}」是隐藏的工作表，不读取（配方中的工作表「{sr.match.name}」）"))
                 continue
             if hit is None and sr.match.fallback == "only_visible_sheet" and len(visible) == 1:
                 hit, renamed = visible[0], True
             if hit is None or hit.name in used:
                 names = "、".join(f"「{s.name}」" for s in visible[:8]) or "无"
-                msg = f"没有找到工作表「{sr.match.name}」（工作簿中有内容的可见工作表：{names}）"
-                self.problems.add("sheet_missing", msg, msg)
+                missing.append((sr, f"没有找到工作表「{sr.match.name}」（工作簿中有内容的可见工作表：{names}）"))
                 continue
             used.add(hit.name)
             self.ex.sheets.matched[sr.id] = hit.name
             if renamed:
                 self.ex.sheets.renamed[sr.match.name] = hit.name
             self.sheets.append(_Sheet(self, si, sr, hit))
+        free = [s.name for s in visible if s.name not in used]
+        for sr, msg in missing:
+            self.problems.add("sheet_missing", msg, msg,
+                              fix_args={"sheet_id": sr.id, "name": sr.match.name, "candidates": list(free)})
         for s in visible:
             if s.name in used:
                 continue
@@ -2366,8 +2756,9 @@ class _Engine:
             return []
         if big and not self.partial and b is not None:
             sh.recon = _Reconciler(s)
+            bid = lists[0].id
             run = _ListRun(self, sh, lists[0], 0, lambda r, cells, claims, data: self.finish_row(
-                sh, r, cells, claims, data))
+                sh, r, cells, claims, data, bid))
             for r, cells in xlsx_cells.sheet_rows(self.books, s, min_row=b.min_row, max_row=b.max_row,
                                                   min_col=b.min_col, max_col=b.max_col):
                 run.feed(r, cells)
@@ -2406,8 +2797,14 @@ class _Engine:
             p.add("segment_overlap", msg, msg, sheet=sh.name)
         for r in grid.row_numbers():
             cells = grid.row(r)
-            claims = {c: sh.claims[(r, c)] for c, _ in cells if (r, c) in sh.claims}
-            self.finish_row(sh, r, cells, claims, r in sh.data_rows)
+            claims: dict[int, str] = {}
+            blocks: dict[int, str] = {}
+            for c, _ in cells:
+                role = sh.claims.get((r, c))
+                if role is not None:
+                    claims[c] = role
+                    blocks[c] = sh.cell_block[(r, c)]
+            self.finish_row(sh, r, cells, claims, r in sh.data_rows, blocks)
         self._recon_problem(sh)
         return cts
 
@@ -2436,16 +2833,43 @@ class _Engine:
             if kind == "number":
                 self._outside_number(sh, r, c, text)
             else:
+                sh.outside_texts.setdefault(r, []).append((c, text))
                 self._outside_text(sh, r, c, text, kind)
+        if sh.held:
+            self._ignore_outside(sh)
         for st in sh.stopped:
+            where = f"工作表「{sh.name}」的列表「{st.block}」"
+            if st.note_row is not None and not st.note_like:
+                # 跳过空行的列表按「表下说明」收尾，可那格文字不像说明：也可能是表尾一条只填了首列的数据行。照样不导入
+                # （与起草器一致），但要人确认，首次导入和每期重放都要勾（confirm 类，确认项 rows_after_stop:<块>）
+                ref = (st.note_cell or "").split("!")[-1]
+                msg = (f"{where}：第 {st.note_row} 行只有首列文字（{ref}「{_shown(st.note_text)}」），"
+                       "已当作表下说明，没有导入。如果它是一条数据，请在原表中补上这一行其他列的值后重新上传")
+                model = f"{where}：第 {st.note_row} 行只有首列文字（{ref}），已当作表下说明，没有导入"
+                self.problems.add("rows_after_stop", msg, model, [st.note_cell or ""], sheet=sh.name)
             if st.rows:
-                where = f"工作表「{sh.name}」的列表「{st.block}」"
-                msg = (f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在空行之后，没有导入"
-                       f"（{_join([c.split('!')[-1] for c in st.cells], 5)}）。"
-                       "如果它们也是数据，请在配方面板的「数据中间的空行」中选择「跳过继续」")
-                model = (f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在空行之后，没有导入"
-                         f"（{_join([c.split('!')[-1] for c in st.cells], 5)}）")
+                shown = _join([c.split('!')[-1] for c in st.cells], 5)
+                if st.note_row is None:
+                    msg = (f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在空行之后，没有导入（{shown}）。"
+                           "如果它们也是数据，请在配方面板的「数据中间的空行」中选择「跳过继续」")
+                    model = f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在空行之后，没有导入（{shown}）"
+                else:
+                    # 已经是「跳过继续」：叫人去选它没有用。列表停在表下说明那一行，说明下面的行要导入只能挪走说明
+                    msg = (f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在表下说明（第 {st.note_row} 行）"
+                           f"之后，没有导入（{shown}）。如果它们也是数据，请把原表第 {st.note_row} 行的说明移到表的"
+                           "最下方后重新上传")
+                    model = (f"{where}：第 {st.rows[0]} 行起有 {len(st.rows)} 行文字在表下说明（第 {st.note_row} 行）"
+                             f"之后，没有导入（{shown}）")
                 self.problems.add("rows_after_stop", msg, model, st.cells, sheet=sh.name)
+                # 排除的行（after_stop）：格数是这些行在本块列范围内的非空格（它们在格子账里照常算区域外）
+                for i, r in enumerate(st.rows):
+                    sh.exclude("after_stop", r, r, st.n if i == 0 else 0, block=st.block, anchor=st.note_text)
+            if st.note_row is not None:
+                # 按表下说明收尾：说明那一行（本块列范围内只有首列一格）和其下交给区域外的行都记进排除的行，锚点是说明
+                # 那格的文字，回执里看得出列表停在哪一行、因为什么。像说明的只记在这里和区域外文字里，不出问题
+                sh.exclude("after_stop", st.note_row, st.note_row, 1, block=st.block, anchor=st.note_text)
+                for i, r in enumerate(st.tail):
+                    sh.exclude("after_stop", r, r, st.tail_n if i == 0 else 0, block=st.block, anchor=st.note_text)
         rows, cols = sorted(sh.hidden_claimed_rows), sorted(sh.hidden_claimed_cols)
         pol = sh.sr.hidden
         if rows or cols:
@@ -2455,16 +2879,22 @@ class _Engine:
             hint = "（工作表设置了筛选，可能是筛选隐藏的行）" if sh.scan.autofilter else ""
             msg = (f"工作表「{sh.name}」导入区域内有隐藏的行：第 {_rows_text(rows)} 行{hint}。"
                    "请在 Excel 中取消隐藏，或在配方面板的「隐藏行」中选择「照常导入」或「跳过」")
-            self.problems.add("hidden_rows", msg, msg, sheet=sh.name)
+            self.problems.add("hidden_rows", msg, msg, sheet=sh.name,
+                              fix_args={"sheet": sh.name, "sheet_id": sh.sr.id, "axis": "rows", "rows": rows,
+                                        "autofilter": bool(sh.scan.autofilter)})
         if cols and pol.cols == "reject_if_any":
-            msg = (f"工作表「{sh.name}」导入区域内有隐藏的列：{_join([col_letter(c) for c in cols])} 列。"
+            letters = [col_letter(c) for c in cols]
+            msg = (f"工作表「{sh.name}」导入区域内有隐藏的列：{_join(letters)} 列。"
                    "请在 Excel 中取消隐藏，或在配方面板的「隐藏列」中选择「照常导入」")
-            self.problems.add("hidden_cols", msg, msg, sheet=sh.name)
+            self.problems.add("hidden_cols", msg, msg, sheet=sh.name,
+                              fix_args={"sheet": sh.name, "sheet_id": sh.sr.id, "axis": "cols", "cols": letters,
+                                        "autofilter": bool(sh.scan.autofilter)})
         roles = dict(sh.roles)
         self.ex.ledger.append(LedgerSheet(sh.name, sh.scan.nonempty, sh.read_count, roles,
                                           max(sh.read_count - sum(roles.values()), 0)))
         self.ex.regions.extend(sh.regions.marks())
         self.ex.block_order[sh.name] = [key for _, key in sorted(sh.order)]
+        self.ex.rows_excluded.extend(sh.excluded_rows())
 
     def _outputs(self) -> None:
         ex = self.ex

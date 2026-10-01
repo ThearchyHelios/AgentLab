@@ -78,13 +78,14 @@ const ORDER = [
   'chat',            // 问数据
   'runs',            // 记录
   'manage',          // 数据、工具、知识、设置
+  'versions',        // 上传表格的版本：回滚、清单、移除一期、清除原件
   'ui',              // 各页面端到端，连真数据
 ]
 // 各项的耗时（秒）。只决定排队顺序：长的先开跑，短的填空，结果不受影响。新加的检查不在表里就按 60 秒算；
 // 拆开的两项看 SPLIT 里各份的 est。2026-09-29 八道并行、关浏览器不干等之后的实测
 const ESTIMATE = {
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
-  evidence: 85, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
+  evidence: 85, versions: 60, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。

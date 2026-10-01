@@ -1,8 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, Info, KeyRound, Layers, Lock, Plug, Plus, RefreshCw,
-  Search, Table2, Upload, X,
+  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
+  RefreshCw, Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api, uploadDecision } from '../api/client'
@@ -21,11 +21,12 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT,
+  RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
 } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
 import { ImportWizard } from './import/ImportWizard'
 import type { WizardEntry } from './import/ImportWizard'
+import { VersionsDialog } from './import/VersionsDialog'
 
 // ===========================================================================
 // 数据源
@@ -183,6 +184,8 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
               onRecipeReupload={() => setWizard({ kind: 'reupload', source: row })}
               onRedraft={() => setWizard({ kind: 'redraft', source: row })}
               onResume={() => row.open_staging && setWizard({ kind: 'resume', stagingId: row.open_staging.id, source: row })}
+              // 版本页里清除原件之后服务端不返回数据源，卡片上的原件状态靠重新取列表
+              onReload={() => void load()}
               kick={kick && kick.id === row.id ? kick.seq : 0}
             />
           ))}
@@ -257,9 +260,11 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
 /** 结构同步超过这么久就提示可能过期：库表会变，Copilot 照旧表写 SQL 只会报错 */
 const STALE_SCHEMA_MS = 7 * 24 * 3600_000
 
-function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onRecipeReupload, onRedraft, onResume, kick }: {
+function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onRecipeReupload, onRedraft, onResume, onReload, kick }: {
   row: any; meta?: any
   onChange: (row: any) => void
+  /** 重新取整个列表（版本页里的写操作没有返回数据源时用） */
+  onReload: () => void
   onRemoved: (id: string) => void
   onEdit: () => void
   onReupload: () => void
@@ -279,6 +284,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   // 传上来的表通常只有一两张，直接摊开；库动辄几十上百个对象，默认收着
   const [open, setOpen] = useState(() => uploaded && row.table_count > 0 && row.table_count <= 3)
   const [masking, setMasking] = useState(false)
+  /** 版本页（当前版本的各期、历史版本、导入记录） */
+  const [versions, setVersions] = useState(false)
   const masks = maskList(row.options?.[MASK_KEY])
   const clock = useRunClock(!!busy)
   const busySince = useRef(0)
@@ -476,6 +483,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
               {RECIPE_TEXT.openStaging}
             </button>
           )}
+          {uploaded && (
+            // 上传的表格才有版本：手工登记的库没有导入记录，也没有可回滚的版本
+            <button className="btn btn-sm btn-ghost" onClick={() => setVersions(true)} title={VERSIONS_TEXT.openHint} data-versions-open="">
+              <History size={11} aria-hidden /> {VERSIONS_TEXT.open}
+            </button>
+          )}
           {uploaded && row.import_mode === 'recipe' ? (
             // 按配方导入的源：每月按已确认的配方重放，不走简单上传（服务端也会拒绝）
             <>
@@ -511,6 +524,10 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
       {masking && (
         <MaskColumnsDialog row={row} onClose={() => setMasking(false)}
                            onSaved={(next) => { setMasking(false); onChange(next); syncCatalog() }} />
+      )}
+      {versions && (
+        // onChange 是父级的「更新这一行并刷新全局目录」：回滚之后表结构可能变了，检查器、问数据读的目录要跟上
+        <VersionsDialog source={row} onClose={() => setVersions(false)} onChange={onChange} onReload={onReload} />
       )}
 
       {failed && (
@@ -648,20 +665,44 @@ function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: bool
 }
 
 /**
+ * 启用时间比导入时间晚这么多，才算「后来又启用过」（回滚、移除一期复用了旧版本）。新导入的版本创建和启用在
+ * 同一次提交里，两个时间只差毫秒级；留一分钟余量，不把同一次提交误写成「…启用」
+ */
+const REACTIVATED_AFTER_MS = 60_000
+
+/**
  * 上传表格当前启用的是哪一版：哪个文件、什么时候导入的。库文件的路径按版本变（而且不是用户
- * 传的那个文件），写出来没有意义；同名重传之后，这一行变了才说明新版本真的启用了
+ * 传的那个文件），写出来没有意义；同名重传之后，这一行变了才说明新版本真的启用了。
+ *
+ * 期 3：在版本页里启用旧版本之后，「3 小时前导入」说的是那个版本当初的导入时间，不是它成为当前版本的时间，
+ * 这时改写「…启用」（评审三-M8）；按期累积的写期数
  */
 function UploadVersion({ snap }: { snap: CurrentSnapshot }) {
   const legacy = isLegacySnapshot(snap)
   // 迁移补建的版本：created_at 是迁移的时间，写成「刚刚导入」是假话
   const at = legacy ? null : parseServerTime(snap.created_at)
+  const activated = legacy ? null : parseServerTime(snap.activated_at)
+  const reactivated = !!at && !!activated && activated.getTime() - at.getTime() > REACTIVATED_AFTER_MS
   const rawNote = snap.raw_state !== 'kept' ? RAW_STATE_LABEL[snap.raw_state] : ''
+  const title = legacy
+    ? UPLOAD_TEXT.legacyTitle
+    : reactivated
+      ? VERSIONS_TEXT.activatedTitle(formatDateTime(snap.activated_at), formatDateTime(snap.created_at))
+      : at ? UPLOAD_TEXT.importedTitle(formatDateTime(snap.created_at)) : undefined
   return (
-    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1" data-current-version={snap.id}
-          title={legacy ? UPLOAD_TEXT.legacyTitle : at ? UPLOAD_TEXT.importedTitle(formatDateTime(snap.created_at)) : undefined}>
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1" data-current-version={snap.id} title={title}>
       <span>{UPLOAD_TEXT.currentVersion}</span>
       <span className="mono break-all text-dim">{snap.file_name || UPLOAD_TEXT.legacyFile}</span>
-      {at && <span className="tnum">· {UPLOAD_TEXT.importedAt(formatRelative(snap.created_at))}</span>}
+      {reactivated
+        ? <span className="tnum" data-current-activated="">· {VERSIONS_TEXT.activatedAt(formatRelative(snap.activated_at))}</span>
+        : at && <span className="tnum">· {UPLOAD_TEXT.importedAt(formatRelative(snap.created_at))}</span>}
+      {/* 只有服务端写明了导入模式才写：简单导入、期 3 之前的版本没有 mode，不替它们说「每期替换」 */}
+      {snap.mode && (
+        <span className="tnum" data-current-mode={snap.mode}
+              title={snap.period_start && snap.period_end ? VERSIONS_TEXT.period(snap.period_start, snap.period_end) : undefined}>
+          · {VERSIONS_TEXT.cardSummary(snap.mode, snap.periods)}
+        </span>
+      )}
       {rawNote && <span>· {rawNote}</span>}
     </span>
   )

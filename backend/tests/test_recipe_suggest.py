@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import io
 import json
@@ -179,7 +180,13 @@ def test_reference_layout_draft_matches_reference_recipe(flow):
     assert calls and calls[0][2] == "rules" and calls[0][1] is d.facts
     wide = d.recipe["tables"][0]["name"]
     assert wide == "客流汇总_按日"
-    assert canonical(rename_wide(d.recipe, wide, "日客流")) == canonical(FLOW)
+    # 期 3：参考布局符合按期累积的资格（交叉表、有统计期），草稿默认写 mode=accumulate（P3-SPEC 2.2），其余与
+    # 参考配方相同；q_mode 答「每期替换」后与参考配方逐字相同
+    assert d.recipe["mode"] == "accumulate"
+    assert canonical(rename_wide(d.recipe, wide, "日客流")) == canonical({**FLOW, "mode": "accumulate"})
+    q_mode = next(q for q in d.questions if q.id == "q_mode")
+    replaced = apply_ops(d.recipe, q_mode.effects["replace"])
+    assert canonical(rename_wide(replaced, wide, "日客流")) == canonical(FLOW)
 
 
 def apply_ops(doc: dict[str, Any], ops: list[dict[str, Any]], reason: str = "巧合") -> dict[str, Any]:
@@ -255,8 +262,9 @@ def test_reference_layout_cards_and_questions(flow):
     assert titles[6] == "第 28–30 行是合计，改作核对并另存"
     assert titles[7] == "各时段之和与全日客流 31 天中 0 天相等"
     assert titles[8] == "B3 是区域外文字"
-    assert titles[9] == "导入模式：每期替换"
-    assert "按期累积将在后续版本提供" in d.cards[9].reason
+    assert titles[9] == "导入模式：按期累积（建议）"
+    assert d.cards[9].question == "q_mode"
+    assert "每期以统计期为键" in d.cards[9].reason and "此前各期留在历史版本中" in d.cards[9].reason
     assert d.cards[1].cells == ["客流汇总!B2"]
     assert d.cards[8].cells == ["客流汇总!B3"]
     by_id = {c.id: c for c in d.cards}
@@ -264,7 +272,8 @@ def test_reference_layout_cards_and_questions(flow):
     assert by_id["fact:F2"].question == "q_relation:F2"
 
     qs = {q.id: q for q in d.questions}
-    assert [q.id for q in d.questions] == ["q_relation:F1", "q_placeholder:·", "q_relation:F2"]
+    # q_mode 固定排在最后（期 2 的测试和性能用例取 questions[0]）
+    assert [q.id for q in d.questions] == ["q_relation:F1", "q_placeholder:·", "q_relation:F2", "q_mode"]
     assert all(q.default is None for q in d.questions)
     for qid in ("q_relation:F1", "q_relation:F2"):
         q = qs[qid]
@@ -1112,3 +1121,146 @@ def test_long_list_with_many_blank_numbers_stays_one_block_and_fast():
     assert time.perf_counter() - t0 < 1.0
     assert d.complete, d.failures
     assert len(d.recipe["sheets"][0]["blocks"]) == 1
+
+
+# ==========================================================================
+# 期 3（WP-2）：导入模式的默认值、q_mode、卡片（P3-SPEC 2.2）
+# ==========================================================================
+
+
+def _sales_list() -> Workbook:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "月报"
+    ws.append(["地区", "销量"])
+    for row in (["分区甲", 10], ["分区乙", 20]):
+        ws.append(row)
+    return wb
+
+
+def test_list_draft_stays_replace_without_q_mode():
+    """列表形态的表不符合按期累积的资格：草稿不写 mode（每期替换），不问 q_mode，卡片写第一条原因。"""
+    sc, grids = build(_sales_list())
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    assert d.complete, d.failures
+    assert d.recipe["mode"] == "replace"
+    assert all(q.id != "q_mode" for q in d.questions)
+    card = next(c for c in d.cards if c.id == "mode")
+    assert card.title == "导入模式：每期替换" and card.question is None
+    assert "配方没有配置统计期" in card.reason and "此前各期留在历史版本中" in card.reason
+
+
+def test_q_mode_effects_and_position(flow):
+    sc, grids, _ = flow
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    q = d.questions[-1]
+    assert q.id == "q_mode" and q.text == "这份报表每期怎么更新" and q.default is None
+    assert [(o["value"], o["label"]) for o in q.options] == [("accumulate", "按期累积（建议）"), ("replace", "每期替换")]
+    assert q.effects == {"accumulate": [{"op": "add", "path": "/mode", "value": "accumulate"}],
+                         "replace": [{"op": "add", "path": "/mode", "value": "replace"}]}
+    # 在 canonical 形式（去掉了 mode）上也能应用：add 到不存在的键等于新增
+    canon_form = canonical(d.recipe)
+    assert apply_ops(canon_form, q.effects["replace"])["mode"] == "replace"
+    # 改成每期替换以后，问题照出（资格看配方结构，不看当前取值），卡片照旧建议按期累积
+    replaced = apply_ops(d.recipe, q.effects["replace"])
+    cards, qs = S.questions_for(replaced, d.facts, grids)
+    assert qs[-1].id == "q_mode" and next(c for c in cards if c.id == "mode").title == "导入模式：按期累积（建议）"
+
+
+def test_ineligible_crosstab_has_no_q_mode(flow):
+    sc, grids, _ = flow
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    relaxed = copy.deepcopy(d.recipe)
+    relaxed["sheets"][0]["blocks"][0]["axis"]["checks"] = ["contiguous"]
+    cards, qs = S.questions_for(relaxed, d.facts, grids)
+    assert all(q.id != "q_mode" for q in qs)
+    mode = next(c for c in cards if c.id == "mode")
+    assert mode.title == "导入模式：每期替换" and "不能按期累积" in mode.reason
+
+
+# ==========================================================================
+# 期 3（WP-2）：按规则重新起草，并把名字对齐到现行配方（P3-SPEC 6.3）
+# ==========================================================================
+
+
+def test_align_to_contract_gives_the_reference_recipe(flow):
+    sc, grids, _ = flow
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    assert canonical(d.recipe) != canonical(FLOW)
+    aligned, report = S.align_to_contract(d.recipe, FLOW)
+    assert report == []
+    assert canonical(aligned) == canonical(FLOW)
+    assert d.recipe["tables"][0]["name"] == "客流汇总_按日", "入参不变"
+
+
+def test_align_to_contract_copies_renamed_columns_ids_and_relations(flow):
+    sc, grids, _ = flow
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    cur = json.loads(json.dumps(FLOW, ensure_ascii=False).replace('"时段客流"', '"分时客流"')
+                     .replace('"客流"', '"人数"').replace('"分区甲"', '"甲区"'))
+    segs = cur["sheets"][0]["blocks"][0]["segments"]
+    segs[1]["id"] = "白天"
+    segs[2]["const"]["时段类别"] = {"pick": "夜"}          # 现行的 pick 仍是新标题的子串：沿用
+    cur["relations"][0]["id"], cur["relations"][1]["id"] = "R7", "R3"
+    Recipe.model_validate(cur)
+    aligned, report = S.align_to_contract(d.recipe, cur)
+    assert report == []
+    assert canonical(aligned) == canonical(cur)
+
+
+def test_align_to_contract_reports_what_did_not_match(flow):
+    sc, grids, _ = flow
+    d = S.draft(sc, grids, "x.xlsx", validate=ok_validate())
+    cur = copy.deepcopy(FLOW)
+    seg = cur["sheets"][0]["blocks"][0]["segments"][0]
+    seg["labels"]["expect"] = ["甲", "乙", "丙"]
+    seg["measures"] = {"甲": "甲", "乙": "乙", "丙": "丙"}
+    cur["tables"][0]["units"] = {}
+    cur["relations"] = [cur["relations"][1]]
+    aligned, report = S.align_to_contract(d.recipe, cur)
+    assert any("表「客流汇总_按日」没有在现行配方里找到对应的表" in r for r in report)
+    assert any(r.startswith("关系「R1」") for r in report)
+    assert aligned["tables"][0]["name"] == "客流汇总_按日"
+    # 宽表没配上，两条关系的成员都对不上现行的关系：保留起草器的编号，各记一句
+    assert [r["id"] for r in aligned["relations"]] == ["R1", "R2"]
+    assert any(r.startswith("关系「R2」") for r in report)
+    Recipe.model_validate(aligned)
+
+
+def _two_tables(names: tuple[str, str], labels: tuple[list[str], list[str]]) -> dict:
+    """两个工作表各一张宽表的配方（只用来比较表的来源签名）。"""
+    sheets, tables = [], []
+    for i, (name, labs) in enumerate(zip(names, labels)):
+        sheets.append({"id": f"s{i + 1}", "match": {"name": f"表{i + 1}"}, "context": [{}], "blocks": [{
+            "id": f"块{i + 1}", "layout": "crosstab", "segments": [{
+                "id": name, "role": "measures", "table": name, "locate": {"by": "labels"},
+                "labels": {"expect": labs}, "measures": {x: f"列{j}" for j, x in enumerate(labs)}}]}]})
+        tables.append({"name": name, "grain": ["日期"]})
+    return {"recipe_format": "agentlab-recipe/2", "sheets": sheets, "tables": tables}
+
+
+def test_align_to_contract_tie_is_not_paired():
+    """同一张起草的表有两个并列最大的候选：不配对，记进 report（评审一-m13）。"""
+    cand = _two_tables(("起草甲", "起草乙"), (["a", "b"], ["x", "y"]))
+    cand["sheets"] = cand["sheets"][:1]
+    cand["tables"] = cand["tables"][:1]
+    cur = _two_tables(("现行一", "现行二"), (["a", "b"], ["a", "b"]))
+    aligned, report = S.align_to_contract(cand, cur)
+    assert aligned["tables"][0]["name"] == "起草甲"
+    assert any("同样相似" in r for r in report)
+
+
+def test_align_to_contract_two_candidates_for_one_current_table_are_not_paired():
+    cand = _two_tables(("起草甲", "起草乙"), (["a", "b"], ["a", "b"]))
+    cur = _two_tables(("现行一", "现行二"), (["a", "b"], ["x", "y"]))
+    aligned, report = S.align_to_contract(cand, cur)
+    assert [t["name"] for t in aligned["tables"]] == ["起草甲", "起草乙"]
+    assert any("都同样像现行的表「现行一」" in r for r in report)
+
+
+def test_align_to_contract_is_one_to_one():
+    cand = _two_tables(("起草甲", "起草乙"), (["a", "b", "c"], ["a", "b"]))
+    cur = _two_tables(("现行一", "现行二"), (["a", "b", "c"], ["a", "b", "d"]))
+    aligned, _ = S.align_to_contract(cand, cur)
+    names = [t["name"] for t in aligned["tables"]]
+    assert names[0] == "现行一" and names[1] != "现行一" and len(set(names)) == 2

@@ -10,6 +10,10 @@ CodedHTTPException（body 是 {"detail": 中文, "code": 机读码}，前端按 
 路由路径都以 /imports/ 开头，或是 /{source_id}/ 后面跟固定的 reupload、redraft、recipe，与 datasources.py
 现有的 /{source_id}、/{source_id}/test|introspect|schema|imports 不重叠；在 main.py 里登记在 datasources
 之前，免得 /imports/… 被通配的 {source_id} 先截走。
+
+期 3（WP-5）加了 edits/preview、edits/apply、edits/undo、redraft-rules，PUT recipe 收可选的 origin；只读进程
+（没拿到版本存储的守卫）里会写版本存储的入口一律回 503 store_unavailable（第 8 节遗留项 5），body 照样是
+{detail, code}：前端把不是 JSON 的 503 当成网络断开。
 """
 from __future__ import annotations
 
@@ -26,8 +30,8 @@ from app.api.coded import CodedHTTPException
 from app.api.datasources import _NAME_PATTERN, _out, read_upload
 from app.api.runs import actor_of
 from app.data import recipe_imports, table_versions
-from app.data.recipe_imports import ImportRefused
-from app.data.recipe_types import Acceptance, AiAvailability, PeriodInput, Recipe
+from app.data.recipe_imports import EditRequest, ImportRefused
+from app.data.recipe_types import Acceptance, AiAvailability, PeriodInput, Recipe, Selection
 from app.db.base import get_session
 from app.db.models import DataSource, ImportStaging, TableRecipe
 
@@ -38,8 +42,14 @@ _NAME_INVALID = "名称必须以小写字母开头，只能包含字母、数字
 _SIGNED_MAX = 100
 
 
-def _refused(e: ImportRefused) -> CodedHTTPException:
-    return CodedHTTPException(e.status, e.message, e.code)
+#: 业务上的拒绝：ImportRefused 带着状态和机读码；StoreUnavailable 是只读进程拒写（503）
+_REFUSALS = (ImportRefused, table_versions.StoreUnavailable)
+
+
+def _refused(e: Exception) -> CodedHTTPException:
+    if isinstance(e, table_versions.StoreUnavailable):
+        return CodedHTTPException(503, str(e), "store_unavailable")
+    return CodedHTTPException(e.status, e.message, e.code)  # type: ignore[attr-defined]
 
 
 def _signed(body: dict[str, Any] | None, header: str | None) -> str | None:
@@ -167,7 +177,7 @@ async def stage(
         staging = await recipe_imports.stage_upload(
             session, raw=raw, filename=file.filename or name, name=name, description=description or "",
             signed_by=_signed({"signed_by": signed_by}, x_actor))
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     except UnsupportedTable as e:
         raise _unreadable(e) from e
@@ -185,7 +195,7 @@ async def discard(staging_id: str, session: AsyncSession = Depends(get_session))
     staging = await _open_staging(session, staging_id)
     try:
         await recipe_imports.discard_staging(session, staging)
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     return Response(status_code=204)
 
@@ -204,7 +214,7 @@ async def answers(staging_id: str, request: Request, session: AsyncSession = Dep
     staging = await _open_staging(session, staging_id)
     try:
         staging = await recipe_imports.answer(session, staging, given)
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     return await _out_of(session, staging)
 
@@ -215,12 +225,97 @@ async def put_recipe(staging_id: str, request: Request, session: AsyncSession = 
     recipe = body.get("recipe")
     if not isinstance(recipe, dict):
         raise CodedHTTPException(422, "配方必须是一个 JSON 对象", "body_invalid")
+    origin = body.get("origin")
+    if origin not in (None, "rules_redraft"):
+        raise CodedHTTPException(422, "配方来源只能不填，或填 rules_redraft（采用按规则重新起草的结果）", "body_invalid")
     staging = await _open_staging(session, staging_id)
     try:
-        staging = await recipe_imports.put_recipe(session, staging, recipe, origin="manual")
-    except ImportRefused as e:
+        staging = await recipe_imports.put_recipe(session, staging, recipe, origin=origin or "manual")
+    except _REFUSALS as e:
         raise _refused(e) from e
     return await _out_of(session, staging)
+
+
+# --------------------------------------------------------------------------
+# 期 3：修复按钮、框选、撤销、按规则重新起草
+# --------------------------------------------------------------------------
+
+_EDIT_SHAPE = "请求里要么给修复（fix），要么给框选（selection），二选一"
+
+
+def _edit_request(body: dict[str, Any]) -> EditRequest:
+    """{"fix": {id, option, reason?}} 或 {"selection": {sheet, ref, as, options?}}，二选一（9.1）。形状不对回 422
+    edit_invalid；框选的形状校验交给契约 Selection.from_json（只抛 ValueError），输出时再经 to_json 改回 as。"""
+    fix, sel = body.get("fix"), body.get("selection")
+    if (fix is None) == (sel is None):
+        raise CodedHTTPException(422, _EDIT_SHAPE, "edit_invalid")
+    if fix is not None:
+        if (not isinstance(fix, dict) or not isinstance(fix.get("id"), str) or not fix["id"]
+                or not isinstance(fix.get("option"), str) or not fix["option"]):
+            raise CodedHTTPException(422, "修复请求要指明是哪条修复建议（id）和选的哪一项（option）", "edit_invalid")
+        reason = fix.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise CodedHTTPException(422, "理由必须是一段文字", "edit_invalid")
+        return EditRequest(kind="fix", fix_id=fix["id"], option=fix["option"], reason=reason)
+    try:
+        return EditRequest(kind="selection", selection=Selection.from_json(sel))
+    except ValueError as e:
+        raise CodedHTTPException(422, str(e) or "框选的请求格式不对", "edit_invalid") from e
+
+
+@router.post("/imports/{staging_id}/edits/preview")
+async def edits_preview(staging_id: str, request: Request, session: AsyncSession = Depends(get_session)) -> Any:
+    """修复或框选的预览（不改工作配方）。seq 原样回传：界面只采用最新一次的回包。"""
+    body = await _body(request)
+    req = _edit_request(body)
+    staging = await _open_staging(session, staging_id)
+    try:
+        return await recipe_imports.edit_preview(session, staging, req, seq=body.get("seq"))
+    except _REFUSALS as e:
+        raise _refused(e) from e
+
+
+@router.post("/imports/{staging_id}/edits/apply")
+async def edits_apply(staging_id: str, request: Request, x_actor: str | None = Header(default=None),
+                      session: AsyncSession = Depends(get_session)) -> Any:
+    """应用预览过的修复或框选：选项和理由与预览时逐字相同，expected_sha256 是预览给的 recipe_sha256_after。"""
+    body = await _body(request)
+    req = _edit_request(body)
+    expected = body.get("expected_sha256")
+    staging = await _open_staging(session, staging_id)
+    try:
+        staging = await recipe_imports.edit_apply(
+            session, staging, req, expected_sha256=expected if isinstance(expected, str) else None,
+            signed_by=_signed(body, x_actor))
+    except _REFUSALS as e:
+        raise _refused(e) from e
+    return await _out_of(session, staging)
+
+
+@router.post("/imports/{staging_id}/edits/undo")
+async def edits_undo(staging_id: str, request: Request, session: AsyncSession = Depends(get_session)) -> Any:
+    await _body(request)
+    staging = await _open_staging(session, staging_id)
+    try:
+        staging = await recipe_imports.edit_undo(session, staging)
+    except _REFUSALS as e:
+        raise _refused(e) from e
+    return await _out_of(session, staging)
+
+
+@router.post("/imports/{staging_id}/redraft-rules")
+async def redraft_rules(staging_id: str, request: Request, session: AsyncSession = Depends(get_session)) -> Any:
+    """按规则重新起草（不调用模型、不改工作配方），名字对齐到现行配方；「采用」走 PUT recipe（origin=rules_redraft）。"""
+    from app.data.tabular import UnsupportedTable
+
+    await _body(request)
+    staging = await _open_staging(session, staging_id)
+    try:
+        return await recipe_imports.redraft_rules(session, staging)
+    except _REFUSALS as e:
+        raise _refused(e) from e
+    except UnsupportedTable as e:
+        raise _unreadable(e) from e
 
 
 # --------------------------------------------------------------------------
@@ -233,7 +328,7 @@ async def draft_ai_preview(staging_id: str, session: AsyncSession = Depends(get_
     staging = await _open_staging(session, staging_id)
     try:
         return await recipe_imports.ai_preview(session, staging)
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
 
 
@@ -247,7 +342,7 @@ async def draft_ai(staging_id: str, request: Request, x_actor: str | None = Head
         staging = await recipe_imports.run_ai_draft(
             session, staging, consent=body.get("consent") is True,
             preview_sha256=sha if isinstance(sha, str) else None, signed_by=_signed(body, x_actor))
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     return await _out_of(session, staging)
 
@@ -291,7 +386,7 @@ async def trial(staging_id: str, request: Request, x_actor: str | None = Header(
     staging = await _open_staging(session, staging_id)
     try:
         staging = await recipe_imports.run_trial(session, staging, context_inputs=inputs, signed_by=who)
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     return await _out_of(session, staging)
 
@@ -325,13 +420,15 @@ async def commit(staging_id: str, request: Request, x_actor: str | None = Header
         result = await recipe_imports.commit_staging(
             session, staging, trial_id=trial_id if isinstance(trial_id, str) else "",
             confirmations=confirmations, acceptances=_acceptances(body.get("acceptances"), who), signed_by=who)
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     source = await session.get(DataSource, result.source_id, populate_existing=True)
     return JSONResponse(status_code=201, content={
         "source": (await _out(session, source)).model_dump() if source is not None else None,
         "import_id": result.import_id, "snapshot_id": result.snapshot_id, "build_id": result.build_id,
         "recipe_id": result.recipe_id, "build_reused": result.build_reused, "unchanged": result.unchanged,
+        # 期 3：同版本数据文件被改过、已用本次的文件恢复；启用后当前版本含几期；直接启用了内容相同的已有版本
+        "build_restored": result.build_restored, "parts": result.parts, "snapshot_reused": result.snapshot_reused,
     })
 
 
@@ -360,7 +457,7 @@ async def reupload(
     try:
         staging = await recipe_imports.reupload(session, source, raw=raw, filename=file.filename or source.name,
                                                 signed_by=_signed({"signed_by": signed_by}, x_actor))
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     except UnsupportedTable as e:
         raise _unreadable(e) from e
@@ -376,7 +473,7 @@ async def redraft(source_id: str, request: Request, x_actor: str | None = Header
     source = await _source(session, source_id)
     try:
         staging = await recipe_imports.redraft(session, source, signed_by=_signed(body, x_actor))
-    except ImportRefused as e:
+    except _REFUSALS as e:
         raise _refused(e) from e
     except UnsupportedTable as e:
         raise _unreadable(e) from e

@@ -912,6 +912,61 @@ await section('confirmDialog / promptDialog', async () => {
   await page.waitForTimeout(100)
   check('回车提交，返回去掉首尾空白的名字', (await result()) === '"月度经营分析"')
 
+  // 空输入：默认（allowEmpty 关）报「不能为空」、确认禁用、回车不提交；打开 allowEmpty（版本页「启用」收可选理由）
+  // 时空输入和只有空白都能确认，返回空字符串，非空时 validate 照旧生效
+  const dialogText = (t) => page.locator('[role="dialog"]').getByText(t, { exact: true }).count()
+  await page.click('#open-prompt')
+  await page.waitForSelector('[role="dialog"]')
+  await page.waitForTimeout(80)
+  const createBtn = page.getByRole('button', { name: '新建', exact: true })
+  await input.fill('   ')
+  await page.waitForTimeout(50)
+  check('默认不允许空：只有空白时报「不能为空」并禁用确认', (await dialogText('不能为空')) === 1 && await createBtn.isDisabled())
+  await input.fill('')
+  await input.press('Enter')
+  await page.waitForTimeout(100)
+  check('……清空后回车不提交，确认仍禁用', (await dialogOpen()) === 1 && await createBtn.isDisabled())
+  await page.getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(100)
+  check('……取消返回 null', (await result()) === 'null')
+
+  const openOptional = () => page.evaluate(() => {
+    window.__optional = undefined
+    void window.__ui.promptDialog({
+      title: '启用这个版本？', label: '理由（可选）', confirmLabel: '启用', allowEmpty: true,
+      validate: (v) => (v.length > 6 ? '理由太长' : null),
+    }).then((v) => { window.__optional = v })
+  })
+  const optional = () => page.evaluate(() => window.__optional)
+  const enableBtn = page.getByRole('button', { name: '启用', exact: true })
+  await openOptional()
+  await page.waitForSelector('[role="dialog"]')
+  await page.waitForTimeout(80)
+  check('allowEmpty：空输入时确认可用，不报「不能为空」', !(await enableBtn.isDisabled()) && (await dialogText('不能为空')) === 0)
+  await input.fill('   ')
+  await page.waitForTimeout(50)
+  check('……只有空白也可用，不报「不能为空」', !(await enableBtn.isDisabled()) && (await dialogText('不能为空')) === 0)
+  await input.fill('这段理由写得太长了')
+  await page.waitForTimeout(50)
+  check('……填了内容时 validate 照旧生效（报原因、禁用）', (await dialogText('理由太长')) === 1 && await enableBtn.isDisabled())
+  await input.fill('  ')
+  await input.press('Enter')
+  await page.waitForTimeout(100)
+  check('……空着回车确认，返回空字符串（不是 null）', (await dialogOpen()) === 0 && (await optional()) === '', JSON.stringify(await optional()))
+  await openOptional()
+  await page.waitForSelector('[role="dialog"]')
+  await page.waitForTimeout(80)
+  await input.fill(' 传错了 ')
+  await enableBtn.click()
+  await page.waitForTimeout(100)
+  check('……填了就返回去掉首尾空白的文字', (await optional()) === '传错了', JSON.stringify(await optional()))
+  await openOptional()
+  await page.waitForSelector('[role="dialog"]')
+  await page.waitForTimeout(80)
+  await page.getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(100)
+  check('……取消仍返回 null', (await optional()) === null, JSON.stringify(await optional()))
+
   // 嵌套：弹窗里再弹确认，Esc 只关一层
   await page.click('#open-dirty')
   await page.waitForSelector('[role="dialog"]')
@@ -1053,6 +1108,49 @@ await section('管理页共用件：页头、连通胶囊、单选组、删除�
   await page.waitForTimeout(80)
   check('撤销：行回来了，一个 DELETE 都没发', (await rowShown('orders')) === 1 && deletes === 0)
   await page.evaluate(() => window.__ui.toast.dismiss())
+})
+
+await section('提示条 Notice、回执块（期 3 共用件：导入向导、修复面板、版本页都用这一份）', async () => {
+  await page.locator('#notice-demo').scrollIntoViewIfNeeded()
+  const notices = page.locator('#notice-demo [data-notice]')
+  check('Notice：三种语气各一条', (await notices.count()) === 3)
+  const tones = await notices.evaluateAll((els) => els.map((el) => ({
+    tone: el.getAttribute('data-notice'), demo: el.getAttribute('data-demo-notice'), role: el.getAttribute('role'),
+    icons: el.querySelectorAll(':scope > svg[aria-hidden="true"]').length,
+    border: getComputedStyle(el).borderTopColor, cls: el.className,
+  })))
+  const sameNode = tones.every((t) => t.tone === t.demo)
+  check('attr 原样挂在根节点上（与 data-notice 同一个元素）', sameNode, sameNode ? '' : JSON.stringify(tones.map((t) => [t.tone, t.demo])))
+  check('info 是 status（礼貌播报），warn、err 是 alert', tones.map((t) => `${t.tone}:${t.role}`).join(',') === 'info:status,warn:alert,err:alert')
+  check('每条一个图标，不进读屏', tones.every((t) => t.icons === 1))
+  const distinct = new Set(tones.map((t) => t.border)).size === 3
+  check('三种语气的边框颜色互不相同', distinct, distinct ? '' : tones.map((t) => t.border).join(' | '))
+  const merged = /\brounded-lg\b/.test(tones[2].cls) && /\bmt-1\b/.test(tones[2].cls)
+  check('className 追加在默认样式之后', merged, merged ? '' : tones[2].cls)
+  check('children 原样渲染（第二行的细节在提示条里）', (await page.locator('#notice-demo [data-notice="err"] #notice-detail').count()) === 1)
+
+  const sum = page.locator('#receipt-demo [data-receipt-summary]')
+  await sum.scrollIntoViewIfNeeded()
+  check('回执摘要：非空单元格总数和「全部有去处」', /非空单元格 771 个，全部有去处/.test(await sum.locator('[data-summary-ledger]').innerText()))
+  check('回执摘要：表与行数', (await sum.locator('[data-summary-table="日客流"]').getAttribute('data-rows')) === '30')
+  check('回执摘要：占位符、规范写法', (await sum.locator('[data-summary-placeholders]').innerText()).includes('「·」30 格')
+    && (await sum.locator('[data-summary-canonicalized]').getAttribute('data-summary-canonicalized')) === '17')
+  check('排除的行：逐项列出', (await sum.locator('[data-excluded-reason]').count()) === 3
+    && (await sum.locator('[data-summary-excluded]').getAttribute('data-summary-excluded')) === '3')
+  const text = await sum.innerText()
+  const reasons = !/ignored_rows|total_not_kept|mystery_reason/.test(text)
+    && text.includes('按配方忽略的行') && text.includes('只核对、不另存的合计行') && text.includes('其他原因')
+  check('排除的行：原因写中文，不露枚举值；认不出的写「其他原因」', reasons, reasons ? '' : text.replace(/\s+/g, ' ').slice(0, 200))
+  check('排除的行：锚点原文、行号区间、格数', text.includes('「补录（人次）」') && text.includes('第 32 行')
+    && text.includes('第 28–30 行') && text.includes('93 格'))
+  check('排除的行的根节点同时带 data-rows-excluded 和规格里的旧名 data-rows-dropped',
+    (await sum.locator('[data-rows-excluded][data-rows-dropped]').count()) === 1)
+  await sum.locator('[data-excluded-rows="32-32"]').click()
+  check('点行号定位到那一行（工作表!A行号）', (await page.locator('#receipt-focus').innerText()) === '客流汇总!A32')
+  const unrecorded = page.locator('#receipt-unrecorded [data-summary-excluded]')
+  check('回执里没有 rows_excluded（期 3 之前的导入）：写「未记录」，不当作「没有」',
+    (await unrecorded.getAttribute('data-summary-excluded')) === 'unrecorded'
+    && (await unrecorded.innerText()).includes('这次导入未记录排除的行'))
 })
 
 await section('空态：catalog 的表没取回来时不说「还没有」', async () => {

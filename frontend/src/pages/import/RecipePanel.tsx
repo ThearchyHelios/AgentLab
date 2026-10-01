@@ -4,7 +4,8 @@ import { Plus, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { Recipe, RecipeProblem } from '../../types'
 import { Spinner } from '../../components/ui'
-import { RECIPE_CHOICE_LABEL, RECIPE_TEXT } from '../../lib/terms'
+import { ACCUMULATE_TEXT, RECIPE_CHOICE_LABEL, RECIPE_TEXT } from '../../lib/terms'
+import { ChoiceGroup } from './SuggestionCards'
 
 // ===========================================================================
 // 配方的几个纯函数：补全默认值、推出每张表的列、改名时连带改引用
@@ -33,6 +34,7 @@ export function fillRecipeDefaults(input: Recipe | null | undefined): Recipe | n
     sheet.match = isObj(sheet.match) ? sheet.match : { name: '' }
     sheet.match.fallback ??= 'only_visible_sheet'
     sheet.hidden = { rows: 'reject_if_any', cols: 'reject_if_any', ...(isObj(sheet.hidden) ? sheet.hidden : {}) }
+    sheet.ignore_outside ??= []
     sheet.context = arr(sheet.context).map((c) => (isObj(c)
       ? { id: '统计期', kind: 'period', parser: 'cn_date_range', prefer_prefix: null, cross_check: 'filename', ...c }
       : c))
@@ -45,6 +47,8 @@ export function fillRecipeDefaults(input: Recipe | null | undefined): Recipe | n
           find: { parser: 'month_day_or_date', min: 2, ...(isObj(axis.find) ? axis.find : {}) },
         }
         block.label_offset ??= -1
+        block.ignore_rows ??= []
+        block.ignore_columns ??= []
         block.values = {
           type: 'INTEGER', blank: 'reject', text_number: 'reject', formula: 'reject', ...(isObj(block.values) ? block.values : {}),
         }
@@ -66,6 +70,7 @@ export function fillRecipeDefaults(input: Recipe | null | undefined): Recipe | n
         block.header_rows ??= 1
         block.after_title ??= null
         block.extra_columns ??= 'reject'
+        block.ignore_columns ??= []
         block.merged_data ??= 'reject'
         block.rows = { blank_rows: 'stop', total_row: null, ...(isObj(block.rows) ? block.rows : {}) }
         if (isObj(block.rows.total_row)) block.rows.total_row.keep_as ??= null
@@ -483,6 +488,40 @@ function Group({ title, children, attr }: { title: ReactNode; children: ReactNod
   )
 }
 
+/**
+ * 忽略规则（期 3：修复按钮、框选加进来的 ignore_rows、ignore_columns、ignore_outside）：只读列出锚点原文和理由，
+ * 每条可以移除（移除走 PUT recipe，和面板里的其他修改一样）。要新增只能经修复按钮或框选：锚点文字必须取自格子原文，
+ * 手写容易写错，也可能写进带年月的文字（下一期必然对不上）
+ */
+function IgnoreRules({ path, items, text, edit, remove }: {
+  path: string
+  items: any[]
+  text: (x: any) => string
+  edit: Edit
+  remove: (r: Recipe, k: number) => void
+}) {
+  if (!items.length) return null
+  return (
+    <FieldWrap path={path} label={RECIPE_TEXT.ignoreRules}>
+      <ul className="space-y-1" data-ignore-rules={path}>
+        {items.map((x, k) => (
+          <li key={k} className="flex items-start gap-2 rounded-md border px-2 py-1 text-xs" data-ignore-rule={text(x)}>
+            <span className="min-w-0 flex-1">
+              <span>{text(x)}</span>
+              {x?.reason && <span className="block text-2xs text-faint">{RECIPE_TEXT.ignoreReason(String(x.reason))}</span>}
+            </span>
+            <button type="button" className="btn btn-xs btn-ghost" aria-label={RECIPE_TEXT.removeIgnore(text(x))} data-ignore-remove
+                    onClick={() => edit((r) => remove(r, k))}>
+              <X size={11} aria-hidden />
+            </button>
+            <FieldProblems path={`${path}/${k}`} />
+          </li>
+        ))}
+      </ul>
+    </FieldWrap>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // 交叉表的分段
 // ---------------------------------------------------------------------------
@@ -818,6 +857,9 @@ function ListEditor({ s, b, block, edit }: { s: number; b: number; block: any; e
           </div>
         )}
       </FieldWrap>
+      <IgnoreRules path={`${base}/ignore_columns`} items={arr(block.ignore_columns)} edit={edit}
+                   text={(x) => RECIPE_TEXT.ignoreColumn(String(x?.header ?? ''))}
+                   remove={(r, k) => { at(r).ignore_columns.splice(k, 1) }} />
       <ValuesEditor base={base} values={block.values} list edit={edit} />
     </Group>
   )
@@ -954,6 +996,7 @@ export function RecipePanel({ recipe, problems, units, candidates, labelOptions,
     server.current = saved
     setFull(project())
   }, [saved])
+  const modeName = useId()
   const [showJson, setShowJson] = useState(false)
   const [pasting, setPasting] = useState(false)
   const [pasteText, setPasteText] = useState('')
@@ -1077,6 +1120,17 @@ export function RecipePanel({ recipe, problems, units, candidates, labelOptions,
           <p className="text-xs text-faint">{RECIPE_TEXT.noRecipe}</p>
         ) : (
           <>
+            <Group title={ACCUMULATE_TEXT.modeField} attr={{ 'data-recipe-mode': String(full.mode ?? 'replace') }}>
+              <FieldWrap path="/mode">
+                <div data-field="/mode">
+                  <ChoiceGroup name={`${modeName}-mode`} label={ACCUMULATE_TEXT.modeField} attr="data-mode-option" value={String(full.mode ?? 'replace')}
+                               options={['accumulate', 'replace'].map((v) => ({
+                                 value: v, label: ACCUMULATE_TEXT.modeLabel[v], detail: ACCUMULATE_TEXT.modeConsequence[v],
+                               }))}
+                               onChange={(v) => edit((r) => { r.mode = v })} />
+                </div>
+              </FieldWrap>
+            </Group>
             {arr(full.tables).map((t, i) => {
               const cols = columns.get(t?.name) ?? []
               const base = `/tables/${i}`
@@ -1184,6 +1238,12 @@ export function RecipePanel({ recipe, problems, units, candidates, labelOptions,
                             </FieldWrap>
                           </div>
                           <ValuesEditor base={bbase} values={block.values} list={false} edit={edit} />
+                          <IgnoreRules path={`${bbase}/ignore_rows`} items={arr(block.ignore_rows)} edit={edit}
+                                       text={(x) => RECIPE_TEXT.ignoreRow(String(x?.label ?? ''))}
+                                       remove={(r, k) => { r.sheets[s].blocks[b].ignore_rows.splice(k, 1) }} />
+                          <IgnoreRules path={`${bbase}/ignore_columns`} items={arr(block.ignore_columns)} edit={edit}
+                                       text={(x) => RECIPE_TEXT.ignoreColumn(String(x?.header ?? ''))}
+                                       remove={(r, k) => { r.sheets[s].blocks[b].ignore_columns.splice(k, 1) }} />
                         </Group>
                         {arr(block.segments).map((seg, g) => (isObj(seg)
                           ? <SegmentEditor key={g} s={s} b={b} g={g} seg={seg} edit={edit} candidates={candidates}
@@ -1207,6 +1267,9 @@ export function RecipePanel({ recipe, problems, units, candidates, labelOptions,
                                 label={RECIPE_TEXT.fallback} onChange={(v) => edit((r) => { r.sheets[s].match.fallback = v })} />
                       </FieldWrap>
                     </div>
+                    <IgnoreRules path={`${sbase}/ignore_outside`} items={arr(sheet?.ignore_outside)} edit={edit}
+                                 text={(x) => RECIPE_TEXT.ignoreOutside(String(x?.anchor ?? ''))}
+                                 remove={(r, k) => { r.sheets[s].ignore_outside.splice(k, 1) }} />
                   </Group>
                 </div>
               )

@@ -465,8 +465,13 @@ async def test_new_source_is_not_created_when_publishing_fails(store, monkeypatc
     assert not files_under(store / "uploads" / "raw")
 
 
-async def test_existing_target_with_wrong_hash_fails_and_keeps_pointer(store):
-    """同一个构建的目标文件已存在、哈希和登记的不一样（0 字节残骸、被改过）：导入失败，指针不动。"""
+def quarantined(store: Path, source_id: str) -> list[Path]:
+    return files_under(store / "uploads" / "quarantine" / source_id)
+
+
+async def test_existing_target_with_wrong_hash_is_restored_and_quarantined(store):
+    """同一个构建的目标文件已存在、哈希和登记的不一样（0 字节残骸、被改过）：这次的临时库哈希等于登记值，
+    就把已有文件挪进隔离区、用临时库恢复（期 3 遗留项 1；期 1 这里一律失败，同一个文件永远传不上去）。"""
     name = unique()
     raw = xlsx(V1)
     sid, first = await publish(name, raw=raw)
@@ -474,15 +479,43 @@ async def test_existing_target_with_wrong_hash_fails_and_keeps_pointer(store):
     path = Path(build.db_path)
     os.chmod(path, 0o644)
     path.write_bytes(b"")
-    with pytest.raises(table_versions.PublishError, match="不一致"):
+    _, second = await publish(name, raw=raw)
+    assert second.build_reused is True and second.build_restored is True
+    assert second.build_id == first.build_id
+    assert (await load(sid)).current_snapshot_id == second.snapshot_id
+    # 恢复的是登记的那一份：旧快照、新快照指着同一个文件，哈希都对得上
+    assert raw_store.sha256_file(path) == build.db_sha256 == (await get(TableBuild, first.build_id)).db_sha256
+    assert stat.S_IMODE(path.stat().st_mode) == 0o444
+    [moved] = quarantined(store, sid)
+    assert moved.name.startswith(f"{first.build_id}-") and moved.stat().st_size == 0
+    assert stat.S_IMODE(moved.stat().st_mode) == 0o444
+    assert await scalar(await resolve(sid), 'SELECT SUM("数量") FROM "甲表"') == 3
+
+
+async def test_existing_target_and_record_both_wrong_is_a_build_conflict(store):
+    """文件和构建记录的哈希都被改了，本次上传也恢复不了：build_conflict，指针不动，什么都不挪。"""
+    name = unique()
+    raw = xlsx(V1)
+    sid, first = await publish(name, raw=raw)
+    async with SessionLocal() as session:
+        row = await session.get(TableBuild, first.build_id)
+        row.db_sha256 = "f" * 64
+        await session.commit()
+    path = Path((await get(TableBuild, first.build_id)).db_path)
+    os.chmod(path, 0o644)
+    path.write_bytes(b"")
+    with pytest.raises(table_versions.PublishError, match="无法用本次上传恢复") as err:
         await publish(name, raw=raw)
+    assert err.value.code == "build_conflict"
     assert (await load(sid)).current_snapshot_id == first.snapshot_id
     assert len(await imports_of(sid)) == 1
     assert path.exists() and path.stat().st_size == 0      # 不是我们建的，不替它删
-    assert raw_store.raw_exists(build.raw_sha256)          # 原件早就在，不能被这次失败删掉
+    assert not quarantined(store, sid)
+    assert raw_store.raw_exists((await get(TableBuild, first.build_id)).raw_sha256)
 
 
-async def test_zero_byte_file_at_target_without_record_fails(store):
+async def test_unregistered_file_at_target_is_quarantined_and_publish_succeeds(store):
+    """目标位置有一个没有记录、内容不同的文件（没人登记的孤儿）：挪进隔离区再 link，发布成功。"""
     sid = uuid.uuid4().hex
     raw = xlsx(V1)
     opts = table_versions.parse_options("客流.xlsx", header_row=1, mixed="reject", raw_mode=False)
@@ -492,10 +525,13 @@ async def test_zero_byte_file_at_target_without_record_fails(store):
     name = unique()
     async with SessionLocal() as session:
         row = DataSource(id=sid, name=name, kind="sqlite", readonly=True, origin="upload")
-        with pytest.raises(table_versions.PublishError):
-            await table_versions.publish_upload(session, row, raw, "客流.xlsx")
-    assert await get(DataSource, sid) is None
-    assert not files_under(store / "uploads" / "raw")
+        result = await table_versions.publish_upload(session, row, raw, "客流.xlsx")
+    assert result.build_reused is False and result.build_restored is False
+    assert (await load(sid)).current_snapshot_id == result.snapshot_id
+    assert raw_store.sha256_file(target) == (await get(TableBuild, result.build_id)).db_sha256
+    [moved] = quarantined(store, sid)
+    assert moved.stat().st_size == 0
+    assert await scalar(await resolve(sid), 'SELECT SUM("数量") FROM "甲表"') == 3
 
 
 async def test_reupload_probes_the_new_file_even_when_the_old_engine_is_cached(store):
@@ -717,7 +753,10 @@ async def test_reusing_a_build_with_an_empty_hash_fills_it_in(store):
 # --------------------------------------------------------------------------
 
 
-async def test_old_versions_are_reclaimed_when_nothing_references_them(store):
+async def test_old_versions_are_reclaimed_when_nothing_references_them(store, monkeypatch):
+    # 期 3 起回收在当前快照、运行引用的之外另外保留每个源最近 SNAPSHOT_KEEP 个快照；调成 0（期 1 的规则）
+    # 才测得出「没人引用就回收」
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     name = unique()
     sid, first = await publish(name, fresh(V1))
     old = await get(TableBuild, first.build_id)
@@ -734,7 +773,9 @@ async def test_old_versions_are_reclaimed_when_nothing_references_them(store):
         await resolve(sid, first.snapshot_id)
 
 
-async def test_gc_keeps_snapshots_referenced_by_interrupted_runs(store):
+async def test_gc_keeps_snapshots_referenced_by_interrupted_runs(store, monkeypatch):
+    # 同上：SNAPSHOT_KEEP 调成 0，保护只来自运行引用，运行记录删掉以后才会被回收
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     name = unique()
     sid, first = await publish(name, fresh(V1))
     async with SessionLocal() as session:
@@ -951,7 +992,9 @@ async def test_startup_leaves_other_sqlite_sources_alone(store, tmp_path):
     assert sqlite3.connect(nested / "x.db").execute('SELECT COUNT(*) FROM "明细"').fetchone()[0] == 2
 
 
-async def test_legacy_upload_can_be_updated_by_a_new_upload(store):
+async def test_legacy_upload_can_be_updated_by_a_new_upload(store, monkeypatch):
+    # 同上：SNAPSHOT_KEEP 调成 0，迁移出的 v0 版本没人引用，随回收删除
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     tables = table_versions.tables_root()
     tables.mkdir(parents=True)
     legacy = tables / "old_c.db"

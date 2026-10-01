@@ -1,5 +1,7 @@
 import type {
-  AiPreview, CommitOut, CurrentRecipe, QuestionAnswer, Recipe, Staging,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
+  ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
+  RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
@@ -572,9 +574,13 @@ export const api = {
     /** 已选的全部回答（服务端从起点配方按问题顺序重放）。needs_reason 的选项要带 reason */
     answers: (id: string, answers: Record<string, QuestionAnswer>) =>
       post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/answers`, { answers }),
-    /** 整份配方替换工作配方：有静态校验问题也照存，只是不能试运行；已选的回答清空 */
-    putRecipe: (id: string, recipe: Recipe) =>
-      put<Staging>(`/datasources/imports/${encodeURIComponent(id)}/recipe`, { recipe }),
+    /**
+     * 整份配方替换工作配方：有静态校验问题也照存，只是不能试运行。期 3：仍然成立的回答保留（不成立的进
+     * answers_dropped），撤销栈清空、之前的修改标「已被覆盖」。origin 只在采用「按规则重新起草」的结果时给
+     * 'rules_redraft'（服务端核对配方哈希，对不上回 409 redraft_mismatch）；不给时请求体与期 2 相同
+     */
+    putRecipe: (id: string, recipe: Recipe, origin?: 'rules_redraft') =>
+      put<Staging>(`/datasources/imports/${encodeURIComponent(id)}/recipe`, origin ? { recipe, origin } : { recipe }),
     /** 将要发给模型的全文（同意框里给人看的就是这一份） */
     draftAiPreview: (id: string) => get<AiPreview>(`/datasources/imports/${encodeURIComponent(id)}/draft-ai/preview`),
     /** 用户同意后才调：preview_sha256 与服务端重算的不一致时回 409 ai_preview_stale */
@@ -595,6 +601,52 @@ export const api = {
     /** 修改配方（不换文件）：用当前导入的原件、以当前配方为工作配方 */
     redraft: (sourceId: string) => post<Staging>(`/datasources/${encodeURIComponent(sourceId)}/redraft`, {}),
     recipe: (sourceId: string) => get<CurrentRecipe>(`/datasources/${encodeURIComponent(sourceId)}/recipe`),
+    /**
+     * 期 3：修复或框选的预览（不改工作配方）。body 是 {fix: {id, option, reason?}} 或 {selection: {sheet, ref, as,
+     * options?}} 二选一，seq 原样回传（只采用最新一次的回包）。ok=false 时照样 200，原因在 problems
+     */
+    editPreview: (id: string, body: EditRequest) =>
+      post<EditPreview>(`/datasources/imports/${encodeURIComponent(id)}/edits/preview`, body),
+    /**
+     * 期 3：应用预览过的修复或框选。选项和理由必须与预览时逐字相同，expected_sha256 是预览返回的
+     * recipe_sha256_after：对不上回 409 edit_stale（需要重新预览）；提议已不在当前列表里回 409 fix_stale
+     */
+    editApply: (id: string, body: EditRequest & { expected_sha256: string; signed_by?: string | null }) =>
+      post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/edits/apply`, body),
+    /** 期 3：撤销上一次修改。没有可撤销的回 409 nothing_to_undo；之后配方又被改过回 409 undo_stale */
+    editUndo: (id: string) => post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/edits/undo`, {}),
+    /** 期 3：按规则重新起草（不调用模型、不改工作配方），名字对齐到现行配方；「采用」走 putRecipe(…, 'rules_redraft') */
+    redraftRules: (id: string) =>
+      post<RedraftRulesOut>(`/datasources/imports/${encodeURIComponent(id)}/redraft-rules`, {}),
+  },
+
+  /**
+   * 期 3 的版本页（数据源卡片上的「版本」，P3-SPEC 第 7 节）：版本列表、启用旧版本、清单、移除一期、作废接受、
+   * 导入记录与清除原件。写操作都要 confirm: true；启用、移除、作废还要带界面看到的当前版本 id
+   * （expected_current_snapshot_id），别人在这期间改过当前版本时回 409 base_changed。错误按 ApiError.code 分支
+   */
+  versions: {
+    /** 最近 50 个版本，当前版本排第一。手工源返回空列表 */
+    snapshots: (sourceId: string) => get<SnapshotOut[]>(`/datasources/${encodeURIComponent(sourceId)}/snapshots`),
+    activate: (sourceId: string, snapshotId: string, body: ActivateSnapshotBody) =>
+      post<ActivateSnapshotOut>(
+        `/datasources/${encodeURIComponent(sourceId)}/snapshots/${encodeURIComponent(snapshotId)}/activate`, body),
+    snapshotManifest: (sourceId: string, snapshotId: string) =>
+      get<ManifestOut>(`/datasources/${encodeURIComponent(sourceId)}/snapshots/${encodeURIComponent(snapshotId)}/manifest`),
+    importManifest: (sourceId: string, importId: string) =>
+      get<ManifestOut>(`/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/manifest`),
+    /** 从当前版本中移除这一期（累积模式；配方和导入模式不变） */
+    removePeriod: (sourceId: string, importId: string, body: RemovePeriodBody) =>
+      post<RemovePeriodOut>(`/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/remove`, body),
+    /** 撤回这一期（作废接受，不可恢复）：替换模式回滚到 revoke_plan 的目标，累积模式移除这一期 */
+    revokeAcceptance: (sourceId: string, importId: string, body: RevokeAcceptanceBody) =>
+      post<RevokeAcceptanceOut>(
+        `/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/revoke-acceptance`, body),
+    /** 全部导入记录，新的在前（含已被替换的） */
+    imports: (sourceId: string) => get<ImportRecord[]>(`/datasources/${encodeURIComponent(sourceId)}/imports`),
+    /** 清除一次导入的原件（同一份内容的其他导入一并清除，引用它的未完成导入一并放弃）。理由必填 */
+    purgeRaw: (sourceId: string, importId: string, body: PurgeRawBody) =>
+      post<PurgeRawOut>(`/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/purge-raw`, body),
   },
 
   runs: {

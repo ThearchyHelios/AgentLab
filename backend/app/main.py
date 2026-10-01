@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import (
     artifacts, conversations, copilot, datasources, evidence, governance, knowledge, runs,
-    sandbox, settings as settings_api, table_imports, tools, workflows,
+    sandbox, settings as settings_api, source_versions, table_imports, tools, workflows,
 )
 from app.api.coded import CodedHTTPException, coded_handler
 from app.core.config import settings
@@ -119,6 +119,7 @@ for router in (
     governance.router,
     # 按配方导入的 /api/datasources/imports/… 要在 datasources 的通配 /{source_id} 之前登记
     table_imports.router,
+    source_versions.router,
     datasources.router,
 ):
     app.include_router(router)

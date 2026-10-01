@@ -376,7 +376,8 @@ def test_side_by_side_tables_split_by_blank_column():
     one["sheets"][0]["blocks"].pop()
     one["tables"].pop()
     p = problem(run(build(), one), "cell_unclaimed")       # 右边那张表的格在左表的数据行上，没有去处
-    assert p.fix == "ignore_cells"
+    # 期 3 起单格没有修复按钮（P3-SPEC 3.1：单格没有能泛化的锚点，只能改文件或框选）
+    assert p.fix is None and p.fix_args is None
 
 
 # --------------------------------------------------------------------------
@@ -459,6 +460,120 @@ def test_blank_row_stop_and_skip():
     ex = run(sales_book(edit=gap, total=False), list_recipe(rows={"blank_rows": "skip"}))
     assert ex.ok and ex.blank_rows_skipped == 1 and ex.expected_rows["销售"] == 5
     assert ex.lineage["销售"]["地区"] == [[1, SHEET, "A4", 2, "down"], [3, SHEET, "A7", 3, "down"]]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_note_below_a_skipped_blank_row_is_outside_text_not_a_record(tmp_path, monkeypatch, stream):
+    """跳过空行（blank_rows=skip）时，表下隔一个空行、只有首列一格文字的说明行（「注：……」）是表的下边界，不是数据行
+    （WP-8 修补）：照起草器 _compatible 的认法交给区域外，文字进回执；那个空行不算「数据中间的空行」，从计数和排除的
+    行里撤回。曾静默写进一条首列是「注：……」、其余全为空值的记录，回执里只多一行。"""
+    def gap_and_note(ws):
+        ws.insert_rows(6)                      # 数据中间一行空白（第 6 行）：明细到第 9 行
+        ws["G10"] = "附注"                     # 第 10 行只在块外有字：先按空行跳过，随后要一并撤回
+        ws["A11"] = "注：以上为初步统计，以终稿为准"
+        ws["A12"] = "制表人：经办甲"
+    data = list_recipe(rows={"blank_rows": "skip"})
+    if stream:
+        monkeypatch.setattr(xlsx_cells, "GRID_MAX_CELLS", 20)
+    db = str(tmp_path / "n.db")
+    ex = run(sales_book(edit=gap_and_note, total=False), data, db=db)
+    assert ex.ok and not ex.problems, [(p.code, p.message) for p in ex.problems]
+    assert ex.expected_rows["销售"] == 5 and ex.blank_rows_skipped == 1
+    assert rows_of(db, "SELECT COUNT(*) FROM 销售 WHERE 产品 IS NULL") == [(0,)]
+    assert [(o.cell, o.kind) for o in ex.outside_text if o.cell.endswith(("11", "12"))] == [
+        (f"{SHEET}!A11", "text"), (f"{SHEET}!A12", "text")]
+    # 判成表的下边界也看得出来（WP-8 评审意见 4）：说明那一行和其下交给区域外的行（第 12 行的落款）记进排除的行
+    # after_stop，锚点是说明那格的文字、格数是本块列范围内的非空格；像说明的不出问题
+    assert [(x.reason, x.rows, x.cells, x.anchor, x.block) for x in ex.rows_excluded] == [
+        ("blank_skipped", [[6, 6]], 0, None, "列表1"),
+        ("after_stop", [[11, 12]], 2, "注：以上为初步统计，以终稿为准", "列表1")]
+    # 说明行之后再有数据：照样不读，数字报 outside_number（响亮地拒收，而不是悄悄截断或读进去）
+    def note_then_data(ws):
+        gap_and_note(ws)
+        ws["D12"] = 987654
+    ex = run(sales_book(edit=note_then_data, total=False), data)
+    assert "outside_number" in codes(ex) and ex.expected_rows["销售"] == 5
+    stop = problem(ex, "rows_after_stop")
+    assert "表下说明（第 11 行）之后" in stop.message and "跳过继续" not in stop.message, stop.message
+    assert [(x.rows, x.cells) for x in ex.rows_excluded if x.reason == "after_stop"] == [([[11, 12]], 3)]
+
+
+def _gap_and_lone(*tail: tuple[str, Any]) -> Callable[[Any], None]:
+    """数据中间一行空白（第 6 行，明细到第 9 行），第 10 行空，第 11 行起按 tail 逐行写（(格, 值)，值为 None 则这一行空着）。"""
+    def edit(ws):
+        ws.insert_rows(6)
+        for i, (cell, value) in enumerate(tail):
+            if value is not None:
+                ws[f"{cell}{11 + i}"] = value
+    return edit
+
+
+def _seen(ex: Extraction) -> tuple[Any, ...]:
+    """两条路径要一致的部分：问题（code、类别、消息、格）、排除的行、区域外文字、各表行数、跳过的空行数。"""
+    return ([(p.code, p.category, p.message, p.cells) for p in ex.problems],
+            [(x.reason, x.rows, x.cells, x.anchor, x.block) for x in ex.rows_excluded],
+            [(o.cell, o.text, o.kind) for o in ex.outside_text], ex.expected_rows, ex.blank_rows_skipped)
+
+
+def test_a_lone_first_column_row_that_does_not_read_like_a_note_must_be_confirmed(tmp_path, monkeypatch):
+    """空行之后只有首列一格文字的行照旧当表的下边界（与起草器一致），但文字不像说明（不以「注」「说明」「备注」……开头）
+    时，它也可能是表尾一条只填了首列的数据行：出 confirm 类的 rows_after_stop（消息写明第几行只有首列文字、已当作表下
+    说明、没有导入），并记进排除的行（WP-8 评审意见 4）。曾只出现在区域外文字里，确认项、排除的行都没有它。网格路径和
+    流式路径结果逐项相同；下面再接一行只有首列的「地区戊」，一并记进排除的行。"""
+    data = list_recipe(rows={"blank_rows": "skip"})
+    book = sales_book(edit=_gap_and_lone(("A", "地区丁"), ("A", "地区戊")), total=False)
+    db = str(tmp_path / "g.db")
+    grid = run(book, data, db=db)
+    monkeypatch.setattr(xlsx_cells, "GRID_MAX_CELLS", 20)
+    stream = run(book, data, db=str(tmp_path / "s.db"))
+    assert _seen(grid) == _seen(stream)
+    for ex in (grid, stream):
+        assert ex.ok and ex.expected_rows["销售"] == 5 and ex.blank_rows_skipped == 1
+        assert [p.code for p in ex.problems] == ["rows_after_stop"], [(p.code, p.message) for p in ex.problems]
+        p = ex.problems[0]
+        assert p.category == "confirm" and p.cells == [f"{SHEET}!A11"]
+        assert "第 11 行只有首列文字" in p.message and "已当作表下说明，没有导入" in p.message, p.message
+        assert "地区丁" not in p.model_message
+        assert [(x.reason, x.rows, x.cells, x.anchor) for x in ex.rows_excluded] == [
+            ("blank_skipped", [[6, 6]], 0, None), ("after_stop", [[11, 12]], 2, "地区丁")]
+        assert [(o.cell, o.text) for o in ex.outside_text if o.cell != f"{SHEET}!A1"] == [
+            (f"{SHEET}!A11", "地区丁"), (f"{SHEET}!A12", "地区戊")]
+    assert rows_of(db, "SELECT COUNT(*) FROM 销售 WHERE 地区 IN ('地区丁', '地区戊')") == [(0,)]
+
+
+@pytest.mark.parametrize("text", ["注：本表为初步统计", "说明：不含退货", "　备注：见附件", "\u200b注：零宽字符开头",
+                                  "制表：经办甲", "填表人：经办乙",
+                                  "填报单位：合成单位", "来源：合成系统", "数据来源：合成系统", "单位：万元",
+                                  "审核：经办丙", "ＮＯＴＥ"])
+def test_which_lone_rows_read_like_a_note(text):
+    """像说明的开头按 canon 之后比（全角空格、零宽字符开头的照样认）：像说明的只记进排除的行和区域外文字，不出问题；
+    不像的（这里用全角字母写的 NOTE）出 rows_after_stop。"""
+    ex = run(sales_book(edit=_gap_and_lone(("A", text)), total=False), list_recipe(rows={"blank_rows": "skip"}))
+    assert ex.expected_rows["销售"] == 5
+    assert [(x.reason, x.rows, x.anchor) for x in ex.rows_excluded if x.reason == "after_stop"] == [
+        ("after_stop", [[11, 11]], text.strip())]
+    assert (codes(ex) == {"rows_after_stop"}) is (text == "ＮＯＴＥ"), [(p.code, p.message) for p in ex.problems]
+
+
+def test_lone_first_column_rows_that_are_data_or_total_are_still_read():
+    """只认「首列一格文字」：首列是数、日期，或者正是合计行的标签时仍按原样读（缺数的数据行、合计行），
+    中间的空行照旧算跳过。"""
+    data = list_recipe(rows={"blank_rows": "skip"})
+    data["tables"][0]["grain"] = []
+    for cell, value in (("C11", dt.datetime(2026, 8, 30)), ("A11", "2026-08-30"), ("A11", "1,234")):
+        def gap_and_lone(ws, cell=cell, value=value):
+            ws.insert_rows(6)
+            ws[cell] = value
+        ex = run(sales_book(edit=gap_and_lone, total=False), data)
+        assert ex.expected_rows["销售"] == 6 and ex.blank_rows_skipped == 2, (cell, value)
+    def gap_and_bare_total(ws):
+        ws.insert_rows(6)
+        ws.insert_rows(10)                     # 合计行（第 11 行）上方也空一行，而且只写了「合计」两个字
+        ws["D11"], ws["E11"] = None, None
+    ex = run(sales_book(edit=gap_and_bare_total), list_recipe(rows={"blank_rows": "skip", "total_row": {
+        "label_column": "地区", "pick": "合计", "keep_as": "销售_表内合计"}}))
+    assert "total_row_missing" not in codes(ex), [(p.code, p.message) for p in ex.problems]
+    assert ex.expected_rows == {"销售": 5, "销售_表内合计": 1} and ex.blank_rows_skipped == 2
 
 
 def test_total_row_formulas_and_hidden_rows():

@@ -546,7 +546,8 @@ def test_row_codes():
     ex = run(flow_book(days=3, edit=extra_row))
     assert codes(ex) == {"row_unclaimed"}
     p = problem(ex, "row_unclaimed")
-    assert p.fix == "add_label" and p.cells[0] == f"{SHEET}!B32"
+    # 期 3 起改为按行标签忽略（P3-SPEC 3.1：隔了空行的那一行加标签也认领不到）；fix_args 见 test_recipe_engine_p3
+    assert p.fix == "ignore_cells" and p.cells[0] == f"{SHEET}!B32"
     ex = run(flow_book(days=3, edit=lambda ws, info: set_value(ws, "D32", 987654)))
     assert codes(ex) == {"row_without_label"}
 

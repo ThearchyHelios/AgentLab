@@ -188,6 +188,16 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("table_imports", "manifest_artifact", "VARCHAR(64)"),
     ("table_imports", "signed_by", "VARCHAR(100)"),
     ("table_imports", "staging_id", "VARCHAR(32)"),
+    # 期 3：按期累积、版本页（P3-SPEC 9.6）。新表 snapshot_activations 由 create_all 建；存量行一律 NULL，
+    # 含义是「期 3 之前的」：快照的 mode 按 replace、recipe_id 取最后一期导入的、activated_at 按 created_at
+    ("source_snapshots", "mode", "VARCHAR(20)"),
+    ("source_snapshots", "recipe_id", "VARCHAR(32)"),
+    ("source_snapshots", "activated_at", "DATETIME"),
+    ("source_snapshots", "manifest_artifact", "VARCHAR(64)"),
+    ("table_imports", "revoked", "JSON"),
+    ("import_stagings", "edits", "JSON"),
+    ("import_stagings", "answers_dropped", "JSON"),
+    ("import_stagings", "redraft_sha256", "VARCHAR(64)"),
 ]
 
 

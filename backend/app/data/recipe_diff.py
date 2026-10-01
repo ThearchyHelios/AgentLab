@@ -28,6 +28,16 @@ TableBuild.report，没有 ledger 键）或配方变了（redraft、改配方）
 **数字遮盖后的模板**（digit_template）：canon 之后把每一段连续的 ASCII 数字换成 ``{}``。文件名、统计期格、
 区域外文字的「写法变了」都按它比，每月必变的日期因此不算变化。
 
+**期 3**（P3-SPEC 9.5）：
+- 给了累积计划（accumulate）时，按计划另出 period_added、period_replaced、period_gap（需确认）、period_backfill
+  （本期统计期是人工录入时需确认）、columns_added、columns_retired、labels_vary。它们来自计划，与配方变没变无关；
+- 追加或替换该期时，区域外文字的差异（outside_*）**配方变了也照比**（outside_items，也公开给调用方单独算
+  ConfirmContext.outside_diff）：本期和此前各期进同一列，单位写在区域外时变化只表现在这里，
+  recipe_confirm 的 accumulate_unit_risk 靠它（P3-SPEC 2.5）；
+- 逐项比较时按回执的 rows_excluded（排除的行）比「按配方忽略的行」：锚点集合或行数变了出 ignored_rows（需确认，
+  ``diff:ignored_rows:<工作表>``，与期 2 ignored_columns 的 ``diff:ignored:<块>`` 不共用前缀）。rows_excluded
+  不在 RECEIPT_KEYS 里：上一期（期 3 之前的导入）没有这个字段时出 info「上一期未记录排除的行」，不当作空列表比。
+
 纯函数，不碰数据库、不读文件。
 """
 from __future__ import annotations
@@ -44,10 +54,11 @@ _DIGITS = re.compile(r"[0-9]+")
 
 #: 差异卡的全部 kind，按界面上的先后（7.6 的表；outside_moved 是表里「只是位置变了的算 info」那一项）
 DIFF_KINDS: tuple[str, ...] = (
-    "period", "rows", "placeholders", "checks", "file_name", "full_calc", "context_text",
+    "period", "period_added", "period_replaced", "period_gap", "period_backfill", "rows", "columns_added",
+    "columns_retired", "labels_vary", "placeholders", "checks", "file_name", "full_calc", "context_text",
     "context_source_added", "column_order", "label_writing", "header_writing", "canon_values", "row_order",
     "block_order", "derived_form", "axis_form", "outside_added", "outside_removed", "outside_changed",
-    "outside_moved", "ignored_columns", "hidden",
+    "outside_moved", "ignored_columns", "ignored_rows", "hidden",
 )
 
 #: 需确认的 kind → 确认项 id 的前缀（id = 前缀 + 键，键的格式见契约 recipe_types 的模块 docstring）
@@ -64,6 +75,10 @@ CONFIRM_PREFIX: dict[str, str] = {
     "outside_changed": "diff:outside:",
     "ignored_columns": "diff:ignored:",
     "hidden": "diff:hidden:",
+    # 期 3。period_backfill、ignored_rows 只在特定情况下需确认（_item 的 confirm=False 时是 info）
+    "period_gap": "diff:period_gap:",
+    "period_backfill": "diff:period_backfill:",
+    "ignored_rows": "diff:ignored_rows:",
 }
 
 _STATUS = {"passed": "通过", "mismatch": "不一致", "unverifiable": "无法核对", "info": "提示"}
@@ -275,7 +290,7 @@ def period_annotated(doc: Any, rec: dict[str, Any]) -> dict[str, str]:
 
 def diff_reports(prev: dict[str, Any] | None, cur: dict[str, Any], *, prev_file_name: str | None,
                  cur_file_name: str, recipe: Recipe | dict[str, Any] | None = None,
-                 recipe_changed: bool | None = None) -> list[DiffItem]:
+                 recipe_changed: bool | None = None, accumulate: Any = None) -> list[DiffItem]:
     """上一期 → 本期的差异卡。prev 为 None（首次）返回 []。需确认的排在前面，同类按 DIFF_KINDS 的顺序。
 
     上一期的回执没有 ledger 键（简单导入，kind=switch）或配方变了（redraft、改配方）时只给 rows、period；
@@ -285,6 +300,9 @@ def diff_reports(prev: dict[str, Any] | None, cur: dict[str, Any], *, prev_file_
     - recipe_changed：配方与上一期是否不同。不传时看 prev、cur 两边的配方哈希（顶层 ``recipe_sha256``，
       或导入清单的 ``recipe.sha256``）；两边没都带、又没传时报错，不默认「没变」。传了、两边也都带了哈希
       而两者矛盾时同样报错。
+    - accumulate（期 3）：累积计划（AccumulatePlan 或它的 asdict）。给了、而且是按期累积的追加或替换该期时，按计划
+      出统计期、列、维度取值的差异项；配方变了也比区域外文字（outside_items，两边回执缺 OUTSIDE_KEYS 时报错），
+      见模块 docstring。
     """
     if prev is None:
         return []
@@ -292,10 +310,18 @@ def diff_reports(prev: dict[str, Any] | None, cur: dict[str, Any], *, prev_file_
     for side, doc in (("prev", prev), ("cur", cur)):
         require_receipt(doc, side, ("tables",), top=())
     p_rec, c_rec = receipt_of(prev), receipt_of(cur)
+    plan = plain(accumulate)
     items: list[DiffItem] = []
     items += _diff_period(prev, cur)
+    items += _diff_accumulate(plan, cur)
     items += _diff_rows(p_rec, c_rec)
-    if "ledger" in p_rec and not _recipe_changed(prev, cur, recipe_changed):
+    full = "ledger" in p_rec and not _recipe_changed(prev, cur, recipe_changed)
+    if not full and accumulating(plan):
+        # 按期累积的追加、替换该期：本期和此前各期进同一列，单位写在区域外时（lab.c01 的「单位：万元」），变化只
+        # 表现为区域外文字的差异（P3-SPEC 2.5，评审一-M10），accumulate_unit_risk 靠它。配方变了也照比：同一暂存区里
+        # 应用过一次修复，单位从「人次」改成「万人次」也不能没有提示（评审意见 H2）
+        items += outside_items(prev, cur)
+    if full:
         require_receipt(prev, "prev")
         require_receipt(cur, "cur")
         if recipe is None:
@@ -314,10 +340,38 @@ def diff_reports(prev: dict[str, Any] | None, cur: dict[str, Any], *, prev_file_
         items += _diff_forms(p_rec, c_rec)
         items += _diff_outside(prev, cur, p_rec, c_rec)
         items += _diff_ignored(p_rec, c_rec)
+        items += _diff_ignored_rows(p_rec, c_rec)
         items += _diff_hidden(p_rec, c_rec)
     order = {k: i for i, k in enumerate(DIFF_KINDS)}
     items.sort(key=lambda d: (not d.requires_confirm, order.get(d.kind, len(order))))
     return items
+
+
+#: 比较区域外文字要用的回执键（outside_items）
+OUTSIDE_KEYS: tuple[str, ...] = ("outside_text", "sheets")
+
+
+def accumulating(plan: Any) -> bool:
+    """累积计划是不是「本期和此前各期进同一个版本」：mode=accumulate 且 action 为追加或替换该期。first、restart、
+    replace 的结果只有本期，rejected 不提交。"""
+    plan = plain(plan)
+    return (isinstance(plan, dict) and plan.get("mode") == "accumulate"
+            and plan.get("action") in ("append", "replace_period"))
+
+
+def outside_items(prev: dict[str, Any], cur: dict[str, Any]) -> list[DiffItem]:
+    """上一期 → 本期区域外文字的差异项（outside_added / outside_removed / outside_changed / outside_moved /
+    context_source_added），与 diff_reports 逐项比较时的那几条相同。
+
+    公开出来是给按期累积用的（P3-SPEC 9.3 ConfirmContext.outside_diff）：accumulate_unit_risk 看区域外文字涉及单位
+    或口径的变化，而 diff_reports 在配方变了时不做逐项比较。diff_reports 收到追加或替换该期的累积计划时已经调用
+    这里；调用方另算 outside_diff 时也用它。两边回执都必须带 OUTSIDE_KEYS，缺了报 ReceiptIncomplete，不按空处理
+    （按空处理时单位变化就静默消失了）。
+    """
+    prev, cur = plain(prev) or {}, plain(cur) or {}
+    require_receipt(prev, "prev", OUTSIDE_KEYS, top=())
+    require_receipt(cur, "cur", OUTSIDE_KEYS, top=())
+    return _diff_outside(prev, cur, receipt_of(prev), receipt_of(cur))
 
 
 def _recipe_changed(prev: dict[str, Any], cur: dict[str, Any], flag: bool | None) -> bool:
@@ -332,9 +386,11 @@ def _recipe_changed(prev: dict[str, Any], cur: dict[str, Any], flag: bool | None
     return flag
 
 
-def _item(kind: str, label: str, detail: str = "", key: str | None = None) -> DiffItem:
+def _item(kind: str, label: str, detail: str = "", key: str | None = None, *, confirm: bool = True) -> DiffItem:
+    """confirm=False：这一类一般需确认，这一条只是信息（period_backfill 的统计期不是人工录入、ignored_rows 的
+    上一期没有记录）。"""
     prefix = CONFIRM_PREFIX.get(kind)
-    if prefix is None:
+    if prefix is None or not confirm:
         return DiffItem(kind=kind, label=label, detail=detail)
     return DiffItem(kind=kind, label=label, detail=detail, requires_confirm=True, confirm_id=f"{prefix}{key}")
 
@@ -773,4 +829,148 @@ def _diff_hidden(p_rec: dict[str, Any], c_rec: dict[str, Any]) -> list[DiffItem]
             parts.append("隐藏列：" + ("、".join(sorted(cb or ())) + " 列" if cb else "本期没有"))
         if parts:
             out.append(_item("hidden", f"工作表「{sheet}」的隐藏行列变了：" + "；".join(parts), key=sheet))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 期 3：按期累积的计划、排除的行
+# --------------------------------------------------------------------------
+
+
+def _refs(entries: Any) -> list[str]:
+    """[{"table", "column" | None}] →「表「日客流」的列「分区丙」」「表「X」」。"""
+    out = []
+    for e in entries or []:
+        if isinstance(e, dict) and e.get("table"):
+            out.append(f"表「{e['table']}」的列「{e['column']}」" if e.get("column") else f"表「{e['table']}」")
+    return out
+
+
+def _diff_accumulate(plan: Any, cur: dict[str, Any]) -> list[DiffItem]:
+    """按期累积的计划给出的差异项（P3-SPEC 2.3、2.5、9.5）。只在 mode=accumulate、action 是追加或替换该期时出：
+    first / restart / replace 的结果只有本期，这些项无从说起（restart、模式切换另有必勾的确认项）。"""
+    if not accumulating(plan):
+        return []
+    action = plan.get("action")
+    out: list[DiffItem] = []
+    period = _period_span(plan.get("period"))
+    parts = [p for p in plan.get("parts") or [] if isinstance(p, dict)]
+    if action == "append" and period is not None:
+        out.append(_item("period_added", f"按期累积：本期 {period[0]} 至 {period[1]} 加入当前版本，启用后共 {len(parts)} 期"))
+    if action == "replace_period":
+        rep = _period_span(plan.get("replaces")) or period
+        if rep is not None:
+            # 替换由必勾项 period_replace 确认，这里只是信息
+            out.append(_item("period_replaced", f"按期累积：替换已有的一期 {rep[0]} 至 {rep[1]}"))
+    for gap in plan.get("gaps") or []:
+        g = _period_span(gap)
+        if g is not None:
+            out.append(_item("period_gap", f"启用后各期之间有空缺：{g[0]} 至 {g[1]} 没有数据",
+                             "比较不同期之前，请先确认空缺的这段时间是否本来就不需要", key=f"{g[0]}~{g[1]}"))
+    if plan.get("backfill") and period is not None:
+        human = (period_of(cur) or {}).get("source") == "human"
+        if human:
+            # 人工录入时日期的年份也按统计期补全：录错年份，同一份数据会按错误的年份进来（评审一-m12）
+            out.append(_item("period_backfill", "本期统计期为人工录入，且早于已有各期：请核对年份和月份无误",
+                             f"本期 {period[0]} 至 {period[1]}，按统计期排在已有各期之前", key=f"{period[0]}~{period[1]}"))
+        else:
+            out.append(_item("period_backfill", f"本期 {period[0]} 至 {period[1]} 早于已有各期，按统计期排在最前",
+                             confirm=False))
+    added = _refs(plan.get("added"))
+    if added:
+        # 写「其他各期」不写「此前各期」：补传早期、替换中间某一期时，没有这些列的是更晚的期
+        out.append(_item("columns_added", "新增：" + "、".join(added) + "，其他各期没有这些数据，为空值"))
+    retired = _refs(plan.get("retired_new"))
+    if retired:
+        # 退役由必勾项 retire:* 确认，这里只是信息
+        out.append(_item("columns_retired", "自本期起不再导入：" + "、".join(retired) + "，早期各期保留原值"))
+    out += _labels_vary(plan, period)
+    return out
+
+
+def _labels_vary(plan: dict[str, Any], period: tuple[str, str] | None) -> list[DiffItem]:
+    """各期维度取值的差异（label_sets）里本期那一项（评审一-M2）。
+
+    label_sets 的 missing 是相对全部各期（含本期，补传早期时还含更晚的期）的并集少了哪些，extra 是比各期的交集多了
+    哪些，所以只能说「与其他各期相比」：本期没有的，其他期里至少有一期有；本期多的，其他期里至少有一期没有。不写
+    「此前各期有 / 没有」——8 月没有「7-8」、9 月有，上传 10 月（有「7-8」）时说「此前各期没有」就错了。细节里按期
+    列出其他各期各缺哪些取值，人能看出是哪几期不一样。"""
+    out: list[DiffItem] = []
+    for entry in plan.get("label_sets") or []:
+        if not isinstance(entry, dict):
+            continue
+        col = entry.get("column") or entry.get("segment") or ""
+        periods = [p for p in entry.get("periods") or [] if isinstance(p, dict)]
+        mine = next((p for p in periods if _period_span(p) == period), None)
+        if mine is None:
+            continue
+        parts = []
+        if mine.get("missing"):
+            parts.append(f"本期「{col}」没有" + "".join(f"「{short(x, 20)}」" for x in mine["missing"]))
+        if mine.get("extra"):
+            parts.append(f"本期「{col}」有" + "".join(f"「{short(x, 20)}」" for x in mine["extra"]) + "，但并非各期都有")
+        if not parts:
+            continue
+        others = []
+        for p in periods:
+            span = _period_span(p)
+            if p is mine or span is None:
+                continue
+            gone = "".join(f"「{short(x, 20)}」" for x in p.get("missing") or [])
+            others.append(f"{span[0]} 至 {span[1]} " + (f"没有{gone}" if gone else "取值齐全"))
+        detail = f"表「{entry.get('table')}」：跨期比较时各期覆盖的取值不同"
+        if others:
+            detail += "；其他各期：" + "；".join(others)
+        out.append(_item("labels_vary", "与其他各期相比，" + "；".join(parts), detail))
+    return out
+
+
+#: 按配方忽略的行（rows_excluded 的这两种原因）：锚点集合或行数和上一期不同就要确认（P3-SPEC 3.2 ⑥）
+_IGNORE_REASONS = ("ignored_rows", "ignored_outside")
+
+
+def _ignored_by_sheet(rec: dict[str, Any]) -> dict[str, tuple[set[tuple[str, str]], int, list[str]]]:
+    """工作表 → (锚点集合 {(原因, match_key)}, 行数, 锚点原文)。"""
+    out: dict[str, tuple[set[tuple[str, str]], int, list[str]]] = {}
+    for e in rec.get("rows_excluded") or []:
+        e = plain(e)
+        if not isinstance(e, dict) or e.get("reason") not in _IGNORE_REASONS:
+            continue
+        keys, n, raws = out.setdefault(str(e.get("sheet") or ""), (set(), 0, []))
+        anchor = str(e.get("anchor") or "")
+        keys.add((str(e["reason"]), match_key(anchor)))
+        if anchor and anchor not in raws:
+            raws.append(anchor)
+        rows = sum(int(b) - int(a) + 1 for a, b in e.get("rows") or [])
+        out[str(e.get("sheet") or "")] = (keys, n + rows, raws)
+    return out
+
+
+def _excluded_total(rec: dict[str, Any]) -> int:
+    return sum(int(b) - int(a) + 1 for e in (plain(x) for x in rec.get("rows_excluded") or [])
+               if isinstance(e, dict) for a, b in e.get("rows") or [])
+
+
+def _diff_ignored_rows(p_rec: dict[str, Any], c_rec: dict[str, Any]) -> list[DiffItem]:
+    """按配方忽略的行（ignore_rows、ignore_outside）和上一期不同：需确认 diff:ignored_rows:<工作表>。
+
+    上一期回执里没有 rows_excluded（期 3 之前的导入）时不当作空列表比：那样本期一有排除的行就成了「新增」，
+    而上一期其实只是没记录。改出 info「上一期未记录排除的行，本期排除了 N 行」（本期没有排除的行就不出）。"""
+    if "rows_excluded" not in p_rec:
+        n = _excluded_total(c_rec)
+        if n <= 0:
+            return []
+        return [_item("ignored_rows", f"上一期未记录排除的行，本期排除了 {n} 行", "排除的行逐项列在本期回执里",
+                      confirm=False)]
+    a, b = _ignored_by_sheet(p_rec), _ignored_by_sheet(c_rec)
+    out = []
+    for sheet in dict.fromkeys([*b, *a]):
+        ka, na, ra = a.get(sheet, (set(), 0, []))
+        kb, nb, rb = b.get(sheet, (set(), 0, []))
+        if ka == kb and na == nb:
+            continue
+        now = "".join(f"「{short(x, 20)}」" for x in rb) or "无"
+        before = "".join(f"「{short(x, 20)}」" for x in ra) or "无"
+        out.append(_item("ignored_rows", f"工作表「{sheet}」按配方忽略的行变了：本期 {nb} 行（锚点{now}）",
+                         f"上一期 {na} 行（锚点{before}）", key=sheet))
     return out

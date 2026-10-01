@@ -4,10 +4,11 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import { Database, Inbox, Plus, Trash2, RefreshCw } from 'lucide-react'
 import {
-  DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Kbd, Modal, OfflineBanner, PageHeader,
+  DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Kbd, Modal, Notice, OfflineBanner, PageHeader,
   SectionBar, Skeleton, StatusBadge, StatusPill, Tabs, TabPanel, ToastHost, confirmDialog, deferDelete,
   promptDialog, toast, useRadioGroup, withoutDeferred,
 } from '../components/ui'
+import { ReceiptSummary } from '../pages/import/ReceiptBlocks'
 import { ApiError, api, streamCopilot } from '../api/client'
 import { useCatalog, useDatasources, useOnReconnect } from '../store/catalog'
 import { STATUS } from '../lib/status'
@@ -32,7 +33,7 @@ import evidenceVerdict from '../run/__tests__/evidence-verdict.json'
 import { EvidenceGuessView } from '../run/EvidenceGuess'
 import { IssuanceBanner } from '../run/AssistantStream'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
-import type { EvidenceDocData, EvidenceGraph } from '../types'
+import type { EvidenceDocData, EvidenceGraph, TrialReceipt } from '../types'
 import '../index.css'
 
 /**
@@ -224,6 +225,44 @@ function longDoc(doc: EvidenceDocData, times: number): EvidenceDocData {
   return { ...doc, blocks, stats: undefined, violations: undefined, markdown: undefined }
 }
 const EV_LONG = longDoc(EV_DOC, 16)
+
+/** 回执块的样例（合成的假数据）：三种排除原因里有一种是界面不认识的，要写「其他原因」，不露枚举值 */
+const DEMO_RECEIPT: TrialReceipt = {
+  ledger: [{ sheet: '客流汇总', nonempty_scan: 771, nonempty_read: 771, roles: { value: 771 }, unclaimed: 0 }],
+  tables: [{ name: '日客流', sheet: '客流汇总', kind: 'data', columns: [], grain: ['日期'], rows: 30 }],
+  placeholders: { '·': 30 },
+  canonicalized_total: 17,
+  outside_text: [{ sheet: '客流汇总', cell: '客流汇总!B3', text: '客流汇总表', kind: 'text' }],
+  rows_excluded: [
+    { sheet: '客流汇总', reason: 'ignored_rows', rows: [[32, 32]], cells: 3, anchor: '补录（人次）', block: '交叉表' },
+    { sheet: '客流汇总', reason: 'total_not_kept', rows: [[28, 30]], cells: 93, block: '交叉表' },
+    { sheet: '客流汇总', reason: 'mystery_reason', rows: [[40, 41]], cells: 2 },
+  ],
+}
+
+/** 期 3 的共用件：提示条 Notice（从导入向导挪进 ui.tsx）、回执块（向导回执和版本页清单视图共用） */
+function NoticeKitDemo() {
+  const [focused, setFocused] = useState('')
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-2" id="notice-demo">
+        <Notice tone="info" attr={{ 'data-demo-notice': 'info' }}>已应用修复，请重新试运行</Notice>
+        <Notice tone="warn" attr={{ 'data-demo-notice': 'warn' }}>服务端的同版本数据文件曾被改动，已用本次上传的文件恢复</Notice>
+        <Notice tone="err" attr={{ 'data-demo-notice': 'err' }} className="mt-1">
+          导入失败：当前版本未受影响
+          <div className="text-2xs text-dim" id="notice-detail">细节写在第二行</div>
+        </Notice>
+      </div>
+      <div className="border-t pt-3" id="receipt-demo">
+        <ReceiptSummary receipt={DEMO_RECEIPT} onFocus={setFocused} />
+        <div className="mt-1 text-2xs text-faint">定位到：<span id="receipt-focus" className="mono">{focused}</span></div>
+      </div>
+      <div className="border-t pt-3" id="receipt-unrecorded">
+        <ReceiptSummary receipt={{ tables: DEMO_RECEIPT.tables }} />
+      </div>
+    </div>
+  )
+}
 
 /**
  * 可点击证据的演示：宽栏（侧边面板 / 窄屏时底部抽屉）、360px 窄栏（栏内展开）、旧契约的
@@ -648,6 +687,10 @@ function Harness() {
 
           <Block title="管理页共用件">
             <ManageKitDemo />
+          </Block>
+
+          <Block title="提示条 Notice · 回执块">
+            <NoticeKitDemo />
           </Block>
 
           <Block title="可点击证据 EvidenceDoc（单独看：?evidence=1）">

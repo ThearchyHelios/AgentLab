@@ -38,6 +38,7 @@ from app.data.recipe_parsers import (
     hour_range_total,
     looks_numeric_text,
     match_key,
+    month_day_or_date,
     split_unit_suffix,
     text_label,
 )
@@ -56,6 +57,7 @@ from app.data.recipe_types import (
     Recipe,
     RecipeProblem,
     SumEq,
+    accumulate_blockers,
     derive_tables,
     prose_problems,
 )
@@ -267,6 +269,8 @@ _FIELD_LABEL = {
     "blank_rows": "空行的处理", "total_row": "合计行", "label_column": "合计标签所在的列",
     "merged_data": "合并单元格的处理", "grain": "主键", "units": "单位", "note": "说明", "total": "合计列",
     "parts": "组成列", "claims": "认领", "a": "一方", "b": "另一方", "reason": "理由",
+    "ignore_rows": "按行标签忽略的行", "ignore_columns": "按表头忽略的列", "ignore_outside": "按同一行文字忽略的数字",
+    "label": "标签", "anchor": "同一行的文字",
 }
 
 
@@ -388,16 +392,45 @@ class _Writer:
     origin: str = ""
 
 
+def _measures_segments(r: Recipe) -> list[MeasuresSegment]:
+    return [s for sheet in r.sheets for b in sheet.blocks if isinstance(b, CrosstabBlock)
+            for s in b.segments if isinstance(s, MeasuresSegment)]
+
+
+def _find_measures(segs: list[MeasuresSegment], seg_id: Any, labels: list[str]) -> MeasuresSegment | None:
+    """按 id 找；找不到时按标签找唯一含这些标签的分段。"""
+    hit = next((s for s in segs if s.id == seg_id), None)
+    if hit is not None:
+        return hit
+    keys = {match_key(x) for x in labels}
+    found = [s for s in segs if keys <= {match_key(x) for x in s.labels.expect}]
+    return found[0] if len(found) == 1 else None
+
+
+def _most_labels(segs: list[MeasuresSegment], labels: list[str]) -> MeasuresSegment | None:
+    """过半标签命中的分段，命中最多且唯一时取它（事实里有标签已被去掉、按全部标签认不出时用）。"""
+    keys = {match_key(x) for x in labels}
+    if not keys:
+        return None
+    scored = [(len(keys & {match_key(x) for x in s.labels.expect}), s) for s in segs]
+    best = max((n for n, _s in scored), default=0)
+    top = [s for n, s in scored if n == best]
+    return top[0] if best * 2 > len(keys) and len(top) == 1 else None
+
+
 def _fact_brief(fact: Fact) -> str:
     # 「第 5 行 = 第 6 行 + 第 7 行（31 列中 31 列成立）」→ 去掉末尾的成立情况，只留关系本身
     return re.sub(r"（[^（）]*）\s*$", "", fact.text).strip() or fact.id
 
 
 class _Checker:
-    def __init__(self, recipe: Recipe, facts: DraftFacts | None, origin: str):
+    def __init__(self, recipe: Recipe, facts: DraftFacts | None, origin: str, base: Recipe | None = None):
         self.r = recipe
         self.facts = facts
         self.origin = origin
+        #: 现行配方（上传新一期、修改配方时），3.3 的「沿用已确认的常量」和「认领只查改动过的部分」用。
+        #: 首次导入、从简单导入切换时为 None，照期 2 全查
+        self.base = base
         self.data = recipe.model_dump(mode="json")
         self.problems: list[RecipeProblem] = []
         self._seen: set[tuple[str, str]] = set()
@@ -492,17 +525,23 @@ class _Checker:
         self.check_units()
         self.check_grain()
         self.check_list_refs()
+        self.check_ignores()
         self.check_relations()
         if self.facts is not None:
             self.check_facts()
         self.check_notes()
         return self.problems
 
-    # ---- 7. 格式版本 ----
+    # ---- 7. 格式版本、导入模式 ----
 
     def check_mode(self) -> None:
-        if self.r.mode == "accumulate":
-            self.add(("mode",), "mode_unsupported", "导入模式「按期累积」将在后续版本提供，目前只支持每期替换")
+        # 期 3：按期累积按资格判（契约 accumulate_blockers，起草器、累积计划共用同一份）；mode_unsupported 不再产生
+        if self.r.mode != "accumulate":
+            return
+        for p in accumulate_blockers(self.r):
+            if (p.path, p.code) not in self._seen:
+                self._seen.add((p.path, p.code))
+                self.problems.append(p)
 
     # ---- 8. 工作表、块、分段的键唯一 ----
 
@@ -792,10 +831,32 @@ class _Checker:
                 elif not title:
                     self.add(cp, "const_not_candidate",
                              f"常量「{name}」只能从分段标题里选词，但这个分段没有按分段标题定位")
-                elif c.pick not in cands:
+                elif c.pick not in cands and not self.const_carried(seg.id, name, c.pick, title):
                     self.add(cp, "const_not_candidate",
                              f"常量「{name}」的取值「{c.pick}」不在分段标题「{title}」的候选词中，"
                              f"可选：{'、'.join(cands) if cands else '（无）'}")
+
+    def const_carried(self, seg_id: str, name: str, pick: str, title: str) -> bool:
+        """3.3 的 (b)(c)：不在新标题的候选词里，但仍可以沿用。两条都要求 canon(pick) 是 canon(新标题) 的子串。
+
+        (b) 沿用：现行配方里同一分段（同 id）同一常量列的 pick 与它逐字相同。pick 当初是从确认过的标题的候选词里
+            选的，现在仍然逐字出现在新标题里，常量列的值不变，不是新编的文字（D09「日间分时段客流」沿用「日间」）；
+        (c) 重放：修复后的配方下个月按 replay 校验、又没有 base，执行时 const_missing 本来就只查子串。
+        不放宽的话 D09 只能改 pick，常量列整列换值，是破坏性变更，累积模式下还要重新开始累积。"""
+        if canon(pick) not in canon(title):
+            return False
+        if self.origin == "replay":
+            return True
+        if self.base is None:
+            return False
+        for sheet in self.base.sheets:
+            for block in sheet.blocks:
+                if not isinstance(block, CrosstabBlock):
+                    continue
+                for seg in block.segments:
+                    if isinstance(seg, DimensionSegment) and seg.id == seg_id and name in seg.const:
+                        return seg.const[name].pick == pick
+        return False
 
     # ---- 3. 占位符只能映射空值，不能像数 ----
 
@@ -945,6 +1006,78 @@ class _Checker:
                              f"表头「{c.header}」与「{seen[key]}」是同一个表头")
                 seen.setdefault(key, c.header)
 
+    # ---- 期 3：忽略规则、表头上方的标题（P3-SPEC 9.2） ----
+
+    def check_ignores(self) -> None:
+        """忽略规则的三条：ignore_conflict（同一行、同一列既导入又忽略；交叉表忽略的表头是日期）、ignore_duplicate
+        （同一列表里写了两遍），以及 period_literal 的扩展范围。
+
+        period_literal 只在 origin 不是 replay 时报：期 2 已有的配方按重放校验时不受影响；人改配方、用修复按钮或
+        框选时才拦。锚点文字含数字（「注：9月补录」「2026年8月 销售月报」）时，这条规则写进配方以后下一期必然
+        对不上，也违背「配方里不写统计期的值」的原则（评审一-M11、二-m11）。"""
+        literal = self.origin != "replay"
+        for si, sheet in enumerate(self.r.sheets):
+            sp = ("sheets", si)
+            self.unique_anchors(sp + ("ignore_outside",), [x.anchor for x in sheet.ignore_outside], "anchor")
+            if literal:
+                for n, x in enumerate(sheet.ignore_outside):
+                    if any(ch.isdigit() for ch in x.anchor):
+                        self.add(sp + ("ignore_outside", n, "anchor"), "period_literal",
+                                 f"按同一行文字忽略数字时用的「{x.anchor}」含数字，下一期很可能对不上"
+                                 "（配方里不能写死年份或期次）")
+            for bi, block in enumerate(sheet.blocks):
+                bp = sp + ("blocks", bi)
+                self.unique_anchors(bp + ("ignore_columns",), [x.header for x in block.ignore_columns], "header")
+                if literal:
+                    for n, x in enumerate(block.ignore_columns):
+                        if any(ch.isdigit() for ch in x.header):
+                            self.add(bp + ("ignore_columns", n, "header"), "period_literal",
+                                     f"按表头忽略的列「{x.header}」含数字，下一期很可能对不上（配方里不能写死年份或期次）")
+                if isinstance(block, CrosstabBlock):
+                    self.unique_anchors(bp + ("ignore_rows",), [x.label for x in block.ignore_rows], "label")
+                    for n, x in enumerate(block.ignore_rows):
+                        xp = bp + ("ignore_rows", n, "label")
+                        if literal and any(ch.isdigit() for ch in x.label):
+                            self.add(xp, "period_literal",
+                                     f"按行标签忽略的「{x.label}」含数字，下一期很可能对不上（配方里不能写死年份或期次）")
+                        owner = self.expecting(block, x.label)
+                        if owner is not None:
+                            self.add(xp, "ignore_conflict",
+                                     f"按行标签忽略的「{x.label}」同时是分段「{owner}」期望的标签：同一行不能既导入又忽略")
+                    for n, x in enumerate(block.ignore_columns):
+                        if month_day_or_date(x.header) is not None:
+                            self.add(bp + ("ignore_columns", n, "header"), "ignore_conflict",
+                                     f"按表头忽略的列「{x.header}」是一个日期：交叉表只能忽略日期表头右侧的列")
+                    continue
+                if literal and block.after_title and any(ch.isdigit() for ch in block.after_title):
+                    self.add(bp + ("after_title",), "period_literal",
+                             f"表头上方的标题「{block.after_title}」含数字，下一期很可能对不上：配方里不能写死年份或期次，"
+                             "请换一行不含数字的文字，或去掉它")
+                heads = {match_key(c.header): c.header for c in block.columns}
+                for n, x in enumerate(block.ignore_columns):
+                    hit = heads.get(match_key(x.header))
+                    if hit is not None:
+                        self.add(bp + ("ignore_columns", n, "header"), "ignore_conflict",
+                                 f"按表头忽略的列「{x.header}」与要导入的列「{hit}」是同一个表头：同一列不能既导入又忽略")
+
+    def unique_anchors(self, parts: tuple[Any, ...], texts: list[str], field: str) -> None:
+        seen: dict[str, str] = {}
+        for n, t in enumerate(texts):
+            k = match_key(t)
+            if k in seen:
+                self.add(parts + (n, field), "ignore_duplicate", f"「{t}」与「{seen[k]}」是同一段文字，写了两遍")
+            seen.setdefault(k, t)
+
+    def expecting(self, block: CrosstabBlock, label: str) -> str | None:
+        """块里期望这个标签的分段 id（按 match_key，或按该段的解析方式得到同一个规范写法）；没有为 None。"""
+        key = match_key(label)
+        for seg in block.segments:
+            own = self.label_key(seg, label)
+            for e in seg.labels.expect:
+                if match_key(e) == key or (own is not None and self.label_key(seg, e) == own):
+                    return seg.id
+        return None
+
     # ---- 9. 关系 ----
 
     def check_relations(self) -> None:
@@ -998,40 +1131,117 @@ class _Checker:
     def check_facts(self) -> None:
         assert self.facts is not None
         facts = {f.id: f for f in self.facts.facts}
+        scope = self.changed_scope()
+        # scope 为 None：首次导入、从简单导入切换，照期 2 全查。否则只查改动过的关系、成员落在改动过的
+        # measures 段上的关系，以及落在改动过的 measures 段上的事实（3.3 第 11 条，评审一-M3）
+        rels = set(range(len(self.r.relations))) if scope is None else self.relations_in(scope)
         claimers: dict[str, list[int]] = {}
         for i, rel in enumerate(self.r.relations):
             if rel.claims is None:
                 continue
             if rel.claims not in facts:
-                self.add(("relations", i, "claims"), "fact_claim_mismatch",
-                         f"认领的系统发现「{rel.claims}」不存在：请去掉认领，或按本次发现重新登记")
+                if i in rels:
+                    self.add(("relations", i, "claims"), "fact_claim_mismatch",
+                             f"认领的系统发现「{rel.claims}」不存在：请去掉认领，或按本次发现重新登记")
                 continue
             claimers.setdefault(rel.claims, []).append(i)
         for fid, fact in facts.items():
             got = claimers.get(fid, [])
-            if not got:
+            in_scope = scope is None or self.fact_in(fact, scope)
+            if not got and in_scope:
                 self.add(("relations",), "fact_unclaimed",
                          f"系统发现的关系「{_fact_brief(fact)}」没有被认领：请登记为每期核对，或说明不登记的理由",
                          where=False)
             for j in got[1:]:
-                self.add(("relations", j, "claims"), "fact_claimed_twice",
-                         f"系统发现的关系「{_fact_brief(fact)}」已经由关系「{self.r.relations[got[0]].id}」认领，"
-                         "每条只能认领一次")
+                if in_scope or j in rels:
+                    self.add(("relations", j, "claims"), "fact_claimed_twice",
+                             f"系统发现的关系「{_fact_brief(fact)}」已经由关系「{self.r.relations[got[0]].id}」认领，"
+                             "每条只能认领一次")
             for j in got:
+                if j not in rels:
+                    continue
                 why = self.claim_mismatch(self.r.relations[j], fact)
                 if why:
                     self.add(("relations", j, "claims"), "fact_claim_mismatch",
                              f"认领了系统发现的关系「{_fact_brief(fact)}」，但{why}")
 
+    def changed_scope(self) -> tuple[set[str], set[str]] | None:
+        """与现行配方（base）相比改动过的 (measures 分段 id, 关系 id)；base 为空时 None（全查）。
+
+        measures 段：同 id 的段 labels.expect 集合、measures 映射、locate 任一不同，或者是新段。
+        关系：同 id 的关系任一字段不同，或者是新关系。
+        理由：用过修复按钮以后工作配方的哈希变了，静态校验改成带本期系统发现。本期 R1 有某天不成立时 _sum_holds
+        不出 sum_eq 事实，没改过的 R1 就会报「认领的系统发现不存在」，D4「每期写理由接受」变成永久的配方改动。
+        没改过的部分按重放处理：R1 本期成不成立交给试运行的 R 核对（数据质量类，可以写理由接受）。"""
+        if self.base is None:
+            return None
+
+        def measures(r: Recipe) -> dict[str, MeasuresSegment]:
+            return {s.id: s for s in _measures_segments(r)}
+
+        old = measures(self.base)
+        segs: set[str] = set()
+        for sid, seg in measures(self.r).items():
+            o = old.get(sid)
+            if (o is None or set(o.labels.expect) != set(seg.labels.expect) or o.measures != seg.measures
+                    or o.locate != seg.locate):
+                segs.add(sid)
+        old_rels = {r.id: r.model_dump(mode="json") for r in self.base.relations}
+        rels = {r.id for r in self.r.relations if old_rels.get(r.id) != r.model_dump(mode="json")}
+        return segs, rels
+
+    def relations_in(self, scope: tuple[set[str], set[str]]) -> set[int]:
+        """要查认领的关系下标：改动过的，以及成员（表 + 列）落在改动过的 measures 段写入的列上的。"""
+        segs, rels = scope
+        cols = {(s.table, c) for *_rest, s in self.segs if isinstance(s, MeasuresSegment) and s.id in segs
+                for c in s.measures.values()}
+        out: set[int] = set()
+        for i, rel in enumerate(self.r.relations):
+            if rel.id in rels:
+                out.add(i)
+            elif isinstance(rel, SumEq):
+                if any((rel.table, c) in cols for c in (rel.total, *rel.parts)):
+                    out.add(i)
+            elif isinstance(rel, NotComparable):
+                if (rel.a.table, rel.a.value) in cols or (rel.b.table, rel.b.value) in cols:
+                    out.add(i)
+        return out
+
+    def fact_in(self, fact: Fact, scope: tuple[set[str], set[str]]) -> bool:
+        """事实是否落在改动过的 measures 段上。
+
+        先在工作配方里按 id、按全部标签认段（measures_seg）。认不出时多半是这一段刚被改过：① 去掉了「分区乙」，
+        本期的事实「全日客流 = 分区甲 + 分区乙」还在，分段 id 又是规则起草的写法（remap_facts 要全部标签对上才
+        换 id），按 id、按全部标签都认不出。只到这一步就判「不在范围内」的话，这条事实连同认领它的关系被删掉以后，
+        既不报未认领、也没有理由，数据质量核对不声不响地消失（3.3 第 11 条要查的正是这种改动）。所以再按两步认：
+        1. 在现行配方（base）里按 id、按全部标签认段：认出的段在工作配方里改动过或已删掉，就在范围内；
+        2. 在工作配方里按「过半标签命中」认段（命中最多且唯一）。
+        两步都只会把事实多算进范围（多查一条认领），不会漏查。"""
+        d = fact.detail or {}
+        if fact.kind == "sum_eq":
+            total, parts = d.get("total"), d.get("parts")
+            labels = [total, *parts] if isinstance(total, str) and isinstance(parts, list) else []
+            seg_id = d.get("segment")
+        else:
+            b = d.get("b")
+            labels, seg_id = ([b] if isinstance(b, str) else []), d.get("b_segment")
+        labels = [x for x in labels if isinstance(x, str)]
+        seg = self.measures_seg(seg_id, labels)
+        if seg is not None:
+            return seg.id in scope[0]
+        if self.base is not None:
+            old = _find_measures(_measures_segments(self.base), seg_id, labels)
+            if old is not None:
+                return old.id in scope[0] or old.id not in {s.id for s in self.measures_list()}
+        seg = _most_labels(self.measures_list(), labels)
+        return seg is not None and seg.id in scope[0]
+
+    def measures_list(self) -> list[MeasuresSegment]:
+        return [s for *_rest, s in self.segs if isinstance(s, MeasuresSegment)]
+
     def measures_seg(self, seg_id: Any, labels: list[str]) -> MeasuresSegment | None:
         """Fact 指向的 measures 分段：按 id 找；改过分段名找不到时，按标签找唯一含这些标签的分段。"""
-        segs = [s for *_rest, s in self.segs if isinstance(s, MeasuresSegment)]
-        hit = next((s for s in segs if s.id == seg_id), None)
-        if hit is not None:
-            return hit
-        keys = {match_key(x) for x in labels}
-        found = [s for s in segs if keys <= {match_key(x) for x in s.labels.expect}]
-        return found[0] if len(found) == 1 else None
+        return _find_measures(self.measures_list(), seg_id, labels)
 
     def dimension_segs(self, seg_ids: list[str], near: MeasuresSegment | None) -> list[DimensionSegment]:
         """not_equal_sum 的 a 指向的 dimension 分段：按 id 找；有改过名找不到的，取与 b 那个 measures 段同块的全部 dimension 段。
@@ -1128,11 +1338,14 @@ def validate_recipe(
     data: dict[str, Any] | Recipe, *,
     facts: DraftFacts | None = None,
     origin: Origin = "manual",
+    base: Recipe | dict[str, Any] | None = None,
 ) -> tuple[Recipe | None, list[RecipeProblem]]:
     """静态校验，不抛异常。schema 不过时返回 (None, problems)；语义问题返回 (recipe, problems)。
 
     facts 给了（首次导入、改配方）才查认领；重放（origin="replay"）不传。origin="ai" 时 note 必须为空。
-    problems 为空才可试运行。
+    base（期 3）是现行配方（数据源当前的 current_recipe_id 对应的那份，canonical 或完整形式都行），上传新一期、
+    修改配方时传：常量沿用现行配方里逐字相同的 pick 时放行（3.3 (b)），认领只查改动过的部分（3.3 第 11 条）。
+    base 本身不合 schema 时按没给处理（它是已提交过的配方，正常不会出现）。problems 为空才可试运行。
     """
     if isinstance(data, Recipe):
         recipe = data
@@ -1141,4 +1354,12 @@ def validate_recipe(
             recipe = parse_recipe(data)
         except RecipeInvalid as exc:
             return None, exc.problems
-    return recipe, _Checker(recipe, facts, origin).run()
+    base_recipe: Recipe | None = None
+    if isinstance(base, Recipe):
+        base_recipe = base
+    elif isinstance(base, dict):
+        try:
+            base_recipe = Recipe.model_validate(base)
+        except ValidationError:
+            base_recipe = None
+    return recipe, _Checker(recipe, facts, origin, base_recipe).run()

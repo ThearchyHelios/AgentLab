@@ -297,10 +297,28 @@ def test_year_in_list_header_is_not_an_error():
 # ==========================================================================
 
 
-def test_accumulate_mode_unsupported():
+def test_accumulate_mode_follows_eligibility():
+    """期 3 改写（P3-SPEC 2.2）：按期累积不再一律报 mode_unsupported，改按资格判（契约 accumulate_blockers）。"""
     r = flow()
     r["mode"] = "accumulate"
-    only(r, "mode_unsupported", "/mode")
+    assert run(r) == []                      # 参考配方符合资格：交叉表、有统计期、covers_context、grain 含日期
+    # 去掉统计期：accumulate_needs_period（同时断言 covers_context、补年份都要求统计期，照期 2 报）
+    r2 = flow()
+    r2["mode"] = "accumulate"
+    r2["sheets"][0]["context"] = []
+    codes = [p.code for p in run(r2)]
+    assert "accumulate_needs_period" in codes and "mode_unsupported" not in codes
+    # 列表写入的表：accumulate_unkeyed，path 指向那张表
+    lr = list_recipe()
+    lr["mode"] = "accumulate"
+    lr["sheets"][0]["context"] = [{}]
+    probs = run(lr, facts=None)
+    assert [(p.code, p.path) for p in probs] == [("accumulate_unkeyed", "/tables/0"),
+                                                ("accumulate_unkeyed", "/tables/1")]
+    assert "列表形态的表目前只支持每期替换" in probs[0].message
+    # 同一份配方每期替换时不报
+    lr["mode"] = "replace"
+    assert run(lr, facts=None) == []
 
 
 # ==========================================================================

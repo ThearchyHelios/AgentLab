@@ -278,18 +278,26 @@ async def test_upload_still_refuses_to_take_over_other_sources(client, tmp_path)
     assert "请换一个名称" in resp.json()["detail"]
 
 
-async def test_publish_failure_is_reported_without_moving_the_pointer(client):
+async def test_reupload_over_a_tampered_build_file_restores_it(client, store):
+    """重传同一文件、服务端的构建文件被改成 0 字节（期 1 这里回 500）：用这次上传恢复，原文件挪进隔离区。
+
+    响应里的 build_restored 字段由 WP-5 加，那条断言在 test_p3_api_errors.py；这里只看状态码、隔离区和指针。
+    """
     name, raw = unique(), xlsx(V1)
     first = (await upload(client, name, raw)).json()
     async with SessionLocal() as session:
         snap = await session.get(SourceSnapshot, first["snapshot_id"])
-        path = Path(snap.db_path)
+        path, registered = Path(snap.db_path), snap.db_sha256
     os.chmod(path, 0o644)
     path.write_bytes(b"")
     resp = await upload(client, name, raw)
-    assert resp.status_code == 500
-    assert "不一致" in resp.json()["detail"]
-    assert (await by_name(name)).current_snapshot_id == first["snapshot_id"]
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    row = await by_name(name)
+    assert row.current_snapshot_id == body["snapshot_id"] != first["snapshot_id"]
+    assert raw_store.sha256_file(path) == registered
+    moved = sorted(p for p in (store / "uploads" / "quarantine" / row.id).rglob("*.db"))
+    assert len(moved) == 1 and moved[0].stat().st_size == 0
 
 
 # --------------------------------------------------------------------------

@@ -602,8 +602,14 @@ export interface DialogOptions {
   initial?: string
   /** promptDialog 的输入框标签 */
   label?: string
-  /** promptDialog：返回错误文字则不让提交 */
+  /** promptDialog：返回错误文字则不让提交。allowEmpty 时空输入不经过它 */
   validate?: (value: string) => string | null | undefined
+  /**
+   * promptDialog：允许不填，空输入（含只有空白）也能确认，返回空字符串。默认关：多数输入框（名称、必填的理由）
+   * 空着提交没有意义，照旧报「不能为空」。用于可选的理由这类「填了更好、不填也成立」的输入，否则调用方只能
+   * 退回不带输入框的 confirmDialog，想写的人也没处写
+   */
+  allowEmpty?: boolean
 }
 
 interface DialogRequest {
@@ -654,7 +660,7 @@ export function confirmDialog(opts: DialogOptions): Promise<boolean> {
   return enqueue<boolean>('confirm', opts)
 }
 
-/** 输入对话框，替代 window.prompt。取消返回 null，确定返回去掉首尾空白的文字 */
+/** 输入对话框，替代 window.prompt。取消返回 null，确定返回去掉首尾空白的文字（allowEmpty 时可能是空字符串） */
 export function promptDialog(opts: DialogOptions): Promise<string | null> {
   if (!dialogHosts.length) {
     const v = window.prompt(plainText(opts), opts.initial ?? '')
@@ -700,7 +706,7 @@ function DialogView({ req }: { req: DialogRequest }) {
 
   const trimmed = value.trim()
   const invalid = kind === 'prompt'
-    ? (!trimmed ? '不能为空' : opts.validate?.(trimmed) || null)
+    ? (!trimmed ? (opts.allowEmpty ? null : '不能为空') : opts.validate?.(trimmed) || null)
     : null
   const textOk = opts.requireText == null || value === opts.requireText
   const canConfirm = kind === 'prompt' ? !invalid && textOk : textOk
@@ -923,6 +929,30 @@ export function ErrorState({ error, onRetry, compact = false, className }: {
 /** 同 ErrorState compact：对话轮次、运行流里轮次级的报错 */
 export function ErrorNotice(props: { error: unknown; onRetry?: () => void; className?: string }) {
   return <ErrorState {...props} compact />
+}
+
+export type NoticeTone = 'warn' | 'err' | 'info'
+
+/**
+ * 页面里的提示条：一句结论加可选的细节（children），按语气配色和图标。info 是 status（读屏礼貌播报），
+ * warn / err 是 alert。attr 原样挂到根节点上，给检查脚本定位（data-wizard-notice 之类）。
+ *
+ * 原来是导入向导的局部组件，期 3 的修复面板、累积计划和版本页都要用，挪到这里共用，不各造一份
+ */
+export function Notice({ tone, children, attr, className }: {
+  tone: NoticeTone; children: ReactNode; attr?: Record<string, string>; className?: string
+}) {
+  const color = tone === 'err' ? 'var(--err)' : tone === 'warn' ? 'var(--warn)' : 'var(--accent)'
+  return (
+    <div role={tone === 'info' ? 'status' : 'alert'} data-notice={tone} {...attr}
+         className={clsx('flex gap-2 rounded-lg border px-3 py-2 text-xs leading-relaxed', className)}
+         style={{ borderColor: `color-mix(in srgb, ${color} 40%, var(--border))`, background: `color-mix(in srgb, ${color} 7%, transparent)` }}>
+      {tone === 'info'
+        ? <Info size={13} className="mt-0.5 shrink-0" style={{ color }} aria-hidden />
+        : <AlertTriangle size={13} className="mt-0.5 shrink-0" style={{ color }} aria-hidden />}
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  )
 }
 
 /**

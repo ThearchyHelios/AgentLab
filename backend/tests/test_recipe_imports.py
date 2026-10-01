@@ -130,8 +130,9 @@ def make_trial_db(path: str, rows: int, tag: str) -> None:
 
 
 def fake_pipeline(state: FakeState) -> Pipeline:
-    def validate(data, *, facts=None, origin="manual"):
-        state.calls["validate"].append({"origin": origin, "facts": facts})
+    def validate(data, *, facts=None, origin="manual", **kw):
+        # 期 3：现行配方作为 base 传进来（只在有现行配方时传，P3-SPEC 12.0）
+        state.calls["validate"].append({"origin": origin, "facts": facts, **kw})
         try:
             parsed = Recipe.model_validate(data)
         except Exception:  # noqa: BLE001
@@ -238,10 +239,11 @@ def fake_pipeline(state: FakeState) -> Pipeline:
         usage = [AiUsage("假模型", 120, 80, 0.0012, True, "2026-10-01T00:00:00+00:00", 1)]
         return AiDraftResult(d, usage, 1, None, compressed.chars, compressed.sha256)
 
-    def diff_reports(prev, cur, *, prev_file_name, cur_file_name, recipe=None, recipe_changed=None):
+    def diff_reports(prev, cur, *, prev_file_name, cur_file_name, recipe=None, recipe_changed=None, **kw):
+        # 期 3：按期累积时多一个 accumulate=（只在有累积计划时传，P3-SPEC 12.0）
         state.calls["diff_reports"].append({"prev": prev, "cur": cur, "prev_file_name": prev_file_name,
                                             "cur_file_name": cur_file_name, "recipe": recipe,
-                                            "recipe_changed": recipe_changed})
+                                            "recipe_changed": recipe_changed, **kw})
         return copy.deepcopy(state.diff)
 
     def confirm_items(ctx):
@@ -460,7 +462,7 @@ async def test_stage_first_does_not_create_the_source_and_keeps_the_raw(client, 
     assert st["grids"][0]["cells"] and st["units"] == ["人次", "元"]
     assert st["candidates"] == FACTS.candidates
     assert [q["id"] for q in st["questions"]] == [q.id for q in QUESTIONS]
-    assert st["marks"] == [{"sheet": "甲表", "role": "value", "ref": "A2:B3"}]
+    assert st["marks"] == [{"sheet": "甲表", "role": "value", "ref": "A2:B3", "block": None}]
     assert st["expires_at"] and st["file"]["sha256_prefix"]
     assert await get(DataSource, st["source"]["id"]) is None
     row = await get(ImportStaging, st["id"])
@@ -485,12 +487,14 @@ async def test_answers_replay_from_base_and_reset_by_put(client, fake):
     assert b["recipe"] == FLOW_FULL and b["answers"] == {"q_relation:F1": {"value": "register", "reason": None}}
     # 每次回答前按工作配方取系统发现
     assert fake.calls["detect_facts"][-1] == FLOW_FULL
-    # PUT 之后回答清空、起点换掉
+    # PUT 之后起点换掉。期 3（第 8 节遗留项 2）：新起点仍体现「登记」这个回答（R1 已在配方里），回答保留、
+    # answers_dropped 为空，不再一律清空
     changed = copy.deepcopy(FLOW_FULL)
     changed["tables"][0]["note"] = "口径说明"
     resp = await client.put(f"/api/datasources/imports/{sid}/recipe", json={"recipe": changed})
     put = resp.json()
-    assert put["answers"] == {} and put["recipe"]["tables"][0]["note"] == "口径说明"
+    assert put["answers"] == {"q_relation:F1": {"value": "register", "reason": None}}
+    assert put["answers_dropped"] == [] and put["recipe"]["tables"][0]["note"] == "口径说明"
     assert put["recipe_origin"] == "manual"
     row = await get(ImportStaging, sid)
     assert row.answers_base["tables"][0]["note"] == "口径说明"

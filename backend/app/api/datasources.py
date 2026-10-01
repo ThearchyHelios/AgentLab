@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
 from app.api.coded import CodedHTTPException
+from app.api.runs import actor_of
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
@@ -174,28 +175,40 @@ def _is_upload(row: DataSource) -> bool:
 
 
 async def _snapshot_infos(session: AsyncSession, rows: list[DataSource]) -> dict[str, dict[str, Any]]:
-    """各上传源当前版本的摘要：{源 id: {id, created_at, file_name, raw_state}}。两次查询取齐，不逐个查。"""
+    """各上传源当前版本的摘要：{源 id: {id, created_at, file_name, raw_state, mode, periods, period_start,
+    period_end, activated_at}}。两次查询取齐，不逐个查。
+
+    文件名、原件状态取最近的那一期（按统计期排在最后的）；期 3 按期累积时一个快照有多期，卡片另写模式、期数、
+    统计期范围。activated_at 是最近一次成为当前版本的时刻：回滚之后卡片写「…启用」，不再写快照当初的导入时间
+    （期 3 之前的快照没有这一列，按 created_at）。"""
     wanted = {r.current_snapshot_id: r.id for r in rows if _is_upload(r) and r.current_snapshot_id}
     if not wanted:
         return {}
     snaps = list((await session.execute(
         select(SourceSnapshot).where(SourceSnapshot.id.in_(list(wanted)))
     )).scalars())
-    # 期 1 一个快照只有一期导入；以后按期累积时，显示最近的那一期
-    last_import = {s.id: str(s.imports[-1]) for s in snaps if s.imports}
+    members = {str(x) for s in snaps for x in s.imports or []}
     imports = {
         i.id: i for i in (await session.execute(
-            select(TableImport).where(TableImport.id.in_(list(last_import.values())))
+            select(TableImport).where(TableImport.id.in_(list(members)))
         )).scalars()
-    } if last_import else {}
+    } if members else {}
     out: dict[str, dict[str, Any]] = {}
     for snap in snaps:
-        imp = imports.get(last_import.get(snap.id, ""))
+        mine = [imports[str(x)] for x in snap.imports or [] if str(x) in imports]
+        imp = mine[-1] if mine else None
+        starts = [i.period_start for i in mine if i.period_start]
+        ends = [i.period_end for i in mine if i.period_end]
         out[snap.source_id] = {
             "id": snap.id,
             "created_at": snap.created_at.isoformat() if snap.created_at else None,
             "file_name": imp.file_name if imp else "",
             "raw_state": imp.raw_state if imp else "absent",
+            "mode": snap.mode or ("replace" if imp is not None and imp.recipe_id else None),
+            "periods": len(snap.imports or []),
+            "period_start": min(starts) if starts else None,
+            "period_end": max(ends) if ends else None,
+            "activated_at": _iso(snap.activated_at or snap.created_at),
         }
     return out
 
@@ -475,15 +488,24 @@ async def update_source(
 @router.delete("/{source_id}", status_code=204)
 async def delete_source(source_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await _get_or_404(session, source_id)
-    # 上传源的导入记录置 retired 留作审计；库文件和原件交给回收，被运行引用的版本会保留
-    await table_versions.retire_source(session, source_id)
+    # 上传源的导入记录置 retired 留作审计；库文件和原件交给回收，被运行引用的版本会保留。只读进程（没拿到
+    # 版本存储的守卫）不删上传源：retire_source 要删隔离文件、放弃暂存区（第 8 节遗留项 5）。
+    # 手工登记的源没有导入记录、配方、暂存区和隔离文件，根本不碰版本存储：不调 retire_source，只读进程里也照常
+    # 删除（9.1 只要求上传源回 503，评审意见）；删完也没有文件可回收
+    upload = _is_upload(row)
+    if upload:
+        try:
+            await table_versions.retire_source(session, source_id)
+        except table_versions.StoreUnavailable as e:
+            raise CodedHTTPException(503, str(e), "store_unavailable") from e
     await session.delete(row)
     await session.commit()
     await engines.invalidate(source_id)
-    try:
-        await table_versions.gc(session)
-    except Exception:  # noqa: BLE001 - 回收失败不影响删除，重启或下次上传时再收
-        logger.exception("删除数据源后的回收失败")
+    if upload:
+        try:
+            await table_versions.gc(session)
+        except Exception:  # noqa: BLE001 - 回收失败不影响删除，重启或下次上传时再收
+            logger.exception("删除数据源后的回收失败")
 
 
 #: 测连接最多等多久。内网库防火墙丢包时驱动默认要等一分钟，弹窗里干转一分钟
@@ -926,6 +948,11 @@ async def upload_table(
         raise HTTPException(400, str(e)) from e
     except table_versions.PublishError as e:
         logger.error("上传表格「%s」发布失败：%s", name, e)
+        if e.code == "store_unavailable":
+            raise CodedHTTPException(503, str(e), "store_unavailable") from e
+        if e.code == "build_conflict":
+            # 服务端已有的同版本文件被改过、这次上传也恢复不了：重试也会失败，要管理员处理（第 8 节遗留项 1）
+            raise CodedHTTPException(409, str(e), "build_conflict") from e
         raise HTTPException(500, str(e)) from e
 
     await session.refresh(row)
@@ -936,6 +963,8 @@ async def upload_table(
         "import_id": result.import_id,
         "snapshot_id": result.snapshot_id,
         "build_reused": result.build_reused,
+        # 服务端的同版本数据文件曾被改动，已用本次上传的文件恢复（原文件挪进了隔离区）
+        "build_restored": result.build_restored,
         "skipped_sheets": report.get("skipped_sheets") or [],
         "conversions": report.get("conversions") or [],
         "warnings": report.get("warnings") or [],
@@ -943,76 +972,72 @@ async def upload_table(
     }
 
 
-def _import_out(imp: TableImport, current: set[str]) -> dict[str, Any]:
-    return {
-        "id": imp.id, "seq": imp.seq, "build_id": imp.build_id,
-        "file_name": imp.file_name, "file_size": imp.file_size, "raw_sha256": imp.raw_sha256,
-        "raw_state": imp.raw_state, "status": imp.status, "purged": imp.purged,
-        "current": imp.id in current,
-        "created_at": imp.created_at.isoformat() if imp.created_at else None,
-        "activated_at": imp.activated_at.isoformat() if imp.activated_at else None,
-        # 按配方导入才有（简单导入为空）：配方、统计期、署名，接受的条数
-        "recipe_id": imp.recipe_id, "period_start": imp.period_start, "period_end": imp.period_end,
-        "signed_by": imp.signed_by, "overrides": len(imp.overrides or []), "waivers": len(imp.waivers or []),
-    }
-
-
-async def _current_imports(session: AsyncSession, row: DataSource) -> set[str]:
-    if not row.current_snapshot_id:
-        return set()
-    snap = await session.get(SourceSnapshot, row.current_snapshot_id)
-    return {str(x) for x in (snap.imports or [])} if snap else set()
-
-
 @router.get("/{source_id}/imports")
 async def list_imports(source_id: str, session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    """上传表格的导入记录，新的在前。手工登记的源没有导入记录，返回空列表。"""
+    """上传表格的导入记录，新的在前。手工登记的源没有导入记录，返回空列表。
+
+    期 3（P3-SPEC 7.6）补了接受明细、作废记录、导入清单、配方第几版、各表行数、作废接受的预案（revoke_plan），
+    以及同一份原件在别处的引用（raw_shared_with、raw_open_stagings）：清除对话框在提交前就要列出来。"""
+    from app.data import source_versions
+
     row = await _get_or_404(session, source_id)
-    rows = (await session.execute(
+    rows = list((await session.execute(
         select(TableImport).where(TableImport.source_id == source_id).order_by(TableImport.seq.desc())
-    )).scalars()
-    current = await _current_imports(session, row)
-    return [_import_out(i, current) for i in rows]
+    )).scalars())
+    return await source_versions.import_records(session, row, rows)
 
 
-class PurgeRawIn(BaseModel):
-    reason: str = Field(min_length=1, max_length=500, description="为什么清除这份原件")
-    signed_by: str | None = Field(
-        default=None, max_length=100,
-        description="署名（未认证）：自填的名字，系统不核实身份，只原样记进清除记录",
-    )
+#: 清除原件的理由、署名的字数上限
+_PURGE_REASON_MAX = 500
+_SIGNED_MAX = 100
 
 
 @router.post("/{source_id}/imports/{import_id}/purge-raw")
 async def purge_raw(
-    source_id: str, import_id: str, payload: PurgeRawIn, session: AsyncSession = Depends(get_session)
+    source_id: str, import_id: str, request: Request, x_actor: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     """清除一次导入的原件。导入记录、哈希和库都保留，原件文件删掉，记下时间、署名和理由。
 
     按内容清除：同一份内容可能被别的导入共用（同一个文件传过两次、传给过两个源），清除的
     目的是让这份内容从服务器上消失，所以文件照删，那些导入一并标成已清除，回执的
     also_purged 逐条列出（期 3 的界面要把它展示出来，不能静默带过）。
+
+    期 3：请求体手工读成 dict（评审二-m8：原来用 pydantic，空理由由 FastAPI 自动回 422，响应体不是 {detail, code}），
+    错误一律带机读码。confirm 键收但不强求（7.7：期 1、期 2 的调用方不带它）；带了而不是 true 时拒绝。
     """
+    from app.data import source_versions
+
+    body = await _json_body(request)
     row = await _get_or_404(session, source_id)
     imp = await session.get(TableImport, import_id)
     if imp is None or imp.source_id != source_id:
-        raise HTTPException(404, "导入记录不存在")
-    reason = payload.reason.strip()
+        raise CodedHTTPException(404, "导入记录不存在", "import_not_found")
+    if "confirm" in body and body.get("confirm") is not True:
+        raise CodedHTTPException(422, "请在确认框中确认后再清除原件", "confirm_required")
+    raw_reason = body.get("reason")
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
     if not reason:
-        raise HTTPException(422, "请填写清除原件的理由")
+        raise CodedHTTPException(422, "请填写清除原件的理由", "reason_required")
+    if len(reason) > _PURGE_REASON_MAX:
+        raise CodedHTTPException(422, f"理由不能超过 {_PURGE_REASON_MAX} 字", "reason_required")
+    signed = body.get("signed_by")
+    signed_by = signed.strip()[:_SIGNED_MAX] if isinstance(signed, str) and signed.strip() else actor_of(x_actor)
     if imp.raw_state == "absent":
-        raise HTTPException(409, "这次导入没有保存原件")
+        raise CodedHTTPException(409, "这次导入没有保存原件", "raw_absent")
     if imp.raw_state == "purged":
-        raise HTTPException(409, "这次导入的原件已经清除")
-    purged = await table_versions.purge_import_raw(
-        session, imp, reason=reason, signed_by=payload.signed_by)
+        raise CodedHTTPException(409, "这次导入的原件已经清除", "raw_already_purged")
+    try:
+        purged = await table_versions.purge_import_raw(session, imp, reason=reason, signed_by=signed_by)
+    except table_versions.StoreUnavailable as e:
+        raise CodedHTTPException(503, str(e), "store_unavailable") from e
     deleted, others = purged.deleted, purged.others
-    current = await _current_imports(session, row)
     names = dict((await session.execute(
         select(DataSource.id, DataSource.name).where(DataSource.id.in_({o.source_id for o in others}))
     )).all()) if others else {}
+    [record] = await source_versions.import_records(session, row, [imp])
     return {
-        "import": _import_out(imp, current),
+        "import": record,
         "file_deleted": deleted,
         "also_purged": [
             {"id": o.id, "source_id": o.source_id, "source_name": names.get(o.source_id),
@@ -1022,3 +1047,17 @@ async def purge_raw(
         # 引用同一份原件、随之一并放弃的未完成导入（暂存区，已清空）
         "discarded_stagings": [st.id for st in purged.discarded_stagings],
     }
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    """JSON 请求体手工读成 dict（空 body 当作 {}）；不是 JSON 对象回 422 body_invalid（不触发 FastAPI 自带的 422）。"""
+    raw = await request.body()
+    if not raw.strip():
+        return {}
+    try:
+        data = await request.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise CodedHTTPException(422, "请求体必须是一个 JSON 对象", "body_invalid")
+    return data

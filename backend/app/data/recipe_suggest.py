@@ -23,6 +23,7 @@ validate）和执行器干跑（注入的 dry_run），再由人逐条确认之�
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as _dt
 import inspect
 import itertools
@@ -54,8 +55,12 @@ from app.data.recipe_types import (
     MeasuresSegment,
     Problem,
     Question,
+    NotComparable,
     Recipe,
     RecipeProblem,
+    SumEq,
+    accumulate_blockers,
+    derive_tables,
 )
 from app.data.tabular import DATE_HEADER_MIN, EXCEL_ERRORS
 from app.data.xlsx_scan import WorkbookScan, cell_ref, col_letter, parse_ref
@@ -1133,9 +1138,6 @@ def _analyze(scan: WorkbookScan, grids: dict[str, Grid]) -> _Analysis:
         seg_ids.add(out)
         return out
 
-    def new_table(want: str, n_fallback: int) -> str:
-        return _unique(to_sql_name(want, fallback=f"表{n_fallback}") if want else f"表{n_fallback}", tables_used)
-
     sheet_dicts: list[dict[str, Any]] = []
     candidates: dict[str, list[str]] = {}
     crosstabs = 0
@@ -1215,42 +1217,13 @@ def _analyze(scan: WorkbookScan, grids: dict[str, Grid]) -> _Analysis:
         if sh.lists is not None:
             for b in sh.lists.blocks:
                 lists_n += 1
-                b.id = f"列表{lists_n}"
-                block_ids.add(b.id)
-                title = b.title if b.title and not any(ch.isdigit() for ch in b.title) else None
-                want = _ENUM_PREFIX.sub("", P.split_unit_suffix(title)[0]) if title else sh.sheet
-                b.table = new_table(want, len(tables_used) + 1)
-                used_cols: set[str] = set()
-                cols_out: list[dict[str, Any]] = []
-                for i, c in enumerate(b.cols):
-                    col, unit, _raw = _measure_column(b.headers[c], i + 1)
-                    col = _unique(col, used_cols)
-                    b.names[c] = col
-                    if unit:
-                        b.units[col] = unit
-                    cols_out.append({"header": b.headers[c][:80], "name": col, "type": b.types[c]})
-                total = None
-                if b.total_row is not None:
-                    keep = f"{b.table}_表内合计"
-                    if collide_key(keep) not in tables_used:
-                        tables_used.add(collide_key(keep))
-                        num_units = {n: u for c, n in b.names.items() if (u := b.units.get(n))
-                                     and b.types[c] in ("INTEGER", "REAL")}
-                        table(keep, ["合计项"], num_units, kind="reported_total", parent=b.table)
-                    b.keep_table = keep
-                    total = {"label_column": b.names[b.cols[0]], "pick": b.total_word, "keep_as": keep}
-                grain = [b.names[b.grain_col]] if b.grain_col is not None else []
-                table(b.table, grain, dict(b.units))
-                fill = bool(b.merged_fill) and all(r2 > r1 and c1 == c2 and b.types.get(c1) == "TEXT"
-                                                    for (r1, c1, r2, c2) in b.merged_fill)
-                blocks.append({
-                    "id": b.id, "layout": "list", "table": b.table, "header_rows": len(b.header_rows),
-                    "after_title": None, "columns": cols_out, "extra_columns": "reject",
-                    "rows": {"blank_rows": "skip" if b.skip_blank else "stop", "total_row": total},
-                    "values": {"placeholders": [{"text": e[0], "meaning": "无数据"} for e in b.placeholders.values()],
-                               "blank": "null", "text_number": "reject", "formula": "accept_cached"},
-                    "merged_data": "fill" if fill else "reject",
-                })
+                block_ids.add(f"列表{lists_n}")
+                block, main, total_spec = list_block(sh.sheet, b, block_id=f"列表{lists_n}", tables_used=tables_used)
+                table(main["name"], main["grain"], main["units"])
+                if total_spec is not None:
+                    table(total_spec["name"], total_spec["grain"], total_spec["units"], kind="reported_total",
+                          parent=main["name"])
+                blocks.append(block)
         if not blocks:
             continue
         context: list[dict[str, Any]] = []
@@ -1279,6 +1252,60 @@ def _analyze(scan: WorkbookScan, grids: dict[str, Grid]) -> _Analysis:
         recipe = {"recipe_format": RECIPE_FORMAT, "mode": "replace", "other_visible_sheets": "confirm",
                   "sheets": sheet_dicts, "tables": ordered, "relations": _relations_for(facts, sheets)}
     return _Analysis(sheets, hidden, facts, recipe, failures)
+
+
+def list_block(sheet: str, b: _ListPlan, *, block_id: str, tables_used: set[str],
+               table: str | None = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    """列表计划 → (块, 主表的表定义, 合计表的表定义或 None)。起草和框选（recipe_select 的 as=list）共用这一个函数
+    （P3-SPEC 4.2、评审二-m12）：列名、单位、类型、grain、合计行、blank_rows、占位符、合并单元格填充都由这里按
+    计划推出，框选只决定表头行和列范围。各写一套的话，走了框选就会丢掉占位符、合并填充、跳过空行这些设置，
+    框选得到的规则也不再与起草器相同（4.6 第 1 条要求同一份文件框选后配方哈希不变）。
+
+    tables_used 是已用表名的 collide_key 集合，原地更新（与起草器的去重同一口径）。table 给了时用它作表名
+    （框选沿用被替换的块的表名、或客户端给的、已经过名字校验的表名），不再从标题推。
+    合计表名撞了已用的名字时照起草器的老行为：不另建表定义，keep_as 仍写这个名字（交给静态校验报）。"""
+    b.id = block_id
+    if table is None:
+        title = b.title if b.title and not any(ch.isdigit() for ch in b.title) else None
+        want = _ENUM_PREFIX.sub("", P.split_unit_suffix(title)[0]) if title else sheet
+        n_fallback = len(tables_used) + 1
+        b.table = _unique(to_sql_name(want, fallback=f"表{n_fallback}") if want else f"表{n_fallback}", tables_used)
+    else:
+        b.table = table
+        tables_used.add(collide_key(table))
+    used_cols: set[str] = set()
+    cols_out: list[dict[str, Any]] = []
+    for i, c in enumerate(b.cols):
+        col, unit, _raw = _measure_column(b.headers[c], i + 1)
+        col = _unique(col, used_cols)
+        b.names[c] = col
+        if unit:
+            b.units[col] = unit
+        cols_out.append({"header": b.headers[c][:80], "name": col, "type": b.types[c]})
+    total = None
+    total_spec: dict[str, Any] | None = None
+    if b.total_row is not None:
+        keep = f"{b.table}_表内合计"
+        if collide_key(keep) not in tables_used:
+            tables_used.add(collide_key(keep))
+            num_units = {n: u for c, n in b.names.items() if (u := b.units.get(n))
+                         and b.types[c] in ("INTEGER", "REAL")}
+            total_spec = {"name": keep, "grain": ["合计项"], "kind": "reported_total", "units": num_units, "note": ""}
+        b.keep_table = keep
+        total = {"label_column": b.names[b.cols[0]], "pick": b.total_word, "keep_as": keep}
+    grain = [b.names[b.grain_col]] if b.grain_col is not None else []
+    main = {"name": b.table, "grain": grain, "kind": "data", "units": dict(b.units), "note": ""}
+    fill = bool(b.merged_fill) and all(r2 > r1 and c1 == c2 and b.types.get(c1) == "TEXT"
+                                        for (r1, c1, r2, c2) in b.merged_fill)
+    block = {
+        "id": b.id, "layout": "list", "table": b.table, "header_rows": len(b.header_rows),
+        "after_title": None, "columns": cols_out, "extra_columns": "reject",
+        "rows": {"blank_rows": "skip" if b.skip_blank else "stop", "total_row": total},
+        "values": {"placeholders": [{"text": e[0], "meaning": "无数据"} for e in b.placeholders.values()],
+                   "blank": "null", "text_number": "reject", "formula": "accept_cached"},
+        "merged_data": "fill" if fill else "reject",
+    }
+    return block, main, total_spec
 
 
 def _prefer_prefix(period: list[tuple[int, int, str]]) -> str | None:
@@ -1535,6 +1562,14 @@ def remap_facts(facts: DraftFacts, recipe: dict[str, Any], *, visible: list[str]
 # ==========================================================================
 
 
+def _eligible(recipe: dict[str, Any]) -> bool:
+    """这份配方符合按期累积的资格（契约 accumulate_blockers 为空）。pydantic 不收时不符合。"""
+    try:
+        return not accumulate_blockers(Recipe.model_validate(recipe))
+    except ValidationError:
+        return False
+
+
 def _full_form(recipe: dict[str, Any]) -> dict[str, Any]:
     """补全默认值的完整形式：问题的 effects 按它写路径，父对象都在。pydantic 不收时原样返回（交给静态校验报）。"""
     try:
@@ -1559,6 +1594,9 @@ def draft(scan: WorkbookScan, grids: dict[str, Grid], filename: str, *,
     failures = [f.human for f in an.failures]
     for_model = [f.model for f in an.failures]
     recipe = _full_form(an.recipe) if an.recipe is not None else None
+    if recipe is not None and _eligible(recipe):
+        # D14 = A：按统计期出的报表默认按期累积，其他默认替换（P3-SPEC 2.2）；首次导入时由人经 q_mode 和确认项确认
+        recipe["mode"] = "accumulate"
     extraction: Extraction | None = None
     if recipe is None and not failures:
         failures.append("没有找到有内容的可见工作表")
@@ -1995,7 +2033,7 @@ def questions_for(recipe: dict[str, Any], facts: DraftFacts, grids: dict[str, Gr
     try:
         parsed = Recipe.model_validate(recipe)
     except ValidationError:
-        return [_mode_card()], []
+        return [_mode_card(None)], []
     relations = recipe.get("relations") if isinstance(recipe.get("relations"), list) else []
     claims = {r.claims: i for i, r in enumerate(parsed.relations) if r.claims}
     next_rid = [max([int(r.id[1:]) for r in parsed.relations] + [0])]
@@ -2092,7 +2130,11 @@ def questions_for(recipe: dict[str, Any], facts: DraftFacts, grids: dict[str, Gr
     if ext is not None and ext.sheets.skipped_hidden:
         for nm in _dedupe([item.get("sheet", "") for item in ext.sheets.skipped_hidden]):
             cards.append(_hidden_sheet_card(nm))
-    cards.append(_mode_card())
+    blockers = accumulate_blockers(parsed)
+    cards.append(_mode_card(blockers))
+    if not blockers:
+        # q_mode 固定排在问题列表最后：期 2 的测试和性能用例取 questions[0]，不能被它顶掉（评审二-B2）
+        questions.append(_mode_question())
     return cards, questions
 
 
@@ -2103,9 +2145,39 @@ def _qid(base: str, block_id: str, used: set[str]) -> str:
     return qid
 
 
-def _mode_card() -> Card:
-    return Card("mode", "导入模式：每期替换",
-                "每次上传新一期时，整份替换上一期的数据（按期累积将在后续版本提供）")
+#: 导入模式两种取值的后果（P3-SPEC 2.2，评审三-m4）：卡片的理由里写，确认项 mode 的 detail（WP-3）和界面
+#: q_mode 选项下方的说明（WP-6）也是这两句
+MODE_CONSEQUENCE = {
+    "accumulate": "每期以统计期为键加入当前版本；统计期与已有各期部分重叠的文件会被拒收，同一统计期再传要确认替换",
+    "replace": "每次上传新一期，当前版本只含新的一期，此前各期留在历史版本中",
+}
+
+
+def _mode_question() -> Question:
+    """q_mode：符合按期累积资格时才问。effects 作用在 answers_base（完整形式，/mode 总在）上；用 add 是为了
+    answers_base 不合 schema、原样保存时也能应用（add 到已有键等于替换，RFC 6902）。没有默认选中：没回答时，
+    草稿里的取值生效（起草器在符合资格时已写 accumulate）。"""
+    return Question("q_mode", "这份报表每期怎么更新",
+                    [{"value": "accumulate", "label": "按期累积（建议）", "needs_reason": False},
+                     {"value": "replace", "label": "每期替换", "needs_reason": False}],
+                    None,
+                    {"accumulate": [{"op": "add", "path": "/mode", "value": "accumulate"}],
+                     "replace": [{"op": "add", "path": "/mode", "value": "replace"}]})
+
+
+def _mode_card(blockers: list[RecipeProblem] | None) -> Card:
+    """导入模式卡片。blockers 为空（符合资格）时建议按期累积并指向 q_mode；不符合时写第一条原因；
+    None 表示配方还没过 schema，判断不了。"""
+    if blockers is not None and not blockers:
+        return Card("mode", "导入模式：按期累积（建议）",
+                    "这是按统计期出的报表：每期以统计期为键累积，跨期可以比较；也可以选每期替换。"
+                    f"按期累积：{MODE_CONSEQUENCE['accumulate']}。每期替换：{MODE_CONSEQUENCE['replace']}",
+                    question="q_mode")
+    if blockers is None:
+        reason = "配方还不完整，暂时无法判断能否按期累积"
+    else:
+        reason = blockers[0].message
+    return Card("mode", "导入模式：每期替换", f"{reason}。每期替换：{MODE_CONSEQUENCE['replace']}")
 
 
 def _period_cells(grid: Grid | None, name: str, region: set[tuple[int, int]],
@@ -2472,3 +2544,358 @@ def _list_cards(si: int, bi: int, sheet: Any, block: ListBlock, loc: _ListLoc | 
         cells = _coords(name, [(loc.total_row, loc.cols[0])]) if loc is not None and loc.total_row else []
         cards.append(Card(f"total_row:{block.id}", f"{where}是合计行，改作核对", reason, cells))
     return cards, questions
+
+
+# ==========================================================================
+# 期 3：按规则重新起草，并把名字对齐到现行配方（P3-SPEC 6.3）
+# ==========================================================================
+
+#: 表配对的门槛：来源签名的 Jaccard 相似度至少这么多
+ALIGN_MIN_JACCARD = 0.5
+
+
+def _table_signatures(recipe: Recipe) -> dict[str, set[tuple[str, str]]]:
+    """表 → 来源签名：写入它的 measures 标签、dimension 标题与标签、合计分段的标签、列表表头的 match_key 集合。
+
+    带上来源的种类（指标、维度标题、维度标签、合计、列表、列表合计）：列表的合计表和主表表头相同，不分种类的话
+    两张表的签名一样，会并列最大、谁也配不上。"""
+    out: dict[str, set[tuple[str, str]]] = {}
+    for sheet in recipe.sheets:
+        for block in sheet.blocks:
+            if isinstance(block, ListBlock):
+                out.setdefault(block.table, set()).update(("list", P.match_key(c.header)) for c in block.columns)
+                total = block.rows.total_row
+                if total is not None and total.keep_as:
+                    out.setdefault(total.keep_as, set()).update(
+                        ("list_total", P.match_key(c.header)) for c in block.columns if c.type in ("INTEGER", "REAL"))
+                continue
+            for seg in block.segments:
+                if isinstance(seg, MeasuresSegment):
+                    out.setdefault(seg.table, set()).update(("measure", P.match_key(x)) for x in seg.labels.expect)
+                elif isinstance(seg, DimensionSegment):
+                    sig = out.setdefault(seg.table, set())
+                    if seg.locate.title:
+                        sig.add(("dim_title", P.match_key(seg.locate.title)))
+                    sig.update(("dim_label", _dim_key(seg.dim.parser, x)) for x in seg.labels.expect)
+                elif isinstance(seg, DerivedSegment) and seg.keep_as is not None:
+                    out.setdefault(seg.keep_as.table, set()).update(
+                        ("derived", (h.canonical if (h := P.hour_range_total(x)) else canon(x))) for x in seg.labels.expect)
+    return out
+
+
+def _pair_tables(cand: Recipe, cur: Recipe, report: list[str]) -> dict[str, str]:
+    """起草的表 → 现行的表，一对一（评审一-m13）：Jaccard ≥ 0.5，按相似度从高到低贪心配对，一张现行表只配一次；
+    同一张起草的表有两个并列最大的候选，或者两张起草的表对同一张现行表并列最大，都不配对，记进 report。"""
+    cs, ks = _table_signatures(cand), _table_signatures(cur)
+    scored: list[tuple[float, str, str]] = []
+    for c, a in cs.items():
+        for k, b in ks.items():
+            if a or b:
+                j = len(a & b) / len(a | b)
+                if j >= ALIGN_MIN_JACCARD:
+                    scored.append((j, c, k))
+    out: dict[str, str] = {}
+    used_c: set[str] = set()
+    used_k: set[str] = set()
+    for score in sorted({s for s, _c, _k in scored}, reverse=True):
+        level = [(c, k) for s, c, k in scored if s == score and c not in used_c and k not in used_k]
+        n_c: dict[str, int] = {}
+        n_k: dict[str, int] = {}
+        for c, k in level:
+            n_c[c] = n_c.get(c, 0) + 1
+            n_k[k] = n_k.get(k, 0) + 1
+        tied_c = {c for c, n in n_c.items() if n > 1}
+        tied_k = {k for k, n in n_k.items() if n > 1}
+        for c, k in level:
+            if c in tied_c or k in tied_k:
+                continue
+            out[c] = k
+        for c in sorted(tied_c):
+            report.append(f"表「{c}」与现行配方里的几张表同样相似，无法确定对应哪一张，保留起草器给的名字")
+        for k in sorted(tied_k - {out.get(c) for c in tied_c}):
+            report.append(f"起草的几张表都同样像现行的表「{k}」，无法确定哪一张对应它，保留起草器给的名字")
+        used_c |= set(out) | tied_c
+        used_k |= set(out.values()) | tied_k
+    return out
+
+
+def align_to_contract(candidate: dict[str, Any], current: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """把按规则重新起草的配方的名字对齐到现行配方（P3-SPEC 6.3）。规则封闭，只从现行配方里抄名字：
+
+    | 对象 | 怎么配对 | 对上以后 |
+    | 表 | 来源签名的 Jaccard ≥ 0.5，一对一贪心，并列不配 | 改成现行的表名，并改掉一切引用 |
+    | measures 列、列表列 | 按标签、表头的 match_key | 改成现行的列名 |
+    | measures 段 | 同一张表上标签重合最多的段 | 抄 id |
+    | dimension 段 | 按标题，或按标签集合 | 抄 id、dim.name、value、常量列名（pick 仍要能沿用，3.3）、派生列名 |
+    | derived 段 | 跟着前一段 | 同上（另存表的合计项列、派生列、值列） |
+    | 关系 | 按 kind 和改名后的成员 | 抄 id 和 claims |
+    另外沿用现行配方的导入模式、日期列名、工作表 id 和块 id：重新起草只是换一套定位规则，不该悄悄改掉这些。
+
+    对不上的保留起草器给的名字，记进 report（人话）。返回 (对齐后的配方（完整形式）, report)。不改入参。
+    任何一份不合 schema 时原样返回候选和一句说明。理由：重新起草时大多数「破坏性变更」只是名字不同（起草器把宽表
+    叫「客流汇总_按日」，现行叫「日客流」），按来源对齐能消掉这类假警报，剩下的才是真变化（final.md R11、3.3）。"""
+    try:
+        cand_m = Recipe.model_validate(candidate)
+        cur_m = Recipe.model_validate(current)
+    except ValidationError:
+        return copy.deepcopy(candidate), ["配方的格式有问题，名字没有对齐"]
+    report: list[str] = []
+    cand = cand_m.model_dump(mode="json")
+    tmap = _pair_tables(cand_m, cur_m, report)
+    for t in derive_tables(cand_m)[0]:
+        if t not in tmap:
+            report.append(f"表「{t}」没有在现行配方里找到对应的表")
+    cmap: dict[str, dict[str, str]] = {}           # 起草的表名 → {起草的列名: 现行的列名}
+    smap: dict[str, str] = {}                      # 起草的分段 id → 现行的分段 id
+    bmap: dict[tuple[int, int], str] = {}          # 起草的块位置 → 现行的块 id
+    picks: dict[str, dict[str, str]] = {}          # 起草的分段 id → {现行的常量列名: pick}
+
+    def col(t: str, old: str, new: str) -> None:
+        if old and new and old != new:
+            cmap.setdefault(t, {})[old] = new
+
+    cur_segs = [(sheet, block, seg) for sheet in cur_m.sheets for block in sheet.blocks
+                if isinstance(block, CrosstabBlock) for seg in block.segments]
+    cur_lists = [(sheet, block) for sheet in cur_m.sheets for block in sheet.blocks if isinstance(block, ListBlock)]
+    cur_cross = [(sheet, block) for sheet in cur_m.sheets for block in sheet.blocks if isinstance(block, CrosstabBlock)]
+    sheet_ids: dict[int, str] = {}
+    for si, sheet in enumerate(cand_m.sheets):
+        same = [s for s in cur_m.sheets if P.match_key(s.match.name) == P.match_key(sheet.match.name)]
+        if len(same) == 1:
+            sheet_ids[si] = same[0].id
+        elif len(cand_m.sheets) == 1 and len(cur_m.sheets) == 1:
+            sheet_ids[si] = cur_m.sheets[0].id
+        for bi, block in enumerate(sheet.blocks):
+            if isinstance(block, ListBlock):
+                target = tmap.get(block.table)
+                hit = next((b for _s, b in cur_lists if b.table == target), None)
+                if hit is None:
+                    continue
+                bmap[(si, bi)] = hit.id
+                by_key = {P.match_key(c.header): c.name for c in hit.columns}
+                for c in block.columns:
+                    new = by_key.get(P.match_key(c.header))
+                    if new:
+                        col(block.table, c.name, new)
+                        if block.rows.total_row is not None and block.rows.total_row.keep_as:
+                            col(block.rows.total_row.keep_as, c.name, new)
+                continue
+            cross = [b for s, b in cur_cross if P.match_key(s.match.name) == P.match_key(sheet.match.name)]
+            if not cross and len(cur_cross) == 1:
+                cross = [cur_cross[0][1]]
+            if len(cross) == 1:
+                bmap[(si, bi)] = cross[0].id
+                if cross[0].axis.name != block.axis.name:
+                    for seg in block.segments:
+                        for t in (getattr(seg, "table", None), seg.keep_as.table if isinstance(seg, DerivedSegment)
+                                  and seg.keep_as else None):
+                            if t:
+                                col(t, block.axis.name, cross[0].axis.name)
+            for seg in block.segments:
+                if isinstance(seg, MeasuresSegment):
+                    pool = [s for _sh, _b, s in cur_segs if isinstance(s, MeasuresSegment) and s.table == tmap.get(seg.table)]
+                    keys = {P.match_key(x): x for x in seg.labels.expect}
+                    best = max(pool, key=lambda s: len(keys.keys() & {P.match_key(x) for x in s.labels.expect}),
+                               default=None)
+                    if best is None or not keys.keys() & {P.match_key(x) for x in best.labels.expect}:
+                        continue
+                    smap[seg.id] = best.id
+                    theirs = {P.match_key(x): best.measures.get(x) for x in best.labels.expect}
+                    for k, raw in keys.items():
+                        if theirs.get(k):
+                            col(seg.table, seg.measures[raw], theirs[k])  # type: ignore[arg-type]
+                elif isinstance(seg, DimensionSegment):
+                    pool = [s for _sh, _b, s in cur_segs if isinstance(s, DimensionSegment)]
+                    title = P.match_key(seg.locate.title) if seg.locate.title else None
+                    hit = next((s for s in pool if title and s.locate.title and P.match_key(s.locate.title) == title), None)
+                    if hit is None:
+                        mine = {_dim_key(seg.dim.parser, x) for x in seg.labels.expect}
+                        same_set = [s for s in pool if {_dim_key(s.dim.parser, x) for x in s.labels.expect} == mine]
+                        hit = same_set[0] if len(same_set) == 1 else None
+                    if hit is None:
+                        report.append(f"分段「{seg.id}」没有在现行配方里找到对应的分段")
+                        continue
+                    smap[seg.id] = hit.id
+                    col(seg.table, seg.dim.name, hit.dim.name)
+                    col(seg.table, seg.value, hit.value)
+                    roles = {v: k for k, v in hit.dim.derive.items()}
+                    for name, role in seg.dim.derive.items():
+                        col(seg.table, name, roles.get(role, name))
+                    if len(seg.const) == 1 and len(hit.const) == 1:
+                        (mine_c, mine_v), (their_c, their_v) = next(iter(seg.const.items())), next(iter(hit.const.items()))
+                        col(seg.table, mine_c, their_c)
+                        # pick 仍要满足 3.3：现行的 pick 仍是新标题的子串才沿用，否则用起草器从新标题里选的词
+                        keep = their_v.pick if seg.locate.title and canon(their_v.pick) in canon(seg.locate.title) \
+                            else mine_v.pick
+                        picks[seg.id] = {their_c: keep}
+            for seg in block.segments:
+                if not isinstance(seg, DerivedSegment):
+                    continue
+                base = smap.get(seg.locate.segment or "")
+                hit = next((s for _sh, _b, s in cur_segs if isinstance(s, DerivedSegment)
+                            and s.locate.segment == base), None) if base else None
+                if hit is None:
+                    report.append(f"合计分段「{seg.id}」没有在现行配方里找到对应的分段")
+                    continue
+                smap[seg.id] = hit.id
+                if seg.keep_as is not None and hit.keep_as is not None:
+                    t = seg.keep_as.table
+                    col(t, seg.keep_as.dim, hit.keep_as.dim)
+                    col(t, seg.keep_as.value, hit.keep_as.value)
+                    roles = {v: k for k, v in hit.keep_as.derive.items()}
+                    for name, role in seg.keep_as.derive.items():
+                        col(t, name, roles.get(role, name))
+
+    def T(name: Any) -> Any:
+        return tmap.get(name, name)
+
+    def C(table: Any, name: Any) -> Any:
+        return cmap.get(table, {}).get(name, name)
+
+    cand["mode"] = cur_m.mode
+    for si, sheet in enumerate(cand["sheets"]):
+        if si in sheet_ids:
+            sheet["id"] = sheet_ids[si]
+        for bi, block in enumerate(sheet["blocks"]):
+            if (si, bi) in bmap:
+                block["id"] = bmap[(si, bi)]
+            if block["layout"] == "list":
+                old = block["table"]
+                block["table"] = T(old)
+                for c in block["columns"]:
+                    c["name"] = C(old, c["name"])
+                total = block["rows"].get("total_row")
+                if total:
+                    total["label_column"] = C(old, total["label_column"])
+                    total["keep_as"] = T(total["keep_as"]) if total.get("keep_as") else total.get("keep_as")
+                continue
+            for seg in block["segments"]:
+                old_id = seg["id"]
+                seg["id"] = smap.get(old_id, old_id)
+                if seg["locate"].get("segment"):
+                    seg["locate"]["segment"] = smap.get(seg["locate"]["segment"], seg["locate"]["segment"])
+                if seg["role"] == "measures":
+                    t = seg["table"]
+                    seg["measures"] = {k: C(t, v) for k, v in seg["measures"].items()}
+                    seg["table"] = T(t)
+                elif seg["role"] == "dimension":
+                    t = seg["table"]
+                    seg["dim"]["name"] = C(t, seg["dim"]["name"])
+                    seg["dim"]["derive"] = {C(t, k): v for k, v in seg["dim"]["derive"].items()}
+                    seg["value"] = C(t, seg["value"])
+                    seg["const"] = {C(t, k): v for k, v in seg["const"].items()}
+                    for k, pick in picks.get(old_id, {}).items():
+                        if k in seg["const"]:
+                            seg["const"][k] = {"pick": pick}
+                    seg["table"] = T(t)
+                else:
+                    v = seg["verify"]
+                    v["value"] = C(v["against_table"], v["value"])
+                    v["against_table"] = T(v["against_table"])
+                    k = seg.get("keep_as")
+                    if k:
+                        t = k["table"]
+                        k.update(dim=C(t, k["dim"]), value=C(t, k["value"]),
+                                 derive={C(t, n): r for n, r in k["derive"].items()}, table=T(t))
+            cur_block = next((b for _s, b in cur_cross if b.id == block["id"]), None) if (si, bi) in bmap else None
+            if cur_block is not None:
+                block["axis"]["name"] = cur_block.axis.name
+    for t in cand["tables"]:
+        old = t["name"]
+        t["name"] = T(old)
+        t["grain"] = [C(old, g) for g in t["grain"]]
+        t["units"] = {C(old, k): v for k, v in t["units"].items()}
+    # 关系：先改引用，再按 kind 和成员与现行的关系配对，抄 id 和 claims；没配上的顺延编号，免得与抄来的 id 重号
+    cur_rel: dict[Any, Any] = {}
+    for r in cur_m.relations:
+        if isinstance(r, SumEq):
+            cur_rel[("sum_eq", r.table, r.total, frozenset(r.parts))] = r
+        elif isinstance(r, NotComparable):
+            cur_rel[("not_comparable", r.a.table, r.a.value, r.b.table, r.b.value, r.by)] = r
+    taken: set[str] = set()
+    loose: list[dict[str, Any]] = []
+    for r in cand["relations"]:
+        if r["kind"] == "sum_eq":
+            old = r["table"]
+            r.update(table=T(old), total=C(old, r["total"]), parts=[C(old, p) for p in r["parts"]])
+            key: Any = ("sum_eq", r["table"], r["total"], frozenset(r["parts"]))
+        elif r["kind"] == "not_comparable":
+            a, b = r["a"], r["b"]
+            r["by"] = C(a["table"], r["by"])
+            a.update(value=C(a["table"], a["value"]), table=T(a["table"]))
+            b.update(value=C(b["table"], b["value"]), table=T(b["table"]))
+            key = ("not_comparable", a["table"], a["value"], b["table"], b["value"], r["by"])
+        else:
+            key = None
+        hit = cur_rel.get(key) if key is not None else None
+        if hit is not None and hit.id not in taken:
+            r["id"] = hit.id
+            r["claims"] = hit.claims
+            taken.add(hit.id)
+        else:
+            loose.append(r)
+            if r["kind"] != "dismissed":
+                report.append(f"关系「{r['id']}」没有在现行配方里找到对应的关系")
+    n = max([int(i[1:]) for i in taken] + [0])
+    for r in loose:
+        if r["id"] in taken:
+            n += 1
+            while f"R{n}" in taken:
+                n += 1
+            r["id"] = f"R{n}"
+        taken.add(r["id"])
+    _dedupe_names(cand, set(tmap.values()), set(smap.values()) | set(bmap.values()))
+    return cand, _dedupe(report)
+
+
+def _dedupe_names(recipe: dict[str, Any], kept_tables: set[str], kept_ids: set[str]) -> None:
+    """对齐之后，没配上的起草名字可能和抄来的现行名字撞上：只改没配上的那一方（加 _2）。"""
+    used = {collide_key(t) for t in kept_tables}
+    rename: dict[str, str] = {}
+    for t in recipe["tables"]:
+        if t["name"] in kept_tables:
+            continue
+        if collide_key(t["name"]) in used:
+            rename[t["name"]] = _unique(t["name"], used)
+        else:
+            used.add(collide_key(t["name"]))
+    if rename:
+        R = lambda n: rename.get(n, n)  # noqa: E731
+        for t in recipe["tables"]:
+            t["name"] = R(t["name"])
+        for sheet in recipe["sheets"]:
+            for block in sheet["blocks"]:
+                if block["layout"] == "list":
+                    block["table"] = R(block["table"])
+                    total = block["rows"].get("total_row")
+                    if total and total.get("keep_as"):
+                        total["keep_as"] = R(total["keep_as"])
+                for seg in block.get("segments") or []:
+                    if seg.get("table"):
+                        seg["table"] = R(seg["table"])
+                    if seg.get("verify"):
+                        seg["verify"]["against_table"] = R(seg["verify"]["against_table"])
+                    if seg.get("keep_as"):
+                        seg["keep_as"]["table"] = R(seg["keep_as"]["table"])
+        for r in recipe["relations"]:
+            if r.get("table"):
+                r["table"] = R(r["table"])
+            for side in ("a", "b"):
+                if isinstance(r.get(side), dict):
+                    r[side]["table"] = R(r[side]["table"])
+    ids = set(kept_ids)
+    for sheet in recipe["sheets"]:
+        for block in sheet["blocks"]:
+            for item in [block, *(block.get("segments") or [])]:
+                if item["id"] in kept_ids:
+                    continue
+                if item["id"] in ids:
+                    old = item["id"]
+                    n = 2
+                    while f"{old[:28]}_{n}" in ids:
+                        n += 1
+                    item["id"] = f"{old[:28]}_{n}"
+                    for seg in block.get("segments") or []:
+                        if (seg.get("locate") or {}).get("segment") == old:
+                            seg["locate"]["segment"] = item["id"]
+                ids.add(item["id"])

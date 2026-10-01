@@ -149,8 +149,11 @@ RECIPE_QUERY_HINT = " 中文表名和列名请加双引号。查单个值时，�
 
 #: 冻结 schema_snapshot 时从 schema_cache 复制的顶层键。import_mode、import_manifests 只有按配方导入的源才有：
 #: 冻结进来以后，schema_snapshot 的内容哈希就承诺了导入清单（证据链按哈希从封存事件走到清单，中间不经过
-#: 可改的数据库列，H5）；手工源和期 1 的上传源没有这两个键，冻结内容和原来一字不差
-_FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode", "import_manifests")
+#: 可改的数据库列，H5）；手工源和期 1 的上传源没有这两个键，冻结内容和原来一字不差。
+#: snapshot_manifest（期 3，P3-SPEC 2.9）：按期累积物化的快照才有，是快照清单的内容哈希。冻结进来以后证据链是
+#: 封存事件 → schema_snapshot → 快照清单 → 各期导入清单 → 原件或清除记录，每一跳都按内容哈希
+_FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode", "import_manifests",
+                       "snapshot_manifest")
 
 
 def _query_description(source: Any) -> str:
