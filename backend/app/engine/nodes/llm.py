@@ -47,7 +47,7 @@ from app.providers.factory import (
     bind_tools_safely,
     get_chat_model,
 )
-from app.tools.datasource import QUERY_PREFIX
+from app.tools.datasource import QUERY_PREFIX, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -333,6 +333,9 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         sandbox_session=ctx.run.thread_id,
         memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
         collection=ctx.cfg("collection") or ctx.run.collection,
+        data_versions=run_versions(ctx.run),
+        # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
+        emit=ctx.emit,
     )
     async with SessionLocal() as session:
         try:

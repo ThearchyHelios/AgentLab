@@ -193,25 +193,42 @@ async def start_run(
 # --------------------------------------------------------------------------
 
 
-def _bindings(spec: GraphSpec) -> list[tuple[str, str]]:
-    """图里每一处绑定的工具：(谁绑的, 工具名)。调用工具节点的 tool、Agent 的 tools、协作成员的 tools。"""
+def node_setting(spec: GraphSpec, node: Any, key: str) -> Any:
+    """节点配置的实际取值，和运行时 NodeContext.cfg 同一个规则：节点上没写（None、空串）就取图级 defaults。"""
+    value = node.config.get(key)
+    return spec.defaults.get(key) if value in (None, "") else value
+
+
+def tool_bindings(spec: GraphSpec) -> list[tuple[str, str]]:
+    """图里每一处绑定的工具：(谁绑的, 工具名)。调用工具节点的 tool、Agent 的 tools、协作成员的 tools。
+
+    取值和运行时一致（node_setting）：Agent 节点上没写 tools、协作节点上没写成员，运行时用的是
+    图级 defaults 里的，这里也算它们——不然发起前检查放过了缺的工具，发起时固定数据版本也漏了源。
+
+    模板拼出来的名字（{{ vars.tool }}）也在内：发起前检查（_bindings）跳过它们，发起时固定数据
+    版本（engine/runner.py）要知道有没有这种名字——有的话说不准会用到哪个数据源。
+    """
     out: list[tuple[str, str]] = []
     for node in spec.nodes:
         who = f"「{node.title}」（{type_label(node.type)}）"
-        cfg = node.config
         if node.type == NodeType.TOOL:
-            names = [cfg.get("tool")]
+            names = [node_setting(spec, node, "tool")]
             out.extend((who, n) for n in names if isinstance(n, str) and n.strip())
         elif node.type == NodeType.AGENT:
-            out.extend((who, n) for n in cfg.get("tools") or [] if isinstance(n, str) and n.strip())
+            out.extend((who, n) for n in node_setting(spec, node, "tools") or []
+                       if isinstance(n, str) and n.strip())
         elif node.type == NodeType.SUPERVISOR:
-            for member in cfg.get("agents") or []:
+            for member in node_setting(spec, node, "agents") or []:
                 if not isinstance(member, dict):
                     continue
                 label = f"「{node.title}」的成员「{member.get('name') or '?'}」"
                 out.extend((label, n) for n in member.get("tools") or [] if isinstance(n, str) and n.strip())
-    # 模板拼出来的工具名（{{ vars.tool }}）发起时还不知道是谁，交给运行时
-    return [(who, name.strip()) for who, name in out if "{{" not in name]
+    return [(who, name.strip()) for who, name in out]
+
+
+def _bindings(spec: GraphSpec) -> list[tuple[str, str]]:
+    """发起前要检查的绑定。模板拼出来的工具名（{{ vars.tool }}）发起时还不知道是谁，交给运行时。"""
+    return [(who, name) for who, name in tool_bindings(spec) if "{{" not in name]
 
 
 async def missing_tools(session: AsyncSession, spec: GraphSpec) -> list[tuple[str, str, str]]:

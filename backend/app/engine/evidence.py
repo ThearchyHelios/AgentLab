@@ -24,6 +24,9 @@ t / c 仍按一期判为解析不了（「这种引用在后续版本支持」�
 写了 entities: off 的，照实说是它关掉的。表结构快照不全（库里的表太多、只存了一部分）时，
 找不到的名字只说「核对不了」，不说「可能是编造的」。自动链接的名字只是标注：一句结论挂没挂
 依据，只看写作者自己写的 [[…]] 和 [[see:…]]。
+表名、字段名怎么写、怎么找，按文档记下的实体语法版本（顶层 entity_syntax，见 ENTITY_SYNTAX）：
+2 版起 [[t:]] / [[c:]] 和 SQL 里不加引号的名字认中文（[[t:明细]]、FROM 明细），按 SQLite 的口径找（name_key）；
+没有这个字段的老文档按 1 版（只认 ASCII 标识符）复核。反引号里的名字核对、正文裸名自动链接两版都只认 ASCII。
 沙箱代码节点的产出不能直接引用（`[[v:N:calc.x]]`），原因写「沙箱算出来的数要进口径卡」。
 
 单元格、整表、引文要读快照：整个模块仍然不碰数据库、不调模型，快照经 loader 取（缺省是
@@ -43,17 +46,29 @@ import difflib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
+from app.data.names import FILLERS, name_key
+from app.data.tabular import UNSHAPED_NOTE
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.issuance import _tolerance, extract_numbers, number_allowance
 from app.engine.labels import option_label
 
 DOC_SCHEMA = "agentlab.report/1"
+#: 实体语法（表名、字段名怎么写、怎么找）的版本。新组装的文档记在顶层 entity_syntax，参与内容哈希。
+#: - 1：名字只认 ASCII 标识符，按 Python 的 lower() 找。没有 entity_syntax 的老文档按它复核；
+#: - 2：[[t:]] / [[c:]] 和 SQL 里不加引号的名字放宽到 Unicode（上传表格的中文表名、列名），按 name_key 找
+#:   （只对 ASCII 不区分大小写、不做 NFKC，和 SQLite 一致；导入和证据层共用 names.py 这一个键）。
+#: 复核必须按文档生成时的那一版：老文档里的 [[t:明细]] 当年判为「格式无法识别」，拿新规则查就解析得了，
+#: 和记下的状态对不上，会被当成文档被改过（state_mismatch）。
+ENTITY_SYNTAX = 2
+ENTITY_SYNTAXES = frozenset({1, 2})
+
 
 # --------------------------------------------------------------------------
 # 数据结构（方案 1.5）。都是普通 dict，TypedDict 只用来写清形状
@@ -223,7 +238,9 @@ def query_entry_fields(payload: Any) -> dict[str, Any] | None:
     schema = data.get("schema_artifact")
     if isinstance(schema, str) and schema:
         # 表结构快照和 SQL 里的表名成对出现：没探查过结构的数据源，只凭 SQL 和结果列核对名字，
-        # 反引号里写的真实表名（没进这条 SQL）会被误标成编造的，这种查询不启用实体核对
+        # 反引号里写的真实表名（没进这条 SQL）会被误标成编造的，这种查询不启用实体核对。
+        # 表名按当前的实体语法版本取：台账条目在查询当时记一次、存下来，复核老文档时目录按存下的台账重建，
+        # 不重新解析 SQL，所以老文档看到的还是当年记的表名
         fields.update(schema_artifact=schema, tables=sql_tables(str(data.get("sql") or "")))
     return fields
 
@@ -235,12 +252,53 @@ def query_entry_fields(payload: Any) -> dict[str, Any] | None:
 #: 数据源工具每次查询时把当时的表结构存成这种工件
 SCHEMA_SNAPSHOT = "schema_snapshot"
 
-_SQL_IDENT = r'(?:"[^"\n]+"|`[^`\n]+`|\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_$#]*)'
-_SQL_NAME = re.compile(rf"\s*({_SQL_IDENT}(?:\s*\.\s*{_SQL_IDENT}){{0,2}})")
-_SQL_PART = re.compile(_SQL_IDENT)
-_SQL_FROM = re.compile(r"\b(?:from|join)\b", re.I)
-#: WITH x AS (…), y AS (…)：公用表表达式的名字不是真表
-_SQL_CTE = re.compile(rf"(?:\bwith\b(?:\s+recursive\b)?|,)\s*({_SQL_IDENT})\s*(?:\([^()]*\)\s*)?\bas\s*\(", re.I)
+class _SqlSyntax:
+    """sql_tables 用的一套正则，按实体语法版本各一套，差在不加引号的名字由哪些字符组成、名字和关键字的边界怎么定。
+
+    1 版：ASCII 字母或下划线开头，字母、数字、_ $ #；空白和词边界按 Python 的 \\s、\\b。原样留着
+    （ENTITY_SYNTAXES 里的版本都得能复现）。
+    2 版：照数据库的分词来——SQLite、PostgreSQL、MySQL 都把 ASCII 以外的字符一律算作不加引号的标识符的一部分
+    （开头也算），所以名字是 ASCII 字母、下划线或任意非 ASCII 字符开头，后面再加数字和 $ #。上传的表格起的是
+    中文名，导入时也鼓励不加引号写 SQL：`FROM 明细` 按 1 版认不出来，这张表的条目就记不下是哪次查询用到的，
+    写作目录把它归到「其他表」，裁判也拿不到这张表的 SQL。
+    不能只认 names.name_problem 的字符集（字母、数字、汉字、下划线）：`FROM 销售数据（2024）` 在库里查的是
+    「销售数据（2024）」这一张表（全角括号、间隔号、全角空格都是名字的一部分），只认 \\w 会截成「销售数据」，
+    记下一张不存在的表，[[t:销售数据]] 就能静默通过。同理，2 版的空白只认 ASCII 空白，FROM / JOIN 等关键字
+    两边不能紧挨非 ASCII 字符（`FROM　明细` 在库里是一个名字，不是 FROM 加表名）。名字切得和数据库一样，
+    才谈得上「拿不准往少认一张表偏」。
+
+    判断「# / $ 前面是不是名字的一部分」用的字符集跟着名字走：2 版里「明细#1」和「abc#1」一样是一个名字，
+    不能把 # 当注释开头。PostgreSQL 美元引号的标签（$标签$）也按同样的字符集认。
+    """
+
+    def __init__(self, start: str, rest: str, tag: str, key: Callable[[str], str], *,
+                 ws: str = r"\s", before: str = r"\b", after: str = r"\b") -> None:
+        self.ident = rf'(?:"[^"\n]+"|`[^`\n]+`|\[[^\]\n]+\]|{start}{rest}*)'
+        self.name = re.compile(rf"{ws}*({self.ident}(?:{ws}*\.{ws}*{self.ident}){{0,2}})")
+        self.part = re.compile(self.ident)
+        #: FROM / JOIN：后面跟着表名
+        self.keyword = re.compile(rf"{before}(?:from|join){after}", re.I)
+        #: WITH x AS (…), y AS (…)：公用表表达式的名字不是真表
+        self.cte = re.compile(rf"(?:{before}with{after}(?:{ws}+recursive{after})?|,){ws}*({self.ident}){ws}*"
+                              rf"(?:\([^()]*\){ws}*)?{before}as{ws}*\(", re.I)
+        self.alias = re.compile(rf"{ws}+(?:as{ws}+)?({self.ident})", re.I)
+        #: 名字后面紧跟括号：子查询、表函数；紧跟逗号：FROM a, b
+        self.call = re.compile(rf"{ws}*\(")
+        self.comma = re.compile(rf"{ws}*,")
+        #: PostgreSQL 的美元引号字符串：$$…$$、$tag$…$tag$（$1 这种参数不是）
+        self.dollar = re.compile(rf"\$(?:{tag})?\$")
+        self.word_char = re.compile(rest)
+        #: 表名去重、和公用表表达式比对用的键：1 版 lower()，2 版 name_key（「Дата」和「дата」是两张表）
+        self.key = key
+
+
+#: 2 版不加引号的名字里能出现的字符：ASCII 字母、数字、_ $ #，加上任意非 ASCII 字符
+_SQL_WORD2 = r"[A-Za-z0-9_$#\x80-\U0010ffff]"
+_SQL = {
+    1: _SqlSyntax("[A-Za-z_]", "[A-Za-z0-9_$#]", "[A-Za-z_][A-Za-z0-9_]*", str.lower),
+    2: _SqlSyntax(r"[A-Za-z_\x80-\U0010ffff]", _SQL_WORD2, r"[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*",
+                  name_key, ws=r"[ \t\n\r\f\v]", before=rf"(?<!{_SQL_WORD2})", after=rf"(?!{_SQL_WORD2})"),
+}
 #: 跟在 FROM 后面、却不是表名的词
 _SQL_NOT_TABLE = frozenset({"select", "lateral", "unnest", "dual", "values", "table"})
 #: 表名后面紧跟这些词时，它们不是别名
@@ -252,12 +310,9 @@ _SQL_CLAUSE = frozenset({
 _SQL_FROM_FUNCS = frozenset({"extract", "substring", "trim", "overlay", "position"})
 #: SQLite / SQL Server 的方括号标识符：里面有引号的不是（那是 ARRAY['…'] 这样的数组字面量）
 _SQL_BRACKET = re.compile(r"\[[^\]'\"\n]*\]")
-#: PostgreSQL 的美元引号字符串：$$…$$、$tag$…$tag$（$1 这种参数不是）
-_SQL_DOLLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
-_SQL_WORD_CHAR = re.compile(r"[A-Za-z0-9_$#]")
 
 
-def _sql_scan(sql: str) -> tuple[str, str]:
+def _sql_scan(sql: str, rules: _SqlSyntax) -> tuple[str, str]:
     """一趟扫完注释、字符串、带引号的标识符，返回两份和原文等长的文本：
 
     - code：注释换成空格，字符串字面量的内容换成空格（引号留着），标识符原样——取表名用
@@ -281,7 +336,7 @@ def _sql_scan(sql: str) -> tuple[str, str]:
     i = 0
     while i < n:
         ch, nxt = sql[i], sql[i + 1] if i + 1 < n else ""
-        word_before = i > 0 and bool(_SQL_WORD_CHAR.match(sql[i - 1]))
+        word_before = i > 0 and bool(rules.word_char.match(sql[i - 1]))
         if (ch == "-" and nxt == "-") or (ch == "#" and not word_before):
             end = sql.find("\n", i)
             end = n if end < 0 else end
@@ -320,7 +375,7 @@ def _sql_scan(sql: str) -> tuple[str, str]:
         elif ch == "[" and (m := _SQL_BRACKET.match(sql, i)):
             blank(i + 1, m.end() - 1, words)
             i = m.end()
-        elif ch == "$" and not word_before and (m := _SQL_DOLLAR.match(sql, i)):
+        elif ch == "$" and not word_before and (m := rules.dollar.match(sql, i)):
             close = sql.find(m.group(0), m.end())
             end = n if close < 0 else close
             blank(m.end(), end, code, words)
@@ -330,8 +385,8 @@ def _sql_scan(sql: str) -> tuple[str, str]:
     return "".join(code), "".join(words)
 
 
-def _unquote(name: str) -> str:
-    return ".".join(p[1:-1] if p[:1] in ('"', "`", "[") else p for p in _SQL_PART.findall(name))
+def _unquote(name: str, rules: _SqlSyntax) -> str:
+    return ".".join(p[1:-1] if p[:1] in ('"', "`", "[") else p for p in rules.part.findall(name))
 
 
 def _inside_call(code: str, pos: int) -> bool:
@@ -351,43 +406,48 @@ def _inside_call(code: str, pos: int) -> bool:
     return False
 
 
-def sql_tables(sql: str) -> list[str]:
+def sql_tables(sql: str, *, syntax: int | None = None) -> list[str]:
     """SQL 里 FROM / JOIN 后面的表名，按第一次出现的顺序、不分大小写去重。
 
     注释、字符串字面量一趟扫掉（_sql_scan：`-- FROM ghost`、'JOIN ghost'、'--x' 后面的正文都
     处理对）。双引号、反引号、方括号括起来的标识符照样认，去掉引号；引号里的 FROM 不算关键字。
     WITH 定义的公用表表达式、子查询、表函数（generate_series(…)）不算表。
+
+    syntax 是实体语法版本，缺省当前版（2 版认不加引号的中文表名：FROM 明细、两张中文表 JOIN；名字切得和数据库
+    一样，`FROM 销售数据（2024）` 记的是整个名字，见 _SqlSyntax）。
+    「不分大小写」按版本的口径：2 版是 name_key，「Дата」和「дата」、「ＯＲＤＥＲＳ」和「orders」算两张表。
     """
     if not sql:
         return []
-    code, words = _sql_scan(sql)
-    ctes = {_unquote(code[m.start(1):m.end(1)]).lower() for m in _SQL_CTE.finditer(words)}
+    rules = _SQL[ENTITY_SYNTAX if syntax is None else syntax]
+    code, words = _sql_scan(sql, rules)
+    ctes = {rules.key(_unquote(code[m.start(1):m.end(1)], rules)) for m in rules.cte.finditer(words)}
     out: dict[str, str] = {}
-    for keyword in _SQL_FROM.finditer(words):
+    for keyword in rules.keyword.finditer(words):
         if _inside_call(words, keyword.start()):
             continue
         pos = keyword.end()
         while True:
-            m = _SQL_NAME.match(code, pos)
-            if not m or re.match(r"\s*\(", code[m.end():]):
+            m = rules.name.match(code, pos)
+            if not m or rules.call.match(code, m.end()):
                 break                                   # 子查询、表函数
-            name = _unquote(m.group(1))
+            name = _unquote(m.group(1), rules)
             lowered = name.lower()
             if lowered == "only":                       # FROM ONLY t（PostgreSQL）
                 pos = m.end()
                 continue
             if lowered in _SQL_NOT_TABLE:
                 break
-            if lowered not in ctes:
-                out.setdefault(lowered, name)
+            if rules.key(name) not in ctes:
+                out.setdefault(rules.key(name), name)
             pos = m.end()
-            alias = re.match(rf"\s+(?:as\s+)?({_SQL_IDENT})", code[pos:], re.I)
+            alias = rules.alias.match(code[pos:])
             if alias and alias.group(1).lower() not in _SQL_CLAUSE:
                 pos += alias.end()
-            comma = re.match(r"\s*,", code[pos:])
+            comma = rules.comma.match(code, pos)
             if not comma:
                 break
-            pos += comma.end()
+            pos = comma.end()
     return list(out.values())
 
 
@@ -925,10 +985,18 @@ def _entity_entries(schemas: list[dict[str, Any]], queries: list[tuple[dict[str,
     的按那份查询快照。sources 记全三种来历（schema / sql / result），queries 是哪几次查询用到。
     同名字段在好几张表里（id、amount）另编一条 c:<列>，tables 写明是哪几张：正文里只写字段名时
     指的是哪张说不准，但这个名字确实存在。
+
+    已知限制：表按 Python 的 lower() 并，比 SQLite 宽（SQLite 只对 ASCII 不区分大小写）。手工接入的库里同时有
+    「Дата」和「дата」两张表时，目录里只有先出现的 t:Дата，后一张的字段记成 c:Дата.<列>：[[c:Дата.y]] 能解析
+    （y 其实是 дата 的字段，静默放行），[[t:дата]] 判为疑似编造（误报）；SQL 里写 FROM дата 的查询也记在
+    t:Дата 名下。上传的表格碰不到：导入时按 names.collide_key（casefold）判撞名，这样的两张表不会并存。
+    没改成按 name_key 并，是因为目录没有版本：复核时它按存下的台账重新拼，不知道文档是哪一版语法，改了
+    并法，碰上这种库的老文档复核时就对不上当年的目录。以后给目录也加版本时再按 name_key 并。
     """
     tables: dict[str, dict[str, Any]] = {}
     columns: dict[str, dict[str, Any]] = {}
-    by_lower: dict[str, str] = {}                  # 小写的表名、全名、全名的末段 → 条目里的表名
+    #: 小写的表名、全名、全名的末段 → 条目里的表名。lower() 并得比 SQLite 宽，见上面的「已知限制」
+    by_lower: dict[str, str] = {}
     owners: dict[str, list[str]] = {}              # 小写的列名 → 表结构里有它的表
 
     def table(name: str, artifact: Any, *, qualified: str | None = None, source: Any = None) -> str:
@@ -997,9 +1065,30 @@ def _entity_entries(schemas: list[dict[str, Any]], queries: list[tuple[dict[str,
     return {**{e["alias"]: e for e in tables.values()}, **{e["alias"]: e for e in columns.values()}}
 
 
-#: 反引号里、正文里像标识符的名字：字母或下划线开头，最多四段用点连起来
-_ENTITY_NAME = r"[A-Za-z_][A-Za-z0-9_$#]*(?:\.[A-Za-z_][A-Za-z0-9_$#]*){0,3}"
-_IDENTIFIER = re.compile(rf"^{_ENTITY_NAME}$")
+#: 反引号里、正文里像标识符的名字，以及 1 版的 [[t:]] / [[c:]]：ASCII 字母或下划线开头，最多四段用点连起来。
+#: 反引号核对（_checked_name）和裸名链接（_BARE_NAME）两版都只认这个：放宽到 Unicode 的话，反引号里的
+#: 「华东」这种业务词会被判成可疑实体，中文正文没有词边界，整句会被当成一个名字
+_ASCII_NAME = r"[A-Za-z_][A-Za-z0-9_$#]*(?:\.[A-Za-z_][A-Za-z0-9_$#]*){0,3}"
+_ASCII_IDENTIFIER = re.compile(rf"^{_ASCII_NAME}$")
+#: 2 版的 [[t:]] / [[c:]]：每段字母或汉字开头，只含字母、数字、汉字、下划线（names.name_problem 的字符集），
+#: 另认 1 版就认的 $ #；段之间仍用「.」分隔（[[c:明细.金额]]）
+_UNICODE_IDENTIFIER = re.compile(r"^[^\W\d][\w$#]*(?:\.[^\W\d][\w$#]*){0,3}$")
+
+
+def _entity_ref_ok(ref: str, syntax: int) -> bool:
+    """[[t:]] / [[c:]] 里的名字写法对不对，按实体语法版本。
+
+    2 版另外挡住 names.name_problem 也挡的两类字符：不等于自身 NFKC 形式的（全角「ＡＢＣ」、带圈数字「①」）——
+    正文照原样显示，和 ABC 肉眼难分，SQLite 里却是另一张表（它不做归一，names.name_key 也不做）；以及填充字符
+    （\\w 把它们算作字母，肉眼看不出来）。填充字符里 U+3164、U+FFA0 经 NFKC 会变，上一条就挡住了；U+115F、U+1160 是 NFKC 稳定的，只能靠 names.FILLERS 挡。
+    长度和 SQL 关键字不管：手工接入的库里有长名字、有叫 order 的表，1 版也认。
+    """
+    if syntax < 2:
+        return bool(_ASCII_IDENTIFIER.match(ref))
+    return bool(_UNICODE_IDENTIFIER.match(ref)) and ref == unicodedata.normalize("NFKC", ref) \
+        and not any(ch in FILLERS for ch in ref)
+
+
 #: 反引号里写了这些不算名字：SQL 关键字、字面量、常用函数
 _SQL_WORDS = frozenset({
     "null", "true", "false", "none", "nan", "select", "from", "where", "group", "order", "by", "having", "limit",
@@ -1020,10 +1109,18 @@ class _EntityIndex:
     表和字段的查法分开（t: 只找表，c: 只找字段）。正文里的名字两样都试：先整名当表，再当
     字段（表.字段、只有字段名），最后才把 schema.表 按末段认成表——「orders.amount」不能因为
     恰好有一张叫 amount 的表就认成表。
+
+    「不分大小写」按实体语法版本的口径（self.key）：2 版用 name_key，只对 ASCII 不区分大小写，和 SQLite 比较
+    标识符一致（ABC 和 abc 是一张表，Дата 和 дата、ＯＲＤＥＲＳ 和 orders 都不是）；1 版照旧用 Python 的 lower()，
+    老文档按当年的口径复核。
+    目录本身怎么并表不分版本（_entity_entries 按 lower() 并），这里只管查：只差非 ASCII 大小写的两张表在目录里
+    已经是一条，见那里的说明。
     """
 
-    def __init__(self, catalog: dict[str, Any]) -> None:
+    def __init__(self, catalog: dict[str, Any], *, syntax: int | None = None) -> None:
         self.catalog = catalog
+        self.key: Callable[[str], str] = name_key if (ENTITY_SYNTAX if syntax is None else syntax) >= 2 \
+            else str.lower
         self.tables: dict[str, str] = {}
         self.columns: dict[str, str] = {}
         self.owners: dict[str, list[str]] = {}
@@ -1042,30 +1139,30 @@ class _EntityIndex:
                 name = str(entry.get("name") or alias[2:])
                 for key in (name, entry.get("qualified"), name.rsplit(".", 1)[-1]):
                     if key:
-                        self.tables.setdefault(str(key).lower(), alias)
+                        self.tables.setdefault(self.key(str(key)), alias)
             elif kind == "column":
                 col = str(locator.get("column") or entry.get("name") or "")
                 if locator.get("table"):
-                    self.columns.setdefault(f"{locator['table']}.{col}".lower(), alias)
-                    self.owners.setdefault(col.lower(), []).append(alias)
+                    self.columns.setdefault(self.key(f"{locator['table']}.{col}"), alias)
+                    self.owners.setdefault(self.key(col), []).append(alias)
                 else:
-                    self.columns.setdefault(col.lower(), alias)
+                    self.columns.setdefault(self.key(col), alias)
             elif kind == "metric":
-                self.others.add(str(locator.get("metric") or "").lower())
+                self.others.add(self.key(str(locator.get("metric") or "")))
             elif kind == "input":
-                self.others.add(str(locator.get("field") or "").lower())
-            self.others.add(alias.lower())
+                self.others.add(self.key(str(locator.get("field") or "")))
+            self.others.add(self.key(alias))
         self.active = bool(self.tables or self.columns)
 
     def table(self, name: str, *, tail: bool = True) -> str | None:
-        lowered = name.lower()
+        lowered = self.key(name)
         hit = self.tables.get(lowered)
         if hit is None and tail and "." in lowered:
             hit = self.tables.get(lowered.rsplit(".", 1)[-1])
         return hit
 
     def column(self, name: str) -> str | None:
-        lowered = name.lower()
+        lowered = self.key(name)
         if lowered in self.columns:
             return self.columns[lowered]
         if "." in lowered:
@@ -1073,7 +1170,7 @@ class _EntityIndex:
             owner = self.table(head)
             if owner is None:
                 return None
-            return self.columns.get(f"{self.catalog[owner]['name']}.{col}".lower())
+            return self.columns.get(self.key(f"{self.catalog[owner]['name']}.{col}"))
         mine = self.owners.get(lowered) or []
         return mine[0] if len(mine) == 1 else None
 
@@ -1089,7 +1186,7 @@ class _EntityIndex:
 
     def known(self, name: str) -> bool:
         """这个名字在这次运行里有没有出处：表、字段，或者指标 id、运行输入、证据编号。"""
-        return self.find(name) is not None or name.lower() in self.others
+        return self.find(name) is not None or self.key(name) in self.others
 
     def unsure(self, name: str) -> bool:
         """一个找不到的名字是不是只能说「核对不了」：表结构快照不全时，它可能在没存下来的表里。
@@ -1103,9 +1200,11 @@ class _EntityIndex:
         return owner is None or owner not in self.described
 
 
-def find_entity(name: str, catalog: dict[str, Any], kind: str | None = None) -> str | None:
-    """按名字找表或字段的目录键（t:orders、c:orders.amount），找不到返回 None。kind 为 table / column 时只找那一种。"""
-    hit = _EntityIndex(catalog).find(name.strip(), kind)
+def find_entity(name: str, catalog: dict[str, Any], kind: str | None = None, *,
+                syntax: int | None = None) -> str | None:
+    """按名字找表或字段的目录键（t:orders、c:orders.amount），找不到返回 None。kind 为 table / column 时只找那一种。
+    syntax 是实体语法版本（决定大小写口径），缺省当前版。"""
+    hit = _EntityIndex(catalog, syntax=syntax).find(name.strip(), kind)
     return hit[1] if hit else None
 
 
@@ -1163,19 +1262,29 @@ class _Snapshots:
     compose / verify / 流式渲染里：出口复核是另一次调用，照样重新取、重新验。
     """
 
-    def __init__(self, loader: Loader | None = None, *, entities: bool = True) -> None:
+    def __init__(self, loader: Loader | None = None, *, entities: bool = True, syntax: int | None = None) -> None:
         self.loader = loader or load_artifact
         self.memo: dict[str, tuple[Any, str | None]] = {}
         self._index: tuple[dict[str, Any], _EntityIndex] | None = None
         #: False：报告节点写了 entities: off，目录里就算有表和字段也整层不管
         self.entities_on = entities
+        #: 这一次解析按哪一版实体语法：组装、流式渲染用当前版，复核按文档记下的版本（verify_doc）
+        self.syntax = ENTITY_SYNTAX if syntax is None else syntax
 
     def entities(self, catalog: dict[str, Any]) -> _EntityIndex:
         if self._index is None or self._index[0] is not catalog:
             shown = catalog if self.entities_on else \
                 {a: e for a, e in catalog.items() if not (isinstance(e, dict) and e.get("kind") in ENTITY_KINDS)}
-            self._index = (catalog, _EntityIndex(shown))
+            self._index = (catalog, _EntityIndex(shown, syntax=self.syntax))
         return self._index[1]
+
+    def with_syntax(self, syntax: int) -> "_Snapshots":
+        """换一版实体语法的同一次解析。取过的快照共用：快照内容和语法版本无关，不必再取、再验一遍。"""
+        if syntax == self.syntax:
+            return self
+        twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax)
+        twin.memo = self.memo
+        return twin
 
     def get(self, alias: str, artifact: Any) -> tuple[Any, str | None]:
         """查询快照：(内容, 取不到的原因)。原因以 alias 开头，能直接当 unresolved 的 reason。"""
@@ -1218,8 +1327,12 @@ class _Snapshots:
         return (None, "absent") if content is None else (content, None)
 
 
-def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True) -> _Snapshots:
-    return loader if isinstance(loader, _Snapshots) else _Snapshots(loader, entities=entities)
+def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True,
+               syntax: int | None = None) -> _Snapshots:
+    """loader 已经是 _Snapshots 时沿用它（entities 不看）；给了 syntax 就换成那一版。"""
+    if isinstance(loader, _Snapshots):
+        return loader if syntax is None else loader.with_syntax(syntax)
+    return _Snapshots(loader, entities=entities, syntax=syntax)
 
 
 _CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
@@ -1472,10 +1585,12 @@ def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
         return _unresolved(marker, alias, ev_kind, _Reason(ENTITIES_OFF_REASON, ENTITIES_OFF_FIX))
     if not index.active:
         return _unresolved(marker, alias, ev_kind, LATER_REASON)
-    if not ref or not _IDENTIFIER.match(ref):
+    if not ref or not _entity_ref_ok(ref, snaps.syntax):
         return _unresolved(marker, alias, ev_kind, _Reason(
             "表名、字段名引用格式无法识别",
-            "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，名字是字母或下划线开头的标识符"))
+            "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，名字是字母或下划线开头的标识符" if snaps.syntax < 2
+            else "表名、字段名要写成 [[t:表名]]、[[c:表名.字段名]]，名字以字母、汉字或下划线开头，只含字母、数字、"
+                 "汉字和下划线，不含空格、括号和全角字符"))
     hit = index.find(ref, ev_kind)
     if hit is None:
         if index.find(ref, other):
@@ -2205,12 +2320,12 @@ def _normalize_strong(raw: str) -> tuple[str, list[tuple[int, int]]]:
 _CODE_NAME = re.compile(r"^`([^`\n]+)`$")
 #: 复核时找反引号：粗体、链接里面的也算——组装时它们没切成片段（切开会拆坏粗体），违规照记
 _CODE_SPAN = re.compile(r"(?<![`\\])`([^`\n]+?)`(?!`)")
-_BARE_NAME = re.compile(rf"(?<![A-Za-z0-9_$#.`/\\@]){_ENTITY_NAME}(?![A-Za-z0-9_$#])")
+_BARE_NAME = re.compile(rf"(?<![A-Za-z0-9_$#.`/\\@]){_ASCII_NAME}(?![A-Za-z0-9_$#])")
 
 
 def _checked_name(name: str) -> bool:
     """反引号里的这段是不是要核对的名字：像标识符、不止一个字、不是 SQL 关键字和常用函数。"""
-    return len(name) >= 2 and bool(_IDENTIFIER.match(name)) and name.lower() not in _SQL_WORDS
+    return len(name) >= 2 and bool(_ASCII_IDENTIFIER.match(name)) and name.lower() not in _SQL_WORDS
 
 
 def _bare_link(name: str, catalog: dict[str, Any], index: _EntityIndex) -> tuple[str, str] | None:
@@ -2484,8 +2599,9 @@ def compose_doc(
             for c in [*(s["cite"] for s in unit["segments"] if s.get("cite")), *unit["see"]]
             if c.get("status") == "resolved" and c.get("alias")}
     kept = {a: e for a, e in catalog.items() if e.get("kind") not in ENTITY_KINDS or a in used}
+    # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     doc: dict[str, Any] = {
-        "schema": DOC_SCHEMA, "run_id": run_id, "node_id": node_id,
+        "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
@@ -2624,13 +2740,18 @@ def verify_doc(
     - 引文重新取检索快照、重新逐字比对
     - 片段标的状态和核对结果一致（界面按状态画线，不能标着「有出处」其实没有）
 
+    表名、字段名按文档记下的实体语法版本解析（entity_syntax，没有这个字段的老文档按 1 版）：老文档按
+    它生成时的规则复核，不能因为今天认得中文名了，就把当年「格式无法识别」的片段判成被改过。loader 是
+    _Snapshots 时也以文档为准。记了认不出的版本的，记 bad_schema，按当前版查。
+
     另外返回 uncited：没挂依据的结论句 [{unit, span, text}]（按这次核对的引用算，不信文档里的 cites；
     自动链接的名字不算依据）。
 
     stats 里 entities、quotes、unknown_entities、unverified_entities 四个键只在目录里有表和字段、或者
     有知识库检索时才有（它们才可能不是 0）：升级前的运行统计的键和以前一模一样。
     """
-    snaps = _snapshots(loader, entities=entities)
+    entity_syntax = doc_entity_syntax(doc)
+    snaps = _snapshots(loader, entities=entities, syntax=entity_syntax or ENTITY_SYNTAX)
     index = snaps.entities(catalog)
     violations: list[dict[str, Any]] = []
     uncited: list[dict[str, Any]] = []
@@ -2645,6 +2766,9 @@ def verify_doc(
         return {"ok": False, "violations": violations, "stats": stats, "uncited": uncited}
     if doc.get("schema") != DOC_SCHEMA:
         violations.append(_violation("bad_schema", f"报告文档格式「{doc.get('schema')}」无法识别"))
+    if entity_syntax is None:
+        violations.append(_violation("bad_schema",
+                                     f"报告文档记录的表名、字段名规则版本「{doc.get('entity_syntax')}」无法识别"))
 
     markdown = str(doc.get("markdown") or "")
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
@@ -2791,6 +2915,12 @@ def verify_doc(
     return {"ok": not violations, "violations": violations, "stats": stats, "uncited": uncited}
 
 
+def doc_entity_syntax(doc: Any) -> int | None:
+    """文档按哪一版实体语法组装：没有 entity_syntax 字段的是老文档（1 版），记了认不出的值返回 None。"""
+    raw = doc.get("entity_syntax", 1) if isinstance(doc, dict) else 1
+    return raw if type(raw) is int and raw in ENTITY_SYNTAXES else None
+
+
 def _phase_two_cite(seg: dict[str, Any], ref: str, text: str) -> dict[str, Any] | None:
     """升级前（二期）组装的文档里的 t / c / q：那时一律判为解析不了，正文是占位，原因是 LEGACY_LATER_REASON。
 
@@ -2854,8 +2984,13 @@ CELL_RULES = (
 )
 
 #: 表名、字段名的写法。只在这次运行冻结了表结构（目录里有表和字段）时出现
+#: 只用于组装新文档的写作目录（catalog_prompt → 报告节点），新文档一律按当前的实体语法（ENTITY_SYNTAX）
+#: 组装和复核，所以这里写的就是当前版的规矩；老文档复核不看提示词。反引号里的名字只核对 ASCII 标识符
+#: （_checked_name，中文正文、地名放进反引号不能被判成编造的名字），所以中文名必须用 [[t:]] / [[c:]]：
+#: 照「放进反引号」写 `某表`，编造的中文表名就绕开了核对
 ENTITY_RULES = (
-    "表和字段（系统会核对）：提到表名、字段名时写 [[t:表名]]、[[c:表名.字段名]]，或者放进反引号（`表名`）；"
+    "表和字段（系统会核对）：提到表名、字段名时写 [[t:表名]]、[[c:表名.字段名]]；英文的名字也可以放进反引号"
+    "（`orders`），中文的表名、字段名一律用 [[t:]] / [[c:]]——反引号里的中文名系统不核对；"
     "只写下面列出的、或者这次查过的数据源里真实存在的名字——本次运行的表结构快照、查询用到的表、"
     "查询结果列里都没有的名字，会被标成「可能是编造的名字」。\n"
     "说明一个数是怎么算出来的（按哪个字段去重、怎么汇总、筛了什么条件）时，句末挂 [[see:Q1]] 指向算出它的那次"
@@ -2957,7 +3092,7 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
         for e in queries:
             lines.extend(_query_prompt(e, snaps, cells_allowed))
     if (index := snaps.entities(catalog)).active:
-        lines.extend(_entity_prompt(catalog, partial=index.partial))
+        lines.extend(_entity_prompt(catalog, partial=index.partial, snaps=snaps))
     retrievals = [e for e in catalog.values() if e.get("kind") == "retrieval"]
     if retrievals:
         lines.append(f"\n{QUOTE_RULES}")
@@ -2969,8 +3104,38 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
     return text
 
 
-def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False) -> list[str]:
-    """表和字段在写作目录里的样子：查询用到的表连同字段，查询结果里的列，别的表只列名字。"""
+def unshaped_table(entry: dict[str, Any], fetch: Callable[[Any], Any]) -> bool:
+    """目录里的这张表是不是按原样导入、未经规整的（冻结的表结构里它的 comment 是 tabular.UNSHAPED_NOTE）。
+
+    看的是这次运行冻结的表结构快照（条目 sources 里 kind 为 schema 的那几份），不看数据源现在的样子。
+    fetch 取工件内容，取不到给 None。写作目录和裁判摘录同一个口径。
+    """
+    name = entry.get("name") or (entry.get("locator") or {}).get("table")
+    for origin in entry.get("sources") or []:
+        if not (isinstance(origin, dict) and origin.get("kind") == "schema" and origin.get("artifact")):
+            continue
+        info = schema_table(fetch(origin["artifact"]), name)
+        if info is not None:
+            return info.get("comment") == UNSHAPED_NOTE
+    return False
+
+
+#: 写作目录里未规整的表名后面跟的那句。不含数字（H11）
+_UNSHAPED_MARK = "（按原样导入、未经规整：同一列里混有不同口径的行，不能直接对列求和）"
+
+
+def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False, snaps: _Snapshots | None = None) -> list[str]:
+    """表和字段在写作目录里的样子：查询用到的表连同字段，查询结果里的列，别的表只列名字。
+
+    按原样导入、未经规整的表（上传时选了「按原样导入」）在名字后面写明不能直接对列求和：说明本来只在
+    db_schema 查单表时看得到，写报告的模型多半没看过（R4、D16）。
+    """
+    def fetch(artifact: Any) -> Any:
+        return snaps._fetch(artifact, "表结构快照")[0] if snaps is not None else None
+
+    def mark(entry: dict[str, Any]) -> str:
+        return _UNSHAPED_MARK if snaps is not None and unshaped_table(entry, fetch) else ""
+
     tables = [e for e in catalog.values() if e.get("kind") == "table"]
     fields: dict[str, list[str]] = {}
     loose: list[str] = []
@@ -2987,12 +3152,12 @@ def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False) -> list[st
     for t in used[:_PROMPT_TABLES]:
         cols = fields.get(t["name"], [])
         more = f" 等 {len(cols)} 个" if len(cols) > _PROMPT_COLS else ""
-        lines.append(f"- {t['name']}（{'、'.join(t['queries'])} 用到）" + (f"：{', '.join(cols[:_PROMPT_COLS])}{more}"
-                                                                          if cols else ""))
+        lines.append(f"- {t['name']}（{'、'.join(t['queries'])} 用到）{mark(t)}"
+                     + (f"：{', '.join(cols[:_PROMPT_COLS])}{more}" if cols else ""))
     if loose:
         more = f" 等 {len(loose)} 个" if len(loose) > _PROMPT_RESULT_COLS else ""
         lines.append(f"- 查询结果里的列：{', '.join(loose[:_PROMPT_RESULT_COLS])}{more}")
-    others = [str(t["name"]) for t in tables if not t.get("queries")]
+    others = [f"{t['name']}{mark(t)}" for t in tables if not t.get("queries")]
     if others:
         more = f" 等 {len(others)} 张" if len(others) > _PROMPT_OTHER_TABLES else ""
         lines.append(f"- 其他表：{'、'.join(others[:_PROMPT_OTHER_TABLES])}{more}")

@@ -25,6 +25,7 @@ from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
+from app.tools.datasource import RUN_VERSIONS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -188,29 +189,35 @@ class RunManager:
             approval_default = await _approval_default(run_class=run_class)
 
         async with SessionLocal() as session:
+            from app.data.table_versions import pin_lock
             from app.tools.trust import run_snapshot
 
             tool_trust = await run_snapshot(session, run_class=run_class)
             agent_limits = await _agent_limits(session)
-            run = Run(
-                workflow_id=workflow_id,
-                workflow_name=workflow_name,
-                status="queued",
-                graph=graph,
-                input=input_payload,
-                run_class=run_class,
-                version=version,
-                version_hash=version_hash,
-                started_by=started_by,
-                memory_scope=memory_scope,
-                collection=collection,
-                approval_default=approval_default,
-                tool_trust=tool_trust,
-                agent_limits=agent_limits,
-            )
-            run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
-            session.add(run)
-            await session.commit()
+            # 读上传表格的当前指针到运行记录提交，持着版本存储的锁：中间有人重传的话，发布后的回收
+            # 看不到这条还没提交的运行，会把刚固定的快照删掉（table_versions.pin_lock）
+            async with pin_lock():
+                data_versions = await _data_versions(session, spec)
+                run = Run(
+                    workflow_id=workflow_id,
+                    workflow_name=workflow_name,
+                    status="queued",
+                    graph=graph,
+                    input=input_payload,
+                    run_class=run_class,
+                    version=version,
+                    version_hash=version_hash,
+                    started_by=started_by,
+                    memory_scope=memory_scope,
+                    collection=collection,
+                    approval_default=approval_default,
+                    tool_trust=tool_trust,
+                    agent_limits=agent_limits,
+                    data_versions=data_versions,
+                )
+                run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
+                session.add(run)
+                await session.commit()
             await session.refresh(run)
 
         self._tasks[run.id] = asyncio.create_task(
@@ -224,6 +231,7 @@ class RunManager:
                 approval_default=approval_default,
                 tool_trust=tool_trust,
                 agent_limits=agent_limits,
+                data_versions=data_versions,
             )
         )
         return run
@@ -576,6 +584,7 @@ class RunManager:
         approval_default: str | None = None,
         tool_trust: dict[str, str] | None = None,
         agent_limits: dict[str, Any] | None = None,
+        data_versions: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
     ) -> None:
@@ -618,6 +627,9 @@ class RunManager:
                           "tool_trust": _trust_event(tool_trust),
                           # agent 护栏的上限（步数兜底、令牌 / 金额预算），None 是升级前的运行
                           "agent_limits": agent_limits,
+                          # 这次运行固定的上传表格版本（源 id → 快照 id、源名）。续跑、恢复记的是
+                          # 运行记录里的那份，含运行中途第一次用到时补上的；None 是升级前的运行
+                          "data_versions": data_versions,
                           # 这一段是按哪一版重放协议跑的，恢复时据此认出升级前做下的工作
                           "replay_protocol": PROTOCOL},
                 )
@@ -632,7 +644,11 @@ class RunManager:
                     approval_default=approval_default,
                     tool_trust=tool_trust,
                     agent_limits=agent_limits,
-                    extra={"resumed": set(resumed), "actors": dict(actors or {})},
+                    # 数据版本放 extra：数据源工具经 ToolContext.data_versions 拿到（tools/datasource.py
+                    # 的 run_versions）。复制一份：运行中途补固定的源就地写进这个 dict，同一段执行里
+                    # 后面的节点都看得到，但不该碰到别处（运行记录、事件）手上的那个对象
+                    extra={"resumed": set(resumed), "actors": dict(actors or {}),
+                           RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
                 # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
@@ -1003,7 +1019,84 @@ def _carried(run: Run) -> dict[str, Any]:
         "approval_default": run.approval_default,
         "tool_trust": run.tool_trust,
         "agent_limits": run.agent_limits,
+        # 固定的数据版本照运行记录来，不重新读数据源的当前指针：中途重传过，续跑查的仍是发起时那一版
+        "data_versions": run.data_versions,
     }
+
+
+async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
+    """发起时固定这次运行用到的上传表格版本：{源 id: {"snapshot": 当前快照 id, "name": 源名}}。
+
+    和 tool_trust、agent_limits 一样在发起这一刻定下、存进运行记录：续跑、审批恢复沿用它，
+    不再读数据源的当前指针——运行中途有人重传，这次运行查的仍是发起时那一版。数据源工具按它
+    解析源（tools/datasource.py），回收按它保留快照（data/table_versions.gc）。
+
+    只算这张图实际用到的源：调用工具节点、Agent、协作成员绑的 db_query__ / db_schema__，连同
+    子工作流里绑的。没用到的源不固定，否则它们的旧版本会因为这次运行白白留着。手工源不分版本，
+    不进来。工具名里有模板（{{ }}）时，发起时说不准它会落到哪个源，就把所有启用的上传源都固定上
+    （多固定几个只是多留几个旧版本；漏掉一个，这次运行就可能前后查到两版数据）。
+
+    发起时算不到的（继续运行时改了节点配置、没固定版本的子工作流中途被改过、运行中途新建的源）
+    由数据源工具第一次用到时补上（tools/datasource.py 的 _pin_late，记进运行记录并发一条日志事件）。
+    没用到任何上传源时返回空 dict 而不是 None：None 留给升级前发起的运行（照旧用当前版本，不补固定）。
+    """
+    from app.db.models import DataSource
+
+    names, anything = await _bound_sources(session, spec)
+    if not names and not anything:
+        return {}
+    query = select(DataSource.id, DataSource.name, DataSource.current_snapshot_id).where(
+        DataSource.enabled.is_(True), DataSource.origin == "upload",
+        DataSource.current_snapshot_id.is_not(None),
+    ).order_by(DataSource.name)
+    if not anything:
+        query = query.where(DataSource.name.in_(sorted(names)))
+    rows = (await session.execute(query)).all()
+    return {sid: {"snapshot": snap, "name": name} for sid, name, snap in rows}
+
+
+async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]:
+    """图里（含子工作流）绑定的数据源工具指向的源名，以及有没有带模板、发起时定不下来的工具名。
+
+    绑定的取法和发起前检查同一个（api/runs.py 的 tool_bindings），子工作流照运行时的取法
+    读出来接着找：固定了版本的读那一版，没固定的读工作流现在的图。读不到、图不成形的跳过——
+    那个节点运行时自己会报错。同一个工作流（同一版）只读一次，互相引用也不会转圈。
+    """
+    from app.api.runs import node_setting, tool_bindings
+    from app.db.models import WorkflowVersion
+    from app.tools.datasource import source_of_tool
+
+    names: set[str] = set()
+    anything = False
+    seen: set[tuple[str, str]] = set()
+    queue: list[GraphSpec] = [spec]
+    while queue:
+        graph = queue.pop(0)
+        for _, tool in tool_bindings(graph):
+            if "{{" in tool:
+                anything = True
+            elif (source := source_of_tool(tool)) is not None:
+                names.add(source)
+        for node in graph.nodes:
+            if node.type != NodeType.SUBGRAPH:
+                continue
+            # 和 NodeContext.cfg 一样：节点上没写就取图级 defaults（tool_bindings 读工具也是这个规则）
+            wid, pinned = (node_setting(graph, node, k) for k in ("workflow_id", "workflow_version"))
+            key = (str(wid or ""), str(pinned or ""))
+            if not wid or key in seen:
+                continue
+            seen.add(key)
+            try:
+                # 只取图：Workflow 的 versions 是 selectin，整行读会把所有历史版本一起读出来
+                query = (select(WorkflowVersion.graph).where(
+                    WorkflowVersion.workflow_id == wid, WorkflowVersion.version == int(pinned))
+                    if pinned else select(Workflow.graph).where(Workflow.id == wid))
+                sub = (await session.execute(query)).scalar_one_or_none()
+                if sub:
+                    queue.append(GraphSpec.model_validate(sub))
+            except Exception:  # noqa: BLE001 - 读不到、不成形：子工作流节点运行时会说清楚
+                continue
+    return names, anything
 
 
 async def _agent_limits(session: Any) -> dict[str, Any]:

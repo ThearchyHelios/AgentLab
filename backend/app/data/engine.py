@@ -6,16 +6,20 @@ MySQL 要 charset、asyncpg 不认 sslmode 这些事。哪天要加一种库，�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
+import sqlite3
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from app.core.crypto import decrypt
 from app.data import guard
@@ -134,6 +138,122 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
     return f"{driver}://{auth}{host}/{source.database or ''}{('?' + query) if query else ''}"
 
 
+class SqliteHardeningError(sqlite3.OperationalError):
+    """SQLite 连接没能关掉「双引号当字符串」的兼容行为。这条连接不交出去。
+
+    继承 sqlite3.OperationalError：SQLAlchemy 按驱动异常包装，上层（测试连接、工具报错）
+    照常拿到一个连接失败，而不是一个不认识的异常类型。
+    """
+
+
+class _DqsOffConnection(sqlite3.Connection):
+    """打开时就关掉 DQS 的 sqlite3 连接（经 sqlite3.connect 的 factory 参数接入）。
+
+    DQS（double-quoted string）是 SQLite 的历史兼容：双引号里的名字找不到对应的列时，
+    当成字符串字面量。于是列名写错不报错：`SUM("金颔")` 得 0，`GROUP BY "金颔"`
+    把整张表归成一组，结论错了却没人知道。关掉以后同一条 SQL 报 no such column。
+
+    为什么用 factory 而不是 SQLAlchemy 的 connect 事件：aiosqlite 的连接在它自己的
+    线程里建，connect 事件拿到的是异步适配层，要碰底层 sqlite3 连接只能走 aiosqlite
+    的私有属性（_execute / _conn），升级就可能失效。factory 是 sqlite3.connect 的公开
+    参数，aiosqlite.connect 的 **kwargs 原样转给它，SQLAlchemy 的 connect_args 又原样
+    转给 aiosqlite.connect——三层都是公开接口。设置在建连接的那个线程里同步完成，
+    没设上就在这里抛错，连接根本不会进连接池。而且凡是经 engine_args 建的 engine
+    （连接缓存、表单里的一次性测试连接）都自动带上，不必逐处挂事件。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        try:
+            _disable_dqs(self)
+        except BaseException:
+            self.close()
+            raise
+
+
+#: 要关掉的两项：DML（查询、增删改）和 DDL（建表、建索引）里的双引号字符串
+_DQS_OPTIONS = (
+    ("DML", getattr(sqlite3, "SQLITE_DBCONFIG_DQS_DML", None)),
+    ("DDL", getattr(sqlite3, "SQLITE_DBCONFIG_DQS_DDL", None)),
+)
+
+
+def _disable_dqs(conn: sqlite3.Connection) -> None:
+    """关掉 DQS，并读回来确认确实关了。任何一步不成立都抛 SqliteHardeningError。
+
+    Python 3.12 起才有 setconfig / getconfig；没有的话同样拒绝——宁可连不上，
+    也不交出一条会把写错的列名静默当成字符串的连接。
+    """
+    for label, op in _DQS_OPTIONS:
+        try:
+            if op is None:
+                raise AttributeError(f"sqlite3 模块缺少 SQLITE_DBCONFIG_DQS_{label}")
+            conn.setconfig(op, False)
+            still_on = conn.getconfig(op)
+        except Exception as e:  # noqa: BLE001 - 原因原样带出，统一换成拒绝连接
+            raise SqliteHardeningError(_dqs_refusal(f"{type(e).__name__}: {e}")) from e
+        if still_on:
+            raise SqliteHardeningError(_dqs_refusal(f"设置后读回仍为开启（{label}）"))
+
+
+def _dqs_refusal(cause: str) -> str:
+    return ("未能关闭 SQLite 的双引号字符串兼容，已拒绝连接"
+            f"（否则写错的列名会被当成文字，查询不报错却给出错误结果）：{cause}")
+
+
+#: 自检先建的探针表
+_SELF_CHECK_SETUP = "CREATE TABLE _dqs_probe (a INTEGER)"
+#: 自检的探针：每条都写了一个不存在的双引号列名，关掉 DQS 后都必须报 no such column。
+#: 查询一条验 DML 那项，建索引一条验 DDL 那项——只关一项时另一条会照常执行。
+#: 用 ASCII 名字：DQS 对中英文名字一视同仁，SQL 原文也不必进文案检查
+_SELF_CHECK_PROBES = (
+    'SELECT "no_such_column" FROM _dqs_probe',
+    'CREATE INDEX _dqs_probe_i ON _dqs_probe ("no_such_column")',
+)
+
+
+def sqlite_dqs_self_check() -> None:
+    """启动自检：在内存库上确认 DQS 确实关得掉，写错的双引号列名确实报错。
+
+    连接层的每条 SQLite 连接都靠 _DqsOffConnection 关 DQS；这里用同一个类开一条内存
+    连接，查询和建索引各验一次。不成立就抛 RuntimeError，让服务起不来——Python 或
+    SQLite 换了版本、行为变了，宁可启动失败，也不悄悄退回「列名写错照样出数」。
+
+    只认「no such column」这一种报错：探针因为别的原因报错（表没建上、语法变了），
+    说明它根本没走到双引号名字那一步，什么也没验到，同样算失败。
+    """
+    problem: str | None = None
+    try:
+        conn = sqlite3.connect(":memory:", factory=_DqsOffConnection)
+    except Exception as e:  # noqa: BLE001
+        problem = str(e)
+    else:
+        try:
+            conn.execute(_SELF_CHECK_SETUP)
+            for sql in _SELF_CHECK_PROBES:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError as e:
+                    if "no such column" not in str(e):
+                        problem = f"{sql} 报错，但不是预期的「no such column」：{e}"
+                        break
+                else:
+                    problem = f"{sql} 没有报错：双引号里的名字仍被当成字符串"
+                    break
+        except Exception as e:  # noqa: BLE001 - 探针表都建不起来，同样是没验到
+            problem = f"{type(e).__name__}: {e}"
+        finally:
+            conn.close()
+    if problem:
+        logger.critical("SQLite 自检失败，服务不启动：%s", problem)
+        raise RuntimeError(f"SQLite 自检失败：无法确认写错的双引号列名会报错，服务不启动。{problem}")
+
+
+def _sqlite_extra() -> dict[str, Any]:
+    """每个 SQLite engine 都带的连接参数：关 DQS。"""
+    return {"connect_args": {"factory": _DqsOffConnection}}
+
+
 def engine_args(source: Any) -> tuple[str, dict[str, Any]]:
     """真正连库用的连接串和额外参数。只读源在这里拿到**连接层**的只读。
 
@@ -146,22 +266,36 @@ def engine_args(source: Any) -> tuple[str, dict[str, Any]]:
     - PostgreSQL：会话的默认事务只读。能关掉它的 SET / set_config() 守卫都拦。
     - MySQL / MariaDB：会话事务只读。能关掉它的只有 SET，守卫拦。
     - Oracle：没有会话级只读开关，只剩守卫这一道——只读数据源请配只读账号。
+
+    SQLite 不论只读与否都关 DQS（见 _DqsOffConnection）。source 带 immutable
+    （上传表格的版本快照，见 table_versions.SourceView）时，以 mode=ro&immutable=1
+    打开，不看 readonly 字段：快照文件发布后就不再变，immutable 让 SQLite 不加锁、
+    不找日志文件，同时也写不进去。
     """
     url = build_url(source, reveal=True)
-    if not source.readonly:
-        return url, {}
     kind = (source.kind or "").lower()
     if kind == "sqlite":
-        path = source.database or ""
-        if path and path != ":memory:":
-            from urllib.parse import quote
-            url = f"{_DRIVERS['sqlite']}:///file:{quote(path)}?mode=ro&uri=true"
+        return _sqlite_url(source, url), _sqlite_extra()
+    if not source.readonly:
         return url, {}
     if kind in ("postgres", "postgresql"):
         return url, {"connect_args": {"server_settings": {"default_transaction_read_only": "on"}}}
     if kind in ("mysql", "mariadb"):
         return url, {"connect_args": {"init_command": "SET SESSION TRANSACTION READ ONLY"}}
     return url, {}
+
+
+def _sqlite_url(source: Any, url: str) -> str:
+    from urllib.parse import quote
+
+    path = source.database or ""
+    if getattr(source, "immutable", False):
+        if not path or path == ":memory:":
+            raise ValueError("版本快照必须指向一个数据文件")
+        return f"{_DRIVERS['sqlite']}:///file:{quote(path)}?mode=ro&immutable=1&uri=true"
+    if source.readonly and path and path != ":memory:":
+        return f"{_DRIVERS['sqlite']}:///file:{quote(path)}?mode=ro&uri=true"
+    return url
 
 
 def _timeout_value(value: Any) -> float | None:
@@ -218,46 +352,247 @@ def _seconds(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
+#: 连接缓存最多留多少个 engine。版本快照各占一个键，长期运行下键只增不减；
+#: 超出时关掉最久没用的那个，下次用到再建
+MAX_ENGINES = 32
+
+
+class SnapshotTampered(ValueError):
+    """版本快照的数据文件和登记的哈希对不上（或者文件没了）。拒绝查询，也不缓存。"""
+
+
+_TAMPERED = "数据文件与登记的版本不一致，可能被修改过，已拒绝查询"
+_SNAPSHOT_UNREADABLE = "登记版本的数据文件无法读取，无法核对是否被修改过，已拒绝查询"
+_NO_HASH = "数据版本缺少文件哈希的登记，无法核对数据文件是否被修改过，已拒绝查询"
+_REPLACED = "数据文件在核对之后被替换或改动过，已拒绝这次查询；再次查询时会重新核对"
+
+#: 快照文件的指纹：(st_dev, st_ino, st_size, st_mtime_ns)。整份替换（rename 覆盖）换 inode，
+#: 原地改写换大小或修改时间：两种都认得出，而 stat 只要几微秒，每次取引擎、每次借连接都查得起
+Fingerprint = tuple[int, int, int, int]
+
+
+def cache_key(source: Any) -> str:
+    """连接缓存的键：数据源 id 加版本快照 id（没有快照的源为空）。
+
+    上传表格每次发布都是一个新文件，同一个数据源的新旧版本得各用各的连接池——
+    否则固定在旧版本上的运行会查到新文件，或者反过来。
+    """
+    return f"{source.id}:{getattr(source, 'snapshot_id', None) or ''}"
+
+
+def _source_of(key: str) -> str:
+    # 快照 id 是十六进制，不含冒号；数据源 id 里就算有冒号，从右边切也切得对
+    return key.rsplit(":", 1)[0]
+
+
+def _file_sha256(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def _fingerprint(path: str) -> Fingerprint | None:
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+class _Moving(OSError):
+    """算哈希的过程中文件变了：算出来的哈希说明不了现在的文件。"""
+
+
+def _hash_and_print(path: str) -> tuple[str, Fingerprint]:
+    """算文件哈希，连同它的指纹。前后各 stat 一次：对不上说明读的过程中文件被替换或改写了。
+
+    指纹和哈希必须描述同一个文件：之后每次取引擎、借连接都拿当时的 stat 和这份指纹比，
+    比得上才说明 SQLite 打开的还是核对过的那个文件。
+    """
+    before = _fingerprint(path)
+    digest = _file_sha256(path)
+    after = _fingerprint(path)
+    if before is None or before != after:
+        raise _Moving(f"文件在核对过程中发生了变化：{path}")
+    return digest, after
+
+
+async def _verify_snapshot(source: Any, expected: str) -> Fingerprint:
+    """建 engine 之前核对快照文件的哈希，返回核对时的文件指纹。大文件读一遍要时间，放到线程里，不卡事件循环。"""
+    try:
+        actual, fingerprint = await asyncio.to_thread(_hash_and_print, source.database or "")
+    except _Moving as e:
+        logger.warning("快照文件在核对过程中发生了变化：source=%s snapshot=%s path=%s",
+                       source.id, getattr(source, "snapshot_id", None), source.database)
+        raise SnapshotTampered(_TAMPERED) from e
+    except OSError as e:
+        raise SnapshotTampered(_SNAPSHOT_UNREADABLE) from e
+    if actual.lower() != str(expected).strip().lower():
+        logger.warning("快照文件哈希不符：source=%s snapshot=%s path=%s",
+                       source.id, getattr(source, "snapshot_id", None), source.database)
+        raise SnapshotTampered(_TAMPERED)
+    return fingerprint
+
+
+@dataclass
+class _Pin:
+    """一个快照引擎核对过的文件：路径和核对时的指纹。stale 表示已经发现对不上，不再可信。"""
+
+    path: str
+    fingerprint: Fingerprint
+    stale: bool = False
+
+    def holds(self) -> bool:
+        return not self.stale and _fingerprint(self.path) == self.fingerprint
+
+
+def _guard_pool(engine: AsyncEngine, pin: _Pin, key: str) -> None:
+    """每次从连接池借连接时核对文件指纹，对不上就拒绝这条连接。
+
+    取引擎时核对过一次，但引擎缓存着、连接池会在之后新开连接（并发查询、pool_recycle、
+    探活失败重连），每条新连接都按路径重新打开文件。文件要是在这期间被整份替换（恢复备份、
+    同步工具），新连接读到的就是没核对过的文件。所以借连接（checkout）时再比一次：新开的
+    连接打开的是哪个文件，这时 stat 看到的就是哪个。对不上就把这个键标成不可信并拒绝；
+    抛出的异常让 SQLAlchemy 关掉这条连接，下次取引擎时重新核对哈希（内容没变的恢复会放行）。
+    """
+    def check(*_args: Any) -> None:
+        if not pin.holds():
+            if not pin.stale:
+                logger.warning("快照文件在核对之后发生了变化，已拒绝连接：key=%s path=%s", key, pin.path)
+            pin.stale = True
+            raise SnapshotTampered(_REPLACED)
+
+    event.listen(engine.sync_engine, "checkout", check)
+
+
 class EngineCache:
-    """按数据源 id 缓存 engine。连接池的建立不便宜，不该每次查询都重来一遍。
+    """按数据源（和版本快照）缓存 engine。连接池的建立不便宜，不该每次查询都重来一遍。
 
     配置变了要显式 invalidate——改了密码却还在用旧连接，排查起来很费神；
-    改了只读开关却还在用旧连接，只读就形同虚设。
+    改了只读开关却还在用旧连接，只读就形同虚设。invalidate 清掉这个源名下所有版本的连接。
+
+    最多留 MAX_ENGINES 个，按最近使用排序，超出时关掉最久没用的。
+    source 带 expected_sha256 时，这个键新建 engine 前核对一遍文件哈希，并记下核对时的文件指纹
+    （inode、大小、修改时间）。之后缓存命中、连接池借连接时都拿当时的 stat 比这份指纹：快照文件
+    0444 挡不住整份替换（rename 只要目录可写），对不上就摘掉这个引擎、下次重新核对哈希——内容
+    没变（备份恢复回同样的文件）就放行，变了就拒绝。同一个键并发首次使用时只核对一次，大家等同一个结果。
+    source 标着 immutable（版本快照）却没给期望哈希的，一律拒绝：默认放行的话，哪条新路径漏传
+    哈希，快照就不经核对地打开了。
     """
 
-    def __init__(self) -> None:
-        self._engines: dict[str, AsyncEngine] = {}
+    def __init__(self, max_engines: int | None = None) -> None:
+        self._engines: OrderedDict[str, AsyncEngine] = OrderedDict()
+        #: 快照引擎核对过的文件，键和 _engines 相同。手工源没有
+        self._pins: dict[str, _Pin] = {}
         self._lock = asyncio.Lock()
+        #: None 表示按模块常量 MAX_ENGINES（现取，测试里可以改）
+        self._max = max_engines
+        #: 正在进行的快照核对，按（缓存键, 文件, 登记的哈希）合并。核对结束（不论成败）即移除，
+        #: 失败结果不留：下次照常重新核对
+        self._verifying: dict[tuple[str, str, str], asyncio.Future[Fingerprint]] = {}
+
+    def _hit(self, key: str, doomed: list[AsyncEngine]) -> AsyncEngine | None:
+        """缓存里还可信的 engine。快照文件和核对时的指纹对不上的，摘出来放进 doomed 交给调用方关掉。"""
+        engine = self._engines.get(key)
+        if engine is None:
+            return None
+        pin = self._pins.get(key)
+        if pin is not None and not pin.holds():
+            if not pin.stale:
+                logger.warning("快照文件在核对之后发生了变化，重新核对：key=%s path=%s", key, pin.path)
+            del self._engines[key]
+            self._pins.pop(key, None)
+            doomed.append(engine)
+            return None
+        self._engines.move_to_end(key)
+        return engine
 
     async def get(self, source: Any) -> AsyncEngine:
-        key = str(source.id)
-        cached = self._engines.get(key)
-        if cached is not None:
-            return cached
-        async with self._lock:
-            if key in self._engines:
-                return self._engines[key]
-            url, extra = engine_args(source)
-            engine = create_async_engine(
-                url,
-                pool_size=3,
-                max_overflow=2,
-                pool_pre_ping=True,   # 长时间空闲后连接会被数据库掐掉，先探活再用
-                pool_recycle=1800,
-                **extra,
-            )
-            self._engines[key] = engine
+        key = cache_key(source)
+        doomed: list[AsyncEngine] = []
+        try:
+            cached = self._hit(key, doomed)
+            if cached is not None:
+                return cached
+            expected = str(getattr(source, "expected_sha256", None) or "").strip()
+            if getattr(source, "immutable", False) and not expected:
+                logger.warning("版本快照没有登记文件哈希，已拒绝：key=%s path=%s", key, source.database)
+                raise SnapshotTampered(_NO_HASH)
+            fingerprint: Fingerprint | None = None
+            if expected:
+                # 在锁外核对：哈希一个大文件要几秒，不能让别的数据源都排在它后面
+                fingerprint = await self._verify_once(key, source, expected)
+            async with self._lock:
+                cached = self._hit(key, doomed)
+                if cached is not None:
+                    return cached
+                url, extra = engine_args(source)
+                engine = create_async_engine(
+                    url,
+                    pool_size=3,
+                    max_overflow=2,
+                    pool_pre_ping=True,   # 长时间空闲后连接会被数据库掐掉，先探活再用
+                    pool_recycle=1800,
+                    **extra,
+                )
+                if fingerprint is not None:
+                    pin = _Pin(str(source.database or ""), fingerprint)
+                    _guard_pool(engine, pin, key)
+                    self._pins[key] = pin
+                self._engines[key] = engine
+                limit = max(1, self._max if self._max is not None else MAX_ENGINES)
+                while len(self._engines) > limit:
+                    old_key, old = self._engines.popitem(last=False)
+                    self._pins.pop(old_key, None)
+                    doomed.append(old)
             return engine
+        finally:
+            for old in doomed:
+                # 正被借出的连接不受影响：dispose 只关池子里空闲的，借出的还回来时随旧池子回收
+                await old.dispose()
+
+    async def _verify_once(self, key: str, source: Any, expected: str) -> Fingerprint:
+        """核对快照哈希；同一个键已经有一次在核对，就等那一次的结果。
+
+        一次运行开头往往同时发起几次工具调用，查的是同一个快照。不合并的话每个请求
+        各读一遍整个文件（快照可能几百 MB），还挤占默认线程池。
+
+        合并的范围带上文件路径和登记的哈希：键相同而这两样不同的（不该出现，但不赌）
+        各核各的，绝不拿别人的结论放行。核对本身包成任务、等的时候加 shield：某个
+        请求被取消，不连累别人在等的那一次。核对结束就移除——成功之后到 engine
+        装进缓存之间若恰好来了新请求，它会再核对一次；多算一次，不会少算。
+        """
+        token = (key, str(source.database or ""), str(expected).strip().lower())
+        loop = asyncio.get_running_loop()
+        pending = self._verifying.get(token)
+        if pending is None or pending.get_loop() is not loop:
+            pending = loop.create_task(_verify_snapshot(source, expected))
+            self._verifying[token] = pending
+            pending.add_done_callback(lambda done: self._settle_verify(token, done))
+        return await asyncio.shield(pending)
+
+    def _settle_verify(self, token: tuple[str, str, str], done: asyncio.Future[Fingerprint]) -> None:
+        # 只移除自己：失效后可能已经有新的一次登记在同一个位置上
+        if self._verifying.get(token) is done:
+            del self._verifying[token]
 
     async def invalidate(self, source_id: str) -> None:
-        engine = self._engines.pop(str(source_id), None)
-        if engine is not None:
+        sid = str(source_id)
+        # 正在进行的核对也撇开：失效之后来的请求重新核对，不搭失效之前那一次的便车
+        for token in [t for t in self._verifying if _source_of(t[0]) == sid]:
+            del self._verifying[token]
+        keys = [key for key in list(self._engines) if _source_of(key) == sid]
+        doomed = [self._engines.pop(key) for key in keys]
+        for key in keys:
+            self._pins.pop(key, None)
+        for engine in doomed:
             await engine.dispose()
 
     async def close(self) -> None:
+        self._verifying.clear()
         for engine in list(self._engines.values()):
             await engine.dispose()
         self._engines.clear()
+        self._pins.clear()
 
 
 engines = EngineCache()

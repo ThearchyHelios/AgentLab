@@ -168,6 +168,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("conversation_turns", "meta", "JSON"),
     ("data_sources", "last_check", "JSON"),
     ("mcp_servers", "last_check", "JSON"),
+    # 存量的源一律先记成 manual；老的上传源由 table_versions.startup 按路径认出来，
+    # 补上 v0 版本后再改成 upload
+    ("data_sources", "origin", "TEXT DEFAULT 'manual'"),
+    ("data_sources", "current_snapshot_id", "VARCHAR(64)"),
+    # 存量运行没有钉过版本，NULL 正好表示「升级前发起的」
+    ("runs", "data_versions", "JSON"),
 ]
 
 

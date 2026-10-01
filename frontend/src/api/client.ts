@@ -1,8 +1,8 @@
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
   EvidenceAudit, EvidenceJudgeResult, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
-  RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, ValidationIssue, VarIssue, Variable, Workflow,
-  WorkflowVersion,
+  RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
+  UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
 import { localActor } from '../lib/actor'
 import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
@@ -30,11 +30,16 @@ export class ApiError extends Error {
    * detail 是给人看的话，随时可能改写；要按错误种类分支的认这个
    */
   code?: string
+  /**
+   * 后端要用户先拍板时随错误一起给的 {kind, details}（比如上传表格的 422：数字列混入非数字、
+   * 交叉表）。原样保留，按接口各自校验后再用（上传表格见 uploadDecision）
+   */
+  decision?: unknown
 
   constructor(
     public status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string },
+    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; decision?: unknown },
   ) {
     super(message)
     this.name = 'ApiError'
@@ -43,6 +48,7 @@ export class ApiError extends Error {
     this.raw = opts?.raw
     this.timeoutMs = opts?.timeoutMs
     this.code = opts?.code
+    this.decision = opts?.decision
   }
 }
 
@@ -167,6 +173,48 @@ const codeOf = (body: unknown): string | undefined => {
   return typeof code === 'string' && code ? code : undefined
 }
 
+/** 后端 {detail, decision} 里要用户拍板的内容：是个对象就原样带上，没有就是 undefined */
+const decisionOf = (body: unknown): unknown => {
+  const decision = body && typeof body === 'object' ? (body as { decision?: unknown }).decision : undefined
+  return decision && typeof decision === 'object' ? decision : undefined
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/**
+ * 上传表格被退回、要用户先选怎么处理（422 带 decision）时，取出那份决定；别的错误返回 null。
+ *
+ * 只认界面会画的两种（mixed、shape），而且逐项校验形状：后端以后多一种决定、或者字段对不上，
+ * 宁可当普通报错弹出那句话（detail 本身就是给人看的），也不画一个空的选择框让人照着点
+ */
+export function uploadDecision(e: unknown): UploadDecision | null {
+  if (!(e instanceof ApiError) || e.status !== 422 || !isObj(e.decision)) return null
+  const { kind, details } = e.decision as { kind?: unknown; details?: unknown }
+  if (!isObj(details)) return null
+  if (kind === 'mixed' && mixedColumns(details.columns)) {
+    return { kind, details: { columns: details.columns as unknown as UploadMixedColumn[] } }
+  }
+  if (kind === 'shape' && Array.isArray(details.reasons) && details.reasons.length
+      && details.reasons.every((r) => isObj(r) && typeof r.message === 'string')) {
+    // 预告的混合列只是告知：形状对不上就不画，结构问题照常问
+    const mixed = mixedColumns(details.mixed) ? details.mixed as unknown as UploadMixedColumn[] : undefined
+    return {
+      kind,
+      details: {
+        reasons: (details.reasons as Record<string, unknown>[]).map((r) => ({
+          ...r, cells: Array.isArray(r.cells) ? r.cells.map(String) : [],
+        }) as unknown as UploadShapeReason),
+        ...(mixed ? { mixed, mixed_complete: details.mixed_complete !== false } : {}),
+      },
+    }
+  }
+  return null
+}
+
+/** 混合列清单的形状对不对：非空数组，每项有列名和取值数组 */
+const mixedColumns = (v: unknown): boolean => Array.isArray(v) && v.length > 0
+  && v.every((c) => isObj(c) && typeof c.column === 'string' && Array.isArray(c.values))
+
 /** 非 2xx 的响应 → ApiError，顺带报告连接状态。fetch 和 XHR 两条路共用 */
 function failure(status: number, statusText: string, text: string, path?: string): ApiError {
   let body: any
@@ -184,7 +232,7 @@ function failure(status: number, statusText: string, text: string, path?: string
     const detail = body?.detail ?? body
     return new ApiError(status, describeDetail(detail, path), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
-      code: codeOf(body),
+      code: codeOf(body), decision: decisionOf(body),
     })
   }
   const message = status >= 500
@@ -472,21 +520,25 @@ export const api = {
     test: (id: string) => post<ConnectionTest>(`/datasources/${id}/test`, {}),
     /** 测一份还没保存的配置，只测连接不落库。编辑时带上 id，后端可以沿用已存的密码 */
     testConfig: (body: any) => post<ConnectionTest>('/datasources/test', body),
-    /** 上传 Excel / CSV，变成一个可以用 SQL 查的数据源。同名就地替换。onProgress 报字节进度 */
-    uploadTable: (file: File, body: { name: string; description?: string; header_row?: number }, opts?: UploadOptions) => {
+    /**
+     * 上传 Excel / CSV，变成一个可以用 SQL 查的数据源。同名发布新版本替换。onProgress 报字节进度。
+     *
+     * 解析器要用户先拍板时回 422，错误上带着 decision（用 uploadDecision 取）；用户选完，带上
+     * 答案重传：mixed='null' 把数字列里的非数字存为空值，raw_mode=true 按原样导入（未规整）
+     */
+    uploadTable: (file: File, body: {
+      name: string; description?: string; header_row?: number; mixed?: 'reject' | 'null'; raw_mode?: boolean
+    }, opts?: UploadOptions) => {
       const form = new FormData()
       form.append('file', file)
       form.append('name', body.name)
       form.append('description', body.description ?? '')
       form.append('header_row', String(body.header_row ?? 1))
-      type Out = {
-        source: any; replaced: boolean
-        tables: { name: string; sheet: string; rows: number
-                  columns: { name: string; type: string }[] }[]
-      }
+      form.append('mixed', body.mixed ?? 'reject')
+      form.append('raw_mode', body.raw_mode ? 'true' : 'false')
       return opts?.onProgress
-        ? upload<Out>('/datasources/upload', form, opts)
-        : request<Out>('/datasources/upload', { method: 'POST', body: form, signal: opts?.signal })
+        ? upload<UploadResult>('/datasources/upload', form, opts)
+        : request<UploadResult>('/datasources/upload', { method: 'POST', body: form, signal: opts?.signal })
     },
     introspect: (id: string, schema?: string) =>
       post<any>(`/datasources/${id}/introspect${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`, {}),

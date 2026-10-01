@@ -14,7 +14,7 @@ from app.db.models import CustomTool, McpServer
 from app.tools.custom import ToolFailure, schema_problem, trial
 from app.tools.mcp_manager import mcp_manager
 from app.tools.registry import (
-    ToolArgsError, ToolBuildError, ToolContext, all_specs, build_tools, call_is_dangerous,
+    ToolArgsError, ToolBuildError, ToolContext, Versions, all_specs, build_tools, call_is_dangerous,
     call_tool, get_spec,
 )
 from app.tools.trust import load_trust, set_trust
@@ -135,8 +135,9 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
             return (f"将调用自定义接口「{name}」"
                     f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（未填写地址）'}）")
         return f"将在沙箱中执行自定义工具「{name}」的代码"
-    # 数据源工具：只读源上的查询没有副作用，可写源上的写操作有
-    tools = await build_tools([name], ToolContext(run_id="playground", node_id="playground"),
+    # 数据源工具：只读源上的查询没有副作用，可写源上的写操作有。不在运行里，上传表格看当前版本
+    tools = await build_tools([name], ToolContext(run_id="playground", node_id="playground",
+                                                  data_versions=Versions.CURRENT),
                               session=session)
     if tools and call_is_dangerous(tools[0], name, args):
         return f"将在可写数据源上执行写操作：{str(args.get('sql') or '')[:120]}"
@@ -163,8 +164,9 @@ async def run_tool(
             # 放进确认框里读起来就不对
             raise HTTPException(409, f"{effect}。在工具库中执行不经过审批，确认后才会执行。")
 
+    # 不在运行里：上传表格查当前版本（运行里查的是发起时固定的那一版）
     ctx = ToolContext(run_id="playground", node_id="playground",
-                      sandbox_session=payload.sandbox_session)
+                      sandbox_session=payload.sandbox_session, data_versions=Versions.CURRENT)
     import time
 
     started = time.perf_counter()
@@ -285,7 +287,8 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
     import json
     import time
 
-    ctx = ToolContext(run_id="playground", node_id="test", sandbox_session="playground")
+    ctx = ToolContext(run_id="playground", node_id="test", sandbox_session="playground",
+                      data_versions=Versions.CURRENT)
     started = time.perf_counter()
 
     def took() -> int:

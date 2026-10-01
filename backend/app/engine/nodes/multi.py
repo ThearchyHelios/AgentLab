@@ -27,6 +27,7 @@ from app.engine.toolcalls import (
 )
 from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
+from app.tools.datasource import run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolContext,
@@ -311,6 +312,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 sandbox_session=ctx.run.thread_id,
                 memory_scope=ctx.run.memory_scope,
                 collection=ctx.run.collection,
+                data_versions=run_versions(ctx.run),
+                # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
+                emit=ctx.emit,
             )
             tools = await build_tools(cfg.get("tools", []) or [], tool_ctx, session=session)
 

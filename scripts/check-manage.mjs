@@ -82,10 +82,35 @@ function fakeUploadProgress() {
 }
 
 /**
+ * 上传表格时表单里的文本字段（mixed、raw_mode、header_row……）逐次记到 window.__uploadForms。
+ * page.route 拿到的 multipart 请求体按原文切太脆（文件那一段 Chrome 也不一定给），在页面里
+ * 直接读 FormData 最稳。和 fakeUploadProgress 谁先装都行：两边都只是包一层 send
+ */
+function recordUploadForms() {
+  const open = XMLHttpRequest.prototype.open
+  const send = XMLHttpRequest.prototype.send
+  window.__uploadForms = []
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__formUrl = String(url)
+    return open.call(this, method, url, ...rest)
+  }
+  XMLHttpRequest.prototype.send = function (body) {
+    if (/\/datasources\/upload(\?|$)/.test(this.__formUrl ?? '') && body instanceof FormData) {
+      window.__uploadForms.push(Object.fromEntries([...body.entries()]
+        .map(([k, v]) => [k, typeof v === 'string' ? v : `<file ${v.name}>`])))
+    }
+    return send.call(this, body)
+  }
+}
+const uploadForms = (page) => page.evaluate(() => window.__uploadForms ?? [])
+
+/**
  * 开一页：GET 放行，写请求交给 handlers（按「METHOD 路径正则」匹配），没配的一律
  * 拦成 503——既不写库，也顺带检验「写失败有反馈」。所有原生对话框都算失败。
  */
-async function open(path, { handlers = [], theme = THEME, viewport = { width: 1280, height: 860 }, uploadProgress = false } = {}) {
+async function open(path, {
+  handlers = [], theme = THEME, viewport = { width: 1280, height: 860 }, uploadProgress = false, recordForms = false,
+} = {}) {
   const ctx = await browser.newContext({ viewport, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
   opened.add(ctx)
   // 找不到元素就早点失败：默认 30 秒一项，一处点不到能拖住整节半分钟
@@ -95,6 +120,7 @@ async function open(path, { handlers = [], theme = THEME, viewport = { width: 12
     try { localStorage.setItem('agentlab.theme', t); localStorage.removeItem('agentlab.health') } catch { /* noop */ }
   }, theme)
   if (uploadProgress) await ctx.addInitScript(fakeUploadProgress)
+  if (recordForms) await ctx.addInitScript(recordUploadForms)
   const page = await ctx.newPage()
   const sent = []
   const errors = []
@@ -735,7 +761,8 @@ await section('设置 · 证据裁判', async () => {
 })
 
 await section('数据 · 数据库', async () => {
-  const dbs = sources.filter((s) => !/[\\/]uploads[\\/]tables[\\/]/.test(s.database ?? ''))
+  // 上传的表格按来源标记认（origin），不按路径：上传库的路径随版本变
+  const dbs = sources.filter((s) => s.origin !== 'upload')
   const first = dbs.find((s) => s.table_count > 0) ?? dbs[0]
   const oracle = dbs.find((s) => s.kind === 'oracle')
   const noCheck = { last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null }
@@ -747,6 +774,7 @@ await section('数据 · 数据库', async () => {
     password_masked: '', has_password: false, table_count: 0, schema_synced_at: null, cached_schema: 'ods',
     schema_error: 'NoSuchTableError: ods', available_schemas: ['mes', 'ods', 'public'], tools: ['db_query__zz_probe'],
     last_checked_at: ago(2 * 3600_000), last_check_ok: false, last_latency_ms: null, last_error: '连接失败：用户名或密码错误',
+    origin: 'manual', current_snapshot: null,
   }
   // 假库二：配置改成了 sales，缓存还是按 legacy 探的——助手看到的和配置对不上
   const drifted = {
@@ -1048,11 +1076,13 @@ await section('数据 · 遮罩列（证据面板的 mask_columns）', async () 
     enabled: true, password_masked: '', has_password: false, table_count: 2, schema_synced_at: ago(3600_000), cached_schema: 'sales',
     schema_error: '', available_schemas: [], tools: ['db_query__zz_mask'],
     last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null,
+    origin: 'manual', current_snapshot: null,
   }
   const upload = {
     ...base, id: 'check-manage-upmask', name: 'zz_upload_mask', kind: 'sqlite', host: null, username: null,
-    database: '/tmp/agentlab/uploads/tables/zz_upload_mask.db', options: { query_timeout_s: '30' }, table_count: 1,
-    tools: ['db_query__zz_upload_mask'],
+    database: `/tmp/agentlab/uploads/tables/check-manage-upmask/builds/${'a'.repeat(64)}.db`,
+    options: { query_timeout_s: '30' }, table_count: 1, tools: ['db_query__zz_upload_mask'],
+    origin: 'upload', current_snapshot: { id: '1'.repeat(64), created_at: ago(3600_000), file_name: 'orders.xlsx', raw_state: 'kept' },
   }
   let cur = base
   let up = upload
@@ -1145,20 +1175,29 @@ await section('数据 · 遮罩列（证据面板的 mask_columns）', async () 
 })
 
 await section('数据 · 表格', async () => {
+  // 新库路径按版本存放：uploads/tables/<源 id>/builds/<构建 id>.db。卡片认的是 origin，不看路径
   const fake = {
     source: {
       id: 'check-manage-fake', name: 'sales_demo', kind: 'sqlite', host: null, port: null,
-      database: '/tmp/x/uploads/tables/sales_demo.db', username: null, options: {}, readonly: true,
+      database: `/tmp/x/uploads/tables/check-manage-fake/builds/${'b'.repeat(64)}.db`, username: null, options: {}, readonly: true,
       description: '', enabled: true, password_masked: '', has_password: false, table_count: 1,
       schema_synced_at: new Date().toISOString(), schema_error: '', available_schemas: [], tools: ['db_query__sales_demo'],
+      origin: 'upload',
+      current_snapshot: { id: 'c'.repeat(64), created_at: new Date().toISOString(), file_name: 'sales_demo.csv', raw_state: 'kept' },
     },
     replaced: false,
-    tables: [{ name: 'sales_demo', sheet: 'sales_demo', rows: 12, columns: [
-      { name: '2026-01', type: 'REAL' }, { name: 'region', type: 'TEXT' }, { name: 'Unnamed: 2', type: 'TEXT' },
-    ] }],
+    import_id: 'check-manage-import', snapshot_id: 'c'.repeat(64), build_reused: false,
+    skipped_sheets: [], conversions: [], warnings: [],
+    // name 是 SQL 列名，header 是原表头：像不像一行数据按原表头判断（「2026-01」清洗成 c_2026_01 就看不出来了）
+    tables: [{ name: 'sales_demo', sheet: 'sales_demo', rows: 12, region: 'A1:C13', unshaped: false, blank_rows_skipped: 0,
+      columns_trimmed: [], columns: [
+        { name: 'c_2026_01', type: 'REAL', header: '2026-01' }, { name: 'region', type: 'TEXT', header: 'region' },
+        { name: 'col_3', type: 'TEXT', header: '' },
+      ] }],
   }
   const { page, sent, natives, close } = await open('/data/tables', {
     uploadProgress: true,
+    recordForms: true,
     handlers: [
       [/^POST \/datasources\/upload$/, delayed(400, fake, 201)],
       // 传上来的表只有一两张，卡片会自动摊开结构：假的那张也得有结构可取
@@ -1178,6 +1217,9 @@ await section('数据 · 表格', async () => {
   })
   await page.getByRole('button', { name: /传表格/ }).first().click()
   const dlg = dialog(page)
+  const notice = await dlg.locator('[data-raw-notice]').innerText().catch(() => '')
+  check('上传之前告知：原件（含隐藏工作表）保存在服务端，用于核对和追溯，之后可以清除',
+        ['原始文件', '隐藏工作表', '服务端', '核对和追溯', '清除'].every((w) => notice.includes(w)), notice)
   await dlg.locator('input[type="file"]').setInputFiles({ name: 'sales_demo.csv', mimeType: 'text/csv', buffer: Buffer.from('2026-01,region\n1,east\n') })
   check('文件名自动变成数据源名', (await dlg.locator('input.mono').first().inputValue()) === 'sales_demo')
   await dlg.getByRole('button', { name: /导入/ }).click()
@@ -1199,7 +1241,11 @@ await section('数据 · 表格', async () => {
   await page.waitForTimeout(700)
   const res = await dialog(page).innerText()
   check('导入完弹窗不关，停在列名和类型上', res.includes('region') && res.includes('TEXT'))
-  check('像数据的列名标黄并提示改表头行号', await dialog(page).locator('[data-suspicious]').count() === 2 && res.includes('第 2 行'))
+  check('像数据的表头标黄并提示改表头行号（按原表头判断，不按清洗后的列名）',
+        await dialog(page).locator('[data-suspicious]').count() === 2 && res.includes('第 2 行'))
+  const firstForm = (await uploadForms(page))[0] ?? {}
+  check('第一次上传不替用户做决定：数字列混入非数字默认拒收，不按原样导入',
+        firstForm.mixed === 'reject' && firstForm.raw_mode === 'false' && firstForm.header_row === '1', JSON.stringify(firstForm))
   check('两个出口：列名无误 · 完成 / 表头有误 · 改行号重传',
         await dialog(page).getByRole('button', { name: '列名无误 · 完成' }).count() === 1
         && await dialog(page).getByRole('button', { name: /表头有误/ }).count() === 1)
@@ -1230,6 +1276,356 @@ await section('数据 · 表格', async () => {
   await shot(page, 'table-columns')
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('上传只发了一次', sent.filter((s) => s.key === 'POST /datasources/upload').length === 1)
+  await close()
+})
+
+await section('数据 · 表格：导入前的决定与回执', async () => {
+  // 一张仿客流表的交叉表（标签都是假名）：服务端先说结构不规整（shape），选了按原样导入之后又说
+  // 数字列混进了占位符（mixed），选了存为空值才导入成功。服务端的回答排在 replies 里，一次取一个
+  const src = {
+    id: 'check-manage-decide', name: 'zz_flow', kind: 'sqlite', host: null, port: null,
+    database: `/tmp/x/uploads/tables/check-manage-decide/builds/${'d'.repeat(64)}.db`, username: null, options: {},
+    readonly: true, description: '', enabled: true, password_masked: '', has_password: false, table_count: 1,
+    schema_synced_at: ago(0), cached_schema: '', schema_error: '', available_schemas: [], tools: ['db_query__zz_flow'],
+    last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null,
+    origin: 'upload', current_snapshot: { id: 'e'.repeat(64), created_at: ago(0), file_name: 'zz_flow.csv', raw_state: 'kept' },
+  }
+  // detail 是服务端那句原话：界面画的是选择页，不该把它当报错弹出来
+  const shape = {
+    detail: '检查脚本的 422 原话：结构不规整',
+    decision: { kind: 'shape', details: { reasons: [
+      { sheet: '时段客流', kind: 'date_header', cells: ['B1:H1'],
+        message: '第 1 行（表头）有 7 个日期样式的单元格（B1:H1），疑似日期横排的交叉表' },
+      { sheet: '时段客流', kind: 'section_title', cells: ['A6', 'A11'],
+        message: '第 6、11 行只有一个单元格有文字、其余列为空（A6「分区乙」、A11「分区丙」），疑似分段标题或备注' },
+    ] } },
+  }
+  const mixed = {
+    detail: '检查脚本的 422 原话：数字列混入非数字',
+    decision: { kind: 'mixed', details: { columns: [
+      { sheet: '时段客流', table: '时段客流', column: 'c_8月1日', header: '8月1日', numeric: 14, nonnumeric: 4,
+        values: [{ value: '·', count: 3 }, { value: 'N/A', count: 1 }] },
+    ] } },
+  }
+  const receipt = {
+    source: src, replaced: false, import_id: 'check-manage-imp', snapshot_id: 'e'.repeat(64), build_reused: false,
+    skipped_sheets: [
+      { sheet: '备注', state: 'hidden', reason: 'hidden' },
+      { sheet: '口令', state: 'veryHidden', reason: 'hidden' },
+      { sheet: 'Sheet3', state: 'visible', reason: 'empty' },
+    ],
+    conversions: [
+      { table: '时段客流', column: 'c_8月1日', kind: 'nonnumeric_to_null', count: 4, examples: ['·', 'N/A'] },
+      { table: '时段客流', column: '合计', kind: 'thousands_separator', count: 2, examples: ['1,234', '2,345'] },
+    ],
+    warnings: ['表「时段客流」按原样导入、未经规整（表头是横排的日期、表内有分段标题行）：同一列里混有不同口径的行，不能直接对列求和'],
+    tables: [{
+      name: '时段客流', sheet: '时段客流', rows: 18, region: 'A1:I20', unshaped: true, blank_rows_skipped: 2,
+      columns_trimmed: ['J'],
+      columns: [
+        { name: '分区', type: 'TEXT', header: '分区' }, { name: 'c_8月1日', type: 'REAL', header: '8月1日' },
+        { name: '合计', type: 'INTEGER', header: '合计' },
+      ],
+    }],
+  }
+  const replies = []
+  const { page, sent, natives, errors, close } = await open('/data/tables', {
+    recordForms: true,
+    handlers: [
+      [/^POST \/datasources\/upload$/, (route) => {
+        const [body, status] = replies.shift() ?? [{ detail: '检查脚本没有准备这次的回答' }, 500]
+        return json(body, status)(route)
+      }],
+      [/^GET \/datasources\/check-manage-decide\/schema$/, json({ tables: ['时段客流'], summary: '', synced_at: ago(0) })],
+    ],
+  })
+  const posts = () => sent.filter((s) => s.key === 'POST /datasources/upload').length
+  const body = () => page.locator('body').innerText()
+  await page.getByRole('button', { name: /传表格/ }).first().click()
+  let dlg = dialog(page)
+  await dlg.locator('input[type="file"]').setInputFiles({ name: 'zz_flow.csv', mimeType: 'text/csv', buffer: Buffer.from('分区,8月1日\n分区甲,12\n') })
+
+  // ---- 结构不规整：逐条原因带坐标，说明要按配方导入，「按原样导入」旁边写后果
+  replies.push([shape, 422])
+  await dlg.getByRole('button', { name: /导入/ }).click()
+  const shapeView = page.locator('[data-upload-decision="shape"]')
+  await shapeView.waitFor({ timeout: 5000 }).catch(() => {})
+  dlg = dialog(page)
+  const shapeText = await shapeView.innerText().catch(() => '')
+  check('结构不规整（422 shape）：弹窗换成选择页，不弹报错', await shapeView.count() === 1
+        && !(await body()).includes('检查脚本的 422 原话'), shapeText.slice(0, 80))
+  check('……逐条列出原因，带坐标', await shapeView.locator('[data-shape-reason]').count() === 2
+        && shapeText.includes('表头是横排的日期') && shapeText.includes('表内有分段标题行')
+        && (await shapeView.locator('[data-shape-cells]').first().innerText()).includes('B1:H1')
+        && shapeText.includes('A6') && shapeText.includes('A11'), shapeText.replace(/\s+/g, ' ').slice(0, 200))
+  check('……说明这类表要按配方导入', (await shapeView.locator('[data-shape-recipe]').innerText().catch(() => '')).includes('按配方导入'))
+  const rawBtn = dlg.getByRole('button', { name: '按原样导入（未规整）' })
+  const consequence = dlg.locator('[data-raw-consequence]')
+  const consequenceText = await consequence.innerText().catch(() => '')
+  const adjacent = await rawBtn.evaluate((el) => {
+    const id = el.getAttribute('aria-describedby')
+    const note = id && document.getElementById(id)
+    return !!note && note.parentElement === el.parentElement && note.hasAttribute('data-raw-consequence')
+  }).catch(() => false)
+  check('……「按原样导入（未规整）」旁边写明后果：同一列混有不同口径的行，不能直接对列求和',
+        await rawBtn.count() === 1 && adjacent && consequenceText.includes('不同口径') && consequenceText.includes('不能直接对列求和'),
+        consequenceText)
+  const firstForm = (await uploadForms(page))[0] ?? {}
+  check('……第一次上传默认拒收：mixed=reject、raw_mode=false',
+        firstForm.mixed === 'reject' && firstForm.raw_mode === 'false', JSON.stringify(firstForm))
+  await shot(page, 'table-decision-shape')
+
+  // ---- 决定页上按 Esc、点 ×：文件还在，先问一句，不直接关掉丢了文件
+  const asking = () => dialog(page).locator('[role="alert"]', { hasText: '有未保存的修改' })
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(150)
+  check('决定页按 Esc：先问「放弃 / 继续编辑」，弹窗和选择页都还在', await asking().count() === 1
+        && await shapeView.count() === 1 && await dialog(page).getByRole('button', { name: '放弃修改' }).count() === 1)
+  await dialog(page).getByRole('button', { name: '继续编辑' }).click()
+  await page.waitForTimeout(150)
+  check('……「继续编辑」：询问收起，仍在选择页', await asking().count() === 0 && await shapeView.count() === 1)
+  await dialog(page).getByRole('button', { name: '关闭' }).click()
+  await page.waitForTimeout(150)
+  check('……点 × 同样先问', await asking().count() === 1 && await shapeView.count() === 1)
+  await dialog(page).getByRole('button', { name: '继续编辑' }).click()
+  await page.waitForTimeout(150)
+  check('……这几下都没有发请求', posts() === 1 && await asking().count() === 0, String(posts()))
+  dlg = dialog(page)
+
+  // ---- 取消：什么都不发，回到表单，文件还在
+  await dlg.getByRole('button', { name: '取消', exact: true }).click()
+  await page.waitForTimeout(200)
+  dlg = dialog(page)
+  check('「取消」回到表单：不再发请求，文件和名字都还在', posts() === 1 && await page.locator('[data-upload-decision]').count() === 0
+        && (await dlg.innerText()).includes('zz_flow.csv') && (await dlg.locator('input.mono').first().inputValue()) === 'zz_flow')
+  check('……没有选过任何处理方式', await dlg.locator('[data-upload-choices]').count() === 0)
+
+  // ---- 再导入：选按原样导入 → 服务端又问数字列 → 选存为空值 → 成功
+  replies.push([shape, 422], [mixed, 422], [receipt, 201])
+  await dlg.getByRole('button', { name: /导入/ }).click()
+  await shapeView.waitFor({ timeout: 5000 }).catch(() => {})
+  await dialog(page).getByRole('button', { name: '按原样导入（未规整）' }).click()
+  const mixedView = page.locator('[data-upload-decision="mixed"]')
+  await mixedView.waitFor({ timeout: 5000 }).catch(() => {})
+  dlg = dialog(page)
+  const forms = await uploadForms(page)
+  check('选「按原样导入」：带 raw_mode=true 重新上传，数字列的处理仍是拒收',
+        forms[2]?.raw_mode === 'true' && forms[2]?.mixed === 'reject', JSON.stringify(forms[2] ?? {}))
+  const col = mixedView.locator('[data-mixed-column="c_8月1日"]')
+  const colText = await col.innerText().catch(() => '')
+  check('数字列混入非数字（422 mixed）：列出每一列和其中的非数字取值及个数',
+        await mixedView.count() === 1 && colText.includes('8月1日') && colText.includes('数字 14 个，非数字 4 个')
+        && (await col.locator('[data-mixed-value="·"]').innerText().catch(() => '')).includes('3 个')
+        && (await col.locator('[data-mixed-value="N/A"]').innerText().catch(() => '')).includes('1 个'),
+        colText.replace(/\s+/g, ' '))
+  check('……写明已选的「按原样导入（未规整）」', (await mixedView.locator('[data-upload-choices]').innerText().catch(() => '')).includes('按原样导入'))
+  check('……两个出口：存为空值按数字导入 / 取消',
+        await dlg.getByRole('button', { name: '把这些值存为空值，按数字导入' }).count() === 1
+        && await dlg.getByRole('button', { name: '取消', exact: true }).count() === 1)
+  check('……不弹报错', !(await body()).includes('检查脚本的 422 原话'))
+  await shot(page, 'table-decision-mixed')
+  await dlg.getByRole('button', { name: '把这些值存为空值，按数字导入' }).click()
+  const result = page.locator('[data-upload-result]')
+  await result.waitFor({ timeout: 5000 }).catch(() => {})
+  const third = (await uploadForms(page))[3] ?? {}
+  check('选「存为空值」：带 mixed=null 重新上传，先前选的按原样导入一并带上',
+        third.mixed === 'null' && third.raw_mode === 'true', JSON.stringify(third))
+  check('一共发了 4 次（取消那次没发）', posts() === 4, String(posts()))
+
+  // ---- 回执
+  const table = result.locator('[data-upload-table="时段客流"]')
+  const tableText = await table.innerText().catch(() => '')
+  check('回执：未规整的表打上标记', (await table.locator('[data-unshaped]').innerText().catch(() => '')).includes('未规整'))
+  const mappedChip = await table.locator('[data-header="8月1日"]').innerText().catch(() => '')
+  check('……原表头和列名不同时并排写出（8月1日 → c_8月1日），相同的只写一次',
+        mappedChip.includes('8月1日') && mappedChip.includes('c_8月1日') && await table.locator('[data-header]').count() === 1
+        && (await result.innerText()).includes('箭头左侧为原表头'), mappedChip.replace(/\s+/g, ' '))
+  const housekeeping = await table.locator('[data-upload-housekeeping]').innerText().catch(() => '')
+  check('……去掉的空行和空列', housekeeping.includes('已跳过 2 个空行') && housekeeping.includes('J'), housekeeping)
+  check('……导入区域', tableText.includes('A1:I20'))
+  const hidden = await result.locator('[data-skipped-hidden]').innerText().catch(() => '')
+  check('……跳过的隐藏工作表（深度隐藏的注明）', hidden.includes('2 个隐藏工作表') && hidden.includes('「备注」')
+        && hidden.includes('「口令」（深度隐藏）'), hidden)
+  check('……没有内容的工作表另写一行', (await result.locator('[data-skipped-empty]').innerText().catch(() => '')).includes('Sheet3'))
+  const toNull = await result.locator('[data-conversion="nonnumeric_to_null"]').innerText().catch(() => '')
+  const thousands = await result.locator('[data-conversion="thousands_separator"]').innerText().catch(() => '')
+  check('……类型转换：哪一列、怎么转、多少个、举例', toNull.includes('c_8月1日') && toNull.includes('非数字的值已存为空值')
+        && toNull.includes('共 4 个') && toNull.includes('「·」') && thousands.includes('千分位') && thousands.includes('「1,234」'),
+        `${toNull} | ${thousands}`)
+  const warnings = result.locator('[data-upload-warnings] li')
+  check('……警告逐条列出', await warnings.count() === 1 && (await warnings.first().innerText()).includes('不能直接对列求和'))
+  check('……列表里有了这张表（按来源分到「表格」）', await page.locator('[data-source="zz_flow"]').count() === 1)
+  await shot(page, 'table-upload-receipt')
+
+  // ---- 改表头行号：上次的回答作废，重新问
+  replies.push([mixed, 422])
+  await dialog(page).getByRole('button', { name: /表头有误/ }).click()
+  await page.waitForTimeout(200)
+  check('改表头行号重传：已选的处理方式清空', await dialog(page).locator('[data-upload-choices]').count() === 0)
+  await dialog(page).getByRole('button', { name: /导入/ }).click()
+  await mixedView.waitFor({ timeout: 5000 }).catch(() => {})
+  const fifth = (await uploadForms(page))[4] ?? {}
+  check('……换了表头行，又按默认拒收发出（不沿用上次的回答）',
+        fifth.header_row === '2' && fifth.mixed === 'reject' && fifth.raw_mode === 'false', JSON.stringify(fifth))
+
+  // ---- 认不出的决定：当普通报错弹出服务端那句话，不画空的选择页
+  await dialog(page).getByRole('button', { name: '取消', exact: true }).click()
+  await page.waitForTimeout(200)
+  replies.push([{ detail: '检查脚本：认不出的决定', decision: { kind: 'other', details: {} } }, 422])
+  await dialog(page).getByRole('button', { name: /导入/ }).click()
+  await page.waitForTimeout(600)
+  check('认不出的决定按普通报错显示服务端的原话，弹窗留在表单上',
+        (await body()).includes('检查脚本：认不出的决定') && await page.locator('[data-upload-decision]').count() === 0
+        && await dialog(page).getByRole('button', { name: /导入/ }).isEnabled())
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据 · 表格：卡片按来源区分、显示当前版本', async () => {
+  const blank = {
+    kind: 'sqlite', host: null, port: null, username: null, options: {}, readonly: true, description: '', enabled: true,
+    password_masked: '', has_password: false, cached_schema: '', schema_error: '', available_schemas: [],
+    last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null,
+  }
+  const up = {
+    ...blank, id: 'check-manage-ver', name: 'zz_versioned', table_count: 2, tools: ['db_query__zz_versioned'],
+    database: `/tmp/x/uploads/tables/check-manage-ver/builds/${'f'.repeat(64)}.db`, schema_synced_at: ago(30 * 24 * 3600_000),
+    origin: 'upload',
+    current_snapshot: { id: '2'.repeat(64), created_at: ago(3 * 3600_000), file_name: '时段客流.xlsx', raw_state: 'kept' },
+  }
+  // 迁移前上传的老版本：没有记下文件名，也没有原件。照真实后端的样子造：迁移补建的快照时间是迁移那一刻
+  // （升级后服务启动时，这里是两分钟前），原来的同步时间（schema_synced_at，40 天前）迁移时原样保留
+  const legacy = {
+    ...up, id: 'check-manage-legacy', name: 'zz_legacy', table_count: 1, tools: ['db_query__zz_legacy'],
+    database: '/tmp/x/uploads/tables/zz_legacy.db', schema_synced_at: ago(40 * 24 * 3600_000),
+    current_snapshot: { id: '4'.repeat(64), created_at: ago(2 * 60_000), file_name: '', raw_state: 'absent' },
+  }
+  // 没迁移成的早期上传（数据文件缺失、迁移失败）：来源还是 manual，路径是老的 uploads/tables/<名>.db。
+  // 服务端允许同名重传把它变成上传的表格，前端不知道上传目录在哪，不能拦
+  let unmigrated = {
+    ...blank, id: 'check-manage-unmigrated', name: 'zz_unmigrated', table_count: 0, tools: ['db_query__zz_unmigrated'],
+    database: '/tmp/x/uploads/tables/zz_unmigrated.db', schema_synced_at: null, origin: 'manual', current_snapshot: null,
+  }
+  // 手工登记的其他库：名字照样在前端就拦住
+  const pg = {
+    ...blank, id: 'check-manage-pg', name: 'zz_pgdb', kind: 'postgres', host: '10.0.0.8', port: 5432, database: 'mes',
+    username: 'reader', table_count: 0, tools: ['db_query__zz_pgdb'], schema_synced_at: null, origin: 'manual', current_snapshot: null,
+  }
+  // 手工登记的 SQLite，路径恰好长得像老的上传路径：按来源算，它在「数据库」标签
+  const lookalike = {
+    ...blank, id: 'check-manage-lookalike', name: 'zz_lookalike', table_count: 0, tools: ['db_query__zz_lookalike'],
+    database: '/srv/old/uploads/tables/zz_lookalike.db', schema_synced_at: null, origin: 'manual', current_snapshot: null,
+  }
+  // 同名重传的回答按次序给（multipart 请求体按原文切太脆，发出的名字用 uploadForms 核对）：
+  // 第一次是手工库，回服务端那句 409 原话；第二次是没迁移成的早期上传，就地变成上传的表格
+  const replies = [
+    () => json({ detail: '已存在名为「zz_lookalike」的数据源（非上传表格），请换一个名称' }, 409),
+    () => {
+      unmigrated = {
+        ...unmigrated, origin: 'upload', table_count: 1, schema_synced_at: ago(0),
+        database: `/tmp/x/uploads/tables/check-manage-unmigrated/builds/${'5'.repeat(64)}.db`,
+        current_snapshot: { id: '6'.repeat(64), created_at: ago(0), file_name: 'zz_unmigrated.csv', raw_state: 'kept' },
+      }
+      return json({
+        source: unmigrated, replaced: true, import_id: 'check-manage-imp2', snapshot_id: '6'.repeat(64), build_reused: false,
+        skipped_sheets: [], conversions: [], warnings: [],
+        tables: [{ name: 'zz_unmigrated', sheet: 'zz_unmigrated', rows: 1, region: 'A1:B2', unshaped: false, blank_rows_skipped: 0,
+          columns_trimmed: [], columns: [{ name: 'region', type: 'TEXT', header: 'region' }, { name: 'amount', type: 'INTEGER', header: 'amount' }] }],
+      }, 201)
+    },
+  ]
+  const reupload = (route) => (replies.shift() ?? (() => json({ detail: '检查脚本没有准备这次的回答' }, 500)))()(route)
+  const { page, sent, natives, errors, close } = await open('/data/tables', {
+    recordForms: true,
+    handlers: [
+      [/^GET \/datasources$/, (route) => json([...sources, up, legacy, lookalike, unmigrated, pg])(route)],
+      [/^GET \/datasources\/check-manage-ver\/schema$/, json({ tables: ['时段客流', '分区明细'], summary: '', synced_at: ago(0) })],
+      [/^GET \/datasources\/check-manage-legacy\/schema$/, json({ tables: ['sales'], summary: '', synced_at: ago(0) })],
+      [/^GET \/datasources\/check-manage-unmigrated\/schema$/, json({ tables: ['zz_unmigrated'], summary: '', synced_at: ago(0) })],
+      [/^POST \/datasources\/[^/]+\/introspect/, json({ detail: '上传的表格无需重新探查，重新上传即可更新' }, 409)],
+      [/^POST \/datasources\/upload$/, reupload],
+    ],
+  })
+  const card = page.locator(`[data-source="${up.name}"]`)
+  check('「表格」标签按来源认：上传的在，路径像上传库的手工 SQLite 不在',
+        await card.count() === 1 && await page.locator('[data-source="zz_legacy"]').count() === 1
+        && await page.locator('[data-source="zz_lookalike"]').count() === 0)
+  const version = card.locator('[data-current-version]')
+  const versionText = await version.innerText().catch(() => '')
+  check('卡片写当前版本的文件名和导入时间', versionText.includes('当前版本') && versionText.includes('时段客流.xlsx')
+        && versionText.includes('3 小时前导入') && ((await version.getAttribute('title')) ?? '').includes('导入'), versionText)
+  check('……原件已保存时不另标', !versionText.includes('原件'))
+  const legacyVersion = page.locator('[data-source="zz_legacy"] [data-current-version]')
+  const legacyText = await legacyVersion.innerText().catch(() => '')
+  check('……迁移前上传的版本：没有文件名、注明未保存原件', legacyText.includes('早期上传的文件') && legacyText.includes('未保存原件'), legacyText)
+  check('……不把迁移那一刻写成导入时间（不写「2 分钟前导入」），悬停说明未记录导入时间',
+        !legacyText.includes('导入') && !legacyText.includes('分钟前') && !legacyText.includes('刚刚')
+        && ((await legacyVersion.getAttribute('title')) ?? '').includes('未记录') && ((await legacyVersion.getAttribute('title')) ?? '').includes('导入时间'),
+        `${legacyText} | ${await legacyVersion.getAttribute('title').catch(() => '')}`)
+  const legacyCard = await page.locator('[data-source="zz_legacy"]').innerText().catch(() => '')
+  check('……照写原来的同步时间（40 天前的「结构同步于」），不提示结构过期',
+        legacyCard.includes('结构同步于') && !legacyCard.includes('分钟前') && !legacyCard.includes('库表可能已变更'),
+        legacyCard.replace(/\s+/g, ' '))
+  const cardText = await card.innerText()
+  check('上传的表格不给「探查结构」「按配置重新探查」（服务端会拒绝）',
+        await card.getByRole('button', { name: /探查/ }).count() === 0 && !cardText.includes('探查结构'))
+  check('……不写「结构同步于」，也不提示结构过期（版本冻结，导入时间写在版本那一行）',
+        !cardText.includes('结构同步于') && !cardText.includes('库表可能已变更'))
+  check('……路径按版本变，卡片上不写库文件路径', !cardText.includes('/builds/') && !cardText.includes('.db'))
+  await card.getByRole('button', { name: '重新上传' }).click()
+  const dlg = dialog(page)
+  const nameBox = dlg.locator('input.mono').first()
+  const importBtn = dlg.getByRole('button', { name: /导入/ })
+  check('同名重新上传：名字已填好，不算被占用', (await nameBox.inputValue()) === up.name
+        && !(await dlg.innerText()).includes('已被其他数据库用作标识'))
+  await nameBox.fill('zz_pgdb')
+  check('……手工登记的其他库的名字不能拿来上传（按来源认，不按路径）',
+        (await dlg.innerText()).includes('「zz_pgdb」已被其他数据库用作标识') && await importBtn.isDisabled())
+  await dlg.locator('input[type="file"]').setInputFiles({ name: 'zz_unmigrated.csv', mimeType: 'text/csv', buffer: Buffer.from('region,amount\neast,1\n') })
+  // 手工登记的 SQLite：可能是没迁移成的早期上传，前端不拦，提示一句，由服务端判断
+  await nameBox.fill('zz_lookalike')
+  const sqliteHint = await dlg.locator('[data-name-sqlite]').innerText().catch(() => '')
+  check('……和手工登记的 SQLite 重名：前端不拦（不知道上传目录在哪），提示早期上传的表格可同名替换、否则将被拒绝',
+        !(await dlg.innerText()).includes('已被其他数据库用作标识') && await importBtn.isEnabled()
+        && sqliteHint.includes('早期上传的表格可同名替换') && sqliteHint.includes('拒绝'), sqliteHint)
+  await importBtn.click()
+  await until(async () => (await dlg.innerText()).includes('非上传表格'), 5000)
+  await page.waitForTimeout(100)
+  const refused = await dlg.innerText()
+  check('……照填的名字发出', (await uploadForms(page)).at(-1)?.name === 'zz_lookalike', JSON.stringify((await uploadForms(page)).at(-1) ?? {}))
+  check('……服务端以重名拒收（409）：原话写在名字下面，弹窗留在表单上，焦点回到名字',
+        refused.includes('已存在名为「zz_lookalike」的数据源（非上传表格），请换一个名称')
+        && await page.locator('[data-upload-result]').count() === 0 && await importBtn.isDisabled()
+        && await nameBox.evaluate((el) => el === document.activeElement && el.getAttribute('aria-invalid') === 'true'),
+        refused.replace(/\s+/g, ' ').slice(0, 160))
+  await nameBox.fill('zz_unmigrated')
+  check('……改了名字，那句 409 就不再显示', !(await dlg.innerText()).includes('非上传表格') && await importBtn.isEnabled()
+        && await dlg.locator('[data-name-sqlite]').count() === 1)
+  await importBtn.click()
+  const replacedResult = page.locator('[data-upload-result]')
+  await replacedResult.waitFor({ timeout: 5000 }).catch(() => {})
+  const lastForm = (await uploadForms(page)).at(-1) ?? {}
+  check('没迁移成的早期上传可以同名重传：照名字发出，服务端替换后写「已替换」',
+        lastForm.name === 'zz_unmigrated' && await replacedResult.count() === 1
+        && (await dialog(page).innerText()).includes('已替换「zz_unmigrated」里的数据'), JSON.stringify(lastForm))
+  await dialog(page).getByRole('button', { name: '列名无误 · 完成' }).click()
+  await page.waitForTimeout(300)
+  const revived = page.locator('[data-source="zz_unmigrated"]')
+  check('……替换后按来源分到「表格」，写当前版本的文件名和「重新上传」',
+        await revived.count() === 1 && (await revived.locator('[data-current-version]').innerText().catch(() => '')).includes('zz_unmigrated.csv')
+        && await revived.getByRole('button', { name: '重新上传' }).count() === 1)
+  await goto(page, '/data/databases')
+  const manual = page.locator('[data-source="zz_lookalike"]')
+  check('「数据库」标签里是手工 SQLite（照常能探查结构），没有上传的表格',
+        await manual.count() === 1 && await manual.getByRole('button', { name: /探查结构/ }).count() === 1
+        && await page.locator(`[data-source="${up.name}"]`).count() === 0
+        && await page.locator('[data-source="zz_unmigrated"]').count() === 0)
+  check('没有对上传的表格发探查请求', !sent.some((s) => /introspect/.test(s.key)))
+  check('上传一共发了 2 次（被拒收一次、替换一次）', sent.filter((s) => s.key === 'POST /datasources/upload').length === 2,
+        String(sent.filter((s) => s.key === 'POST /datasources/upload').length))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
 
