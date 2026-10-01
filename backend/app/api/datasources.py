@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
+from app.api.coded import CodedHTTPException
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
@@ -27,7 +28,7 @@ from app.data.engine import (
     engine_args, engines, mask_columns_problem, query_timeout_problem,
 )
 from app.db.base import get_session, new_id
-from app.db.models import DataSource, SourceSnapshot, TableImport
+from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport, TableRecipe
 from app.tools.datasource import tool_names
 
 router = APIRouter(prefix="/api/datasources", tags=["datasources"])
@@ -100,6 +101,12 @@ class DataSourceOut(BaseModel):
     origin: str = "manual"
     #: 上传表格当前启用的版本：{id, created_at, file_name, raw_state}。手工源恒为 None
     current_snapshot: dict[str, Any] | None = None
+    #: simple：简单导入的上传表格；recipe：按配方导入；手工源为 None
+    import_mode: str | None = None
+    #: 按配方导入的源当前启用的配方：{id, seq, origin, activated_at, signed_by}
+    current_recipe: dict[str, Any] | None = None
+    #: 这个源最近一个未结束的导入暂存区：{id, kind, status, created_at}
+    open_staging: dict[str, Any] | None = None
 
 
 def _cached_schema(cache: dict[str, Any]) -> str | None:
@@ -108,11 +115,21 @@ def _cached_schema(cache: dict[str, Any]) -> str | None:
     return str(cache.get("schema") or "")
 
 
-def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None) -> DataSourceOut:
+def _import_mode(row: DataSource) -> str | None:
+    if row.current_recipe_id:
+        return "recipe"
+    return "simple" if _is_upload(row) else None
+
+
+def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None,
+            recipe_info: dict[str, Any] | None = None) -> DataSourceOut:
     cache = row.schema_cache or {}
     tables = cache.get("tables") or {}
+    recipe_info = recipe_info or {}
     return DataSourceOut(
         origin=row.origin or "manual", current_snapshot=snapshot,
+        import_mode=_import_mode(row), current_recipe=recipe_info.get("current_recipe"),
+        open_staging=recipe_info.get("open_staging"),
         cached_schema=_cached_schema(cache),
         schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
         available_schemas=list(cache.get("available_schemas") or []),
@@ -183,8 +200,41 @@ async def _snapshot_infos(session: AsyncSession, rows: list[DataSource]) -> dict
     return out
 
 
+def _iso(v: datetime | None) -> str | None:
+    return v.isoformat() if v else None
+
+
+async def _recipe_infos(session: AsyncSession, rows: list[DataSource]) -> dict[str, dict[str, Any]]:
+    """各源的当前配方摘要和最近一个未结束的暂存区：{源 id: {current_recipe, open_staging}}。两次查询取齐。"""
+    out: dict[str, dict[str, Any]] = {}
+    recipe_ids = {r.current_recipe_id: r.id for r in rows if r.current_recipe_id}
+    if recipe_ids:
+        for rec in (await session.execute(
+            select(TableRecipe).where(TableRecipe.id.in_(list(recipe_ids)))
+        )).scalars():
+            sid = recipe_ids.get(rec.id)
+            if sid is not None:
+                out.setdefault(sid, {})["current_recipe"] = {
+                    "id": rec.id, "seq": rec.seq, "origin": rec.origin,
+                    "activated_at": _iso(rec.activated_at), "signed_by": rec.signed_by,
+                }
+    ids = [r.id for r in rows if _is_upload(r)]
+    if ids:
+        for st in (await session.execute(
+            select(ImportStaging).where(
+                ImportStaging.source_id.in_(ids), ImportStaging.status.in_(table_versions.STAGING_OPEN),
+            ).order_by(ImportStaging.created_at)
+        )).scalars():
+            # 按创建时间升序，后面的覆盖前面的：留下最近的那一个
+            out.setdefault(st.source_id, {})["open_staging"] = {
+                "id": st.id, "kind": st.kind, "status": st.status, "created_at": _iso(st.created_at),
+            }
+    return out
+
+
 async def _out(session: AsyncSession, row: DataSource) -> DataSourceOut:
-    return _to_out(row, (await _snapshot_infos(session, [row])).get(row.id))
+    return _to_out(row, (await _snapshot_infos(session, [row])).get(row.id),
+                   (await _recipe_infos(session, [row])).get(row.id))
 
 
 #: 上传源上由系统维护的字段：连接一律从快照解析，database 只作显示
@@ -252,7 +302,8 @@ def _locked_refusal(changed: list[str]) -> str:
 async def list_sources(session: AsyncSession = Depends(get_session)) -> list[DataSourceOut]:
     rows = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
     snaps = await _snapshot_infos(session, rows)
-    return [_to_out(r, snaps.get(r.id)) for r in rows]
+    recipes = await _recipe_infos(session, rows)
+    return [_to_out(r, snaps.get(r.id), recipes.get(r.id)) for r in rows]
 
 
 #: 每种库都有的「查询时限」。数据库按它自己停下语句，不只是后端不再等
@@ -785,6 +836,22 @@ def _table_out(t: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def read_upload(file: UploadFile) -> bytes:
+    """读上传的文件，边读边数，超了立刻停（413 file_too_large）。简单上传和按配方导入共用。
+
+    和知识库上传同一套：那个检查拦的是「入库」，不是「占内存」，读完再判等于先把内存吃掉。
+    """
+    limit = settings.max_upload_mb * 1024 * 1024
+    pieces: list[bytes] = []
+    total = 0
+    while piece := await file.read(1024 * 1024):
+        total += len(piece)
+        if total > limit:
+            raise CodedHTTPException(413, f"文件超过 {settings.max_upload_mb} MB", "file_too_large")
+        pieces.append(piece)
+    return b"".join(pieces)
+
+
 @router.post("/upload", response_model=dict, status_code=201)
 async def upload_table(
     file: UploadFile = File(...),
@@ -823,21 +890,14 @@ async def upload_table(
     if mixed not in _MIXED_CHOICES:
         raise HTTPException(400, "数字列混入非数字时，只能选择拒收或将非数字的值存为空值")
 
-    # 边读边数，超了立刻停。和知识库上传同一套：那个检查拦的是"入库"，
-    # 不是"占内存"，读完再判等于先把内存吃掉
-    limit = settings.max_upload_mb * 1024 * 1024
-    pieces: list[bytes] = []
-    total = 0
-    while piece := await file.read(1024 * 1024):
-        total += len(piece)
-        if total > limit:
-            raise HTTPException(413, f"文件超过 {settings.max_upload_mb} MB")
-        pieces.append(piece)
-    raw = b"".join(pieces)
+    raw = await read_upload(file)
 
     existing = (await session.execute(
         select(DataSource).where(DataSource.name == name)
     )).scalar_one_or_none()
+    # 按配方导入的源：重传要按已确认的配方重放（上传新一期），不能退回简单解析把配方和核对绕过去
+    if existing is not None and existing.current_recipe_id:
+        raise CodedHTTPException(409, f"「{name}」按配方导入，请使用「上传新一期」", "recipe_source")
     # 同名的只有上传表格可以更新。迁移前的老上传（路径还在上传目录里）也算
     if existing is not None and not _is_upload(existing) and not (
         existing.kind == "sqlite" and table_versions.under_uploads(existing.database)
@@ -891,6 +951,9 @@ def _import_out(imp: TableImport, current: set[str]) -> dict[str, Any]:
         "current": imp.id in current,
         "created_at": imp.created_at.isoformat() if imp.created_at else None,
         "activated_at": imp.activated_at.isoformat() if imp.activated_at else None,
+        # 按配方导入才有（简单导入为空）：配方、统计期、署名，接受的条数
+        "recipe_id": imp.recipe_id, "period_start": imp.period_start, "period_end": imp.period_end,
+        "signed_by": imp.signed_by, "overrides": len(imp.overrides or []), "waivers": len(imp.waivers or []),
     }
 
 
@@ -941,8 +1004,9 @@ async def purge_raw(
         raise HTTPException(409, "这次导入没有保存原件")
     if imp.raw_state == "purged":
         raise HTTPException(409, "这次导入的原件已经清除")
-    deleted, others = await table_versions.purge_import_raw(
+    purged = await table_versions.purge_import_raw(
         session, imp, reason=reason, signed_by=payload.signed_by)
+    deleted, others = purged.deleted, purged.others
     current = await _current_imports(session, row)
     names = dict((await session.execute(
         select(DataSource.id, DataSource.name).where(DataSource.id.in_({o.source_id for o in others}))
@@ -955,4 +1019,6 @@ async def purge_raw(
              "seq": o.seq, "file_name": o.file_name}
             for o in others
         ],
+        # 引用同一份原件、随之一并放弃的未完成导入（暂存区，已清空）
+        "discarded_stagings": [st.id for st in purged.discarded_stagings],
     }

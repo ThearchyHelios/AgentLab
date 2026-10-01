@@ -31,8 +31,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 from xml.parsers import expat
 from contextlib import closing
-from dataclasses import dataclass, field
-from typing import IO
+from dataclasses import asdict, dataclass, field, fields
+from typing import IO, Any
 
 #: 解压后的总大小上限。上传本身限 50 MB，正常的 xlsx 压缩比在 5 到 20 倍之间；
 #: 超过这个数的基本是 zip 炸弹。可调
@@ -172,6 +172,10 @@ class SheetScan:
     far_cells: list[str] = field(default_factory=list)
     #: 文件自己声明的 <dimension>，只作记录，不用来定边界
     dimension: str | None = None
+    #: 每行非空格数的游程：(起始行, 结束行, 每行个数)，只记个数 > 0 的行，按行号升序。
+    #: 配方执行器拿它和第二遍（openpyxl）逐行读到的个数对账：两边数的口径一致（见 nonempty），
+    #: 对不上就说明两个解析器看到的不是同一张表（XML 行号乱序、重复的行，openpyxl 会静默跳过）
+    row_runs: list[tuple[int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -860,6 +864,11 @@ def _scan_sheet(archive: _Archive, sheet: SheetScan, sst_flags: bytearray | None
 
     alive = rows = 0
     where = f"工作表「{sheet.name}」"
+    # 逐行非空格数的游程。行号单调递增（正常文件）时就地合并，O(1)；遇到行号回退或重复（构造的、
+    # 或别的程序写乱的 XML）改用 dict 累加，扫完再压缩成游程
+    runs = sheet.row_runs
+    by_row: dict[int, int] | None = None
+    last_filled_row = 0
     # 上限先取到局部变量：每个元素都要比一次，模块属性每次现查要多花时间（测试里照样能改模块常量）
     max_alive, max_rows, max_cols = MAX_ALIVE, EXCEL_MAX_ROWS, EXCEL_MAX_COLS
     max_text, max_formula = EXCEL_MAX_TEXT, EXCEL_MAX_FORMULA
@@ -904,6 +913,7 @@ def _scan_sheet(archive: _Archive, sheet: SheetScan, sst_flags: bytearray | None
             col = 0
             #: 这一行清空时随之释放的元素个数（行本身的空壳留着，不算）
             freed = 0
+            row_filled = 0
             for cell in el:
                 freed += 1
                 if tags.get(cell.tag) != "c":
@@ -969,6 +979,7 @@ def _scan_sheet(archive: _Archive, sheet: SheetScan, sst_flags: bytearray | None
                 if not filled:
                     continue
                 nonempty += 1
+                row_filled += 1
                 if row < min_row:
                     min_row = row
                 if col < min_col:
@@ -985,11 +996,98 @@ def _scan_sheet(archive: _Archive, sheet: SheetScan, sst_flags: bytearray | None
                     max_row_cell = cell_ref(row, col)
                 if jumped and len(far) < MAX_FAR:
                     far.append(cell_ref(row, col))
+            if row_filled:
+                if by_row is None and row > last_filled_row:
+                    if runs and runs[-1][1] + 1 == row and runs[-1][2] == row_filled:
+                        runs[-1] = (runs[-1][0], row, row_filled)
+                    else:
+                        runs.append((row, row, row_filled))
+                    last_filled_row = row
+                else:
+                    if by_row is None:
+                        by_row = {}
+                        for lo, hi, n in runs:
+                            for rr in range(lo, hi + 1):
+                                by_row[rr] = n
+                    by_row[row] = by_row.get(row, 0) + row_filled
             el.clear()
             alive -= freed
 
+    if by_row is not None:
+        runs.clear()
+        for rr in sorted(by_row):
+            n = by_row[rr]
+            if runs and runs[-1][1] + 1 == rr and runs[-1][2] == n:
+                runs[-1] = (runs[-1][0], rr, n)
+            else:
+                runs.append((rr, rr, n))
     sheet.nonempty = nonempty
     if nonempty:
         sheet.bounds = Bounds(min_row, min_col, max_row, max_col)
         # 没有明显的跳跃（比如区域是慢慢变稀的），就拿撑出右边界、下边界的格子当示例
         sheet.far_cells = far or list(dict.fromkeys(c for c in (max_col_cell, max_row_cell) if c))
+
+
+# --------------------------------------------------------------------------
+# 序列化：暂存区存扫描结果，试运行不必再扫一遍（配方导入，P2-SPEC 4.1）
+# --------------------------------------------------------------------------
+
+
+def _jsonable(value: Any) -> Any:
+    """asdict 的结果里元组照样是元组：转成列表，返回值和 json 往返一次之后逐字相等。"""
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def scan_to_json(scan: WorkbookScan) -> dict[str, Any]:
+    """WorkbookScan → 可以 json.dumps 的 dict（dataclasses.asdict 的形状，元组写成列表）。"""
+    return _jsonable(asdict(scan))
+
+
+def _pairs(items: Any, width: int) -> list[tuple[int, ...]]:
+    out = []
+    for item in items or []:
+        seq = tuple(int(x) for x in item)
+        if len(seq) != width:
+            raise ValueError(f"扫描结果里的区间应有 {width} 项：{item!r}")
+        out.append(seq)
+    return out
+
+
+def _cell_list(data: Any) -> CellList:
+    data = data or {}
+    return CellList(cells=list(data.get("cells") or []), total=int(data.get("total") or 0),
+                    max_row=int(data.get("max_row") or 0), texts=list(data.get("texts") or []))
+
+
+def _known(cls: type, data: dict[str, Any]) -> dict[str, Any]:
+    """只取 cls 认识的键：老版本存下的 JSON 少了新字段时取默认值，多出的键（更新的版本写的）忽略。"""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in data.items() if k in names}
+
+
+def scan_from_json(data: dict[str, Any]) -> WorkbookScan:
+    """scan_to_json 的逆操作。字段缺了取默认值（老暂存区里没有 row_runs），多了忽略。"""
+    sheets = []
+    for raw in data.get("sheets") or []:
+        d = _known(SheetScan, dict(raw))
+        bounds = d.get("bounds")
+        sheets.append(SheetScan(
+            name=str(d["name"]), state=str(d.get("state") or "visible"), path=str(d.get("path") or ""),
+            bounds=Bounds(**_known(Bounds, bounds)) if bounds else None,
+            nonempty=int(d.get("nonempty") or 0),
+            merged=list(d.get("merged") or []), merged_total=int(d.get("merged_total") or 0),
+            hidden_rows=_pairs(d.get("hidden_rows"), 2), hidden_cols=_pairs(d.get("hidden_cols"), 2),
+            autofilter=d.get("autofilter"), formulas=int(d.get("formulas") or 0),
+            formulas_uncached=_cell_list(d.get("formulas_uncached")), errors=_cell_list(d.get("errors")),
+            formulas_above=_cell_list(d.get("formulas_above")), far_cells=list(d.get("far_cells") or []),
+            dimension=d.get("dimension"), row_runs=_pairs(d.get("row_runs"), 3),
+        ))
+    tables = [TableScan(**_known(TableScan, dict(t))) for t in data.get("tables") or []]
+    for t in tables:
+        t.columns = list(t.columns)
+    return WorkbookScan(sheets=sheets, full_calc_on_load=bool(data.get("full_calc_on_load")), tables=tables,
+                        defined_names=dict(data.get("defined_names") or {}))

@@ -134,6 +134,25 @@ def unshaped_tables(source: Any) -> list[str]:
             if isinstance(meta, dict) and meta.get("comment") == UNSHAPED_NOTE]
 
 
+def reported_total_tables(source: Any) -> list[str]:
+    """按配方导入时另存的「原表写明的合计」表（表结构里 kind=reported_total，recipe_notes.apply_notes 记的）。"""
+    tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+    return [meta.get("qualified", name) for name, meta in tables.items()
+            if isinstance(meta, dict) and meta.get("kind") == "reported_total"]
+
+
+#: 原表写明的合计表在工具描述、db_schema 表清单里的标记。不含数字（H11）
+REPORTED_TOTAL_MARK = "（原表写明的合计，不要彼此相加，也不要与明细相加）"
+
+#: 按配方导入的源在工具描述「可用表」之后多加的两句（P2-SPEC 5.4，不含数字）
+RECIPE_QUERY_HINT = " 中文表名和列名请加双引号。查单个值时，把主键列一起选出来，证据面板才能追到原表格子。"
+
+#: 冻结 schema_snapshot 时从 schema_cache 复制的顶层键。import_mode、import_manifests 只有按配方导入的源才有：
+#: 冻结进来以后，schema_snapshot 的内容哈希就承诺了导入清单（证据链按哈希从封存事件走到清单，中间不经过
+#: 可改的数据库列，H5）；手工源和期 1 的上传源没有这两个键，冻结内容和原来一字不差
+_FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode", "import_manifests")
+
+
 def _query_description(source: Any) -> str:
     tables = introspect.table_names(source)
     head = f"在数据源「{source.name}」上执行 SQL 查询。"
@@ -144,11 +163,18 @@ def _query_description(source: Any) -> str:
         listed = "、".join(tables[:25])
         more = f" 等 {len(tables)} 张表" if len(tables) > 25 else ""
         head += f" 可用表：{listed}{more}。"
+        # 按配方导入的源：表名列名是中文（不加引号在多数方言里报错），主键是证据面板追溯原表格子的钥匙
+        if (getattr(source, "schema_cache", None) or {}).get("import_mode") == "recipe":
+            head += RECIPE_QUERY_HINT
         # 未规整的说明以前只在 db_schema 查单表时看得到：只绑了查询工具的 Agent、调用工具节点接报告的
         # 链路都看不到，照样对列求和。工具描述里点名（不含数字，H11）
         if raw := unshaped_tables(source):
             shown = "、".join(raw[:10]) + (f" 等 {len(raw)} 张" if len(raw) > 10 else "")
             head += f" 其中 {shown} 按原样导入、未经规整：同一列里混有不同口径的行，不能直接对列求和。"
+        # 原表写明的合计表同理：「不要相加」的说明只在 db_schema 查单表时看得到（AU-5）
+        if totals := reported_total_tables(source):
+            shown = "、".join(totals[:10]) + (f" 等 {len(totals)} 张" if len(totals) > 10 else "")
+            head += f" 其中 {shown} 是原表写明的合计：各合计项可能互相重叠，不要彼此相加，也不要与明细表相加。"
         head += " 字段不确定时先查结构，不要猜字段名。"
     else:
         head += _no_schema_note(source)
@@ -473,7 +499,7 @@ async def _store_schema(source: Any, ctx: ToolContext) -> str | None:
     from app.engine.evidence import SCHEMA_SNAPSHOT
 
     content = {"source": source.name, "tables": tables,
-               **{k: cache[k] for k in ("schema", "synced_at", "truncated", "total") if k in cache}}
+               **{k: cache[k] for k in _FROZEN_SCHEMA_KEYS if k in cache}}
     try:
         return await put_json(content, kind=SCHEMA_SNAPSHOT, run_id=ctx.run_id or "", node_id=ctx.node_id or "",
                               meta={"source": source.name, "tables": len(tables)})
@@ -497,8 +523,10 @@ def _make_schema_tool(source: Any, *, fixed: bool = False) -> StructuredTool:
             # 把实情交出去，而不是让它去点一个它点不到的按钮
             return f"数据源「{source.name}」的结构信息不可用。" + _no_schema_note(source)
         raw = set(unshaped_tables(source))
+        totals = set(reported_total_tables(source))
         return f"数据源「{source.name}」共 {len(tables)} 张表：\n" + "\n".join(
-            f"  {n}" + ("（按原样导入、未经规整，不能直接对列求和）" if n in raw else "") for n in tables
+            f"  {n}" + ("（按原样导入、未经规整，不能直接对列求和）" if n in raw else "")
+            + (REPORTED_TOTAL_MARK if n in totals else "") for n in tables
         )
 
     return StructuredTool(

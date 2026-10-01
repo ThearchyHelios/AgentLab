@@ -3122,6 +3122,20 @@ def unshaped_table(entry: dict[str, Any], fetch: Callable[[Any], Any]) -> bool:
 
 #: 写作目录里未规整的表名后面跟的那句。不含数字（H11）
 _UNSHAPED_MARK = "（按原样导入、未经规整：同一列里混有不同口径的行，不能直接对列求和）"
+#: 写作目录里「原表写明的合计」表（按配方导入另存的表内合计，表结构里 kind=reported_total）后面跟的那句（AU-5）
+_REPORTED_TOTAL_MARK = "（原表写明的合计：不要彼此相加，也不要与明细相加）"
+
+
+def reported_total_table(entry: dict[str, Any], fetch: Callable[[Any], Any]) -> bool:
+    """目录里的这张表是不是原表写明的合计（冻结的表结构里 kind 为 reported_total）。口径同 unshaped_table。"""
+    name = entry.get("name") or (entry.get("locator") or {}).get("table")
+    for origin in entry.get("sources") or []:
+        if not (isinstance(origin, dict) and origin.get("kind") == "schema" and origin.get("artifact")):
+            continue
+        info = schema_table(fetch(origin["artifact"]), name)
+        if info is not None:
+            return info.get("kind") == "reported_total"
+    return False
 
 
 def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False, snaps: _Snapshots | None = None) -> list[str]:
@@ -3134,7 +3148,11 @@ def _entity_prompt(catalog: dict[str, Any], *, partial: bool = False, snaps: _Sn
         return snaps._fetch(artifact, "表结构快照")[0] if snaps is not None else None
 
     def mark(entry: dict[str, Any]) -> str:
-        return _UNSHAPED_MARK if snaps is not None and unshaped_table(entry, fetch) else ""
+        if snaps is None:
+            return ""
+        if unshaped_table(entry, fetch):
+            return _UNSHAPED_MARK
+        return _REPORTED_TOTAL_MARK if reported_total_table(entry, fetch) else ""
 
     tables = [e for e in catalog.values() if e.get("kind") == "table"]
     fields: dict[str, list[str]] = {}

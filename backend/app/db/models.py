@@ -67,6 +67,9 @@ class DataSource(Base, TimestampMixin):
     # 上传源当前启用的快照（source_snapshots.id）。查询、探查都从快照解析，
     # database 只作显示；手工源恒为 None
     current_snapshot_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 按配方导入的源当前启用的配方（table_recipes.id）。非空即「按配方导入」：重传走「上传新一期」，
+    # 旧的简单上传对它拒收。简单导入的上传源和手工源恒为 None
+    current_recipe_id: Mapped[str | None] = mapped_column(String(32), default=None)
 
 
 # --------------------------------------------------------------------------
@@ -123,6 +126,133 @@ class TableImport(Base):
     purged: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+
+    # 以下是按配方导入（期 2）才有的列，简单导入一律为空。状态仍只有 active / superseded / retired：
+    # 没发布的尝试记在 import_stagings 上，不进这张表——回收的保护集合、seq 的递增、导入列表都按
+    # 这张表算，塞进未发布的尝试会同时扰动这三处
+    recipe_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # 统计期（YYYY-MM-DD）。期 3 按期累积时按它排序
+    period_start: Mapped[str | None] = mapped_column(String(10), default=None)
+    period_end: Mapped[str | None] = mapped_column(String(10), default=None)
+    # 统计期的来源与原文（PeriodOut）
+    context: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 核对摘要（id、状态、核对数、不一致数、无法核对数、原因）。含 C1、C2：它们取决于文件名，
+    # 而构建按内容复用、不含文件名，所以不能放在构建回执里
+    checks: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 数据质量类的接受、无法核对的接受（各带理由）
+    overrides: Mapped[list[Any] | None] = mapped_column(default=None)
+    waivers: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 本次提交时勾过的确认项（id、label、at）
+    confirmations: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 导入清单的工件 id。只作索引：证据链经快照 schema_cache 里的 import_manifests 承诺（内容寻址），
+    # 不经过这个可改的列
+    manifest_artifact: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 署名（自报，未认证）
+    signed_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    staging_id: Mapped[str | None] = mapped_column(String(32), default=None)
+
+
+class TableRecipe(Base):
+    """按配方导入的源的一版配方。同一个源从 1 起编号，只增不改：改配方就是新的一版。
+
+    recipe 存去掉默认值的紧凑形式（recipe.canonical_recipe），recipe_sha256 由它算，进构建 id。
+    不挂外键：数据源删掉以后配方置 retired 留作审计，导入清单里引用的配方 id 仍查得到。
+    """
+
+    __tablename__ = "table_recipes"
+    # 同源的 seq 不重复：发布在版本存储的锁里取「最大 seq + 1」，这条约束兜住锁外误用
+    __table_args__ = (UniqueConstraint("source_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(String(32), index=True)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    recipe: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    recipe_sha256: Mapped[str] = mapped_column(String(64), default="")
+    # 配方格式版本，与 recipe_types.RECIPE_FORMAT 一致（这里不 import 数据层，测试核对两边相等）
+    recipe_format: Mapped[str] = mapped_column(String(40), default="agentlab-recipe/2")
+    # rules：规则起草；ai：AI 起草；manual：手工；mixed：起草后又改过
+    origin: Mapped[str] = mapped_column(String(20), default="manual")
+    # active：现行；superseded：被新的一版替换；retired：数据源已删除
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    # 确认时勾过的确认项（id、label、at）
+    confirmations: Mapped[list[Any]] = mapped_column(default=list)
+    # 署名（自报，未认证）
+    signed_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # {"calls": [AiUsage], "consents": [同意记录]}；不是 AI 起草的为空
+    ai_usage: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    staging_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+
+
+class ImportStaging(Base, TimestampMixin):
+    """一次还没发布的配方导入：暂存、起草、试运行都在这里，提交成功时才影响数据源。
+
+    「拒收、放弃、过期都不动当前快照」由此天然成立：在提交那个事务之前，这里的任何东西都不碰
+    数据源、导入记录和快照。新源在暂存时就分配 source_id，提交时用它建 DataSource。
+
+    **结束即瘦身**（table_versions.close_staging）：进入 committed / discarded / expired 的同一个事务里，
+    网格预览（有数字格的值、隐藏行列）、试运行回执（有区域外文字全文）这些大字段一律清空、试运行库
+    删掉，只留 id、来源、文件哈希、状态、工作配方及其哈希、用量、同意记录、署名和时间。接口没有认证，
+    这些内容不该在用完之后还留在库里。结束超过 90 天的行由回收删除。
+    """
+
+    __tablename__ = "import_stagings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(String(32), index=True)
+    source_name: Mapped[str] = mapped_column(String(100), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    # first：首次导入；reupload：上传新一期；redraft：修改配方（不换文件）；switch：从简单导入切换
+    kind: Mapped[str] = mapped_column(String(20), default="first")
+    # 未结束：drafting / trialed / rejected；已结束：committed / discarded / expired
+    status: Mapped[str] = mapped_column(String(20), default="drafting", index=True)
+    # 原件按内容存档（raw_store）。未结束的暂存区保护它不被回收；清除原件时按它找到要一并放弃的暂存区
+    raw_sha256: Mapped[str] = mapped_column(String(64), default="", index=True)
+    file_name: Mapped[str] = mapped_column(String(500), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    # 以下几项结束即清空
+    scan: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    grid_preview: Mapped[list[Any] | None] = mapped_column(default=None)
+    facts: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # {"rules": Draft 或 null, "ai": AI 起草结果的摘要或 null}
+    drafts: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 工作配方
+    recipe: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    recipe_origin: Mapped[str | None] = mapped_column(String(20), default=None)
+    recipe_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 回答问题的起点配方。工作配方 = 它按问题顺序重放全部回答；PUT 配方、AI 草稿会换掉它并清空回答
+    answers_base: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # {question_id: {"value": 选项值, "reason": 理由或 null}}
+    answers: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    cards: Mapped[list[Any] | None] = mapped_column(default=list)
+    questions: Mapped[list[Any] | None] = mapped_column(default=list)
+    # 最近一次静态校验
+    recipe_problems: Mapped[list[Any]] = mapped_column(default=list)
+    # 最近一次干跑的问题、是否只在前若干行上干跑
+    draft_problems: Mapped[list[Any] | None] = mapped_column(default=list)
+    draft_partial: Mapped[bool] = mapped_column(default=False)
+    # 起点配方（上传新一期、修改配方时是现行配方）
+    base_recipe_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # 试运行时源的当前快照；提交时在版本存储的锁里核对它没变
+    base_snapshot_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    # {"统计期": {"start", "end", "signed_by"}}：人工录入
+    context_inputs: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 最近一次试运行的回执（含 extraction、checks 的整份 JSON，提交时据此还原）
+    trial: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 试运行库的键和路径。库被发布消耗或删除后两者都清空
+    trial_key: Mapped[str | None] = mapped_column(String(64), default=None)
+    trial_path: Mapped[str | None] = mapped_column(Text, default=None)
+    # 每次调用模型的用量；用户同意发送的记录 {signed_by, at, model, provider, compressed_sha256, chars}
+    ai_usage: Mapped[list[Any]] = mapped_column(default=list)
+    ai_consents: Mapped[list[Any]] = mapped_column(default=list)
+    # 署名（自报，未认证）
+    signed_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    committed_import_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # 过期时刻（创建后 table_versions.STAGING_TTL）。为空时按 created_at 加 TTL 算
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 进入 committed / discarded / expired 的时刻
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
 class SourceSnapshot(Base):

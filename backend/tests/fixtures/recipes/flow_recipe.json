@@ -1,0 +1,85 @@
+{
+  "recipe_format": "agentlab-recipe/2",
+  "mode": "replace",
+  "other_visible_sheets": "confirm",
+  "sheets": [
+    {
+      "id": "s1",
+      "match": {"name": "客流汇总", "fallback": "only_visible_sheet"},
+      "hidden": {"rows": "reject_if_any", "cols": "reject_if_any"},
+      "context": [
+        {"id": "统计期", "kind": "period", "parser": "cn_date_range", "prefer_prefix": "统计时间范围", "cross_check": "filename"}
+      ],
+      "blocks": [
+        {
+          "id": "交叉表",
+          "layout": "crosstab",
+          "axis": {
+            "find": {"parser": "month_day_or_date", "min": 2},
+            "name": "日期",
+            "type": "DATE",
+            "year_from": "统计期",
+            "checks": ["contiguous", "covers_context"]
+          },
+          "label_offset": -1,
+          "values": {
+            "type": "INTEGER",
+            "placeholders": [{"text": "·", "meaning": "无数据"}],
+            "blank": "reject",
+            "text_number": "reject",
+            "formula": "reject"
+          },
+          "segments": [
+            {
+              "id": "日客流",
+              "role": "measures",
+              "table": "日客流",
+              "locate": {"by": "labels"},
+              "labels": {"expect": ["全日客流（人次）", "分区甲（人次）", "分区乙（人次）"]},
+              "measures": {"全日客流（人次）": "全日客流", "分区甲（人次）": "分区甲", "分区乙（人次）": "分区乙"}
+            },
+            {
+              "id": "日间",
+              "role": "dimension",
+              "table": "时段客流",
+              "locate": {"by": "section_title", "title": "日间时段客流（人次）"},
+              "labels": {"expect": ["7-8", "8-9", "9-10", "10-11", "11-12", "12-13", "13-14", "14-15", "15-16", "16-17", "17-18"]},
+              "dim": {"name": "时段", "parser": "hour_range", "derive": {"起始小时": "start", "结束小时": "end"}},
+              "value": "客流",
+              "const": {"时段类别": {"pick": "日间"}}
+            },
+            {
+              "id": "夜间",
+              "role": "dimension",
+              "table": "时段客流",
+              "locate": {"by": "section_title", "title": "夜间时段客流（人次）"},
+              "labels": {"expect": ["18-19", "19-20", "20-21", "21-22", "22-23", "23-24"]},
+              "dim": {"name": "时段", "parser": "hour_range", "derive": {"起始小时": "start", "结束小时": "end"}},
+              "value": "客流",
+              "const": {"时段类别": {"pick": "夜间"}},
+              "stop_parser": "hour_range_total"
+            },
+            {
+              "id": "夜间合计",
+              "role": "derived",
+              "locate": {"by": "after", "segment": "夜间"},
+              "labels_parser": "hour_range_total",
+              "labels": {"expect": ["18-22 时合计", "22-24 时合计", "18-24 时合计"]},
+              "verify": {"kind": "label_range_sum", "against_table": "时段客流", "value": "客流"},
+              "keep_as": {"table": "时段客流_表内合计", "dim": "合计项", "derive": {"起始小时": "start", "结束小时": "end"}, "value": "客流"}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {"name": "日客流", "grain": ["日期"], "kind": "data", "units": {"全日客流": "人次", "分区甲": "人次", "分区乙": "人次"}, "note": ""},
+    {"name": "时段客流", "grain": ["日期", "时段"], "kind": "data", "units": {"客流": "人次"}, "note": ""},
+    {"name": "时段客流_表内合计", "grain": ["日期", "合计项"], "kind": "reported_total", "units": {"客流": "人次"}, "note": ""}
+  ],
+  "relations": [
+    {"id": "R1", "kind": "sum_eq", "table": "日客流", "total": "全日客流", "parts": ["分区甲", "分区乙"], "claims": "F1"},
+    {"id": "R2", "kind": "not_comparable", "a": {"table": "时段客流", "value": "客流"}, "b": {"table": "日客流", "value": "全日客流"}, "by": "日期", "claims": "F2"}
+  ]
+}

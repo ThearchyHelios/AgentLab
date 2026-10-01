@@ -11,6 +11,7 @@
 // 沙箱拷贝）跑时带上地址：
 //   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-manage.mjs
 // 截图：CHECK_SHOTS=/某个目录 时把关键状态存下来；CHECK_THEME=light 换浅色跑一遍。
+import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -94,15 +95,22 @@ function recordUploadForms() {
     this.__formUrl = String(url)
     return open.call(this, method, url, ...rest)
   }
+  window.__importForms = []
   XMLHttpRequest.prototype.send = function (body) {
+    const entries = () => Object.fromEntries([...body.entries()]
+      .map(([k, v]) => [k, typeof v === 'string' ? v : `<file ${v.name}>`]))
     if (/\/datasources\/upload(\?|$)/.test(this.__formUrl ?? '') && body instanceof FormData) {
-      window.__uploadForms.push(Object.fromEntries([...body.entries()]
-        .map(([k, v]) => [k, typeof v === 'string' ? v : `<file ${v.name}>`])))
+      window.__uploadForms.push(entries())
+    }
+    // 按配方导入的两个上传口（暂存、上传新一期）另记一份：不挤占上面那份的下标
+    if (/\/datasources\/(imports\/stage|[^/]+\/reupload)(\?|$)/.test(this.__formUrl ?? '') && body instanceof FormData) {
+      window.__importForms.push({ url: this.__formUrl, ...entries() })
     }
     return send.call(this, body)
   }
 }
 const uploadForms = (page) => page.evaluate(() => window.__uploadForms ?? [])
+const importForms = (page) => page.evaluate(() => window.__importForms ?? [])
 
 /**
  * 开一页：GET 放行，写请求交给 handlers（按「METHOD 路径正则」匹配），没配的一律
@@ -1624,6 +1632,814 @@ await section('数据 · 表格：卡片按来源区分、显示当前版本', a
   check('没有对上传的表格发探查请求', !sent.some((s) => /introspect/.test(s.key)))
   check('上传一共发了 2 次（被拒收一次、替换一次）', sent.filter((s) => s.key === 'POST /datasources/upload').length === 2,
         String(sent.filter((s) => s.key === 'POST /datasources/upload').length))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+// ---------------------------------------------------------------------------
+// 按配方导入（期 2）：接口全部伪造。夹具是契约里的参考配方（「结构仿照客流表」，假名）和照它造的
+// 假暂存区：网格按 P2-SPEC 9.1 的坐标摆（B2:AG30，非空格 771），另加一行没有去处的 B32:C32
+// ---------------------------------------------------------------------------
+const FLOW_RECIPE = JSON.parse(readFileSync(new URL('../backend/tests/fixtures/recipes/flow_recipe.json', import.meta.url), 'utf8'))
+const RECIPE_UNITS = ['人次', '人', '元', '万元', '千元', '亿元', '千克', '吨', '个', '件', '户', '%']
+const RECIPE_CANDIDATES = { '日间时段客流（人次）': ['日间', '日间时段客流'], '夜间时段客流（人次）': ['夜间', '夜间时段客流'] }
+// 参考配方没有列表块：另加一张「分区明细」工作表，给配方面板的「数据中间的空行」那一项用
+const recipeWithList = () => {
+  const r = JSON.parse(JSON.stringify(FLOW_RECIPE))
+  r.sheets.push({ id: 's2', match: { name: '分区明细' }, blocks: [{ id: '列表1', layout: 'list', table: '分区明细', columns: [
+    { header: '分区', name: '分区', type: 'TEXT' }, { header: '客流（人次）', name: '客流', type: 'INTEGER' },
+  ] }] })
+  r.tables.push({ name: '分区明细', grain: ['分区'], units: { 客流: '人次' } })
+  return r
+}
+function flowGrid() {
+  const col = (n) => { let s = ''; let x = n; while (x > 0) { s = String.fromCharCode(65 + ((x - 1) % 26)) + s; x = Math.floor((x - 1) / 26) } return s }
+  const days = 31
+  const cells = []
+  const formulas = {}
+  cells.push([2, 2, '统计时间范围：2026年8月1日至2026年8月31日', 'text'], [3, 2, '客流汇总表', 'text'])
+  for (let d = 1; d <= days; d++) cells.push([4, 2 + d, `8月${d}日`, 'text'])
+  ;['全日客流（人次）', '分区甲（人次）', '分区乙（人次）'].forEach((l, i) => cells.push([5 + i, 2, l, 'text']))
+  for (let d = 1; d <= days; d++) {
+    const a = 3000 + ((d * 137) % 6000)
+    const b = 2000 + ((d * 91) % 6000)
+    cells.push([5, 2 + d, String(a + b), 'number'], [6, 2 + d, String(a), 'number'], [7, 2 + d, String(b), 'number'])
+  }
+  cells.push([9, 2, '日间时段客流（人次）', 'text'])
+  for (let h = 7; h < 18; h++) {
+    const r = 10 + h - 7
+    cells.push([r, 2, `${h}-${h + 1}`, 'text'])
+    for (let d = 1; d <= days; d++) cells.push([r, 2 + d, h === 7 ? '·' : String(50 + ((d * h * 13) % 850)), h === 7 ? 'text' : 'number'])
+  }
+  cells.push([21, 2, '夜间时段客流（人次）', 'text'])
+  for (let h = 18; h < 24; h++) {
+    const r = 22 + h - 18
+    cells.push([r, 2, `${h}-${h + 1}`, 'text'])
+    for (let d = 1; d <= days; d++) cells.push([r, 2 + d, String(50 + ((d * h * 7) % 850)), 'number'])
+  }
+  ;[['18-22 时合计', 22, 25], ['22-24 时合计', 26, 27], ['18-24 时合计', 22, 27]].forEach(([label, r1, r2], i) => {
+    cells.push([28 + i, 2, label, 'text'])
+    for (let d = 1; d <= days; d++) {
+      cells.push([28 + i, 2 + d, String(1000 + d), 'formula'])
+      formulas[`${col(2 + d)}${28 + i}`] = `=SUM(${col(2 + d)}${r1}:${col(2 + d)}${r2})`
+    }
+  })
+  // 表下补录的一行：没有分段认领它（P2-SPEC 9.2 的 D21）
+  cells.push([32, 2, '补录（人次）', 'text'], [32, 3, '1,234', 'text'])
+  const rows = []; for (let r = 2; r <= 32; r++) rows.push(r)
+  const cols = []; for (let c = 2; c <= 33; c++) cols.push(c)
+  return {
+    sheet: '客流汇总', bounds: 'B2:AG32', total_rows: 31, total_cols: 32, truncated: false, rows, cols, cells, formulas,
+    merges: ['B2:AG2', 'B3:AG3', 'B8:AG8', 'B9:AG9', 'B21:AG21'], hidden_rows: [], hidden_cols: [],
+  }
+}
+const FLOW_MARKS = [
+  ['context', 'B2'], ['outside_text', 'B3'], ['col_header', 'C4:AG4'], ['row_label', 'B5:B7'], ['value', 'C5:AG7'],
+  ['section_title', 'B9'], ['row_label', 'B10:B20'], ['value', 'C10:AG20'], ['section_title', 'B21'], ['row_label', 'B22:B27'],
+  ['value', 'C22:AG27'], ['derived_label', 'B28:B30'], ['derived_value', 'C28:AG30'],
+].map(([role, ref]) => ({ sheet: '客流汇总', role, ref }))
+const FLOW_CARDS = [
+  { id: 'axis', title: '第 4 行是日期表头：按交叉表导入', reason: 'C4:AG4 共 31 格都能解析为日期', cells: ['客流汇总!C4:AG4'] },
+  { id: 'period', title: '统计期取自 B2', reason: 'B2 能解析出 2026-08-01 至 2026-08-31，没有别处冲突', cells: ['客流汇总!B2'] },
+  { id: 'titles', title: '分段标题：B9、B21', reason: '标签列有字、日期列全空的行按分段标题处理', cells: ['客流汇总!B9', '客流汇总!B21'] },
+  { id: 'f1', title: '第 5 行 = 第 6 行 + 第 7 行', reason: '31 列中 31 列成立，建议登记为每期核对', cells: ['客流汇总!B5:B7'], question: 'q_relation:F1' },
+  { id: 'merge', title: '日间、夜间合进一张表', reason: '两段标签都是时段、互不相交；类别从标题的候选词里选', cells: ['客流汇总!B9', '客流汇总!B21'] },
+  { id: 'placeholder', title: '「·」表示无数据吗', reason: '第 10 行整行都是「·」', cells: ['客流汇总!C10:AG10'], question: 'q_placeholder:·' },
+  { id: 'derived', title: '第 28–30 行是合计：改作核对并另存', reason: '标签能解析出时段区间，值是汇总上方几行的公式', cells: ['客流汇总!B28:B30'] },
+  { id: 'f2', title: '各时段之和与全日客流 31 天中 0 天相等', reason: '口径不同，建议登记为「口径不同」', cells: ['客流汇总!B5'], question: 'q_relation:F2' },
+  { id: 'outside', title: 'B3 是区域外文字', reason: '不含数字，只记进回执', cells: ['客流汇总!B3'] },
+  { id: 'mode', title: '导入模式：每期替换', reason: '按期累积将在后续版本提供', cells: [] },
+]
+const relationQuestion = (id, extra = {}) => ({
+  id: `q_relation:${id}`, text: `系统发现的关系 ${id} 要登记吗`,
+  options: [{ value: 'register', label: '登记', needs_reason: false }, { value: 'dismiss', label: '不登记', needs_reason: true }],
+  ...extra,
+})
+// 前两题带起草器的建议（契约 Question.default）：界面只写「建议：…」，不替人选
+const FLOW_QUESTIONS = [
+  { id: 'q_placeholder:·', text: '「·」是否表示无数据', default: 'null', options: [
+    { value: 'null', label: '是，存为空值', needs_reason: false }, { value: 'reject', label: '不是，不导入', needs_reason: false },
+  ] },
+  relationQuestion('F1', { default: 'register' }), relationQuestion('F2'),
+]
+const FLOW_CONFIRMS = [
+  ['placeholder:·', '「·」存为空值（31 格）'], ['derived:夜间合计', '第 28–30 行改作核对，原值另存表「时段客流_表内合计」'],
+  ['year_from:交叉表', '表头只写月日，年份取自统计期'], ['relation:R1', '每期核对「全日客流 = 分区甲 + 分区乙」'],
+  ['relation:R2', '「时段客流」与「日客流」口径不同'], ['unit:日客流.全日客流', '「全日客流（人次）」→ 列「全日客流」，单位 人次'],
+  ['unit:日客流.分区甲', '「分区甲（人次）」→ 列「分区甲」，单位 人次'], ['unit:日客流.分区乙', '「分区乙（人次）」→ 列「分区乙」，单位 人次'],
+  ['unit:时段客流.客流', '列「客流」，单位 人次'], ['unit:时段客流_表内合计.客流', '列「客流」，单位 人次'], ['mode', '导入模式：每期替换'],
+].map(([id, label]) => ({ id, label, detail: '', required: true, source: 'recipe' }))
+// 外加一条不必勾的（ConfirmItem.required=false）：检查脚本不勾它，提交的 confirmations 里就不能有它
+const OPTIONAL_CONFIRM = { id: 'sheet_extra:说明', label: '另有可见工作表「说明」，不导入', detail: '', required: false, source: 'sheet' }
+FLOW_CONFIRMS.push(OPTIONAL_CONFIRM)
+const flowCheck = (id, kind, title, status, extra = {}) => ({
+  id, kind, title, status, category: status === 'info' ? 'info' : 'structure', checked: 31, failed: 0, unverifiable: 0,
+  details: [], cells: [], acceptable: false, reasons: {}, ...extra,
+})
+function flowTrial(status, extra = {}) {
+  const checks = status === 'needs_decision' ? [
+    flowCheck('C1', 'context_agree', '统计期多处一致', 'passed', { checked: 1 }),
+    flowCheck('K1', 'derived_sum', '夜间合计按时段区间重算', 'unverifiable', { category: 'structure', acceptable: true, unverifiable: 31,
+      details: ['明细含无数据占位符：31 格'], reasons: { null_detail: 31 }, cells: ['客流汇总!C28'] }),
+    flowCheck('R1', 'relation_sum_eq', '全日客流 = 分区甲 + 分区乙', 'mismatch', { category: 'data_quality', acceptable: true, failed: 2,
+      details: ['8 月 3 日：全日客流与分区之和不等'], cells: ['客流汇总!E5'] }),
+    flowCheck('R2', 'relation_not_comparable', '「时段客流」与「日客流」口径不同', 'info', { failed: 31, details: ['31 天中 0 天相等'] }),
+  ] : [
+    flowCheck('C1', 'context_agree', '统计期多处一致', 'passed', { checked: 1 }),
+    flowCheck('K1', 'derived_sum', '夜间合计按时段区间重算', 'passed', { checked: 93 }),
+    flowCheck('R1', 'relation_sum_eq', '全日客流 = 分区甲 + 分区乙', 'passed'),
+    flowCheck('R2', 'relation_not_comparable', '「时段客流」与「日客流」口径不同', 'info', { failed: 31, details: ['31 天中 0 天相等'] }),
+  ]
+  return {
+    trial_id: `trial-${status}-${Math.random().toString(36).slice(2, 8)}`, status,
+    receipt: {
+      ledger: [{ sheet: '客流汇总', nonempty_scan: 771, nonempty_read: 771, unclaimed: 0, roles: {
+        value: 620, derived_value: 93, derived_label: 3, col_header: 31, row_label: 20, section_title: 2, context: 1, outside_text: 1,
+      } }],
+      tables: [
+        { name: '日客流', sheet: '客流汇总', kind: 'data', rows: 31, grain: ['日期'], columns: [
+          { name: '日期', type: 'TEXT' }, { name: '全日客流', type: 'INTEGER', unit: '人次' },
+          { name: '分区甲', type: 'INTEGER', unit: '人次' }, { name: '分区乙', type: 'INTEGER', unit: '人次' }] },
+        { name: '时段客流', sheet: '客流汇总', kind: 'data', rows: 527, grain: ['日期', '时段'], columns: [
+          { name: '日期', type: 'TEXT' }, { name: '时段', type: 'TEXT' }, { name: '客流', type: 'INTEGER', unit: '人次' }] },
+        { name: '时段客流_表内合计', sheet: '客流汇总', kind: 'reported_total', rows: 93, grain: ['日期', '合计项'], columns: [
+          { name: '日期', type: 'TEXT' }, { name: '合计项', type: 'TEXT' }, { name: '客流', type: 'INTEGER', unit: '人次' }] },
+      ],
+      period: status === 'needs_input' ? null : { start: '2026-08-01', end: '2026-08-31', source: 'cells', cells: ['客流汇总!B2'] },
+      placeholders: { '·': 31 }, outside_text: [{ sheet: '客流汇总', cell: '客流汇总!B3', text: '客流汇总表', kind: 'text' }],
+      db_sha256: 'a'.repeat(64),
+    },
+    problems: status === 'needs_input'
+      ? [{ code: 'period_missing', category: 'input', message: '未能从表格中解析出统计期，请为本期录入统计期', cells: [] }] : [],
+    checks: status === 'needs_input' ? [] : checks,
+    confirm_items: FLOW_CONFIRMS,
+    acceptable: status === 'needs_decision' ? ['K1', 'R1'] : [],
+    notes: { 日客流: { comment: '按日的客流，已逐日核对全日客流等于两个分区之和。', columns: { 全日客流: '单位：人次' } } },
+    diff: null, same_as_import: null, base_snapshot_id: null,
+    ...extra,
+  }
+}
+function flowStaging(over = {}) {
+  return {
+    id: 'stg-flow', kind: 'first', status: 'drafting',
+    source: { id: 'src-new-flow', name: 'zz_flow_recipe', exists: false, import_mode: null },
+    file: { name: '月报导出_2026-08-01_2026-08-31.xlsx', size: 12345, sha256_prefix: 'a1b2c3d4' },
+    sheets: [{ name: '客流汇总', state: 'visible', bounds: 'B2:AG32', nonempty: 773, merged: 5, formulas: 93, formulas_uncached: 0, hidden_rows: 0, hidden_cols: 0 }],
+    skipped_sheets: [], full_calc_on_load: false, grids: [flowGrid()],
+    draft: { recipe: recipeWithList(), complete: true, origin: 'rules', cards: FLOW_CARDS, questions: FLOW_QUESTIONS, failures: [] },
+    ai_draft: null, ai: { offered: false, available: true, reason: '', model: '检查脚本模型', provider: '检查脚本接入' }, ai_consents: [],
+    recipe: recipeWithList(), recipe_origin: 'rules', recipe_problems: [], answers: {},
+    cards: FLOW_CARDS, questions: FLOW_QUESTIONS,
+    draft_problems: [{ code: 'row_unclaimed', category: 'structure', message: '第 32 行：标签列有字、日期列有值，没有分段认领这一行', cells: ['客流汇总!B32:C32'] }],
+    draft_partial: false, candidates: RECIPE_CANDIDATES, units: RECIPE_UNITS, marks: FLOW_MARKS, trial: null, context_inputs: {},
+    created_at: ago(60_000), updated_at: ago(0), expires_at: ago(-7 * 24 * 3600_000),
+    ...over,
+  }
+}
+const RECIPE_SRC_BASE = {
+  kind: 'sqlite', host: null, port: null, username: null, options: {}, readonly: true, description: '', enabled: true,
+  password_masked: '', has_password: false, cached_schema: '', schema_error: '', available_schemas: [],
+  last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null, table_count: 3,
+  schema_synced_at: ago(0), origin: 'upload', import_mode: 'recipe',
+  current_snapshot: { id: '7'.repeat(64), created_at: ago(3600_000), file_name: '月报导出_2026-07-01_2026-07-31.xlsx', raw_state: 'kept' },
+  current_recipe: { id: 'rcp-1', seq: 1, origin: 'rules', activated_at: ago(3600_000), signed_by: '检查脚本' },
+  open_staging: null,
+}
+const recipeSource = (id, name, over = {}) => ({
+  ...RECIPE_SRC_BASE, id, name, tools: [`db_query__${name}`], database: `/tmp/x/uploads/tables/${id}/builds/${'8'.repeat(64)}.db`, ...over,
+})
+const coded = (status, code, detail) => json({ detail, code }, status)
+/** 确认清单：逐条勾上全部必勾的确认项（不点任何「全选」；标了「可选」的不勾） */
+const tickRequired = async (list) => {
+  const boxes = list.locator('[data-confirm-item][data-required="true"] input[type="checkbox"]')
+  for (let i = 0; i < await boxes.count(); i++) await boxes.nth(i).check()
+}
+
+await section('数据 · 表格：按配方导入', async () => {
+  // 服务端的回答排队：每个接口按到达顺序取一个；没备好的回 500，免得静默通过
+  const replies = { stage: [], answers: [], recipe: [], trial: [], commit: [], get: [], preview: [], draftAi: [] }
+  const take = (k) => (route, ctx) => {
+    const r = replies[k].shift()
+    return r ? r(route, ctx) : json({ detail: `检查脚本没有准备这次的回答（${k}）` }, 500)(route)
+  }
+  let current = flowStaging()
+  const echo = (patch = {}) => (route, { body }) => {
+    current = { ...current, ...patch, ...(body?.recipe ? { recipe: body.recipe, answers: {} } : {}) }
+    return json(current)(route)
+  }
+  const shapeReply = {
+    detail: '检查脚本的 422 原话：结构不规整',
+    decision: { kind: 'shape', details: { reasons: [{ sheet: '客流汇总', kind: 'date_header', cells: ['C4:AG4'], message: '第 4 行有 31 个日期样式的单元格（C4:AG4），疑似日期横排的交叉表' }] } },
+  }
+  const recipeSrc = recipeSource('check-manage-recipe', 'zz_recipe_card')
+  const aiSrc = recipeSource('check-manage-ai', 'zz_ai_offer', { import_mode: 'simple', open_staging: { id: 'stg-ai', kind: 'switch', status: 'drafting', created_at: ago(60_000) } })
+  const aiOffSrc = recipeSource('check-manage-ai-off', 'zz_ai_unavailable', { import_mode: 'simple', open_staging: { id: 'stg-ai-off', kind: 'switch', status: 'drafting', created_at: ago(60_000) } })
+  const PREVIEW = { text: '## 工作表「客流汇总」 已用区域 B2:AG30，非空格 771\n合并：B2:AG2、B3:AG3\n数字（只有类型）：\n  C5:AG7 整数', chars: 66, sha256: 'f'.repeat(64), model: '检查脚本模型', provider: '检查脚本接入' }
+  const { page, sent, natives, errors, close } = await open('/data/tables', {
+    recordForms: true,
+    handlers: [
+      [/^GET \/datasources$/, (route) => json([...sources, recipeSrc, aiSrc, aiOffSrc])(route)],
+      [/^GET \/datasources\/check-manage-[^/]+\/schema$/, json({ tables: ['日客流'], summary: '', synced_at: ago(0) })],
+      [/^POST \/datasources\/upload$/, json(shapeReply, 422)],
+      [/^POST \/datasources\/imports\/stage$/, take('stage')],
+      [/^GET \/datasources\/imports\/[^/]+\/draft-ai\/preview$/, take('preview')],
+      [/^POST \/datasources\/imports\/[^/]+\/draft-ai$/, take('draftAi')],
+      [/^GET \/datasources\/imports\/[^/]+$/, take('get')],
+      [/^POST \/datasources\/imports\/[^/]+\/answers$/, take('answers')],
+      [/^PUT \/datasources\/imports\/[^/]+\/recipe$/, take('recipe')],
+      [/^POST \/datasources\/imports\/[^/]+\/trial$/, take('trial')],
+      [/^POST \/datasources\/imports\/[^/]+\/commit$/, take('commit')],
+    ],
+  })
+  const count = (key) => sent.filter((s) => s.key === key || new RegExp(key).test(s.key)).length
+  const last = (re) => [...sent].reverse().find((s) => re.test(s.key))
+  const wizard = () => dialog(page)
+
+  // ---- 卡片：按配方导入的源换成「上传新一期」「修改配方」，没有「重新上传」
+  const rcard = page.locator('[data-source="zz_recipe_card"]')
+  check('按配方导入的源：卡片上有「上传新一期」「修改配方」，没有「重新上传」',
+        await rcard.getByRole('button', { name: '上传新一期' }).count() === 1
+        && await rcard.getByRole('button', { name: '修改配方' }).count() === 1
+        && await rcard.getByRole('button', { name: '重新上传' }).count() === 0)
+  const recipeLine = await rcard.locator('[data-current-recipe]').innerText().catch(() => '')
+  check('……卡片上写当前配方：第几版、起草方式、启用时间、署名（未认证）',
+        recipeLine.includes('配方第 1 版') && recipeLine.includes('规则起草') && recipeLine.includes('启用')
+        && recipeLine.includes('署名「检查脚本」（未认证）'), recipeLine)
+  check('……简单导入的源不写配方信息', await page.locator('[data-source="zz_ai_offer"] [data-current-recipe]').count() === 0)
+  check('表格标签页头部有「按配方导入」入口', await page.locator('[data-recipe-entry]').count() === 1)
+
+  // ---- 头部入口：选文件区接得住拖进来的文件；提示的格式与选择框收的一致
+  await page.locator('[data-recipe-entry]').click()
+  const dropZone = dialog(page).locator('[data-wizard-drop]')
+  await dropZone.waitFor({ timeout: 4000 }).catch(() => {})
+  const pickHint = await dropZone.innerText().catch(() => '')
+  const accept = await dropZone.locator('input[type="file"]').getAttribute('accept').catch(() => '')
+  check('选文件区写「拖入文件」，提示的格式与选择框收的一致（.xlsx、.xlsm）', pickHint.includes('拖入文件')
+        && accept === '.xlsx,.xlsm' && pickHint.includes('.xlsx') && pickHint.includes('.xlsm'), `${pickHint} | ${accept}`)
+  const dropFile = async (name) => {
+    const dt = await page.evaluateHandle((n) => {
+      const d = new DataTransfer()
+      d.items.add(new File(['PK'], n, { type: 'application/octet-stream' }))
+      return d
+    }, name)
+    await dropZone.dispatchEvent('dragover', { dataTransfer: dt })
+    await dropZone.dispatchEvent('drop', { dataTransfer: dt })
+    await page.waitForTimeout(200)
+  }
+  await dropFile('drop_flow.csv')
+  check('……拖进来的不是 Excel：不选中，说明只支持 .xlsx、.xlsm', await dropZone.locator('[data-wizard-file]').count() === 0
+        && (await page.locator('body').innerText()).includes('不是 Excel 文件'))
+  await dropFile('drop_flow.xlsx')
+  check('……拖进来的文件被选中，名字取自文件名', (await dropZone.locator('[data-wizard-file]').innerText().catch(() => '')).includes('drop_flow.xlsx')
+        && (await dialog(page).locator('[data-wizard-name]').inputValue().catch(() => '')) === 'drop_flow')
+  await dialog(page).getByRole('button', { name: '取消', exact: true }).click()
+  await page.waitForTimeout(200)
+
+  // ---- 交叉表决定页 → 按配方导入：带着同一个文件和名字发 stage
+  await page.getByRole('button', { name: /传表格/ }).first().click()
+  let dlg = dialog(page)
+  await dlg.locator('input[type="file"]').setInputFiles({ name: '月报导出_2026-08-01_2026-08-31.xlsx', mimeType: 'application/octet-stream', buffer: Buffer.from('PK\x03\x04') })
+  await dlg.locator('input.mono').first().fill('zz_flow_recipe')
+  await dlg.getByRole('button', { name: /导入/ }).click()
+  const recipeBtn = page.locator('[data-shape-recipe] button', { hasText: '按配方导入' })
+  await recipeBtn.waitFor({ timeout: 5000 }).catch(() => {})
+  check('交叉表决定页出现「按配方导入」按钮', await recipeBtn.count() === 1)
+  replies.stage.push(json(current, 201))
+  await recipeBtn.click()
+  const grid = page.locator('[data-sheet-grid]')
+  await grid.waitFor({ timeout: 5000 }).catch(() => {})
+  const stageForm = (await importForms(page)).at(-1) ?? {}
+  check('……点了发 POST /datasources/imports/stage，表单里带同一个文件和名字',
+        count('^POST /datasources/imports/stage$') === 1 && /imports\/stage/.test(stageForm.url ?? '')
+        && stageForm.name === 'zz_flow_recipe' && stageForm.file === '<file 月报导出_2026-08-01_2026-08-31.xlsx>', JSON.stringify(stageForm))
+  check('……上传弹窗让位给向导（只剩一个弹窗）', await page.locator('[role="dialog"]').count() === 1 && await page.locator('[data-upload-decision]').count() === 0)
+
+  // ---- 网格
+  check('网格：行号、列字母', await grid.locator('[data-row-header="5"]').count() === 1 && await grid.locator('[data-col-header="C"]').count() === 1)
+  check('……B5 按去向着色为行标签', (await grid.locator('[data-cell="B5"]').getAttribute('data-role').catch(() => '')) === 'row_label')
+  check('……C28 是合计格，悬停显示公式', (await grid.locator('[data-cell="C28"]').getAttribute('data-role').catch(() => '')) === 'derived_value'
+        && ((await grid.locator('[data-cell="C28"]').getAttribute('title').catch(() => '')) ?? '').includes('=SUM(C22:C25)'))
+  check('……没有去处的格（B32）标成 unclaimed，图例里有「没有去处」',
+        (await grid.locator('[data-cell="B32"]').getAttribute('data-role').catch(() => '')) === 'unclaimed'
+        && (await grid.locator('[data-grid-legend]').innerText().catch(() => '')).includes('没有去处'))
+  check('……合并区 B2:AG2 画成一格', (await grid.locator('[data-cell="B2"]').getAttribute('colspan').catch(() => '')) === '32'
+        && await grid.locator('[data-cell="C2"]').count() === 0)
+
+  // ---- 规则草稿完整：不提供 AI 入口
+  check('规则草稿完整（offered=false）：没有 AI 入口', await page.locator('[data-ai-offer]').count() === 0)
+
+  // ---- 建议卡片与问题
+  const cards = page.locator('[data-suggestion-card]')
+  const reasons = await page.locator('[data-suggestion-card] [data-card-reason]').allInnerTexts()
+  check('建议卡片 10 张，每张都有理由', await cards.count() === 10 && reasons.length === 10 && reasons.every((r) => r.trim().length > 0), String(await cards.count()))
+  const qPlace = page.locator('[data-question="q_placeholder:·"]')
+  const radios = page.locator('[data-question] input[type="radio"]')
+  check('问题是单选，没有默认选中', await radios.count() === 6 && await page.locator('[data-question] input[type="radio"]:checked').count() === 0
+        && (await qPlace.locator('input[type="radio"]').first().getAttribute('type')) === 'radio')
+  check('……带起草建议（default）的问题也不预选，只写「建议：…」',
+        (await qPlace.locator('[data-question-suggested]').innerText().catch(() => '')).includes('建议：是，存为空值')
+        && (await page.locator('[data-question="q_relation:F1"] [data-question-suggested]').innerText().catch(() => '')).includes('建议：登记')
+        && await page.locator('[data-question="q_relation:F2"] [data-question-suggested]').count() === 0)
+  replies.answers.push((route, { body }) => { current = { ...current, answers: Object.fromEntries(Object.entries(body.answers).map(([k, v]) => [k, { reason: null, ...v }])) }; return json(current)(route) })
+  await qPlace.locator('[data-option="null"] input').check()
+  await until(async () => count('^POST /datasources/imports/[^/]+/answers$') === 1, 4000)
+  const a1 = last(/answers$/)
+  check('选了以后发 POST …/answers，body 的 answers 是 {问题: {value}}',
+        a1?.body?.answers?.['q_placeholder:·']?.value === 'null' && !('reason' in (a1?.body?.answers?.['q_placeholder:·'] ?? {})), JSON.stringify(a1?.body ?? {}))
+  await page.waitForTimeout(200)
+  check('……服务端回的 answers 回显为选中', await qPlace.locator('[data-option="null"] input').isChecked())
+  const qF2 = page.locator('[data-question="q_relation:F2"]')
+  await qF2.locator('[data-option="dismiss"] input').check()
+  await page.waitForTimeout(250)
+  const reasonBox = qF2.locator('[data-question-reason] textarea')
+  const submitReason = qF2.locator('[data-question-reason] button')
+  check('选需要理由的「不登记」：出现理由框，没填理由不发请求',
+        await reasonBox.count() === 1 && await submitReason.isDisabled() && count('^POST /datasources/imports/[^/]+/answers$') === 1)
+  replies.answers.push((route, { body }) => { current = { ...current, answers: Object.fromEntries(Object.entries(body.answers).map(([k, v]) => [k, { reason: null, ...v }])) }; return json(current)(route) })
+  await reasonBox.fill('两段口径本来就不同，检查脚本')
+  await submitReason.click()
+  await until(async () => count('^POST /datasources/imports/[^/]+/answers$') === 2, 4000)
+  const a2 = last(/answers$/)
+  check('……写了理由再提交：带理由发出，之前的回答一并带上',
+        a2?.body?.answers?.['q_relation:F2']?.value === 'dismiss' && a2?.body?.answers?.['q_relation:F2']?.reason === '两段口径本来就不同，检查脚本'
+        && a2?.body?.answers?.['q_placeholder:·']?.value === 'null', JSON.stringify(a2?.body ?? {}))
+  await shot(page, 'recipe-drafting')
+
+  // ---- 配方面板
+  await page.locator('[data-recipe-drawer-toggle]').click()
+  const panel = page.locator('[data-recipe-panel]')
+  await panel.waitFor({ timeout: 4000 }).catch(() => {})
+  const panelText = await panel.innerText().catch(() => '')
+  check('配方面板整段文本里没有「正则」「regex」「pattern」', panelText.length > 100 && !/正则|regex|pattern/i.test(panelText))
+  const unitOptions = await panel.locator('[data-field="/tables/0/units/全日客流"] option').evaluateAll((os) => os.map((o) => o.value))
+  check('……单位是下拉框，选项恰好是单位词表（外加一个「无单位」）',
+        JSON.stringify(unitOptions.filter((v) => v)) === JSON.stringify(RECIPE_UNITS) && unitOptions.filter((v) => !v).length === 1, unitOptions.join(','))
+  const constOptions = await panel.locator('[data-field="/sheets/0/blocks/0/segments/1/const/时段类别/pick"] option').evaluateAll((os) => os.map((o) => o.value))
+  check('……常量是下拉框，选项恰好是该分段标题的候选词', JSON.stringify(constOptions) === JSON.stringify(RECIPE_CANDIDATES['日间时段客流（人次）']), constOptions.join(','))
+  const puts = () => sent.filter((s) => /^PUT \/datasources\/imports\/[^/]+\/recipe$/.test(s.key))
+  replies.recipe.push(echo())
+  await panel.locator('[data-field="/tables/0/name"]').fill('日客流量')
+  await panel.locator('[data-field="/tables/0/name"]').press('Enter')
+  await until(async () => puts().length === 1, 4000)
+  const p1 = puts()[0]?.body?.recipe
+  check('改表名：发一次 PUT …/recipe，表名变了，引用它的分段一并改',
+        puts().length === 1 && p1?.tables?.[0]?.name === '日客流量' && p1?.sheets?.[0]?.blocks?.[0]?.segments?.[0]?.table === '日客流量'
+        && p1?.relations?.[0]?.table === '日客流量', JSON.stringify(p1?.tables?.[0] ?? {}))
+  await page.waitForTimeout(300)
+  replies.recipe.push(echo())
+  const dayLabels = panel.locator('[data-field-wrap="/sheets/0/blocks/0/segments/1/labels/expect"]')
+  await dayLabels.locator('[data-label-input]').fill('6-7')
+  await dayLabels.locator('[data-label-add]').click()
+  await until(async () => puts().length === 2, 4000)
+  const p2 = puts()[1]?.body?.recipe?.sheets?.[0]?.blocks?.[0]?.segments?.[1]?.labels?.expect ?? []
+  check('增一个标签：发 PUT，标签集合多了「6-7」', puts().length === 2 && p2.includes('6-7') && p2.length === 12, p2.join(','))
+  await page.waitForTimeout(300)
+  replies.recipe.push(echo())
+  await dayLabels.getByRole('button', { name: '移除标签「7-8」' }).click()
+  await until(async () => puts().length === 3, 4000)
+  const p3 = puts()[2]?.body?.recipe?.sheets?.[0]?.blocks?.[0]?.segments?.[1]?.labels?.expect ?? []
+  check('删一个标签：发 PUT，标签集合少了「7-8」', puts().length === 3 && !p3.includes('7-8') && p3.includes('6-7'), p3.join(','))
+  await page.waitForTimeout(300)
+  replies.recipe.push(echo())
+  const titleBox = panel.locator('[data-field="/sheets/0/blocks/0/segments/2/locate/title"]')
+  await titleBox.fill('夜间客流（人次）')
+  await titleBox.blur()
+  await until(async () => puts().length === 4, 4000)
+  check('改分段标题：发 PUT，标题变了', puts()[3]?.body?.recipe?.sheets?.[0]?.blocks?.[0]?.segments?.[2]?.locate?.title === '夜间客流（人次）')
+  await page.waitForTimeout(300)
+  replies.recipe.push(echo())
+  await panel.locator('[data-field="/sheets/1/blocks/0/rows/blank_rows"] input[value="skip"]').check()
+  await until(async () => puts().length === 5, 4000)
+  check('切换「数据中间的空行」：发 PUT，blank_rows 变成跳过', puts()[4]?.body?.recipe?.sheets?.[1]?.blocks?.[0]?.rows?.blank_rows === 'skip')
+  await page.waitForTimeout(300)
+  // 有问题的配方：一条对得上字段（单位），一条对不上（挂到面板顶部）
+  replies.recipe.push(echo({ recipe_problems: [
+    { path: '/tables/0/units/分区甲', code: 'unit_label_conflict', message: '表「日客流量」：列「分区甲」的单位与标签「分区甲（人次）」不一致' },
+    { path: '/sheets/0/blocks/0/label_offset', code: 'schema', message: '第 1 个工作表的交叉表：标签列偏移只能是紧挨日期的左侧一列' },
+  ] }))
+  await panel.locator('[data-field="/tables/0/units/分区甲"]').selectOption('人')
+  await until(async () => puts().length === 6, 4000)
+  await page.waitForTimeout(300)
+  const trialBtn = wizard().locator('[data-trial-run]')
+  check('配方有问题时「试运行」禁用', await trialBtn.isDisabled())
+  check('……带 path 的问题显示在对应字段旁', (await panel.locator('[data-field-wrap="/tables/0/units/分区甲"] [data-recipe-problem]').innerText().catch(() => '')).includes('不一致'))
+  check('……对不到字段的显示在面板顶部', (await panel.locator('[data-recipe-problems-top]').innerText().catch(() => '')).includes('标签列偏移')
+        && await panel.locator('[data-recipe-problems-top] [data-recipe-problem]').count() === 1)
+  await panel.locator('[data-recipe-json-toggle]').click()
+  const jsonText = await panel.locator('[data-recipe-json]').innerText().catch(() => '')
+  check('「查看配方 JSON」可见，补全了默认值', jsonText.includes('"recipe_format"') && jsonText.includes('"fallback"') && jsonText.includes('"blank_rows"'))
+  replies.recipe.push(echo({ recipe_problems: [] }))
+  await panel.locator('[data-recipe-paste-toggle]').click()
+  await panel.locator('[data-recipe-paste] textarea').fill(JSON.stringify(FLOW_RECIPE))
+  await panel.locator('[data-recipe-paste] button', { hasText: '保存配方' }).click()
+  await until(async () => puts().length === 7, 4000)
+  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[6]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
+  await page.waitForTimeout(300)
+  check('……问题清掉以后「试运行」可用', await trialBtn.isEnabled())
+  // 连续修改：上一次 PUT 还没回来就接着改。上一次回来时，排在后面的修改不能被服务端那份盖掉，
+  // 之后的修改也要以含它的配方为底（服务端每次回复都慢 1.2 秒）
+  const slowEcho = (route, ctx) => new Promise((r) => setTimeout(r, 1200)).then(() => echo()(route, ctx))
+  replies.recipe.push(slowEcho, slowEcho, slowEcho)
+  const unitSel = (t, c) => panel.locator(`[data-field="/tables/${t}/units/${c}"]`)
+  const putsBefore = puts().length
+  await unitSel(1, '客流').selectOption('人')
+  await unitSel(2, '客流').selectOption('人')
+  await until(async () => puts().length === putsBefore + 2, 6000)
+  await page.waitForTimeout(150)
+  const midUi = await unitSel(2, '客流').inputValue().catch(() => '')
+  await unitSel(0, '全日客流').selectOption('元')
+  await until(async () => puts().length === putsBefore + 3, 6000)
+  await until(async () => !(await panel.locator('[data-recipe-saving]').count()), 6000)
+  await page.waitForTimeout(200)
+  const lastUnits = (puts().at(-1)?.body?.recipe?.tables ?? []).map((t) => t?.units ?? {})
+  const finalUi = [await unitSel(0, '全日客流').inputValue(), await unitSel(1, '客流').inputValue(), await unitSel(2, '客流').inputValue()]
+  check('连续改三处（回复慢）：上一次 PUT 回来时，排着的那处修改在界面上不退回', midUi === '人', midUi)
+  check('……最后一次 PUT 三处修改都在，界面停在三处都改过的样子',
+        puts().length === putsBefore + 3 && lastUnits[0]?.['全日客流'] === '元' && lastUnits[1]?.['客流'] === '人' && lastUnits[2]?.['客流'] === '人'
+        && JSON.stringify(finalUi) === JSON.stringify(['元', '人', '人']), `${puts().length - putsBefore} 次：${JSON.stringify(lastUnits)} 界面 ${finalUi.join(',')}`)
+  await shot(page, 'recipe-panel')
+
+  // ---- 试运行：先要录入统计期，再出回执
+  replies.trial.push((route) => { current = { ...current, status: 'trialed', trial: flowTrial('needs_input') }; return json(current)(route) })
+  await trialBtn.click()
+  const periodForm = page.locator('[data-period-form]')
+  await periodForm.waitFor({ timeout: 4000 }).catch(() => {})
+  check('needs_input：出现两个日期框，文件名里的区间作建议', await periodForm.locator('input[type="date"]').count() === 2
+        && (await periodForm.innerText()).includes('2026-08-01'))
+  check('……needs_input 没有写库：「表与行数」只列表和列，写「未写入」，不显示行数',
+        await page.locator('[data-trial-receipt] [data-receipt-tables="unwritten"]').count() === 1
+        && await page.locator('[data-trial-receipt] [data-receipt-table][data-rows]').count() === 0
+        && !(await page.locator('[data-trial-receipt] [data-receipt-tables]').innerText().catch(() => '')).includes(' 行'))
+  replies.trial.push((route) => { current = { ...current, status: 'trialed', trial: flowTrial('needs_decision') }; return json(current)(route) })
+  await periodForm.locator('[data-period-start]').fill('2026-08-01')
+  await periodForm.locator('[data-period-end]').fill('2026-08-31')
+  await periodForm.getByRole('button', { name: '按此统计期试运行' }).click()
+  const receipt = page.locator('[data-trial-receipt]')
+  await until(async () => (await receipt.locator('[data-check]').count()) > 0, 4000)
+  const t2 = sent.filter((s) => /\/trial$/.test(s.key))[1]
+  check('……提交 trial 时 body 带 context_inputs', t2?.body?.context_inputs?.['统计期']?.start === '2026-08-01'
+        && t2?.body?.context_inputs?.['统计期']?.end === '2026-08-31', JSON.stringify(t2?.body ?? {}))
+  check('回执：格子账含 771', (await receipt.locator('[data-ledger]').innerText().catch(() => '')).includes('771'))
+  const rows = async (n) => (await receipt.locator(`[data-receipt-table="${n}"]`).getAttribute('data-rows').catch(() => ''))
+  check('……日客流 31 行、时段客流 527 行、时段客流_表内合计 93 行',
+        await rows('日客流') === '31' && await rows('时段客流') === '527' && await rows('时段客流_表内合计') === '93'
+        && (await receipt.locator('[data-receipt-table="时段客流"]').innerText()).includes('527 行'))
+  const chip = (st) => receipt.locator(`[data-check][data-status="${st}"] [data-check-status]`).first()
+  const look = async (st) => ({ text: await chip(st).innerText().catch(() => ''), color: await chip(st).evaluate((el) => getComputedStyle(el).color).catch(() => '') })
+  const [okLook, badLook, unvLook] = [await look('passed'), await look('mismatch'), await look('unverifiable')]
+  check('……通过 / 不一致 / 无法核对三种状态各有不同的文字和样式',
+        okLook.text.includes('通过') && badLook.text.includes('不一致') && unvLook.text.includes('无法核对')
+        && new Set([okLook.color, badLook.color, unvLook.color]).size === 3, JSON.stringify([okLook, badLook, unvLook]))
+  const r2 = receipt.locator('[data-check="R2"]')
+  check('……口径不同的 R2（说明）不写「不一致 31」：只有细节「31 天中 0 天相等」',
+        await r2.count() === 1 && await r2.locator('[data-check-counts]').count() === 0
+        && !(await r2.innerText()).includes('不一致') && (await r2.innerText()).includes('31 天中 0 天相等'))
+  check('……区域外文字的坐标是「客流汇总!B3」（cell 本来就带工作表名，不再拼一次）',
+        await receipt.locator('[data-outside-text="客流汇总!B3"] [data-cell-ref="客流汇总!B3"]').count() === 1)
+  await shot(page, 'recipe-receipt')
+
+  // ---- 确认清单
+  await wizard().locator('[data-to-confirm]').click()
+  const list = page.locator('[data-confirm-list]')
+  await list.waitFor({ timeout: 4000 }).catch(() => {})
+  const commitBtn = list.locator('[data-commit]')
+  check('确认清单：没有「全选」', await list.getByRole('button', { name: /全选/ }).count() === 0 && !(await list.innerText()).includes('全选'))
+  check('……逐列的单位确认项（unit:日客流.全日客流 等五条）',
+        await list.locator('[data-confirm-item^="unit:"]').count() === 5 && await list.locator('[data-confirm-item="unit:日客流.全日客流"]').count() === 1)
+  check('……署名旁写「署名（未认证）」', (await list.locator('[data-sign-note]').innerText().catch(() => '')).includes('署名（未认证）'))
+  check('……不必勾的确认项标「可选」', await list.locator(`[data-confirm-item="${OPTIONAL_CONFIRM.id}"] [data-confirm-optional]`).count() === 1
+        && await list.locator('[data-confirm-optional]').count() === 1)
+  check('……一项没勾时「确认并启用」禁用', await commitBtn.isDisabled() && (await commitBtn.innerText()).includes('确认并启用'))
+  await tickRequired(list)
+  check('……全勾了、可接受的核对还没写理由：仍禁用', await commitBtn.isDisabled())
+  check('……可接受的核对各一个「接受理由（必填）」', await list.locator('[data-acceptance]').count() === 2
+        && (await list.locator('[data-acceptance="R1"]').innerText()).includes('接受理由（必填）'))
+  await list.locator('[data-acceptance="R1"] textarea').fill('8 月 3 日分区数据补录，检查脚本')
+  check('……只写了一条理由：仍禁用', await commitBtn.isDisabled())
+  await list.locator('[data-acceptance="K1"] textarea').fill('占位符时段本来无数据，检查脚本')
+  check('……全部勾上、理由都写了：可用', await commitBtn.isEnabled())
+  replies.commit.push(coded(409, 'base_changed', '在你试运行之后，当前版本已被更新，请重新试运行'))
+  replies.get.push((route) => { current = { ...current, status: 'drafting' }; return json(current)(route) })
+  await commitBtn.click()
+  await until(async () => count('/commit$') === 1, 4000)
+  const c1 = last(/commit$/)
+  check('提交的 body：confirmations 恰好是勾过的项（没勾的可选项不在里面）、acceptances 带理由、trial_id 对',
+        JSON.stringify([...(c1?.body?.confirmations ?? [])].sort()) === JSON.stringify(FLOW_CONFIRMS.filter((x) => x.required).map((x) => x.id).sort())
+        && !(c1?.body?.confirmations ?? []).includes(OPTIONAL_CONFIRM.id)
+        && c1?.body?.acceptances?.length === 2 && c1.body.acceptances.every((a) => a.reason.includes('检查脚本'))
+        && c1?.body?.trial_id === current.trial.trial_id, JSON.stringify(c1?.body ?? {}).slice(0, 300))
+  await until(async () => await page.locator('[data-import-wizard][data-view="draft"]').count() > 0, 4000)
+  await page.waitForTimeout(300)
+  check('提交回 409 base_changed：出现「请重新试运行」，回到配方步骤',
+        (await page.locator('[data-wizard-notice]').innerText().catch(() => '')).includes('请重新试运行')
+        && await page.locator('[data-import-wizard][data-view="draft"]').count() === 1 && await page.locator('[data-trial-run]').count() === 1)
+  // 再试运行一次：这回提交时试运行库已不在（trial_required）
+  replies.trial.push((route) => { current = { ...current, status: 'trialed', trial: flowTrial('passed') }; return json(current)(route) })
+  await page.locator('[data-trial-run]').click()
+  await until(async () => await page.locator('[data-to-confirm]').count() > 0, 4000)
+  await page.locator('[data-to-confirm]').click()
+  await tickRequired(page.locator('[data-confirm-list]'))
+  replies.commit.push(coded(409, 'trial_required', '试运行之后修改过配方，或试运行结果已失效：请重新试运行'))
+  replies.get.push((route) => { current = { ...current, status: 'drafting' }; return json(current)(route) })
+  await page.locator('[data-confirm-list] [data-commit]').click()
+  await until(async () => await page.locator('[data-import-wizard][data-view="draft"]').count() > 0, 4000)
+  check('提交回 409 trial_required：同样出现「请重新试运行」并回到配方步骤',
+        (await page.locator('[data-wizard-notice]').innerText().catch(() => '')).includes('请重新试运行')
+        && await page.locator('[data-import-wizard][data-view="draft"]').count() === 1)
+  // 第三次：与第 3 次导入相同，未新建版本
+  replies.trial.push((route) => { current = { ...current, status: 'trialed', trial: flowTrial('passed', { same_as_import: { id: 'imp-3', seq: 3 } }) }; return json(current)(route) })
+  await page.locator('[data-trial-run]').click()
+  await until(async () => await page.locator('[data-to-confirm]').count() > 0, 4000)
+  await page.locator('[data-to-confirm]').click()
+  await tickRequired(page.locator('[data-confirm-list]'))
+  replies.commit.push(json({ source: recipeSource('src-new-flow', 'zz_flow_recipe'), import_id: 'imp-3', snapshot_id: '9'.repeat(64),
+    build_id: 'b'.repeat(64), recipe_id: 'rcp-9', build_reused: true, unchanged: true }, 201))
+  await page.locator('[data-confirm-list] [data-commit]').click()
+  const doneView = page.locator('[data-import-done]')
+  await doneView.waitFor({ timeout: 4000 }).catch(() => {})
+  check('提交回 unchanged: true：显示「与第 3 次导入相同」', (await doneView.innerText().catch(() => '')).includes('与第 3 次导入相同'))
+  check('……启用后卡片列表里有了这个源', await page.locator('[data-source="zz_flow_recipe"]').count() === 1)
+  await wizard().getByRole('button', { name: '完成' }).click()
+  await page.waitForTimeout(300)
+
+  // ---- AI 起草：从卡片「有未完成的导入」继续（同名的简单导入切换为按配方导入）
+  const aiStaging = () => flowStaging({
+    id: 'stg-ai', kind: 'switch', source: { id: 'check-manage-ai', name: 'zz_ai_offer', exists: true, import_mode: 'simple' },
+    draft: { recipe: null, complete: false, origin: 'rules', cards: [], questions: [], failures: ['第 28 行像合计行，但标签无法确定区间'] },
+    recipe: null, cards: FLOW_CARDS.slice(0, 3), questions: [FLOW_QUESTIONS[0]], answers: { 'q_placeholder:·': { value: 'reject', reason: null } },
+    ai: { offered: true, available: true, reason: '', model: '检查脚本模型', provider: '检查脚本接入' }, draft_partial: true,
+  })
+  replies.get.push(json(aiStaging()))
+  await page.locator('[data-source="zz_ai_offer"] [data-open-staging]').click()
+  const offer = page.locator('[data-ai-offer]')
+  await offer.waitFor({ timeout: 4000 }).catch(() => {})
+  check('继续未完成的导入：GET imports/{id} 进入起草', count('^GET /datasources/imports/stg-ai$') === 1 && await page.locator('[data-sheet-grid]').count() === 1)
+  check('……刷新后已选的回答处于选中状态', await page.locator('[data-question="q_placeholder:·"] [data-option="reject"] input').isChecked())
+  check('……部分干跑：可见文字写全「仅检查了前 500 行，完整检查在试运行时进行」',
+        (await page.locator('[data-draft-partial]').innerText().catch(() => '')).includes('仅检查了前 500 行，完整检查在试运行时进行'))
+  check('offered 且可用：有 AI 入口', await offer.count() === 1 && (await offer.innerText()).includes('让 AI 起草（会把表格结构发给模型）')
+        && await offer.getByRole('button').isEnabled())
+  replies.preview.push(json(PREVIEW))
+  await offer.getByRole('button').click()
+  const consent = page.locator('[data-ai-consent]')
+  await consent.waitFor({ timeout: 4000 }).catch(() => {})
+  const consentText = await consent.innerText().catch(() => '')
+  check('点了先发 GET …/draft-ai/preview，再出同意框', count('/draft-ai/preview$') === 1 && await consent.count() === 1)
+  check('……同意框写模型名和「不会发送数字单元格的值」', consentText.includes('检查脚本模型') && consentText.includes('不会发送数字单元格的值'), consentText.slice(0, 120))
+  check('……[data-ai-preview] 是预览接口返回的原文', (await consent.locator('[data-ai-preview]').innerText().catch(() => '')).trim() === PREVIEW.text.trim())
+  await shot(page, 'recipe-ai-consent')
+  await dialog(page).getByRole('button', { name: '取消', exact: true }).click()
+  await page.waitForTimeout(250)
+  check('……点「取消」不发 POST', count('/draft-ai$') === 0 && await consent.count() === 0)
+  replies.preview.push(json(PREVIEW))
+  replies.draftAi.push((route) => json({ ...aiStaging(), recipe: FLOW_RECIPE, recipe_origin: 'ai',
+    ai_draft: { draft: { recipe: FLOW_RECIPE, complete: true, origin: 'ai' }, usage: [], attempts: 2, total_tokens: 4300, cost_usd: 0.012, error: null } })(route))
+  await offer.getByRole('button').click()
+  await consent.waitFor({ timeout: 4000 }).catch(() => {})
+  await dialog(page).getByRole('button', { name: '同意并发送' }).click()
+  await until(async () => count('/draft-ai$') === 1, 4000)
+  const ai1 = last(/draft-ai$/)
+  check('「同意并发送」发 POST …/draft-ai，consent: true，preview_sha256 等于预览返回的',
+        ai1?.body?.consent === true && ai1?.body?.preview_sha256 === PREVIEW.sha256, JSON.stringify(ai1?.body ?? {}))
+  const usage = page.locator('[data-ai-usage]')
+  await usage.waitFor({ timeout: 4000 }).catch(() => {})
+  check('……成功后显示用了多少 token', (await usage.innerText().catch(() => '')).includes('4,300 token'))
+  replies.preview.push(json(PREVIEW))
+  // 没有工作配方（recipe: null）时服务端的下一步是「粘贴一份完整的配方」：界面照写原话，不再另补「请在配方面板中填写」
+  replies.draftAi.push(coded(502, 'ai_failed', 'AI 未能起草出合法的配方。可以重试，或在配方面板中粘贴一份完整的配方'))
+  await offer.getByRole('button').click()
+  await consent.waitFor({ timeout: 4000 }).catch(() => {})
+  await dialog(page).getByRole('button', { name: '同意并发送' }).click()
+  await page.locator('[data-ai-error]').waitFor({ timeout: 4000 }).catch(() => {})
+  const failedText = (await page.locator('[data-ai-error]').innerText().catch(() => '')).trim()
+  check('ai_failed：显示服务端原话，下一步与可做的事一致（没有工作配方时不叫人去「填写」面板）',
+        failedText === 'AI 未能起草出合法的配方。可以重试，或在配方面板中粘贴一份完整的配方' && !failedText.includes('填写'), failedText)
+  replies.preview.push(json(PREVIEW))
+  replies.draftAi.push(coded(409, 'ai_preview_stale', '检查脚本：表格或模型设置在预览之后变了'))
+  await offer.getByRole('button').click()
+  await consent.waitFor({ timeout: 4000 }).catch(() => {})
+  await dialog(page).getByRole('button', { name: '同意并发送' }).click()
+  await until(async () => (await page.locator('[data-ai-error]').innerText().catch(() => '')).includes('预览之后变了'), 4000)
+  const staleText = await page.locator('[data-ai-error]').innerText().catch(() => '')
+  check('ai_preview_stale：显示服务端原话，并提示重新查看将要发送的内容', staleText.includes('预览之后变了') && staleText.includes('重新查看'), staleText)
+  await wizard().getByRole('button', { name: '稍后继续' }).click()
+  await page.waitForTimeout(300)
+
+  // ---- 模型接入不可用：按钮禁用并写出原因
+  replies.get.push(json({ ...aiStaging(), id: 'stg-ai-off', source: { id: 'check-manage-ai-off', name: 'zz_ai_unavailable', exists: true, import_mode: 'simple' },
+    ai: { offered: true, available: false, reason: '未配置模型接入，无法使用 AI 起草（设置 → 模型接入）', model: '', provider: '' } }))
+  await page.locator('[data-source="zz_ai_unavailable"] [data-open-staging]').click()
+  await offer.waitFor({ timeout: 4000 }).catch(() => {})
+  check('offered 但不可用：按钮禁用并显示原因', await offer.getByRole('button').isDisabled()
+        && (await offer.innerText()).includes('未配置模型接入'))
+  await wizard().getByRole('button', { name: '稍后继续' }).click()
+  await page.waitForTimeout(200)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据 · 表格：上传新一期', async () => {
+  const src = recipeSource('check-manage-reup', 'zz_recipe_reup')
+  // 试运行之后又改过配方的未完成导入（status 回到 drafting、trial 还在）
+  const staleSrc = recipeSource('check-manage-stale', 'zz_recipe_stale', {
+    open_staging: { id: 'stg-stale', kind: 'reupload', status: 'drafting', created_at: ago(60_000) } })
+  const replies = { reupload: [], trial: [], commit: [], recipe: [], redraft: [], discard: [] }
+  const take = (k) => (route, ctx) => {
+    const r = replies[k].shift()
+    return r ? r(route, ctx) : json({ detail: `检查脚本没有准备这次的回答（${k}）` }, 500)(route)
+  }
+  const reupStaging = (trial, over = {}) => flowStaging({
+    id: 'stg-reup', kind: 'reupload', status: trial.status === 'rejected' ? 'rejected' : 'trialed',
+    source: { id: src.id, name: src.name, exists: true, import_mode: 'recipe' },
+    file: { name: '月报导出_2026-09-01_2026-09-30.xlsx', size: 12000, sha256_prefix: 'b2c3d4e5' },
+    draft: null, cards: [], questions: [], answers: {}, ai: { offered: false, available: true, reason: '', model: '', provider: '' },
+    recipe: FLOW_RECIPE, trial, ...over,
+  })
+  const diffTrial = flowTrial('passed', {
+    diff: [
+      { kind: 'period', label: '统计期 2026-07-01 至 2026-07-31 → 2026-09-01 至 2026-09-30', requires_confirm: false },
+      { kind: 'rows', label: '时段客流 527 行 → 510 行', requires_confirm: false },
+      { kind: 'label_writing', label: '分段「日间」：标签「8-9」现在写作「8－9」', requires_confirm: true, confirm_id: 'diff:label_writing:日间' },
+    ],
+    confirm_items: [
+      { id: 'diff:label_writing:日间', label: '分段「日间」的标签写法变了：「8-9」→「8－9」', required: true, source: 'diff' },
+      { id: 'outside_digits:客流汇总!B33', label: '区域外有含数字的文字「注：9月15日闭馆」', required: true, source: 'outside' },
+      OPTIONAL_CONFIRM,
+    ],
+  })
+  const rejectedTrial = flowTrial('rejected', {
+    checks: [], confirm_items: [],
+    problems: [{ code: 'label_missing', category: 'structure', message: '分段「夜间」：期望的标签「23-24」在表格中没有找到', cells: ['客流汇总!B27'] }],
+  })
+  const { page, sent, natives, errors, close } = await open('/data/tables', {
+    recordForms: true,
+    handlers: [
+      [/^GET \/datasources$/, (route) => json([...sources, src, staleSrc])(route)],
+      [/^GET \/datasources\/check-manage-(?:reup|stale)\/schema$/, json({ tables: ['日客流'], summary: '', synced_at: ago(0) })],
+      [/^GET \/datasources\/imports\/stg-stale$/, (route) => json(reupStaging(flowTrial('passed'), {
+        id: 'stg-stale', status: 'drafting', source: { id: staleSrc.id, name: staleSrc.name, exists: true, import_mode: 'recipe' } }))(route)],
+      [/^POST \/datasources\/check-manage-reup\/reupload$/, take('reupload')],
+      [/^POST \/datasources\/imports\/[^/]+\/trial$/, take('trial')],
+      [/^POST \/datasources\/imports\/[^/]+\/commit$/, take('commit')],
+      [/^PUT \/datasources\/imports\/[^/]+\/recipe$/, take('recipe')],
+      [/^POST \/datasources\/check-manage-reup\/redraft$/, take('redraft')],
+      [/^DELETE \/datasources\/imports\/[^/]+$/, take('discard')],
+    ],
+  })
+  const card = page.locator('[data-source="zz_recipe_reup"]')
+  const start = async (name) => {
+    await card.getByRole('button', { name: '上传新一期' }).click()
+    const dlg = dialog(page)
+    await dlg.locator('input[type="file"]').setInputFiles({ name, mimeType: 'application/octet-stream', buffer: Buffer.from('PK\x03\x04') })
+    await dlg.locator('[data-wizard-start]').click()
+  }
+
+  // ---- 通过：差异卡需确认的在前，并且在确认清单里；「启用」要全勾
+  replies.reupload.push(json(reupStaging(diffTrial), 201))
+  await start('月报导出_2026-09-01_2026-09-30.xlsx')
+  const diffCard = page.locator('[data-reupload-diff]')
+  await diffCard.waitFor({ timeout: 5000 }).catch(() => {})
+  const form = (await importForms(page)).at(-1) ?? {}
+  check('点「上传新一期」发 POST /datasources/{id}/reupload，带上文件',
+        sent.filter((s) => s.key === 'POST /datasources/check-manage-reup/reupload').length === 1
+        && form.file === '<file 月报导出_2026-09-01_2026-09-30.xlsx>', JSON.stringify(form))
+  const diffs = await diffCard.locator('[data-diff]').evaluateAll((els) => els.map((e) => e.hasAttribute('data-requires-confirm')))
+  check('结果通过：显示差异卡，需确认的项排在前面', await diffCard.count() === 1 && diffs.length === 3 && diffs[0] === true && !diffs[1] && !diffs[2],
+        JSON.stringify(diffs))
+  check('……上传新一期没有 AI 入口', await page.locator('[data-ai-offer]').count() === 0)
+  await shot(page, 'recipe-reupload-diff')
+  await page.locator('[data-to-confirm]').click()
+  const list = page.locator('[data-confirm-list]')
+  await list.waitFor({ timeout: 4000 }).catch(() => {})
+  const enable = list.locator('[data-commit]')
+  check('……需确认的差异出现在确认清单里，按钮写「启用」',
+        await list.locator('[data-confirm-item="diff:label_writing:日间"]').count() === 1 && (await enable.innerText()).trim() === '启用')
+  await list.locator('[data-confirm-item="diff:label_writing:日间"] input').check()
+  check('……没有全勾时「启用」禁用', await enable.isDisabled())
+  await tickRequired(list)
+  check('……全勾以后可用', await enable.isEnabled())
+  replies.commit.push(json({ source: src, import_id: 'imp-9', snapshot_id: '6'.repeat(64), build_id: 'c'.repeat(64), recipe_id: 'rcp-1', build_reused: false, unchanged: false }, 201))
+  await enable.click()
+  await page.locator('[data-import-done]').waitFor({ timeout: 4000 }).catch(() => {})
+  const c1 = sent.filter((s) => /\/commit$/.test(s.key)).at(-1)
+  check('……启用：confirmations 是勾过的两项（没勾的可选项不在里面）', JSON.stringify([...(c1?.body?.confirmations ?? [])].sort())
+        === JSON.stringify(['diff:label_writing:日间', 'outside_digits:客流汇总!B33'].sort()) && await page.locator('[data-import-done="committed"]').count() === 1)
+  await dialog(page).getByRole('button', { name: '完成' }).click()
+  await page.waitForTimeout(300)
+
+  // ---- 拒收：问题带坐标，「修改配方」回到配方面板，没有「启用」，也没有 AI 入口
+  replies.reupload.push(json(reupStaging(rejectedTrial), 201))
+  await start('月报导出_2026-10-01_2026-10-31.xlsx')
+  const problem = page.locator('[data-problem="label_missing"]')
+  await problem.waitFor({ timeout: 5000 }).catch(() => {})
+  check('结果拒收：问题列表带坐标', await problem.count() === 1 && await problem.locator('[data-cell-ref="客流汇总!B27"]').count() === 1)
+  await problem.locator('[data-cell-ref="客流汇总!B27"]').click()
+  await page.waitForTimeout(400)
+  check('……点坐标，网格滚到那一格', await inView(page.locator('[data-sheet-grid] [data-cell="B27"]')))
+  check('……没有「启用」、没有「下一步：逐条确认」', await page.locator('[data-to-confirm]').count() === 0 && await page.locator('[data-commit]').count() === 0
+        && await dialog(page).getByRole('button', { name: '启用' }).count() === 0)
+  check('……没有 AI 入口', await page.locator('[data-ai-offer]').count() === 0)
+  check('……拒收时服务端不算差异（diff 为 null）：不显示差异卡；「表与行数」写「未写入」，不显示只写了一半的行数',
+        await page.locator('[data-reupload-diff]').count() === 0
+        && await page.locator('[data-receipt-tables="unwritten"]').count() === 1
+        && await page.locator('[data-receipt-table][data-rows]').count() === 0)
+  await page.locator('[data-back-to-recipe]').click()
+  await page.waitForTimeout(300)
+  check('「修改配方」回到配方面板', await page.locator('[data-recipe-panel]').count() === 1 && await page.locator('[data-ai-offer]').count() === 0)
+  // 任一写请求遇到 staging_closed：说清楚并关掉向导
+  replies.trial.push(coded(409, 'staging_closed', '这次导入已结束（过期或已放弃）'))
+  await page.locator('[data-trial-run]').click()
+  await until(async () => (await page.locator('body').innerText()).includes('这次导入已结束'), 4000)
+  await page.waitForTimeout(300)
+  check('写请求回 409 staging_closed：显示「这次导入已结束」并关闭向导',
+        (await page.locator('body').innerText()).includes('这次导入已结束') && await page.locator('[role="dialog"]').count() === 0)
+
+  // ---- 差异卡的种类名：7.6 补上的 outside_moved 有中文名；不认识的 kind 写通用名，不露键名
+  replies.reupload.push(json(reupStaging(flowTrial('passed', { diff: [
+    { kind: 'outside_moved', label: '区域外文字「注：数据为初步统计」从 B32 移到 B33', requires_confirm: false },
+    { kind: 'zz_future_kind', label: '检查脚本：将来新增的一种变化', requires_confirm: false },
+  ] })), 201))
+  await start('月报导出_2026-11-01_2026-11-30.xlsx')
+  const kindCard = page.locator('[data-reupload-diff]')
+  await kindCard.waitFor({ timeout: 5000 }).catch(() => {})
+  const kindText = await kindCard.innerText().catch(() => '')
+  check('差异卡：outside_moved 写「区域外文字挪了位置」，不认识的 kind 写「其他变化」，不露键名',
+        kindText.includes('区域外文字挪了位置') && kindText.includes('其他变化') && !/outside_moved|zz_future_kind/.test(kindText), kindText)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(300)
+
+  // ---- 试运行之后又改过配方（status 回到 drafting、trial 还在）：不显示「下一步：逐条确认」，写明已失效
+  await page.locator('[data-source="zz_recipe_stale"] [data-open-staging]').click().catch(() => {})
+  await page.locator('[data-trial-stale]').waitFor({ timeout: 4000 }).catch(() => {})
+  check('试运行已失效：写明「上次的试运行已失效」，没有「下一步：逐条确认」',
+        await page.locator('[data-trial-stale]').count() === 1 && await page.locator('[data-to-confirm]').count() === 0)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(300)
+
+  // ---- 与某次导入相同
+  replies.reupload.push(json(reupStaging(flowTrial('passed', { same_as_import: { id: 'imp-2', seq: 2 }, diff: [] })), 201))
+  await start('月报导出_2026-08-01_2026-08-31.xlsx')
+  const same = page.locator('[data-same-as-import]')
+  await same.waitFor({ timeout: 5000 }).catch(() => {})
+  check('same_as_import：显示「与第 2 次导入相同」', (await same.innerText().catch(() => '')).includes('与第 2 次导入相同'))
+  // 放弃：先问一句（说清当前版本不受影响），确认后发 DELETE 并关掉向导
+  replies.discard.push((route) => route.fulfill({ status: 204, body: '' }))
+  await page.locator('[data-wizard-discard]').click()
+  const ask = page.locator('[role="dialog"]', { hasText: '放弃这次导入？' })
+  await ask.waitFor({ timeout: 4000 }).catch(() => {})
+  check('「放弃这次导入」先问一句，写明当前版本不受影响，还没发 DELETE',
+        (await ask.innerText().catch(() => '')).includes('当前版本不受影响') && sent.filter((s) => s.key.startsWith('DELETE ')).length === 0)
+  await ask.getByRole('button', { name: '放弃这次导入' }).click()
+  await until(async () => await page.locator('[data-import-wizard]').count() === 0, 4000)
+  check('……确认后发 DELETE /datasources/imports/{id}，向导关闭',
+        sent.filter((s) => s.key === 'DELETE /datasources/imports/stg-reup').length === 1 && await page.locator('[role="dialog"]').count() === 0)
+
+  // ---- 配方里的工作表没读到：执行器不给它记账。账是空的、或缺了工作表时，回执不写「全部有去处」「两遍读取一致」
+  const base = flowTrial('rejected').receipt
+  const noLedger = flowTrial('rejected', {
+    checks: [], confirm_items: [],
+    receipt: { ...base, ledger: [], tables: [], period: null, placeholders: {}, outside_text: [] },
+    problems: [{ code: 'sheet_missing', category: 'structure', message: '没有找到工作表「客流汇总」（工作簿中有内容的可见工作表：「表一」「表二」）', cells: [] }],
+  })
+  const ledgerOf = async () => {
+    const box = page.locator('[data-trial-receipt] [data-ledger]')
+    await box.waitFor({ timeout: 5000 }).catch(() => {})
+    return box.innerText().catch(() => '')
+  }
+  replies.reupload.push(json(reupStaging(noLedger), 201))
+  await start('月报导出_2026-11-01_2026-11-30.xlsx')
+  const noneText = await ledgerOf()
+  check('配方里的工作表一张都没读到（账为空）：回执写「未读取到配方中的工作表」，不写「全部有去处」「两遍读取一致」',
+        noneText.includes('未读取到配方中的工作表') && !noneText.includes('全部有去处') && !noneText.includes('两遍读取一致'), noneText)
+  await page.keyboard.press('Escape')
+  await until(async () => await page.locator('[data-import-wizard]').count() === 0, 4000)
+  replies.reupload.push(json(reupStaging(flowTrial('rejected', {
+    checks: [], confirm_items: [],
+    problems: [{ code: 'sheet_missing', category: 'structure', message: '没有找到工作表「分区明细」（工作簿中有内容的可见工作表：「客流汇总」）', cells: [] }],
+  }), { recipe: recipeWithList() }), 201))
+  await start('月报导出_2026-12-01_2026-12-31.xlsx')
+  const partText = await ledgerOf()
+  check('……缺了一张工作表：写明有 1 张未读取到，同样不写「全部有去处」「两遍读取一致」',
+        partText.includes('771') && partText.includes('配方中有 1 张工作表未读取到') && !partText.includes('全部有去处') && !partText.includes('两遍读取一致'), partText)
+  await page.keyboard.press('Escape')
+  await until(async () => await page.locator('[data-import-wizard]').count() === 0, 4000)
+
+  // ---- 修改配方：POST redraft 进入起草（以现行配方为工作配方，没有 AI 入口）
+  replies.redraft.push(json(reupStaging({ ...flowTrial('passed') }, { kind: 'redraft', status: 'drafting', trial: null }), 201))
+  await card.getByRole('button', { name: '修改配方' }).click()
+  await page.locator('[data-import-wizard]').waitFor({ timeout: 4000 }).catch(() => {})
+  check('「修改配方」发 POST /datasources/{id}/redraft，进入起草', sent.filter((s) => s.key === 'POST /datasources/check-manage-reup/redraft').length === 1
+        && await page.locator('[data-import-wizard][data-view="draft"]').count() === 1 && await page.locator('[data-ai-offer]').count() === 0)
+  await dialog(page).getByRole('button', { name: '稍后继续' }).click()
+  await page.waitForTimeout(200)
+  replies.redraft.push(json({ detail: '当前导入的原始文件已清除', code: 'raw_missing' }, 409))
+  await card.getByRole('button', { name: '修改配方' }).click()
+  await page.locator('[data-wizard-failed]').waitFor({ timeout: 4000 }).catch(() => {})
+  check('……409 raw_missing：提示用「上传新一期」带着文件进入修改', (await page.locator('[data-wizard-failed]').innerText().catch(() => '')).includes('上传新一期'))
+  await dialog(page).getByRole('button', { name: '关闭', exact: true }).last().click()
+  await page.waitForTimeout(200)
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

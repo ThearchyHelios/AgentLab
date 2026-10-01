@@ -1,13 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, Info, KeyRound, Lock, Plug, Plus, RefreshCw,
+  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, Info, KeyRound, Layers, Lock, Plug, Plus, RefreshCw,
   Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api, uploadDecision } from '../api/client'
 import type { IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
-import type { CurrentSnapshot, UploadDecision, UploadMixedColumn, UploadResult } from '../types'
+import type { CurrentSnapshot, DataSource, UploadDecision, UploadMixedColumn, UploadResult } from '../types'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Modal, promptDialog,
@@ -20,8 +20,12 @@ import {
 import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
-import { RAW_STATE_LABEL, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT } from '../lib/terms'
+import {
+  RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT,
+} from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
+import { ImportWizard } from './import/ImportWizard'
+import type { WizardEntry } from './import/ImportWizard'
 
 // ===========================================================================
 // 数据源
@@ -70,6 +74,8 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
   const [loadError, setLoadError] = useState<unknown>(null)
   const [editing, setEditing] = useState<any | null>(null)
   const [uploading, setUploading] = useState<{ name?: string } | null>(null)
+  /** 按配方导入的向导（首次、上传新一期、修改配方、继续未完成的导入） */
+  const [wizard, setWizard] = useState<WizardEntry | null>(null)
   const [kick, setKick] = useState<{ id: string; seq: number } | null>(null)
   const loadSeq = useRef(0)
   const hasRows = useRef(false)
@@ -116,6 +122,9 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
           title="表格"
           hint="上传 Excel / CSV 文件，每个工作表会转为一张可用 SQL 查询的表，数字可计算、可溯源。同名文件重新上传会直接替换数据，工具名不变。"
         >
+          <button className="btn btn-sm" onClick={() => setWizard({ kind: 'new' })} title={RECIPE_TEXT.entryHint} data-recipe-entry>
+            <Layers size={12} aria-hidden /> {RECIPE_TEXT.entry}
+          </button>
           <button className="btn btn-primary btn-sm" onClick={() => setUploading({})}>
             <Upload size={12} /> 上传表格
           </button>
@@ -171,6 +180,9 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
               onRemoved={drop}
               onEdit={() => setEditing(row)}
               onReupload={() => setUploading({ name: row.name })}
+              onRecipeReupload={() => setWizard({ kind: 'reupload', source: row })}
+              onRedraft={() => setWizard({ kind: 'redraft', source: row })}
+              onResume={() => row.open_staging && setWizard({ kind: 'resume', stagingId: row.open_staging.id, source: row })}
               kick={kick && kick.id === row.id ? kick.seq : 0}
             />
           ))}
@@ -215,6 +227,27 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
             syncCatalog()
             if (!tables) navigate('/data/tables', { replace: true })
           }}
+          onRecipe={(file, name, description) => {
+            // 交叉表决定页的「按配方导入」：带着同一个文件、名字和说明进向导，上传弹窗让位
+            setUploading(null)
+            setWizard({ kind: 'stage', file, name, description })
+          }}
+        />
+      )}
+
+      {wizard && (
+        <ImportWizard
+          entry={wizard}
+          // 同上传弹窗：手工登记的 SQLite 可能是还没迁移的早期上传，交给服务端判断
+          taken={(rows ?? []).filter((r) => !isUploadedTable(r) && r.kind !== 'sqlite').map((r) => r.name)}
+          onClose={() => setWizard(null)}
+          onCommitted={(row) => {
+            upsert(row)
+            syncCatalog()
+            if (!tables) navigate('/data/tables', { replace: true })
+          }}
+          // 暂存区开始、放弃、关掉：卡片上的「有未完成的导入」要跟上
+          onChanged={() => void load()}
         />
       )}
     </div>
@@ -224,12 +257,16 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
 /** 结构同步超过这么久就提示可能过期：库表会变，Copilot 照旧表写 SQL 只会报错 */
 const STALE_SCHEMA_MS = 7 * 24 * 3600_000
 
-function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }: {
+function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onRecipeReupload, onRedraft, onResume, kick }: {
   row: any; meta?: any
   onChange: (row: any) => void
   onRemoved: (id: string) => void
   onEdit: () => void
   onReupload: () => void
+  /** 按配方导入的源：上传新一期、修改配方；有未完成的导入时继续它 */
+  onRecipeReupload: () => void
+  onRedraft: () => void
+  onResume: () => void
   /** 非 0 时自动点一次「探查结构」（新建后 toast 上的按钮） */
   kick: number
 }) {
@@ -433,7 +470,19 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
                 : <><RefreshCw size={11} aria-hidden /> 探查结构</>}
             </button>
           )}
-          {uploaded
+          {row.open_staging && (
+            <button className="btn btn-sm" onClick={onResume} title={RECIPE_TEXT.openStagingHint} data-open-staging={row.open_staging.id}
+                    style={{ color: 'var(--warn)', borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+              {RECIPE_TEXT.openStaging}
+            </button>
+          )}
+          {uploaded && row.import_mode === 'recipe' ? (
+            // 按配方导入的源：每月按已确认的配方重放，不走简单上传（服务端也会拒绝）
+            <>
+              <button className="btn btn-sm btn-ghost" onClick={onRecipeReupload} title={RECIPE_TEXT.reuploadHint}>{RECIPE_TEXT.reupload}</button>
+              <button className="btn btn-sm btn-ghost" onClick={onRedraft} title={RECIPE_TEXT.redraftHint}>{RECIPE_TEXT.redraft}</button>
+            </>
+          ) : uploaded
             ? <button className="btn btn-sm btn-ghost" onClick={onReupload} title={UPLOAD_TEXT.reuploadHint}>{UPLOAD_TEXT.reupload}</button>
             : <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>}
           <DeleteButton label={`删除数据源 ${row.name}`} onClick={() => void remove()} />
@@ -579,6 +628,7 @@ function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: bool
       <>
         <span>上传的表格{row.table_count ? ` · ${row.table_count} 张表` : ''}</span>
         {snap && <UploadVersion snap={snap} />}
+        {row.import_mode === 'recipe' && row.current_recipe && <RecipeVersion recipe={row.current_recipe} />}
       </>
     )
   }
@@ -613,6 +663,23 @@ function UploadVersion({ snap }: { snap: CurrentSnapshot }) {
       <span className="mono break-all text-dim">{snap.file_name || UPLOAD_TEXT.legacyFile}</span>
       {at && <span className="tnum">· {UPLOAD_TEXT.importedAt(formatRelative(snap.created_at))}</span>}
       {rawNote && <span>· {rawNote}</span>}
+    </span>
+  )
+}
+
+/**
+ * 按配方导入的源当前用的是哪一版配方：第几版、怎么起草的、什么时候启用、谁署的名（署名未认证）。
+ * 每月按配方重放，配方换了版本，引用它的报告口径可能跟着变，所以和当前版本写在同一处
+ */
+function RecipeVersion({ recipe }: { recipe: NonNullable<DataSource['current_recipe']> }) {
+  const at = parseServerTime(recipe.activated_at)
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1" data-current-recipe={recipe.id}
+          title={at ? RECIPE_TEXT.recipeActivatedTitle(formatDateTime(recipe.activated_at)) : undefined}>
+      <span className="tnum">{RECIPE_TEXT.recipeVersion(formatNumber(recipe.seq))}</span>
+      <span>· {RECIPE_ORIGIN_LABEL[recipe.origin] ?? recipe.origin}</span>
+      {at && <span className="tnum">· {RECIPE_TEXT.recipeActivated(formatRelative(recipe.activated_at))}</span>}
+      {recipe.signed_by && <span className="break-all">· {RECIPE_TEXT.recipeSigned(recipe.signed_by)}</span>}
     </span>
   )
 }
@@ -1552,12 +1619,14 @@ const quoteList = (values: unknown[], max = 3) => values.slice(0, max).map((v) =
  * 只有后端给的两种（数字列混入非数字、交叉表或多块结构）。选「取消」回到表单：文件、名字、
  * 表头行号都还在——表头行号设错是这两种问题最常见的来由，改一下行号可能就不用选了
  */
-function UploadDecisionBody({ decision, choices, headerRow, sheetNoun }: {
+function UploadDecisionBody({ decision, choices, headerRow, sheetNoun, onRecipe }: {
   decision: UploadDecision
   choices: UploadChoices
   headerRow: number
   /** 「工作表」；CSV 没有工作表，是「文件」 */
   sheetNoun: string
+  /** 按配方导入（CSV 没有这条路：配方只认 Excel） */
+  onRecipe?: () => void
 }) {
   if (decision.kind === 'mixed') {
     return (
@@ -1601,7 +1670,14 @@ function UploadDecisionBody({ decision, choices, headerRow, sheetNoun }: {
           )}
         </div>
       )}
-      <p className="text-xs leading-relaxed text-dim" data-shape-recipe>{UPLOAD_TEXT.shapeRecipe}</p>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border bg-bg px-2.5 py-2" data-shape-recipe>
+        <p className="min-w-0 flex-1 text-xs leading-relaxed text-dim">{onRecipe ? UPLOAD_TEXT.shapeRecipe : UPLOAD_TEXT.shapeRecipeCsv}</p>
+        {onRecipe && (
+          <button type="button" className="btn btn-sm btn-primary shrink-0" onClick={onRecipe} data-shape-recipe-start>
+            <Layers size={12} aria-hidden /> {RECIPE_TEXT.entry}
+          </button>
+        )}
+      </div>
       <p className="text-2xs text-faint">{UPLOAD_TEXT.shapeHeader(headerRow)}</p>
       <ChosenLine choices={choices} />
     </div>
@@ -1762,7 +1838,7 @@ function UploadNotes({ result }: { result: UploadResult }) {
  * 选（UploadDecisionBody），选完带着答案重传。答案跟着这一份文件和表头行号走，换文件、
  * 改行号就清掉，重新问
  */
-function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported }: {
+function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported, onRecipe }: {
   initialName?: string
   /** 已经被数据库占用的名字（传表格只能就地替换表格，不能顶掉数据库） */
   taken: string[]
@@ -1773,6 +1849,8 @@ function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported }:
   sqliteTaken: string[]
   onClose: () => void
   onImported: (row: any) => void
+  /** 交叉表决定页上选「按配方导入」：带着这份文件、名字和说明交给向导 */
+  onRecipe: (file: File, name: string, description: string) => void
 }) {
   const [file, setFile] = useState<File | null>(null)
   const [name, setName] = useState(initialName ?? '')
@@ -1917,7 +1995,8 @@ function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported }:
           </>
         )}
       >
-        <UploadDecisionBody decision={decision} choices={choices} headerRow={headerRow} sheetNoun={sheetNoun} />
+        <UploadDecisionBody decision={decision} choices={choices} headerRow={headerRow} sheetNoun={sheetNoun}
+                            onRecipe={file && sheetNoun === '工作表' ? () => onRecipe(file, name, description) : undefined} />
       </Modal>
     )
   }
