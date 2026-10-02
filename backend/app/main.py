@@ -28,6 +28,9 @@ logger = logging.getLogger("agentlab")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    from app.data.engine import sqlite_dqs_self_check
+
+    sqlite_dqs_self_check()  # 写错的双引号列名必须报错；做不到就记日志并让启动失败
     settings.ensure_dirs()
     await init_db()
     await seed_defaults()
@@ -56,6 +59,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             .values(status="failed", error="服务重启，这份文档没有处理完，请重新上传")
         )
         await _s.commit()
+
+    # 上传表格的版本底座：清理上次没发布完的文件、给老上传补初始版本、回收没人用的版本。
+    # 出错只记日志：最坏是留下几个多余的文件，不该让服务起不来
+    from app.data import table_versions
+
+    async with SessionLocal() as _s:
+        try:
+            await table_versions.startup(_s)
+        except Exception:  # noqa: BLE001
+            logger.exception("上传表格的版本整理失败，服务照常启动")
 
     await run_manager.setup()
     from app.sandbox.manager import sandbox_manager as _sbm

@@ -43,6 +43,7 @@ from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
+from app.data.tabular import UNSHAPED_NOTE
 from app.db.base import SessionLocal
 from app.db.models import Setting
 from app.engine.evidence import (
@@ -495,6 +496,9 @@ def _table_lines(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch,
                      + (f" | …另有 {more} 个字段" if more else ""))
         if masked_any:
             lines.append("（有的字段按数据源的设置遮罩了，没有列出）")
+        if info.get("comment") == UNSHAPED_NOTE:
+            # 上传时选了「按原样导入（未规整）」：对这张表的列直接求和得出的数，裁判要知道它不可靠（R4、D16）
+            lines.append(f"表的说明：{UNSHAPED_NOTE}")
     if truncated:
         lines.append("注意：表结构快照不完整（数据源的表太多，只保存了一部分），不能据此断定某张表或某个字段不存在")
     return lines

@@ -61,6 +61,88 @@ class DataSource(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(default=True)
     # 最近一次测连接：{at, ok, latency_ms, error}。记在对象上，换台浏览器也看得到
     last_check: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # upload：上传表格建的源，连接信息由系统维护（data/table_versions.py），不许手改；
+    # manual：手工登记的连接。按这个字段判断，而不是猜 database 的路径
+    origin: Mapped[str] = mapped_column(String(20), default="manual")
+    # 上传源当前启用的快照（source_snapshots.id）。查询、探查都从快照解析，
+    # database 只作显示；手工源恒为 None
+    current_snapshot_id: Mapped[str | None] = mapped_column(String(64), default=None)
+
+
+# --------------------------------------------------------------------------
+# 上传表格的版本：构建 → 导入记录 → 快照（data/table_versions.py）
+# --------------------------------------------------------------------------
+
+
+class TableBuild(Base):
+    """一次解析的产物：同一个源、同一份原件、同一组解析选项、同一版解析器，只建一次库。
+
+    id 是这四样的 sha256 全长，source_id 算在里面：两个源传同一个文件得到两个构建，
+    互不引用——一个源删掉、回收，不会连带另一个源的库。库文件写好后是只读的（0444），
+    之后不再改动；回收时删掉文件、记录留着（retired_at）备查。
+    """
+
+    __tablename__ = "table_builds"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(32), index=True)
+    raw_sha256: Mapped[str] = mapped_column(String(64), default="")
+    options_sha256: Mapped[str] = mapped_column(String(64), default="")
+    engine_ver: Mapped[str] = mapped_column(String(40), default="")
+    options: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    db_path: Mapped[str] = mapped_column(Text, default="")
+    db_sha256: Mapped[str] = mapped_column(String(64), default="")
+    # 解析回执（tabular.LoadReport）：区域、跳过的工作表、类型转换、警告
+    report: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    # 库文件被回收的时刻。为空表示文件还在
+    retired_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+
+
+class TableImport(Base):
+    """一次上传。重传同一个文件也是一条新记录（指向同一个构建）：谁、何时、传了什么，都要留痕。
+
+    不挂外键：数据源删掉以后，导入记录置 retired 留作审计，不跟着删。
+    """
+
+    __tablename__ = "table_imports"
+    __table_args__ = (Index("ix_table_imports_source_seq", "source_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(String(32))
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    build_id: Mapped[str] = mapped_column(String(64), default="")
+    file_name: Mapped[str] = mapped_column(String(500), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    raw_sha256: Mapped[str] = mapped_column(String(64), default="")
+    # kept：原件在 uploads/raw 里；purged：清除过（purged 里记时间、署名、理由）；
+    # absent：从来没有原件（迁移前的老上传只剩 .db）
+    raw_state: Mapped[str] = mapped_column(String(20), default="kept")
+    # active：当前快照里的那一期；superseded：被新上传替换、文件还在；retired：已回收或源已删除
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    purged: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+
+
+class SourceSnapshot(Base):
+    """数据源的一个可查询版本：若干期导入合成的一个库，加上冻结的表结构。
+
+    期 1 只有「每期替换」：一个快照就是一期导入，db_path 直接用那次构建的库。
+    运行钉的是快照 id（runs.data_versions），表结构和数据出自同一个版本。
+    """
+
+    __tablename__ = "source_snapshots"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(32), index=True)
+    imports: Mapped[list[Any]] = mapped_column(default=list)  # import id 列表
+    db_path: Mapped[str] = mapped_column(Text, default="")
+    db_sha256: Mapped[str] = mapped_column(String(64), default="")
+    schema_cache: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    # 没有运行、也不是当前版本时由回收标上；之后钉着它的请求明确报「版本不存在」
+    retired_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
 class Setting(Base, TimestampMixin):
@@ -199,6 +281,9 @@ class Run(Base, TimestampMixin):
     agent_limits: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     # 失败时能定位到的节点。报错要能落到画布上的那张卡片，而不只是一句话
     error_node_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    # 发起时钉住的上传表格版本：{source_id: {"snapshot": 快照 id, "name": 源名}}。续跑、恢复沿用，
+    # 回收（table_versions.gc）不删任何运行引用的快照。None 是升级前发起的运行
+    data_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"

@@ -18,7 +18,7 @@ from app.engine.state import GraphState
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
-from app.tools.datasource import QUERY_PREFIX
+from app.tools.datasource import DATA_UNAVAILABLE, QUERY_PREFIX, SCHEMA_PREFIX, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -31,8 +31,9 @@ from app.tools.registry import (
 from app.tools.trust import ask_gate, asks_trustable, call_policy, node_task
 
 #: 数据源查询工具没查成时交回的话的开头（tools/datasource.py）。agent 里原话喂回模型让它改 SQL；
-#: tool 节点没有下一轮可改，照常往下走的话，下游拿到的是一句报错当查询结果
-QUERY_FAILED = ("查询失败：", "SQL 被拒绝：")
+#: tool 节点没有下一轮可改，照常往下走的话，下游拿到的是一句报错当查询结果。
+#: DATA_UNAVAILABLE 是数据本身用不了（这次运行固定的版本没了、表格文件被删），改 SQL 没用
+QUERY_FAILED = ("查询失败：", "SQL 被拒绝：", DATA_UNAVAILABLE)
 #: code 节点在证据链里的角色：取数（产出本身就是源数据）还是计算。缺省按计算算
 EVIDENCE_ROLES = ("source", "compute")
 
@@ -44,6 +45,9 @@ def _tool_ctx(ctx: NodeContext) -> ToolContext:
         sandbox_session=ctx.run.thread_id,
         memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
         collection=ctx.cfg("collection") or ctx.run.collection,
+        data_versions=run_versions(ctx.run),
+        # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
+        emit=ctx.emit,
     )
 
 
@@ -156,11 +160,15 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     elapsed = int((time.perf_counter() - started) * 1000)
     evidence_on = ledger_enabled(ctx.run)
-    if evidence_on and name.startswith(QUERY_PREFIX) and isinstance(result, str) and result.startswith(QUERY_FAILED):
+    # 查表结构的工具只在数据本身用不了时算失败：它别的回话（「结构信息不可用」之类）是正常的结果
+    failed = isinstance(result, str) and (
+        (name.startswith(QUERY_PREFIX) and result.startswith(QUERY_FAILED))
+        or (name.startswith(SCHEMA_PREFIX) and result.startswith(DATA_UNAVAILABLE)))
+    if evidence_on and failed:
         # 没查成：原话就是报错（「查询失败：no such table: x」），照写，别再套一层
         ctx.emit(EventType.TOOL_ERROR, tool=name, error=result[:2000], duration_ms=elapsed)
         if ctx.cfg("fail_fast", True):
-            raise NodeError(ctx.node.id, f"工具 {name} 查询失败：{result}。请据此修改节点中的 SQL 后重新运行")
+            raise NodeError(ctx.node.id, _query_failure(name, result))
         result = {"error": result}
 
     # 取数快照：query（args）和结果集一起进工件库，完整出具时数字回指的就是它
@@ -204,6 +212,18 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: result}
     return updates
+
+
+def _query_failure(name: str, result: str) -> str:
+    """调用工具节点上查询没查成时的报错。
+
+    数据本身用不了（DATA_UNAVAILABLE）：原因里已经写了怎么办（重新发起运行、重新上传），照交。
+    不能再加「修改节点中的 SQL」——改 SQL、继续运行都没用，只会再失败一次。SQL 的错才让人改 SQL。
+    原话开头的「查询失败：」去掉，免得和前面的「查询失败：」叠成两遍。
+    """
+    if result.startswith(DATA_UNAVAILABLE):
+        return f"工具 {name} 无法使用：{result.removeprefix(DATA_UNAVAILABLE)}"
+    return f"工具 {name} 查询失败：{result.removeprefix('查询失败：')}。请据此修改节点中的 SQL 后重新运行"
 
 
 async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:

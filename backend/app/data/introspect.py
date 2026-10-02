@@ -27,6 +27,8 @@ from app.data.engine import engines
 _MAX_TABLES = 200
 # summary 里每张表列几个代表字段。够 Copilot 判断"这表是不是我要的"即可。
 _PREVIEW_COLUMNS = 6
+# 批量反射失败、逐个对象重试时，开头连着这么多个都取不到就不再试了
+_GIVE_UP_AFTER = 5
 
 
 # 各家的系统 schema，发现可用 schema 时要排掉——否则用户面对的是一屏
@@ -141,25 +143,49 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         # shop 那次 "Lost connection to MySQL server during query"
         # （run 554a0f92）多半是偶发的服务端超时——所以真正的对策不在这里，
         # 在下面：失败要如实记成失败，让工具和界面都说真话。
-        def _multi(fn: Any, **kw: Any) -> dict[Any, Any]:
+        #
+        # 批量是一锤子买卖：其中一个对象反射出错，整批都拿不到。SQLite 连接关了双引号
+        # 字符串兼容以后，老库里一个写着 `"yes" AS flag` 的视图就让 PRAGMA 报错；以前这里
+        # 吞掉异常返回空，好好的表跟着一起消失，探查却显示「成功、0 张表」。所以批量失败
+        # 时逐个对象再取一遍，只跳过真正取不到的那个，名字和原因记进 skipped。
+        failures: dict[str, str] = {}
+
+        def _multi(fn: Any, single: Any, names: list[str], *,
+                   errors: dict[str, str] | None = None) -> dict[Any, Any]:
             try:
-                return dict(fn(schema=target_schema, filter_names=picked,
-                               kind=ObjectKind.ANY, **kw))
+                return dict(fn(schema=target_schema, filter_names=names, kind=ObjectKind.ANY))
             except NotImplementedError:
                 return {}          # 表注释这类不是所有方言都支持
-            except Exception:  # noqa: BLE001 - 取不到不该让整次探查失败
-                return {}
+            except Exception:  # noqa: BLE001 - 批量取不到，逐个对象再试
+                pass
+            out: dict[Any, Any] = {}
+            for name in names:
+                try:
+                    out[(target_schema, name)] = single(name, schema=target_schema)
+                except NotImplementedError:
+                    break
+                except Exception as e:  # noqa: BLE001 - 只跳过这一个对象
+                    if errors is not None:
+                        errors[name] = first_line(e) or describe_exception(e)
+                    if not out and len(errors or ()) >= _GIVE_UP_AFTER:
+                        break      # 开头几个全取不到，多半是连接本身出了问题，不再挨个耗时间
+            return out
 
-        columns_by = _multi(inspector.get_multi_columns)
-        pk_by = _multi(inspector.get_multi_pk_constraint)
-        comment_by = _multi(inspector.get_multi_table_comment)
+        columns_by = _multi(inspector.get_multi_columns, inspector.get_columns, picked,
+                            errors=failures)
+        readable = [n for n in picked if columns_by.get((target_schema, n))]
+        pk_by = _multi(inspector.get_multi_pk_constraint, inspector.get_pk_constraint, readable)
+        comment_by = _multi(inspector.get_multi_table_comment, inspector.get_table_comment, readable)
 
         tables: dict[str, Any] = {}
+        skipped: dict[str, str] = {}
         for name in picked:
             key = (target_schema, name)
             columns = columns_by.get(key)
             if not columns:
-                continue           # 这张表反射不出来，跳过，别毁掉整次探查
+                # 这个对象反射不出来，跳过，别毁掉整次探查；但要留下名字和原因
+                skipped[name] = failures.get(name) or "读不到列"
+                continue
             pk = (pk_by.get(key) or {}).get("constrained_columns") or []
             comment = (comment_by.get(key) or {}).get("text")
 
@@ -181,7 +207,14 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
                 "comment": comment,
                 "is_view": name in views,
             }
-        return {"tables": tables, "truncated": truncated, "total": len(names) + len(views)}
+        payload: dict[str, Any] = {"tables": tables, "truncated": truncated,
+                                   "total": len(names) + len(views)}
+        if failures and not tables:
+            # 一个对象也取不到、而且确实出了错：如实记成失败，不能显示成「已同步、0 张表」
+            payload.update(failed=True, error=next(iter(failures.values())))
+        elif skipped:
+            payload["skipped"] = skipped
+        return payload
 
     try:
         async with engine.connect() as conn:

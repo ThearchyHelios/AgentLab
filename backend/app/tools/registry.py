@@ -3,12 +3,23 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ValidationError
 
 ToolFunc = Callable[..., Awaitable[Any]]
+
+
+class Versions(Enum):
+    """ToolContext.data_versions 除了运行固定的那个 dict 之外的两个取值。"""
+
+    #: 不在运行里（工具库试用、试用前的副作用检查）：用数据源的当前版本。这类调用要显式传它
+    CURRENT = "current"
+    #: 缺省值：构造 ToolContext 的地方没说用哪一版。在运行里漏传了固定的版本就是这样——上传源遇到它
+    #: 报错，不退回当前版本：静默改用当前版本，同一次运行就可能前后查到两版数据而没人察觉
+    UNSET = "unset"
 
 
 @dataclass
@@ -20,7 +31,14 @@ class ToolContext:
     sandbox_session: str = "default"
     memory_scope: str = "default"
     collection: str = "default"
-    emit: Callable[..., Awaitable[None]] | None = None
+    #: 往运行的事件流里发一条事件：节点传 NodeContext.emit（同步）；协程函数也认，调用方 await 它的返回值
+    emit: Callable[..., Any] | None = None
+    #: 用哪一版上传表格。运行里是固定的版本（runs.data_versions：{源 id: {"snapshot": 快照 id, "name": 源名}}），
+    #: 由构造 ToolContext 的节点从运行上下文取来（tools/datasource.py 的 run_versions）；同一段执行里各节点
+    #: 拿到的是同一个 dict，运行中途第一次用到的源固定下来后，后面的节点都看得到。
+    #: None 是升级前发起的运行，用当前版本；Versions.CURRENT 是不在运行里的调用，用当前版本；
+    #: 缺省 Versions.UNSET 是谁都没给——上传源遇到它报错，见 Versions
+    data_versions: dict[str, Any] | Versions | None = Versions.UNSET
     extra: dict[str, Any] = field(default_factory=dict)
 
 

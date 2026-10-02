@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, Info, KeyRound, Lock, Plug, Plus, RefreshCw,
   Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { ApiError, api } from '../api/client'
+import { ApiError, api, uploadDecision } from '../api/client'
 import type { IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
+import type { CurrentSnapshot, UploadDecision, UploadMixedColumn, UploadResult } from '../types'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Modal, promptDialog,
@@ -19,6 +20,7 @@ import {
 import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
+import { RAW_STATE_LABEL, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
 
 // ===========================================================================
@@ -35,9 +37,20 @@ import { useRunClock } from '../run/useRunClock'
  */
 export type DataView = 'databases' | 'tables'
 
-/** 传上来的表格落在数据目录的 uploads/tables/<name>.db。后端没给来源标记，按路径认 */
-export const isUploadedTable = (row: any): boolean =>
-  row?.kind === 'sqlite' && /[\\/]uploads[\\/]tables[\\/][^\\/]+\.db$/.test(row?.database ?? '')
+/**
+ * 上传的表格：认后端给的来源标记 origin，不按库文件路径猜。上传库现在按版本存放
+ * （uploads/tables/<源 id>/builds/<构建 id>.db），路径每传一次就变；而手工登记的 SQLite
+ * 即使指向别处同名的目录也不是上传的表格
+ */
+export const isUploadedTable = (row: any): boolean => row?.origin === 'upload'
+
+/**
+ * 迁移补建的初始版本（升级前就传上来的表）：没有原件、没有记下文件名。它的快照时间是迁移那一刻
+ * （升级后服务启动时），不是导入时间，界面上不能当导入时间写；原来的同步时间（schema_synced_at）
+ * 迁移时原样保留，照常写「结构同步于」
+ */
+const isLegacySnapshot = (snap: CurrentSnapshot | null | undefined): boolean =>
+  !!snap && snap.raw_state === 'absent' && !snap.file_name
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
 
@@ -192,7 +205,10 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
       {uploading && (
         <TableUploader
           initialName={uploading.name}
-          taken={(rows ?? []).filter((r) => !isUploadedTable(r)).map((r) => r.name)}
+          // 手工登记的 SQLite 不在前端拦：还没迁移的早期上传（数据文件缺失、迁移失败）也是这种源，
+          // 服务端按它是否在上传目录里决定能不能同名替换，前端不知道上传目录在哪
+          taken={(rows ?? []).filter((r) => !isUploadedTable(r) && r.kind !== 'sqlite').map((r) => r.name)}
+          sqliteTaken={(rows ?? []).filter((r) => !isUploadedTable(r) && r.kind === 'sqlite').map((r) => r.name)}
           onClose={() => setUploading(null)}
           onImported={(row) => {
             upsert(row)
@@ -242,7 +258,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   // 缓存是按哪个 schema 探的（null：老缓存没记，或者还没探过）。和配置对不上时，
   // 助手写 SQL 用的是另一个 schema 的表——改了配置没重探、或者重探失败都会这样
   const cachedSchema: string | null = row.cached_schema ?? null
-  const schemaDrift = cachedSchema != null && cachedSchema !== configured
+  // 上传的表格只有一个库，结构随版本冻结，谈不上「和配置的 schema 对不上」
+  const schemaDrift = !uploaded && cachedSchema != null && cachedSchema !== configured
 
   const introspect = async () => {
     if (busy) return
@@ -382,7 +399,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
   const countChanged = lastCount.current !== row.table_count
   useEffect(() => { lastCount.current = row.table_count }, [row.table_count])
 
-  const staleSchema = !!synced && now - synced > STALE_SCHEMA_MS
+  // 上传的表格结构随版本冻结，不会「过期」：要更新就重新上传
+  const staleSchema = !uploaded && !!synced && now - synced > STALE_SCHEMA_MS
   const failed = record && !record.ok && !checkingSince
 
   return (
@@ -406,14 +424,17 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}>
             <Plug size={11} aria-hidden /> 测试连接
           </button>
-          <button className="btn btn-sm tnum" disabled={!!busy} onClick={() => void introspect()}
-                  title="读取表结构并缓存，助手据此编写 SQL">
-            {busy === 'introspect'
-              ? <><Spinner size={11} /> 探查中 {formatDuration(clock - busySince.current)}</>
-              : <><RefreshCw size={11} aria-hidden /> 探查结构</>}
-          </button>
+          {/* 上传的表格不探查：结构在导入时随版本冻结，服务端也不接受（要更新就重新上传） */}
+          {!uploaded && (
+            <button className="btn btn-sm tnum" disabled={!!busy} onClick={() => void introspect()}
+                    title="读取表结构并缓存，助手据此编写 SQL">
+              {busy === 'introspect'
+                ? <><Spinner size={11} /> 探查中 {formatDuration(clock - busySince.current)}</>
+                : <><RefreshCw size={11} aria-hidden /> 探查结构</>}
+            </button>
+          )}
           {uploaded
-            ? <button className="btn btn-sm btn-ghost" onClick={onReupload} title="同名重新上传：直接替换其中的数据，工具名不变">重新上传</button>
+            ? <button className="btn btn-sm btn-ghost" onClick={onReupload} title={UPLOAD_TEXT.reuploadHint}>{UPLOAD_TEXT.reupload}</button>
             : <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>}
           <DeleteButton label={`删除数据源 ${row.name}`} onClick={() => void remove()} />
         </div>
@@ -460,7 +481,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
         >
           <div className="font-medium text-[var(--err)]">上次探查失败</div>
           <div className="mt-0.5 break-all text-dim">{row.schema_error}</div>
-          {!!otherSchemas.length && (
+          {!uploaded && !!otherSchemas.length && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <span className="text-faint">
                 当前为「{row.options?.schema || row.database || '默认'}」。该服务器上还有以下 schema，点击可预览（不保存）：
@@ -518,6 +539,9 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           // 也没用。以前两者显示成同一句，没有一处说的是真话
           // 红字上面那块已经说了，这里只说后果，不再叠一道红
           <span className="text-faint">结构不可用：助手无法获取该数据库的表清单</span>
+        ) : uploaded ? (
+          // 上传的表格没有「探查结构」可点，只能重新上传
+          <span className="text-[var(--warn)]">{UPLOAD_TEXT.noSchema}</span>
         ) : (
           <span className="text-[var(--warn)]">尚未探查结构 · 助手无法获取表清单</span>
         )}
@@ -531,7 +555,9 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
           </button>
         )}
         <span className="flex-1" />
-        {synced > 0 && (
+        {/* 上传的表格在地址那一行写当前版本和导入时间，这里不再重复一遍「结构同步于」。
+            迁移补建的初始版本没有导入时间可写，留着原来的同步时间 */}
+        {synced > 0 && !(uploaded && row.current_snapshot && !isLegacySnapshot(row.current_snapshot)) && (
           <span className={clsx('tnum', staleSchema ? 'text-[var(--warn)]' : 'text-faint')}
                 title={`${formatDateTime(row.schema_synced_at)} 同步${staleSchema ? '。库表可能已变更，请点击「探查结构」重新同步' : ''}`}>
             {staleSchema && <AlertTriangle size={10} className="mr-1 inline" aria-hidden />}
@@ -548,7 +574,13 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, kick }
 /** 连接地址。端口为空时不留尾巴冒号，淡色写上默认端口 */
 function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: boolean }) {
   if (uploaded) {
-    return <span>上传的表格{row.table_count ? ` · ${row.table_count} 张表` : ''}</span>
+    const snap: CurrentSnapshot | null = row.current_snapshot ?? null
+    return (
+      <>
+        <span>上传的表格{row.table_count ? ` · ${row.table_count} 张表` : ''}</span>
+        {snap && <UploadVersion snap={snap} />}
+      </>
+    )
   }
   if (row.kind === 'sqlite') return <span className="mono break-all">{row.database}</span>
   const target = row.kind === 'oracle'
@@ -561,6 +593,26 @@ function Address({ row, meta, uploaded }: { row: any; meta?: any; uploaded: bool
         ? `:${row.port}`
         : meta?.default_port ? <span className="opacity-60" title="未填写端口，使用默认端口">:{meta.default_port}</span> : null}
       {target}
+    </span>
+  )
+}
+
+/**
+ * 上传表格当前启用的是哪一版：哪个文件、什么时候导入的。库文件的路径按版本变（而且不是用户
+ * 传的那个文件），写出来没有意义；同名重传之后，这一行变了才说明新版本真的启用了
+ */
+function UploadVersion({ snap }: { snap: CurrentSnapshot }) {
+  const legacy = isLegacySnapshot(snap)
+  // 迁移补建的版本：created_at 是迁移的时间，写成「刚刚导入」是假话
+  const at = legacy ? null : parseServerTime(snap.created_at)
+  const rawNote = snap.raw_state !== 'kept' ? RAW_STATE_LABEL[snap.raw_state] : ''
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1" data-current-version={snap.id}
+          title={legacy ? UPLOAD_TEXT.legacyTitle : at ? UPLOAD_TEXT.importedTitle(formatDateTime(snap.created_at)) : undefined}>
+      <span>{UPLOAD_TEXT.currentVersion}</span>
+      <span className="mono break-all text-dim">{snap.file_name || UPLOAD_TEXT.legacyFile}</span>
+      {at && <span className="tnum">· {UPLOAD_TEXT.importedAt(formatRelative(snap.created_at))}</span>}
+      {rawNote && <span>· {rawNote}</span>}
     </span>
   )
 }
@@ -594,7 +646,8 @@ function SchemaBrowser({ row }: { row: any }) {
       (e) => { if (live) setError(e) },
     )
     return () => { live = false }
-  }, [row.id, row.schema_synced_at, row.table_count])
+    // 上传的表格换了版本（同名重传）也要重取：结构跟着当前版本走
+  }, [row.id, row.schema_synced_at, row.table_count, row.current_snapshot?.id])
 
   useEffect(() => {
     for (const t of expanded) {
@@ -674,7 +727,7 @@ function SchemaBrowser({ row }: { row: any }) {
                       <span className="tnum text-2xs text-faint">{loaded.columns.length} 列</span>
                     )}
                   </button>
-                  {isOpen && <ColumnList detail={d} />}
+                  {isOpen && <ColumnList detail={d} uploaded={isUploadedTable(row)} />}
                 </div>
               )
             })}
@@ -690,7 +743,7 @@ function SchemaBrowser({ row }: { row: any }) {
   )
 }
 
-function ColumnList({ detail }: { detail?: ColumnsState }) {
+function ColumnList({ detail, uploaded }: { detail?: ColumnsState; uploaded: boolean }) {
   if (!detail || detail === 'loading') {
     return <div className="mb-1 ml-5 py-1"><Skeleton rows={3} height={9} gap={6} /></div>
   }
@@ -700,7 +753,10 @@ function ColumnList({ detail }: { detail?: ColumnsState }) {
     // 只认明确的 false：老后端的响应里根本没有 found，得往下走到原文显示
     return (
       <div className="mb-1.5 ml-5 text-2xs text-faint">
-        缓存中已没有这张表的结构，可能刚重新探查过。请收起后再展开，或点击「探查结构」。
+        {uploaded
+          // 上传的表格没有「探查结构」：结构跟着版本走，清单和列之间多半是换了版本
+          ? '当前版本中已没有这张表，可能刚重新上传过。请收起后再展开。'
+          : '缓存中已没有这张表的结构，可能刚重新探查过。请收起后再展开，或点击「探查结构」。'}
       </div>
     )
   }
@@ -1464,6 +1520,231 @@ export function UploadMeter({ progress, startedAt, sentAt, processing, now }: {
     </span>
   )
 }
+/** 用户对解析器问题的回答，随上传一起发：mixed 数字列混入非数字怎么办，rawMode 按原样导入（未规整） */
+interface UploadChoices { mixed: 'reject' | 'null'; rawMode: boolean }
+const NO_CHOICES: UploadChoices = { mixed: 'reject', rawMode: false }
+
+const WARN_BOX = {
+  borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--border))',
+  background: 'color-mix(in srgb, var(--warn) 8%, transparent)',
+}
+const WARN_CHIP = {
+  color: 'var(--warn)', borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+}
+
+/** 这次上传已经选好的处理方式。重传时写在表单上，免得人以为又是从头导入 */
+function ChosenLine({ choices }: { choices: UploadChoices }) {
+  const items = [
+    choices.rawMode ? UPLOAD_TEXT.chosenRaw : '',
+    choices.mixed === 'null' ? UPLOAD_TEXT.chosenMixed : '',
+  ].filter(Boolean)
+  if (!items.length) return null
+  return <p className="text-2xs text-faint" data-upload-choices>{UPLOAD_TEXT.chosen}：{items.join('；')}</p>
+}
+
+/** 「1,234」「N/A」这样的示例，最多三个 */
+const quoteList = (values: unknown[], max = 3) => values.slice(0, max).map((v) => `「${String(v)}」`).join('')
+
+/**
+ * 解析器退回、要用户先拍板时的那一页的正文：为什么不能直接导入。可以怎么选、选了会怎样写在
+ * 底栏的按钮上和按钮旁边（TableUploader 里，和这一页共用同一个弹窗，切换时不重新挂载）。
+ *
+ * 只有后端给的两种（数字列混入非数字、交叉表或多块结构）。选「取消」回到表单：文件、名字、
+ * 表头行号都还在——表头行号设错是这两种问题最常见的来由，改一下行号可能就不用选了
+ */
+function UploadDecisionBody({ decision, choices, headerRow, sheetNoun }: {
+  decision: UploadDecision
+  choices: UploadChoices
+  headerRow: number
+  /** 「工作表」；CSV 没有工作表，是「文件」 */
+  sheetNoun: string
+}) {
+  if (decision.kind === 'mixed') {
+    return (
+      <div className="space-y-3" data-upload-decision="mixed">
+        <p className="text-xs leading-relaxed text-dim">{UPLOAD_TEXT.mixedLead}</p>
+        <MixedColumnList columns={decision.details.columns} sheetNoun={sheetNoun} />
+        <ChosenLine choices={choices} />
+      </div>
+    )
+  }
+  const preview = decision.details.mixed
+  return (
+    <div className="space-y-3" data-upload-decision="shape">
+      <p className="text-xs leading-relaxed text-dim">{UPLOAD_TEXT.shapeLead}</p>
+      <ul className="space-y-2">
+        {decision.details.reasons.map((r, i) => (
+          <li key={i} className="rounded-lg border bg-bg p-2.5 text-xs" data-shape-reason={r.kind}>
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              {UPLOAD_SHAPE_LABEL[r.kind] && <span className="font-medium">{UPLOAD_SHAPE_LABEL[r.kind]}</span>}
+              {r.sheet && <span className="text-faint">{sheetNoun}「{r.sheet}」</span>}
+            </div>
+            <p className="mt-0.5 leading-relaxed text-dim">{r.message}</p>
+            {r.cells.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap items-center gap-1" data-shape-cells>
+                {r.cells.slice(0, 8).map((cell) => <span key={cell} className="chip mono">{cell}</span>)}
+                {r.cells.length > 8 && (
+                  <span className="text-2xs text-faint">{UPLOAD_TEXT.moreCells(formatNumber(r.cells.length))}</span>
+                )}
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+      {/* 选按原样导入以后还会因为这些列再问一次：第一次就列出来，一次看全要拍板的事 */}
+      {!!preview?.length && (
+        <div className="space-y-2" data-shape-mixed>
+          <p className="text-xs leading-relaxed text-dim">{UPLOAD_TEXT.shapeMixedLead}</p>
+          <MixedColumnList columns={preview} sheetNoun={sheetNoun} />
+          {decision.details.mixed_complete === false && (
+            <p className="text-2xs text-faint">{UPLOAD_TEXT.shapeMixedPartial}</p>
+          )}
+        </div>
+      )}
+      <p className="text-xs leading-relaxed text-dim" data-shape-recipe>{UPLOAD_TEXT.shapeRecipe}</p>
+      <p className="text-2xs text-faint">{UPLOAD_TEXT.shapeHeader(headerRow)}</p>
+      <ChosenLine choices={choices} />
+    </div>
+  )
+}
+
+/** 混合列清单：列名（原表头）、所在工作表、数字和非数字各多少、非数字的取值 */
+function MixedColumnList({ columns, sheetNoun }: { columns: UploadMixedColumn[]; sheetNoun: string }) {
+  return (
+    <ul className="space-y-2">
+      {columns.map((c, i) => (
+        <li key={`${c.table}.${c.column}.${i}`} className="rounded-lg border bg-bg p-2.5 text-xs"
+            data-mixed-column={c.column}>
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <span className="font-medium">{c.header || c.column}</span>
+            {!!c.header && c.header !== c.column && <span className="mono text-faint">{c.column}</span>}
+            <span className="text-faint">{sheetNoun}「{c.sheet}」</span>
+            <span className="tnum text-faint">
+              {UPLOAD_TEXT.mixedCounts(formatNumber(c.numeric), formatNumber(c.nonnumeric))}
+            </span>
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {c.values.map((v, j) => (
+              <span key={j} className="chip" data-mixed-value={String(v.value)}>
+                <span className="mono">「{String(v.value)}」</span>
+                <span className="tnum text-faint">{formatNumber(v.count)} 个</span>
+              </span>
+            ))}
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** 一张导入的表：表名、行列数、区域、未规整标记、去掉的空行空列，以及原表头 → 列名 */
+function UploadedTableCard({ table: t, flagged, sheetNoun }: {
+  table: UploadResult['tables'][number]
+  flagged: Set<string>
+  /** 「工作表」；CSV 没有工作表，是「文件」 */
+  sheetNoun: string
+}) {
+  const trimmed = t.columns_trimmed ?? []
+  const housekeeping = [
+    t.blank_rows_skipped ? UPLOAD_TEXT.blankRows(formatNumber(t.blank_rows_skipped)) : '',
+    trimmed.length ? UPLOAD_TEXT.trimmedCols(trimmed.join('、')) : '',
+  ].filter(Boolean)
+  return (
+    <div className="rounded-lg border bg-bg p-2.5" data-upload-table={t.name}>
+      <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2 text-xs">
+        <span className="mono font-medium">{t.name}</span>
+        {t.sheet !== t.name && <span className="text-faint">{sheetNoun}「{t.sheet}」</span>}
+        <span className="tnum text-faint">{formatNumber(t.rows)} 行 · {t.columns.length} 列</span>
+        {t.region && <span className="mono text-faint" title={UPLOAD_TEXT.region}>{t.region}</span>}
+        {t.unshaped && (
+          <span className="chip" style={WARN_CHIP} title={UPLOAD_TEXT.unshapedHint} data-unshaped>
+            <AlertTriangle size={10} aria-hidden /> {UPLOAD_TEXT.unshaped}
+          </span>
+        )}
+      </div>
+      {housekeeping.length > 0 && (
+        <p className="mb-1.5 text-2xs text-faint" data-upload-housekeeping>{housekeeping.join('；')}</p>
+      )}
+      <div className="flex flex-wrap gap-1">
+        {t.columns.map((c, j) => {
+          const header = c.header ?? c.name
+          const bad = flagged.has(header)
+          // 原表头和 SQL 列名不同（括号、空格换成下划线，数字开头加前缀，重名加序号）时两个都写：
+          // 用户认的是原表头，助手写 SQL 用的是列名
+          const mapped = c.header != null && c.header !== c.name
+          return (
+            <span key={`${c.name}-${j}`} className="chip" data-suspicious={bad || undefined}
+                  data-header={mapped ? header : undefined}
+                  style={bad ? WARN_CHIP : undefined}
+                  title={bad ? '该列的表头看起来像一行数据' : mapped ? `原表头「${header}」，SQL 中的列名为 ${c.name}` : undefined}>
+              {mapped && (
+                <>
+                  <span className="text-faint">{header || UPLOAD_TEXT.emptyHeader}</span>
+                  <span className="text-faint" aria-hidden>→</span>
+                </>
+              )}
+              <span className="mono">{c.name || '（空）'}</span>
+              <span className="mono text-faint">{c.type}</span>
+            </span>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+/** 回执里「导入时的处理」：跳过的工作表、类型转换、警告。一样都没有就不画 */
+function UploadNotes({ result }: { result: UploadResult }) {
+  const skipped = result.skipped_sheets ?? []
+  const hidden = skipped.filter((s) => s.reason === 'hidden')
+  const empty = skipped.filter((s) => s.reason !== 'hidden')
+  const conversions = result.conversions ?? []
+  const warnings = result.warnings ?? []
+  if (!hidden.length && !empty.length && !conversions.length && !warnings.length) return null
+  const names = (list: typeof skipped) => list
+    .map((s) => `「${s.sheet}」${s.state === 'veryHidden' ? UPLOAD_TEXT.veryHidden : ''}`).join('、')
+  return (
+    <div className="space-y-2 rounded-lg border bg-bg p-2.5 text-xs leading-relaxed" data-upload-notes>
+      <div className="text-2xs font-medium text-dim">{UPLOAD_TEXT.notes}</div>
+      {warnings.length > 0 && (
+        <ul className="space-y-1" data-upload-warnings>
+          {warnings.map((w, i) => (
+            <li key={i} className="flex gap-1.5">
+              <AlertTriangle size={12} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
+              <span>{w}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {conversions.length > 0 && (
+        <ul className="space-y-1" data-upload-conversions>
+          {conversions.map((c, i) => (
+            <li key={i} className="flex gap-1.5" data-conversion={c.kind}>
+              <Info size={12} className="mt-0.5 shrink-0 text-faint" aria-hidden />
+              <span>
+                <span className="mono">{c.table}.{c.column}</span>：{UPLOAD_CONVERSION_LABEL[c.kind] ?? '已按列类型转换'}，
+                {UPLOAD_TEXT.conversionCount(formatNumber(c.count))}
+                {(c.examples ?? []).length > 0 && UPLOAD_TEXT.examples(quoteList(c.examples))}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {hidden.length > 0 && (
+        <p className="flex gap-1.5" data-skipped-hidden>
+          <EyeOff size={12} className="mt-0.5 shrink-0 text-faint" aria-hidden />
+          <span>{UPLOAD_TEXT.skippedHidden(formatNumber(hidden.length), names(hidden))}</span>
+        </p>
+      )}
+      {empty.length > 0 && (
+        <p className="flex gap-1.5 text-dim" data-skipped-empty>
+          <Info size={12} className="mt-0.5 shrink-0 text-faint" aria-hidden />
+          <span>{UPLOAD_TEXT.skippedEmpty(names(empty))}</span>
+        </p>
+      )}
+    </div>
+  )
+}
 
 /**
  * 传一个 Excel / CSV，变成可以用 SQL 查的表。
@@ -1476,11 +1757,20 @@ export function UploadMeter({ progress, startedAt, sentAt, processing, now }: {
  * （比如文件前两行是标题），列名会变成一行数据——不给看的话，这个错要等到
  * 有人发现汇总一直少一行才暴露。以前导入成功的同一帧弹窗就被卸载了，这段
  * 回显从来没被人看到过。
+ *
+ * 解析器不再替用户做取舍：数字列混进了「N/A」、表格是日期横排的交叉表，服务端回 422 请用户
+ * 选（UploadDecisionBody），选完带着答案重传。答案跟着这一份文件和表头行号走，换文件、
+ * 改行号就清掉，重新问
  */
-function TableUploader({ initialName, taken, onClose, onImported }: {
+function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported }: {
   initialName?: string
   /** 已经被数据库占用的名字（传表格只能就地替换表格，不能顶掉数据库） */
   taken: string[]
+  /**
+   * 手工登记的 SQLite 源的名字：可能是还没迁移的早期上传，服务端允许同名替换，也可能是真正的手工库，
+   * 服务端回 409。前端分不出来，只提示、不拦
+   */
+  sqliteTaken: string[]
   onClose: () => void
   onImported: (row: any) => void
 }) {
@@ -1491,12 +1781,28 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<{ p: UploadProgress; sentAt?: number } | null>(null)
   const [dragging, setDragging] = useState(false)
-  const [result, setResult] = useState<Awaited<ReturnType<typeof api.datasources.uploadTable>> | null>(null)
+  const [result, setResult] = useState<UploadResult | null>(null)
+  const [choices, setChoices] = useState<UploadChoices>(NO_CHOICES)
+  const [decision, setDecision] = useState<UploadDecision | null>(null)
+  /** 服务端以重名拒收（409）时那句原话，挂在当时那个名字上：改了名字就不再显示 */
+  const [rejected, setRejected] = useState<{ name: string; message: string } | null>(null)
   const headerRef = useRef<HTMLInputElement>(null)
+  const nameRef = useRef<HTMLInputElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  const consequenceId = useId()
   const clock = useRunClock(busy)
   const busySince = useRef(0)
   const upload = useRef<{ abort: () => void; sent: boolean } | null>(null)
   const sent = !!progress?.p.sent
+  // CSV / TSV 没有工作表，一个文件就是一张表：退回的原因、回执里说「文件「…」」（后端按扩展名判断，这里同一个规则）
+  const sheetNoun = /\.(csv|tsv)$/i.test(file?.name ?? '') ? '文件' : '工作表'
+
+  // 表单、选择页、回执共用一个弹窗（不重新挂载，不重播入场），焦点得自己挪：选择页落在最稳妥的「取消」上
+  useEffect(() => {
+    if (!decision) return
+    const frame = requestAnimationFrame(() => cancelRef.current?.focus({ preventScroll: true }))
+    return () => cancelAnimationFrame(frame)
+  }, [decision])
 
   // 弹窗关掉时字节还没发完，就不传了：后端收不全，什么都不会建。已经发完的让它
   // 做完——后端已经在建表，这时断开只会让人以为没传上
@@ -1505,6 +1811,8 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
   const pick = (f: File | null) => {
     setFile(f)
     setResult(null)
+    setDecision(null)
+    setChoices(NO_CHOICES)
     // 拿文件名当默认数据源名。它会变成工具名的一部分，所以只留 ASCII；
     // 中文文件名清洗完可能什么都不剩，那就让用户自己填
     if (f && !name) {
@@ -1516,18 +1824,23 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
 
   const nameError = name && !NAME_RE.test(name)
     ? '须以小写字母开头，只能包含小写字母、数字和下划线'
-    : taken.includes(name) ? `「${name}」已被其他数据库用作标识，请更换名称` : null
+    : taken.includes(name) ? `「${name}」已被其他数据库用作标识，请更换名称`
+      : rejected && rejected.name === name ? rejected.message : null
 
-  const submit = async () => {
+  const submit = async (next: UploadChoices = choices) => {
     if (!file || !name || nameError) return
     const ctl = new AbortController()
     const handle = { abort: () => ctl.abort(), sent: false }
     upload.current = handle
     busySince.current = Date.now()
+    setChoices(next)
+    setDecision(null)
     setProgress(null)
     setBusy(true)
     try {
-      const out = await api.datasources.uploadTable(file, { name, description, header_row: headerRow }, {
+      const out = await api.datasources.uploadTable(file, {
+        name, description, header_row: headerRow, mixed: next.mixed, raw_mode: next.rawMode,
+      }, {
         signal: ctl.signal,
         onProgress: (p) => {
           if (p.sent) handle.sent = true
@@ -1537,8 +1850,14 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
       setResult(out)
       onImported(out.source)
     } catch (e) {
+      const asked = uploadDecision(e)
       if (isAbort(e)) toast.info(`上传已取消，「${name}」未创建或修改`)
-      else toast.error(e)
+      else if (asked) setDecision(asked)
+      else if (e instanceof ApiError && e.status === 409) {
+        // 只有重名会回 409（同名的是手工登记的库）：原话写在名字下面，焦点给名字
+        setRejected({ name, message: e.message })
+        requestAnimationFrame(() => { nameRef.current?.focus(); nameRef.current?.select() })
+      } else toast.error(e)
     } finally {
       if (upload.current === handle) upload.current = null
       setBusy(false)
@@ -1546,16 +1865,68 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
     }
   }
 
+  const changeHeaderRow = (n: number) => {
+    setHeaderRow(n)
+    // 换了表头行，解析出来的就是另一张表：上次的回答不作数
+    setChoices(NO_CHOICES)
+  }
+
   const retry = () => {
     // 回到表单改行号：文件、名字都留着，同名重传会就地替换刚才那份
     setResult(null)
-    setHeaderRow((n) => n + 1)
+    changeHeaderRow(headerRow + 1)
     requestAnimationFrame(() => { headerRef.current?.focus(); headerRef.current?.select() })
   }
 
+  if (decision) {
+    const back = () => {
+      // 不导入，回到表单：焦点给表头行号（最常见的改法），不留在原地——那里换成了表单的「取消」，
+      // 再按一下回车就把整个弹窗关了
+      setDecision(null)
+      requestAnimationFrame(() => headerRef.current?.focus({ preventScroll: true }))
+    }
+    const cancel = <button ref={cancelRef} className="btn" onClick={back} title={UPLOAD_TEXT.cancelHint}>取消</button>
+    return (
+      <Modal
+        open
+        onClose={onClose}
+        // 文件、名字、表头行号和已选的处理方式都还在：Esc、点遮罩、点 × 先问一句，和表单一样。
+        // 底部的「取消」是回到表单，不关弹窗
+        dirty={!!file}
+        width={640}
+        title={decision.kind === 'mixed' ? UPLOAD_TEXT.mixedTitle : UPLOAD_TEXT.shapeTitle}
+        footer={decision.kind === 'mixed' ? (
+          <>
+            {cancel}
+            <button className="btn btn-primary" onClick={() => void submit({ ...choices, mixed: 'null' })}>
+              {UPLOAD_TEXT.mixedAccept}
+            </button>
+          </>
+        ) : (
+          <>
+            {/* 后果紧挨着那个按钮写：这一项不是「修好了」，是带着问题导入 */}
+            <span id={consequenceId} className="mr-auto min-w-0 flex-1 self-center text-2xs leading-snug text-[var(--warn)]"
+                  data-raw-consequence>
+              {UPLOAD_TEXT.rawConsequence}
+            </span>
+            {cancel}
+            <button className="btn" aria-describedby={consequenceId} style={{ color: 'var(--warn)' }}
+                    onClick={() => void submit({ ...choices, rawMode: true })}>
+              <AlertTriangle size={12} aria-hidden /> {UPLOAD_TEXT.rawAccept}
+            </button>
+          </>
+        )}
+      >
+        <UploadDecisionBody decision={decision} choices={choices} headerRow={headerRow} sheetNoun={sheetNoun} />
+      </Modal>
+    )
+  }
+
   if (result) {
-    const flagged = result.tables.map((t) => suspiciousColumns(t.columns))
+    // 看原表头像不像数据：SQL 列名清洗过（「2026-01」成了 c_2026_01），拿它判断就看不出来了
+    const flagged = result.tables.map((t) => suspiciousColumns(t.columns.map((c) => ({ name: c.header ?? c.name }))))
     const anyFlagged = flagged.some((s) => s.size > 0)
+    const anyMapped = result.tables.some((t) => t.columns.some((c) => c.header != null && c.header !== c.name))
     return (
       <Modal
         open
@@ -1574,40 +1945,21 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
         <div className="space-y-3" data-upload-result>
           <p className="text-xs leading-relaxed text-dim">
             共 {result.tables.length} 张表，表头取自第 {headerRow} 行。请核对列名和类型：如果列名显示为一行数据，
-            说明表头行号设置有误。
+            说明表头行号设置有误。{anyMapped && UPLOAD_TEXT.headerMapped}
           </p>
           {anyFlagged && (
-            <div role="alert" className="flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed"
-                 style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 8%, transparent)' }}>
+            <div role="alert" className="flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed" style={WARN_BOX}>
               <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
               <span>
-                标黄的列名看起来像数据（纯数字、日期、空值或重复值）。表头可能不在第 {headerRow} 行，
+                标黄的列，表头看起来像数据（纯数字、日期、空值或重复值）。表头可能不在第 {headerRow} 行，
                 可尝试改为第 {headerRow + 1} 行后重新上传。
               </span>
             </div>
           )}
           {result.tables.map((t, i) => (
-            <div key={t.name} className="rounded-lg border bg-bg p-2.5">
-              <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2 text-xs">
-                <span className="mono font-medium">{t.name}</span>
-                {t.sheet !== t.name && <span className="text-faint">工作表「{t.sheet}」</span>}
-                <span className="tnum text-faint">{formatNumber(t.rows)} 行 · {t.columns.length} 列</span>
-              </div>
-              <div className="flex flex-wrap gap-1">
-                {t.columns.map((c, j) => {
-                  const bad = flagged[i].has(c.name)
-                  return (
-                    <span key={`${c.name}-${j}`} className="chip" data-suspicious={bad || undefined}
-                          style={bad ? { color: 'var(--warn)', borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)' } : undefined}
-                          title={bad ? '该列名看起来像一行数据' : undefined}>
-                      <span className="mono">{c.name || '（空）'}</span>
-                      <span className="mono text-faint">{c.type}</span>
-                    </span>
-                  )
-                })}
-              </div>
-            </div>
+            <UploadedTableCard key={t.name} table={t} flagged={flagged[i]} sheetNoun={sheetNoun} />
           ))}
+          <UploadNotes result={result} />
         </div>
       </Modal>
     )
@@ -1657,6 +2009,14 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
                  onChange={(e) => pick(e.target.files?.[0] ?? null)} />
         </label>
 
+        {/* 上传之前说清：原件整份留在服务端，隐藏工作表虽然不导入也在里面 */}
+        <p className="flex gap-1.5 text-2xs leading-relaxed text-faint" data-raw-notice>
+          <Info size={11} className="mt-0.5 shrink-0" aria-hidden />
+          <span>{UPLOAD_TEXT.rawNotice}</span>
+        </p>
+
+        <ChosenLine choices={choices} />
+
         {busy && (
           <div className="rounded-lg border bg-bg px-3 py-2 text-2xs" data-upload-progress>
             <UploadMeter progress={progress?.p ?? null} startedAt={busySince.current} sentAt={progress?.sentAt}
@@ -1666,9 +2026,11 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
 
         <div className="grid grid-cols-[1fr_120px] gap-3">
           <Field label="数据源名" required error={nameError}
-                 hint={`将用作工具名的一部分（db_query__${name || 'sales'}）；同名重新上传会直接替换`}>
+                 hint={sqliteTaken.includes(name)
+                   ? <span className="text-[var(--warn)]" data-name-sqlite>{UPLOAD_TEXT.nameSqliteTaken}</span>
+                   : `将用作工具名的一部分（db_query__${name || 'sales'}）；同名重新上传会直接替换`}>
             {(p) => (
-              <input {...p} className="field mono" value={name} placeholder="sales" autoComplete="off" spellCheck={false}
+              <input {...p} ref={nameRef} className="field mono" value={name} placeholder="sales" autoComplete="off" spellCheck={false}
                      style={nameError ? { borderColor: 'var(--err)' } : undefined}
                      onChange={(e) => setName(e.target.value)} />
             )}
@@ -1676,7 +2038,7 @@ function TableUploader({ initialName, taken, onClose, onImported }: {
           <Field label="表头在第几行">
             {(p) => (
               <input {...p} ref={headerRef} className="field tnum" type="number" min={1} value={headerRow}
-                     onChange={(e) => setHeaderRow(Math.max(1, Number(e.target.value) || 1))} />
+                     onChange={(e) => changeHeaderRow(Math.max(1, Number(e.target.value) || 1))} />
             )}
           </Field>
         </div>

@@ -5,28 +5,33 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
-from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, first_line, raw
+from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import introspect as introspect_mod
+from app.data import table_versions
 from app.data.engine import (
-    MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, build_url, engine_args,
-    engines, mask_columns_problem, query_timeout_problem,
+    MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, SnapshotTampered, build_url,
+    engine_args, engines, mask_columns_problem, query_timeout_problem,
 )
-from app.db.base import get_session
-from app.db.models import DataSource
+from app.db.base import get_session, new_id
+from app.db.models import DataSource, SourceSnapshot, TableImport
 from app.tools.datasource import tool_names
 
 router = APIRouter(prefix="/api/datasources", tags=["datasources"])
+logger = logging.getLogger(__name__)
 
 # 名字会成为工具名的一部分（db_query__<name>），而模型的 function name 只认
 # ASCII。所以这里收紧成 slug，中文说明放 description 字段。
@@ -91,6 +96,10 @@ class DataSourceOut(BaseModel):
     last_check_ok: bool | None = None
     last_latency_ms: int | None = None
     last_error: str | None = None
+    #: upload：上传的表格（连接信息由系统维护，不能手改、不能重新探查）；manual：手工登记的连接
+    origin: str = "manual"
+    #: 上传表格当前启用的版本：{id, created_at, file_name, raw_state}。手工源恒为 None
+    current_snapshot: dict[str, Any] | None = None
 
 
 def _cached_schema(cache: dict[str, Any]) -> str | None:
@@ -99,10 +108,11 @@ def _cached_schema(cache: dict[str, Any]) -> str | None:
     return str(cache.get("schema") or "")
 
 
-def _to_out(row: DataSource) -> DataSourceOut:
+def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None) -> DataSourceOut:
     cache = row.schema_cache or {}
     tables = cache.get("tables") or {}
     return DataSourceOut(
+        origin=row.origin or "manual", current_snapshot=snapshot,
         cached_schema=_cached_schema(cache),
         schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
         available_schemas=list(cache.get("available_schemas") or []),
@@ -142,10 +152,107 @@ async def _get_or_404(session: AsyncSession, source_id: str) -> DataSource:
     return row
 
 
+def _is_upload(row: DataSource) -> bool:
+    return (row.origin or "manual") == "upload"
+
+
+async def _snapshot_infos(session: AsyncSession, rows: list[DataSource]) -> dict[str, dict[str, Any]]:
+    """各上传源当前版本的摘要：{源 id: {id, created_at, file_name, raw_state}}。两次查询取齐，不逐个查。"""
+    wanted = {r.current_snapshot_id: r.id for r in rows if _is_upload(r) and r.current_snapshot_id}
+    if not wanted:
+        return {}
+    snaps = list((await session.execute(
+        select(SourceSnapshot).where(SourceSnapshot.id.in_(list(wanted)))
+    )).scalars())
+    # 期 1 一个快照只有一期导入；以后按期累积时，显示最近的那一期
+    last_import = {s.id: str(s.imports[-1]) for s in snaps if s.imports}
+    imports = {
+        i.id: i for i in (await session.execute(
+            select(TableImport).where(TableImport.id.in_(list(last_import.values())))
+        )).scalars()
+    } if last_import else {}
+    out: dict[str, dict[str, Any]] = {}
+    for snap in snaps:
+        imp = imports.get(last_import.get(snap.id, ""))
+        out[snap.source_id] = {
+            "id": snap.id,
+            "created_at": snap.created_at.isoformat() if snap.created_at else None,
+            "file_name": imp.file_name if imp else "",
+            "raw_state": imp.raw_state if imp else "absent",
+        }
+    return out
+
+
+async def _out(session: AsyncSession, row: DataSource) -> DataSourceOut:
+    return _to_out(row, (await _snapshot_infos(session, [row])).get(row.id))
+
+
+#: 上传源上由系统维护的字段：连接一律从快照解析，database 只作显示
+_UPLOAD_LOCKED = {
+    "kind": "类型", "host": "主机", "port": "端口", "database": "数据库文件路径",
+    "username": "用户名", "password": "密码", "readonly": "只读",
+}
+
+
+#: 手工源指向上传目录时的拒收原因：创建、修改时 422，测连接时作为失败原因交回
+_UPLOAD_DIR_REFUSED = "数据库文件路径不能指向上传表格的存放目录。上传的表格请通过「上传表格」更新"
+#: 升级前就指向上传目录的手工源（启动时已强制只读）想改回可写时的拒收原因
+_UPLOAD_DIR_READONLY = ("这个数据库文件位于上传表格的存放目录，只能以只读方式连接。"
+                        "上传的表格请通过「上传表格」更新")
+
+
+#: 手工源指向 AgentLab 自己的数据文件时的拒收原因：创建、修改时 422，测连接时作为失败原因交回
+_APP_FILES_REFUSED = ("数据库文件路径不能指向 AgentLab 自己的数据文件（应用数据库、运行检查点、密钥、工件等）。"
+                      "请填写存放业务数据的 SQLite 文件")
+
+
+def _in_upload_dir(kind: str | None, database: str | None) -> bool:
+    return (kind or "").lower() == "sqlite" and table_versions.under_uploads(database)
+
+
+def _in_app_files(kind: str | None, database: str | None) -> bool:
+    return (kind or "").lower() == "sqlite" and table_versions.reaches_app_files(database)
+
+
+def _reserved_reason(kind: str | None, database: str | None) -> str | None:
+    """手工登记的 SQLite 源不许指向的位置：返回拒收原因，没问题时返回 None。
+
+    上传目录归版本底座管，手工源指过去会绕开只读和版本；应用自己的数据文件（元数据库等）登记成
+    数据源，经审批的一条 UPDATE 就能改掉上传源的连接字段和快照登记。两处都按文件身份判断。
+    """
+    if _in_app_files(kind, database):
+        return _APP_FILES_REFUSED
+    if _in_upload_dir(kind, database):
+        return _UPLOAD_DIR_REFUSED
+    return None
+
+
+def _refuse_reserved(kind: str | None, database: str | None) -> None:
+    reason = _reserved_reason(kind, database)
+    if reason:
+        raise HTTPException(422, reason)
+
+
+def _locked_changes(row: DataSource, data: dict[str, Any]) -> list[str]:
+    """上传源上这次要改的、由系统维护的连接字段（给人看的名字）。
+
+    原样带回的值不算修改（编辑表单会把整份配置一起提交）；密码只看是否填了新的——上传源本来就没有密码。
+    修改接口和测连接共用：测连接说「能连」、保存却被拒，两边就对不上了。
+    """
+    return [label for key, label in _UPLOAD_LOCKED.items() if key in data and (
+        bool(data[key]) if key == "password" else data[key] != getattr(row, key)
+    )]
+
+
+def _locked_refusal(changed: list[str]) -> str:
+    return f"上传的表格由系统维护连接信息，不能修改「{'」「'.join(changed)}」。如需更新数据，请重新上传"
+
+
 @router.get("", response_model=list[DataSourceOut])
 async def list_sources(session: AsyncSession = Depends(get_session)) -> list[DataSourceOut]:
-    rows = (await session.execute(select(DataSource).order_by(DataSource.name))).scalars()
-    return [_to_out(r) for r in rows]
+    rows = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
+    snaps = await _snapshot_infos(session, rows)
+    return [_to_out(r, snaps.get(r.id)) for r in rows]
 
 
 #: 每种库都有的「查询时限」。数据库按它自己停下语句，不只是后端不再等
@@ -249,6 +356,7 @@ async def create_source(
     if exists:
         raise HTTPException(409, f"已存在名为「{payload.name}」的数据源，请换一个标识")
     _refuse_bad_options(payload.options)
+    _refuse_reserved(payload.kind, payload.database)
 
     row = DataSource(
         **payload.model_dump(exclude={"password"}),
@@ -269,6 +377,29 @@ async def update_source(
 ) -> DataSourceOut:
     row = await _get_or_404(session, source_id)
     data = payload.model_dump(exclude_unset=True)
+    if _is_upload(row):
+        # 上传源的连接由版本底座维护（见 _locked_changes）
+        changed = _locked_changes(row, data)
+        if changed:
+            raise HTTPException(422, _locked_refusal(changed))
+        for key in _UPLOAD_LOCKED:
+            data.pop(key, None)
+        if data.get("options") is not None:
+            # 上传库只有一个 main：指定 schema 会让探查去找不存在的对象。原样带回的不算修改，摘掉即可
+            options = dict(data["options"])
+            wanted = str(options.pop("schema", None) or "").strip()
+            if wanted and wanted != str((row.options or {}).get("schema") or "").strip():
+                raise HTTPException(422, "上传的表格只有一个库，不能指定 schema。如需更新数据，请重新上传")
+            data["options"] = options
+    elif "kind" in data or "database" in data:
+        _refuse_reserved(data.get("kind", row.kind), data.get("database", row.database))
+    elif _in_app_files(row.kind, row.database):
+        # 升级前登记的、指向应用自己数据文件的源：启动时已停用（table_versions.startup）。
+        # 这类登记没有正当用途，除了改路径和删除，别的修改（重新启用、改回可写……）一律拒
+        raise HTTPException(422, _APP_FILES_REFUSED)
+    elif data.get("readonly") is False and row.readonly and _in_upload_dir(row.kind, row.database):
+        # 升级前就指向上传目录的手工源：启动时已强制只读（table_versions.startup），不许再改回可写
+        raise HTTPException(422, _UPLOAD_DIR_READONLY)
     if "options" in data:
         _refuse_bad_options(data["options"])
     if "password" in data:
@@ -287,15 +418,21 @@ async def update_source(
     await session.refresh(row)
     # 连接参数可能变了，旧连接池不能再用——否则改完密码还在用旧连接，很难排查
     await engines.invalidate(source_id)
-    return _to_out(row)
+    return await _out(session, row)
 
 
 @router.delete("/{source_id}", status_code=204)
 async def delete_source(source_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await _get_or_404(session, source_id)
+    # 上传源的导入记录置 retired 留作审计；库文件和原件交给回收，被运行引用的版本会保留
+    await table_versions.retire_source(session, source_id)
     await session.delete(row)
     await session.commit()
     await engines.invalidate(source_id)
+    try:
+        await table_versions.gc(session)
+    except Exception:  # noqa: BLE001 - 回收失败不影响删除，重启或下次上传时再收
+        logger.exception("删除数据源后的回收失败")
 
 
 #: 测连接最多等多久。内网库防火墙丢包时驱动默认要等一分钟，弹窗里干转一分钟
@@ -404,6 +541,10 @@ async def _probe(source: Any, *, cached: bool) -> dict[str, Any]:
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
             "url": _safe_url(source),
         }
+    except SnapshotTampered as e:
+        # 快照文件和登记的哈希对不上：原话就是原因，不翻译成泛泛的连接错误
+        return {"ok": False, "error": str(e), "hint": "请重新上传这份表格", "detail": "",
+                "elapsed_ms": int((time.perf_counter() - started) * 1000), "url": _safe_url(source)}
     except Exception as e:  # noqa: BLE001
         reason, hint = _explain_connect(e, (source.kind or "").lower())
         return {
@@ -465,6 +606,17 @@ async def test_draft(
         return {"ok": False, "error": f"不支持「{payload.kind}」类型的数据库",
                 "hint": f"目前支持：{'、'.join(SUPPORTED_KINDS)}", "detail": "", "elapsed_ms": 0, "url": ""}
     saved = await session.get(DataSource, payload.id) if payload.id else None
+    if saved is not None and _is_upload(saved):
+        # 上传源：连接字段由系统维护。改了就和保存一样拒；没改，测的就是它当前版本的快照，
+        # 不拿表单里的路径去连——否则带上一个上传源的 id，就能把上传目录里任何文件拿来试
+        changed = _locked_changes(saved, payload.model_dump(exclude_unset=True, include=set(_UPLOAD_LOCKED)))
+        if changed:
+            return _refused(_locked_refusal(changed))
+        return await _test_saved(session, saved)
+    reason = _reserved_reason(payload.kind, payload.database)
+    if reason:
+        # 保存时会被拒（_refuse_reserved）：测连接不能先报「连接成功」，到保存才说不行
+        return _refused(reason)
     draft = _draft_source(payload, saved)
     result = await _probe(draft, cached=False)
     last, key = _probe_record(result), _connection(draft)
@@ -479,8 +631,32 @@ async def test_draft(
 @router.post("/{source_id}/test")
 async def test_source(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """测连接。失败时说清原因和怎么办，驱动的原始报错放在 detail——这类问题九成靠它定位。"""
-    row = await _get_or_404(session, source_id)
-    result = await _probe(row, cached=True)
+    return await _test_saved(session, await _get_or_404(session, source_id))
+
+
+def _refused(reason: str) -> dict[str, Any]:
+    """不去连就能判定失败的测连接结果（形状和 _probe 的一样）。"""
+    return {"ok": False, "error": reason, "hint": "", "detail": "", "elapsed_ms": 0, "url": ""}
+
+
+async def _test_saved(session: AsyncSession, row: DataSource) -> dict[str, Any]:
+    """测一个已保存的数据源，结果记进 last_check（提交）。
+
+    上传源测的是它当前版本的快照：只读、immutable、建引擎前核对哈希，和查询走同一条路。
+    拿数据源行本身去连，既不核对哈希（快照被改过也报「连接成功」），还会在连接缓存里留下
+    一个不带版本、不核对的引擎。手工源指向应用自己的数据文件（升级前登记的）时不去连。
+    """
+    if _is_upload(row):
+        try:
+            view = await table_versions.resolve_source(session, row)
+        except table_versions.SnapshotMissing as e:
+            result = _refused(str(e))
+        else:
+            result = await _probe(view, cached=True)
+    elif _in_app_files(row.kind, row.database):
+        result = _refused(_APP_FILES_REFUSED)
+    else:
+        result = await _probe(row, cached=True)
     row.last_check = _probe_record(result)
     await session.commit()
     return result
@@ -512,8 +688,12 @@ async def introspect_source(
 
     dry_run=true 只看不存：「换个 schema 看看」以前一探就把缓存换掉，用户随后
     选了「不改」，助手此刻看到的也已经是另一套表了。
+
+    上传的表格不探查：结构在发布那一刻随快照冻结，重新探查只会让缓存和快照对不上。
     """
     row = await _get_or_404(session, source_id)
+    if _is_upload(row):
+        raise HTTPException(409, "上传的表格无需重新探查，重新上传即可更新")
     try:
         cache = await introspect_mod.introspect(row, schema=schema)
     except Exception as e:  # noqa: BLE001
@@ -544,7 +724,12 @@ async def introspect_source(
 @router.get("/{source_id}/schema")
 async def get_schema(source_id: str, table: str | None = None,
                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    row = await _get_or_404(session, source_id)
+    """表结构。上传的表格返回当前快照里冻结的那份——和查询实际用的库是同一个版本。"""
+    found = await _get_or_404(session, source_id)
+    try:
+        row = await table_versions.resolve_source(session, found)
+    except table_versions.SnapshotMissing as e:
+        raise HTTPException(409, str(e)) from e
     if table:
         meta = introspect_mod.find_table(row, table)
         return {
@@ -568,6 +753,37 @@ async def get_schema(source_id: str, table: str | None = None,
 # 上传表格
 # --------------------------------------------------------------------------
 
+#: 「数字列混入非数字」的两种处理：reject 拒收并请用户选择；null 非数字的值存空值、列按数字存
+_MIXED_CHOICES = ("reject", "null")
+
+
+def _decision(e: Exception) -> dict[str, Any] | None:
+    """解析器要用户先做决定（tabular.NeedsDecision：交叉表、数字列混入非数字）时，取出决定的内容。
+
+    NeedsDecision 是 UnsupportedTable 的子类，多带 kind 和 details 两个属性；普通的
+    UnsupportedTable 没有。按属性认，而不是按类名：接口层只关心「要不要请用户选」。
+    """
+    kind, details = getattr(e, "kind", None), getattr(e, "details", None)
+    if not kind or not isinstance(details, dict):
+        return None
+    return {"kind": kind, "details": jsonable_encoder(details)}
+
+
+def _table_out(t: dict[str, Any]) -> dict[str, Any]:
+    """回执里的一张表。原表头和列名并排回显：表头行取错了（比如文件前两行是标题），当场看得出来。"""
+    return {
+        "name": t.get("name"), "sheet": t.get("sheet"), "rows": t.get("rows", 0),
+        "columns": [
+            {"name": c.get("name"), "type": c.get("type"), "header": c.get("header")}
+            for c in t.get("columns") or [] if isinstance(c, dict)
+        ],
+        "region": t.get("region"),
+        "unshaped": bool(t.get("unshaped")),
+        "blank_rows_skipped": t.get("blank_rows_skipped", 0),
+        # 原样转交解析器给的值，不替它改类型
+        "columns_trimmed": t.get("columns_trimmed", []),
+    }
+
 
 @router.post("/upload", response_model=dict, status_code=201)
 async def upload_table(
@@ -575,27 +791,37 @@ async def upload_table(
     name: str = Form(...),
     description: str = Form(""),
     header_row: int = Form(1),
+    mixed: str = Form("reject"),
+    raw_mode: bool = Form(False),
     session: AsyncSession = Depends(get_session),
-) -> dict[str, Any]:
+) -> Any:
     """把 Excel / CSV 变成一个可以用 SQL 查的数据源。
 
-    走 SQLite：落成一个 .db 文件，再建一条 kind='sqlite' 的数据源指过去。
-    下游一行都不用改——SQL 守卫、结构探查、db_query__<name> 工具、查询快照进
-    工件库、Copilot 的数据源清单，全都白拿。
+    落成一个 SQLite 库，数据源 kind='sqlite' 指过去。下游一行都不用改——SQL 守卫、
+    结构探查、db_query__<name> 工具、查询快照进工件库、助手的数据源清单，全都白拿。
 
     这条路存在的理由不是"多支持一种格式"：表格传进知识库只能被切块检索，
     数字就成了模型从片段里读出来的，而这个项目的地基是"所有算术下沉到
     SQL 或口径卡"。表格必须变成表。
 
-    **同名就地替换**，不新建。数据源名字会成为工具名（db_query__sales），
+    **同名就地更新**，不新建。数据源名字会成为工具名（db_query__sales），
     而工具名写进了保存过的工作流——重传时另起一个 sales_2 等于悄悄让那些图失效。
+    每次上传发布成一个新版本（data/table_versions.py）：写新文件、最后切指针，
+    失败时旧版本完整可查；原件按哈希存档，不提供下载。
+
+    解析器需要用户先做决定时（交叉表 / 多块结构、数字列混入非数字）回 422，body 里的
+    decision 说明要选什么；mixed、raw_mode 是用户选完再传回来的答案。
     """
     import re as _re
+
+    from app.data.tabular import UnsupportedTable
 
     if not _re.match(_NAME_PATTERN, name or ""):
         raise HTTPException(
             400, "名称必须以小写字母开头，只能包含字母、数字和下划线（名称会成为工具名的一部分）"
         )
+    if mixed not in _MIXED_CHOICES:
+        raise HTTPException(400, "数字列混入非数字时，只能选择拒收或将非数字的值存为空值")
 
     # 边读边数，超了立刻停。和知识库上传同一套：那个检查拦的是"入库"，
     # 不是"占内存"，读完再判等于先把内存吃掉
@@ -609,67 +835,124 @@ async def upload_table(
         pieces.append(piece)
     raw = b"".join(pieces)
 
-    tables_dir = settings.uploads_dir / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    db_path = tables_dir / f"{name}.db"
-
-    from app.data.tabular import UnsupportedTable, load_into
-
     existing = (await session.execute(
         select(DataSource).where(DataSource.name == name)
     )).scalar_one_or_none()
-    if existing and existing.kind != "sqlite":
+    # 同名的只有上传表格可以更新。迁移前的老上传（路径还在上传目录里）也算
+    if existing is not None and not _is_upload(existing) and not (
+        existing.kind == "sqlite" and table_versions.under_uploads(existing.database)
+    ):
         raise HTTPException(
             409, f"已存在名为「{name}」的数据源（非上传表格），请换一个名称"
         )
 
-    try:
-        report = load_into(str(db_path), raw, file.filename or name, header_row=header_row)
-    except UnsupportedTable as e:
-        raise HTTPException(400, str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(
-            400, f"导入失败：{first_line(e) if isinstance(e, ValueError) else explain(e)[0]}。"
-                 "请确认文件是未加密的 Excel 或 CSV，且表头行号填写正确",
-        ) from e
-
     row = existing
     if row is None:
-        row = DataSource(
-            name=name, kind="sqlite", database=str(db_path),
-            readonly=True, description=description,
-        )
-        session.add(row)
-    else:
-        row.database = str(db_path)
-        if description:
-            row.description = description
-        # 换了文件内容，缓存的连接还指着旧的那个 engine
-        await engines.invalidate(row.id)
+        # 先不进会话：发布失败时这个源不该被建出来，由 publish_upload 在提交前加入
+        row = DataSource(id=new_id(), name=name, kind="sqlite", readonly=True,
+                         description=description, origin="upload")
+    elif description:
+        row.description = description
 
-    await session.flush()
-    # 建完立刻探查：不探的话 db_query 工具的 description 里没有表清单，
-    # 模型得先花一步去问"有哪些表"
     try:
-        row.schema_cache = await introspect_mod.introspect(row)
-        row.schema_synced_at = datetime.now(timezone.utc)
-    except Exception:  # noqa: BLE001 - 探查失败不该让导入白做，用户可以手动再探
-        pass
-    await session.commit()
-    await session.refresh(row)
+        result = await table_versions.publish_upload(
+            session, row, raw, file.filename or name,
+            header_row=header_row, mixed=mixed, raw_mode=raw_mode,
+        )
+    except UnsupportedTable as e:
+        decision = _decision(e)
+        if decision is not None:
+            return JSONResponse(status_code=422, content={"detail": str(e), "decision": decision})
+        raise HTTPException(400, str(e)) from e
+    except table_versions.PublishError as e:
+        logger.error("上传表格「%s」发布失败：%s", name, e)
+        raise HTTPException(500, str(e)) from e
 
+    await session.refresh(row)
+    report = result.report
     return {
-        "source": _to_out(row).model_dump(),
+        "source": (await _out(session, row)).model_dump(),
         "replaced": existing is not None,
-        # 推断出的列名和类型原样回显：表头行取错了（比如文件前两行是标题），
-        # 这里当场就能看出来——列名会变成一行数据
-        "tables": [
-            {
-                "name": t.name, "sheet": t.source_name, "rows": t.rows,
-                "columns": [
-                    {"name": c, "type": ty} for c, ty in zip(t.columns, t.types)
-                ],
-            }
-            for t in report.tables
+        "import_id": result.import_id,
+        "snapshot_id": result.snapshot_id,
+        "build_reused": result.build_reused,
+        "skipped_sheets": report.get("skipped_sheets") or [],
+        "conversions": report.get("conversions") or [],
+        "warnings": report.get("warnings") or [],
+        "tables": [_table_out(t) for t in report.get("tables") or [] if isinstance(t, dict)],
+    }
+
+
+def _import_out(imp: TableImport, current: set[str]) -> dict[str, Any]:
+    return {
+        "id": imp.id, "seq": imp.seq, "build_id": imp.build_id,
+        "file_name": imp.file_name, "file_size": imp.file_size, "raw_sha256": imp.raw_sha256,
+        "raw_state": imp.raw_state, "status": imp.status, "purged": imp.purged,
+        "current": imp.id in current,
+        "created_at": imp.created_at.isoformat() if imp.created_at else None,
+        "activated_at": imp.activated_at.isoformat() if imp.activated_at else None,
+    }
+
+
+async def _current_imports(session: AsyncSession, row: DataSource) -> set[str]:
+    if not row.current_snapshot_id:
+        return set()
+    snap = await session.get(SourceSnapshot, row.current_snapshot_id)
+    return {str(x) for x in (snap.imports or [])} if snap else set()
+
+
+@router.get("/{source_id}/imports")
+async def list_imports(source_id: str, session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
+    """上传表格的导入记录，新的在前。手工登记的源没有导入记录，返回空列表。"""
+    row = await _get_or_404(session, source_id)
+    rows = (await session.execute(
+        select(TableImport).where(TableImport.source_id == source_id).order_by(TableImport.seq.desc())
+    )).scalars()
+    current = await _current_imports(session, row)
+    return [_import_out(i, current) for i in rows]
+
+
+class PurgeRawIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500, description="为什么清除这份原件")
+    signed_by: str | None = Field(
+        default=None, max_length=100,
+        description="署名（未认证）：自填的名字，系统不核实身份，只原样记进清除记录",
+    )
+
+
+@router.post("/{source_id}/imports/{import_id}/purge-raw")
+async def purge_raw(
+    source_id: str, import_id: str, payload: PurgeRawIn, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """清除一次导入的原件。导入记录、哈希和库都保留，原件文件删掉，记下时间、署名和理由。
+
+    按内容清除：同一份内容可能被别的导入共用（同一个文件传过两次、传给过两个源），清除的
+    目的是让这份内容从服务器上消失，所以文件照删，那些导入一并标成已清除，回执的
+    also_purged 逐条列出（期 3 的界面要把它展示出来，不能静默带过）。
+    """
+    row = await _get_or_404(session, source_id)
+    imp = await session.get(TableImport, import_id)
+    if imp is None or imp.source_id != source_id:
+        raise HTTPException(404, "导入记录不存在")
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(422, "请填写清除原件的理由")
+    if imp.raw_state == "absent":
+        raise HTTPException(409, "这次导入没有保存原件")
+    if imp.raw_state == "purged":
+        raise HTTPException(409, "这次导入的原件已经清除")
+    deleted, others = await table_versions.purge_import_raw(
+        session, imp, reason=reason, signed_by=payload.signed_by)
+    current = await _current_imports(session, row)
+    names = dict((await session.execute(
+        select(DataSource.id, DataSource.name).where(DataSource.id.in_({o.source_id for o in others}))
+    )).all()) if others else {}
+    return {
+        "import": _import_out(imp, current),
+        "file_deleted": deleted,
+        "also_purged": [
+            {"id": o.id, "source_id": o.source_id, "source_name": names.get(o.source_id),
+             "seq": o.seq, "file_name": o.file_name}
+            for o in others
         ],
     }

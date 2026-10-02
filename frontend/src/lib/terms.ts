@@ -820,3 +820,84 @@ export const AGENT_GUARD_TEXT = {
   unlimited: '不限：费用仅受最大步数和上下文长度约束',
   unlimitedShort: '不限',
 } as const
+
+/**
+ * 上传表格：数据页「表格」标签的上传弹窗、导入回执和卡片。种类的说法和后端 data/tabular.py 的
+ * CONVERSION_KINDS、SHAPE_KINDS 对得上；后端以后多出来的种类，界面上只显示它给的那句话
+ */
+export const UPLOAD_TEXT = {
+  /** 上传前的告知：原件按内容存档、不提供下载，可以清除 */
+  rawNotice: '原始文件将完整保存在服务端（包括不导入的隐藏工作表），用于核对和追溯，之后可以清除。',
+  /** 表单和决定页上：这次上传已经选好的处理方式 */
+  chosen: '本次上传已选择',
+  chosenMixed: '数字列中的非数字值存为空值',
+  chosenRaw: '按原样导入（未规整）',
+  cancelHint: '不导入，返回上传表单',
+  // 数字列混入非数字
+  mixedTitle: '部分数字列中混有非数字的值',
+  mixedLead: '以下各列以数字为主，但混有非数字的值。可以把这些值存为空值、整列按数字导入，空值不参与求和、平均等计算；'
+    + '也可以取消，在 Excel 中修正后重新上传。',
+  mixedAccept: '把这些值存为空值，按数字导入',
+  mixedCounts: (numeric: string, other: string) => `数字 ${numeric} 个，非数字 ${other} 个`,
+  // 交叉表、多块结构
+  shapeTitle: '该表格不是一行一条记录的明细表',
+  shapeLead: '检测到以下结构，默认不导入：',
+  shapeRecipe: '这类表格需要按配方导入（指定表头、分段和合计行的处理方式），该功能将在后续版本提供。',
+  shapeHeader: (row: number) => `如果表头不在第 ${row} 行，请取消后修改表头行号，再重新上传。`,
+  /** 结构问题之外，预告的混合列：选按原样导入以后还要再选一次 */
+  shapeMixedLead: '另外，以下各列以数字为主，但混有非数字的值。选择按原样导入后，还需要选择这些值的处理方式：',
+  shapeMixedPartial: '以上按表格前面的部分统计，其余部分可能还有。',
+  rawAccept: '按原样导入（未规整）',
+  rawConsequence: '按原样导入后，同一列混有不同口径的行，不能直接对列求和',
+  moreCells: (n: string) => `等 ${n} 处`,
+  // 导入回执
+  headerMapped: '箭头左侧为原表头，右侧为 SQL 中使用的列名。',
+  emptyHeader: '（空表头）',
+  unshaped: '未规整',
+  unshapedHint: '按原样导入、未经规整：同一列里混有不同口径的行，不能直接对列求和',
+  region: '导入区域：表头行到最后一行数据',
+  blankRows: (n: string) => `已跳过 ${n} 个空行`,
+  trimmedCols: (cols: string) => `已去掉两侧整列为空的列 ${cols}`,
+  notes: '导入时的处理',
+  skippedHidden: (n: string, names: string) => `已跳过 ${n} 个隐藏工作表：${names}。隐藏工作表不导入，原始文件中仍保留。`,
+  skippedEmpty: (names: string) => `已跳过没有内容的工作表：${names}。`,
+  veryHidden: '（深度隐藏）',
+  conversionCount: (n: string) => `共 ${n} 个`,
+  /** list 是一串「」括起来的示例，紧跟在「如」后面 */
+  examples: (list: string) => `（如${list}）`,
+  // 卡片
+  currentVersion: '当前版本',
+  legacyFile: '早期上传的文件',
+  /** 迁移补建的初始版本：快照的创建时间是迁移那一刻，不是导入时间，不写出来 */
+  legacyTitle: '早期上传的版本，未记录原始文件名和导入时间',
+  importedAt: (when: string) => `${when}${/\d$/.test(when) ? ' ' : ''}导入`,
+  importedTitle: (when: string) => `当前版本于 ${when} 导入`,
+  /** 名字和一个手工登记的 SQLite 源重名：可能是还没迁移的早期上传，能不能替换由服务端判断 */
+  nameSqliteTaken: '已有同名的 SQLite 数据源：早期上传的表格可同名替换，否则将被拒绝',
+  noSchema: '未读取到表结构 · 请重新上传',
+  reupload: '重新上传',
+  reuploadHint: '同名重新上传：发布新版本替换其中的数据，工具名不变',
+} as const
+
+/** 导入回执里的类型转换（tabular.CONVERSION_KINDS） */
+export const UPLOAD_CONVERSION_LABEL: Record<string, string> = {
+  thousands_separator: '千分位写法的文本已按数字保存',
+  nonnumeric_to_null: '非数字的值已存为空值',
+  kept_as_text: '含前导零或超长数字，整列按文本保存',
+}
+
+/** 不是规整明细表的几种理由（tabular.SHAPE_KINDS） */
+export const UPLOAD_SHAPE_LABEL: Record<string, string> = {
+  date_header: '表头是横排的日期',
+  date_row: '表内有横排的日期行',
+  section_title: '表内有分段标题行',
+  table_totals: '表内有表格对象的汇总行',
+  formula_above: '表内有汇总上方各行的公式',
+}
+
+/** 上传表格的原件状态（kept 不单独标：上传前已告知会保存） */
+export const RAW_STATE_LABEL: Record<string, string> = {
+  kept: '原件已保存',
+  purged: '原件已清除',
+  absent: '未保存原件',
+}

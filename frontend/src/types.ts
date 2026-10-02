@@ -227,6 +227,108 @@ export interface DataSource extends ServerHealth {
   tools?: string[]
   /** 缓存按哪个 schema 探的：'' 默认 schema，null 没有缓存 */
   cached_schema?: string | null
+  /**
+   * upload：上传的表格（连接信息由系统维护，不能手改、不能重新探查，更新数据靠同名重新上传）；
+   * manual：手工登记的连接。卡片按它分到「表格」「数据库」两个标签，不再按库文件路径猜
+   */
+  origin?: 'upload' | 'manual' | (string & {})
+  /** 上传表格当前启用的版本。手工登记的源恒为 null */
+  current_snapshot?: CurrentSnapshot | null
+}
+
+/** 上传表格当前启用的版本（DataSource.current_snapshot） */
+export interface CurrentSnapshot {
+  id: string
+  /**
+   * 这一版导入（发布）的时间。迁移补建的初始版本（raw_state 为 absent、没有文件名）例外：
+   * 这里是迁移那一刻（升级后服务启动的时间），不是导入时间
+   */
+  created_at: string | null
+  /** 上传时的文件名。迁移前上传的老版本没有记录，是空串 */
+  file_name: string
+  /** 原件：kept 保存在服务端；purged 已清除；absent 没有保存（迁移前上传的老版本） */
+  raw_state: 'kept' | 'purged' | 'absent' | (string & {})
+}
+
+/**
+ * 上传表格时解析器要用户先拍板的事（POST /api/datasources/upload 回 422，body 是
+ * {detail, decision}）。mixed：数字列混入非数字；shape：交叉表、多块结构
+ */
+export type UploadDecision =
+  | { kind: 'mixed'; details: { columns: UploadMixedColumn[] } }
+  | {
+    kind: 'shape'
+    details: {
+      reasons: UploadShapeReason[]
+      /** 预告：选了按原样导入之后还会问的混合列（没有就是 undefined） */
+      mixed?: UploadMixedColumn[]
+      /** 预告是不是看完了整张表；为假时之后的混合列可能比这里多 */
+      mixed_complete?: boolean
+    }
+  }
+
+/** 一列以数字为主、混有非数字的值。values 是非数字的取值和个数（最多五种） */
+export interface UploadMixedColumn {
+  sheet: string
+  table: string
+  /** SQL 列名 */
+  column: string
+  /** 原表头 */
+  header: string
+  numeric: number
+  nonnumeric: number
+  values: { value: string; count: number }[]
+}
+
+/** 这张表不是一行一条记录的一条理由。cells 是 A1 坐标或区域，message 是给人看的一句话（已含坐标） */
+export interface UploadShapeReason {
+  sheet: string
+  /** date_header / date_row / section_title / table_totals / formula_above */
+  kind: string
+  cells: string[]
+  message: string
+}
+
+/** 导入回执里的一张表 */
+export interface UploadedTable {
+  name: string
+  /** 原工作表名（CSV 是文件名） */
+  sheet: string
+  rows: number
+  /** name 是 SQL 列名，header 是原表头（表头格为空时是空串） */
+  columns: { name: string; type: string; header?: string | null }[]
+  /** 导入区域（A1，表头行到最后一行数据） */
+  region?: string | null
+  /** 按原样导入、未经规整 */
+  unshaped?: boolean
+  blank_rows_skipped?: number
+  /** 去掉的左右两侧整列为空的列（列字母） */
+  columns_trimmed?: string[]
+}
+
+/** 导入时做过的类型转换：kind 是 thousands_separator / nonnumeric_to_null / kept_as_text */
+export interface UploadConversion {
+  table: string
+  column: string
+  kind: string
+  count: number
+  examples: unknown[]
+}
+
+/** POST /api/datasources/upload 成功时的回执 */
+export interface UploadResult {
+  source: DataSource
+  /** 同名就地更新（新版本替换了旧版本），不是新建 */
+  replaced: boolean
+  import_id?: string
+  snapshot_id?: string
+  /** 同一份文件、同样的选项以前导入过，沿用了那次的库 */
+  build_reused?: boolean
+  /** reason：hidden 隐藏工作表不导入；empty 没有内容。state：visible / hidden / veryHidden */
+  skipped_sheets?: { sheet: string; state: string; reason: string }[]
+  conversions?: UploadConversion[]
+  warnings?: string[]
+  tables: UploadedTable[]
 }
 
 /** 自定义工具（GET /api/custom-tools 的一行；POST / PATCH 的返回同形） */
