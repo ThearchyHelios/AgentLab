@@ -46,7 +46,7 @@ from app.data.xlsx_scan import SheetScan, TableScan, UnsupportedTable, WorkbookS
 
 __all__ = [
     "CONVERSION_KINDS", "SHAPE_KINDS", "UNSHAPED_NOTE", "LoadReport", "LoadedTable", "NeedsDecision",
-    "UnsupportedTable", "infer_type", "load_into",
+    "UnsupportedTable", "as_text", "infer_type", "load_into", "open_book", "worksheet_for",
 ]
 
 #: 按原样导入（未规整）的表写进表结构的说明（data/table_versions.py 注入 schema_cache 的 comment）。
@@ -307,6 +307,21 @@ def _as_text(value: Any, cls: int, payload: Any) -> str:
     if isinstance(value, float):
         return _fmt_float(value)
     return str(value)
+
+
+def as_text(value: Any) -> str:
+    """一个单元格要存进 TEXT 列的写法，与简单导入完全一致（配方导入的列表 TEXT 列、主键列共用）。
+
+    零点的日期写成 YYYY-MM-DD，带时刻的 YYYY-MM-DD HH:MM:SS，time 写成 HH:MM:SS，原生数字按常规写法，
+    文本去首尾空白。两条导入路径各写一套的话，期 1 修掉的「日期存成 … 00:00:00」（#23）会在另一条路上重现。
+    空值（None）是空字符串：调用方先判空，这里只保证不写出「None」。
+    """
+    if value is None:
+        return ""
+    cls, payload, _ = _classify(value)
+    if cls == _EMPTY:
+        return ""
+    return _as_text(value, cls, payload)
 
 
 def _is_date_like(value: Any) -> bool:
@@ -884,17 +899,52 @@ def _csv_sources(raw: bytes, filename: str, header_row: int) -> list[_Source]:
                     csv=True)]
 
 
-def _open_book(raw: bytes) -> Any:
+def _quick_get_size(self: Any) -> None:
+    """openpyxl ReadOnlyWorksheet._get_size 的等价实现，只是读到 <sheetData> 开头就停。
+
+    原实现用 iterparse 的结束事件找 <dimension>，<sheetData> 的结束事件要等整张表读完才出现：文件里没有
+    <dimension> 时（openpyxl write_only 等导出工具都不写），每次打开工作簿都把每张表整个解析一遍（20 万行约
+    3 秒）。按 OOXML 的元素顺序 <dimension> 在 <sheetData> 之前，所以改用开始事件、碰到 <sheetData> 就停，
+    结果与原实现完全相同（有就取它，没有就留空）；读取层本来也先 reset_dimensions、按扫描算出的边界读。
+    """
+    from openpyxl.worksheet._reader import DATA_TAG, DIMENSION_TAG
+    from openpyxl.worksheet.dimensions import SheetDimension
+    from openpyxl.xml.functions import iterparse
+
+    src = self._get_source()
+    try:
+        for _event, element in iterparse(src, events=("start",)):
+            if element.tag == DIMENSION_TAG:
+                self._min_column, self._min_row, self._max_column, self._max_row = \
+                    SheetDimension.from_tree(element).boundaries
+                return
+            if element.tag == DATA_TAG:
+                return
+    finally:
+        src.close()
+
+
+def _install_quick_size() -> None:
+    """装上 _quick_get_size（幂等）。openpyxl 改了内部结构（没有 _get_size）就什么都不做，照原样慢一点。"""
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    if getattr(ReadOnlyWorksheet, "_get_size", None) not in (None, _quick_get_size):
+        ReadOnlyWorksheet._get_size = _quick_get_size
+
+
+def open_book(raw: bytes, *, data_only: bool = True) -> Any:
+    """只读打开工作簿。data_only=False 取公式本身（配方读取层的公式一份，xlsx_cells.Workbooks）。"""
     try:
         from openpyxl import load_workbook
     except ImportError as e:
         raise UnsupportedTable(
             "读取 Excel 需要安装解析库：pip install 'agentlab-backend[docs]'"
         ) from e
+    _install_quick_size()
     try:
         # read_only 走流式；data_only 取公式算出来的值而不是公式本身——用户要的是数。
         # keep_links=False：外部链接里是别的工作簿的缓存数据（可以很大），导入用不上，不让它整份建树
-        return load_workbook(io.BytesIO(raw), read_only=True, data_only=True, keep_links=False)
+        return load_workbook(io.BytesIO(raw), read_only=True, data_only=data_only, keep_links=False)
     except Exception as e:  # noqa: BLE001
         # 这句话原样进上传的 400：异常类名留在日志（from e），界面上只说能照着做的
         raise UnsupportedTable(
@@ -902,7 +952,7 @@ def _open_book(raw: bytes) -> Any:
         ) from e
 
 
-def _worksheet_for(book: Any, sheet: xlsx_scan.SheetScan) -> Any:
+def worksheet_for(book: Any, sheet: xlsx_scan.SheetScan) -> Any:
     """扫描结果里的一张工作表 → openpyxl 里的同一张。按部件路径配对，不按名字。
 
     按名字取（book[名字]）时，openpyxl 返回第一个同名的表；扫描说「可见」的那张和导入实际读的
@@ -914,6 +964,11 @@ def _worksheet_for(book: Any, sheet: xlsx_scan.SheetScan) -> Any:
         raise UnsupportedTable(
             f"无法确认工作表「{sheet.name}」对应的内容，已拒绝导入。请在 Excel 中另存为 .xlsx 后重新上传")
     return found[0]
+
+
+#: 旧名字：期 1 的调用方和测试照旧可用（配方导入的读取层 xlsx_cells 用上面的公开名）
+_open_book = open_book
+_worksheet_for = worksheet_for
 
 
 def _excel_sources(scan: WorkbookScan, book: Any, header_row: int, report: LoadReport) -> list[_Source]:

@@ -249,6 +249,25 @@ def sqlite_dqs_self_check() -> None:
         raise RuntimeError(f"SQLite 自检失败：无法确认写错的双引号列名会报错，服务不启动。{problem}")
 
 
+def open_checked_sqlite(path: str, *, readonly: bool = True) -> sqlite3.Connection:
+    """同步打开一个本地 SQLite 文件，DQS 已关（配方导入的建库、核对用）。
+
+    配方执行器建临时库、核对模块跑 SQL 都不经 SQLAlchemy，直接用 sqlite3。它们同样要关 DQS：
+    核对 SQL 里写错一个双引号列名，在默认连接上会被当成字符串常量，`TOTAL("客流")` 得 0、
+    `WHERE "时段类别" = ?` 一行都对不上，于是「合计与明细一致」或「不一致」都可能是假的。
+    所以和连接层共用 _DqsOffConnection：关不掉就抛 SqliteHardeningError，连接不交出去。
+
+    readonly=True 以 mode=ro 打开（核对只读，文件不存在直接报错，不会悄悄建一个空库）；
+    readonly=False 以 mode=rwc 打开（执行器建库）。不设日志模式：沿用 SQLite 默认的回滚日志，
+    不开 WAL——WAL 会改写文件头，库文件哈希就对不上了（P2-SPEC 4.2 第 9 步）。
+    路径按 URI 转义：文件名里的空格、中文、「?」「#」都不会被当成 URI 的参数或片段。
+    """
+    from urllib.parse import quote
+
+    mode = "ro" if readonly else "rwc"
+    return sqlite3.connect(f"file:{quote(os.fspath(path))}?mode={mode}", uri=True, factory=_DqsOffConnection)
+
+
 def _sqlite_extra() -> dict[str, Any]:
     """每个 SQLite engine 都带的连接参数：关 DQS。"""
     return {"connect_args": {"factory": _DqsOffConnection}}

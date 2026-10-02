@@ -174,6 +174,20 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("data_sources", "current_snapshot_id", "VARCHAR(64)"),
     # 存量运行没有钉过版本，NULL 正好表示「升级前发起的」
     ("runs", "data_versions", "JSON"),
+    # 按配方导入（期 2）。新表 table_recipes、import_stagings 由 create_all 建；这些是已有表的新列，
+    # 存量行一律 NULL：存量的源都是简单导入或手工源，存量的导入记录都不是按配方导入的
+    ("data_sources", "current_recipe_id", "VARCHAR(32)"),
+    ("table_imports", "recipe_id", "VARCHAR(32)"),
+    ("table_imports", "period_start", "VARCHAR(10)"),
+    ("table_imports", "period_end", "VARCHAR(10)"),
+    ("table_imports", "context", "JSON"),
+    ("table_imports", "checks", "JSON"),
+    ("table_imports", "overrides", "JSON"),
+    ("table_imports", "waivers", "JSON"),
+    ("table_imports", "confirmations", "JSON"),
+    ("table_imports", "manifest_artifact", "VARCHAR(64)"),
+    ("table_imports", "signed_by", "VARCHAR(100)"),
+    ("table_imports", "staging_id", "VARCHAR(32)"),
 ]
 
 

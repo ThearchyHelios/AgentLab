@@ -326,6 +326,70 @@ def test_same_named_sheets_are_rejected_and_nothing_is_imported(tmp_path):
     assert not db.exists() or tables(db) == []
 
 
+def _write_only_xlsx(rows: int) -> bytes:
+    """openpyxl write_only 写出的工作簿：不带 <dimension>（不少导出工具都这样写）。"""
+    from openpyxl import Workbook
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("明细")
+    ws.append(["地区", "产品", "销量", "金额", "备注"])
+    for i in range(rows):
+        ws.append([f"区{i % 7}", f"品{i % 50}", i % 997, i * 3, "无"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_open_book_does_not_parse_a_whole_sheet_to_find_a_missing_dimension():
+    """openpyxl 只读打开时要找 <dimension>，原实现一直读到 </sheetData>：没有这个元素的文件，每打开一次就把
+    整张表解析一遍（20 万行约 3 秒，交互路径每次回答都要开两遍）。open_book 装的等价实现读到 <sheetData>
+    开头就停：有 <dimension> 的照样取到，没有的照样留空（读取层本来就按扫描的边界读）。"""
+    raw = _write_only_xlsx(20_000)
+    part = next(n for n in zipfile.ZipFile(io.BytesIO(raw)).namelist() if n.startswith("xl/worksheets/sheet"))
+    size = zipfile.ZipFile(io.BytesIO(raw)).getinfo(part).file_size
+    assert size > 1_000_000 and b"<dimension" not in zipfile.ZipFile(io.BytesIO(raw)).read(part)
+    book = tabular.open_book(raw)
+    try:
+        ws = book.worksheets[0]
+        assert ws.max_row is None and ws.max_column is None
+        # 再探一次尺寸，数一数读了多少字节：只读到 <sheetData> 开头附近
+        counted: list[int] = []
+        original = ws._get_source
+
+        class Counting:
+            def __init__(self, f):
+                self.f, self.n = f, 0
+
+            def read(self, n=-1):
+                b = self.f.read(n)
+                self.n += len(b)
+                return b
+
+            def close(self):
+                counted.append(self.n)
+                self.f.close()
+
+        ws._get_source = lambda: Counting(original())
+        ws._get_size()
+        del ws._get_source
+        assert counted and counted[0] < size // 10, (counted, size)
+        assert ws.max_row is None
+        # 值照常读得出来
+        assert list(ws.iter_rows(min_row=2, max_row=2, min_col=1, max_col=5, values_only=True)) == \
+            [("区0", "品0", 0, 0, "无")]
+    finally:
+        book.close()
+    # 有 <dimension> 的（Excel 存盘的文件）照样取到；公式一份（data_only=False）同样
+    with_dim = xlsx({"甲": [["a", "b"], [1, 2], [3, 4]]})
+    for data_only in (True, False):
+        book = tabular.open_book(with_dim, data_only=data_only)
+        try:
+            ws = book.worksheets[0]
+            assert (ws.min_row, ws.min_column, ws.max_row, ws.max_column) == (1, 1, 3, 2)
+        finally:
+            book.close()
+
+
 def test_worksheets_are_matched_by_part_path(tmp_path):
     """扫描结果和 openpyxl 的工作表按部件路径配对。钉住 openpyxl 的私有属性 _worksheet_path：
     它改名或换了格式，这里先失败，而不是导入时静默配错。"""

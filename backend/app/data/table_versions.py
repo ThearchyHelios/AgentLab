@@ -18,6 +18,12 @@
 
 **回收。** 任何运行引用的快照、各源当前快照，以及它们用到的构建和原件受保护；其余的删文件、
 记录标 retired 留作审计。
+
+**按配方导入（期 2）。** 构建、导入记录、快照三层和查询路径都不变，只是多了两样：
+- 发布拆成两步：publish_upload 只管解析，「把一个建好的临时库发布成新版本」抽成 publish_build，
+  配方导入的提交事务也调它（带期望的库哈希、锁内的提交前回调）；
+- 暂存区（import_stagings）：没发布的尝试都在这里，提交成功前不碰数据源。它引用的原件、试运行库
+  归这里的回收与清理管：未结束的暂存区保护原件，结束即瘦身，过期、放弃、清除原件都会结束它。
 """
 from __future__ import annotations
 
@@ -34,12 +40,12 @@ import sqlite3
 import stat
 import weakref
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,11 +53,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.errors import explain, first_line
 from app.data import introspect as introspect_mod
-from app.data import raw_store, tabular
+from app.data import raw_store, recipe_parsers, recipe_types, tabular
 from app.data.engine import engines
 from app.db import base as db_base
 from app.db.base import new_id, utcnow
-from app.db.models import DataSource, Run, SourceSnapshot, TableBuild, TableImport
+from app.db.models import (
+    DataSource, ImportStaging, Run, SourceSnapshot, TableBuild, TableImport, TableRecipe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +86,15 @@ class SnapshotMissing(ValueError):
 
 
 class PublishError(RuntimeError):
-    """解析成功了，但没能把库文件安全地发布出去。指针没动，旧版照常可查。"""
+    """解析成功了，但没能把库文件安全地发布出去。指针没动，旧版照常可查。
+
+    code 是给接口层分支用的机读码（trial_missing / trial_tampered / raw_missing）；期 1 的抛出处
+    不带，为 None，接口层照旧按 500 回原话。
+    """
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ParseFailed(tabular.UnsupportedTable):
@@ -94,8 +110,31 @@ class ImportResult:
     snapshot_id: str
     build_id: str
     build_reused: bool
-    #: 解析回执（tabular.LoadReport 的 JSON 形状）
+    #: 解析回执（tabular.LoadReport 的 JSON 形状；配方导入是执行器回执）
     report: dict[str, Any]
+    #: 新导入记录的序号
+    seq: int = 0
+    #: 实际发布（或复用）的库文件哈希
+    db_sha256: str = ""
+
+
+@dataclass
+class PublishInfo:
+    """publish_build 交给 schema_cache_for 的发布结果：这时库文件已经落位，记录还没写。
+
+    配方导入在 schema_cache_for 里写导入清单，清单要记的导入 id、快照 id、序号、实际发布的库哈希
+    此时都已确定。db_sha256 一律是**实际发布（或复用）**的那个文件的哈希：复用构建时它可能和试运行
+    回执里的不同（比如 SQLite 升级后文件头里的版本号变了），清单取这里的，不取回执里的。
+    """
+
+    import_id: str
+    snapshot_id: str
+    seq: int
+    build_id: str
+    db_sha256: str
+    build_reused: bool
+    #: 实际冻结的回执：复用构建时是已有构建登记的回执，否则是这次传进来的
+    report: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -135,9 +174,13 @@ class SourceView:
 # --------------------------------------------------------------------------
 
 
-def _sha_json(obj: Any) -> str:
+def sha_json(obj: Any) -> str:
+    """JSON 的规范写法（键排序、紧凑分隔）的 sha256。构建 id、快照 id、选项哈希都用它。"""
     text = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_sha_json = sha_json
 
 
 def parse_options(filename: str, *, header_row: int, mixed: str, raw_mode: bool) -> dict[str, Any]:
@@ -168,6 +211,27 @@ def snapshot_id(source_id: str, import_ids: list[str], engine_ver: str = ENGINE_
     return _sha_json({"source_id": source_id, "imports": list(import_ids), "engine_ver": engine_ver})
 
 
+def recipe_build_options(recipe_sha: str, inputs: dict[str, Any]) -> dict[str, Any]:
+    """按配方导入的构建登记的选项（TableBuild.options）。options_sha256 = sha_json(它)。"""
+    return {"kind": "recipe", "recipe_sha256": recipe_sha,
+            "parser_ver": recipe_parsers.PARSER_VER, "inputs": inputs}
+
+
+def recipe_build_id(source_id: str, raw_sha: str, recipe_sha: str, inputs: dict[str, Any]) -> str:
+    """按配方导入的构建 id：源、原件、配方、解析器版本、执行器版本、人工录入。
+
+    inputs 只放人工录入的东西（{"context": {"统计期": {"start", "end"}}}，没有就 {}）；署名和文件名
+    不进。同一份原件换个名字再传会复用构建，所以凡是取决于文件名的结果（C2）都不能放进构建回执，
+    得跟着导入记录走（table_imports.checks、导入清单）。解析器或执行器升级会换掉 id：按新规则建出来的
+    库不是同一个构建，不能复用旧文件。
+    """
+    return sha_json({
+        "source_id": source_id, "raw_sha256": raw_sha, "recipe_sha256": recipe_sha,
+        "parser_ver": recipe_parsers.PARSER_VER, "engine_ver": recipe_types.RECIPE_ENGINE_VER,
+        "inputs_sha256": sha_json(inputs),
+    })
+
+
 def legacy_build_id(source_id: str, file_sha: str) -> str:
     """迁移前老上传的 v0 构建 id。带上 source_id：两个源的老库内容相同，id 也不同。"""
     return hashlib.sha256(f"legacy{source_id}{file_sha}".encode("utf-8")).hexdigest()
@@ -181,6 +245,23 @@ def build_path(source_id: str, bid: str) -> Path:
     if not _SOURCE_ID.match(source_id or ""):
         raise ValueError("数据源 id 的格式不对")
     return tables_root() / source_id / "builds" / f"{bid}.db"
+
+
+#: 试运行库所在的目录名：tables/<源 id>/trials/<暂存区 id>-<trial_key 前 16 位>.db
+TRIALS_DIR = "trials"
+
+
+def trial_db_path(source_id: str, staging_id: str, trial_key: str) -> Path:
+    """试运行库的路径。和构建库同一个文件系统，发布时 link 过去，不用拷贝。
+
+    文件名带暂存区 id：启动清理按它找回暂存区，暂存区不在、已结束、或者指着的不是这个文件就删。
+    写的时候先写 .tmp- 再改名（半成品归 _sweep_tmp 管）。
+    """
+    if not _SOURCE_ID.match(source_id or "") or not _SOURCE_ID.match(staging_id or ""):
+        raise ValueError("数据源或暂存区 id 的格式不对")
+    if not re.fullmatch(r"[0-9A-Za-z]{16,}", trial_key or ""):
+        raise ValueError("试运行的键格式不对")
+    return tables_root() / source_id / TRIALS_DIR / f"{staging_id}-{trial_key[:16]}.db"
 
 
 def _under(path: str | os.PathLike[str], root: Path) -> bool:
@@ -427,8 +508,8 @@ async def resolve_source(
 _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
 
 
-def _store_lock() -> asyncio.Lock:
-    """版本存储的写锁，按事件循环各一把。
+def store_lock() -> asyncio.Lock:
+    """版本存储的写锁，按事件循环各一把。不可重入：持着它时别再调会自己取锁的函数。
 
     回收要先看「哪些文件有记录」再删：发布正处在「文件已 link、记录未提交」之间时，回收
     会把它当孤儿删掉；复用一个刚被判为无人引用的构建，也会撞上正在删它的回收。上传不频繁，
@@ -441,19 +522,25 @@ def _store_lock() -> asyncio.Lock:
     return lock
 
 
+_store_lock = store_lock
+
+
 #: 同时解析的上传最多几个。解析在线程里做，内存和上传数成正比；不设上限的话，几个大文件
 #: 同时上传，内存会叠加起来。超出的排队等前面的解析完
 MAX_PARALLEL_PARSES = 2
 _parse_slots: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
 
 
-def _parse_slot() -> asyncio.Semaphore:
-    """解析的并发名额，按事件循环各一份（理由同 _store_lock）。"""
+def parse_slot() -> asyncio.Semaphore:
+    """解析的并发名额，按事件循环各一份（理由同 store_lock）。配方导入的扫描、干跑、试运行也占它。"""
     loop = asyncio.get_running_loop()
     slot = _parse_slots.get(loop)
     if slot is None:
         slot = _parse_slots[loop] = asyncio.Semaphore(MAX_PARALLEL_PARSES)
     return slot
+
+
+_parse_slot = parse_slot
 
 
 def pin_lock() -> asyncio.Lock:
@@ -465,7 +552,7 @@ def pin_lock() -> asyncio.Lock:
     这次运行只能报「固定的数据版本已不存在」。持着这把锁，回收要么在读指针之前做完，要么等运行
     记录提交之后才开始。只包住读指针到提交这一小段，别在里面做慢事（发布和回收也在等它）。
     """
-    return _store_lock()
+    return store_lock()
 
 
 # --------------------------------------------------------------------------
@@ -512,11 +599,15 @@ def _parse_to_tmp(final: Path, raw: bytes, filename: str, header_row: int, mixed
 _JOURNAL_STUCK = "数据文件的日志未能合并，已停止发布，原数据未受影响"
 
 
-def _settle_journal(path: Path) -> None:
+def settle_journal(path: Path) -> None:
     """切成回滚日志模式并确认没有残留的 -wal / -journal：发布后以 immutable 打开，SQLite 不会再看日志。
 
     解析器要是用了 WAL、又有连接没关，切换会报「database is locked」或者原样留在 WAL：
     这时库里的一部分数据还在 -wal 里，按 immutable 打开会静默少数据，只能停下。
+
+    配方导入的试运行写完库先调它、再算回执里的 db_sha256：WAL 模式下切换会改写文件头第 18、19
+    字节，先切再算，发布时 _publish_file 再切一次就不会改动文件，两次哈希才对得上。
+    注意文件不存在时 sqlite3.connect 会新建一个空库：调用方要先确认文件在。
     """
     try:
         conn = sqlite3.connect(str(path))
@@ -534,6 +625,13 @@ def _settle_journal(path: Path) -> None:
     Path(f"{path}-shm").unlink(missing_ok=True)
 
 
+_settle_journal = settle_journal
+
+_TRIAL_MISSING = "试运行的数据文件已不在，请重新试运行"
+_TRIAL_TAMPERED = "试运行之后数据文件被改动过，请重新试运行"
+_RAW_MISSING = "这次导入的原件已不在服务端（可能已被清除），请重新上传文件"
+
+
 def _fsync_file(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -542,19 +640,28 @@ def _fsync_file(path: Path) -> None:
         os.close(fd)
 
 
-def _publish_file(tmp: Path, final: Path, expected_sha: str | None) -> tuple[str, bool]:
+def _publish_file(tmp: Path, final: Path, expected_sha: str | None,
+                  trial_sha: str | None = None) -> tuple[str, bool]:
     """把临时库发布到最终路径，返回 (库文件 sha256, 是否复用了已有文件)。
 
     先落盘再 link：link 不会覆盖已有文件，已发布的版本因此不可能被半个新文件顶掉。
     目标已存在时（同一个构建传过），只有它的哈希等于登记的 db_sha256 才复用——0 字节的
     残骸、被改过的文件都不能冒充。没有登记过（上次发布到一半进程没了）时，和这次刚建的
     临时库逐字节一致也可以接手。临时文件无论成败都删掉。
+
+    trial_sha：配方导入试运行时算的库哈希。给了就在 link 之前比对，对不上说明试运行之后有人改过
+    这个文件，不能把改过的数据当成用户核对过的那份发布出去。目标已存在时也先比它：被改过的试运行库
+    本身就是要停下的信号，不因为这次碰巧复用旧文件而放过。
     """
     try:
-        _settle_journal(tmp)
+        settle_journal(tmp)
         sha = raw_store.sha256_file(tmp)
+        if trial_sha is not None and sha != trial_sha:
+            logger.warning("试运行库的哈希与试运行回执不符，已停止发布：%s", tmp)
+            raise PublishError(_TRIAL_TAMPERED, code="trial_tampered")
         _fsync_file(tmp)
         raw_store.fsync_dir(tmp.parent)
+        final.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.link(tmp, final)
         except FileExistsError:
@@ -574,7 +681,7 @@ def _publish_file(tmp: Path, final: Path, expected_sha: str | None) -> tuple[str
         _remove_db_files(tmp)
 
 
-async def _introspect_view(view: SourceView, report: dict[str, Any]) -> dict[str, Any]:
+async def introspect_view(view: SourceView, report: dict[str, Any]) -> dict[str, Any]:
     """探查快照库的结构，给未规整的表注入说明。
 
     走 introspect 而不是自己读 sqlite_master：表结构的形状必须和手工源的一模一样，下游
@@ -597,7 +704,10 @@ async def _introspect_view(view: SourceView, report: dict[str, Any]) -> dict[str
     return cache
 
 
-def _check_probe(cache: dict[str, Any], report: dict[str, Any], source_id: str) -> None:
+_introspect_view = introspect_view
+
+
+def check_probe(cache: dict[str, Any], report: dict[str, Any], source_id: str) -> None:
     """冻结进快照之前核对：探查成功，且探到的表正是解析回执里的那些。
 
     快照的结构一旦冻结就改不了（上传源不能重新探查），所以宁可这次发布失败、旧版照常可查，
@@ -615,66 +725,105 @@ def _check_probe(cache: dict[str, Any], report: dict[str, Any], source_id: str) 
         raise PublishError("导入失败：新数据的表结构与解析结果对不上，已停止发布，当前版本未受影响")
 
 
-async def publish_upload(
-    session: AsyncSession, source: DataSource, raw: bytes, filename: str, *,
-    header_row: int = 1, mixed: str = "reject", raw_mode: bool = False,
+_check_probe = check_probe
+
+
+#: publish_build 的 import_fields 能写的列：配方导入在 table_imports 上新加的那些。id、状态、序号、
+#: 原件这些由发布流程自己定，不许经这里改
+IMPORT_FIELDS = frozenset({
+    "recipe_id", "period_start", "period_end", "context", "checks", "overrides", "waivers",
+    "confirmations", "manifest_artifact", "signed_by", "staging_id",
+})
+
+SchemaCacheFor = Callable[[SourceView, PublishInfo], Awaitable[dict[str, Any]]]
+BeforeCommit = Callable[[str, str], Awaitable[None]]
+
+
+def _usable_tmp(tmp: Path) -> bool:
+    """临时库在、非空、在上传目录里。不在上传目录里的一律不认：发布结束要删它，不能删到别处去。"""
+    try:
+        return tmp.is_file() and tmp.stat().st_size > 0 and _under(tmp, settings.uploads_dir)
+    except OSError:
+        return False
+
+
+async def publish_build(
+    session: AsyncSession, source: DataSource, *, tmp_db: Path, build_id: str,
+    build_options: dict[str, Any], engine_ver: str, report: dict[str, Any],
+    raw: bytes | None, raw_sha: str, file_name: str, file_size: int,
+    schema_cache_for: SchemaCacheFor, import_fields: dict[str, Any],
+    expected_db_sha256: str | None = None,
+    before_commit: BeforeCommit | None = None,
+    import_id: str | None = None,
 ) -> ImportResult:
-    """解析一份上传、发布成新版本并启用。返回导入回执。
+    """把一个建好的临时库发布成数据源的新版本并启用。期 1 的上传和期 2 的配方提交都走这里。
 
-    1. 线程池里解析到临时库；NeedsDecision / UnsupportedTable 原样抛出——不留原件、不动指针。
-    2. 发布库文件：落盘、link 到构建路径、0444。
-    3. 存原件；一个事务里写构建、导入记录、快照，旧的 active 导入置 superseded，切数据源指针。
-       任何一步失败都回滚，并删掉这次新建的文件，指针不动。
-    4. 回收一次（失败只记日志）。
+    1. 进锁后先确认临时库在且非空：settle_journal 的 sqlite3.connect 碰到不存在的文件会新建一个空库，
+       不先查就会把空库当成新版本发布出去（PublishError code=trial_missing）。
+    2. 原件：raw 给了就存档；为 None 时原件必须已在存档里（配方导入暂存时存过），否则 raw_missing。
+    3. 发布库文件：落盘、（给了 expected_db_sha256 就先比哈希，code=trial_tampered）、link 到构建路径、0444。
+    4. 写构建记录（复用时照期 1 的规则）；schema_cache_for(view, info) 返回要冻结进快照的表结构。
+       它在库文件落位之后、写任何导入记录之前调用：配方导入在这里写导入清单，这时导入 id、快照 id、
+       序号、实际发布的库哈希都已确定。
+    5. 写导入记录（import_fields 写进新列）、快照，旧的 active 导入置 superseded。
+    6. before_commit(imp_id, snap_id)：同一事务、版本存储锁内。调用时新导入记录、快照、构建已刷进当前
+       事务（session.get 取得到导入记录），**新源还没加入会话、数据源指针还没切**——在里面 select 读到的
+       current_snapshot_id 是发布前的值，查同名源也不会查到这次要建的新源。配方导入在这里重新核对
+       base_changed、name_taken，写配方表、清单索引，结束暂存区。
+    7. 加入数据源、切指针、提交。之后回收一次（失败只记日志）。
 
+    任何一步失败（包括 before_commit 抛的异常）都回滚，删掉这次 link 出来的库文件和这次新存的原件，
+    指针不动，异常原样抛出。**tmp_db 一律被消耗**：成功时 link 走，失败时也删，调用方不能指望它还在。
+
+    调用之前，调用方不得改动会话里的任何对象（暂存区也不行，放进 before_commit）：schema_cache_for
+    里写工件会另开会话提交，主会话要是已经有待刷的改动、占着应用库的写锁，两边会互等。
     source 可以是还没入库的新 DataSource：失败时它也不会被建出来。
     """
     if not source.id:
         source.id = new_id()
     # 失败回滚后 source 的属性会过期，再读就要回库加载；后面一律用这份本地值
     source_id = source.id
-    raw_sha = hashlib.sha256(raw).hexdigest()
-    options = parse_options(filename, header_row=header_row, mixed=mixed, raw_mode=raw_mode)
-    bid = build_id(source_id, raw_sha, options)
-    final = build_path(source_id, bid)
-    # 还没入库的新源（接口层每次给一个新 id）：失败时它的 tables/<源 id>/builds/ 目录也不该留下。
-    # 被拒收的上传在「422 → 用户选择 → 重传」里每轮都是一个新 id，不收拾的话每轮多一个空目录。
-    # 新 id 只有这一个请求在用，删目录不会和别的发布撞上；已有的源目录里有当前版本，不动
+    final = build_path(source_id, build_id)
+    # 还没入库的新源：失败时它的 tables/<源 id>/builds/ 目录也不该留下（见 publish_upload）
     state = sa_inspect(source)
     fresh = state.transient or state.pending
 
-    try:
-        async with _parse_slot():
-            tmp, parsed = await asyncio.to_thread(
-                _parse_to_tmp, final, raw, filename, header_row, mixed, raw_mode)
-    except BaseException:
-        if fresh:
-            await asyncio.to_thread(_prune_build_dirs, final)
-        raise
-    report = report_to_json(parsed)
-
     linked = raw_new = False
     try:
-        async with _store_lock():
+        unknown = set(import_fields) - IMPORT_FIELDS
+        if unknown:
+            raise ValueError(f"import_fields 含有不能经发布写入的列：{sorted(unknown)}")
+        # 导入记录上的原件哈希必须就是这份内容的：对不上的话，清除、回收、重放都会找错文件
+        if raw is not None and hashlib.sha256(raw).hexdigest() != raw_sha:
+            raise ValueError("raw_sha 与传入的原件内容不符")
+        report = report_to_json(report)
+        async with store_lock():
+            if not _usable_tmp(tmp_db):
+                raise PublishError(_TRIAL_MISSING, code="trial_missing")
             # 先读后写：读的时候别把调用方挂起的改动（新源、改说明）提前刷进库。
             # 应用库的写锁只在最后提交那一下持有，解析、哈希、fsync 都不占着它
             with session.no_autoflush:
-                build = await session.get(TableBuild, bid)
+                build = await session.get(TableBuild, build_id)
                 last_seq = (await session.execute(
                     select(func.max(TableImport.seq)).where(TableImport.source_id == source_id)
                 )).scalar() or 0
+            if raw is None and not raw_store.raw_exists(raw_sha):
+                raise PublishError(_RAW_MISSING, code="raw_missing")
             db_sha, reused_file = await asyncio.to_thread(
-                _publish_file, tmp, final, build.db_sha256 if build is not None else None)
+                _publish_file, tmp_db, final, build.db_sha256 if build is not None else None,
+                expected_db_sha256)
             linked = not reused_file
-            raw_new = not raw_store.raw_exists(raw_sha)
-            await asyncio.to_thread(raw_store.put_raw, raw)
+            if raw is not None:
+                raw_new = not raw_store.raw_exists(raw_sha)
+                await asyncio.to_thread(raw_store.put_raw, raw)
 
             now = utcnow()
             if build is None:
                 build = TableBuild(
-                    id=bid, source_id=source_id, raw_sha256=raw_sha,
-                    options_sha256=_sha_json(options), engine_ver=ENGINE_VER, options=options,
-                    db_path=str(final), db_sha256=db_sha, report=report, created_at=now,
+                    id=build_id, source_id=source_id, raw_sha256=raw_sha,
+                    options_sha256=sha_json(build_options), engine_ver=engine_ver,
+                    options=build_options, db_path=str(final), db_sha256=db_sha, report=report,
+                    created_at=now,
                 )
                 session.add(build)
                 build_reused = False
@@ -690,22 +839,24 @@ async def publish_upload(
                 build_reused = reused_file
                 report = build.report or report
 
-            imp_id = new_id()
-            snap_id = snapshot_id(source_id, [imp_id])
+            imp_id = import_id or new_id()
+            seq = last_seq + 1
+            snap_id = snapshot_id(source_id, [imp_id], engine_ver)
             options_now = upload_options(source.options)
             view = SourceView(
                 id=source_id, name=source.name, database=str(final), options=options_now,
                 description=source.description or "", snapshot_id=snap_id,
                 expected_sha256=build.db_sha256,
             )
-            cache = await _introspect_view(view, report)
-            _check_probe(cache, report, source_id)
+            info = PublishInfo(import_id=imp_id, snapshot_id=snap_id, seq=seq, build_id=build_id,
+                               db_sha256=db_sha, build_reused=build_reused, report=report)
+            cache = await schema_cache_for(view, info)
 
-            session.add(source)
             session.add(TableImport(
-                id=imp_id, source_id=source_id, seq=last_seq + 1, build_id=bid,
-                file_name=(filename or "")[:500], file_size=len(raw), raw_sha256=raw_sha,
+                id=imp_id, source_id=source_id, seq=seq, build_id=build_id,
+                file_name=(file_name or "")[:500], file_size=int(file_size), raw_sha256=raw_sha,
                 raw_state="kept", status="active", created_at=now, activated_at=now,
+                **import_fields,
             ))
             session.add(SourceSnapshot(
                 id=snap_id, source_id=source_id, imports=[imp_id], db_path=str(final),
@@ -717,6 +868,10 @@ async def publish_upload(
                        TableImport.id != imp_id)
                 .values(status="superseded")
             )
+            if before_commit is not None:
+                await before_commit(imp_id, snap_id)
+
+            session.add(source)
             source.kind, source.origin, source.readonly = "sqlite", "upload", True
             source.host = source.port = source.username = source.password = None
             if options_now != (source.options or {}):
@@ -737,11 +892,13 @@ async def publish_upload(
         if raw_new:
             raw_store.purge_raw(raw_sha)
         if fresh:
-            _remove_db_files(tmp)
+            if _under(tmp_db, settings.uploads_dir):
+                _remove_db_files(tmp_db)
             _prune_build_dirs(final)
         raise
     finally:
-        _remove_db_files(tmp)
+        if _under(tmp_db, settings.uploads_dir):
+            _remove_db_files(tmp_db)
         # 指针换了（或没换成）：按源 id 清掉缓存的引擎，下次按新的快照重建
         await engines.invalidate(source_id)
 
@@ -749,50 +906,332 @@ async def publish_upload(
         await gc(session)
     except Exception:  # noqa: BLE001 - 回收失败不影响这次导入，下次发布或重启再收
         logger.exception("上传表格发布后的回收失败")
-    return ImportResult(import_id=imp_id, snapshot_id=snap_id, build_id=bid,
-                        build_reused=build_reused, report=report)
+    return ImportResult(import_id=imp_id, snapshot_id=snap_id, build_id=build_id,
+                        build_reused=build_reused, report=report, seq=seq, db_sha256=db_sha)
+
+
+async def publish_upload(
+    session: AsyncSession, source: DataSource, raw: bytes, filename: str, *,
+    header_row: int = 1, mixed: str = "reject", raw_mode: bool = False,
+) -> ImportResult:
+    """解析一份上传、发布成新版本并启用。返回导入回执。
+
+    1. 线程池里解析到临时库；NeedsDecision / UnsupportedTable 原样抛出——不留原件、不动指针。
+    2. 交给 publish_build：发布库文件、存原件、一个事务里写构建 / 导入记录 / 快照、切指针，
+       失败时回滚并删掉这次新建的文件；之后回收一次。
+
+    source 可以是还没入库的新 DataSource：失败时它也不会被建出来。
+    """
+    if not source.id:
+        source.id = new_id()
+    source_id = source.id
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    options = parse_options(filename, header_row=header_row, mixed=mixed, raw_mode=raw_mode)
+    bid = build_id(source_id, raw_sha, options)
+    final = build_path(source_id, bid)
+    # 还没入库的新源（接口层每次给一个新 id）：失败时它的 tables/<源 id>/builds/ 目录也不该留下。
+    # 被拒收的上传在「422 → 用户选择 → 重传」里每轮都是一个新 id，不收拾的话每轮多一个空目录。
+    # 新 id 只有这一个请求在用，删目录不会和别的发布撞上；已有的源目录里有当前版本，不动
+    state = sa_inspect(source)
+    fresh = state.transient or state.pending
+
+    try:
+        async with parse_slot():
+            tmp, parsed = await asyncio.to_thread(
+                _parse_to_tmp, final, raw, filename, header_row, mixed, raw_mode)
+    except BaseException:
+        if fresh:
+            await asyncio.to_thread(_prune_build_dirs, final)
+        raise
+
+    async def schema(view: SourceView, info: PublishInfo) -> dict[str, Any]:
+        # 经模块里的旧名调用：期 1 的测试按这个名字替换探查，模拟发布到一半失败
+        cache = await _introspect_view(view, info.report)
+        _check_probe(cache, info.report, source_id)
+        return cache
+
+    return await publish_build(
+        session, source, tmp_db=tmp, build_id=bid, build_options=options, engine_ver=ENGINE_VER,
+        report=report_to_json(parsed), raw=raw, raw_sha=raw_sha, file_name=filename,
+        file_size=len(raw), schema_cache_for=schema, import_fields={},
+    )
 
 
 # --------------------------------------------------------------------------
-# 删除数据源
+# 暂存区：结束、瘦身、过期、原件的存与放
+# --------------------------------------------------------------------------
+
+#: 暂存区多久不提交就过期（D9 未拍板，推测；常量可调）
+STAGING_TTL = timedelta(days=7)
+#: 结束（瘦身）后的暂存区行保留多久。之后由回收删掉：用量和同意记录已经抄进配方表和导入清单
+STAGING_KEEP_CLOSED = timedelta(days=90)
+#: 配方源保留最近几次导入的原件（按 seq，被替换的也算）。期 3 的「破坏性变更用新配方重放历史原件」、
+#: 解析器升级的回归重放都要用到历史原件；构建库照常回收，需要时按原件重建。N 的取值待拍板
+RECIPE_RAW_KEEP = 12
+STAGING_OPEN = ("drafting", "trialed", "rejected")
+STAGING_CLOSED = ("committed", "discarded", "expired")
+#: 暂存区结束时清空的字段和清空后的值。网格预览里有数字格的值和隐藏行列，试运行回执里有区域外文字
+#: 全文，回答里有用户写的理由：用完就不该留在库里（接口没有认证）。留下的是 id、来源、文件哈希、
+#: 状态、工作配方及其哈希、用量、同意记录、署名和时间
+STAGING_SLIM: dict[str, Any] = {
+    "scan": None, "grid_preview": None, "facts": None, "drafts": None, "trial": None,
+    "answers_base": None, "cards": [], "questions": [], "draft_problems": [], "draft_partial": False,
+    "answers": {}, "recipe_problems": [], "context_inputs": {}, "trial_key": None, "trial_path": None,
+}
+
+
+def staging_is_open(staging: ImportStaging) -> bool:
+    return staging.status in STAGING_OPEN
+
+
+def close_staging(staging: ImportStaging, status: str, *, now: datetime | None = None) -> str | None:
+    """暂存区进入结束状态并瘦身（不提交）。返回它原来的试运行库路径：提交之后交给 remove_trial_file 删。
+
+    文件放到提交之后再删：提交失败时暂存区还开着，库还在，用户不用重新试运行。提交成功、删文件失败
+    只是留下一个孤儿，回收和启动清理会按「暂存区已结束」把它删掉。
+    """
+    if status not in STAGING_CLOSED:
+        raise ValueError(f"暂存区的结束状态只能是 {STAGING_CLOSED}，不能是 {status!r}")
+    now = now or utcnow()
+    old_trial = staging.trial_path
+    for name, value in STAGING_SLIM.items():
+        setattr(staging, name, copy.deepcopy(value))
+    staging.status, staging.closed_at, staging.updated_at = status, now, now
+    return old_trial
+
+
+def remove_trial_file(path: str | None) -> bool:
+    """删一个试运行库（连同日志文件）。只删上传目录里 trials/ 下的：记录被改坏了也不能删到别处去。"""
+    if not path:
+        return False
+    target = Path(path)
+    if target.parent.name != TRIALS_DIR or not _under(target, tables_root()):
+        logger.warning("没有删除试运行库以外的文件：%s", path)
+        return False
+    existed = target.exists()
+    try:
+        _remove_db_files(target)
+    except OSError as e:
+        logger.warning("没能删掉试运行库 %s：%s", path, e)
+        return False
+    return existed
+
+
+def _expiry_due(now: datetime) -> Any:
+    """「该过期了」的条件。expires_at 没写的按 created_at 加 TTL 算，免得漏写一列就永不过期。"""
+    return and_(
+        ImportStaging.status.in_(STAGING_OPEN),
+        or_(
+            and_(ImportStaging.expires_at.is_not(None), ImportStaging.expires_at <= now),
+            and_(ImportStaging.expires_at.is_(None), ImportStaging.created_at <= now - STAGING_TTL),
+        ),
+    )
+
+
+def _closed_long_ago(now: datetime) -> Any:
+    """「结束超过 90 天」的条件。closed_at 没写的按 updated_at 算（同 _expiry_due 的兜底）：
+    哪条结束路径只改了状态、没经过 close_staging，行也不会因此永远留着。"""
+    cutoff = now - STAGING_KEEP_CLOSED
+    return and_(
+        ImportStaging.status.in_(STAGING_CLOSED),
+        or_(
+            and_(ImportStaging.closed_at.is_not(None), ImportStaging.closed_at <= cutoff),
+            and_(ImportStaging.closed_at.is_(None), ImportStaging.updated_at <= cutoff),
+        ),
+    )
+
+
+async def _raw_in_use(session: AsyncSession, sha: str, *, except_staging: str | None = None) -> bool:
+    """这份原件还有没有人要：留着原件的导入记录（raw_state=kept），或者未结束的暂存区。"""
+    if (await session.execute(
+        select(TableImport.id).where(TableImport.raw_sha256 == sha, TableImport.raw_state == "kept")
+        .limit(1)
+    )).first() is not None:
+        return True
+    cond = [ImportStaging.raw_sha256 == sha, ImportStaging.status.in_(STAGING_OPEN)]
+    if except_staging:
+        cond.append(ImportStaging.id != except_staging)
+    return (await session.execute(select(ImportStaging.id).where(*cond).limit(1))).first() is not None
+
+
+async def _release_raws_locked(session: AsyncSession, shas: set[str]) -> set[str]:
+    """（持锁）这些原件没人要了就删掉，返回删了的。暂存区引用的原件没有导入记录记着，不在这里删就成了孤儿。"""
+    unused = {sha for sha in shas if sha and not await _raw_in_use(session, sha)}
+
+    def _purge() -> set[str]:
+        return {sha for sha in unused if raw_store.purge_raw(sha, prune=True)}
+
+    return await asyncio.to_thread(_purge) if unused else set()
+
+
+async def _expire_stagings_locked(session: AsyncSession, now: datetime) -> list[str]:
+    """（持锁）过期的暂存区 → expired、瘦身、删试运行库、放掉没人要的原件；结束超过 90 天的行删掉（提交）。"""
+    expired = list((await session.execute(
+        select(ImportStaging).where(_expiry_due(now)).order_by(ImportStaging.created_at)
+    )).scalars())
+    ids, shas = [s.id for s in expired], {s.raw_sha256 for s in expired}
+    trials = [close_staging(s, "expired", now=now) for s in expired]
+    old = (await session.execute(
+        select(func.count()).select_from(ImportStaging).where(_closed_long_ago(now))
+    )).scalar() or 0
+    if old:
+        await session.execute(delete(ImportStaging).where(_closed_long_ago(now))
+                              .execution_options(synchronize_session=False))
+    if not expired and not old:
+        return []
+    await session.commit()
+    for path in trials:
+        await asyncio.to_thread(remove_trial_file, path)
+    await _release_raws_locked(session, shas)
+    if expired:
+        logger.info("%d 个导入暂存区已过期并清空", len(expired))
+    return ids
+
+
+async def expire_stagings(session: AsyncSession, *, now: datetime | None = None) -> list[str]:
+    """过期的暂存区 → expired（瘦身、删试运行库、原件没人要了就删）；结束超过 90 天的行删除。提交。
+
+    返回这次过期的暂存区 id。回收（gc）开头会做一遍；但回收只在发布、删源、启动时跑，光靠它 7 天的
+    TTL 不一定生效，所以暂存、上传新一期、查看暂存区时也顺手调一次。调用时会话里不要有没提交的改动。
+
+    先在锁外看一眼有没有要处理的：没有就不去等锁，查看暂存区不该因为别处正在发布大文件而排队。
+    """
+    now = now or utcnow()
+    pending = (await session.execute(
+        select(ImportStaging.id).where(or_(_expiry_due(now), _closed_long_ago(now))).limit(1)
+    )).first()
+    if pending is None:
+        return []
+    async with store_lock():
+        return await _expire_stagings_locked(session, now)
+
+
+async def store_staging(session: AsyncSession, staging: ImportStaging, raw: bytes) -> None:
+    """存原件、把暂存区写进库（提交），全程持版本存储的锁。
+
+    原件和引用它的暂存区必须在同一把锁里落地：回收、清除原件、放弃导入都持着这把锁判断「这份原件
+    还有没有人要」，锁外先存原件、过一会儿才提交暂存区，中间插进来的回收会把它当成没人要的删掉。
+    expires_at 没写的按现在加 STAGING_TTL 补上。提交失败时，这次新存的原件删掉。
+    """
+    sha = hashlib.sha256(raw).hexdigest()
+    if staging.raw_sha256 and staging.raw_sha256 != sha:
+        raise ValueError("暂存区登记的原件哈希与这份内容不符")
+    staging.raw_sha256 = sha
+    if staging.file_size in (None, 0):
+        staging.file_size = len(raw)
+    if staging.expires_at is None:
+        staging.expires_at = utcnow() + STAGING_TTL
+    async with store_lock():
+        raw_new = not raw_store.raw_exists(sha)
+        try:
+            await asyncio.to_thread(raw_store.put_raw, raw)
+            session.add(staging)
+            await session.commit()
+        except BaseException:
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001 - 回滚失败也要先把原件收拾掉，再抛原来的异常
+                logger.exception("导入暂存区写入失败后回滚出错")
+            if raw_new:
+                raw_store.purge_raw(sha, prune=True)
+            raise
+
+
+async def release_staging_raw(session: AsyncSession, staging: ImportStaging) -> bool:
+    """放弃导入之后调用：这份原件已经没有别的引用（没有留着原件的导入记录、没有别的未结束暂存区）就
+    当场删掉，不等回收。返回是否删了文件。
+
+    自己取版本存储的锁，**不要在持锁时调用**。暂存区必须已经结束（一般是刚提交成 discarded），
+    还开着的一律不删：它自己就是这份原件的引用。
+    """
+    if staging.status not in STAGING_CLOSED or not staging.raw_sha256:
+        return False
+    sha = staging.raw_sha256
+    async with store_lock():
+        if await _raw_in_use(session, sha, except_staging=staging.id):
+            return False
+        return await asyncio.to_thread(lambda: raw_store.purge_raw(sha, prune=True))
+
+
+# --------------------------------------------------------------------------
+# 删除数据源、清除原件
 # --------------------------------------------------------------------------
 
 
 async def retire_source(session: AsyncSession, source_id: str) -> None:
-    """数据源删除时调用（不提交）：它的导入记录全部置 retired。文件交给回收，被运行引用的会保留。"""
+    """数据源删除时调用（不提交）：导入记录、配方全部置 retired，未结束的暂存区放弃（瘦身）。
+
+    文件交给随后的回收：被运行引用的版本会保留；放弃的暂存区留下的试运行库、没人要的原件也由回收删。
+    """
     await session.execute(
         update(TableImport).where(TableImport.source_id == source_id, TableImport.status != "retired")
         .values(status="retired")
     )
+    await session.execute(
+        update(TableRecipe).where(TableRecipe.source_id == source_id, TableRecipe.status != "retired")
+        .values(status="retired")
+    )
+    now = utcnow()
+    for staging in (await session.execute(
+        select(ImportStaging).where(ImportStaging.source_id == source_id,
+                                    ImportStaging.status.in_(STAGING_OPEN))
+    )).scalars():
+        close_staging(staging, "discarded", now=now)
+
+
+@dataclass
+class RawPurge:
+    """清除原件的结果。按两元组解包得到 (是否删了文件, 一并标成已清除的其他导入记录)，和期 1 一样。"""
+
+    deleted: bool
+    others: list[TableImport]
+    #: 引用同一份原件、随之一并放弃的未结束暂存区（已瘦身）
+    discarded_stagings: list[ImportStaging] = field(default_factory=list)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.deleted, self.others))
 
 
 async def purge_import_raw(
     session: AsyncSession, imp: TableImport, *, reason: str, signed_by: str | None
-) -> tuple[bool, list[TableImport]]:
-    """清除一次导入的原件（提交）。返回 (是否删了文件, 一并标成已清除的其他导入记录)。
+) -> RawPurge:
+    """清除一次导入的原件（提交）。按两元组解包得到 (是否删了文件, 一并标成已清除的其他导入记录)，
+    discarded_stagings 是一并放弃的暂存区。
 
     **按内容清除。** 原件按哈希只存一份，同一个文件传过两次、传给过两个源，共用的是同一个
     文件。清除的目的是让含敏感内容的原件从服务器上消失（D13），所以文件一定删；同一份内容
     下其他仍保留原件的导入一并标成已清除，记录里写明是随哪次导入清除的，回执逐条列出。
+    引用同一份原件的未结束暂存区也在同一个事务里放弃并瘦身、删掉试运行库：不这么做，它们随后
+    试运行或提交时读不到原件，暂存区里那份网格和回执也照样留着，清除就没有达到目的。
     持版本存储的锁：发布正在把同一份原件登记给新导入时，不能在它提交前把文件删掉。
     """
-    async with _store_lock():
+    async with store_lock():
+        sha = imp.raw_sha256
         others = list((await session.execute(
             select(TableImport).where(
-                TableImport.raw_sha256 == imp.raw_sha256, TableImport.raw_state == "kept",
+                TableImport.raw_sha256 == sha, TableImport.raw_state == "kept",
                 TableImport.id != imp.id,
             ).order_by(TableImport.source_id, TableImport.seq)
         )).scalars())
+        stagings = list((await session.execute(
+            select(ImportStaging).where(
+                ImportStaging.raw_sha256 == sha, ImportStaging.status.in_(STAGING_OPEN),
+            ).order_by(ImportStaging.created_at)
+        )).scalars()) if sha else []
+        now = utcnow()
         record = {
-            "at": utcnow().isoformat(), "reason": reason,
+            "at": now.isoformat(), "reason": reason,
             "signed_by": (signed_by or "").strip() or None, "signed_by_verified": False,
         }
         imp.raw_state, imp.purged = "purged", record
         for other in others:
             other.raw_state, other.purged = "purged", {**record, "via_import": imp.id}
+        trials = [close_staging(s, "discarded", now=now) for s in stagings]
         await session.commit()
-        deleted = await asyncio.to_thread(lambda: raw_store.purge_raw(imp.raw_sha256, prune=True))
-    return deleted, others
+        for path in trials:
+            await asyncio.to_thread(remove_trial_file, path)
+        deleted = await asyncio.to_thread(lambda: raw_store.purge_raw(sha, prune=True))
+    return RawPurge(deleted=deleted, others=others, discarded_stagings=stagings)
 
 
 # --------------------------------------------------------------------------
@@ -834,8 +1273,15 @@ async def gc(session: AsyncSession) -> None:
     快照 ∪ 各源当前的快照。受保护的是这些快照、它们的导入记录、构建库，以及这些导入记录里
     还留着的原件。其余的：记录先标 retired 并提交，再删文件——删到一半出错，下次回收会接着删
     （已 retired、没被保护的文件照样会被处理）。
+
+    按配方导入之后多了几条：
+    - 开头先让过期的暂存区过期（expire_stagings 的同一套处理）；
+    - 原件的保护集合并上未结束暂存区的原件（被拒收、正在修改的那份不能删），以及配方源最近
+      RECIPE_RAW_KEEP 次导入的原件（被替换、构建已回收的也留着原件，重放要用）；
+    - 已结束的暂存区留下的原件没人要了就删，留下的试运行库也删（放弃、删源时没来得及删的）。
     """
-    async with _store_lock():
+    async with store_lock():
+        await _expire_stagings_locked(session, utcnow())
         referenced: set[str] = set()
         for (versions,) in (await session.execute(select(Run.data_versions))).all():
             referenced |= _snapshots_in(versions)
@@ -857,6 +1303,17 @@ async def gc(session: AsyncSession) -> None:
         kept_builds = {i.build_id for i in imports if i.id in kept_imports}
         kept_raw = {i.raw_sha256 for i in imports
                     if i.id in kept_imports and i.raw_state == "kept" and i.raw_sha256}
+        kept_raw |= _recent_recipe_raws(imports, {
+            sid for (sid,) in (await session.execute(
+                select(DataSource.id).where(DataSource.current_recipe_id.is_not(None))
+            )).all()
+        })
+        stagings = (await session.execute(
+            select(ImportStaging.id, ImportStaging.status, ImportStaging.raw_sha256)
+        )).all()
+        open_raw = {sha for (_sid, status, sha) in stagings if status in STAGING_OPEN and sha}
+        closed_stagings = {sid for (sid, status, _sha) in stagings if status in STAGING_CLOSED}
+        kept_raw |= open_raw
         build_paths = {b.db_path for b in builds}
 
         now = utcnow()
@@ -889,6 +1346,10 @@ async def gc(session: AsyncSession) -> None:
                 imp.purged = {"at": now.isoformat(), "reason": "版本已回收，原件随之删除",
                               "signed_by": None, "auto": True}
                 raws.add(imp.raw_sha256)
+        # 已结束的暂存区引用过的原件：没有导入记录留着它、也没有未结束的暂存区要它，就是没人要了
+        still_kept = {i.raw_sha256 for i in imports if i.raw_state == "kept" and i.raw_sha256} | open_raw
+        raws |= {sha for (_sid, status, sha) in stagings
+                 if status in STAGING_CLOSED and sha and sha not in still_kept}
         await session.commit()
 
         def _delete() -> None:
@@ -897,6 +1358,11 @@ async def gc(session: AsyncSession) -> None:
                     _delete_store_file(path)
             for sha in raws:
                 raw_store.purge_raw(sha, prune=True)
+            # 只删「暂存区已结束」的试运行库。暂存区不存在的不在这里删：上传新一期可能先试运行、后写暂存区，
+            # 发布后的回收撞上这个空档会删掉正要登记的库；这类孤儿留给启动清理（那时没有请求在跑）
+            for path in _trial_files():
+                if _trial_owner(path) in closed_stagings:
+                    _remove_db_files(path)
 
         await asyncio.to_thread(_delete)
     # 被删掉文件的快照可能还有引擎开着文件句柄：已删除的文件要等句柄关了才真正释放空间
@@ -907,6 +1373,40 @@ async def gc(session: AsyncSession) -> None:
 # --------------------------------------------------------------------------
 # 启动：清理半成品、迁移老上传、回收
 # --------------------------------------------------------------------------
+
+
+def _recent_recipe_raws(imports: list[TableImport], recipe_sources: set[str]) -> set[str]:
+    """配方源最近 RECIPE_RAW_KEEP 次导入（按 seq，不论状态）还留着的原件。"""
+    by_source: dict[str, list[TableImport]] = {}
+    for imp in imports:
+        if imp.source_id in recipe_sources:
+            by_source.setdefault(imp.source_id, []).append(imp)
+    kept: set[str] = set()
+    for items in by_source.values():
+        items.sort(key=lambda i: i.seq or 0, reverse=True)
+        kept |= {i.raw_sha256 for i in items[:RECIPE_RAW_KEEP] if i.raw_state == "kept" and i.raw_sha256}
+    return kept
+
+
+def _trial_files() -> list[Path]:
+    root = tables_root()
+    return sorted(root.glob(f"*/{TRIALS_DIR}/*.db")) if root.is_dir() else []
+
+
+def _trial_owner(path: Path) -> str:
+    """试运行库文件名里的暂存区 id（<暂存区 id>-<trial_key 前 16 位>.db）。
+
+    从右边切：trial_key 只有字母数字，暂存区 id 却可以带「-」。从左边切会把 stg-1 认成 stg，
+    启动清理就把一个开着的暂存区的库当孤儿删掉，回收也认不出已结束的暂存区。
+    """
+    return path.name.removesuffix(".db").rsplit("-", 1)[0]
+
+
+def _same_path(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (OSError, ValueError):
+        return False
 
 
 def _sweep_tmp() -> int:
@@ -930,6 +1430,17 @@ async def _sweep_orphans(session: AsyncSession) -> None:
             select(TableImport.raw_sha256).where(TableImport.raw_state == "kept")
         )).all() if sha
     }
+    rows = (await session.execute(
+        select(ImportStaging.id, ImportStaging.status, ImportStaging.trial_path, ImportStaging.raw_sha256)
+    )).all()
+    staging_rows = {sid: (status, trial_path) for (sid, status, trial_path, _sha) in rows}
+    # 未结束的暂存区引用的原件没有导入记录记着，不并进来就会被当成孤儿删掉
+    kept_raw |= {sha for (_sid, status, _path, sha) in rows if status in STAGING_OPEN and sha}
+
+    def _stale_trial(path: Path) -> bool:
+        """试运行库：暂存区不在、已结束、或者它指着的不是这个文件，就是孤儿。"""
+        row = staging_rows.get(_trial_owner(path))
+        return row is None or row[0] not in STAGING_OPEN or not row[1] or not _same_path(row[1], path)
 
     def _sweep() -> list[Path]:
         orphans: list[Path] = []
@@ -943,12 +1454,13 @@ async def _sweep_orphans(session: AsyncSession) -> None:
             for path in raw_root.glob("*/*"):
                 if path.is_file() and path.name not in kept_raw and _TMP not in path.name:
                     orphans.append(path)
+        orphans.extend(path for path in _trial_files() if _stale_trial(path))
         for path in orphans:
             _remove_db_files(path)
         # 空目录：被拒收的新源留下的 tables/<源 id>/builds/、清除原件后的 raw/<前两位>/。
         # 启动时持着锁、还没开始接请求，删了也不会和正在写的发布撞上（发布会按需重建目录）
         if root.is_dir():
-            for builds in root.glob("*/builds"):
+            for builds in [*root.glob("*/builds"), *root.glob(f"*/{TRIALS_DIR}")]:
                 if builds.is_dir() and raw_store.remove_empty_dir(builds):
                     orphans.append(builds)
             for folder in root.iterdir():

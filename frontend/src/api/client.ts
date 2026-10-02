@@ -1,4 +1,7 @@
 import type {
+  AiPreview, CommitOut, CurrentRecipe, QuestionAnswer, Recipe, Staging,
+} from '../types'
+import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
   EvidenceAudit, EvidenceJudgeResult, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
@@ -550,6 +553,48 @@ export const api = {
     /** 一张表的结构，带结构化的列信息，不用再去解析 detail 文本 */
     tableSchema: (id: string, table: string) =>
       get<TableSchema>(`/datasources/${id}/schema?table=${encodeURIComponent(table)}`),
+  },
+
+  /**
+   * 按配方导入（期 2）。暂存区（staging）是一次还没提交的导入：起草、回答问题、改配方、试运行都在它上面做，
+   * 提交（commit）成功之前不动数据源的当前版本。错误按 ApiError.code 分支（staging_closed、trial_required……）
+   */
+  tableImports: {
+    /** 选文件开始一次导入（首次，或同名的简单导入切换为按配方导入）。带字节进度 */
+    stage: (file: File, body: { name: string; description?: string }, opts?: UploadOptions) => {
+      const form = new FormData()
+      form.append('file', file)
+      form.append('name', body.name)
+      form.append('description', body.description ?? '')
+      return upload<Staging>('/datasources/imports/stage', form, opts)
+    },
+    get: (id: string) => get<Staging>(`/datasources/imports/${encodeURIComponent(id)}`),
+    /** 已选的全部回答（服务端从起点配方按问题顺序重放）。needs_reason 的选项要带 reason */
+    answers: (id: string, answers: Record<string, QuestionAnswer>) =>
+      post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/answers`, { answers }),
+    /** 整份配方替换工作配方：有静态校验问题也照存，只是不能试运行；已选的回答清空 */
+    putRecipe: (id: string, recipe: Recipe) =>
+      put<Staging>(`/datasources/imports/${encodeURIComponent(id)}/recipe`, { recipe }),
+    /** 将要发给模型的全文（同意框里给人看的就是这一份） */
+    draftAiPreview: (id: string) => get<AiPreview>(`/datasources/imports/${encodeURIComponent(id)}/draft-ai/preview`),
+    /** 用户同意后才调：preview_sha256 与服务端重算的不一致时回 409 ai_preview_stale */
+    draftAi: (id: string, previewSha256: string) =>
+      post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/draft-ai`, { consent: true, preview_sha256: previewSha256 }),
+    trial: (id: string, body: { context_inputs?: Record<string, { start: string; end: string }>; signed_by?: string | null } = {}) =>
+      post<Staging>(`/datasources/imports/${encodeURIComponent(id)}/trial`, body),
+    commit: (id: string, body: {
+      trial_id: string; confirmations: string[]; acceptances: { check_id: string; reason: string }[]; signed_by?: string | null
+    }) => post<CommitOut>(`/datasources/imports/${encodeURIComponent(id)}/commit`, body),
+    discard: (id: string) => del(`/datasources/imports/${encodeURIComponent(id)}`),
+    /** 上传新一期：按当前配方自动试运行，回来时已带回执和差异卡。带字节进度 */
+    reupload: (sourceId: string, file: File, opts?: UploadOptions) => {
+      const form = new FormData()
+      form.append('file', file)
+      return upload<Staging>(`/datasources/${encodeURIComponent(sourceId)}/reupload`, form, opts)
+    },
+    /** 修改配方（不换文件）：用当前导入的原件、以当前配方为工作配方 */
+    redraft: (sourceId: string) => post<Staging>(`/datasources/${encodeURIComponent(sourceId)}/redraft`, {}),
+    recipe: (sourceId: string) => get<CurrentRecipe>(`/datasources/${encodeURIComponent(sourceId)}/recipe`),
   },
 
   runs: {

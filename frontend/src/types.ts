@@ -234,6 +234,12 @@ export interface DataSource extends ServerHealth {
   origin?: 'upload' | 'manual' | (string & {})
   /** 上传表格当前启用的版本。手工登记的源恒为 null */
   current_snapshot?: CurrentSnapshot | null
+  /** simple 简单导入；recipe 按配方导入；手工登记的源为 null。老后端没有这个字段 */
+  import_mode?: 'simple' | 'recipe' | null
+  /** 按配方导入的源当前启用的配方 */
+  current_recipe?: { id: string; seq: number; origin: string; activated_at: string | null; signed_by: string | null } | null
+  /** 这个源最近一个未结束的导入（按配方导入的暂存区） */
+  open_staging?: { id: string; kind: ImportStagingKind; status: ImportStagingStatus; created_at: string } | null
 }
 
 /** 上传表格当前启用的版本（DataSource.current_snapshot） */
@@ -329,6 +335,315 @@ export interface UploadResult {
   conversions?: UploadConversion[]
   warnings?: string[]
   tables: UploadedTable[]
+}
+
+// ---------------------------------------------------------------------------
+// 按配方导入（期 2：/api/datasources/imports/*、/{id}/reupload|redraft|recipe）
+// 字段与后端 recipe_types.py 的 dataclass 同名；后端多出来的字段界面不认也不报错
+// ---------------------------------------------------------------------------
+
+/** first 首次导入；reupload 上传新一期；redraft 修改配方（不换文件）；switch 从简单导入切换 */
+export type ImportStagingKind = 'first' | 'reupload' | 'redraft' | 'switch' | (string & {})
+export type ImportStagingStatus = 'drafting' | 'trialed' | 'rejected' | 'committed' | 'discarded' | 'expired' | (string & {})
+
+/**
+ * 配方 JSON（agentlab-recipe/2）。结构由服务端的静态校验把关，界面只按已知字段读写，所以这里是宽松类型：
+ * 表单改哪个字段就按路径写哪个字段，整份经 PUT recipe 交给服务端
+ */
+export type Recipe = Record<string, any>
+
+/** 配方静态校验的问题：path 是 JSON Pointer（如 /tables/0/units/客流），message 是整句人话 */
+export interface RecipeProblem {
+  path: string
+  code: string
+  message: string
+}
+
+/** structure 结构问题；data_quality 数据质量；confirm 需确认；input 需要录入；recipe 配方不合法 */
+export type ImportProblemCategory = 'structure' | 'data_quality' | 'confirm' | 'input' | 'recipe' | (string & {})
+
+/** 干跑、试运行的问题（契约 Problem）。cells 是「工作表!A1」或「工作表!A1:B2」，最多 20 个 */
+export interface ImportProblem {
+  code: string
+  category: ImportProblemCategory
+  message: string
+  cells?: string[]
+  fix?: string | null
+}
+
+export type CheckStatus = 'passed' | 'mismatch' | 'unverifiable' | 'info' | (string & {})
+
+/** 一条核对的结果（契约 CheckResult）。acceptable：可以写理由接受 */
+export interface CheckResult {
+  id: string
+  kind: string
+  title: string
+  status: CheckStatus
+  category: 'structure' | 'data_quality' | 'info' | (string & {})
+  checked?: number
+  failed?: number
+  unverifiable?: number
+  sql?: string | null
+  params?: unknown[]
+  details?: string[]
+  cells?: string[]
+  acceptable?: boolean
+  reasons?: Record<string, number>
+}
+
+/** 启用前要逐条勾选的一项（契约 ConfirmItem；id 的取值见 P2-SPEC 7.5） */
+export interface ConfirmItem {
+  id: string
+  label: string
+  detail?: string
+  required?: boolean
+  source?: string
+}
+
+/** 上传新一期与上一期相比的一条差异（契约 DiffItem） */
+export interface DiffItem {
+  kind: string
+  label: string
+  detail?: string
+  requires_confirm?: boolean
+  confirm_id?: string | null
+}
+
+/** 建议卡片：一条建议加一句理由，指向网格上的格子 */
+export interface Card {
+  id: string
+  title: string
+  reason: string
+  cells?: string[]
+  /** 对应的待确认问题（Question.id） */
+  question?: string | null
+}
+
+export interface QuestionOption {
+  value: string
+  label: string
+  /** 选它时必须写理由（如「不登记」） */
+  needs_reason?: boolean
+}
+
+/** 待确认问题：只有封闭的选项；选项对配方的修改由服务端应用，界面只发选了哪一项 */
+export interface Question {
+  id: string
+  text: string
+  options: QuestionOption[]
+  default?: string | null
+}
+
+/** 已选的回答（StagingOut.answers 的值） */
+export interface QuestionAnswer {
+  value: string
+  reason?: string | null
+}
+
+/** 规则或 AI 起草的结果（契约 Draft，不含给模型看的那份原因） */
+export interface Draft {
+  recipe: Recipe | null
+  complete: boolean
+  origin: 'rules' | 'ai' | (string & {})
+  cards?: Card[]
+  questions?: Question[]
+  failures?: string[]
+}
+
+/** 一次模型调用的用量 */
+export interface AiUsage {
+  model: string
+  input_tokens: number
+  output_tokens: number
+  cost_usd: number
+  ok: boolean
+  at: string
+  attempt?: number
+}
+
+/** 一张可见工作表的原始网格预览 */
+export interface GridPreview {
+  sheet: string
+  bounds: string | null
+  total_rows?: number
+  total_cols?: number
+  /** 预览只取了前面的部分 */
+  truncated?: boolean
+  rows?: number[]
+  cols?: number[]
+  /** [行, 列, 显示文字, 种类]；种类：text / number / date / bool / error / formula / formula_uncached */
+  cells: [number, number, string, string][]
+  /** A1 → 公式原文 */
+  formulas?: Record<string, string>
+  merges?: string[]
+  hidden_rows?: number[]
+  hidden_cols?: number[]
+}
+
+/** 格子的去向（契约 Role），按区域给出 */
+export interface RegionMark {
+  sheet: string
+  role: string
+  ref: string
+}
+
+/** 格子账：每张工作表的非空格和各去向的个数 */
+export interface LedgerSheet {
+  sheet: string
+  nonempty_scan: number
+  nonempty_read: number
+  roles?: Record<string, number>
+  unclaimed?: number
+}
+
+export interface ReceiptTable {
+  name: string
+  sheet: string
+  kind: 'data' | 'reported_total' | (string & {})
+  columns: { name: string; type: string; header?: string | null; unit?: string | null; role?: string }[]
+  grain: string[]
+  rows: number
+  sources?: string[]
+}
+
+export interface PeriodOut {
+  start: string
+  end: string
+  source: 'cells' | 'human' | (string & {})
+  cells?: string[]
+  signed_by?: string | null
+  texts?: Record<string, string>
+  annotated?: Record<string, string>
+}
+
+export interface OutsideText {
+  sheet: string
+  /** 带工作表名的坐标「工作表!A1」（与问题的 cells 同一写法） */
+  cell: string
+  text: string
+  kind: 'text' | 'text_digits' | (string & {})
+  period_source?: boolean
+}
+
+/** 试运行回执（Extraction 去掉问题和核对之后给界面看的部分） */
+export interface TrialReceipt {
+  ledger?: LedgerSheet[]
+  tables?: ReceiptTable[]
+  period?: PeriodOut | null
+  placeholders?: Record<string, number>
+  outside_text?: OutsideText[]
+  canonicalized_total?: number
+  blank_rows_skipped?: number
+  formula_cells_accepted?: number
+  full_calc_on_load?: boolean
+  db_sha256?: string
+  [key: string]: any
+}
+
+/** passed 通过；needs_input 需要录入统计期；needs_decision 有可接受的核对待写理由；rejected 拒收 */
+export type TrialStatus = 'passed' | 'needs_input' | 'needs_decision' | 'rejected' | (string & {})
+
+/** 最近一次试运行（StagingOut.trial） */
+export interface TrialOut {
+  trial_id: string
+  status: TrialStatus
+  receipt: TrialReceipt
+  problems: ImportProblem[]
+  checks: CheckResult[]
+  confirm_items: ConfirmItem[]
+  /** 可以写理由接受、本次未通过的核对 id */
+  acceptable: string[]
+  /** 表 → 说明预览 */
+  notes?: Record<string, { comment: string; columns?: Record<string, string> }>
+  diff?: DiffItem[] | null
+  same_as_import?: { id: string; seq: number } | null
+  base_snapshot_id?: string | null
+}
+
+/** AI 起草的结果摘要 */
+export interface AiDraftSummary {
+  draft: Draft | null
+  usage?: AiUsage[]
+  attempts?: number
+  total_tokens?: number
+  cost_usd?: number
+  error?: string | null
+}
+
+/** 暂存区（一次未提交的按配方导入）：GET /imports/{id} 等接口的返回 */
+export interface Staging {
+  id: string
+  kind: ImportStagingKind
+  status: ImportStagingStatus
+  source: { id: string; name: string; exists: boolean; import_mode: 'simple' | 'recipe' | null }
+  file: { name: string; size: number; sha256_prefix: string }
+  sheets?: {
+    name: string; state: string; bounds: string | null; nonempty: number; merged?: number
+    formulas?: number; formulas_uncached?: number; hidden_rows?: number; hidden_cols?: number
+  }[]
+  skipped_sheets?: { sheet: string; state: string }[]
+  full_calc_on_load?: boolean
+  grids: GridPreview[]
+  draft: Draft | null
+  ai_draft: AiDraftSummary | null
+  /** offered：这次导入提供 AI 起草入口；available：模型接入可用 */
+  ai: { offered: boolean; available: boolean; reason?: string; model?: string; provider?: string }
+  ai_consents?: { signed_by: string | null; at: string; model: string; compressed_sha256: string; chars: number }[]
+  recipe: Recipe | null
+  recipe_origin?: string | null
+  recipe_problems: RecipeProblem[]
+  answers: Record<string, QuestionAnswer>
+  cards: Card[]
+  questions: Question[]
+  draft_problems: ImportProblem[]
+  /** 干跑只检查了每张工作表的前若干行 */
+  draft_partial: boolean
+  /** 分段标题原文 → 常量可选的词 */
+  candidates: Record<string, string[]>
+  /** 单位词表 */
+  units: string[]
+  marks: RegionMark[]
+  trial: TrialOut | null
+  context_inputs?: Record<string, { start: string; end: string; signed_by?: string | null }>
+  created_at?: string
+  updated_at?: string
+  expires_at?: string
+}
+
+/** GET draft-ai/preview：将要发给模型的压缩表示原文 */
+export interface AiPreview {
+  text: string
+  chars: number
+  /** 同意令牌：绑定全文、接入名和模型 id，POST draft-ai 原样带回（三者任一变了服务端回 409 ai_preview_stale） */
+  sha256: string
+  /** 全文本身的 sha256（留痕用） */
+  text_sha256?: string
+  model: string
+  provider: string
+}
+
+/** POST imports/{id}/commit 的返回 */
+export interface CommitOut {
+  source: DataSource
+  import_id: string
+  snapshot_id: string
+  build_id: string
+  recipe_id: string
+  build_reused: boolean
+  /** 与某次导入完全相同，未新建版本 */
+  unchanged: boolean
+}
+
+/** GET /{source_id}/recipe：当前启用的配方（补全了默认值） */
+export interface CurrentRecipe {
+  recipe_id: string
+  seq: number
+  origin: string
+  recipe: Recipe
+  recipe_sha256: string
+  confirmations: { id: string; label: string; at: string }[]
+  signed_by: string | null
+  activated_at: string | null
 }
 
 /** 自定义工具（GET /api/custom-tools 的一行；POST / PATCH 的返回同形） */

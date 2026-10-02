@@ -499,6 +499,9 @@ def _table_lines(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch,
         if info.get("comment") == UNSHAPED_NOTE:
             # 上传时选了「按原样导入（未规整）」：对这张表的列直接求和得出的数，裁判要知道它不可靠（R4、D16）
             lines.append(f"表的说明：{UNSHAPED_NOTE}")
+        elif info.get("kind") == "reported_total":
+            # 按配方导入另存的「原表写明的合计」：各合计项可能重叠，相加得出的数不可靠（AU-5）
+            lines.append("表的说明：原表写明的合计，各合计项可能互相重叠，不要彼此相加，也不要与明细相加")
     if truncated:
         lines.append("注意：表结构快照不完整（数据源的表太多，只保存了一部分），不能据此断定某张表或某个字段不存在")
     return lines
