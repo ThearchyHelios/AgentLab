@@ -37,6 +37,11 @@ const fxj = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-
 // 文档由 compose_doc 真跑、证据链由 api/evidence.py 的 _chain 真跑；判定和表名实体步骤的 fields 照前后端接口约定写
 const fxv = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-verdict.json`, 'utf8'))
 const JUDGE_SETS = [fxj.formal, fxj.explore, fxj.plain, fxv.formal, fxv.explore]
+// Excel 导入期 4：推断的来源。文档由 compose_doc 真跑（带文档标记），片段答复由 _chain 真跑，推断来源的答复按契约
+// （backend/app/data/provenance_types.py）拼；cases 写明每个场景是哪个片段、片段文字、覆盖 P4-SPEC 4.4 的哪几条
+const fxp = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-provenance.json`, 'utf8'))
+/** 推断来源夹具里各期导入清单的工件 id：夹具只收了两份清单，其余的按「工件不存在」答，不落到真服务端 */
+const FXP_MANIFESTS = new Set(Object.values(fxp.provenance).flatMap((a) => a.version?.parts ?? []).map((p) => p.manifest))
 /** 夹具里某段文字是哪个片段：检查按文字认片段，重新生成夹具时编号变了也不用改 */
 const segOf = (doc, text) => doc.blocks.flatMap((b) => b.units.flatMap((u) => u.segments)).find((s) => s.text === text)?.id
 
@@ -75,12 +80,18 @@ function judgeReply(set, body) {
 /**
  * 伪造证据相关的 GET；片段请求记账（缓存：同一个片段点两次只取一次）。四期：按需裁判的 POST 也在这里认
  * （记进 hits 的 judge:<运行>:<句子>），别的非 GET 一律拦掉。judge 给了就用它答（改坏验证、触顶、出错）；
- * segPatch 给了就改片段接口的答复（比如 on_demand 说运行还没封存）
+ * segPatch 给了就改片段接口的答复（比如 on_demand 说运行还没封存）。
+ *
+ * Excel 导入期 4：推断来源接口（…/segments/<id>/provenance）在片段正则之前单独认，不分运行、不分夹具，一律记成
+ * prov:<运行>:<片段>——片段正则以 $ 结尾认不出它，落到 r.continue() 会得到一个没有机读码的 404，界面按「老服务端」
+ * 三节都不画，只看 DOM 的断言不论前端发没发请求都会过。推断来源夹具的运行按 provenance[<片段>] 作答，其余一律回
+ * 可识别的哨兵（418，harness_unexpected_provenance），界面会画出「未能获取推断的来源」。prov 给了就由它改答复
+ * （prov(运行, 片段, 默认答复) → {status?, json} 或它的 Promise：延迟、出错、老服务端）
  */
-async function routed(page, { judge = null, segPatch = null } = {}) {
+async function routed(page, { judge = null, segPatch = null, prov = null } = {}) {
   const hits = []
   const judged = new Set()
-  await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
+  await page.route((u) => new URL(u).pathname.startsWith('/api/'), async (r) => {
     const req = r.request()
     const url = new URL(req.url())
     const jset = JUDGE_SETS.find((x) => url.pathname.includes(`/runs/${x.run_id}/`) || url.pathname.endsWith(`/runs/${x.run_id}`))
@@ -92,6 +103,33 @@ async function routed(page, { judge = null, segPatch = null } = {}) {
       return r.fulfill({ status: reply.status ?? 200, json: reply.json })
     }
     if (req.method() !== 'GET') return r.abort()
+    const pm = url.pathname.match(/\/api\/runs\/([^/]+)\/evidence\/segments\/([^/]+)\/provenance$/)
+    if (pm) {
+      const [run, sid] = [decodeURIComponent(pm[1]), decodeURIComponent(pm[2])]
+      hits.push(`prov:${run}:${sid}`)
+      const own = run === fxp.run_id && fxp.provenance[sid]
+      let reply = own ? { json: structuredClone(own) } : fxp.errors.unexpected
+      if (prov) reply = await prov(run, sid, reply)
+      return r.fulfill({ status: reply.status ?? 200, json: reply.json })
+    }
+    if (url.pathname.includes(`/runs/${fxp.run_id}/`)) {
+      const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+      if (seg) {
+        const id = decodeURIComponent(seg[1])
+        hits.push(`p:${id}`)
+        const body = fxp.segments[id]
+        return body ? r.fulfill({ json: structuredClone(body) })
+          : r.fulfill({ status: 404, json: { detail: '报告中没有这个片段', code: 'evidence_segment_not_found' } })
+      }
+      if (/\/evidence$/.test(url.pathname)) return r.fulfill({ json: fxp.graph })
+    }
+    // 「查看导入清单」按清单的工件 id 取（内容寻址）
+    const art = url.pathname.match(/^\/api\/artifacts\/([^/]+)$/)?.[1]
+    if (art && fxp.artifacts[art]) {
+      hits.push(`artifact:P:${art}`)
+      return r.fulfill({ json: fxp.artifacts[art] })
+    }
+    if (art && FXP_MANIFESTS.has(art)) return r.fulfill({ status: 404, json: { detail: '工件不存在' } })
     // 四期的报告工件：问数据页的答案（Output → EvidenceField）按工件 id 取文档
     const jart = JUDGE_SETS.find((x) => url.pathname === `/api/artifacts/${x.doc_artifact}`)
     if (jart) return r.fulfill({ json: { id: jart.doc_artifact, content: jart.doc } })
@@ -144,14 +182,14 @@ async function routed(page, { judge = null, segPatch = null } = {}) {
   return hits
 }
 
-async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null, judge = null, segPatch = null } = {}) {
+async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null, judge = null, segPatch = null, prov = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width: w, height: h }, ...(reduced ? { reducedMotion: 'reduce' } : {}) })
   const page = await ctx.newPage()
   // 找不到元素时 8 秒就报，不等默认的 30 秒：改坏验证时一节里十几处都找不到
   page.setDefaultTimeout(8000)
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
-  const hits = await routed(page, { judge, segPatch })
+  const hits = await routed(page, { judge, segPatch, prov })
   // 预览页直接 import 第二期夹具（vite 把 JSON 当模块给）：要一份改过的文档时把那个模块换掉
   if (patchQuery) {
     await page.route((u) => new URL(u).pathname.endsWith('/run/__tests__/evidence-query.json'), (r) =>
@@ -742,6 +780,12 @@ await section('query', '查询步骤：SQL 带复制、被引用的行和格高�
     return !!note && !!seal && !!(seal.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING)
   }))
   check('查询快照复验通过时不多说一句', await panel(page).locator('[data-ev-integrity]').count() === 0)
+  // Excel 导入期 4 之前的报告：查询步骤不带推断来源的提示，前端一个请求都不多发、三节都不画（P4-SPEC 4.4 第 14 条）。
+  // 断言请求记账，不只看 DOM：老服务端那种 404 也会让三节不画
+  check('期 4 之前的报告（查询步骤没有提示）：不请求推断的来源，面板里没有数据版本、推断的来源',
+    !harness.hits.some((h) => h.startsWith('prov:'))
+    && await panel(page).locator('[data-ev-provenance], [data-ev-prov-version], [data-ev-prov-checks]').count() === 0,
+    harness.hits.filter((h) => h.startsWith('prov:')).join(','))
   const aria = await page.locator(`${Q} [data-seg="${qseg('1,288')}"]`).getAttribute('aria-label')
   check('单元格的 aria-label 写明查询、第几行、哪一列', aria === '1,288，有出处：查询 Q3 · 第 6 行 · amount', aria)
 
@@ -2492,6 +2536,419 @@ await section('jr-banner', '裁判拆档：出具横幅的结论句计数带上�
     }
     await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
   }
+})
+
+// ---------------------------------------------------------------------------
+// Excel 导入期 4：推断的来源（夹具 evidence-provenance.json，P4-SPEC 4.4）
+// ---------------------------------------------------------------------------
+const PV = '#evidence-provenance'
+const PVN = '#evidence-provenance-narrow'
+/** 场景的片段 id：按夹具 cases 里记的片段文字认，重新生成夹具后编号挪了也不用改 */
+const pseg = (name) => segOf(fxp.doc, fxp.cases[name].text)
+/** 这个场景的片段请求过几次推断来源 */
+const provHits = (hits, name) => hits.filter((h) => h === `prov:${fxp.run_id}:${pseg(name)}`).length
+/** 点开一个场景，等推断的来源那一节定下来（不再是「正在推断」）；不该有这一节的场景改等查询步骤、指标步骤 */
+async function openP(p, name, { box = PV, wait = '[data-ev-provenance]:not([data-ev-provenance="loading"])' } = {}) {
+  await p.locator(`${box} [data-seg="${pseg(name)}"]`).click()
+  await p.waitForSelector(`[data-evidence-panel] ${wait}`, { timeout: 4000 }).catch(() => {})
+  await p.waitForTimeout(120)
+}
+const pv = (p, sel = '') => p.locator(`[data-evidence-panel] ${sel}`)
+/** 元素的文字（空白合成一个空格）；没有这个元素时是空串 */
+const textOf = async (loc) => ((await loc.count()) ? (await loc.first().innerText()).replace(/\s+/g, ' ').trim() : '')
+const fromOf = (p) => p.locator('[data-evidence-panel] [data-ev-provenance] [data-ev-prov-from] li').allInnerTexts()
+const partsOf = (p) => p.locator('[data-evidence-panel] [data-ev-prov-version] [data-ev-prov-part]')
+  .evaluateAll((els) => els.map((e) => `${e.getAttribute('data-ev-prov-part')}${e.hasAttribute('data-ev-prov-has-row') ? '*' : ''}`))
+/** 只给表级来历的场景：table_only、一句原因、没有格子和相关核对、数据版本照样有 */
+async function tableOnly(p, name, want, what) {
+  await openP(p, name)
+  const reason = await textOf(pv(p, '[data-ev-provenance="table_only"] [data-ev-prov-reason]'))
+  check(what, (typeof want === 'string' ? reason === want : want.test(reason))
+    && await pv(p, '[data-ev-prov-cell], [data-ev-prov-checks], [data-ev-prov-alert]').count() === 0
+    && await pv(p, '[data-ev-prov-version]').count() === 1, reason)
+}
+const noSections = async (p) => (await pv(p, '[data-ev-provenance], [data-ev-prov-version], [data-ev-prov-checks]').count()) === 0
+const activeHas = (p, attr) => p.evaluate((a) => document.activeElement?.hasAttribute(a) ?? false, attr)
+
+await section('provenance', '期 4：推断的来源——数据版本、格子与逐条、相关核对，只在上传表格的单元格上请求', async () => {
+  const ids = Object.fromEntries(Object.keys(fxp.cases).map((k) => [k, pseg(k)]))
+  check('夹具的场景都能按片段文字认出来（和 cases 记的编号一致）', Object.entries(fxp.cases).every(([k, c]) => ids[k] === c.segment),
+    JSON.stringify(ids))
+  // 前面各节点开的都是期 4 之前的报告、没有提示的查询步骤：一个推断来源请求都不该有（4.4 第 14 条的全局版）
+  const stray = harness.hits.filter((h) => h.startsWith('prov:'))
+  check('其他夹具（期 4 之前的报告）点开过的片段一个推断来源请求都没发', stray.length === 0, stray.join(','))
+
+  // ---- 1. 宽表的一格：格子、逐条、相关核对、位置、标题
+  await openP(page, 'wide')
+  const sec = pv(page, '[data-ev-provenance="inferred"]')
+  check('满足条件：有「推断的来源」一节（inferred）', await sec.count() === 1, String(await pv(page, '[data-ev-provenance]').getAttribute('data-ev-provenance').catch(() => null)))
+  check('……标题「推断的来源」，旁边标「推断，不属于已封存的证据」', await textOf(sec.locator('h4')) === '推断的来源'
+    && await textOf(sec.locator('[data-ev-prov-badge]')) === '推断，不属于已封存的证据')
+  const cell = await textOf(sec.locator('[data-ev-prov-cell]'))
+  check('……第一行醒目地写格子：工作表「客流汇总」G5', cell === '工作表「客流汇总」G5', cell)
+  const items = await fromOf(page)
+  check('……逐条：日期取自表头格 G4 → 年份取自统计期 → 行标签 B5（指标名）', items.join('|')
+    === '日期取自表头格 G4|年份取自统计期（客流汇总!B2）|行标签 B5「全日客流（人次）」', items.join('|'))
+  check('相关核对：R1「这一行成立」', (await textOf(pv(page, '[data-ev-prov-checks] [data-ev-prov-check="R1"]'))).includes('这一行成立'))
+  // 规格 4.1 的散文写「口径说明：…」；R2 的标题本身是「口径不同：…」，再套一层冒号读不顺，所以和别的核对同一种
+  // 写法「R2 标题 — 口径说明」（口径说明是 4.2 partStatus.info 的原文）。改写法要连同 CheckRow 一起改
+  check('……口径不同（R2）只写口径说明，不判行', (await textOf(pv(page, '[data-ev-prov-check="R2"]'))).endsWith('— 口径说明')
+    && await pv(page, '[data-ev-prov-check="R2"][data-ev-prov-row]').count() === 0)
+  const order = await page.evaluate(() => {
+    const p = document.querySelector('[data-evidence-panel]')
+    const q = p?.querySelector('[data-ev-query]')
+    const seq = ['[data-ev-prov-version]', '[data-ev-provenance]', '[data-ev-prov-checks]', '[data-ev-judge]', '[data-ev-seal]']
+      .map((s) => p?.querySelector(s)).filter(Boolean)
+    if (!q || seq.length < 4) return `缺：${seq.length}`
+    let prev = q
+    for (const el of seq) {
+      if (!(prev.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return `顺序不对：${el.outerHTML.slice(0, 60)}`
+      prev = el
+    }
+    return 'ok'
+  })
+  check('三节在查询步骤之后、结论句裁判和封存之前：数据版本 → 推断的来源 → 相关核对', order === 'ok', order)
+  const heads = await Promise.all(['数据版本', '推断的来源', '相关核对']
+    .map((name) => panel(page).getByRole('heading', { name, exact: true }).evaluateAll((els) => els.map((e) => e.tagName).join(','))))
+  check('三节的标题都是真正的标题（getByRole heading，h4）', heads.every((t) => t === 'H4'), heads.join(' | '))
+  check('推断的来源用虚线左边框，和其余几节区分', await sec.evaluate((el) => getComputedStyle(el).borderLeftStyle) === 'dashed')
+  check('相关核对也挂「推断」标签；数据版本来自封存链上的清单，不挂', await pv(page, '[data-ev-prov-checks] [data-ev-prov-badge]').count() === 1
+    && await pv(page, '[data-ev-prov-version] [data-ev-prov-badge]').count() === 0)
+  check('封存那一行照旧只按片段接口的链算：「已封存 · 核对一致」', (await textOf(pv(page, '[data-ev-seal]'))).includes('已封存 · 核对一致'))
+  const integrityBase = await pv(page, '[data-ev-integrity]').count()
+
+  const ver = pv(page, '[data-ev-prov-version]')
+  const vtext = await textOf(ver)
+  const p1 = fxp.provenance[ids.wide].version.parts[0]
+  check('数据版本：首行「数据源「flow_demo」· 每期替换」（每期替换不写期数）', await textOf(ver.locator('[data-ev-prov-head]')) === '数据源「flow_demo」· 每期替换',
+    vtext)
+  check('……每期一行：第几次导入 · 统计期；文件名、sha256 前 12 位、区域、原件状态、配方第几版',
+    vtext.includes('第 1 次导入 · 统计期 2026-08-01 至 2026-08-31') && vtext.includes(`文件「${p1.file_name}」· sha256 ${p1.raw_sha256.slice(0, 12)}`)
+    && !vtext.includes(p1.raw_sha256.slice(0, 13)) && vtext.includes('区域 客流汇总!B4:AG30') && vtext.includes('原件已保存')
+    && vtext.includes('配方第 1 版') && vtext.includes('涉及的表：日客流'), vtext)
+  check('……这一格所在的一期有标记；已封存的运行不写「尚未封存」', (await partsOf(page)).join(',') === '1*'
+    && vtext.includes('这一格所在的一期') && await ver.locator('[data-ev-prov-unsealed]').count() === 0)
+
+  const det = sec.locator('[data-ev-prov-details]')
+  check('末尾一行小字「已按主键回查数据文件，值一致」，回查 SQL 收在「技术细节」里（默认收起）',
+    await textOf(sec.locator('[data-ev-prov-recheck]')) === '已按主键回查数据文件，值一致'
+    && await det.getAttribute('aria-expanded') === 'false' && await sec.locator('[data-ev-prov-tech]').isHidden()
+    && await det.getAttribute('aria-controls') === await sec.locator('[data-ev-prov-tech]').getAttribute('id'))
+  await det.focus()
+  await page.keyboard.press('Enter')
+  const tech = await textOf(sec.locator('[data-ev-prov-tech]'))
+  check('……「技术细节」是按钮，回车展开：回查 SQL 和参数，带复制', await det.getAttribute('aria-expanded') === 'true'
+    && await sec.locator('[data-ev-prov-tech]').isVisible()
+    && tech.includes('SELECT rowid, "全日客流" FROM "日客流" WHERE "日期" = ?') && tech.includes('2026-08-05')
+    && await sec.locator('[data-ev-prov-tech] button', { hasText: '复制 SQL' }).count() === 1, tech)
+
+  // ---- 16、28：键盘打开导入清单，对话框是结构化的清单渲染，Esc 只关对话框
+  await pv(page, '[data-ev-query] [data-ev-query-head]').focus()
+  let reached = false
+  for (let i = 0; i < 30 && !reached; i++) {
+    await page.keyboard.press('Tab')
+    reached = await activeHas(page, 'data-ev-prov-manifest')
+  }
+  check('键盘：从查询步骤 Tab 走得到「查看导入清单」', reached)
+  const arts = harness.hits.filter((h) => h.startsWith('artifact:P:')).length
+  await page.keyboard.press('Enter')
+  await page.waitForSelector('[role="dialog"] [data-manifest-block]', { timeout: 4000 }).catch(() => {})
+  const dlg = page.locator('[role="dialog"]')
+  const dtext = await dlg.innerText().catch(() => '')
+  check('回车打开导入清单对话框，按清单的工件 id 经工件接口取', await dlg.count() === 1
+    && harness.hits.filter((h) => h.startsWith('artifact:P:')).length === arts + 1 && harness.hits.includes(`artifact:P:${p1.manifest}`)
+    && dtext.includes('第 1 次导入的导入清单'), dtext.slice(0, 80))
+  check('……正文是版本页的清单渲染（结构化区块），不是整份 JSON（展开的文字里没有键名 "acceptances"）',
+    await dlg.locator('[data-manifest-block]').count() >= 5 && !dtext.includes('"acceptances"') && dtext.includes(p1.file_name)
+    && await dlg.locator('[data-manifest-raw]').evaluate((el) => !el.open).catch(() => false), String(await dlg.locator('[data-manifest-block]').count()))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/evidence-p4-manifest-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+  check('Esc 只关清单对话框：证据面板还开着，焦点回到「查看导入清单」', await dlg.count() === 0 && await panel(page).count() === 1
+    && await activeHas(page, 'data-ev-prov-manifest'))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await panel(page).screenshot({ path: `${SHOTS}/evidence-p4-inferred-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+
+  // ---- 18：缓存只在面板这次打开期间有效
+  const c0 = provHits(harness.hits, 'wide')
+  await openP(page, 'wide')
+  await openP(page, 'long')
+  await openP(page, 'wide')
+  check('同一次打开里同一片段点两次，推断的来源只取一次', provHits(harness.hits, 'wide') === c0 + 1 && provHits(harness.hits, 'long') >= 1,
+    `${c0} → ${provHits(harness.hits, 'wide')}`)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+  check('……面板关掉了', await panel(page).count() === 0)
+  await openP(page, 'wide')
+  check('关闭面板再打开、再点同一片段：重新取（回答里有当前状态）', provHits(harness.hits, 'wide') === c0 + 2, String(provHits(harness.hits, 'wide')))
+
+  // ---- 2、3：长表的分段标题、全角标签的规范写法、合计表
+  await openP(page, 'long')
+  const longItems = await fromOf(page)
+  check('长表一格：分段标题 B9（按配方中的标题「…」定位），不说它是格子原文；行标签 B16「13-14」',
+    longItems.includes('分段标题 B9（按配方中的标题「日间时段客流（人次）」定位）') && longItems.includes('行标签 B16「13-14」'), longItems.join('|'))
+  await openP(page, 'fullwidth')
+  const fw = await fromOf(page)
+  check('全角标签那一期的维度列：原文「８－９」，按规范写法存为「8-9」', fw.includes('原文「８－９」，按规范写法存为「8-9」'), fw.join('|'))
+  await openP(page, 'total')
+  const tItems = await fromOf(page)
+  check('合计表一格：合计标签 B28「18-22 时合计」（原文），口径「原表写明的合计：不要彼此相加…」', tItems.includes('合计标签 B28「18-22 时合计」')
+    && tItems.includes('原表写明的合计：不要彼此相加，也不要与明细相加') && tItems.includes('原文「18-22 时合计」，按规范写法存为「18-22时合计」'),
+    tItems.join('|'))
+  check('……相关核对里 K1「这一格一致」', (await textOf(pv(page, '[data-ev-prov-check="K1"]'))).includes('这一格一致'))
+
+  // ---- 4：累积的两期
+  await openP(page, 'union')
+  const un = fxp.provenance[ids.union]
+  check('按期累积：首行写「按期累积 · 共 2 期」，两期都列出，第 2 期标「这一格所在的一期」',
+    await textOf(pv(page, '[data-ev-prov-head]')) === `数据源「${un.version.source}」· 按期累积 · 共 2 期`
+    && (await partsOf(page)).join(',') === '1,2*', (await partsOf(page)).join(','))
+  const ufrom = await textOf(pv(page, '[data-ev-prov-from-part]'))
+  check('……格子是第 2 期（9 月）文件的坐标', await textOf(pv(page, '[data-ev-prov-cell]')) === `工作表「${un.cell_source.sheet}」${un.cell_source.cell}`
+    && ufrom.includes('第 2 次导入') && ufrom.includes(un.version.parts[1].file_name), ufrom)
+
+  // ---- 5–8：只给表级来历
+  await tableOnly(page, 'alias', /改了名/, '改名：table_only，原因写「改了名」，没有格子，数据版本照样有')
+  await tableOnly(page, 'selfjoin', /同一张表多次/, '自连接：table_only，原因写「同一张表多次」')
+  await tableOnly(page, 'null', '这一格是空值，不推断来源', '空值：table_only，「这一格是空值，不推断来源」')
+  await tableOnly(page, 'aggregate', /计算、聚合/, '聚合：table_only，原因写「计算、聚合」')
+  check('……聚合的格子数据版本照样列出涉及的表', (await textOf(pv(page, '[data-ev-prov-tables]'))) === '涉及的表：日客流')
+
+  // ---- 9、10、21：标红
+  const failedColor = await tokenColor(page, 'color', 'var(--st-failed)')
+  const look = (code) => pv(page, `[data-ev-prov-alert="${code}"]`).evaluate((el) => {
+    const cs = getComputedStyle(el)
+    return { color: cs.color, border: cs.borderLeftColor, text: el.innerText }
+  }).catch(() => null)
+  await openP(page, 'tampered')
+  const tam = await look('db_tampered')
+  check('数据文件被改：标红（data-ev-prov-alert="db_tampered"），写「可能被修改过」，边框和字都是 --st-failed',
+    !!tam && tam.text.includes('可能被修改过') && tam.color === failedColor && tam.border === failedColor, JSON.stringify({ tam, failedColor }))
+  check('……不给格子、不写原因那一句（有 alert 时只画 alert），数据版本照样有', await pv(page, '[data-ev-prov-cell], [data-ev-prov-reason], [data-ev-prov-checks]').count() === 0
+    && await pv(page, '[data-ev-prov-version]').count() === 1 && await pv(page, '[data-ev-provenance="table_only"]').count() === 1)
+  check('……标红用自己的属性：面板里 data-ev-integrity 的个数和没有 alert 时相同', await pv(page, '[data-ev-integrity]').count() === integrityBase)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await panel(page).screenshot({ path: `${SHOTS}/evidence-p4-tampered-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await openP(page, 'chain')
+  check('登记哈希与清单不符：table_only，标红 chain_mismatch，数据版本照样有，没有原因那一句',
+    await pv(page, '[data-ev-provenance="table_only"] [data-ev-prov-alert="chain_mismatch"]').count() === 1
+    && await pv(page, '[data-ev-prov-version]').count() === 1 && await pv(page, '[data-ev-prov-reason]').count() === 0)
+  await openP(page, 'unreadable')
+  const unr = await look('manifest_unreadable')
+  check('清单无法读取：none 里只有红色的 manifest_unreadable，没有数据版本、没有原因那一句',
+    await pv(page, '[data-ev-provenance="none"] [data-ev-prov-alert="manifest_unreadable"]').count() === 1 && unr?.color === failedColor
+    && await pv(page, '[data-ev-prov-version], [data-ev-prov-reason], [data-ev-prov-cell], [data-ev-prov-checks]').count() === 0, JSON.stringify(unr))
+
+  // ---- 11、12：当前状态
+  await openP(page, 'purged')
+  const pver = await textOf(pv(page, '[data-ev-prov-version]'))
+  const purgedLine = await textOf(pv(page, '[data-ev-prov-purged]'))
+  check('原件已清除：数据版本里写「原件已清除 · 清除时间 · 理由 · 署名（未认证）」，标「当前状态」',
+    /^原件已清除 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\) · 理由：合成理由：原件不再保留 · 署名（未认证）：录入员甲/.test(purgedLine)
+    && await pv(page, '[data-ev-prov-purged] [data-ev-prov-current]').count() === 1, purgedLine)
+  check('……格子照样有，旁边注明「原件已清除：坐标来自导入时的记录，无法再对照原件」', await pv(page, '[data-ev-prov-cell]').count() === 1
+    && await textOf(pv(page, '[data-ev-prov-raw]')) === '原件已清除：坐标来自导入时的记录，无法再对照原件')
+  await openP(page, 'revoked')
+  const rver = await textOf(pv(page, '[data-ev-prov-version]'))
+  check('作废接受：数据版本里写「这一期的接受已作废 · 作废时间 · 理由」（当前状态），接受理由照旧列出',
+    /^这一期的接受已作废 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\) · 理由：合成理由：接受依据有误 · 署名（未认证）：未填写/
+      .test(await textOf(pv(page, '[data-ev-prov-revoked]')))
+    && await pv(page, '[data-ev-prov-revoked] [data-ev-prov-current]').count() === 1
+    && rver.includes('已接受：「日客流」：全日客流 = 分区甲 + 分区乙 · 合成理由：分区合计口径调整 · 署名（未认证）：未填写'), rver)
+
+  // ---- 13：简单导入
+  await openP(page, 'simple')
+  check('简单导入：none 里只有一句「这份表格按表头行直接导入…」，没有数据版本',
+    (await textOf(pv(page, '[data-ev-provenance="none"] [data-ev-prov-reason]'))).startsWith('这份表格按表头行直接导入')
+    && await pv(page, '[data-ev-prov-version], [data-ev-prov-alert], [data-ev-prov-checks]').count() === 0)
+
+  // ---- 15、20：不该请求的两种
+  check('夹具自检：手工源那一格的查询步骤没有提示，指标片段链上的查询步骤误带了提示',
+    fxp.segments[ids.manual].chain.every((st) => st.provenance !== true)
+    && fxp.segments[ids.metric].chain.some((st) => st.step === 'query' && st.provenance === true))
+  await openP(page, 'manual', { wait: '[data-ev-query]' })
+  await page.waitForTimeout(250)
+  check('手工源（查询步骤不带提示）：不请求推断的来源，三节都不画', provHits(harness.hits, 'manual') === 0 && await noSections(page))
+  await openP(page, 'metric', { wait: '[data-ev-metric]' })
+  await page.waitForTimeout(250)
+  check('指标片段：链上的查询步骤带了提示也不请求（只认单元格引用）', provHits(harness.hits, 'metric') === 0 && await noSections(page)
+    && await pv(page, '[data-ev-query]').count() >= 1)
+
+  // ---- 22、23、25、26：回收、遮罩、未封存、本期不成立并接受
+  await tableOnly(page, 'gone', /已回收或不存在/, '数据文件已回收：table_only，原因写「已回收或不存在」，不标红')
+  await tableOnly(page, 'masked', '这一格涉及设置了遮罩的列，不推断来源', '遮罩：table_only，「这一格涉及设置了遮罩的列，不推断来源」')
+  check('……数据源设有遮罩：数据版本里没有「查看导入清单」，改写一句去向', await pv(page, '[data-ev-prov-manifest]').count() === 0
+    && await textOf(pv(page, '[data-ev-prov-manifest-masked]')) === '数据源设置了遮罩，导入清单请到数据源卡片上的「版本」查看')
+  await openP(page, 'unsealed')
+  check('运行未封存：照常推断，数据版本一节写「本次运行尚未封存…」，不标红', await pv(page, '[data-ev-provenance="inferred"]').count() === 1
+    && (await textOf(pv(page, '[data-ev-prov-version] [data-ev-prov-unsealed]'))).startsWith('本次运行尚未封存或封存核对未通过')
+    && await pv(page, '[data-ev-prov-alert]').count() === 0)
+  // 接受理由挂在本期结论上（接受针对的是这一期的核对结果，不是这一行），写法取 4.2 的 accepted 原文「已接受，理由：…」，
+  // 不是 4.1 散文里的「已接受：理由」；行级结果单独一行，本期结论另起一行——d26_other 要同时看得到「这一行成立」和
+  // 「本期不成立 · 已接受」（4.4 第 26 条）
+  await openP(page, 'd26_bad')
+  const bad = await textOf(pv(page, '[data-ev-prov-check="R1"]'))
+  check('不成立的那一天：R1「这一行不成立」，接着写「本期不成立 · 已接受，理由：…」', bad.includes('这一行不成立')
+    && bad.includes('本期不成立 · 已接受，理由：合成理由：分区合计口径调整（署名（未认证）：未填写）'), bad)
+  await openP(page, 'd26_other')
+  const other = await textOf(pv(page, '[data-ev-prov-check="R1"]'))
+  check('同一期的另一天：「这一行成立」，本期结论照样写「本期不成立 · 已接受」', other.includes('这一行成立') && other.includes('本期不成立 · 已接受'), other)
+
+  // ---- 人工录入的统计期、列表
+  await openP(page, 'human')
+  const hItems = await fromOf(page)
+  check('统计期人工录入：年份取自人工录入的统计期（署名（未认证）：录入员甲）', hItems.includes('年份取自人工录入的统计期（署名（未认证）：录入员甲）')
+    && (await textOf(pv(page, '[data-ev-prov-version]'))).includes('人工录入（署名（未认证）：录入员甲）'), hItems.join('|'))
+  await openP(page, 'list')
+  check('列表：格子在列表头下面（列表头 F5），统计期未记录', await textOf(pv(page, '[data-ev-prov-cell]')) === '工作表「月报」F8'
+    && (await fromOf(page)).includes('列表头 F5') && (await textOf(pv(page, '[data-ev-prov-version]'))).includes('第 1 次导入 · 统计期未记录'))
+
+  // ---- 27：多于 3 期的折叠
+  await openP(page, 'many')
+  const more = pv(page, '[data-ev-prov-more]')
+  check('四期：首行「按期累积 · 共 4 期」，只展开这一格所在的一期和最近一期，其余收进「另有 2 期」',
+    (await textOf(pv(page, '[data-ev-prov-head]'))).endsWith('按期累积 · 共 4 期') && (await partsOf(page)).join(',') === '2*,4'
+    && await textOf(more) === '另有 2 期' && await more.getAttribute('aria-expanded') === 'false', (await partsOf(page)).join(','))
+  await more.focus()
+  await page.keyboard.press('Enter')
+  check('……「另有 2 期」是带 aria-expanded 的按钮：回车展开（true），四期按统计期列全，焦点留在按钮上',
+    await more.getAttribute('aria-expanded') === 'true' && (await partsOf(page)).join(',') === '1,2*,3,4' && await activeHas(page, 'data-ev-prov-more'),
+    (await partsOf(page)).join(','))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await panel(page).screenshot({ path: `${SHOTS}/evidence-p4-many-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+
+  // ---- 17：360 宽的画布右栏
+  const wrap = async () => page.evaluate((sel) => {
+    const box = document.querySelector(sel)
+    const p = box?.querySelector('[data-evidence-panel]')
+    return { mode: p?.getAttribute('data-evidence-panel') ?? null, box: [box?.scrollWidth, box?.clientWidth], panel: p ? [p.scrollWidth, p.clientWidth] : null }
+  }, PVN)
+  const fits = (w) => w.mode === 'inline' && w.box[0] <= w.box[1] && !!w.panel && w.panel[0] <= w.panel[1]
+  await openP(page, 'wide', { box: PVN })
+  await page.locator(`${PVN} [data-ev-prov-details]`).click().catch(() => {})
+  const w1 = await wrap()
+  await openP(page, 'many', { box: PVN })
+  await page.locator(`${PVN} [data-ev-prov-more]`).click().catch(() => {})
+  const w2 = await wrap()
+  await openP(page, 'tampered', { box: PVN })
+  const w3 = await wrap()
+  check('360 宽的画布右栏：栏内展开；宽表一格（技术细节展开）、四期（全部展开）、标红三种都不出横向滚动',
+    fits(w1) && fits(w2) && fits(w3), JSON.stringify({ w1, w2, w3 }))
+  if (SHOTS) {
+    await openP(page, 'wide', { box: PVN })
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.locator(PVN).screenshot({ path: `${SHOTS}/evidence-p4-360-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await page.locator(`${PVN} [data-evidence-panel] button`, { hasText: '回到正文' }).click().catch(() => {})
+  await page.waitForTimeout(150)
+
+  // ---- 24：加载态
+  const wideId = ids.wide
+  const slow = await open('/ui-harness.html?evidence=1', {
+    prov: async (run, sid, reply) => {
+      if (sid === wideId) await new Promise((res) => setTimeout(res, 300))
+      return reply
+    },
+  })
+  await slow.page.locator(`${PV} [data-seg="${wideId}"]`).click()
+  await slow.page.waitForSelector('[data-evidence-panel] [data-ev-prov-loading]', { timeout: 4000 }).catch(() => {})
+  const loading = await textOf(pv(slow.page, '[data-ev-provenance="loading"] [data-ev-prov-loading]'))
+  check('取的过程中：「推断的来源」一节写「正在推断来源…」，三节不先画空壳', loading === '正在推断来源…'
+    && await pv(slow.page, '[data-ev-prov-version], [data-ev-prov-checks], [data-ev-prov-cell]').count() === 0, loading)
+  await slow.page.waitForSelector('[data-evidence-panel] [data-ev-provenance="inferred"]', { timeout: 4000 }).catch(() => {})
+  check('……答复到了以后加载态消失，三节画出来', await pv(slow.page, '[data-ev-prov-loading]').count() === 0
+    && await pv(slow.page, '[data-ev-prov-version]').count() === 1 && await pv(slow.page, '[data-ev-prov-checks]').count() === 1)
+  check('没有运行时报错（加载态）', slow.errors.length === 0, slow.errors.join(' | '))
+  await slow.ctx.close()
+
+  // ---- 19：出错、老服务端。另守渲染矩阵本身：服务端误把数据版本带在 none · manifest_unreadable、table_only 的答复里
+  // 时照样按矩阵画（前者不画数据版本，后者不画格子）——不能只靠夹具里那些字段恰好为空。
+  // 清除、作废、导入的时间没记（契约里 at 可以是 null，夹具里恰好都有）：略去这一项，不留孤立的「—」
+  const longId = ids.long
+  const untimed = (ans) => ({
+    ...ans,
+    version: {
+      ...ans.version,
+      parts: ans.version.parts.map((pt) => ({
+        ...pt,
+        committed_at: null,
+        purged: pt.purged && { ...pt.purged, at: null },
+        revoked: pt.revoked && { ...pt.revoked, at: null },
+      })),
+    },
+  })
+  const sloppy = {
+    [ids.unreadable]: { ...fxp.provenance[ids.unreadable], version: fxp.provenance[wideId].version },
+    [ids.alias]: { ...fxp.provenance[ids.alias], cell_source: fxp.provenance[wideId].cell_source, checks: fxp.provenance[wideId].checks },
+    [ids.purged]: untimed(fxp.provenance[ids.purged]),
+    [ids.revoked]: untimed(fxp.provenance[ids.revoked]),
+  }
+  const broken = await open('/ui-harness.html?evidence=1', {
+    prov: (run, sid, reply) => (sid === wideId ? fxp.errors.server : sid === longId ? fxp.errors.old_server
+      : sloppy[sid] ? { json: sloppy[sid] } : reply),
+  })
+  await openP(broken.page, 'wide')
+  check('推断来源接口回 500：「推断的来源」一节只写「未能获取推断的来源」', await textOf(pv(broken.page, '[data-ev-provenance="error"] [data-ev-prov-failed]'))
+    === '未能获取推断的来源' && await pv(broken.page, '[data-ev-prov-version], [data-ev-prov-checks], [data-ev-prov-cell]').count() === 0)
+  check('……其余几节照常：查询步骤、封存都在', await pv(broken.page, '[data-ev-query]').count() === 1
+    && (await textOf(pv(broken.page, '[data-ev-seal]'))).includes('已封存 · 核对一致'))
+  await openP(broken.page, 'long', { wait: '[data-ev-query]' })
+  await broken.page.waitForTimeout(300)
+  check('回 404 且没有机读码（老服务端）：请求发了，三节都不画', provHits(broken.hits, 'long') === 1 && await noSections(broken.page),
+    String(provHits(broken.hits, 'long')))
+  await openP(broken.page, 'unreadable')
+  check('渲染矩阵：清单无法读取时，答复里哪怕带着数据版本也不画，只画红色提示',
+    await pv(broken.page, '[data-ev-prov-alert="manifest_unreadable"]').count() === 1 && await pv(broken.page, '[data-ev-prov-version]').count() === 0)
+  await openP(broken.page, 'alias')
+  check('渲染矩阵：只给表级来历时，答复里哪怕带着格子和核对也不画', await pv(broken.page, '[data-ev-prov-reason]').count() === 1
+    && await pv(broken.page, '[data-ev-prov-cell], [data-ev-prov-checks]').count() === 0)
+  await openP(broken.page, 'purged')
+  const purgedUntimed = await textOf(pv(broken.page, '[data-ev-prov-purged]'))
+  const verUntimed = await textOf(pv(broken.page, '[data-ev-prov-version]'))
+  check('清除时间、导入时间没记：写「原件已清除 · 理由：… · 署名（未认证）：…」，不留孤立的「—」，也不写「导入于」',
+    /^原件已清除 · 理由：合成理由：原件不再保留 · 署名（未认证）：录入员甲/.test(purgedUntimed)
+    && !verUntimed.includes('—') && !verUntimed.includes('导入于')
+    && await pv(broken.page, '[data-ev-prov-purged] [data-ev-prov-current]').count() === 1, verUntimed)
+  await openP(broken.page, 'revoked')
+  const revokedUntimed = await textOf(pv(broken.page, '[data-ev-prov-revoked]'))
+  check('作废时间没记：写「这一期的接受已作废 · 理由：… · 署名（未认证）：未填写」，不留孤立的「—」',
+    /^这一期的接受已作废 · 理由：合成理由：接受依据有误 · 署名（未认证）：未填写/.test(revokedUntimed)
+    && !(await textOf(pv(broken.page, '[data-ev-prov-version]'))).includes('—'), revokedUntimed)
+  check('没有运行时报错（出错、老服务端）', broken.errors.length === 0, broken.errors.join(' | '))
+  await broken.ctx.close()
 })
 
 if (SHOTS) {

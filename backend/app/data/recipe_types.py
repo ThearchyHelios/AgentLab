@@ -1,4 +1,5 @@
-"""配方导入的契约（期 2，波次 0 由编排者提交；期 3 的改动见 P3-SPEC 9.2，同样由波次 0 提交）：配方 JSON 的模型、
+"""配方导入的契约（期 2，波次 0 由编排者提交；期 3 的改动见 P3-SPEC 9.2，同样由波次 0 提交；期 4 只给 OutsideText
+加了 hidden，见 P4-SPEC 7.1）：配方 JSON 的模型、
 执行结果和各模块之间传递的数据结构。
 
 各工作包之间只通过这里的类型和 P2-SPEC.md、P3-SPEC.md 里写明的函数签名交互。这里**只有声明**，没有业务逻辑
@@ -706,6 +707,12 @@ class OutsideText:
     kind: Literal["text", "text_digits"]
     #: 这格同时是统计期来源（带附加文字的统计期格，PeriodOut.annotated）
     period_source: bool = False
+    #: 期 4（P4-SPEC 7.1，WP-0）：这格所在的行或列是否被隐藏，执行器写入（_outside_text、统计期格附带的文字两处）。
+    #: True = 在隐藏行列里；False = 可见；None = 导入时没有记录（期 4 之前的清单没有这个键，
+    #: recipe_imports._known 读老清单时缺键就是 None，不用改读法）。
+    #: 裁判摘录只送 hidden is False 的项（P4-SPEC 3.2）：隐藏行里的内部备注不能多一条经裁判外发的通道，
+    #: 不知道是否隐藏的（None）同样只计条数。差异卡、确认项只按坐标、文字、kind、period_source 比较，不看它
+    hidden: bool | None = None
 
 
 @dataclass

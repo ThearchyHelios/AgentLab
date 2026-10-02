@@ -446,20 +446,36 @@ def _check_t(sql: _Sql, cid: str, title: str, items: list[DerivedItem], full_cal
 # ---------------------------------------------------------------- R：关系
 
 
-def _check_sum_eq(sql: _Sql, rel: SumEq, title: str, columns: list[ColumnOut], grain: list[str],
-                  lineage: dict[str, dict[str, list[list[Any]]]]) -> CheckResult:
-    table, total, parts = rel.table, rel.total, list(rel.parts)
+def sum_eq_conditions(total: str, parts: list[str], types: dict[str, str]) -> tuple[str, str, str]:
+    """关系核对「total = parts 之和」逐行判定用的三段 SQL 条件：(nonnull, anynull, mismatch)。
+
+    - nonnull：参与的列都不是空值（这一行比得上）；
+    - anynull：任一列是空值（这一行无法核对）；
+    - mismatch：合计与各部分之和不等。只在 nonnull 成立时有意义，调用方自己和 nonnull 组合（AND，或者 CASE 里
+      先判 anynull）。有一列是 REAL 时按相对误差 1e-9 比（浮点加法有舍入），全是整数时严格比。
+
+    为什么抽出来：导入时的核对（_check_sum_eq）和证据面板的行级核对（provenance_db.row_status，P4-SPEC 2.7）
+    必须用同一段代码生成的条件。面板说「这一天成立」，就得和导入时的结论是同一个判断，不能各写一份、日后改了一边。
+    types 是列名 → INTEGER / REAL / TEXT（回执里这一期的列类型），缺的列按非 REAL 处理。
+    """
     names = [total, *parts]
     nonnull = " AND ".join(f"{_q(c)} IS NOT NULL" for c in names)
     anynull = " OR ".join(f"{_q(c)} IS NULL" for c in names)
-    checked = sql.one(f"SELECT COUNT(*) FROM {_q(table)} WHERE {nonnull}")[0]
-    nulls = sql.one(f"SELECT COUNT(*) FROM {_q(table)} WHERE {anynull}")[0]
-    types = {c.name: c.type for c in columns}
     added = " + ".join(_q(p) for p in parts)
     if any(types.get(c) == "REAL" for c in names):
-        cond = f"ABS({_q(total)} - ({added})) > 1e-9 * MAX(1, ABS({_q(total)}))"
+        mismatch = f"ABS({_q(total)} - ({added})) > 1e-9 * MAX(1, ABS({_q(total)}))"
     else:
-        cond = f"{_q(total)} <> {added}"
+        mismatch = f"{_q(total)} <> {added}"
+    return nonnull, anynull, mismatch
+
+
+def _check_sum_eq(sql: _Sql, rel: SumEq, title: str, columns: list[ColumnOut], grain: list[str],
+                  lineage: dict[str, dict[str, list[list[Any]]]]) -> CheckResult:
+    table, total, parts = rel.table, rel.total, list(rel.parts)
+    nonnull, anynull, cond = sum_eq_conditions(total, parts, {c.name: c.type for c in columns})
+    checked = sql.one(f"SELECT COUNT(*) FROM {_q(table)} WHERE {nonnull}")[0]
+    nulls = sql.one(f"SELECT COUNT(*) FROM {_q(table)} WHERE {anynull}")[0]
+    added = " + ".join(_q(p) for p in parts)
     where = f"{nonnull} AND {cond}"
     failed = sql.one(f"SELECT COUNT(*) FROM {_q(table)} WHERE {where}")[0]
     picked = ", ".join(["rowid", *(_q(g) for g in grain), _q(total), f"({added})"])

@@ -351,6 +351,36 @@ def test_outside_text_with_digits_needs_confirmation():
     assert (f"{SHEET}!B32", "text_digits", False) in [(o.cell, o.kind, o.period_source) for o in ex.outside_text]
 
 
+def test_outside_text_records_whether_its_row_or_column_is_hidden():
+    """期 4（P4-SPEC 7.3、调整 10，评审 hid.py 的复现）：区域外文字在隐藏行、隐藏列里时 hidden 为 True，可见的为
+    False；带附加文字的统计期格（period_source）同样写。裁判摘录只送 hidden is False 的项，隐藏行里的内部备注
+    不能多一条经裁判外发的通道。隐藏行列在认领区域之外，不触发 hidden_rows / hidden_cols。"""
+    def edit(ws, info):
+        ws["B32"] = "注：8月15日闸机故障，当日客流为估算值"            # 可见、含数字
+        ws["B33"] = "内部：本月补贴 45678 元"                          # 隐藏行
+        ws.row_dimensions[33].hidden = True
+        ws["H34"] = "内部备注：分区甲口令 abc123"                       # 区域右侧、区域下方的隐藏列
+        ws.column_dimensions["H"].hidden = True
+        ws["B3"] = "客流汇总表（2026年8月）"                           # 可见的统计期附加文字
+        ws["B35"] = "注：2026年8月数据为初步统计"                       # 隐藏行里的统计期附加文字
+        ws.row_dimensions[35].hidden = True
+    ex = run(flow_book(days=3, edit=edit))
+    assert ex.ok, [(p.code, p.message) for p in ex.problems]
+    assert not {"hidden_rows", "hidden_cols"} & codes(ex)
+    got = {o.cell: (o.kind, o.period_source, o.hidden) for o in ex.outside_text}
+    assert got == {
+        f"{SHEET}!B3": ("text_digits", True, False),
+        f"{SHEET}!B32": ("text_digits", False, False),
+        f"{SHEET}!B33": ("text_digits", False, True),
+        f"{SHEET}!H34": ("text_digits", False, True),
+        f"{SHEET}!B35": ("text_digits", True, True),
+    }
+    # 回执（asdict）里一律带 hidden 键：导入清单按它判断，老清单没有这个键才是「未记录」
+    from dataclasses import asdict
+
+    assert all(isinstance(o["hidden"], bool) for o in asdict(ex)["outside_text"])
+
+
 def test_outside_number_is_structure_and_merges_per_row():
     def edit(ws, info):
         ws["B1"] = 987654                  # 日期表头以上：区域外

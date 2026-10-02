@@ -3,7 +3,8 @@ import { create } from 'zustand'
 import { ApiError, api } from '../api/client'
 import { graphVerdicts, judgedVerdicts, sqlOf } from '../lib/evidence'
 import type {
-  EvidenceDocData, EvidenceGraph, EvidenceJudgeResult, EvidenceSegmentDetail, EvidenceStats, EvidenceVerdict,
+  EvidenceDocData, EvidenceGraph, EvidenceJudgeResult, EvidenceProvenance, EvidenceSegmentDetail, EvidenceStats,
+  EvidenceVerdict,
 } from '../types'
 
 /**
@@ -20,6 +21,11 @@ import type {
  * 四期：封存之后按需追加的结论句判定按 `runId@报告` 记在 judged 里（按需裁判接口、片段接口叠上的
  * 判定都记进来），正文的句末徽标、横幅的结论句计数据此盖过文档里的「未裁判 · 按需」。封存的文档本身
  * 一个字不改。同一句正在判的不重复发；判过的（判定不是未裁判）不再给按钮，也就不会再发
+ *
+ * Excel 导入期 4：推断的来源按片段的缓存键记在 provenance 里，但**只在面板开着期间有效**。回答里有当前状态
+ * （原件已清除、接受已作废）和取决于数据文件现状的结论（被修改过、已回收），在版本页清除、作废、回滚之后，
+ * 关掉面板再打开就要看到新结论。所以面板挂载时 holdProvenance，最后一个面板关掉（或换了运行）时清掉这次
+ * 运行的槽；同一次打开里来回点同一片段只取一次
  */
 
 export interface Slot<T> {
@@ -69,6 +75,14 @@ interface EvidenceState {
   asks: Record<string, Slot<EvidenceJudgeResult>>
   /** 运行类别（formal / exploratory）：没开裁判的文档靠它认探索运行，按需取一次 */
   runClasses: Record<string, Slot<string | null>>
+  /** 推断的来源（Excel 导入期 4），键同 segmentKey。只在面板开着期间有效，见 holdProvenance */
+  provenance: Record<string, Slot<EvidenceProvenance>>
+  loadProvenance: (runId: string, segmentId: string, report?: string) => Promise<void>
+  /**
+   * 证据面板挂载时调用，返回释放函数（面板卸载、换了运行时调）。这次运行最后一个面板释放后，清掉它的推断来源槽：
+   * 关掉面板再打开会重新取
+   */
+  holdProvenance: (runId: string) => () => void
   /** 记下几句封存后追加的判定（片段接口叠上的、证据图带来的） */
   noteVerdicts: (runId: string, report: string | undefined, verdicts: Record<string, EvidenceVerdict>) => void
   /** 请模型判断这几句（探索运行）。判定记进 judged；答复（含触顶、出错）记进 asks */
@@ -101,12 +115,17 @@ export class NotADocError extends Error {
   }
 }
 
+/**
+ * 每次运行开着几个证据面板。放在模块里不放进 store：它只决定什么时候清缓存，界面不读它，变了也不该重渲染
+ */
+const provenanceHolds = new Map<string, number>()
+
 export const useEvidence = create<EvidenceState>((set, get) => {
   /**
    * 取一次、记进 table[key]；正在取或已经取到的不再发。取的途中这一格被清掉或换了（dropLatest 之后
    * 又起了一次），回来的结果作废：不能让早先发出的请求把后来那份盖掉
    */
-  async function fill<K extends 'docs' | 'graphs' | 'segments' | 'latest' | 'sqls'>(
+  async function fill<K extends 'docs' | 'graphs' | 'segments' | 'latest' | 'sqls' | 'provenance'>(
     table: K, key: string, fetcher: () => Promise<NonNullable<EvidenceState[K][string]['data']>>, force = false,
   ) {
     const cur = get()[table][key]
@@ -188,6 +207,33 @@ export const useEvidence = create<EvidenceState>((set, get) => {
         mark({ status: 'ok', data: res })
       } catch (error) {
         mark({ status: 'error', error })
+      }
+    },
+    provenance: {},
+    loadProvenance: (runId, segmentId, report) =>
+      fill('provenance', segmentKey(runId, segmentId, report), () => api.evidence.provenance(runId, segmentId, { report })),
+    holdProvenance: (runId) => {
+      provenanceHolds.set(runId, (provenanceHolds.get(runId) ?? 0) + 1)
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        const left = (provenanceHolds.get(runId) ?? 1) - 1
+        if (left > 0) {
+          provenanceHolds.set(runId, left)
+          return
+        }
+        provenanceHolds.delete(runId)
+        // 推到这一轮之后再清：开发期 StrictMode 把挂载的 effect 先清理、紧接着再跑一遍（又 hold 回来），
+        // 同一次提交里一个面板关、另一个面板开也是这样——这两种都不算「面板关了」
+        queueMicrotask(() => {
+          if (provenanceHolds.has(runId)) return
+          const prefix = `${runId}:`
+          const cur = get().provenance
+          if (!Object.keys(cur).some((k) => k.startsWith(prefix))) return
+          // 正在取的也清掉：fill 只在槽还是它自己放的那一份时才落结果，晚到的回包作废
+          set({ provenance: Object.fromEntries(Object.entries(cur).filter(([k]) => !k.startsWith(prefix))) })
+        })
       }
     },
     loadRunClass: (runId) => {

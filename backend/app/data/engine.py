@@ -249,7 +249,7 @@ def sqlite_dqs_self_check() -> None:
         raise RuntimeError(f"SQLite 自检失败：无法确认写错的双引号列名会报错，服务不启动。{problem}")
 
 
-def open_checked_sqlite(path: str, *, readonly: bool = True) -> sqlite3.Connection:
+def open_checked_sqlite(path: str, *, readonly: bool = True, immutable: bool = False) -> sqlite3.Connection:
     """同步打开一个本地 SQLite 文件，DQS 已关（配方导入的建库、核对用）。
 
     配方执行器建临时库、核对模块跑 SQL 都不经 SQLAlchemy，直接用 sqlite3。它们同样要关 DQS：
@@ -261,11 +261,20 @@ def open_checked_sqlite(path: str, *, readonly: bool = True) -> sqlite3.Connecti
     readonly=False 以 mode=rwc 打开（执行器建库）。不设日志模式：沿用 SQLite 默认的回滚日志，
     不开 WAL——WAL 会改写文件头，库文件哈希就对不上了（P2-SPEC 4.2 第 9 步）。
     路径按 URI 转义：文件名里的空格、中文、「?」「#」都不会被当成 URI 的参数或片段。
+
+    immutable=True 另加 `immutable=1`，和 EngineCache 打开版本快照的方式一致（_sqlite_url）：证据下钻在快照文件上
+    单开一个连接编译原 SQL（provenance_db.compile_facts，P4-SPEC 2.9），读的必须是查询走的同一种打开方式。
+    只许和 readonly 一起用：immutable 告诉 SQLite 文件不会变、不加锁，可写的连接这样开会写坏库。缺省 False，
+    现有调用方的行为不变。
     """
     from urllib.parse import quote
 
+    if immutable and not readonly:
+        raise ValueError("immutable 只能用于只读连接")
     mode = "ro" if readonly else "rwc"
-    return sqlite3.connect(f"file:{quote(os.fspath(path))}?mode={mode}", uri=True, factory=_DqsOffConnection)
+    extra = "&immutable=1" if immutable else ""
+    return sqlite3.connect(f"file:{quote(os.fspath(path))}?mode={mode}{extra}", uri=True,
+                           factory=_DqsOffConnection)
 
 
 def _sqlite_extra() -> dict[str, Any]:
@@ -568,6 +577,17 @@ class EngineCache:
             for old in doomed:
                 # 正被借出的连接不受影响：dispose 只关池子里空闲的，借出的还回来时随旧池子回收
                 await old.dispose()
+
+    def pinned(self, source: Any) -> Fingerprint | None:
+        """这个源（版本快照）的引擎核对过的文件指纹；不是快照引擎、或者引擎不在缓存里时为 None。
+
+        给证据下钻的编译核对用（provenance_db.compile_facts，P4-SPEC 2.9）：它在同一个文件上单开一个连接，
+        开连接前、关连接后各拿当时的 stat 和这份指纹比，比得上才说明单开的连接读的是 get() 核对过的那个文件。
+        调用方要在 `await get(source)` 返回之后**同步**调它，中间不能有 await：否则这个键可能已经被 LRU 挤掉，
+        或者被别的请求摘掉重核。只读不改：已经标成不可信（stale）的也照样返回那份指纹，调用方比对时自然对不上。
+        """
+        pin = self._pins.get(cache_key(source))
+        return pin.fingerprint if pin is not None else None
 
     async def _verify_once(self, key: str, source: Any, expected: str) -> Fingerprint:
         """核对快照哈希；同一个键已经有一次在核对，就等那一次的结果。

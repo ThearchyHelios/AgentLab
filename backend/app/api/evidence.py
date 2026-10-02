@@ -31,22 +31,49 @@ import asyncio
 import contextlib
 import csv
 import io
+import logging
 import re
+import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any, get_args
 
 from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, update
+from sqlalchemy.exc import StatementError
 
 from app.api.coded import CodedHTTPException
 from app.core.artifact_store import load
 from app.core.events import EventType
-from app.data.engine import masked_columns
+from app.data import provenance as prov
+from app.data import provenance_db
+from app.data.engine import SnapshotTampered, engines, masked_columns
+from app.data.names import name_key
+from app.data.provenance_types import (
+    DOC_PROVENANCE,
+    Alert,
+    CellRef,
+    Chain,
+    ChainProblem,
+    LocateProblem,
+    ProvenanceOut,
+    RawState,
+    Reason,
+    Recheck,
+    RelatedCheck,
+    ReportRef,
+    SelectRefusal,
+    VersionView,
+    alert,
+    refuse,
+)
+from app.data.table_versions import SnapshotManifestMismatch, SnapshotMissing
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
+from app.engine import direct_select
 from app.engine.evidence import (
     ENTITY_KINDS,
     GUESS_NOTE,
@@ -76,6 +103,7 @@ from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candida
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
+logger = logging.getLogger(__name__)
 
 SCHEMA = "agentlab.evidence/1"
 
@@ -673,20 +701,8 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     一次运行里有好几份报告时用 ?report=<节点 id> 指定；不指定取成果里标注的那一份。
     """
     sealed = await _sealed(run_id)
-    reports = _reports(sealed)
-    if not reports:
-        raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
-    chosen = _choose(reports, report, sealed)
-    if chosen.hash_ok is False:
-        raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
-    if chosen.doc is None:
-        raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
-    found = find_segment(chosen.doc, segment_id)
-    if found is None:
-        raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
-
-    block, unit, seg = found
-    doc = chosen.doc
+    chosen, (block, unit, seg) = _open_segment(sealed, report, segment_id)
+    doc = chosen.doc or {}
     markdown = str(doc.get("markdown") or "")
     start, end = unit.get("span") or [0, 0]
     chain = await _chain(seg, doc, sealed, chosen.node_id)
@@ -710,6 +726,23 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
         "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
         "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []},
     }
+
+
+def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
+                  ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
+    reports = _reports(sealed)
+    if not reports:
+        raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
+    chosen = _choose(reports, wanted, sealed)
+    if chosen.hash_ok is False:
+        raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
+    if chosen.doc is None:
+        raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
+    found = find_segment(chosen.doc, segment_id)
+    if found is None:
+        raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
+    return chosen, found
 
 
 def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Report:
@@ -743,8 +776,10 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
         return []
     if cite.get("kind") == "cell":
         locator = cite.get("locator") or {}
+        # 只有直接引用的单元格才可能推断来源（P4-SPEC 2.8.2）。指标链里的查询步骤不带：指标片段的推断来源只会
+        # 回「不是单元格」，带上提示等于让界面白发一次请求
         return [await _query_step(str(entry.get("artifact") or ""), [(locator.get("row"), locator.get("column"))],
-                                  doc, sealed, masks)]
+                                  doc, sealed, masks, hint=doc.get("provenance") == DOC_PROVENANCE)]
     if cite.get("kind") == "input":
         name = (cite.get("locator") or {}).get("field")
         inputs = _input_payloads(sealed)
@@ -857,11 +892,15 @@ class _Masks:
 
 
 async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
-                      masks: _Masks) -> dict[str, Any]:
+                      masks: _Masks, *, hint: bool = False) -> dict[str, Any]:
     """查询步骤：被引用的格所在的行加前后各 WINDOW 行，高亮那几格，遮掉数据源设了遮罩的列。
 
     快照只认封存范围内的事件交回过的那些（tool.end.query_artifact、node.finished.evidence 的
     query 条目）；目录里写着、事件里追不到的，照实说不认，一行都不给。
+
+    hint（期 4，P4-SPEC 2.8.2）：调用方是带文档标记的单元格片段时为真。这时快照若是上传表格的（有 data_version），
+    步骤多一个 `provenance: true`，界面据此才去请求推断来源接口；其余情况一个键都不加，形状和期 4 之前完全相同
+    （期 4 之前的文档、手工源、指标链都不多发请求）。不看封存状态：未封存的运行照常推断，响应里照实标明。
     """
     catalog = doc.get("catalog") or {}
     alias = _query_alias(catalog, artifact)
@@ -905,7 +944,8 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step.update(sql=snap.get("sql"), columns=columns, total_rows=len(rows), truncated=bool(snap.get("truncated")),
                 masked=[columns[i] for i in sorted(masked)],
                 # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
-                column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {})
+                column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
+                **({"provenance": True} if hint and snap.get("data_version") else {}))
     if len(index) > MAX_WINDOW_ROWS:
         index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
     step["row_index"] = index
@@ -913,6 +953,395 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+# --------------------------------------------------------------------------
+# GET /api/runs/{run_id}/evidence/segments/{segment_id}/provenance（期 4：推断的来源）
+# --------------------------------------------------------------------------
+
+
+@router.get("/{run_id}/evidence/segments/{segment_id}/provenance")
+async def evidence_provenance(run_id: str, segment_id: str, report: str | None = None) -> dict[str, Any]:
+    """点开报告里一个直接引用的查询单元格时，这一格来自原表的哪个工作表、哪一格（P4-SPEC 2.8.1）。
+
+    选报告、错误码和片段接口相同（run_not_found、evidence_report_not_found、evidence_doc_tampered、
+    evidence_doc_missing、evidence_segment_not_found）。其余情况一律 200：推断不出来不是错误，结论写在
+    status、reason、alert 里。按需算、不缓存（2.9）：原件是否清除、数据文件是否被改都是当前状态，事后会变。
+
+    返回 `asdict(ProvenanceOut)`：CellSource 的「from」在 Python 里叫 from_，asdict 已经换回「from」；返回注解
+    写 dict，不写 ProvenanceOut，和其余证据路由一样不让框架按类型再校验、再序列化一遍（provenance_types 模块说明）。
+    """
+    sealed = await _sealed(run_id)
+    chosen, (_block, _unit, seg) = _open_segment(sealed, report, segment_id)
+    out = await segment_provenance(chosen, seg, sealed, masks=_Masks())
+    return asdict(out)
+
+
+#: R14 之后（绑定快照、取引擎、编译核对、回查、行级核对）会抛的三类异常，按 _snapshot_failure 的顺序映射
+_SNAPSHOT_ERRORS: tuple[type[BaseException], ...] = (SnapshotMissing, SnapshotTampered)
+
+
+def _snapshot_failure(exc: BaseException) -> tuple[Reason, Alert | None]:
+    """R14 之后抛出的数据文件异常 → (原因, 标红提示)（P4-SPEC 2.3 的异常映射）。
+
+    **顺序是守卫点**：SnapshotManifestMismatch 同时继承 SnapshotMissing 和引擎的 SnapshotTampered
+    （table_versions.py 的定义），必须最先认，否则会被当成文件被改（db_tampered）或文件不在（snapshot_gone）：
+    1. SnapshotManifestMismatch：登记的哈希与快照清单对不上 → chain_mismatch，标红；
+    2. SnapshotTampered（含借连接时指纹不符）：数据文件与登记的版本不一致 → db_tampered，标红；
+    3. SnapshotMissing：绑定时文件没了、记录不全 → snapshot_gone，不标红（被运行引用的版本受保护，出现多半是
+       数据源被删或手工清理）。
+    三种都是 table_only：数据版本一节只靠清单，照样给；不给格子，已经算出的行级状态一律丢掉（调用方负责）。
+    不是这三类的异常原样抛出：不该被当成「推断不出来」吞掉。
+    """
+    if isinstance(exc, SnapshotManifestMismatch):
+        return refuse("chain_mismatch"), alert("chain_mismatch")
+    if isinstance(exc, SnapshotTampered):
+        return refuse("db_tampered"), alert("db_tampered")
+    if isinstance(exc, SnapshotMissing):
+        return refuse("snapshot_gone"), None
+    raise exc
+
+
+class _Artifacts:
+    """一次请求里取过的工件（P4-SPEC 2.9「同一工件只取一次」）。取回的结果按 _fetch 的口径记 (内容, hash_ok)。
+
+    - `await get(id)`：在线程里取（快照、清单可能几十 KB 到几 MB，读文件、复验哈希不该卡事件循环，H9）；
+    - `load(id)`：同步取，语义同 artifact_store.load（取不到 None，哈希不符抛 ValueError），给已经在线程里跑的
+      纯函数当 loader 用（WP-B 的 resolve_chain 等）。两条路共用同一份备忘。
+    """
+
+    def __init__(self) -> None:
+        self._memo: dict[str, tuple[Any, bool | None]] = {}
+
+    async def get(self, artifact: str) -> tuple[Any, bool | None]:
+        key = str(artifact or "")
+        if not key:
+            return None, None
+        if key not in self._memo:
+            self._memo[key] = await asyncio.to_thread(_fetch, key)
+        return self._memo[key]
+
+    def load(self, artifact: str) -> Any:
+        key = str(artifact or "")
+        if not key:
+            return None
+        if key not in self._memo:
+            self._memo[key] = _fetch(key)
+        content, ok = self._memo[key]
+        if ok is False:
+            raise ValueError(f"工件 {key[:12]} 与哈希不一致")
+        return content
+
+
+def _cell_ref(cite: dict[str, Any], entry: dict[str, Any]) -> CellRef | None:
+    """片段本身是单元格引用（有 alias 和 row、column 齐全的定位）就给，与 status 无关（2.8.1「字段取值」）。"""
+    locator = cite.get("locator") or {}
+    row, column = locator.get("row"), locator.get("column")
+    if cite.get("kind") != "cell" or not cite.get("alias") or not isinstance(row, int) or isinstance(row, bool) \
+            or not isinstance(column, str) or not column:
+        return None
+    artifact = entry.get("artifact")
+    return CellRef(alias=str(cite["alias"]), row=row, column=column, artifact=str(artifact) if artifact else None)
+
+
+async def segment_provenance(report: _Report, seg: dict[str, Any], sealed: _Sealed, *,
+                             masks: _Masks) -> ProvenanceOut:
+    """一个片段的推断来源：按 P4-SPEC 2.3 的规则表顺序判断，第一条不满足的就是结论。
+
+    **封存状态不进规则**（1.3 调整 11）：未封存（停在审批上）、封存核对不通过的运行照常判断，`sealed` 照实给
+    sealed.trusted，界面另加一句。查询快照、表结构快照按「本次运行的事件交回过」认（sealed.queries、
+    sealed.schemas，_sealed 对未封存的运行按全部事件拼），不经 _sealed_loader：它在 trusted 为假时一律不给，
+    会把未封存的运行误判成清单无法读取（2.8.3）。
+
+    这里判 R0–R4（只看文档、目录和两份快照），R5 起交给 _drill：清单链（provenance）、SQL 判据（direct_select）、
+    遮罩、空值、数据文件（provenance_db）、找回格子和相关核对。
+    """
+    doc = report.doc or {}
+    cite = seg.get("cite") or {}
+    entry = (doc.get("catalog") or {}).get(cite.get("alias")) or {}
+    base: dict[str, Any] = {
+        "report": ReportRef(node_id=report.node_id, doc_artifact=report.doc_artifact),
+        "segment": str(seg.get("id") or ""), "cell": _cell_ref(cite, entry), "sealed": sealed.trusted,
+    }
+
+    def none(code: Any) -> ProvenanceOut:
+        return ProvenanceOut(status="none", reason=refuse(code), **base)
+
+    # R0：期 4 之前组装的文档（没有标记）一律不推断，期 4 之前的面板不变（1.4）
+    if doc.get("provenance") != DOC_PROVENANCE:
+        return none("legacy_doc")
+    # R1：只对直接引用的查询单元格下钻；代码节点、Agent 字段的取数（工具名不是 db_query__ 开头）不算
+    if (cite.get("kind") != "cell" or cite.get("status") != "resolved" or seg.get("state") != "deterministic"
+            or entry.get("kind") != "query" or not str(entry.get("tool") or "").startswith(QUERY_PREFIX)):
+        return none("not_cell")
+    artifacts = _Artifacts()
+    # R2：查询快照是本次运行的事件交回过的，取回时哈希复验通过
+    artifact = str(entry.get("artifact") or "")
+    query, ok = await artifacts.get(artifact) if artifact in sealed.queries else (None, None)
+    if ok is not True or not isinstance(query, dict):
+        return none("not_sealed")
+    # R3：上传表格的查询快照才有 data_version（datasource.py 只给上传源写）
+    if not query.get("data_version"):
+        return none("not_upload")
+    # R4：表结构快照同样要是本次运行交回过、复验通过的；不是按配方导入的（简单导入、v0 迁移出的版本）没有溯源
+    schema_id = str(query.get("schema_artifact") or "")
+    schema, ok = await artifacts.get(schema_id) if schema_id in sealed.schemas else (None, None)
+    if ok is not True or not isinstance(schema, dict):
+        return none("not_sealed")
+    if schema.get("import_mode") != "recipe":
+        return none("simple_upload")
+    return await _drill(base, seg=seg, entry=entry, query=query, schema=schema, artifacts=artifacts,
+                        masks=masks, sealed=sealed)
+
+
+async def _drill(base: dict[str, Any], *, seg: dict[str, Any], entry: dict[str, Any], query: dict[str, Any],
+                 schema: dict[str, Any], artifacts: _Artifacts, masks: _Masks, sealed: _Sealed) -> ProvenanceOut:
+    """R5–R17（P4-SPEC 2.3）：第一条不满足的就是结论。
+
+    - R5、R6 只看内容寻址的工件（resolve_chain，放线程：要逐份取回清单、复验哈希）。链断了就什么来历都不给：
+      status none、version 为 null，标红；
+    - 之后的每一条都照样给数据版本（它只靠清单），不给格子：R7–R11 只看查询快照和冻结表结构，R12、R13 对照数据库
+      里的数据文件记录，R14 起打开数据文件。R14 之后任何一步抛出的数据文件异常按 _snapshot_failure 的顺序映射，
+      已经算出的格子、行级状态一律丢掉（2.3 末尾）；
+    - 全部满足才给格子（inferred）。
+    """
+    # R5（取不回、哈希不符）、R6（链本身对不上）：resolve_chain 不往外抛，结论在 ChainProblem 里
+    chain = await asyncio.to_thread(prov.resolve_chain, query, schema, artifacts.load)
+    if isinstance(chain, ChainProblem):
+        return ProvenanceOut(status="none", reason=refuse(chain.code, chain.detail), alert=alert(chain.code), **base)
+
+    frozen = _frozen_tables(schema)
+    tables = {name: _frozen_columns(meta) for name, meta in frozen.items()}
+    sql = str(query.get("sql") or "")
+    # 遮罩 = 数据源现在设的 + 查询当时记下的（同 _query_step 的口径：数据源改名、删掉了也照遮）
+    source_name = (sealed.queries.get(str(entry.get("artifact") or "")) or {}).get("source") \
+        or entry.get("source") or query.get("source")
+    current, _found = await masks.of(source_name)
+    hidden = current | _recorded_masks(query)
+    async with SessionLocal() as session:
+        states = await provenance_db.import_states(session, [p.import_id for p in chain.parts])
+        record = await provenance_db.snapshot_record(session, chain.snapshot_id)
+    # 版本页同一个口径的表：SQL 里出现的冻结表结构的表（tables_in 宁可多认，2.4）
+    version = _version_of(chain, direct_select.tables_in(sql, tables), states, manifest_view=not hidden)
+
+    def table_only(reason: Reason, red: Alert | None = None) -> ProvenanceOut:
+        return ProvenanceOut(status="table_only", reason=reason, alert=red, version=version, **base)
+
+    # R7：受限文法内的直接选取（识别器和执行这条 SQL 的 SQLite 读同一串记号）。传的是快照里原样存下的 SQL
+    columns = [str(c) for c in query.get("columns") or []]
+    picked = direct_select.recognize(sql, result_columns=columns, tables=tables)
+    if isinstance(picked, SelectRefusal):
+        return table_only(refuse(picked.code, picked.detail))
+    # R8：被引用的结果列按第一次出现的位置对应选取项（locate_cell 也按第一次出现取）。识别器已拒绝重名，
+    # 这里对不上只是防御
+    locator = (seg.get("cite") or {}).get("locator") or {}
+    row, column = locator.get("row"), locator.get("column")
+    if not isinstance(column, str) or column not in columns or columns.index(column) >= len(picked.columns):
+        return table_only(refuse("unparsed"))
+    at = columns.index(column)
+    target = picked.columns[at]
+    # R9：表有主键，主键各列都以直接引用出现在结果里；结果各行的主键两两不同（与解析无关的兜底：同一张表经集合
+    # 运算拼出来的结果可能重复主键）
+    meta = frozen.get(picked.table)
+    pk_names = [str(p) for p in (meta.get("primary_key") or [])] if isinstance(meta, dict) else []
+    if not pk_names:
+        return table_only(refuse("no_pk"))
+    where = {name_key(c): j for j, c in enumerate(picked.columns)}
+    missing = [p for p in pk_names if name_key(p) not in where]
+    if missing:
+        return table_only(refuse("pk_missing", 列=missing))
+    rows = query.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(r, list) and len(r) == len(columns) for r in rows):
+        return table_only(refuse("unparsed"))
+    pk_at = [where[name_key(p)] for p in pk_names]
+    if _repeats([tuple(r[j] for j in pk_at) for r in rows]):
+        return table_only(refuse("multi_table", "duplicate_pk"))
+    # R10：被引用的列、主键列、推断要用到的键列（维度、派生、常量：行标签原文、分段标题的定位文字都是它们的值）
+    # 都不在遮罩里
+    needed = [column, target, *pk_names, *_key_columns(chain, picked.table)]
+    if any(str(n).lower() in hidden for n in needed):
+        return table_only(refuse("masked"))
+    # R11：被引用的值、主键各值都不是空值
+    if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row < len(rows):
+        return table_only(refuse("unparsed"))
+    value = rows[row][at]
+    if value is None:
+        return table_only(refuse("null_value"))
+    pk = {p: rows[row][j] for p, j in zip(pk_names, pk_at)}
+    if any(v is None for v in pk.values()):
+        return table_only(refuse("null_pk"))
+    # R12：数据文件记录在、没回收、文件在（不标红：被运行引用的版本受保护，出现多半是数据源被删或手工清理）
+    if record is None or record.retired_at is not None or not record.db_path or not Path(record.db_path).is_file():
+        return table_only(refuse("snapshot_gone"))
+    # R13：登记哈希等于清单里期望的库哈希、source_id 一致（防「数据文件和登记哈希被一起改成一致的假值」：
+    # 清单是内容寻址的，又挂在封存的表结构快照下面，改不了）。登记哈希为空也算不等。
+    # Reason.detail 不带细分：契约只给 DETAILS 和 ChainProblem / LocateProblem 的细分留了位置，R13 规格只写
+    # chain_mismatch，和异常映射（SnapshotManifestMismatch）同一个口径；哪一项对不上写进日志
+    registered = str(record.db_sha256 or "").strip().lower()
+    if not registered or registered != chain.expected_db_sha256.strip().lower():
+        logger.warning("provenance: 快照 %s 的登记哈希与导入清单里的库哈希不一致", chain.snapshot_id)
+        return table_only(refuse("chain_mismatch"), alert("chain_mismatch"))
+    if str(record.source_id) != chain.source_id:
+        logger.warning("provenance: 快照 %s 的 source_id 与导入清单不一致", chain.snapshot_id)
+        return table_only(refuse("chain_mismatch"), alert("chain_mismatch"))
+    try:
+        return await _open_and_locate(base, table_only, chain=chain, record=record, version=version,
+                                      states=states, hidden=hidden, sql=sql, table=picked.table, target=target,
+                                      value=value, pk=pk)
+    except _SNAPSHOT_ERRORS as exc:
+        # R14 之后（绑定、取引擎、编译核对、回查、行级核对）任何一步：不给格子，已算出的行级状态一律丢掉
+        reason, red = _snapshot_failure(exc)
+        return table_only(reason, red)
+
+
+async def _open_and_locate(base: dict[str, Any], table_only: Callable[..., ProvenanceOut], *, chain: Chain,
+                           record: Any, version: VersionView, states: dict[str, dict[str, Any]], hidden: set[str],
+                           sql: str, table: str, target: str, value: Any, pk: dict[str, Any]) -> ProvenanceOut:
+    """R14–R17 和行级核对：要打开数据文件的几步。三类数据文件异常原样往外抛，由 _drill 统一映射。"""
+    # R14：绑定快照（累积快照首次绑定时和快照清单交叉核对），经 EngineCache 打开数据文件（只读、immutable，本进程
+    # 首次整份核对哈希）。之后的回查、行级核对都经同一个缓存键，读的就是查询读过的那个文件
+    view = provenance_db.view_of(record, source_name=chain.source)
+    await engines.get(view)
+    # R15：第二道核对，与解析无关。读到的表恰好只有识别器认出的那一张；字节码里 ResultRow 恰好 1 个、没有 Yield
+    # （UNION ALL 有多个 ResultRow，UNION、INTERSECT、EXCEPT 有 Yield）。编译不了（SQLite 自己报错）同样不下钻
+    try:
+        facts = await provenance_db.compile_facts(view, sql)
+    except sqlite3.Error:
+        logger.warning("provenance: 编译核对失败，只给表级来历", exc_info=True)
+        return table_only(refuse("unparsed"))
+    if {name_key(t) for t in facts.tables} != {name_key(table)}:
+        return table_only(refuse("multi_table", "authorizer"))
+    if facts.result_rows != 1 or facts.yields != 0:
+        return table_only(refuse("multi_table", "compound"))
+    # R16：按主键参数化回查，恰好一行，值和快照里那一格类型、值都相等
+    try:
+        found, recheck_sql, params = await provenance_db.recheck(view, table=table, column=target, pk=pk)
+    except (sqlite3.Error, StatementError) as e:
+        _reraise_snapshot_error(e)
+        # 细分同样不进 Reason.detail（契约外的值），回查出错和回查没找到行给同一个原因，区别只在日志
+        logger.warning("provenance: 回查失败，只给表级来历", exc_info=True)
+        return table_only(refuse("recheck_missing"))
+    if not found:
+        return table_only(refuse("recheck_missing"))
+    if len(found) > 1:
+        return table_only(refuse("recheck_multiple"))
+    rowid, now = found[0]
+    if not _same_cell(now, value):
+        # 值对不上先强制整份重算一次哈希（不走 EngineCache 的指纹捷径：原地改写同样字节数、再还原修改时间的改动，
+        # 指纹认不出，P4-SPEC 2.6）。文件确实变了 → 标红；没变 → 这条 SQL 的含义和判据认定的不同，不标红
+        if not await provenance_db.rehash(view):
+            return table_only(refuse("db_tampered"), alert("db_tampered"))
+        return table_only(refuse("recheck_mismatch"))
+    # R17：从 (表, 列, rowid) 找回格子（并集 rowid 先换算到某一期）。纯函数，但要解析配方、还原回执，放线程
+    located = await asyncio.to_thread(prov.locate, chain, table=table, column=target, rowid=rowid)
+    if isinstance(located, LocateProblem):
+        if located.code == "chain_mismatch":
+            return table_only(refuse("chain_mismatch", located.detail), alert("chain_mismatch"))
+        return table_only(refuse("no_lineage", located.detail))
+    # 附带的格写出的是哪几列的值（R10 已按回执里的键列判过，这里按实际给出的再核一次，防回执和推断不一致）
+    if any(str(f.column).lower() in hidden for f in located.cell.from_ if f.column):
+        return table_only(refuse("masked"))
+    plans = await asyncio.to_thread(prov.related_checks, chain, located, table=table, column=target)
+    checks: list[RelatedCheck] = []
+    for plan in plans:
+        if plan.rule is None:
+            checks.append(plan.check)
+            continue
+        # 行级状态按**快照库**的 rowid 跑（并集时是并集 rowid），条件和导入时的核对是同一段代码生成的
+        try:
+            status = await provenance_db.row_status(view, plan.rule, rowid)
+        except (sqlite3.Error, StatementError) as e:
+            _reraise_snapshot_error(e)
+            logger.warning("provenance: 行级核对失败，这一行不给结论", exc_info=True)
+            status = None
+        checks.append(replace(plan.check, row_status=status))
+    state = states.get(located.part.import_id) or {}
+    cell = replace(located.cell, rowid=rowid, pk=pk, raw_purged=state.get("raw_state") == "purged",
+                   recheck=Recheck(sql=recheck_sql, params=list(params), ok=True))
+    version = replace(version, parts=[replace(p, has_row=p.import_id == located.part.import_id)
+                                      for p in version.parts])
+    return ProvenanceOut(status="inferred", version=version, cell_source=cell, checks=checks, **base)
+
+
+def _reraise_snapshot_error(exc: BaseException) -> None:
+    """SQLAlchemy 把连接池事件里抛出的异常包成 StatementError 时，数据文件的三类异常要原样交给 _drill 映射，
+    不能被当成「这条 SQL 执行失败」吞掉（借连接时指纹不符抛的 SnapshotTampered 就在这一路上）。"""
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, _SNAPSHOT_ERRORS):
+        raise orig from exc
+
+
+def _frozen_tables(schema: dict[str, Any]) -> dict[str, Any]:
+    tables = schema.get("tables") if isinstance(schema, dict) else None
+    return tables if isinstance(tables, dict) else {}
+
+
+def _frozen_columns(meta: Any) -> list[str]:
+    """冻结表结构里一张表的列名，按定义顺序（`SELECT *` 要按这个顺序比对结果列）。"""
+    cols = meta.get("columns") if isinstance(meta, dict) else None
+    return [str(c["name"]) for c in cols or [] if isinstance(c, dict) and c.get("name") is not None]
+
+
+def _recorded_masks(query: dict[str, Any]) -> set[str]:
+    recorded = query.get("mask_columns")
+    return {c.lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
+
+
+#: 推断要用到的键列（回执 tables[].columns[].role）：维度列的行标签原文、派生列由行标签解析、常量列取分段标题的
+#: 定位文字，展示出来就是这几列的值（R10）
+_KEY_COLUMN_ROLES = frozenset({"dim", "derive", "const"})
+
+
+def _key_columns(chain: Chain, table: str) -> list[str]:
+    """各期回执里这张表的键列（维度、派生、常量）。取全部各期的并集：R10 在知道格子落在哪一期之前判，宁可多遮。"""
+    out: list[str] = []
+    for part in chain.parts:
+        receipt = part.manifest.get("receipt") if isinstance(part.manifest.get("receipt"), dict) else {}
+        for t in receipt.get("tables") or []:
+            if not isinstance(t, dict) or t.get("name") != table:
+                continue
+            out += [str(c["name"]) for c in t.get("columns") or []
+                    if isinstance(c, dict) and c.get("role") in _KEY_COLUMN_ROLES and c.get("name")]
+    return list(dict.fromkeys(out))
+
+
+def _repeats(keys: list[tuple[Any, ...]]) -> bool:
+    """主键元组有没有重复。按 Python 的相等比（5 和 5.0 算同一个）：宁可多判重复、少下钻。"""
+    seen: set[Any] = set()
+    for key in keys:
+        try:
+            marker: Any = key
+            hash(marker)
+        except TypeError:
+            marker = repr(key)
+        if marker in seen:
+            return True
+        seen.add(marker)
+    return False
+
+
+def _same_cell(now: Any, then: Any) -> bool:
+    """回查的值和快照里那一格：类型和值都相等（int、float、str 分开比，8754 和 8754.0 不算相等；bool 不算数）。
+
+    两边都经 engine._jsonable 同一口径规范化过（快照还经过一次 JSON 存取，int、float、str 原样回来），类型不同
+    只可能是文件或 SQL 的含义变了，不能按数值宽松地放过。"""
+    if isinstance(now, bool) or isinstance(then, bool):
+        return False
+    return type(now) is type(then) and now == then
+
+
+def _version_of(chain: Chain, tables: list[str], states: dict[str, dict[str, Any]], *,
+                manifest_view: bool) -> VersionView:
+    """数据版本：清单里的部分由 provenance.version_view 给（内容寻址），原件状态、清除、作废、配方第几版取自导入
+    记录（当前状态，界面标「当前状态」）。manifest_view：数据源设有任何遮罩时不在面板里出「查看导入清单」。"""
+    view = prov.version_view(chain, tables=tables)
+    parts = []
+    for p in view.parts:
+        state = states.get(p.import_id) or {}
+        raw = state.get("raw_state")
+        parts.append(replace(p, raw_state=raw if raw in get_args(RawState) else None, purged=state.get("purged"),
+                             revoked=state.get("revoked"), recipe_seq=state.get("recipe_seq")))
+    return replace(view, parts=parts, manifest_view=manifest_view)
 
 
 # --------------------------------------------------------------------------
@@ -1340,15 +1769,54 @@ def _stale(verdict: Any) -> bool:
     return isinstance(verdict, dict) and bool(verdict.get("post_seal")) and outdated(verdict)
 
 
-def _sealed_loader(sealed: _Sealed) -> Callable[[str], Any]:
+def _sealed_loader(sealed: _Sealed, *, chain: bool = False) -> Callable[[str], Any]:
     """给裁判取证据的 loader：只认封存范围内的事件交回过的工件（查询、表结构、检索快照和台账里记过的），
     取回时照旧复验哈希。别的一律当取不到——人为插进工件表的行、封存之后才追加的事件引用的快照，
-    都不能送进裁判的摘录。报告文档里的目录也不例外：目录写着哪件工件，不等于它在封存链上。"""
+    都不能送进裁判的摘录。报告文档里的目录也不例外：目录写着哪件工件，不等于它在封存链上。
+
+    chain（期 4，P4-SPEC 2.8.3）：只有带文档标记的文档传真。这时另外认封存范围内的表结构快照经哈希链列出的
+    导入清单、快照清单（以及快照清单各期的导入清单）：这些 id 写在内容寻址、又在封存范围内的表结构快照里，属于
+    封存链的延伸，不是数据库列。扩展集合**惰性**计算：第一次被要一件不在基本范围里的工件时才算，同一个 loader
+    只算一次（一次请求一个 loader）。chain 为假时和期 4 之前完全相同，期 4 之前的文档不会因为任何一份清单出错。
+    """
     allowed = {*sealed.queries, *sealed.schemas, *sealed.retrievals, *(str(a) for _, a in sealed.ledger)}
+    extended: set[str] | None = None
 
     def loader(artifact: str) -> Any:
-        return load(artifact) if sealed.trusted and str(artifact) in allowed else None
+        nonlocal extended
+        key = str(artifact)
+        if not sealed.trusted:
+            return None
+        if key in allowed:
+            return load(key)
+        if not chain:
+            return None
+        if extended is None:
+            extended = _chain_set(sealed)
+        return load(key) if key in extended else None
     return loader
+
+
+def _chain_set(sealed: _Sealed) -> set[str]:
+    """封存范围内每份表结构快照经哈希链列出的清单 id 的并集。表结构快照取不回、哈希不符的跳过（不在链上）。"""
+    out: set[str] = set()
+    for schema_id in sealed.schemas:
+        try:
+            schema = load(schema_id)
+        except ValueError:
+            continue
+        if isinstance(schema, dict):
+            out |= _chain_artifacts(schema, load)
+    return out
+
+
+def _chain_artifacts(schema: dict[str, Any], loader: Callable[[str], Any]) -> set[str]:
+    """一份表结构快照经哈希链列出的清单 id：provenance.chain_artifacts（永不抛异常，坏清单视为不在链上）。
+
+    按名字现取（不用模块顶部绑定的 prov）：测试可以在 sys.modules 里换掉这个模块，核对这里确实委托给它。"""
+    from app.data.provenance import chain_artifacts
+
+    return set(chain_artifacts(schema, loader))
 
 
 def _node_judge(sealed: _Sealed, node_id: str) -> dict[str, Any]:
@@ -1450,7 +1918,8 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
     event = None
     lost = False
     if pending:
-        loader = _sealed_loader(sealed)
+        # 带期 4 标记的文档才让裁判取得到哈希链上的清单（摘录的来历行要用）；老文档的 loader 和以前完全相同
+        loader = _sealed_loader(sealed, chain=doc.get("provenance") == DOC_PROVENANCE)
         masked = await judging.source_masks(catalog, loader=loader)
         request = judging.prepare(doc, catalog, units=pending, loader=loader, masked=masked)
         skipped = dict(request.skipped)

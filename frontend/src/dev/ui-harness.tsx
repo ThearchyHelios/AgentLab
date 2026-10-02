@@ -30,6 +30,7 @@ import evidenceQuery from '../run/__tests__/evidence-query.json'
 import evidenceEntity from '../run/__tests__/evidence-entity.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import evidenceVerdict from '../run/__tests__/evidence-verdict.json'
+import evidenceProvenance from '../run/__tests__/evidence-provenance.json'
 import { EvidenceGuessView } from '../run/EvidenceGuess'
 import { IssuanceBanner } from '../run/AssistantStream'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
@@ -207,6 +208,11 @@ const EV_JUDGE_PLAIN = evidenceJudge.plain.doc as unknown as EvidenceDocData
  */
 const EV_VERDICT = evidenceVerdict.formal.doc as unknown as EvidenceDocData
 const EV_VERDICT_EXPLORE = evidenceVerdict.explore.doc as unknown as EvidenceDocData
+/**
+ * Excel 导入期 4：上传表格的单元格追到原表格子（evidence-provenance.json）。文档由 compose_doc 真跑、带文档标记；
+ * 片段接口、推断来源接口、导入清单的工件都由 check-evidence 用 page.route 伪造（按 runId 认出这一份夹具）
+ */
+const EV_PROVENANCE = evidenceProvenance.doc as unknown as EvidenceDocData
 /** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
 const LEGACY_LOOSE = {
   matched: EV_LEGACY.matched.map(({ start: _s, end: _e, ...m }) => m),
@@ -429,6 +435,20 @@ function EvidenceOnly() {
                   }} />
               </div>
             ))}
+          </div>
+        </div>
+        {/*
+          Excel 导入期 4：推断的来源。宽栏一份、360 宽的画布右栏一份（栏内展开，不出横向滚动）
+        */}
+        <div className="flex flex-col gap-4" id="evidence-provenance-demo">
+          <div id="evidence-provenance" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">上传表格的单元格：数据版本、推断的来源、相关核对</div>
+            <EvidenceDoc doc={EV_PROVENANCE} artifact={evidenceProvenance.doc_artifact} runId={evidenceProvenance.run_id}
+                         label="answer" tally />
+          </div>
+          <div id="evidence-provenance-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_PROVENANCE} artifact={evidenceProvenance.doc_artifact} runId={evidenceProvenance.run_id}
+                         label="answer" dense tally />
           </div>
         </div>
         <div id="evidence-long" className="rounded-lg border p-3">

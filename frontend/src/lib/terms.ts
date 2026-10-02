@@ -341,6 +341,78 @@ export const EVIDENCE_TEXT = {
   guessNone: '未找到数值相同的单元格',
   guessDiff: (d: string) => `相差 ${d}`,
   guessCandidates: '可能来自',
+
+  // ---- 期 4：推断的来源（上传表格的单元格追到原表格子，P4-SPEC 4.2）----
+  // 用词同版本页：不写「快照」「构建」「并集」，写「数据版本」「这一期」「数据文件」；署名一律标「署名（未认证）」。
+  // 不下钻的原因、标红的提示由服务端给原文（provenance_types.REASON_TEXT / ALERT_TEXT），界面原样显示，不在这里另写
+  provenance: {
+    version: '数据版本',
+    /** 首行。每期替换只有一期，不写期数；导入模式的说法同版本页（VERSIONS_TEXT.modeLabel） */
+    versionHead: (source: string, mode: string, n: number) => (mode === 'accumulate'
+      ? `数据源「${source}」· 按期累积 · 共 ${formatNumber(n)} 期`
+      : `数据源「${source}」· 每期替换`),
+    part: (seq: number, start: string, end: string) => `第 ${formatNumber(seq)} 次导入 · 统计期 ${start} 至 ${end}`,
+    partNoPeriod: (seq: number) => `第 ${formatNumber(seq)} 次导入 · 统计期未记录`,
+    /** sha 是原件 sha256 的前 12 位；清单没记哈希时只写文件名 */
+    file: (name: string, sha: string) => (sha ? `文件「${name}」· sha256 ${sha}` : `文件「${name}」`),
+    /** S9：回执里块内各区域的外接矩形和排除的行数。排除 0 行、没有记录时不写 */
+    region: (region: string, excluded: number | null) =>
+      (excluded ? `区域 ${region} · 排除 ${formatNumber(excluded)} 行` : `区域 ${region}`),
+    excluded: (n: number) => `排除 ${formatNumber(n)} 行`,
+    committedAt: (at: string) => `导入于 ${at}`,
+    /** 查询用到的表（与冻结表结构的交集）。原表写明的合计表另注一句：它不能和明细相加 */
+    tables: (names: string[]) => `涉及的表：${names.join('、')}`,
+    totalTable: (name: string) => `${name}（原表写明的合计）`,
+    hasRow: '这一格所在的一期',
+    current: '当前状态',
+    revoked: '这一期的接受已作废',
+    /** 清除原件、作废接受的记录：时间 · 理由 · 署名（未认证）。缺的不写（时间没记时调用方传空串），署名没填写「未填写」 */
+    stateDetail: (at: string, reason: string | null, name: string | null) =>
+      [at, reason ? `理由：${reason}` : '', `署名（未认证）：${name || '未填写'}`].filter(Boolean).join(' · '),
+    /** 这一期写过的接受理由（导入清单里的，是当时的事实）。核对标题取不到时写核对编号 */
+    acceptedLine: (check: string, reason: string, name: string | null) =>
+      `已接受：${check} · ${reason} · 署名（未认证）：${name || '未填写'}`,
+    manifest: '查看导入清单',
+    manifestMasked: '数据源设置了遮罩，导入清单请到数据源卡片上的「版本」查看',
+    unsealed: '本次运行尚未封存或封存核对未通过，以下内容不计入已封存的证据',
+    morePeriods: (n: number) => `另有 ${formatNumber(n)} 期`,
+    title: '推断的来源',
+    badge: '推断，不属于已封存的证据',
+    cell: (sheet: string, ref: string) => `工作表「${sheet}」${ref}`,
+    /** 多期时格子在哪一期的文件里：坐标是那一期原件的坐标，不是别的期的 */
+    fromPart: (seq: number, file: string | null) =>
+      (file ? `取自第 ${formatNumber(seq)} 次导入的文件「${file}」` : `取自第 ${formatNumber(seq)} 次导入`),
+    axisHeader: (ref: string) => `日期取自表头格 ${ref}`,
+    yearPeriod: (cells: string) => (cells ? `年份取自统计期（${cells}）` : '年份取自统计期'),
+    yearHuman: (name: string) => `年份取自人工录入的统计期（署名（未认证）：${name}）`,
+    yearMixed: '这一块的日期表头有的是日期格（自带年份），有的是文本（年份取自统计期），无法确定这一格属于哪一种',
+    /** 格子原文拿不到时（text 为 null）只写坐标，不拿规范写法冒充原文 */
+    rowLabel: (ref: string, text?: string | null) => (text ? `行标签 ${ref}「${text}」` : `行标签 ${ref}`),
+    /** 清单里没有分段标题格的原文，只有配方里的定位文字：照实说是「按配方中的标题定位」 */
+    sectionTitle: (ref: string, title?: string | null) =>
+      (title ? `分段标题 ${ref}（按配方中的标题「${title}」定位）` : `分段标题 ${ref}`),
+    colHeader: (refs: string) => `列表头 ${refs}`,
+    totalLabel: (ref: string, text?: string | null) => (text ? `合计标签 ${ref}「${text}」` : `合计标签 ${ref}`),
+    canonical: (raw: string, canon: string) => `原文「${raw}」，按规范写法存为「${canon}」`,
+    reportedTotal: '原表写明的合计：不要彼此相加，也不要与明细相加',
+    rawPurged: '原件已清除：坐标来自导入时的记录，无法再对照原件',
+    mergedFill: '这一块按合并单元格的左上格填充：如果这一格在合并区域内，值取自该区域的左上格',
+    recheck: '已按主键回查数据文件，值一致',
+    details: '技术细节',
+    recheckSql: '回查 SQL',
+    checks: '相关核对',
+    row: { passed: '这一行成立', mismatch: '这一行不成立', unverifiable: '这一行含空值，未能核对' } as Record<string, string>,
+    cellStatus: {
+      ok: '这一格一致',
+      unverifiable: '这一格未能核对',
+      unknown: '本期有格子未能核对，这一格是否在其中无法确定',
+      not_formula: '这一格是写死的数，不做公式引用核对',
+    } as Record<string, string>,
+    partStatus: { passed: '本期通过', mismatch: '本期不成立', unverifiable: '本期未能核对', info: '口径说明' } as Record<string, string>,
+    accepted: (reason: string, name: string | null) => `已接受，理由：${reason}（署名（未认证）：${name || '未填写'}）`,
+    loading: '正在推断来源…',
+    failed: '未能获取推断的来源',
+  },
 } as const
 
 /** 结论句按裁判结论分成的几堆（lib/evidence 的 claimCounts 数出来的） */
@@ -1074,7 +1146,8 @@ export const VERSIONS_TEXT = {
   /** tokens 是 formatTokens 的结果（带单位），cost 是 formatCost 的结果 */
   aiUsage: (calls: number, tokens: string, cost: string) => `调用模型 ${formatNumber(calls)} 次，共 ${tokens}，约 ${cost}`,
   aiNone: '这次导入没有调用模型',
-  outsideTextNote: '区域外文字只在这里显示，不提供给模型',
+  /** 期 4 起，带来源标记的报告里，裁判摘录会带上可见单元格里的区域外文字（隐藏行列里的不送） */
+  outsideTextNote: '区域外文字不导入数据表；核对报告时，裁判可以看到其中可见单元格的文字',
   revokedBadge: '接受已作废',
   /** 当前版本或回滚目标被别人改过（base_changed、revoke_target_changed）：服务端原话说了变的是什么，这里只说列表已刷新 */
   refreshHint: '列表已刷新，请重新确认',

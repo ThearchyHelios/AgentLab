@@ -9,7 +9,8 @@
    哪一格和那次查询的 SQL；查询给 SQL 前 300 字和被引用的行（最多 20 行，数据源遮罩的列不给；宽表先给
    被引用的列，再补满 12 列）；表附上字段清单和类型（最多 60 个，遮罩的列不列，快照不完整要注明），
    字段附上类型和所属的表，两样都附上出现过的查询 SQL；知识库片段最多 600 字。快照一律经 loader 取
-   （按需裁判传只认封存工件的那个）。规则里写明数字已经由系统核对过
+   （按需裁判传只认封存工件的那个）。规则里写明数字已经由系统核对过。带期 4 文档标记的报告，上传表格的
+   查询在 SQL 之后另有来历行（来源、口径、已接受、区域外文字，_provenance_lines）
 3. 调用（judge_doc）：一份报告合并成一次调用，超过每批的句数就分批；结构化输出失败退回 JSON 解析，
    再失败就记未裁判。thinking 关掉，max_tokens 4096
 4. 预算：每份报告的句数、金额、时长和全局每日金额，每一项都能是 None（不限）。调用前按目录价估算，
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import re
 import time
@@ -43,6 +45,8 @@ from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
+# 只用标准库的契约模块：取文档标记的版本号。识别器、清单模块（direct_select、provenance）在函数体内导入（_provenance_lines）
+from app.data.provenance_types import DOC_PROVENANCE
 from app.data.tabular import UNSHAPED_NOTE
 from app.db.base import SessionLocal
 from app.db.models import Setting
@@ -65,6 +69,8 @@ from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # 常量
@@ -328,7 +334,12 @@ def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
 
 
 def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iterable[str], whole: bool,
-                   fetch: _Fetch, masked: dict[str, Any] | None) -> str | None:
+                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False) -> str | None:
+    """一条查询的摘录：头、SQL、（期 4）来历行、列、被引用的行。
+
+    provenance_on：文档带期 4 标记时为真（prepare 算）。这时上传表格的查询快照（有 data_version）在 SQL 之后、「列：」
+    之前多几行来历（_provenance_lines）；其余情况一个字都不多，期 4 之前的文档、手工源的摘录和以前逐字相同。
+    """
     snapshot = fetch(entry.get("artifact"))
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list):
         return None
@@ -339,6 +350,8 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     sql = _clean(str(snapshot.get("sql") or ""))
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
     hidden = _hidden(snapshot, source, masked)
+    if provenance_on and snapshot.get("data_version"):
+        lines += _provenance_lines(snapshot, fetch, hidden)
     columns = [str(c) for c in snapshot.get("columns") or [] if str(c).lower() not in hidden]
     shown_cols = _shown_columns(columns, cols)
     # 点名引用的行先给，整份引用的再从头补满，一共不超过 EXCERPT_ROWS 行
@@ -359,6 +372,34 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     if hidden & {str(c).lower() for c in snapshot.get("columns") or []}:
         lines.append("（有的列按数据源的设置遮罩了，没有给出）")
     return "\n".join(lines)
+
+
+def _provenance_lines(snapshot: dict[str, Any], fetch: _Fetch, hidden: set[str]) -> list[str]:
+    """上传表格的查询快照的来历行（P4-SPEC 3.2、3.3）：provenance.judge_lines 生成，这里只负责取冻结的表结构快照、
+    算 SQL 用到的表（direct_select.tables_in，和执行这条 SQL 的 SQLite 同一种读法，宁可多认），把现成的遮罩交过去。
+
+    - 两个模块在函数体内导入：judge 被设置接口等地方导入，不能因此拉进整套配方模块；也只有带标记的文档、上传
+      表格的快照才走到这里，期 4 之前的文档一次都不碰它们（测试用桩钉住）；
+    - 工件一律经同一个 fetch 取（按需裁判时是只认封存工件、带标记才扩展到哈希链上清单的那个 loader），取不到、
+      哈希不符的都当没有：judge_lines 据此写「导入清单无法读取…」那一行，不中断摘录；
+    - 确定：同样的工件永远得到同样的行（摘录进断点指纹）。生成过程中出了意外（工件形状不对）同样落到那一行，
+      报告节点的裁判不因一份坏清单整体失败。
+    """
+    from app.data.provenance import SOURCE_BROKEN, judge_lines
+    from app.engine.direct_select import tables_in
+
+    schema_id = snapshot.get("schema_artifact")
+    schema = fetch(schema_id) if schema_id else None
+    schema = schema if isinstance(schema, dict) else None
+    frozen = schema.get("tables") if schema is not None else None
+    tables = {str(name): [str(c.get("name")) for c in (meta.get("columns") or []) if isinstance(c, dict)]
+              for name, meta in frozen.items() if isinstance(meta, dict)} if isinstance(frozen, dict) else {}
+    try:
+        used = tables_in(str(snapshot.get("sql") or ""), tables) if tables else []
+        return judge_lines(snapshot, schema, fetch, tables=used, hidden=hidden)
+    except Exception:  # noqa: BLE001 - 坏形状的工件只让这条查询少了来历，不让整份报告判不了
+        logger.warning("judge: 生成来历行失败", exc_info=True)
+        return [SOURCE_BROKEN]
 
 
 def _sql_line(label: str, sql: str) -> str:
@@ -557,7 +598,9 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
 
 
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
-             masked: dict[str, Any] | None, catalog: dict[str, Any]) -> str | None:
+             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False) -> str | None:
+    """一件证据的摘录。provenance_on 只交给查询摘录（_query_excerpt）：指标摘录里「输入取自查询 Qn」的那几行不加
+    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。"""
     kind = entry.get("kind")
     if kind == "metric":
         return _metric_excerpt(alias, entry, fetch, catalog, masked)
@@ -567,7 +610,8 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
     if kind == "query":
         rows = {r for c in cands for a, r in c.rows if a == alias}
         cols = [col for c in cands for a, col in c.cols if a == alias]
-        return _query_excerpt(alias, entry, rows, cols, any(alias in c.whole for c in cands), fetch, masked)
+        return _query_excerpt(alias, entry, rows, cols, any(alias in c.whole for c in cands), fetch, masked,
+                              provenance_on=provenance_on)
     if kind == "retrieval":
         picked = [h for c in cands for a, h in c.hits if a == alias]
         return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
@@ -666,14 +710,19 @@ def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units
     """裁判的输入：候选句和证据摘录。纯函数（快照经 loader 取，缺省读工件库），不调模型。
 
     catalog 缺省用文档自己存的目录；masked = {数据源名: 要遮的列}，和快照里记下的 mask_columns 合在一起。
+
+    摘录按文档标记分版本（P4-SPEC 1.4、3.3）：带 `provenance: DOC_PROVENANCE` 的文档，上传表格的查询摘录多几行
+    来历；没有标记的（期 4 之前组装的）和以前逐字相同，复用键、断点指纹都不变，已判过的句子照旧复用。
     """
     catalog = catalog if catalog is not None else (doc.get("catalog") or {})
     cands = candidates(doc, units)
     fetch = _Fetch(loader)
+    provenance_on = doc.get("provenance") == DOC_PROVENANCE
     excerpts: dict[str, str] = {}
     for alias in dict.fromkeys(a for c in cands for a in c.aliases):
         entry = catalog.get(alias)
-        if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog)):
+        if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog,
+                                                         provenance_on=provenance_on)):
             excerpts[alias] = text
     picked = {c.unit for c in cands}
     skipped: dict[str, str] = {}
