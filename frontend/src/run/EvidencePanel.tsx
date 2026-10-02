@@ -27,6 +27,7 @@ import type {
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { useEvidenceHost } from './evidenceHost'
+import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
 
 /**
@@ -58,6 +59,9 @@ import { CopyChip } from './Markdown'
  * 裁判拆档（JR）：证据不足的写明缺什么；裁判模型和写作模型相同、模型不在价格表里时在「模型的解释」下提醒；
  * 表名实体步骤列出字段清单；讲方法、讲结构的句子在「挂的依据」下直接列出 SQL 和字段清单。
  *
+ * Excel 导入期 4：上传表格的单元格多三节——数据版本、推断的来源、相关核对（EvidenceProvenance）。只在片段是单元格
+ * 引用、且片段接口的查询步骤带 provenance: true 时请求推断来源接口；推断来源的缓存只在面板开着期间有效。
+ *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
  * 都不是模态的：开着面板照样能在正文里走。
@@ -82,6 +86,10 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, view, 
   onViolations: () => void
 }) {
   const titleId = `${id}-title`
+  // 推断的来源只在面板这次打开期间缓存：回答里有当前状态（原件已清除、接受已作废）和取决于数据文件现状的结论，
+  // 关掉面板（卸载）或换了运行就作废，再打开重新取。同一次打开里来回点同一片段只取一次
+  const holdProvenance = useEvidence((s) => s.holdProvenance)
+  useEffect(() => (runId ? holdProvenance(runId) : undefined), [runId, holdProvenance])
   const found = useMemo(() => (view.kind === 'seg' ? findSeg(doc, view.id) : null), [doc, view])
   const claimAt = useMemo(() => (view.kind === 'unit' ? findUnit(doc, view.id) : null), [doc, view])
   const overlay = useVerdicts(runId, doc.node_id || undefined)
@@ -247,6 +255,10 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
     && (cite?.kind === 'cell' || entry?.kind === 'query' || !!queries.length)
   const bad = state === 'none' || state === 'suspect' || state === 'unverified'
   const closest = closestNames(detail?.closest ?? entityStep?.closest)
+  // 期 4：推断的来源。条件写死成「片段是单元格引用、它的查询步骤带了提示」：期 4 之前的运行、手工源（查询步骤没有
+  // 提示）、指标片段（cite.kind 是 metric，哪怕它链上的查询步骤误带了提示）一个请求都不多发。接口答的是另一份报告
+  // （docForeign）时 detail 为空、链是空的，也就不请求
+  const provenanceOn = !!runId && cite?.kind === 'cell' && queries.some((q) => q.provenance === true)
 
   // 画布右栏：点开片段时把证据路径交给画布（产出证据的节点实线、报告虚线），链取回来后再补全
   const host = useEvidenceHost()
@@ -385,6 +397,8 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       {queries.map((q, i) => (
         <QueryPart key={`${q.artifact ?? ''}-${i}`} id={queryId(i)} step={q} seal={seal} masked={masked} />
       ))}
+
+      {provenanceOn && runId && <EvidenceProvenance runId={runId} segId={seg.id} report={report} />}
 
       {state === 'deterministic' && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
         <p className="text-dim">{sourceOf(seg, doc) || detail?.note}</p>

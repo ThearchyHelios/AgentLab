@@ -550,6 +550,11 @@ export interface OutsideText {
   text: string
   kind: 'text' | 'text_digits' | (string & {})
   period_source?: boolean
+  /**
+   * 期 4：所在行或列是否被隐藏（执行器写入）。true 在隐藏行列里；false 可见；null 或没有这个键：导入时没有记录
+   * （期 4 之前的清单）。裁判摘录只送 false 的项，界面照常显示全部区域外文字
+   */
+  hidden?: boolean | null
 }
 
 /** 试运行回执（Extraction 去掉问题和核对之后给界面看的部分） */
@@ -2117,6 +2122,11 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   note?: string
   /** 数据源改名或删掉了、按查询当时记下的遮罩处理时的那句说明。行照样有 */
   mask_note?: string
+  /**
+   * 期 4：可以请求推断来源（GET …/segments/{sid}/provenance）。只有带文档标记的报告、单元格片段的查询步骤、
+   * 查询快照来自上传的表格时才有，且恒为 true；其余一个键都不加。前端只在 seg.cite?.kind === 'cell' 且它为 true 时请求
+   */
+  provenance?: boolean
   // ---- entity：表或字段（三期）----
   /** entity：table / column */
   kind?: string
@@ -2236,4 +2246,228 @@ export interface EvidenceSegmentDetail {
   redacted?: { columns?: string[] }
   /** 可疑实体：最接近的已知名字（最多 3 个），给「是不是想写…」 */
   closest?: (string | { alias?: string; name?: string; table?: string; kind?: string })[]
+}
+
+// -------------------------------------------------------------------------
+// 期 4：推断的来源（GET /runs/{id}/evidence/segments/{sid}/provenance?report=…）
+// 契约照 backend/app/data/provenance_types.py（asdict 之后的 JSON，P4-SPEC 2.8.1）。这是期 4 新加的接口，
+// 答复里每个键都在（值可以是 null），所以这里不写成可选；老服务端没有这个接口时回 404 且没有 code，三节都不画。
+// -------------------------------------------------------------------------
+
+/** inferred 给出格子；table_only 只给表级来历（version 非空）；none 不画，或只画一句原因 / 红色提示 */
+export type ProvenanceStatus = 'inferred' | 'table_only' | 'none'
+
+/** 不下钻的原因（provenance_types.ReasonCode）。界面不按它拼字，原样显示服务端给的 reason.text */
+export type ProvenanceReasonCode =
+  | 'legacy_doc' | 'not_cell' | 'not_sealed' | 'not_upload' | 'simple_upload' | 'manifest_unreadable'
+  | 'chain_mismatch' | 'expression' | 'alias' | 'multi_table' | 'unparsed' | 'no_pk' | 'pk_missing' | 'masked'
+  | 'null_value' | 'null_pk' | 'snapshot_gone' | 'db_tampered' | 'recheck_missing' | 'recheck_multiple'
+  | 'recheck_mismatch' | 'no_lineage'
+
+/** 标红的提示：出现时 reason.code 与它相同，界面只画提示 */
+export type ProvenanceAlertCode = 'db_tampered' | 'chain_mismatch' | 'manifest_unreadable'
+
+/** 附带的格：日期表头格、行标签、分段标题、列表头、合计标签 */
+export type ProvenanceFromRole = 'axis_header' | 'row_label' | 'section_title' | 'col_header' | 'total_label'
+
+/** 本期结论（照搬清单里 CheckResult.status） */
+export type ProvenancePartStatus = 'passed' | 'mismatch' | 'unverifiable' | 'info'
+/** 这一行的关系核对结果（只给关系核对） */
+export type ProvenanceRowStatus = 'passed' | 'mismatch' | 'unverifiable'
+/** 这一格的合计核对结果（只给 K、G、T） */
+export type ProvenanceCellStatus = 'ok' | 'unverifiable' | 'unknown' | 'not_formula'
+
+export interface ProvenanceReportRef {
+  node_id: string
+  doc_artifact: string
+}
+
+/** 片段本身是单元格引用就给（与 status 无关），不是时为 null */
+export interface ProvenanceCellRef {
+  /** 目录里的查询编号（Q3） */
+  alias: string
+  row: number
+  column: string
+  /** 查询快照的工件 id */
+  artifact: string | null
+}
+
+export interface ProvenanceReason {
+  code: ProvenanceReasonCode
+  /** 细分，给测试和日志用，界面不显示 */
+  detail: string
+  /** 界面原样显示 */
+  text: string
+}
+
+export interface ProvenanceAlert {
+  code: ProvenanceAlertCode
+  text: string
+}
+
+export interface ProvenanceTableRef {
+  name: string
+  kind: 'data' | 'reported_total'
+}
+
+export interface ProvenancePeriod {
+  start: string
+  end: string
+  source: 'cells' | 'human'
+  /** 解析出统计期的格子，带工作表名（「客流汇总!B2」） */
+  cells: string[]
+  /** 人工录入时的署名（未认证） */
+  signed_by: string | null
+}
+
+/** 一条接受理由（导入清单里的，内容寻址，是当时的事实） */
+export interface ProvenanceAcceptance {
+  check_id: string
+  title: string | null
+  kind: 'override' | 'waiver'
+  reason: string
+  signed_by: string | null
+  at: string | null
+}
+
+/** 导入记录上的当前状态（清除原件、作废接受） */
+export interface ProvenanceStateNote {
+  at: string | null
+  signed_by: string | null
+  reason: string | null
+}
+
+/** 数据版本里的一期（按统计期升序）。raw_state、purged、revoked 是当前状态，界面标「当前状态」 */
+export interface ProvenancePart {
+  import_id: string
+  seq: number
+  /** 导入清单的工件 id：「查看导入清单」按它经 /api/artifacts/{id} 取 */
+  manifest: string
+  /** 没有统计期时 null（「统计期未记录」） */
+  period: ProvenancePeriod | null
+  file_name: string | null
+  raw_sha256: string | null
+  /** 区域（「客流汇总!B4:AG30」，多张表用「、」连）；取不到为 null */
+  region: string | null
+  /** 排除的行数之和；期 3 之前的回执没有记录时为 null */
+  excluded_rows: number | null
+  recipe_sha256: string | null
+  /** 配方第几版（当前状态）；取不到为 null */
+  recipe_seq: number | null
+  /** 导入时间（清单的 created_at） */
+  committed_at: string | null
+  /** 署名（未认证） */
+  signed_by: string | null
+  acceptances: ProvenanceAcceptance[]
+  raw_state: 'kept' | 'purged' | 'absent' | null
+  purged: ProvenanceStateNote | null
+  revoked: ProvenanceStateNote | null
+  /** 这一格所在的一期：inferred 时恰好一项为 true */
+  has_row: boolean
+}
+
+/** 数据版本（表级来历），来自封存链上的清单，不加「推断」标注 */
+export interface ProvenanceVersion {
+  source: string
+  snapshot_id: string
+  mode: 'replace' | 'accumulate'
+  union: boolean
+  tables: ProvenanceTableRef[]
+  /** false：数据源设有遮罩，不出「查看导入清单」 */
+  manifest_view: boolean
+  parts: ProvenancePart[]
+}
+
+export interface ProvenanceFromCell {
+  role: ProvenanceFromRole
+  /** 这一格给出的是哪一列的值；宽表指标列的行标签（指标名取自哪一格）为 null */
+  column: string | null
+  sheet: string
+  /** 不带工作表名的坐标（「G4」） */
+  cell: string
+  /** 格子原文；拿不到为 null */
+  text: string | null
+  /** 只给分段标题：配方中的定位文字 */
+  locate_title: string | null
+}
+
+export interface ProvenanceYear {
+  source: 'period' | 'human'
+  cells: string[]
+  signed_by: string | null
+  /** 这一块的日期表头有的是日期格、有的是文本，无法确定这一格属于哪一种 */
+  mixed: boolean
+}
+
+/**
+ * 这一行标签列（交叉表的维度、合计表的合计项）的原文与数据库里的规范写法不同时给出。被引用的是值列也给：
+ * 合计表那一格是「18-22 时合计」→「18-22时合计」，全角标签那一期的值格是「８－９」→「8-9」
+ */
+export interface ProvenanceCanonical {
+  raw: string
+  canonical: string
+}
+
+export interface ProvenanceRecheck {
+  /** 占位符一律是 ?，按主键的顺序与 params 一一对应 */
+  sql: string
+  params: unknown[]
+  ok: boolean
+}
+
+/** 推断出的格子（只在 inferred 时有） */
+export interface ProvenanceCellSource {
+  table: string
+  column: string
+  column_role: 'axis' | 'dim' | 'derive' | 'const' | 'measure' | 'value' | 'text' | (string & {})
+  kind: 'data' | 'reported_total'
+  pk: Record<string, unknown>
+  /** 快照库的 rowid（累积时是合并后的行号） */
+  rowid: number
+  part_seq: number
+  part_rowid: number
+  sheet: string
+  /** 不带工作表名的坐标（「G5」） */
+  cell: string
+  header: string | null
+  unit: string | null
+  from: ProvenanceFromCell[]
+  year: ProvenanceYear | null
+  canonical: ProvenanceCanonical | null
+  raw_purged: boolean
+  /** 列表这一块按合并单元格的左上格填充 */
+  merged_fill: boolean
+  recheck: ProvenanceRecheck
+}
+
+/** 相关核对的一条（只在 inferred 时有） */
+export interface ProvenanceCheck {
+  id: string
+  kind: string
+  title: string
+  part_status: ProvenancePartStatus
+  row_status: ProvenanceRowStatus | null
+  cell_status: ProvenanceCellStatus | null
+  acceptance: ProvenanceAcceptance | null
+  /** K 无法核对时的原因摘要（可能带数字，系统呈现） */
+  detail: string | null
+}
+
+/** GET /runs/{id}/evidence/segments/{sid}/provenance：推断的来源 */
+export interface EvidenceProvenance {
+  schema: 'agentlab.provenance/1' | (string & {})
+  report: ProvenanceReportRef
+  segment: string
+  cell: ProvenanceCellRef | null
+  status: ProvenanceStatus
+  /** status 不是 inferred 时必有 */
+  reason: ProvenanceReason | null
+  /** 标红；有它时不再画 reason.text */
+  alert: ProvenanceAlert | null
+  /** 运行已封存且封存核对通过；false 时数据版本一节加一句未封存 */
+  sealed: boolean
+  /** status 为 none 时为 null */
+  version: ProvenanceVersion | null
+  cell_source: ProvenanceCellSource | null
+  checks: ProvenanceCheck[]
 }

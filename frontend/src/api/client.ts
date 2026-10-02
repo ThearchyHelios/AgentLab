@@ -5,7 +5,7 @@ import type {
 } from '../types'
 import type {
   Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
-  EvidenceAudit, EvidenceJudgeResult, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
+  EvidenceAudit, EvidenceJudgeResult, EvidenceProvenance, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
@@ -891,6 +891,15 @@ export const api = {
      */
     judge: (runId: string, body: { units: string[]; report?: string }) =>
       post<EvidenceJudgeResult>(`/runs/${encodeURIComponent(runId)}/evidence/judge`, body),
+    /**
+     * 推断的来源（期 4）：上传表格的一个单元格来自原表的哪一格、这次查询查的是哪一版数据、相关核对。按需算，
+     * 推断不出来不是错误（200，结论在 status、reason、alert 里）。只在片段接口的查询步骤带 provenance: true 时请求；
+     * 老服务端没有这个接口，回 404 且没有 code。report 同片段接口
+     */
+    provenance: (runId: string, segmentId: string, opts?: RequestOptions & { report?: string }) =>
+      get<EvidenceProvenance>(
+        `/runs/${encodeURIComponent(runId)}/evidence/segments/${encodeURIComponent(segmentId)}/provenance${qs({ report: opts?.report })}`,
+        opts),
     /**
      * 导出审计表：?format=json / csv 作为附件下载。回来的是文件本身和后端给的文件名
      * （Content-Disposition；没给就用 evidence-<运行号前 8 位>.<格式>）

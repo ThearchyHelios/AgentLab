@@ -239,6 +239,11 @@ def _in_spans(spans: list[tuple[int, int]], starts: list[int], x: int) -> bool:
     return i >= 0 and spans[i][0] <= x <= spans[i][1]
 
 
+def _hidden_cell(sh: _Sheet, r: int, c: int) -> bool:
+    """这一格所在的行或列是否被隐藏（OutsideText.hidden）。行列都看：隐藏列里的备注和隐藏行里的一样不外发。"""
+    return sh.hidden_row(r) or sh.hidden_col(c)
+
+
 def _open_sqlite(path: str, *, readonly: bool) -> sqlite3.Connection:
     """关 DQS 的 sqlite3 连接，和核对模块共用 engine.open_checked_sqlite：关不掉就拒绝连接。"""
     return _data_engine.open_checked_sqlite(path, readonly=readonly)
@@ -2475,7 +2480,10 @@ class _Engine:
         coord = sh.coord(r, c)
         sh.roles[role] += 1
         sh.regions.feed_row(r, [(c, role)])
-        self.ex.outside_text.append(OutsideText(sh.name, coord, text, kind, period_source))  # type: ignore[arg-type]
+        # 期 4（P4-SPEC 3.2、调整 10）：记下这格是否在隐藏行列里。裁判摘录只把确知可见的区域外文字全文外发，
+        # 隐藏行列里常是内部备注（H10 的依据正是隐藏内容里实测有口令），不能借裁判多一条外发通道
+        self.ex.outside_text.append(OutsideText(sh.name, coord, text, kind, period_source,  # type: ignore[arg-type]
+                                                hidden=_hidden_cell(sh, r, c)))
         if kind == "text_digits" and not period_source:
             self.problems.add(
                 "outside_digits",
@@ -2551,7 +2559,9 @@ class _Engine:
             sh.regions.feed_row(r, [(c, "context")])
             if not is_pure_period_cell(text, prefer):
                 out.annotated[coord] = period_residue(text) or ""
-                self.ex.outside_text.append(OutsideText(sh.name, coord, text, "text_digits", True))
+                # 带附加文字的统计期格同样是区域外文字，同样记是否隐藏（同 _outside_text）
+                self.ex.outside_text.append(OutsideText(sh.name, coord, text, "text_digits", True,
+                                                        hidden=_hidden_cell(sh, r, c)))
         self.ex.period = out
         cells = list(out.cells)
         if failed:

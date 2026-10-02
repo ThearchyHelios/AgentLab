@@ -54,6 +54,7 @@ from typing import Any, Literal, TypedDict
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.data.names import FILLERS, name_key
+from app.data.provenance_types import DOC_PROVENANCE
 from app.data.tabular import UNSHAPED_NOTE
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.issuance import _tolerance, extract_numbers, number_allowance
@@ -2600,8 +2601,11 @@ def compose_doc(
             if c.get("status") == "resolved" and c.get("alias")}
     kept = {a: e for a, e in catalog.items() if e.get("kind") not in ENTITY_KINDS or a in used}
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
+    # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
+    # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
     doc: dict[str, Any] = {
-        "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "run_id": run_id, "node_id": node_id,
+        "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
+        "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
