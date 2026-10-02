@@ -1,8 +1,10 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { AlertTriangle, CheckCircle2, Info, XCircle } from 'lucide-react'
-import type { CheckResult, ImportProblem, TrialOut } from '../../types'
+import type { CheckResult, FixProposal, ImportProblem, PriorAcceptance, TrialOut } from '../../types'
 import { formatNumber } from '../../lib/format'
-import { CHECK_STATUS_LABEL, LEDGER_ROLE_LABEL, PROBLEM_CATEGORY_LABEL, RECIPE_TEXT } from '../../lib/terms'
+import { CHECK_STATUS_LABEL, LEDGER_ROLE_LABEL, PROBLEM_CATEGORY_LABEL, RECEIPT_BLOCK_TEXT, RECIPE_TEXT } from '../../lib/terms'
+import { FixButtons } from './FixPanel'
+import { RowsDropped } from './ReceiptBlocks'
 import { roleStyle } from './SheetGrid'
 import { CellChips } from './SuggestionCards'
 
@@ -33,7 +35,24 @@ export function CheckStatusChip({ status }: { status: string }) {
   )
 }
 
-function CheckRow({ c, onFocus }: { c: CheckResult; onFocus: (cell: string) => void }) {
+/**
+ * 同一份构建以前被接受过的理由（第 5 节）：只读显示在可接受的核对旁，理由框不预填——接受是对这一期数据的判断，
+ * 预填会让人不看就点
+ */
+export function PriorAcceptances({ items }: { items?: PriorAcceptance[] }) {
+  if (!items?.length) return null
+  return (
+    <ul className="space-y-0.5 text-2xs leading-relaxed text-faint" data-prior-acceptances>
+      {items.map((p, i) => (
+        <li key={`${p.check_id}-${i}`} data-prior-acceptance={p.check_id}>
+          {RECIPE_TEXT.priorAcceptance(p.reason, formatNumber(p.import_seq), p.signed_by || RECIPE_TEXT.priorUnsigned)}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function CheckRow({ c, onFocus, prior }: { c: CheckResult; onFocus: (cell: string) => void; prior?: PriorAcceptance[] }) {
   const failedLine = c.status !== 'passed' && c.status !== 'info' && c.category !== 'info' ? PROBLEM_CATEGORY_LABEL[c.category] : ''
   // 「说明」类（如口径不同的 R2）的 failed 是「两边不相等的个数」，正是预期的结果，不是核对不一致：
   // 不写计数，只看服务端给的细节（「31 天中 0 天相等」）
@@ -60,12 +79,27 @@ function CheckRow({ c, onFocus }: { c: CheckResult; onFocus: (cell: string) => v
         </ul>
       )}
       <CellChips cells={c.cells} onFocus={onFocus} />
+      {c.acceptable && <PriorAcceptances items={prior} />}
     </li>
   )
 }
 
-/** 问题列表：带类别和坐标，点坐标网格滚到那格 */
-export function ProblemList({ problems, onFocus }: { problems: ImportProblem[]; onFocus: (cell: string) => void }) {
+/** 修复提议按 id 查：问题对象上的 fix_ids 指向它 */
+export const fixMap = (fixes?: FixProposal[] | null) => new Map((fixes ?? []).map((f) => [f.id, f]))
+
+/**
+ * 某张改了名的工作表旁该放哪几个「更新工作表名」：提议的 anchor.sheet 就是本期的工作表名（契约 FixAnchor），
+ * 按它对上，同一次有几张表改名时各放各的。没写 sheet 的提议对不上具体哪张，哪里都放；本期表名不知道时
+ * 只放这种，不把别的表的按钮挂过来
+ */
+export const renameFixIds = (fixes: FixProposal[] | null | undefined, sheet: string | null | undefined) => (fixes ?? [])
+  .filter((f) => f.anchor?.kind === 'sheet_renamed' && (!f.anchor.sheet || f.anchor.sheet === sheet)).map((f) => f.id)
+
+/** 问题列表：带类别和坐标，点坐标网格滚到那格；有修复提议的问题旁放修复按钮（只按 fix_ids 放） */
+export function ProblemList({ problems, onFocus, fixes, onFix }: {
+  problems: ImportProblem[]; onFocus: (cell: string) => void
+  fixes?: Map<string, FixProposal>; onFix?: (id: string) => void
+}) {
   if (!problems.length) return null
   return (
     <ul className="space-y-1.5" data-problems>
@@ -77,7 +111,10 @@ export function ProblemList({ problems, onFocus }: { problems: ImportProblem[]; 
               style={{ borderColor: `color-mix(in srgb, ${tone} 40%, var(--border))` }}>
             <div className="text-2xs" style={{ color: tone }}>{PROBLEM_CATEGORY_LABEL[p.category] ?? p.category}</div>
             <div className="leading-relaxed">{p.message}</div>
-            <CellChips cells={p.cells} onFocus={onFocus} max={10} />
+            <div className="flex flex-wrap items-center gap-1.5">
+              <CellChips cells={p.cells} onFocus={onFocus} max={10} />
+              <FixButtons ids={p.fix_ids} fixes={fixes} onFix={onFix} />
+            </div>
           </li>
         )
       })}
@@ -128,11 +165,14 @@ export function ledgerVerdict(trial: TrialOut, expectedSheets?: number) {
   return { ledger, state, missing, total, unclaimed, assigned, balanced, twoPass }
 }
 
-export function ImportReceipt({ trial, expectedSheets, onFocusCell }: {
+export function ImportReceipt({ trial, expectedSheets, onFocusCell, fixes, onFix }: {
   trial: TrialOut
   /** 配方里有几张工作表：账里少了的就是没读到的 */
   expectedSheets?: number
   onFocusCell: (cell: string) => void
+  /** 修复提议（StagingOut.fixes）：问题旁、工作表改名说明旁放修复按钮 */
+  fixes?: FixProposal[]
+  onFix?: (id: string) => void
 }) {
   const r = trial.receipt ?? {}
   const { ledger, state, missing, total, unclaimed, assigned, balanced, twoPass } = ledgerVerdict(trial, expectedSheets)
@@ -152,6 +192,11 @@ export function ImportReceipt({ trial, expectedSheets, onFocusCell }: {
   const outside = r.outside_text ?? []
   // 拒收时执行器在结构问题上就停了（表可能只写了一半），需要录入时根本没写库：行数不能当真
   const written = trial.status === 'passed' || trial.status === 'needs_decision'
+  const byId = fixMap(fixes)
+  // 按 fallback 认出的改名（配方里的名字 → 本期的名字）：「更新工作表名」的提议挂在这里（anchor.kind=sheet_renamed）
+  const renamed = Object.entries((r.sheets?.renamed ?? {}) as Record<string, string>)
+  const excluded = r.rows_excluded ?? []
+  const prior = (id: string) => (trial.prior_acceptances ?? []).filter((p) => p.check_id === id)
 
   return (
     <div className="space-y-3" data-trial-receipt data-trial-id={trial.trial_id}>
@@ -224,6 +269,19 @@ export function ImportReceipt({ trial, expectedSheets, onFocusCell }: {
         </p>
       )}
 
+      {renamed.length > 0 && (
+        <Section title={RECIPE_TEXT.sheetRenamed} attr={{ 'data-sheet-renamed': '' }}>
+          <ul className="space-y-1">
+            {renamed.map(([from, to]) => (
+              <li key={from} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs" data-sheet-renamed-item={to}>
+                <span className="min-w-0 flex-1">{RECIPE_TEXT.sheetRenamedLine(from, to)}</span>
+                <FixButtons ids={renameFixIds(fixes, to)} fixes={byId} onFix={onFix} />
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
       {placeholders.length > 0 && (
         <p className="text-xs text-dim" data-receipt-placeholders>
           {RECIPE_TEXT.placeholderCounts}：{placeholders.map(([text, n]) => RECIPE_TEXT.placeholderCount(text, formatNumber(n))).join('，')}
@@ -232,15 +290,21 @@ export function ImportReceipt({ trial, expectedSheets, onFocusCell }: {
 
       {!!trial.problems?.length && (
         <Section title={RECIPE_TEXT.problems}>
-          <ProblemList problems={trial.problems} onFocus={onFocusCell} />
+          <ProblemList problems={trial.problems} onFocus={onFocusCell} fixes={byId} onFix={onFix} />
         </Section>
       )}
 
       {!!trial.checks?.length && (
         <Section title={RECIPE_TEXT.checks}>
           <ul className="space-y-1.5" data-checks>
-            {trial.checks.map((c) => <CheckRow key={c.id} c={c} onFocus={onFocusCell} />)}
+            {trial.checks.map((c) => <CheckRow key={c.id} c={c} onFocus={onFocusCell} prior={prior(c.id)} />)}
           </ul>
+        </Section>
+      )}
+
+      {excluded.length > 0 && (
+        <Section title={RECEIPT_BLOCK_TEXT.excludedTitle}>
+          <RowsDropped rows={excluded} onFocus={onFocusCell} />
         </Section>
       )}
 

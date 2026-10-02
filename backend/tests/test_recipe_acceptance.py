@@ -238,7 +238,9 @@ async def flow_trial(client, seed: int = SEED, name: str | None = None) -> dict[
     """
     raw, fn = flow_workbook(AUG, 31, seed=seed)
     staged = await stage(client, raw, fn, name)
-    answers = {q["id"]: {"value": "register" if q["id"].startswith("q_relation") else "null"}
+    # 期 3：q_mode（每期怎么更新）答「每期替换」，按参考配方比哈希（P3-SPEC 12.0、1.5）
+    answers = {q["id"]: {"value": "register" if q["id"].startswith("q_relation")
+                         else "replace" if q["id"] == "q_mode" else "null"}
                for q in staged["questions"]}
     after = await answer(client, staged["id"], answers)
     wide = next(t["name"] for t in after["recipe"]["tables"] if t["name"].endswith("_按日"))

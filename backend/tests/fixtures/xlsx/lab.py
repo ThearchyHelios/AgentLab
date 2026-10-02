@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from openpyxl import Workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils.cell import coordinate_from_string
 
 from . import excel_saved, save
 
@@ -29,38 +31,65 @@ def _variant(v: str, allowed: tuple[str, ...]) -> str:
     return v
 
 
-def c01(variant: str = "literal") -> tuple[bytes, str]:
+#: c01 挪位（shift）时，表的上方另加的两行说明（不含数字：只让「挪了位置」这一件事不同，P3-SPEC 11.1）
+C01_SHIFT_NOTES = ("说明：本表为合成测试数据", "说明：口径与上月相同")
+
+
+def _shift_ref(ref: str, dr: int, dc: int) -> str:
+    """「C5」或「C1:F1」整体平移 dr 行、dc 列。"""
+    def one(a: str) -> str:
+        col, row = coordinate_from_string(a)
+        return f"{get_column_letter(column_index_from_string(col) + dc)}{row + dr}"
+    return ":".join(one(a) for a in ref.split(":"))
+
+
+def c01(variant: str = "literal", *, shift: tuple[int, int] = (0, 0)) -> tuple[bytes, str]:
     """表头在 C5，上方标题、单位、编制行，下方合计行、空行、备注。
 
     literal：合计写死；uncached：合计是公式、没有缓存值（openpyxl 直接写出的样子）；cached：补上缓存值。
     期望：列表块 + total_row(pick=合计, keep_as)；区域外含数字的文字只有 C1、C3 两格（outside_digits ×2）。
+
+    shift=(行, 列)（期 3，框选回放验收 4.6 第 2 条）：整张表（含 C1:C3 的标题、单位、编制行和下方的备注、
+    合计公式的引用）整体往下挪若干行、往右挪若干列；往下挪了 2 行及以上时，第 1、2 行另加两行不含数字的说明
+    （C01_SHIFT_NOTES，写在挪位后的首列）。shift=(3, 2) 时表头落在 E8。默认 (0, 0) 与期 2 逐字节相同。
     """
     variant = _variant(variant, C01_VARIANTS)
+    dr, dc = shift
+    if dr < 0 or dc < 0:
+        raise ValueError(f"shift 只能往下、往右挪，收到 {shift!r}")
+
+    def at(ref: str) -> str:
+        return _shift_ref(ref, dr, dc)
+
     book = Workbook()
     ws = book.active
     ws.title = "月报"
-    ws["C1"] = "2026年8月 销售月报"
-    ws.merge_cells("C1:F1")
-    ws["C2"] = "单位：万元"
-    ws["C3"] = "编制：财务部    日期：2026-09-05"
+    ws[at("C1")] = "2026年8月 销售月报"
+    ws.merge_cells(at("C1:F1"))
+    ws[at("C2")] = "单位：万元"
+    ws[at("C3")] = "编制：财务部    日期：2026-09-05"
     for i, h in enumerate(("地区", "产品", "销量", "金额")):
-        ws.cell(5, 3 + i, h)
+        ws.cell(5 + dr, 3 + dc + i, h)
     data = [(ZONES[0], PRODUCTS[0], 10, 100), (ZONES[1], PRODUCTS[1], 20, 120), (ZONES[2], PRODUCTS[2], 15, 80)]
     for r, row in enumerate(data, start=6):
         for i, v in enumerate(row):
-            ws.cell(r, 3 + i, v)
-    ws["C9"] = "合计"
+            ws.cell(r + dr, 3 + dc + i, v)
+    ws[at("C9")] = "合计"
     cached: dict[str, object] = {}
     if variant == "literal":
-        ws["E9"], ws["F9"] = 45, 300
+        ws[at("E9")], ws[at("F9")] = 45, 300
     else:
-        ws["E9"], ws["F9"] = "=SUM(E6:E8)", "=SUM(F6:F8)"
+        ws[at("E9")], ws[at("F9")] = f"=SUM({at('E6:E8')})", f"=SUM({at('F6:F8')})"
         if variant == "cached":
-            cached = {"E9": 45, "F9": 300}
+            cached = {at("E9"): 45, at("F9"): 300}
     # 备注不含数字：这一格若带数字会多出一条 outside_digits，与 9.3 的期望（C1、C3 两格）不符
-    ws["C11"] = "注：数据来源于业务系统，金额含税。"
-    ws["C12"] = "制表人：经办甲"
-    return excel_saved(save(book), "月报", cached), f"c01_{variant}.xlsx"
+    ws[at("C11")] = "注：数据来源于业务系统，金额含税。"
+    ws[at("C12")] = "制表人：经办甲"
+    if dr >= 2:
+        for i, note in enumerate(C01_SHIFT_NOTES):
+            ws.cell(1 + i, 3 + dc, note)
+    name = f"c01_{variant}.xlsx" if shift == (0, 0) else f"c01_{variant}_shifted.xlsx"
+    return excel_saved(save(book), "月报", cached), name
 
 
 def c04() -> tuple[bytes, str]:

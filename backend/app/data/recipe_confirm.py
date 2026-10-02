@@ -17,9 +17,22 @@ id 里的键一律按契约「键的格式」：分段、块用 id，工作表�
 rows_after_stop 就没了；上传新一期漏传现行配方，破坏性变更和单位变化就没了），而提交时重算用的是同一个
 函数，服务端也发现不了。所以 kind 只认四种；reupload、redraft 必须给现行配方和上一期回执；extraction
 必须带齐 EXTRACTION_KEYS、不能是部分干跑；checks 必须给；有上一期时差异卡必须给（可以是空列表）。
+
+期 3（P3-SPEC 6.2、9.5）：
+- **只列有变化的配方类确认项**：首次、切换、采用「按规则重新起草」（recipe_origin=rules_redraft）仍列全部；其余
+  上传新一期、修改配方只列 recipe_item_signatures 与现行配方不同的项。没变的项在现行配方提交时已经由人确认过
+  （TableRecipe.confirmations），重复勾选只会让人习惯性地全勾。例外：按本期数据才出、或内容随数据变的几项
+  （忽略的列、列表的公式按保存值、年份取自统计期、隐藏行列、忽略规则命中的行），实际内容与上一期回执不同也照列
+  （_data_signatures）：配方变了时差异卡不再逐项比较，只看签名的话，上次没出、从没人确认过的这几项就漏了；
+- 新确认项：修改记录（fix:*、select:*）、redraft_adopted、按期累积的计划（period_replace、accumulate_restart、
+  retire、mode_switch、accumulate_unit_risk）、忽略规则（ignore_rows、ignore_outside）。ConfirmItem.source 标出
+  来源（recipe / edit / accumulate / outside / sheet / context / diff / switch），界面按它分组。
 """
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +41,7 @@ from app.data.recipe_diff import (
     ReceiptIncomplete, col_letter, outside_of, period_annotated, period_of, period_texts, plain, receipt_of,
     require_receipt, rows_text, same_period_sentence, short, split_coord,
 )
-from app.data.recipe_parsers import match_key, period_residue, split_unit_suffix
+from app.data.recipe_parsers import UNITS, match_key, period_residue, split_unit_suffix
 from app.data.recipe_types import (
     ConfirmItem, CrosstabBlock, DerivedSegment, Dismissed, ListBlock, MeasuresSegment, NotComparable, Recipe,
     SheetRecipe, SumEq, derive_tables,
@@ -75,6 +88,19 @@ class ConfirmContext:
     facts: Any = None
     #: 数据源现在设的遮罩列（options.mask_columns）。切换、改配方之后列名变了，遮罩按列名匹配会静默失效（AU-6）
     mask_columns: list[str] | None = None
+    #: 期 3：累积计划（AccumulatePlan 或它的 asdict）。新配方 mode=accumulate、或者现行是累积时由试运行给出；
+    #: period_replace、accumulate_restart、retire、mode_switch、accumulate_unit_risk 由它出
+    accumulate: Any = None
+    #: 期 3：暂存区里已应用的修改（StagingOut.edits 的形状），每条出 fix:<key> 或 select:<key>。调用方只传未被
+    #: 覆盖的；superseded 为真的这里也会跳过（PUT 之后它们的效果可能已经不在新配方里）
+    edits: list[dict[str, Any]] | None = None
+    #: 期 3：recipe_origin=rules_redraft 时 compare_recipes(现行, 采用的配方) 的结果，redraft_adopted 据此逐条列出
+    #: 变化；不给时按 old_recipe 现算
+    redraft_compare: dict[str, Any] | None = None
+    #: 期 3：区域外文字的差异项（accumulate_unit_risk 用）；不给时从 diff 里取 outside_* 和统计期写法的项。
+    #: diff_reports 收到追加或替换该期的累积计划时，配方变了也比区域外文字，所以通常不用另给；另算时用
+    #: recipe_diff.outside_items(上一期, 本期)，不能传空列表顶替（传了就只看它，单位变化会静默消失）
+    outside_diff: list[Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -336,17 +362,22 @@ def switch_changes(old_schema_cache: dict[str, Any] | None, new_recipe: Recipe |
 
 
 class _Bag:
-    """按出现顺序收集，id 重复的只留第一条。"""
+    """按出现顺序收集，id 重复的只留第一条。keep 不为 None 时只收 keep(id) 为真的（只列有变化的配方类项）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, keep: Callable[[str], bool] | None = None) -> None:
         self.items: list[ConfirmItem] = []
         self._ids: set[str] = set()
+        self.keep = keep
 
     def add(self, item_id: str, label: str, detail: str = "", source: str = "recipe") -> None:
-        if item_id in self._ids:
+        if item_id in self._ids or (self.keep is not None and not self.keep(item_id)):
             return
         self._ids.add(item_id)
         self.items.append(ConfirmItem(id=item_id, label=label, detail=detail, required=True, source=source))
+
+    def into(self, other: "_Bag") -> None:
+        for i in self.items:
+            other.add(i.id, i.label, i.detail, i.source)
 
 
 def _validate(ctx: ConfirmContext) -> dict[str, Any]:
@@ -378,13 +409,16 @@ def _validate(ctx: ConfirmContext) -> dict[str, Any]:
 
 
 def confirm_items(ctx: ConfirmContext) -> list[ConfirmItem]:
-    """生成必勾的确认项（P2-SPEC 7.5）。顺序：单位变化（排最前）、其余破坏性变更、切换、配方类、AI 类、本期类、差异卡。
+    """生成必勾的确认项（P2-SPEC 7.5、P3-SPEC 6.2、9.5）。顺序：单位变化（排最前）、其余破坏性变更、切换、
+    按期累积（重新开始、切换模式、退役、替换该期、单位风险）、采用重新起草、配方类、修改记录、AI 类、本期类、差异卡。
 
+    配方类：首次、切换、采用按规则重新起草时列全部；其余只列签名与现行配方不同的（recipe_item_signatures）。
     输入不全时抛 ValueError（缺键时是它的子类 ReceiptIncomplete），见模块 docstring。
     """
     ex = _validate(ctx)
     recipe = as_recipe(ctx.recipe)
     old = as_recipe(ctx.old_recipe) if ctx.old_recipe is not None else None
+    plan = _plan(ctx.accumulate)
     bag = _Bag()
     differs = recipe_differs(ctx.kind, recipe, old)
 
@@ -395,10 +429,17 @@ def confirm_items(ctx: ConfirmContext) -> list[ConfirmItem]:
                 bag.add(f"unit_changed:{ch.table}.{ch.column}",
                         f"表「{ch.table}」列「{ch.column}」的单位 {_unit_name(ch.old)} → {_unit_name(ch.new)}："
                         "数量级或含义可能不同，引用它的报告口径会变")
+        retired_tables, retired_existing = _retired_scope(plan)
         grouped: dict[str, list[str]] = {}
         for ch in changes:
-            if ch.kind != "unit":
-                grouped.setdefault(ch.table, []).append(ch.message)
+            if ch.kind == "unit":
+                continue
+            # 同一张表已有 retire:*（按期累积时退役的列和表保留在并集里），删除或改名就不在 breaking 里再列一遍；
+            # 早已退役的同样不列（P3-SPEC 2.5）
+            if ch.kind in ("column_removed", "table_removed") and (
+                    ch.table in retired_tables or (ch.table, ch.column) in retired_existing):
+                continue
+            grouped.setdefault(ch.table, []).append(ch.message)
         for table, msgs in grouped.items():
             bag.add(f"breaking:{table}", f"表「{table}」：" + "；".join(msgs))
 
@@ -410,13 +451,26 @@ def confirm_items(ctx: ConfirmContext) -> list[ConfirmItem]:
             tail = ("以下表和列将消失或改变：" + "；".join(lines)) if lines else "原有的表和列都保留"
         bag.add("switch_from_simple", "从简单导入切换为按配方导入：" + tail, source="switch")
 
+    if plan is not None:
+        _accumulate_items(bag, plan, ctx, recipe, old)
+    if ctx.recipe_origin == "rules_redraft":
+        _redraft_item(bag, ctx, recipe, old)
+
     if differs and ctx.mask_columns:
         _mask_items(bag, ctx, recipe, old)
 
     if differs:
-        _recipe_items(bag, recipe, ex, ctx.facts, ai=ctx.recipe_origin in ("ai", "mixed"))
-        if ctx.recipe_origin in ("ai", "mixed"):
-            _ai_items(bag, recipe)
+        # 首次、切换、采用重新起草：列全部（重新起草的分段定位、标签集合、工作表匹配名不在签名里，任何一项都
+        # 兜不住，评审一-M6）。其余只列新增的、签名变了的
+        full = ctx.kind in ("first", "switch") or ctx.recipe_origin == "rules_redraft" or old is None
+        sub = _Bag(None if full else _changed_items(recipe, old, ex, ctx.prev))
+        _recipe_items(sub, recipe, ex, ctx.facts, ai=ctx.recipe_origin in ("ai", "mixed"))
+        sub.into(bag)
+
+    _edit_items(bag, ctx.edits)
+
+    if differs and ctx.recipe_origin in ("ai", "mixed"):
+        _ai_items(bag, recipe)
 
     _period_items(bag, recipe, ex, ctx)
 
@@ -425,6 +479,458 @@ def confirm_items(ctx: ConfirmContext) -> list[ConfirmItem]:
         if isinstance(d, dict) and d.get("requires_confirm") and d.get("confirm_id"):
             bag.add(str(d["confirm_id"]), str(d.get("label") or ""), str(d.get("detail") or ""), source="diff")
     return bag.items
+
+
+# --------------------------------------------------------------------------
+# 期 3：只列有变化的配方类确认项（P3-SPEC 6.2）
+# --------------------------------------------------------------------------
+
+
+def _sig(*parts: Any) -> str:
+    return json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _signatures(recipe: Recipe, sheet_name: Callable[[SheetRecipe], str]) -> dict[str, str]:
+    """确认项 id → 签名（只看配方内容，不看本期计数）。按工作表出的 id 用 sheet_name(工作表) 拼：比较时两份配方
+    按工作表 id 换成同一个名字（本期实际的工作表名），所以只改了匹配名（⑨ 更新工作表名）不算变化。"""
+    out: dict[str, str] = {}
+    for sheet in recipe.sheets:
+        name = sheet_name(sheet)
+        if sheet.context:
+            out[f"cross_check_off:{name}"] = _sig(sheet.context[0].cross_check)
+        out[f"hidden:{name}"] = _sig(sheet.hidden.rows, sheet.hidden.cols)
+        out[f"ignore_outside:{name}"] = _sig(sorted((match_key(r.anchor), r.reason) for r in sheet.ignore_outside))
+        for block in sheet.blocks:
+            for p in block.values.placeholders:
+                out.setdefault(f"placeholder:{p.text}", _sig(p.meaning))
+            out[f"text_number:{block.id}"] = _sig(block.values.text_number)
+            out[f"formula_cached:{block.id}"] = _sig(block.values.formula)
+            ignore_cols = sorted((match_key(r.header), r.reason) for r in block.ignore_columns)
+            if isinstance(block, CrosstabBlock):
+                out[f"blank_null:{block.id}"] = _sig(block.values.blank)
+                out[f"checks_relaxed:{block.id}"] = _sig(sorted(k for k in _AXIS_CHECK if k not in block.axis.checks))
+                out[f"year_from:{block.id}"] = _sig(block.axis.year_from)
+                out[f"ignored_columns:{block.id}"] = _sig(None, ignore_cols)
+                out[f"ignore_rows:{block.id}"] = _sig(sorted((match_key(r.label), r.reason) for r in block.ignore_rows))
+                for seg in block.segments:
+                    if isinstance(seg, DerivedSegment):
+                        keep = seg.keep_as.table if seg.keep_as else None
+                        out[f"derived:{seg.id}"] = _sig(keep, sorted(match_key(x) for x in seg.labels.expect))
+            else:
+                out[f"merged_fill:{block.id}"] = _sig(block.merged_data)
+                out[f"ignored_columns:{block.id}"] = _sig(block.extra_columns, ignore_cols)
+                out[f"blank_skip:{block.id}"] = _sig(block.rows.blank_rows)
+                total = block.rows.total_row
+                out[f"total_row:{block.id}"] = _sig(
+                    None if total is None else (total.label_column, total.pick, total.keep_as))
+    for r in recipe.relations:
+        if isinstance(r, SumEq):
+            out[f"relation:{r.id}"] = _sig("sum_eq", r.table, r.total, sorted(r.parts))
+        elif isinstance(r, NotComparable):
+            out[f"relation:{r.id}"] = _sig("not_comparable", r.a.table, r.a.value, r.b.table, r.b.value, r.by)
+        elif isinstance(r, Dismissed):
+            out[f"dismissed:{r.claims}"] = _sig(r.reason)
+    tables, _ = derive_tables(recipe)
+    for t, cols in tables.items():
+        for c in cols:
+            out[f"unit:{t}.{c.name}"] = _sig(c.unit, c.header)
+    out["mode"] = _sig(recipe.mode)
+    return out
+
+
+def recipe_item_signatures(recipe: Recipe | dict[str, Any]) -> dict[str, str]:
+    """配方类确认项 id → 签名（P3-SPEC 6.2 的表）。改配方之后只列「新增的、签名变了的」配方类项。
+
+    签名只看配方内容：占位符的含义、空格与千分位与公式的处理、合并单元格、缺的日期断言、文件名核对、
+    忽略的列（多出的列怎么处理加按表头忽略的表头和理由）、跳过空行、合计段与合计行、年份来源、关系、不登记的理由、
+    单位与来源标签、隐藏行列的策略、导入模式、按行标签忽略和按同一行文字忽略的锚点加理由。
+    分段定位（标题、标签集合、after_title）、工作表匹配名、列的来源标签不在签名里：来自修复按钮时有 fix:*，来自
+    框选时有 select:*，来自手工修改时有破坏性变更和对照界面，来自按规则重新起草时按首次导入列全部。
+
+    按工作表出的 id（cross_check_off、hidden、ignore_outside）这里用配方里的工作表名拼；confirm_items 比较时
+    两份配方按工作表 id 换成本期实际的工作表名。
+
+    签名只是一半：confirm_items 另按本期数据和上一期回执比较几项按数据出的确认项（_data_signatures，不在这个公开
+    函数里，因为它要读回执）。
+    """
+    return _signatures(as_recipe(recipe), lambda s: s.match.name)
+
+
+def _changed_items(recipe: Recipe, old: Recipe, ex: dict[str, Any],
+                   prev: dict[str, Any] | None) -> Callable[[str], bool]:
+    """「这个配方类确认项要不要列出」：新配方里新增的 id，签名与现行配方不同的，或者按本期数据出的内容与上一期
+    不同的（_data_signatures）。没有签名定义的 id 照列（宁可多勾一项，不能漏）。工作表按 id 换成本期实际的名字，
+    两份配方用同一个名字比。"""
+    matched = (ex.get("sheets") or {}).get("matched") or {}
+
+    def name(sheet: SheetRecipe) -> str:
+        return str(matched.get(sheet.id) or sheet.match.name)
+
+    new, old_sig = _signatures(recipe, name), _signatures(old, name)
+    p_rec = receipt_of(prev) if prev is not None else {}
+    now, before = _data_signatures(recipe, ex), _data_signatures(recipe, p_rec)
+
+    def keep(item_id: str) -> bool:
+        if item_id not in new or old_sig.get(item_id) != new[item_id]:
+            return True
+        return item_id in now and before.get(item_id) != now[item_id]
+
+    return keep
+
+
+def _data_signatures(recipe: Recipe, rec: dict[str, Any]) -> dict[str, str | None]:
+    """按数据出的那几种配方类确认项 → 本期（或上一期回执）的实际内容（P3-SPEC 6.2 的补充，评审意见 H3）。
+
+    为什么要有：签名只看配方内容，但下面几项在期 2 里只在本期数据满足条件时才出，或者内容随数据变：
+    - ignored_columns:<块>：实际被忽略的表头集合（extra_columns=ignore 时本期没有多出的列就不出）；
+    - formula_cached:<列表块>：本期有没有按保存值导入的公式格（列表的默认取值就是放宽，有公式格才出）；
+    - year_from:<块>：日期表头的写法集合（表头都是完整日期时不出）；
+    - hidden:<工作表>：照常导入或排除的是哪些隐藏行列；
+    - ignore_rows:<块> / ignore_outside:<工作表>：忽略规则命中的锚点和行数。
+    配方没变时这些变化由差异卡兜住（diff:ignored:、diff:axis_form:、diff:hidden:、diff:ignored_rows:），但配方变了时
+    差异卡只给行数和统计期（recipe_diff 的模块 docstring）。只比签名的话，同一暂存区里应用过一次修复，上一次提交时
+    没出、从未被人确认过的这几项就永远不用确认了。所以配方变了时，这几项的实际内容和上一期回执（ctx.prev，现行
+    导入的导入清单）不同也照列。
+
+    回执里缺对应字段（期 3 之前的导入没有 rows_excluded、手写的最小回执）时值为 None：一边 None、一边有值就算不同，
+    照列；两边都缺则相同。工作表按 id 换成各自回执里的实际工作表名（改了名的照样对得上）。
+    """
+    out: dict[str, str | None] = {}
+    matched = (rec.get("sheets") or {}).get("matched") or {}
+
+    def name(sheet: SheetRecipe) -> str:
+        return str(matched.get(sheet.id) or sheet.match.name)
+
+    def has(field: str) -> bool:
+        return field in rec
+
+    ignored = rec.get("ignored_columns") or {}
+    forms: dict[str, list[str]] = {}
+    for a in rec.get("axes") or []:
+        if isinstance(a, dict):
+            forms.setdefault(str(a.get("block")), []).append(str(a.get("form") or ""))
+    excluded = [e for e in (plain(x) for x in rec.get("rows_excluded") or []) if isinstance(e, dict)]
+
+    def hits(reason: str, pred: Callable[[dict[str, Any]], bool]) -> str | None:
+        if not has("rows_excluded"):
+            return None
+        rows: dict[str, int] = {}
+        for e in excluded:
+            if e.get("reason") == reason and pred(e):
+                key = match_key(e.get("anchor") or "")
+                rows[key] = rows.get(key, 0) + sum(int(b) - int(a) + 1 for a, b in e.get("rows") or [])
+        return _sig(sorted(rows.items()))
+
+    hidden = rec.get("hidden") or {}
+    for sheet in recipe.sheets:
+        sname = name(sheet)
+        h = hidden.get(sname) if isinstance(hidden.get(sname), dict) else {}
+        out[f"hidden:{sname}"] = _sig(sorted(int(r) for r in h.get("rows") or [] if str(r).isdigit()),
+                                      sorted(str(c) for c in h.get("cols") or [])) if has("hidden") else None
+        out[f"ignore_outside:{sname}"] = hits("ignored_outside", lambda e, s=sname: e.get("sheet") == s)
+        for block in sheet.blocks:
+            out[f"ignored_columns:{block.id}"] = (_sig(sorted({match_key(h) for h in ignored.get(block.id) or []}))
+                                                  if has("ignored_columns") else None)
+            if isinstance(block, CrosstabBlock):
+                out[f"year_from:{block.id}"] = _sig(sorted(set(forms.get(block.id, [])))) if has("axes") else None
+                out[f"ignore_rows:{block.id}"] = hits("ignored_rows", lambda e, b=block.id: e.get("block") == b)
+            else:
+                out[f"formula_cached:{block.id}"] = (_sig(int(rec.get("formula_cells_accepted") or 0) > 0)
+                                                     if has("formula_cells_accepted") else None)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 期 3：修改记录、重新起草、按期累积（P3-SPEC 9.5）
+# --------------------------------------------------------------------------
+
+
+def _edit_items(bag: _Bag, edits: list[dict[str, Any]] | None) -> None:
+    """每条已应用、未被覆盖的修改出一项：修复 fix:<目标键>，框选 select:<as>:<块或分段 id>。文案是修改的标题，
+    细节是人话摘要和署名（未认证）。"""
+    for e in edits or []:
+        e = plain(e)
+        if not isinstance(e, dict) or e.get("superseded") or not e.get("key"):
+            continue
+        prefix = "select" if e.get("kind") == "selection" else "fix"
+        title = str(e.get("title") or "").strip() or ("按框选修改了配方" if prefix == "select" else "用修复按钮修改了配方")
+        summary = e.get("summary")
+        detail = "；".join(str(x) for x in summary) if isinstance(summary, list) else str(summary or "")
+        if e.get("signed_by"):
+            detail = "；".join(x for x in (detail, f"署名（未认证）：{e['signed_by']}") if x)
+        bag.add(f"{prefix}:{e['key']}", title, detail, source="edit")
+
+
+def _compare_lines(cmp: dict[str, Any]) -> list[str]:
+    """compare_recipes 的结果里，分段、标签、工作表名、列来源的变化，逐条写成人话（redraft_adopted 用）。"""
+    lines: list[str] = []
+    for seg in cmp.get("segments") or []:
+        sid, status = seg.get("id"), seg.get("status")
+        title = seg.get("title") or {}
+        labels = seg.get("labels") or {}
+        if status in ("added", "removed"):
+            # 新增、去掉的分段写出标题和全部标签：起草器换了分段 id 时，新分段的定位规则只在这里经人确认
+            # （配方类确认项里没有分段的标题和标签）
+            new = status == "added"
+            head = title.get("new" if new else "old")
+            tags = labels.get("added" if new else "removed") or []
+            what = "".join([f"，标题「{head}」" if head else "",
+                            "，标签" + "".join(f"「{x}」" for x in tags) if tags else ""])
+            lines.append(f"{'新增' if new else '去掉'}分段「{sid}」{what}")
+            continue
+        if status == "changed" and title.get("old") != title.get("new"):
+            lines.append(f"分段「{sid}」的标题「{title.get('old') or '无'}」→「{title.get('new') or '无'}」")
+        if labels.get("added"):
+            lines.append(f"分段「{sid}」加入标签" + "".join(f"「{x}」" for x in labels["added"]))
+        if labels.get("removed"):
+            lines.append(f"分段「{sid}」去掉标签" + "".join(f"「{x}」" for x in labels["removed"]))
+        ignore = seg.get("ignore") or {}
+        if ignore.get("added"):
+            lines.append(f"「{sid}」新增忽略规则：" + "、".join(str(x) for x in ignore["added"]))
+        if ignore.get("removed"):
+            lines.append(f"「{sid}」去掉忽略规则：" + "、".join(str(x) for x in ignore["removed"]))
+    for sh in cmp.get("sheets") or []:
+        nm = sh.get("name") or {}
+        if nm.get("old") != nm.get("new"):
+            lines.append(f"工作表名「{nm.get('old') or '无'}」→「{nm.get('new') or '无'}」")
+    for t in cmp.get("tables") or []:
+        for c in t.get("columns") or []:
+            o, n = c.get("old") or {}, c.get("new") or {}
+            if o.get("source") != n.get("source") and (o.get("source") or n.get("source")):
+                lines.append(f"表「{t.get('name')}」列「{c.get('name')}」的来源"
+                             f"「{o.get('source') or '无'}」→「{n.get('source') or '无'}」")
+    return lines
+
+
+def _redraft_item(bag: _Bag, ctx: ConfirmContext, recipe: Recipe, old: Recipe | None) -> None:
+    """采用了按规则重新起草的配方（P3-SPEC 6.3）：起草器识别出的定位规则要逐项经过人的确认，不能因为只列
+    有变化的配方类项就直接成为现行配方（H3）。"""
+    cmp = plain(ctx.redraft_compare)
+    if not isinstance(cmp, dict):
+        if old is None:
+            raise ValueError("采用按规则重新起草的配方时必须给现行配方或对照结果，否则无法列出变化")
+        from app.data.recipe_compare import compare_recipes  # 循环导入：recipe_compare 用本模块的 table_changes
+
+        cmp = compare_recipes(old, recipe)
+    lines = _compare_lines(cmp)
+    head = "采用按规则重新起草的配方："
+    if not lines:
+        bag.add("redraft_adopted", head + "分段、标签、工作表名和列的来源与现行配方相同", source="edit")
+        return
+    shown = "；".join(lines[:6]) + (f"等 {len(lines)} 处" if len(lines) > 6 else "")
+    bag.add("redraft_adopted", head + shown, "；".join(lines), source="edit")
+
+
+def _plan(data: Any) -> dict[str, Any] | None:
+    plan = plain(data)
+    if plan is None:
+        return None
+    if not isinstance(plan, dict) or not plan.get("action"):
+        raise ValueError("累积计划不完整：缺少 action，无法确定要确认的项")
+    return plan
+
+
+def _span(p: Any) -> tuple[str, str] | None:
+    if not isinstance(p, dict) or not p.get("start") or not p.get("end"):
+        return None
+    return str(p["start"]), str(p["end"])
+
+
+def _spans(parts: list[Any]) -> str:
+    return "、".join(f"{s} 至 {e}" for s, e in (_span(p) for p in parts or []) if s) if parts else ""
+
+
+def _blocker_text(part: dict[str, Any]) -> str:
+    msgs = [str(b.get("message") if isinstance(b, dict) else b) for b in part.get("blockers") or []]
+    return "；".join(m for m in msgs if m)
+
+
+def _retired_scope(plan: dict[str, Any] | None) -> tuple[set[str], set[tuple[str, str | None]]]:
+    """breaking 去重的范围：有 retire:* 的表（只在追加、替换该期时出），以及早已退役的 (表, 列)。"""
+    if plan is None or plan.get("mode") != "accumulate" or plan.get("action") not in ("append", "replace_period"):
+        return set(), set()
+    tables = {str(e.get("table")) for e in plan.get("retired_new") or [] if isinstance(e, dict)}
+    existing = {(str(e.get("table")), e.get("column")) for e in plan.get("retired_existing") or []
+                if isinstance(e, dict)}
+    return tables, existing
+
+
+#: 区域外文字里提示单位或口径的词（P3-SPEC 2.5）
+_SCOPE_WORDS = ("单位", "口径", "统计范围", "计量")
+#: 含单位字、却不是在说单位的常见词。按规格「出现即算」，只把这些词先去掉再找单位词：单字单位（人、元、个、件、户）
+#: 太容易出现在别的词里，「编制人：测试员甲」→「编制人：测试员乙」这种每期都可能变的落款不该要求确认单位。
+#: 只列确定不是单位的词；拿不准的（人数、件数、户数）不列，宁可多确认一次
+_UNIT_STOPWORDS = (
+    "编制人", "填报人", "填表人", "制表人", "负责人", "联系人", "审核人", "复核人", "审批人", "批准人", "经办人",
+    "统计人", "报送人", "签发人", "核对人", "人员", "人工", "单元", "元旦", "文件", "附件", "条件", "事件", "邮件",
+    "软件", "用户", "账户", "客户", "门户", "个别", "各个", "整个", "个人", "个月",
+    # 「单位」在这几个词里指填报的机构，不是计量单位
+    "填报单位", "编制单位", "报送单位", "制表单位", "责任单位",
+)
+
+
+def _unit_pattern() -> re.Pattern[str]:
+    """单位词（P3-SPEC 2.5：新旧文字里出现 UNITS 词表中的词，或出现「单位」「口径」「统计范围」「计量」之一）。
+    出现就算，不论前后是什么：「货运量按吨统计」→「按件统计」、「每户」→「每人」、「元/件」→「元/个」都是单位真的变了。
+    误报靠 _UNIT_STOPWORDS 先去掉（_unit_tokens）。单位前面的数量级（万、千、百、亿）算进同一个词：「人次」→「万人次」
+    要能比出不同；多字的排在单字前面，「人次」不会被拆成「人」。"""
+    units = sorted(UNITS, key=len, reverse=True)
+    alt = "|".join(re.escape(u) for u in units)
+    scope = "|".join(map(re.escape, _SCOPE_WORDS))
+    return re.compile(rf"(?:{scope})|(?:[万千百亿]?(?:{alt}))")
+
+
+_UNIT_RE = _unit_pattern()
+#: 停用词按长度从长到短排进正则：长词先匹配，不会被其中的短词截断
+_STOP_RE = re.compile("|".join(re.escape(w) for w in sorted(_UNIT_STOPWORDS, key=len, reverse=True)))
+
+
+def _unit_tokens(text: str) -> list[str]:
+    """文字里的单位、口径词（去掉停用词之后）。停用词换成「|」：它不是单位，也不会和前后的字拼成新词。"""
+    return sorted(m.group(0) for m in _UNIT_RE.finditer(_STOP_RE.sub("|", canon(text))))
+
+
+#: 区域外文字的差异项，以及统计期格写法的变化（D12 那种）：单位、口径的说明可能写在这些格里
+_OUTSIDE_KINDS = ("outside_added", "outside_removed", "outside_changed", "context_text", "context_source_added")
+
+
+def _unit_risks(ctx: ConfirmContext, recipe: Recipe, old: Recipe | None) -> list[str]:
+    """按期累积时单位写在配方之外、只表现为区域外文字变化的那几种（评审一-M10）。返回涉及单位或口径的变化。"""
+    out: list[str] = []
+    source = ctx.outside_diff if ctx.outside_diff is not None else ctx.diff
+    for d in source or []:
+        d = plain(d)
+        if not isinstance(d, dict) or d.get("kind") not in _OUTSIDE_KINDS:
+            continue
+        # 只看差异项里的原文（detail：全文或「上一期：…；本期：…」），不看 label 里的坐标和工作表名
+        if _unit_tokens(str(d.get("detail") or "")):
+            out.append(str(d.get("label") or ""))
+    if old is not None:
+        # 分段标题（D09 那种改字）：只在新旧标题里的单位、口径词不同时算。标题里常年写着「（人次）」，只改了别的字
+        # 就报，会让每次改标题都多一项必勾
+        titles = {s.id: s.locate.title for s in _segments(old) if getattr(s.locate, "title", None)}
+        for seg in _segments(recipe):
+            new_title, old_title = getattr(seg.locate, "title", None), titles.get(seg.id)
+            if new_title and old_title and _unit_tokens(new_title) != _unit_tokens(old_title):
+                out.append(f"分段「{seg.id}」的标题「{old_title}」→「{new_title}」")
+    return out
+
+
+def _segments(recipe: Recipe) -> list[Any]:
+    return [s for sheet in recipe.sheets for b in sheet.blocks if isinstance(b, CrosstabBlock) for s in b.segments]
+
+
+def _switch_to_accumulate_text(plan: dict[str, Any], ctx: ConfirmContext, dropped: list[dict[str, Any]]) -> str | None:
+    """mode_switch:replace->accumulate 冒号后面那一句（P3-SPEC 2.4 表）。按 action 分开写，不能只看 parts：
+
+    - append：当前那一期原样保留，parts 里它是 new=False 的那一项；
+    - replace_period：当前那一期被本次替换（修改配方后重新导入同一个文件，或者同一统计期再传），parts 里只有本期，
+      被替换的那一期在 replaces。只看 parts 找不到「第一期」，早先因此落到「当前版本没有统计期」，与同一清单里的
+      period_replace 自相矛盾（评审意见）；
+    - restart：配方变化不兼容；
+    - first：当前那一期没有统计期，或者它的配方不满足资格，只有这里才写这两种原因；
+    - rejected：试运行拒收（部分重叠），不能提交，不出这一项（拒收的原因在问题列表里），返回 None。
+    """
+    action = plan.get("action")
+    if action == "append":
+        kept = next((p for p in plan.get("parts") or [] if isinstance(p, dict) and not p.get("new")), None)
+        sp = _span(kept)
+        if sp is None:
+            raise ValueError("累积计划是追加，但结果里没有可作为第一期保留的当前那一期")
+        return f"当前版本的 {sp[0]} 至 {sp[1]} 作为第一期保留，此前被替换的各期不会补回"
+    if action == "replace_period":
+        rep = plan.get("replaces") if isinstance(plan.get("replaces"), dict) else None
+        sp = _span(rep)
+        if sp is None:
+            raise ValueError("累积计划是替换该期，但没有给出被替换那一期的统计期")
+        if ctx.kind == "redraft":
+            return f"当前版本的 {sp[0]} 至 {sp[1]} 按修改后的配方重新导入，作为第一期，此前被替换的各期不会补回"
+        return f"本次导入替换当前版本的 {sp[0]} 至 {sp[1]}，作为第一期，此前被替换的各期不会补回"
+    if action == "restart":
+        return "表结构有不兼容的变化，当前版本不能作为第一期：启用后当前版本只含本期"
+    if action == "first":
+        blocked = next((p for p in dropped if p.get("blockers")), None)
+        if blocked is not None:
+            return (f"当前版本的配方不满足按期累积的要求（{_blocker_text(blocked)}），不能作为第一期："
+                    "启用后当前版本只含本期")
+        # 计划里当前那一期是 dropped 的最后一项（plan_accumulate 取最晚的一期判资格）
+        if not dropped or _span(dropped[-1]) is None:
+            return "当前版本没有统计期，不能作为第一期：启用后当前版本只含本期"
+        why = f"（{plan['reason']}）" if plan.get("reason") else ""
+        return f"当前版本不能作为第一期{why}：启用后当前版本只含本期"
+    return None
+
+
+def _accumulate_items(bag: _Bag, plan: dict[str, Any], ctx: ConfirmContext, recipe: Recipe,
+                      old: Recipe | None) -> None:
+    """按期累积的必勾项（P3-SPEC 2.4、2.5、9.5），来源都是 accumulate。"""
+    action, switch = plan.get("action"), plan.get("mode_switch")
+    dropped = [p for p in plan.get("dropped") or [] if isinstance(p, dict)]
+    n = len(dropped)
+    before = f"此前 {n} 期" if n else "此前各期"
+
+    if action == "restart":
+        changes = [str(x) for x in plan.get("semantic") or []]
+        for p in dropped:
+            # 已是累积模式、某一期的配方不满足资格（blockers）也走 restart，变化一栏写明是哪一期、为什么
+            text, sp = _blocker_text(p), _span(p)
+            if text:
+                where = f"{sp[0]} 至 {sp[1]} 这一期" if sp else "此前的一期"
+                changes.append(f"{where}的配方不满足按期累积的要求：{text}")
+        what = "（" + "；".join(changes) + "）" if changes else ""
+        bag.add("accumulate_restart",
+                f"表结构有不兼容的变化{what}：启用后当前版本只含本期，{before}不再出现在当前版本中，之后各期在本期基础上"
+                "继续累积；可以在数据源卡片的「版本」中启用此前的版本",
+                "如果不想重新开始累积，请返回修改配方（例如保留原来的单位、列名或常量取值）", source="accumulate")
+
+    if switch == "accumulate->replace":
+        spans = _spans(dropped)
+        bag.add("mode_switch:accumulate->replace",
+                f"从按期累积改为每期替换：启用后当前版本只含本期，{before}" + (f"（{spans}）" if spans else "")
+                + "不再出现在当前版本中，可以在数据源卡片的「版本」中启用此前的版本", source="accumulate")
+    elif switch == "replace->accumulate":
+        text = _switch_to_accumulate_text(plan, ctx, dropped)
+        if text is not None:
+            bag.add("mode_switch:replace->accumulate", "从每期替换改为按期累积：" + text, str(plan.get("reason") or ""),
+                    source="accumulate")
+
+    accumulating = plan.get("mode") == "accumulate" and action in ("append", "replace_period")
+    if accumulating:
+        for e in plan.get("retired_new") or []:
+            if not isinstance(e, dict) or not e.get("table"):
+                continue
+            t, c = str(e["table"]), e.get("column")
+            if c:
+                bag.add(f"retire:{t}.{c}", f"表「{t}」的列「{c}」自本期起不再导入：早期各期保留原值，本期起为空值",
+                        "如果是改名：旧列名保留早期各期的值，新列名从本期起有值，两列并存", source="accumulate")
+            else:
+                bag.add(f"retire:{t}", f"表「{t}」自本期起不再导入：早期各期的行保留，本期起没有新的行",
+                        "如果是改名：旧表保留早期各期的行，新表从本期起有行，两张表并存", source="accumulate")
+
+    if action == "replace_period":
+        rep = plan.get("replaces") if isinstance(plan.get("replaces"), dict) else {}
+        sp = _span(rep) or _span(plan.get("period"))
+        if sp is None:
+            raise ValueError("累积计划是替换该期，但没有给出被替换那一期的统计期")
+        if ctx.kind == "redraft":
+            label = f"用修改后的配方重新导入最近一期 {sp[0]} 至 {sp[1]}：启用后该期以本次为准，其余各期不变"
+        else:
+            src = []
+            if rep.get("seq") is not None:
+                src.append(f"第 {rep['seq']} 次导入")
+            if rep.get("file_name"):
+                src.append(f"「{short(rep['file_name'])}」")
+            label = (f"替换已有的一期 {sp[0]} 至 {sp[1]}" + (f"（{''.join(src)}）" if src else "")
+                     + "：启用后该期以本次为准")
+        bag.add(f"period_replace:{sp[0]}~{sp[1]}", label, source="accumulate")
+
+    if accumulating:
+        risks = _unit_risks(ctx, recipe, old)
+        if risks:
+            shown = "；".join(risks[:3]) + (f"等 {len(risks)} 处" if len(risks) > 3 else "")
+            bag.add("accumulate_unit_risk",
+                    f"区域外的说明文字有变化，且涉及单位或口径（{shown}）：确认后，本期与此前各期按同一单位累积在同一列中。"
+                    "如果单位已经变了，请返回修改配方里的单位（这会重新开始累积）", "；".join(risks), source="accumulate")
 
 
 def _mask_items(bag: _Bag, ctx: ConfirmContext, recipe: Recipe, old: Recipe | None) -> None:
@@ -509,11 +1015,19 @@ def _recipe_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], facts: Any, *, 
             bag.add(f"cross_check_off:{name}", f"工作表「{name}」的统计期不与文件名里的日期核对")
 
     ignored = ex.get("ignored_columns") or {}
-    for b in lists:
+    for _, _, b in blocks:
         heads = [str(h) for h in ignored.get(b.id) or []]
-        if b.extra_columns == "ignore" and heads:
+        extra = isinstance(b, ListBlock) and b.extra_columns == "ignore"
+        if b.ignore_columns:
+            # 期 3 的按表头忽略（修复按钮 ⑥、框选）：配置了就出，写明每条规则和理由，细节里是本期实际忽略的列
+            rules = "、".join(f"「{short(r.header, 20)}」（理由：{short(r.reason)}）" for r in b.ignore_columns)
+            tail = "；其余多出的列也不导入" if extra else ""
+            now = "本期忽略的列：" + "、".join(heads) if heads else "本期没有命中的列"
+            bag.add(f"ignored_columns:{b.id}", f"「{b.id}」按表头忽略列：{rules}{tail}", now)
+        elif extra and heads:
             bag.add(f"ignored_columns:{b.id}", f"「{b.id}」不导入这些列：" + "".join(f"「{short(h, 20)}」" for h in heads),
                     "、".join(heads))
+    _ignore_rule_items(bag, recipe, ex)
     skips = [b for b in lists if b.rows.blank_rows == "skip"]
     for b in skips:
         n = f"（本期 {int(ex.get('blank_rows_skipped') or 0)} 行）" if len(skips) == 1 else ""
@@ -590,7 +1104,58 @@ def _recipe_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], facts: Any, *, 
         if parts:
             bag.add(f"hidden:{name}", f"工作表「{name}」的" + "；".join(parts))
 
-    bag.add("mode", "导入模式：每期替换" if recipe.mode == "replace" else "导入模式：按期累积")
+    # 两种取值的后果（P3-SPEC 2.2，评审三-m4）：首次导入时由人确认，这就是 D14 的「首次导入时由人确认」
+    bag.add("mode", "导入模式：每期替换" if recipe.mode == "replace" else "导入模式：按期累积", MODE_DETAIL[recipe.mode])
+
+
+#: 导入模式两种取值的后果（q_mode 卡片和确认项 mode 用同一句）
+MODE_DETAIL = {
+    "accumulate": "每期以统计期为键加入当前版本；统计期与已有各期部分重叠的文件会被拒收，同一统计期再传要确认替换",
+    "replace": "每次上传新一期，当前版本只含新的一期，此前各期留在历史版本中",
+}
+
+
+def _excluded_rows(ex: dict[str, Any], reason: str) -> list[dict[str, Any]] | None:
+    """本期 rows_excluded 里某种原因的项；回执里没有这个字段（期 3 之前）时 None，个数就不写。"""
+    if "rows_excluded" not in ex:
+        return None
+    entries = (plain(x) for x in ex.get("rows_excluded") or [])
+    return [e for e in entries if isinstance(e, dict) and e.get("reason") == reason]
+
+
+def _row_count(entries: list[dict[str, Any]]) -> int:
+    return sum(int(b) - int(a) + 1 for e in entries for a, b in (e.get("rows") or []))
+
+
+def _rule_text(anchor: str, reason: str, entries: list[dict[str, Any]] | None) -> str:
+    """「「补录（人次）」（理由：…；本期 1 行）」。本期命中几行按 rows_excluded 里锚点相同（match_key）的项数。"""
+    tail = ""
+    if entries is not None:
+        hit = [e for e in entries if match_key(e.get("anchor") or "") == match_key(anchor)]
+        tail = f"；本期 {_row_count(hit)} 行"
+    return f"「{short(anchor, 20)}」（理由：{short(reason)}{tail}）"
+
+
+def _ignore_rule_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any]) -> None:
+    """期 3 的忽略规则（修复按钮 ⑥ 和框选写入）：按行标签忽略 ignore_rows:<块>、按同一行文字忽略区域外的数字
+    ignore_outside:<工作表>。配置了就出，写上每条规则的理由和本期命中的行数（可以是 0）。"""
+    rows = _excluded_rows(ex, "ignored_rows")
+    for sheet in recipe.sheets:
+        for b in sheet.blocks:
+            if isinstance(b, CrosstabBlock) and b.ignore_rows:
+                mine = None if rows is None else [e for e in rows if e.get("block") == b.id]
+                rules = "、".join(_rule_text(r.label, r.reason, mine) for r in b.ignore_rows)
+                bag.add(f"ignore_rows:{b.id}", f"「{b.id}」按行标签忽略：{rules}",
+                        "；".join(f"「{r.label}」：{r.reason}" for r in b.ignore_rows))
+    outside = _excluded_rows(ex, "ignored_outside")
+    for sheet in recipe.sheets:
+        if not sheet.ignore_outside:
+            continue
+        name = _sheet_name(ex, sheet)
+        mine = None if outside is None else [e for e in outside if e.get("sheet") == name]
+        rules = "、".join(_rule_text(r.anchor, r.reason, mine) for r in sheet.ignore_outside)
+        bag.add(f"ignore_outside:{name}", f"工作表「{name}」按同一行的文字忽略导入区域之外的数字：{rules}",
+                "；".join(f"「{r.anchor}」：{r.reason}" for r in sheet.ignore_outside))
 
 
 def _coord_of(d: dict[str, Any]) -> str:
@@ -744,7 +1309,14 @@ def _outside_exempt(o: dict[str, Any], p_out: dict[str, dict[str, Any]], p_per: 
 
 def _stop_block(problem: dict[str, Any], recipe: Recipe, ex: dict[str, Any]) -> str:
     """rows_after_stop 属于哪个列表块。问题对象里没有块键，按工作表和溯源的列范围找：同一工作表上被空行停下的
-    列表块只有一个就是它；有多个时取列范围与问题格相交、数据在问题格之上、最靠近的那个。"""
+    列表块只有一个就是它；有多个时取列范围与问题格相交、数据在问题格之上、最靠近的那个。
+
+    执行器的消息里写着「列表「块」」，恰好认出一个块时直接用它。跳过空行的列表按表下说明收尾时也会报这个问题
+    （WP-8 修补 3 与评审意见 4），下面按 blank_rows=stop 找候选的办法找不到它。"""
+    message = str(problem.get("message") or "")
+    named = [b.id for _, _, b in _blocks(recipe, ex) if isinstance(b, ListBlock) and f"列表「{b.id}」" in message]
+    if len(named) == 1:
+        return named[0]
     cells = [split_coord(c) for c in problem.get("cells") or []]
     sheet = next((s for s, _, _ in cells if s), None)
     rows = [r for _, r, _ in cells if r is not None]

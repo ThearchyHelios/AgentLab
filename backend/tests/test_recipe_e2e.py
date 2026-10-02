@@ -195,6 +195,10 @@ def answer_all(questions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         values = [o["value"] for o in q["options"]]
         if q["id"].startswith("q_relation"):
             out[q["id"]] = {"value": "register"}
+        elif q["id"] == "q_mode":
+            # 期 3：q_mode 的 values[0] 是「按期累积」，配方哈希就不再等于参考配方。期 2 的用例都按每期替换走
+            # （P3-SPEC 12.0、1.5）；要累积的用例显式答 accumulate
+            out[q["id"]] = {"value": "replace"}
         elif "null" in values:
             out[q["id"]] = {"value": "null"}
         else:
@@ -257,11 +261,13 @@ async def test_step01_02_first_import_matches_the_reference_recipe_and_9_1(clien
     assert resp.status_code == 200, resp.text
     st = resp.json()
     assert set(st["answers"]) == {q["id"] for q in st["questions"]}
+    answered = st["answers"]
     wide = next(t["name"] for t in st["recipe"]["tables"] if t["name"] not in ("时段客流", "时段客流_表内合计"))
     resp = await client.put(f"{API}/imports/{sid}/recipe", json={"recipe": rename_wide(st["recipe"], wide, "日客流")})
     assert resp.status_code == 200, resp.text
     st = resp.json()
-    assert st["recipe_problems"] == [] and st["answers"] == {}
+    # 期 3（第 8 节遗留项 2）：改名之后的配方仍然体现每一个回答，回答照旧保留，没有被丢弃的
+    assert st["recipe_problems"] == [] and st["answers"] == answered and st["answers_dropped"] == []
     ref, ref_problems = recipe.validate_recipe(FLOW_RECIPE, origin="manual")
     mine, mine_problems = recipe.validate_recipe(st["recipe"], origin="manual")
     assert ref_problems == [] and mine_problems == []
@@ -980,27 +986,16 @@ async def test_rejected_reupload_is_fixed_by_editing_the_recipe_and_committed(cl
     assert resp.status_code == 200, resp.text
     st = resp.json()
     assert st["status"] == "drafting"
-    # 2.2 第 2 条：pick 必须是本段新标题的候选词。「日间」不是「日间分时段客流（人次）」的候选词，静态校验
-    # 报 const_not_candidate，path 指到 pick（表单把问题显示在常量下拉旁边），下拉的选项来自 candidates
-    assert [p["code"] for p in st["recipe_problems"]] == ["const_not_candidate"], st["recipe_problems"]
-    assert st["recipe_problems"][0]["path"].endswith("/const/时段类别/pick")
-    options = st["candidates"].get("日间分时段客流（人次）")
-    assert options, st["candidates"]
-    seg["const"]["时段类别"]["pick"] = options[0]
-    resp = await client.put(f"{API}/imports/{sid}/recipe", json={"recipe": fixed})
-    assert resp.status_code == 200, resp.text
-    st = resp.json()
-    assert st["recipe_problems"] == [] and st["status"] == "drafting"
+    # 期 3（P3-SPEC 3.3 (b)，第 8 节遗留项 3）：pick「日间」是现行配方里确认过的、仍逐字出现在新标题里，沿用它
+    # 不是新编的文字，静态校验放行；常量列的值不变，不是破坏性变更
+    assert st["recipe_problems"] == [], st["recipe_problems"]
     resp = await trial(client, sid)
     st = resp.json()
     assert st["trial"]["status"] == "passed", st["trial"]["problems"]
     ids = all_confirms(st)
-    # 配方变了：配方类确认项重新出现（mode、单位……）。表结构没变，但常量「时段类别」只能另选新标题的候选词，
-    # 这一列的值整列从「日间」变了：7.5 的 breaking_changes 报常量取值变化（集成验收补，原来这里静默换值），
-    # 必须出 breaking:时段客流 让人确认，别的表不报
-    assert "mode" in ids and [i for i in ids if i.startswith("breaking:")] == ["breaking:时段客流"], ids
-    label = next(i["label"] for i in st["trial"]["confirm_items"] if i["id"] == "breaking:时段客流")
-    assert f"列「时段类别」取值「日间」→「{options[0]}」" in label, label
+    # 6.2：只列签名与现行配方不同的配方类项，导入模式没变就不再出；只改标题、不改 pick，表结构和常量都没变，
+    # 没有 breaking:*
+    assert "mode" not in ids and [i for i in ids if i.startswith("breaking:")] == [], ids
     resp = await commit(client, st)
     assert resp.status_code == 201, resp.text
     out = resp.json()
@@ -1010,6 +1005,41 @@ async def test_rejected_reupload_is_fixed_by_editing_the_recipe_and_committed(cl
         recipes = {r.seq: r.status for r in (await session.execute(
             select(TableRecipe).where(TableRecipe.source_id == source_id))).scalars()}
     assert recipes == {1: "superseded", 2: "active"}
+    assert await count(client, name, "日客流") == 30
+
+
+async def test_rejected_reupload_fixed_by_picking_a_new_word_still_reports_breaking(client):
+    """D09 改标题时另选新标题的候选词（期 2 的修法）：常量「时段类别」整列从「日间」换了值，7.5 的 breaking_changes
+    报常量取值变化，必须出 breaking:时段客流 让人确认，别的表不报（期 3 起只改标题可以沿用旧词，见上一个用例）。"""
+    name = unique()
+    base = await first_import(client, name, seed=119)
+    source_id = base["commit"]["source"]["id"]
+    raw, fn = DRIFT_CASES["D09"].build(119)
+    st = (await reupload(client, source_id, raw, fn)).json()
+    sid = st["id"]
+    assert st["trial"]["status"] == "rejected"
+    fixed = json.loads(json.dumps(st["recipe"], ensure_ascii=False))
+    seg = next(s for s in fixed["sheets"][0]["blocks"][0]["segments"] if s["id"] == "日间")
+    seg["locate"]["title"] = "日间分时段客流（人次）"
+    resp = await client.put(f"{API}/imports/{sid}/recipe", json={"recipe": fixed})
+    assert resp.status_code == 200, resp.text
+    options = resp.json()["candidates"].get("日间分时段客流（人次）")
+    assert options and options[0] != "日间", resp.json()["candidates"]
+    seg["const"]["时段类别"]["pick"] = options[0]
+    resp = await client.put(f"{API}/imports/{sid}/recipe", json={"recipe": fixed})
+    assert resp.status_code == 200, resp.text
+    st = resp.json()
+    assert st["recipe_problems"] == [] and st["status"] == "drafting"
+    resp = await trial(client, sid)
+    st = resp.json()
+    assert st["trial"]["status"] == "passed", st["trial"]["problems"]
+    ids = all_confirms(st)
+    assert "mode" not in ids and [i for i in ids if i.startswith("breaking:")] == ["breaking:时段客流"], ids
+    label = next(i["label"] for i in st["trial"]["confirm_items"] if i["id"] == "breaking:时段客流")
+    assert f"列「时段类别」取值「日间」→「{options[0]}」" in label, label
+    resp = await commit(client, st)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["source"]["current_recipe"]["seq"] == 2
     assert await count(client, name, "日客流") == 30
 
 

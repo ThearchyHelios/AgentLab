@@ -254,6 +254,15 @@ export interface CurrentSnapshot {
   file_name: string
   /** 原件：kept 保存在服务端；purged 已清除；absent 没有保存（迁移前上传的老版本） */
   raw_state: 'kept' | 'purged' | 'absent' | (string & {})
+  /** 期 3：导入模式。简单导入、期 3 之前的版本没有或为 null（按每期替换理解） */
+  mode?: 'replace' | 'accumulate' | (string & {}) | null
+  /** 期 3：当前版本含几期（按期累积时可以多于 1） */
+  periods?: number
+  /** 期 3：各期统计期的最早起点、最晚终点；没有统计期为 null */
+  period_start?: string | null
+  period_end?: string | null
+  /** 期 3：最近一次成为当前版本的时刻（回滚之后卡片写「…启用」，不再写当初的导入时间） */
+  activated_at?: string | null
 }
 
 /**
@@ -330,6 +339,8 @@ export interface UploadResult {
   snapshot_id?: string
   /** 同一份文件、同样的选项以前导入过，沿用了那次的库 */
   build_reused?: boolean
+  /** 期 3：服务端的同版本数据文件曾被改动，已用本次上传的文件恢复（P3-SPEC 第 8 节遗留项 1） */
+  build_restored?: boolean
   /** reason：hidden 隐藏工作表不导入；empty 没有内容。state：visible / hidden / veryHidden */
   skipped_sheets?: { sheet: string; state: string; reason: string }[]
   conversions?: UploadConversion[]
@@ -357,6 +368,8 @@ export interface RecipeProblem {
   path: string
   code: string
   message: string
+  /** 期 3：这条问题对应的修复提议 id（Staging.fixes 里的 FixProposal.id）；没有提议为 [] 或缺省 */
+  fix_ids?: string[]
 }
 
 /** structure 结构问题；data_quality 数据质量；confirm 需确认；input 需要录入；recipe 配方不合法 */
@@ -368,7 +381,12 @@ export interface ImportProblem {
   category: ImportProblemCategory
   message: string
   cells?: string[]
+  /** 修复按钮的种类（FixKind）；界面不靠它放按钮，只按 fix_ids 放（P3-SPEC 3.1） */
   fix?: string | null
+  /** 期 3：构造修复补丁的参数（只含原文和坐标），界面不直接用：补丁由服务端算 */
+  fix_args?: Record<string, any> | null
+  /** 期 3：这条问题对应的修复提议 id（Staging.fixes 里的 FixProposal.id）；没有提议为 [] 或缺省 */
+  fix_ids?: string[]
 }
 
 export type CheckStatus = 'passed' | 'mismatch' | 'unverifiable' | 'info' | (string & {})
@@ -391,13 +409,20 @@ export interface CheckResult {
   reasons?: Record<string, number>
 }
 
-/** 启用前要逐条勾选的一项（契约 ConfirmItem；id 的取值见 P2-SPEC 7.5） */
+/**
+ * 确认项的来源（契约 ConfirmItem.source），确认清单按它分组（P3-SPEC 9.5）：recipe 配方；edit 修改（fix:*、select:*、
+ * redraft_adopted）；accumulate 累积；outside / sheet / context 本期；diff 差异；switch 切换
+ */
+export type ConfirmSource = 'recipe' | 'diff' | 'outside' | 'sheet' | 'context' | 'switch' | 'edit' | 'accumulate' | (string & {})
+
+/** 启用前要逐条勾选的一项（契约 ConfirmItem；id 的取值见 P2-SPEC 7.5、P3-SPEC 9.5） */
 export interface ConfirmItem {
   id: string
   label: string
   detail?: string
   required?: boolean
-  source?: string
+  /** 缺省按 recipe */
+  source?: ConfirmSource
 }
 
 /** 上传新一期与上一期相比的一条差异（契约 DiffItem） */
@@ -480,11 +505,13 @@ export interface GridPreview {
   hidden_cols?: number[]
 }
 
-/** 格子的去向（契约 Role），按区域给出 */
+/** 格子的去向（契约 Role），按区域给出。期 3 新增角色 ignored（按配方忽略） */
 export interface RegionMark {
   sheet: string
   role: string
   ref: string
+  /** 期 3：所在块的 id（区域外文字、统计期为 null）：网格按块描边、框选的重放比对按它过滤 */
+  block?: string | null
 }
 
 /** 格子账：每张工作表的非空格和各去向的个数 */
@@ -537,6 +564,10 @@ export interface TrialReceipt {
   formula_cells_accepted?: number
   full_calc_on_load?: boolean
   db_sha256?: string
+  /** 期 3：排除的行（H2）。期 3 之前的回执没有这个字段：缺省表示「未记录」，不等于「没有排除」。
+   * 服务端：试运行回执（TrialOut.receipt）只抄 recipe_imports._RECEIPT_VIEW 白名单里的键，WP-5 要把
+   * rows_excluded 加进去；导入清单的 receipt 也要有。期 3 的试运行一律带这个键（没有排除时是 []） */
+  rows_excluded?: ExcludedRows[]
   [key: string]: any
 }
 
@@ -558,6 +589,14 @@ export interface TrialOut {
   diff?: DiffItem[] | null
   same_as_import?: { id: string; seq: number } | null
   base_snapshot_id?: string | null
+  /** 期 3：累积计划。新配方是按期累积、或现行是按期累积时给出 */
+  accumulate?: AccumulatePlan | null
+  /** 期 3：工作配方与现行配方不同时的新旧对照 */
+  recipe_compare?: RecipeComparison | null
+  /** 期 3：并集的结构核对 U1–U3（物化了才有） */
+  union_checks?: CheckResult[] | null
+  /** 期 3：同一份构建以前被接受过的理由，只读显示，不预填 */
+  prior_acceptances?: PriorAcceptance[]
 }
 
 /** AI 起草的结果摘要 */
@@ -605,6 +644,20 @@ export interface Staging {
   marks: RegionMark[]
   trial: TrialOut | null
   context_inputs?: Record<string, { start: string; end: string; signed_by?: string | null }>
+  /** 最近一次试运行时数据源的当前版本（与 trial.base_snapshot_id 同值；提交时对不上回 409 base_changed）。
+   *  数据源还没有当前版本（首次导入）或没试运行过时为 null；试运行作废后保留原值。
+   *  所以不能拿它是不是 null 判断「试运行过没有」，那要看 trial 与 status */
+  base_snapshot_id?: string | null
+  /** 提交后生成的导入记录 id；未提交为 null */
+  committed_import_id?: string | null
+  /** 期 3：修复提议（按当前问题现算）。问题对象上的 fix_ids 指向这里的 id */
+  fixes?: FixProposal[]
+  /** 期 3：当前工作配方的哈希（撤销是否可用、预览是否过期都按它判断） */
+  recipe_sha256?: string | null
+  /** 期 3：已应用的修改（修复、框选），按 seq 升序 */
+  edits?: StagingEdit[]
+  /** 期 3：改配方后不再成立、被移除的回答 */
+  answers_dropped?: AnswerDropped[]
   created_at?: string
   updated_at?: string
   expires_at?: string
@@ -632,6 +685,12 @@ export interface CommitOut {
   build_reused: boolean
   /** 与某次导入完全相同，未新建版本 */
   unchanged: boolean
+  /** 期 3：服务端的同版本数据文件曾被改动，已用本次上传的文件恢复 */
+  build_restored?: boolean
+  /** 期 3：启用后当前版本含几期 */
+  parts?: number
+  /** 期 3：与此前某个版本内容相同，直接启用了那个版本 */
+  snapshot_reused?: boolean
 }
 
 /** GET /{source_id}/recipe：当前启用的配方（补全了默认值） */
@@ -644,6 +703,530 @@ export interface CurrentRecipe {
   confirmations: { id: string; label: string; at: string }[]
   signed_by: string | null
   activated_at: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 期 3：修复按钮、框选、按期累积、配方对照、版本页（P3-SPEC 第 9 节）。字段与后端 recipe_types.py 的 dataclass
+// 和接口的 JSON 同名（Selection 的 as 除外：后端 dataclass 叫 as_，JSON 里是 as）
+// ---------------------------------------------------------------------------
+
+/** 修复按钮的九种（契约 FIX_KINDS） */
+export type FixKind =
+  | 'remove_label' | 'add_label' | 'edit_members' | 'rename_title' | 'declare_total' | 'ignore_cells'
+  | 'declare_placeholder' | 'declare_hidden' | 'rename_sheet' | (string & {})
+
+/** 修复提议的一个封闭选项。效果由服务端算：界面只发 fix_id、value 和理由 */
+export interface FixOption {
+  value: string
+  label: string
+  detail?: string
+  /** 选它必须写理由（1–200 字）：理由填好后才预览，理由改了要重新预览 */
+  needs_reason?: boolean
+  breaking?: boolean
+}
+
+/** 提议对应哪一条问题：problem / recipe_problem 按下标，sheet_renamed 按本期的工作表名 */
+export interface FixAnchor {
+  kind: 'problem' | 'recipe_problem' | 'sheet_renamed' | (string & {})
+  index?: number | null
+  sheet?: string | null
+}
+
+/** 修复提议（Staging.fixes 的一项，契约 FixProposal） */
+export interface FixProposal {
+  /** fx- 加 12 位十六进制：同样的问题得到同样的 id */
+  id: string
+  kind: FixKind
+  problem_code: string | null
+  title: string
+  cells: string[]
+  target: Record<string, any>
+  options: FixOption[]
+  anchor: FixAnchor
+}
+
+/** 框选「选它是什么」的封闭取值（契约 SELECTION_AS） */
+export type SelectionAs =
+  | 'list' | 'crosstab' | 'segment' | 'derived' | 'section_title' | 'ignore_rows' | 'ignore_columns' | 'ignore_outside'
+
+/** 框选的参数（按 as 取用：list 用 header_rows、table、bottom；segment 用 role、table；derived 用 keep；
+ * section_title 用 segment；ignore_* 用 reason） */
+export interface SelectionOptions {
+  /** 1–3，默认 1 */
+  header_rows?: number
+  table?: string
+  /** box 以框的下边为准（默认）；auto 下边界按规则推断 */
+  bottom?: 'box' | 'auto'
+  role?: 'measures' | 'dimension'
+  keep?: boolean
+  segment?: string
+  reason?: string
+  [key: string]: unknown
+}
+
+/** 一次框选（edits/preview、edits/apply 请求里的 selection） */
+export interface SelectionRequest {
+  sheet: string
+  /** A1 区域，不带工作表名，列字母大写、不带 $（「C5」或「C5:F8」）：别的写法服务端回 422 edit_invalid */
+  ref: string
+  as: SelectionAs
+  options?: SelectionOptions
+}
+
+/** edits/preview、edits/apply 的请求：fix 与 selection 二选一。seq 是界面的预览序号，原样回传 */
+export type EditRequest =
+  | { fix: { id: string; option: string; reason?: string }; selection?: never; seq?: number }
+  | { selection: SelectionRequest; fix?: never; seq?: number }
+
+/** 框选换算出的锚点（契约 Anchor），界面显示「按文字定位」 */
+export interface EditAnchor {
+  kind: 'header' | 'row_label' | 'section_title' | 'total_word' | 'axis' | 'after_title' | 'outside_text' | (string & {})
+  text: string
+  cell?: string | null
+}
+
+/** 框选的期望区域与重放结果的比对（契约 ReplayCompare） */
+export interface ReplayCompare {
+  /** 列表：{header, data, total}；交叉表：{axis, labels, values} */
+  expected: Record<string, string | null>
+  actual: Record<string, string | null>
+  match: boolean
+  diffs: string[]
+  /** 部分干跑时只比较前多少行；完整比较为 null */
+  window_rows?: number | null
+}
+
+/** POST edits/preview 的返回（P3-SPEC 9.4 EditPreview） */
+export interface EditPreview {
+  ok: boolean
+  kind: 'fix' | 'selection' | (string & {})
+  /** 目标键（remove_label:日间:7-8）；确认项 fix:<key> / select:<key> 用它 */
+  key: string
+  title: string
+  summary: string[]
+  /** 按完整形式写的 JSON Patch：不给用户看，最多收在技术细节里 */
+  ops: { op: string; path: string; value?: unknown }[]
+  anchors: EditAnchor[]
+  notes: string[]
+  /** ok=false 时的原因（category=recipe），坐标可点 */
+  problems: ImportProblem[]
+  recipe_sha256_before: string | null
+  /** apply 时原样作为 expected_sha256 发回 */
+  recipe_sha256_after: string | null
+  recipe_problems: RecipeProblem[]
+  dry_run: { problems: ImportProblem[]; partial: boolean; marks: RegionMark[] } | null
+  replay: ReplayCompare | null
+  /** 对现行配方的破坏性变化：表名 → 人话列表；空对象表示没有。
+   * 注意：这不是后端 EditResult.breaking（那是服务端内部的布尔）。WP-5 组装预览时必须总是用
+   * table_changes 算出的字典覆盖它；收到布尔说明服务端漏了覆盖，Object.entries(false) 是 []，
+   * 破坏性变化会从预览里消失 */
+  breaking: Record<string, string[]>
+  accumulate_change: 'same' | 'compatible' | 'retire' | 'semantic' | (string & {}) | null
+  /** 当前工作配方对比修改后的配方（复用 RecipeCompare 显示） */
+  compare: RecipeComparison | null
+  /** 框选：换算出的期望区域 */
+  expected?: Record<string, string | null> | null
+  /** 框选：新增或替换的块 id */
+  block?: string | null
+  /** 请求里的预览序号，原样回传：不是最新一次的回包丢弃 */
+  seq?: number | null
+}
+
+/**
+ * 暂存区里已应用的一次修改（Staging.edits 的一项）。服务端 recipe_imports._edit_out 从修改记录里去掉撤销用的起点
+ * （before、base_sha256_after）和补丁（ops，只进导入清单），其余原样给出
+ */
+export interface StagingEdit {
+  seq: number
+  kind: 'fix' | 'selection' | (string & {})
+  key: string
+  title: string
+  /** 预览时的人话摘要（EditPreview.summary），应用时原样记下 */
+  summary?: string[]
+  at: string
+  signed_by: string | null
+  recipe_sha256_before: string | null
+  recipe_sha256_after: string | null
+  /** 之后整份替换过配方（PUT）：不能撤销，也不再出确认项 */
+  superseded: boolean
+  /** 只有最后一条、未被覆盖的为 true */
+  undoable: boolean
+  /** kind=fix：人选的是哪条提议、哪一项、写的理由（与 edits/apply 请求里的 fix 同形）。WP-5 评审修复之前记下的修改没有 */
+  fix?: { id: string; option: string; reason: string | null }
+  /** kind=selection：这次框选（Selection.to_json，键是 as，options 总是对象）。同上，旧记录没有 */
+  selection?: SelectionRequest & { options: SelectionOptions }
+}
+
+/** 改配方后被移除的回答：changed 需要重新回答；gone 问题已不适用。text 是问题文字（界面不露 id） */
+export interface AnswerDropped {
+  id: string
+  text: string
+  reason: 'changed' | 'gone' | (string & {})
+}
+
+/** 同一份构建以前被接受过的理由（TrialOut.prior_acceptances），只读显示 */
+export interface PriorAcceptance {
+  check_id: string
+  reason: string
+  signed_by: string | null
+  at: string
+  /** 第几次导入 */
+  import_seq: number
+}
+
+/** 排除的行的原因（契约 ExcludedRows.reason） */
+export type ExcludedReason =
+  | 'hidden_excluded' | 'blank_skipped' | 'ignored_rows' | 'ignored_outside' | 'after_stop' | 'total_not_kept'
+  | (string & {})
+
+/** 回执里的「排除的行」（契约 ExcludedRows）。按表头忽略的列不在这里（记在回执的 ignored_columns） */
+export interface ExcludedRows {
+  sheet: string
+  reason: ExcludedReason
+  /** [[起, 止], …]，1 起的行号闭区间 */
+  rows: [number, number][]
+  cells: number
+  anchor?: string | null
+  block?: string | null
+}
+
+/** ReceiptBlocks.tsx 的「排除的行」：向导回执和版本页的清单视图共用。onFocus 收「工作表!A1」 */
+export interface RowsExcludedProps {
+  rows: ExcludedRows[] | null | undefined
+  onFocus?: (cell: string) => void
+}
+
+/** ReceiptBlocks.tsx 的回执摘要：receipt 是试运行回执或导入清单里的 receipt（形状相同） */
+export interface ReceiptSummaryProps {
+  receipt: TrialReceipt | null | undefined
+  onFocus?: (cell: string) => void
+}
+
+/** 累积计划的 action（契约 ACCUMULATE_ACTIONS） */
+export type AccumulateAction = 'replace' | 'first' | 'append' | 'replace_period' | 'restart' | 'rejected' | (string & {})
+
+/** 累积计划里的一期。本期 import_id、seq 为 null，new 为 true */
+export interface AccumulatePart {
+  import_id: string | null
+  seq: number | null
+  start: string
+  end: string
+  file_name: string
+  new: boolean
+  /** 表 → 该期行数 */
+  rows: Record<string, number>
+  /** 该期配方不满足按期累积的原因（契约 accumulate_blockers） */
+  blockers: RecipeProblem[]
+}
+
+/** 计划里提到的一期（被替换、被移出、部分重叠）：至少有起止，其余字段同 AccumulatePart、可能缺省 */
+export interface AccumulatePeriodRef {
+  import_id?: string | null
+  seq?: number | null
+  start: string | null
+  end: string | null
+  file_name?: string
+  rows?: Record<string, number>
+}
+
+/** 表或列的新增、退役：column 为 null 表示整张表 */
+export interface TableColumnRef {
+  table: string
+  column: string | null
+  periods?: string[]
+}
+
+/** 各期维度取值的差异（P3-SPEC 2.5） */
+export interface LabelSetDiff {
+  table: string
+  column: string
+  segment: string
+  periods: { start: string; end: string; missing: string[]; extra: string[] }[]
+}
+
+/** 累积计划（TrialOut.accumulate，P3-SPEC 9.4 AccumulatePlan） */
+export interface AccumulatePlan {
+  mode: 'replace' | 'accumulate' | (string & {})
+  action: AccumulateAction
+  /** 本期统计期。source：cells 取自表内，human 人工录入；每期替换且没有统计期时 start、end 为 null */
+  period: { start: string | null; end: string | null; source?: 'cells' | 'human' | (string & {}) }
+  parts: AccumulatePart[]
+  replaces: AccumulatePeriodRef | null
+  /** restart、模式切换时移出当前版本的各期：界面标「将不在当前版本中」 */
+  dropped: AccumulatePeriodRef[]
+  overlaps: AccumulatePeriodRef[]
+  gaps: { start: string; end: string }[]
+  backfill: boolean
+  change: 'same' | 'compatible' | 'retire' | 'semantic' | (string & {})
+  added: TableColumnRef[]
+  retired_new: TableColumnRef[]
+  retired_existing: TableColumnRef[]
+  semantic: string[]
+  label_sets: LabelSetDiff[]
+  mode_switch: 'replace->accumulate' | 'accumulate->replace' | (string & {}) | null
+  reason: string | null
+  /** 物化了的并集：rows 是「启用后当前版本」的行数；没有物化为 null（此时等于本期） */
+  union: { union_id: string; db_sha256: string; rows: Record<string, number> } | null
+}
+
+/** 新旧配方对照里一列的摘要 */
+export interface CompareColumnBrief {
+  type: string
+  unit?: string | null
+  source?: string | null
+}
+
+export type CompareStatus = 'added' | 'removed' | 'changed' | 'same' | (string & {})
+
+/** 新旧配方对照（P3-SPEC 9.4 RecipeComparison，WP-3 compare_recipes 产出） */
+export interface RecipeComparison {
+  tables: {
+    name: string
+    status: CompareStatus
+    columns: {
+      name: string
+      status: CompareStatus
+      old: CompareColumnBrief | null
+      new: CompareColumnBrief | null
+      /** table_changes 的 kind（type / unit / source / store / const_value …） */
+      changes: string[]
+    }[]
+    grain: { old: string[] | null; new: string[] | null; changed: boolean }
+    kind: { old: string | null; new: string | null }
+    /** 这张表除单位以外的破坏性变化（table_changes 的原话），是完整清单；单位变化只在 columns[].changes 与 units_changed 里 */
+    breaking: string[]
+  }[]
+  segments: {
+    id: string
+    status: CompareStatus
+    title: { old: string | null; new: string | null }
+    labels: { added: string[]; removed: string[] }
+    ignore: { added: string[]; removed: string[] }
+  }[]
+  relations: { id: string; status: CompareStatus; old: string | null; new: string | null }[]
+  sheets: { id: string; name: { old: string | null; new: string | null } }[]
+  mode: { old: string | null; new: string | null }
+  breaking: boolean
+  /** 单位变化的列（界面排在最前） */
+  units_changed: { table: string; column: string; old?: string | null; new?: string | null }[]
+  accumulate: {
+    change: string
+    added: TableColumnRef[]
+    retired_new: TableColumnRef[]
+    retired_existing: TableColumnRef[]
+  } | null
+}
+
+/** POST imports/{id}/redraft-rules 的返回：不改工作配方，「采用」时再 PUT recipe（origin: rules_redraft） */
+export interface RedraftRulesOut {
+  draft: Draft
+  aligned_recipe: Recipe | null
+  /** 名字对齐的人话说明 */
+  alignment: string[]
+  compare: RecipeComparison | null
+}
+
+// ---- 版本页（P3-SPEC 第 7 节）
+
+/** 一期的统计期引用：简单导入或没有统计期的期，start、end 为 null，带 file_name */
+export interface PeriodRef {
+  start: string | null
+  end: string | null
+  file_name?: string
+}
+
+/** 版本列表里一个版本的一期 */
+export interface SnapshotPart {
+  import_id: string
+  seq: number
+  period_start: string | null
+  period_end: string | null
+  file_name: string
+  raw_state: 'kept' | 'purged' | 'absent' | (string & {})
+  status: string
+  /** 表 → 该期行数 */
+  rows: Record<string, number>
+  /** 接受的条数（数据质量不成立 / 合计无法核对） */
+  overrides: number
+  waivers: number
+  revoked: boolean
+}
+
+/** GET /{source_id}/snapshots 的一行（7.1）。当前版本排第一 */
+/** 快照不能启用的原因代码（后端 recipe_types.SnapshotReasonCode；VERSIONS_TEXT.notActivatable 的键与它相同） */
+export type SnapshotReasonCode = 'current' | 'retired' | 'file_lost' | 'contains_revoked'
+
+export interface SnapshotOut {
+  id: string
+  current: boolean
+  mode: 'replace' | 'accumulate' | (string & {}) | null
+  created_at: string | null
+  activated_at: string | null
+  /** 简单导入为 null */
+  recipe: { id: string; seq: number } | null
+  parts: SnapshotPart[]
+  /** 表 → 启用这个版本后的行数 */
+  tables: Record<string, number>
+  db_sha256_prefix: string
+  /** 数据文件的字节数 */
+  db_size: number | null
+  /** 记录没回收、文件在 */
+  available: boolean
+  /** 引用它的运行数（任何状态） */
+  pinned_runs: number
+  activatable: boolean
+  /** 不能启用的原因（人话）；能启用为 null。服务端取后端契约 SNAPSHOT_NOT_ACTIVATABLE[reason_code]，
+   * 与 VERSIONS_TEXT.notActivatable 逐字相同 */
+  reason: string | null
+  /** 不能启用的原因的代码（契约补充：7.1 只给了人话，available=false 同时覆盖「已回收」和「数据文件已丢失」，
+   * 界面分不出来）。能启用为 null。界面按 VERSIONS_TEXT.notActivatable[reason_code] 显示，缺省或不认识时
+   * 退回显示 reason，不去匹配 reason 的原文。几种同时成立时服务端取第一个：current > retired > file_lost >
+   * contains_revoked */
+  reason_code?: SnapshotReasonCode | null
+  /** 当前的遮罩列里，这个版本没有同名列的 */
+  mask_lost: string[]
+  /** 与当前版本相比，启用后增减的期 */
+  periods_diff: { added: PeriodRef[]; removed: PeriodRef[] }
+}
+
+/** POST …/snapshots/{snapshot_id}/activate 的请求（7.2） */
+export interface ActivateSnapshotBody {
+  confirm: true
+  /** 界面看到的当前版本 id：对不上回 409 base_changed */
+  expected_current_snapshot_id: string | null
+  /** mask_lost 非空时必填，与它相同 */
+  ack_mask_lost?: string[]
+  reason?: string
+  signed_by?: string | null
+}
+
+export interface ActivateSnapshotOut {
+  source: DataSource
+  snapshot_id: string
+  previous_snapshot_id: string | null
+  recipe_id: string | null
+}
+
+/** 导入清单、快照清单（7.3）。verified：取回时内容哈希复验通过 */
+export interface ManifestOut {
+  artifact_id: string | null
+  verified?: boolean
+  /** import_manifest；简单导入是 build_report（构建回执）；snapshot_manifest；单期快照是 snapshot_view（合成的视图） */
+  kind: 'import_manifest' | 'build_report' | 'snapshot_manifest' | 'snapshot_view' | (string & {})
+  content: Record<string, any>
+}
+
+/** POST …/imports/{import_id}/remove 的请求（7.4，累积模式） */
+export interface RemovePeriodBody {
+  confirm: true
+  expected_current_snapshot_id: string | null
+  /** 1–500 字，必填 */
+  reason: string
+  signed_by?: string | null
+}
+
+export interface RemovePeriodOut {
+  source: DataSource
+  snapshot_id: string
+  removed_import_id: string
+  /** 复用（或复活）了同内容的已有版本 */
+  reused: boolean
+}
+
+/** POST …/imports/{import_id}/revoke-acceptance 的请求（7.5） */
+export interface RevokeAcceptanceBody {
+  confirm: true
+  expected_current_snapshot_id: string | null
+  reason: string
+  signed_by?: string | null
+  /** 替换模式：取自 revoke_plan.target_snapshot_id */
+  expected_target_snapshot_id?: string | null
+  /** 回滚目标有遮罩列丢失时带上，与 revoke_plan.mask_lost 相同 */
+  ack_mask_lost?: string[]
+}
+
+export interface RevokeAcceptanceOut {
+  source: DataSource
+  snapshot_id: string
+  action: 'rollback' | 'remove_period' | (string & {})
+}
+
+/** 一条接受（导入记录的 acceptances） */
+export interface ImportAcceptance {
+  check_id: string
+  kind: 'override' | 'waiver' | (string & {})
+  reason: string
+  signed_by: string | null
+  at: string | null
+}
+
+/** 作废接受的预案（只对在当前版本里、带接受的导入给）：确认框照它写 */
+export interface RevokePlan {
+  /** 不能作废时为 null，reason 写原因 */
+  action: 'rollback' | 'remove_period' | (string & {}) | null
+  target_snapshot_id: string | null
+  /** 替换模式的回滚目标 */
+  target: { parts: PeriodRef[]; recipe_seq: number | null; mode: string | null; simple: boolean } | null
+  /** 累积模式：移除后的各期 */
+  result_parts: PeriodRef[]
+  gaps: { start: string; end: string }[]
+  mask_lost: string[]
+  reason: string | null
+}
+
+/** GET /{source_id}/imports 的一行（期 1 接口，期 3 补字段，7.6） */
+export interface ImportRecord {
+  id: string
+  seq: number
+  build_id: string
+  file_name: string
+  file_size: number | null
+  raw_sha256: string | null
+  raw_state: 'kept' | 'purged' | 'absent' | (string & {})
+  status: string
+  /** 清除记录 {at, reason, signed_by…}；没清除为 null */
+  purged: Record<string, any> | null
+  /** 在当前版本里（与 in_current 同值） */
+  current: boolean
+  created_at: string | null
+  activated_at: string | null
+  recipe_id: string | null
+  period_start: string | null
+  period_end: string | null
+  signed_by: string | null
+  /** 接受的条数 */
+  overrides: number
+  waivers: number
+  /** 期 3 */
+  acceptances?: ImportAcceptance[]
+  revoked?: { at: string; reason: string; signed_by: string | null; signed_by_verified: boolean } | null
+  manifest_artifact?: string | null
+  recipe_seq?: number | null
+  in_current?: boolean
+  /** 表 → 该期行数 */
+  rows?: Record<string, number>
+  revoke_plan?: RevokePlan | null
+  /** 同一份原件内容在其他导入记录里的引用，按源汇总（本源也算）。source_name：现在的后端对已删除的源写
+   *  「已删除的数据源」，老后端或老数据可能是 null——声明成可空，让界面的兜底由类型强制（同 also_purged） */
+  raw_shared_with?: { source_name: string | null; count: number }[]
+  /** 引用这份原件的未结束导入个数 */
+  raw_open_stagings?: number
+}
+
+/** POST …/imports/{import_id}/purge-raw 的请求（理由必填） */
+export interface PurgeRawBody {
+  confirm: true
+  reason: string
+  signed_by?: string | null
+}
+
+export interface PurgeRawOut {
+  import: ImportRecord
+  file_deleted: boolean
+  /** 同一份内容一并清除的其他导入记录 */
+  also_purged: { id: string; source_id: string; source_name: string | null; seq: number; file_name: string }[]
+  /** 一并放弃的未完成导入 */
+  discarded_stagings: string[]
 }
 
 /** 自定义工具（GET /api/custom-tools 的一行；POST / PATCH 的返回同形） */

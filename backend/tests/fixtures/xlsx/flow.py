@@ -33,11 +33,15 @@ EXTRA_SHEET = "说明"
 
 #: 只换起止日期、版式与 D00 相同的代号
 _PLAIN = {"D00", "D01", "D02", "D03", "D03b"}
-#: 9.2 的全部代号，外加 noperiod（把 B2 删掉，9.7 第 6 步的人工录入统计期用）
+#: 9.2 的全部代号，外加 noperiod（把 B2 删掉，9.7 第 6 步的人工录入统计期用）和期 3 的 D24w
+#: （时段标签用全角数字和全角减号「７－８」，其余同 D01；P3-SPEC 11.1，验收 A5 用）
 VARIANTS = frozenset(_PLAIN | {
     "D04", "D05", "D06", "D07", "D08", "D09", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D18",
-    "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D28b", "noperiod",
+    "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D28b", "noperiod", "D24w",
 })
+
+#: 半角数字 → 全角数字（D24w）
+_FULLWIDTH_DIGITS = str.maketrans("0123456789", "０１２３４５６７８９")
 
 #: D00（2026-08-01 起 31 天、参考配方）的期望，照 P2-SPEC 9.1 抄录，WP-7 验收时逐项比
 FLOW_EXPECT: dict[str, Any] = {
@@ -91,6 +95,8 @@ def _hour_label(h: int, variant: str) -> str:
         return f"{h:02d}:00-{h + 1:02d}:00"
     if variant == "D24":
         return f"{h}–{h + 1}"          # en dash
+    if variant == "D24w":               # 全角数字、全角减号（U+FF0D）：按规范写法存成「7-8」
+        return f"{h}－{h + 1}".translate(_FULLWIDTH_DIGITS)
     return f"{h}-{h + 1}"
 
 

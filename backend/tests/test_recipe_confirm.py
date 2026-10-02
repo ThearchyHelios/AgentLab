@@ -234,12 +234,16 @@ def test_recipe_class_only_when_recipe_differs():
     assert not recipe_differs("reupload", explicit, compact)
     assert ids(ConfirmContext(kind="reupload", recipe=explicit, old_recipe=compact, extraction=ex, checks=[], diff=[],
                               prev=BASE[0])) == set()
-    # 改了配方：配方类全部重新出
+    # 改了配方：期 3 起只列签名有变化的配方类项（P3-SPEC 6.2），没变的已在现行配方提交时确认过
     r = flow()
     r["sheets"][0]["blocks"][0]["values"]["blank"] = "null"
     got = ids(ConfirmContext(kind="redraft", recipe=r, old_recipe=FLOW, extraction=ex, checks=[], diff=[],
                              prev=BASE[0]))
-    assert D00_CONFIRMS | {"blank_null:交叉表"} <= got
+    assert got == {"blank_null:交叉表"}
+    # 采用按规则重新起草的配方：按首次导入列全部，另出 redraft_adopted
+    got = ids(ConfirmContext(kind="redraft", recipe=r, old_recipe=FLOW, extraction=ex, checks=[], diff=[],
+                             prev=BASE[0], recipe_origin="rules_redraft"))
+    assert D00_CONFIRMS | {"blank_null:交叉表", "redraft_adopted"} <= got
     # 首次、切换、没有现行配方都算不同
     assert recipe_differs("first", FLOW, FLOW) and recipe_differs("switch", FLOW, None)
     assert recipe_differs("reupload", FLOW, None)
@@ -610,6 +614,23 @@ def test_rows_after_stop_two_blocks_uses_lineage():
     prob["cells"] = ["销售!C8", "销售!D8"]
     got = ids(first(r, list_ex(problems=[prob], lineage=lineage, derived=[])))
     assert "rows_after_stop:列表1" in got
+
+
+
+def test_rows_after_stop_from_a_skip_list_goes_to_the_block_named_in_the_message():
+    """跳过空行的列表按表下说明收尾、那格文字不像说明时也报 rows_after_stop（WP-8 评审意见 4）。同一工作表上另有一个
+    stop 模式的列表：只按 blank_rows=stop 找候选会把它归到列表1；消息里写着「列表「列表2」」，确认项按它记在列表2 上。"""
+    r = copy.deepcopy(LIST)
+    r["sheets"][0]["blocks"][0]["rows"] = {}
+    second = copy.deepcopy(r["sheets"][0]["blocks"][0])
+    second.update(id="列表2", table="费用", after_title="二、费用", rows={"blank_rows": "skip"})
+    r["sheets"][0]["blocks"].append(second)
+    r["tables"] = [{"name": "销售"}, {"name": "费用"}]
+    lineage = {"销售": {"地区": [[1, "销售", "C3", 4, "down"]]}, "费用": {"地区": [[1, "销售", "C12", 3, "down"]]}}
+    prob = {"code": "rows_after_stop", "category": "confirm", "cells": ["销售!C16"],
+            "message": "工作表「销售」的列表「列表2」：第 16 行只有首列文字（C16「地区丁」），已当作表下说明，没有导入。"}
+    got = ids(first(r, list_ex(problems=[prob], lineage=lineage, derived=[])))
+    assert "rows_after_stop:列表2" in got and "rows_after_stop:列表1" not in got
 
 
 def test_relation_observed():

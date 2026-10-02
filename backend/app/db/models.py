@@ -150,6 +150,9 @@ class TableImport(Base):
     # 署名（自报，未认证）
     signed_by: Mapped[str | None] = mapped_column(String(100), default=None)
     staging_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # 期 3：作废接受（界面叫「撤回这一期」）的记录 {at, reason, signed_by, signed_by_verified: false}。
+    # 导入记录本身不删、接受内容不改（H4、H5），只在这里记下作废；含作废导入的快照不能再启用
+    revoked: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
 
 class TableRecipe(Base):
@@ -253,26 +256,65 @@ class ImportStaging(Base, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
     # 进入 committed / discarded / expired 的时刻
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 期 3：已应用的修改（修复、框选）。每条含撤销用的 before（answers_base、recipe_origin）、base_sha256_after、
+    # superseded；接口不给 before。结束时瘦身清空，提交前先抄进导入清单（含已被覆盖的，作为历史）
+    edits: Mapped[list[Any] | None] = mapped_column(default=list)
+    # 期 3：改配方后丢弃的回答 [{id, text, reason: changed | gone}]（遗留项 2）。结束时清空
+    answers_dropped: Mapped[list[Any] | None] = mapped_column(default=list)
+    # 期 3：最近一次「按规则重新起草」给出的对齐配方的哈希。PUT recipe 带 origin=rules_redraft 时核对它；结束时清空
+    redraft_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
 
 
 class SourceSnapshot(Base):
     """数据源的一个可查询版本：若干期导入合成的一个库，加上冻结的表结构。
 
-    期 1 只有「每期替换」：一个快照就是一期导入，db_path 直接用那次构建的库。
-    运行钉的是快照 id（runs.data_versions），表结构和数据出自同一个版本。
+    「每期替换」：一个快照就是一期导入，db_path 直接用那次构建的库。「按期累积」（期 3）：imports 是
+    各期导入记录、按统计期排序，两期及以上（或一期但那一期的配方不是目标配方）时 db_path 指向物化出的
+    并集库（tables/<源>/snapshots/<并集 id>.db，并集也登记成一个构建）。
+    运行固定的是快照 id（runs.data_versions），表结构和数据出自同一个版本。
     """
 
     __tablename__ = "source_snapshots"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_id: Mapped[str] = mapped_column(String(32), index=True)
-    imports: Mapped[list[Any]] = mapped_column(default=list)  # import id 列表
+    imports: Mapped[list[Any]] = mapped_column(default=list)  # import id 列表（按统计期排序）
     db_path: Mapped[str] = mapped_column(Text, default="")
     db_sha256: Mapped[str] = mapped_column(String(64), default="")
     schema_cache: Mapped[dict[str, Any]] = mapped_column(default=dict)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     # 没有运行、也不是当前版本时由回收标上；之后钉着它的请求明确报「版本不存在」
     retired_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 以下是期 3 的新列，存量行一律 NULL，含义是「期 3 之前的」：
+    # replace / accumulate；NULL 按 replace 处理
+    mode: Mapped[str | None] = mapped_column(String(20), default=None)
+    # 快照库按哪一版配方的表结构建的；NULL 时取 imports 最后一期的 recipe_id，简单导入为 NULL
+    recipe_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # 最近一次成为当前快照的时刻；NULL 按 created_at。回收按它保留最近 SNAPSHOT_KEEP 个
+    activated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 快照清单的工件 id（物化过的快照才有）。只作索引：证据链经 schema_cache 的 snapshot_manifest 承诺
+    manifest_artifact: Mapped[str | None] = mapped_column(String(64), default=None)
+
+
+class SnapshotActivation(Base):
+    """数据源的当前快照每切换一次记一行：提交、启用旧版本（回滚）、移除某一期、作废接受。
+
+    快照记录只有「最近一次启用」的时刻；谁在什么时候、为什么把当前版本切到哪里，要留完整的历史
+    （署名自报、未认证，照实标注）。不挂外键：数据源删掉以后照样留作审计。
+    """
+
+    __tablename__ = "snapshot_activations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(String(32), index=True)
+    snapshot_id: Mapped[str] = mapped_column(String(64))
+    previous_snapshot_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    # commit / activate / remove_period / revoke_acceptance
+    kind: Mapped[str] = mapped_column(String(20), default="commit")
+    import_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    signed_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class Setting(Base, TimestampMixin):

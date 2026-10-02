@@ -38,7 +38,7 @@
  * 枚举值（formal / degraded / withheld 等）不动，只换显示。
  */
 
-import type { NodeType, ToolTrust } from '../types'
+import type { NodeType, SnapshotReasonCode, ToolTrust } from '../types'
 import { formatNumber } from './format'
 
 export const TERMS = {
@@ -905,6 +905,183 @@ export const RAW_STATE_LABEL: Record<string, string> = {
 }
 
 /**
+ * 版本页（数据源卡片上的「版本」，P3-SPEC 7.8、附录 C）。整页不出现「快照」「并集」「构建」，一律写「版本」
+ * 「这一期」「数据文件」；署名一律标「署名（未认证）」；指向这个入口时写「数据源卡片上的「版本」」，不写「版本页」。
+ * 服务端返回的错误原话直接显示，不在这里重复。
+ *
+ * 这一段是连续的一段，由版本页维护；本文件的其余部分归导入向导
+ */
+export const VERSIONS_TEXT = {
+  open: '版本',
+  openHint: '查看各期和历史版本：启用旧版本、移除某一期、查看导入清单、清除原件',
+  title: (name: string) => `「${name}」的版本`,
+  retentionRule: (keep: number) =>
+    `除当前版本和被运行引用的版本外，系统保留最近 ${formatNumber(keep)} 个版本；更早的版本会被回收，回收后无法再启用`,
+  tabs: { current: '当前版本', history: '历史版本', imports: '全部导入记录' },
+  modeLabel: { accumulate: '按期累积', replace: '每期替换' } as Record<string, string>,
+  /**
+   * 卡片上的一句：按期累积写期数，每期替换只写「每期替换」。服务端没给期数（老后端、字段漏了）时只写「按期累积」：
+   * 缺值不能替它说成「1 期」，实际可能是多期
+   */
+  cardSummary: (mode: string | null | undefined, n: number | null | undefined) =>
+    (mode === 'accumulate' ? (typeof n === 'number' ? `按期累积 · ${formatNumber(n)} 期` : '按期累积') : '每期替换'),
+  /** at 是 formatRelative 或 formatDateTime 的结果：以数字结尾时补一个空格（同 UPLOAD_TEXT.importedAt） */
+  activatedAt: (at: string) => `${at}${/\d$/.test(at) ? ' ' : ''}启用`,
+  /** 卡片悬停：回滚之后启用时间晚于导入时间，两个都写 */
+  activatedTitle: (at: string, created: string) => `当前版本于 ${at} 启用，导入于 ${created}`,
+  period: (start: string, end: string) => `${start} 至 ${end}`,
+  periodUnknown: '统计期未记录',
+  /** 没有统计期的一期（简单导入、期 3 之前的导入）用文件名指代 */
+  periodFile: (file: string) => `${file}（统计期未记录）`,
+  periods: (n: number) => `${formatNumber(n)} 期`,
+  /** 当前版本的各期之间本来就有空缺（移除过中间一期、某个月没导入）：每次打开都写，不只在移除时的确认框里写一次 */
+  currentGaps: (list: string) => `各期之间有空缺（${list}），比较不同期之前需要先查询日期的覆盖范围`,
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  recipeSeq: (n: number) => `配方第 ${formatNumber(n)} 版`,
+  simpleImport: '简单导入',
+  importSeq: (n: number) => `第 ${formatNumber(n)} 次导入`,
+  /** 导入记录的状态（table_imports.status） */
+  importStatus: { active: '在当前版本中', superseded: '已被替换', retired: '已回收' } as Record<string, string>,
+  signedBy: (name: string) => `署名（未认证）：${name}`,
+  /** 本机没有填署名时，确认框里「署名（未认证）：」后面写这个 */
+  unsigned: '未填写',
+  /** 当前版本的概览 */
+  overview: { mode: '导入模式', periods: '期数', recipe: '配方', activated: '启用时间', tables: '各表行数' },
+  acceptCount: (n: number) => `接受 ${formatNumber(n)} 条`,
+  acceptRow: (check: string, reason: string) => `${check}：${reason}`,
+  /** 接受的种类：override 是数据质量类不成立，waiver 是合计无法核对 */
+  acceptKind: { override: '数据质量', waiver: '无法核对' } as Record<string, string>,
+  pinnedRuns: (n: number) => `被 ${formatNumber(n)} 次运行引用`,
+  /** text 是 formatBytes 的结果 */
+  size: (text: string) => `文件大小 ${text}`,
+  retiredGroup: (n: number) => `已回收 ${formatNumber(n)} 个`,
+  /** 不能启用的原因，按 SnapshotOut.reason_code 取（键就是代码；文字与后端 SNAPSHOT_NOT_ACTIVATABLE 逐字相同，
+   * 改这里的文字时请编排者同步改后端）。没有 reason_code 时显示服务端的 reason，不按原文反查键 */
+  notActivatable: {
+    current: '已是当前版本',
+    retired: '已回收，无法启用',
+    file_lost: '数据文件已丢失，无法启用',
+    contains_revoked: '包含已作废接受的导入，无法启用',
+  } satisfies Record<SnapshotReasonCode, string>,
+  maskLostBadge: '部分遮罩列在这个版本中没有同名列',
+  historyEmpty: '没有其他版本',
+  importsEmpty: '还没有导入记录',
+  // ---- 启用（回滚）
+  activate: '启用这个版本',
+  activateTitle: '启用这个版本？',
+  activateConsequence: {
+    removed: (list: string) => `当前版本将不再包含：${list}`,
+    added: (list: string) => `当前版本将增加：${list}`,
+    newRuns: '启用后，新发起的运行使用这个版本',
+    running: '已经在进行的运行不受影响',
+    recipe: (n: number) => `配方回到这个版本使用的第 ${formatNumber(n)} 版`,
+    simple: '这个数据源回到简单导入，之后上传新一期时不再按配方导入',
+    /** label 取 modeLabel 的值 */
+    mode: (label: string) => `导入模式回到${label}`,
+    nextUpload: '之后上传新一期时，以启用后的版本为基础',
+    stagings: '未完成的导入需要重新试运行',
+    maskLost: (cols: string) => `以下遮罩列在这个版本中没有同名列，启用后不再遮罩：${cols}`,
+  },
+  activated: '已启用这个版本',
+  // ---- 移除这一期（按期累积）
+  removePeriod: '移除这一期',
+  removeTitle: (period: string) => `从当前版本中移除 ${period}？`,
+  removeConsequence: {
+    result: (list: string) => `移除后当前版本包含：${list}`,
+    gap: (period: string) => `移除后各期之间出现空缺（${period}），比较不同期之前需要先查询日期的覆盖范围`,
+    recipe: '配方和导入模式不变',
+    reactivate: '可以在「历史版本」中重新启用移除前的版本（在保留期内）',
+    running: '已经在进行的运行不受影响',
+    stagings: '未完成的导入需要重新试运行',
+  },
+  removeLastDisabled: '这是当前版本里唯一的一期，不能移除',
+  removed: (period: string) => `已从当前版本中移除 ${period}`,
+  /** 移除后的各期与此前某个版本相同：服务端直接启用了那个版本 */
+  removedReused: '与此前的某个版本内容相同，已直接启用该版本',
+  // ---- 撤回这一期（作废接受，不可恢复）
+  revoke: '撤回这一期（作废接受）',
+  revokeTitle: '作废这一期的接受？',
+  revokeConsequence: {
+    irreversible: '作废后无法恢复：作废本身不能撤回，包含这一期的版本都不能再启用',
+    rollback: (desc: string) => `当前版本将回到：${desc}`,
+    remove: (list: string) => `这一期将从当前版本中移除，当前版本包含：${list}；配方和导入模式不变`,
+    record: '导入记录和接受理由保留，标记为已作废',
+    running: '已经在进行的运行不受影响',
+  },
+  revokeUnavailable: '没有可以回滚的版本，请上传修正后的文件',
+  revoked: '已作废这一期的接受',
+  // ---- 清除原件
+  purge: '清除原件',
+  purgeTitle: '清除这一期的原件？',
+  purgeConsequence: {
+    evidence: '证据面板将显示「原件已清除」',
+    redraft: '原件清除后，这一期无法再按修改后的配方重新导入',
+    shared: (list: string) => `同一份内容的其他导入记录一并清除：${list}`,
+    stagings: (n: number) => `引用它的 ${formatNumber(n)} 个未完成导入一并放弃`,
+  },
+  /** 清除前列出同一份原件的其他引用：按数据源汇总 */
+  sharedItem: (name: string, n: number) => `「${name}」${formatNumber(n)} 条`,
+  purgeDone: (also: number, discarded: number) =>
+    `已清除。另外清除了 ${formatNumber(also)} 条导入记录的原件，放弃了 ${formatNumber(discarded)} 个未完成导入`,
+  purgedItem: (name: string, seq: number, file: string) => `「${name}」第 ${formatNumber(seq)} 次导入（${file}）`,
+  /** 清除确认框的正文开头：哪一次导入、哪一期。同一统计期可能导入过几次（替换前后），带上导入次序才分得清 */
+  purgeTarget: (seq: number, period: string) => `第 ${formatNumber(seq)} 次导入，${period}`,
+  /** 一并清除的导入记录属于已经删除的数据源时，名字的位置写这个 */
+  deletedSource: '已删除的数据源',
+  /** 移除这一期、作废接受、清除原件的理由输入框 */
+  reasonLabel: '理由（必填）',
+  /** 启用旧版本的理由输入框（7.2 理由可选）：空着也能启用，不填就不随请求发送 */
+  reasonOptional: '理由（可选）',
+  reasonTooLong: '理由不能超过 500 字',
+  // ---- 清单
+  manifest: '查看导入清单',
+  manifestRaw: '查看原始清单',
+  manifestTitle: (seq: number) => `第 ${formatNumber(seq)} 次导入的导入清单`,
+  back: '返回版本列表',
+  /** 清单视图的各块标题（回执摘要、排除的行也用在向导的回执里） */
+  manifestBlocks: {
+    file: '文件',
+    recipe: '配方',
+    period: '统计期',
+    checks: '核对',
+    acceptances: '接受',
+    confirmations: '确认清单',
+    edits: '修改记录',
+    notes: '说明',
+    receipt: '回执摘要',
+    excluded: '排除的行',
+    ai: 'AI 用量',
+  },
+  manifestUnverified: '这份清单的内容哈希校验失败，可能已被修改，不能作为证据',
+  /** 简单导入没有导入清单，服务端给的是导入回执 */
+  manifestSimple: '简单导入没有导入清单，以下是这次导入的回执',
+  sha: (prefix: string) => `内容哈希 ${prefix}`,
+  recipeJson: '查看配方 JSON',
+  periodHuman: '人工录入',
+  sql: '查看 SQL',
+  /** 核对的计数：checked 是核对了几处，failed、unverifiable 为 0 时不写 */
+  checkCounts: (checked: number, failed: number, unverifiable: number) =>
+    [`核对 ${formatNumber(checked)} 处`, failed ? `不一致 ${formatNumber(failed)} 处` : '',
+      unverifiable ? `无法核对 ${formatNumber(unverifiable)} 处` : ''].filter(Boolean).join('，'),
+  editKind: { fix: '修复', selection: '框选' } as Record<string, string>,
+  editSuperseded: '已被覆盖',
+  editsNone: '这次导入没有修改',
+  editsUnrecorded: '这次导入未记录修改',
+  checksNone: '没有核对结果',
+  acceptancesNone: '没有接受的核对',
+  confirmationsNone: '没有勾选的确认项',
+  notesNone: '没有说明',
+  /** tokens 是 formatTokens 的结果（带单位），cost 是 formatCost 的结果 */
+  aiUsage: (calls: number, tokens: string, cost: string) => `调用模型 ${formatNumber(calls)} 次，共 ${tokens}，约 ${cost}`,
+  aiNone: '这次导入没有调用模型',
+  outsideTextNote: '区域外文字只在这里显示，不提供给模型',
+  revokedBadge: '接受已作废',
+  /** 当前版本或回滚目标被别人改过（base_changed、revoke_target_changed）：服务端原话说了变的是什么，这里只说列表已刷新 */
+  refreshHint: '列表已刷新，请重新确认',
+  empty: '还没有版本',
+} as const
+
+/**
  * 按配方导入（期 2）：向导、原始网格、建议卡片、配方面板、试运行回执、确认清单、差异卡、AI 起草。
  * 后端返回的问题、确认项、核对标题是整句人话，界面原样显示；这里只放界面自己的文字和枚举的显示名。
  *
@@ -1085,6 +1262,12 @@ export const RECIPE_TEXT = {
   notComparable: (a: string, b: string) => `「${a}」与「${b}」口径不同`,
   sumEq: (total: string, parts: string) => `${total} = ${parts}`,
   dismissed: (claims: string) => `不登记系统发现的关系 ${claims}`,
+  ignoreRules: '忽略规则',
+  ignoreRow: (label: string) => `按行标签忽略「${label}」这一行`,
+  ignoreColumn: (header: string) => `按表头忽略「${header}」这一列`,
+  ignoreOutside: (anchor: string) => `同一行有文字「${anchor}」时，忽略这一行导入区域之外的数字`,
+  ignoreReason: (reason: string) => `理由：${reason}`,
+  removeIgnore: (text: string) => `移除忽略规则：${text}`,
   // ---- 试运行回执
   receipt: '试运行回执',
   ledger: (n: string) => `单元格去向：非空单元格 ${n} 个`,
@@ -1158,6 +1341,279 @@ export const RECIPE_TEXT = {
   diffRequires: '需确认',
   diffNone: '与上一期相比没有需要说明的差异',
   sameAsImport: (seq: string) => `与第 ${seq} 次导入相同，无需重复导入`,
+
+  // ======== 期 3（P3-SPEC 10.2）。向导新增的部分和版本页一样不出现「快照」「并集」「构建」，「锚点」是内部术语也不上界面
+  // ---- 网格框选
+  selectToggle: '框选',
+  selectToggleHint: '在表格上按住拖动选出一块区域，或在下方输入区域；按文字定位，不记坐标',
+  selectionNone: '在表格上拖动，或输入区域',
+  selected: (ref: string) => `已选 ${ref}`,
+  selectionRef: '区域',
+  selectionRefPlaceholder: '如 C5:F8',
+  selectionRefInvalid: '区域写法不对，请写成「C5:F8」这样的形式',
+  selectionMenu: '框选为…',
+  selectionCancel: '取消',
+  outOfPreview: '这一格不在预览范围内（仅显示前 300 行、60 列）',
+  // ---- 框选面板
+  selectionTitle: (label: string) => `框选为：${label}`,
+  selectionHeaderRows: '表头行数',
+  selectionBottom: '下边界',
+  selectionBottomBox: '以框为准',
+  selectionBottomAuto: '按规则推断',
+  selectionTable: '新表名（可不填）',
+  selectionTablePlaceholder: '不填时按规则取名',
+  selectionRole: '这组行是',
+  selectionRoleMeasures: '各行是不同的量（每行一列）',
+  selectionRoleDimension: '各行是同一列的不同取值',
+  selectionKeep: '合计行的原值',
+  selectionKeepYes: '另存一张表',
+  selectionKeepNo: '只核对，不另存',
+  selectionSegment: '哪个分段',
+  selectionSegmentPick: '请选择分段',
+  selectionCrosstabNote: '框只用来指认是哪一块，范围按日期表头和行标签确定',
+  selectionByText: '按文字定位，不记坐标',
+  selectionReplayMatch: '重放结果与框选一致',
+  selectionReplayDiffer: '重放结果与框选不一致，应用后以重放结果为准',
+  selectionWindow: (n: string) => `仅比对前 ${n} 行，完整范围在试运行时核对`,
+  selectionExpected: '框选的范围',
+  selectionActual: '重放识别的范围',
+  selectionRegion: { header: '表头', data: '数据', total: '合计行', axis: '日期表头', labels: '行标签', values: '数据' } as Record<string, string>,
+  selectionCannot: '无法按这个框选修改配方',
+  selectionApply: '应用',
+  selectionApplyAnyway: '仍然应用（以重放结果为准）',
+  selectionApplied: '已按框选修改配方，请重新试运行',
+  selectionNotes: '提示',
+  // ---- 修复面板
+  fixBack: '返回',
+  fixOptions: '怎么修改',
+  fixReasonLabel: '理由（必填，最多 200 字）',
+  fixReasonPlaceholder: '说明为什么这样处理；理由会写进配方',
+  fixPreview: '预览',
+  fixPreviewAgain: '重新预览',
+  fixPreviewing: '正在预览',
+  fixReasonChanged: '理由已修改，请重新预览',
+  fixOptionChanged: '选项已修改，请重新预览',
+  fixReasonFirst: '请先填写理由，再预览',
+  fixSummary: '将做的修改',
+  fixAfter: '修改后的检查结果',
+  fixAfterClean: '修改后没有发现问题',
+  fixBreaking: '对现行配方的破坏性变化',
+  fixBreakingBadge: '破坏性变更',
+  fixApply: '应用修复',
+  fixApplying: '正在应用',
+  fixApplied: '已应用修复，请重新试运行',
+  fixStale: '问题已变化，请重新查看修复建议',
+  fixCannot: '无法应用这条修复',
+  /** 预览没通过、服务端却没有给出原因（不该出现）：不留一块空的预览区 */
+  editCannotUnknown: '服务端未说明原因，请返回后重新查看',
+  editStale: '配方在预览之后有变化，请重新预览',
+  previewToggle: '网格显示',
+  previewBefore: '修改前',
+  previewAfter: '修改后',
+  recipeProblemsBar: (n: string) => `配方有 ${n} 个问题`,
+  recipeProblemsHint: '修改之前不能试运行',
+  // ---- 已做的修改
+  editsTitle: '已做的修改',
+  editSuperseded: '已被覆盖',
+  editSupersededHint: '之后整份替换过配方：这项修改不能再撤销，也不再列入确认清单',
+  editUndo: '撤销上一次修改',
+  editUndone: '已撤销上一次修改，请重新试运行',
+  editSigned: (who: string) => `署名（未认证）：${who}`,
+  // ---- 改配方后的回答
+  answersChanged: (list: string) => `改配方后，以下问题需要重新回答：${list}`,
+  answersGone: (list: string) => `以下问题已不适用，回答已移除：${list}`,
+  // ---- 整份替换工作配方之前的确认
+  replaceTitle: '替换当前工作配方？',
+  saveRecipeTitle: '保存对配方的修改？',
+  replaceEdits: (n: number) => (n > 0 ? `当前工作配方（含已做的 ${formatNumber(n)} 项修改）将被替换` : '当前工作配方将被替换'),
+  replaceUndo: '之前的修改标为「已被覆盖」，不能再撤销，也不再列入确认清单',
+  replaceConfirm: '替换',
+  saveRecipeConfirm: '保存',
+  // ---- 按规则重新起草
+  redraftRules: '按规则重新起草（不调用模型）',
+  redraftRulesHint: '按本次的文件重新起草，并把表名、列名对齐到现行配方；采用之前不改工作配方',
+  redraftRunning: '正在重新起草',
+  redraftTitle: '按规则重新起草的结果',
+  redraftAlignment: '名字对齐',
+  redraftNoRecipe: '规则起草未能得到完整的配方，无法采用',
+  redraftAdopt: '采用',
+  redraftAdoptTitle: '采用重新起草的配方？',
+  redraftAdoptAfter: '采用后，确认清单按首次导入逐项列出配方的各项设置',
+  redraftDiscard: '不采用',
+  redraftMismatch: '采用的配方与重新起草的结果不同，请重新起草后再采用',
+  // ---- 回执、确认清单
+  sheetRenamed: '工作表改名',
+  sheetRenamedLine: (from: string, to: string) => `配方里的工作表「${from}」，本期叫「${to}」`,
+  priorAcceptance: (reason: string, seq: string, who: string) =>
+    `上次接受的理由：${reason}（第 ${seq} 次导入，署名（未认证）：${who}）`,
+  priorUnsigned: '未署名',
+  commitConflict: '服务端的数据文件与登记的不一致，重试也会失败：请联系管理员检查数据目录',
+  // ---- 完成
+  doneRestored: '服务端的同版本数据文件曾被改动，已用本次上传的文件恢复',
+  doneSnapshotReused: '与此前的某个版本内容相同，已直接启用该版本',
+} as const
+
+/** 修复按钮的文字（契约 FIX_KINDS）：按钮放在对应的问题旁，文字写会做什么，不写内部的叫法 */
+export const FIX_KIND_LABEL: Record<string, string> = {
+  remove_label: '去掉标签',
+  add_label: '加入标签',
+  edit_members: '更新关系成员',
+  rename_title: '改分段标题',
+  declare_total: '改作合计核对',
+  ignore_cells: '按文字忽略',
+  declare_placeholder: '声明占位符',
+  declare_hidden: '设置隐藏行处理',
+  rename_sheet: '更新工作表名',
+}
+
+/** 「框选为…」的取值（契约 SELECTION_AS），顺序就是下拉框里的顺序 */
+export const SELECT_AS_LABEL: Record<string, string> = {
+  list: '列表（含表头）',
+  crosstab: '交叉表（整块）',
+  segment: '分段',
+  derived: '合计行',
+  section_title: '分段标题',
+  ignore_rows: '忽略这些行',
+  ignore_columns: '忽略这些列',
+  ignore_outside: '忽略区域外的数字',
+}
+
+/** 框选换算出的定位文字的种类（契约 Anchor.kind）：「表头：地区、产品…」 */
+export const ANCHOR_KIND_LABEL: Record<string, string> = {
+  header: '表头',
+  row_label: '行标签',
+  section_title: '分段标题',
+  total_word: '合计词',
+  axis: '日期表头',
+  after_title: '上方的标题',
+  outside_text: '同一行的文字',
+}
+
+/** 确认清单的分组（契约 ConfirmItem.source）。区域外文字、工作表、统计期都是「本期」才有的项，合成一组 */
+export const CONFIRM_SOURCE_LABEL: Record<string, string> = {
+  recipe: '配方',
+  edit: '修改',
+  accumulate: '累积',
+  outside: '本期',
+  sheet: '本期',
+  context: '本期',
+  diff: '差异',
+  switch: '切换',
+}
+
+/**
+ * 按期累积（P3-SPEC 2.2–2.5、10.2）：累积计划、导入模式。行数分「本期」「启用后当前版本」两栏，
+ * 不写「并集行数」
+ */
+export const ACCUMULATE_TEXT = {
+  title: '各期',
+  action: {
+    append: '新增一期',
+    replace_period: '替换该期',
+    restart: '重新开始累积',
+    replace: '改为每期替换',
+    first: '作为第一期',
+    rejected: '与已有各期部分重叠，不能累积',
+  } as Record<string, string>,
+  thisPeriod: '本期',
+  afterEnable: '启用后当前版本',
+  table: '表',
+  partNew: '本期',
+  partReplaced: '将被替换',
+  partDropped: '将不在当前版本中',
+  period: (start: string, end: string) => `${start} 至 ${end}`,
+  periodUnknown: '统计期未记录',
+  importSeq: (n: string) => `第 ${n} 次导入`,
+  overlaps: '部分重叠的各期',
+  gaps: (list: string) => `各期之间有空缺：${list}`,
+  backfill: '本期早于已有各期，按统计期排序插入',
+  semantic: '与当前版本不兼容的变化',
+  restartHint: '如果不想重新开始累积，请返回修改配方（例如保留原来的单位、列名或常量取值）',
+  added: '新增的列',
+  retired: '自本期起不再导入的列',
+  wholeTable: '整张表',
+  labelSets: '各期取值不完全相同',
+  labelMissing: (period: string, list: string) => `${period} 没有：${list}`,
+  labelExtra: (period: string, list: string) => `${period} 另有：${list}`,
+  blockers: (period: string, reason: string) => `${period} 的配方不满足按期累积的要求：${reason}`,
+  checks: '整体核对',
+  modeField: '导入模式',
+  modeLabel: { accumulate: '按期累积', replace: '每期替换' } as Record<string, string>,
+  /** 两种取值的后果（P3-SPEC 2.2，评审三-m4）：问题选项下方、配方面板单选下方各显示一句 */
+  modeConsequence: {
+    accumulate: '每期以统计期为键加入当前版本；统计期与已有各期部分重叠的文件会被拒收，同一统计期再传要确认替换',
+    replace: '每次上传新一期，当前版本只含新的一期，此前各期留在历史版本中',
+  } as Record<string, string>,
+} as const
+
+/** 新旧配方对照（P3-SPEC 6.2、9.4）：试运行回执、确认清单顶部、修复预览、重新起草共用 */
+export const COMPARE_TEXT = {
+  title: '配方前后对照',
+  none: '配方没有变化',
+  breakingBadge: '破坏性',
+  nothing: '无',
+  tableAdded: (t: string) => `新增表「${t}」`,
+  tableRemoved: (t: string) => `表「${t}」不再产出（删除或改名）`,
+  columnAdded: (t: string, c: string, unit: string) => `表「${t}」新增列「${c}」${unit ? `（${unit}）` : ''}`,
+  columnRemoved: (t: string, c: string) => `表「${t}」删除或改名了列「${c}」`,
+  unit: (t: string, c: string, from: string, to: string) => `表「${t}」列「${c}」的单位 ${from} → ${to}`,
+  noUnit: '无单位',
+  change: (t: string, c: string, what: string, from: string, to: string) =>
+    (from || to ? `表「${t}」列「${c}」的${what} ${from || '无'} → ${to || '无'}` : `表「${t}」列「${c}」的${what}有变化`),
+  changeKind: {
+    type: '类型', unit: '单位', source: '来源', store: '文字存法', const_value: '常量取值', placeholder_meaning: '占位符含义',
+  } as Record<string, string>,
+  changeOther: '设置',
+  grain: (t: string, from: string, to: string) => `表「${t}」的主键 ${from} → ${to}`,
+  tableKind: (t: string, from: string, to: string) => `表「${t}」的种类 ${from} → ${to}`,
+  tableKindLabel: { data: '数据表', reported_total: '原表写明的合计' } as Record<string, string>,
+  /** 服务端的破坏性原话（不带表名）前面补上是哪张表 */
+  breakingLine: (t: string, msg: string) => `表「${t}」：${msg}`,
+  /**
+   * 新增、去掉的分段：标题和全部标签一起写在这一条里（list 是已经加好引号的标签）。起草器换了分段 id 时，新分段的
+   * 标题和标签就是它新认出的定位规则，确认时得看得到；去掉的分段写原来认的是什么，免得只剩一个 id 看不出丢了哪些行
+   */
+  segAdded: (id: string, title: string, list: string) =>
+    `新增分段「${id}」${title ? `，标题「${title}」` : ''}${list ? `，标签：${list}` : ''}`,
+  segRemoved: (id: string, title: string, list: string) =>
+    `去掉分段「${id}」${title ? `，原标题「${title}」` : ''}${list ? `，原有标签：${list}` : ''}`,
+  segTitle: (id: string, from: string, to: string) => `分段「${id}」的标题「${from}」→「${to}」`,
+  labelsAdded: (id: string, list: string) => `分段「${id}」加入标签：${list}`,
+  labelsRemoved: (id: string, list: string) => `分段「${id}」去掉标签：${list}`,
+  ignoreAdded: (id: string, list: string) => `「${id}」新增忽略规则：${list}`,
+  ignoreRemoved: (id: string, list: string) => `「${id}」去掉忽略规则：${list}`,
+  relation: (id: string, from: string, to: string) => `关系 ${id}：${from} → ${to}`,
+  relationNone: '不登记',
+  sheetName: (from: string, to: string) => `工作表名「${from}」→「${to}」`,
+  mode: (from: string, to: string) => `导入模式：${from} → ${to}`,
+  accumulate: {
+    compatible: '与当前版本兼容：早期各期没有的列为空值',
+    retire: '部分列自本期起不再导入，早期各期保留原值',
+    semantic: '与当前版本不兼容：启用后将重新开始累积',
+  } as Record<string, string>,
+} as const
+
+/**
+ * 回执的只读展示块（ReceiptBlocks.tsx）：「排除的行」、回执摘要。向导回执和版本页的清单视图共用。
+ * 排除原因的说法不露枚举值：认不出的原因写「其他原因」
+ */
+export const RECEIPT_BLOCK_TEXT = {
+  excludedReason: {
+    hidden_excluded: '隐藏的行（按配方不导入）',
+    blank_skipped: '跳过的空行',
+    ignored_rows: '按配方忽略的行',
+    ignored_outside: '按配方忽略了区域外数字的行',
+    after_stop: '列表结束之后的文字行',
+    total_not_kept: '只核对、不另存的合计行',
+  } as Record<string, string>,
+  excludedOther: '其他原因',
+  excludedTitle: '排除的行',
+  rowSpan: (a: number, b: number) => (a === b ? `第 ${formatNumber(a)} 行` : `第 ${formatNumber(a)}–${formatNumber(b)} 行`),
+  cells: (n: number) => `${formatNumber(n)} 格`,
+  groupTotal: (rows: number, cells: number) => `共 ${formatNumber(rows)} 行、${formatNumber(cells)} 格`,
+  excludedNone: '没有排除的行',
+  excludedUnrecorded: '这次导入未记录排除的行',
+  canonicalized: (n: number) => `按规范写法存储的取值 ${formatNumber(n)} 种`,
 } as const
 
 /** 格子的去向（契约 Role）：网格图例、回执里的格子账 */
@@ -1174,6 +1630,8 @@ export const LEDGER_ROLE_LABEL: Record<string, string> = {
   hidden_excluded: '排除的隐藏行',
   total_label: '合计标签',
   total_value: '合计格',
+  /** 期 3：按配方忽略的行、区域外数字（ignore_rows、ignore_outside） */
+  ignored: '按配方忽略',
 }
 
 /** 核对结果的状态 */
@@ -1218,6 +1676,15 @@ export const DIFF_KIND_LABEL: Record<string, string> = {
   outside_moved: '区域外文字挪了位置',
   ignored_columns: '忽略的列',
   hidden: '隐藏的行列',
+  // 期 3：按期累积、忽略规则（P3-SPEC 9.5）
+  period_added: '新增的一期',
+  period_replaced: '替换的一期',
+  period_gap: '各期之间的空缺',
+  period_backfill: '补传早期',
+  columns_added: '新增的列',
+  columns_retired: '不再导入的列',
+  labels_vary: '各期取值不同',
+  ignored_rows: '按配方忽略的行',
 }
 
 /**

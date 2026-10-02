@@ -113,7 +113,9 @@ async def first_import(client, name: str, seed: int = 1) -> dict[str, Any]:
     assert resp.status_code == 201, resp.text
     st = resp.json()
     sid = st["id"]
-    answers = {q["id"]: {"value": "register" if q["id"].startswith("q_relation") else "null"}
+    # 期 3：q_mode（这份报表每期怎么更新）答「每期替换」，与参考配方的哈希一致（P3-SPEC 12.0、1.5）
+    answers = {q["id"]: {"value": "register" if q["id"].startswith("q_relation")
+                         else "replace" if q["id"] == "q_mode" else "null"}
                for q in st["questions"]}
     resp = await client.post(f"/api/datasources/imports/{sid}/answers", json={"answers": answers})
     assert resp.status_code == 200, resp.text
@@ -158,19 +160,23 @@ async def test_real_pipeline_first_import_stage_draft_answer_trial_commit(client
         "q_relation:F1": {"value": "dismiss", "reason": "合成理由：判断为巧合"}}})
     assert first.status_code == 200, first.text
     assert next(r for r in first.json()["recipe"]["relations"] if r["id"] == "R1")["kind"] == "dismissed"
-    answers = {q: {"value": "register" if q.startswith("q_relation") else "null"} for q in qids}
+    answers = {q: {"value": "register" if q.startswith("q_relation") else "replace" if q == "q_mode" else "null"}
+               for q in qids}
     resp = await client.post(f"/api/datasources/imports/{sid}/answers", json={"answers": answers})
     assert resp.status_code == 200, resp.text
     st = resp.json()
     assert st["answers"]["q_relation:F1"] == {"value": "register", "reason": None}
     assert [q["id"] for q in st["questions"]] == qids, "问题集合按起点配方生成，回答不改变它"
+    answered = st["answers"]
 
-    # 改表名（PUT）：起点换成它，回答清空；与参考配方逐字相同
+    # 改表名（PUT）：起点换成它；与参考配方逐字相同。期 3（第 8 节遗留项 2）：PUT 进来的配方已经体现了之前的
+    # 回答，回答照旧保留（与新起点一致），没有被丢弃的回答
     resp = await client.put(f"/api/datasources/imports/{sid}/recipe",
                             json={"recipe": rename_wide(st["recipe"], "客流汇总_按日", "日客流")})
     assert resp.status_code == 200, resp.text
     st = resp.json()
-    assert st["answers"] == {} and st["recipe_origin"] == "manual" and st["recipe_problems"] == []
+    assert st["answers"] == answered and st["answers_dropped"] == []
+    assert st["recipe_origin"] == "manual" and st["recipe_problems"] == []
     ref, _ = recipe.validate_recipe(FLOW_RECIPE, origin="manual")
     mine, _ = recipe.validate_recipe(st["recipe"], origin="manual")
     assert recipe.recipe_sha256(mine) == recipe.recipe_sha256(ref)

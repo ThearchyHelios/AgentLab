@@ -1,25 +1,32 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, ChevronRight, FileSpreadsheet, Info, Upload } from 'lucide-react'
+import { ChevronRight, FileSpreadsheet, Info, RotateCcw, Upload, Wand2 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type { UploadProgress } from '../../api/client'
-import type { CommitOut, DataSource, QuestionAnswer, Recipe, Staging } from '../../types'
-import { Field, Modal, Spinner, confirmDialog, toast } from '../../components/ui'
+import type {
+  CommitOut, DataSource, EditPreview, QuestionAnswer, Recipe, RedraftRulesOut, SelectionAs, Staging,
+} from '../../types'
+import { Field, Modal, Notice, Spinner, confirmDialog, toast } from '../../components/ui'
 import { localActor } from '../../lib/actor'
 import { errorMessage } from '../../lib/errors'
-import { formatBytes, formatDuration, formatNumber } from '../../lib/format'
+import { formatBytes, formatDateTime, formatDuration, formatNumber } from '../../lib/format'
 import { RECIPE_TEXT, UPLOAD_TEXT } from '../../lib/terms'
 import { useRunClock } from '../../run/useRunClock'
 import { UploadMeter } from '../DataSourcesTab'
+import { AccumulatePlan } from './AccumulatePlan'
 import { AiDraftOffer } from './AiDraftDialog'
 import { ConfirmList } from './ConfirmList'
 import type { CommitBody } from './ConfirmList'
-import { ImportReceipt, ProblemList, TrialStatusLine } from './ImportReceipt'
+import { FixButtons, FixPanel } from './FixPanel'
+import type { EditFlowHandlers } from './FixPanel'
+import { ImportReceipt, ProblemList, TrialStatusLine, fixMap } from './ImportReceipt'
+import { RecipeCompare } from './RecipeCompare'
 import { RecipePanel } from './RecipePanel'
 import { ReuploadDiff } from './ReuploadDiff'
+import { SelectionPanel } from './SelectionPanel'
 import { SheetGrid, parseRef } from './SheetGrid'
-import type { GridFocus } from './SheetGrid'
+import type { GridAfter, GridFocus, GridReplay, GridSelection } from './SheetGrid'
 import { SuggestionCards } from './SuggestionCards'
 
 // ===========================================================================
@@ -45,6 +52,8 @@ type Phase = 'pick' | 'uploading' | 'loading' | 'work' | 'confirm' | 'done' | 'f
 type View = 'draft' | 'result'
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
+/** 提交时遇到这些：试运行库已被消耗、作废或被改过，回到配方步骤重新试运行（期 3 加了并集、各期被改过的两种） */
+const RERUN_CODES = new Set(['trial_required', 'trial_tampered', 'base_changed', 'name_taken', 'union_tampered', 'part_tampered'])
 /** 选择框收的扩展名，与 RECIPE_TEXT.pickFormats 的说法一致 */
 const PICK_ACCEPT = '.xlsx,.xlsm'
 const ENDED = new Set(['committed', 'discarded', 'expired'])
@@ -117,19 +126,6 @@ function Steps({ current, reupload }: { current: (typeof STEP_KEYS)[number]; reu
   )
 }
 
-function Notice({ tone, children, attr }: { tone: 'warn' | 'err' | 'info'; children: ReactNode; attr?: Record<string, string> }) {
-  const color = tone === 'err' ? 'var(--err)' : tone === 'warn' ? 'var(--warn)' : 'var(--accent)'
-  return (
-    <div role={tone === 'info' ? 'status' : 'alert'} className="flex gap-2 rounded-lg border px-3 py-2 text-xs leading-relaxed" {...attr}
-         style={{ borderColor: `color-mix(in srgb, ${color} 40%, var(--border))`, background: `color-mix(in srgb, ${color} 7%, transparent)` }}>
-      {tone === 'info'
-        ? <Info size={13} className="mt-0.5 shrink-0" style={{ color }} aria-hidden />
-        : <AlertTriangle size={13} className="mt-0.5 shrink-0" style={{ color }} aria-hidden />}
-      <div className="min-w-0 flex-1">{children}</div>
-    </div>
-  )
-}
-
 /** 统计期录入：两个日期框，文件名里的区间作建议。日期是否合法、起点是否晚于终点，服务端还会再查 */
 function PeriodForm({ fileName, busy, error, onSubmit }: {
   fileName: string; busy: boolean; error: string | null; onSubmit: (start: string, end: string) => void
@@ -189,6 +185,20 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
   const [confirmError, setConfirmError] = useState<string | null>(null)
   const [periodError, setPeriodError] = useState<string | null>(null)
   const [done, setDone] = useState<CommitOut | null>(null)
+  // 期 3：修复面板、框选、预览在网格上的「修改后」、按规则重新起草
+  const [fixOpen, setFixOpen] = useState<string | null>(null)
+  const [selection, setSelection] = useState<GridSelection | null>(null)
+  const [selAs, setSelAs] = useState<SelectionAs | null>(null)
+  const [after, setAfter] = useState<GridAfter | null>(null)
+  const [replay, setReplay] = useState<GridReplay | null>(null)
+  const [problemsBar, setProblemsBar] = useState(false)
+  const [redraft, setRedraft] = useState<{ out: RedraftRulesOut | null; error: string | null; hidden: boolean }>(
+    { out: null, error: null, hidden: false })
+  const [commitBlocked, setCommitBlocked] = useState(false)
+  // 配方面板连续保存时，排在后面的那几次拿到的还是发起时的 staging：撤销栈是否还在要看最新的那一份。
+  // 渲染时同步一次；saveRecipe 存上以后还要当场改（见那里），不能只等下一次渲染
+  const stagingRef = useRef<Staging | null>(null)
+  stagingRef.current = staging
   // 选文件
   const [file, setFile] = useState<File | null>(entry.kind === 'stage' ? entry.file : null)
   const [name, setName] = useState(entry.kind === 'stage' ? entry.name : '')
@@ -230,6 +240,36 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
     try { setStaging(await api.tableImports.get(id)) } catch (e) { if (!guard(e)) toast.error(e) }
   }
 
+  /**
+   * 写请求失败的统一去向：暂存区已结束就关掉向导；只读进程（503 store_unavailable）照写服务端原话、不自动重试
+   * （原话已说明是数据目录被另一个进程占用）；其余弹出报错
+   */
+  const report = (e: unknown) => {
+    if (guard(e)) return
+    if (e instanceof ApiError && e.code === 'store_unavailable') { setNotice({ tone: 'err', text: errorMessage(e) }); return }
+    toast.error(e)
+  }
+
+  /** 关掉修复面板和框选面板，网格回到「修改前」 */
+  const closePanels = () => {
+    setFixOpen(null)
+    setSelAs(null)
+    setAfter(null)
+    setReplay(null)
+  }
+
+  /** 问题旁的修复按钮：回到起草，在右栏打开修复面板（网格仍然可见） */
+  const openFix = (id: string) => {
+    setSelAs(null)
+    setAfter(null)
+    setReplay(null)
+    setFixOpen(id)
+    setPhase('work')
+    setView('draft')
+  }
+
+  /** 未被覆盖的修改：整份替换工作配方（PUT）之前要先说清楚它们会被覆盖、不能再撤销 */
+  const liveEdits = (s: Staging | null) => (s?.edits ?? []).filter((x) => !x.superseded).length
   /** 选中文件（点选或拖入）：新导入拿文件名当默认数据源名，只留 ASCII；中文文件名清洗完可能什么都不剩，那就让用户自己填 */
   const pickFile = (f: File | null) => {
     // 拖进来的文件不经过选择框的 accept：不是 Excel 的在这里挡下，免得传完才被服务端拒收
@@ -319,34 +359,139 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
       setStaging(await api.tableImports.answers(staging.id, answers))
       return true
     } catch (e) {
-      if (!guard(e)) toast.error(e)
+      report(e)
       return false
     } finally {
       setBusy('')
     }
   }
 
-  /** 存上了返回服务端存下的配方：配方面板以它为底接着发排在后面的修改 */
+  /**
+   * 存上了返回服务端存下的配方：配方面板以它为底接着发排在后面的修改。还有未被覆盖的修复、框选时先确认：
+   * PUT 会清空撤销栈，之前的修改标「已被覆盖」
+   */
   const saveRecipe = async (recipe: Recipe): Promise<{ recipe: Recipe | null } | null> => {
-    if (!staging) return null
+    const cur = stagingRef.current
+    if (!cur) return null
+    const n = liveEdits(cur)
+    if (n > 0) {
+      const ok = await confirmDialog({
+        title: RECIPE_TEXT.saveRecipeTitle, consequences: [RECIPE_TEXT.replaceEdits(n), RECIPE_TEXT.replaceUndo],
+        confirmLabel: RECIPE_TEXT.saveRecipeConfirm,
+      })
+      if (!ok) return null
+    }
     setBusy('recipe')
     try {
-      const s = await api.tableImports.putRecipe(staging.id, recipe)
+      const s = await api.tableImports.putRecipe(cur.id, recipe)
+      // 当场更新 ref：配方面板在这次 await 返回后的同一段续体里就为排在后面的修改再调 saveRecipe，而 await 之后的
+      // setStaging 要到下一个任务才重新渲染。不改的话那一次读到的还是 PUT 之前的 staging，已被覆盖的修改仍算
+      // 「未被覆盖」，又弹一次「保存对配方的修改？」，点了取消，排在后面的那处修改就丢了
+      stagingRef.current = s
       setStaging(s)
       return { recipe: s.recipe }
     } catch (e) {
-      if (!guard(e)) toast.error(e)
+      report(e)
       return null
     } finally {
       setBusy('')
     }
   }
 
+  /** 撤销上一次修改：撤销之后的回答按服务端的规则延续，试运行作废 */
+  const undo = async () => {
+    if (!staging) return
+    setBusy('undo')
+    try {
+      setStaging(await api.tableImports.editUndo(staging.id))
+      closePanels()
+      setNotice({ tone: 'info', text: RECIPE_TEXT.editUndone })
+    } catch (e) {
+      const code = e instanceof ApiError ? e.code : undefined
+      if (code === 'nothing_to_undo' || code === 'undo_stale') {
+        // 原话已给出出路（undo_stale：在配方面板中手工改回）；撤销栈的样子以服务端为准
+        setNotice({ tone: 'warn', text: errorMessage(e) })
+        await refetch(staging.id)
+      } else report(e)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  /** 按规则重新起草（不调用模型、不改工作配方）：给出对照和名字对齐，人看过再决定采用 */
+  const runRedraft = async () => {
+    if (!staging) return
+    setBusy('redraft')
+    setRedraft((r) => ({ ...r, out: null, error: null }))
+    try {
+      const out = await api.tableImports.redraftRules(staging.id)
+      setRedraft((r) => ({ ...r, out }))
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'redraft_not_offered') {
+        setRedraft({ out: null, error: null, hidden: true })
+        setNotice({ tone: 'warn', text: errorMessage(e) })
+      } else report(e)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  /** 采用重新起草的配方：先确认工作配方（含已做的修改）将被替换，再 PUT（origin: rules_redraft，服务端核对哈希） */
+  const adoptRedraft = async () => {
+    const aligned = redraft.out?.aligned_recipe
+    if (!staging || !aligned) return
+    const ok = await confirmDialog({
+      title: RECIPE_TEXT.redraftAdoptTitle,
+      consequences: [RECIPE_TEXT.replaceEdits(liveEdits(staging)), RECIPE_TEXT.redraftAdoptAfter],
+      confirmLabel: RECIPE_TEXT.redraftAdopt,
+    })
+    if (!ok) return
+    setBusy('recipe')
+    try {
+      setStaging(await api.tableImports.putRecipe(staging.id, aligned, 'rules_redraft'))
+      setRedraft((r) => ({ ...r, out: null, error: null }))
+      closePanels()
+    } catch (e) {
+      // 采用的配方与重新起草的结果对不上：留在对照上，请人重新起草
+      if (e instanceof ApiError && e.code === 'redraft_mismatch') setRedraft((r) => ({ ...r, error: RECIPE_TEXT.redraftMismatch }))
+      else report(e)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  /** 修复面板、框选面板的预览与应用。kind 只决定应用之后的那句提示 */
+  const editHandlers = (kind: 'fix' | 'selection', s: Staging): EditFlowHandlers => ({
+    stagingId: s.id,
+    onApplied: (next) => {
+      setStaging(next)
+      closePanels()
+      setSelection(null)
+      setView('draft')
+      setNotice({ tone: 'info', text: kind === 'fix' ? RECIPE_TEXT.fixApplied : RECIPE_TEXT.selectionApplied })
+    },
+    onGone: (detail) => {
+      closePanels()
+      setNotice({ tone: 'warn', text: RECIPE_TEXT.fixStale, detail })
+      void refetch(s.id)
+    },
+    onPreview: (p: EditPreview | null) => {
+      setAfter(p?.dry_run ? { marks: p.dry_run.marks ?? [], problems: p.dry_run.problems ?? [], partial: p.dry_run.partial } : null)
+      setReplay(kind === 'selection' && p?.ok && p.replay && selection ? { sheet: selection.sheet, actual: p.replay.actual ?? {} } : null)
+    },
+    onError: (e) => {
+      if (guard(e)) return true
+      if (e instanceof ApiError && e.code === 'store_unavailable') { setNotice({ tone: 'err', text: errorMessage(e) }); return true }
+      return false
+    },
+  })
+
   const trial = async (context?: { start: string; end: string }) => {
     if (!staging) return
     setBusy('trial')
     setNotice(null)
     setPeriodError(null)
+    closePanels()
     try {
       const s = await api.tableImports.trial(staging.id, {
         ...(context ? { context_inputs: { 统计期: context } } : {}), signed_by: localActor(),
@@ -359,6 +504,8 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
       if (guard(e)) return
       const code = e instanceof ApiError ? e.code : undefined
       if (code === 'context_invalid' || code === 'context_not_needed') setPeriodError(errorMessage(e))
+      // 某一期的数据文件不在了：原话指向数据源卡片上的「版本」（移除那一期或启用更早的版本），这次不能继续
+      else if (code === 'part_missing' || code === 'store_unavailable') setNotice({ tone: 'err', text: errorMessage(e) })
       else toast.error(e)
     } finally {
       setBusy('')
@@ -386,7 +533,7 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
         for (const id of staging.trial.acceptable ?? []) if (message.includes(id)) ids.add(id)
         setMissing(ids)
         setConfirmError(message)
-      } else if (code === 'trial_required' || code === 'trial_tampered' || code === 'base_changed' || code === 'name_taken') {
+      } else if (code && RERUN_CODES.has(code)) {
         // 试运行库已被消耗或作废：回到配方步骤重新试运行
         const text = code === 'base_changed' ? RECIPE_TEXT.baseChanged : code === 'name_taken' ? RECIPE_TEXT.nameTaken : RECIPE_TEXT.rerunTrial
         setNotice({ tone: 'warn', text, detail: message })
@@ -397,6 +544,10 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
         setNotice({ tone: 'warn', text: message })
         setPhase('work')
         setView('result')
+      } else if (code === 'build_conflict') {
+        // 服务端已有的同版本数据文件与登记的不一致、又无法恢复：重试也会失败，留在确认页、禁用启用，等管理员处理
+        setConfirmError(message)
+        setCommitBlocked(true)
       } else {
         setConfirmError(message)
       }
@@ -418,7 +569,7 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
       onChanged?.()
       onClose()
     } catch (e) {
-      if (!guard(e)) toast.error(e)
+      report(e)
     } finally {
       setBusy('')
     }
@@ -438,6 +589,13 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
   const t = staging?.trial ?? null
   const trialStale = !!t && staging?.status === 'drafting'
   const canTrial = !!staging?.recipe && !staging.recipe_problems?.length && !busy
+  const fixes = useMemo(() => fixMap(staging?.fixes), [staging?.fixes])
+  const proposal = fixOpen ? fixes.get(fixOpen) ?? null : null
+  const drafting = phase === 'work' && view === 'draft'
+  // 提议已不在当前列表里（重新评估之后问题变了）：面板跟着关掉，不对着一个不存在的提议预览
+  useEffect(() => { if (fixOpen && staging && !fixes.has(fixOpen)) closePanels() }, [fixOpen, fixes])
+  // 离开起草（试运行结果、确认清单）：选区和框选面板一并清掉
+  useEffect(() => { if (!drafting) { setSelection(null); setSelAs(null); setReplay(null); if (!fixOpen) setAfter(null) } }, [drafting])
 
   // ---- 正文
   let body: ReactNode = null
@@ -518,7 +676,11 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
       <div className="space-y-2 py-4 text-center" data-import-done={done.unchanged ? 'unchanged' : 'committed'}>
         <div className="text-sm font-medium">{RECIPE_TEXT.done(done.source?.name ?? srcName)}</div>
         {done.unchanged && seq != null && <p className="text-xs text-dim">{RECIPE_TEXT.doneUnchanged(formatNumber(seq))}</p>}
-        {!done.unchanged && done.build_reused && <p className="text-xs text-faint">{RECIPE_TEXT.doneReused}</p>}
+        {!done.unchanged && done.snapshot_reused && <p className="text-xs text-dim" data-done-reused-version>{RECIPE_TEXT.doneSnapshotReused}</p>}
+        {!done.unchanged && !done.snapshot_reused && done.build_reused && <p className="text-xs text-faint">{RECIPE_TEXT.doneReused}</p>}
+        {done.build_restored && (
+          <Notice tone="warn" className="text-left" attr={{ 'data-build-restored': '' }}>{RECIPE_TEXT.doneRestored}</Notice>
+        )}
       </div>
     )
     footer = <button className="btn btn-primary" onClick={onClose} data-autofocus>{RECIPE_TEXT.finish}</button>
@@ -527,8 +689,14 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
     let right: ReactNode
     if (phase === 'confirm' && t && !trialStale) {
       right = (
-        <ConfirmList items={t.confirm_items ?? []} checks={t.checks ?? []} acceptable={t.acceptable ?? []} reupload={isReupload}
-                     busy={busy === 'commit'} missing={missing} error={confirmError} onSubmit={(b) => void commit(b)} />
+        <div className="space-y-3">
+          {/* 新旧配方对照也放在确认清单顶部：勾选之前再看一眼这次改了什么 */}
+          {t.recipe_compare && <RecipeCompare compare={t.recipe_compare} attr="data-confirm-compare" />}
+          <ConfirmList items={t.confirm_items ?? []} checks={t.checks ?? []} acceptable={t.acceptable ?? []} reupload={isReupload}
+                       busy={busy === 'commit'} missing={missing} error={confirmError} blocked={commitBlocked}
+                       prior={t.prior_acceptances} fixes={staging.fixes} sheets={t.receipt?.sheets} onFix={openFix}
+                       onSubmit={(b) => void commit(b)} />
+        </div>
       )
     } else if (view === 'result' && t) {
       right = (
@@ -539,11 +707,24 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
             <PeriodForm fileName={staging.file?.name ?? ''} busy={busy === 'trial'} error={periodError}
                         onSubmit={(start, end) => void trial({ start, end })} />
           )}
+          {/* 配方与现行的不同：对照放在回执顶部，破坏性的项排在最前 */}
+          {t.recipe_compare && <RecipeCompare compare={t.recipe_compare} />}
+          {t.accumulate && <AccumulatePlan plan={t.accumulate} checks={t.union_checks} />}
           {/* 拒收、需要录入时服务端有意不算差异（diff 为 null）：不显示差异卡 */}
           {(Array.isArray(t.diff) || t.same_as_import) && <ReuploadDiff diff={t.diff} sameAsImport={t.same_as_import} />}
-          <ImportReceipt trial={t} onFocusCell={focusCell}
+          <ImportReceipt trial={t} onFocusCell={focusCell} fixes={staging.fixes} onFix={openFix}
                          expectedSheets={Array.isArray(staging.recipe?.sheets) ? staging.recipe.sheets.length : undefined} />
         </div>
+      )
+    } else if (proposal) {
+      right = (
+        <FixPanel key={proposal.id} proposal={proposal} handlers={editHandlers('fix', staging)} onFocus={focusCell}
+                  onClose={closePanels} />
+      )
+    } else if (selection && selAs) {
+      right = (
+        <SelectionPanel key={`${selection.sheet}!${selection.ref}|${selAs}`} selection={selection} as={selAs} recipe={staging.recipe}
+                        handlers={editHandlers('selection', staging)} onFocus={focusCell} onClose={closePanels} />
       )
     } else {
       const failures = staging.draft && !staging.draft.complete ? staging.draft.failures ?? [] : []
@@ -561,11 +742,13 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
           )}
           {trialStale && <Notice tone="info" attr={{ 'data-trial-stale': '' }}>{RECIPE_TEXT.trialStale}</Notice>}
           <SuggestionCards cards={staging.cards ?? []} questions={staging.questions ?? []} answers={staging.answers ?? {}}
-                           busy={!!busy} applying={busy === 'answer'} onAnswer={answer} onFocusCell={focusCell} />
+                           busy={!!busy} applying={busy === 'answer'} dropped={staging.answers_dropped}
+                           onAnswer={answer} onFocusCell={focusCell} />
           {(staging.draft_problems ?? []).some((p) => p.category !== 'confirm') && (
             <section className="space-y-1.5">
               <h3 className="text-xs font-semibold">{RECIPE_TEXT.problems}</h3>
-              <ProblemList problems={(staging.draft_problems ?? []).filter((p) => p.category !== 'confirm')} onFocus={focusCell} />
+              <ProblemList problems={(staging.draft_problems ?? []).filter((p) => p.category !== 'confirm')} onFocus={focusCell}
+                           fixes={fixes} onFix={openFix} />
             </section>
           )}
         </div>
@@ -582,9 +765,61 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
         )}
         <div className="grid min-h-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
           <SheetGrid grids={staging.grids ?? []} marks={staging.marks ?? []} problems={problemsForGrid}
-                     partial={view === 'draft' && staging.draft_partial} focus={focus} />
+                     partial={view === 'draft' && staging.draft_partial} focus={focus}
+                     selectable={drafting} selection={selection} highlight={proposal?.cells} after={after} replay={replay}
+                     onSelection={(sel) => {
+                       // 选区变了：之前的框选预览不再对应这个框，面板关掉，重新选「框选为…」
+                       setSelection(sel)
+                       if (selAs) { setSelAs(null); setAfter(null); setReplay(null) }
+                     }}
+                     onSelectAs={(as) => { setFixOpen(null); setAfter(null); setReplay(null); setSelAs(as) }} />
           <div className="min-h-0 overflow-y-auto pr-1" style={{ maxHeight: '60vh' }} data-wizard-side>{right}</div>
         </div>
+        {drafting && !!staging.recipe_problems?.length && (
+          // 配方有问题时「试运行」是禁用的：原因和出路（修复按钮）放在抽屉外，不用先展开配方面板才看得到
+          <section className="rounded-lg border" data-recipe-problems-bar={staging.recipe_problems.length}
+                   style={{ borderColor: 'color-mix(in srgb, var(--err) 35%, var(--border))' }}>
+            <button type="button" className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs hover:bg-hover"
+                    aria-expanded={problemsBar} onClick={() => setProblemsBar((v) => !v)} data-recipe-problems-toggle>
+              <ChevronRight size={12} className={clsx('transition-transform', problemsBar && 'rotate-90')} aria-hidden />
+              <span className="font-medium text-[var(--err)]">{RECIPE_TEXT.recipeProblemsBar(formatNumber(staging.recipe_problems.length))}</span>
+              <span className="text-2xs text-faint">{RECIPE_TEXT.recipeProblemsHint}</span>
+            </button>
+            {problemsBar && (
+              <ul className="space-y-1.5 border-t px-3 py-2" data-recipe-problems-list>
+                {staging.recipe_problems.map((p, i) => (
+                  <li key={i} className="flex flex-wrap items-center gap-2 text-xs" data-recipe-problem={p.code}>
+                    <span className="min-w-0 flex-1 leading-relaxed">{p.message}</span>
+                    <FixButtons ids={p.fix_ids} fixes={fixes} onFix={openFix} />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
+        {drafting && !!staging.edits?.length && (
+          <section className="space-y-1.5 rounded-lg border px-3 py-2" data-edits={staging.edits.length}>
+            <h3 className="text-xs font-semibold">{RECIPE_TEXT.editsTitle}</h3>
+            <ul className="space-y-1">
+              {staging.edits.map((x) => (
+                <li key={x.seq} className={clsx('flex flex-wrap items-center gap-2 text-xs', x.superseded && 'text-faint')}
+                    data-edit={x.seq} data-superseded={x.superseded || undefined}
+                    title={x.superseded ? RECIPE_TEXT.editSupersededHint : undefined}>
+                  <span className={clsx('min-w-0 flex-1', x.superseded && 'line-through')}>{x.title}</span>
+                  {x.superseded && <span className="chip" data-edit-superseded>{RECIPE_TEXT.editSuperseded}</span>}
+                  <span className="text-2xs text-faint">
+                    {formatDateTime(x.at)}{x.signed_by ? ` · ${RECIPE_TEXT.editSigned(x.signed_by)}` : ''}
+                  </span>
+                  {x.undoable && !x.superseded && (
+                    <button type="button" className="btn btn-xs" disabled={!!busy} onClick={() => void undo()} data-edit-undo>
+                      <RotateCcw size={10} aria-hidden /> {RECIPE_TEXT.editUndo}
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
         {view === 'draft' && phase === 'work' && (
           <section className="rounded-lg border" data-recipe-drawer>
             <button type="button" className="flex w-full items-center gap-1.5 px-3 py-2 text-xs font-medium hover:bg-hover"
@@ -598,7 +833,41 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
               )}
             </button>
             {drawer && (
-              <div className="border-t p-3">
+              <div className="space-y-3 border-t p-3">
+                {(kind === 'reupload' || kind === 'redraft') && !redraft.hidden && (
+                  <div className="space-y-2" data-redraft-block>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button type="button" className="btn btn-sm" disabled={!!busy} onClick={() => void runRedraft()} data-redraft-rules>
+                        {busy === 'redraft' ? <Spinner size={11} /> : <Wand2 size={11} aria-hidden />} {RECIPE_TEXT.redraftRules}
+                      </button>
+                      <span className="text-2xs text-faint">{RECIPE_TEXT.redraftRulesHint}</span>
+                    </div>
+                    {redraft.out && (
+                      <RecipeCompare compare={redraft.out.compare} attr="data-redraft-compare" title={RECIPE_TEXT.redraftTitle}
+                                     notes={redraft.out.alignment} notesTitle={RECIPE_TEXT.redraftAlignment}>
+                        {!redraft.out.aligned_recipe && (
+                          <div className="text-xs text-[var(--warn)]" data-redraft-incomplete>
+                            <div>{RECIPE_TEXT.redraftNoRecipe}</div>
+                            {!!redraft.out.draft?.failures?.length && (
+                              <ul className="mt-0.5 list-disc pl-4 text-dim">{redraft.out.draft.failures.map((f, i) => <li key={i}>{f}</li>)}</ul>
+                            )}
+                          </div>
+                        )}
+                        {redraft.error && <p className="text-xs text-[var(--err)]" role="alert" data-redraft-error>{redraft.error}</p>}
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          <button type="button" className="btn btn-sm btn-primary" disabled={!redraft.out.aligned_recipe || !!busy}
+                                  onClick={() => void adoptRedraft()} data-redraft-adopt>
+                            {RECIPE_TEXT.redraftAdopt}
+                          </button>
+                          <button type="button" className="btn btn-sm" disabled={!!busy}
+                                  onClick={() => setRedraft((r) => ({ ...r, out: null, error: null }))} data-redraft-discard>
+                            {RECIPE_TEXT.redraftDiscard}
+                          </button>
+                        </div>
+                      </RecipeCompare>
+                    )}
+                  </div>
+                )}
                 <RecipePanel recipe={staging.recipe} problems={staging.recipe_problems ?? []} units={staging.units ?? []}
                              candidates={staging.candidates ?? {}} labelOptions={labelOptions} saving={busy === 'recipe'}
                              onSave={saveRecipe} />
@@ -630,7 +899,7 @@ export function ImportWizard({ entry, taken = [], onClose, onCommitted, onChange
             {RECIPE_TEXT.backToRecipe}
           </button>
           {next && (
-            <button className="btn btn-primary" onClick={() => { setMissing(new Set()); setConfirmError(null); setPhase('confirm') }}
+            <button className="btn btn-primary" onClick={() => { setMissing(new Set()); setConfirmError(null); setCommitBlocked(false); setPhase('confirm') }}
                     disabled={!!busy} data-to-confirm>
               {RECIPE_TEXT.toConfirm}
             </button>

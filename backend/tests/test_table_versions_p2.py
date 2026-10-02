@@ -301,6 +301,32 @@ def test_recipe_build_options_shape():
     opts = table_versions.recipe_build_options("b" * 64, {})
     assert opts == {"kind": "recipe", "recipe_sha256": "b" * 64,
                     "parser_ver": recipe_parsers.PARSER_VER, "inputs": {}}
+    assert table_versions.recipe_build_options("b" * 64, {}, semantics={}) == opts
+
+
+def test_engine_semantics_marks_only_lists_that_skip_blank_rows():
+    """执行器语义标记（WP-8 评审意见 1）：只有含 blank_rows=skip 列表块的配方带 list_note_after_blank，构建 id 和
+    构建选项随之变；交叉表、stop 模式的列表不带，构建 id 与期 2 逐字相同（不升 RECIPE_ENGINE_VER 的前提）。"""
+    def recipe(**rows: Any) -> recipe_types.Recipe:
+        return recipe_types.Recipe.model_validate({
+            "recipe_format": "agentlab-recipe/2",
+            "sheets": [{"id": "s1", "match": {"name": "明细"}, "blocks": [{
+                "id": "列表1", "layout": "list", "table": "明细",
+                "columns": [{"header": "地区", "name": "地区", "type": "TEXT"},
+                            {"header": "金额", "name": "金额", "type": "INTEGER"}],
+                "rows": rows}]}],
+            "tables": [{"name": "明细", "grain": ["地区"]}]})
+
+    mark = {table_versions.LIST_NOTE_AFTER_BLANK: 1}
+    assert table_versions.recipe_engine_semantics(recipe(blank_rows="skip")) == mark
+    assert table_versions.recipe_engine_semantics(recipe()) == {}
+    assert table_versions.recipe_engine_semantics(recipe(blank_rows="stop")) == {}
+    assert table_versions.recipe_engine_semantics(None) == {}
+    base = table_versions.recipe_build_id("s1", "a" * 64, "b" * 64, {})
+    assert table_versions.recipe_build_id("s1", "a" * 64, "b" * 64, {}, semantics={}) == base
+    assert table_versions.recipe_build_id("s1", "a" * 64, "b" * 64, {}, semantics=mark) != base
+    opts = table_versions.recipe_build_options("b" * 64, {}, semantics=mark)
+    assert opts["engine_semantics"] == mark
 
 
 def test_public_names_keep_the_old_aliases():
@@ -445,8 +471,10 @@ async def test_wal_trial_settled_before_hashing_matches_at_publish(store):
     assert info.value.code == "trial_tampered"
 
 
-async def test_reused_build_reports_the_existing_file_hash(store):
+async def test_reused_build_reports_the_existing_file_hash(store, monkeypatch):
     """同一个构建 id 再发布：复用已有文件，PublishInfo.db_sha256 是已有文件的，不是这次试运行库的。"""
+    # 期 3 起回收另外保留最近 SNAPSHOT_KEEP 个快照；调成 0（期 1、期 2 的规则）才测得出「被替换的那一期随回收置 retired」
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     name, raw = unique(), raw_bytes()
     sid = uuid.uuid4().hex
     bid = table_versions.recipe_build_id(sid, hashlib.sha256(raw).hexdigest(), RECIPE_SHA, {})
@@ -682,8 +710,10 @@ async def test_open_staging_raw_survives_gc_and_startup(store):
     assert (await get(ImportStaging, sid)).status == "rejected"
 
 
-async def test_open_staging_protects_a_raw_shared_with_a_replaced_import(store):
+async def test_open_staging_protects_a_raw_shared_with_a_replaced_import(store, monkeypatch):
     """上传新一期被拒收、正在修改时，那份原件和一次旧导入相同：旧导入被回收，原件不能跟着删。"""
+    # 同上：SNAPSHOT_KEEP 调成 0，旧导入才会随替换被回收
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     name, raw = unique(), raw_bytes()
     src, first = await publish_trial(name, new_trial(uuid.uuid4().hex), raw)
     sha = hashlib.sha256(raw).hexdigest()

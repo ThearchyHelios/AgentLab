@@ -338,3 +338,163 @@ def teardown_module(_module) -> None:
         for row in RESULTS:
             target = f"目标 {row['target']} {row['unit']}，{row['ratio']} 倍" if row["target"] is not None else "无目标"
             print(f"[perf]   {row['item']}: {row['value']} {row['unit']}（{target}，{row['verdict']}）")
+
+
+# --------------------------------------------------------------------------
+# 期 3（WP-8，P3-SPEC 11.5）：按期累积的物化、累积试运行、修复与框选的预览
+# --------------------------------------------------------------------------
+
+#: 12 期 × 20 万行 × 10 列的合成表（同 p3-probe/probe_perf.py 的结构：每期 30 天 × 6667 个项目，主键 (日期, 项目)）
+UNION_PERIODS = 12
+UNION_COLS = ["日期", "项目", "类别"] + [f"值{i}" for i in range(7)]
+
+
+def _union_target() -> Any:
+    """物化的目标配方：一张 10 列的表，主键 (日期, 项目)。用列表块写出这个表结构（交叉表块一段只有一个值列，造不出
+    10 列 × 20 万行）；物化只看 derive_tables 推出的表结构，与块的形态无关。列表表没有日期轴，U3 不跑（U3 每期每表
+    一条带 rowid 区间的 COUNT，量级可以忽略）。"""
+    from app.data.recipe_types import Recipe
+
+    return Recipe.model_validate({
+        "recipe_format": "agentlab-recipe/2",
+        "sheets": [{"id": "s1", "match": {"name": SHEET}, "blocks": [{
+            "id": "列表1", "layout": "list", "table": "明细",
+            "columns": [{"header": c, "name": c, "type": "DATE" if c == "日期" else "TEXT" if i < 3 else "INTEGER"}
+                        for i, c in enumerate(UNION_COLS)]}]}],
+        "tables": [{"name": "明细", "grain": ["日期", "项目"]}],
+    })
+
+
+def _union_part_db(path: Path, start: dt.date, seed: int) -> None:
+    """一期的构建库：执行器建的那种 STRICT 表，rowid 从 1 连续（物化前要断言）。"""
+    import sqlite3
+
+    rnd = random.Random(seed)
+    per = ROWS // 30
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute('CREATE TABLE "明细" ("日期" TEXT NOT NULL, "项目" TEXT NOT NULL, "类别" TEXT, '
+                 + ", ".join(f'"值{i}" INTEGER' for i in range(7)) + ', PRIMARY KEY ("日期", "项目")) STRICT')
+    rows = []
+    for d in range(30):
+        day = (start + dt.timedelta(days=d)).isoformat()
+        for k in range(per):
+            rows.append((day, f"项目{k:05d}", "甲" if k % 2 else "乙", *[rnd.randint(0, 99999) for _ in range(7)]))
+    conn.executemany(f'INSERT INTO "明细" VALUES ({", ".join("?" * 10)})', rows)
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture(scope="module")
+def union_parts(tmp_path_factory) -> list[Any]:
+    from app.data import raw_store
+    from app.data.recipe_types import UnionPart
+
+    target = _union_target()
+    root = tmp_path_factory.mktemp("union_parts")
+    parts = []
+    for m in range(UNION_PERIODS):
+        start = dt.date(2025, 1, 1) + dt.timedelta(days=31 * m)
+        path = root / f"p{m:02d}.db"
+        _union_part_db(path, start, seed=700 + m)
+        end = start + dt.timedelta(days=29)
+        parts.append(UnionPart(import_id=f"imp{m:02d}", start=start.isoformat(), end=end.isoformat(),
+                               db_path=str(path), recipe=target, db_sha256=raw_store.sha256_file(path),
+                               table_hashes={"明细": f"{m:064x}"}))
+    return parts
+
+
+def test_perf_materialize_twelve_periods_of_two_hundred_thousand_rows(record_property, union_parts, tmp_path,
+                                                                      monkeypatch):
+    """11.5：12 期 × 20 万行的累积物化（各期哈希核对 + INSERT…SELECT + U1/U2 + 空值数 + 组合表哈希 + 库哈希）≤ 8 s；
+    其中表哈希这一步（union/1 的组合定义，不逐行重算）≤ 0.2 s。进程内存增量只记录。"""
+    from app.data import recipe_accumulate as ra
+
+    hashing = {"s": 0.0}
+    real_sha = ra.sha_json
+
+    def timed_sha(obj):
+        t0 = time.perf_counter()
+        try:
+            return real_sha(obj)
+        finally:
+            hashing["s"] += time.perf_counter() - t0
+
+    monkeypatch.setattr(ra, "sha_json", timed_sha)
+    out = tmp_path / "union.db"
+    with _Peak() as peak:
+        t0 = time.perf_counter()
+        report = ra.materialize_union(out, target=_union_target(), parts=union_parts)
+        elapsed = time.perf_counter() - t0
+    assert report.ok, [c for c in report.checks if c.status != "passed"]
+    assert report.rows == {"明细": UNION_PERIODS * (ROWS // 30) * 30}
+    rows = [judge(record_property, "期 3：12 期 × 20 万行累积物化（含核对、哈希）", elapsed, 8.0),
+            judge(record_property, "期 3：其中组合表哈希", hashing["s"], 0.2),
+            judge(record_property, "期 3：物化的进程内存增量", peak.delta, None, "MB"),
+            judge(record_property, "期 3：并集库大小", out.stat().st_size / 1e6, None, "MB")]
+    assert_all(rows)
+
+
+async def _accumulate_first(client, seed: int) -> str:
+    """参考夹具 8 月按期累积首次导入（回答问题、宽表改名、提交），返回数据源 id。"""
+    from tests.test_recipe_acceptance_p3 import answers_for, rename_wide
+
+    raw, fn = flow_workbook(dt.date(2026, 8, 1), 31, seed=seed)
+    resp = await client.post("/api/datasources/imports/stage", files={"file": (fn, raw, XLSX)},
+                             data={"name": f"perf_{uuid.uuid4().hex[:8]}"})
+    st = resp.json()
+    st = (await client.post(f"/api/datasources/imports/{st['id']}/answers",
+                            json={"answers": answers_for(st["questions"], "accumulate")})).json()
+    wide = next(t["name"] for t in st["recipe"]["tables"] if t["name"].endswith("_按日"))
+    st = (await client.put(f"/api/datasources/imports/{st['id']}/recipe",
+                           json={"recipe": rename_wide(st["recipe"], wide, "日客流")})).json()
+    st = (await client.post(f"/api/datasources/imports/{st['id']}/trial", json={})).json()
+    resp = await client.post(f"/api/datasources/imports/{st['id']}/commit",
+                             json={"trial_id": st["trial"]["trial_id"], "confirmations": _confirms(st)})
+    assert resp.status_code == 201, resp.text
+    return resp.json()["source"]["id"]
+
+
+async def test_perf_flow_fixture_accumulate_trial_and_previews(client, record_property):
+    """11.5：参考夹具 8 月加 9 月，试运行（含物化）≤ 1.5 s；交互路径：修复预览（D04 去掉「7-8」）、框选预览（c01 框为
+    列表；参考夹具框为交叉表整块，要对整张表跑规则起草）≤ 1 s。上传新一期（扫描 + 试运行 + 物化）只记录。"""
+    from tests.fixtures.xlsx import lab
+    from tests.fixtures.xlsx.drift import DRIFT_CASES
+
+    source_id = await _accumulate_first(client, seed=31)
+    raw, fn = flow_workbook(dt.date(2026, 9, 1), 30, seed=32)
+    resp, up_s = await _timed(client.post(f"/api/datasources/{source_id}/reupload",
+                                          files={"file": (fn, raw, XLSX)}))
+    assert resp.status_code == 201, resp.text
+    st = resp.json()
+    assert st["trial"]["status"] == "passed" and st["trial"]["accumulate"]["action"] == "append"
+    rows = [judge(record_property, "期 3：客流夹具 8+9 月上传新一期（扫描 + 试运行 + 物化）", up_s, None)]
+    resp, trial_s = await _timed(client.post(f"/api/datasources/imports/{st['id']}/trial", json={}))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["trial"]["accumulate"]["union"]["rows"] == {"日客流": 61, "时段客流": 1037,
+                                                                   "时段客流_表内合计": 183}
+    rows.append(judge(record_property, "期 3：客流夹具 8+9 月试运行（含物化）", trial_s, 1.5))
+    await client.delete(f"/api/datasources/imports/{st['id']}")
+
+    raw, fn = DRIFT_CASES["D04"].build(33)
+    st = (await client.post(f"/api/datasources/{source_id}/reupload", files={"file": (fn, raw, XLSX)})).json()
+    fx = next(f for f in st["fixes"] if f["kind"] == "remove_label")
+    resp, fix_s = await _timed(client.post(f"/api/datasources/imports/{st['id']}/edits/preview",
+                                           json={"fix": {"id": fx["id"], "option": "remove"}}))
+    assert resp.status_code == 200 and resp.json()["ok"], resp.text
+    rows.append(judge(record_property, "期 3：修复预览（D04 去掉标签）", fix_s, 1.0))
+    sel = {"sheet": "客流汇总", "ref": "B4:AG30", "as": "crosstab", "options": {}}
+    resp, cross_s = await _timed(client.post(f"/api/datasources/imports/{st['id']}/edits/preview",
+                                             json={"selection": sel}))
+    assert resp.status_code == 200, resp.text
+    rows.append(judge(record_property, "期 3：框选预览（客流夹具框为交叉表整块）", cross_s, 1.0))
+
+    raw, fn = lab.c01("literal")
+    st = (await client.post("/api/datasources/imports/stage", files={"file": (fn, raw, XLSX)},
+                            data={"name": f"perf_{uuid.uuid4().hex[:8]}"})).json()
+    sel = {"sheet": "月报", "ref": "C5:F8", "as": "list", "options": {"header_rows": 1, "bottom": "box"}}
+    resp, list_s = await _timed(client.post(f"/api/datasources/imports/{st['id']}/edits/preview",
+                                            json={"selection": sel}))
+    assert resp.status_code == 200 and resp.json()["ok"], resp.text
+    rows.append(judge(record_property, "期 3：框选预览（c01 框为列表）", list_s, 1.0))
+    assert_all(rows)

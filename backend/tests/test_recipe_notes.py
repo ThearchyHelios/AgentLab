@@ -623,6 +623,24 @@ def test_rows_after_stop_goes_to_block_above():
     assert "空行之后" not in notes.tables["销售"].comment
 
 
+
+def test_rows_after_stop_from_a_skip_list_goes_to_the_block_named_in_the_message():
+    """跳过空行的列表按表下说明收尾、那格文字不像说明时报的 rows_after_stop（WP-8 评审意见 4）也写进那张表的说明：
+    消息里写着「列表「费用」」，按它找块；只按 blank_rows=stop 找的话，这张表的说明里没有这一句。"""
+    data = deepcopy(LIST_RECIPE)
+    second = deepcopy(data["sheets"][0]["blocks"][0])
+    second.update(id="费用", table="费用", after_title="二、费用")
+    second["rows"] = {"blank_rows": "skip"}
+    data["sheets"][0]["blocks"].append(second)
+    data["tables"].append({"name": "费用"})
+    lineage = {"销售": {"金额": [[1, "销售", "D2", 6, "down"]]}, "费用": {"金额": [[1, "销售", "D20", 3, "down"]]}}
+    notes = list_notes(data=data, lineage=lineage, problems=[Problem(
+        "rows_after_stop", "confirm", "工作表「销售」的列表「费用」：第 25 行只有首列文字（A25「地区丁」），"
+        "已当作表下说明，没有导入。", cells=["销售!A25"])])
+    assert "空行之后" in notes.tables["费用"].comment
+    assert "空行之后" not in notes.tables["销售"].comment
+
+
 # ---------------------------------------------------------------- 列说明：空值、日期、单位
 
 

@@ -435,7 +435,9 @@ async def test_tools_follow_the_pinned_snapshot_and_record_data_version():
         await engines.invalidate(sid)
 
 
-async def test_pinned_snapshot_collected_by_gc_gives_a_clear_error_and_never_reads_current():
+async def test_pinned_snapshot_collected_by_gc_gives_a_clear_error_and_never_reads_current(monkeypatch):
+    # 期 3 起回收另外保留最近 SNAPSHOT_KEEP 个快照；调成 0（期 1 的规则），没人引用的 S1 才会在重传后被回收
+    monkeypatch.setattr(table_versions, "SNAPSHOT_KEEP", 0)
     src = uniq()
     sid, s1 = await publish(src, V1)
     # 没有运行引用 S1：重传后的回收把它标成已回收、删掉文件

@@ -1,7 +1,13 @@
-"""配方导入的契约（期 2，波次 0 由编排者提交）：配方 JSON 的模型、执行结果和各模块之间传递的数据结构。
+"""配方导入的契约（期 2，波次 0 由编排者提交；期 3 的改动见 P3-SPEC 9.2，同样由波次 0 提交）：配方 JSON 的模型、
+执行结果和各模块之间传递的数据结构。
 
-各工作包之间只通过这里的类型和 P2-SPEC.md 里写明的函数签名交互。这里**只有声明**，没有业务逻辑
-（prose_problems / render_prose 两个小函数除外：静态校验、说明生成、AI 起草三处共用，必须是同一份）。
+各工作包之间只通过这里的类型和 P2-SPEC.md、P3-SPEC.md 里写明的函数签名交互。这里**只有声明**，没有业务逻辑
+（prose_problems / render_prose / accumulate_blockers 三个小函数除外：静态校验、说明生成、AI 起草、累积计划
+几处共用，必须是同一份）。
+
+**哈希前向兼容**（P2-SPEC 2.3、P3-SPEC 9.6）：配方的新字段默认值一律等于「没有这个字段时的行为」，canonical 形式
+去掉默认值，所以老配方的哈希和构建 id 不变；不改已有字段的默认值。执行结果、说明里的新字段也都有默认值：旧回执、
+旧清单里没有它们，读的一方按默认值处理。
 
 改这个文件要编排者拍板：字段的增删会同时影响执行器、核对、起草、接口和前端。
 
@@ -33,8 +39,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 #: 配方格式版本。改结构就要升，静态校验只认这一个
 RECIPE_FORMAT = "agentlab-recipe/2"
-#: 配方执行器版本：进构建 id 和快照 id（table_versions.recipe_build_id / snapshot_id）
+#: 配方执行器版本：进构建 id 和快照 id（table_versions.recipe_build_id / snapshot_id）。期 3 不升：没用新字段的配方，
+#: 执行器写出的库与期 2 逐字节相同（P3-SPEC 2.1），期 2 的构建照样复用
 RECIPE_ENGINE_VER = "recipe/1"
+#: 按期累积的并集库的物化规则版本：进并集构建（TableBuild.engine_ver）、并集 id 和组合表哈希（P3-SPEC 2.1、2.6）
+UNION_VER = "union/1"
 
 # ==========================================================================
 # 配方 JSON（agentlab-recipe/2）
@@ -211,6 +220,53 @@ class DerivedSegment(_M):
 Segment = Annotated[Union[MeasuresSegment, DimensionSegment, DerivedSegment], Field(discriminator="role")]
 
 
+# ---- 忽略规则（期 3，修复按钮 ⑥ 和框选写入，P3-SPEC 3.2、9.2）。都按文件里的文字认，不记坐标；锚点在某一期
+# 没出现，就什么也不忽略、也不报错。锚点文字含数字时静态校验报 period_literal（origin 不是 replay 时）。
+# 注意：Recipe.model_json_schema() 会进 AI 起草的提示词（recipe_ai._schema_text），类的 docstring 是 schema 的
+# description，所以 docstring 只写给读配方的人看的语义，实现细节写在注释里。
+#
+# 执行语义（WP-1 实现）：
+# - IgnoreRow：轴行以下的行，标签 match_key 在集合里、又没有被分段认领的，归类为 ignored：标签格和轴列格的去向是
+#   ignored，不进分段，不报 row_unclaimed；行记进 Extraction.rows_excluded（reason=ignored_rows，anchor=命中的
+#   标签原文）。同一文字同时在本块某个分段的 expect 里是静态校验的 ignore_conflict。
+# - IgnoreColumn（交叉表）：轴行最后一个日期右侧、表头 match_key 在集合里的列，从轴行到本块数据区底部的格，去向是
+#   ignored_column，不报 axis_extra_cells；表头记进 Extraction.ignored_columns[块]。表头能被 month_day_or_date
+#   解析的是 ignore_conflict。
+# - IgnoreColumn（列表）：表头命中的列按 extra_columns=ignore 的方式处理（去向 ignored_column，表头记进
+#   ignored_columns），只针对这些列；其余多出的列照 extra_columns 处理。与 columns 的表头重复是 ignore_conflict。
+#   列不是行，不进 rows_excluded。
+# - IgnoreOutside：区域外的数字格（含区域外的公式格）所在行，如果有区域外文字格的 match_key 等于锚点，这些数字格的
+#   去向是 ignored；锚点格本身仍是区域外文字（照常记录、比对）。行记进 rows_excluded（reason=ignored_outside，
+#   anchor=锚点原文）。
+# - 同一列表里 match_key 相同是静态校验的 ignore_duplicate。理由（reason）只作说明、不参与匹配，但进配方哈希：
+#   改理由就是改配方。
+
+
+class IgnoreRow(_M):
+    """按行标签忽略交叉表里的一行：标签与 label 相同、又没有被任何分段认领的行不导入，记进回执的「排除的行」。"""
+
+    #: 交叉表标签列上要忽略的行的标签原文（按 match_key 比；1–40 字）
+    label: str = Field(min_length=1, max_length=40)
+    #: 为什么忽略（说明用，不参与匹配；1–200 字）
+    reason: str = Field(min_length=1, max_length=200)
+
+
+class IgnoreColumn(_M):
+    """按表头忽略一列。交叉表只认日期表头右侧的列；列表只针对这些表头，其余多出的列照 extra_columns 处理。"""
+
+    #: 交叉表：轴行最后一个日期右侧的表头原文；列表：表头原文（按 match_key 比；1–80 字）
+    header: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=1, max_length=200)
+
+
+class IgnoreOutside(_M):
+    """导入区域之外、同一行有这段文字时，这一行区域外的数字格不导入；这段文字本身照常作为区域外文字记录。"""
+
+    #: 区域外同一行里的文字（按 match_key 比；1–40 字）。这一行区域外的数字格都忽略
+    anchor: str = Field(min_length=1, max_length=40)
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class CrosstabBlock(_M):
     id: str = Field(min_length=1, max_length=32)
     layout: Literal["crosstab"]
@@ -219,6 +275,10 @@ class CrosstabBlock(_M):
     label_offset: int = Field(default=-1, ge=-1, le=-1)
     values: CrossValues = Field(default_factory=CrossValues)
     segments: list[Segment] = Field(min_length=1, max_length=16)
+    #: 期 3：按行标签忽略的行（IgnoreRow）。默认空 = 期 2 的行为
+    ignore_rows: list[IgnoreRow] = Field(default_factory=list, max_length=50)
+    #: 期 3：轴行最后一个日期右侧、按表头忽略的列（IgnoreColumn）。默认空 = 期 2 的行为
+    ignore_columns: list[IgnoreColumn] = Field(default_factory=list, max_length=50)
 
 
 class ListColumn(_M):
@@ -270,6 +330,8 @@ class ListBlock(_M):
     values: ListValues = Field(default_factory=ListValues)
     #: 数据区里的合并单元格：reject（默认）；fill 在合并范围内用左上格的值填充（只对 TEXT 列）
     merged_data: Literal["reject", "fill"] = "reject"
+    #: 期 3：按表头忽略的列（IgnoreColumn），只针对这些列；其余多出的列照 extra_columns。默认空 = 期 2 的行为
+    ignore_columns: list[IgnoreColumn] = Field(default_factory=list, max_length=50)
 
 
 Block = Annotated[Union[CrosstabBlock, ListBlock], Field(discriminator="layout")]
@@ -281,6 +343,8 @@ class SheetRecipe(_M):
     hidden: HiddenPolicy = Field(default_factory=HiddenPolicy)
     context: list[ContextSpec] = Field(default_factory=list, max_length=1)
     blocks: list[Block] = Field(min_length=1, max_length=8)
+    #: 期 3：按同一行的文字忽略导入区域之外的数字格（IgnoreOutside）。默认空 = 期 2 的行为
+    ignore_outside: list[IgnoreOutside] = Field(default_factory=list, max_length=20)
 
 
 class TableSpec(_M):
@@ -337,7 +401,7 @@ Relation = Annotated[Union[SumEq, NotComparable, Dismissed], Field(discriminator
 
 class Recipe(_M):
     recipe_format: Literal["agentlab-recipe/2"]
-    #: replace 每期替换；accumulate 按期累积（期 3，期 2 静态校验拒收，数据模型兼容）
+    #: replace 每期替换；accumulate 按期累积（期 3 起可用：静态校验按 accumulate_blockers 判资格，P3-SPEC 2.2）
     mode: Literal["replace", "accumulate"] = "replace"
     #: 配方没列到的、有内容的可见工作表：confirm 记进回执且需确认（默认）；reject 拒收
     other_visible_sheets: Literal["confirm", "reject"] = "confirm"
@@ -366,9 +430,19 @@ class Problem:
     #: 给 AI 修订看的版本：可以有坐标和标签文字，不能有数据格的数值。执行器产出的每个 code 都必须填
     #: （WP-2 的契约测试逐个 code 断言非空）；万一为空，回灌时只发 code 和 cells，**绝不退回 message**
     model_message: str = ""
-    #: 期 3 修复按钮的种类（add_label / remove_label / rename_title / declare_total / edit_members /
-    #: ignore_cells / declare_placeholder）。期 2 只透传
+    #: 修复按钮的种类，取值见 FIX_KINDS（执行器按 recipe_engine.PROBLEM_FIX 填；edit_members 只来自静态校验，
+    #: rename_sheet 另有不是问题的触发：Extraction.sheets.renamed）。没有修复按钮时 None
     fix: str | None = None
+    #: 期 3：构造修复补丁要的参数，形状按 fix 的种类见 P3-SPEC 3.2（如 label_missing 的
+    #: {"segment": 分段 id, "labels": [原文…]}）。由执行器填写。**只含标签、表头、分段标题、锚点的原文和坐标，
+    #: 不得含数据格的数值**（declare_placeholder 的 texts 是数据格里的占位符文字，不是数值，允许）。
+    #: 没有修复按钮时 None
+    fix_args: dict[str, Any] | None = None
+
+
+#: 修复按钮的九种（P3-SPEC 3.2 ①–⑨）。Problem.fix、FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
+FIX_KINDS = ("remove_label", "add_label", "edit_members", "rename_title", "declare_total", "ignore_cells",
+             "declare_placeholder", "declare_hidden", "rename_sheet")
 
 
 @dataclass
@@ -388,10 +462,12 @@ CheckStatus = Literal["passed", "mismatch", "unverifiable", "info"]
 @dataclass
 class CheckResult:
     #: 稳定 id：K1… 合计核对、G1… 公式引用、T1… 列表合计、R1… 关系（沿用配方里的 id）、C1 统计期、C2 文件名、
-    #: N1… 行数、P1… 主键。F 编号留给系统发现的事实（Fact.id），两者不混用
+    #: N1… 行数、P1… 主键；期 3 的并集整体核对 U1 行数、U2 主键、U3 统计期（物化时跑，都是结构类，P3-SPEC 2.7）。
+    #: F 编号留给系统发现的事实（Fact.id），两者不混用
     id: str
     kind: Literal["derived_sum", "formula_refs", "column_sum", "relation_sum_eq", "relation_not_comparable",
-                  "context_agree", "filename_period", "row_count", "pk_unique"]
+                  "context_agree", "filename_period", "row_count", "pk_unique",
+                  "union_rows", "union_pk", "union_period"]
     title: str
     status: CheckStatus
     #: 不通过时的类别：structure / data_quality / info
@@ -422,12 +498,14 @@ class Acceptance:
 
 @dataclass
 class ConfirmItem:
-    #: 稳定 id，见 P2-SPEC 第 7.5 节的取值表
+    #: 稳定 id，见 P2-SPEC 第 7.5 节、P3-SPEC 9.5 的取值表
     id: str
     label: str
     detail: str = ""
     required: bool = True
-    source: Literal["recipe", "diff", "outside", "sheet", "context", "switch"] = "recipe"
+    #: 界面按它分组（P3-SPEC 9.5）。期 3 新增 edit（fix:*、select:*、redraft_adopted）和 accumulate
+    #: （period_replace、retire、mode_switch、accumulate_restart、accumulate_unit_risk）；默认值仍是 recipe
+    source: Literal["recipe", "diff", "outside", "sheet", "context", "switch", "edit", "accumulate"] = "recipe"
 
 
 @dataclass
@@ -503,9 +581,11 @@ class Grid:
 # 执行结果（执行器 → 核对、说明、差异、回执）
 # ==========================================================================
 
-#: 格子账的去处（每个非空格恰好一个）
+#: 格子账的去处（每个非空格恰好一个）。期 3 新增 ignored：按配方的 ignore_rows / ignore_outside 忽略的格
+#: （按表头忽略的列沿用 ignored_column）
 Role = Literal["value", "derived_value", "derived_label", "col_header", "row_label", "section_title",
-               "context", "outside_text", "ignored_column", "hidden_excluded", "total_label", "total_value"]
+               "context", "outside_text", "ignored_column", "hidden_excluded", "total_label", "total_value",
+               "ignored"]
 
 
 @dataclass
@@ -514,6 +594,13 @@ class RegionMark:
     role: Role
     #: A1 区域（「C5:AG7」或单格）
     ref: str
+    #: 期 3：块 id（Block.id）。区域外文字、统计期这类不属于任何块的为 None。框选的重放比对按它过滤出新块的区域，
+    #: 网格按块描边。执行器按 (role, block, 列段) 合矩形，不同块的格不合进同一个矩形。
+    #: JSON（asdict）里一律带 block 键，None 也带：界面和 replay_compare 按键取，不判断有没有这个键。
+    #: 已知后果：期 2 的 test_recipe_imports.py 的 test_stage_first_does_not_create_the_source_and_keeps_the_raw
+    #: 逐字比 marks（不含 block），WP-0 合并后它会失败。那个文件归 WP-5（P3-SPEC 12.0），改法是期望值补
+    #: "block": None 或只比 sheet / role / ref。不要为了让它通过去掉这个字段或改默认值
+    block: str | None = None
 
 
 @dataclass
@@ -661,6 +748,34 @@ class SheetsOut:
     skipped_hidden: list[dict[str, str]] = field(default_factory=list)
 
 
+#: 排除的行的原因（P3-SPEC 第 8 节遗留项 4）：
+#: hidden_excluded = hidden.rows=exclude 排除的隐藏行；blank_skipped = 列表 blank_rows=skip 跳过的空行；
+#: ignored_rows = 交叉表 ignore_rows 忽略的行；ignored_outside = ignore_outside 忽略了区域外数字格的行；
+#: after_stop = 列表停止之后没导入的文字行；total_not_kept = 参与核对、但不另存的合计行（交叉表 keep_as 为空的
+#: derived 段、列表 total_row.keep_as 为空的合计行）
+ExcludedReason = Literal["hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop",
+                         "total_not_kept"]
+
+
+@dataclass
+class ExcludedRows:
+    """回执里的「排除的行」（H2：排除的行要写进回执）。同一工作表、同一原因、同一块（和同一锚点）合成一项，
+    行号写成闭区间列表。按表头忽略的列不是行，不在这里（记在 Extraction.ignored_columns）。"""
+
+    #: 实际工作表名
+    sheet: str
+    reason: ExcludedReason
+    #: [[起, 止], …]，1 起的行号闭区间，升序、不重叠
+    rows: list[list[int]]
+    #: 这些行里被排除的非空格个数（与格子账同一口径）
+    cells: int
+    #: ignored_rows / ignored_outside：命中的锚点原文（标签或区域外文字）；after_stop 且是跳过空行的列表按「表下说明」
+    #: 收尾时（WP-8）：说明那一格的文字（去首尾空白），列表停在哪一行、因为什么由它看出；其余 None
+    anchor: str | None = None
+    #: 所在块的 id；ignored_outside、hidden_excluded 这类按工作表算的为 None
+    block: str | None = None
+
+
 @dataclass
 class Extraction:
     #: 没有 structure / input 类问题，且库已写好
@@ -706,6 +821,14 @@ class Extraction:
     table_hashes: dict[str, str] = field(default_factory=dict)
     #: 各阶段耗时（秒）
     timings: dict[str, float] = field(default_factory=dict)
+    #: 期 3：排除的行（ExcludedRows）。只取本次试运行的 Extraction 写进导入清单的 receipt；复用的期 2 构建回执
+    #: （TableBuild.report）里没有这个字段，读的一方按空列表处理。差异卡不把它加进 RECEIPT_KEYS：上一期没有这个
+    #: 字段时出 info「上一期未记录」，不当作空列表比较（P3-SPEC 第 8 节遗留项 4）。
+    #: 要显示它的地方有两处，WP-5 两处都要接上：①试运行回执 TrialOut.receipt——recipe_imports._RECEIPT_VIEW
+    #: 只抄白名单里的键，要把 "rows_excluded" 加进去，否则向导回执一律显示「这次导入未记录排除的行」（界面把缺这个
+    #: 键当作期 3 之前的回执）；②导入清单的 receipt。extraction_from_dict 读回时还要在 _EXTRACTION_PARTS 里把
+    #: 每项转回 ExcludedRows
+    rows_excluded: list[ExcludedRows] = field(default_factory=list)
 
 
 @dataclass
@@ -827,6 +950,19 @@ class TableNote:
 
 
 @dataclass
+class NoteFragment:
+    """表说明里的一个片段（期 3）：build_notes 按片段族拼说明时顺带记下，build_union_notes 按 (key, subject)
+    逐期合并、取最弱（P3-SPEC 2.8）。只是多返回结构，渲染结果不变。"""
+
+    #: NOTE_TEXT 的键（片段族，如 sum_eq_passed、total_k_passed）
+    key: str
+    #: 关系 id（sum_eq / not_comparable 的 Rn）或表名（合计表、本表）；与 subject 无关的片段为 None
+    subject: str | None
+    #: 带 {列:} {表:} {单位:} 引用的模板（未渲染）
+    template: str
+
+
+@dataclass
 class SchemaNotes:
     tables: dict[str, TableNote] = field(default_factory=dict)
     #: 渲染前的模板（带 {列:名} 标记），进清单，复核时可以重查。键：表名或「表名.列名」
@@ -836,6 +972,8 @@ class SchemaNotes:
     #: 表名 → 表的种类，只记 reported_total（原表写明的合计）。apply_notes 记进表结构，工具描述、db_schema 的
     #: 表清单、写作目录据此标出「不要彼此相加、不要与明细相加」（AU-5）
     kinds: dict[str, str] = field(default_factory=dict)
+    #: 期 3：表名 → 这张表说明的片段（NoteFragment），按拼接顺序。旧清单里没有，按空处理
+    fragments: dict[str, list[NoteFragment]] = field(default_factory=dict)
 
 
 _TOKEN = re.compile(r"\{(列|表|单位):([^{}]{1,48})\}")
@@ -970,3 +1108,385 @@ def derive_tables(recipe: Recipe) -> tuple[dict[str, list[ColumnOut]], list[Reci
                               for c in cols if c.type in ("INTEGER", "REAL")]
                     put(total.keep_as, tcols, f"{base}/rows/total_row")
     return out, problems
+
+
+# ==========================================================================
+# 期 3：按期累积的资格（静态校验、起草器、累积计划共用同一份，P3-SPEC 2.2）
+# ==========================================================================
+
+
+def accumulate_blockers(recipe: Recipe) -> list[RecipeProblem]:
+    """这份配方为什么不能按期累积；空列表 = 符合资格。不看 recipe.mode：静态校验只在 mode=accumulate 时报它们，
+    起草器在为空时才写 mode=accumulate，累积计划对每一期的配方都跑一遍（P3-SPEC 2.2、2.4）。
+
+    按期累积要求同时满足：
+    1. 至少一个工作表配置了统计期上下文（SheetRecipe.context 非空），否则报 accumulate_needs_period（path=/mode）；
+    2. derive_tables 推出的每张表都「按统计期分得开」，否则逐表报 accumulate_unkeyed（path=/tables/{ti}，表没在
+       tables 里声明时指向第一个写入它的块），消息写明哪一条不满足：
+       - 只由交叉表块写入（measures、dimension 段，或者 derived 段的 keep_as）——列表写入的表一律不满足；
+       - 写入它的每个交叉表块，axis.checks 都含 covers_context（日期恰好落在统计期内）；
+       - 这张表的 grain 含那个块的 axis.name。
+    两条都成立时，各期的日期集合互不相交（统计期不重叠由累积计划保证），主键里不需要另加统计期列。
+    """
+    problems: list[RecipeProblem] = []
+    if not any(sheet.context for sheet in recipe.sheets):
+        problems.append(RecipeProblem("/mode", "accumulate_needs_period",
+                                      "配方没有配置统计期，不能按期累积：各期要按统计期区分"))
+    tables, _ = derive_tables(recipe)
+    # 表名 → 写入它的块（去重，按配方顺序）和第一个块的路径
+    writers: dict[str, list[CrosstabBlock | ListBlock]] = {}
+    first_path: dict[str, str] = {}
+
+    def _add(table: str, block: CrosstabBlock | ListBlock, path: str) -> None:
+        got = writers.setdefault(table, [])
+        if all(b is not block for b in got):
+            got.append(block)
+        first_path.setdefault(table, path)
+
+    for si, sheet in enumerate(recipe.sheets):
+        for bi, block in enumerate(sheet.blocks):
+            path = f"/sheets/{si}/blocks/{bi}"
+            if isinstance(block, CrosstabBlock):
+                for seg in block.segments:
+                    if isinstance(seg, (MeasuresSegment, DimensionSegment)):
+                        _add(seg.table, block, path)
+                    elif isinstance(seg, DerivedSegment) and seg.keep_as is not None:
+                        _add(seg.keep_as.table, block, path)
+            else:
+                _add(block.table, block, path)
+                total = block.rows.total_row
+                if total is not None and total.keep_as:
+                    _add(total.keep_as, block, path)
+
+    index = {t.name: ti for ti, t in enumerate(recipe.tables)}
+    grains = {t.name: list(t.grain) for t in recipe.tables}
+    for name in tables:
+        blocks = writers.get(name, [])
+        if any(isinstance(b, ListBlock) for b in blocks):
+            reasons = ["列表形态的表目前只支持每期替换"]
+        else:
+            reasons = []
+            uncovered = [b.id for b in blocks if isinstance(b, CrosstabBlock) and "covers_context" not in b.axis.checks]
+            if uncovered:
+                reasons.append("、".join(f"交叉表「{x}」" for x in uncovered)
+                               + "的日期检查没有选「恰好覆盖统计期」，各期的日期可能超出统计期")
+            grain = grains.get(name, [])
+            axes = sorted({b.axis.name for b in blocks if isinstance(b, CrosstabBlock) and b.axis.name not in grain})
+            if axes:
+                reasons.append("主键不含日期列" + "、".join(f"「{x}」" for x in axes) + "，各期的行无法按日期区分")
+        if reasons:
+            path = f"/tables/{index[name]}" if name in index else first_path.get(name, "/tables")
+            problems.append(RecipeProblem(path, "accumulate_unkeyed", f"表「{name}」不能按期累积：" + "；".join(reasons)))
+    return problems
+
+
+# ==========================================================================
+# 期 3：修复、框选、累积、并集的数据结构（P3-SPEC 9.2；JSON 形状见 9.4，dataclass 字段与 JSON 同名，
+# Selection.as_ 除外）。字段名由 test_recipe_contract.py 钉住，实现者不改名
+# ==========================================================================
+
+
+@dataclass
+class FixOption:
+    """修复提议的一个封闭选项。效果由服务端算：客户端只发 fix_id、value 和理由，不发补丁。"""
+
+    #: 选项值（remove / add / update / dismiss / keep / check_only / ignore / no_data / not_applicable /
+    #: include / exclude / "<候选格>|keep" / "<候选格>|pick:<词>" / 新工作表名……，P3-SPEC 3.2）
+    value: str
+    #: 给人看的一句话（「去掉标签「7-8」」）
+    label: str
+    #: 后果说明（「今后各期如果又出现「7-8」，会再次拒收」）
+    detail: str = ""
+    #: 选它必须写理由（1–200 字）。理由进配方哈希：改理由要重新预览
+    needs_reason: bool = False
+    #: 这是破坏性变更（如常量换值）
+    breaking: bool = False
+
+
+@dataclass
+class FixAnchor:
+    """提议对应哪一条问题（P3-SPEC 3.1）。staging_out 按它把 fix_ids 写到对应的问题上，界面只按 fix_ids 放按钮。"""
+
+    kind: Literal["problem", "recipe_problem", "sheet_renamed"]
+    #: problem / recipe_problem：在传给 propose_fixes 的 problems / recipe_problems 列表里的下标；sheet_renamed 为 None
+    index: int | None = None
+    #: sheet_renamed：本期的工作表名；其余 None
+    sheet: str | None = None
+
+
+@dataclass
+class FixProposal:
+    #: "fx-" + sha1(kind + "|" + 目标键)[:12]：同样的问题得到同样的 id
+    id: str
+    #: FIX_KINDS 之一
+    kind: str
+    #: 触发它的问题 code（sheet_renamed 触发时为 None）
+    problem_code: str | None
+    title: str
+    #: 网格上要标出的格（「工作表!A1」）
+    cells: list[str]
+    #: 目标（{"segment", "labels"}、{"relation", "fact", "total", "parts"}……，P3-SPEC 3.2）
+    target: dict[str, Any]
+    options: list[FixOption]
+    anchor: FixAnchor
+
+
+#: 框选「选它是什么」的封闭取值（P3-SPEC 4.2）
+SELECTION_AS = ("list", "crosstab", "segment", "derived", "section_title", "ignore_rows", "ignore_columns",
+                "ignore_outside")
+#: 框选的 ref：不带工作表名的 A1 区域，列字母大写，行号从 1 起（界面按网格坐标生成，不会有 $ 和小写）
+_SELECTION_REF = re.compile(r"[A-Z]{1,3}[1-9][0-9]{0,6}(?::[A-Z]{1,3}[1-9][0-9]{0,6})?")
+
+
+@dataclass
+class Selection:
+    """网格上的一次框选。**JSON 里的键是 as**（Python 关键字），dataclass 字段叫 as_：接口层一律经
+    from_json / to_json 改名，不要直接 asdict。"""
+
+    sheet: str
+    #: A1 区域（「C5:F8」），不带工作表名
+    ref: str
+    #: SELECTION_AS 之一
+    as_: str
+    #: list：header_rows、table、bottom（box / auto）；segment：role、table；derived：keep；section_title：segment；
+    #: ignore_*：reason
+    options: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: Any) -> "Selection":
+        """请求体里的 {"sheet", "ref", "as", "options"?} → Selection，同时把形状校验做完。
+
+        **任何形状不对都只抛 ValueError**（不抛 KeyError、TypeError），消息是可以直接给人看的中文：接口层只要
+        ``except ValueError`` 就能映射成 422 edit_invalid（P3-SPEC 9.1），不会因为请求体写得怪而落到 500。
+        这里查的是「请求本身对不对」：body 是对象；sheet 是非空文字；ref 是不带工作表名的 A1 区域（大写列字母，
+        「C5」或「C5:F8」）；as 是 SELECTION_AS 之一；options 缺省、为 null 或是对象。框和网格、配方的关系
+        （超出网格、重叠、表头为空……）是 selection_edit 的事，报成 EditResult.problems，不在这里。"""
+        if not isinstance(data, dict):
+            raise ValueError("框选的请求格式不对：应为一个对象")
+        sheet, ref, as_, options = data.get("sheet"), data.get("ref"), data.get("as"), data.get("options")
+        if not isinstance(sheet, str) or not sheet.strip():
+            raise ValueError("框选没有指明工作表")
+        if not isinstance(ref, str) or not _SELECTION_REF.fullmatch(ref):
+            raise ValueError("框选的区域写法不对：应为「C5」或「C5:F8」这样的单元格区域")
+        if not isinstance(as_, str) or as_ not in SELECTION_AS:
+            raise ValueError("框选没有指明选中的是什么，或取值不在可选范围内")
+        if options is not None and not isinstance(options, dict):
+            raise ValueError("框选的选项格式不对：应为一个对象")
+        return cls(sheet=sheet, ref=ref, as_=as_, options=dict(options or {}))
+
+    def to_json(self) -> dict[str, Any]:
+        return {"sheet": self.sheet, "ref": self.ref, "as": self.as_, "options": dict(self.options)}
+
+
+@dataclass
+class Anchor:
+    """框选换算出的锚点，给界面显示「按文字定位」用。"""
+
+    kind: Literal["header", "row_label", "section_title", "total_word", "axis", "after_title", "outside_text"]
+    text: str
+    cell: str | None = None
+
+
+@dataclass
+class EditResult:
+    """一次修复（fix_ops）或框选换算（selection_edit）的结果。ok=False 时 problems 写原因（category=recipe），
+    ops 为空，界面不能应用。"""
+
+    ok: bool
+    kind: Literal["fix", "selection"]
+    #: 修复：目标键（remove_label:日间:7-8）；框选：<as>:<块或分段 id>。确认项 fix:<key> / select:<key> 用它
+    key: str
+    title: str
+    #: 人话摘要，确认项和修改记录用
+    summary: list[str]
+    #: 按完整形式写的 JSON Patch（add / replace / remove，不给用户看）
+    ops: list[dict[str, Any]]
+    anchors: list[Anchor]
+    notes: list[str]
+    problems: list[Problem]
+    #: apply_patch → validate 解析 → recipe_sha256，与暂存区的哈希同一口径；ok=False 时 None
+    recipe_sha256_after: str | None = None
+    #: 框选：换算出的期望区域（列表 {"header", "data", "total"}；交叉表 {"axis", "labels", "values"}）
+    expected: dict[str, str | None] | None = None
+    #: 框选：新增或替换的块 id（重放比对按它过滤 RegionMark）
+    block: str | None = None
+    #: 只在服务端内部用：这次修改是否带破坏性变化（WP-2 按所选 FixOption.breaking 或换算结果填）。
+    #: **注意与 EditPreview JSON 的 breaking 不是同一个值**：预览里的 breaking 是「表名 → 人话列表」（WP-5 用
+    #: recipe_confirm.table_changes 拿修改后的配方对现行配方算，P3-SPEC 9.4），没有破坏性变化时是 {}。WP-5 组装
+    #: 预览时如果从 asdict(EditResult) 出发，必须总是用那份字典覆盖 breaking：漏了的话界面收到 false，
+    #: Object.entries(false) 是空数组，破坏性变化会不声不响地从预览里消失
+    breaking: bool = False
+
+
+@dataclass
+class ReplayCompare:
+    """框选的期望区域与干跑后执行器认出的区域比对（P3-SPEC 4.5）。match=False 不阻止应用。"""
+
+    expected: dict[str, str | None]
+    actual: dict[str, str | None]
+    match: bool
+    #: 不一致时逐条写人话（「重放的数据区到第 10 行，比框多 2 行（第 9–10 行）」）
+    diffs: list[str]
+    #: 部分干跑时只比较前多少行；完整比较为 None
+    window_rows: int | None = None
+
+
+#: 累积计划的 action（P3-SPEC 2.4）
+ACCUMULATE_ACTIONS = ("replace", "first", "append", "replace_period", "restart", "rejected")
+
+
+@dataclass
+class ChangeClass:
+    """classify_changes 的结果（P3-SPEC 2.5）。"""
+
+    change: Literal["same", "compatible", "retire", "semantic"]
+    #: [{"table", "column" | None}]
+    added: list[dict[str, Any]]
+    #: 这次才退役的，出必勾项 retire:*
+    retired_new: list[dict[str, Any]]
+    #: 早已退役、仍保留在并集里的，不出确认项
+    retired_existing: list[dict[str, Any]]
+    #: 不兼容变化的人话
+    semantic: list[str]
+    #: 各期维度取值的差异：[{"table", "column", "segment", "periods": [{"start", "end", "missing", "extra"}]}]
+    label_sets: list[dict[str, Any]]
+
+
+@dataclass
+class AccumulatePlan:
+    """累积计划（WP-4 plan_accumulate 产出，JSON 形状见 P3-SPEC 9.4，TrialOut.accumulate 原样给界面）。"""
+
+    mode: str
+    #: ACCUMULATE_ACTIONS 之一
+    action: str
+    #: 本期 {"start", "end", "source"}：source 是 "cells"（取自表内统计期）或 "human"（人工录入）；
+    #: 每期替换且没有统计期时 start、end 为 None
+    period: dict[str, Any]
+    #: 结果快照的各期，按统计期排序：[{"import_id", "seq", "start", "end", "file_name", "new", "rows", "blockers"}]，
+    #: 本期 import_id、seq 为 None、new 为 True
+    parts: list[dict[str, Any]]
+    #: 被替换的那一期（replace_period），没有为 None
+    replaces: dict[str, Any] | None
+    #: restart、模式切换时移出当前版本的各期
+    dropped: list[dict[str, Any]]
+    #: 部分重叠的各期（rejected；restart 时只作提示）
+    overlaps: list[dict[str, Any]]
+    #: 相邻两期之间的空缺 [{"start", "end"}]
+    gaps: list[dict[str, str]]
+    #: 本期早于已有各期
+    backfill: bool
+    #: ChangeClass.change
+    change: str
+    added: list[dict[str, Any]]
+    retired_new: list[dict[str, Any]]
+    retired_existing: list[dict[str, Any]]
+    semantic: list[str]
+    label_sets: list[dict[str, Any]]
+    #: "replace->accumulate" / "accumulate->replace" / None
+    mode_switch: str | None
+    #: first / restart 的原因（blockers、没有统计期），其余 None
+    reason: str | None
+    #: 物化了的并集 {"union_id", "db_sha256", "rows"}；没有物化为 None
+    union: dict[str, Any] | None
+
+
+@dataclass
+class PartInfo:
+    """当前快照里的一期（WP-5 组装，交给 plan_accumulate / materialize_union）。"""
+
+    import_id: str
+    seq: int
+    #: 统计期取自该期导入清单（内容寻址），再与 table_imports 的库列比对（P3-SPEC 2.3）
+    start: str
+    end: str
+    build_id: str
+    db_path: str
+    #: 取自 TableBuild
+    db_sha256: str
+    #: 该期导入清单里记的库哈希（物化第 0 步比对用）
+    manifest_db_sha256: str | None
+    recipe_id: str | None
+    recipe: Recipe | None
+    recipe_sha256: str | None
+    raw_state: str
+    file_name: str
+    manifest_artifact: str | None
+    #: 表 → 该期行数
+    rows: dict[str, int] = field(default_factory=dict)
+    overrides: int = 0
+    waivers: int = 0
+
+
+@dataclass
+class UnionPart:
+    """物化的一期。"""
+
+    #: None = 本期（试运行库）
+    import_id: str | None
+    start: str
+    end: str
+    db_path: str
+    recipe: Recipe
+    #: 期望的库哈希：已有的期取 TableBuild，本期取试运行回执
+    db_sha256: str
+    manifest_db_sha256: str | None = None
+    #: 该期登记的表哈希（组合定义要用，P3-SPEC 2.6 第 6 步）
+    table_hashes: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class UnionReport:
+    """materialize_union 的结果。UnionBuild.report = asdict(UnionReport) 的 JSON，登记进 TableBuild.report。"""
+
+    #: 表 → 列（目标表结构加退役列）
+    tables: dict[str, list[ColumnOut]]
+    grains: dict[str, list[str]]
+    rows: dict[str, int]
+    #: 与 parts 同序：表 → {"union": [a, b], "part": [1, n]}
+    part_rows: list[dict[str, dict[str, list[int]]]]
+    table_hashes: dict[str, str]
+    null_counts: dict[str, dict[str, int]]
+    #: 与 parts 同序（说明的空值只按含这一列的期统计）
+    part_null_counts: list[dict[str, dict[str, int]]]
+    #: [{"table", "column" | None, "periods": [...]}]
+    added: list[dict[str, Any]]
+    retired: list[dict[str, Any]]
+    #: U1–U3
+    checks: list[CheckResult]
+    ok: bool
+    db_sha256: str
+
+
+@dataclass
+class UnionNotePart:
+    """build_union_notes 的一期输入。"""
+
+    recipe: Recipe
+    extraction: Extraction
+    checks: list[CheckResult]
+    acceptances: list[Acceptance]
+    null_counts: dict[str, dict[str, int]] | None
+    start: str
+    end: str
+
+
+# ==========================================================================
+# 期 3：版本页（P3-SPEC 7.1）
+# ==========================================================================
+
+#: 快照不能启用的原因（SnapshotOut.reason_code，P3-SPEC 7.1 的补充）。7.1 只给了人话 reason，而 available=false
+#: 同时覆盖「已回收」和「数据文件已丢失」，界面分不出该用哪句文案，只能去匹配服务端的原话；WP-5 和 WP-7 并行，
+#: 各写一套文字必然对不上。所以加一个机器可读的 code：
+#: - WP-5 列快照时 reason_code 取这几个值之一（能启用时为 None），reason 一律取 SNAPSHOT_NOT_ACTIVATABLE[code]，
+#:   不自己另写文字。几种同时成立时按字典顺序取第一个：已是当前版本 > 已回收 > 数据文件已丢失 > 含作废的导入；
+#: - WP-7 按 VERSIONS_TEXT.notActivatable[reason_code] 显示（键与这里相同），没有 reason_code 时退回显示 reason。
+#: 文字与附录 C 的 notActivatable 逐字相同，所以无论界面走哪条路，显示都一样。
+#: 遮罩列丢失（mask_lost）不在这里：它不让快照变成不能启用，只是启用时要确认。哈希校验（snapshot_tampered）
+#: 只在启用时算，列表不算，所以也不在这里
+SnapshotReasonCode = Literal["current", "retired", "file_lost", "contains_revoked"]
+SNAPSHOT_NOT_ACTIVATABLE: dict[str, str] = {
+    "current": "已是当前版本",
+    "retired": "已回收，无法启用",
+    "file_lost": "数据文件已丢失，无法启用",
+    "contains_revoked": "包含已作废接受的导入，无法启用",
+}

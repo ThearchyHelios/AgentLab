@@ -1,0 +1,36 @@
+{
+  "about": "期 2 基线（P3-SPEC 11.3 WP-1、12.1）：在 feat/excel-p2 2d5e50f 的代码上按参考配方执行 D00 得到的构建库哈希与表哈希。期 3 对没用新字段的配方必须写出逐字节相同的库（RECIPE_ENGINE_VER 不升，期 2 的构建照样复用），WP-1 拿它当测试常量；snapshot_id、recipe_build_id 用固定的假 id 算，替换模式、简单导入的 id 规则不得变化（WP-4）。夹具是合成的假数据",
+  "commit": "2d5e50fa88ac45aa174ec68f4d3b5b425c8bcbd8",
+  "procedure": "raw, name = flow_workbook(date(2026, 8, 1), 31)；ex = recipe_engine.execute(Recipe.model_validate(flow_recipe.json), raw, name, xlsx_scan.scan(raw), db)；table_versions.settle_journal(db)；db_sha256 = raw_store.sha256_file(db)；table_hashes = ex.table_hashes",
+  "fixture": {
+    "call": "flow_workbook(date(2026, 8, 1), 31)",
+    "file_name": "月报导出_2026-08-01_2026-08-31.xlsx",
+    "raw_sha256": "6269f8e67b1f3a9517fd1e2e027d01f05a53205699a00f5bf72a7945bf08c748"
+  },
+  "recipe": {
+    "path": "tests/fixtures/recipes/flow_recipe.json",
+    "recipe_sha256": "971a8eba5ac606bd0552c43ff83b5c361d134c77d471bfe2d28e440ebfcc07b4"
+  },
+  "engine_ver": "recipe/1",
+  "ok": true,
+  "db_sha256": "986c9128e60b653852330cc496215e634cf37086947c6c9e709cc54737e7f313",
+  "table_hashes": {
+    "日客流": "36452a4d651d017f2d7865e63b1543f6afb939f43c2c61c3672a67df421a4b2b",
+    "时段客流": "3dce5a79d697ca9b0078d2cc34d75d32d7094119385bee874663f5f1d6429c3a",
+    "时段客流_表内合计": "098eca2473c066b156d7f42650b2545f3ec9bc283ee95e110aa11e560b02ef68"
+  },
+  "rows": {
+    "日客流": 31,
+    "时段客流": 527,
+    "时段客流_表内合计": 93
+  },
+  "ids": {
+    "source_id": "src-p2-baseline",
+    "import_ids": [
+      "imp-p2-baseline"
+    ],
+    "recipe_build_id": "f0b253448ae17d20b54710c60fed8d28e96fe457e5fe65cd042fd09eb5e0dea4",
+    "snapshot_id_recipe": "b3ff74d7716ce2ea204b7c9b4fe3148d9263c638f49c5d8696a6eb1c2edfab80",
+    "snapshot_id_simple": "bbb5efd66da448b991d2706ed4656b9dfc6424f1dfd9247fffab6bc64689b262"
+  }
+}
