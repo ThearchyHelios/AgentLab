@@ -14,13 +14,16 @@ import { splitShrunk } from '../canvas/copilotMerge'
 import { confirmDialog, IconButton, StatusBadge, toast } from '../components/ui'
 import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortId, NONE } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { runClassLabel } from '../lib/terms'
+import { runClassLabel, SQL_CHECK_TEXT } from '../lib/terms'
+import { sortSqlChecks } from '../lib/sqlcheck'
 import type { RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
+import { SqlCheckBody } from './SqlChecks'
 import { EvidenceHostContext, type EvidenceHost } from './evidenceHost'
 import {
-  COPILOT_PHASE_TEXT, copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
+  COPILOT_PHASE_TEXT, copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, issueSqlCheck, SELF_CHECK_ROUNDS, type CopilotIssue,
+  type CopilotOutcome,
 } from './decode'
 import { ApprovalCard } from './RunPanel'
 import { useRunGlance } from './RunHud'
@@ -287,11 +290,13 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
       )
     }
     const issues = out.check?.status === 'failed' ? out.check.issues : []
+    // 对照数据目录的 SQL 检查：不挡运行的提醒、提示（错误交回模型改过，没改好的在上面那组）
+    const sqlNotes = sortSqlChecks(out.sqlChecks)
     const { unasked, asked } = toolLossOf(out)
     // 画布一处没变（unchanged）就没有可撤的：给了按钮，撤掉的是这一轮之前的那一步
     const undo = source.outcome === 'applied'
       || (out.kind === 'built' && source.outcome !== 'reverted' && source.outcome !== 'unchanged')
-    if (!issues.length && !out.skipped.length && !unasked.length && !asked.length) {
+    if (!issues.length && !out.skipped.length && !unasked.length && !asked.length && !sqlNotes.length) {
       return undo ? (
         <button type="button" className="btn btn-xs btn-ghost" onClick={() => undoCopilotTurn(source.id)}>
           <Undo2 size={11} aria-hidden /> 撤销这次生成
@@ -304,6 +309,10 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
       <div className="w-full space-y-1.5">
         {/* 没修好的问题直接摊开，不折叠：这是此刻唯一要做的事 */}
         {issues.length > 0 && <IssueList issues={issues} onLocate={locateIssue} />}
+        {sqlNotes.length > 0 && (
+          <IssueList issues={sqlNotes} onLocate={locateIssue} title={SQL_CHECK_TEXT.title}
+                     plain={sqlNotes.every((x) => x.level === 'info')} />
+        )}
         {(unasked.length > 0 || asked.length > 0) && <ToolLossList unasked={unasked} asked={asked} onLocate={locateTools} />}
         <div className="flex flex-wrap items-center gap-1.5">
           {repairable && (
@@ -378,28 +387,40 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
   )
 }
 
-/** 自查没修好的问题，逐条带「定位」。问题落在哪个节点上认得出来才给；写节点名，认不出才写 id */
-function IssueList({ issues, onLocate }: { issues: CopilotIssue[]; onLocate: (x: CopilotIssue) => void }) {
+/**
+ * 自查没修好的问题，逐条带「定位」。问题落在哪个节点上认得出来才给；写节点名，认不出才写 id。
+ * 对照数据目录的 SQL 检查另画级别、中文规则名、涉及的表和列、SQL 片段（和证据面板同一套），「定位」落到 SQL 那一项。
+ * title 有值时是不挡运行的那一组（SQL 检查的提醒、提示）：全是提示时不用提醒色
+ */
+function IssueList({ issues, onLocate, title, plain = false }: {
+  issues: CopilotIssue[]; onLocate: (x: CopilotIssue) => void; title?: string; plain?: boolean
+}) {
   return (
-    <ul data-issue-list="" className="space-y-0.5 rounded border px-2 py-1.5 text-2xs leading-relaxed"
-        style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))',
-                 background: 'var(--st-waiting-soft)' }}>
-      {issues.map((x, i) => (
-        <li key={i} className="flex items-start gap-1.5" data-issue-node={x.nodeId} data-issue-field={x.field}>
-          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]" title={issueLine(x)}>
-            {x.nodeId && <span className={clsx('text-dim', !x.label && 'mono')}>「{x.label ?? x.nodeId}」</span>}{x.message}
-          </span>
-          {x.nodeId && (
-            <button type="button"
-                    className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
-                    title={x.field ? '打开该节点的设置，定位到出问题的配置项' : '在画布上定位这个节点'}
-                    onClick={() => onLocate(x)}>
-              <Crosshair size={10} aria-hidden /> 定位
-            </button>
-          )}
-        </li>
-      ))}
-    </ul>
+    <div data-issue-list={title ? 'sql' : ''} className="rounded border px-2 py-1.5 text-2xs leading-relaxed"
+         style={plain ? undefined : { borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))', background: 'var(--st-waiting-soft)' }}>
+      {title && <div className="mb-1 font-medium text-fg">{title}</div>}
+      <ul className="space-y-1">
+        {issues.map((x, i) => {
+          const sql = issueSqlCheck(x)
+          return (
+            <li key={i} className="flex items-start gap-1.5" data-issue-node={x.nodeId} data-issue-field={x.field} data-issue-code={x.code}>
+              <div className="min-w-0 flex-1 [overflow-wrap:anywhere]" title={issueLine(x)}>
+                {x.nodeId && <span className={clsx('text-dim', !x.label && 'mono')}>「{x.label ?? x.nodeId}」</span>}
+                {sql ? <div className="mt-0.5"><SqlCheckBody check={sql} /></div> : x.message}
+              </div>
+              {x.nodeId && (
+                <button type="button"
+                        className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-dim transition-colors hover:bg-hover hover:text-fg"
+                        title={x.field ? '打开该节点的设置，定位到出问题的配置项' : '在画布上定位这个节点'}
+                        onClick={() => onLocate(x)}>
+                  <Crosshair size={10} aria-hidden /> 定位
+                </button>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
   )
 }
 

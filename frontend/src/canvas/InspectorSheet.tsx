@@ -77,7 +77,26 @@ export function revealField(nodeId: string, field?: FieldRef | string | null, op
       const to = target.querySelector<HTMLElement>(FILLABLE) ?? target.querySelector<HTMLElement>(PRESSABLE)
       to?.focus({ preventScroll: true })
     }
+    // 子键没有自己的一行、字段是一段 JSON（调用工具的「参数」，问题落在 args.sql 上）：在文字里找到那个键，
+    // 框内滚到那一行，聚焦时光标放在它的值开头
+    if (!part && at.sub) revealJsonKey(target, at.sub, !!opts.focus)
   }))
+}
+
+/** JSON 文字框里的某个键：滚到它那一行；focus 时把光标放在值的开头（不选中，免得一敲键就把整段 SQL 换掉） */
+function revealJsonKey(field: HTMLElement, key: string, focus: boolean): void {
+  const box = field.querySelector<HTMLTextAreaElement>('textarea')
+  if (!box) return
+  const m = new RegExp(`"${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*:\\s*"?`).exec(box.value)
+  if (!m) return
+  const line = box.value.slice(0, m.index).split('\n').length - 1
+  const height = parseFloat(getComputedStyle(box).lineHeight) || 16
+  box.scrollTop = Math.max(0, (line - 1) * height)
+  if (focus) {
+    const at = m.index + m[0].length
+    box.focus({ preventScroll: true })
+    box.setSelectionRange(at, at)
+  }
 }
 
 // 选中 → 面板开不开。放在模块级：选中可能来自别处（问题面板定位、发布弹窗、快捷键），
