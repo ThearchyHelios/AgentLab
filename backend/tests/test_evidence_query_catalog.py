@@ -83,12 +83,15 @@ async def test_the_query_step_names_the_catalog_version_it_was_checked_against()
 
 
 async def test_a_query_without_a_frozen_catalog_says_nothing_extra():
-    query = {"columns": ["n"], "rows": [[4]], "row_count": 1, "truncated": False, "source": "scenic",
-             "sql": "SELECT COUNT(*) AS n FROM visits"}
-    qid = await put(query)
-    doc = {"catalog": {"Q1": {"kind": "query", "artifact": qid}}}
-    step = await api._query_step(qid, [(0, "n")], doc, _sealed({qid: {"node_id": "fetch"}}), api._Masks())
-    assert "catalog" not in step and "schema_artifact" not in step
+    """没对照过目录的查询（老快照、没有目录的源）：步骤的形状和以前一字不差（期 4 的金样逐字比对）。"""
+    schema_id = await put({"source": "scenic", **_schema_cache()}, kind="schema_snapshot")
+    for extra in ({}, {"schema_artifact": schema_id}):
+        query = {"columns": ["n"], "rows": [[4]], "row_count": 1, "truncated": False, "source": "scenic",
+                 "sql": "SELECT COUNT(*) AS n FROM visits", **extra}
+        qid = await put(query)
+        doc = {"catalog": {"Q1": {"kind": "query", "artifact": qid}}}
+        step = await api._query_step(qid, [(0, "n")], doc, _sealed({qid: {"node_id": "fetch"}}), api._Masks())
+        assert "catalog" not in step and "schema_artifact" not in step
 
 
 def test_frozen_catalog_keeps_rejected_relation_ids_without_their_content():

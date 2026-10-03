@@ -999,20 +999,19 @@ def _catalog_of(snap: dict[str, Any]) -> dict[str, Any]:
 
     数据源查询工具每次查询都把当时的表结构和数据目录冻结进表结构快照（tools/datasource._store_schema），SQL 检查
     对照的就是这一版。面板上写「数据目录：入园记录 第 3 版」：事后目录改了、升了版本，看得出这次查询按的是哪一版。
-    catalog 只列 SQL 用到、而且冻结了目录的表：[{table, label?, version}]。没有表结构快照的（合并查询、老快照、
-    没探查过结构的源）两个键都不加；有快照没目录的只给 schema_artifact。
+    catalog 只列 SQL 用到、而且冻结了目录的表：[{table, label?, version}]。这条查询没对照过目录（合并查询、老快照、
+    没探查过结构或没有目录的源、表结构快照读不出来）时两个键都不加：步骤的形状和以前一字不差（期 4 的金样逐字比对）。
     """
     schema_id = snap.get("schema_artifact")
     if not isinstance(schema_id, str) or not schema_id:
         return {}
-    out: dict[str, Any] = {"schema_artifact": schema_id}
     try:
         schema = load(schema_id)
-    except Exception:  # noqa: BLE001 - 读不出来：只给 id，不编版本
-        return out
+    except Exception:  # noqa: BLE001 - 读不出来：不编版本
+        return {}
     frozen = schema.get("catalog") if isinstance(schema, dict) else None
     if not isinstance(frozen, dict) or not frozen:
-        return out
+        return {}
     from app.data.catalog import resolve_table_name
 
     listed: list[dict[str, Any]] = []
@@ -1024,9 +1023,7 @@ def _catalog_of(snap: dict[str, Any]) -> dict[str, Any]:
         label = ((entry.get("notes") or {}).get("label") or {}).get("value")
         listed.append({"table": key, **({"label": label} if isinstance(label, str) and label else {}),
                        "version": entry.get("version")})
-    if listed:
-        out["catalog"] = listed
-    return out
+    return {"schema_artifact": schema_id, "catalog": listed} if listed else {}
 
 
 #: 查询步骤里每条 SQL 检查结果交给界面的字段（data/sqlcheck.SqlCheck.as_dict 去掉 for_model）
