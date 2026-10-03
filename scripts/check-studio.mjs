@@ -1011,6 +1011,12 @@ await section('分析失败不静默', async () => {
 // ================================================================ 5
 await section('版本历史：预览、恢复成一次可撤销的改动', async () => {
   const { ctx, page, state, errors } = await open()
+  // 发布时的目录版本按横幅的写法列：「数据源」中文名（表名）。中文名从数据源的目录清单补（只读，这里答掉）
+  const catRow = (table, label) => ({ table_name: table, qualified: table, is_view: false, in_schema: true, label, label_status: label ? 'confirmed' : null,
+    kind: null, counts: { proposed: 0, verified: 0, confirmed: label ? 1 : 0, rejected: 0 }, relations: 0, usage: 0, version: 1, updated_at: null, updated_by: null })
+  await page.route(/\/api\/datasources\/src-shop\/catalog$/, (route) => route.fulfill({ json: { system_notes: false, schema_note: null,
+    schema_truncated: false, schema_total: 5, tables: [catRow('parks', '景区'), catRow('visits', '入园记录'), catRow('orders', '订单'),
+      catRow('channels', '渠道'), catRow('gates', null)] } }))
   // 记下按版本号取详情的请求：版本历史开着时换工作流，不能拿上一张选中的版本去请求这一张
   const asked = []
   page.on('request', (r) => {
@@ -1044,6 +1050,12 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
     (await possible.locator('[data-version-catalog-table="gates"]').getAttribute('data-changed')) === 'true'
     && (await possible.locator('[data-version-catalog-table="gates"]').innerText()).includes('尚无目录'))
   check('……发布时一张有目录的表都没有的源写一句', possibleText.includes('「crm」发布时还没有目录'), possibleText.replace(/\s+/g, ' '))
+  // 和运行横幅同一个写法：「数据源」中文名（表名）；没改过的表也写中文名，没有中文名的只写表名
+  const nameOf = (table) => cat.locator(`[data-version-catalog-table="${table}"] [data-version-catalog-name]`).first().innerText().catch(() => '')
+  check('……每张表写「数据源」中文名（表名），没改过的也写', await until(async () => (await nameOf('parks')) === '「shop」景区（parks）')
+    && (await nameOf('visits')) === '「shop」入园记录（visits）' && (await nameOf('channels')) === '「shop」渠道（channels）',
+    [await nameOf('parks'), await nameOf('visits'), await nameOf('channels')].join(' | '))
+  check('……没有中文名的表只写表名', (await nameOf('gates')) === '「shop」gates', await nameOf('gates'))
   await page.locator('ol[aria-label="版本"] > li').nth(2).locator('button').first().click()
   await page.waitForTimeout(300)
   check('没发布过的版本没有目录版本这一栏', await count(page, '[data-version-catalog]') === 0)

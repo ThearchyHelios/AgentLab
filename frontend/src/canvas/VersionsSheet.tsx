@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, History, RotateCcw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -6,6 +6,7 @@ import {
   EDIT_LOCK_TEXT, diffGraphs, toFlow, useEditLock, useStudio, type EditLock, type FlowNode, type GraphDiff,
 } from '../store/studio'
 import { ErrorState, Skeleton, toast } from '../components/ui'
+import { useDatasources } from '../store/catalog'
 import { formatDateTime, formatTime } from '../lib/format'
 import { CATALOG_DRIFT_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import { hintOf } from './shortcuts'
@@ -218,11 +219,15 @@ const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } a
  * 发布时的目录版本：这一版用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式运行时会
  * 提醒「数据目录有变化」，这里先让人看到是哪几张表。
  *
+ * 每张表和运行横幅同一个写法：「数据源」中文名（表名）。发布记录里只有数据源名和表名，中文名按数据源的目录清单补
+ * （变了的表服务端带着现在的中文名）；取不到清单时只写表名。
+ *
  * 两组分开列：SQL 里写着的表在前；Agent 可能查询的表（Agent 绑定了数据源的查询工具，发布时记下数据源中所有有
  * 目录的表）在小标题下面。可能涉及的数据源里发布之后新建了目录的表，记录里没有它，按变化里给的补进来（发布时
  * 「尚无目录」）
  */
 function CatalogVersions({ versions, changes }: { versions: CatalogVersionsRecord; changes: CatalogDriftTable[] }) {
+  const labelOf = useCatalogLabels(versions, changes)
   // 老后端给的变化没有 impact：按直接引用
   const impactOf = (c: CatalogDriftTable) => (c.impact === 'possible' ? 'possible' : 'direct')
   const changed = new Map(changes.map((c) => [`${impactOf(c)}/${c.source}/${c.table}`, c]))
@@ -246,7 +251,9 @@ function CatalogVersions({ versions, changes }: { versions: CatalogVersionsRecor
         return (
           <li key={`${source}/${table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5"
               data-version-catalog-table={table} data-impact={impact} data-changed={c ? 'true' : undefined}>
-            <span className="mono min-w-0 truncate" title={`${source} · ${table}`}>{table}</span>
+            <span className="min-w-0 break-words" title={`${source} · ${table}`} data-version-catalog-name="">
+              「{source}」{CATALOG_DRIFT_TEXT.table(labelOf(source, table) ?? c?.label ?? null, table)}
+            </span>
             <span className="shrink-0 text-faint">{CATALOG_DRIFT_TEXT.version(v)}</span>
             {c && (
               <span className="shrink-0" style={{ color: 'var(--st-waiting)' }}>
@@ -283,6 +290,39 @@ function CatalogVersions({ versions, changes }: { versions: CatalogVersionsRecor
       )}
     </div>
   )
+}
+
+/** 数据源 id → 表名 → 中文名。几个版本、几次展开共用，同一个数据源只取一次清单 */
+const labelCache = new Map<string, Promise<Record<string, string | null>>>()
+
+/**
+ * 发布记录里各表现在的中文名：按数据源名找到 id（变化里带着 source_id，否则查数据源列表），取那个数据源的目录清单。
+ * 取不到（数据源删了、没权限、断网）就只写表名，不报错——这一栏是附带的说明
+ */
+function useCatalogLabels(versions: CatalogVersionsRecord, changes: CatalogDriftTable[]): (source: string, table: string) => string | null {
+  const { list: sources } = useDatasources()
+  const [labels, setLabels] = useState<Record<string, Record<string, string | null>>>({})
+  const got = useRef(labels)
+  got.current = labels
+  const names = useMemo(() => [...new Set([...Object.keys(versions.direct ?? {}), ...Object.keys(versions.possible ?? {}),
+    ...changes.map((c) => c.source)])], [versions, changes])
+  useEffect(() => {
+    let alive = true
+    for (const name of names) {
+      const id = changes.find((c) => c.source === name && c.source_id)?.source_id ?? sources.find((x) => x.name === name)?.id
+      if (!id || got.current[name]) continue
+      let pending = labelCache.get(id)
+      if (!pending) {
+        pending = api.dataCatalog.list(id).then((d) => Object.fromEntries(d.tables.map((t) => [t.table_name, t.label])))
+        labelCache.set(id, pending)
+        // 清单会变（有人补了中文名）：只缓存这一阵子，失败的不缓存
+        pending.then(() => setTimeout(() => labelCache.delete(id), 60_000), () => labelCache.delete(id))
+      }
+      pending.then((m) => { if (alive) setLabels((cur) => ({ ...cur, [name]: m })) }, () => {})
+    }
+    return () => { alive = false }
+  }, [names, changes, sources])
+  return (source, table) => labels[source]?.[table] ?? null
 }
 
 /**
