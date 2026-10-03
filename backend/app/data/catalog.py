@@ -1,4 +1,4 @@
-"""业务数据目录：每张表一份业务说明，给助手建图、db_schema 工具和后续的检查用。
+"""业务数据目录：每张表一份业务说明，给助手建图、db_schema 工具和 SQL 检查（data/sqlcheck.py）用。
 
 **为什么要有它。** 接进来的业务库往往一个注释都没有：几百张表、上千个字段，助手只看得到名字，模型就会
 照着名字编字段、猜关联。目录把「一行代表什么、业务主键是哪几列、业务日期按哪列算、金额是什么单位、
@@ -23,12 +23,14 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
 来源（source）：comment 数据库注释、fk 外键约束、name 命名推断、profile 数据剖析（data/catalog_profile.py）、
 llm 模型起草、human 人工填写。状态（status）：proposed 推断（命名推断、模型起草、数据库注释）、verified 有确证
 （外键约束；数据剖析核实了覆盖率和父键唯一的关系也是，见 profile_relation_holds）、confirmed 人工确认、
-rejected 人工驳回。只有 confirmed 和 verified
-将来会触发错误级检查；给模型看时 proposed 的项标「推断，未确认」；rejected 的项留着（防止下次起草又提出
-来），但模型和检查都看不到。
+rejected 人工驳回。SQL 检查只在依据全是 confirmed、verified
+时报错误级（data/sqlcheck.py），依据里有 proposed 就降为提示；给模型看时 proposed 的项标「推断，未确认」；
+rejected 的项留着（防止下次起草又提出来），但模型和检查都看不到。
 
-本模块分几块：存取（带乐观锁）、结构校验、合并与审阅、起草、渲染、关系图、使用次数、冻结。存取以外的
-函数尽量是纯函数，接口层、db_schema 工具和后续阶段（1B 助手挑表、2 数据剖析、4 维护闭环）共用。
+本模块分几块：存取（带乐观锁）、结构校验、合并与审阅、对话提案、起草、渲染、关系图、使用次数、冻结。存取
+以外的函数尽量是纯函数，接口层、db_schema 工具、助手挑表（api/copilot_context.py）、数据剖析
+（data/catalog_profile.py）和 SQL 检查（data/sqlcheck.py）共用；几处两边都要用的判断也放在这里只写一份：
+表名的匹配（resolve_table_name，按 name_key）、名字切词（name_words）、日期列的判定（is_date_column）。
 """
 from __future__ import annotations
 
@@ -535,7 +537,7 @@ def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
 
 
 def visible_notes(notes: Mapping[str, Any] | None) -> dict[str, Any]:
-    """去掉被驳回的项和关系。给模型看、冻结进证据、将来的检查都只用这一份。"""
+    """去掉被驳回的项和关系。给模型看、冻结进证据、SQL 检查（data/sqlcheck.py）都只用这一份。"""
     return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") != "rejected"})
 
 
@@ -1128,15 +1130,20 @@ def system_notes_source(source: Any) -> bool:
 
 
 def resolve_table_name(schema_cache: Mapping[str, Any] | None, name: str) -> str | None:
-    """在表结构里找表，返回 schema_cache["tables"] 的键。全名、只有表名、大小写不一致都认。"""
+    """在表结构里找表，返回 schema_cache["tables"] 的键。全名、只有表名、大小写不一致都认。
+
+    大小写按 name_key 比：只把 ASCII 字母转小写，和 SQLite 比较标识符、使用次数（table_usage）、影响面
+    （catalog_impact）的口径一致。以前这里按 Unicode 转小写，表名里有非 ASCII 大写字母时（「CAFÉ_ORDERS」）
+    这里认得、那两处认不得，同一张表在目录页和影响面上对不上。
+    """
     tables = (schema_cache or {}).get("tables") or {}
     if name in tables:
         return name
     short = name.rsplit(".", 1)[-1]
     if short in tables:
         return short
-    lowered = short.lower()
-    return next((n for n in tables if n.lower() == lowered), None)
+    key = name_key(short)
+    return next((n for n in tables if name_key(n) == key), None)
 
 
 #: 数据库注释多长、带不带句读，决定它是「名字」还是「解释」
@@ -1202,9 +1209,35 @@ _CAMEL_ID = re.compile(r"^(?P<stem>.*[a-z0-9])(?:Id|ID)$")
 _WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
 
 
-def _words(name: str) -> list[str]:
-    """名字切成小写的词：下划线和驼峰都是分隔（memberTag、member_tag、MEMBER_TAG 都是 member + tag）。"""
+def name_words(name: str) -> list[str]:
+    """名字切成小写的词：下划线和驼峰都是分隔（memberTag、member_tag、MEMBER_TAG 都是 member + tag）。
+
+    命名推断、数据剖析认码值列和日期列都用这一个切法（以前剖析另写了一份一样的）。
+    """
     return [w.lower() for part in name.split("_") for w in _WORDS.findall(part)]
+
+
+#: 名字像日期、时间的列，切词后的最后一个词：visit_time、ordered_at、joined_on、createdAt、biz_dt、load_ts……
+_DATE_TAILS = frozenset({"at", "on", "date", "time", "day", "dt", "ts", "timestamp", "datetime"})
+#: 单独做列名也算日期的词。at、on 单独做列名不是日期
+_DATE_WORDS = frozenset({"date", "time", "day", "dt", "ts", "timestamp", "datetime"})
+_TEXT_TYPES = ("CHAR", "TEXT", "STRING", "CLOB")
+
+
+def is_date_column(name: str, type_name: str | None) -> bool:
+    """日期类列：类型是日期、时间戳（DATE、DATETIME、TIMESTAMP……）；或者类型是文字（或者不知道类型）、名字像日期
+    （SQLite 的日期常存成文字）。只有时刻的 TIME、整数存的时间戳不算：取值不是日期。
+
+    数据剖析（表里只有一个日期类列时提议它作业务日期）和 SQL 检查（按业务日期以外的时间列统计）共用这一个判断。
+    以前两边各写一套：剖析认的「唯一日期列」，SQL 检查可能认为还有别的时间列，反过来也一样，两边对不上。
+    """
+    t = (type_name or "").upper()
+    if "DATE" in t or "TIMESTAMP" in t:
+        return True
+    if t and not any(k in t for k in _TEXT_TYPES):
+        return False
+    words = name_words(name)
+    return bool(words) and words[-1] in _DATE_TAILS and (len(words) > 1 or words[0] in _DATE_WORDS)
 
 
 def _singulars(word: str) -> set[str]:
@@ -1224,7 +1257,7 @@ def _name_index(tables: Mapping[str, Any]) -> dict[tuple[str, str], set[str]]:
     """{(前面几个词拼起来, 最后一个词的单数形式): 表名}。"""
     index: dict[tuple[str, str], set[str]] = {}
     for name in tables:
-        words = _words(name)
+        words = name_words(name)
         if not words:
             continue
         prefix = "".join(words[:-1])
@@ -1277,7 +1310,7 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         stem = _id_stem(name)
         if stem is None or name.lower() in constrained:
             continue
-        words = _words(stem)
+        words = name_words(stem)
         if not words or len("".join(words)) < 2:
             continue
         prefix = "".join(words[:-1])
@@ -1287,7 +1320,7 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         if not candidates:
             # 直接对不上：库里的表常带业务前缀（store_tags），列名却只写词根（tagId）。
             # 只认和引用它的表共用前缀的那张，从最长的共用前缀试起；仍然不止一张就不推
-            own = _words(table)
+            own = name_words(table)
             for k in range(len(own) - 1, 0, -1):
                 for form in _singulars(words[-1]):
                     candidates |= index.get(("".join(own[:k]) + prefix, form), set())
@@ -2148,14 +2181,13 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
     "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE",
-    "PatchChange", "PatchPlan",
-    "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft",
-    "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "codes_complete",
-    "describe_slot",
-    "draft_catalog", "draft_structure", "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations",
-    "initial_status", "join_paths", "make_item", "merge_notes", "now_iso", "parse_path", "plan_patch",
-    "profile_relation_holds", "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id",
-    "render_table_index", "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry",
-    "review_item", "same_notes", "save_human_edit", "save_patch", "status_counts", "structure_relation_ids",
+    "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
+    "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
+    "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
+    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "join_paths",
+    "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",
+    "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
+    "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",
+    "same_profile_note", "save_human_edit", "save_patch", "status_counts", "structure_relation_ids",
     "system_notes_source", "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
 ]

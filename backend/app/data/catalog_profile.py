@@ -67,7 +67,8 @@ class ProfileSettings:
         return asdict(self)
 
 
-#: 数值项：(中文叫法, 下限, 上限, 是否必须是整数)。叫法和将来设置界面上的标签一致，报错里只写它
+#: 数值项：(中文叫法, 下限, 上限, 是否必须是整数)。叫法和数据源设置里剖析预算的标签一致（frontend/src/lib/terms.ts），
+#: 报错里只写它
 _NUMBER_FIELDS: dict[str, tuple[str, float, float, bool]] = {
     "max_queries": ("查询次数上限", 1, 500, True),
     "query_timeout_s": ("单条查询时限（秒）", 1, 60, False),
@@ -770,16 +771,8 @@ _CODE_WORDS = frozenset({"status", "state", "type", "kind", "category", "channel
 #: 以这些词结尾的列不是码值：标识、名称、说明、时间、金额、数量（channel_id、level_name、status_time……）
 _NOT_CODE_TAILS = frozenset({"id", "no", "num", "number", "name", "desc", "description", "text", "remark", "note",
                              "at", "date", "time", "on", "amount", "price", "count", "qty", "rate", "url"})
-#: 文字类型的列名以这些词结尾时，按日期类列看待（SQLite 里日期都存成文字：visit_time、ordered_at、joined_on）
-_DATE_TAILS = frozenset({"at", "date", "time", "on", "dt", "day"})
 #: 像日期的取值：2026-07-01、2026/07/01，后面可以跟时间
 _DATE_TEXT = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
-_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
-
-
-def _words(name: str) -> list[str]:
-    """列名切成小写的词：下划线和驼峰都是分隔（和目录的命名推断同一个切法）。"""
-    return [w.lower() for part in name.split("_") for w in _WORDS.findall(part)]
 
 
 def _code_type_ok(type_name: str | None) -> bool:
@@ -799,7 +792,7 @@ def _code_type_ok(type_name: str | None) -> bool:
 
 
 def _looks_like_code(name: str) -> bool:
-    words = _words(name)
+    words = catalog.name_words(name)
     return bool(words) and words[-1] not in _NOT_CODE_TAILS and any(w in _CODE_WORDS for w in words)
 
 
@@ -881,14 +874,8 @@ async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome
 
 
 def _is_date_column(col: dict[str, Any]) -> bool:
-    """日期类列：类型是日期、时间戳；或者类型是文字、列名像日期（SQLite 的日期都存成文字）。"""
-    t = str(col.get("type") or "").upper()
-    if "DATE" in t or "TIMESTAMP" in t:
-        return True
-    if t and not any(k in t for k in ("CHAR", "TEXT", "STRING")):
-        return False
-    words = _words(str(col.get("name") or ""))
-    return bool(words) and words[-1] in _DATE_TAILS and (len(words) > 1 or words[0] in ("date", "time", "day"))
+    """日期类列（catalog.is_date_column：和 SQL 检查认时间列是同一个判断）。"""
+    return catalog.is_date_column(str(col.get("name") or ""), col.get("type"))
 
 
 async def _check_dates(cx: _Context, table: str, columns: list[str], total: int, out: _TableOutcome,

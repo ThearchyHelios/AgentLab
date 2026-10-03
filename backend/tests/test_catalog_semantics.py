@@ -441,3 +441,42 @@ async def test_model_draft_drops_formula_items():
     assert set(notes["columns"]["total_amount"]) == {"label", "unit"}
 
 
+# ==========================================================================
+# 一致性
+# ==========================================================================
+
+
+@pytest.mark.parametrize("name, type_, expected", [
+    ("visit_time", "TEXT", True), ("ordered_at", "TEXT", True), ("joined_on", "VARCHAR(20)", True),
+    ("createdAt", "", True), ("biz_date", "DATE", True), ("paid", "DATETIME", True), ("loaded", "TIMESTAMP", True),
+    ("dt", "TEXT", True), ("date", "TEXT", True),
+    ("created_at", "INTEGER", False),        # 整数存的时间戳：取值不是日期，剖析和检查都不当日期列
+    ("open_time", "TIME", False),            # 只有时刻、没有日期
+    ("on_hand", "INTEGER", False), ("status", "TEXT", False), ("at", "TEXT", False), ("ticket_no", "TEXT", False),
+])
+def test_date_column_rule_is_shared(name, type_, expected):
+    assert catalog.is_date_column(name, type_) is expected
+    # 剖析认的日期列（业务日期提议）和 SQL 检查认的时间列（按别的时间列统计）是同一套
+    assert catalog_profile._is_date_column({"name": name, "type": type_}) is expected
+    table = sqlcheck._Table(alias="t", name="t", meta={"columns": [{"name": name, "type": type_}]}, notes={},
+                            order=0)
+    assert table.temporal(name) is expected
+
+
+def test_table_names_match_by_name_key_everywhere():
+    """表名只把 ASCII 字母转小写（name_key，和 SQLite 比较标识符一致）：非 ASCII 的大小写不同就是两张表。"""
+    cache = {"tables": {"CAFÉ_ORDERS": {"columns": []}, "Visits": {"columns": []}}}
+    assert catalog.resolve_table_name(cache, "visits") == "Visits"
+    assert catalog.resolve_table_name(cache, "main.VISITS") == "Visits"
+    assert catalog.resolve_table_name(cache, "cafÉ_orders") == "CAFÉ_ORDERS"
+    assert catalog.resolve_table_name(cache, "café_orders") is None
+    checker = sqlcheck.SqlChecker(kind="sqlite", schema_cache=cache, notes={"CAFÉ_ORDERS": {
+        "label": catalog.make_item("咖啡订单", "human")}})
+    assert checker.notes_of("cafÉ_orders")["label"]["value"] == "咖啡订单"
+    assert checker.notes_of("café_orders") == {}
+
+
+def test_word_splitting_has_one_implementation():
+    assert catalog.name_words("memberTagId") == ["member", "tag", "id"]
+    assert catalog.name_words("MEMBER_TAG") == ["member", "tag"]
+    assert not hasattr(catalog_profile, "_words") and not hasattr(catalog_profile, "_WORDS")

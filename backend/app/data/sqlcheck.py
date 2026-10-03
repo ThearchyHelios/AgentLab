@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.data import catalog
+from app.data.names import name_key
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +69,6 @@ _EXCERPT_MAX = 160
 #: 在引号外是一个不属于任何表的列名（各条规则都对不上它）。不换成数字 0：放在引号里的 0 会被当成码值去比
 _SENTINEL = "__agentlab_tpl__"
 _TEMPLATE = re.compile(r"\{\{.*?\}\}", re.S)
-
-#: 名字看得出是时间的列：xxx_at、xxx_time、xxx_date、xxx_on、createdAt…（SQLite 的日期常存成文本，只看类型认不全）
-_TEMPORAL_NAME = re.compile(r"(?:^|_)(?:at|time|date|day|dt|ts|on|timestamp|datetime)$|[a-z0-9](?:At|Time|Date|On)$",
-                            re.IGNORECASE)
-_TEMPORAL_TYPE = re.compile(r"DATE|TIME", re.IGNORECASE)
 
 
 def dialect_of(kind: str | None) -> str | None:
@@ -133,7 +129,8 @@ class SqlChecker:
         self.source_name = source_name
         self._raw = {str(k): v for k, v in (notes or {}).items() if isinstance(v, Mapping) and v}
         self._visible = {k: catalog.visible_notes(v) for k, v in self._raw.items()}
-        self._visible_lower = {k.lower(): v for k, v in self._visible.items()}
+        # 表名按 name_key 比（只把 ASCII 字母转小写），和 catalog.resolve_table_name、使用次数、影响面同一个口径
+        self._visible_lower = {name_key(k): v for k, v in self._visible.items()}
         self._edges: dict[str, list[catalog.JoinEdge]] | None = None
 
     @property
@@ -161,7 +158,7 @@ class SqlChecker:
         return (key, meta) if key and isinstance(meta, Mapping) else None
 
     def notes_of(self, table: str) -> dict[str, Any]:
-        return self._visible.get(table) or self._visible_lower.get(table.lower()) or {}
+        return self._visible.get(table) or self._visible_lower.get(name_key(table)) or {}
 
     def edges_between(self, a: str, b: str) -> list[catalog.JoinEdge]:
         """从 a 连到 b 的边（每条关系正反各一条）。关系图第一次用到时才建，之后复用。
@@ -169,7 +166,7 @@ class SqlChecker:
         和助手挑表看到的是同一张图（catalog.relation_graph）：目录里的关系，加上没起草过的表按外键、命名现推的；
         被驳回的关系不进图，也不会被现推回来。
         """
-        return [e for e in self.edges_from(a) if e.to_table.lower() == b.lower()]
+        return [e for e in self.edges_from(a) if name_key(e.to_table) == name_key(b)]
 
     def edges_from(self, a: str) -> list[catalog.JoinEdge]:
         """从 a 出发的全部边。关系图第一次用到时才建，之后复用。"""
@@ -177,9 +174,9 @@ class SqlChecker:
             graph = catalog.relation_graph(self._raw, schema_cache=self.schema_cache)
             index: dict[str, list[catalog.JoinEdge]] = {}
             for table, edges in graph.items():
-                index.setdefault(table.lower(), []).extend(edges)
+                index.setdefault(name_key(table), []).extend(edges)
             self._edges = index
-        return list(self._edges.get(a.lower(), []))
+        return list(self._edges.get(name_key(a), []))
 
     # ---- 检查
 
@@ -302,10 +299,11 @@ class _Table:
         return self.columns[column.lower()], str(item.get("status"))
 
     def temporal(self, column: str) -> bool:
+        """这一列是不是时间列（catalog.is_date_column：和数据剖析认日期列是同一个判断，剖析提议业务日期时认的
+        「唯一日期列」和这里认的时间列对得上）。"""
         meta = next((c for c in self.meta.get("columns") or []
                      if isinstance(c, Mapping) and str(c.get("name")).lower() == column.lower()), None)
-        kind = str((meta or {}).get("type") or "")
-        return bool(_TEMPORAL_TYPE.search(kind) or _TEMPORAL_NAME.search(column))
+        return catalog.is_date_column(column, (meta or {}).get("type"))
 
 
 #: 一列解析到的位置：(表, 列的真名)
@@ -548,7 +546,7 @@ class _ScopeCheck:
             if x in skip or y in skip:
                 continue
             a, b = self.tables[x], self.tables[y]
-            if a.name.lower() == b.name.lower():
+            if name_key(a.name) == name_key(b.name):
                 continue                          # 自己连自己：目录不记这种关系
             pairs = group["pairs"]
             candidates = self.checker.edges_between(a.name, b.name)
@@ -990,7 +988,11 @@ def _number(text: str) -> float | None:
 
 
 def _known_code(literal: tuple[str, bool], codes: Mapping[str, Any]) -> bool:
-    """值在不在码值表里：原样相等、不分大小写相等、或者两边都是数且数值相等（1 和 '1'、1.0 都算 1）。"""
+    """值在不在码值表里：原样相等、不分大小写相等、或者两边都是数且数值相等（1 和 '1'、1.0 都算 1）。
+
+    不分大小写是有意的：MySQL 默认的排序规则比较字符串本来就不分大小写，status = 'paid' 照样筛得出 'PAID'；
+    PostgreSQL、SQLite 区分大小写，这样比会漏报一些，但宁可漏报，不能把在 MySQL 上完全正确的写法报成错。
+    """
     text = literal[0]
     keys = [str(k) for k in codes]
     if text in keys or text.strip().lower() in {k.strip().lower() for k in keys}:
