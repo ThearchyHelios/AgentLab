@@ -955,5 +955,94 @@ def _known_code(literal: tuple[str, bool], codes: Mapping[str, Any]) -> bool:
     return number is not None and any(_number(k) == number for k in keys)
 
 
+# ==========================================================================
+# 工作流里写死的 SQL、从库里读目录
+# ==========================================================================
+
+
+def tool_query(node: Any) -> tuple[str, str] | None:
+    """调用工具节点里写死的查询：(数据源名, SQL)。不是数据源查询工具、SQL 不是字符串的返回 None。
+
+    Agent 节点的 SQL 要到运行时才由模型写出来，静态拿不到，这里不管；它们由数据源查询工具在执行后检查。
+    """
+    from app.tools.datasource import QUERY_PREFIX
+
+    if str(getattr(node, "type", "")) != "tool":
+        return None
+    config = getattr(node, "config", None) or {}
+    tool = str(config.get("tool") or "")
+    args = config.get("args")
+    sql = args.get("sql") if isinstance(args, Mapping) else None
+    if not tool.startswith(QUERY_PREFIX) or not isinstance(sql, str) or not sql.strip():
+        return None
+    return tool[len(QUERY_PREFIX):], sql
+
+
+def graph_sources(nodes: Iterable[Any]) -> set[str]:
+    """一张图里调用工具节点写死查询用到的数据源名。"""
+    return {found[0] for node in nodes if (found := tool_query(node))}
+
+
+def graph_checks(nodes: Iterable[Any], checkers: Mapping[str, SqlChecker], *,
+                 only: set[str] | None = None) -> list[tuple[Any, SqlCheck]]:
+    """一张图里调用工具节点写死的 SQL 逐个检查：[(节点, 结果)]。only 给了就只查这些节点。"""
+    out: list[tuple[Any, SqlCheck]] = []
+    for node in nodes:
+        if only is not None and getattr(node, "id", None) not in only:
+            continue
+        found = tool_query(node)
+        checker = checkers.get(found[0]) if found else None
+        if checker is not None:
+            out += [(node, check) for check in checker.check(found[1])]
+    return out
+
+
+async def load_checkers(session: Any, sources: Iterable[Any]) -> dict[str, SqlChecker]:
+    """给一批数据源（DataSource 行）各建一个检查器：{源名: SqlChecker}。没有目录的源不建。
+
+    一次查询读出这些源的全部目录。读不到就当没有目录（返回空 dict）：检查是附加的，不能挡住自查和发布本身。
+    """
+    from sqlalchemy import select
+
+    from app.db.models import CatalogNote
+
+    rows = [s for s in sources if getattr(s, "id", None) and dialect_of(getattr(s, "kind", None))]
+    if not rows:
+        return {}
+    try:
+        notes = (await session.execute(
+            select(CatalogNote.source_id, CatalogNote.table_name, CatalogNote.notes)
+            .where(CatalogNote.source_id.in_([r.id for r in rows]))
+        )).all()
+    except Exception:  # noqa: BLE001
+        logger.exception("读取数据目录失败，本次不做基于目录的 SQL 检查")
+        return {}
+    by_source: dict[str, dict[str, Any]] = {}
+    for source_id, table, value in notes:
+        if isinstance(value, dict) and value:
+            by_source.setdefault(source_id, {})[table] = value
+    return {r.name: SqlChecker(kind=r.kind, schema_cache=r.schema_cache, notes=by_source[r.id], source_name=r.name)
+            for r in rows if r.id in by_source}
+
+
+async def load_checkers_by_name(session: Any, names: Iterable[str]) -> dict[str, SqlChecker]:
+    """按数据源名建检查器（只看启用着的源）。发布门禁用：图里写的是源名。"""
+    from sqlalchemy import select
+
+    from app.db.models import DataSource
+
+    wanted = sorted({n for n in names if n})
+    if not wanted:
+        return {}
+    try:
+        rows = list((await session.execute(
+            select(DataSource).where(DataSource.name.in_(wanted), DataSource.enabled.is_(True))
+        )).scalars())
+    except Exception:  # noqa: BLE001
+        logger.exception("读取数据源失败，本次不做基于目录的 SQL 检查")
+        return {}
+    return await load_checkers(session, rows)
+
+
 __all__ = ["CHECK_CODES", "LEVELS", "MAX_CHECKS", "MAX_SQL_CHARS", "SqlCheck", "SqlChecker", "check_sql",
-           "dialect_of"]
+           "dialect_of", "graph_checks", "graph_sources", "load_checkers", "load_checkers_by_name", "tool_query"]

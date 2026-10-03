@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.data.sqlcheck import CHECK_CODES
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
@@ -1081,6 +1082,7 @@ def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
+    checkers: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
@@ -1098,6 +1100,9 @@ def _blocking_issues(
 
     defaults 是全图默认（graph.defaults）：报告撰写节点的 numbers / claims、审批策略都跟随它，不带上的话
     自查看到的问题和真正的门禁对不上。
+
+    checkers 是各数据源基于数据目录的 SQL 检查器（data/sqlcheck.load_checkers）：调用工具节点里写死的 SQL
+    查出 error 级的问题（一对多关联后重复计算、存量跨期求和）也算挡住，交回模型改；warning、info 不挡。
     """
     try:
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges,
@@ -1106,7 +1111,7 @@ def _blocking_issues(
         return None
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
-           + authored_issues(spec, sources or [], baseline))
+           + [i for i in authored_issues(spec, sources or [], baseline, checkers=checkers) if i["level"] == "error"])
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1181,7 +1186,7 @@ def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any
 
 
 def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str, Any]] | None = None,
-                    ) -> list[dict[str, Any]]:
+                    *, checkers: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """助手搭图时要打回、运行时却不挡的写法，按 error 交回模型改：
 
     - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
@@ -1189,6 +1194,11 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
     - report_no_source：报告撰写节点的上游没有任何证据来源（运行时只给一条警告，报告里的数全没有出处）。
       metrics_from 指向不是口径卡的节点，validate 本来就报 error，自查照样交回去
+
+    另外，给了 checkers（各数据源基于数据目录的 SQL 检查器）时，调用工具节点里写死的 SQL 再对照目录查一遍
+    （code 是 data/sqlcheck.CHECK_CODES 里的规则编号），级别照检查结果：error 交回模型改，warning、info
+    由调用方放进交付的问题清单。列名都对不上的 SQL 先改列名，这一轮不叠加目录检查。Agent 节点的 SQL 要到
+    运行时才写出来，这里拿不到，由数据源查询工具在执行后检查。
     """
     changed = _changed(spec, baseline)
     out: list[dict[str, Any]] = []
@@ -1212,6 +1222,7 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
             continue
         found = sql_unknown_columns(sql, source)
         if not found:
+            out += _catalog_issues(node.id, sql, (checkers or {}).get(source.name))
             continue
         unknown, known = found
         listed = "、".join(known[:20]) + (f" 等 {len(known)} 列" if len(known) > 20 else "")
@@ -1223,6 +1234,14 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
                                  f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
                                  "别凭空猜列名"})
     return out
+
+
+def _catalog_issues(node_id: str, sql: str, checker: Any) -> list[dict[str, Any]]:
+    """一个调用工具节点的 SQL 对照数据目录查出来的问题，形状和别的自查问题一样（node_id、field 都在），
+    另带 table、column、relation_id、sql_excerpt 给界面定位。"""
+    if checker is None:
+        return []
+    return [{**check, "node_id": node_id, "edge_id": None, "field": "args.sql"} for check in checker.check_dicts(sql)]
 
 
 # --------------------------------------------------------------------------
@@ -1599,10 +1618,14 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     """
     from fastapi.responses import StreamingResponse
 
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
     tool_list = _tool_catalog(sources)
     datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
+    # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
+    checkers = await load_checkers(session, sources)
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
         f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
@@ -1721,7 +1744,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         repaired = 0
         for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
-            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
+            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
             if not errors:
                 break
             yield _sse({"op": "check", "status": "repairing", "round": round_no, "issues": errors})
@@ -1739,7 +1762,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                             "message": f"自查修正失败：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
-        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
+        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1763,9 +1786,11 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             issues = [i.model_dump() for i in validate_graph(spec).issues if i.level != "info"]
             issues += _issue_dicts(scope_issues(list(nodes.values()), scope),
                                    "datasource_out_of_scope")
-            # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见
-            issues += [{**i, "level": "warning"} for i in authored_issues(spec, sources, baseline)
-                       if i["code"] == "sql_unknown_column"]
+            # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见。
+            # 对照数据目录的 SQL 检查照原级别列出：warning、info 本来就不返工，改不好的 error 也在这里看得见
+            authored = authored_issues(spec, sources, baseline, checkers=checkers)
+            issues += [{**i, "level": "warning"} for i in authored if i["code"] == "sql_unknown_column"]
+            issues += [i for i in authored if i["code"] in CHECK_CODES]
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
