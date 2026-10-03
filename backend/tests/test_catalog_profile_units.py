@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.data import catalog_profile, guard
 from app.data.catalog_profile import PROFILE_OPTION, ProfileSettings, profile_settings, profile_settings_problem
 from app.data.engine import build_url
 
@@ -57,3 +58,88 @@ def test_profile_option_never_reaches_the_connection_url():
                              password=None, options={"charset": "utf8mb4", PROFILE_OPTION: {"enabled": True}})
     url = build_url(source)
     assert "charset=utf8mb4" in url and PROFILE_OPTION not in url and "enabled" not in url
+
+
+# ---------------------------------------------------------------- 字面量
+
+
+@pytest.mark.parametrize("value, kind, expected", [
+    (42, "number", "42"),
+    (-7, None, "-7"),
+    (3.0, "number", "3"),
+    ("12345678901234567890", "number", "12345678901234567890"),   # DECIMAL 经查询层转成了字符串
+    ("A-01", "text", "'A-01'"),
+    ("O'Neil", "text", "'O''Neil'"),
+    ("12:30", "text", "'12:30'"),
+])
+def test_sql_literal_quotes_safe_values(value, kind, expected):
+    assert catalog_profile.sql_literal(value, kind) == expected
+
+
+@pytest.mark.parametrize("value, kind", [
+    (True, "boolean"),                 # 布尔不当键
+    (2.5, "number"),                   # 非整数的数不当键：浮点相等比较靠不住
+    ("12.50", "number"),
+    ("1e3", "number"),
+    ("2026-07-01", "date"),            # 日期的字面量各家写法不同，不猜
+    ("a\\b", "text"),                  # 反斜杠：MySQL 不同设置下读法不同，守卫会拒
+    ("a :b", "text"),                  # 「:名字」会被查询层当成绑定参数
+    (":b", "text"),
+    ("a\nb", "text"),                  # 控制字符
+    ("x" * 201, "text"),
+    (None, "text"),
+    ([1], None),
+])
+def test_sql_literal_refuses_unsafe_or_unsupported_values(value, kind):
+    assert catalog_profile.sql_literal(value, kind) is None
+
+
+# ---------------------------------------------------------------- 各方言的剖析 SQL
+
+
+_META = {"visits": {"schema": None, "columns": [{"name": "memberTagId", "type": "INTEGER"}], "primary_key": ["id"]},
+         "orders": {"schema": "sales", "columns": [{"name": "status", "type": "INTEGER"}], "primary_key": ["id"]}}
+
+
+@pytest.mark.parametrize("kind", ["mysql", "mariadb", "postgresql", "oracle", "sqlite"])
+def test_profile_sql_passes_readonly_guard_on_every_dialect(kind):
+    """剖析的每一种查询（含读统计信息的系统视图）都得过只读守卫——守卫不为剖析放宽。"""
+    d = catalog_profile.SqlDialect(kind)
+    sqls = []
+    for table in ("visits", "orders"):
+        stats = d.stats_sql(_META[table], table)
+        if kind == "sqlite":
+            assert stats is None           # SQLite 没有可读的统计信息，改为数到上限
+        else:
+            assert stats
+            sqls.append(stats)
+        tbl = d.table(_META[table], table)
+        col = d.quote(_META[table]["columns"][0]["name"])
+        sqls += [
+            d.bounded_count_sql(tbl, 100_001),
+            d.distinct_sample_sql(tbl, col, 2000, scan_cap=None),
+            d.distinct_sample_sql(tbl, col, 2000, scan_cap=100_000),
+            d.match_count_sql(tbl, col, ["1", "'A'"]),
+            d.unique_check_sql(tbl, col),
+            d.value_counts_sql(tbl, col, 21, scan_cap=None),
+            d.value_counts_sql(tbl, col, 21, scan_cap=100_000),
+            d.min_max_sql(tbl, [col]),
+        ]
+    for sql in sqls:
+        assert guard.check(sql, readonly=True, dialect=kind) == sql, sql
+
+
+def test_dialect_quoting_and_row_limits():
+    my, ora, pg = (catalog_profile.SqlDialect(k) for k in ("mysql", "oracle", "postgresql"))
+    assert my.quote("memberTagId") == "`memberTagId`" and pg.quote("memberTagId") == '"memberTagId"'
+    assert my.table(_META["orders"], "orders") == "sales.orders"
+    assert pg.table({"schema": "Sales"}, "memberTags") == '"Sales"."memberTags"'
+    # Oracle 没有 LIMIT（11g 也没有 FETCH FIRST）：一律用 ROWNUM
+    sample = ora.distinct_sample_sql("visits", '"memberTagId"', 50, scan_cap=None)
+    assert "LIMIT" not in sample and "ROWNUM <= 50" in sample
+    assert "LIMIT 50" in pg.distinct_sample_sql("visits", "x", 50, scan_cap=None)
+    # 统计信息按方言读各自的系统视图
+    assert "information_schema.TABLES" in my.stats_sql(_META["visits"], "visits")
+    assert "pg_class" in pg.stats_sql(_META["visits"], "visits")
+    stats = ora.stats_sql(_META["orders"], "orders")
+    assert "ALL_TABLES" in stats and "'ORDERS'" in stats and "'SALES'" in stats

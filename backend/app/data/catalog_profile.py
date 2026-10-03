@@ -18,10 +18,18 @@
 """
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from typing import Any
 
-from app.data.engine import CATALOG_PROFILE_OPTION
+from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
+
+from app.data import engine as data_engine
+from app.data import guard
+from app.data.engine import CATALOG_PROFILE_OPTION, QueryResult, SnapshotTampered
+from app.data.guard import QueryLimits, SqlRejected
 
 #: 数据源 options 里剖析设置的键
 PROFILE_OPTION = CATALOG_PROFILE_OPTION
@@ -116,4 +124,305 @@ def profile_settings_problem(options: dict[str, Any] | None) -> str | None:
     return None
 
 
-__all__ = ["PROFILE_OPTION", "ProfileSettings", "profile_settings", "profile_settings_problem"]
+# ==========================================================================
+# SQL：字面量与方言
+# ==========================================================================
+
+#: 查询层不支持参数绑定（run_query 只收一段 SQL），核对键值只能把值拼进 IN 列表。所以只拼「自己刚从库里
+#: 取回的原值」，并且按类型生成字面量：整数原样写，文字加单引号、单引号写两遍。下面几种文字不拼，跳过：
+#: - 带反斜杠的：MySQL 在 NO_BACKSLASH_ESCAPES 开与不开时读法不同，守卫会整条拒掉；
+#: - 带「:名字」的：查询层用 SQLAlchemy 的 text() 执行，它不认引号，会把字符串里的 :b 当成绑定参数；
+#: - 带控制字符的、太长的：键值不该长这样，多半不是键。
+_BIND_LIKE = re.compile(r"(?<![:\w\\]):\w")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_INT_TEXT = re.compile(r"-?\d{1,38}")
+#: 文字字面量的长度上限
+MAX_LITERAL_LEN = 200
+
+
+def sql_literal(value: Any, kind: str | None) -> str | None:
+    """一个取回的值 → SQL 字面量；不安全或类型不支持时返回 None（调用方跳过这个值）。
+
+    kind 是查询层记下的列类型（QueryResult.column_types：number / text / date …），None 表示拿不准。
+    DECIMAL 经查询层已经转成了字符串（保精度），所以 number 列的整数文字原样写成数字。只认整数和文字：
+    非整数的数做相等比较靠不住；日期、时间的字面量各家写法不同，不猜；布尔不当键。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() and abs(value) < 2 ** 53 else None
+    if isinstance(value, Decimal):
+        return str(int(value)) if value.is_finite() and value == value.to_integral_value() else None
+    if not isinstance(value, str):
+        return None
+    if kind == "number":
+        return value if _INT_TEXT.fullmatch(value) else None
+    if kind not in ("text", None):
+        return None
+    if len(value) > MAX_LITERAL_LEN or "\\" in value or _CONTROL.search(value) or _BIND_LIKE.search(value):
+        return None
+    return "'" + value.replace("'", "''") + "'"
+
+
+_DIALECT_MODULES = {"sqlite": sqlite, "postgres": postgresql, "postgresql": postgresql, "mysql": mysql,
+                    "mariadb": mysql, "oracle": oracle}
+
+
+class SqlDialect:
+    """剖析 SQL 的方言差异：标识符怎么加引号、怎么只取前 n 行、统计信息在哪个系统视图里。只拼字符串，不连库。
+
+    标识符交给 SQLAlchemy 各方言的 identifier_preparer：需要时才加引号（memberTags 加、visits 不加），
+    MySQL 用反引号。Oracle 尤其不能一律加双引号：探查拿到的表名是 SQLAlchemy 规整过的小写，库里其实是
+    大写，"visits" 加了引号就成了另一张不存在的表；不加引号 Oracle 自己转大写才对得上。
+    """
+
+    def __init__(self, kind: str | None) -> None:
+        self.kind = (kind or "").lower()
+        module = _DIALECT_MODULES.get(self.kind)
+        if module is None:
+            raise ValueError(f"不支持的数据库类型：{kind}")
+        self._dialect = module.dialect()
+        self._prep = self._dialect.identifier_preparer
+        self.oracle = self.kind == "oracle"
+
+    def quote(self, name: str) -> str:
+        return self._prep.quote(name)
+
+    def table(self, meta: dict[str, Any] | None, name: str) -> str:
+        """写进 FROM 的表名：探查时指定了 schema 的带上它（Oracle 只读账号名下没有对象，全靠 schema 前缀）。"""
+        schema = (meta or {}).get("schema")
+        return f"{self._prep.quote_schema(schema)}.{self.quote(name)}" if schema else self.quote(name)
+
+    def limit(self, sql: str, n: int) -> str:
+        """只取前 n 行。Oracle 11g 没有 LIMIT 也没有 FETCH FIRST，一律套一层 ROWNUM。"""
+        if self.oracle:
+            return f"SELECT * FROM ({sql}) WHERE ROWNUM <= {int(n)}"
+        return f"{sql} LIMIT {int(n)}"
+
+    def _first_rows(self, table: str, column: str, scan_cap: int | None) -> str:
+        """FROM 子句：整张表，或者只看前 scan_cap 行非空值的子查询（大表不做整表扫描）。"""
+        if scan_cap is None:
+            return table
+        return f"({self.limit(f'SELECT {column} FROM {table} WHERE {column} IS NOT NULL', scan_cap)}) s"
+
+    def stats_sql(self, meta: dict[str, Any] | None, name: str) -> str | None:
+        """读这张表行数估算值的查询：MySQL information_schema.TABLES.TABLE_ROWS、PostgreSQL pg_class.reltuples、
+        Oracle ALL_TABLES.NUM_ROWS。SQLite 没有可靠的统计信息，返回 None（改为数到上限为止）。"""
+        schema = (meta or {}).get("schema")
+        if self.kind in ("mysql", "mariadb"):
+            where_schema = sql_literal(schema, "text") if schema else "DATABASE()"
+            table = sql_literal(name, "text")
+            if not (where_schema and table):
+                return None
+            return (f"SELECT TABLE_ROWS FROM information_schema.TABLES "
+                    f"WHERE TABLE_SCHEMA = {where_schema} AND TABLE_NAME = {table}")
+        if self.kind in ("postgres", "postgresql"):
+            where_schema = sql_literal(schema, "text") if schema else "current_schema()"
+            table = sql_literal(name, "text")
+            if not (where_schema and table):
+                return None
+            return ("SELECT c.reltuples FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    f"WHERE n.nspname = {where_schema} AND c.relname = {table}")
+        if self.oracle:
+            denorm = self._dialect.denormalize_name
+            owner = sql_literal(denorm(schema), "text") if schema else "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
+            table = sql_literal(denorm(name), "text")
+            if not (owner and table):
+                return None
+            return f"SELECT NUM_ROWS FROM ALL_TABLES WHERE OWNER = {owner} AND TABLE_NAME = {table}"
+        return None
+
+    def bounded_count_sql(self, table: str, cap: int) -> str:
+        """数到 cap 行为止：小表得到准确行数，大表只知道「至少 cap 行」，不做全表 COUNT。"""
+        return f"SELECT COUNT(*) AS n FROM ({self.limit(f'SELECT 1 AS one FROM {table}', cap)}) s"
+
+    def distinct_sample_sql(self, table: str, column: str, n: int, *, scan_cap: int | None) -> str:
+        """至多 n 个不同的非空键值。scan_cap 给了时只在前 scan_cap 行里找：键的取值少时 DISTINCT … LIMIT
+        凑不满 n 个，会一直扫到表尾。"""
+        if scan_cap is None:
+            return self.limit(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL", n)
+        return self.limit(f"SELECT DISTINCT {column} FROM {self._first_rows(table, column, scan_cap)}", n)
+
+    def match_count_sql(self, table: str, column: str, literals: list[str]) -> str:
+        """被指向表里能对上这些键值的个数（去重：被指向列有重复值时不多算）。"""
+        return f"SELECT COUNT(DISTINCT {column}) AS n FROM {table} WHERE {column} IN ({', '.join(literals)})"
+
+    def unique_check_sql(self, table: str, column: str) -> str:
+        """非空值个数和不同值个数：相等即这一列（非空部分）唯一。整表统计，只对小表用。"""
+        return f"SELECT COUNT({column}) AS n, COUNT(DISTINCT {column}) AS d FROM {table}"
+
+    def value_counts_sql(self, table: str, column: str, n: int, *, scan_cap: int | None) -> str:
+        """取值分布：出现最多的 n 个取值和各自的行数。只拿取值和计数，不拿明细行。"""
+        sql = (f"SELECT {column}, COUNT(*) AS cnt FROM {self._first_rows(table, column, scan_cap)} "
+               f"WHERE {column} IS NOT NULL GROUP BY {column} ORDER BY cnt DESC, {column}")
+        return self.limit(sql, n)
+
+    def min_max_sql(self, table: str, columns: list[str]) -> str:
+        return f"SELECT {', '.join(f'MIN({c}), MAX({c})' for c in columns)} FROM {table}"
+
+
+# ==========================================================================
+# 发查询：守卫、查询次数、时限
+# ==========================================================================
+
+#: 总时长只剩这么一点时不再发新查询：发出去的时限也只剩零点几秒，白占一次查询次数
+_MIN_WINDOW_S = 0.5
+#: 连续失败这么多条就停：多半是连接断了、账号没有权限，再发只是一条条重复同一个错误
+_MAX_CONSECUTIVE_ERRORS = 3
+
+
+class _Stop(Exception):
+    """整次剖析停下：budget 查询次数用完、deadline 总时长用完、failed 连续失败。剩下的检查都不再发查询。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Skip(Exception):
+    """这一项没查成：timeout 超时、error 查询失败、rejected 未通过守卫。记下原因，接着查别的。"""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+def _brief(e: BaseException) -> str:
+    """驱动报错的第一行，去掉 SQLAlchemy 加的「(模块.类名)」前缀和后面附的 SQL、文档链接。"""
+    lines = str(getattr(e, "orig", None) or e).strip().splitlines()
+    first = re.sub(r"^\([\w.]+\)\s*", "", lines[0] if lines else "")
+    return first[:160] or type(e).__name__
+
+
+class _Runner:
+    """剖析发的每一条查询都从这里走：先按只读过守卫，再交给查询层 run_query；记次数、管时限。
+
+    - 只读：不论数据源本身可写与否，先用 guard.check(readonly=True) 判一遍，再进 run_query——那里还会按
+      数据源自己的设置判一遍。两遍是同一个守卫，不为剖析放宽，也不另开连接。
+    - 查询次数：每发一条记一次（超时、失败的也算），到上限就停。没发出去的（守卫拒了）不算。
+    - 时限：单条取设置和数据源查询时限中较小的一个，并且不超过总时长剩下的部分。
+    """
+
+    def __init__(self, source: Any, settings: ProfileSettings, dialect: SqlDialect) -> None:
+        self.source = source
+        self.settings = settings
+        self.kind = dialect.kind
+        self.timeout = min(float(settings.query_timeout_s), float(data_engine.query_timeout(source)))
+        self.ends = time.monotonic() + float(settings.max_total_s)
+        self.used = 0
+        self.stopped: str | None = None
+        self._errors = 0
+
+    def _stop(self, reason: str) -> None:
+        self.stopped = reason
+        raise _Stop(reason)
+
+    async def __call__(self, sql: str, *, max_rows: int = 1) -> QueryResult:
+        if self.stopped:
+            raise _Stop(self.stopped)
+        if self.used >= self.settings.max_queries:
+            self._stop("budget")
+        remaining = self.ends - time.monotonic()
+        if remaining <= _MIN_WINDOW_S:
+            self._stop("deadline")
+        try:
+            guard.check(sql, readonly=True, source_name=getattr(self.source, "name", ""), dialect=self.kind)
+        except SqlRejected as e:
+            raise _Skip("rejected", f"剖析查询未通过安全守卫：{e}") from e
+        self.used += 1
+        cut = remaining < self.timeout
+        seconds = round(min(self.timeout, remaining), 3)
+        limits = QueryLimits(max_rows=max(1, int(max_rows)), timeout_seconds=seconds)
+        try:
+            result = await data_engine.run_query(self.source, sql, limits=limits)
+        except SqlRejected as e:
+            # 上面已经按只读过了同一个守卫，查询层再拒只可能是时限到了
+            if cut:
+                self.stopped = "deadline"
+            raise _Skip("timeout", f"查询超过 {_fmt(seconds)} 秒被中断，已跳过") from e
+        except SnapshotTampered:
+            raise
+        except Exception as e:  # noqa: BLE001 - 一条查询失败不该拖垮整次剖析，原因照实记下
+            self._errors += 1
+            if self._errors >= _MAX_CONSECUTIVE_ERRORS:
+                self.stopped = "failed"
+            raise _Skip("error", f"查询失败：{_brief(e)}") from e
+        self._errors = 0
+        return result
+
+
+# ==========================================================================
+# 表有多大
+# ==========================================================================
+
+
+@dataclass(frozen=True)
+class TableSize:
+    """一张表的行数。rows 为 None 表示不知道（没有统计信息、也没数）或者超过了整表统计的上限。"""
+
+    rows: int | None
+    #: stats 数据库的统计信息（估算值）；count 数到上限为止；unknown 没能得到
+    method: str
+    #: 数到上限也没数完：至少这么多行
+    at_least: int | None = None
+
+    def within(self, limit: int) -> bool:
+        """行数已知且不超过 limit：可以做整表统计。不知道多大的表按大表对待。"""
+        return self.rows is not None and self.rows <= limit
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rows": self.rows, "method": self.method, "at_least": self.at_least}
+
+
+def _first(result: QueryResult) -> Any:
+    return result.rows[0][0] if result.rows and result.rows[0] else None
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value))
+    except ValueError:
+        return None
+    return int(number) if number == number and abs(number) != float("inf") else None
+
+
+async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any], name: str, *,
+                        max_scan_rows: int) -> tuple[TableSize, list[_Skip]]:
+    """先读统计信息；读不到（SQLite、没分析过的表）再数到 max_scan_rows + 1 行为止。
+
+    统计信息为 0 或负数（PostgreSQL 没分析过的表是 -1，MySQL 的估算值可能是 0）当作不知道：一张其实很大的表
+    要是被当成空表，后面就会对它做整表统计。返回 (行数, 途中没查成的几条)。查询次数、总时长用完时抛 _Stop。
+    """
+    skips: list[_Skip] = []
+    sql = dialect.stats_sql(meta, name)
+    if sql:
+        try:
+            rows = _as_int(_first(await run(sql)))
+        except _Skip as e:
+            skips.append(e)
+        else:
+            if rows is not None and rows > 0:
+                return TableSize(rows, "stats"), skips
+    if max_scan_rows <= 0:
+        return TableSize(None, "unknown"), skips
+    cap = max_scan_rows + 1
+    try:
+        counted = _as_int(_first(await run(dialect.bounded_count_sql(dialect.table(meta, name), cap))))
+    except _Skip as e:
+        skips.append(e)
+        return TableSize(None, "unknown"), skips
+    if counted is None:
+        return TableSize(None, "unknown"), skips
+    if counted <= max_scan_rows:
+        return TableSize(counted, "count"), skips
+    return TableSize(None, "count", at_least=cap), skips
+
+
+__all__ = ["MAX_LITERAL_LEN", "PROFILE_OPTION", "ProfileSettings", "SqlDialect", "TableSize", "estimate_size",
+           "profile_settings", "profile_settings_problem", "sql_literal"]
