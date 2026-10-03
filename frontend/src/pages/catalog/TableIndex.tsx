@@ -12,7 +12,8 @@ import type { ListFilter, ListSort } from './model'
 
 // ===========================================================================
 // 表清单（数据目录页的左栏）：搜索、按审阅进度筛选、排序、多选后批量起草。
-// 一行两层：上面是中文名和各状态的项数，下面是表名、类型、关联数和使用次数。键盘：↑↓ 在行之间移动，
+// 一行两层：上面是中文名和各状态的项数，下面是表名、类型、关联数和使用次数；还没填中文名的表上面直接写表名，
+// 下面淡淡地写「未填写中文名」——一屏几十行「未填写中文名」认不出是哪张表。键盘：↑↓ 在行之间移动，
 // Home / End 到两头，Enter 打开；复选框按住 Shift 点选可以连选一段。
 // ===========================================================================
 
@@ -224,15 +225,17 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
         data-catalog-open-row=""
       >
         <span className="flex items-center gap-2">
-          <span className={clsx('min-w-0 flex-1 truncate text-xs', r.label ? 'font-medium text-fg' : 'text-faint')} data-row-label="">
-            {r.label ?? CT.noLabel}
-          </span>
+          {r.label
+            ? <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg" data-row-title="" data-row-label="">{r.label}</span>
+            : <span className="mono min-w-0 flex-1 truncate text-xs font-medium text-fg" title={r.qualified} data-row-title="">{r.table_name}</span>}
           {progress === 'none'
             ? <span className="shrink-0 text-2xs text-faint">{CT.noCatalog}</span>
             : <CountBadges counts={r.counts} className="shrink-0" />}
         </span>
         <span className="mt-0.5 flex items-center gap-1.5 text-2xs text-faint">
-          <span className="mono min-w-0 truncate" title={r.qualified}>{r.table_name}</span>
+          {r.label
+            ? <span className="mono min-w-0 truncate" title={r.qualified}>{r.table_name}</span>
+            : <span className="min-w-0 truncate" data-row-label="" data-row-no-label="">{CT.noLabel}</span>}
           {r.kind && <span className="shrink-0">· {CATALOG_KIND_LABEL[r.kind] ?? r.kind}</span>}
           {r.is_view && <span className="shrink-0">· {CT.view}</span>}
           {r.relations > 0 && <span className="shrink-0 tnum">· {CT.relationCount(r.relations)}</span>}

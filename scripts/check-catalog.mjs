@@ -537,6 +537,16 @@ await section('数据目录 · 表清单的排序与筛选', async () => {
   check('……读屏念得出各状态的项数', (await page.locator('[data-catalog-row="visits"] .sr-only').allInnerTexts()).join('|').includes(`推断 ${c.proposed} 项`))
   check('没有目录的表写「没有目录」、中文名写「未填写中文名」', (await page.locator('[data-catalog-row="gates"]').innerText()).includes('没有目录')
         && (await page.locator('[data-catalog-row="gates"] [data-row-label]').innerText()) === '未填写中文名')
+  // 没填中文名的表：标题就是表名，「未填写中文名」降为下一行的淡色提示；填了的照旧中文名作标题、表名在下一行
+  const titleOf = (name) => page.locator(`[data-catalog-row="${name}"] [data-row-title]`).evaluate((el) => ({
+    text: el.innerText, weight: Number(getComputedStyle(el).fontWeight), color: getComputedStyle(el).color,
+    hint: getComputedStyle(el.closest('[data-catalog-row]').querySelector('[data-row-no-label]') ?? el).color,
+  }))
+  const gatesTitle = await titleOf('gates')
+  const visitsTitle = await titleOf('visits')
+  check('没填中文名：标题写表名、用正文的颜色和字重，「未填写中文名」是淡色的次要提示', gatesTitle.text === 'gates' && gatesTitle.weight >= 500
+    && gatesTitle.color === visitsTitle.color && gatesTitle.hint !== gatesTitle.color, JSON.stringify(gatesTitle))
+  check('填了中文名：标题写中文名', visitsTitle.text === '入园记录')
   await cleanCopy(page, '表清单')
   await shot(page, 'catalog-list')
 
