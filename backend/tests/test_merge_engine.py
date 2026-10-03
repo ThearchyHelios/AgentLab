@@ -225,6 +225,39 @@ def test_byte_limit_matches_the_query_layer():
     assert out.truncated is True and 0 < len(out.rows) < 16
 
 
+def test_row_collector_is_the_one_cutoff_rule():
+    """截断判定只有一份（data.engine.RowCollector）：到了行数或字节上限之后确实还有下一行才算截断，恰好取满不算；
+    第一行总是收下（单行就超过字节上限也得交回点什么）。"""
+    from app.data.engine import RowCollector
+
+    full = RowCollector(QueryLimits(max_rows=2))
+    assert full.take([1]) and full.take([2])
+    assert full.rows == [[1], [2]] and full.truncated is False      # 恰好取满、后面没有了
+    assert full.take([3]) is False                                  # 取满之后还有一行：截断，这一行不收
+    assert full.rows == [[1], [2]] and full.truncated is True
+
+    tiny = RowCollector(QueryLimits(max_bytes=5))
+    assert tiny.take(["一行就超过字节上限"]) is True and tiny.take(["下一行"]) is False
+    assert len(tiny.rows) == 1 and tiny.truncated is True
+
+
+def test_merge_reads_through_the_query_layer_cutoff(monkeypatch):
+    """合并查询调用查询层的判定，不另写一遍：两边的口径不会再各改各的。"""
+    import app.engine.merge_query as merge_query
+    from app.data.engine import RowCollector
+
+    made: list[RowCollector] = []
+
+    class Spy(RowCollector):
+        def __init__(self, limits):
+            super().__init__(limits)
+            made.append(self)
+
+    monkeypatch.setattr(merge_query, "RowCollector", Spy)
+    out = execute([sales(), visits()], "SELECT * FROM s CROSS JOIN v", limits=QueryLimits(max_rows=5))
+    assert len(made) == 1 and made[0].truncated is True and len(out.rows) == len(made[0].rows) == 5
+
+
 def test_runaway_query_is_stopped():
     endless = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c"
     with pytest.raises(MergeError, match="秒"):

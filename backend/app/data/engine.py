@@ -879,6 +879,33 @@ async def _bounded(
         raise
 
 
+class RowCollector:
+    """逐行收结果、边收边判上限（行数 max_rows、字节 max_bytes）。截断的判定只有这一份：查询层（run_query）和
+    合并查询（engine/merge_query._read）都调它，不各写一遍。
+
+    到了上限之后确实还有下一行才记 truncated。以前一到上限就标截断，恰好 1000 行的完整结果也算截断——截断的结果
+    整组拿去算的指标要降档出具、截断的合并结果下游会拒收，误报就是把完整的结果降了档、拒了。字节数按收下的行累加，
+    第一行总是收下：单行就超过字节上限也交回这一行。
+    """
+
+    def __init__(self, limits: QueryLimits) -> None:
+        self.limits = limits
+        self.rows: list[list[Any]] = []
+        self.size = 0
+        self.truncated = False
+        self._full = False
+
+    def take(self, values: list[Any]) -> bool:
+        """收一行（已转成能进 JSON 的值）。已经取满还来一行：记截断、不收，返回 False，调用方就此停止读取。"""
+        if self._full:
+            self.truncated = True
+            return False
+        self.rows.append(values)
+        self.size += len(json.dumps(values, ensure_ascii=False, default=str))
+        self._full = len(self.rows) >= self.limits.max_rows or self.size >= self.limits.max_bytes
+        return True
+
+
 async def run_query(
     source: Any, sql: str, *, limits: QueryLimits | None = None
 ) -> QueryResult:
@@ -903,23 +930,14 @@ async def run_query(
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
         cursor = await conn.stream(text(statement))
         columns = list(cursor.keys())
-        rows: list[list[Any]] = []
+        collected = RowCollector(limits)
         seen = _TypeTally(len(columns))
-        truncated = full = False
-        size = 0
+        # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
         async for row in cursor:
-            if full:
-                # 到了上限之后还有下一行：确实没取完。以前一到上限就标截断，恰好 1000 行的完整结果
-                # 也算截断——截断的结果整组拿去算的指标要降档出具，误报就是把完整的结果降了档
-                truncated = True
+            if not collected.take([_jsonable(v) for v in row]):
                 break
-            # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
             seen.add(row)
-            values = [_jsonable(v) for v in row]
-            rows.append(values)
-            size += len(json.dumps(values, ensure_ascii=False, default=str))
-            full = len(rows) >= limits.max_rows or size >= limits.max_bytes
-        return columns, rows, truncated, seen.types(columns)
+        return columns, collected.rows, collected.truncated, seen.types(columns)
 
     columns, rows, truncated, types = await _bounded(
         engine.connect, kind, limits,
