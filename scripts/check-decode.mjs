@@ -673,18 +673,30 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
 
   const seeded = mod.copilotContext({ op: 'context', sources: [
     { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })
-  check('没挑成但现有工作流的表带着字段：标题说几张、副标题说没挑成',
-    seeded?.title === '参考了 1 张表' && seeded?.sub === '未能按需求挑选，已提供全部表名'
+  check('没挑成但现有工作流的表带着字段：标题说几张带字段、副标题说没挑成和只给了表名的张数',
+    seeded?.title === '参考了 1 张表的字段' && seeded?.sub === '未能按需求挑选，另有 50 张表只提供了表名'
     && seeded.detail.includes('现有工作流用到的 1 张表附带全部字段：stores'), JSON.stringify(seeded))
   const mixed = mod.copilotContext({ op: 'context', sources: [
     { source: 'a', tables: ['x'], selected_by: 'all', total: 1 },
     { source: 'b', tables: [], selected_by: 'fallback', total: 80, reason: 'r' }] })
-  check('只有一个库没挑成：副标题点名是哪个库', mixed?.sub === '「b」未能按需求挑选，已提供全部表名', mixed?.sub)
+  check('只有一个库没挑成：副标题点名是哪个库，并写只提供了表名的张数', mixed?.title === '参考了 1 张表的字段'
+    && mixed?.sub === '「b」未能按需求挑选，另有 80 张表只提供了表名', `${mixed?.title} / ${mixed?.sub}`)
   const none = mod.copilotContext({ op: 'context', sources: [
     { source: 'a', tables: ['x'], selected_by: 'model', total: 60 },
     { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
-  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名'),
-    none?.detail)
+  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名')
+    && none.title === '参考了 1 张表的字段' && none.sub === '另有 70 张表只提供了表名', `${none?.title} / ${none?.sub} / ${none?.detail}`)
+  // R2 走查（B14）：几个小库全给、点名的大库按需求挑、另一个大库没挑成。展开后挑表的库排在最前面，
+  // 两个数分开说：26 张带字段，206 张只给了表名
+  const r2 = mod.copilotContext({ op: 'context', sources: [
+    { source: 'small_a', tables: Array.from({ length: 12 }, (_, i) => `a${i}`), selected_by: 'all', total: 12 },
+    { source: 'small_b', tables: Array.from({ length: 11 }, (_, i) => `b${i}`), selected_by: 'all', total: 11 },
+    { source: 'big', tables: [], selected_by: 'fallback', total: 206, reason: '超时' },
+    { source: 'named', tables: ['visits', 'channels', 'parks'], selected_by: 'model', total: 51 }] })
+  check('展开后按需求挑表的库排在第一行，没挑成的排在最后', r2?.detail.split('\n')[0].startsWith('「named」按需求从 51 张表中挑出 3 张')
+    && r2.detail.split('\n')[3].startsWith('「big」'), r2?.detail.split('\n').map((l) => l.slice(0, 12)).join(' | '))
+  check('两个数分开说：带字段的 26 张、只提供了表名的 206 张', r2?.title === '参考了 26 张表的字段'
+    && r2.sub === '「big」未能按需求挑选，另有 206 张表只提供了表名', `${r2?.title} / ${r2?.sub}`)
   // 探查结构截断了（每个数据源最多取 200 张表）：total 是数据库里的总数，explored 是探查到的
   const partial = mod.copilotContext({ op: 'context', sources: [
     { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 },

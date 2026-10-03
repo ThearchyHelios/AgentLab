@@ -2,7 +2,7 @@ import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, 
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally,
+  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
@@ -2665,24 +2665,38 @@ function contextLine(g: CopilotContextSource): string {
  * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
  */
 export function copilotContext(op: CopilotOp): { title: string; sub?: string; detail: string; ms?: number } | null {
-  const groups = contextSources(op)
+  // 展开区里按需求挑过表的库排在前面：请求里点名的那个库往往就是它，排在一串小库后面得在内层滚动框里翻才看得到
+  const order: Record<CopilotContextSource['selectedBy'], number> = { model: 0, all: 1, fallback: 2 }
+  const groups = contextSources(op).map((g, i) => ({ g, i }))
+    .sort((a, b) => order[a.g.selectedBy] - order[b.g.selectedBy] || a.i - b.i).map((x) => x.g)
   if (!groups.length) return null
+  // 两个数分开说：带着全部字段的表（count），和只提供了表名的表（namesOnly：没挑成的库、一张没挑中的库）。
+  // 以前标题只写前者，「参考了 26 张表」看不出另有 206 张只给了表名
   const count = groups.reduce((n, g) => n + g.tables.length, 0)
+  const namesOnly = groups.reduce((n, g) => n + namesOnlyOf(g), 0)
   const failed = groups.filter((g) => g.selectedBy === 'fallback')
   // 有表带着字段（小库，或者现有工作流用到的表）时标题仍说几张，没挑成的事放副标题
+  const who = failed.length && failed.length < groups.length ? `「${failed.map((g) => g.source).join('」「')}」` : ''
   const sub = count && failed.length
-    ? failed.length === groups.length ? CONTEXT_FALLBACK_TEXT
-      : `「${failed.map((g) => g.source).join('」「')}」${CONTEXT_FALLBACK_TEXT}`
-    : undefined
+    ? namesOnly ? `${who}${COPILOT_CONTEXT_TEXT.notPicked}，${COPILOT_CONTEXT_TEXT.namesOnly(namesOnly)}` : `${who}${CONTEXT_FALLBACK_TEXT}`
+    : count && namesOnly ? COPILOT_CONTEXT_TEXT.namesOnly(namesOnly) : undefined
   const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
   // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
   const ms = num(op.elapsed_ms)
   return {
-    title: count ? `参考了 ${count} 张表` : CONTEXT_FALLBACK_TEXT,
+    title: count ? (namesOnly ? COPILOT_CONTEXT_TEXT.withFields(count) : `参考了 ${count} 张表`) : CONTEXT_FALLBACK_TEXT,
     ...(sub ? { sub } : {}),
     detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
     ...(ms != null && ms >= 10 ? { ms } : {}),
   }
+}
+
+/** 这个库里只提供了表名、没带字段的表有几张（模型看得到的那些：探查截断了的按探查到的算） */
+function namesOnlyOf(g: CopilotContextSource): number {
+  const seen = g.explored ?? g.total
+  if (seen == null) return 0
+  if (g.selectedBy === 'fallback' || (g.selectedBy === 'model' && !g.tables.length)) return Math.max(0, seen - g.tables.length)
+  return 0
 }
 
 /** 用了限定范围之外的数据源：自查交回模型改也改不掉时，人要知道是范围的事，不是图写错了 */
