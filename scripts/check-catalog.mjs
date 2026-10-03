@@ -761,6 +761,33 @@ await section('数据目录 · 起草', async () => {
   check('……写出用的是哪个模型', (await draftBox(page).innerText()).includes('模型：check-model'))
   await page.locator('[data-draft-close]').click()
 
+  // 一项都没写进去：只有「模型给了内容、只是和现有目录一致」才说「没有变化」，模型没给出内容要说「目录没有更新」
+  const emptyReply = ({ items, modelError }) => (route, ctx) => json({
+    tables: ctx.body.tables.map((n) => ({ table_name: n, added: 0, updated: 0, removed: 0, version: 1, error: null,
+      model_error: modelError, model_items: items })),
+    total: { added: 0, updated: 0, removed: 0 }, model_used: true, model: 'check-model', model_error: null,
+  })(route)
+  const draftOnce = async (reply) => {
+    replies.draft.push(reply, reply)
+    await page.locator('[data-catalog-draft]').first().click()
+    await draftBox(page).locator('[data-draft-model] input').check()
+    await page.locator('[data-draft-start]').click()
+    await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 8000)
+    const summary = await draftBox(page).locator('[data-draft-summary]').innerText()
+    const notice = await draftBox(page).locator('[data-draft-table-model-errors]').innerText().catch(() => '')
+    await page.locator('[data-draft-close]').click()
+    return { summary, notice }
+  }
+  const noContent = await draftOnce(emptyReply({ items: null, modelError: '模型没有给出这张表的可用内容' }))
+  check('模型没给出内容（每张表记 model_error）：不说「没有变化」，说「目录没有更新」并列出原因',
+    noContent.summary === '目录没有更新：模型没有给出可用的内容，原因见下方' && noContent.notice.includes('模型没有给出这张表的可用内容'),
+    JSON.stringify(noContent))
+  const zeroItems = await draftOnce(emptyReply({ items: 0, modelError: null }))
+  check('……模型一项可用内容都没给（model_items 都是 0）：同样不说「没有变化」', zeroItems.summary === '目录没有更新：模型没有给出可用的内容，原因见下方',
+    JSON.stringify(zeroItems))
+  const same = await draftOnce(emptyReply({ items: 3, modelError: null }))
+  check('……模型给了内容、只是和现有目录一致：才说「没有变化」', same.summary === '没有变化：起草出的内容与现有目录一致', JSON.stringify(same))
+
   // 中途停止：当前这一批做完后不再发下一批
   replies.draft.push(async (route, ctx) => { await sleep(900); return draftReply(state)(route, ctx) })
   await page.locator('[data-catalog-draft]').first().click()

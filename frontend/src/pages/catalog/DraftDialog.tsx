@@ -36,12 +36,28 @@ interface Outcome {
   model: string | null
   failure: string | null
   stopped: boolean
+  /** 这一次勾了「用模型起草」 */
+  modelAsked: boolean
+  /** 模型给了可用内容（model_items > 0）的表有几张；服务端没给 model_items（老服务端）时 modelItemsKnown 为假 */
+  modelItems: number
+  modelItemsKnown: boolean
 }
 
-const fresh = (total: number): Outcome => ({
+const fresh = (total: number, modelAsked = false): Outcome => ({
   done: 0, total, added: 0, updated: 0, removed: 0, tableErrors: [], modelErrors: [], modelSkipped: null, model: null,
-  failure: null, stopped: false,
+  failure: null, stopped: false, modelAsked, modelItems: 0, modelItemsKnown: false,
 })
+
+/**
+ * 一项都没写进去时怎么说。「没有变化」只在确实是「起草出了内容、和现有目录一致」时说：有表没起草、模型在某些表上
+ * 没给出内容（model_error），或者勾了用模型、却没有一张表拿到模型的可用内容（模型整体用不了、model_items 都是 0），
+ * 都说「目录没有更新」，原因写在下面
+ */
+function nothingWrittenText(out: Outcome): string {
+  const failed = out.modelErrors.length > 0 || out.tableErrors.length > 0
+  const modelEmpty = out.modelAsked && (!!out.modelSkipped || (out.modelItemsKnown && out.modelItems === 0))
+  return failed || modelEmpty ? CT.draftNothingWritten : CT.draftNoChange
+}
 
 export function DraftDialog({ sourceId, rows, visible, selected, filtered, onClose, onDrafted }: {
   sourceId: string
@@ -81,7 +97,7 @@ export function DraftDialog({ sourceId, rows, visible, selected, filtered, onClo
     stopRef.current = false
     setStopping(false)
     setPhase('running')
-    const acc = fresh(tables.length)
+    const acc = fresh(tables.length, useModel)
     setOut({ ...acc })
     const touched: string[] = []
     let withModel = useModel
@@ -96,6 +112,8 @@ export function DraftDialog({ sourceId, rows, visible, selected, filtered, onClo
         acc.removed += r.total.removed
         acc.tableErrors.push(...r.tables.filter((t) => t.error))
         acc.modelErrors.push(...r.tables.filter((t) => !t.error && t.model_error))
+        acc.modelItems += r.tables.filter((t) => !t.error && (t.model_items ?? 0) > 0).length
+        if (r.tables.some((t) => t.model_items !== undefined)) acc.modelItemsKnown = true
         if (r.model) acc.model = r.model
         // 模型整体用不了（没配置、已停用……）：后面的批次不再请模型，免得每批都撞一次同样的错
         if (withModel && r.model_error && !r.model_used) { acc.modelSkipped = r.model_error; withModel = false }
@@ -181,7 +199,7 @@ export function DraftDialog({ sourceId, rows, visible, selected, filtered, onClo
             </div>
             <p className="tnum text-sm" data-draft-summary="">
               {out.added + out.updated + out.removed === 0 && phase === 'done' && !out.failure
-                ? CT.draftNoChange
+                ? nothingWrittenText(out)
                 : CT.draftSummary(out.added, out.updated, out.removed)}
             </p>
             {out.model && <p className="text-2xs text-faint">{CT.draftModelUsed(out.model)}</p>}
