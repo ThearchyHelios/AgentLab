@@ -310,6 +310,7 @@ function ToastCard({ item }: { item: ToastItem }) {
     <div
       className="fade-up pointer-events-auto flex items-start gap-2 rounded-lg border bg-panel px-3 py-2 shadow-elev-2"
       style={{ borderColor: item.kind === 'error' ? 'var(--err)' : item.kind === 'warn' ? 'var(--warn)' : 'var(--border)' }}
+      data-toast={item.kind}
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
       onFocus={() => setPaused(true)}

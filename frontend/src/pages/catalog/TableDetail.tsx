@@ -12,12 +12,14 @@ import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber } from '../../lib/format'
 import {
   CATALOG_CARDINALITY_LABEL, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT, CATALOG_TABLE_FIELD_LABEL,
-  CATALOG_TEXT as CT,
+  CATALOG_TEXT as CT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CountBadges, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
 import type { ReviewTarget } from './parts'
-import { ColumnTable, Value } from './ColumnTable'
+import { ColumnTable, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
+import { CodesDialog } from './CodesDialog'
+import { coverageText } from './profile'
 import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
   relationDraft, relationPath, tablePath, unknownKeys, validateForm,
@@ -48,13 +50,15 @@ const PROBLEM_TEXT = {
 type Editing = { initial: EditForm; form: EditForm }
 type Conflict = 'edit' | 'review'
 
-export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen, onBack, onDetail }: {
+export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, next, onOpen, onBack, onDetail }: {
   sourceId: string
   table: string
   /** 全部表：关联关系的目标表能点就跳过去，编辑时给目标表做候选 */
   rows: CatalogTableRow[]
   /** 起草刚写进了这些表：正在看的表在里面、又没在编辑，就重新载入 */
   drafted: { seq: number; tables: Set<string> }
+  /** 从剖析报告点「填写含义」过来：载入后打开这一列的码值弹窗（seq 让同一列连点两次也会再开） */
+  fillCodes?: { table: string; column: string; seq: number } | null
   prev: string | null
   next: string | null
   onOpen: (table: string) => void
@@ -72,6 +76,8 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
   const [live, setLive] = useState('')
   const [colQuery, setColQuery] = useState('')
   const [onlyPending, setOnlyPending] = useState(false)
+  /** 正在填写哪一列的码值含义 */
+  const [codesFor, setCodesFor] = useState<string | null>(null)
   const loadSeq = useRef(0)
   const onDetailRef = useRef(onDetail)
   onDetailRef.current = onDetail
@@ -100,6 +106,7 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
     setColQuery('')
     setOnlyPending(false)
     setLive('')
+    setCodesFor(null)
     void load()
   }, [load])
 
@@ -113,6 +120,15 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
     draftSeen.current = drafted.seq
     if (drafted.tables.has(table) && !editingRef.current) void load()
   }, [drafted, table, load])
+
+  // 剖析报告里点了「填写含义」：这张表载入后打开那一列的码值弹窗。编辑中不打开，免得同一项两处同时改
+  const fillSeen = useRef(0)
+  useEffect(() => {
+    if (!fillCodes || fillCodes.table !== table || fillCodes.seq === fillSeen.current) return
+    if (!detail || detail.table_name !== table || editingRef.current) return
+    fillSeen.current = fillCodes.seq
+    if (detail.notes.columns?.[fillCodes.column]?.codes) setCodesFor(fillCodes.column)
+  }, [fillCodes, table, detail])
 
   const changes = edit ? changeCount(edit.initial, edit.form) : 0
   const problems = useMemo(() => (edit ? validateForm(edit.form, PROBLEM_TEXT) : {}), [edit])
@@ -161,6 +177,41 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
     const done = await write(`column:${col}`, () => api.dataCatalog.put(sourceId, table, notes, d.version))
     if (done) setLive(CT.confirmedN(n))
   }, [sourceId, table, write])
+
+  const fillCodesOf = useCallback((col: string) => setCodesFor(col), [])
+
+  /**
+   * 填好的码值含义整份提交：只换这一列码值的值，服务端记为人工填写、已确认。别人刚改过（409）时收起弹窗、挂冲突横幅；
+   * 其余失败弹窗留着，填的字不丢
+   */
+  const saveCodes = useCallback(async (col: string, value: Record<string, string>) => {
+    const d = detailRef.current
+    const item = d?.notes.columns?.[col]?.codes
+    if (!d || !item) return
+    const notes = structuredClone(d.notes)
+    notes.columns![col] = { ...notes.columns![col], codes: { ...item, value } }
+    setBusy(`codes:${col}`)
+    setWriteError(null)
+    try {
+      const next = await api.dataCatalog.put(sourceId, table, notes, d.version)
+      setDetail(next)
+      setConflict(null)
+      onDetailRef.current(next)
+      setCodesFor(null)
+      const filled = Math.max(0, pendingCodes(item.value) - pendingCodes(value))
+      toast.ok(KT.saved(filled))
+      setLive(KT.saved(filled))
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        setCodesFor(null)
+        setConflict('review')
+      } else {
+        toast.error(e)
+      }
+    } finally {
+      setBusy('')
+    }
+  }, [sourceId, table])
 
   const setColumn = useCallback((col: string, f: ColumnField, v: string) => {
     setEdit((e) => e && ({ ...e, form: { ...e.form, columns: { ...e.form.columns, [col]: { ...e.form.columns[col], [f]: v } } } }))
@@ -367,7 +418,7 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
               ? (
                 <ColumnTable columns={shownColumns} form={edit?.form.columns ?? null} initial={edit?.initial.columns ?? null}
                              problems={problems} busy={!!busy} systemNotes={detail.system_notes}
-                             onReview={review} onConfirmColumn={confirmColumn} onChange={setColumn} />
+                             onReview={review} onConfirmColumn={confirmColumn} onFillCodes={fillCodesOf} onChange={setColumn} />
               )
               : <p className="rounded-lg border px-3 py-6 text-center text-xs text-faint">{CT.noColumns}</p>}
           </section>
@@ -384,6 +435,11 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
           </section>
         </div>
       </div>
+
+      {codesFor && notes.columns?.[codesFor]?.codes && (
+        <CodesDialog column={codesFor} item={notes.columns[codesFor]!.codes!} saving={busy === `codes:${codesFor}`}
+                     onSave={(v) => void saveCodes(codesFor, v)} onClose={() => setCodesFor(null)} />
+      )}
 
       {edit && (
         <footer className="flex flex-wrap items-center gap-2 border-t bg-panel px-4 py-2.5" data-catalog-edit-bar="">
@@ -588,7 +644,9 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
                 <td className={clsx('mono px-2 py-1.5 align-top', rejected && 'text-faint line-through')}>{r.to_columns.join(', ')}</td>
                 <td className="px-2 py-1.5 align-top">{r.cardinality ? CATALOG_CARDINALITY_LABEL[r.cardinality] : <span className="text-faint">{CT.cardinalityNone}</span>}</td>
                 <td className="tnum px-2 py-1.5 align-top">
-                  {typeof r.coverage === 'number' ? CT.coverageValue(Math.round(r.coverage * 100)) : <span className="text-faint">—</span>}
+                  {typeof r.coverage === 'number'
+                    ? <span data-relation-coverage={r.coverage}>{coverageText(r.coverage)}</span>
+                    : <span className="text-faint">—</span>}
                 </td>
                 <td className="px-2 py-1.5 align-top">
                   <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, updated_at: r.updated_at }}

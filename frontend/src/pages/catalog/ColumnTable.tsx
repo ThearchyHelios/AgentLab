@@ -1,13 +1,13 @@
 import { memo } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, CheckCheck, Lock } from 'lucide-react'
+import { AlertTriangle, CheckCheck, Lock, PencilLine } from 'lucide-react'
 import clsx from 'clsx'
 import type {
   CatalogColumnNotes, CatalogItem, CatalogMeasure, CatalogReviewAction, CatalogStructureColumn,
 } from '../../types'
 import { IconButton } from '../../components/ui'
 import {
-  CATALOG_COLUMN_FIELD_LABEL, CATALOG_MEASURE_HINT, CATALOG_MEASURE_LABEL, CATALOG_TEXT as CT,
+  CATALOG_COLUMN_FIELD_LABEL, CATALOG_MEASURE_HINT, CATALOG_MEASURE_LABEL, CATALOG_TEXT as CT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { ItemMark } from './parts'
 import type { ReviewTarget } from './parts'
@@ -32,7 +32,7 @@ export interface ColumnModel {
 
 type ColumnTexts = Partial<Record<ColumnField, string>>
 
-export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onChange }: {
+export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange }: {
   columns: ColumnModel[]
   /** 编辑中：列名 → 字段 → 文字（form 是当前的，initial 是进入编辑时的）；不在编辑时为 null */
   form: Record<string, ColumnTexts> | null
@@ -44,6 +44,8 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   systemNotes: boolean
   onReview: (target: ReviewTarget, action: CatalogReviewAction) => void
   onConfirmColumn: (col: string) => void
+  /** 码值里有含义空着的：打开逐个填写含义的弹窗 */
+  onFillCodes: (col: string) => void
   onChange: (col: string, field: ColumnField, value: string) => void
 }) {
   return (
@@ -66,7 +68,7 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
         <tbody>
           {columns.map((c) => (
             <ColumnRow key={c.name} col={c} editing={!!form} draft={form?.[c.name]} initial={initial?.[c.name]} problems={problems} busy={busy}
-                       systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onChange={onChange} />
+                       systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onFillCodes={onFillCodes} onChange={onChange} />
           ))}
         </tbody>
       </table>
@@ -74,7 +76,7 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   )
 }
 
-const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onChange }: {
+const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange }: {
   col: ColumnModel
   editing: boolean
   /** 这一列的表单。只有改了这一列时引用才会变，别的行不重画 */
@@ -85,6 +87,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
   systemNotes: boolean
   onReview: (target: ReviewTarget, action: CatalogReviewAction) => void
   onConfirmColumn: (col: string) => void
+  onFillCodes: (col: string) => void
   onChange: (col: string, field: ColumnField, value: string) => void
 }) {
   const { name, structure, items } = col
@@ -166,7 +169,10 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
       )}
       {cell(
         'codes',
-        <Value item={codes} render={(v) => <Codes value={v as Record<string, string>} />} />,
+        <Value item={codes} render={(v) => (
+          <Codes value={v as Record<string, string>} label={KT.fillLabel(name)}
+                 onFill={codes?.status !== 'rejected' && !busy ? () => onFillCodes(name) : undefined} />
+        )} />,
         <textarea className="field mono !min-h-0 !px-1.5 !py-1 !text-2xs" rows={Math.min(4, Math.max(1, (draft?.codes ?? '').split('\n').length))}
                   value={draft?.codes ?? ''}
                   placeholder={codes?.status === 'rejected' ? CT.rejectedPlaceholder(codesInline(codes.value)) : CT.codesPlaceholder}
@@ -183,7 +189,8 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     </tr>
   )
 }, (a, b) => a.col === b.col && a.editing === b.editing && a.draft === b.draft && a.initial === b.initial && a.busy === b.busy
-  && a.systemNotes === b.systemNotes && a.onReview === b.onReview && a.onConfirmColumn === b.onConfirmColumn && a.onChange === b.onChange
+  && a.systemNotes === b.systemNotes && a.onReview === b.onReview && a.onConfirmColumn === b.onConfirmColumn && a.onFillCodes === b.onFillCodes
+  && a.onChange === b.onChange
   // 格式问题每次都是新对象：只比这一列的几格
   && COLUMN_FIELDS.every((f) => a.problems[`c:${a.col.name}:${f}`] === b.problems[`c:${b.col.name}:${f}`]))
 
@@ -195,17 +202,33 @@ export function Value<T>({ item, render }: { item: CatalogItem<T> | undefined; r
   return <span className={clsx(item.status === 'rejected' && 'text-faint line-through')}>{render(item.value)}</span>
 }
 
-function Codes({ value }: { value: Record<string, string> }) {
+/** 含义还空着的码值个数（数据剖析给的码值候选只有取值，含义等人填） */
+export const pendingCodes = (v: Record<string, string> | undefined): number =>
+  Object.values(v ?? {}).filter((x) => !String(x ?? '').trim()).length
+
+function Codes({ value, label, onFill }: { value: Record<string, string>; label: string; onFill?: () => void }) {
   const entries = Object.entries(value)
+  const pending = pendingCodes(value)
   return (
-    <span className="flex flex-wrap gap-1" title={entries.map(([k, v]) => `${k}=${v}`).join('\n')}>
-      {entries.slice(0, CODES_SHOWN).map(([k, v]) => (
-        <span key={k} className="inline-flex max-w-full items-center gap-1 rounded border bg-bg px-1 text-2xs">
-          <span className="mono text-dim">{k}</span>
-          <span className="truncate">{v}</span>
-        </span>
-      ))}
-      {entries.length > CODES_SHOWN && <span className="text-2xs text-faint">+{entries.length - CODES_SHOWN}</span>}
+    <span className="block">
+      <span className="flex flex-wrap gap-1" title={entries.map(([k, v]) => `${k}=${v.trim() || KT.pending}`).join('\n')}>
+        {entries.slice(0, CODES_SHOWN).map(([k, v]) => (
+          <span key={k} className="inline-flex max-w-full items-center gap-1 rounded border bg-bg px-1 text-2xs" data-code={k}>
+            <span className="mono text-dim">{k}</span>
+            {v.trim()
+              ? <span className="truncate">{v}</span>
+              : <span className="truncate" style={{ color: 'var(--st-waiting)' }} data-code-pending="">{KT.pending}</span>}
+          </span>
+        ))}
+        {entries.length > CODES_SHOWN && <span className="text-2xs text-faint">+{entries.length - CODES_SHOWN}</span>}
+      </span>
+      {pending > 0 && onFill && (
+        // 各码值的「含义待填写」已经写在上面，这里只给入口；几个待填写写在悬停里
+        <button type="button" className="mt-1 inline-flex items-center gap-1 whitespace-nowrap rounded px-1 text-2xs text-dim underline decoration-dotted underline-offset-2 hover:text-fg"
+                onClick={onFill} aria-label={label} title={KT.pendingN(pending)} data-codes-fill={pending}>
+          <PencilLine size={10} aria-hidden /> {KT.fill}
+        </button>
+      )}
     </span>
   )
 }

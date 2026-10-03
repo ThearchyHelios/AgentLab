@@ -148,6 +148,20 @@ const ASK = {
   edges: chain('in', 'fetch', 'done'),
 }
 
+/**
+ * 调用工具节点里写死的 SQL 对照数据目录查出了问题（数据目录阶段 4B）：门禁的问题 code 是规则编号，field 是 args.sql。
+ * 参数里 sql 不在第一行，定位要在 JSON 里找到这个键
+ */
+const SQLWF = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('sum', 'tool', 240, '订单汇总', { tool: 'db_query__shop', args: { limit: 500, timeout: 30,
+      sql: 'SELECT o.region, SUM(o.amount) AS amt\nFROM orders o JOIN order_items i ON i.order_id = o.id\nGROUP BY o.region' } }),
+    node('done', 'output', 480, '成果', { fields: [{ name: 'table', value: '{{ nodes.sum.output }}' }] }),
+  ],
+  edges: chain('in', 'sum', 'done'),
+}
+
 const wf = (id, name, graph, extra = {}) => ({
   id, name, description: '检查脚本伪造的工作流', graph, tags: [], version: 3, is_template: false,
   status: 'draft', published_version: null, published_by: null, run_count: 0,
@@ -164,6 +178,7 @@ const FAKES = {
   'pf-defs': wf('pf-defs', '__publish_check_defaults__', { ...EASY, defaults: { approval: 'always', model: 'demo-model' } }),
   'pf-legacy': wf('pf-legacy', '__upgrade_check_legacy__', LEGACY, { status: 'published', published_version: 3 }),
   'pf-ask': wf('pf-ask', '__upgrade_check_ask__', ASK),
+  'pf-sql': wf('pf-sql', '__publish_check_sql__', SQLWF),
 }
 
 const clone = (x) => JSON.parse(JSON.stringify(x))
@@ -199,6 +214,11 @@ function lint(graph, level, { followsNever = false } = {}) {
   }
   for (const n of graph.nodes) {
     const c = n.data.config ?? {}
+    // 基于数据目录的 SQL 检查（governance._lint_sql）：错误级在受管档是硬性问题，已发布档只提示；没有确定性的修复
+    if (n.type === 'tool' && /JOIN order_items/i.test(c.args?.sql ?? '')) {
+      issues.push({ level: hard ? 'error' : 'warning', node_id: n.id, code: 'fanout_sum', fix: null, field: 'args.sql',
+        message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联' })
+    }
     if (followsNever && n.type === 'agent' && !c.approval && (c.tools ?? []).length) {
       const id = 'governed.default_approval_never:graph'
       issues.push({ level: hard ? 'error' : 'warning', node_id: n.id, code: 'governed.default_approval_never', fix: id, field: 'approval',
@@ -804,6 +824,44 @@ await section('问题面板的发布前检查：选档、同一套修法、点�
   check('面板里也不发布', state.publishes.length === 0)
   await page.locator('[data-problems-mode="lint"]').click()
   check('切回「校验」照旧是原来的问题清单', await page.locator('[data-preflight="panel"]').count() === 0)
+})
+
+await section('SQL 检查（数据目录阶段 4B）：发布前检查写中文规则名，点一条定位到调用工具参数里的 SQL', async () => {
+  const { page, state, errors } = await open({ id: 'pf-sql' })
+  await openDialog(page)
+  const row = dialog(page).locator('[data-preflight-issue="fanout_sum"]')
+  await row.waitFor()
+  const text = await row.innerText()
+  check('发布弹窗：SQL 检查的问题写节点名和中文规则名，不露规则编号', text.includes('「订单汇总」') && text.includes('一对多关联后重复计算：')
+    && text.includes('会重复计算') && !/fanout_sum|args\.sql/.test(text), text)
+  await shoot(page, 'preflight-sqlcheck', dialog(page))
+  await row.locator('button').first().click()
+  const where = () => page.evaluate(() => {
+    const box = document.querySelector('[data-inspector-sheet] [data-field="args"] textarea')
+    const line = box ? box.value.slice(0, box.value.indexOf('"sql"')).split('\n').length - 1 : -1
+    const height = box ? parseFloat(getComputedStyle(box).lineHeight) || 16 : 16
+    return { sel: window.__studio.getState().selectedId, field: !!box, line, top: box?.scrollTop ?? -1, visible: box ? box.scrollTop <= line * height : false }
+  })
+  check('点一条：弹窗关掉，选中节点并翻到「参数」，框内滚到 sql 那一行', await waitFor(page, async () => {
+    const w = await where()
+    return w.sel === 'sum' && w.field && w.line > 0 && w.visible
+  }) && await dialog(page).count() === 0, JSON.stringify(await where()))
+  // 问题面板的发布前检查：同一个落点
+  await page.evaluate(() => window.__studio.getState().select(null))
+  await page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } })
+  await page.keyboard.press('Alt+KeyP')
+  await page.locator('#dock-problems').waitFor()
+  await page.locator('[data-problems-mode="publish"]').click()
+  const panelRow = page.locator('[data-preflight="panel"] [data-preflight-issue="fanout_sum"]')
+  await panelRow.waitFor()
+  check('问题面板的发布前检查：同样写中文规则名', (await panelRow.innerText()).includes('一对多关联后重复计算：'))
+  await panelRow.locator('button').first().click()
+  check('……点一条同样落到「参数」里的 SQL', await waitFor(page, async () => {
+    const w = await where()
+    return w.sel === 'sum' && w.field && w.visible
+  }), JSON.stringify(await where()))
+  check('没有发布、没有保存', state.publishes.length === 0 && state.patches.length === 0)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
 })
 
 await section('同一个修复只画一次：validate 和门禁各报一条、几条问题共用一个图级修复', async () => {

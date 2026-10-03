@@ -13,6 +13,7 @@ import { useCatalog } from '../store/catalog'
 import { Modal, Spinner, toast, useRadioGroup } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
 import { setLocalActor, useLocalActor } from '../lib/actor'
 import {
   autoFixIds, choiceReady, contentSig, fixFieldLabel, fixFor, fixValueLines, fixValueText, isMissingEndpoint, mergeIssues,
@@ -42,7 +43,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   workflow: Workflow
   onClose: () => void
   onDone: () => void
-  onLocate: (nodeId: string) => void
+  /** 定位一条问题：选中节点，能落到具体配置项（调用工具的 SQL）就落到那一项 */
+  onLocate: (issue: ValidationIssue) => void
 }) {
   const load = useStudio((s) => s.load)
   const dirty = useStudio((s) => s.dirty)
@@ -208,7 +210,7 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
       </dl>
 
       <div className="mt-3" data-preflight="dialog">
-        <Preflight pf={pf} gate={gate} onLocate={(issue) => { if (issue.node_id) { onLocate(issue.node_id); onClose() } }} />
+        <Preflight pf={pf} gate={gate} onLocate={(issue) => { if (issue.node_id) { onLocate(issue); onClose() } }} />
       </div>
     </Modal>
   )
@@ -564,6 +566,8 @@ function PreflightRow({ issue, others, fix, where, pf, onLocate }: {
               aria-label={err ? '错误' : '提示'} />
         <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
           {where && !String(issue.message).includes(`「${where}」`) && <b className="font-semibold">「{where}」</b>}
+          {/* 对照数据目录的 SQL 检查：先写中文规则名，不露规则编号 */}
+          {isSqlCheckCode(issue.code) && <span className="font-medium" data-preflight-rule="">{sqlRuleLabel(issue.code)}：</span>}
           {issue.message}
         </span>
         {issue.node_id && <CornerDownRight size={10} className="mt-px shrink-0 text-faint" aria-hidden />}

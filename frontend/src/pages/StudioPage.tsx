@@ -14,7 +14,7 @@ import { LineageLayer } from '../canvas/LineageLayer'
 import { VersionsSheet } from '../canvas/VersionsSheet'
 import { PublishDialog } from '../canvas/PublishDialog'
 import { WorkflowPicker, confirmDiscard, createWorkflow, takeDiscarded } from '../canvas/WorkflowPicker'
-import { problemsOf, type Problem } from '../canvas/issues'
+import { fieldOfIssue, problemsOf, type Problem } from '../canvas/issues'
 import { STUDIO_SHORTCUTS, hintOf, studioShortcut, type StudioShortcutId } from '../canvas/shortcuts'
 import { AssistantPanel } from '../run/AssistantPanel'
 import { copilotProgress } from '../run/Composer'
@@ -620,7 +620,12 @@ export function StudioPage() {
       {publishing && workflow && (
         <PublishDialog workflow={workflow} onClose={() => setPublishing(false)}
                        onDone={() => { setPublishing(false); void refresh() }}
-                       onLocate={(id) => { select(id); focusNode(id) }} />
+                       onLocate={(issue) => {
+                         // 和问题面板同一个落点：选中节点、取景，问题落在某一项配置上（调用工具的 SQL）就翻到那一项
+                         if (!issue.node_id) return
+                         const node = useStudio.getState().nodes.find((n) => n.id === issue.node_id)
+                         revealField(issue.node_id, fieldOfIssue(issue, node))
+                       }} />
       )}
     </div>
   )

@@ -18,7 +18,7 @@ import {
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
@@ -29,6 +29,7 @@ import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
+import { SqlCheckList } from './SqlChecks'
 
 /**
  * 证据面板：点开报告里的一个片段，看它从哪来。
@@ -1109,6 +1110,9 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   // 拿截断的查询结果整组算出来的：值是真的算出来的，但只算到了取回的那部分，出具已按缺口降档
   const incomplete = step?.incomplete === true || entry?.incomplete === true
   const incompleteReason = step?.incomplete_reason || entry?.incomplete_reason || EVIDENCE_TEXT.incompleteFallback
+  // 所依据的查询对照数据目录查出了错误级的问题：值照算，结果不可靠，出具同样按缺口降档。问题和改法在查询步骤里
+  const sqlFailed = step?.sql_check_failed === true || entry?.sql_check_failed === true
+  const sqlReason = step?.sql_check_reason || entry?.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback
 
   return (
     <Part title={EVIDENCE_TEXT.metric} data-ev-metric="">
@@ -1119,6 +1123,12 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
           <span className="chip" data-ev-incomplete="" title={incompleteReason}
                 style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
             {EVIDENCE_TEXT.incomplete}
+          </span>
+        )}
+        {sqlFailed && (
+          <span className="chip" data-ev-sql-check-failed="" title={sqlReason}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.sqlCheckFailed}
           </span>
         )}
       </div>
@@ -1138,6 +1148,9 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
       {missing && <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing="">{EVIDENCE_TEXT.missingValue}</p>}
       {incomplete && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-incomplete-reason="">{incompleteReason}</p>
+      )}
+      {sqlFailed && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-sql-check-reason="">{sqlReason}</p>
       )}
       {unshowable && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-unshowable="">
@@ -1365,6 +1378,13 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
              data-ev-sql="">
           {step.sql}
         </pre>
+      )}
+      {!!step.checks?.length && (
+        // 这次查询对照数据目录查出的问题：说明、涉及的表和列、SQL 片段。没查出问题时接口不给这个键
+        <div className="mb-1.5" data-ev-sql-checks="">
+          <div className="mb-0.5 text-2xs text-faint">{SQL_CHECK_TEXT.title}</div>
+          <SqlCheckList checks={step.checks} />
+        </div>
       )}
       {!!step.merge?.warnings.length && (
         <div className="mb-1.5 text-2xs" data-ev-merge-warnings="">

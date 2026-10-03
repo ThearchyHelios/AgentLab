@@ -1564,6 +1564,65 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   await page.evaluate(() => window.__studio.getState().select(null))
   await page.waitForTimeout(200)
 
+  // 对照数据目录的 SQL 检查（数据目录阶段 4B）：自查没修好的错误、不挡运行的提醒各一组，写中文规则名、级别、表和列、
+  // SQL 片段，不露规则编号；「定位」落到调用工具参数里的 SQL，光标放在 sql 的值开头
+  const SQL = 'SELECT o.region, SUM(o.amount) AS amt\nFROM orders o JOIN order_items i ON i.order_id = o.id\nGROUP BY o.region'
+  await page.evaluate((sql) => {
+    const st = window.__studio.getState()
+    window.__studio.setState({ nodes: [...st.nodes, { id: 'fetch', type: 'card', position: { x: 620, y: 200 },
+      data: { nodeType: 'tool', label: '订单汇总', config: { tool: 'db_query__shop', args: { limit: 100, sql } } } }] })
+  }, SQL)
+  const sqlErr = { level: 'error', node_id: 'fetch', edge_id: null, field: 'args.sql', code: 'fanout_sum', table: 'orders', column: 'amount',
+    sql_excerpt: 'SUM(o.amount)', message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联' }
+  const sqlWarn = { level: 'warning', node_id: 'fetch', edge_id: null, field: 'args.sql', code: 'missing_valid_filter', table: 'orders',
+    message: '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选' }
+  await page.evaluate(([err, warn]) => window.__studio.setState({ copilotTurns: [{ explanation: '', error: '', phase: 'done', id: 'u8',
+    instruction: '按地区汇总订单金额', outcome: 'applied', diff: { added: ['fetch'], changed: [], removed: [], total: 1 },
+    ops: [{ op: 'add_node', node: { id: 'fetch', type: 'tool', data: { label: '订单汇总' } } },
+      { op: 'check', status: 'repairing', round: 1, issues: [err] },
+      { op: 'check', status: 'failed', issues: [err] },
+      { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'fetch' }] }, issues: [err, warn] }] }] }), [sqlErr, sqlWarn])
+  await page.waitForTimeout(400)
+  const blocking = page.locator('[data-issue-list=""] [data-issue-code="fanout_sum"]')
+  const blockingText = await blocking.innerText().catch(() => '')
+  check('自查没修好的 SQL 问题：级别、中文规则名、涉及的表和列、说明、SQL 片段', blockingText.includes('错误') && blockingText.includes('一对多关联后重复计算')
+    && blockingText.includes('orders.amount') && blockingText.includes('会重复计算') && blockingText.includes('SUM(o.amount)')
+    && blockingText.includes('「订单汇总」'), blockingText.replace(/\s+/g, ' '))
+  const notes = page.locator('[data-issue-list="sql"]')
+  const notesText = await notes.innerText().catch(() => '')
+  check('不挡运行的提醒单列一组「SQL 检查」，没修好的错误不重复', notesText.startsWith('SQL 检查') && notesText.includes('提醒')
+    && notesText.includes('未筛选有效记录') && !notesText.includes('一对多关联后重复计算'), notesText.replace(/\s+/g, ' '))
+  const panelText = await page.locator('[data-assistant-panel]').innerText()
+  check('助手面板不露规则编号', !/fanout_sum|missing_valid_filter|args\.sql/.test(panelText))
+  const sqlRow = page.locator('[data-turn="u8"] [data-step-code="sql_check"]')
+  check('过程里有一行「SQL 检查：1 处提醒」', (await sqlRow.innerText().catch(() => '')).includes('SQL 检查：1 处提醒'),
+    await page.locator('[data-turn="u8"]').innerText().then((t) => t.replace(/\s+/g, ' ').slice(0, 240)))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-sqlcheck-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await blocking.getByRole('button', { name: /定位/ }).click()
+  await page.waitForTimeout(600)
+  const sqlFocus = await page.evaluate((sql) => {
+    const a = document.activeElement
+    const at = a instanceof HTMLTextAreaElement ? a.selectionStart : -1
+    return { sel: window.__studio.getState().selectedId, tag: a?.tagName ?? null,
+             field: a?.closest('[data-inspector-sheet] [data-field]')?.getAttribute('data-field') ?? null,
+             atSql: at >= 0 && (a.value.slice(at).startsWith(sql.split('\n')[0]) || a.value.slice(at).startsWith(JSON.stringify(sql).slice(1, 30))) }
+  }, SQL)
+  check('定位 SQL 检查的问题：打开调用工具的设置，光标落在「参数」里 sql 的值开头', sqlFocus.sel === 'fetch' && sqlFocus.field === 'args'
+    && sqlFocus.tag === 'TEXTAREA' && sqlFocus.atSql, JSON.stringify(sqlFocus))
+  await page.evaluate(() => {
+    const st = window.__studio.getState()
+    st.select(null)
+    window.__studio.setState({ copilotTurns: [], nodes: st.nodes.filter((n) => n.id !== 'fetch') })
+  })
+  await page.waitForTimeout(200)
+
   // 模型把工具调用写成文字、判失败：报错和提醒行给「打开『数据查询』的设置」，点了就是那个节点的属性面板
   const MARKUP_ERROR = '模型以文本形式输出了工具调用的原始标记，未实际调用工具，这一步没有查询到任何数据。常见原因：节点未绑定工具，或模型、服务不支持工具调用。请在画布中为该节点绑定所需工具；如已绑定仍出现此问题，请换用支持工具调用的模型'
   await page.evaluate((run) => {
