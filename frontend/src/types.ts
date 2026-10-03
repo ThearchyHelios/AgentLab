@@ -2705,3 +2705,138 @@ export interface CatalogDraftOut {
   /** 模型整体用不了（没有配置、已停用……）：只按注释、外键和命名起草 */
   model_error: string | null
 }
+
+// ===========================================================================
+// 数据剖析（后端 app/data/catalog_profile.py）：对业务库发少量只读查询，核实推断的关联关系、取码值候选、
+// 提议业务日期。默认关闭，按数据源在 options.catalog_profile 里开启。
+// ===========================================================================
+
+/** 剖析设置里的数值项 */
+export type CatalogProfileNumberKey = 'max_queries' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows' | 'max_total_s'
+
+/** 一个数据源的剖析设置（服务端 ProfileSettings.to_dict） */
+export interface CatalogProfileSettings {
+  enabled: boolean
+  max_queries: number
+  query_timeout_s: number
+  sample_size: number
+  /** 0 表示一律不做整表统计 */
+  max_scan_rows: number
+  max_total_s: number
+}
+
+/** 整次剖析中途停下的原因：查询次数用完、总时长用完、连续多条查询失败 */
+export type CatalogProfileStop = 'budget' | 'deadline' | 'failed'
+
+/** 一张表的行数：stats 数据库的统计信息（估算）；count 数到上限为止；unknown 没能得到 */
+export interface CatalogProfileSize {
+  rows: number | null
+  method: 'stats' | 'count' | 'unknown' | (string & {})
+  /** 数到上限也没数完：至少这么多行 */
+  at_least: number | null
+}
+
+/** 关系的核对结论：覆盖率、基数，升为已验证（verified）或保持推断（proposed）；人工确认过的只补覆盖率和基数 */
+export interface CatalogProfileRelationFinding {
+  kind: 'relation'
+  path: string
+  target: string
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+  status: CatalogStatus
+  confirmed: boolean
+  coverage: number
+  cardinality: CatalogCardinality | null
+  /** 抽了几个不同的键值、在被指向表里对上几个 */
+  sample: number
+  matched: number
+  summary: string
+}
+
+/** 码值候选：观察到的取值和行数，含义留给人填 */
+export interface CatalogProfileCodesFinding {
+  kind: 'codes'
+  path: string
+  column: string
+  values: { value: string; rows: number }[]
+  rows: number
+  status: CatalogStatus
+  summary: string
+}
+
+/** 业务日期提议：表里只有一个日期类列 */
+export interface CatalogProfileDateFinding {
+  kind: 'business_date'
+  path: string
+  column: string
+  min: string
+  max: string
+  status: CatalogStatus
+  summary: string
+}
+
+export type CatalogProfileFinding = CatalogProfileRelationFinding | CatalogProfileCodesFinding | CatalogProfileDateFinding
+
+/** 没做的一项。detail 是可以直接显示的整句 */
+export interface CatalogProfileSkip {
+  /** relation / codes / date / row_estimate / table */
+  kind: string
+  target: string
+  path: string | null
+  /** budget / deadline / failed / timeout / error / rejected / masked / too_large / view / unsupported / no_data / missing / high_cardinality */
+  reason: string
+  detail: string
+}
+
+export interface CatalogProfileTable {
+  table_name: string
+  queries: number
+  row_estimate: CatalogProfileSize | null
+  findings: CatalogProfileFinding[]
+  skipped: CatalogProfileSkip[]
+  /** 日期类列的取值范围 */
+  date_ranges: { column: string; min: string; max: string }[]
+  added: number
+  updated: number
+  removed: number
+  version: number
+  /** 这张表没剖析（表结构里没有）或结果没写进去（写入一直冲突） */
+  error: string | null
+}
+
+/** POST /datasources/{id}/catalog/profile */
+export interface CatalogProfileOut {
+  profiled_at: string
+  actor: string | null
+  settings: CatalogProfileSettings
+  queries_used: number
+  stopped: CatalogProfileStop | null
+  tables: CatalogProfileTable[]
+  total: { added: number; updated: number; removed: number }
+  /** 一张表都没有剖析时的说明 */
+  note: string | null
+}
+
+// ===========================================================================
+// 基于数据目录的 SQL 检查（后端 app/data/sqlcheck.py）：七条规则，编号稳定
+// ===========================================================================
+
+export type SqlCheckCode = 'fanout_sum' | 'stock_summed' | 'join_unconfirmed' | 'ratio_aggregated' | 'missing_valid_filter'
+  | 'unknown_code' | 'wrong_date_column'
+
+/** error：依据有确证、结果必然有误；warning：依据有确证、很可能有误；info：依据只是推断 */
+export type SqlCheckLevel = 'error' | 'warning' | 'info'
+
+/** 一条检查结果（证据接口查询步骤里的 checks、助手自查和发布前检查的问题）。交回模型改写用的那句不上界面，这里不收 */
+export interface SqlCheckItem {
+  code: SqlCheckCode | (string & {})
+  level: SqlCheckLevel | (string & {})
+  /** 给人看的说明 */
+  message: string
+  /** schema_cache 里的表名 */
+  table: string
+  column?: string
+  relation_id?: string
+  sql_excerpt?: string
+}

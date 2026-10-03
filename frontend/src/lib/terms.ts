@@ -43,7 +43,8 @@
  */
 
 import type {
-  CatalogCardinality, CatalogMeasure, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode, ToolTrust,
+  CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
+  ToolTrust,
 } from '../types'
 import { formatNumber } from './format'
 
@@ -2147,4 +2148,65 @@ export const CATALOG_TEXT = {
   reload: '重新载入',
   reloadDiscardTitle: '放弃未保存的修改并重新载入？',
   reloadDiscardAction: '放弃修改并重新载入',
+}
+
+// ===========================================================================
+// 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」）
+//
+// 术语：
+// - 「数据剖析」：对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。
+//   动作写「剖析」，不写扫描、探测。默认关闭，按数据源开启。
+// - 预算五项：查询次数上限、单条查询时限、抽样键值数、整表统计行数上限、总时长上限。标签和服务端校验报错里的叫法
+//   一致（catalog_profile._NUMBER_FIELDS），保存被拒时按它认出是哪一项。
+// ===========================================================================
+
+export const PROFILE_FIELD_LABEL: Record<'enabled' | CatalogProfileNumberKey, string> = {
+  enabled: '开启数据剖析',
+  max_queries: '查询次数上限',
+  query_timeout_s: '单条查询时限',
+  sample_size: '抽样键值数',
+  max_scan_rows: '整表统计行数上限',
+  max_total_s: '总时长上限',
+}
+
+export const PROFILE_FIELD_UNIT: Record<CatalogProfileNumberKey, string> = {
+  max_queries: '条',
+  query_timeout_s: '秒',
+  sample_size: '个',
+  max_scan_rows: '行',
+  max_total_s: '秒',
+}
+
+export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
+  max_queries: '一次剖析最多发出的查询条数，用完即停止',
+  query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限',
+  sample_size: '核对一条关联关系时，从本表抽取的不同键值个数',
+  max_scan_rows: '不超过此行数的表才做去重计数、最小值和最大值等整表统计',
+  max_total_s: '一次剖析的总时长，到时即停止',
+}
+
+export const PROFILE_TEXT = {
+  // ---- 设置
+  section: '数据剖析',
+  enableHint: '默认关闭。开启后可在数据目录中核实推断的关联关系、取状态类列的码值候选',
+  risk: (queries: number, timeout: number, total: number) =>
+    `开启后，每次剖析会对这个数据源发出只读查询：最多 ${formatNumber(queries)} 条，单条不超过 ${formatNumber(timeout)} 秒，`
+    + `总时长不超过 ${formatNumber(total)} 秒。不读取明细行，遮罩的列不取样。`,
+  range: (min: number, max: number, unit: string, def: number) =>
+    `范围 ${formatNumber(min)}–${formatNumber(max)} ${unit}，默认 ${formatNumber(def)}`,
+  scanZero: '填 0 表示一律不做整表统计',
+  placeholder: (def: number) => `默认 ${formatNumber(def)}`,
+  rangeError: (min: number, max: number, integer: boolean) =>
+    `请填写 ${formatNumber(min)} 到 ${formatNumber(max)} 之间的${integer ? '整数' : '数'}`,
+  invalid: (n: number) => `数据剖析有 ${formatNumber(n)} 项设置不正确`,
+  // ---- 数据源卡片
+  chip: '数据剖析已开启',
+  chipHint: (queries: number, timeout: number) =>
+    `数据剖析已开启：每次最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
+  open: '设置数据剖析',
+  dialogTitle: (name: string) => `「${name}」的数据剖析设置`,
+  dialogBody: '设置保存在数据源上，对数据目录中的每次剖析生效。',
+  savedOn: (name: string) => `「${name}」已开启数据剖析`,
+  savedOff: (name: string) => `「${name}」已关闭数据剖析`,
+  saved: (name: string) => `已保存「${name}」的数据剖析设置`,
 }
