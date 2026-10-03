@@ -648,6 +648,49 @@ await section('从 SQL 认表名', async () => {
   check('不是查询就不硬认', g('这不是 SQL') === null)
 })
 
+await section('Copilot：这一轮参考了哪些表（context 操作）', async () => {
+  // 大库先按需求挑表，挑中的表给模型全部字段。生成的 SQL 用错了表时，先得知道模型当时看到的是哪几张
+  const steps = mod.decodeCopilot(synthetic.COPILOT_CONTEXT, { context: 'canvas' })
+  const row = steps.find((s) => s.code === 'copilot_context')
+  check('一行说清参考了几张表', row?.title === '参考了 5 张表', row?.title)
+  check('展开按数据源分组列出表名', !!row?.detail?.includes('「scenic」按需求从 51 张表中挑出 3 张：visits、channels、channel_visits')
+    && row.detail.includes('「shop」全部 2 张表：orders、customers'), row?.detail)
+  check('挑表的耗时挂在行尾', row?.ms === 3420 && !!row?.meta, `${row?.ms} ${row?.meta}`)
+  check('是看表结构那一类、标着规划阶段', row?.kind === 'schema' && row?.stage === 'plan' && row?.status === 'done')
+  check('排在思考之前，心跳仍然只更新那一条阶段行',
+    steps.indexOf(row) < steps.findIndex((s) => s.kind === 'think')
+    && steps.filter((s) => s.kind === 'lifecycle' && s.id.startsWith('hb-')).length === 1,
+    steps.map((s) => `${s.kind}:${s.title}`).join(' | '))
+  check('收尾后没有还在转的行', !steps.some((s) => s.status === 'running'),
+    steps.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+  check('结局不受影响', mod.copilotOutcome(synthetic.COPILOT_CONTEXT).kind === 'built')
+
+  const fb = mod.decodeCopilot(synthetic.COPILOT_CONTEXT_FALLBACK, { context: 'chat' }).find((s) => s.code === 'copilot_context')
+  check('挑表失败：标题直说只给了表名', fb?.title === '未能按需求挑选，已提供全部表名', fb?.title)
+  check('挑表失败：原因和库的规模放在展开区', !!fb?.detail?.includes('原因：挑选数据表超过 20 秒未完成')
+    && fb.detail.includes('「scenic」共 51 张表'), fb?.detail)
+  check('挑表失败也说等了多久', fb?.ms === 20004, String(fb?.ms))
+
+  const seeded = mod.copilotContext({ op: 'context', sources: [
+    { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })
+  check('没挑成但现有工作流的表带着字段：标题说几张、副标题说没挑成',
+    seeded?.title === '参考了 1 张表' && seeded?.sub === '未能按需求挑选，已提供全部表名'
+    && seeded.detail.includes('现有工作流用到的 1 张表附带全部字段：stores'), JSON.stringify(seeded))
+  const mixed = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: ['x'], selected_by: 'all', total: 1 },
+    { source: 'b', tables: [], selected_by: 'fallback', total: 80, reason: 'r' }] })
+  check('只有一个库没挑成：副标题点名是哪个库', mixed?.sub === '「b」未能按需求挑选，已提供全部表名', mixed?.sub)
+  const none = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: ['x'], selected_by: 'model', total: 60 },
+    { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
+  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名'),
+    none?.detail)
+  check('形状不对不出行、不报错', mod.decodeCopilot([
+    { op: 'context' }, { op: 'context', sources: 'x' }, { op: 'context', sources: [null, 3, { tables: ['t'] }] },
+  ]).length === 0)
+  check('认不出的操作照旧忽略', mod.decodeCopilot([{ op: 'something_new', x: 1 }]).length === 0)
+})
+
 await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,

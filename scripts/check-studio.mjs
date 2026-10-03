@@ -1043,6 +1043,9 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   }
   state.stream = [
     { op: 'model', model: 'fake-model' },
+    // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
+    { op: 'context', elapsed_ms: 1500, sources: [
+      { source: 'shop', tables: ['orders', 'order_items', 'customers'], selected_by: 'model', total: 48 }] },
     { op: 'plan', summary: '加一步润色' },
     { op: 'update_node', id: 'answer', config: finalGraph.nodes[3].data.config },
     { op: 'add_node', node: { id: 'polish', type: 'llm', label: '润色', config: { prompt: '{{ nodes.answer.text }}' } } },
@@ -1059,6 +1062,12 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   const t1 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
   check('开始了就告诉输入框（runCopilot 返回 true）', began === true, String(began))
   check('收到 final：这一轮是「已应用」', t1.outcome === 'applied', t1.outcome)
+  const ctxRow = page.locator('[data-step-code="copilot_context"]').last()
+  check('助手栏的过程里一行说参考了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await ctxRow.innerText()).includes('参考了 3 张表'))
+  await ctxRow.locator('button').first().click()
+  check('点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 3 张：orders、order_items、customers')
+    .waitFor({ timeout: 3000 }).then(() => true, () => false))
   check('diff 记下新增和改动', t1.diff?.added.includes('polish') && t1.diff?.changed.includes('answer'), JSON.stringify(t1.diff))
   check('final.issues 进了这一轮（少了一步）', t1.issues?.some((i) => i.code === 'unknown_node_type'))
   const pos1 = await S(page, () => Object.fromEntries(window.__studio.getState().nodes.map((n) => [n.id, n.position])))

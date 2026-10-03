@@ -13,7 +13,7 @@ import mdSamples from '../run/__tests__/markdown-samples.json'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
-  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mergeRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
@@ -323,6 +323,8 @@ function synthetic(name: string): StreamTurn[] {
       // 问数据的一轮：先建图、再执行。执行开始后「规划」收成一行
       const plan = decodeCopilot([
         { op: 'heartbeat', phase: 'planning', elapsed_ms: 6400 },
+        { op: 'context', elapsed_ms: 2100, sources: [
+          { source: 'warehouse', tables: ['v_device_kpi', 'dim_device'], selected_by: 'model', total: 53 }] },
         { op: 'thinking', delta: '要先查表结构，再按设备汇总 KPI。' },
         { op: 'plan', summary: '取数 → 汇总 → 出结论' },
         { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询设备 KPI' } },
@@ -337,6 +339,13 @@ function synthetic(name: string): StreamTurn[] {
                 graph: { nodes: [{ id: 'q', type: 'tool', data: { label: '查询设备 KPI' } },
                                  { id: 'o', type: 'output', data: { label: '成果' } }] } }]
     }
+    case 'copilot-context':
+      // 大库按需求挑表：过程里一行「参考了 N 张表」，展开按数据源分组列表名
+      return [{ id: 'copilot-context', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
+                steps: decodeCopilot(COPILOT_CONTEXT, { context: 'canvas' }) }]
+    case 'copilot-fallback':
+      return [{ id: 'copilot-fallback', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
+                steps: decodeCopilot(COPILOT_CONTEXT_FALLBACK, { context: 'canvas' }) }]
     case 'copilot':
       return [{ id: 'copilot', question: '做一个每天的出勤日报', phase: 'done',
                 status: '已应用到画布，仍有 2 处问题待处理',
