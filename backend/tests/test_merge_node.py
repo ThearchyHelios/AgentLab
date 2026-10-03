@@ -260,6 +260,22 @@ def test_merge_inputs_count_as_references_to_the_upstream_nodes():
     assert any(r.node_id == "merge" for r in refs["nodes.q_sales"])
 
 
+def test_publish_checks_treat_the_merge_as_traceable_evidence():
+    """受管级别的发布检查：合并结果喂给口径卡、报告，和数据源查询一样算可追溯的证据，不在合并节点上报任何问题。"""
+    from app.engine.governance import publish_issues
+
+    graph = store_graph()
+    for n in graph["nodes"]:
+        if n["id"] == "write":
+            n["data"]["config"].update(numbers="strict", on_violation="fail", claims="require_citation")
+        if n["id"] == "out":
+            n["data"]["config"]["contract"] = {"report_from": "write", "metrics_from": ["card"],
+                                               "required": ["conversion"], "strict": True}
+    issues = publish_issues(GraphSpec.model_validate(graph), level="governed")
+    assert [i for i in issues if i.node_id == "merge"] == []
+    assert [i for i in issues if i.level == "error"] == [], [i.message for i in issues if i.level == "error"]
+
+
 def test_labels_and_governance_know_the_type():
     from app.engine.governance import _traceable
     from app.engine.labels import field_label, type_label
