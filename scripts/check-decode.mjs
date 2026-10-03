@@ -685,6 +685,16 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
     { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
   check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名'),
     none?.detail)
+  // 探查结构截断了（每个数据源最多取 200 张表）：total 是数据库里的总数，explored 是探查到的
+  const partial = mod.copilotContext({ op: 'context', sources: [
+    { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 },
+    { source: 'wide2', tables: [], selected_by: 'fallback', total: 260, explored: 200, reason: 'r' }] })
+  check('截断了的库写「共 N 张，只探查了 200 张」', !!partial?.detail.includes('「wide」共 205 张，只探查了 200 张，按需求挑出 2 张：t001、t002')
+    && partial.detail.includes('「wide2」共 260 张，只探查了 200 张，未能按需求挑选'), partial?.detail)
+  const whole = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: ['x'], selected_by: 'model', total: 60, explored: 60 }] })
+  check('探查到的和总数一样：照旧写「从 N 张表中挑出」', !!whole?.detail.includes('「a」按需求从 60 张表中挑出 1 张') && !whole.detail.includes('只探查了'),
+    whole?.detail)
   check('形状不对不出行、不报错', mod.decodeCopilot([
     { op: 'context' }, { op: 'context', sources: 'x' }, { op: 'context', sources: [null, 3, { tables: ['t'] }] },
   ]).length === 0)

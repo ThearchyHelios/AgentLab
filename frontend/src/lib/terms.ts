@@ -2260,6 +2260,21 @@ export const CATALOG_DRIFT_TEXT = {
   possibleNone: (source: string) => `「${source}」发布时还没有目录`,
 }
 
+/**
+ * 表结构只探查了一部分：探查结构时每个数据源最多取 200 张表（服务端 introspect._MAX_TABLES），多出来的表不在
+ * 表结构里，数据目录列不出，助手也看不到它们的字段。数据目录页顶部和助手「参考了哪些表」那一行都要说出来。
+ */
+export const SCHEMA_PARTIAL_TEXT = {
+  /** 数据目录页顶部：「这个数据源共有 205 张表，只探查了前 200 张」 */
+  title: (total: number, explored: number) =>
+    `这个数据源共有 ${formatNumber(total)} 张表，只探查了前 ${formatNumber(explored)} 张`,
+  body: (rest: number) => `探查结构时每个数据源最多取 200 张表（按数据库列出的顺序）：生产库动辄上千张，全部取回既慢也看不完。`
+    + `其余 ${formatNumber(rest)} 张不在数据目录中，助手也看不到它们的字段。`,
+  next: '所需的表不在清单中时，请回到数据源卡片换一个 schema，或改用只能看到所需表的数据库账号缩小范围，然后重新「探查结构」。',
+  /** 助手「参考了哪些表」那一行：「共 205 张，只探查了 200 张」 */
+  context: (total: number, explored: number) => `共 ${formatNumber(total)} 张，只探查了 ${formatNumber(explored)} 张`,
+}
+
 // ===========================================================================
 // 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」）
 //

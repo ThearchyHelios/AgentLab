@@ -2,8 +2,8 @@ import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, 
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally, evidenceTally,
-  issuanceLabel, nodeTypeLabel,
+  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally,
+  evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
@@ -2605,8 +2605,10 @@ export interface CopilotContextSource {
   tables: string[]
   /** model：按需求挑的；all：库不大，全部表都带字段；fallback：没能挑出来，只给了表名 */
   selectedBy: 'model' | 'all' | 'fallback'
-  /** 这个库一共几张表 */
+  /** 这个库一共几张表（数据库里的真实总数） */
   total?: number
+  /** 探查结构截断了时，探查到几张（服务端只在截断时给）：模型只看得到这几张 */
+  explored?: number
   /** 没能挑出来的原因 */
   reason?: string
 }
@@ -2620,26 +2622,34 @@ function contextSources(op: CopilotOp): CopilotContextSource[] {
     .filter((x): x is Record<string, any> => !!x && typeof x === 'object' && typeof (x as any).source === 'string')
     .map((x) => {
       const total = num(x.total)
+      const explored = num(x.explored)
       return {
         source: x.source,
         tables: Array.isArray(x.tables) ? x.tables.map(String) : [],
         selectedBy: x.selected_by === 'model' || x.selected_by === 'fallback' ? x.selected_by : 'all',
         ...(total != null ? { total } : {}),
+        ...(total != null && explored != null && explored < total ? { explored } : {}),
         ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
       }
     })
 }
 
-/** 一个库在展开区里的那一行：怎么来的 + 表名 */
+/**
+ * 一个库在展开区里的那一行：怎么来的 + 表名。探查结构截断了的库写明「共 205 张，只探查了 200 张」：
+ * 模型只看得到探查到的那些，用户说的表不在里面时，先得知道是没探查到，不是库里没有
+ */
 function contextLine(g: CopilotContextSource): string {
   const names = g.tables.join('、')
-  const of = g.total != null ? `共 ${g.total} 张表` : ''
+  const partial = g.total != null && g.explored != null ? SCHEMA_PARTIAL_TEXT.context(g.total, g.explored) : ''
+  const of = partial || (g.total != null ? `共 ${g.total} 张表` : '')
   switch (g.selectedBy) {
     case 'all':
-      return `「${g.source}」全部 ${g.tables.length} 张表：${names}`
+      return `「${g.source}」全部 ${g.tables.length} 张表${partial ? `（${partial}）` : ''}：${names}`
     case 'model':
       return g.tables.length
-        ? `「${g.source}」按需求${g.total != null ? `从 ${g.total} 张表中` : ''}挑出 ${g.tables.length} 张：${names}`
+        ? partial
+          ? `「${g.source}」${partial}，按需求挑出 ${g.tables.length} 张：${names}`
+          : `「${g.source}」按需求${g.total != null ? `从 ${g.total} 张表中` : ''}挑出 ${g.tables.length} 张：${names}`
         : `「${g.source}」${of ? `${of}，` : ''}未挑中与需求相关的表，已提供全部表名`
     default:
       return `「${g.source}」${of ? `${of}，` : ''}${CONTEXT_FALLBACK_TEXT}`

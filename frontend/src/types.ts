@@ -2671,6 +2671,10 @@ export interface CatalogList {
   system_notes: boolean
   /** 没有表结构时的原因（「尚未探查结构」「结构探查失败：…」）；有表结构时为 null */
   schema_note: string | null
+  /** 探查结构截断了（每个数据源最多取 200 张表）：没探查到的表不在清单里，助手也看不到。老后端没有这一项 */
+  schema_truncated?: boolean
+  /** 数据库里一共几张表（含视图）；没截断时等于探查到的张数 */
+  schema_total?: number
 }
 
 /** 表结构里的一列 */
