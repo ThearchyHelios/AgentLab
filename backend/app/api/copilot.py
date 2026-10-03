@@ -2251,13 +2251,18 @@ async def assist_upgrade(
     if not feeders:
         out["summary"] = "口径卡的输入均不来自负责计算的沙箱代码，无需交给助手改写"
         return out
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, None)
+    # 基于数据目录的 SQL 检查器：自查和最终判断都带上，和发布门禁一个口径（受管级别下一对多关联后求和这类 error
+    # 会挡发布）。不带的话，助手改出这种 SQL 照样被采纳，交出去的图要到发布时才被拦
+    checkers = await load_checkers(session, sources)
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
     before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
     baseline = list(copy.deepcopy(before_nodes).values())
     defaults = base.get("defaults")
     base_errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
-                                   defaults=defaults) or []
+                                   defaults=defaults, checkers=checkers) or []
     known = {_sig(e) for e in base_errors}
     out["warnings"] = _kept_code(spec)
     request = GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model)
@@ -2309,7 +2314,8 @@ async def assist_upgrade(
         await collect(_upgrade_assist_request(base, spec, feeders), first=True)
         # 自查：和搭图同一套规则，只把这一轮冒出来的 error 交回去改（原来就有的不归这一轮管）
         for _ in range(_SELF_CHECK_ROUNDS):
-            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults)
+            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults,
+                                   checkers=checkers)
             fresh = [e for e in now or [] if _sig(e) not in known]
             if not effective or not fresh:
                 break
@@ -2326,7 +2332,7 @@ async def assist_upgrade(
     proposed = _proposed_graph(base, nodes, edges)
     reasons = forbidden_changes(base, proposed, tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
-                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
         out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:

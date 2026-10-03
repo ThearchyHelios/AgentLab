@@ -241,3 +241,54 @@ async def test_clean_sql_costs_no_extra_call(scenic_source, monkeypatch):
     final = events[-1]
     assert final["autorun"] is True
     assert not [i for i in final["issues"] if i.get("code") in ("fanout_sum", "missing_valid_filter")]
+
+
+# --------------------------------------------------------------------------
+# 一键升级的语义层（assist_upgrade）：自查和最终判断同样带 SQL 检查器，和发布门禁一个口径
+# --------------------------------------------------------------------------
+
+
+def _upgrade_graph(source: str) -> dict:
+    """查库 → 沙箱代码算比率 → 口径卡读代码的产出 → 报告撰写 → 出口。查库的 SQL 本身没问题。"""
+    def n(nid, ntype, x, **config):
+        return {"id": nid, "type": ntype, "position": {"x": x, "y": 80}, "data": {"label": nid, "config": config}}
+
+    nodes = [
+        n("start", "input", 0),
+        n("fetch", "tool", 280, tool=f"db_query__{source}", args={"sql": CLEAN_SQL}),
+        n("calc", "code", 560, language="python", assign_to="calc", code="import json\nprint(json.dumps({'ratio': 3 / 4}))"),
+        n("card", "metrics", 840, metrics=[{"id": "ratio", "name": "客单价", "expression": "vars.calc.ratio"}]),
+        n("write", "report", 1120, instructions="写一句话"),
+        n("out", "output", 1400, fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+    ]
+    return {"nodes": nodes, "edges": [{"id": f"e{i}", "source": a["id"], "target": b["id"]}
+                                      for i, (a, b) in enumerate(zip(nodes, nodes[1:]))]}
+
+
+async def test_upgrade_assist_checks_sql_like_the_publish_gate(scenic_source, monkeypatch):
+    """助手改写口径卡时顺手把查询改成了一对多关联后求和：受管级别的发布门禁会挡，升级的自查也得交回去改，
+    改不好就作废——以前自查和最终判断都没带 SQL 检查器，这样的改写会被采纳，交出去的图发布时才被拦。"""
+    import app.api.copilot as copilot
+    from app.db.base import SessionLocal
+
+    first = [{"op": "plan", "summary": "把纯算术的代码挪进口径卡"},
+             {"op": "update_node", "id": "card", "config": {"metrics": [
+                 {"id": "ratio", "name": "客单价", "expression": "cell(nodes.fetch, 0, 'gmv') / 4"}]}},
+             {"op": "update_node", "id": "fetch", "config": {"args": {"sql": FANOUT_SQL}}},
+             {"op": "done", "explanation": "客单价改由口径卡直接算"}]
+    fix = [{"op": "update_node", "id": "fetch", "config": {"args": {"sql": FANOUT_SQL + " "}}},
+           {"op": "done", "explanation": "改了"}]
+    model = _Scripted(first, fix)
+
+    async def _model(*_a, **_k):
+        return model, "mock-fast"
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    async with SessionLocal() as session:
+        out = await copilot.assist_upgrade(session, _upgrade_graph(scenic_source), level="governed")
+    # 自查把一对多求和交回模型，带着给模型的改法
+    assert len(model.calls) >= 2 and "上线前自查" in model.calls[1]
+    assert "orders 关联 order_items 是一对多" in model.calls[1]
+    # 改不好：整个作废，原因写的是这条 SQL 检查
+    assert out["accepted"] is False and out["ok"] is False
+    assert "一对多" in (out["reason"] or ""), out["reason"]
