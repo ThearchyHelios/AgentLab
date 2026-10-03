@@ -459,7 +459,457 @@ class _ScopeCheck:
         return out
 
     def run(self) -> list[SqlCheck]:
-        return []
+        out: list[SqlCheck] = []
+        if self.tables:
+            out += self.matched_join_checks()
+            out += self.fanout()
+            out += self.stock_summed()
+            out += self.ratio_aggregated()
+            out += self.missing_valid_filter()
+            out += self.unknown_code()
+            out += self.wrong_date_column()
+        return out
+
+    # ---- 关联：认出每一对表的关联条件，对照目录里的关系
+
+    def matched_joins(self) -> list[tuple[str, str, catalog.JoinEdge]]:
+        """对上目录关系的关联：[(别名 x, 别名 y, 从 x 看过去的边)]。顺带记下 join_unconfirmed。"""
+        if self._matched is None:
+            self._matched = []
+            self._analyze_joins()
+        return self._matched
+
+    def matched_join_checks(self) -> list[SqlCheck]:
+        self.matched_joins()
+        return self._join_checks
+
+    def _analyze_joins(self) -> None:
+        from sqlglot import exp
+
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+        skip: set[str] = set()
+        seen: list[str] = []
+        first = self.select.args.get("from_")
+        if first is not None:
+            seen.append(first.this.alias_or_name.lower())
+
+        def add(conds: list[Any], *, owner: str | None) -> None:
+            for cond in conds:
+                cond = _unparen(cond)
+                if not isinstance(cond, exp.EQ):
+                    continue
+                left, right = _unparen(cond.left), _unparen(cond.right)
+                if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+                    continue
+                a, b = self.resolve(left), self.resolve(right)
+                if a is None or b is None:
+                    if owner is not None:
+                        skip.add(owner)       # 关联条件里有认不出的列：说不清这一连是按什么连的
+                    continue
+                if a[0].alias == b[0].alias:
+                    continue
+                if a[0].order > b[0].order:
+                    a, b = b, a
+                group = groups.setdefault((a[0].alias, b[0].alias), {"pairs": set(), "conds": []})
+                group["pairs"].add((a[1].lower(), b[1].lower()))
+                group["conds"].append(cond)
+
+        for join in self.select.args.get("joins") or []:
+            alias = join.this.alias_or_name.lower()
+            if join.args.get("method"):           # NATURAL JOIN：按同名列连，不去猜
+                skip.add(alias)
+            on, using = join.args.get("on"), join.args.get("using")
+            if on is not None:
+                conds = _conjuncts(on)
+                if any(isinstance(_unparen(c), exp.Or) for c in conds):
+                    skip.add(alias)
+                add(conds, owner=alias)
+            elif using:
+                right = self.tables.get(alias)
+                for ident in using:
+                    name = ident.name.lower()
+                    lefts = [self.tables[s] for s in seen if s in self.tables and name in self.tables[s].columns]
+                    if right is None or len(lefts) != 1 or name not in right.columns:
+                        skip.add(alias)
+                        break
+                    left = lefts[0]
+                    group = groups.setdefault((left.alias, right.alias), {"pairs": set(), "conds": []})
+                    group["pairs"].add((name, name))
+                    group["conds"].append(ident)
+            seen.append(alias)
+        # 逗号连接（以及显式 JOIN 外加的等值条件）写在 WHERE 里
+        add(_conjuncts(self.where()), owner=None)
+
+        for (x, y), group in groups.items():
+            if x in skip or y in skip:
+                continue
+            a, b = self.tables[x], self.tables[y]
+            if a.name.lower() == b.name.lower():
+                continue                          # 自己连自己：目录不记这种关系
+            pairs = group["pairs"]
+            candidates = self.checker.edges_between(a.name, b.name)
+            matched = [e for e in candidates
+                       if {(f.lower(), t.lower()) for f, t in zip(e.from_columns, e.to_columns)} <= pairs]
+            best = max(matched, key=lambda e: _STATUS_RANK.get(e.status, 0), default=None)
+            if best is not None:
+                self._matched.append((x, y, best))
+            if not (a.notes or b.notes):
+                continue                          # 两张表都没写目录：没有可对照的，不判
+            condition = " AND ".join(filter(None, (self.excerpt(c) for c in group["conds"])))
+            if best is None:
+                self._join_checks.append(self._join_unknown(a, b, candidates, condition))
+            elif best.status not in _STRONG:
+                self._join_checks.append(self._join_proposed(a, b, best, condition))
+
+    def _join_unknown(self, a: _Table, b: _Table, candidates: list[catalog.JoinEdge], condition: str) -> SqlCheck:
+        known = "；".join(dict.fromkeys(e.condition() for e in candidates))
+        hint = f"目录里这两张表的关系是：{known}。照它改关联条件" if known else \
+            "目录里没有这两张表之间的关系。确认这样连两边各是什么粒度、会不会一对多"
+        return SqlCheck(
+            code="join_unconfirmed", level="warning", table=b.name, sql_excerpt=condition or None,
+            message=(f"「{a.label()}」与「{b.label()}」的关联条件对不上数据目录中的任何关系，可能连错了列。"
+                     "请对照数据目录修改关联条件，或在数据目录中补充并确认这条关系"),
+            for_model=(f"{a.name} 和 {b.name} 按 {condition or '这组条件'} 关联，数据目录里没有对应的关系。{hint}；"
+                       "确实要这样连的话，避免一对多关联之后对「一」那一侧的列求和"))
+
+    def _join_proposed(self, a: _Table, b: _Table, edge: catalog.JoinEdge, condition: str) -> SqlCheck:
+        return SqlCheck(
+            code="join_unconfirmed", level="info", table=b.name, relation_id=edge.relation_id,
+            sql_excerpt=condition or None,
+            message=(f"「{a.label()}」与「{b.label()}」按推断的关系关联（{edge.condition()}），这条关系尚未确认。"
+                     "请在数据目录中确认"),
+            for_model=(f"{a.name} 和 {b.name} 的关联依据的是推断出来的关系（{edge.condition()}），没人确认过。"
+                       "核对两边的列确实对应、基数和你以为的一致"))
+
+    # ---- fanout_sum
+
+    def _fanned(self, start: str) -> tuple[str, str, list[catalog.JoinEdge]] | None:
+        """start 这张表会不会被关联放大：沿多对一、一对一往外走，碰到一条一对多的边就会。返回 (V, W, 路径)。
+
+        按 W 的业务主键分组时，每组只有一条 W：这条边不放大，接着往外找。对不上关系的关联不知道基数，不往外走。
+        """
+        adjacency: dict[str, list[tuple[str, catalog.JoinEdge]]] = {}
+        for x, y, edge in self.matched_joins():
+            adjacency.setdefault(x, []).append((y, edge))
+            adjacency.setdefault(y, []).append((x, edge.reversed()))
+        grouped = {(r[0].alias, r[1].lower()) for r in self.group_refs() if r}
+        # 反连接（LEFT JOIN 明细 … WHERE 明细.id IS NULL）：留下的是没有明细的订单，每条订单至多一行
+        absent = {r[0].alias for c in _conjuncts(self.where()) if self._is_null(c) for r in self.refs(c) if r}
+        visited = {start}
+        queue: list[tuple[str, list[catalog.JoinEdge]]] = [(start, [])]
+        while queue:
+            here, path = queue.pop(0)
+            for there, edge in adjacency.get(here, []):
+                if there in visited:
+                    continue
+                keys = self.tables[there].keys()
+                collapsed = there in absent or (bool(keys) and all((there, k.lower()) in grouped for k in keys[0]))
+                if edge.cardinality == "one_to_many" and not collapsed:
+                    return here, there, path + [edge]
+                if edge.cardinality in ("many_to_one", "one_to_one") or collapsed:
+                    visited.add(there)
+                    queue.append((there, path + [edge]))
+        return None
+
+    @staticmethod
+    def _is_null(cond: Any) -> bool:
+        """col IS NULL（不含 IS NOT NULL）。"""
+        from sqlglot import exp
+
+        cond = _unparen(cond)
+        return isinstance(cond, exp.Is) and isinstance(_unparen(cond.expression), exp.Null) and \
+            isinstance(_unparen(cond.this), exp.Column)
+
+    def fanout(self) -> list[SqlCheck]:
+        from sqlglot import exp
+
+        if not self.matched_joins():
+            return []
+        out = []
+        for node, arg in self.aggregates(exp.Sum, exp.Count):
+            refs = self.refs(arg)
+            if not refs or any(r is None for r in refs) or len({r[0].alias for r in refs}) != 1:
+                continue
+            table = refs[0][0]
+            basis = self._fanout_basis(table, [r[1] for r in refs], counting=isinstance(node, exp.Count))
+            if basis is None:
+                continue
+            cause = self._fanned(table.alias)
+            if cause is None:
+                continue
+            column, status = basis
+            via, many, path = cause
+            out.append(self._fanout_check(node, table, column, self.tables[via], self.tables[many], path,
+                                          [status] + [e.status for e in path], counting=isinstance(node, exp.Count)))
+        return out
+
+    def _fanout_basis(self, table: _Table, columns: list[str], *, counting: bool) -> tuple[str, str] | None:
+        """参数里能说明「这是一张表自己的数」的那一列和它的依据：求和看度量类型（流量、存量），
+        计数另外认标识列和业务主键（数订单数却数成了明细行数）。"""
+        keys = table.keys()
+        for column in columns:
+            measure = table.measure(column)
+            wanted = ("flow", "stock", "identifier") if counting else ("flow", "stock")
+            if measure and measure[0] in wanted:
+                return column, measure[1]
+            if counting and keys and column.lower() in {k.lower() for k in keys[0]}:
+                return column, keys[1]
+        return None
+
+    def _fanout_check(self, node: Any, table: _Table, column: str, via: _Table, many: _Table,
+                      path: list[catalog.JoinEdge], statuses: list[str], *, counting: bool) -> SqlCheck:
+        what = "计数" if counting else "求和"
+        excerpt = self.excerpt(node)
+        if via.alias == table.alias:
+            head = f"「{table.label()}」关联「{many.label()}」是一对多，"
+            model_head = f"{table.name} 关联 {many.name} 是一对多（一行 {table.name} 对多行 {many.name}），"
+        else:
+            head = f"「{via.label()}」关联「{many.label()}」是一对多，「{table.label()}」的每一行会随之重复，"
+            model_head = (f"{via.name} 关联 {many.name} 是一对多，经 {via.name} 连过去之后 {table.name} 的每一行"
+                          f"都按 {many.name} 的行数重复，")
+        # 直接连的：常见的本意是「明细的数」，改法之一是换成对明细求和；隔一层连的（明细经订单连支付记录），
+        # 本意是明细自己的数，要么先把支付记录汇总，要么根本不该连它
+        if counting:
+            fix = f"请改为对「{table.label()}」去重计数，或先在子查询中把「{many.label()}」汇总后再关联"
+            model_fix = (f"改成 COUNT(DISTINCT {table.name} 的主键)，或者先在子查询里把 {many.name} 汇总成每条 "
+                         f"{via.name} 一行再关联")
+        elif via.alias == table.alias:
+            fix = (f"请先在子查询中把「{many.label()}」按「{table.label()}」汇总后再关联，"
+                   f"或改为对「{many.label()}」上的对应列求和")
+            model_fix = (f"先在子查询里把 {many.name} 按关联列汇总成每条 {table.name} 一行再关联；或者改成对 {many.name} "
+                         f"上的对应列求和；只要 {table.name} 自己的数就不要关联 {many.name}")
+        else:
+            fix = f"请先在子查询中把「{many.label()}」按「{via.label()}」汇总后再关联，或去掉与「{many.label()}」的关联"
+            model_fix = (f"先在子查询里把 {many.name} 按关联列汇总成每条 {via.name} 一行再关联；用不到 {many.name} 的列"
+                         f"就去掉这个关联")
+        return SqlCheck(
+            code="fanout_sum", level=_level("fanout_sum", statuses), table=table.name, column=column,
+            relation_id=path[-1].relation_id, sql_excerpt=excerpt,
+            message=f"{head}对「{table.label()}」的「{table.column_label(column)}」{what}会重复计算。{fix}",
+            for_model=f"{model_head}{excerpt or what} 会把 {table.name}.{column} 重复计算。{model_fix}")
+
+    # ---- stock_summed
+
+    def _date_equivalents(self, table: _Table, column: str) -> set[tuple[str, str]]:
+        """业务日期列，加上关联、筛选条件里和它等值的列（经日期维度表分组也算按日期分组）。"""
+        out = {(table.alias, column.lower())}
+        conds = _conjuncts(self.where())
+        for join in self.select.args.get("joins") or []:
+            conds += _conjuncts(join.args.get("on"))
+        from sqlglot import exp
+
+        for cond in conds:
+            cond = _unparen(cond)
+            if isinstance(cond, exp.EQ):
+                a, b = self.refs(cond.left), self.refs(cond.right)
+                if len(a) == 1 and len(b) == 1 and a[0] and b[0]:
+                    ka, kb = (a[0][0].alias, a[0][1].lower()), (b[0][0].alias, b[0][1].lower())
+                    if ka in out:
+                        out.add(kb)
+                    elif kb in out:
+                        out.add(ka)
+        return out
+
+    def _mentions(self, refs: list[_Ref | None], wanted: set[tuple[str, str]], name: str) -> bool:
+        """refs 里有没有 wanted 里的列；认不出来、但名字就是 name 的列也算有（宁可漏报）。"""
+        return any((r[0].alias, r[1].lower()) in wanted if r else False for r in refs) or \
+            self._unresolved_named(refs, name)
+
+    def _unresolved_named(self, refs: list[_Ref | None], name: str) -> bool:
+        return False if not any(r is None for r in refs) else name.lower() in self.statement_columns
+
+    def stock_summed(self) -> list[SqlCheck]:
+        from sqlglot import exp
+
+        out = []
+        for node, arg in self.aggregates(exp.Sum):
+            refs = self.refs(arg)
+            if not refs or any(r is None for r in refs) or len({r[0].alias for r in refs}) != 1:
+                continue
+            table = refs[0][0]
+            stock = next(((c, m[1]) for c in (r[1] for r in refs) if (m := table.measure(c)) and m[0] == "stock"), None)
+            date = table.business_date()
+            if stock is None or date is None or any(r[1].lower() == date[0].lower() for r in refs):
+                continue
+            equivalents = self._date_equivalents(table, date[0])
+            if self._mentions(self.group_refs(), equivalents, date[0]):
+                continue
+            pinned = False
+            for cond in (self.where().walk() if self.where() is not None else []):
+                if isinstance(cond, (exp.EQ, exp.In)) and self._mentions(self.refs(cond), equivalents, date[0]):
+                    pinned = True              # 筛到某一天（或某几天）：不算跨期加总
+                    break
+            if pinned:
+                continue
+            column, label = stock[0], table.column_label(stock[0])
+            date_label = table.column_label(date[0])
+            excerpt = self.excerpt(node)
+            out.append(SqlCheck(
+                code="stock_summed", level=_level("stock_summed", [stock[1], date[1]]), table=table.name,
+                column=column, sql_excerpt=excerpt,
+                message=(f"「{table.label()}」的「{label}」是存量，跨日期求和会把不同日期的存量加在一起。"
+                         f"请按「{date_label}」分组，或筛选到某一天后再求和"),
+                for_model=(f"{table.name}.{column} 是存量（某一时点的值），{excerpt or 'SUM'} 把不同日期的存量加在一起了。"
+                           f"按 {date[0]} 分组，或者在 WHERE 里把 {date[0]} 限定到某一天（比如期末那天）再求和；"
+                           "要看一段时间的水平就用 AVG，或取期末那天的值")))
+        return out
+
+    # ---- ratio_aggregated
+
+    def ratio_aggregated(self) -> list[SqlCheck]:
+        from sqlglot import exp
+
+        out = []
+        for node, arg in self.aggregates(exp.Sum, exp.Avg):
+            column = _bare_column(arg)
+            ref = self.resolve(column) if column is not None else None
+            measure = ref[0].measure(ref[1]) if ref else None
+            if not ref or not measure or measure[0] != "ratio":
+                continue
+            table, name = ref
+            what = "求平均" if isinstance(node, exp.Avg) else "求和"
+            excerpt = self.excerpt(node)
+            out.append(SqlCheck(
+                code="ratio_aggregated", level=_level("ratio_aggregated", [measure[1]]), table=table.name,
+                column=name, sql_excerpt=excerpt,
+                message=(f"「{table.label()}」的「{table.column_label(name)}」是比率，直接{what}得不到正确的结果。"
+                         "请分别汇总分子和分母后再相除"),
+                for_model=(f"{table.name}.{name} 是比率，{excerpt or what} 直接把比率{what}了。分别对分子、分母求和以后"
+                           f"再相除；要按权重平均就写 SUM(权重 * {name}) / SUM(权重)")))
+        return out
+
+    # ---- missing_valid_filter
+
+    def missing_valid_filter(self) -> list[SqlCheck]:
+        out = []
+        done: set[str] = set()
+        local = [self.resolve(c) for c in self.columns]
+        for table in sorted(self.tables.values(), key=lambda t: t.order):
+            item = table.item("valid_filter")
+            condition = item.get("value") if item else None
+            if table.name in done or not isinstance(condition, str) or not condition.strip():
+                continue
+            wanted = self._filter_columns(condition, table)
+            if not wanted:
+                continue
+            done.add(table.name)
+            if any(r and r[0].name == table.name and r[1].lower() in wanted for r in local):
+                continue
+            # 没加前缀、认不出是哪张表的同名列：可能就是它，不报
+            if any(c.name.lower() in wanted for c, r in zip(self.columns, local) if r is None):
+                continue
+            # 子查询、CTE 里的表：外层可能按透出的列筛（SELECT … FROM (SELECT * FROM t) x WHERE x.status = 1）
+            if not self.scope.is_root and wanted & self.statement_columns:
+                continue
+            cols = "、".join(table.columns[c] for c in sorted(wanted))
+            out.append(SqlCheck(
+                code="missing_valid_filter", level=_level("missing_valid_filter", [item.get("status")]),
+                table=table.name, sql_excerpt=self.excerpt(table.node),
+                message=(f"「{table.label()}」定义了有效记录条件「{condition.strip()}」，查询中没有按它筛选，"
+                         "结果会包含无效记录。请在筛选条件中加上该条件，或确认确实需要包含全部记录"),
+                for_model=(f"{table.name} 的有效记录条件是 {condition.strip()}，这条 SQL 没有用到其中的列（{cols}）。"
+                           "在 WHERE 里加上这个条件（有别名就加上别名前缀）；确实要包含无效记录的话，在条件里显式写出这一列")))
+        return out
+
+    def _filter_columns(self, condition: str, table: _Table) -> set[str]:
+        """有效记录条件里用到的、这张表上的列（小写）。条件解析不了就返回空集（不查）。"""
+        import sqlglot
+        from sqlglot import exp
+
+        try:
+            parsed = sqlglot.parse_one(f"SELECT 1 FROM t WHERE {condition}", read=self.dialect)
+        except Exception:  # noqa: BLE001
+            return set()
+        return {c.name.lower() for c in parsed.find_all(exp.Column) if c.name and c.name.lower() in table.columns}
+
+    # ---- unknown_code
+
+    def unknown_code(self) -> list[SqlCheck]:
+        from sqlglot import exp
+
+        hits: dict[tuple[str, str], tuple[_Table, str, Mapping[str, Any], list[str], Any]] = {}
+        for node in self.nodes:
+            if isinstance(node, exp.EQ):
+                pairs = [(node.left, [node.right]), (node.right, [node.left])]
+            elif isinstance(node, exp.In) and not node.args.get("query") and node.expressions:
+                pairs = [(node.this, node.expressions)]
+            else:
+                continue
+            for target, values in pairs:
+                column = _unparen(target)
+                if not isinstance(column, exp.Column):
+                    continue
+                ref = self.resolve(column)
+                item = ref[0].column_item(ref[1], "codes") if ref else None
+                codes = item.get("value") if item else None
+                if not isinstance(codes, Mapping) or not codes:
+                    continue
+                for value in values:
+                    literal = _literal(value)
+                    if literal is None or _known_code(literal, codes):
+                        continue
+                    key = (ref[0].name, ref[1].lower())
+                    entry = hits.setdefault(key, (ref[0], ref[1], item, [], node))
+                    if literal[0] not in entry[3]:
+                        entry[3].append(literal[0])
+        out = []
+        for table, column, item, values, node in hits.values():
+            codes = item["value"]
+            shown = "、".join(f"{k}={v}" for k, v in list(codes.items())[:10]) + ("等" if len(codes) > 10 else "")
+            told = "、".join(f"「{v}」" for v in values[:5])
+            listed = "、".join(f"{k}（{v}）" for k, v in list(codes.items())[:10])
+            hint = f"；拿不准就先用 db_schema__{self.checker.source_name} 查这张表的码值" if self.checker.source_name else ""
+            out.append(SqlCheck(
+                code="unknown_code", level=_level("unknown_code", [item.get("status")]), table=table.name,
+                column=column, sql_excerpt=self.excerpt(node),
+                message=(f"「{table.label()}」的「{table.column_label(column)}」没有码值{told}（已知码值：{shown}）。"
+                         "请按数据目录中的码值修改筛选条件"),
+                for_model=(f"{table.name}.{column} 的码值只有 {listed}，SQL 里写的 {'、'.join(values[:5])} 不在其中。"
+                           f"照目录里的码值改{hint}")))
+        return out
+
+    # ---- wrong_date_column
+
+    def wrong_date_column(self) -> list[SqlCheck]:
+        from sqlglot import exp
+
+        out = []
+        where = self.where()
+        where_refs = [(c, self.resolve(c)) for c in (where.find_all(exp.Column) if where is not None else [])
+                      if not any(isinstance(p, (exp.Subquery, exp.Select)) for p in _parents(c, stop=where))]
+        group = self.group_refs()
+        for table in sorted(self.tables.values(), key=lambda t: t.order):
+            date = table.business_date()
+            if date is None:
+                continue
+            own = {(table.alias, date[0].lower())}
+            if self._mentions([r for _, r in where_refs] + group, own, date[0]):
+                continue                          # 业务日期已经用上了：另一个时间列只是附加条件
+            used: dict[str, set[str]] = {}
+            for column, ref in where_refs:
+                # IS NULL / IS NOT NULL 只是要求有值，不是按这一列划时间范围
+                if ref and ref[0].alias == table.alias and not isinstance(column.parent, exp.Is):
+                    used.setdefault(ref[1], set()).add("筛选")
+            for ref in group:
+                if ref and ref[0].alias == table.alias:
+                    used.setdefault(ref[1], set()).add("分组")
+            for column, how in used.items():
+                if column.lower() == date[0].lower() or not table.temporal(column):
+                    continue
+                verb = "分组和筛选" if len(how) == 2 else next(iter(how))
+                label, date_label = table.column_label(column), table.column_label(date[0])
+                item = table.item("business_date")
+                rule = (item.get("value") or {}).get("rule") if item else None
+                out.append(SqlCheck(
+                    code="wrong_date_column", level=_level("wrong_date_column", [date[1]]), table=table.name,
+                    column=column, sql_excerpt=self.excerpt(next((c for c, r in where_refs if r and
+                                                                  r[1] == column), None) or exp.column(column)),
+                    message=(f"「{table.label()}」的业务日期按「{date_label}」计，查询却按「{label}」{verb}。"
+                             f"请改用「{date_label}」，或确认确实要按「{label}」统计"),
+                    for_model=(f"{table.name} 的业务日期列是 {date[0]}{f'（{rule}）' if rule else ''}，这条 SQL 却按 "
+                               f"{column} {verb}。按业务日期统计就把 {column} 换成 {date[0]}；确实要按 {column} 统计的话"
+                               "保留，并在结果说明里写清口径")))
+        return out
 
 
 def _parents(node: Any, *, stop: Any) -> Iterable[Any]:
@@ -468,6 +918,41 @@ def _parents(node: Any, *, stop: Any) -> Iterable[Any]:
     while parent is not None and parent is not stop:
         yield parent
         parent = parent.parent
+
+
+def _literal(node: Any) -> tuple[str, bool] | None:
+    """字面量 → (文本, 是不是字符串)。负数照常认；模板占位、参数、表达式返回 None（值到运行时才知道）。"""
+    from sqlglot import exp
+
+    node = _unparen(node)
+    negative = False
+    if isinstance(node, exp.Neg):
+        node, negative = _unparen(node.this), True
+    if not isinstance(node, exp.Literal):
+        return None
+    text = str(node.this)
+    if _SENTINEL in text:
+        return None
+    if node.is_string:
+        return (text, True) if not negative else None
+    return (f"-{text}" if negative else text), False
+
+
+def _number(text: str) -> float | None:
+    try:
+        return float(text.strip())
+    except ValueError:
+        return None
+
+
+def _known_code(literal: tuple[str, bool], codes: Mapping[str, Any]) -> bool:
+    """值在不在码值表里：原样相等、不分大小写相等、或者两边都是数且数值相等（1 和 '1'、1.0 都算 1）。"""
+    text = literal[0]
+    keys = [str(k) for k in codes]
+    if text in keys or text.strip().lower() in {k.strip().lower() for k in keys}:
+        return True
+    number = _number(text)
+    return number is not None and any(_number(k) == number for k in keys)
 
 
 __all__ = ["CHECK_CODES", "LEVELS", "MAX_CHECKS", "MAX_SQL_CHARS", "SqlCheck", "SqlChecker", "check_sql",
