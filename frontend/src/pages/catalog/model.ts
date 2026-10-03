@@ -155,6 +155,34 @@ export function filterCounts(rows: CatalogTableRow[], q: string, used = false): 
   return out
 }
 
+/**
+ * 清单的筛选、搜索、排序记在地址栏里（刷新、前进后退、把链接发给同事都不丢）：q 搜索词，filter 筛选，sort 排序，
+ * used=1 只看运行中查询过的表。默认值不写进地址；认不出的值按默认
+ */
+export interface ListParams { query: string; filter: ListFilter; sort: ListSort; used: boolean }
+
+export function listParamsOf(p: URLSearchParams): ListParams {
+  const filter = p.get('filter') as ListFilter | null
+  const sort = p.get('sort') as ListSort | null
+  return {
+    query: p.get('q') ?? '',
+    filter: filter && LIST_FILTERS.includes(filter) ? filter : 'all',
+    sort: sort && LIST_SORTS.includes(sort) ? sort : 'usage',
+    used: p.get('used') === '1',
+  }
+}
+
+/** 把清单的状态写回地址的查询参数：只动这几个键，别的参数原样留着 */
+export function writeListParams(p: URLSearchParams, s: ListParams): URLSearchParams {
+  const next = new URLSearchParams(p)
+  const put = (k: string, v: string | null) => (v ? next.set(k, v) : next.delete(k))
+  put('q', s.query.trim() ? s.query : null)
+  put('filter', s.filter === 'all' ? null : s.filter)
+  put('sort', s.sort === 'usage' ? null : s.sort)
+  put('used', s.used ? '1' : null)
+  return next
+}
+
 // ---------------------------------------------------------------------------
 // 批量确认：把选中的推断项改成已确认，整份提交（服务端把「值没动、状态改成确认」当作单项审阅，来源不变）
 // ---------------------------------------------------------------------------

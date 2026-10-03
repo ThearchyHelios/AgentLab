@@ -580,6 +580,33 @@ await section('数据目录 · 表清单的排序与筛选', async () => {
         && names.at(-1) === 'legacy_coupons', names.slice(0, 3).join(','))
   await page.locator('[data-catalog-sort]').selectOption('usage')
 
+  // 筛选、搜索、排序写进地址栏：刷新不丢，打开一张表、再回到清单都带着
+  await page.locator('[data-filter="pending"]').click()
+  await page.locator('[data-catalog-sort]').selectOption('name')
+  await search.fill('order')
+  await until(async () => new URL(page.url()).searchParams.get('q') === 'order', 3000)
+  const listUrl = new URL(page.url())
+  check('筛选、搜索、排序写进地址栏的查询参数', listUrl.searchParams.get('filter') === 'pending' && listUrl.searchParams.get('sort') === 'name'
+    && listUrl.searchParams.get('q') === 'order', listUrl.search)
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  names = await rowNames(page)
+  check('刷新之后筛选、搜索、排序都还在', (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'pending'
+    && await page.locator('[data-catalog-sort]').inputValue() === 'name' && await search.inputValue() === 'order'
+    && names.join(',') === 'order_items', `${names.join(',')} ${page.url()}`)
+  await page.locator('[data-catalog-row="order_items"] [data-catalog-open-row]').click()
+  await page.waitForURL(`**/data/catalog/${S1}/order_items?**`, { timeout: 5000 }).catch(() => {})
+  const tableUrl = new URL(page.url())
+  check('打开一张表：地址带着清单的查询参数，清单照旧筛着', tableUrl.pathname === `/data/catalog/${S1}/order_items`
+    && tableUrl.search === listUrl.search && (await rowNames(page)).join(',') === 'order_items', page.url())
+  await page.goBack({ waitUntil: 'networkidle' })
+  check('后退回到清单：筛选照旧', new URL(page.url()).search === listUrl.search
+    && (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'pending', page.url())
+  await page.locator('[data-filter="all"]').click()
+  await page.locator('[data-catalog-sort]').selectOption('usage')
+  await search.fill('')
+  check('回到默认（全部、按使用次数、不搜索）：地址里不留这几个参数', await until(async () => new URL(page.url()).search === '', 3000), page.url())
+
   // 键盘：↑↓ 在行之间移动，Enter 打开
   await page.locator('[data-catalog-row="visits"] [data-catalog-open-row]').focus()
   await page.keyboard.press('ArrowDown')

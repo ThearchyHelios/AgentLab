@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
@@ -16,8 +16,8 @@ import { ProfileSettingsDialog } from './ProfileSettings'
 import { profileBlockOf, profileSettingsOf, secondsText } from './profile'
 import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
-import { filterCounts, progressOf, rowFromDetail, usageSummary, visibleRows } from './model'
-import type { ListFilter, ListSort } from './model'
+import { filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
+import type { ListFilter, ListParams, ListSort } from './model'
 
 // ===========================================================================
 // 数据目录页（/data/catalog/:sourceId，选中一张表时 /data/catalog/:sourceId/:table）。
@@ -27,6 +27,9 @@ import type { ListFilter, ListSort } from './model'
 // 位置；编辑到一半换表、离开页面，走全站统一的离开前确认。
 //
 // 宽屏左右两栏；窄屏（< lg）一次只显示一栏：没选表时是清单，选了表是详情（详情里有「返回表清单」）。
+//
+// 清单的搜索词、筛选、排序和「只看运行中查询过的表」记在地址的查询参数里（q / filter / sort / used），刷新、前进后退
+// 都不丢；在清单和表详情之间跳转时带着它们走。
 // ===========================================================================
 
 export function CatalogPage() {
@@ -62,11 +65,39 @@ export function CatalogPage() {
   }, [load])
   useOnReconnect(() => { void load() })
 
-  const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState<ListFilter>('all')
-  const [sort, setSort] = useState<ListSort>('usage')
+  // 清单的状态以页面上的为准（点了立刻生效），再写进地址：搜索词停手 200ms 再写，其余马上写，都替换当前这条历史
+  // （筛选不该占满后退键）。地址被别处改了（前进后退、点了带参数的链接）时按地址重来
+  const [params, setParams] = useSearchParams()
+  const fromUrl = useMemo(() => listParamsOf(params), [params])
+  const urlSig = useMemo(() => writeListParams(new URLSearchParams(), fromUrl).toString(), [fromUrl])
+  const [list, setList] = useState<ListParams>(fromUrl)
+  const wrote = useRef(urlSig)
+  useEffect(() => {
+    if (urlSig === wrote.current) return
+    wrote.current = urlSig
+    setList(fromUrl)
+  }, [urlSig, fromUrl])
+  const listSig = useMemo(() => writeListParams(new URLSearchParams(), list).toString(), [list])
+  const typedAt = useRef(0)
+  useEffect(() => {
+    if (listSig === wrote.current) return
+    const t = setTimeout(() => {
+      wrote.current = listSig
+      setParams((prev) => writeListParams(prev, list), { replace: true })
+    }, Date.now() - typedAt.current < 200 ? 200 : 0)
+    return () => clearTimeout(t)
+  }, [listSig, list, setParams])
+  const { query, filter, sort } = list
   /** 只看运行中查询过的表：从顶部摘要点进来时打开，筛选结果和摘要的数字一致 */
-  const [usedOnly, setUsedOnly] = useState(false)
+  const usedOnly = list.used
+  const setQuery = useCallback((q: string) => { typedAt.current = Date.now(); setList((c) => ({ ...c, query: q })) }, [])
+  const setFilter = useCallback((f: ListFilter) => setList((c) => ({ ...c, filter: f })), [])
+  const setSort = useCallback((v: ListSort) => setList((c) => ({ ...c, sort: v })), [])
+  const setUsedOnly = useCallback((v: boolean) => setList((c) => ({ ...c, used: v })), [])
+  /** 跳到别的表、回到清单时带上清单的查询参数（按页面上的算：搜索词可能还没写进地址） */
+  const searchRef = useRef('')
+  const search = writeListParams(params, list).toString()
+  searchRef.current = search ? `?${search}` : ''
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   const [drafting, setDrafting] = useState(false)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
@@ -94,7 +125,8 @@ export function CatalogPage() {
   const visible = useMemo(() => visibleRows(rows, query, filter, sort, usedOnly), [rows, query, filter, sort, usedOnly])
   const counts = useMemo(() => filterCounts(rows, query, usedOnly), [rows, query, usedOnly])
   const base = `/data/catalog/${encodeURIComponent(sourceId)}`
-  const openTable = useCallback((t: string) => navigate(`${base}/${encodeURIComponent(t)}`), [navigate, base])
+  const openTable = useCallback((t: string) => navigate(`${base}/${encodeURIComponent(t)}${searchRef.current}`), [navigate, base])
+  const backToList = useCallback(() => navigate(`${base}${searchRef.current}`), [navigate, base])
   const back = source?.origin === 'upload' ? '/data/tables' : '/data/databases'
 
   /** 写入、审阅之后按返回的单表目录更新清单里那一行 */
@@ -198,12 +230,13 @@ export function CatalogPage() {
    * 正在看表详情时回到清单才看得到筛选结果；宽屏两栏都在，正在看的表不动
    */
   const focusUsed = useCallback((f: ListFilter) => {
-    setQuery('')
-    setFilter(f)
-    setUsedOnly(true)
-    setSort('usage')
-    if (table && typeof matchMedia === 'function' && matchMedia('(max-width: 1023px)').matches) navigate(base)
-  }, [table, navigate, base])
+    const next: ListParams = { query: '', filter: f, used: true, sort: 'usage' }
+    setList(next)
+    if (table && typeof matchMedia === 'function' && matchMedia('(max-width: 1023px)').matches) {
+      const q = writeListParams(params, next).toString()
+      navigate(`${base}${q ? `?${q}` : ''}`)
+    }
+  }, [table, navigate, base, params])
 
   const filtered = !!query.trim() || filter !== 'all' || usedOnly
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
@@ -290,7 +323,7 @@ export function CatalogPage() {
           {table
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
-                           onOpen={openTable} onBack={() => navigate(base)} onDetail={onDetail} />
+                           onOpen={openTable} onBack={backToList} onDetail={onDetail} />
             )
             : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
         </section>
