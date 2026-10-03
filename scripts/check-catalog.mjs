@@ -1248,6 +1248,9 @@ function profileReply(state, { ms = 0, extraCodes = false } = {}) {
     const visits = state.tables[S1].find((t) => t.name === 'visits')
     const notes = clone(visits.notes)
     const at = `${PROFILE_DAY}T03:00:00+00:00`
+    // 剖析之前这两条关系的状态（服务端 previous_status）：第一次闸机关系是命名推断，再剖析一次时已经是已验证
+    const before = (id) => visits.notes.relations.find((r) => r.id === id)?.status ?? null
+    const previous = { gate: before(GATE_REL), member: before(MEMBER_REL) }
     notes.relations = notes.relations.map((r) => (r.id === GATE_REL ? {
       ...r, source: 'profile', status: 'verified', coverage: 0.987, cardinality: 'many_to_one', updated_at: at,
       note: `数据剖析（${PROFILE_DAY}）：子表抽样 300 个不同键值，父表对上 296 个，覆盖率 98.7%；被指向列是主键；子表一侧有重复值，多对一。`,
@@ -1266,9 +1269,11 @@ function profileReply(state, { ms = 0, extraCodes = false } = {}) {
         table_name: 'visits', queries: 38, row_estimate: { rows: 182000, method: 'stats', at_least: null },
         findings: [
           { kind: 'relation', path: `relations.${GATE_REL}`, target: 'gate_id → gates.id', columns: ['gate_id'], to_table: 'gates', to_columns: ['id'],
-            status: 'verified', confirmed: false, coverage: 0.987, cardinality: 'many_to_one', sample: 300, matched: 296, summary: '覆盖率 98.7%，升为有确证' },
+            status: 'verified', confirmed: false, previous_status: previous.gate, coverage: 0.987, cardinality: 'many_to_one', sample: 300, matched: 296,
+            summary: previous.gate === 'verified' ? '覆盖率 98.7%，仍为有确证' : '覆盖率 98.7%，升为有确证' },
           { kind: 'relation', path: `relations.${MEMBER_REL}`, target: 'member_id → members.id', columns: ['member_id'], to_table: 'members',
-            to_columns: ['id'], status: 'proposed', confirmed: false, coverage: 0.62, cardinality: 'many_to_one', sample: 200, matched: 124,
+            to_columns: ['id'], status: 'proposed', confirmed: false, previous_status: previous.member, coverage: 0.62, cardinality: 'many_to_one',
+            sample: 200, matched: 124,
             summary: '抽样覆盖率 62%，保持推断' },
           { kind: 'codes', path: 'columns.status.codes', column: 'status', values: [{ value: '1', rows: 171080 }, { value: '9', rows: 9100 },
             { value: '2', rows: 1820 }], rows: 182000, status: 'proposed', summary: '3 个取值，1 个含义待填写' },
@@ -1558,6 +1563,13 @@ await section('数据目录 · 数据剖析', async () => {
   await page.locator('[data-profile-start]').click()
   await until(async () => (await profilePhase(page)) === 'done')
   check('窗口开着时完成：直接看报告，不另弹提示', (await toastBox.count()) <= 1)
+  // 重新剖析：闸机关系上一次已经核实成已验证，这次照样核实——写「仍为已验证」，不说「升为已验证」
+  const gateAgain = profileBox(page).locator(`[data-profile-finding="relation"][data-path="relations.${GATE_REL}"] [data-profile-outcome]`)
+  check('重新剖析：原本就是已验证的关系写「仍为已验证，覆盖率 98.7%」，不说「升为」', (await gateAgain.innerText()) === '仍为已验证，覆盖率 98.7%'
+        && (await gateAgain.getAttribute('data-profile-outcome')) === 'same', await gateAgain.innerText())
+  const memberAgain = profileBox(page).locator(`[data-profile-finding="relation"][data-path="relations.${MEMBER_REL}"] [data-profile-outcome]`)
+  check('……原本就是推断、这次仍不够的写「保持推断」', (await memberAgain.innerText()) === '保持推断：覆盖率不足，可能不是这条关系'
+        && (await memberAgain.getAttribute('data-profile-outcome')) === 'kept')
   // 点「填写含义」：报告收起、弹出那一列的码值；保存或取消之后回到报告，这一列改写成「含义已填写」，焦点落在下一列上
   const fillLine = (col) => profileBox(page).locator(`[data-profile-finding="codes"][data-column="${col}"]`)
   await fillLine('status').locator('[data-profile-fill]').click()

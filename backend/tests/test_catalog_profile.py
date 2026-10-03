@@ -277,6 +277,11 @@ async def test_rerun_with_same_data_changes_nothing(client, make_source, scenic_
     a, b = _table(first, "visits"), _table(second, "visits")
     assert (b["added"], b["updated"], b["removed"]) == (0, 0, 0)
     assert b["version"] == a["version"]
+    # 逐条结论按实际变化说：第一次是从推断升上来的，第二次原本就是已验证，不能再说「升为」
+    gate_a = next(f for f in a["findings"] if f.get("columns") == ["gate_id"])
+    gate_b = next(f for f in b["findings"] if f.get("columns") == ["gate_id"])
+    assert (gate_a["previous_status"], gate_a["status"]) == ("proposed", "verified") and "升为有确证" in gate_a["summary"]
+    assert (gate_b["previous_status"], gate_b["status"]) == ("verified", "verified") and "仍为有确证" in gate_b["summary"]
 
 
 # ---------------------------------------------------------------- 安全约束

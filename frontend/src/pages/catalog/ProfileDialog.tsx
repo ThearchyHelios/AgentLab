@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { ArrowUpRight, CircleCheck, OctagonX, ScanSearch, ShieldAlert, TriangleAlert } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpRight, CircleCheck, Equal, Minus, OctagonX, ScanSearch, ShieldAlert, TriangleAlert, UserCheck } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import type {
   CatalogProfileCodesFinding, CatalogProfileDateFinding, CatalogProfileOut, CatalogProfileRelationFinding, CatalogProfileSettings,
@@ -386,12 +387,27 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
   )
 }
 
+type RelationOutcome = 'confirmed' | 'raised' | 'same' | 'lowered' | 'kept'
+
+/**
+ * 一条关系这次剖析的结论，按实际变化说：原本就是已验证、这次照样核实的写「仍为已验证，覆盖率 x」，不能说「升为」——
+ * 重新剖析、目录没变时报告头写「目录没有变化」，下面却说升了，自相矛盾。老服务端不给剖析前的状态，按升级说
+ */
+function relationOutcome(f: CatalogProfileRelationFinding): { kind: RelationOutcome; text: string; tone: string; icon: LucideIcon } {
+  const reason = f.coverage < 0.95 ? PT.relationLowCoverage : PT.relationNotUnique
+  if (f.confirmed) return { kind: 'confirmed', text: PT.relationConfirmed, tone: STATUS_TONE.confirmed, icon: UserCheck }
+  if (f.status === 'verified') {
+    return f.previous_status === 'verified'
+      ? { kind: 'same', text: UT.relationStillVerified(coverageText(f.coverage)), tone: STATUS_TONE.verified, icon: Equal }
+      : { kind: 'raised', text: PT.relationVerified, tone: STATUS_TONE.verified, icon: ArrowUp }
+  }
+  return f.previous_status === 'verified'
+    ? { kind: 'lowered', text: UT.relationLowered(reason), tone: STATUS_TONE.proposed, icon: ArrowDown }
+    : { kind: 'kept', text: `${PT.relationKept}：${reason}`, tone: STATUS_TONE.proposed, icon: Minus }
+}
+
 function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
-  const outcome = f.confirmed
-    ? { text: PT.relationConfirmed, tone: 'var(--text-dim)' }
-    : f.status === 'verified'
-      ? { text: PT.relationVerified, tone: STATUS_TONE.verified }
-      : { text: `${PT.relationKept}：${f.coverage < 0.95 ? PT.relationLowCoverage : PT.relationNotUnique}`, tone: STATUS_TONE.proposed }
+  const outcome = relationOutcome(f)
   return (
     <li className="text-xs" data-profile-finding="relation" data-status={f.status} data-path={f.path}>
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
@@ -405,7 +421,7 @@ function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
         {' · '}
         {PT.sampled(f.sample, f.matched)}
       </div>
-      <div className="mt-0.5 text-2xs" style={{ color: outcome.tone }} data-profile-outcome="">{outcome.text}</div>
+      <div className="mt-0.5 text-2xs" style={{ color: outcome.tone }} data-profile-outcome={outcome.kind}>{outcome.text}</div>
     </li>
   )
 }

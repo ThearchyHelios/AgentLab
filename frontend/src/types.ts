@@ -2850,6 +2850,8 @@ export interface CatalogProfileRelationFinding {
   to_columns: string[]
   status: CatalogStatus
   confirmed: boolean
+  /** 剖析之前目录里这条关系的状态：报告按它说「升为已验证」还是「仍为已验证」。老服务端不给 */
+  previous_status?: CatalogStatus | null
   coverage: number
   cardinality: CatalogCardinality | null
   /** 抽了几个不同的键值、在被指向表里对上几个 */

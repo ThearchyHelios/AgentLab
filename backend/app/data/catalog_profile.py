@@ -910,10 +910,13 @@ async def _check_dates(cx: _Context, table: str, columns: list[str], total: int,
 
 
 def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, confirmed: bool) -> dict[str, Any]:
+    """一条关系的核实结论。previous_status 是剖析之前目录里这条关系的状态：报告按它说「升为已验证」还是「仍为已验证」
+    （重新剖析、目录没变时不能说升了）。"""
+    previous = rel.get("status")
     if confirmed:
         summary = "已人工确认，只补充覆盖率和基数"
     elif status == "verified":
-        summary = f"覆盖率 {_percent(o.coverage)}，升为有确证"
+        summary = f"覆盖率 {_percent(o.coverage)}，" + ("仍为有确证" if previous == "verified" else "升为有确证")
     elif o.coverage < catalog.PROFILE_VERIFY_COVERAGE:
         summary = f"抽样覆盖率 {_percent(o.coverage)}，保持推断"
     else:
@@ -921,8 +924,8 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,
             "columns": list(rel.get("columns") or []), "to_table": rel.get("to_table"),
             "to_columns": list(rel.get("to_columns") or []), "status": status, "confirmed": confirmed,
-            "coverage": o.coverage, "cardinality": o.cardinality, "sample": o.sample, "matched": o.matched,
-            "summary": summary}
+            "previous_status": previous, "coverage": o.coverage, "cardinality": o.cardinality, "sample": o.sample,
+            "matched": o.matched, "summary": summary}
 
 
 def _codes_value(c: _CodesOutcome, item: dict[str, Any] | None) -> dict[str, str]:

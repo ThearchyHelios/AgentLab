@@ -2517,6 +2517,9 @@ export const CATALOG_UI_TEXT = {
   editMeanings: '修改含义',
   editMeaningsLabel: (col: string) => `修改含义：列 ${col} 的码值`,
   fillWhileEditing: '正在编辑这张表，保存或取消后再填写码值的含义',
+  // ---- 剖析报告里关系的结论：按这次的实际变化说（原本就是已验证的不说「升为」）
+  relationStillVerified: (coverage: string) => `仍为已验证，覆盖率 ${coverage}`,
+  relationLowered: (reason: string) => `降为推断：${reason}`,
 }
 
 // ===========================================================================
