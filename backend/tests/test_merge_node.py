@@ -432,6 +432,7 @@ def test_judge_excerpt_names_the_inputs_and_masks_their_sources():
     entry = {"kind": "query", "artifact": "m" * 64, "source": MERGE_SOURCE}
     text = judge._query_excerpt("Q3", entry, {0}, ["订单数"], False, lambda _a: snap,
                                 {"merge_members": ["手机号"]})
+    assert text.startswith("【Q3】合并查询结果（共 1 行）")
     assert "合并的输入：s（节点 q_sales，数据源 merge_stores，1 行）、v（节点 q_visits，数据源 merge_members，1 行）" in text
     assert "13800000000" not in text and "遮罩" in text
 

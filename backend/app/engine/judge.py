@@ -350,7 +350,8 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     total = len(snapshot["rows"])
     # 旧形状的台账条目没记数据源：按快照自己记的找遮罩（证据面板同一个口径）
     source = entry.get("source") or snapshot.get("source")
-    head = f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）"
+    head = (f"【{alias}】合并查询结果（共 {total} 行）" if snapshot.get("source") == MERGE_SOURCE
+            else f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）")
     sql = _clean(str(snapshot.get("sql") or ""))
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
     if snapshot.get("source") == MERGE_SOURCE:
