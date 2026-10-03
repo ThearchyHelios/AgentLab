@@ -307,7 +307,8 @@ export function changeCount(initial: EditForm, form: EditForm): number {
   for (const k of TABLE_KEYS) if ((initial.table[k] ?? '') !== (form.table[k] ?? '')) n++
   for (const [col, fields] of Object.entries(form.columns)) {
     for (const f of COLUMN_FIELDS) if ((initial.columns[col]?.[f] ?? '') !== (fields[f] ?? '')) n++
-    if (completeOf(initial.columns[col]) !== completeOf(fields)) n++
+    // 清空码值时勾选跟着失效，那一处已经算在码值的文字里，不重复算
+    if ((fields.codes ?? '').trim() && completeOf(initial.columns[col]) !== completeOf(fields)) n++
   }
   const before = new Map(initial.relations.map((r) => [r.key, r]))
   const after = new Set(form.relations.map((r) => r.key))
