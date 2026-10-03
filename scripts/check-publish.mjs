@@ -209,7 +209,7 @@ function lint(graph, level, { followsNever = false } = {}) {
     issues.push({ level: 'error', node_id: null, code: 'governed.no_contract', fix: id, field: null,
       message: '受管级别要求至少一个「成果」节点声明出具契约，否则无法判定出具档位' })
     fixes.push({ id, code: 'governed.no_contract', node_id: outputs[0].id, kind: 'choice', multiple: true,
-      label: `为${who(outputs[0])}生成出具契约：核对${report ? who(report) : '「报告撰写」'}的文档，指标来自${who(cards[0])}，再选择「必需指标」`,
+      label: `为${who(outputs[0])}生成出具契约：核对${report ? who(report) : '「报告撰写」'}的文档，指标来自${cards.length ? who(cards[0]) : '「口径卡」'}，再选择「必需指标」`,
       options: cards.flatMap(metricOptions) })
   }
   for (const n of graph.nodes) {
@@ -834,6 +834,29 @@ await section('SQL 检查（数据目录阶段 4B）：发布前检查写中文�
   const text = await row.innerText()
   check('发布弹窗：SQL 检查的问题写节点名和中文规则名，不露规则编号', text.includes('「订单汇总」') && text.includes('一对多关联后重复计算：')
     && text.includes('会重复计算') && !/fanout_sum|args\.sql/.test(text), text)
+  // 错误级的 SQL 检查在已发布档只提醒（设计如此），但不能和「没指定模型」这类提示一个样：级别标识和证据面板同一个
+  // （SqlLevelBadge：图标 + 「错误」、失败色），并说清已发布级别只提醒、受管级别会拦
+  const badge = row.locator('[data-sql-level]')
+  const badgeLook = await badge.evaluate((el) => {
+    const probe = document.createElement('span')
+    probe.style.color = 'var(--st-failed)'
+    document.body.append(probe)
+    const failed = getComputedStyle(probe).color
+    probe.remove()
+    return { level: el.getAttribute('data-sql-level'), text: el.innerText.trim(), color: getComputedStyle(el).color, failed, icon: !!el.querySelector('svg') }
+  }).catch(() => null)
+  check('……带证据面板同一个级别标识：「错误」、失败色、带图标', badgeLook?.level === 'error' && badgeLook.text === '错误'
+    && badgeLook.color === badgeLook.failed && badgeLook.icon, JSON.stringify(badgeLook))
+  check('……写明这是 SQL 检查发现的错误级问题：已发布级别只提醒、不拦，受管级别会拦下',
+    (await row.locator('[data-preflight-sql-gate="reminded"]').innerText().catch(() => '')) === 'SQL 检查发现的错误级问题：已发布级别只提醒、不拦发布；受管级别会拦下')
+  check('……结论那句话里点出来，不和别的提示混成一个数', (await dialog(page).locator('[data-preflight-sql-errors="1"]').innerText().catch(() => ''))
+    .includes('其中 1 处是 SQL 检查发现的错误级问题'))
+  await dialog(page).locator('[role="radio"]:has-text("受管")').click()
+  await waitFor(page, async () => (await row.locator('[data-preflight-sql-gate="blocked"]').count()) === 1)
+  check('换成受管：同一条写「受管级别会拦下发布」，行首是错误', (await row.locator('[data-preflight-sql-gate]').innerText()).includes('受管级别会拦下发布')
+    && await row.locator('svg[aria-label="错误"]').count() === 1 && await dialog(page).locator('[data-preflight-sql-errors]').count() === 0)
+  await dialog(page).locator('[role="radio"]:has-text("已发布")').click()
+  await waitFor(page, async () => (await row.locator('[data-preflight-sql-gate="reminded"]').count()) === 1)
   await shoot(page, 'preflight-sqlcheck', dialog(page))
   await row.locator('button').first().click()
   const where = () => page.evaluate(() => {

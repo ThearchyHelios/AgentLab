@@ -2533,6 +2533,11 @@ export const CATALOG_UI_TEXT = {
   patchNote: '说明',
   // ---- 合并查询的输入：连线时还没选工具、后来才选上的查询节点，一次带出来
   mergeAddConnected: (n: number) => `带出连着的 ${formatNumber(n)} 个查询节点`,
+  // ---- 发布前检查里的 SQL 检查问题：级别标识和证据面板一致，并说清两个发布级别下拦不拦
+  publishSqlErrorReminded: 'SQL 检查发现的错误级问题：已发布级别只提醒、不拦发布；受管级别会拦下',
+  publishSqlErrorBlocked: 'SQL 检查发现的错误级问题：受管级别会拦下发布，请先修改 SQL',
+  publishSqlWarning: 'SQL 检查的提醒：两个发布级别都只提醒、不拦发布',
+  publishSqlErrors: (n: number) => `，其中 ${formatNumber(n)} 处是 SQL 检查发现的错误级问题（受管级别会拦下）`,
 }
 
 // ===========================================================================
