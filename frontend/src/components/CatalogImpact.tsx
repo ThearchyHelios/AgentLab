@@ -18,24 +18,28 @@ import { Skeleton } from './ui'
 
 const SHOWN = 5
 
-export function CatalogImpactList({ sourceId, table, refreshKey, compact = false }: {
+export function CatalogImpactList({ sourceId, table, refreshKey, compact = false, onLoad }: {
   sourceId: string
   table: string
   /** 变了就重新统计（表详情传目录版本：保存之后刷新） */
   refreshKey?: number | string
   /** 卡片里的紧凑版：只列前几个模板，节点收成一行 */
   compact?: boolean
+  /** 统计好了：数据目录页据此在保存之后说「N 个已发布模板引用这张表」 */
+  onLoad?: (d: CatalogImpact) => void
 }) {
   const [data, setData] = useState<CatalogImpact | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [all, setAll] = useState(false)
   const seq = useRef(0)
+  const onLoadRef = useRef(onLoad)
+  onLoadRef.current = onLoad
 
   const load = useCallback(() => {
     const mine = ++seq.current
     setError(null)
     api.dataCatalog.impact(sourceId, table)
-      .then((d) => { if (mine === seq.current) setData(d) })
+      .then((d) => { if (mine === seq.current) { setData(d); onLoadRef.current?.(d) } })
       .catch((e) => { if (mine === seq.current) setError(e) })
   }, [sourceId, table])
 

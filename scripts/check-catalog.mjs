@@ -925,8 +925,27 @@ await section('数据目录 · 引用这张表的模板（影响面）', async (
   // 开发模式下 StrictMode 会把挂载时的取数做两遍，只查有没有取、没有写
   check('统计影响面只读', writes(sent, /impact/).length === 0 && count(sent, /\/visits\/impact$/) >= 1,
     `${count(sent, /\/visits\/impact$/)} 次`)
+  // 在目录页改过（这里是编辑保存）：表头说有几个已发布模板引用这张表，和助手卡片保存后同一句
+  const savedHint = page.locator('[data-catalog-saved-impact]')
+  check('没改过：表头不说影响面', await savedHint.count() === 0)
+  await page.locator('[data-catalog-edit]').click()
+  await page.locator('[data-input="grain"]').fill('一张门票的一次入园（检查）')
+  await page.locator('[data-catalog-save]').click()
+  check('在目录页编辑保存后：表头说「2 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化」',
+    await until(async () => (await savedHint.count()) === 1)
+    && (await savedHint.innerText()).includes('2 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化'),
+    await savedHint.innerText().catch(() => ''))
+  await savedHint.locator('[data-catalog-saved-impact-show]').click()
+  check('……点「查看模板」：焦点落到「引用这张表的模板」一栏', await until(async () => page.evaluate(() => document.activeElement?.id === 'catalog-sec-impact'), 2000))
+  await savedHint.locator('[data-catalog-saved-impact-dismiss]').click()
+  check('……可以收起', await savedHint.count() === 0)
+  // 单项确认也升版本：同样说
+  await openMark(page, 'description')
+  await page.locator('[data-item-panel] [data-review-action="confirm"]').click()
+  check('单项确认之后同样说', await until(async () => (await savedHint.count()) === 1))
   // 没有模板引用的表：直说没有
   await openDetail(page, S1, 'orders')
+  check('换一张表：上一张的提示不带过来', await savedHint.count() === 0)
   check('没有模板引用：直说没有', (await page.locator('[data-catalog-section="impact"] [data-catalog-impact="0"]').innerText())
     .includes('没有已发布或受管的模板引用这张表'))
   // 表详情保存之后（版本变了）重新统计
@@ -936,6 +955,8 @@ await section('数据目录 · 引用这张表的模板（影响面）', async (
   await page.locator('[data-catalog-save]').click()
   await until(async () => count(sent, /\/orders\/impact$/) > before, 3000)
   check('保存之后重新统计影响面', count(sent, /\/orders\/impact$/) > before, `${before} → ${count(sent, /\/orders\/impact$/)}`)
+  await sleep(300)
+  check('……没有模板引用的表保存后不说影响面', await savedHint.count() === 0)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await close()
 })

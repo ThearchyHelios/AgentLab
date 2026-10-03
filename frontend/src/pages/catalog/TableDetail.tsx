@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, ListChecks, Lock, Pencil, Plus, RotateCw, Search } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, ListChecks, Lock, Pencil, Plus, RotateCw, Search, X } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type {
@@ -95,6 +95,12 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
     setCodesFor(null)
     if (seq != null && back) onFillDoneRef.current?.(seq, pending)
   }, [])
+  /**
+   * 在这一页改过目录（保存、确认、驳回、填码值）：改了就升版本，从已发布版本发起的正式运行会提醒「数据目录有变化」。
+   * 改完在表头说一句有几个已发布模板引用这张表（和助手的「建议更新数据目录」卡片保存后同一句），版本号对上才说
+   */
+  const [savedAt, setSavedAt] = useState<number | null>(null)
+  const [impact, setImpact] = useState<{ version: number; n: number } | null>(null)
   const loadSeq = useRef(0)
   const onDetailRef = useRef(onDetail)
   onDetailRef.current = onDetail
@@ -125,6 +131,8 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
     setLive('')
     setCodesFor(null)
     fillOpen.current = null
+    setSavedAt(null)
+    setImpact(null)
     void load()
   }, [load])
 
@@ -172,6 +180,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
       setDetail(d)
       setConflict(null)
       onDetailRef.current(d)
+      setSavedAt(d.version)
       return d
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) setConflict(editingRef.current ? 'edit' : 'review')
@@ -236,6 +245,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
       setDetail(next)
       setConflict(null)
       onDetailRef.current(next)
+      setSavedAt(next.version)
       closeCodes(pendingCodes(value))
       const filled = Math.max(0, pendingCodes(item.value) - pendingCodes(value))
       toast.ok(KT.saved(filled))
@@ -342,6 +352,13 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
     await load()
   }
 
+  /** 表头那句影响面提示的「查看」：滚到「引用这张表的模板」一栏，焦点给它的标题 */
+  const showImpact = () => {
+    const el = document.getElementById('catalog-sec-impact')
+    el?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    el?.focus({ preventScroll: true })
+  }
+
   const targetOf = (name: string) => {
     const lower = name.toLowerCase()
     return rows.find((r) => r.table_name === name || r.qualified === name)
@@ -385,6 +402,22 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
             </button>
           </div>
         </div>
+        {!edit && savedAt === detail.version && impact?.version === detail.version && impact.n > 0 && (
+          <div className="flex items-start gap-1.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed text-dim" role="status"
+               style={{ borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))', background: 'color-mix(in srgb, var(--accent) 6%, transparent)' }}
+               data-catalog-saved-impact={impact.n}>
+            <GitBranch size={11} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} aria-hidden />
+            <span className="min-w-0 flex-1">
+              {UT.savedImpact(impact.n)}
+              <button type="button" className="ml-1.5 rounded px-0.5 text-[var(--accent)] underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                      onClick={showImpact} data-catalog-saved-impact-show="">{UT.savedImpactShow}</button>
+            </span>
+            <button type="button" className="shrink-0 rounded p-0.5 text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                    onClick={() => setSavedAt(null)} aria-label={UT.savedImpactDismiss} title={UT.savedImpactDismiss} data-catalog-saved-impact-dismiss="">
+              <X size={10} aria-hidden />
+            </button>
+          </div>
+        )}
         {!edit && (
           <div className="flex flex-wrap items-center gap-1.5">
             {counts.proposed > 0 && (
@@ -482,10 +515,11 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
 
           <section aria-labelledby="catalog-sec-impact" data-catalog-section="impact">
             <div className="mb-2 flex flex-wrap items-baseline gap-2">
-              <h3 id="catalog-sec-impact" className="text-xs font-semibold">{CATALOG_IMPACT_TEXT.title}</h3>
+              <h3 id="catalog-sec-impact" className="text-xs font-semibold outline-none" tabIndex={-1}>{CATALOG_IMPACT_TEXT.title}</h3>
               <span className="text-2xs text-faint">{CATALOG_IMPACT_TEXT.hint}</span>
             </div>
-            <CatalogImpactList sourceId={sourceId} table={detail.table_name} refreshKey={detail.version} />
+            <CatalogImpactList sourceId={sourceId} table={detail.table_name} refreshKey={detail.version}
+                               onLoad={(d) => setImpact({ version: detail.version, n: d.templates.length })} />
           </section>
         </div>
       </div>

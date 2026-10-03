@@ -2525,6 +2525,10 @@ export const CATALOG_UI_TEXT = {
   codesPendingAfter: '确认后这些码值仍显示「含义待填写」，之后可以再填写',
   confirmColumnTitle: (col: string, n: number) => `确认列 ${col} 的 ${formatNumber(n)} 项推断？`,
   confirmCodesTitle: (where: string) => `确认${where}？`,
+  // ---- 在目录页改过之后：和助手卡片保存后同一句，说有几个已发布模板引用这张表
+  savedImpact: (n: number) => `已保存。${formatNumber(n)} 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化`,
+  savedImpactShow: '查看模板',
+  savedImpactDismiss: '收起这条提示',
 }
 
 // ===========================================================================
