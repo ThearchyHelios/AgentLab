@@ -25,7 +25,7 @@ import {
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
 import { EVIDENCE_STATE, claimProblems, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
-import type { EvidenceDocData } from '../types'
+import type { EvidenceDocData, IssuanceSqlCheck } from '../types'
 import { useRunClock } from './useRunClock'
 import { CatalogPatchCard } from './CatalogPatchCard'
 import type { CatalogPatch } from './catalogPatch'
@@ -2262,6 +2262,32 @@ function OutputValue({ value, marks, label }: { value: unknown; marks?: MarkSpec
   )
 }
 
+/**
+ * 出具声明里没通过 SQL 检查的查询（sql_checks）：每条写是哪次查询、什么问题、影响了哪些引用，下一步写改来源查询的 SQL。
+ * 出具横幅和报告页顶部共用。颜色跟着档位：降档用提醒色，不予出具用失败色
+ */
+export function IssuanceSqlChecks({ tier, checks }: { tier: string; checks: IssuanceSqlCheck[] }) {
+  const tone = tier === 'withheld' ? 'var(--st-failed)' : 'var(--st-waiting)'
+  return (
+    <div className="mt-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed" data-issuance-sql-checks={checks.length}
+         style={{ borderColor: `color-mix(in srgb, ${tone} 45%, var(--border))`, background: `color-mix(in srgb, ${tone} 6%, transparent)` }}>
+      <div className="flex items-center gap-1 font-medium" style={{ color: tone }}>
+        <AlertTriangle size={11} aria-hidden /> {RUN_SQL_CHECK_TEXT.issuanceTitle(tier)}
+      </div>
+      <ul className="mt-0.5 space-y-0.5">
+        {checks.map((c, i) => (
+          <li key={`${c.query ?? ''}:${i}`} className="[overflow-wrap:anywhere]" data-issuance-sql-check={c.node_id ?? ''}>
+            <span className="font-medium text-fg">{c.query || RUN_SQL_CHECK_TEXT.issuanceQuery}</span>
+            {!!c.problems?.length && <span className="text-fg">：{c.problems.join('；')}</span>}
+            {!!c.refs?.length && <span className="text-dim">（{RUN_SQL_CHECK_TEXT.issuanceAffected(c.refs.join('、'))}）</span>}
+          </li>
+        ))}
+      </ul>
+      <div className="mt-0.5 text-dim">{RUN_SQL_CHECK_TEXT.issuanceNext}</div>
+    </div>
+  )
+}
+
 const TIER_META: Record<string, { color: string; soft: string; hint: string }> = {
   formal: { color: 'var(--st-done)', soft: 'var(--st-done-soft)', hint: ISSUANCE_HINT.formal },
   degraded: { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: ISSUANCE_HINT.degraded },
@@ -2292,7 +2318,12 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   if (!tier) return null
   const meta = TIER_META[tier] ?? { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: '' }
   const unmatched: any[] = issuance?.unmatched_numbers ?? []
-  const gaps: string[] = Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []
+  // 没通过 SQL 检查的查询（出具声明的 sql_checks）单列一块、写在显眼处：数字都有出处，降档却是因为算数的查询本身有问题。
+  // 单列了的那几句（gap）不在其余缺口里重复
+  const sqlChecks: IssuanceSqlCheck[] = (Array.isArray(issuance?.sql_checks) ? issuance.sql_checks : [])
+    .filter((x: unknown): x is IssuanceSqlCheck => !!x && typeof x === 'object')
+  const sqlGaps = new Set(sqlChecks.map((x) => x.gap).filter(Boolean))
+  const gaps: string[] = (Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []).filter((g: string) => !sqlGaps.has(g))
   const calibers: any[] = issuance?.calibers ?? []
   const matched = Number(issuance?.matched_numbers ?? 0)
   // 逐个数字的出处（matched[].caliber 形如「口径名 @ v2」）：有它就能按卡数清楚，
@@ -2309,6 +2340,8 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   const uncitedClaims = Number(issuance?.claims?.uncited_claims ?? 0) || 0
   const numbers = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
   const numbersOk = !counts?.none && !counts?.other
+  // 数字都有出处只在完整出具时用绿色：降档时「10 个数字都有出处」画成绿的，读的人会以为一切正常
+  const numbersColor = !numbersOk ? 'var(--st-waiting)' : tier === 'formal' ? 'var(--st-done)' : 'var(--text-dim)'
   // 四期：结论句有判定（开了裁判，或探索运行里按需判过）时多一段「结论 4 句（支持 3 · 无证据 1）」。
   // 没开裁判的文档里没挂依据的都数在这一段的「无证据」里，不再另起一句；开了裁判的文档里，没挂依据却送了
   // 裁判的句子按判定数、预筛放掉的不数——出具照样按没挂依据计缺口（require_citation、judge 都是），这时
@@ -2340,7 +2373,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         // 结论句靠句末徽标定位；只是没挂依据的结论句没有徽标，定位不到
         <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
           {numbers && (
-            <span className="tnum" style={{ color: numbersOk ? 'var(--st-done)' : 'var(--st-waiting)' }}>{numbers}</span>
+            <span className="tnum" style={{ color: numbersColor }} data-evidence-line-numbers="">{numbers}</span>
           )}
           {suspect > 0 && (
             <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-suspect="">
@@ -2362,9 +2395,10 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         </div>
       )}
 
+      {!!sqlChecks.length && <IssuanceSqlChecks tier={tier} checks={sqlChecks} />}
       {!!gaps.length && (
-        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
-          <div className="font-medium">校验未全部完成：</div>
+        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-issuance-gaps="">
+          <div className="font-medium">{RUN_SQL_CHECK_TEXT.otherGaps}</div>
           <ul className="mt-0.5 space-y-0.5 pl-2">
             {gaps.map((g) => <li key={g}>· {g}</li>)}
           </ul>

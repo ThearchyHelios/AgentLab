@@ -466,6 +466,12 @@ def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
 
 def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | None = None, *,
                    label: Callable[[str, str | None], str | None] | None = None) -> list[str]:
+    """sql_check_findings 的那几句缺口（见下）。"""
+    return [f["text"] for f in sql_check_findings(metrics, cited, label=label)]
+
+
+def sql_check_findings(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | None = None, *,
+                       label: Callable[[str, str | None], str | None] | None = None) -> list[dict[str, Any]]:
     """没通过 SQL 检查（error 级：一对多关联后重复计算、存量跨期加总）的查询，每条一句缺口。
 
     两处来历：契约收来的指标（口径卡标了 sql_check_failed，sql_check_sources 记着取数的查询快照），以及报告直接
@@ -475,9 +481,12 @@ def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | 
     按出问题的那条查询归并（合并查询顺着输入找到源查询）：同一条查询算出三个指标、报告又引用了它的格，也只记一句，
     句子里列出受影响的引用。label(快照 id, 节点 id) 给出「查询「取数」（Q1）」这样的称呼，给不出就写「所依据的查询」。
     指标标了 sql_check_failed、快照却读不出来（被清理、被改过）的，退回口径卡记下的那句：缺口不能因为读不到快照就消失。
+
+    每条一个 dict：text（缺口那句）、query（称呼）、artifact、node_id、problems、refs。出具声明里另存一份
+    sql_checks：报告页据此在显眼处说「因为 SQL 检查没通过而降档」，不用从缺口的中文里认。
     """
     groups: dict[str, dict[str, Any]] = {}
-    fallback: list[str] = []
+    fallback: list[dict[str, Any]] = []
 
     def add(artifact: Any, ref: str) -> bool:
         found = query_problems(artifact) if isinstance(artifact, str) and artifact else []
@@ -495,7 +504,8 @@ def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | 
         name = f"指标「{m.get('name') or m.get('id')}」"
         hits = [add(src.get("artifact"), name) for src in m.get("sql_check_sources") or [] if isinstance(src, dict)]
         if not any(hits):
-            fallback.append(f"{name}{m.get('sql_check_reason') or '所依据的查询未通过 SQL 检查'}")
+            fallback.append({"text": f"{name}{m.get('sql_check_reason') or '所依据的查询未通过 SQL 检查'}",
+                             "query": None, "artifact": None, "node_id": None, "problems": [], "refs": [name]})
     for artifact, refs in (cited or {}).items():
         for ref in refs:
             add(artifact, ref)
@@ -503,10 +513,13 @@ def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | 
     out = []
     for artifact, group in groups.items():
         problem = group["problem"]
-        who = (label(artifact, problem.node_id) if label else None) or "所依据的查询"
+        named = label(artifact, problem.node_id) if label else None
+        who = named or "所依据的查询"
         refs = group["refs"]
         listed = "、".join(refs[:_SQL_REFS]) + (f"等 {len(refs)} 处" if len(refs) > _SQL_REFS else "")
-        out.append(f"{who}{problem_clause(problem.problems)}；受影响的引用：{listed}")
+        out.append({"text": f"{who}{problem_clause(problem.problems)}；受影响的引用：{listed}", "query": named,
+                    "artifact": artifact, "node_id": problem.node_id, "problems": problem.problems,
+                    "refs": refs[:_SQL_REFS * 2]})
     return out + fallback
 
 

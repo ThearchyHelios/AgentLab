@@ -188,6 +188,29 @@ export const CALIBERS_OUTPUT = {
   },
 }
 
+/**
+ * 数字都有出处，却因为算数的查询没通过 SQL 检查而降档（engine/nodes/io.py 的 sql_checks）：横幅单列一块说明，
+ * 那一句不在其余缺口里重复；「都有出处」不画成绿色
+ */
+export const SQL_GAP = `查询「订单金额查询」（Q1）未通过 SQL 检查（${'「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'}），结果不可靠；受影响的引用：指标「订单金额」、Q1 第 1 行「gmv」`
+export const SQL_DEGRADED_OUTPUT = {
+  answer: '上周订单金额 **119,160** 元。',
+  _issuance: {
+    tier: 'degraded',
+    calibers: [{ node: 'k1', caliber: '订单口径', version: 'v2' }],
+    metrics_checked: 1,
+    missing_required: [],
+    missing_expected: [],
+    unmatched_numbers: [],
+    matched_numbers: 1,
+    matched: [{ token: '119,160', metric: 'gmv', caliber: '订单口径 @ v2' }],
+    gaps: [SQL_GAP, '协作团队「分析团队」用完 2 轮仍未完成，交付的是成员最后的回复'],
+    sql_checks: [{ query: '查询「订单金额查询」（Q1）', node_id: 'q_a',
+      problems: ['「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'],
+      refs: ['指标「订单金额」', 'Q1 第 1 行「gmv」'], gap: SQL_GAP }],
+  },
+}
+
 /** 只有一张口径卡、逐个出处都指向它：直说「都来自这张卡」 */
 export const CALIBER_ONE_OUTPUT = {
   answer: '上周订单 **128** 单，已付款 **96** 单。',

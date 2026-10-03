@@ -97,6 +97,12 @@ async def test_one_failing_query_is_one_gap_and_one_timeline_row(scenic_source, 
     [gap] = [g for g in issuance["gaps"] if "SQL 检查" in g]
     assert gap.count(PROBLEM) == 1
     assert "指标「订单金额」" in gap and "指标「订单金额（整形后）」" in gap and "Q1 第 1 行「gmv」" in gap
+    # 出具声明和事件另带结构化的 sql_checks：报告页在显眼处说明降档原因，不从缺口的中文里认（B5）
+    [found] = issuance["sql_checks"]
+    assert found == {"query": "查询「fetch」（Q1）", "node_id": "fetch", "problems": [PROBLEM],
+                     "refs": ["指标「订单金额」", "指标「订单金额（整形后）」", "Q1 第 1 行「gmv」"], "gap": gap}, found
+    [declared] = [e.data for e in await events(row.id, "issuance")]
+    assert declared["sql_checks"] == issuance["sql_checks"]
 
     # 运行时间线：同一条查询的问题一行，列出受影响的指标；带着结构化字段，界面不用解析中文
     [log] = [e.data for e in await events(row.id, "log", "card") if e.data.get("code") == "metric_sql_check"]

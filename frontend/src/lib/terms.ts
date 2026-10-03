@@ -2598,6 +2598,13 @@ export const RUN_SQL_CHECK_TEXT = {
   /** 「打开设置」落到来源查询节点的 SQL 上 */
   openSql: (label?: string) => (label ? `打开「${label}」的 SQL` : '打开来源查询的 SQL'),
   metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 出具横幅、报告页：SQL 检查导致的降档单列一块 */
+  issuanceTitle: (tier: string) => (tier === 'degraded' ? '降档原因：所依据的查询未通过 SQL 检查' : '所依据的查询未通过 SQL 检查'),
+  issuanceQuery: '所依据的查询',
+  issuanceAffected: (refs: string) => `受影响：${refs}`,
+  issuanceNext: '数字的出处都对得上，但算出这些数的查询本身有问题，结果不可靠。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 其余缺口的标题（SQL 检查的那几条单列之后） */
+  otherGaps: '校验未全部完成：',
 }
 
 export const COPILOT_CONTEXT_TEXT = {

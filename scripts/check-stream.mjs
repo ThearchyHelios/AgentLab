@@ -1303,6 +1303,17 @@ await section('放弃、结构化的报错、恢复的轮次、出具横幅（RE
   check('恢复的轮次：头部照样写几次查询', head.includes('3 次查询'), head.replace(/\n/g, ' '))
   await r.page.close()
 
+  // 降档是因为查询没通过 SQL 检查（B5）：横幅单列一块写是哪次查询、什么问题、影响了哪些引用；那一句不在其余缺口里重复
+  const q = await open('syn=issued-sql', { w: 1100, h: 900, name: 'issued-sql' })
+  const banner = q.page.locator('[data-issuance-banner=degraded]')
+  const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('SQL 检查导致的降档单列一块：写降档原因、哪次查询、问题、受影响的引用、下一步', sql.includes('降档原因：所依据的查询未通过 SQL 检查')
+    && sql.includes('查询「订单金额查询」（Q1）') && sql.includes('求和会重复计算') && sql.includes('受影响：指标「订单金额」、Q1 第 1 行「gmv」')
+    && sql.includes('修改来源查询的 SQL'), sql)
+  const rest = (await banner.locator('[data-issuance-gaps]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……那一句不在「校验未全部完成」里重复，其余缺口照列', !rest.includes('未通过 SQL 检查') && rest.includes('协作团队'), rest)
+  await q.page.close()
+
   const i = await open('syn=issued', { w: 1100, h: 900 })
   check('出具横幅带 data-issuance-banner（画布印章据此滚过来）', await i.page.locator('[data-issuance-banner]').count() === 1)
   const live = await i.page.locator('[data-turn] [role="status"][aria-live="polite"]').first().innerText()

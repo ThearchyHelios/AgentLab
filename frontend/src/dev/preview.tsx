@@ -14,7 +14,7 @@ import mdSamples from '../run/__tests__/markdown-samples.json'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
-  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_CATALOG_PATCH, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, SQL_DEGRADED_OUTPUT, COPILOT_CATALOG_PATCH, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mergeRun, mixedRun, parallelQueryRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
@@ -302,6 +302,11 @@ function synthetic(name: string): StreamTurn[] {
                 steps: decodeRun(ev, { status: 'succeeded' }), output: MIXED_OUTPUT, runId: 'syn-issued',
                 runClass: 'exploratory', review: REVIEW_DEGRADED_TURN.review }]
     }
+    case 'issued-sql':
+      // 数字都有出处，却因为查询没通过 SQL 检查而降档：横幅单列说明
+      return [{ id: name, question: '上周订单金额', phase: 'done', status: '已完成',
+                steps: decodeRun(parallelQueryRun(), { status: 'succeeded' }), runId: 'syn-issued-sql', runClass: 'formal',
+                output: SQL_DEGRADED_OUTPUT }]
     case 'calibers':
     case 'caliber-one': {
       // 按口径卡清点回指的数字：两张卡各数各的；只有一张卡时直说都来自它

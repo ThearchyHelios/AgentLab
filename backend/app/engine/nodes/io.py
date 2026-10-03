@@ -147,7 +147,7 @@ def _apply_contract(
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_gaps, trace_numbers
+    from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_findings, trace_numbers
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -236,7 +236,17 @@ def _apply_contract(
             return f"查询「{title}」（{alias}）"
         return f"查询「{title}」" if title else (f"查询 {alias}" if alias else "")
 
-    gaps[sql_at:sql_at] = sql_check_gaps(metrics, cited.get("queries"), label=query_label)
+    findings = sql_check_findings(metrics, cited.get("queries"), label=query_label)
+    gaps[sql_at:sql_at] = [f["text"] for f in findings]
+    # 出具声明另存一份结构化的：报告页在显眼处说「因为 SQL 检查没通过而降档」，不从缺口的中文里认。没有就不加这个键
+    from app.engine.sql_problems import node_of
+
+    for f in findings:
+        if not f.get("node_id") and f.get("artifact"):
+            f["node_id"] = node_of(f["artifact"], state.get("evidence"))
+    # gap 是 gaps 里对应的那一句：界面单列这几条时，据它不在「其余缺口」里重复
+    sql_checks = [{**{k: f[k] for k in ("query", "node_id", "problems", "refs") if f.get(k)}, "gap": f["text"]}
+                  for f in findings]
 
     # 声明了 metrics_from 却一个指标都没收到，同样是"没查成"
     if sources and not metrics:
@@ -265,7 +275,7 @@ def _apply_contract(
         return _declare_citations(tier, cited, calibers=calibers, metrics=metrics, gaps=gaps,
                                   missing_required=missing_required, missing_expected=missing_expected,
                                   report_from=str(report_from), declared_at=datetime.now(timezone.utc),
-                                  ctx=ctx)
+                                  ctx=ctx, sql_checks=sql_checks)
 
     # 逐个数字的出处。以前只有一个计数，界面标不出「这个数来自哪个指标」
     matched = [
@@ -284,6 +294,7 @@ def _apply_contract(
         # 校验没跑全的原因照实印出来——读的人要能分辨"查过都对"和"根本没查"
         "gaps": gaps,
         "declared_at": datetime.now(timezone.utc).isoformat(),
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     }
     ctx.emit(
         EventType.ISSUANCE,
@@ -298,6 +309,7 @@ def _apply_contract(
         metrics_checked=len(metrics),
         matched_numbers=len(trace.matched) if trace else 0,
         matched=matched,
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     )
     return issuance
 
@@ -584,7 +596,7 @@ def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[s
 def _declare_citations(
     tier: str, cited: dict[str, Any], *, calibers: list[dict[str, str]], metrics: list[dict[str, Any]],
     gaps: list[str], missing_required: list[str], missing_expected: list[str], report_from: str,
-    declared_at: Any, ctx: NodeContext,
+    declared_at: Any, ctx: NodeContext, sql_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """引用模式的 _issuance。旧字段一个不少（老前端照常显示），另加 mode、report、unresolved。"""
     report = {"node_id": report_from, "doc_artifact": cited["doc_artifact"]}
@@ -606,6 +618,8 @@ def _declare_citations(
         # 结论句策略和可疑实体：只在用上时才有这两个键，升级前的运行和没用上的契约形状不变
         **({"claims": cited["claims"]} if cited.get("claims") else {}),
         **({"entities": cited["entities"]} if cited.get("entities") else {}),
+        # 没通过 SQL 检查的查询（结构化）：报告页据此在显眼处说明降档原因。没有就不加这个键
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     }
     entities = cited.get("entities")
     ctx.emit(
@@ -619,6 +633,7 @@ def _declare_citations(
         unresolved=len(cited["unresolved"]),
         calibers=calibers,
         gaps=gaps,
+        **({"sql_checks": sql_checks} if sql_checks else {}),
         metrics_checked=len(metrics),
         matched_numbers=len(cited["matched"]),
         matched=cited["matched"][:50],

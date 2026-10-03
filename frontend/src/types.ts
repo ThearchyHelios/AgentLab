@@ -2112,6 +2112,21 @@ export interface EvidenceMergeInput {
   checks?: SqlCheckItem[]
 }
 
+/**
+ * 出具声明（output._issuance、issuance 事件）里的 sql_checks：没通过 SQL 检查的查询，一条一个。报告页、出具横幅据此
+ * 在显眼处说「因为 SQL 检查没通过而降档」。gap 是 gaps 里对应的那一句（单列之后不在其余缺口里重复）
+ */
+export interface IssuanceSqlCheck {
+  /** 「查询「取数」（Q1）」；给不出时没有 */
+  query?: string
+  node_id?: string
+  /** 每条问题那半句 */
+  problems?: string[]
+  /** 受影响的引用：「指标「订单金额」」「Q1 第 1 行「gmv」」 */
+  refs?: string[]
+  gap?: string
+}
+
 /** 查询用到的一张表、查询当时它的数据目录版本 */
 export interface EvidenceCatalogVersion {
   /** 表结构里的表名 */
