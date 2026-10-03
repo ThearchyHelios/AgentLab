@@ -30,9 +30,14 @@ human 人工填写。状态（status）：proposed 推断（命名推断、模�
 """
 from __future__ import annotations
 
+import asyncio
 import copy
+import hashlib
 import json
-from dataclasses import dataclass
+import re
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,7 +45,8 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import CatalogNote
+from app.data.names import name_key
+from app.db.models import Artifact, CatalogNote, Run
 
 # ==========================================================================
 # 取值
@@ -368,16 +374,1318 @@ def relation_id(table: str, columns: list[str], to_table: str, to_columns: list[
     列按 (本表列, 被指向列) 成对排序后再算，复合外键列的书写顺序不影响编号；不区分大小写（外键约束
     和命名推断拿到的大小写可能不同）。编号里不含句点：审阅接口的路径按句点切分（relations.<编号>）。
     """
-    import hashlib
-
     pairs = sorted(zip((c.lower() for c in columns), (c.lower() for c in to_columns)))
     raw = json.dumps([table.lower(), to_table.lower(), pairs], ensure_ascii=False, separators=(",", ":"))
     return "r" + hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
+# ==========================================================================
+# 槽位：把 notes 摊平成「一项一个键」，合并、审阅、人工编辑都在这上面做
+# ==========================================================================
+
+#: 槽位键：("t", 字段) 表级项、("c", 列名, 字段) 列级项、("r", 关系编号) 关系
+Slot = tuple[str, ...]
+
+#: 关系里决定「是不是同一条、值有没有变」的字段（来源、状态、备注、时间之外的部分）
+_RELATION_VALUE_KEYS = ("columns", "to_table", "to_columns", "cardinality", "coverage")
+
+
+def _slots(notes: Mapping[str, Any] | None) -> dict[Slot, dict[str, Any]]:
+    """notes → {槽位: 项}（深拷贝，不改入参）。顺序：表级项、列级项、关系，各自保持原来的顺序。"""
+    out: dict[Slot, dict[str, Any]] = {}
+    notes = notes or {}
+    for name in TABLE_FIELDS:
+        if isinstance(notes.get(name), dict):
+            out[("t", name)] = copy.deepcopy(notes[name])
+    columns = notes.get("columns") if isinstance(notes.get("columns"), dict) else {}
+    for col, items in columns.items():
+        for name in COLUMN_FIELDS:
+            if isinstance(items, dict) and isinstance(items.get(name), dict):
+                out[("c", col, name)] = copy.deepcopy(items[name])
+    relations = notes.get("relations") if isinstance(notes.get("relations"), list) else []
+    for rel in relations:
+        if isinstance(rel, dict) and rel.get("id"):
+            out[("r", str(rel["id"]))] = copy.deepcopy(rel)
+    return out
+
+
+def _assemble(slots: Mapping[Slot, dict[str, Any]]) -> dict[str, Any]:
+    """槽位 → notes。空的列、空的关系列表不留：目录内容相同则序列化结果相同（冻结的哈希靠它）。"""
+    notes: dict[str, Any] = {}
+    columns: dict[str, dict[str, Any]] = {}
+    relations: list[dict[str, Any]] = []
+    for key, item in slots.items():
+        if key[0] == "t":
+            notes[key[1]] = item
+        elif key[0] == "c":
+            columns.setdefault(key[1], {})[key[2]] = item
+        else:
+            relations.append(item)
+    if columns:
+        notes["columns"] = columns
+    if relations:
+        notes["relations"] = relations
+    return notes
+
+
+def _value_of(key: Slot, item: Mapping[str, Any]) -> Any:
+    """一项的「值」：比较人工有没有改动时只看它。"""
+    if key[0] == "r":
+        return {k: item.get(k) for k in _RELATION_VALUE_KEYS}
+    return item.get("value")
+
+
+def _core(item: Mapping[str, Any]) -> dict[str, Any]:
+    """去掉修改时间的项：判断起草结果和已有的是不是一回事。"""
+    return {k: v for k, v in item.items() if k != "updated_at"}
+
+
+def visible_notes(notes: Mapping[str, Any] | None) -> dict[str, Any]:
+    """去掉被驳回的项和关系。给模型看、冻结进证据、将来的检查都只用这一份。"""
+    return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") != "rejected"})
+
+
+def status_counts(notes: Mapping[str, Any] | None) -> dict[str, int]:
+    """各状态的项数（表级项、列级项、关系都算），四种状态都有键。"""
+    counts = dict.fromkeys(ITEM_STATUSES, 0)
+    for item in _slots(notes).values():
+        if item.get("status") in counts:
+            counts[item["status"]] += 1
+    return counts
+
+
+# ==========================================================================
+# 合并：起草结果并入已有目录
+# ==========================================================================
+
+#: 来源的可信程度。不同来源对同一个槽位各有说法时，高的留下；同级（模型起草和命名推断）先到先得
+_SOURCE_RANK = {"human": 5, "fk": 4, "profile": 3, "comment": 2, "llm": 1, "name": 1}
+#: 人工定过的状态：起草永远不碰
+_LOCKED = ("confirmed", "rejected")
+
+
+@dataclass(frozen=True)
+class MergeStats:
+    """一次合并新增、更新、删除了几项。"""
+
+    added: int = 0
+    updated: int = 0
+    removed: int = 0
+
+    def __add__(self, other: "MergeStats") -> "MergeStats":
+        return MergeStats(self.added + other.added, self.updated + other.updated, self.removed + other.removed)
+
+
+def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | None, *,
+                covered: Iterable[str] = (), at: str | None = None) -> tuple[dict[str, Any], MergeStats]:
+    """把起草结果并入已有目录，返回 (新目录, 计数)。不改入参。
+
+    规则（逐个槽位）：
+    - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
+    - 起草结果里没有这一项：已有项的来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。
+      外键约束被删掉以后，原来那条「有确证」的关系不能还挂着；而这一轮没调模型，就不能因此删掉模型起草的项。
+    - 同一来源：值或状态有变化就更新。
+    - 不同来源：来源更可信的（_SOURCE_RANK）顶掉不如它的，反过来不行。
+
+    新增和更新的项盖上 at（缺省为当前时间）作为 updated_at；内容没变的项保持原样，修改时间也不动。
+    """
+    at = at or now_iso()
+    covered = set(covered)
+    old, new = _slots(existing), _slots(draft)
+    out: dict[Slot, dict[str, Any]] = {}
+    added = updated = removed = 0
+    for key, item in old.items():
+        cand = new.get(key)
+        if item.get("status") in _LOCKED:
+            out[key] = item
+        elif cand is None:
+            if item.get("source") in covered:
+                removed += 1
+            else:
+                out[key] = item
+        elif (cand.get("source") == item.get("source")
+              or _SOURCE_RANK.get(cand.get("source"), 0) > _SOURCE_RANK.get(item.get("source"), 0)):
+            if _core(cand) != _core(item):
+                out[key] = {**_core(cand), "updated_at": at}
+                updated += 1
+            else:
+                out[key] = item
+        else:
+            out[key] = item
+    for key, cand in new.items():
+        if key not in old:
+            out[key] = {**_core(cand), "updated_at": at}
+            added += 1
+    return _assemble(out), MergeStats(added, updated, removed)
+
+
+# ==========================================================================
+# 单项审阅与人工编辑
+# ==========================================================================
+
+#: 单项审阅的操作：confirm 确认、reject 驳回、reset 撤销审阅（回到来源的初始状态；人工填写的项直接删掉）
+REVIEW_ACTIONS = ("confirm", "reject", "reset")
+
+
+class CatalogPathError(ValueError):
+    """审阅的路径或操作不对：路径写错、项不存在、操作不认识。message 给人看。"""
+
+
+def parse_path(path: str) -> Slot:
+    """审阅路径 → 槽位。
+
+    写法：表级项直接写字段名（grain）；列级项 columns.<列名>.<字段>（列名里可以有句点，按最后一个句点切出
+    字段）；关系 relations.<编号>。
+    """
+    path = (path or "").strip()
+    if path in TABLE_FIELDS:
+        return ("t", path)
+    if path.startswith("columns."):
+        col, _, name = path[len("columns."):].rpartition(".")
+        if col and name in COLUMN_FIELDS:
+            return ("c", col, name)
+    if path.startswith("relations.") and path[len("relations."):]:
+        return ("r", path[len("relations."):])
+    raise CatalogPathError("无法识别要审阅的项，请重新载入后再试")
+
+
+def describe_slot(key: Slot) -> str:
+    """槽位的中文说法：「表的粒度」「列 amount 的度量类型」「关联关系 r1a2b3」。"""
+    if key[0] == "t":
+        return f"表的{TABLE_FIELD_LABEL.get(key[1], key[1])}"
+    if key[0] == "c":
+        return f"列 {key[1]} 的{COLUMN_FIELD_LABEL.get(key[2], key[2])}"
+    return f"关联关系 {key[1]}"
+
+
+def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: str | None = None) -> dict[str, Any]:
+    """对一项做审阅，返回新目录（不改入参）。路径不对、项不存在、操作不认识都抛 CatalogPathError。"""
+    if action not in REVIEW_ACTIONS:
+        raise CatalogPathError("不支持这种审阅操作，只能确认、驳回或撤销审阅")
+    key = parse_path(path)
+    slots = _slots(notes)
+    item = slots.get(key)
+    if item is None:
+        raise CatalogPathError(f"找不到{describe_slot(key)}，可能已被修改，请重新载入")
+    if action == "reset" and item.get("source") == "human":
+        # 人工填写的项没有「推断时的样子」可回：撤销就是删掉，下次起草可以重新提出
+        del slots[key]
+        return _assemble(slots)
+    item["status"] = {"confirm": "confirmed", "reject": "rejected"}.get(action) or initial_status(item.get("source"))
+    item["updated_at"] = at or now_iso()
+    return _assemble(slots)
+
+
+def _normalize_submitted(submitted: Mapping[str, Any], table: str) -> dict[str, Any]:
+    """人工提交的目录：补上没写的来源和状态（下面会按规则改写），关系编号按两端重算。"""
+    out = copy.deepcopy(dict(submitted))
+
+    def fill(item: Any) -> None:
+        if isinstance(item, dict) and "value" in item:
+            item.setdefault("source", "human")
+            item.setdefault("status", "confirmed")
+
+    for name in TABLE_FIELDS:
+        fill(out.get(name))
+    columns = out.get("columns") if isinstance(out.get("columns"), dict) else {}
+    for items in columns.values():
+        for name in COLUMN_FIELDS:
+            fill(items.get(name) if isinstance(items, dict) else None)
+    relations = out.get("relations") if isinstance(out.get("relations"), list) else []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        rel.setdefault("source", "human")
+        rel.setdefault("status", "confirmed")
+        rel.setdefault("cardinality", None)
+        rel.setdefault("coverage", None)
+        cols, to_table, to_cols = rel.get("columns"), rel.get("to_table"), rel.get("to_columns")
+        if _str_list_ok(cols) and isinstance(to_table, str) and to_table and _str_list_ok(to_cols):
+            # 编号由两端决定：改了指向就是另一条关系，沿用旧编号会让「同一条关系同一个编号」失效
+            rel["id"] = relation_id(table, cols, to_table, to_cols)
+    return out
+
+
+def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str, Any], *, table: str,
+                     at: str | None = None) -> dict[str, Any]:
+    """人工提交的整份目录 → 要写入的目录（不改入参）。
+
+    - 值改过的项、新填的项：记为 human / confirmed。提交里写的来源和状态不作数——客户端不能冒充外键约束
+      或数据剖析。
+    - 值没动的项：保持原来的来源和状态；提交里把状态改成确认、驳回或来源的初始状态的，照改（等同单项审阅）；
+      改成别的状态的不认（不能把推断改成「有确证」）。
+    - 已有、但提交里没有的项：删掉。
+    - 关系编号按两端重算（_normalize_submitted）。
+
+    结构不合规抛 CatalogInvalid。
+    """
+    if not isinstance(submitted, Mapping):
+        raise CatalogInvalid(["数据目录应为对象"])
+    normalized = _normalize_submitted(submitted, table)
+    if problems := validate_notes(normalized):
+        raise CatalogInvalid(problems)
+    at = at or now_iso()
+    old, new = _slots(existing), _slots(normalized)
+    out: dict[Slot, dict[str, Any]] = {}
+    for key, item in new.items():
+        prev = old.get(key)
+        if prev is None or _value_of(key, item) != _value_of(key, prev):
+            fresh = {k: v for k, v in item.items() if k != "updated_at"}
+            fresh.update(source="human", status="confirmed", updated_at=at)
+            out[key] = fresh
+            continue
+        kept = dict(prev)
+        status = item.get("status")
+        if status != prev.get("status") and status in ("confirmed", "rejected", initial_status(prev.get("source"))):
+            kept["status"] = status
+            kept["updated_at"] = at
+        if item.get("note") != prev.get("note"):
+            if item.get("note"):
+                kept["note"] = item["note"]
+            else:
+                kept.pop("note", None)
+            kept["updated_at"] = at
+        out[key] = kept
+    return _assemble(out)
+
+
+async def review_entry(session: AsyncSession, source_id: str, table: str, path: str, action: str, *,
+                       if_version: int, actor: str | None) -> CatalogEntry:
+    """单项审阅并写入（乐观锁同 write_entry）。版本不符抛 CatalogConflict，路径不对抛 CatalogPathError。"""
+    entry = await read_entry(session, source_id, table)
+    current = entry.version if entry else 0
+    if if_version != current:
+        raise CatalogConflict(table, current)
+    notes = review_item(entry.notes if entry else {}, path, action)
+    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+
+
+async def save_human_edit(session: AsyncSession, source_id: str, table: str, submitted: Mapping[str, Any], *,
+                          if_version: int, actor: str | None) -> CatalogEntry:
+    """人工提交整份目录并写入（规则见 apply_human_edit，乐观锁同 write_entry）。"""
+    entry = await read_entry(session, source_id, table)
+    current = entry.version if entry else 0
+    if if_version != current:
+        raise CatalogConflict(table, current)
+    notes = apply_human_edit(entry.notes if entry else {}, submitted, table=table)
+    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+
+
+# ==========================================================================
+# 起草：数据库注释、外键约束、命名推断（只看探查缓存，不发数据库查询）
+# ==========================================================================
+
+
+@dataclass(frozen=True)
+class TableDraft:
+    """一张表的起草结果。covered：这一轮完整算过的来源（merge_notes 据此删掉这些来源里已经没有的旧项）。"""
+
+    notes: dict[str, Any]
+    covered: frozenset[str] = frozenset()
+
+
+def system_notes_source(source: Any) -> bool:
+    """这个源的表说明、列说明是不是系统生成的（导入表格）。
+
+    上传表格建的源（origin=upload）：简单导入时未规整的表写着 UNSHAPED_NOTE，按配方导入时表和列的说明
+    由 recipe_notes 按核对结果生成（schema_cache 顶层 import_mode=recipe）。这些说明有严格的规矩（跟着
+    核对结果走、不带数字和坐标），目录不能重复它们，也不能和它们矛盾：起草时不拷进中文名和含义，渲染时
+    保留说明、只追加说明没有覆盖的项（render_table_notes）。
+    """
+    if (getattr(source, "origin", None) or "manual") == "upload":
+        return True
+    return (getattr(source, "schema_cache", None) or {}).get("import_mode") == "recipe"
+
+
+def resolve_table_name(schema_cache: Mapping[str, Any] | None, name: str) -> str | None:
+    """在表结构里找表，返回 schema_cache["tables"] 的键。全名、只有表名、大小写不一致都认。"""
+    tables = (schema_cache or {}).get("tables") or {}
+    if name in tables:
+        return name
+    short = name.rsplit(".", 1)[-1]
+    if short in tables:
+        return short
+    lowered = short.lower()
+    return next((n for n in tables if n.lower() == lowered), None)
+
+
+#: 数据库注释多长、带不带句读，决定它是「名字」还是「解释」
+_LABEL_MAX = 24
+_SENTENCE_MARKS = re.compile(r"[，。；;,.!?！？：:\n]")
+
+
+def _comment_is_label(text: str) -> bool:
+    """短、不带句读的注释是名字（「实收金额」），否则是一段解释（「状态：1 表示有效…」）。"""
+    return len(text) <= _LABEL_MAX and not _SENTENCE_MARKS.search(text)
+
+
+def _cardinality(meta: Mapping[str, Any], columns: list[str]) -> str:
+    """本表这几列指向别的表时的基数：这几列恰好是本表的主键或某个唯一约束，就是一对一，否则多对一。"""
+    wanted = {c.lower() for c in columns}
+    keys = [meta.get("primary_key") or []] + [u for u in meta.get("unique") or [] if isinstance(u, list)]
+    return "one_to_one" if any(wanted == {c.lower() for c in k} for k in keys if k) else "many_to_one"
+
+
+def _relation(table: str, columns: list[str], to_table: str, to_columns: list[str], source: str, *,
+              cardinality: str | None) -> dict[str, Any]:
+    return {"id": relation_id(table, columns, to_table, to_columns), "columns": list(columns), "to_table": to_table,
+            "to_columns": list(to_columns), "cardinality": cardinality, "coverage": None, "source": source,
+            "status": initial_status(source)}
+
+
+def fk_relations(schema_cache: Mapping[str, Any] | None, table: str) -> list[dict[str, Any]] | None:
+    """外键约束 → 关系（fk / verified）。缓存里没有 foreign_keys（升级前探查的）返回 None：不知道有没有外键。
+
+    外键没写被指向的列（SQLite 的 REFERENCES t 可以省略列）时取被指向表的主键；列数对不上的跳过。
+    """
+    tables = (schema_cache or {}).get("tables") or {}
+    meta = tables.get(table)
+    if not isinstance(meta, dict) or not isinstance(meta.get("foreign_keys"), list):
+        return None
+    out: dict[str, dict[str, Any]] = {}
+    for fk in meta["foreign_keys"]:
+        if not isinstance(fk, dict):
+            continue
+        cols, to_table = list(fk.get("columns") or []), fk.get("to_table")
+        to_cols = list(fk.get("to_columns") or [])
+        if not cols or not isinstance(to_table, str) or not to_table:
+            continue
+        if not to_cols:
+            to_cols = list((tables.get(to_table) or {}).get("primary_key") or [])
+        if len(to_cols) != len(cols):
+            continue
+        rel = _relation(table, cols, to_table, to_cols, "fk", cardinality=_cardinality(meta, cols))
+        out.setdefault(rel["id"], rel)
+    return list(out.values())
+
+
+# ---- 命名推断
+
+#: xxx_id（不分大小写）、xxxId、xxxID。没有分隔的 paid、uuid、PAID 都不算
+_SNAKE_ID = re.compile(r"^(?P<stem>.+?)_id$", re.IGNORECASE)
+_CAMEL_ID = re.compile(r"^(?P<stem>.*[a-z0-9])(?:Id|ID)$")
+_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _words(name: str) -> list[str]:
+    """名字切成小写的词：下划线和驼峰都是分隔（memberTag、member_tag、MEMBER_TAG 都是 member + tag）。"""
+    return [w.lower() for part in name.split("_") for w in _WORDS.findall(part)]
+
+
+def _singulars(word: str) -> set[str]:
+    """一个词可能的单数形式（含它自己）。两边都取这个集合、有交集就算同一个词：categories 和 category、
+    courses 和 course、status 和 statuses 都对得上，不靠一套「复数变单数」的规则硬猜。"""
+    out = {word}
+    if word.endswith("ies") and len(word) > 3:
+        out.add(word[:-3] + "y")
+    if word.endswith("es") and len(word) > 2:
+        out.add(word[:-2])
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 1:
+        out.add(word[:-1])
+    return out
+
+
+def _name_index(tables: Mapping[str, Any]) -> dict[tuple[str, str], set[str]]:
+    """{(前面几个词拼起来, 最后一个词的单数形式): 表名}。"""
+    index: dict[tuple[str, str], set[str]] = {}
+    for name in tables:
+        words = _words(name)
+        if not words:
+            continue
+        prefix = "".join(words[:-1])
+        for form in _singulars(words[-1]):
+            index.setdefault((prefix, form), set()).add(name)
+    return index
+
+
+def _type_family(type_name: str | None) -> str | None:
+    """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。"""
+    t = (type_name or "").upper()
+    if not t:
+        return None
+    if any(k in t for k in ("CHAR", "TEXT", "CLOB", "STRING", "UUID")):
+        return "text"
+    if any(k in t for k in ("INT", "NUMBER", "NUMERIC", "DECIMAL", "SERIAL", "REAL", "FLOAT", "DOUBLE")):
+        return "number"
+    if any(k in t for k in ("DATE", "TIME")):
+        return "time"
+    return None
+
+
+def _id_stem(column: str) -> str | None:
+    m = _SNAKE_ID.match(column) or _CAMEL_ID.match(column)
+    return m.group("stem") if m else None
+
+
+def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
+                         _index: dict[tuple[str, str], set[str]] | None = None) -> list[dict[str, Any]]:
+    """按列名推断关系（name / proposed）：xxx_id、xxxId、xxxID 对上表名的单复数、驼峰和下划线变体，指向那张表的主键。
+
+    推不准就不推。以下情况一律放过：
+    - 列上已经有外键约束（外键说了算）；
+    - 词根太短（x_id）；
+    - 没有对得上的表，或者对得上的表不止一张（guide 和 guides 都在）；
+    - 对上的是本表自己（employees.employee_id 是工号，不是自引用）；
+    - 被指向的表没有主键，或主键不止一列；
+    - 两边的类型大类不同（文字列指向整数主键）。
+    """
+    tables = (schema_cache or {}).get("tables") or {}
+    meta = tables.get(table)
+    if not isinstance(meta, dict):
+        return []
+    index = _index if _index is not None else _name_index(tables)
+    constrained = {c.lower() for fk in meta.get("foreign_keys") or [] if isinstance(fk, dict)
+                   for c in fk.get("columns") or []}
+    out: list[dict[str, Any]] = []
+    for col in meta.get("columns") or []:
+        name = str(col.get("name") or "")
+        stem = _id_stem(name)
+        if stem is None or name.lower() in constrained:
+            continue
+        words = _words(stem)
+        if not words or len("".join(words)) < 2:
+            continue
+        prefix = "".join(words[:-1])
+        candidates: set[str] = set()
+        for form in _singulars(words[-1]):
+            candidates |= index.get((prefix, form), set())
+        if len(candidates) != 1:
+            continue
+        target = next(iter(candidates))
+        if target == table:
+            continue
+        target_meta = tables.get(target) or {}
+        pk = list(target_meta.get("primary_key") or [])
+        if len(pk) != 1:
+            continue
+        pk_type = next((c.get("type") for c in target_meta.get("columns") or [] if c.get("name") == pk[0]), None)
+        mine, theirs = _type_family(col.get("type")), _type_family(pk_type)
+        if mine and theirs and mine != theirs:
+            continue
+        out.append(_relation(table, [name], target, pk, "name", cardinality=_cardinality(meta, [name])))
+    return out
+
+
+def draft_structure(source: Any, table: str) -> TableDraft:
+    """只看表结构就能起草的部分：数据库注释、外键约束、命名推断。table 必须是 schema_cache["tables"] 的键。
+
+    - 数据库注释 → 中文名或含义（comment / proposed）：短而不带句读的是名字，记进表或列的中文名；否则是
+      一段解释，记进表的说明或列的含义。导入表格的源例外（system_notes_source）：说明是系统生成的，不拷。
+    - 外键约束 → 关系（fk / verified）。
+    - 命名推断 → 关系（name / proposed）。
+    """
+    cache = getattr(source, "schema_cache", None) or {}
+    meta = (cache.get("tables") or {}).get(table)
+    if not isinstance(meta, dict):
+        raise KeyError(table)
+    notes: dict[str, Any] = {}
+    if not system_notes_source(source):
+        comment = (meta.get("comment") or "").strip()
+        if comment:
+            notes["label" if _comment_is_label(comment) else "description"] = make_item(comment, "comment")
+        columns: dict[str, dict[str, Any]] = {}
+        for col in meta.get("columns") or []:
+            text = (col.get("comment") or "").strip()
+            if text:
+                columns[col["name"]] = {("label" if _comment_is_label(text) else "meaning"): make_item(text, "comment")}
+        if columns:
+            notes["columns"] = columns
+    fks = fk_relations(cache, table)
+    relations = list(fks or [])
+    seen = {r["id"] for r in relations}
+    relations += [r for r in infer_name_relations(cache, table) if r["id"] not in seen]
+    if relations:
+        notes["relations"] = relations
+    covered = {"comment", "name"} | ({"fk"} if fks is not None else set())
+    return TableDraft(notes=notes, covered=frozenset(covered))
+
+
+# ==========================================================================
+# 起草：模型（可选，按表分批，结构化输出）
+# ==========================================================================
+
+#: 每批最多几张表、合计多少列。一批太大模型容易漏表、输出被截断；太小则调用次数多
+MODEL_BATCH_TABLES = 4
+MODEL_BATCH_COLUMNS = 120
+#: 同时发出的批数
+MODEL_CONCURRENCY = 3
+#: 一批最多等多久
+MODEL_TIMEOUT_S = 120
+#: 输出额度。一批四张表的目录远用不完；给太大的额度有的服务方会直接拒收
+MODEL_MAX_TOKENS = 8192
+#: 不指定表时起草使用次数最多的前几张
+DRAFT_DEFAULT_TABLES = 20
+
+
+class CatalogModelUnavailable(RuntimeError):
+    """没有可用于起草的模型（没有接入、停用、只有演示接入、缺 key）。message 给人看；在调用模型之前判定。"""
+
+
+CATALOG_DRAFT_SYSTEM = """你在为一个业务数据库编写数据目录：说明每张表、每一列在业务上是什么。只根据给出的表结构推断，\
+不要编造不存在的表和列。
+
+要写的内容：
+- label：表的中文名，简短（例如「入园记录」）。
+- grain：一行代表什么（例如「每张门票每次检票一行」）。
+- kind：表类型，fact（事实表，记录业务事件）、dimension（维度表，描述对象）、snapshot（快照表，某一时点的状态）、\
+log（日志表）、config（配置表）之一。
+- keys：业务主键，即在业务上唯一确定一行的列（可以和数据库主键不同），写列名。
+- business_date：业务日期按哪一列算，rule 写一句规则，timezone 写时区（不确定就留空）。
+- columns：每一列的 label（中文名）、meaning（含义，一句话）、unit（单位，例如「元」「人」，没有单位就留空）、\
+measure（度量类型：flow 流量，可跨期加总；stock 存量，时点值，不能跨期加总；ratio 比率；identifier 标识；\
+status 状态；attribute 属性）。
+
+规矩：
+- 只写数据事实，不写计算公式，不写指标怎么算。
+- 拿不准的字段留空，不要猜。列名、表名照原样写，不要翻译或改写。
+- 标着「系统说明」的内容是导入时按核对结果生成的，以它为准：不要重复，也不要与之矛盾。
+- 标着「已确认」的目录项由人工确认过，以它为准。"""
+
+CATALOG_DRAFT_PROMPT = "请为下面 {n} 张表编写数据目录，每张表输出一项，table 写表名。\n\n{tables}"
+
+#: 拼表结构描述用的固定片段（写给模型）
+CATALOG_DRAFT_PROMPT_LABELS = {
+    "table": "表 {name}",
+    "view": "表 {name}（视图）",
+    "comment": "数据库注释：{text}",
+    "system": "系统说明：{text}",
+    "columns": "列：",
+    "column": "- {name} {type}",
+    "pk": "主键",
+    "not_null": "非空",
+    "fk": "外键 → {target}",
+    "col_comment": "注释：{text}",
+    "col_system": "系统说明：{text}",
+    "unique": "唯一约束：{cols}",
+    "confirmed": "已确认的目录项：",
+}
+
+CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
+    "title": "catalog_draft",
+    "description": "数据目录草稿，每张表一项",
+    "type": "object",
+    "properties": {
+        "tables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "table": {"type": "string", "description": "表名，照原样写"},
+                    "label": {"type": "string", "description": "表的中文名"},
+                    "grain": {"type": "string", "description": "一行代表什么"},
+                    "kind": {"type": "string", "enum": list(TABLE_KINDS)},
+                    "keys": {"type": "array", "items": {"type": "string"}, "description": "业务主键的列名"},
+                    "business_date": {
+                        "type": "object",
+                        "properties": {"column": {"type": "string"}, "rule": {"type": "string"},
+                                       "timezone": {"type": "string"}},
+                        "required": ["column"],
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "列名，照原样写"},
+                                "label": {"type": "string"}, "meaning": {"type": "string"},
+                                "unit": {"type": "string"},
+                                "measure": {"type": "string", "enum": list(COLUMN_MEASURES)},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                },
+                "required": ["table"],
+            },
+        },
+    },
+    "required": ["tables"],
+}
+
+_P = CATALOG_DRAFT_PROMPT_LABELS
+
+
+async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
+    """(模型, 模型 id)：用设置里助手的模型，关掉思考、温度 0。没有可用的模型抛 CatalogModelUnavailable。
+
+    和 recipe_ai.resolve_draft_model 一样不用 get_chat_model：它在没有接入时静默退回演示模型，拿演示模型
+    起草出来的目录会被当成真的写进库里。数据层不导入接口层，设置键取 recipe_ai 里那份（与助手的同值，
+    那边有测试核对）。
+    """
+    from app.core.errors import not_configured
+    from app.data.recipe_ai import COPILOT_SETTING_KEY
+    from app.db.models import Setting
+    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model, resolve_provider
+
+    row = await session.get(Setting, COPILOT_SETTING_KEY)
+    saved = (row.value if row else None) or {}
+    spec = ModelSpec(provider=saved.get("provider") or None, model=saved.get("model") or None,
+                     max_tokens=MODEL_MAX_TOKENS, temperature=0, thinking="off")
+    unconfigured = "助手使用的模型尚未配置完成：{reason}。请到「设置 → 模型接入」检查"
+    try:
+        provider = await resolve_provider(session, spec.provider, spec.model)
+    except ProviderNotConfigured as e:
+        raise CatalogModelUnavailable(unconfigured.format(reason=not_configured(e, with_hint=False))) from e
+    if provider is None:
+        if spec.provider:
+            raise CatalogModelUnavailable(f"助手设置里的模型接入「{spec.provider}」不存在。请到「设置 → 模型接入」检查")
+        raise CatalogModelUnavailable("未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加")
+    if provider.kind == "mock":
+        raise CatalogModelUnavailable("当前只有演示用的模型接入，无法用于起草数据目录。"
+                                      "请到「设置 → 模型接入」添加真实的模型接入")
+    if not provider.enabled:
+        raise CatalogModelUnavailable(f"助手使用的模型接入「{provider.name}」已停用。"
+                                      "请到「设置 → 模型接入」启用它，或为助手换一个模型")
+    try:
+        model = build_chat_model(provider, spec)
+    except ProviderNotConfigured as e:
+        raise CatalogModelUnavailable(unconfigured.format(reason=not_configured(e, with_hint=False))) from e
+    return model, spec.model or provider.default_model or ""
+
+
+def _confirmed_only(notes: Mapping[str, Any] | None) -> dict[str, Any]:
+    return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") in ("confirmed", "verified")})
+
+
+def _describe_for_model(name: str, meta: Mapping[str, Any], *, system: bool, existing: Mapping[str, Any] | None) -> str:
+    """一张表交给模型的结构描述：列、类型、主键、外键、唯一约束、注释；不含任何数据值。"""
+    lines = [(_P["view"] if meta.get("is_view") else _P["table"]).format(name=name)]
+    comment = (meta.get("comment") or "").strip()
+    if comment:
+        lines.append((_P["system"] if system else _P["comment"]).format(text=comment))
+    pk = set(meta.get("primary_key") or [])
+    fk_of: dict[str, str] = {}
+    for fk in meta.get("foreign_keys") or []:
+        if isinstance(fk, dict) and len(fk.get("columns") or []) == 1:
+            to_cols = fk.get("to_columns") or []
+            fk_of[fk["columns"][0]] = f"{fk.get('to_table')}.{to_cols[0]}" if to_cols else str(fk.get("to_table"))
+    lines.append(_P["columns"])
+    for col in meta.get("columns") or []:
+        marks = []
+        if col["name"] in pk:
+            marks.append(_P["pk"])
+        if not col.get("nullable", True):
+            marks.append(_P["not_null"])
+        if col["name"] in fk_of:
+            marks.append(_P["fk"].format(target=fk_of[col["name"]]))
+        if text := (col.get("comment") or "").strip():
+            marks.append((_P["col_system"] if system else _P["col_comment"]).format(text=text))
+        line = _P["column"].format(name=col["name"], type=col.get("type") or "")
+        lines.append(line + ("，" + "，".join(marks) if marks else ""))
+    for group in meta.get("unique") or []:
+        if isinstance(group, list) and group:
+            lines.append(_P["unique"].format(cols="、".join(group)))
+    confirmed = _notes_lines(_confirmed_only(existing), meta=meta, system_notes=False)
+    if confirmed:
+        lines.append(_P["confirmed"])
+        lines += confirmed
+    return "\n".join(lines)
+
+
+def _batches(names: list[str], tables: Mapping[str, Any]) -> list[list[str]]:
+    """按表分批：每批不超过 MODEL_BATCH_TABLES 张、合计不超过 MODEL_BATCH_COLUMNS 列（一张表超了就自成一批）。"""
+    out: list[list[str]] = []
+    batch: list[str] = []
+    width = 0
+    for name in names:
+        n = len((tables.get(name) or {}).get("columns") or [])
+        if batch and (len(batch) >= MODEL_BATCH_TABLES or width + n > MODEL_BATCH_COLUMNS):
+            out.append(batch)
+            batch, width = [], 0
+        batch.append(name)
+        width += n
+    if batch:
+        out.append(batch)
+    return out
+
+
+def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
+    """模型的回复 → 每张表一项的列表。结构化输出给的对象、正文里的 JSON 都认；对不上格式返回 None。"""
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
+    if isinstance(raw, str):
+        text = raw.strip()
+        start = min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=-1)
+        if start < 0:
+            return None
+        end = text.rfind("}" if text[start] == "{" else "]")
+        try:
+            raw = json.loads(text[start:end + 1])
+        except ValueError:
+            return None
+    if isinstance(raw, dict):
+        raw = raw.get("tables")
+    if not isinstance(raw, list):
+        return None
+    return [t for t in raw if isinstance(t, dict)]
+
+
+async def _ask_model(model: Any, messages: list[Any]) -> list[dict[str, Any]]:
+    """问一批。先走结构化输出；模型不支持、或给回来的不是约定的结构，再退回纯文本、从正文里取 JSON。"""
+    try:
+        runnable = model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA)
+    except (AttributeError, NotImplementedError):
+        runnable = None
+    if runnable is not None:
+        parsed = _model_tables(await runnable.ainvoke(messages))
+        if parsed is not None:
+            return parsed
+    from app.engine.state import message_text
+
+    reply = await model.ainvoke(messages)
+    parsed = _model_tables(message_text(reply))
+    if parsed is None:
+        raise ValueError("模型的回复不是约定的格式")
+    return parsed
+
+
+def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return text if text and len(text) <= limit else None
+
+
+def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
+    """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
+    表类型和度量类型不在取值里的、业务主键里有不存在的列的。导入表格的源，说明已经覆盖的字段也丢掉。"""
+    columns = {c["name"]: c for c in meta.get("columns") or []}
+    notes: dict[str, Any] = {}
+    table_has_system_note = system and bool((meta.get("comment") or "").strip())
+    for name in ("label", "grain"):
+        if name == "grain" and table_has_system_note:
+            continue
+        if (text := _clean_text(entry.get(name))) is not None:
+            notes[name] = make_item(text, "llm")
+    if entry.get("kind") in TABLE_KINDS:
+        notes["kind"] = make_item(entry["kind"], "llm")
+    keys = entry.get("keys")
+    if _str_list_ok(keys) and all(k in columns for k in keys):
+        notes["keys"] = make_item(list(dict.fromkeys(keys)), "llm")
+    date = entry.get("business_date")
+    if isinstance(date, dict) and date.get("column") in columns:
+        value = {"column": date["column"]}
+        for k in ("rule", "timezone"):
+            if (text := _clean_text(date.get(k))) is not None:
+                value[k] = text
+        notes["business_date"] = make_item(value, "llm")
+    out_cols: dict[str, dict[str, Any]] = {}
+    for col in entry.get("columns") or []:
+        if not isinstance(col, dict) or col.get("name") not in columns:
+            continue
+        name = col["name"]
+        has_system_note = system and bool((columns[name].get("comment") or "").strip())
+        items: dict[str, Any] = {}
+        for field_name, limit in (("label", _TEXT_MAX), ("meaning", _TEXT_MAX), ("unit", 50)):
+            if has_system_note and field_name in ("meaning", "unit"):
+                continue
+            if (text := _clean_text(col.get(field_name), limit)) is not None:
+                items[field_name] = make_item(text, "llm")
+        if col.get("measure") in COLUMN_MEASURES:
+            items["measure"] = make_item(col["measure"], "llm")
+        if items:
+            out_cols[name] = items
+    if out_cols:
+        notes["columns"] = out_cols
+    return notes
+
+
+async def draft_with_model(model: Any, source: Any, tables: list[str], *,
+                           existing: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, TableDraft | str]:
+    """用模型起草这些表的中文名、粒度、表类型、业务主键、业务日期和每列的中文名、含义、单位、度量类型。
+
+    model 要有 with_structured_output(schema) 或 ainvoke(messages)（测试注入假模型）。按表分批（_batches），
+    最多 MODEL_CONCURRENCY 批同时发。返回 {表名: TableDraft 或失败原因}：一批失败只影响这一批的表，
+    其余照常；失败的表不算 covered，已有的模型起草项不会因此被删。
+
+    交给模型的只有表结构（列、类型、主键、外键、唯一约束、注释），不发任何数据值；existing 里已确认、
+    有确证的项作为「以此为准」的背景一起交过去。
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    all_tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+    system = system_notes_source(source)
+    names = [t for t in tables if isinstance(all_tables.get(t), dict)]
+    results: dict[str, TableDraft | str] = {}
+    gate = asyncio.Semaphore(MODEL_CONCURRENCY)
+
+    async def run(batch: list[str]) -> None:
+        described = "\n\n".join(_describe_for_model(n, all_tables[n], system=system,
+                                                    existing=(existing or {}).get(n)) for n in batch)
+        messages = [SystemMessage(content=CATALOG_DRAFT_SYSTEM),
+                    HumanMessage(content=CATALOG_DRAFT_PROMPT.format(n=len(batch), tables=described))]
+        try:
+            async with gate:
+                got = await asyncio.wait_for(_ask_model(model, messages), timeout=MODEL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            for n in batch:
+                results[n] = f"模型起草超时：{MODEL_TIMEOUT_S} 秒内没有收到回复"
+            return
+        except Exception as e:  # noqa: BLE001 - 一批失败不影响其他批和其他来源
+            from app.core.errors import describe_exception, first_line
+
+            for n in batch:
+                results[n] = f"模型起草失败：{first_line(e) or describe_exception(e)}"
+            return
+        by_name = {str(t.get("table")): t for t in got}
+        for n in batch:
+            entry = by_name.get(n)
+            if entry is None:
+                results[n] = "模型的回复里没有这张表"
+                continue
+            results[n] = TableDraft(notes=_from_model(entry, all_tables[n], system=system),
+                                    covered=frozenset({"llm"}))
+
+    await asyncio.gather(*(run(b) for b in _batches(names, all_tables)))
+    return {n: results[n] for n in names if n in results}
+
+
+# ==========================================================================
+# 起草并写入
+# ==========================================================================
+
+
+@dataclass
+class TableDraftResult:
+    """一张表这次起草的结果。error：这张表没起草（表结构里没有、写入一直冲突）；model_error：只是模型那部分失败。"""
+
+    table: str
+    added: int = 0
+    updated: int = 0
+    removed: int = 0
+    version: int = 0
+    error: str | None = None
+    model_error: str | None = None
+
+
+@dataclass
+class DraftReport:
+    """一次起草的结果：每张表各一项，以及模型用没用上。"""
+
+    tables: list[TableDraftResult] = field(default_factory=list)
+    #: 这次有没有调模型、调的是哪个
+    model_used: bool = False
+    model: str = ""
+    #: 模型整体用不了的原因（没有接入等）；单张表的模型失败记在 TableDraftResult.model_error
+    model_error: str | None = None
+
+
+async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str] | None = None,
+                        use_model: bool = False, model: Any = None, actor: str | None = None) -> DraftReport:
+    """起草这些表的目录并写入，同步完成。
+
+    - source：手工源的 DataSource，或上传源绑定当前快照的视图（table_versions.resolve_source）；按 source.id 存。
+    - tables 为空时按使用次数（table_usage）取前 DRAFT_DEFAULT_TABLES 张，次数相同按表结构里的顺序。
+    - 每张表：数据库注释、外键约束、命名推断照做；use_model 时再加模型起草。model 可注入（测试用假模型），
+      不给就按设置解析（resolve_draft_model）；模型用不了、某一批失败，都不影响其余来源照常写入。
+    - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
+    - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
+    """
+    cache = getattr(source, "schema_cache", None) or {}
+    all_tables = cache.get("tables") or {}
+    report = DraftReport()
+    if tables:
+        wanted = list(dict.fromkeys(str(t) for t in tables))
+    else:
+        usage = await table_usage(session, source)
+        order = {name: i for i, name in enumerate(all_tables)}
+        wanted = sorted(all_tables, key=lambda n: (-usage.get(n, 0), order[n]))[:DRAFT_DEFAULT_TABLES]
+    picked: list[str] = []
+    for name in wanted:
+        key = resolve_table_name(cache, name)
+        if key is None:
+            report.tables.append(TableDraftResult(table=name, error=f"表结构里没有 {name}，请先重新探查结构"))
+        elif key not in picked:
+            picked.append(key)
+
+    llm: dict[str, TableDraft | str] = {}
+    if use_model and picked:
+        try:
+            if model is None:
+                model, report.model = await resolve_draft_model(session)
+            else:
+                report.model = str(getattr(model, "model_name", "") or "")
+        except CatalogModelUnavailable as e:
+            report.model_error = str(e)
+        else:
+            report.model_used = True
+            existing = await read_catalog(session, source.id)
+            llm = await draft_with_model(model, source, picked, existing={t: e.notes for t, e in existing.items()})
+
+    at = now_iso()
+    for table in picked:
+        result = TableDraftResult(table=table)
+        structure = draft_structure(source, table)
+        modeled = llm.get(table)
+        if isinstance(modeled, str):
+            result.model_error = modeled
+        for _attempt in range(3):
+            entry = await read_entry(session, source.id, table)
+            version = entry.version if entry else 0
+            merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered,
+                                        at=at)
+            if isinstance(modeled, TableDraft):
+                merged, more = merge_notes(merged, modeled.notes, covered=modeled.covered, at=at)
+                stats += more
+            result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
+            result.version = version
+            if entry is None and not merged:
+                break                    # 什么也没起草出来，不建空目录
+            try:
+                written = await write_entry(session, source.id, table, merged, if_version=version, actor=actor)
+            except CatalogConflict:
+                continue
+            result.version = written.version
+            break
+        else:
+            result.error = "这张表的数据目录正被其他人修改，请稍后再起草"
+            result.added = result.updated = result.removed = 0
+        report.tables.append(result)
+    return report
+
+
+# ==========================================================================
+# 渲染：交给模型看的文本
+# ==========================================================================
+
+#: proposed 的项在模型可见文本里的标记
+INFERRED_MARK = "（推断，未确认）"
+KIND_LABEL = {"fact": "事实表", "dimension": "维度表", "snapshot": "快照表", "log": "日志表", "config": "配置表"}
+MEASURE_LABEL = {"flow": "流量，可跨期加总", "stock": "存量，不能跨期加总", "ratio": "比率，不能直接加总",
+                 "identifier": "标识", "status": "状态", "attribute": "属性"}
+CARDINALITY_LABEL = {"many_to_one": "多对一", "one_to_one": "一对一", "one_to_many": "一对多"}
+#: 单表目录的标题行
+NOTES_HEADING = "数据目录（标「推断，未确认」的项是推断，使用前请核实）："
+
+
+def _mark(item: Mapping[str, Any]) -> str:
+    return INFERRED_MARK if item.get("status") == "proposed" else ""
+
+
+def _shown(item: Any, *, covered: bool) -> bool:
+    """这一项给不给模型看：被驳回的不给；系统说明已经覆盖的，只给人工确认过的。"""
+    if not isinstance(item, dict) or item.get("status") == "rejected":
+        return False
+    return not covered or item.get("status") == "confirmed"
+
+
+def _date_text(value: Mapping[str, Any]) -> str:
+    parts = [str(value.get("column") or "")]
+    if value.get("rule"):
+        parts.append(f"规则：{value['rule']}")
+    if value.get("timezone"):
+        parts.append(f"时区：{value['timezone']}")
+    return "；".join(parts)
+
+
+def _relation_text(rel: Mapping[str, Any]) -> str:
+    left = ", ".join(rel.get("columns") or [])
+    right = ", ".join(f"{rel.get('to_table')}.{c}" for c in rel.get("to_columns") or [])
+    extra = []
+    if rel.get("cardinality") in CARDINALITY_LABEL:
+        extra.append(CARDINALITY_LABEL[rel["cardinality"]])
+    coverage = rel.get("coverage")
+    if isinstance(coverage, (int, float)) and not isinstance(coverage, bool):
+        extra.append(f"覆盖率 {coverage:.0%}")
+    return f"{left} → {right}" + (f"（{'，'.join(extra)}）" if extra else "") + _mark(rel)
+
+
+def _notes_lines(notes: Mapping[str, Any] | None, *, meta: Mapping[str, Any] | None,
+                 system_notes: bool) -> list[str]:
+    """单表目录的正文行（不含标题），两格缩进起。"""
+    notes = notes or {}
+    meta = meta or {}
+    table_covered = system_notes and bool((meta.get("comment") or "").strip())
+    lines: list[str] = []
+    for name in TABLE_FIELDS:
+        item = notes.get(name)
+        if not _shown(item, covered=table_covered and name in ("grain", "description")):
+            continue
+        value = item["value"]
+        if name == "kind":
+            text = KIND_LABEL.get(value, str(value))
+        elif name == "keys":
+            text = ", ".join(value)
+        elif name == "business_date":
+            text = _date_text(value)
+        else:
+            text = str(value)
+        lines.append(f"  {TABLE_FIELD_LABEL[name]}：{text}{_mark(item)}")
+
+    col_comment = {c.get("name"): bool((c.get("comment") or "").strip()) for c in meta.get("columns") or []}
+    order = [c.get("name") for c in meta.get("columns") or []]
+    columns = notes.get("columns") if isinstance(notes.get("columns"), dict) else {}
+    col_lines: list[str] = []
+    for col in [c for c in order if c in columns] + [c for c in columns if c not in order]:
+        items = columns[col] if isinstance(columns[col], dict) else {}
+        covered = system_notes and col_comment.get(col, False)
+        parts: list[str] = []
+        for name in COLUMN_FIELDS:
+            item = items.get(name)
+            if not _shown(item, covered=covered and name in ("meaning", "unit")):
+                continue
+            value = item["value"]
+            if name == "measure":
+                text = MEASURE_LABEL.get(value, str(value))
+            elif name == "codes":
+                text = "、".join(f"{k}={v}" for k, v in value.items())
+            else:
+                text = str(value)
+            # 第一段是中文名（没有中文名时是含义），不加前缀；其余写明是什么
+            plain = not parts and name in ("label", "meaning")
+            parts.append(("" if plain else f"{COLUMN_FIELD_LABEL[name]}：") + text + _mark(item))
+        if parts:
+            col_lines.append(f"    {col}：{'；'.join(parts)}")
+    if col_lines:
+        lines.append("  列：")
+        lines += col_lines
+
+    relations = notes.get("relations") if isinstance(notes.get("relations"), list) else []
+    rel_lines = [f"    {_relation_text(r)}" for r in relations if isinstance(r, dict) and r.get("status") != "rejected"]
+    if rel_lines:
+        lines.append("  关联关系：")
+        lines += rel_lines
+    return lines
+
+
+def render_table_notes(notes: Mapping[str, Any] | None, *, meta: Mapping[str, Any] | None = None,
+                       system_notes: bool = False) -> str:
+    """单表目录的完整版，给 db_schema 工具和助手挑表后补上下文用。没有可给模型看的内容时返回空串。
+
+    - 被驳回的项、关系不出现；proposed 的项标「推断，未确认」，有确证和人工确认的不标。
+    - meta 是这张表在 schema_cache 里的结构：列按表结构的顺序列出。
+    - system_notes（导入表格的源）：表和列已有系统生成的说明。表有说明时，粒度、说明只在人工确认过时追加；
+      列有说明时，含义、单位同理；其余的项（中文名、表类型、业务主键、度量类型、码值、关系……）说明里不写，
+      照常追加。
+    """
+    lines = _notes_lines(notes, meta=meta, system_notes=system_notes)
+    return "\n".join([NOTES_HEADING, *lines]) if lines else ""
+
+
+def render_table_index(schema_cache: Mapping[str, Any] | None, notes_by_table: Mapping[str, Mapping[str, Any]], *,
+                       tables: Iterable[str] | None = None) -> str:
+    """紧凑的表目录，每张表一行：表名｜中文名｜粒度。给助手按任务挑表用。
+
+    表名用全名（模型照着写 SQL）；中文名或粒度是推断的，行尾标「推断，未确认」。没有目录的表只写表名。
+    tables 给了就只列这些（按给的顺序），否则按表结构的顺序列全部。
+    """
+    all_tables = (schema_cache or {}).get("tables") or {}
+    lines = []
+    for name in (list(tables) if tables is not None else list(all_tables)):
+        meta = all_tables.get(name)
+        if not isinstance(meta, dict):
+            continue
+        notes = notes_by_table.get(name) or {}
+        label = notes.get("label") if _shown(notes.get("label"), covered=False) else None
+        grain = notes.get("grain") if _shown(notes.get("grain"), covered=False) else None
+        parts = [str(meta.get("qualified") or name)]
+        if label:
+            parts.append(str(label["value"]))
+        if grain:
+            parts.append(str(grain["value"]) if label else f"粒度：{grain['value']}")
+        mark = INFERRED_MARK if any(i and i.get("status") == "proposed" for i in (label, grain)) else ""
+        lines.append("｜".join(parts) + mark)
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# 关系图
+# ==========================================================================
+
+_FLIP = {"many_to_one": "one_to_many", "one_to_many": "many_to_one", "one_to_one": "one_to_one"}
+
+
+@dataclass(frozen=True)
+class JoinEdge:
+    """关系图里的一条有向边：从 from_table 的 from_columns 连到 to_table 的 to_columns。
+
+    每条关系在图里有正反两条边；cardinality 是从 from_table 看过去的基数。
+    """
+
+    from_table: str
+    from_columns: tuple[str, ...]
+    to_table: str
+    to_columns: tuple[str, ...]
+    relation_id: str
+    cardinality: str | None
+    source: str
+    status: str
+
+    def reversed(self) -> "JoinEdge":
+        return JoinEdge(self.to_table, self.to_columns, self.from_table, self.from_columns, self.relation_id,
+                        _FLIP.get(self.cardinality or ""), self.source, self.status)
+
+    def condition(self) -> str:
+        """连接条件：visits.id = channel_visits.visit_id（多列用 AND 连接）。"""
+        return " AND ".join(f"{self.from_table}.{a} = {self.to_table}.{b}"
+                            for a, b in zip(self.from_columns, self.to_columns))
+
+
+def relation_graph(notes_by_table: Mapping[str, Mapping[str, Any]], *,
+                   schema_cache: Mapping[str, Any] | None = None) -> dict[str, list[JoinEdge]]:
+    """邻接表 {表: [从这张表出发的边]}，每条关系正反各一条边；被驳回的关系不进图，自己连自己的也不进。
+
+    schema_cache 给了的话，没起草过目录的关系按表结构现推（外键约束 + 命名推断）补进来：助手挑表时不必等
+    每张表都起草过。目录里已有的关系（含驳回的）以目录为准。
+    """
+    rels: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    rejected: set[str] = set()
+    for table, notes in notes_by_table.items():
+        relations = (notes or {}).get("relations")
+        for rel in relations if isinstance(relations, list) else []:
+            if not isinstance(rel, dict) or not rel.get("id"):
+                continue
+            if rel.get("status") == "rejected":
+                rejected.add(rel["id"])
+            else:
+                rels.setdefault(rel["id"], (table, rel))
+    if schema_cache:
+        all_tables = schema_cache.get("tables") or {}
+        index = _name_index(all_tables)
+        for table in all_tables:
+            inferred = (fk_relations(schema_cache, table) or []) + infer_name_relations(schema_cache, table,
+                                                                                         _index=index)
+            for rel in inferred:
+                if rel["id"] not in rels and rel["id"] not in rejected:
+                    rels[rel["id"]] = (table, rel)
+    graph: dict[str, list[JoinEdge]] = {}
+    for rid, (table, rel) in rels.items():
+        if rel.get("to_table") == table:
+            continue
+        edge = JoinEdge(table, tuple(rel.get("columns") or ()), str(rel.get("to_table")),
+                        tuple(rel.get("to_columns") or ()), rid, rel.get("cardinality"), str(rel.get("source")),
+                        str(rel.get("status")))
+        graph.setdefault(edge.from_table, []).append(edge)
+        graph.setdefault(edge.to_table, []).append(edge.reversed())
+    return graph
+
+
+def join_paths(graph: Mapping[str, list[JoinEdge]], start: str, end: str, *,
+               max_hops: int = 2) -> list[tuple[JoinEdge, ...]]:
+    """两张表之间不超过 max_hops 跳（最多 2）的连接路径，短的在前，同样长的推断边少的在前。"""
+    paths: list[tuple[JoinEdge, ...]] = [(e,) for e in graph.get(start, []) if e.to_table == end]
+    if max_hops >= 2:
+        for first in graph.get(start, []):
+            mid = first.to_table
+            if mid in (start, end):
+                continue
+            paths += [(first, second) for second in graph.get(mid, []) if second.to_table == end]
+    return sorted(paths, key=lambda p: (len(p), sum(e.status == "proposed" for e in p)))
+
+
+# ==========================================================================
+# 使用次数
+# ==========================================================================
+
+#: 数据源查询工具存查询快照用的工件类型（tools/datasource.py）
+QUERY_SNAPSHOT_KIND = "query_snapshot"
+
+#: 老的查询快照引用（meta 里没记源和表名）读过一次的结果：{工件 id: (源名, 表名)}。工件内容按哈希寻址、
+#: 永不改变，缓存不会过期
+_LEGACY_QUERY_TABLES: dict[str, tuple[str | None, tuple[str, ...]]] = {}
+
+
+def _load_artifact(artifact_id: str) -> Any:
+    from app.core.artifact_store import load
+
+    return load(artifact_id)
+
+
+def _legacy_query(artifact_id: str) -> tuple[str | None, tuple[str, ...]]:
+    if artifact_id not in _LEGACY_QUERY_TABLES:
+        from app.engine.evidence import sql_tables
+
+        content = _load_artifact(artifact_id)
+        if isinstance(content, dict):
+            found = (content.get("source"), tuple(sql_tables(str(content.get("sql") or ""))))
+        else:
+            found = (None, ())
+        _LEGACY_QUERY_TABLES[artifact_id] = found
+    return _LEGACY_QUERY_TABLES[artifact_id]
+
+
+def query_snapshot_meta(source: Any, sql: str) -> dict[str, Any]:
+    """查询快照工件引用的 meta：源 id、源名、SQL 里的表名。数据源查询工具存快照时写进去，table_usage 据此计数。
+
+    表名的取法和证据台账一样（evidence.sql_tables：FROM / JOIN 后面的表，去掉注释和字符串）。meta 只在
+    工件引用表里，不进工件内容：查询快照的内容哈希不变。
+    """
+    from app.engine.evidence import sql_tables
+
+    return {"source_id": getattr(source, "id", None), "source": getattr(source, "name", None),
+            "tables": sql_tables(sql or "")}
+
+
+async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
+    """每张表被运行查询过的次数：{schema_cache 的表名: 次数}，没被查过的表不出现。
+
+    取法：数据源查询工具每次成功查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里
+    按 (内容哈希, 运行) 各记一行。数「属于某次运行（runs 里有这次运行）、属于这个源、SQL 里用到了这张表」的
+    行：同一次运行里结果一模一样的重复查询只算一次，工具库里的试用（不属于任何运行）不算。
+
+    表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用
+    没有 meta，退回读工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉
+    schema 前缀后按 name_key（只把 ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
+    """
+    rows = (await session.execute(
+        select(Artifact.id, Artifact.meta).join(Run, Run.id == Artifact.run_id)
+        .where(Artifact.kind == QUERY_SNAPSHOT_KIND)
+    )).all()
+    tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+    lookup: dict[str, str] = {}
+    for name in tables:
+        lookup.setdefault(name_key(name), name)
+    counts: Counter[str] = Counter()
+    for artifact_id, meta in rows:
+        meta = meta if isinstance(meta, dict) else {}
+        if isinstance(meta.get("tables"), list):
+            source_id, source_name, names = meta.get("source_id"), meta.get("source"), meta["tables"]
+        else:
+            source_id = None
+            source_name, names = _legacy_query(str(artifact_id))
+        if source_id is not None:
+            if source_id != source.id:
+                continue
+        elif source_name != source.name:
+            continue
+        hit = {lookup.get(name_key(str(n).rsplit(".", 1)[-1])) for n in names}
+        counts.update(t for t in hit if t is not None)
+    return dict(counts)
+
+
+# ==========================================================================
+# 冻结进证据
+# ==========================================================================
+
+
+def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """要冻结进表结构快照的目录：{表名: {"version": 版本, "notes": 去掉驳回项的目录}}。
+
+    只收表结构快照里有的表（tables）；去掉驳回项以后什么都不剩的表不收。一张也没有时返回空 dict，
+    调用方据此不加这个键：没有目录的源，快照内容和以前一字不差。目录不变（版本和内容都不变）则返回值
+    不变，快照哈希也就不变。
+    """
+    wanted = set(tables)
+    out: dict[str, dict[str, Any]] = {}
+    for name in sorted(entries):
+        if name not in wanted:
+            continue
+        notes = visible_notes(entries[name].notes)
+        if notes:
+            out[name] = {"version": entries[name].version, "notes": notes}
+    return out
+
+
 __all__ = [
-    "CARDINALITIES", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict", "CatalogEntry",
-    "CatalogInvalid", "ITEM_SOURCES", "ITEM_STATUSES", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS",
-    "initial_status", "make_item", "now_iso", "read_catalog", "read_entry", "relation_id", "same_notes",
-    "validate_notes", "write_entry",
+    "CARDINALITIES", "CARDINALITY_LABEL", "CATALOG_DRAFT_PROMPT", "CATALOG_DRAFT_PROMPT_SCHEMA",
+    "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
+    "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
+    "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
+    "MergeStats", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS",
+    "TableDraft", "TableDraftResult", "apply_human_edit", "describe_slot", "draft_catalog", "draft_structure",
+    "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "join_paths",
+    "make_item", "merge_notes", "now_iso", "parse_path", "query_snapshot_meta", "read_catalog", "read_entry",
+    "relation_graph", "relation_id", "render_table_index", "render_table_notes", "resolve_draft_model",
+    "resolve_table_name", "review_entry", "review_item", "same_notes", "save_human_edit", "status_counts",
+    "system_notes_source", "table_usage", "validate_notes", "visible_notes", "write_entry",
 ]

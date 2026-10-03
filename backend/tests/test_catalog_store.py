@@ -127,7 +127,7 @@ def test_validate_accepts_full_example():
     notes = {
         "label": _label("入园记录"), "description": _label("每次检票入园记一行", "llm", "proposed"),
         "grain": _label("每次入园"), "keys": _label(["visit_id"]), "kind": _label("fact"),
-        "business_date": _label({"column": "visit_date", "rule": "按检票时间计", "timezone": "Asia/Shanghai"}),
+        "business_date": _label({"column": "visit_date", "rule": "按检票时间计", "timezone": "+08:00"}),
         "valid_filter": _label("status = 1"), "dedup": _label("同一票号只计一次"),
         "columns": {"amount": {"label": _label("实收金额"), "meaning": _label("扣除优惠后的金额"),
                                "unit": _label("元"), "measure": _label("flow"),
