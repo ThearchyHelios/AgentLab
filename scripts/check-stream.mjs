@@ -709,6 +709,10 @@ await section('合并查询：输入、合并 SQL、结果预览，警告各占�
   check('合并 SQL 有标签、带复制', (await row.innerText()).includes('合并 SQL')
     && await row.getByRole('button', { name: '复制合并 SQL' }).count() === 1)
   check('结果预览画成表格（列是合并结果的列）', (await row.locator('table th').allInnerTexts()).some((t) => t.includes('到店人数')))
+  // 合并结果 8 行、预览只存了 5 行：说「此处仅为预览」和「显示前 5 / 8 行」，不说「查询已达行数上限」（A3）
+  const foot = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('预览只存了前几行：写「显示前 5 / 8 行」和「仅为预览」，不说查询已达行数上限', foot.includes('显示前 5 / 8 行')
+    && foot.includes('此处仅为预览') && !foot.includes('查询已达行数上限'), foot.slice(-120))
   check('输入写在合并 SQL 前面：先看合并的是什么，再看怎么合并', await row.evaluate((el) => {
     const m = el.querySelector('[data-step-merge]')
     const pre = el.querySelector('pre')
@@ -729,6 +733,32 @@ await section('合并查询：输入、合并 SQL、结果预览，警告各占�
   const overflow = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('窄栏展开合并那一行：输入清单、合并 SQL、预览都不撑出横向滚动', overflow <= 0, `${overflow}px`)
   await narrow.page.close()
+})
+
+await section('并行查询各配各的；查询的 SQL 检查；指标的问题指到来源查询的 SQL（A1、B2）', async () => {
+  const { page, errors } = await open('syn=parallel&link=1', { w: 1100, h: 900, name: 'parallel' })
+  const qa = page.locator('[data-node-id="q_a"]').filter({ hasText: 'SQL 检查：1 处错误' }).last()
+  check('出问题的那条查询：行上就说「SQL 检查：1 处错误」', await qa.count() === 1)
+  await qa.locator('button').first().click()
+  await page.waitForTimeout(200)
+  const list = qa.locator('[data-step-sql-checks] [data-sql-check="fanout_sum"][data-level="error"]')
+  const text = (await qa.locator('[data-step-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('展开：用 SQL 检查清单列出级别、规则名、说明、涉及的表和列', await list.count() === 1 && text.includes('错误')
+    && text.includes('一对多关联后重复计算') && text.includes('orders.total_amount') && !text.includes('fanout_sum'), text)
+  const qb = (await page.locator('[data-node-id="q_b"]').last().innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('另一条查询没有检查结果，也没被配上别人的结果', !qb.includes('SQL 检查') && !qb.includes('119'), qb)
+  const metric = page.locator('[data-step-code="metric_sql_check"]')
+  check('两个指标出自同一条查询：时间线一行', await metric.count() === 1, String(await metric.count()))
+  const fix = metric.locator('[data-fix="canvas"]')
+  check('「打开设置」落到来源查询节点的 SQL：写「打开「订单金额查询」的 SQL」', (await fix.innerText().catch(() => '')).trim()
+    === '打开「订单金额查询」的 SQL' && await fix.getAttribute('data-fix-node') === 'q_a'
+    && await fix.getAttribute('data-fix-field') === 'args.sql', await fix.innerText().catch(() => ''))
+  await fix.click()
+  const opened = await page.evaluate(() => window.__opened ?? [])
+  check('……点了打开的是来源查询节点的 args.sql，不是口径卡', JSON.stringify(opened) === JSON.stringify([['q_a', 'args.sql']]),
+    JSON.stringify(opened))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
 })
 
 await section('参考了哪些表：画布右栏和问数据页（context 操作）', async () => {
@@ -1272,6 +1302,17 @@ await section('放弃、结构化的报错、恢复的轮次、出具横幅（RE
   const head = await r.page.locator('[data-turn] .sticky').first().innerText()
   check('恢复的轮次：头部照样写几次查询', head.includes('3 次查询'), head.replace(/\n/g, ' '))
   await r.page.close()
+
+  // 降档是因为查询没通过 SQL 检查（B5）：横幅单列一块写是哪次查询、什么问题、影响了哪些引用；那一句不在其余缺口里重复
+  const q = await open('syn=issued-sql', { w: 1100, h: 900, name: 'issued-sql' })
+  const banner = q.page.locator('[data-issuance-banner=degraded]')
+  const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('SQL 检查导致的降档单列一块：写降档原因、哪次查询、问题、受影响的引用、下一步', sql.includes('降档原因：所依据的查询未通过 SQL 检查')
+    && sql.includes('查询「订单金额查询」（Q1）') && sql.includes('求和会重复计算') && sql.includes('受影响：指标「订单金额」、Q1 第 1 行「gmv」')
+    && sql.includes('修改来源查询的 SQL'), sql)
+  const rest = (await banner.locator('[data-issuance-gaps]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……那一句不在「校验未全部完成」里重复，其余缺口照列', !rest.includes('未通过 SQL 检查') && rest.includes('协作团队'), rest)
+  await q.page.close()
 
   const i = await open('syn=issued', { w: 1100, h: 900 })
   check('出具横幅带 data-issuance-banner（画布印章据此滚过来）', await i.page.locator('[data-issuance-banner]').count() === 1)

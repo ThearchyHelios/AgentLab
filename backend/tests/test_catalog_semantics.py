@@ -137,6 +137,8 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     rel = _relation(detail["notes"], "gate_id")
     assert (rel["source"], rel["status"], rel["cardinality"], rel["coverage"]) == (
         "profile", "verified", "many_to_one", 1.0)
+    # 子表一侧数过、确有重复：基数用数据核实过，一对多确有其事 → error（A6）
+    assert rel["cardinality_checked"] is True
     assert ("fanout_sum", "error", "gates", "id") in await _found(sid, sql)
 
     changes = [{"path": "relations.new", "value": {"columns": ["gate_id"], "to_table": "gates", "to_columns": ["id"]},
@@ -147,6 +149,21 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     after = _relation(r.json()["notes"], "gate_id")
     assert (after["status"], after["cardinality"], after["coverage"]) == ("confirmed", "many_to_one", 1.0)
     assert ("fanout_sum", "error", "gates", "id") in await _found(sid, sql)
+
+
+async def test_profiled_relation_without_child_check_only_warns(client, make_source, scenic_db):
+    """A6：子表超过整表统计上限、没核对子表一侧唯不唯一的关系，剖析照样记有确证、按多对一记，但基数不算用数据
+    核实过：扇出检查只给 warning（「可能重复计算」），不给 error、不让出具降档。"""
+    sql = "SELECT COUNT(g.id) AS n FROM gates g JOIN visits v ON v.gate_id = g.id"
+    sid = await make_source(scenic_db, options=_on(max_scan_rows=100), draft=["visits", "gates"])
+    r = await client.post(_url(sid), json={"tables": ["visits"]})
+    assert r.status_code == 200, r.text
+    rel = _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")
+    assert (rel["source"], rel["status"], rel["cardinality"]) == ("profile", "verified", "many_to_one")
+    assert not rel.get("cardinality_checked")
+    found = await _found(sid, sql)
+    assert ("fanout_sum", "warning", "gates", "id") in found
+    assert ("fanout_sum", "error", "gates", "id") not in found
 
 
 # ==========================================================================
@@ -191,6 +208,19 @@ def test_human_edit_rejects_a_removed_human_relation_that_structure_would_bring_
                                    inferable={park["id"]})
     assert [(r["id"], r["status"]) for r in out["relations"]] == [(park["id"], "rejected")]
     assert catalog.apply_human_edit({"relations": [park]}, {"relations": []}, table="visits", at=AT) == {}
+
+
+def test_human_edit_cannot_forge_a_data_checked_cardinality():
+    """A6：「基数用数据核实过」只能由数据剖析写。人工改了关系（记成人工确认），提交里带的 cardinality_checked 不作数；
+    值没动的关系保留剖析原来写的。"""
+    gate = {**_rel(["gate_id"], "gates", ["id"], "profile", "verified"), "coverage": 1.0, "cardinality_checked": True}
+    park = _rel(["park_id"], "parks", ["id"], "name")
+    forged = {**park, "cardinality": "one_to_many", "cardinality_checked": True}
+    out = catalog.apply_human_edit({"relations": [gate, park]}, {"relations": [gate, forged]}, table="visits", at=AT)
+    by_id = {r["id"]: r for r in out["relations"]}
+    assert by_id[gate["id"]]["cardinality_checked"] is True
+    assert (by_id[park["id"]]["source"], by_id[park["id"]]["status"]) == ("human", "confirmed")
+    assert "cardinality_checked" not in by_id[park["id"]]
 
 
 async def test_removed_or_rejected_relations_stay_out_of_checks_graph_and_redraft(client, make_source, scenic_db):
@@ -377,7 +407,9 @@ async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, mak
     third = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
     assert third["version"] == second["version"] + 1 and third["updated"] >= 1
     codes = (await _notes(client, sid, "visits"))["notes"]["columns"]["status"]["codes"]
-    assert set(codes["value"]) == {"0", "1", "2"} and "2026-10-03" in codes["note"]
+    assert set(codes["value"]) == {"0", "1", "2"} and codes["updated_at"] == DAY3
+    # A7：说明里不写日期（以前写的是 UTC 日期，和界面上的本地时间对不上），时间以这一项的 updated_at 为准
+    assert codes["note"].startswith("数据剖析：") and "2026-10-03" not in codes["note"]
 
 
 def test_merge_ignores_a_profile_note_that_only_changed_its_date():
@@ -392,6 +424,24 @@ def test_merge_ignores_a_profile_note_that_only_changed_its_date():
         {"1": "", "0": ""}, "profile", "proposed", note="数据剖析（2026-10-02）：统计全表，1600 行非空值共 2 个取值。")}}}
     merged, stats = catalog.merge_notes(old, changed, covered={"profile"}, at=DAY2)
     assert stats.updated == 1 and "2026-10-02" in merged["columns"]["status"]["codes"]["note"]
+
+
+def test_profile_notes_without_date_stay_compatible_with_dated_ones():
+    """A7：剖析写的说明不再带日期（「数据剖析：…」）。升级前写的「数据剖析（2026-10-01）：…」照样认得是剖析写的；
+    结论一样、只是新的不带日期，不算变化——升级后第一次重新剖析不能因此给每张表升一个版本。"""
+    dated = "数据剖析（2026-10-01）：统计全表，1500 行非空值共 2 个取值。"
+    plain = "数据剖析：统计全表，1500 行非空值共 2 个取值。"
+    assert catalog.is_profile_note(dated) and catalog.is_profile_note(plain)
+    assert not catalog.is_profile_note("人工备注：数据剖析（2026-10-01）") and not catalog.is_profile_note(None)
+    assert catalog.same_profile_note(dated, plain) and catalog.same_profile_note(plain, dated)
+    assert catalog.same_profile_note("数据剖析（2026-10-02）：统计全表，1500 行非空值共 2 个取值。", dated)
+    assert not catalog.same_profile_note(dated, "数据剖析：统计全表，1600 行非空值共 2 个取值。")
+    assert not catalog.same_profile_note(plain, "统计全表，1500 行非空值共 2 个取值。")
+    old = {"columns": {"status": {"codes": catalog.make_item({"1": "", "0": ""}, "profile", "proposed", note=dated,
+                                                             at=DAY1)}}}
+    new = {"columns": {"status": {"codes": catalog.make_item({"1": "", "0": ""}, "profile", "proposed", note=plain)}}}
+    merged, stats = catalog.merge_notes(old, new, covered={"profile"}, at=DAY2)
+    assert merged == old and stats == catalog.MergeStats()
 
 
 # ==========================================================================

@@ -2108,6 +2108,32 @@ export interface EvidenceMergeInput {
   source?: string | null
   artifact?: string | null
   sealed?: boolean
+  /** 这个输入查询对照数据目录查出的问题（形状同查询步骤的 checks）。没查出问题、快照读不出来时没有这个键 */
+  checks?: SqlCheckItem[]
+}
+
+/**
+ * 出具声明（output._issuance、issuance 事件）里的 sql_checks：没通过 SQL 检查的查询，一条一个。报告页、出具横幅据此
+ * 在显眼处说「因为 SQL 检查没通过而降档」。gap 是 gaps 里对应的那一句（单列之后不在其余缺口里重复）
+ */
+export interface IssuanceSqlCheck {
+  /** 「查询「取数」（Q1）」；给不出时没有 */
+  query?: string
+  node_id?: string
+  /** 每条问题那半句 */
+  problems?: string[]
+  /** 受影响的引用：「指标「订单金额」」「Q1 第 1 行「gmv」」 */
+  refs?: string[]
+  gap?: string
+}
+
+/** 查询用到的一张表、查询当时它的数据目录版本 */
+export interface EvidenceCatalogVersion {
+  /** 表结构里的表名 */
+  table: string
+  /** 目录里的中文名 */
+  label?: string
+  version?: number | null
 }
 
 /** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */
@@ -2166,6 +2192,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_reason?: string
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
+  /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
+  schema_artifact?: string
+  /** query：这条查询用到的表在表结构快照里冻结的数据目录版本（SQL 检查对照的那一版）。没有目录时没有这个键 */
+  catalog?: EvidenceCatalogVersion[]
   inputs?: EvidenceInput[]
   /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
   caliber_from?: EvidenceCaliberSource | null
@@ -2622,6 +2652,11 @@ export interface CatalogRelation {
   status: CatalogStatus
   note?: string
   updated_at?: string
+  /**
+   * 基数是数据剖析用数据核实的（子表一侧数过是否唯一），只由剖析写。外键、命名推断的基数没有这个键。
+   * 一对多关联后重复计算的检查只在它为真、或者关系人工确认过时报「错误」，否则最多是「提醒」
+   */
+  cardinality_checked?: boolean
 }
 
 /** 一张表的目录（notes）。字段固定，服务端不认识的一律拒收 */
@@ -2731,8 +2766,13 @@ export interface CatalogDraftRow {
   version: number
   /** 这张表没有起草（表结构里没有、写入一直冲突） */
   error: string | null
-  /** 只是模型那部分失败，其余来源照常写入 */
+  /** 只是模型那部分失败，其余来源照常写入。模型给了这张表、却一项可用内容都没有，也记在这里 */
   model_error: string | null
+  /**
+   * 模型给了这张表几项可用内容（并入目录之前）。没用模型、模型这部分失败时为 null（老后端没有这个键）。
+   * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
+   */
+  model_items?: number | null
 }
 
 /** POST /datasources/{id}/catalog/draft */
@@ -2922,6 +2962,11 @@ export interface CatalogProfileOut {
   stopped: CatalogProfileStop | null
   tables: CatalogProfileTable[]
   total: { added: number; updated: number; removed: number }
+  /**
+   * 不指定表时，挑表途中估过行数、确知是空表而跳过的表（老后端没有这个键；指定了表时是空列表）。
+   * 估行数的查询算在 queries_used 里，不算在各表的 queries 里
+   */
+  empty_tables?: string[]
   /** 一张表都没有剖析时的说明 */
   note: string | null
 }
@@ -2933,7 +2978,7 @@ export interface CatalogProfileOut {
 export type SqlCheckCode = 'fanout_sum' | 'stock_summed' | 'join_unconfirmed' | 'ratio_aggregated' | 'missing_valid_filter'
   | 'unknown_code' | 'wrong_date_column'
 
-/** error：依据有确证、结果必然有误；warning：依据有确证、很可能有误；info：依据只是推断 */
+/** error：依据已核实、结果很可能有误；warning：依据有确证、结果可能有误；info：依据只是推断 */
 export type SqlCheckLevel = 'error' | 'warning' | 'info'
 
 /** 一条检查结果（证据接口查询步骤里的 checks、助手自查和发布前检查的问题）。交回模型改写用的那句不上界面，这里不收 */

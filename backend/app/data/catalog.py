@@ -18,7 +18,11 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
                        "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写；项上可带 complete: true，
                                   表示已列出全部取值)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
-                    "source", "status", "note"?}]}
+                    "source", "status", "note"?, "cardinality_checked"?}]}
+
+关系上的 cardinality_checked: true 只由数据剖析写：基数是用数据核实的（子表一侧数过 COUNT 和 COUNT(DISTINCT)，
+或者有主键、唯一约束）。外键约束、命名推断给的基数是按表结构推的，子表一侧可能每个键恰好一行；SQL 检查只在
+基数用数据核实过、或者人工确认过时，才把一对多关联后的重复计算报成错误（data/sqlcheck.py）。
 
 来源（source）：comment 数据库注释、fk 外键约束、name 命名推断、profile 数据剖析（data/catalog_profile.py）、
 llm 模型起草、human 人工填写。状态（status）：proposed 推断（命名推断、模型起草、数据库注释）、verified 有确证
@@ -40,7 +44,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -88,7 +92,7 @@ _ITEM_KEYS = frozenset({"value", "source", "status", "note", "updated_at"})
 #: 没截断地看完了全表取值时才有；没有它的码值表只是「已知的一部分」，SQL 检查不能拿它判断某个值「不在码值表里」
 _CODES_ITEM_KEYS = _ITEM_KEYS | {"complete"}
 _RELATION_KEYS = frozenset({"id", "columns", "to_table", "to_columns", "cardinality", "coverage", "source",
-                            "status", "note", "updated_at"})
+                            "status", "note", "updated_at", "cardinality_checked"})
 _BUSINESS_DATE_KEYS = frozenset({"column", "rule", "timezone"})
 #: 文本项的长度上限。目录是给模型和人读的短说明，长篇大论放口径卡或知识库
 _TEXT_MAX = 500
@@ -293,6 +297,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}的状态「{rel.get('status')}」不在可选值内")
     if "note" in rel and not isinstance(rel["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "cardinality_checked" in rel and not isinstance(rel["cardinality_checked"], bool):
+        problems.append(f"{where}的「基数已用数据核实」应为是或否")
     if "updated_at" in rel and not isinstance(rel["updated_at"], str):
         problems.append(f"{where}的修改时间应为文字")
     return problems
@@ -512,22 +518,35 @@ def _core(item: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k != "updated_at"}
 
 
-#: 数据剖析写的备注都以「数据剖析（日期）：」开头（data/catalog_profile.py 的 NOTE_PREFIX 就是它）
-PROFILE_NOTE_PREFIX = "数据剖析（"
-_PROFILE_NOTE_DAY = re.compile(r"^数据剖析（\d{4}-\d{2}-\d{2}）")
+#: 数据剖析写的备注都以「数据剖析：」开头（data/catalog_profile.py 的 NOTE_PREFIX 就是它）。说明里不写日期：以前写的是
+#: UTC 日期，和界面上按本地时间显示的修改时间对不上；什么时候剖析的，看这一项的 updated_at
+PROFILE_NOTE_PREFIX = "数据剖析："
+#: 升级前的剖析备注带着当天的 UTC 日期：「数据剖析（2026-10-01）：」。旧数据里还有，照样认
+_PROFILE_NOTE_DAY = re.compile(r"^数据剖析（\d{4}-\d{2}-\d{2}）(?=：)")
+
+
+def is_profile_note(note: Any) -> bool:
+    """这段备注是不是数据剖析写的（新写法「数据剖析：」，或者升级前带日期的「数据剖析（日期）：」）。"""
+    return isinstance(note, str) and (note.startswith(PROFILE_NOTE_PREFIX) or bool(_PROFILE_NOTE_DAY.match(note)))
+
+
+def _undated(note: str) -> str:
+    """剖析备注去掉升级前写的日期：「数据剖析（2026-10-01）：…」→「数据剖析：…」。别的备注原样返回。"""
+    return _PROFILE_NOTE_DAY.sub("数据剖析", note, count=1)
 
 
 def same_profile_note(a: Any, b: Any) -> bool:
-    """两段备注是否相同；数据剖析写的备注只有开头的日期不同，也算相同。
+    """两段备注是否相同；数据剖析写的备注只差开头的日期（升级前每次都写当天的日期），或者一段带日期、一段是不带
+    日期的新写法，也算相同。
 
-    剖析每次都把当天的日期写进备注。隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就
-    升一个版本，发布时记下的目录版本对不上，之后每次正式运行都提醒「目录有变化」。
+    隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就升一个版本，发布时记下的目录版本
+    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期。
     """
     if a == b:
         return True
-    if not (isinstance(a, str) and isinstance(b, str) and _PROFILE_NOTE_DAY.match(a) and _PROFILE_NOTE_DAY.match(b)):
+    if not (is_profile_note(a) and is_profile_note(b)):
         return False
-    return _PROFILE_NOTE_DAY.sub("", a, count=1) == _PROFILE_NOTE_DAY.sub("", b, count=1)
+    return _undated(a) == _undated(b)
 
 
 def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -742,7 +761,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     for key, item in new.items():
         prev = old.get(key)
         if prev is None or _edit_value(key, item) != _edit_value(key, prev):
-            fresh = {k: v for k, v in item.items() if k != "updated_at"}
+            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数
+            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked")}
             fresh.update(source="human", status="confirmed", updated_at=at)
             out[key] = fresh
             continue
@@ -1576,8 +1596,16 @@ def _batches(names: list[str], tables: Mapping[str, Any]) -> list[list[str]]:
     return out
 
 
+#: 模型给了这张表、但一项可用内容都没有（只有表名的空壳，或者给的值全不合规）：这张表记模型失败，不算起草成功。
+#: 不然界面只看到「新增 0 项」，会说成「没有变化」
+MODEL_EMPTY_REASON = "模型没有给出这张表的可用内容"
+
+
 def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
-    """模型的回复 → 每张表一项的列表。结构化输出给的对象、正文里的 JSON 都认；对不上格式返回 None。"""
+    """模型的回复 → 每张表一项的列表。结构化输出给的对象、正文里的 JSON 都认；对不上格式返回 None。
+
+    实测模型有时不带 tables 外壳、只回单个表对象（{"table": "x", "label": …}），也认成一张表。
+    """
     if hasattr(raw, "model_dump"):
         raw = raw.model_dump()
     if isinstance(raw, str):
@@ -1591,31 +1619,43 @@ def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
         except ValueError:
             return None
     if isinstance(raw, dict):
-        raw = raw.get("tables")
+        raw = [raw] if "tables" not in raw and raw.get("table") else raw.get("tables")
     if not isinstance(raw, list):
         return None
     return [t for t in raw if isinstance(t, dict)]
 
 
-async def _ask_model(model: Any, messages: list[Any]) -> list[dict[str, Any]]:
-    """问一批。先走结构化输出；模型不支持、调用报错、或给回来的不是约定的结构，再退回纯文本、从正文里取 JSON。
+async def _ask_model(model: Any, messages: list[Any],
+                     usable: Callable[[list[dict[str, Any]]], bool] | None = None) -> list[dict[str, Any]]:
+    """问一批。先走结构化输出；模型不支持、调用报错、给回来的不是约定的结构，或者 usable 说它不够用（实测见过
+    结构化输出只给 {"tables":[{"table":"x"}]} 这样的空壳），再退回纯文本、从正文里取 JSON。
 
     结构化输出报错也退回（同 judge._ask）：有的网关不支持工具调用，一调就报错，纯文本却能用。代价是真的
     网络故障会多试一次，两次加起来仍受 MODEL_TIMEOUT_S 约束。
+
+    两条路都拿到了东西时，结构化的在前、纯文本的在后一起交回（同一张表各有一份，调用方挑能用的那份）；纯文本那次
+    失败了就只交回结构化的那份（调用方据此给空壳的表记失败）。
     """
     try:
         parsed = _model_tables(await model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA).ainvoke(messages))
     except Exception:  # noqa: BLE001 - 退回纯文本
         parsed = None
-    if parsed is not None:
+    if parsed is not None and (usable is None or usable(parsed)):
         return parsed
     from app.engine.state import message_text
 
-    reply = await model.ainvoke(messages)
-    parsed = _model_tables(message_text(reply))
-    if parsed is None:
+    try:
+        reply = await model.ainvoke(messages)
+    except Exception:  # noqa: BLE001 - 结构化那份还在：交回它，空壳的表由调用方记失败
+        if parsed is not None:
+            return parsed
+        raise
+    text = _model_tables(message_text(reply))
+    if text is None:
+        if parsed is not None:
+            return parsed
         raise ValueError("模型的回复不是约定的格式")
-    return parsed
+    return [*(parsed or []), *text]
 
 
 def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
@@ -1695,9 +1735,22 @@ async def draft_with_model(model: Any, source: Any, tables: list[str], *,
                                                     existing=(existing or {}).get(n)) for n in batch)
         messages = [SystemMessage(content=CATALOG_DRAFT_SYSTEM),
                     HumanMessage(content=CATALOG_DRAFT_PROMPT.format(n=len(batch), tables=described))]
+        def drafted(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            """这批里每张表能用的那份：同一张表给了几份（结构化、纯文本各一份）时取第一份有可用内容的。"""
+            out: dict[str, dict[str, Any]] = {}
+            for entry in entries:
+                name = str(entry.get("table"))
+                if name in batch and name not in out:
+                    notes = _from_model(entry, all_tables[name], system=system)
+                    if notes:
+                        out[name] = notes
+            return out
+
         try:
             async with gate:
-                got = await asyncio.wait_for(_ask_model(model, messages), timeout=MODEL_TIMEOUT_S)
+                got = await asyncio.wait_for(
+                    _ask_model(model, messages, usable=lambda entries: len(drafted(entries)) == len(batch)),
+                    timeout=MODEL_TIMEOUT_S)
         except asyncio.TimeoutError:
             for n in batch:
                 results[n] = f"模型起草超时：{MODEL_TIMEOUT_S} 秒内没有收到回复"
@@ -1708,14 +1761,13 @@ async def draft_with_model(model: Any, source: Any, tables: list[str], *,
             for n in batch:
                 results[n] = f"模型起草失败：{first_line(e) or describe_exception(e)}"
             return
-        by_name = {str(t.get("table")): t for t in got}
+        named = {str(t.get("table")) for t in got}
+        usable = drafted(got)
         for n in batch:
-            entry = by_name.get(n)
-            if entry is None:
-                results[n] = "模型的回复里没有这张表"
-                continue
-            results[n] = TableDraft(notes=_from_model(entry, all_tables[n], system=system),
-                                    covered=frozenset({"llm"}))
+            if n in usable:
+                results[n] = TableDraft(notes=usable[n], covered=frozenset({"llm"}))
+            else:
+                results[n] = MODEL_EMPTY_REASON if n in named else "模型的回复里没有这张表"
 
     await asyncio.gather(*(run(b) for b in _batches(names, all_tables)))
     return {n: results[n] for n in names if n in results}
@@ -1737,6 +1789,9 @@ class TableDraftResult:
     version: int = 0
     error: str | None = None
     model_error: str | None = None
+    #: 模型给了这张表几项可用内容（并入目录之前，按项数）。没用模型、模型这部分失败时为 None。
+    #: 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
+    model_items: int | None = None
 
 
 @dataclass
@@ -1800,6 +1855,8 @@ async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str]
         modeled = llm.get(table)
         if isinstance(modeled, str):
             result.model_error = modeled
+        elif isinstance(modeled, TableDraft):
+            result.model_items = len(_slots(modeled.notes))
         for _attempt in range(3):
             entry = await read_entry(session, source.id, table)
             version = entry.version if entry else 0
@@ -1991,7 +2048,8 @@ _FLIP = {"many_to_one": "one_to_many", "one_to_many": "many_to_one", "one_to_one
 class JoinEdge:
     """关系图里的一条有向边：从 from_table 的 from_columns 连到 to_table 的 to_columns。
 
-    每条关系在图里有正反两条边；cardinality 是从 from_table 看过去的基数。
+    每条关系在图里有正反两条边；cardinality 是从 from_table 看过去的基数。cardinality_checked：基数是数据剖析
+    用数据核实的（关系上的同名字段），不是按表结构推的。
     """
 
     from_table: str
@@ -2002,10 +2060,11 @@ class JoinEdge:
     cardinality: str | None
     source: str
     status: str
+    cardinality_checked: bool = False
 
     def reversed(self) -> "JoinEdge":
         return JoinEdge(self.to_table, self.to_columns, self.from_table, self.from_columns, self.relation_id,
-                        _FLIP.get(self.cardinality or ""), self.source, self.status)
+                        _FLIP.get(self.cardinality or ""), self.source, self.status, self.cardinality_checked)
 
     def condition(self) -> str:
         """连接条件：visits.id = channel_visits.visit_id（多列用 AND 连接）。"""
@@ -2049,7 +2108,7 @@ def relation_graph(notes_by_table: Mapping[str, Mapping[str, Any]], *,
             continue
         edge = JoinEdge(table, tuple(rel.get("columns") or ()), str(rel.get("to_table")),
                         tuple(rel.get("to_columns") or ()), rid, rel.get("cardinality"), str(rel.get("source")),
-                        str(rel.get("status")))
+                        str(rel.get("status")), rel.get("cardinality_checked") is True)
         graph.setdefault(edge.from_table, []).append(edge)
         graph.setdefault(edge.to_table, []).append(edge.reversed())
     return graph
@@ -2163,6 +2222,10 @@ def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -
     只收表结构快照里有的表（tables）；去掉驳回项以后什么都不剩的表不收。一张也没有时返回空 dict，
     调用方据此不加这个键：没有目录的源，快照内容和以前一字不差。目录不变（版本和内容都不变）则返回值
     不变，快照哈希也就不变。
+
+    被驳回的关系留下编号和状态（{"id", "status": "rejected"}，不放内容）：拿冻结的这份重建 SQL 检查器
+    （sqlcheck.frozen_checker）时，关系图（relation_graph）认得这些编号，按外键、命名现推的关系不会把驳回的推回来。
+    只有驳回关系的表也因此要冻结。visible_notes 照样把它们去掉，给人看、给模型看的内容不变。
     """
     wanted = set(tables)
     out: dict[str, dict[str, Any]] = {}
@@ -2170,6 +2233,10 @@ def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -
         if name not in wanted:
             continue
         notes = visible_notes(entries[name].notes)
+        rejected = [{"id": str(item["id"]), "status": "rejected"} for key, item in _slots(entries[name].notes).items()
+                    if key[0] == "r" and item.get("status") == "rejected"]
+        if rejected:
+            notes = {**notes, "relations": [*(notes.get("relations") or []), *rejected]}
         if notes:
             out[name] = {"version": entries[name].version, "notes": notes}
     return out
@@ -2180,11 +2247,13 @@ __all__ = [
     "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE",
+    "MODEL_EMPTY_REASON", "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX",
+    "PROFILE_VERIFY_COVERAGE",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
     "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
     "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
-    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "join_paths",
+    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
+    "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",
     "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
     "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",

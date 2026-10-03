@@ -227,7 +227,11 @@ async def put_catalog_table(source_id: str, table: str, payload: CatalogPutIn,
 async def draft_catalog(source_id: str, payload: CatalogDraftIn,
                         x_actor: str | None = Header(default=None),
                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """同步起草。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。"""
+    """同步起草。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。
+
+    model_items：模型给了这张表几项可用内容（没用模型、模型这部分失败时为 null）。界面据此区分「模型给了内容、
+    只是和现有目录一致」（model_items > 0、三个数都是 0）和「模型没给内容」（model_error 有值）。
+    """
     _, source = await _resolved(session, source_id)
     cache = source.schema_cache or {}
     if not cache.get("tables"):
@@ -235,7 +239,8 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
     report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
                                          use_model=payload.use_model, actor=actor_of(x_actor))
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
-             "version": r.version, "error": r.error, "model_error": r.model_error} for r in report.tables]
+             "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
+            for r in report.tables]
     return {
         "tables": rows,
         "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},
@@ -287,7 +292,10 @@ async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
         raise HTTPException(409, str(e)) from e
     rows = [_profile_table_out(t) for t in report.tables]
     note = None
-    if not rows:
+    if not rows and report.empty_tables:
+        note = (f"有待核对关联关系的 {len(report.empty_tables)} 张表都是空表，没有可以核实的数据。"
+                "请在数据有了之后再剖析，或指定要剖析的表")
+    elif not rows:
         note = "目录里还没有待核实的关联关系，请先起草数据目录，或指定要剖析的表"
     return {
         "profiled_at": report.profiled_at,
@@ -297,6 +305,8 @@ async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
         "stopped": report.stopped,
         "tables": rows,
         "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},
+        # 不指定表时挑表途中确知是空表、跳过了的表（指定了表时总是空列表）
+        "empty_tables": report.empty_tables,
         "note": note,
     }
 

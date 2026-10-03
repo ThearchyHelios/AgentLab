@@ -146,7 +146,12 @@ def test_frozen_catalog_strips_rejected_and_keeps_versions():
     assert set(frozen) == {"visits"}                              # 表结构里没有的、全被驳回的都不冻结
     assert frozen["visits"]["version"] == 4
     assert "dedup" not in frozen["visits"]["notes"]
-    assert len(frozen["visits"]["notes"]["relations"]) == 2
+    # 两条没被驳回的关系原样冻结；驳回的那条只留编号和状态（重建检查器时不被按外键、命名推回来）
+    relations = frozen["visits"]["notes"]["relations"]
+    assert len([r for r in relations if r.get("status") != "rejected"]) == 2
+    assert [r for r in relations if r.get("status") == "rejected"] == [
+        {"id": r["id"], "status": "rejected"} for r in VISITS["relations"] if r.get("status") == "rejected"]
+    assert len(catalog.visible_notes(frozen["visits"]["notes"])["relations"]) == 2
     assert catalog.frozen_catalog({}, ["visits"]) == {}
 
 

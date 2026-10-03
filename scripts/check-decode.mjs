@@ -123,17 +123,29 @@ await section('合并查询', async () => {
   check('标题说合并的是哪几个输入', m?.title === '合并 s、v 的查询结果', m?.title)
   check('合并 SQL 留在详情里', m?.detail === synthetic.MERGE_SQL)
   check('预览按查询结果的形状给出，能画成表格', !!mod.parseQueryResult(m?.result ?? '')?.columns?.includes('到店人数'))
+  // 合并结果 8 行、预览只存了 5 行：这是「此处仅为预览」，不是「查询已达行数上限」（A3）
+  const table = mod.parseQueryResult(m?.result ?? '')
+  check('预览只存了前几行：记为预览（clipped），不记为查询撞了行数上限（truncated），并带上一共几行', table?.truncated === false
+    && table?.clipped === true && table?.total === 8 && table?.rows.length === 5, JSON.stringify({ t: table?.truncated, c: table?.clipped, n: table?.total }))
   check('输入、行数、数据源都在', m?.merge?.inputs?.length === 2 && m.merge.inputs[1].source === 'members'
     && m.merge.inputs[0].label === '门店销售' && m.merge.rows === 8)
   check('行数和耗时写在行尾', !!m?.meta?.includes('8 行'), m?.meta)
   check('工件可下钻到合并结果的快照', m?.artifact === 'mq-merge')
   check('有警告时这一行标成警告、说有几条', m?.level === 'warn' && !!m.sub?.includes('2 条警告'), m?.sub)
   const key = all.find((s) => s.code === 'merge_key_type')
-  check('键类型不一致说成人话：标题点名两列', !!key?.title.includes('s.门店') && key.title.includes('v.门店'), key?.title)
+  check('键类型不一致说成人话：标题点名两列（读 keys 字段）', key?.title === '合并键类型不一致：s.门店 与 v.门店', key?.title)
+  check('……副标题是 detail 字段', key?.sub === "s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）", key?.sub)
   check('键类型不一致给出下一步', !!key?.next?.includes('CAST') && key.fix === 'canvas')
   const grew = all.find((s) => s.code === 'merge_rows_grew')
-  check('行数放大说成人话，并带上行数和重复的键', !!grew?.title.includes('不唯一') && !!grew.sub?.includes('8 行')
-    && !!grew.sub?.includes('出现 2 次'), grew?.sub)
+  check('行数放大说成人话，并带上行数和重复的键（读 rows、input、input_rows、duplicates 字段）', !!grew?.title.includes('不唯一')
+    && grew.sub === '合并结果 8 行，行数最多的输入「s」4 行；「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组',
+    grew?.sub)
+  // 老运行的日志没有结构化字段：不从中文里解析，只给标题，原话留在展开区
+  const old = flatten(mod.decodeRun([
+    { seq: 1, type: 'node.started', node_id: 'merge', ts: 1, data: { node_type: 'merge' } },
+    { seq: 2, type: 'log', node_id: 'merge', ts: 2, data: { level: 'warn', code: 'merge_key_type', message: '合并键类型不一致：s.门店 是文本，v.门店 是数值。' } },
+  ])).find((s) => s.code === 'merge_key_type')
+  check('老日志没有结构化字段：只给标题，不解析原话', old?.title === '合并键类型不一致' && !old.sub && !!old.detail?.includes('s.门店'), old?.title)
   check('警告原文各占一行，不在合并那一行里重复', all.filter((s) => s.level === 'warn' && s.nodeId === 'merge').length === 3)
   check('合并节点照常完成，两次源查询仍是普通查询步骤', all.filter((s) => s.kind === 'query' && s.code !== 'merge').length === 2
     && steps.find((s) => s.nodeId === 'merge')?.status === 'done')
@@ -673,18 +685,30 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
 
   const seeded = mod.copilotContext({ op: 'context', sources: [
     { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })
-  check('没挑成但现有工作流的表带着字段：标题说几张、副标题说没挑成',
-    seeded?.title === '参考了 1 张表' && seeded?.sub === '未能按需求挑选，已提供全部表名'
+  check('没挑成但现有工作流的表带着字段：标题说几张带字段、副标题说没挑成和只给了表名的张数',
+    seeded?.title === '参考了 1 张表的字段' && seeded?.sub === '未能按需求挑选，另有 50 张表只提供了表名'
     && seeded.detail.includes('现有工作流用到的 1 张表附带全部字段：stores'), JSON.stringify(seeded))
   const mixed = mod.copilotContext({ op: 'context', sources: [
     { source: 'a', tables: ['x'], selected_by: 'all', total: 1 },
     { source: 'b', tables: [], selected_by: 'fallback', total: 80, reason: 'r' }] })
-  check('只有一个库没挑成：副标题点名是哪个库', mixed?.sub === '「b」未能按需求挑选，已提供全部表名', mixed?.sub)
+  check('只有一个库没挑成：副标题点名是哪个库，并写只提供了表名的张数', mixed?.title === '参考了 1 张表的字段'
+    && mixed?.sub === '「b」未能按需求挑选，另有 80 张表只提供了表名', `${mixed?.title} / ${mixed?.sub}`)
   const none = mod.copilotContext({ op: 'context', sources: [
     { source: 'a', tables: ['x'], selected_by: 'model', total: 60 },
     { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
-  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名'),
-    none?.detail)
+  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名')
+    && none.title === '参考了 1 张表的字段' && none.sub === '另有 70 张表只提供了表名', `${none?.title} / ${none?.sub} / ${none?.detail}`)
+  // R2 走查（B14）：几个小库全给、点名的大库按需求挑、另一个大库没挑成。展开后挑表的库排在最前面，
+  // 两个数分开说：26 张带字段，206 张只给了表名
+  const r2 = mod.copilotContext({ op: 'context', sources: [
+    { source: 'small_a', tables: Array.from({ length: 12 }, (_, i) => `a${i}`), selected_by: 'all', total: 12 },
+    { source: 'small_b', tables: Array.from({ length: 11 }, (_, i) => `b${i}`), selected_by: 'all', total: 11 },
+    { source: 'big', tables: [], selected_by: 'fallback', total: 206, reason: '超时' },
+    { source: 'named', tables: ['visits', 'channels', 'parks'], selected_by: 'model', total: 51 }] })
+  check('展开后按需求挑表的库排在第一行，没挑成的排在最后', r2?.detail.split('\n')[0].startsWith('「named」按需求从 51 张表中挑出 3 张')
+    && r2.detail.split('\n')[3].startsWith('「big」'), r2?.detail.split('\n').map((l) => l.slice(0, 12)).join(' | '))
+  check('两个数分开说：带字段的 26 张、只提供了表名的 206 张', r2?.title === '参考了 26 张表的字段'
+    && r2.sub === '「big」未能按需求挑选，另有 206 张表只提供了表名', `${r2?.title} / ${r2?.sub}`)
   // 探查结构截断了（每个数据源最多取 200 张表）：total 是数据库里的总数，explored 是探查到的
   const partial = mod.copilotContext({ op: 'context', sources: [
     { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 },
@@ -1468,16 +1492,17 @@ await section('agent 字段按出处核对（可点击证据第二期）：抽�
 
 await section('口径卡指标不完整（数据目录阶段 0）：截断的查询结果整组拿来算的指标，警告说人话并指到 SQL', async () => {
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
-  // 原话和 backend/app/engine/nodes/metrics.py 的 _incomplete_reason 同一个句式。先核对后端源码还是这么说的
-  const INCOMPLETE = '指标「入园人次」基于被截断的查询结果计算（只取回了前 1000 行），结果不完整'
+  // 日志带着结构化字段（metric_name、reason），界面读字段，不从原话里解析。先核对后端还发这两个字段
+  const REASON = '基于被截断的查询结果计算（只取回了前 1000 行），结果不完整'
+  const INCOMPLETE = `指标「入园人次」${REASON}`
   const metricsPy = readFileSync(`${root}backend/app/engine/nodes/metrics.py`, 'utf8')
-  check('后端发指标不完整警告的格式还是夹具里这一种', metricsPy.includes('code="metric_incomplete"')
-    && metricsPy.includes('message=f"指标「{m[\'name\']}」{m[\'incomplete_reason\']}"')
-    && metricsPy.includes('f"基于被截断的查询结果计算（只取回了{fetched[0]}），结果不完整"'),
-  '改了 metrics.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  check('后端发指标不完整警告时带着 metric_name、reason 字段', metricsPy.includes('code="metric_incomplete"')
+    && metricsPy.includes('metric_name=m["name"]') && metricsPy.includes('reason=m["incomplete_reason"]'),
+  '改了 metrics.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
   const all = flatten(mod.decodeRun([
     E(1, 'node.started', 'card', { node_type: 'metrics' }),
-    E(2, 'log', 'card', { level: 'warn', code: 'metric_incomplete', metric: 'visits', message: INCOMPLETE }),
+    E(2, 'log', 'card', { level: 'warn', code: 'metric_incomplete', metric: 'visits', metric_name: '入园人次', reason: REASON,
+      rows: [1000], message: INCOMPLETE }),
     E(3, 'node.finished', 'card', { duration_ms: 3 }),
   ]))
   const inc = all.find((s) => s.code === 'metric_incomplete')
@@ -1486,6 +1511,12 @@ await section('口径卡指标不完整（数据目录阶段 0）：截断的查
     `${inc?.sub} / ${inc?.detail}`)
   check('……是提醒（warn），下一步指到 SQL，节点本身照样成功', inc?.level === 'warn' && !!inc?.next?.includes('SQL')
     && all.find((s) => s.kind === 'node')?.status === 'done', `${inc?.level} ${inc?.next}`)
+  const bare = flatten(mod.decodeRun([
+    E(1, 'node.started', 'card', { node_type: 'metrics' }),
+    E(2, 'log', 'card', { level: 'warn', code: 'metric_incomplete', metric: 'visits', message: INCOMPLETE }),
+  ])).find((s) => s.code === 'metric_incomplete')
+  check('老日志没有结构化字段：只给不点名的标题，不解析原话', bare?.title === '指标结果不完整' && !bare.sub && bare.detail === INCOMPLETE,
+    bare?.title)
 })
 
 await section('结论句裁判（可点击证据第四期）：裁判调用单独成行、几条警告说人话、封存后按需裁判有记录', async () => {
@@ -1765,45 +1796,44 @@ await section('按后端原文匹配的地方：后端现在的原文、整改�
 
 await section('SQL 检查（数据目录阶段 4B）：指标所依据的查询未通过检查说成一行；助手自查和交付的问题写中文规则名', async () => {
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
-  // 原话和 backend/app/engine/nodes/metrics.py 的 _sql_check_reason 同一个句式。先核对后端源码还是这么说的
+  // 日志按查询归并（同一条查询的问题一行），带着结构化字段：metric_names、problems、checks、source_node、source_field。
+  // 界面读字段，不从原话里解析。先核对后端还发这些字段
   const metricsPy = readFileSync(`${root}backend/app/engine/nodes/metrics.py`, 'utf8')
-  check('后端发指标未通过 SQL 检查警告的格式还是夹具里这几种', metricsPy.includes('code="metric_sql_check"')
-    && metricsPy.includes('message=f"指标「{m[\'name\']}」{m[\'sql_check_reason\']}"')
-    && metricsPy.includes('"所依据的查询未通过 SQL 检查，结果不可靠"')
-    && metricsPy.includes('f"所依据的查询未通过 SQL 检查（{problems[0]}），结果不可靠"')
-    && metricsPy.includes('f"所依据的查询有 {len(problems)} 处未通过 SQL 检查（{problems[0]}等），结果不可靠"'),
-  '改了 metrics.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  check('后端发指标未通过 SQL 检查的日志时带着结构化字段', metricsPy.includes('code="metric_sql_check"')
+    && ['metrics=ids', 'metric_names=', 'problems=problem.problems', 'checks=', 'source_node', 'source_field'].every((k) => metricsPy.includes(k)),
+  '改了 metrics.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
   const CODES = /fanout_sum|stock_summed|join_unconfirmed|ratio_aggregated|missing_valid_filter|unknown_code|wrong_date_column/
-  const decodeOne = (message) => {
+  const decodeOne = (fields) => {
     const all = flatten(mod.decodeRun([
       E(1, 'node.started', 'card', { node_type: 'metrics' }),
-      E(2, 'log', 'card', { level: 'warn', code: 'metric_sql_check', metric: 'aov', message }),
+      E(2, 'log', 'card', { level: 'warn', code: 'metric_sql_check', metric: 'aov', ...fields }),
       E(3, 'node.finished', 'card', { duration_ms: 3 }),
     ]))
     return { step: all.find((s) => s.code === 'metric_sql_check'), node: all.find((s) => s.kind === 'node') }
   }
-  // 问题本身带括号（列的中文名里写了单位）：副标题要取到「，结果不可靠」前面最后一个右括号
-  const ONE = '指标「客单价」所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额（元）」求和会重复计算），结果不可靠'
-  const one = decodeOne(ONE)
+  // 问题本身带括号（列的中文名里写了单位）：读字段就不存在截断的问题
+  const P1 = '「订单」关联「订单明细」是一对多，对「订单」的「订单金额（元）」求和会重复计算'
+  const ONE = `指标「客单价」所依据的查询未通过 SQL 检查（${P1}），结果不可靠`
+  const one = decodeOne({ metric_names: ['客单价'], problems: [P1], message: ONE })
   check('metric_sql_check 一行：标题点名哪个指标', one.step?.title === '指标「客单价」所依据的查询未通过 SQL 检查', one.step?.title)
-  check('……原因放副标题（问题里的括号不截断），原话留在展开区',
-    one.step?.sub === '「订单」关联「订单明细」是一对多，对「订单」的「订单金额（元）」求和会重复计算' && one.step?.detail === ONE,
+  check('……原因放副标题（读 problems 字段），原话留在展开区', one.step?.sub === P1 && one.step?.detail === ONE,
     `${one.step?.sub} / ${one.step?.detail}`)
   check('……是提醒（warn），下一步指到 SQL 和数据目录，节点本身照样成功', one.step?.level === 'warn'
     && !!one.step?.next?.includes('SQL') && !!one.step?.next?.includes('数据目录') && one.step?.fix === 'canvas'
     && one.node?.status === 'done', `${one.step?.level} ${one.step?.next}`)
-  const two = decodeOne('指标「客单价」所依据的查询有 2 处未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算等），结果不可靠')
-  check('几处问题：标题写处数，副标题是第一处', two.step?.title === '指标「客单价」所依据的查询有 2 处未通过 SQL 检查'
-    && two.step?.sub === '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算等', `${two.step?.title} / ${two.step?.sub}`)
-  const bare = decodeOne('指标「客单价」所依据的查询未通过 SQL 检查，结果不可靠')
-  check('没有括号里的问题：只有标题，不编副标题', bare.step?.title === '指标「客单价」所依据的查询未通过 SQL 检查' && !bare.step?.sub,
-    `${bare.step?.title} / ${bare.step?.sub}`)
+  const P2 = '「库存」按日期以外的列求和会把存量跨期加总'
+  const two = decodeOne({ metric_names: ['客单价', '订单金额'], problems: [P1, P2], message: 'x' })
+  check('一条查询两处问题、影响两个指标：标题点名两个指标并写处数，副标题列出两处', two.step?.title === '指标「客单价」「订单金额」所依据的查询有 2 处未通过 SQL 检查'
+    && two.step?.sub === `${P1}；${P2}`, `${two.step?.title} / ${two.step?.sub}`)
+  const bare = decodeOne({ message: '指标「客单价」所依据的查询未通过 SQL 检查（某个问题），结果不可靠' })
+  check('老日志没有结构化字段：只给不点名的标题，不解析原话', bare.step?.title === '指标所依据的查询未通过 SQL 检查' && !bare.step?.sub
+    && !bare.step?.fixNode, `${bare.step?.title} / ${bare.step?.sub}`)
 
   // 助手自查（check）和交付（final.issues）里的 SQL 检查问题：code 是规则编号，field 是 args.sql，另带表、列和 SQL 片段
   const sqlIssue = (level, code, message, extra = {}) => ({ level, node_id: 'q', edge_id: null, field: 'args.sql', code, message,
     table: 'orders', ...extra })
   const ERR = sqlIssue('error', 'fanout_sum', '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联',
-    { column: 'total_amount', sql_excerpt: 'SUM(o.total_amount)' })
+    { column: 'total_amount', sql_excerpt: 'SUM(o.total_amount)', relation_id: 'r0a1b2c3d4e5' })
   const WARN = sqlIssue('warning', 'missing_valid_filter', '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选')
   const INFO = sqlIssue('info', 'join_unconfirmed', '「订单」与「门店」按推断的关系关联（o.store_id = s.id），这条关系尚未确认', { table: 'stores' })
   const ops = [
@@ -1840,11 +1870,36 @@ await section('SQL 检查（数据目录阶段 4B）：指标所依据的查询�
   const asCheck = mod.issueSqlCheck(out.check.issues[0])
   check('问题按 SQL 检查读得出级别、表、列、SQL 片段', asCheck?.level === 'error' && asCheck.table === 'orders' && asCheck.column === 'total_amount'
     && asCheck.sql_excerpt === 'SUM(o.total_amount)' && out.check.issues[0].field === 'args.sql', JSON.stringify(asCheck))
+  // 和证据面板、运行时间线同一个读法（lib/sqlcheck 的 sqlCheckOf）：关系编号不丢
+  check('……关系编号也留着（以前另写的一份丢了 relation_id）', asCheck?.relation_id === 'r0a1b2c3d4e5', JSON.stringify(asCheck))
   check('不是 SQL 检查的问题不按它读', mod.issueSqlCheck({ message: 'x', code: 'tools_dropped' }) === null)
   const infoOnly = mod.decodeCopilot([{ op: 'final', graph: { nodes: [{ id: 'q' }] }, issues: [INFO] }], { context: 'canvas' })
     .find((s) => s.code === 'sql_check')
   check('只有提示：不用提醒色，下一步说依据尚未确认', !!infoOnly && !infoOnly.level && !!infoOnly.next?.includes('尚未确认'),
     `${infoOnly?.level} ${infoOnly?.next}`)
+})
+
+await section('并行查询配对（A1）、查询的 SQL 检查（tool.end.checks）、指标的问题指到来源查询的 SQL（B2）', async () => {
+  const all = flatten(mod.decodeRun(synthetic.parallelQueryRun(), { status: 'succeeded' }))
+  const qa = all.find((s) => s.kind === 'query' && s.nodeId === 'q_a')
+  const qb = all.find((s) => s.kind === 'query' && s.nodeId === 'q_b')
+  check('两个并行的查询节点用同一个工具：各自的结果配回各自的节点', !!qa?.result?.includes('119160') && !!qb?.result?.includes('"refunds"')
+    && !qb.result.includes('119160'), `${qa?.result?.slice(0, 40)} | ${qb?.result?.slice(0, 40)}`)
+  check('……两行都收尾了，没有一直显示进行中', qa?.status === 'done' && qb?.status === 'done', `${qa?.status} ${qb?.status}`)
+  check('……检查结果挂在出问题的那条查询上', qa?.checks?.length === 1 && !qb?.checks, JSON.stringify(qb?.checks))
+  const [c] = qa?.checks ?? []
+  check('查询那一行带着 SQL 检查结果（级别、规则、表和列、关系编号），副标题数一下', c?.code === 'fanout_sum' && c.level === 'error'
+    && c.table === 'orders' && c.column === 'total_amount' && c.relation_id === 'r1a2b3c4d5e6'
+    && qa.sub === 'SQL 检查：1 处错误' && qa.level === 'warn', `${qa?.sub} ${qa?.level}`)
+  const rows = all.filter((s) => s.code === 'metric_sql_check')
+  check('同一条查询影响两个指标：时间线一行', rows.length === 1, String(rows.length))
+  const m = rows[0]
+  check('……标题点名两个指标，副标题是问题', m?.title === '指标「订单金额」「客单价」所依据的查询未通过 SQL 检查'
+    && m.sub === synthetic.FANOUT_PROBLEM, `${m?.title} / ${m?.sub}`)
+  check('……「打开设置」指到来源查询节点的 SQL，不是口径卡', m?.fix === 'canvas' && m.fixNode === 'q_a' && m.fixField === 'args.sql'
+    && m.fixLabel === '订单金额查询' && m.nodeId === 'card', `${m?.fixNode} ${m?.fixField} ${m?.fixLabel}`)
+  check('……检查结果也挂在这一行，展开能看', m?.checks?.length === 1 && m.checks[0].code === 'fanout_sum')
+  check('……下一步说改来源查询的 SQL', !!m?.next?.includes('来源查询的 SQL'), m?.next)
 })
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')

@@ -57,6 +57,12 @@ export function sqlCheckOf(v: unknown): SqlCheckItem | null {
   }
 }
 
+/** 一组检查（事件、接口里的 checks 字段，助手自查的问题）：认不出的丢掉 */
+export function sqlChecksOf(v: unknown): SqlCheckItem[] {
+  const list: unknown[] = Array.isArray(v) ? v : []
+  return list.map(sqlCheckOf).filter((c): c is SqlCheckItem => c !== null)
+}
+
 /** 一条检查写成一行（时间线的展开区、交给助手再修的清单）：「错误 · 一对多关联后重复计算：……（涉及 orders.amount）」 */
 export function sqlCheckLine(c: SqlCheckItem): string {
   const where = sqlCheckWhere(c)

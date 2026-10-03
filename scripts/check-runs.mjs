@@ -1981,6 +1981,37 @@ await section('证据页签：左边报告、右边常驻面板、下方审计�
   await page.keyboard.press('Escape')
 })
 
+await section('证据页签：降档时报告上方写明档位和原因，SQL 检查没通过的单独说，「都有出处」不画成绿色（B5）', async () => {
+  // 成果的 _issuance 带 sql_checks（engine/nodes/io.py）：数字都有出处，降档却是因为算数的查询没通过 SQL 检查
+  const EV_SQL = 'fake0evsqldegrade000000000000'
+  const PROBLEM = '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'
+  const GAP = `查询「取订单」（Q1）未通过 SQL 检查（${PROBLEM}），结果不可靠；受影响的引用：Q1 第 1 行「gmv」`
+  const issuance = { tier: 'degraded', calibers: [], metrics_checked: 0, missing_required: [], missing_expected: [],
+    unmatched_numbers: [], matched_numbers: 10, matched: [], gaps: [GAP],
+    sql_checks: [{ query: '查询「取订单」（Q1）', node_id: 'fetch', problems: [PROBLEM], refs: ['Q1 第 1 行「gmv」'], gap: GAP }] }
+  evFakes(EV_SQL, { output: { ...fxe.output, _issuance: issuance }, graph: fxe.graph, audit: fxe.audit, csv: fxe.audit_csv })
+  await page.route(new RegExp(`/api/runs/${EV_SQL}/evidence/segments/`), (r) => r.fulfill({ status: 404, json: { detail: '没有这个片段' } }))
+  try {
+    await openEvidence(EV_SQL)
+    await page.locator('[data-evidence-report=write] [data-evidence-doc]').waitFor({ timeout: 5000 }).catch(() => {})
+    const banner = page.locator('[data-view-pane=evidence] [data-evidence-issuance] [data-issuance-banner=degraded]')
+    check('报告上方写明出具档位', await banner.count() === 1 && (await banner.innerText().catch(() => '')).includes('降档出具'))
+    const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check('……SQL 检查导致的降档在显眼处说明：哪次查询、什么问题、受影响的引用', sql.includes('降档原因：所依据的查询未通过 SQL 检查')
+      && sql.includes('查询「取订单」（Q1）') && sql.includes(PROBLEM) && sql.includes('Q1 第 1 行「gmv」'), sql)
+    check('……那一句不在其余缺口里重复', await banner.locator('[data-issuance-gaps]').count() === 0)
+    const tally = page.locator('[data-evidence-report=write] [data-evidence-tally-numbers]')
+    const [color, done] = await Promise.all([tally.evaluate((el) => getComputedStyle(el).color).catch(() => ''),
+      page.evaluate(() => { const s = document.createElement('span'); s.style.color = 'var(--st-done)'; document.body.append(s)
+        const c = getComputedStyle(s).color; s.remove(); return c })])
+    check('降档时报告上的数字计数不画成绿色', !!color && color !== done, `${color} vs ${done}`)
+  } finally {
+    for (const k of [...fakes.keys()]) if (k.includes(EV_SQL)) fakes.delete(k)
+  }
+  await openEvidence(EV)
+  check('没有出具契约的运行：报告上方不出出具横幅', await page.locator('[data-view-pane=evidence] [data-evidence-issuance]').count() === 0)
+})
+
 await section('证据页签：同一段文字里好几条同样的违规、正文里点不开的行', async () => {
   // 夹具同样是后端真跑的：粗体、链接里反引号写的可疑名字只记违规、不切片段——同一段文字上两条 unknown_entity、
   // 两条 unverified_entity（片段和 code 都相同），列表序号 100. 是结构片段上的裸数字。这几行正文里都点不开

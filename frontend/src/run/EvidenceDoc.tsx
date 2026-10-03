@@ -212,7 +212,13 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
    * （on_demand / inline），没开的看这里，不给就按运行 id 取一次
    */
   runClass?: string
-}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false, runClass }, ref) {
+  /**
+   * 这次出具的档位（output._issuance.tier）。不是完整出具时，「N 个数字都有出处」不画成绿色：
+   * 数字的出处都对得上，档位却因为别的原因（比如查询没通过 SQL 检查）降了
+   */
+  tier?: string
+}>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false, runClass,
+  tier }, ref) {
   const blocks = useMemo(() => doc.blocks ?? [], [doc])
   const report = doc.node_id || undefined
   // 封存之后按需追加的判定：盖过文档里的「未裁判 · 按需」。只换句末徽标，封存的文档一个字不改
@@ -447,7 +453,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       <p id={summaryId} className="sr-only" data-evidence-summary="">{summary}</p>
       <div className="sr-only" aria-live="polite" aria-atomic="true">{announce}</div>
       {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect || !!claims?.total) && (
-        <EvidenceTally counts={{ ...counts, claims }} onNext={() => {
+        <EvidenceTally counts={{ ...counts, claims }} tier={tier} onNext={() => {
           const target = step(model.alerts, current, 1)
           if (target) { focusSeg(target, { flash: true }); openSeg(target) } else openViolations()
         }} onList={doc.violations?.length ? openViolations : undefined} />
@@ -520,10 +526,12 @@ function usePanelMode(panel: 'auto' | PanelMode, dense: boolean): PanelMode {
  * 证据条：没有出具横幅时由文档自己说「7/12 数字有出处 · 无证据 5 · 另有 1 处引用解析不了」，
  * 有结论句判定时接着说「结论 4 句（支持 3 · 不支持 1）」
  */
-export function EvidenceTally({ counts, onNext, onList }: {
+export function EvidenceTally({ counts, onNext, onList, tier }: {
   counts: Pick<Tally, 'total' | 'cited' | 'none' | 'other' | 'suspect' | 'claims'>
   onNext?: () => void
   onList?: () => void
+  /** 出具档位：给了、又不是完整出具时，数字都有出处也不用绿色 */
+  tier?: string
 }) {
   const suspect = counts.suspect ?? 0
   const claims = counts.claims
@@ -532,7 +540,8 @@ export function EvidenceTally({ counts, onNext, onList }: {
   return (
     <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-evidence-tally="">
       {numbers && (
-        <span className="tnum" style={{ color: !counts.none && !counts.other ? 'var(--st-done)' : 'var(--st-waiting)' }}>
+        <span className="tnum" data-evidence-tally-numbers=""
+              style={{ color: counts.none || counts.other ? 'var(--st-waiting)' : !tier || tier === 'formal' ? 'var(--st-done)' : 'var(--text-dim)' }}>
           {numbers}
         </span>
       )}

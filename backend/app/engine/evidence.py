@@ -2631,7 +2631,8 @@ def compose_doc(
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
-    doc["stats"], doc["violations"] = checked["stats"], checked["violations"]
+    # 句中的 [[see:]] 只在组装时查（交回写作者重写）：出口复核看的是数字和出处，句子通不通不影响出具
+    doc["stats"], doc["violations"] = checked["stats"], checked["violations"] + inline_see(source)
     return doc
 
 
@@ -2999,6 +3000,38 @@ MARKER_RULES = """写作规则（系统会逐字核对）：
 4. 日期、ISO 周（2026-W37）、「前 3 名」「第 2 季度」这类序号可以直接写。
 5. 目录里没有的指标不要编造引用；标着「没有值」的指标不要写进报告。"""
 
+#: 跟在写作规则后面的两条（R2 走查 A4、B4）：写作规则本身保持一期那份，这两条另起一段
+#: - [[see:]] 渲染后不显示：写进句子中间（「以 [[see:Q1]] 为依据看」）会留下「以 为依据看」这样的断句；
+#: - 码值（status = 9 里的 9）是没有出处的数字，会被数字核对打回重写：写它的含义，不写码值本身。
+SEE_AND_CODE_RULES = (
+    "另外两条：\n"
+    "- [[see:…]] 渲染后不显示，只能挂在句末（句号前后都行）。不要把它写进句子当成分：「以 [[see:Q1]] 为依据看，……」"
+    "「根据 [[see:Q1]]，……」渲染后会变成「以 为依据看」「根据 ，」这样的断句。先说结论，句末再写 [[see:Q1]]。\n"
+    "- 涉及码值（状态、类型这类用数字编码的取值）时，写它的含义，比如「作废记录」「有效记录」，不要写码值本身"
+    "（「状态为 9」「类型 1」）：码值是没有出处的数字，系统会当成裸数字打回重写。"
+)
+
+#: 句中的 [[see:]]：前面是介词、后面接着句子的写法（「以 [[see:Q1]] 为依据」「根据 [[see:Q1]]，」「详见 [[see:Q1]]」）。
+#: 只认这几种拿得准的：「以」前面是「所、可、加……」的是另一个词（所以、可以），不算；「依据 [[see:…]]。」可能是
+#: 「这是结论的依据」，不算。认出来就交回写作者重写（report.REWRITE_ONLY：重写不好也不判失败）
+_SEE_MARK = r"\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\]"
+_INLINE_SEE = re.compile(
+    r"(?<![所可加予得难足用是何之])以[ \t\u3000]*" + _SEE_MARK + r"[ \t\u3000]*为"
+    r"|(?:根据|按照|基于|参见|详见)[ \t\u3000]*" + _SEE_MARK
+)
+INLINE_SEE_MESSAGE = _Reason(
+    "依据标记写在了句子中间：依据不显示，正文会留下「以 为依据」这样的断句",
+    "依据标记 [[see:…]] 写在了句子中间。它渲染后不显示，只能挂在句末：把这一句改成先说结论、句末再写 [[see:…]]，"
+    "不要写「以 [[see:Q1]] 为依据」「根据 [[see:Q1]]」「详见 [[see:Q1]]」",
+)
+
+
+def inline_see(source: str) -> list[dict[str, Any]]:
+    """原文里写在句子中间的 [[see:]]（_INLINE_SEE），每处一条违规 inline_see。text 是那一截原文，没有 span：
+    标记渲染后不在正文里，定位不到片段。"""
+    return [_violation("inline_see", INLINE_SEE_MESSAGE, text=m.group(0)) for m in _INLINE_SEE.finditer(source or "")]
+
+
 #: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
 #: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
 CELL_RULES = (
@@ -3044,6 +3077,23 @@ _PROMPT_HITS = 8
 _PROMPT_HIT_CHARS = 300
 
 
+def _sql_check_note(artifact: Any, snaps: _Snapshots) -> str | None:
+    """这次查询（合并查询则是它的输入）没通过 SQL 检查时，写作目录里跟在它后面的那句提醒；没问题返回 None。
+
+    口径卡的指标早就标「存疑」了，直接引用查询格子的写作者却看不到：报告照样把一对多关联后求和的数写成定论。
+    出具契约会按缺口降档（issuance.sql_check_gaps），这里先让写作者知道、引用时如实交代。
+    """
+    from app.engine.sql_problems import query_problems
+
+    found = query_problems(artifact, loader=snaps.loader)
+    if not found:
+        return None
+    problems = list(dict.fromkeys(text for p in found for text in p.problems))
+    who = "这次查询" if all(p.artifact == artifact for p in found) else "这次合并的输入查询"
+    return (f"  （{who}未通过 SQL 检查：{'；'.join(problems[:3]) or '有错误级的问题'}。其中的数存疑："
+            "引用时须如实说明，不要当作确定的结论）")
+
+
 def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
     """一次查询在写作目录里的样子：编号、来源、列，以及能引用的行（行号 + 渲染后的值）。
 
@@ -3058,6 +3108,8 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool)
     if snapshot.get("truncated") is True:
         lines.append("  （查询结果已截断：只取回了前面一部分行，库里还有更多。单格可以引用；"
                      "不要把取回的行数当成总数，也不要据此写合计、全部之类的结论）")
+    if note := _sql_check_note(entry.get("artifact"), snaps):
+        lines.append(note)
     if not cells_allowed:
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]

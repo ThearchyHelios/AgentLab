@@ -2051,7 +2051,10 @@ export const CATALOG_TEXT = {
   draftFailed: '起草中断',
   draftSummary: (added: number, updated: number, removed: number) =>
     `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
-  draftNoChange: '没有变化：起草结果与现有目录一致',
+  // 只在起草确实给出了内容、只是和现有目录一致时用：有表的模型起草失败或没给出可用内容（model_error）时
+  // 不能说「没有变化」，改用 draftNothingWritten
+  draftNoChange: '没有变化：起草出的内容与现有目录一致',
+  draftNothingWritten: '目录没有更新：模型没有给出可用的内容，原因见下方',
   draftModelSkipped: (reason: string) => `模型未参与起草：${reason.replace(/[。.]$/, '')}。已按注释、外键和命名起草。`,
   draftModelUsed: (model: string) => `模型：${model}`,
   draftTableErrors: (n: number) => `${formatNumber(n)} 张表未能起草`,
@@ -2545,7 +2548,8 @@ export const CATALOG_UI_TEXT = {
 //
 // 术语：
 // - 「SQL 检查」：对照数据目录找出能执行、数却可能不对的写法。七条规则，界面上写中文规则名，不露规则编号。
-// - 级别：错误（依据已确认，结果必然有误）、提醒（依据已确认，结果很可能有误）、提示（依据只是推断，仅供参考）。
+// - 级别：错误（依据已核实，结果很可能有误）、提醒（依据已确认，结果可能有误）、提示（依据只是推断，仅供参考）。
+//   一对多关联后重复计算：只有一对多人工确认过、或数据剖析用数据核实过时才是错误；只凭外键推出的是提醒。
 //   颜色走语义令牌：错误 --st-failed，提醒 --st-waiting，提示 --accent。
 // ===========================================================================
 
@@ -2576,8 +2580,8 @@ export const SQL_CHECK_LEVEL_LABEL: Record<SqlCheckLevel, string> = {
 }
 
 export const SQL_CHECK_LEVEL_HINT: Record<SqlCheckLevel, string> = {
-  error: '依据已确认，结果必然有误',
-  warning: '依据已确认，结果很可能有误',
+  error: '依据已核实，结果很可能有误，需要修改',
+  warning: '依据已确认，结果可能有误，请核对',
   info: '依据尚未确认（推断），仅供参考',
 }
 
@@ -2603,4 +2607,48 @@ export const SQL_CHECK_TEXT = {
   assistantNext: '请打开对应节点，在「参数」中修改 SQL；检查依据有误时，请在数据目录中修正对应项',
   assistantNextChat: '可在画布中打开此工作流，修改对应节点「参数」中的 SQL；检查依据有误时，请在数据目录中修正对应项',
   assistantInfoNext: '这些检查的依据尚未确认，仅供参考。在数据目录中确认相关项后，检查结论更可靠',
+}
+
+// ===========================================================================
+// 证据面板、运行时间线里的 SQL 检查和数据目录版本，助手「参考了哪些表」（数据目录完整性修复 F2a）
+//
+// - 证据面板的查询步骤写这次查询对照的是哪一版数据目录（表结构快照里冻结的那份）：「数据目录：入园记录 第 3 版」。
+// - 合并查询的每个输入带着它自己的 SQL 检查结果。
+// - 运行时间线：同一条查询的问题只列一行，写明受影响的指标；「打开设置」落到来源查询节点的 SQL 上。
+// - 助手「参考了哪些表」：带字段的表和只提供了表名的表分开数。
+// ===========================================================================
+
+export const RUN_SQL_CHECK_TEXT = {
+  /** 证据面板查询步骤：SQL 检查对照的数据目录版本 */
+  catalogLine: (items: { name: string; version?: number | null }[]) =>
+    `数据目录：${items.map((i) => (i.version != null ? `${i.name} 第 ${formatNumber(i.version)} 版` : i.name)).join('、')}`,
+  catalogHint: '这次查询时冻结的数据目录版本，SQL 检查对照的就是这一版',
+  /** 合并查询的输入：这个输入查询自己的 SQL 检查 */
+  mergeInputChecks: (alias: string) => `输入 ${alias} 的 SQL 检查`,
+  /** 运行时间线：一条查询的问题影响了几个指标 */
+  metricsTitle: (names: string[], n = 1) => {
+    const who = names.length > 3
+      ? `指标${names.slice(0, 3).map((x) => `「${x}」`).join('')}等 ${formatNumber(names.length)} 个`
+      : `指标${names.map((x) => `「${x}」`).join('')}`
+    return n > 1 ? `${who}所依据的查询有 ${formatNumber(n)} 处未通过 SQL 检查` : `${who}所依据的查询未通过 SQL 检查`
+  },
+  /** 运行时间线：一次查询的 SQL 检查结果（查询那一行展开后） */
+  toolChecks: 'SQL 检查',
+  /** 「打开设置」落到来源查询节点的 SQL 上 */
+  openSql: (label?: string) => (label ? `打开「${label}」的 SQL` : '打开来源查询的 SQL'),
+  metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 出具横幅、报告页：SQL 检查导致的降档单列一块 */
+  issuanceTitle: (tier: string) => (tier === 'degraded' ? '降档原因：所依据的查询未通过 SQL 检查' : '所依据的查询未通过 SQL 检查'),
+  issuanceQuery: '所依据的查询',
+  issuanceAffected: (refs: string) => `受影响：${refs}`,
+  issuanceNext: '数字的出处都对得上，但算出这些数的查询本身有问题，结果不可靠。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 其余缺口的标题（SQL 检查的那几条单列之后） */
+  otherGaps: '校验未全部完成：',
+}
+
+export const COPILOT_CONTEXT_TEXT = {
+  /** 标题：另有只提供了表名的表时，写明这个数只算带着字段的表 */
+  withFields: (n: number) => `参考了 ${formatNumber(n)} 张表的字段`,
+  namesOnly: (n: number) => `另有 ${formatNumber(n)} 张表只提供了表名`,
+  notPicked: '未能按需求挑选',
 }

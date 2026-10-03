@@ -440,12 +440,14 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
 # 一次剖析：上下文、结果
 # ==========================================================================
 
-#: 不指定表时剖析几张：按使用次数取目录里有待核实关系的表
+#: 不指定表时剖析几张：目录里有要核对的关系的表，还有待核实（推断）关系的在前，再按使用次数；确知是空表的跳过
 PROFILE_DEFAULT_TABLES = 10
+#: 不指定表时，为跳过空表最多先估几张候选表的行数；估行数的查询最多用掉查询次数上限的一半，免得都花在挑表上
+PROFILE_PROBE_TABLES = 30
 #: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
 IN_CHUNK = 1000
-#: 剖析写的备注都以它开头：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的。开头接着剖析的日期，
-#: 比较「结论变没变」时日期不算（catalog.same_profile_note）
+#: 剖析写的备注都以它开头（「数据剖析：」）：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的（认的时候连
+#: 升级前带日期的「数据剖析（日期）：」一起认，catalog.is_profile_note）。不写日期，时间看这一项的 updated_at
 NOTE_PREFIX = catalog.PROFILE_NOTE_PREFIX
 #: 整次剖析停下的原因 → 剩下没查的项的说明
 _STOP_DETAIL = {
@@ -512,6 +514,8 @@ class ProfileReport:
     tables: list[TableProfile] = field(default_factory=list)
     queries_used: int = 0
     stopped: str | None = None
+    #: 不指定表时，挑表途中估过行数、确知是空表而跳过的表（表结构顺序）。估行数的查询算在 queries_used 里
+    empty_tables: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -526,6 +530,9 @@ class _RelationOutcome:
     sample: int
     matched: int
     note: str
+    #: 基数是用数据核实的：子表一侧是否唯一有了定论（主键、唯一约束，或数过 COUNT 和 COUNT(DISTINCT)）。
+    #: 子表太大、没数成的按多对一记，但不算核实——SQL 检查据此不把一对多关联后的重复计算报成错误
+    cardinality_checked: bool = False
 
 
 @dataclass
@@ -572,8 +579,6 @@ class _Context:
     tables: dict[str, Any]
     #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
     masked: set[str]
-    #: 写进备注的剖析日期（UTC）
-    day: str
     sizes: dict[str, TableSize] = field(default_factory=dict)
 
     async def size(self, table: str, result: TableProfile) -> TableSize:
@@ -663,10 +668,11 @@ async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
     return total == distinct, "count"
 
 
-def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan_cap: int | None,
+def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int | None,
                    skipped_values: int, parent: tuple[bool | None, str], child: tuple[bool | None, str] | None,
                    holds: bool) -> str:
-    """关系的剖析备注：日期、抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。"""
+    """关系的剖析备注：抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。
+    不写日期：什么时候剖析的看这一项的 updated_at（界面按本地时间显示）。"""
     parts: list[str] = []
     low = coverage < catalog.PROFILE_VERIFY_COVERAGE
     if low:
@@ -698,7 +704,7 @@ def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan
             parts.append("未能核对子表一侧是否唯一，按多对一记")
     if not holds and not low:
         parts.append("暂不升为有确证")
-    return f"{NOTE_PREFIX}{day}）：" + "；".join(parts) + "。"
+    return NOTE_PREFIX + "；".join(parts) + "。"
 
 
 async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _TableOutcome,
@@ -749,12 +755,13 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
     if child_unique is not None:
         cardinality = "one_to_one" if child_unique[0] is True else "many_to_one"
     holds = coverage >= catalog.PROFILE_VERIFY_COVERAGE and cardinality is not None
-    note = _relation_note(cx.day, sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
+    note = _relation_note(sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
                           skipped_values=len(values) - len(literals), parent=parent_unique, child=child_unique,
                           holds=holds)
+    checked = child_unique is not None and child_unique[0] is not None
     out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=coverage,
                                           cardinality=cardinality, holds=holds, sample=len(literals),
-                                          matched=matched, note=note))
+                                          matched=matched, note=note, cardinality_checked=checked))
 
 
 # ==========================================================================
@@ -869,7 +876,7 @@ async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome
     rows = sum(n for _, n in values)
     scope = f"按前 {scan_cap} 行统计" if scan_cap else "统计全表"
     spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
-    note = f"{NOTE_PREFIX}{cx.day}）：{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
+    note = f"{NOTE_PREFIX}{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
     out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note, complete=scan_cap is None))
 
 
@@ -899,7 +906,7 @@ async def _check_dates(cx: _Context, table: str, columns: list[str], total: int,
     if not result.date_ranges:
         raise _Skip("no_data", f"{table}.{columns[0]} 没有可识别的日期值")
     found = result.date_ranges[0]
-    note = (f"{NOTE_PREFIX}{cx.day}）：表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
+    note = (f"{NOTE_PREFIX}表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
             f"{str(found['max'])[:19]}，可作为业务日期的参考。")
     out.business_date = _DateOutcome(column=found["column"], low=found["min"], high=found["max"], note=note)
 
@@ -956,9 +963,11 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
         changed = True
     if rel.get("cardinality") is None and o.cardinality is not None:
         rel["cardinality"] = o.cardinality
+        if o.cardinality_checked:
+            rel["cardinality_checked"] = True
         changed = True
     note = rel.get("note")
-    if (not note or str(note).startswith(NOTE_PREFIX)) and not catalog.same_profile_note(note, o.note):
+    if (not note or catalog.is_profile_note(note)) and not catalog.same_profile_note(note, o.note):
         rel["note"] = o.note
         changed = True
     if changed:
@@ -995,7 +1004,9 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
         status = "verified" if o.holds else "proposed"
         relations.append({"id": o.rid, "columns": list(rel["columns"]), "to_table": rel["to_table"],
                           "to_columns": list(rel["to_columns"]), "cardinality": o.cardinality,
-                          "coverage": o.coverage, "source": "profile", "status": status, "note": o.note})
+                          "coverage": o.coverage, "source": "profile", "status": status, "note": o.note,
+                          # 只在基数用数据核实过时有这个键：没核实的关系和以前一字不差
+                          **({"cardinality_checked": True} if o.cardinality_checked else {})})
         findings.append(_relation_finding(o, rel, status=status, confirmed=False))
     for rid in out.keep_relations:
         rel = current.get(rid)
@@ -1152,7 +1163,44 @@ async def _pick_tables(session: AsyncSession, source: Any, tables: list[str] | N
     candidates = [name for name, meta in all_tables.items()
                   if not (meta or {}).get("is_view") and name in entries
                   and _relation_candidates(entries[name].notes)]
-    return sorted(candidates, key=lambda n: (-usage.get(n, 0), order[n]))[:PROFILE_DEFAULT_TABLES]
+    # 还有待核实（推断）关系的表排在前面：剖析就是来核实它们的；关系都核实过、人工确认过的再剖析只是补覆盖率。
+    # 同样待核实的按使用次数，再按表结构顺序。返回全部候选，空表由 _skip_empty 估过行数再跳过
+    return sorted(candidates, key=lambda n: (not _pending(entries[n].notes), -usage.get(n, 0), order[n]))
+
+
+def _pending(notes: dict[str, Any] | None) -> bool:
+    """这张表还有没有待核实的关系：要核对的关系里有还是推断（proposed）的。"""
+    return any(r.get("status") == "proposed" for r in _relation_candidates(notes))
+
+
+async def _skip_empty(cx: _Context, candidates: list[str], report: ProfileReport) -> list[TableProfile]:
+    """不指定表时：按顺序估候选表的行数，确知是空表的跳过（记进 report.empty_tables），凑够 PROFILE_DEFAULT_TABLES
+    张为止。以前不估，所有表使用次数都是 0 时按表结构顺序取前 10 张，结果大半是空表、一条关系都核实不了。
+
+    估行数的查询算进这张表的查询数，行数留在 cx.sizes 里，剖析时不再查。最多估 PROFILE_PROBE_TABLES 张、最多用掉
+    查询次数上限的一半；超过了、或者整次剖析已经停下，剩下的候选不估、照顺序排上（真是空表的，剖析时各项检查会
+    记下「空表，无法剖析」）。
+    """
+    picked: list[TableProfile] = []
+    probed = 0
+    for name in candidates:
+        if len(picked) >= PROFILE_DEFAULT_TABLES:
+            break
+        result = TableProfile(table=name)
+        if (cx.run.stopped is None and probed < PROFILE_PROBE_TABLES
+                and cx.run.used < cx.settings.max_queries // 2):
+            probed += 1
+            before = cx.run.used
+            try:
+                size = await cx.size(name, result)
+            except _Stop:
+                size = None
+            result.queries = cx.run.used - before
+            if size is not None and size.rows == 0:
+                report.empty_tables.append(name)
+                continue
+        picked.append(result)
+    return picked
 
 
 async def profile_catalog(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None = None,
@@ -1194,11 +1242,12 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
     run = _Runner(source, settings, dialect)
     cx = _Context(source=source, settings=settings, dialect=dialect, run=run,
                   tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
-                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))},
-                  day=at[:10])
+                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))})
     entries = await catalog.read_catalog(session, source.id)
-    for table in await _pick_tables(session, source, tables, entries, report):
-        result = TableProfile(table=table)
+    picked = await _pick_tables(session, source, tables, entries, report)
+    results = [TableProfile(table=t) for t in picked] if tables else await _skip_empty(cx, picked, report)
+    for result in results:
+        table = result.table
         report.tables.append(result)
         if run.stopped:
             detail = _STOP_DETAIL[run.stopped].format(max_queries=settings.max_queries,
@@ -1208,7 +1257,7 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
         before = run.used
         entry = entries.get(table)
         out = await _profile_table(cx, table, entry.notes if entry else {}, result)
-        result.queries = run.used - before
+        result.queries += run.used - before
         await _write(session, source.id, table, out, result, at=at, actor=actor)
     report.queries_used = run.used
     report.stopped = run.stopped
@@ -1218,6 +1267,6 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
 
 
 __all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
-           "PROFILE_OPTION", "ProfileBusy", "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip",
-           "SqlDialect", "TableProfile", "TableSize", "ensure_enabled", "estimate_size", "profile_catalog",
-           "profile_settings", "profile_settings_problem", "sql_literal"]
+           "PROFILE_OPTION", "PROFILE_PROBE_TABLES", "ProfileBusy", "ProfileDisabled", "ProfileReport",
+           "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "ensure_enabled",
+           "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem", "sql_literal"]

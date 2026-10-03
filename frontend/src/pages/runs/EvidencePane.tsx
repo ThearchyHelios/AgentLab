@@ -13,6 +13,7 @@ import {
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
 import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
+import { IssuanceBanner } from '../../run/AssistantStream'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { Markdown, inlineStyles } from '../../run/Markdown'
@@ -142,6 +143,13 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
           <SummaryBar mode={mode} seal={seal} message={audit.data?.seal?.message}
                       reports={graph.reports ?? []} labelOf={labelOf} />
           <UpgradeBanner run={run} mode={mode} />
+          {/* 出具档位和降档原因写在报告上方：降档时只在侧栏小标签里写「SQL 检查未通过」，报告上却是绿色的
+              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块 */}
+          {!!output?._issuance?.tier && (
+            <div data-evidence-issuance="">
+              <IssuanceBanner issuance={output._issuance} runClass={run.run_class} />
+            </div>
+          )}
 
           {mode === 'cited' && reports.map((r) => {
             const doc = docOf(r.node_id)
@@ -157,6 +165,7 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                 {doc ? (
                   <EvidenceDoc ref={(h) => { handles.current.set(r.node_id!, h) }} doc={doc} artifact={r.doc_artifact}
                                runId={run.id} runClass={run.run_class} label={r.fields?.join('、') || r.node_id} tally
+                               tier={typeof output?._issuance?.tier === 'string' ? output._issuance.tier : undefined}
                                panel={wide ? 'dock' : 'auto'} dock={dock} onView={(o) => onView(r.node_id!, o)} />
                 ) : slot?.status === 'error' ? (
                   <p className="text-2xs" style={{ color: 'var(--st-failed)' }}>{T.docGone(labelOf(r.node_id) ?? r.node_id ?? '')}</p>
