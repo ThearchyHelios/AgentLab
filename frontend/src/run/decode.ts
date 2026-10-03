@@ -1,7 +1,7 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { JUDGE_TEXT, MERGE_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
@@ -772,6 +772,20 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         sub: message.match(/^指标「.+?」(.+?)，结果不完整$/)?.[1],
         next: '口径卡对截断的查询结果计数、求和，只算到了取回的部分，出具按缺口降档。'
           + '请在 SQL 中直接聚合（如 COUNT、SUM）或缩小查询范围后重新运行',
+        fix: 'canvas',
+      }
+    }
+    case 'metric_sql_check': {
+      // 「指标「客单价」所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会
+      // 重复计算），结果不可靠」；几处时是「所依据的查询有 2 处未通过 SQL 检查（…等），结果不可靠」（metrics.py
+      // _sql_check_reason）。括号里的问题本身可能带括号：取到「，结果不可靠」前面最后一个右括号
+      const name = message.match(/^指标「(.+?)」/)?.[1]
+      const n = message.match(/有\s*(\d+)\s*处未通过 SQL 检查/)?.[1]
+      const why = message.match(/未通过 SQL 检查（([\s\S]+)）[，,]\s*结果不可靠\s*$/)?.[1]
+      return {
+        title: name ? SQL_CHECK_TEXT.metricTitle(name, n ? Number(n) : 1) : SQL_CHECK_TEXT.metricTitleAnon,
+        sub: why,
+        next: SQL_CHECK_TEXT.metricNext,
         fix: 'canvas',
       }
     }

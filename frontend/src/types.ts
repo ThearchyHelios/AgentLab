@@ -2131,6 +2131,12 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   incomplete?: boolean
   /** metric：不完整的原因（人话，「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」） */
   incomplete_reason?: string
+  /** metric：所依据的查询没通过 SQL 检查（有错误级的问题），值照算，出具已按缺口降档 */
+  sql_check_failed?: boolean
+  /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
+  sql_check_reason?: string
+  /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
+  checks?: SqlCheckItem[]
   inputs?: EvidenceInput[]
   /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
   caliber_from?: EvidenceCaliberSource | null

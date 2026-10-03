@@ -44,7 +44,7 @@
 
 import type {
   CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
-  ToolTrust,
+  SqlCheckCode, SqlCheckLevel, ToolTrust,
 } from '../types'
 import { formatNumber } from './format'
 
@@ -248,6 +248,9 @@ export const EVIDENCE_TEXT = {
   /** 指标拿截断的查询结果整组算出来（计数、求和……）：值只算到了取回的那部分，出具按缺口降档 */
   incomplete: '结果不完整',
   incompleteFallback: '基于被截断的查询结果计算，结果不完整',
+  /** 指标所依据的查询对照数据目录查出了错误级的问题：值照算，出具按缺口降档 */
+  sqlCheckFailed: 'SQL 检查未通过',
+  sqlCheckFallback: '所依据的查询未通过 SQL 检查，结果不可靠',
   /** 输入是 Agent 交来、被截断切开的数组字段 */
   inputTruncated: '查询结果已截断，该字段只含取回的部分行',
   unshowable: (value: string) => `有值（${value}），但无法按口径卡的格式显示`,
@@ -2364,4 +2367,68 @@ export const CODES_TEXT = {
   saved: (n: number) => (n ? `已填写 ${formatNumber(n)} 个码值的含义` : '已保存'),
   save: '保存',
   cancel: '取消',
+}
+
+// ===========================================================================
+// 基于数据目录的 SQL 检查（后端 data/sqlcheck.py）
+//
+// 术语：
+// - 「SQL 检查」：对照数据目录找出能执行、数却可能不对的写法。七条规则，界面上写中文规则名，不露规则编号。
+// - 级别：错误（依据已确认，结果必然有误）、提醒（依据已确认，结果很可能有误）、提示（依据只是推断，仅供参考）。
+//   颜色走语义令牌：错误 --st-failed，提醒 --st-waiting，提示 --accent。
+// ===========================================================================
+
+export const SQL_CHECK_RULE_LABEL: Record<SqlCheckCode, string> = {
+  fanout_sum: '一对多关联后重复计算',
+  stock_summed: '存量跨期加总',
+  join_unconfirmed: '关联条件未经确认',
+  ratio_aggregated: '比率直接加总或平均',
+  missing_valid_filter: '未筛选有效记录',
+  unknown_code: '码值不在码值表中',
+  wrong_date_column: '未按业务日期统计',
+}
+
+export const SQL_CHECK_RULE_HINT: Record<SqlCheckCode, string> = {
+  fanout_sum: '沿一对多方向关联后，对「一」那一侧的度量求和或计数，会按明细行数重复计算',
+  stock_summed: '对存量列求和却没有按业务日期分组，不同日期的存量被加在一起',
+  join_unconfirmed: '关联条件对不上数据目录中有确证的关系，可能连错了列',
+  ratio_aggregated: '对比率列直接求和或求平均，得不到正确的比率',
+  missing_valid_filter: '表定义了有效记录条件，查询没有按它筛选',
+  unknown_code: '按码值筛选时用了码值表中没有的值',
+  wrong_date_column: '表定义了业务日期，查询却按另一个时间列分组或筛选',
+}
+
+export const SQL_CHECK_LEVEL_LABEL: Record<SqlCheckLevel, string> = {
+  error: '错误',
+  warning: '提醒',
+  info: '提示',
+}
+
+export const SQL_CHECK_LEVEL_HINT: Record<SqlCheckLevel, string> = {
+  error: '依据已确认，结果必然有误',
+  warning: '依据已确认，结果很可能有误',
+  info: '依据尚未确认（推断），仅供参考',
+}
+
+export const SQL_CHECK_TEXT = {
+  title: 'SQL 检查',
+  /** 规则编号不认识（服务端新加了规则）时的叫法 */
+  unknownRule: 'SQL 检查',
+  listLabel: (n: number) => `SQL 检查发现 ${formatNumber(n)} 处问题`,
+  where: '涉及',
+  excerpt: 'SQL 片段',
+  catalogHint: '检查依据来自数据目录。依据有误时，请在数据目录中修正对应项。',
+  // ---- 运行时间线：指标所依据的查询没通过 SQL 检查（日志 metric_sql_check）
+  metricTitle: (name: string, n = 1) =>
+    (n > 1 ? `指标「${name}」所依据的查询有 ${formatNumber(n)} 处未通过 SQL 检查` : `指标「${name}」所依据的查询未通过 SQL 检查`),
+  metricTitleAnon: '指标所依据的查询未通过 SQL 检查',
+  metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请在证据面板的查询步骤中查看问题，修改 SQL 后重新运行；'
+    + '检查依据有误时，请在数据目录中修正对应项',
+  // ---- 助手：搭图时查出的问题
+  counts: (errors: number, warnings: number, infos: number) =>
+    [errors ? `${formatNumber(errors)} 处错误` : '', warnings ? `${formatNumber(warnings)} 处提醒` : '',
+      infos ? `${formatNumber(infos)} 处提示` : ''].filter(Boolean).join('、'),
+  assistantTitle: (counts: string) => `SQL 检查：${counts}`,
+  assistantNext: '请打开对应节点，在「参数」中修改 SQL；检查依据有误时，请在数据目录中修正对应项',
+  assistantInfoNext: '这些检查的依据尚未确认，仅供参考。在数据目录中确认相关项后，检查结论更可靠',
 }
