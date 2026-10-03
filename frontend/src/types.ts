@@ -2530,3 +2530,178 @@ export interface ProvenanceMergeHop {
   row: number | null
   column: string | null
 }
+
+// ===========================================================================
+// 业务数据目录（/api/datasources/{id}/catalog，后端 app/data/catalog.py）。
+// 每张表一份业务说明：中文名、粒度、业务主键、列的含义和度量类型、表与表的关联关系……每一项都注明来源和状态。
+// 目录只记数据事实，不放计算公式（公式在口径卡里）。
+// ===========================================================================
+
+/** 项的来源：数据库注释、外键约束、命名推断、数据剖析、模型起草、人工填写 */
+export type CatalogSource = 'comment' | 'fk' | 'name' | 'profile' | 'llm' | 'human'
+/** 项的状态：推断、已验证（外键约束、数据剖析）、已确认（人工）、已驳回（人工） */
+export type CatalogStatus = 'proposed' | 'verified' | 'confirmed' | 'rejected'
+/** 表类型：明细（事实）、维度、快照、日志、配置 */
+export type CatalogTableKind = 'fact' | 'dimension' | 'snapshot' | 'log' | 'config'
+/** 列的度量类型：可累加（流量）、存量、比率、标识、状态、属性 */
+export type CatalogMeasure = 'flow' | 'stock' | 'ratio' | 'identifier' | 'status' | 'attribute'
+/** 关系的基数（从本表看过去） */
+export type CatalogCardinality = 'many_to_one' | 'one_to_one' | 'one_to_many'
+
+/** 目录里的一项：值连同来源、状态 */
+export interface CatalogItem<T = unknown> {
+  value: T
+  source: CatalogSource
+  status: CatalogStatus
+  note?: string
+  updated_at?: string
+}
+
+/** 业务日期：按哪一列算，规则和时区写成文字 */
+export interface CatalogBusinessDate {
+  column: string
+  rule?: string
+  timezone?: string
+}
+
+/** 一列的目录 */
+export interface CatalogColumnNotes {
+  label?: CatalogItem<string>
+  meaning?: CatalogItem<string>
+  unit?: CatalogItem<string>
+  measure?: CatalogItem<CatalogMeasure>
+  /** 码值 → 含义 */
+  codes?: CatalogItem<Record<string, string>>
+}
+
+/** 一条关联关系。编号由两端的表和列算出来，改了指向就是另一条 */
+export interface CatalogRelation {
+  id: string
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+  cardinality: CatalogCardinality | null
+  /** 0 到 1：本表这几列的值在被指向表里找得到的比例（数据剖析给出） */
+  coverage: number | null
+  source: CatalogSource
+  status: CatalogStatus
+  note?: string
+  updated_at?: string
+}
+
+/** 一张表的目录（notes）。字段固定，服务端不认识的一律拒收 */
+export interface CatalogNotes {
+  label?: CatalogItem<string>
+  description?: CatalogItem<string>
+  grain?: CatalogItem<string>
+  keys?: CatalogItem<string[]>
+  kind?: CatalogItem<CatalogTableKind>
+  business_date?: CatalogItem<CatalogBusinessDate>
+  /** SQL 条件片段 */
+  valid_filter?: CatalogItem<string>
+  dedup?: CatalogItem<string>
+  columns?: Record<string, CatalogColumnNotes>
+  relations?: CatalogRelation[]
+}
+
+/** 各状态的项数（表级项、列级项、关系都算），四种状态都有键 */
+export type CatalogCounts = Record<CatalogStatus, number>
+
+/** 表清单的一行。表结构里的每张表各一行（没有目录的也列）；目录还在、表已不在的 in_schema 为 false，排在最后 */
+export interface CatalogTableRow {
+  table_name: string
+  qualified: string
+  is_view: boolean
+  in_schema: boolean
+  /** 中文名（被驳回的不算） */
+  label: string | null
+  label_status: CatalogStatus | null
+  kind: CatalogTableKind | null
+  counts: CatalogCounts
+  /** 没被驳回的关联关系条数 */
+  relations: number
+  /** 被运行查询过的次数（同一次运行里结果相同的重复查询只算一次） */
+  usage: number
+  /** 这张表还没有目录时为 0 */
+  version: number
+  updated_at: string | null
+  updated_by: string | null
+}
+
+/** GET /datasources/{id}/catalog */
+export interface CatalogList {
+  /** 使用次数多的在前 */
+  tables: CatalogTableRow[]
+  /** 导入表格的源：表和列的说明由系统按核对结果生成，只读 */
+  system_notes: boolean
+  /** 没有表结构时的原因（「尚未探查结构」「结构探查失败：…」）；有表结构时为 null */
+  schema_note: string | null
+}
+
+/** 表结构里的一列 */
+export interface CatalogStructureColumn {
+  name: string
+  type: string
+  pk: boolean
+  not_null: boolean
+  /** 数据库注释；导入表格的源是系统按核对结果生成的说明 */
+  comment: string | null
+}
+
+export interface CatalogForeignKey {
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+}
+
+export interface CatalogStructure {
+  qualified: string | null
+  is_view: boolean
+  /** 表注释；导入表格的源是系统按核对结果生成的说明 */
+  comment: string | null
+  columns: CatalogStructureColumn[]
+  primary_key: string[]
+  /** 升级前探查的缓存里没有：null 表示不知道，空列表表示读过、没有 */
+  foreign_keys: CatalogForeignKey[] | null
+  unique: string[][] | null
+}
+
+/** GET /datasources/{id}/catalog/{table}；PUT、审阅也返回这个形状 */
+export interface CatalogDetail {
+  table_name: string
+  in_schema: boolean
+  notes: CatalogNotes
+  version: number
+  updated_at: string | null
+  updated_by: string | null
+  /** 表结构里已经没有这张表时为 null */
+  structure: CatalogStructure | null
+  system_notes: boolean
+  usage: number
+}
+
+/** 单项审阅：确认、驳回、撤销审阅（回到来源的初始状态；人工填写的项直接删掉） */
+export type CatalogReviewAction = 'confirm' | 'reject' | 'reset'
+
+/** 起草结果里的一张表 */
+export interface CatalogDraftRow {
+  table_name: string
+  added: number
+  updated: number
+  removed: number
+  version: number
+  /** 这张表没有起草（表结构里没有、写入一直冲突） */
+  error: string | null
+  /** 只是模型那部分失败，其余来源照常写入 */
+  model_error: string | null
+}
+
+/** POST /datasources/{id}/catalog/draft */
+export interface CatalogDraftOut {
+  tables: CatalogDraftRow[]
+  total: { added: number; updated: number; removed: number }
+  model_used: boolean
+  model: string | null
+  /** 模型整体用不了（没有配置、已停用……）：只按注释、外键和命名起草 */
+  model_error: string | null
+}

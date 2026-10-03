@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
+  AlertTriangle, BookMarked, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
   RefreshCw, Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -21,7 +21,7 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
+  CATALOG_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
 } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
 import { ImportWizard } from './import/ImportWizard'
@@ -279,6 +279,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
   const { record, checkingSince } = useHealth(healthKey, healthFromServer(row))
   const workflows = useCatalog((s) => s.workflows)
+  const navigate = useNavigate()
   const [busy, setBusy] = useState('')
   const uploaded = isUploadedTable(row)
   // 传上来的表通常只有一两张，直接摊开；库动辄几十上百个对象，默认收着
@@ -489,6 +490,11 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
               <History size={11} aria-hidden /> {VERSIONS_TEXT.open}
             </button>
           )}
+          {/* 数据目录是独立页面：一个库上百张表、一张表几十列，逐表审阅要整屏的宽度。窄屏只留图标 */}
+          <button className="btn btn-sm btn-ghost" onClick={() => navigate(`/data/catalog/${encodeURIComponent(row.id)}`)}
+                  title={CATALOG_TEXT.openHint} aria-label={CATALOG_TEXT.open} data-catalog-open="">
+            <BookMarked size={11} aria-hidden /> <span className="hidden sm:inline">{CATALOG_TEXT.open}</span>
+          </button>
           {uploaded && row.import_mode === 'recipe' ? (
             // 按配方导入的源：每月按已确认的配方重放，不走简单上传（服务端也会拒绝）
             <>

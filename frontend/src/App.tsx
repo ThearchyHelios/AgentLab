@@ -13,6 +13,7 @@ import { ChatPage } from './pages/ChatPage'
 import { StudioPage } from './pages/StudioPage'
 import { RunsPage } from './pages/RunsPage'
 import { DataPage } from './pages/DataPage'
+import { CatalogPage } from './pages/catalog/CatalogPage'
 import { ToolsPage } from './pages/ToolsPage'
 import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage } from './pages/SettingsPage'
@@ -105,6 +106,9 @@ export default function App() {
               <Route path="/runs/:runId" element={<RunsPage />} />
               <Route path="/data" element={<DataPage />} />
               <Route path="/data/:tab" element={<DataPage />} />
+              {/* 数据源的数据目录：两段以上的 /data 地址不会落到上面的标签页 */}
+              <Route path="/data/catalog/:sourceId" element={<CatalogPage />} />
+              <Route path="/data/catalog/:sourceId/:table" element={<CatalogPage />} />
               <Route path="/tools" element={<ToolsPage />} />
               <Route path="/tools/:tab" element={<ToolsPage />} />
               <Route path="/tools/:tab/:id" element={<ToolsPage />} />
