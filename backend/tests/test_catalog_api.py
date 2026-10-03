@@ -162,6 +162,9 @@ async def test_draft_defaults_to_top_tables_and_model_via_settings(client, sourc
     body = r.json()
     assert len(body["tables"]) == 20 and body["tables"][0]["table_name"] == "visits"
     assert body["model_used"] is True and body["model"] == "fake-model"
+    # 每张表模型给了几项可用内容：模型给了内容的表是正数；回复里没有的表记 model_error，没有这个数
+    assert body["tables"][0]["model_items"] == 2 and body["tables"][0]["model_error"] is None
+    assert all(t["model_items"] is None and t["model_error"] for t in body["tables"][1:])
     detail = (await client.get(f"{_base(source_id)}/visits")).json()
     assert detail["notes"]["label"]["source"] == "llm" and detail["usage"] == 7
 

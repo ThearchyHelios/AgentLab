@@ -2050,7 +2050,10 @@ export const CATALOG_TEXT = {
   draftFailed: '起草中断',
   draftSummary: (added: number, updated: number, removed: number) =>
     `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
-  draftNoChange: '没有变化：起草结果与现有目录一致',
+  // 只在起草确实给出了内容、只是和现有目录一致时用：有表的模型起草失败或没给出可用内容（model_error）时
+  // 不能说「没有变化」，改用 draftNothingWritten
+  draftNoChange: '没有变化：起草出的内容与现有目录一致',
+  draftNothingWritten: '目录没有更新：模型没有给出可用的内容，原因见下方',
   draftModelSkipped: (reason: string) => `模型未参与起草：${reason.replace(/[。.]$/, '')}。已按注释、外键和命名起草。`,
   draftModelUsed: (model: string) => `模型：${model}`,
   draftTableErrors: (n: number) => `${formatNumber(n)} 张表未能起草`,

@@ -263,6 +263,41 @@ async def test_model_without_structured_output_falls_back_to_text():
     assert got["visits"].notes == {"label": make_item("入园记录", "llm")}
 
 
+# ---- 实测见过的几种退化回复（A2）：一项都没写进去时不能说「没有变化」
+
+
+async def test_model_single_table_object_without_wrapper_is_recognized():
+    """纯文本兜底时只回了单个表对象，没有 tables 外壳：照样认出来。"""
+    model = FakeModel({"visits": {"label": "入园记录"}}, structured="error", text="single")
+    got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
+    assert got["visits"].notes == {"label": make_item("入园记录", "llm")}
+
+
+async def test_hollow_structured_output_retries_with_text():
+    """结构化输出只给了 {"tables":[{"table":"visits"}]} 这样的空壳：改走纯文本再问一次，用纯文本给的内容。"""
+    model = FakeModel({"visits": {"label": "入园记录", "kind": "fact"}}, structured="hollow", text="tables")
+    got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
+    assert model.modes == ["structured", "text"]
+    assert got["visits"].notes == {"label": make_item("入园记录", "llm"), "kind": make_item("fact", "llm")}
+
+
+async def test_hollow_structured_then_single_text_object():
+    model = FakeModel({"visits": {"label": "入园记录"}}, structured="hollow", text="single")
+    got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
+    assert got["visits"].notes == {"label": make_item("入园记录", "llm")}
+
+
+async def test_table_with_no_usable_content_is_a_model_error():
+    """表名对上了、一个字段都没有（两条路都是空壳）：这张表记模型失败，不算起草成功。"""
+    model = FakeModel({"visits": {"label": "入园记录"}}, structured="hollow", text="hollow")
+    got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
+    assert got["visits"] == catalog.MODEL_EMPTY_REASON
+    # 给了字段、但没有一项合规（列名对不上、取值不在范围里）同样算没有可用内容
+    junk = FakeModel({"visits": {"kind": "planet", "columns": [{"name": "ghost", "label": "不存在的列"}]}})
+    got = await catalog.draft_with_model(junk, _source(_scenic_tables()), ["visits"])
+    assert got["visits"] == catalog.MODEL_EMPTY_REASON
+
+
 async def test_model_draft_respects_system_notes_of_imported_tables():
     """导入表格：表说明已经写了粒度、列说明写了单位，模型起草的粒度和单位不进目录，免得重复或矛盾。"""
     src = _source({"日报": _table(_col("日期", "TEXT", comment="格式 YYYY-MM-DD"), _col("客流"), pk=(),
@@ -381,6 +416,30 @@ async def test_draft_catalog_model_failure_on_one_table(monkeypatch):
     by = {r.table: r for r in report.tables}
     assert by["visits"].model_error and "网关超时" in by["visits"].model_error
     assert by["channels"].model_error is None and by["channels"].added == 1
+
+
+async def test_draft_catalog_empty_model_reply_is_not_no_change():
+    """模型一项可用内容都没给：这张表记 model_error，没有 model_items，界面据此不说「没有变化」。
+    模型给了内容、只是和现有目录一致：没有 model_error，model_items 是模型给的项数。"""
+    row = await _db_source(_scenic_tables())
+    hollow = FakeModel({"visits": {"label": "入园记录"}}, structured="hollow", text="hollow")
+    async with SessionLocal() as session:
+        report = await catalog.draft_catalog(session, row, tables=["visits"], use_model=True, model=hollow)
+    result = report.tables[0]
+    assert result.model_error == catalog.MODEL_EMPTY_REASON and result.model_items is None
+    assert (result.added, result.updated, result.removed) == (0, 0, 0)
+
+    model = FakeModel({"visits": {"label": "入园记录", "kind": "fact"}})
+    async with SessionLocal() as session:
+        first = await catalog.draft_catalog(session, row, tables=["visits"], use_model=True, model=model)
+        again = await catalog.draft_catalog(session, row, tables=["visits"], use_model=True, model=model)
+    assert first.tables[0].model_items == 2 and first.tables[0].added == 2
+    assert again.tables[0].model_error is None and again.tables[0].model_items == 2
+    assert (again.tables[0].added, again.tables[0].updated, again.tables[0].removed) == (0, 0, 0)
+    # 不用模型时没有这个数
+    async with SessionLocal() as session:
+        plain = await catalog.draft_catalog(session, row, tables=["visits"], use_model=False)
+    assert plain.tables[0].model_items is None
 
 
 async def test_draft_catalog_defaults_to_most_used_tables(monkeypatch):

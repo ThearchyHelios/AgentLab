@@ -227,7 +227,11 @@ async def put_catalog_table(source_id: str, table: str, payload: CatalogPutIn,
 async def draft_catalog(source_id: str, payload: CatalogDraftIn,
                         x_actor: str | None = Header(default=None),
                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """同步起草。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。"""
+    """同步起草。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。
+
+    model_items：模型给了这张表几项可用内容（没用模型、模型这部分失败时为 null）。界面据此区分「模型给了内容、
+    只是和现有目录一致」（model_items > 0、三个数都是 0）和「模型没给内容」（model_error 有值）。
+    """
     _, source = await _resolved(session, source_id)
     cache = source.schema_cache or {}
     if not cache.get("tables"):
@@ -235,7 +239,8 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
     report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
                                          use_model=payload.use_model, actor=actor_of(x_actor))
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
-             "version": r.version, "error": r.error, "model_error": r.model_error} for r in report.tables]
+             "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
+            for r in report.tables]
     return {
         "tables": rows,
         "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},

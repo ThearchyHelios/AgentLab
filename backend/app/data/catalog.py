@@ -40,7 +40,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -1576,8 +1576,16 @@ def _batches(names: list[str], tables: Mapping[str, Any]) -> list[list[str]]:
     return out
 
 
+#: 模型给了这张表、但一项可用内容都没有（只有表名的空壳，或者给的值全不合规）：这张表记模型失败，不算起草成功。
+#: 不然界面只看到「新增 0 项」，会说成「没有变化」
+MODEL_EMPTY_REASON = "模型没有给出这张表的可用内容"
+
+
 def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
-    """模型的回复 → 每张表一项的列表。结构化输出给的对象、正文里的 JSON 都认；对不上格式返回 None。"""
+    """模型的回复 → 每张表一项的列表。结构化输出给的对象、正文里的 JSON 都认；对不上格式返回 None。
+
+    实测模型有时不带 tables 外壳、只回单个表对象（{"table": "x", "label": …}），也认成一张表。
+    """
     if hasattr(raw, "model_dump"):
         raw = raw.model_dump()
     if isinstance(raw, str):
@@ -1591,31 +1599,43 @@ def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
         except ValueError:
             return None
     if isinstance(raw, dict):
-        raw = raw.get("tables")
+        raw = [raw] if "tables" not in raw and raw.get("table") else raw.get("tables")
     if not isinstance(raw, list):
         return None
     return [t for t in raw if isinstance(t, dict)]
 
 
-async def _ask_model(model: Any, messages: list[Any]) -> list[dict[str, Any]]:
-    """问一批。先走结构化输出；模型不支持、调用报错、或给回来的不是约定的结构，再退回纯文本、从正文里取 JSON。
+async def _ask_model(model: Any, messages: list[Any],
+                     usable: Callable[[list[dict[str, Any]]], bool] | None = None) -> list[dict[str, Any]]:
+    """问一批。先走结构化输出；模型不支持、调用报错、给回来的不是约定的结构，或者 usable 说它不够用（实测见过
+    结构化输出只给 {"tables":[{"table":"x"}]} 这样的空壳），再退回纯文本、从正文里取 JSON。
 
     结构化输出报错也退回（同 judge._ask）：有的网关不支持工具调用，一调就报错，纯文本却能用。代价是真的
     网络故障会多试一次，两次加起来仍受 MODEL_TIMEOUT_S 约束。
+
+    两条路都拿到了东西时，结构化的在前、纯文本的在后一起交回（同一张表各有一份，调用方挑能用的那份）；纯文本那次
+    失败了就只交回结构化的那份（调用方据此给空壳的表记失败）。
     """
     try:
         parsed = _model_tables(await model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA).ainvoke(messages))
     except Exception:  # noqa: BLE001 - 退回纯文本
         parsed = None
-    if parsed is not None:
+    if parsed is not None and (usable is None or usable(parsed)):
         return parsed
     from app.engine.state import message_text
 
-    reply = await model.ainvoke(messages)
-    parsed = _model_tables(message_text(reply))
-    if parsed is None:
+    try:
+        reply = await model.ainvoke(messages)
+    except Exception:  # noqa: BLE001 - 结构化那份还在：交回它，空壳的表由调用方记失败
+        if parsed is not None:
+            return parsed
+        raise
+    text = _model_tables(message_text(reply))
+    if text is None:
+        if parsed is not None:
+            return parsed
         raise ValueError("模型的回复不是约定的格式")
-    return parsed
+    return [*(parsed or []), *text]
 
 
 def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
@@ -1695,9 +1715,22 @@ async def draft_with_model(model: Any, source: Any, tables: list[str], *,
                                                     existing=(existing or {}).get(n)) for n in batch)
         messages = [SystemMessage(content=CATALOG_DRAFT_SYSTEM),
                     HumanMessage(content=CATALOG_DRAFT_PROMPT.format(n=len(batch), tables=described))]
+        def drafted(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            """这批里每张表能用的那份：同一张表给了几份（结构化、纯文本各一份）时取第一份有可用内容的。"""
+            out: dict[str, dict[str, Any]] = {}
+            for entry in entries:
+                name = str(entry.get("table"))
+                if name in batch and name not in out:
+                    notes = _from_model(entry, all_tables[name], system=system)
+                    if notes:
+                        out[name] = notes
+            return out
+
         try:
             async with gate:
-                got = await asyncio.wait_for(_ask_model(model, messages), timeout=MODEL_TIMEOUT_S)
+                got = await asyncio.wait_for(
+                    _ask_model(model, messages, usable=lambda entries: len(drafted(entries)) == len(batch)),
+                    timeout=MODEL_TIMEOUT_S)
         except asyncio.TimeoutError:
             for n in batch:
                 results[n] = f"模型起草超时：{MODEL_TIMEOUT_S} 秒内没有收到回复"
@@ -1708,14 +1741,13 @@ async def draft_with_model(model: Any, source: Any, tables: list[str], *,
             for n in batch:
                 results[n] = f"模型起草失败：{first_line(e) or describe_exception(e)}"
             return
-        by_name = {str(t.get("table")): t for t in got}
+        named = {str(t.get("table")) for t in got}
+        usable = drafted(got)
         for n in batch:
-            entry = by_name.get(n)
-            if entry is None:
-                results[n] = "模型的回复里没有这张表"
-                continue
-            results[n] = TableDraft(notes=_from_model(entry, all_tables[n], system=system),
-                                    covered=frozenset({"llm"}))
+            if n in usable:
+                results[n] = TableDraft(notes=usable[n], covered=frozenset({"llm"}))
+            else:
+                results[n] = MODEL_EMPTY_REASON if n in named else "模型的回复里没有这张表"
 
     await asyncio.gather(*(run(b) for b in _batches(names, all_tables)))
     return {n: results[n] for n in names if n in results}
@@ -1737,6 +1769,9 @@ class TableDraftResult:
     version: int = 0
     error: str | None = None
     model_error: str | None = None
+    #: 模型给了这张表几项可用内容（并入目录之前，按项数）。没用模型、模型这部分失败时为 None。
+    #: 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
+    model_items: int | None = None
 
 
 @dataclass
@@ -1800,6 +1835,8 @@ async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str]
         modeled = llm.get(table)
         if isinstance(modeled, str):
             result.model_error = modeled
+        elif isinstance(modeled, TableDraft):
+            result.model_items = len(_slots(modeled.notes))
         for _attempt in range(3):
             entry = await read_entry(session, source.id, table)
             version = entry.version if entry else 0
@@ -2188,7 +2225,8 @@ __all__ = [
     "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE",
+    "MODEL_EMPTY_REASON", "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX",
+    "PROFILE_VERIFY_COVERAGE",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
     "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
     "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",

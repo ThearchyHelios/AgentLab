@@ -2746,8 +2746,13 @@ export interface CatalogDraftRow {
   version: number
   /** 这张表没有起草（表结构里没有、写入一直冲突） */
   error: string | null
-  /** 只是模型那部分失败，其余来源照常写入 */
+  /** 只是模型那部分失败，其余来源照常写入。模型给了这张表、却一项可用内容都没有，也记在这里 */
   model_error: string | null
+  /**
+   * 模型给了这张表几项可用内容（并入目录之前）。没用模型、模型这部分失败时为 null（老后端没有这个键）。
+   * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
+   */
+  model_items?: number | null
 }
 
 /** POST /datasources/{id}/catalog/draft */
