@@ -183,3 +183,25 @@ def test_graph_sql_tables_uses_the_evidence_rules():
     ))
     tables = {"shop": {"orders": {}, "order_items": {}, "customers": {}}, "other": {"orders": {}}}
     assert graph_sql_tables(spec, tables) == {"shop": {"orders", "order_items", "customers"}, "other": {"orders"}}
+
+
+def test_assistant_seeds_read_tool_nodes_the_same_way():
+    """助手给全字段的「现有工作流用到的表」和发布记录、SQL 检查认的是同一种节点（sqlcheck.tool_query）。
+
+    画布上把调用工具节点换成别的类型，配置里的 tool、args 还留着：那已经不是一条会执行的查询，不能当成用到的表。
+    """
+    from app.api.copilot_context import graph_tables
+
+    shop = SimpleNamespace(name="shop", schema_cache={"tables": {
+        "orders": {"qualified": "orders"}, "customers": {"qualified": "customers"}, "stores": {"qualified": "stores"}}})
+    graph = _graph(
+        _query("q1", "shop", "SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id"),
+        # 换成了 Agent 的节点：残留的写死查询不算
+        _node("ask", "agent", tool="db_query__shop", args={"sql": "SELECT * FROM stores"}, tools=["db_query__shop"]),
+        # GraphSpec 的写法（config 在节点上）照样认
+        {"id": "q2", "type": "tool", "config": {"tool": "db_query__shop", "args": {"sql": "SELECT * FROM stores"}}},
+        _query("q3", "shop", "   "),
+    )
+    assert graph_tables(graph, [shop]) == {"shop": ["customers", "orders", "stores"]}
+    graph["nodes"] = [n for n in graph["nodes"] if n["id"] != "q2"]
+    assert graph_tables(graph, [shop]) == {"shop": ["customers", "orders"]}

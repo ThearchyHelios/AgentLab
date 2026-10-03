@@ -212,35 +212,28 @@ def _modes(sources: list[Any]) -> list[Literal["all", "pick"]]:
 def graph_tables(graph: Mapping[str, Any] | None, sources: Iterable[Any]) -> dict[str, list[str]]:
     """现有工作流里查库节点的 SQL 用到的表：{源名: [schema_cache 的键]}，按出现顺序。
 
-    只认调用工具节点上写死的 SQL（db_query__<源>）；Agent 运行时自己写的 SQL 图里看不到。节点认两种写法：
-    画布的 {data: {config}} 和 GraphSpec 的 {config}。SQL 解析不了的跳过。
+    只认调用工具节点上写死的 SQL（db_query__<源>）；Agent 运行时自己写的 SQL 图里看不到。哪些节点算写死的查询
+    以 sqlcheck.tool_query 为准（catalog_impact.tool_queries，和发布记录、SQL 检查同一份）：换成别的类型的节点
+    配置里残留的 tool、args 不算。节点认两种写法：画布的 {data: {config}} 和 GraphSpec 的 {config}。SQL 解析
+    不了的跳过。
     """
+    from app.data.catalog_impact import tool_queries
     from app.engine.evidence import sql_tables
-    from app.tools.datasource import QUERY_PREFIX
 
     by_name = {getattr(s, "name", None): s for s in sources}
     out: dict[str, list[str]] = {}
-    for node in (graph or {}).get("nodes") or []:
-        if not isinstance(node, dict):
-            continue
-        config = node.get("config")
-        if not isinstance(config, dict):
-            config = (node.get("data") or {}).get("config") if isinstance(node.get("data"), dict) else None
-        if not isinstance(config, dict):
-            continue
-        tool = str(config.get("tool") or "")
-        source = by_name.get(tool[len(QUERY_PREFIX):]) if tool.startswith(QUERY_PREFIX) else None
-        args = config.get("args")
-        sql = args.get("sql") if isinstance(args, dict) else None
-        if source is None or not isinstance(sql, str):
+    nodes = (graph or {}).get("nodes") or []
+    for _, source_name, sql in tool_queries(n for n in nodes if isinstance(n, dict)):
+        source = by_name.get(source_name)
+        if source is None:
             continue
         try:
             names = sql_tables(sql)
         except Exception:  # noqa: BLE001 - 认不出表就当没用到，只少一个提示
             continue
         found = out.setdefault(source.name, [])
-        for name in names:
-            key = catalog.resolve_table_name(source.schema_cache, name)
+        for table in names:
+            key = catalog.resolve_table_name(source.schema_cache, table)
             if key and key not in found:
                 found.append(key)
     return {k: v for k, v in out.items() if v}
@@ -604,7 +597,13 @@ def _edge_line(edge: JoinEdge, qualified) -> str:
 
 
 def _edges_within(graph: Mapping[str, list[JoinEdge]], tables: list[str]) -> list[JoinEdge]:
-    """两端都在 tables 里的关系，每条一次；一对多的翻过来，从「多」的一端写起（外键所在的表在左）。"""
+    """两端都在 tables 里的关系，每条一次；一对多的翻过来，从「多」的一端写起（外键所在的表在左）。
+
+    「每条一次」按 relation_id 去重，去掉的是同一条关系在关系图里的正反两条边。注意 catalog.relation_id 区分方向：
+    A 表目录里记的 A→B 和 B 表目录里记的 B→A 是两个编号，两边都记了的话这里会各出一行（内容相同、写法相反）。
+    这是有意不改的：编号存在每条关系上，也是审阅路径 relations.<编号> 的一部分，改成不分方向会让已有目录里的
+    编号全部对不上。
+    """
     wanted = set(tables)
     seen: set[str] = set()
     out = []
