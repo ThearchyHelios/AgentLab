@@ -2520,6 +2520,11 @@ export const CATALOG_UI_TEXT = {
   // ---- 剖析报告里关系的结论：按这次的实际变化说（原本就是已验证的不说「升为」）
   relationStillVerified: (coverage: string) => `仍为已验证，覆盖率 ${coverage}`,
   relationLowered: (reason: string) => `降为推断：${reason}`,
+  // ---- 确认含义还空着的码值：确认的是取值清单，含义照旧待填写
+  codesPendingConfirm: (n: number) => `有 ${formatNumber(n)} 个码值的含义待填写，确认的是取值清单`,
+  codesPendingAfter: '确认后这些码值仍显示「含义待填写」，之后可以再填写',
+  confirmColumnTitle: (col: string, n: number) => `确认列 ${col} 的 ${formatNumber(n)} 项推断？`,
+  confirmCodesTitle: (where: string) => `确认${where}？`,
 }
 
 // ===========================================================================

@@ -986,6 +986,40 @@ await section('数据目录 · 批量确认', async () => {
         && cb.notes.columns.amount.measure.status === 'confirmed' && cb.notes.columns.qty.label.status === 'proposed'
         && cb.notes.label.status === 'proposed' && JSON.stringify(cb.notes.columns.amount.unit.value) === JSON.stringify(wideOld.columns.amount.unit.value))
   check('……这一行的按钮消失', await until(async () => (await page.locator('[data-confirm-column="amount"]').count()) === 0))
+
+  // 码值的含义还空着（数据剖析给的候选只有取值）：各种确认都先说清确认的是取值清单，确认后照旧写「含义待填写」
+  state.tables[S1].find((t) => t.name === 'visits').notes.columns.status.codes = item({ 1: '已入园', 9: '', 2: '' }, 'profile', 'proposed')
+  await openDetail(page, S1, 'visits')
+  const puts = () => count(sent, /^PUT |\/review$/)
+  const put0 = puts()
+  await page.locator('[data-catalog-confirm-all]').click()
+  await confirmBox(page).waitFor()
+  check('「确认本表全部推断」：码值含义还空着时后果里写明确认的是取值清单', (await consequences(page)).includes('有 2 个码值的含义待填写，确认的是取值清单'),
+        (await consequences(page)).join(' | '))
+  await confirmBox(page).getByRole('button', { name: '取消' }).click()
+  await openMark(page, 'columns.status.codes')
+  await panel(page).locator('[data-review-action="confirm"]').click()
+  await confirmBox(page).waitFor()
+  check('单项「确认」码值：同样先问', (await confirmBox(page).innerText()).includes('确认列 status 的码值？')
+        && (await consequences(page)).includes('有 2 个码值的含义待填写，确认的是取值清单'), (await confirmBox(page).innerText()).replace(/\s+/g, ' '))
+  await confirmBox(page).getByRole('button', { name: '取消' }).click()
+  await page.locator('[data-confirm-column="status"]').click()
+  await confirmBox(page).waitFor()
+  const blankCons = await consequences(page)
+  check('「确认本列推断」原本一键确认，码值含义还空着时先问：有 2 个码值的含义待填写，确认的是取值清单',
+        (await confirmBox(page).innerText()).includes('确认列 status 的 2 项推断？') && blankCons.includes('有 2 个码值的含义待填写，确认的是取值清单')
+        && blankCons.some((c) => c.includes('仍显示「含义待填写」')), blankCons.join(' | '))
+  await confirmBox(page).getByRole('button', { name: '取消' }).click()
+  check('……三处取消都没有提交', puts() === put0, String(puts() - put0))
+  await page.locator('[data-confirm-column="status"]').click()
+  await confirmBox(page).waitFor()
+  await confirmBox(page).getByRole('button', { name: '确认 2 项' }).click()
+  await until(async () => puts() === put0 + 1)
+  const blankCell = page.locator('[data-column="status"] [data-cell="codes"]')
+  check('……确认后码值记为已确认，空着的仍写「含义待填写」，还能填写', await until(async () => (await markStatus(page, 'columns.status.codes')) === 'confirmed')
+        && await blankCell.locator('[data-code-pending]').count() === 2 && await blankCell.locator('[data-codes-fill]').count() === 1
+        && JSON.stringify(lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status?.codes?.value) === JSON.stringify({ 1: '已入园', 9: '', 2: '' }),
+        (await blankCell.innerText()).replace(/\s+/g, ' '))
   check('只发了整份提交，没有别的写请求', writes(sent, /./).every((s) => /^PUT /.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')

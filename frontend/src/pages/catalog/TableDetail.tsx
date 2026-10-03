@@ -189,6 +189,13 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
   const review = useCallback(async (t: ReviewTarget, action: CatalogReviewAction) => {
     const d = detailRef.current
     if (!d) return
+    // 确认一份含义还空着的码值：先说清确认的是取值清单，含义照旧待填写
+    if (action === 'confirm') {
+      const blank = blankCodes(d.notes, (p) => p === t.path)
+      if (blank.n && !(await confirmDialog({
+        title: UT.confirmCodesTitle(t.where), consequences: [UT.codesPendingConfirm(blank.n), UT.codesPendingAfter], confirmLabel: CT.confirm,
+      }))) return
+    }
     const done = await write(t.path, () => api.dataCatalog.review(sourceId, table, { path: t.path, action, if_version: d.version }))
     if (done) setLive(action === 'reset' && t.source === 'human' ? CT.removed(t.where) : CT.reviewed[action](t.where))
   }, [sourceId, table, write])
@@ -199,6 +206,12 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
     const paths = new Set(COLUMN_FIELDS.map((f) => columnPath(col, f)))
     const { notes, n } = confirmProposed(d.notes, (p) => paths.has(p))
     if (!n) return
+    // 一键确认本来不问；这一列的码值还有含义空着时先问一句：确认的是取值清单，含义照旧待填写
+    const blank = blankCodes(d.notes, (p) => paths.has(p))
+    if (blank.n && !(await confirmDialog({
+      title: UT.confirmColumnTitle(col, n), consequences: [UT.codesPendingConfirm(blank.n), UT.codesPendingAfter, ...CT.confirmAllConsequences],
+      confirmLabel: CT.confirmAllAction(n),
+    }))) return
     const done = await write(`column:${col}`, () => api.dataCatalog.put(sourceId, table, notes, d.version))
     if (done) setLive(CT.confirmedN(n))
   }, [sourceId, table, write])
@@ -313,8 +326,10 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
   const confirmAll = async () => {
     const { notes: body, n } = confirmProposed(notes)
     if (!n) return
+    const blank = blankCodes(notes)
     const ok = await confirmDialog({
-      title: CT.confirmAllTitle(n, label ?? table), consequences: CT.confirmAllConsequences, confirmLabel: CT.confirmAllAction(n),
+      title: CT.confirmAllTitle(n, label ?? table), confirmLabel: CT.confirmAllAction(n),
+      consequences: blank.n ? [...CT.confirmAllConsequences, UT.codesPendingConfirm(blank.n), UT.codesPendingAfter] : CT.confirmAllConsequences,
     })
     if (!ok) return
     const done = await write('confirm-all', () => api.dataCatalog.put(sourceId, table, body, detail.version))
@@ -500,6 +515,19 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
       )}
     </div>
   )
+}
+
+/**
+ * 要确认的推断码值里，含义还空着的码值有几个（数据剖析给的码值候选只有取值，含义等人填）。pick 挑审阅路径，
+ * 不给就是整张表。确认的是「这一列只有这些取值」，含义照旧待填写——确认之前要说清楚
+ */
+function blankCodes(notes: CatalogDetail['notes'], pick: (path: string) => boolean = () => true): { n: number } {
+  let n = 0
+  for (const [col, items] of Object.entries(notes.columns ?? {})) {
+    const codes = items?.codes
+    if (codes && codes.status === 'proposed' && pick(columnPath(col, 'codes'))) n += pendingCodes(codes.value)
+  }
+  return { n }
 }
 
 // ---------------------------------------------------------------------------
