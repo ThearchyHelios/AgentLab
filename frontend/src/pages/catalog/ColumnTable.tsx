@@ -223,10 +223,10 @@ function Codes({ value, label, onFill }: { value: Record<string, string>; label:
         {entries.length > CODES_SHOWN && <span className="text-2xs text-faint">+{entries.length - CODES_SHOWN}</span>}
       </span>
       {pending > 0 && onFill && (
-        <button type="button" className="mt-1 inline-flex items-center gap-1 rounded px-1 text-2xs text-dim underline decoration-dotted underline-offset-2 hover:text-fg"
-                onClick={onFill} aria-label={label} data-codes-fill="">
+        // 各码值的「含义待填写」已经写在上面，这里只给入口；几个待填写写在悬停里
+        <button type="button" className="mt-1 inline-flex items-center gap-1 whitespace-nowrap rounded px-1 text-2xs text-dim underline decoration-dotted underline-offset-2 hover:text-fg"
+                onClick={onFill} aria-label={label} title={KT.pendingN(pending)} data-codes-fill={pending}>
           <PencilLine size={10} aria-hidden /> {KT.fill}
-          <span className="tnum text-faint">（{KT.pendingN(pending)}）</span>
         </button>
       )}
     </span>

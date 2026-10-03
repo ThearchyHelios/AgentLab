@@ -2300,11 +2300,11 @@ export const PROFILE_TEXT = {
     other: '无法开始剖析',
   } as Record<string, string>,
   blockedNext: {
-    disabled: '剖析会对业务库发出只读查询，需要先在数据源设置中开启。开启后即可在这里剖析。',
-    inactive: '停用的数据源无法剖析。请在数据源设置中启用后重试。',
-    noSchema: '请回到数据源卡片点击「探查结构」，探查完成后重试。',
-    busy: '同一个数据源同一时间只能进行一次剖析。请等待当前剖析完成后重试。',
-    tampered: '数据文件与登记的版本不一致，已拒绝查询。请重新上传表格，或联系管理员核对数据文件。',
+    disabled: '开启后即可在这里剖析。',
+    inactive: '启用后回到这里重试。',
+    noSchema: '探查完成后回到这里重试。',
+    busy: '同一个数据源同一时间只能进行一次剖析。',
+    tampered: '请重新上传表格，或联系管理员核对数据文件。',
     other: '请稍后重试。',
   } as Record<string, string>,
   goSource: '前往数据源',
@@ -2430,5 +2430,6 @@ export const SQL_CHECK_TEXT = {
       infos ? `${formatNumber(infos)} 处提示` : ''].filter(Boolean).join('、'),
   assistantTitle: (counts: string) => `SQL 检查：${counts}`,
   assistantNext: '请打开对应节点，在「参数」中修改 SQL；检查依据有误时，请在数据目录中修正对应项',
+  assistantNextChat: '可在画布中打开此工作流，修改对应节点「参数」中的 SQL；检查依据有误时，请在数据目录中修正对应项',
   assistantInfoNext: '这些检查的依据尚未确认，仅供参考。在数据目录中确认相关项后，检查结论更可靠',
 }

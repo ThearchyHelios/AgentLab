@@ -152,7 +152,7 @@ export function ProfileSettingsDialog({ row, onClose, onSaved }: {
                </button>
              </>
            )}>
-      <div className="space-y-3" data-profile-dialog={row.id}>
+      <div className="space-y-3" data-profile-settings-dialog={row.id}>
         <p className="text-2xs leading-relaxed text-faint">{PT.dialogBody}</p>
         <ProfileSettingsSection idPrefix={idPrefix} form={form} serverError={serverError}
                                 onChange={(next) => { setForm(next); setServerError(null) }} />

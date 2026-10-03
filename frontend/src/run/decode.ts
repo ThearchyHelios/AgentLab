@@ -2835,8 +2835,10 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
             ...(n.error || n.warning ? { level: 'warn' as const } : {}),
             title: SQL_CHECK_TEXT.assistantTitle(SQL_CHECK_TEXT.counts(n.error, n.warning, n.info)),
             detail: sortSqlChecks(sql).map(issueLine).join('\n'),
-            next: n.error || n.warning ? SQL_CHECK_TEXT.assistantNext : SQL_CHECK_TEXT.assistantInfoNext,
-            ...(nodes.length === 1 ? { nodeId: nodes[0], fix: 'canvas' as const } : {}),
+            // 问数据页没有画布：下一步说去画布里打开这个工作流
+            next: n.error || n.warning ? (canvas ? SQL_CHECK_TEXT.assistantNext : SQL_CHECK_TEXT.assistantNextChat)
+              : SQL_CHECK_TEXT.assistantInfoNext,
+            ...(nodes.length === 1 ? { nodeId: nodes[0], ...(canvas ? { fix: 'canvas' as const } : {}) } : {}),
           })
         }
         // 工具绑定变化单独成一行：改图回执以前只说「修改 1」，模型改提示词时漏写 tools、

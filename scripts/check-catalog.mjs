@@ -4,6 +4,8 @@
 // 所以这里查的是「请求里带没带读到的版本」「批量确认只动推断项、来源不变」「编辑时没动的项原样交回（被驳回的照旧
 // 驳回）」「别人刚改过时有没有停下来让人重新载入，而不是悄悄覆盖」「起草按批调用、能停、出错时说得清」——
 // 正常路径的页面检查一个字都不会说。
+// 数据剖析（阶段 4B）会对业务库发查询：剖析接口、保存数据源一律在浏览器层答掉，查的是「确认前写没写预算」「进行中是否
+// 明说停不下来」「报告说没说清用了几条查询、为什么停、跳过了什么」「各种 409 有没有下一步」「设置被拒时报错落没落到那一项」。
 //
 // 写法同 check-versions：沙箱里的数据源多半没探查过结构，目录也是空的，所以数据源列表、目录清单、单表目录都用
 // page.route 伪造（虚构的景区业务库和一个导入表格的源）；写请求（整份提交、单项审阅、起草）也在浏览器层答掉，
@@ -395,6 +397,14 @@ function catalogHandlers(state, replies = {}) {
       json({ tables: state.tables[parts(key)[2]].filter((t) => !t.missing).map((t) => t.name), summary: '', synced_at: T0 })(route)],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft$/, reply('draft', draftReply(state))],
+    // 剖析没配答复的一律 503：检查脚本不能让剖析真的发到业务库
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/profile$/, reply('profile', json({ detail: '检查脚本没有为这次剖析准备答复' }, 503))],
+    // 保存数据源（剖析设置）：照提交改假状态，回整条数据源
+    [/^PATCH \/datasources\/check-cat-[a-z]+$/, reply('patch', (route, { key, body }) => {
+      const id = parts(key)[2]
+      state.sources = state.sources.map((s) => (s.id === id ? { ...s, ...body, password: undefined } : s))
+      return json(state.sources.find((s) => s.id === id))(route)
+    })],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/[^/]+$/, reply('get', (route, { key }) => {
       const { src, t } = findTable(state, key)
       return t ? json(detailOf(src, t))(route) : json({ detail: `数据源中没有表 ${parts(key)[4]}，可能已被删除或尚未探查结构` }, 404)(route)
@@ -1018,6 +1028,384 @@ await section('数据目录 · 空状态与导入表格', async () => {
   await close()
 })
 
+// ---------------------------------------------------------------------------
+// 数据剖析（阶段 4B）：剖析会对业务库发查询，这里一条都不能真的发出去——剖析接口和保存数据源都在浏览器层答掉，
+// 照服务端（data/catalog_profile.py）的结论改假状态
+// ---------------------------------------------------------------------------
+const GATE_REL = relId(['gate_id'], 'gates', ['id'])
+const MEMBER_REL = relId(['member_id'], 'members', ['id'])
+const PROFILE_DAY = '2026-10-03'
+const PROFILE_ON = { enabled: true, max_queries: 60, query_timeout_s: 10 }
+const withProfile = (state, src, value) => {
+  state.sources = state.sources.map((s) => (s.id === src ? { ...s, options: { ...s.options, catalog_profile: value } } : s))
+}
+const BUDGET_DETAIL = '本次剖析的查询次数已用完（上限 60 条），未检查'
+
+/**
+ * 剖析的默认答复：入园记录的闸机关系核实成已验证（覆盖率 98.7%），会员关系覆盖率不够保持推断，状态列的码值候选多出一个
+ * 没有含义的取值 2；订单只剖析了一半就用完了查询次数，订单明细一条没查。ms 是服务端「执行」多久
+ */
+function profileReply(state, { ms = 0 } = {}) {
+  return async (route) => {
+    if (ms) await sleep(ms)
+    const visits = state.tables[S1].find((t) => t.name === 'visits')
+    const notes = clone(visits.notes)
+    const at = `${PROFILE_DAY}T03:00:00+00:00`
+    notes.relations = notes.relations.map((r) => (r.id === GATE_REL ? {
+      ...r, source: 'profile', status: 'verified', coverage: 0.987, cardinality: 'many_to_one', updated_at: at,
+      note: `数据剖析（${PROFILE_DAY}）：子表抽样 300 个不同键值，父表对上 296 个，覆盖率 98.7%；被指向列是主键；子表一侧有重复值，多对一。`,
+    } : r))
+    notes.relations.push(rel(['member_id'], 'members', ['id'], 'profile', { coverage: 0.62, updated_at: at,
+      note: `数据剖析（${PROFILE_DAY}）：抽样覆盖率 62%，可能不是这条关系；子表抽样 200 个不同键值，父表对上 124 个；被指向列是主键。` }))
+    notes.columns.status.codes = item({ 1: '已入园', 9: '已作废', 2: '' }, 'profile', 'proposed')
+    notes.columns.status.codes.note = `数据剖析（${PROFILE_DAY}）：统计全表，182000 行非空值共 3 个取值：1（94%）、9（5%）、2（1%）。`
+    writeEntry(visits, notes)
+    const tables = [
+      {
+        table_name: 'visits', queries: 38, row_estimate: { rows: 182000, method: 'stats', at_least: null },
+        findings: [
+          { kind: 'relation', path: `relations.${GATE_REL}`, target: 'gate_id → gates.id', columns: ['gate_id'], to_table: 'gates', to_columns: ['id'],
+            status: 'verified', confirmed: false, coverage: 0.987, cardinality: 'many_to_one', sample: 300, matched: 296, summary: '覆盖率 98.7%，升为有确证' },
+          { kind: 'relation', path: `relations.${MEMBER_REL}`, target: 'member_id → members.id', columns: ['member_id'], to_table: 'members',
+            to_columns: ['id'], status: 'proposed', confirmed: false, coverage: 0.62, cardinality: 'many_to_one', sample: 200, matched: 124,
+            summary: '抽样覆盖率 62%，保持推断' },
+          { kind: 'codes', path: 'columns.status.codes', column: 'status', values: [{ value: '1', rows: 171080 }, { value: '9', rows: 9100 },
+            { value: '2', rows: 1820 }], rows: 182000, status: 'proposed', summary: '3 个取值，1 个含义待填写' },
+        ],
+        skipped: [
+          { kind: 'codes', target: 'member_level', path: 'columns.member_level.codes', reason: 'masked', detail: 'visits.member_level 在数据源设置中被遮罩，不取值' },
+          { kind: 'date', target: 'visit_time', path: 'business_date', reason: 'too_large',
+            detail: 'visits 的行数超过整表统计的行数上限（100000 行），不取日期列的最小值和最大值' },
+        ],
+        date_ranges: [], added: 1, updated: 2, removed: 0, version: visits.version, error: null,
+      },
+      {
+        table_name: 'orders', queries: 22, row_estimate: { rows: null, method: 'count', at_least: 100001 }, findings: [],
+        skipped: [{ kind: 'relation', target: 'member_id → members.id', path: 'relations.x', reason: 'budget', detail: BUDGET_DETAIL }],
+        date_ranges: [], added: 0, updated: 0, removed: 0, version: 1, error: null,
+      },
+      {
+        table_name: 'order_items', queries: 0, row_estimate: null, findings: [],
+        skipped: [{ kind: 'table', target: 'order_items', path: null, reason: 'budget', detail: BUDGET_DETAIL }],
+        date_ranges: [], added: 0, updated: 0, removed: 0, version: 1, error: null,
+      },
+    ]
+    return json({
+      profiled_at: at, actor: ACTOR, settings: { ...PROFILE_ON, sample_size: 2000, max_scan_rows: 100000, max_total_s: 120 },
+      queries_used: 60, stopped: 'budget', tables, total: { added: 1, updated: 2, removed: 0 }, note: null,
+    })(route)
+  }
+}
+const profileBox = (page) => page.locator('[data-profile-dialog]')
+const profilePhase = (page) => profileBox(page).getAttribute('data-profile-dialog').catch(() => null)
+/** 报告里不该露的机读码：停止原因、跳过原因、状态、基数的英文值 */
+const PROFILE_CODE_RE = /\b(?:budget|deadline|failed|masked|too_large|high_cardinality|no_data|unsupported|verified|proposed|many_to_one|row_estimate)\b/
+
+await section('数据目录 · 数据剖析设置', async () => {
+  const state = freshState()
+  const replies = { patch: [] }
+  const { page, sent, errors, natives, close } = await open('/data/databases', { handlers: catalogHandlers(state, replies) })
+  // 手工登记的库：编辑框里有「数据剖析」一段，默认关闭，预算收着
+  await page.locator('[data-source="zzcatscenic"]').getByRole('button', { name: '编辑', exact: true }).click()
+  const box = page.locator('[data-profile-settings]')
+  await box.waitFor()
+  check('编辑框里有「数据剖析」，默认关闭、预算收着', (await box.getAttribute('data-profile-settings')) === 'off'
+        && await box.locator('[data-profile-field]').count() === 0 && (await box.innerText()).includes('默认关闭'))
+  await box.locator('[data-profile-enabled]').check()
+  const labels = await box.locator('label.label').allInnerTexts()
+  check('开启后五项预算展开，中文标签', labels.join('、') === '查询次数上限、单条查询时限、抽样键值数、整表统计行数上限、总时长上限', labels.join('、'))
+  const units = await box.locator('[data-profile-field] span').allInnerTexts()
+  check('……每项带单位', units.join(',') === '条,秒,个,行,秒', units.join(','))
+  const hints = await box.locator('[id$="-hint"]').allInnerTexts()
+  check('……写明范围和默认值，整表统计写明 0 的含义', hints.some((h) => h.startsWith('范围 1–500 条，默认 60'))
+        && hints.some((h) => h.includes('范围 0–10,000,000 行') && h.includes('填 0 表示一律不做整表统计')), hints.join(' | '))
+  const risk = () => box.locator('[data-profile-risk]').innerText().catch(() => '')
+  check('……风险说明：会发出只读查询，每次最多 60 条、单条 10 秒（缺省）', (await risk()).includes('只读查询：最多 60 条，单条不超过 10 秒'), await risk())
+  await page.locator('#ds-profile-max_queries').fill('80')
+  check('……风险说明跟着填的数走', (await risk()).includes('最多 80 条'), await risk())
+  await page.locator('#ds-profile-max_queries').fill('0')
+  const err = await page.locator('#ds-profile-max_queries-error').innerText().catch(() => '')
+  check('填错（0 条）：就地写明范围，保存按钮禁用', err === '请填写 1 到 500 之间的整数' && await page.locator('[data-source-save]').isDisabled(), err)
+  check('……输入框标出错（aria-invalid）', (await page.locator('#ds-profile-max_queries').getAttribute('aria-invalid')) === 'true')
+  await page.locator('#ds-profile-max_queries').fill('80')
+  await page.locator('#ds-profile-query_timeout_s').fill('20')
+  // 服务端按字段拒收（422）：报错落在那一项下面，光标放进去，不只弹提示
+  const REJECT = '数据剖析的「单条查询时限（秒）」需要填写 1 到 60 之间的数；当前为「20」'
+  replies.patch.push(json({ detail: REJECT }, 422))
+  await page.locator('[data-source-save]').click()
+  check('保存被拒（422）：服务端原话写在「单条查询时限」下面', await until(async () =>
+    (await page.locator('#ds-profile-query_timeout_s-error').innerText().catch(() => '')) === REJECT),
+  await page.locator('#ds-profile-query_timeout_s-error').innerText().catch(() => ''))
+  check('……光标落在那一项上，框标出错', await until(async () => page.evaluate(() => document.activeElement?.id === 'ds-profile-query_timeout_s'))
+        && (await page.locator('#ds-profile-query_timeout_s').getAttribute('aria-invalid')) === 'true')
+  check('……没有落到「高级连接参数」的查询时限上', await page.locator('#ds-adv-query_timeout_s-error').count() === 0)
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-settings-422')
+  await page.locator('#ds-profile-query_timeout_s').fill('15')
+  check('改了这一项，报错收起', await page.locator('#ds-profile-query_timeout_s-error').count() === 0)
+  await page.locator('[data-source-save]').click()
+  await until(async () => (await page.locator('[data-profile-settings]').count()) === 0)
+  const saved = writes(sent, /^PATCH /).at(-1)?.body
+  check('保存：options 里写剖析设置（开关和填了的项，数字）', JSON.stringify(saved?.options?.catalog_profile)
+        === JSON.stringify({ enabled: true, max_queries: 80, query_timeout_s: 15 }), JSON.stringify(saved?.options))
+  check('……卡片上标「数据剖析已开启」，悬停写明预算', await until(async () => (await page.locator('[data-source="zzcatscenic"] [data-profile-on]').count()) === 1)
+        && (await page.locator('[data-source="zzcatscenic"] [data-profile-on]').getAttribute('title')) === '数据剖析已开启：每次最多 80 条只读查询，单条不超过 15 秒')
+  // 再打开：剖析设置回显，没有摊进「高级连接参数」变成一串文字
+  await page.locator('[data-source="zzcatscenic"]').getByRole('button', { name: '编辑', exact: true }).click()
+  await page.locator('[data-profile-settings="on"]').waitFor()
+  check('再打开编辑框：开关和填的数回显', await page.locator('#ds-profile-max_queries').inputValue() === '80'
+        && await page.locator('#ds-profile-query_timeout_s').inputValue() === '15')
+  const advanced = await page.locator('[data-profile-settings] ~ details, details').allInnerTexts()
+  check('……剖析设置没有摊进「高级连接参数」', !advanced.join(' ').includes('catalog_profile') && !advanced.join(' ').includes('[object Object]'))
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+
+  // 导入表格的源没有编辑框：卡片上单独设置，options 的其余键原样带上
+  withProfile(state, S2, undefined)
+  state.sources = state.sources.map((s) => (s.id === S2 ? { ...s, options: { mask_columns: ['联系电话'] } } : s))
+  await goto(page, '/data/tables')
+  await page.locator('[data-source="zzcatupload"] [data-edit-profile]').click()
+  const dialog = page.locator('[data-profile-settings-dialog]')
+  await dialog.waitFor()
+  check('导入表格的源：卡片上「设置数据剖析」打开只改这一项的弹窗', (await page.locator('[role="dialog"]').last().innerText()).includes('「zzcatupload」的数据剖析设置'))
+  check('……没改时保存禁用', await page.locator('[data-profile-save]').isDisabled())
+  await dialog.locator('[data-profile-enabled]').check()
+  await page.locator('[data-profile-save]').click()
+  await until(async () => (await dialog.count()) === 0)
+  const body = writes(sent, /^PATCH \/datasources\/check-cat-upload$/).at(-1)?.body
+  check('……保存只换剖析设置，遮罩列原样带上', JSON.stringify(body) === JSON.stringify({ options: { mask_columns: ['联系电话'], catalog_profile: { enabled: true } } }),
+        JSON.stringify(body))
+  check('……卡片上标「数据剖析已开启」', await until(async () => (await page.locator('[data-source="zzcatupload"] [data-profile-on]').count()) === 1))
+  check('写请求只有保存数据源', writes(sent, /./).every((s) => /^PATCH \/datasources\/check-cat-/.test(s.key)),
+        JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 数据剖析', async () => {
+  const state = freshState()
+  withProfile(state, S1, PROFILE_ON)
+  const replies = { profile: [] }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const head = page.locator('[data-catalog-profile]')
+  check('页头有「数据剖析」', (await head.getAttribute('aria-label')) === '数据剖析')
+  await head.click()
+  await profileBox(page).waitFor()
+  const setup = await profileBox(page).innerText()
+  check('没选表、没筛选：范围只有「使用次数最多、有待核实关联关系的表」，写明至多 10 张',
+        (await profileBox(page).locator('[data-profile-scope]').evaluateAll((els) => els.map((e) => e.getAttribute('data-profile-scope')))).join(',') === 'default'
+        && setup.includes('使用次数最多、有待核实关联关系的表') && setup.includes('至多 10 张'))
+  const budget = await profileBox(page).locator('[data-profile-budget]').innerText()
+  check('确认前写明预算：查询条数、单条和总时长、抽样规模、整表统计门槛，按哪个源的设置',
+        ['最多 60 条只读查询，单条不超过 10 秒', '总时长不超过 120 秒', '抽样 2,000 个键值', '行数超过 100,000 的表不做整表统计', '按「zzcatscenic」的数据剖析设置']
+          .every((s) => budget.includes(s)), budget.replace(/\s+/g, ' '))
+  check('……写明开始后无法中途停止', setup.includes('开始后无法中途停止'))
+  check('……还没开始就没有写请求', writes(sent, /./).length === 0)
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-setup')
+  await page.keyboard.press('Escape')
+  await until(async () => (await profileBox(page).count()) === 0)
+
+  // 打开入园记录的详情，选两张表剖析：完成后清单和正在看的详情都要重新载入
+  await openDetail(page, S1, 'visits')
+  const v0 = await version(page)
+  check('剖析前：闸机关系是「推断 · 命名推断」，没有覆盖率', (await markStatus(page, `relations.${GATE_REL}`)) === 'proposed'
+        && (await page.locator(`[data-relation="${GATE_REL}"]`).innerText()).includes('—'))
+  await page.locator('[data-catalog-select="visits"]').click()
+  await page.locator('[data-catalog-select="orders"]').click()
+  await page.locator('[data-catalog-profile-selected]').click()
+  await profileBox(page).waitFor()
+  check('剖析所选：范围默认是「已选的 2 张表」', await profileBox(page).locator('[data-profile-scope="selected"] input').isChecked()
+        && (await profileBox(page).locator('[data-profile-scope="selected"]').innerText()).includes('已选的 2 张表'))
+  replies.profile.push(profileReply(state, { ms: 2600 }))
+  const lists0 = count(sent, /^GET \/datasources\/check-cat-scenic\/catalog$/)
+  await page.locator('[data-profile-start]').click()
+  check('进行中：写「正在剖析…」和已用时长、总时长上限', await until(async () => (await profilePhase(page)) === 'running')
+        && (await profileBox(page).locator('[data-profile-title]').innerText()) === '正在剖析…'
+        && (await profileBox(page).locator('[data-profile-elapsed]').innerText()).includes('（总时长上限 2 分 00 秒）'))
+  check('……时长在走（不是一直「不到 1 秒」）', await until(async () => Number(await profileBox(page).locator('[data-profile-elapsed]').getAttribute('data-profile-elapsed')) >= 1, 2500))
+  check('……不给「停止」，明说无法中途停止', await profileBox(page).getByRole('button', { name: /停止|取消/ }).count() === 0
+        && (await profileBox(page).locator('[data-profile-no-cancel]').innerText()).includes('无法中途停止'))
+  const req = writes(sent, /catalog\/profile$/).at(-1)
+  check('……请求带所选的两张表和本机署名', JSON.stringify([...(req?.body?.tables ?? [])].sort()) === JSON.stringify(['orders', 'visits'])
+        && decodeURIComponent(req?.actor ?? '') === ACTOR, JSON.stringify(req?.body))
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-running')
+  // 关掉窗口剖析照常进行：页头换成计时，完成后提示并可以打开报告
+  await page.locator('[data-profile-background]').click()
+  check('「在后台继续」：窗口关掉，页头换成「正在剖析」', await until(async () => (await profileBox(page).count()) === 0)
+        && (await page.locator('[data-catalog-profile="running"]').innerText()).includes('正在剖析'))
+  const toastBox = page.locator('[data-toast]').filter({ hasText: '数据剖析已停止' })
+  check('完成：提示「数据剖析已停止：查询次数已用完」，带「查看报告」', await until(async () => (await toastBox.count()) > 0, 6000),
+        await page.locator('[data-toast]').allInnerTexts().then((t) => t.join(' | ')).catch(() => ''))
+  check('……页头回到「数据剖析」', await page.locator('[data-catalog-profile="running"]').count() === 0)
+  check('……写进去的表重新载入：清单重取、正在看的详情版本更新', await until(async () => count(sent, /^GET \/datasources\/check-cat-scenic\/catalog$/) > lists0)
+        && await until(async () => (await version(page)) === v0 + 1))
+  await toastBox.getByRole('button', { name: '查看报告' }).click()
+  await profileBox(page).waitFor()
+  const report = profileBox(page).locator('[data-profile-report]')
+  check('报告：停止原因说中文', (await report.locator('[data-profile-title]').innerText()) === '剖析已停止：查询次数已用完')
+  check('……用了多少条查询、剖析几张表', (await report.locator('[data-profile-summary]').innerText()).startsWith('用了 60 / 60 条查询，剖析 3 张表'))
+  check('……目录的变化', (await report.locator('[data-profile-changes]').innerText()) === '新增 1 项、更新 2 项')
+  check('……停下之后怎么办：调高查询次数上限或缩小范围，给「修改设置」', (await report.locator('[data-profile-stopped="budget"]').innerText()).includes('调高查询次数上限')
+        && await report.locator('[data-profile-stopped] [data-profile-settings-open]').count() === 1)
+  const visitsCard = report.locator('[data-profile-table="visits"]')
+  const gate = visitsCard.locator(`[data-profile-finding="relation"][data-path="relations.${GATE_REL}"]`)
+  check('关系核实：覆盖率、基数、抽样规模，升为已验证', (await gate.locator('[data-profile-coverage]').innerText()) === '覆盖率 98.7%'
+        && (await gate.locator('[data-profile-cardinality]').innerText()) === '多对一' && (await gate.innerText()).includes('抽样 300 个键值，对上 296 个')
+        && (await gate.locator('[data-profile-outcome]').innerText()) === '升为已验证' && (await gate.getAttribute('data-status')) === 'verified',
+        (await gate.innerText()).replace(/\s+/g, ' '))
+  const member = visitsCard.locator(`[data-profile-finding="relation"][data-path="relations.${MEMBER_REL}"]`)
+  check('……覆盖率不够的保持推断，写明原因', (await member.locator('[data-profile-outcome]').innerText()) === '保持推断：覆盖率不足，可能不是这条关系'
+        && (await member.locator('[data-profile-coverage]').innerText()) === '覆盖率 62%')
+  const codes = visitsCard.locator('[data-profile-finding="codes"]')
+  check('码值候选：列、各取值的行数、几个含义待填写，给「填写含义」', (await codes.getAttribute('data-column')) === 'status'
+        && (await codes.innerText()).includes('3 个取值，共 182,000 行') && (await codes.innerText()).includes('171,080 行')
+        && (await codes.locator('[data-codes-pending]').innerText()) === '1 个含义待填写' && await codes.locator('[data-profile-fill="status"]').count() === 1,
+        (await codes.innerText()).replace(/\s+/g, ' '))
+  const skipped = visitsCard.locator('[data-profile-skipped]')
+  check('跳过的项：原因说中文，附服务端的整句', (await skipped.innerText()).includes('列已遮罩') && (await skipped.innerText()).includes('visits.member_level 在数据源设置中被遮罩，不取值')
+        && (await skipped.innerText()).includes('表太大'), (await skipped.innerText()).replace(/\s+/g, ' '))
+  check('……行数估算写成人话：统计信息约 182,000 行、数到上限的超过 100,000 行',
+        (await visitsCard.locator('header').innerText()).includes('约 182,000 行') && (await report.locator('[data-profile-table="orders"] header').innerText()).includes('超过 100,000 行'))
+  check('……一条没查的表写明「查询次数用完」', (await report.locator('[data-profile-table="order_items"] [data-profile-skip="budget"]').innerText()).includes('查询次数用完'))
+  const reportText = await report.innerText()
+  check('报告不露机读码', !PROFILE_CODE_RE.test(reportText), reportText.match(PROFILE_CODE_RE)?.[0] ?? '')
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-report')
+  await page.locator('[data-profile-close]').click()
+  await until(async () => (await profileBox(page).count()) === 0)
+
+  // 表详情：关系的来源写「数据剖析」，带覆盖率和基数；码值的含义空着写「含义待填写」
+  const gateRow = page.locator(`[data-relation="${GATE_REL}"]`)
+  check('表详情：闸机关系「已验证 · 数据剖析」，覆盖率 98.7%、多对一', (await markStatus(page, `relations.${GATE_REL}`)) === 'verified'
+        && (await gateRow.innerText()).includes('数据剖析') && (await gateRow.innerText()).includes('98.7%') && (await gateRow.innerText()).includes('多对一'),
+        (await gateRow.innerText().catch(() => '')).replace(/\s+/g, ' '))
+  await openMark(page, `relations.${GATE_REL}`)
+  check('……点开来源：写明抽样规模和覆盖率的剖析说明', (await panel(page).innerText()).includes('子表抽样 300 个不同键值，父表对上 296 个'))
+  await page.keyboard.press('Escape')
+  const statusCodes = page.locator('[data-column="status"] [data-cell="codes"]')
+  check('……码值的含义空着写「含义待填写」，给「填写含义」', (await statusCodes.locator('[data-code="2"] [data-code-pending]').innerText()) === '含义待填写'
+        && (await statusCodes.locator('[data-codes-fill]').innerText()).includes('填写含义'))
+  // 从报告点「填写含义」：窗口关掉，打开这张表那一列的码值弹窗，光标在空着的那一个上
+  await page.locator('[data-catalog-profile]').click()
+  await profileBox(page).waitFor()
+  check('页头再点：上一次的报告看过了就回到选范围', (await profilePhase(page)) === 'setup')
+  await page.keyboard.press('Escape')
+  await statusCodes.locator('[data-codes-fill]').click()
+  const codesBox = page.locator('[data-codes-dialog="status"]')
+  await codesBox.waitFor()
+  check('码值弹窗：每个码值一个输入框，空着的写「含义待填写」，光标在它上面', await codesBox.locator('input[data-code]').count() === 3
+        && (await codesBox.locator('input[data-code="2"]').getAttribute('placeholder')) === '含义待填写'
+        && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-code') === '2')))
+  check('……写明剖析说明（各取值的占比）', (await codesBox.innerText()).includes('1（94%）、9（5%）、2（1%）'))
+  check('……没填时保存禁用', await page.locator('[data-codes-save]').isDisabled())
+  await codesBox.locator('input[data-code="2"]').fill('已退票')
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-codes-fill')
+  const v1 = await version(page)
+  await page.keyboard.press('Enter')
+  check('回车保存：整份提交，只换这一列码值的含义，带读到的版本', await until(async () => (await codesBox.count()) === 0)
+        && JSON.stringify(lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status?.codes?.value) === JSON.stringify({ 1: '已入园', 9: '已作废', 2: '已退票' })
+        && lastBody(sent, /^PUT .*catalog\/visits$/)?.if_version === v1, JSON.stringify(lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status))
+  check('……保存后不再有「含义待填写」，这一项记为人工确认', await until(async () => (await statusCodes.locator('[data-code-pending]').count()) === 0)
+        && (await statusCodes.innerText()).includes('已退票') && (await markStatus(page, 'columns.status.codes')) === 'confirmed')
+  // 报告里的「填写含义」直达
+  await page.locator('[data-catalog-profile]').click()
+  replies.profile.push(profileReply(state))
+  await page.locator('[data-profile-start]').click()
+  await until(async () => (await profilePhase(page)) === 'done')
+  check('窗口开着时完成：直接看报告，不另弹提示', (await toastBox.count()) <= 1)
+  await openDetail(page, S1, 'orders')
+  await page.locator('[data-catalog-profile]').click()
+  await profileBox(page).waitFor()
+  check('换了一张表、再点页头：回到选范围（报告已看过）', (await profilePhase(page)) === 'setup')
+  await page.keyboard.press('Escape')
+
+  check('写请求只有剖析和整份提交', writes(sent, /./).every((s) => /catalog\/profile$|^PUT .*catalog\/visits$/.test(s.key)),
+        JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 数据剖析开始不了（409）', async () => {
+  const state = freshState()
+  const replies = { profile: [], patch: [] }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  // 数据源列表里就没开：不让开始，就地开启
+  await page.locator('[data-catalog-profile]').click()
+  await profileBox(page).waitFor()
+  check('没开启：写明需要先开启，「开始剖析」禁用，没有预算', (await profileBox(page).locator('[data-profile-disabled]').innerText()).includes('未开启数据剖析')
+        && await page.locator('[data-profile-start]').isDisabled() && await profileBox(page).locator('[data-profile-budget]').count() === 0)
+  await profileBox(page).locator('[data-profile-disabled] [data-profile-enable]').click()
+  const settings = page.locator('[data-profile-settings-dialog]')
+  await settings.waitFor()
+  await settings.locator('[data-profile-enabled]').check()
+  await page.locator(`#profile-${S1}-max_queries`).fill('40')
+  await page.locator('[data-profile-save]').click()
+  check('就地开启：保存后回到剖析，预算按刚存的设置', await until(async () => (await settings.count()) === 0)
+        && await until(async () => (await profileBox(page).locator('[data-profile-budget]').innerText().catch(() => '')).includes('最多 40 条只读查询'))
+        && !(await page.locator('[data-profile-start]').isDisabled()))
+  check('……保存的是这个源的剖析设置', JSON.stringify(writes(sent, /^PATCH /).at(-1)?.body) === JSON.stringify({ options: { catalog_profile: { enabled: true, max_queries: 40 } } }),
+        JSON.stringify(writes(sent, /^PATCH /).at(-1)?.body))
+
+  const cases = [
+    ['disabled', '数据源「zzcatscenic」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析', '未开启数据剖析', 'data-profile-enable'],
+    ['inactive', '数据源「zzcatscenic」已停用，无法进行数据剖析。请先在数据源设置中启用', '数据源已停用', 'data-profile-go-source'],
+    ['noSchema', '尚未探查结构，无法进行数据剖析。请先在数据源卡片上点「探查结构」', '还没有表结构', 'data-profile-go-source'],
+    ['busy', '数据源「zzcatscenic」正在进行数据剖析，请等待完成后再试', '这个数据源正在剖析', 'data-profile-retry'],
+    ['tampered', '数据文件与登记的版本不一致，可能被修改过，已拒绝查询', '数据文件核对未通过', 'data-profile-go-source'],
+  ]
+  for (const [kind, detail, title, action] of cases) {
+    replies.profile.push(json({ detail }, 409))
+    await page.locator('[data-profile-start]').click()
+    const blocked = profileBox(page).locator(`[data-profile-blocked="${kind}"]`)
+    const ok = await until(async () => (await blocked.count()) === 1)
+    const text = ok ? await blocked.innerText() : ''
+    check(`409（${title}）：写明是哪种情况、服务端原话和下一步，给对应的按钮`, ok && text.includes(title) && text.includes(detail)
+          && await blocked.locator(`[${action}]`).count() === 1, text.replace(/\s+/g, ' ').slice(0, 140))
+    if (kind === 'busy') {
+      // 稍后重试：同一个范围再发一次，这次成功
+      replies.profile.push(profileReply(state))
+      await blocked.locator('[data-profile-retry]').click()
+      check('……「重试」再发一次，成功后看到报告', await until(async () => (await profilePhase(page)) === 'done'))
+    }
+    if (kind === 'disabled') {
+      // 服务端说没开（列表里的设置过时了）：同样就地开启，开了回到选范围
+      await blocked.locator('[data-profile-enable]').click()
+      await settings.waitFor()
+      await page.locator(`#profile-${S1}-max_queries`).fill('45')
+      await page.locator('[data-profile-save]').click()
+      check('……就地开启后回到选范围', await until(async () => (await profilePhase(page)) === 'setup'))
+      continue
+    }
+    // 底栏的按钮不在弹窗正文里
+    await page.locator(kind === 'busy' ? '[data-profile-again]' : '[data-profile-back]').click()
+    await until(async () => (await profilePhase(page)) === 'setup')
+  }
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-blocked')
+  // 不是 409 的失败：照常的报错，能重试
+  replies.profile.push(json({ detail: '服务端处理剖析时出错，请稍后重试' }, 500))
+  await page.locator('[data-profile-start]').click()
+  check('其余失败：写「剖析未能完成」和原因，能重试', await until(async () => (await profileBox(page).locator('[data-profile-failed]').count()) === 1)
+        && (await profileBox(page).locator('[data-profile-failed]').innerText()).includes('剖析未能完成'))
+  // 去数据源：停用、没有表结构、快照被改动时
+  replies.profile.push(json({ detail: cases[1][1] }, 409))
+  await profileBox(page).locator('[data-profile-failed]').getByRole('button', { name: /重试/ }).click()
+  await profileBox(page).locator('[data-profile-go-source]').click()
+  await page.waitForURL('**/data/databases', { timeout: 5000 }).catch(() => {})
+  check('「前往数据源」回到数据源卡片', new URL(page.url()).pathname === '/data/databases', page.url())
+  check('写请求只有剖析和保存剖析设置', writes(sent, /./).every((s) => /catalog\/profile$|^PATCH \/datasources\/check-cat-scenic$/.test(s.key)),
+        JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('数据目录 · 窄屏', async () => {
   const state = freshState()
   const { page, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state), viewport: { width: 390, height: 844 } })
@@ -1045,6 +1433,13 @@ await section('数据目录 · 窄屏', async () => {
   await page.locator('[data-catalog-detail-back]').click()
   check('……「返回表清单」回到清单', await until(async () => page.locator('[data-catalog-list]').isVisible()))
   await shot(page, 'catalog-narrow')
+  // 数据剖析：页头只留图标，弹窗在视口里、不横向滚动
+  await page.locator('[data-catalog-profile]').click()
+  await profileBox(page).waitFor()
+  const dlg = await page.locator('[role="dialog"]').last().boundingBox()
+  const inner = await profileBox(page).evaluate((el) => el.scrollWidth - el.clientWidth)
+  check('……数据剖析弹窗在视口里，正文不横向滚动', !!dlg && dlg.x >= 0 && dlg.x + dlg.width <= 390 && inner <= 1, `${JSON.stringify(dlg)} ${inner}`)
+  await page.keyboard.press('Escape')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
