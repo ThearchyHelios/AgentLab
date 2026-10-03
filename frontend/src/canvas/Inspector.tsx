@@ -12,8 +12,9 @@ import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasour
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
+import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
+import { MERGE_ALIAS, isQueryNode, mergeAlias } from './mergeInputs'
 import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
 
 /** 检查器里一条落到字段上的问题 */
@@ -158,19 +159,12 @@ function mergeRowsOf(value: any): MergeRow[] {
   return Object.entries(value).map(([alias, node]) => ({ alias, node: typeof node === 'string' ? node : '' }))
 }
 
-/** 和后端 engine/merge_query.alias_problem 的写法规则一致；关键字、sqlite_ 前缀这类由后端校验报出来 */
-const MERGE_ALIAS = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/
-
-/** 新加一行时的别名：从节点 id 取（q_sales → q_sales），不合法的退成 t1、t2…，和已有的不重名 */
-function freshAlias(nodeId: string, taken: Set<string>): string {
-  const base = nodeId.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/^(?=[0-9])/, 't')
-  const head = MERGE_ALIAS.test(base) ? base : 't'
-  if (head !== 't' && !taken.has(head)) return head
-  for (let n = 1; ; n += 1) if (!taken.has(`${head}${n}`)) return `${head}${n}`
-}
 
 /**
  * 合并查询的输入：每一行一个别名（合并 SQL 里的表名）加一个上游查询节点。
+ *
+ * 查询节点连到合并查询时就自动加成一行（store 的 onConnect，别名按查询的主表起）；连线时还没选工具、后来才选上的，
+ * 这里给一个「带出连着的 N 个查询节点」一次补齐。手动「添加输入」的别名也按主表起，不用节点 id。
  *
  * 只列上游的查询节点：选了数据库查询工具的「调用工具」节点和别的合并查询。Agent 查过的库、模型写的文字都不能合并
  * （后端校验会报错），这里干脆不给选。已经选了、后来被删掉或挪到下游的节点照样显示成一行并说明，好让人看见并改掉。
@@ -196,11 +190,7 @@ function MergeInputList({ nodeId, value, issues, onChange }: {
       stack.push(...(parents.get(id) ?? []))
     }
     return nodes
-      .filter((n) => {
-        if (!seen.has(n.id)) return false
-        const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
-        return n.data?.nodeType === 'merge' || (n.data?.nodeType === 'tool' && tool.startsWith('db_query__'))
-      })
+      .filter((n) => seen.has(n.id) && isQueryNode(n))
       .map((n) => {
         const label = String(n.data?.label || n.id)
         const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
@@ -231,11 +221,27 @@ function MergeInputList({ nodeId, value, issues, onChange }: {
     wrote.current = JSON.stringify(mergeRowsOf(obj))
     onChange(obj)
   }
+  const nodeOf = (id: string) => nodes.find((n) => n.id === id)
   const add = () => {
     const used = new Set(rows.map((r) => r.node))
     const pick = options.find((o) => !used.has(o.value)) ?? options[0]
     if (!pick) return
-    commit([...rows, { alias: freshAlias(pick.value, new Set(rows.map((r) => keyOf(r.alias)))), node: pick.value }])
+    commit([...rows, { alias: mergeAlias(nodeOf(pick.value), new Set(rows.map((r) => keyOf(r.alias)))), node: pick.value }])
+  }
+  // 直接连着、还不是输入的查询节点（连线时还没选工具的）：一次带出来
+  const connected = useMemo(() => {
+    const used = new Set(rows.map((r) => r.node))
+    const direct = new Set(edges.filter((e) => e.target === nodeId).map((e) => e.source))
+    return options.filter((o) => direct.has(o.value) && !used.has(o.value)).map((o) => o.value)
+  }, [edges, nodeId, options, rows])
+  const addConnected = () => {
+    const taken = new Set(rows.map((r) => keyOf(r.alias)))
+    const added = connected.map((id) => {
+      const alias = mergeAlias(nodeOf(id), taken)
+      taken.add(alias)
+      return { alias, node: id }
+    })
+    commit([...rows, ...added])
   }
 
   return (
@@ -276,6 +282,11 @@ function MergeInputList({ nodeId, value, issues, onChange }: {
           </Row>
         )
       })}
+      {connected.length > 0 && (
+        <button type="button" className="btn btn-sm mb-1.5 w-full justify-center" onClick={addConnected} data-merge-add-connected={connected.length}>
+          <Plus size={11} /> {CATALOG_UI_TEXT.mergeAddConnected(connected.length)}
+        </button>
+      )}
       <button type="button" className="btn btn-sm w-full justify-center" disabled={!options.length} onClick={add}>
         <Plus size={11} /> {MERGE_TEXT.addInput}
       </button>

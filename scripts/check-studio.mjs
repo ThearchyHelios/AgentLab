@@ -2539,11 +2539,59 @@ await section('合并查询：节点库认得、卡片摘要、检查器从上�
   await box.getByRole('button', { name: '添加输入' }).click()
   await page.waitForTimeout(150)
   const added = JSON.parse(await config())
-  check('添加输入：取一个上游查询节点，别名从节点 id 起、不重名', Object.keys(added).length === 3
-    && Object.keys(added)[2] === 'q_sales', JSON.stringify(added))
-  await box.getByRole('button', { name: '删除输入 q_sales' }).click()
+  check('添加输入：取一个上游查询节点，别名按查询的主表起（orders），不用节点 id', Object.keys(added).length === 3
+    && Object.keys(added)[2] === 'orders' && added.orders === 'q_sales', JSON.stringify(added))
+  await box.getByRole('button', { name: '删除输入 orders' }).click()
   await page.waitForTimeout(150)
   check('删除输入：那一行和配置里的那一项一起去掉', await config() === JSON.stringify({ s: 'q_sales', v: 'q_visits' }), await config())
+
+  // 连好上游就自动带出输入：查询节点连到合并查询时加一行，别名按主表起、重名加序号；不是查询节点的不加；和连线同一步撤销
+  const mid = await S(page, () => {
+    window.__studio.getState().addNode('merge', { x: 640, y: 620 })
+    return window.__studio.getState().selectedId
+  })
+  const connect = (source, target) => S(page, ([a, b]) => window.__studio.getState().onConnect({ source: a, target: b, sourceHandle: 'out', targetHandle: null }), [source, target])
+  const inputsOf = (id) => S(page, (x) => JSON.stringify(window.__studio.getState().nodes.find((n) => n.id === x)?.data.config.inputs ?? {}), id)
+  await connect('q_sales', mid)
+  await connect('q_visits', mid)
+  await connect('think', mid)
+  check('连线即带出输入：两个查询节点各一行，别名按主表起（orders、visits）；模型调用不加', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', visits: 'q_visits' }),
+    await inputsOf(mid))
+  await S(page, () => window.__studio.getState().undo())
+  await S(page, () => window.__studio.getState().undo())
+  check('……撤销连线时这一行一起退回', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales' })
+    && !(await S(page, (x) => window.__studio.getState().edges.some((e) => e.source === 'q_visits' && e.target === x), mid)), await inputsOf(mid))
+  const t1 = await S(page, () => {
+    const st = window.__studio.getState()
+    st.addNode('tool', { x: 300, y: 620 })
+    const id = window.__studio.getState().selectedId
+    window.__studio.getState().updateNode(id, { config: { tool: 'db_query__shop', args: { sql: 'SELECT COUNT(*) AS n FROM shop.orders WHERE status = 1' } } })
+    return id
+  })
+  await connect(t1, mid)
+  check('……主表重名时加序号（orders_2）', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1 }), await inputsOf(mid))
+  // 连线时还没选工具：不加；选上工具后检查器给「带出连着的 1 个查询节点」，一次补齐
+  const t2 = await S(page, () => {
+    window.__studio.getState().addNode('tool', { x: 300, y: 780 })
+    return window.__studio.getState().selectedId
+  })
+  await connect(t2, mid)
+  check('……连线时还没选数据库查询工具：先不加', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1 }))
+  await S(page, (id) => window.__studio.getState().updateNode(id, { config: { tool: 'db_query__members', args: { sql: '-- 会员卡\nSELECT COUNT(*) AS n FROM "member_cards"' } } }), t2)
+  await S(page, (id) => window.__studio.getState().select(id), mid)
+  const bring = page.locator('[data-inspector-sheet] [data-merge-add-connected]')
+  await bring.waitFor({ timeout: 3000 }).catch(() => {})
+  check('……选上工具后，检查器给「带出连着的 1 个查询节点」', (await bring.innerText().catch(() => '')).includes('带出连着的 1 个查询节点'))
+  await bring.click()
+  await page.waitForTimeout(150)
+  check('……一次补齐，别名按主表起（去掉注释和引号）', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1, member_cards: t2 })
+    && await bring.count() === 0, await inputsOf(mid))
+  const midBox = page.locator('[data-inspector-sheet] [data-field="inputs"]')
+  await midBox.locator('input.mono').nth(1).fill('sales_valid')
+  await page.waitForTimeout(150)
+  check('……自动起的别名照样可以改', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', sales_valid: t1, member_cards: t2 }), await inputsOf(mid))
+  await S(page, () => window.__studio.getState().select('merge'))
+  await page.waitForSelector('[data-inspector-sheet] [data-field="inputs"]', { timeout: 4000 }).catch(() => {})
 
   await S(page, () => window.__studio.getState().select(null))
   await page.waitForTimeout(200)
