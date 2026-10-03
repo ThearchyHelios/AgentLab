@@ -25,7 +25,7 @@ import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
   relationDraft, relationPath, relationRemoval, tablePath, unknownKeys, validateForm,
 } from './model'
-import type { ColumnField, EditForm, RelationDraft, TableField, TableKey } from './model'
+import type { CodesItem, ColumnField, EditForm, RelationDraft, TableField, TableKey } from './model'
 
 // ===========================================================================
 // 单表详情：表级各项、列表格、关联关系。每一项标出来源和状态，点状态标识做单项确认 / 驳回 / 恢复（审阅接口）；
@@ -182,15 +182,16 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
   const fillCodesOf = useCallback((col: string) => setCodesFor(col), [])
 
   /**
-   * 填好的码值含义整份提交：只换这一列码值的值，服务端记为人工填写、已确认。别人刚改过（409）时收起弹窗、挂冲突横幅；
+   * 填好的码值含义（和「已列出全部取值」）整份提交：只换这一列码值的值，服务端记为人工填写、已确认。别人刚改过（409）时收起弹窗、挂冲突横幅；
    * 其余失败弹窗留着，填的字不丢
    */
-  const saveCodes = useCallback(async (col: string, value: Record<string, string>) => {
+  const saveCodes = useCallback(async (col: string, value: Record<string, string>, complete: boolean) => {
     const d = detailRef.current
     const item = d?.notes.columns?.[col]?.codes
     if (!d || !item) return
     const notes = structuredClone(d.notes)
-    notes.columns![col] = { ...notes.columns![col], codes: { ...item, value } }
+    // 「已列出全部取值」跟着交：取消勾选交 false（服务端不留这个键），只改勾选也算人工改动
+    notes.columns![col] = { ...notes.columns![col], codes: { ...item, value, complete } as CodesItem }
     setBusy(`codes:${col}`)
     setWriteError(null)
     try {
@@ -216,6 +217,9 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
 
   const setColumn = useCallback((col: string, f: ColumnField, v: string) => {
     setEdit((e) => e && ({ ...e, form: { ...e.form, columns: { ...e.form.columns, [col]: { ...e.form.columns[col], [f]: v } } } }))
+  }, [])
+  const setCodesComplete = useCallback((col: string, v: boolean) => {
+    setEdit((e) => e && ({ ...e, form: { ...e.form, columns: { ...e.form.columns, [col]: { ...e.form.columns[col], complete: v } } } }))
   }, [])
   const setTable = (k: TableKey, v: string) => setEdit((e) => e && ({ ...e, form: { ...e.form, table: { ...e.form.table, [k]: v } } }))
   const setRelations = (fn: (rs: RelationDraft[]) => RelationDraft[]) =>
@@ -419,7 +423,8 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
               ? (
                 <ColumnTable columns={shownColumns} form={edit?.form.columns ?? null} initial={edit?.initial.columns ?? null}
                              problems={problems} busy={!!busy} systemNotes={detail.system_notes}
-                             onReview={review} onConfirmColumn={confirmColumn} onFillCodes={fillCodesOf} onChange={setColumn} />
+                             onReview={review} onConfirmColumn={confirmColumn} onFillCodes={fillCodesOf} onChange={setColumn}
+                             onCodesComplete={setCodesComplete} />
               )
               : <p className="rounded-lg border px-3 py-6 text-center text-xs text-faint">{CT.noColumns}</p>}
           </section>
@@ -447,7 +452,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
 
       {codesFor && notes.columns?.[codesFor]?.codes && (
         <CodesDialog column={codesFor} item={notes.columns[codesFor]!.codes!} saving={busy === `codes:${codesFor}`}
-                     onSave={(v) => void saveCodes(codesFor, v)} onClose={() => setCodesFor(null)} />
+                     onSave={(v, complete) => void saveCodes(codesFor, v, complete)} onClose={() => setCodesFor(null)} />
       )}
 
       {edit && (

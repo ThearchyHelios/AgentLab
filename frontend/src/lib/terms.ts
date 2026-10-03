@@ -2465,6 +2465,11 @@ export const CODES_TEXT = {
   saved: (n: number) => (n ? `已填写 ${formatNumber(n)} 个码值的含义` : '已保存'),
   save: '保存',
   cancel: '取消',
+  // 「已列出全部取值」：只有勾了的码值表，SQL 检查才提醒「码值不在码值表中」；只列了一部分（比如对话里只补了一个码）不勾
+  complete: '已列出全部取值',
+  completeHint: '勾选表示这一列只会出现这些取值，SQL 检查会据此提醒码值表中没有的取值；只列了一部分时不要勾选',
+  completeMark: '已列全',
+  completeMarkHint: '已列出全部取值：SQL 检查会提醒码值表中没有的取值',
 }
 
 // ===========================================================================
@@ -2492,7 +2497,7 @@ export const SQL_CHECK_RULE_HINT: Record<SqlCheckCode, string> = {
   join_unconfirmed: '关联条件对不上数据目录中有确证的关系，可能连错了列',
   ratio_aggregated: '对比率列直接求和或求平均，得不到正确的比率',
   missing_valid_filter: '表定义了有效记录条件，查询没有按它筛选',
-  unknown_code: '按码值筛选时用了码值表中没有的值',
+  unknown_code: '码值表已列出全部取值，按码值筛选时却用了其中没有的值',
   wrong_date_column: '表定义了业务日期，查询却按另一个时间列分组或筛选',
 }
 

@@ -955,6 +955,11 @@ await section('数据目录 · 编辑即确认', async () => {
   check('码值格式不对：就地写第几行、底部写几处格式不正确、不能保存', (await page.locator('[data-column="status"] [role="alert"]').innerText()) === '第 3 行应写成「码值=含义」'
         && (await page.locator('[data-catalog-problems]').innerText()).includes('1 处格式不正确') && await page.locator('[data-catalog-save]').isDisabled())
   await codes.fill('1=已入园\n2=已退票\n9=已作废')
+  const complete = page.locator('[data-column="status"] [data-input="codes-complete"]')
+  check('码值下有「已列出全部取值」：原来没标的不勾，没有码值的列勾不了', !(await complete.isChecked())
+        && (await page.locator('[data-column="status"] [data-cell="codes"]').innerText()).includes('已列出全部取值')
+        && await page.locator('[data-column="visitor_count"] [data-input="codes-complete"]').isDisabled())
+  await complete.check()
   await page.locator('[data-column="visitor_count"] [data-input="unit"]').fill('人次')
   await page.locator('[data-add-relation]').click()
   const draft = page.locator('[data-relation-draft^="new-"]')
@@ -981,10 +986,10 @@ await section('数据目录 · 编辑即确认', async () => {
         && await parkDraft.locator('[data-input="columns"]').isDisabled() && await parkDraft.locator('[data-relation-undo-reject]').count() === 1)
   await parkDraft.locator('[data-relation-undo-reject]').click()
   check('……撤销驳回：回到原样，不算修改', (await parkDraft.getAttribute('data-rejecting')) === null
-        && (await page.locator('[data-catalog-changes]').innerText()) === '6 处修改', await page.locator('[data-catalog-changes]').innerText())
+        && (await page.locator('[data-catalog-changes]').innerText()) === '7 处修改', await page.locator('[data-catalog-changes]').innerText())
   await page.locator(`[data-relation-draft="${GATE}"] [data-relation-reject]`).click()
   await shot(page, 'catalog-edit')
-  check('保存栏写「7 处修改」（驳回一条关系也算一处）', (await page.locator('[data-catalog-changes]').innerText()) === '7 处修改', await page.locator('[data-catalog-changes]').innerText())
+  check('保存栏写「8 处修改」（勾「已列出全部取值」、驳回一条关系各算一处）', (await page.locator('[data-catalog-changes]').innerText()) === '8 处修改', await page.locator('[data-catalog-changes]').innerText())
   await page.locator('[data-catalog-save]').click()
   await until(async () => count(sent, /^PUT /) === 1)
   const body = lastBody(sent, /^PUT /)
@@ -994,6 +999,7 @@ await section('数据目录 · 编辑即确认', async () => {
   check('……改过的项交新值：中文名、业务主键、码值、单位', n.label?.value === '入园流水' && JSON.stringify(n.keys?.value) === '["ticket_no","park_id"]'
         && JSON.stringify(n.columns?.status?.codes?.value) === JSON.stringify({ 1: '已入园', 2: '已退票', 9: '已作废' })
         && n.columns?.visitor_count?.unit?.value === '人次', JSON.stringify({ label: n.label, keys: n.keys }))
+  check('……码值带上「已列出全部取值」', n.columns?.status?.codes?.complete === true, JSON.stringify(n.columns?.status?.codes))
   check('……清空的粒度不交（服务端删掉这一项）', !('grain' in n))
   check('……没动的项原样交回：来源、状态都不变（被驳回的照旧驳回）', JSON.stringify(n.dedup) === JSON.stringify(old.dedup)
         && JSON.stringify(n.description) === JSON.stringify(old.description) && JSON.stringify(n.columns?.park_id) === JSON.stringify(old.columns.park_id))
@@ -1005,6 +1011,8 @@ await section('数据目录 · 编辑即确认', async () => {
   check('保存后退出编辑，改过的项显示「已确认 · 人工填写」', await until(async () => (await detail(page).getAttribute('data-editing')) === 'false')
         && await markStatus(page, 'label') === 'confirmed' && (await page.locator('[data-field="label"]').innerText()).includes('人工填写'))
   check('……驳回的关系在列表里划掉、标已驳回', (await page.locator(`[data-relation="${GATE}"]`).getAttribute('data-status')) === 'rejected')
+  check('……码值标「已列全」', await page.locator('[data-column="status"] [data-codes-complete-mark]').count() === 1
+        && (await page.locator('[data-column="status"] [data-codes-complete-mark]').innerText()).includes('已列全'))
   check('……清单上的中文名跟着变', await until(async () => (await page.locator('[data-catalog-row="visits"] [data-row-label]').innerText()) === '入园流水'))
   check('……提示已保存', await until(async () => (await page.locator('body').innerText()).includes('已保存，改动过的项已记为人工确认')))
 
@@ -1173,6 +1181,8 @@ function profileReply(state, { ms = 0 } = {}) {
       note: `数据剖析（${PROFILE_DAY}）：抽样覆盖率 62%，可能不是这条关系；子表抽样 200 个不同键值，父表对上 124 个；被指向列是主键。` }))
     notes.columns.status.codes = item({ 1: '已入园', 9: '已作废', 2: '' }, 'profile', 'proposed')
     notes.columns.status.codes.note = `数据剖析（${PROFILE_DAY}）：统计全表，182000 行非空值共 3 个取值：1（94%）、9（5%）、2（1%）。`
+    // 统计的是全表：服务端给码值候选标「已列全」
+    notes.columns.status.codes.complete = true
     writeEntry(visits, notes)
     const tables = [
       {
@@ -1415,6 +1425,11 @@ await section('数据目录 · 数据剖析', async () => {
         && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-code') === '2')))
   check('……写明剖析说明（各取值的占比）', (await codesBox.innerText()).includes('1（94%）、9（5%）、2（1%）'))
   check('……没填时保存禁用', await page.locator('[data-codes-save]').isDisabled())
+  check('……写明当前已列出全部取值（剖析统计了全表），可以取消', await codesBox.locator('[data-codes-complete]').isChecked()
+        && (await codesBox.innerText()).includes('已列出全部取值') && (await statusCodes.locator('[data-codes-complete-mark]').count()) === 1)
+  await codesBox.locator('[data-codes-complete]').uncheck()
+  check('……只改勾选也能保存', !(await page.locator('[data-codes-save]').isDisabled()))
+  await codesBox.locator('[data-codes-complete]').check()
   await codesBox.locator('input[data-code="2"]').fill('已退票')
   if (SHOTS) await sleep(350)
   await shot(page, 'catalog-codes-fill')
@@ -1422,6 +1437,7 @@ await section('数据目录 · 数据剖析', async () => {
   await page.keyboard.press('Enter')
   check('回车保存：整份提交，只换这一列码值的含义，带读到的版本', await until(async () => (await codesBox.count()) === 0)
         && JSON.stringify(lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status?.codes?.value) === JSON.stringify({ 1: '已入园', 9: '已作废', 2: '已退票' })
+        && lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status?.codes?.complete === true
         && lastBody(sent, /^PUT .*catalog\/visits$/)?.if_version === v1, JSON.stringify(lastBody(sent, /^PUT .*catalog\/visits$/)?.notes?.columns?.status))
   check('……保存后不再有「含义待填写」，这一项记为人工确认', await until(async () => (await statusCodes.locator('[data-code-pending]').count()) === 0)
         && (await statusCodes.innerText()).includes('已退票') && (await markStatus(page, 'columns.status.codes')) === 'confirmed')

@@ -528,12 +528,14 @@ class _RelationOutcome:
 
 @dataclass
 class _CodesOutcome:
-    """一列的取值分布：[(码值, 行数)]，按行数从多到少。"""
+    """一列的取值分布：[(码值, 行数)]，按行数从多到少。complete：看的是全表（没有只看前若干行），取到的就是
+    这一列的全部取值，码值项标「已列全」，SQL 检查才拿它判断某个值「不在码值表里」。"""
 
     column: str
     values: list[tuple[str, int]]
     rows: int
     note: str
+    complete: bool = False
 
 
 @dataclass
@@ -874,7 +876,7 @@ async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome
     scope = f"按前 {scan_cap} 行统计" if scan_cap else "统计全表"
     spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
     note = f"{NOTE_PREFIX}{cx.day}）：{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
-    out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note))
+    out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note, complete=scan_cap is None))
 
 
 def _is_date_column(col: dict[str, Any]) -> bool:
@@ -980,7 +982,8 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
     - 没被确认、驳回的关系：记为 source=profile，覆盖率够、父键唯一的 verified，否则 proposed；按 merge_notes
       的规则并入（剖析顶得掉命名推断、模型起草，顶不掉外键和人工）。
     - 人工确认过的关系：只补覆盖率和基数（_patch_confirmed）。
-    - 码值候选：profile / proposed，含义沿用别的来源写过的（_codes_value）；人工确认、驳回过的码值不碰。
+    - 码值候选：profile / proposed，含义沿用别的来源写过的（_codes_value）；整表统计得到的标「已列全」，只看了
+      前若干行的不标；人工确认、驳回过的码值不碰。
     - 业务日期：只有一个日期类列时提议，profile / proposed；已有别的来源定的业务日期不顶掉。
     - covered={"profile"}：这次完整检查过、却没再得出的剖析结论删掉（比如取值变多、不再像码值的列，列被遮罩
       之后它的码值）；没查成的检查（超时、预算用完……）把剖析以前写的结论原样带上，不因为这次没查成就删。
@@ -1015,7 +1018,8 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
         item = (described.get(c.column) or {}).get("codes") if isinstance(described.get(c.column), dict) else None
         if isinstance(item, dict) and item.get("status") in ("confirmed", "rejected"):
             continue
-        columns[c.column] = {"codes": catalog.make_item(_codes_value(c, item), "profile", "proposed", note=c.note)}
+        columns[c.column] = {"codes": catalog.make_item(_codes_value(c, item), "profile", "proposed", note=c.note,
+                                                        complete=c.complete)}
         findings.append(_codes_finding(c, columns[c.column]["codes"]["value"]))
     for column in out.keep_codes:
         item = (described.get(column) or {}).get("codes") if isinstance(described.get(column), dict) else None

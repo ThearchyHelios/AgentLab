@@ -12,7 +12,7 @@
 - join_unconfirmed：关联条件对不上目录里的任何关系；
 - ratio_aggregated：对比率列直接求和或求平均；
 - missing_valid_filter：表定义了有效记录条件，查询完全没涉及条件里的列；
-- unknown_code：对有码值的列写了 = 或 IN，值不在码值表里；
+- unknown_code：对码值表标了「已列全」的列写了 = 或 IN，值不在码值表里（只补了一部分的码值表不拿来判断）；
 - wrong_date_column：表定义了业务日期，查询却按这张表的另一个时间列分组或筛选。
 
 **级别看依据。** 依据全是 confirmed / verified（人工确认、外键约束、数据剖析）时，fanout_sum、stock_summed 是 error，
@@ -882,7 +882,9 @@ class _ScopeCheck:
                 ref = self.resolve(column)
                 item = ref[0].column_item(ref[1], "codes") if ref else None
                 codes = item.get("value") if item else None
-                if not isinstance(codes, Mapping) or not codes:
+                # 只有标了「已列全」的码值表才能说某个值「不在里面」：经对话只补了 status=9 表示作废，之后 status = 1
+                # 就会被报，模型还会照着改错。没标的码值表只是已知的一部分，不判（宁可漏报）
+                if not isinstance(codes, Mapping) or not codes or not catalog.codes_complete(item):
                     continue
                 for value in values:
                     literal = _literal(value)
@@ -898,14 +900,16 @@ class _ScopeCheck:
             shown = "、".join(f"{k}={v}" for k, v in list(codes.items())[:10]) + ("等" if len(codes) > 10 else "")
             told = "、".join(f"「{v}」" for v in values[:5])
             listed = "、".join(f"{k}（{v}）" for k, v in list(codes.items())[:10])
-            hint = f"；拿不准就先用 db_schema__{self.checker.source_name} 查这张表的码值" if self.checker.source_name else ""
+            hint = f"，或者用 db_schema__{self.checker.source_name} 看这张表的码值说明" if self.checker.source_name else ""
+            # 给模型的话只叫它核对，不叫它「照目录改」：码值表也可能漏了某个取值，照改会把本来对的 SQL 改错
             out.append(SqlCheck(
                 code="unknown_code", level=_level("unknown_code", [item.get("status")]), table=table.name,
                 column=column, sql_excerpt=self.excerpt(node),
-                message=(f"「{table.label()}」的「{table.column_label(column)}」没有码值{told}（已知码值：{shown}）。"
-                         "请按数据目录中的码值修改筛选条件"),
-                for_model=(f"{table.name}.{column} 的码值只有 {listed}，SQL 里写的 {'、'.join(values[:5])} 不在其中。"
-                           f"照目录里的码值改{hint}")))
+                message=(f"「{table.label()}」的「{table.column_label(column)}」没有码值{told}（数据目录中已列出的全部码值："
+                         f"{shown}）。请核对筛选条件里的取值"),
+                for_model=(f"{table.name}.{column} 的码值表已列全，只有 {listed}，SQL 里写的 {'、'.join(values[:5])} "
+                           f"不在其中。核对这个取值有没有写错（比如写成了含义、别的列的取值，或者类型不对）；拿不准就先查一下"
+                           f"这一列实际有哪些取值{hint}。确认取值存在就保留原写法，并在结果说明里写明数据目录的码值表可能缺了它")))
         return out
 
     # ---- wrong_date_column

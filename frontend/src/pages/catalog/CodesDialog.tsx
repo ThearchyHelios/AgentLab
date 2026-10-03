@@ -3,28 +3,32 @@ import type { CatalogItem } from '../../types'
 import { isComposing, Modal, Spinner } from '../../components/ui'
 import { CODES_TEXT as KT } from '../../lib/terms'
 import { StatusChip } from './parts'
+import { codesComplete } from './model'
 
 // ===========================================================================
 // 填写码值的含义。数据剖析只知道列里出现过哪些取值（码值候选的含义是空串），含义要人填：逐个码值一个输入框，
 // 比在编辑模式里改「码值=含义」的多行文字省事。保存走整份提交，这一项记为人工填写、已确认；
 // 暂不清楚的含义可以留空，表格里照旧显示「含义待填写」。
+// 底下的「已列出全部取值」写明当前是否已列全，可以勾选或取消：只有勾了的码值表，SQL 检查才会提醒「取值不在码值表中」。
 // ===========================================================================
 
 export function CodesDialog({ column, item, saving, onSave, onClose }: {
   column: string
   item: CatalogItem<Record<string, string>>
   saving: boolean
-  /** 新的码值对照（码值不变，只改含义） */
-  onSave: (value: Record<string, string>) => void
+  /** 新的码值对照（码值不变，只改含义）和「已列出全部取值」 */
+  onSave: (value: Record<string, string>, complete: boolean) => void
   onClose: () => void
 }) {
   const [initial] = useState(() => ({ ...item.value }))
   const [value, setValue] = useState<Record<string, string>>(initial)
+  const [wasComplete] = useState(() => codesComplete(item))
+  const [complete, setComplete] = useState(wasComplete)
   const codes = Object.keys(initial)
-  const dirty = codes.some((k) => (value[k] ?? '').trim() !== (initial[k] ?? '').trim())
+  const dirty = complete !== wasComplete || codes.some((k) => (value[k] ?? '').trim() !== (initial[k] ?? '').trim())
   const save = () => {
     if (!dirty || saving) return
-    onSave(Object.fromEntries(codes.map((k) => [k, (value[k] ?? '').trim()])))
+    onSave(Object.fromEntries(codes.map((k) => [k, (value[k] ?? '').trim()])), complete)
   }
   return (
     <Modal open onClose={onClose} dirty={dirty} width={520} title={KT.title(column)}
@@ -72,6 +76,13 @@ export function CodesDialog({ column, item, saving, onSave, onClose }: {
             </tbody>
           </table>
         </div>
+        <label className="flex items-start gap-2 rounded border bg-bg px-2 py-1.5 text-xs" data-codes-complete-field={complete ? 'true' : 'false'}>
+          <input type="checkbox" className="mt-[3px]" checked={complete} onChange={(e) => setComplete(e.target.checked)} data-codes-complete="" />
+          <span className="min-w-0">
+            <span className="font-medium">{KT.complete}</span>
+            <span className="block text-2xs leading-relaxed text-faint">{KT.completeHint}</span>
+          </span>
+        </label>
         <p className="text-2xs leading-relaxed text-faint">{KT.hint}</p>
       </div>
     </Modal>

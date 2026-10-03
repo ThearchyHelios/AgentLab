@@ -24,6 +24,11 @@ def _item(value: Any, status: str) -> dict[str, Any]:
     return make_item(value, _SOURCE_OF[status], status)
 
 
+def _codes(value: dict[str, str], status: str) -> dict[str, Any]:
+    """码值项，标了「已列全」：码值不在码值表中的检查只认这样的码值表。"""
+    return make_item(value, _SOURCE_OF[status], status, complete=True)
+
+
 def _rel(table: str, columns: list[str], to_table: str, to_columns: list[str], cardinality: str,
          status: str) -> dict[str, Any]:
     source = {"confirmed": "human", "verified": "fk"}.get(status, "name")
@@ -51,7 +56,7 @@ def notes(status: str = "confirmed", override: dict[tuple[str, str], str] | None
                 "total_amount": {"label": _item("订单金额", "confirmed"), "unit": _item("元", s),
                                  "measure": _item("flow", s)},
                 "status": {"label": _item("订单状态", "confirmed"), "measure": _item("status", s),
-                           "codes": _item({"1": "已支付", "2": "已退款"}, s)},
+                           "codes": _codes({"1": "已支付", "2": "已退款"}, s)},
                 "ordered_at": {"label": _item("下单时间", "confirmed")},
             },
         },
@@ -72,7 +77,7 @@ def notes(status: str = "confirmed", override: dict[tuple[str, str], str] | None
             "valid_filter": _item("status = 1", s),
             "columns": {
                 "visitor_count": {"label": _item("入园人数", "confirmed"), "measure": _item("flow", s)},
-                "status": {"label": _item("检票状态", "confirmed"), "codes": _item({"1": "有效", "0": "作废"}, s)},
+                "status": {"label": _item("检票状态", "confirmed"), "codes": _codes({"1": "有效", "0": "作废"}, s)},
                 "visit_time": {"label": _item("检票时间", "confirmed")},
             },
             "relations": [_rel("visits", ["park_id"], "parks", ["id"], "many_to_one", s)],
@@ -102,8 +107,8 @@ def notes(status: str = "confirmed", override: dict[tuple[str, str], str] | None
         "channels": {
             "label": _item("渠道", "confirmed"),
             "columns": {"channel_type": {"label": _item("渠道类型", "confirmed"),
-                                         "codes": _item({"线上直销": "官网和小程序", "线下": "窗口售票",
-                                                         "分销": "旅行社和第三方平台"}, s)}},
+                                         "codes": _codes({"线上直销": "官网和小程序", "线下": "窗口售票",
+                                                          "分销": "旅行社和第三方平台"}, s)}},
         },
     }
     for (table, path), wanted in (override or {}).items():

@@ -252,3 +252,93 @@ def test_relation_graph_keeps_structure_relations_of_partially_annotated_tables(
     assert edges == {"gates"}
 
 
+# ==========================================================================
+# A4：码值「已列全」
+# ==========================================================================
+
+
+def _codes(value: dict, *, complete: bool | None, status: str = "confirmed") -> dict:
+    item = catalog.make_item(value, "human" if status == "confirmed" else "profile", status)
+    if complete is not None:
+        item["complete"] = complete
+    return item
+
+
+async def test_unknown_code_only_for_codes_marked_complete(scenic_db):
+    cache = await _schema(scenic_db)
+    sql = "SELECT COUNT(*) FROM visits WHERE status = 3"
+
+    def found(item: dict) -> list[str]:
+        notes = scenic_notes.notes()
+        notes["visits"]["columns"]["status"]["codes"] = item
+        checker = sqlcheck.SqlChecker(kind="sqlite", schema_cache=cache, notes=notes, source_name="scenic")
+        return [c.code for c in checker.check(sql)]
+
+    assert "unknown_code" not in found(_codes({"1": "有效", "0": "作废"}, complete=None))
+    assert "unknown_code" in found(_codes({"1": "有效", "0": "作废"}, complete=True))
+
+
+async def test_partial_codes_from_a_patch_are_not_treated_as_the_full_list(client, make_source, scenic_db):
+    """审查探针 A4：经提案只写了 status=9 表示作废，之后 status = 1 不该被报「码值不在码值表中」。"""
+    sid = await make_source(scenic_db, draft=["orders"])
+    detail = await _notes(client, sid, "orders")
+    r = await client.post(f"/api/datasources/{sid}/catalog/orders/patch", json={
+        "changes": [{"path": "columns.status.codes", "value": {"9": "作废"}}], "if_version": detail["version"]})
+    assert r.status_code == 200, r.text
+    codes = r.json()["notes"]["columns"]["status"]["codes"]
+    assert codes["value"] == {"9": "作废"} and "complete" not in codes
+    sql = "SELECT COUNT(*) FROM orders WHERE status = 1"
+    assert not any(c[0] == "unknown_code" for c in await _found(sid, sql))
+
+    # 人工在目录页把码值补全，并勾上「已列出全部取值」：这时才报
+    notes = r.json()["notes"]
+    notes["columns"]["status"]["codes"] = {**codes, "value": {"1": "已支付", "2": "已退款", "9": "作废"},
+                                           "complete": True}
+    r = await _put(client, sid, "orders", notes, r.json()["version"])
+    assert r.status_code == 200, r.text
+    saved = r.json()["notes"]["columns"]["status"]["codes"]
+    assert (saved["source"], saved["status"], saved.get("complete")) == ("human", "confirmed", True)
+    assert not any(c[0] == "unknown_code" for c in await _found(sid, sql))
+    checker = await _checker(sid)
+    [check] = [c for c in checker.check("SELECT COUNT(*) FROM orders WHERE status = 5") if c.code == "unknown_code"]
+    assert check.level == "warning"
+    # 给模型的话：提示核对取值，不叫它「照目录里的码值改」
+    assert "照目录里的码值改" not in check.for_model and "核对" in check.for_model
+
+
+def test_codes_complete_flag_is_validated_and_counts_as_an_edit():
+    base = {"columns": {"status": {"codes": _codes({"1": "", "0": ""}, complete=None, status="proposed")}}}
+    assert catalog.validate_notes(base) == []
+    assert catalog.validate_notes({"columns": {"status": {"codes": _codes({"1": "有效"}, complete=True)}}}) == []
+    bad = catalog.validate_notes({"columns": {"status": {"codes": {**_codes({"1": "有效"}, complete=None),
+                                                                   "complete": "是"}}}})
+    assert bad and "码值" in bad[0]
+    wrong_place = catalog.validate_notes({"label": {**catalog.make_item("入园记录", "human"), "complete": True}})
+    assert wrong_place and "complete" in wrong_place[0]
+
+    # 值没动、只勾上「已列全」：算人工改动，记为人工填写、已确认
+    ticked = {"columns": {"status": {"codes": {**base["columns"]["status"]["codes"], "complete": True}}}}
+    out = catalog.apply_human_edit(base, ticked, table="visits", at=AT)
+    codes = out["columns"]["status"]["codes"]
+    assert (codes["source"], codes["status"], codes["complete"]) == ("human", "confirmed", True)
+    # 取消勾选：不留 complete: false，和没有这个标记写法一样
+    unticked = {"columns": {"status": {"codes": {**codes, "complete": False}}}}
+    out = catalog.apply_human_edit(out, unticked, table="visits", at=AT)
+    assert "complete" not in out["columns"]["status"]["codes"]
+
+
+async def test_profile_marks_codes_complete_only_when_the_whole_table_was_read(client, make_source, scenic_db):
+    whole = await make_source(scenic_db, options=_on(), draft=["visits"])
+    r = await client.post(_url(whole), json={"tables": ["visits"]})
+    assert r.status_code == 200, r.text
+    codes = (await _notes(client, whole, "visits"))["notes"]["columns"]["status"]["codes"]
+    assert "统计全表" in codes["note"] and codes.get("complete") is True
+
+    # 不做整表统计（只看前若干行）：取值可能没看全，不标
+    capped = await make_source(scenic_db, options=_on(max_scan_rows=0, sample_size=10), draft=["visits"])
+    r = await client.post(_url(capped), json={"tables": ["visits"]})
+    assert r.status_code == 200, r.text
+    codes = (await _notes(client, capped, "visits"))["notes"]["columns"]["status"]["codes"]
+    assert "按前 10 行统计" in codes["note"] and "complete" not in codes
+
+

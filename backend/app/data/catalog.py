@@ -15,7 +15,8 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
      "valid_filter": 项(str，SQL 条件片段), "dedup": 项(str),
      "columns": {列名: {"label": 项, "meaning": 项, "unit": 项,
                        "measure": 项("flow"|"stock"|"ratio"|"identifier"|"status"|"attribute"),
-                       "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写)}},
+                       "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写；项上可带 complete: true，
+                                  表示已列出全部取值)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
                     "source", "status", "note"?}]}
 
@@ -81,6 +82,9 @@ COLUMN_FIELD_LABEL = {"label": "中文名", "meaning": "含义", "unit": "单位
 _INITIAL_STATUS = {"fk": "verified", "human": "confirmed"}
 
 _ITEM_KEYS = frozenset({"value", "source", "status", "note", "updated_at"})
+#: 码值项另有一个「已列全」标记（complete: true）：码值表列出了这一列的全部取值。只有人工明确确认、或者数据剖析
+#: 没截断地看完了全表取值时才有；没有它的码值表只是「已知的一部分」，SQL 检查不能拿它判断某个值「不在码值表里」
+_CODES_ITEM_KEYS = _ITEM_KEYS | {"complete"}
 _RELATION_KEYS = frozenset({"id", "columns", "to_table", "to_columns", "cardinality", "coverage", "source",
                             "status", "note", "updated_at"})
 _BUSINESS_DATE_KEYS = frozenset({"column", "rule", "timezone"})
@@ -127,14 +131,22 @@ def unreviewed_status(item: Mapping[str, Any]) -> str:
 
 
 def make_item(value: Any, source: str, status: str | None = None, *, note: str | None = None,
-              at: str | None = None) -> dict[str, Any]:
-    """构造一个项。status 不给时按来源取初始状态（initial_status）。"""
+              at: str | None = None, complete: bool = False) -> dict[str, Any]:
+    """构造一个项。status 不给时按来源取初始状态（initial_status）。complete 只用于码值项（已列出全部取值），
+    为假时不写这个键：没有标记和标记为否是一回事，写法统一，冻结进快照的哈希才稳定。"""
     out: dict[str, Any] = {"value": value, "source": source, "status": status or initial_status(source)}
     if note:
         out["note"] = note
     if at:
         out["updated_at"] = at
+    if complete:
+        out["complete"] = True
     return out
+
+
+def codes_complete(item: Any) -> bool:
+    """码值项是不是标了「已列全」。"""
+    return isinstance(item, Mapping) and item.get("complete") is True
 
 
 # ==========================================================================
@@ -220,12 +232,15 @@ _COLUMN_VALUE_RULES: dict[str, tuple[Any, str]] = {
 }
 
 
-def _item_problems(where: str, item: Any, rule: tuple[Any, str]) -> list[str]:
+def _item_problems(where: str, item: Any, rule: tuple[Any, str], *,
+                   keys: frozenset[str] = _ITEM_KEYS) -> list[str]:
     if not isinstance(item, dict) or not {"value", "source", "status"} <= set(item):
         return [f"{where}不是有效的目录项：需要值、来源和状态"]
     problems: list[str] = []
-    if extra := sorted(set(item) - _ITEM_KEYS):
+    if extra := sorted(set(item) - keys):
         problems.append(f"{where}含有不认识的字段「{'、'.join(extra)}」")
+    if "complete" in item and not isinstance(item["complete"], bool):
+        problems.append(f"{where}是否已列出全部取值应为是或否")
     if item["source"] not in ITEM_SOURCES:
         problems.append(f"{where}的来源「{item['source']}」不在可选值内")
     if item["status"] not in ITEM_STATUSES:
@@ -309,7 +324,8 @@ def validate_notes(notes: Any) -> list[str]:
         for field_name in COLUMN_FIELDS:
             if field_name in items:
                 problems += _item_problems(f"列 {col} 的{COLUMN_FIELD_LABEL[field_name]}", items[field_name],
-                                           _COLUMN_VALUE_RULES[field_name])
+                                           _COLUMN_VALUE_RULES[field_name],
+                                           keys=_CODES_ITEM_KEYS if field_name == "codes" else _ITEM_KEYS)
     relations = notes.get("relations", [])
     if not isinstance(relations, list):
         problems.append("关联关系应为列表")
@@ -481,6 +497,14 @@ def _value_of(key: Slot, item: Mapping[str, Any]) -> Any:
     return item.get("value")
 
 
+def _edit_value(key: Slot, item: Mapping[str, Any]) -> Any:
+    """人工编辑时比较「改没改」看的部分：值，码值另加「已列全」标记——只勾上这个标记也是人工改动（记为人工填写、
+    已确认），检查据此认定码值表是完整的。"""
+    if key[0] == "c" and key[2] == "codes":
+        return item.get("value"), codes_complete(item)
+    return _value_of(key, item)
+
+
 def _core(item: Mapping[str, Any]) -> dict[str, Any]:
     """去掉修改时间的项：判断起草结果和已有的是不是一回事。"""
     return {k: v for k, v in item.items() if k != "updated_at"}
@@ -630,6 +654,8 @@ def _normalize_submitted(submitted: Mapping[str, Any], table: str) -> dict[str, 
         if isinstance(item, dict) and "value" in item:
             item.setdefault("source", "human")
             item.setdefault("status", "confirmed")
+            if item.get("complete") is False:
+                del item["complete"]          # 「没列全」就是没有这个标记，写法统一（make_item）
 
     for name in TABLE_FIELDS:
         fill(out.get(name))
@@ -657,7 +683,7 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     """人工提交的整份目录 → 要写入的目录（不改入参）。
 
     - 值改过的项、新填的项：记为 human / confirmed。提交里写的来源和状态不作数——客户端不能冒充外键约束
-      或数据剖析。
+      或数据剖析。码值的「已列全」标记跟着值走：只勾上或取消它也算改过（_edit_value）。
     - 值没动的项：保持原来的来源和状态；提交里把状态改成确认、驳回或来源的初始状态的，照改（等同单项审阅）；
       改成别的状态的不认（不能把推断改成「有确证」）。
     - 已有、但提交里没有的表级项、列级项：删掉。
@@ -681,7 +707,7 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     out: dict[Slot, dict[str, Any]] = {}
     for key, item in new.items():
         prev = old.get(key)
-        if prev is None or _value_of(key, item) != _value_of(key, prev):
+        if prev is None or _edit_value(key, item) != _edit_value(key, prev):
             fresh = {k: v for k, v in item.items() if k != "updated_at"}
             fresh.update(source="human", status="confirmed", updated_at=at)
             out[key] = fresh
@@ -1015,7 +1041,11 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
                 rel["note"] = prev["note"]       # 覆盖率沿用了，说明它怎么测的那段备注也留着
             slots[key] = rel
         else:
-            slots[key] = {"value": change.after, "source": "human", "status": "confirmed", "updated_at": at}
+            # 码值是补充、不删已有的码：原来标了「已列全」的，补充之后仍然列全。提案自己不能标「已列全」——
+            # 用户在对话里说一个码值的意思，不等于确认这一列只有这些取值
+            done = key[0] == "c" and key[2] == "codes" and prev is not None and prev.get("status") != "rejected" \
+                and codes_complete(prev)
+            slots[key] = make_item(change.after, "human", "confirmed", at=at, complete=done)
     out = _assemble(slots)
     if problems := validate_notes(out):
         raise CatalogInvalid(problems)
@@ -2079,7 +2109,8 @@ __all__ = [
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
     "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_VERIFY_COVERAGE", "PatchChange", "PatchPlan",
     "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft",
-    "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "describe_slot",
+    "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "codes_complete",
+    "describe_slot",
     "draft_catalog", "draft_structure", "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations",
     "initial_status", "join_paths", "make_item", "merge_notes", "now_iso", "parse_path", "plan_patch",
     "profile_relation_holds", "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id",

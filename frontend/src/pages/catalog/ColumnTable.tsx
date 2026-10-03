@@ -11,8 +11,8 @@ import {
 } from '../../lib/terms'
 import { ItemMark } from './parts'
 import type { ReviewTarget } from './parts'
-import { COLUMN_FIELDS, columnPath } from './model'
-import type { ColumnField } from './model'
+import { COLUMN_FIELDS, codesComplete, columnPath, completeOf } from './model'
+import type { ColumnDraft, ColumnField } from './model'
 
 // ===========================================================================
 // 单表详情的列表格：列名 / 类型、中文名、含义、单位、度量类型、码值。每格的值旁边是只有图标的状态标识，点开看来源、
@@ -30,9 +30,9 @@ export interface ColumnModel {
   items: CatalogColumnNotes | undefined
 }
 
-type ColumnTexts = Partial<Record<ColumnField, string>>
+type ColumnTexts = ColumnDraft
 
-export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange }: {
+export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange, onCodesComplete }: {
   columns: ColumnModel[]
   /** 编辑中：列名 → 字段 → 文字（form 是当前的，initial 是进入编辑时的）；不在编辑时为 null */
   form: Record<string, ColumnTexts> | null
@@ -47,6 +47,8 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   /** 码值里有含义空着的：打开逐个填写含义的弹窗 */
   onFillCodes: (col: string) => void
   onChange: (col: string, field: ColumnField, value: string) => void
+  /** 编辑中勾选或取消码值的「已列出全部取值」 */
+  onCodesComplete: (col: string, value: boolean) => void
 }) {
   return (
     <div className="relative overflow-x-auto rounded-lg border" data-catalog-columns="">
@@ -68,7 +70,8 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
         <tbody>
           {columns.map((c) => (
             <ColumnRow key={c.name} col={c} editing={!!form} draft={form?.[c.name]} initial={initial?.[c.name]} problems={problems} busy={busy}
-                       systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onFillCodes={onFillCodes} onChange={onChange} />
+                       systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onFillCodes={onFillCodes} onChange={onChange}
+                       onCodesComplete={onCodesComplete} />
           ))}
         </tbody>
       </table>
@@ -76,7 +79,8 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   )
 }
 
-const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange }: {
+const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange,
+  onCodesComplete }: {
   col: ColumnModel
   editing: boolean
   /** 这一列的表单。只有改了这一列时引用才会变，别的行不重画 */
@@ -89,6 +93,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
   onConfirmColumn: (col: string) => void
   onFillCodes: (col: string) => void
   onChange: (col: string, field: ColumnField, value: string) => void
+  onCodesComplete: (col: string, value: boolean) => void
 }) {
   const { name, structure, items } = col
   const pending = COLUMN_FIELDS.filter((f) => items?.[f]?.status === 'proposed').length
@@ -97,7 +102,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     const it = items?.[f] as CatalogItem | undefined
     const where = CT.whereColumn(name, CATALOG_COLUMN_FIELD_LABEL[f])
     const problem = problems[`c:${name}:${f}`]
-    const changed = editing && (draft?.[f] ?? '') !== (initial?.[f] ?? '')
+    const changed = editing && ((draft?.[f] ?? '') !== (initial?.[f] ?? '') || (f === 'codes' && completeOf(draft) !== completeOf(initial)))
     return (
       <td className="px-2 py-1.5 align-top" data-cell={f} data-status={it?.status}>
         <div className="flex items-start gap-1.5">
@@ -170,15 +175,23 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
       {cell(
         'codes',
         <Value item={codes} render={(v) => (
-          <Codes value={v as Record<string, string>} label={KT.fillLabel(name)}
+          <Codes value={v as Record<string, string>} label={KT.fillLabel(name)} complete={codesComplete(codes)}
                  onFill={codes?.status !== 'rejected' && !busy ? () => onFillCodes(name) : undefined} />
         )} />,
-        <textarea className="field mono !min-h-0 !px-1.5 !py-1 !text-2xs" rows={Math.min(4, Math.max(1, (draft?.codes ?? '').split('\n').length))}
-                  value={draft?.codes ?? ''}
-                  placeholder={codes?.status === 'rejected' ? CT.rejectedPlaceholder(codesInline(codes.value)) : CT.codesPlaceholder}
-                  aria-label={CT.whereColumn(name, CATALOG_COLUMN_FIELD_LABEL.codes)}
-                  aria-invalid={problems[`c:${name}:codes`] ? true : undefined}
-                  onChange={(e) => onChange(name, 'codes', e.target.value)} data-input="codes" />,
+        <>
+          <textarea className="field mono !min-h-0 !px-1.5 !py-1 !text-2xs" rows={Math.min(4, Math.max(1, (draft?.codes ?? '').split('\n').length))}
+                    value={draft?.codes ?? ''}
+                    placeholder={codes?.status === 'rejected' ? CT.rejectedPlaceholder(codesInline(codes.value)) : CT.codesPlaceholder}
+                    aria-label={CT.whereColumn(name, CATALOG_COLUMN_FIELD_LABEL.codes)}
+                    aria-invalid={problems[`c:${name}:codes`] ? true : undefined}
+                    onChange={(e) => onChange(name, 'codes', e.target.value)} data-input="codes" />
+          {/* 只列了一部分取值时不勾：SQL 检查只拿勾了的码值表判断「取值不在码值表中」 */}
+          <label className="mt-1 flex items-start gap-1 text-2xs leading-snug text-dim" title={KT.completeHint}>
+            <input type="checkbox" className="mt-[2px]" checked={completeOf(draft)} disabled={!(draft?.codes ?? '').trim()}
+                   onChange={(e) => onCodesComplete(name, e.target.checked)} data-input="codes-complete" />
+            {KT.complete}
+          </label>
+        </>,
       )}
       <td className="px-1 py-1.5 align-top">
         {!editing && pending > 0 && (
@@ -190,7 +203,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
   )
 }, (a, b) => a.col === b.col && a.editing === b.editing && a.draft === b.draft && a.initial === b.initial && a.busy === b.busy
   && a.systemNotes === b.systemNotes && a.onReview === b.onReview && a.onConfirmColumn === b.onConfirmColumn && a.onFillCodes === b.onFillCodes
-  && a.onChange === b.onChange
+  && a.onChange === b.onChange && a.onCodesComplete === b.onCodesComplete
   // 格式问题每次都是新对象：只比这一列的几格
   && COLUMN_FIELDS.every((f) => a.problems[`c:${a.col.name}:${f}`] === b.problems[`c:${b.col.name}:${f}`]))
 
@@ -206,11 +219,11 @@ export function Value<T>({ item, render }: { item: CatalogItem<T> | undefined; r
 export const pendingCodes = (v: Record<string, string> | undefined): number =>
   Object.values(v ?? {}).filter((x) => !String(x ?? '').trim()).length
 
-function Codes({ value, label, onFill }: { value: Record<string, string>; label: string; onFill?: () => void }) {
+function Codes({ value, label, complete, onFill }: { value: Record<string, string>; label: string; complete: boolean; onFill?: () => void }) {
   const entries = Object.entries(value)
   const pending = pendingCodes(value)
   return (
-    <span className="block">
+    <span className="block" data-codes-complete={complete ? 'true' : 'false'}>
       <span className="flex flex-wrap gap-1" title={entries.map(([k, v]) => `${k}=${v.trim() || KT.pending}`).join('\n')}>
         {entries.slice(0, CODES_SHOWN).map(([k, v]) => (
           <span key={k} className="inline-flex max-w-full items-center gap-1 rounded border bg-bg px-1 text-2xs" data-code={k}>
@@ -222,6 +235,11 @@ function Codes({ value, label, onFill }: { value: Record<string, string>; label:
         ))}
         {entries.length > CODES_SHOWN && <span className="text-2xs text-faint">+{entries.length - CODES_SHOWN}</span>}
       </span>
+      {complete && (
+        <span className="mt-1 inline-flex items-center gap-0.5 text-2xs text-faint" title={KT.completeMarkHint} data-codes-complete-mark="">
+          <CheckCheck size={10} aria-hidden /> {KT.completeMark}
+        </span>
+      )}
       {pending > 0 && onFill && (
         // 各码值的「含义待填写」已经写在上面，这里只给入口；几个待填写写在悬停里
         <button type="button" className="mt-1 inline-flex items-center gap-1 whitespace-nowrap rounded px-1 text-2xs text-dim underline decoration-dotted underline-offset-2 hover:text-fg"

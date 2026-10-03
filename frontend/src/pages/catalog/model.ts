@@ -203,11 +203,25 @@ export function relationRemoval(orig: CatalogRelation | null): 'delete' | 'rejec
   return orig.status === 'rejected' ? null : 'reject'
 }
 
+/** 一列的表单：每个字段一段文字；complete 是码值的「已列出全部取值」勾选 */
+export type ColumnDraft = Partial<Record<ColumnField, string>> & { complete?: boolean }
+
 export interface EditForm {
   table: Partial<Record<TableKey, string>>
   /** 列名 → 字段 → 文字 */
-  columns: Record<string, Partial<Record<ColumnField, string>>>
+  columns: Record<string, ColumnDraft>
   relations: RelationDraft[]
+}
+
+/** 码值项：可带「已列全」标记（服务端 catalog.codes_complete） */
+export type CodesItem = CatalogItem<Record<string, string>> & { complete?: boolean }
+
+/**
+ * 码值表是不是标了「已列出全部取值」。只有标了的，SQL 检查才会提醒「码值不在码值表中」；没标的只是已知的一部分取值
+ * （比如对话里只补了一个码的含义），不拿来判断。被驳回的不算
+ */
+export function codesComplete(item: CatalogItem<Record<string, string>> | undefined): boolean {
+  return !!item && item.status !== 'rejected' && (item as CodesItem).complete === true
 }
 
 const splitList = (s: string) => s.split(/[、,，;；\s]+/).map((x) => x.trim()).filter(Boolean)
@@ -264,7 +278,7 @@ export function formFromNotes(notes: CatalogNotes, structure: CatalogStructureCo
   for (const col of names) {
     if (columns[col]) continue
     const items = notes.columns?.[col]
-    columns[col] = Object.fromEntries(COLUMN_FIELDS.map((f) => [f, columnText(items, f)]))
+    columns[col] = { ...Object.fromEntries(COLUMN_FIELDS.map((f) => [f, columnText(items, f)])), complete: codesComplete(items?.codes) }
   }
   const relations = (notes.relations ?? []).map((r) => relationDraft(r))
   return { table, columns, relations }
@@ -284,12 +298,16 @@ export function relationDraft(r: CatalogRelation | null, key?: string): Relation
 const sameRelation = (a: RelationDraft, b: RelationDraft) =>
   a.columns === b.columns && a.to_table === b.to_table && a.to_columns === b.to_columns && a.cardinality === b.cardinality
 
-/** 表单里改了几处：表级、列级各算一格，关系增删改各算一条 */
+/** 表单里「已列出全部取值」算不算勾上：码值清空了就不算（没有码值，谈不上列全） */
+export const completeOf = (d: ColumnDraft | undefined): boolean => !!d?.complete && !!(d.codes ?? '').trim()
+
+/** 表单里改了几处：表级、列级各算一格（码值的「已列全」勾选另算一格），关系增删改各算一条 */
 export function changeCount(initial: EditForm, form: EditForm): number {
   let n = 0
   for (const k of TABLE_KEYS) if ((initial.table[k] ?? '') !== (form.table[k] ?? '')) n++
   for (const [col, fields] of Object.entries(form.columns)) {
     for (const f of COLUMN_FIELDS) if ((initial.columns[col]?.[f] ?? '') !== (fields[f] ?? '')) n++
+    if (completeOf(initial.columns[col]) !== completeOf(fields)) n++
   }
   const before = new Map(initial.relations.map((r) => [r.key, r]))
   const after = new Set(form.relations.map((r) => r.key))
@@ -400,6 +418,16 @@ export function buildNotes(orig: CatalogNotes, initial: EditForm, form: EditForm
       const o = orig.columns?.[col]?.[f] as CatalogItem | undefined
       const a = initial.columns[col]?.[f] ?? ''
       const b = form.columns[col]?.[f] ?? a
+      if (f === 'codes') {
+        // 码值的文字没动、只改了「已列全」勾选：值原样、带上新的勾选交回（服务端也算改动，记为人工填写、已确认）
+        const was = completeOf(initial.columns[col])
+        const now = form.columns[col] ? completeOf(form.columns[col]) : was
+        if (a === b && was === now) { if (o) items[f] = o; continue }
+        if (!b.trim()) continue
+        const value = a === b && o ? o.value : parseColumn(f, b)
+        items[f] = { ...(o ?? {}), value, complete: now }
+        continue
+      }
       const next = put(o, a, b, () => parseColumn(f, b))
       if (next) items[f] = next
     }
