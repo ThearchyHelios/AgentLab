@@ -44,7 +44,7 @@ def test_literals():
         "legacy_doc", "not_cell", "not_sealed", "not_upload", "simple_upload", "manifest_unreadable",
         "chain_mismatch", "expression", "alias", "multi_table", "unparsed", "no_pk", "pk_missing", "masked",
         "null_value", "null_pk", "snapshot_gone", "db_tampered", "recheck_missing", "recheck_multiple",
-        "recheck_mismatch", "no_lineage"}
+        "recheck_mismatch", "no_lineage", "merge_no_lineage"}
     assert len(get_args(P.ReasonCode)) == len(set(get_args(P.ReasonCode)))
     assert set(get_args(P.AlertCode)) == {"db_tampered", "chain_mismatch", "manifest_unreadable"}
     assert set(get_args(P.AlertCode)) <= set(get_args(P.ReasonCode))
@@ -130,7 +130,10 @@ SHAPES: dict[str, list[tuple[str, object]]] = {
                      ("cell_status", None), ("acceptance", None), ("detail", None)],
     "ProvenanceOut": [("schema", P.SCHEMA), ("report", REQ), ("segment", REQ), ("cell", None), ("status", REQ),
                       ("reason", None), ("alert", None), ("sealed", REQ), ("version", None),
-                      ("cell_source", None), ("checks", FACTORY)],
+                      ("cell_source", None), ("checks", FACTORY), ("merge", FACTORY)],
+    # 合并查询结果里的格经过的每一次合并（P3：合并查询节点）
+    "MergeHop": [("alias", REQ), ("node_id", None), ("input", None), ("query", None), ("row", None),
+                 ("column", None)],
     # 中间结构（P4-SPEC 7.2–7.4）
     "DirectSelect": [("table", REQ), ("alias", REQ), ("columns", REQ)],
     "SelectRefusal": [("code", REQ), ("detail", REQ)],
@@ -146,7 +149,7 @@ SHAPES: dict[str, list[tuple[str, object]]] = {
 }
 RESPONSE = ("ReportRef", "CellRef", "Reason", "Alert", "TableRef", "PeriodView", "AcceptanceView", "StateNote",
             "PartView", "VersionView", "FromCell", "YearSource", "CanonicalView", "Recheck", "CellSource",
-            "RelatedCheck", "ProvenanceOut")
+            "RelatedCheck", "ProvenanceOut", "MergeHop")
 
 
 @pytest.mark.parametrize("name", sorted(SHAPES))
@@ -184,7 +187,8 @@ def test_intermediate_types_take_positional_args_as_the_spec_writes_them():
 
 KEYS = {
     "top": ["schema", "report", "segment", "cell", "status", "reason", "alert", "sealed", "version", "cell_source",
-            "checks"],
+            "checks", "merge"],
+    "merge": ["alias", "node_id", "input", "query", "row", "column"],
     "report": ["node_id", "doc_artifact"],
     "cell": ["alias", "row", "column", "artifact"],
     "reason": ["code", "detail", "text"],
@@ -248,6 +252,7 @@ def full_out() -> P.ProvenanceOut:
         checks=[P.RelatedCheck(id="R1", kind="relation_sum_eq", title="「日客流」：全日客流 = 分区甲 + 分区乙",
                                part_status="mismatch", row_status="passed", cell_status=None,
                                acceptance=_accept(), detail="合成的原因摘要")],
+        merge=[P.MergeHop(alias="Q3", node_id="merge", input="f", query="Q1", row=5, column="全日客流")],
     )
 
 
@@ -258,7 +263,7 @@ def test_asdict_matches_the_spec_json_level_by_level():
         "top": d, "report": d["report"], "cell": d["cell"], "version": v, "table": v["tables"][0], "part": part,
         "period": part["period"], "acceptance": part["acceptances"][0], "state": part["purged"],
         "cell_source": cs, "from": cs["from"][0], "year": cs["year"], "canonical": cs["canonical"],
-        "recheck": cs["recheck"], "check": d["checks"][0],
+        "recheck": cs["recheck"], "check": d["checks"][0], "merge": d["merge"][0],
     }
     for name, obj in levels.items():
         assert isinstance(obj, dict), name
@@ -280,7 +285,8 @@ def test_null_and_empty_defaults_match_the_spec():
                           reason=P.refuse("legacy_doc"), sealed=False)
     d = asdict(out)
     assert d["schema"] == "agentlab.provenance/1"
-    assert (d["cell"], d["alert"], d["version"], d["cell_source"], d["checks"]) == (None, None, None, None, [])
+    assert (d["cell"], d["alert"], d["version"], d["cell_source"], d["checks"], d["merge"]) == (
+        None, None, None, None, [], [])
     assert d["reason"] == {"code": "legacy_doc", "detail": "", "text": P.REASON_TEXT["legacy_doc"]}
 
 
@@ -666,7 +672,7 @@ TS_INTERFACES = {
     "ProvenancePeriod": "PeriodView", "ProvenanceAcceptance": "AcceptanceView", "ProvenanceStateNote": "StateNote",
     "ProvenancePart": "PartView", "ProvenanceVersion": "VersionView", "ProvenanceFromCell": "FromCell",
     "ProvenanceYear": "YearSource", "ProvenanceCanonical": "CanonicalView", "ProvenanceRecheck": "Recheck",
-    "ProvenanceCellSource": "CellSource", "ProvenanceCheck": "RelatedCheck",
+    "ProvenanceCellSource": "CellSource", "ProvenanceCheck": "RelatedCheck", "ProvenanceMergeHop": "MergeHop",
 }
 TS_UNIONS = {
     "ProvenanceStatus": P.Status, "ProvenanceReasonCode": P.ReasonCode, "ProvenanceAlertCode": P.AlertCode,

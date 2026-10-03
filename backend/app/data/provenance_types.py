@@ -95,6 +95,8 @@ ReasonCode = Literal[
     "recheck_missing", "recheck_multiple", "recheck_mismatch",
     # R17
     "no_lineage",
+    # 合并查询的结果：这一格说不清来自哪个输入的哪一格（计算、聚合出来的列，或合并 SQL 超出可追溯的写法）
+    "merge_no_lineage",
 ]
 
 #: 标红的提示。出现时 reason.code 与它相同，界面只画提示、不再画 reason.text（P4-SPEC 4.1、4.2 末尾）
@@ -179,6 +181,8 @@ REASON_TEXT: dict[str, str] = {
     "recheck_multiple": _RECHECK_TEXT,
     "recheck_mismatch": _RECHECK_TEXT,
     "no_lineage": "导入清单里没有这一格的溯源记录，只给出表级来历",
+    "merge_no_lineage": ("这一格来自合并查询，无法确定它对应哪个输入的哪一格（计算、聚合出来的列，或合并 SQL 超出可追溯的"
+                         "写法），没有逐格来历，只有表级来历：合并了哪几个输入、用的哪条合并 SQL"),
 }
 
 #: 标红提示的原文：与同名 reason 的原文相同（两处同时出现时界面只画提示）
@@ -507,6 +511,27 @@ class RelatedCheck:
 
 
 @dataclass(kw_only=True)
+class MergeHop:
+    """经过的一次合并查询（engine/merge_query.py）：被引用的格在合并结果里，追到了哪个输入的哪一格。
+
+    追不到的那一跳 input、query、row、column 都是 None，结论是 merge_no_lineage。输入本身也是合并结果时再追一跳，
+    ProvenanceOut.merge 按从报告引用的那一份往下的顺序列出每一跳。"""
+
+    #: 合并结果在目录里的编号（Q3）
+    alias: str
+    #: 合并查询节点
+    node_id: str | None = None
+    #: 追到的输入别名（合并 SQL 里的表名）
+    input: str | None = None
+    #: 那个输入在目录里的编号（Q1）；输入不在这份报告的目录里时为 None
+    query: str | None = None
+    #: 输入快照里的行号，从 0 数
+    row: int | None = None
+    #: 输入快照里的列名
+    column: str | None = None
+
+
+@dataclass(kw_only=True)
 class ProvenanceOut:
     """推断来源接口的响应。asdict 之后就是 P4-SPEC 2.8.1 的 JSON；不变式见 contract_problems。"""
 
@@ -523,6 +548,9 @@ class ProvenanceOut:
     version: VersionView | None = None
     cell_source: CellSource | None = None
     checks: list[RelatedCheck] = field(default_factory=list)
+    #: 被引用的格在合并查询的结果里时，经过的每一次合并（见 MergeHop）；别的查询为空。下钻的结论（status、version、
+    #: cell_source）说的是最后追到的那个输入的那一格，cell 仍是报告引用的那一格
+    merge: list[MergeHop] = field(default_factory=list)
 
 
 # ==========================================================================
@@ -727,4 +755,11 @@ def contract_problems(out: ProvenanceOut) -> list[str]:
         bad("table_only 时 version 必须有")
     if out.status == "none" and out.version is not None:
         bad("none 时 version 为 null")
+    if out.reason is not None and out.reason.code == "merge_no_lineage":
+        if out.status != "none":
+            bad("merge_no_lineage 时 status 为 none")
+        if not out.merge or out.merge[-1].input is not None:
+            bad("merge_no_lineage 时 merge 的最后一跳没有追到输入（input 为 null）")
+    if any(hop.input is None for hop in out.merge[:-1]):
+        bad("merge 里只有最后一跳可以没追到输入")
     return out_problems

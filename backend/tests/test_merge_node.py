@@ -395,6 +395,31 @@ async def test_a_computed_merge_column_has_no_cell_lineage(monkeypatch, sources,
                              "column": None}]
 
 
+async def test_evidence_graph_links_the_merge_to_its_inputs(monkeypatch, sources, client):
+    row = await run_graph(monkeypatch)
+    doc = load_doc(row)
+    body = (await client.get(f"/api/runs/{row.id}/evidence")).json()
+    merged = sorted((e["to"], e["input"]) for e in body["edges"] if e["rel"] == "merged_from" and e["from"] == "Q3")
+    assert merged == sorted([(alias_of(doc, "q_sales"), "s"), (alias_of(doc, "q_visits"), "v")])
+
+
+def test_judge_excerpt_names_the_inputs_and_masks_their_sources():
+    """裁判看合并结果时，知道合并了哪几个输入；输入数据源现在设的遮罩照样生效。"""
+    from app.engine import judge
+    from app.engine.merge_query import MergeInput, execute
+
+    sales = {"columns": ["门店", "订单数"], "rows": [["S01", 3]], "truncated": False, "source": "merge_stores"}
+    visits = {"columns": ["门店", "手机号"], "rows": [["S01", "13800000000"]], "truncated": False,
+              "source": "merge_members"}
+    snap = execute([MergeInput("s", "q_sales", "a" * 64, sales), MergeInput("v", "q_visits", "b" * 64, visits)],
+                   "SELECT s.门店, s.订单数, v.手机号 FROM s JOIN v ON s.门店 = v.门店").snapshot()
+    entry = {"kind": "query", "artifact": "m" * 64, "source": MERGE_SOURCE}
+    text = judge._query_excerpt("Q3", entry, {0}, ["订单数"], False, lambda _a: snap,
+                                {"merge_members": ["手机号"]})
+    assert "合并的输入：s（节点 q_sales，数据源 merge_stores，1 行）、v（节点 q_visits，数据源 merge_members，1 行）" in text
+    assert "13800000000" not in text and "遮罩" in text
+
+
 async def test_a_truncated_input_fails_the_node(monkeypatch, sources):
     row = await run_graph(monkeypatch, store_graph(visits_args={"limit": 2}, report=False))
     assert row.status == "failed"

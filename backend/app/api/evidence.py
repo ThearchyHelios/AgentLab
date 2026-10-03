@@ -58,7 +58,9 @@ from app.data.provenance_types import (
     CellRef,
     Chain,
     ChainProblem,
+    REASON_TEXT,
     LocateProblem,
+    MergeHop,
     ProvenanceOut,
     RawState,
     Reason,
@@ -100,6 +102,7 @@ from app.engine.evidence import (
     uncited_claims,
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
+from app.engine.merge_query import MERGE_SOURCE, trace_cell
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -426,6 +429,12 @@ def _graph_of(report: _Report, sealed: _Sealed, inputs: dict[str, Any]) -> tuple
         if entry.get("kind") in ("query", "retrieval"):
             # 查询、检索条目带上是什么、有多大：图上不点开也看得出这是哪次取数
             item.update({k: entry[k] for k in ("tool", "source", "columns", "rows", "truncated") if k in entry})
+        if entry.get("kind") == "query" and entry.get("source") == MERGE_SOURCE:
+            # 合并结果连向它合并的那几次查询：图上看得出 Q3 是 Q1、Q2 按键合并出来的
+            edges.extend({"from": alias, "to": target, "rel": "merged_from", "input": source.get("alias"),
+                          "report": report.node_id}
+                         for source in _merge_inputs(entry.get("artifact"))
+                         if (target := _query_alias(catalog, source.get("artifact"))))
         elif entry.get("kind") in ENTITY_KINDS:
             # 表和字段：叫什么、出现在哪几次查询里、来历（表结构快照 / SQL / 结果列）各自封存了没有
             item.update({k: entry[k] for k in ("name", "table", "tables", "qualified", "source") if entry.get(k)})
@@ -452,6 +461,16 @@ def _graph_of(report: _Report, sealed: _Sealed, inputs: dict[str, Any]) -> tuple
     for cell in dict.fromkeys(c for c in cells if c):
         edges.append({"from": cell, "to": cell.split(".", 1)[0], "rel": "cell_of", "report": report.node_id})
     return evidence, edges
+
+
+def _merge_inputs(artifact: Any) -> list[dict[str, Any]]:
+    """合并结果快照记下的输入；取不回、哈希不符的当没有（证据图只是少几条边，片段接口照样说清楚）。"""
+    try:
+        snap = load(str(artifact)) if artifact else None
+    except ValueError:
+        return []
+    inputs = snap.get("inputs") if isinstance(snap, dict) else None
+    return [i for i in inputs if isinstance(i, dict)] if isinstance(inputs, list) else []
 
 
 def _cell_name(alias: Any, locator: dict[str, Any]) -> str:
@@ -778,8 +797,8 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
         locator = cite.get("locator") or {}
         # 只有直接引用的单元格才可能推断来源（P4-SPEC 2.8.2）。指标链里的查询步骤不带：指标片段的推断来源只会
         # 回「不是单元格」，带上提示等于让界面白发一次请求
-        return [await _query_step(str(entry.get("artifact") or ""), [(locator.get("row"), locator.get("column"))],
-                                  doc, sealed, masks, hint=doc.get("provenance") == DOC_PROVENANCE)]
+        return await _query_steps(str(entry.get("artifact") or ""), [(locator.get("row"), locator.get("column"))],
+                                  doc, sealed, masks, hint=doc.get("provenance") == DOC_PROVENANCE)
     if cite.get("kind") == "input":
         name = (cite.get("locator") or {}).get("field")
         inputs = _input_payloads(sealed)
@@ -843,7 +862,7 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
                 one["cell"] = cell
             wanted.setdefault(str(artifact_of), []).extend(_located(item.get("locator") or {}))
         inputs.append(one)
-    queries = [await _query_step(a, cells, doc, sealed, masks) for a, cells in wanted.items()]
+    queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
 
 
@@ -932,20 +951,30 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     columns = [str(c) for c in snap.get("columns") or []]
     rows = snap["rows"]
     step["source"] = step["source"] or snap.get("source")
-    # 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、
-    # 删掉了也不会把当时遮着的列亮出来
-    hidden, found = await masks.of(step["source"])
-    recorded = snap.get("mask_columns")
-    hidden = hidden | ({str(c).lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set())
-    if not found:
-        step["mask_note"] = SOURCE_GONE.format(source=step["source"])
+    merged = snap.get("source") == MERGE_SOURCE
+    if merged:
+        # 合并查询不是数据源：遮罩按它合并的那几个数据源算（_merge_masks），不能拿「合并查询」去找数据源，
+        # 找不到再说它「已不存在」
+        hidden, gone = await _merge_masks(snap, masks)
+        if gone:
+            step["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
+        step["merge"] = _merge_view(snap, cells, catalog, sealed)
+        if hint and _leads_to_upload(snap, cells):
+            step["provenance"] = True
+    else:
+        # 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、
+        # 删掉了也不会把当时遮着的列亮出来
+        hidden, found = await masks.of(step["source"])
+        hidden = hidden | _recorded_masks(snap)
+        if not found:
+            step["mask_note"] = SOURCE_GONE.format(source=step["source"])
     masked = {i for i, c in enumerate(columns) if c.lower() in hidden}
     index = sorted({i for r in rows_hit for i in range(r - WINDOW, r + WINDOW + 1) if 0 <= i < len(rows)})
     step.update(sql=snap.get("sql"), columns=columns, total_rows=len(rows), truncated=bool(snap.get("truncated")),
                 masked=[columns[i] for i in sorted(masked)],
                 # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
                 column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
-                **({"provenance": True} if hint and snap.get("data_version") else {}))
+                **({"provenance": True} if hint and snap.get("data_version") and not merged else {}))
     if len(index) > MAX_WINDOW_ROWS:
         index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
     step["row_index"] = index
@@ -953,6 +982,116 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+# --------------------------------------------------------------------------
+# 合并查询的结果：表级来历（输入、合并 SQL）和逐格来历（被引用的格追到输入的哪一格）
+# --------------------------------------------------------------------------
+
+#: 一条链最多追几层合并（合并的合并）。画布上不会无限嵌套，这只是防御坏快照
+MERGE_DEPTH = 4
+
+
+async def _query_steps(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
+                       masks: _Masks, *, hint: bool = False, depth: int = 0) -> list[dict[str, Any]]:
+    """查询步骤；快照是合并结果时，后面接上被引用的格追到的那几个输入的查询步骤（高亮追到的那一格）。
+
+    追不到的格不接任何输入步骤：合并步骤的 merge.traced 里照实写「没有逐格来历」，只给表级来历。输入步骤带
+    merged_into（合并结果的编号），界面据此标明它是哪次合并的输入。不是合并结果的快照，返回的就是原来那一个步骤。
+    """
+    step = await _query_step(artifact, cells, doc, sealed, masks, hint=hint)
+    traced = [t for t in (step.get("merge") or {}).get("traced") or [] if t.get("input")]
+    if not traced or depth >= MERGE_DEPTH:
+        return [step]
+    by_input: dict[str, list[tuple[Any, Any]]] = {}
+    artifacts = {str(i.get("alias")): str(i.get("artifact") or "") for i in step["merge"]["inputs"]}
+    for t in traced:
+        by_input.setdefault(artifacts.get(str(t["input"]), ""), []).append((t["row"], t["column"]))
+    out = [step]
+    for source, picked in by_input.items():
+        if not source:
+            continue
+        for sub in await _query_steps(source, picked, doc, sealed, masks, depth=depth + 1):
+            out.append({**sub, "merged_into": sub.get("merged_into") or step.get("alias")})
+    return out
+
+
+def _merge_view(snap: dict[str, Any], cells: list[tuple[Any, Any]], catalog: dict[str, Any],
+                sealed: _Sealed) -> dict[str, Any]:
+    """合并步骤的 merge 一节：每个输入（别名、节点、节点名、目录编号、行数、数据源、封存与否）、合并 SQL、执行时的
+    警告，以及被引用的每一格追到了哪个输入的哪一格（追不到的写明原因）。"""
+    labels = {str(n.get("id")): (n.get("data") or {}).get("label") or None
+              for n in sealed.graph.get("nodes") or [] if isinstance(n, dict)}
+    inputs = []
+    for item in snap.get("inputs") or []:
+        if not isinstance(item, dict):
+            continue
+        art = str(item.get("artifact") or "")
+        inputs.append({"alias": item.get("alias"), "node_id": item.get("node_id"),
+                       "label": labels.get(str(item.get("node_id"))), "query": _query_alias(catalog, art),
+                       "rows": item.get("rows"), "source": item.get("source"), "artifact": art or None,
+                       "sealed": sealed.trusted and art in sealed.queries})
+    traced = []
+    for row, column in dict.fromkeys((r, c) for r, c in cells if isinstance(r, int) and c):
+        hit = trace_cell(snap, row, column)
+        if hit is None:
+            traced.append({"cell": [row, str(column)], "input": None, "query": None, "row": None, "column": None,
+                           "note": REASON_TEXT["merge_no_lineage"]})
+        else:
+            traced.append({"cell": [row, str(column)], "input": hit.alias, "query": _query_alias(catalog, hit.artifact),
+                           "row": hit.row, "column": hit.column})
+    warnings = [{"code": w.get("code"), "message": w.get("message")} for w in snap.get("warnings") or []
+                if isinstance(w, dict) and w.get("message")]
+    return {"sql": snap.get("sql"), "inputs": inputs, "warnings": warnings, "traced": traced}
+
+
+async def _merge_masks(snap: dict[str, Any], masks: _Masks) -> tuple[set[str], list[str]]:
+    """合并结果要遮的列（小写）和已经不在的数据源：
+
+    - 合并当时记下的（快照的 mask_columns：各输入当时的遮罩列，加上来自遮罩列、换了名字的结果列）；
+    - 它合并的每个数据源现在设的（按列名）；
+    - 结果列有逐格来历、来自某个数据源现在遮着的列的，按来历遮（换了名字也遮住）。宁可多遮。"""
+    hidden = _recorded_masks(snap)
+    gone: list[str] = []
+    for name in snap.get("sources") or []:
+        cols, found = await masks.of(name)
+        hidden |= cols
+        if not found:
+            gone.append(str(name))
+    lineage = snap.get("lineage") if isinstance(snap.get("lineage"), dict) else {}
+    origins = lineage.get("sources") or []
+    by_alias = {str(i.get("alias")): i for i in snap.get("inputs") or [] if isinstance(i, dict)}
+    for name, target in zip(snap.get("columns") or [], lineage.get("columns") or []):
+        if not isinstance(target, dict) or not isinstance(target.get("source"), int) \
+                or not 0 <= target["source"] < len(origins):
+            continue
+        origin = origins[target["source"]] if isinstance(origins[target["source"]], dict) else {}
+        source = (by_alias.get(str(origin.get("input"))) or {}).get("source")
+        if source and source != MERGE_SOURCE and str(target.get("column") or "").lower() in (await masks.of(source))[0]:
+            hidden.add(str(name).lower())
+    return hidden, gone
+
+
+def _leads_to_upload(snap: dict[str, Any], cells: list[tuple[Any, Any]], depth: int = 0) -> bool:
+    """被引用的格经合并追下去，最后落在上传表格的查询快照上（有 data_version）：界面才去请求推断来源。"""
+    if depth >= MERGE_DEPTH:
+        return False
+    for row, column in cells:
+        hit = trace_cell(snap, row, column)
+        if hit is None or not hit.artifact:
+            continue
+        try:
+            source = load(hit.artifact)
+        except ValueError:
+            continue
+        if not isinstance(source, dict):
+            continue
+        if source.get("source") == MERGE_SOURCE:
+            if _leads_to_upload(source, [(hit.row, hit.column)], depth + 1):
+                return True
+        elif source.get("data_version"):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -1070,6 +1209,10 @@ async def segment_provenance(report: _Report, seg: dict[str, Any], sealed: _Seal
     # R0：期 4 之前组装的文档（没有标记）一律不推断，期 4 之前的面板不变（1.4）
     if doc.get("provenance") != DOC_PROVENANCE:
         return none("legacy_doc")
+    # 合并查询结果里的格：先按逐格来历追到输入的那一格，再对那一格照常判断；追不到就只有表级来历
+    if (cite.get("kind") == "cell" and cite.get("status") == "resolved" and seg.get("state") == "deterministic"
+            and entry.get("kind") == "query" and entry.get("source") == MERGE_SOURCE):
+        return await _merge_provenance(report, seg, entry, sealed, masks=masks, base=base)
     # R1：只对直接引用的查询单元格下钻；代码节点、Agent 字段的取数（工具名不是 db_query__ 开头）不算
     if (cite.get("kind") != "cell" or cite.get("status") != "resolved" or seg.get("state") != "deterministic"
             or entry.get("kind") != "query" or not str(entry.get("tool") or "").startswith(QUERY_PREFIX)):
@@ -1092,6 +1235,46 @@ async def segment_provenance(report: _Report, seg: dict[str, Any], sealed: _Seal
         return none("simple_upload")
     return await _drill(base, seg=seg, entry=entry, query=query, schema=schema, artifacts=artifacts,
                         masks=masks, sealed=sealed)
+
+
+async def _merge_provenance(report: _Report, seg: dict[str, Any], entry: dict[str, Any], sealed: _Sealed, *,
+                            masks: _Masks, base: dict[str, Any], hops: tuple[MergeHop, ...] = ()) -> ProvenanceOut:
+    """合并结果里的一格：沿合并快照记下的逐格来历（engine/merge_query.py）追到输入的那一格，换成对那一格的判断。
+
+    宁可不下钻，也不下钻错：追不到（计算、聚合出来的列，合并 SQL 超出可追溯的写法，一模一样的两行）就判
+    merge_no_lineage，只有表级来历（合并的输入、合并 SQL 在查询步骤的 merge 一节里）。追到的输入是数据源查询时，
+    结论就是直接引用那一格时的结论（上传表格照常推断原表格子，手工源 not_upload）；输入本身也是合并结果时再追一跳。
+    cell 始终是报告引用的那一格，merge 列出经过的每一跳。
+    """
+    def out(status: str, reason: Reason, *more: MergeHop) -> ProvenanceOut:
+        return ProvenanceOut(status=status, reason=reason, merge=[*hops, *more], **base)  # type: ignore[arg-type]
+
+    cite = seg.get("cite") or {}
+    artifact = str(entry.get("artifact") or "")
+    snap, ok = await _Artifacts().get(artifact) if artifact in sealed.queries else (None, None)
+    if ok is not True or not isinstance(snap, dict):
+        return out("none", refuse("not_sealed"))
+    locator = cite.get("locator") or {}
+    row, column = locator.get("row"), locator.get("column")
+    if isinstance(column, str) and column.lower() in _recorded_masks(snap):
+        return out("none", refuse("masked"))
+    hit = trace_cell(snap, row, column)
+    catalog = (report.doc or {}).get("catalog") or {}
+    alias = _query_alias(catalog, hit.artifact) if hit is not None else None
+    hop = MergeHop(alias=str(cite.get("alias") or ""), node_id=entry.get("node_id"),
+                   input=hit.alias if hit else None, query=alias, row=hit.row if hit else None,
+                   column=hit.column if hit else None)
+    if hit is None or len(hops) >= MERGE_DEPTH:
+        return out("none", refuse("merge_no_lineage"), replace(hop, input=None, query=None, row=None, column=None))
+    if alias is None:
+        # 输入不在这份报告的目录里（不在报告的上游、没有记进台账）：认不出它是封存过的查询
+        return out("none", refuse("not_sealed"), hop)
+    sub_entry = catalog[alias]
+    sub_seg = {**seg, "cite": {**cite, "alias": alias, "locator": {"row": hit.row, "column": hit.column}}}
+    if sub_entry.get("source") == MERGE_SOURCE:
+        return await _merge_provenance(report, sub_seg, sub_entry, sealed, masks=masks, base=base, hops=(*hops, hop))
+    found = await segment_provenance(report, sub_seg, sealed, masks=masks)
+    return replace(found, cell=base["cell"], segment=base["segment"], merge=[*hops, hop])
 
 
 async def _drill(base: dict[str, Any], *, seg: dict[str, Any], entry: dict[str, Any], query: dict[str, Any],

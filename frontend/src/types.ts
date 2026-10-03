@@ -2262,7 +2262,7 @@ export type ProvenanceReasonCode =
   | 'legacy_doc' | 'not_cell' | 'not_sealed' | 'not_upload' | 'simple_upload' | 'manifest_unreadable'
   | 'chain_mismatch' | 'expression' | 'alias' | 'multi_table' | 'unparsed' | 'no_pk' | 'pk_missing' | 'masked'
   | 'null_value' | 'null_pk' | 'snapshot_gone' | 'db_tampered' | 'recheck_missing' | 'recheck_multiple'
-  | 'recheck_mismatch' | 'no_lineage'
+  | 'recheck_mismatch' | 'no_lineage' | 'merge_no_lineage'
 
 /** 标红的提示：出现时 reason.code 与它相同，界面只画提示 */
 export type ProvenanceAlertCode = 'db_tampered' | 'chain_mismatch' | 'manifest_unreadable'
@@ -2470,4 +2470,19 @@ export interface EvidenceProvenance {
   version: ProvenanceVersion | null
   cell_source: ProvenanceCellSource | null
   checks: ProvenanceCheck[]
+  /** 被引用的格在合并查询的结果里时，经过的每一次合并；别的查询为空 */
+  merge: ProvenanceMergeHop[]
+}
+
+/** 经过的一次合并查询：合并结果里被引用的格追到了哪个输入的哪一格；追不到的那一跳后四项为 null */
+export interface ProvenanceMergeHop {
+  /** 合并结果在目录里的编号（Q3） */
+  alias: string
+  node_id: string | null
+  /** 追到的输入别名（合并 SQL 里的表名） */
+  input: string | null
+  /** 那个输入在目录里的编号（Q1） */
+  query: string | null
+  row: number | null
+  column: string | null
 }
