@@ -158,3 +158,37 @@ def test_a_flagged_metric_whose_snapshot_is_gone_still_counts(monkeypatch):
                 "sql_check_sources": [{"artifact": "gone", "codes": ["fanout_sum"]}]}]
     assert sql_check_gaps(metrics) == [f"指标「订单金额」{REASON}"]
     assert sql_check_gaps([{"id": "n", "name": "订单数", "value": 2}]) == []
+
+
+# --------------------------------------------------------------------------
+# 运行时间线：tool.end 单独带上这次查询的 SQL 检查结果
+# --------------------------------------------------------------------------
+
+
+async def test_tool_end_carries_the_sql_checks_of_the_query(scenic_source, engine_up, monkeypatch):
+    """preview 只是结果的前 2000 个字符，checks 排在 rows 后面，通常被截掉：界面看不到这条查询的检查结果。"""
+    Writer(monkeypatch, text="本周订单金额 [[v:Q1.r0.gmv]]。")
+    run = await run_manager.start(graph=direct(scenic_source, FANOUT_SQL, ""), input_payload={})
+    row = await wait(run.id)
+    [end] = [e.data for e in await events(row.id, "tool.end", "fetch")]
+    [check] = end["checks"]
+    assert check["code"] == "fanout_sum" and check["level"] == "error" and check["table"] == "orders"
+    assert PROBLEM in check["message"] and "for_model" not in check
+
+    clean = await run_manager.start(graph=direct(scenic_source, CLEAN_SQL, ""), input_payload={})
+    row = await wait(clean.id)
+    [end] = [e.data for e in await events(row.id, "tool.end", "fetch")]
+    assert "checks" not in end
+
+
+def test_agent_and_team_tool_events_read_checks_the_same_way():
+    """Agent 节点和协作团队里的查库调用交回的是 JSON 文本：同一个读法，取不到就不加。"""
+    import json
+
+    from app.engine.sql_problems import event_checks
+
+    text = json.dumps({"rows": [[1]], "checks": [{**FANOUT, "for_model": "改写"}]}, ensure_ascii=False)
+    assert event_checks(text) == [{k: v for k, v in FANOUT.items()}]
+    assert event_checks({"rows": [], "checks": [FANOUT]}) == [FANOUT]
+    assert event_checks("查询失败：no such table") == [] and event_checks(None) == []
+    assert event_checks('{"rows": [], "checks": "坏的"}') == []

@@ -33,7 +33,7 @@ from app.engine.expressions import (
     substitute,
 )
 from app.engine.labels import field_label
-from app.engine.sql_problems import QueryProblem, merge_problems, node_of, query_problems, reason_text
+from app.engine.sql_problems import CHECK_FIELDS, QueryProblem, merge_problems, node_of, query_problems, reason_text
 from app.engine.state import GraphState, template_context
 
 
@@ -410,10 +410,6 @@ def _sql_check_reason(failed: list[tuple[str, list[QueryProblem]]]) -> str:
     return reason_text(list(dict.fromkeys(text for _, found in failed for p in found for text in p.problems)))
 
 
-#: 运行日志里每条 SQL 检查结果交给界面的字段（data/sqlcheck.SqlCheck.as_dict 去掉给模型的那句 for_model）
-_CHECK_FIELDS = ("code", "level", "message", "table", "column", "relation_id", "sql_excerpt")
-
-
 def _emit_sql_check_logs(metrics: list[dict[str, Any]], failed_by: dict[str, list[QueryProblem]],
                          state: GraphState, ctx: NodeContext) -> None:
     """没通过 SQL 检查的来源查询，一条一行运行日志（metric_sql_check），列出受它影响的指标。
@@ -441,7 +437,7 @@ def _emit_sql_check_logs(metrics: list[dict[str, Any]], failed_by: dict[str, lis
         ctx.emit(EventType.LOG, level="warn", code="metric_sql_check",
                  metric=ids[0], metrics=ids, metric_names=[names.get(i, i) for i in ids],
                  reason=reason, problems=problem.problems,
-                 checks=[{k: c[k] for k in _CHECK_FIELDS if k in c} for c in problem.checks],
+                 checks=[{k: c[k] for k in CHECK_FIELDS if k in c} for c in problem.checks],
                  query_artifact=artifact,
                  **({"source_node": source} if source else {}),
                  **({"source_field": "args.sql"} if sql_in_args else {}),

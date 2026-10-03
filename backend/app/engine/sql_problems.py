@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -87,6 +88,30 @@ def error_checks(artifact: Any, *, loader: Callable[[str], Any] | None = None) -
     return [c for p in query_problems(artifact, loader=loader) for c in p.checks]
 
 
+#: 运行事件、证据接口交给界面的检查字段（data/sqlcheck.SqlCheck.as_dict 去掉给模型的那句 for_model）
+CHECK_FIELDS = ("code", "level", "message", "table", "column", "relation_id", "sql_excerpt")
+
+
+def event_checks(result: Any) -> list[dict[str, Any]]:
+    """数据源查询工具交回的结果（dict 或 JSON 文本）里的 SQL 检查结果，只留给人看的字段；没有就是空列表。
+
+    tool.end 的 preview 只是结果的前 2000 个字符，checks 排在 rows 后面，通常被截掉。事件里单独带一份，
+    运行时间线才看得到这条查询的检查结果。调用方只对数据源查询工具（db_query__）问这里。
+    """
+    if isinstance(result, str):
+        text = result.lstrip()
+        if not text.startswith("{") or '"checks"' not in text:
+            return []
+        try:
+            result = json.loads(text)
+        except ValueError:
+            return []
+    checks = result.get("checks") if isinstance(result, dict) else None
+    if not isinstance(checks, list):
+        return []
+    return [{k: c[k] for k in CHECK_FIELDS if k in c} for c in checks if isinstance(c, dict) and c.get("code")]
+
+
 def node_of(artifact: str, ledger: Iterable[Any] | None) -> str | None:
     """证据台账里交回这份查询快照的节点。台账里没有（老运行、Agent 没交台账）返回 None。"""
     for entry in ledger or []:
@@ -122,5 +147,5 @@ def merge_problems(found: Iterable[QueryProblem]) -> list[QueryProblem]:
     return list(out.values())
 
 
-__all__ = ["MERGE_SOURCE", "QueryProblem", "error_checks", "merge_problems", "node_of", "problem_clause", "query_problems",
+__all__ = ["CHECK_FIELDS", "MERGE_SOURCE", "QueryProblem", "error_checks", "event_checks", "merge_problems", "node_of", "problem_clause", "query_problems",
            "reason_text"]
