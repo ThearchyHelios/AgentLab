@@ -15,7 +15,7 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import {
   ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
@@ -723,7 +723,10 @@ function findFirst(steps: Step[], pred: (s: Step) => boolean): Step | undefined 
 
 function countKind(steps: Step[], kind: StepKind): number {
   let n = 0
-  for (const s of steps) n += (s.kind === kind ? 1 : 0) + (s.children ? countKind(s.children, kind) : 0)
+  // 合并查询那一行也是 kind query（同样的展开区和下钻），但它没有查数据库：「N 次查询」和落库的查询次数对得上
+  for (const s of steps) {
+    n += (s.kind === kind && !s.merge ? 1 : 0) + (s.children ? countKind(s.children, kind) : 0)
+  }
   return n
 }
 
@@ -1471,14 +1474,32 @@ function StepDetail({ step, table, explained }: {
           )}
         </div>
       )}
+      {step.merge && step.merge.inputs.length > 0 && (
+        // 合并查询：先说合并的是哪几个输入（合并 SQL 里的表名 → 上游节点、行数、数据源），再看合并 SQL 和结果
+        <div className="text-2xs text-dim" data-step-merge="">
+          <div className="mb-0.5">{MERGE_TEXT.inputs(step.merge.inputs.length)}</div>
+          <ul className="space-y-0.5">
+            {step.merge.inputs.map((i) => (
+              <li key={i.alias} className="flex min-w-0 items-baseline gap-1.5" data-step-merge-input={i.alias}>
+                <span className="mono shrink-0 rounded bg-bg px-1 text-fg">{i.alias}</span>
+                <span className="min-w-0 truncate" title={i.nodeId}>{i.label || i.nodeId || '—'}</span>
+                <span className="shrink-0 text-faint">
+                  {[i.rows != null ? MERGE_TEXT.rows(i.rows) : '', i.source ? MERGE_TEXT.source(i.source) : '']
+                    .filter(Boolean).join(' · ')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {detail && (
         <div className="group/detail relative">
           {step.kind === 'query' && (
             <div className="mb-0.5 flex items-center gap-2 text-2xs text-dim">
-              <span className="mono">SQL</span>
+              <span className={step.merge ? undefined : 'mono'}>{step.merge ? MERGE_TEXT.sql : 'SQL'}</span>
               {step.source && <span>数据源 {step.source}</span>}
               <span className="flex-1" />
-              <CopyChip label="复制 SQL" text={() => step.detail ?? ''} />
+              <CopyChip label={step.merge ? MERGE_TEXT.copySql : '复制 SQL'} text={() => step.detail ?? ''} />
             </div>
           )}
           <pre className={pre}>

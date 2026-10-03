@@ -114,6 +114,23 @@ const EV_GRAPH = {
   edges: [edge('start', 'fetch'), edge('start', 'manual'), edge('fetch', 'write'), edge('manual', 'write'), edge('write', 'done')],
 }
 
+// 合并查询：门店库、会员库各查一次，按日期 + 门店合并。上游另有一个模型调用节点，检查器的输入下拉里不该有它
+const MERGE_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 200, '输入', { fields: [{ name: 'day', required: true }] }),
+    node('q_sales', 'tool', 300, 80, '门店销售', { tool: 'db_query__shop', args: { sql: 'SELECT order_date AS 日期, store_id AS 门店, COUNT(*) AS 订单数 FROM orders GROUP BY 1, 2' } }),
+    node('q_visits', 'tool', 300, 240, '到店人数', { tool: 'db_query__members', args: { sql: 'SELECT visit_date AS 日期, store_code AS 门店, COUNT(*) AS 到店人数 FROM visits GROUP BY 1, 2' } }),
+    node('think', 'llm', 300, 400, '先想一想', { prompt: '{{ input.day }}' }),
+    node('merge', 'merge', 640, 200, '按门店合并', {
+      inputs: { s: 'q_sales', v: 'q_visits' },
+      sql: 'SELECT s.日期, s.门店, s.订单数, v.到店人数 FROM s JOIN v ON s.日期 = v.日期 AND s.门店 = v.门店',
+    }),
+    node('done', 'output', 980, 200, '成果', { fields: [{ name: 'answer', value: '{{ nodes.merge.rows }}' }] }),
+  ],
+  edges: [edge('start', 'q_sales'), edge('start', 'q_visits'), edge('start', 'think'), edge('q_sales', 'merge'),
+    edge('q_visits', 'merge'), edge('think', 'merge'), edge('merge', 'done')],
+}
+
 const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
@@ -128,6 +145,7 @@ const FAKES = {
   'st-team': wf('st-team', { name: '__studio_check_team__', graph: TEAM_BOUND, version: 2, published_version: 2, status: 'published' }),
   'st-lint': wf('st-lint', { name: '__studio_check_lint__', graph: TEAM_GRAPH, version: 1 }),
   'st-ev': wf('st-ev', { name: '__studio_check_ev__', graph: EV_GRAPH, version: 2 }),
+  'st-merge': wf('st-merge', { name: '__studio_check_merge__', graph: MERGE_GRAPH, version: 1 }),
 }
 const VERSIONS = [
   { id: 'v3', version: 3, note: '', created_at: '2026-09-26T02:00:00Z' },
@@ -2351,6 +2369,69 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
     `${raceHits} 次请求，${await stamp(race.page).innerText().catch(() => '没有章')}`)
   check('没有运行时报错（请求先后颠倒）', race.errors.length === 0, race.errors.slice(0, 2).join(' | '))
   await race.ctx.close()
+})
+
+// ================================================================ 合并查询
+await section('合并查询：节点库认得、卡片摘要、检查器从上游查询节点里选输入、别名重名先不写回、定位落到那一行', async () => {
+  const { ctx, page, errors } = await open({ path: '/studio/st-merge' })
+  const entry = page.locator('[aria-label="节点库"] button[data-node-type="merge"]')
+  check('节点库「执行」一类里有「合并查询」', await entry.count() === 1 && (await entry.innerText()).includes('合并查询'))
+  const card = page.locator('.react-flow__node[data-id="merge"]')
+  check('卡片摘要写合并的是哪几张表（别名）', (await card.innerText().catch(() => '')).includes('合并 s、v'),
+    (await card.innerText().catch(() => '')).replace(/\s+/g, ' ').slice(0, 80))
+  await S(page, () => window.__studio.getState().select('merge'))
+  await page.waitForSelector('[data-inspector-sheet] [data-field="inputs"]', { timeout: 4000 }).catch(() => {})
+  // STUDIO_SHOTS=<目录>：亮暗两套各截一张合并查询的检查器，供人眼复核
+  if (process.env.STUDIO_SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${process.env.STUDIO_SHOTS}/studio-merge-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const box = page.locator('[data-inspector-sheet] [data-field="inputs"]')
+  const aliases = await box.locator('input.mono').evaluateAll((els) => els.map((e) => e.value))
+  check('每个输入一行：别名 s、v，各配一个查询节点', aliases.join(',') === 's,v', aliases.join(','))
+  const options = await box.locator('select').first().locator('option:not([disabled])').evaluateAll((els) => els.map((e) => e.value))
+  check('下拉只列上游的查询节点（调用数据库查询工具的节点），不列模型调用', options.join(',') === 'q_sales,q_visits'
+    || options.join(',') === 'q_visits,q_sales', options.join(','))
+  check('选中的节点下面写着它调用的工具', (await box.innerText()).includes('db_query__shop'))
+  check('合并 SQL 用代码编辑框', await page.locator('[data-inspector-sheet] [data-field="sql"] textarea, [data-inspector-sheet] [data-field="sql"] [contenteditable]').count() >= 1)
+  const config = () => S(page, () => JSON.stringify(window.__studio.getState().nodes.find((n) => n.id === 'merge')?.data.config.inputs))
+
+  await box.locator('input.mono').nth(1).fill('S')
+  await page.waitForTimeout(150)
+  check('别名改成和另一行只差大小写：行内说明重复，先不写回（两行都还在）',
+    (await box.innerText()).includes('重复') && await config() === JSON.stringify({ s: 'q_sales', v: 'q_visits' }), await config())
+  await box.locator('input.mono').nth(1).fill('visits')
+  await page.waitForTimeout(150)
+  check('改成不重名的别名：写回，顺序不变', await config() === JSON.stringify({ s: 'q_sales', visits: 'q_visits' }), await config())
+  await box.locator('input.mono').nth(1).fill('9v')
+  await page.waitForTimeout(150)
+  check('不合法的别名当场说明写法', (await box.innerText()).includes('只能用英文字母、数字和下划线'))
+  await box.locator('input.mono').nth(1).fill('v')
+  await box.getByRole('button', { name: '添加输入' }).click()
+  await page.waitForTimeout(150)
+  const added = JSON.parse(await config())
+  check('添加输入：取一个上游查询节点，别名从节点 id 起、不重名', Object.keys(added).length === 3
+    && Object.keys(added)[2] === 'q_sales', JSON.stringify(added))
+  await box.getByRole('button', { name: '删除输入 q_sales' }).click()
+  await page.waitForTimeout(150)
+  check('删除输入：那一行和配置里的那一项一起去掉', await config() === JSON.stringify({ s: 'q_sales', v: 'q_visits' }), await config())
+
+  await S(page, () => window.__studio.getState().select(null))
+  await page.waitForTimeout(200)
+  const r = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/canvas/InspectorSheet.tsx')
+    m.revealField('merge', 'inputs.v', { focus: true })
+    await new Promise((res) => setTimeout(res, 600))
+    const a = document.activeElement
+    return { inRow: !!a?.closest('[data-field="inputs"] [data-sub="v"]'), value: (a && 'value' in a) ? a.value : null }
+  }).catch((e) => ({ error: e.message.split('\n')[0] }))
+  check('问题落在 inputs.<别名> 上：定位到那一行，光标落进别名', r.inRow && r.value === 'v', JSON.stringify(r))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
 })
 
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)

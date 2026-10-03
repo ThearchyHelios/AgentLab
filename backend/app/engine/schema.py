@@ -23,6 +23,7 @@ class NodeType(StrEnum):
 
     TOOL = "tool"  # 直接调用一个工具
     CODE = "code"  # 沙箱里跑代码
+    MERGE = "merge"  # 合并查询：几次查询的完整结果在库外按键合并（engine/merge_query.py）
 
     BRANCH = "branch"  # 条件分支
     LOOP = "loop"  # 循环 / 迭代
@@ -416,6 +417,70 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
                        node_id=node.id, field="metrics_from", code=code)
 
 
+def _produces_query(node: GraphNode) -> bool:
+    """这个节点的产出是一份存成快照的查询结果：调用数据库查询工具的「调用工具」节点，或另一个合并查询。"""
+    if node.type == NodeType.MERGE:
+        return True
+    return node.type == NodeType.TOOL and str(node.config.get("tool") or "").startswith("db_query__")
+
+
+def _check_merge(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """合并查询的输入和合并 SQL。规则和执行时（engine/merge_query.py）同一套，画图时就说破，不等运行到这一步才失败。
+
+    输入只认能稳定取到一份查询快照的节点。Agent 查过的库不行：一次循环里可能查好几次，取哪一次说不准，
+    拿错一次合并出来的数照样像模像样——所以报 error，并说清楚把那条查询单独放进「调用工具」节点。
+    """
+    from app.engine.merge_query import MAX_INPUTS, alias_problem, sql_problem
+
+    cfg = node.config
+    inputs = cfg.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        result.add("「合并查询」还没有配置输入：至少选择一个上游的查询节点，并给它起一个别名（合并 SQL 里的表名）",
+                   node_id=node.id, field="inputs", code="merge.inputs_missing")
+    else:
+        if len(inputs) > MAX_INPUTS:
+            result.add(f"「合并查询」最多 {MAX_INPUTS} 个输入，这里有 {len(inputs)} 个。请先在源库里合并一部分",
+                       node_id=node.id, field="inputs", code="merge.inputs_missing")
+        nodes = spec.node_map()
+        upstream = _ancestors(spec, node.id)
+        seen: dict[str, str] = {}
+        for alias, source in inputs.items():
+            field = f"inputs.{alias}"
+            if problem := alias_problem(alias):
+                result.add(f"「合并查询」的{problem}", node_id=node.id, field=field, code="merge.alias_invalid")
+            elif alias.lower() in seen:
+                result.add(f"「合并查询」的别名「{seen[alias.lower()]}」和「{alias}」只差大小写：SQLite 的表名不分大小写，"
+                           "会被当成同一张表。请换一个别名", node_id=node.id, field=field, code="merge.alias_invalid")
+            else:
+                seen[alias.lower()] = alias
+            target = nodes.get(source) if isinstance(source, str) else None
+            who = f"「合并查询」的输入「{alias}」"
+            if not isinstance(source, str) or not source:
+                result.add(f"{who}还没有选择节点", node_id=node.id, field=field, code="merge.input_invalid")
+            elif target is None:
+                result.add(f"{who}选择了「{source}」，但工作流中不存在这个节点", node_id=node.id, field=field,
+                           code="merge.input_invalid")
+            elif target.type == NodeType.AGENT:
+                result.add(f"{who}选择了「{target.title}」（Agent）：Agent 可能查询多次，无法确定合并哪一次的结果。"
+                           "请把要合并的那条查询单独放进「调用工具」节点（选择数据库查询工具），再把它选作输入",
+                           node_id=node.id, field=field, code="merge.input_invalid")
+            elif target.type == NodeType.TOOL and not _produces_query(target):
+                result.add(f"{who}选择的「{target.title}」调用的不是数据库查询工具：合并查询只能合并数据库查询的结果",
+                           node_id=node.id, field=field, code="merge.input_invalid")
+            elif not _produces_query(target):
+                result.add(f"{who}选择的「{target.title}」是「{type_label(target.type)}」节点，不产出查询结果。"
+                           "输入只能是调用数据库查询工具的「调用工具」节点，或另一个「合并查询」节点",
+                           node_id=node.id, field=field, code="merge.input_invalid")
+            elif source not in upstream:
+                result.add(f"{who}选择的「{target.title}」不在合并查询的上游：合并时它还没有运行。请把它连到合并查询之前",
+                           node_id=node.id, field=field, code="merge.input_invalid")
+    sql = cfg.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        result.add("「合并查询」还没有填写合并 SQL", node_id=node.id, field="sql", code="merge.sql_invalid")
+    elif problem := sql_problem(sql):
+        result.add(problem, node_id=node.id, field="sql", code="merge.sql_invalid")
+
+
 #: 报告撰写节点的结论句策略（claims）。off：结论句不参与判档（默认，保持以前的行为）；
 #: require_citation：没挂引用的结论句计入缺口、按出具档位降档。这两档是确定性的（发布前自动修复
 #: 给人选的也只有这两档）
@@ -604,6 +669,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.REPORT:
             _check_report_sources(node, spec, result)
             _check_report_claims(node, spec, result)
+        elif node.type == NodeType.MERGE:
+            _check_merge(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not isinstance(contract, dict):

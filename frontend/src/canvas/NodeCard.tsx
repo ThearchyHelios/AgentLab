@@ -52,6 +52,13 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return config.tool ? String(config.tool) : '未选择工具'
     case 'code':
       return `${config.language ?? 'python'} · ${(config.code ?? '').split('\n')[0].slice(0, 48) || '空'}`
+    case 'merge': {
+      // 别名就是合并 SQL 里的表名：卡片上看得出合并的是哪几张
+      const aliases = config.inputs && typeof config.inputs === 'object' && !Array.isArray(config.inputs)
+        ? Object.keys(config.inputs) : []
+      if (!aliases.length) return '未配置输入'
+      return `合并 ${aliases.join('、')}${String(config.sql ?? '').trim() ? '' : ' · 未填写合并 SQL'}`
+    }
     case 'branch':
       return (config.cases ?? []).map((c: any) => c.key).filter(Boolean).join(' / ') || '未配置分支'
     case 'loop':

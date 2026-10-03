@@ -5,12 +5,12 @@ import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
 import { ErrorState, Modal, Skeleton } from '../components/ui'
 import { NONE, formatDateTime } from '../lib/format'
-import { EVIDENCE_TEXT, RAW_STATE_LABEL, VERSIONS_TEXT } from '../lib/terms'
+import { EVIDENCE_TEXT, MERGE_TEXT, RAW_STATE_LABEL, VERSIONS_TEXT } from '../lib/terms'
 import { ManifestBody } from '../pages/import/ManifestBody'
 import { segmentKey, useEvidence } from '../store/evidence'
 import type {
-  EvidenceProvenance as Provenance, ManifestOut, ProvenanceCellSource, ProvenanceCheck, ProvenanceFromCell, ProvenancePart,
-  ProvenanceVersion,
+  EvidenceProvenance as Provenance, ManifestOut, ProvenanceCellSource, ProvenanceCheck, ProvenanceFromCell, ProvenanceMergeHop,
+  ProvenancePart, ProvenanceVersion,
 } from '../types'
 import { CopyChip } from './Markdown'
 
@@ -106,7 +106,9 @@ function planOf(d: Provenance): Plan {
   const alert = d.alert?.code
   if (d.status === 'none') {
     if (!alert && (code === 'legacy_doc' || code === 'not_upload' || code === 'not_cell')) return NOTHING
-    if (!alert && (code === 'not_sealed' || code === 'simple_upload')) return { version: false, source: 'reason', checks: false }
+    if (!alert && (code === 'not_sealed' || code === 'simple_upload' || code === 'merge_no_lineage')) {
+      return { version: false, source: 'reason', checks: false }
+    }
     if (alert === 'manifest_unreadable' || alert === 'chain_mismatch') return { version: false, source: 'alert', checks: false }
   } else if (d.status === 'table_only') {
     if (alert === 'db_tampered' || alert === 'chain_mismatch') return { version: true, source: 'alert', checks: false }
@@ -126,6 +128,7 @@ function Answer({ d }: { d: Provenance }) {
     <>
       {version && <VersionPart v={version} sealed={d.sealed !== false} onManifest={setManifest} />}
       <SourceShell state={d.status}>
+        {Array.isArray(d.merge) && d.merge.length > 0 && <MergeHops hops={d.merge} />}
         {plan.source === 'alert' && d.alert && (
           // 标红：样式同 IntegrityList（失败色的框），放在这一节最前面；有它时不再画 reason.text
           <p className="flex items-start gap-1.5 rounded border px-2 py-1 [overflow-wrap:anywhere]" data-ev-prov-alert={d.alert.code}
@@ -146,6 +149,24 @@ function Answer({ d }: { d: Provenance }) {
         document.body,
       )}
     </>
+  )
+}
+
+/**
+ * 被引用的格在合并查询的结果里：先说经过了哪几次合并、追到了哪个输入的哪一格（行号对人从 1 数），下面的数据版本、
+ * 原表格子说的都是追到的那一格。追不到的那一跳照实说没有逐格来历
+ */
+function MergeHops({ hops }: { hops: ProvenanceMergeHop[] }) {
+  return (
+    <ul className="mb-1 space-y-0.5 text-2xs text-dim" data-ev-prov-merge="">
+      {hops.map((h, k) => (
+        <li key={k} className="[overflow-wrap:anywhere]" data-ev-prov-merge-hop={h.input ? 'traced' : 'none'}>
+          {h.input && h.row != null && h.column
+            ? MERGE_TEXT.hop(h.alias, MERGE_TEXT.cellAt(h.query ?? h.input, h.row, h.column))
+            : MERGE_TEXT.hopMissing(h.alias)}
+        </li>
+      ))}
+    </ul>
   )
 }
 

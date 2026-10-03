@@ -14,7 +14,7 @@ import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
   CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
-  markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
+  markupRun, mergeRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
 
@@ -348,6 +348,10 @@ function synthetic(name: string): StreamTurn[] {
                   columns: ['factory_code', 'line_name', 'attribute_group', 'output_qty'],
                   rows: [['1063', '一号线', '001', 1520], ['1064', '二号线', '002', 1310], ['1065', '三号线', '001', 980]],
                   row_count: 3 }) } }]
+    case 'merge':
+      // 合并查询：两个库各查一次、在库外按门店合并，带两道警告（键类型不一致、行数放大）
+      return [{ id: 'merge', question: '按门店合并销售和到店人数', phase: 'done', status: '已完成',
+                steps: decodeRun(mergeRun(), { status: 'succeeded' }) }]
     case 'schema': {
       const ev = mixedRun().slice(0, 10)
       return [{ id: 'schema', question: '看看有哪些人事表', phase: 'done', status: '已完成',

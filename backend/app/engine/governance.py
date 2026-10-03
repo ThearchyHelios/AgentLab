@@ -237,7 +237,7 @@ REPORT_POLICY_ALSO: dict[str, tuple[str, ...]] = {"claims": (CLAIMS_JUDGE,)}
 JUDGE_UNLIMITED = "不设上限，费用只受句数、时长上限和每日上限约束"
 
 #: 产出本身就是证据、或者由系统确定地算出来的节点。成果字段取它们的值，不算「别的节点写的字」
-_TRACEABLE = (NodeType.REPORT, NodeType.METRICS, NodeType.INPUT, NodeType.TOOL, NodeType.RETRIEVE)
+_TRACEABLE = (NodeType.REPORT, NodeType.METRICS, NodeType.INPUT, NodeType.TOOL, NodeType.RETRIEVE, NodeType.MERGE)
 _WRITERS = (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR)
 #: 往对话里写消息的节点（emit_message 没关时），「最后一条消息」就是它们里最后跑的那个写的
 _EMITTERS = (*_WRITERS, NodeType.REPORT)

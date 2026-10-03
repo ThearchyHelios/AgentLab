@@ -18,7 +18,7 @@ from typing import Any
 #: 节点类型的叫法，和前端 lib/terms.ts 的 NODE_TYPE_LABEL 一致
 TYPE_LABEL: dict[str, str] = {
     "input": "输入", "output": "成果", "llm": "模型调用", "agent": "Agent",
-    "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码",
+    "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码", "merge": "合并查询",
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
     "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
@@ -79,6 +79,7 @@ _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
     "human": {"mode": "审批方式", "title": "标题", "message": "展示给审批人的内容", "draft": "草稿内容",
               "stop_on_reject": "驳回即终止运行"},
     "validate": {"source": "待校验内容", "fail_fast": "校验失败即中断"},
+    "merge": {"inputs": "输入", "sql": "合并 SQL"},
 }
 
 #: 出具契约里的键（canvas/issues.ts 的 CONTRACT_KEYS、SUB_KEYS）

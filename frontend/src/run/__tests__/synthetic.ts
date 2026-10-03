@@ -335,6 +335,45 @@ export function markupRun(): RunEvent[] {
   return out
 }
 
+/**
+ * 合并查询：门店库、会员库各查一次，在库外按门店合并（engine/nodes/merge.py 的 merge.end 和随后的警告 log）。
+ * 门店编号一边是文本、一边是数，又只按门店没按日期合并：两道警告都发
+ */
+export const MERGE_SQL = 'SELECT s.门店, s.订单数, v.到店人数 FROM s JOIN v ON s.门店 = v.门店'
+export function mergeRun(): RunEvent[] {
+  const { out, ev } = builder('syn-merge')
+  const query = (node: string, label: string, source: string, sql: string, columns: string[], rows: unknown[][]) => {
+    ev('node.started', node, { node_type: 'tool', label })
+    ev('tool.start', node, { tool: `db_query__${source}`, args: { sql } })
+    ev('tool.end', node, { tool: `db_query__${source}`, duration_ms: 40, artifact: `ts-${node}`, query_artifact: `qs-${node}`,
+      preview: JSON.stringify({ columns, rows, row_count: rows.length, truncated: false, sql, source }) }, 0.04)
+    ev('node.finished', node, { duration_ms: 45, attempt: 1 })
+  }
+  ev('run.started', null, { nodes: 4, resumed: false })
+  query('q_sales', '门店销售', 'stores', 'SELECT order_date AS 日期, substr(store_id, 2) AS 门店, COUNT(*) AS 订单数 FROM orders GROUP BY 1, 2',
+    ['日期', '门店', '订单数'], [['2026-05-01', '01', 3], ['2026-05-01', '02', 2], ['2026-05-02', '01', 2], ['2026-05-02', '02', 1]])
+  query('q_visits', '到店人数', 'members', 'SELECT visit_date AS 日期, CAST(substr(store_code, 2) AS INTEGER) AS 门店, COUNT(*) AS 到店人数 FROM visits GROUP BY 1, 2',
+    ['日期', '门店', '到店人数'], [['2026-05-01', 1, 6], ['2026-05-01', 2, 4], ['2026-05-02', 1, 5], ['2026-05-02', 2, 4]])
+  ev('node.started', 'merge', { node_type: 'merge', label: '按门店合并' })
+  ev('merge.end', 'merge', {
+    inputs: [
+      { alias: 's', node_id: 'q_sales', label: '门店销售', rows: 4, source: 'stores', artifact: 'qs-q_sales' },
+      { alias: 'v', node_id: 'q_visits', label: '到店人数', rows: 4, source: 'members', artifact: 'qs-q_visits' },
+    ],
+    sql: MERGE_SQL, rows: 8, columns: ['门店', '订单数', '到店人数'],
+    preview_rows: [['01', 3, 6], ['01', 3, 5], ['01', 2, 6], ['01', 2, 5], ['02', 2, 4]],
+    truncated: false, duration_ms: 12, query_artifact: 'mq-merge', lineage: true,
+    warnings: [{ code: 'key_type_mismatch', message: '键类型' }, { code: 'rows_grew', message: '行数' }],
+  }, 0.02)
+  ev('log', 'merge', { level: 'warn', code: 'merge_key_type',
+    message: "合并键类型不一致：s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）。SQLite 比较时会做隐式转换：文本形式的编号（如 '001'、'01'）都会等于数值 1，也可能完全匹配不上。请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换" })
+  ev('log', 'merge', { level: 'warn', code: 'merge_rows_grew',
+    message: '合并结果有 8 行，多于行数最多的输入「s」（4 行）：合并键可能不唯一，同一行被重复匹配。「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组。请检查合并条件是否覆盖了全部键（例如同时按日期和门店），或先在源库里聚合到相同粒度' })
+  ev('node.finished', 'merge', { duration_ms: 15, attempt: 1 })
+  ev('run.finished', null, { output: {}, timing: { wall_ms: 400, active_ms: 400, wait_ms: 0 } })
+  return out
+}
+
 /** 结构化校验：原文里没有数，修复两次都编出了 total_count=0，两次都作废，判失败 */
 export function repairRun(): RunEvent[] {
   const { out, ev } = builder('syn-repair')

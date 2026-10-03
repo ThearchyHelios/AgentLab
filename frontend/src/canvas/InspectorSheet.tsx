@@ -67,7 +67,8 @@ export function revealField(nodeId: string, field?: FieldRef | string | null, op
     const sheet = document.querySelector('[data-inspector-sheet]') ?? document
     const box = sheet.querySelector<HTMLElement>(`[data-field="${CSS.escape(at.key)}"]`)
     const item = at.index != null ? box?.querySelector<HTMLElement>(`[data-item="${at.index}"]`) : null
-    const part = at.sub ? item?.querySelector<HTMLElement>(`[data-sub="${CSS.escape(at.sub)}"]`) : null
+    // 只有子键没有序号的（合并查询的 inputs.<别名>）：在整个字段里按子键找那一行
+    const part = at.sub ? (item ?? box)?.querySelector<HTMLElement>(`[data-sub="${CSS.escape(at.sub)}"]`) : null
     const target = part ?? item ?? box
     if (!target) return
     const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches

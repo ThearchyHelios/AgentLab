@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import { AlertTriangle, ChevronLeft, Copy, Lock, Maximize2, Plus, Trash2, X, XCircle } from 'lucide-react'
@@ -12,7 +12,7 @@ import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasour
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
+import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
 
@@ -150,6 +150,140 @@ function NodeRefsInput({ nodeId, type, value, onChange }: {
   )
 }
 
+interface MergeRow { alias: string; node: string }
+
+/** config.inputs（{别名: 节点 id}）→ 行。对象的键顺序就是行的顺序 */
+function mergeRowsOf(value: any): MergeRow[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  return Object.entries(value).map(([alias, node]) => ({ alias, node: typeof node === 'string' ? node : '' }))
+}
+
+/** 和后端 engine/merge_query.alias_problem 的写法规则一致；关键字、sqlite_ 前缀这类由后端校验报出来 */
+const MERGE_ALIAS = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/
+
+/** 新加一行时的别名：从节点 id 取（q_sales → q_sales），不合法的退成 t1、t2…，和已有的不重名 */
+function freshAlias(nodeId: string, taken: Set<string>): string {
+  const base = nodeId.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/^(?=[0-9])/, 't')
+  const head = MERGE_ALIAS.test(base) ? base : 't'
+  if (head !== 't' && !taken.has(head)) return head
+  for (let n = 1; ; n += 1) if (!taken.has(`${head}${n}`)) return `${head}${n}`
+}
+
+/**
+ * 合并查询的输入：每一行一个别名（合并 SQL 里的表名）加一个上游查询节点。
+ *
+ * 只列上游的查询节点：选了数据库查询工具的「调用工具」节点和别的合并查询。Agent 查过的库、模型写的文字都不能合并
+ * （后端校验会报错），这里干脆不给选。已经选了、后来被删掉或挪到下游的节点照样显示成一行并说明，好让人看见并改掉。
+ *
+ * 行先记在本地再写回：别名是对象的键，改到和另一行重名的那一刻写回去会吞掉一行。重名时先不写回，行内说明；
+ * 撤销、助手改图这类外部改动到达时按新的配置重来。后端按 inputs.<别名> 报的问题落在那一行下面
+ */
+function MergeInputList({ nodeId, value, issues, onChange }: {
+  nodeId: string; value: any; issues: FieldIssue[]; onChange: (v: any) => void
+}) {
+  const nodes = useStudio((s) => s.nodes)
+  const edges = useStudio((s) => s.edges)
+  const uid = useId()
+  const options = useMemo(() => {
+    const parents = new Map<string, string[]>()
+    for (const e of edges) parents.set(e.target, [...(parents.get(e.target) ?? []), e.source])
+    const seen = new Set<string>()
+    const stack = [...(parents.get(nodeId) ?? [])]
+    while (stack.length) {
+      const id = stack.pop()!
+      if (seen.has(id) || id === nodeId) continue
+      seen.add(id)
+      stack.push(...(parents.get(id) ?? []))
+    }
+    return nodes
+      .filter((n) => {
+        if (!seen.has(n.id)) return false
+        const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
+        return n.data?.nodeType === 'merge' || (n.data?.nodeType === 'tool' && tool.startsWith('db_query__'))
+      })
+      .map((n) => {
+        const label = String(n.data?.label || n.id)
+        const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
+        return {
+          value: n.id, label: label === n.id ? label : `${label}（${n.id}）`,
+          hint: n.data?.nodeType === 'merge' ? NODE_TYPE_LABEL.merge : tool,
+        }
+      })
+  }, [nodes, edges, nodeId])
+
+  const external = useMemo(() => mergeRowsOf(value), [value])
+  const [rows, setRows] = useState<MergeRow[]>(external)
+  const wrote = useRef(JSON.stringify(external))
+  useEffect(() => {
+    const sig = JSON.stringify(external)
+    if (sig !== wrote.current) {
+      wrote.current = sig
+      setRows(external)
+    }
+  }, [external])
+  const keyOf = (alias: string) => alias.toLowerCase()
+  const clash = (list: MergeRow[], i: number) =>
+    !!list[i].alias && list.some((r, j) => j !== i && keyOf(r.alias) === keyOf(list[i].alias))
+  const commit = (next: MergeRow[]) => {
+    setRows(next)
+    if (next.some((_, i) => clash(next, i))) return
+    const obj = Object.fromEntries(next.map((r) => [r.alias, r.node]))
+    wrote.current = JSON.stringify(mergeRowsOf(obj))
+    onChange(obj)
+  }
+  const add = () => {
+    const used = new Set(rows.map((r) => r.node))
+    const pick = options.find((o) => !used.has(o.value)) ?? options[0]
+    if (!pick) return
+    commit([...rows, { alias: freshAlias(pick.value, new Set(rows.map((r) => keyOf(r.alias)))), node: pick.value }])
+  }
+
+  return (
+    <div>
+      {rows.map((row, i) => {
+        const own = issues.filter((x) => x.at?.sub != null && x.at.sub === row.alias)
+        const local = clash(rows, i) ? `别名「${row.alias}」与另一个输入重复（不区分大小写），请换一个`
+          : !row.alias ? '请填写别名'
+          : !MERGE_ALIAS.test(row.alias) ? '别名只能用英文字母、数字和下划线，不能以数字开头，最多 32 个字符' : ''
+        const known = options.find((o) => o.value === row.node)
+        const tone = own.some((x) => x.level === 'error') || local ? 'error' : own.length ? 'warning' : undefined
+        return (
+          <Row key={i} item={i} removeLabel={MERGE_TEXT.removeInput(row.alias)} tone={tone}
+               onRemove={() => commit(rows.filter((_, j) => j !== i))}>
+            <div className="flex gap-1.5" data-sub={row.alias || undefined}>
+              <Sub label={MERGE_TEXT.alias} htmlFor={`${uid}-${i}-alias`} className="w-32 shrink-0" sub="alias">
+                <input id={`${uid}-${i}-alias`} className="field mono text-xs" value={row.alias} placeholder="s"
+                       spellCheck={false} aria-invalid={!!local || undefined}
+                       onChange={(e) => commit(rows.map((r, j) => (j === i ? { ...r, alias: e.target.value.trim() } : r)))} />
+              </Sub>
+              <Sub label={MERGE_TEXT.node} htmlFor={`${uid}-${i}-node`} className="min-w-0 flex-1" sub="node">
+                <select id={`${uid}-${i}-node`} className="field text-xs" value={row.node}
+                        onChange={(e) => commit(rows.map((r, j) => (j === i ? { ...r, node: e.target.value } : r)))}>
+                  <option value="" disabled>{MERGE_TEXT.pick}</option>
+                  {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  {row.node && !known && <option value={row.node} disabled>{MERGE_TEXT.missingNode(row.node)}</option>}
+                </select>
+              </Sub>
+            </div>
+            {known?.hint && <div className="mono truncate text-2xs text-faint" title={known.hint}>{known.hint}</div>}
+            {local && !own.length && (
+              <div className="flex items-start gap-1 text-2xs leading-snug" style={{ color: 'var(--err)' }}>
+                <XCircle size={11} className="mt-px shrink-0" aria-hidden />
+                <span className="min-w-0 [overflow-wrap:anywhere]">{local}</span>
+              </div>
+            )}
+            {own.map((x, k) => <IssueLine key={k} issue={x} />)}
+          </Row>
+        )
+      })}
+      <button type="button" className="btn btn-sm w-full justify-center" disabled={!options.length} onClick={add}>
+        <Plus size={11} /> {MERGE_TEXT.addInput}
+      </button>
+      {!options.length && <div className="mt-1.5 text-2xs leading-snug text-faint">{MERGE_TEXT.noUpstream}</div>}
+    </div>
+  )
+}
+
 /**
  * 子工作流钉住版本后的升版处置：和口径卡的是同一个下拉——直接借口径卡的字段定义，选项、
  * 文案一字不差，只换说明里「和谁同一套」那半句。上游在钉住的那一版之后又发了版时，正式运行
@@ -271,7 +405,10 @@ export function Inspector() {
             placeholder={def.label}
           />
           <div className="mt-1 text-2xs text-faint">
-            ID <code className="mono">{node.id}</code> · 下游用 <code className="mono">{`{{ nodes.${node.id}.text }}`}</code> 引用
+            {/* 合并查询的产出是一张表、没有 text：口径卡按格取值，报告按查询编号引用 */}
+            ID <code className="mono">{node.id}</code> · {node.data.nodeType === 'merge'
+              ? <>口径卡用 <code className="mono">{`cell(nodes.${node.id}, 0, '列名')`}</code> 取值</>
+              : <>下游用 <code className="mono">{`{{ nodes.${node.id}.text }}`}</code> 引用</>}
           </div>
         </div>
 
@@ -404,8 +541,11 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   const syntax = syntaxOf(field)
   const composite = field.type === 'cases' || field.type === 'agents' || field.type === 'ioFields'
     || field.type === 'metricsList' || field.type === 'caliberFrom' || field.type === 'judge'
-  // 复合字段自己把问题落到第几项；落不到具体某一项的，和普通字段一样挂在下面。结论句裁判按子键（judge.max_cost_usd）落
+    || field.type === 'mergeInputs'
+  // 复合字段自己把问题落到第几项；落不到具体某一项的，和普通字段一样挂在下面。结论句裁判按子键（judge.max_cost_usd）落，
+  // 合并查询的输入按别名（inputs.<别名>）落到那一行
   const own = field.type === 'judge' ? issues.filter((i) => !i.at?.sub || !JUDGE_SUB_KEYS.has(i.at.sub))
+    : field.type === 'mergeInputs' ? issues.filter((i) => !i.at?.sub)
     : composite ? issues.filter((i) => i.at?.index == null) : issues
   const bad = own.some((i) => i.level === 'error')
   const errorId = own.length ? `${id}-issues` : undefined
@@ -605,6 +745,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 
     case 'nodeRefs':
       return <NodeRefsInput nodeId={nodeId} type={field.refType} value={value} onChange={onChange} />
+
+    case 'mergeInputs':
+      return <MergeInputList nodeId={nodeId} value={value} issues={issues} onChange={onChange} />
 
     case 'caliberFrom':
       return <CaliberFromPicker id={id} value={value} invalid={invalid} describedBy={describedBy} />

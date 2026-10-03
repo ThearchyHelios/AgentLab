@@ -112,6 +112,33 @@ await section('知识检索', async () => {
   check('未知事件的类型名不上标题和副标题', !unknown.some((x) => x.title.includes('brand.new') || x.sub?.includes('brand.new')))
 })
 
+await section('合并查询', async () => {
+  // merge.end 是合并查询节点做完的那一条：哪几个输入、合并 SQL、几行。和查询同一类（kind query），
+  // 合并 SQL 进详情、预览进结果、工件可下钻；警告的原文由紧跟着的 log 各占一行，这一行只说有几条
+  const steps = mod.decodeRun(synthetic.mergeRun(), { status: 'succeeded' })
+  const all = flatten(steps)
+  const m = all.find((s) => s.code === 'merge')
+  check('合并查询是一行查询步骤，挂在合并节点下', !!m && m.kind === 'query' && m.nodeId === 'merge'
+    && steps.some((s) => s.kind === 'node' && s.nodeId === 'merge' && s.children?.includes(m)), m?.kind)
+  check('标题说合并的是哪几个输入', m?.title === '合并 s、v 的查询结果', m?.title)
+  check('合并 SQL 留在详情里', m?.detail === synthetic.MERGE_SQL)
+  check('预览按查询结果的形状给出，能画成表格', !!mod.parseQueryResult(m?.result ?? '')?.columns?.includes('到店人数'))
+  check('输入、行数、数据源都在', m?.merge?.inputs?.length === 2 && m.merge.inputs[1].source === 'members'
+    && m.merge.inputs[0].label === '门店销售' && m.merge.rows === 8)
+  check('行数和耗时写在行尾', !!m?.meta?.includes('8 行'), m?.meta)
+  check('工件可下钻到合并结果的快照', m?.artifact === 'mq-merge')
+  check('有警告时这一行标成警告、说有几条', m?.level === 'warn' && !!m.sub?.includes('2 条警告'), m?.sub)
+  const key = all.find((s) => s.code === 'merge_key_type')
+  check('键类型不一致说成人话：标题点名两列', !!key?.title.includes('s.门店') && key.title.includes('v.门店'), key?.title)
+  check('键类型不一致给出下一步', !!key?.next?.includes('CAST') && key.fix === 'canvas')
+  const grew = all.find((s) => s.code === 'merge_rows_grew')
+  check('行数放大说成人话，并带上行数和重复的键', !!grew?.title.includes('不唯一') && !!grew.sub?.includes('8 行')
+    && !!grew.sub?.includes('出现 2 次'), grew?.sub)
+  check('警告原文各占一行，不在合并那一行里重复', all.filter((s) => s.level === 'warn' && s.nodeId === 'merge').length === 3)
+  check('合并节点照常完成，两次源查询仍是普通查询步骤', all.filter((s) => s.kind === 'query' && s.code !== 'merge').length === 2
+    && steps.find((s) => s.nodeId === 'merge')?.status === 'done')
+})
+
 await section('长期记忆', async () => {
   // 写记忆以前只发 info 日志，而 info 在这一层是被丢弃的——系统往长期记忆里
   // 存东西，界面上一点痕迹都没有。Copilot 会主动记之后，这条不可接受。

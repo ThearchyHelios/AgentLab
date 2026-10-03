@@ -1,5 +1,5 @@
 export type NodeType =
-  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code'
+  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
   | 'human' | 'validate' | 'metrics' | 'report'
 
@@ -2065,6 +2065,40 @@ export interface EvidenceCaliberUpgrade {
  * run_input（报告直接引用的运行输入）、query（查询快照：被引用的行加前后各 2 行）。
  * input 步骤同时带着 EvidenceInput 的字段（via、status、model_value、ref、locator、artifact）
  */
+/** 合并查询的一个输入（证据面板的 merge.inputs） */
+export interface EvidenceMergeInput {
+  /** 合并 SQL 里的表名 */
+  alias: string
+  node_id?: string | null
+  /** 节点在画布上的名字 */
+  label?: string | null
+  /** 这个输入在报告目录里的编号（Q1）；不在这份报告的目录里时为空 */
+  query?: string | null
+  rows?: number | null
+  /** 数据源名；输入本身是合并结果时是「合并查询」 */
+  source?: string | null
+  artifact?: string | null
+  sealed?: boolean
+}
+
+/** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */
+export interface EvidenceMergeTrace {
+  /** 合并结果里的 [行, 列]，行号从 0 数 */
+  cell: [number, string]
+  input: string | null
+  query: string | null
+  row: number | null
+  column: string | null
+  note?: string
+}
+
+export interface EvidenceMerge {
+  sql?: string | null
+  inputs: EvidenceMergeInput[]
+  warnings: { code?: string | null; message: string }[]
+  traced: EvidenceMergeTrace[]
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
@@ -2133,6 +2167,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
    * 查询快照来自上传的表格时才有，且恒为 true；其余一个键都不加。前端只在 seg.cite?.kind === 'cell' 且它为 true 时请求
    */
   provenance?: boolean
+  /** 合并查询的结果（快照的 source 是「合并查询」）：合并了哪几个输入、合并 SQL、执行时的警告、被引用的格追到哪 */
+  merge?: EvidenceMerge
+  /** 这一步是哪次合并查询的输入（合并结果在目录里的编号）：排在那个合并步骤后面，高亮的是追到的格 */
+  merged_into?: string
   // ---- entity：表或字段（三期）----
   /** entity：table / column */
   kind?: string
@@ -2268,7 +2306,7 @@ export type ProvenanceReasonCode =
   | 'legacy_doc' | 'not_cell' | 'not_sealed' | 'not_upload' | 'simple_upload' | 'manifest_unreadable'
   | 'chain_mismatch' | 'expression' | 'alias' | 'multi_table' | 'unparsed' | 'no_pk' | 'pk_missing' | 'masked'
   | 'null_value' | 'null_pk' | 'snapshot_gone' | 'db_tampered' | 'recheck_missing' | 'recheck_multiple'
-  | 'recheck_mismatch' | 'no_lineage'
+  | 'recheck_mismatch' | 'no_lineage' | 'merge_no_lineage'
 
 /** 标红的提示：出现时 reason.code 与它相同，界面只画提示 */
 export type ProvenanceAlertCode = 'db_tampered' | 'chain_mismatch' | 'manifest_unreadable'
@@ -2476,4 +2514,19 @@ export interface EvidenceProvenance {
   version: ProvenanceVersion | null
   cell_source: ProvenanceCellSource | null
   checks: ProvenanceCheck[]
+  /** 被引用的格在合并查询的结果里时，经过的每一次合并；别的查询为空 */
+  merge: ProvenanceMergeHop[]
+}
+
+/** 经过的一次合并查询：合并结果里被引用的格追到了哪个输入的哪一格；追不到的那一跳后四项为 null */
+export interface ProvenanceMergeHop {
+  /** 合并结果在目录里的编号（Q3） */
+  alias: string
+  node_id: string | null
+  /** 追到的输入别名（合并 SQL 里的表名） */
+  input: string | null
+  /** 那个输入在目录里的编号（Q1） */
+  query: string | null
+  row: number | null
+  column: string | null
 }

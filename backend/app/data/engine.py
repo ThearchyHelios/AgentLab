@@ -280,6 +280,15 @@ def open_checked_sqlite(path: str, *, readonly: bool = True, immutable: bool = F
                            factory=_DqsOffConnection)
 
 
+def open_memory_sqlite() -> sqlite3.Connection:
+    """一个内存 SQLite 连接，DQS 已关（合并查询把几次查询的结果落进来再合并，engine/merge_query.py）。
+
+    合并 SQL 同样是模型写的：双引号里的列名写错一个字，默认连接会把它当成字符串常量，`SUM("销售颔")` 得 0，
+    `ON s."门店" = v."门店 "` 一行都对不上却不报错。所以和连接层共用 _DqsOffConnection，关不掉就不交出连接。
+    """
+    return sqlite3.connect(":memory:", factory=_DqsOffConnection)
+
+
 def _sqlite_extra() -> dict[str, Any]:
     """每个 SQLite engine 都带的连接参数：关 DQS。"""
     return {"connect_args": {"factory": _DqsOffConnection}}

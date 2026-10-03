@@ -65,6 +65,7 @@ from app.engine.evidence import (
     table_fields,
 )
 from app.engine.expressions import CellError, column_kind, locate_cell
+from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
@@ -314,10 +315,13 @@ class _Fetch:
 
 
 def _hidden(snapshot: dict[str, Any], source: Any, masked: dict[str, Any] | None) -> set[str]:
-    """要遮住的列（小写）：查询当时记下的，加上数据源现在设的。"""
+    """要遮住的列（小写）：查询当时记下的，加上数据源现在设的。合并查询的结果不是数据源，按它合并的那几个数据源算。"""
     names = _mask_names(snapshot.get("mask_columns"))
+    wanted = {str(source or "")}
+    if snapshot.get("source") == MERGE_SOURCE and isinstance(snapshot.get("sources"), list):
+        wanted |= {str(s) for s in snapshot["sources"]}
     for name, cols in (masked or {}).items():
-        if str(name) == str(source or ""):
+        if str(name) in wanted:
             names |= _mask_names(cols)
     return names
 
@@ -346,9 +350,12 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     total = len(snapshot["rows"])
     # 旧形状的台账条目没记数据源：按快照自己记的找遮罩（证据面板同一个口径）
     source = entry.get("source") or snapshot.get("source")
-    head = f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）"
+    head = (f"【{alias}】合并查询结果（共 {total} 行）" if snapshot.get("source") == MERGE_SOURCE
+            else f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）")
     sql = _clean(str(snapshot.get("sql") or ""))
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
+    if snapshot.get("source") == MERGE_SOURCE:
+        lines.append(_merge_line(snapshot))
     hidden = _hidden(snapshot, source, masked)
     if provenance_on and snapshot.get("data_version"):
         lines += _provenance_lines(snapshot, fetch, hidden)
@@ -372,6 +379,16 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     if hidden & {str(c).lower() for c in snapshot.get("columns") or []}:
         lines.append("（有的列按数据源的设置遮罩了，没有给出）")
     return "\n".join(lines)
+
+
+def _merge_line(snapshot: dict[str, Any]) -> str:
+    """合并查询结果的摘录多一行：合并了哪几个输入（SQL 里的别名、节点、数据源、行数）。上面的 SQL 就是合并 SQL。"""
+    parts = []
+    for item in snapshot.get("inputs") or []:
+        if isinstance(item, dict):
+            parts.append(f"{item.get('alias')}（节点 {item.get('node_id') or '—'}，数据源 {item.get('source') or '—'}，"
+                         f"{item.get('rows')} 行）")
+    return "合并的输入：" + ("、".join(parts) if parts else "—")
 
 
 def _provenance_lines(snapshot: dict[str, Any], fetch: _Fetch, hidden: set[str]) -> list[str]:

@@ -163,6 +163,18 @@ NODE_REFERENCE = """\
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
   成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
+- merge：合并查询，把几次查询的结果在库外按键合并成一张表。config: {inputs: {别名: 上游查询节点id}, sql, assign_to}
+  **只在数据分在不同的库、要按行对齐时用**：先在各自的库里用 SQL 聚合到相同的键和粒度（比如「日期 + 门店」），
+  再由 merge 按键合并。同一个库里的数据写成一条 SQL（JOIN / WITH），不要拆成两次查询再合并；只组合几个单值时
+  用口径卡的 cell()，不用 merge。比率、增幅、占比这类派生计算仍然写在口径卡里，不写进合并 SQL。
+  inputs 的值只能是调用 db_query__ 工具的 tool 节点或另一个 merge 节点，而且要连在 merge 之前；agent 查过的库
+  不能当输入（它可能查了好几次），要合并的那条查询单独放进 tool 节点。别名就是 sql 里的表名，只用英文字母、数字
+  和下划线（例如 s、v）。sql 是一条 SQLite 的 SELECT 或 WITH，例如：SELECT s.日期, s.门店, s.订单数, v.到店人数
+  FROM s JOIN v ON s.日期 = v.日期 AND s.门店 = v.门店。合并读的是每个输入的完整结果：任何一个输入被截断（超过
+  查询的行数上限）merge 就会失败，所以源查询要先聚合、缩小范围；两边的键类型要一致（文本 '001' 对数值 1 会给警告）；
+  结果比行数最多的输入还多，说明合并键不唯一（也会给警告）。结果和查询同形：报告按先后编号引用 [[v:Qn.r0.列名]]，
+  口径卡写 cell(nodes.merge节点id, 行, '列名')。选取项直接写输入的列（可以用 AS 改名）时，报告里的数点得开、能追到
+  输入的那一格；表达式算出来的列只有表级来历
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
   evidence_role：source（取数：产出本身就是源数据）/ compute（计算，默认）。负责取数的代码写 source；
   compute 的产出喂给口径卡会被提示「核对不了出处」——业务计算写进口径卡的表达式。
@@ -194,7 +206,7 @@ NODE_REFERENCE = """\
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
   claims, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
-  （tool 节点和 agent 查过的库，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
+  （tool 节点和 agent 查过的库、merge 的合并结果，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
   和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；模型自己写的数字会被打回重写：
   - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用
   - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
@@ -234,6 +246,8 @@ NODE_REFERENCE = """\
 2. 能用 SUM / COUNT 做的聚合放在 SQL 里，口径卡只做标量运算
 3. 不要用 code 节点做业务计算；code 只做格式转换（负责取数的 code 标 evidence_role: source）
 4. 不要用 transform 解析 agent / llm 的文字：口径卡读 cell(nodes.查库节点id, 行, '列名') 或 vars.<agent 的 assign_to>.字段
+5. 数据在两个库、要按行对齐时：两个 tool 节点各自聚合到相同的键和粒度 → merge 按键合并 → 口径卡算派生指标 → report。
+   同一个库写成一条 SQL；只组合几个单值用口径卡的 cell()；不要用 code 节点合并（出处会断，喂给口径卡时核对不了）
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -1154,7 +1168,8 @@ def _evidence_source(node: Any) -> bool:
     if node.type == NodeType.INPUT:
         fields = node.config.get("fields")
         return isinstance(fields, list) and any(_numeric_input(f) for f in fields)
-    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.RETRIEVE, NodeType.SUBGRAPH, NodeType.SUPERVISOR)
+    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.MERGE, NodeType.RETRIEVE, NodeType.SUBGRAPH,
+                         NodeType.SUPERVISOR)
 
 
 def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
