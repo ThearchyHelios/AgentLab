@@ -248,31 +248,15 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
           data-item-panel={target.path}
         >
           <div id={titleId} className="font-medium text-fg">{CT.itemTitle(target.where)}</div>
-          <dl className="mt-2 space-y-1.5 text-2xs leading-relaxed">
-            <div className="flex items-start gap-2">
-              <dt className="sr-only">状态</dt>
-              <dd className="flex min-w-0 flex-wrap items-center gap-1.5">
-                <StatusChip status={status} />
-                <span className="text-dim">{CATALOG_STATUS_HINT[status]}</span>
-              </dd>
-            </div>
-            <div className="flex gap-2 text-dim">
-              <dt className="sr-only">来源</dt>
-              <dd>{CT.itemSource(CATALOG_SOURCE_LABEL[source])}</dd>
-            </div>
-            {target.updated_at && (
-              <div className="flex gap-2 text-faint">
-                <dt className="sr-only">更新时间</dt>
-                <dd className="tnum">{CT.itemUpdated(formatDateTime(target.updated_at))}</dd>
-              </div>
-            )}
-            {target.note && (
-              <div className="rounded border bg-bg px-2 py-1 text-dim">
-                <dt className="sr-only">备注</dt>
-                <dd className="whitespace-pre-wrap break-words">{target.note}</dd>
-              </div>
-            )}
-          </dl>
+          <div className="mt-2 space-y-1.5 text-2xs leading-relaxed">
+            <p className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <StatusChip status={status} />
+              <span className="text-dim">{CATALOG_STATUS_HINT[status]}</span>
+            </p>
+            <p className="text-dim">{CT.itemSource(CATALOG_SOURCE_LABEL[source])}</p>
+            {target.updated_at && <p className="tnum text-faint">{CT.itemUpdated(formatDateTime(target.updated_at))}</p>}
+            {target.note && <p className="whitespace-pre-wrap break-words rounded border bg-bg px-2 py-1 text-dim">{target.note}</p>}
+          </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
             <ActionButton icon={<Check size={11} />} disabled={disabled || status === 'confirmed'} onClick={() => act('confirm')} action="confirm">
               {CT.confirm}

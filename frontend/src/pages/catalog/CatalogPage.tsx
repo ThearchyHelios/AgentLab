@@ -104,6 +104,12 @@ export function CatalogPage() {
       <Sparkles size={11} aria-hidden /> {CT.draft}
     </button>
   )
+  // 页头的「起草」窄屏只留图标，标题才放得下
+  const headerDraft = (
+    <button type="button" className="btn btn-sm" onClick={() => setDrafting(true)} aria-label={CT.draft} title={CT.draft} data-catalog-draft="">
+      <Sparkles size={11} aria-hidden /> <span className="hidden sm:inline">{CT.draft}</span>
+    </button>
+  )
 
   let body: ReactNode
   if (!data) {
@@ -175,7 +181,7 @@ export function CatalogPage() {
         subtitle={CT.subtitle}
         actions={(
           <div className="flex shrink-0 items-center gap-1.5">
-            {hasTables && draftButton()}
+            {hasTables && headerDraft}
             <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate(back)} aria-label={CT.back} data-catalog-back="">
               <ArrowLeft size={12} aria-hidden /> <span className="hidden sm:inline">{CT.back}</span>
             </button>
