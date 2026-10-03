@@ -61,7 +61,8 @@ async def test_plan_patch_reports_before_and_after(scenic_db):
     assert (measure.path, measure.before, measure.before_status, measure.after) == (
         "columns.visitor_count.measure", "flow", "confirmed", "stock")
     assert measure.state == "change" and measure.reason == "在园人数是存量，不能跨天相加"
-    assert (kind.path, kind.before, kind.before_status, kind.after, kind.state) == ("kind", None, None, "fact", "change")
+    assert (kind.path, kind.before, kind.before_status, kind.after, kind.state) == (
+        "kind", None, None, "fact", "change")
 
 
 async def test_codes_are_supplemented_not_replaced(scenic_db):

@@ -77,8 +77,8 @@ async def world(scenic_db):
             created.append(wf.id)
             return wf
 
-        direct = await template("入园日报", [_graph(_query("q", src, "SELECT COUNT(*) FROM main.VISITS v WHERE v.status = 1",
-                                                           "查询入园人数"))], published=1)
+        counted = _query("q", src, "SELECT COUNT(*) FROM main.VISITS v WHERE v.status = 1", "查询入园人数")
+        direct = await template("入园日报", [_graph(counted)], published=1)
         agent = await template("入园分析", [_graph(_node("ask", "agent", "分析入园", prompt="分析",
                                                           tools=[f"db_query__{src}", f"db_schema__{src}"]))],
                                published=1, level="governed")

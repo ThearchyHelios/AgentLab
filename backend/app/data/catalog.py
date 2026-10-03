@@ -157,13 +157,26 @@ def _codes_ok(value: Any) -> bool:
             and all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in value.items()))
 
 
+#: 表类型、度量类型在界面上的叫法（和 frontend/src/lib/terms.ts 的 CATALOG_KIND_LABEL / CATALOG_MEASURE_LABEL 一致）。
+#: 校验报错会原样上界面（接口 422 的 detail），按它写：以前写「事实表」「流量」，界面上却是「明细表」「可累加」。
+#: 给模型看的渲染另用 KIND_LABEL / MEASURE_LABEL，保留「事实表」「流量，可跨期加总」——模型认得这套说法
+UI_KIND_LABEL = {"fact": "明细表", "dimension": "维度表", "snapshot": "快照表", "log": "日志表", "config": "配置表"}
+UI_MEASURE_LABEL = {"flow": "可累加", "stock": "存量", "ratio": "比率", "identifier": "标识", "status": "状态",
+                    "attribute": "属性"}
+
+
+def _one_of(labels: Iterable[str]) -> str:
+    names = list(labels)
+    return f"应为{'、'.join(names[:-1])}或{names[-1]}之一"
+
+
 #: 每个字段的值怎么查、不合规时怎么说
 _TABLE_VALUE_RULES: dict[str, tuple[Any, str]] = {
     "label": (_text_ok, "应为不超过 500 字的文字"),
     "description": (lambda v: _text_ok(v, _LONG_TEXT_MAX), "应为不超过 2000 字的文字"),
     "grain": (_text_ok, "应为不超过 500 字的文字"),
     "keys": (_str_list_ok, "应为列名的列表"),
-    "kind": (lambda v: v in TABLE_KINDS, "应为事实表、维度表、快照表、日志表或配置表之一"),
+    "kind": (lambda v: v in TABLE_KINDS, _one_of(UI_KIND_LABEL[k] for k in TABLE_KINDS)),
     "business_date": (_business_date_ok, "应写明日期列，规则和时区写成文字"),
     "valid_filter": (_text_ok, "应为不超过 500 字的条件"),
     "dedup": (_text_ok, "应为不超过 500 字的文字"),
@@ -172,7 +185,7 @@ _COLUMN_VALUE_RULES: dict[str, tuple[Any, str]] = {
     "label": (_text_ok, "应为不超过 500 字的文字"),
     "meaning": (_text_ok, "应为不超过 500 字的文字"),
     "unit": (lambda v: _text_ok(v, 50), "应为不超过 50 字的文字"),
-    "measure": (lambda v: v in COLUMN_MEASURES, "应为流量、存量、比率、标识、状态或属性之一"),
+    "measure": (lambda v: v in COLUMN_MEASURES, _one_of(UI_MEASURE_LABEL[k] for k in COLUMN_MEASURES)),
     "codes": (_codes_ok, "应为码值到含义的对照，含义写成文字"),
 }
 
@@ -201,7 +214,7 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
     if not isinstance(rel, dict):
         return ["关联关系应为对象"]
     rid = rel.get("id")
-    # 带编号时后面空一格再接说明：「关联关系 r1a2 的被指向列…」
+    # 带编号时后面空一格再接说明：「关联关系 r1a2 的目标字段…」。两端的叫法和界面一致：本表字段 → 目标表的目标字段
     where = f"关联关系 {rid} " if isinstance(rid, str) and rid else "关联关系"
     problems: list[str] = []
     if not (isinstance(rid, str) and rid.strip()) or "." in str(rid):
@@ -214,13 +227,13 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}含有不认识的字段「{'、'.join(extra)}」")
     cols, to_cols = rel.get("columns"), rel.get("to_columns")
     if not _str_list_ok(cols):
-        problems.append(f"{where}的本表列应为列名的列表")
+        problems.append(f"{where}的本表字段应为列名的列表")
     if not _text_ok(rel.get("to_table"), 255):
-        problems.append(f"{where}缺少被指向的表")
+        problems.append(f"{where}缺少目标表")
     if not _str_list_ok(to_cols):
-        problems.append(f"{where}的被指向列应为列名的列表")
+        problems.append(f"{where}的目标字段应为列名的列表")
     elif _str_list_ok(cols) and len(cols) != len(to_cols):
-        problems.append(f"{where}两端的列数不一致")
+        problems.append(f"{where}两端的字段数不一致")
     if rel.get("cardinality") not in (*CARDINALITIES, None):
         problems.append(f"{where}的基数「{rel.get('cardinality')}」不在可选值内")
     coverage = rel.get("coverage")
@@ -1921,10 +1934,11 @@ __all__ = [
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
     "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND",
     "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft", "TableDraftResult",
-    "apply_human_edit", "apply_patch", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
-    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "join_paths", "make_item",
-    "merge_notes", "now_iso", "parse_path", "plan_patch", "query_snapshot_meta", "read_catalog", "read_entry",
-    "relation_graph", "relation_id", "render_table_index", "render_table_notes", "resolve_draft_model",
-    "resolve_table_name", "review_entry", "review_item", "same_notes", "save_human_edit", "save_patch",
-    "status_counts", "system_notes_source", "table_usage", "validate_notes", "visible_notes", "write_entry",
+    "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "describe_slot", "draft_catalog",
+    "draft_structure", "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations",
+    "initial_status", "join_paths", "make_item", "merge_notes", "now_iso", "parse_path", "plan_patch",
+    "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
+    "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",
+    "save_human_edit", "save_patch", "status_counts", "system_notes_source", "table_usage", "validate_notes",
+    "visible_notes", "write_entry",
 ]
