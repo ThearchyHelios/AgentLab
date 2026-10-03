@@ -746,6 +746,8 @@ class PatchChange:
     - after：保存后的值（码值是补充后的完整对照）；value：要交回保存的原样取值（码值只有补充的那几个，
       409 之后在最新的目录上重新补）；
     - state：change 值有变化；confirm 值相同、但还不是已确认（保存即确认）；same 已经是这个值且已确认。
+    - note：服务端对这一项的说明，给人看；没有时为 None，as_dict 里也不出现。目前只有一种：新增的关联关系没写
+      基数、又推算不出来（_relation_after）。
     """
 
     path: str
@@ -755,10 +757,14 @@ class PatchChange:
     value: Any
     reason: str
     state: str
+    note: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"path": self.path, "before": self.before, "before_status": self.before_status, "after": self.after,
-                "value": self.value, "reason": self.reason, "state": self.state}
+        out = {"path": self.path, "before": self.before, "before_status": self.before_status, "after": self.after,
+               "value": self.value, "reason": self.reason, "state": self.state}
+        if self.note:
+            out["note"] = self.note
+        return out
 
 
 @dataclass(frozen=True)
@@ -785,7 +791,11 @@ def _formula_like(key: Slot, value: Any) -> bool:
 
 def _patch_relation(table: str, raw: Any, path_id: str | None, tables: Mapping[str, Any] | None,
                     columns: set[str] | None) -> tuple[dict[str, Any] | None, str | None]:
-    """关联关系的取值 → (关系的值部分, 问题)。值写两端（columns、to_table、to_columns），基数可选。"""
+    """关联关系的取值 → (关系的值部分, 问题)。值写两端（columns、to_table、to_columns），基数可选。
+
+    返回的是提案原样的取值：基数没写就是 None，覆盖率一律 None（模型写了也不认）。保存后的值由 _relation_after
+    并上目录里已有的测量结果再算。
+    """
     if not isinstance(raw, Mapping):
         return None, "关联关系的值应写明本表字段、目标表和目标字段"
     to_table = raw.get("to_table")
@@ -807,6 +817,35 @@ def _patch_relation(table: str, raw: Any, path_id: str | None, tables: Mapping[s
     if path_id is not None and path_id != rid:
         return None, f"关联关系 {path_id} 的两端与取值不一致：要改指向，请驳回原关系后再新增"
     return value, None
+
+
+def _relation_after(table: str, value: Mapping[str, Any], prev: Mapping[str, Any] | None,
+                    tables: Mapping[str, Any] | None) -> tuple[dict[str, Any], str | None]:
+    """提案里一条关系保存后的值：(值, 给人看的说明)。
+
+    以前直接拿提案的取值整份替换：覆盖率写成空、基数取提案原值（模型多半不写）。数据剖析测得多对一、覆盖率 100%
+    的关系，经对话「确认一下」就丢了基数，一对多关联后重复计算的检查跟着失效。所以：
+    - 覆盖率是数据剖析测出来的，一律沿用目录里这条关系的（包括被驳回的那条留下的），没有就是空；
+    - 基数：提案写了用提案的；没写时，目录里已有这条关系就沿用它的；新增的按目标表的主键或唯一约束推算
+      （目标列是键，本表这几列也是键就是一对一，否则多对一，同外键约束的 _cardinality）；推算不了就留空，
+      并说明为什么空着。
+    """
+    out = dict(value)
+    out["coverage"] = prev.get("coverage") if prev is not None else None
+    if out.get("cardinality") is not None:
+        return out, None
+    if prev is not None:
+        out["cardinality"] = prev.get("cardinality")
+        return out, None
+    meta = tables.get(table) if tables is not None else None
+    target = tables.get(str(out.get("to_table"))) if tables is not None else None
+    if not isinstance(meta, Mapping) or not isinstance(target, Mapping):
+        return out, "没有写明基数，表结构里也查不到两端的主键和唯一约束，基数暂时空着；一对多关联后重复计算的检查用不上这条关系"
+    if not _is_key(target, list(out.get("to_columns") or [])):
+        return out, (f"没有写明基数，目标字段不是 {out.get('to_table')} 的主键或唯一约束，推算不出，基数暂时空着；"
+                     "一对多关联后重复计算的检查用不上这条关系，可以在数据目录里补上基数")
+    out["cardinality"] = _cardinality(meta, list(out.get("columns") or []))
+    return out, None
 
 
 def _merge_codes(before: Mapping[str, str], value: Mapping[str, str]) -> dict[str, str]:
@@ -833,6 +872,8 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
     - 码值是补充：在现有（没被驳回的）码值上加或改给出的码，不整份替换——「status=9 表示作废」不该把已确认的
       其余码值删掉。含义为空的码（数据剖析写进来的「含义待填写」）可以被补上含义；提案里含义为空的码只在原来
       没有这个码时加进去，不会把已有的含义抹掉（_merge_codes）。
+    - 关联关系不抹掉测量结果：覆盖率沿用目录里的，基数没写时沿用或推算（_relation_after）。两端、基数、覆盖率都和
+      目录里一样时只是确认，来源不变。
     - 看起来像计算公式的文字不收（_FORMULA）：公式进口径卡。
     - 同一个路径出现两次只认第一次。
     """
@@ -904,8 +945,10 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
         prev = slots.get(key)
         live = prev if prev is not None and prev.get("status") != "rejected" else None
         before = _value_of(key, live) if live is not None else None
-        after = value
-        if key[0] == "c" and key[2] == "codes" and isinstance(before, dict):
+        after, note = value, None
+        if key[0] == "r":
+            after, note = _relation_after(table, value, prev, tables)
+        elif key[0] == "c" and key[2] == "codes" and isinstance(before, dict):
             after = _merge_codes(before, value)
         if before is not None and before == after:
             state = "same" if live.get("status") == "confirmed" else "confirm"
@@ -913,7 +956,7 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             state = "change"
         out.append(PatchChange(path=norm, before=copy.deepcopy(before),
                                before_status=live.get("status") if live is not None else None,
-                               after=after, value=value, reason=reason, state=state))
+                               after=after, value=value, reason=reason, state=state, note=note))
     return PatchPlan(out, problems)
 
 
@@ -938,7 +981,10 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             slots[key] = {**prev, "status": "confirmed", "updated_at": at}
             continue
         if key[0] == "r":
-            slots[key] = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
+            rel = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
+            if prev is not None and prev.get("note"):
+                rel["note"] = prev["note"]       # 覆盖率沿用了，说明它怎么测的那段备注也留着
+            slots[key] = rel
         else:
             slots[key] = {"value": change.after, "source": "human", "status": "confirmed", "updated_at": at}
     out = _assemble(slots)
@@ -1006,11 +1052,16 @@ def _comment_is_label(text: str) -> bool:
     return len(text) <= _LABEL_MAX and not _SENTENCE_MARKS.search(text)
 
 
-def _cardinality(meta: Mapping[str, Any], columns: list[str]) -> str:
-    """本表这几列指向别的表时的基数：这几列恰好是本表的主键或某个唯一约束，就是一对一，否则多对一。"""
-    wanted = {c.lower() for c in columns}
+def _is_key(meta: Mapping[str, Any], columns: list[str]) -> bool:
+    """这几列恰好是这张表的主键或某个唯一约束（不分大小写、不计顺序）。"""
+    wanted = {str(c).lower() for c in columns}
     keys = [meta.get("primary_key") or []] + [u for u in meta.get("unique") or [] if isinstance(u, list)]
-    return "one_to_one" if any(wanted == {c.lower() for c in k} for k in keys if k) else "many_to_one"
+    return bool(wanted) and any(wanted == {str(c).lower() for c in k} for k in keys if k)
+
+
+def _cardinality(meta: Mapping[str, Any], columns: list[str]) -> str:
+    """本表这几列指向别的表（的键）时的基数：这几列恰好是本表的主键或某个唯一约束，就是一对一，否则多对一。"""
+    return "one_to_one" if _is_key(meta, columns) else "many_to_one"
 
 
 def _relation(table: str, columns: list[str], to_table: str, to_columns: list[str], source: str, *,
