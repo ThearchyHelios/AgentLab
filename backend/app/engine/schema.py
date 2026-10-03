@@ -23,6 +23,7 @@ class NodeType(StrEnum):
 
     TOOL = "tool"  # 直接调用一个工具
     CODE = "code"  # 沙箱里跑代码
+    MERGE = "merge"  # 合并查询：几次查询的完整结果在库外按键合并（engine/merge_query.py）
 
     BRANCH = "branch"  # 条件分支
     LOOP = "loop"  # 循环 / 迭代

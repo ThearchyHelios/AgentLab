@@ -11,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
-from app.engine.nodes import control, human, io, knowledge, llm, metrics, multi, report, tools
+from app.engine.nodes import control, human, io, knowledge, llm, merge, metrics, multi, report, tools
 from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
 from app.engine.state import GraphState
 
@@ -28,6 +28,7 @@ RUNNERS: dict[NodeType, NodeRunner] = {
     NodeType.SUBGRAPH: multi.run_subgraph,
     NodeType.TOOL: tools.run_tool,
     NodeType.CODE: tools.run_code,
+    NodeType.MERGE: merge.run_merge,
     NodeType.BRANCH: control.run_branch,
     NodeType.LOOP: control.run_loop,
     NodeType.HUMAN: human.run_human,

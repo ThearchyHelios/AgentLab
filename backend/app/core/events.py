@@ -48,6 +48,9 @@ class EventType(StrEnum):
     # 记忆读写。以前发的是 info 日志，而解码器丢弃所有 info——于是往长期记忆里
     # 写东西这件事在界面上是隐形的。让 Copilot 主动记之后，这条不可接受
     MEMORY_END = "memory.end"
+    # 合并查询做完了：哪几个输入（别名、节点、行数、数据源）、哪条合并 SQL、得到几行、有哪些警告。
+    # 运行详情据此展示这一步；完整结果在 query_artifact 指向的查询快照里
+    MERGE_END = "merge.end"
     SANDBOX_START = "sandbox.start"
     SANDBOX_END = "sandbox.end"
 

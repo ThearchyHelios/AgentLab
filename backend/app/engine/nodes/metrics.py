@@ -330,7 +330,7 @@ _REF_HEAD = re.compile(r"^(vars|nodes|input)\.([A-Za-z_一-鿿][\w\-一-鿿]*)(.
 _VIA = {"input": "input", "code": "code", "agent": "agent", "llm": "llm", "tool": "tool",
         "transform": "transform", "metrics": "metric", "retrieve": "retrieval", "loop": "loop",
         "human": "human", "validate": "validate", "supervisor": "team", "subgraph": "subgraph",
-        "memory": "memory"}
+        "memory": "memory", "merge": "merge"}
 
 
 def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,

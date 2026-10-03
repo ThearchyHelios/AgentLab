@@ -53,7 +53,7 @@ _LLM_ONLY = ("prompt", "system", "skills", "use_history", "output_schema")
 _MODEL_KEYS = ("provider", "model")
 #: 报告的指令里照搬了这几类节点的文字，就要提醒：报告撰写自己会收集它们的证据
 _EVIDENCE_TYPES = (NodeType.METRICS, NodeType.TOOL, NodeType.AGENT, NodeType.RETRIEVE, NodeType.CODE,
-                   NodeType.SUBGRAPH)
+                   NodeType.SUBGRAPH, NodeType.MERGE)
 #: 写整段文字的节点：出具契约的 narrative 拼了其中几个的文字，就说不准该换哪一个
 _WRITER_TYPES = (NodeType.LLM, NodeType.AGENT)
 _QUESTION = re.compile(r"(?<![\w.])input\s*\.\s*question(?![\w-])")
@@ -93,7 +93,9 @@ class _Step:
 
 def _queries(node: GraphNode) -> bool:
     """这个节点查库：报告撰写能把它查到的结果编成 Q1、Q2… 引用。只认数据源的查询工具，别的工具的
-    返回进不了目录。"""
+    返回进不了目录。合并查询的结果和数据源查询同形，同样编号。"""
+    if node.type == NodeType.MERGE:
+        return True
     if node.type == NodeType.TOOL:
         return str(node.config.get("tool") or "").startswith("db_query__")
     if node.type == NodeType.AGENT:
