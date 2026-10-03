@@ -825,6 +825,9 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         # 拿截断的查询结果整组算出来的：面板标「结果不完整」并写明原因。完整的指标没有这两个键
         **({"incomplete": True, "incomplete_reason": source.get("incomplete_reason") or ""}
            if source.get("incomplete") else {}),
+        # 来源查询没通过 SQL 检查：面板标出来并写明原因（问题和改法在查询步骤的 checks 里）。没问题的没有这两个键
+        **({"sql_check_failed": True, "sql_check_reason": source.get("sql_check_reason") or ""}
+           if source.get("sql_check_failed") else {}),
         "node_id": entry.get("node_id"), "artifact": artifact or None, "eid": cite.get("eid"),
         "eid_ok": cite.get("eid") == entry.get("eid") == make_eid("metric", artifact or None, {"metric": metric_id}),
         "hash_ok": hash_ok and metric is not None,
@@ -904,6 +907,8 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     hint（期 4，P4-SPEC 2.8.2）：调用方是带文档标记的单元格片段时为真。这时快照若是上传表格的（有 data_version），
     步骤多一个 `provenance: true`，界面据此才去请求推断来源接口；其余情况一个键都不加，形状和期 4 之前完全相同
     （期 4 之前的文档、手工源、指标链都不多发请求）。不看封存状态：未封存的运行照常推断，响应里照实标明。
+
+    checks：快照里记下的 SQL 检查结果（数据目录阶段 2B，见 _query_checks），只在查出问题时有这个键。
     """
     catalog = doc.get("catalog") or {}
     alias = _query_alias(catalog, artifact)
@@ -948,7 +953,8 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
                 masked=[columns[i] for i in sorted(masked)],
                 # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
                 column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
-                **({"provenance": True} if hint and snap.get("data_version") else {}))
+                **({"provenance": True} if hint and snap.get("data_version") else {}),
+                **({"checks": checks} if (checks := _query_checks(snap)) else {}))
     if len(index) > MAX_WINDOW_ROWS:
         index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
     step["row_index"] = index
@@ -956,6 +962,19 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+#: 查询步骤里每条 SQL 检查结果交给界面的字段（data/sqlcheck.SqlCheck.as_dict 去掉 for_model）
+_CHECK_FIELDS = ("code", "level", "message", "table", "column", "relation_id", "sql_excerpt")
+
+
+def _query_checks(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """查询快照里记下的 SQL 检查结果（数据源查询工具执行后对照数据目录查的）。给模型的那句改法不上界面。
+    快照里没有（没查出问题、或者是升级前的快照）返回空列表，步骤里就不加这个键。"""
+    checks = snap.get("checks")
+    if not isinstance(checks, list):
+        return []
+    return [{k: c[k] for k in _CHECK_FIELDS if k in c} for c in checks if isinstance(c, dict) and c.get("code")]
 
 
 # --------------------------------------------------------------------------

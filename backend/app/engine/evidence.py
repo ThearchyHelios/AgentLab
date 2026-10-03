@@ -902,6 +902,9 @@ def build_catalog(
                 # 只在不完整时有这两个键，完整的指标条目和以前一字不差
                 **({"incomplete": True, "incomplete_reason": metric.get("incomplete_reason") or ""}
                    if metric.get("incomplete") else {}),
+                # 来源查询没通过 SQL 检查（data/sqlcheck.py 的 error 级问题）：同样只在有问题时有这两个键
+                **({"sql_check_failed": True, "sql_check_reason": metric.get("sql_check_reason") or ""}
+                   if metric.get("sql_check_failed") else {}),
             }
 
     queries = retrievals = 0
@@ -3109,6 +3112,9 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
                 # 不完整的指标照样能引用（单格、口径都对），但写作者得知道它不是全量：不写行数，免得照抄成裸数字
                 caveat = "（基于被截断的查询结果计算，结果不完整：引用时须如实说明，不要写成全部数据）" \
                     if e.get("incomplete") else ""
+                # 取数的 SQL 没通过检查（重复计算、存量跨期加总）：数是算错的可能很大，写作者引用时得交代
+                if e.get("sql_check_failed"):
+                    caveat += "（所依据的查询未通过 SQL 检查，结果存疑：引用时须如实说明，不要当作确定的结论）"
                 lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}{caveat}")
     inputs = [e for e in catalog.values() if e.get("kind") == "input"]
     if inputs:
