@@ -694,6 +694,43 @@ await section('长表名、Copilot 结局、问数据的分段', async () => {
   await q.page.close()
 })
 
+await section('参考了哪些表：画布右栏和问数据页（context 操作）', async () => {
+  const c = await open('syn=copilot-context&dense=1', { w: 380, h: 800, name: 'copilot-context' })
+  const row = c.page.locator('[data-step-code="copilot_context"]')
+  check('画布右栏：一行说参考了几张表', await row.count() === 1 && (await row.innerText()).includes('参考了 5 张表'),
+    await row.count() ? await row.innerText() : '没有这一行')
+  check('表名收在展开区，不铺满窄栏', !(await row.innerText()).includes('channel_visits'))
+  await row.locator('button').first().click()
+  await c.page.waitForTimeout(150)
+  const expanded = await row.innerText()
+  check('展开看到按数据源分组的表名', expanded.includes('「scenic」按需求从 51 张表中挑出 3 张')
+    && expanded.includes('channel_visits') && expanded.includes('「shop」全部 2 张表'), expanded.slice(0, 160))
+  const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('展开后不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+  check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
+  await c.page.close()
+
+  const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-fallback' })
+  const fb = f.page.locator('[data-step-code="copilot_context"]')
+  check('挑表失败：写明只给了表名', await fb.count() === 1 && (await fb.innerText()).includes('未能按需求挑选，已提供全部表名'))
+  await fb.locator('button').first().click()
+  await f.page.waitForTimeout(150)
+  check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))
+  await f.page.close()
+
+  const q = await open('syn=chat', { w: 1100, h: 800, name: 'chat-context' })
+  check('问数据页：执行开始后这一行随「规划」收起', !(await q.page.locator('body').innerText()).includes('参考了 2 张表'))
+  await q.page.locator('button', { hasText: '规划' }).first().click()
+  await q.page.waitForTimeout(200)
+  const qrow = q.page.locator('[data-step-code="copilot_context"]')
+  check('问数据页：点开「规划」看到参考了几张表', await qrow.count() === 1 && (await qrow.innerText()).includes('参考了 2 张表'))
+  await qrow.locator('button').first().click()
+  await q.page.waitForTimeout(150)
+  check('问数据页：展开看到表名', (await qrow.innerText()).includes('v_device_kpi、dim_device'))
+  check('问数据页：没有运行时报错', q.errors.length === 0, q.errors.join(' | '))
+  await q.page.close()
+})
+
 await section('步骤行和画布联动', async () => {
   const { page } = await open('syn=mixed&link=1', { w: 1100, h: 800 })
   const row = page.locator('[data-node-id="agent"]').first()

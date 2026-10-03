@@ -10,7 +10,7 @@
 
 - all：放得下详细摘要的库，照旧每张表一行带字段，额外带上数据目录和表之间的连接条件；
 - model：大库，挑表成功：挑中的表讲透，其余只列名字；
-- fallback：大库，挑表失败（模型不可用、报错、超时、回复读不出、返回为空或返回的表都不存在），退回以前的
+- fallback：大库，挑表失败（模型不可用、报错、超时、回复无法识别、返回为空或返回的表都不存在），退回以前的
   「只列表名」。挑表只是让模型少猜，**绝不能挡住生成**：没有它，模型照旧可以先用 db_schema 查字段。
 
 现有工作流（画布上改图时的原图、问数据追问时上一轮的图）的 SQL 里查过哪些表是确定的事实：大库里这些表一律
@@ -269,7 +269,7 @@ async def plan_context(sources: list[Any], *, graph: Mapping[str, Any] | None = 
 
 
 class _Unreadable(ValueError):
-    """模型的回复读不出表名。"""
+    """模型的回复里识别不出表名。"""
 
 
 def _picked(raw: Any) -> list[tuple[str | None, str]] | None:
@@ -316,7 +316,7 @@ async def _ask(model: Any, messages: list[tuple[str, str]]) -> list[tuple[str | 
         return parsed
     parsed = _picked(message_text(await model.ainvoke(messages)))
     if parsed is None:
-        raise _Unreadable("模型的回复不是约定的格式，读不出要用的表")
+        raise _Unreadable("模型的回复不是约定的格式，无法识别要用的表")
     return parsed
 
 
@@ -386,13 +386,13 @@ class ContextPlan:
         reason: str | None = None
         chosen: list[tuple[int, str]] = []
         if model is None:
-            reason = unavailable or "没有可用的模型"
+            reason = unavailable or "未配置可用的模型"
         else:
             try:
                 picks = await asyncio.wait_for(_ask(model, self._pick_messages(need)), timeout=PICK_TIMEOUT_S)
                 chosen = self._resolve(picks)
                 if not picks:
-                    reason = "模型没有挑出任何表"
+                    reason = "模型未挑出任何表"
                 elif not chosen:
                     reason = "模型挑出的表在表结构中都不存在"
             except asyncio.TimeoutError:

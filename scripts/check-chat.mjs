@@ -472,6 +472,9 @@ async function fakeApi(route) {
     }
     const ops = [
       { op: 'heartbeat', phase: 'planning', elapsed_ms: 800 },
+      // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
+      { op: 'context', elapsed_ms: 1200, sources: [
+        { source: 'shop', tables: ['orders', 'order_items'], selected_by: 'model', total: 48 }] },
       { op: 'plan', summary: '查一下再回答' },
       ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
       { op: 'done', explanation: '一张三步的图' },
@@ -1024,6 +1027,16 @@ for (const theme of THEMES) {
     check('完整答案取到了，meta 里没有「没取全」', !meta?.clipped, JSON.stringify(meta?.clipped))
     await page.getByText('展开全部').first().click().catch(() => {})
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
+    // 建图时服务端说了这一轮参考了哪些表：收在「规划」里，点开是一行，再点开看表名
+    check('建图的 context 操作原样记进这一轮', t.ops.some((o) => o.op === 'context'))
+    const turnCard = page.locator('[data-turn]').last()
+    await turnCard.locator('button', { hasText: '规划' }).first().click()
+    const ctxRow = turnCard.locator('[data-step-code="copilot_context"]')
+    check('点开「规划」看到参考了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
+      && (await ctxRow.innerText()).includes('参考了 2 张表'))
+    await ctxRow.locator('button').first().click()
+    check('再点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 2 张：orders、order_items')
+      .waitFor({ timeout: 3000 }).then(() => true, () => false))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

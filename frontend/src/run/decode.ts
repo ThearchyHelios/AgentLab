@@ -2404,6 +2404,83 @@ function labelsOf(ops: CopilotOp[], fallback?: (id: string) => string | undefine
   return (id) => map.get(id) ?? fallback?.(id)
 }
 
+/** context 操作里一个数据源的那一项（服务端 copilot_context.DatasourceContext.op） */
+export interface CopilotContextSource {
+  source: string
+  /** 模型看得到全部字段的表（全名）。只给了表名的不在这里 */
+  tables: string[]
+  /** model：按需求挑的；all：库不大，全部表都带字段；fallback：没能挑出来，只给了表名 */
+  selectedBy: 'model' | 'all' | 'fallback'
+  /** 这个库一共几张表 */
+  total?: number
+  /** 没能挑出来的原因 */
+  reason?: string
+}
+
+/** 挑表失败时的说法：模型这一轮只看到表名，字段要它自己去查 */
+export const CONTEXT_FALLBACK_TEXT = '未能按需求挑选，已提供全部表名'
+
+function contextSources(op: CopilotOp): CopilotContextSource[] {
+  const list: unknown[] = Array.isArray(op.sources) ? op.sources : []
+  return list
+    .filter((x): x is Record<string, any> => !!x && typeof x === 'object' && typeof (x as any).source === 'string')
+    .map((x) => {
+      const total = num(x.total)
+      return {
+        source: x.source,
+        tables: Array.isArray(x.tables) ? x.tables.map(String) : [],
+        selectedBy: x.selected_by === 'model' || x.selected_by === 'fallback' ? x.selected_by : 'all',
+        ...(total != null ? { total } : {}),
+        ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
+      }
+    })
+}
+
+/** 一个库在展开区里的那一行：怎么来的 + 表名 */
+function contextLine(g: CopilotContextSource): string {
+  const names = g.tables.join('、')
+  const of = g.total != null ? `共 ${g.total} 张表` : ''
+  switch (g.selectedBy) {
+    case 'all':
+      return `「${g.source}」全部 ${g.tables.length} 张表：${names}`
+    case 'model':
+      return g.tables.length
+        ? `「${g.source}」按需求${g.total != null ? `从 ${g.total} 张表中` : ''}挑出 ${g.tables.length} 张：${names}`
+        : `「${g.source}」${of ? `${of}，` : ''}未挑中与需求相关的表，已提供全部表名`
+    default:
+      return `「${g.source}」${of ? `${of}，` : ''}${CONTEXT_FALLBACK_TEXT}`
+        + (g.tables.length ? `；现有工作流用到的 ${g.tables.length} 张表附带全部字段：${names}` : '')
+  }
+}
+
+/**
+ * 助手这一轮参考了哪些表（context 操作）→ 过程里的一行。
+ *
+ * 大库放不下全部字段，服务端先按需求挑表，挑中的表给模型全部字段。这件事要看得见：生成的 SQL 用错了表，
+ * 先得知道模型当时看到的是哪几张。标题只说几张（「参考了 8 张表」），展开按数据源分组列表名；挑表失败时
+ * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
+ */
+export function copilotContext(op: CopilotOp): { title: string; sub?: string; detail: string; ms?: number } | null {
+  const groups = contextSources(op)
+  if (!groups.length) return null
+  const count = groups.reduce((n, g) => n + g.tables.length, 0)
+  const failed = groups.filter((g) => g.selectedBy === 'fallback')
+  // 有表带着字段（小库，或者现有工作流用到的表）时标题仍说几张，没挑成的事放副标题
+  const sub = count && failed.length
+    ? failed.length === groups.length ? CONTEXT_FALLBACK_TEXT
+      : `「${failed.map((g) => g.source).join('」「')}」${CONTEXT_FALLBACK_TEXT}`
+    : undefined
+  const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
+  // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
+  const ms = num(op.elapsed_ms)
+  return {
+    title: count ? `参考了 ${count} 张表` : CONTEXT_FALLBACK_TEXT,
+    ...(sub ? { sub } : {}),
+    detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
+    ...(ms != null && ms >= 10 ? { ms } : {}),
+  }
+}
+
 /** 用了限定范围之外的数据源：自查交回模型改也改不掉时，人要知道是范围的事，不是图写错了 */
 const OUT_OF_SCOPE_NEXT = '本轮限定了查询的数据源，但工作流使用了范围之外的数据库。请取消限定后重新提问，或将所需数据库加入查询范围'
 
@@ -2506,6 +2583,16 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         }
         add({ id: `hb-${i}`, seq: i, kind: 'lifecycle', status: 'running', title: label,
               ...(elapsed ? { ms: elapsed, meta: formatDuration(elapsed) } : {}) })
+        break
+      }
+      case 'context': {
+        // 这一轮参考了哪些表：标题说几张，展开看按数据源分组的表名
+        const ctx = copilotContext(op)
+        if (!ctx) break
+        add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: 'copilot_context',
+              title: ctx.title, detail: ctx.detail,
+              ...(ctx.sub ? { sub: ctx.sub } : {}),
+              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}) })
         break
       }
       case 'plan':

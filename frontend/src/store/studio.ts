@@ -12,7 +12,7 @@ import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
 import { UPGRADE_TEXT } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
-import { endingOf, reduceTeam, settleTeam } from '../run/decode'
+import { copilotContext, endingOf, reduceTeam, settleTeam } from '../run/decode'
 import { activeEdgesOf, applyDerived } from '../run/derive'
 import {
   emptyTrace, finalizeTrace, foldEvent, isActivePhase, isSettled, isTerminal, runStatusOf,
@@ -1888,6 +1888,12 @@ export const useStudio = create<StudioState>((set, get) => ({
               },
             })
             break
+          case 'context': {
+            // 服务端按需求挑了表：浮条和轮次卡上先说参考了几张表，展开的过程里有表名（decodeCopilot）
+            const ctx = copilotContext(op)
+            if (ctx) set({ copilot: { ...s.copilot, lastOp: ctx.title } })
+            break
+          }
           case 'plan':
             set({ copilot: { ...s.copilot, phase: 'planning', lastOp: op.summary ?? '规划中' } })
             break

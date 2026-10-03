@@ -395,6 +395,41 @@ export const COPILOT_TOOLS_DROPPED = [
   ] },
 ]
 
+/**
+ * 助手按需求挑表（context 操作，copilot_context.DatasourceContext.op）：大库挑了 3 张（含补进来的关联表），
+ * 小库全部表都带字段。挑表用了 3 秒多，先到一拍心跳，再是 context，然后照常思考、起草、自查
+ */
+export const COPILOT_CONTEXT = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
+  { op: 'context', elapsed_ms: 3420, sources: [
+    { source: 'scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51 },
+    { source: 'shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2 },
+  ] },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 6000 },
+  { op: 'thinking', delta: '入园记录不带渠道，要经 channel_visits 连到渠道表，再按渠道汇总上月的入园人次。' },
+  { op: 'plan', summary: '取数 → 出结论' },
+  { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询各渠道入园人次' } },
+  { op: 'add_node', node: { id: 'o', type: 'output', label: '成果' } },
+  { op: 'done', explanation: '两步' },
+  { op: 'check', status: 'passed', repaired: 0 },
+  { op: 'final', graph: { nodes: [{ id: 'q' }, { id: 'o' }] } },
+]
+
+/** 挑表失败（超时）：只给了表名，原因随 context 带来；生成照常进行 */
+export const COPILOT_CONTEXT_FALLBACK = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 18000 },
+  { op: 'context', elapsed_ms: 20004, sources: [
+    { source: 'scenic', tables: [], selected_by: 'fallback', total: 51, reason: '挑选数据表超过 20 秒未完成' },
+  ] },
+  { op: 'plan', summary: '先查表结构，再取数' },
+  { op: 'add_node', node: { id: 's', type: 'tool', label: '查看表结构' } },
+  { op: 'add_node', node: { id: 'o', type: 'output', label: '成果' } },
+  { op: 'done', explanation: '两步' },
+  { op: 'final', graph: { nodes: [{ id: 's' }, { id: 'o' }] } },
+]
+
 /** Copilot 操作流：思考被心跳打断、自查修一轮没修好、模型写了不存在的节点类型 */
 export const COPILOT_STUCK = [
   { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
