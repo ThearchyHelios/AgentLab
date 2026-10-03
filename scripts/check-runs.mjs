@@ -706,9 +706,11 @@ await section('正式运行：发布之后数据目录有变化，提醒但不�
   ], edges: [{ source: 'a', target: 'q' }] }
   const events = [
     { seq: 1, type: 'run.started', node_id: null, ts: t, data: { nodes: 2 } },
-    { seq: 2, type: 'catalog.drift', node_id: null, ts: t + 0.01, data: { version: 3, count: 2, tables: [
-      { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5 },
-      { source: 'scenic', source_id: 'src-scenic', table: 'parks', label: null, published: 0, current: 1 },
+    { seq: 2, type: 'catalog.drift', node_id: null, ts: t + 0.01, data: { version: 3, count: 3, tables: [
+      { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+      { source: 'scenic', source_id: 'src-scenic', table: 'parks', label: null, published: 0, current: 1, impact: 'direct' },
+      // Agent 绑定了这个源的查询工具：SQL 运行时才写，记的是源里有目录的表
+      { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
     ] } },
     { seq: 3, type: 'node.started', node_id: 'a', ts: t + 0.1, data: {} },
     { seq: 4, type: 'node.finished', node_id: 'a', ts: t + 0.2, data: { duration_ms: 100 } },
@@ -723,11 +725,20 @@ await section('正式运行：发布之后数据目录有变化，提醒但不�
   const banner = page.locator('[data-run-banner="catalog-drift"]')
   check('详情显示目录变化的横幅', await banner.waitFor({ timeout: 5000 }).then(() => true, () => false))
   const text = await banner.innerText().catch(() => '')
-  check('横幅标题：「入园记录」等 2 张表有变化', text.includes('自发布以来，数据目录中「入园记录」等 2 张表有变化'), text.split('\n')[0])
+  check('横幅标题：「入园记录」等 2 张表有变化，另有 1 张 Agent 可能查询的表有变化',
+    text.includes('自发布以来，数据目录中「入园记录」等 2 张表有变化；另有 1 张 Agent 可能查询的表有变化'), text.split('\n')[0])
   check('写明运行未被拦截', text.includes('运行未被拦截'))
   check('逐表写发布时和现在的版本，没有目录写「尚无目录」', text.includes('「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版')
     && text.includes('「scenic」parks：发布时尚无目录，现为第 1 版'), text.replace(/\s+/g, ' '))
   check('每张表给到数据目录的入口', (await banner.locator('[data-drift-open="visits"]').getAttribute('href')) === '/data/catalog/src-scenic/visits')
+  const possible = banner.locator('[data-drift-possible]')
+  const possibleText = await possible.innerText().catch(() => '')
+  check('Agent 可能查询的表另起一组：小标题、说明、逐表一行', await possible.count() === 1
+    && possibleText.includes('Agent 可能查询的表') && possibleText.includes('SQL 在运行时生成')
+    && possibleText.includes('「scenic」订单（orders）：发布时第 2 版，现为第 4 版'), possibleText.replace(/\s+/g, ' '))
+  check('……直接引用的表不在这一组里', await possible.locator('[data-drift-table="visits"]').count() === 0
+    && (await banner.locator('[data-drift-table="orders"]').getAttribute('data-drift-impact')) === 'possible')
+  check('……也给到数据目录的入口', (await banner.locator('[data-drift-open="orders"]').getAttribute('href')) === '/data/catalog/src-scenic/orders')
   check('运行照常完成：没有失败横幅', await page.locator('[data-run-banner=failed]').count() === 0)
   const row = page.locator('[data-step-code="catalog_drift"]')
   check('时间线里也有一行提醒', await row.count() === 1 && (await row.innerText()).includes('等 2 张表有变化'))

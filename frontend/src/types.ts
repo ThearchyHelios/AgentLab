@@ -56,10 +56,21 @@ export interface WorkflowVersion {
   input_fields?: { name: string; required?: boolean; [key: string]: any }[]
   /** 是不是当前的已发布版本 */
   published?: boolean
-  /** 发布时这一版 SQL 用到的表的数据目录版本 {源名: {表名: 版本}}，0 表示当时还没有目录；没记过为 null */
-  catalog_versions?: Record<string, Record<string, number>> | null
+  /** 发布时记下的数据目录版本，没记过为 null */
+  catalog_versions?: CatalogVersions | null
   /** 发布之后目录有变化的表 */
   catalog_changes?: CatalogDriftTable[]
+}
+
+/**
+ * 发布时记下的数据目录版本（服务端 catalog_impact.recorded_versions），两组都是 {源名: {表名: 版本}}：
+ * - direct：SQL 里写着的表，0 表示当时还没有目录
+ * - possible：Agent 绑定了查询工具的数据源中所有有目录的表（SQL 运行时才生成）；源下为空表示当时一张有目录的
+ *   表都没有。只记了直接引用的老版本这一组为空
+ */
+export interface CatalogVersions {
+  direct: Record<string, Record<string, number>>
+  possible: Record<string, Record<string, number>>
 }
 
 /** 发布之后数据目录有变化的一张表（服务端 catalog_impact.catalog_drift；运行里的 catalog.drift 事件同形） */
@@ -72,6 +83,8 @@ export interface CatalogDriftTable {
   /** 发布时的版本，0 表示当时还没有目录 */
   published: number | null
   current: number
+  /** direct：SQL 里写着这张表；possible：Agent 可能查询的表。老事件没有这一项，按 direct */
+  impact: 'direct' | 'possible'
 }
 
 /**

@@ -205,3 +205,18 @@ def test_assistant_seeds_read_tool_nodes_the_same_way():
     assert graph_tables(graph, [shop]) == {"shop": ["customers", "orders", "stores"]}
     graph["nodes"] = [n for n in graph["nodes"] if n["id"] != "q2"]
     assert graph_tables(graph, [shop]) == {"shop": ["customers", "orders"]}
+
+
+def test_recorded_versions_reads_both_shapes():
+    """发布记录两种写法：现在的 {direct, possible}，和可能涉及上线之前只记直接引用的 {源名: {表名: 版本}}。
+    源名可以就叫 direct / possible，靠第二层是不是版本号分开。"""
+    from app.data.catalog_impact import recorded_versions
+
+    now = {"direct": {"shop": {"orders": 2}}, "possible": {"shop": {"customers": 1}, "crm": {}}}
+    assert recorded_versions(now) == now
+    assert recorded_versions({"direct": {}, "possible": {}}) == {"direct": {}, "possible": {}}
+    assert recorded_versions({"shop": {"orders": 2}}) == {"direct": {"shop": {"orders": 2}}, "possible": {}}
+    # 旧写法里一个叫 direct 的源
+    assert recorded_versions({"direct": {"orders": 2}}) == {"direct": {"direct": {"orders": 2}}, "possible": {}}
+    assert recorded_versions({}) == {"direct": {}, "possible": {}}
+    assert recorded_versions(None) is None and recorded_versions("x") is None and recorded_versions({"shop": 3}) is None

@@ -263,11 +263,17 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
     if (sub === 'versions' && !v) return json(route, VERSIONS)
     if (sub === 'versions' && v) {
       const n = Number(v)
-      // 已发布的 v2 记着发布时的目录版本：入园记录之后改过（第 3 版 → 第 5 版），景区表没变
+      // 已发布的 v2 记着发布时的目录版本：入园记录之后改过（第 3 版 → 第 5 版），景区表没变；
+      // Agent 绑定了 shop 的查询工具，可能查询的表里订单改过、闸机是发布之后才建的目录，另一个源发布时还没有目录
       return json(route, { ...VERSIONS.find((x) => x.version === n), workflow_id: id,
         graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2,
-        catalog_versions: n === 2 ? { shop: { parks: 1, visits: 3 } } : null,
-        catalog_changes: n === 2 ? [{ source: 'shop', source_id: 'src-shop', table: 'visits', label: '入园记录', published: 3, current: 5 }] : [] })
+        catalog_versions: n === 2
+          ? { direct: { shop: { parks: 1, visits: 3 } }, possible: { shop: { orders: 2, channels: 1 }, crm: {} } } : null,
+        catalog_changes: n === 2 ? [
+          { source: 'shop', source_id: 'src-shop', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+          { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+          { source: 'shop', source_id: 'src-shop', table: 'gates', label: null, published: 0, current: 1, impact: 'possible' },
+        ] : [] })
     }
     if (method === 'GET' && !sub) return state.deleted.has(id) ? json(route, { detail: '工作流不存在，可能已被删除' }, 404) : json(route, FAKES[id])
     if (method === 'DELETE' && !sub) {
@@ -1011,8 +1017,20 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   const catText = await cat.innerText().catch(() => '')
   check('已发布的版本写「发布时的目录版本」', catText.includes('发布时的目录版本') && catText.includes('parks') && catText.includes('第 1 版'), catText)
   check('之后改过的表标出来', (await page.locator('[data-version-catalog-table="visits"]').getAttribute('data-changed')) === 'true'
-    && catText.includes('之后有变化，现为第 5 版') && catText.includes('1 张表在发布之后有变化'), catText.replace(/\s+/g, ' '))
+    && catText.includes('之后有变化，现为第 5 版') && catText.includes('3 张表在发布之后有变化'), catText.replace(/\s+/g, ' '))
   check('没改过的表不标', (await page.locator('[data-version-catalog-table="parks"]').getAttribute('data-changed')) === null)
+  // Agent 可能查询的表：另起一组，和 SQL 里写着的表分开
+  const possible = cat.locator('[data-version-catalog-possible]')
+  const possibleText = await possible.innerText().catch(() => '')
+  check('Agent 可能查询的表另起一组', await possible.count() === 1 && possibleText.includes('Agent 可能查询的表')
+    && await possible.locator('[data-version-catalog-table="visits"]').count() === 0, possibleText.replace(/\s+/g, ' '))
+  check('……改过的标出来，没改过的不标', (await possible.locator('[data-version-catalog-table="orders"]').getAttribute('data-changed')) === 'true'
+    && (await possible.locator('[data-version-catalog-table="channels"]').getAttribute('data-changed')) === null
+    && possibleText.includes('之后有变化，现为第 4 版'), possibleText.replace(/\s+/g, ' '))
+  check('……发布之后才建目录的表也列出来，发布时写「尚无目录」',
+    (await possible.locator('[data-version-catalog-table="gates"]').getAttribute('data-changed')) === 'true'
+    && (await possible.locator('[data-version-catalog-table="gates"]').innerText()).includes('尚无目录'))
+  check('……发布时一张有目录的表都没有的源写一句', possibleText.includes('「crm」发布时还没有目录'), possibleText.replace(/\s+/g, ' '))
   await page.locator('ol[aria-label="版本"] > li').nth(2).locator('button').first().click()
   await page.waitForTimeout(300)
   check('没发布过的版本没有目录版本这一栏', await count(page, '[data-version-catalog]') === 0)

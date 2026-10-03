@@ -2224,26 +2224,40 @@ export const CATALOG_IMPACT_TEXT = {
 }
 
 /**
- * 发布时的目录版本：发布时记下这一版 SQL 用到的表的数据目录版本；从这一版发起正式运行时目录有变化，提醒而不拦。
+ * 发布时的目录版本：发布时记下这一版用到的表的数据目录版本；从这一版发起正式运行时目录有变化，提醒而不拦。
  * 版本号写「第 N 版」，还没有目录的表写「尚无目录」。
+ *
+ * 和影响面（CATALOG_IMPACT_TEXT）同一个分法：SQL 里写着的表是直接引用，说「有变化」；Agent 绑定了数据源的查询工具、
+ * SQL 运行时才写的，记的是这个数据源中所有有目录的表，说「Agent 可能查询的表有变化」——两组分开写，不混成一句。
  */
 export const CATALOG_DRIFT_TEXT = {
   /** 运行里的提醒：「自发布以来，数据目录中「入园记录」等 2 张表有变化」 */
   title: (first: string, n: number) => (n > 1
     ? `自发布以来，数据目录中「${first}」等 ${formatNumber(n)} 张表有变化`
     : `自发布以来，数据目录中「${first}」有变化`),
+  /** 只有 Agent 可能查询的表变了：「自发布以来，Agent 可能查询的表有变化：「入园记录」等 3 张」 */
+  possibleTitle: (first: string, n: number) => (n > 1
+    ? `自发布以来，Agent 可能查询的表有变化：「${first}」等 ${formatNumber(n)} 张`
+    : `自发布以来，Agent 可能查询的表有变化：「${first}」`),
+  /** 两组都有：直接引用的标题后面补一句 */
+  alsoPossible: (n: number) => `；另有 ${formatNumber(n)} 张 Agent 可能查询的表有变化`,
   sub: '运行未被拦截。请核对这些表的目录修改是否影响本次结果',
   table: (label: string | null, table: string) => (label ? `${label}（${table}）` : table),
   version: (v: number | null) => (v ? `第 ${formatNumber(v)} 版` : '尚无目录'),
   line: (source: string, table: string, from: string, to: string) => `「${source}」${table}：发布时${from}，现为${to}`,
   open: '查看目录',
+  /** 可能涉及那一组的小标题和说明（运行横幅、时间线展开、版本历史共用） */
+  possibleHead: 'Agent 可能查询的表',
+  possibleHint: 'Agent 绑定了这些数据源的查询工具，SQL 在运行时生成：发布时记下了数据源中所有有目录的表，不一定都会用到',
   // ---- 版本历史里的「发布时的目录版本」
   section: '发布时的目录版本',
-  sectionHint: '这一版 SQL 用到的表在发布时的数据目录版本',
+  sectionHint: '这一版 SQL 用到的表，以及 Agent 可能查询的表，在发布时的数据目录版本',
   changedSince: (now: string) => `之后有变化，现为${now}`,
   changedCount: (n: number) => `${formatNumber(n)} 张表在发布之后有变化，下次正式运行时会提醒`,
   unchanged: '发布之后这些表的目录没有变化',
   empty: '这一版的 SQL 没有用到数据库表',
+  /** 可能涉及的数据源在发布时一张有目录的表都没有 */
+  possibleNone: (source: string) => `「${source}」发布时还没有目录`,
 }
 
 // ===========================================================================

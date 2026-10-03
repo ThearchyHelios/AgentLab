@@ -737,6 +737,26 @@ await section('正式运行：发布之后数据目录有变化（catalog.drift 
     && row.detail.includes('「scenic」parks：发布时尚无目录，现为第 1 版'), row?.detail)
   const one = mod.catalogDrift({ tables: [{ source: 's', table: 't', label: null, published: 1, current: 2 }] })
   check('只有一张表：标题不写「等」', one?.title === '自发布以来，数据目录中「t」有变化', one?.title)
+  check('老事件的表没有 impact：按直接引用', one?.direct.length === 1 && one?.possible.length === 0 && one?.tables[0].impact === 'direct')
+  // Agent 可能查询的表（SQL 运行时才写）：和直接引用分开说
+  const mixed = mod.catalogDrift({ tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+    { source: 'scenic', source_id: 'src-scenic', table: 'gates', label: null, published: 0, current: 1, impact: 'possible' },
+  ] })
+  check('两组都有：标题说直接引用的，再补一句 Agent 可能查询的表有变化',
+    mixed?.title === '自发布以来，数据目录中「入园记录」有变化；另有 2 张 Agent 可能查询的表有变化', mixed?.title)
+  check('……展开：直接引用在前，可能涉及的在小标题下面', mixed?.detail === [
+    '「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版', 'Agent 可能查询的表：',
+    '「scenic」订单（orders）：发布时第 2 版，现为第 4 版', '「scenic」gates：发布时尚无目录，现为第 1 版'].join('\n'), mixed?.detail)
+  const agentOnly = mod.catalogDrift({ tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+  ] })
+  check('只有可能涉及的：标题直说「Agent 可能查询的表有变化」', agentOnly?.title === '自发布以来，Agent 可能查询的表有变化：「订单」', agentOnly?.title)
+  const run = mod.decodeRun([{ seq: 1, type: 'catalog.drift', node_id: null, ts: 1, data: { version: 2, count: 1, tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' }] } }])
+    .find((s) => s.code === 'catalog_drift')
+  check('……时间线里那一行同样是警告', run?.level === 'warn' && run?.title === agentOnly?.title, run?.title)
   check('形状不对不出行', mod.decodeRun([{ seq: 1, type: 'catalog.drift', node_id: null, ts: 1, data: { tables: 'x' } }])
     .every((s) => s.code !== 'catalog_drift'))
 })

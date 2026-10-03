@@ -10,7 +10,7 @@ import { formatDateTime, formatTime } from '../lib/format'
 import { CATALOG_DRIFT_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import { hintOf } from './shortcuts'
 import type { Edge } from '@xyflow/react'
-import type { CatalogDriftTable, GraphSpec, Workflow, WorkflowVersion } from '../types'
+import type { CatalogDriftTable, CatalogVersions as CatalogVersionsRecord, GraphSpec, Workflow, WorkflowVersion } from '../types'
 
 /**
  * 版本历史。盖在右栏上的一层，和属性面板同一种「临时造访」。
@@ -212,38 +212,65 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
 
 /**
- * 发布时的目录版本：这一版 SQL 用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式
- * 运行时会提醒「数据目录有变化」，这里先让人看到是哪几张表
+ * 发布时的目录版本：这一版用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式运行时会
+ * 提醒「数据目录有变化」，这里先让人看到是哪几张表。
+ *
+ * 两组分开列：SQL 里写着的表在前；Agent 可能查询的表（Agent 绑定了数据源的查询工具，发布时记下数据源中所有有
+ * 目录的表）在小标题下面。可能涉及的数据源里发布之后新建了目录的表，记录里没有它，按变化里给的补进来（发布时
+ * 「尚无目录」）
  */
-function CatalogVersions({ versions, changes }: {
-  versions: Record<string, Record<string, number>>
-  changes: CatalogDriftTable[]
-}) {
-  const rows = Object.entries(versions).flatMap(([source, tables]) =>
-    Object.entries(tables).map(([table, v]) => ({ source, table, v })))
-  const changed = new Map(changes.map((c) => [`${c.source}/${c.table}`, c]))
+function CatalogVersions({ versions, changes }: { versions: CatalogVersionsRecord; changes: CatalogDriftTable[] }) {
+  // 老后端给的变化没有 impact：按直接引用
+  const impactOf = (c: CatalogDriftTable) => (c.impact === 'possible' ? 'possible' : 'direct')
+  const changed = new Map(changes.map((c) => [`${impactOf(c)}/${c.source}/${c.table}`, c]))
+  const rowsOf = (impact: CatalogDriftTable['impact']) => {
+    const recorded = Object.entries(versions[impact] ?? {}).flatMap(([source, tables]) =>
+      Object.entries(tables).map(([table, v]) => ({ source, table, v: v as number | null })))
+    const known = new Set(recorded.map((r) => `${r.source}/${r.table}`))
+    const added = changes.filter((c) => impactOf(c) === impact && !known.has(`${c.source}/${c.table}`))
+      .map((c) => ({ source: c.source, table: c.table, v: c.published }))
+    return [...recorded, ...added]
+  }
+  const direct = rowsOf('direct')
+  const possible = rowsOf('possible')
+  const bare = Object.entries(versions.possible ?? {})
+    .filter(([source, tables]) => !Object.keys(tables).length && !possible.some((r) => r.source === source))
+    .map(([source]) => source)
+  const list = (impact: CatalogDriftTable['impact'], rows: typeof direct) => (
+    <ul className="mt-1 space-y-0.5 text-2xs">
+      {rows.map(({ source, table, v }) => {
+        const c = changed.get(`${impact}/${source}/${table}`)
+        return (
+          <li key={`${source}/${table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5"
+              data-version-catalog-table={table} data-impact={impact} data-changed={c ? 'true' : undefined}>
+            <span className="mono min-w-0 truncate" title={`${source} · ${table}`}>{table}</span>
+            <span className="shrink-0 text-faint">{CATALOG_DRIFT_TEXT.version(v)}</span>
+            {c && (
+              <span className="shrink-0" style={{ color: 'var(--st-waiting)' }}>
+                {CATALOG_DRIFT_TEXT.changedSince(CATALOG_DRIFT_TEXT.version(c.current))}
+              </span>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+  const empty = !direct.length && !possible.length && !bare.length
   return (
     <div className="mt-3 border-t pt-2" data-version-catalog={changes.length}>
       <div className="text-2xs font-medium text-dim" title={CATALOG_DRIFT_TEXT.sectionHint}>{CATALOG_DRIFT_TEXT.section}</div>
-      {!rows.length ? <div className="mt-1 text-2xs text-faint">{CATALOG_DRIFT_TEXT.empty}</div> : (
+      {empty ? <div className="mt-1 text-2xs text-faint">{CATALOG_DRIFT_TEXT.empty}</div> : (
         <>
-          <ul className="mt-1 space-y-0.5 text-2xs">
-            {rows.map(({ source, table, v }) => {
-              const c = changed.get(`${source}/${table}`)
-              return (
-                <li key={`${source}/${table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5" data-version-catalog-table={table}
-                    data-changed={c ? 'true' : undefined}>
-                  <span className="mono min-w-0 truncate" title={`${source} · ${table}`}>{table}</span>
-                  <span className="shrink-0 text-faint">{CATALOG_DRIFT_TEXT.version(v)}</span>
-                  {c && (
-                    <span className="shrink-0" style={{ color: 'var(--st-waiting)' }}>
-                      {CATALOG_DRIFT_TEXT.changedSince(CATALOG_DRIFT_TEXT.version(c.current))}
-                    </span>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
+          {direct.length > 0 && list('direct', direct)}
+          {(possible.length > 0 || bare.length > 0) && (
+            <div className="mt-1.5" data-version-catalog-possible={possible.length}>
+              <div className="text-2xs text-dim" title={CATALOG_DRIFT_TEXT.possibleHint}>{CATALOG_DRIFT_TEXT.possibleHead}</div>
+              {possible.length > 0 && list('possible', possible)}
+              {bare.map((source) => (
+                <div key={source} className="mt-0.5 text-2xs text-faint">{CATALOG_DRIFT_TEXT.possibleNone(source)}</div>
+              ))}
+            </div>
+          )}
           <div className="mt-1 text-2xs" style={{ color: changes.length ? 'var(--st-waiting)' : undefined }}>
             <span className={changes.length ? undefined : 'text-faint'}>
               {changes.length ? CATALOG_DRIFT_TEXT.changedCount(changes.length) : CATALOG_DRIFT_TEXT.unchanged}

@@ -2556,25 +2556,45 @@ function labelsOf(ops: CopilotOp[], fallback?: (id: string) => string | undefine
   return (id) => map.get(id) ?? fallback?.(id)
 }
 
+/** 一张表的那一行：「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版 */
+export function catalogDriftLine(t: CatalogDriftTable): string {
+  return CATALOG_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table),
+    CATALOG_DRIFT_TEXT.version(t.published), CATALOG_DRIFT_TEXT.version(t.current))
+}
+
 /**
- * catalog.drift 事件 → 提醒的标题和逐表明细。标题按第一张表的中文名说（「入园记录」等 2 张表），明细每张表一行：
- * 发布时第几版、现在第几版（0 写「尚无目录」）。认不出的形状返回 null
+ * catalog.drift 事件 → 提醒的标题和逐表明细。每张表带 impact：direct 是 SQL 里写着的表，possible 是 Agent 可能
+ * 查询的表（Agent 绑定了数据源的查询工具，SQL 运行时才生成），两组分开说：
+ * - 标题按第一张直接引用的表说（「入园记录」等 2 张表有变化），还有可能涉及的补一句「另有 N 张 Agent 可能查询的表
+ *   有变化」；只有可能涉及的，标题直说「Agent 可能查询的表有变化」
+ * - 明细每张表一行：发布时第几版、现在第几版（0 写「尚无目录」）；可能涉及的放在小标题下面
+ * 老事件的表没有 impact，按直接引用。认不出的形状返回 null
  */
-export function catalogDrift(d: Record<string, any>): { title: string; detail: string; tables: CatalogDriftTable[] } | null {
+export function catalogDrift(d: Record<string, any>): {
+  title: string; detail: string; tables: CatalogDriftTable[]; direct: CatalogDriftTable[]; possible: CatalogDriftTable[]
+} | null {
   const tables: CatalogDriftTable[] = (Array.isArray(d?.tables) ? d.tables : [])
     .filter((t: any) => t && typeof t === 'object' && typeof t.table === 'string' && typeof t.source === 'string')
     .map((t: any) => ({
       source: t.source, source_id: String(t.source_id ?? ''), table: t.table,
       label: typeof t.label === 'string' && t.label ? t.label : null,
       published: num(t.published) ?? null, current: num(t.current) ?? 0,
+      impact: t.impact === 'possible' ? 'possible' : 'direct',
     }))
   if (!tables.length) return null
-  const first = tables[0].label ?? tables[0].table
+  const direct = tables.filter((t) => t.impact === 'direct')
+  const possible = tables.filter((t) => t.impact === 'possible')
+  const name = (t: CatalogDriftTable) => t.label ?? t.table
+  const title = direct.length
+    ? CATALOG_DRIFT_TEXT.title(name(direct[0]), direct.length) + (possible.length ? CATALOG_DRIFT_TEXT.alsoPossible(possible.length) : '')
+    : CATALOG_DRIFT_TEXT.possibleTitle(name(possible[0]), possible.length)
   return {
-    title: CATALOG_DRIFT_TEXT.title(first, tables.length),
-    detail: tables.map((t) => CATALOG_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table),
-      CATALOG_DRIFT_TEXT.version(t.published), CATALOG_DRIFT_TEXT.version(t.current))).join('\n'),
-    tables,
+    title,
+    detail: [
+      ...direct.map(catalogDriftLine),
+      ...(possible.length ? [`${CATALOG_DRIFT_TEXT.possibleHead}：`, ...possible.map(catalogDriftLine)] : []),
+    ].join('\n'),
+    tables, direct, possible,
   }
 }
 
