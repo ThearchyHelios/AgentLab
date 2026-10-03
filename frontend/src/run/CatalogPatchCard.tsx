@@ -1,11 +1,11 @@
 import { useCallback, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { BookMarked, Check, ExternalLink, RotateCw } from 'lucide-react'
+import { BookMarked, Check, ExternalLink, Info, RotateCw } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
 import { Notice, Spinner, toast } from '../components/ui'
 import { CatalogImpactList } from '../components/CatalogImpact'
-import { CATALOG_PATCH_TEXT as T, CATALOG_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_PATCH_TEXT as T, CATALOG_STATUS_LABEL, CATALOG_UI_TEXT as UT } from '../lib/terms'
 import type { CatalogPatchChange } from '../types'
 import {
   catalogTableHref, codeMeaning, patchSubmit, patchTarget, patchValueText, patchWhere, type CatalogPatch,
@@ -198,6 +198,13 @@ function ChangeRow({ change: c, dense }: { change: CatalogPatchChange; dense: bo
           </>
         )}
       </dl>
+      {/* 服务端的说明（新增关系推算不出基数时）：保存照样能存，但要让人知道哪一处空着、影响哪条检查 */}
+      {c.note && (
+        <p className="mt-1 flex items-start gap-1 text-2xs leading-relaxed text-dim" data-patch-note="">
+          <Info size={11} className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
+          <span className="min-w-0 break-words"><span className="text-faint">{UT.patchNote}：</span>{c.note}</span>
+        </p>
+      )}
     </li>
   )
 }

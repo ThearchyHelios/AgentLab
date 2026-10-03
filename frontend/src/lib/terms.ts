@@ -2529,6 +2529,8 @@ export const CATALOG_UI_TEXT = {
   savedImpact: (n: number) => `已保存。${formatNumber(n)} 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化`,
   savedImpactShow: '查看模板',
   savedImpactDismiss: '收起这条提示',
+  // ---- 助手「建议更新数据目录」卡片：服务端对一项的说明（新增的关联关系推算不出基数）
+  patchNote: '说明',
 }
 
 // ===========================================================================

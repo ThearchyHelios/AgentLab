@@ -1149,7 +1149,12 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
     { op: 'model', model: 'fake-model' },
     { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
       { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
-        value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] },
+        value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+      // 新增的关联关系没写基数、又推算不出来：服务端（PatchChange.as_dict）带一句说明
+      { path: 'relations.rmember-id-members-id', before: null, before_status: null,
+        after: { columns: ['member_id'], to_table: 'members', to_columns: ['id'], cardinality: null },
+        value: { columns: ['member_id'], to_table: 'members', to_columns: ['id'] }, reason: '用户说明 member_id 对应会员', state: 'change',
+        note: '没有写明基数，表结构里也查不到两端的主键和唯一约束，基数暂时空着；一对多关联后重复计算的检查用不上这条关系' }] },
     { op: 'reply', text: '已整理成数据目录的修改建议。' },
   ]
   const patchSent = []
@@ -1169,6 +1174,9 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   const patchCard = page.locator('[data-catalog-patch="orders"]').last()
   check('助手栏里有「建议更新数据目录」卡片', await patchCard.waitFor({ timeout: 3000 }).then(() => true, () => false)
     && (await patchCard.innerText()).includes('列 status 的码值'))
+  const noteRow = patchCard.locator('[data-patch-change="relations.rmember-id-members-id"]')
+  check('……服务端对一项的说明（新增关系推算不出基数）写在那一项下面', (await noteRow.locator('[data-patch-note]').innerText().catch(() => ''))
+    .includes('没有写明基数') && await patchCard.locator('[data-patch-note]').count() === 1, await noteRow.innerText().catch(() => ''))
   await patchCard.locator('[data-patch-save]').click()
   await patchCard.locator('[data-patch-done]').waitFor({ timeout: 3000 })
   check('保存带版本和原样取值', patchSent[0]?.if_version === 2 && JSON.stringify(patchSent[0]?.changes?.[0]?.value) === '{"9":"作废"}',

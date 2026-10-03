@@ -61,6 +61,7 @@ function changeOf(x: unknown): CatalogPatchChange | null {
     value: 'value' in c ? c.value : c.after,
     reason: typeof c.reason === 'string' ? c.reason : '',
     state: typeof c.state === 'string' && STATES.has(c.state) ? c.state as CatalogPatchChange['state'] : 'change',
+    ...(typeof c.note === 'string' && c.note.trim() ? { note: c.note.trim() } : {}),
   }
 }
 

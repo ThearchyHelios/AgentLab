@@ -2761,6 +2761,8 @@ export interface CatalogPatchChange {
   reason: string
   /** change 值有变化；confirm 值相同、还不是已确认（保存即确认）；same 已经是这个值且已确认 */
   state: 'change' | 'confirm' | 'same'
+  /** 服务端对这一项的说明（目前只有：新增的关联关系没写基数、又推算不出来）。没有时不给 */
+  note?: string
 }
 
 /** 保存、预览提案时交回的一项：路径、原样取值、理由 */
