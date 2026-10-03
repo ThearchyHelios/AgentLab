@@ -83,10 +83,16 @@ export function CatalogImpactList({ sourceId, table, refreshKey, compact = false
   )
 }
 
+/**
+ * 「直接引用」用强调色：它说的是引用关系的强弱，不是警示——琥珀色在全站是「等待、要人处理」，用在这里像是出了问题。
+ * 「可能涉及」用次要文字色
+ */
 function ImpactBadge({ impact }: { impact: 'direct' | 'possible' }) {
   return (
     <span className={clsx('chip shrink-0', impact === 'direct' ? 'text-fg' : 'text-faint')} title={T.impactHint[impact]}
-          style={impact === 'direct' ? { borderColor: 'var(--st-waiting)', color: 'var(--st-waiting)' } : undefined}
+          style={impact === 'direct'
+            ? { borderColor: 'color-mix(in srgb, var(--accent) 45%, var(--border))', color: 'var(--accent)' }
+            : undefined}
           data-impact={impact}>
       {T.impact[impact]}
     </span>

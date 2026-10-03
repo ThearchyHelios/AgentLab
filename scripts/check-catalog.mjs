@@ -919,6 +919,16 @@ await section('数据目录 · 引用这张表的模板（影响面）', async (
   const daily = sec.locator('[data-impact-template="wf-daily"]')
   check('直接引用：模板名、版本、受管、「直接引用」', ['入园日报', 'v4', '受管', '直接引用'].every((x) => text.includes(x))
     && await daily.getAttribute('data-impact-level') === 'direct')
+  // 「直接引用」不是警示：用强调色，不用琥珀色（全站的「等待、要人处理」）
+  const directLook = await daily.locator('[data-impact="direct"]').first().evaluate((el) => {
+    const probe = document.createElement('span')
+    document.body.append(probe)
+    const tone = (v) => { probe.style.color = `var(${v})`; return getComputedStyle(probe).color }
+    const out = { color: getComputedStyle(el).color, accent: tone('--accent'), waiting: tone('--st-waiting') }
+    probe.remove()
+    return out
+  })
+  check('「直接引用」用强调色，不用警示的琥珀色', directLook.color === directLook.accent && directLook.color !== directLook.waiting, JSON.stringify(directLook))
   check('合并查询写明经由哪个输入', (await daily.locator('[data-impact-node="m"]').innerText()).includes('经由输入「查询入园人数」'))
   check('Agent 写「可能涉及」，悬停说明原因', (await sec.locator('[data-impact-template="wf-ask"] [data-impact="possible"]').getAttribute('title')).includes('运行时生成'))
   check('模板名点进去是画布，定位到那个节点', (await daily.locator('a').first().getAttribute('href')) === '/studio/wf-daily?focus=q')
