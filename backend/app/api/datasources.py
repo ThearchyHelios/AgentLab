@@ -17,13 +17,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
-from app.api.coded import CodedHTTPException
+from app.api.coded import PROFILE_SETTINGS_INVALID, CodedHTTPException
 from app.api.runs import actor_of
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import catalog as data_catalog
-from app.data.catalog_profile import profile_settings_problem
+from app.data.catalog_profile import profile_settings_rejection
 from app.data import introspect as introspect_mod
 from app.data import table_versions
 from app.data.engine import (
@@ -337,10 +337,13 @@ _MASK_FIELD = {
 
 
 def _refuse_bad_options(options: dict[str, Any] | None) -> None:
-    problem = (query_timeout_problem(options) or mask_columns_problem(options)
-               or profile_settings_problem(options))
+    problem = query_timeout_problem(options) or mask_columns_problem(options)
     if problem:
         raise HTTPException(422, problem)
+    # 剖析设置：带机读码和出错的那一项（field），表单按它把报错落到那一格，不再从原话里认
+    if rejected := profile_settings_rejection(options):
+        message, field = rejected
+        raise CodedHTTPException(422, message, PROFILE_SETTINGS_INVALID, field=field)
 
 
 @router.get("/kinds")

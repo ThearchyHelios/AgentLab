@@ -1465,7 +1465,8 @@ await section('数据目录 · 数据剖析设置', async () => {
   await page.locator('#ds-profile-query_timeout_s').fill('20')
   // 服务端按字段拒收（422）：报错落在那一项下面，光标放进去，不只弹提示
   const REJECT = '数据剖析的「单条查询时限（秒）」需要填写 1 到 60 之间的数；当前为「20」'
-  replies.patch.push(json({ detail: REJECT }, 422))
+  // 服务端带机读码和出错的那一项（api/coded.py：code + field），界面按它落到那一格，不从原话里认
+  replies.patch.push(json({ detail: REJECT, code: 'profile_settings_invalid', field: 'query_timeout_s' }, 422))
   await page.locator('[data-source-save]').click()
   check('保存被拒（422）：服务端原话写在「单条查询时限」下面', await until(async () =>
     (await page.locator('#ds-profile-query_timeout_s-error').innerText().catch(() => '')) === REJECT),
@@ -1735,6 +1736,22 @@ await section('数据目录 · 数据剖析开始不了（409）', async () => {
   await settings.waitFor()
   await settings.locator('[data-profile-enabled]').check()
   await page.locator(`#profile-${S1}-max_queries`).fill('40')
+  // 保存被拒：只认机读码和 field。没带机读码的（老服务端）不从原话里猜是哪一项，只弹通用提示，弹窗留着
+  const QUERIES_REJECT = '数据剖析的「查询次数上限」需要填写 1 到 500 之间的整数；当前为「40」'
+  replies.patch.push(json({ detail: QUERIES_REJECT }, 422))
+  await page.locator('[data-profile-save]').click()
+  check('422 没带机读码：不从原话里猜是哪一项，只弹通用提示，弹窗留着',
+    await until(async () => (await page.locator('[data-toast]').filter({ hasText: '查询次数上限' }).count()) > 0)
+    && await settings.locator('[aria-invalid="true"]').count() === 0 && await settings.count() === 1)
+  replies.patch.push(json({ detail: QUERIES_REJECT, code: 'profile_settings_invalid', field: 'max_queries' }, 422))
+  await page.locator('[data-profile-save]').click()
+  check('422 带机读码和 field：报错落在「查询次数上限」那一格，光标放进去',
+    await until(async () => (await page.locator(`#profile-${S1}-max_queries`).getAttribute('aria-invalid')) === 'true')
+    && await until(async () => page.evaluate((id) => document.activeElement?.id === id, `profile-${S1}-max_queries`)))
+  replies.patch.push(json({ detail: '数据剖析设置中有无法识别的项「rows」，请删除后重试', code: 'profile_settings_invalid' }, 422))
+  await page.locator('[data-profile-save]').click()
+  check('422 带机读码、没有 field：报错写在剖析设置这一节上', await until(async () =>
+    (await settings.locator('[data-profile-error="section"]').innerText().catch(() => '')).includes('无法识别的项')))
   await page.locator('[data-profile-save]').click()
   check('就地开启：保存后回到剖析，预算按刚存的设置', await until(async () => (await settings.count()) === 0)
         && await until(async () => (await profileBox(page).locator('[data-profile-budget]').innerText().catch(() => '')).includes('最多 40 条只读查询'))
@@ -1742,15 +1759,24 @@ await section('数据目录 · 数据剖析开始不了（409）', async () => {
   check('……保存的是这个源的剖析设置', JSON.stringify(writes(sent, /^PATCH /).at(-1)?.body) === JSON.stringify({ options: { catalog_profile: { enabled: true, max_queries: 40 } } }),
         JSON.stringify(writes(sent, /^PATCH /).at(-1)?.body))
 
+  // 服务端的 409 都带机读码（api/coded.py），界面按它分五种情况，不从原话里认
   const cases = [
-    ['disabled', '数据源「zzcatscenic」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析', '未开启数据剖析', 'data-profile-enable'],
-    ['inactive', '数据源「zzcatscenic」已停用，无法进行数据剖析。请先在数据源设置中启用', '数据源已停用', 'data-profile-go-source'],
-    ['noSchema', '尚未探查结构，无法进行数据剖析。请先在数据源卡片上点「探查结构」', '还没有表结构', 'data-profile-go-source'],
-    ['busy', '数据源「zzcatscenic」正在进行数据剖析，请等待完成后再试', '这个数据源正在剖析', 'data-profile-retry'],
-    ['tampered', '数据文件与登记的版本不一致，可能被修改过，已拒绝查询', '数据文件核对未通过', 'data-profile-go-source'],
+    ['disabled', '数据源「zzcatscenic」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析', '未开启数据剖析', 'data-profile-enable', 'profile_disabled'],
+    ['inactive', '数据源「zzcatscenic」已停用，无法进行数据剖析。请先在数据源设置中启用', '数据源已停用', 'data-profile-go-source', 'datasource_inactive'],
+    ['noSchema', '尚未探查结构，无法进行数据剖析。请先在数据源卡片上点「探查结构」', '还没有表结构', 'data-profile-go-source', 'schema_missing'],
+    ['busy', '数据源「zzcatscenic」正在进行数据剖析，请等待完成后再试', '这个数据源正在剖析', 'data-profile-retry', 'profile_busy'],
+    ['tampered', '数据文件与登记的版本不一致，可能被修改过，已拒绝查询', '数据文件核对未通过', 'data-profile-go-source', 'snapshot_tampered'],
   ]
-  for (const [kind, detail, title, action] of cases) {
-    replies.profile.push(json({ detail }, 409))
+  // 没带机读码的 409（老服务端）：原话里明明写着「正在进行数据剖析」，也不去猜，按「无法开始剖析」给重试
+  replies.profile.push(json({ detail: cases[3][1] }, 409))
+  await page.locator('[data-profile-start]').click()
+  check('409 没带机读码：不从原话里猜，按「无法开始剖析」说，给重试', await until(async () =>
+    (await profileBox(page).locator('[data-profile-blocked="other"]').count()) === 1)
+    && await profileBox(page).locator('[data-profile-blocked="other"] [data-profile-retry]').count() === 1)
+  await page.locator('[data-profile-back]').click()
+  await until(async () => (await profilePhase(page)) === 'setup')
+  for (const [kind, detail, title, action, code] of cases) {
+    replies.profile.push(json({ detail, code }, 409))
     await page.locator('[data-profile-start]').click()
     const blocked = profileBox(page).locator(`[data-profile-blocked="${kind}"]`)
     const ok = await until(async () => (await blocked.count()) === 1)
@@ -1784,7 +1810,7 @@ await section('数据目录 · 数据剖析开始不了（409）', async () => {
   check('其余失败：写「剖析未能完成」和原因，能重试', await until(async () => (await profileBox(page).locator('[data-profile-failed]').count()) === 1)
         && (await profileBox(page).locator('[data-profile-failed]').innerText()).includes('剖析未能完成'))
   // 去数据源：停用、没有表结构、快照被改动时
-  replies.profile.push(json({ detail: cases[1][1] }, 409))
+  replies.profile.push(json({ detail: cases[1][1], code: cases[1][4] }, 409))
   await profileBox(page).locator('[data-profile-failed]').getByRole('button', { name: /重试/ }).click()
   await profileBox(page).locator('[data-profile-go-source]').click()
   await page.waitForURL('**/data/databases', { timeout: 5000 }).catch(() => {})

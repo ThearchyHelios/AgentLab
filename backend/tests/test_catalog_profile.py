@@ -151,6 +151,7 @@ async def test_profile_is_off_by_default_and_says_where_to_turn_it_on(client, ma
     assert r.status_code == 409
     detail = r.json()["detail"]
     assert "数据源设置" in detail and "开启数据剖析" in detail
+    assert r.json()["code"] == "profile_disabled"      # 界面按机读码认是哪一种，不从原话里认
     assert watch.executed == []          # 一条查询都没发
 
 
@@ -158,6 +159,12 @@ async def test_settings_are_saved_and_validated_through_datasource_update(client
     sid = await make_source(scenic_db)
     r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(max_queries=0)})
     assert r.status_code == 422 and "查询次数上限" in r.json()["detail"]
+    # 机读码和出错的那一项：表单按 field 把报错落到那一格
+    assert (r.json()["code"], r.json()["field"]) == ("profile_settings_invalid", "max_queries")
+    r = await client.patch(f"/api/datasources/{sid}", json={"options": {PROFILE_OPTION: {"enabled": "是"}}})
+    assert r.status_code == 422 and (r.json()["code"], r.json()["field"]) == ("profile_settings_invalid", "enabled")
+    r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(rows=5)})
+    assert r.status_code == 422 and r.json()["code"] == "profile_settings_invalid" and "field" not in r.json()
     r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(max_queries=40, sample_size=500)})
     assert r.status_code == 200, r.text
     assert r.json()["options"][PROFILE_OPTION] == {"enabled": True, "max_queries": 40, "sample_size": 500}
@@ -414,12 +421,44 @@ async def test_concurrent_profile_on_same_source_returns_409(client, make_source
     await asyncio.wait_for(started.wait(), 10)
     second = await client.post(_url(sid), json={"tables": ["visits"]}, headers=ACTOR)
     assert second.status_code == 409 and "正在进行数据剖析" in second.json()["detail"]
+    assert second.json()["code"] == "profile_busy"
     release.set()
     done = await asyncio.wait_for(first, 30)
     assert done.status_code == 200, done.text
     # 做完以后可以再来
     again = await client.post(_url(sid), json={"tables": ["channels"]}, headers=ACTOR)
     assert again.status_code == 200, again.text
+
+
+async def test_blocked_profile_says_which_case_by_code(client, make_source, scenic_db, monkeypatch):
+    """剖析开始不了的 409 都带机读码：数据源停用、没有表结构、快照被改动（未开启、正在剖析见上面两条）。"""
+    from app.data.engine import SnapshotTampered
+
+    sid = await make_source(scenic_db, options=_on(), draft=["visits"])
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.enabled = False
+        await session.commit()
+    r = await client.post(_url(sid), json={"tables": ["visits"]}, headers=ACTOR)
+    assert r.status_code == 409 and r.json()["code"] == "datasource_inactive" and "已停用" in r.json()["detail"]
+
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.enabled = True
+        row.schema_cache = {}
+        await session.commit()
+    r = await client.post(_url(sid), json={"tables": ["visits"]}, headers=ACTOR)
+    assert r.status_code == 409 and r.json()["code"] == "schema_missing" and "探查结构" in r.json()["detail"]
+
+    r = await client.post(f"/api/datasources/{sid}/introspect")
+    assert r.status_code == 200, r.text
+
+    async def tampered(*_args, **_kwargs):
+        raise SnapshotTampered("数据文件与登记的版本不一致，可能被修改过，已拒绝查询")
+
+    monkeypatch.setattr(catalog_profile, "profile_catalog", tampered)
+    r = await client.post(_url(sid), json={"tables": ["visits"]}, headers=ACTOR)
+    assert r.status_code == 409 and r.json()["code"] == "snapshot_tampered"
 
 
 async def test_default_tables_are_used_tables_with_relation_candidates(client, make_source, scenic_db):

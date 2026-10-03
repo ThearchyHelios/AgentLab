@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.coded import PROFILE_BUSY, SCHEMA_MISSING, SNAPSHOT_TAMPERED, CodedHTTPException
 from app.api.runs import actor_of
 from app.data import catalog, catalog_impact, catalog_profile, introspect, table_versions
 from app.data.engine import SnapshotTampered
@@ -275,21 +276,25 @@ async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
     默认关闭：数据源设置里没开启数据剖析、数据源停用，409；同一个数据源已经在剖析，409。
     """
     row, source = await _resolved(session, source_id)
+    # 409 都带机读码（api/coded.py），界面按它分五种情况给下一步，不从原话里认
     try:
         catalog_profile.ensure_enabled(row)
     except catalog_profile.ProfileDisabled as e:
-        raise HTTPException(409, str(e)) from e
+        raise CodedHTTPException(409, str(e), e.code) from e
     cache = source.schema_cache or {}
     if not cache.get("tables"):
-        raise HTTPException(409, f"{introspect.why_empty(cache)}，无法进行数据剖析。请先在数据源卡片上点「探查结构」")
+        raise CodedHTTPException(409, f"{introspect.why_empty(cache)}，无法进行数据剖析。请先在数据源卡片上点「探查结构」",
+                                 SCHEMA_MISSING)
     actor = actor_of(x_actor)
     try:
         report = await catalog_profile.profile_catalog(session, row, source, tables=payload.tables or None,
                                                        actor=actor)
-    except (catalog_profile.ProfileDisabled, catalog_profile.ProfileBusy) as e:
-        raise HTTPException(409, str(e)) from e
+    except catalog_profile.ProfileDisabled as e:
+        raise CodedHTTPException(409, str(e), e.code) from e
+    except catalog_profile.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
     except SnapshotTampered as e:
-        raise HTTPException(409, str(e)) from e
+        raise CodedHTTPException(409, str(e), SNAPSHOT_TAMPERED) from e
     rows = [_profile_table_out(t) for t in report.tables]
     note = None
     if not rows and report.empty_tables:

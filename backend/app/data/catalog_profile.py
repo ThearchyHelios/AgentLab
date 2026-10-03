@@ -115,19 +115,26 @@ def profile_settings(options: dict[str, Any] | None) -> ProfileSettings:
 
 def profile_settings_problem(options: dict[str, Any] | None) -> str | None:
     """保存数据源时查一下剖析设置；没填、或者填对了返回 None。写的时候严格：不认识的项、超出范围的值都拒。"""
+    found = profile_settings_rejection(options)
+    return found[0] if found else None
+
+
+def profile_settings_rejection(options: dict[str, Any] | None) -> tuple[str, str | None] | None:
+    """同 profile_settings_problem，另给出错的是哪一项：(给人看的一句, 字段名)。字段名是 enabled 或 _NUMBER_FIELDS
+    的键（max_queries……），格式不对、有认不出的项时为 None。接口带着它回 422，表单不必从原话里认是哪一格。"""
     raw = (options or {}).get(PROFILE_OPTION)
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        return "数据剖析设置的格式不正确，请在数据源设置中重新填写"
+        return "数据剖析设置的格式不正确，请在数据源设置中重新填写", None
     if unknown := sorted(set(raw) - _KNOWN_KEYS):
-        return f"数据剖析设置中有无法识别的项「{'、'.join(map(str, unknown))}」，请删除后重试"
+        return f"数据剖析设置中有无法识别的项「{'、'.join(map(str, unknown))}」，请删除后重试", None
     if "enabled" in raw and not isinstance(raw["enabled"], bool):
-        return f"数据剖析的「{_ENABLED_LABEL}」只能是开启或关闭"
+        return f"数据剖析的「{_ENABLED_LABEL}」只能是开启或关闭", "enabled"
     for key, (label, low, high, integer) in _NUMBER_FIELDS.items():
         if key in raw and _number(raw[key], low, high, integer) is None:
             kind = "整数" if integer else "数"
-            return f"数据剖析的「{label}」需要填写 {_fmt(low)} 到 {_fmt(high)} 之间的{kind}；当前为「{raw[key]}」"
+            return f"数据剖析的「{label}」需要填写 {_fmt(low)} 到 {_fmt(high)} 之间的{kind}；当前为「{raw[key]}」", key
     return None
 
 
@@ -458,7 +465,12 @@ _STOP_DETAIL = {
 
 
 class ProfileDisabled(Exception):
-    """这个数据源没有开启数据剖析。message 给人看。"""
+    """这个数据源没有开启数据剖析，或者数据源停用了。message 给人看；code 是接口回 409 时带的机读码
+    （api/coded.py：profile_disabled / datasource_inactive）。"""
+
+    def __init__(self, message: str, code: str = "profile_disabled") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ProfileBusy(Exception):
@@ -1228,7 +1240,7 @@ def ensure_enabled(row: Any, settings: ProfileSettings | None = None) -> Profile
     settings = settings or profile_settings(getattr(row, "options", None))
     name = getattr(row, "name", "") or ""
     if getattr(row, "enabled", True) is False:
-        raise ProfileDisabled(f"数据源「{name}」已停用，无法进行数据剖析。请先在数据源设置中启用")
+        raise ProfileDisabled(f"数据源「{name}」已停用，无法进行数据剖析。请先在数据源设置中启用", code="datasource_inactive")
     if not settings.enabled:
         raise ProfileDisabled(f"数据源「{name}」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析")
     return settings
@@ -1269,4 +1281,5 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
 __all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
            "PROFILE_OPTION", "PROFILE_PROBE_TABLES", "ProfileBusy", "ProfileDisabled", "ProfileReport",
            "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "ensure_enabled",
-           "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem", "sql_literal"]
+           "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem", "profile_settings_rejection",
+           "sql_literal"]

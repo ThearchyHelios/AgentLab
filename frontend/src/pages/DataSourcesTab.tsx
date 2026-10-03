@@ -1039,13 +1039,13 @@ function toBody(form: SourceForm, isNew: boolean, wasOracle = true): any {
 }
 
 /**
- * 422 的中文 detail 说的是哪一项：查询时限（后端 query_timeout_problem）；数据剖析的某一项（profile_settings_problem，
- * 记为 profile.<键>，它的「单条查询时限」也带「查询时限」四个字，要先认）。认不出的交回 toast
+ * 422 说的是哪一项：数据剖析的某一项按机读码和 field 认（profile_settings_rejection，记为 profile.<键>）；
+ * 查询时限（后端 query_timeout_problem）还没有机读码，按 detail 认。认不出的交回 toast
  */
-function fieldOfRejection(message: string): string | null {
-  const profile = profileFieldOfRejection(message)
+function fieldOfRejection(e: ApiError): string | null {
+  const profile = profileFieldOfRejection(e)
   if (profile) return `profile.${profile}`
-  if (/查询时限/.test(message)) return 'query_timeout_s'
+  if (/查询时限/.test(e.message)) return 'query_timeout_s'
   return null
 }
 
@@ -1151,7 +1151,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       onSaved(row, testFresh ? test.result : undefined, connectionOf(body) !== before)
     } catch (e) {
       const rejected = e instanceof ApiError && e.status === 422 ? e.message : ''
-      const key = rejected ? fieldOfRejection(rejected) : null
+      const key = e instanceof ApiError && rejected ? fieldOfRejection(e) : null
       if (key?.startsWith('profile.')) {
         setFieldError({ key, message: rejected })
         focusProfileField('ds-profile', key.slice('profile.'.length) as ProfileErrorKey)

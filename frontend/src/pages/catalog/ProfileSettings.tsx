@@ -128,7 +128,7 @@ export function ProfileSettingsDialog({ row, onClose, onSaved }: {
       onSaved(next)
       toast.ok(form.enabled === initial.enabled ? PT.saved(row.name) : form.enabled ? PT.savedOn(row.name) : PT.savedOff(row.name))
     } catch (e) {
-      const key = e instanceof ApiError && e.status === 422 ? profileFieldOfRejection(e.message) : null
+      const key = e instanceof ApiError && e.status === 422 ? profileFieldOfRejection(e) : null
       if (key) {
         setServerError({ key, message: e instanceof ApiError ? e.message : '' })
         focusProfileField(idPrefix, key)

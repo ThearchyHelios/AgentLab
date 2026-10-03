@@ -1,5 +1,5 @@
 import type { CatalogProfileNumberKey, CatalogProfileSettings } from '../../types'
-import { PROFILE_FIELD_LABEL, PROFILE_TEXT } from '../../lib/terms'
+import { PROFILE_TEXT } from '../../lib/terms'
 
 // ===========================================================================
 // 数据剖析的设置：数据源 options.catalog_profile 和表单之间的来回转换、校验、保存被拒时认出是哪一项。
@@ -120,18 +120,20 @@ export function profileSettingsOfForm(form: ProfileForm): CatalogProfileSettings
 export const sameProfileForm = (a: ProfileForm, b: ProfileForm): boolean =>
   a.enabled === b.enabled && PROFILE_NUMBER_KEYS.every((k) => a.values[k] === b.values[k])
 
+/** 剖析设置不合规的 422 带的机读码（服务端 api/coded.PROFILE_SETTINGS_INVALID） */
+export const PROFILE_SETTINGS_INVALID = 'profile_settings_invalid'
+
 /**
- * 服务端保存时拒收的 422（一句中文）说的是剖析设置的哪一项：
- * 「数据剖析的「查询次数上限」需要填写 1 到 500 之间的整数；当前为「0」」→ max_queries。
- * 说的是剖析设置、但认不出哪一项（格式不对、有认不出的项）返回 'section'；说的不是剖析设置返回 null
+ * 服务端保存时拒收的 422 说的是剖析设置的哪一项：按机读码和 field 认（服务端 profile_settings_rejection），不从原话里认——
+ * 文案一改，按原话认的就悄悄失效。说的是剖析设置、但没有 field（格式不对、有认不出的项）返回 'section'；
+ * 不是剖析设置的、没带机读码的（老服务端）返回 null，交给通用的报错提示
  */
-export function profileFieldOfRejection(message: string): 'enabled' | CatalogProfileNumberKey | 'section' | null {
-  if (!message.includes('数据剖析')) return null
-  const named = message.match(/「([^」]+)」/)?.[1] ?? ''
-  for (const k of ['enabled', ...PROFILE_NUMBER_KEYS] as const) {
-    if (named && named.startsWith(PROFILE_FIELD_LABEL[k])) return k
-  }
-  return 'section'
+export function profileFieldOfRejection(e: { code?: string; field?: string }): 'enabled' | CatalogProfileNumberKey | 'section' | null {
+  if (e.code !== PROFILE_SETTINGS_INVALID) return null
+  const field = e.field ?? ''
+  return field === 'enabled' || (PROFILE_NUMBER_KEYS as readonly string[]).includes(field)
+    ? field as 'enabled' | CatalogProfileNumberKey
+    : 'section'
 }
 
 // ---------------------------------------------------------------------------
@@ -156,16 +158,20 @@ export function secondsText(ms: number): string {
   return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${String(s % 60).padStart(2, '0')} 秒`
 }
 
-/** 剖析接口回 409 的几种情况（按服务端的原话认：catalog_profile.ensure_enabled、api/catalog.py、engine.SnapshotTampered） */
+/** 剖析接口回 409 的几种情况：按机读码认（服务端 api/coded.py，api/catalog.profile_catalog_tables 带上） */
 export type ProfileBlock = 'disabled' | 'inactive' | 'noSchema' | 'busy' | 'tampered' | 'other'
 
-export function profileBlockOf(message: string): ProfileBlock {
-  if (message.includes('未开启数据剖析')) return 'disabled'
-  if (message.includes('已停用')) return 'inactive'
-  if (message.includes('正在进行数据剖析')) return 'busy'
-  if (message.includes('探查结构')) return 'noSchema'
-  if (/已拒绝(?:这次)?查询/.test(message)) return 'tampered'
-  return 'other'
+const PROFILE_BLOCK_CODES: Record<string, ProfileBlock> = {
+  profile_disabled: 'disabled',
+  datasource_inactive: 'inactive',
+  schema_missing: 'noSchema',
+  profile_busy: 'busy',
+  snapshot_tampered: 'tampered',
+}
+
+/** 没带机读码（老服务端）或认不出的按「无法开始剖析」说，给重试；不从原话里猜 */
+export function profileBlockOf(e: { code?: string }): ProfileBlock {
+  return (e.code && PROFILE_BLOCK_CODES[e.code]) || 'other'
 }
 
 /** 设置里有没有剖析设置这一项（options 的其余键原样带上） */

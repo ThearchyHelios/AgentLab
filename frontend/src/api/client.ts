@@ -37,6 +37,8 @@ export class ApiError extends Error {
    * detail 是给人看的话，随时可能改写；要按错误种类分支的认这个
    */
   code?: string
+  /** 带机读码的错误里出错的是哪一项（app/api/coded.py 的 field，比如剖析设置的 max_queries）；没有就是 undefined */
+  field?: string
   /**
    * 后端要用户先拍板时随错误一起给的 {kind, details}（比如上传表格的 422：数字列混入非数字、
    * 交叉表）。原样保留，按接口各自校验后再用（上传表格见 uploadDecision）
@@ -46,7 +48,7 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; decision?: unknown },
+    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; field?: string; decision?: unknown },
   ) {
     super(message)
     this.name = 'ApiError'
@@ -55,6 +57,7 @@ export class ApiError extends Error {
     this.raw = opts?.raw
     this.timeoutMs = opts?.timeoutMs
     this.code = opts?.code
+    this.field = opts?.field
     this.decision = opts?.decision
   }
 }
@@ -180,6 +183,12 @@ const codeOf = (body: unknown): string | undefined => {
   return typeof code === 'string' && code ? code : undefined
 }
 
+/** 后端 {detail, code, field} 里出错的那一项；没有就是 undefined */
+const fieldOf = (body: unknown): string | undefined => {
+  const field = body && typeof body === 'object' ? (body as { field?: unknown }).field : undefined
+  return typeof field === 'string' && field ? field : undefined
+}
+
 /** 后端 {detail, decision} 里要用户拍板的内容：是个对象就原样带上，没有就是 undefined */
 const decisionOf = (body: unknown): unknown => {
   const decision = body && typeof body === 'object' ? (body as { decision?: unknown }).decision : undefined
@@ -239,7 +248,7 @@ function failure(status: number, statusText: string, text: string, path?: string
     const detail = body?.detail ?? body
     return new ApiError(status, describeDetail(detail, path), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
-      code: codeOf(body), decision: decisionOf(body),
+      code: codeOf(body), field: fieldOf(body), decision: decisionOf(body),
     })
   }
   const message = status >= 500

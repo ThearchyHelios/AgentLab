@@ -168,7 +168,7 @@ export function CatalogPage() {
       next = { phase: 'done', report, ms: Date.now() - startedAt }
     } catch (e) {
       next = e instanceof ApiError && e.status === 409
-        ? { phase: 'blocked', kind: profileBlockOf(e.message), message: e.message, tables }
+        ? { phase: 'blocked', kind: profileBlockOf(e), message: e.message, tables }
         : { phase: 'failed', error: e, tables }
     }
     const here = alive.current && sourceRef.current === src
