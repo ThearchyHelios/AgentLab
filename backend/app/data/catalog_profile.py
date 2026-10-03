@@ -22,6 +22,7 @@ import copy
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -526,12 +527,36 @@ class _RelationOutcome:
 
 
 @dataclass
+class _CodesOutcome:
+    """一列的取值分布：[(码值, 行数)]，按行数从多到少。"""
+
+    column: str
+    values: list[tuple[str, int]]
+    rows: int
+    note: str
+
+
+@dataclass
+class _DateOutcome:
+    """表里唯一一个日期类列，提议作为业务日期。"""
+
+    column: str
+    low: str
+    high: str
+    note: str
+
+
+@dataclass
 class _TableOutcome:
     """一张表所有检查的结论，以及没查成、要原样保留旧结论的槽位。"""
 
     relations: list[_RelationOutcome] = field(default_factory=list)
-    #: 没查成的关系：目录里剖析以前写的结论原样留着（不然会被 covered={"profile"} 当成「这次没有」删掉）
+    codes: list[_CodesOutcome] = field(default_factory=list)
+    business_date: _DateOutcome | None = None
+    #: 没查成的项：目录里剖析以前写的结论原样留着（不然会被 covered={"profile"} 当成「这次没有」删掉）
     keep_relations: set[str] = field(default_factory=set)
+    keep_codes: set[str] = field(default_factory=set)
+    keep_business_date: bool = False
 
 
 @dataclass
@@ -555,6 +580,13 @@ class _Context:
             self.sizes[table] = size
             result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
         return self.sizes[table]
+
+    async def size_with_data(self, table: str, result: TableProfile) -> TableSize:
+        """同 size，但确知是空表时直接跳过这一项（抛 _Skip），不再为它发查询。"""
+        size = await self.size(table, result)
+        if size.rows == 0:
+            raise _Skip("no_data", f"{table} 是空表，无法剖析")
+        return size
 
     def is_masked(self, column: str) -> bool:
         return column.lower() in self.masked
@@ -684,7 +716,7 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
             raise _Skip("masked", f"{owner}.{name} 在数据源设置中被遮罩，不取样", carry=True)
 
     d, s = cx.dialect, cx.settings
-    size = await cx.size(table, result)
+    size = await cx.size_with_data(table, result)
     scan_cap = cx.scan_cap(size)
     child_table, parent_table = d.table(meta, table), d.table(pmeta, parent)
     res = await cx.run(d.distinct_sample_sql(child_table, d.quote(col), s.sample_size, scan_cap=scan_cap),
@@ -718,6 +750,167 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
 
 
 # ==========================================================================
+# 检查：码值候选、日期列
+# ==========================================================================
+
+#: 码值候选最多几个取值。查询取 CODES_MAX + 1 个：取满了说明不是低基数列
+CODES_MAX = 20
+#: 码值的长度上限。更长的不像状态码，像说明文字
+MAX_CODE_LEN = 64
+#: 像状态、类型、渠道的列名里会有的词
+_CODE_WORDS = frozenset({"status", "state", "type", "kind", "category", "channel", "level", "method", "mode",
+                         "reason", "stage", "phase", "grade", "flag", "source", "result"})
+#: 以这些词结尾的列不是码值：标识、名称、说明、时间、金额、数量（channel_id、level_name、status_time……）
+_NOT_CODE_TAILS = frozenset({"id", "no", "num", "number", "name", "desc", "description", "text", "remark", "note",
+                             "at", "date", "time", "on", "amount", "price", "count", "qty", "rate", "url"})
+#: 文字类型的列名以这些词结尾时，按日期类列看待（SQLite 里日期都存成文字：visit_time、ordered_at、joined_on）
+_DATE_TAILS = frozenset({"at", "date", "time", "on", "dt", "day"})
+#: 像日期的取值：2026-07-01、2026/07/01，后面可以跟时间
+_DATE_TEXT = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
+_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _words(name: str) -> list[str]:
+    """列名切成小写的词：下划线和驼峰都是分隔（和目录的命名推断同一个切法）。"""
+    return [w.lower() for part in name.split("_") for w in _WORDS.findall(part)]
+
+
+def _code_type_ok(type_name: str | None) -> bool:
+    """整数，或者短文字（定长不超过 MAX_CODE_LEN；SQLite 的 TEXT 不带长度，也算）。"""
+    t = (type_name or "").upper()
+    if not t or any(k in t for k in ("CLOB", "BLOB", "BINARY", "JSON", "DATE", "TIME", "INTERVAL", "REAL", "FLOAT",
+                                     "DOUBLE", "BOOL")):
+        return False
+    if "INT" in t:
+        return True
+    size = re.search(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)", t)
+    if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
+        return size is None or not size.group(2) or int(size.group(2)) == 0
+    if any(k in t for k in ("CHAR", "TEXT", "STRING")):
+        return size is None or int(size.group(1)) <= MAX_CODE_LEN
+    return False
+
+
+def _looks_like_code(name: str) -> bool:
+    words = _words(name)
+    return bool(words) and words[-1] not in _NOT_CODE_TAILS and any(w in _CODE_WORDS for w in words)
+
+
+def _code_columns(meta: dict[str, Any], notes: dict[str, Any]) -> list[str]:
+    """要取值分布的列：目录里度量类型记为状态的、剖析以前提过码值候选的（再核一次）、或者类型和命名像状态、
+    类型、渠道的整数或短文字列。主键、唯一约束列、关系里的键列不算；码值人工确认或驳回过的不再取。
+    被遮罩的列也列出来，由检查记为「被遮罩」跳过——要让人看得见为什么它没有码值。"""
+    pk = [c.lower() for c in meta.get("primary_key") or []]
+    unique = {str(g[0]).lower() for g in meta.get("unique") or [] if isinstance(g, list) and len(g) == 1}
+    keys = {str(c).lower() for r in notes.get("relations") or [] if isinstance(r, dict) for c in r.get("columns") or []}
+    described = notes.get("columns") if isinstance(notes.get("columns"), dict) else {}
+    out: list[str] = []
+    for col in meta.get("columns") or []:
+        name = str(col.get("name") or "")
+        items = described.get(name) if isinstance(described.get(name), dict) else {}
+        codes, measure = items.get("codes"), items.get("measure")
+        if isinstance(codes, dict) and codes.get("status") in ("confirmed", "rejected"):
+            continue
+        status_measure = (isinstance(measure, dict) and measure.get("value") == "status"
+                          and measure.get("status") != "rejected")
+        profiled = isinstance(codes, dict) and codes.get("source") == "profile"
+        if not (status_measure or profiled or _looks_like_code(name)):
+            continue
+        lowered = name.lower()
+        if (pk == [lowered]) or lowered in unique or lowered in keys or not _code_type_ok(col.get("type")):
+            continue
+        out.append(name)
+    return out
+
+
+def _code_key(value: Any) -> str | None:
+    """取值分布里的一个取值 → 码值（文字）。只认整数和不太长的文字。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else None
+    if isinstance(value, str) and value.strip() and len(value) <= MAX_CODE_LEN and not _CONTROL.search(value):
+        return value
+    return None
+
+
+def _share(count: int, total: int) -> str:
+    if total <= 0:
+        return "0%"
+    ratio = count / total
+    return "不足 1%" if 0 < ratio < 0.01 else f"{round(ratio * 100)}%"
+
+
+async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome, result: TableProfile) -> None:
+    """GROUP BY 取出现最多的 CODES_MAX + 1 个取值：不超过 CODES_MAX 个就是码值候选（值有了，含义等人填）。"""
+    if cx.is_masked(column):
+        raise _Skip("masked", f"{table}.{column} 在数据源设置中被遮罩，不取值", carry=False)
+    d, meta = cx.dialect, cx.tables[table]
+    size = await cx.size_with_data(table, result)
+    scan_cap = cx.scan_cap(size)
+    res = await cx.run(d.value_counts_sql(d.table(meta, table), d.quote(column), CODES_MAX + 1, scan_cap=scan_cap),
+                       max_rows=CODES_MAX + 1)
+    if not res.rows:
+        raise _Skip("no_data", f"{table}.{column} 没有非空值，无法取值分布")
+    if len(res.rows) > CODES_MAX:
+        raise _Skip("high_cardinality", f"{table}.{column} 的取值超过 {CODES_MAX} 个，不作为码值候选", carry=False)
+    values: list[tuple[str, int]] = []
+    for row in res.rows:
+        key = _code_key(row[0])
+        if key is None:
+            raise _Skip("unsupported", f"{table}.{column} 的取值不是整数或短文字，不作为码值候选", carry=False)
+        values.append((key, _as_int(row[1]) or 0))
+    if len(values) >= 3 and all(n == 1 for _, n in values):
+        # 每个取值只出现一次（票种编码 T01…T09）：这是一列标识，不是状态码
+        raise _Skip("high_cardinality", f"{table}.{column} 的取值各不相同，像标识而不是码值，不作为码值候选",
+                    carry=False)
+    rows = sum(n for _, n in values)
+    scope = f"按前 {scan_cap} 行统计" if scan_cap else "统计全表"
+    spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
+    note = f"{NOTE_PREFIX}{cx.day}）：{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
+    out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note))
+
+
+def _is_date_column(col: dict[str, Any]) -> bool:
+    """日期类列：类型是日期、时间戳；或者类型是文字、列名像日期（SQLite 的日期都存成文字）。"""
+    t = str(col.get("type") or "").upper()
+    if "DATE" in t or "TIMESTAMP" in t:
+        return True
+    if t and not any(k in t for k in ("CHAR", "TEXT", "STRING")):
+        return False
+    words = _words(str(col.get("name") or ""))
+    return bool(words) and words[-1] in _DATE_TAILS and (len(words) > 1 or words[0] in ("date", "time", "day"))
+
+
+async def _check_dates(cx: _Context, table: str, columns: list[str], total: int, out: _TableOutcome,
+                       result: TableProfile) -> None:
+    """日期类列的 MIN、MAX，作为业务日期的参考。整表统计，只对行数不超过上限的表做。表里只有一个日期类列
+    （total 是表结构里日期类列的个数，含被遮罩的）时提议它作为业务日期。"""
+    d, meta = cx.dialect, cx.tables[table]
+    size = await cx.size_with_data(table, result)
+    if not size.within(cx.settings.max_scan_rows):
+        raise _Skip("too_large", f"{table} 的行数超过整表统计的行数上限（{cx.settings.max_scan_rows} 行），"
+                                 "不取日期列的最小值和最大值")
+    res = await cx.run(d.min_max_sql(d.table(meta, table), [d.quote(c) for c in columns]))
+    row = res.rows[0] if res.rows else []
+    for i, column in enumerate(columns):
+        low, high = (row[2 * i], row[2 * i + 1]) if len(row) >= 2 * i + 2 else (None, None)
+        if low is None or high is None or not (_DATE_TEXT.match(str(low)) and _DATE_TEXT.match(str(high))):
+            continue
+        result.date_ranges.append({"column": column, "min": str(low), "max": str(high)})
+    if total != 1:
+        return
+    if not result.date_ranges:
+        raise _Skip("no_data", f"{table}.{columns[0]} 没有可识别的日期值")
+    found = result.date_ranges[0]
+    note = (f"{NOTE_PREFIX}{cx.day}）：表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
+            f"{str(found['max'])[:19]}，可作为业务日期的参考。")
+    out.business_date = _DateOutcome(column=found["column"], low=found["min"], high=found["max"], note=note)
+
+
+# ==========================================================================
 # 结论进目录
 # ==========================================================================
 
@@ -735,6 +928,25 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
             "columns": list(rel.get("columns") or []), "to_table": rel.get("to_table"),
             "to_columns": list(rel.get("to_columns") or []), "status": status, "confirmed": confirmed,
             "coverage": o.coverage, "cardinality": o.cardinality, "sample": o.sample, "matched": o.matched,
+            "summary": summary}
+
+
+def _codes_value(c: _CodesOutcome, item: dict[str, Any] | None) -> dict[str, str]:
+    """码值候选的值：观察到的取值，含义先空着。原来有别的来源（模型起草、数据库注释）写过含义的，对得上的取值
+    沿用它的含义；它写了、数据里没出现的取值也留着——码值是「可能的取值」，没出现不等于不存在。"""
+    old = item.get("value") if isinstance(item, dict) and isinstance(item.get("value"), dict) else {}
+    value = {key: str(old.get(key) or "") for key, _ in c.values}
+    for key, meaning in old.items():
+        if key not in value and isinstance(meaning, str) and meaning.strip():
+            value[key] = meaning
+    return value
+
+
+def _codes_finding(c: _CodesOutcome, value: dict[str, str]) -> dict[str, Any]:
+    pending = sum(1 for v in value.values() if not v.strip())
+    summary = f"{len(c.values)} 个取值" + (f"，{pending} 个含义待填写" if pending else "")
+    return {"kind": "codes", "path": f"columns.{c.column}.codes", "column": c.column,
+            "values": [{"value": k, "rows": n} for k, n in c.values], "rows": c.rows, "status": "proposed",
             "summary": summary}
 
 
@@ -764,8 +976,10 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
     - 没被确认、驳回的关系：记为 source=profile，覆盖率够、父键唯一的 verified，否则 proposed；按 merge_notes
       的规则并入（剖析顶得掉命名推断、模型起草，顶不掉外键和人工）。
     - 人工确认过的关系：只补覆盖率和基数（_patch_confirmed）。
-    - covered={"profile"}：这次完整检查过、却没再得出的剖析结论删掉（比如取值变多、不再像码值的列）；
-      没查成的检查（超时、预算用完……）把剖析以前写的结论原样带上，不因为这次没查成就删。
+    - 码值候选：profile / proposed，含义沿用别的来源写过的（_codes_value）；人工确认、驳回过的码值不碰。
+    - 业务日期：只有一个日期类列时提议，profile / proposed；已有别的来源定的业务日期不顶掉。
+    - covered={"profile"}：这次完整检查过、却没再得出的剖析结论删掉（比如取值变多、不再像码值的列，列被遮罩
+      之后它的码值）；没查成的检查（超时、预算用完……）把剖析以前写的结论原样带上，不因为这次没查成就删。
     """
     existing = existing or {}
     current = {str(r["id"]): r for r in existing.get("relations") or [] if isinstance(r, dict) and r.get("id")}
@@ -790,6 +1004,35 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
         if rel is not None and rel.get("source") == "profile":
             relations.append(copy.deepcopy(rel))
     draft: dict[str, Any] = {"relations": relations} if relations else {}
+
+    described = existing.get("columns") if isinstance(existing.get("columns"), dict) else {}
+    columns: dict[str, dict[str, Any]] = {}
+    for c in out.codes:
+        item = (described.get(c.column) or {}).get("codes") if isinstance(described.get(c.column), dict) else None
+        if isinstance(item, dict) and item.get("status") in ("confirmed", "rejected"):
+            continue
+        columns[c.column] = {"codes": catalog.make_item(_codes_value(c, item), "profile", "proposed", note=c.note)}
+        findings.append(_codes_finding(c, columns[c.column]["codes"]["value"]))
+    for column in out.keep_codes:
+        item = (described.get(column) or {}).get("codes") if isinstance(described.get(column), dict) else None
+        if isinstance(item, dict) and item.get("source") == "profile":
+            columns[column] = {"codes": copy.deepcopy(item)}
+    if columns:
+        draft["columns"] = columns
+
+    current_date = existing.get("business_date") if isinstance(existing.get("business_date"), dict) else None
+    ours = current_date is None or (current_date.get("source") == "profile"
+                                    and current_date.get("status") not in ("confirmed", "rejected"))
+    if out.business_date is not None and ours:
+        # 已有别的来源（模型起草、人工）定的业务日期不顶掉：按来源的可信程度剖析排得更前，但它只知道
+        # 「表里只有这一个日期列」，不比写了规则和时区的那条更懂业务
+        b = out.business_date
+        draft["business_date"] = catalog.make_item({"column": b.column}, "profile", "proposed", note=b.note)
+        findings.append({"kind": "business_date", "path": "business_date", "column": b.column, "min": b.low,
+                         "max": b.high, "status": "proposed", "summary": f"提议按 {b.column} 作为业务日期"})
+    elif out.keep_business_date and current_date is not None and current_date.get("source") == "profile":
+        draft["business_date"] = copy.deepcopy(current_date)
+
     merged, stats = catalog.merge_notes(existing, draft, covered={"profile"}, at=at)
     for rel in merged.get("relations") or []:
         o = confirmed.get(str(rel.get("id")))
@@ -812,19 +1055,35 @@ class _Check:
     kind: str
     target: str
     path: str | None
-    run: Any
-    #: 没查成时要原样保留的旧结论（关系编号）
-    keep_relation: str | None = None
+    run: Callable[[], Awaitable[None]]
+    #: 没查成时调用：把目录里剖析以前对这一项写的结论标记为原样保留
+    keep: Callable[[], None]
 
 
 def _plan(cx: _Context, table: str, notes: dict[str, Any], out: _TableOutcome,
           result: TableProfile) -> list[_Check]:
     """这张表要做的检查，按价值排：关系、码值、日期。先列全再执行：中途停下时，没做的每一项都要记下原因。"""
+    meta = cx.tables[table]
     checks: list[_Check] = []
     for rel in _relation_candidates(notes):
-        checks.append(_Check("relation", _relation_target(rel), f"relations.{rel['id']}",
+        rid = str(rel["id"])
+        checks.append(_Check("relation", _relation_target(rel), f"relations.{rid}",
                              lambda rel=rel: _check_relation(cx, table, rel, out, result),
-                             keep_relation=str(rel["id"])))
+                             lambda rid=rid: out.keep_relations.add(rid)))
+    for column in _code_columns(meta, notes):
+        checks.append(_Check("codes", column, f"columns.{column}.codes",
+                             lambda column=column: _check_codes(cx, table, column, out, result),
+                             lambda column=column: out.keep_codes.add(column)))
+    dates = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and _is_date_column(c)]
+    for column in dates:
+        if cx.is_masked(column):
+            result.skipped.append(ProfileSkip("date", column, "masked",
+                                              f"{table}.{column} 在数据源设置中被遮罩，不取最小值和最大值"))
+    usable = [c for c in dates if not cx.is_masked(c)]
+    if usable:
+        checks.append(_Check("date", "、".join(usable), "business_date" if len(dates) == 1 else None,
+                             lambda: _check_dates(cx, table, usable, len(dates), out, result),
+                             lambda: setattr(out, "keep_business_date", True)))
     return checks
 
 
@@ -839,15 +1098,14 @@ async def _profile_table(cx: _Context, table: str, notes: dict[str, Any], result
             await check.run()
         except _Skip as e:
             result.skipped.append(ProfileSkip(check.kind, check.target, e.reason, e.detail, check.path))
-            if check.keep_relation and e.carry:
-                out.keep_relations.add(check.keep_relation)
+            if e.carry:
+                check.keep()
         except _Stop as e:
             detail = _STOP_DETAIL[e.reason].format(max_queries=cx.settings.max_queries,
                                                    max_total_s=_fmt(cx.settings.max_total_s))
             for rest in checks[i:]:
                 result.skipped.append(ProfileSkip(rest.kind, rest.target, e.reason, detail, rest.path))
-                if rest.keep_relation:
-                    out.keep_relations.add(rest.keep_relation)
+                rest.keep()
             break
     if table in cx.sizes:
         result.row_estimate = cx.sizes[table]
@@ -951,7 +1209,7 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
     return report
 
 
-__all__ = ["IN_CHUNK", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES", "PROFILE_OPTION", "ProfileBusy",
+__all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES", "PROFILE_OPTION", "ProfileBusy",
            "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile",
            "TableSize", "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem",
            "sql_literal"]

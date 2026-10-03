@@ -15,7 +15,7 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
      "valid_filter": 项(str，SQL 条件片段), "dedup": 项(str),
      "columns": {列名: {"label": 项, "meaning": 项, "unit": 项,
                        "measure": 项("flow"|"stock"|"ratio"|"identifier"|"status"|"attribute"),
-                       "codes": 项(dict[str, str])}},
+                       "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
                     "source", "status", "note"?}]}
 
@@ -181,8 +181,10 @@ def _business_date_ok(value: Any) -> bool:
 
 
 def _codes_ok(value: Any) -> bool:
+    """码值对照：{码值: 含义}，都是文字。含义可以是空串——数据剖析只知道列里出现过哪些取值，含义要等人填；
+    以前要求含义非空，剖析得到的码值候选就写不进来。"""
     return (isinstance(value, dict) and bool(value)
-            and all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in value.items()))
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()))
 
 
 #: 每个字段的值怎么查、不合规时怎么说
@@ -1411,6 +1413,17 @@ def _date_text(value: Mapping[str, Any]) -> str:
     return "；".join(parts)
 
 
+def _codes_text(codes: Mapping[str, Any]) -> str:
+    """码值对照的文字：有含义的写「1=有效」，含义待填写的单独说明——不能写成「1=」，模型会当成含义就是空。"""
+    filled = [f"{k}={v}" for k, v in codes.items() if str(v).strip()]
+    pending = [str(k) for k, v in codes.items() if not str(v).strip()]
+    if not pending:
+        return "、".join(filled)
+    if not filled:
+        return f"{'、'.join(pending)}（含义待填写）"
+    return f"{'、'.join(filled)}，{'、'.join(pending)} 的含义待填写"
+
+
 def _relation_text(rel: Mapping[str, Any]) -> str:
     left = ", ".join(rel.get("columns") or [])
     right = ", ".join(f"{rel.get('to_table')}.{c}" for c in rel.get("to_columns") or [])
@@ -1461,7 +1474,7 @@ def _notes_lines(notes: Mapping[str, Any] | None, *, meta: Mapping[str, Any] | N
             if name == "measure":
                 text = MEASURE_LABEL.get(value, str(value))
             elif name == "codes":
-                text = "、".join(f"{k}={v}" for k, v in value.items())
+                text = _codes_text(value)
             else:
                 text = str(value)
             # 第一段是中文名（没有中文名时是含义），不加前缀；其余写明是什么

@@ -152,6 +152,16 @@ def test_dialect_quoting_and_row_limits():
 # ---------------------------------------------------------------- 目录对剖析结果的容纳
 
 
+def test_codes_with_pending_meanings_are_valid_and_render_as_pending():
+    """剖析得到的码值只有取值、含义待人填写：目录要收得下，给模型看时写明含义待填写。"""
+    notes = {"columns": {"status": {"codes": make_item({"1": "", "0": ""}, "profile", "proposed")},
+                         "channel": {"codes": make_item({"WEB": "官网", "BOX": ""}, "profile", "proposed")}}}
+    assert catalog.validate_notes(notes) == []
+    text = catalog.render_table_notes(notes)
+    assert "1、0（含义待填写）" in text
+    assert "WEB=官网，BOX 的含义待填写" in text
+    # 码值仍得是对照表：值不是文字的照样拒收
+    assert catalog.validate_notes({"columns": {"s": {"codes": make_item({"1": 2}, "profile")}}})
 
 
 def _profile_rel(coverage, cardinality, status):
