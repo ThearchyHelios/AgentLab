@@ -130,7 +130,7 @@ async def _datasource_context(
 ) -> copilot_context.DatasourceContext:
     """这一轮的数据源上下文：读目录、大库按需求挑表、组装（copilot_context）。挑表失败退回只列表名，不抛异常。
 
-    非流式生成、发布前修复、升级都走这里；流式生成把三步拆开，挑表放进流里（期间发心跳）。
+    非流式生成、发布前修复、升级都走这里；流式生成把三步拆开，挑表放进流里（期间发心跳、挑完发 context 操作）。
     graph 是现有工作流：它的 SQL 查过的表一律给全字段。
     """
     plan = await copilot_context.plan_context(sources, graph=graph)
@@ -666,7 +666,7 @@ async def generate(
         model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
-    # 和流式生成同一套数据源上下文
+    # 和流式生成同一套数据源上下文，只是不发 context 操作（这条接口一次返回整张图）
     context = await _datasource_context(
         session, sources, payload, need=await _pick_need(session, payload),
         graph=payload.base_graph if (payload.base_graph or {}).get("nodes")
@@ -1704,6 +1704,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 这一份 system 一直用到最后：自查交回修正时沿用同一份上下文，不重新挑表
         system = system_for(context)
         messages = [("system", system), ("human", human)]
+        if (shown := context.op()) is not None:
+            yield _sse(shown)
         try:
             async for op in _with_heartbeat(_iter_ops(model, messages), started=started):
                 kind = op.get("op")

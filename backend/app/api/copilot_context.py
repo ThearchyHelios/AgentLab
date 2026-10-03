@@ -22,7 +22,7 @@
 **用法。** plan_context 读目录、按大小定每个源怎么给（不调模型，接口函数在开流之前调，因为请求的会话只在
 那时可用）；pick_model 拿挑表用的模型（同一个助手模型，关掉思考、额度取小）；ContextPlan.resolve 挑表并组装
 （流式生成在流里调，期间照常发心跳）；DatasourceContext 给出提示词片段（section）、工具清单里列出的可查对象
-（listed）。
+（listed）和告诉前端这一轮参考了哪些表的 context 操作（op）。
 """
 from __future__ import annotations
 
@@ -376,7 +376,7 @@ class ContextPlan:
         return out
 
     async def resolve(self, model: Any | None, *, need: str, unavailable: str | None = None) -> DatasourceContext:
-        """挑表并组装。不抛异常：挑表的任何失败都退回只列表名（fallback），原因写进日志。
+        """挑表并组装。不抛异常：挑表的任何失败都退回只列表名（fallback），原因写进 context 操作和日志。
 
         model 是 pick_model 拿到的模型；拿不到时为 None，unavailable 是原因。没有要挑表的源时不调模型。
         """
@@ -528,6 +528,28 @@ class DatasourceContext:
             return names
         first = [ctx.qualified(t) for t in ctx.tables]
         return first + [n for n in names if n not in first]
+
+    def op(self) -> dict[str, Any] | None:
+        """告诉前端这一轮参考了哪些表：{"op": "context", "sources": [...], "elapsed_ms"?}。没有可查的表时为 None。
+
+        每个源一项：source 源名，tables 给了全字段的表（全名），selected_by，total 这个源一共几张表；挑表失败的
+        带上 reason。只列了名字的表不进 tables：界面上说的「参考了 N 张表」是模型看得到字段的那些。
+        """
+        rows = []
+        for s in self.sources:
+            if not s.total:
+                continue
+            row: dict[str, Any] = {"source": s.source.name, "tables": [s.qualified(t) for t in s.tables],
+                                   "selected_by": s.selected_by, "total": s.total}
+            if s.selected_by == "fallback" and self.reason:
+                row["reason"] = self.reason
+            rows.append(row)
+        if not rows:
+            return None
+        out: dict[str, Any] = {"op": "context", "sources": rows}
+        if self.elapsed_ms is not None:
+            out["elapsed_ms"] = self.elapsed_ms
+        return out
 
     def section(self) -> str:
         """system 提示词里的数据源一节。没有数据源时返回空串，不占提示词。"""

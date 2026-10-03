@@ -8,7 +8,7 @@
 - 挑表、补路径、组装的结果（合成景区库：入园记录和渠道之间要经关联表 channel_visits）
 - 挑表失败（报错、超时、返回不存在的表、返回为空）一律退回只列表名，生成照常进行
 - 小库保持详细模式，额外带上目录
-- 自查修正沿用同一份上下文，不再重新挑表
+- 流式输出里有 context 操作；自查修正沿用同一份上下文，不再重新挑表
 - 非流式生成、发布前修复、升级共用同一套组装
 """
 from __future__ import annotations
@@ -176,6 +176,12 @@ OTHER_COLUMNS = ("store_code", "sku", "on_hand", "refund_amount")
 JOINS = ("channel_visits.visit_id = visits.id", "channel_visits.channel_id = channels.id")
 
 
+def _context_op(events: list[dict]) -> dict:
+    found = [e for e in events if e.get("op") == "context"]
+    assert len(found) == 1, [e.get("op") for e in events]
+    return found[0]
+
+
 # ---------------------------------------------------------------- 组装
 
 
@@ -289,7 +295,9 @@ async def test_several_sources_pick_with_source_names(scenic_db, tmp_path):
         by_name = {s.source.name: s for s in ctx.sources}
         assert by_name[a.name].tables == ["visits"]
         assert by_name[b.name].tables == ["orders", "payments"]
-        assert all(s.selected_by == "model" for s in ctx.sources)
+        op = ctx.op()
+        assert [s["source"] for s in op["sources"]] == [a.name, b.name]
+        assert all(s["selected_by"] == "model" for s in op["sources"])
     finally:
         await _drop_source(a)
         await _drop_source(b)
@@ -313,7 +321,9 @@ async def test_small_source_keeps_detail_and_carries_the_catalog(small_source):
     # 额外带上目录和连接条件
     assert f"中文名：订单{INFERRED_MARK}" in text and "单位：元" in text
     assert f"orders.customer_id = customers.id（多对一）{INFERRED_MARK}" in text
-    assert ctx.sources[0].selected_by == "all" and ctx.sources[0].tables == ["customers", "orders"]
+    op = ctx.op()
+    assert op["sources"] == [{"source": small_source.name, "tables": ["customers", "orders"], "selected_by": "all",
+                              "total": 2}]
 
 
 # ---------------------------------------------------------------- 回退：绝不阻断生成
@@ -335,6 +345,10 @@ async def test_pick_failures_fall_back_to_names_only(client, monkeypatch, scenic
     events = await _stream(client, monkeypatch, model, {
         "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
 
+    op = _context_op(events)
+    assert op["sources"] == [{"source": scenic_source.name, "tables": [], "selected_by": "fallback",
+                              "total": scenic.TABLE_COUNT + len(scenic.VIEWS), "reason": op["sources"][0]["reason"]}]
+    assert op["sources"][0]["reason"]
     system = model.systems[0]
     # 和以前一样只列表名、提醒先查字段
     assert "channel_visits" in system and "attributed_share" not in system
@@ -344,10 +358,10 @@ async def test_pick_failures_fall_back_to_names_only(client, monkeypatch, scenic
 
 
 
-# ---------------------------------------------------------------- 流式：自查沿用同一份上下文
+# ---------------------------------------------------------------- 流式：context 操作、自查沿用同一份上下文
 
 
-async def test_stream_prompt_carries_selected_tables(client, monkeypatch, scenic_source):
+async def test_stream_reports_the_context_and_prompt_carries_selected_tables(client, monkeypatch, scenic_source):
     from app.api import copilot_context
 
     picker = Picker(PICKED)
@@ -356,7 +370,13 @@ async def test_stream_prompt_carries_selected_tables(client, monkeypatch, scenic
     events = await _stream(client, monkeypatch, model, {
         "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
 
-    assert events[-1]["op"] == "final", events[-1]
+    op = _context_op(events)
+    assert op["sources"] == [{"source": scenic_source.name, "tables": ["visits", "channels", "channel_visits"],
+                              "selected_by": "model", "total": scenic.TABLE_COUNT + len(scenic.VIEWS)}]
+    assert isinstance(op["elapsed_ms"], int) and op["elapsed_ms"] >= 0
+    # context 在模型首帧之后、第一条图操作之前
+    kinds = [e["op"] for e in events]
+    assert kinds.index("model") < kinds.index("context") < kinds.index("add_node")
 
     # 挑表用同一个助手模型，关掉思考、额度取小
     (spec,) = specs
@@ -409,7 +429,8 @@ async def test_small_sources_do_not_call_the_picker(client, monkeypatch, small_s
     model = Scripted(_graph_using(f"db_query__{small_source.name}"))
     events = await _stream(client, monkeypatch, model, {
         "instruction": "订单总额", "intent": "answer", "datasource_ids": [small_source.id]})
-    assert events[-1]["op"] == "final", events[-1]
+    op = _context_op(events)
+    assert op["sources"][0]["selected_by"] == "all" and "elapsed_ms" not in op
     assert not picker.calls
     assert "· orders[表]" in model.systems[0]
 
@@ -450,7 +471,7 @@ def _node(nid, ntype, label, **config):
 
 
 async def test_publish_fix_shares_the_context(monkeypatch, scenic_source):
-    """发布前修复：现有图查的表一定带上，需求写的是挡住发布的问题。"""
+    """发布前修复：现有图查的表一定带上，需求写的是挡住发布的问题；不发 context 操作（返回值里没有）。"""
     import app.api.copilot as copilot
 
     picker = Picker({"tables": [{"source": scenic_source.name, "table": "visits"},
@@ -477,6 +498,7 @@ async def test_publish_fix_shares_the_context(monkeypatch, scenic_source):
     assert len(picker.calls) == 1 and "发布前检查" in picker.calls[0]
     system = model.systems[0]
     assert "attributed_share  REAL" in system and "sold_at  TEXT" in system
+    assert "context" not in json.dumps(out, ensure_ascii=False)
 
 
 async def test_upgrade_shares_the_context(monkeypatch, scenic_source):
