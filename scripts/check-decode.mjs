@@ -123,6 +123,10 @@ await section('合并查询', async () => {
   check('标题说合并的是哪几个输入', m?.title === '合并 s、v 的查询结果', m?.title)
   check('合并 SQL 留在详情里', m?.detail === synthetic.MERGE_SQL)
   check('预览按查询结果的形状给出，能画成表格', !!mod.parseQueryResult(m?.result ?? '')?.columns?.includes('到店人数'))
+  // 合并结果 8 行、预览只存了 5 行：这是「此处仅为预览」，不是「查询已达行数上限」（A3）
+  const table = mod.parseQueryResult(m?.result ?? '')
+  check('预览只存了前几行：记为预览（clipped），不记为查询撞了行数上限（truncated），并带上一共几行', table?.truncated === false
+    && table?.clipped === true && table?.total === 8 && table?.rows.length === 5, JSON.stringify({ t: table?.truncated, c: table?.clipped, n: table?.total }))
   check('输入、行数、数据源都在', m?.merge?.inputs?.length === 2 && m.merge.inputs[1].source === 'members'
     && m.merge.inputs[0].label === '门店销售' && m.merge.rows === 8)
   check('行数和耗时写在行尾', !!m?.meta?.includes('8 行'), m?.meta)

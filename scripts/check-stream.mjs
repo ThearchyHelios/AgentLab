@@ -709,6 +709,10 @@ await section('合并查询：输入、合并 SQL、结果预览，警告各占�
   check('合并 SQL 有标签、带复制', (await row.innerText()).includes('合并 SQL')
     && await row.getByRole('button', { name: '复制合并 SQL' }).count() === 1)
   check('结果预览画成表格（列是合并结果的列）', (await row.locator('table th').allInnerTexts()).some((t) => t.includes('到店人数')))
+  // 合并结果 8 行、预览只存了 5 行：说「此处仅为预览」和「显示前 5 / 8 行」，不说「查询已达行数上限」（A3）
+  const foot = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('预览只存了前几行：写「显示前 5 / 8 行」和「仅为预览」，不说查询已达行数上限', foot.includes('显示前 5 / 8 行')
+    && foot.includes('此处仅为预览') && !foot.includes('查询已达行数上限'), foot.slice(-120))
   check('输入写在合并 SQL 前面：先看合并的是什么，再看怎么合并', await row.evaluate((el) => {
     const m = el.querySelector('[data-step-merge]')
     const pre = el.querySelector('pre')

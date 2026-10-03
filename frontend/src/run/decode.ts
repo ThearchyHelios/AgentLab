@@ -441,8 +441,10 @@ export interface ResultTable {
   rows: unknown[][]
   /** 查询本身撞了行数上限——数据库里还有更多，是 guard 没让它全取回来 */
   truncated: boolean
-  /** 这份预览被按字符数切断了——取回来的行数比这里显示的多，只是没存下来 */
+  /** 这份预览被按字符数切断了，或者本来就只存了前几行——实际的行数比这里显示的多，只是没存下来 */
   clipped?: boolean
+  /** 实际一共几行（结果里的 row_count）。比 rows 多时，表格脚注写「显示前 5 / 6 行」 */
+  total?: number
 }
 
 /**
@@ -477,7 +479,9 @@ function tryTable(text: string): ResultTable | null {
   try {
     const data = JSON.parse(text)
     if (Array.isArray(data?.columns) && Array.isArray(data?.rows)) {
-      return { columns: data.columns, rows: data.rows, truncated: !!data.truncated }
+      const total = typeof data.row_count === 'number' && data.row_count > data.rows.length ? data.row_count : undefined
+      return { columns: data.columns, rows: data.rows, truncated: !!data.truncated,
+               ...(data.clipped === true || total != null ? { clipped: true } : {}), ...(total != null ? { total } : {}) }
     }
   } catch {
     /* 交给调用方决定要不要修 */
@@ -2187,8 +2191,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           ...(warnings ? { level: 'warn' as const, sub: MERGE_TEXT.warnings(warnings) } : {}),
           title: MERGE_TEXT.stepTitle(inputs.map((i) => i.alias)),
           detail: typeof d.sql === 'string' && d.sql ? d.sql : undefined,
+          // 预览只存了前几行：那是「此处仅为预览」（clipped），不是「查询已达行数上限」（truncated）。
+          // 合并结果本身超过上限才是 truncated；row_count 记全部行数，表格脚注写「显示前 5 / 6 行」
           result: Array.isArray(d.columns)
-            ? JSON.stringify({ columns: d.columns, rows: preview, truncated: rows != null && rows > preview.length })
+            ? JSON.stringify({ columns: d.columns, rows: preview, truncated: !!d.truncated,
+                               clipped: rows != null && rows > preview.length, ...(rows != null ? { row_count: rows } : {}) })
             : undefined,
           meta: [rows != null ? MERGE_TEXT.rows(rows) : '', dur(ms) ?? ''].filter(Boolean).join(' · ') || undefined,
           ms,

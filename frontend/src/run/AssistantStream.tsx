@@ -1854,8 +1854,9 @@ export function ResultTable({ table, artifact, title, full = false, highlight, m
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-t px-1.5 py-1 text-2xs leading-relaxed text-dim">
         <span className="tnum">
           {[
-            rows.length < table.rows.length
-              ? `显示前 ${formatNumber(rows.length)} / ${formatNumber(table.rows.length)} 行`
+            // total：结果一共几行（预览只存了前几行时比 rows 多，比如合并查询 6 行只预览 5 行）
+            rows.length < Math.max(table.total ?? 0, table.rows.length)
+              ? `显示前 ${formatNumber(rows.length)} / ${formatNumber(Math.max(table.total ?? 0, table.rows.length))} 行`
               : `${formatNumber(table.rows.length)} 行`,
             hiddenCols > 0 ? `显示前 ${cols.length} / ${table.columns.length} 列` : null,
           ].filter(Boolean).join(' · ')}
