@@ -1106,12 +1106,21 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   const dash = rendered === NONE || entry?.rendered === NONE
   const missing = entry?.status === 'missing_input' || (value == null && (dash || !resolved))
   const unshowable = !missing && dash && value != null
+  // 拿截断的查询结果整组算出来的：值是真的算出来的，但只算到了取回的那部分，出具已按缺口降档
+  const incomplete = step?.incomplete === true || entry?.incomplete === true
+  const incompleteReason = step?.incomplete_reason || entry?.incomplete_reason || EVIDENCE_TEXT.incompleteFallback
 
   return (
     <Part title={EVIDENCE_TEXT.metric} data-ev-metric="">
       <div className="flex flex-wrap items-baseline gap-x-2">
         <span className="font-medium">{name}</span>
         {resolved && rendered && <span className="mono tnum text-sm" data-ev-value="">{rendered}</span>}
+        {incomplete && (
+          <span className="chip" data-ev-incomplete="" title={incompleteReason}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.incomplete}
+          </span>
+        )}
       </div>
       {(caliber || version || artifact || from) && (
         <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-2xs text-dim">
@@ -1127,6 +1136,9 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
       )}
       <Integrity step={step} seal={seal} />
       {missing && <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing="">{EVIDENCE_TEXT.missingValue}</p>}
+      {incomplete && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-incomplete-reason="">{incompleteReason}</p>
+      )}
       {unshowable && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-unshowable="">
           {EVIDENCE_TEXT.unshowable(valueText(value))}
@@ -1201,12 +1213,16 @@ function IntegrityList({ code, items }: { code: string; items: string[] }) {
 function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) {
   const host = useEvidenceHost()
   const missing = input.status === 'missing' || input.value == null
+  // Agent 交来、被截断切开的数组字段：对它计数、求和只算到了取回的那部分
+  const cut = !missing && input.truncated === true
   const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
   const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
-  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`]
-    .filter(Boolean).join('')
-  const style = missing ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
-  const body = <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : ''}</span>
+  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
+    cut && ` · ${EVIDENCE_TEXT.inputTruncated}`].filter(Boolean).join('')
+  const style = missing || cut ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
+  const body = (
+    <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : cut ? '（已截断）' : ''}</span>
+  )
   return (
     <li className="max-w-full">
       {link ? (

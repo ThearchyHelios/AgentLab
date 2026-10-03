@@ -2036,6 +2036,8 @@ export interface EvidenceInput {
   query?: string | null
   /** 输入落在哪一格，全局编号（Q3.r5.amount） */
   cell?: string
+  /** agent 的数组字段：引用的行段到了截断查询结果的末行，后面还有没取回的行（query 步骤上是快照本身截断了） */
+  truncated?: boolean | null
 }
 
 /** 口径卡钉在另一个已发布工作流某个版本里的口径卡上 */
@@ -2091,6 +2093,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   substituted?: string
   recompute_ok?: boolean | null
   status?: string
+  /** metric：表达式把截断的查询结果当成整组用了（计数、求和……），值只算到了取回的那部分 */
+  incomplete?: boolean
+  /** metric：不完整的原因（人话，「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」） */
+  incomplete_reason?: string
   inputs?: EvidenceInput[]
   /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
   caliber_from?: EvidenceCaliberSource | null

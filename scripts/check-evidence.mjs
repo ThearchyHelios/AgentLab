@@ -1010,6 +1010,32 @@ await section('caliber', '口径卡来源和升版处置', async () => {
   await none.ctx.close()
 })
 
+await section('incomplete', '截断的查询结果整组算出来的指标：标「结果不完整」并写明原因，完整的指标不标', async () => {
+  await openQ(page, '45,678.5元', { wait: '[data-ev-expression]' })
+  check('完整的指标不出不完整标识', await panel(page).locator('[data-ev-incomplete], [data-ev-incomplete-reason]').count() === 0)
+  check('……输入也不标「已截断」', !(await panel(page).locator('[data-ev-input]').allInnerTexts()).some((t) => t.includes('已截断')))
+  await page.keyboard.press('Escape')
+  // 接口的形状：backend/app/api/evidence.py 的指标步骤带 incomplete / incomplete_reason，输入带 Agent 字段证据里的 truncated
+  const REASON = '基于被截断的查询结果计算（只取回了前 1000 行），结果不完整'
+  const cut = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'metric'
+    ? { ...st, incomplete: true, incomplete_reason: REASON } : st.step === 'input' ? { ...st, truncated: true } : st)) }))
+  await openQ(cut.page, '45,678.5元', { wait: '[data-ev-incomplete]' })
+  const p = cut.page.locator('[data-evidence-panel]')
+  const chip = p.locator('[data-ev-incomplete]')
+  check('指标名旁有「结果不完整」标识，悬停看原因', (await chip.innerText().catch(() => '')) === '结果不完整'
+    && await chip.getAttribute('title') === REASON, await chip.innerText().catch(() => ''))
+  const why = await p.locator('[data-ev-incomplete-reason]').innerText().catch(() => '')
+  check('原因写在指标下面', why === REASON, why)
+  const warn = await tokenColor(cut.page, 'color', 'var(--st-waiting)')
+  check('用提醒色（不是失败色：值是真算出来的，只是不全）', await chip.evaluate((el) => getComputedStyle(el).color) === warn)
+  const inputs = await p.locator('[data-ev-input]').allInnerTexts()
+  check('被截断切开的 Agent 字段输入标「已截断」', inputs.some((t) => t.includes('（已截断）')), inputs.join('|'))
+  const source = await p.locator('[data-ev-sources]').innerText().catch(() => '')
+  check('……输入来源写明与快照一致、但只含取回的部分行', source.includes('与快照一致；查询结果已截断，该字段只含取回的部分行'),
+    source.replace(/\s+/g, ' ').slice(0, 160))
+  await cut.ctx.close()
+})
+
 await section('q-narrow', '查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
   const overflow = () => page.evaluate((sel) => {
     const el = document.querySelector(sel)

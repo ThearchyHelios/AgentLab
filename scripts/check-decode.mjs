@@ -1316,6 +1316,28 @@ await section('agent 字段按出处核对（可点击证据第二期）：抽�
     && !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}`)), odd.map((s) => s.title).join(' | '))
 })
 
+await section('口径卡指标不完整（数据目录阶段 0）：截断的查询结果整组拿来算的指标，警告说人话并指到 SQL', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  // 原话和 backend/app/engine/nodes/metrics.py 的 _incomplete_reason 同一个句式。先核对后端源码还是这么说的
+  const INCOMPLETE = '指标「入园人次」基于被截断的查询结果计算（只取回了前 1000 行），结果不完整'
+  const metricsPy = readFileSync(`${root}backend/app/engine/nodes/metrics.py`, 'utf8')
+  check('后端发指标不完整警告的格式还是夹具里这一种', metricsPy.includes('code="metric_incomplete"')
+    && metricsPy.includes('message=f"指标「{m[\'name\']}」{m[\'incomplete_reason\']}"')
+    && metricsPy.includes('f"基于被截断的查询结果计算（只取回了{fetched[0]}），结果不完整"'),
+  '改了 metrics.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const all = flatten(mod.decodeRun([
+    E(1, 'node.started', 'card', { node_type: 'metrics' }),
+    E(2, 'log', 'card', { level: 'warn', code: 'metric_incomplete', metric: 'visits', message: INCOMPLETE }),
+    E(3, 'node.finished', 'card', { duration_ms: 3 }),
+  ]))
+  const inc = all.find((s) => s.code === 'metric_incomplete')
+  check('metric_incomplete 说人话：标题点名哪个指标不完整', inc?.title === '指标「入园人次」结果不完整', inc?.title)
+  check('……原因放副标题，原话留在展开区', inc?.sub === '基于被截断的查询结果计算（只取回了前 1000 行）' && inc?.detail === INCOMPLETE,
+    `${inc?.sub} / ${inc?.detail}`)
+  check('……是提醒（warn），下一步指到 SQL，节点本身照样成功', inc?.level === 'warn' && !!inc?.next?.includes('SQL')
+    && all.find((s) => s.kind === 'node')?.status === 'done', `${inc?.level} ${inc?.next}`)
+})
+
 await section('结论句裁判（可点击证据第四期）：裁判调用单独成行、几条警告说人话、封存后按需裁判有记录', async () => {
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
   // 原话和后端同一个格式：engine/judge.py 的 run_request、engine/nodes/report.py 的改写一次。先核对后端源码还是这么说的

@@ -237,6 +237,11 @@ export const EVIDENCE_TEXT = {
   unmatchedPlain: '无法追溯的数字：',
   uncited: '该数字未使用引用标记，系统无法核对其来源',
   missingValue: '缺少输入：口径卡本次未计算出该指标的值',
+  /** 指标拿截断的查询结果整组算出来（计数、求和……）：值只算到了取回的那部分，出具按缺口降档 */
+  incomplete: '结果不完整',
+  incompleteFallback: '基于被截断的查询结果计算，结果不完整',
+  /** 输入是 Agent 交来、被截断切开的数组字段 */
+  inputTruncated: '查询结果已截断，该字段只含取回的部分行',
   unshowable: (value: string) => `有值（${value}），但无法按口径卡的格式显示`,
   chainPending: '正在加载算式和输入…',
   /** 证据接口逐项复核出来的问题。正常时不说，出问题才醒目 */

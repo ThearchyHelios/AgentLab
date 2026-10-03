@@ -745,6 +745,17 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
       }
     }
+    case 'metric_incomplete': {
+      // 「指标「入园人次」基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」（metrics.py _incomplete_reason）
+      const name = message.match(/^指标「(.+?)」/)?.[1]
+      return {
+        title: name ? `指标「${name}」结果不完整` : '指标结果不完整',
+        sub: message.match(/^指标「.+?」(.+?)，结果不完整$/)?.[1],
+        next: '口径卡对截断的查询结果计数、求和，只算到了取回的部分，出具按缺口降档。'
+          + '请在 SQL 中直接聚合（如 COUNT、SUM）或缩小查询范围后重新运行',
+        fix: 'canvas',
+      }
+    }
     case 'judge_limit': {
       // 「结论句裁判已到上限（这份报告的裁判金额上限 $0.05）：3 句没判，记为未裁判；已判的保留」（judge.py run_request）
       const n = message.match(/[：:]\s*(\d+)\s*句(?:没判|未裁判)/)?.[1]
