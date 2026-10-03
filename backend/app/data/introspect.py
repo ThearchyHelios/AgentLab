@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -421,8 +422,14 @@ def table_columns(meta: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def describe_table(source: Any, table: str) -> str:
-    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。"""
+def describe_table(source: Any, table: str, *, catalog: Mapping[str, Mapping[str, Any]] | None = None) -> str:
+    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。
+
+    catalog 是这个源的数据目录 {表名: notes}（data/catalog.py），给了且这张表有可给模型看的内容时，在字段
+    清单后面附上目录：中文名、粒度、业务主键、业务日期、有效记录条件、每列的含义 / 单位 / 度量类型 / 码值、
+    关联关系，推断的项标出来。导入表格的源，表和列的说明是系统按核对结果生成的：说明照旧拼在表名和列后面，
+    目录只追加说明没有覆盖的、或人工确认过的项（catalog.render_table_notes）。不给 catalog 时输出和以前一样。
+    """
     cache = source.schema_cache or {}
     tables = cache.get("tables") or {}
     # 模型可能传全名（ANALYTICS.V_TRIP_FACT），也可能只传表名，两种都认
@@ -457,6 +464,14 @@ def describe_table(source: Any, table: str) -> str:
             marks.append(col["comment"])
         suffix = f"  {'、'.join(marks)}" if marks else ""
         lines.append(f"  {col['name']}  {col['type']}{suffix}")
+    if catalog:
+        from app.data import catalog as catalog_mod
+
+        key = catalog_mod.resolve_table_name(cache, table)
+        block = catalog_mod.render_table_notes(catalog.get(key) if key else None, meta=meta,
+                                               system_notes=catalog_mod.system_notes_source(source))
+        if block:
+            lines.append(block)
     return "\n".join(lines)
 
 

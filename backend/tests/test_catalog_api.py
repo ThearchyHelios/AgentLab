@@ -187,3 +187,13 @@ async def test_draft_without_schema_is_refused(client):
     r = await client.post(f"{_base(sid)}/draft", json={})
     assert r.status_code == 409 and "探查结构" in r.json()["detail"]
     assert (await client.get(_base(sid))).json()["tables"] == []
+
+
+async def test_schema_endpoint_detail_carries_catalog(client, source_id):
+    """数据源页「表结构」里给模型看的那段文本和 db_schema 工具同一个说法，也附上目录。"""
+    before = (await client.get(f"/api/datasources/{source_id}/schema", params={"table": "visits"})).json()
+    assert catalog.NOTES_HEADING not in before["detail"]
+    await client.post(f"{_base(source_id)}/draft", json={"tables": ["visits"]}, headers=ACTOR)
+    after = (await client.get(f"/api/datasources/{source_id}/schema", params={"table": "visits"})).json()
+    assert catalog.NOTES_HEADING in after["detail"] and "gate_id → gates.id" in after["detail"]
+    assert after["detail"].startswith(before["detail"])
