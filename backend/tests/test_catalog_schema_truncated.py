@@ -114,3 +114,20 @@ async def test_assistant_context_of_a_complete_schema_says_nothing_extra(narrow)
     (row,) = ctx.op()["sources"]
     assert row["total"] == 3 and "explored" not in row
     assert "没有探查到" not in ctx.section()
+
+
+async def test_schema_tool_does_not_deny_a_table_that_was_not_introspected(wide, narrow):
+    """只探查了一部分表时，查一张没探查到的表不能说「没有」：它可能就在没探查到的那部分里。
+    以前回「数据源中没有 X」，模型据此改用别的表，或者编一个答案。"""
+    from app.data.introspect import describe_table
+
+    row = await _row(wide[0])
+    explored = set((row.schema_cache or {}).get("tables") or {})
+    missing = next(f"t{i:03d}" for i in range(WIDE) if f"t{i:03d}" not in explored)
+    text = describe_table(row, missing)
+    assert "中没有" not in text
+    assert "只探查了" in text and "information_schema" in text
+
+    # 探查完整的库：查不存在的表照旧说没有
+    small = await _row(narrow[0])
+    assert "中没有 nope" in describe_table(small, "nope")

@@ -447,6 +447,15 @@ def describe_table(source: Any, table: str, *, catalog: Mapping[str, Mapping[str
         available = "、".join(
             m.get("qualified", n) for n, m in list(tables.items())[:30]
         )
+        if cache.get("truncated"):
+            # 只探查了一部分表：没探查到不等于没有。以前照样回「中没有 X」，模型据此换了别的表或者编答案
+            total = cache.get("total")
+            of = f"共 {total} 个对象，" if isinstance(total, int) else ""
+            return (
+                f"数据源「{source.name}」{of}只探查了其中 {len(tables)} 个，{table} 不在已探查的范围内，"
+                "无法判断是否存在。请直接查询数据字典（information_schema.tables / columns，SQLite 用 "
+                f"sqlite_master）确认它的结构。已探查的对象包括：{available}"
+            )
         return f"数据源「{source.name}」中没有 {table}。现有的对象：{available}"
 
     head = f"{'视图' if meta.get('is_view') else '表'} {meta.get('qualified', table)}"
