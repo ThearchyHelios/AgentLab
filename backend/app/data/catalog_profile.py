@@ -354,7 +354,7 @@ class _Runner:
             # 上面已经按只读过了同一个守卫，查询层再拒只可能是时限到了
             if cut:
                 self.stopped = "deadline"
-            raise _Skip("timeout", f"查询超过 {_fmt(seconds)} 秒被中断，已跳过") from e
+            raise _Skip("timeout", f"查询超时：超过 {_fmt(seconds)} 秒被中断，已跳过") from e
         except SnapshotTampered:
             raise
         except Exception as e:  # noqa: BLE001 - 一条查询失败不该拖垮整次剖析，原因照实记下
@@ -677,8 +677,10 @@ def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan
         parts.append(f"被指向列是{how}" if how in ("主键", "唯一约束") else "被指向列经计数核对唯一")
     elif unique is False:
         parts.append("被指向列有重复值，不能作为关联的被指向键")
-    else:
+    elif how == "too_large":
         parts.append("被指向的表超过整表统计的行数上限，未核对被指向列是否唯一")
+    else:
+        parts.append("未能核对被指向列是否唯一")
     if child is not None:
         child_unique, child_how = child
         if child_unique is True:
@@ -686,8 +688,10 @@ def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan
             parts.append(f"子表一侧也唯一（{basis}），一对一")
         elif child_unique is False:
             parts.append("子表一侧有重复值，多对一")
-        else:
+        elif child_how == "too_large":
             parts.append("子表超过整表统计的行数上限，未核对子表一侧是否唯一，按多对一记")
+        else:
+            parts.append("未能核对子表一侧是否唯一，按多对一记")
     if not holds and not low:
         parts.append("暂不升为有确证")
     return f"{NOTE_PREFIX}{day}）：" + "；".join(parts) + "。"
@@ -696,8 +700,8 @@ def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan
 async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _TableOutcome,
                           result: TableProfile) -> None:
     """从子表取至多 sample_size 个不同的非空键值，去父表里数对上几个，得到覆盖率；再看父键、子键唯不唯一。"""
-    cols, to_table, to_cols = list(rel.get("columns") or []), str(rel.get("to_table") or ""), \
-        list(rel.get("to_columns") or [])
+    cols, to_cols = list(rel.get("columns") or []), list(rel.get("to_columns") or [])
+    to_table = str(rel.get("to_table") or "")
     if len(cols) != 1 or len(to_cols) != 1:
         raise _Skip("unsupported", "多列组成的关联关系暂不剖析")
     meta = cx.tables[table]
@@ -1165,17 +1169,26 @@ async def profile_catalog(session: AsyncSession, row: Any, source: Any, *, table
     - tables 为空时按使用次数取前 PROFILE_DEFAULT_TABLES 张目录里有待核实关系的表。
     - 每张表做完就写入，后面的表停下（预算、总时长）不影响前面已经写进去的。
     """
-    settings = settings or profile_settings(getattr(row, "options", None))
-    name = getattr(row, "name", "") or ""
-    if not settings.enabled:
-        raise ProfileDisabled(f"数据源「{name}」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析")
+    settings = ensure_enabled(row, settings)
     if source.id in _RUNNING:
-        raise ProfileBusy(f"数据源「{name}」正在进行数据剖析，请等待完成后再试")
+        raise ProfileBusy(f"数据源「{getattr(row, 'name', '')}」正在进行数据剖析，请等待完成后再试")
     _RUNNING.add(source.id)
     try:
         return await _profile(session, row, source, tables, actor, settings)
     finally:
         _RUNNING.discard(source.id)
+
+
+def ensure_enabled(row: Any, settings: ProfileSettings | None = None) -> ProfileSettings:
+    """这个数据源能不能剖析：数据源停用了、或者没开启数据剖析，抛 ProfileDisabled（message 给人看）。
+    返回要用的设置（不给就按 row.options 读）。接口在做别的检查之前先调它：开关是第一道门。"""
+    settings = settings or profile_settings(getattr(row, "options", None))
+    name = getattr(row, "name", "") or ""
+    if getattr(row, "enabled", True) is False:
+        raise ProfileDisabled(f"数据源「{name}」已停用，无法进行数据剖析。请先在数据源设置中启用")
+    if not settings.enabled:
+        raise ProfileDisabled(f"数据源「{name}」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析")
+    return settings
 
 
 async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[str] | None, actor: str | None,
@@ -1209,7 +1222,7 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
     return report
 
 
-__all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES", "PROFILE_OPTION", "ProfileBusy",
-           "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile",
-           "TableSize", "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem",
-           "sql_literal"]
+__all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
+           "PROFILE_OPTION", "ProfileBusy", "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip",
+           "SqlDialect", "TableProfile", "TableSize", "ensure_enabled", "estimate_size", "profile_catalog",
+           "profile_settings", "profile_settings_problem", "sql_literal"]
