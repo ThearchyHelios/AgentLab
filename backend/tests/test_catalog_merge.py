@@ -152,7 +152,7 @@ def test_human_edit_marks_changed_items_as_human_confirmed_and_keeps_the_rest():
         "grain": {**existing["grain"], "value": "每张门票每次检票一行"},       # 改了值
         "columns": {"amount": {"measure": existing["columns"]["amount"]["measure"],   # 没动
                                "unit": {"value": "元"}}},                             # 新填，没写来源和状态
-        "relations": existing["relations"][:1],                                      # 删掉一条关系
+        "relations": existing["relations"][:1],                                      # 去掉一条推断出来的关系
         "dedup": {"value": "同一票号只计一次", "source": "llm", "status": "verified"},   # 冒充别的来源、状态
     }
     out = catalog.apply_human_edit(existing, submitted, table="visits", at=AT)
@@ -161,7 +161,9 @@ def test_human_edit_marks_changed_items_as_human_confirmed_and_keeps_the_rest():
     assert out["columns"]["amount"]["unit"] == {"value": "元", "source": "human", "status": "confirmed",
                                                 "updated_at": AT}
     assert out["dedup"]["source"] == "human" and out["dedup"]["status"] == "confirmed"
-    assert len(out["relations"]) == 1 and out["relations"][0] == existing["relations"][0]
+    # 去掉的推断关系转为驳回、保留编号（删掉的话下次起草、关系图现推都会把它带回来）
+    assert out["relations"] == [existing["relations"][0],
+                                {**existing["relations"][1], "status": "rejected", "updated_at": AT}]
     assert catalog.validate_notes(out) == []
 
 
@@ -181,3 +183,6 @@ def test_human_edit_relation_id_follows_its_ends():
     out = catalog.apply_human_edit(existing, {"relations": [moved]}, table="visits", at=AT)
     assert out["relations"][0]["id"] == catalog.relation_id("visits", ["gate_id"], "parks", ["id"])
     assert out["relations"][0]["source"] == "human"
+    # 两条原有的推断关系都不在提交里了（一条改了两端）：转为驳回
+    assert [(r["id"], r["status"]) for r in out["relations"][1:]] == [(r["id"], "rejected")
+                                                                       for r in existing["relations"]]

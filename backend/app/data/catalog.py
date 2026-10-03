@@ -47,7 +47,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.names import name_key
-from app.db.models import Artifact, CatalogNote, Run
+from app.db.models import Artifact, CatalogNote, DataSource, Run
 
 # ==========================================================================
 # 取值
@@ -653,14 +653,19 @@ def _normalize_submitted(submitted: Mapping[str, Any], table: str) -> dict[str, 
 
 
 def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str, Any], *, table: str,
-                     at: str | None = None) -> dict[str, Any]:
+                     at: str | None = None, inferable: Iterable[str] = ()) -> dict[str, Any]:
     """人工提交的整份目录 → 要写入的目录（不改入参）。
 
     - 值改过的项、新填的项：记为 human / confirmed。提交里写的来源和状态不作数——客户端不能冒充外键约束
       或数据剖析。
     - 值没动的项：保持原来的来源和状态；提交里把状态改成确认、驳回或来源的初始状态的，照改（等同单项审阅）；
       改成别的状态的不认（不能把推断改成「有确证」）。
-    - 已有、但提交里没有的项：删掉。
+    - 已有、但提交里没有的表级项、列级项：删掉。
+    - 已有、但提交里没有的关联关系：外键约束、命名推断、数据剖析、模型起草来的，转为驳回、保留编号；只有人工
+      新建的才真正删掉。删掉的推断关系下次起草会再提出来，关系图（助手挑表、SQL 检查）也会按表结构现推回来，
+      照样驱动检查和助手——驳回才留得住。改了两端的关系编号跟着变，旧编号在提交里就「没有了」，同样按这条处理。
+      inferable 是表结构能推出来的关系编号（外键约束、命名推断，structure_relation_ids）：人工改过基数的外键关系
+      记成了人工填写，删掉照样会被现推回来，也只能驳回。
     - 关系编号按两端重算（_normalize_submitted）。
 
     结构不合规抛 CatalogInvalid。
@@ -672,6 +677,7 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
         raise CatalogInvalid(problems)
     at = at or now_iso()
     old, new = _slots(existing), _slots(normalized)
+    inferable = set(inferable)
     out: dict[Slot, dict[str, Any]] = {}
     for key, item in new.items():
         prev = old.get(key)
@@ -692,7 +698,21 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
                 kept.pop("note", None)
             kept["updated_at"] = at
         out[key] = kept
+    for key, prev in old.items():
+        if key in new or key[0] != "r":
+            continue
+        if prev.get("source") == "human" and key[1] not in inferable:
+            continue                                         # 人工新建的：真正删掉
+        out[key] = prev if prev.get("status") == "rejected" else {**prev, "status": "rejected", "updated_at": at}
     return _assemble(out)
+
+
+def structure_relation_ids(schema_cache: Mapping[str, Any] | None, table: str) -> set[str]:
+    """表结构能推出来的这张表的关系编号（外键约束、命名推断）。表结构里没有这张表时为空集。"""
+    if not isinstance(((schema_cache or {}).get("tables") or {}).get(table), Mapping):
+        return set()
+    rels = (fk_relations(schema_cache, table) or []) + infer_name_relations(schema_cache, table)
+    return {str(r["id"]) for r in rels}
 
 
 async def review_entry(session: AsyncSession, source_id: str, table: str, path: str, action: str, *,
@@ -707,13 +727,22 @@ async def review_entry(session: AsyncSession, source_id: str, table: str, path: 
 
 
 async def save_human_edit(session: AsyncSession, source_id: str, table: str, submitted: Mapping[str, Any], *,
-                          if_version: int, actor: str | None) -> CatalogEntry:
-    """人工提交整份目录并写入（规则见 apply_human_edit，乐观锁同 write_entry）。"""
+                          if_version: int, actor: str | None,
+                          schema_cache: Mapping[str, Any] | None = None) -> CatalogEntry:
+    """人工提交整份目录并写入（规则见 apply_human_edit，乐观锁同 write_entry）。
+
+    schema_cache 用来判断哪些关系表结构推得出来（去掉时只能驳回）；不给就读数据源记录上的，和 SQL 检查建关系图
+    用的是同一份（sqlcheck.load_checkers）。
+    """
     entry = await read_entry(session, source_id, table)
     current = entry.version if entry else 0
     if if_version != current:
         raise CatalogConflict(table, current)
-    notes = apply_human_edit(entry.notes if entry else {}, submitted, table=table)
+    if schema_cache is None:
+        row = await session.get(DataSource, source_id)
+        schema_cache = getattr(row, "schema_cache", None)
+    notes = apply_human_edit(entry.notes if entry else {}, submitted, table=table,
+                             inferable=structure_relation_ids(schema_cache, table))
     return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
 
 
@@ -1885,8 +1914,11 @@ def relation_graph(notes_by_table: Mapping[str, Mapping[str, Any]], *,
                    schema_cache: Mapping[str, Any] | None = None) -> dict[str, list[JoinEdge]]:
     """邻接表 {表: [从这张表出发的边]}，每条关系正反各一条边；被驳回的关系不进图，自己连自己的也不进。
 
-    schema_cache 给了的话，没起草过目录的关系按表结构现推（外键约束 + 命名推断）补进来：助手挑表时不必等
-    每张表都起草过。目录里已有的关系（含驳回的）以目录为准。
+    schema_cache 给了的话，目录里没有的关系按表结构现推（外键约束 + 命名推断）补进来：助手挑表时不必等每张表
+    都起草过，只做过部分注释（目录里一条关系都没记）的表也不会丢掉外键关系——所以不能只给「没有目录的表」现推。
+    目录里已有的关系（含驳回的）以目录为准：编号由两端的表和列算出（relation_id，含本表表名），目录里驳回过的
+    编号就不再现推。这要求「去掉一条推断出来的关系」落成驳回而不是删除（apply_human_edit），删掉就留不下编号，
+    下次又被现推回来。
     """
     rels: dict[str, tuple[str, Mapping[str, Any]]] = {}
     rejected: set[str] = set()
@@ -2052,6 +2084,6 @@ __all__ = [
     "initial_status", "join_paths", "make_item", "merge_notes", "now_iso", "parse_path", "plan_patch",
     "profile_relation_holds", "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id",
     "render_table_index", "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry",
-    "review_item", "same_notes", "save_human_edit", "save_patch", "status_counts", "system_notes_source",
-    "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
+    "review_item", "same_notes", "save_human_edit", "save_patch", "status_counts", "structure_relation_ids",
+    "system_notes_source", "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
 ]

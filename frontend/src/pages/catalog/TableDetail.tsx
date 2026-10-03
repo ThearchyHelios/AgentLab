@@ -23,7 +23,7 @@ import { CodesDialog } from './CodesDialog'
 import { coverageText } from './profile'
 import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
-  relationDraft, relationPath, tablePath, unknownKeys, validateForm,
+  relationDraft, relationPath, relationRemoval, tablePath, unknownKeys, validateForm,
 } from './model'
 import type { ColumnField, EditForm, RelationDraft, TableField, TableKey } from './model'
 
@@ -681,42 +681,70 @@ function RelationEditor({ drafts, initial, problems, rows, onChange }: {
   const patch = (key: string, p: Partial<RelationDraft>) => onChange((rs) => rs.map((r) => (r.key === key ? { ...r, ...p } : r)))
   return (
     <div className="space-y-2" data-relation-editor="">
+      <p className="text-2xs leading-relaxed text-faint" data-relation-remove-hint="">{CT.relationRemoveHint}</p>
       {drafts.map((r) => {
         const b = before.get(r.key)
         const changed = !b || b.columns !== r.columns || b.to_table !== r.to_table || b.to_columns !== r.to_columns || b.cardinality !== r.cardinality
         const problem = problems[`r:${r.key}`]
+        // 人工添加的才能删除；外键约束、命名推断、数据剖析得出的只能驳回（删掉会被起草和现推带回来）
+        const removal = relationRemoval(r.orig)
+        const rejecting = !!r.reject
+        const locked = rejecting ? 'text-faint line-through' : undefined
         return (
-          <div key={r.key} className="rounded-lg border bg-panel p-2.5" data-relation-draft={r.key}>
+          <div key={r.key} className="rounded-lg border bg-panel p-2.5" data-relation-draft={r.key} data-rejecting={rejecting ? 'true' : undefined}>
             <div className="grid items-end gap-2 sm:grid-cols-[1fr_1fr_1fr_8rem_auto]">
               <label className="min-w-0">
                 <span className="label">{CT.relationHead.from}</span>
-                <input className="field mono" value={r.columns} placeholder={CT.relationColumns}
+                <input className={clsx('field mono', locked)} value={r.columns} placeholder={CT.relationColumns} disabled={rejecting}
                        onChange={(e) => patch(r.key, { columns: e.target.value })} data-input="columns" />
               </label>
               <label className="min-w-0">
                 <span className="label">{CT.relationTarget}</span>
-                <input className="field mono" list="catalog-tables" value={r.to_table}
+                <input className={clsx('field mono', locked)} list="catalog-tables" value={r.to_table} disabled={rejecting}
                        onChange={(e) => patch(r.key, { to_table: e.target.value })} data-input="to_table" />
               </label>
               <label className="min-w-0">
                 <span className="label">{CT.relationHead.toColumns}</span>
-                <input className="field mono" value={r.to_columns} placeholder={CT.relationToColumns}
+                <input className={clsx('field mono', locked)} value={r.to_columns} placeholder={CT.relationToColumns} disabled={rejecting}
                        onChange={(e) => patch(r.key, { to_columns: e.target.value })} data-input="to_columns" />
               </label>
               <label className="min-w-0">
                 <span className="label">{CT.relationHead.cardinality}</span>
-                <select className="field" value={r.cardinality} onChange={(e) => patch(r.key, { cardinality: e.target.value })} data-input="cardinality">
+                <select className={clsx('field', locked)} value={r.cardinality} disabled={rejecting}
+                        onChange={(e) => patch(r.key, { cardinality: e.target.value })} data-input="cardinality">
                   <option value="">{CT.cardinalityNone}</option>
                   {CARDINALITIES.map((c) => <option key={c} value={c}>{CATALOG_CARDINALITY_LABEL[c]}</option>)}
                 </select>
               </label>
               <div className="flex items-center gap-1.5 pb-1">
-                {r.orig && !changed && <StatusChip status={r.orig.status} source={r.orig.source} />}
-                {changed && <span className="chip !text-2xs" style={{ color: 'var(--accent)' }}>{CT.changedMark}</span>}
-                <DeleteButton label={CT.removeRelation} onClick={() => onChange((rs) => rs.filter((x) => x.key !== r.key))} />
+                {rejecting
+                  ? (
+                    <>
+                      <span className="chip !text-2xs" style={{ color: 'var(--accent)' }} data-rejecting-mark="">{CT.rejectingMark}</span>
+                      <button type="button" className="btn btn-sm btn-ghost !px-1.5" onClick={() => patch(r.key, { reject: false })} data-relation-undo-reject="">
+                        {CT.undoRejectRelation}
+                      </button>
+                    </>
+                  )
+                  : (
+                    <>
+                      {r.orig && !changed && <StatusChip status={r.orig.status} source={r.orig.source} />}
+                      {changed && <span className="chip !text-2xs" style={{ color: 'var(--accent)' }}>{CT.changedMark}</span>}
+                      {removal === 'delete' && (
+                        <DeleteButton label={CT.removeRelation} onClick={() => onChange((rs) => rs.filter((x) => x.key !== r.key))} />
+                      )}
+                      {removal === 'reject' && (
+                        // 驳回时两端和基数回到原样：驳回的是原来那条关系，不是改过的
+                        <button type="button" className="btn btn-sm btn-ghost !px-1.5" aria-label={CT.rejectRelationLabel} title={CT.rejectRelationLabel}
+                                onClick={() => patch(r.key, { ...(b ?? {}), reject: true })} data-relation-reject="">
+                          {CT.rejectRelation}
+                        </button>
+                      )}
+                    </>
+                  )}
               </div>
             </div>
-            {problem && <div className="mt-1.5 text-2xs text-[var(--err)]" role="alert">{problem}</div>}
+            {problem && !rejecting && <div className="mt-1.5 text-2xs text-[var(--err)]" role="alert">{problem}</div>}
           </div>
         )
       })}

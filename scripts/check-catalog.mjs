@@ -306,13 +306,17 @@ function countsOf(notes) {
 const valueOf = (path, it) => JSON.stringify(path.startsWith('relations.')
   ? [it.columns, it.to_table, it.to_columns, it.cardinality ?? null, it.coverage ?? null] : it.value)
 
-/** 整份提交（apply_human_edit）：值改过的、新填的记为人工确认；值没动的按提交的状态（只认确认、驳回、初始状态） */
+/**
+ * 整份提交（apply_human_edit）：值改过的、新填的记为人工确认；值没动的按提交的状态（只认确认、驳回、初始状态）；
+ * 提交里没有的关联关系，人工添加的删掉，其余的转为驳回（删掉会被起草和现推带回来）
+ */
 function applyPut(old, submitted) {
   const prev = slots(old)
   const sub = clone(submitted)
   for (const r of sub.relations ?? []) { r.id = relId(r.columns, r.to_table, r.to_columns); r.source ??= 'human'; r.status ??= 'confirmed' }
   const out = new Map()
-  for (const [path, it] of slots(sub)) {
+  const given = slots(sub)
+  for (const [path, it] of given) {
     const p = prev.get(path)
     if (!p || valueOf(path, it) !== valueOf(path, p)) {
       out.set(path, { ...it, source: 'human', status: 'confirmed', updated_at: new Date().toISOString() })
@@ -320,6 +324,9 @@ function applyPut(old, submitted) {
       const ok = ['confirmed', 'rejected', INIT[p.source] ?? 'proposed'].includes(it.status)
       out.set(path, { ...p, status: ok ? it.status : p.status })
     }
+  }
+  for (const [path, p] of prev) {
+    if (path.startsWith('relations.') && !given.has(path) && p.source !== 'human') out.set(path, { ...p, status: 'rejected' })
   }
   return assemble(out)
 }
@@ -958,8 +965,26 @@ await section('数据目录 · 编辑即确认', async () => {
   check('……两端字段数不一致：写明', (await draft.innerText()).includes('两端的字段数不一致'))
   await draft.locator('[data-input="to_columns"]').fill('id')
   await draft.locator('[data-input="cardinality"]').selectOption('many_to_one')
+  // 关联关系：人工添加的才能删除；外键约束、命名推断得出的只能驳回（删掉会被起草和现推带回来）
+  const PARK = relId(['park_id'], 'parks', ['id'])
+  const GATE = relId(['gate_id'], 'gates', ['id'])
+  const parkDraft = page.locator(`[data-relation-draft="${PARK}"]`)
+  check('关联关系：外键约束、命名推断得出的不给「删除」只给「驳回」，新加的给「删除」，写明为什么',
+        await parkDraft.locator('[data-relation-reject]').count() === 1 && await parkDraft.locator('[aria-label="删除这条关联关系"]').count() === 0
+        && await page.locator(`[data-relation-draft="${GATE}"] [data-relation-reject]`).count() === 1
+        && await draft.locator('[aria-label="删除这条关联关系"]').count() === 1 && await draft.locator('[data-relation-reject]').count() === 0
+        && (await page.locator('[data-relation-remove-hint]').innerText()).includes('只能驳回'))
+  await parkDraft.locator('[data-input="cardinality"]').selectOption('one_to_one')
+  await parkDraft.locator('[data-relation-reject]').click()
+  check('……点「驳回」：标「保存后驳回」，两端和基数回到原样、锁住不能改，可以撤销', (await parkDraft.getAttribute('data-rejecting')) === 'true'
+        && (await parkDraft.innerText()).includes('保存后驳回') && (await parkDraft.locator('[data-input="cardinality"]').inputValue()) === 'many_to_one'
+        && await parkDraft.locator('[data-input="columns"]').isDisabled() && await parkDraft.locator('[data-relation-undo-reject]').count() === 1)
+  await parkDraft.locator('[data-relation-undo-reject]').click()
+  check('……撤销驳回：回到原样，不算修改', (await parkDraft.getAttribute('data-rejecting')) === null
+        && (await page.locator('[data-catalog-changes]').innerText()) === '6 处修改', await page.locator('[data-catalog-changes]').innerText())
+  await page.locator(`[data-relation-draft="${GATE}"] [data-relation-reject]`).click()
   await shot(page, 'catalog-edit')
-  check('保存栏写「6 处修改」', (await page.locator('[data-catalog-changes]').innerText()) === '6 处修改', await page.locator('[data-catalog-changes]').innerText())
+  check('保存栏写「7 处修改」（驳回一条关系也算一处）', (await page.locator('[data-catalog-changes]').innerText()) === '7 处修改', await page.locator('[data-catalog-changes]').innerText())
   await page.locator('[data-catalog-save]').click()
   await until(async () => count(sent, /^PUT /) === 1)
   const body = lastBody(sent, /^PUT /)
@@ -972,10 +997,14 @@ await section('数据目录 · 编辑即确认', async () => {
   check('……清空的粒度不交（服务端删掉这一项）', !('grain' in n))
   check('……没动的项原样交回：来源、状态都不变（被驳回的照旧驳回）', JSON.stringify(n.dedup) === JSON.stringify(old.dedup)
         && JSON.stringify(n.description) === JSON.stringify(old.description) && JSON.stringify(n.columns?.park_id) === JSON.stringify(old.columns.park_id))
-  check('……原有的关系原样交回，新的一条带两端和基数', old.relations.every((r) => n.relations?.some((x) => JSON.stringify(x) === JSON.stringify(r)))
+  const gateOld = old.relations.find((r) => r.id === GATE)
+  check('……原有的关系原样交回，新的一条带两端和基数', old.relations.filter((r) => r.id !== GATE).every((r) => n.relations?.some((x) => JSON.stringify(x) === JSON.stringify(r)))
         && n.relations?.some((r) => r.to_table === 'members' && r.columns.join() === 'member_id' && r.to_columns.join() === 'id' && r.cardinality === 'many_to_one'))
+  check('……驳回的那条原样交回、状态改为已驳回（等同单项驳回，不是删掉）',
+        JSON.stringify(n.relations?.find((r) => r.id === GATE)) === JSON.stringify({ ...gateOld, status: 'rejected' }))
   check('保存后退出编辑，改过的项显示「已确认 · 人工填写」', await until(async () => (await detail(page).getAttribute('data-editing')) === 'false')
         && await markStatus(page, 'label') === 'confirmed' && (await page.locator('[data-field="label"]').innerText()).includes('人工填写'))
+  check('……驳回的关系在列表里划掉、标已驳回', (await page.locator(`[data-relation="${GATE}"]`).getAttribute('data-status')) === 'rejected')
   check('……清单上的中文名跟着变', await until(async () => (await page.locator('[data-catalog-row="visits"] [data-row-label]').innerText()) === '入园流水'))
   check('……提示已保存', await until(async () => (await page.locator('body').innerText()).includes('已保存，改动过的项已记为人工确认')))
 

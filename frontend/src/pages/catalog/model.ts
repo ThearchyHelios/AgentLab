@@ -173,7 +173,7 @@ export function confirmProposed(notes: CatalogNotes, pick: (path: string) => boo
 // ---------------------------------------------------------------------------
 // 编辑表单：每一项一段文字。进入编辑时按目录生成（被驳回的项留空，原值放在占位里），提交时和进入时的文字逐项
 // 比较——没动的原样交回（保留来源和状态，被驳回的照旧驳回），改了的交新值（服务端记为人工填写、已确认），
-// 清空的不交（服务端删掉这一项）
+// 清空的不交（服务端删掉这一项）。关联关系另有规矩：只有人工添加的能删除，其余的只能驳回（relationRemoval）
 // ---------------------------------------------------------------------------
 
 /** 表级的表单键：业务日期拆成三格 */
@@ -189,6 +189,18 @@ export interface RelationDraft {
   to_table: string
   to_columns: string
   cardinality: string
+  /** 编辑中点了「驳回」：保存时原样交回、状态改为已驳回（等同单项驳回） */
+  reject?: boolean
+}
+
+/**
+ * 去掉一条关联关系是删除还是驳回：人工添加的（以及还没保存的）可以删除；外键约束、命名推断、数据剖析、模型起草得出的
+ * 只能驳回——删掉的话下次起草、助手和 SQL 检查按表结构现推都会把它带回来（服务端 apply_human_edit 也按这条处理：
+ * 提交里没有的非人工关系转为驳回）。已经驳回的返回 null，没有可做的
+ */
+export function relationRemoval(orig: CatalogRelation | null): 'delete' | 'reject' | null {
+  if (!orig || orig.source === 'human') return 'delete'
+  return orig.status === 'rejected' ? null : 'reject'
 }
 
 export interface EditForm {
@@ -283,7 +295,7 @@ export function changeCount(initial: EditForm, form: EditForm): number {
   const after = new Set(form.relations.map((r) => r.key))
   for (const r of form.relations) {
     const b = before.get(r.key)
-    if (!b || !sameRelation(b, r)) n++
+    if (!b || !sameRelation(b, r) || !!b.reject !== !!r.reject) n++
   }
   for (const k of before.keys()) if (!after.has(k)) n++
   return n
@@ -398,6 +410,7 @@ export function buildNotes(orig: CatalogNotes, initial: EditForm, form: EditForm
   const relations: CatalogRelation[] = []
   for (const r of form.relations) {
     const b = before.get(r.key)
+    if (r.orig && r.reject) { relations.push({ ...r.orig, status: 'rejected' }); continue }
     if (r.orig && b && sameRelation(b, r)) { relations.push(r.orig); continue }
     relations.push({
       ...(r.orig ?? { coverage: null }),

@@ -149,3 +149,106 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     assert ("fanout_sum", "error", "gates", "id") in await _found(sid, sql)
 
 
+# ==========================================================================
+# A2：去掉推断或外键来的关系即驳回
+# ==========================================================================
+
+
+def _rel(columns, to_table, to_columns, source="name", status=None, table="visits"):
+    return {"id": catalog.relation_id(table, columns, to_table, to_columns), "columns": columns,
+            "to_table": to_table, "to_columns": to_columns, "cardinality": "many_to_one", "coverage": None,
+            "source": source, "status": status or catalog.initial_status(source)}
+
+
+def test_human_edit_rejects_removed_inferred_relations_and_deletes_human_ones():
+    park, gate = _rel(["park_id"], "parks", ["id"], "fk"), _rel(["gate_id"], "gates", ["id"], "name")
+    mine = _rel(["member_id"], "members", ["id"], "human")
+    out = catalog.apply_human_edit({"relations": [park, gate, mine]}, {"relations": []}, table="visits", at=AT)
+    by_id = {r["id"]: r for r in out["relations"]}
+    assert set(by_id) == {park["id"], gate["id"]}                    # 人工新建的那条真正删掉
+    for old in (park, gate):
+        assert by_id[old["id"]] == {**old, "status": "rejected", "updated_at": AT}   # 编号、来源、两端都留着
+    # 已经驳回的再去掉一次：不变
+    again = catalog.apply_human_edit(out, {"relations": []}, table="visits", at="2026-10-05T00:00:00+00:00")
+    assert again == out
+
+
+def test_human_edit_moving_an_inferred_relation_rejects_the_old_one():
+    gate = _rel(["gate_id"], "gates", ["id"], "name")
+    moved = {**gate, "to_table": "parks", "to_columns": ["id"]}
+    out = catalog.apply_human_edit({"relations": [gate]}, {"relations": [moved]}, table="visits", at=AT)
+    new_id = catalog.relation_id("visits", ["gate_id"], "parks", ["id"])
+    by_id = {r["id"]: r for r in out["relations"]}
+    assert (by_id[new_id]["source"], by_id[new_id]["status"]) == ("human", "confirmed")
+    assert by_id[gate["id"]]["status"] == "rejected" and by_id[gate["id"]]["source"] == "name"
+
+
+def test_human_edit_rejects_a_removed_human_relation_that_structure_would_bring_back():
+    """人工改过基数的外键关系记成了人工填写；去掉它时若表结构还推得出来，删掉就会被现推回来，只能驳回。"""
+    park = {**_rel(["park_id"], "parks", ["id"], "fk"), "cardinality": "one_to_one", "source": "human",
+            "status": "confirmed"}
+    out = catalog.apply_human_edit({"relations": [park]}, {"relations": []}, table="visits", at=AT,
+                                   inferable={park["id"]})
+    assert [(r["id"], r["status"]) for r in out["relations"]] == [(park["id"], "rejected")]
+    assert catalog.apply_human_edit({"relations": [park]}, {"relations": []}, table="visits", at=AT) == {}
+
+
+async def test_removed_or_rejected_relations_stay_out_of_checks_graph_and_redraft(client, make_source, scenic_db):
+    sid = await make_source(scenic_db, draft=["visits"])
+    detail = await _notes(client, sid, "visits")
+    park, gate = _relation(detail["notes"], "park_id"), _relation(detail["notes"], "gate_id")
+    ticket = _relation(detail["notes"], "ticket_type_id")
+    assert (park["source"], gate["source"], ticket["source"]) == ("fk", "name", "fk")
+    gone = {park["id"], gate["id"]}
+
+    # 目录页编辑时去掉两条（外键来的、命名推断的）：转为驳回
+    notes = {**detail["notes"], "relations": [r for r in detail["notes"]["relations"] if r["id"] not in gone]}
+    r = await _put(client, sid, "visits", notes, detail["version"])
+    assert r.status_code == 200, r.text
+    saved = {x["id"]: x for x in r.json()["notes"]["relations"]}
+    assert {saved[i]["status"] for i in gone} == {"rejected"}
+    # 单项审阅里驳回第三条（界面上非人工来源的关系只给「驳回」）
+    r = await client.post(f"/api/datasources/{sid}/catalog/visits/review",
+                          json={"path": f"relations.{ticket['id']}", "action": "reject",
+                                "if_version": r.json()["version"]})
+    assert r.status_code == 200, r.text
+    gone.add(ticket["id"])
+
+    def absent(edges) -> bool:
+        return not any(e.relation_id in gone for e in edges)
+
+    # 检查器：被驳回的关系不当作「对上了」，也不拿来判断基数
+    checker = await _checker(sid)
+    for target in ("parks", "gates", "ticket_types"):
+        assert checker.edges_between("visits", target) == []
+    joined = await _found(sid, "SELECT COUNT(*) FROM visits v JOIN gates g ON v.gate_id = g.id")
+    assert ("join_unconfirmed", "warning", "gates", None) in joined
+    # 关系图（助手挑表也用它）：不按表结构现推回来
+    graph = await _graph(sid)
+    assert absent(graph.get("visits", [])) and absent(graph.get("parks", [])) and absent(graph.get("gates", []))
+    # 重新起草：仍是驳回
+    r = await client.post(f"/api/datasources/{sid}/catalog/draft", json={"tables": ["visits"]})
+    assert r.status_code == 200, r.text
+    again = {x["id"]: x for x in (await _notes(client, sid, "visits"))["notes"]["relations"]}
+    assert {again[i]["status"] for i in gone} == {"rejected"}
+    assert absent((await _graph(sid)).get("visits", []))
+
+
+def test_relation_graph_keeps_structure_relations_of_partially_annotated_tables():
+    """只做过部分注释的表（目录里没有关系）照样按结构补上外键和命名推断；这张表目录里驳回的不补。"""
+    cache = {"tables": {
+        "visits": {"columns": [{"name": "id", "type": "INTEGER"}, {"name": "park_id", "type": "INTEGER"},
+                               {"name": "gate_id", "type": "INTEGER"}],
+                   "primary_key": ["id"], "foreign_keys": [{"columns": ["park_id"], "to_table": "parks",
+                                                            "to_columns": ["id"]}]},
+        "parks": {"columns": [{"name": "id", "type": "INTEGER"}], "primary_key": ["id"], "foreign_keys": []},
+        "gates": {"columns": [{"name": "id", "type": "INTEGER"}], "primary_key": ["id"], "foreign_keys": []},
+    }}
+    labelled = {"visits": {"label": catalog.make_item("入园记录", "human")}}
+    edges = {(e.to_table, e.source) for e in catalog.relation_graph(labelled, schema_cache=cache)["visits"]}
+    assert edges == {("parks", "fk"), ("gates", "name")}
+    rejected = {"visits": {"relations": [_rel(["park_id"], "parks", ["id"], "fk", "rejected")]}}
+    edges = {e.to_table for e in catalog.relation_graph(rejected, schema_cache=cache)["visits"]}
+    assert edges == {"gates"}
+
+
