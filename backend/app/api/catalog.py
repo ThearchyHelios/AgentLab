@@ -5,9 +5,10 @@
 - PUT    /catalog/{table}        整份提交（乐观锁），改动过的项记为人工确认
 - POST   /catalog/{table}/review 单项审阅：确认、驳回、撤销审阅
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）
+- POST   /catalog/profile        同步剖析：对业务库发少量只读查询，核对关系、取码值候选（data/catalog_profile.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
-不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。
+不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
 
 上传表格的源按当前快照的表结构回答（table_versions.resolve_source），和查询实际用的库是同一个版本。
 """
@@ -20,7 +21,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.runs import actor_of
-from app.data import catalog, introspect, table_versions
+from app.data import catalog, catalog_profile, introspect, table_versions
+from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
 
@@ -45,6 +47,11 @@ class CatalogDraftIn(BaseModel):
     tables: list[str] | None = Field(default=None, max_length=200)
     #: 是否请助手的模型起草中文名、粒度、列的含义等
     use_model: bool = False
+
+
+class CatalogProfileIn(BaseModel):
+    #: 要剖析的表；不给或为空时按使用次数取前 10 张目录里有待核实关系的表
+    tables: list[str] | None = Field(default=None, max_length=200)
 
 
 async def _resolved(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:
@@ -206,6 +213,62 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
         "model_used": report.model_used,
         "model": report.model or None,
         "model_error": report.model_error,
+    }
+
+
+def _profile_table_out(t: catalog_profile.TableProfile) -> dict[str, Any]:
+    return {
+        "table_name": t.table,
+        "queries": t.queries,
+        "row_estimate": t.row_estimate.to_dict() if t.row_estimate else None,
+        "findings": t.findings,
+        "skipped": [s.to_dict() for s in t.skipped],
+        "date_ranges": t.date_ranges,
+        "added": t.added,
+        "updated": t.updated,
+        "removed": t.removed,
+        "version": t.version,
+        "error": t.error,
+    }
+
+
+@router.post("/{source_id}/catalog/profile")
+async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
+                                 x_actor: str | None = Header(default=None),
+                                 session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """同步剖析。返回每张表用了几条查询、写进目录的发现、跳过了什么及原因。
+
+    默认关闭：数据源设置里没开启数据剖析、数据源停用，409；同一个数据源已经在剖析，409。
+    """
+    row, source = await _resolved(session, source_id)
+    try:
+        catalog_profile.ensure_enabled(row)
+    except catalog_profile.ProfileDisabled as e:
+        raise HTTPException(409, str(e)) from e
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise HTTPException(409, f"{introspect.why_empty(cache)}，无法进行数据剖析。请先在数据源卡片上点「探查结构」")
+    actor = actor_of(x_actor)
+    try:
+        report = await catalog_profile.profile_catalog(session, row, source, tables=payload.tables or None,
+                                                       actor=actor)
+    except (catalog_profile.ProfileDisabled, catalog_profile.ProfileBusy) as e:
+        raise HTTPException(409, str(e)) from e
+    except SnapshotTampered as e:
+        raise HTTPException(409, str(e)) from e
+    rows = [_profile_table_out(t) for t in report.tables]
+    note = None
+    if not rows:
+        note = "目录里还没有待核实的关联关系，请先起草数据目录，或指定要剖析的表"
+    return {
+        "profiled_at": report.profiled_at,
+        "actor": actor,
+        "settings": report.settings.to_dict(),
+        "queries_used": report.queries_used,
+        "stopped": report.stopped,
+        "tables": rows,
+        "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},
+        "note": note,
     }
 
 

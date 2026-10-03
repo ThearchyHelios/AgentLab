@@ -58,11 +58,16 @@ MAX_QUERY_TIMEOUT_S = 600
 #: 完整快照仍能按工件 id 取到，SQL 里给列起个别名也能绕开
 MASK_COLUMNS_OPTION = "mask_columns"
 
+#: 数据源 options 里的数据剖析设置（一个对象：开关、查询次数上限、单条时限……）。取值和校验见
+#: data/catalog_profile.py；放在这里只为让拼连接串时摘掉它
+CATALOG_PROFILE_OPTION = "catalog_profile"
+
 # options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
 # schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
 # query_timeout_s：查询时限，由数据层按语句下发给数据库，见 _server_deadline
 # mask_columns：证据面板遮罩的列，驱动不认识它，拼进连接串会被当成未知参数拒掉
-_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION})
+# catalog_profile：数据剖析设置，同上；它还是个对象，拼进去连 URL 都不成形
+_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION})
 
 _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
