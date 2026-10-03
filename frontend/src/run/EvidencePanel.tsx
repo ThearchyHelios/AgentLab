@@ -1371,6 +1371,13 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
           <CopyChip label={step.merge ? MERGE_TEXT.copySql : EVIDENCE_TEXT.copySql} text={() => step.sql ?? ''} />
         )}
       </div>
+      {!!step.catalog?.length && (
+        // SQL 检查对照的是哪一版数据目录（查询当时冻结进表结构快照的那份）：事后目录改了、升了版本，看得出这次按的是哪一版
+        <div className="mb-1 text-2xs text-faint [overflow-wrap:anywhere]" data-ev-catalog=""
+             title={RUN_SQL_CHECK_TEXT.catalogHint}>
+          {RUN_SQL_CHECK_TEXT.catalogLine(step.catalog.map((c) => ({ name: c.label || c.table, version: c.version })))}
+        </div>
+      )}
       {step.merge && <MergeInputs merge={step.merge} />}
       {step.sql && step.merge && <div className="mb-0.5 text-2xs text-faint">{MERGE_TEXT.sql}</div>}
       {step.sql && (

@@ -2163,6 +2163,10 @@ def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -
     只收表结构快照里有的表（tables）；去掉驳回项以后什么都不剩的表不收。一张也没有时返回空 dict，
     调用方据此不加这个键：没有目录的源，快照内容和以前一字不差。目录不变（版本和内容都不变）则返回值
     不变，快照哈希也就不变。
+
+    被驳回的关系留下编号和状态（{"id", "status": "rejected"}，不放内容）：拿冻结的这份重建 SQL 检查器
+    （sqlcheck.frozen_checker）时，关系图（relation_graph）认得这些编号，按外键、命名现推的关系不会把驳回的推回来。
+    只有驳回关系的表也因此要冻结。visible_notes 照样把它们去掉，给人看、给模型看的内容不变。
     """
     wanted = set(tables)
     out: dict[str, dict[str, Any]] = {}
@@ -2170,6 +2174,10 @@ def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -
         if name not in wanted:
             continue
         notes = visible_notes(entries[name].notes)
+        rejected = [{"id": str(item["id"]), "status": "rejected"} for key, item in _slots(entries[name].notes).items()
+                    if key[0] == "r" and item.get("status") == "rejected"]
+        if rejected:
+            notes = {**notes, "relations": [*(notes.get("relations") or []), *rejected]}
         if notes:
             out[name] = {"version": entries[name].version, "notes": notes}
     return out

@@ -983,7 +983,8 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
                 # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
                 column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
                 **({"provenance": True} if hint and snap.get("data_version") and not merged else {}),
-                **({"checks": checks} if (checks := _query_checks(snap)) else {}))
+                **({"checks": checks} if (checks := _query_checks(snap)) else {}),
+                **_catalog_of(snap))
     if len(index) > MAX_WINDOW_ROWS:
         index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
     step["row_index"] = index
@@ -991,6 +992,41 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+def _catalog_of(snap: dict[str, Any]) -> dict[str, Any]:
+    """{schema_artifact, catalog}：这条查询当时冻结的表结构快照，以及它用到的表在快照里冻结的目录版本。
+
+    数据源查询工具每次查询都把当时的表结构和数据目录冻结进表结构快照（tools/datasource._store_schema），SQL 检查
+    对照的就是这一版。面板上写「数据目录：入园记录 第 3 版」：事后目录改了、升了版本，看得出这次查询按的是哪一版。
+    catalog 只列 SQL 用到、而且冻结了目录的表：[{table, label?, version}]。没有表结构快照的（合并查询、老快照、
+    没探查过结构的源）两个键都不加；有快照没目录的只给 schema_artifact。
+    """
+    schema_id = snap.get("schema_artifact")
+    if not isinstance(schema_id, str) or not schema_id:
+        return {}
+    out: dict[str, Any] = {"schema_artifact": schema_id}
+    try:
+        schema = load(schema_id)
+    except Exception:  # noqa: BLE001 - 读不出来：只给 id，不编版本
+        return out
+    frozen = schema.get("catalog") if isinstance(schema, dict) else None
+    if not isinstance(frozen, dict) or not frozen:
+        return out
+    from app.data.catalog import resolve_table_name
+
+    listed: list[dict[str, Any]] = []
+    for name in sql_tables(str(snap.get("sql") or "")):
+        key = resolve_table_name(schema, name)
+        entry = frozen.get(key) if key else None
+        if not isinstance(entry, dict) or any(t["table"] == key for t in listed):
+            continue
+        label = ((entry.get("notes") or {}).get("label") or {}).get("value")
+        listed.append({"table": key, **({"label": label} if isinstance(label, str) and label else {}),
+                       "version": entry.get("version")})
+    if listed:
+        out["catalog"] = listed
+    return out
 
 
 #: 查询步骤里每条 SQL 检查结果交给界面的字段（data/sqlcheck.SqlCheck.as_dict 去掉 for_model）

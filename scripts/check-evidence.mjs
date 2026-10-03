@@ -1039,6 +1039,7 @@ await section('incomplete', '截断的查询结果整组算出来的指标：标
 await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤列出级别、规则名、说明、表和列、SQL 片段；指标未通过时标出来并写明原因', async () => {
   await openQ(page, '1,288')
   check('没查出问题的查询步骤不出 SQL 检查', await panel(page).locator('[data-ev-sql-checks]').count() === 0)
+  check('没有冻结目录的查询步骤不写数据目录版本', await panel(page).locator('[data-ev-catalog]').count() === 0)
   await page.keyboard.press('Escape')
   await openQ(page, '45,678.5元', { wait: '[data-ev-expression]' })
   check('通过的指标不出「SQL 检查未通过」', await panel(page).locator('[data-ev-sql-check-failed], [data-ev-sql-check-reason]').count() === 0)
@@ -1051,10 +1052,15 @@ await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤�
     { code: 'missing_valid_filter', level: 'warning', message: '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选。', table: 'orders' },
   ]
   const REASON = '所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），结果不可靠'
+  // 查询步骤带着这次查询对照的数据目录版本（_catalog_of：表结构快照里冻结的那份）
+  const CATALOG = [{ table: 'orders', label: '订单', version: 3 }, { table: 'order_items', version: 1 }]
   const bad = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
-    ? { ...st, checks: CHECKS } : st.step === 'metric' ? { ...st, sql_check_failed: true, sql_check_reason: REASON } : st)) }))
+    ? { ...st, checks: CHECKS, schema_artifact: 'c'.repeat(64), catalog: CATALOG }
+    : st.step === 'metric' ? { ...st, sql_check_failed: true, sql_check_reason: REASON } : st)) }))
   await openQ(bad.page, '1,288', { wait: '[data-ev-sql-checks]' })
   const p = bad.page.locator('[data-evidence-panel]')
+  const cat = await p.locator('[data-ev-catalog]').innerText().catch(() => '')
+  check('查询步骤写明对照的数据目录版本：有中文名写中文名，没有写表名', cat === '数据目录：订单 第 3 版、order_items 第 1 版', cat)
   const items = p.locator('[data-ev-sql-checks] [data-sql-check]')
   const levels = await items.evaluateAll((els) => els.map((e) => e.getAttribute('data-level')))
   check('三条都列在 SQL 下面，错误在前、提示在后', levels.join(',') === 'error,warning,info', levels.join(','))

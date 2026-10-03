@@ -2112,6 +2112,15 @@ export interface EvidenceMergeInput {
   checks?: SqlCheckItem[]
 }
 
+/** 查询用到的一张表、查询当时它的数据目录版本 */
+export interface EvidenceCatalogVersion {
+  /** 表结构里的表名 */
+  table: string
+  /** 目录里的中文名 */
+  label?: string
+  version?: number | null
+}
+
 /** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */
 export interface EvidenceMergeTrace {
   /** 合并结果里的 [行, 列]，行号从 0 数 */
@@ -2168,6 +2177,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_reason?: string
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
+  /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
+  schema_artifact?: string
+  /** query：这条查询用到的表在表结构快照里冻结的数据目录版本（SQL 检查对照的那一版）。没有目录时没有这个键 */
+  catalog?: EvidenceCatalogVersion[]
   inputs?: EvidenceInput[]
   /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
   caliber_from?: EvidenceCaliberSource | null

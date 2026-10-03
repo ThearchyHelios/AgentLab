@@ -221,6 +221,25 @@ def check_sql(sql: Any, *, kind: str | None, schema_cache: Mapping[str, Any] | N
     return SqlChecker(kind=kind, schema_cache=schema_cache, notes=notes, source_name=source_name).check(sql)
 
 
+def frozen_checker(schema_snapshot: Any, *, kind: str | None) -> SqlChecker | None:
+    """按表结构快照里冻结的那一版目录重建检查器：事后核对一次运行当时的 SQL 检查用。快照里没冻结目录返回 None。
+
+    数据源查询工具每次查询都把当时的表结构和目录冻结进表结构快照（tools/datasource._store_schema，
+    catalog.frozen_catalog）。冻结的目录去掉了驳回项，只留被驳回关系的编号和状态，关系图据此不把它们按外键推回来。
+    快照里没有数据源类型，方言由调用方给（数据源的 kind）。
+    """
+    if not isinstance(schema_snapshot, Mapping):
+        return None
+    frozen = schema_snapshot.get("catalog")
+    tables = schema_snapshot.get("tables")
+    if not isinstance(frozen, Mapping) or not frozen or not isinstance(tables, Mapping):
+        return None
+    notes = {str(name): entry.get("notes") for name, entry in frozen.items()
+             if isinstance(entry, Mapping) and isinstance(entry.get("notes"), Mapping)}
+    cache = {"tables": tables, **({"schema": schema_snapshot["schema"]} if schema_snapshot.get("schema") else {})}
+    return SqlChecker(kind=kind, schema_cache=cache, notes=notes, source_name=schema_snapshot.get("source"))
+
+
 def _fold(found: list[SqlCheck]) -> list[SqlCheck]:
     """同一件事只报一次（规则、表、列、关系相同的留最重的那条），重的在前，最多 MAX_CHECKS 条。"""
     kept: dict[tuple[Any, ...], SqlCheck] = {}

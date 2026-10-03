@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from app.api import evidence as api
 from app.core import artifact_store
+from app.data import catalog, sqlcheck
 from app.engine.merge_query import MERGE_SOURCE, MergeInput, execute
 
 FANOUT = {"code": "fanout_sum", "level": "error", "message": "「订单」关联「订单明细」是一对多，求和会重复计算。先汇总再关联",
@@ -48,3 +49,67 @@ async def test_merge_inputs_carry_their_sql_checks():
     assert all("for_model" not in c for c in s_in["checks"])
     assert s_in["checks"][0]["level"] == "error" and s_in["checks"][0]["table"] == "orders"
     assert "checks" not in v_in
+
+
+def _schema_cache() -> dict:
+    return {"schema": "main", "tables": {
+        "visits": {"qualified": "main.visits", "primary_key": ["id"],
+                   "columns": [{"name": "id", "type": "INTEGER"}, {"name": "member_id", "type": "INTEGER"},
+                               {"name": "fee", "type": "REAL"}],
+                   "foreign_keys": [{"columns": ["member_id"], "to_table": "members", "to_columns": ["id"]}]},
+        "members": {"qualified": "main.members", "primary_key": ["id"],
+                    "columns": [{"name": "id", "type": "INTEGER"}], "foreign_keys": []}}}
+
+
+def _fk_relation(cache: dict) -> dict:
+    [rel] = [r for r in catalog.fk_relations(cache, "visits") or [] if r["to_table"] == "members"]
+    return rel
+
+
+async def test_the_query_step_names_the_catalog_version_it_was_checked_against():
+    cache = _schema_cache()
+    notes = {"label": catalog.make_item("入园记录", "human")}
+    frozen = catalog.frozen_catalog({"visits": catalog.CatalogEntry("visits", notes, 3)}, cache["tables"])
+    schema_id = await put({"source": "scenic", **cache, "catalog": frozen}, kind="schema_snapshot")
+    query = {"columns": ["n"], "rows": [[4]], "row_count": 1, "truncated": False, "source": "scenic",
+             "sql": "SELECT COUNT(*) AS n FROM visits v JOIN members m ON m.id = v.member_id",
+             "schema_artifact": schema_id}
+    qid = await put(query)
+    doc = {"catalog": {"Q1": {"kind": "query", "artifact": qid}}}
+    step = await api._query_step(qid, [(0, "n")], doc, _sealed({qid: {"node_id": "fetch"}}), api._Masks())
+    assert step["schema_artifact"] == schema_id
+    # 只列这条查询用到、而且有目录的表：members 没有目录，不列
+    assert step["catalog"] == [{"table": "visits", "label": "入园记录", "version": 3}]
+
+
+async def test_a_query_without_a_frozen_catalog_says_nothing_extra():
+    query = {"columns": ["n"], "rows": [[4]], "row_count": 1, "truncated": False, "source": "scenic",
+             "sql": "SELECT COUNT(*) AS n FROM visits"}
+    qid = await put(query)
+    doc = {"catalog": {"Q1": {"kind": "query", "artifact": qid}}}
+    step = await api._query_step(qid, [(0, "n")], doc, _sealed({qid: {"node_id": "fetch"}}), api._Masks())
+    assert "catalog" not in step and "schema_artifact" not in step
+
+
+def test_frozen_catalog_keeps_rejected_relation_ids_without_their_content():
+    cache = _schema_cache()
+    rel = {**_fk_relation(cache), "status": "rejected", "note": "这条外键是历史遗留，不能拿来关联"}
+    notes = {"label": catalog.make_item("入园记录", "human"), "relations": [rel]}
+    frozen = catalog.frozen_catalog({"visits": catalog.CatalogEntry("visits", notes, 2)}, cache["tables"])
+    assert frozen["visits"]["notes"]["relations"] == [{"id": rel["id"], "status": "rejected"}]
+    assert catalog.visible_notes(frozen["visits"]["notes"]) == {"label": notes["label"]}
+
+    # 拿冻结的那份重建检查器：驳回过的外键关系不会按表结构又推回来
+    checker = sqlcheck.frozen_checker({"source": "scenic", **cache, "catalog": frozen}, kind="sqlite")
+    assert checker is not None and checker.edges_between("visits", "members") == []
+    live = sqlcheck.SqlChecker(kind="sqlite", schema_cache=cache, notes={"visits": notes})
+    assert live.edges_between("visits", "members") == []           # 和当时库里那份一致
+
+    # 只有驳回关系的表也要冻结：不然编号丢了，重建时又推回来
+    only = catalog.frozen_catalog({"visits": catalog.CatalogEntry("visits", {"relations": [rel]}, 1)}, cache["tables"])
+    assert only == {"visits": {"version": 1, "notes": {"relations": [{"id": rel["id"], "status": "rejected"}]}}}
+
+
+def test_a_snapshot_without_a_catalog_rebuilds_no_checker():
+    assert sqlcheck.frozen_checker({"source": "scenic", **_schema_cache()}, kind="sqlite") is None
+    assert sqlcheck.frozen_checker(None, kind="sqlite") is None
