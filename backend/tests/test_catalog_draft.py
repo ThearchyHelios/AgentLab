@@ -222,6 +222,21 @@ async def test_model_failure_only_affects_its_batch():
     assert len(model.calls) >= 2                                   # 按表分批，不是一次全发
 
 
+async def test_model_without_structured_output_falls_back_to_text():
+    """有的网关不支持工具调用：结构化输出一调就报错，退回纯文本、从正文里取 JSON。"""
+    from langchain_core.messages import AIMessage
+
+    class TextOnly:
+        def with_structured_output(self, schema, **_):
+            raise NotImplementedError
+
+        async def ainvoke(self, messages):
+            return AIMessage(content='草稿如下：{"tables": [{"table": "visits", "label": "入园记录"}]}')
+
+    got = await catalog.draft_with_model(TextOnly(), _source(_scenic_tables()), ["visits"])
+    assert got["visits"].notes == {"label": make_item("入园记录", "llm")}
+
+
 async def test_model_draft_respects_system_notes_of_imported_tables():
     """导入表格：表说明已经写了粒度、列说明写了单位，模型起草的粒度和单位不进目录，免得重复或矛盾。"""
     src = _source({"日报": _table(_col("日期", "TEXT", comment="格式 YYYY-MM-DD"), _col("客流"), pk=(),

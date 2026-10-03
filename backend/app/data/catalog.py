@@ -201,7 +201,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
     if not isinstance(rel, dict):
         return ["关联关系应为对象"]
     rid = rel.get("id")
-    where = f"关联关系 {rid}" if isinstance(rid, str) and rid else "关联关系"
+    # 带编号时后面空一格再接说明：「关联关系 r1a2 的被指向列…」
+    where = f"关联关系 {rid} " if isinstance(rid, str) and rid else "关联关系"
     problems: list[str] = []
     if not (isinstance(rid, str) and rid.strip()) or "." in str(rid):
         problems.append(f"{where}缺少编号，或编号里含有句点")
@@ -232,6 +233,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}的状态「{rel.get('status')}」不在可选值内")
     if "note" in rel and not isinstance(rel["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "updated_at" in rel and not isinstance(rel["updated_at"], str):
+        problems.append(f"{where}的修改时间应为文字")
     return problems
 
 
@@ -1121,15 +1124,17 @@ def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
 
 
 async def _ask_model(model: Any, messages: list[Any]) -> list[dict[str, Any]]:
-    """问一批。先走结构化输出；模型不支持、或给回来的不是约定的结构，再退回纯文本、从正文里取 JSON。"""
+    """问一批。先走结构化输出；模型不支持、调用报错、或给回来的不是约定的结构，再退回纯文本、从正文里取 JSON。
+
+    结构化输出报错也退回（同 judge._ask）：有的网关不支持工具调用，一调就报错，纯文本却能用。代价是真的
+    网络故障会多试一次，两次加起来仍受 MODEL_TIMEOUT_S 约束。
+    """
     try:
-        runnable = model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA)
-    except (AttributeError, NotImplementedError):
-        runnable = None
-    if runnable is not None:
-        parsed = _model_tables(await runnable.ainvoke(messages))
-        if parsed is not None:
-            return parsed
+        parsed = _model_tables(await model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA).ainvoke(messages))
+    except Exception:  # noqa: BLE001 - 退回纯文本
+        parsed = None
+    if parsed is not None:
+        return parsed
     from app.engine.state import message_text
 
     reply = await model.ainvoke(messages)
