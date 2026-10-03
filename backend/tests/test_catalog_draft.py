@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import uuid
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -15,6 +14,7 @@ from app.data import catalog
 from app.data.catalog import make_item
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from tests.fixtures.catalog.fake_model import FakeModel
 
 
 def _col(name: str, type_: str = "INTEGER", comment: str | None = None, nullable: bool = True) -> dict:
@@ -163,25 +163,6 @@ def test_name_inference_one_to_one_when_column_is_own_key():
 
 
 # ---------------------------------------------------------------- 模型起草
-
-
-class FakeModel:
-    """假模型：结构化输出返回 replies[表名] 拼成的 {"tables": [...]}；fail 里的表所在的那一批抛异常。"""
-
-    def __init__(self, replies: dict[str, dict], fail: set[str] = frozenset()) -> None:
-        self.replies, self.fail, self.calls = replies, set(fail), []
-
-    def with_structured_output(self, schema: Any, **_: Any) -> "FakeModel":
-        assert schema["title"]
-        return self
-
-    async def ainvoke(self, messages: list[Any]) -> dict:
-        text = "\n".join(str(getattr(m, "content", m)) for m in messages)
-        self.calls.append(text)
-        names = [t for t in self.replies if f"表 {t}" in text]
-        if any(t in self.fail for t in names):
-            raise RuntimeError("网关超时")
-        return {"tables": [{"table": t, **self.replies[t]} for t in names]}
 
 
 _VISITS_REPLY = {
