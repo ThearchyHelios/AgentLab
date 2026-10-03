@@ -130,7 +130,7 @@ export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilt
 
 /**
  * 「用到但没确认」：运行中查询过的表（使用次数大于 0、还在表结构里）一共几张，其中几张还有推断项、几张还没有目录。
- * 页面顶部的摘要按它写，点进去复用清单的筛选（有未确认项 / 没有目录）和按使用次数排序，不另做一套
+ * 页面顶部的摘要按它写，点进去复用清单的筛选（有待确认项 / 没有目录）和按使用次数排序，不另做一套
  */
 export function usageSummary(rows: CatalogTableRow[]): { used: number; pending: number; none: number } {
   const out = { used: 0, pending: 0, none: 0 }

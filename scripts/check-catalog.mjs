@@ -552,26 +552,29 @@ await section('数据目录 · 表清单的排序与筛选', async () => {
 
   // 按状态筛选
   const counts = await page.locator('[data-catalog-filter] [data-filter]').evaluateAll((els) => els.map((e) => e.innerText.replace(/\s+/g, '')))
-  check('筛选按钮带数量：全部 152、有未确认项 5、全部已确认 3、没有目录 144', counts.join('|') === '全部152|有未确认项5|全部已确认3|没有目录144', counts.join('|'))
+  check('筛选按钮带数量：全部 152、有待确认项 5、没有待确认项 3、没有目录 144', counts.join('|') === '全部152|有待确认项5|没有待确认项3|没有目录144', counts.join('|'))
+  // 「已确认」专指人工确认：只有已验证项的表不说「全部已确认」，说「没有待确认项」，悬停写明已验证的不需要逐项确认
+  check('筛选不说「全部已确认」（只有已验证项的表也在这一组）', !counts.join('|').includes('全部已确认')
+    && (await page.locator('[data-filter="done"]').getAttribute('title')).includes('已验证的项由外键约束或数据剖析核实'))
   await page.locator('[data-filter="pending"]').click()
   names = await rowNames(page)
-  check('「有未确认项」：只有还有推断项的表', names.join(',') === 'visits,order_items,ticket_types,store_sales,inventory_snapshots', names.join(','))
+  check('「有待确认项」：只有还有推断项的表', names.join(',') === 'visits,order_items,ticket_types,store_sales,inventory_snapshots', names.join(','))
   await page.locator('[data-filter="done"]').click()
   names = await rowNames(page)
-  check('「全部已确认」：订单、景区、只剩目录的旧表', names.join(',') === 'orders,parks,legacy_coupons', names.join(','))
+  check('「没有待确认项」：订单、景区、只剩目录的旧表', names.join(',') === 'orders,parks,legacy_coupons', names.join(','))
   await page.locator('[data-filter="none"]').click()
   check('「没有目录」：144 张', (await rowNames(page)).length === 144)
   // 筛选组是单选组：方向键在组内移动并选中
   await page.locator('[data-filter="none"]').focus()
   await page.keyboard.press('ArrowLeft')
-  check('筛选组：← 选中前一项「全部已确认」', (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'done')
+  check('筛选组：← 选中前一项「没有待确认项」', (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'done')
   await page.locator('[data-filter="all"]').click()
 
   // 排序
   await page.locator('[data-catalog-sort]').selectOption('pending')
   names = await rowNames(page)
   const proposedOf = (n) => countsOf(state.tables[S1].find((t) => t.name === n)?.notes).proposed
-  check('按未确认项排序：推断项最多的在前', proposedOf(names[0]) >= proposedOf(names[1]) && proposedOf(names[1]) >= proposedOf(names[2])
+  check('按待确认项排序：推断项最多的在前', proposedOf(names[0]) >= proposedOf(names[1]) && proposedOf(names[1]) >= proposedOf(names[2])
         && names.at(-1) === 'legacy_coupons', names.slice(0, 3).join(','))
   await page.locator('[data-catalog-sort]').selectOption('name')
   names = await rowNames(page)
@@ -642,7 +645,7 @@ await section('数据目录 · 用到但没确认（顶部摘要）', async () =
   const text = await bar.innerText()
   check('写成一句话', text.includes(`运行中查询过的 ${used.length} 张表里，有 ${pending} 张还有推断项未确认，${none} 张还没有目录`), text)
   await bar.locator('[data-usage-focus="pending"]').click()
-  check('点「还有推断项未确认」：切到「有未确认项」筛选',
+  check('点「还有推断项未确认」：切到「有待确认项」筛选',
     (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'pending')
   check('……排序是按使用次数', await page.locator('[data-catalog-sort]').inputValue() === 'usage')
   const shown = await rowNames(page)
@@ -671,7 +674,7 @@ await section('数据目录 · 用到但没确认（顶部摘要）', async () =
   for (const t of state.tables[S1]) if (!t.notes && t.usage > 0) t.notes = { label: item(t.name, 'human') }
   await goto(page, `/data/catalog/${S1}`)
   await bar.waitFor({ timeout: 3000 })
-  check('都确认了：写「都已确认」，没有按钮', (await bar.innerText()).includes(`运行中查询过的 ${used.length} 张表都已确认`)
+  check('都确认了：写「都没有待确认项」，没有按钮', (await bar.innerText()).includes(`运行中查询过的 ${used.length} 张表都没有待确认项`)
     && await bar.locator('[data-usage-focus]').count() === 0, await bar.innerText())
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await close()
@@ -948,7 +951,7 @@ await section('数据目录 · 批量确认', async () => {
   check('……提交后按钮消失、表头计数没有推断', await until(async () => (await btn.count()) === 0)
         && (await detail(page).locator('header [data-counts]').getAttribute('data-counts')).startsWith('0,'))
   await until(async () => (await rowCounts(page, 'order_items')).startsWith('0,'))
-  check('……清单上这张表移到「全部已确认」', (await page.locator('[data-catalog-row="order_items"]').getAttribute('data-progress')) === 'done')
+  check('……清单上这张表移到「没有待确认项」', (await page.locator('[data-catalog-row="order_items"]').getAttribute('data-progress')) === 'done')
 
   // 确认本列推断：只动这一列
   await openDetail(page, S1, 'store_sales')
@@ -1169,7 +1172,7 @@ await section('数据目录 · 空状态与导入表格', async () => {
 
   await goto(page, `/data/catalog/${S1}`)
   const ovt = await page.locator('[data-catalog-overview]').innerText()
-  check('有目录、没选表时：写审阅进度，给出使用最多、还有推断项的表', ovt.includes('共 152 张表：5 张有未确认项，3 张全部已确认，144 张没有目录')
+  check('有目录、没选表时：写审阅进度，给出使用最多、还有推断项的表', ovt.includes('共 152 张表：5 张有待确认项，3 张没有待确认项，144 张没有目录')
         && (await page.locator('[data-catalog-review-next]').getAttribute('data-catalog-review-next')) === 'visits', ovt.replace(/\s+/g, ' ').slice(0, 120))
 
   // 导入表格的源：说明由系统生成，只读

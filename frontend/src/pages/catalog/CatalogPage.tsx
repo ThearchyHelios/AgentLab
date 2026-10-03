@@ -498,7 +498,7 @@ function Overview({ rows, empty, systemNotes, draft, onOpen }: {
   )
 }
 
-/** 审阅进度：有未确认项 / 全部已确认 / 没有目录的表各占多少 */
+/** 审阅进度：有待确认项 / 没有待确认项 / 没有目录的表各占多少 */
 function ProgressBar({ pending, done, none }: { pending: number; done: number; none: number }) {
   const total = pending + done + none || 1
   const seg = (n: number, color: string, label: string) => (n > 0

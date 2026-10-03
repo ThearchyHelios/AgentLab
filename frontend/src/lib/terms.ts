@@ -1988,15 +1988,16 @@ export const CATALOG_TEXT = {
   // ---- 表清单
   search: '搜索表名或中文名',
   filterLabel: '按状态筛选',
-  filter: { all: '全部', pending: '有未确认项', done: '全部已确认', none: '没有目录' },
+  // 「已确认」专指人工确认：只有已验证项（外键约束、数据剖析核实）的表不能说「全部已确认」，按「没有待确认项」说
+  filter: { all: '全部', pending: '有待确认项', done: '没有待确认项', none: '没有目录' },
   filterHint: {
     all: '全部表',
-    pending: '还有推断状态的项',
-    done: '有目录，且没有推断状态的项',
+    pending: '还有推断状态的项，需要逐项确认',
+    done: '有目录，没有推断状态的项。已验证的项由外键约束或数据剖析核实，不需要逐项确认',
     none: '还没有任何目录项',
   },
   sortLabel: '排序',
-  sort: { usage: '按使用次数', pending: '按未确认项', name: '按表名' },
+  sort: { usage: '按使用次数', pending: '按待确认项', name: '按表名' },
   tableCount: (shown: number, total: number) =>
     (shown === total ? `${formatNumber(total)} 张表` : `${formatNumber(shown)} / ${formatNumber(total)} 张表`),
   selectAll: '全选当前结果',
@@ -2017,16 +2018,16 @@ export const CATALOG_TEXT = {
   usageLead: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表里，`,
   usagePending: (n: number) => `有 ${formatNumber(n)} 张还有推断项未确认`,
   usageNone: (n: number) => `${formatNumber(n)} 张还没有目录`,
-  usageAllDone: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表都已确认`,
-  usageHintPending: '筛选有未确认项的表，按使用次数排序',
+  usageAllDone: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表都没有待确认项`,
+  usageHintPending: '筛选有待确认项的表，按使用次数排序',
   usageHintNone: '筛选没有目录的表，按使用次数排序',
   // ---- 概览（没有选中表时）
   overviewTitle: '选择一张表开始审阅',
   overviewBody: '按使用次数从高到低逐表确认。推断的项只作提示，确认后才参与 SQL 检查。',
   overviewStats: (total: number, pending: number, done: number, none: number) =>
-    `共 ${formatNumber(total)} 张表：${formatNumber(pending)} 张有未确认项，${formatNumber(done)} 张全部已确认，${formatNumber(none)} 张没有目录`,
+    `共 ${formatNumber(total)} 张表：${formatNumber(pending)} 张有待确认项，${formatNumber(done)} 张没有待确认项，${formatNumber(none)} 张没有目录`,
   reviewNext: (name: string) => `审阅「${name}」`,
-  reviewNextHint: '使用次数最多、还有未确认项的表',
+  reviewNextHint: '使用次数最多、还有待确认项的表',
   legend: '状态说明',
   // ---- 起草
   draft: '起草',
