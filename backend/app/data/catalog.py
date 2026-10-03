@@ -1613,12 +1613,16 @@ def query_snapshot_meta(source: Any, sql: str) -> dict[str, Any]:
     """查询快照工件引用的 meta：源 id、源名、SQL 里的表名。数据源查询工具存快照时写进去，table_usage 据此计数。
 
     表名的取法和证据台账一样（evidence.sql_tables：FROM / JOIN 后面的表，去掉注释和字符串）。meta 只在
-    工件引用表里，不进工件内容：查询快照的内容哈希不变。
+    工件引用表里，不进工件内容：查询快照的内容哈希不变。不抛异常：它和查询快照在同一个 try 里，
+    这里出错会让快照存不下，证据就断了。
     """
     from app.engine.evidence import sql_tables
 
-    return {"source_id": getattr(source, "id", None), "source": getattr(source, "name", None),
-            "tables": sql_tables(sql or "")}
+    try:
+        tables = sql_tables(sql or "")
+    except Exception:  # noqa: BLE001 - 解析不了就当没用到表，只影响使用次数
+        tables = []
+    return {"source_id": getattr(source, "id", None), "source": getattr(source, "name", None), "tables": tables}
 
 
 async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:

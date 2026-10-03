@@ -222,7 +222,7 @@ async def build_datasource_tools(
         except table_versions.SnapshotMissing as e:
             tools.extend(_unavailable_tool(row, prefix, str(e)) for prefix in prefixes)
             continue
-        entries = await _catalog_of(session, row)
+        entries = await _catalog_of(row)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
                 tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries))
@@ -231,13 +231,17 @@ async def build_datasource_tools(
     return tools
 
 
-async def _catalog_of(session: AsyncSession, row: DataSource) -> dict[str, data_catalog.CatalogEntry]:
+async def _catalog_of(row: DataSource) -> dict[str, data_catalog.CatalogEntry]:
     """这个源的数据目录，建工具时读一次：db_schema 给模型看的和查询时冻结进表结构快照的是同一版。
 
-    读不到（库还没建这张表之类）就当没有目录，工具照常可用——目录是附加说明，不能挡住查询。
+    读不到就当没有目录，工具照常可用——目录是附加说明，不能挡住查询。用单独的会话读：出错要回滚，
+    而回滚会让调用方会话里已经加载的对象（row）全部过期，之后再读属性就是异步环境里的懒加载。
     """
+    from app.db.base import SessionLocal
+
     try:
-        return await data_catalog.read_catalog(session, row.id)
+        async with SessionLocal() as own:
+            return await data_catalog.read_catalog(own, row.id)
     except Exception:  # noqa: BLE001
         logger.exception("读取数据源 %s 的数据目录失败，本次不附目录", row.name)
         return {}
