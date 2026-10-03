@@ -20,6 +20,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, ToolMessage
 from sqlalchemy import select
 
@@ -28,10 +29,11 @@ from app.data.engine import engines, run_query
 from app.data.guard import QueryLimits
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent
-from app.engine.evidence import StreamRenderer, build_catalog, compose_doc, verify_doc
+from app.engine.evidence import StreamRenderer, build_catalog, compose_doc, iter_segments, verify_doc
 from app.engine.expressions import TruncatedUse, eval_expression
 from app.engine.issuance import decide_tier, incomplete_gaps
 from app.engine.runner import run_manager
+from app.main import app
 
 # --------------------------------------------------------------------------
 # 求值器：整组用到截断结果时记一笔，单格不记
@@ -373,10 +375,18 @@ def daily(limit: int | None) -> dict:
 
 
 class Writer:
+    """报告写作者：每次都照 text 写；记下看到的提示。"""
+
     def __init__(self, monkeypatch, text: str = DAILY):
         from app.providers import mock_model
 
-        monkeypatch.setattr(mock_model.MockChatModel, "_decide", lambda model, messages: AIMessage(content=text))
+        self.prompts: list[str] = []
+
+        def decide(model, messages):
+            self.prompts.append("\n".join(str(m.content) for m in messages))
+            return AIMessage(content=text)
+
+        monkeypatch.setattr(mock_model.MockChatModel, "_decide", decide)
 
 
 async def wait(run_id: str) -> Run:
@@ -403,7 +413,7 @@ async def output_of(run_id: str, node_id: str) -> dict:
 
 
 async def test_counting_a_truncated_result_degrades_the_issuance(park, monkeypatch):
-    Writer(monkeypatch)
+    writer = Writer(monkeypatch)
     run = await run_manager.start(graph=daily(limit=2), input_payload={})
     row = await wait(run.id)
     assert row.status == "succeeded", row.error
@@ -432,6 +442,24 @@ async def test_counting_a_truncated_result_degrades_the_issuance(park, monkeypat
     assert "首张门票 60。" in report
     [checked] = [e.data for e in await events(row.id, "report.checked")]
     assert checked["ok"] is True, checked["violations"]
+    # 写作目录提醒写作者：指标不完整、查询已截断（不写行数，免得照抄成裸数字）
+    prompt = writer.prompts[0]
+    assert "入园人次 = 2人次（基于被截断的查询结果计算，结果不完整" in prompt
+    assert "查询结果已截断：只取回了前面一部分行" in prompt
+
+    # 证据面板：点开报告里的这个指标，指标步骤带着「不完整」和原因
+    doc = artifact_store.load(row.output["_evidence"]["doc_artifact"])
+    assert doc["catalog"]["m:visits"]["incomplete"] is True
+    assert "incomplete" not in doc["catalog"]["m:first"]
+    seg = next(s for s in iter_segments(doc) if s["text"] == "2人次")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{seg['id']}")).json()
+        metric = body["chain"][0]
+        assert metric["step"] == "metric" and metric["incomplete"] is True
+        assert metric["incomplete_reason"] == reason
+        first = next(s for s in iter_segments(doc) if s.get("ref") == "m:first")
+        body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{first['id']}")).json()
+        assert "incomplete" not in body["chain"][0]
 
 
 async def test_the_same_card_on_a_complete_result_issues_formally(park, monkeypatch):

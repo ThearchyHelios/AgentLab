@@ -898,6 +898,10 @@ def build_catalog(
                 "value": metric.get("value"),
                 "status": metric.get("status") or ("ok" if metric.get("value") is not None else "missing_input"),
                 "rendered": rendered, "label": f"{metric.get('name') or mid} = {rendered}",
+                # 拿截断的查询结果整组算出来的：写作目录里提醒写作者，证据面板标「结果不完整」。
+                # 只在不完整时有这两个键，完整的指标条目和以前一字不差
+                **({"incomplete": True, "incomplete_reason": metric.get("incomplete_reason") or ""}
+                   if metric.get("incomplete") else {}),
             }
 
     queries = retrievals = 0
@@ -1473,7 +1477,22 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
     lines = ["| " + " | ".join(_clean(c) for c in wanted) + " |",
              "| " + " | ".join("---" for _ in wanted) + " |"]
     lines += ["| " + " | ".join(f"[[v:{alias}.r{r}.{c}]]" for c in wanted) + " |" for r in range(first, last + 1)]
+    if snapshot.get("truncated") is True:
+        lines.append(_truncated_note(first, last))
     return "\n".join(lines), None
+
+
+def _truncated_note(first: int, last: int) -> str:
+    """截断的查询结果生成的表格下面那行说明。表里每一格都是真实的，但读的人会把它当成全部数据。
+
+    写成紧跟表格的引用块：切块（_scan_blocks）和前端 Markdown.tsx 都在不以竖线开头的行结束表格，引用块
+    只认以 > 开头的行，不会把下一段吞进来——普通段落接在表格后面，下一行正文就成了同一段。
+    不写取回了多少行：正文里没有出处的数字是裸数字（叙述层没有算术权限），行数写进来，每份带截断表格的
+    报告都会违规。「前 N 行」只在从第一行显示起时写，N 不超过整表上限 20，按序号放行（_structural_number）；
+    行数在证据面板的查询步骤里能看到。
+    """
+    shown = f"表中只显示了前 {last + 1} 行；" if first == 0 else ""
+    return f"> 注：{shown}查询结果已截断，取回的数据并不完整。"
 
 
 def _expand_tables(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
@@ -3033,6 +3052,9 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool)
     snapshot, why = snaps.get(alias, entry.get("artifact"))
     if why:
         return [*lines, f"  （{why}，不要引用）"]
+    if snapshot.get("truncated") is True:
+        lines.append("  （查询结果已截断：只取回了前面一部分行，库里还有更多。单格可以引用；"
+                     "不要把取回的行数当成总数，也不要据此写合计、全部之类的结论）")
     if not cells_allowed:
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
@@ -3084,7 +3106,10 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
                 # 有值但按口径卡的格式显示不出来（太小、太大、不是有限的数）：引用了也是解析不了
                 lines.append(f"- [[{e['alias']}]] {e.get('name')}：按口径卡的格式显示不出来，不要引用")
             else:
-                lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}")
+                # 不完整的指标照样能引用（单格、口径都对），但写作者得知道它不是全量：不写行数，免得照抄成裸数字
+                caveat = "（基于被截断的查询结果计算，结果不完整：引用时须如实说明，不要写成全部数据）" \
+                    if e.get("incomplete") else ""
+                lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}{caveat}")
     inputs = [e for e in catalog.values() if e.get("kind") == "input"]
     if inputs:
         lines.append("\n运行输入：")

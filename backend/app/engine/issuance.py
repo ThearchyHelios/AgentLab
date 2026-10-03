@@ -451,6 +451,17 @@ def decide_tier(
     return "formal"
 
 
+def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
+    """契约收来的指标里结果不完整的（口径卡标了 incomplete：拿截断的查询结果整组算出来的），每个一句缺口。
+
+    交给 decide_tier 的 gaps：完整出具的前提是每个数都算全了。「前 1000 行的人次」不是「入园人次」，
+    数字照样回指得上口径卡，只看回指的话它会被盖上完整出具的章。原因用口径卡记下的那句，读的人
+    看得懂是哪个指标、为什么不完整。
+    """
+    return [f"指标「{m.get('name') or m.get('id')}」{m.get('incomplete_reason') or '结果不完整'}"
+            for m in metrics if isinstance(m, dict) and m.get("incomplete")]
+
+
 def _claims_effect(
     policy: str | dict[str, Any] | None,
     unsupported: list[Any] | int | None,

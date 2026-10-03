@@ -1163,6 +1163,10 @@ def _verify_rows(schema: dict[str, Any], told: Any, source: Any, by_alias: dict[
                                **({"columns": names} if fields is not None else {"column": names[""]})}
     cited = {"ref": f"{call}.r{first}-{last}" + ("" if fields is not None else f".{names['']}"), **base,
              "locator": locator, "eid": make_eid("rows", q["artifact"], locator)}
+    if content.get("truncated") is True and last == len(content.get("rows") or []) - 1:
+        # 行段到了截断快照的末行：库里还有没取回的行，可能也属于这个字段。口径卡对它整组求和、计数时
+        # 据此标「不完整」（metrics._truncated_field）。停在末行之前的不标：引用的每一行都在快照里
+        cited["truncated"] = True
     same = isinstance(told, list) and len(told) == len(truth) and all(
         (isinstance(m, dict) and all(same_value(m.get(f), t[f]) for f in t)) if isinstance(t, dict)
         else same_value(m, t)

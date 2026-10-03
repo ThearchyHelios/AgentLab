@@ -71,7 +71,10 @@ _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 class QueryResult:
     columns: list[str]
     rows: list[list[Any]]
+    #: 取回的行数。截断时只是取回的那一截，不是完整结果的行数
     row_count: int
+    #: 撞了行数或字节上限、而且后面确实还有行：rows 只是完整结果的前 row_count 行。按行号取的单格是真实的，
+    #: 整组拿去计数、求和算出来的数不完整——口径卡据此标 incomplete，出具据此降档。恰好取满、后面没有了的不算
     truncated: bool
     elapsed_ms: int
     sql: str
@@ -888,17 +891,20 @@ async def run_query(
         columns = list(cursor.keys())
         rows: list[list[Any]] = []
         seen = _TypeTally(len(columns))
-        truncated = False
+        truncated = full = False
         size = 0
         async for row in cursor:
+            if full:
+                # 到了上限之后还有下一行：确实没取完。以前一到上限就标截断，恰好 1000 行的完整结果
+                # 也算截断——截断的结果整组拿去算的指标要降档出具，误报就是把完整的结果降了档
+                truncated = True
+                break
             # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
             seen.add(row)
             values = [_jsonable(v) for v in row]
             rows.append(values)
             size += len(json.dumps(values, ensure_ascii=False, default=str))
-            if len(rows) >= limits.max_rows or size >= limits.max_bytes:
-                truncated = True
-                break
+            full = len(rows) >= limits.max_rows or size >= limits.max_bytes
         return columns, rows, truncated, seen.types(columns)
 
     columns, rows, truncated, types = await _bounded(
@@ -976,8 +982,9 @@ async def _run_write(
     async def _write(conn: AsyncConnection) -> tuple[list[str], list[list[Any]]]:
         result = await conn.execute(text(statement))
         if result.returns_rows:          # RETURNING、PG 的数据修改 CTE
+            # 多取一行：取到了才说明确实截断了（和查询的口径一致，恰好取满不算截断）
             return (list(result.keys()),
-                    [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows)])
+                    [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows + 1)])
         return ["affected_rows"], [[result.rowcount]]
 
     # engine.begin()：正常退出提交，出错（包括数据库按时限停下）回滚
@@ -985,11 +992,13 @@ async def _run_write(
         engine.begin, kind, limits,
         f"写操作超过 {_seconds(limits.timeout_seconds)} 秒被中断，已回滚。", _write,
     )
+    truncated = len(rows) > limits.max_rows
+    rows = rows[:limits.max_rows]
     return QueryResult(
         columns=columns,
         rows=rows,
         row_count=len(rows),
-        truncated=len(rows) >= limits.max_rows,
+        truncated=truncated,
         elapsed_ms=int((time.perf_counter() - started) * 1000),
         sql=statement,
     )

@@ -822,6 +822,9 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         "version": (card or {}).get("caliber_version", entry.get("version")),
         "expression": (metric or {}).get("expression"), "substituted": (metric or {}).get("substituted"),
         "recompute_ok": (metric or {}).get("recompute_ok"), "status": source.get("status"),
+        # 拿截断的查询结果整组算出来的：面板标「结果不完整」并写明原因。完整的指标没有这两个键
+        **({"incomplete": True, "incomplete_reason": source.get("incomplete_reason") or ""}
+           if source.get("incomplete") else {}),
         "node_id": entry.get("node_id"), "artifact": artifact or None, "eid": cite.get("eid"),
         "eid_ok": cite.get("eid") == entry.get("eid") == make_eid("metric", artifact or None, {"metric": metric_id}),
         "hash_ok": hash_ok and metric is not None,

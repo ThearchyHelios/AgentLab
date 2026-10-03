@@ -22,6 +22,7 @@ from app.engine.evidence import (
 from app.engine.expressions import (
     CellError,
     ExpressionError,
+    TruncatedUse,
     cell_parts,
     cell_value,
     eval_expression,
@@ -45,6 +46,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     每个指标还记下它是怎么来的：用到了哪些输入、各取自哪个节点、代入后的算式、
     拿代入式复算是否一致。整张卡落成 metric_set 工件，id 进证据台账——报告里的
     数字点开，一路能追到这里。
+
+    表达式把截断的查询结果当成整组用了（len、sum、max……，见 expressions.TruncatedUse）的指标，
+    值照算，但标 incomplete 并写明原因：它算的只是取回的那一截。出具契约据此降档（issuance.incomplete_gaps）。
     """
     definitions = ctx.cfg("metrics", []) or []
     caliber_raw, caliber_version = ctx.cfg("caliber", "") or ctx.node.title, str(ctx.cfg("caliber_version", "") or "v1")
@@ -87,8 +91,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         missing = [path for path in paths if values[path] is None]
 
         value: Any = None
+        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
         try:
-            value = eval_expression(expr, tctx)
+            value = eval_expression(expr, tctx, track=use)
         except ExpressionError as e:
             errors.append(f"指标「{metric_id}」：表达式有误（{e}）")
             continue
@@ -117,6 +122,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if isinstance(value, float) and decimals is not None:
             value = round(value, decimals)
         substituted = substitute(tree, values)
+        incomplete: dict[str, Any] = {}
+        if use.sources:
+            sources = list(use.sources.values())
+            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(sources),
+                          "truncated_sources": sources}
         metrics.append(
             {
                 "id": metric_id,
@@ -133,6 +143,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
                 # 指标（原式就是 vars.x.y 而 y 不存在）以前也是照常产出一个 None
                 "status": "ok" if value is not None else "missing_input",
+                # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
+                **incomplete,
             }
         )
 
@@ -142,10 +154,16 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
-        f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
-        else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）"
+        (f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
+         else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）")
+        # 不写行数：叙述节点照抄进正文就是一个没有出处的数
+        + ("（不完整：基于被截断的查询结果计算）" if m.get("incomplete") else "")
         for m in metrics
     ]
+    for m in metrics:
+        if m.get("incomplete"):
+            ctx.emit(EventType.LOG, level="warn", code="metric_incomplete", metric=m["id"],
+                     message=f"指标「{m['name']}」{m['incomplete_reason']}")
     card = {
         "kind": "metric_set",
         "caliber": caliber,
@@ -305,6 +323,46 @@ def _value_of(path: str, tctx: dict[str, Any]) -> Any:
         return None
 
 
+def _incomplete_reason(sources: list[dict[str, Any]]) -> str:
+    """「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」：出具声明、运行日志、证据面板都用这句。"""
+    fetched = [f"前 {s['rows']} 行" for s in sources]
+    if len(fetched) == 1:
+        return f"基于被截断的查询结果计算（只取回了{fetched[0]}），结果不完整"
+    return f"基于 {len(fetched)} 份被截断的查询结果计算（分别只取回了{'、'.join(fetched)}），结果不完整"
+
+
+def _truncated_field(path: str, state: GraphState, ctx: NodeContext) -> dict[str, Any] | None:
+    """agent 经 cite_fields 交来、被截断切开的数组字段：{rows, artifact}。别的取值链返回 None。
+
+    数组字段的出处是快照里的一段行（data_evidence 的 locator.rows = [a, b]）。cite_fields 核对时，这段行
+    到了截断快照的末行就记 truncated（llm._verify_rows）：快照后面还有没取回的行，可能也属于这个字段，
+    对它求和、计数算的就只是取回的那一截。停在末行之前的不记——引用的每一行都在快照里，截断拿不走其中
+    任何一行。标量字段是一格，不是聚合，也不记。取回的行数就是末行的行号加一。
+
+    路径怎么对到字段和 _input_of 一样：vars.X 找最后写它的节点，nodes.<agent> 下多走一层 data。
+    求值器只对取到列表的取值链问这里，一个指标问不了几次。
+    """
+    head = _REF_HEAD.match(path)
+    if not head or head.group(1) == "input":
+        return None
+    root, name, rest = head.groups()
+    field = rest.lstrip(".")
+    node_id = name if root == "nodes" else _writer_of(name, state, ctx)
+    producer = ctx.run.spec.node_map().get(node_id) if node_id and field else None
+    if producer is None or str(producer.type) != "agent":
+        return None
+    output = (state.get("nodes") or {}).get(producer.id)
+    evidence = output.get("data_evidence") if isinstance(output, dict) else None
+    key = _field_key(field)
+    if root == "nodes":
+        key = key[len("data."):] if key.startswith("data.") else ""
+    cited = evidence.get(key) if isinstance(evidence, dict) and key else None
+    rows = (cited.get("locator") or {}).get("rows") if isinstance(cited, dict) and cited.get("truncated") else None
+    if not (isinstance(rows, list) and len(rows) == 2 and isinstance(rows[1], int)):
+        return None
+    return {"rows": rows[1] + 1, "artifact": cited.get("artifact")}
+
+
 def _missing_reason(missing: list[str]) -> str:
     if not missing:
         return "有输入为空值，无法计算（请检查上游是否产出了这些字段）"
@@ -404,7 +462,7 @@ def _agent_field(state: GraphState, node_id: str, root: str, field: str) -> dict
     if not isinstance(cited, dict):
         return _agent_element(evidence, key)
     out: dict[str, Any] = {"via": "agent_field", "field": key, "status": cited.get("status") or "unresolved"}
-    for k in ("ref", "artifact", "locator", "eid", "model_value", "reason"):
+    for k in ("ref", "artifact", "locator", "eid", "model_value", "reason", "truncated"):
         if k in cited:
             out[k] = cited[k]
     return out
