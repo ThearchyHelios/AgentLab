@@ -1496,6 +1496,22 @@ await section('数据目录 · 数据剖析', async () => {
         && (await gate.locator('[data-profile-cardinality]').innerText()) === '多对一' && (await gate.innerText()).includes('抽样 300 个键值，对上 296 个')
         && (await gate.locator('[data-profile-outcome]').innerText()) === '升为已验证' && (await gate.getAttribute('data-status')) === 'verified',
         (await gate.innerText()).replace(/\s+/g, ' '))
+  // 结论是状态说明，不是链接：带框的小标签，文字用次要文字色（不是强调蓝），不能点
+  const outcomeLook = await gate.locator('[data-profile-outcome]').evaluate((el) => {
+    const probe = document.createElement('span')
+    probe.style.color = 'var(--accent)'
+    document.body.append(probe)
+    const accent = getComputedStyle(probe).color
+    probe.style.color = 'var(--text-dim)'
+    const dim = getComputedStyle(probe).color
+    probe.remove()
+    const cs = getComputedStyle(el)
+    return { tag: el.tagName, color: cs.color, accent, dim, border: cs.borderTopStyle, cursor: cs.cursor, kind: el.getAttribute('data-profile-outcome'),
+      clickable: !!el.closest('a, button') }
+  })
+  check('……结论用状态标签的样子：带框、次要文字色，不是蓝色正文、不像链接', outcomeLook.kind === 'raised' && outcomeLook.color === outcomeLook.dim
+    && outcomeLook.color !== outcomeLook.accent && outcomeLook.border === 'solid' && outcomeLook.cursor !== 'pointer' && !outcomeLook.clickable,
+    JSON.stringify(outcomeLook))
   const member = visitsCard.locator(`[data-profile-finding="relation"][data-path="relations.${MEMBER_REL}"]`)
   check('……覆盖率不够的保持推断，写明原因', (await member.locator('[data-profile-outcome]').innerText()) === '保持推断：覆盖率不足，可能不是这条关系'
         && (await member.locator('[data-profile-coverage]').innerText()) === '覆盖率 62%')

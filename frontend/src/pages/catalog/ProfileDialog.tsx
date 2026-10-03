@@ -408,6 +408,7 @@ function relationOutcome(f: CatalogProfileRelationFinding): { kind: RelationOutc
 
 function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
   const outcome = relationOutcome(f)
+  const Icon = outcome.icon
   return (
     <li className="text-xs" data-profile-finding="relation" data-status={f.status} data-path={f.path}>
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
@@ -421,7 +422,13 @@ function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
         {' · '}
         {PT.sampled(f.sample, f.matched)}
       </div>
-      <div className="mt-0.5 text-2xs" style={{ color: outcome.tone }} data-profile-outcome={outcome.kind}>{outcome.text}</div>
+      {/* 结论是状态说明，不是链接：用状态标识的样子（带框的小标签、图标着状态色），正文用次要文字色 */}
+      <div className="mt-1">
+        <span className="chip !text-2xs" data-profile-outcome={outcome.kind}>
+          <Icon size={10} className="shrink-0" style={{ color: outcome.tone }} aria-hidden />
+          {outcome.text}
+        </span>
+      </div>
     </li>
   )
 }
