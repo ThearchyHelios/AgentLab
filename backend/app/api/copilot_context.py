@@ -78,6 +78,14 @@ SECTION_HEAD_PROMPT = "\n\n已接入的数据源（涉及取数时优先用它�
 NAMES_ONLY_PROMPT = "  （对象较多，上面只列了名字。写 SQL 前用 db_schema 工具确认字段，别猜）"
 INFERRED_PROMPT = ("  标「推断，未确认」的说明和连接条件是按列名、数据库注释或模型推断出来的，没有人确认过："
                    "照抄前对照字段核实，拿不准就先用 db_schema 工具查")
+#: 探查结构截断了的源（每个源最多取 200 张表，introspect._MAX_TABLES）：没探查到的表不在表结构缓存里，上面列不出、
+#: db_schema 也查不到。不说的话模型会以为库里就这么多表，用户说的表名对不上时就近找一张名字像的顶上
+UNEXPLORED_PROMPT = ("    （这个库共 {total} 张表，只探查了 {explored} 张，还有 {rest} 张没有探查到、不在上面。用户提到的表名"
+                     "在上面找不到时，先用 db_schema__{source} 查；也查不到就查数据字典（information_schema.columns，"
+                     "SQLite 用 sqlite_master）确认它的字段，别猜，也别拿名字相近的表顶替）")
+#: 挑表请求里一个源的标题：截断了的写明只列了探查到的
+PICK_SOURCE_PROMPT = "数据源「{source}」（共 {total} 张表）"
+PICK_SOURCE_PARTIAL_PROMPT = "数据源「{source}」（共 {total} 张表，只探查了 {explored} 张，下面只列探查到的）"
 SQL_RULES_PROMPT = (
     "\n\n写 SQL 的硬性要求：\n"
     # 这三条都是真实踩过的：Oracle 上漏 schema 前缀直接 ORA-00942，
@@ -178,6 +186,26 @@ class SourcePlan:
         return (getattr(self.source, "schema_cache", None) or {}).get("tables") or {}
 
     @property
+    def explored(self) -> int:
+        """探查到、在表结构缓存里的表数。"""
+        return len(self.tables)
+
+    @property
+    def total(self) -> int:
+        """这个源一共几张表（含视图）：探查时数据库报的总数。老缓存没记总数时按探查到的算。"""
+        raw = (getattr(self.source, "schema_cache", None) or {}).get("total")
+        return max(raw if isinstance(raw, int) and not isinstance(raw, bool) else 0, self.explored)
+
+    @property
+    def unexplored(self) -> int:
+        """探查截断了的话还有几张没探查到；没截断为 0。
+
+        只看 truncated：反射失败跳过的表（skipped）也算在 total 里，但那是「探查了、读不到」，不是没探查到。
+        """
+        truncated = (getattr(self.source, "schema_cache", None) or {}).get("truncated")
+        return max(self.total - self.explored, 0) if truncated else 0
+
+    @property
     def notes(self) -> dict[str, dict[str, Any]]:
         """给模型看的目录：去掉驳回项。"""
         return {t: catalog.visible_notes(n) for t, n in self.raw_notes.items()}
@@ -212,35 +240,28 @@ def _modes(sources: list[Any]) -> list[Literal["all", "pick"]]:
 def graph_tables(graph: Mapping[str, Any] | None, sources: Iterable[Any]) -> dict[str, list[str]]:
     """现有工作流里查库节点的 SQL 用到的表：{源名: [schema_cache 的键]}，按出现顺序。
 
-    只认调用工具节点上写死的 SQL（db_query__<源>）；Agent 运行时自己写的 SQL 图里看不到。节点认两种写法：
-    画布的 {data: {config}} 和 GraphSpec 的 {config}。SQL 解析不了的跳过。
+    只认调用工具节点上写死的 SQL（db_query__<源>）；Agent 运行时自己写的 SQL 图里看不到。哪些节点算写死的查询
+    以 sqlcheck.tool_query 为准（catalog_impact.tool_queries，和发布记录、SQL 检查同一份）：换成别的类型的节点
+    配置里残留的 tool、args 不算。节点认两种写法：画布的 {data: {config}} 和 GraphSpec 的 {config}。SQL 解析
+    不了的跳过。
     """
+    from app.data.catalog_impact import tool_queries
     from app.engine.evidence import sql_tables
-    from app.tools.datasource import QUERY_PREFIX
 
     by_name = {getattr(s, "name", None): s for s in sources}
     out: dict[str, list[str]] = {}
-    for node in (graph or {}).get("nodes") or []:
-        if not isinstance(node, dict):
-            continue
-        config = node.get("config")
-        if not isinstance(config, dict):
-            config = (node.get("data") or {}).get("config") if isinstance(node.get("data"), dict) else None
-        if not isinstance(config, dict):
-            continue
-        tool = str(config.get("tool") or "")
-        source = by_name.get(tool[len(QUERY_PREFIX):]) if tool.startswith(QUERY_PREFIX) else None
-        args = config.get("args")
-        sql = args.get("sql") if isinstance(args, dict) else None
-        if source is None or not isinstance(sql, str):
+    nodes = (graph or {}).get("nodes") or []
+    for _, source_name, sql in tool_queries(n for n in nodes if isinstance(n, dict)):
+        source = by_name.get(source_name)
+        if source is None:
             continue
         try:
             names = sql_tables(sql)
         except Exception:  # noqa: BLE001 - 认不出表就当没用到，只少一个提示
             continue
         found = out.setdefault(source.name, [])
-        for name in names:
-            key = catalog.resolve_table_name(source.schema_cache, name)
+        for table in names:
+            key = catalog.resolve_table_name(source.schema_cache, table)
             if key and key not in found:
                 found.append(key)
     return {k: v for k, v in out.items() if v}
@@ -337,7 +358,9 @@ class ContextPlan:
                 continue
             qualified = _qualifier(p.tables)
             index = catalog.render_table_index(p.source.schema_cache, p.notes)
-            blocks.append(f"数据源「{p.source.name}」（共 {len(p.tables)} 张表）：\n{index}")
+            head = (PICK_SOURCE_PARTIAL_PROMPT if p.unexplored else PICK_SOURCE_PROMPT).format(
+                source=p.source.name, total=p.total, explored=p.explored)
+            blocks.append(f"{head}：\n{index}")
             if p.seeds:
                 used.append(f"数据源「{p.source.name}」的 " + "、".join(qualified(t) for t in p.seeds))
         human = PICK_PROMPT.format(need=need.strip(), used=PICK_USED_PROMPT.format(tables="；".join(used)) if used
@@ -506,7 +529,13 @@ class SourceContext:
 
     @property
     def total(self) -> int:
-        return len(self.plan.tables)
+        """这个源一共几张表：表结构缓存里记的真实总数（探查截断时比探查到的多），见 SourcePlan.total。"""
+        return self.plan.total
+
+    @property
+    def explored(self) -> int:
+        """探查到的表数：没有表结构时为 0。"""
+        return self.plan.explored
 
     def qualified(self, key: str) -> str:
         return _qualifier(self.plan.tables)(key)
@@ -532,15 +561,18 @@ class DatasourceContext:
     def op(self) -> dict[str, Any] | None:
         """告诉前端这一轮参考了哪些表：{"op": "context", "sources": [...], "elapsed_ms"?}。没有可查的表时为 None。
 
-        每个源一项：source 源名，tables 给了全字段的表（全名），selected_by，total 这个源一共几张表；挑表失败的
+        每个源一项：source 源名，tables 给了全字段的表（全名），selected_by，total 这个源一共几张表（表结构缓存里
+        记的真实总数）；探查截断了的再带 explored（探查到几张），界面写「共 N 张，只探查了 200 张」；挑表失败的
         带上 reason。只列了名字的表不进 tables：界面上说的「参考了 N 张表」是模型看得到字段的那些。
         """
         rows = []
         for s in self.sources:
-            if not s.total:
+            if not s.explored:
                 continue
             row: dict[str, Any] = {"source": s.source.name, "tables": [s.qualified(t) for t in s.tables],
                                    "selected_by": s.selected_by, "total": s.total}
+            if s.plan.unexplored:
+                row["explored"] = s.explored
             if s.selected_by == "fallback" and self.reason:
                 row["reason"] = self.reason
             rows.append(row)
@@ -571,6 +603,10 @@ class DatasourceContext:
                 logger.exception("数据源 %s 的上下文组装失败，本轮只列表名", s.source.name)
                 blocks.append(introspect.summary(s.source, detail=False))
                 names_only = True
+            if s.plan.unexplored:
+                # 探查截断了：上面列的只是探查到的那部分，说清还有多少张没探查到、遇到不认识的表名怎么办
+                blocks.append(UNEXPLORED_PROMPT.format(total=s.total, explored=s.explored, rest=s.plan.unexplored,
+                                                       source=s.source.name))
         text = "\n".join(blocks)
         tail = []
         if names_only:
@@ -604,7 +640,13 @@ def _edge_line(edge: JoinEdge, qualified) -> str:
 
 
 def _edges_within(graph: Mapping[str, list[JoinEdge]], tables: list[str]) -> list[JoinEdge]:
-    """两端都在 tables 里的关系，每条一次；一对多的翻过来，从「多」的一端写起（外键所在的表在左）。"""
+    """两端都在 tables 里的关系，每条一次；一对多的翻过来，从「多」的一端写起（外键所在的表在左）。
+
+    「每条一次」按 relation_id 去重，去掉的是同一条关系在关系图里的正反两条边。注意 catalog.relation_id 区分方向：
+    A 表目录里记的 A→B 和 B 表目录里记的 B→A 是两个编号，两边都记了的话这里会各出一行（内容相同、写法相反）。
+    这是有意不改的：编号存在每条关系上，也是审阅路径 relations.<编号> 的一部分，改成不分方向会让已有目录里的
+    编号全部对不上。
+    """
     wanted = set(tables)
     seen: set[str] = set()
     out = []
@@ -636,7 +678,7 @@ def _detail_block(s: SourceContext, budget: list[int]) -> str:
     目录按表放，放不下的表让模型用 db_schema 查（db_schema 的输出里带目录）。
     """
     lines = [introspect.summary(s.source, detail=True)]
-    if not s.total:
+    if not s.explored:
         return lines[0]
     joins = _join_lines(s, _relation_graph(s.plan), list(s.plan.tables))
     size = sum(len(line) + 1 for line in joins)

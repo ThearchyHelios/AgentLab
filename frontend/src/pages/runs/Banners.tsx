@@ -5,6 +5,7 @@ import { CopyButton, Spinner, StatusBadge } from '../../components/ui'
 import { formatDateTime, formatSpan, formatTime } from '../../lib/format'
 import type { Approval, CatalogDriftTable } from '../../types'
 import { CATALOG_DRIFT_TEXT, CATALOG_IMPACT_TEXT } from '../../lib/terms'
+import { catalogDriftLine } from '../../run/decode'
 import type { RunErrorExplain } from '../../lib/explain'
 import { LONG_WAIT_MS, ageMs } from './model'
 import { copyText } from './parts'
@@ -28,12 +29,14 @@ function Shell({ color, children, data }: { color: string; children: ReactNode; 
 // -------------------------------------------------------------------------
 
 /**
- * 从发布版本发起的正式运行，开始时发现这一版 SQL 用到的表的数据目录在发布之后改过。运行照常（目录是说明，
+ * 从发布版本发起的正式运行，开始时发现这一版用到的表的数据目录在发布之后改过。运行照常（目录是说明，
  * 不是运行的输入），但看结果的人要知道：「在园人数」在发布之后被改成了存量，这一版的 SQL 可能还在跨天相加。
- * 每张表给到数据目录的入口；表多时只列前几张
+ * SQL 里写着的表在前；Agent 可能查询的表（Agent 运行时自己写 SQL）另起一组、带小标题，和直接引用分开。
+ * 每张表给到数据目录的入口；每组表多时只列前几张
  */
-export function CatalogDriftBanner({ drift }: { drift: { title: string; tables: CatalogDriftTable[] } }) {
-  const shown = drift.tables.slice(0, DRIFT_SHOWN)
+export function CatalogDriftBanner({ drift }: {
+  drift: { title: string; direct: CatalogDriftTable[]; possible: CatalogDriftTable[] }
+}) {
   return (
     <Shell color="var(--st-waiting)" data="catalog-drift">
       <div className="flex items-start gap-2.5">
@@ -41,26 +44,38 @@ export function CatalogDriftBanner({ drift }: { drift: { title: string; tables: 
         <div className="min-w-0 flex-1 text-xs">
           <p className="font-semibold" data-drift-title="">{drift.title}</p>
           <p className="mt-0.5 text-2xs text-dim">{CATALOG_DRIFT_TEXT.sub}</p>
-          <ul className="mt-1 space-y-0.5 text-2xs text-dim">
-            {shown.map((t) => (
-              <li key={`${t.source}/${t.table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-2" data-drift-table={t.table}>
-                <span className="min-w-0 break-words">
-                  {CATALOG_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table),
-                    CATALOG_DRIFT_TEXT.version(t.published), CATALOG_DRIFT_TEXT.version(t.current))}
-                </span>
-                {t.source_id && (
-                  <Link className="shrink-0 text-[var(--accent)] hover:underline" data-drift-open={t.table}
-                        to={`/data/catalog/${encodeURIComponent(t.source_id)}/${encodeURIComponent(t.table)}`}>
-                    {CATALOG_DRIFT_TEXT.open}
-                  </Link>
-                )}
-              </li>
-            ))}
-            {drift.tables.length > shown.length && <li className="text-faint">{CATALOG_IMPACT_TEXT.more(drift.tables.length - shown.length)}</li>}
-          </ul>
+          {drift.direct.length > 0 && <DriftTables tables={drift.direct} />}
+          {drift.possible.length > 0 && (
+            <div className="mt-1.5" data-drift-possible={drift.possible.length}>
+              <p className="text-2xs font-medium text-dim">{CATALOG_DRIFT_TEXT.possibleHead}</p>
+              <p className="text-2xs text-faint">{CATALOG_DRIFT_TEXT.possibleHint}</p>
+              <DriftTables tables={drift.possible} />
+            </div>
+          )}
         </div>
       </div>
     </Shell>
+  )
+}
+
+function DriftTables({ tables }: { tables: CatalogDriftTable[] }) {
+  const shown = tables.slice(0, DRIFT_SHOWN)
+  return (
+    <ul className="mt-1 space-y-0.5 text-2xs text-dim">
+      {shown.map((t) => (
+        <li key={`${t.source}/${t.table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-2" data-drift-table={t.table}
+            data-drift-impact={t.impact}>
+          <span className="min-w-0 break-words">{catalogDriftLine(t)}</span>
+          {t.source_id && (
+            <Link className="shrink-0 text-[var(--accent)] hover:underline" data-drift-open={t.table}
+                  to={`/data/catalog/${encodeURIComponent(t.source_id)}/${encodeURIComponent(t.table)}`}>
+              {CATALOG_DRIFT_TEXT.open}
+            </Link>
+          )}
+        </li>
+      ))}
+      {tables.length > shown.length && <li className="text-faint">{CATALOG_IMPACT_TEXT.more(tables.length - shown.length)}</li>}
+    </ul>
   )
 }
 

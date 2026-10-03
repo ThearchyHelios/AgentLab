@@ -17,6 +17,7 @@ from sqlalchemy import select as _select
 from app.api.coded import CodedHTTPException
 from app.core.bus import bus
 from app.core import artifact_store
+from app.core.events import EventType
 from app.data.catalog_impact import catalog_drift
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent, Workflow, WorkflowVersion
@@ -186,8 +187,9 @@ async def start_run(
         await run_manager.note(run.id, "log", **governance_note(
             governed=governed, workflow_name=name, version=version))
     if catalog_changes:
-        # 落在封存范围内：之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表
-        await run_manager.note(run.id, "catalog.drift", version=version, count=len(catalog_changes),
+        # 落在封存范围内：之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。
+        # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的（界面分开说）
+        await run_manager.note(run.id, EventType.CATALOG_DRIFT, version=version, count=len(catalog_changes),
                                tables=catalog_changes)
     # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
     for ev in upgrade_events:

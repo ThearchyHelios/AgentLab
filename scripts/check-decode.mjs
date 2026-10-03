@@ -685,6 +685,16 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
     { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
   check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名'),
     none?.detail)
+  // 探查结构截断了（每个数据源最多取 200 张表）：total 是数据库里的总数，explored 是探查到的
+  const partial = mod.copilotContext({ op: 'context', sources: [
+    { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 },
+    { source: 'wide2', tables: [], selected_by: 'fallback', total: 260, explored: 200, reason: 'r' }] })
+  check('截断了的库写「共 N 张，只探查了 200 张」', !!partial?.detail.includes('「wide」共 205 张，只探查了 200 张，按需求挑出 2 张：t001、t002')
+    && partial.detail.includes('「wide2」共 260 张，只探查了 200 张，未能按需求挑选'), partial?.detail)
+  const whole = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: ['x'], selected_by: 'model', total: 60, explored: 60 }] })
+  check('探查到的和总数一样：照旧写「从 N 张表中挑出」', !!whole?.detail.includes('「a」按需求从 60 张表中挑出 1 张') && !whole.detail.includes('只探查了'),
+    whole?.detail)
   check('形状不对不出行、不报错', mod.decodeCopilot([
     { op: 'context' }, { op: 'context', sources: 'x' }, { op: 'context', sources: [null, 3, { tables: ['t'] }] },
   ]).length === 0)
@@ -737,6 +747,26 @@ await section('正式运行：发布之后数据目录有变化（catalog.drift 
     && row.detail.includes('「scenic」parks：发布时尚无目录，现为第 1 版'), row?.detail)
   const one = mod.catalogDrift({ tables: [{ source: 's', table: 't', label: null, published: 1, current: 2 }] })
   check('只有一张表：标题不写「等」', one?.title === '自发布以来，数据目录中「t」有变化', one?.title)
+  check('老事件的表没有 impact：按直接引用', one?.direct.length === 1 && one?.possible.length === 0 && one?.tables[0].impact === 'direct')
+  // Agent 可能查询的表（SQL 运行时才写）：和直接引用分开说
+  const mixed = mod.catalogDrift({ tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+    { source: 'scenic', source_id: 'src-scenic', table: 'gates', label: null, published: 0, current: 1, impact: 'possible' },
+  ] })
+  check('两组都有：标题说直接引用的，再补一句 Agent 可能查询的表有变化',
+    mixed?.title === '自发布以来，数据目录中「入园记录」有变化；另有 2 张 Agent 可能查询的表有变化', mixed?.title)
+  check('……展开：直接引用在前，可能涉及的在小标题下面', mixed?.detail === [
+    '「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版', 'Agent 可能查询的表：',
+    '「scenic」订单（orders）：发布时第 2 版，现为第 4 版', '「scenic」gates：发布时尚无目录，现为第 1 版'].join('\n'), mixed?.detail)
+  const agentOnly = mod.catalogDrift({ tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+  ] })
+  check('只有可能涉及的：标题直说「Agent 可能查询的表有变化」', agentOnly?.title === '自发布以来，Agent 可能查询的表有变化：「订单」', agentOnly?.title)
+  const run = mod.decodeRun([{ seq: 1, type: 'catalog.drift', node_id: null, ts: 1, data: { version: 2, count: 1, tables: [
+    { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' }] } }])
+    .find((s) => s.code === 'catalog_drift')
+  check('……时间线里那一行同样是警告', run?.level === 'warn' && run?.title === agentOnly?.title, run?.title)
   check('形状不对不出行', mod.decodeRun([{ seq: 1, type: 'catalog.drift', node_id: null, ts: 1, data: { tables: 'x' } }])
     .every((s) => s.code !== 'catalog_drift'))
 })

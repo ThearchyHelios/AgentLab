@@ -87,6 +87,10 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def _item_value(notes: dict[str, Any], name: str) -> tuple[Any, str | None]:
     item = notes.get(name)
     if not isinstance(item, dict) or item.get("status") == "rejected":
@@ -169,7 +173,12 @@ def _invalid(e: catalog.CatalogInvalid) -> HTTPException:
 
 @router.get("/{source_id}/catalog")
 async def list_catalog(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """表清单：表结构里的每张表各一行（没有目录的也列），使用次数多的在前；目录还在、表已不在的排最后。"""
+    """表清单：表结构里的每张表各一行（没有目录的也列），使用次数多的在前；目录还在、表已不在的排最后。
+
+    探查结构每个源最多取 200 张表（introspect._MAX_TABLES），多出来的不在表结构里、这里也列不出：schema_truncated
+    说明有没有截断，schema_total 是数据库里一共几张表（含视图），界面据此说明「只探查了前 200 张」。老缓存没记
+    总数时按探查到的张数算。
+    """
     _, source = await _resolved(session, source_id)
     cache = source.schema_cache or {}
     tables = cache.get("tables") or {}
@@ -184,6 +193,8 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         "system_notes": catalog.system_notes_source(source),
         # 没有表结构时说明原因（尚未探查 / 探查失败），界面据此引导去探查
         "schema_note": None if tables else introspect.why_empty(cache),
+        "schema_truncated": bool(cache.get("truncated")),
+        "schema_total": max(_int(cache.get("total")), len(tables)),
     }
 
 

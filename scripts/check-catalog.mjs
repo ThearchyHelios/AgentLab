@@ -354,7 +354,11 @@ function listOf(state, src) {
   const all = state.tables[src]
   const rows = all.filter((t) => !t.missing).sort((a, b) => b.usage - a.usage).map(rowOf)
   rows.push(...all.filter((t) => t.missing).map(rowOf))
-  return { tables: rows, system_notes: isUpload(src), schema_note: all.length ? null : '尚未探查结构' }
+  // 探查结构截断了的源（state.schemaTotal 里给了数据库里的总数）：清单只有探查到的那部分
+  const explored = all.filter((t) => !t.missing).length
+  const total = state.schemaTotal?.[src] ?? explored
+  return { tables: rows, system_notes: isUpload(src), schema_note: all.length ? null : '尚未探查结构',
+    schema_truncated: total > explored, schema_total: total }
 }
 const detailOf = (src, t) => ({
   table_name: t.name, in_schema: !t.missing, notes: t.notes ?? {}, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
@@ -1224,6 +1228,38 @@ const profileBox = (page) => page.locator('[data-profile-dialog]')
 const profilePhase = (page) => profileBox(page).getAttribute('data-profile-dialog').catch(() => null)
 /** 报告里不该露的机读码：停止原因、跳过原因、状态、基数的英文值 */
 const PROFILE_CODE_RE = /\b(?:budget|deadline|failed|masked|too_large|high_cardinality|no_data|unsupported|verified|proposed|many_to_one|row_estimate)\b/
+
+await section('数据目录 · 只探查了一部分表', async () => {
+  // 探查结构每个数据源最多取 200 张表：多出来的不在清单里，助手也看不到。顶部要说出来，并给出下一步
+  const state = freshState()
+  const explored = state.tables[S1].filter((t) => !t.missing).length
+  const total = explored + 57
+  state.schemaTotal = { [S1]: total }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  const bar = page.locator('[data-catalog-schema-partial]')
+  check('顶部有一条说明', await bar.waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('……数字：一共几张、探查了几张', (await bar.getAttribute('data-catalog-schema-partial')) === `${total},${explored}`,
+    await bar.getAttribute('data-catalog-schema-partial'))
+  const text = await bar.innerText().catch(() => '')
+  check('……写成「共有 N 张表，只探查了前 M 张」', text.includes(`这个数据源共有 ${total} 张表，只探查了前 ${explored} 张`), text)
+  check('……说明为什么只取了这些、其余的助手也看不到', text.includes('最多取 200 张表') && text.includes('其余 57 张不在数据目录中')
+    && text.includes('助手也看不到'), text.replace(/\s+/g, ' '))
+  check('……给出下一步：换 schema 或缩小范围后重新探查', text.includes('换一个 schema') && text.includes('缩小范围')
+    && text.includes('探查结构'), text.replace(/\s+/g, ' '))
+  await shot(page, 'catalog-schema-partial')
+  await cleanCopy(page, '只探查了一部分表')
+  await bar.locator('[data-catalog-schema-partial-go]').click()
+  await page.waitForURL('**/data/databases', { timeout: 5000 }).catch(() => {})
+  check('……按钮回到数据源卡片', new URL(page.url()).pathname === '/data/databases', page.url())
+  // 没截断的库不出这一条
+  await goto(page, `/data/catalog/${S4}`)
+  await page.locator('[data-catalog-overview]').waitFor()
+  check('没截断的库不出这一条', await page.locator('[data-catalog-schema-partial]').count() === 0)
+  check('只读、不发写请求', writes(sent, /./).length === 0)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await close()
+})
 
 await section('数据目录 · 数据剖析设置', async () => {
   const state = freshState()

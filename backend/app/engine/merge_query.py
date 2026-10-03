@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.data import guard
-from app.data.engine import _jsonable, column_types, open_memory_sqlite
+from app.data.engine import RowCollector, _jsonable, column_types, open_memory_sqlite
 from app.data.guard import QueryLimits, SqlRejected
 from app.data.names import name_key
 from app.engine.direct_select import _kw, _lex, _Lex
@@ -343,24 +343,17 @@ def _authorize(action: int, *_args: Any) -> int:
 
 
 def _read(conn: sqlite3.Connection, stmt: str, limits: QueryLimits) -> tuple[list[str], list[list[Any]], bool]:
-    """逐行读、边读边判上限：和查询层（data.engine.run_query）同一个口径——到了行数或字节上限之后
-    确实还有下一行才记 truncated，恰好取满不算（截断的合并结果下游会拒收，误报就是拒了完整的结果）。"""
+    """逐行读、边读边判上限。判定调查询层的 RowCollector（data/engine.py），和 run_query 是同一份：到了行数或
+    字节上限之后确实还有下一行才记 truncated，恰好取满不算（截断的合并结果下游会拒收，误报就是拒了完整的结果）。"""
     cursor = conn.execute(stmt)
     columns = [str(d[0]) for d in cursor.description or []]
     if not columns:
         raise MergeError("合并 SQL 没有返回任何列")
-    rows: list[list[Any]] = []
-    size = 0
-    truncated = full = False
+    collected = RowCollector(limits)
     for row in cursor:
-        if full:
-            truncated = True
+        if not collected.take([_jsonable(v) for v in row]):
             break
-        values = [_jsonable(v) for v in row]
-        rows.append(values)
-        size += len(json.dumps(values, ensure_ascii=False, default=str))
-        full = len(rows) >= limits.max_rows or size >= limits.max_bytes
-    return columns, rows, truncated
+    return columns, collected.rows, collected.truncated
 
 
 def _sqlite_reason(e: sqlite3.Error, limits: QueryLimits) -> str:

@@ -7,7 +7,7 @@ import { ApiError, api } from '../../api/client'
 import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
 import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, toast, useTicker } from '../../components/ui'
 import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
-import { CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT } from '../../lib/terms'
+import { CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
 import { ProfileDialog } from './ProfileDialog'
@@ -308,6 +308,10 @@ export function CatalogPage() {
           </div>
         )}
       />
+      {hasTables && data?.schema_truncated && (
+        <SchemaPartialNotice total={data.schema_total ?? 0} explored={rows.filter((r) => r.in_schema).length}
+                             onGoSource={() => navigate(back)} />
+      )}
       {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={filter} onFocus={focusUsed} />}
       {body}
       {drafting && data && (
@@ -343,6 +347,29 @@ export function CatalogPage() {
         <ProfileSettingsDialog row={{ id: source.id, name: source.name, options }} onClose={() => setProfileSettingsOpen(false)}
                                onSaved={onProfileSettingsSaved} />
       )}
+    </div>
+  )
+}
+
+/**
+ * 表结构只探查了一部分（每个数据源最多取 200 张表）：没探查到的表不在清单里，助手也看不到。顶部常驻一条说明，
+ * 写清一共几张、探查了几张、为什么只取了这些，以及下一步——回到数据源卡片换 schema 或缩小范围后重新探查
+ */
+function SchemaPartialNotice({ total, explored, onGoSource }: { total: number; explored: number; onGoSource: () => void }) {
+  const shownTotal = Math.max(total, explored)
+  return (
+    <div className="flex shrink-0 items-start gap-2 border-b px-4 py-2 text-xs"
+         style={{ background: 'color-mix(in srgb, var(--st-waiting) 6%, var(--bg-panel))' }}
+         data-catalog-schema-partial={`${shownTotal},${explored}`}>
+      <Database size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
+      <div className="min-w-0 flex-1 leading-relaxed">
+        <p className="font-medium">{SPT.title(shownTotal, explored)}</p>
+        <p className="text-2xs text-dim">{SPT.body(Math.max(shownTotal - explored, 0))}</p>
+        <p className="text-2xs text-dim">{SPT.next}</p>
+      </div>
+      <button type="button" className="btn btn-sm shrink-0" onClick={onGoSource} data-catalog-schema-partial-go="">
+        {CT.back}
+      </button>
     </div>
   )
 }
