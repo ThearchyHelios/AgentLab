@@ -108,8 +108,10 @@ async def run_merge(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
              preview_rows=outcome.rows[:PREVIEW_ROWS], duration_ms=elapsed, query_artifact=artifact,
              lineage=outcome.lineage is not None)
     for warning in outcome.warnings:
+        # 结构化字段（keys、detail、rows、input、input_rows、duplicates、max_rows）随日志带上：界面读字段，不解析中文
+        fields = {k: v for k, v in warning.items() if k not in ("code", "message")}
         ctx.emit(EventType.LOG, level="warn", message=warning["message"],
-                 code=LOG_CODES.get(warning["code"], "merge_warning"))
+                 code=LOG_CODES.get(warning["code"], "merge_warning"), **fields)
 
     output: dict[str, Any] = {
         "artifact": artifact, "columns": outcome.columns, "rows": outcome.rows, "row_count": len(outcome.rows),

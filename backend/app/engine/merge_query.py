@@ -834,7 +834,8 @@ def _warnings(stmt: str, inputs: list[MergeInput], tables: dict[str, list[str]],
         else:
             tail = ("SQLite 比较时会做隐式转换：文本形式的编号（如 '001'、'01'）都会等于数值 1，也可能完全匹配不上。"
                     "请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换")
-        out.append({"code": "key_type_mismatch", "keys": [f"{a}.{ac}", f"{b}.{bc}"],
+        # keys、detail 是给界面读的结构化字段（运行时间线的标题、副标题），不让它从 message 里解析中文
+        out.append({"code": "key_type_mismatch", "keys": [f"{a}.{ac}", f"{b}.{bc}"], "detail": f"{left}，{right}",
                     "message": f"合并键类型不一致：{left}，{right}。{tail}"})
     largest = max(inputs, key=lambda inp: len(inp.snapshot["rows"]))
     biggest = len(largest.snapshot["rows"])
@@ -846,12 +847,13 @@ def _warnings(stmt: str, inputs: list[MergeInput], tables: dict[str, list[str]],
                     keys[alias].append(col)
         dups = [_duplicates(alias, snaps[alias], cols) for alias, cols in keys.items()]
         detail = "；".join(d for d in dups if d)
-        out.append({"code": "rows_grew", "message": (
+        out.append({"code": "rows_grew", "rows": len(rows), "input": largest.alias, "input_rows": biggest,
+                    **({"duplicates": detail} if detail else {}), "message": (
             f"合并结果有 {len(rows)} 行，多于行数最多的输入「{largest.alias}」（{biggest} 行）：合并键可能不唯一，"
             "同一行被重复匹配。" + (f"{detail}。" if detail else "")
             + "请检查合并条件是否覆盖了全部键（例如同时按日期和门店），或先在源库里聚合到相同粒度")})
     if truncated:
-        out.append({"code": "result_truncated", "message": (
+        out.append({"code": "result_truncated", "rows": len(rows), "max_rows": limits.max_rows, "message": (
             f"合并结果超过上限（{limits.max_rows} 行或约 {max(1, limits.max_bytes // 1_000_000)} MB），只保留了前 "
             f"{len(rows)} 行，下游拿到的不是完整结果。请在合并 SQL 中聚合或加条件缩小范围")})
     return out

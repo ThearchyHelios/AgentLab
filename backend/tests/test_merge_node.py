@@ -462,6 +462,12 @@ async def test_warnings_reach_the_output_and_the_events(monkeypatch, sources):
     logs = [e for e in await events(row.id, "log", "merge") if e.get("level") == "warn"]
     assert sorted(e["code"] for e in logs) == ["merge_key_type", "merge_rows_grew"]
     assert all(e["message"] for e in logs)
+    # 结构化字段随日志带上：运行时间线读字段，不从中文里解析
+    key = next(e for e in logs if e["code"] == "merge_key_type")
+    assert key["keys"] == ["s.门店", "v.门店"] and key["detail"].startswith("s.门店 是文本") and "v.门店 是数值" in key["detail"]
+    grew = next(e for e in logs if e["code"] == "merge_rows_grew")
+    assert grew["rows"] == done["rows"] and grew["input"] in ("s", "v") and isinstance(grew["input_rows"], int)
+    assert grew["rows"] > grew["input_rows"] and "有重复的键" in grew["duplicates"]
 
 
 async def test_rerunning_the_node_on_the_same_inputs_gives_the_same_snapshot(monkeypatch, sources):
