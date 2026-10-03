@@ -673,6 +673,7 @@ await section('数据目录 · 用到但没确认（顶部摘要）', async () =
   const usedCounts = await page.locator('[data-catalog-filter] [data-filter]').evaluateAll((els) => els.map((e) => e.innerText.replace(/\s+/g, '')))
   check('……筛选按钮上的数字按同一个口径算', usedCounts.includes(`没有目录${none}`) && usedCounts.includes(`全部${used.length}`), usedCounts.join('|'))
   check('……摘要上点中的那一段标为按下', await bar.locator('[data-usage-focus="none"]').getAttribute('aria-pressed') === 'true')
+  await shot(page, 'catalog-used-only')
   await page.locator('[data-catalog-used-only-clear]').click()
   const allNone = state.tables[S1].filter((t) => progress(t) === 'none').length
   check('取消「只看运行中查询过的表」：回到全部没有目录的表，摘要不再标按下', (await rowNames(page)).length === allNone
@@ -945,6 +946,7 @@ await section('数据目录 · 引用这张表的模板（影响面）', async (
     await until(async () => (await savedHint.count()) === 1)
     && (await savedHint.innerText()).includes('2 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化'),
     await savedHint.innerText().catch(() => ''))
+  await shot(page, 'catalog-saved-impact')
   await savedHint.locator('[data-catalog-saved-impact-show]').click()
   check('……点「查看模板」：焦点落到「引用这张表的模板」一栏', await until(async () => page.evaluate(() => document.activeElement?.id === 'catalog-sec-impact'), 2000))
   await savedHint.locator('[data-catalog-saved-impact-dismiss]').click()
@@ -1668,6 +1670,8 @@ await section('数据目录 · 数据剖析', async () => {
   check('……还没填的下一列照旧写待填写，焦点落在它的「填写含义」上', (await fillLine('ticket_type_id').locator('[data-codes-pending]').innerText()) === '2 个含义待填写'
         && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-profile-fill') === 'ticket_type_id'), 2000),
         await page.evaluate(() => document.activeElement?.outerHTML?.slice(0, 120) ?? ''))
+  if (SHOTS) await sleep(350)
+  await shot(page, 'catalog-profile-report-filled')
   await page.keyboard.press('Enter')
   const nextBox = page.locator('[data-codes-dialog="ticket_type_id"]')
   check('……回车接着填下一列', await until(async () => (await nextBox.count()) === 1))
