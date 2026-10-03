@@ -343,21 +343,23 @@ def _authorize(action: int, *_args: Any) -> int:
 
 
 def _read(conn: sqlite3.Connection, stmt: str, limits: QueryLimits) -> tuple[list[str], list[list[Any]], bool]:
-    """逐行读、边读边判上限：和查询层（data.engine.run_query）同一个口径，到了行数或字节上限就停，记 truncated。"""
+    """逐行读、边读边判上限：和查询层（data.engine.run_query）同一个口径——到了行数或字节上限之后
+    确实还有下一行才记 truncated，恰好取满不算（截断的合并结果下游会拒收，误报就是拒了完整的结果）。"""
     cursor = conn.execute(stmt)
     columns = [str(d[0]) for d in cursor.description or []]
     if not columns:
         raise MergeError("合并 SQL 没有返回任何列")
     rows: list[list[Any]] = []
     size = 0
-    truncated = False
+    truncated = full = False
     for row in cursor:
+        if full:
+            truncated = True
+            break
         values = [_jsonable(v) for v in row]
         rows.append(values)
         size += len(json.dumps(values, ensure_ascii=False, default=str))
-        if len(rows) >= limits.max_rows or size >= limits.max_bytes:
-            truncated = True
-            break
+        full = len(rows) >= limits.max_rows or size >= limits.max_bytes
     return columns, rows, truncated
 
 

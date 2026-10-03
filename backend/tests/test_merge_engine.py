@@ -213,6 +213,13 @@ def test_result_over_the_row_limit_is_truncated_and_warned():
     assert "result_truncated" in [w["code"] for w in out.warnings]
 
 
+def test_exactly_full_result_is_not_truncated():
+    """恰好取满上限、后面没有了：和查询层同一个口径，不算截断——截断的合并结果下游会拒收，误报就是把完整的结果拒了。"""
+    out = execute([sales(), visits()], "SELECT * FROM s CROSS JOIN v", limits=QueryLimits(max_rows=16))
+    assert out.truncated is False and len(out.rows) == 16
+    assert "result_truncated" not in [w["code"] for w in out.warnings]
+
+
 def test_byte_limit_matches_the_query_layer():
     out = execute([sales(), visits()], "SELECT * FROM s CROSS JOIN v", limits=QueryLimits(max_bytes=100))
     assert out.truncated is True and 0 < len(out.rows) < 16
