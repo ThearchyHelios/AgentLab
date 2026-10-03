@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import copilot_context
 from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
+# 摘要的预算和截断阈值随数据源上下文搬到了 copilot_context，这里留着老名字
+from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
+from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
 from app.db.base import get_session
@@ -61,12 +65,15 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any]) -> str:
+def _tool_catalog(rows: list[Any], context: copilot_context.DatasourceContext | None = None) -> str:
     """给 Copilot 看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
     （db_query__<源>），不补进来 Copilot 就不知道它们存在，只会退回让用户
     自己写 SQL 的代码节点——接了数据库等于白接。
+
+    「可查」后面列前 12 个对象。给了这一轮的数据源上下文时按它排：大库里按需求挑中的表排在前面
+    （DatasourceContext.listed），不然列出来的是表结构里排在最前的那几张，和需求未必相干。
     """
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
@@ -77,7 +84,7 @@ def _tool_catalog(rows: list[Any]) -> str:
     from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
 
     for row in rows:
-        tables = _introspect.table_names(row)
+        tables = context.listed(row) if context is not None else _introspect.table_names(row)
         listed = "、".join(tables[:12]) + (f" 等 {len(tables)} 个对象" if len(tables) > 12 else "")
         lines.append(
             f"- {QUERY_PREFIX}{row.name}（数据库）：在「{row.name}」上执行 SQL。"
@@ -90,53 +97,45 @@ def _tool_catalog(rows: list[Any]) -> str:
     return "\n".join(lines)
 
 
-# 数据源摘要的字符预算。超了就退成"只列对象名"，字段让 Copilot 用
-# db_schema 工具按需查。实测一个 53 对象的库带字段约 4000 字符，
-# 接三五个库就会把真正的需求淹掉——system prompt 里塞满 schema 而挤掉
-# 用户想要什么，是本末倒置。
-_DATASOURCE_BUDGET_CHARS = 6000
-# detail 模式下每个库最多列这么多对象（与 introspect.summary 的默认值一致）。
-# 超过就说明会截断，那还不如切紧凑模式把对象名列全。
-_DETAIL_TABLE_LIMIT = 40
+#: 带进挑表需求里的前几轮问题：追问常常只说「那上上个月呢」，光看这一句挑不出表
+_PICK_HISTORY_TURNS = 3
 
 
-def _datasource_section(rows: list[Any]) -> str:
-    """数据源与结构摘要。没有数据源时返回空串，不占 prompt。"""
-    from app.data import introspect as _introspect
+async def _pick_need(session: AsyncSession, payload: GenerateIn) -> str:
+    """挑表用的需求：这一轮的原话，问数据追问时再带上这次对话前几轮的问题。"""
+    from app.api.conversations import recent_turns
 
-    if not rows:
-        return ""
+    if not payload.conversation_id:
+        return payload.instruction
+    turns = await recent_turns(session, payload.conversation_id)
+    asked = [t.question for t in turns if t.question][-_PICK_HISTORY_TURNS:]
+    return payload.instruction + (PICK_HISTORY_PROMPT.format(questions="；".join(asked)) if asked else "")
 
-    # detail 模式每个库最多列 40 个对象，多出来的直接看不见。对象一多，
-    # "40 张表带字段"反而不如"全部表只给名字"——Copilot 找不到那张表，
-    # 字段写得再全也没用。所以超出截断阈值就整体切到紧凑模式。
-    detail = all(len(_introspect.table_names(row)) <= _DETAIL_TABLE_LIMIT for row in rows)
-    blocks = [_introspect.summary(row, detail=detail) for row in rows]
-    if detail and sum(len(b) for b in blocks) > _DATASOURCE_BUDGET_CHARS:
-        detail = False
-        blocks = [_introspect.summary(row, detail=False) for row in rows]
-    if not detail:
-        # Copilot 仍然知道有哪些对象可查，要字段时在图里放一个 db_schema 节点，
-        # 或者交给运行期的 agent 自己探
-        blocks.append(
-            "  （对象较多，上面只列了名字。写 SQL 前用 db_schema 工具确认字段，别猜）"
-        )
-    return (
-        "\n\n已接入的数据源（涉及取数时优先用它们，而不是让用户自己写 SQL 的代码节点）：\n"
-        + "\n".join(blocks)
-        + "\n\n写 SQL 的硬性要求：\n"
-        # 这三条都是真实踩过的：Oracle 上漏 schema 前缀直接 ORA-00942，
-        # 写惯 MySQL 的模型会顺手写 LIMIT，而一条没有行数限制的查询能拖垮生产库
-        "- 表名照抄上面的全名（含 schema 前缀），漏掉前缀在 Oracle 上会直接报 ORA-00942\n"
-        "- 认准方言：Oracle 用 FETCH FIRST n ROWS ONLY，不是 LIMIT\n"
-        "- 一次只写一条语句；分号拼接会被拒\n"
-        "- 字段拿不准就在图里先放一个 db_schema 工具节点，别猜字段名\n"
-        # 真实踩过：列名是照着业务说法猜的，跑到查库那一步才「no such column」
-        "- 列名只照上面结构里列出来的写；结构里只列了表名时先用 db_schema 查字段。搭完自查会拿 SQL 里的列名"
-        "去对结构，对不上会打回来让你改\n"
-        "- 比率、增幅、占比这类派生计算进口径卡（metrics 节点）；查询结果里原样的数，报告撰写节点（report）"
-        "可以直接用 [[v:Q1.r0.列名]] 引用。别让 llm 节点直接对数字做算术\n"
-    )
+
+PICK_HISTORY_PROMPT = "\n（这次对话之前问过：{questions}）"
+
+
+async def _picker(session: AsyncSession, payload: GenerateIn,
+                  plan: copilot_context.ContextPlan) -> tuple[Any | None, str | None]:
+    """挑表用的模型：同一个助手模型（copilot_model_spec），思考、额度在 pick_model 里调。不用挑表时不拿。"""
+    if not plan.needs_pick:
+        return None, None
+    spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
+    return await copilot_context.pick_model(session, spec)
+
+
+async def _datasource_context(
+    session: AsyncSession, sources: list[Any], payload: GenerateIn, *, need: str,
+    graph: dict[str, Any] | None,
+) -> copilot_context.DatasourceContext:
+    """这一轮的数据源上下文：读目录、大库按需求挑表、组装（copilot_context）。挑表失败退回只列表名，不抛异常。
+
+    非流式生成、发布前修复、升级都走这里；流式生成把三步拆开，挑表放进流里（期间发心跳）。
+    graph 是现有工作流：它的 SQL 查过的表一律给全字段。
+    """
+    plan = await copilot_context.plan_context(sources, graph=graph)
+    picker, unavailable = await _picker(session, payload, plan)
+    return await plan.resolve(picker, need=need, unavailable=unavailable)
 
 
 NODE_REFERENCE = """\
@@ -662,8 +661,18 @@ async def generate(
     """
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
-    tool_list = _tool_catalog(sources)
-    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
+    # 先拿模型：没配好就直接 400，不白花一次挑表
+    try:
+        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
+    except ProviderNotConfigured as e:
+        raise HTTPException(400, _unconfigured(e)) from e
+    # 和流式生成同一套数据源上下文
+    context = await _datasource_context(
+        session, sources, payload, need=await _pick_need(session, payload),
+        graph=payload.base_graph if (payload.base_graph or {}).get("nodes")
+        else await _previous_graph(session, payload.conversation_id))
+    tool_list = _tool_catalog(sources, context)
+    datasources = context.section() + _scope_note(sources, scope is not None)
 
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求产出一张可执行的工作流图。\n\n"
@@ -685,11 +694,6 @@ async def generate(
         )
     else:
         user = _user_message(payload, patch=False)
-
-    try:
-        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
-    except ProviderNotConfigured as e:
-        raise HTTPException(400, _unconfigured(e)) from e
 
     messages = [("system", system),
                 ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
@@ -1034,13 +1038,16 @@ async def _iter_ops(model: Any, messages: list[Any]):
 _HEARTBEAT_SECONDS = 3.0
 
 
-async def _with_heartbeat(source: Any, phase: str = "planning"):
+async def _with_heartbeat(source: Any, phase: str = "planning", *, started: float | None = None):
     """模型沉默时按拍补心跳，让前端能显示阶段和已用时长。
 
     必须在这一层做而不是在 _iter_ops 里判断时间差：模型不吐 chunk 时那个
     async for 的循环体根本不执行，压根轮不到检查。
+
+    started 给了就从那一刻算已用时长：流式生成先挑表、再起草，两段的心跳要接着算，
+    不能起草一开始就跳回 0 秒。
     """
-    started = time.monotonic()
+    started = time.monotonic() if started is None else started
     iterator = source.__aiter__()
     while True:
         pending = asyncio.ensure_future(iterator.__anext__())
@@ -1066,6 +1073,18 @@ async def _with_heartbeat(source: Any, phase: str = "planning"):
                 "phase": phase,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
+
+
+async def _heartbeat_until(task: asyncio.Future, *, started: float, phase: str = "planning"):
+    """等 task 做完，期间按拍出心跳（同 _with_heartbeat）。结果由调用方取 task.result()。
+
+    流式生成在流里挑表时用：挑表最长要等 copilot_context.PICK_TIMEOUT_S，这段时间不出声，
+    前端就只能干挂着「正在连接模型」。阶段算「理解需求」：挑表正是在读需求。
+    """
+    while not task.done():
+        done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
+        if not done:
+            yield {"op": "heartbeat", "phase": phase, "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
 
 #: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是
@@ -1578,6 +1597,12 @@ def dropped_tool_warnings(changes: list[dict[str, Any]], instruction: str) -> li
 def _repair_request(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[dict[str, Any]],
 ) -> str:
+    """自查交回修正的请求：只写图和问题。
+
+    数据源上下文（挑中的表、字段、目录、连接条件）在 system 里，修正轮和起草用同一条 system，
+    不重新挑表：两次挑出来的表不一样，模型前后看到的结构就对不上，改着改着换了一张表。
+    猜错的列名由 sql_unknown_column 的 for_model 带回那几张表的真实列。
+    """
     graph = {"nodes": list(nodes.values()), "edges": edges}
     return (
         "这是你刚搭好的工作流：\n"
@@ -1601,19 +1626,20 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
 
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
-    tool_list = _tool_catalog(sources)
-    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
-    system = (
-        "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
-        "结构要求：\n"
-        "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
-        "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
-        "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
-        "4. 只能用上面列出的工具名\n"
-        "5. 能用 3 个节点解决就别堆 8 个\n\n"
-        f"{_STREAM_PROTOCOL}"
-    )
+
+    def system_for(context: copilot_context.DatasourceContext) -> str:
+        return (
+            "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
+            f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}"
+            f"{context.section()}{_scope_note(sources, scope is not None)}\n\n"
+            "结构要求：\n"
+            "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
+            "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
+            "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
+            "4. 只能用上面列出的工具名\n"
+            "5. 能用 3 个节点解决就别堆 8 个\n\n"
+            f"{_STREAM_PROTOCOL}"
+        )
 
     # 现有图状态：修改场景从 base_graph 起步，新建场景从空图起步
     nodes: dict[str, dict[str, Any]] = {}
@@ -1641,13 +1667,18 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
 
-    messages = [("system", system),
-                ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
+    human = _with_history(user, await _history_section(session, payload.conversation_id))
     # 兜底用：模型只发了改动操作时，把它们重放到这张图上
     prev_graph = await _previous_graph(session, payload.conversation_id)
     # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
     baseline = copy.deepcopy(
         (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
+    # 数据源上下文：读目录、拿挑表模型都要用请求的会话，开流之前做完；挑表本身放进流里，期间照常发心跳。
+    # 现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表一律给全字段
+    plan = await copilot_context.plan_context(
+        sources, graph=payload.base_graph if (payload.base_graph or {}).get("nodes") else prev_graph)
+    picker, unavailable = await _picker(session, payload, plan)
+    need = await _pick_need(session, payload)
 
     async def event_stream():
         explanation = ""
@@ -1656,8 +1687,25 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 建完要不要跑，由模型在 done.run 里表态
         autorun = True
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
+        # 大库先按需求挑表。resolve 自己兜住了挑表的所有失败（退回只列表名），这里的 except 只防组装出意外：
+        # 挑表是让模型少猜，不能因为它让这一轮生成失败
+        started = time.monotonic()
+        pending = asyncio.ensure_future(plan.resolve(picker, need=need, unavailable=unavailable))
         try:
-            async for op in _with_heartbeat(_iter_ops(model, messages)):
+            async for beat in _heartbeat_until(pending, started=started):
+                yield _sse(beat)
+            context = pending.result()
+        except Exception as e:  # noqa: BLE001
+            context = plan.fallback(f"组装数据源上下文时出错：{explain_error(e)[0]}")
+        finally:
+            # 用户中途断开时流在上面的 yield 处被关掉，挑表的调用不能留在后台接着等
+            if not pending.done():
+                pending.cancel()
+        # 这一份 system 一直用到最后：自查交回修正时沿用同一份上下文，不重新挑表
+        system = system_for(context)
+        messages = [("system", system), ("human", human)]
+        try:
+            async for op in _with_heartbeat(_iter_ops(model, messages), started=started):
                 kind = op.get("op")
                 # 思考和心跳不是图操作，不进 _apply_op，直接转给前端
                 if kind in ("thinking", "heartbeat"):
@@ -1847,6 +1895,12 @@ def _publish_fix_request(graph: dict[str, Any], errors: list[dict[str, Any]], le
     )
 
 
+def _publish_fix_need(errors: list[dict[str, Any]], level: str) -> str:
+    """发布前修复挑表用的需求：要过哪一级的发布前检查、挡着的是哪些问题。"""
+    return (f"让这张工作流通过「{_LEVEL_WORD.get(level, level)}」级别的发布前检查，挡住发布的问题：\n"
+            + "\n".join(f"- {_issue_line(i)}" for i in errors))
+
+
 async def assist_publish_fix(
     session: AsyncSession, graph: dict[str, Any], *, level: str,
     provider: str | None = None, model: str | None = None,
@@ -1874,16 +1928,18 @@ async def assist_publish_fix(
     if not errors:
         out["summary"] = "没有阻止发布的错误，无需交给助手"
         return out
+    request = GenerateIn(instruction="发布前自动修复", provider=provider, model=model)
     try:
-        chat, _ = await _op_model(
-            session, GenerateIn(instruction="发布前自动修复", provider=provider, model=model))
+        chat, _ = await _op_model(session, request)
     except ProviderNotConfigured as e:
         out["summary"] = _unconfigured(e)
         return out
+    # 和画布上改图同一套数据源上下文：挑表的需求是挡住发布的这些问题，图里查过的表一律给全字段
+    context = await _datasource_context(session, sources, request, need=_publish_fix_need(errors, level), graph=base)
 
     system = (
         "你是一个 agent 工作流编排专家。现在要做的是：让一张工作流过发布前检查，以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
         f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
     )
     nodes = copy.deepcopy(before_nodes)
@@ -2006,6 +2062,12 @@ def _upgrade_assist_request(graph: dict[str, Any], spec: GraphSpec, feeders: lis
     )
 
 
+def _upgrade_need(feeders: list[Any]) -> str:
+    """升级挑表用的需求：哪几段沙箱代码要改写成口径卡表达式（改写要用到上游查库节点查出的列）。"""
+    return ("把喂给口径卡的纯算术沙箱代码改写成口径卡表达式，表达式直接读上游查库节点查出的列。涉及的代码节点："
+            + "、".join(f"「{code.title}」" for code, _cards in feeders))
+
+
 def _kept_code(spec: GraphSpec) -> list[str]:
     """assist 之后仍然喂着口径卡的计算角色沙箱代码：不是纯算术、或者 Copilot 拿不准的，保留原样并警告。"""
     from app.engine.upgrade import compute_feeders
@@ -2048,17 +2110,19 @@ async def assist_upgrade(
                                    defaults=defaults) or []
     known = {_sig(e) for e in base_errors}
     out["warnings"] = _kept_code(spec)
+    request = GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model)
     try:
-        chat, _ = await _op_model(
-            session, GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model))
+        chat, _ = await _op_model(session, request)
     except ProviderNotConfigured as e:
         out.update(ok=False, summary=_unconfigured(e))
         return out
+    # 同一套数据源上下文：改写时要用到查库节点查出的列，图里查过的表一律给全字段
+    context = await _datasource_context(session, sources, request, need=_upgrade_need(feeders), graph=base)
 
     system = (
         "你是一个 agent 工作流编排专家。现在要做的是：把一张工作流里喂给口径卡的纯算术沙箱代码改写成口径卡表达式，"
         "以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
         f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
     )
     nodes = copy.deepcopy(before_nodes)
