@@ -116,6 +116,9 @@ async def test_read_catalog_lists_all_tables_of_a_source():
     ({"formula": _label("sum(amount)")}, "formula"),                                         # 目录不放公式
     ({"relations": [{"id": "r1", "columns": ["a"], "to_table": "t", "to_columns": [],
                      "source": "fk", "status": "verified"}]}, "关联关系 r1"),
+    # 基数是否用数据核实过（数据剖析写）：只能是 true / false
+    ({"relations": [{"id": "r1", "columns": ["a"], "to_table": "t", "to_columns": ["id"], "cardinality": "many_to_one",
+                     "source": "profile", "status": "verified", "cardinality_checked": "yes"}]}, "关联关系 r1"),
 ])
 def test_validate_rejects_malformed_notes(notes, fragment):
     problems = catalog.validate_notes(notes)
@@ -134,7 +137,10 @@ def test_validate_accepts_full_example():
                                "codes": _label({"1": "有效"}, "comment", "proposed")}},
         "relations": [{"id": catalog.relation_id("visits", ["store_id"], "stores", ["id"]), "columns": ["store_id"],
                        "to_table": "stores", "to_columns": ["id"], "cardinality": "many_to_one", "coverage": None,
-                       "source": "fk", "status": "verified"}],
+                       "source": "fk", "status": "verified"},
+                      {"id": catalog.relation_id("visits", ["gate_id"], "gates", ["id"]), "columns": ["gate_id"],
+                       "to_table": "gates", "to_columns": ["id"], "cardinality": "many_to_one", "coverage": 1.0,
+                       "source": "profile", "status": "verified", "cardinality_checked": True}],
     }
     assert catalog.validate_notes(notes) == []
 

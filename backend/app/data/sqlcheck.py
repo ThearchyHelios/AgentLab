@@ -16,7 +16,10 @@
 - wrong_date_column：表定义了业务日期，查询却按这张表的另一个时间列分组或筛选。
 
 **级别看依据。** 依据全是 confirmed / verified（人工确认、外键约束、数据剖析）时，fanout_sum、stock_summed 是 error，
-其余是 warning；依据里有 proposed（命名推断、模型起草）就一律降为 info。join_unconfirmed 反过来看：对上推断的关系是
+其余是 warning；依据里有 proposed（命名推断、模型起草）就一律降为 info。fanout_sum 另有一道门槛：error 只给「一对多
+确有其事」的——那条一对多的关系人工确认过，或者数据剖析在数据上核实过子表一侧的键不唯一（关系上的
+cardinality_checked）。只凭外键约束推出的一对多降为 warning、说「可能重复计算」：外键只保证父键唯一，子表一侧完全
+可能每个键恰好一行，照「会重复计算」报错就是误报，还会让出具降档。join_unconfirmed 反过来看：对上推断的关系是
 info，什么都对不上是 warning，对上有确证的关系不报。rejected 的项一律视而不见（catalog.visible_notes），被驳回的关系
 既不算「对上了」，也不拿来判断基数。
 
@@ -50,7 +53,8 @@ CHECK_CODES = ("fanout_sum", "stock_summed", "join_unconfirmed", "ratio_aggregat
                "unknown_code", "wrong_date_column")
 #: 结果的级别，从重到轻
 LEVELS = ("error", "warning", "info")
-#: 依据有确证时报 error 的规则：它们算出来的数必然是错的。其余规则只是「很可能不对」
+#: 依据有确证时报 error 的规则：照这样写，算出来的数很可能是错的。其余规则只是「可能不对」。
+#: fanout_sum 另要那条一对多的基数人工确认过、或用数据核实过（_ScopeCheck.fanout）
 _ERROR_CODES = frozenset({"fanout_sum", "stock_summed"})
 _STRONG = frozenset({"confirmed", "verified"})
 _STATUS_RANK = {"confirmed": 3, "verified": 2, "proposed": 1}
@@ -700,6 +704,12 @@ class _ScopeCheck:
                                           [status] + [e.status for e in path], counting=isinstance(node, exp.Count)))
         return out
 
+    @staticmethod
+    def _one_to_many_established(edge: catalog.JoinEdge) -> bool:
+        """这条一对多是不是确有其事：人工确认过（基数是人定的），或者数据剖析在数据上核实过子表一侧的键不唯一
+        （cardinality_checked）。外键约束、命名推断给的基数只是按表结构推的：子表一侧可能每个键恰好一行。"""
+        return edge.status == "confirmed" or edge.cardinality_checked
+
     def _fanout_basis(self, table: _Table, columns: list[str], *, counting: bool) -> tuple[str, str] | None:
         """参数里能说明「这是一张表自己的数」的那一列和它的依据：求和看度量类型（流量、存量），
         计数另外认标识列和业务主键（数订单数却数成了明细行数）。"""
@@ -717,6 +727,18 @@ class _ScopeCheck:
                       path: list[catalog.JoinEdge], statuses: list[str], *, counting: bool) -> SqlCheck:
         what = "计数" if counting else "求和"
         excerpt = self.excerpt(node)
+        level = _level("fanout_sum", statuses)
+        if not self._one_to_many_established(path[-1]):
+            # 只凭表结构推出的一对多：不说「会重复计算」，最多是提醒；下一步先确认是不是真的一对多
+            return SqlCheck(
+                code="fanout_sum", level="warning" if level == "error" else level, table=table.name, column=column,
+                relation_id=path[-1].relation_id, sql_excerpt=excerpt,
+                message=(f"按表结构，「{via.label()}」关联「{many.label()}」是一对多，"
+                         f"对「{table.label()}」的「{table.column_label(column)}」{what}可能重复计算。"
+                         f"请确认关联表「{many.label()}」里每个键只有一行，或先汇总再关联"),
+                for_model=(f"按表结构，{via.name} 关联 {many.name} 是一对多（这个基数没用数据核对过），"
+                           f"{excerpt or what} 可能把 {table.name}.{column} 重复计算。确认 {many.name} 里每个关联键"
+                           f"只有一行；不确定就先在子查询里把 {many.name} 汇总成每条 {via.name} 一行再关联"))
         if via.alias == table.alias:
             head = f"「{table.label()}」关联「{many.label()}」是一对多，"
             model_head = f"{table.name} 关联 {many.name} 是一对多（一行 {table.name} 对多行 {many.name}），"
@@ -740,7 +762,7 @@ class _ScopeCheck:
             model_fix = (f"先在子查询里把 {many.name} 按关联列汇总成每条 {via.name} 一行再关联；用不到 {many.name} 的列"
                          f"就去掉这个关联")
         return SqlCheck(
-            code="fanout_sum", level=_level("fanout_sum", statuses), table=table.name, column=column,
+            code="fanout_sum", level=level, table=table.name, column=column,
             relation_id=path[-1].relation_id, sql_excerpt=excerpt,
             message=f"{head}对「{table.label()}」的「{table.column_label(column)}」{what}会重复计算。{fix}",
             for_model=f"{model_head}{excerpt or what} 会把 {table.name}.{column} 重复计算。{model_fix}")

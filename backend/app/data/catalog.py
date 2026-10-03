@@ -18,7 +18,11 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
                        "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写；项上可带 complete: true，
                                   表示已列出全部取值)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
-                    "source", "status", "note"?}]}
+                    "source", "status", "note"?, "cardinality_checked"?}]}
+
+关系上的 cardinality_checked: true 只由数据剖析写：基数是用数据核实的（子表一侧数过 COUNT 和 COUNT(DISTINCT)，
+或者有主键、唯一约束）。外键约束、命名推断给的基数是按表结构推的，子表一侧可能每个键恰好一行；SQL 检查只在
+基数用数据核实过、或者人工确认过时，才把一对多关联后的重复计算报成错误（data/sqlcheck.py）。
 
 来源（source）：comment 数据库注释、fk 外键约束、name 命名推断、profile 数据剖析（data/catalog_profile.py）、
 llm 模型起草、human 人工填写。状态（status）：proposed 推断（命名推断、模型起草、数据库注释）、verified 有确证
@@ -88,7 +92,7 @@ _ITEM_KEYS = frozenset({"value", "source", "status", "note", "updated_at"})
 #: 没截断地看完了全表取值时才有；没有它的码值表只是「已知的一部分」，SQL 检查不能拿它判断某个值「不在码值表里」
 _CODES_ITEM_KEYS = _ITEM_KEYS | {"complete"}
 _RELATION_KEYS = frozenset({"id", "columns", "to_table", "to_columns", "cardinality", "coverage", "source",
-                            "status", "note", "updated_at"})
+                            "status", "note", "updated_at", "cardinality_checked"})
 _BUSINESS_DATE_KEYS = frozenset({"column", "rule", "timezone"})
 #: 文本项的长度上限。目录是给模型和人读的短说明，长篇大论放口径卡或知识库
 _TEXT_MAX = 500
@@ -293,6 +297,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}的状态「{rel.get('status')}」不在可选值内")
     if "note" in rel and not isinstance(rel["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "cardinality_checked" in rel and not isinstance(rel["cardinality_checked"], bool):
+        problems.append(f"{where}的「基数已用数据核实」应为是或否")
     if "updated_at" in rel and not isinstance(rel["updated_at"], str):
         problems.append(f"{where}的修改时间应为文字")
     return problems
@@ -742,7 +748,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     for key, item in new.items():
         prev = old.get(key)
         if prev is None or _edit_value(key, item) != _edit_value(key, prev):
-            fresh = {k: v for k, v in item.items() if k != "updated_at"}
+            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数
+            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked")}
             fresh.update(source="human", status="confirmed", updated_at=at)
             out[key] = fresh
             continue
@@ -2028,7 +2035,8 @@ _FLIP = {"many_to_one": "one_to_many", "one_to_many": "many_to_one", "one_to_one
 class JoinEdge:
     """关系图里的一条有向边：从 from_table 的 from_columns 连到 to_table 的 to_columns。
 
-    每条关系在图里有正反两条边；cardinality 是从 from_table 看过去的基数。
+    每条关系在图里有正反两条边；cardinality 是从 from_table 看过去的基数。cardinality_checked：基数是数据剖析
+    用数据核实的（关系上的同名字段），不是按表结构推的。
     """
 
     from_table: str
@@ -2039,10 +2047,11 @@ class JoinEdge:
     cardinality: str | None
     source: str
     status: str
+    cardinality_checked: bool = False
 
     def reversed(self) -> "JoinEdge":
         return JoinEdge(self.to_table, self.to_columns, self.from_table, self.from_columns, self.relation_id,
-                        _FLIP.get(self.cardinality or ""), self.source, self.status)
+                        _FLIP.get(self.cardinality or ""), self.source, self.status, self.cardinality_checked)
 
     def condition(self) -> str:
         """连接条件：visits.id = channel_visits.visit_id（多列用 AND 连接）。"""
@@ -2086,7 +2095,7 @@ def relation_graph(notes_by_table: Mapping[str, Mapping[str, Any]], *,
             continue
         edge = JoinEdge(table, tuple(rel.get("columns") or ()), str(rel.get("to_table")),
                         tuple(rel.get("to_columns") or ()), rid, rel.get("cardinality"), str(rel.get("source")),
-                        str(rel.get("status")))
+                        str(rel.get("status")), rel.get("cardinality_checked") is True)
         graph.setdefault(edge.from_table, []).append(edge)
         graph.setdefault(edge.to_table, []).append(edge.reversed())
     return graph

@@ -113,10 +113,19 @@ async def test_fanout_count_of_the_one_side_key(cache):
 
 
 async def test_fanout_through_two_hops_with_an_inferred_foreign_key(cache):
-    """支付记录没写目录：订单 → 支付记录的关系按外键现推（verified），明细经订单连支付记录，明细的金额照样重复。"""
+    """支付记录没写目录：订单 → 支付记录的关系按外键现推（verified），明细经订单连支付记录，明细的金额可能重复。
+    这条一对多只是按外键推的（没用数据核对过子表一侧），所以是 warning（A6）。"""
     sql = ("SELECT SUM(i.amount) FROM order_items i JOIN orders o ON o.id = i.order_id "
            "JOIN payments p ON p.order_id = o.id WHERE o.status = 1")
     [check] = [c for c in run(cache, sql) if c.code == "fanout_sum"]
+    assert (check.level, check.table, check.column) == ("warning", "order_items", "amount")
+    assert "可能重复计算" in check.message and "「订单」关联「payments」" in check.message
+    # 人工确认了支付记录 → 订单这条关系（基数是人定的）：一对多确有其事，error，说清明细怎么随之重复
+    notes = scenic_notes.notes()
+    notes["payments"] = {"relations": [scenic_notes._rel("payments", ["order_id"], "orders", ["id"], "many_to_one",
+                                                         "confirmed")]}
+    checker = SqlChecker(kind="sqlite", schema_cache=cache, notes=notes, source_name="scenic")
+    [check] = [c for c in checker.check(sql) if c.code == "fanout_sum"]
     assert (check.level, check.table, check.column) == ("error", "order_items", "amount")
     assert "「订单」关联「payments」是一对多，「订单明细」的每一行会随之重复" in check.message
     assert "去掉与「payments」的关联" in check.message
@@ -156,7 +165,9 @@ async def test_fanout_sum_negative(cache, sql):
 
 async def test_fanout_level_follows_the_status_of_its_basis(cache):
     sql = FANOUT[0]
-    assert ("fanout_sum", "error", "orders", "total_amount") in found(cache, sql, "verified")
+    assert ("fanout_sum", "error", "orders", "total_amount") in found(cache, sql, "confirmed")
+    # 外键 + verified：一对多只是按表结构推的，降为 warning（A6，见下一个测试）
+    assert ("fanout_sum", "warning", "orders", "total_amount") in found(cache, sql, "verified")
     assert ("fanout_sum", "info", "orders", "total_amount") in found(cache, sql, "proposed")
     # 关系确认了、度量类型只是推断：依据里有推断就降为 info
     assert ("fanout_sum", "info", "orders", "total_amount") in found(
@@ -167,6 +178,37 @@ async def test_fanout_level_follows_the_status_of_its_basis(cache):
     assert ("join_unconfirmed", "warning", "order_items", None) in rejected
     # 度量类型被驳回：不知道订单金额能不能加，不报
     assert "fanout_sum" not in codes(cache, sql, override={("orders", "columns.total_amount.measure"): "rejected"})
+
+
+def _checked(table_notes: dict, rid: str, *, source: str = "profile") -> dict:
+    """把一条关系记成「剖析用数据核实过基数」（cardinality_checked），不改入参。"""
+    import copy
+
+    out = copy.deepcopy(table_notes)
+    rel = next(r for r in out["relations"] if r["id"] == rid)
+    rel.update(source=source, status="verified", cardinality_checked=True)
+    return out
+
+
+async def test_fanout_error_only_when_one_to_many_is_established(cache):
+    """A6：error 只给「一对多确有其事」——剖析在数据上核实过子表一侧的键不唯一，或者人工确认过基数。
+    只凭外键结构推出的一对多（子表一侧可能每个键恰好一行）降为 warning，说法是「可能重复计算」。"""
+    sql = FANOUT[0]
+    # 外键 + verified：基数是按表结构推的，没用数据核对过 → warning，不说「会重复计算」
+    [fk] = [c for c in run(cache, sql, "verified") if c.code == "fanout_sum"]
+    assert (fk.level, fk.table, fk.column) == ("warning", "orders", "total_amount")
+    assert "可能重复计算" in fk.message and "会重复计算" not in fk.message
+    assert "确认关联表" in fk.message and "每个键只有一行" in fk.message and "先汇总再关联" in fk.message
+    assert "必然" not in fk.message and "必然" not in fk.for_model
+    # 剖析核实过（关系上记 cardinality_checked）→ error
+    profiled = scenic_notes.notes("verified")
+    profiled["order_items"] = _checked(profiled["order_items"], ORDER_ITEMS_TO_ORDERS)
+    checker = SqlChecker(kind="sqlite", schema_cache=cache, notes=profiled, source_name="scenic")
+    [hit] = [c for c in checker.check(sql) if c.code == "fanout_sum"]
+    assert hit.level == "error" and "会重复计算" in hit.message
+    # 人工确认过基数（关系是 confirmed）→ error
+    assert ("fanout_sum", "error", "orders", "total_amount") in found(
+        cache, sql, "verified", override={("order_items", f"relations.{ORDER_ITEMS_TO_ORDERS}"): "confirmed"})
 
 
 # --------------------------------------------------------------------------

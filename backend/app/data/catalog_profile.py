@@ -526,6 +526,9 @@ class _RelationOutcome:
     sample: int
     matched: int
     note: str
+    #: 基数是用数据核实的：子表一侧是否唯一有了定论（主键、唯一约束，或数过 COUNT 和 COUNT(DISTINCT)）。
+    #: 子表太大、没数成的按多对一记，但不算核实——SQL 检查据此不把一对多关联后的重复计算报成错误
+    cardinality_checked: bool = False
 
 
 @dataclass
@@ -752,9 +755,10 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
     note = _relation_note(cx.day, sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
                           skipped_values=len(values) - len(literals), parent=parent_unique, child=child_unique,
                           holds=holds)
+    checked = child_unique is not None and child_unique[0] is not None
     out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=coverage,
                                           cardinality=cardinality, holds=holds, sample=len(literals),
-                                          matched=matched, note=note))
+                                          matched=matched, note=note, cardinality_checked=checked))
 
 
 # ==========================================================================
@@ -953,6 +957,8 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
         changed = True
     if rel.get("cardinality") is None and o.cardinality is not None:
         rel["cardinality"] = o.cardinality
+        if o.cardinality_checked:
+            rel["cardinality_checked"] = True
         changed = True
     note = rel.get("note")
     if (not note or str(note).startswith(NOTE_PREFIX)) and not catalog.same_profile_note(note, o.note):
@@ -992,7 +998,9 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
         status = "verified" if o.holds else "proposed"
         relations.append({"id": o.rid, "columns": list(rel["columns"]), "to_table": rel["to_table"],
                           "to_columns": list(rel["to_columns"]), "cardinality": o.cardinality,
-                          "coverage": o.coverage, "source": "profile", "status": status, "note": o.note})
+                          "coverage": o.coverage, "source": "profile", "status": status, "note": o.note,
+                          # 只在基数用数据核实过时有这个键：没核实的关系和以前一字不差
+                          **({"cardinality_checked": True} if o.cardinality_checked else {})})
         findings.append(_relation_finding(o, rel, status=status, confirmed=False))
     for rid in out.keep_relations:
         rel = current.get(rid)

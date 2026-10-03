@@ -194,9 +194,12 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
         assert (rel["source"], rel["status"]) == ("profile", "verified")
         assert rel["coverage"] == 1.0 and rel["cardinality"] == "many_to_one"
         assert "数据剖析" in rel["note"] and "抽样" in rel["note"]
+        # 子表一侧数过 COUNT 和 COUNT(DISTINCT)、确有重复：基数是用数据核实的（A6，一对多关联的检查据此给 error）
+        assert rel["cardinality_checked"] is True
     # 外键约束来的关系不动：外键是外键，剖析是剖析
     park = _relation(notes, "park_id")
     assert (park["source"], park["status"], park["coverage"]) == ("fk", "verified", None)
+    assert "cardinality_checked" not in park              # 外键的基数是按表结构推的，没用数据核对
 
     # 状态列：码值候选，值有了、含义留空，推断
     codes = notes["columns"]["status"]["codes"]
@@ -265,6 +268,8 @@ async def test_confirmed_relation_only_gets_coverage_and_cardinality(client, mak
     rel = _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")
     assert (rel["source"], rel["status"]) == ("name", "confirmed")
     assert rel["coverage"] == 1.0 and rel["cardinality"] == "many_to_one"
+    # 人定的基数不改；原来就有基数（命名推断记的多对一），剖析也不给它记「用数据核实过」
+    assert "cardinality_checked" not in rel
     finding = next(f for f in _table(r.json(), "visits")["findings"] if f.get("columns") == ["gate_id"])
     assert finding["status"] == "confirmed" and finding["confirmed"] is True
 
@@ -376,9 +381,10 @@ async def test_large_tables_get_no_full_scans(client, make_source, scenic_db, sp
     assert not any("MIN(" in s for s in on_visits)
     assert "too_large" in _reasons(visits)
     assert any("太大" in s["detail"] or "上限" in s["detail"] for s in visits["skipped"] if s["reason"] == "too_large")
-    # 父表有主键，覆盖率又够：照样有确证；子表一侧没核对唯一，按多对一记
+    # 父表有主键，覆盖率又够：照样有确证；子表一侧没核对唯一，按多对一记，不算用数据核实过基数
     rel = _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")
     assert rel["status"] == "verified" and rel["cardinality"] == "many_to_one"
+    assert not rel.get("cardinality_checked")
 
 
 # ---------------------------------------------------------------- 接口

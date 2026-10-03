@@ -2637,6 +2637,11 @@ export interface CatalogRelation {
   status: CatalogStatus
   note?: string
   updated_at?: string
+  /**
+   * 基数是数据剖析用数据核实的（子表一侧数过是否唯一），只由剖析写。外键、命名推断的基数没有这个键。
+   * 一对多关联后重复计算的检查只在它为真、或者关系人工确认过时报「错误」，否则最多是「提醒」
+   */
+  cardinality_checked?: boolean
 }
 
 /** 一张表的目录（notes）。字段固定，服务端不认识的一律拒收 */
@@ -2949,7 +2954,7 @@ export interface CatalogProfileOut {
 export type SqlCheckCode = 'fanout_sum' | 'stock_summed' | 'join_unconfirmed' | 'ratio_aggregated' | 'missing_valid_filter'
   | 'unknown_code' | 'wrong_date_column'
 
-/** error：依据有确证、结果必然有误；warning：依据有确证、很可能有误；info：依据只是推断 */
+/** error：依据已核实、结果很可能有误；warning：依据有确证、结果可能有误；info：依据只是推断 */
 export type SqlCheckLevel = 'error' | 'warning' | 'info'
 
 /** 一条检查结果（证据接口查询步骤里的 checks、助手自查和发布前检查的问题）。交回模型改写用的那句不上界面，这里不收 */

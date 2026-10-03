@@ -1073,7 +1073,7 @@ await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤�
   const want = [await tokenColor(bad.page, 'color', 'var(--st-failed)'), await tokenColor(bad.page, 'color', 'var(--st-waiting)'),
     await tokenColor(bad.page, 'color', 'var(--accent)')]
   check('级别的颜色走令牌：错误 --st-failed、提醒 --st-waiting、提示 --accent', tones.join('|') === want.join('|'), tones.join('|'))
-  check('悬停写明依据的确证程度', (await items.first().locator('[data-sql-level]').getAttribute('title')) === '依据已确认，结果必然有误')
+  check('悬停写明依据的确证程度', (await items.first().locator('[data-sql-level]').getAttribute('title')) === '依据已核实，结果很可能有误，需要修改')
   check('不露规则编号', !/fanout_sum|missing_valid_filter|join_unconfirmed/.test(await p.innerText()))
   await bad.page.keyboard.press('Escape')
   await openQ(bad.page, '45,678.5元', { wait: '[data-ev-sql-check-failed]' })

@@ -137,6 +137,8 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     rel = _relation(detail["notes"], "gate_id")
     assert (rel["source"], rel["status"], rel["cardinality"], rel["coverage"]) == (
         "profile", "verified", "many_to_one", 1.0)
+    # 子表一侧数过、确有重复：基数用数据核实过，一对多确有其事 → error（A6）
+    assert rel["cardinality_checked"] is True
     assert ("fanout_sum", "error", "gates", "id") in await _found(sid, sql)
 
     changes = [{"path": "relations.new", "value": {"columns": ["gate_id"], "to_table": "gates", "to_columns": ["id"]},
@@ -147,6 +149,21 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     after = _relation(r.json()["notes"], "gate_id")
     assert (after["status"], after["cardinality"], after["coverage"]) == ("confirmed", "many_to_one", 1.0)
     assert ("fanout_sum", "error", "gates", "id") in await _found(sid, sql)
+
+
+async def test_profiled_relation_without_child_check_only_warns(client, make_source, scenic_db):
+    """A6：子表超过整表统计上限、没核对子表一侧唯不唯一的关系，剖析照样记有确证、按多对一记，但基数不算用数据
+    核实过：扇出检查只给 warning（「可能重复计算」），不给 error、不让出具降档。"""
+    sql = "SELECT COUNT(g.id) AS n FROM gates g JOIN visits v ON v.gate_id = g.id"
+    sid = await make_source(scenic_db, options=_on(max_scan_rows=100), draft=["visits", "gates"])
+    r = await client.post(_url(sid), json={"tables": ["visits"]})
+    assert r.status_code == 200, r.text
+    rel = _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")
+    assert (rel["source"], rel["status"], rel["cardinality"]) == ("profile", "verified", "many_to_one")
+    assert not rel.get("cardinality_checked")
+    found = await _found(sid, sql)
+    assert ("fanout_sum", "warning", "gates", "id") in found
+    assert ("fanout_sum", "error", "gates", "id") not in found
 
 
 # ==========================================================================
@@ -191,6 +208,19 @@ def test_human_edit_rejects_a_removed_human_relation_that_structure_would_bring_
                                    inferable={park["id"]})
     assert [(r["id"], r["status"]) for r in out["relations"]] == [(park["id"], "rejected")]
     assert catalog.apply_human_edit({"relations": [park]}, {"relations": []}, table="visits", at=AT) == {}
+
+
+def test_human_edit_cannot_forge_a_data_checked_cardinality():
+    """A6：「基数用数据核实过」只能由数据剖析写。人工改了关系（记成人工确认），提交里带的 cardinality_checked 不作数；
+    值没动的关系保留剖析原来写的。"""
+    gate = {**_rel(["gate_id"], "gates", ["id"], "profile", "verified"), "coverage": 1.0, "cardinality_checked": True}
+    park = _rel(["park_id"], "parks", ["id"], "name")
+    forged = {**park, "cardinality": "one_to_many", "cardinality_checked": True}
+    out = catalog.apply_human_edit({"relations": [gate, park]}, {"relations": [gate, forged]}, table="visits", at=AT)
+    by_id = {r["id"]: r for r in out["relations"]}
+    assert by_id[gate["id"]]["cardinality_checked"] is True
+    assert (by_id[park["id"]]["source"], by_id[park["id"]]["status"]) == ("human", "confirmed")
+    assert "cardinality_checked" not in by_id[park["id"]]
 
 
 async def test_removed_or_rejected_relations_stay_out_of_checks_graph_and_redraft(client, make_source, scenic_db):
