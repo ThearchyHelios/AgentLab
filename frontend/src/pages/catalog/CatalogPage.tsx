@@ -243,6 +243,7 @@ export function CatalogPage() {
   }, [table, visible, rows, sort])
 
   const usage = useMemo(() => usageSummary(rows), [rows])
+  const wideHeader = useMedia('(min-width: 640px)')
   /**
    * 顶部摘要点进来：清掉搜索词，切到对应的筛选、只看运行中查询过的表（和摘要同一个口径：摘要说「1 张还没有目录」，
    * 点进去就是那 1 张，不是全部没有目录的表），按使用次数排——用到最多的排在最前。窄屏一次只显示一栏，
@@ -355,7 +356,8 @@ export function CatalogPage() {
       <PageHeader
         icon={<BookMarked size={13} />}
         title={CT.title(source?.name ?? sourceId)}
-        subtitle={CT.subtitle}
+        // 窄屏放不下说明：硬塞进去会被挤成一个字的宽度，标题后面露出说明的头一个字（「先」）。窄屏只留标题
+        subtitle={wideHeader ? CT.subtitle : undefined}
         actions={(
           <div className="flex shrink-0 items-center gap-1.5">
             {hasTables && headerProfile}
@@ -408,6 +410,20 @@ export function CatalogPage() {
       )}
     </div>
   )
+}
+
+/** 媒体查询的当前结果，跟着窗口大小变 */
+function useMedia(query: string): boolean {
+  const [on, setOn] = useState(() => typeof matchMedia !== 'function' || matchMedia(query).matches)
+  useEffect(() => {
+    if (typeof matchMedia !== 'function') return
+    const mq = matchMedia(query)
+    const sync = () => setOn(mq.matches)
+    sync()
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [query])
+  return on
 }
 
 /**

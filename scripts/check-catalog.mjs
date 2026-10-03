@@ -1777,11 +1777,40 @@ await section('数据目录 · 窄屏', async () => {
   await page.locator('[data-catalog-row]').first().waitFor()
   check('390 宽：只显示表清单', await page.locator('[data-catalog-list]').isVisible() && !(await page.locator('[data-catalog-overview]').isVisible()))
   check('……清单没有横向滚动', await overflow() <= 1, String(await overflow()))
+  // 页头放不下说明：只留标题，不能被挤成一个字的宽度、在标题后面露出说明的头一个字
+  const headSub = await page.locator('[data-catalog-page] > header p').count()
+  check('……页头只有标题，不露说明的残字', headSub === 0 && !(await page.locator('[data-catalog-page] > header').innerText()).includes('先起草'),
+    await page.locator('[data-catalog-page] > header').innerText())
   await page.locator('[data-catalog-row="visits"] [data-catalog-open-row]').click()
   await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) === 1)
   check('……打开一张表：只显示详情，有「返回表清单」', !(await page.locator('[data-catalog-list]').isVisible())
         && await page.locator('[data-catalog-detail-back]').isVisible())
-  check('……详情没有横向滚动（列表格在自己的框里滚）', await overflow() <= 1, String(await overflow()))
+  check('……详情没有横向滚动', await overflow() <= 1, String(await overflow()))
+  // 列表格、关联关系不再是 860px / 640px 宽、要横着滚的表格：排成卡片，状态标识始终在框里看得到
+  const fits = (sel) => page.evaluate((q) => {
+    const box = document.querySelector(q)
+    if (!box) return null
+    const r = box.getBoundingClientRect()
+    const marks = [...box.querySelectorAll('[data-item-mark]')].map((m) => m.getBoundingClientRect())
+    return { scroll: box.scrollWidth - box.clientWidth, width: Math.round(r.width), marks: marks.length,
+      inside: marks.every((m) => m.width > 0 && m.left >= r.left - 1 && m.right <= r.right + 1),
+      head: getComputedStyle(box.querySelector('thead')).display }
+  }, sel)
+  const cols = await fits('[data-catalog-columns]')
+  check('……列表格排成卡片：不横向滚动，表头收起，每个状态标识都在框里', !!cols && cols.scroll <= 1 && cols.head === 'none' && cols.marks > 0 && cols.inside,
+    JSON.stringify(cols))
+  const codesBox = await page.locator('[data-column="status"] [data-cell="codes"]').boundingBox()
+  check('……码值那一项在屏幕里，前面写着字段名', !!codesBox && codesBox.x >= 0 && codesBox.x + codesBox.width <= 390
+    && (await page.locator('[data-column="status"] [data-cell="codes"]').innerText()).startsWith('码值'), JSON.stringify(codesBox))
+  await page.locator('[data-column="visitor_count"]').scrollIntoViewIfNeeded()
+  if (SHOTS) await sleep(200)
+  await shot(page, 'catalog-narrow-columns')
+  const rels = await fits('[data-catalog-relations]')
+  check('……关联关系也排成卡片：不横向滚动，三条关系的状态都看得到', !!rels && rels.scroll <= 1 && rels.head === 'none' && rels.marks === 3 && rels.inside,
+    JSON.stringify(rels))
+  await page.locator('[data-catalog-section="relations"]').scrollIntoViewIfNeeded()
+  if (SHOTS) await sleep(200)
+  await shot(page, 'catalog-narrow-relations')
   await openMark(page, 'grain')
   const box = await panel(page).boundingBox()
   check('……状态弹层在视口里', !!box && box.x >= 0 && box.x + box.width <= 390, JSON.stringify(box))
@@ -1799,6 +1828,13 @@ await section('数据目录 · 窄屏', async () => {
   const inner = await profileBox(page).evaluate((el) => el.scrollWidth - el.clientWidth)
   check('……数据剖析弹窗在视口里，正文不横向滚动', !!dlg && dlg.x >= 0 && dlg.x + dlg.width <= 390 && inner <= 1, `${JSON.stringify(dlg)} ${inner}`)
   await page.keyboard.press('Escape')
+  // 宽屏照旧是表格（表头在，列表格 860px 起，框里横向滚动）
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await openDetail(page, S1, 'visits')
+  const wide = await page.locator('[data-catalog-columns]').evaluate((el) => ({ head: getComputedStyle(el.querySelector('thead')).display,
+    table: getComputedStyle(el.querySelector('table')).display, width: el.querySelector('table').getBoundingClientRect().width }))
+  check('宽屏照旧是表格', wide.head !== 'none' && wide.table === 'table' && wide.width >= 860, JSON.stringify(wide))
+  check('……页头写着说明', (await page.locator('[data-catalog-page] > header').innerText()).includes('先起草'))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })

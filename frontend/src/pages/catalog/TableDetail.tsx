@@ -17,7 +17,7 @@ import {
 import { CatalogImpactList } from '../../components/CatalogImpact'
 import { CountBadges, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
 import type { ReviewTarget } from './parts'
-import { ColumnTable, Value, pendingCodes } from './ColumnTable'
+import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
 import { CodesDialog } from './CodesDialog'
 import { coverageText } from './profile'
@@ -710,10 +710,13 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
   onReview: (t: ReviewTarget, a: CatalogReviewAction) => void
 }) {
   if (!relations.length) return <p className="rounded-lg border px-3 py-4 text-xs text-faint" data-relations-empty="">{CT.noRelations}</p>
+  // 窄框（< 40rem）下和列表格一样排成卡片：状态在第一行，下面每项一行「字段名 值」，不用横向滚动
+  const cell = clsx('px-2 py-1.5 align-top', NARROW.cell)
+  const label = (text: string) => <span className={NARROW.label} aria-hidden>{text}</span>
   return (
-    <div className="relative overflow-x-auto rounded-lg border" data-catalog-relations="">
-      <table className="w-full min-w-[640px] border-collapse text-xs">
-        <thead>
+    <div className="@container relative overflow-x-auto rounded-lg border" data-catalog-relations="">
+      <table className="w-full border-collapse text-xs @max-[40rem]:block @min-[40rem]:min-w-[640px]">
+        <thead className={NARROW.head}>
           <tr className="border-b bg-elev text-left text-2xs text-faint">
             <th scope="col" className="px-3 py-2 font-medium">{CT.relationHead.from}</th>
             <th scope="col" className="px-2 py-2 font-medium">{CT.relationHead.to}</th>
@@ -723,15 +726,20 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
             <th scope="col" className="px-2 py-2 font-medium">{CT.relationHead.source} / {CT.relationHead.status}</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody className={NARROW.body}>
           {relations.map((r) => {
             const target = targetOf(r.to_table)
             const where = CT.whereRelation(r.to_table)
             const rejected = r.status === 'rejected'
             return (
-              <tr key={r.id} className="border-b border-hairline last:border-b-0" data-relation={r.id} data-status={r.status}>
-                <td className={clsx('mono px-3 py-1.5 align-top', rejected && 'text-faint line-through')}>{r.columns.join(', ')}</td>
-                <td className="px-2 py-1.5 align-top">
+              <tr key={r.id} className={clsx('border-b border-hairline last:border-b-0', NARROW.row)} data-relation={r.id} data-status={r.status}>
+                <td className={clsx(cell, 'px-3')}>
+                  {label(CT.relationHead.from)}
+                  <span className={clsx('mono min-w-0 break-all', rejected && 'text-faint line-through')}>{r.columns.join(', ')}</span>
+                </td>
+                <td className={cell}>
+                  {label(CT.relationHead.to)}
+                  <span className="min-w-0">
                   {target
                     ? (
                       <button type="button" className={clsx('mono text-left underline decoration-dotted underline-offset-2 hover:text-[var(--accent)]', rejected && 'text-faint line-through')}
@@ -740,16 +748,24 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
                       </button>
                     )
                     : <span className={clsx('mono', rejected && 'text-faint line-through')}>{r.to_table}</span>}
-                  {target?.label && <div className="text-2xs text-faint">{target.label}</div>}
+                    {target?.label && <span className="block text-2xs text-faint">{target.label}</span>}
+                  </span>
                 </td>
-                <td className={clsx('mono px-2 py-1.5 align-top', rejected && 'text-faint line-through')}>{r.to_columns.join(', ')}</td>
-                <td className="px-2 py-1.5 align-top">{r.cardinality ? CATALOG_CARDINALITY_LABEL[r.cardinality] : <span className="text-faint">{CT.cardinalityNone}</span>}</td>
-                <td className="tnum px-2 py-1.5 align-top">
+                <td className={cell}>
+                  {label(CT.relationHead.toColumns)}
+                  <span className={clsx('mono min-w-0 break-all', rejected && 'text-faint line-through')}>{r.to_columns.join(', ')}</span>
+                </td>
+                <td className={cell}>
+                  {label(CT.relationHead.cardinality)}
+                  {r.cardinality ? CATALOG_CARDINALITY_LABEL[r.cardinality] : <span className="text-faint">{CT.cardinalityNone}</span>}
+                </td>
+                <td className={clsx('tnum', cell, typeof r.coverage !== 'number' && '@max-[40rem]:hidden')}>
+                  {label(CT.relationHead.coverage)}
                   {typeof r.coverage === 'number'
                     ? <span data-relation-coverage={r.coverage}>{coverageText(r.coverage)}</span>
                     : <span className="text-faint">—</span>}
                 </td>
-                <td className="px-2 py-1.5 align-top">
+                <td className={clsx(cell, '@max-[40rem]:order-first @max-[40rem]:pb-1')} data-relation-status="">
                   <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, updated_at: r.updated_at }}
                             disabled={busy} onReview={(a) => onReview({ path: relationPath(r.id), where, source: r.source, status: r.status }, a)} />
                 </td>

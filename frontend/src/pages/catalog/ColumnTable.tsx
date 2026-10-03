@@ -18,7 +18,22 @@ import type { ColumnDraft, ColumnField } from './model'
 // 单表详情的列表格：列名 / 类型、中文名、含义、单位、度量类型、码值。每格的值旁边是只有图标的状态标识，点开看来源、
 // 做确认 / 驳回 / 恢复；有推断项的行末尾有「确认本列推断」。编辑时每格换成输入框。
 // 一张表 50 列时每次按键都会重画整张表：行是 memo 的，只有改动的那一行重画。
+//
+// 窄（表格所在的框不到 40rem，比如 390 宽的手机）时不再是 860px 宽、要横向滚动的表格：每一列排成一张卡片，列名在上，
+// 下面每项一行「字段名 值 状态」，没填的项不占行；状态标识跟着值走，始终在框里看得到。按框的宽度（容器查询）切换，
+// 不按视口：宽屏左右两栏时右栏也可能很窄。
 // ===========================================================================
+
+/** 窄框下的卡片式排法（容器查询，框宽 < 40rem 时生效）。表格元素改成块，表头藏起来，每格前面补上字段名 */
+export const NARROW = {
+  table: '@max-[40rem]:block @min-[40rem]:min-w-[860px] @min-[40rem]:table-fixed',
+  head: '@max-[40rem]:hidden',
+  body: '@max-[40rem]:block',
+  row: '@max-[40rem]:relative @max-[40rem]:flex @max-[40rem]:flex-col @max-[40rem]:py-1.5',
+  rowHead: '@max-[40rem]:block @max-[40rem]:pr-12',
+  cell: '@max-[40rem]:flex @max-[40rem]:items-start @max-[40rem]:gap-2 @max-[40rem]:px-3 @max-[40rem]:py-0.5',
+  label: 'hidden w-16 shrink-0 pt-0.5 text-2xs text-faint @max-[40rem]:block',
+}
 
 const MEASURES = Object.keys(CATALOG_MEASURE_LABEL) as CatalogMeasure[]
 const CODES_SHOWN = 4
@@ -51,9 +66,9 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   onCodesComplete: (col: string, value: boolean) => void
 }) {
   return (
-    <div className="relative overflow-x-auto rounded-lg border" data-catalog-columns="">
-      <table className="w-full min-w-[860px] table-fixed border-collapse text-xs">
-        <thead>
+    <div className="@container relative overflow-x-auto rounded-lg border" data-catalog-columns="">
+      <table className={clsx('w-full border-collapse text-xs', NARROW.table)}>
+        <thead className={NARROW.head}>
           <tr className="border-b bg-elev text-left text-2xs text-faint">
             <th scope="col" className="w-[21%] px-3 py-2 font-medium">{CT.columnHead.name} / {CT.columnHead.type}</th>
             <th scope="col" className="w-[14%] px-2 py-2 font-medium">{CT.columnHead.label}</th>
@@ -67,7 +82,7 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
             <th scope="col" className="w-9 px-1 py-2"><span className="sr-only">{CT.confirmColumn}</span></th>
           </tr>
         </thead>
-        <tbody>
+        <tbody className={NARROW.body}>
           {columns.map((c) => (
             <ColumnRow key={c.name} col={c} editing={!!form} draft={form?.[c.name]} initial={initial?.[c.name]} problems={problems} busy={busy}
                        systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onFillCodes={onFillCodes} onChange={onChange}
@@ -104,8 +119,10 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     const problem = problems[`c:${name}:${f}`]
     const changed = editing && ((draft?.[f] ?? '') !== (initial?.[f] ?? '') || (f === 'codes' && completeOf(draft) !== completeOf(initial)))
     return (
-      <td className="px-2 py-1.5 align-top" data-cell={f} data-status={it?.status}>
-        <div className="flex items-start gap-1.5">
+      // 窄框下没填的项不占行（编辑时照常列出来好填）
+      <td className={clsx('px-2 py-1.5 align-top', NARROW.cell, !it && !editing && '@max-[40rem]:hidden')} data-cell={f} data-status={it?.status}>
+        <span className={NARROW.label} aria-hidden>{CT.columnHead[f]}</span>
+        <div className="flex min-w-0 flex-1 items-start gap-1.5">
           <div className="min-w-0 flex-1">{editing ? input : view}</div>
           {it && !changed && (
             <span className="pt-0.5">
@@ -140,8 +157,8 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
   const measure = items?.measure
   const codes = items?.codes
   return (
-    <tr className="border-b border-hairline last:border-b-0 hover:bg-hover/40" data-column={name} data-pending={pending}>
-      <th scope="row" className="px-3 py-1.5 text-left align-top font-normal">
+    <tr className={clsx('border-b border-hairline last:border-b-0 hover:bg-hover/40', NARROW.row)} data-column={name} data-pending={pending}>
+      <th scope="row" className={clsx('px-3 py-1.5 text-left align-top font-normal', NARROW.rowHead)}>
         <div className="flex flex-wrap items-center gap-1">
           <span className="mono text-xs font-medium text-fg [overflow-wrap:anywhere]">{name}</span>
           {structure?.pk && <span className="chip !px-1.5 !py-0 !text-2xs">{CT.pk}</span>}
@@ -193,7 +210,8 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
           </label>
         </>,
       )}
-      <td className="px-1 py-1.5 align-top">
+      <td className={clsx('px-1 py-1.5 align-top', '@max-[40rem]:absolute @max-[40rem]:right-1.5 @max-[40rem]:top-1.5 @max-[40rem]:p-0',
+        (editing || !pending) && '@max-[40rem]:hidden')}>
         {!editing && pending > 0 && (
           <IconButton label={CT.confirmColumnLabel(name, pending)} icon={<CheckCheck size={13} />} disabled={busy}
                       onClick={() => onConfirmColumn(name)} data-confirm-column={name} />
