@@ -1,5 +1,5 @@
 export type NodeType =
-  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code'
+  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
   | 'human' | 'validate' | 'metrics' | 'report'
 
@@ -2063,6 +2063,40 @@ export interface EvidenceCaliberUpgrade {
  * run_input（报告直接引用的运行输入）、query（查询快照：被引用的行加前后各 2 行）。
  * input 步骤同时带着 EvidenceInput 的字段（via、status、model_value、ref、locator、artifact）
  */
+/** 合并查询的一个输入（证据面板的 merge.inputs） */
+export interface EvidenceMergeInput {
+  /** 合并 SQL 里的表名 */
+  alias: string
+  node_id?: string | null
+  /** 节点在画布上的名字 */
+  label?: string | null
+  /** 这个输入在报告目录里的编号（Q1）；不在这份报告的目录里时为空 */
+  query?: string | null
+  rows?: number | null
+  /** 数据源名；输入本身是合并结果时是「合并查询」 */
+  source?: string | null
+  artifact?: string | null
+  sealed?: boolean
+}
+
+/** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */
+export interface EvidenceMergeTrace {
+  /** 合并结果里的 [行, 列]，行号从 0 数 */
+  cell: [number, string]
+  input: string | null
+  query: string | null
+  row: number | null
+  column: string | null
+  note?: string
+}
+
+export interface EvidenceMerge {
+  sql?: string | null
+  inputs: EvidenceMergeInput[]
+  warnings: { code?: string | null; message: string }[]
+  traced: EvidenceMergeTrace[]
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
@@ -2127,6 +2161,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
    * 查询快照来自上传的表格时才有，且恒为 true；其余一个键都不加。前端只在 seg.cite?.kind === 'cell' 且它为 true 时请求
    */
   provenance?: boolean
+  /** 合并查询的结果（快照的 source 是「合并查询」）：合并了哪几个输入、合并 SQL、执行时的警告、被引用的格追到哪 */
+  merge?: EvidenceMerge
+  /** 这一步是哪次合并查询的输入（合并结果在目录里的编号）：排在那个合并步骤后面，高亮的是追到的格 */
+  merged_into?: string
   // ---- entity：表或字段（三期）----
   /** entity：table / column */
   kind?: string

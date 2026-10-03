@@ -1,7 +1,7 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { JUDGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
@@ -145,6 +145,25 @@ export interface Step {
   limitS?: number
   /** 出具那一行的档位（formal / degraded / withheld） */
   tier?: string
+  /** 合并查询那一行（merge.end）：合并了哪几个输入、几条警告。SQL 在 detail，预览在 result */
+  merge?: MergeStep
+}
+
+/** 合并查询的一个输入：合并 SQL 里的别名、上游节点、行数、数据源 */
+export interface MergeStepInput {
+  alias: string
+  nodeId?: string
+  label?: string
+  rows?: number
+  source?: string
+}
+
+export interface MergeStep {
+  inputs: MergeStepInput[]
+  /** 执行时的警告条数。警告的原文由同一节点紧接着的 log（merge_key_type…）各占一行，不在这里重复 */
+  warnings: number
+  rows?: number
+  truncated: boolean
 }
 
 // 这两个是流式增量，后端根本不落库（_EPHEMERAL）。单次运行的 delta 量级会
@@ -752,6 +771,38 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         title: `结论句裁判已达上限${n ? `，${n} 句未裁判` : ''}（已裁判的结果保留）`,
         sub: message.match(/已[到达]上限（(.+?)）/)?.[1],
         next: '存在未裁判的结论句时不能完整出具。请在报告撰写节点的「结论句裁判」中调高上限（或设为不限），或在「设置 → 偏好设置 → 证据裁判」中修改默认值',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_key_type': {
+      // 「合并键类型不一致：s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）。SQLite 比较时会做隐式转换…」
+      // （engine/merge_query._warnings）。标题说是哪两列，副标题说各是什么类型
+      const m = message.match(/^合并键类型不一致[：:]\s*(.+?)。/)
+      const keys = [...(m?.[1] ?? '').matchAll(/([\w一-龥]+\.[^\s，,]+)\s*是/g)].map((x) => x[1])
+      return {
+        title: keys.length === 2 ? `合并键类型不一致：${keys[0]} 与 ${keys[1]}` : '合并键类型不一致',
+        sub: m?.[1],
+        next: '两边类型不同时，SQLite 按隐式转换比较，可能错配或完全匹配不上。请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_rows_grew': {
+      // 「合并结果有 8 行，多于行数最多的输入「s」（4 行）：合并键可能不唯一，同一行被重复匹配。…」
+      const head = message.match(/^合并结果有\s*([\d,]+)\s*行，多于行数最多的输入「(.+?)」（([\d,]+)\s*行）/)
+      const dup = message.match(/重复匹配。(.+?)。请检查/)?.[1]
+      return {
+        title: '合并结果行数多于输入，合并键可能不唯一',
+        sub: [head ? `合并结果 ${head[1]} 行，行数最多的输入「${head[2]}」${head[3]} 行` : '', dup ?? '']
+          .filter(Boolean).join('；') || undefined,
+        next: '请检查合并条件是否覆盖了全部合并键（例如同时按日期和门店），或先在源库里聚合到相同粒度',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_truncated': {
+      const rows = message.match(/只保留了前\s*([\d,]+)\s*行/)?.[1]
+      return {
+        title: `合并结果超过上限，${rows ? `只保留了前 ${rows} 行` : '已截断'}`,
+        next: '下游拿到的不是完整结果。请在合并 SQL 中聚合或加条件缩小范围',
         fix: 'canvas',
       }
     }
@@ -2070,6 +2121,38 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           status: count ? 'done' : 'failed',
           level: count ? undefined : 'warn',
           title: count ? `召回 ${count} 条相关记忆` : '未召回相关记忆',
+        }, nodeId)
+        break
+      }
+
+      case 'merge.end': {
+        // 合并查询：几次查询的结果在库外按键合并。和查询同一类（kind query）：detail 是合并 SQL，result 是预览，
+        // 工件是合并结果的查询快照。输入列在 merge 里，展开区单列一块；警告的原文由紧跟着的 log 各占一行
+        const inputs: MergeStepInput[] = (Array.isArray(d.inputs) ? d.inputs : [])
+          .filter((i: any) => i && typeof i === 'object' && typeof i.alias === 'string')
+          .map((i: any) => ({
+            alias: String(i.alias),
+            ...(typeof i.node_id === 'string' ? { nodeId: i.node_id } : {}),
+            ...(typeof i.label === 'string' && i.label ? { label: i.label } : {}),
+            ...(num(i.rows) != null ? { rows: num(i.rows) } : {}),
+            ...(typeof i.source === 'string' && i.source ? { source: i.source } : {}),
+          }))
+        const warnings = Array.isArray(d.warnings) ? d.warnings.filter((w: any) => w && w.message).length : 0
+        const rows = num(d.rows)
+        const ms = num(d.duration_ms)
+        const preview = Array.isArray(d.preview_rows) ? d.preview_rows : []
+        push({
+          id: `mg-${seq}`, seq, kind: 'query', nodeId, status: 'done', code: 'merge',
+          ...(warnings ? { level: 'warn' as const, sub: MERGE_TEXT.warnings(warnings) } : {}),
+          title: MERGE_TEXT.stepTitle(inputs.map((i) => i.alias)),
+          detail: typeof d.sql === 'string' && d.sql ? d.sql : undefined,
+          result: Array.isArray(d.columns)
+            ? JSON.stringify({ columns: d.columns, rows: preview, truncated: rows != null && rows > preview.length })
+            : undefined,
+          meta: [rows != null ? MERGE_TEXT.rows(rows) : '', dur(ms) ?? ''].filter(Boolean).join(' · ') || undefined,
+          ms,
+          ...(typeof d.query_artifact === 'string' && d.query_artifact ? { artifact: d.query_artifact } : {}),
+          merge: { inputs, warnings, ...(rows != null ? { rows } : {}), truncated: !!d.truncated },
         }, nodeId)
         break
       }

@@ -72,6 +72,7 @@
   --nt-supervisor: #bcadff;
   --nt-tool: #10c4c9;
   --nt-code: #57e3df;
+  --nt-merge: #96efe6;
   --nt-branch: #e389ca;
   --nt-loop: #ffaddd;
   --nt-subgraph: #dba9c8;
@@ -130,6 +131,7 @@
   --nt-supervisor: #63519e;
   --nt-tool: #026264;
   --nt-code: #057c79;
+  --nt-merge: #0a4d5a;
   --nt-branch: #7e376c;
   --nt-loop: #9b4c7d;
   --nt-subgraph: #7a516c;
@@ -186,6 +188,7 @@
     --nt-supervisor: #63519e;
     --nt-tool: #026264;
     --nt-code: #057c79;
+    --nt-merge: #0a4d5a;
     --nt-branch: #7e376c;
     --nt-loop: #9b4c7d;
     --nt-subgraph: #7a516c;
@@ -393,6 +396,7 @@
 .nt-supervisor { --nt: var(--nt-supervisor); }
 .nt-tool       { --nt: var(--nt-tool); }
 .nt-code       { --nt: var(--nt-code); }
+.nt-merge      { --nt: var(--nt-merge); }
 .nt-branch     { --nt: var(--nt-branch); }
 .nt-loop       { --nt: var(--nt-loop); }
 .nt-human      { --nt: var(--nt-human); }

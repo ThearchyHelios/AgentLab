@@ -1,14 +1,14 @@
 import {
-  Bot, Braces, Brain, CheckCircle2, Code2, Database, FileInput, FileOutput, FileText,
+  Bot, Braces, Brain, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
 } from 'lucide-react'
-import { APPROVAL_POLICY_LABEL, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
+import { APPROVAL_POLICY_LABEL, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
 import type { NodeType } from '../types'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
-  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom' | 'judge'
+  | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom' | 'judge' | 'mergeInputs'
 
 /**
  * 这个字段里写的是什么语法。
@@ -295,6 +295,23 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       ...COMMON_TAIL,
     ],
     defaults: { args: {} },
+  },
+  merge: {
+    type: 'merge', label: NODE_TYPE_LABEL.merge, category: '执行', icon: Combine,
+    description: '把不同数据库的查询结果按合并键合并成一张表，报告和口径卡照常引用、可查看出处',
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    fields: [
+      // 后端 config.inputs 是 {别名: 节点 id}：别名就是内存库里的表名（engine/merge_query.alias_problem 校验）
+      { key: 'inputs', label: '输入', type: 'mergeInputs', help: MERGE_TEXT.inputsHint },
+      {
+        key: 'sql', label: '合并 SQL', type: 'code',
+        placeholder: 'SELECT s.day, s.store, s.orders, v.visitors FROM s JOIN v ON s.day = v.day AND s.store = v.store',
+        help: '一条 SQLite 的 SELECT 或 WITH 查询，表名用上面的别名。同一个库的数据请直接写成一条查询；'
+          + '比率、增幅等派生计算请写在口径卡中。直接选取输入的列（可用 AS 改名）时，报告中的数字可以追到输入的那一格',
+      },
+      ...COMMON_TAIL,
+    ],
+    defaults: { inputs: {}, sql: '' },
   },
   code: {
     type: 'code', label: NODE_TYPE_LABEL.code, category: '执行', icon: Code2,

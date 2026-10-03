@@ -2963,7 +2963,96 @@ if (SHOTS) {
     await page.keyboard.press('Escape')
   }
 }
-await section('copy-r2', '按后端原文匹配的地方：后端现在的原文、整改前的原文都认得（文案整改第二轮）', async () => {
+// ---------------------------------------------------------------------------
+// 合并查询：片段接口的查询步骤带 merge（表级来历、逐格来历），后面接着追到的输入的查询步骤（merged_into）；
+// 推断来源的答复带 merge（经过的每一次合并）。答复按 backend/app/api/evidence.py 的 _merge_view、_query_steps 的形状改
+// ---------------------------------------------------------------------------
+const MERGE_SQL = 'SELECT o.order_id, o.region, o.amount, t.target FROM o JOIN t ON o.region = t.region ORDER BY o.order_id'
+function asMerge(body, traced, { withInput = true } = {}) {
+  const q = body.chain.find((st) => st.step === 'query')
+  const merged = {
+    ...q, tool: undefined, source: '合并查询', sql: MERGE_SQL,
+    merge: {
+      sql: MERGE_SQL,
+      inputs: [
+        { alias: 'o', node_id: 'fetch', label: '订单明细', query: 'Q1', rows: 12, source: 'shop', artifact: 'a'.repeat(64), sealed: true },
+        { alias: 't', node_id: 'targets', label: '区域目标', query: null, rows: 4, source: 'plan', artifact: 'b'.repeat(64), sealed: true },
+      ],
+      warnings: [{ code: 'rows_grew', message: '合并结果有 14 行，多于行数最多的输入「o」（12 行）：合并键可能不唯一，同一行被重复匹配' }],
+      traced,
+    },
+  }
+  const input = { ...q, alias: 'Q1', merged_into: q.alias }
+  return { ...body, chain: body.chain.flatMap((st) => (st.step === 'query' ? (withInput ? [merged, input] : [merged]) : [st])) }
+}
+
+await section('merge', '合并查询：表级来历（输入、合并 SQL、警告）、逐格来历、输入步骤标明是哪次合并的输入', async () => {
+  const traced = await probeQ((id, body) => (id === qseg('1,288')
+    ? asMerge(body, [{ cell: [5, 'amount'], input: 'o', query: 'Q1', row: 5, column: 'amount' }]) : body))
+  await openQ(traced.page, '1,288')
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await traced.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await traced.page.waitForTimeout(250)
+      await traced.page.screenshot({ path: `${SHOTS}/evidence-merge-${theme}.png`, fullPage: true })
+    }
+    await traced.page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const p = traced.page.locator('[data-evidence-panel]')
+  const parts = p.locator('[data-ev-query]')
+  check('合并步骤和它追到的输入步骤各一块', await parts.count() === 2, String(await parts.count()))
+  const head = await parts.first().locator('[data-ev-query-head]').innerText().catch(() => '')
+  check('合并步骤的标题写「合并查询」，不写工具名', head.includes('Q3') && head.includes('合并查询') && !head.includes('db_query__'), head)
+  const inputs = p.locator('[data-ev-merge]')
+  check('表级来历：合并自 2 个输入', (await inputs.innerText().catch(() => '')).includes('合并自 2 个输入'))
+  const o = await p.locator('[data-ev-merge-input="o"]').innerText().catch(() => '')
+  check('……每个输入写别名、目录编号、节点名、行数、数据源', ['o', '查询 Q1', '订单明细', '12 行', '数据源 shop'].every((t) => o.includes(t)), o)
+  const t = await p.locator('[data-ev-merge-input="t"]').innerText().catch(() => '')
+  check('……不在本报告目录里的输入照实说', t.includes('不在本报告的证据目录中'), t)
+  check('合并 SQL 有标签、带复制', (await parts.first().innerText()).includes('合并 SQL')
+    && await parts.first().locator('button', { hasText: '复制合并 SQL' }).count() === 1)
+  const warn = await p.locator('[data-ev-merge-warnings]').innerText().catch(() => '')
+  check('执行时的警告写出来', warn.includes('执行时的警告') && warn.includes('不唯一'), warn)
+  const line = await p.locator('[data-ev-merge-trace="cell"]').innerText().catch(() => '')
+  check('逐格来历：被引用的格追到输入的哪一格（行号从 1 数）', line.includes('Q3 第 6 行「amount」') && line.includes('Q1 第 6 行「amount」'), line)
+  const into = await parts.nth(1).locator('[data-ev-merged-into]').innerText().catch(() => '')
+  check('输入步骤标明是哪次合并的输入，高亮追到的那一格', into.includes('合并查询 Q3 的输入')
+    && await parts.nth(1).locator('td[data-highlight="cell"]').count() === 1, into)
+  check('合并查询不是数据源：不说它「已不存在」', await p.locator('[data-ev-query-mask-note]').count() === 0)
+  await traced.ctx.close()
+
+  const flat = await probeQ((id, body) => (id === qseg('1,288') ? asMerge(body, [{
+    cell: [5, 'amount'], input: null, query: null, row: null, column: null, note: '没有逐格来历',
+  }], { withInput: false }) : body))
+  await openQ(flat.page, '1,288')
+  const none = await flat.page.locator('[data-evidence-panel] [data-ev-merge-trace="none"]').innerText().catch(() => '')
+  check('追不到的格：写明没有逐格来历、只有表级来历，不接输入步骤', none.includes('没有逐格来历')
+    && none.includes('表级来历') && await flat.page.locator('[data-evidence-panel] [data-ev-query]').count() === 1, none)
+  await flat.ctx.close()
+
+  const wideId = pseg('wide')
+  const hop = { alias: 'Q3', node_id: 'merge', input: 'f', query: 'Q1', row: 5, column: '全日客流' }
+  const lost = { alias: 'Q3', node_id: 'merge', input: null, query: null, row: null, column: null }
+  const noLineage = {
+    ...fxp.provenance[wideId], status: 'none', version: null, cell_source: null, checks: [], merge: [lost],
+    reason: { code: 'merge_no_lineage', detail: '', text: '这一格来自合并查询，无法确定它对应哪个输入的哪一格' },
+  }
+  const hops = await open('/ui-harness.html?evidence=1', {
+    prov: (run, sid, reply) => (sid === wideId ? { json: { ...reply.json, merge: [hop] } }
+      : sid === pseg('long') ? { json: noLineage } : reply),
+  })
+  await openP(hops.page, 'wide')
+  const said = await textOf(pv(hops.page, '[data-ev-prov-merge]'))
+  check('推断的来源：先说经过的合并、追到的那一格，下面的原表格子照常', said === '经合并查询 Q3 追到 Q1 第 6 行「全日客流」'
+    && await pv(hops.page, '[data-ev-prov-cell]').count() === 1, said)
+  await openP(hops.page, 'long')
+  check('追不到逐格来历：写原因和没追到的那一跳，不画数据版本和格子', (await textOf(pv(hops.page, '[data-ev-prov-reason="merge_no_lineage"]')))
+    .includes('合并查询') && (await textOf(pv(hops.page, '[data-ev-prov-merge-hop="none"]'))).includes('没有逐格来历')
+    && await pv(hops.page, '[data-ev-prov-version], [data-ev-prov-cell]').count() === 0)
+  await hops.ctx.close()
+})
+
+await section('copy-r2','按后端原文匹配的地方：后端现在的原文、整改前的原文都认得（文案整改第二轮）', async () => {
   // 画布问题落到哪一栏（canvas/issues.ts）、检查器的分支标识过滤（Inspector 用 issues.ts 的 isCaseKeyIssue）、
   // 证据面板的裁判触顶（lib/evidence.ts）都按后端原文判断。开发库里历史运行、旧版本存下的文字是整改前的，
   // 新的是整改后的：两种各喂一遍。「新」样本和 backend/app 现在的写法一致（先核对源码片段），

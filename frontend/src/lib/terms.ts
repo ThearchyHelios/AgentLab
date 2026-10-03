@@ -25,6 +25,10 @@
  * - 报错、修复选项、说明里写界面上的中文标签（「单元格引用」「报告来自」），不在句子里裸写键名和
  *   枚举值；配置界面里字段自身旁边可以附键名。
  * - 导航里的历史页叫「记录」。
+ * - 「合并查询」是节点名，也指它做的事：把几次查询的结果在库外按键合并成一张表。不写联表、联邦查询、join。
+ *   合并时两边对齐的列（日期、门店）叫「合并键」；合并 SQL 里代表某个输入的表名叫「别名」；被合并的那几次
+ *   查询叫「输入」。合并结果里的一格能指回输入的哪一格时叫「逐格来历」，指不回时只有「表级来历」（合并了
+ *   哪几个输入、用的哪条合并 SQL）。
  *
  * 语体：
  * - 书面、简洁、中性。用「无法 / 未能 / 失败 / 请」，不用「取不到 / 连不上 / 写坏了」这类口语补语；
@@ -120,6 +124,7 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   supervisor: '多 Agent 协作',
   tool: '调用工具',
   code: '沙箱代码',
+  merge: '合并查询',
   branch: '条件分支',
   loop: '循环',
   subgraph: '子工作流',
@@ -413,6 +418,41 @@ export const EVIDENCE_TEXT = {
     loading: '正在推断来源…',
     failed: '未能获取推断的来源',
   },
+} as const
+
+/**
+ * 合并查询（merge 节点）在检查器、运行详情、证据面板和推断来源里的说法。用到的术语（输入、别名、合并键、
+ * 逐格来历、表级来历）见文件开头。行号对人一律从 1 数，和证据面板查询表格最前面那一列「#」一致
+ */
+export const MERGE_TEXT = {
+  // ---- 检查器 ----
+  addInput: '添加输入',
+  alias: '别名（表名）',
+  node: '查询节点',
+  pick: '选择上游的查询节点',
+  removeInput: (alias: string) => `删除输入 ${alias || '（未命名）'}`,
+  noUpstream: '上游没有查询节点。请先在本节点之前连接选择了数据库查询工具的「调用工具」节点，或另一个「合并查询」节点',
+  missingNode: (id: string) => `节点「${id}」不在上游或已删除，请重新选择`,
+  inputsHint: '别名就是合并 SQL 中的表名。各输入请先在自己的库中聚合到相同的合并键和粒度（例如日期 + 门店），任何一个输入被截断，合并都会失败',
+  // ---- 运行详情 ----
+  stepTitle: (aliases: string[]) => (aliases.length ? `合并 ${aliases.join('、')} 的查询结果` : '合并查询结果'),
+  sql: '合并 SQL',
+  copySql: '复制合并 SQL',
+  inputs: (n: number) => `合并自 ${formatNumber(n)} 个输入`,
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  source: (name: string) => `数据源 ${name}`,
+  warnings: (n: number) => `${formatNumber(n)} 条警告，详见本节点下方`,
+  // ---- 证据面板 ----
+  mergedInto: (alias: string) => `合并查询 ${alias} 的输入`,
+  traced: '被引用的格来自',
+  cellAt: (alias: string, row: number, column: string) => `${alias} 第 ${formatNumber(row + 1)} 行「${column}」`,
+  noLineage: '没有逐格来历，只有表级来历：见上方的输入和合并 SQL',
+  unsealed: '不在封存范围内',
+  notInCatalog: '不在本报告的证据目录中',
+  executionWarnings: '执行时的警告',
+  // ---- 推断来源 ----
+  hop: (alias: string, to: string) => `经合并查询 ${alias} 追到 ${to}`,
+  hopMissing: (alias: string) => `合并查询 ${alias} 中的这一格没有逐格来历`,
 } as const
 
 /** 结论句按裁判结论分成的几堆（lib/evidence 的 claimCounts 数出来的） */
