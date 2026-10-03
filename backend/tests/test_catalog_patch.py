@@ -25,6 +25,7 @@ from app.data import catalog
 from app.data.engine import engines
 from app.data.introspect import introspect
 from tests.fixtures.catalog import scenic_notes
+from tests.fixtures.sources import drop_source
 
 _CACHE: dict[str, dict] = {}
 
@@ -74,6 +75,32 @@ async def test_codes_are_supplemented_not_replaced(scenic_db):
     assert change.after == {"1": "有效", "0": "作废", "9": "作废"}
     # 交回保存的是原样的补充值：409 之后在最新的目录上重新补
     assert change.value == {"9": "作废"}
+
+
+async def test_codes_with_pending_meanings(scenic_db):
+    """数据剖析写进来的码值候选含义为空（界面上写「含义待填写」）：提案可以补上含义；提案里含义为空的码只在原来
+    没有时加进去，不抹掉已有的含义；含义为空的码合法，保存不报错。"""
+    tables = (await _schema(scenic_db))["tables"]
+    profiled = _visits()
+    profiled["columns"]["status"]["codes"] = catalog.make_item({"1": "有效", "0": "", "9": ""}, "profile", "proposed")
+    plan = catalog.plan_patch(profiled, [{"path": "columns.status.codes", "value": {"9": "作废", "1": ""}}],
+                              table="visits", tables=tables)
+    assert plan.problems == []
+    [change] = plan.changes
+    assert change.after == {"1": "有效", "0": "", "9": "作废"} and change.state == "change"
+    # 只给了含义为空的新码：照样加进去，含义待人填
+    plan = catalog.plan_patch(profiled, [{"path": "columns.status.codes", "value": {"7": ""}}], table="visits",
+                              tables=tables)
+    assert plan.changes[0].after == {"1": "有效", "0": "", "9": "", "7": ""}
+    # 只给了含义为空的已有码：什么都没变，这一项是「保存即确认」（原来是推断）
+    plan = catalog.plan_patch(profiled, [{"path": "columns.status.codes", "value": {"1": ""}}], table="visits",
+                              tables=tables)
+    assert plan.changes[0].state == "confirm"
+    out = catalog.apply_patch(profiled, [{"path": "columns.status.codes", "value": {"9": "作废"}}], table="visits",
+                              tables=tables)
+    codes = out["columns"]["status"]["codes"]
+    assert codes["value"] == {"1": "有效", "0": "", "9": "作废"} and (codes["source"], codes["status"]) == (
+        "human", "confirmed")
 
 
 async def test_new_relation_gets_its_id_from_both_ends(scenic_db):
@@ -190,11 +217,7 @@ async def scenic_source(scenic_db):
             await catalog.write_entry(session, row.id, table, notes, if_version=0, actor="王敏")
         source_id = row.id
     yield SimpleNamespace(id=source_id, name=name)
-    async with SessionLocal() as session:
-        row = await session.get(DataSource, source_id)
-        if row is not None:
-            await session.delete(row)
-            await session.commit()
+    await drop_source(source_id)
 
 
 async def _stream(monkeypatch, model, source, base_graph=None):

@@ -24,6 +24,7 @@ from app.db.models import DataSource, Run, RunEvent, Workflow, WorkflowVersion
 from app.engine.runner import run_manager
 from app.main import app
 from tests.fixtures.catalog import scenic_notes
+from tests.fixtures.sources import drop_source
 
 _CACHE: dict[str, dict] = {}
 SQL = "SELECT COUNT(*) AS n FROM visits v JOIN parks p ON p.id = v.park_id WHERE v.status = 1"
@@ -72,9 +73,8 @@ async def source(scenic_db):
         for wid in made:
             if (wf := await session.get(Workflow, wid)) is not None:
                 await session.delete(wf)
-        if (row := await session.get(DataSource, sid)) is not None:
-            await session.delete(row)
         await session.commit()
+    await drop_source(sid)
 
 
 def node(nid, ntype, **config):

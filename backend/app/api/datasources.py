@@ -23,6 +23,7 @@ from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import catalog as data_catalog
+from app.data.catalog_profile import profile_settings_problem
 from app.data import introspect as introspect_mod
 from app.data import table_versions
 from app.data.engine import (
@@ -336,7 +337,8 @@ _MASK_FIELD = {
 
 
 def _refuse_bad_options(options: dict[str, Any] | None) -> None:
-    problem = query_timeout_problem(options) or mask_columns_problem(options)
+    problem = (query_timeout_problem(options) or mask_columns_problem(options)
+               or profile_settings_problem(options))
     if problem:
         raise HTTPException(422, problem)
 

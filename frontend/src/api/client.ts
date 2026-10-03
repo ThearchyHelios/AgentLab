@@ -1,6 +1,7 @@
 import type {
   ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogImpact, CatalogList, CatalogNotes,
-  CatalogPatchPreview, CatalogPatchSubmit, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
+  CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview,
+  EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
@@ -686,6 +687,13 @@ export const api = {
      */
     draft: (sourceId: string, body: { tables?: string[]; use_model: boolean }, opts?: RequestOptions) =>
       request<CatalogDraftOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/draft`,
+        { method: 'POST', body: JSON.stringify(body), ...opts }),
+    /**
+     * 同步剖析：对业务库发少量只读查询，核对关系、取码值候选，结论写进目录。不给 tables 时按使用次数取前 10 张
+     * 有待核实关系的表。没开启、数据源停用、没有表结构、同一个数据源正在剖析、快照被改动时回 409（detail 是一句中文）
+     */
+    profile: (sourceId: string, body: { tables?: string[] }, opts?: RequestOptions) =>
+      request<CatalogProfileOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/profile`,
         { method: 'POST', body: JSON.stringify(body), ...opts }),
   },
 

@@ -32,6 +32,7 @@ from app.main import app
 from app.tools.datasource import build_datasource_tools
 from app.tools.registry import ToolContext
 from tests.fixtures.catalog import scenic_notes
+from tests.fixtures.sources import drop_source
 
 FANOUT_SQL = ("SELECT SUM(o.total_amount) AS gmv FROM orders o JOIN order_items i ON i.order_id = o.id "
               "WHERE o.status = 1")
@@ -54,6 +55,16 @@ async def _schema(path: str) -> dict:
     return _CACHE[path]
 
 
+_CREATED: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+async def _drop_created_sources():
+    yield
+    while _CREATED:
+        await drop_source(_CREATED.pop())
+
+
 async def _source(path: str, *, with_catalog: bool = True) -> tuple[str, str]:
     name = f"scenic_{uuid.uuid4().hex[:8]}"
     async with SessionLocal() as session:
@@ -61,6 +72,7 @@ async def _source(path: str, *, with_catalog: bool = True) -> tuple[str, str]:
         row.schema_cache = await _schema(path)
         session.add(row)
         await session.commit()
+        _CREATED.append(row.id)
         if with_catalog:
             for table, notes in scenic_notes.notes().items():
                 await catalog.write_entry(session, row.id, table, notes, if_version=0, actor="王敏")
@@ -69,9 +81,8 @@ async def _source(path: str, *, with_catalog: bool = True) -> tuple[str, str]:
 
 @pytest.fixture
 async def scenic_source(scenic_db):
-    source_id, name = await _source(scenic_db)
+    _, name = await _source(scenic_db)
     yield name
-    await engines.invalidate(source_id)
 
 
 async def _query_tool(name: str):

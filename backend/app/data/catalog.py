@@ -15,13 +15,14 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
      "valid_filter": 项(str，SQL 条件片段), "dedup": 项(str),
      "columns": {列名: {"label": 项, "meaning": 项, "unit": 项,
                        "measure": 项("flow"|"stock"|"ratio"|"identifier"|"status"|"attribute"),
-                       "codes": 项(dict[str, str])}},
+                       "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
                     "source", "status", "note"?}]}
 
-来源（source）：comment 数据库注释、fk 外键约束、name 命名推断、profile 数据剖析（阶段 2）、llm 模型起草、
-human 人工填写。状态（status）：proposed 推断（命名推断、模型起草、数据库注释）、verified 有确证（外键
-约束；阶段 2 的数据剖析也写这个状态）、confirmed 人工确认、rejected 人工驳回。只有 confirmed 和 verified
+来源（source）：comment 数据库注释、fk 外键约束、name 命名推断、profile 数据剖析（data/catalog_profile.py）、
+llm 模型起草、human 人工填写。状态（status）：proposed 推断（命名推断、模型起草、数据库注释）、verified 有确证
+（外键约束；数据剖析核实了覆盖率和父键唯一的关系也是，见 profile_relation_holds）、confirmed 人工确认、
+rejected 人工驳回。只有 confirmed 和 verified
 将来会触发错误级检查；给模型看时 proposed 的项标「推断，未确认」；rejected 的项留着（防止下次起草又提出
 来），但模型和检查都看不到。
 
@@ -98,6 +99,33 @@ def initial_status(source: str) -> str:
     return _INITIAL_STATUS.get(source, "proposed")
 
 
+#: 数据剖析把关系升为有确证的抽样覆盖率下限（data/catalog_profile.py 判定，撤销审阅时按它判回剖析的结论）
+PROFILE_VERIFY_COVERAGE = 0.95
+
+
+def profile_relation_holds(rel: Mapping[str, Any]) -> bool:
+    """一条数据剖析得出的关系站不站得住：抽样覆盖率不低于 PROFILE_VERIFY_COVERAGE，而且被指向列核实唯一。
+
+    剖析只在被指向列核实唯一时才写基数（多对一或一对一），所以「基数有值」就是「父键唯一」。结论全在关系
+    自己的字段里，撤销审阅时照原样判得回来，不必另存一份「审阅前的状态」。
+    """
+    coverage = rel.get("coverage")
+    return (rel.get("source") == "profile" and isinstance(coverage, (int, float)) and not isinstance(coverage, bool)
+            and coverage >= PROFILE_VERIFY_COVERAGE and rel.get("cardinality") in ("many_to_one", "one_to_one"))
+
+
+def unreviewed_status(item: Mapping[str, Any]) -> str:
+    """撤销审阅后回到的状态：来源的初始状态。
+
+    数据剖析是例外：它的状态随数据而定（覆盖率够、父键唯一的关系是有确证，其余是推断），不能一律回到
+    initial_status("profile") 的推断——那样人工确认过再撤销，有确证就无故丢了，要等下一次剖析才回来。
+    剖析提的码值候选、业务日期永远是推断。
+    """
+    if item.get("source") == "profile" and "to_table" in item:
+        return "verified" if profile_relation_holds(item) else "proposed"
+    return initial_status(item.get("source"))
+
+
 def make_item(value: Any, source: str, status: str | None = None, *, note: str | None = None,
               at: str | None = None) -> dict[str, Any]:
     """构造一个项。status 不给时按来源取初始状态（initial_status）。"""
@@ -153,8 +181,10 @@ def _business_date_ok(value: Any) -> bool:
 
 
 def _codes_ok(value: Any) -> bool:
+    """码值对照：{码值: 含义}，都是文字。含义可以是空串——数据剖析只知道列里出现过哪些取值，含义要等人填；
+    以前要求含义非空，剖析得到的码值候选就写不进来。"""
     return (isinstance(value, dict) and bool(value)
-            and all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in value.items()))
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()))
 
 
 #: 表类型、度量类型在界面上的叫法（和 frontend/src/lib/terms.ts 的 CATALOG_KIND_LABEL / CATALOG_MEASURE_LABEL 一致）。
@@ -587,7 +617,7 @@ def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: 
         # 人工填写的项没有「推断时的样子」可回：撤销就是删掉，下次起草可以重新提出
         del slots[key]
         return _assemble(slots)
-    item["status"] = {"confirm": "confirmed", "reject": "rejected"}.get(action) or initial_status(item.get("source"))
+    item["status"] = {"confirm": "confirmed", "reject": "rejected"}.get(action) or unreviewed_status(item)
     item["updated_at"] = at or now_iso()
     return _assemble(slots)
 
@@ -652,7 +682,7 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
             continue
         kept = dict(prev)
         status = item.get("status")
-        if status != prev.get("status") and status in ("confirmed", "rejected", initial_status(prev.get("source"))):
+        if status != prev.get("status") and status in ("confirmed", "rejected", unreviewed_status(prev)):
             kept["status"] = status
             kept["updated_at"] = at
         if item.get("note") != prev.get("note"):
@@ -779,6 +809,17 @@ def _patch_relation(table: str, raw: Any, path_id: str | None, tables: Mapping[s
     return value, None
 
 
+def _merge_codes(before: Mapping[str, str], value: Mapping[str, str]) -> dict[str, str]:
+    """码值的补充：给出的码加进去或改掉原来的含义。含义为空表示「只知道有这个码、含义待填写」（数据剖析的码值
+    候选就是这样），所以提案里含义为空的码不覆盖已有的含义，只在原来没有这个码时加进去。"""
+    out = dict(before)
+    for code, meaning in value.items():
+        if not str(meaning).strip() and str(out.get(code) or "").strip():
+            continue
+        out[code] = meaning
+    return out
+
+
 def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
                tables: Mapping[str, Any] | None = None) -> PatchPlan:
     """逐项核对一条目录修改提案，算出改前、改后。不改入参、不抛异常：不合法的项写进 problems。
@@ -790,7 +831,8 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
     规则：
     - 取值格式和 validate_notes 同一套（_TABLE_VALUE_RULES / _COLUMN_VALUE_RULES / _relation_problems）。
     - 码值是补充：在现有（没被驳回的）码值上加或改给出的码，不整份替换——「status=9 表示作废」不该把已确认的
-      其余码值删掉。
+      其余码值删掉。含义为空的码（数据剖析写进来的「含义待填写」）可以被补上含义；提案里含义为空的码只在原来
+      没有这个码时加进去，不会把已有的含义抹掉（_merge_codes）。
     - 看起来像计算公式的文字不收（_FORMULA）：公式进口径卡。
     - 同一个路径出现两次只认第一次。
     """
@@ -864,7 +906,7 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
         before = _value_of(key, live) if live is not None else None
         after = value
         if key[0] == "c" and key[2] == "codes" and isinstance(before, dict):
-            after = {**before, **value}
+            after = _merge_codes(before, value)
         if before is not None and before == after:
             state = "same" if live.get("status") == "confirmed" else "confirm"
         else:
@@ -1094,6 +1136,15 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         candidates: set[str] = set()
         for form in _singulars(words[-1]):
             candidates |= index.get((prefix, form), set())
+        if not candidates:
+            # 直接对不上：库里的表常带业务前缀（store_tags），列名却只写词根（tagId）。
+            # 只认和引用它的表共用前缀的那张，从最长的共用前缀试起；仍然不止一张就不推
+            own = _words(table)
+            for k in range(len(own) - 1, 0, -1):
+                for form in _singulars(words[-1]):
+                    candidates |= index.get(("".join(own[:k]) + prefix, form), set())
+                if candidates:
+                    break
         if len(candidates) != 1:
             continue
         target = next(iter(candidates))
@@ -1625,6 +1676,17 @@ def _date_text(value: Mapping[str, Any]) -> str:
     return "；".join(parts)
 
 
+def _codes_text(codes: Mapping[str, Any]) -> str:
+    """码值对照的文字：有含义的写「1=有效」，含义待填写的单独说明——不能写成「1=」，模型会当成含义就是空。"""
+    filled = [f"{k}={v}" for k, v in codes.items() if str(v).strip()]
+    pending = [str(k) for k, v in codes.items() if not str(v).strip()]
+    if not pending:
+        return "、".join(filled)
+    if not filled:
+        return f"{'、'.join(pending)}（含义待填写）"
+    return f"{'、'.join(filled)}，{'、'.join(pending)} 的含义待填写"
+
+
 def _relation_text(rel: Mapping[str, Any]) -> str:
     left = ", ".join(rel.get("columns") or [])
     right = ", ".join(f"{rel.get('to_table')}.{c}" for c in rel.get("to_columns") or [])
@@ -1675,7 +1737,7 @@ def _notes_lines(notes: Mapping[str, Any] | None, *, meta: Mapping[str, Any] | N
             if name == "measure":
                 text = MEASURE_LABEL.get(value, str(value))
             elif name == "codes":
-                text = "、".join(f"{k}={v}" for k, v in value.items())
+                text = _codes_text(value)
             else:
                 text = str(value)
             # 第一段是中文名（没有中文名时是含义），不加前缀；其余写明是什么
@@ -1932,13 +1994,13 @@ __all__ = [
     "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND",
-    "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft", "TableDraftResult",
-    "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "describe_slot", "draft_catalog",
-    "draft_structure", "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations",
+    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_VERIFY_COVERAGE", "PatchChange", "PatchPlan",
+    "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft",
+    "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "describe_slot",
+    "draft_catalog", "draft_structure", "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations",
     "initial_status", "join_paths", "make_item", "merge_notes", "now_iso", "parse_path", "plan_patch",
-    "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
-    "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",
-    "save_human_edit", "save_patch", "status_counts", "system_notes_source", "table_usage", "validate_notes",
-    "visible_notes", "write_entry",
+    "profile_relation_holds", "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id",
+    "render_table_index", "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry",
+    "review_item", "same_notes", "save_human_edit", "save_patch", "status_counts", "system_notes_source",
+    "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
 ]

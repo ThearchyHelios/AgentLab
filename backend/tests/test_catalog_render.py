@@ -7,6 +7,7 @@ from app.data import catalog
 from app.data.catalog import make_item
 from app.db.base import SessionLocal
 from app.db.models import Artifact, DataSource, Run
+from tests.fixtures.sources import drop_source
 
 MARK = "（推断，未确认）"
 
@@ -184,4 +185,5 @@ async def test_table_usage_counts_run_queries_per_table(monkeypatch):
         await session.commit()
         source = await session.get(DataSource, sid)
         usage = await catalog.table_usage(session, source)
+    await drop_source(sid)
     assert usage == {"visits": 4, "明细": 2, "parks": 1}

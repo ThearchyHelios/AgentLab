@@ -714,6 +714,7 @@ await section('Copilot：建议更新数据目录（catalog_patch 操作）', as
     cardinality: 'many_to_one' }) === 'visit_id → visits.id（多对一）')
   check('表类型、度量类型写界面上的叫法', cp.patchValueText('kind', 'fact') === '明细表' && cp.patchValueText('columns.a.measure', 'stock') === '存量')
   check('没有值写「未填写」', cp.patchValueText('grain', null) === '未填写')
+  check('码值含义为空（剖析的候选）写「含义待填写」', cp.patchValueText('columns.status.codes', { 1: '有效', 9: '' }) === '1=有效、9=含义待填写')
   check('列名里有句点照样认', JSON.stringify(cp.patchTarget('columns.a.b.unit')) === '{"kind":"column","column":"a.b","field":"unit"}')
   check('形状不对不出卡片、不出行', cp.catalogPatchesOf([
     { op: 'catalog_patch' }, { op: 'catalog_patch', source: 's', source_id: 'i', table: 't', changes: [{ path: 'nope', after: 1 }] },
@@ -1730,6 +1731,90 @@ await section('按后端原文匹配的地方：后端现在的原文、整改�
   ])).filter((s) => s.kind === 'note').map((s) => s.title)
   check('子工作流进出的日志各收成一行', sub.includes('进入子工作流「月报」（4 个节点）') && sub.includes('子工作流「月报」完成'),
     sub.join(' | '))
+})
+
+await section('SQL 检查（数据目录阶段 4B）：指标所依据的查询未通过检查说成一行；助手自查和交付的问题写中文规则名', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  // 原话和 backend/app/engine/nodes/metrics.py 的 _sql_check_reason 同一个句式。先核对后端源码还是这么说的
+  const metricsPy = readFileSync(`${root}backend/app/engine/nodes/metrics.py`, 'utf8')
+  check('后端发指标未通过 SQL 检查警告的格式还是夹具里这几种', metricsPy.includes('code="metric_sql_check"')
+    && metricsPy.includes('message=f"指标「{m[\'name\']}」{m[\'sql_check_reason\']}"')
+    && metricsPy.includes('"所依据的查询未通过 SQL 检查，结果不可靠"')
+    && metricsPy.includes('f"所依据的查询未通过 SQL 检查（{problems[0]}），结果不可靠"')
+    && metricsPy.includes('f"所依据的查询有 {len(problems)} 处未通过 SQL 检查（{problems[0]}等），结果不可靠"'),
+  '改了 metrics.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const CODES = /fanout_sum|stock_summed|join_unconfirmed|ratio_aggregated|missing_valid_filter|unknown_code|wrong_date_column/
+  const decodeOne = (message) => {
+    const all = flatten(mod.decodeRun([
+      E(1, 'node.started', 'card', { node_type: 'metrics' }),
+      E(2, 'log', 'card', { level: 'warn', code: 'metric_sql_check', metric: 'aov', message }),
+      E(3, 'node.finished', 'card', { duration_ms: 3 }),
+    ]))
+    return { step: all.find((s) => s.code === 'metric_sql_check'), node: all.find((s) => s.kind === 'node') }
+  }
+  // 问题本身带括号（列的中文名里写了单位）：副标题要取到「，结果不可靠」前面最后一个右括号
+  const ONE = '指标「客单价」所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额（元）」求和会重复计算），结果不可靠'
+  const one = decodeOne(ONE)
+  check('metric_sql_check 一行：标题点名哪个指标', one.step?.title === '指标「客单价」所依据的查询未通过 SQL 检查', one.step?.title)
+  check('……原因放副标题（问题里的括号不截断），原话留在展开区',
+    one.step?.sub === '「订单」关联「订单明细」是一对多，对「订单」的「订单金额（元）」求和会重复计算' && one.step?.detail === ONE,
+    `${one.step?.sub} / ${one.step?.detail}`)
+  check('……是提醒（warn），下一步指到 SQL 和数据目录，节点本身照样成功', one.step?.level === 'warn'
+    && !!one.step?.next?.includes('SQL') && !!one.step?.next?.includes('数据目录') && one.step?.fix === 'canvas'
+    && one.node?.status === 'done', `${one.step?.level} ${one.step?.next}`)
+  const two = decodeOne('指标「客单价」所依据的查询有 2 处未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算等），结果不可靠')
+  check('几处问题：标题写处数，副标题是第一处', two.step?.title === '指标「客单价」所依据的查询有 2 处未通过 SQL 检查'
+    && two.step?.sub === '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算等', `${two.step?.title} / ${two.step?.sub}`)
+  const bare = decodeOne('指标「客单价」所依据的查询未通过 SQL 检查，结果不可靠')
+  check('没有括号里的问题：只有标题，不编副标题', bare.step?.title === '指标「客单价」所依据的查询未通过 SQL 检查' && !bare.step?.sub,
+    `${bare.step?.title} / ${bare.step?.sub}`)
+
+  // 助手自查（check）和交付（final.issues）里的 SQL 检查问题：code 是规则编号，field 是 args.sql，另带表、列和 SQL 片段
+  const sqlIssue = (level, code, message, extra = {}) => ({ level, node_id: 'q', edge_id: null, field: 'args.sql', code, message,
+    table: 'orders', ...extra })
+  const ERR = sqlIssue('error', 'fanout_sum', '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联',
+    { column: 'total_amount', sql_excerpt: 'SUM(o.total_amount)' })
+  const WARN = sqlIssue('warning', 'missing_valid_filter', '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选')
+  const INFO = sqlIssue('info', 'join_unconfirmed', '「订单」与「门店」按推断的关系关联（o.store_id = s.id），这条关系尚未确认', { table: 'stores' })
+  const ops = [
+    { op: 'add_node', node: { id: 'q', type: 'tool', data: { label: '订单汇总' } } },
+    { op: 'done', explanation: '' },
+    { op: 'check', status: 'repairing', round: 1, issues: [ERR] },
+    { op: 'check', status: 'failed', issues: [ERR] },
+    { op: 'final', graph: { nodes: [{ id: 'q' }] }, issues: [ERR, INFO, WARN,
+      { level: 'warning', node_id: 'q', edge_id: null, field: null, code: 'tools_dropped', message: '工具被移除' }] },
+  ]
+  const steps = mod.decodeCopilot(ops, { context: 'canvas' })
+  const repairing = steps.find((s) => s.title.startsWith('自查发现'))
+  check('自查交回去改的那一行：节点名 + 中文规则名 + 涉及的表和列，不露规则编号',
+    repairing?.detail === '「订单汇总」一对多关联后重复计算：「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。'
+      + '请先按订单汇总明细再关联（涉及 orders.total_amount）', repairing?.detail)
+  const failedRow = steps.find((s) => s.kind === 'error')
+  check('没修好的那一行同样写规则名', !!failedRow?.detail?.includes('一对多关联后重复计算') && !CODES.test(failedRow.detail), failedRow?.detail)
+  const sqlRow = steps.find((s) => s.code === 'sql_check')
+  check('交付时的 SQL 检查单独一行：数提醒、提示，没修好的错误已经列过不重复', sqlRow?.title === 'SQL 检查：1 处提醒、1 处提示', sqlRow?.title)
+  check('……提醒在前、提示在后，每条写规则名和表', sqlRow?.detail === [
+    '「订单汇总」未筛选有效记录：「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选（涉及 orders）',
+    '「订单汇总」关联条件未经确认：「订单」与「门店」按推断的关系关联（o.store_id = s.id），这条关系尚未确认（涉及 stores）',
+  ].join('\n'), sqlRow?.detail)
+  check('……有提醒时是 warn，下一步指到「参数」里的 SQL，单个节点时给打开设置', sqlRow?.level === 'warn' && !!sqlRow.next?.includes('参数')
+    && sqlRow.nodeId === 'q' && sqlRow.fix === 'canvas', `${sqlRow?.level} ${sqlRow?.next} ${sqlRow?.nodeId}`)
+  check('整个助手流里不露规则编号', !steps.some((s) => CODES.test(`${s.title}\n${s.detail ?? ''}\n${s.sub ?? ''}`)))
+  const chatRow = mod.decodeCopilot(ops, { context: 'chat' }).find((s) => s.code === 'sql_check')
+  check('问数据页没有画布：下一步说去画布里打开这个工作流，不给「打开设置」', !!chatRow?.next?.includes('在画布中打开') && !chatRow.fix,
+    `${chatRow?.next} ${chatRow?.fix}`)
+  const out = mod.copilotOutcome(ops)
+  check('结局里带着不挡运行的 SQL 检查（没修好的错误在 check 里，不重复）', out.sqlChecks.length === 2
+    && out.sqlChecks.map((x) => x.code).join(',') === 'join_unconfirmed,missing_valid_filter'
+    && out.check?.issues.length === 1 && out.check.issues[0].code === 'fanout_sum', JSON.stringify(out.sqlChecks.map((x) => x.code)))
+  const asCheck = mod.issueSqlCheck(out.check.issues[0])
+  check('问题按 SQL 检查读得出级别、表、列、SQL 片段', asCheck?.level === 'error' && asCheck.table === 'orders' && asCheck.column === 'total_amount'
+    && asCheck.sql_excerpt === 'SUM(o.total_amount)' && out.check.issues[0].field === 'args.sql', JSON.stringify(asCheck))
+  check('不是 SQL 检查的问题不按它读', mod.issueSqlCheck({ message: 'x', code: 'tools_dropped' }) === null)
+  const infoOnly = mod.decodeCopilot([{ op: 'final', graph: { nodes: [{ id: 'q' }] }, issues: [INFO] }], { context: 'canvas' })
+    .find((s) => s.code === 'sql_check')
+  check('只有提示：不用提醒色，下一步说依据尚未确认', !!infoOnly && !infoOnly.level && !!infoOnly.next?.includes('尚未确认'),
+    `${infoOnly?.level} ${infoOnly?.next}`)
 })
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')

@@ -19,6 +19,7 @@ from app.data.engine import engines
 from app.data.introspect import introspect
 # 模型要在建表之前注册进 metadata：conftest 的建表只导入了 app.db.base，这个文件单独跑时没有别的模块先导入它们
 from app.db import models  # noqa: F401
+from tests.fixtures.sources import drop_source
 
 _CACHE: dict[str, dict] = {}
 
@@ -106,10 +107,9 @@ async def world(scenic_db):
         for wid in created:
             if (wf := await session.get(Workflow, wid)) is not None:
                 await session.delete(wf)
-        for sid in (ids.source, ids.other):
-            if (row := await session.get(DataSource, sid)) is not None:
-                await session.delete(row)
         await session.commit()
+    for sid in (ids.source, ids.other):
+        await drop_source(sid)
 
 
 async def _impact(source_id: str, table: str) -> dict:

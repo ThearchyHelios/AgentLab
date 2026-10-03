@@ -1036,6 +1036,58 @@ await section('incomplete', '截断的查询结果整组算出来的指标：标
   await cut.ctx.close()
 })
 
+await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤列出级别、规则名、说明、表和列、SQL 片段；指标未通过时标出来并写明原因', async () => {
+  await openQ(page, '1,288')
+  check('没查出问题的查询步骤不出 SQL 检查', await panel(page).locator('[data-ev-sql-checks]').count() === 0)
+  await page.keyboard.press('Escape')
+  await openQ(page, '45,678.5元', { wait: '[data-ev-expression]' })
+  check('通过的指标不出「SQL 检查未通过」', await panel(page).locator('[data-ev-sql-check-failed], [data-ev-sql-check-reason]').count() === 0)
+  await page.keyboard.press('Escape')
+  // 接口的形状：backend/app/api/evidence.py 的查询步骤带 checks（去掉了给模型的那句），指标步骤带 sql_check_failed / sql_check_reason
+  const CHECKS = [
+    { code: 'join_unconfirmed', level: 'info', message: '「订单」与「地区」按推断的关系关联（o.region = r.code），这条关系尚未确认。', table: 'orders' },
+    { code: 'fanout_sum', level: 'error', table: 'orders', column: 'amount', sql_excerpt: 'SUM(o.amount)',
+      message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联。' },
+    { code: 'missing_valid_filter', level: 'warning', message: '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选。', table: 'orders' },
+  ]
+  const REASON = '所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），结果不可靠'
+  const bad = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, checks: CHECKS } : st.step === 'metric' ? { ...st, sql_check_failed: true, sql_check_reason: REASON } : st)) }))
+  await openQ(bad.page, '1,288', { wait: '[data-ev-sql-checks]' })
+  const p = bad.page.locator('[data-evidence-panel]')
+  const items = p.locator('[data-ev-sql-checks] [data-sql-check]')
+  const levels = await items.evaluateAll((els) => els.map((e) => e.getAttribute('data-level')))
+  check('三条都列在 SQL 下面，错误在前、提示在后', levels.join(',') === 'error,warning,info', levels.join(','))
+  const first = await items.first().innerText().catch(() => '')
+  check('一条里有级别、中文规则名、说明、涉及的表和列、SQL 片段', first.includes('错误') && first.includes('一对多关联后重复计算')
+    && first.includes('会重复计算') && first.includes('orders.amount') && first.includes('SUM(o.amount)'), first.replace(/\s+/g, ' '))
+  check('级别四通道：图标 + 文字，三档文字各不相同', (await items.locator('[data-sql-level]').allInnerTexts()).map((t) => t.trim()).join(',')
+    === '错误,提醒,提示' && await items.locator('[data-sql-level] svg').count() === 3)
+  const tones = await items.locator('[data-sql-level]').evaluateAll((els) => els.map((e) => getComputedStyle(e).color))
+  const want = [await tokenColor(bad.page, 'color', 'var(--st-failed)'), await tokenColor(bad.page, 'color', 'var(--st-waiting)'),
+    await tokenColor(bad.page, 'color', 'var(--accent)')]
+  check('级别的颜色走令牌：错误 --st-failed、提醒 --st-waiting、提示 --accent', tones.join('|') === want.join('|'), tones.join('|'))
+  check('悬停写明依据的确证程度', (await items.first().locator('[data-sql-level]').getAttribute('title')) === '依据已确认，结果必然有误')
+  check('不露规则编号', !/fanout_sum|missing_valid_filter|join_unconfirmed/.test(await p.innerText()))
+  await bad.page.keyboard.press('Escape')
+  await openQ(bad.page, '45,678.5元', { wait: '[data-ev-sql-check-failed]' })
+  const chip = p.locator('[data-ev-sql-check-failed]')
+  check('指标名旁有「SQL 检查未通过」标识，悬停看原因', (await chip.innerText().catch(() => '')) === 'SQL 检查未通过'
+    && await chip.getAttribute('title') === REASON, await chip.innerText().catch(() => ''))
+  check('原因写在指标下面', (await p.locator('[data-ev-sql-check-reason]').innerText().catch(() => '')) === REASON)
+  check('和「结果不完整」同一种样式（提醒色的标识）', await chip.evaluate((el) => getComputedStyle(el).color)
+    === await tokenColor(bad.page, 'color', 'var(--st-waiting)') && (await chip.getAttribute('class'))?.includes('chip'))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await bad.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await bad.page.waitForTimeout(200)
+      await bad.page.screenshot({ path: `${SHOTS}/evidence-sqlcheck-metric-${theme}.png` })
+    }
+  }
+  check('没有运行时报错', bad.errors.length === 0, bad.errors[0] ?? '')
+  await bad.ctx.close()
+})
+
 await section('q-narrow', '查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
   const overflow = () => page.evaluate((sel) => {
     const el = document.querySelector(sel)

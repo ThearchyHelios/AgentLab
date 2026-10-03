@@ -1,7 +1,7 @@
 import type { CatalogBusinessDate, CatalogCardinality, CatalogMeasure, CatalogPatchChange, CatalogTableKind } from '../types'
 import {
   CATALOG_CARDINALITY_LABEL, CATALOG_COLUMN_FIELD_LABEL, CATALOG_KIND_LABEL, CATALOG_MEASURE_LABEL, CATALOG_PATCH_TEXT,
-  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT,
+  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT, CODES_TEXT,
 } from '../lib/terms'
 
 // ===========================================================================
@@ -108,10 +108,13 @@ export function relationText(v: unknown): string {
   return `${left} → ${right}${card ? `（${card}）` : ''}`
 }
 
-/** 码值写成一行：1=有效、9=作废 */
+/** 码值的含义：空串是数据剖析写进来的候选，含义还要人填，和目录页同一个说法 */
+export const codeMeaning = (x: unknown) => (String(x ?? '').trim() ? String(x) : CODES_TEXT.pending)
+
+/** 码值写成一行：1=有效、9=作废、8=含义待填写 */
 export function codesText(v: unknown): string {
   if (!v || typeof v !== 'object') return String(v)
-  return Object.entries(v as Record<string, string>).map(([k, x]) => `${k}=${x}`).join('、')
+  return Object.entries(v as Record<string, string>).map(([k, x]) => `${k}=${codeMeaning(x)}`).join('、')
 }
 
 /** 一项的值写成一行字（过程里的明细、卡片里的改前改后都用它）。没有值写「未填写」 */

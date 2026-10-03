@@ -8,7 +8,7 @@ import { CatalogImpactList } from '../components/CatalogImpact'
 import { CATALOG_PATCH_TEXT as T, CATALOG_STATUS_LABEL } from '../lib/terms'
 import type { CatalogPatchChange } from '../types'
 import {
-  catalogTableHref, patchSubmit, patchTarget, patchValueText, patchWhere, type CatalogPatch,
+  catalogTableHref, codeMeaning, patchSubmit, patchTarget, patchValueText, patchWhere, type CatalogPatch,
 } from './catalogPatch'
 
 // ===========================================================================
@@ -211,8 +211,9 @@ function CodesAfter({ before, after }: { before: unknown; after: unknown }) {
       {entries.map(([k, v], i) => (
         <span key={k}>
           {i > 0 && '、'}
-          <span className={clsx(prev[k] !== v && 'font-medium text-[var(--accent)]')} data-code-changed={prev[k] !== v ? k : undefined}>
-            {k}={v}
+          <span className={clsx(prev[k] !== v && 'font-medium text-[var(--accent)]', !String(v ?? '').trim() && 'text-faint')}
+                data-code-changed={prev[k] !== v ? k : undefined}>
+            {k}={codeMeaning(v)}
           </span>
         </span>
       ))}

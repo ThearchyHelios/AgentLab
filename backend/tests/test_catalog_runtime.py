@@ -14,12 +14,12 @@ from types import SimpleNamespace
 from app.core.artifact_store import canonical_json, content_hash, load
 from app.data import catalog
 from app.data.catalog import make_item
-from app.data.engine import engines
 from app.data.introspect import describe_table, introspect
 from app.db.base import SessionLocal
 from app.db.models import Artifact, DataSource
 from app.tools.datasource import _store_schema, build_datasource_tools
 from app.tools.registry import ToolContext
+from tests.fixtures.sources import drop_source
 
 MARK = "（推断，未确认）"
 
@@ -182,4 +182,4 @@ async def test_tools_show_and_freeze_catalog_and_record_query_tables(scenic_db):
             ref = await session.get(Artifact, (result["artifact"], run_id))
         assert ref.meta == {"source_id": row.id, "source": row.name, "tables": ["visits", "parks"]}
     finally:
-        await engines.invalidate(row.id)
+        await drop_source(row.id)

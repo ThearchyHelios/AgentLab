@@ -9,8 +9,9 @@
   从 visits 到 channels 要经过它，正好是两跳的连接路径。group_visits 同理（旅行团与入园记录）。
 - **命名推断必须放过的列**（NOT_INFERRED）：自引用（employees.employee_id 是工号，不是指向自己）、
   多个候选（guide 和 guides 两张表都在，tour_assignments.guide_id 不知道指哪张）、没有对应的表
-  （parking_records.lot_id、operation_logs.operator_id、categories.parentId）、类型对不上
-  （feedback_forms.store_id 是文字，stores.id 是整数）。
+  （operation_logs.operator_id、categories.parentId）、类型对不上（feedback_forms.store_id 是文字，stores.id 是整数）。
+  parking_records.lot_id 没有直接对上的 lot / lots，但和引用它的表共用 parking 前缀的 parking_lots 只有一张，
+  推得出来（在 NAME_RELATIONS 里）。
 - **唯一约束 / 唯一索引。** orders.order_no、channels.channel_code 是列上的 UNIQUE；members.member_no、
   visits.ticket_no 是单独建的唯一索引。
 
@@ -188,6 +189,8 @@ NAME_RELATIONS = frozenset({
     ("tour_groups", ("agency_id",), "agencies", ("id",)),
     ("tour_assignments", ("tour_group_id",), "tour_groups", ("id",)),
     ("lost_and_found", ("park_id",), "parks", ("id",)),
+    # 没有 lot / lots，按引用表共用的 parking 前缀对上 parking_lots
+    ("parking_records", ("lot_id",), "parking_lots", ("id",)),
     # 视图没有约束，按列名同样推得出来：按日汇总的入园人数照样能按 park_id 连到景区
     ("v_daily_visits", ("park_id",), "parks", ("id",)),
 })
@@ -196,7 +199,6 @@ NAME_RELATIONS = frozenset({
 NOT_INFERRED = {
     ("employees", "employee_id"): "自引用：工号，不是指向本表",
     ("tour_assignments", "guide_id"): "多个候选：guide 与 guides",
-    ("parking_records", "lot_id"): "没有名为 lot / lots 的表",
     ("operation_logs", "operator_id"): "没有名为 operator / operators 的表",
     ("categories", "parentId"): "没有名为 parent / parents 的表",
     ("feedback_forms", "store_id"): "类型对不上：文字列指向整数主键",

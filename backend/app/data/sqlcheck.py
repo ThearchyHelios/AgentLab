@@ -169,13 +169,17 @@ class SqlChecker:
         和助手挑表看到的是同一张图（catalog.relation_graph）：目录里的关系，加上没起草过的表按外键、命名现推的；
         被驳回的关系不进图，也不会被现推回来。
         """
+        return [e for e in self.edges_from(a) if e.to_table.lower() == b.lower()]
+
+    def edges_from(self, a: str) -> list[catalog.JoinEdge]:
+        """从 a 出发的全部边。关系图第一次用到时才建，之后复用。"""
         if self._edges is None:
             graph = catalog.relation_graph(self._raw, schema_cache=self.schema_cache)
             index: dict[str, list[catalog.JoinEdge]] = {}
             for table, edges in graph.items():
                 index.setdefault(table.lower(), []).extend(edges)
             self._edges = index
-        return [e for e in self._edges.get(a.lower(), []) if e.to_table.lower() == b.lower()]
+        return list(self._edges.get(a.lower(), []))
 
     # ---- 检查
 
@@ -557,9 +561,45 @@ class _ScopeCheck:
                 continue                          # 两张表都没写目录：没有可对照的，不判
             condition = " AND ".join(filter(None, (self.excerpt(c) for c in group["conds"])))
             if best is None:
-                self._join_checks.append(self._join_unknown(a, b, candidates, condition))
+                parent = self._shared_parent(a, b, pairs)
+                self._join_checks.append(self._join_sibling(a, b, parent, condition) if parent
+                                         else self._join_unknown(a, b, candidates, condition))
             elif best.status not in _STRONG:
                 self._join_checks.append(self._join_proposed(a, b, best, condition))
+
+    def _shared_parent(self, a: _Table, b: _Table, pairs: set[tuple[str, str]]) -> str | None:
+        """兄弟关联：每一对连接列都是两边各自指向同一张父表的同一组列（a.member_id → members.id ← b.member_id）。
+        返回父表名；不是这种连法返回 None。
+
+        目录里不会记 a 和 b 之间的关系，但这不是「连错了列」：比如评价表和标签关联表各自按门店编号指向门店、
+        彼此按门店编号相连。照「对不上任何关系」报警告是误报。
+        """
+        def parents(table: _Table, column: str) -> set[tuple[str, tuple[str, ...]]]:
+            return {(e.to_table.lower(), tuple(c.lower() for c in e.to_columns))
+                    for e in self.checker.edges_from(table.name)
+                    if tuple(c.lower() for c in e.from_columns) == (column,)
+                    and e.cardinality in (None, "many_to_one", "one_to_one")}
+
+        shared: set[tuple[str, tuple[str, ...]]] | None = None
+        for left, right in pairs:
+            common = parents(a, left) & parents(b, right)
+            shared = common if shared is None else shared & common
+            if not shared:
+                return None
+        names = {table for table, _ in shared or ()}
+        return next(iter(names)) if len(names) == 1 else None
+
+    def _join_sibling(self, a: _Table, b: _Table, parent: str, condition: str) -> SqlCheck:
+        item = (self.checker.notes_of(parent) or {}).get("label")
+        label = str(item["value"]) if isinstance(item, dict) and isinstance(item.get("value"), str) \
+            and item["value"].strip() else parent
+        return SqlCheck(
+            code="join_unconfirmed", level="info", table=b.name, sql_excerpt=condition or None,
+            message=(f"「{a.label()}」与「{b.label()}」之间没有直接的关系，这里经共同的「{label}」相连。"
+                     "关联后行数可能成倍增加：确认其中一侧每个键只有一行，或先各自汇总再关联"),
+            for_model=(f"{a.name} 和 {b.name} 按 {condition or '这组条件'} 关联：两边都指向 {parent}，彼此是一对多对多。"
+                       "如果其中一侧每个键不止一行，关联后另一侧的行会被重复，求和、计数会放大；"
+                       "先把一侧筛到每个键一行（例如只取主记录），或分别汇总到这个键再关联"))
 
     def _join_unknown(self, a: _Table, b: _Table, candidates: list[catalog.JoinEdge], condition: str) -> SqlCheck:
         known = "；".join(dict.fromkeys(e.condition() for e in candidates))

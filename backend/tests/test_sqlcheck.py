@@ -254,6 +254,16 @@ async def test_join_unconfirmed_negative(cache, sql):
     assert "join_unconfirmed" not in codes(cache, sql)
 
 
+async def test_sibling_join_through_a_shared_parent_is_only_a_note(cache):
+    """两张表各自按 member_id 指向会员（都是外键），彼此按 member_id 相连：目录里没有这两张表之间的关系，
+    但这是经共同父表推得出来的连法，不是「连错了列」。只提示一句：关联后行数可能成倍增加。"""
+    sql = "SELECT COUNT(*) FROM orders o JOIN member_tag_links t ON t.member_id = o.member_id WHERE o.status = 1"
+    [check] = [c for c in run(cache, sql) if c.code == "join_unconfirmed"]
+    assert check.level == "info"
+    assert "会员" in check.message or "members" in check.message
+    assert "成倍" in check.message
+
+
 async def test_join_level_follows_status(cache):
     sql = "SELECT SUM(i.amount) FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.status = 1"
     assert "join_unconfirmed" not in codes(cache, sql, "confirmed")

@@ -1,11 +1,13 @@
-import type { CatalogDriftTable, RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
+import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel,
+  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, SQL_CHECK_TEXT, TYPE_LABEL, claimTally, evidenceTally,
+  issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
+import { isSqlCheckCode, sortSqlChecks, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
@@ -775,6 +777,20 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         sub: message.match(/^指标「.+?」(.+?)，结果不完整$/)?.[1],
         next: '口径卡对截断的查询结果计数、求和，只算到了取回的部分，出具按缺口降档。'
           + '请在 SQL 中直接聚合（如 COUNT、SUM）或缩小查询范围后重新运行',
+        fix: 'canvas',
+      }
+    }
+    case 'metric_sql_check': {
+      // 「指标「客单价」所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会
+      // 重复计算），结果不可靠」；几处时是「所依据的查询有 2 处未通过 SQL 检查（…等），结果不可靠」（metrics.py
+      // _sql_check_reason）。括号里的问题本身可能带括号：取到「，结果不可靠」前面最后一个右括号
+      const name = message.match(/^指标「(.+?)」/)?.[1]
+      const n = message.match(/有\s*(\d+)\s*处未通过 SQL 检查/)?.[1]
+      const why = message.match(/未通过 SQL 检查（([\s\S]+)）[，,]\s*结果不可靠\s*$/)?.[1]
+      return {
+        title: name ? SQL_CHECK_TEXT.metricTitle(name, n ? Number(n) : 1) : SQL_CHECK_TEXT.metricTitleAnon,
+        sub: why,
+        next: SQL_CHECK_TEXT.metricNext,
         fix: 'canvas',
       }
     }
@@ -2452,8 +2468,14 @@ export interface CopilotIssue {
   label?: string
   /** 落在节点的哪一项配置上（condition、tools、agents[1].tools）：「定位」据此聚焦到检查器里那个输入框 */
   field?: string
-  /** 机读代号：datasource_out_of_scope、tools_dropped…… */
+  /** 机读代号：datasource_out_of_scope、tools_dropped……；SQL 检查是规则编号（fanout_sum……） */
   code?: string
+  /** error / warning / info。老会话、老后端不给 */
+  level?: 'error' | 'warning' | 'info'
+  /** SQL 检查的问题另带：涉及的表和列、SQL 片段 */
+  table?: string
+  column?: string
+  sqlExcerpt?: string
 }
 
 /**
@@ -2468,11 +2490,16 @@ function parseIssue(v: unknown, labels?: (id: string) => string | undefined): Co
   }
   if (v && typeof v === 'object') {
     const o = v as Record<string, unknown>
+    const str = (x: unknown) => (typeof x === 'string' && x ? x : undefined)
     return named({
       message: String(o.message ?? ''),
       ...(o.node_id ? { nodeId: String(o.node_id) } : {}),
-      ...(typeof o.field === 'string' && o.field ? { field: o.field } : {}),
-      ...(typeof o.code === 'string' && o.code ? { code: o.code } : {}),
+      ...(str(o.field) ? { field: str(o.field) } : {}),
+      ...(str(o.code) ? { code: str(o.code) } : {}),
+      ...(o.level === 'error' || o.level === 'warning' || o.level === 'info' ? { level: o.level } : {}),
+      ...(str(o.table) ? { table: str(o.table) } : {}),
+      ...(str(o.column) ? { column: str(o.column) } : {}),
+      ...(str(o.sql_excerpt) ? { sqlExcerpt: str(o.sql_excerpt) } : {}),
     })
   }
   const text = String(v ?? '')
@@ -2480,9 +2507,37 @@ function parseIssue(v: unknown, labels?: (id: string) => string | undefined): Co
   return named(m ? { nodeId: m[1], message: m[2] || text } : { message: text })
 }
 
-/** 一条自查问题写成一行：带节点名（认得出时），认不出才退到 id */
-export const issueLine = (x: CopilotIssue): string =>
-  x.nodeId ? `「${x.label ?? x.nodeId}」${x.message}` : x.message
+/**
+ * 一条自查问题写成一行：带节点名（认得出时），认不出才退到 id。SQL 检查的问题前面写中文规则名、后面写涉及的表和列，
+ * 不露规则编号
+ */
+export const issueLine = (x: CopilotIssue): string => {
+  const where = isSqlCheckCode(x.code) ? sqlCheckWhere({ table: x.table ?? '', column: x.column }) : ''
+  const body = isSqlCheckCode(x.code)
+    ? `${sqlRuleLabel(x.code)}：${x.message}${where ? `（${SQL_CHECK_TEXT.where} ${where}）` : ''}`
+    : x.message
+  return x.nodeId ? `「${x.label ?? x.nodeId}」${body}` : body
+}
+
+/** 一条自查问题按 SQL 检查读（界面上画级别、规则名、表和列、SQL 片段）；不是 SQL 检查的返回 null */
+export function issueSqlCheck(x: CopilotIssue): SqlCheckItem | null {
+  if (!isSqlCheckCode(x.code)) return null
+  return {
+    code: x.code, level: x.level ?? 'error', message: x.message, table: x.table ?? '',
+    ...(x.column ? { column: x.column } : {}), ...(x.sqlExcerpt ? { sql_excerpt: x.sqlExcerpt } : {}),
+  }
+}
+
+/** final.issues 里对照数据目录的 SQL 检查结果（不挡运行的提醒、提示也在里面）；自查没修好、已经列过的错误不再算 */
+function sqlIssuesOf(ops: CopilotOp[], labels: (id: string) => string | undefined): CopilotIssue[] {
+  const final = [...ops].reverse().find((o) => o.op === 'final')
+  const list: unknown[] = final && Array.isArray(final.issues) ? final.issues : []
+  const failed = [...ops].reverse().find((o) => o.op === 'check' && o.status === 'failed')
+  const listed = new Set((failed && Array.isArray(failed.issues) ? failed.issues : [])
+    .map((x: unknown) => parseIssue(x)).map((x: CopilotIssue) => `${x.nodeId ?? ''}|${x.code ?? ''}|${x.message}`))
+  return list.map((x) => parseIssue(x, labels))
+    .filter((x) => isSqlCheckCode(x.code) && !listed.has(`${x.nodeId ?? ''}|${x.code ?? ''}|${x.message}`))
+}
 
 /**
  * 节点 id → 名字。先认这一轮操作流里加过、改过的（问数据页没有画布，只有这一份），
@@ -2817,6 +2872,23 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
           add({ id: `cm-${i}-${t}`, seq: i, kind: 'note', status: 'done', level: 'warn',
                 title: clip(`已跳过一个步骤：节点类型「${t}」不存在`, 80) })
         }
+        // 对照数据目录的 SQL 检查：错误交回模型改过（没改好的在自查那一行），不挡运行的提醒、提示照样要看得见
+        const sql = sqlIssuesOf(ops.slice(0, i), labels)
+        if (sql.length) {
+          const n = { error: 0, warning: 0, info: 0 }
+          for (const x of sql) n[x.level ?? 'error'] += 1
+          const nodes = [...new Set(sql.map((x) => x.nodeId).filter(Boolean))]
+          add({
+            id: `cs-${i}`, seq: i, kind: 'note', status: 'done', code: 'sql_check',
+            ...(n.error || n.warning ? { level: 'warn' as const } : {}),
+            title: SQL_CHECK_TEXT.assistantTitle(SQL_CHECK_TEXT.counts(n.error, n.warning, n.info)),
+            detail: sortSqlChecks(sql).map(issueLine).join('\n'),
+            // 问数据页没有画布：下一步说去画布里打开这个工作流
+            next: n.error || n.warning ? (canvas ? SQL_CHECK_TEXT.assistantNext : SQL_CHECK_TEXT.assistantNextChat)
+              : SQL_CHECK_TEXT.assistantInfoNext,
+            ...(nodes.length === 1 ? { nodeId: nodes[0], ...(canvas ? { fix: 'canvas' as const } : {}) } : {}),
+          })
+        }
         // 工具绑定变化单独成一行：改图回执以前只说「修改 1」，模型改提示词时漏写 tools、
         // 把查库的工具整个抹掉，要到运行结果不对才发现
         const changes = toolChangesOf(op)
@@ -2913,6 +2985,8 @@ export interface CopilotOutcome {
   toolChanges: ToolChange[]
   /** 自查的「工具被去掉了」警告（tools_dropped）：这一轮的要求里没提到去掉 */
   dropped: CopilotIssue[]
+  /** 对照数据目录的 SQL 检查结果（final.issues），自查没修好、已经列在 check 里的不重复 */
+  sqlChecks: CopilotIssue[]
 }
 
 export function copilotOutcome(
@@ -2920,7 +2994,7 @@ export function copilotOutcome(
 ): CopilotOutcome {
   const res: CopilotOutcome = {
     kind: running ? 'running' : 'empty', skipped: [], added: 0, updated: 0, removed: 0,
-    toolChanges: [], dropped: [],
+    toolChanges: [], dropped: [], sqlChecks: [],
   }
   const labels = labelsOf(ops, labelOf)
   for (const op of ops) {
@@ -2952,6 +3026,7 @@ export function copilotOutcome(
         res.toolChanges = toolChangesOf(op)
         // 同一批警告 final.issues 里也有一份：自查已经带回来了就不再算一遍
         if (!res.dropped.length) res.dropped = droppedOf(op)
+        res.sqlChecks = sqlIssuesOf(ops, labels)
         if (!running) res.kind = 'built'
         break
       case 'error':
