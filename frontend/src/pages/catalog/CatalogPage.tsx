@@ -4,12 +4,13 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, BookMarked, Database, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
-import type { CatalogDetail, CatalogList } from '../../types'
-import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, toast } from '../../components/ui'
+import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
+import { EmptyState, ErrorState, PageHeader, Skeleton, toast } from '../../components/ui'
 import { useDatasources, useOnReconnect } from '../../store/catalog'
 import { CATALOG_TEXT as CT } from '../../lib/terms'
-import { StatusLegend } from './parts'
+import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
+import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
 import { filterCounts, progressOf, rowFromDetail, visibleRows } from './model'
 import type { ListFilter, ListSort } from './model'
@@ -86,6 +87,15 @@ export function CatalogPage() {
     void load()
   }, [load])
 
+  // 上一张 / 下一张按清单当前的筛选和排序走；正在看的表不在筛选结果里（刚确认完、从关联关系跳过来）时按全部表走
+  const [prev, next] = useMemo(() => {
+    if (!table) return [null, null]
+    const list = visible.some((r) => r.table_name === table) ? visible : visibleRows(rows, '', 'all', sort)
+    const i = list.findIndex((r) => r.table_name === table)
+    if (i < 0) return [null, null]
+    return [list[i - 1]?.table_name ?? null, list[i + 1]?.table_name ?? null]
+  }, [table, visible, rows, sort])
+
   const filtered = !!query.trim() || filter !== 'all'
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
   const hasTables = rows.length > 0
@@ -117,9 +127,6 @@ export function CatalogPage() {
       </div>
     )
   } else {
-    const pendingNext = rows.find((r) => r.in_schema && r.counts.proposed > 0)
-    const stats = { pending: 0, done: 0, none: 0 }
-    for (const r of rows) stats[progressOf(r.counts)]++
     body = (
       <div className="flex min-h-0 flex-1">
         <aside className={clsx('min-h-0 w-full flex-col border-r lg:flex lg:w-[380px] lg:shrink-0 xl:w-[420px]', table ? 'hidden' : 'flex')}>
@@ -149,39 +156,12 @@ export function CatalogPage() {
           />
         </aside>
         <section className={clsx('min-h-0 min-w-0 flex-1 flex-col lg:flex', table ? 'flex' : 'hidden')} aria-label={table ?? CT.overviewTitle}>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <div className="mx-auto max-w-xl space-y-4 p-6" data-catalog-overview="">
-              {empty
-                ? (
-                  <EmptyState icon={<BookMarked size={22} />} title={CT.emptyTitle} body={CT.emptyBody} offline={false}
-                              action={draftButton(true)} className="!py-8" />
-                )
-                : (
-                  <div className="space-y-3">
-                    <h2 className="text-sm font-semibold">{CT.overviewTitle}</h2>
-                    <p className="text-xs leading-relaxed text-dim">{CT.overviewBody}</p>
-                    <p className="tnum text-xs text-dim" data-catalog-stats={`${stats.pending},${stats.done},${stats.none}`}>
-                      {CT.overviewStats(rows.length, stats.pending, stats.done, stats.none)}
-                    </p>
-                    <ProgressBar pending={stats.pending} done={stats.done} none={stats.none} />
-                    {pendingNext && (
-                      <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <button type="button" className="btn btn-primary btn-sm" onClick={() => openTable(pendingNext.table_name)}
-                                data-catalog-review-next={pendingNext.table_name}>
-                          {CT.reviewNext(pendingNext.label ?? pendingNext.table_name)}
-                        </button>
-                        <span className="text-2xs text-faint">{CT.reviewNextHint}</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-              {data.system_notes && <SystemNotesNotice />}
-              <div className="rounded-lg border bg-panel p-3">
-                <div className="mb-2 text-2xs font-medium text-dim">{CT.legend}</div>
-                <StatusLegend detailed />
-              </div>
-            </div>
-          </div>
+          {table
+            ? (
+              <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} prev={prev} next={next}
+                           onOpen={openTable} onBack={() => navigate(base)} onDetail={onDetail} />
+            )
+            : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
         </section>
       </div>
     )
@@ -218,14 +198,48 @@ export function CatalogPage() {
   )
 }
 
-/** 导入表格的源：说明是系统生成的，只读 */
-export function SystemNotesNotice() {
+/** 没有选中表时的右栏：空目录时引导起草；否则写审阅进度，给出下一张该审的表 */
+function Overview({ rows, empty, systemNotes, draft, onOpen }: {
+  rows: CatalogTableRow[]
+  empty: boolean
+  systemNotes: boolean
+  draft: ReactNode
+  onOpen: (table: string) => void
+}) {
+  const pendingNext = rows.find((r) => r.in_schema && r.counts.proposed > 0)
+  const stats = { pending: 0, done: 0, none: 0 }
+  for (const r of rows) stats[progressOf(r.counts)]++
   return (
-    <Notice tone="info" attr={{ 'data-catalog-system-notes': '' }}>
-      <p className="font-medium">{CT.systemTitle}</p>
-      <p className="mt-0.5 text-dim">{CT.systemBody}</p>
-      <p className="mt-0.5 text-dim">{CT.systemCovered}</p>
-    </Notice>
+    <div className="relative min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto max-w-xl space-y-4 p-6" data-catalog-overview="">
+        {empty
+          ? <EmptyState icon={<BookMarked size={22} />} title={CT.emptyTitle} body={CT.emptyBody} offline={false} action={draft} className="!py-8" />
+          : (
+            <div className="space-y-3">
+              <h2 className="text-sm font-semibold">{CT.overviewTitle}</h2>
+              <p className="text-xs leading-relaxed text-dim">{CT.overviewBody}</p>
+              <p className="tnum text-xs text-dim" data-catalog-stats={`${stats.pending},${stats.done},${stats.none}`}>
+                {CT.overviewStats(rows.length, stats.pending, stats.done, stats.none)}
+              </p>
+              <ProgressBar pending={stats.pending} done={stats.done} none={stats.none} />
+              {pendingNext && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => onOpen(pendingNext.table_name)}
+                          data-catalog-review-next={pendingNext.table_name}>
+                    {CT.reviewNext(pendingNext.label ?? pendingNext.table_name)}
+                  </button>
+                  <span className="text-2xs text-faint">{CT.reviewNextHint}</span>
+                </div>
+              )}
+            </div>
+          )}
+        {systemNotes && <SystemNotesNotice />}
+        <div className="rounded-lg border bg-panel p-3">
+          <div className="mb-2 text-2xs font-medium text-dim">{CT.legend}</div>
+          <StatusLegend detailed />
+        </div>
+      </div>
+    </div>
   )
 }
 

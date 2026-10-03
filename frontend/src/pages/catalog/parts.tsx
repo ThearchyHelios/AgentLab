@@ -5,6 +5,7 @@ import { Check, CircleCheck, CircleDashed, CircleX, RotateCcw, ShieldCheck, Tras
 import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogCounts, CatalogReviewAction, CatalogSource, CatalogStatus } from '../../types'
+import { Notice } from '../../components/ui'
 import { formatDateTime, formatNumber } from '../../lib/format'
 import {
   CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT,
@@ -104,7 +105,7 @@ export interface ReviewTarget {
 /**
  * 单项的来源和状态。触发按钮就是状态标识（compact 时只有图标，列表格里每格一个）；点开是一个小弹层：
  * 位置、来源、状态说明、更新时间，以及确认 / 驳回 / 恢复。弹层挂在 body 上、按触发按钮的位置固定定位，
- * 不会被表格的横向滚动裁掉；滚动或改窗口大小时收起。键盘：Enter 打开，焦点落到第一个可点的操作，
+ * 不会被表格的横向滚动裁掉；滚动时跟着触发按钮走，滚出视野或改窗口大小时收起。键盘：Enter 打开，焦点落到第一个可点的操作，
  * ←→↑↓ 在操作之间移动，Tab 在弹层里循环，Esc 收起并把焦点还给触发按钮
  */
 export function ItemMark({ target, compact = false, disabled = false, onReview }: {
@@ -130,18 +131,25 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
     if (focusBack) trigger.current?.focus()
   }
 
-  // 先按触发按钮下方放，量过弹层的高度后，下方放不下就翻到上方
-  useLayoutEffect(() => {
-    if (!open) return
+  // 先按触发按钮下方放，量过弹层的高度后，下方放不下就翻到上方。返回 false 表示触发按钮已经滚出视野
+  const place = (): boolean => {
     const r = trigger.current?.getBoundingClientRect()
     const el = panel.current
-    if (!r || !el) return
+    if (!r || !el) return false
+    if (r.bottom < 0 || r.top > window.innerHeight) return false
     const w = el.offsetWidth
     const h = el.offsetHeight
     const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8))
     const below = r.bottom + 4
     const top = below + h > window.innerHeight - 8 && r.top - h - 4 > 8 ? r.top - h - 4 : below
-    setPos({ top, left })
+    setPos((p) => (p && p.top === top && p.left === left ? p : { top, left }))
+    return true
+  }
+  const placeRef = useRef(place)
+  placeRef.current = place
+
+  useLayoutEffect(() => {
+    if (open) placeRef.current()
   }, [open])
 
   useEffect(() => {
@@ -150,8 +158,11 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
       const t = e.target as Node
       if (!panel.current?.contains(t) && !trigger.current?.contains(t)) close(false)
     }
-    // 弹层自己里面的滚动不算（它不滚）；页面或表格一滚，固定定位就对不上触发按钮了
-    const onScroll = (e: Event) => { if (!panel.current?.contains(e.target as Node)) close(false) }
+    // 页面或表格滚动时跟着触发按钮走；滚出视野就收起
+    const onScroll = (e: Event) => {
+      if (panel.current?.contains(e.target as Node)) return
+      if (!placeRef.current()) close(false)
+    }
     const onResize = () => close(false)
     document.addEventListener('mousedown', onDown)
     window.addEventListener('scroll', onScroll, true)
@@ -163,12 +174,13 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
     }
   }, [open])
 
-  // 定好位置以后把焦点交给第一个能点的操作
+  // 定好位置以后把焦点交给第一个能点的操作（只在打开那一下）
+  const placed = !!pos
   useEffect(() => {
-    if (!open || !pos) return
+    if (!open || !placed) return
     const first = panel.current?.querySelector<HTMLButtonElement>('[data-review-action]:not([disabled])')
     ;(first ?? panel.current)?.focus({ preventScroll: true })
-  }, [open, pos])
+  }, [open, placed])
 
   const onKey = (e: ReactKeyboardEvent) => {
     if (e.key === 'Escape') {
@@ -273,7 +285,7 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
               {human ? CT.remove : CT.reset}
             </ActionButton>
           </div>
-          <p className="mt-2 text-2xs leading-relaxed text-faint">{human ? CT.removeHint : CT.resetHint}</p>
+          {canReset && <p className="mt-2 text-2xs leading-relaxed text-faint">{human ? CT.removeHint : CT.resetHint}</p>}
         </div>,
         document.body,
       )}
@@ -289,5 +301,16 @@ function ActionButton({ icon, children, disabled, onClick, action, title }: {
       <span aria-hidden>{icon}</span>
       {children}
     </button>
+  )
+}
+
+/** 导入表格的源：说明是系统生成的，只读 */
+export function SystemNotesNotice() {
+  return (
+    <Notice tone="info" attr={{ 'data-catalog-system-notes': '' }}>
+      <p className="font-medium">{CT.systemTitle}</p>
+      <p className="mt-0.5 text-dim">{CT.systemBody}</p>
+      <p className="mt-0.5 text-dim">{CT.systemCovered}</p>
+    </Notice>
   )
 }

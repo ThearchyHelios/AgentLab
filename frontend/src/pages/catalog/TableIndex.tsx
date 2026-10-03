@@ -150,7 +150,7 @@ export function TableIndex({
         </div>
       </div>
 
-      <ul ref={listRef} className="min-h-0 flex-1 overflow-y-auto" aria-label={CT.tableCount(rows.length, total)}>
+      <ul ref={listRef} className="relative min-h-0 flex-1 overflow-y-auto" aria-label={CT.tableCount(rows.length, total)}>
         {rows.map((r, i) => (
           <Row key={r.table_name} row={r} index={i} active={r.table_name === active} checked={selected.has(r.table_name)}
                onToggle={toggle} onOpen={onOpen} onKey={onRowKey} />

@@ -316,7 +316,7 @@ export function validateForm(form: EditForm, text: ProblemText): FormProblems {
 }
 
 /** 业务主键里写了表结构中没有的列（只提醒，不拦：表结构会变，目录里先写着的列等结构同步后自然对上） */
-export function unknownKeys(text: string, structure: CatalogStructureColumn[]): string[] {
+export function unknownKeys(text: string, structure: { name: string }[]): string[] {
   if (!structure.length) return []
   const names = new Set(structure.map((c) => c.name.toLowerCase()))
   return splitList(text).filter((k) => !names.has(k.toLowerCase()))
