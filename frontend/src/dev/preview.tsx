@@ -15,7 +15,7 @@ import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
   CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_CATALOG_PATCH, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
-  markupRun, mergeRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
+  markupRun, mergeRun, mixedRun, parallelQueryRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
 
@@ -364,6 +364,10 @@ function synthetic(name: string): StreamTurn[] {
                   columns: ['factory_code', 'line_name', 'attribute_group', 'output_qty'],
                   rows: [['1063', '一号线', '001', 1520], ['1064', '二号线', '002', 1310], ['1065', '三号线', '001', 980]],
                   row_count: 3 }) } }]
+    case 'parallel':
+      // 两个并行的查询节点用同一个工具；第一条查询没通过 SQL 检查，口径卡的问题指到它的 SQL
+      return [{ id: 'parallel', question: '订单金额和退款数', phase: 'done', status: '已完成',
+                steps: decodeRun(parallelQueryRun(), { status: 'succeeded' }) }]
     case 'merge':
       // 合并查询：两个库各查一次、在库外按门店合并，带两道警告（键类型不一致、行数放大）
       return [{ id: 'merge', question: '按门店合并销售和到店人数', phase: 'done', status: '已完成',
@@ -533,6 +537,9 @@ function Preview() {
         turns={synthetic(syn)}
         onStepHover={params.get('link') === '1' ? (id) => { (window as any).__hovered = id } : undefined}
         onStepFocus={params.get('link') === '1' ? (id) => { linked.push(id) } : undefined}
+        // 「打开设置」：记下要打开哪个节点、落到哪一栏（指标的问题落到来源查询的 SQL）
+        onStepOpen={params.get('link') === '1'
+          ? (id, field) => { ((window as any).__opened ??= []).push([id, field ?? null]) } : undefined}
         renderTurnActions={(t) => (t.phase === 'error'
           ? <button type="button" className="btn btn-xs"><RotateCw size={11} aria-hidden /> 重试本轮</button>
           : null)}

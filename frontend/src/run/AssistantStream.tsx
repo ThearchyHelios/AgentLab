@@ -15,7 +15,8 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { SqlCheckList } from './SqlChecks'
 import {
   ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
@@ -135,8 +136,8 @@ interface StreamCtx {
   dense: boolean
   onHover?: (nodeId: string | null) => void
   onFocus?: (nodeId: string) => void
-  /** 打开这个节点的设置去改（编排页）。下一步是「去画布改」的行据此给直达入口 */
-  onOpen?: (nodeId: string) => void
+  /** 打开这个节点的设置去改（编排页）。下一步是「去画布改」的行据此给直达入口；给了 field 就落到那一栏（args.sql） */
+  onOpen?: (nodeId: string, field?: string) => void
   activeNodeId?: string | null
   skewMs: number
   openArtifact: (id: string, title?: string) => void
@@ -196,7 +197,7 @@ export function AssistantStream({
    * 编排页：打开某个节点的设置。节点没绑工具、团队轮数不够这类要去画布上改的，
    * 报错和提醒行据此给「打开设置」；不传就只说该去哪儿改
    */
-  onStepOpen?: (nodeId: string) => void
+  onStepOpen?: (nodeId: string, field?: string) => void
   /** 画布上悬停的节点：对应的步骤行高亮 */
   activeNodeId?: string | null
   /** 贴着底部时，新步骤到来自动滚到底。离开底部就不再拽人 */
@@ -877,19 +878,23 @@ function failureOf(turn: StreamTurn): Failure | null {
  * 下一步的直达入口。要去画布上改的，编排页能直接打开那个节点的设置；别处只说该去哪儿，
  * 不装作能点。「接着跑」「重新运行」由页面自己放（renderTurnActions），这里不给
  */
-function FixAction({ fix, nodeId, label, to, first }: {
+function FixAction({ fix, nodeId, label, to, first, field }: {
   fix?: FixKind | 'rerun'; nodeId?: string; label?: string
   /** lib/explain 的 fixTo：直达要改的那一项 */
   to?: string
   /** lib/explain 的 fixFirst：先改好才接得下去，入口写明要改什么 */
   first?: boolean
+  /** 要改的那一栏（args.sql：调用工具节点里写死的 SQL）。给了就落到那一栏，入口写「打开「取数」的 SQL」 */
+  field?: string
 }) {
   const { onOpen } = useContext(Ctx)
   const cls = 'inline-flex shrink-0 items-center gap-1 rounded px-1 text-2xs text-[var(--accent)] underline-offset-2 transition-colors hover:bg-hover hover:underline'
   if (fix === 'canvas' && nodeId && onOpen) {
+    const sql = field === 'args.sql' || field === 'sql'
     return (
-      <button type="button" className={cls} data-fix="canvas" onClick={() => onOpen(nodeId)}>
-        <Settings2 size={10} aria-hidden /> 打开{label ? `「${label}」的` : ''}设置
+      <button type="button" className={cls} data-fix="canvas" data-fix-node={nodeId} data-fix-field={field || undefined}
+              onClick={() => onOpen(nodeId, field || undefined)}>
+        <Settings2 size={10} aria-hidden /> {sql ? RUN_SQL_CHECK_TEXT.openSql(label) : `打开${label ? `「${label}」的` : ''}设置`}
       </button>
     )
   }
@@ -1064,7 +1069,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
   const [open, setOpen] = useState(false)
   const Icon = ICONS[step.kind] ?? CircleDot
   const result = step.result
-  const expandable = !!(step.detail || result || step.raw || step.artifact)
+  const expandable = !!(step.detail || result || step.raw || step.artifact || step.checks?.length)
   const table = result ? parseQueryResult(result) : null
   const status = step.status ?? 'done'
   // 失败的节点：收着的时候就说为什么（和轮次顶上的报错同一份 lib/explain），展开再看原因、
@@ -1163,7 +1168,9 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
             <CornerDownRight size={10} className="mt-[2px] shrink-0" aria-hidden />
             <span className="min-w-0 [overflow-wrap:anywhere]">{step.next}</span>
           </span>
-          <FixAction fix={step.fix} nodeId={step.nodeId} />
+          {/* 要改的是另一个节点（指标的问题出在来源查询的 SQL 上）：入口落到那个节点的那一栏 */}
+          <FixAction fix={step.fix} nodeId={step.fixNode ?? step.nodeId} field={step.fixField}
+                     label={step.fixNode ? step.fixLabel : undefined} />
         </div>
       )}
 
@@ -1516,6 +1523,13 @@ function StepDetail({ step, table, explained }: {
           <pre className={pre}>
             {detail}
           </pre>
+        </div>
+      )}
+      {!!step.checks?.length && (
+        // 对照数据目录的 SQL 检查：查询那一行是这次查询的检查结果，指标那一行是来源查询没通过的那几条
+        <div className="text-2xs" data-step-sql-checks="">
+          <div className="mb-0.5 text-dim">{RUN_SQL_CHECK_TEXT.toolChecks}</div>
+          <SqlCheckList checks={step.checks} />
         </div>
       )}
       {table

@@ -735,6 +735,32 @@ await section('合并查询：输入、合并 SQL、结果预览，警告各占�
   await narrow.page.close()
 })
 
+await section('并行查询各配各的；查询的 SQL 检查；指标的问题指到来源查询的 SQL（A1、B2）', async () => {
+  const { page, errors } = await open('syn=parallel&link=1', { w: 1100, h: 900, name: 'parallel' })
+  const qa = page.locator('[data-node-id="q_a"]').filter({ hasText: 'SQL 检查：1 处错误' }).last()
+  check('出问题的那条查询：行上就说「SQL 检查：1 处错误」', await qa.count() === 1)
+  await qa.locator('button').first().click()
+  await page.waitForTimeout(200)
+  const list = qa.locator('[data-step-sql-checks] [data-sql-check="fanout_sum"][data-level="error"]')
+  const text = (await qa.locator('[data-step-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('展开：用 SQL 检查清单列出级别、规则名、说明、涉及的表和列', await list.count() === 1 && text.includes('错误')
+    && text.includes('一对多关联后重复计算') && text.includes('orders.total_amount') && !text.includes('fanout_sum'), text)
+  const qb = (await page.locator('[data-node-id="q_b"]').last().innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('另一条查询没有检查结果，也没被配上别人的结果', !qb.includes('SQL 检查') && !qb.includes('119'), qb)
+  const metric = page.locator('[data-step-code="metric_sql_check"]')
+  check('两个指标出自同一条查询：时间线一行', await metric.count() === 1, String(await metric.count()))
+  const fix = metric.locator('[data-fix="canvas"]')
+  check('「打开设置」落到来源查询节点的 SQL：写「打开「订单金额查询」的 SQL」', (await fix.innerText().catch(() => '')).trim()
+    === '打开「订单金额查询」的 SQL' && await fix.getAttribute('data-fix-node') === 'q_a'
+    && await fix.getAttribute('data-fix-field') === 'args.sql', await fix.innerText().catch(() => ''))
+  await fix.click()
+  const opened = await page.evaluate(() => window.__opened ?? [])
+  check('……点了打开的是来源查询节点的 args.sql，不是口径卡', JSON.stringify(opened) === JSON.stringify([['q_a', 'args.sql']]),
+    JSON.stringify(opened))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+})
+
 await section('参考了哪些表：画布右栏和问数据页（context 操作）', async () => {
   const c = await open('syn=copilot-context&dense=1', { w: 380, h: 800, name: 'copilot-context' })
   const row = c.page.locator('[data-step-code="copilot_context"]')

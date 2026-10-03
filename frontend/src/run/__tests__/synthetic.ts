@@ -365,12 +365,50 @@ export function mergeRun(): RunEvent[] {
     truncated: false, duration_ms: 12, query_artifact: 'mq-merge', lineage: true,
     warnings: [{ code: 'key_type_mismatch', message: '键类型' }, { code: 'rows_grew', message: '行数' }],
   }, 0.02)
-  ev('log', 'merge', { level: 'warn', code: 'merge_key_type',
+  // 结构化字段和 engine/merge_query._warnings 一致：界面读字段，不从 message 里解析
+  ev('log', 'merge', { level: 'warn', code: 'merge_key_type', keys: ['s.门店', 'v.门店'],
+    detail: "s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）",
     message: "合并键类型不一致：s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）。SQLite 比较时会做隐式转换：文本形式的编号（如 '001'、'01'）都会等于数值 1，也可能完全匹配不上。请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换" })
-  ev('log', 'merge', { level: 'warn', code: 'merge_rows_grew',
+  ev('log', 'merge', { level: 'warn', code: 'merge_rows_grew', rows: 8, input: 's', input_rows: 4,
+    duplicates: '「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组',
     message: '合并结果有 8 行，多于行数最多的输入「s」（4 行）：合并键可能不唯一，同一行被重复匹配。「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组。请检查合并条件是否覆盖了全部键（例如同时按日期和门店），或先在源库里聚合到相同粒度' })
   ev('node.finished', 'merge', { duration_ms: 15, attempt: 1 })
   ev('run.finished', null, { output: {}, timing: { wall_ms: 400, active_ms: 400, wait_ms: 0 } })
+  return out
+}
+
+/**
+ * 两个查询节点并行、用同一个数据源工具（独立的调用工具节点不带 call_id）：时间线要按节点配对，不能按工具名。
+ * 第一条查询一对多关联后求和，tool.end 带着 SQL 检查结果；口径卡里两个指标取自它，日志按查询归并成一行，
+ * 带着来源查询节点和它的 SQL 那一栏（engine/nodes/metrics._emit_sql_check_logs）
+ */
+export const PARALLEL_SQL_A = 'SELECT SUM(o.total_amount) AS gmv FROM orders o JOIN order_items i ON i.order_id = o.id'
+export const PARALLEL_SQL_B = 'SELECT COUNT(*) AS refunds FROM refunds'
+export const FANOUT_PROBLEM = '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'
+export const FANOUT_CHECK = { code: 'fanout_sum', level: 'error', table: 'orders', column: 'total_amount',
+  relation_id: 'r1a2b3c4d5e6', message: `${FANOUT_PROBLEM}。请先按订单汇总明细再关联` }
+export function parallelQueryRun(): RunEvent[] {
+  const { out, ev } = builder('syn-parallel')
+  ev('run.started', null, { nodes: 4, resumed: false })
+  ev('node.started', 'q_a', { node_type: 'tool', label: '订单金额查询' })
+  ev('node.started', 'q_b', { node_type: 'tool', label: '退款查询' })
+  ev('tool.start', 'q_a', { tool: 'db_query__shop', args: { sql: PARALLEL_SQL_A } })
+  ev('tool.start', 'q_b', { tool: 'db_query__shop', args: { sql: PARALLEL_SQL_B } })
+  // 先开始的那条先结束：按工具名配对时，它会配到后开始的那一行上
+  ev('tool.end', 'q_a', { tool: 'db_query__shop', duration_ms: 40, artifact: 'ts-q_a', query_artifact: 'qs-q_a',
+    preview: JSON.stringify({ columns: ['gmv'], rows: [[119160]], row_count: 1, truncated: false, sql: PARALLEL_SQL_A, source: 'shop' }),
+    checks: [FANOUT_CHECK] }, 0.04)
+  ev('tool.end', 'q_b', { tool: 'db_query__shop', duration_ms: 30, artifact: 'ts-q_b', query_artifact: 'qs-q_b',
+    preview: JSON.stringify({ columns: ['refunds'], rows: [[7]], row_count: 1, truncated: false, sql: PARALLEL_SQL_B, source: 'shop' }) }, 0.03)
+  ev('node.finished', 'q_a', { duration_ms: 45, attempt: 1 })
+  ev('node.finished', 'q_b', { duration_ms: 35, attempt: 1 })
+  ev('node.started', 'card', { node_type: 'metrics', label: '订单口径' })
+  ev('log', 'card', { level: 'warn', code: 'metric_sql_check', metric: 'gmv', metrics: ['gmv', 'aov'],
+    metric_names: ['订单金额', '客单价'], reason: `所依据的查询未通过 SQL 检查（${FANOUT_PROBLEM}），结果不可靠`,
+    problems: [FANOUT_PROBLEM], checks: [FANOUT_CHECK], query_artifact: 'qs-q_a', source_node: 'q_a', source_field: 'args.sql',
+    message: `指标「订单金额」「客单价」所依据的查询未通过 SQL 检查（${FANOUT_PROBLEM}），结果不可靠` })
+  ev('node.finished', 'card', { duration_ms: 3, attempt: 1 })
+  ev('run.finished', null, { output: {}, timing: { wall_ms: 300, active_ms: 300, wait_ms: 0 } })
   return out
 }
 

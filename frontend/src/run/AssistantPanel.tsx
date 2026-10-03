@@ -791,8 +791,12 @@ function RunView({ onBack, reveal, onRevealed }: {
             clockSkewMs={trace.skewMs ?? 0}
             onStepHover={setHoveredNode}
             onStepFocus={focusNode}
-            // 没绑工具、轮数不够这种要去画布上改的：直接打开那个节点的设置，镜头也带过去
-            onStepOpen={(id) => { select(id); focusNode(id) }}
+            // 没绑工具、轮数不够这种要去画布上改的：直接打开那个节点的设置，镜头也带过去。
+            // 给了栏位（指标的问题出在来源查询的 SQL 上，field 是 args.sql）就落到那一栏
+            onStepOpen={(id, field) => {
+              if (field) revealField(id, field, { focus: true })
+              else { select(id); focusNode(id) }
+            }}
             activeNodeId={hoveredNodeId}
             reveal={stepReveal}
             onRevealed={onRevealed}
