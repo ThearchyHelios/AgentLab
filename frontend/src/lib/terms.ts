@@ -38,7 +38,9 @@
  * 枚举值（formal / degraded / withheld 等）不动，只换显示。
  */
 
-import type { NodeType, SnapshotReasonCode, ToolTrust } from '../types'
+import type {
+  CatalogCardinality, CatalogMeasure, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode, ToolTrust,
+} from '../types'
 import { formatNumber } from './format'
 
 export const TERMS = {
@@ -1796,4 +1798,308 @@ export const RECIPE_CHOICE_LABEL = {
   colType: { TEXT: '文字', INTEGER: '整数', REAL: '小数', DATE: '日期' } as Record<string, string>,
   colStore: { '': '默认', canonical: '规范写法', raw: '原文' } as Record<string, string>,
   axisChecks: { contiguous: '逐日连续', covers_context: '恰好覆盖统计期' } as Record<string, string>,
+}
+
+// ===========================================================================
+// 业务数据目录（数据源卡片上的「数据目录」）
+//
+// 术语：
+// - 「数据目录」：每张表、每一列的业务说明和表之间的关联关系。只记数据事实，不放计算公式（公式在口径卡里）。
+// - 表级：中文名、说明、粒度（一行代表什么）、业务主键、表类型、业务日期、有效记录条件、去重规则。
+// - 列级：中文名、含义、单位、度量类型、码值。度量类型的 flow 写「可累加」，不写「流量」；表类型的 fact 写「明细表」。
+// - 关联关系：本表字段 → 目标表的字段，带基数（多对一……）和覆盖率。
+// - 状态：推断 / 已验证 / 已确认 / 已驳回。来源：数据库注释 / 外键约束 / 命名推断 / 数据剖析 / 模型起草 / 人工填写。
+// - 动作：起草（批量生成推断项）、确认、驳回、恢复（回到起草时的状态）。直接编辑即确认。
+// ===========================================================================
+
+export const CATALOG_TERMS = {
+  catalog: '数据目录',
+  grain: '粒度',
+  keys: '业务主键',
+  measure: '度量类型',
+  codes: '码值',
+  relation: '关联关系',
+  cardinality: '基数',
+  coverage: '覆盖率',
+  draft: '起草',
+} as const
+
+/** 项的状态。四种状态在界面上用同一套样式（pages/catalog/parts.tsx 的 StatusMark） */
+export const CATALOG_STATUS_LABEL: Record<CatalogStatus, string> = {
+  proposed: '推断',
+  verified: '已验证',
+  confirmed: '已确认',
+  rejected: '已驳回',
+}
+
+export const CATALOG_STATUS_HINT: Record<CatalogStatus, string> = {
+  proposed: '只作提示，确认后才参与 SQL 检查',
+  verified: '有确证（外键约束或数据剖析），参与 SQL 检查',
+  confirmed: '人工确认，参与 SQL 检查',
+  rejected: '人工驳回，不提供给助手，之后起草也不会再提出',
+}
+
+export const CATALOG_SOURCE_LABEL: Record<CatalogSource, string> = {
+  comment: '数据库注释',
+  fk: '外键约束',
+  name: '命名推断',
+  profile: '数据剖析',
+  llm: '模型起草',
+  human: '人工填写',
+}
+
+export const CATALOG_KIND_LABEL: Record<CatalogTableKind, string> = {
+  fact: '明细表',
+  dimension: '维度表',
+  snapshot: '快照表',
+  log: '日志表',
+  config: '配置表',
+}
+
+export const CATALOG_KIND_HINT: Record<CatalogTableKind, string> = {
+  fact: '一行是一笔业务事件，如订单、入园、销售',
+  dimension: '描述业务对象，如门店、票种、渠道',
+  snapshot: '按时点记录的状态，如每日库存',
+  log: '系统操作或变更记录',
+  config: '参数、映射等配置',
+}
+
+export const CATALOG_MEASURE_LABEL: Record<CatalogMeasure, string> = {
+  flow: '可累加',
+  stock: '存量',
+  ratio: '比率',
+  identifier: '标识',
+  status: '状态',
+  attribute: '属性',
+}
+
+export const CATALOG_MEASURE_HINT: Record<CatalogMeasure, string> = {
+  flow: '可以跨期加总，如金额、人数',
+  stock: '时点值，不能跨期加总，如库存、余额',
+  ratio: '不能直接加总，如折扣率、转化率',
+  identifier: '编号或外键，不参与计算',
+  status: '状态码，按码值解释',
+  attribute: '描述性属性，如名称、类别',
+}
+
+export const CATALOG_CARDINALITY_LABEL: Record<CatalogCardinality, string> = {
+  many_to_one: '多对一',
+  one_to_one: '一对一',
+  one_to_many: '一对多',
+}
+
+/** 表级各项，按显示顺序 */
+export const CATALOG_TABLE_FIELD_LABEL = {
+  label: '中文名',
+  description: '说明',
+  grain: '粒度',
+  keys: '业务主键',
+  kind: '表类型',
+  business_date: '业务日期',
+  valid_filter: '有效记录条件',
+  dedup: '去重规则',
+} as const
+
+export const CATALOG_TABLE_FIELD_HINT: Record<keyof typeof CATALOG_TABLE_FIELD_LABEL, string> = {
+  label: '表的业务名称',
+  description: '这张表记录什么、怎么用',
+  grain: '一行代表什么，如「一张门票的一次入园」',
+  keys: '唯一确定一行业务记录的列',
+  kind: '明细、维度、快照、日志或配置',
+  business_date: '按哪一列归属到日期',
+  valid_filter: '有效记录的 SQL 条件，如 status <> 9',
+  dedup: '同一笔业务出现多行时如何取舍',
+}
+
+/** 列级各项，按显示顺序 */
+export const CATALOG_COLUMN_FIELD_LABEL = {
+  label: '中文名',
+  meaning: '含义',
+  unit: '单位',
+  measure: '度量类型',
+  codes: '码值',
+} as const
+
+export const CATALOG_TEXT = {
+  // ---- 入口
+  open: '数据目录',
+  openHint: '记录每张表、每一列的业务含义和表之间的关联关系，助手建图和查询时读取',
+  // ---- 页面
+  title: (name: string) => `「${name}」的数据目录`,
+  subtitle: '先起草，再按使用次数逐表确认。推断的项只作提示，确认后才参与 SQL 检查',
+  back: '返回数据源',
+  sourceMissing: '该数据源不存在',
+  sourceMissingBody: '可能已被删除，请返回数据源列表查看。',
+  noSchemaTitle: '还没有表结构',
+  noSchemaBody: (note: string) => `${note.replace(/[。.]$/, '')}。数据目录按表结构逐表记录，请先回到数据源卡片点击「探查结构」。`,
+  noSchemaUploadBody: '这个表格还没有可用的表结构，请重新上传后再编写数据目录。',
+  emptyTitle: '还没有数据目录',
+  emptyBody: '先起草，再逐表确认。起草按数据库注释、外键约束和列名推断，也可以请助手的模型起草中文名和含义。',
+  // ---- 导入表格的说明
+  systemTitle: '导入时生成的说明',
+  systemBody: '这个数据源由导入表格生成，表和列的说明由系统按核对结果生成，只读，不能在数据目录中改写。',
+  systemCovered: '目录中与说明重复的项（表的粒度和说明、列的含义和单位）确认后才提供给助手。',
+  systemTag: '导入时生成',
+  systemTableNote: '表说明',
+  // ---- 表清单
+  search: '搜索表名或中文名',
+  filterLabel: '按状态筛选',
+  filter: { all: '全部', pending: '有未确认项', done: '全部已确认', none: '没有目录' },
+  filterHint: {
+    all: '全部表',
+    pending: '还有推断状态的项',
+    done: '有目录，且没有推断状态的项',
+    none: '还没有任何目录项',
+  },
+  sortLabel: '排序',
+  sort: { usage: '按使用次数', pending: '按未确认项', name: '按表名' },
+  tableCount: (shown: number, total: number) =>
+    (shown === total ? `${formatNumber(total)} 张表` : `${formatNumber(shown)} / ${formatNumber(total)} 张表`),
+  selectAll: '全选当前结果',
+  selectTable: (name: string) => `选择 ${name}`,
+  selected: (n: number) => `已选 ${formatNumber(n)} 张`,
+  clearSelection: '取消选择',
+  noLabel: '未填写中文名',
+  view: '视图',
+  missing: '表结构中已没有这张表',
+  noCatalog: '没有目录',
+  usage: (n: number) => `使用 ${formatNumber(n)} 次`,
+  usageHint: '被运行查询过的次数，同一次运行中结果相同的重复查询只算一次',
+  relationCount: (n: number) => `${formatNumber(n)} 个关联`,
+  countTitle: (label: string, n: number) => `${label} ${formatNumber(n)} 项`,
+  noMatch: '没有符合条件的表',
+  noMatchBody: '请换个关键词或筛选条件。',
+  // ---- 概览（没有选中表时）
+  overviewTitle: '选择一张表开始审阅',
+  overviewBody: '按使用次数从高到低逐表确认。推断的项只作提示，确认后才参与 SQL 检查。',
+  overviewStats: (total: number, pending: number, done: number, none: number) =>
+    `共 ${formatNumber(total)} 张表：${formatNumber(pending)} 张有未确认项，${formatNumber(done)} 张全部已确认，${formatNumber(none)} 张没有目录`,
+  reviewNext: (name: string) => `审阅「${name}」`,
+  reviewNextHint: '使用次数最多、还有未确认项的表',
+  legend: '状态说明',
+  // ---- 起草
+  draft: '起草',
+  draftSelected: (n: number) => `起草所选（${formatNumber(n)}）`,
+  draftTitle: '起草数据目录',
+  draftScope: '起草范围',
+  scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
+  scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
+  scopeTop: (n: number) => `使用次数最多的 ${formatNumber(n)} 张表`,
+  scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
+  draftBase: '按数据库注释、外键约束和列名推断起草。已确认、已驳回的项不会被改动；起草出的项都是推断，需要逐项确认。',
+  useModel: '用模型起草',
+  useModelHint: '请助手的模型按表结构起草中文名、说明、粒度和列的含义。只发送表结构（表名、列名、类型、约束、注释），不发送数据；耗时较长，并产生模型费用。',
+  draftStart: (n: number) => `起草 ${formatNumber(n)} 张表`,
+  drafting: '正在起草…',
+  draftProgress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  draftStop: '停止',
+  draftStopping: '当前这一批完成后停止…',
+  draftDone: '起草完成',
+  draftStopped: (done: number, total: number) => `已停止：完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，其余未起草`,
+  draftFailed: '起草中断',
+  draftSummary: (added: number, updated: number, removed: number) =>
+    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+  draftNoChange: '没有变化：起草结果与现有目录一致',
+  draftModelSkipped: (reason: string) => `模型未参与起草：${reason.replace(/[。.]$/, '')}。已按注释、外键和命名起草。`,
+  draftModelUsed: (model: string) => `模型：${model}`,
+  draftTableErrors: (n: number) => `${formatNumber(n)} 张表未能起草`,
+  draftModelErrors: (n: number) => `${formatNumber(n)} 张表的模型起草失败，已按注释、外键和命名起草`,
+  draftClose: '完成',
+  moreTables: (n: number) => `…另有 ${formatNumber(n)} 张`,
+  cancel: '取消',
+  draftBackground: '起草仍在进行，当前这一批完成后停止',
+  // ---- 表详情
+  backToList: '返回表清单',
+  prev: '上一张',
+  next: '下一张',
+  updatedBy: (who: string, at: string) => `${who} 于 ${at} 修改`,
+  updatedAt: (at: string) => `${at} 修改`,
+  notStarted: '尚未建立目录',
+  missingBody: '表结构中已没有这张表（可能已删除或改名）。目录仍然保留，可以查看、驳回或删除其中的项。',
+  sectionTable: '表级信息',
+  sectionColumns: '列',
+  sectionRelations: '关联关系',
+  columnCount: (shown: number, total: number) =>
+    (shown === total ? `${formatNumber(total)} 列` : `${formatNumber(shown)} / ${formatNumber(total)} 列`),
+  columnFilter: '筛选列名或中文名',
+  onlyPending: '只看有推断项的列',
+  columnHead: { name: '列名', type: '类型', label: '中文名', meaning: '含义', unit: '单位', measure: '度量类型', codes: '码值' },
+  pk: '主键',
+  columnMissing: '表结构中已没有这一列',
+  noColumns: '没有符合条件的列',
+  empty: '未填写',
+  relationHead: { from: '本表字段', to: '目标表', toColumns: '目标字段', cardinality: '基数', coverage: '覆盖率', source: '来源', status: '状态' },
+  noRelations: '还没有关联关系。起草会按外键约束和列名推断，也可以在编辑时添加。',
+  openTable: (name: string) => `打开「${name}」`,
+  coverageValue: (pct: number) => `${formatNumber(pct)}%`,
+  dateColumn: '日期列',
+  dateRule: '规则',
+  dateTimezone: '时区',
+  // ---- 单项审阅
+  itemTitle: (where: string) => `${where}的来源和状态`,
+  itemSource: (s: string) => `来源：${s}`,
+  itemUpdated: (at: string) => `更新于 ${at}`,
+  confirm: '确认',
+  reject: '驳回',
+  reset: '恢复',
+  resetHint: '回到起草时的状态',
+  remove: '删除',
+  removeHint: '人工填写的项没有起草时的状态，恢复即删除',
+  reviewed: {
+    confirm: (where: string) => `已确认${where}`,
+    reject: (where: string) => `已驳回${where}`,
+    reset: (where: string) => `已恢复${where}`,
+  },
+  removed: (where: string) => `已删除${where}`,
+  whereTable: (field: string) => `表的${field}`,
+  whereColumn: (col: string, field: string) => `列 ${col} 的${field}`,
+  whereRelation: (to: string) => `指向 ${to} 的关联关系`,
+  // ---- 批量确认
+  confirmAll: (n: number) => `确认本表全部推断（${formatNumber(n)}）`,
+  confirmAllTitle: (n: number, table: string) => `确认「${table}」的 ${formatNumber(n)} 项推断？`,
+  confirmAllConsequences: ['确认后这些项参与 SQL 检查', '来源保持不变，状态改为已确认', '之后仍可逐项恢复'],
+  confirmAllAction: (n: number) => `确认 ${formatNumber(n)} 项`,
+  confirmColumn: '确认本列推断',
+  confirmColumnLabel: (col: string, n: number) => `确认列 ${col} 的 ${formatNumber(n)} 项推断`,
+  confirmedN: (n: number) => `已确认 ${formatNumber(n)} 项`,
+  // ---- 编辑
+  edit: '编辑',
+  editHint: '保存后，改动过的项记为人工填写、已确认',
+  clearHint: '清空一项即删除；不希望起草再次提出的项，请用「驳回」',
+  save: '保存',
+  saving: '正在保存…',
+  cancelEdit: '取消',
+  changes: (n: number) => `${formatNumber(n)} 处修改`,
+  noChanges: '尚未修改',
+  saved: '已保存，改动过的项已记为人工确认',
+  invalidCount: (n: number) => `${formatNumber(n)} 处格式不正确`,
+  keysPlaceholder: '列名，用顿号或逗号分隔',
+  keysUnknown: (cols: string) => `表结构中没有这些列：${cols}`,
+  codesPlaceholder: '每行一个，如 1=已支付',
+  codesInvalid: (line: number) => `第 ${formatNumber(line)} 行应写成「码值=含义」`,
+  codesDuplicate: (code: string) => `码值 ${code} 重复`,
+  dateColumnRequired: '填写规则或时区时，日期列必填',
+  tooLong: (n: number) => `不超过 ${formatNumber(n)} 字`,
+  kindNone: '未填写',
+  measureNone: '未填写',
+  cardinalityNone: '未知',
+  addRelation: '添加关联关系',
+  removeRelation: '删除这条关联关系',
+  relationColumns: '本表字段，用逗号分隔',
+  relationTarget: '目标表',
+  relationToColumns: '目标字段，用逗号分隔',
+  relationIncomplete: '本表字段、目标表和目标字段都要填写',
+  relationMismatch: '两端的字段数不一致',
+  relationDuplicate: '与另一条关联关系重复',
+  rejectedPlaceholder: (value: string) => `已驳回：${value}`,
+  leaveTitle: '数据目录有未保存的修改',
+  leaveConsequences: ['离开后修改将丢失'],
+  leaveConfirm: '放弃修改并离开',
+  // ---- 冲突与错误
+  conflictTitle: '这张表的数据目录刚被其他人修改过',
+  conflictEditing: '你的修改尚未保存。重新载入会放弃你的修改并显示最新内容；如需保留，请先记下要改的地方。',
+  conflictReview: '刚才的操作未生效，请重新载入后再操作。',
+  reload: '重新载入',
+  reloadDiscardTitle: '放弃未保存的修改并重新载入？',
+  reloadDiscardAction: '放弃修改并重新载入',
 }
