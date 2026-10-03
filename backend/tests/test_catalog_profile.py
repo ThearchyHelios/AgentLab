@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -196,6 +197,9 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
         assert "数据剖析" in rel["note"] and "抽样" in rel["note"]
         # 子表一侧数过 COUNT 和 COUNT(DISTINCT)、确有重复：基数是用数据核实的（A6，一对多关联的检查据此给 error）
         assert rel["cardinality_checked"] is True
+        # A7：说明里不写日期，时间看这一项的 updated_at（界面按本地时间显示）
+        assert rel["note"].startswith("数据剖析：") and not re.search(r"\d{4}-\d{2}-\d{2}", rel["note"])
+        assert rel["updated_at"]
     # 外键约束来的关系不动：外键是外键，剖析是剖析
     park = _relation(notes, "park_id")
     assert (park["source"], park["status"], park["coverage"]) == ("fk", "verified", None)

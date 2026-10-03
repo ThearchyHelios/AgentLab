@@ -518,22 +518,35 @@ def _core(item: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k != "updated_at"}
 
 
-#: 数据剖析写的备注都以「数据剖析（日期）：」开头（data/catalog_profile.py 的 NOTE_PREFIX 就是它）
-PROFILE_NOTE_PREFIX = "数据剖析（"
-_PROFILE_NOTE_DAY = re.compile(r"^数据剖析（\d{4}-\d{2}-\d{2}）")
+#: 数据剖析写的备注都以「数据剖析：」开头（data/catalog_profile.py 的 NOTE_PREFIX 就是它）。说明里不写日期：以前写的是
+#: UTC 日期，和界面上按本地时间显示的修改时间对不上；什么时候剖析的，看这一项的 updated_at
+PROFILE_NOTE_PREFIX = "数据剖析："
+#: 升级前的剖析备注带着当天的 UTC 日期：「数据剖析（2026-10-01）：」。旧数据里还有，照样认
+_PROFILE_NOTE_DAY = re.compile(r"^数据剖析（\d{4}-\d{2}-\d{2}）(?=：)")
+
+
+def is_profile_note(note: Any) -> bool:
+    """这段备注是不是数据剖析写的（新写法「数据剖析：」，或者升级前带日期的「数据剖析（日期）：」）。"""
+    return isinstance(note, str) and (note.startswith(PROFILE_NOTE_PREFIX) or bool(_PROFILE_NOTE_DAY.match(note)))
+
+
+def _undated(note: str) -> str:
+    """剖析备注去掉升级前写的日期：「数据剖析（2026-10-01）：…」→「数据剖析：…」。别的备注原样返回。"""
+    return _PROFILE_NOTE_DAY.sub("数据剖析", note, count=1)
 
 
 def same_profile_note(a: Any, b: Any) -> bool:
-    """两段备注是否相同；数据剖析写的备注只有开头的日期不同，也算相同。
+    """两段备注是否相同；数据剖析写的备注只差开头的日期（升级前每次都写当天的日期），或者一段带日期、一段是不带
+    日期的新写法，也算相同。
 
-    剖析每次都把当天的日期写进备注。隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就
-    升一个版本，发布时记下的目录版本对不上，之后每次正式运行都提醒「目录有变化」。
+    隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就升一个版本，发布时记下的目录版本
+    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期。
     """
     if a == b:
         return True
-    if not (isinstance(a, str) and isinstance(b, str) and _PROFILE_NOTE_DAY.match(a) and _PROFILE_NOTE_DAY.match(b)):
+    if not (is_profile_note(a) and is_profile_note(b)):
         return False
-    return _PROFILE_NOTE_DAY.sub("", a, count=1) == _PROFILE_NOTE_DAY.sub("", b, count=1)
+    return _undated(a) == _undated(b)
 
 
 def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -2239,7 +2252,8 @@ __all__ = [
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
     "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
     "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
-    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "join_paths",
+    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
+    "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",
     "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
     "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",

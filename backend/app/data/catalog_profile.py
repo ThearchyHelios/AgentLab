@@ -444,8 +444,8 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
 PROFILE_DEFAULT_TABLES = 10
 #: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
 IN_CHUNK = 1000
-#: 剖析写的备注都以它开头：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的。开头接着剖析的日期，
-#: 比较「结论变没变」时日期不算（catalog.same_profile_note）
+#: 剖析写的备注都以它开头（「数据剖析：」）：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的（认的时候连
+#: 升级前带日期的「数据剖析（日期）：」一起认，catalog.is_profile_note）。不写日期，时间看这一项的 updated_at
 NOTE_PREFIX = catalog.PROFILE_NOTE_PREFIX
 #: 整次剖析停下的原因 → 剩下没查的项的说明
 _STOP_DETAIL = {
@@ -575,8 +575,6 @@ class _Context:
     tables: dict[str, Any]
     #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
     masked: set[str]
-    #: 写进备注的剖析日期（UTC）
-    day: str
     sizes: dict[str, TableSize] = field(default_factory=dict)
 
     async def size(self, table: str, result: TableProfile) -> TableSize:
@@ -666,10 +664,11 @@ async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
     return total == distinct, "count"
 
 
-def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan_cap: int | None,
+def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int | None,
                    skipped_values: int, parent: tuple[bool | None, str], child: tuple[bool | None, str] | None,
                    holds: bool) -> str:
-    """关系的剖析备注：日期、抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。"""
+    """关系的剖析备注：抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。
+    不写日期：什么时候剖析的看这一项的 updated_at（界面按本地时间显示）。"""
     parts: list[str] = []
     low = coverage < catalog.PROFILE_VERIFY_COVERAGE
     if low:
@@ -701,7 +700,7 @@ def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan
             parts.append("未能核对子表一侧是否唯一，按多对一记")
     if not holds and not low:
         parts.append("暂不升为有确证")
-    return f"{NOTE_PREFIX}{day}）：" + "；".join(parts) + "。"
+    return NOTE_PREFIX + "；".join(parts) + "。"
 
 
 async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _TableOutcome,
@@ -752,7 +751,7 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
     if child_unique is not None:
         cardinality = "one_to_one" if child_unique[0] is True else "many_to_one"
     holds = coverage >= catalog.PROFILE_VERIFY_COVERAGE and cardinality is not None
-    note = _relation_note(cx.day, sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
+    note = _relation_note(sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
                           skipped_values=len(values) - len(literals), parent=parent_unique, child=child_unique,
                           holds=holds)
     checked = child_unique is not None and child_unique[0] is not None
@@ -873,7 +872,7 @@ async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome
     rows = sum(n for _, n in values)
     scope = f"按前 {scan_cap} 行统计" if scan_cap else "统计全表"
     spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
-    note = f"{NOTE_PREFIX}{cx.day}）：{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
+    note = f"{NOTE_PREFIX}{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
     out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note, complete=scan_cap is None))
 
 
@@ -903,7 +902,7 @@ async def _check_dates(cx: _Context, table: str, columns: list[str], total: int,
     if not result.date_ranges:
         raise _Skip("no_data", f"{table}.{columns[0]} 没有可识别的日期值")
     found = result.date_ranges[0]
-    note = (f"{NOTE_PREFIX}{cx.day}）：表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
+    note = (f"{NOTE_PREFIX}表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
             f"{str(found['max'])[:19]}，可作为业务日期的参考。")
     out.business_date = _DateOutcome(column=found["column"], low=found["min"], high=found["max"], note=note)
 
@@ -961,7 +960,7 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
             rel["cardinality_checked"] = True
         changed = True
     note = rel.get("note")
-    if (not note or str(note).startswith(NOTE_PREFIX)) and not catalog.same_profile_note(note, o.note):
+    if (not note or catalog.is_profile_note(note)) and not catalog.same_profile_note(note, o.note):
         rel["note"] = o.note
         changed = True
     if changed:
@@ -1199,8 +1198,7 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
     run = _Runner(source, settings, dialect)
     cx = _Context(source=source, settings=settings, dialect=dialect, run=run,
                   tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
-                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))},
-                  day=at[:10])
+                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))})
     entries = await catalog.read_catalog(session, source.id)
     for table in await _pick_tables(session, source, tables, entries, report):
         result = TableProfile(table=table)

@@ -407,7 +407,9 @@ async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, mak
     third = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
     assert third["version"] == second["version"] + 1 and third["updated"] >= 1
     codes = (await _notes(client, sid, "visits"))["notes"]["columns"]["status"]["codes"]
-    assert set(codes["value"]) == {"0", "1", "2"} and "2026-10-03" in codes["note"]
+    assert set(codes["value"]) == {"0", "1", "2"} and codes["updated_at"] == DAY3
+    # A7：说明里不写日期（以前写的是 UTC 日期，和界面上的本地时间对不上），时间以这一项的 updated_at 为准
+    assert codes["note"].startswith("数据剖析：") and "2026-10-03" not in codes["note"]
 
 
 def test_merge_ignores_a_profile_note_that_only_changed_its_date():
@@ -422,6 +424,24 @@ def test_merge_ignores_a_profile_note_that_only_changed_its_date():
         {"1": "", "0": ""}, "profile", "proposed", note="数据剖析（2026-10-02）：统计全表，1600 行非空值共 2 个取值。")}}}
     merged, stats = catalog.merge_notes(old, changed, covered={"profile"}, at=DAY2)
     assert stats.updated == 1 and "2026-10-02" in merged["columns"]["status"]["codes"]["note"]
+
+
+def test_profile_notes_without_date_stay_compatible_with_dated_ones():
+    """A7：剖析写的说明不再带日期（「数据剖析：…」）。升级前写的「数据剖析（2026-10-01）：…」照样认得是剖析写的；
+    结论一样、只是新的不带日期，不算变化——升级后第一次重新剖析不能因此给每张表升一个版本。"""
+    dated = "数据剖析（2026-10-01）：统计全表，1500 行非空值共 2 个取值。"
+    plain = "数据剖析：统计全表，1500 行非空值共 2 个取值。"
+    assert catalog.is_profile_note(dated) and catalog.is_profile_note(plain)
+    assert not catalog.is_profile_note("人工备注：数据剖析（2026-10-01）") and not catalog.is_profile_note(None)
+    assert catalog.same_profile_note(dated, plain) and catalog.same_profile_note(plain, dated)
+    assert catalog.same_profile_note("数据剖析（2026-10-02）：统计全表，1500 行非空值共 2 个取值。", dated)
+    assert not catalog.same_profile_note(dated, "数据剖析：统计全表，1600 行非空值共 2 个取值。")
+    assert not catalog.same_profile_note(plain, "统计全表，1500 行非空值共 2 个取值。")
+    old = {"columns": {"status": {"codes": catalog.make_item({"1": "", "0": ""}, "profile", "proposed", note=dated,
+                                                             at=DAY1)}}}
+    new = {"columns": {"status": {"codes": catalog.make_item({"1": "", "0": ""}, "profile", "proposed", note=plain)}}}
+    merged, stats = catalog.merge_notes(old, new, covered={"profile"}, at=DAY2)
+    assert merged == old and stats == catalog.MergeStats()
 
 
 # ==========================================================================
