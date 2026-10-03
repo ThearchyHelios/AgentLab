@@ -2512,6 +2512,11 @@ export const CATALOG_UI_TEXT = {
   usedOnly: '只看运行中查询过的表',
   usedOnlyHint: '使用次数大于 0、还在表结构里的表，和顶部摘要的口径一致',
   usedOnlyClear: '取消「只看运行中查询过的表」',
+  // ---- 剖析报告里的「填写含义」：填完回到报告，接着填下一列
+  codesFilled: '含义已填写',
+  editMeanings: '修改含义',
+  editMeaningsLabel: (col: string) => `修改含义：列 ${col} 的码值`,
+  fillWhileEditing: '正在编辑这张表，保存或取消后再填写码值的含义',
 }
 
 // ===========================================================================

@@ -173,3 +173,6 @@ export function withProfileOption(options: Record<string, unknown> | null | unde
   const { [PROFILE_OPTION]: _old, ...rest } = options ?? {}
   return value ? { ...rest, [PROFILE_OPTION]: value } : rest
 }
+
+/** 剖析报告里一列码值的键（表名 + 列名）：从报告去填含义、填完回到报告时按它对上是哪一列 */
+export const fillKey = (table: string, column: string): string => `${table}\u0000${column}`

@@ -13,7 +13,7 @@ import { DraftDialog } from './DraftDialog'
 import { ProfileDialog } from './ProfileDialog'
 import type { ProfileJob } from './ProfileDialog'
 import { ProfileSettingsDialog } from './ProfileSettings'
-import { profileBlockOf, profileSettingsOf, secondsText } from './profile'
+import { fillKey, profileBlockOf, profileSettingsOf, secondsText } from './profile'
 import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
 import { filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
@@ -108,8 +108,13 @@ export function CatalogPage() {
   const [job, setJob] = useState<(ProfileJob & { sourceId: string }) | null>(null)
   /** 剖析设置刚存过：数据源列表重取回来之前按存下的这份算（预算、开没开） */
   const [savedOptions, setSavedOptions] = useState<{ sourceId: string; options: Record<string, unknown> } | null>(null)
-  /** 从剖析报告点「填写含义」：打开那张表并弹出那一列的码值 */
+  /**
+   * 从剖析报告点「填写含义」：报告先收起，打开那张表并弹出那一列的码值；码值弹窗关上（保存或取消）后回到报告，
+   * 焦点落在下一列的「填写含义」上，一列接一列地填
+   */
   const [fillCodes, setFillCodes] = useState<{ table: string; column: string; seq: number } | null>(null)
+  /** 回到报告时从哪一列接着往下 */
+  const [returnTo, setReturnTo] = useState<{ table: string; column: string } | null>(null)
   const profilingRef = useRef(profiling)
   profilingRef.current = profiling
   const alive = useRef(true)
@@ -213,6 +218,20 @@ export function CatalogPage() {
     setFillCodes((cur) => ({ table: t, column, seq: (cur?.seq ?? 0) + 1 }))
     openTable(t)
   }, [openTable])
+
+  const jobRef = useRef(job)
+  jobRef.current = job
+  /** 从报告打开的码值弹窗关上了：记下这一列还剩几个含义待填写（报告里跟着改），回到报告 */
+  const onFillDone = useCallback((seq: number, pending: number | null) => {
+    const fill = fillCodes?.seq === seq ? fillCodes : null
+    const cur = jobRef.current
+    if (!fill || !alive.current || cur?.phase !== 'done' || cur.sourceId !== sourceRef.current) return
+    if (pending != null) {
+      setJob((j) => (j && j.phase === 'done' ? { ...j, filled: { ...j.filled, [fillKey(fill.table, fill.column)]: pending } } : j))
+    }
+    setReturnTo({ table: fill.table, column: fill.column })
+    setProfiling(true)
+  }, [fillCodes])
 
   // 上一张 / 下一张按清单当前的筛选和排序走；正在看的表不在筛选结果里（刚确认完、从关联关系跳过来）时按全部表走
   const [prev, next] = useMemo(() => {
@@ -323,7 +342,7 @@ export function CatalogPage() {
           {table
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
-                           onOpen={openTable} onBack={backToList} onDetail={onDetail} />
+                           onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail} />
             )
             : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
         </section>
@@ -374,7 +393,8 @@ export function CatalogPage() {
           filtered={filtered}
           job={myJob}
           onStart={(tables) => void startProfile(tables)}
-          onClose={() => setProfiling(false)}
+          onClose={() => { setProfiling(false); setReturnTo(null) }}
+          returnTo={returnTo}
           onSettings={() => setProfileSettingsOpen(true)}
           onGoSource={() => navigate(back)}
           onOpenTable={openFromReport}

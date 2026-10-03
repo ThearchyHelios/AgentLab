@@ -12,7 +12,7 @@ import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
   CATALOG_CARDINALITY_LABEL, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
-  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CODES_TEXT as KT,
+  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
 import { CountBadges, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
@@ -51,7 +51,7 @@ const PROBLEM_TEXT = {
 type Editing = { initial: EditForm; form: EditForm }
 type Conflict = 'edit' | 'review'
 
-export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, next, onOpen, onBack, onDetail }: {
+export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail }: {
   sourceId: string
   table: string
   /** 全部表：关联关系的目标表能点就跳过去，编辑时给目标表做候选 */
@@ -60,6 +60,11 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
   drafted: { seq: number; tables: Set<string> }
   /** 从剖析报告点「填写含义」过来：载入后打开这一列的码值弹窗（seq 让同一列连点两次也会再开） */
   fillCodes?: { table: string; column: string; seq: number } | null
+  /**
+   * 从剖析报告打开的码值弹窗关上了（保存了、取消了），或者打不开（正在编辑这张表）：页面据此回到报告，接着处理下一列。
+   * pending 是保存后这一列还有几个含义待填写；取消、打不开为 null
+   */
+  onFillDone?: (seq: number, pending: number | null) => void
   prev: string | null
   next: string | null
   onOpen: (table: string) => void
@@ -79,6 +84,17 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
   const [onlyPending, setOnlyPending] = useState(false)
   /** 正在填写哪一列的码值含义 */
   const [codesFor, setCodesFor] = useState<string | null>(null)
+  /** 码值弹窗是从剖析报告的「填写含义」打开的：那一次的 seq。弹窗关上时据此回到报告 */
+  const fillOpen = useRef<number | null>(null)
+  const onFillDoneRef = useRef(onFillDone)
+  onFillDoneRef.current = onFillDone
+  /** 收起码值弹窗；是从剖析报告打开的就告诉页面（回到报告）。back=false：不回报告（别人刚改过，先处理冲突横幅） */
+  const closeCodes = useCallback((pending: number | null, back = true) => {
+    const seq = fillOpen.current
+    fillOpen.current = null
+    setCodesFor(null)
+    if (seq != null && back) onFillDoneRef.current?.(seq, pending)
+  }, [])
   const loadSeq = useRef(0)
   const onDetailRef = useRef(onDetail)
   onDetailRef.current = onDetail
@@ -108,6 +124,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
     setOnlyPending(false)
     setLive('')
     setCodesFor(null)
+    fillOpen.current = null
     void load()
   }, [load])
 
@@ -126,9 +143,16 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
   const fillSeen = useRef(0)
   useEffect(() => {
     if (!fillCodes || fillCodes.table !== table || fillCodes.seq === fillSeen.current) return
-    if (!detail || detail.table_name !== table || editingRef.current) return
+    if (!detail || detail.table_name !== table) return
     fillSeen.current = fillCodes.seq
-    if (detail.notes.columns?.[fillCodes.column]?.codes) setCodesFor(fillCodes.column)
+    if (!editingRef.current && detail.notes.columns?.[fillCodes.column]?.codes) {
+      fillOpen.current = fillCodes.seq
+      setCodesFor(fillCodes.column)
+      return
+    }
+    // 打不开（正在编辑这张表，或者这一列的码值已经没了）：说一声，回到报告
+    if (editingRef.current) toast.warn(UT.fillWhileEditing)
+    onFillDoneRef.current?.(fillCodes.seq, null)
   }, [fillCodes, table, detail])
 
   const changes = edit ? changeCount(edit.initial, edit.form) : 0
@@ -199,13 +223,13 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
       setDetail(next)
       setConflict(null)
       onDetailRef.current(next)
-      setCodesFor(null)
+      closeCodes(pendingCodes(value))
       const filled = Math.max(0, pendingCodes(item.value) - pendingCodes(value))
       toast.ok(KT.saved(filled))
       setLive(KT.saved(filled))
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
-        setCodesFor(null)
+        closeCodes(null, false)
         setConflict('review')
       } else {
         toast.error(e)
@@ -213,7 +237,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
     } finally {
       setBusy('')
     }
-  }, [sourceId, table])
+  }, [sourceId, table, closeCodes])
 
   const setColumn = useCallback((col: string, f: ColumnField, v: string) => {
     setEdit((e) => e && ({ ...e, form: { ...e.form, columns: { ...e.form.columns, [col]: { ...e.form.columns[col], [f]: v } } } }))
@@ -453,7 +477,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
 
       {codesFor && notes.columns?.[codesFor]?.codes && (
         <CodesDialog column={codesFor} item={notes.columns[codesFor]!.codes!} saving={busy === `codes:${codesFor}`}
-                     onSave={(v, complete) => void saveCodes(codesFor, v, complete)} onClose={() => setCodesFor(null)} />
+                     onSave={(v, complete) => void saveCodes(codesFor, v, complete)} onClose={() => closeCodes(null)} />
       )}
 
       {edit && (

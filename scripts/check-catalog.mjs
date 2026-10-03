@@ -1242,7 +1242,7 @@ const BUDGET_DETAIL = '本次剖析的查询次数已用完（上限 60 条）�
  * 剖析的默认答复：入园记录的闸机关系核实成已验证（覆盖率 98.7%），会员关系覆盖率不够保持推断，状态列的码值候选多出一个
  * 没有含义的取值 2；订单只剖析了一半就用完了查询次数，订单明细一条没查。ms 是服务端「执行」多久
  */
-function profileReply(state, { ms = 0 } = {}) {
+function profileReply(state, { ms = 0, extraCodes = false } = {}) {
   return async (route) => {
     if (ms) await sleep(ms)
     const visits = state.tables[S1].find((t) => t.name === 'visits')
@@ -1258,6 +1258,8 @@ function profileReply(state, { ms = 0 } = {}) {
     notes.columns.status.codes.note = `数据剖析（${PROFILE_DAY}）：统计全表，182000 行非空值共 3 个取值：1（94%）、9（5%）、2（1%）。`
     // 统计的是全表：服务端给码值候选标「已列全」
     notes.columns.status.codes.complete = true
+    // extraCodes：票种列也取到码值候选（两个取值，含义都空着）——报告里有两列要填，填完一列回到报告接着填下一列
+    if (extraCodes) notes.columns.ticket_type_id = { codes: item({ 11: '', 12: '' }, 'profile', 'proposed') }
     writeEntry(visits, notes)
     const tables = [
       {
@@ -1270,6 +1272,8 @@ function profileReply(state, { ms = 0 } = {}) {
             summary: '抽样覆盖率 62%，保持推断' },
           { kind: 'codes', path: 'columns.status.codes', column: 'status', values: [{ value: '1', rows: 171080 }, { value: '9', rows: 9100 },
             { value: '2', rows: 1820 }], rows: 182000, status: 'proposed', summary: '3 个取值，1 个含义待填写' },
+          ...(extraCodes ? [{ kind: 'codes', path: 'columns.ticket_type_id.codes', column: 'ticket_type_id', values: [{ value: '11', rows: 120000 },
+            { value: '12', rows: 62000 }], rows: 182000, status: 'proposed', summary: '2 个取值，2 个含义待填写' }] : []),
         ],
         skipped: [
           { kind: 'codes', target: 'member_level', path: 'columns.member_level.codes', reason: 'masked', detail: 'visits.member_level 在数据源设置中被遮罩，不取值' },
@@ -1550,10 +1554,35 @@ await section('数据目录 · 数据剖析', async () => {
         && (await statusCodes.innerText()).includes('已退票') && (await markStatus(page, 'columns.status.codes')) === 'confirmed')
   // 报告里的「填写含义」直达
   await page.locator('[data-catalog-profile]').click()
-  replies.profile.push(profileReply(state))
+  replies.profile.push(profileReply(state, { extraCodes: true }))
   await page.locator('[data-profile-start]').click()
   await until(async () => (await profilePhase(page)) === 'done')
   check('窗口开着时完成：直接看报告，不另弹提示', (await toastBox.count()) <= 1)
+  // 点「填写含义」：报告收起、弹出那一列的码值；保存或取消之后回到报告，这一列改写成「含义已填写」，焦点落在下一列上
+  const fillLine = (col) => profileBox(page).locator(`[data-profile-finding="codes"][data-column="${col}"]`)
+  await fillLine('status').locator('[data-profile-fill]').click()
+  const fillBox = page.locator('[data-codes-dialog="status"]')
+  check('报告里点「填写含义」：报告收起，弹出这一列的码值', await until(async () => (await fillBox.count()) === 1)
+        && (await profileBox(page).count()) === 0)
+  await fillBox.locator('input[data-code="2"]').fill('已退票')
+  await page.keyboard.press('Enter')
+  check('填完保存：回到报告（不用重新剖析）', await until(async () => (await profilePhase(page)) === 'done') && (await fillBox.count()) === 0
+        && count(sent, /catalog\/profile$/) === 2, String(await profilePhase(page)))
+  const statusLine = fillLine('status')
+  check('……刚填的这一列写「含义已填写」，按钮改成「修改含义」', (await statusLine.locator('[data-codes-filled]').innerText().catch(() => '')).includes('含义已填写')
+        && await statusLine.locator('[data-codes-pending]').count() === 0 && (await statusLine.locator('[data-profile-fill]').innerText()) === '修改含义',
+        (await statusLine.innerText().catch(() => '')).replace(/\s+/g, ' '))
+  check('……还没填的下一列照旧写待填写，焦点落在它的「填写含义」上', (await fillLine('ticket_type_id').locator('[data-codes-pending]').innerText()) === '2 个含义待填写'
+        && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-profile-fill') === 'ticket_type_id'), 2000),
+        await page.evaluate(() => document.activeElement?.outerHTML?.slice(0, 120) ?? ''))
+  await page.keyboard.press('Enter')
+  const nextBox = page.locator('[data-codes-dialog="ticket_type_id"]')
+  check('……回车接着填下一列', await until(async () => (await nextBox.count()) === 1))
+  await page.keyboard.press('Escape')
+  check('码值弹窗取消：同样回到报告，那一列仍写待填写', await until(async () => (await profilePhase(page)) === 'done') && (await nextBox.count()) === 0
+        && (await fillLine('ticket_type_id').locator('[data-codes-pending]').innerText()) === '2 个含义待填写')
+  await page.locator('[data-profile-close]').click()
+  await until(async () => (await profileBox(page).count()) === 0)
   await openDetail(page, S1, 'orders')
   await page.locator('[data-catalog-profile]').click()
   await profileBox(page).waitFor()

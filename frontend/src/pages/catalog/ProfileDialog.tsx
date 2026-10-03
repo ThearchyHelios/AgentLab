@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { ArrowUpRight, CircleCheck, OctagonX, ScanSearch, ShieldAlert, TriangleAlert } from 'lucide-react'
 import clsx from 'clsx'
@@ -8,10 +8,10 @@ import type {
 } from '../../types'
 import { ErrorState, Modal, Notice, Spinner, useTicker } from '../../components/ui'
 import {
-  CATALOG_CARDINALITY_LABEL, CATALOG_TEXT as CT, PROFILE_SKIP_KIND_LABEL, PROFILE_SKIP_REASON_LABEL, PROFILE_STOP_LABEL, PROFILE_STOP_NEXT, PROFILE_TEXT as PT,
+  CATALOG_CARDINALITY_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, PROFILE_SKIP_KIND_LABEL, PROFILE_SKIP_REASON_LABEL, PROFILE_STOP_LABEL, PROFILE_STOP_NEXT, PROFILE_TEXT as PT,
 } from '../../lib/terms'
 import { STATUS_TONE, StatusChip } from './parts'
-import { PROFILE_DEFAULT_TABLES, PROFILE_MAX_TABLES, coverageText, secondsText } from './profile'
+import { PROFILE_DEFAULT_TABLES, PROFILE_MAX_TABLES, coverageText, fillKey, secondsText } from './profile'
 import type { ProfileBlock } from './profile'
 
 // ===========================================================================
@@ -26,7 +26,8 @@ import type { ProfileBlock } from './profile'
 /** 一次剖析的状态。放在页面上而不是弹窗里：关掉弹窗剖析照常进行，完成后还能再打开报告 */
 export type ProfileJob =
   | { phase: 'running'; startedAt: number; tables: string[] | null; settings: CatalogProfileSettings }
-  | { phase: 'done'; report: CatalogProfileOut; ms: number }
+  /** filled：从报告去填了含义的码值列（fillKey）→ 保存后还剩几个含义待填写，报告里按它改写那一列 */
+  | { phase: 'done'; report: CatalogProfileOut; ms: number; filled?: Record<string, number> }
   | { phase: 'blocked'; kind: ProfileBlock; message: string; tables: string[] | null }
   | { phase: 'failed'; error: unknown; tables: string[] | null }
 
@@ -37,7 +38,8 @@ const SKIP_SHOWN = 6
 const CODES_SHOWN = 12
 
 export function ProfileDialog({
-  sourceName, settings, rows, visible, selected, filtered, job, onStart, onClose, onSettings, onGoSource, onOpenTable, onFillCodes, onReset,
+  sourceName, settings, rows, visible, selected, filtered, job, returnTo, onStart, onClose, onSettings, onGoSource, onOpenTable, onFillCodes,
+  onReset,
 }: {
   sourceName: string
   /** 这个数据源此刻的剖析设置（数据源列表里读的） */
@@ -48,6 +50,8 @@ export function ProfileDialog({
   filtered: boolean
   /** null：还没开始（选范围） */
   job: ProfileJob | null
+  /** 填完一列码值的含义、回到报告：焦点落在下一列还有待填写的「填写含义」上 */
+  returnTo?: { table: string; column: string } | null
   /** tables 为 null 时由服务端挑表 */
   onStart: (tables: string[] | null) => void
   onClose: () => void
@@ -152,7 +156,8 @@ export function ProfileDialog({
     )
     footer = <button type="button" className="btn" onClick={onClose} data-autofocus data-profile-background="">{PT.background}</button>
   } else if (job.phase === 'done') {
-    body = <Report report={job.report} ms={job.ms} onSettings={onSettings} onOpenTable={onOpenTable} onFillCodes={onFillCodes} />
+    body = <Report report={job.report} ms={job.ms} filled={job.filled ?? {}} returnTo={returnTo ?? null} onSettings={onSettings}
+                   onOpenTable={onOpenTable} onFillCodes={onFillCodes} />
     footer = (
       <>
         <button type="button" className="btn btn-ghost mr-auto" onClick={onReset} data-profile-again="">{PT.again}</button>
@@ -230,9 +235,11 @@ function Budget({ settings: s, sourceName, onSettings }: { settings: CatalogProf
 // 报告
 // ---------------------------------------------------------------------------
 
-function Report({ report: r, ms, onSettings, onOpenTable, onFillCodes }: {
+function Report({ report: r, ms, filled, returnTo, onSettings, onOpenTable, onFillCodes }: {
   report: CatalogProfileOut
   ms: number
+  filled: Record<string, number>
+  returnTo: { table: string; column: string } | null
   onSettings: () => void
   onOpenTable: (table: string) => void
   onFillCodes: (table: string, column: string) => void
@@ -242,8 +249,19 @@ function Report({ report: r, ms, onSettings, onOpenTable, onFillCodes }: {
   // 一项发现、一项跳过都没有的表合成一行，几十张表时报告不被空卡片撑长
   const quiet = r.tables.filter((t) => !t.error && !t.findings.length && !t.skipped.length && !t.date_ranges.length)
   const shown = r.tables.filter((t) => !quiet.includes(t))
+  // 填完一列回到报告：焦点交给它后面第一个还有含义待填写的「填写含义」，没有了就落回刚填的那一列。
+  // 弹窗自己的初始焦点在下一帧，这里先聚焦，它看到焦点已在弹窗里就不再动
+  const root = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!returnTo) return
+    const buttons = [...(root.current?.querySelectorAll<HTMLButtonElement>('[data-profile-fill-key]') ?? [])]
+    const at = buttons.findIndex((b) => b.dataset.profileFillKey === fillKey(returnTo.table, returnTo.column))
+    const target = buttons.slice(at + 1).find((b) => Number(b.dataset.pending) > 0) ?? buttons[at]
+    target?.focus()
+    target?.scrollIntoView({ block: 'nearest' })
+  }, [returnTo])
   return (
-    <div className="space-y-3" data-profile-report={stop ?? 'done'}>
+    <div ref={root} className="space-y-3" data-profile-report={stop ?? 'done'}>
       <div className="flex items-start gap-2">
         {stop
           ? <TriangleAlert size={15} className="mt-px shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
@@ -268,7 +286,7 @@ function Report({ report: r, ms, onSettings, onOpenTable, onFillCodes }: {
         </Notice>
       )}
       {r.note && <Notice tone="info" attr={{ 'data-profile-note': '' }}>{r.note}</Notice>}
-      {shown.map((t) => <TableReport key={t.table_name} t={t} onOpenTable={onOpenTable} onFillCodes={onFillCodes} />)}
+      {shown.map((t) => <TableReport key={t.table_name} t={t} filled={filled} onOpenTable={onOpenTable} onFillCodes={onFillCodes} />)}
       {quiet.length > 0 && (
         <p className="text-2xs leading-relaxed text-faint" data-profile-quiet={quiet.length}>
           {PT.noFindings}：<span className="mono">{quiet.map((t) => t.table_name).join('、')}</span>
@@ -285,8 +303,9 @@ function sizeText(size: CatalogProfileSize | null): { text: string; hint?: strin
   return null
 }
 
-function TableReport({ t, onOpenTable, onFillCodes }: {
+function TableReport({ t, filled, onOpenTable, onFillCodes }: {
   t: CatalogProfileTable
+  filled: Record<string, number>
   onOpenTable: (table: string) => void
   onFillCodes: (table: string, column: string) => void
 }) {
@@ -325,7 +344,10 @@ function TableReport({ t, onOpenTable, onFillCodes }: {
         )}
         {codes.length > 0 && (
           <Group title={PT.findingCodes}>
-            {codes.map((f) => <CodesLine key={f.path} f={f} onFill={() => onFillCodes(t.table_name, f.column)} />)}
+            {codes.map((f) => (
+              <CodesLine key={f.path} f={f} fillKey={fillKey(t.table_name, f.column)} filled={filled[fillKey(t.table_name, f.column)]}
+                         onFill={() => onFillCodes(t.table_name, f.column)} />
+            ))}
           </Group>
         )}
         {date && (
@@ -388,9 +410,17 @@ function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
   )
 }
 
-function CodesLine({ f, onFill }: { f: CatalogProfileCodesFinding; onFill: () => void }) {
+function CodesLine({ f, fillKey: key, filled, onFill }: {
+  f: CatalogProfileCodesFinding
+  fillKey: string
+  /** 从报告去填过含义：保存后还剩几个待填写。没去填过为 undefined，按剖析时的说 */
+  filled: number | undefined
+  onFill: () => void
+}) {
   // 服务端在 summary 里写了几个含义待填写（别的来源写过的含义会沿用）；认不出时按都待填写
-  const pending = Number(f.summary.match(/(\d+)\s*个含义待填写/)?.[1] ?? (f.summary.includes('待填写') ? f.values.length : 0))
+  const reported = Number(f.summary.match(/(\d+)\s*个含义待填写/)?.[1] ?? (f.summary.includes('待填写') ? f.values.length : 0))
+  const pending = filled ?? reported
+  const done = filled != null && filled === 0
   return (
     <li className="text-xs" data-profile-finding="codes" data-column={f.column}>
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
@@ -409,8 +439,14 @@ function CodesLine({ f, onFill }: { f: CatalogProfileCodesFinding; onFill: () =>
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-2">
         {pending > 0 && <span className="text-2xs" style={{ color: 'var(--st-waiting)' }} data-codes-pending={pending}>{PT.codesPendingN(pending)}</span>}
-        <button type="button" className="btn btn-xs" onClick={onFill} aria-label={PT.fillMeaningsLabel(f.column)} data-profile-fill={f.column}>
-          {PT.fillMeanings}
+        {done && (
+          <span className="inline-flex items-center gap-1 text-2xs text-dim" data-codes-filled="">
+            <CircleCheck size={11} className="shrink-0" style={{ color: 'var(--st-done)' }} aria-hidden /> {UT.codesFilled}
+          </span>
+        )}
+        <button type="button" className="btn btn-xs" onClick={onFill} aria-label={done ? UT.editMeaningsLabel(f.column) : PT.fillMeaningsLabel(f.column)}
+                data-profile-fill={f.column} data-profile-fill-key={key} data-pending={pending}>
+          {done ? UT.editMeanings : PT.fillMeanings}
         </button>
       </div>
     </li>
