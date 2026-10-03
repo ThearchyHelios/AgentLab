@@ -109,13 +109,16 @@ export function matchesQuery(r: CatalogTableRow, q: string): boolean {
   return [r.table_name, r.qualified, r.label ?? ''].some((s) => s.toLowerCase().includes(needle))
 }
 
+/** 运行中查询过的表：使用次数大于 0、还在表结构里。顶部摘要和「只看运行中查询过的表」用同一个口径 */
+export const isUsed = (r: CatalogTableRow): boolean => r.in_schema && r.usage > 0
+
 /**
  * 筛选并排序。默认保持服务端的顺序（使用次数多的在前，次数相同按表结构里的顺序）；表结构里已经没有的表
- * 不论怎么排都在最后
+ * 不论怎么排都在最后。used：只看运行中查询过的表（从顶部摘要点进来时带上，和摘要的数字对得上）
  */
-export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilter, sort: ListSort): CatalogTableRow[] {
+export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilter, sort: ListSort, used = false): CatalogTableRow[] {
   const order = new Map(rows.map((r, i) => [r.table_name, i]))
-  const picked = rows.filter((r) => matchesQuery(r, q) && (filter === 'all' || progressOf(r.counts) === filter))
+  const picked = rows.filter((r) => matchesQuery(r, q) && (!used || isUsed(r)) && (filter === 'all' || progressOf(r.counts) === filter))
   const idx = (r: CatalogTableRow) => order.get(r.table_name) ?? 0
   return picked.sort((a, b) => {
     if (a.in_schema !== b.in_schema) return a.in_schema ? -1 : 1
@@ -132,7 +135,7 @@ export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilt
 export function usageSummary(rows: CatalogTableRow[]): { used: number; pending: number; none: number } {
   const out = { used: 0, pending: 0, none: 0 }
   for (const r of rows) {
-    if (!r.in_schema || r.usage <= 0) continue
+    if (!isUsed(r)) continue
     out.used++
     const p = progressOf(r.counts)
     if (p === 'pending') out.pending++
@@ -141,11 +144,11 @@ export function usageSummary(rows: CatalogTableRow[]): { used: number; pending: 
   return out
 }
 
-/** 各筛选项下有几张表（筛选按钮上的数字，按搜索词算） */
-export function filterCounts(rows: CatalogTableRow[], q: string): Record<ListFilter, number> {
+/** 各筛选项下有几张表（筛选按钮上的数字，按搜索词和「只看运行中查询过的表」算） */
+export function filterCounts(rows: CatalogTableRow[], q: string, used = false): Record<ListFilter, number> {
   const out: Record<ListFilter, number> = { all: 0, pending: 0, done: 0, none: 0 }
   for (const r of rows) {
-    if (!matchesQuery(r, q)) continue
+    if (!matchesQuery(r, q) || (used && !isUsed(r))) continue
     out.all++
     out[progressOf(r.counts)]++
   }

@@ -65,6 +65,8 @@ export function CatalogPage() {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<ListFilter>('all')
   const [sort, setSort] = useState<ListSort>('usage')
+  /** 只看运行中查询过的表：从顶部摘要点进来时打开，筛选结果和摘要的数字一致 */
+  const [usedOnly, setUsedOnly] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   const [drafting, setDrafting] = useState(false)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
@@ -89,8 +91,8 @@ export function CatalogPage() {
   sourceRef.current = sourceId
 
   const rows = useMemo(() => data?.tables ?? [], [data])
-  const visible = useMemo(() => visibleRows(rows, query, filter, sort), [rows, query, filter, sort])
-  const counts = useMemo(() => filterCounts(rows, query), [rows, query])
+  const visible = useMemo(() => visibleRows(rows, query, filter, sort, usedOnly), [rows, query, filter, sort, usedOnly])
+  const counts = useMemo(() => filterCounts(rows, query, usedOnly), [rows, query, usedOnly])
   const base = `/data/catalog/${encodeURIComponent(sourceId)}`
   const openTable = useCallback((t: string) => navigate(`${base}/${encodeURIComponent(t)}`), [navigate, base])
   const back = source?.origin === 'upload' ? '/data/tables' : '/data/databases'
@@ -191,17 +193,19 @@ export function CatalogPage() {
 
   const usage = useMemo(() => usageSummary(rows), [rows])
   /**
-   * 顶部摘要点进来：清掉搜索词，切到对应的筛选，按使用次数排——用到最多的排在最前。窄屏一次只显示一栏，
+   * 顶部摘要点进来：清掉搜索词，切到对应的筛选、只看运行中查询过的表（和摘要同一个口径：摘要说「1 张还没有目录」，
+   * 点进去就是那 1 张，不是全部没有目录的表），按使用次数排——用到最多的排在最前。窄屏一次只显示一栏，
    * 正在看表详情时回到清单才看得到筛选结果；宽屏两栏都在，正在看的表不动
    */
   const focusUsed = useCallback((f: ListFilter) => {
     setQuery('')
     setFilter(f)
+    setUsedOnly(true)
     setSort('usage')
     if (table && typeof matchMedia === 'function' && matchMedia('(max-width: 1023px)').matches) navigate(base)
   }, [table, navigate, base])
 
-  const filtered = !!query.trim() || filter !== 'all'
+  const filtered = !!query.trim() || filter !== 'all' || usedOnly
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
   const hasTables = rows.length > 0
   const draftButton = (primary = false) => (
@@ -270,6 +274,8 @@ export function CatalogPage() {
             onQuery={setQuery}
             filter={filter}
             onFilter={setFilter}
+            usedOnly={usedOnly}
+            onUsedOnly={setUsedOnly}
             sort={sort}
             onSort={setSort}
             selected={selected}
@@ -312,7 +318,7 @@ export function CatalogPage() {
         <SchemaPartialNotice total={data.schema_total ?? 0} explored={rows.filter((r) => r.in_schema).length}
                              onGoSource={() => navigate(back)} />
       )}
-      {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={filter} onFocus={focusUsed} />}
+      {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={usedOnly ? filter : null} onFocus={focusUsed} />}
       {body}
       {drafting && data && (
         <DraftDialog
@@ -382,7 +388,8 @@ function UsageSummary({ used, pending, none, active, onFocus }: {
   used: number
   pending: number
   none: number
-  active: ListFilter
+  /** 清单正按摘要的哪一段筛（只看运行中查询过的表时）；没有按摘要筛为 null */
+  active: ListFilter | null
   onFocus: (f: ListFilter) => void
 }) {
   const part = (f: 'pending' | 'none', text: string, hint: string) => (

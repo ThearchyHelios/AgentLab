@@ -1,11 +1,11 @@
 import { memo, useCallback, useEffect, useRef } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
-import { AlertTriangle, ScanSearch, Search, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, History, ScanSearch, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogTableRow } from '../../types'
 import { useRadioGroup } from '../../components/ui'
 import { formatNumber } from '../../lib/format'
-import { CATALOG_KIND_LABEL, CATALOG_TEXT as CT, PROFILE_TEXT as PT } from '../../lib/terms'
+import { CATALOG_KIND_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, PROFILE_TEXT as PT } from '../../lib/terms'
 import { CountBadges } from './parts'
 import { LIST_FILTERS, LIST_SORTS, progressOf } from './model'
 import type { ListFilter, ListSort } from './model'
@@ -17,7 +17,8 @@ import type { ListFilter, ListSort } from './model'
 // ===========================================================================
 
 export function TableIndex({
-  rows, total, counts, query, onQuery, filter, onFilter, sort, onSort, selected, onSelected, active, onOpen, onDraft, onProfile,
+  rows, total, counts, query, onQuery, filter, onFilter, usedOnly = false, onUsedOnly, sort, onSort, selected, onSelected, active, onOpen,
+  onDraft, onProfile,
 }: {
   /** 筛选、排序后的行 */
   rows: CatalogTableRow[]
@@ -28,6 +29,9 @@ export function TableIndex({
   onQuery: (q: string) => void
   filter: ListFilter
   onFilter: (f: ListFilter) => void
+  /** 只看运行中查询过的表（从顶部摘要点进来）：筛选组下面挂一个能取消的标签 */
+  usedOnly?: boolean
+  onUsedOnly?: (v: boolean) => void
   sort: ListSort
   onSort: (s: ListSort) => void
   selected: Set<string>
@@ -131,6 +135,21 @@ export function TableIndex({
             </button>
           ))}
         </div>
+        {usedOnly && (
+          <div className="flex" data-catalog-used-only="">
+            <span className="inline-flex min-w-0 items-center gap-1 rounded-md border border-[var(--accent)] bg-accent-soft py-0.5 pl-2 pr-0.5 text-2xs text-fg"
+                  title={UT.usedOnlyHint}>
+              <History size={10} className="shrink-0 text-[var(--accent)]" aria-hidden />
+              <span className="truncate">{UT.usedOnly}</span>
+              {onUsedOnly && (
+                <button type="button" className="rounded p-0.5 text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                        onClick={() => onUsedOnly(false)} aria-label={UT.usedOnlyClear} title={UT.usedOnlyClear} data-catalog-used-only-clear="">
+                  <X size={10} aria-hidden />
+                </button>
+              )}
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-2 text-2xs text-faint">
           <input ref={allRef} type="checkbox" checked={all} onChange={toggleAll} disabled={!rows.length}
                  aria-label={CT.selectAll} title={CT.selectAll} data-catalog-select-all="" />

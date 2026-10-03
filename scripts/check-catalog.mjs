@@ -620,11 +620,24 @@ await section('数据目录 · 用到但没确认（顶部摘要）', async () =
   check('……排序是按使用次数', await page.locator('[data-catalog-sort]').inputValue() === 'usage')
   const shown = await rowNames(page)
   const expectTop = used.filter((t) => progress(t) === 'pending').sort((a, b) => b.usage - a.usage).map((t) => t.name)
-  check('……查询过的、有推断项的表排在最前', shown.slice(0, expectTop.length).join(',') === expectTop.join(','),
-    `${shown.slice(0, expectTop.length).join(',')} ≠ ${expectTop.join(',')}`)
+  check('……只列查询过的、有推断项的表，按使用次数排', shown.join(',') === expectTop.join(','), `${shown.join(',')} ≠ ${expectTop.join(',')}`)
   await bar.locator('[data-usage-focus="none"]').click()
   check('点「还没有目录」：切到「没有目录」筛选', (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'none'
     && (await rowNames(page))[0] === used.filter((t) => progress(t) === 'none').sort((a, b) => b.usage - a.usage)[0].name)
+  // 摘要说「N 张还没有目录」，点进去就是那 N 张：只看运行中查询过的表，不是全部没有目录的表
+  const expectNone = used.filter((t) => progress(t) === 'none').sort((a, b) => b.usage - a.usage).map((t) => t.name)
+  const noneShown = await rowNames(page)
+  check('……只列运行中查询过、还没有目录的表，张数和摘要一致', noneShown.join(',') === expectNone.join(',') && noneShown.length === none,
+    `${noneShown.length} 张：${noneShown.slice(0, 6).join(',')}`)
+  check('……清单上写明「只看运行中查询过的表」', (await page.locator('[data-catalog-used-only]').innerText().catch(() => '')).includes('只看运行中查询过的表'))
+  const usedCounts = await page.locator('[data-catalog-filter] [data-filter]').evaluateAll((els) => els.map((e) => e.innerText.replace(/\s+/g, '')))
+  check('……筛选按钮上的数字按同一个口径算', usedCounts.includes(`没有目录${none}`) && usedCounts.includes(`全部${used.length}`), usedCounts.join('|'))
+  check('……摘要上点中的那一段标为按下', await bar.locator('[data-usage-focus="none"]').getAttribute('aria-pressed') === 'true')
+  await page.locator('[data-catalog-used-only-clear]').click()
+  const allNone = state.tables[S1].filter((t) => progress(t) === 'none').length
+  check('取消「只看运行中查询过的表」：回到全部没有目录的表，摘要不再标按下', (await rowNames(page)).length === allNone
+    && await page.locator('[data-catalog-used-only]').count() === 0
+    && await bar.locator('[data-usage-focus="none"]').getAttribute('aria-pressed') === 'false', String((await rowNames(page)).length))
   check('摘要只读、不发请求', writes(sent, /./).length === 0)
   // 都审完了：只写一句，不给按钮
   for (const t of state.tables[S1]) if (t.notes) t.notes = applyPut({}, { label: { value: t.notes.label?.value ?? t.name } })
