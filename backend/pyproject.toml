@@ -30,6 +30,10 @@ dependencies = [
     "jsonschema>=4.23",
     "beautifulsoup4>=4.12",
     "cryptography>=43.0",
+    # 数据目录的 SQL 检查（data/sqlcheck.py）按数据源方言解析 SQL。sqlglot 的大版本常改语法树节点和
+    # 方言行为（节点改名、某个写法从解析成 Anonymous 变成专门的节点），规则是照着这些节点写的，
+    # 上限卡到下一个大版本——升级要重新锁、跑一遍 test_sqlcheck
+    "sqlglot>=30.21,<31",
 ]
 
 [project.optional-dependencies]
