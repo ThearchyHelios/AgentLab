@@ -69,7 +69,8 @@ class EventType(StrEnum):
     # 出具与口径治理
     ISSUANCE = "issuance"  # 出具契约的判定结果（档位 / 缺数据 / 未回指数字）
     CALIBER_UPGRADE = "caliber.upgrade"  # 钉住的方法卡有新版本，按声明的策略处置
-    # 从发布版本发起的正式运行：发布之后这一版 SQL 用到的表的数据目录有变化（data/catalog_impact.catalog_drift）。
+    # 从发布版本发起的正式运行：发布之后这一版用到的表的数据目录有变化（data/catalog_impact.catalog_drift）。
+    # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的。
     # 只提醒、不拦运行；落在封存范围内，出具物上看得到「当时的目录和发布时不一样」
     CATALOG_DRIFT = "catalog.drift"
     # 报告撰写节点的自查结果：报告文档工件 id、统计、违规清单。落在封存范围内，

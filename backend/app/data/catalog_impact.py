@@ -5,17 +5,20 @@
 - **影响面**：哪些已发布、受管的模板用到了这张表（table_impact）。按每个模板当前的已发布版本算，不看画布上的
   草稿——正式运行跑的是已发布的那一版。调用工具节点写死的 SQL 用到了这张表算「直接引用」；Agent 绑定了这个源
   的查询工具算「可能涉及」（SQL 是运行时写的，静态看不出）；合并查询按它的输入一路追溯。
-- **发布时的目录版本**：发布时记下模板 SQL 用到的每张表的目录版本 {源名: {表名: 版本}}（catalog_versions_for），
-  从这一版发起正式运行时和当前的比（catalog_drift），有变化只提醒、不拦运行——目录是给人和助手看的说明，
-  不是运行的输入；拦下来等于让一次文字修订卡住正式出具。
+- **发布时的目录版本**：发布时记下模板用到的表的目录版本（catalog_versions_for），和影响面同一个说法分两组：
+  {"direct": {源名: {表名: 版本}}, "possible": {源名: {表名: 版本}}}。direct 是写死的 SQL 用到的表；possible 是
+  Agent、协作成员绑定了查询工具的源里所有有目录的表。从这一版发起正式运行时和当前的比（catalog_drift），有变化
+  只提醒、不拦运行——目录是给人和助手看的说明，不是运行的输入；拦下来等于让一次文字修订卡住正式出具。
 
 表名的取法和证据台账同一个口径：evidence.sql_tables 取 FROM / JOIN 后面的表（去掉注释、字符串、CTE），
-去掉 schema 前缀后按 name_key 对到表结构上（和 catalog.table_usage 一致）。
+去掉 schema 前缀后按 name_key 对到表结构上（和 catalog.table_usage 一致）。哪些节点算「写死的查询」以
+sqlcheck.tool_query 为准（tool_queries），发布记录、影响面、SQL 检查和助手的上下文认的是同一种节点。
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -51,20 +54,43 @@ def sql_table_keys(sql: str, tables: Iterable[str] | None) -> set[str]:
     return {hit for s in shorts if (hit := lookup.get(name_key(s))) is not None}
 
 
+def _as_node(raw: Mapping[str, Any]) -> Any:
+    """字典写法的节点 → tool_query 认的样子（有 type、config）。画布 {data: {config}} 和 GraphSpec {config} 都认。"""
+    config = raw.get("config")
+    if not isinstance(config, Mapping):
+        data = raw.get("data")
+        config = data.get("config") if isinstance(data, Mapping) else None
+    return SimpleNamespace(id=raw.get("id"), type=raw.get("type"), config=config if isinstance(config, Mapping) else {})
+
+
+def tool_queries(nodes: Iterable[Any]) -> Iterator[tuple[Any, str, str]]:
+    """一张图里调用工具节点写死的查询：(节点, 源名, SQL)，按图里的顺序。
+
+    判定一律交给 sqlcheck.tool_query（是不是调用工具节点、是不是数据源查询工具、SQL 是不是非空字符串）：发布时
+    记目录版本、影响面、SQL 检查、助手给全字段的表都走这一份，不各写一遍。节点认 GraphSpec 的节点对象，也认还没
+    校验过的字典（画布写法、GraphSpec 写法）——助手改图时手上的是字典，图不一定完整到能过 GraphSpec。
+    """
+    from app.data.sqlcheck import tool_query
+
+    for node in nodes or []:
+        if isinstance(node, Mapping):
+            found = tool_query(_as_node(node))
+        elif node is not None:
+            found = tool_query(node)
+        else:
+            found = None
+        if found:
+            yield node, found[0], found[1]
+
+
 def graph_sql_tables(spec: Any, tables_by_source: Mapping[str, Iterable[str]] | None = None) -> dict[str, set[str]]:
-    """一张图里调用工具节点写死的 SQL 用到的表：{源名: {表名}}。Agent 的 SQL 运行时才有，不在这里。
+    """一张图里调用工具节点写死的 SQL 用到的表：{源名: {表名}}。Agent 的 SQL 运行时才有，不在这里（见 agent_sources）。
 
     tables_by_source 是各源表结构里的表名（schema_cache 的 tables 的键）：给了的源按它规范表名、对不上的不算；
     没给的源用 SQL 里的原名。
     """
-    from app.data.sqlcheck import tool_query
-
     out: dict[str, set[str]] = {}
-    for node in getattr(spec, "nodes", []) or []:
-        found = tool_query(node)
-        if not found:
-            continue
-        source, sql = found
+    for _, source, sql in tool_queries(getattr(spec, "nodes", []) or []):
         known = (tables_by_source or {}).get(source)
         hits = sql_table_keys(sql, list(known) if known is not None else None)
         if hits:
@@ -82,6 +108,36 @@ def _setting(spec: Any, node: Any, key: str) -> Any:
     return (getattr(spec, "defaults", None) or {}).get(key) if value in (None, "") else value
 
 
+def _query_sources(tools: Any) -> set[str]:
+    """工具清单里绑定的数据源查询工具（db_query__<源>）→ 源名。"""
+    from app.tools.datasource import QUERY_PREFIX
+
+    names = [t.strip() for t in tools if isinstance(t, str)] if isinstance(tools, (list, tuple)) else []
+    return {t[len(QUERY_PREFIX):] for t in names if t.startswith(QUERY_PREFIX) and len(t) > len(QUERY_PREFIX)}
+
+
+def agent_bindings(spec: Any) -> list[tuple[Any, str | None, set[str]]]:
+    """Agent 节点和协作成员各自绑定了哪些源的查询工具：[(节点, 成员名或 None, {源名})]，按图里的顺序。
+
+    它们的 SQL 运行时才由模型写出来，静态看不出用哪张表：影响面算「可能涉及」，发布时记下整个源有目录的表。
+    """
+    out: list[tuple[Any, str | None, set[str]]] = []
+    for node in getattr(spec, "nodes", []) or []:
+        kind = _kind(node)
+        if kind == "agent":
+            out.append((node, None, _query_sources(_setting(spec, node, "tools"))))
+        elif kind == "supervisor":
+            for member in _setting(spec, node, "agents") or []:
+                if isinstance(member, Mapping):
+                    out.append((node, str(member.get("name") or ""), _query_sources(member.get("tools"))))
+    return out
+
+
+def agent_sources(spec: Any) -> set[str]:
+    """Agent 节点、协作成员绑定了查询工具的数据源名。"""
+    return {name for _, _, bound in agent_bindings(spec) for name in bound}
+
+
 def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | None) -> list[dict[str, Any]]:
     """一张图里哪些节点用到了某个源的某张表，按图里的顺序。每项 {node_id, label, type, impact, via?, member?}。
 
@@ -90,10 +146,6 @@ def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | No
     - 合并查询：输入（别名 → 节点）里有用到这张表的 → 取输入里最强的那一级，via 写经由哪些输入。合并的合并
       一路追到底；成环（校验会报错的图）时停下。
     """
-    from app.data.sqlcheck import tool_query
-    from app.tools.datasource import QUERY_PREFIX
-
-    tool = f"{QUERY_PREFIX}{source}"
     wanted = name_key(table)
     known = list(tables) if tables is not None else None
     nodes = list(getattr(spec, "nodes", []) or [])
@@ -104,20 +156,16 @@ def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | No
     def base(node: Any, impact: str, **extra: Any) -> dict[str, Any]:
         return {"node_id": node.id, "label": node.title, "type": _kind(node), "impact": impact, **extra}
 
-    for node in nodes:
-        kind = _kind(node)
-        if kind == "tool":
-            found = tool_query(node)
-            if found and found[0] == source and wanted in {name_key(t) for t in sql_table_keys(found[1], known)}:
-                own[node.id] = base(node, "direct")
-        elif kind == "agent":
-            if tool in [str(t).strip() for t in _setting(spec, node, "tools") or [] if isinstance(t, str)]:
-                own[node.id] = base(node, "possible")
-        elif kind == "supervisor":
-            for member in _setting(spec, node, "agents") or []:
-                if isinstance(member, Mapping) and tool in [str(t).strip() for t in member.get("tools") or []
-                                                            if isinstance(t, str)]:
-                    out.append(base(node, "possible", member=str(member.get("name") or "")))
+    for node, name, sql in tool_queries(nodes):
+        if name == source and wanted in {name_key(t) for t in sql_table_keys(sql, known)}:
+            own[node.id] = base(node, "direct")
+    for node, member, bound in agent_bindings(spec):
+        if source not in bound:
+            continue
+        if member is None:
+            own[node.id] = base(node, "possible")
+        else:
+            out.append(base(node, "possible", member=member))
 
     resolved: dict[str, dict[str, Any] | None] = {}
 
@@ -224,66 +272,135 @@ def _schema_tables(view: Any) -> list[str] | None:
     return list(tables) if isinstance(tables, Mapping) and tables else None
 
 
-async def catalog_versions_for(session: AsyncSession, spec: Any) -> dict[str, dict[str, int]]:
-    """发布时要记下的目录版本：{源名: {表名: 版本}}，只收模板 SQL 用到的表；还没有目录的表记 0。
+#: 发布记录的两组，和影响面的两级同名：direct 写死的 SQL 用到的表，possible Agent 可能查询的表
+CatalogVersions = dict[str, dict[str, dict[str, int]]]
 
-    记 0 是有意的：发布之后有人给这张表补了目录，同样算「自发布以来有变化」。找不到的源（停用、删了）不记：
-    没有目录可比，正式运行时工具自己会报源不存在。读库出错时返回空 dict——记不下版本不该挡住发布。
+
+def _pinned_group(value: Any) -> dict[str, dict[str, Any]] | None:
+    """{源名: {表名: 版本}} 的一组；形状不对返回 None。"""
+    if not isinstance(value, Mapping) or not all(isinstance(t, Mapping) for t in value.values()):
+        return None
+    return {str(k): dict(v) for k, v in value.items()}
+
+
+def recorded_versions(recorded: Any) -> CatalogVersions | None:
+    """发布时记下的目录版本，统一成 {"direct": {...}, "possible": {...}}。没记过返回 None。
+
+    认两种写法：
+    - 现在的写法：顶层只有 direct、possible 两个键，每组 {源名: {表名: 版本}}。
+    - 可能涉及上线之前的写法：{源名: {表名: 版本}}，只记了写死的 SQL 用到的表——整个算 direct，possible 为空：
+      那时没记 Agent 可能查询的表，不知道当时是哪一版，不能说它们变了。
+    两种写法靠第二层分得开：旧写法第二层是版本号（整数），新写法第二层是 {表名: 版本}。源名可以叫 direct，
+    所以不能只看顶层的键。
+    """
+    if not isinstance(recorded, Mapping):
+        return None
+    if recorded and set(recorded) <= set(IMPACTS):
+        groups = {k: _pinned_group(recorded.get(k, {})) for k in IMPACTS}
+        if all(g is not None for g in groups.values()):
+            return {k: g or {} for k, g in groups.items()}
+    legacy = _pinned_group(recorded)
+    return {"direct": legacy, "possible": {}} if legacy is not None else None
+
+
+async def catalog_versions_for(session: AsyncSession, spec: Any) -> CatalogVersions | None:
+    """发布时要记下的目录版本：{"direct": {源名: {表名: 版本}}, "possible": {源名: {表名: 版本}}}。
+
+    - direct：调用工具节点写死的 SQL 用到的表；还没有目录的表记 0。记 0 是有意的：发布之后有人给这张表补了
+      目录，同样算「自发布以来有变化」。
+    - possible：Agent 节点、协作成员绑定了某个源的查询工具（影响面里的「可能涉及」）。SQL 运行时才写，看不出用哪
+      张表，于是记下这个源里**所有有目录的表**；direct 里已经有的不重复记。发布时还没有目录的表不逐张记 0（一个
+      库几百张表），比对时「之后新建了目录」照样算变化（catalog_drift）。源里一张有目录的表都没有时记一个空的
+      {}，表示这个源在看着。
+
+    找不到的源（停用、删了）不记：没有目录可比，正式运行时工具自己会报源不存在。读库出错时返回 None（和没记过
+    一样，不提醒）——记不下版本不该挡住发布。
     """
     from app.data import catalog
 
     try:
-        names = graph_sql_tables(spec).keys()
-        sources = await _sources_by_name(session, names)
+        possible_names = agent_sources(spec)
+        sources = await _sources_by_name(session, [*graph_sql_tables(spec).keys(), *possible_names])
         tables_by_source = {name: _schema_tables(view) for name, (_, view) in sources.items()}
         used = graph_sql_tables(spec, {k: v for k, v in tables_by_source.items() if v is not None})
-        out: dict[str, dict[str, int]] = {}
+        entries_of: dict[str, dict[str, Any]] = {}
+
+        async def entries(name: str) -> dict[str, Any]:
+            if name not in entries_of:
+                entries_of[name] = await catalog.read_catalog(session, sources[name][0].id)
+            return entries_of[name]
+
+        direct: dict[str, dict[str, int]] = {}
         for name, tables in sorted(used.items()):
-            if name not in sources:
-                continue
-            entries = await catalog.read_catalog(session, sources[name][0].id)
-            out[name] = {t: (entries[t].version if t in entries else 0) for t in sorted(tables)}
-        return out
+            if name in sources:
+                found = await entries(name)
+                direct[name] = {t: (found[t].version if t in found else 0) for t in sorted(tables)}
+        possible: dict[str, dict[str, int]] = {}
+        for name in sorted(possible_names):
+            if name in sources:
+                pinned = direct.get(name, {})
+                possible[name] = {t: e.version for t, e in sorted((await entries(name)).items()) if t not in pinned}
+        return {"direct": direct, "possible": possible}
     except Exception:  # noqa: BLE001
         logger.exception("记录发布时的目录版本失败，本次不记")
-        return {}
+        return None
+
+
+def _label(entry: Any) -> str | None:
+    """表现在的中文名；没有或被驳回时为 None。"""
+    label = (entry.notes.get("label") if entry else None) or {}
+    return label.get("value") if isinstance(label, dict) and label.get("status") != "rejected" else None
 
 
 async def catalog_drift(session: AsyncSession, recorded: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """发布时记下的目录版本和现在比：变了的表 [{source, source_id, table, label, published, current}]。
+    """发布时记下的目录版本和现在比：变了的表 [{source, source_id, table, label, published, current, impact}]。
 
-    没记过（这个功能之前发布的版本）返回空列表——不知道当时是哪一版，不能说它变了。现在找不到的源跳过（理由同
-    catalog_versions_for）。label 是表现在的中文名（没有或被驳回时为 None）。读库出错返回空列表：提醒是附加的。
+    impact 是这张表属于哪一组（direct 直接引用 / possible Agent 可能查询的），direct 在前，同组按源名、表名。
+    possible 的源里发布时没记、现在有了目录的表也算（published 为 0），direct 里已有的表不重复报。
+
+    没记过（这个功能之前发布的版本）返回空列表——不知道当时是哪一版，不能说它变了；只记了直接引用的旧记录
+    同理不报可能涉及（recorded_versions）。现在找不到的源跳过（理由同 catalog_versions_for）。label 是表现在的
+    中文名（没有或被驳回时为 None）。读库出错返回空列表：提醒是附加的。
     """
     from app.data import catalog
 
-    if not isinstance(recorded, Mapping) or not recorded:
+    groups = recorded_versions(recorded)
+    if not groups or not any(groups.values()):
         return []
     try:
-        sources = await _sources_by_name(session, recorded.keys())
+        sources = await _sources_by_name(session, [*groups["direct"], *groups["possible"]])
+        entries_of: dict[str, dict[str, Any]] = {}
+
+        async def entries(name: str) -> dict[str, Any]:
+            if name not in entries_of:
+                entries_of[name] = await catalog.read_catalog(session, sources[name][0].id)
+            return entries_of[name]
+
         out: list[dict[str, Any]] = []
-        for name in sorted(recorded):
-            pinned = recorded[name]
-            if name not in sources or not isinstance(pinned, Mapping):
-                continue
-            row = sources[name][0]
-            entries = await catalog.read_catalog(session, row.id)
-            for table in sorted(pinned):
-                then = pinned[table]
-                entry = entries.get(table)
-                now = entry.version if entry else 0
-                if isinstance(then, int) and then == now:
+        for impact in IMPACTS:
+            for name in sorted(groups[impact]):
+                if name not in sources:
                     continue
-                label = (entry.notes.get("label") if entry else None) or {}
-                out.append({"source": name, "source_id": row.id, "table": table,
-                            "label": label.get("value") if isinstance(label, dict) and label.get("status") != "rejected"
-                            else None,
-                            "published": then if isinstance(then, int) else None, "current": now})
+                pinned = dict(groups[impact][name])
+                found = await entries(name)
+                if impact == "possible":
+                    # 发布时没有目录、之后新建了的表：记录里没有它，按发布时「尚无目录」算
+                    skip = groups["direct"].get(name, {})
+                    pinned.update({t: 0 for t in found if t not in pinned and t not in skip})
+                for table in sorted(pinned):
+                    then = pinned[table]
+                    entry = found.get(table)
+                    now = entry.version if entry else 0
+                    if isinstance(then, int) and then == now:
+                        continue
+                    out.append({"source": name, "source_id": sources[name][0].id, "table": table,
+                                "label": _label(entry), "published": then if isinstance(then, int) else None,
+                                "current": now, "impact": impact})
         return out
     except Exception:  # noqa: BLE001
         logger.exception("比对发布时的目录版本失败，本次不提醒")
         return []
 
 
-__all__ = ["IMPACTS", "catalog_drift", "catalog_versions_for", "graph_sql_tables", "sql_table_keys", "table_impact",
-           "template_refs"]
+__all__ = ["IMPACTS", "CatalogVersions", "agent_bindings", "agent_sources", "catalog_drift", "catalog_versions_for",
+           "graph_sql_tables", "recorded_versions", "sql_table_keys", "table_impact", "template_refs", "tool_queries"]
