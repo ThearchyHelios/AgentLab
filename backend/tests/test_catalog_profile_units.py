@@ -6,9 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.data import catalog_profile, guard
+from app.data import catalog, catalog_profile, guard
+from app.data.catalog import make_item
 from app.data.catalog_profile import PROFILE_OPTION, ProfileSettings, profile_settings, profile_settings_problem
 from app.data.engine import build_url
+
+AT = "2026-10-03T08:00:00+00:00"
+
 
 # ---------------------------------------------------------------- 设置
 
@@ -143,3 +147,49 @@ def test_dialect_quoting_and_row_limits():
     assert "pg_class" in pg.stats_sql(_META["visits"], "visits")
     stats = ora.stats_sql(_META["orders"], "orders")
     assert "ALL_TABLES" in stats and "'ORDERS'" in stats and "'SALES'" in stats
+
+
+# ---------------------------------------------------------------- 目录对剖析结果的容纳
+
+
+
+
+def _profile_rel(coverage, cardinality, status):
+    return {"id": catalog.relation_id("visits", ["gate_id"], "gates", ["id"]), "columns": ["gate_id"],
+            "to_table": "gates", "to_columns": ["id"], "cardinality": cardinality, "coverage": coverage,
+            "source": "profile", "status": status}
+
+
+def test_reset_returns_profile_relation_to_what_profiling_concluded():
+    """撤销审阅回到「来源的初始状态」。剖析的结论随数据而定：覆盖率够、父键唯一（基数有值）就是有确证。"""
+    verified = {"relations": [_profile_rel(1.0, "many_to_one", "verified")]}
+    rid = verified["relations"][0]["id"]
+    out = catalog.review_item(verified, f"relations.{rid}", "confirm", at=AT)
+    assert out["relations"][0]["status"] == "confirmed"
+    out = catalog.review_item(out, f"relations.{rid}", "reset", at=AT)
+    assert out["relations"][0]["status"] == "verified"
+    out = catalog.review_item(catalog.review_item(out, f"relations.{rid}", "reject", at=AT),
+                              f"relations.{rid}", "reset", at=AT)
+    assert out["relations"][0]["status"] == "verified"
+    # 覆盖率低、父键没核实唯一的：撤销后仍是推断
+    for coverage, cardinality in ((0.62, "many_to_one"), (1.0, None)):
+        low = {"relations": [_profile_rel(coverage, cardinality, "proposed")]}
+        out = catalog.review_item(catalog.review_item(low, f"relations.{rid}", "confirm", at=AT),
+                                  f"relations.{rid}", "reset", at=AT)
+        assert out["relations"][0]["status"] == "proposed"
+    # 剖析提的码值候选、业务日期永远是推断
+    codes = {"columns": {"status": {"codes": make_item({"1": ""}, "profile", "proposed")}}}
+    out = catalog.review_item(catalog.review_item(codes, "columns.status.codes", "confirm", at=AT),
+                              "columns.status.codes", "reset", at=AT)
+    assert out["columns"]["status"]["codes"]["status"] == "proposed"
+
+
+def test_human_edit_may_restore_profile_conclusion_but_not_invent_one():
+    rel = _profile_rel(1.0, "many_to_one", "confirmed")
+    existing = {"relations": [rel]}
+    back = catalog.apply_human_edit(existing, {"relations": [{**rel, "status": "verified"}]}, table="visits", at=AT)
+    assert back["relations"][0]["status"] == "verified" and back["relations"][0]["source"] == "profile"
+    low = _profile_rel(0.4, "many_to_one", "proposed")
+    kept = catalog.apply_human_edit({"relations": [low]}, {"relations": [{**low, "status": "verified"}]},
+                                    table="visits", at=AT)
+    assert kept["relations"][0]["status"] == "proposed"

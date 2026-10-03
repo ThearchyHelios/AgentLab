@@ -18,18 +18,23 @@
 """
 from __future__ import annotations
 
+import copy
+import logging
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.data import catalog, guard
 from app.data import engine as data_engine
-from app.data import guard
 from app.data.engine import CATALOG_PROFILE_OPTION, QueryResult, SnapshotTampered
 from app.data.guard import QueryLimits, SqlRejected
+
+logger = logging.getLogger(__name__)
 
 #: 数据源 options 里剖析设置的键
 PROFILE_OPTION = CATALOG_PROFILE_OPTION
@@ -283,12 +288,17 @@ class _Stop(Exception):
 
 
 class _Skip(Exception):
-    """这一项没查成：timeout 超时、error 查询失败、rejected 未通过守卫。记下原因，接着查别的。"""
+    """这一项没查成或不查：timeout 超时、error 查询失败、rejected 未通过守卫、masked 被遮罩……记下原因，接着查别的。
 
-    def __init__(self, reason: str, detail: str) -> None:
+    carry：目录里剖析以前对这一项写的结论要不要原样留着。没查成的（超时、表太大……）留着——这次没查不等于
+    结论错了；被遮罩的列上取过值的结论（码值、日期范围）不留：遮罩之后，带着原值的结论也不该再给人看。
+    """
+
+    def __init__(self, reason: str, detail: str, *, carry: bool = True) -> None:
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+        self.carry = carry
 
 
 def _brief(e: BaseException) -> str:
@@ -424,5 +434,524 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
     return TableSize(None, "count", at_least=cap), skips
 
 
-__all__ = ["MAX_LITERAL_LEN", "PROFILE_OPTION", "ProfileSettings", "SqlDialect", "TableSize", "estimate_size",
-           "profile_settings", "profile_settings_problem", "sql_literal"]
+# ==========================================================================
+# 一次剖析：上下文、结果
+# ==========================================================================
+
+#: 不指定表时剖析几张：按使用次数取目录里有待核实关系的表
+PROFILE_DEFAULT_TABLES = 10
+#: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
+IN_CHUNK = 1000
+#: 剖析写的备注都以它开头：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的
+NOTE_PREFIX = "数据剖析（"
+#: 整次剖析停下的原因 → 剩下没查的项的说明
+_STOP_DETAIL = {
+    "budget": "本次剖析的查询次数已用完（上限 {max_queries} 条），未检查",
+    "deadline": "本次剖析的总时长已用完（上限 {max_total_s} 秒），未检查",
+    "failed": "连续多条查询失败，已停止剖析，未检查",
+}
+
+
+class ProfileDisabled(Exception):
+    """这个数据源没有开启数据剖析。message 给人看。"""
+
+
+class ProfileBusy(Exception):
+    """这个数据源正在剖析。message 给人看。"""
+
+
+@dataclass
+class ProfileSkip:
+    """没做的一项和原因。
+
+    kind：relation 关系、codes 码值、date 日期列、row_estimate 行数估算、table 整张表。
+    reason：budget 查询次数用完、deadline 总时长用完、failed 连续失败、timeout 超时、error 查询失败、
+    rejected 未通过守卫、masked 字段被遮罩、too_large 表太大、view 视图、unsupported 暂不支持、
+    no_data 没有数据、missing 表结构里没有、high_cardinality 取值太多（不像码值）。detail 是给人看的整句。
+    """
+
+    kind: str
+    target: str
+    reason: str
+    detail: str
+    path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "target": self.target, "path": self.path, "reason": self.reason,
+                "detail": self.detail}
+
+
+@dataclass
+class TableProfile:
+    """一张表这次剖析的结果。findings 是写进目录的发现（给界面看，形状见 _finding_*）。"""
+
+    table: str
+    queries: int = 0
+    row_estimate: TableSize | None = None
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    skipped: list[ProfileSkip] = field(default_factory=list)
+    #: 日期类列的取值范围（MIN、MAX）。只有一个日期列时它还写进了业务日期的备注；多个时只在这里
+    date_ranges: list[dict[str, Any]] = field(default_factory=list)
+    added: int = 0
+    updated: int = 0
+    removed: int = 0
+    version: int = 0
+    #: 这张表没剖析（表结构里没有）或结果没写进去（写入一直冲突）
+    error: str | None = None
+
+
+@dataclass
+class ProfileReport:
+    """一次剖析的结果。stopped：整次剖析中途停下的原因（budget / deadline / failed），做完了为 None。"""
+
+    profiled_at: str
+    settings: ProfileSettings
+    tables: list[TableProfile] = field(default_factory=list)
+    queries_used: int = 0
+    stopped: str | None = None
+
+
+@dataclass
+class _RelationOutcome:
+    """一条关系核对完的结论。写不写、怎么写由 _apply 按写入时目录里那条关系的状态决定。"""
+
+    rid: str
+    target: str
+    coverage: float
+    cardinality: str | None
+    holds: bool
+    sample: int
+    matched: int
+    note: str
+
+
+@dataclass
+class _TableOutcome:
+    """一张表所有检查的结论，以及没查成、要原样保留旧结论的槽位。"""
+
+    relations: list[_RelationOutcome] = field(default_factory=list)
+    #: 没查成的关系：目录里剖析以前写的结论原样留着（不然会被 covered={"profile"} 当成「这次没有」删掉）
+    keep_relations: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _Context:
+    source: Any
+    settings: ProfileSettings
+    dialect: SqlDialect
+    run: _Runner
+    tables: dict[str, Any]
+    #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
+    masked: set[str]
+    #: 写进备注的剖析日期（UTC）
+    day: str
+    sizes: dict[str, TableSize] = field(default_factory=dict)
+
+    async def size(self, table: str, result: TableProfile) -> TableSize:
+        """表有多大，一次剖析里每张表只估一次。途中没查成的记进 result（行数估算这一项）。"""
+        if table not in self.sizes:
+            size, skips = await estimate_size(self.run, self.dialect, self.tables[table], table,
+                                              max_scan_rows=self.settings.max_scan_rows)
+            self.sizes[table] = size
+            result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
+        return self.sizes[table]
+
+    def is_masked(self, column: str) -> bool:
+        return column.lower() in self.masked
+
+    def scan_cap(self, size: TableSize) -> int | None:
+        """大表（或不知道多大）抽样、取值分布只看前多少行；小表整表看，返回 None。"""
+        if size.within(self.settings.max_scan_rows):
+            return None
+        return max(self.settings.sample_size, self.settings.max_scan_rows)
+
+
+def _column(meta: dict[str, Any], name: str) -> str | None:
+    """表结构里这一列的写法（目录里的列名大小写可能和表结构不同）；没有返回 None。"""
+    lowered = name.lower()
+    return next((str(c["name"]) for c in meta.get("columns") or []
+                 if isinstance(c, dict) and str(c.get("name", "")).lower() == lowered), None)
+
+
+def _constraint(meta: dict[str, Any], column: str) -> str | None:
+    """这一列单独是主键或某个唯一约束时返回「主键」/「唯一约束」，否则 None。"""
+    wanted = [column.lower()]
+    if [c.lower() for c in meta.get("primary_key") or []] == wanted:
+        return "主键"
+    for group in meta.get("unique") or []:
+        if isinstance(group, list) and [str(c).lower() for c in group] == wanted:
+            return "唯一约束"
+    return None
+
+
+def _percent(ratio: float) -> str:
+    """覆盖率写成百分数：整数不带小数，其余留一位；不到 100% 的不四舍五入成 100%。"""
+    text = f"{ratio * 100:.1f}".rstrip("0").rstrip(".")
+    return "99.9%" if text == "100" and ratio < 1 else f"{text}%"
+
+
+def _relation_target(rel: dict[str, Any]) -> str:
+    left = ", ".join(rel.get("columns") or [])
+    right = ", ".join(f"{rel.get('to_table')}.{c}" for c in rel.get("to_columns") or [])
+    return f"{left} → {right}"
+
+
+# ==========================================================================
+# 检查：关联关系
+# ==========================================================================
+
+
+def _relation_candidates(notes: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """要核对的关系：没被驳回、不是外键约束来的（外键由数据库保证，剖析也顶不掉它）。人工确认过的也核对，
+    只补覆盖率和基数。"""
+    return [r for r in (notes or {}).get("relations") or []
+            if isinstance(r, dict) and r.get("id") and r.get("status") != "rejected" and r.get("source") != "fk"]
+
+
+async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
+                  result: TableProfile) -> tuple[bool | None, str]:
+    """这一列（非空部分）唯一吗：(True / False / None 不知道, 依据)。有主键或唯一约束直接认；否则只对行数不超过
+    整表统计上限的表数一次 COUNT 和 COUNT(DISTINCT)，大表不扫。"""
+    how = _constraint(meta, column)
+    if how:
+        return True, how
+    size = await cx.size(table, result)
+    if not size.within(cx.settings.max_scan_rows):
+        return None, "too_large"
+    d = cx.dialect
+    res = await cx.run(d.unique_check_sql(d.table(meta, table), d.quote(column)))
+    row = res.rows[0] if res.rows else [None, None]
+    total, distinct = _as_int(row[0]), _as_int(row[1])
+    if total is None or distinct is None:
+        return None, "count"
+    return total == distinct, "count"
+
+
+def _relation_note(day: str, *, sample: int, matched: int, coverage: float, scan_cap: int | None,
+                   skipped_values: int, parent: tuple[bool | None, str], child: tuple[bool | None, str] | None,
+                   holds: bool) -> str:
+    """关系的剖析备注：日期、抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。"""
+    parts: list[str] = []
+    low = coverage < catalog.PROFILE_VERIFY_COVERAGE
+    if low:
+        parts.append(f"抽样覆盖率 {_percent(coverage)}，可能不是这条关系")
+    scope = f"（只看前 {scan_cap} 行）" if scan_cap else ""
+    sampled = f"子表抽样 {sample} 个不同键值{scope}，父表对上 {matched} 个"
+    parts.append(sampled if low else f"{sampled}，覆盖率 {_percent(coverage)}")
+    if skipped_values:
+        parts.append(f"另有 {skipped_values} 个键值的类型不支持核对，未计入")
+    unique, how = parent
+    if unique is True:
+        parts.append(f"被指向列是{how}" if how in ("主键", "唯一约束") else "被指向列经计数核对唯一")
+    elif unique is False:
+        parts.append("被指向列有重复值，不能作为关联的被指向键")
+    else:
+        parts.append("被指向的表超过整表统计的行数上限，未核对被指向列是否唯一")
+    if child is not None:
+        child_unique, child_how = child
+        if child_unique is True:
+            basis = child_how if child_how in ("主键", "唯一约束") else "计数核对"
+            parts.append(f"子表一侧也唯一（{basis}），一对一")
+        elif child_unique is False:
+            parts.append("子表一侧有重复值，多对一")
+        else:
+            parts.append("子表超过整表统计的行数上限，未核对子表一侧是否唯一，按多对一记")
+    if not holds and not low:
+        parts.append("暂不升为有确证")
+    return f"{NOTE_PREFIX}{day}）：" + "；".join(parts) + "。"
+
+
+async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _TableOutcome,
+                          result: TableProfile) -> None:
+    """从子表取至多 sample_size 个不同的非空键值，去父表里数对上几个，得到覆盖率；再看父键、子键唯不唯一。"""
+    cols, to_table, to_cols = list(rel.get("columns") or []), str(rel.get("to_table") or ""), \
+        list(rel.get("to_columns") or [])
+    if len(cols) != 1 or len(to_cols) != 1:
+        raise _Skip("unsupported", "多列组成的关联关系暂不剖析")
+    meta = cx.tables[table]
+    parent = to_table if to_table in cx.tables else catalog.resolve_table_name({"tables": cx.tables}, to_table)
+    if parent is None:
+        raise _Skip("missing", f"表结构里没有被指向的表 {to_table}，请先重新探查结构")
+    pmeta = cx.tables[parent]
+    col, pcol = _column(meta, cols[0]), _column(pmeta, to_cols[0])
+    if col is None or pcol is None:
+        missing = f"{table}.{cols[0]}" if col is None else f"{parent}.{to_cols[0]}"
+        raise _Skip("missing", f"表结构里没有列 {missing}，请先重新探查结构")
+    if pmeta.get("is_view"):
+        raise _Skip("view", f"被指向的 {parent} 是视图，不剖析")
+    for name, owner in ((col, table), (pcol, parent)):
+        if cx.is_masked(name):
+            raise _Skip("masked", f"{owner}.{name} 在数据源设置中被遮罩，不取样", carry=True)
+
+    d, s = cx.dialect, cx.settings
+    size = await cx.size(table, result)
+    scan_cap = cx.scan_cap(size)
+    child_table, parent_table = d.table(meta, table), d.table(pmeta, parent)
+    res = await cx.run(d.distinct_sample_sql(child_table, d.quote(col), s.sample_size, scan_cap=scan_cap),
+                       max_rows=s.sample_size)
+    kind = (res.column_types or {}).get(res.columns[0]) if res.columns else None
+    values = [row[0] for row in res.rows if row]
+    literals = list(dict.fromkeys(lit for v in values if (lit := sql_literal(v, kind)) is not None))
+    if not values:
+        raise _Skip("no_data", f"{table}.{col} 没有非空值，无法核对")
+    if not literals:
+        raise _Skip("unsupported", f"{table}.{col} 的取值类型不支持核对（只核对整数和文字）")
+    matched = 0
+    for start in range(0, len(literals), IN_CHUNK):
+        sql = d.match_count_sql(parent_table, d.quote(pcol), literals[start:start + IN_CHUNK])
+        matched += _as_int(_first(await cx.run(sql))) or 0
+    matched = min(matched, len(literals))
+    coverage = round(matched / len(literals), 4)
+
+    parent_unique = await _unique(cx, parent, pmeta, pcol, result)
+    child_unique = await _unique(cx, table, meta, col, result) if parent_unique[0] else None
+    cardinality = None
+    if child_unique is not None:
+        cardinality = "one_to_one" if child_unique[0] is True else "many_to_one"
+    holds = coverage >= catalog.PROFILE_VERIFY_COVERAGE and cardinality is not None
+    note = _relation_note(cx.day, sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
+                          skipped_values=len(values) - len(literals), parent=parent_unique, child=child_unique,
+                          holds=holds)
+    out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=coverage,
+                                          cardinality=cardinality, holds=holds, sample=len(literals),
+                                          matched=matched, note=note))
+
+
+# ==========================================================================
+# 结论进目录
+# ==========================================================================
+
+
+def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, confirmed: bool) -> dict[str, Any]:
+    if confirmed:
+        summary = "已人工确认，只补充覆盖率和基数"
+    elif status == "verified":
+        summary = f"覆盖率 {_percent(o.coverage)}，升为有确证"
+    elif o.coverage < catalog.PROFILE_VERIFY_COVERAGE:
+        summary = f"抽样覆盖率 {_percent(o.coverage)}，保持推断"
+    else:
+        summary = "被指向列未核实唯一，保持推断"
+    return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,
+            "columns": list(rel.get("columns") or []), "to_table": rel.get("to_table"),
+            "to_columns": list(rel.get("to_columns") or []), "status": status, "confirmed": confirmed,
+            "coverage": o.coverage, "cardinality": o.cardinality, "sample": o.sample, "matched": o.matched,
+            "summary": summary}
+
+
+def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
+    """人工确认过的关系只补覆盖率和基数：覆盖率是测量值，照新的写；基数只在原来没有时补，不改人定的；
+    备注只在原来为空、或者是剖析自己写的时候换成新的。状态、来源不动。返回改没改。"""
+    changed = False
+    if rel.get("coverage") != o.coverage:
+        rel["coverage"] = o.coverage
+        changed = True
+    if rel.get("cardinality") is None and o.cardinality is not None:
+        rel["cardinality"] = o.cardinality
+        changed = True
+    note = rel.get("note")
+    if (not note or str(note).startswith(NOTE_PREFIX)) and note != o.note:
+        rel["note"] = o.note
+        changed = True
+    if changed:
+        rel["updated_at"] = at
+    return changed
+
+
+def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
+           at: str) -> tuple[dict[str, Any], list[dict[str, Any]], catalog.MergeStats]:
+    """把一张表的结论并进写入时的目录：(新目录, 写进去的发现, 计数)。纯函数，写入冲突重来时再调一次。
+
+    - 没被确认、驳回的关系：记为 source=profile，覆盖率够、父键唯一的 verified，否则 proposed；按 merge_notes
+      的规则并入（剖析顶得掉命名推断、模型起草，顶不掉外键和人工）。
+    - 人工确认过的关系：只补覆盖率和基数（_patch_confirmed）。
+    - covered={"profile"}：这次完整检查过、却没再得出的剖析结论删掉（比如取值变多、不再像码值的列）；
+      没查成的检查（超时、预算用完……）把剖析以前写的结论原样带上，不因为这次没查成就删。
+    """
+    existing = existing or {}
+    current = {str(r["id"]): r for r in existing.get("relations") or [] if isinstance(r, dict) and r.get("id")}
+    relations: list[dict[str, Any]] = []
+    confirmed: dict[str, _RelationOutcome] = {}
+    findings: list[dict[str, Any]] = []
+    for o in out.relations:
+        rel = current.get(o.rid)
+        if rel is None or rel.get("status") == "rejected" or rel.get("source") == "fk":
+            continue                     # 核对期间被删、被驳回了：不写
+        if rel.get("status") == "confirmed":
+            confirmed[o.rid] = o
+            findings.append(_relation_finding(o, rel, status="confirmed", confirmed=True))
+            continue
+        status = "verified" if o.holds else "proposed"
+        relations.append({"id": o.rid, "columns": list(rel["columns"]), "to_table": rel["to_table"],
+                          "to_columns": list(rel["to_columns"]), "cardinality": o.cardinality,
+                          "coverage": o.coverage, "source": "profile", "status": status, "note": o.note})
+        findings.append(_relation_finding(o, rel, status=status, confirmed=False))
+    for rid in out.keep_relations:
+        rel = current.get(rid)
+        if rel is not None and rel.get("source") == "profile":
+            relations.append(copy.deepcopy(rel))
+    draft: dict[str, Any] = {"relations": relations} if relations else {}
+    merged, stats = catalog.merge_notes(existing, draft, covered={"profile"}, at=at)
+    for rel in merged.get("relations") or []:
+        o = confirmed.get(str(rel.get("id")))
+        if o is not None and rel.get("status") == "confirmed" and _patch_confirmed(rel, o, at):
+            stats += catalog.MergeStats(updated=1)
+    return merged, findings, stats
+
+
+# ==========================================================================
+# 入口
+# ==========================================================================
+
+#: 正在剖析的数据源。检查和登记之间没有 await，在一个事件循环里是原子的；服务端是单进程部署，
+#: 多进程部署时要换成库里的锁
+_RUNNING: set[str] = set()
+
+
+@dataclass
+class _Check:
+    kind: str
+    target: str
+    path: str | None
+    run: Any
+    #: 没查成时要原样保留的旧结论（关系编号）
+    keep_relation: str | None = None
+
+
+def _plan(cx: _Context, table: str, notes: dict[str, Any], out: _TableOutcome,
+          result: TableProfile) -> list[_Check]:
+    """这张表要做的检查，按价值排：关系、码值、日期。先列全再执行：中途停下时，没做的每一项都要记下原因。"""
+    checks: list[_Check] = []
+    for rel in _relation_candidates(notes):
+        checks.append(_Check("relation", _relation_target(rel), f"relations.{rel['id']}",
+                             lambda rel=rel: _check_relation(cx, table, rel, out, result),
+                             keep_relation=str(rel["id"])))
+    return checks
+
+
+async def _profile_table(cx: _Context, table: str, notes: dict[str, Any], result: TableProfile) -> _TableOutcome:
+    out = _TableOutcome()
+    if cx.tables[table].get("is_view"):
+        result.skipped.append(ProfileSkip("table", table, "view", "视图没有统计信息，剖析可能触发整个视图的计算，已跳过"))
+        return out
+    checks = _plan(cx, table, notes, out, result)
+    for i, check in enumerate(checks):
+        try:
+            await check.run()
+        except _Skip as e:
+            result.skipped.append(ProfileSkip(check.kind, check.target, e.reason, e.detail, check.path))
+            if check.keep_relation and e.carry:
+                out.keep_relations.add(check.keep_relation)
+        except _Stop as e:
+            detail = _STOP_DETAIL[e.reason].format(max_queries=cx.settings.max_queries,
+                                                   max_total_s=_fmt(cx.settings.max_total_s))
+            for rest in checks[i:]:
+                result.skipped.append(ProfileSkip(rest.kind, rest.target, e.reason, detail, rest.path))
+                if rest.keep_relation:
+                    out.keep_relations.add(rest.keep_relation)
+            break
+    if table in cx.sizes:
+        result.row_estimate = cx.sizes[table]
+    return out
+
+
+async def _write(session: AsyncSession, source_id: str, table: str, out: _TableOutcome, result: TableProfile, *,
+                 at: str, actor: str | None) -> None:
+    """并入并写入（乐观锁）。撞上别人刚改过就重读重并，最多三次。"""
+    for _attempt in range(3):
+        entry = await catalog.read_entry(session, source_id, table)
+        version = entry.version if entry else 0
+        notes, findings, stats = _apply(entry.notes if entry else {}, out, at=at)
+        result.findings = findings
+        result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
+        result.version = version
+        if entry is None and not notes:
+            return                       # 什么也没得出，不建空目录
+        try:
+            written = await catalog.write_entry(session, source_id, table, notes, if_version=version, actor=actor)
+        except catalog.CatalogConflict:
+            continue
+        result.version = written.version
+        return
+    result.error = "这张表的数据目录正被其他人修改，剖析结果未能写入，请稍后重新剖析"
+    result.findings = []
+    result.added = result.updated = result.removed = 0
+
+
+async def _pick_tables(session: AsyncSession, source: Any, tables: list[str] | None,
+                       entries: dict[str, catalog.CatalogEntry], report: ProfileReport) -> list[str]:
+    cache = getattr(source, "schema_cache", None) or {}
+    all_tables = cache.get("tables") or {}
+    if tables:
+        picked: list[str] = []
+        for name in dict.fromkeys(str(t) for t in tables):
+            key = catalog.resolve_table_name(cache, name)
+            if key is None:
+                report.tables.append(TableProfile(table=name, error=f"表结构里没有 {name}，请先重新探查结构"))
+            elif key not in picked:
+                picked.append(key)
+        return picked
+    usage = await catalog.table_usage(session, source)
+    order = {name: i for i, name in enumerate(all_tables)}
+    candidates = [name for name, meta in all_tables.items()
+                  if not (meta or {}).get("is_view") and name in entries
+                  and _relation_candidates(entries[name].notes)]
+    return sorted(candidates, key=lambda n: (-usage.get(n, 0), order[n]))[:PROFILE_DEFAULT_TABLES]
+
+
+async def profile_catalog(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None = None,
+                          actor: str | None = None, settings: ProfileSettings | None = None) -> ProfileReport:
+    """剖析这些表并把结论写进数据目录，同步完成。
+
+    - row：数据源记录（开关、遮罩按它的 options）；source：用来查询和读表结构的源（上传源是绑定当前快照的视图）。
+    - settings 不给就按 row.options 读；没开启抛 ProfileDisabled，这个源正在剖析抛 ProfileBusy。
+    - tables 为空时按使用次数取前 PROFILE_DEFAULT_TABLES 张目录里有待核实关系的表。
+    - 每张表做完就写入，后面的表停下（预算、总时长）不影响前面已经写进去的。
+    """
+    settings = settings or profile_settings(getattr(row, "options", None))
+    name = getattr(row, "name", "") or ""
+    if not settings.enabled:
+        raise ProfileDisabled(f"数据源「{name}」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析")
+    if source.id in _RUNNING:
+        raise ProfileBusy(f"数据源「{name}」正在进行数据剖析，请等待完成后再试")
+    _RUNNING.add(source.id)
+    try:
+        return await _profile(session, row, source, tables, actor, settings)
+    finally:
+        _RUNNING.discard(source.id)
+
+
+async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[str] | None, actor: str | None,
+                   settings: ProfileSettings) -> ProfileReport:
+    at = catalog.now_iso()
+    report = ProfileReport(profiled_at=at, settings=settings)
+    dialect = SqlDialect(source.kind)
+    run = _Runner(source, settings, dialect)
+    cx = _Context(source=source, settings=settings, dialect=dialect, run=run,
+                  tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
+                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))},
+                  day=at[:10])
+    entries = await catalog.read_catalog(session, source.id)
+    for table in await _pick_tables(session, source, tables, entries, report):
+        result = TableProfile(table=table)
+        report.tables.append(result)
+        if run.stopped:
+            detail = _STOP_DETAIL[run.stopped].format(max_queries=settings.max_queries,
+                                                      max_total_s=_fmt(settings.max_total_s))
+            result.skipped.append(ProfileSkip("table", table, run.stopped, detail))
+            continue
+        before = run.used
+        entry = entries.get(table)
+        out = await _profile_table(cx, table, entry.notes if entry else {}, result)
+        result.queries = run.used - before
+        await _write(session, source.id, table, out, result, at=at, actor=actor)
+    report.queries_used = run.used
+    report.stopped = run.stopped
+    logger.info("数据剖析 源=%s 表=%s 查询=%d 停止=%s 署名=%s", source.id,
+                ",".join(t.table for t in report.tables), run.used, run.stopped, actor)
+    return report
+
+
+__all__ = ["IN_CHUNK", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES", "PROFILE_OPTION", "ProfileBusy",
+           "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile",
+           "TableSize", "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem",
+           "sql_literal"]
