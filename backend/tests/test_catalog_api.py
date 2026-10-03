@@ -11,12 +11,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.data import catalog
-from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.main import app as _fastapi_app
 from tests.fixtures.catalog import scenic
 from tests.fixtures.catalog.fake_model import FakeModel
+from tests.fixtures.sources import drop_source
 
 ACTOR = {"X-Actor": quote("王敏")}
 
@@ -38,7 +38,7 @@ async def source_id(client, scenic_db):
     r = await client.post(f"/api/datasources/{sid}/introspect")
     assert r.status_code == 200, r.text
     yield sid
-    await engines.invalidate(sid)
+    await drop_source(sid)
 
 
 def _base(sid: str) -> str:
@@ -184,9 +184,12 @@ async def test_draft_without_schema_is_refused(client):
         session.add(row)
         await session.commit()
         sid = row.id
-    r = await client.post(f"{_base(sid)}/draft", json={})
-    assert r.status_code == 409 and "探查结构" in r.json()["detail"]
-    assert (await client.get(_base(sid))).json()["tables"] == []
+    try:
+        r = await client.post(f"{_base(sid)}/draft", json={})
+        assert r.status_code == 409 and "探查结构" in r.json()["detail"]
+        assert (await client.get(_base(sid))).json()["tables"] == []
+    finally:
+        await drop_source(sid)
 
 
 async def test_schema_endpoint_detail_carries_catalog(client, source_id):

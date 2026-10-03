@@ -23,6 +23,7 @@ from app.engine.governance import lint_for_publish, publish_issues
 from app.engine.schema import GraphSpec
 from app.main import app
 from tests.fixtures.catalog import scenic_notes
+from tests.fixtures.sources import drop_source
 
 FANOUT_SQL = ("SELECT SUM(o.total_amount) AS gmv FROM orders o JOIN order_items i ON i.order_id = o.id "
               "WHERE o.status = 1")
@@ -133,10 +134,7 @@ async def scenic_source(scenic_db):
             await catalog.write_entry(session, row.id, table, notes, if_version=0, actor="王敏")
         source_id = row.id
     yield name
-    async with SessionLocal() as session:
-        row = await session.get(DataSource, source_id)
-        row.enabled = False
-        await session.commit()
+    await drop_source(source_id)
 
 
 @pytest.fixture

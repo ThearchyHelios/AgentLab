@@ -15,6 +15,7 @@ from app.data.catalog import make_item
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 from tests.fixtures.catalog.fake_model import FakeModel
+from tests.fixtures.sources import drop_source
 
 
 def _col(name: str, type_: str = "INTEGER", comment: str | None = None, nullable: bool = True) -> dict:
@@ -255,6 +256,16 @@ async def test_model_draft_respects_system_notes_of_imported_tables():
 # ---------------------------------------------------------------- 起草并写入
 
 
+_CREATED: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+async def _drop_created_sources():
+    yield
+    while _CREATED:
+        await drop_source(_CREATED.pop())
+
+
 async def _db_source(tables: dict, **kw) -> DataSource:
     for name, meta in tables.items():
         meta["qualified"] = name
@@ -263,6 +274,7 @@ async def _db_source(tables: dict, **kw) -> DataSource:
                          schema_cache={"tables": tables}, **kw)
         session.add(row)
         await session.commit()
+        _CREATED.append(row.id)
         return row
 
 

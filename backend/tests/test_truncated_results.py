@@ -34,6 +34,7 @@ from app.engine.expressions import TruncatedUse, eval_expression
 from app.engine.issuance import decide_tier, incomplete_gaps
 from app.engine.runner import run_manager
 from app.main import app
+from tests.fixtures.sources import drop_source
 
 # --------------------------------------------------------------------------
 # 求值器：整组用到截断结果时记一笔，单格不记
@@ -345,7 +346,7 @@ async def park(ticket_db, engine_up):
     # 连接池按数据源 id 缓存：换了库文件不作废，查的还是上一个测试的库
     await engines.invalidate(source_id)
     yield
-    await engines.invalidate(source_id)
+    await drop_source(source_id)
 
 
 def node(nid, ntype, **config):
