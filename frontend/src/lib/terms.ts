@@ -2121,7 +2121,7 @@ export const CATALOG_TEXT = {
   keysPlaceholder: '列名，用顿号或逗号分隔',
   keysUnknown: (cols: string) => `表结构中没有这些列：${cols}`,
   codesPlaceholder: '1=已支付',
-  codesHint: '每行一个，写成「码值=含义」',
+  codesHint: '每行一个，写成「码值=含义」，含义可暂不填写',
   codesInvalid: (line: number) => `第 ${formatNumber(line)} 行应写成「码值=含义」`,
   codesDuplicate: (code: string) => `码值 ${code} 重复`,
   dateColumnRequired: '填写规则或时区时，日期列必填',
@@ -2209,4 +2209,159 @@ export const PROFILE_TEXT = {
   savedOn: (name: string) => `「${name}」已开启数据剖析`,
   savedOff: (name: string) => `「${name}」已关闭数据剖析`,
   saved: (name: string) => `已保存「${name}」的数据剖析设置`,
+  // ---- 数据目录页：范围与确认
+  action: '数据剖析',
+  actionHint: '对业务库发少量只读查询：核实推断的关联关系、取码值候选、提议业务日期',
+  profileSelected: (n: number) => `剖析所选（${formatNumber(n)}）`,
+  title: '数据剖析',
+  intro: '对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。'
+    + '结论写入数据目录；已确认、已驳回的项不会被改动。',
+  scope: '剖析范围',
+  scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
+  scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
+  scopeDefault: '使用次数最多、有待核实关联关系的表',
+  scopeDefaultHint: (n: number) => `由服务端挑选，至多 ${formatNumber(n)} 张`,
+  scopeTooMany: (max: number) => `超过 ${formatNumber(max)} 张，请缩小范围`,
+  budget: '本次预算',
+  budgetQueries: (queries: number, timeout: number) =>
+    `最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
+  budgetTotal: (total: number) => `总时长不超过 ${formatNumber(total)} 秒，到时即停止`,
+  budgetSample: (n: number) => `每条关联关系抽样 ${formatNumber(n)} 个键值`,
+  budgetScan: (n: number) => (n > 0 ? `行数超过 ${formatNumber(n)} 的表不做整表统计` : '不做整表统计'),
+  budgetFrom: (name: string) => `按「${name}」的数据剖析设置`,
+  editSettings: '修改设置',
+  noCancel: '剖析在服务端一次完成，开始后无法中途停止。',
+  start: '开始剖析',
+  again: '重新剖析',
+  disabledTitle: '这个数据源未开启数据剖析',
+  disabledBody: '剖析会对业务库发出只读查询，需要先在数据源设置中开启。',
+  enable: '开启数据剖析',
+  // ---- 进行中
+  running: '正在剖析…',
+  elapsed: (used: string, total: string) => `已用时 ${used}（总时长上限 ${total}）`,
+  runningHint: '剖析在服务端一次完成，无法中途停止。关闭此窗口不影响剖析，完成后会提示结果。',
+  background: '在后台继续',
+  headerRunning: (used: string) => `正在剖析 ${used}`,
+  headerRunningHint: '数据剖析进行中，点击查看',
+  leavePage: '离开本页不会中止剖析，结论仍会写入数据目录，但不再显示本次的报告。',
+  // ---- 报告
+  done: '剖析完成',
+  stoppedTitle: (reason: string) => `剖析已停止：${reason}`,
+  summary: (used: number, max: number, tables: number) =>
+    `用了 ${formatNumber(used)} / ${formatNumber(max)} 条查询，剖析 ${formatNumber(tables)} 张表`,
+  changes: (added: number, updated: number, removed: number) =>
+    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+  noChange: '目录没有变化',
+  toastDone: (summary: string) => `数据剖析完成：${summary}`,
+  toastStopped: (reason: string) => `数据剖析已停止：${reason}`,
+  toastFailed: '数据剖析未能完成',
+  viewReport: '查看报告',
+  close: '完成',
+  tableQueries: (n: number) => `${formatNumber(n)} 条查询`,
+  rowsStats: (n: number) => `约 ${formatNumber(n)} 行`,
+  rowsCount: (n: number) => `${formatNumber(n)} 行`,
+  rowsAtLeast: (n: number) => `超过 ${formatNumber(n - 1)} 行`,
+  rowsHint: { stats: '数据库统计信息中的估算值', count: '计数到整表统计行数上限为止' } as Record<string, string>,
+  openTable: '打开',
+  openTableLabel: (name: string) => `打开「${name}」`,
+  noFindings: '没有新的发现',
+  findingRelations: '关联关系',
+  findingCodes: '码值候选',
+  findingDate: '业务日期',
+  relationVerified: '升为已验证',
+  relationKept: '保持推断',
+  relationConfirmed: '已人工确认，只补充覆盖率和基数',
+  relationLowCoverage: '覆盖率不足，可能不是这条关系',
+  relationNotUnique: '被指向列未核实唯一',
+  coverage: (pct: string) => `覆盖率 ${pct}`,
+  sampled: (sample: number, matched: number) => `抽样 ${formatNumber(sample)} 个键值，对上 ${formatNumber(matched)} 个`,
+  cardinalityUnknown: '基数未核实',
+  codeRows: (n: number) => `${formatNumber(n)} 行`,
+  codesSummary: (values: number, rows: number) => `${formatNumber(values)} 个取值，共 ${formatNumber(rows)} 行`,
+  codesPendingN: (n: number) => `${formatNumber(n)} 个含义待填写`,
+  fillMeanings: '填写含义',
+  fillMeaningsLabel: (col: string) => `填写含义：列 ${col} 的码值`,
+  dateProposal: (col: string) => `提议按 ${col} 作为业务日期`,
+  dateSpan: (min: string, max: string) => `取值从 ${min} 到 ${max}`,
+  dateRanges: '日期列的取值范围',
+  skippedTitle: (n: number) => `跳过 ${formatNumber(n)} 项`,
+  moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
+  tableError: '这张表未能剖析',
+  // ---- 无法开始（409）
+  blocked: {
+    disabled: '未开启数据剖析',
+    inactive: '数据源已停用',
+    noSchema: '还没有表结构',
+    busy: '这个数据源正在剖析',
+    tampered: '数据文件核对未通过',
+    other: '无法开始剖析',
+  } as Record<string, string>,
+  blockedNext: {
+    disabled: '剖析会对业务库发出只读查询，需要先在数据源设置中开启。开启后即可在这里剖析。',
+    inactive: '停用的数据源无法剖析。请在数据源设置中启用后重试。',
+    noSchema: '请回到数据源卡片点击「探查结构」，探查完成后重试。',
+    busy: '同一个数据源同一时间只能进行一次剖析。请等待当前剖析完成后重试。',
+    tampered: '数据文件与登记的版本不一致，已拒绝查询。请重新上传表格，或联系管理员核对数据文件。',
+    other: '请稍后重试。',
+  } as Record<string, string>,
+  goSource: '前往数据源',
+  retry: '重试',
+  failedTitle: '剖析未能完成',
+  backToSetup: '返回',
+}
+
+/** 整次剖析中途停下的原因 */
+export const PROFILE_STOP_LABEL: Record<string, string> = {
+  budget: '查询次数已用完',
+  deadline: '总时长已用完',
+  failed: '连续多条查询失败',
+}
+
+/** 停下之后怎么办 */
+export const PROFILE_STOP_NEXT: Record<string, string> = {
+  budget: '其余检查未执行。可在数据剖析设置中调高查询次数上限，或缩小剖析范围后重新剖析。',
+  deadline: '其余检查未执行。可在数据剖析设置中调高总时长上限，或缩小剖析范围后重新剖析。',
+  failed: '其余检查未执行。请先在数据源卡片上测试连接，确认可用后重新剖析。',
+}
+
+/** 跳过一项的原因（skipped.reason）。整句说明在 skipped.detail 里 */
+export const PROFILE_SKIP_REASON_LABEL: Record<string, string> = {
+  budget: '查询次数用完',
+  deadline: '总时长用完',
+  failed: '连续失败',
+  timeout: '查询超时',
+  error: '查询失败',
+  rejected: '未通过安全守卫',
+  masked: '列已遮罩',
+  too_large: '表太大',
+  view: '视图',
+  unsupported: '暂不支持',
+  no_data: '没有数据',
+  missing: '表结构中没有',
+  high_cardinality: '取值太多',
+}
+
+/** 跳过的是哪一类检查（skipped.kind） */
+export const PROFILE_SKIP_KIND_LABEL: Record<string, string> = {
+  relation: '关联关系',
+  codes: '码值',
+  date: '日期列',
+  row_estimate: '行数估算',
+  table: '整张表',
+}
+
+/** 码值候选：剖析只知道出现过哪些取值，含义等人填 */
+export const CODES_TEXT = {
+  pending: '含义待填写',
+  pendingN: (n: number) => `${formatNumber(n)} 个含义待填写`,
+  fill: '填写含义',
+  fillLabel: (col: string) => `填写含义：列 ${col} 的码值`,
+  title: (col: string) => `列 ${col} 的码值含义`,
+  hint: '保存后这一项记为人工填写、已确认。暂不清楚的含义可以留空，之后再填。',
+  head: { code: '码值', meaning: '含义' },
+  note: '来源说明',
+  placeholder: '含义待填写',
+  saved: (n: number) => (n ? `已填写 ${formatNumber(n)} 个码值的含义` : '已保存'),
+  save: '保存',
+  cancel: '取消',
 }

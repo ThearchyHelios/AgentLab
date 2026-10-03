@@ -189,15 +189,18 @@ function codesText(v: Record<string, string>): string {
   return Object.entries(v).map(([k, x]) => `${k}=${x}`).join('\n')
 }
 
-/** 码值的文字：每行一个「码值=含义」（全角等号也认）。返回解析结果和第一处错误 */
+/**
+ * 码值的文字：每行一个「码值=含义」（全角等号也认）。含义可以空着（「2=」）：数据剖析只知道列里出现过哪些取值，
+ * 含义等人填，服务端也收空含义。返回解析结果和第一处错误
+ */
 export function parseCodes(text: string): { value: Record<string, string>; error: { line: number } | { dup: string } | null } {
   const value: Record<string, string> = {}
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim()
     if (!line) continue
-    const m = line.match(/^(.+?)\s*[=＝]\s*(.+)$/)
-    if (!m) return { value, error: { line: i + 1 } }
+    const m = line.match(/^(.+?)\s*[=＝]\s*(.*)$/)
+    if (!m || !m[1].trim()) return { value, error: { line: i + 1 } }
     const code = m[1].trim()
     if (code in value) return { value, error: { dup: code } }
     value[code] = m[2].trim()

@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, BookMarked, Database, Sparkles } from 'lucide-react'
+import { ArrowLeft, BookMarked, Database, ScanSearch, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
-import { EmptyState, ErrorState, PageHeader, Skeleton, toast } from '../../components/ui'
-import { useDatasources, useOnReconnect } from '../../store/catalog'
-import { CATALOG_TEXT as CT } from '../../lib/terms'
+import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, toast, useTicker } from '../../components/ui'
+import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
+import { CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
+import { ProfileDialog } from './ProfileDialog'
+import type { ProfileJob } from './ProfileDialog'
+import { ProfileSettingsDialog } from './ProfileSettings'
+import { profileBlockOf, profileSettingsOf, secondsText } from './profile'
 import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
 import { filterCounts, progressOf, rowFromDetail, visibleRows } from './model'
@@ -65,6 +69,24 @@ export function CatalogPage() {
   const [drafting, setDrafting] = useState(false)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
   const [drafted, setDrafted] = useState<{ seq: number; tables: Set<string> }>({ seq: 0, tables: new Set() })
+  const [profiling, setProfiling] = useState(false)
+  const [profileSettingsOpen, setProfileSettingsOpen] = useState(false)
+  /** 一次剖析的状态。关掉弹窗剖析照常进行：状态留在页面上，页头有入口，完成后提示并可再打开报告 */
+  const [job, setJob] = useState<(ProfileJob & { sourceId: string }) | null>(null)
+  /** 剖析设置刚存过：数据源列表重取回来之前按存下的这份算（预算、开没开） */
+  const [savedOptions, setSavedOptions] = useState<{ sourceId: string; options: Record<string, unknown> } | null>(null)
+  /** 从剖析报告点「填写含义」：打开那张表并弹出那一列的码值 */
+  const [fillCodes, setFillCodes] = useState<{ table: string; column: string; seq: number } | null>(null)
+  const profilingRef = useRef(profiling)
+  profilingRef.current = profiling
+  const alive = useRef(true)
+  // 开发模式的严格模式会先卸载再挂载一次：挂载时要重新置为真
+  useEffect(() => {
+    alive.current = true
+    return () => { alive.current = false }
+  }, [])
+  const sourceRef = useRef(sourceId)
+  sourceRef.current = sourceId
 
   const rows = useMemo(() => data?.tables ?? [], [data])
   const visible = useMemo(() => visibleRows(rows, query, filter, sort), [rows, query, filter, sort])
@@ -87,6 +109,77 @@ export function CatalogPage() {
     void load()
   }, [load])
 
+  const options = savedOptions?.sourceId === sourceId ? savedOptions.options : source?.options
+  const profileSettings = useMemo(() => profileSettingsOf(options), [options])
+  const myJob = job?.sourceId === sourceId ? job : null
+  const jobRunning = myJob?.phase === 'running'
+  useTicker(1000, jobRunning)
+
+  /**
+   * 剖析：同步请求，做完才返回。期间关掉弹窗不影响；回来时页面已经换了数据源或卸载了，只提示、不再改这一页。
+   * 写进去的表重新载入清单和正在看的详情（编辑中的不动，同起草）
+   */
+  const startProfile = useCallback(async (tables: string[] | null) => {
+    const src = sourceId
+    const startedAt = Date.now()
+    setJob({ sourceId: src, phase: 'running', startedAt, tables, settings: profileSettings })
+    let next: ProfileJob
+    try {
+      const report = await api.dataCatalog.profile(src, tables ? { tables } : {})
+      next = { phase: 'done', report, ms: Date.now() - startedAt }
+    } catch (e) {
+      next = e instanceof ApiError && e.status === 409
+        ? { phase: 'blocked', kind: profileBlockOf(e.message), message: e.message, tables }
+        : { phase: 'failed', error: e, tables }
+    }
+    const here = alive.current && sourceRef.current === src
+    if (here) setJob({ ...next, sourceId: src })
+    if (next.phase === 'done') {
+      const r = next.report
+      const touched = r.tables.filter((t) => !t.error && t.added + t.updated + t.removed > 0).map((t) => t.table_name)
+      if (here) {
+        if (touched.length) setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(touched) }))
+        void load()
+      }
+      // 弹窗开着就看报告；关了（在后台继续）才提示，并给「查看报告」
+      if (!here || !profilingRef.current) {
+        const summary = PT.summary(r.queries_used, r.settings.max_queries, r.tables.length)
+        const text = r.stopped ? PT.toastStopped(PROFILE_STOP_LABEL[r.stopped] ?? r.stopped) : PT.toastDone(summary)
+        const show = r.stopped ? toast.warn : toast.ok
+        show(text, here ? { key: `profile:${src}`, duration: 10000, action: { label: PT.viewReport, onClick: () => setProfiling(true) } }
+          : { key: `profile:${src}` })
+      }
+    } else if (!here || !profilingRef.current) {
+      toast.error(next.phase === 'blocked' ? next.message : next.error, here
+        ? { key: `profile:${src}`, action: { label: PT.viewReport, onClick: () => setProfiling(true) } } : { key: `profile:${src}` })
+    }
+  }, [sourceId, profileSettings, load])
+
+  const openProfile = useCallback(() => {
+    // 上一次的结果（报告、被拒）看过了，再点就是重新开始；正在剖析时打开的是进度
+    setJob((cur) => (cur && cur.phase === 'running' && cur.sourceId === sourceId ? cur : null))
+    setProfiling(true)
+  }, [sourceId])
+
+  const onProfileSettingsSaved = useCallback((row: any) => {
+    setProfileSettingsOpen(false)
+    setSavedOptions({ sourceId, options: row?.options ?? {} })
+    void useCatalog.getState().reload('datasources')
+    // 因为没开启被拒的：开了就回到选范围，可以直接开始
+    setJob((cur) => (cur && cur.phase === 'blocked' && cur.kind === 'disabled' ? null : cur))
+  }, [sourceId])
+
+  const openFromReport = useCallback((t: string) => {
+    setProfiling(false)
+    openTable(t)
+  }, [openTable])
+
+  const fillFromReport = useCallback((t: string, column: string) => {
+    setProfiling(false)
+    setFillCodes((cur) => ({ table: t, column, seq: (cur?.seq ?? 0) + 1 }))
+    openTable(t)
+  }, [openTable])
+
   // 上一张 / 下一张按清单当前的筛选和排序走；正在看的表不在筛选结果里（刚确认完、从关联关系跳过来）时按全部表走
   const [prev, next] = useMemo(() => {
     if (!table) return [null, null]
@@ -104,6 +197,19 @@ export function CatalogPage() {
       <Sparkles size={11} aria-hidden /> {CT.draft}
     </button>
   )
+  // 页头的「数据剖析」：剖析进行中换成计时，点开看进度（关掉弹窗剖析照常进行）
+  const headerProfile = jobRunning && myJob?.phase === 'running'
+    ? (
+      <button type="button" className="btn btn-sm" onClick={() => setProfiling(true)} title={PT.headerRunningHint}
+              aria-label={PT.headerRunning(secondsText(Date.now() - myJob.startedAt))} data-catalog-profile="running">
+        <Spinner size={11} /> <span className="tnum hidden sm:inline">{PT.headerRunning(secondsText(Date.now() - myJob.startedAt))}</span>
+      </button>
+    )
+    : (
+      <button type="button" className="btn btn-sm" onClick={openProfile} aria-label={PT.action} title={PT.actionHint} data-catalog-profile="">
+        <ScanSearch size={11} aria-hidden /> <span className="hidden sm:inline">{PT.action}</span>
+      </button>
+    )
   // 页头的「起草」窄屏只留图标，标题才放得下
   const headerDraft = (
     <button type="button" className="btn btn-sm" onClick={() => setDrafting(true)} aria-label={CT.draft} title={CT.draft} data-catalog-draft="">
@@ -159,12 +265,13 @@ export function CatalogPage() {
             active={table}
             onOpen={openTable}
             onDraft={() => setDrafting(true)}
+            onProfile={openProfile}
           />
         </aside>
         <section className={clsx('min-h-0 min-w-0 flex-1 flex-col lg:flex', table ? 'flex' : 'hidden')} aria-label={table ?? CT.overviewTitle}>
           {table
             ? (
-              <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} prev={prev} next={next}
+              <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
                            onOpen={openTable} onBack={() => navigate(base)} onDetail={onDetail} />
             )
             : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
@@ -181,6 +288,7 @@ export function CatalogPage() {
         subtitle={CT.subtitle}
         actions={(
           <div className="flex shrink-0 items-center gap-1.5">
+            {hasTables && headerProfile}
             {hasTables && headerDraft}
             <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate(back)} aria-label={CT.back} data-catalog-back="">
               <ArrowLeft size={12} aria-hidden /> <span className="hidden sm:inline">{CT.back}</span>
@@ -199,6 +307,28 @@ export function CatalogPage() {
           onClose={() => setDrafting(false)}
           onDrafted={onDrafted}
         />
+      )}
+      {profiling && data && (
+        <ProfileDialog
+          sourceName={source?.name ?? sourceId}
+          settings={profileSettings}
+          rows={rows}
+          visible={visible}
+          selected={[...selected]}
+          filtered={filtered}
+          job={myJob}
+          onStart={(tables) => void startProfile(tables)}
+          onClose={() => setProfiling(false)}
+          onSettings={() => setProfileSettingsOpen(true)}
+          onGoSource={() => navigate(back)}
+          onOpenTable={openFromReport}
+          onFillCodes={fillFromReport}
+          onReset={() => setJob(null)}
+        />
+      )}
+      {profileSettingsOpen && source && (
+        <ProfileSettingsDialog row={{ id: source.id, name: source.name, options }} onClose={() => setProfileSettingsOpen(false)}
+                               onSaved={onProfileSettingsSaved} />
       )}
     </div>
   )

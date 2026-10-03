@@ -134,6 +134,40 @@ export function profileFieldOfRejection(message: string): 'enabled' | CatalogPro
   return 'section'
 }
 
+// ---------------------------------------------------------------------------
+// 剖析：范围、报告里的读数、409 的分类
+// ---------------------------------------------------------------------------
+
+/** 不指定表时服务端剖析几张（PROFILE_DEFAULT_TABLES） */
+export const PROFILE_DEFAULT_TABLES = 10
+/** 一次最多指定几张表（接口 tables 的 max_length） */
+export const PROFILE_MAX_TABLES = 200
+
+/** 覆盖率写成百分数：最多一位小数，不到 100% 的不进成 100%（同服务端 _percent） */
+export function coverageText(ratio: number): string {
+  const text = (ratio * 100).toFixed(1).replace(/\.0$/, '')
+  return text === '100' && ratio < 1 ? '99.9%' : `${text}%`
+}
+
+/** 已用时长的读数：「不到 1 秒」「8 秒」「1 分 05 秒」 */
+export function secondsText(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 1) return '不到 1 秒'
+  return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${String(s % 60).padStart(2, '0')} 秒`
+}
+
+/** 剖析接口回 409 的几种情况（按服务端的原话认：catalog_profile.ensure_enabled、api/catalog.py、engine.SnapshotTampered） */
+export type ProfileBlock = 'disabled' | 'inactive' | 'noSchema' | 'busy' | 'tampered' | 'other'
+
+export function profileBlockOf(message: string): ProfileBlock {
+  if (message.includes('未开启数据剖析')) return 'disabled'
+  if (message.includes('已停用')) return 'inactive'
+  if (message.includes('正在进行数据剖析')) return 'busy'
+  if (message.includes('探查结构')) return 'noSchema'
+  if (/已拒绝(?:这次)?查询/.test(message)) return 'tampered'
+  return 'other'
+}
+
 /** 设置里有没有剖析设置这一项（options 的其余键原样带上） */
 export function withProfileOption(options: Record<string, unknown> | null | undefined, value: Record<string, unknown> | undefined): Record<string, unknown> {
   const { [PROFILE_OPTION]: _old, ...rest } = options ?? {}

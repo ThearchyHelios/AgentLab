@@ -1,11 +1,11 @@
 import { memo, useCallback, useEffect, useRef } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
-import { AlertTriangle, Search, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, ScanSearch, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogTableRow } from '../../types'
 import { useRadioGroup } from '../../components/ui'
 import { formatNumber } from '../../lib/format'
-import { CATALOG_KIND_LABEL, CATALOG_TEXT as CT } from '../../lib/terms'
+import { CATALOG_KIND_LABEL, CATALOG_TEXT as CT, PROFILE_TEXT as PT } from '../../lib/terms'
 import { CountBadges } from './parts'
 import { LIST_FILTERS, LIST_SORTS, progressOf } from './model'
 import type { ListFilter, ListSort } from './model'
@@ -17,7 +17,7 @@ import type { ListFilter, ListSort } from './model'
 // ===========================================================================
 
 export function TableIndex({
-  rows, total, counts, query, onQuery, filter, onFilter, sort, onSort, selected, onSelected, active, onOpen, onDraft,
+  rows, total, counts, query, onQuery, filter, onFilter, sort, onSort, selected, onSelected, active, onOpen, onDraft, onProfile,
 }: {
   /** 筛选、排序后的行 */
   rows: CatalogTableRow[]
@@ -35,6 +35,8 @@ export function TableIndex({
   active: string | undefined
   onOpen: (table: string) => void
   onDraft: () => void
+  /** 剖析所选（数据剖析弹窗，范围默认是已选的表） */
+  onProfile?: () => void
 }) {
   const radio = useRadioGroup(LIST_FILTERS, filter, onFilter)
   const listRef = useRef<HTMLUListElement>(null)
@@ -162,6 +164,11 @@ export function TableIndex({
           <button type="button" className="btn btn-primary btn-sm" onClick={onDraft} data-catalog-draft-selected="">
             <Sparkles size={11} aria-hidden /> {CT.draftSelected(selected.size)}
           </button>
+          {onProfile && (
+            <button type="button" className="btn btn-sm" onClick={onProfile} data-catalog-profile-selected="">
+              <ScanSearch size={11} aria-hidden /> {PT.profileSelected(selected.size)}
+            </button>
+          )}
         </div>
       )}
     </div>
