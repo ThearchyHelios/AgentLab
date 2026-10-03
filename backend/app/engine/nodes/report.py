@@ -48,6 +48,7 @@ from app.engine.evidence import (
     CLAIMS_RULE,
     ENTITY_KINDS,
     MARKER_RULES,
+    SEE_AND_CODE_RULES,
     StreamRenderer,
     build_catalog,
     catalog_prompt,
@@ -80,6 +81,8 @@ CLAIMS = CLAIMS_VALUES
 #: 只标注、不让写作者重写也不判失败的违规：可疑实体（受管的正式出具按缺口降档）、表结构快照不全时
 #: 核对不了的名字（出口只标注）
 SOFT = frozenset({"unknown_entity", "unverified_entity"})
+#: 交回写作者重写、重写不好也不判失败的违规：句中的 [[see:]]（渲染后留下断句，数字和出处都没问题）
+REWRITE_ONLY = frozenset({"inline_see"})
 #: 重写一次就是多一次整篇的模型调用，写不对的模型多给几次也大多写不对
 MAX_REPAIRS = 3
 
@@ -304,6 +307,11 @@ def _blocking(violations: list[dict[str, Any]], numbers: str) -> list[dict[str, 
             and not (numbers == "off" and v.get("code") == "uncited_number")]
 
 
+def _fatal(blocking: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """要判失败的违规：重写之后还在的、不属于 REWRITE_ONLY 的。"""
+    return [v for v in blocking if v.get("code") not in REWRITE_ONLY]
+
+
 def _violation_key(violation: dict[str, Any]) -> tuple[str, str]:
     """认一处违规：(code, 点名的字)。点名的字按 text、ref、message 的顺序取第一个有的。"""
     named = violation.get("text") or violation.get("ref") or violation.get("message") or ""
@@ -348,7 +356,7 @@ def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cell
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
-    rules = MARKER_RULES
+    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}"
     if claims in ("require_citation", CLAIMS_JUDGE):
         # 裁判只看写作者挂的依据：要判，就更得每句都挂上
         rules = f"{rules}\n{CLAIMS_RULE}" + (f"\n{judging.JUDGE_RULE}" if claims == CLAIMS_JUDGE else "")
@@ -451,7 +459,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱
             judgement = judging.on_demand(doc, on_unsupported=judge_cfg["on_unsupported"],
                                           rewrite_once=judge_cfg["rewrite_once"], writer_model=model_id)
-        elif not (blocking and on_violation == "fail"):
+        elif not (_fatal(blocking) and on_violation == "fail"):
             # 反正要判失败的报告不值得再花钱判（节点紧接着就报错）
             doc, response, blocking, judgement, usages = await _judge_inline(
                 ctx, doc, catalog, judge_cfg, model_id=model_id, messages=[*messages, response],
@@ -461,10 +469,11 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
-             on_violation=on_violation, failed=bool(blocking) and on_violation == "fail",
+             on_violation=on_violation, failed=bool(_fatal(blocking)) and on_violation == "fail",
              **({"claims": claims} if evidence_on else {}),
              **({"judge": judgement} if judgement is not None else {}))
-    if blocking and on_violation == "fail":
+    if (fatal := _fatal(blocking)) and on_violation == "fail":
+        blocking = fatal
         head = "；".join(v["message"] for v in blocking[:5])
         more = f"；…另有 {len(blocking) - 5} 处" if len(blocking) > 5 else ""
         raise NodeError(
