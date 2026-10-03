@@ -712,7 +712,7 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
   if (!relations.length) return <p className="rounded-lg border px-3 py-4 text-xs text-faint" data-relations-empty="">{CT.noRelations}</p>
   // 窄框（< 40rem）下和列表格一样排成卡片：状态在第一行，下面每项一行「字段名 值」，不用横向滚动
   const cell = clsx('px-2 py-1.5 align-top', NARROW.cell)
-  const label = (text: string) => <span className={NARROW.label} aria-hidden>{text}</span>
+  const label = (text: string) => <span className={NARROW.label}>{text}</span>
   return (
     <div className="@container relative overflow-x-auto rounded-lg border" data-catalog-relations="">
       <table className="w-full border-collapse text-xs @max-[40rem]:block @min-[40rem]:min-w-[640px]">

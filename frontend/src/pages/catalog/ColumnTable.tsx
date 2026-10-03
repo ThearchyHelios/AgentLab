@@ -24,7 +24,10 @@ import type { ColumnDraft, ColumnField } from './model'
 // 不按视口：宽屏左右两栏时右栏也可能很窄。
 // ===========================================================================
 
-/** 窄框下的卡片式排法（容器查询，框宽 < 40rem 时生效）。表格元素改成块，表头藏起来，每格前面补上字段名 */
+/**
+ * 窄框下的卡片式排法（容器查询，框宽 < 40rem 时生效）。表格元素改成块，表头藏起来，每格前面补上字段名。
+ * 字段名宽屏时 display:none，读屏不重复念；窄屏时表头藏了，读屏靠它知道是哪一项
+ */
 export const NARROW = {
   table: '@max-[40rem]:block @min-[40rem]:min-w-[860px] @min-[40rem]:table-fixed',
   head: '@max-[40rem]:hidden',
@@ -121,7 +124,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     return (
       // 窄框下没填的项不占行（编辑时照常列出来好填）
       <td className={clsx('px-2 py-1.5 align-top', NARROW.cell, !it && !editing && '@max-[40rem]:hidden')} data-cell={f} data-status={it?.status}>
-        <span className={NARROW.label} aria-hidden>{CT.columnHead[f]}</span>
+        <span className={NARROW.label}>{CT.columnHead[f]}</span>
         <div className="flex min-w-0 flex-1 items-start gap-1.5">
           <div className="min-w-0 flex-1">{editing ? input : view}</div>
           {it && !changed && (
