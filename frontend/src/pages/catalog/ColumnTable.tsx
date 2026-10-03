@@ -101,7 +101,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
           <div className="min-w-0 flex-1">{editing ? input : view}</div>
           {it && !changed && (
             <span className="pt-0.5">
-              <ItemMark compact disabled={busy || editing}
+              <ItemMark compact disabled={busy || editing} disabledHint={editing ? CT.reviewWhileEditing : undefined}
                         target={{ path: columnPath(name, f), where, source: it.source, status: it.status, note: it.note, updated_at: it.updated_at }}
                         onReview={(a) => onReview({ path: columnPath(name, f), where, source: it.source, status: it.status }, a)} />
             </span>

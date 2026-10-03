@@ -108,11 +108,13 @@ export interface ReviewTarget {
  * 不会被表格的横向滚动裁掉；滚动时跟着触发按钮走，滚出视野或改窗口大小时收起。键盘：Enter 打开，焦点落到第一个可点的操作，
  * ←→↑↓ 在操作之间移动，Tab 在弹层里循环，Esc 收起并把焦点还给触发按钮
  */
-export function ItemMark({ target, compact = false, disabled = false, onReview }: {
+export function ItemMark({ target, compact = false, disabled = false, disabledHint, onReview }: {
   target: ReviewTarget
   compact?: boolean
-  /** 正在提交别的操作：弹层照常能看，操作按钮禁用 */
+  /** 正在提交别的操作、正在编辑：弹层照常能看，操作按钮禁用 */
   disabled?: boolean
+  /** 禁用的原因，写在操作按钮下面 */
+  disabledHint?: string
   onReview: (action: CatalogReviewAction) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -269,7 +271,9 @@ export function ItemMark({ target, compact = false, disabled = false, onReview }
               {human ? CT.remove : CT.reset}
             </ActionButton>
           </div>
-          {canReset && <p className="mt-2 text-2xs leading-relaxed text-faint">{human ? CT.removeHint : CT.resetHint}</p>}
+          {disabled && disabledHint
+            ? <p className="mt-2 text-2xs leading-relaxed text-faint" data-review-disabled="">{disabledHint}</p>
+            : canReset && <p className="mt-2 text-2xs leading-relaxed text-faint">{human ? CT.removeHint : CT.resetHint}</p>}
         </div>,
         document.body,
       )}

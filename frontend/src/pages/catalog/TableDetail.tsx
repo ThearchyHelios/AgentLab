@@ -486,7 +486,7 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
           <div className="min-w-0 flex-1 text-xs">{edit ? input : <FieldValue field={field} item={item} />}</div>
           {item && !changed && (
             <ItemMark target={{ path: tablePath(field), where, source: item.source, status: item.status, note: item.note, updated_at: item.updated_at }}
-                      disabled={busy || !!edit}
+                      disabled={busy || !!edit} disabledHint={edit ? CT.reviewWhileEditing : undefined}
                       onReview={(a) => onReview({ path: tablePath(field), where, source: item.source, status: item.status }, a)} />
           )}
           {changed && <span className="chip shrink-0 !text-2xs" style={{ color: 'var(--accent)' }} data-changed="">{CT.changedMark}</span>}

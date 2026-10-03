@@ -2051,6 +2051,7 @@ export const CATALOG_TEXT = {
     reset: (where: string) => `已恢复${where}`,
   },
   removed: (where: string) => `已删除${where}`,
+  reviewWhileEditing: '正在编辑这张表，保存或取消后再逐项审阅',
   whereTable: (field: string) => `表的${field}`,
   whereColumn: (col: string, field: string) => `列 ${col} 的${field}`,
   whereRelation: (to: string) => `指向 ${to} 的关联关系`,
