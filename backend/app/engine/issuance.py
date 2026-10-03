@@ -462,6 +462,17 @@ def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
             for m in metrics if isinstance(m, dict) and m.get("incomplete")]
 
 
+def sql_check_gaps(metrics: list[dict[str, Any]]) -> list[str]:
+    """契约收来的指标里来源查询没通过 SQL 检查的（口径卡标了 sql_check_failed：取数的那条 SQL 对照数据目录查出
+    error 级问题，比如一对多关联之后对「一」那一侧求和），每个一句缺口。
+
+    和 incomplete_gaps 同一个道理：数字照样回指得上口径卡，口径卡照样复算一致，但算它的那条查询本身就把数算错了
+    （重复计算、存量跨期加总），盖完整出具的章等于替一个错数作保。原因用口径卡记下的那句，写明是哪条检查。
+    """
+    return [f"指标「{m.get('name') or m.get('id')}」{m.get('sql_check_reason') or '所依据的查询未通过 SQL 检查'}"
+            for m in metrics if isinstance(m, dict) and m.get("sql_check_failed")]
+
+
 def _claims_effect(
     policy: str | dict[str, Any] | None,
     unsupported: list[Any] | int | None,

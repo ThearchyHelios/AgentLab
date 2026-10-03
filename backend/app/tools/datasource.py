@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.events import EventType
 from app.data import catalog as data_catalog
 from app.data import introspect, table_versions
+from app.data.sqlcheck import SqlChecker
 from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run_query
 from app.data.guard import QueryLimits, SqlRejected, is_write
 from app.data.tabular import UNSHAPED_NOTE
@@ -52,6 +53,10 @@ RUN_VERSIONS_KEY = "data_versions"
 DATA_UNAVAILABLE = "查询失败（数据不可用）："
 #: 运行中途补固定一个源时发的那条日志事件的 code（_pin_late）
 LATE_PIN_CODE = "data_version_pinned"
+
+#: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
+#: 查询结果照常交回——检查是附加的，不能拖慢查询
+SQL_CHECK_TIMEOUT_S = 2.0
 
 
 class _QueryArgs(BaseModel):
@@ -445,6 +450,15 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
     seconds = query_timeout(source)
+    # 基于数据目录的 SQL 检查器：和冻结进表结构快照的是同一版目录。第一次查询时才建（关系图也是用到才建）
+    checker: list[SqlChecker] = []
+
+    def _checker() -> SqlChecker:
+        if not checker:
+            checker.append(SqlChecker(kind=source.kind, schema_cache=source.schema_cache,
+                                      notes={name: entry.notes for name, entry in (catalog or {}).items()},
+                                      source_name=source.name))
+        return checker[0]
 
     async def _run(sql: str, limit: int | None = None) -> str:
         if gone := _vanished(source, fixed):
@@ -470,6 +484,11 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
         payload = result.to_payload()
         payload["source"] = source.name
+        # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
+        # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
+        # 快照和以前一字不差
+        if checks := await _sql_checks(_checker(), sql):
+            payload["checks"] = checks
         # 表结构快照：这次查询时数据源的结构冻结下来，报告里写的表名、字段名按它核对。事后数据源
         # 重新探查、改了结构，已经跑完的运行核对的还是当时那一份。上传源冻结的是绑定快照里那份
         if schema := await _store_schema(source, ctx, catalog=catalog):
@@ -509,6 +528,20 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or "")),
                   "timeout_s": seconds},
     )
+
+
+async def _sql_checks(checker: SqlChecker, sql: str) -> list[dict[str, Any]]:
+    """一条查询的 SQL 检查结果（as_dict 的形状）。在线程里跑、限时 SQL_CHECK_TIMEOUT_S：解析是纯计算，放在事件循环里
+    会挡住同一进程里别的运行。出错、超时都返回空列表——检查不能让一次成功的查询变成失败。"""
+    if not checker.enabled:
+        return []
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(checker.check_dicts, sql), timeout=SQL_CHECK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("SQL 检查超过 %.1f 秒，本次跳过（数据源 %s）", SQL_CHECK_TIMEOUT_S, checker.source_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("SQL 检查出错，本次跳过（数据源 %s）", checker.source_name)
+    return []
 
 
 async def _store_schema(source: Any, ctx: ToolContext, *,

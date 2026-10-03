@@ -147,7 +147,7 @@ def _apply_contract(
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    from app.engine.issuance import decide_tier, incomplete_gaps, trace_numbers
+    from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_gaps, trace_numbers
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -188,6 +188,8 @@ def _apply_contract(
         gaps.append(f"指标来源未解析：{'、'.join(unresolved[:5])}")
     # 拿截断的查询结果整组算出来的指标：数回指得上，但算的只是取回的那一截，不能完整出具
     gaps.extend(incomplete_gaps(metrics))
+    # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）的指标：口径卡复算得一致，算的却是错数
+    gaps.extend(sql_check_gaps(metrics))
 
     # 引用模式下，缺输入记成空值的指标（口径卡 on_missing=null）就是缺：报告里引用不了它，
     # 也不能因为 id 在清单里就算「齐了」。旧模式照旧只看 id，行为不变

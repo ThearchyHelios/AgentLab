@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from sqlalchemy import func, select
@@ -29,7 +30,7 @@ UPGRADE_POLICIES = {"recompute", "dual", "incomparable"}
 UPGRADE_POLICY_LABELS = {k: option_label("upgrade_policy", k) for k in ("recompute", "dual", "incomparable")}
 
 
-def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
+def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None) -> ValidationResult:
     """发布门禁。
 
     published：基础可运行性之外只给警告。
@@ -38,6 +39,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
 
     每条问题带机器编号（code）：发布前自动修复（engine/autofix.py）按它认问题、出修复，
     文案可以改，编号不能随便改。证据门禁 G1–G5 见 _lint_evidence。
+
+    checkers 是各数据源基于数据目录的 SQL 检查器（data/sqlcheck.load_checkers_by_name），由调用方读好传进来：
+    门禁本身不查库。给了的话，调用工具节点里写死的 SQL 对照目录查一遍（_lint_sql）。
     """
     result = ValidationResult()
     strict = level == "governed"
@@ -100,6 +104,7 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
                      "（那里会保存取数快照）", code="governed.code_network", node_id=node.id, field="network")
 
     _lint_evidence(spec, flag, strict=strict)
+    _lint_sql(spec, flag, checkers)
 
     if strict and not has_contract_output:
         result.add(
@@ -109,13 +114,32 @@ def lint_for_publish(spec: GraphSpec, *, level: str) -> ValidationResult:
     return result
 
 
-def publish_issues(spec: GraphSpec, *, level: str) -> list[Any]:
+def publish_issues(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None) -> list[Any]:
     """发布时拦的全部问题：validate_graph 和 lint_for_publish 的并集，顺序也照发布接口。
 
-    发布、发布前检查、自动修复复核都走这一个口径——检查说能发的，真发布时不会被拦。
+    发布、发布前检查、自动修复复核都走这一个口径——检查说能发的，真发布时不会被拦。checkers 见 lint_for_publish：
+    这几处都要传同一份，否则检查和发布对 SQL 的判断不一致。
     """
-    gate = lint_for_publish(spec, level=level).issues
+    gate = lint_for_publish(spec, level=level, checkers=checkers).issues
     return [*_not_repeated(validate_graph(spec).issues, gate, spec), *gate]
+
+
+def _lint_sql(spec: GraphSpec, flag: Callable[..., None], checkers: Mapping[str, Any] | None) -> None:
+    """调用工具节点里写死的 SQL 对照数据目录检查（data/sqlcheck.py）。
+
+    error 级（依据有确证的重复计算、存量跨期求和）按硬性问题报：受管级别挡住发布，已发布级别只警告——和别的
+    受管要求同一个口径。warning 两档都只提示。info 的依据只是推断（模型起草、命名推断），不进门禁：发布时
+    摆一排「推断，未确认」的提示，只会让人学会无视门禁。编号就是规则编号（fanout_sum…），没有确定性的修复，
+    改 SQL 交给人或助手。Agent 节点的 SQL 要到运行时才写出来，不在这里查。
+    """
+    if not checkers:
+        return
+    from app.data.sqlcheck import graph_checks
+
+    for node, check in graph_checks(spec.nodes, checkers):
+        if check.level == "info":
+            continue
+        flag(check.message, code=check.code, node_id=node.id, hard=check.level == "error", field="args.sql")
 
 
 #: validate 里和门禁 G4、G5 说同一件事的两条提示（schema.evidence_issues）

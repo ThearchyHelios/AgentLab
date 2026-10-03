@@ -49,6 +49,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     表达式把截断的查询结果当成整组用了（len、sum、max……，见 expressions.TruncatedUse）的指标，
     值照算，但标 incomplete 并写明原因：它算的只是取回的那一截。出具契约据此降档（issuance.incomplete_gaps）。
+
+    取数的那条 SQL 对照数据目录查出 error 级问题的（查询快照的 checks，见 data/sqlcheck.py：一对多关联后重复计算、
+    存量跨期加总），同样值照算，标 sql_check_failed 并写明原因，出具契约据此降档（issuance.sql_check_gaps）。
     """
     definitions = ctx.cfg("metrics", []) or []
     caliber_raw, caliber_version = ctx.cfg("caliber", "") or ctx.node.title, str(ctx.cfg("caliber_version", "") or "v1")
@@ -71,6 +74,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     metrics: list[dict[str, Any]] = []
     errors: list[str] = []
+    #: 查询快照工件 id → 它的 error 级检查结果。一张卡里多个指标常常取自同一次查询，快照只读一次
+    checked: dict[str, list[dict[str, Any]]] = {}
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
@@ -127,6 +132,12 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             sources = list(use.sources.values())
             incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(sources),
                           "truncated_sources": sources}
+        inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
+        sql_check: dict[str, Any] = {}
+        if failed := _failed_queries(inputs, list(use.sources.values()), paths, tctx, checked):
+            sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
+                         "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
+                             str(c.get("code")) for c in found))} for artifact, found in failed]}
         metrics.append(
             {
                 "id": metric_id,
@@ -137,7 +148,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "decimals": decimals,
                 "format": display["format"],
                 "rendered": _rendered(value, definition, display),
-                "inputs": [_input_of(path, values[path], state, ctx, tctx) for path in paths],
+                "inputs": inputs,
                 "substituted": substituted,
                 "recompute_ok": _recompute(substituted, tctx, value, decimals),
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
@@ -145,6 +156,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "status": "ok" if value is not None else "missing_input",
                 # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
                 **incomplete,
+                # 只在来源查询没通过 SQL 检查时出现，同上
+                **sql_check,
             }
         )
 
@@ -158,12 +171,16 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
          else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）")
         # 不写行数：叙述节点照抄进正文就是一个没有出处的数
         + ("（不完整：基于被截断的查询结果计算）" if m.get("incomplete") else "")
+        + ("（存疑：所依据的查询未通过 SQL 检查）" if m.get("sql_check_failed") else "")
         for m in metrics
     ]
     for m in metrics:
         if m.get("incomplete"):
             ctx.emit(EventType.LOG, level="warn", code="metric_incomplete", metric=m["id"],
                      message=f"指标「{m['name']}」{m['incomplete_reason']}")
+        if m.get("sql_check_failed"):
+            ctx.emit(EventType.LOG, level="warn", code="metric_sql_check", metric=m["id"],
+                     message=f"指标「{m['name']}」{m['sql_check_reason']}")
     card = {
         "kind": "metric_set",
         "caliber": caliber,
@@ -329,6 +346,72 @@ def _incomplete_reason(sources: list[dict[str, Any]]) -> str:
     if len(fetched) == 1:
         return f"基于被截断的查询结果计算（只取回了{fetched[0]}），结果不完整"
     return f"基于 {len(fetched)} 份被截断的查询结果计算（分别只取回了{'、'.join(fetched)}），结果不完整"
+
+
+#: 取值链的最后一段：.字段 或 [下标]
+_LAST_STEP = re.compile(r"(?:\.[^.\[\]]+|\[[^\[\]]*\])$")
+
+
+def _failed_queries(inputs: list[dict[str, Any]], truncated: list[dict[str, Any]], paths: list[str],
+                    tctx: dict[str, Any], checked: dict[str, list[dict[str, Any]]],
+                    ) -> list[tuple[str, list[dict[str, Any]]]]:
+    """这个指标用到的查询里，SQL 检查有 error 的：[(查询快照工件 id, error 级检查结果)]。
+
+    用到了哪些查询，三处来历合起来认：输入的出处（cell() 取的格、Agent 经 cite_fields 交来的字段都带着快照 id）、
+    截断跟踪记下的整组、取值链上的查询结果本身（数据整形解析过的 vars.res.rows[0][0]，往上找到 vars.res 那份
+    带 artifact 的结果）。检查结果从快照里读，不信内存里那份：快照按哈希寻址，就是查询当时存下的那份。
+    读不出来的快照不算（另有别的检查报快照的问题）。Agent 没开 cite_fields 时说不清数出自哪次查询，不算。
+    """
+    artifacts = [item.get("artifact") for item in inputs] + [s.get("artifact") for s in truncated]
+    artifacts += [_result_artifact(path, tctx) for path in paths if cell_parts(path) is None]
+    out = []
+    for artifact in dict.fromkeys(a for a in artifacts if isinstance(a, str) and a):
+        if artifact not in checked:
+            checked[artifact] = _error_checks(artifact)
+        if checked[artifact]:
+            out.append((artifact, checked[artifact]))
+    return out
+
+
+def _result_artifact(path: str, tctx: dict[str, Any]) -> str | None:
+    """顺着取值链往上找（vars.res.rows[0][0] → vars.res.rows[0] → vars.res.rows → vars.res），第一个查询结果的快照 id。
+    数据源工具交回的是 JSON 文本（调用工具节点的输出），解析过的是对象（数据整形之后），两种都认。"""
+    current = path
+    for _ in range(8):
+        value = _value_of(current, tctx)
+        if isinstance(value, str) and value.lstrip().startswith("{") and '"artifact"' in value:
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = None
+        if isinstance(value, dict) and isinstance(value.get("artifact"), str) and isinstance(value.get("rows"), list):
+            return value["artifact"]
+        shorter = _LAST_STEP.sub("", current)
+        if not shorter or shorter == current:
+            return None
+        current = shorter
+    return None
+
+
+def _error_checks(artifact: str) -> list[dict[str, Any]]:
+    try:
+        snapshot = artifact_store.load(artifact)
+    except Exception:  # noqa: BLE001 - 快照读不出来、被改过：这里不报，证据层另有说法
+        return []
+    checks = snapshot.get("checks") if isinstance(snapshot, dict) else None
+    return [c for c in checks if isinstance(c, dict) and c.get("level") == "error"] if isinstance(checks, list) else []
+
+
+def _sql_check_reason(failed: list[tuple[str, list[dict[str, Any]]]]) -> str:
+    """「所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），
+    结果不可靠」：出具声明、运行日志、证据面板都用这句。只摘问题那半句，改法留在查询步骤里看。"""
+    problems = list(dict.fromkeys(str(c.get("message") or "").split("。")[0] for _, found in failed for c in found))
+    problems = [p for p in problems if p]
+    if not problems:
+        return "所依据的查询未通过 SQL 检查，结果不可靠"
+    if len(problems) == 1:
+        return f"所依据的查询未通过 SQL 检查（{problems[0]}），结果不可靠"
+    return f"所依据的查询有 {len(problems)} 处未通过 SQL 检查（{problems[0]}等），结果不可靠"
 
 
 def _truncated_field(path: str, state: GraphState, ctx: NodeContext) -> dict[str, Any] | None:
