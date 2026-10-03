@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.engine.sql_problems import problem_clause, query_problems
+
 # --------------------------------------------------------------------------
 # 出具校验：叙述里的每个数字必须能回指到指标集
 #
@@ -462,15 +464,54 @@ def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
             for m in metrics if isinstance(m, dict) and m.get("incomplete")]
 
 
-def sql_check_gaps(metrics: list[dict[str, Any]]) -> list[str]:
-    """契约收来的指标里来源查询没通过 SQL 检查的（口径卡标了 sql_check_failed：取数的那条 SQL 对照数据目录查出
-    error 级问题，比如一对多关联之后对「一」那一侧求和），每个一句缺口。
+def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | None = None, *,
+                   label: Callable[[str, str | None], str | None] | None = None) -> list[str]:
+    """没通过 SQL 检查（error 级：一对多关联后重复计算、存量跨期加总）的查询，每条一句缺口。
 
-    和 incomplete_gaps 同一个道理：数字照样回指得上口径卡，口径卡照样复算一致，但算它的那条查询本身就把数算错了
-    （重复计算、存量跨期加总），盖完整出具的章等于替一个错数作保。原因用口径卡记下的那句，写明是哪条检查。
+    两处来历：契约收来的指标（口径卡标了 sql_check_failed，sql_check_sources 记着取数的查询快照），以及报告直接
+    引用的查询（cited：{查询快照 id: [引用的写法…]}，单元格、表格、[[see:]] 依据）。数字照样回指得上，口径卡照样
+    复算一致，但算它的那条查询本身就把数算错了，盖完整出具的章等于替一个错数作保。
+
+    按出问题的那条查询归并（合并查询顺着输入找到源查询）：同一条查询算出三个指标、报告又引用了它的格，也只记一句，
+    句子里列出受影响的引用。label(快照 id, 节点 id) 给出「查询「取数」（Q1）」这样的称呼，给不出就写「所依据的查询」。
+    指标标了 sql_check_failed、快照却读不出来（被清理、被改过）的，退回口径卡记下的那句：缺口不能因为读不到快照就消失。
     """
-    return [f"指标「{m.get('name') or m.get('id')}」{m.get('sql_check_reason') or '所依据的查询未通过 SQL 检查'}"
-            for m in metrics if isinstance(m, dict) and m.get("sql_check_failed")]
+    groups: dict[str, dict[str, Any]] = {}
+    fallback: list[str] = []
+
+    def add(artifact: Any, ref: str) -> bool:
+        found = query_problems(artifact) if isinstance(artifact, str) and artifact else []
+        for problem in found:
+            group = groups.setdefault(problem.artifact, {"problem": problem, "refs": []})
+            if group["problem"].node_id is None and problem.node_id:
+                group["problem"].node_id = problem.node_id
+            if ref not in group["refs"]:
+                group["refs"].append(ref)
+        return bool(found)
+
+    for m in metrics:
+        if not (isinstance(m, dict) and m.get("sql_check_failed")):
+            continue
+        name = f"指标「{m.get('name') or m.get('id')}」"
+        hits = [add(src.get("artifact"), name) for src in m.get("sql_check_sources") or [] if isinstance(src, dict)]
+        if not any(hits):
+            fallback.append(f"{name}{m.get('sql_check_reason') or '所依据的查询未通过 SQL 检查'}")
+    for artifact, refs in (cited or {}).items():
+        for ref in refs:
+            add(artifact, ref)
+
+    out = []
+    for artifact, group in groups.items():
+        problem = group["problem"]
+        who = (label(artifact, problem.node_id) if label else None) or "所依据的查询"
+        refs = group["refs"]
+        listed = "、".join(refs[:_SQL_REFS]) + (f"等 {len(refs)} 处" if len(refs) > _SQL_REFS else "")
+        out.append(f"{who}{problem_clause(problem.problems)}；受影响的引用：{listed}")
+    return out + fallback
+
+
+#: 一句 SQL 检查缺口里最多列出几处受影响的引用（计数照实）
+_SQL_REFS = 8
 
 
 def _claims_effect(

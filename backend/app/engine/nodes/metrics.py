@@ -33,7 +33,7 @@ from app.engine.expressions import (
     substitute,
 )
 from app.engine.labels import field_label
-from app.engine.merge_query import MERGE_SOURCE
+from app.engine.sql_problems import QueryProblem, merge_problems, node_of, query_problems, reason_text
 from app.engine.state import GraphState, template_context
 
 
@@ -75,8 +75,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     metrics: list[dict[str, Any]] = []
     errors: list[str] = []
-    #: 查询快照工件 id → 它的 error 级检查结果。一张卡里多个指标常常取自同一次查询，快照只读一次
-    checked: dict[str, list[dict[str, Any]]] = {}
+    #: 查询快照工件 id → 它（含合并查询的输入）没通过 SQL 检查的那几条查询。一张卡里多个指标常常取自同一次查询，
+    #: 快照只读一次
+    checked: dict[str, list[QueryProblem]] = {}
+    #: 指标 id → 它没通过 SQL 检查的那几条来源查询。运行日志按查询归并（_emit_sql_check_logs）
+    failed_by: dict[str, list[QueryProblem]] = {}
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
@@ -138,7 +141,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if failed := _failed_queries(inputs, list(use.sources.values()), paths, tctx, checked):
             sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
                          "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
-                             str(c.get("code")) for c in found))} for artifact, found in failed]}
+                             code for p in found for code in p.codes))} for artifact, found in failed]}
+            failed_by[metric_id] = [p for _, found in failed for p in found]
         metrics.append(
             {
                 "id": metric_id,
@@ -177,11 +181,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     ]
     for m in metrics:
         if m.get("incomplete"):
-            ctx.emit(EventType.LOG, level="warn", code="metric_incomplete", metric=m["id"],
+            # 结构化字段（metric_name、reason、rows）给界面读，不让它从 message 里解析中文
+            ctx.emit(EventType.LOG, level="warn", code="metric_incomplete", metric=m["id"], metric_name=m["name"],
+                     reason=m["incomplete_reason"], rows=[s.get("rows") for s in m.get("truncated_sources") or []],
                      message=f"指标「{m['name']}」{m['incomplete_reason']}")
-        if m.get("sql_check_failed"):
-            ctx.emit(EventType.LOG, level="warn", code="metric_sql_check", metric=m["id"],
-                     message=f"指标「{m['name']}」{m['sql_check_reason']}")
+    _emit_sql_check_logs(metrics, failed_by, state, ctx)
     card = {
         "kind": "metric_set",
         "caliber": caliber,
@@ -354,9 +358,10 @@ _LAST_STEP = re.compile(r"(?:\.[^.\[\]]+|\[[^\[\]]*\])$")
 
 
 def _failed_queries(inputs: list[dict[str, Any]], truncated: list[dict[str, Any]], paths: list[str],
-                    tctx: dict[str, Any], checked: dict[str, list[dict[str, Any]]],
-                    ) -> list[tuple[str, list[dict[str, Any]]]]:
-    """这个指标用到的查询里，SQL 检查有 error 的：[(查询快照工件 id, error 级检查结果)]。
+                    tctx: dict[str, Any], checked: dict[str, list[QueryProblem]],
+                    ) -> list[tuple[str, list[QueryProblem]]]:
+    """这个指标用到的查询里，SQL 检查有 error 的：[(查询快照工件 id, 没通过检查的查询)]。合并查询的快照对应它出问题的
+    那几个输入（sql_problems.query_problems）。
 
     用到了哪些查询，三处来历合起来认：输入的出处（cell() 取的格、Agent 经 cite_fields 交来的字段都带着快照 id）、
     截断跟踪记下的整组、取值链上的查询结果本身（数据整形解析过的 vars.res.rows[0][0]，往上找到 vars.res 那份
@@ -368,7 +373,7 @@ def _failed_queries(inputs: list[dict[str, Any]], truncated: list[dict[str, Any]
     out = []
     for artifact in dict.fromkeys(a for a in artifacts if isinstance(a, str) and a):
         if artifact not in checked:
-            checked[artifact] = _error_checks(artifact)
+            checked[artifact] = query_problems(artifact)
         if checked[artifact]:
             out.append((artifact, checked[artifact]))
     return out
@@ -394,41 +399,53 @@ def _result_artifact(path: str, tctx: dict[str, Any]) -> str | None:
     return None
 
 
-def _error_checks(artifact: str, _seen: set[str] | None = None) -> list[dict[str, Any]]:
-    """这份查询快照对照数据目录查出的 error 级问题。
-
-    合并查询的快照没有自己的 checks（它在内存 SQLite 上执行，不对照数据目录），但记着 inputs：顺着往下找。
-    不然源库那条查询一对多关联后重复计算了，经过一次合并，指标就看不出来、照样完整出具。
-    """
-    seen = _seen if _seen is not None else set()
-    if artifact in seen:
-        return []
-    seen.add(artifact)
-    try:
-        snapshot = artifact_store.load(artifact)
-    except Exception:  # noqa: BLE001 - 快照读不出来、被改过：这里不报，证据层另有说法
-        return []
-    if not isinstance(snapshot, dict):
-        return []
-    checks = snapshot.get("checks")
-    found = [c for c in checks if isinstance(c, dict) and c.get("level") == "error"] if isinstance(checks, list) else []
-    inputs = snapshot.get("inputs") if snapshot.get("source") == MERGE_SOURCE else None
-    for entry in inputs if isinstance(inputs, list) else []:
-        if isinstance(entry, dict) and isinstance(entry.get("artifact"), str):
-            found += _error_checks(entry["artifact"], seen)
-    return found
+def _error_checks(artifact: str) -> list[dict[str, Any]]:
+    """这份查询快照对照数据目录查出的 error 级问题（合并查询顺着 inputs 往下找，见 sql_problems.query_problems）。"""
+    return [c for p in query_problems(artifact) for c in p.checks]
 
 
-def _sql_check_reason(failed: list[tuple[str, list[dict[str, Any]]]]) -> str:
+def _sql_check_reason(failed: list[tuple[str, list[QueryProblem]]]) -> str:
     """「所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），
     结果不可靠」：出具声明、运行日志、证据面板都用这句。只摘问题那半句，改法留在查询步骤里看。"""
-    problems = list(dict.fromkeys(str(c.get("message") or "").split("。")[0] for _, found in failed for c in found))
-    problems = [p for p in problems if p]
-    if not problems:
-        return "所依据的查询未通过 SQL 检查，结果不可靠"
-    if len(problems) == 1:
-        return f"所依据的查询未通过 SQL 检查（{problems[0]}），结果不可靠"
-    return f"所依据的查询有 {len(problems)} 处未通过 SQL 检查（{problems[0]}等），结果不可靠"
+    return reason_text(list(dict.fromkeys(text for _, found in failed for p in found for text in p.problems)))
+
+
+#: 运行日志里每条 SQL 检查结果交给界面的字段（data/sqlcheck.SqlCheck.as_dict 去掉给模型的那句 for_model）
+_CHECK_FIELDS = ("code", "level", "message", "table", "column", "relation_id", "sql_excerpt")
+
+
+def _emit_sql_check_logs(metrics: list[dict[str, Any]], failed_by: dict[str, list[QueryProblem]],
+                         state: GraphState, ctx: NodeContext) -> None:
+    """没通过 SQL 检查的来源查询，一条一行运行日志（metric_sql_check），列出受它影响的指标。
+
+    以前一个指标一行：同一条查询算出三个指标，时间线上同一句话重复三遍。现在按出问题的那条查询归并。
+    结构化字段给界面读，不让它从 message 里解析中文：metrics / metric_names（受影响的指标）、reason、problems、
+    checks（不带 for_model）、query_artifact（出问题的查询快照）、source_node（跑这条查询的节点）、
+    source_field（要改的那一栏：调用工具节点写死的 SQL 在 args.sql；Agent 自己写的 SQL 没有可定位的栏，不给）。
+    界面据 source_node / source_field 把「打开设置」落到来源查询节点的 SQL 上，而不是口径卡。
+    """
+    names = {m["id"]: m["name"] for m in metrics}
+    groups: dict[str, tuple[QueryProblem, list[str]]] = {}
+    for metric_id, found in failed_by.items():
+        for problem in merge_problems(found):
+            held = groups.setdefault(problem.artifact, (problem, []))
+            if metric_id not in held[1]:
+                held[1].append(metric_id)
+    nodes = ctx.run.spec.node_map()
+    for artifact, (problem, ids) in groups.items():
+        source = problem.node_id or node_of(artifact, state.get("evidence"))
+        producer = nodes.get(source) if source else None
+        sql_in_args = producer is not None and str(producer.type) == "tool" \
+            and isinstance((producer.config.get("args") or {}), dict) and "sql" in (producer.config.get("args") or {})
+        reason = reason_text(problem.problems)
+        ctx.emit(EventType.LOG, level="warn", code="metric_sql_check",
+                 metric=ids[0], metrics=ids, metric_names=[names.get(i, i) for i in ids],
+                 reason=reason, problems=problem.problems,
+                 checks=[{k: c[k] for k in _CHECK_FIELDS if k in c} for c in problem.checks],
+                 query_artifact=artifact,
+                 **({"source_node": source} if source else {}),
+                 **({"source_field": "args.sql"} if sql_in_args else {}),
+                 message="指标" + "".join(f"「{names.get(i, i)}」" for i in ids) + reason)
 
 
 def _truncated_field(path: str, state: GraphState, ctx: NodeContext) -> dict[str, Any] | None:

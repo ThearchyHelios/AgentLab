@@ -188,8 +188,9 @@ def _apply_contract(
         gaps.append(f"指标来源未解析：{'、'.join(unresolved[:5])}")
     # 拿截断的查询结果整组算出来的指标：数回指得上，但算的只是取回的那一截，不能完整出具
     gaps.extend(incomplete_gaps(metrics))
-    # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）的指标：口径卡复算得一致，算的却是错数
-    gaps.extend(sql_check_gaps(metrics))
+    # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）：口径卡复算得一致，算的却是错数。
+    # 报告直接引用的查询要等引用核对之后才知道，缺口放在这个位置，下面一起算
+    sql_at = len(gaps)
 
     # 引用模式下，缺输入记成空值的指标（口径卡 on_missing=null）就是缺：报告里引用不了它，
     # 也不能因为 id 在清单里就算「齐了」。旧模式照旧只看 id，行为不变
@@ -222,13 +223,27 @@ def _apply_contract(
         )
         unmatched = trace.unmatched if trace else []
 
+    # 同一条查询算出几个指标、报告又引用了它的格，只记一句（按出问题的那条查询归并，列出受影响的引用）
+    titles = {n.id: n.title for n in ctx.run.spec.nodes}
+    aliases: dict[str, str] = cited.get("aliases") or {}
+
+    def query_label(artifact: str, node_id: str | None) -> str:
+        from app.engine.sql_problems import node_of
+
+        title = titles.get(node_id or node_of(artifact, state.get("evidence")) or "")
+        alias = aliases.get(artifact)
+        if title and alias:
+            return f"查询「{title}」（{alias}）"
+        return f"查询「{title}」" if title else (f"查询 {alias}" if alias else "")
+
+    gaps[sql_at:sql_at] = sql_check_gaps(metrics, cited.get("queries"), label=query_label)
+
     # 声明了 metrics_from 却一个指标都没收到，同样是"没查成"
     if sources and not metrics:
         gaps.append("指标集为空，叙述中的数字无法追溯")
 
     # 上游有协作团队用完轮数、按降档交付的：叙述里的话不是调度者认可的结论，
     # 数字全都对得上也不能盖「完整出具」
-    titles = {n.id: n.title for n in ctx.run.spec.nodes}
     for node_id, payload in nodes.items():
         if isinstance(payload, dict) and payload.get("exhausted"):
             gaps.append(f"协作团队「{titles.get(node_id, node_id)}」用完 {payload.get('rounds', '?')} "
@@ -318,7 +333,7 @@ def _check_citations(
 
     out: dict[str, Any] = {"matched": [], "unmatched": [], "unresolved": [], "gaps": [],
                            "doc_artifact": None, "stats": None, "claims_policy": None, "uncited": None,
-                           "unsupported": None, "claims": None, "entities": None}
+                           "unsupported": None, "claims": None, "entities": None, "queries": {}, "aliases": {}}
     gaps = out["gaps"]
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
@@ -383,6 +398,8 @@ def _check_citations(
         # 表结构快照不全时核对不了的名字（unverified）在哪个级别都只标注
         out["entities"] = {"unknown": unknown[:_LISTED], "unverified": unverified[:_LISTED],
                            "counted": governed and bool(unknown)}
+
+    out["queries"], out["aliases"] = _cited_queries(doc, catalog)
 
     # 老前端要用的逐个数字出处，从复核通过的数字片段拼出来
     for _, unit in iter_units(doc):
@@ -522,6 +539,46 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         "unjudged": dict(summary.get("unjudged") or {}), "limits_hit": list(summary.get("limits_hit") or []),
         "complete": bool(summary.get("complete")), "model": summary.get("model"),
     }
+
+
+def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """报告直接引用的查询：({查询快照 id: [引用的写法…]}, {目录里每个查询的快照 id: 编号})。
+
+    单元格（[[v:Q1.r0.gmv]]，[[table:]] 展开后也是一格一格的引用）按查询数：一格写「Q1 第 1 行「gmv」」，
+    几格写「Q1 的 3 格」；只拿它当依据（[[see:Q1]]）的写「Q1（结论依据）」。出具契约据此判这些查询有没有通过
+    SQL 检查（issuance.sql_check_gaps）。
+    """
+    from app.engine.evidence import iter_units
+
+    cells: dict[str, list[tuple[Any, Any]]] = {}
+    support: list[str] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            if cite.get("kind") == "cell" and cite.get("status") == "resolved" and cite.get("alias"):
+                loc = cite.get("locator") or {}
+                cells.setdefault(str(cite["alias"]), [])
+                if (loc.get("row"), loc.get("column")) not in cells[str(cite["alias"])]:
+                    cells[str(cite["alias"])].append((loc.get("row"), loc.get("column")))
+        for cite in unit.get("see") or []:
+            alias = str((cite or {}).get("alias") or "")
+            if (catalog.get(alias) or {}).get("kind") == "query" and alias not in support:
+                support.append(alias)
+    queries: dict[str, list[str]] = {}
+    # 目录里全部查询的编号：合并查询的输入没被直接引用，缺口里也要写得出它是 Q 几
+    aliases = {str(e["artifact"]): str(e["alias"]) for e in catalog.values()
+               if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact") and e.get("alias")}
+    for alias in [*cells, *(a for a in support if a not in cells)]:
+        artifact = (catalog.get(alias) or {}).get("artifact")
+        if not isinstance(artifact, str) or not artifact:
+            continue
+        hit = cells.get(alias) or []
+        if len(hit) == 1 and isinstance(hit[0][0], int):
+            ref = f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」"
+        else:
+            ref = f"{alias} 的 {len(hit)} 格" if hit else f"{alias}（结论依据）"
+        queries.setdefault(artifact, []).append(ref)
+    return queries, aliases
 
 
 def _declare_citations(

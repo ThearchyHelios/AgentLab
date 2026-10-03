@@ -150,6 +150,7 @@ async def test_a_failing_or_slow_check_never_breaks_the_query(scenic_source, mon
 
 
 def test_sql_check_failures_become_readable_gaps():
+    # 没记来源快照（或快照读不出来）时退回口径卡那句；按查询归并的写法见 test_report_sqlcheck_cells
     metrics = [{"id": "gmv", "name": "订单金额", "value": 1, "sql_check_failed": True, "sql_check_reason": REASON},
                {"id": "n", "name": "订单数", "value": 2}]
     assert sql_check_gaps(metrics) == [f"指标「订单金额」{REASON}"]
@@ -246,11 +247,13 @@ async def test_a_fanout_behind_a_contract_metric_degrades_the_issuance(scenic_so
                                                      "codes": ["fanout_sum"]}]
     assert "（存疑：所依据的查询未通过 SQL 检查）" in card["text"]
     warns = [e.data for e in await events(row.id, "log", "card") if e.data.get("code") == "metric_sql_check"]
-    assert [w["message"] for w in warns] == [f"指标「订单金额」{REASON}", f"指标「订单金额（整形后）」{REASON}"]
+    # 同一条查询算出的两个指标：时间线上一行，降档原因里一句（按查询归并，列出受影响的指标）
+    assert [w["message"] for w in warns] == [f"指标「订单金额」「订单金额（整形后）」{REASON}"]
 
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "degraded", issuance
-    assert f"指标「订单金额」{REASON}" in issuance["gaps"]
+    assert [g for g in issuance["gaps"] if "SQL 检查" in g] == [
+        f"查询「fetch」（Q1）{REASON.removeprefix('所依据的查询')}；受影响的引用：指标「订单金额」、指标「订单金额（整形后）」"]
     # 写作目录提醒写作者：这个数存疑，引用时要说明
     assert "所依据的查询未通过 SQL 检查，结果存疑" in writer.prompts[0]
 

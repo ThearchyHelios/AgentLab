@@ -3044,6 +3044,23 @@ _PROMPT_HITS = 8
 _PROMPT_HIT_CHARS = 300
 
 
+def _sql_check_note(artifact: Any, snaps: _Snapshots) -> str | None:
+    """这次查询（合并查询则是它的输入）没通过 SQL 检查时，写作目录里跟在它后面的那句提醒；没问题返回 None。
+
+    口径卡的指标早就标「存疑」了，直接引用查询格子的写作者却看不到：报告照样把一对多关联后求和的数写成定论。
+    出具契约会按缺口降档（issuance.sql_check_gaps），这里先让写作者知道、引用时如实交代。
+    """
+    from app.engine.sql_problems import query_problems
+
+    found = query_problems(artifact, loader=snaps.loader)
+    if not found:
+        return None
+    problems = list(dict.fromkeys(text for p in found for text in p.problems))
+    who = "这次查询" if all(p.artifact == artifact for p in found) else "这次合并的输入查询"
+    return (f"  （{who}未通过 SQL 检查：{'；'.join(problems[:3]) or '有错误级的问题'}。其中的数存疑："
+            "引用时须如实说明，不要当作确定的结论）")
+
+
 def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
     """一次查询在写作目录里的样子：编号、来源、列，以及能引用的行（行号 + 渲染后的值）。
 
@@ -3058,6 +3075,8 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool)
     if snapshot.get("truncated") is True:
         lines.append("  （查询结果已截断：只取回了前面一部分行，库里还有更多。单格可以引用；"
                      "不要把取回的行数当成总数，也不要据此写合计、全部之类的结论）")
+    if note := _sql_check_note(entry.get("artifact"), snaps):
+        lines.append(note)
     if not cells_allowed:
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
