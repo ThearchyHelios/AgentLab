@@ -1109,14 +1109,30 @@ def _blocking_issues(
                                          **({"defaults": defaults} if isinstance(defaults, dict) else {})})
     except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
         return None
+    # 带发布级别时 SQL 检查交给门禁（查全图、按级别定挡不挡），自查这边就不再查一遍，免得同一处报两条
+    authored = authored_issues(spec, sources or [], baseline, checkers=None if level else checkers)
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
-           + [i for i in authored_issues(spec, sources or [], baseline, checkers=checkers) if i["level"] == "error"])
+           + [i for i in authored if i["level"] == "error"])
     if level:
         from app.engine.governance import lint_for_publish
 
-        out += [i.model_dump() for i in lint_for_publish(spec, level=level).issues if i.level == "error"]
+        gate = [i.model_dump() for i in lint_for_publish(spec, level=level, checkers=checkers).issues
+                if i.level == "error"]
+        out += _sql_model_hints(gate, spec, checkers)
     return out
+
+
+def _sql_model_hints(issues: list[dict[str, Any]], spec: GraphSpec, checkers: dict[str, Any] | None,
+                     ) -> list[dict[str, Any]]:
+    """门禁报的 SQL 问题只有给人看的那句（ValidationIssue 不带 for_model）；交回模型改时补上给模型的改法。"""
+    if not checkers or not any(i.get("code") in CHECK_CODES for i in issues):
+        return issues
+    from app.data.sqlcheck import graph_checks
+
+    hints = {(node.id, c.code, c.message): c.for_model for node, c in graph_checks(spec.nodes, checkers)}
+    return [{**i, "for_model": hints[key]} if (key := (i.get("node_id"), i.get("code"), i.get("message"))) in hints
+            else i for i in issues]
 
 
 def _changed(spec: GraphSpec, baseline: list[dict[str, Any]] | None) -> set[str]:
@@ -1887,13 +1903,17 @@ async def assist_publish_fix(
     """
     from app.engine.autofix import forbidden_changes, judge
 
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, None)
+    # 和发布接口同一套 SQL 检查：受管级别里 SQL 的 error 也是挡住发布的问题，一并交给助手改
+    checkers = await load_checkers(session, sources)
     base = copy.deepcopy(graph)
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
     before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
     baseline = list(copy.deepcopy(before_nodes).values())
     errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
-                              defaults=base.get("defaults")) or []
+                              defaults=base.get("defaults"), checkers=checkers) or []
     out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
                            "ops": []}
     if not errors:
@@ -1949,7 +1969,7 @@ async def assist_publish_fix(
     proposed = _proposed_graph(base, nodes, edges)
     reasons = forbidden_changes(base, proposed, tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
-                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
         out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:
@@ -2217,7 +2237,11 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
             out["notes"] = [n for n in out["notes"] if n["rule"] != "R5" or n["node_id"] in still]
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
-    issues = publish_issues(GraphSpec.model_validate(out["graph"]), level=payload.level)
+    from app.data.sqlcheck import graph_sources, load_checkers_by_name
+
+    upgraded = GraphSpec.model_validate(out["graph"])
+    checkers = await load_checkers_by_name(session, graph_sources(upgraded.nodes))
+    issues = publish_issues(upgraded, level=payload.level, checkers=checkers)
     out["issues"] = [i.model_dump() for i in issues]
     out["ok"] = not any(i.level == "error" for i in issues)
     return out
