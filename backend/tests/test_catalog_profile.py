@@ -24,11 +24,11 @@ from sqlalchemy.engine import Engine
 from app.data import catalog, catalog_profile
 from app.data import engine as data_engine
 from app.data.catalog_profile import PROFILE_OPTION, ProfileSettings
-from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.main import app as _fastapi_app
 from tests.fixtures.catalog import scenic
+from tests.fixtures.sources import drop_source
 
 ACTOR = {"X-Actor": quote("周宁")}
 
@@ -65,7 +65,7 @@ async def make_source(client):
 
     yield _make
     for sid in made:
-        await engines.invalidate(sid)
+        await drop_source(sid)
 
 
 class _Spy:
