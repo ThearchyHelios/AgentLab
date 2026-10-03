@@ -536,7 +536,8 @@ class _RelationOutcome:
 
     rid: str
     target: str
-    coverage: float
+    #: 外键关系不抽样（外键已保证引用完整），没有覆盖率
+    coverage: float | None
     cardinality: str | None
     holds: bool
     sample: int
@@ -655,10 +656,13 @@ def _relation_target(rel: dict[str, Any]) -> str:
 
 
 def _relation_candidates(notes: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """要核对的关系：没被驳回、不是外键约束来的（外键由数据库保证，剖析也顶不掉它）。人工确认过的也核对，
-    只补覆盖率和基数。"""
+    """要核对的关系：没被驳回的。人工确认过的也核对，只补覆盖率和基数。
+
+    外键约束来的也核对，但只核对基数：外键保证了引用完整（不必抽样算覆盖率），却只保证被指向的键唯一，
+    子表一侧每个键是一行还是多行要看数据。以前跳过外键关系，外键来的一对多永远拿不到「用数据核实过」，
+    扇出检查只能报 warning——最常见的「订单关联明细后对订单金额求和」在受管发布时也挡不住。"""
     return [r for r in (notes or {}).get("relations") or []
-            if isinstance(r, dict) and r.get("id") and r.get("status") != "rejected" and r.get("source") != "fk"]
+            if isinstance(r, dict) and r.get("id") and r.get("status") != "rejected"]
 
 
 async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
@@ -678,6 +682,17 @@ async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
     if total is None or distinct is None:
         return None, "count"
     return total == distinct, "count"
+
+
+def _fk_note(child: tuple[bool | None, str]) -> str:
+    """外键关系的剖析备注：只说子表一侧唯不唯一、依据是什么。不写日期（同 _relation_note）。"""
+    unique, how = child
+    if unique is None:
+        why = "子表太大，没有整表统计" if how == "too_large" else "没能数清子表的取值"
+        return f"{catalog.PROFILE_NOTE_PREFIX}外键约束已保证引用完整，未抽样核对覆盖率；{why}，基数未用数据核实"
+    basis = "按主键或唯一约束" if how not in ("count", "too_large") else "整表数过取值"
+    shape = "每个键只有一行（一对一）" if unique else "同一个键有多行（一对多）"
+    return f"{catalog.PROFILE_NOTE_PREFIX}外键约束已保证引用完整，未抽样核对覆盖率；子表一侧{basis}：{shape}"
 
 
 def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int | None,
@@ -740,6 +755,15 @@ async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _T
     for name, owner in ((col, table), (pcol, parent)):
         if cx.is_masked(name):
             raise _Skip("masked", f"{owner}.{name} 在数据源设置中被遮罩，不取样", carry=True)
+
+    if rel.get("source") == "fk":
+        await cx.size_with_data(table, result)
+        child = await _unique(cx, table, meta, col, result)
+        cardinality = None if child[0] is None else ("one_to_one" if child[0] else "many_to_one")
+        out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=None,
+                                              cardinality=cardinality, holds=cardinality is not None, sample=0,
+                                              matched=0, note=_fk_note(child), cardinality_checked=child[0] is not None))
+        return
 
     d, s = cx.dialect, cx.settings
     size = await cx.size_with_data(table, result)
@@ -933,7 +957,11 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     （重新剖析、目录没变时不能说升了）；cardinality_checked：基数是不是用数据核实的（子表一侧数过是否唯一），
     报告据此写「已用数据核实」，不从说明的原话里认。"""
     previous = rel.get("status")
-    if confirmed:
+    if rel.get("source") == "fk":
+        summary = ("外键约束，" + ("子表每个键只有一行（一对一）" if o.cardinality == "one_to_one"
+                                  else "子表同一个键有多行（一对多）") + "，基数已用数据核实") \
+            if o.cardinality_checked else "外键约束，子表太大或没能数清，基数未用数据核实"
+    elif confirmed:
         summary = "已人工确认，只补充覆盖率和基数"
     elif status == "verified":
         summary = f"覆盖率 {_percent(o.coverage)}，" + ("仍为有确证" if previous == "verified" else "升为有确证")
@@ -990,6 +1018,26 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     return changed
 
 
+def _patch_fk(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
+    """外键关系只补基数和「用数据核实过」：外键结构推的多对一可能其实是一对一，数据说了算。来源、状态、
+    覆盖率都不动；备注同 _patch_confirmed（只是旧备注的日期不同不换）。返回改没改。"""
+    changed = False
+    if o.cardinality_checked:
+        if rel.get("cardinality") != o.cardinality:
+            rel["cardinality"] = o.cardinality
+            changed = True
+        if rel.get("cardinality_checked") is not True:
+            rel["cardinality_checked"] = True
+            changed = True
+    note = rel.get("note")
+    if (not note or catalog.is_profile_note(note)) and not catalog.same_profile_note(note, o.note):
+        rel["note"] = o.note
+        changed = True
+    if changed:
+        rel["updated_at"] = at
+    return changed
+
+
 def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
            at: str) -> tuple[dict[str, Any], list[dict[str, Any]], catalog.MergeStats]:
     """把一张表的结论并进写入时的目录：(新目录, 写进去的发现, 计数)。纯函数，写入冲突重来时再调一次。
@@ -997,6 +1045,7 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
     - 没被确认、驳回的关系：记为 source=profile，覆盖率够、父键唯一的 verified，否则 proposed；按 merge_notes
       的规则并入（剖析顶得掉命名推断、模型起草，顶不掉外键和人工）。
     - 人工确认过的关系：只补覆盖率和基数（_patch_confirmed）。
+    - 外键约束来的关系：只补基数和「用数据核实过」（_patch_fk），来源、状态、覆盖率都不动。
     - 码值候选：profile / proposed，含义沿用别的来源写过的（_codes_value）；整表统计得到的标「已列全」，只看了
       前若干行的不标；人工确认、驳回过的码值不碰。
     - 业务日期：只有一个日期类列时提议，profile / proposed；已有别的来源定的业务日期不顶掉。
@@ -1007,11 +1056,16 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
     current = {str(r["id"]): r for r in existing.get("relations") or [] if isinstance(r, dict) and r.get("id")}
     relations: list[dict[str, Any]] = []
     confirmed: dict[str, _RelationOutcome] = {}
+    foreign: dict[str, _RelationOutcome] = {}
     findings: list[dict[str, Any]] = []
     for o in out.relations:
         rel = current.get(o.rid)
-        if rel is None or rel.get("status") == "rejected" or rel.get("source") == "fk":
+        if rel is None or rel.get("status") == "rejected":
             continue                     # 核对期间被删、被驳回了：不写
+        if rel.get("source") == "fk":
+            foreign[o.rid] = o
+            findings.append(_relation_finding(o, rel, status=str(rel.get("status")), confirmed=False))
+            continue
         if rel.get("status") == "confirmed":
             confirmed[o.rid] = o
             findings.append(_relation_finding(o, rel, status="confirmed", confirmed=True))
@@ -1060,7 +1114,13 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
 
     merged, stats = catalog.merge_notes(existing, draft, covered={"profile"}, at=at)
     for rel in merged.get("relations") or []:
-        o = confirmed.get(str(rel.get("id")))
+        rid = str(rel.get("id"))
+        o = foreign.get(rid)
+        if o is not None and rel.get("source") == "fk":
+            if _patch_fk(rel, o, at):
+                stats += catalog.MergeStats(updated=1)
+            continue
+        o = confirmed.get(rid)
         if o is not None and rel.get("status") == "confirmed" and _patch_confirmed(rel, o, at):
             stats += catalog.MergeStats(updated=1)
     return merged, findings, stats

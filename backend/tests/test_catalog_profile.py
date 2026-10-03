@@ -207,10 +207,10 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
         # A7：说明里不写日期，时间看这一项的 updated_at（界面按本地时间显示）
         assert rel["note"].startswith("数据剖析：") and not re.search(r"\d{4}-\d{2}-\d{2}", rel["note"])
         assert rel["updated_at"]
-    # 外键约束来的关系不动：外键是外键，剖析是剖析
+    # 外键约束来的关系：来源、状态、覆盖率都不动（外键已保证引用完整，不抽样），只补用数据核实过的基数
     park = _relation(notes, "park_id")
     assert (park["source"], park["status"], park["coverage"]) == ("fk", "verified", None)
-    assert "cardinality_checked" not in park              # 外键的基数是按表结构推的，没用数据核对
+    assert park.get("cardinality_checked") is True and park["cardinality"] == "many_to_one"
 
     # 状态列：码值候选，值有了、含义留空，推断
     codes = notes["columns"]["status"]["codes"]
@@ -227,7 +227,11 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
 
     visits = _table(body, "visits")
     kinds = sorted(f["kind"] for f in visits["findings"])
-    assert kinds == ["business_date", "codes", "relation", "relation"]
+    # 两条命名推断的关系（gate_id、member_id），加两条外键关系（park_id、ticket_type_id）：外键的只核实基数
+    assert kinds == ["business_date", "codes", "relation", "relation", "relation", "relation"]
+    fk = [f for f in visits["findings"] if f["kind"] == "relation" and f["columns"] in (["park_id"], ["ticket_type_id"])]
+    assert len(fk) == 2 and all(f["cardinality_checked"] and f["coverage"] is None and "外键约束" in f["summary"]
+                                for f in fk)
     gate = next(f for f in visits["findings"] if f["kind"] == "relation" and f["columns"] == ["gate_id"])
     assert gate["status"] == "verified" and gate["path"] == f"relations.{_relation(notes, 'gate_id')['id']}"
     assert gate["sample"] == 8 and gate["matched"] == 8 and gate["summary"]
@@ -237,7 +241,8 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
     blank = sum(1 for v in notes["columns"][codes["column"]]["codes"]["value"].values() if not v.strip())
     assert codes["pending"] == blank and (f"{blank} 个含义待填写" in codes["summary"]) == (blank > 0)
     assert visits["row_estimate"] == {"rows": 1500, "method": "count", "at_least": None}
-    assert visits["added"] == 2 and visits["updated"] == 2 and visits["error"] is None
+    # 更新的 4 项：两条命名关系升为有确证，两条外键关系补上用数据核实过的基数
+    assert visits["added"] == 2 and visits["updated"] == 4 and visits["error"] is None
 
 
 async def test_wrong_name_relation_stays_proposed_with_coverage_in_note(client, make_source, tmp_path):
@@ -475,8 +480,7 @@ async def test_default_tables_are_used_tables_with_relation_candidates(client, m
     async with SessionLocal() as session:
         entries = await catalog.read_catalog(session, sid)
     for name in names:
-        rels = entries[name].notes.get("relations") or []
-        assert any(rel["source"] not in ("fk",) for rel in rels), name
+        assert catalog_profile._relation_candidates(entries[name].notes), name
     assert "parks" not in names and "channels" not in names          # 没有待核实关系的表不选
 
 
@@ -550,3 +554,71 @@ async def test_unknown_table_and_missing_source(client, make_source, scenic_db):
     assert _table(r.json(), "nope")["error"] and r.json()["queries_used"] == 0
     r = await client.post(_url("0" * 32), json={}, headers=ACTOR)
     assert r.status_code == 404
+
+
+def _orders_db(path, *, items_per_order: int) -> str:
+    """订单和订单明细，明细按外键指向订单。items_per_order=1 时数据上一对一，>1 时一对多。"""
+    db = sqlite3.connect(path)
+    try:
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total_amount REAL NOT NULL)")
+        db.execute("CREATE TABLE order_items (id INTEGER PRIMARY KEY, "
+                   "order_id INTEGER NOT NULL REFERENCES orders(id), amount REAL NOT NULL)")
+        db.executemany("INSERT INTO orders VALUES (?, ?)", [(i, 100.0) for i in range(1, 41)])
+        db.executemany("INSERT INTO order_items (order_id, amount) VALUES (?, ?)",
+                       [(o, 100.0 / items_per_order) for o in range(1, 41) for _ in range(items_per_order)])
+        db.commit()
+    finally:
+        db.close()
+    return str(path)
+
+
+@pytest.mark.parametrize("items, cardinality", [(3, "many_to_one"), (1, "one_to_one")])
+async def test_foreign_key_relations_get_their_cardinality_checked_with_data(client, make_source, tmp_path,
+                                                                            items, cardinality):
+    """外键只保证被指向的键唯一，子表一侧每个键是一行还是多行要看数据。以前剖析跳过外键关系，于是外键来的
+    一对多永远拿不到「用数据核实过」，扇出检查只能报 warning——最常见的「订单关联明细后对订单金额求和」
+    在受管发布时也挡不住。剖析要数子表一侧，来源、状态都不动，也不抽样算覆盖率（外键已经保证了）。"""
+    sid = await make_source(_orders_db(tmp_path / f"o{items}.db", items_per_order=items), options=_on(),
+                            draft=["order_items"])
+    before = _relation((await _notes(client, sid, "order_items"))["notes"], "order_id")
+    assert (before["source"], before["status"]) == ("fk", "verified")
+
+    r = await client.post(_url(sid), json={"tables": ["order_items"]}, headers=ACTOR)
+    assert r.status_code == 200, r.text
+    rel = _relation((await _notes(client, sid, "order_items"))["notes"], "order_id")
+    assert (rel["source"], rel["status"]) == ("fk", "verified")
+    assert rel["cardinality"] == cardinality and rel.get("cardinality_checked") is True
+    assert rel.get("coverage") is None
+    finding = next(f for f in _table(r.json(), "order_items")["findings"] if f.get("columns") == ["order_id"])
+    assert finding["cardinality_checked"] is True and finding["cardinality"] == cardinality
+
+    # 重新剖析、数据没变：版本不升
+    version = (await _notes(client, sid, "order_items"))["version"]
+    r = await client.post(_url(sid), json={"tables": ["order_items"]}, headers=ACTOR)
+    assert r.status_code == 200, r.text
+    assert (await _notes(client, sid, "order_items"))["version"] == version
+
+
+async def test_fanout_on_a_data_checked_foreign_key_is_an_error_again(client, make_source, tmp_path):
+    """剖析核实过的外键一对多：订单关联明细后对订单金额求和，扇出检查报 error；数据上一对一的不报。"""
+    from app.data.sqlcheck import load_checkers
+    from app.db.base import SessionLocal
+    from app.db.models import DataSource
+
+    sql = "SELECT SUM(o.total_amount) AS gmv FROM orders o JOIN order_items i ON i.order_id = o.id"
+    for items, expected in ((3, "error"), (1, None)):
+        sid = await make_source(_orders_db(tmp_path / f"f{items}.db", items_per_order=items), options=_on(),
+                                draft=["orders", "order_items"])
+        detail = await _notes(client, sid, "orders")
+        notes = detail["notes"]
+        notes.setdefault("columns", {})["total_amount"] = {"measure": {"value": "flow"}}
+        r = await client.put(f"/api/datasources/{sid}/catalog/orders",
+                             json={"notes": notes, "if_version": detail["version"]}, headers=ACTOR)
+        assert r.status_code == 200, r.text
+        r = await client.post(_url(sid), json={"tables": ["order_items"]}, headers=ACTOR)
+        assert r.status_code == 200, r.text
+        async with SessionLocal() as session:
+            source = await session.get(DataSource, sid)
+            checker = (await load_checkers(session, [source]))[source.name]
+        levels = [c.level for c in checker.check(sql) if c.code == "fanout_sum"]
+        assert levels == ([expected] if expected else []), (items, levels)
