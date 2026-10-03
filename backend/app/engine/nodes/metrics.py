@@ -33,6 +33,7 @@ from app.engine.expressions import (
     substitute,
 )
 from app.engine.labels import field_label
+from app.engine.merge_query import MERGE_SOURCE
 from app.engine.state import GraphState, template_context
 
 
@@ -393,13 +394,29 @@ def _result_artifact(path: str, tctx: dict[str, Any]) -> str | None:
     return None
 
 
-def _error_checks(artifact: str) -> list[dict[str, Any]]:
+def _error_checks(artifact: str, _seen: set[str] | None = None) -> list[dict[str, Any]]:
+    """这份查询快照对照数据目录查出的 error 级问题。
+
+    合并查询的快照没有自己的 checks（它在内存 SQLite 上执行，不对照数据目录），但记着 inputs：顺着往下找。
+    不然源库那条查询一对多关联后重复计算了，经过一次合并，指标就看不出来、照样完整出具。
+    """
+    seen = _seen if _seen is not None else set()
+    if artifact in seen:
+        return []
+    seen.add(artifact)
     try:
         snapshot = artifact_store.load(artifact)
     except Exception:  # noqa: BLE001 - 快照读不出来、被改过：这里不报，证据层另有说法
         return []
-    checks = snapshot.get("checks") if isinstance(snapshot, dict) else None
-    return [c for c in checks if isinstance(c, dict) and c.get("level") == "error"] if isinstance(checks, list) else []
+    if not isinstance(snapshot, dict):
+        return []
+    checks = snapshot.get("checks")
+    found = [c for c in checks if isinstance(c, dict) and c.get("level") == "error"] if isinstance(checks, list) else []
+    inputs = snapshot.get("inputs") if snapshot.get("source") == MERGE_SOURCE else None
+    for entry in inputs if isinstance(inputs, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("artifact"), str):
+            found += _error_checks(entry["artifact"], seen)
+    return found
 
 
 def _sql_check_reason(failed: list[tuple[str, list[dict[str, Any]]]]) -> str:
