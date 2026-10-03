@@ -2148,3 +2148,42 @@ export const CATALOG_TEXT = {
   reloadDiscardTitle: '放弃未保存的修改并重新载入？',
   reloadDiscardAction: '放弃修改并重新载入',
 }
+
+// ===========================================================================
+// 目录修改提案：用户在助手（画布）或问数据页说出一条数据事实时，助手提出的数据目录修改。
+//
+// 术语：
+// - 卡片标题写「建议更新数据目录」；两个动作是「保存到数据目录」和「忽略」。提案在保存之前不写入目录。
+// - 每一项写「改前 / 改后 / 理由」。保存后改动过的项记为人工填写、已确认（和直接编辑同一条规矩）。
+// - 别人在提案之后改过这张表：写「这张表刚被修改过」，给「重新载入」，按最新内容重算改前和改后再保存。
+// ===========================================================================
+
+export const CATALOG_PATCH_TEXT = {
+  title: '建议更新数据目录',
+  /** 过程里的那一行 */
+  step: (table: string, n: number) => `建议更新「${table}」的数据目录（${formatNumber(n)} 项）`,
+  stepSub: '确认后才写入数据目录',
+  before: '改前',
+  after: '改后',
+  reason: '理由',
+  empty: '未填写',
+  stateConfirm: '值不变，保存即确认',
+  stateSame: '已是这个值',
+  save: '保存到数据目录',
+  saving: '正在保存…',
+  ignore: '忽略',
+  hint: '保存后改动的项记为人工填写、已确认，助手和 SQL 检查随即采用',
+  saved: (version: number) => `已保存到数据目录（第 ${formatNumber(version)} 版）`,
+  savedToast: (table: string) => `已更新「${table}」的数据目录`,
+  ignored: '已忽略这条建议，数据目录未修改',
+  undoIgnore: '重新查看',
+  open: '在数据目录中查看',
+  conflictTitle: '这张表刚被修改过',
+  conflictBody: '其他人在这条建议之后修改了这张表的数据目录。重新载入后按最新内容重算改前和改后，确认后再保存。',
+  reload: '重新载入',
+  reloading: '正在重新载入…',
+  allSame: '数据目录中已是这些值，无需保存',
+  problems: '以下几项已无法按建议保存：',
+  whereRelationNew: (to: string) => `新增指向 ${to} 的关联关系`,
+  sourceOf: (source: string) => `数据源「${source}」`,
+}

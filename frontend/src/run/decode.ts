@@ -1,7 +1,10 @@
 import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import {
+  CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel,
+} from '../lib/terms'
+import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
@@ -2676,6 +2679,17 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
               title: ctx.title, detail: ctx.detail,
               ...(ctx.sub ? { sub: ctx.sub } : {}),
               ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}) })
+        break
+      }
+      case 'catalog_patch': {
+        // 目录修改提案：过程里记一行（哪张表、几项，展开看改前改后），保存、忽略在轮次里的卡片上做（catalogPatchesOf）
+        const patch = catalogPatchOf(op, String(i - 1))
+        if (!patch) break
+        add({ id: `cpt-${i}`, seq: i, kind: 'schema', status: 'done', code: 'catalog_patch',
+              title: CATALOG_PATCH_TEXT.step(patch.tableLabel ?? patch.table, patch.changes.length),
+              sub: CATALOG_PATCH_TEXT.stepSub,
+              detail: patch.changes.map((c) => `${patchWhere(c)}：${patchValueText(c.path, c.before)} → ${patchValueText(c.path, c.after)}`)
+                .join('\n') })
         break
       }
       case 'plan':

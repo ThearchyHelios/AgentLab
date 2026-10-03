@@ -10,9 +10,10 @@ import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
-import { UPGRADE_TEXT } from '../lib/terms'
+import { CATALOG_PATCH_TEXT, UPGRADE_TEXT } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
 import { copilotContext, endingOf, reduceTeam, settleTeam } from '../run/decode'
+import { catalogPatchOf } from '../run/catalogPatch'
 import { activeEdgesOf, applyDerived } from '../run/derive'
 import {
   emptyTrace, finalizeTrace, foldEvent, isActivePhase, isSettled, isTerminal, runStatusOf,
@@ -1892,6 +1893,13 @@ export const useStudio = create<StudioState>((set, get) => ({
             // 服务端按需求挑了表：浮条和轮次卡上先说参考了几张表，展开的过程里有表名（decodeCopilot）
             const ctx = copilotContext(op)
             if (ctx) set({ copilot: { ...s.copilot, lastOp: ctx.title } })
+            break
+          }
+          case 'catalog_patch': {
+            // 助手把用户说的数据事实整理成了目录修改提案：浮条上先说一句，卡片在这一轮的对话里（catalogPatchesOf），
+            // 人点「保存到数据目录」才写入。和画布无关，不动节点、不占撤销栈
+            const patch = catalogPatchOf(op)
+            if (patch) set({ copilot: { ...s.copilot, lastOp: CATALOG_PATCH_TEXT.step(patch.tableLabel ?? patch.table, patch.changes.length) } })
             break
           }
           case 'plan':

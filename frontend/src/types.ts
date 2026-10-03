@@ -2705,3 +2705,37 @@ export interface CatalogDraftOut {
   /** 模型整体用不了（没有配置、已停用……）：只按注释、外键和命名起草 */
   model_error: string | null
 }
+
+/**
+ * 目录修改提案的一项（服务端 catalog.PatchChange）。助手转出的提案和预览接口都是这个形状。
+ * path 是审阅接口的写法；新增关联关系已规范成 relations.<编号>
+ */
+export interface CatalogPatchChange {
+  path: string
+  /** 当前目录里的值；没有（或被驳回）为 null */
+  before: unknown
+  before_status: CatalogStatus | null
+  /** 保存后的值（码值是补充后的完整对照） */
+  after: unknown
+  /** 交回保存的原样取值（码值只有补充的那几个） */
+  value: unknown
+  reason: string
+  /** change 值有变化；confirm 值相同、还不是已确认（保存即确认）；same 已经是这个值且已确认 */
+  state: 'change' | 'confirm' | 'same'
+}
+
+/** 保存、预览提案时交回的一项：路径、原样取值、理由 */
+export interface CatalogPatchSubmit {
+  path: string
+  value: unknown
+  reason?: string
+}
+
+/** POST /datasources/{id}/catalog/{table}/patch/preview：对着当前目录重算改前、改后（只读） */
+export interface CatalogPatchPreview {
+  table_name: string
+  version: number
+  changes: CatalogPatchChange[]
+  /** 不合法的项的说明（目录刚被改过、列已删除……） */
+  problems: string[]
+}

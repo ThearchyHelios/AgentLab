@@ -10,6 +10,7 @@ import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/AssistantStream'
 import { PromptBox } from '../run/Composer'
 import { decodeCopilot, decodeRun, exitLabels } from '../run/decode'
+import { catalogPatchesOf } from '../run/catalogPatch'
 import { sourceHandles } from '../canvas/nodeDefs'
 import { isComposing, PageHeader, Skeleton, Spinner, StatusBadge, TechDetails, toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
@@ -401,6 +402,8 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     runClass: turn.run?.run_class,
     graph: turn.graph,
     graphNote: turn.explanation,
+    // 助手提出的数据目录修改：每条一张卡片，人点保存才写入。不随「执行过程」收起——要人拿主意的事不能藏着
+    catalogPatches: catalogPatchesOf(turn.ops),
     noQuery: turn.noQuery,
     review: turn.review,
     rawOutput: turn.rawOutput,

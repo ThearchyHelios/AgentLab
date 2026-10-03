@@ -1112,6 +1112,37 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   check('reply：这一轮记下回答', t2.reply?.includes('input.goal') && t2.outcome === 'answered', t2.outcome)
   check('reply：画布没动、不占撤销栈', (await st(page)).nodes.length === b2.nodes.length && (await st(page)).past === b2.past)
 
+  // 2b) 用户说了一条数据事实：助手只回答，附一条目录修改提案。卡片在助手栏这一轮里，点保存才写（这里在浏览器层答掉）
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
+      { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
+        value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] },
+    { op: 'reply', text: '已整理成数据目录的修改建议。' },
+  ]
+  const patchSent = []
+  await page.route(/\/api\/datasources\/src-shop\/catalog\/orders\/patch$/, (route) => {
+    patchSent.push(route.request().postDataJSON())
+    return route.fulfill({ json: { table_name: 'orders', in_schema: true, notes: {}, version: 3, updated_at: null, updated_by: null,
+      structure: null, system_notes: false, usage: 0 } })
+  })
+  await page.route(/\/api\/datasources\/src-shop\/catalog\/orders\/impact$/, (route) =>
+    route.fulfill({ json: { table: 'orders', templates: [] } }))
+  const b2b = await st(page)
+  await S(page, () => window.__studio.getState().runCopilot('status=9 表示作废', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const t2b = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('目录修改提案：这一轮照样记下回答', t2b.outcome === 'answered' && t2b.ops.some((o) => o.op === 'catalog_patch'), t2b.outcome)
+  check('目录修改提案：画布没动', (await st(page)).nodes.length === b2b.nodes.length && (await st(page)).past === b2b.past)
+  const patchCard = page.locator('[data-catalog-patch="orders"]').last()
+  check('助手栏里有「建议更新数据目录」卡片', await patchCard.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await patchCard.innerText()).includes('列 status 的码值'))
+  await patchCard.locator('[data-patch-save]').click()
+  await patchCard.locator('[data-patch-done]').waitFor({ timeout: 3000 })
+  check('保存带版本和原样取值', patchSent[0]?.if_version === 2 && JSON.stringify(patchSent[0]?.changes?.[0]?.value) === '{"9":"作废"}',
+    JSON.stringify(patchSent[0]))
+  check('保存后给到数据目录的入口', (await patchCard.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-shop/orders')
+
   // 3) 从头生成，搭到一半失败：画布退回原样，半成品能 ⇧⌘Z 找回
   state.stream = [
     { op: 'model', model: 'fake-model' },

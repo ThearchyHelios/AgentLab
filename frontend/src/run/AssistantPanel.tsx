@@ -22,6 +22,7 @@ import { EvidenceHostContext, type EvidenceHost } from './evidenceHost'
 import {
   COPILOT_PHASE_TEXT, copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, SELF_CHECK_ROUNDS, type CopilotIssue, type CopilotOutcome,
 } from './decode'
+import { catalogPatchesOf } from './catalogPatch'
 import { ApprovalCard } from './RunPanel'
 import { useRunGlance } from './RunHud'
 import { isSettled, lastEventAt, liveAt, project, type RunPhase, type Trace } from './trace'
@@ -204,6 +205,7 @@ function copilotTurn(
     statusCode,
     steps,
     output: reply ? { 回答: reply } : t.explanation ? { 说明: t.explanation } : null,
+    catalogPatches: catalogPatchesOf(t.ops),
     error: errorOp
       ? { error: errorOp.message, hint: errorOp.hint, detail: errorOp.raw }
       : t.error || undefined,

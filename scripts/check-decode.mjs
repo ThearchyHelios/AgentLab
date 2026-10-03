@@ -691,6 +691,35 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
   check('认不出的操作照旧忽略', mod.decodeCopilot([{ op: 'something_new', x: 1 }]).length === 0)
 })
 
+await section('Copilot：建议更新数据目录（catalog_patch 操作）', async () => {
+  // 用户在助手里说了一条数据事实，服务端核对后转出目录修改提案。过程里记一行，保存、忽略在卡片上做
+  const cp = await import(await load('/src/run/catalogPatch.ts'))
+  const steps = mod.decodeCopilot(synthetic.COPILOT_CATALOG_PATCH, { context: 'canvas' })
+  const row = steps.find((s) => s.code === 'catalog_patch')
+  check('一行说清建议改哪张表、几项', row?.title === '建议更新「入园记录」的数据目录（3 项）', row?.title)
+  check('副标题说明确认后才写入', row?.sub === '确认后才写入数据目录', row?.sub)
+  check('展开逐项写改前 → 改后，用界面上的叫法', !!row?.detail?.includes('列 status 的码值：0=作废、1=有效 → 0=作废、1=有效、9=作废')
+    && row.detail.includes('表的有效记录条件：status = 1 → status = 1 AND status <> 9')
+    && row.detail.includes('列 visitor_count 的度量类型：可累加 → 可累加'), row?.detail)
+  check('是看表结构那一类、标着规划阶段', row?.kind === 'schema' && row?.stage === 'plan' && row?.status === 'done')
+  check('结局仍是「只回答」', mod.copilotOutcome(synthetic.COPILOT_CATALOG_PATCH).kind === 'reply')
+
+  const [patch] = cp.catalogPatchesOf(synthetic.COPILOT_CATALOG_PATCH)
+  check('卡片拿到版本、数据源 id、表和中文名', patch?.version === 3 && patch.sourceId === 'src-scenic' && patch.table === 'visits'
+    && patch.tableLabel === '入园记录' && patch.key === '1', JSON.stringify(patch && { ...patch, changes: patch.changes.length }))
+  check('三项都认、状态照抄', patch?.changes.map((c) => c.state).join(',') === 'change,change,confirm')
+  check('交回保存的是原样取值', JSON.stringify(cp.patchSubmit(patch.changes)[0]) === '{"path":"columns.status.codes","value":{"9":"作废"},"reason":"用户说明 status=9 表示作废"}')
+  check('新增关联关系的说法', cp.patchWhere({ path: 'relations.r1', before: null, after: { to_table: 'visits' } }) === '新增指向 visits 的关联关系')
+  check('关联关系写成一行', cp.patchValueText('relations.r1', { columns: ['visit_id'], to_table: 'visits', to_columns: ['id'],
+    cardinality: 'many_to_one' }) === 'visit_id → visits.id（多对一）')
+  check('表类型、度量类型写界面上的叫法', cp.patchValueText('kind', 'fact') === '明细表' && cp.patchValueText('columns.a.measure', 'stock') === '存量')
+  check('没有值写「未填写」', cp.patchValueText('grain', null) === '未填写')
+  check('列名里有句点照样认', JSON.stringify(cp.patchTarget('columns.a.b.unit')) === '{"kind":"column","column":"a.b","field":"unit"}')
+  check('形状不对不出卡片、不出行', cp.catalogPatchesOf([
+    { op: 'catalog_patch' }, { op: 'catalog_patch', source: 's', source_id: 'i', table: 't', changes: [{ path: 'nope', after: 1 }] },
+  ]).length === 0 && mod.decodeCopilot([{ op: 'catalog_patch', source: 's', table: 't' }]).length === 0)
+})
+
 await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,

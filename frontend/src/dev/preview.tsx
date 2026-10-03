@@ -6,6 +6,7 @@ import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantS
 import { Markdown } from '../run/Markdown'
 import { ApprovalCard } from '../run/RunPanel'
 import { decodeCopilot, decodeRun } from '../run/decode'
+import { catalogPatchesOf } from '../run/catalogPatch'
 import { ToastHost } from '../components/ui'
 import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
@@ -13,7 +14,7 @@ import mdSamples from '../run/__tests__/markdown-samples.json'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
-  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_CATALOG_PATCH, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
   markupRun, mergeRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
@@ -343,6 +344,12 @@ function synthetic(name: string): StreamTurn[] {
       // 大库按需求挑表：过程里一行「参考了 N 张表」，展开按数据源分组列表名
       return [{ id: 'copilot-context', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
                 steps: decodeCopilot(COPILOT_CONTEXT, { context: 'canvas' }) }]
+    case 'catalog-patch':
+      // 用户说了一条数据事实：助手只回答、不改图，附一张「建议更新数据目录」卡片
+      return [{ id: 'catalog-patch', question: 'status=9 表示作废，统计时要排除', phase: 'done', status: '已回答（未修改画布）',
+                steps: decodeCopilot(COPILOT_CATALOG_PATCH, { context: 'canvas' }),
+                output: { 回答: '好的，已整理成数据目录的修改建议，确认后保存即可。' },
+                catalogPatches: catalogPatchesOf(COPILOT_CATALOG_PATCH) }]
     case 'copilot-fallback':
       return [{ id: 'copilot-fallback', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
                 steps: decodeCopilot(COPILOT_CONTEXT_FALLBACK, { context: 'canvas' }) }]

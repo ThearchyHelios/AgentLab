@@ -455,6 +455,24 @@ export const COPILOT_CONTEXT = [
   { op: 'final', graph: { nodes: [{ id: 'q' }, { id: 'o' }] } },
 ]
 
+/**
+ * 用户在助手里说了一条数据事实（「status=9 表示作废，统计时要排除」）：服务端核对后转出目录修改提案
+ * （catalog_patch，带版本、改前、改后），只回答、不改图。服务端没写库，要人在卡片上点保存
+ */
+export const COPILOT_CATALOG_PATCH = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'catalog_patch', source: 'scenic', source_id: 'src-scenic', table: 'visits', table_label: '入园记录', version: 3,
+    changes: [
+      { path: 'columns.status.codes', before: { 1: '有效', 0: '作废' }, before_status: 'confirmed',
+        after: { 1: '有效', 0: '作废', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+      { path: 'valid_filter', before: 'status = 1', before_status: 'proposed', after: 'status = 1 AND status <> 9',
+        value: 'status = 1 AND status <> 9', reason: '统计时要排除作废记录', state: 'change' },
+      { path: 'columns.visitor_count.measure', before: 'flow', before_status: 'proposed', after: 'flow', value: 'flow',
+        reason: '', state: 'confirm' },
+    ] },
+  { op: 'reply', text: '好的，已整理成数据目录的修改建议，确认后保存即可。' },
+]
+
 /** 挑表失败（超时）：只给了表名，原因随 context 带来；生成照常进行 */
 export const COPILOT_CONTEXT_FALLBACK = [
   { op: 'model', model: 'claude-sonnet-4' },

@@ -768,6 +768,85 @@ await section('参考了哪些表：画布右栏和问数据页（context 操作
   await q.page.close()
 })
 
+await section('建议更新数据目录：卡片的保存、忽略和 409（catalog_patch 操作）', async () => {
+  // 保存、预览都在浏览器层答掉：预览页没有真的数据源，检查也不许写库
+  const detail = (version) => ({ table_name: 'visits', in_schema: true, notes: {}, version, updated_at: null, updated_by: '检查脚本',
+    structure: null, system_notes: false, usage: 0 })
+  const c = await open('syn=catalog-patch&dense=1', { w: 380, h: 900, name: 'catalog-patch' })
+  const sent = []
+  let conflictOnce = true
+  await c.page.route('**/api/datasources/src-scenic/catalog/visits/patch**', async (route) => {
+    const req = route.request()
+    const body = req.postDataJSON()
+    sent.push({ url: req.url(), body, actor: req.headers()['x-actor'] })
+    if (req.url().endsWith('/patch/preview')) {
+      // 重新载入：别人刚把码值补了一个 8，改前改后按最新的算
+      return route.fulfill({ json: { table_name: 'visits', version: 4, problems: [], changes: [
+        { path: 'columns.status.codes', before: { 1: '有效', 0: '作废', 8: '退票' }, before_status: 'confirmed',
+          after: { 1: '有效', 0: '作废', 8: '退票', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+        { path: 'valid_filter', before: 'status = 1', before_status: 'proposed', after: 'status = 1 AND status <> 9',
+          value: 'status = 1 AND status <> 9', reason: '统计时要排除作废记录', state: 'change' },
+      ] } })
+    }
+    if (conflictOnce) {
+      conflictOnce = false
+      return route.fulfill({ status: 409, json: { detail: '表「visits」的数据目录刚被修改过，请重新载入后再提交' } })
+    }
+    return route.fulfill({ json: detail(5) })
+  })
+  await c.page.route('**/api/datasources/src-scenic/catalog/visits/impact', (route) =>
+    route.fulfill({ json: { table: 'visits', templates: [] } }))
+  const card = c.page.locator('[data-catalog-patch="visits"]')
+  check('卡片在：标题写「建议更新数据目录」', await card.count() === 1 && (await card.innerText()).includes('建议更新数据目录'))
+  const codes = card.locator('[data-patch-change="columns.status.codes"]')
+  check('逐项写改到哪儿：「列 status 的码值」', (await codes.innerText()).includes('列 status 的码值'))
+  check('改前、改后、理由都在', (await codes.locator('[data-patch-before]').innerText()).includes('0=作废、1=有效')
+    && (await codes.locator('[data-patch-after]').innerText()).includes('9=作废')
+    && (await codes.locator('[data-patch-reason]').innerText()).includes('status=9'))
+  check('新补的码值加重显示', await codes.locator('[data-code-changed="9"]').count() === 1
+    && await codes.locator('[data-code-changed="1"]').count() === 0)
+  check('值不变的项写明保存即确认', (await card.locator('[data-patch-state="confirm"]').innerText()).includes('值不变，保存即确认'))
+  check('改前写状态（推断）', (await card.locator('[data-patch-change="valid_filter"] [data-patch-before]').innerText()).includes('（推断）'))
+  check('过程里也记了一行', (await c.page.locator('[data-step-code="catalog_patch"]').innerText()).includes('建议更新「入园记录」的数据目录（3 项）'))
+  const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('卡片不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+
+  // 第一次保存撞上 409：写明「这张表刚被修改过」，给「重新载入」。署名在设置页填，这里直接写进本机
+  await c.page.evaluate(() => localStorage.setItem('agentlab_actor', '检查脚本'))
+  await card.locator('[data-patch-save]').click()
+  await card.locator('[data-patch-conflict]').waitFor({ timeout: 3000 })
+  check('409：提示这张表刚被修改过', (await card.innerText()).includes('这张表刚被修改过'))
+  check('保存带着提案对照的版本、原样取值和署名', sent[0]?.body?.if_version === 3
+    && JSON.stringify(sent[0]?.body?.changes?.[0]?.value) === '{"9":"作废"}' && !!sent[0]?.actor, JSON.stringify(sent[0]))
+  await card.locator('[data-patch-reload]').click()
+  await c.page.waitForFunction(() => document.querySelector('[data-catalog-patch="visits"]')?.getAttribute('data-patch-version') === '4',
+    null, { timeout: 3000 })
+  check('重新载入交回的是助手原来的提案', sent[1]?.url.endsWith('/patch/preview')
+    && JSON.stringify(sent[1]?.body?.changes?.[0]?.value) === '{"9":"作废"}', JSON.stringify(sent[1]))
+  check('重新载入后改前按最新的目录写', (await codes.locator('[data-patch-before]').innerText()).includes('8=退票'))
+  await card.locator('[data-patch-save]').click()
+  await card.locator('[data-patch-done]').waitFor({ timeout: 3000 })
+  check('再保存带新版本', sent[2]?.body?.if_version === 4, JSON.stringify(sent[2]?.body))
+  check('保存成功：写明第几版，给到数据目录的入口', (await card.locator('[data-patch-done]').innerText()).includes('已保存到数据目录（第 5 版）')
+    && (await card.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-scenic/visits')
+  check('保存后不再有保存按钮', await card.locator('[data-patch-save]').count() === 0)
+  check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
+  await c.page.close()
+
+  // 忽略：收成一行，可以重新查看；不发任何请求
+  const g = await open('syn=catalog-patch&dense=1', { w: 380, h: 900 })
+  let writes = 0
+  await g.page.route('**/api/datasources/**', (route) => { writes++; return route.abort() })
+  const gc = g.page.locator('[data-catalog-patch="visits"]')
+  await gc.locator('[data-patch-ignore]').click()
+  check('忽略：收成一行说明', (await gc.getAttribute('data-patch-phase')) === 'ignored'
+    && (await gc.innerText()).includes('已忽略这条建议'))
+  await gc.locator('[data-patch-unignore]').click()
+  check('重新查看：卡片回来', await gc.locator('[data-patch-save]').count() === 1)
+  check('忽略不发请求', writes === 0, `${writes}`)
+  await g.page.close()
+})
+
 await section('步骤行和画布联动', async () => {
   const { page } = await open('syn=mixed&link=1', { w: 1100, h: 800 })
   const row = page.locator('[data-node-id="agent"]').first()

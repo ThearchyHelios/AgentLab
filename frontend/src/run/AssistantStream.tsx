@@ -26,6 +26,8 @@ import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc
 import { EVIDENCE_STATE, claimProblems, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
 import type { EvidenceDocData } from '../types'
 import { useRunClock } from './useRunClock'
+import { CatalogPatchCard } from './CatalogPatchCard'
+import type { CatalogPatch } from './catalogPatch'
 import type { ReviewResult } from '../types'
 
 /**
@@ -98,6 +100,11 @@ export interface StreamTurn {
   noQuery?: boolean
   /** 复核结论：这次运行有什么不对，以及对这个答案意味着什么 */
   review?: ReviewResult | null
+  /**
+   * 助手这一轮提出的数据目录修改（catalog_patch）。每条一张「建议更新数据目录」卡片，人点保存才写入；
+   * 从库里恢复的轮次没有操作流，也就没有卡片
+   */
+  catalogPatches?: CatalogPatch[]
   /** 被复核重写之前的答案。改写是有损的，得能对照原件 */
   rawOutput?: Record<string, any> | null
   /**
@@ -531,6 +538,10 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
               </div>
             </details>
           )}
+
+          {turn.catalogPatches?.map((p) => (
+            <CatalogPatchCard key={p.key} patch={p} turnId={turn.id} dense={dense} />
+          ))}
 
           {!!turn.graph?.nodes?.length && (
             <GraphPeek graph={turn.graph} note={turn.graphNote}

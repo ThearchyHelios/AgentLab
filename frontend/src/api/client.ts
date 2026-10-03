@@ -1,6 +1,6 @@
 import type {
   ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogList, CatalogNotes,
-  CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
+  CatalogPatchPreview, CatalogPatchSubmit, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
@@ -669,6 +669,14 @@ export const api = {
     /** 单项审阅。path：表级项写字段名（grain）；列级项 columns.<列名>.<字段>；关系 relations.<编号> */
     review: (sourceId: string, table: string, body: { path: string; action: CatalogReviewAction; if_version: number }) =>
       post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/review`, body),
+    /** 目录修改提案的预览：对着当前目录重算改前、改后，不写库（保存遇到 409 后重新载入用） */
+    patchPreview: (sourceId: string, table: string, changes: CatalogPatchSubmit[]) =>
+      post<CatalogPatchPreview>(
+        `/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/patch/preview`, { changes }),
+    /** 保存目录修改提案：改动过的项记为人工填写、已确认。版本不符 409，有一项不合法 422 */
+    patch: (sourceId: string, table: string, changes: CatalogPatchSubmit[], ifVersion: number) =>
+      post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/patch`,
+        { changes, if_version: ifVersion }),
     /**
      * 同步起草（注释、外键、命名推断；use_model 时再请助手的模型起草）。不给 tables 时按使用次数取前 20 张。
      * 人工确认、驳回过的项不动。没有表结构时回 409
