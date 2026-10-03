@@ -106,8 +106,12 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
   // 起草写进了这张表：没在编辑就重新载入；在编辑就不动，保存时服务端按版本号拦下，横幅里再重新载入
   const editingRef = useRef(false)
   editingRef.current = !!edit
+  // 只认新的一次起草：换表时上面那个 effect 已经载入过，不再重复取
+  const draftSeen = useRef(drafted.seq)
   useEffect(() => {
-    if (drafted.seq && drafted.tables.has(table) && !editingRef.current) void load()
+    if (drafted.seq === draftSeen.current) return
+    draftSeen.current = drafted.seq
+    if (drafted.tables.has(table) && !editingRef.current) void load()
   }, [drafted, table, load])
 
   const changes = edit ? changeCount(edit.initial, edit.form) : 0
