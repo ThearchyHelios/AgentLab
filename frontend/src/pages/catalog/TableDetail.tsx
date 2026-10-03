@@ -9,7 +9,7 @@ import type {
 } from '../../types'
 import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confirmDialog, toast } from '../../components/ui'
 import { useLeaveGuard } from '../../lib/leave'
-import { formatDateTime, formatNumber } from '../../lib/format'
+import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
   CATALOG_CARDINALITY_LABEL, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
   CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CODES_TEXT as KT,
@@ -326,9 +326,10 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, prev, n
             <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-faint">
               {label && <span className="mono break-all text-dim">{st?.qualified ?? detail.table_name}</span>}
               <span className="tnum" title={CT.usageHint}>{CT.usage(detail.usage)}</span>
-              <span className="tnum">
+              {/* 时间写全站统一的短格式（今天「10:05」、今年「9/27 15:21」），完整时间放在悬停里 */}
+              <span className="tnum" title={detail.updated_at ? formatDateTime(detail.updated_at) : undefined} data-detail-updated="">
                 {detail.updated_at
-                  ? (detail.updated_by ? CT.updatedBy(detail.updated_by, formatDateTime(detail.updated_at)) : CT.updatedAt(formatDateTime(detail.updated_at)))
+                  ? (detail.updated_by ? CT.updatedBy(detail.updated_by, formatTime(detail.updated_at)) : CT.updatedAt(formatTime(detail.updated_at)))
                   : CT.notStarted}
               </span>
               <CountBadges counts={counts} />

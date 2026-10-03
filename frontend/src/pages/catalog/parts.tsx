@@ -6,7 +6,7 @@ import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogCounts, CatalogReviewAction, CatalogSource, CatalogStatus } from '../../types'
 import { Notice } from '../../components/ui'
-import { formatDateTime, formatNumber } from '../../lib/format'
+import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
   CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT,
 } from '../../lib/terms'
@@ -256,7 +256,9 @@ export function ItemMark({ target, compact = false, disabled = false, disabledHi
               <span className="text-dim">{CATALOG_STATUS_HINT[status]}</span>
             </p>
             <p className="text-dim">{CT.itemSource(CATALOG_SOURCE_LABEL[source])}</p>
-            {target.updated_at && <p className="tnum text-faint">{CT.itemUpdated(formatDateTime(target.updated_at))}</p>}
+            {target.updated_at && (
+              <p className="tnum text-faint" title={formatDateTime(target.updated_at)} data-item-updated="">{CT.itemUpdated(formatTime(target.updated_at))}</p>
+            )}
             {target.note && <p className="whitespace-pre-wrap break-words rounded border bg-bg px-2 py-1 text-dim">{target.note}</p>}
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
