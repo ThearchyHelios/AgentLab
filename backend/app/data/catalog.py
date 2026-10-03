@@ -882,6 +882,15 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         candidates: set[str] = set()
         for form in _singulars(words[-1]):
             candidates |= index.get((prefix, form), set())
+        if not candidates:
+            # 直接对不上：库里的表常带业务前缀（store_tags），列名却只写词根（tagId）。
+            # 只认和引用它的表共用前缀的那张，从最长的共用前缀试起；仍然不止一张就不推
+            own = _words(table)
+            for k in range(len(own) - 1, 0, -1):
+                for form in _singulars(words[-1]):
+                    candidates |= index.get(("".join(own[:k]) + prefix, form), set())
+                if candidates:
+                    break
         if len(candidates) != 1:
             continue
         target = next(iter(candidates))

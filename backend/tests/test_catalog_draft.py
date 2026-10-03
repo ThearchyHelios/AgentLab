@@ -157,6 +157,31 @@ def test_name_inference_negative(tables, why):
     assert _infer(tables, next(iter(tables))) == set(), why
 
 
+def test_name_inference_falls_back_to_a_table_sharing_the_prefix():
+    """库里没有 tags，只有带前缀的 store_tags 和 menu_tag：和引用它的表共用 store 前缀的那张才是它要指的。
+    以前这种命名推不出关系，SQL 检查跟着误报「对不上任何关系」。"""
+    tables = {
+        "store_tag_links": _table(_col("id"), _col("tagId"), _col("storeID")),
+        "store_tags": _table(_col("id")),
+        "menu_tag": _table(_col("id")),
+        "store": _table(_col("id")),
+    }
+    assert _infer(tables, "store_tag_links") == {
+        (("tagId",), "store_tags", ("id",)), (("storeID",), "store", ("id",))}
+
+
+@pytest.mark.parametrize("tables, why", [
+    # 直接对得上就用直接的，不去找带前缀的
+    ({"shop_category_links": _table(_col("id"), _col("category_id")), "categories": _table(_col("id")),
+      "shop_categories": _table(_col("id"))}, {(("category_id",), "categories", ("id",))}),
+    # 引用它的表没有可共用的前缀：带前缀的表不止一张时照旧不推
+    ({"links": _table(_col("id"), _col("tag_id")), "store_tags": _table(_col("id")),
+      "menu_tags": _table(_col("id"))}, set()),
+])
+def test_prefix_fallback_only_when_direct_match_is_missing(tables, why):
+    assert _infer(tables, next(iter(tables))) == why
+
+
 def test_name_inference_one_to_one_when_column_is_own_key():
     tables = {"member_profiles": _table(_col("member_id"), pk=("member_id",)), "members": _table(_col("id"))}
     rel = catalog.infer_name_relations(_source(tables).schema_cache, "member_profiles")[0]
