@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import re
 import time
@@ -30,6 +31,7 @@ from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_mod
 from app.tools.registry import all_specs
 
 router = APIRouter(prefix="/api/copilot", tags=["copilot"])
+logger = logging.getLogger(__name__)
 
 
 async def _sources(session: AsyncSession, scope: list[str] | None) -> list[Any]:
@@ -795,7 +797,22 @@ _STREAM_PROTOCOL = """\
   （"设计一个每天跑的工作流"）时给 false —— 他要的是这张图，不是这一次的结果
 - 如果这句话根本不需要工作流（见下面的路径约定），**第一行也是最后一行**就输出：
   {"op":"reply","text":"直接回答的内容"}
-  这时不要输出任何别的操作"""
+  这时除了下面的 catalog_patch，不要输出任何别的操作
+- 数据目录修改提案（可选）：用户在这句话里**明确陈述了一条数据事实**时，另输出一行
+  {"op":"catalog_patch","source":"数据源名","table":"表名","changes":[{"path":"…","value":…,"reason":"一句话依据"}]}
+  它只是提案，用户确认后才写进数据目录。可以和图操作一起出现（写在 done 之前），也可以只配一行 reply（写在 reply 之前）
+  · path：表级项直接写字段名（label 中文名、description 说明、grain 粒度、keys 业务主键列表、
+    kind 表类型 fact/dimension/snapshot/log/config、business_date {"column","rule","timezone"}、
+    valid_filter 有效记录的 SQL 条件、dedup 去重规则）；列级项写 columns.<列名>.<字段>（label、meaning 含义、
+    unit 单位、measure 度量类型 flow/stock/ratio/identifier/status/attribute、codes 码值 {"码":"含义"}）；
+    已有的关联关系写 relations.<编号>；新增关联关系写 relations.new，value 写
+    {"columns":[本表列],"to_table":"目标表","to_columns":[目标列],"cardinality":"many_to_one/one_to_one/one_to_many"}
+  · codes 只写要补充或更正的码，原有的码会保留；valid_filter 要写成完整的条件（原有条件也要带上）
+  · 例：「在园人数是存量，不能跨天相加」→ columns.<那一列>.measure 写 stock；「status=9 表示作废，统计时要排除」→
+    columns.status.codes 写 {"9":"作废"}，再把 valid_filter 补上排除条件；「channel_visits 是渠道和入园记录的关联表」→
+    description 和两条 relations.new
+  · 只有用户明确说出了数据事实才提，不要从自己的推测、查询结果或提问里提；表名、列名必须是上面数据源里真实存在的
+  · 计算公式不进数据目录：「转化率=下单数/访问数」这类指标怎么算的说法属于口径卡，不要提"""
 
 
 def _parse_op_line(line: str) -> dict[str, Any] | None:
@@ -811,6 +828,56 @@ def _parse_op_line(line: str) -> dict[str, Any] | None:
     if not isinstance(obj, dict) or "op" not in obj:
         return None
     return obj
+
+
+#: 模型只发了目录修改提案、既没回答也没改图时，补的那句回答
+PATCH_ONLY_REPLY = "已按你的说明整理出数据目录的修改建议，确认无误后可保存到数据目录。"
+
+
+async def catalog_patch_op(op: dict[str, Any], sources: list[Any]) -> dict[str, Any] | None:
+    """模型发的 catalog_patch → 转给前端的提案；整条不成立时返回 None。**只读，不写目录。**
+
+    核对数据源（只认这一轮给助手看的源，按名字）、表（按表结构认）、每一项的路径和取值格式（catalog.plan_patch，
+    和保存时同一套），附上当前版本、改前和改后的值。不合法的项丢掉、记一条日志，其余照转；一项都不剩就整条不转。
+    写入只发生在人点「保存到数据目录」之后（/catalog/{table}/patch，带着这里给的版本）。
+
+    开流之后请求的会话不能再用，这里另开一个短会话读目录：版本取提案到达的这一刻，比开流前读的新。
+    """
+    from app.data import catalog, table_versions
+    from app.db.base import SessionLocal
+
+    name = op.get("source")
+    table = op.get("table")
+    row = next((s for s in sources if isinstance(name, str) and s.name == name), None)
+    if row is None:
+        logger.warning("目录修改提案被丢弃：数据源「%s」不在这一轮的范围内", name)
+        return None
+    try:
+        async with SessionLocal() as session:
+            source = await table_versions.resolve_source(session, row)
+            tables = (source.schema_cache or {}).get("tables") or {}
+            key = catalog.resolve_table_name(source.schema_cache, table) if isinstance(table, str) else None
+            if key is None:
+                logger.warning("目录修改提案被丢弃：数据源「%s」中没有表「%s」", name, table)
+                return None
+            entry = await catalog.read_entry(session, row.id, key)
+    except Exception:  # noqa: BLE001 - 提案是附加的，读不到目录就不提，不能让这一轮生成失败
+        logger.exception("目录修改提案被丢弃：读取「%s」的数据目录失败", name)
+        return None
+    plan = catalog.plan_patch(entry.notes if entry else {}, op.get("changes"), table=key, tables=tables)
+    for problem in plan.problems:
+        logger.warning("目录修改提案（%s.%s）有一项被丢弃：%s", name, key, problem)
+    # 已经是这个值、也确认过的项没什么可提的
+    changes = [c.as_dict() for c in plan.changes if c.state != "same"]
+    if not changes:
+        logger.warning("目录修改提案被丢弃：%s.%s 没有需要修改的项", name, key)
+        return None
+    label = (entry.notes.get("label") if entry else None) or {}
+    return {
+        "op": "catalog_patch", "source": row.name, "source_id": row.id, "table": key,
+        "table_label": label.get("value") if label.get("status") != "rejected" else None,
+        "version": entry.version if entry else 0, "changes": changes,
+    }
 
 
 _NODE_TYPES = frozenset(t.value for t in NodeType)
@@ -1760,6 +1827,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         messages = [("system", system), ("human", human)]
         if (shown := context.op()) is not None:
             yield _sse(shown)
+        # reply 先压着：模型可能把目录修改提案写在 reply 后面，而前端收到 reply 就收尾（画布那边之后的操作一律不收），
+        # 提案得排在它前面转出。reply 之后只再认 catalog_patch，其余一概不理
+        replied: dict[str, Any] | None = None
+        patches = 0
         try:
             async for op in _with_heartbeat(_iter_ops(model, messages), started=started):
                 kind = op.get("op")
@@ -1767,11 +1838,19 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 if kind in ("thinking", "heartbeat"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
                     continue
+                if kind == "catalog_patch":
+                    # 目录修改提案：核对后转给前端做成卡片，人点「保存」才写。不进图，也不算这一轮的图操作
+                    if (checked := await catalog_patch_op(op, sources)) is not None:
+                        patches += 1
+                        yield _sse(checked)
+                    continue
+                if replied is not None:
+                    continue
                 if kind == "reply":
-                    # 这句话不需要工作流。原样转给前端，然后收流——后面那套
+                    # 这句话不需要工作流：等模型说完（只收它后面的提案）再转给前端、收流——后面那套
                     # 排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
-                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
-                    return
+                    replied = op
+                    continue
                 if kind == "done":
                     explanation = str(op.get("explanation", ""))
                     # 用户要的是流程本身时（"设计一个每天跑的工作流"），
@@ -1785,6 +1864,14 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                         skipped_types.append(str(bad_type))
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+            if replied is not None:
+                yield _sse(replied)
+                return
+            # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
+            # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
+            if patches and all(o.get("op") == "plan" for o in seen_ops):
+                yield _sse({"op": "reply", "text": PATCH_ONLY_REPLY})
+                return
             # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
             # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
             if all(o.get("op") == "plan" for o in seen_ops):
@@ -2012,7 +2099,8 @@ async def assist_publish_fix(
     try:
         async for op in _iter_ops(chat, [("system", system), ("human", _publish_fix_request(base, errors, level))]):
             kind = op.get("op")
-            if kind in ("thinking", "heartbeat"):
+            # 目录修改提案只在用户亲口陈述数据事实时才有；这里的「用户消息」是系统拼的修复请求，提了也不转
+            if kind in ("thinking", "heartbeat", "catalog_patch"):
                 continue
             if kind == "plan":
                 plan = str(op.get("summary") or "")
@@ -2197,7 +2285,8 @@ async def assist_upgrade(
         nonlocal plan
         async for op in _iter_ops(chat, [("system", system), ("human", request)]):
             kind = op.get("op")
-            if kind in ("thinking", "heartbeat"):
+            # 同发布修复：这里没有用户陈述的数据事实，目录修改提案不收
+            if kind in ("thinking", "heartbeat", "catalog_patch"):
                 continue
             if kind in ("plan", "done"):
                 # 修补轮的开场和收尾不是新方案，不覆盖第一轮的说明

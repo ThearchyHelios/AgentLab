@@ -675,6 +675,235 @@ async def save_human_edit(session: AsyncSession, source_id: str, table: str, sub
 
 
 # ==========================================================================
+# 目录修改提案：对话里的纠正（阶段 4A）
+#
+# 用户在助手里说出一条数据事实（「status=9 表示作废」），模型发一条 catalog_patch；这里逐项核对、算出改前和
+# 改后，转给前端做成卡片。**提案本身从不落库**：要人点「保存到数据目录」，带着读到的版本走 save_patch，
+# 改动记为人工填写、已确认——和人工编辑同一条规矩，只是改动由模型起草。
+# ==========================================================================
+
+#: 新增关联关系的路径：relations.new，值写两端；编号按两端算（relation_id），同一条关系不论谁提都是同一个编号
+NEW_RELATION_PATH = "relations.new"
+#: 一条提案最多几项：用户说的是一两条事实，几十项的「提案」多半是模型在重写整张表
+PATCH_MAX_CHANGES = 20
+_REASON_MAX = 500
+#: 看起来像计算公式的文字：「转化率=下单数/访问数」「= SUM(amount)」。公式进口径卡，目录只记数据事实。
+#: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它
+_FORMULA = re.compile(r"[=＝][^=<>!]*?[+*/×÷]|\b(?:sum|count|avg|average)\s*\(", re.IGNORECASE)
+_FORMULA_CHECKED = frozenset({("t", "label"), ("t", "description"), ("t", "grain"), ("c", "label"),
+                              ("c", "meaning"), ("c", "unit"), ("c", "codes")})
+
+
+@dataclass(frozen=True)
+class PatchChange:
+    """提案里的一项，核对过的。
+
+    - path：规范化后的路径（新增关系写成 relations.<编号>）；
+    - before / before_status：当前目录里这一项的值和状态（被驳回的和没有的都算没有，为 None）；
+    - after：保存后的值（码值是补充后的完整对照）；value：要交回保存的原样取值（码值只有补充的那几个，
+      409 之后在最新的目录上重新补）；
+    - state：change 值有变化；confirm 值相同、但还不是已确认（保存即确认）；same 已经是这个值且已确认。
+    """
+
+    path: str
+    before: Any
+    before_status: str | None
+    after: Any
+    value: Any
+    reason: str
+    state: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "before": self.before, "before_status": self.before_status, "after": self.after,
+                "value": self.value, "reason": self.reason, "state": self.state}
+
+
+@dataclass(frozen=True)
+class PatchPlan:
+    """一条提案核对的结果：合法的项（changes）和不合法的项的中文说明（problems）。"""
+
+    changes: list[PatchChange]
+    problems: list[str]
+
+
+def _column_names(meta: Mapping[str, Any] | None) -> set[str] | None:
+    """表结构里的列名；不知道（表结构里没有这张表）时为 None，不核对。"""
+    if not isinstance(meta, Mapping):
+        return None
+    return {str(c.get("name")) for c in meta.get("columns") or [] if isinstance(c, Mapping) and c.get("name")}
+
+
+def _formula_like(key: Slot, value: Any) -> bool:
+    if key[:1] + key[-1:] not in _FORMULA_CHECKED:
+        return False
+    texts = list(value.values()) if isinstance(value, dict) else [value]
+    return any(isinstance(t, str) and _FORMULA.search(t) for t in texts)
+
+
+def _patch_relation(table: str, raw: Any, path_id: str | None, tables: Mapping[str, Any] | None,
+                    columns: set[str] | None) -> tuple[dict[str, Any] | None, str | None]:
+    """关联关系的取值 → (关系的值部分, 问题)。值写两端（columns、to_table、to_columns），基数可选。"""
+    if not isinstance(raw, Mapping):
+        return None, "关联关系的值应写明本表字段、目标表和目标字段"
+    to_table = raw.get("to_table")
+    if isinstance(to_table, str) and tables is not None:
+        to_table = resolve_table_name({"tables": tables}, to_table)
+        if to_table is None:
+            return None, f"关联关系的目标表「{raw.get('to_table')}」不在数据源的表结构里"
+    value = {"columns": raw.get("columns"), "to_table": to_table, "to_columns": raw.get("to_columns"),
+             "cardinality": raw.get("cardinality"), "coverage": None}
+    probe = {"id": "probe", **value, "source": "human", "status": "confirmed"}
+    if problems := _relation_problems(probe, set()):
+        return None, problems[0].replace("关联关系 probe ", "关联关系")
+    if columns is not None and (missing := [c for c in value["columns"] if c not in columns]):
+        return None, f"关联关系的本表字段「{'、'.join(missing)}」不在表结构里"
+    target = _column_names((tables or {}).get(to_table)) if tables is not None else None
+    if target is not None and (missing := [c for c in value["to_columns"] if c not in target]):
+        return None, f"关联关系的目标字段「{'、'.join(missing)}」不在 {to_table} 的表结构里"
+    rid = relation_id(table, value["columns"], to_table, value["to_columns"])
+    if path_id is not None and path_id != rid:
+        return None, f"关联关系 {path_id} 的两端与取值不一致：要改指向，请驳回原关系后再新增"
+    return value, None
+
+
+def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
+               tables: Mapping[str, Any] | None = None) -> PatchPlan:
+    """逐项核对一条目录修改提案，算出改前、改后。不改入参、不抛异常：不合法的项写进 problems。
+
+    changes 是 [{path, value, reason?}]。path 用审阅接口的写法：表级项写字段名，列级项 columns.<列名>.<字段>，
+    关系 relations.<编号>；新增关系写 relations.new。tables 是数据源 schema_cache 的 tables：给了就核对列名、
+    业务主键、业务日期列、关系两端在不在表结构里（模型会照着名字编列名）；不给不核对。
+
+    规则：
+    - 取值格式和 validate_notes 同一套（_TABLE_VALUE_RULES / _COLUMN_VALUE_RULES / _relation_problems）。
+    - 码值是补充：在现有（没被驳回的）码值上加或改给出的码，不整份替换——「status=9 表示作废」不该把已确认的
+      其余码值删掉。
+    - 看起来像计算公式的文字不收（_FORMULA）：公式进口径卡。
+    - 同一个路径出现两次只认第一次。
+    """
+    meta = (tables or {}).get(table) if tables is not None else None
+    columns = _column_names(meta)
+    slots = _slots(notes)
+    out: list[PatchChange] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(changes, list) or not changes:
+        return PatchPlan([], ["提案里没有要修改的项"])
+    if len(changes) > PATCH_MAX_CHANGES:
+        problems.append(f"提案里有 {len(changes)} 项，只核对前 {PATCH_MAX_CHANGES} 项")
+        changes = changes[:PATCH_MAX_CHANGES]
+    for raw in changes:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("path"), str) or "value" not in raw:
+            problems.append("提案里有一项不是「路径 + 取值」的形式")
+            continue
+        path = raw["path"].strip()
+        value = copy.deepcopy(raw["value"])
+        reason = raw.get("reason")
+        reason = reason.strip()[:_REASON_MAX] if isinstance(reason, str) else ""
+        if path == NEW_RELATION_PATH:
+            rel, problem = _patch_relation(table, value, None, tables, columns)
+            if problem:
+                problems.append(problem)
+                continue
+            key: Slot = ("r", relation_id(table, rel["columns"], rel["to_table"], rel["to_columns"]))
+            value = rel
+        else:
+            try:
+                key = parse_path(path)
+            except CatalogPathError:
+                problems.append(f"无法识别要修改的项（{path[:60]}）")
+                continue
+            if key[0] == "r":
+                rel, problem = _patch_relation(table, value, key[1], tables, columns)
+                if problem:
+                    problems.append(problem)
+                    continue
+                value = rel
+        where = describe_slot(key) if key[0] != "r" else "关联关系"
+        if key[0] == "t":
+            check, hint = _TABLE_VALUE_RULES[key[1]]
+            if not check(value):
+                problems.append(f"{where}{hint}")
+                continue
+            if columns is not None:
+                cited = value if key[1] == "keys" else [value["column"]] if key[1] == "business_date" else []
+                if missing := [c for c in cited if c not in columns]:
+                    problems.append(f"{where}里的「{'、'.join(missing)}」不在表结构里")
+                    continue
+        elif key[0] == "c":
+            if columns is not None and key[1] not in columns:
+                problems.append(f"列 {key[1]} 不在表结构里")
+                continue
+            check, hint = _COLUMN_VALUE_RULES[key[2]]
+            if not check(value):
+                problems.append(f"{where}{hint}")
+                continue
+        if _formula_like(key, value):
+            problems.append(f"{where}看起来是计算公式：公式请写进口径卡，数据目录只记数据事实")
+            continue
+        norm = f"relations.{key[1]}" if key[0] == "r" else path
+        if norm in seen:
+            problems.append(f"{where}在提案里出现了两次，只采用第一次")
+            continue
+        seen.add(norm)
+        prev = slots.get(key)
+        live = prev if prev is not None and prev.get("status") != "rejected" else None
+        before = _value_of(key, live) if live is not None else None
+        after = value
+        if key[0] == "c" and key[2] == "codes" and isinstance(before, dict):
+            after = {**before, **value}
+        if before is not None and before == after:
+            state = "same" if live.get("status") == "confirmed" else "confirm"
+        else:
+            state = "change"
+        out.append(PatchChange(path=norm, before=copy.deepcopy(before),
+                               before_status=live.get("status") if live is not None else None,
+                               after=after, value=value, reason=reason, state=state))
+    return PatchPlan(out, problems)
+
+
+def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
+                tables: Mapping[str, Any] | None = None, at: str | None = None) -> dict[str, Any]:
+    """把一条提案并进目录，返回新目录（不改入参）。有一项不合法就整条不收，抛 CatalogInvalid。
+
+    值有变化的项记为人工填写、已确认（和人工编辑同一条规矩：改动出自人的确认，不是模型起草）；值没变的只把
+    状态改成已确认、来源不变（等同单项确认）；已经确认过的原样不动。
+    """
+    plan = plan_patch(notes, changes, table=table, tables=tables)
+    if plan.problems:
+        raise CatalogInvalid(plan.problems)
+    at = at or now_iso()
+    slots = _slots(notes)
+    for change in plan.changes:
+        key = parse_path(change.path)
+        if change.state == "same":
+            continue
+        prev = slots.get(key)
+        if change.state == "confirm" and prev is not None:
+            slots[key] = {**prev, "status": "confirmed", "updated_at": at}
+            continue
+        if key[0] == "r":
+            slots[key] = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
+        else:
+            slots[key] = {"value": change.after, "source": "human", "status": "confirmed", "updated_at": at}
+    out = _assemble(slots)
+    if problems := validate_notes(out):
+        raise CatalogInvalid(problems)
+    return out
+
+
+async def save_patch(session: AsyncSession, source_id: str, table: str, changes: Any, *, if_version: int,
+                     actor: str | None, tables: Mapping[str, Any] | None = None) -> CatalogEntry:
+    """保存一条目录修改提案（规则见 apply_patch，乐观锁同 write_entry）。版本不符抛 CatalogConflict。"""
+    entry = await read_entry(session, source_id, table)
+    current = entry.version if entry else 0
+    if if_version != current:
+        raise CatalogConflict(table, current)
+    notes = apply_patch(entry.notes if entry else {}, changes, table=table, tables=tables)
+    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+
+
+# ==========================================================================
 # 起草：数据库注释、外键约束、命名推断（只看探查缓存，不发数据库查询）
 # ==========================================================================
 
@@ -1690,11 +1919,12 @@ __all__ = [
     "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MergeStats", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS",
-    "TableDraft", "TableDraftResult", "apply_human_edit", "describe_slot", "draft_catalog", "draft_structure",
-    "draft_with_model", "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "join_paths",
-    "make_item", "merge_notes", "now_iso", "parse_path", "query_snapshot_meta", "read_catalog", "read_entry",
+    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND",
+    "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft", "TableDraftResult",
+    "apply_human_edit", "apply_patch", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
+    "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "join_paths", "make_item",
+    "merge_notes", "now_iso", "parse_path", "plan_patch", "query_snapshot_meta", "read_catalog", "read_entry",
     "relation_graph", "relation_id", "render_table_index", "render_table_notes", "resolve_draft_model",
-    "resolve_table_name", "review_entry", "review_item", "same_notes", "save_human_edit", "status_counts",
-    "system_notes_source", "table_usage", "validate_notes", "visible_notes", "write_entry",
+    "resolve_table_name", "review_entry", "review_item", "same_notes", "save_human_edit", "save_patch",
+    "status_counts", "system_notes_source", "table_usage", "validate_notes", "visible_notes", "write_entry",
 ]

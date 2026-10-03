@@ -4,6 +4,8 @@
 - GET    /catalog/{table}        单表目录 + 表结构
 - PUT    /catalog/{table}        整份提交（乐观锁），改动过的项记为人工确认
 - POST   /catalog/{table}/review 单项审阅：确认、驳回、撤销审阅
+- POST   /catalog/{table}/patch/preview  目录修改提案的预览（只读）：对着当前目录算改前、改后
+- POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
@@ -37,6 +39,21 @@ class CatalogReviewIn(BaseModel):
     #: grain、columns.amount.measure、relations.<编号>
     path: str = Field(min_length=1, max_length=600)
     action: Literal["confirm", "reject", "reset"]
+    if_version: int = Field(ge=0)
+
+
+class CatalogPatchChange(BaseModel):
+    #: 审阅接口的路径写法；新增关联关系写 relations.new
+    path: str = Field(min_length=1, max_length=600)
+    value: Any
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class CatalogPatchPreviewIn(BaseModel):
+    changes: list[CatalogPatchChange] = Field(min_length=1, max_length=catalog.PATCH_MAX_CHANGES)
+
+
+class CatalogPatchIn(CatalogPatchPreviewIn):
     if_version: int = Field(ge=0)
 
 
@@ -223,4 +240,43 @@ async def review_catalog_item(source_id: str, table: str, payload: CatalogReview
         raise _conflict(e) from e
     except catalog.CatalogPathError as e:
         raise HTTPException(422, str(e)) from e
+    return await _detail(session, source, key, entry)
+
+
+def _tables_of(source: Any) -> dict[str, Any] | None:
+    """核对提案用的表结构；没有表结构（尚未探查）时不核对列名。"""
+    return ((source.schema_cache or {}).get("tables") or None) if source is not None else None
+
+
+@router.post("/{source_id}/catalog/{table}/patch/preview")
+async def preview_catalog_patch(source_id: str, table: str, payload: CatalogPatchPreviewIn,
+                                session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """目录修改提案的预览：对着当前目录逐项算改前、改后，不写库。
+
+    助手转出的提案卡片在保存遇到 409（别人刚改过这张表）时用它重新载入：改前的值、码值补充后的样子都按
+    最新的目录重算，人看过之后再带新版本保存。
+    """
+    _, source = await _resolved(session, source_id)
+    key, entry = await _table_key(session, source, table)
+    plan = catalog.plan_patch(entry.notes if entry else {}, [c.model_dump() for c in payload.changes], table=key,
+                              tables=_tables_of(source))
+    return {"table_name": key, "version": entry.version if entry else 0,
+            "changes": [c.as_dict() for c in plan.changes], "problems": plan.problems}
+
+
+@router.post("/{source_id}/catalog/{table}/patch")
+async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn,
+                             x_actor: str | None = Header(default=None),
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """保存一条目录修改提案：改动过的项记为人工填写、已确认。版本不符 409；有一项不合法 422，整条不写。"""
+    _, source = await _resolved(session, source_id)
+    key, _ = await _table_key(session, source, table)
+    try:
+        entry = await catalog.save_patch(session, source.id, key, [c.model_dump() for c in payload.changes],
+                                         if_version=payload.if_version, actor=actor_of(x_actor),
+                                         tables=_tables_of(source))
+    except catalog.CatalogConflict as e:
+        raise _conflict(e) from e
+    except catalog.CatalogInvalid as e:
+        raise _invalid(e) from e
     return await _detail(session, source, key, entry)
