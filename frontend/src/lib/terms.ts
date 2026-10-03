@@ -2009,6 +2009,13 @@ export const CATALOG_TEXT = {
   countTitle: (label: string, n: number) => `${label} ${formatNumber(n)} 项`,
   noMatch: '没有符合条件的表',
   noMatchBody: '请换个关键词或筛选条件。',
+  // ---- 用到但没确认（页面顶部的摘要）
+  usageLead: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表里，`,
+  usagePending: (n: number) => `有 ${formatNumber(n)} 张还有推断项未确认`,
+  usageNone: (n: number) => `${formatNumber(n)} 张还没有目录`,
+  usageAllDone: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表都已确认`,
+  usageHintPending: '筛选有未确认项的表，按使用次数排序',
+  usageHintNone: '筛选没有目录的表，按使用次数排序',
   // ---- 概览（没有选中表时）
   overviewTitle: '选择一张表开始审阅',
   overviewBody: '按使用次数从高到低逐表确认。推断的项只作提示，确认后才参与 SQL 检查。',

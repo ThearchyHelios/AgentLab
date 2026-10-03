@@ -579,6 +579,43 @@ await section('数据目录 · 表清单的排序与筛选', async () => {
   await close()
 })
 
+await section('数据目录 · 用到但没确认（顶部摘要）', async () => {
+  const state = freshState()
+  // 期望值照假数据现算：使用次数大于 0、还在表结构里的表，按推断项 / 没有目录分
+  const used = state.tables[S1].filter((t) => !t.missing && t.usage > 0)
+  const progress = (t) => { const c = countsOf(t.notes ?? {}); return c.proposed ? 'pending' : c.verified + c.confirmed + c.rejected ? 'done' : 'none' }
+  const pending = used.filter((t) => progress(t) === 'pending').length
+  const none = used.filter((t) => progress(t) === 'none').length
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  const bar = page.locator('[data-catalog-usage-summary]')
+  await bar.waitFor({ timeout: 3000 })
+  check('数字照清单算：查询过的表、有推断项的、没有目录的', await bar.getAttribute('data-catalog-usage-summary') === `${used.length},${pending},${none}`,
+    `${await bar.getAttribute('data-catalog-usage-summary')} ≠ ${used.length},${pending},${none}`)
+  const text = await bar.innerText()
+  check('写成一句话', text.includes(`运行中查询过的 ${used.length} 张表里，有 ${pending} 张还有推断项未确认，${none} 张还没有目录`), text)
+  await bar.locator('[data-usage-focus="pending"]').click()
+  check('点「还有推断项未确认」：切到「有未确认项」筛选',
+    (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'pending')
+  check('……排序是按使用次数', await page.locator('[data-catalog-sort]').inputValue() === 'usage')
+  const shown = await rowNames(page)
+  const expectTop = used.filter((t) => progress(t) === 'pending').sort((a, b) => b.usage - a.usage).map((t) => t.name)
+  check('……查询过的、有推断项的表排在最前', shown.slice(0, expectTop.length).join(',') === expectTop.join(','),
+    `${shown.slice(0, expectTop.length).join(',')} ≠ ${expectTop.join(',')}`)
+  await bar.locator('[data-usage-focus="none"]').click()
+  check('点「还没有目录」：切到「没有目录」筛选', (await page.locator('[data-catalog-filter]').getAttribute('data-catalog-filter')) === 'none'
+    && (await rowNames(page))[0] === used.filter((t) => progress(t) === 'none').sort((a, b) => b.usage - a.usage)[0].name)
+  check('摘要只读、不发请求', writes(sent, /./).length === 0)
+  // 都审完了：只写一句，不给按钮
+  for (const t of state.tables[S1]) if (t.notes) t.notes = applyPut({}, { label: { value: t.notes.label?.value ?? t.name } })
+  for (const t of state.tables[S1]) if (!t.notes && t.usage > 0) t.notes = { label: item(t.name, 'human') }
+  await goto(page, `/data/catalog/${S1}`)
+  await bar.waitFor({ timeout: 3000 })
+  check('都确认了：写「都已确认」，没有按钮', (await bar.innerText()).includes(`运行中查询过的 ${used.length} 张表都已确认`)
+    && await bar.locator('[data-usage-focus]').count() === 0, await bar.innerText())
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await close()
+})
+
 await section('数据目录 · 起草', async () => {
   const state = freshState()
   const MODEL_ERR = '未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加'

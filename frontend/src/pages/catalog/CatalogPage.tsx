@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, BookMarked, Database, Sparkles } from 'lucide-react'
+import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
@@ -12,7 +12,7 @@ import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
 import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
-import { filterCounts, progressOf, rowFromDetail, visibleRows } from './model'
+import { filterCounts, progressOf, rowFromDetail, usageSummary, visibleRows } from './model'
 import type { ListFilter, ListSort } from './model'
 
 // ===========================================================================
@@ -95,6 +95,18 @@ export function CatalogPage() {
     if (i < 0) return [null, null]
     return [list[i - 1]?.table_name ?? null, list[i + 1]?.table_name ?? null]
   }, [table, visible, rows, sort])
+
+  const usage = useMemo(() => usageSummary(rows), [rows])
+  /**
+   * 顶部摘要点进来：清掉搜索词，切到对应的筛选，按使用次数排——用到最多的排在最前。窄屏一次只显示一栏，
+   * 正在看表详情时回到清单才看得到筛选结果；宽屏两栏都在，正在看的表不动
+   */
+  const focusUsed = useCallback((f: ListFilter) => {
+    setQuery('')
+    setFilter(f)
+    setSort('usage')
+    if (table && typeof matchMedia === 'function' && matchMedia('(max-width: 1023px)').matches) navigate(base)
+  }, [table, navigate, base])
 
   const filtered = !!query.trim() || filter !== 'all'
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
@@ -188,6 +200,7 @@ export function CatalogPage() {
           </div>
         )}
       />
+      {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={filter} onFocus={focusUsed} />}
       {body}
       {drafting && data && (
         <DraftDialog
@@ -200,6 +213,45 @@ export function CatalogPage() {
           onDrafted={onDrafted}
         />
       )}
+    </div>
+  )
+}
+
+/**
+ * 「用到但没确认」：运行中查询过的表里还有几张有推断项、几张没有目录。这些表的推断项会被助手当真用，最该先审。
+ * 两段各是一个按钮，点了切到清单的对应筛选、按使用次数排；都审完了只写一句，不给按钮
+ */
+function UsageSummary({ used, pending, none, active, onFocus }: {
+  used: number
+  pending: number
+  none: number
+  active: ListFilter
+  onFocus: (f: ListFilter) => void
+}) {
+  const part = (f: 'pending' | 'none', text: string, hint: string) => (
+    <button type="button" onClick={() => onFocus(f)} title={hint} aria-pressed={active === f} data-usage-focus={f}
+            className={clsx('rounded px-1 font-medium underline decoration-dotted underline-offset-2 outline-none',
+              'hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+              active === f ? 'text-[var(--accent)]' : 'text-fg')}>
+      {text}
+    </button>
+  )
+  const todo = pending > 0 || none > 0
+  return (
+    <div className="flex shrink-0 items-start gap-2 border-b px-4 py-2 text-xs"
+         style={todo ? { background: 'color-mix(in srgb, var(--st-waiting) 6%, var(--bg-panel))' } : undefined}
+         data-catalog-usage-summary={`${used},${pending},${none}`}>
+      <ListFilterIcon size={12} className="mt-0.5 shrink-0" style={{ color: todo ? 'var(--st-waiting)' : 'var(--st-done)' }} aria-hidden />
+      {todo
+        ? (
+          <p className="min-w-0 leading-relaxed text-dim">
+            {CT.usageLead(used)}
+            {pending > 0 && part('pending', CT.usagePending(pending), CT.usageHintPending)}
+            {pending > 0 && none > 0 && '，'}
+            {none > 0 && part('none', CT.usageNone(none), CT.usageHintNone)}
+          </p>
+        )
+        : <p className="min-w-0 text-dim">{CT.usageAllDone(used)}</p>}
     </div>
   )
 }
