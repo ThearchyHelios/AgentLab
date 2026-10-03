@@ -432,6 +432,10 @@ class WorkflowVersion(Base, TimestampMixin):
     # 这一版按哪一档发布的：published | governed。没发布过、或者是加这一列之前发布的为空。
     # 正式运行按不按受管出具看它，而不是工作流的 status——status 说的是当前画布，改一笔就退回 draft
     level: Mapped[str | None] = mapped_column(String(20), default=None)
+    # 发布时这一版 SQL 用到的表的数据目录版本：{源名: {表名: 版本}}，还没有目录的表记 0（data/catalog_impact.py）。
+    # 从这一版发起正式运行时和当前的比，有变化只提醒、不拦。没发布过、或者是加这一列之前发布的为空——不知道
+    # 当时是哪一版，不提醒
+    catalog_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 

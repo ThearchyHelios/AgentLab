@@ -720,6 +720,26 @@ await section('Copilot：建议更新数据目录（catalog_patch 操作）', as
   ]).length === 0 && mod.decodeCopilot([{ op: 'catalog_patch', source: 's', table: 't' }]).length === 0)
 })
 
+await section('正式运行：发布之后数据目录有变化（catalog.drift 事件）', async () => {
+  const steps = mod.decodeRun([
+    { seq: 1, type: 'run.started', node_id: null, ts: 1, data: { nodes: 1 } },
+    { seq: 2, type: 'catalog.drift', node_id: null, ts: 1.01, data: { version: 3, count: 2, tables: [
+      { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5 },
+      { source: 'scenic', source_id: 'src-scenic', table: 'parks', label: null, published: 0, current: 1 },
+    ] } },
+  ])
+  const row = steps.find((s) => s.code === 'catalog_drift')
+  check('一行提醒：「入园记录」等 2 张表有变化', row?.title === '自发布以来，数据目录中「入园记录」等 2 张表有变化', row?.title)
+  check('是警告、不是失败', row?.level === 'warn' && row?.status === 'done' && row?.kind === 'note')
+  check('副标题写明运行未被拦截', !!row?.sub?.includes('运行未被拦截'), row?.sub)
+  check('展开逐表写版本，没有目录写「尚无目录」', !!row?.detail?.includes('「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版')
+    && row.detail.includes('「scenic」parks：发布时尚无目录，现为第 1 版'), row?.detail)
+  const one = mod.catalogDrift({ tables: [{ source: 's', table: 't', label: null, published: 1, current: 2 }] })
+  check('只有一张表：标题不写「等」', one?.title === '自发布以来，数据目录中「t」有变化', one?.title)
+  check('形状不对不出行', mod.decodeRun([{ seq: 1, type: 'catalog.drift', node_id: null, ts: 1, data: { tables: 'x' } }])
+    .every((s) => s.code !== 'catalog_drift'))
+})
+
 await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,

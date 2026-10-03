@@ -9,13 +9,13 @@ import {
 import { formatDateTime, formatNumber, formatTime, shortId } from '../../lib/format'
 import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../../run/AssistantStream'
-import { decodePhase, decodeRun, exitLabels, summarizeRun, type RunFinal } from '../../run/decode'
+import { catalogDrift, decodePhase, decodeRun, exitLabels, summarizeRun, type RunFinal } from '../../run/decode'
 import { sourceHandles } from '../../canvas/nodeDefs'
 import { ApprovalCard } from '../../run/RunPanel'
 import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
-import { FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
+import { CatalogDriftBanner, FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
 import { localActor } from '../../lib/actor'
 import { explainRunError, explainStartError } from '../../lib/explain'
 import { canLeave, leavePass } from '../../lib/leave'
@@ -520,6 +520,10 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     </div>
   ) : null
 
+  // 发布之后数据目录有变化：正式运行开始时记下的提醒，横幅一直挂着（不拦运行，但看结果的人得知道）。
+  // 上面有提前返回，这里不能再用 hook；只解一条事件，直接算
+  const catalogEvent = lastOf(d.events, 'catalog.drift')
+  const catalogChange = catalogEvent ? catalogDrift(catalogEvent.data ?? {}) : null
   const unsaved = isUnsaved(run)
   const artifactCount = artifacts.items?.length
   const viewTabs: TabItem<DetailView>[] = [
@@ -612,6 +616,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
           <WaitingBanner approvals={d.pending} labelOf={labelOf} onJump={jumpToApproval}
                          onAbandon={() => void abandon()} busy={busy === 'abandon'} now={now} />
         )}
+        {catalogChange && <CatalogDriftBanner drift={catalogChange} />}
         {feedback && <FeedbackStrip feedback={feedback} onDismiss={() => setFeedback(null)} />}
         <div className="flex items-center border-t pr-2">
           <RunTabs tabs={viewTabs} active={view} onChange={setView} label="运行详情视图" idPrefix="run-view"

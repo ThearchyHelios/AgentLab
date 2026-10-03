@@ -1,8 +1,8 @@
-import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
+import type { CatalogDriftTable, RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel,
+  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, JUDGE_TEXT, MERGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
@@ -1862,6 +1862,17 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         break
       }
 
+      case 'catalog.drift': {
+        // 从发布版本发起的正式运行：发布之后数据目录有变化。只提醒、运行照常，所以是一条警告，不是失败
+        const drift = catalogDrift(d)
+        if (!drift) break
+        out.push({
+          id: `cd-${seq}`, seq, kind: 'note', level: 'warn', status: 'done', code: 'catalog_drift',
+          title: drift.title, sub: CATALOG_DRIFT_TEXT.sub, detail: drift.detail,
+        })
+        break
+      }
+
       case 'caliber.upgrade':
         out.push({
           id: `cu-${seq}`, seq, kind: 'note', level: 'warn', status: 'done',
@@ -2488,6 +2499,28 @@ function labelsOf(ops: CopilotOp[], fallback?: (id: string) => string | undefine
     }
   }
   return (id) => map.get(id) ?? fallback?.(id)
+}
+
+/**
+ * catalog.drift 事件 → 提醒的标题和逐表明细。标题按第一张表的中文名说（「入园记录」等 2 张表），明细每张表一行：
+ * 发布时第几版、现在第几版（0 写「尚无目录」）。认不出的形状返回 null
+ */
+export function catalogDrift(d: Record<string, any>): { title: string; detail: string; tables: CatalogDriftTable[] } | null {
+  const tables: CatalogDriftTable[] = (Array.isArray(d?.tables) ? d.tables : [])
+    .filter((t: any) => t && typeof t === 'object' && typeof t.table === 'string' && typeof t.source === 'string')
+    .map((t: any) => ({
+      source: t.source, source_id: String(t.source_id ?? ''), table: t.table,
+      label: typeof t.label === 'string' && t.label ? t.label : null,
+      published: num(t.published) ?? null, current: num(t.current) ?? 0,
+    }))
+  if (!tables.length) return null
+  const first = tables[0].label ?? tables[0].table
+  return {
+    title: CATALOG_DRIFT_TEXT.title(first, tables.length),
+    detail: tables.map((t) => CATALOG_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table),
+      CATALOG_DRIFT_TEXT.version(t.published), CATALOG_DRIFT_TEXT.version(t.current))).join('\n'),
+    tables,
+  }
 }
 
 /** context 操作里一个数据源的那一项（服务端 copilot_context.DatasourceContext.op） */

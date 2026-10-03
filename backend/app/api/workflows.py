@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import graph_error
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
+from app.data.catalog_impact import catalog_drift, catalog_versions_for
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
@@ -209,6 +210,10 @@ class VersionDetailOut(VersionOut):
     #: 画布上改过入口字段时，拿当前画布的字段去跑已发布版本会传错参数
     input_fields: list[dict[str, Any]] = Field(default_factory=list)
     published: bool = False
+    #: 发布时这一版 SQL 用到的表的数据目录版本 {源名: {表名: 版本}}；没发布过、或者记录之前发布的为 null
+    catalog_versions: dict[str, Any] | None = None
+    #: 发布之后目录有变化的表：[{source, source_id, table, label, published, current}]
+    catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @router.get("/{workflow_id}/versions/{version}", response_model=VersionDetailOut)
@@ -243,6 +248,8 @@ async def get_version(
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
         graph_hash=snapshot.graph_hash or graph_hash(graph), input_fields=fields,
         published=workflow.published_version == snapshot.version, level=snapshot.level,
+        catalog_versions=snapshot.catalog_versions,
+        catalog_changes=await catalog_drift(session, snapshot.catalog_versions),
     )
 
 
@@ -333,6 +340,8 @@ async def publish_workflow(
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
     snapshot.level = payload.level
+    # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
+    snapshot.catalog_versions = await catalog_versions_for(session, spec)
     workflow.status = payload.level
     workflow.published_version = version
     workflow.published_by = actor_of(x_actor)
@@ -343,6 +352,7 @@ async def publish_workflow(
         "version": version,
         "graph_hash": snapshot.graph_hash,
         "published_by": workflow.published_by,
+        "catalog_versions": snapshot.catalog_versions,
         "issues": issues,  # 剩下的都是警告
     }
 

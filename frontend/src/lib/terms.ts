@@ -2218,3 +2218,26 @@ export const CATALOG_IMPACT_TEXT = {
   error: '无法统计引用这张表的模板',
   retry: '重试',
 }
+
+/**
+ * 发布时的目录版本：发布时记下这一版 SQL 用到的表的数据目录版本；从这一版发起正式运行时目录有变化，提醒而不拦。
+ * 版本号写「第 N 版」，还没有目录的表写「尚无目录」。
+ */
+export const CATALOG_DRIFT_TEXT = {
+  /** 运行里的提醒：「自发布以来，数据目录中「入园记录」等 2 张表有变化」 */
+  title: (first: string, n: number) => (n > 1
+    ? `自发布以来，数据目录中「${first}」等 ${formatNumber(n)} 张表有变化`
+    : `自发布以来，数据目录中「${first}」有变化`),
+  sub: '运行未被拦截。请核对这些表的目录修改是否影响本次结果',
+  table: (label: string | null, table: string) => (label ? `${label}（${table}）` : table),
+  version: (v: number | null) => (v ? `第 ${formatNumber(v)} 版` : '尚无目录'),
+  line: (source: string, table: string, from: string, to: string) => `「${source}」${table}：发布时${from}，现为${to}`,
+  open: '查看目录',
+  // ---- 版本历史里的「发布时的目录版本」
+  section: '发布时的目录版本',
+  sectionHint: '这一版 SQL 用到的表在发布时的数据目录版本',
+  changedSince: (now: string) => `之后有变化，现为${now}`,
+  changedCount: (n: number) => `${formatNumber(n)} 张表在发布之后有变化，下次正式运行时会提醒`,
+  unchanged: '发布之后这些表的目录没有变化',
+  empty: '这一版的 SQL 没有用到数据库表',
+}

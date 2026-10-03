@@ -263,8 +263,11 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
     if (sub === 'versions' && !v) return json(route, VERSIONS)
     if (sub === 'versions' && v) {
       const n = Number(v)
+      // 已发布的 v2 记着发布时的目录版本：入园记录之后改过（第 3 版 → 第 5 版），景区表没变
       return json(route, { ...VERSIONS.find((x) => x.version === n), workflow_id: id,
-        graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2 })
+        graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2,
+        catalog_versions: n === 2 ? { shop: { parks: 1, visits: 3 } } : null,
+        catalog_changes: n === 2 ? [{ source: 'shop', source_id: 'src-shop', table: 'visits', label: '入园记录', published: 3, current: 5 }] : [] })
     }
     if (method === 'GET' && !sub) return state.deleted.has(id) ? json(route, { detail: '工作流不存在，可能已被删除' }, 404) : json(route, FAKES[id])
     if (method === 'DELETE' && !sub) {
@@ -1001,7 +1004,18 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   const rows = await count(page, 'ol[aria-label="版本"] > li')
   check('列出全部版本', rows === 3, `${rows} 版`)
   check('标出已发布的那一版', (await page.locator('ol[aria-label="版本"] > li').nth(1).innerText()).includes('已发布'))
+  // 已发布的那一版：看得到发布时的目录版本，之后改过的表标出来
+  await page.locator('ol[aria-label="版本"] > li').nth(1).locator('button').first().click()
+  const cat = page.locator('[data-version-catalog]')
+  await cat.waitFor({ timeout: 3000 }).catch(() => {})
+  const catText = await cat.innerText().catch(() => '')
+  check('已发布的版本写「发布时的目录版本」', catText.includes('发布时的目录版本') && catText.includes('parks') && catText.includes('第 1 版'), catText)
+  check('之后改过的表标出来', (await page.locator('[data-version-catalog-table="visits"]').getAttribute('data-changed')) === 'true'
+    && catText.includes('之后有变化，现为第 5 版') && catText.includes('1 张表在发布之后有变化'), catText.replace(/\s+/g, ' '))
+  check('没改过的表不标', (await page.locator('[data-version-catalog-table="parks"]').getAttribute('data-changed')) === null)
   await page.locator('ol[aria-label="版本"] > li').nth(2).locator('button').first().click()
+  await page.waitForTimeout(300)
+  check('没发布过的版本没有目录版本这一栏', await count(page, '[data-version-catalog]') === 0)
   await page.waitForTimeout(500)
   check('选一版给出缩略图预览', await count(page, 'svg[aria-label^="缩略图"]') === 1)
   check('预览列出恢复后将移除的节点', (await page.locator('[role="dialog"][aria-label="版本历史"]').innerText()).includes('将移除'))

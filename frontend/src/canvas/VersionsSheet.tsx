@@ -7,10 +7,10 @@ import {
 } from '../store/studio'
 import { ErrorState, Skeleton, toast } from '../components/ui'
 import { formatDateTime, formatTime } from '../lib/format'
-import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_DRIFT_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import { hintOf } from './shortcuts'
 import type { Edge } from '@xyflow/react'
-import type { GraphSpec, Workflow, WorkflowVersion } from '../types'
+import type { CatalogDriftTable, GraphSpec, Workflow, WorkflowVersion } from '../types'
 
 /**
  * 版本历史。盖在右栏上的一层，和属性面板同一种「临时造访」。
@@ -27,7 +27,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
   const [list, setList] = useState<WorkflowVersion[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [picked, setPicked] = useState<number | null>(null)
-  const [detail, setDetail] = useState<{ v: number; graph: GraphSpec } | { v: number; error: unknown } | null>(null)
+  const [detail, setDetail] = useState<{ v: number; graph: GraphSpec; version: WorkflowVersion } | { v: number; error: unknown } | null>(null)
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
   const dirty = useStudio((s) => s.dirty)
@@ -61,7 +61,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
     let alive = true
     setDetail(null)
     api.workflows.version(workflow.id, picked)
-      .then((v) => { if (alive) setDetail({ v: picked, graph: v.graph ?? { nodes: [], edges: [] } }) })
+      .then((v) => { if (alive) setDetail({ v: picked, graph: v.graph ?? { nodes: [], edges: [] }, version: v }) })
       .catch((e) => { if (alive) setDetail({ v: picked, error: e }) })
     return () => { alive = false }
   }, [workflow.id, picked])
@@ -137,8 +137,14 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                         {!detail ? <Skeleton rows={3} height={12} />
                           : 'error' in detail ? <ErrorState error={detail.error} compact />
                           : target && diff && (
-                            <VersionPreview version={v.version} target={target} diff={diff}
-                                            lock={lock} onRestore={restore} />
+                            <>
+                              <VersionPreview version={v.version} target={target} diff={diff}
+                                              lock={lock} onRestore={restore} />
+                              {detail.version.catalog_versions && (
+                                <CatalogVersions versions={detail.version.catalog_versions}
+                                                 changes={detail.version.catalog_changes ?? []} />
+                              )}
+                            </>
                           )}
                       </div>
                     )}
@@ -204,6 +210,50 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 }
 
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
+
+/**
+ * 发布时的目录版本：这一版 SQL 用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式
+ * 运行时会提醒「数据目录有变化」，这里先让人看到是哪几张表
+ */
+function CatalogVersions({ versions, changes }: {
+  versions: Record<string, Record<string, number>>
+  changes: CatalogDriftTable[]
+}) {
+  const rows = Object.entries(versions).flatMap(([source, tables]) =>
+    Object.entries(tables).map(([table, v]) => ({ source, table, v })))
+  const changed = new Map(changes.map((c) => [`${c.source}/${c.table}`, c]))
+  return (
+    <div className="mt-3 border-t pt-2" data-version-catalog={changes.length}>
+      <div className="text-2xs font-medium text-dim" title={CATALOG_DRIFT_TEXT.sectionHint}>{CATALOG_DRIFT_TEXT.section}</div>
+      {!rows.length ? <div className="mt-1 text-2xs text-faint">{CATALOG_DRIFT_TEXT.empty}</div> : (
+        <>
+          <ul className="mt-1 space-y-0.5 text-2xs">
+            {rows.map(({ source, table, v }) => {
+              const c = changed.get(`${source}/${table}`)
+              return (
+                <li key={`${source}/${table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5" data-version-catalog-table={table}
+                    data-changed={c ? 'true' : undefined}>
+                  <span className="mono min-w-0 truncate" title={`${source} · ${table}`}>{table}</span>
+                  <span className="shrink-0 text-faint">{CATALOG_DRIFT_TEXT.version(v)}</span>
+                  {c && (
+                    <span className="shrink-0" style={{ color: 'var(--st-waiting)' }}>
+                      {CATALOG_DRIFT_TEXT.changedSince(CATALOG_DRIFT_TEXT.version(c.current))}
+                    </span>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+          <div className="mt-1 text-2xs" style={{ color: changes.length ? 'var(--st-waiting)' : undefined }}>
+            <span className={changes.length ? undefined : 'text-faint'}>
+              {changes.length ? CATALOG_DRIFT_TEXT.changedCount(changes.length) : CATALOG_DRIFT_TEXT.unchanged}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
 
 /**
  * 缩略图：这一版的节点按真实坐标缩进一个小框，类型色填充；恢复后会被拿掉的

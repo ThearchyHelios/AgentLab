@@ -56,6 +56,22 @@ export interface WorkflowVersion {
   input_fields?: { name: string; required?: boolean; [key: string]: any }[]
   /** 是不是当前的已发布版本 */
   published?: boolean
+  /** 发布时这一版 SQL 用到的表的数据目录版本 {源名: {表名: 版本}}，0 表示当时还没有目录；没记过为 null */
+  catalog_versions?: Record<string, Record<string, number>> | null
+  /** 发布之后目录有变化的表 */
+  catalog_changes?: CatalogDriftTable[]
+}
+
+/** 发布之后数据目录有变化的一张表（服务端 catalog_impact.catalog_drift；运行里的 catalog.drift 事件同形） */
+export interface CatalogDriftTable {
+  source: string
+  source_id: string
+  table: string
+  /** 表现在的中文名 */
+  label: string | null
+  /** 发布时的版本，0 表示当时还没有目录 */
+  published: number | null
+  current: number
 }
 
 /**
