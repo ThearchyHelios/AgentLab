@@ -26,7 +26,10 @@ import type { CatalogDriftTable, CatalogVersions as CatalogVersionsRecord, Graph
 export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClose: () => void }) {
   const [list, setList] = useState<WorkflowVersion[] | null>(null)
   const [error, setError] = useState<unknown>(null)
-  const [picked, setPicked] = useState<number | null>(null)
+  // 选中的版本记着是哪张工作流的：版本历史开着时换了工作流，上一张选的 v2 不能拿去请求这一张（没有这一版就是 404）
+  const [pickedOf, setPickedOf] = useState<{ wf: string; v: number } | null>(null)
+  const picked = pickedOf?.wf === workflow.id ? pickedOf.v : null
+  const setPicked = (v: number | null) => setPickedOf(v == null ? null : { wf: workflow.id, v })
   const [detail, setDetail] = useState<{ v: number; graph: GraphSpec; version: WorkflowVersion } | { v: number; error: unknown } | null>(null)
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)

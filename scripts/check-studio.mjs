@@ -367,6 +367,13 @@ const waitAnalysis = (page) => page.waitForFunction(() => {
 /** 点画布空白处：让焦点离开输入框（快捷键不抢输入框里的键） */
 const blur = (page) => page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } })
 const count = (page, sel) => page.locator(sel).count()
+/** 轮询到条件成立或超时，返回最后一次的结果 */
+const until = async (fn, ms = 3000, step = 100) => {
+  const end = Date.now() + ms
+  let v = await fn()
+  while (!v && Date.now() < end) { await new Promise((r) => setTimeout(r, step)); v = await fn() }
+  return v
+}
 
 /**
  * 页面里的 navigate(to, opts)：从 React 树里找到 RouterProvider 手里的那个 data router，
@@ -1003,7 +1010,13 @@ await section('分析失败不静默', async () => {
 
 // ================================================================ 5
 await section('版本历史：预览、恢复成一次可撤销的改动', async () => {
-  const { ctx, page, state } = await open()
+  const { ctx, page, state, errors } = await open()
+  // 记下按版本号取详情的请求：版本历史开着时换工作流，不能拿上一张选中的版本去请求这一张
+  const asked = []
+  page.on('request', (r) => {
+    const m = new URL(r.url()).pathname.match(/^\/api\/workflows\/([^/]+)\/versions\/(\d+)$/)
+    if (m) asked.push(`${m[1]}@${m[2]}`)
+  })
   await blur(page)
   await page.keyboard.press('Alt+KeyH')
   await page.waitForTimeout(500)
@@ -1053,6 +1066,26 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   await page.keyboard.press(`${MOD}+s`)
   await page.waitForTimeout(400)
   check('保存带上版本说明', state.patches[0]?.note === '恢复到 v1', JSON.stringify(state.patches[0] ?? {}).slice(0, 60))
+
+  // 版本历史开着、选着 v2 时换到另一张工作流：不能拿 v2 去请求那一张（那一张未必有 v2，会 404、控制台报错）
+  await page.waitForFunction(() => !window.__studio.getState().dirty, null, { timeout: 3000 }).catch(() => {})
+  await blur(page)
+  await page.keyboard.press('Alt+KeyH')
+  await page.waitForTimeout(400)
+  await page.locator('ol[aria-label="版本"] > li').nth(1).locator('button').first().click()
+  await until(async () => asked.includes('st-main@2'), 3000)
+  await page.locator('button[title^="切换、新建"]').click()
+  await page.waitForTimeout(250)
+  await page.locator('li[role="option"]', { has: page.locator('span.truncate', { hasText: /^__studio_check_team__$/ }) }).click()
+  await page.waitForFunction(() => window.__studio.getState().workflow?.id === 'st-team', null, { timeout: 5000 }).catch(() => {})
+  await page.waitForTimeout(600)
+  const sheetOpen = await count(page, '[role="dialog"][aria-label="版本历史"]')
+  check('版本历史开着时换工作流：不拿上一张选中的版本去请求这一张', sheetOpen === 1 && !asked.some((a) => a.startsWith('st-team@')),
+    `${sheetOpen ? '版本历史开着' : '版本历史关了'}；${asked.join(',')}`)
+  check('……换过去之后没有展开的版本，选一版照常能看', await count(page, 'ol[aria-label="版本"] button[aria-expanded="true"]') === 0)
+  await page.locator('ol[aria-label="版本"] > li').nth(0).locator('button').first().click()
+  check('……再选一版：按这一张的 id 取', await until(async () => asked.includes('st-team@3'), 3000), asked.join(','))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await ctx.close()
 })
 
