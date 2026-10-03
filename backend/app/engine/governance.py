@@ -47,9 +47,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     strict = level == "governed"
 
     def flag(message: str, *, code: str, node_id: str | None = None, hard: bool = False,
-             field: str | None = None) -> None:
+             field: str | None = None, sql_level: str | None = None) -> None:
         result.add(message, level="error" if (hard and strict) else "warning", node_id=node_id,
-                   field=field, code=code)
+                   field=field, code=code, sql_level=sql_level)
 
     has_contract_output = False
     for node in spec.nodes:
@@ -139,7 +139,9 @@ def _lint_sql(spec: GraphSpec, flag: Callable[..., None], checkers: Mapping[str,
     for node, check in graph_checks(spec.nodes, checkers):
         if check.level == "info":
             continue
-        flag(check.message, code=check.code, node_id=node.id, hard=check.level == "error", field="args.sql")
+        # sql_level：检查本来的级别。已发布档 level 一律 warning，界面靠它说清这是错误级、只是这一档不拦
+        flag(check.message, code=check.code, node_id=node.id, hard=check.level == "error", field="args.sql",
+             sql_level=check.level)
 
 
 #: validate 里和门禁 G4、G5 说同一件事的两条提示（schema.evidence_issues）

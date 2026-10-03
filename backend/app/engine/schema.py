@@ -154,6 +154,10 @@ class ValidationIssue(BaseModel):
     code: str | None = None
     #: 这条问题对应的修复 id（engine/autofix.py 算出来的）。只在发布检查的结果里填
     fix: str | None = None
+    #: 发布门禁里基于数据目录的 SQL 检查（governance._lint_sql）：这条检查本来的级别（error / warning）。level 说的是
+    #: 拦不拦（已发布档一律 warning），前端要按它说清「错误级问题，已发布只提醒、受管会拦」。别的问题没有这一项，
+    #: 序列化时也不出现
+    sql_level: Literal["error", "warning"] | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class ValidationResult(BaseModel):
@@ -161,10 +165,11 @@ class ValidationResult(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
     def add(self, message: str, *, level: str = "error", node_id: str | None = None,
-            edge_id: str | None = None, field: str | None = None, code: str | None = None) -> None:
+            edge_id: str | None = None, field: str | None = None, code: str | None = None,
+            sql_level: str | None = None) -> None:
         self.issues.append(
             ValidationIssue(level=level, message=message, node_id=node_id,  # type: ignore[arg-type]
-                            edge_id=edge_id, field=field, code=code)
+                            edge_id=edge_id, field=field, code=code, sql_level=sql_level)  # type: ignore[arg-type]
         )
         if level == "error":
             self.ok = False

@@ -216,7 +216,7 @@ function lint(graph, level, { followsNever = false } = {}) {
     const c = n.data.config ?? {}
     // 基于数据目录的 SQL 检查（governance._lint_sql）：错误级在受管档是硬性问题，已发布档只提示；没有确定性的修复
     if (n.type === 'tool' && /JOIN order_items/i.test(c.args?.sql ?? '')) {
-      issues.push({ level: hard ? 'error' : 'warning', node_id: n.id, code: 'fanout_sum', fix: null, field: 'args.sql',
+      issues.push({ level: hard ? 'error' : 'warning', sql_level: 'error', node_id: n.id, code: 'fanout_sum', fix: null, field: 'args.sql',
         message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联' })
     }
     if (followsNever && n.type === 'agent' && !c.approval && (c.tools ?? []).length) {

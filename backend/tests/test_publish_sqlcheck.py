@@ -84,8 +84,14 @@ async def test_governed_level_blocks_error_level_sql_problems(scenic_db):
     [issue] = [i for i in issues if i.code == "fanout_sum"]
     assert issue.message.startswith("「订单」关联「订单明细」是一对多")
     # 已发布级别：同一个问题只警告
-    assert _sql_issues(publish_issues(spec, level="published", checkers=checkers)) == [
-        ("fanout_sum", "warning", "fetch", "args.sql")]
+    published = publish_issues(spec, level="published", checkers=checkers)
+    assert _sql_issues(published) == [("fanout_sum", "warning", "fetch", "args.sql")]
+    # 拦不拦（level）之外，带着检查本来的级别（sql_level）：界面据此说「错误级问题，已发布只提醒、受管会拦」
+    assert [i.sql_level for i in issues if i.field == "args.sql"] == ["error"]
+    assert [i.sql_level for i in published if i.field == "args.sql"] == ["error"]
+    # 别的问题没有这一项，序列化时也不出现
+    assert all("sql_level" not in i.model_dump() for i in published if i.field != "args.sql")
+    assert [i.model_dump()["sql_level"] for i in published if i.field == "args.sql"] == ["error"]
     # 依据只是推断：info 不进门禁
     assert _sql_issues(lint_for_publish(spec, level="governed", checkers=await _checkers(scenic_db, "proposed"))
                        .issues) == []
@@ -153,6 +159,10 @@ async def test_publish_endpoints_block_governed_fanout(client, scenic_source):
     assert checked["ok"] is False
     [issue] = [i for i in checked["issues"] if i["code"] == "fanout_sum"]
     assert issue["level"] == "error" and issue["node_id"] == "fetch" and issue["field"] == "args.sql"
+    assert issue["sql_level"] == "error"
+    hint = (await client.post(f"/api/workflows/{wid}/publish-check", json={"level": "published"})).json()
+    assert [(i["level"], i["sql_level"]) for i in hint["issues"] if i["code"] == "fanout_sum"] == [("warning", "error")]
+    assert all("sql_level" not in i for i in hint["issues"] if i.get("field") != "args.sql")
     assert issue["fix"] is None, "SQL 写错没有确定性的修复，交给人或助手改"
 
     fixed = (await client.post(f"/api/workflows/{wid}/autofix", json={"level": "governed", "apply": []})).json()

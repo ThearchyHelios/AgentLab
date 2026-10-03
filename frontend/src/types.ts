@@ -1346,6 +1346,11 @@ export interface ValidationIssue {
   code?: string | null
   /** 这条问题对应的修复 id：publish-check 的 fixes 里同 id 的那一项。没有修复时为空 */
   fix?: string | null
+  /**
+   * 发布门禁里的 SQL 检查：这条检查本来的级别。level 说的是拦不拦（已发布档一律 warning），它说的是错误还是提醒。
+   * 别的问题、老服务端不给
+   */
+  sql_level?: 'error' | 'warning' | null
 }
 
 /** 发布等级：发布弹窗、问题面板的发布前检查共用 */

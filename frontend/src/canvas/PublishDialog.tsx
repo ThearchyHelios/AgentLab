@@ -445,13 +445,15 @@ export function usePreflight(workflowId: string | undefined, level: PublishLevel
 }
 
 /**
- * 发布前检查里一条 SQL 检查问题原本的级别。门禁只收错误和提醒两级（提示的依据只是推断，不进门禁），问题的 level 换成了
- * 「拦不拦」：受管档错误级拦（error），其余都是 warning——原来是哪一级看不出来了。错误级只有两条规则
- * （服务端 sqlcheck._ERROR_CODES：一对多关联后重复计算、存量跨期加总），按规则编号认回来
+ * 发布前检查里一条 SQL 检查问题本来的级别。问题的 level 说的是「拦不拦」（已发布档一律 warning），本来是错误还是提醒
+ * 看服务端给的 sql_level（governance._lint_sql）。老服务端不给时按受管档的 level 认；已发布档就认不出来，按提醒说，
+ * 不把拿不准的说重
  */
-const SQL_ERROR_CODES = new Set(['fanout_sum', 'stock_summed'])
-const publishSqlLevel = (code: unknown): 'error' | 'warning' | null =>
-  (isSqlCheckCode(code) ? (SQL_ERROR_CODES.has(code) ? 'error' : 'warning') : null)
+const publishSqlLevel = (issue: ValidationIssue): 'error' | 'warning' | null => {
+  if (!isSqlCheckCode(issue.code)) return null
+  if (issue.sql_level === 'error' || issue.sql_level === 'warning') return issue.sql_level
+  return issue.level === 'error' ? 'error' : 'warning'
+}
 
 function fixLabelOf(data: PublishCheck | undefined, id: string): string {
   return data?.fixes.find((f) => f.id === id)?.label ?? ''
@@ -478,7 +480,7 @@ export function Preflight({ pf, gate, onLocate, stale }: {
   const errors = (rows ?? []).filter((r) => r.issue.level === 'error').length
   const warns = (rows ?? []).length - errors
   // 已发布档只提醒、不拦的 SQL 检查错误级问题：结论那句话里点出来，别和「没指定模型」这类提示混成一个数
-  const sqlErrors = (rows ?? []).filter((r) => r.issue.level !== 'error' && publishSqlLevel(r.issue.code) === 'error').length
+  const sqlErrors = (rows ?? []).filter((r) => r.issue.level !== 'error' && publishSqlLevel(r.issue) === 'error').length
   const canFix = !lock && check.status !== 'unsupported'
   const autoIds = issues ? autoFixIds(issues, fixes) : []
   const labelOf = (id?: string | null) => (id ? nodeOf(id)?.label || id : '')
@@ -564,7 +566,7 @@ function PreflightRow({ issue, others, fix, where, pf, onLocate }: {
 }) {
   const err = issue.level === 'error'
   const Icon = err ? XCircle : AlertTriangle
-  const sqlLevel = publishSqlLevel(issue.code)
+  const sqlLevel = publishSqlLevel(issue)
   return (
     <li data-preflight-issue={issue.code ?? ''} data-fix-kind={fix?.kind} data-sql-check-level={sqlLevel ?? undefined}>
       <button
