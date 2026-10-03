@@ -2901,6 +2901,8 @@ export interface CatalogProfileRelationFinding {
   previous_status?: CatalogStatus | null
   coverage: number
   cardinality: CatalogCardinality | null
+  /** 基数是不是用数据核实的（子表一侧数过是否唯一）。老服务端不给 */
+  cardinality_checked?: boolean
   /** 抽了几个不同的键值、在被指向表里对上几个 */
   sample: number
   matched: number
@@ -2915,6 +2917,8 @@ export interface CatalogProfileCodesFinding {
   values: { value: string; rows: number }[]
   rows: number
   status: CatalogStatus
+  /** 写进目录的码值里还有几个含义空着（别的来源写过的含义会沿用）。老服务端不给 */
+  pending?: number
   summary: string
 }
 

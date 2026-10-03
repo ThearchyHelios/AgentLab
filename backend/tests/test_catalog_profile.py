@@ -231,6 +231,11 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
     gate = next(f for f in visits["findings"] if f["kind"] == "relation" and f["columns"] == ["gate_id"])
     assert gate["status"] == "verified" and gate["path"] == f"relations.{_relation(notes, 'gate_id')['id']}"
     assert gate["sample"] == 8 and gate["matched"] == 8 and gate["summary"]
+    # 结构化的字段：基数用数据核实过没有、码值还有几个含义待填写（界面读这些，不从原话里认）
+    assert isinstance(gate["cardinality_checked"], bool)
+    codes = next(f for f in visits["findings"] if f["kind"] == "codes")
+    blank = sum(1 for v in notes["columns"][codes["column"]]["codes"]["value"].values() if not v.strip())
+    assert codes["pending"] == blank and (f"{blank} 个含义待填写" in codes["summary"]) == (blank > 0)
     assert visits["row_estimate"] == {"rows": 1500, "method": "count", "at_least": None}
     assert visits["added"] == 2 and visits["updated"] == 2 and visits["error"] is None
 

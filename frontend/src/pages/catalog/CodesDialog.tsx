@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { CatalogItem } from '../../types'
 import { isComposing, Modal, Spinner } from '../../components/ui'
+import { formatDateTime, formatTime } from '../../lib/format'
 import { CODES_TEXT as KT } from '../../lib/terms'
 import { StatusChip } from './parts'
 import { codesComplete } from './model'
@@ -45,8 +46,12 @@ export function CodesDialog({ column, item, saving, onSave, onClose }: {
           <StatusChip status={item.status} source={item.source} />
         </div>
         {item.note && (
-          <div className="rounded border bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim">
+          <div className="rounded border bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim" data-codes-note="">
             <span className="text-faint">{KT.note}：</span>{item.note}
+            {/* 说明里不带日期，时间看这一项的 updated_at（按本地时间显示） */}
+            {item.updated_at && (
+              <span className="tnum ml-1 text-faint" title={formatDateTime(item.updated_at)} data-codes-note-at="">（{formatTime(item.updated_at)}）</span>
+            )}
           </div>
         )}
         <div className="overflow-hidden rounded-lg border">

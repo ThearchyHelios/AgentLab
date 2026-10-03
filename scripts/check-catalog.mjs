@@ -1346,13 +1346,13 @@ function profileReply(state, { ms = 0, extraCodes = false } = {}) {
     const before = (id) => visits.notes.relations.find((r) => r.id === id)?.status ?? null
     const previous = { gate: before(GATE_REL), member: before(MEMBER_REL) }
     notes.relations = notes.relations.map((r) => (r.id === GATE_REL ? {
-      ...r, source: 'profile', status: 'verified', coverage: 0.987, cardinality: 'many_to_one', updated_at: at,
-      note: `数据剖析（${PROFILE_DAY}）：子表抽样 300 个不同键值，父表对上 296 个，覆盖率 98.7%；被指向列是主键；子表一侧有重复值，多对一。`,
+      ...r, source: 'profile', status: 'verified', coverage: 0.987, cardinality: 'many_to_one', cardinality_checked: true, updated_at: at,
+      note: '数据剖析：子表抽样 300 个不同键值，父表对上 296 个，覆盖率 98.7%；被指向列是主键；子表一侧有重复值，多对一。',
     } : r))
     notes.relations.push(rel(['member_id'], 'members', ['id'], 'profile', { coverage: 0.62, updated_at: at,
-      note: `数据剖析（${PROFILE_DAY}）：抽样覆盖率 62%，可能不是这条关系；子表抽样 200 个不同键值，父表对上 124 个；被指向列是主键。` }))
-    notes.columns.status.codes = item({ 1: '已入园', 9: '已作废', 2: '' }, 'profile', 'proposed')
-    notes.columns.status.codes.note = `数据剖析（${PROFILE_DAY}）：统计全表，182000 行非空值共 3 个取值：1（94%）、9（5%）、2（1%）。`
+      note: '数据剖析：抽样覆盖率 62%，可能不是这条关系；子表抽样 200 个不同键值，父表对上 124 个；被指向列是主键。' }))
+    notes.columns.status.codes = { ...item({ 1: '已入园', 9: '已作废', 2: '' }, 'profile', 'proposed'), updated_at: at }
+    notes.columns.status.codes.note = '数据剖析：统计全表，182000 行非空值共 3 个取值：1（94%）、9（5%）、2（1%）。'
     // 统计的是全表：服务端给码值候选标「已列全」
     notes.columns.status.codes.complete = true
     // extraCodes：票种列也取到码值候选（两个取值，含义都空着）——报告里有两列要填，填完一列回到报告接着填下一列
@@ -1363,16 +1363,17 @@ function profileReply(state, { ms = 0, extraCodes = false } = {}) {
         table_name: 'visits', queries: 38, row_estimate: { rows: 182000, method: 'stats', at_least: null },
         findings: [
           { kind: 'relation', path: `relations.${GATE_REL}`, target: 'gate_id → gates.id', columns: ['gate_id'], to_table: 'gates', to_columns: ['id'],
-            status: 'verified', confirmed: false, previous_status: previous.gate, coverage: 0.987, cardinality: 'many_to_one', sample: 300, matched: 296,
+            status: 'verified', confirmed: false, previous_status: previous.gate, coverage: 0.987, cardinality: 'many_to_one', cardinality_checked: true,
+            sample: 300, matched: 296,
             summary: previous.gate === 'verified' ? '覆盖率 98.7%，仍为有确证' : '覆盖率 98.7%，升为有确证' },
           { kind: 'relation', path: `relations.${MEMBER_REL}`, target: 'member_id → members.id', columns: ['member_id'], to_table: 'members',
             to_columns: ['id'], status: 'proposed', confirmed: false, previous_status: previous.member, coverage: 0.62, cardinality: 'many_to_one',
-            sample: 200, matched: 124,
+            cardinality_checked: false, sample: 200, matched: 124,
             summary: '抽样覆盖率 62%，保持推断' },
           { kind: 'codes', path: 'columns.status.codes', column: 'status', values: [{ value: '1', rows: 171080 }, { value: '9', rows: 9100 },
-            { value: '2', rows: 1820 }], rows: 182000, status: 'proposed', summary: '3 个取值，1 个含义待填写' },
+            { value: '2', rows: 1820 }], rows: 182000, status: 'proposed', pending: 1, summary: '3 个取值' },
           ...(extraCodes ? [{ kind: 'codes', path: 'columns.ticket_type_id.codes', column: 'ticket_type_id', values: [{ value: '11', rows: 120000 },
-            { value: '12', rows: 62000 }], rows: 182000, status: 'proposed', summary: '2 个取值，2 个含义待填写' }] : []),
+            { value: '12', rows: 62000 }], rows: 182000, status: 'proposed', pending: 2, summary: '2 个取值' }] : []),
         ],
         skipped: [
           { kind: 'codes', target: 'member_level', path: 'columns.member_level.codes', reason: 'masked', detail: 'visits.member_level 在数据源设置中被遮罩，不取值' },
@@ -1395,6 +1396,7 @@ function profileReply(state, { ms = 0, extraCodes = false } = {}) {
     return json({
       profiled_at: at, actor: ACTOR, settings: { ...PROFILE_ON, sample_size: 2000, max_scan_rows: 100000, max_total_s: 120 },
       queries_used: 60, stopped: 'budget', tables, total: { added: 1, updated: 2, removed: 0 }, note: null,
+      empty_tables: ['ext_log_001', 'ext_log_002'],
     })(route)
   }
 }
@@ -1588,7 +1590,7 @@ await section('数据目录 · 数据剖析', async () => {
   const visitsCard = report.locator('[data-profile-table="visits"]')
   const gate = visitsCard.locator(`[data-profile-finding="relation"][data-path="relations.${GATE_REL}"]`)
   check('关系核实：覆盖率、基数、抽样规模，升为已验证', (await gate.locator('[data-profile-coverage]').innerText()) === '覆盖率 98.7%'
-        && (await gate.locator('[data-profile-cardinality]').innerText()) === '多对一' && (await gate.innerText()).includes('抽样 300 个键值，对上 296 个')
+        && (await gate.locator('[data-profile-cardinality]').innerText()) === '多对一（已用数据核实）' && (await gate.innerText()).includes('抽样 300 个键值，对上 296 个')
         && (await gate.locator('[data-profile-outcome]').innerText()) === '升为已验证' && (await gate.getAttribute('data-status')) === 'verified',
         (await gate.innerText()).replace(/\s+/g, ' '))
   // 结论是状态说明，不是链接：带框的小标签，文字用次要文字色（不是强调蓝），不能点
@@ -1607,6 +1609,11 @@ await section('数据目录 · 数据剖析', async () => {
   check('……结论用状态标签的样子：带框、次要文字色，不是蓝色正文、不像链接', outcomeLook.kind === 'raised' && outcomeLook.color === outcomeLook.dim
     && outcomeLook.color !== outcomeLook.accent && outcomeLook.border === 'solid' && outcomeLook.cursor !== 'pointer' && !outcomeLook.clickable,
     JSON.stringify(outcomeLook))
+  // 结构化的读数：基数核实读 cardinality_checked，几个含义待填写读 pending（假答复的 summary 里故意不写），空表读 empty_tables
+  check('……基数用数据核实过没有，读 cardinality_checked', (await gate.locator('[data-profile-cardinality]').getAttribute('data-checked')) === 'true'
+        && (await visitsCard.locator(`[data-path="relations.${MEMBER_REL}"] [data-profile-cardinality]`).innerText()) === '多对一（子表一侧未核实，按表结构推断）')
+  check('……挑表时跳过的空表读 empty_tables', (await report.locator('[data-profile-empty-tables="2"]').innerText().catch(() => ''))
+        === '挑表时跳过 2 张空表：ext_log_001、ext_log_002')
   const member = visitsCard.locator(`[data-profile-finding="relation"][data-path="relations.${MEMBER_REL}"]`)
   check('……覆盖率不够的保持推断，写明原因', (await member.locator('[data-profile-outcome]').innerText()) === '保持推断：覆盖率不足，可能不是这条关系'
         && (await member.locator('[data-profile-coverage]').innerText()) === '覆盖率 62%')
@@ -1635,6 +1642,11 @@ await section('数据目录 · 数据剖析', async () => {
         (await gateRow.innerText().catch(() => '')).replace(/\s+/g, ' '))
   await openMark(page, `relations.${GATE_REL}`)
   check('……点开来源：写明抽样规模和覆盖率的剖析说明', (await panel(page).innerText()).includes('子表抽样 300 个不同键值，父表对上 296 个'))
+  // 说明里不带日期：时间看这一项的 updated_at（按本地时间，2026-10-03 03:00 UTC 是 11:00）
+  check('……说明不带日期，时间按这一项的 updated_at 写', !/\d{4}-\d{2}-\d{2}/.test(await panel(page).locator('.whitespace-pre-wrap').innerText())
+        && /更新于 (2026\/)?10\/3 11:00/.test(await panel(page).innerText()), (await panel(page).innerText()).replace(/\s+/g, ' '))
+  check('……关系表上写基数已用数据核实', await page.locator(`[data-relation="${GATE_REL}"] [data-relation-cardinality][data-checked="true"]`).count() === 1
+        && (await page.locator(`[data-relation="${GATE_REL}"] [data-relation-cardinality]`).innerText()).includes('已核实'))
   await page.keyboard.press('Escape')
   const statusCodes = page.locator('[data-column="status"] [data-cell="codes"]')
   check('……码值的含义空着写「含义待填写」，给「填写含义」', (await statusCodes.locator('[data-code="2"] [data-code-pending]').innerText()) === '含义待填写'
@@ -1650,7 +1662,9 @@ await section('数据目录 · 数据剖析', async () => {
   check('码值弹窗：每个码值一个输入框，空着的写「含义待填写」，光标在它上面', await codesBox.locator('input[data-code]').count() === 3
         && (await codesBox.locator('input[data-code="2"]').getAttribute('placeholder')) === '含义待填写'
         && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-code') === '2')))
-  check('……写明剖析说明（各取值的占比）', (await codesBox.innerText()).includes('1（94%）、9（5%）、2（1%）'))
+  check('……写明剖析说明（各取值的占比），时间按这一项的 updated_at', (await codesBox.innerText()).includes('1（94%）、9（5%）、2（1%）')
+        && /^（(2026\/)?10\/3 11:00）$/.test(await codesBox.locator('[data-codes-note-at]').innerText().catch(() => '')),
+        await codesBox.locator('[data-codes-note]').innerText().catch(() => ''))
   check('……没填时保存禁用', await page.locator('[data-codes-save]').isDisabled())
   check('……写明当前已列出全部取值（剖析统计了全表），可以取消', await codesBox.locator('[data-codes-complete]').isChecked()
         && (await codesBox.innerText()).includes('已列出全部取值') && (await statusCodes.locator('[data-codes-complete-mark]').count()) === 1)

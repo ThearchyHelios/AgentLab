@@ -757,7 +757,13 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
                 </td>
                 <td className={cell}>
                   {label(CT.relationHead.cardinality)}
-                  {r.cardinality ? CATALOG_CARDINALITY_LABEL[r.cardinality] : <span className="text-faint">{CT.cardinalityNone}</span>}
+                  <span data-relation-cardinality={r.cardinality ?? ''} data-checked={r.cardinality_checked ? 'true' : undefined}>
+                    {r.cardinality ? CATALOG_CARDINALITY_LABEL[r.cardinality] : <span className="text-faint">{CT.cardinalityNone}</span>}
+                    {/* 数据剖析用数据核实过的基数（cardinality_checked）：一对多关联的检查据此给「错误」，其余的最多「提醒」 */}
+                    {r.cardinality && r.cardinality_checked && (
+                      <span className="ml-1 text-2xs text-faint" title={UT.cardinalityCheckedHint}>{UT.cardinalityCheckedShort}</span>
+                    )}
+                  </span>
                 </td>
                 <td className={clsx('tnum', cell, typeof r.coverage !== 'number' && '@max-[40rem]:hidden')}>
                   {label(CT.relationHead.coverage)}

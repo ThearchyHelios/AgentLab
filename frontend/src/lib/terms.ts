@@ -2541,6 +2541,12 @@ export const CATALOG_UI_TEXT = {
   publishSqlErrorBlocked: 'SQL 检查发现的错误级问题：受管级别会拦下发布，请先修改 SQL',
   publishSqlWarning: 'SQL 检查的提醒：两个发布级别都只提醒、不拦发布',
   publishSqlErrors: (n: number) => `，其中 ${formatNumber(n)} 处是 SQL 检查发现的错误级问题（受管级别会拦下）`,
+  // ---- 剖析的结构化读数：基数用数据核实过没有、挑表时跳过的空表
+  cardinalityChecked: '已用数据核实',
+  cardinalityByStructure: '子表一侧未核实，按表结构推断',
+  cardinalityCheckedShort: '已核实',
+  cardinalityCheckedHint: '基数由数据剖析用数据核实（子表一侧确有重复或确实唯一），一对多关联后重复计算的检查据此报错误',
+  emptyTables: (n: number) => `挑表时跳过 ${formatNumber(n)} 张空表`,
 }
 
 // ===========================================================================

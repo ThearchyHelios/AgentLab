@@ -287,6 +287,12 @@ function Report({ report: r, ms, filled, returnTo, onSettings, onOpenTable, onFi
         </Notice>
       )}
       {r.note && <Notice tone="info" attr={{ 'data-profile-note': '' }}>{r.note}</Notice>}
+      {/* 挑表途中确知是空表、跳过的表（服务端 empty_tables）：一张都没剖析时 note 已经说了，这里只在剖析了别的表时列出 */}
+      {r.tables.length > 0 && (r.empty_tables?.length ?? 0) > 0 && (
+        <p className="text-2xs leading-relaxed text-faint" data-profile-empty-tables={r.empty_tables!.length}>
+          {UT.emptyTables(r.empty_tables!.length)}：<span className="mono">{r.empty_tables!.join('、')}</span>
+        </p>
+      )}
       {shown.map((t) => <TableReport key={t.table_name} t={t} filled={filled} onOpenTable={onOpenTable} onFillCodes={onFillCodes} />)}
       {quiet.length > 0 && (
         <p className="text-2xs leading-relaxed text-faint" data-profile-quiet={quiet.length}>
@@ -418,7 +424,13 @@ function RelationLine({ f }: { f: CatalogProfileRelationFinding }) {
       <div className="tnum mt-0.5 text-2xs text-dim">
         <span data-profile-coverage="">{PT.coverage(coverageText(f.coverage))}</span>
         {' · '}
-        <span data-profile-cardinality="">{f.cardinality ? CATALOG_CARDINALITY_LABEL[f.cardinality] : PT.cardinalityUnknown}</span>
+        <span data-profile-cardinality="" data-checked={f.cardinality ? String(!!f.cardinality_checked) : undefined}>
+          {f.cardinality ? CATALOG_CARDINALITY_LABEL[f.cardinality] : PT.cardinalityUnknown}
+          {/* 基数用数据核实过没有：读服务端的 cardinality_checked，不从说明的原话里认 */}
+          {f.cardinality && f.cardinality_checked !== undefined && (
+            <span className="text-faint">（{f.cardinality_checked ? UT.cardinalityChecked : UT.cardinalityByStructure}）</span>
+          )}
+        </span>
         {' · '}
         {PT.sampled(f.sample, f.matched)}
       </div>
@@ -440,9 +452,8 @@ function CodesLine({ f, fillKey: key, filled, onFill }: {
   filled: number | undefined
   onFill: () => void
 }) {
-  // 服务端在 summary 里写了几个含义待填写（别的来源写过的含义会沿用）；认不出时按都待填写
-  const reported = Number(f.summary.match(/(\d+)\s*个含义待填写/)?.[1] ?? (f.summary.includes('待填写') ? f.values.length : 0))
-  const pending = filled ?? reported
+  // 几个含义待填写读服务端的 pending（别的来源写过的含义会沿用），不从 summary 的原话里认；老服务端不给时不说
+  const pending = filled ?? f.pending ?? 0
   const done = filled != null && filled === 0
   return (
     <li className="text-xs" data-profile-finding="codes" data-column={f.column}>

@@ -930,7 +930,8 @@ async def _check_dates(cx: _Context, table: str, columns: list[str], total: int,
 
 def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, confirmed: bool) -> dict[str, Any]:
     """一条关系的核实结论。previous_status 是剖析之前目录里这条关系的状态：报告按它说「升为已验证」还是「仍为已验证」
-    （重新剖析、目录没变时不能说升了）。"""
+    （重新剖析、目录没变时不能说升了）；cardinality_checked：基数是不是用数据核实的（子表一侧数过是否唯一），
+    报告据此写「已用数据核实」，不从说明的原话里认。"""
     previous = rel.get("status")
     if confirmed:
         summary = "已人工确认，只补充覆盖率和基数"
@@ -943,8 +944,8 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,
             "columns": list(rel.get("columns") or []), "to_table": rel.get("to_table"),
             "to_columns": list(rel.get("to_columns") or []), "status": status, "confirmed": confirmed,
-            "previous_status": previous, "coverage": o.coverage, "cardinality": o.cardinality, "sample": o.sample,
-            "matched": o.matched, "summary": summary}
+            "previous_status": previous, "coverage": o.coverage, "cardinality": o.cardinality,
+            "cardinality_checked": o.cardinality_checked, "sample": o.sample, "matched": o.matched, "summary": summary}
 
 
 def _codes_value(c: _CodesOutcome, item: dict[str, Any] | None) -> dict[str, str]:
@@ -959,11 +960,13 @@ def _codes_value(c: _CodesOutcome, item: dict[str, Any] | None) -> dict[str, str
 
 
 def _codes_finding(c: _CodesOutcome, value: dict[str, str]) -> dict[str, Any]:
+    """码值候选的结论。pending：写进目录的码值里还有几个含义空着（别的来源写过的含义会沿用），报告按它说
+    「N 个含义待填写」，不从 summary 的原话里认。"""
     pending = sum(1 for v in value.values() if not v.strip())
     summary = f"{len(c.values)} 个取值" + (f"，{pending} 个含义待填写" if pending else "")
     return {"kind": "codes", "path": f"columns.{c.column}.codes", "column": c.column,
             "values": [{"value": k, "rows": n} for k, n in c.values], "rows": c.rows, "status": "proposed",
-            "summary": summary}
+            "pending": pending, "summary": summary}
 
 
 def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
