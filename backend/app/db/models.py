@@ -317,6 +317,37 @@ class SnapshotActivation(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+# --------------------------------------------------------------------------
+# 数据目录（data/catalog.py）
+# --------------------------------------------------------------------------
+
+
+class CatalogNote(Base, TimestampMixin):
+    """一张表的业务目录：中文名、粒度、业务主键、业务日期、列的含义 / 单位 / 度量类型 / 码值、表间关系。
+
+    只记数据事实，不放计算公式（公式在口径卡里）。notes 的结构和每一项的来源、状态见 data/catalog.py。
+
+    一表一行而不是一项一行：起草、审阅、冻结进表结构快照都以表为单位，版本号也按表走——两个人改
+    同一个源的不同表互不冲突，改同一张表时后提交的被乐观锁拦下。
+
+    挂外键、级联删除：目录是数据源的附属说明，源删掉了留着没有意义（和导入记录不同，后者要留作审计）。
+    运行用过的那一版目录已经随表结构快照冻结进证据，不靠这张表回溯。
+    """
+
+    __tablename__ = "catalog_notes"
+    __table_args__ = (UniqueConstraint("source_id", "table_name"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"), index=True)
+    # 与 schema_cache["tables"] 的键一致（不带 schema 前缀）
+    table_name: Mapped[str] = mapped_column(String(255))
+    notes: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 从 1 起，每次内容有变化的写入加 1；写入方必须带上读到的版本（data/catalog.write_entry）
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # 最近一次写入的署名（请求头 X-Actor，自报、未认证）；助手起草时可为空
+    updated_by: Mapped[str | None] = mapped_column(String(100), default=None)
+
+
 class Setting(Base, TimestampMixin):
     """键值形式的用户设置，前端 Settings 页直接读写。"""
 

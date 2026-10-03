@@ -41,3 +41,14 @@ def _prepare_schema():
 
 def pytest_report_header(config) -> str:
     return f"测试数据目录：{_TMP}"
+
+
+@pytest.fixture(scope="session")
+def scenic_db(tmp_path_factory) -> str:
+    """合成的景区业务库（tests/fixtures/catalog/scenic.py）：50 张表、真外键与只能靠命名推断的关系并存。
+
+    每个测试进程建一次，只读使用；要改库内容的测试自己调 scenic.build(tmp_path / "x.db") 另建一个。
+    """
+    from tests.fixtures.catalog import scenic
+
+    return str(scenic.build(tmp_path_factory.mktemp("catalog") / "scenic.db"))
