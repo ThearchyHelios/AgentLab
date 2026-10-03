@@ -2565,3 +2565,32 @@ export const SQL_CHECK_TEXT = {
   assistantNextChat: '可在画布中打开此工作流，修改对应节点「参数」中的 SQL；检查依据有误时，请在数据目录中修正对应项',
   assistantInfoNext: '这些检查的依据尚未确认，仅供参考。在数据目录中确认相关项后，检查结论更可靠',
 }
+
+// ===========================================================================
+// 证据面板、运行时间线里的 SQL 检查和数据目录版本（数据目录完整性修复 F2a）
+//
+// - 证据面板的查询步骤写这次查询对照的是哪一版数据目录（表结构快照里冻结的那份）：「数据目录：入园记录 第 3 版」。
+// - 合并查询的每个输入带着它自己的 SQL 检查结果。
+// - 运行时间线：同一条查询的问题只列一行，写明受影响的指标；「打开设置」落到来源查询节点的 SQL 上。
+// ===========================================================================
+
+export const RUN_SQL_CHECK_TEXT = {
+  /** 证据面板查询步骤：SQL 检查对照的数据目录版本 */
+  catalogLine: (items: { name: string; version?: number | null }[]) =>
+    `数据目录：${items.map((i) => (i.version != null ? `${i.name} 第 ${formatNumber(i.version)} 版` : i.name)).join('、')}`,
+  catalogHint: '这次查询时冻结的数据目录版本，SQL 检查对照的就是这一版',
+  /** 合并查询的输入：这个输入查询自己的 SQL 检查 */
+  mergeInputChecks: (alias: string) => `输入 ${alias} 的 SQL 检查`,
+  /** 运行时间线：一条查询的问题影响了几个指标 */
+  metricsTitle: (names: string[], n = 1) => {
+    const who = names.length > 3
+      ? `指标${names.slice(0, 3).map((x) => `「${x}」`).join('')}等 ${formatNumber(names.length)} 个`
+      : `指标${names.map((x) => `「${x}」`).join('')}`
+    return n > 1 ? `${who}所依据的查询有 ${formatNumber(n)} 处未通过 SQL 检查` : `${who}所依据的查询未通过 SQL 检查`
+  },
+  /** 运行时间线：一次查询的 SQL 检查结果（查询那一行展开后） */
+  toolChecks: 'SQL 检查',
+  /** 「打开设置」落到来源查询节点的 SQL 上 */
+  openSql: (label?: string) => (label ? `打开「${label}」的 SQL` : '打开来源查询的 SQL'),
+  metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+}

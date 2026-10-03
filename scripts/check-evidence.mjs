@@ -3046,14 +3046,18 @@ if (SHOTS) {
 // 推断来源的答复带 merge（经过的每一次合并）。答复按 backend/app/api/evidence.py 的 _merge_view、_query_steps 的形状改
 // ---------------------------------------------------------------------------
 const MERGE_SQL = 'SELECT o.order_id, o.region, o.amount, t.target FROM o JOIN t ON o.region = t.region ORDER BY o.order_id'
-function asMerge(body, traced, { withInput = true } = {}) {
+// 合并输入自己的 SQL 检查（_merge_view 的 inputs[].checks，形状同查询步骤的 checks）
+const INPUT_CHECKS = [{ code: 'fanout_sum', level: 'error', table: 'orders', column: 'amount',
+  message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联。' }]
+function asMerge(body, traced, { withInput = true, inputChecks = false } = {}) {
   const q = body.chain.find((st) => st.step === 'query')
   const merged = {
     ...q, tool: undefined, source: '合并查询', sql: MERGE_SQL,
     merge: {
       sql: MERGE_SQL,
       inputs: [
-        { alias: 'o', node_id: 'fetch', label: '订单明细', query: 'Q1', rows: 12, source: 'shop', artifact: 'a'.repeat(64), sealed: true },
+        { alias: 'o', node_id: 'fetch', label: '订单明细', query: 'Q1', rows: 12, source: 'shop', artifact: 'a'.repeat(64), sealed: true,
+          ...(inputChecks ? { checks: INPUT_CHECKS } : {}) },
         { alias: 't', node_id: 'targets', label: '区域目标', query: null, rows: 4, source: 'plan', artifact: 'b'.repeat(64), sealed: true },
       ],
       warnings: [{ code: 'rows_grew', message: '合并结果有 14 行，多于行数最多的输入「o」（12 行）：合并键可能不唯一，同一行被重复匹配' }],
@@ -3097,15 +3101,24 @@ await section('merge', '合并查询：表级来历（输入、合并 SQL、警�
   check('输入步骤标明是哪次合并的输入，高亮追到的那一格', into.includes('合并查询 Q3 的输入')
     && await parts.nth(1).locator('td[data-highlight="cell"]').count() === 1, into)
   check('合并查询不是数据源：不说它「已不存在」', await p.locator('[data-ev-query-mask-note]').count() === 0)
+  check('输入没查出问题：合并步骤里不出输入的 SQL 检查', await p.locator('[data-ev-merge-input-checks]').count() === 0)
   await traced.ctx.close()
 
   const flat = await probeQ((id, body) => (id === qseg('1,288') ? asMerge(body, [{
     cell: [5, 'amount'], input: null, query: null, row: null, column: null, note: '没有逐格来历',
-  }], { withInput: false }) : body))
+  }], { withInput: false, inputChecks: true }) : body))
   await openQ(flat.page, '1,288')
   const none = await flat.page.locator('[data-evidence-panel] [data-ev-merge-trace="none"]').innerText().catch(() => '')
   check('追不到的格：写明没有逐格来历、只有表级来历，不接输入步骤', none.includes('没有逐格来历')
     && none.includes('表级来历') && await flat.page.locator('[data-evidence-panel] [data-ev-query]').count() === 1, none)
+  // 没有输入步骤时，输入查询的 SQL 检查结果要在合并步骤里看得到（指标正是因为它标了「存疑」）
+  const inChecks = flat.page.locator('[data-evidence-panel] [data-ev-merge-input-checks="o"]')
+  const inText = await inChecks.innerText().catch(() => '')
+  check('追不到逐格来历时，合并步骤的输入下面列出它自己的 SQL 检查（级别、规则名、说明）', inText.includes('输入 o 的 SQL 检查')
+    && inText.includes('错误') && inText.includes('一对多关联后重复计算') && inText.includes('会重复计算')
+    && await inChecks.locator('[data-sql-check="fanout_sum"][data-level="error"]').count() === 1, inText.replace(/\s+/g, ' '))
+  check('……没查出问题的输入不出', await flat.page.locator('[data-evidence-panel] [data-ev-merge-input-checks="t"]').count() === 0)
+  check('……不露规则编号', !/fanout_sum/.test(await flat.page.locator('[data-evidence-panel] [data-ev-merge]').innerText()))
   await flat.ctx.close()
 
   const wideId = pseg('wide')

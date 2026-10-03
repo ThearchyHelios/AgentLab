@@ -1052,7 +1052,10 @@ def _merge_view(snap: dict[str, Any], cells: list[tuple[Any, Any]], catalog: dic
         inputs.append({"alias": item.get("alias"), "node_id": item.get("node_id"),
                        "label": labels.get(str(item.get("node_id"))), "query": _query_alias(catalog, art),
                        "rows": item.get("rows"), "source": item.get("source"), "artifact": art or None,
-                       "sealed": sealed.trusted and art in sealed.queries})
+                       "sealed": sealed.trusted and art in sealed.queries,
+                       # 输入查询的 SQL 检查结果：被引用的格追不到逐格来历时没有输入步骤，指标却因为它标了「存疑」，
+                       # 问题得在合并步骤里看得到。没查出问题、快照读不出来的输入不加这个键
+                       **({"checks": checks} if (checks := _input_checks(art)) else {})})
     traced = []
     for row, column in dict.fromkeys((r, c) for r, c in cells if isinstance(r, int) and c):
         hit = trace_cell(snap, row, column)
@@ -1065,6 +1068,17 @@ def _merge_view(snap: dict[str, Any], cells: list[tuple[Any, Any]], catalog: dic
     warnings = [{"code": w.get("code"), "message": w.get("message")} for w in snap.get("warnings") or []
                 if isinstance(w, dict) and w.get("message")]
     return {"sql": snap.get("sql"), "inputs": inputs, "warnings": warnings, "traced": traced}
+
+
+def _input_checks(artifact: str) -> list[dict[str, Any]]:
+    """合并查询某个输入的 SQL 检查结果（_query_checks 的形状）。读不出来的快照返回空列表：快照的问题输入步骤另有说法。"""
+    if not artifact:
+        return []
+    try:
+        snap = load(artifact)
+    except Exception:  # noqa: BLE001 - 被改过、读不出来：这里不报
+        return []
+    return _query_checks(snap) if isinstance(snap, dict) else []
 
 
 async def _merge_masks(snap: dict[str, Any], masks: _Masks) -> tuple[set[str], list[str]]:

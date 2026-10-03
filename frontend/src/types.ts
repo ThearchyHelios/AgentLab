@@ -2108,6 +2108,8 @@ export interface EvidenceMergeInput {
   source?: string | null
   artifact?: string | null
   sealed?: boolean
+  /** 这个输入查询对照数据目录查出的问题（形状同查询步骤的 checks）。没查出问题、快照读不出来时没有这个键 */
+  checks?: SqlCheckItem[]
 }
 
 /** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */

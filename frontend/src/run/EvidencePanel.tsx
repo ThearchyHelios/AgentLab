@@ -18,7 +18,7 @@ import {
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
@@ -1471,6 +1471,13 @@ function MergeInputs({ merge }: { merge: EvidenceMerge }) {
                 .filter(Boolean).join(' · ')}
             </span>
             {host.onNode && i.node_id && <NodeChip id={i.node_id} />}
+            {!!i.checks?.length && (
+              // 输入查询自己的 SQL 检查：被引用的格追不到逐格来历时，下面没有这个输入的查询步骤，问题只能在这里看到
+              <div className="mt-0.5 w-full" data-ev-merge-input-checks={i.alias}>
+                <div className="mb-0.5 text-faint">{RUN_SQL_CHECK_TEXT.mergeInputChecks(i.alias)}</div>
+                <SqlCheckList checks={i.checks} />
+              </div>
+            )}
           </li>
         ))}
       </ul>
