@@ -440,8 +440,10 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
 # 一次剖析：上下文、结果
 # ==========================================================================
 
-#: 不指定表时剖析几张：按使用次数取目录里有待核实关系的表
+#: 不指定表时剖析几张：目录里有要核对的关系的表，还有待核实（推断）关系的在前，再按使用次数；确知是空表的跳过
 PROFILE_DEFAULT_TABLES = 10
+#: 不指定表时，为跳过空表最多先估几张候选表的行数；估行数的查询最多用掉查询次数上限的一半，免得都花在挑表上
+PROFILE_PROBE_TABLES = 30
 #: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
 IN_CHUNK = 1000
 #: 剖析写的备注都以它开头（「数据剖析：」）：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的（认的时候连
@@ -512,6 +514,8 @@ class ProfileReport:
     tables: list[TableProfile] = field(default_factory=list)
     queries_used: int = 0
     stopped: str | None = None
+    #: 不指定表时，挑表途中估过行数、确知是空表而跳过的表（表结构顺序）。估行数的查询算在 queries_used 里
+    empty_tables: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1156,7 +1160,44 @@ async def _pick_tables(session: AsyncSession, source: Any, tables: list[str] | N
     candidates = [name for name, meta in all_tables.items()
                   if not (meta or {}).get("is_view") and name in entries
                   and _relation_candidates(entries[name].notes)]
-    return sorted(candidates, key=lambda n: (-usage.get(n, 0), order[n]))[:PROFILE_DEFAULT_TABLES]
+    # 还有待核实（推断）关系的表排在前面：剖析就是来核实它们的；关系都核实过、人工确认过的再剖析只是补覆盖率。
+    # 同样待核实的按使用次数，再按表结构顺序。返回全部候选，空表由 _skip_empty 估过行数再跳过
+    return sorted(candidates, key=lambda n: (not _pending(entries[n].notes), -usage.get(n, 0), order[n]))
+
+
+def _pending(notes: dict[str, Any] | None) -> bool:
+    """这张表还有没有待核实的关系：要核对的关系里有还是推断（proposed）的。"""
+    return any(r.get("status") == "proposed" for r in _relation_candidates(notes))
+
+
+async def _skip_empty(cx: _Context, candidates: list[str], report: ProfileReport) -> list[TableProfile]:
+    """不指定表时：按顺序估候选表的行数，确知是空表的跳过（记进 report.empty_tables），凑够 PROFILE_DEFAULT_TABLES
+    张为止。以前不估，所有表使用次数都是 0 时按表结构顺序取前 10 张，结果大半是空表、一条关系都核实不了。
+
+    估行数的查询算进这张表的查询数，行数留在 cx.sizes 里，剖析时不再查。最多估 PROFILE_PROBE_TABLES 张、最多用掉
+    查询次数上限的一半；超过了、或者整次剖析已经停下，剩下的候选不估、照顺序排上（真是空表的，剖析时各项检查会
+    记下「空表，无法剖析」）。
+    """
+    picked: list[TableProfile] = []
+    probed = 0
+    for name in candidates:
+        if len(picked) >= PROFILE_DEFAULT_TABLES:
+            break
+        result = TableProfile(table=name)
+        if (cx.run.stopped is None and probed < PROFILE_PROBE_TABLES
+                and cx.run.used < cx.settings.max_queries // 2):
+            probed += 1
+            before = cx.run.used
+            try:
+                size = await cx.size(name, result)
+            except _Stop:
+                size = None
+            result.queries = cx.run.used - before
+            if size is not None and size.rows == 0:
+                report.empty_tables.append(name)
+                continue
+        picked.append(result)
+    return picked
 
 
 async def profile_catalog(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None = None,
@@ -1200,8 +1241,10 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
                   tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
                   masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))})
     entries = await catalog.read_catalog(session, source.id)
-    for table in await _pick_tables(session, source, tables, entries, report):
-        result = TableProfile(table=table)
+    picked = await _pick_tables(session, source, tables, entries, report)
+    results = [TableProfile(table=t) for t in picked] if tables else await _skip_empty(cx, picked, report)
+    for result in results:
+        table = result.table
         report.tables.append(result)
         if run.stopped:
             detail = _STOP_DETAIL[run.stopped].format(max_queries=settings.max_queries,
@@ -1211,7 +1254,7 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
         before = run.used
         entry = entries.get(table)
         out = await _profile_table(cx, table, entry.notes if entry else {}, result)
-        result.queries = run.used - before
+        result.queries += run.used - before
         await _write(session, source.id, table, out, result, at=at, actor=actor)
     report.queries_used = run.used
     report.stopped = run.stopped
@@ -1221,6 +1264,6 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
 
 
 __all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
-           "PROFILE_OPTION", "ProfileBusy", "ProfileDisabled", "ProfileReport", "ProfileSettings", "ProfileSkip",
-           "SqlDialect", "TableProfile", "TableSize", "ensure_enabled", "estimate_size", "profile_catalog",
-           "profile_settings", "profile_settings_problem", "sql_literal"]
+           "PROFILE_OPTION", "PROFILE_PROBE_TABLES", "ProfileBusy", "ProfileDisabled", "ProfileReport",
+           "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "ensure_enabled",
+           "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem", "sql_literal"]

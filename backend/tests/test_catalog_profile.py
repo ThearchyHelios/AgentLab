@@ -431,6 +431,69 @@ async def test_default_tables_are_used_tables_with_relation_candidates(client, m
     assert "parks" not in names and "channels" not in names          # 没有待核实关系的表不选
 
 
+async def _candidates(sid: str) -> tuple[list[str], set[str]]:
+    """默认挑表的候选（目录里有要核对的关系的表，按表结构顺序）和其中还有待核实（推断）关系的那些。"""
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        entries = await catalog.read_catalog(session, sid)
+    order = list((row.schema_cache or {}).get("tables") or {})
+    rels = {name: catalog_profile._relation_candidates(entries[name].notes) for name in order if name in entries}
+    names = [name for name in order if rels.get(name)]
+    return names, {name for name in names if any(r["status"] == "proposed" for r in rels[name])}
+
+
+async def test_default_pick_skips_empty_tables_and_prefers_pending_relations(client, make_source, tmp_path,
+                                                                           monkeypatch):
+    """B1：表都没被运行查询过（使用次数都是 0）时，以前按表结构顺序取前几张，结果大半是空表（景区库里排在前面的
+    候选表正好多数没有数据）。现在跳过行数估计为 0 的表（记在 empty_tables 里），并且先挑还有待核实关系的表，
+    不把刚核实过的再剖析一遍。默认张数调成 3，好在一个小库上看出先后。"""
+    monkeypatch.setattr(catalog_profile, "PROFILE_DEFAULT_TABLES", 3)
+    path = scenic.build(tmp_path / "b1.db")
+    db = sqlite3.connect(path)
+    try:
+        tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY rowid")]
+        empty = {t for t in tables if db.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] == 0}
+    finally:
+        db.close()
+    sid = await make_source(str(path), options=_on(), draft=tables)
+    names, pending = await _candidates(sid)
+    full = [name for name in names if name not in empty]
+    # 前提：按表结构顺序的前 3 张候选里有空表（以前就会挑中它们），有数据、还待核实的候选不止 6 张
+    assert set(names[:3]) & empty
+    assert len([name for name in full if name in pending]) >= 6
+
+    first = (await client.post(_url(sid), json={}, headers=ACTOR)).json()
+    picked = [t["table_name"] for t in first["tables"]]
+    assert len(picked) == 3 and not set(picked) & empty, picked
+    assert first["empty_tables"] and set(first["empty_tables"]) <= empty
+    assert all(t["queries"] > 0 for t in first["tables"])
+    assert first["queries_used"] >= sum(t["queries"] for t in first["tables"]) + len(first["empty_tables"])
+
+    # 第二次：先挑还有待核实关系的表；第一次核实过的（关系都升为有确证了）排到后面，这次挑不到
+    names, pending = await _candidates(sid)
+    assert not set(picked) & pending                         # 第一次挑的三张，关系都核实了
+    second = (await client.post(_url(sid), json={}, headers=ACTOR)).json()
+    again = [t["table_name"] for t in second["tables"]]
+    assert len(again) == 3 and all(name in pending for name in again), (again, pending)
+    assert not set(again) & set(picked) and not set(again) & empty
+
+
+async def test_profile_note_when_every_candidate_is_empty(client, make_source, tmp_path):
+    path = scenic.build(tmp_path / "b1-empty.db")
+    sid = await make_source(str(path), options=_on(), draft=[])
+    names, _ = await _candidates(sid)
+    db = sqlite3.connect(path)
+    try:
+        for name in names:
+            db.execute(f'DELETE FROM "{name}"')
+        db.commit()
+    finally:
+        db.close()
+    body = (await client.post(_url(sid), json={}, headers=ACTOR)).json()
+    assert body["tables"] == [] and set(body["empty_tables"]) == set(names)
+    assert "空表" in body["note"]
+
+
 async def test_unknown_table_and_missing_source(client, make_source, scenic_db):
     sid = await make_source(scenic_db, options=_on(), draft=["visits"])
     r = await client.post(_url(sid), json={"tables": ["nope"]}, headers=ACTOR)

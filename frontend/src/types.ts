@@ -2943,6 +2943,11 @@ export interface CatalogProfileOut {
   stopped: CatalogProfileStop | null
   tables: CatalogProfileTable[]
   total: { added: number; updated: number; removed: number }
+  /**
+   * 不指定表时，挑表途中估过行数、确知是空表而跳过的表（老后端没有这个键；指定了表时是空列表）。
+   * 估行数的查询算在 queries_used 里，不算在各表的 queries 里
+   */
+  empty_tables?: string[]
   /** 一张表都没有剖析时的说明 */
   note: string | null
 }

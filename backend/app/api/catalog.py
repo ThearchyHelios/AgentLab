@@ -292,7 +292,10 @@ async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
         raise HTTPException(409, str(e)) from e
     rows = [_profile_table_out(t) for t in report.tables]
     note = None
-    if not rows:
+    if not rows and report.empty_tables:
+        note = (f"有待核对关联关系的 {len(report.empty_tables)} 张表都是空表，没有可以核实的数据。"
+                "请在数据有了之后再剖析，或指定要剖析的表")
+    elif not rows:
         note = "目录里还没有待核实的关联关系，请先起草数据目录，或指定要剖析的表"
     return {
         "profiled_at": report.profiled_at,
@@ -302,6 +305,8 @@ async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
         "stopped": report.stopped,
         "tables": rows,
         "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},
+        # 不指定表时挑表途中确知是空表、跳过了的表（指定了表时总是空列表）
+        "empty_tables": report.empty_tables,
         "note": note,
     }
 
