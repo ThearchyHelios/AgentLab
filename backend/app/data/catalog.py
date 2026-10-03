@@ -717,8 +717,11 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
       inferable 是表结构能推出来的关系编号（外键约束、命名推断，structure_relation_ids）：人工改过基数的外键关系
       记成了人工填写，删掉照样会被现推回来，也只能驳回。
     - 关系编号按两端重算（_normalize_submitted）。
+    - 值改过、新填的文字项看起来像计算公式（「客单价=金额/人数」）就整份不收，和对话提案同一套判断（_formula_like）：
+      公式进口径卡。只查改动过的项：库里早就有的含公式的项值没动，照常提交——不放进 validate_notes 也是这个
+      道理，否则旧数据会把这张表的任何写入都挡住。
 
-    结构不合规抛 CatalogInvalid。
+    结构不合规、有公式都抛 CatalogInvalid。
     """
     if not isinstance(submitted, Mapping):
         raise CatalogInvalid(["数据目录应为对象"])
@@ -727,6 +730,11 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
         raise CatalogInvalid(problems)
     at = at or now_iso()
     old, new = _slots(existing), _slots(normalized)
+    formulas = [_formula_problem(key) for key, item in new.items()
+                if (key not in old or _value_of(key, item) != _value_of(key, old[key]))
+                and _formula_like(key, item.get("value"))]
+    if formulas:
+        raise CatalogInvalid(formulas)
     inferable = set(inferable)
     out: dict[Slot, dict[str, Any]] = {}
     for key, item in new.items():
@@ -810,7 +818,9 @@ NEW_RELATION_PATH = "relations.new"
 PATCH_MAX_CHANGES = 20
 _REASON_MAX = 500
 #: 看起来像计算公式的文字：「转化率=下单数/访问数」「= SUM(amount)」。公式进口径卡，目录只记数据事实。
-#: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它
+#: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它。
+#: 对话提案（plan_patch）、人工整份提交（apply_human_edit，只查改动过的项）、模型起草（_from_model，丢掉这一项）
+#: 三条路径都用它；不放进 validate_notes——库里已有的含公式的项会把那张表的任何写入都挡住
 _FORMULA = re.compile(r"[=＝][^=<>!]*?[+*/×÷]|\b(?:sum|count|avg|average)\s*\(", re.IGNORECASE)
 _FORMULA_CHECKED = frozenset({("t", "label"), ("t", "description"), ("t", "grain"), ("c", "label"),
                               ("c", "meaning"), ("c", "unit"), ("c", "codes")})
@@ -866,6 +876,10 @@ def _formula_like(key: Slot, value: Any) -> bool:
         return False
     texts = list(value.values()) if isinstance(value, dict) else [value]
     return any(isinstance(t, str) and _FORMULA.search(t) for t in texts)
+
+
+def _formula_problem(key: Slot) -> str:
+    return f"{describe_slot(key)}看起来是计算公式：公式请写进口径卡，数据目录只记数据事实"
 
 
 def _patch_relation(table: str, raw: Any, path_id: str | None, tables: Mapping[str, Any] | None,
@@ -1014,7 +1028,7 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
                 problems.append(f"{where}{hint}")
                 continue
         if _formula_like(key, value):
-            problems.append(f"{where}看起来是计算公式：公式请写进口径卡，数据目录只记数据事实")
+            problems.append(_formula_problem(key))
             continue
         norm = f"relations.{key[1]}" if key[0] == "r" else path
         if norm in seen:
@@ -1580,14 +1594,15 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
 
 def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
-    表类型和度量类型不在取值里的、业务主键里有不存在的列的。导入表格的源，说明已经覆盖的字段也丢掉。"""
+    表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
+    导入表格的源，说明已经覆盖的字段也丢掉。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
     for name in ("label", "grain"):
         if name == "grain" and table_has_system_note:
             continue
-        if (text := _clean_text(entry.get(name))) is not None:
+        if (text := _clean_text(entry.get(name))) is not None and not _formula_like(("t", name), text):
             notes[name] = make_item(text, "llm")
     if entry.get("kind") in TABLE_KINDS:
         notes["kind"] = make_item(entry["kind"], "llm")
@@ -1611,7 +1626,8 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
         for field_name, limit in (("label", _TEXT_MAX), ("meaning", _TEXT_MAX), ("unit", 50)):
             if has_system_note and field_name in ("meaning", "unit"):
                 continue
-            if (text := _clean_text(col.get(field_name), limit)) is not None:
+            text = _clean_text(col.get(field_name), limit)
+            if text is not None and not _formula_like(("c", name, field_name), text):
                 items[field_name] = make_item(text, "llm")
         if col.get("measure") in COLUMN_MEASURES:
             items["measure"] = make_item(col["measure"], "llm")

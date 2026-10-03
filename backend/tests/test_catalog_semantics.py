@@ -394,3 +394,50 @@ def test_merge_ignores_a_profile_note_that_only_changed_its_date():
     assert stats.updated == 1 and "2026-10-02" in merged["columns"]["status"]["codes"]["note"]
 
 
+# ==========================================================================
+# B3：公式在人工编辑、模型起草两条路径上也拦下
+# ==========================================================================
+
+
+def test_human_edit_rejects_formulas_in_changed_text():
+    existing = {"columns": {"amount": {"label": catalog.make_item("实收金额", "llm")}}}
+    for submitted in (
+        {"columns": {"amount": {"label": catalog.make_item("实收金额", "llm"),
+                                "meaning": {"value": "客单价=金额/人数"}}}},
+        {"description": {"value": "转化率 = 下单数 / 访问数"}},
+        {"columns": {"amount": {"label": {"value": "SUM(amount)"}}}},
+    ):
+        with pytest.raises(catalog.CatalogInvalid) as e:
+            catalog.apply_human_edit(existing, submitted, table="orders", at=AT)
+        assert "口径卡" in str(e.value)
+    # 库里早就有的含公式的项，值没动就照常提交：不能因为旧数据挡住这张表的任何写入
+    legacy = {"columns": {"amount": {"meaning": catalog.make_item("客单价=金额/人数", "llm")}}}
+    out = catalog.apply_human_edit(legacy, {**legacy, "label": {"value": "订单"}}, table="orders", at=AT)
+    assert out["columns"]["amount"]["meaning"]["value"] == "客单价=金额/人数"
+    assert catalog.validate_notes(legacy) == []           # 结构校验不查公式
+
+
+async def test_put_with_a_formula_is_422_and_says_where_formulas_go(client, make_source, scenic_db):
+    sid = await make_source(scenic_db, draft=["orders"])
+    detail = await _notes(client, sid, "orders")
+    notes = {**detail["notes"], "columns": {"total_amount": {"meaning": {"value": "客单价=金额/人数"}}}}
+    r = await _put(client, sid, "orders", notes, detail["version"])
+    assert r.status_code == 422 and "口径卡" in r.json()["detail"]
+    assert (await _notes(client, sid, "orders"))["version"] == detail["version"]
+
+
+async def test_model_draft_drops_formula_items():
+    from types import SimpleNamespace
+
+    meta = {"qualified": "orders", "columns": [{"name": "id", "type": "INTEGER"},
+                                               {"name": "total_amount", "type": "REAL"}],
+            "primary_key": ["id"], "foreign_keys": []}
+    source = SimpleNamespace(id="src", name="shop", kind="sqlite", origin="manual",
+                             schema_cache={"tables": {"orders": meta}})
+    model = FakeModel({"orders": {"label": "客单价=金额/人数", "grain": "每笔订单一行", "columns": [
+        {"name": "total_amount", "label": "订单金额", "meaning": "= SUM(明细金额)", "unit": "元"}]}})
+    notes = (await catalog.draft_with_model(model, source, ["orders"]))["orders"].notes
+    assert "label" not in notes and notes["grain"]["value"] == "每笔订单一行"
+    assert set(notes["columns"]["total_amount"]) == {"label", "unit"}
+
+
