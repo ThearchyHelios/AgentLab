@@ -510,6 +510,30 @@ def _core(item: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k != "updated_at"}
 
 
+#: 数据剖析写的备注都以「数据剖析（日期）：」开头（data/catalog_profile.py 的 NOTE_PREFIX 就是它）
+PROFILE_NOTE_PREFIX = "数据剖析（"
+_PROFILE_NOTE_DAY = re.compile(r"^数据剖析（\d{4}-\d{2}-\d{2}）")
+
+
+def same_profile_note(a: Any, b: Any) -> bool:
+    """两段备注是否相同；数据剖析写的备注只有开头的日期不同，也算相同。
+
+    剖析每次都把当天的日期写进备注。隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就
+    升一个版本，发布时记下的目录版本对不上，之后每次正式运行都提醒「目录有变化」。
+    """
+    if a == b:
+        return True
+    if not (isinstance(a, str) and isinstance(b, str) and _PROFILE_NOTE_DAY.match(a) and _PROFILE_NOTE_DAY.match(b)):
+        return False
+    return _PROFILE_NOTE_DAY.sub("", a, count=1) == _PROFILE_NOTE_DAY.sub("", b, count=1)
+
+
+def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """两项除修改时间外相同（剖析备注里的日期不算，same_profile_note）。"""
+    ca, cb = _core(a), _core(b)
+    return same_profile_note(ca.pop("note", None), cb.pop("note", None)) and ca == cb
+
+
 def visible_notes(notes: Mapping[str, Any] | None) -> dict[str, Any]:
     """去掉被驳回的项和关系。给模型看、冻结进证据、将来的检查都只用这一份。"""
     return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") != "rejected"})
@@ -554,7 +578,7 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
     - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
     - 起草结果里没有这一项：已有项的来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。
       外键约束被删掉以后，原来那条「有确证」的关系不能还挂着；而这一轮没调模型，就不能因此删掉模型起草的项。
-    - 同一来源：值或状态有变化就更新。
+    - 同一来源：值或状态有变化就更新。数据剖析写的备注只是日期变了不算变化（same_profile_note），保留旧的项。
     - 不同来源：来源更可信的（_SOURCE_RANK）顶掉不如它的，反过来不行。
 
     新增和更新的项盖上 at（缺省为当前时间）作为 updated_at；内容没变的项保持原样，修改时间也不动。
@@ -575,7 +599,7 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
                 out[key] = item
         elif (cand.get("source") == item.get("source")
               or _SOURCE_RANK.get(cand.get("source"), 0) > _SOURCE_RANK.get(item.get("source"), 0)):
-            if _core(cand) != _core(item):
+            if not _same_core(cand, item):
                 out[key] = {**_core(cand), "updated_at": at}
                 updated += 1
             else:
@@ -2107,7 +2131,8 @@ __all__ = [
     "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_VERIFY_COVERAGE", "PatchChange", "PatchPlan",
+    "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE",
+    "PatchChange", "PatchPlan",
     "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL", "TABLE_KINDS", "TableDraft",
     "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit", "apply_patch", "codes_complete",
     "describe_slot",

@@ -443,8 +443,9 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
 PROFILE_DEFAULT_TABLES = 10
 #: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
 IN_CHUNK = 1000
-#: 剖析写的备注都以它开头：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的
-NOTE_PREFIX = "数据剖析（"
+#: 剖析写的备注都以它开头：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的。开头接着剖析的日期，
+#: 比较「结论变没变」时日期不算（catalog.same_profile_note）
+NOTE_PREFIX = catalog.PROFILE_NOTE_PREFIX
 #: 整次剖析停下的原因 → 剩下没查的项的说明
 _STOP_DETAIL = {
     "budget": "本次剖析的查询次数已用完（上限 {max_queries} 条），未检查",
@@ -958,7 +959,7 @@ def _codes_finding(c: _CodesOutcome, value: dict[str, str]) -> dict[str, Any]:
 
 def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     """人工确认过的关系只补覆盖率和基数：覆盖率是测量值，照新的写；基数只在原来没有时补，不改人定的；
-    备注只在原来为空、或者是剖析自己写的时候换成新的。状态、来源不动。返回改没改。"""
+    备注只在原来为空、或者是剖析自己写的时候换成新的（只是日期变了不换）。状态、来源不动。返回改没改。"""
     changed = False
     if rel.get("coverage") != o.coverage:
         rel["coverage"] = o.coverage
@@ -967,7 +968,7 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
         rel["cardinality"] = o.cardinality
         changed = True
     note = rel.get("note")
-    if (not note or str(note).startswith(NOTE_PREFIX)) and note != o.note:
+    if (not note or str(note).startswith(NOTE_PREFIX)) and not catalog.same_profile_note(note, o.note):
         rel["note"] = o.note
         changed = True
     if changed:

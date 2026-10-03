@@ -342,3 +342,55 @@ async def test_profile_marks_codes_complete_only_when_the_whole_table_was_read(c
     assert "按前 10 行统计" in codes["note"] and "complete" not in codes
 
 
+# ==========================================================================
+# B2：隔天重新剖析、数据没变，不升版本
+# ==========================================================================
+
+
+async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, make_source, tmp_path, monkeypatch):
+    path = scenic.build(tmp_path / "b2.db")
+    sid = await make_source(path, options=_on(), draft=["visits"])
+    # 人工确认过的关系：剖析只补覆盖率和基数、换自己的备注，同样不能因为日期变了就改
+    detail = await _notes(client, sid, "visits")
+    gate = _relation(detail["notes"], "gate_id")
+    r = await client.post(f"/api/datasources/{sid}/catalog/visits/review",
+                          json={"path": f"relations.{gate['id']}", "action": "confirm", "if_version": detail["version"]})
+    assert r.status_code == 200, r.text
+
+    monkeypatch.setattr(catalog, "now_iso", lambda: DAY1)
+    first = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    notes_day1 = (await _notes(client, sid, "visits"))["notes"]
+    monkeypatch.setattr(catalog, "now_iso", lambda: DAY2)
+    second = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    assert (second["added"], second["updated"], second["removed"]) == (0, 0, 0)
+    assert second["version"] == first["version"]
+    assert (await _notes(client, sid, "visits"))["notes"] == notes_day1        # 备注里还是第一天的日期
+
+    # 数据变了（多了一种状态），结论跟着变：照常升版本
+    db = sqlite3.connect(path)
+    try:
+        db.execute("INSERT INTO visits VALUES (1501, 'TK9001501', 1, 1, 1, NULL, '2026-09-30 10:00:00', 1, 2)")
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setattr(catalog, "now_iso", lambda: DAY3)
+    third = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    assert third["version"] == second["version"] + 1 and third["updated"] >= 1
+    codes = (await _notes(client, sid, "visits"))["notes"]["columns"]["status"]["codes"]
+    assert set(codes["value"]) == {"0", "1", "2"} and "2026-10-03" in codes["note"]
+
+
+def test_merge_ignores_a_profile_note_that_only_changed_its_date():
+    old = {"columns": {"status": {"codes": catalog.make_item(
+        {"1": "", "0": ""}, "profile", "proposed", note="数据剖析（2026-10-01）：统计全表，1500 行非空值共 2 个取值。",
+        at=DAY1)}}}
+    same = {"columns": {"status": {"codes": catalog.make_item(
+        {"1": "", "0": ""}, "profile", "proposed", note="数据剖析（2026-10-02）：统计全表，1500 行非空值共 2 个取值。")}}}
+    merged, stats = catalog.merge_notes(old, same, covered={"profile"}, at=DAY2)
+    assert merged == old and stats == catalog.MergeStats()
+    changed = {"columns": {"status": {"codes": catalog.make_item(
+        {"1": "", "0": ""}, "profile", "proposed", note="数据剖析（2026-10-02）：统计全表，1600 行非空值共 2 个取值。")}}}
+    merged, stats = catalog.merge_notes(old, changed, covered={"profile"}, at=DAY2)
+    assert stats.updated == 1 and "2026-10-02" in merged["columns"]["status"]["codes"]["note"]
+
+
