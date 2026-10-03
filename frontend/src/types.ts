@@ -2739,3 +2739,34 @@ export interface CatalogPatchPreview {
   /** 不合法的项的说明（目录刚被改过、列已删除……） */
   problems: string[]
 }
+
+/** 影响面里模板的一个节点（服务端 catalog_impact.template_refs） */
+export interface CatalogImpactNode {
+  node_id: string
+  label: string
+  type: string
+  /** direct：SQL 里写着这张表；possible：Agent 运行时自己写 SQL，可能用到 */
+  impact: 'direct' | 'possible'
+  /** 合并查询：经由哪些输入（别名 → 节点） */
+  via?: { node_id: string; label: string; alias: string }[]
+  /** 协作节点：绑定了查询工具的成员 */
+  member?: string
+}
+
+/** 引用这张表的一个已发布或受管模板（按它当前的已发布版本算） */
+export interface CatalogImpactTemplate {
+  workflow_id: string
+  name: string
+  /** 当前的已发布版本 */
+  version: number
+  level: 'published' | 'governed'
+  impact: 'direct' | 'possible'
+  nodes: CatalogImpactNode[]
+}
+
+/** GET /datasources/{id}/catalog/{table}/impact */
+export interface CatalogImpact {
+  table: string
+  /** 直接引用的在前 */
+  templates: CatalogImpactTemplate[]
+}

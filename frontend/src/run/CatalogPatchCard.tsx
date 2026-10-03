@@ -4,6 +4,7 @@ import { BookMarked, Check, ExternalLink, RotateCw } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
 import { Notice, Spinner, toast } from '../components/ui'
+import { CatalogImpactList } from '../components/CatalogImpact'
 import { CATALOG_PATCH_TEXT as T, CATALOG_STATUS_LABEL } from '../lib/terms'
 import type { CatalogPatchChange } from '../types'
 import {
@@ -15,7 +16,7 @@ import {
 // 改后和理由，人点「保存到数据目录」才写入——服务端从不自动写。
 //
 // 保存带着提案对照的版本：别人在这之后改过这张表就 409，卡片写明「这张表刚被修改过」，「重新载入」按最新的
-// 目录重算改前和改后（预览接口，只读），人看过再保存。保存成功后给到数据目录那张表的入口。
+// 目录重算改前和改后（预览接口，只读），人看过再保存。保存成功后列出受影响的模板（影响面），给到数据目录那张表的入口。
 //
 // 卡片的结局（已保存、已忽略、重新载入后的内容）记在模块级的表里：画布右栏在对话层和运行层之间切换会卸载
 // 卡片，回来时不能又变回「未保存」，再点一次只会撞上 409。
@@ -151,6 +152,7 @@ export function CatalogPatchCard({ patch, turnId, dense = false }: {
                     {T.open} <ExternalLink size={10} aria-hidden />
                   </Link>
                 </p>
+                {saved && <CatalogImpactList sourceId={patch.sourceId} table={patch.table} compact />}
               </div>
             )
             : (

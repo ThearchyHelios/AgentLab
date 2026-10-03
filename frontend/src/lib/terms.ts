@@ -2187,3 +2187,27 @@ export const CATALOG_PATCH_TEXT = {
   whereRelationNew: (to: string) => `新增指向 ${to} 的关联关系`,
   sourceOf: (source: string) => `数据源「${source}」`,
 }
+
+/**
+ * 影响面：哪些已发布、受管的模板引用这张表。按每个模板当前的已发布版本统计（正式运行用的是它）。
+ * 「直接引用」：查询的 SQL 里写着这张表；「可能涉及」：Agent 绑定了这个数据源的查询工具，SQL 运行时才生成。
+ */
+export const CATALOG_IMPACT_TEXT = {
+  title: '引用这张表的模板',
+  hint: '按每个模板当前的已发布版本统计',
+  none: '没有已发布或受管的模板引用这张表',
+  count: (n: number) => `${formatNumber(n)} 个模板`,
+  impact: { direct: '直接引用', possible: '可能涉及' } as Record<'direct' | 'possible', string>,
+  impactHint: {
+    direct: '查询的 SQL 中写着这张表',
+    possible: 'Agent 绑定了这个数据源的查询工具，SQL 在运行时生成，可能用到这张表',
+  } as Record<'direct' | 'possible', string>,
+  version: (v: number) => `v${v}`,
+  via: (labels: string) => `经由输入${labels}`,
+  member: (name: string) => `成员「${name}」`,
+  afterSave: (n: number) => `${formatNumber(n)} 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化：`,
+  afterSaveNone: '没有已发布或受管的模板引用这张表',
+  more: (n: number) => `另有 ${formatNumber(n)} 个`,
+  error: '无法统计引用这张表的模板',
+  retry: '重试',
+}

@@ -1,5 +1,5 @@
 import type {
-  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogList, CatalogNotes,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogImpact, CatalogList, CatalogNotes,
   CatalogPatchPreview, CatalogPatchSubmit, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
@@ -669,6 +669,9 @@ export const api = {
     /** 单项审阅。path：表级项写字段名（grain）；列级项 columns.<列名>.<字段>；关系 relations.<编号> */
     review: (sourceId: string, table: string, body: { path: string; action: CatalogReviewAction; if_version: number }) =>
       post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/review`, body),
+    /** 影响面：引用这张表的已发布、受管模板（直接引用 / 可能涉及，合并查询按输入追溯） */
+    impact: (sourceId: string, table: string, opts?: RequestOptions) =>
+      get<CatalogImpact>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/impact`, opts),
     /** 目录修改提案的预览：对着当前目录重算改前、改后，不写库（保存遇到 409 后重新载入用） */
     patchPreview: (sourceId: string, table: string, changes: CatalogPatchSubmit[]) =>
       post<CatalogPatchPreview>(

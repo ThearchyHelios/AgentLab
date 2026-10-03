@@ -795,7 +795,12 @@ await section('建议更新数据目录：卡片的保存、忽略和 409（cata
     return route.fulfill({ json: detail(5) })
   })
   await c.page.route('**/api/datasources/src-scenic/catalog/visits/impact', (route) =>
-    route.fulfill({ json: { table: 'visits', templates: [] } }))
+    route.fulfill({ json: { table: 'visits', templates: [
+      { workflow_id: 'wf-daily', name: '入园日报', version: 4, level: 'governed', impact: 'direct',
+        nodes: [{ node_id: 'q', label: '查询入园人数', type: 'tool', impact: 'direct' }] },
+      { workflow_id: 'wf-ask', name: '客流分析', version: 2, level: 'published', impact: 'possible',
+        nodes: [{ node_id: 'ask', label: '分析客流', type: 'agent', impact: 'possible' }] },
+    ] } }))
   const card = c.page.locator('[data-catalog-patch="visits"]')
   check('卡片在：标题写「建议更新数据目录」', await card.count() === 1 && (await card.innerText()).includes('建议更新数据目录'))
   const codes = card.locator('[data-patch-change="columns.status.codes"]')
@@ -830,6 +835,10 @@ await section('建议更新数据目录：卡片的保存、忽略和 409（cata
   check('保存成功：写明第几版，给到数据目录的入口', (await card.locator('[data-patch-done]').innerText()).includes('已保存到数据目录（第 5 版）')
     && (await card.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-scenic/visits')
   check('保存后不再有保存按钮', await card.locator('[data-patch-save]').count() === 0)
+  await card.locator('[data-catalog-impact="2"]').waitFor({ timeout: 3000 })
+  const impact = await card.locator('[data-catalog-impact]').innerText()
+  check('保存后列出受影响的模板：直接引用、可能涉及', impact.includes('2 个已发布模板引用这张表') && impact.includes('入园日报')
+    && impact.includes('直接引用') && impact.includes('可能涉及'), impact.replace(/\s+/g, ' '))
   check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
   await c.page.close()
 

@@ -395,6 +395,11 @@ function catalogHandlers(state, replies = {}) {
       json({ tables: state.tables[parts(key)[2]].filter((t) => !t.missing).map((t) => t.name), summary: '', synced_at: T0 })(route)],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft$/, reply('draft', draftReply(state))],
+    // 影响面：引用这张表的已发布、受管模板（只读）。没配的表答空
+    [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/[^/]+\/impact$/, reply('impact', (route, { key }) => {
+      const name = parts(key)[4]
+      return json({ table: name, templates: state.impact?.[name] ?? [] })(route)
+    })],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/[^/]+$/, reply('get', (route, { key }) => {
       const { src, t } = findTable(state, key)
       return t ? json(detailOf(src, t))(route) : json({ detail: `数据源中没有表 ${parts(key)[4]}，可能已被删除或尚未探查结构` }, 404)(route)
@@ -772,6 +777,49 @@ await section('数据目录 · 表详情与单项审阅', async () => {
   check('只发了审阅请求，没有别的写请求', writes(sent, /./).every((s) => /\/review$/.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 引用这张表的模板（影响面）', async () => {
+  const state = freshState()
+  state.impact = {
+    visits: [
+      { workflow_id: 'wf-daily', name: '入园日报', version: 4, level: 'governed', impact: 'direct', nodes: [
+        { node_id: 'q', label: '查询入园人数', type: 'tool', impact: 'direct' },
+        { node_id: 'm', label: '合并入园和订单', type: 'merge', impact: 'direct', via: [{ node_id: 'q', label: '查询入园人数', alias: 'v' }] },
+      ] },
+      { workflow_id: 'wf-ask', name: '客流分析', version: 2, level: 'published', impact: 'possible', nodes: [
+        { node_id: 'ask', label: '分析客流', type: 'agent', impact: 'possible' },
+      ] },
+    ],
+  }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await openDetail(page, S1, 'visits')
+  const sec = page.locator('[data-catalog-section="impact"]')
+  await sec.locator('[data-catalog-impact="2"]').waitFor({ timeout: 3000 })
+  const text = await sec.innerText()
+  check('表详情有「引用这张表的模板」一栏，写明按已发布版本统计', text.includes('引用这张表的模板') && text.includes('按每个模板当前的已发布版本统计'))
+  const daily = sec.locator('[data-impact-template="wf-daily"]')
+  check('直接引用：模板名、版本、受管、「直接引用」', ['入园日报', 'v4', '受管', '直接引用'].every((x) => text.includes(x))
+    && await daily.getAttribute('data-impact-level') === 'direct')
+  check('合并查询写明经由哪个输入', (await daily.locator('[data-impact-node="m"]').innerText()).includes('经由输入「查询入园人数」'))
+  check('Agent 写「可能涉及」，悬停说明原因', (await sec.locator('[data-impact-template="wf-ask"] [data-impact="possible"]').getAttribute('title')).includes('运行时生成'))
+  check('模板名点进去是画布，定位到那个节点', (await daily.locator('a').first().getAttribute('href')) === '/studio/wf-daily?focus=q')
+  // 开发模式下 StrictMode 会把挂载时的取数做两遍，只查有没有取、没有写
+  check('统计影响面只读', writes(sent, /impact/).length === 0 && count(sent, /\/visits\/impact$/) >= 1,
+    `${count(sent, /\/visits\/impact$/)} 次`)
+  // 没有模板引用的表：直说没有
+  await openDetail(page, S1, 'orders')
+  check('没有模板引用：直说没有', (await page.locator('[data-catalog-section="impact"] [data-catalog-impact="0"]').innerText())
+    .includes('没有已发布或受管的模板引用这张表'))
+  // 表详情保存之后（版本变了）重新统计
+  const before = count(sent, /\/orders\/impact$/)
+  await page.locator('[data-catalog-edit]').click()
+  await page.locator('[data-input="grain"]').fill('一笔订单一行（检查）')
+  await page.locator('[data-catalog-save]').click()
+  await until(async () => count(sent, /\/orders\/impact$/) > before, 3000)
+  check('保存之后重新统计影响面', count(sent, /\/orders\/impact$/) > before, `${before} → ${count(sent, /\/orders\/impact$/)}`)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await close()
 })
 

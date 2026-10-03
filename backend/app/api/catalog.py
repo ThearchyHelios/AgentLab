@@ -6,6 +6,7 @@
 - POST   /catalog/{table}/review 单项审阅：确认、驳回、撤销审阅
 - POST   /catalog/{table}/patch/preview  目录修改提案的预览（只读）：对着当前目录算改前、改后
 - POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
+- GET    /catalog/{table}/impact 影响面：引用这张表的已发布、受管模板（data/catalog_impact.py）
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
@@ -22,7 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.runs import actor_of
-from app.data import catalog, introspect, table_versions
+from app.data import catalog, catalog_impact, introspect, table_versions
 from app.db.base import get_session
 from app.db.models import DataSource
 
@@ -280,3 +281,15 @@ async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn
     except catalog.CatalogInvalid as e:
         raise _invalid(e) from e
     return await _detail(session, source, key, entry)
+
+
+@router.get("/{source_id}/catalog/{table}/impact")
+async def catalog_table_impact(source_id: str, table: str,
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """引用这张表的已发布、受管模板，每个模板按当前的已发布版本算：调用工具节点的 SQL 用到了这张表算直接引用，
+    Agent 绑定了这个源的查询工具算可能涉及，合并查询按输入追溯。改目录之前、保存纠正之后都看它。"""
+    row, source = await _resolved(session, source_id)
+    key, _ = await _table_key(session, source, table)
+    tables = _tables_of(source)
+    templates = await catalog_impact.table_impact(session, row.name, key, list(tables) if tables else None)
+    return {"table": key, "templates": templates}

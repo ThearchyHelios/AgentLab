@@ -11,9 +11,10 @@ import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confir
 import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber } from '../../lib/format'
 import {
-  CATALOG_CARDINALITY_LABEL, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT, CATALOG_TABLE_FIELD_LABEL,
-  CATALOG_TEXT as CT,
+  CATALOG_CARDINALITY_LABEL, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
+  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT,
 } from '../../lib/terms'
+import { CatalogImpactList } from '../../components/CatalogImpact'
 import { CountBadges, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
 import type { ReviewTarget } from './parts'
 import { ColumnTable, Value } from './ColumnTable'
@@ -381,6 +382,14 @@ export function TableDetail({ sourceId, table, rows, drafted, prev, next, onOpen
               ? <RelationEditor drafts={edit.form.relations} initial={edit.initial.relations} problems={problems} rows={rows}
                                 onChange={setRelations} />
               : <RelationList relations={notes.relations ?? []} busy={!!busy} targetOf={targetOf} onOpen={onOpen} onReview={review} />}
+          </section>
+
+          <section aria-labelledby="catalog-sec-impact" data-catalog-section="impact">
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <h3 id="catalog-sec-impact" className="text-xs font-semibold">{CATALOG_IMPACT_TEXT.title}</h3>
+              <span className="text-2xs text-faint">{CATALOG_IMPACT_TEXT.hint}</span>
+            </div>
+            <CatalogImpactList sourceId={sourceId} table={detail.table_name} refreshKey={detail.version} />
           </section>
         </div>
       </div>
