@@ -1,5 +1,6 @@
 import type {
-  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogList, CatalogNotes,
+  CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
@@ -647,6 +648,34 @@ export const api = {
     /** 清除一次导入的原件（同一份内容的其他导入一并清除，引用它的未完成导入一并放弃）。理由必填 */
     purgeRaw: (sourceId: string, importId: string, body: PurgeRawBody) =>
       post<PurgeRawOut>(`/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/purge-raw`, body),
+  },
+
+  /**
+   * 业务数据目录（每个数据源一份，按表存）。写操作都带读到的版本（if_version，这张表还没有目录时为 0）：别人在这期间
+   * 改过时回 409，detail 是给人看的话（「表「x」的数据目录刚被修改过，请重新载入后再提交」）；格式不对回 422；源或表
+   * 不存在回 404。署名走请求头 X-Actor（request 统一带上）
+   */
+  dataCatalog: {
+    /** 表清单：表结构里的每张表各一行，使用次数多的在前；没有表结构时 tables 为空、schema_note 写明原因 */
+    list: (sourceId: string, opts?: RequestOptions) =>
+      get<CatalogList>(`/datasources/${encodeURIComponent(sourceId)}/catalog`, opts),
+    /** 单表目录连同表结构 */
+    get: (sourceId: string, table: string, opts?: RequestOptions) =>
+      get<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}`, opts),
+    /** 整份提交：值改过的项、新填的项记为人工填写、已确认；提交里没有的项删掉 */
+    put: (sourceId: string, table: string, notes: CatalogNotes, ifVersion: number) =>
+      put<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}`,
+        { notes, if_version: ifVersion }),
+    /** 单项审阅。path：表级项写字段名（grain）；列级项 columns.<列名>.<字段>；关系 relations.<编号> */
+    review: (sourceId: string, table: string, body: { path: string; action: CatalogReviewAction; if_version: number }) =>
+      post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/review`, body),
+    /**
+     * 同步起草（注释、外键、命名推断；use_model 时再请助手的模型起草）。不给 tables 时按使用次数取前 20 张。
+     * 人工确认、驳回过的项不动。没有表结构时回 409
+     */
+    draft: (sourceId: string, body: { tables?: string[]; use_model: boolean }, opts?: RequestOptions) =>
+      request<CatalogDraftOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/draft`,
+        { method: 'POST', body: JSON.stringify(body), ...opts }),
   },
 
   runs: {
