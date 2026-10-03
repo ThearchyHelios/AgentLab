@@ -498,17 +498,34 @@ function Overview({ rows, empty, systemNotes, draft, onOpen }: {
   )
 }
 
-/** 审阅进度：有待确认项 / 没有待确认项 / 没有目录的表各占多少 */
-function ProgressBar({ pending, done, none }: { pending: number; done: number; none: number }) {
-  const total = pending + done + none || 1
-  const seg = (n: number, color: string, label: string) => (n > 0
-    ? <span className="h-full" style={{ width: `${(n / total) * 100}%`, background: color }} title={`${label} ${n}`} />
-    : null)
+/**
+ * 审阅进度：有待确认项 / 没有待确认项 / 没有目录的表各占多少。色段的先后和上面那句话一致（有待确认项在前），
+ * 下面挂图例说明每种颜色。数字已经写在那句话里，色条和图例只给眼睛看，读屏不重复念
+ */
+const PROGRESS: { key: 'pending' | 'done' | 'none'; color: string }[] = [
+  { key: 'pending', color: 'var(--st-waiting)' },
+  { key: 'done', color: 'var(--st-done)' },
+  { key: 'none', color: 'var(--border-strong)' },
+]
+
+function ProgressBar(counts: { pending: number; done: number; none: number }) {
+  const total = counts.pending + counts.done + counts.none || 1
   return (
-    <div className="flex h-1.5 overflow-hidden rounded-full bg-hover" aria-hidden>
-      {seg(done, 'var(--st-done)', CT.filter.done)}
-      {seg(pending, 'var(--st-waiting)', CT.filter.pending)}
-      {seg(none, 'var(--border-strong)', CT.filter.none)}
+    <div aria-hidden>
+      <div className="flex h-1.5 overflow-hidden rounded-full bg-hover" data-catalog-progress={PROGRESS.map((p) => p.key).join(',')}>
+        {PROGRESS.map(({ key, color }) => (counts[key] > 0
+          ? <span key={key} className="h-full" style={{ width: `${(counts[key] / total) * 100}%`, background: color }}
+                  title={`${CT.filter[key]} ${counts[key]}`} data-progress-seg={key} />
+          : null))}
+      </div>
+      <ul className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-faint" data-catalog-progress-legend="">
+        {PROGRESS.map(({ key, color }) => (
+          <li key={key} className="inline-flex items-center gap-1.5" data-legend={key}>
+            <span className="h-2 w-2 shrink-0 rounded-sm" style={{ background: color }} />
+            {CT.filter[key]}
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }

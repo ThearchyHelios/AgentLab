@@ -1174,6 +1174,18 @@ await section('数据目录 · 空状态与导入表格', async () => {
   const ovt = await page.locator('[data-catalog-overview]').innerText()
   check('有目录、没选表时：写审阅进度，给出使用最多、还有推断项的表', ovt.includes('共 152 张表：5 张有待确认项，3 张没有待确认项，144 张没有目录')
         && (await page.locator('[data-catalog-review-next]').getAttribute('data-catalog-review-next')) === 'visits', ovt.replace(/\s+/g, ' ').slice(0, 120))
+  // 进度条的色段和那句话同一个先后（有待确认项、没有待确认项、没有目录），下面有图例说明每种颜色
+  const segs = await page.locator('[data-catalog-overview] [data-progress-seg]').evaluateAll((els) => els.map((e) => e.getAttribute('data-progress-seg')))
+  const legend = await page.locator('[data-catalog-progress-legend] [data-legend]').evaluateAll((els) => els.map((e) => [e.getAttribute('data-legend'), e.innerText.trim()]))
+  check('进度条的色段按「有待确认项、没有待确认项、没有目录」排，和文字的先后一致', segs.join(',') === 'pending,done,none', segs.join(','))
+  check('……下面有图例，先后和文字一致', legend.map(([k]) => k).join(',') === 'pending,done,none'
+    && legend.map(([, t]) => t).join('|') === '有待确认项|没有待确认项|没有目录', JSON.stringify(legend))
+  const swatch = await page.evaluate(() => [...document.querySelectorAll('[data-catalog-progress-legend] [data-legend]')].map((li) => {
+    const key = li.getAttribute('data-legend')
+    const seg = document.querySelector(`[data-progress-seg="${key}"]`)
+    return getComputedStyle(li.querySelector('span')).backgroundColor === (seg ? getComputedStyle(seg).backgroundColor : '')
+  }))
+  check('……图例的色块和色段同色', swatch.length === 3 && swatch.every(Boolean), JSON.stringify(swatch))
 
   // 导入表格的源：说明由系统生成，只读
   await goto(page, `/data/catalog/${S2}`)
