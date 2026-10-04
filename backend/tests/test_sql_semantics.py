@@ -4,11 +4,13 @@
   不同，不能算模板变了）；关键字大小写、空白、注释也不算不同；解析不了的退回逐词规范化，照样认得出只改了字面量
 - facets：表、连接（类型 / 关联进来的表 / ON 条件）、WHERE 合取式、时间条件（列 / 运算符 / 取值）、分组、聚合
   （函数 / 参数 / 去重）、HAVING、取哪几行（各段的 LIMIT / OFFSET / 排序）。别名换成真实表名（条件里套着的子查询、
-  HAVING 里的别名也是）、比较的两边排好顺序；解析不了带 parse_error，不抛
+  HAVING 里的别名也是），CTE、子查询按位置编号、不按起的名字比，条件里的子查询选出来的列名不算；比较的两边排好
+  顺序；解析不了带 parse_error，不抛
 - diff_facets：每处不同一句中文：「A 按支付时间 paid_at 筛时间，B 按下单时间 created_at」「A 排除了
-  is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报
+  is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报，一边多出一个排在
+  前面的 CTE、编号错开了也不报
 
-夹具全是虚构的表：订单 orders、退款 refunds、门店 stores，以及一张中文表「订单」。
+夹具全是虚构的表：订单 orders、退款 refunds、门店 stores、用户 users、付款 payments，以及一张中文表「订单」。
 """
 from __future__ import annotations
 
@@ -433,6 +435,229 @@ def test_a_real_difference_inside_a_subquery_is_still_reported():
     b = "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.referrer_id FROM users u WHERE u.vip = 1)"
     assert texts(a, b) == ["A 按 user_id IN (SELECT id FROM users WHERE vip = 1) 筛选，"
                            "B 按 user_id IN (SELECT referrer_id FROM users WHERE vip = 1) 筛选"]
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    # 条件里的子查询给选出来的列起了名字：IN、标量子查询只看取值，列名不影响口径
+    ("sqlite",
+     "SELECT SUM(o.amount) FROM orders o WHERE o.amount > "
+     "(SELECT AVG(o2.amount) AS avg_amount FROM orders o2 WHERE o2.is_deleted = 0)",
+     "SELECT SUM(amount) FROM orders WHERE amount > (SELECT AVG(amount) FROM orders WHERE is_deleted = 0)"),
+    ("sqlite",
+     "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.id AS uid FROM users u WHERE u.vip = 1)",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT id FROM users WHERE vip = 1)"),
+    # 条件里的子查询从 FROM 里的子查询取数，两边给它起的别名不同
+    ("sqlite",
+     "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT s.user_id FROM "
+     "(SELECT user_id, SUM(amount) AS total FROM payments GROUP BY user_id) s WHERE s.total > 100)",
+     "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT agg.user_id FROM "
+     "(SELECT user_id, SUM(amount) AS total FROM payments GROUP BY user_id) agg WHERE agg.total > 100)"),
+    # CTE 起的名字不同，外层按 CTE 算出来的列筛选
+    ("sqlite",
+     "WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM user_totals WHERE total > 100",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM t WHERE t.total > 100"),
+    # 写成 CTE 还是写成 FROM 里的子查询
+    ("postgres",
+     "WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM user_totals WHERE total > 100",
+     "SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) AS agg "
+     "WHERE agg.total > 100"),
+    # LATERAL 子查询的别名不同：别名挂在 LATERAL 上，不在子查询上
+    ("postgres",
+     "SELECT SUM(o.amount) FROM orders o, LATERAL (SELECT COUNT(*) AS n FROM refunds r WHERE r.order_id = o.id) l "
+     "WHERE l.n > 0",
+     "SELECT SUM(o.amount) FROM orders o CROSS JOIN LATERAL (SELECT COUNT(*) AS n FROM refunds r "
+     "WHERE r.order_id = o.id) AS x WHERE x.n > 0"),
+    # 关联进来的是子查询，两边的别名不同（一边是带反引号的中文别名）
+    ("mysql",
+     "SELECT SUM(o.amount) FROM orders o JOIN (SELECT order_id, COUNT(*) AS n FROM refunds GROUP BY order_id) r "
+     "ON r.order_id = o.id WHERE r.n > 1",
+     "SELECT SUM(o.amount) FROM orders o JOIN (SELECT order_id, COUNT(*) AS n FROM refunds GROUP BY order_id) "
+     "`退款` ON o.id = `退款`.order_id WHERE `退款`.n > 1"),
+    # 条件里的子查询用到 CTE，两边给 CTE 起的名字不同
+    ("sqlite",
+     "WITH vip AS (SELECT id FROM users WHERE grade >= 3) "
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT id FROM vip)",
+     "WITH good_users AS (SELECT id FROM users WHERE grade >= 3) "
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT g.id FROM good_users g)"),
+    # CTE 定义在条件里的子查询里：定义连同子查询整个写进外层的条件，定义上的名字也不算
+    ("postgres",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN "
+     "(WITH t AS (SELECT id FROM users WHERE grade >= 3) SELECT id FROM t)",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN "
+     "(WITH g AS (SELECT id FROM users WHERE grade >= 3) SELECT g.id FROM g)"),
+    # 两个 CTE 定义的先后、起的名字都不同，按用到的先后它们是同一对
+    ("sqlite",
+     "WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id), "
+     "refunded AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
+     "SELECT COUNT(*) FROM paid p JOIN refunded r ON r.user_id = p.user_id WHERE p.total > r.total",
+     "WITH r AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id), "
+     "p AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id) "
+     "SELECT COUNT(*) FROM p JOIN r ON p.user_id = r.user_id WHERE p.total > r.total"),
+    # CTE 定义的先后和用到的先后不一致，另一边又把它们写成了 FROM 里的子查询：按用到的先后编号才对得上
+    ("sqlite",
+     "WITH c AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+     "d AS (SELECT user_id, COUNT(*) AS n FROM refunds GROUP BY user_id), "
+     "a AS (SELECT * FROM c WHERE total > 100), b AS (SELECT * FROM d WHERE n > 1) "
+     "SELECT COUNT(*) FROM b JOIN a ON a.user_id = b.user_id",
+     "SELECT COUNT(*) FROM (SELECT * FROM (SELECT user_id, COUNT(*) AS n FROM refunds GROUP BY user_id) x "
+     "WHERE n > 1) b JOIN (SELECT * FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) y "
+     "WHERE total > 100) a ON a.user_id = b.user_id"),
+    # 同上，两个 CTE 还算出了同名的列、外层拿它们互相比：不写编号的写法分不出是哪个的 total，编号得对得上
+    ("sqlite",
+     "WITH c AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+     "d AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id), "
+     "a AS (SELECT * FROM c), b AS (SELECT * FROM d) "
+     "SELECT COUNT(*) FROM b JOIN a ON a.user_id = b.user_id WHERE a.total > b.total",
+     "SELECT COUNT(*) FROM (SELECT * FROM (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) x) b "
+     "JOIN (SELECT * FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) y) a "
+     "ON a.user_id = b.user_id WHERE a.total > b.total"),
+    # 先用一个 CTE 筛一遍再汇总，还是直接在汇总的 CTE 里筛：里层多一段，不挪动外层那一段的编号
+    ("sqlite",
+     "WITH base AS (SELECT * FROM orders WHERE is_deleted = 0), "
+     "per_user AS (SELECT user_id, SUM(amount) AS total FROM base GROUP BY user_id) "
+     "SELECT COUNT(*) FROM per_user WHERE total > 100",
+     "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM totals WHERE total > 100"),
+])
+def test_names_given_to_derived_tables_are_no_difference(dialect, a, b):
+    """CTE 名、子查询的别名、条件里的子查询选出来的列名都是各自起的（双盲复算的盲算更是）：只因起的名字不同，
+    不算换了口径。"""
+    assert texts(a, b, dialect) == []
+
+
+def test_derived_tables_are_compared_by_position_and_shown_by_name():
+    """派生来源（CTE、FROM 里的子查询）比较用的写法按它在语句里的位置编号，不写名字；给人看的写法照原样写名字。"""
+    a = facets("WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+               "SELECT COUNT(*) FROM user_totals WHERE total > 100")
+    b = facets("SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) agg "
+               "WHERE agg.total > 100")
+    assert a.where[0].key == b.where[0].key
+    assert "user_totals" not in a.where[0].key and "agg" not in b.where[0].key
+    assert (a.where[0].text, a.where[0].full) == ("total > 100", "user_totals.total > 100")
+    assert (b.where[0].text, b.where[0].full) == ("total > 100", "agg.total > 100")
+    joined = facets("SELECT SUM(o.amount) FROM orders o JOIN (SELECT order_id, COUNT(*) AS n FROM refunds "
+                    "GROUP BY order_id) r ON r.order_id = o.id")
+    [join] = joined.joins
+    assert join.table.text == "r" and join.on.text == "orders.id = refunds.order_id"
+
+
+SHIFTED_A = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+             "SELECT COUNT(*) FROM t WHERE total > 100 AND user_id IN (SELECT id FROM users WHERE vip = 1)")
+SHIFTED_B = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+             "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+             "SELECT COUNT(*) FROM vip JOIN t ON t.user_id = vip.id WHERE t.total > 100")
+
+
+def test_a_shifted_derived_number_does_not_split_one_condition_in_two():
+    """编号只看位置：一边多出一个排在前面的 CTE（筛 VIP 用户），后面那个 CTE 的编号就错开了。按编号比不上的再按
+    不写编号的写法一对一地配，同一个条件不会被说成两边各有一个；真正的不同（VIP 用 IN 筛还是关联进来）照报。"""
+    found = diff_facets(facets(SHIFTED_A), facets(SHIFTED_B), labels=("原流程", "盲算"))
+    filters = [d.text for d in found if d.aspect == "filter"]
+    assert filters == ["原流程只保留 user_id IN (SELECT id FROM users WHERE vip = 1) 的行，盲算没有这个条件"]
+    # 错开之后的条件真不同，也照样配成一对说
+    other = SHIFTED_B.replace("t.total > 100", "t.total > 200")
+    filters = [d.text for d in diff_facets(facets(SHIFTED_A), facets(other), labels=("原流程", "盲算"))
+               if d.aspect == "filter"]
+    assert filters[0] == "原流程按 total > 100 筛选，盲算按 total > 200 筛选" and len(filters) == 2
+
+
+@pytest.mark.parametrize("aspect,a,b", [
+    # 时间条件、分组键、聚合、HAVING、取前几行时的排序都是按 CTE 算出来的列
+    ("time",
+     "WITH t AS (SELECT user_id, DATE(paid_at) AS day, amount FROM orders) "
+     "SELECT SUM(amount) FROM t WHERE day >= '2026-09-01' AND user_id IN (SELECT id FROM users WHERE vip = 1)",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "t AS (SELECT user_id, DATE(paid_at) AS day, amount FROM orders) "
+     "SELECT SUM(t.amount) FROM vip JOIN t ON t.user_id = vip.id WHERE t.day >= '2026-09-01'"),
+    ("group_by",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total, COUNT(*) AS n FROM orders GROUP BY user_id) "
+     "SELECT n, COUNT(*) FROM t WHERE user_id IN (SELECT id FROM users WHERE vip = 1) GROUP BY n",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "t AS (SELECT user_id, SUM(amount) AS total, COUNT(*) AS n FROM orders GROUP BY user_id) "
+     "SELECT t.n, COUNT(*) FROM vip JOIN t ON t.user_id = vip.id GROUP BY t.n"),
+    ("aggregate",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT AVG(total) FROM t WHERE user_id IN (SELECT id FROM users WHERE vip = 1)",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT AVG(t.total) FROM vip JOIN t ON t.user_id = vip.id"),
+    ("having",
+     "WITH t AS (SELECT store_id, user_id, SUM(amount) AS total FROM orders GROUP BY store_id, user_id) "
+     "SELECT store_id FROM t WHERE user_id IN (SELECT id FROM users WHERE vip = 1) GROUP BY store_id "
+     "HAVING MAX(total) > 100",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "t AS (SELECT store_id, user_id, SUM(amount) AS total FROM orders GROUP BY store_id, user_id) "
+     "SELECT t.store_id FROM vip JOIN t ON t.user_id = vip.id GROUP BY t.store_id HAVING MAX(t.total) > 100"),
+    ("limit",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT user_id FROM t WHERE user_id IN (SELECT id FROM users WHERE vip = 1) ORDER BY total DESC LIMIT 10",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT t.user_id FROM vip JOIN t ON t.user_id = vip.id ORDER BY t.total DESC LIMIT 10"),
+])
+def test_a_shifted_derived_number_is_no_difference_in_any_aspect(aspect, a, b):
+    """编号错开之后，按 CTE 算出来的列写的时间条件、分组键、聚合、HAVING、排序也不算不同：只剩 VIP 那处真正的
+    不同。"""
+    assert not [x for x in aspects(a, b) if x.startswith(aspect)]
+
+
+def test_a_shifted_number_inside_a_condition_subquery_is_no_difference():
+    """条件里的子查询用到的 CTE 编号错开了：子查询整个写进外层条件的那一份，按不写编号的写法也写「@」，照样配得上。"""
+    a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u WHERE u.vip = 1 AND u.id IN (SELECT user_id FROM t WHERE total > 100)")
+    b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+         "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM vip WHERE vip.id IN (SELECT user_id FROM t WHERE total > 100)")
+    assert texts(a, b) == []
+
+
+def test_a_shifted_derived_join_is_paired_with_its_counterpart():
+    """关联进来的 CTE 编号错开了（盲算多关联了一个排在前面的 CTE）：先把完全一样的关联配掉，再按关联的是哪张表配，
+    不会把原流程的 t 和盲算的 vip 当成同一处关联、说成「关联条件不同」。"""
+    a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN t ON t.user_id = u.id WHERE t.total > 100")
+    b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+         "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN vip ON vip.id = u.id JOIN t ON t.user_id = u.id WHERE t.total > 100")
+    assert texts(a, b, labels=("原流程", "盲算")) == ["盲算只保留 vip = 1 的行，原流程没有这个条件",
+                                                    "盲算关联了 vip 表，原流程没有"]
+
+
+def test_swapped_join_order_of_two_derived_tables_is_no_difference():
+    """两个 CTE 关联的先后对调，编号也跟着对调：拿它们的列互相比的条件，两边先按不写编号的写法排好两边的先后，
+    才配得上（只按编号排，同一个比较会排成两个方向）。"""
+    ctes = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+            "u AS (SELECT user_id, COUNT(*) AS cnt FROM refunds GROUP BY user_id) ")
+    assert texts(ctes + "SELECT COUNT(*) FROM t JOIN u ON u.user_id = t.user_id WHERE t.total > u.cnt",
+                 ctes + "SELECT COUNT(*) FROM u JOIN t ON t.user_id = u.user_id WHERE t.total > u.cnt") == []
+
+
+def test_a_reversed_comparison_between_two_derived_tables_is_still_reported():
+    """两个 CTE 算出了同名的列：编号对得上时照样分得清是哪个 CTE 的，比较的方向反了要报出来（不写编号的写法只在
+    按编号比不上时才拿来配，不会把它吞掉）。"""
+    a = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+         "refunded AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
+         "SELECT COUNT(*) FROM paid p JOIN refunded r ON r.user_id = p.user_id WHERE p.total > r.total")
+    b = a.replace("WHERE p.total > r.total", "WHERE r.total > p.total")
+    assert texts(a, b) == ["A 只保留 paid.total > refunded.total 的行，B 没有这个条件",
+                           "B 只保留 paid.total < refunded.total 的行，A 没有这个条件"]
+
+
+def test_a_real_difference_next_to_renamed_derived_tables_is_reported_once():
+    """派生来源起的名字不同、里面又真有不同时，只报真正不同的那一处：CTE 里少一个条件，外层按 CTE 算出来的列
+    筛选的条件不跟着报（不然两边各报一句「只保留 total > 100 的行」，自相矛盾）；外层的条件本身不同，两边配成
+    一对说。"""
+    a = ("WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 "
+         "GROUP BY user_id) SELECT COUNT(*) FROM user_totals WHERE total > 100")
+    inner = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+             "SELECT COUNT(*) FROM t WHERE total > 100")
+    assert texts(a, inner, labels=("原流程", "盲算")) == ["原流程只保留 is_deleted = 0 的行，盲算没有这个条件"]
+    outer = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
+             "SELECT COUNT(*) FROM t WHERE total > 200")
+    assert texts(a, outer, labels=("原流程", "盲算")) == ["原流程按 total > 100 筛选，盲算按 total > 200 筛选"]
 
 
 @pytest.mark.parametrize("a,b,text", [

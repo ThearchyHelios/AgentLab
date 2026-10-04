@@ -17,6 +17,13 @@
 写在 WHERE 里的列等式算作关联条件，不算筛选。条件里套着的子查询（EXISTS、IN (SELECT …)）既单算一段，也按它自己
 那一段的来源整个写进外层那个条件：别名在子查询里定义，拿外层的来源去认，同一个条件只因别名不同就会被报成不同。
 
+**各自起的名字不进比较。** 表的别名换成真实表名；CTE、FROM 里的子查询没有真实表名可换，比较时按它在语句里的位置
+编号（@1、@2…，从外往里、按第一次用到的先后），给人看时照写名字；条件里的子查询（IN、EXISTS、标量子查询）选出来
+的列名不影响取值，比较时去掉。这些名字都是各自起的，双盲复算的盲算更是：按名字比，同一个口径会被说成换了口径。
+编号只看位置，一边多出一个排在前面的 CTE、子查询，后面的编号就错开了：diff_facets 先按编号比，比不上的再按不写
+编号的写法一对一地配，配上的不算不同。仍按名字比的只有 CTE、子查询选出来、外层按名字引用的列（一边叫 total、
+一边叫 sum_amt，算两列）。
+
 **和 sqlcheck 一样宁可漏报。** 解析不了（语法错、方言特性、多条语句、不是查询）就带 parse_error 返回，从不抛
 异常。没加表前缀、又有好几张表可能有这一列的，照写列名（给了表结构才去对）。只读语法树，不执行 SQL。
 """
@@ -24,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import deque
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from itertools import zip_longest
@@ -42,6 +50,11 @@ MAX_SQL_CHARS = 100_000
 #: 每段 SELECT 在语法树上记段号的 meta 键。条件、表达式要复制一份再改写，复制出来的子查询靠段号找回原来那一段
 #: 算好的来源（别名、外层）：复制品没有父节点，自己找不到外层
 _SEGMENT = "sql_semantics_segment"
+#: 派生来源（引用 CTE 的表和 CTE 的定义、FROM / JOIN 里的子查询）在语法树上记比较用编号的 meta 键（见
+#: _Statement._number_derived）。复制出来的条件里套着子查询时，靠它把 CTE 名、子查询的别名换成编号
+_DERIVED = "sql_semantics_derived"
+#: 比较用的写法里不写编号时，派生来源一律写成这个（见 Part.anon）
+_ANON = "@"
 
 
 # ==========================================================================
@@ -201,11 +214,14 @@ ColumnRef = tuple[str | None, str]
 class Part:
     """一个条件、一个分组键、一个聚合参数……
 
-    key 用来比较：别名换成真实表名，表名、列名按 name_key，等式和比较的两边排好顺序；loose 同 key 但不写表名，两边
-    查的表换了一张（orders 换成 orders_archive）时拿它比其余各方面，免得同一个条件只因表名不同被报成不同。
-    text 给人看：好几张表都有的列写「表.列」（真实表名，不是别名），其余只写列名；full 一律写表名，两边的 text
-    一样、key 却不同时改用它说明。excludes 只在 WHERE 的「排除」写法上有：<>、NOT、NOT IN、IS NOT NULL 去掉
-    否定之后排除的是什么（IS NOT NULL 写成「列 为空」）。
+    key 用来比较：别名换成真实表名（CTE、子查询写编号），表名、列名按 name_key，等式和比较的两边排好顺序；loose 同
+    key 但不写表名，两边查的表换了一张（orders 换成 orders_archive）时拿它比其余各方面，免得同一个条件只因表名不同
+    被报成不同；anon 同 key，但 CTE、子查询一律写「@」、不写编号（loose 也不写），编号错开时拿它再配一遍（见
+    _Compare.unmatched）。text 给人看：好几张表都有的列写「表.列」（真实表名，不是别名），其余只写列名；full 一律
+    写表名，两边的 text 一样、key 却不同时改用它说明。excludes 只在 WHERE 的「排除」写法上有：<>、NOT、NOT IN、
+    IS NOT NULL 去掉否定之后排除的是什么（IS NOT NULL 写成「列 为空」）。column_keys 和 columns 一一对应，是各列
+    比较用的写法（实表.列；CTE、子查询的列写成「@.列」）：两边给 CTE、子查询起的名字不同、编号错开，也认得出两个
+    条件说的是同一列，配成一对说。
     """
 
     key: str
@@ -214,11 +230,13 @@ class Part:
     excludes: str | None = None
     loose: str = ""
     full: str = ""
+    column_keys: tuple[str, ...] = ()
+    anon: str = ""
 
     @staticmethod
     def plain(key: str, text: str) -> "Part":
-        """没有列的一项（表名、COUNT(*) 的「*」）：四种写法相同。"""
-        return Part(key=key, text=text, loose=key, full=text)
+        """没有列的一项（表名、COUNT(*) 的「*」）：比较用的写法都是 key，给人看的都是 text。"""
+        return Part(key=key, text=text, loose=key, full=text, anon=key)
 
 
 @dataclass(frozen=True)
@@ -358,6 +376,53 @@ def _own_columns(node: Any) -> list[Any]:
     return [c for c in found if c.name and not c.is_star]
 
 
+def _inner_queries(query: Any, skip: Iterable[Any] = ()) -> list[Any]:
+    """query 里直接套着的查询（不再往里找），按出现的先后：条件、SELECT 列表里的子查询，UNION 的各支，子查询里面
+    那段。WITH 里的 CTE 定义不算（在用到它的地方才算），skip 里的节点整个跳过。"""
+    from sqlglot import exp
+
+    skipped = {id(n) for n in skip}
+    found = []
+    stack = list(reversed(list(query.iter_expressions())))
+    while stack:
+        node = stack.pop()
+        if id(node) in skipped or isinstance(node, exp.With):
+            continue
+        if isinstance(node, exp.Query):
+            found.append(node)
+            continue
+        stack.extend(reversed(list(node.iter_expressions())))
+    return found
+
+
+def _named_output(select: Any) -> bool:
+    """这段 SELECT 选出来的列会被别处按名字引用：它（或者它所在的 UNION）是 FROM / JOIN 里的子查询、CTE 的定义。
+    IN、EXISTS、标量子查询只看取值，选出来的列叫什么不影响口径。"""
+    from sqlglot import exp
+
+    node = select
+    while isinstance(node.parent, (exp.Subquery, exp.SetOperation)):
+        node = node.parent
+    return isinstance(node.parent, (exp.From, exp.Join, exp.CTE, exp.Lateral))
+
+
+def _alias(item: Any) -> str:
+    """FROM / JOIN 项的别名（没有别名的实表、CTE 是它的名字）；表函数这类认不出的来源是空串。LATERAL 的别名
+    挂在 Lateral 节点上，不在里面的子查询上。"""
+    from sqlglot import exp
+
+    return item.alias_or_name if isinstance(item, (exp.Table, exp.Subquery, exp.Lateral)) else ""
+
+
+def _derived_body(item: Any) -> Any:
+    """FROM / JOIN 项是子查询（含 LATERAL 子查询）时，里面那段查询；别的（实表、CTE、表函数）返回 None。"""
+    from sqlglot import exp
+
+    if isinstance(item, exp.Lateral):
+        item = item.this
+    return item.this if isinstance(item, exp.Subquery) else None
+
+
 def _own_nodes(select: Any) -> Iterator[Any]:
     """一段 SELECT 自己的节点：不进 CTE、子查询（它们是别的段）。"""
     from sqlglot import exp
@@ -423,11 +488,12 @@ class _Sources(dict):
 
 @dataclass
 class _Source:
-    """一段 SELECT 的一个来源。kind：table（实表）/ derived（CTE、子查询）/ other（表函数、认不出的别名）。"""
+    """一段 SELECT 的一个来源。kind：table（实表）/ derived（CTE、子查询、LATERAL 子查询）/ other（表函数、认不出的
+    别名）。"""
 
     kind: str
-    name: str                       # 给人看：表名（有库名就带上）、CTE 名、子查询别名
-    key: str                        # 比较用：name_key
+    name: str                       # 给人看：表名（有库名就带上）、CTE 名、子查询（含 LATERAL）的别名
+    key: str                        # 比较用：实表是 name_key，派生来源是编号（见 _Statement._number_derived）
     idents: tuple[Any, ...] = ()    # 表名各段的 Identifier：给人看的写法照原样写回去
     query: Any = None               # derived：里面那段查询
 
@@ -446,9 +512,13 @@ class _Statement:
             select.meta[_SEGMENT] = len(self.segments)
             self.segments.append(select)
         self.ctes: dict[str, Any] = {}
+        #: CTE 的定义（exp.CTE 节点），和 ctes 同一个键：编号也记在定义上，定义写进条件时靠它换掉名字
+        self._cte_defs: dict[str, Any] = {}
         for cte in root.find_all(exp.CTE):
             if cte.alias:
                 self.ctes.setdefault(name_key(cte.alias), cte.this)
+                self._cte_defs.setdefault(name_key(cte.alias), cte)
+        self._number_derived()
         tables: dict[str, _Source] = {}
         for table in root.find_all(exp.Table, bfs=False):
             if isinstance(table.this, exp.Identifier) and table.name and not self._is_cte(table):
@@ -471,6 +541,61 @@ class _Statement:
         return not table.text("db") and not table.text("catalog") and name_key(table.name) in self.ctes
 
     @staticmethod
+    def _items(select: Any) -> list[Any]:
+        """一段 SELECT 的 FROM、JOIN 项，按出现的先后。"""
+        first = select.args.get("from_")
+        return ([first.this] if first is not None else []) + [j.this for j in select.args.get("joins") or []]
+
+    def _number_derived(self) -> None:
+        """给派生来源（引用 CTE 的表、FROM / JOIN 里的子查询和 LATERAL 子查询）编比较用的 key：@1、@2…，记在节点的
+        meta 上。
+
+        CTE 名、子查询的别名是各自起的（双盲复算的盲算更是），拿它作 key，同一个口径只因起的名字不同就被报成不同；
+        拿里面那段查询的写法作 key 也不行：里面差一个条件，外层按它的列写的条件就全跟着变，同一处不同报好几遍，还会
+        出现两边各说一句「只保留 total > 100 的行」的自相矛盾。所以只按位置编：从最外层往里一层一层地编，同一层按
+        出现的先后；CTE 在第一次用到的地方编号，在哪儿用到都是这一个编号。写成 CTE 还是 FROM 里的子查询、CTE 定义
+        的先后都不影响编号，里层多一段、少一段也不挪动外层的编号。
+        """
+        from sqlglot import exp
+
+        ctes: dict[str, str] = {}
+        count = 0
+
+        def visit(select: Any) -> list[Any]:
+            """给这一段还没编号的 FROM / JOIN 项编号，返回要接着往里看的查询（子查询、第一次用到的 CTE 的定义）。"""
+            nonlocal count
+            inner = []
+            for item in self._items(select):
+                body = _derived_body(item)
+                if body is not None:
+                    if _DERIVED not in item.meta:
+                        count += 1
+                        item.meta[_DERIVED] = f"@{count}"
+                        inner.append(body)
+                elif isinstance(item, exp.Table) and isinstance(item.this, exp.Identifier) and item.name \
+                        and self._is_cte(item):
+                    name = name_key(item.name)
+                    if name not in ctes:
+                        count += 1
+                        ctes[name] = f"@{count}"
+                        self._cte_defs[name].meta[_DERIVED] = ctes[name]
+                        inner.append(self.ctes[name])
+                    item.meta[_DERIVED] = ctes[name]
+            return inner
+
+        queue: deque[Any] = deque([self.root])
+        while queue:
+            query = queue.popleft()
+            items: list[Any] = []
+            if isinstance(query, exp.Select):
+                queue.extend(visit(query))
+                items = self._items(query)
+            queue.extend(_inner_queries(query, skip=items))
+        # 没走到的（没用到的 CTE 里的、表函数参数里的）按出现的先后补上：每个派生来源都得有编号
+        for select in self.root.find_all(exp.Select, bfs=False):
+            visit(select)
+
+    @staticmethod
     def _table(table: Any) -> _Source:
         from sqlglot import exp
 
@@ -485,21 +610,19 @@ class _Statement:
 
         if id(select) in self._memo:
             return self._memo[id(select)]
-        items = ([select.args["from_"].this] if select.args.get("from_") is not None else []) + \
-            [j.this for j in select.args.get("joins") or []]
         out = _Sources()
-        for i, node in enumerate(items):
-            alias = node.alias_or_name if isinstance(node, (exp.Table, exp.Subquery)) else ""
+        for i, node in enumerate(self._items(select)):
+            alias = _alias(node)
             slot = name_key(alias) if alias else f"#{i}"
             if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier) and node.name:
                 if self._is_cte(node):
-                    out[slot] = _Source("derived", node.name, name_key(node.name), (node.this.copy(),),
+                    out[slot] = _Source("derived", node.name, node.meta.get(_DERIVED, slot), (node.this.copy(),),
                                         self.ctes[name_key(node.name)])
                 else:
                     out[slot] = self._table(node)
-            elif isinstance(node, exp.Subquery):
-                out[slot] = _Source("derived", alias or "子查询", slot, (exp.to_identifier(alias),) if alias else (),
-                                    node.this)
+            elif (body := _derived_body(node)) is not None:
+                out[slot] = _Source("derived", alias or "子查询", node.meta.get(_DERIVED, slot),
+                                    (exp.to_identifier(alias),) if alias else (), body)
             else:
                 out[slot] = _Source("other", alias, slot)
         self._memo[id(select)] = out
@@ -598,11 +721,13 @@ class _Statement:
         return default if owner is None else self.sources(self.segments[owner.meta[_SEGMENT]])
 
     def render(self, node: Any, sources: dict[str, _Source], mode: str = "text") -> str:
-        """四种写法（见 Part）：key、loose 比较用，名字按 name_key，key 写真实表名、loose 不写；text、full 给人看，
-        text 只在好几张表都有这一列时写真实表名，full 一律写（关联条件说的就是两张表各出哪一列，用 full）。
+        """五种写法（见 Part）：key、anon、loose 比较用，名字按 name_key，key、anon 写真实表名、loose 不写（CTE、子查询
+        只有 key 写编号）；text、full 给人看，text 只在好几张表都有这一列时写真实表名，full 一律写（关联条件说的就是
+        两张表各出哪一列，用 full）。
 
         node 里套着的子查询逐段改写：每一列按它所在那一段的来源认，子查询里的表去掉别名（列已经写成了真实表名）。
-        子查询里拿两张表的列互相比的（相关子查询），给人看时和关联条件一样写表名。
+        子查询里拿两张表的列互相比的（相关子查询），给人看时和关联条件一样写表名。比较用的写法里各自起的名字也去掉
+        （见 _drop_names）。
         """
         from sqlglot import exp
 
@@ -623,21 +748,50 @@ class _Statement:
         for table in copy.find_all(exp.Table):
             if isinstance(table.this, exp.Identifier) and self._owner(table) is not None:
                 table.set("alias", None)
-                if mode in ("key", "loose"):
+                if mode in ("key", "loose", "anon"):
                     for arg in ("catalog", "db", "this"):
                         ident = table.args.get(arg)
                         if isinstance(ident, exp.Identifier):
                             table.set(arg, exp.to_identifier(name_key(ident.name)))
+        if mode in ("key", "loose", "anon"):
+            self._drop_names(copy, numbered=mode == "key")
         return copy.sql(dialect=self.read, comments=False)
+
+    @staticmethod
+    def _drop_names(copy: Any, *, numbered: bool) -> None:
+        """比较用的写法里抹掉套着的子查询里各自起的名字（就地改）：引用 CTE 的表、FROM 里的子查询（含 LATERAL）、
+        子查询里自带的 CTE 定义写编号（numbered 为假时写「@」；引用它们的列已经照这样写了）；只看取值的子查询（IN、
+        EXISTS、标量子查询）去掉选出来的列名。FROM 里的子查询、CTE 定义选出来的列名留着：外层按这个名字引用它们，
+        去掉了就分不出外层用的是哪一列。"""
+        from sqlglot import exp
+
+        for node in copy.find_all(exp.Table, exp.Subquery, exp.Lateral, exp.CTE):
+            derived = node.meta.get(_DERIVED)
+            if not derived:
+                continue
+            mark = exp.to_identifier(derived if numbered else _ANON)
+            if isinstance(node, exp.Table):
+                for arg in ("catalog", "db", "alias"):
+                    node.set(arg, None)
+                node.set("this", mark)
+            elif isinstance(node.args.get("alias"), exp.TableAlias):
+                node.args["alias"].set("this", mark)
+            else:
+                node.set("alias", exp.TableAlias(this=mark))
+        for select in copy.find_all(exp.Select):
+            if not _named_output(select):
+                select.set("expressions", [e.this if isinstance(e, exp.Alias) else e for e in select.expressions])
 
     def _write(self, col: Any, source: _Source | None, name: str, mode: str) -> None:
         """按 render 的写法改写一列（就地改）。"""
         from sqlglot import exp
 
         quoted = isinstance(col.this, exp.Identifier) and bool(col.this.args.get("quoted"))
-        if mode in ("key", "loose"):
+        if mode in ("key", "loose", "anon"):
+            owner = None if source is None or mode == "loose" else \
+                _ANON if mode == "anon" and source.kind == "derived" else source.key
             col.set("this", exp.to_identifier(name_key(name)))
-            col.set("table", exp.to_identifier(source.key) if source is not None and mode == "key" else None)
+            col.set("table", exp.to_identifier(owner) if owner else None)
             col.set("db", None)
             col.set("catalog", None)
             return
@@ -654,7 +808,7 @@ class _Statement:
             col.set("catalog", heads[-2].copy() if len(heads) > 1 else None)
 
     def canonical(self, node: Any, sources: dict[str, _Source]) -> Any:
-        """比较的两边排好顺序（列在左、字面量在右；两边都有列的按 key 排），IN 的取值排好序。返回新的树。
+        """比较的两边排好顺序（列在左、字面量在右；两边都有列的按 _rank 排），IN 的取值排好序。返回新的树。
         套着的子查询里的比较按它那一段的来源排：拿外层的来源去认子查询的别名，排出来的先后就取决于别名怎么起。"""
         from sqlglot import exp
 
@@ -664,7 +818,7 @@ class _Statement:
                 left, right = n.this, n.expression
                 lc, rc = bool(_own_columns(left)), bool(_own_columns(right))
                 here = self.scope(n, sources) if lc and rc else sources
-                if (rc and not lc) or (lc and rc and self.render(left, here, "key") > self.render(right, here, "key")):
+                if (rc and not lc) or (lc and rc and self._rank(left, here) > self._rank(right, here)):
                     return getattr(exp, found[1])(this=right, expression=left)
             elif isinstance(n, exp.In) and n.expressions and not n.args.get("query") \
                     and not any(_own_columns(e) for e in n.expressions):
@@ -673,17 +827,24 @@ class _Statement:
 
         return node.transform(fix)
 
+    def _rank(self, node: Any, sources: dict[str, _Source]) -> tuple[str, str]:
+        """比较的两边谁排前面：先按不写编号的写法，分不出（同名的列）再按编号。只按编号排的话，编号错开的两条语句里
+        同一个比较会排成两个方向，按不写编号的写法也配不上了。"""
+        return self.render(node, sources, "anon"), self.render(node, sources, "key")
+
     def part(self, node: Any, sources: dict[str, _Source], *, excludes: bool = False) -> Part:
-        refs: dict[tuple[str | None, str], None] = {}
+        refs: dict[tuple[str | None, str], str] = {}
         for col in _own_columns(node):
             source, name = self.resolve(col, sources)
-            refs.setdefault((source.name if source is not None else None, name))
+            owner = "" if source is None else _ANON if source.kind == "derived" else source.key
+            refs.setdefault((source.name if source is not None else None, name), f"{owner}.{name_key(name)}")
         full = self.render(node, sources, "full")
         # 拿两张表的列互相比的（相关子查询里的 o.id = r.order_id）和关联条件一样，给人看也写表名
         across = len({table for table, _ in refs}) > 1
         return Part(key=self.render(node, sources, "key"), text=full if across else self.render(node, sources),
                     columns=tuple(refs), excludes=self._excludes(node, sources) if excludes else None,
-                    loose=self.render(node, sources, "loose"), full=full)
+                    loose=self.render(node, sources, "loose"), full=full, column_keys=tuple(refs.values()),
+                    anon=self.render(node, sources, "anon"))
 
     def _excludes(self, node: Any, sources: dict[str, _Source]) -> str | None:
         """排除写法去掉否定之后排除的是什么：a <> 1 → a = 1；NOT IN、NOT LIKE、NOT BETWEEN 同理；IS NOT NULL → 「a 为空」。
@@ -748,12 +909,10 @@ class _Statement:
         from sqlglot import exp
 
         first = select.args.get("from_")
-        first_alias = first.this.alias_or_name if first is not None and \
-            isinstance(first.this, (exp.Table, exp.Subquery)) else ""
+        first_alias = _alias(first.this) if first is not None else ""
         drafts: list[dict[str, Any]] = []
         for i, join in enumerate(select.args.get("joins") or []):
-            target = join.this
-            alias = target.alias_or_name if isinstance(target, (exp.Table, exp.Subquery)) else ""
+            alias = _alias(join.this)
             slot = name_key(alias) if alias else f"#{i + 1}"
             conds: list[Any] = []
             if join.args.get("on") is not None:
@@ -790,12 +949,14 @@ class _Statement:
 
     def _join(self, draft: dict[str, Any], sources: dict[str, _Source]) -> JoinFacet:
         source = draft["source"]
-        table = Part.plain(source.key, source.name) if source is not None else Part.plain("?", "?")
-        triples = sorted((self.render(c, sources, "key"), self.render(c, sources, "loose"),
-                          self.render(c, sources, "full")) for c in draft["conds"])
-        on = Part(key=" AND ".join(t[0] for t in triples), text=" AND ".join(t[2] for t in triples),
-                  loose=" AND ".join(sorted(t[1] for t in triples)), full=" AND ".join(t[2] for t in triples)) \
-            if triples else None
+        table = Part.plain("?", "?") if source is None else \
+            Part(key=source.key, text=source.name, loose=source.key, full=source.name,
+                 anon=_ANON if source.kind == "derived" else source.key)
+        forms = sorted((self.render(c, sources, "key"), self.render(c, sources, "loose"),
+                        self.render(c, sources, "full"), self.render(c, sources, "anon")) for c in draft["conds"])
+        on = Part(key=" AND ".join(f[0] for f in forms), text=" AND ".join(f[2] for f in forms),
+                  loose=" AND ".join(sorted(f[1] for f in forms)), full=" AND ".join(f[2] for f in forms),
+                  anon=" AND ".join(sorted(f[3] for f in forms))) if forms else None
         mentioned = {table for c in draft["conds"] for table, _ in self.part(c, sources).columns}
         other = [name for name in dict.fromkeys(t for t in mentioned if t) if name != table.text] if draft["conds"] \
             else draft["before"]
@@ -1071,11 +1232,11 @@ def _labeler(names: Mapping[str, str] | None) -> Any:
 
 
 def _single_column(part: Part, *, loose: bool) -> str | None:
-    """只涉及一列的条件：那一列（表.列；loose 时只看列名），用来把两边对同一列的不同写法配成一对。"""
-    if len(part.columns) != 1:
+    """只涉及一列的条件：那一列（Part.column_keys：实表.列，CTE、子查询的列写「@.列」，两边起的名字不同、编号错开
+    也配得上；loose 时只看列名），用来把两边对同一列的不同写法配成一对。"""
+    if len(part.columns) != 1 or len(part.column_keys) != 1:
         return None
-    table, column = part.columns[0]
-    return name_key(column) if loose else f"{name_key(table or '')}.{name_key(column)}"
+    return name_key(part.columns[0][1]) if loose else part.column_keys[0]
 
 
 def _verb(g: Aggregate) -> str:
@@ -1099,6 +1260,8 @@ class _Compare:
 
     两边各有一张只在自己这边出现、又不是关联进来的表（orders 换成了 orders_archive）时，其余各方面按不写表名的
     loose 比：表换了这件事由一条「tables」说清，同一个条件、同一个聚合不再因为表名不同被重复报一遍。
+
+    每个方面都先按 k 比，比不上的再按 ak（CTE、子查询不写编号）一对一地配一遍（见 unmatched）。
     """
 
     def __init__(self, a: Facets, b: Facets, labels: tuple[str, str], names: Mapping[str, str] | None) -> None:
@@ -1114,6 +1277,32 @@ class _Compare:
         if part is None:
             return None
         return part.loose if self.swapped else part.key
+
+    def ak(self, part: Part | None) -> str | None:
+        """同 k，但 CTE、子查询不写编号（见 unmatched）。"""
+        if part is None:
+            return None
+        return part.loose if self.swapped else (part.anon or part.key)
+
+    @staticmethod
+    def unmatched(xs: Iterable[Any], ys: Iterable[Any], key: Any, anon: Any) -> tuple[list[Any], list[Any]]:
+        """两边各自独有的项，各按原来的先后。先按 key 比；剩下的再按 anon（CTE、子查询不写编号）一对一地配，配上的
+        也不算不同。编号只看位置，一边多出一个排在前面的 CTE、子查询，后面的编号就错开了：同一个条件不能因此被说成
+        两边各有一个。编号对得上时 key 就分得清是哪个 CTE 的列，anon 只收拾 key 比不上的；两个 CTE 算出同名的列、
+        编号又错开时可能配错一对，宁可漏报。"""
+        xs, ys = list(xs), list(ys)
+        kx, ky = {key(x) for x in xs}, {key(y) for y in ys}
+        only_x = [x for x in xs if key(x) not in ky]
+        only_y = [y for y in ys if key(y) not in kx]
+        paired_x: set[int] = set()
+        paired_y: set[int] = set()
+        for i, x in enumerate(only_x):
+            j = next((j for j, y in enumerate(only_y) if j not in paired_y and anon(y) == anon(x)), None)
+            if j is not None:
+                paired_x.add(i)
+                paired_y.add(j)
+        return [x for i, x in enumerate(only_x) if i not in paired_x], \
+            [y for j, y in enumerate(only_y) if j not in paired_y]
 
     @staticmethod
     def shown(xs: list[str], ys: list[str], full_xs: list[str], full_ys: list[str]) -> tuple[str, str]:
@@ -1143,7 +1332,7 @@ class _Compare:
         a, b, la, lb = self.a, self.b, self.la, self.lb
         ca = list(_dedupe((t.column for t in a.time), self.k))
         cb = list(_dedupe((t.column for t in b.time), self.k))
-        if {self.k(p) for p in ca} != {self.k(p) for p in cb}:
+        if any(self.unmatched(ca, cb, self.k, self.ak)):
             wa, wb = self.named(ca), self.named(cb)
             if wa == wb:
                 wa, wb = self.named(ca, full=True), self.named(cb, full=True)
@@ -1157,7 +1346,7 @@ class _Compare:
                       for side, parts in (("a", ca), ("b", cb))}
             return [FacetDiff("time", "、".join(p.text for p in ca) or None, "、".join(p.text for p in cb) or None,
                               text, detail)]
-        if {self.k(t.condition) for t in a.time} != {self.k(t.condition) for t in b.time}:
+        if any(self.unmatched(a.time, b.time, lambda t: self.k(t.condition), lambda t: self.ak(t.condition))):
             ra = " AND ".join(t.condition.text for t in a.time)
             rb = " AND ".join(t.condition.text for t in b.time)
             return [FacetDiff("time_range", ra, rb, _say(la, "的时间范围是", ra, "，", lb, "是", rb))]
@@ -1167,8 +1356,7 @@ class _Compare:
         timed = {self.k(t.condition) for t in (*self.a.time, *self.b.time)}
         fa = [p for p in self.a.where if self.k(p) not in timed]
         fb = [p for p in self.b.where if self.k(p) not in timed]
-        only_a = [p for p in fa if self.k(p) not in {self.k(q) for q in fb}]
-        only_b = [p for p in fb if self.k(p) not in {self.k(q) for q in fa}]
+        only_a, only_b = self.unmatched(fa, fb, self.k, self.ak)
         out: list[FacetDiff] = []
         for p in list(only_a):
             column = _single_column(p, loose=self.swapped)
@@ -1190,6 +1378,9 @@ class _Compare:
         def key(g: Aggregate) -> tuple[str, str | None, bool]:
             return g.func, self.k(g.arg), g.distinct
 
+        def anon(g: Aggregate) -> tuple[str, str | None, bool]:
+            return g.func, self.ak(g.arg), g.distinct
+
         def pair(xs: list[Aggregate], ys: list[Aggregate], same: Any) -> list[tuple[Aggregate, Aggregate]]:
             pairs = []
             for x in list(xs):
@@ -1200,8 +1391,7 @@ class _Compare:
                     ys.remove(y)
             return pairs
 
-        ga = [g for g in self.a.aggregates if key(g) not in {key(h) for h in self.b.aggregates}]
-        gb = [g for g in self.b.aggregates if key(g) not in {key(h) for h in self.a.aggregates}]
+        ga, gb = self.unmatched(self.a.aggregates, self.b.aggregates, key, anon)
         # 先配参数相同的（同一列：函数或去重不同），再配函数相同的（同一种算法：列不同）；各剩一个的也配成一对
         pairs = pair(ga, gb, lambda x, y: self.k(x.arg) == self.k(y.arg))
         pairs += pair(ga, gb, lambda x, y: x.func == y.func)
@@ -1229,30 +1419,31 @@ class _Compare:
         return out
 
     def joins(self) -> list[FacetDiff]:
+        """连接：先把完全一样的（类型、关联的表、条件）两边配掉，剩下的按关联的是哪张表配成一对、说类型或条件哪里
+        不同，再剩下的是只有一边关联了。直接按表配的话，编号错开时会把两个不相干的 CTE 配成一对，说成「关联条件
+        不同」；先配完全一样的，同一张表关联了两次、先后不同也不算不同。"""
         la, lb = self.la, self.lb
-
-        def index(f: Facets) -> dict[str, list[JoinFacet]]:
-            out: dict[str, list[JoinFacet]] = {}
-            for j in f.joins:
-                out.setdefault(j.table.key, []).append(j)
-            return out
-
-        ja, jb = index(self.a), index(self.b)
+        rest_a, rest_b = self.unmatched(self.a.joins, self.b.joins,
+                                        lambda j: (j.kind, j.table.key, self.k(j.on)),
+                                        lambda j: (j.kind, j.table.anon, self.ak(j.on)))
+        pairs: list[tuple[JoinFacet, JoinFacet]] = []
+        for table in (lambda j: j.table.key, lambda j: j.table.anon):
+            for x in list(rest_a):
+                y = next((y for y in rest_b if table(y) == table(x)), None)
+                if y is not None:
+                    pairs.append((x, y))
+                    rest_a.remove(x)
+                    rest_b.remove(y)
         out: list[FacetDiff] = []
-        for key in dict.fromkeys([*ja, *jb]):
-            xs, ys = ja.get(key, []), jb.get(key, [])
-            for x, y in zip(xs, ys):
-                if x.kind != y.kind:
-                    kx, ky = _JOIN_WORDS.get(x.kind, x.kind), _JOIN_WORDS.get(y.kind, y.kind)
-                    out.append(FacetDiff("join", kx, ky, _say(la, "用", kx, "关联", x.table.text, "表，", lb, "用", ky)))
-                if self.k(x.on) != self.k(y.on):
-                    xa, ya = (x.on.text if x.on else "（无条件）"), (y.on.text if y.on else "（无条件）")
-                    out.append(FacetDiff("join", xa, ya, _say(la, "关联", x.table.text, "表的条件是", xa, "，", lb, "是",
-                                                              ya)))
-            out += [FacetDiff("join", x.table.text, None, _say(la, "关联了", x.table.text, "表，", lb, "没有"))
-                    for x in xs[len(ys):]]
-            out += [FacetDiff("join", None, y.table.text, _say(lb, "关联了", y.table.text, "表，", la, "没有"))
-                    for y in ys[len(xs):]]
+        for x, y in pairs:
+            if x.kind != y.kind:
+                kx, ky = _JOIN_WORDS.get(x.kind, x.kind), _JOIN_WORDS.get(y.kind, y.kind)
+                out.append(FacetDiff("join", kx, ky, _say(la, "用", kx, "关联", x.table.text, "表，", lb, "用", ky)))
+            if self.k(x.on) != self.k(y.on) and self.ak(x.on) != self.ak(y.on):
+                xa, ya = (x.on.text if x.on else "（无条件）"), (y.on.text if y.on else "（无条件）")
+                out.append(FacetDiff("join", xa, ya, _say(la, "关联", x.table.text, "表的条件是", xa, "，", lb, "是", ya)))
+        out += [FacetDiff("join", x.table.text, None, _say(la, "关联了", x.table.text, "表，", lb, "没有")) for x in rest_a]
+        out += [FacetDiff("join", None, y.table.text, _say(lb, "关联了", y.table.text, "表，", la, "没有")) for y in rest_b]
         # 关联之外的表（FROM 的表、子查询里的表）只在一边出现的
         if self.swapped:
             ta, tb = self.ta[0], self.tb[0]
@@ -1264,7 +1455,7 @@ class _Compare:
 
     def group(self) -> list[FacetDiff]:
         a, b = self.a.group_by, self.b.group_by
-        if {self.k(p) for p in a} == {self.k(p) for p in b}:
+        if not any(self.unmatched(a, b, self.k, self.ak)):
             return []
         wa, wb = self.shown([p.text for p in a], [p.text for p in b], [p.full for p in a], [p.full for p in b])
         if wa and wb:
@@ -1276,11 +1467,9 @@ class _Compare:
         return [FacetDiff("group_by", wa or None, wb or None, text)]
 
     def having(self) -> list[FacetDiff]:
-        ka, kb = {self.k(p) for p in self.a.having}, {self.k(p) for p in self.b.having}
-        return [FacetDiff("having", p.text, None, self.one_sided(self.la, self.lb, p, group=True))
-                for p in self.a.having if self.k(p) not in kb] + \
-            [FacetDiff("having", None, p.text, self.one_sided(self.lb, self.la, p, group=True))
-             for p in self.b.having if self.k(p) not in ka]
+        only_a, only_b = self.unmatched(self.a.having, self.b.having, self.k, self.ak)
+        return [FacetDiff("having", p.text, None, self.one_sided(self.la, self.lb, p, group=True)) for p in only_a] + \
+            [FacetDiff("having", None, p.text, self.one_sided(self.lb, self.la, p, group=True)) for p in only_b]
 
     def limit(self) -> list[FacetDiff]:
         """取哪几行：最外层两边比；CTE、子查询里的按出现的先后一一配对（两边给它起的名字可以不同），整组一样就不报。"""
@@ -1290,15 +1479,18 @@ class _Compare:
         out = self.rows(outer(self.a), outer(self.b))
         ia = [x for x in self.a.limits if x.scope is not None]
         ib = [x for x in self.b.limits if x.scope is not None]
-        if [self.lk(x) for x in ia] != [self.lk(x) for x in ib]:
+        if [self.lk(x) for x in ia] != [self.lk(x) for x in ib] and \
+                [self.lk(x, anon=True) for x in ia] != [self.lk(x, anon=True) for x in ib]:
             for x, y in zip_longest(ia, ib):
                 out += self.rows(x, y)
         return out
 
-    def lk(self, x: LimitFacet | None) -> tuple[Any, ...] | None:
+    def lk(self, x: LimitFacet | None, *, anon: bool = False) -> tuple[Any, ...] | None:
+        """一段取哪几行的比较用写法：行数、跳过的行数、排序键。anon 时排序键按 ak（见 unmatched）。"""
         if x is None:
             return None
-        return x.count, x.offset, tuple((self.k(p), desc) for p, desc in x.order)
+        key = self.ak if anon else self.k
+        return x.count, x.offset, tuple((key(p), desc) for p, desc in x.order)
 
     def sorting(self, x: LimitFacet, *, full: bool = False) -> str:
         if not x.order:
@@ -1308,7 +1500,7 @@ class _Compare:
 
     def rows(self, x: LimitFacet | None, y: LimitFacet | None) -> list[FacetDiff]:
         """一对段（一边可以没有）取的行有什么不同：行数、跳过的行数，两边都限了行时再比排序。"""
-        if self.lk(x) == self.lk(y):
+        if self.lk(x) == self.lk(y) or self.lk(x, anon=True) == self.lk(y, anon=True):
             return []
         sa, sb = (x.scope if x else None), (y.scope if y else None)
         la = _say(self.la, "在", sa, "里") if sa else self.la
@@ -1320,7 +1512,8 @@ class _Compare:
         oa, ob = (x.offset if x else None), (y.offset if y else None)
         if oa != ob:
             out.append(FacetDiff("limit", oa, ob, _say(la, _skip(oa), "，", lb, _skip(ob))))
-        if x is not None and y is not None and self.lk(x)[2] != self.lk(y)[2]:
+        if x is not None and y is not None and self.lk(x)[2] != self.lk(y)[2] \
+                and self.lk(x, anon=True)[2] != self.lk(y, anon=True)[2]:
             wa, wb = self.sorting(x), self.sorting(y)
             if wa == wb:
                 wa, wb = self.sorting(x, full=True), self.sorting(y, full=True)
