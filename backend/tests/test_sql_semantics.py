@@ -3,7 +3,8 @@
 - normalize_sql：字面量换成占位符后的规范文本 + 字面量。只有字面量不同的两条 SQL 规范文本相同（定时运行每期的日期
   不同，不能算模板变了）；关键字大小写、空白、注释也不算不同；解析不了的退回逐词规范化，照样认得出只改了字面量
 - facets：表、连接（类型 / 关联进来的表 / ON 条件）、WHERE 合取式、时间条件（列 / 运算符 / 取值）、分组、聚合
-  （函数 / 参数 / 去重）、HAVING、LIMIT。别名换成真实表名、比较的两边排好顺序；解析不了带 parse_error，不抛
+  （函数 / 参数 / 去重）、HAVING、取哪几行（各段的 LIMIT / OFFSET / 排序）。别名换成真实表名（条件里套着的子查询、
+  HAVING 里的别名也是）、比较的两边排好顺序；解析不了带 parse_error，不抛
 - diff_facets：每处不同一句中文：「A 按支付时间 paid_at 筛时间，B 按下单时间 created_at」「A 排除了
   is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报
 
@@ -186,6 +187,27 @@ def test_having_and_limit():
     assert facets("SELECT a FROM orders LIMIT 5, 20", "mysql").limit == "20"
 
 
+def test_having_reads_select_aliases():
+    """HAVING 里引用 SELECT 的别名（MySQL、SQLite 的写法）换成别名指的表达式，和 GROUP BY 别名一样。"""
+    by_alias = facets("SELECT region AS r, SUM(amount) AS s FROM orders GROUP BY r HAVING s > 100")
+    explicit = facets("SELECT o.region, SUM(o.amount) FROM orders o GROUP BY o.region HAVING SUM(o.amount) > 100")
+    assert [p.key for p in by_alias.having] == [p.key for p in explicit.having] == ["SUM(orders.amount) > 100"]
+
+
+def test_limits_are_collected_per_segment_with_offset_and_order():
+    """LIMIT 逐段收集（CTE、FROM 里的子查询各算一段），连同 OFFSET 和这一段的排序：只取前几行时，按什么排、
+    跳过几行决定了取到的是哪几行。OFFSET 0 等于没写。"""
+    f = facets("WITH top AS (SELECT amount FROM orders ORDER BY amount DESC LIMIT 10) "
+               "SELECT SUM(amount) FROM top LIMIT 1")
+    assert [(x.scope, x.count, x.offset) for x in f.limits] == [(None, "1", None), ("top", "10", None)]
+    [(key, desc)] = f.limits[1].order
+    assert key.text == "amount" and desc is True
+    mysql = facets("SELECT a FROM orders ORDER BY 1 LIMIT 5, 20", "mysql")
+    assert (mysql.limits[0].count, mysql.limits[0].offset) == ("20", "5")
+    assert [(k.text, d) for k, d in mysql.limits[0].order] == [("a", False)], "ORDER BY 1 换成 SELECT 里的第一项"
+    assert facets("SELECT a FROM orders LIMIT 10 OFFSET 0").limits[0].offset is None
+
+
 @pytest.mark.parametrize("dialect,sql", [
     ("sqlite", 'SELECT SUM("金额") AS "销售额" FROM "订单" WHERE "是否作废" = 0'),
     ("mysql", "SELECT SUM(`金额`) AS `销售额` FROM `订单` WHERE `是否作废` = 0"),
@@ -211,8 +233,18 @@ def test_a_correlated_subquery_reads_the_outer_alias():
     """子查询里引用外层的别名（o.id）到外层去找：写成真实表名，两张表的列互相比的条件也写出表名。"""
     f = facets("SELECT o.id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)")
     assert "orders.id = refunds.order_id" in [p.text for p in f.where]
-    assert facets("SELECT orders.id FROM orders WHERE NOT EXISTS "
-                  "(SELECT 1 FROM refunds WHERE orders.id = refunds.order_id)").where[1].key == f.where[1].key
+    plain = facets("SELECT orders.id FROM orders WHERE NOT EXISTS "
+                   "(SELECT 1 FROM refunds WHERE orders.id = refunds.order_id)")
+    assert plain.where[1].key == f.where[1].key
+    # 外层那个条件（NOT EXISTS 整句）也一样：子查询按它自己那一段的来源写，别名换成真实表名
+    assert plain.where[0].key == f.where[0].key
+    assert f.where[0].excludes == "EXISTS(SELECT 1 FROM refunds WHERE orders.id = refunds.order_id)"
+
+
+def test_a_subquery_in_a_condition_is_written_with_its_own_tables():
+    f = facets("SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.id FROM users u WHERE u.vip = 1)")
+    assert f.where[0].text == "user_id IN (SELECT id FROM users WHERE vip = 1)"
+    assert f.where[0].key == "orders.user_id IN (SELECT users.id FROM users WHERE users.vip = 1)"
 
 
 def test_the_schema_tells_which_table_an_unqualified_column_belongs_to():
@@ -380,9 +412,45 @@ def test_an_unparsable_side_is_reported_once_without_item_by_item_comparison():
     ("SELECT SUM(o.amount) FROM orders o, stores s WHERE o.store_id = s.id AND s.city = '虚构市'",
      "SELECT SUM(orders.amount) FROM orders INNER JOIN stores ON stores.id = orders.store_id "
      "WHERE stores.city = '虚构市'"),
+    # 条件里套着的子查询用了别名：NOT EXISTS、IN (SELECT …)
+    ("SELECT o.id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT orders.id FROM orders WHERE NOT EXISTS (SELECT 1 FROM refunds WHERE refunds.order_id = orders.id)"),
+    ("SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.id FROM users u WHERE u.vip = 1)",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT id FROM users WHERE vip = 1)"),
+    # HAVING 里用 SELECT 的别名
+    ("SELECT o.region, SUM(o.amount) FROM orders o GROUP BY o.region HAVING SUM(o.amount) > 100",
+     "SELECT region AS r, SUM(amount) AS s FROM orders GROUP BY r HAVING s > 100"),
+    # OFFSET 0 等于没写；取前几行时 ORDER BY 1 和写出列名是同一个排序
+    ("SELECT amount FROM orders ORDER BY 1 DESC LIMIT 10 OFFSET 0",
+     "SELECT o.amount FROM orders o ORDER BY o.amount DESC LIMIT 10"),
 ])
 def test_the_same_meaning_written_differently_is_no_difference(a, b):
     assert texts(a, b) == []
+
+
+def test_a_real_difference_inside_a_subquery_is_still_reported():
+    a = "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.id FROM users u WHERE u.vip = 1)"
+    b = "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT u.referrer_id FROM users u WHERE u.vip = 1)"
+    assert texts(a, b) == ["A 按 user_id IN (SELECT id FROM users WHERE vip = 1) 筛选，"
+                           "B 按 user_id IN (SELECT referrer_id FROM users WHERE vip = 1) 筛选"]
+
+
+@pytest.mark.parametrize("a,b,text", [
+    ("WITH top AS (SELECT amount FROM orders ORDER BY amount DESC LIMIT 10) SELECT SUM(amount) FROM top",
+     "WITH top AS (SELECT amount FROM orders ORDER BY amount DESC LIMIT 100) SELECT SUM(amount) FROM top",
+     "A 在 top 里只取前 10 行，B 只取前 100 行"),
+    ("SELECT amount FROM orders LIMIT 10 OFFSET 0", "SELECT amount FROM orders LIMIT 10 OFFSET 10",
+     "A 不跳过行，B 跳过前 10 行"),
+    ("SELECT amount FROM orders ORDER BY 1 DESC LIMIT 10", "SELECT amount FROM orders ORDER BY 1 ASC LIMIT 10",
+     "A 取行前按 amount 降序排，B 按 amount 升序排"),
+    ("SELECT amount FROM orders ORDER BY amount DESC LIMIT 10", "SELECT amount FROM orders LIMIT 10",
+     "A 取行前按 amount 降序排，B 没有排序"),
+])
+def test_which_rows_are_taken_is_compared(a, b, text):
+    """取哪几行：每一段的行数、跳过的行数，以及取前几行时的排序。排序只在有 LIMIT / OFFSET 的段里比：
+    没有取前几行，排序不影响算出来的数。"""
+    assert texts(a, b) == [text]
+    assert texts("SELECT SUM(amount) FROM orders ORDER BY 1 DESC", "SELECT SUM(amount) FROM orders") == []
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)

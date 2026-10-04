@@ -7,13 +7,15 @@
 - normalize_sql：字面量换成占位符之后的规范文本，加上字面量本身（按规范文本里的顺序）。两条 SQL 只有字面量不同，
   规范文本就相同；关键字大小写、空白、注释、不加引号的名字的大小写都不算不同。
 - facets：把一条查询拆成几个方面——用到的表、连接（类型、关联进来的表、ON 条件）、WHERE 的各个合取式、其中的
-  时间条件（列、运算符、取值）、分组、聚合（函数、参数、是否去重）、HAVING、LIMIT。别名一律换成真实表名，
-  等式、比较的两边排好顺序：o.paid_at >= '2026-09-01' 和 '2026-09-01' <= orders.paid_at 是同一个条件。
+  时间条件（列、运算符、取值）、分组、聚合（函数、参数、是否去重）、HAVING、取哪几行（LIMIT、OFFSET、取前几行
+  时的排序）。别名一律换成真实表名（条件里套着的子查询也是），等式、比较的两边排好顺序：o.paid_at >= '2026-09-01'
+  和 '2026-09-01' <= orders.paid_at 是同一个条件。
 - diff_facets：逐个方面比两份 facets，每处不同给一句中文说明。
 
-**逐段收集。** CTE、子查询里的条件和聚合也算进来：盲算可能把有效记录条件写在 CTE 里，原流程写在外层，按
+**逐段收集。** CTE、子查询里的条件、聚合和取行也算进来：盲算可能把有效记录条件写在 CTE 里，原流程写在外层，按
 「整条语句里有哪些条件」比才不会把同一个口径报成不同。逗号连接（以及 INNER JOIN 之外又写在 WHERE 里的等值关联）
-写在 WHERE 里的列等式算作关联条件，不算筛选。
+写在 WHERE 里的列等式算作关联条件，不算筛选。条件里套着的子查询（EXISTS、IN (SELECT …)）既单算一段，也按它自己
+那一段的来源整个写进外层那个条件：别名在子查询里定义，拿外层的来源去认，同一个条件只因别名不同就会被报成不同。
 
 **和 sqlcheck 一样宁可漏报。** 解析不了（语法错、方言特性、多条语句、不是查询）就带 parse_error 返回，从不抛
 异常。没加表前缀、又有好几张表可能有这一列的，照写列名（给了表结构才去对）。只读语法树，不执行 SQL。
@@ -24,6 +26,7 @@ import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from itertools import zip_longest
 from typing import Any
 
 from app.data import catalog
@@ -36,6 +39,9 @@ logger = logging.getLogger(__name__)
 PLACEHOLDER = "?"
 #: 太长的 SQL 不做语法分析（normalize_sql 退回逐词规范化，facets 带 parse_error）：解析耗时随长度增长
 MAX_SQL_CHARS = 100_000
+#: 每段 SELECT 在语法树上记段号的 meta 键。条件、表达式要复制一份再改写，复制出来的子查询靠段号找回原来那一段
+#: 算好的来源（别名、外层）：复制品没有父节点，自己找不到外层
+_SEGMENT = "sql_semantics_segment"
 
 
 # ==========================================================================
@@ -250,8 +256,24 @@ class Aggregate:
 
 
 @dataclass(frozen=True)
+class LimitFacet:
+    """一段查询取哪几行。count、offset 是行数和跳过行数的写法（没写为 None，OFFSET 0 也算没写）；order 是这一段的
+    排序键 (Part, 是否降序)：只取前几行时，按什么排决定了取到的是哪几行。scope 是哪一段：None 是最外层，CTE 写它的
+    名字，FROM 里的子查询写它的别名（没有别名写「子查询」）。条件里套着的子查询不单算：它整个写在那个条件里比。"""
+
+    count: str | None
+    offset: str | None = None
+    order: tuple[tuple[Part, bool], ...] = ()
+    scope: str | None = None
+
+
+@dataclass(frozen=True)
 class Facets:
-    """一条查询的各个方面。每一项都按在 SQL 里出现的先后排、按 key 去重；parse_error 不为空时其余都是空的。"""
+    """一条查询的各个方面。每一项都按在 SQL 里出现的先后排、按 key 去重；parse_error 不为空时其余都是空的。
+
+    limit 是最外层 LIMIT 的行数（写法）；limits 是各段取哪几行（最外层在前，见 LimitFacet），只有写了 LIMIT 或
+    OFFSET 的段才有。
+    """
 
     dialect: str | None = None
     tables: tuple[Part, ...] = ()
@@ -262,6 +284,7 @@ class Facets:
     aggregates: tuple[Aggregate, ...] = ()
     having: tuple[Part, ...] = ()
     limit: str | None = None
+    limits: tuple[LimitFacet, ...] = ()
     parse_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -417,6 +440,11 @@ class _Statement:
 
         self.root = root
         self.read = read
+        #: 各段 SELECT（原树上的节点），下标就是记在 meta 里的段号
+        self.segments: list[Any] = []
+        for select in root.find_all(exp.Select, bfs=False):
+            select.meta[_SEGMENT] = len(self.segments)
+            self.segments.append(select)
         self.ctes: dict[str, Any] = {}
         for cte in root.find_all(exp.CTE):
             if cte.alias:
@@ -552,36 +580,82 @@ class _Statement:
 
     # ---- 写成 key / text
 
+    @staticmethod
+    def _owner(node: Any) -> Any:
+        """node 往上最近的一段 SELECT（带段号的，node 本身是也算）；没有就是 None：node 在调用方那一段里。"""
+        from sqlglot import exp
+
+        while node is not None:
+            if isinstance(node, exp.Select) and node.meta.get(_SEGMENT) is not None:
+                return node
+            node = node.parent
+        return None
+
+    def scope(self, node: Any, default: dict[str, _Source]) -> dict[str, _Source]:
+        """node 所在那一段的来源。条件里套着的子查询（EXISTS、IN (SELECT …)）是另一段：别名在那一段里定义，相关
+        子查询还要到外层找。复制出来的子查询带着段号，按段号找回原树上那一段算好的来源；不在子查询里就是 default。"""
+        owner = self._owner(node)
+        return default if owner is None else self.sources(self.segments[owner.meta[_SEGMENT]])
+
     def render(self, node: Any, sources: dict[str, _Source], mode: str = "text") -> str:
         """四种写法（见 Part）：key、loose 比较用，名字按 name_key，key 写真实表名、loose 不写；text、full 给人看，
-        text 只在好几张表都有这一列时写真实表名，full 一律写（关联条件说的就是两张表各出哪一列，用 full）。"""
+        text 只在好几张表都有这一列时写真实表名，full 一律写（关联条件说的就是两张表各出哪一列，用 full）。
+
+        node 里套着的子查询逐段改写：每一列按它所在那一段的来源认，子查询里的表去掉别名（列已经写成了真实表名）。
+        子查询里拿两张表的列互相比的（相关子查询），给人看时和关联条件一样写表名。
+        """
         from sqlglot import exp
 
         copy = node.copy()
-        for col in _own_columns(copy):
-            source, name = self.resolve(col, sources)
-            quoted = isinstance(col.this, exp.Identifier) and bool(col.this.args.get("quoted"))
-            if mode in ("key", "loose"):
-                col.set("this", exp.to_identifier(name_key(name)))
-                col.set("table", exp.to_identifier(source.key) if source is not None and mode == "key" else None)
-                col.set("db", None)
-                col.set("catalog", None)
-                continue
-            col.set("this", exp.Identifier(this=name, quoted=quoted or not _PLAIN_NAME.match(name)))
-            if source is None or (source.kind != "other" and mode != "full"
-                                  and (self.single or name_key(name) not in self.shared())):
-                col.set("table", None)
-                col.set("db", None)
-                col.set("catalog", None)
-            else:
-                *heads, last = source.idents or (exp.to_identifier(source.name),)
-                col.set("table", last.copy())
-                col.set("db", heads[-1].copy() if heads else None)
-                col.set("catalog", heads[-2].copy() if len(heads) > 1 else None)
+        groups: dict[int, tuple[Any, list[Any]]] = {}
+        for col in copy.find_all(exp.Column):
+            if col.name and not col.is_star:
+                owner = self._owner(col)
+                groups.setdefault(id(owner), (owner, []))[1].append(col)
+        for owner, cols in groups.values():
+            scope = sources if owner is None else self.sources(self.segments[owner.meta[_SEGMENT]])
+            found = [(col, *self.resolve(col, scope)) for col in cols]
+            here = mode
+            if owner is not None and mode == "text" and len({s.key for _, s, _ in found if s is not None}) > 1:
+                here = "full"
+            for col, source, name in found:
+                self._write(col, source, name, here)
+        for table in copy.find_all(exp.Table):
+            if isinstance(table.this, exp.Identifier) and self._owner(table) is not None:
+                table.set("alias", None)
+                if mode in ("key", "loose"):
+                    for arg in ("catalog", "db", "this"):
+                        ident = table.args.get(arg)
+                        if isinstance(ident, exp.Identifier):
+                            table.set(arg, exp.to_identifier(name_key(ident.name)))
         return copy.sql(dialect=self.read, comments=False)
 
+    def _write(self, col: Any, source: _Source | None, name: str, mode: str) -> None:
+        """按 render 的写法改写一列（就地改）。"""
+        from sqlglot import exp
+
+        quoted = isinstance(col.this, exp.Identifier) and bool(col.this.args.get("quoted"))
+        if mode in ("key", "loose"):
+            col.set("this", exp.to_identifier(name_key(name)))
+            col.set("table", exp.to_identifier(source.key) if source is not None and mode == "key" else None)
+            col.set("db", None)
+            col.set("catalog", None)
+            return
+        col.set("this", exp.Identifier(this=name, quoted=quoted or not _PLAIN_NAME.match(name)))
+        if source is None or (source.kind != "other" and mode != "full"
+                              and (self.single or name_key(name) not in self.shared())):
+            col.set("table", None)
+            col.set("db", None)
+            col.set("catalog", None)
+        else:
+            *heads, last = source.idents or (exp.to_identifier(source.name),)
+            col.set("table", last.copy())
+            col.set("db", heads[-1].copy() if heads else None)
+            col.set("catalog", heads[-2].copy() if len(heads) > 1 else None)
+
     def canonical(self, node: Any, sources: dict[str, _Source]) -> Any:
-        """比较的两边排好顺序（列在左、字面量在右；两边都有列的按 key 排），IN 的取值排好序。返回新的树。"""
+        """比较的两边排好顺序（列在左、字面量在右；两边都有列的按 key 排），IN 的取值排好序。返回新的树。
+        套着的子查询里的比较按它那一段的来源排：拿外层的来源去认子查询的别名，排出来的先后就取决于别名怎么起。"""
         from sqlglot import exp
 
         def fix(n: Any) -> Any:
@@ -589,8 +663,8 @@ class _Statement:
             if found is not None and isinstance(n, exp.Binary):
                 left, right = n.this, n.expression
                 lc, rc = bool(_own_columns(left)), bool(_own_columns(right))
-                if (rc and not lc) or (lc and rc and self.render(left, sources, "key")
-                                       > self.render(right, sources, "key")):
+                here = self.scope(n, sources) if lc and rc else sources
+                if (rc and not lc) or (lc and rc and self.render(left, here, "key") > self.render(right, here, "key")):
                     return getattr(exp, found[1])(this=right, expression=left)
             elif isinstance(n, exp.In) and n.expressions and not n.args.get("query") \
                     and not any(_own_columns(e) for e in n.expressions):
@@ -656,9 +730,7 @@ class _Statement:
             joins += [self._join(d, sources) for d in drafts]
             group += self._group(select, sources)
             aggregates += self._aggregates(select, sources)
-            clause = select.args.get("having")
-            having += [self.part(self.canonical(c, sources), sources)
-                       for c in (_conjuncts(clause.this) if clause is not None else [])]
+            having += self._having(select, sources)
         return Facets(
             dialect=self.read,
             tables=tuple(Part.plain(s.key, s.name) for s in self.tables),
@@ -669,6 +741,7 @@ class _Statement:
             aggregates=_dedupe(aggregates, lambda a: (a.func, a.arg.key, a.distinct)),
             having=_dedupe(having, lambda p: p.key),
             limit=self._limit(),
+            limits=tuple(self._limits()),
         )
 
     def _join_drafts(self, select: Any, sources: dict[str, _Source]) -> list[dict[str, Any]]:
@@ -757,25 +830,59 @@ class _Statement:
         return TimePredicate(column=self.part(cols[0], sources), op=op, value=value,
                              condition=self.part(cond, sources, excludes=True))
 
-    def _group(self, select: Any, sources: dict[str, _Source]) -> list[Part]:
-        """分组键。GROUP BY 1 换成 SELECT 里对应的表达式，GROUP BY 别名换成别名指的表达式（MySQL、SQLite 的读法）。"""
+    @staticmethod
+    def _aliases(query: Any) -> dict[str, Any]:
+        """SELECT 里的别名 {name_key: 别名指的表达式}。"""
         from sqlglot import exp
 
+        return {name_key(s.alias): s.this for s in query.selects if isinstance(s, exp.Alias) and s.alias}
+
+    @staticmethod
+    def _target(item: Any, selects: list[Any], aliases: dict[str, Any]) -> Any:
+        """GROUP BY、ORDER BY 里的一项：写序号（1）的换成 SELECT 里对应的表达式，写别名的换成别名指的表达式
+        （MySQL、SQLite 的读法），其余原样。"""
+        from sqlglot import exp
+
+        target = _unparen(item)
+        if isinstance(target, exp.Literal) and not target.is_string and str(target.this).isdigit():
+            index = int(target.this) - 1
+            if 0 <= index < len(selects):
+                return selects[index].this if isinstance(selects[index], exp.Alias) else selects[index]
+        elif isinstance(target, exp.Column) and not target.table and name_key(target.name) in aliases:
+            return aliases[name_key(target.name)]
+        return target
+
+    def _group(self, select: Any, sources: dict[str, _Source]) -> list[Part]:
+        """分组键。GROUP BY 1 换成 SELECT 里对应的表达式，GROUP BY 别名换成别名指的表达式（MySQL、SQLite 的读法）。"""
         group = select.args.get("group")
         if group is None:
             return []
-        selects = select.selects
-        by_alias = {name_key(s.alias): s.this for s in selects if isinstance(s, exp.Alias) and s.alias}
+        selects, aliases = select.selects, self._aliases(select)
+        return [self.part(self.canonical(self._target(item, selects, aliases), sources), sources)
+                for item in group.expressions]
+
+    def _having(self, select: Any, sources: dict[str, _Source]) -> list[Part]:
+        """HAVING 的各个合取式。引用 SELECT 别名的列（HAVING s > 100，MySQL、SQLite 的写法）换成别名指的表达式，
+        和 GROUP BY 别名一个读法：不换的话，写别名和写表达式的同一个条件会被报成两个不同的条件。"""
+        from sqlglot import exp
+
+        clause = select.args.get("having")
+        if clause is None:
+            return []
+        aliases = self._aliases(select)
         out = []
-        for item in group.expressions:
-            target = _unparen(item)
-            if isinstance(target, exp.Literal) and not target.is_string and str(target.this).isdigit():
-                index = int(target.this) - 1
-                if 0 <= index < len(selects):
-                    target = selects[index].this if isinstance(selects[index], exp.Alias) else selects[index]
-            elif isinstance(target, exp.Column) and not target.table and name_key(target.name) in by_alias:
-                target = by_alias[name_key(target.name)]
-            out.append(self.part(self.canonical(target, sources), sources))
+        for cond in _conjuncts(clause.this):
+            copy = cond.copy()
+            for col in _own_columns(copy):
+                target = aliases.get(name_key(col.name)) if not col.table else None
+                # 聚合函数里的名字指的是表里的列，不是别名：SUM(amount) AS amount 之后的 SUM(amount) 不能再换
+                if target is None or any(isinstance(p, exp.AggFunc) for p in _parents(col, stop=None)):
+                    continue
+                if col is copy:
+                    copy = target.copy()
+                    break
+                col.replace(target.copy())
+            out.append(self.part(self.canonical(copy, sources), sources))
         return out
 
     def _aggregates(self, select: Any, sources: dict[str, _Source]) -> list[Aggregate]:
@@ -811,6 +918,76 @@ class _Statement:
         value = node.expression if isinstance(node, exp.Limit) else node.args.get("count")
         return value.sql(dialect=self.read, comments=False) if value is not None else None
 
+    def _limits(self) -> list[LimitFacet]:
+        """各段取哪几行：最外层在前，其余按出现的先后。条件里套着的子查询（WHERE、HAVING、ON 里的）不单算：
+        它整个写在那个条件的 key 里，单算的话同一处不同会报两遍。"""
+        from sqlglot import exp
+
+        out = []
+        for query in self.root.find_all(exp.Select, exp.SetOperation, bfs=False):
+            if query is not self.root and self._in_condition(query):
+                continue
+            if (found := self._limit_of(query)) is not None:
+                out.append(found)
+        return out
+
+    def _in_condition(self, node: Any) -> bool:
+        from sqlglot import exp
+
+        while node is not None and node is not self.root:
+            if isinstance(node, (exp.Where, exp.Having)) or \
+                    (isinstance(node.parent, exp.Join) and node.arg_key == "on"):
+                return True
+            node = node.parent
+        return False
+
+    def _limit_of(self, query: Any) -> LimitFacet | None:
+        """一段的 LIMIT / OFFSET，连同这一段的排序；两样都没写返回 None。"""
+        from sqlglot import exp
+
+        def written(node: Any) -> str | None:
+            return node.sql(dialect=self.read, comments=False) if node is not None else None
+
+        limit, offset = query.args.get("limit"), query.args.get("offset")
+        count = written(limit.expression if isinstance(limit, exp.Limit) else limit.args.get("count")) \
+            if limit is not None else None
+        if offset is None and isinstance(limit, exp.Limit):
+            offset = limit.args.get("offset")        # 有的方言把 OFFSET 挂在 LIMIT 底下
+        skip = written(offset.expression if isinstance(offset, exp.Offset) else offset)
+        if skip is not None and skip.strip() == "0":
+            skip = None                              # OFFSET 0 等于没写
+        if limit is None and skip is None:
+            return None
+        return LimitFacet(count=count, offset=skip, order=self._order(query), scope=self._scope_name(query))
+
+    def _order(self, query: Any) -> tuple[tuple[Part, bool], ...]:
+        """这一段的排序键 (Part, 是否降序)。ORDER BY 1、ORDER BY 别名换成 SELECT 里的表达式（UNION 按第一支的）。"""
+        from sqlglot import exp
+
+        order = query.args.get("order")
+        if order is None:
+            return ()
+        select = query if isinstance(query, exp.Select) else None
+        sources = self.sources(select) if select is not None else _Sources()
+        selects = list(query.selects)
+        aliases = self._aliases(query)
+        out = []
+        for item in order.expressions:
+            target = self._target(item.this if isinstance(item, exp.Ordered) else item, selects, aliases)
+            desc = bool(item.args.get("desc")) if isinstance(item, exp.Ordered) else False
+            out.append((self.part(self.canonical(target, sources), sources), desc))
+        return tuple(out)
+
+    def _scope_name(self, query: Any) -> str | None:
+        from sqlglot import exp
+
+        if query is self.root:
+            return None
+        parent = query.parent
+        if isinstance(parent, (exp.CTE, exp.Subquery)) and parent.alias:
+            return parent.alias
+        return "子查询"
+
 
 # ==========================================================================
 # 比较
@@ -820,7 +997,8 @@ class _Statement:
 @dataclass(frozen=True)
 class FacetDiff:
     """一处不同。aspect：time（时间列）/ time_range（同一时间列、范围不同）/ filter / aggregate / join / tables /
-    group_by / having / limit / parse。a、b 是两边各自的写法（给人看，没有就是 None），text 是一句中文说明。
+    group_by / having / limit（取哪几行：行数、跳过的行数、取前几行时的排序）/ parse。a、b 是两边各自的写法（给人看，
+    没有就是 None），text 是一句中文说明。
     detail 只在 time 上有：两边的时间列 [{table, column}]，调用方据此对照数据目录（业务日期）。"""
 
     aspect: str
@@ -908,6 +1086,12 @@ def _rows(limit: str | None) -> str:
     if limit is None:
         return "不限行数"
     return f"只取前 {limit} 行" if limit.isdigit() else f"按 LIMIT {limit} 取行"
+
+
+def _skip(offset: str | None) -> str:
+    if offset is None:
+        return "不跳过行"
+    return f"跳过前 {offset} 行" if offset.isdigit() else f"按 OFFSET {offset} 跳过行"
 
 
 class _Compare:
@@ -1099,14 +1283,55 @@ class _Compare:
              for p in self.b.having if self.k(p) not in ka]
 
     def limit(self) -> list[FacetDiff]:
-        a, b = self.a.limit, self.b.limit
-        return [FacetDiff("limit", a, b, _say(self.la, _rows(a), "，", self.lb, _rows(b)))] if a != b else []
+        """取哪几行：最外层两边比；CTE、子查询里的按出现的先后一一配对（两边给它起的名字可以不同），整组一样就不报。"""
+        def outer(f: Facets) -> LimitFacet | None:
+            return next((x for x in f.limits if x.scope is None), None)
+
+        out = self.rows(outer(self.a), outer(self.b))
+        ia = [x for x in self.a.limits if x.scope is not None]
+        ib = [x for x in self.b.limits if x.scope is not None]
+        if [self.lk(x) for x in ia] != [self.lk(x) for x in ib]:
+            for x, y in zip_longest(ia, ib):
+                out += self.rows(x, y)
+        return out
+
+    def lk(self, x: LimitFacet | None) -> tuple[Any, ...] | None:
+        if x is None:
+            return None
+        return x.count, x.offset, tuple((self.k(p), desc) for p, desc in x.order)
+
+    def sorting(self, x: LimitFacet, *, full: bool = False) -> str:
+        if not x.order:
+            return "没有排序"
+        keys = "、".join(_say(p.full if full else p.text, "降序" if desc else "升序") for p, desc in x.order)
+        return _say("按", keys, "排")
+
+    def rows(self, x: LimitFacet | None, y: LimitFacet | None) -> list[FacetDiff]:
+        """一对段（一边可以没有）取的行有什么不同：行数、跳过的行数，两边都限了行时再比排序。"""
+        if self.lk(x) == self.lk(y):
+            return []
+        sa, sb = (x.scope if x else None), (y.scope if y else None)
+        la = _say(self.la, "在", sa, "里") if sa else self.la
+        lb = _say(self.lb, "在", sb, "里") if sb and sb != sa else self.lb
+        out = []
+        ca, cb = (x.count if x else None), (y.count if y else None)
+        if ca != cb:
+            out.append(FacetDiff("limit", ca, cb, _say(la, _rows(ca), "，", lb, _rows(cb))))
+        oa, ob = (x.offset if x else None), (y.offset if y else None)
+        if oa != ob:
+            out.append(FacetDiff("limit", oa, ob, _say(la, _skip(oa), "，", lb, _skip(ob))))
+        if x is not None and y is not None and self.lk(x)[2] != self.lk(y)[2]:
+            wa, wb = self.sorting(x), self.sorting(y)
+            if wa == wb:
+                wa, wb = self.sorting(x, full=True), self.sorting(y, full=True)
+            out.append(FacetDiff("limit", wa, wb, _say(la, "取行前", wa, "，", lb, wb)))
+        return out
 
 
 def diff_facets(a: Facets, b: Facets, labels: tuple[str, str] = ("A", "B"), *,
                 names: Mapping[str, str] | None = None) -> list[FacetDiff]:
     """逐个方面比两份 facets，每处不同一条，按对结果影响大致从大到小排：时间、筛选、聚合、连接和表、分组、HAVING、
-    LIMIT。完全一致返回空列表。
+    取哪几行。完全一致返回空列表。
 
     labels 是两边的叫法（缺省 A / B，双盲复算可以传「原流程」「盲算」）；names 是列的中文名（{「表.列」或「列」:
     中文名}，可以用 catalog_labels 从数据目录取），给了的话时间列写成「支付时间 paid_at」。任一边解析不了就只返回
@@ -1124,5 +1349,5 @@ def diff_facets(a: Facets, b: Facets, labels: tuple[str, str] = ("A", "B"), *,
     return cmp.time() + cmp.filters() + cmp.aggregates() + cmp.joins() + cmp.group() + cmp.having() + cmp.limit()
 
 
-__all__ = ["MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "FacetDiff", "Facets", "JoinFacet",
+__all__ = ["MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "FacetDiff", "Facets", "JoinFacet", "LimitFacet",
            "NormalizedSql", "Part", "TimePredicate", "catalog_labels", "diff_facets", "facets", "normalize_sql"]
