@@ -11,7 +11,8 @@ import { formatDateTime, formatSpan, formatTime, parseServerTime } from '../lib/
 import { runClassLabel, runName, TOOL_TRUST_TEXT } from '../lib/terms'
 import { useRunClock } from './useRunClock'
 import { Markdown } from './Markdown'
-import type { Approval } from '../types'
+import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
+import type { Approval, ApprovalReport } from '../types'
 
 // 发起运行的表单搬去了 run/RunControl.tsx 的工具栏控件里。它原先常驻在
 // 助手栏顶部，和 Copilot 输入框两个"主要动作"互相压着——而它们是两种不同的
@@ -99,6 +100,12 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
   }
 
   const where = approval.node_label || approval.node_id
+  // 人工审批节点挂起的审批（工具、代码的审批另有 kind）：卡上标明运行类别、批了会怎样，审的是报告时附上核对概况
+  const humanNode = payload.kind === 'human_node'
+  const reports: ApprovalReport[] = Array.isArray(payload.reports)
+    ? payload.reports.filter((r: unknown): r is ApprovalReport =>
+      !!r && typeof r === 'object' && typeof (r as ApprovalReport).node_id === 'string')
+    : []
   return (
     <div className="fade-up border-b p-3 last:border-b-0" data-approval={approval.id}
          style={{ background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
@@ -109,7 +116,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         <span>人工审批</span>
         {showWorkflow && approval.workflow_name && <><span aria-hidden>·</span><span>{runName(approval)}</span></>}
         {where && <><span aria-hidden>·</span><span>节点「{where}」</span></>}
-        {approval.run_class && <><span aria-hidden>·</span><span>{runClassLabel(approval.run_class)}</span></>}
+        {approval.run_class && !humanNode && <><span aria-hidden>·</span><span>{runClassLabel(approval.run_class)}</span></>}
         {created && (
           <>
             <span aria-hidden>·</span>
@@ -126,6 +133,9 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         )}
       </div>
 
+      {/* 老后端的审批没有运行类别：不猜，不画这一行 */}
+      {humanNode && approval.run_class && <ApprovalRunClass runClass={approval.run_class} approve={approveMode} />}
+
       {payload.message && (
         // 待审的往往是一整段模型写的文案，同样是 Markdown。要人家判断"能不能
         // 发"，却让他对着一堆星号看，是在给审批这件事添难度
@@ -133,6 +143,8 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
           <Markdown text={String(payload.message)} dense />
         </div>
       )}
+
+      <ApprovalReports reports={reports} runId={approval.run_id} runClass={approval.run_class} />
 
       {payload.tool && (
         <div className="mb-2 rounded border bg-bg p-2">

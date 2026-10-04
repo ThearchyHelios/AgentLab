@@ -174,6 +174,21 @@ export interface Approval {
 }
 
 /**
+ * 人工审批审的报告的核对概况（human 节点请求里的 payload.reports，服务端 nodes/human._reviewed_reports）：
+ * 上游直接连着的、或者标题和说明里引用了正文的报告撰写节点，各一项。stats 同 report.checked，judge 是裁判摘要
+ * 的几项（mode：inline 节点里当场判的 / on_demand 探索运行按需判）。老后端、审的不是报告时没有
+ */
+export interface ApprovalReport {
+  node_id: string
+  label?: string
+  stats?: EvidenceStats
+  /** 结论句策略：off / require_citation / judge */
+  claims?: string
+  doc_artifact?: string
+  judge?: { mode?: string; counts?: Record<string, unknown>; complete?: boolean; unjudged?: unknown; limits_hit?: unknown }
+}
+
+/**
  * 后端记着的最近一次测连接（模型接入、数据源、MCP 的列表接口都平铺这四项）。
  * 没测过、或者连接配置改过之后全是 null。用 lib/health 的 healthFromServer 转成
  * HealthRecord 给 HealthPill

@@ -88,6 +88,33 @@ export function runClassLabel(runClass: 'formal' | 'exploratory' | null | undefi
 }
 
 /**
+ * 审批卡上人工审批的运行类别和审的报告的核对概况。出具只发生在成果节点配了出具契约、从已发布版本发起的正式运行里：
+ * 探索运行批准后只是输出，卡上要说破，不能让审批人以为自己在签发正式的东西
+ */
+export const APPROVAL_TEXT = {
+  /** 人工审批批了会怎样，按运行类别说 */
+  outcome: (runClass: 'formal' | 'exploratory' | null | undefined, approve: boolean) => (runClass === 'formal'
+    ? `从已发布版本发起，${approve ? '批准' : '提交'}后继续运行`
+    : `${approve ? '批准后输出' : '提交后继续运行'}，这是探索运行，不是正式出具`),
+  reportHead: (label: string) => `报告「${label}」的核对`,
+  noNumbers: '报告中没有需要核对的数字',
+  /** 节点里当场裁判过（正式运行开了结论句裁判）：判了几句、几句证据相矛盾、几句没判成 */
+  claimsJudged: (judged: number, contradicted: number, unjudged: number) =>
+    `结论句已裁判 ${formatNumber(judged)} 句，证据相矛盾 ${formatNumber(contradicted)} 句`
+    + (unjudged ? `，未裁判 ${formatNumber(unjudged)} 句` : ''),
+  claimsNone: '报告中没有需要裁判的结论句',
+  claimsPending: '结论句尚未核对',
+  /** 探索运行停在审批上时还没封存，按需裁判要等运行结束 */
+  claimsLater: '探索运行不在节点内裁判，运行结束后可在证据中逐句请模型判断',
+  /** 正式运行、报告没开结论句裁判 */
+  claimsOff: '这份报告没有开启结论句裁判',
+  openEvidence: '查看逐段证据',
+  closeEvidence: '收起证据',
+  docLoading: '正在加载报告文档…',
+  docMissing: '无法获取报告文档',
+}
+
+/**
  * 没挂在工作流上的运行：画布或问数据当场搭的，从没存成工作流。后端给它的名字老数据是
  * 「临时图」、新的是「未保存的工作流」，也可能是空的；界面上一律叫「未保存的工作流」。
  * 运行和审批都带 workflow_id / workflow_name，记录页、命令面板、审批卡、通知走同一处

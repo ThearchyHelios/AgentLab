@@ -33,6 +33,8 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
     if mode == "edit":
         payload["draft"] = ctx.render(ctx.cfg("draft", ""), state)
+    if reports := _reviewed_reports(state, ctx):
+        payload["reports"] = reports
 
     response = await ask(ctx, payload, **payload)
     # 谁批的跟着事件走：时间线要写得出"张工驳回了"，没署名就是 None，不再默认写"你"
@@ -69,6 +71,52 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: result.get("value", result.get("approved"))}
     return updates
+
+
+#: 模板里对某个节点产出的引用：{{ nodes.write.text }}、{{ vars.weekly }}
+_NODE_REF = re.compile(r"\bnodes\s*\.\s*([\w-]+)")
+_VAR_REF = re.compile(r"\bvars\s*\.\s*([\w-]+)")
+#: 审批卡要的裁判摘要：判了几句、各判成什么、有没有判完。其余（上限、费用、模型名）留在证据面板里看
+_JUDGE_KEYS = ("mode", "counts", "complete", "unjudged", "limits_hit")
+
+
+def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any]]:
+    """这次审批审的报告各自的核对概况：上游直接连着的报告撰写节点，加上标题、说明里引用了正文的
+    （{{ nodes.<id>.text }}，或者报告的 assign_to 变量）。
+
+    真实运行里报告有一句结论和证据相矛盾，审批人批准时完全不知道：审批卡只有正文。这里带上报告节点产出里的
+    stats（同 report.checked）、结论句策略、裁判摘要和报告文档的工件 id，审批卡据此写核对概况、给打开证据的入口。
+    只认已经跑完、带着核对统计的报告；重放时 state 一样，算出来的也一样。"""
+    from app.engine.schema import NodeType
+
+    spec = ctx.run.spec
+    nodes = spec.node_map()
+    text = " ".join(json.dumps(ctx.config.get(key), ensure_ascii=False, default=str)
+                    for key in ("title", "message", "context", "draft") if ctx.config.get(key))
+    # 报告节点的 assign_to 也能把正文交给下游：{{ vars.<assign_to> }} 和 {{ nodes.<id>.text }} 一样算引用
+    by_var = {str(n.config.get("assign_to")): n.id for n in spec.nodes
+              if n.type == NodeType.REPORT and n.config.get("assign_to")}
+    wanted = ([e.source for e in spec.edges if e.target == ctx.node.id] + _NODE_REF.findall(text)
+              + [by_var[v] for v in _VAR_REF.findall(text) if v in by_var])
+    outputs = state.get("nodes") or {}
+    out: list[dict[str, Any]] = []
+    for rid in dict.fromkeys(wanted):
+        node = nodes.get(rid)
+        result = outputs.get(rid)
+        if node is None or node.type != NodeType.REPORT or not isinstance(result, dict) \
+                or not isinstance(result.get("stats"), dict):
+            continue
+        item: dict[str, Any] = {
+            "node_id": rid, "label": node.title,
+            "stats": {k: v for k, v in result["stats"].items() if isinstance(v, int) and not isinstance(v, bool)},
+            "claims": result.get("claims") or "off",
+        }
+        if isinstance(result.get("doc_artifact"), str) and result["doc_artifact"]:
+            item["doc_artifact"] = result["doc_artifact"]
+        if isinstance(result.get("judge"), dict):
+            item["judge"] = {k: result["judge"][k] for k in _JUDGE_KEYS if k in result["judge"]}
+        out.append(item)
+    return out
 
 
 # --------------------------------------------------------------------------

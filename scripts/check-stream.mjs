@@ -923,8 +923,63 @@ await section('审批卡的上下文', async () => {
   check('没署名时提醒并给去处', body.includes('未署名') && await page.locator('a[href="/settings/prefs"]').count() === 1)
   await page.close()
   const s = await open('approval=1&actor=张工', { w: 820, h: 500, name: 'approval-signed' })
-  check('署了名就写明以谁的名义', (await s.page.locator('body').innerText()).includes('将以「张工」签批'))
+  const signed = await s.page.locator('body').innerText()
+  check('署了名就写明以谁的名义', signed.includes('将以「张工」签批'))
+  // 人工审批自己标明运行类别：正式运行从已发布版本发起
+  check('人工审批：正式运行标明类别和批了会怎样', await s.page.locator('[data-approval-run-class="formal"]').count() === 1
+    && signed.includes('从已发布版本发起，批准后继续运行'), signed.replace(/\n/g, ' ').slice(0, 200))
   await s.page.close()
+})
+
+await section('审批卡：审的报告的核对概况', async () => {
+  // 真实运行里审批说明写着「批准后才会正式出具」，那却是一次探索运行；报告里一句结论和证据相矛盾，审批人批准时完全
+  // 不知道。审批卡自己标明运行类别，附上报告的核对概况和查看逐段证据的入口。文档、片段、证据图都用夹具伪造，非 GET 拦掉
+  const { readFileSync } = await import('node:fs')
+  const fx = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
+  const page = await browser.newPage({ viewport: { width: 420, height: 900 } })
+  const errors = []
+  page.on('pageerror', (e) => errors.push(e.message))
+  await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
+    const url = new URL(r.request().url())
+    if (r.request().method() !== 'GET') return r.abort()
+    const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+    if (seg) return r.fulfill({ json: fx.segments[seg[1]] ?? {} })
+    if (url.pathname === `/api/runs/${fx.run_id}/evidence`) return r.fulfill({ json: fx.graph })
+    if (url.pathname === `/api/artifacts/${fx.doc_artifact}`) return r.fulfill({ json: { id: fx.doc_artifact, content: fx.doc } })
+    return r.continue()
+  })
+  await page.goto(`${WEB}/preview.html?approval=report&dense=1&actor=张工`, { waitUntil: 'networkidle' })
+  await page.waitForSelector('[data-approval]', { timeout: 6000 })
+  const card = page.locator('[data-approval]')
+  const text = await card.innerText()
+  check('探索运行：标明类别，写明批准后输出、不是正式出具', await card.locator('[data-approval-run-class="exploratory"]').count() === 1
+    && text.includes('批准后输出，这是探索运行，不是正式出具'), text.replace(/\n/g, ' ').slice(0, 160))
+  const report = card.locator('[data-approval-report="write"]')
+  check('报告的核对概况：标题写哪份报告', (await report.innerText()).includes('报告「写周报」的核对'))
+  check('数字和证据条同一种说法', (await report.locator('[data-approval-report-numbers]').innerText())
+    .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用无法解析'), await report.locator('[data-approval-report-numbers]').innerText())
+  check('探索运行：结论句尚未核对，并说运行结束后才能逐句判断', (await report.locator('[data-approval-report-claims]').innerText())
+    .includes('结论句尚未核对') && (await report.innerText()).includes('运行结束后可在证据中逐句请模型判断'))
+  await report.locator('[data-approval-evidence]').click()
+  await page.waitForSelector('[data-approval-evidence-doc] [data-evidence-doc]', { timeout: 6000 })
+  check('查看逐段证据：卡里展开可点的报告文档，自带证据条', await report.locator('[data-evidence-doc] [data-seg]').count() > 0
+    && await report.locator('[data-evidence-tally]').count() === 1)
+  await report.locator('[data-seg="s6"]').click()
+  await page.waitForSelector('[data-approval] [data-evidence-panel]', { timeout: 6000 })
+  check('点数字打开证据面板，在卡内展开', await page.locator('[data-approval] [data-evidence-panel]').getAttribute('data-evidence-panel') === 'inline')
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('展开后不撑破窄栏', overflow <= 0, `${overflow}px`)
+  await report.locator('[data-approval-evidence]').click()
+  check('再点一下收起', await report.locator('[data-approval-evidence-doc]').count() === 0)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+
+  const f = await open('approval=report-formal&dense=1&actor=张工', { w: 420, h: 700, name: 'approval-report-formal' })
+  const formal = await f.page.locator('[data-approval-report="write"]').innerText()
+  check('正式运行：节点里判过的写判了几句、几句证据相矛盾', formal.includes('结论句已裁判 6 句，证据相矛盾 1 句'), formal.replace(/\n/g, ' '))
+  check('正式运行：数字都有出处', formal.includes('12 个数字都有出处'))
+  check('正式运行：卡上标明正式运行', await f.page.locator('[data-approval-run-class="formal"]').count() === 1)
+  await f.page.close()
 })
 
 await section('画布右栏：运行视图', async () => {
