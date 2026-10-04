@@ -22,6 +22,7 @@ TYPE_LABEL: dict[str, str] = {
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
     "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
+    "dual_check": "双盲复算", "challenge": "反方审稿",
 }
 
 #: 各类节点共用的字段名（nodeDefs.ts）。同一个键在不同节点上叫法不同的，见 _FIELD_BY_TYPE

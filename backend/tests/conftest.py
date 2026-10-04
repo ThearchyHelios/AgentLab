@@ -20,6 +20,8 @@ _TMP = Path(tempfile.mkdtemp(prefix="agentlab-tests-"))
 os.environ["AGENTLAB_DATA_DIR"] = str(_TMP)
 # 别把真实的 key 带进测试环境
 os.environ.setdefault("AGENTLAB_SECRET_KEY", "test-only-not-a-real-key")
+# 定时任务的调度循环不在测试里起：走 lifespan 的测试不该到点替人发起运行。要测调度的直接调它
+os.environ.setdefault("AGENTLAB_SCHEDULER", "0")
 
 import pytest  # noqa: E402
 

@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     max_upload_mb: int = 50
     max_concurrent_runs: int = 20
 
+    # --- 定时任务 ---
+    # 后台调度循环开不开（AGENTLAB_SCHEDULER=0 / false / off 关掉）。拷一份数据目录另起的服务
+    # （检查脚本的 --stacks、沙箱）必须关：库里的定时任务会照常到点发起运行、发出 webhook，
+    # 拷贝里的任务和原库的是同一批，等于同一件事做两遍
+    scheduler: bool = True
+
     # --- 工具 ---
     http_tool_timeout: int = 20
     http_tool_max_bytes: int = 2_000_000
@@ -115,6 +121,15 @@ class Settings(BaseSettings):
 
                 return json.loads(text)
             return [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @field_validator("scheduler", mode="before")
+    @classmethod
+    def _blank_is_default(cls, value: object) -> object:
+        # AGENTLAB_SCHEDULER= 写成空值等于没设（默认开）。其余写法照 pydantic 的布尔解析：
+        # 0 / false / off / no 关，1 / true / on / yes 开，认不出的值启动时就报错，不猜
+        if isinstance(value, str) and not value.strip():
+            return True
         return value
 
     @field_validator("web_dist", mode="before")

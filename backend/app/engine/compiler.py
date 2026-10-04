@@ -11,7 +11,9 @@ from langgraph.graph import END, START, StateGraph
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
-from app.engine.nodes import control, human, io, knowledge, llm, merge, metrics, multi, report, tools
+from app.engine.nodes import (
+    challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
+)
 from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
 from app.engine.state import GraphState
 
@@ -37,6 +39,8 @@ RUNNERS: dict[NodeType, NodeRunner] = {
     NodeType.METRICS: metrics.run_metrics,
     NodeType.RETRIEVE: knowledge.run_retrieve,
     NodeType.REPORT: report.run_report,
+    NodeType.DUAL_CHECK: dual_check.run_dual_check,
+    NodeType.CHALLENGE: challenge.run_challenge,
 }
 
 # 这些节点的出边由"决定"路由，不能直接连死

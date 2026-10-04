@@ -37,6 +37,9 @@ class NodeType(StrEnum):
     VALIDATE = "validate"  # 结构化校验 + 自动重试
     METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
     REPORT = "report"  # 报告撰写：模型只写引用标记，数字由系统从口径卡取出来渲染
+    # 下面两种目前只是占位（执行器原样放行），各自的工作包补上真正的逻辑
+    DUAL_CHECK = "dual_check"  # 双盲复算：另起一路独立算一遍，和原结果比对
+    CHALLENGE = "challenge"  # 反方审稿：专挑报告的毛病，提出反驳意见
 
 
 # 节点类型在画布上的叫法（TYPE_LABEL / type_label）从 labels.py 导入：报错和门禁文案用它，
