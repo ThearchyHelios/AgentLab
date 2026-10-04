@@ -773,9 +773,24 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       // 写作目录超出篇幅（report.py _trimmed_message）。读结构化字段（queries、omitted、nodes），不从原话里认
       const total = typeof d.queries === 'number' ? d.queries : undefined
       const omitted = typeof d.omitted === 'number' ? d.omitted : undefined
+      const compact = typeof d.compact === 'number' ? d.compact : undefined
       const rows: any[] = Array.isArray(d.nodes) ? d.nodes : []
       const per = rows.filter((r) => typeof r?.omitted === 'number' && r.omitted > 0 && str(r?.title))
         .map((r) => `${r.title} 省略 ${formatNumber(r.omitted)}/${formatNumber(r.total)} 次`)
+      const all = total != null ? `${formatNumber(total)} 次查询都列出了数据` : '查询都列出了数据'
+      if (omitted === 0) {
+        // 放不下但一次查询都没省略：有的只列了前几行，或者只省略了表和字段的说明。不写「0 次只列了编号和摘要」
+        const rowsPer = rows.filter((r) => typeof r?.compact === 'number' && r.compact > 0 && str(r?.title))
+          .map((r) => `${r.title} ${formatNumber(r.compact)}/${formatNumber(r.total)} 次只列前几行`)
+        return {
+          title: compact ? `证据目录超出篇幅，${all}，${formatNumber(compact)} 次只列了前几行`
+            : compact === 0 ? `证据目录超出篇幅，${all}，表和字段的说明有省略`
+            : `证据目录超出篇幅，${all}，部分明细有省略`,
+          sub: rowsPer.length ? rowsPer.join('、') : undefined,
+          next: '写作模型看到了每次查询，但有的只看到前几行；其余的行仍在证据台账里，报告不得据此断言没有数据。'
+            + '需要完整明细时，请换用上下文窗口更大的写作模型，或让 Agent 在 SQL 中先汇总再交出结果',
+        }
+      }
       return {
         title: omitted != null
           ? `证据目录超出篇幅，${total != null ? `${formatNumber(total)} 次查询中 ` : ''}${formatNumber(omitted)} 次只列了编号和摘要`

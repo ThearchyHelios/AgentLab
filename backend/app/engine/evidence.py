@@ -3277,6 +3277,7 @@ class WriterCatalog:
     - trimmed：放不下、有省略；nodes 是各来源的查询数 [{node_id, title, total, full, compact, omitted}]，
       full 列出前 20 行、compact 只列前几行、omitted 只列编号和摘要；omitted 是只列摘要的查询编号
     - empty_sources：结构化结论为空的来源（Agent 的名字）
+    - compact_rows：只列前几行的查询列了几行
     清单有省略、或有来源的结构化结论为空时，报告节点加写作规则（ABSENCE_RULE）；有省略时组装文档另查缺失断言
     """
 
@@ -3287,6 +3288,12 @@ class WriterCatalog:
     nodes: list[dict[str, Any]] = field(default_factory=list)
     omitted: list[str] = field(default_factory=list)
     empty_sources: list[str] = field(default_factory=list)
+    compact_rows: int = _PROMPT_COMPACT_ROWS
+
+    @property
+    def compact(self) -> int:
+        """列出了数据、但只列了前 compact_rows 行的查询次数。"""
+        return sum(int(r.get("compact") or 0) for r in self.nodes)
 
     @property
     def guarded(self) -> bool:

@@ -207,3 +207,45 @@ async def test_the_window_comes_from_the_provider_entry_then_the_catalog():
         finally:
             await session.execute(delete(Provider).where(Provider.id == row.id))
             await session.commit()
+
+
+# ---------------------------------------------------------------- 警告说的是实情
+
+
+def _writer(nodes, omitted=()):
+    from app.engine.evidence import WriterCatalog
+
+    return WriterCatalog(text="", budget=51200, queries=sum(r["total"] for r in nodes), trimmed=True, nodes=nodes,
+                         omitted=list(omitted))
+
+
+def _row(title, total, *, full=0, compact=0, omitted=0):
+    return {"node_id": title, "title": title, "total": total, "full": full, "compact": compact, "omitted": omitted}
+
+
+def test_the_warning_names_omitted_queries_when_there_are_some():
+    from app.engine.nodes.report import _trimmed_message
+
+    text = _trimmed_message(_writer([_row("会员专项", 26, full=26), _row("卡券核销", 79, full=20, omitted=59)],
+                                    omitted=[f"Q{i}" for i in range(1, 60)]))
+    assert "105 次查询中 46 次列出了数据，59 次只列编号和摘要（卡券核销省略 59 次）" in text
+    assert "看不到这些查询的明细" in text
+
+
+def test_all_queries_listed_but_some_only_first_rows_is_not_called_omitted():
+    """放不下但查询全都列出，只是有的只列前几行：不写「0 次只列编号和摘要（）」，写清是行数有省略。"""
+    from app.engine.nodes.report import _trimmed_message
+
+    writer = _writer([_row("会员专项", 26, full=26), _row("卡券核销", 79, full=30, compact=49)])
+    text = _trimmed_message(writer)
+    assert writer.compact == 49
+    assert f"105 次查询都列出了数据，其中 49 次只列前 {writer.compact_rows} 行（卡券核销 49 次）" in text
+    assert "看不到这些查询其余的行" in text
+    assert "只列编号和摘要" not in text and "（）" not in text
+
+
+def test_only_the_table_notes_were_cut():
+    from app.engine.nodes.report import _trimmed_message
+
+    text = _trimmed_message(_writer([_row("会员专项", 26, full=26)]))
+    assert "26 次查询都列出了数据，表和字段、知识库检索的说明有省略" in text and "（）" not in text

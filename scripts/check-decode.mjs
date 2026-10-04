@@ -1336,6 +1336,19 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
         { node_id: 'c', title: '活动内容', total: 42, omitted: 22 }] })])).find((s) => s.code === 'report_catalog_trimmed')
   check('report_catalog_trimmed：标题说几次查询只列了编号和摘要', trimmed?.title === '证据目录超出篇幅，164 次查询中 74 次只列了编号和摘要', trimmed?.title)
   check('……副标题按来源列省略了几次（没省略的来源不列）', trimmed?.sub === '卡券核销 省略 52/79 次、活动内容 省略 22/42 次', trimmed?.sub)
+  // 放不下但查询全都列出、只是有的只列前几行：不写「0 次只列了编号和摘要」
+  const rowsOnly = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '证据目录超出篇幅', budget: 51200, window: null,
+      queries: 140, omitted: 0, compact: 38, compact_rows: 3, nodes: [{ node_id: 'a', title: '会员专项', total: 60, omitted: 0, compact: 0 },
+        { node_id: 'b', title: '卡券核销', total: 80, omitted: 0, compact: 38 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('……查询全都列出、有的只列前几行：标题照实说，不写「0 次只列了编号和摘要」',
+    rowsOnly?.title === '证据目录超出篇幅，140 次查询都列出了数据，38 次只列了前几行' && !rowsOnly?.title?.includes('编号和摘要'), rowsOnly?.title)
+  check('……副标题按来源列只列了前几行的次数', rowsOnly?.sub === '卡券核销 38/80 次只列前几行', rowsOnly?.sub)
+  check('……下一步说其余的行仍在台账里', !!rowsOnly?.next?.includes('只看到前几行') && !!rowsOnly?.next?.includes('不得据此断言没有数据'), rowsOnly?.next)
+  const notesOnly = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '证据目录超出篇幅', queries: 12, omitted: 0, compact: 0,
+      nodes: [{ node_id: 'a', title: '会员专项', total: 12, omitted: 0, compact: 0 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('……只省略了表和字段的说明：照实说', notesOnly?.title === '证据目录超出篇幅，12 次查询都列出了数据，表和字段的说明有省略', notesOnly?.title)
   check('……下一步说被省略的仍在台账里、不得据此断言没有数据，以及怎么看全', !!trimmed?.next?.includes('不得据此断言没有数据')
     && !!trimmed?.next?.includes('上下文窗口更大') && trimmed?.level === 'warn' && trimmed?.detail === TRIMMED, trimmed?.next)
   const trimmedBare = flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '目录有省略' })]))

@@ -189,12 +189,21 @@ async def model_window(session: Any, spec: ModelSpec, model_id: str) -> int | No
 
 
 def _trimmed_message(writer: WriterCatalog) -> str:
-    """写作目录有省略时的那条警告（给人看）：各来源省略了几次，写作模型看不到哪些明细。"""
-    per = "、".join(f"{r['title']}省略 {r['omitted']} 次" for r in writer.nodes if r["omitted"])
-    shown = writer.queries - len(writer.omitted)
-    return (f"证据目录超出篇幅（约 {writer.budget} 字，按写作模型的上下文窗口确定）：{writer.queries} 次查询中 "
-            f"{shown} 次列出了数据，{len(writer.omitted)} 次只列编号和摘要（{per}）。写作模型看不到这些查询的明细，"
-            "报告不得据此断言没有数据")
+    """写作目录有省略时的那条警告（给人看）：省略的是什么、各来源省略了几次，写作模型看不到哪些明细。
+
+    放不下不一定省略了查询：查询全都列出、只是有的只列前几行，或者只省略了表和字段的说明。以前一律按「省略查询」写，
+    全部列出时成了「0 次只列编号和摘要（）。写作模型看不到这些查询的明细」，说的不是实情。"""
+    head = f"证据目录超出篇幅（约 {writer.budget} 字，按写作模型的上下文窗口确定）："
+    if writer.omitted:
+        per = "、".join(f"{r['title']}省略 {r['omitted']} 次" for r in writer.nodes if r["omitted"])
+        shown = writer.queries - len(writer.omitted)
+        return (f"{head}{writer.queries} 次查询中 {shown} 次列出了数据，{len(writer.omitted)} 次只列编号和摘要（{per}）。"
+                "写作模型看不到这些查询的明细，报告不得据此断言没有数据")
+    if writer.compact:
+        per = "、".join(f"{r['title']} {r['compact']} 次" for r in writer.nodes if r.get("compact"))
+        return (f"{head}{writer.queries} 次查询都列出了数据，其中 {writer.compact} 次只列前 {writer.compact_rows} 行"
+                f"（{per}）。写作模型看不到这些查询其余的行，报告不得据此断言没有数据")
+    return f"{head}{writer.queries} 次查询都列出了数据，表和字段、知识库检索的说明有省略"
 
 
 def report_entities(spec: GraphSpec, node: GraphNode) -> str:
@@ -475,7 +484,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if writer.trimmed:
         ctx.emit(EventType.LOG, level="warn", code="report_catalog_trimmed", message=_trimmed_message(writer),
                  budget=writer.budget, window=window, queries=writer.queries, omitted=len(writer.omitted),
-                 nodes=[{k: r[k] for k in ("node_id", "title", "total", "omitted")} for r in writer.nodes])
+                 compact=writer.compact, compact_rows=writer.compact_rows,
+                 nodes=[{k: r[k] for k in ("node_id", "title", "total", "omitted", "compact")} for r in writer.nodes])
     messages = _messages(ctx, state, writer, claims)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
