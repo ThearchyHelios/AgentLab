@@ -2,11 +2,14 @@
 //
 // 守的是这些「看着没坏、其实用不了」的地方：横幅没了或者不醒目（推演被当成出具）、边打字边发请求、请求体里的
 // 输入路径和行号不对（行号对人从 1 数，对接口从 0 数）、勾选框在不推演时也冒出来、恢复原值之后还留着一行没勾回去、
-// 不支持的输入一声不吭、窄屏（390px）被推演区撑出横向滚动、浅色主题下横幅看不清。
+// 不支持的输入一声不吭、窄屏（390px）被推演区撑出横向滚动、浅色主题下横幅看不清。还有复核第 1 轮查出来的：整份
+// 结果作输入时无行可勾、窗口里勾了不起作用的行也给勾、勾完行结果不在视野里、加载中和失败后还摆着上一次的答复、
+// 封存核对没过不说、整个指标推演不了时又写「无可推演」又写「无变化」。
 //
 // 跑在预览页上：/preview.html?syn=whatif（宽屏右侧弹出、窄屏底部抽出）和 ?syn=whatif-rail（360px 画布右栏）。
 // 文档是 frontend/src/run/__tests__/evidence-query.json 里后端 compose_doc 真跑出来的（只用通用名）；片段接口
-// 按它的 segments 作答，推演接口按后端 engine/recompute.py 的规则在这里算（只覆盖用到的三个指标），非 GET 一律拦掉。
+// 按它的 segments 作答（s18 改成整份结果作输入），推演接口按后端 engine/recompute.py 的规则在这里算（只覆盖用到的
+// 几个指标），勾行接口按夹具里 Q3 的快照作答，别的非 GET 一律拦掉。
 //
 //   node scripts/check-whatif.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-whatif.mjs
@@ -38,13 +41,23 @@ async function section(name, fn) {
 
 // ---------------------------------------------------------------- 夹具
 
-/** 片段接口的答复：夹具里的原样，s22 改成老运行的容器输入（推演不了的那种） */
+/**
+ * 片段接口的答复：夹具里的原样。s22 改成老运行的容器输入（推演不了的那种）；s18 改成整份查询结果作输入
+ * （len(vars.orders.rows)）：证据链里没有它的查询步骤，和后端真跑出来的一样
+ */
 function segmentReply(sid) {
   const body = structuredClone(fx.segments[sid])
   if (sid === 's22') {
     body.chain[0] = { ...body.chain[0], expression: 'sum(vars.adjust.items)', substituted: 'sum(vars.adjust.items)' }
     body.chain[1] = { step: 'input', path: 'vars.adjust.items', value: '[4 项]', node_id: 'adjust', via: 'code',
       field: 'items', role: 'compute', status: 'ok' }
+  }
+  if (sid === 's18') {
+    body.chain = [
+      { ...body.chain[0], name: '订单笔数', expression: 'len(vars.orders.rows)', substituted: 'len(vars.orders.rows)',
+        value: 12, rendered: '12单', unit: '单', decimals: null, status: 'ok', recompute_ok: true },
+      { step: 'input', path: 'vars.orders.rows', value: '[12 项]', node_id: 'parse', via: 'transform', field: 'rows', status: 'ok' },
+    ]
   }
   return body
 }
@@ -54,7 +67,10 @@ const inputsOf = (sid) => chainOf(sid).filter((s) => s.step === 'input')
 const Q1 = chainOf('s12')[1].artifact
 const Q4 = chainOf('s12')[2].artifact
 const Q3 = inputsOf('s70')[0].artifact
+const SNAP = fx.snapshots.Q3.content
 const thousands1 = (v) => v.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+const NO_LINEAGE = '这个指标生成于系统升级前，口径卡没有记录输入，不能推演'
+const AFFECTED = [{ node_id: 'yearly', artifact: 'b1'.repeat(32), caliber: '年报口径', version: 'v1', metrics: ['y'], direct: false }]
 
 /** 推演接口在这里按后端的规则算：给了新值的用新值；cell / agent 字段那一格所在的行被排除了，指标排除后无法计算 */
 const METRICS = {
@@ -74,6 +90,32 @@ function whatifReply(body) {
   const exclude = overrides.exclude_rows ?? {}
   const base = { run_id: RUN, card: { node_id: 'caliber', artifact: chainOf('s12')[0].artifact, caliber: '周报口径', version: 'v3' },
     report: body?.report ?? null, sealed: true, seal: { sealed: true, ok: true }, affected_cards: [] }
+  const changed = Object.keys(inputs).length > 0 || Object.keys(exclude).length > 0
+  if (body?.metric === 'new_users') {
+    // 整份查询结果作输入：行数就是指标，勾掉几行少几单
+    const gone = exclude[Q3] ?? []
+    const value = SNAP.rows.length - gone.length
+    return { ...base, affected_cards: gone.length ? AFFECTED : [],
+      metrics: [{ id: 'new_users', name: '订单笔数', unit: '单', old: 12, new: value, delta: value - 12,
+        rendered_old: '12单', rendered_new: `${value}单`, rendered_delta: gone.length ? `-${gone.length}单` : null,
+        changed: gone.length > 0, status: gone.length ? 'ok' : 'unchanged', reason: null,
+        substituted: 'len(vars.orders.rows)',
+        inputs: [{ path: 'vars.orders.rows', via: 'transform', node_id: 'parse', artifact: Q3, row_span: [0, 11],
+          kind: 'container', editable: false, old: '[12 项]', new: `[${value} 项]`, changed: gone.length > 0,
+          ...(gone.length ? { excluded_rows: gone } : {}) }] }],
+      segments: [{ report: 'write', unit: fx.segments.s18.unit.id, sid: 's18', metric: 'new_users', rendered_old: '12单',
+        rendered_new: `${value}单`, changed: gone.length > 0 }],
+      unsupported: [] }
+  }
+  if (body?.metric === 'refund_rate') {
+    // 升级前的口径卡：没记输入，整个指标推演不了
+    return { ...base, metrics: [{ id: 'refund_rate', name: '退款率', unit: '', old: 0.0235, new: 0.0235, delta: 0,
+      rendered_old: '2.35%', rendered_new: '2.35%', rendered_delta: null, changed: false, status: 'unchanged', reason: null,
+      substituted: null, inputs: [] }],
+    segments: [{ report: 'write', unit: fx.segments.s16.unit.id, sid: 's16', metric: 'refund_rate', rendered_old: '2.35%',
+      rendered_new: '2.35%', changed: false }],
+    unsupported: [{ metric: 'refund_rate', input: null, reason: NO_LINEAGE }] }
+  }
   if (body?.metric === 'adj') {
     return { ...base, metrics: [{ id: 'adj', name: '调整后销售额', unit: '元', old: 44000, new: 44000, delta: 0,
       rendered_old: '44,000.0元', rendered_new: '44,000.0元', rendered_delta: null, changed: false, status: 'unchanged',
@@ -93,8 +135,9 @@ function whatifReply(body) {
   const step = chainOf(def.sid)[0]
   const views = inputsOf(def.sid).map((inp) => {
     const row = inp.locator?.row
+    // row_span：这个输入实际用到的快照行，单格就是它那一行（后端 recompute._row_span）
     const view = { path: inp.path, via: inp.via, node_id: inp.node_id, artifact: inp.artifact, locator: inp.locator,
-      kind: 'number', editable: true, old: inp.value }
+      row_span: [row, row], kind: 'number', editable: true, old: inp.value }
     if (inp.path in inputs) return { ...view, new: inputs[inp.path], changed: inputs[inp.path] !== inp.value, touched: true }
     if ((exclude[inp.artifact] ?? []).includes(row)) {
       return { ...view, new: null, changed: true, excluded_rows: [row], touched: true, gone: true }
@@ -115,9 +158,21 @@ function whatifReply(body) {
     rendered_old: step.rendered, rendered_new: rendered, rendered_delta: delta ? def.delta(delta) : null,
     changed: value !== step.value, status, reason, substituted: status === 'ok' ? `（推演代入式 ${views.map((v) => v.new).join('、')}）` : step.substituted,
     inputs: views.map(({ touched: _t, gone: _g, ...v }) => v) }
-  return { ...base, metrics: [metric], unsupported: [],
+  return { ...base, metrics: [metric], unsupported: [], affected_cards: changed ? AFFECTED : [],
     segments: [{ report: 'write', unit: fx.segments[def.sid].unit.id, sid: def.sid, metric: step.metric,
       rendered_old: step.rendered, rendered_new: rendered, changed: rendered !== step.rendered }] }
+}
+
+/** 勾行接口：按夹具里 Q3 的快照给一页（phone 列在夹具里已经写成「已遮罩」） */
+function rowsReply(url) {
+  const artifact = url.searchParams.get('artifact')
+  const offset = Number(url.searchParams.get('offset') ?? 0)
+  const limit = Number(url.searchParams.get('limit') ?? 50)
+  if (artifact !== Q3) return { status: 422, json: { detail: '这份查询快照不属于这次运行，或不在封存范围内，不能用于推演', code: 'whatif_bad_input' } }
+  const picked = SNAP.rows.slice(offset, offset + limit)
+  return { json: { run_id: RUN, artifact, node_id: 'fetch', tool: 'db_query__shop', source: 'shop', columns: SNAP.columns,
+    rows: picked, row_offset: offset, row_index: picked.map((_, i) => offset + i), total_rows: SNAP.rows.length,
+    truncated: false, masked: ['phone'], hash_ok: true, sealed: true } }
 }
 
 // ---------------------------------------------------------------- 页面
@@ -133,6 +188,7 @@ async function open(syn, { width = 1280, height = 900, theme = 'dark', reply = n
   ctx.setDefaultTimeout(6000)
   const page = await ctx.newPage()
   const sent = []
+  const pages = []
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
   page.on('dialog', (d) => { errors.push(`原生对话框：${d.message()}`); void d.dismiss() })
@@ -146,13 +202,18 @@ async function open(syn, { width = 1280, height = 900, theme = 'dark', reply = n
       return route.fulfill({ status: out.status ?? 200, json: out.json })
     }
     if (req.method() !== 'GET') return route.abort()
+    if (url.pathname === `/api/runs/${RUN}/evidence/whatif/rows`) {
+      pages.push(Object.fromEntries(url.searchParams))
+      const out = rowsReply(url)
+      return route.fulfill({ status: out.status ?? 200, json: out.json })
+    }
     const seg = url.pathname.match(new RegExp(`/api/runs/${RUN}/evidence/segments/([^/]+)$`))
     if (seg) return route.fulfill({ json: segmentReply(decodeURIComponent(seg[1])) })
     return route.continue()
   })
   await page.goto(`${WEB}/preview.html?syn=${syn}&theme=${theme}`, { waitUntil: 'networkidle' })
   await page.waitForSelector('[data-evidence-doc]')
-  return { ctx, page, sent, errors }
+  return { ctx, page, sent, pages, errors }
 }
 
 /** 点开一个片段，等指标步骤和「推演」开关出来 */
@@ -169,6 +230,14 @@ async function openWhatIf(page) {
 
 const settle = (page, ms = 700) => page.waitForTimeout(ms)
 const text = (page, sel) => page.locator(sel).first().innerText()
+/** 这个元素整个在面板正文（窄屏抽屉、宽屏侧栏都是 [data-ev-body] 在滚）和窗口的可见范围里 */
+const inView = (page, sel) => page.evaluate((s) => {
+  const el = document.querySelector(s)
+  if (!el) return false
+  const body = document.querySelector('[data-ev-body]')?.getBoundingClientRect() ?? { top: 0, bottom: innerHeight }
+  const r = el.getBoundingClientRect()
+  return r.top >= Math.max(0, body.top) - 1 && r.bottom <= Math.min(innerHeight, body.bottom) + 1
+}, sel)
 const shot = async (page, name) => {
   if (!SHOTS) return
   mkdirSync(SHOTS, { recursive: true })
@@ -193,8 +262,9 @@ await section('打开推演', async () => {
   check('两个数值输入都能改，框里是原值', fields === 2
     && await page.locator('[data-whatif-input="vars.kpi.gmv"] [data-whatif-field]').inputValue() === '45678.5')
   check('取自查询的输入给「去勾选要排除的行」', await page.locator('[data-whatif-pick]').count() === 2)
-  check('输入落在的两个查询步骤里出现勾选框', await page.locator('[data-whatif-rows]').count() === 2
-    && await page.locator('[data-whatif-row] input[type="checkbox"]').count() === 2)
+  check('输入落在的两个查询步骤里出现勾选框，都是这个指标用到的行、可勾', await page.locator('[data-whatif-rows]').count() === 2
+    && await page.locator('[data-whatif-row] input[type="checkbox"]').count() === 2
+    && await page.locator('[data-whatif-row] input[type="checkbox"]:disabled').count() === 0)
   check('报告里引用它的一处不受影响', (await text(page, '[data-whatif-segments-none]')).includes('1 处不受影响'))
   check('「恢复原值」在没有改动时不可点', await page.locator('[data-whatif-reset]').isDisabled())
   await shot(page, 'open-dark')
@@ -296,6 +366,74 @@ await section('多行快照与遮罩', async () => {
   await ctx.close()
 })
 
+await section('只让这个指标用到的行可勾', async () => {
+  const { ctx, page, sent } = await open('whatif')
+  await openMetric(page, 's70')
+  await openWhatIf(page)
+  const row = (n) => page.locator(`[data-ev-query="${Q3}"] [data-whatif-row="${n}"]`)
+  check('用到的第 6、12 行可勾', !(await row(5).locator('input').isDisabled()) && !(await row(11).locator('input').isDisabled()))
+  const unused = await page.locator(`[data-ev-query="${Q3}"] [data-whatif-row][data-whatif-row-unused]`).count()
+  check('前后几行上下文不能勾，悬停写明没用到', unused === 6 && await row(4).locator('input').isDisabled()
+    && (await row(4).locator('td').first().getAttribute('title')) === '这个指标没有用到这一行，排除它不影响结果', `${unused} 行`)
+  const before = sent.length
+  await row(4).locator('input').click({ force: true })
+  await settle(page, 300)
+  check('点了不起作用的行也不发请求', sent.length === before && !(await row(4).locator('input').isChecked()))
+  check('表格下面说明只有用到的行能勾', (await text(page, `[data-ev-query="${Q3}"] [data-whatif-rows]`)).includes('没有用到的行不能勾选'))
+  await ctx.close()
+})
+
+await section('整份结果作输入：推演区里勾行', async () => {
+  const { ctx, page, sent, pages } = await open('whatif')
+  await openMetric(page, 's18')
+  await openWhatIf(page)
+  check('证据链里没有它的查询步骤', await page.locator('[data-ev-query]').count() === 0)
+  const toggle = page.locator('[data-whatif-input="vars.orders.rows"] [data-whatif-pick-here]')
+  check('输入下面给「勾选要排除的行（共 12 行）」', (await toggle.innerText()).includes('勾选要排除的行（共 12 行）'))
+  await toggle.click()
+  await page.waitForSelector('[data-whatif-snapshot] [data-whatif-row]')
+  check('按页取这份快照，从第 0 行起', pages[0]?.artifact === Q3 && pages[0]?.offset === '0', JSON.stringify(pages[0]))
+  const rows = page.locator('[data-whatif-snapshot] [data-whatif-row]')
+  check('12 行都在、都能勾', await rows.count() === 12
+    && await page.locator('[data-whatif-snapshot] [data-whatif-row] input:disabled').count() === 0)
+  check('遮罩列写「已遮罩」', await page.locator('[data-whatif-snapshot] td[data-masked]').count() === 12)
+  check('写明是第几行到第几行', (await text(page, '[data-whatif-snapshot-range]')) === '第 1–12 行，共 12 行')
+  await page.locator('[data-whatif-snapshot] [data-whatif-row="7"] input').check()
+  await page.waitForSelector('[data-whatif-result="ok"]')
+  check('请求体带 exclude_rows：第 8 行是行号 7',
+    JSON.stringify(sent.at(-1).body.overrides) === JSON.stringify({ inputs: {}, exclude_rows: { [Q3]: [7] } }), JSON.stringify(sent.at(-1).body.overrides))
+  check('新值随之变化：12单 → 11单', (await text(page, '[data-whatif-result] [data-whatif-new]')) === '11单'
+    && (await text(page, '[data-whatif-result] [data-whatif-delta]')) === '变化 -1单')
+  check('勾行的表格底下带着推演结果', (await text(page, '[data-whatif-snapshot] [data-whatif-summary]')).includes('11单'))
+  check('输入下写明排除了哪一行', (await text(page, '[data-whatif-input="vars.orders.rows"] [data-whatif-excluded]')) === '已排除第 8 行')
+  check('报告里引用它的那一处跟着变', (await text(page, '[data-whatif-segment="s18"]')).includes('11单'))
+  await shot(page, 'table-input-dark')
+  await ctx.close()
+})
+
+await section('勾行后结果就在手边', async () => {
+  const { ctx, page } = await open('whatif')
+  await openMetric(page, 's12')
+  await openWhatIf(page)
+  await page.locator(`[data-whatif-input="cell(nodes.pull, 0, 'gmv')"] [data-whatif-pick]`).click()
+  await page.locator(`[data-ev-query="${Q4}"] [data-whatif-row="0"] input`).check()
+  await page.waitForSelector(`[data-ev-query="${Q4}"] [data-whatif-summary="excluded"]`)
+  const summary = await text(page, `[data-ev-query="${Q4}"] [data-whatif-summary]`)
+  check('勾了行，表格底下就写着新值和原因', summary.includes('—') && summary.includes('排除后无法计算'), summary)
+  await page.waitForTimeout(200)
+  check('答复回来后，表格底下这份结果整个在视野里', await inView(page, `[data-ev-query="${Q4}"] [data-whatif-summary]`),
+    JSON.stringify(await page.evaluate((s) => {
+      const r = document.querySelector(s)?.getBoundingClientRect()
+      const b = document.querySelector('[data-ev-body]')?.getBoundingClientRect()
+      return { top: r?.top, bottom: r?.bottom, bodyTop: b?.top, bodyBottom: b?.bottom, h: innerHeight }
+    }, `[data-ev-query="${Q4}"] [data-whatif-summary]`)))
+  await page.click(`[data-ev-query="${Q4}"] [data-whatif-back]`)
+  await page.waitForTimeout(250)
+  check('「回到推演结果」：焦点回到推演结果、滚进视野', await page.evaluate(() => document.activeElement?.hasAttribute('data-whatif-result'))
+    && await inView(page, '[data-whatif-result]'))
+  await ctx.close()
+})
+
 await section('不支持的输入', async () => {
   const { ctx, page } = await open('whatif')
   await openMetric(page, 's22')
@@ -304,6 +442,20 @@ await section('不支持的输入', async () => {
     .includes('无法推演：当时没有保存这个输入的完整值'))
   check('容器输入不给输入框', await page.locator('[data-whatif-field]').count() === 0
     && (await text(page, '[data-whatif-input="vars.adjust.items"] [data-whatif-value]')).includes('[4 项]'))
+  check('没有能改的输入、也没有能勾的行：说一句为什么', (await text(page, '[data-whatif-nothing]')).includes('没有可以修改的输入'))
+  await ctx.close()
+})
+
+await section('整个指标推演不了', async () => {
+  const { ctx, page } = await open('whatif')
+  await openMetric(page, 's16')
+  await page.click('[data-whatif-toggle]')
+  await page.waitForSelector('[data-whatif-result="whole"]')
+  const result = await text(page, '[data-whatif-result]')
+  check('只说原因：口径卡没有记录输入', result.includes('口径卡没有记录输入，不能推演'), result)
+  check('不写「无变化」，也不说「没有引用任何输入」', !result.includes('无变化') && !result.includes('→')
+    && await page.locator('[data-whatif-empty], [data-whatif-inputs], [data-whatif-unsupported]').count() === 0)
+  check('不画勾选框', await page.locator('[data-whatif-rows]').count() === 0)
   await ctx.close()
 })
 
@@ -350,6 +502,40 @@ await section('加载、失败、未封存', async () => {
   await openWhatIf(open_.page)
   check('运行未封存时提示数据可能还会变', (await text(open_.page, '[data-whatif-unsealed]')) === '运行未封存，数据可能还会变')
   await open_.ctx.close()
+
+  const broken = await open('whatif', { reply: async (body) => ({ json: { ...whatifReply(body), sealed: false, seal: { sealed: true, ok: false } } }) })
+  await openMetric(broken.page, 's12')
+  await openWhatIf(broken.page)
+  check('封存核对未通过时照实说', (await text(broken.page, '[data-whatif-unsealed="broken"]')) === '封存核对未通过，推演所依据的数据可能已被改动')
+  await broken.ctx.close()
+})
+
+await section('加载中、失败后不留上一次的答复', async () => {
+  let release
+  const gate = new Promise((r) => { release = r })
+  const { ctx, page } = await open('whatif', { reply: async (body, n) => {
+    if (n === 2) await gate
+    if (n === 3) return { status: 500, json: { detail: '推演服务暂时不可用' } }
+    return { json: whatifReply(body) }
+  } })
+  await openMetric(page, 's12')
+  await openWhatIf(page)
+  await page.locator(`[data-ev-query="${Q4}"] [data-whatif-row="0"] input`).check()
+  await page.waitForSelector('[data-whatif-segments="loading"]')
+  check('答复回来之前：报告中会变的地方变淡、标为忙，结果也是', (await page.locator('[data-whatif-segments]').getAttribute('aria-busy')) === 'true'
+    && await page.locator('[data-whatif-result="loading"]').count() === 1)
+  release()
+  await page.waitForSelector('[data-whatif-result="excluded"]')
+  check('答复回来后按这一次画：排除标记、下游口径卡', await page.locator('[data-whatif-excluded]').count() === 1
+    && await page.locator('[data-whatif-affected=""]').count() === 1)
+  const field = page.locator('[data-whatif-input="vars.kpi.gmv"] [data-whatif-field]')
+  await field.fill('50000')
+  await field.press('Enter')
+  await page.waitForSelector('[data-whatif] [role="alert"]')
+  check('请求失败：上一次的结果、排除标记、报告中会变的地方、下游口径卡都不再显示',
+    await page.locator('[data-whatif-result], [data-whatif-excluded], [data-whatif-segments], [data-whatif-affected]').count() === 0)
+  check('输入框还在，能接着改', await page.locator('[data-whatif-field]').count() === 2)
+  await ctx.close()
 })
 
 /** 页面和面板正文都没有横向滚动（表格自己的横向滚动条不算：那是表格容器里的） */
@@ -377,6 +563,15 @@ await section('窄屏', async () => {
     const o = await overflow(page)
     check(`390px（${theme}）：推演展开、勾了行也没有横向溢出`, o.page <= 0 && o.body <= 1 && o.whatif <= 1, JSON.stringify(o))
     await shot(page, `narrow-${theme}`)
+    // 推演区里另给的勾行表格（四列，带遮罩列）在窄屏里同样不撑宽
+    // 先关上抽屉再点另一处：抽屉盖着正文下半截
+    await page.locator('[data-evidence-panel] button[aria-label="关闭证据"]').click()
+    await openMetric(page, 's18')
+    await openWhatIf(page)
+    await page.click('[data-whatif-pick-here]')
+    await page.waitForSelector('[data-whatif-snapshot] [data-whatif-row]')
+    const t = await overflow(page)
+    check(`390px（${theme}）：推演区里的勾行表格不横向溢出`, t.page <= 0 && t.body <= 1 && t.whatif <= 1, JSON.stringify(t))
     check(`390px（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
     await ctx.close()
   }

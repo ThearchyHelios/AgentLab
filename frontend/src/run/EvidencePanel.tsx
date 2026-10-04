@@ -30,7 +30,10 @@ import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
 import { SqlCheckList } from './SqlChecks'
-import { WhatIf, WhatIfRows, WhatIfToggle, useWhatIfDraft } from './WhatIf'
+import {
+  WhatIf, WhatIfRows, WhatIfSummary, WhatIfToggle, focusResult, inSpans, pickMetric, usableRows, useWhatIfDraft,
+  useWhatIfResult, wholeReason,
+} from './WhatIf'
 
 /**
  * 证据面板：点开报告里的一个片段，看它从哪来。
@@ -65,7 +68,8 @@ import { WhatIf, WhatIfRows, WhatIfToggle, useWhatIfDraft } from './WhatIf'
  * 引用、且片段接口的查询步骤带 provenance: true 时请求推断来源接口；推断来源的缓存只在面板开着期间有效。
  *
  * 数字推演（WhatIf.tsx）：指标步骤上的「推演」展开推演区，改输入的值、在查询步骤里勾掉几行，看这个数和报告会变成
- * 多少。推演不是出具，不写运行记录、不改报告。勾选框只在推演时出现在查询步骤的结果窗口里。
+ * 多少。推演不是出具，不写运行记录、不改报告。勾选框只在推演时出现在查询步骤的结果窗口里，只有这个指标用到的行能勾，
+ * 表格底下带着推演结果。
  *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
@@ -311,8 +315,17 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   const whatifReady = !!runId && !docIssue && !!metricStep && !!whatifCard && !!whatifMetric
   const whatifOpen = whatif.open && whatifReady
   const whatifId = `${panelId}-whatif`
-  // 能勾行的查询步骤：指标的输入（单元格取数、Agent 字段）落在它上面。合并查询的输入步骤不给——指标引用的是合并结果
-  const pickable = new Set(inputs.map((inp) => inp.artifact).filter((a): a is string => !!a))
+  // 推演的请求和答复也放在这一层：查询步骤里勾行的表格底下要带着推演结果，和推演区是同一份
+  const whatifRequest = useMemo(() => (whatifOpen && whatifCard && whatifMetric
+    ? { ...(report ? { report } : {}), card: whatifCard, metric: whatifMetric, overrides: whatif.overrides } : null),
+  [whatifOpen, report, whatifCard, whatifMetric, whatif.overrides])
+  const whatifView = useWhatIfResult(runId, whatifRequest)
+  // 每份快照里这个指标用得到的行：别的行勾了不影响结果，表格里不让勾
+  const whatifUsable = useMemo(() => usableRows(pickMetric(whatifView.data, whatifMetric)), [whatifView.data, whatifMetric])
+  // 能勾行的查询步骤：指标的输入（单元格取数、Agent 字段）落在它上面。合并查询的输入步骤不给——指标引用的是合并结果。
+  // 整个指标推演不了（口径卡没记输入）时一行都不给勾
+  const pickable = new Set(wholeReason(whatifView.data, whatifMetric) ? []
+    : inputs.map((inp) => inp.artifact).filter((a): a is string => !!a))
   const queryLink = (artifactOf?: string) => {
     const i = artifactOf ? queries.findIndex((q) => q.artifact === artifactOf && !q.merged_into) : -1
     return i >= 0 ? { alias: queries[i].alias ?? '', go: () => jumpTo(i) } : undefined
@@ -393,8 +406,8 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
                     linkOf={linkOf}
                     workflowName={workflowName(pinnedWorkflow(metricStep))}
                     whatif={whatifReady ? { open: whatifOpen, onToggle: whatif.toggle, controls: whatifId } : undefined}>
-          {whatifOpen && runId && whatifCard && whatifMetric && (
-            <WhatIf id={whatifId} runId={runId} report={report} card={whatifCard} metric={whatifMetric} draft={whatif}
+          {whatifOpen && runId && whatifMetric && (
+            <WhatIf id={whatifId} runId={runId} report={report} metric={whatifMetric} draft={whatif} view={whatifView}
                     queryOf={queryLink} onLocate={onLocate} />
           )}
         </MetricPart>
@@ -425,8 +438,15 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
 
       {queries.map((q, i) => (
         <QueryPart key={`${q.artifact ?? ''}-${i}`} id={queryId(i)} step={q} seal={seal} masked={masked}
-                   pick={whatifOpen && q.artifact && !q.merged_into && pickable.has(q.artifact)
-                     ? { excluded: whatif.excluded(q.artifact), onToggle: (row) => whatif.toggleRow(q.artifact!, row) }
+                   pick={whatifOpen && whatifMetric && q.artifact && !q.merged_into && pickable.has(q.artifact)
+                     ? {
+                       excluded: whatif.excluded(q.artifact),
+                       onToggle: (row) => whatif.toggleRow(q.artifact!, row),
+                       usable: whatifUsable ? (row) => inSpans(whatifUsable.get(q.artifact!), row) : undefined,
+                       // 勾了行，新值就在表格底下：推演区在上面，往往已经不在视野里
+                       summary: <WhatIfSummary view={whatifView} metric={whatifMetric} onBack={() => focusResult(whatifId)} />,
+                       busy: whatifView.status === 'loading',
+                     }
                      : undefined} />
       ))}
 
@@ -1361,8 +1381,13 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
  */
 function QueryPart({ id, step, seal, masked, pick }: {
   id: string; step: EvidenceStep; seal?: EvidenceSeal; masked: string[]
-  /** 推演时：结果窗口每行前面加勾选框，勾掉的行在推演里视为不存在 */
-  pick?: { excluded: number[]; onToggle: (row: number) => void }
+  /**
+   * 推演时：结果窗口每行前面加勾选框，勾掉的行在推演里视为不存在。usable 说哪几行这个指标用得到（别的行不让勾），
+   * summary 是画在表格底下的推演结果
+   */
+  pick?: {
+    excluded: number[]; onToggle: (row: number) => void; usable?: (row: number) => boolean; summary?: ReactNode; busy?: boolean
+  }
 }) {
   const host = useEvidenceHost()
   const win = useMemo(() => queryWindow(step), [step])
@@ -1454,7 +1479,8 @@ function QueryPart({ id, step, seal, masked, pick }: {
       {win.columns.length > 0 && win.rows.length > 0 && (
         <div ref={scroller} className={clsx(bad.length > 0 && 'mt-1.5')}>
           {pick && win.index
-            ? <WhatIfRows win={win} hidden={hidden} excluded={pick.excluded} onToggle={pick.onToggle} />
+            ? <WhatIfRows win={win} hidden={hidden} excluded={pick.excluded} onToggle={pick.onToggle} usable={pick.usable}
+                          summary={pick.summary} busy={pick.busy} />
             : (
               <ResultTable table={table} full title={EVIDENCE_TEXT.query(alias)}
                            highlight={win.marks.length || win.cells?.length ? { rows: win.marks, cols: win.cols, cells: win.cells } : undefined}

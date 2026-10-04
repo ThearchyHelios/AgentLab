@@ -3060,7 +3060,14 @@ export interface WhatIfInput {
   changed?: boolean
   /** 起了作用的被排除行（快照里的行号，从 0 数） */
   excluded_rows?: number[]
+  /**
+   * 这个输入实际用到的快照行（含两端，从 0 数）：单格一行、数组字段一段、整份查询结果全部。排除别的行影响不到它，
+   * 界面只让这几行可勾。遮罩的、快照读不出来的没有
+   */
+  row_span?: [number, number]
   masked?: boolean
+  /** 落在的查询快照读不出来（文件不在、与哈希不一致）：遮没遮核对不了，值不给 */
+  withheld?: boolean
 }
 
 /**
@@ -3119,6 +3126,28 @@ export interface WhatIfAffectedCard {
   metrics: string[]
   /** 直接引用（false 是经别的卡间接引用） */
   direct: boolean
+}
+
+/**
+ * GET /runs/{id}/evidence/whatif/rows：一页查询快照的行（推演时勾行用），形状和证据面板的查询步骤一致，
+ * 可以直接交给 queryWindow。遮罩列写「已遮罩」；快照读不出来时没有行，note 说明原因
+ */
+export interface WhatIfRowsPage {
+  run_id: string
+  artifact: string
+  node_id?: string | null
+  tool?: string | null
+  source?: string | null
+  columns: string[]
+  rows: unknown[][]
+  row_offset: number
+  row_index: number[]
+  total_rows: number | null
+  truncated: boolean | null
+  masked: string[]
+  hash_ok: boolean | null
+  sealed: boolean
+  note?: string
 }
 
 export interface WhatIfResult {

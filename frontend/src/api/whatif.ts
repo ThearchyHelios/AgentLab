@@ -4,8 +4,8 @@
  * 请求函数（get / post / del……）和 ApiError 从 ./http 导入，不要从 ./client 导入：client.ts 要导入
  * 这个文件把它挂到 api 上，反过来导入就成了循环（见 http.ts 开头的说明）。
  */
-import type { WhatIfRequest, WhatIfResult } from '../types'
-import { request } from './http'
+import type { WhatIfRequest, WhatIfResult, WhatIfRowsPage } from '../types'
+import { get, request } from './http'
 
 export const whatif = {
   /**
@@ -16,4 +16,9 @@ export const whatif = {
     request<WhatIfResult>(`/runs/${encodeURIComponent(runId)}/evidence/whatif`, {
       method: 'POST', body: JSON.stringify(body), signal: opts?.signal,
     }),
+  /** 一页查询快照的行（从第 offset 行起最多 limit 行，行号从 0 数）：推演区里给整份结果、数组字段勾行用 */
+  rows: (runId: string, artifact: string, page: { offset: number; limit: number }, opts?: { signal?: AbortSignal }) =>
+    get<WhatIfRowsPage>(`/runs/${encodeURIComponent(runId)}/evidence/whatif/rows?${new URLSearchParams({
+      artifact, offset: String(page.offset), limit: String(page.limit),
+    })}`, { signal: opts?.signal }),
 }
