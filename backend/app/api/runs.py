@@ -68,6 +68,8 @@ class RunOut(BaseModel):
     #: 发起时实际生效的记忆域和知识库
     memory_scope: str | None = None
     collection: str | None = None
+    #: 发起它的定时任务。为空 = 手动发起
+    schedule_id: str | None = None
     # 时间一律带时区（db.base.UTCDateTime 读出来就是 UTC aware）
     created_at: Any = None
     started_at: Any = None
@@ -118,6 +120,7 @@ async def list_runs(
     status: str | None = Query(default=None, description="逗号分隔，如 failed,cancelled"),
     run_class: str | None = None,
     q: str | None = Query(default=None, description="按工作流名模糊匹配"),
+    schedule_id: str | None = Query(default=None, description="只要这个定时任务发起的运行"),
     limit: int = Query(default=50, ge=1, le=200),
     before: datetime | None = Query(default=None, description="翻页游标：只要 created_at 早于它的"),
     session: AsyncSession = Depends(get_session),
@@ -138,6 +141,8 @@ async def list_runs(
         stmt = stmt.where(Run.run_class.in_(classes))
     if q and q.strip():
         stmt = stmt.where(Run.workflow_name.ilike(f"%{_like(q.strip())}%", escape="\\"))
+    if schedule_id:
+        stmt = stmt.where(Run.schedule_id == schedule_id)
     if before is not None:
         stmt = stmt.where(Run.created_at < before)
     return list((await session.execute(stmt)).scalars())

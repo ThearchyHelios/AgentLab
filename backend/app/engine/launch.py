@@ -52,10 +52,13 @@ async def launch_run(
     run_class: str = "exploratory",
     version: int | None = None,
     actor: str | None,
+    schedule_id: str | None = None,
+    options: dict[str, Any] | None = None,
 ) -> Run:
     """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused。
 
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
+    schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start。
     """
     # 没挂在工作流上（画布没保存就发起、问数据当场搭的）。老数据里是「临时图」，前端两种都认
     name = "未保存的工作流"
@@ -146,6 +149,8 @@ async def launch_run(
             version=run_version,
             version_hash=version_hash,
             started_by=actor,
+            options=options,
+            schedule_id=schedule_id,
         )
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import time
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 # 流式增量（正文 token、思考 delta）量太大，只做实时推送不落库；
 # 轨迹里正文靠 node.finished 的 preview，思考靠调用结束时的单条 llm.thinking 汇总
 _EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
+
+#: RunContext.extra 里放这次运行的选项（Run.options）的键。节点从这里读发起时定下的快照、不读设置的
+#: 当前值：审批停下期间改了设置，恢复后的那一段也按发起时的，重放和正式运行才可复现
+RUN_OPTIONS_KEY = "run_options"
 
 
 class RunManager:
@@ -177,7 +182,10 @@ class RunManager:
         version_hash: str | None = None,
         started_by: str | None = None,
         approval_default: str | None = None,
+        options: dict[str, Any] | None = None,
+        schedule_id: str | None = None,
     ) -> Run:
+        """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。"""
         spec = GraphSpec.model_validate(graph)
         report = validate_graph(spec)
         if not report.ok:
@@ -187,6 +195,8 @@ class RunManager:
             )
         if approval_default is None:
             approval_default = await _approval_default(run_class=run_class)
+        # 拷一份：调用方手上的 dict 之后再改，不该改到这次运行的快照
+        options = copy.deepcopy(options) if options else {}
 
         async with SessionLocal() as session:
             from app.data.table_versions import pin_lock
@@ -214,6 +224,8 @@ class RunManager:
                     tool_trust=tool_trust,
                     agent_limits=agent_limits,
                     data_versions=data_versions,
+                    options=options,
+                    schedule_id=schedule_id,
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
@@ -232,6 +244,7 @@ class RunManager:
                 tool_trust=tool_trust,
                 agent_limits=agent_limits,
                 data_versions=data_versions,
+                options=options,
             )
         )
         return run
@@ -585,6 +598,7 @@ class RunManager:
         tool_trust: dict[str, str] | None = None,
         agent_limits: dict[str, Any] | None = None,
         data_versions: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
     ) -> None:
@@ -631,7 +645,10 @@ class RunManager:
                           # 运行记录里的那份，含运行中途第一次用到时补上的；None 是升级前的运行
                           "data_versions": data_versions,
                           # 这一段是按哪一版重放协议跑的，恢复时据此认出升级前做下的工作
-                          "replay_protocol": PROTOCOL},
+                          "replay_protocol": PROTOCOL,
+                          # 发起时定下的运行选项（核查设置之类），每一段都记、记的是同一份。没有选项的
+                          # 运行不带这个键，和加选项之前的 run.started 逐字相同
+                          **({"options": options} if options else {})},
                 )
 
                 run_ctx = RunContext(
@@ -648,7 +665,9 @@ class RunManager:
                     # 的 run_versions）。复制一份：运行中途补固定的源就地写进这个 dict，同一段执行里
                     # 后面的节点都看得到，但不该碰到别处（运行记录、事件）手上的那个对象
                     extra={"resumed": set(resumed), "actors": dict(actors or {}),
-                           RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None},
+                           RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None,
+                           # 同理也是一份拷贝：节点读它，不该改到运行记录那份
+                           RUN_OPTIONS_KEY: copy.deepcopy(options or {})},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
                 # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
@@ -1025,6 +1044,8 @@ def _carried(run: Run) -> dict[str, Any]:
         "agent_limits": run.agent_limits,
         # 固定的数据版本照运行记录来，不重新读数据源的当前指针：中途重传过，续跑查的仍是发起时那一版
         "data_versions": run.data_versions,
+        # 运行选项同理：照发起时的快照，不重新读设置
+        "options": run.options or {},
     }
 
 
