@@ -2,7 +2,8 @@
 
 - 每一种拒绝：POST /api/runs 的状态码、detail、code 先按搬家之前的原话写死（这一组先在旧代码上通过）；
   直接调 launch_run 抛 LaunchRefused，和 HTTP 的返回逐条一致
-- 发起之后的治理事件（受管级别那条日志、口径升版处置）在服务里写：不经 HTTP 发起的正式运行一样有
+- 发起时定下的治理事件（受管级别那条日志、口径升版处置）在服务里写：不经 HTTP 发起的正式运行一样有；
+  它们和运行记录同一个事务提交，排在 run.started 前面、在封存范围里，写不进去就不建运行
 - 旧的导入路径（app.api.runs 的 missing_tools、node_setting、tool_bindings、TOOL_MISSING）照旧可用；
   runner 不再从接口层导入
 """
@@ -299,10 +300,41 @@ async def test_a_formal_launch_records_the_governance_notes():
     assert run.version_hash and run.input == {"week": "第 40 周"}
     row = await _settle(run.id)
     assert row.status == "succeeded", row.error
-    notes = [e.data for e in await _events(run.id, "log") if e.data.get("code") == "run_governance"]
-    assert len(notes) == 1 and notes[0]["governed"] is False and "v1" in notes[0]["message"]
+    notes = [e for e in await _events(run.id, "log") if e.data.get("code") == "run_governance"]
+    assert len(notes) == 1 and notes[0].data["governed"] is False and "v1" in notes[0].data["message"]
     [upgrade] = await _events(run.id, "caliber.upgrade")
     assert upgrade.node_id == "card" and upgrade.data["policy"] == "dual" and upgrade.data["latest"] == 2
+    # 发起时就有的事件排在 run.started 前面，都在封存范围里
+    [started] = await _events(run.id, "run.started")
+    assert notes[0].seq < upgrade.seq < started.seq <= row.manifest_seq
+
+
+async def test_launch_events_are_written_with_the_run_or_not_at_all():
+    """发起时定下的事件和运行记录同一个事务提交：写不进去就不建运行，launch_run 抛出异常就是没有发起。以前运行
+    建好、开始执行之后才另外写，写失败时运行已经在执行，调用方（定时任务）只拿到一个异常，会把一次正在执行的
+    正式运行记成未能发起，封存范围里也少了受管级别那条日志。"""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.base import engine
+    from app.engine.launch import launch_run
+
+    lib = await upstream_with_two_versions()
+    wf, _ = await workflow(weekly(lib, upgrade_policy="dual"), published=1, versions=(1,))
+    before = await _run_count()
+    # 口径升版处置那条写不进去。走异步引擎建删触发器：同步连接等写锁时会卡住事件循环，而持锁的正是这个循环里的写入
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "CREATE TRIGGER refuse_upgrade_note BEFORE INSERT ON run_events WHEN NEW.type = 'caliber.upgrade' "
+            "BEGIN SELECT RAISE(ABORT, 'refused by test'); END"))
+    try:
+        async with SessionLocal() as session:
+            with pytest.raises(IntegrityError):
+                await launch_run(session, workflow_id=wf, run_class="formal", actor="定时任务")
+        assert await _run_count() == before, "没写进治理事件，却留下了一条运行"
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TRIGGER IF EXISTS refuse_upgrade_note"))
 
 
 async def test_an_exploratory_launch_takes_the_saved_graph_and_the_run_defaults():

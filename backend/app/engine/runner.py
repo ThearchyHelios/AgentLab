@@ -6,7 +6,7 @@ import copy
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -172,7 +172,7 @@ class RunManager:
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
         **data: Any,
     ) -> None:
-        """给 API 层用的事件入口（比如 formal 启动时记录口径升版处置）。"""
+        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。"""
         await self._emit(run_id, event_type, node_id=node_id, data=data)
 
     # ---------------- 启动 ----------------
@@ -193,8 +193,14 @@ class RunManager:
         approval_default: str | None = None,
         options: dict[str, Any] | None = None,
         schedule_id: str | None = None,
+        notes: Sequence[tuple[EventType | str, str | None, dict[str, Any]]] = (),
     ) -> Run:
-        """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。"""
+        """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。
+
+        notes 是发起时就定下的事件 (类型, node_id, 数据)，比如正式运行按什么级别出具、口径升版怎么处置。它们和
+        运行记录同一个事务提交，排在 run.started 前面：写不进去就不建运行，不会出现运行已经在执行、调用方却
+        只拿到一个异常（定时任务会把它记成未能发起）；也不会和执行抢先后，运行结束得快时落到封存之后。
+        """
         spec = GraphSpec.model_validate(graph)
         report = validate_graph(spec)
         if not report.ok:
@@ -238,8 +244,18 @@ class RunManager:
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
+                staged: list[RunEventModel] = []
+                if notes:
+                    await session.flush()   # 事件要带上运行的 id
+                    staged = [self._event(run.id, kind, node_id=node_id, data=data)
+                              for kind, node_id, data in notes]
+                    for event in staged:
+                        await _stage(session, event, run)
                 await session.commit()
             await session.refresh(run)
+        # 先落库再广播，理由同 _emit；执行任务还没建，run.started 必定排在它们后面
+        for event in staged:
+            await bus.publish(event)
 
         self._tasks[run.id] = asyncio.create_task(
             self._drive(

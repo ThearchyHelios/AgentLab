@@ -3,7 +3,8 @@
 以前这些规则全写在 start_run 里、只认 HTTP 请求：定时任务要发起正式运行，要么另抄一份（两份规则迟早
 走样，正式运行「只能从当前发布版本发起」这条最要紧的规则就可能在一边被绕过），要么假装成一次 HTTP 请求。
 现在两边都调 launch_run。拒绝时抛 LaunchRefused：start_run 把它换回以前的 HTTP 响应（状态码、detail、
-code 逐字不变），调度器据此记一次未能发起。
+code 逐字不变），调度器据此记一次未能发起。别的异常（库出错之类）也说明运行没有开始执行：发起时定下的事件
+（受管级别、目录变化、口径升版处置）和运行记录同一个事务提交，执行任务是最后一步才建的。
 
 发起前检查绑定的工具（missing_tools），以及它和 runner 固定数据版本共用的取绑定的办法（tool_bindings、
 node_setting）也放在这里：runner 以前要从接口层导入它们。
@@ -55,7 +56,8 @@ async def launch_run(
     schedule_id: str | None = None,
     options: dict[str, Any] | None = None,
 ) -> Run:
-    """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused。
+    """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused；抛别的异常时
+    运行也没有开始执行。
 
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
     schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start。
@@ -137,6 +139,24 @@ async def launch_run(
     from app.api.settings import resolve_run_scope
 
     memory_scope, collection = await resolve_run_scope(session, memory_scope, collection)
+    # 发起时就定下的事件交给 run_manager.start，和运行记录同一个事务写进事件流（在封存范围内、排在 run.started
+    # 前面）。以前运行建好、开始执行之后才另外写：写失败时运行已经在执行，这里却抛出异常，定时任务会把一次
+    # 正在执行的正式运行记成未能发起
+    notes: list[tuple[EventType | str, str | None, dict[str, Any]]] = []
+    if formal:
+        # 按不按受管出具在发起这一刻定下来：status 反映的是当前画布，中途改图、审批停下再恢复时再去读它，
+        # 报告节点和出口复核可能各读到不同的值
+        notes.append(("log", None, governance_note(governed=governed, workflow_name=name, version=run_version)))
+    if catalog_changes:
+        # 之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。每张表带 impact：direct 写死的
+        # SQL 用到的，possible Agent 可能查询的（界面分开说）
+        notes.append((EventType.CATALOG_DRIFT, None,
+                      {"version": run_version, "count": len(catalog_changes), "tables": catalog_changes}))
+    # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
+    for ev in upgrade_events:
+        payload_ev = dict(ev)
+        node = payload_ev.pop("node_id", None)
+        notes.append(("caliber.upgrade", node, payload_ev))
     try:
         run = await run_manager.start(
             graph=graph,
@@ -151,25 +171,10 @@ async def launch_run(
             started_by=actor,
             options=options,
             schedule_id=schedule_id,
+            notes=notes,
         )
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e
-
-    if formal:
-        # 按不按受管出具在发起这一刻定下来、记进封存范围：status 反映的是当前画布，中途改图、
-        # 审批停下再恢复时再去读它，报告节点和出口复核可能各读到不同的值
-        await run_manager.note(run.id, "log", **governance_note(
-            governed=governed, workflow_name=name, version=run_version))
-    if catalog_changes:
-        # 落在封存范围内：之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。
-        # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的（界面分开说）
-        await run_manager.note(run.id, EventType.CATALOG_DRIFT, version=run_version, count=len(catalog_changes),
-                               tables=catalog_changes)
-    # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
-    for ev in upgrade_events:
-        payload_ev = dict(ev)
-        node = payload_ev.pop("node_id", None)
-        await run_manager.note(run.id, "caliber.upgrade", node_id=node, **payload_ev)
     return run
 
 
