@@ -2,7 +2,7 @@ import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, 
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -759,6 +759,32 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         sub: message.match(/(?:没|未)通过核对（(.+?)）/)?.[1],
       }
     }
+    case 'report_absence_claim': {
+      // 证据目录有省略时报告写了缺失断言，重写后仍在（report.py）：读结构化字段 count、texts，不从原话里认
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const texts = strs(d.texts)
+      return {
+        title: ABSENCE_CLAIM_TEXT.title(n),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
+        next: ABSENCE_CLAIM_TEXT.next,
+      }
+    }
+    case 'report_catalog_trimmed': {
+      // 写作目录超出篇幅（report.py _trimmed_message）。读结构化字段（queries、omitted、nodes），不从原话里认
+      const total = typeof d.queries === 'number' ? d.queries : undefined
+      const omitted = typeof d.omitted === 'number' ? d.omitted : undefined
+      const rows: any[] = Array.isArray(d.nodes) ? d.nodes : []
+      const per = rows.filter((r) => typeof r?.omitted === 'number' && r.omitted > 0 && str(r?.title))
+        .map((r) => `${r.title} 省略 ${formatNumber(r.omitted)}/${formatNumber(r.total)} 次`)
+      return {
+        title: omitted != null
+          ? `证据目录超出篇幅，${total != null ? `${formatNumber(total)} 次查询中 ` : ''}${formatNumber(omitted)} 次只列了编号和摘要`
+          : '证据目录超出篇幅，部分查询只列了编号和摘要',
+        sub: per.length ? per.join('、') : undefined,
+        next: '写作模型按来源均衡地看到了一部分查询的明细，被省略的查询仍在证据台账里，报告不得据此断言没有数据。'
+          + '需要完整明细时，请换用上下文窗口更大的写作模型，或让 Agent 在 SQL 中先汇总再交出结果',
+      }
+    }
     case 'agent_field_mismatch': {
       // 「有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234」（llm.py _field_warnings）
       const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
@@ -785,6 +811,22 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         title: `有${n ? ` ${n} 个` : ''}字段无法核对出处，记为空值（未以 0 代替）`,
         sub: message.match(/记为空值（[^）]*）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
         next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
+      }
+    }
+    case 'agent_field_truncated': {
+      // 结构化抽取两次都被截断（llm.py TRUNCATED_EXTRACT）：「结构化抽取没有完成：模型的输出额度在推理阶段就用完了
+      // （最后一次的额度为 32768 token），结构化结论没能写出来。5 个字段都记为空值（未以 0 代替）。可以……」。
+      // 字段数、额度读结构化字段（fields、max_tokens），不从原话里认；不说「稍后重试」——重试解决不了额度问题
+      const n = strs(d.fields).length || Number(message.match(/(\d+)\s*个字段都?记为空值/)?.[1] ?? 0)
+      const budget = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      return {
+        title: `模型的输出额度在推理阶段用完，${n ? `${n} 个` : ''}字段记为空值（未以 0 代替）`,
+        sub: `按出处抽取字段时输出被截断${budget ? `（已加大额度重试，最后一次为 ${formatNumber(budget)} token）` : ''}，`
+          + '结构化结论没能写出来',
+        next: '这些字段以空值传给下游，口径卡按缺少输入处理，报告不得据此断言没有数据。请为该 Agent 换用非推理模型'
+          + '（抽取沿用 Agent 的模型），或调大它的「最大输出 token」后重新运行',
+        fix: 'canvas',
+        fixField: 'max_tokens',
       }
     }
     case 'metric_incomplete': {

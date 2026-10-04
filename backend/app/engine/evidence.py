@@ -47,7 +47,9 @@ import json
 import math
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
@@ -57,6 +59,7 @@ from app.data.names import FILLERS, name_key
 from app.data.provenance_types import DOC_PROVENANCE
 from app.data.tabular import UNSHAPED_NOTE
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
+from app.engine.guards import FALLBACK_CONTEXT
 from app.engine.issuance import _tolerance, extract_numbers, number_allowance
 from app.engine.labels import option_label
 
@@ -69,6 +72,15 @@ DOC_SCHEMA = "agentlab.report/1"
 #: 和记下的状态对不上，会被当成文档被改过（state_mismatch）。
 ENTITY_SYNTAX = 2
 ENTITY_SYNTAXES = frozenset({1, 2})
+#: 单元格显示规则的版本（文档顶层 cell_display）：
+#: - 1：照快照里的原样显示，ISO 日期时间带 T（2026-06-30T08:21:39）。没有这个字段的老文档按它复核
+#: - 2：ISO 日期时间显示成「2026-06-30 08:21:39」（小数秒、时区照留）。只改显示：快照里的值、引用记下的 value、
+#:   eid、证据下钻都不变
+#: 新组装的文档里真有日期时间被改写时才记 cell_display: 2（参与内容哈希），没有的文档和以前一字不差。复核必须按
+#: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
+CELL_DISPLAY = 2
+CELL_DISPLAYS = frozenset({1, 2})
+_ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
 # --------------------------------------------------------------------------
@@ -1270,7 +1282,8 @@ class _Snapshots:
     compose / verify / 流式渲染里：出口复核是另一次调用，照样重新取、重新验。
     """
 
-    def __init__(self, loader: Loader | None = None, *, entities: bool = True, syntax: int | None = None) -> None:
+    def __init__(self, loader: Loader | None = None, *, entities: bool = True, syntax: int | None = None,
+                 display: int | None = None) -> None:
         self.loader = loader or load_artifact
         self.memo: dict[str, tuple[Any, str | None]] = {}
         self._index: tuple[dict[str, Any], _EntityIndex] | None = None
@@ -1278,6 +1291,17 @@ class _Snapshots:
         self.entities_on = entities
         #: 这一次解析按哪一版实体语法：组装、流式渲染用当前版，复核按文档记下的版本（verify_doc）
         self.syntax = ENTITY_SYNTAX if syntax is None else syntax
+        #: 单元格按哪一版显示规则渲染（CELL_DISPLAY）：组装、流式渲染用当前版，复核按文档记下的版本
+        self.display = CELL_DISPLAY if display is None else display
+        #: 这一次解析里有没有哪一格因为显示规则改了写法：组装时据此决定文档记不记 cell_display
+        self.reformatted = False
+
+    def shown(self, raw: Any) -> Any:
+        """按显示规则要显示的原值：2 版起 ISO 日期时间的 T 换成空格。没改就是原值本身。"""
+        if self.display >= 2 and isinstance(raw, str) and (m := _ISO_DATETIME.match(raw.strip())):
+            self.reformatted = True
+            return f"{m.group(1)} {m.group(2)}"
+        return raw
 
     def entities(self, catalog: dict[str, Any]) -> _EntityIndex:
         if self._index is None or self._index[0] is not catalog:
@@ -1286,11 +1310,12 @@ class _Snapshots:
             self._index = (catalog, _EntityIndex(shown, syntax=self.syntax))
         return self._index[1]
 
-    def with_syntax(self, syntax: int) -> "_Snapshots":
-        """换一版实体语法的同一次解析。取过的快照共用：快照内容和语法版本无关，不必再取、再验一遍。"""
-        if syntax == self.syntax:
+    def with_syntax(self, syntax: int, display: int | None = None) -> "_Snapshots":
+        """换一版实体语法（和单元格显示规则）的同一次解析。取过的快照共用：快照内容和版本无关，不必再取、再验一遍。"""
+        display = self.display if display is None else display
+        if syntax == self.syntax and display == self.display:
             return self
-        twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax)
+        twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax, display=display)
         twin.memo = self.memo
         return twin
 
@@ -1336,11 +1361,11 @@ class _Snapshots:
 
 
 def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True,
-               syntax: int | None = None) -> _Snapshots:
-    """loader 已经是 _Snapshots 时沿用它（entities 不看）；给了 syntax 就换成那一版。"""
+               syntax: int | None = None, display: int | None = None) -> _Snapshots:
+    """loader 已经是 _Snapshots 时沿用它（entities 不看）；给了 syntax、display 就换成那一版。"""
     if isinstance(loader, _Snapshots):
-        return loader if syntax is None else loader.with_syntax(syntax)
-    return _Snapshots(loader, entities=entities, syntax=syntax)
+        return loader if syntax is None and display is None else loader.with_syntax(syntax or loader.syntax, display)
+    return _Snapshots(loader, entities=entities, syntax=syntax, display=display)
 
 
 _CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
@@ -1390,7 +1415,7 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
     try:
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
-        rendered = render_cell(raw, conv, kind=kind)
+        rendered = render_cell(snaps.shown(raw), conv, kind=kind)
     except CellError as e:
         return _unresolved(marker, alias, "cell", f"{alias} {e}")
     except RenderError as e:
@@ -2471,11 +2496,13 @@ def compose_doc(
     cells_allowed: bool = True,
     loader: Loader | None = None,
     entities: bool = True,
+    absence: bool = False,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
+    absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
@@ -2625,14 +2652,18 @@ def compose_doc(
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
+    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，复核照它渲染；没有的文档和以前一字不差
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
+        **({"cell_display": snaps.display} if snaps.reformatted and snaps.display != 1 else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
-    # 句中的 [[see:]] 只在组装时查（交回写作者重写）：出口复核看的是数字和出处，句子通不通不影响出具
-    doc["stats"], doc["violations"] = checked["stats"], checked["violations"] + inline_see(source)
+    # 句中的 [[see:]]、目录有省略时的缺失断言只在组装时查（交回写作者重写）：出口复核看的是数字和出处，
+    # 句子通不通、结论有没有越过证据不影响出具
+    doc["stats"], doc["violations"] = checked["stats"], \
+        checked["violations"] + inline_see(source) + (absence_claims(doc) if absence else [])
     return doc
 
 
@@ -2778,7 +2809,8 @@ def verify_doc(
     有知识库检索时才有（它们才可能不是 0）：升级前的运行统计的键和以前一模一样。
     """
     entity_syntax = doc_entity_syntax(doc)
-    snaps = _snapshots(loader, entities=entities, syntax=entity_syntax or ENTITY_SYNTAX)
+    display = doc_cell_display(doc)
+    snaps = _snapshots(loader, entities=entities, syntax=entity_syntax or ENTITY_SYNTAX, display=display or CELL_DISPLAY)
     index = snaps.entities(catalog)
     violations: list[dict[str, Any]] = []
     uncited: list[dict[str, Any]] = []
@@ -2796,6 +2828,8 @@ def verify_doc(
     if entity_syntax is None:
         violations.append(_violation("bad_schema",
                                      f"报告文档记录的表名、字段名规则版本「{doc.get('entity_syntax')}」无法识别"))
+    if display is None:
+        violations.append(_violation("bad_schema", f"报告文档记录的单元格显示规则版本「{doc.get('cell_display')}」无法识别"))
 
     markdown = str(doc.get("markdown") or "")
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
@@ -2942,6 +2976,13 @@ def verify_doc(
     return {"ok": not violations, "violations": violations, "stats": stats, "uncited": uncited}
 
 
+def doc_cell_display(doc: Any) -> int | None:
+    """文档按哪一版单元格显示规则组装：没有 cell_display 字段的是 1 版（老文档、没有日期时间被改写的文档），
+    记了认不出的值返回 None。"""
+    raw = doc.get("cell_display", 1) if isinstance(doc, dict) else 1
+    return raw if type(raw) is int and raw in CELL_DISPLAYS else None
+
+
 def doc_entity_syntax(doc: Any) -> int | None:
     """文档按哪一版实体语法组装：没有 entity_syntax 字段的是老文档（1 版），记了认不出的值返回 None。"""
     raw = doc.get("entity_syntax", 1) if isinstance(doc, dict) else 1
@@ -3032,6 +3073,58 @@ def inline_see(source: str) -> list[dict[str, Any]]:
     return [_violation("inline_see", INLINE_SEE_MESSAGE, text=m.group(0)) for m in _INLINE_SEE.finditer(source or "")]
 
 
+#: 写作目录有省略、或者有来源的结构化结论为空时，拼在写作规则后面（给模型看）
+ABSENCE_RULE = (
+    "这次你看不到全部证据（证据目录有省略，或者有来源的结构化结论为空）：不得断言「没有查到」「未查到」「不存在」"
+    "「缺失」「没有数据」「无数据」这类结论。某个方向的证据没有展开或为空时，只能写「本报告未覆盖……」，并说明依据不足"
+    "（比如「目录有省略，相关查询未展开」），句末可以挂 [[see:Qn]] 指向相关查询。"
+)
+
+#: 缺失断言：断言「没有数据」的几种说法。只认拿得准的，不泛化：「不存在明显差异」「缺少口径说明」这类说的是看到的
+#: 数据里的情况，不算；「不存在」「为空」「缺失」只认跟在数据、记录、结果后面（或者前面）的
+_ABSENCE = re.compile(
+    r"(?:没有|没|未|未能|没能)(?:查询|查)到|查不到|查无"
+    r"|(?:没有|暂无|并无)(?:任何)?(?:相关的?)?(?:数据|记录|结果)"
+    r"|无(?:任何)?(?:相关的?)?(?:数据|记录)(?![库源集表权字项列])"
+    r"|不存在(?:任何)?(?:相关的?)?(?:数据|记录|结果)|(?:数据|记录|结果)(?:均|都|全部)?(?:不存在|为空|缺失|空缺)"
+)
+#: 前面是这些词的不算：「不代表没有数据」「并非查不到」说的恰恰是不能下这个结论
+_ABSENCE_NEGATED = re.compile(r"(?:不代表|并不代表|不等于|不意味着|并非|不是|不能说明|不能断言|不得断言|不应断言)[^。！？\n]{0,6}$")
+ABSENCE_MESSAGE = _Reason(
+    "证据目录有省略时写了缺失断言：写作模型没有看到全部证据，「没有查到」「不存在」「缺失」这类结论依据不足",
+    "证据目录有省略（没展开的查询只列了编号和摘要），这一句却断言了没有数据。看不到的证据不能当成不存在："
+    "改成「本报告未覆盖……」，并说明依据不足（目录有省略、相关查询未展开），不要写「没有查到」「不存在」「缺失」「没有数据」",
+)
+
+
+def absence_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """正文里的缺失断言（_ABSENCE），每处一条违规 absence_claim。只在写作目录有省略时由报告节点要求查（compose_doc 的
+    absence）：目录全给了的时候，「本周没有退款记录」可能就是看了数据说的。
+
+    在渲染后的正文里找（标记已经换成了字），代码块不查。带着 span、所在片段和句子：证据面板能定位、能显示原句。
+    """
+    markdown = str(doc.get("markdown") or "")
+    found: list[dict[str, Any]] = []
+    for block in doc.get("blocks") or []:
+        if block.get("type") == "code":
+            continue
+        for unit in block.get("units") or []:
+            span = unit.get("span")
+            if not (isinstance(span, list) and len(span) == 2):
+                continue
+            sentence = markdown[span[0]:span[1]]
+            for m in _ABSENCE.finditer(sentence):
+                if _ABSENCE_NEGATED.search(sentence[:m.start()]):
+                    continue
+                at = span[0] + m.start()
+                seg = next((g for g in unit.get("segments") or [] if g.get("kind") != "structural"
+                            and isinstance(g.get("span"), list) and g["span"][0] <= at < g["span"][1]), None)
+                found.append(_violation("absence_claim", ABSENCE_MESSAGE, text=m.group(0),
+                                        span=[at, span[0] + m.end()], context=sentence.strip()[:120],
+                                        segment=seg.get("id") if seg else None, unit=unit.get("id")))
+    return found
+
+
 #: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
 #: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
 CELL_RULES = (
@@ -3094,10 +3187,12 @@ def _sql_check_note(artifact: Any, snaps: _Snapshots) -> str | None:
             "引用时须如实说明，不要当作确定的结论）")
 
 
-def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
+def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
+                  shown_rows: int = _PROMPT_ROWS) -> list[str]:
     """一次查询在写作目录里的样子：编号、来源、列，以及能引用的行（行号 + 渲染后的值）。
 
-    值按 [[v:]] 的渲染规则写出来：写作者在这里看到的，就是引用之后报告里显示的字。
+    值按 [[v:]] 的渲染规则写出来：写作者在这里看到的，就是引用之后报告里显示的字。shown_rows 是列出几行：
+    目录放不下时先给每次查询列前几行（_PROMPT_COMPACT_ROWS），再补到 _PROMPT_ROWS。
     """
     alias = entry["alias"]
     cols = entry.get("columns") or []
@@ -3115,13 +3210,13 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool)
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
     rows = snapshot["rows"]
     example = None
-    for r, record in enumerate(rows[:_PROMPT_ROWS]):
+    for r, record in enumerate(rows[:shown_rows]):
         cells = []
         for c in columns:
             try:
                 raw, _ = locate_cell(snapshot, r, c)
                 kind = column_kind(snapshot, c)
-                shown, numeric = render_cell(raw, kind=kind), is_number(cell_value(raw, kind))
+                shown, numeric = render_cell(snaps.shown(raw), kind=kind), is_number(cell_value(raw, kind))
             except (CellError, RenderError):
                 shown, numeric = MISSING, False
             cells.append(f"{c}={shown}")
@@ -3130,22 +3225,78 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool)
         lines.append(f"  r{r}：" + "，".join(cells))
     if not rows:
         lines.append("  （0 行，没有可以引用的格）")
-    elif len(rows) > _PROMPT_ROWS:
-        lines.append(f"  …共 {len(rows)} 行，这里只列出前 {_PROMPT_ROWS} 行；后面的行也能按行号引用")
+    elif len(rows) > shown_rows:
+        lines.append(f"  …共 {len(rows)} 行，这里只列出前 {shown_rows} 行；后面的行也能按行号引用")
     if rows and columns:
         lines.append(f"  例：[[v:{alias}.r0.{example or columns[0]}]]")
     return lines
 
 
-def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowed: bool = True,
-                   loader: Loader | None = None) -> str:
-    """证据目录的文字版，放进写作者的 prompt。超过预算就截断，并照实说截断了。
+#: 写作目录的字数预算（catalog_budget）按写作模型的上下文窗口定，不再写死 12000：
+#: - 占窗口的 40%。其余留给写作规则和指令（约 4 千字）、重写轮次（每轮把上一稿和违规清单追加进对话，最多 3 轮）、
+#:   推理模型的思考和报告正文（输出额度）。字数按 1 字 ≈ 1 token 算：中文一个字约 0.6–1 个 token，目录里的数字、
+#:   列名、标点每个字更少，按 1:1 算偏保守，实际占用低于 40%
+#: - 拿不到窗口时按 128K（和 Agent 护栏的 FALLBACK_CONTEXT 同一个保守值），即 51200 字。原来的 12000 字只放得下
+#:   20 多次查询：2026-10 一次上百次查询的运行，十万字以上的目录被截到一万两千字以内，写作者只看到前二十来次
+#: - 下限 12000：窗口很小（32K 以下）的本地模型维持原来的篇幅；上限 160000：百万窗口的模型每写一稿、每重写一次
+#:   都要重发整份目录，花费随之上涨，而 160000 字已经放得下那次运行的查询全部展开
+CATALOG_WINDOW_SHARE = 0.4
+CATALOG_MIN_CHARS = 12_000
+CATALOG_MAX_CHARS = 160_000
+#: 目录放不下时，先给每次查询列几行
+_PROMPT_COMPACT_ROWS = 3
+#: 放不下时表和字段、知识库检索两节合起来最多占预算的几分之一（剩下的给查询）
+_PROMPT_TAIL_SHARE = 4
+_PROMPT_CUT = "\n…（目录太长，后面的省略了）"
 
-    查询结果会列出能引用的行（要读快照）；cells_allowed=False 时只列编号，说明只能当依据。
-    沙箱代码节点不列：它的产出不能引用。
+
+def catalog_budget(window: int | None) -> int:
+    """写作目录的字数预算：写作模型上下文窗口（token）的 40%，夹在上下限之间；拿不到窗口按 FALLBACK_CONTEXT。"""
+    size = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else FALLBACK_CONTEXT
+    return max(CATALOG_MIN_CHARS, min(CATALOG_MAX_CHARS, int(size * CATALOG_WINDOW_SHARE)))
+
+
+DEFAULT_CATALOG_BUDGET = catalog_budget(None)
+
+#: 目录有省略时，开头跟在省略情况后面的约定（给模型看）。和数字核对一致：没展开的查询只能当依据，数照样逐字核对
+OMITTED_RULES = (
+    "没展开的查询照样在证据台账里，只是这里没有列出它的数据：\n"
+    "- 不要据此断言「没有查到」「不存在」「缺失」「没有数据」，只能写「本报告未覆盖」，并说明依据不足；\n"
+    "- 要用没展开的查询，只能在句末写 [[see:Qn]] 作依据（Qn 换成它的编号）；不要写 [[v:]]、[[table:]] 去猜它的行和列，"
+    "也不要凭摘要写任何数字——数字照样逐字核对，没有出处的数会被打回重写。结构化结论里写好的引用标记可以照抄。"
+)
+#: 结构化结论为空的来源后面跟的那句（给模型看）
+EMPTY_SOURCE_PROMPT = ("结构化结论为空（字段都记为空值）。这不代表没有数据：不得据此断言没有查到、不存在或缺失，"
+                       "只能写本报告未覆盖")
+
+
+@dataclass
+class WriterCatalog:
+    """给写作者的出处清单（writer_catalog）：文字，以及省略了什么。
+
+    - trimmed：放不下、有省略；nodes 是各来源的查询数 [{node_id, title, total, full, compact, omitted}]，
+      full 列出前 20 行、compact 只列前几行、omitted 只列编号和摘要；omitted 是只列摘要的查询编号
+    - empty_sources：结构化结论为空的来源（Agent 的名字）
+    清单有省略、或有来源的结构化结论为空时，报告节点加写作规则（ABSENCE_RULE）；有省略时组装文档另查缺失断言
     """
-    snaps = _Snapshots(loader)
-    lines = ["可引用的证据（写数字只能用下面的引用标记，系统会换成真实数值）："]
+
+    text: str
+    budget: int
+    queries: int = 0
+    trimmed: bool = False
+    nodes: list[dict[str, Any]] = field(default_factory=list)
+    omitted: list[str] = field(default_factory=list)
+    empty_sources: list[str] = field(default_factory=list)
+
+    @property
+    def guarded(self) -> bool:
+        """写作者看不全证据：缺失断言没有依据。"""
+        return self.trimmed or bool(self.empty_sources)
+
+
+def _metric_prompt(catalog: dict[str, Any]) -> list[str]:
+    """口径卡指标和运行输入在写作目录里的样子。"""
+    lines: list[str] = []
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for entry in catalog.values():
         if entry.get("kind") == "metric":
@@ -3172,23 +3323,257 @@ def catalog_prompt(catalog: dict[str, Any], *, budget: int = 12000, cells_allowe
     if inputs:
         lines.append("\n运行输入：")
         lines.extend(f"- [[{e['alias']}]] = {e.get('rendered')}" for e in inputs)
+    return lines
+
+
+def _dig_path(data: Any, path: str) -> Any:
+    for key in path.split("."):
+        data = data.get(key) if isinstance(data, dict) else None
+    return data
+
+
+def _field_prompt(path: str, value: Any, ev: dict[str, Any], aliases: dict[str, str], snaps: _Snapshots,
+                  cells_allowed: bool) -> str:
+    """一个结构化字段在写作目录里的那一行：值（按 [[v:]] 的渲染规则）和引用它的标记。"""
+    status = ev.get("status")
+    if status == "missing":
+        return f"- {path}：抽取时没有找到这个值（记为空，不代表库里没有）"
+    if status not in ("verified", "mismatch"):
+        return f"- {path}：出处核对不了（记为空）"
+    locator = ev.get("locator") if isinstance(ev.get("locator"), dict) else {}
+    alias = aliases.get(str(ev.get("artifact") or ""))
+    if alias is None:
+        return f"- {path}：所依据的查询不在这份目录里，不能引用"
+    if not cells_allowed:
+        return f"- {path}：出自 {alias}，只能在句末写 [[see:{alias}]] 作依据"
+    if isinstance(locator.get("rows"), list) and len(locator["rows"]) == 2:
+        first, last = locator["rows"]
+        named = locator.get("columns") if isinstance(locator.get("columns"), dict) else {"": locator.get("column")}
+        cols = ",".join(dict.fromkeys(str(c) for c in named.values() if c))
+        many = f"（共 {last - first + 1} 行，整表最多 {TABLE_MAX_ROWS} 行，要分成几张表）" \
+            if last - first + 1 > TABLE_MAX_ROWS else ""
+        return (f"- {path}：数组，出自 {alias} 第 {first}–{last} 行，可以单独一行写 "
+                f"[[table:{alias} cols={cols} rows={first}-{last}]]{many}")
+    row, column = locator.get("row"), locator.get("column")
+    shown = MISSING
+    snapshot, why = snaps.get(alias, ev.get("artifact"))
+    try:
+        if why:
+            raise CellError(why)
+        raw, column = locate_cell(snapshot, row, column)
+        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column))
+    except (CellError, RenderError):
+        try:
+            shown = render_cell(value)
+        except RenderError:
+            pass
+    return f"- {path} = {shown}：[[v:{alias}.r{row}.{column}]]"
+
+
+def _fields_prompt(sources: list[dict[str, Any]], catalog: dict[str, Any], snaps: _Snapshots,
+                   cells_allowed: bool) -> tuple[list[str], list[str], list[str]]:
+    """各 Agent 经按出处核对交来的结构化字段：(写作目录里的几行, 结构化结论为空的来源, 字段引用到的查询编号)。
+
+    字段的出处记的是 Agent 自己的编号（它的第几次查询），这里换成报告目录里的全局编号：按快照工件认，同一个节点的
+    优先（工件内容寻址，两次一模一样的查询共用一份快照，指哪一次都是同一格）。
+    """
+    mine: dict[tuple[str, str], str] = {}
+    anyone: dict[str, str] = {}
+    for e in catalog.values():
+        if e.get("kind") == "query":
+            mine.setdefault((str(e.get("node_id") or ""), str(e.get("artifact") or "")), e["alias"])
+            anyone.setdefault(str(e.get("artifact") or ""), e["alias"])
+    lines: list[str] = []
+    empty: list[str] = []
+    cited: list[str] = []
+    for source in sources:
+        evidence = source.get("evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            continue
+        node_id = str(source.get("node_id") or "")
+        title = str(source.get("title") or node_id)
+        data = source.get("data") if isinstance(source.get("data"), dict) else {}
+        if all(_dig_path(data, path) is None for path in evidence):
+            empty.append(title)
+            lines.append(f"「{title}」：{EMPTY_SOURCE_PROMPT}")
+            continue
+        aliases = {artifact: mine.get((node_id, artifact)) or alias for artifact, alias in anyone.items()}
+        lines.append(f"「{title}」：")
+        for path, ev in evidence.items():
+            ev = ev if isinstance(ev, dict) else {}
+            lines.append(_field_prompt(path, _dig_path(data, path), ev, aliases, snaps, cells_allowed))
+            if ev.get("status") in ("verified", "mismatch") and (alias := aliases.get(str(ev.get("artifact") or ""))):
+                cited.append(alias)
+    if not lines:
+        return [], [], []
+    return (["\n各 Agent 交来的结构化结论（系统已逐格核对到查询快照；要写这些数，用后面的引用标记）：", *lines],
+            empty, list(dict.fromkeys(cited)))
+
+
+def _query_brief(entry: dict[str, Any], tables: list[str], snaps: _Snapshots) -> str:
+    """没展开的查询在目录里的一行摘要：编号、查的表、行数。
+
+    表先看目录里的表条目（带表结构快照的查询才有），没有就从查询快照里存的 SQL 认（sql_tables），
+    再没有写工具名。
+    """
+    if not tables:
+        snapshot, why = snaps.get(entry["alias"], entry.get("artifact"))
+        if not why and isinstance(snapshot.get("sql"), str):
+            tables = sql_tables(snapshot["sql"])
+    rows = entry.get("rows")
+    what = ("、".join(tables[:3]) + (f" 等 {len(tables)} 张表" if len(tables) > 3 else "")) if tables \
+        else str(entry.get("tool") or entry.get("source") or "查询")
+    size = f"{rows} 行" if isinstance(rows, int) else "行数不明"
+    return f"  - {entry['alias']}：{what}，{size}" + ("（结果已截断）" if entry.get("truncated") else "")
+
+
+def _cut_lines(lines: list[str], limit: int, note: str) -> list[str]:
+    """从头取到放得下 limit 个字为止，后面换成一句 note。"""
+    out: list[str] = []
+    used = len(note) + 1
+    for line in lines:
+        if used + len(line) + 1 > limit:
+            return [*out, note]
+        out.append(line)
+        used += len(line) + 1
+    return out
+
+
+def writer_catalog(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
+                   loader: Loader | None = None, fields: list[dict[str, Any]] | None = None,
+                   titles: dict[str, str] | None = None) -> WriterCatalog:
+    """证据目录的文字版，放进写作者的 prompt，连同省略了什么（WriterCatalog）。
+
+    查询结果会列出能引用的行（要读快照）；cells_allowed=False 时只列编号，说明只能当依据。
+    沙箱代码节点不列：它的产出不能引用。fields 是上游 Agent 经按出处核对交来的结构化字段
+    [{node_id, title, data, evidence}]，titles 是节点在画布上的名字（分组标题用）。
+
+    放得下就整份给（没有结构化字段时和以前一字不差）。放不下时按优先级、按来源均衡（_trimmed_catalog）：
+    口径卡指标、运行输入、结构化字段一律列出；查询按产出它的节点分组、轮流展开；没展开的列编号和摘要；
+    开头照实说目录有省略、各来源省略了几次。
+    """
+    snaps = _Snapshots(loader)
+    head = ["可引用的证据（写数字只能用下面的引用标记，系统会换成真实数值）："]
+    field_lines, empty, cited = _fields_prompt(fields or [], catalog, snaps, cells_allowed)
+    first = [*_metric_prompt(catalog), *field_lines]
     queries = [e for e in catalog.values() if e.get("kind") == "query"]
-    if queries:
-        lines.append(f"\n{CELL_RULES}" if cells_allowed else
-                     "\n查询结果（这次出具不允许直接引用单元格，只能写在 [[see:Q1]] 这样的依据里）：")
-        for e in queries:
-            lines.extend(_query_prompt(e, snaps, cells_allowed))
+    rules = ([f"\n{CELL_RULES}" if cells_allowed else
+              "\n查询结果（这次出具不允许直接引用单元格，只能写在 [[see:Q1]] 这样的依据里）："] if queries else [])
+    tail: list[str] = []
     if (index := snaps.entities(catalog)).active:
-        lines.extend(_entity_prompt(catalog, partial=index.partial, snaps=snaps))
+        tail.extend(_entity_prompt(catalog, partial=index.partial, snaps=snaps))
     retrievals = [e for e in catalog.values() if e.get("kind") == "retrieval"]
     if retrievals:
-        lines.append(f"\n{QUOTE_RULES}")
+        tail.append(f"\n{QUOTE_RULES}")
         for e in retrievals:
-            lines.extend(_retrieval_prompt(e, snaps))
-    text = "\n".join(lines)
+            tail.extend(_retrieval_prompt(e, snaps))
+    full = {e["alias"]: _query_prompt(e, snaps, cells_allowed) for e in queries}
+    text = "\n".join([*head, *first, *rules, *(line for e in queries for line in full[e["alias"]]), *tail])
+    if len(text) <= budget:
+        return WriterCatalog(text=text, budget=budget, queries=len(queries), empty_sources=empty)
+    return _trimmed_catalog(catalog, head, first, rules, queries, full, tail, budget=budget, snaps=snaps,
+                    cells_allowed=cells_allowed, titles=titles or {}, empty=empty, pinned=cited)
+
+
+def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str], rules: list[str],
+                     queries: list[dict[str, Any]], full: dict[str, list[str]], tail: list[str], *, budget: int,
+                     snaps: _Snapshots, cells_allowed: bool, titles: dict[str, str], empty: list[str],
+                     pinned: list[str]) -> WriterCatalog:
+    """放不下时的目录。以前从头截断：查询按编号排，前面的节点占满预算，后面的节点一次都不露面。
+
+    1. 口径卡指标、运行输入、结构化字段一律列出（第一优先）
+    2. 表和字段、知识库检索两节合起来最多占预算的 1/_PROMPT_TAIL_SHARE
+    3. 每次查询先只占一行摘要；结构化字段引用到的查询先展开（pinned），再按产出它的节点分组、轮流展开：
+       第一轮每次列前 _PROMPT_COMPACT_ROWS 行，第二轮补到 _PROMPT_ROWS 行，放不下为止
+    4. 开头写明目录有省略、各来源省略了几次，以及没展开的查询怎么用（OMITTED_RULES）
+    最后整份量一次：超了就把最后展开的退回去；指标和字段本身就超（极少见）才从尾部截断。
+    """
+    if tail and len("\n".join(tail)) > budget // _PROMPT_TAIL_SHARE:
+        tail = _cut_lines(tail, budget // _PROMPT_TAIL_SHARE, "…（表和字段、知识库检索太长，后面的省略了）")
+    tables: dict[str, list[str]] = {}
+    for e in catalog.values():
+        if e.get("kind") == "table":
+            for alias in e.get("queries") or []:
+                tables.setdefault(alias, []).append(str(e.get("name")))
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for e in queries:
+        groups.setdefault(str(e.get("node_id") or ""), []).append(e)
+    compact = {e["alias"]: _query_prompt(e, snaps, cells_allowed, _PROMPT_COMPACT_ROWS) for e in queries}
+    brief = {e["alias"]: [_query_brief(e, tables.get(e["alias"], []), snaps)] for e in queries}
+    shapes = {"brief": brief, "compact": compact, "full": full}
+    tier = {e["alias"]: "brief" for e in queries}
+
+    def rows() -> list[dict[str, Any]]:
+        out = []
+        for nid, entries in groups.items():
+            got = Counter(tier[e["alias"]] for e in entries)
+            out.append({"node_id": nid, "title": titles.get(nid) or nid or "其他", "total": len(entries),
+                        "full": got["full"], "compact": got["compact"], "omitted": got["brief"]})
+        return out
+
+    def assemble() -> str:
+        stats = rows()
+        per = "、".join(f"{r['title']} {r['total']} 次（展开 {r['full'] + r['compact']} 次，省略 {r['omitted']} 次）"
+                        for r in stats)
+        n = {k: sum(r[k] for r in stats) for k in ("full", "compact", "omitted")}
+        notice = (f"注意：证据太多，这份目录有省略（篇幅上限约 {budget} 字）。共 {len(queries)} 次查询："
+                  f"{n['full']} 次列出前 {_PROMPT_ROWS} 行，{n['compact']} 次只列前 {_PROMPT_COMPACT_ROWS} 行，"
+                  f"{n['omitted']} 次只列编号和摘要。各来源：{per}。")
+        body = [*head, notice, OMITTED_RULES, *first, *rules]
+        for r, entries in zip(stats, groups.values()):
+            body.append(f"\n来自「{r['title']}」的查询（共 {r['total']} 次，展开 {r['full'] + r['compact']} 次）：")
+            for e in entries:
+                if tier[e["alias"]] != "brief":
+                    body.extend(shapes[tier[e["alias"]]][e["alias"]])
+            if r["omitted"]:
+                body.append(f"  没展开（{r['omitted']} 次，只列编号和摘要）：")
+                body.extend(brief[e["alias"]][0] for e in entries if tier[e["alias"]] == "brief")
+        return "\n".join([*body, *tail])
+
+    def size(lines: list[str]) -> int:
+        return sum(len(line) + 1 for line in lines)
+
+    # 省略情况那句里的数字会变长几位：留一点余量，最后再整份量一次
+    remaining = budget - len(assemble()) - 8 * (len(groups) + 3)
+    upgraded: list[tuple[str, str]] = []
+    for alias in pinned:
+        if tier.get(alias) == "brief" and (delta := size(compact[alias]) - size(brief[alias])) <= remaining:
+            tier[alias] = "compact"
+            remaining -= delta
+            upgraded.append((alias, "brief"))
+    for target, source in (("compact", "brief"), ("full", "compact")):
+        moved = True
+        while moved:
+            moved = False
+            for entries in groups.values():
+                for e in entries:
+                    alias = e["alias"]
+                    if tier[alias] != source:
+                        continue
+                    delta = size(shapes[target][alias]) - size(shapes[source][alias])
+                    if delta <= remaining:
+                        tier[alias] = target
+                        remaining -= delta
+                        upgraded.append((alias, source))
+                        moved = True
+                        break
+    text = assemble()
+    while len(text) > budget and upgraded:
+        alias, source = upgraded.pop()
+        tier[alias] = source
+        text = assemble()
     if len(text) > budget:
-        text = text[:budget].rsplit("\n", 1)[0] + "\n…（目录太长，后面的省略了）"
-    return text
+        text = text[:budget - len(_PROMPT_CUT)].rsplit("\n", 1)[0] + _PROMPT_CUT
+    return WriterCatalog(text=text, budget=budget, queries=len(queries), trimmed=True, nodes=rows(),
+                         omitted=[e["alias"] for e in queries if tier[e["alias"]] == "brief"], empty_sources=empty)
+
+
+def catalog_prompt(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
+                   loader: Loader | None = None, fields: list[dict[str, Any]] | None = None,
+                   titles: dict[str, str] | None = None) -> str:
+    """证据目录的文字版（writer_catalog 的文字）。超过预算时分优先级、按来源均衡，并照实说省略了什么。"""
+    return writer_catalog(catalog, budget=budget, cells_allowed=cells_allowed, loader=loader, fields=fields,
+                          titles=titles).text
 
 
 def unshaped_table(entry: dict[str, Any], fetch: Callable[[Any], Any]) -> bool:

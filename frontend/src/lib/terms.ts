@@ -230,6 +230,19 @@ export function evidenceTally(cited: number, total: number, other = 0): string {
   return parts.join(' · ')
 }
 
+/**
+ * 缺失断言：证据目录有省略时，报告写了「没有查到」「不存在」「缺失」这类结论（违规 absence_claim，重写后仍有时
+ * 报告节点另发日志 report_absence_claim）。证据面板的违规清单和运行时间线共用这一套说法
+ */
+export const ABSENCE_CLAIM_TEXT = {
+  label: '缺失断言',
+  hint: '写作模型没有看到全部证据：被省略的查询仍在证据台账里，看不到不等于不存在，这类结论应写作「本报告未覆盖」。'
+    + '报告照常产出，这一处只标注、不判失败',
+  title: (n?: number) => `报告写了${n ? ` ${formatNumber(n)} 处` : ''}缺失断言，已标注（证据目录有省略）`,
+  next: '被省略的查询仍在证据台账里，可在证据面板中查看。请在报告撰写节点的指令中要求未展开的方向写作「本报告未覆盖」，'
+    + '或换用上下文窗口更大的写作模型后重新运行',
+}
+
 /** 证据面板和证据条的文案 */
 export const EVIDENCE_TEXT = {
   allCited: (n: number) => `${formatNumber(n)} 个数字都有出处`,

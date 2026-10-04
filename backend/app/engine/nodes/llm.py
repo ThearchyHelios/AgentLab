@@ -541,25 +541,66 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     async def extract_step(payload: list[BaseMessage], schema: dict[str, Any]) -> dict[str, Any]:
         # cite_fields 的结构化抽取：进 checkpoint，节点重放时不再调用、不再计费。失败也在这里收住、
         # 作为结果返回——agent 的结论还在，字段记空值、发警告，而不是把整个节点赔进去。
-        # thinking 关掉：结构化输出靠强制工具调用，和思考模式不兼容，抽取也用不着思考
-        spec = model_spec.model_copy(update={
-            "thinking": "off", "max_tokens": max(int(ctx.cfg("max_tokens") or 0), 4096)})
-        started = time.perf_counter()
-        ctx.emit(EventType.LLM_START, model=model_id, structured=True, purpose="cite_fields",
-                 message_count=len(payload))
-        try:
-            async with SessionLocal() as session:
-                extractor, _ = await get_chat_model(session, spec)
-            got = await extractor.with_structured_output(schema, include_raw=True).ainvoke(payload)
-        except Exception as e:  # noqa: BLE001
+        # thinking 关掉：结构化输出靠强制工具调用，和思考模式不兼容，抽取也用不着思考。但经 OpenAI 兼容
+        # 接口接入的推理模型关不掉思考，推理照样算在额度里：额度见 EXTRACT_MAX_TOKENS，被截断时加大重试一次
+        budget = max(int(ctx.cfg("max_tokens") or 0), EXTRACT_MAX_TOKENS)
+        spent = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+        rejected: int | None = None     # 服务方嫌太大、拒收的额度：之后重试不再超过它
+        retried = False
+
+        def count(usage: dict[str, Any]) -> None:
+            for key in ("input_tokens", "output_tokens", "calls"):
+                spent[key] += int(usage.get(key) or 0)
+            spent["cost_usd"] = round(spent["cost_usd"] + float(usage.get("cost_usd") or 0), 6)
+
+        while True:
+            spec = model_spec.model_copy(update={"thinking": "off", "max_tokens": budget})
+            started = time.perf_counter()
+            ctx.emit(EventType.LLM_START, model=model_id, structured=True, purpose="cite_fields",
+                     message_count=len(payload), max_tokens=budget)
+            failure: Exception | None = None
+            raw: BaseMessage | None = None
+            parsed: Any = None
+            try:
+                async with SessionLocal() as session:
+                    extractor, _ = await get_chat_model(session, spec)
+                got = await extractor.with_structured_output(schema, include_raw=True).ainvoke(payload)
+                raw, parsed = _split_structured(got)
+                usage = _usage_of(raw if raw is not None else AIMessage(content=""), model_id)
+            except Exception as e:  # noqa: BLE001
+                failure, usage = e, _error_usage(e, model_id)
+            count(usage)
+            cut = truncated_error(failure) if failure is not None else (parsed is None and truncated_reply(raw))
+            elapsed = int((time.perf_counter() - started) * 1000)
+            if failure is not None and not cut and _budget_rejected(failure) \
+                    and (lower := next((b for b in _EXTRACT_FALLBACKS if b < budget), None)) is not None:
+                # 服务方的输出上限比默认额度小（DeepSeek chat 系只收 8K）：退一档再来，别因为额度提高反而抽不成
+                ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                         duration_ms=elapsed, **usage,
+                         error=f"模型接入不接受 {budget} token 的输出额度，已改用 {lower} token 重试")
+                rejected, budget = budget, lower
+                continue
+            bigger = min(budget * 2, EXTRACT_RETRY_CAP)
+            if cut and not retried and bigger > budget and (rejected is None or bigger < rejected):
+                ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                         duration_ms=elapsed, **usage,
+                         error=f"输出被截断：{budget} token 的输出额度用完了，结构化结论没有写完，"
+                               f"已把额度加大到 {bigger} token 重试一次")
+                retried, budget = True, bigger
+                continue
+            if cut:
+                ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                         duration_ms=elapsed, **usage,
+                         error=f"输出被截断：{budget} token 的输出额度用完了，结构化结论没有写完")
+                return {"error": TRUNCATED_EXTRACT.format(budget=budget), "truncated": True,
+                        "max_tokens": budget, **spent}
+            if failure is not None:
+                ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
+                         duration_ms=elapsed, **usage, error=describe_exception(failure))
+                return {"error": f"结构化抽取失败：{explain_model_error(failure, model_id)}", **spent}
             ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
-                     duration_ms=int((time.perf_counter() - started) * 1000), error=describe_exception(e))
-            return {"error": f"结构化抽取失败：{explain_model_error(e, model_id)}"}
-        raw, parsed = _split_structured(got)
-        usage = _usage_of(raw if raw is not None else AIMessage(content=""), model_id)
-        ctx.emit(EventType.LLM_END, agent=ctx.node.title, model=model_id, purpose="cite_fields",
-                 duration_ms=int((time.perf_counter() - started) * 1000), **usage)
-        return {"parsed": parsed, **usage}
+                     duration_ms=elapsed, **usage)
+            return {"parsed": parsed, **spent}
 
     final_text = ""
     #: 模型把工具调用写成了文字：纠正过一次了没有
@@ -778,8 +819,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 total_usage[key] += int(extracted.get(key) or 0)
             total_usage["cost_usd"] = round(total_usage["cost_usd"] + float(extracted.get("cost_usd") or 0), 6)
         cited = verify_cited_fields(extracted, fields, queries)
-        for code, message, names in _field_warnings(*cited, extracted.get("error")):
-            await once(ctx, EventType.LOG, level="warn", code=code, message=message, fields=names)
+        truncated = extracted.get("truncated") is True
+        for code, message, names in _field_warnings(*cited, extracted.get("error"), truncated=truncated):
+            extra = {"max_tokens": extracted.get("max_tokens")} if code == "agent_field_truncated" else {}
+            await once(ctx, EventType.LOG, level="warn", code=code, message=message, fields=names, **extra)
 
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
@@ -939,6 +982,60 @@ def cited_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
     # 走工具调用的结构化输出要求函数名只含字母、数字、下划线
     return {"title": "cited_fields", **rewrite(schema)}
+
+
+#: cite_fields 结构化抽取的输出额度。thinking: off 只对 Anthropic 有用：经 OpenAI 兼容接口接入的推理模型
+#: （DeepSeek 系等）关不掉思考，推理也算在这个额度里。以前是 4096：2026-10 一次运行 4 个 Agent 的抽取全部在
+#: 推理阶段就用完了额度（completion_tokens=4096），一个字段都没写出来。节点配了更大的「最大输出 token」就用节点的
+EXTRACT_MAX_TOKENS = 16384
+#: 被截断时额度翻倍重试一次，最多到这里
+EXTRACT_RETRY_CAP = 32768
+#: 服务方嫌额度太大、拒收时依次退到这几档（DeepSeek chat 系只收 8K）。拒收发生在请求刚发出时，不产生用量
+_EXTRACT_FALLBACKS = (8192, 4096)
+#: 服务方嫌额度太大时报错里会出现的字样（和 api/copilot.py 改图时退回小额度是同一个判断）
+_BUDGET_WORDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length")
+#: 截断类报错的原话：openai 的 LengthFinishReasonError（结构化输出解析时 finish_reason=length）
+_LENGTH_WORDS = ("length limit was reached", "finish_reason=length", "finish_reason='length'")
+#: 两次都被截断时的原因（给人看）。重试、去设置页测试模型都不解决额度问题，不能照通用的模型报错那样说
+TRUNCATED_EXTRACT = ("结构化抽取没有完成：模型的输出额度在推理阶段就用完了（最后一次的额度为 {budget} token），"
+                     "结构化结论没能写出来")
+#: agent_field_truncated 的下一步（接在「N 个字段都记为空值」后面）
+TRUNCATED_NEXT = ("可以为该 Agent 换用非推理模型（抽取沿用 Agent 的模型），或者调大该 Agent 的"
+                  "「最大输出 token」后重新运行")
+
+
+def truncated_error(error: BaseException | None) -> bool:
+    """这个异常是不是在说「输出被截断」：openai 的 LengthFinishReasonError，或者 langchain、网关转述的同一件事。
+
+    服务方嫌额度太大的 400（报错里也有 max_tokens）不算：那是请求被拒，模型一个字都没写。
+    """
+    if error is None:
+        return False
+    if type(error).__name__ == "LengthFinishReasonError":
+        return True
+    text = str(error).lower()
+    return any(word in text for word in _LENGTH_WORDS)
+
+
+def truncated_reply(raw: Any) -> bool:
+    """这条回复是不是因为额度用完停下的：OpenAI 系是 finish_reason=length，Anthropic 是 stop_reason=max_tokens。"""
+    meta = getattr(raw, "response_metadata", None) or {}
+    reason = meta.get("finish_reason") or meta.get("stop_reason")
+    return reason in ("length", "max_tokens")
+
+
+def _budget_rejected(error: BaseException) -> bool:
+    status = getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
+    return status in (400, 422) and any(word in str(error).lower() for word in _BUDGET_WORDS)
+
+
+def _error_usage(error: BaseException, model_id: str) -> dict[str, Any]:
+    """失败的那次调用花掉的用量。截断时 openai 的异常带着 completion.usage：额度是真花出去了，要记账。"""
+    usage = getattr(getattr(error, "completion", None), "usage", None)
+    inp = int(getattr(usage, "prompt_tokens", 0) or 0)
+    out = int(getattr(usage, "completion_tokens", 0) or 0)
+    return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
+            "cost_usd": round(catalog.estimate_cost(model_id, inp, out), 6), "calls": int(bool(inp or out))}
 
 
 EXTRACT_SYSTEM = (
@@ -1184,9 +1281,12 @@ def _shown(value: Any) -> str:
 
 
 def _field_warnings(data: dict[str, Any], evidence: dict[str, Any],
-                    failed: str | None) -> list[tuple[str, str, list[str]]]:
+                    failed: str | None, *, truncated: bool = False) -> list[tuple[str, str, list[str]]]:
     """核对结果里要让人看见的：(code, message, 字段)。mismatch 和 unresolved 各一条；missing 是模型
-    照实说没查到，值已经是空的，不另发警告。"""
+    照实说没查到，值已经是空的，不另发警告。
+
+    抽取两次都被截断（truncated）时 code 是 agent_field_truncated：原因是输出额度在推理阶段就用完了，
+    下一步是换非推理模型或调大最大输出 token，不是「稍后重试」——和别的抽取失败分开说。"""
     out: list[tuple[str, str, list[str]]] = []
     mismatched = [(p, e) for p, e in evidence.items() if e.get("status") == "mismatch"]
     if mismatched:
@@ -1196,6 +1296,11 @@ def _field_warnings(data: dict[str, Any], evidence: dict[str, Any],
                     f"有 {len(mismatched)} 个字段与查询快照不一致，已按快照取值：{detail}", [p for p, _ in mismatched]))
     unresolved = [(p, e) for p, e in evidence.items() if e.get("status") == "unresolved"]
     if unresolved:
+        if failed and truncated:
+            out.append(("agent_field_truncated",
+                        f"{failed}。{len(unresolved)} 个字段都记为空值（未以 0 代替）。{TRUNCATED_NEXT}",
+                        [p for p, _ in unresolved]))
+            return out
         if failed:
             message = f"{failed}。{len(unresolved)} 个字段都记为空值（未以 0 代替）"
         else:
