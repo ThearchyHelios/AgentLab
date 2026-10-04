@@ -4,9 +4,11 @@
 - 每次成功的查询是一份查询快照，按这个 agent 自己的顺序编 Q1、Q2…；节点里调用时发 tool.end（带 query_artifact、
   role: verify），但不往证据台账里写 query：核查的查询进了报告的写作目录，写作者就会把它们当成可以引用的证据
 - 最后按调用方的结构交结果：数值字段一律是格子引用 {alias, row, column}，由代码从快照取值，模型自己写的数字
-  不采信；理由里的数字要写成 [[v:Qn.rX.列]]，用本 agent 自己的台账组装成文档，裸数字会被标出
-- 查询次数、时长、金额（单次和每日）任何一项到顶就停止查询、按已有结果收尾；模型不在价格目录里时金额上限
-  无效，照裁判的说法记一条说明
+  不采信（type 列表、anyOf、$ref、allOf 里的数也是；认不出的结构下写的数一律丢掉）；没交的字段和交了 null 分开记；
+  理由里的数字要写成 [[v:Qn.rX.列]]，用本 agent 自己的台账组装成文档，裸数字会被标出
+- 查询次数、时长、金额（单次和每日）任何一项到顶就停止查询、按已有结果收尾；收尾的钱在查询之前就按最贵的样子
+  留好；每日上限缺省按设置；模型不在价格目录里时金额上限无效，照裁判的说法记一条说明
+- 永远不抛：库写不进去、模型不支持结构化输出，都落在返回值里
 - 上传表格按调用方给的数据版本查（运行固定的那一版），不拿当前版本顶上
 
 模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件，表名、数字都是虚构的。
@@ -31,7 +33,8 @@ from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Setting
 from app.engine import spend, verify_agent
-from app.engine.verify_agent import run_verify_agent
+from app.engine.toolcalls import Limit, ToolTimeout
+from app.engine.verify_agent import result_schema, run_verify_agent
 from app.providers import catalog as pricing
 from app.providers.factory import ModelSpec, ProviderNotConfigured
 from app.providers.mock_model import MockChatModel
@@ -48,9 +51,12 @@ VALID_SUM = "SELECT SUM(amount) AS total FROM orders WHERE is_deleted = 0"
 @pytest.fixture(autouse=True)
 async def clean_spend():
     async with SessionLocal() as session:
-        await session.execute(delete(Setting).where(Setting.key == spend.SPEND_KEY))
+        await session.execute(delete(Setting).where(Setting.key.in_([spend.SPEND_KEY, "verify"])))
         await session.commit()
     yield
+    async with SessionLocal() as session:
+        await session.execute(delete(Setting).where(Setting.key == "verify"))
+        await session.commit()
 
 
 @pytest.fixture
@@ -272,11 +278,119 @@ async def test_a_model_call_that_runs_past_the_deadline_is_cut(monkeypatch, shop
     assert out.result is None and out.error, "收尾那次也没赶上：照实说没交成结果"
 
 
+async def test_a_query_that_hits_its_own_time_limit_is_not_the_overall_deadline(monkeypatch, shop):
+    """一条查询超过它自己的时限（ToolTimeout，也是一种 TimeoutError）：这条查询作罢、原因交回模型让它改，核查
+    照常往下走。不能当成整个核查的时长到了，把还剩的时间全扔掉。"""
+    name, _ = shop
+    real = verify_agent.run_bounded
+    seen = {"n": 0}
+
+    async def stuck_once(call, limit, tool_name):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            call.close()
+            raise ToolTimeout(tool_name, Limit(seconds=30.0, enforce=True, kind="query"))
+        return await real(call, limit, tool_name)
+
+    monkeypatch.setattr(verify_agent, "run_bounded", stuck_once)
+    script = Script(monkeypatch, [q(name, "SELECT COUNT(*) AS n FROM orders", "c1"), q(name, VALID_SUM, "c2")],
+                    {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "x"})
+    events: list[tuple] = []
+    out = await run(name, timeout_s=600, emit=lambda kind, **data: events.append((kind, data)))
+    assert out.limit is None, "整个核查的时长远没到"
+    assert script.tool_results()["c1"].startswith("查询超过 30 秒没有返回")
+    assert out.result["value"] == 230 and [qd["alias"] for qd in out.queries] == ["Q1"]
+    [error] = [d for k, d in events if k == EventType.TOOL_ERROR]
+    assert error["call_id"] == "c1" and "核查的时长上限" not in error["error"]
+
+
 @pytest.fixture
 def priced(monkeypatch):
     """每次调用按 0.01 美元估算、按 0.01 美元结算：金额上限的算术好核对。"""
     monkeypatch.setattr(pricing, "find_pricing", lambda model: {"input": 1.0, "output": 1.0})
     monkeypatch.setattr(pricing, "estimate_cost", lambda model, inp, out: 0.01)
+
+
+@pytest.fixture
+def by_tokens(monkeypatch):
+    """按 token 数估算（每个 token 0.000001 美元）：消息越长估得越多，收尾时交给模型的查询结果也要算钱。"""
+    monkeypatch.setattr(pricing, "find_pricing", lambda model: {"input": 1.0, "output": 1.0})
+    monkeypatch.setattr(pricing, "estimate_cost", lambda model, inp, out: (inp + out) / 1_000_000)
+
+
+@pytest.fixture
+async def wordy(tmp_path):
+    """200 条留言，每条一大段中文：查出来交给收尾那次调用时很占 token。返回源名。"""
+    path = tmp_path / f"{uuid.uuid4().hex[:8]}.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)")
+    db.executemany("INSERT INTO notes VALUES (?, ?)", [(i, f"第{i}条留言" + "虚构的长段落文字" * 50) for i in range(200)])
+    db.commit()
+    db.close()
+    name = f"notes_{uuid.uuid4().hex[:8]}"
+    async with SessionLocal() as session:
+        row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True)
+        session.add(row)
+        await session.flush()
+        row.schema_cache = await introspect.introspect(row)
+        await session.commit()
+        source_id = row.id
+    yield name
+    await engines.invalidate(source_id)
+
+
+@pytest.mark.parametrize("cap", [0.003, 0.004, 0.005, 0.02, 0.05])
+async def test_a_query_never_runs_without_money_left_to_settle_it(monkeypatch, wordy, by_tokens, cap):
+    """收尾那次调用要把查到的结果交给模型：结果越长越贵。查询之前就要按收尾最贵的样子把钱留好，不然查完了却
+    付不起收尾，查到的结果白查。"""
+    count = {"type": "object", "properties": {"count": {"type": "integer"}}}
+    Script(monkeypatch, [q(wordy, "SELECT id, note FROM notes ORDER BY id", "c1")],
+           {"count": {"alias": "Q1", "row": 0, "column": "id"}, "rationale": "x"}, model_id="priced-model")
+    out = await run(wordy, output_schema=count, max_cost_usd=cap, max_queries=1)
+    assert out.error is None and out.result is not None, "不管上限多紧，都交得出结果"
+    assert out.usage["cost_usd"] <= cap, "收尾那次也在上限以内：钱是查询之前就留好的，不是收尾时硬超出去"
+    if out.queries:
+        assert out.result["count"] == 0, "查了就用上了"
+    else:
+        assert out.limit == "max_cost_usd", "钱不够查询加收尾，就不查"
+
+
+async def test_a_final_answer_budgeted_in_the_loop_is_not_refused_by_the_daily_cap(monkeypatch, shop, priced):
+    """查询之后、收尾之前，别的核查把当天的余额用光了（几个核查并行）：收尾那次已经在循环里留过钱，照常交结果，
+    查到的结果不白查。"""
+    name, _ = shop
+
+    async def crowded(kind, **data):
+        if kind == EventType.TOOL_END:
+            async with SessionLocal() as session:
+                row = await session.get(Setting, spend.SPEND_KEY)
+                row.value = {**row.value, "usd": 1.999}
+                await session.commit()
+
+    Script(monkeypatch, [q(name, VALID_SUM, "c1"), q(name, "SELECT COUNT(*) AS n FROM orders", "c2")],
+           {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "x"},
+           model_id="priced-model")
+    out = await run(name, daily_max_usd=2.0, emit=crowded)
+    assert out.limit == "daily_max_usd", "下一轮查询付不起了"
+    assert out.error is None and out.result["value"] == 230
+
+
+async def test_the_daily_cap_comes_from_the_settings_unless_given(monkeypatch, shop, priced):
+    """不传每日上限就按设置里的「核查每日金额上限」：节点、质询接口不必各自记得去读；明确传 None 才是不限。"""
+    name, _ = shop
+    async with SessionLocal() as session:
+        session.add(Setting(key=spend.SPEND_KEY, value={"date": spend._today(), "usd": 0.995, "calls": 3}))
+        session.add(Setting(key="verify", value={"daily_max_usd": 1.0}))
+        await session.commit()
+    final = {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "x"}
+    script = Script(monkeypatch, [q(name, VALID_SUM, "c1")], final, model_id="priced-model")
+    out = await run(name)
+    assert out.limit == "daily_max_usd" and script.calls == [] and out.result is None
+    assert "$1.00" in out.error
+
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], final, model_id="priced-model")
+    unlimited = await run(name, daily_max_usd=None)
+    assert unlimited.limit is None and unlimited.result["value"] == 230
 
 
 async def test_the_cost_limit_keeps_room_for_the_final_answer(monkeypatch, shop, priced):
@@ -394,6 +508,131 @@ async def test_nested_numbers_and_arrays_are_references_too(monkeypatch, shop):
     assert [c["path"] for c in out.cells] == ["totals[0]", "totals[1]", "detail.count"]
 
 
+#: Pydantic 这类工具生成的结构：可为 null 的数写成 anyOf，嵌套的对象写成 $ref 到 $defs，带说明的引用包一层 allOf，
+#: Optional[对象] 是 anyOf [$ref, null]
+PYDANTIC_STYLE = {
+    "type": "object",
+    "$defs": {"Region": {"type": "object", "properties": {"name": {"type": "string"}, "total": {"type": "number"}}}},
+    "properties": {
+        "value": {"anyOf": [{"type": "number"}, {"type": "null"}], "description": "未作废订单的金额合计"},
+        "count": {"type": ["integer", "null"]},
+        "top": {"$ref": "#/$defs/Region"},
+        "backup": {"anyOf": [{"$ref": "#/$defs/Region"}, {"type": "null"}]},
+        "wrapped": {"allOf": [{"$ref": "#/$defs/Region"}], "description": "带说明的引用"},
+        "regions": {"type": "array", "items": {"$ref": "#/$defs/Region"}},
+    },
+}
+
+
+def test_every_way_of_writing_a_number_becomes_a_reference():
+    """anyOf、type 列表、$ref、allOf 里的数也换成格子引用：认不出这些写法，模型在那里写的数就绕过了格子这一关。"""
+    shaped = result_schema(PYDANTIC_STYLE)
+    assert "$ref" not in json.dumps(shaped) and "$defs" not in shaped
+
+    def is_ref(node):
+        return node["anyOf"][0]["required"] == ["alias", "row", "column"] and node["anyOf"][1] == {"type": "null"}
+
+    props = shaped["properties"]
+    assert is_ref(props["value"]) and "未作废订单的金额合计" in props["value"]["description"]
+    assert is_ref(props["count"])
+    assert is_ref(props["top"]["properties"]["total"]) and props["top"]["properties"]["name"] == {"type": "string"}
+    assert is_ref(props["wrapped"]["properties"]["total"])
+    assert is_ref(props["regions"]["items"]["properties"]["total"])
+    [region, null] = props["backup"]["anyOf"]
+    assert is_ref(region["properties"]["total"]) and null == {"type": "null"}
+
+
+async def test_numbers_written_directly_in_any_of_those_shapes_are_ignored(monkeypatch, shop):
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")],
+           {"value": 999, "count": 7, "top": {"name": "分区甲", "total": 999}, "backup": {"name": "分区乙", "total": 1},
+            "wrapped": {"name": "分区丙", "total": 2}, "regions": [{"name": "分区丁", "total": 3}], "rationale": "x"})
+    out = await run(name, output_schema=PYDANTIC_STYLE)
+    assert out.result == {"value": None, "count": None, "top": {"name": "分区甲", "total": None},
+                          "backup": {"name": "分区乙", "total": None}, "wrapped": {"name": "分区丙", "total": None},
+                          "regions": [{"name": "分区丁", "total": None}], "rationale": "x"}
+    assert {c["path"]: c["model_value"] for c in out.cells} == {
+        "value": 999, "count": 7, "top.total": 999, "backup.total": 1, "wrapped.total": 2, "regions[0].total": 3}
+    assert all(c["status"] == "unresolved" and "没有给出格子引用" in c["reason"] for c in out.cells), \
+        "都认成了数值字段（该写格子引用），不是碰巧被当成认不出的结构丢掉"
+
+
+async def test_references_in_those_shapes_are_resolved(monkeypatch, shop):
+    name, _ = shop
+    ref = {"alias": "Q1", "row": 0, "column": "total"}
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")],
+           {"value": ref, "count": None, "top": {"name": "分区甲", "total": ref}, "backup": None,
+            "wrapped": {"name": "分区丙", "total": ref}, "regions": [{"name": "分区丁", "total": ref}], "rationale": "x"})
+    out = await run(name, output_schema=PYDANTIC_STYLE)
+    assert out.result["value"] == 230 and out.result["top"]["total"] == 230 and out.result["wrapped"]["total"] == 230
+    assert out.result["regions"] == [{"name": "分区丁", "total": 230}]
+    assert out.result["count"] is None and out.result["backup"] is None, "可以为 null 的照实是 null"
+
+
+async def test_numbers_under_a_shape_that_is_not_recognised_are_dropped(monkeypatch, shop):
+    """认不出的结构（没写类型、没写 items 的数组、没写属性的对象）、文本字段里冒出来的数：一律不采信，照记下来。
+    码值（enum）里的数是调用方给的选项，不是查出来的数，照收。"""
+    name, _ = shop
+    schema = {"type": "object", "properties": {
+        "anything": {}, "notes": {"type": "array"}, "label": {"type": "string"}, "level": {"enum": [1, 2, 3]},
+        "extra": {"type": "object"}}}
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")],
+           {"anything": 999, "notes": ["见 Q1", 120], "label": 5, "level": 2,
+            "extra": {"note": "按支付时间算", "share": 0.3}, "rationale": "x"})
+    out = await run(name, output_schema=schema)
+    assert out.result == {"anything": None, "notes": ["见 Q1", None], "label": None, "level": 2,
+                          "extra": {"note": "按支付时间算", "share": None}, "rationale": "x"}
+    assert {c["path"]: c["model_value"] for c in out.cells} == {"anything": 999, "notes[1]": 120, "label": 5,
+                                                                "extra.share": 0.3}
+    assert all(c["status"] == "unresolved" for c in out.cells)
+
+
+async def test_references_written_as_json_text_are_read(monkeypatch, shop):
+    """有的模型把嵌套的对象、数组写成一段 JSON 文本：照样认（裁判也是这么认的）。还不是数组的照实记下格式不对。"""
+    name, _ = shop
+    schema = {"type": "object", "properties": {
+        "value": {"type": "number"}, "totals": {"type": "array", "items": {"type": "number"}},
+        "broken": {"type": "array", "items": {"type": "number"}}}}
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")],
+           {"value": '{"alias": "Q1", "row": 0, "column": "total"}',
+            "totals": '[{"alias": "Q1", "row": 0, "column": "total"}]', "broken": "没有这一项", "rationale": "x"})
+    out = await run(name, output_schema=schema)
+    assert out.result == {"value": 230, "totals": [230], "broken": None, "rationale": "x"}
+    broken = next(c for c in out.cells if c["path"] == "broken")
+    assert broken["status"] == "unresolved" and "数组" in broken["reason"]
+
+
+async def test_a_number_field_pointing_at_a_text_cell_is_unresolved(monkeypatch, shop):
+    name, _ = shop
+    Script(monkeypatch, [q(name, "SELECT paid_at, amount FROM orders ORDER BY id", "c1")],
+           {"value": {"alias": "Q1", "row": 0, "column": "paid_at"}, "verdict": "一致", "rationale": "x"})
+    out = await run(name)
+    assert out.result["value"] is None, "数值字段只收数：日期文本拿去和原流程的数比，比较会出错"
+    [cell] = out.cells
+    assert cell["status"] == "unresolved" and "不是数值" in cell["reason"] and cell["ref"] == "Q1.r0.paid_at"
+    assert cell["value"] == "2026-09-02"
+
+
+async def test_a_field_left_out_is_not_a_field_reported_missing(monkeypatch, shop):
+    """没交这个字段和交了 null（模型说查不到）是两回事：前者是没按结构交，后者才是 missing。"""
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {"verdict": "无法判断", "rationale": "x"})
+    left_out = await run(name)
+    [cell] = left_out.cells
+    assert cell["status"] == "unresolved" and "没有交" in cell["reason"]
+
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {"value": None, "verdict": "无法判断", "rationale": "x"})
+    said_null = await run(name)
+    assert said_null.cells == [{"path": "value", "status": "missing"}]
+
+
+async def test_an_answer_with_none_of_the_fields_is_an_error(monkeypatch, shop):
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {"total": 230, "rationale": "合计 230"})
+    out = await run(name)
+    assert out.result is None and out.cells == [] and "没有按结构交结果" in out.error
+
+
 # --------------------------------------------------------------------------
 # 数据版本
 # --------------------------------------------------------------------------
@@ -482,3 +721,74 @@ async def test_a_final_answer_in_plain_text_json_is_still_read(monkeypatch, shop
     monkeypatch.setattr(MockChatModel, "_decide", decide)
     out = await run(name)
     assert out.result["value"] == 230 and script.kinds.count("final") == 1
+
+
+def plain_reply(monkeypatch, reply):
+    """普通调用（退回的那一次）的回复：reply(最后一条消息的正文) → 回复正文。其余照剧本。"""
+    original = MockChatModel._decide
+    seen: list[str] = []
+
+    def decide(model, messages):
+        text = str(messages[-1].content)
+        if not model.response_format and "交结果" in text:
+            seen.append(text)
+            return AIMessage(content=reply(text))
+        return original(model, messages)
+
+    monkeypatch.setattr(MockChatModel, "_decide", decide)
+    return seen
+
+
+async def test_the_plain_fallback_is_told_which_fields_to_fill(monkeypatch, shop):
+    """结构化输出不成、退回普通调用时，结构不在请求里了：要写进消息，不然模型不知道字段叫什么，交回来的字段
+    对不上，全成了「查不到」。"""
+    name, _ = shop
+    schema = {"type": "object", "properties": {
+        "blind_total_amount": {"type": "number", "description": "盲算的金额合计"},
+        "consistency_verdict": {"type": "string", "enum": ["一致", "不一致"]}}}
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], "不是 JSON")
+
+    def reply(text):
+        # 模型只能按消息里看得到的字段名交
+        body = {"rationale": "x"}
+        if "blind_total_amount" in text:
+            body["blind_total_amount"] = {"alias": "Q1", "row": 0, "column": "total"}
+        if "consistency_verdict" in text:
+            body["consistency_verdict"] = "一致"
+        return json.dumps(body, ensure_ascii=False)
+
+    seen = plain_reply(monkeypatch, reply)
+    out = await run(name, output_schema=schema)
+    assert len(seen) == 1 and "盲算的金额合计" in seen[0] and "alias" in seen[0]
+    assert out.error is None and out.result == {"blind_total_amount": 230, "consistency_verdict": "一致",
+                                                "rationale": "x"}
+
+
+async def test_a_model_without_structured_output_goes_straight_to_the_plain_call(monkeypatch, shop):
+    """模型不支持结构化输出（建的时候就报错）：直接走普通调用，不算一次调用，也不抛。"""
+    name, _ = shop
+
+    def unsupported(self, schema, **kwargs):
+        raise NotImplementedError("这个模型不支持结构化输出")
+
+    monkeypatch.setattr(MockChatModel, "with_structured_output", unsupported)
+    script = Script(monkeypatch, [q(name, VALID_SUM, "c1")], "不会用到")
+    plain_reply(monkeypatch, lambda text: '{"value": {"alias": "Q1", "row": 0, "column": "total"}, '
+                                          '"verdict": "一致", "rationale": "x"}')
+    out = await run(name)
+    assert out.error is None and out.result["value"] == 230
+    assert out.usage["calls"] == len(script.calls) + 1 == 3, "两轮查库加一次普通调用，建不起来的那次不算"
+
+
+async def test_a_failing_ledger_is_reported_not_raised(monkeypatch, shop):
+    """每日账写不进去（库被锁住）：照实交回，不抛。节点因此降成「核不了」，质询接口不会回 500。"""
+    name, _ = shop
+
+    async def locked(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(spend, "charge", locked)
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")],
+           {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "x"})
+    out = await run(name)
+    assert out.result is None and out.error
