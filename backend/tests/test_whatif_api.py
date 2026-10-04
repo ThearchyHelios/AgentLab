@@ -214,6 +214,52 @@ async def test_changing_an_input_of_one_metric(client, monkeypatch):
     assert [(s["metric"], s["rendered_new"]) for s in body["segments"]] == [("per", "100.00元")]
 
 
+async def faithful(run_id: str) -> list[tuple]:
+    """真跑出来的每张卡、每个指标，什么都不改、强制重算一遍：(卡, 指标, 状态, 重算值, 卡上的值)。
+    输入的还原（标量、cell()、整份查询结果、agent 数组、nodes.*）是否忠实，在真卡上对一遍。"""
+    from app.api import whatif as api_whatif
+    from app.api.evidence import _reports, _sealed, _sealed_cards
+    from app.engine import recompute
+
+    sealed = await _sealed(run_id)
+    cards = _sealed_cards(sealed)
+    out = []
+    for node_id in dict.fromkeys(nid for nid, _, _ in cards):
+        _, card, started = api_whatif._card_of(sealed, cards, node_id, _reports(sealed), None)
+        loader = api_whatif._loader(sealed, cards)
+        sources = recompute.Sources(load=loader, queries=tuple(sealed.queries),
+                                    outputs=api_whatif._outputs_before(sealed, started),
+                                    masked=await api_whatif._hidden(sealed, loader))
+        for metric in card["metrics"]:
+            again = recompute.recompute(metric, recompute.Changes(), sources)
+            out.append((node_id, metric["id"], again["status"], again["new"], metric["value"]))
+    return out
+
+
+async def test_recomputing_real_cards_without_changes_reproduces_them(monkeypatch):
+    row = await run_graph(monkeypatch, query_graph())
+    assert [(m, s, new == old) for _, m, s, new, old in await faithful(row.id)] == [
+        ("amount5", "ok", True), ("cnt", "ok", True), ("per", "ok", True)]
+
+
+async def test_events_appended_after_the_seal_are_ignored(client, monkeypatch):
+    """封存之后插进来的 node.finished，哪怕指向一张真的指标集，也不能换掉推演用的那张卡。"""
+    from app.core.artifact_store import load, put_json
+
+    row = await run_graph(monkeypatch, query_graph())
+    card = (await whatif(client, row.id, {"card": "card"}))["card"]
+    forged = load(card["artifact"])
+    forged["metrics"][0]["value"] = 1.5
+    fake = await put_json(forged, kind="metric_set", run_id=row.id, node_id="card")
+    async with SessionLocal() as session:
+        session.add(RunEvent(run_id=row.id, seq=row.manifest_seq + 5, type="node.finished", node_id="card", ts=0.0,
+                             data={"evidence": [{"kind": "metric_set", "node_id": "card", "artifact": fake}]}))
+        await session.commit()
+    body = await whatif(client, row.id, {"card": "card"})
+    assert body["card"]["artifact"] == card["artifact"] and by_id(body)["amount5"]["old"] == 600.5
+    assert body["sealed"] is True
+
+
 async def test_whatif_is_read_only(client, monkeypatch):
     row = await run_graph(monkeypatch, query_graph())
     snapshot = await snapshot_of(row.id)
@@ -315,6 +361,7 @@ async def test_masked_columns_are_neither_shown_nor_used(client, monkeypatch, sh
     metrics = by_id(body)
     [cell] = metrics["amount5"]["inputs"]
     assert cell["masked"] is True and cell["old"] is None and cell["new"] is None and cell["editable"] is False
+    assert metrics["amount5"]["substituted"] is None and metrics["per"]["substituted"] is None
     reasons = {(u["metric"], u["input"]): u["reason"] for u in body["unsupported"]}
     assert "遮罩" in reasons[("amount5", AMOUNT5)] and "遮罩" in reasons[("cnt", "vars.res.rows")]
 
@@ -367,6 +414,7 @@ async def test_node_containers_come_from_the_sealed_node_output(client, monkeypa
         node("card", "metrics", caliber="推演口径", metrics=[
             {"id": "n", "name": "加权条数", "expression": "len(nodes.fetch.items) * vars.kpi.k"}]),
         node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.text }}"}])))
+    assert [(m, s, new == old) for _, m, s, new, old in await faithful(row.id)] == [("n", "ok", True)]
     body = await whatif(client, row.id, {"card": "card", "overrides": {"inputs": {"vars.kpi.k": 5}}})
     [n] = body["metrics"]
     assert n["status"] == "ok" and (n["old"], n["new"]) == (6, 15)
@@ -417,6 +465,8 @@ async def test_agent_array_fields_follow_the_excluded_rows(client, monkeypatch):
 
     baseline = by_id(await whatif(client, row.id, {"card": "card"}))
     assert baseline["via_node"]["old"] == baseline["via_vars"]["old"] == total
+    assert [(m, s, new == old) for _, m, s, new, old in await faithful(row.id)] == [
+        ("via_node", "ok", True), ("via_vars", "ok", True)]
     body = await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [0]}}})
     for metric in by_id(body).values():
         assert metric["status"] == "ok" and metric["new"] == round(weeks["2026-W37"], 1), metric
@@ -439,6 +489,8 @@ async def test_downstream_cards_are_flagged_only_when_something_changes(client, 
             {"id": "year", "name": "年化", "decimals": 1, "expression": "vars.m.metrics[0].value * 52"}]),
         node("out", "output", fields=[{"name": "r", "value": "{{ nodes.yearly.text }}"}])))
     assert (await whatif(client, row.id, {"card": "card"}))["affected_cards"] == []
+    assert [(c, m, s, new == old) for c, m, s, new, old in await faithful(row.id)] == [
+        ("card", "gmv", "ok", True), ("yearly", "year", "ok", True)]
     body = await whatif(client, row.id, {"card": "card", "overrides": {"inputs": {"vars.kpi.gmv": 120}}})
     assert by_id(body)["gmv"]["new"] == 120
     [flagged] = body["affected_cards"]

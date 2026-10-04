@@ -147,6 +147,8 @@ def test_a_baseline_lists_what_cannot_be_used_without_recomputing_anything():
     # 遮罩列的值不给
     [phone] = metrics["phone_len"]["inputs"]
     assert phone["masked"] is True and phone["old"] is None and phone["new"] is None and phone["editable"] is False
+    # 代入式里代进去的就是那一格：同样不给
+    assert metrics["phone_len"]["substituted"] is None and "13800000000" not in str(metrics["phone_len"])
     # 能改的只有数值标量
     editable = {i["path"]: i["editable"] for i in metrics["wow"]["inputs"] + metrics["total"]["inputs"]}
     assert editable == {"vars.kpi.gmv": True, "vars.kpi.prev": True, "vars.kpi.amounts": False}

@@ -540,6 +540,8 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
     delta, rendered_delta = _delta(metric, old, new) if known else (None, None)
     substituted = metric.get("substituted") if status == "unchanged" \
         else substitute(plan.tree, values) if status == "ok" and plan.tree is not None else None
+    if any(inp.masked for inp in plan.inputs.values()):
+        substituted = None      # 代入式里代进去的就是遮罩列的那一格
     return {
         "id": metric.get("id"), "name": metric.get("name") or metric.get("id"), "unit": metric.get("unit") or "",
         "decimals": metric.get("decimals"), "format": metric.get("format") or DEFAULT_FORMAT,
