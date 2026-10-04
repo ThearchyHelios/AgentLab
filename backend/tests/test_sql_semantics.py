@@ -9,7 +9,10 @@
 - diff_facets：每处不同一句中文：「A 按支付时间 paid_at 筛时间，B 按下单时间 created_at」「A 排除了
   is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报。两边的派生来源先按
   结构（读的表、各列的定义、名字）配好对再比：一边多出一个排在前面的 CTE、内连接换了先后不报，两个 CTE 算出同名
-  的列时外层用的是哪一个照报
+  的列时外层用的是哪一个照报；外连接按主表比（LEFT / RIGHT 对调不报，主表换了、被 WHERE 变成内连接照报）；算出来
+  的列按算法比（最外层的算式、窗口函数，CTE 里被外面用到的列的定义）；时间列透过 CTE 里的日期表达式认；取前几行、
+  窗口函数前后筛的不同照报；没用到的 CTE 不算；两边同名却不是同一个的派生来源说清各是什么；自己关联自己的两个
+  别名分得开
 
 夹具全是虚构的表：订单 orders、退款 refunds、门店 stores、用户 users、付款 payments，以及一张中文表「订单」。
 """
@@ -883,6 +886,453 @@ def test_which_rows_are_taken_is_compared(a, b, text):
     没有取前几行，排序不影响算出来的数。"""
     assert texts(a, b) == [text]
     assert texts("SELECT SUM(amount) FROM orders ORDER BY 1 DESC", "SELECT SUM(amount) FROM orders") == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：外连接以哪一侧为主表
+# --------------------------------------------------------------------------
+
+LABELS = ("原流程", "盲算")
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    ("sqlite", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id",
+     ["原流程以 orders 为主表外连接 refunds，盲算以 refunds 为主表外连接 orders"]),
+    # 「没有退款的订单数」对「order_id 为空的退款数」：IS NULL 不会把外连接变成内连接，差的是主表
+    ("sqlite",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.order_id IS NULL",
+     "SELECT COUNT(*) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id WHERE r.order_id IS NULL",
+     ["原流程以 orders 为主表外连接 refunds，盲算以 refunds 为主表外连接 orders"]),
+    ("postgres", "SELECT COUNT(*) FROM orders o RIGHT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM refunds r RIGHT JOIN orders o ON o.id = r.order_id",
+     ["原流程以 refunds 为主表外连接 orders，盲算以 orders 为主表外连接 refunds"]),
+    ("postgres", PAID_REFUNDED + "SELECT COUNT(*) FROM paid p LEFT JOIN refunded r ON r.user_id = p.user_id",
+     PAID_REFUNDED + "SELECT COUNT(*) FROM refunded r LEFT JOIN paid p ON p.user_id = r.user_id",
+     ["原流程以 paid 为主表外连接 refunded，盲算以 refunded 为主表外连接 paid"]),
+    ("mysql",
+     "SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p "
+     "LEFT JOIN (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r ON r.user_id = p.user_id",
+     "SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r "
+     "LEFT JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p ON p.user_id = r.user_id",
+     ["原流程以 p 为主表外连接 r，盲算以 r 为主表外连接 p"]),
+], ids=["left", "left-anti", "right", "cte", "subquery"])
+def test_which_side_an_outer_join_keeps_is_compared(dialect, a, b, expected):
+    """外连接两边对调，保留的就是另一张表的全部行（有没有退款的订单都算，还是有没有订单的退款都算）：按主表比，
+    关联的表、条件一样也要报出来。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("sqlite", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM refunds r RIGHT JOIN orders o ON o.id = r.order_id"),
+    ("postgres", PAID_REFUNDED + "SELECT COUNT(*) FROM paid p LEFT JOIN refunded r ON r.user_id = p.user_id",
+     PAID_REFUNDED + "SELECT COUNT(*) FROM refunded r RIGHT JOIN paid p ON p.user_id = r.user_id"),
+    # 外连接后又在 WHERE 里筛可空那一侧：等于内连接加同一个条件
+    ("sqlite", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.state = 'done'",
+     "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id WHERE r.state = 'done'"),
+    # 筛的是主表那一侧，外连接照旧
+    ("sqlite", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'",
+     "SELECT COUNT(*) FROM orders AS o LEFT OUTER JOIN refunds AS r ON o.id = r.order_id WHERE o.status = 'paid'"),
+    # 外连接链换了先后，各自的主表不变
+    ("sqlite",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id LEFT JOIN users u ON u.id = o.user_id",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN users u ON u.id = o.user_id LEFT JOIN refunds r ON r.order_id = o.id"),
+], ids=["left-vs-right", "left-vs-right-cte", "rejected-left-vs-inner", "filter-on-kept-side", "chain-reordered"])
+def test_the_same_outer_join_written_differently_is_no_difference(dialect, a, b):
+    """orders LEFT JOIN refunds 和 refunds RIGHT JOIN orders 是同一次连接：按主表比，不按写的是 LEFT 还是 RIGHT。"""
+    assert texts(a, b, dialect) == []
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    ("sqlite", "SELECT COUNT(*) FROM orders o LEFT JOIN (SELECT * FROM refunds WHERE state = 'done') r "
+               "ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN (SELECT * FROM refunds) r ON r.order_id = o.id WHERE r.state = 'done'",
+     ["原流程以 orders 为主表外连接 r，盲算的 WHERE 里有 refunds.state = 'done'，把关联不上 r 的行筛掉了，"
+      "LEFT JOIN 实际成了 INNER JOIN"]),
+    ("mysql", "WITH done AS (SELECT * FROM refunds WHERE state = 'done') "
+              "SELECT SUM(o.amount) FROM orders o LEFT JOIN done d ON d.order_id = o.id",
+     "WITH done AS (SELECT * FROM refunds) "
+     "SELECT SUM(o.amount) FROM orders o LEFT JOIN done d ON d.order_id = o.id WHERE d.state = 'done'",
+     ["原流程以 orders 为主表外连接 done，盲算的 WHERE 里有 refunds.state = 'done'，把关联不上 done 的行筛掉了，"
+      "LEFT JOIN 实际成了 INNER JOIN"]),
+    # 盲算以 refunds 为主表，WHERE 又筛掉了没对上订单的行：没有退款的已付订单原流程算、盲算不算
+    ("postgres",
+     "SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'",
+     "SELECT SUM(o.amount) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id WHERE o.status = 'paid'",
+     ["原流程以 orders 为主表外连接 refunds，盲算的 WHERE 里有 orders.status = 'paid'，把关联不上 orders 的行筛掉了，"
+      "LEFT JOIN 实际成了 INNER JOIN"]),
+    ("postgres", "SELECT COUNT(*) FROM orders o RIGHT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM orders o RIGHT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'",
+     ["盲算只保留 status = 'paid' 的行，原流程没有这个条件",
+      "原流程以 refunds 为主表外连接 orders，盲算的 WHERE 里有 orders.status = 'paid'，把关联不上 orders 的行筛掉了，"
+      "RIGHT JOIN 实际成了 INNER JOIN"]),
+], ids=["subquery", "cte", "swapped-and-filtered", "right"])
+def test_an_outer_join_turned_inner_by_where_is_reported(dialect, a, b, expected):
+    """可空那一侧的条件写在 ON / 子查询里，和写在 WHERE 里不是一回事：WHERE 里拿空值比不成立，没关联上的行被筛掉，
+    LEFT JOIN 实际成了内连接。条件本身两边一样（透过子查询都是 refunds.state = 'done'），只报连接。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+def test_only_null_rejecting_where_conditions_turn_an_outer_join_inner():
+    """IS NULL、和 IS NULL 用 OR 连着的、套在 COALESCE 里的，没关联上的行照样留着：外连接不变（宁可漏报）。"""
+    left = "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    inner = "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id"
+    either = " WHERE r.state = 'done' OR r.id IS NULL"
+    assert texts(left + either, inner + either) == ["A 用 LEFT JOIN 关联 refunds 表，B 用 INNER JOIN"]
+    assert aspects(left + " WHERE COALESCE(r.amount, 0) < 100", left) == ["filter"]
+
+
+# --------------------------------------------------------------------------
+# diff_facets：算出来的列
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    ("sqlite", PAID_REFUNDED + f"SELECT SUM(p.total) - SUM(r.total) {PR_JOIN}",
+     PAID_REFUNDED + f"SELECT SUM(r.total) - SUM(p.total) {PR_JOIN}",
+     ["原流程算的是 SUM(paid.total) - SUM(refunded.total)，盲算算的是 SUM(refunded.total) - SUM(paid.total)"]),
+    # 退款率的分子分母对调
+    ("postgres", f"SELECT SUM(r.total) / SUM(p.total) {PR_SUBQUERIES}",
+     f"SELECT SUM(p.total) / SUM(r.total) {PR_SUBQUERIES}",
+     ["原流程算的是 SUM(r.total) / SUM(p.total)，盲算算的是 SUM(p.total) / SUM(r.total)"]),
+    # 窗口：每个用户的合计还是每家门店的合计
+    ("sqlite", "SELECT order_id, SUM(amount) OVER (PARTITION BY user_id) AS s FROM orders",
+     "SELECT order_id, SUM(amount) OVER (PARTITION BY store_id) AS s FROM orders",
+     ["原流程算的是 SUM(amount) OVER (PARTITION BY user_id)，盲算算的是 SUM(amount) OVER (PARTITION BY store_id)"]),
+    # 同一个合计再算一下（分换成元）：和光一个聚合配成一对说
+    ("sqlite", "SELECT SUM(amount) FROM orders", "SELECT SUM(amount) / 100 FROM orders",
+     ["原流程算的是 SUM(amount)，盲算算的是 SUM(amount) / 100"]),
+    ("sqlite", "SELECT SUM(amount) - SUM(fee) FROM orders", "SELECT SUM(amount), SUM(fee) FROM orders",
+     ["原流程多算了 SUM(amount) - SUM(fee)，盲算没有"]),
+], ids=["difference", "ratio", "window-partition", "scaled", "one-sided"])
+def test_how_an_output_column_is_computed_is_compared(dialect, a, b, expected):
+    """最外层算出来的列按算法比：两边用到的聚合一模一样（SUM(paid.total)、SUM(refunded.total)），只是谁减谁、谁除谁
+    换了，聚合那一面看不出来。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("sqlite", PAID_REFUNDED + f"SELECT SUM(p.total) - SUM(r.total) {PR_JOIN}",
+     PAID_REFUNDED + "SELECT SUM(p.total) - SUM(r.total) FROM refunded r JOIN paid p ON p.user_id = r.user_id"),
+    ("sqlite", "SELECT region, SUM(amount) * 1.0 / COUNT(*) AS avg_amt FROM orders GROUP BY region",
+     "SELECT o.region, 1.0 * SUM(o.amount) / COUNT(*) FROM orders o GROUP BY 1"),
+    ("postgres", "SELECT order_id, RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) AS k FROM orders",
+     "SELECT o.order_id, RANK() OVER (PARTITION BY o.user_id ORDER BY o.amount DESC) FROM orders o"),
+    # 最外层取整到分、空值记 0：还是那个合计
+    ("sqlite", "SELECT SUM(amount) FROM orders", "SELECT ROUND(SUM(amount), 2) FROM orders"),
+    ("mysql", "SELECT SUM(amount) FROM orders", "SELECT IFNULL(SUM(amount), 0) FROM orders"),
+], ids=["swapped-join", "commutative", "window", "round", "default"])
+def test_the_same_output_computation_written_differently_is_no_difference(dialect, a, b):
+    """别名、加法乘法的先后、最外层取整、空值记 0 这类写法不同，算的是同一个数。"""
+    assert texts(a, b, dialect) == []
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    # 往里挪一层：net 的 v 是谁减谁
+    ("sqlite",
+     PAID_REFUNDED + ", net AS (SELECT p.user_id, p.total - r.total AS v FROM paid p JOIN refunded r "
+                     "ON r.user_id = p.user_id) SELECT SUM(v) FROM net",
+     PAID_REFUNDED + ", net AS (SELECT p.user_id, r.total - p.total AS v FROM paid p JOIN refunded r "
+                     "ON r.user_id = p.user_id) SELECT SUM(v) FROM net",
+     ["原流程的 net.v 是 paid.total - refunded.total，盲算是 refunded.total - paid.total"]),
+    ("postgres",
+     PAID_REFUNDED + ", net AS (SELECT p.user_id, p.total AS v FROM paid p JOIN refunded r ON r.user_id = p.user_id) "
+                     "SELECT COUNT(*) FROM net WHERE v > 100",
+     PAID_REFUNDED + ", net AS (SELECT p.user_id, r.total AS v FROM paid p JOIN refunded r ON r.user_id = p.user_id) "
+                     "SELECT COUNT(*) FROM net WHERE v > 100",
+     ["原流程的 net.v 是 paid.total，盲算是 refunded.total"]),
+    ("mysql",
+     "SELECT SUM(x.total) FROM (SELECT p.user_id, p.total " + PR_SUBQUERIES + ") x",
+     "SELECT SUM(x.total) FROM (SELECT p.user_id, r.total " + PR_SUBQUERIES + ") x",
+     ["原流程的 x.total 是 p.total，盲算是 r.total"]),
+    ("sqlite", "WITH t AS (SELECT user_id, amount * 0.9 AS net FROM orders) SELECT SUM(net) FROM t",
+     "WITH t AS (SELECT user_id, amount * 0.8 AS net FROM orders) SELECT SUM(net) FROM t",
+     ["原流程的 t.net 是 amount * 0.9，盲算是 amount * 0.8"]),
+    ("mysql",
+     "WITH t AS (SELECT user_id, CASE WHEN status = 'paid' THEN amount ELSE 0 END AS paid_amt FROM orders) "
+     "SELECT SUM(paid_amt) FROM t",
+     "WITH t AS (SELECT user_id, CASE WHEN status IN ('paid', 'shipped') THEN amount ELSE 0 END AS paid_amt "
+     "FROM orders) SELECT SUM(paid_amt) FROM t",
+     ["原流程的 t.paid_amt 是 CASE WHEN status = 'paid' THEN amount ELSE 0 END，"
+      "盲算是 CASE WHEN status IN ('paid', 'shipped') THEN amount ELSE 0 END"]),
+    ("postgres", "SELECT COUNT(*) FROM (SELECT user_id, amount - fee AS net FROM orders) a WHERE a.net > 100",
+     "SELECT COUNT(*) FROM (SELECT user_id, amount + fee AS net FROM orders) b WHERE b.net > 100",
+     ["原流程的 a.net 是 amount - fee，盲算的 b.net 是 amount + fee"]),
+    # 按支付月份还是下单月份分组
+    ("mysql", "WITH t AS (SELECT DATE_FORMAT(paid_at, '%Y-%m') AS m, amount FROM orders) "
+              "SELECT m, SUM(amount) FROM t GROUP BY m",
+     "WITH t AS (SELECT DATE_FORMAT(created_at, '%Y-%m') AS m, amount FROM orders) "
+     "SELECT m, SUM(amount) FROM t GROUP BY m",
+     ["原流程的 t.m 是 DATE_FORMAT(paid_at, '%Y-%m')，盲算是 DATE_FORMAT(created_at, '%Y-%m')"]),
+    ("sqlite", "WITH t AS (SELECT strftime('%Y-%m', paid_at) AS m, amount FROM orders) "
+               "SELECT m, SUM(amount) FROM t GROUP BY m",
+     "WITH t AS (SELECT strftime('%Y-%m', created_at) AS m, amount FROM orders) "
+     "SELECT m, SUM(amount) FROM t GROUP BY m",
+     ["原流程的 t.m 是 STRFTIME('%Y-%m', paid_at)，盲算是 STRFTIME('%Y-%m', created_at)"]),
+    # 窗口：每人第一笔还是最后一笔；有并列时 RANK 和 ROW_NUMBER 取到的行数不同
+    ("postgres",
+     "SELECT SUM(amount) FROM (SELECT user_id, amount, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at) "
+     "AS rn FROM orders) t WHERE rn = 1",
+     "SELECT SUM(amount) FROM (SELECT user_id, amount, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at DESC) "
+     "AS rn FROM orders) t WHERE rn = 1",
+     ["原流程的 t.rn 是 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at)，"
+      "盲算是 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at DESC)"]),
+    ("mysql", "WITH r AS (SELECT user_id, amount, RANK() OVER (ORDER BY amount DESC) AS k FROM orders) "
+              "SELECT SUM(amount) FROM r WHERE k <= 10",
+     "WITH r AS (SELECT user_id, amount, ROW_NUMBER() OVER (ORDER BY amount DESC) AS k FROM orders) "
+     "SELECT SUM(amount) FROM r WHERE k <= 10",
+     ["原流程的 r.k 是 RANK() OVER (ORDER BY amount DESC)，盲算是 ROW_NUMBER() OVER (ORDER BY amount DESC)"]),
+    # 外面直接 SELECT *：每一列都用到了
+    ("sqlite", "WITH t AS (SELECT user_id, amount * 0.9 AS net FROM orders) SELECT * FROM t",
+     "WITH t AS (SELECT user_id, amount * 0.8 AS net FROM orders) SELECT * FROM t",
+     ["原流程的 t.net 是 amount * 0.9，盲算是 amount * 0.8"]),
+    # 递归 CTE 自己写了列名：按列名找各支同一位置的定义
+    ("postgres", "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 10) SELECT SUM(n) FROM t",
+     "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 2 FROM t WHERE n < 10) SELECT SUM(n) FROM t",
+     ["原流程的 t.n 是 1 | n + 1，盲算是 1 | n + 2"]),
+], ids=["nested-difference", "nested-column", "nested-subquery", "scale", "case", "renamed-subquery", "month",
+        "month-strftime", "window-order", "window-function", "select-star", "recursive"])
+def test_how_a_derived_column_is_computed_is_reported(dialect, a, b, expected):
+    """外面写的都是 t.net、net.v、x.total，两边一样；它在 CTE、子查询里怎么算的不一样，要报出来，而且只报这一处：
+    外面按它写的条件、聚合两边写法一样，不跟着报。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("sqlite", "WITH t AS (SELECT user_id, amount * 0.9 AS net FROM orders) SELECT SUM(net) FROM t",
+     "WITH x AS (SELECT user_id, 0.9 * amount AS net FROM orders) SELECT SUM(x.net) FROM x"),
+    # 外面没用到的列算法不同，不影响结果
+    ("sqlite", "WITH t AS (SELECT user_id, amount, paid_at AS ts FROM orders) SELECT SUM(amount) FROM t",
+     "WITH t AS (SELECT user_id, amount, created_at AS ts FROM orders) SELECT SUM(amount) FROM t"),
+    # 取日期的两种写法
+    ("postgres", "WITH t AS (SELECT DATE(paid_at) AS d, amount FROM orders) SELECT d, SUM(amount) FROM t GROUP BY d",
+     "WITH t AS (SELECT CAST(paid_at AS DATE) AS d, amount FROM orders) SELECT d, SUM(amount) FROM t GROUP BY d"),
+    ("mysql",
+     "SELECT SUM(x.total) FROM (SELECT p.user_id, p.total " + PR_SUBQUERIES + ") x",
+     "SELECT SUM(y.total) FROM (SELECT a.user_id, a.total FROM (SELECT user_id, SUM(amount) AS total FROM refunds "
+     "GROUP BY user_id) b JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) a "
+     "ON a.user_id = b.user_id) y"),
+], ids=["commutative", "unused-column", "date-cast", "nested-renamed"])
+def test_the_same_derived_column_written_differently_is_no_difference(dialect, a, b):
+    """派生来源里一列的写法不同、算的一样（0.9 * amount 和 amount * 0.9、DATE() 和 CAST(… AS DATE)），或者外面根本
+    没用到那一列：不报。"""
+    assert texts(a, b, dialect) == []
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    # 换了名字、算法一样：配成同一列
+    ("sqlite", "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+               "SELECT COUNT(*) FROM t WHERE total > 100",
+     "WITH x AS (SELECT user_id, SUM(amount) AS sum_amt FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM x WHERE sum_amt > 100", []),
+    ("sqlite", "WITH t AS (SELECT user_id, SUM(amount) AS total, COUNT(*) AS n FROM orders GROUP BY user_id) "
+               "SELECT COUNT(*) FROM t WHERE total > 100 AND n > 1",
+     "WITH t AS (SELECT user_id, SUM(amount) AS s, COUNT(*) AS c FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM t WHERE s > 100 AND c > 1", []),
+    ("sqlite", "WITH t AS (SELECT user_id, amount, DATE(paid_at) AS d FROM orders) "
+               "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'",
+     "WITH t AS (SELECT user_id, amount, DATE(paid_at) AS day FROM orders) "
+     "SELECT SUM(amount) FROM t WHERE day >= '2026-09-01'", []),
+    # 换了名字又改了算法：两边各剩一列，配成同一列，外面的条件不报成两边各有一个
+    ("sqlite", "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+               "SELECT COUNT(*) FROM t WHERE total > 100",
+     "WITH x AS (SELECT user_id, SUM(amount - discount) AS net_total FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM x WHERE net_total > 100",
+     ["原流程对 amount 求和，盲算对 amount - discount 求和",
+      "原流程的 t.total 是 SUM(amount)，盲算的 x.net_total 是 SUM(amount - discount)"]),
+], ids=["renamed", "two-renamed", "renamed-date", "renamed-and-changed"])
+def test_derived_columns_renamed_on_one_side_are_paired(dialect, a, b, expected):
+    """CTE、子查询选出来的列外面按名字引用，盲算常给它另起名字（total、sum_amt）：按定义配成同一列，外面按它写的条件
+    不算两边各有一个。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+# --------------------------------------------------------------------------
+# diff_facets：时间列写在 CTE、子查询里
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_time_column_computed_in_a_cte_is_seen_through(dialect):
+    """按支付时间还是下单时间筛，日期表达式写在 CTE 里也认得出：时间那一面透过 d = DATE(paid_at) 认出是 paid_at，带上
+    表名、列名给调用方对照数据目录；d 的定义不同不再另报一遍。"""
+    a = ("WITH t AS (SELECT user_id, amount, DATE(paid_at) AS d FROM orders) "
+         "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'")
+    b = a.replace("DATE(paid_at)", "DATE(created_at)")
+    [diff] = diff_facets(facets(a, dialect), facets(b, dialect), labels=LABELS,
+                         names={"orders.paid_at": "支付时间", "created_at": "下单时间"})
+    assert (diff.aspect, diff.text) == ("time", "原流程按支付时间 paid_at 筛时间，盲算按下单时间 created_at")
+    assert diff.detail == {"a": [{"table": "orders", "column": "paid_at"}],
+                           "b": [{"table": "orders", "column": "created_at"}]}
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    ("postgres", "SELECT SUM(x.amount) FROM (SELECT amount, CAST(paid_at AS DATE) AS day FROM orders) x "
+                 "WHERE x.day BETWEEN '2026-09-01' AND '2026-09-30'",
+     "SELECT SUM(y.amount) FROM (SELECT amount, CAST(created_at AS DATE) AS day FROM orders) y "
+     "WHERE y.day BETWEEN '2026-09-01' AND '2026-09-30'",
+     ["原流程按 paid_at 筛时间，盲算按 created_at"]),
+    # 两个 CTE 同名、定义对调：原流程筛付款时间，盲算筛退款时间
+    ("mysql", "WITH a AS (SELECT user_id, MAX(paid_at) AS ts FROM orders GROUP BY user_id), "
+              "b AS (SELECT user_id, MAX(refunded_at) AS ts FROM refunds GROUP BY user_id) "
+              "SELECT COUNT(*) FROM a JOIN b ON b.user_id = a.user_id WHERE a.ts >= '2026-09-01'",
+     "WITH a AS (SELECT user_id, MAX(refunded_at) AS ts FROM refunds GROUP BY user_id), "
+     "b AS (SELECT user_id, MAX(paid_at) AS ts FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM a JOIN b ON b.user_id = a.user_id WHERE a.ts >= '2026-09-01'",
+     ["原流程按 paid_at 筛时间，盲算按 refunded_at"]),
+    # 带时区偏移的不是同一天：时间列一样，d 的定义不同照报
+    ("sqlite", "WITH t AS (SELECT amount, DATE(paid_at) AS d FROM orders) "
+               "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'",
+     "WITH t AS (SELECT amount, DATE(paid_at, '+8 hours') AS d FROM orders) "
+     "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'",
+     ["原流程的 t.d 是 DATE(paid_at)，盲算是 DATE(paid_at, '+8 hours')"]),
+    ("postgres", "WITH t AS (SELECT DATE(paid_at) AS d, amount FROM orders) "
+                 "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'",
+     "WITH t AS (SELECT CAST(paid_at AS DATE) AS d, amount FROM orders) "
+     "SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'", []),
+], ids=["cast-between", "same-name-swapped", "time-zone", "date-or-cast"])
+def test_time_columns_inside_derived_tables(dialect, a, b, expected):
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+# --------------------------------------------------------------------------
+# diff_facets：两边写法一样、意思不同时说清楚
+# --------------------------------------------------------------------------
+
+
+def test_same_named_derived_tables_with_swapped_definitions_are_told_apart():
+    """两边的 CTE 同名、定义对调了（盲算的 t1 是原流程的 t2）：按结构配对之后 t1.total 两边不是同一列，可只写
+    「t1.total > 100」两边一模一样，自相矛盾。带上各自的来历：原流程筛付款合计，盲算筛退款合计。"""
+    a = ("WITH t1 AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+         "t2 AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
+         "SELECT COUNT(*) FROM t1 JOIN t2 ON t2.user_id = t1.user_id WHERE t1.total > 100")
+    b = ("WITH t1 AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id), "
+         "t2 AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM t1 JOIN t2 ON t2.user_id = t1.user_id WHERE t1.total > 100")
+    assert texts(a, b, "postgres", labels=LABELS) == [
+        "原流程按 t1.total > 100（t1.total 即 SUM(orders.amount)）筛选，"
+        "盲算按 t1.total > 100（t1.total 即 SUM(refunds.amount)）筛选"]
+    a_sum = ("WITH a AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+             "b AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
+             "SELECT SUM(a.total) FROM a JOIN b ON b.user_id = a.user_id")
+    b_sum = ("WITH a AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id), "
+             "b AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+             "SELECT SUM(a.total) FROM a JOIN b ON b.user_id = a.user_id")
+    assert texts(a_sum, b_sum, labels=LABELS) == [
+        "原流程对 a.total（即 SUM(orders.amount)）求和，盲算对 a.total（即 SUM(refunds.amount)）求和"]
+
+
+def test_same_named_derived_tables_that_differ_only_in_conditions_say_which_is_which():
+    """两个 CTE 读同一张表、各列定义一样，只差里面的条件；盲算把两个名字的定义对调了、还都多了 is_deleted = 0。按条件
+    的重合配（不按名字：盲算的 paid 筛的是 status = 'open'），外面的「> 100」筛的就是未付合计；来历也一样（都是
+    SUM(orders.amount)），说清两边同名的各对应哪一个。"""
+    a = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id), "
+         "open AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' GROUP BY user_id) "
+         "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE p.total > 100")
+    b = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' AND is_deleted = 0 "
+         "GROUP BY user_id), "
+         "open AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' AND is_deleted = 0 "
+         "GROUP BY user_id) "
+         "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE p.total > 100")
+    assert texts(a, b, labels=LABELS) == [
+        "原流程按 paid.total > 100 筛选，"
+        "盲算按 paid.total > 100（盲算的 paid 对应原流程的 open、盲算的 open 对应原流程的 paid）筛选",
+        "盲算只保留 is_deleted = 0 的行，原流程没有这个条件"]
+
+
+# --------------------------------------------------------------------------
+# diff_facets：同一个条件筛的先后
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    # 「第一单就是已付的人数」对「有已付订单的人数」
+    ("postgres",
+     "SELECT COUNT(*) FROM (SELECT user_id, status, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at) AS rn "
+     "FROM orders) t WHERE t.rn = 1 AND t.status = 'paid'",
+     "SELECT COUNT(*) FROM (SELECT user_id, status, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at) AS rn "
+     "FROM orders WHERE status = 'paid') t WHERE t.rn = 1",
+     ["原流程先算 t 的窗口函数、再按 status = 'paid' 筛选，盲算先按 status = 'paid' 筛选、再算 t 的窗口函数"]),
+    ("sqlite", "WITH t AS (SELECT * FROM orders ORDER BY amount DESC LIMIT 10) SELECT SUM(amount) FROM t "
+               "WHERE status = 'paid'",
+     "WITH t AS (SELECT * FROM orders WHERE status = 'paid' ORDER BY amount DESC LIMIT 10) SELECT SUM(amount) FROM t",
+     ["原流程先取 t 的前 10 行、再按 status = 'paid' 筛选，盲算先按 status = 'paid' 筛选、再取 t 的前 10 行"]),
+    ("sqlite", "WITH t AS (SELECT * FROM orders ORDER BY amount DESC LIMIT 10) SELECT SUM(amount) FROM t "
+               "WHERE paid_at >= '2026-09-01'",
+     "WITH t AS (SELECT * FROM orders WHERE paid_at >= '2026-09-01' ORDER BY amount DESC LIMIT 10) "
+     "SELECT SUM(amount) FROM t",
+     ["原流程先取 t 的前 10 行、再按 paid_at >= '2026-09-01' 筛选，"
+      "盲算先按 paid_at >= '2026-09-01' 筛选、再取 t 的前 10 行"]),
+], ids=["window", "limit", "limit-time"])
+def test_filtering_before_or_after_a_window_or_limit_is_reported(dialect, a, b, expected):
+    """先取前 10 行再筛已付，和先筛已付再取前 10 行，取到的不是同一批：派生来源取前几行、算窗口函数时，外面的条件
+    不再透成里面那张表的条件，两边只差在筛的先后，照报。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    # 按窗口的分区键筛，窗口里外都一样
+    ("postgres",
+     "SELECT COUNT(*) FROM (SELECT user_id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at) AS rn "
+     "FROM orders) t WHERE t.rn = 1 AND t.user_id > 100",
+     "SELECT COUNT(*) FROM (SELECT user_id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY paid_at) AS rn "
+     "FROM orders WHERE user_id > 100) t WHERE t.rn = 1"),
+    # 两边都是先取前 10 行再筛，只是起的名字不同
+    ("sqlite", "WITH t AS (SELECT * FROM orders ORDER BY amount DESC LIMIT 10) SELECT SUM(amount) FROM t "
+               "WHERE status = 'paid'",
+     "WITH top10 AS (SELECT * FROM orders ORDER BY amount DESC LIMIT 10) SELECT SUM(t.amount) FROM top10 t "
+     "WHERE t.status = 'paid'"),
+], ids=["partition-key", "same-order"])
+def test_filtering_at_an_equivalent_stage_is_no_difference(dialect, a, b):
+    assert texts(a, b, dialect) == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：没用到的 CTE
+# --------------------------------------------------------------------------
+
+
+def test_a_cte_defined_but_not_used_does_not_count():
+    """盲算定义了只筛已付的 CTE，却直接查 orders：少的那个条件要报出来；定义了没用的 CTE 里多一个条件、多一张表，
+    不影响结果，不报。"""
+    paid = "WITH paid AS (SELECT * FROM orders WHERE status = 'paid') "
+    assert texts(paid + "SELECT SUM(amount) FROM paid", paid + "SELECT SUM(amount) FROM orders", labels=LABELS) == \
+        ["原流程只保留 status = 'paid' 的行，盲算没有这个条件"]
+    assert texts("SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+                 "WITH junk AS (SELECT * FROM users WHERE vip = 1) "
+                 "SELECT SUM(amount) FROM orders WHERE status = 'paid'") == []
+    assert texts(paid + "SELECT SUM(amount) FROM paid",
+                 paid + "SELECT SUM(amount) FROM orders WHERE status = 'paid'") == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：自己关联自己
+# --------------------------------------------------------------------------
+
+SELF_BASE = ("WITH base AS (SELECT user_id, referrer_id, SUM(amount) AS total FROM orders "
+             "GROUP BY user_id, referrer_id) ")
+
+
+@pytest.mark.parametrize("dialect,a,b,expected", [
+    ("postgres", SELF_BASE + "SELECT COUNT(*) FROM base b1 JOIN base b2 ON b2.user_id = b1.referrer_id "
+                             "WHERE b1.total > b2.total",
+     SELF_BASE + "SELECT COUNT(*) FROM base b1 JOIN base b2 ON b2.user_id = b1.referrer_id WHERE b2.total > b1.total",
+     ["原流程只保留 b1.total > b2.total 的行，盲算没有这个条件", "盲算只保留 b1.total < b2.total 的行，原流程没有这个条件"]),
+    ("sqlite", "SELECT COUNT(*) FROM orders o1 JOIN orders o2 ON o2.id = o1.parent_id WHERE o1.amount > o2.amount",
+     "SELECT COUNT(*) FROM orders o1 JOIN orders o2 ON o2.id = o1.parent_id WHERE o2.amount > o1.amount",
+     ["原流程只保留 o2.amount < o1.amount 的行，盲算没有这个条件", "盲算只保留 o2.amount > o1.amount 的行，原流程没有这个条件"]),
+    # 换了别名、换了关联先后：b1 还是出 referrer_id 的那一个
+    ("postgres", SELF_BASE + "SELECT COUNT(*) FROM base b1 JOIN base b2 ON b2.user_id = b1.referrer_id "
+                             "WHERE b1.total > b2.total",
+     SELF_BASE + "SELECT COUNT(*) FROM base y JOIN base x ON x.referrer_id = y.user_id WHERE y.total < x.total", []),
+    ("sqlite", "SELECT COUNT(*) FROM orders o1 JOIN orders o2 ON o2.id = o1.parent_id WHERE o1.amount > o2.amount",
+     "SELECT COUNT(*) FROM orders c JOIN orders p ON c.parent_id = p.id WHERE c.amount > p.amount", []),
+], ids=["cte-reversed", "table-reversed", "cte-renamed", "table-renamed"])
+def test_a_self_join_tells_its_two_aliases_apart(dialect, a, b, expected):
+    """同一个 CTE、同一张表自己关联自己：两个别名按各自在关联条件里出的列区分（出 referrer_id 的、出 user_id 的），
+    比较写反了要报；只是换了别名、换了关联先后不报。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
