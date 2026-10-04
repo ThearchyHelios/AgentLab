@@ -12,7 +12,9 @@
   的列时外层用的是哪一个照报；外连接按主表比（LEFT / RIGHT 对调不报，主表换了、被 WHERE 变成内连接照报）；算出来
   的列按算法比（最外层的算式、窗口函数，CTE 里被外面用到的列的定义）；时间列透过 CTE 里的日期表达式认；取前几行、
   窗口函数前后筛的不同照报；没用到的 CTE 不算；两边同名却不是同一个的派生来源说清各是什么；自己关联自己的两个
-  别名分得开
+  别名分得开；读同一张表的几个派生来源同在一段时不透成那张表的列（用的是已付那份还是未付那份照报）；相关子查询里
+  外层的列另带标记（子单、父单分得开）；条件、分组、连接、聚合按层计数（外层少了一个和子查询里一样的条件照报）；
+  去重、UNION 还是 UNION ALL、最后出一行还是每组一行照报
 
 夹具全是虚构的表：订单 orders、退款 refunds、门店 stores、用户 users、付款 payments，以及一张中文表「订单」。
 """
@@ -1369,3 +1371,339 @@ def test_catalog_labels_come_from_visible_catalog_items():
 def test_a_facets_object_compares_with_itself_cleanly():
     f = facets(BASE)
     assert isinstance(f, Facets) and diff_facets(f, f) == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：读同一张表的几个派生来源（原样透出的 CTE、子查询）
+# --------------------------------------------------------------------------
+
+#: 两个原样透出的 CTE 读同一张表：一个是已付的订单，一个是未付的
+PASS_PO = ("WITH paid AS (SELECT * FROM orders WHERE status = 'paid'), "
+           "open AS (SELECT * FROM orders WHERE status = 'open') ")
+PO_JOIN = "FROM paid p JOIN open o ON o.user_id = p.user_id"
+#: 同样两段写成 FROM 里的子查询
+PO_SUBQUERIES = ("FROM (SELECT * FROM orders WHERE status = 'paid') p "
+                 "JOIN (SELECT * FROM orders WHERE status = 'open') o ON o.user_id = p.user_id")
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("form", ["cte", "subquery"])
+@pytest.mark.parametrize("a,b,expected", [
+    ("SELECT SUM(p.amount) {j}", "SELECT SUM(o.amount) {j}", ["原流程对 paid.amount 求和，盲算对 open.amount 求和"]),
+    ("SELECT COUNT(*) {j} WHERE p.amount > 100", "SELECT COUNT(*) {j} WHERE o.amount > 100",
+     ["原流程按 paid.amount > 100 筛选，盲算按 open.amount > 100 筛选"]),
+    ("SELECT COUNT(*) {j} WHERE p.created_at >= '2026-09-01'",
+     "SELECT COUNT(*) {j} WHERE o.created_at >= '2026-09-01'",
+     ["原流程按 paid.created_at 筛时间，盲算按 open.created_at"]),
+    ("SELECT p.id {j} ORDER BY p.created_at DESC LIMIT 10", "SELECT p.id {j} ORDER BY o.created_at DESC LIMIT 10",
+     ["原流程取行前按 paid.created_at 降序排，盲算按 open.created_at 降序排"]),
+    ("SELECT COUNT(*) {j} GROUP BY p.store_id", "SELECT COUNT(*) {j} GROUP BY o.store_id",
+     ["原流程按 paid.store_id 分组，盲算按 open.store_id 分组"]),
+], ids=["sum", "where", "time", "order-by", "group-by"])
+def test_which_pass_through_derived_table_a_column_comes_from_is_reported(dialect, form, a, b, expected):
+    """两个原样透出的 CTE（SELECT * FROM orders WHERE …）读同一张表：透过去都成了 orders 的列，外层用的是已付的那份
+    还是未付的那份就分不出来了（SQLite 实测求和 230 对 400）。同一段里有几个来源最后读的是同一张表时，这几个派生来源
+    不透过去，按配好对的编号认列。"""
+    if form == "cte":
+        head, j = PASS_PO, PO_JOIN
+    else:
+        head, j = "", PO_SUBQUERIES
+        expected = [t.replace("paid.", "p.").replace("open.", "o.") for t in expected]
+    assert texts(head + a.format(j=j), head + b.format(j=j), dialect, labels=LABELS) == expected
+
+
+def test_a_time_column_of_a_pass_through_derived_table_names_the_real_table():
+    """按哪个派生来源的同名时间列筛，说明里写派生来源的名字；给调用方对照数据目录的 detail 写透到底的实表和列。"""
+    [diff] = diff_facets(facets(PASS_PO + f"SELECT COUNT(*) {PO_JOIN} WHERE p.created_at::date >= '2026-09-01'",
+                                "postgres"),
+                         facets(PASS_PO + f"SELECT COUNT(*) {PO_JOIN} WHERE o.created_at::date >= '2026-09-01'",
+                                "postgres"), labels=LABELS)
+    assert (diff.aspect, diff.text) == ("time", "原流程按 paid.created_at 筛时间，盲算按 open.created_at")
+    assert diff.detail == {"a": [{"table": "orders", "column": "created_at"}],
+                           "b": [{"table": "orders", "column": "created_at"}]}
+
+
+PO_COLUMNS = ("WITH paid AS (SELECT user_id, referrer_id, amount FROM orders WHERE status = 'paid'), "
+              "open AS (SELECT user_id, referrer_id, amount FROM orders WHERE status = 'open') ")
+PO_CHAIN = ("WITH base AS (SELECT * FROM orders WHERE is_deleted = 0), "
+            "paid AS (SELECT * FROM base WHERE status = 'paid'), open AS (SELECT * FROM base WHERE status = 'open') ")
+#: 原样透出的 CTE 自己关联自己
+SELF_T = "WITH t AS (SELECT * FROM orders WHERE status = 'paid') "
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b,expected", [
+    # 直接选出各列的 CTE：关联条件透过去两边都是 orders.referrer_id = orders.user_id
+    (PO_COLUMNS + "SELECT SUM(p.amount) FROM paid p JOIN open o ON p.user_id = o.referrer_id",
+     PO_COLUMNS + "SELECT SUM(p.amount) FROM paid p JOIN open o ON p.referrer_id = o.user_id",
+     ["原流程关联 open 表的条件是 open.referrer_id = paid.user_id，盲算是 paid.referrer_id = open.user_id"]),
+    # CTE 套 CTE：paid、open 都从 base 取数
+    (PO_CHAIN + "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE p.amount > 100",
+     PO_CHAIN + "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE o.amount > 100",
+     ["原流程按 paid.amount > 100 筛选，盲算按 open.amount > 100 筛选"]),
+    # 子查询里再套子查询
+    ("SELECT COUNT(*) FROM (SELECT p.user_id " + PO_SUBQUERIES + " WHERE p.amount > 100) x",
+     "SELECT COUNT(*) FROM (SELECT p.user_id " + PO_SUBQUERIES + " WHERE o.amount > 100) x",
+     ["原流程按 p.amount > 100 筛选，盲算按 o.amount > 100 筛选"]),
+    # 派生列的定义里谁减谁
+    (PASS_PO + "SELECT SUM(d) FROM (SELECT p.amount - o.amount AS d " + PO_JOIN + ") x",
+     PASS_PO + "SELECT SUM(d) FROM (SELECT o.amount - p.amount AS d " + PO_JOIN + ") x",
+     ["原流程的 x.d 是 paid.amount - open.amount，盲算是 open.amount - paid.amount"]),
+    # CTE 和它自己读的那张表关联：父单的金额还是子单的金额
+    (SELF_T + "SELECT SUM(p.amount) FROM t p JOIN orders c ON c.parent_id = p.id",
+     SELF_T + "SELECT SUM(c.amount) FROM t p JOIN orders c ON c.parent_id = p.id",
+     ["原流程对 t.amount 求和，盲算对 orders.amount 求和"]),
+    # 原样透出的 CTE 自己关联自己：两个别名按各自在关联条件里出的列区分，透过去也不丢
+    (SELF_T + "SELECT SUM(a.amount) FROM t a JOIN t b ON b.user_id = a.referrer_id",
+     SELF_T + "SELECT SUM(b.amount) FROM t a JOIN t b ON b.user_id = a.referrer_id",
+     ["原流程对 a.amount 求和，盲算对 b.amount 求和"]),
+    # 自己关联自己、关联的方向反了：两边都写 a.amount，说清各自的 a 是哪一个
+    (SELF_T + "SELECT SUM(a.amount) FROM t a JOIN t b ON b.user_id = a.referrer_id",
+     SELF_T + "SELECT SUM(a.amount) FROM t a JOIN t b ON b.referrer_id = a.user_id",
+     ["原流程对 a.amount（a 是关联条件里出 referrer_id 的那个 t）求和，"
+      "盲算对 a.amount（a 是关联条件里出 user_id 的那个 t）求和"]),
+    ("SELECT SUM(a.amount) FROM orders a JOIN orders b ON b.user_id = a.referrer_id",
+     "SELECT SUM(a.amount) FROM orders a JOIN orders b ON b.referrer_id = a.user_id",
+     ["原流程对 a.amount（a 是关联条件里出 referrer_id 的那个 orders）求和，"
+      "盲算对 a.amount（a 是关联条件里出 user_id 的那个 orders）求和"]),
+], ids=["columns-join", "cte-chain", "nested-subquery", "derived-column", "with-own-table", "self-join",
+        "self-join-reversed", "table-self-join-reversed"])
+def test_derived_tables_reading_the_same_table_keep_apart(dialect, a, b, expected):
+    """读同一张表的几个派生来源（还有派生来源和它自己读的那张表）在同一段里，各自的列不透成那张表的列：关联条件、
+    CTE 链、往里套的子查询、派生列的定义、自己关联自己都分得清是哪一份。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    # 关联先后对调、比较两边对调：意思一样
+    ("sqlite", PASS_PO + f"SELECT COUNT(*) {PO_JOIN} WHERE p.amount > o.amount",
+     PASS_PO + "SELECT COUNT(*) FROM open o JOIN paid p ON p.user_id = o.user_id WHERE o.amount < p.amount"),
+    ("postgres", f"SELECT SUM(p.amount) {PO_SUBQUERIES}",
+     "SELECT SUM(x.amount) FROM (SELECT * FROM orders WHERE status = 'open') y "
+     "JOIN (SELECT * FROM orders WHERE status = 'paid') x ON x.user_id = y.user_id"),
+    # 两边给 CTE 起的名字不同
+    ("mysql", PASS_PO + f"SELECT SUM(p.amount) {PO_JOIN}",
+     "WITH settled AS (SELECT * FROM orders WHERE status = 'paid'), "
+     "pending AS (SELECT * FROM orders WHERE status = 'open') "
+     "SELECT SUM(s.amount) FROM settled s JOIN pending q ON q.user_id = s.user_id"),
+    # 只有一个原样透出的 CTE：照旧透成那张表的列，写在 CTE 里还是外层的条件是同一个
+    ("sqlite", "WITH paid AS (SELECT * FROM orders WHERE status = 'paid') "
+               "SELECT SUM(p.amount) FROM paid p JOIN refunds r ON r.order_id = p.id",
+     "SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'"),
+    # 自己关联自己换了别名、换了关联先后
+    ("sqlite", SELF_T + "SELECT SUM(a.amount) FROM t a JOIN t b ON b.user_id = a.referrer_id",
+     SELF_T + "SELECT SUM(y.amount) FROM t x JOIN t y ON y.referrer_id = x.user_id"),
+], ids=["swapped", "subquery-renamed-swapped", "cte-renamed", "single-pass-through", "self-join-renamed"])
+def test_derived_tables_reading_the_same_table_written_differently_are_no_difference(dialect, a, b):
+    assert texts(a, b, dialect) == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：相关子查询读的是外层那张表
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b,expected", [
+    # 有子单的订单数对有父单的订单数：内外两个 orders 写出来一样，得分清哪一列是外层的
+    ("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders c WHERE c.parent_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders c WHERE c.id = o.parent_id)",
+     ["原流程按 EXISTS(SELECT 1 FROM orders AS c WHERE o.id = c.parent_id) 筛选，"
+      "盲算按 EXISTS(SELECT 1 FROM orders AS c WHERE o.parent_id = c.id) 筛选"]),
+    # 之前有过订单对之后还有订单
+    ("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders p WHERE p.user_id = o.user_id "
+     "AND p.created_at < o.created_at)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders p WHERE p.user_id = o.user_id "
+     "AND o.created_at < p.created_at)",
+     ["原流程按 EXISTS(SELECT 1 FROM orders AS p WHERE o.user_id = p.user_id AND o.created_at > p.created_at) 筛选，"
+      "盲算按 EXISTS(SELECT 1 FROM orders AS p WHERE o.user_id = p.user_id AND o.created_at < p.created_at) 筛选"]),
+    # 外层是透过 CTE 的 orders
+    ("WITH p AS (SELECT * FROM orders WHERE status = 'paid') "
+     "SELECT COUNT(*) FROM p WHERE EXISTS (SELECT 1 FROM orders c WHERE c.parent_id = p.id)",
+     "WITH p AS (SELECT * FROM orders WHERE status = 'paid') "
+     "SELECT COUNT(*) FROM p WHERE EXISTS (SELECT 1 FROM orders c WHERE c.id = p.parent_id)",
+     ["原流程按 EXISTS(SELECT 1 FROM orders AS c WHERE p.id = c.parent_id) 筛选，"
+      "盲算按 EXISTS(SELECT 1 FROM orders AS c WHERE p.parent_id = c.id) 筛选"]),
+    # SELECT 列表里的标量子查询：子单数对父单数
+    ("SELECT o.id, (SELECT COUNT(*) FROM orders c WHERE c.parent_id = o.id) AS n FROM orders o",
+     "SELECT o.id, (SELECT COUNT(*) FROM orders c WHERE c.id = o.parent_id) AS n FROM orders o",
+     ["原流程算的是 (SELECT COUNT(*) FROM orders AS c WHERE o.id = c.parent_id)，"
+      "盲算算的是 (SELECT COUNT(*) FROM orders AS c WHERE o.parent_id = c.id)"]),
+], ids=["exists-parent-child", "exists-before-after", "exists-through-cte", "scalar"])
+def test_a_correlated_subquery_on_the_outer_table_tells_inner_from_outer(dialect, a, b, expected):
+    """相关子查询读的表和外层是同一张（orders 里找子单、父单、同一用户更早的单）：比较用的写法里外层的列另带标记，
+    c.parent_id = o.id 和 c.id = o.parent_id 才不会都成了 orders.id = orders.parent_id；给人看的写法照写别名（两边
+    表名一样时外层的列排在前面）。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+def test_a_correlated_lateral_subquery_on_the_outer_table_is_reported():
+    a = ("SELECT o.id, x.s FROM orders o CROSS JOIN LATERAL "
+         "(SELECT SUM(c.amount) AS s FROM orders c WHERE c.parent_id = o.id) x")
+    b = a.replace("c.parent_id = o.id", "c.id = o.parent_id")
+    assert texts(a, b, "postgres", labels=LABELS) == ["原流程只保留 o.id = c.parent_id 的行，盲算没有这个条件",
+                                                      "盲算只保留 o.parent_id = c.id 的行，原流程没有这个条件"]
+
+
+@pytest.mark.parametrize("a,b", [
+    ("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders c WHERE c.parent_id = o.id)",
+     "SELECT COUNT(*) FROM orders x WHERE EXISTS (SELECT 1 FROM orders y WHERE x.id = y.parent_id)"),
+    ("SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders WHERE NOT EXISTS (SELECT 1 FROM refunds WHERE refunds.order_id = orders.id)"),
+], ids=["renamed", "other-table"])
+def test_the_same_correlated_subquery_written_differently_is_no_difference(a, b):
+    assert texts(a, b) == []
+
+
+def test_a_difference_inside_a_condition_subquery_is_said_once():
+    """条件里的子查询整个写进外层那个条件：里面多一个条件，外层那个条件已经报了，不再另说一句「只保留 state =
+    'done' 的行」（它不筛外层的行，是 NOT EXISTS 里面的）。"""
+    a = "SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"
+    b = ("SELECT COUNT(*) FROM orders o WHERE NOT EXISTS "
+         "(SELECT 1 FROM refunds r WHERE r.order_id = o.id AND r.state = 'done')")
+    assert texts(a, b, labels=LABELS) == [
+        "原流程按 NOT EXISTS(SELECT 1 FROM refunds WHERE orders.id = refunds.order_id) 筛选，"
+        "盲算按 NOT EXISTS(SELECT 1 FROM refunds WHERE orders.id = refunds.order_id AND refunds.state = 'done') 筛选"]
+
+
+# --------------------------------------------------------------------------
+# diff_facets：同一个条件、分组、连接出现在不同的层
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b,expected", [
+    # 外层的条件和 IN 子查询里的同一个条件
+    ("SELECT SUM(amount) FROM orders WHERE status = 'paid' AND user_id IN "
+     "(SELECT user_id FROM orders WHERE status = 'paid')",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT user_id FROM orders WHERE status = 'paid')",
+     ["原流程在外层也只保留 status = 'paid' 的行，盲算在外层没有这个条件"]),
+    ("SELECT COUNT(*) FROM orders o WHERE o.status = 'paid' AND EXISTS (SELECT 1 FROM orders x "
+     "WHERE x.user_id = o.user_id AND x.status = 'paid' AND x.id <> o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM orders x "
+     "WHERE x.user_id = o.user_id AND x.status = 'paid' AND x.id <> o.id)",
+     ["原流程在外层也只保留 status = 'paid' 的行，盲算在外层没有这个条件"]),
+    # 关联进来的汇总 CTE 里有，外层没有
+    ("WITH pu AS (SELECT user_id, COUNT(*) AS n FROM orders WHERE status = 'paid' GROUP BY user_id) "
+     "SELECT SUM(o.amount) FROM orders o JOIN pu ON pu.user_id = o.user_id WHERE o.status = 'paid'",
+     "WITH pu AS (SELECT user_id, COUNT(*) AS n FROM orders WHERE status = 'paid' GROUP BY user_id) "
+     "SELECT SUM(o.amount) FROM orders o JOIN pu ON pu.user_id = o.user_id",
+     ["原流程在外层也只保留 status = 'paid' 的行，盲算在外层没有这个条件"]),
+    # UNION 的第二支少了条件
+    ("SELECT COUNT(*) FROM (SELECT user_id FROM orders WHERE status = 'paid' "
+     "UNION SELECT referrer_id FROM orders WHERE status = 'paid') t",
+     "SELECT COUNT(*) FROM (SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders) t",
+     ["原流程在 t 的 UNION 第 2 支里也只保留 status = 'paid' 的行，盲算在 t 的 UNION 第 2 支里没有这个条件"]),
+    # 外层的分组和 IN 子查询里的分组
+    ("SELECT user_id, COUNT(*) FROM orders WHERE user_id IN "
+     "(SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1) GROUP BY user_id",
+     "SELECT COUNT(*) FROM orders WHERE user_id IN (SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1)",
+     ["原流程在外层按 user_id 分组，盲算在外层没有分组"]),
+    # 外层的关联和 EXISTS 子查询里的关联
+    ("SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id WHERE EXISTS "
+     "(SELECT 1 FROM orders o2 JOIN refunds r2 ON r2.order_id = o2.id WHERE o2.user_id = o.user_id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS "
+     "(SELECT 1 FROM orders o2 JOIN refunds r2 ON r2.order_id = o2.id WHERE o2.user_id = o.user_id)",
+     ["原流程在外层也关联了 refunds 表，盲算在外层没有"]),
+    # 外层算的聚合和标量子查询里的聚合
+    ("SELECT SUM(o.amount) FROM orders o WHERE o.amount > (SELECT AVG(amount) FROM orders)",
+     "SELECT AVG(o.amount) FROM orders o WHERE o.amount > (SELECT AVG(amount) FROM orders)",
+     ["原流程对 amount 求和，盲算求平均"]),
+    # 外层的时间条件和 IN 子查询里的同一个时间条件
+    ("SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01' AND user_id IN "
+     "(SELECT user_id FROM orders WHERE paid_at >= '2026-09-01')",
+     "SELECT SUM(amount) FROM orders WHERE user_id IN (SELECT user_id FROM orders WHERE paid_at >= '2026-09-01')",
+     ["原流程在外层也按 paid_at >= '2026-09-01' 筛了时间，盲算在外层没有这个条件"]),
+    # 读同一张表的两个 CTE 各有一个 is_deleted = 0，盲算的 b 里少了：两个条件，不是一个
+    ("WITH a AS (SELECT * FROM orders WHERE is_deleted = 0 AND status = 'paid'), "
+     "b AS (SELECT * FROM orders WHERE is_deleted = 0 AND status = 'open') "
+     "SELECT COUNT(*) FROM a JOIN b ON b.user_id = a.user_id",
+     "WITH a AS (SELECT * FROM orders WHERE is_deleted = 0 AND status = 'paid'), "
+     "b AS (SELECT * FROM orders WHERE status = 'open') SELECT COUNT(*) FROM a JOIN b ON b.user_id = a.user_id",
+     ["原流程在 b 里也只保留 is_deleted = 0 的行，盲算在 b 里没有这个条件"]),
+    # 最外层就是 UNION：第二支少了条件
+    ("SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders WHERE status = 'paid'",
+     "SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders",
+     ["原流程在 UNION 第 2 支里也只保留 status = 'paid' 的行，盲算在 UNION 第 2 支里没有这个条件"]),
+], ids=["in-subquery", "exists", "joined-cte", "union-branch", "group-by", "join", "aggregate", "time",
+        "two-ctes", "root-union"])
+def test_the_same_item_on_another_layer_is_counted_once_per_layer(dialect, a, b, expected):
+    """各段收集到的条件、分组、连接、聚合原来按整条语句去重成一个集合：外层的 status = 'paid' 和 IN 子查询（关联进来的
+    汇总 CTE、UNION 的另一支）里的同一个条件合成了一个，外层少了它报不出来（实测 350 对 700）。现在每一项记下在哪
+    一层，同一项在一边出现在几层就算几个：另一边层数少了，报多出来的那一层。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("a,b", [
+    # 有效记录条件写在原样透出的 CTE 里、外层又写了一遍：还是同一层的同一个条件
+    ("WITH v AS (SELECT * FROM orders WHERE is_deleted = 0) SELECT SUM(amount) FROM v WHERE is_deleted = 0",
+     "SELECT SUM(amount) FROM orders WHERE is_deleted = 0"),
+    # 两边外层都有、子查询里也都有
+    ("SELECT SUM(amount) FROM orders WHERE status = 'paid' AND user_id IN "
+     "(SELECT user_id FROM orders WHERE status = 'paid')",
+     "SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT x.user_id FROM orders x WHERE x.status = 'paid') "
+     "AND o.status = 'paid'"),
+    # 条件从汇总的 CTE 里挪到外层（按分组键筛，先筛后筛一样）
+    ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE user_id > 100 GROUP BY user_id) "
+     "SELECT SUM(total) FROM t",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+     "SELECT SUM(total) FROM t WHERE user_id > 100"),
+], ids=["repeated-in-pass-through", "both-layers", "moved-group-key-filter"])
+def test_the_same_item_on_equivalent_layers_is_no_difference(a, b):
+    assert texts(a, b) == []
+
+
+# --------------------------------------------------------------------------
+# diff_facets：去重、UNION、最后出几行
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b,expected", [
+    # 先在子查询里按用户分组、外层数用户数，对外层按用户分组、每人一行（实测 [(4,)] 对 [(3,),(2,),(1,),(1,)]）
+    ("SELECT COUNT(t.user_id) FROM (SELECT user_id FROM orders GROUP BY user_id) t",
+     "SELECT COUNT(user_id) FROM orders GROUP BY user_id",
+     ["原流程最后只出一行，盲算按 user_id 分组、每组一行"]),
+    # 同一批行 UNION ALL 了两遍（实测 8 对 4）
+    ("SELECT COUNT(*) FROM (SELECT id FROM orders WHERE status = 'paid' "
+     "UNION ALL SELECT id FROM orders WHERE status = 'paid') t",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+     ["原流程在 t 里把 2 支查询用 UNION ALL 合起来，盲算没有"]),
+    # 去重后的用户数对订单行数（实测 3 对 4）
+    ("SELECT COUNT(*) FROM (SELECT DISTINCT user_id FROM orders WHERE status = 'paid') t",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+     ["原流程在 t 里对 user_id 去重，盲算没有去重"]),
+    ("SELECT COUNT(*) FROM (SELECT DISTINCT user_id FROM orders WHERE status = 'paid') t",
+     "SELECT COUNT(*) FROM (SELECT user_id FROM orders WHERE status = 'paid') t",
+     ["原流程在 t 里对 user_id 去重，盲算没有去重"]),
+    ("SELECT DISTINCT region FROM orders", "SELECT region FROM orders", ["原流程对 region 去重，盲算没有去重"]),
+    ("SELECT COUNT(*) FROM (SELECT user_id FROM orders UNION SELECT referrer_id FROM orders) t",
+     "SELECT COUNT(*) FROM (SELECT user_id FROM orders UNION ALL SELECT referrer_id FROM orders) t",
+     ["原流程在 t 里用 UNION 合并（去掉重复的行），盲算用 UNION ALL（重复的行都留着）"]),
+], ids=["grain", "union-all-twice", "distinct-vs-rows", "distinct-vs-plain", "distinct-outer", "union-vs-all"])
+def test_dedup_union_and_how_many_rows_come_out_are_compared(dialect, a, b, expected):
+    """DISTINCT、UNION / UNION ALL 不进原来的任何一面，分组键挪了一层也只按整条语句比：同一批行合了两遍、去重后的
+    用户数对订单行数、外层出一行还是每个用户一行，都报不出来。"""
+    assert texts(a, b, dialect, labels=LABELS) == expected
+
+
+@pytest.mark.parametrize("a,b", [
+    # 分组写在 CTE 里、外面原样取出来，和直接分组出的行一样
+    ("SELECT region, SUM(amount) FROM orders GROUP BY region",
+     "WITH t AS (SELECT region, SUM(amount) AS s FROM orders GROUP BY region) SELECT region, s FROM t"),
+    # 按某列分组不算别的，和对这一列去重一样
+    ("SELECT user_id FROM orders GROUP BY user_id", "SELECT DISTINCT user_id FROM orders"),
+    # 两边一样的 UNION，派生来源起的名字不同
+    ("SELECT COUNT(*) FROM (SELECT user_id FROM orders WHERE status = 'paid' UNION ALL "
+     "SELECT referrer_id FROM orders WHERE status = 'paid') t",
+     "WITH ids AS (SELECT user_id FROM orders WHERE status = 'paid' UNION ALL "
+     "SELECT referrer_id FROM orders WHERE status = 'paid') SELECT COUNT(*) FROM ids"),
+    # 最外层直接 UNION，和包进子查询再原样取出来
+    ("SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders",
+     "SELECT * FROM (SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders) t"),
+    # 分组后的结果包一层原样取出来
+    ("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id",
+     "SELECT user_id, n FROM (SELECT user_id, COUNT(*) AS n FROM orders GROUP BY user_id) t"),
+], ids=["group-in-cte", "group-or-distinct", "same-union", "union-wrapped", "grouped-wrapped"])
+def test_the_same_rows_written_differently_are_no_difference(a, b):
+    assert texts(a, b) == []
