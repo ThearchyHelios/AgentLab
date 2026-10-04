@@ -35,7 +35,7 @@ from app.data import catalog as data_catalog
 from app.data import introspect, table_versions
 from app.data.sqlcheck import SqlChecker
 from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run_query
-from app.data.guard import QueryLimits, SqlRejected, is_write
+from app.data.guard import QueryLimits, SqlRejected, check, is_write
 from app.data.tabular import UNSHAPED_NOTE
 from app.db.models import DataSource
 from app.tools.registry import ToolContext, Versions
@@ -57,6 +57,10 @@ LATE_PIN_CODE = "data_version_pinned"
 #: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
 #: 查询结果照常交回——检查是附加的，不能拖慢查询
 SQL_CHECK_TIMEOUT_S = 2.0
+#: force_readonly 的工具拒掉写语句时交回的原因（接在「SQL 被拒绝：」后面）。不说「数据源是只读的」：源本身
+#: 可能是可写的，是这次调用只许读；也不提「另建一个可写的数据源」——核查用不着写
+FORCED_READONLY = ("这次查询只允许读取数据，这条语句会修改数据，不被允许。"
+                   "只能执行不改数据的 SELECT / WITH / SHOW / DESCRIBE / EXPLAIN")
 
 
 class _QueryArgs(BaseModel):
@@ -165,12 +169,13 @@ _FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode
 CATALOG_SNAPSHOT_KEY = "catalog"
 
 
-def _query_description(source: Any) -> str:
+def _query_description(source: Any, *, readonly: bool | None = None) -> str:
+    """readonly 不给就按源本身；force_readonly 的工具传 True（源可写，这次调用也只许读）。"""
     tables = introspect.table_names(source)
     head = f"在数据源「{source.name}」上执行 SQL 查询。"
     if source.description:
         head += f"{source.description}。"
-    head += "只读。" if source.readonly else "可写（写操作需要人工审批）。"
+    head += "只读。" if (source.readonly if readonly is None else readonly) else "可写（写操作需要人工审批）。"
     if tables:
         listed = "、".join(tables[:25])
         more = f" 等 {len(tables)} 张表" if len(tables) > 25 else ""
@@ -194,13 +199,16 @@ def _query_description(source: Any) -> str:
 
 
 async def build_datasource_tools(
-    names: list[str], ctx: ToolContext, session: AsyncSession
+    names: list[str], ctx: ToolContext, session: AsyncSession, *, force_readonly: bool = False
 ) -> list[StructuredTool]:
     """按工具名反查数据源并构造工具。build_tools 的第四个来源。
 
     上传源先按 ctx.data_versions 解析成绑定快照的视图（见 _resolve），工具描述、表结构、
     查询都按那个版本来。固定的版本找不到时建一个同名的替身（_unavailable_tool），
     每次调用都说明原因，不拿当前版本顶上。
+
+    force_readonly：查询工具一律按只读守卫检查，可写源上的写语句也拒绝（见 _make_query_tool）。
+    核查（engine/verify_agent.py）建工具时传它：那一路没有审批关卡，绝不能写。
     """
     wanted: dict[str, list[str]] = {}
     for name in names:
@@ -230,7 +238,7 @@ async def build_datasource_tools(
         entries = await _catalog_of(row)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
-                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries))
+                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly))
             else:
                 tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries))
     return tools
@@ -441,11 +449,15 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
 
 
 def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
-                     catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
+                     catalog: Mapping[str, data_catalog.CatalogEntry] | None = None,
+                     force_readonly: bool = False) -> StructuredTool:
     """source 是手工源的 DataSource，或上传源绑定快照的 SourceView（字段同名）。
 
     fixed：上传源的版本是这次运行固定的（找不到时的说法不同）。
     catalog：建工具时读到的数据目录，随表结构快照冻结（_store_schema）。
+    force_readonly：不管源可不可写，一律按只读守卫检查，写语句交回 FORCED_READONLY、不执行。只靠守卫这一道：
+    连接池按源缓存、不分只读与否（engine.cache_key），可写源借不到连接层只读的连接——别为此另起一个只读池，
+    缓存键相同，会把这个源平时用的可写连接也换成只读的。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
@@ -463,6 +475,15 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     async def _run(sql: str, limit: int | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
+        if force_readonly and not source.readonly:
+            # 只读源由 run_query 自己按只读检查（原因照旧说「数据源是只读的」）；可写源在这里先按只读判一遍。
+            # 先过一遍和 run_query 相同的检查：多条语句、结构变更这类问题照原来的说法交回
+            try:
+                statement = check(sql, readonly=False, source_name=source.name, dialect=(source.kind or "").lower())
+            except SqlRejected as e:
+                return f"SQL 被拒绝：{e}"
+            if is_write(statement, dialect=(source.kind or "").lower()):
+                return f"SQL 被拒绝：{FORCED_READONLY}"
         limits = QueryLimits(timeout_seconds=seconds, **({"max_rows": int(limit)} if limit else {}))
         try:
             result = await run_query(source, sql, limits=limits)
@@ -520,12 +541,14 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
     return StructuredTool(
         name=f"{QUERY_PREFIX}{source.name}",
-        description=_query_description(source),
+        description=_query_description(source, readonly=True if force_readonly else None),
         args_schema=_QueryArgs,
         coroutine=_run,
         func=None,
-        # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它
-        metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or "")),
+        # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它。
+        # force_readonly 的工具写不了，没有要人批的调用
+        metadata={"dangerous_if": (lambda args: False) if force_readonly
+                  else (lambda args: is_dangerous_call(source, str(args.get("sql") or ""))),
                   "timeout_s": seconds},
     )
 
