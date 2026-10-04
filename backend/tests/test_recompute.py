@@ -218,6 +218,21 @@ def test_division_by_zero_is_explained():
     assert wow["status"] == "error" and wow["new"] is None and wow["reason"] == "除以零"
 
 
+def test_an_overflow_is_an_error_not_a_crash():
+    """算出无穷大：说清算不出来；老卡上记着无穷大的也不往外送（JSON 放不下，接口会 500）。"""
+    import json
+
+    result = whatif(CARD, Changes(inputs={"vars.kpi.refunds": 1e308, "vars.kpi.orders": 1e-10}), sources(),
+                    metric="ratio")
+    [ratio] = result["metrics"]
+    assert ratio["status"] == "error" and ratio["new"] is None and "有限" in ratio["reason"]
+    card = {**CARD, "metrics": [metric("big", "vars.kpi.x * 2", "inf * 2", math.inf,
+                                       [scalar("vars.kpi.x", math.inf)], rendered="—")]}
+    big = whatif(card, Changes(), sources())["metrics"][0]
+    assert big["old"] is None and big["inputs"][0]["old"] is None and big["rendered_old"] == "—"
+    json.dumps([result, big], allow_nan=False)
+
+
 def test_a_missing_input_can_be_supplied():
     card = {**CARD, "metrics": [metric("cost", "vars.kpi.cost / vars.kpi.orders", "vars.kpi.cost / 1234", None,
                                        [scalar("vars.kpi.cost", None), scalar("vars.kpi.orders", 1234)], decimals=2,

@@ -473,6 +473,9 @@ def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]],
         if inp.row is not None and path in notes and path not in changes.inputs:
             return "excluded", None, f"{EXCLUDED}：{path} 所在的第 {inp.row + 1} 行已排除"
     value, reason = _evaluate(plan, values)
+    if reason is None and isinstance(value, float) and not math.isfinite(value):
+        # 溢出成无穷大、算出非数：口径卡渲染成「—」，这里也说清算不出来（JSON 里也放不下这种值）
+        reason = "计算结果不是有限的数值（溢出或非数），无法推演"
     return ("ok", value, None) if reason is None else ("error", None, reason)
 
 
@@ -545,7 +548,7 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
     return {
         "id": metric.get("id"), "name": metric.get("name") or metric.get("id"), "unit": metric.get("unit") or "",
         "decimals": metric.get("decimals"), "format": metric.get("format") or DEFAULT_FORMAT,
-        "old": old, "new": new, "delta": delta,
+        "old": _finite(old), "new": _finite(new), "delta": delta,
         "rendered_old": _render(metric, old), "rendered_new": _render(metric, new) if known else None,
         "rendered_delta": rendered_delta,
         "changed": (not _same(old, new)) if known else None,
@@ -560,6 +563,11 @@ def _render(metric: dict[str, Any], value: Any, conv: str | None = None) -> str:
         return render_metric({**metric, "value": value}, conv)
     except RenderError:
         return MISSING
+
+
+def _finite(value: Any) -> Any:
+    """无穷大、非数换成 None：老卡上可能记着（口径卡渲染成「—」），JSON 里放不下。"""
+    return None if isinstance(value, float) and not math.isfinite(value) else value
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -620,7 +628,7 @@ def _input_view(inp: _Input, values: dict[str, Any], notes: dict[str, list[int]]
         new = _outline(values.get(inp.path), inp.table) if inp.problem is None else None
         changed = inp.problem is None and not _same(old, new)
     else:
-        old, new = item.get("value"), values.get(inp.path)
+        old, new = _finite(item.get("value")), _finite(values.get(inp.path))
         changed = not _same(old, new)
     view.update(old=old, new=new, changed=changed)
     if inp.path in notes:
