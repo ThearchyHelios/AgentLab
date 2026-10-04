@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from datetime import datetime
 from typing import Any
 from urllib.parse import unquote
@@ -12,24 +11,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy import select as _select
-
 from app.api.coded import CodedHTTPException
 from app.core.bus import bus
-from app.core import artifact_store
-from app.core.events import EventType
-from app.data.catalog_impact import catalog_drift
 from app.db.base import SessionLocal, get_session
-from app.db.models import Approval, Artifact, Run, RunEvent, Workflow, WorkflowVersion
-from app.engine.governance import governance_note, unresolved_caliber_upgrades
+from app.db.models import Approval, Artifact, Run, RunEvent
+# 发起规则和发起前检查绑定的工具搬到了 engine/launch.py。这几个名字以前从这里导入，照旧可用
+from app.engine.launch import (  # noqa: F401
+    TOOL_MISSING, LaunchRefused, launch_run, missing_tools, node_setting, tool_bindings,
+)
 from app.engine.runner import run_manager
-from app.engine.schema import GraphSpec, NodeType, type_label
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
-logger = logging.getLogger(__name__)
-
-#: 发起时发现绑定的工具在本机不存在（见 missing_tools）
-TOOL_MISSING = "run_tool_missing"
 
 
 def actor_of(header: str | None) -> str | None:
@@ -90,218 +82,29 @@ async def start_run(
     session: AsyncSession = Depends(get_session),
     x_actor: str | None = Header(default=None),
 ) -> Run:
-    actor = actor_of(x_actor)
-    # 没挂在工作流上（画布没保存就跑、问数据当场搭的）。老数据里是「临时图」，前端两种都认
-    name = "未保存的工作流"
-    version: int | None = None
-    version_hash: str | None = None
-    governed = False
-
-    if payload.run_class == "formal":
-        # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
-        # 传裸 graph、或工作流还没发布过，都进不了 formal。
-        if not payload.workflow_id:
-            raise HTTPException(400, "正式运行需要从已保存的工作流发起：请求中没有指定工作流")
-        if payload.graph is not None:
-            raise HTTPException(400, "正式运行只能使用已发布的版本，画布上未发布的修改不会生效。请先保存并发布")
-        workflow = await session.get(Workflow, payload.workflow_id)
-        if not workflow:
-            raise HTTPException(404, "工作流不存在，可能已被删除")
-        # 只看 published_version：status 反映的是当前画布（改过图就退回 draft），
-        # 而 formal 跑的是已发布的那一版，两者本来就可以不一致
-        if not workflow.published_version:
-            raise HTTPException(409, f"「{workflow.name}」还没有发布版本，请先在编排页发布")
-        version = payload.version or workflow.published_version
-        # "不可变"和"过过闸"是两件事。快照确实不可变，但 PATCH 保存出来的
-        # 草稿版本同样有快照——只认 version 存不存在的话，工作流只要发布过
-        # 任意一个版本，之后所有草稿都能以 formal 身份启动，发布期的
-        # validate_graph + lint_for_publish 全部绕过。
-        if version != workflow.published_version:
-            raise HTTPException(
-                409,
-                f"v{version} 不是当前发布版本（v{workflow.published_version}）。"
-                "正式运行只能使用当前发布版本；如需运行这一版，请先发布它。",
-            )
-        snapshot = (
-            await session.execute(
-                _select(WorkflowVersion).where(
-                    WorkflowVersion.workflow_id == workflow.id,
-                    WorkflowVersion.version == version,
-                )
-            )
-        ).scalar_one_or_none()
-        if not snapshot:
-            raise HTTPException(404, f"版本 v{version} 不存在")
-        graph = snapshot.graph
-        version_hash = snapshot.graph_hash or artifact_store.graph_hash(graph)
-        name = workflow.name
-        # 按这一版发布时记下的级别；记级别之前发布的老版本没有，照旧看工作流现在的 status
-        governed = (snapshot.level == "governed") if snapshot.level else workflow.status == "governed"
-
-        # 口径升版是被迫处置的事件：钉住的方法卡有新版本而未声明策略，拒绝启动
-        spec = GraphSpec.model_validate(graph)
-        errors, upgrade_events = await unresolved_caliber_upgrades(session, spec)
-        if errors:
-            raise HTTPException(409, "；".join(errors))
-        # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
-        # 拦下来等于让一次文字修订卡住正式出具
-        catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
-    else:
-        graph = payload.graph
-        upgrade_events = []
-        catalog_changes = []
-        if payload.workflow_id:
-            workflow = await session.get(Workflow, payload.workflow_id)
-            if not workflow:
-                raise HTTPException(404, "工作流不存在，可能已被删除")
-            graph = graph or workflow.graph
-            name = workflow.name
-    if not graph:
-        raise HTTPException(400, "没有要运行的内容：请求中既没有工作流 ID，也没有工作流内容")
-    await _refuse_missing_tools(session, graph)
-
-    from app.api.settings import resolve_run_scope
-
-    memory_scope, collection = await resolve_run_scope(
-        session, payload.memory_scope, payload.collection
-    )
+    """发起规则全在 engine/launch.py（定时任务到点发起也用它），这里只把拒绝换回 HTTP 响应。"""
     try:
-        run = await run_manager.start(
-            graph=graph,
-            input_payload=payload.input,
+        return await launch_run(
+            session,
             workflow_id=payload.workflow_id,
-            workflow_name=name,
-            memory_scope=memory_scope,
-            collection=collection,
-            run_class="formal" if payload.run_class == "formal" else "exploratory",
-            version=version,
-            version_hash=version_hash,
-            started_by=actor,
+            graph=payload.graph,
+            input_payload=payload.input,
+            memory_scope=payload.memory_scope,
+            collection=payload.collection,
+            run_class=payload.run_class,
+            version=payload.version,
+            actor=actor_of(x_actor),
         )
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
-
-    if payload.run_class == "formal":
-        # 按不按受管出具在发起这一刻定下来、记进封存范围：status 反映的是当前画布，中途改图、
-        # 审批停下再恢复时再去读它，报告节点和出口复核可能各读到不同的值
-        await run_manager.note(run.id, "log", **governance_note(
-            governed=governed, workflow_name=name, version=version))
-    if catalog_changes:
-        # 落在封存范围内：之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。
-        # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的（界面分开说）
-        await run_manager.note(run.id, EventType.CATALOG_DRIFT, version=version, count=len(catalog_changes),
-                               tables=catalog_changes)
-    # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
-    for ev in upgrade_events:
-        payload_ev = dict(ev)
-        node = payload_ev.pop("node_id", None)
-        await run_manager.note(run.id, "caliber.upgrade", node_id=node, **payload_ev)
-    return run
+    except LaunchRefused as e:
+        raise _refused(e) from e
 
 
-# --------------------------------------------------------------------------
-# 发起前检查绑定的工具
-# --------------------------------------------------------------------------
-
-
-def node_setting(spec: GraphSpec, node: Any, key: str) -> Any:
-    """节点配置的实际取值，和运行时 NodeContext.cfg 同一个规则：节点上没写（None、空串）就取图级 defaults。"""
-    value = node.config.get(key)
-    return spec.defaults.get(key) if value in (None, "") else value
-
-
-def tool_bindings(spec: GraphSpec) -> list[tuple[str, str]]:
-    """图里每一处绑定的工具：(谁绑的, 工具名)。调用工具节点的 tool、Agent 的 tools、协作成员的 tools。
-
-    取值和运行时一致（node_setting）：Agent 节点上没写 tools、协作节点上没写成员，运行时用的是
-    图级 defaults 里的，这里也算它们——不然发起前检查放过了缺的工具，发起时固定数据版本也漏了源。
-
-    模板拼出来的名字（{{ vars.tool }}）也在内：发起前检查（_bindings）跳过它们，发起时固定数据
-    版本（engine/runner.py）要知道有没有这种名字——有的话说不准会用到哪个数据源。
-    """
-    out: list[tuple[str, str]] = []
-    for node in spec.nodes:
-        who = f"「{node.title}」（{type_label(node.type)}）"
-        if node.type == NodeType.TOOL:
-            names = [node_setting(spec, node, "tool")]
-            out.extend((who, n) for n in names if isinstance(n, str) and n.strip())
-        elif node.type == NodeType.AGENT:
-            out.extend((who, n) for n in node_setting(spec, node, "tools") or []
-                       if isinstance(n, str) and n.strip())
-        elif node.type == NodeType.SUPERVISOR:
-            for member in node_setting(spec, node, "agents") or []:
-                if not isinstance(member, dict):
-                    continue
-                label = f"「{node.title}」的成员「{member.get('name') or '?'}」"
-                out.extend((label, n) for n in member.get("tools") or [] if isinstance(n, str) and n.strip())
-    return [(who, name.strip()) for who, name in out]
-
-
-def _bindings(spec: GraphSpec) -> list[tuple[str, str]]:
-    """发起前要检查的绑定。模板拼出来的工具名（{{ vars.tool }}）发起时还不知道是谁，交给运行时。"""
-    return [(who, name) for who, name in tool_bindings(spec) if "{{" not in name]
-
-
-async def missing_tools(session: AsyncSession, spec: GraphSpec) -> list[tuple[str, str, str]]:
-    """本机不存在的绑定：(谁绑的, 工具名, 去哪接入：data / tools)。
-
-    解析和运行时 build_tools 一致：内置（静态注册）、mcp:<服务>/<工具>、db_query__ / db_schema__
-    <数据源>、其余按自定义工具。数据源和自定义工具只认启用着的——停用的运行时同样拿不到。
-    MCP 只看服务登记着、启用着没有：连不连得上、工具还在不在，要连一次才知道，发起时不去等它，
-    上次没连上或者工具清单里没有的只在日志里提一句。
-    """
-    from app.db.models import CustomTool, DataSource, McpServer
-    from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
-    from app.tools.registry import all_specs
-
-    bindings = _bindings(spec)
-    if not bindings:
-        return []
-    builtin = all_specs()
-    sources = {n for (n,) in await session.execute(select(DataSource.name).where(DataSource.enabled.is_(True)))}
-    custom = {n for (n,) in await session.execute(select(CustomTool.name).where(CustomTool.enabled.is_(True)))}
-    servers = {r.name: r for r in (await session.execute(select(McpServer))).scalars()}
-    missing: list[tuple[str, str, str]] = []
-    for who, name in bindings:
-        if name.startswith("mcp:"):
-            server, _, tool = name[4:].partition("/")
-            row = servers.get(server)
-            if row is None or not row.enabled:
-                missing.append((who, name, "tools"))
-            elif row.status == "error":
-                logger.warning("%s 绑的 %s：MCP 服务 %s 上次没连上，运行时可能拿不到这个工具", who, name, server)
-            elif tool not in ("", "*") and row.tools_cache and tool not in row.tools_cache:
-                logger.warning("%s 绑的 %s：MCP 服务 %s 上次交回的工具清单里没有 %s", who, name, server, tool)
-        elif name in builtin:
-            continue
-        elif name.startswith((QUERY_PREFIX, SCHEMA_PREFIX)):
-            source = name[len(QUERY_PREFIX):] if name.startswith(QUERY_PREFIX) else name[len(SCHEMA_PREFIX):]
-            if source not in sources:
-                missing.append((who, name, "data"))
-        elif name not in custom:
-            missing.append((who, name, "tools"))
-    return missing
-
-
-async def _refuse_missing_tools(session: AsyncSession, graph: dict[str, Any]) -> None:
-    """绑定的工具在本机不存在就不发起：以前要跑到那一步才失败，前面的步骤白跑、钱白花。"""
-    try:
-        spec = GraphSpec.model_validate(graph)
-    except Exception:  # noqa: BLE001 - 图本身不成形交给 run_manager.start 报
-        return
-    missing = await missing_tools(session, spec)
-    if not missing:
-        return
-    lines = "；".join(f"{who}绑定的 {name}" for who, name, _ in missing[:8])
-    more = f"等 {len(missing)} 处" if len(missing) > 8 else ""
-    places = {where for _, _, where in missing}
-    if places == {"data"}:
-        fix = "请到「数据」页接入，或在节点中重新选择"
-    elif places == {"tools"}:
-        fix = "请到「工具」页接入，或在节点中重新选择"
-    else:
-        fix = "数据源工具请到「数据」页接入，其他工具请到「工具」页接入，或在节点中重新选择"
-    raise CodedHTTPException(422, f"绑定的工具不存在：{lines}{more}。{fix}", TOOL_MISSING)
+def _refused(e: LaunchRefused) -> HTTPException:
+    """发起被拒的 HTTP 响应，和规则搬去 engine/launch.py 之前逐字相同：带机器码的回 {detail, code}，
+    不带的回 {detail}。"""
+    if e.code:
+        return CodedHTTPException(e.status_code, e.message, e.code)
+    return HTTPException(e.status_code, e.message)
 
 
 #: workflow_id 取这个值时只要没挂在任何工作流上的运行：画布上没保存就跑的临时图，

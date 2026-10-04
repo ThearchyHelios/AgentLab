@@ -1062,11 +1062,12 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
 async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]:
     """图里（含子工作流）绑定的数据源工具指向的源名，以及有没有带模板、发起时定不下来的工具名。
 
-    绑定的取法和发起前检查同一个（api/runs.py 的 tool_bindings），子工作流照运行时的取法
+    绑定的取法和发起前检查同一个（engine/launch.py 的 tool_bindings），子工作流照运行时的取法
     读出来接着找：固定了版本的读那一版，没固定的读工作流现在的图。读不到、图不成形的跳过——
     那个节点运行时自己会报错。同一个工作流（同一版）只读一次，互相引用也不会转圈。
     """
-    from app.api.runs import node_setting, tool_bindings
+    # 在函数里导入：launch 在模块级导入了本模块（它要 run_manager）
+    from app.engine.launch import node_setting, tool_bindings
     from app.db.models import WorkflowVersion
     from app.tools.datasource import source_of_tool
 
