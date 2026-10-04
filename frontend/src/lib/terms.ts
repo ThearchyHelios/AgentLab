@@ -46,7 +46,7 @@ import type {
   CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
   SqlCheckCode, SqlCheckLevel, ToolTrust,
 } from '../types'
-import { formatNumber } from './format'
+import { formatCost, formatNumber } from './format'
 
 export const TERMS = {
   workflow: '工作流',
@@ -651,6 +651,24 @@ export const JUDGE_ON_UNSUPPORTED_LABEL: Record<string, string> = {
 }
 
 /** 设置页「证据裁判」一组（后端 engine/judge.py 的 JUDGE_DEFAULTS） */
+/** 运行的金额。有调用的模型不在价格目录中时金额估不出来，不写「$0」（看着像没花钱） */
+export const COST_TEXT = {
+  unpriced: '金额无法估算',
+  /** 悬停说明，n 是估不出金额的调用次数 */
+  unpricedTitle: (n: number) => `${formatNumber(n)} 次调用的模型不在价格目录中，金额无法估算，未计入`,
+} as const
+
+/**
+ * 运行级金额的写法。unpriced 是估不出金额的调用次数：一分都没估出来写「金额无法估算」，估出了一部分写「≥ $x」；
+ * 运行中（approx）只算已上报的调用，也写「≥」。没有金额返回 null，由调用方写占位
+ */
+export function runCostText(usd: number | null | undefined, unpriced: number, approx = false): string | null {
+  const known = typeof usd === 'number' && Number.isFinite(usd)
+  if (unpriced > 0 && !(known && usd > 0)) return COST_TEXT.unpriced
+  if (!known) return null
+  return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
+}
+
 export const JUDGE_SETTING_TEXT = {
   label: '证据裁判',
   hint: '报告中的结论句（如「增长主要来自新客首单」）由另一个模型按证据逐句判断：正式运行由报告撰写节点当场裁判，探索运行在点击时逐句裁判。判断由模型给出，不是系统核对，界面上一律标注「非确定」。',

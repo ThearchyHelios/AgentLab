@@ -171,9 +171,8 @@ async def engine_up():
     await run_manager.shutdown()
 
 
-async def test_run_usage_counts_streamed_tokens(server, engine_up):
-    """整条链：兼容接入 → llm 节点流式调用 → llm.end → 运行的用量。修之前这里是 0 token、0 美元。"""
-    server()
+async def _run_once(model: str) -> tuple[Run, list[RunEvent]]:
+    """兼容接入上用 model 跑一个 llm 节点，返回运行行和 llm.end 事件。"""
     provider = _provider()
     async with SessionLocal() as session:
         session.add(provider)
@@ -185,7 +184,7 @@ async def test_run_usage_counts_streamed_tokens(server, engine_up):
             "nodes": [
                 {"id": "in", "type": "input", "data": {"config": {}}},
                 {"id": "ask", "type": "llm", "data": {"label": "问答", "config": {
-                    "prompt": "上周到店多少人", "provider": provider.name, "model": PRICED}}},
+                    "prompt": "上周到店多少人", "provider": provider.name, "model": model}}},
                 {"id": "out", "type": "output", "data": {"config": {
                     "fields": [{"name": "回答", "value": "{{ nodes.ask.text }}"}]}}},
             ],
@@ -202,12 +201,46 @@ async def test_run_usage_counts_streamed_tokens(server, engine_up):
         async with SessionLocal() as session:
             ends = list((await session.execute(select(RunEvent).where(
                 RunEvent.run_id == started.id, RunEvent.type == "llm.end"))).scalars())
-        assert [(e.data["input_tokens"], e.data["output_tokens"]) for e in ends] == [(1200, 300)]
-        assert row.usage["input_tokens"] == 1200 and row.usage["output_tokens"] == 300
-        assert row.usage["total_tokens"] == 1500
-        expected = round(catalog.estimate_cost(PRICED, 1200, 300), 6)
-        assert expected > 0 and row.usage["cost_usd"] == pytest.approx(expected)
+        return row, ends
     finally:
         async with SessionLocal() as session:
             await session.execute(delete(Provider).where(Provider.id == provider.id))
             await session.commit()
+
+
+async def test_run_usage_counts_streamed_tokens(server, engine_up):
+    """整条链：兼容接入 → llm 节点流式调用 → llm.end → 运行的用量。修之前这里是 0 token、0 美元。"""
+    server()
+    row, ends = await _run_once(PRICED)
+    assert [(e.data["input_tokens"], e.data["output_tokens"]) for e in ends] == [(1200, 300)]
+    assert row.usage["input_tokens"] == 1200 and row.usage["output_tokens"] == 300
+    assert row.usage["total_tokens"] == 1500
+    expected = round(catalog.estimate_cost(PRICED, 1200, 300), 6)
+    assert expected > 0 and row.usage["cost_usd"] == pytest.approx(expected)
+    assert "unpriced" not in ends[0].data and "unpriced_calls" not in row.usage
+
+
+async def test_a_model_missing_from_the_price_catalog_is_marked_unpriced(server, engine_up):
+    """token 记到了，模型却不在价格目录里：金额估不出来，不能让运行页写 $0 像是没花钱。
+    llm.end 标 unpriced（运行中的实时统计据此数），运行用量记 unpriced_calls（界面据此写「无法估算」）。"""
+    server()
+    row, ends = await _run_once("vendor-unlisted-model")
+    assert [(e.data["input_tokens"], e.data["output_tokens"]) for e in ends] == [(1200, 300)]
+    assert ends[0].data["unpriced"] is True and ends[0].data["cost_usd"] == 0
+    assert row.usage["total_tokens"] == 1500 and row.usage["cost_usd"] == 0
+    assert row.usage["unpriced_calls"] == 1
+
+
+@pytest.mark.parametrize(("data", "unpriced"), [
+    ({"model": "vendor-unlisted-model", "input_tokens": 10, "output_tokens": 2, "cost_usd": 0}, True),
+    ({"model": PRICED, "input_tokens": 10, "output_tokens": 2, "cost_usd": 0.0001}, False),
+    # 目录里标 0 价的本地模型是真不花钱，不是估不出来
+    ({"model": "qwen3:8b", "input_tokens": 10, "output_tokens": 2, "cost_usd": 0}, False),
+    # 没用 token 的调用（失败、被取消）谈不上金额
+    ({"model": "vendor-unlisted-model", "input_tokens": 0, "output_tokens": 0}, False),
+    # 老事件没有 unpriced 键：按模型名补判；事件自己标了的以它为准
+    ({"model": PRICED, "input_tokens": 10, "unpriced": True}, True),
+    (None, False),
+])
+def test_unpriced_call(data, unpriced):
+    assert catalog.unpriced_call(data) is unpriced

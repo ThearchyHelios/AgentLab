@@ -540,6 +540,35 @@ await section('右栏收尾（decodeRun）', async () => {
     fold([start('甲', 1), start('乙', 2), end('甲', 3, 100), end('乙', 4, 300)]).savedMs === 100)
 })
 
+await section('金额估不出来的调用', async () => {
+  // 模型不在价格目录中：token 记到了，金额只能是 0。运行页写 $0 像是没花钱，改写「金额无法估算」
+  const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 5500 + seq, data })
+  const head = [
+    ev(1, 'run.started', null, { nodes: 1 }),
+    ev(2, 'node.started', 'agent'),
+    ev(3, 'llm.end', 'agent', { model: 'vendor-unlisted', input_tokens: 900, output_tokens: 90, cost_usd: 0, unpriced: true }),
+    ev(4, 'llm.end', 'agent', { model: 'vendor-unlisted', input_tokens: 700, output_tokens: 70, cost_usd: 0, unpriced: true }),
+  ]
+  const gr = g(['agent'], [])
+  const live = run(head, gr)
+  check('运行中：llm.end 标了 unpriced 的逐次数进来', live.unpricedCalls === 2 && live.costUsd === 0, `${live.unpricedCalls}`)
+  const done = run([...head, ev(5, 'node.finished', 'agent', { duration_ms: 10 }),
+    ev(6, 'run.finished', null, { usage: { input_tokens: 1600, output_tokens: 160, cost_usd: 0, unpriced_calls: 3 } })], gr)
+  check('终态以后端总数为准（老后端少发的也算上）', done.unpricedCalls === 3, `${done.unpricedCalls}`)
+  const plain = run([ev(1, 'run.started', null, { nodes: 1 }), ev(2, 'node.started', 'agent'),
+    ev(3, 'llm.end', 'agent', { input_tokens: 10, output_tokens: 1, cost_usd: 0.001 })], gr)
+  check('目录里有价的调用不算', plain.unpricedCalls === 0)
+
+  const { runCostText, COST_TEXT } = await import(await load('/src/lib/terms.ts'))
+  check('一分都没估出来：写「金额无法估算」，不写 $0', runCostText(0, 3) === COST_TEXT.unpriced, runCostText(0, 3))
+  check('……没拿到金额时也一样', runCostText(null, 1) === COST_TEXT.unpriced)
+  check('估出了一部分：写「≥」', runCostText(0.012, 2) === '≥ $0.012', runCostText(0.012, 2))
+  check('全都有价：照常写', runCostText(0.012, 0) === '$0.012' && runCostText(0, 0) === '$0', `${runCostText(0.012, 0)} / ${runCostText(0, 0)}`)
+  check('运行中只算已上报的：写「≥」', runCostText(0.012, 0, true) === '≥ $0.012')
+  check('没有金额也没有估不出的：交给调用方写占位', runCostText(undefined, 0) === null)
+  check('悬停说明写清几次调用、为什么', COST_TEXT.unpricedTitle(3).includes('3 次调用') && COST_TEXT.unpricedTitle(3).includes('价格目录'))
+})
+
 await section('回放时的用量和工具数（逐刻度）', async () => {
   // 回放到半路，卡片和 HUD 要写「那一刻」的 tokens 和工具数，而不是拿终值冒充
   const ev = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 5000 + seq, data })

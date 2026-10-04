@@ -8,7 +8,7 @@ import { confirmDialog, Kbd, Spinner, StatusBadge, toast } from '../components/u
 import { formatCost, formatDuration, formatLapse, formatOffset, formatSpan, formatTokens, NONE } from '../lib/format'
 import { isTypingTarget, matchShortcut } from '../lib/keys'
 import { statusMeta, STATUS, type StatusCode } from '../lib/status'
-import { issuanceLabel, runClassLabel } from '../lib/terms'
+import { COST_TEXT, issuanceLabel, runClassLabel, runCostText } from '../lib/terms'
 import { lastStampOf, projectSettled, useDock, waitedMs } from '../canvas/RunTimeline'
 import { structureSig, useStudio } from '../store/studio'
 import type { RunEvent } from '../types'
@@ -91,6 +91,8 @@ export interface RunGlance {
   series: [number, number][]
   tokens: number | null
   cost: number | null
+  /** 金额估不出来的调用次数（模型不在价格目录中）；有的话金额不写 $0 */
+  unpriced: number
   /** 这一段执行还剩多少时间；null = 不知道上限或眼下不在计时 */
   remainingMs: number | null
   limitMs: number | null
@@ -220,6 +222,7 @@ export function useRunGlance(active: boolean): RunGlance {
   const replayTok = proj.tokensIn != null && proj.tokensOut != null ? proj.tokensIn + proj.tokensOut : null
   const tokens = replayAt != null ? replayTok : backendTok ?? (seen ? usage.tokensIn + usage.tokensOut : null)
   const cost = replayAt != null ? proj.costUsd ?? null : backendCost ?? (seen ? usage.costUsd : null)
+  const unpriced = (settledUsage ? num(runUsage.unpriced_calls) : null) ?? trace.unpricedCalls
 
   // 时限按"这一段执行"计：等人工审批时执行已经结束，那段不算（和后端一致）
   const drive = trace.drives[trace.drives.length - 1]
@@ -253,7 +256,7 @@ export function useRunGlance(active: boolean): RunGlance {
     headline: headlineOf(trace, phase, states, at, label, runError, replayAt == null ? cancelled : ''),
     executing: phase === 'running' && cells.some((c) => c.state === 'running' && !trace.nodes[c.id]?.looping),
     cells, done, visited, parallelNow: proj.parallelNow, series: trace.parallelSeries,
-    tokens, cost, remainingMs, limitMs, attention,
+    tokens, cost, unpriced, remainingMs, limitMs, attention,
     failedNodeId: trace.failedNodeId, waitingNodeId: trace.waitingNodeId,
   }
 }
@@ -591,7 +594,7 @@ export function RunCapsule() {
               <span className="sf-cap-nodes tnum hidden lg:inline" title="完成的节点 / 全部节点">{nodesText}</span>
               <span className="sf-cap-sep hidden xl:block" />
               <span className="sf-cap-usage tnum hidden xl:inline">
-                {tokens}{g.cost ? ` · ${formatCost(g.cost)}` : ''}
+                {tokens}{g.cost || g.unpriced ? ` · ${runCostText(g.cost, g.unpriced)}` : ''}
               </span>
             </>
           )}
@@ -654,7 +657,9 @@ export function RunCapsule() {
             <div className="sf-metric">
               <div className="sf-metric-k">用量</div>
               <div className="sf-metric-v tnum">{tokens}</div>
-              <div className="sf-metric-s tnum">{g.cost != null ? `≈ ${formatCost(g.cost)}` : NONE}</div>
+              <div className="sf-metric-s tnum" title={g.unpriced ? COST_TEXT.unpricedTitle(g.unpriced) : undefined}>
+                {g.unpriced ? runCostText(g.cost, g.unpriced) : g.cost != null ? `≈ ${formatCost(g.cost)}` : NONE}
+              </div>
             </div>
             <div className="sf-metric">
               <div className="sf-metric-k">时限</div>

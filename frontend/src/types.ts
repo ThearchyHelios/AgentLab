@@ -110,6 +110,8 @@ export interface RunUsage {
   input_tokens?: number
   output_tokens?: number
   cost_usd?: number
+  /** 金额估不出来的调用次数（模型不在价格目录中），cost_usd 只是估得出的那部分。没有这种调用时不给 */
+  unpriced_calls?: number
   [key: string]: any
 }
 

@@ -56,6 +56,12 @@ class NodeContext:
             writer = get_stream_writer()
         except Exception:  # noqa: BLE001 - 不在图执行上下文里（比如单元测试）
             return
+        if str(event_type) == EventType.LLM_END and "unpriced" not in data:
+            from app.providers.catalog import unpriced_call
+
+            if unpriced_call(data):
+                # 金额估不出来（模型不在价格目录里）：标出来，界面不把它的 0 当成「没花钱」
+                data = {**data, "unpriced": True}
         writer(
             {
                 "__agentlab__": True,
