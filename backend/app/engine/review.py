@@ -89,12 +89,18 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_repair": ("report_repair", DEGRADED),
     # 报告撰写节点的上游没有可引用的口径卡指标：报告里的数都没有出处
     "report_no_evidence": ("report_no_evidence", DEGRADED),
+    # 证据目录超出篇幅，有的查询只列了编号和摘要：写作模型没看全证据，报告的覆盖面有缺口
+    "report_catalog_trimmed": ("report_catalog_trimmed", DEGRADED),
+    # 目录有省略时写了「没有查到」这类缺失断言、重写后仍在：报告照常产出并标注，这几句结论依据不足
+    "report_absence_claim": ("report_absence_claim", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),
     # agent 的结构化字段：模型报的值和查询快照对不上（已按快照取值），或者出处核对不了
     # （记成空值，不兜底成 0）。答案能用，缺口要说清是哪一种
     "agent_field_mismatch": ("agent_field_mismatch", DEGRADED),
     "agent_field_unverified": ("agent_field_unverified", DEGRADED),
+    # 结构化抽取两次都被截断（输出额度在推理阶段就用完了）：字段都记空值，答案能用，缺口要说清是额度问题
+    "agent_field_truncated": ("agent_field_truncated", DEGRADED),
     # 结论句裁判（claims: judge）：触顶、没跑成的句子记为未裁判，出具不能判完整——是缺口，要说明
     "judge_limit": ("judge_limit", DEGRADED),
     "judge_failed": ("judge_failed", DEGRADED),

@@ -322,8 +322,9 @@ async def test_small_source_keeps_detail_and_carries_the_catalog(small_source):
     assert f"中文名：订单{INFERRED_MARK}" in text and "单位：元" in text
     assert f"orders.customer_id = customers.id（多对一）{INFERRED_MARK}" in text
     op = ctx.op()
-    assert op["sources"] == [{"source": small_source.name, "tables": ["customers", "orders"], "selected_by": "all",
-                              "total": 2}]
+    assert op["sources"] == [{"source": small_source.name, "source_id": small_source.id,
+                              "tables": ["customers", "orders"], "selected_by": "all", "total": 2,
+                              "catalog_tables": 1}]
 
 
 # ---------------------------------------------------------------- 回退：绝不阻断生成
@@ -346,8 +347,9 @@ async def test_pick_failures_fall_back_to_names_only(client, monkeypatch, scenic
         "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
 
     op = _context_op(events)
-    assert op["sources"] == [{"source": scenic_source.name, "tables": [], "selected_by": "fallback",
-                              "total": scenic.TABLE_COUNT + len(scenic.VIEWS), "reason": op["sources"][0]["reason"]}]
+    assert op["sources"] == [{"source": scenic_source.name, "source_id": scenic_source.id, "tables": [],
+                              "selected_by": "fallback", "total": scenic.TABLE_COUNT + len(scenic.VIEWS),
+                              "catalog_tables": 0, "reason": op["sources"][0]["reason"]}]
     assert op["sources"][0]["reason"]
     system = model.systems[0]
     # 和以前一样只列表名、提醒先查字段
@@ -371,8 +373,9 @@ async def test_stream_reports_the_context_and_prompt_carries_selected_tables(cli
         "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
 
     op = _context_op(events)
-    assert op["sources"] == [{"source": scenic_source.name, "tables": ["visits", "channels", "channel_visits"],
-                              "selected_by": "model", "total": scenic.TABLE_COUNT + len(scenic.VIEWS)}]
+    assert op["sources"] == [{"source": scenic_source.name, "source_id": scenic_source.id,
+                              "tables": ["visits", "channels", "channel_visits"], "selected_by": "model",
+                              "total": scenic.TABLE_COUNT + len(scenic.VIEWS), "catalog_tables": 0}]
     assert isinstance(op["elapsed_ms"], int) and op["elapsed_ms"] >= 0
     # context 在模型首帧之后、第一条图操作之前
     kinds = [e["op"] for e in events]
@@ -421,6 +424,28 @@ async def test_self_check_repair_reuses_the_same_context(client, monkeypatch, sc
     assert model.systems[1] == model.systems[0]
     assert "attributed_share  REAL" in model.systems[1]
     assert len(picker.calls) == 1
+
+
+async def test_context_op_says_how_much_of_each_source_has_a_catalog(scenic_source):
+    """context 操作里每个源带上有数据目录的表数（catalog_tables）和源的 id：没有目录的大库，界面提示先去起草目录。
+
+    真实运行里数据源一张目录都没有，挑表和 SQL 检查都用不上目录，用户也不知道该先去起草。只算有可见项的表：
+    整份被驳回的不算有目录。"""
+    from app.api import copilot_context
+
+    async def op() -> dict:
+        plan = await copilot_context.plan_context([scenic_source])
+        return (await plan.resolve(Picker(PICKED), need=NEED)).op()["sources"][0]
+
+    first = await op()
+    assert first["catalog_tables"] == 0 and first["source_id"] == scenic_source.id
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, scenic_source.id, "visits", {
+            "label": make_item("入园记录", "llm")}, if_version=0, actor="王敏")
+        rejected = make_item("门店", "llm")
+        rejected["status"] = "rejected"
+        await catalog.write_entry(session, scenic_source.id, "stores", {"label": rejected}, if_version=0, actor="王敏")
+    assert (await op())["catalog_tables"] == 1
 
 
 async def test_small_sources_do_not_call_the_picker(client, monkeypatch, small_source):

@@ -44,17 +44,20 @@ from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
 from app.engine.labels import field_label, option_label
 from app.engine.evidence import (
+    ABSENCE_RULE,
     CELLS_REASON,
     CLAIMS_RULE,
     ENTITY_KINDS,
     MARKER_RULES,
     SEE_AND_CODE_RULES,
     StreamRenderer,
+    WriterCatalog,
     build_catalog,
-    catalog_prompt,
+    catalog_budget,
     compose_doc,
     describe_violations,
     ledger_enabled,
+    writer_catalog,
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
 from app.engine.schema import (
@@ -70,7 +73,8 @@ from app.engine.schema import (
 )
 from app.engine.state import GraphState, message_text, thinking_text
 from app.engine.toolcalls import leaked_markup, markup_warning
-from app.providers.factory import ProviderNotConfigured, get_chat_model
+from app.providers import catalog as model_catalog
+from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model, resolve_provider
 
 ON_VIOLATION = ("fail", "flag")
 NUMBERS = ("strict", "off")
@@ -81,8 +85,10 @@ CLAIMS = CLAIMS_VALUES
 #: 只标注、不让写作者重写也不判失败的违规：可疑实体（受管的正式出具按缺口降档）、表结构快照不全时
 #: 核对不了的名字（出口只标注）
 SOFT = frozenset({"unknown_entity", "unverified_entity"})
-#: 交回写作者重写、重写不好也不判失败的违规：句中的 [[see:]]（渲染后留下断句，数字和出处都没问题）
-REWRITE_ONLY = frozenset({"inline_see"})
+#: 交回写作者重写一次、重写不好也不判失败的违规：句中的 [[see:]]（渲染后留下断句，数字和出处都没问题）；
+#: 写作目录有省略时的缺失断言（「没有查到」「数据缺失」：写作者没看全证据，结论依据不足，但数字和出处都核对过）。
+#: 只剩这几类时不按 max_repairs 反复重写：重写一次没改掉，再写也多半一样，留在核对结果里标注
+REWRITE_ONLY = frozenset({"inline_see", "absence_claim"})
 #: 重写一次就是多一次整篇的模型调用，写不对的模型多给几次也大多写不对
 MAX_REPAIRS = 3
 
@@ -138,6 +144,66 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
         # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
         catalog = {alias: e for alias, e in catalog.items() if e.get("kind") not in ENTITY_KINDS}
     return catalog
+
+
+def report_fields(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[dict[str, Any]]:
+    """上游 Agent 经按出处核对交来的结构化字段：[{node_id, title, data, evidence}]，按画布上的顺序。
+
+    范围和 report_catalog 收查询的范围一致：祖先节点，写了 evidence_from 就只收那几个。只进写作目录（第一优先，
+    放不下也列出），不进目录本身：出口复核按目录重建，字段的引用落到的是查询单元格，和以前一样核对。
+    """
+    sources = _setting(spec, node, "evidence_from", "ancestors")
+    if isinstance(sources, str) and sources != "ancestors":
+        sources = [sources]
+    keep = {str(s) for s in sources} if isinstance(sources, list) else None
+    allowed = _ancestors(spec, node.id)
+    outputs = state.get("nodes") or {}
+    found: list[dict[str, Any]] = []
+    for other in spec.nodes:
+        result = outputs.get(other.id)
+        if other.id not in allowed or (keep is not None and other.id not in keep) or not isinstance(result, dict):
+            continue
+        if isinstance(result.get("data_evidence"), dict) and result["data_evidence"]:
+            found.append({"node_id": other.id, "title": other.title or other.id, "data": result.get("data"),
+                          "evidence": result["data_evidence"]})
+    return found
+
+
+async def model_window(session: Any, spec: ModelSpec, model_id: str) -> int | None:
+    """写作模型的上下文窗口（token）：模型接入里给这个模型登记的 context 优先，其次模型目录
+    （providers/catalog.py）；都没有返回 None，由 catalog_budget 取保守值。"""
+    try:
+        provider = await resolve_provider(session, spec.provider, spec.model or model_id)
+    except ProviderNotConfigured:
+        provider = None
+    for entry in (provider.models or []) if provider is not None else []:
+        if isinstance(entry, dict) and entry.get("id") == model_id:
+            raw = entry.get("context")
+            try:
+                value = int(raw) if not isinstance(raw, bool) and raw not in (None, "") else 0
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+    return model_catalog.find_context(model_id)
+
+
+def _trimmed_message(writer: WriterCatalog) -> str:
+    """写作目录有省略时的那条警告（给人看）：省略的是什么、各来源省略了几次，写作模型看不到哪些明细。
+
+    放不下不一定省略了查询：查询全都列出、只是有的只列前几行，或者只省略了表和字段的说明。以前一律按「省略查询」写，
+    全部列出时成了「0 次只列编号和摘要（）。写作模型看不到这些查询的明细」，说的不是实情。"""
+    head = f"证据目录超出篇幅（约 {writer.budget} 字，按写作模型的上下文窗口确定）："
+    if writer.omitted:
+        per = "、".join(f"{r['title']}省略 {r['omitted']} 次" for r in writer.nodes if r["omitted"])
+        shown = writer.queries - len(writer.omitted)
+        return (f"{head}{writer.queries} 次查询中 {shown} 次列出了数据，{len(writer.omitted)} 次只列编号和摘要（{per}）。"
+                "写作模型看不到这些查询的明细，报告不得据此断言没有数据")
+    if writer.compact:
+        per = "、".join(f"{r['title']} {r['compact']} 次" for r in writer.nodes if r.get("compact"))
+        return (f"{head}{writer.queries} 次查询都列出了数据，其中 {writer.compact} 次只列前 {writer.compact_rows} 行"
+                f"（{per}）。写作模型看不到这些查询其余的行，报告不得据此断言没有数据")
+    return f"{head}{writer.queries} 次查询都列出了数据，表和字段、知识库检索的说明有省略"
 
 
 def report_entities(spec: GraphSpec, node: GraphNode) -> str:
@@ -351,19 +417,21 @@ def _repair_request(violations: list[dict[str, Any]]) -> str:
     )
 
 
-def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cells: bool = True,
-              claims: str = "off") -> list[BaseMessage]:
+def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off") -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
     rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}"
+    if writer.guarded:
+        # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
+        rules = f"{rules}\n{ABSENCE_RULE}"
     if claims in ("require_citation", CLAIMS_JUDGE):
         # 裁判只看写作者挂的依据：要判，就更得每句都挂上
         rules = f"{rules}\n{CLAIMS_RULE}" + (f"\n{judging.JUDGE_RULE}" if claims == CLAIMS_JUDGE else "")
     return [
         SystemMessage(content="\n\n".join(p for p in (system, ROLE) if p)),
         HumanMessage(content=(
-            f"{instructions}\n\n{catalog_prompt(catalog, cells_allowed=cells)}\n\n{rules}\n\n"
+            f"{instructions}\n\n{writer.text}\n\n{rules}\n\n"
             "只输出报告正文（Markdown），不要写撰写说明。"
         )),
     ]
@@ -392,6 +460,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             model, model_id = await get_chat_model(session, _model_spec(ctx))
         except ProviderNotConfigured as e:
             raise NodeError(ctx.node.id, not_configured(e)) from e
+        # 写作目录的篇幅按这个模型的上下文窗口定（evidence.catalog_budget）
+        window = await model_window(session, _model_spec(ctx), model_id)
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
@@ -408,7 +478,15 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if warning := _no_evidence(catalog, cells):
         ctx.emit(EventType.LOG, level="warn", code="report_no_evidence", message=warning)
 
-    messages = _messages(ctx, state, catalog, cells, claims)
+    writer = writer_catalog(catalog, budget=catalog_budget(window), cells_allowed=cells,
+                            fields=report_fields(state, spec, ctx.node),
+                            titles={n.id: n.title or n.id for n in spec.nodes})
+    if writer.trimmed:
+        ctx.emit(EventType.LOG, level="warn", code="report_catalog_trimmed", message=_trimmed_message(writer),
+                 budget=writer.budget, window=window, queries=writer.queries, omitted=len(writer.omitted),
+                 compact=writer.compact, compact_rows=writer.compact_rows,
+                 nodes=[{k: r[k] for k in ("node_id", "title", "total", "omitted", "compact")} for r in writer.nodes])
+    messages = _messages(ctx, state, writer, claims)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
@@ -438,12 +516,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     def compose(raw: str) -> dict[str, Any]:
         return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
-                           cells_allowed=cells, entities=entities)
+                           cells_allowed=cells, entities=entities, absence=writer.trimmed)
 
     response, raw = await draft(messages)
     doc = compose(raw)
     repairs = 0
-    while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs:
+    while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
+            and not (repairs and not _fatal(blocking)):
         repairs += 1
         ctx.emit(EventType.LOG, level="warn", code="report_repair",
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
@@ -454,9 +533,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     judgement: dict[str, Any] | None = None
     if claims == CLAIMS_JUDGE:
+        from app.engine.nodes.human import reviewed_by_human
+
         judge_cfg = report_judge(spec, ctx.node)
-        if await _run_class(ctx.run.run_id) != "formal":
-            # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱
+        if await _run_class(ctx.run.run_id) != "formal" and not reviewed_by_human(spec, ctx.node.id):
+            # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱。要交给人工审批的报告例外：审批人据此
+            # 拍板，批准前就该知道哪句结论站不住；而按需裁判要等运行封存之后才能判，封存前放开会动证据清单的
+            # 完整性约束，所以这种报告探索运行也在节点里当场判（和正式运行同一条路）
             judgement = judging.on_demand(doc, on_unsupported=judge_cfg["on_unsupported"],
                                           rewrite_once=judge_cfg["rewrite_once"], writer_model=model_id)
         elif not (_fatal(blocking) and on_violation == "fail"):
@@ -466,6 +549,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 draft=draft, compose=compose, numbers=numbers, blocking=blocking)
             spent.extend(usages)
 
+    if absent := [v for v in doc["violations"] if v.get("code") == "absence_claim"]:
+        # 重写之后还在（或者没让重写）：报告照常产出，这几处标注出来，时间线上单独说清为什么依据不足
+        texts = list(dict.fromkeys(str(v.get("text") or "") for v in absent))
+        tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
+        ctx.emit(EventType.LOG, level="warn", code="report_absence_claim", count=len(absent), texts=texts,
+                 message=f"报告在证据目录有省略时写了 {len(absent)} 处缺失断言（{_named(absent)}），{tried}："
+                         "被省略的查询仍在证据台账里，这类结论依据不足，应写作本报告未覆盖。报告照常产出，这几处已标注")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,

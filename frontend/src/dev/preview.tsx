@@ -488,9 +488,33 @@ function Expanding({ dense, n }: { dense: boolean; n: number }) {
 const APPROVAL = {
   id: 'ap-1', run_id: 'syn-mixed', node_id: 'review', mode: 'approve' as const,
   title: '出勤结论可以发出吗？', status: 'pending', response: {},
-  payload: { message: '早班出勤率 **94.23%**，晚班 **73.08%**。' },
+  payload: { kind: 'human_node', message: '早班出勤率 **94.23%**，晚班 **73.08%**。' },
   created_at: new Date(Date.now() - 8 * 86_400_000 - 3_600_000).toISOString().replace('Z', ''),
   workflow_name: '出勤日报', node_label: '班长复核', run_class: 'formal' as const,
+}
+
+/**
+ * ?approval=report：探索运行里审一份报告。核对概况取 evidence-doc 夹具（7/12 数字有出处、1 处引用解析不了），
+ * 报告没开结论句裁判；?approval=report-formal：正式运行，节点里判过，1 句证据相矛盾
+ */
+const APPROVAL_REPORT = {
+  id: 'ap-2', run_id: evidenceFixture.run_id, node_id: 'review', mode: 'approve' as const,
+  title: '本周周报可以发出吗？', status: 'pending', response: {},
+  payload: {
+    kind: 'human_node', message: '请审核本周周报。',
+    reports: [{ node_id: 'write', label: '写周报', stats: evidenceFixture.doc.stats, claims: 'off',
+                doc_artifact: evidenceFixture.doc_artifact }],
+  },
+  created_at: new Date(Date.now() - 120_000).toISOString().replace('Z', ''),
+  workflow_name: '周报', node_label: '主管审批', run_class: 'exploratory' as const,
+}
+const APPROVAL_REPORT_FORMAL = {
+  ...APPROVAL_REPORT, id: 'ap-3', run_class: 'formal' as const,
+  payload: {
+    ...APPROVAL_REPORT.payload,
+    reports: [{ ...APPROVAL_REPORT.payload.reports[0], claims: 'judge', stats: { ...evidenceFixture.doc.stats, numbers_cited: 12, uncited_numbers: 0, unresolved: 0 },
+                judge: { mode: 'inline', counts: { supported: 5, contradicted: 1, unjudged: 0 }, complete: true } }],
+  },
 }
 
 function Preview() {
@@ -525,11 +549,13 @@ function Preview() {
   if (md) return <div className="h-full overflow-y-auto"><MarkdownCases /></div>
   if (params.get('grow') === '1') return <Growing dense={dense} />
   if (params.get('expand')) return <Expanding dense={dense} n={Number(params.get('expand')) || 1} />
-  if (params.get('approval') === '1') {
+  const approvalCase = params.get('approval')
+  if (approvalCase === '1' || approvalCase === 'report' || approvalCase === 'report-formal') {
+    const approval = approvalCase === 'report' ? APPROVAL_REPORT : approvalCase === 'report-formal' ? APPROVAL_REPORT_FORMAL : APPROVAL
     return (
       <div className={dense ? 'w-[360px] border-r' : 'mx-auto max-w-3xl p-4'}>
         <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-          <ApprovalCard approval={APPROVAL} onResolved={() => undefined} />
+          <ApprovalCard approval={approval} onResolved={() => undefined} />
         </div>
       </div>
     )

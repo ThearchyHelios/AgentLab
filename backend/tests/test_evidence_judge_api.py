@@ -374,11 +374,15 @@ async def test_formal_runs_are_judged_inside_the_node_not_on_demand(client, monk
 
 
 async def test_a_run_paused_at_an_approval_is_not_judged(client, monkeypatch):
+    """停在审批上的运行还没封存，按需裁判不接。交给审批的报告探索运行也在节点里判过了
+    （test_approval_report_check），这里只看点击：不再多一次裁判调用，也不追加判定事件。"""
     models = Models(monkeypatch)
     row = await finish(weekly(claims="judge", gate=True), statuses=("interrupted",))
+    judged_in_node = list(models.judges)
+    assert judged_in_node
     res = await judge(client, row.id, ["u1"])
     assert res.status_code == 409 and res.json()["code"] == "evidence_judge_unsealed"
-    assert models.judges == [] and await judged_events(row.id) == []
+    assert models.judges == judged_in_node and await judged_events(row.id) == []
 
 
 async def test_runs_from_before_the_upgrade_are_not_judged(client, monkeypatch):

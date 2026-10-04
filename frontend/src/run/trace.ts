@@ -96,6 +96,8 @@ export interface Trace {
   tokensIn: number
   tokensOut: number
   costUsd: number
+  /** 金额估不出来的调用次数（llm.end 标了 unpriced：模型不在价格目录中）。这时 costUsd 的 0 不是「没花钱」 */
+  unpricedCalls: number
   failedNodeId?: string
   waitingNodeId?: string
   issuance?: {
@@ -238,7 +240,7 @@ export const lastEventAt = (t: Trace): number => t.book.clock
 
 export function emptyTrace(): Trace {
   return {
-    phase: 'idle', waitMs: 0, nodes: {}, tokensIn: 0, tokensOut: 0, costUsd: 0,
+    phase: 'idle', waitMs: 0, nodes: {}, tokensIn: 0, tokensOut: 0, costUsd: 0, unpricedCalls: 0,
     lastSeq: 0, parallelSeries: [], usageSeries: [], timed: true, drives: [], waits: [], phases: [],
     lastReplay: false,
     book: { clock: 0, awaiting: false, dispatchFrom: {}, exactDispatch: {}, asking: {} },
@@ -673,6 +675,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       next.tokensIn += inTok
       next.tokensOut += outTok
       next.costUsd += cost
+      if (d.unpriced === true) next.unpricedCalls += 1
       next.usageSeries = [...next.usageSeries, [at, next.tokensIn, next.tokensOut, next.costUsd]]
       if (nodeId) {
         const n = node(nodeId)
@@ -816,6 +819,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
         next.tokensIn = num(u.input_tokens) ?? next.tokensIn
         next.tokensOut = num(u.output_tokens) ?? next.tokensOut
         next.costUsd = num(u.cost_usd) ?? next.costUsd
+        next.unpricedCalls = num(u.unpriced_calls) ?? next.unpricedCalls
       }
       const timing = d.timing
       if (timing && num(timing.wall_ms) != null) {

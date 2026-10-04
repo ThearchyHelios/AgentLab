@@ -18,7 +18,7 @@ import {
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
+import { ABSENCE_CLAIM_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
@@ -1552,6 +1552,7 @@ const CODE_LABEL: Record<string, string> = {
   unresolved_ref: '引用无法解析',
   unknown_entity: '疑似不存在的名称',
   unverified_entity: '无法核实的名称',
+  absence_claim: ABSENCE_CLAIM_TEXT.label,
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */
@@ -1563,7 +1564,9 @@ function ViolationList({ doc, onLocate }: { doc: EvidenceDocData; onLocate: (seg
       <p className="text-2xs text-faint">{EVIDENCE_TEXT.violationsHint}</p>
       <ul className="space-y-2" data-ev-violations="">
         {list.map((v, i) => {
-          const seg = locatable(doc, v)
+          // 缺失断言说的是一整句话，正文里普通文字不是可聚焦的片段：不给「定位」，原句写在下面
+          const sentence = v.code === 'absence_claim'
+          const seg = sentence ? null : locatable(doc, v)
           return (
             <li key={i} className="rounded border px-2 py-1.5" data-ev-violation={v.code}
                 data-ev-locatable={seg ? 'yes' : 'no'}>
@@ -1576,8 +1579,11 @@ function ViolationList({ doc, onLocate }: { doc: EvidenceDocData; onLocate: (seg
                 )}
               </div>
               {v.message && <p className="mt-1 text-dim">{v.message}</p>}
+              {v.code === 'absence_claim' && (
+                <p className="mt-0.5 text-2xs text-dim" data-ev-absence-hint="">{ABSENCE_CLAIM_TEXT.hint}</p>
+              )}
               {v.context && <p className="mono mt-0.5 text-2xs text-faint [overflow-wrap:anywhere]">「{v.context.trim()}」</p>}
-              {!seg && (
+              {!seg && !sentence && (
                 <p className="mt-0.5 text-2xs" style={{ color: 'var(--st-waiting)' }}>
                   {v.segment ? EVIDENCE_TEXT.structural : EVIDENCE_TEXT.noSegment}
                 </p>

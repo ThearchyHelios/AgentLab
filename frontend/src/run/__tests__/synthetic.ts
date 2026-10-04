@@ -503,8 +503,10 @@ export const COPILOT_CONTEXT = [
   { op: 'model', model: 'claude-sonnet-4' },
   { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
   { op: 'context', elapsed_ms: 3420, sources: [
-    { source: 'scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51 },
-    { source: 'shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2 },
+    { source: 'scenic', source_id: 'src-scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51,
+      catalog_tables: 12 },
+    // 小库全部表都带字段：没有数据目录也不提示
+    { source: 'shop', source_id: 'src-shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2, catalog_tables: 0 },
   ] },
   { op: 'heartbeat', phase: 'planning', elapsed_ms: 6000 },
   { op: 'thinking', delta: '入园记录不带渠道，要经 channel_visits 连到渠道表，再按渠道汇总上月的入园人次。' },
@@ -539,7 +541,9 @@ export const COPILOT_CONTEXT_FALLBACK = [
   { op: 'model', model: 'claude-sonnet-4' },
   { op: 'heartbeat', phase: 'planning', elapsed_ms: 18000 },
   { op: 'context', elapsed_ms: 20004, sources: [
-    { source: 'scenic', tables: [], selected_by: 'fallback', total: 51, reason: '挑选数据表超过 20 秒未完成' },
+    // 大库一张目录都没有：过程里提示先去起草目录
+    { source: 'scenic', source_id: 'src-scenic', tables: [], selected_by: 'fallback', total: 51, catalog_tables: 0,
+      reason: '挑选数据表超过 20 秒未完成' },
   ] },
   { op: 'plan', summary: '先查表结构，再取数' },
   { op: 'add_node', node: { id: 's', type: 'tool', label: '查看表结构' } },

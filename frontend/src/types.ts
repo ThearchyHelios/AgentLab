@@ -110,6 +110,8 @@ export interface RunUsage {
   input_tokens?: number
   output_tokens?: number
   cost_usd?: number
+  /** 金额估不出来的调用次数（模型不在价格目录中），cost_usd 只是估得出的那部分。没有这种调用时不给 */
+  unpriced_calls?: number
   [key: string]: any
 }
 
@@ -171,6 +173,22 @@ export interface Approval {
   /** 谁处理的。null 表示处理时没有署名，显示「未署名」 */
   resolved_by?: string | null
   resolved_at?: string | null
+}
+
+/**
+ * 人工审批审的报告的核对概况（human 节点请求里的 payload.reports，服务端 nodes/human._reviewed_reports）：
+ * 上游直接连着的、或者标题和说明里引用了正文的报告撰写节点，各一项。stats 同 report.checked，judge 是裁判摘要
+ * 的几项（mode：inline 节点里当场判的——交给审批的报告探索运行也当场判 / on_demand 按需判，老服务端的探索运行）。
+ * 老后端、审的不是报告时没有
+ */
+export interface ApprovalReport {
+  node_id: string
+  label?: string
+  stats?: EvidenceStats
+  /** 结论句策略：off / require_citation / judge */
+  claims?: string
+  doc_artifact?: string
+  judge?: { mode?: string; counts?: Record<string, unknown>; complete?: boolean; unjudged?: unknown; limits_hit?: unknown }
 }
 
 /**
@@ -1782,8 +1800,8 @@ export interface EvidenceUnit {
   /** 列表项的缩进层级 */
   depth?: number
   /**
-   * 结论句裁判的判定（四期）：只有送了裁判的候选句有。正式运行里节点当场判的进封存（post_seal false）；
-   * 探索运行里候选句先标 unjudged + reason on_demand，点开再判
+   * 结论句裁判的判定（四期）：只有送了裁判的候选句有。正式运行（以及交给人工审批的探索运行）里节点当场判的
+   * 进封存（post_seal false）；其余探索运行里候选句先标 unjudged + reason on_demand，点开再判
    */
   verdict?: EvidenceVerdict
 }
@@ -1820,7 +1838,7 @@ export interface EvidenceVerdict {
 
 /** 文档（和 report.checked、节点产出）里的裁判摘要：键的顺序同后端 judge.SUMMARY_KEYS */
 export interface EvidenceJudgeSummary {
-  /** inline：正式运行节点里当场判；on_demand：探索运行按需 */
+  /** inline：节点里当场判（正式运行，以及交给人工审批的探索运行）；on_demand：其余探索运行按需 */
   mode?: 'inline' | 'on_demand' | string
   model?: string | null
   on_unsupported?: 'degrade' | 'withhold' | string

@@ -774,12 +774,24 @@ await section('参考了哪些表：画布右栏和问数据页（context 操作
     && expanded.includes('channel_visits') && expanded.includes('「shop」全部 2 张表'), expanded.slice(0, 160))
   const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('展开后不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+  check('有数据目录的大库：不提示起草目录', await row.locator('[data-step-next]').count() === 0
+    && await row.locator('[data-fix="catalog"]').count() === 0)
   check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
   await c.page.close()
 
   const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-fallback' })
   const fb = f.page.locator('[data-step-code="copilot_context"]')
   check('挑表失败：写明只给了表名', await fb.count() === 1 && (await fb.innerText()).includes('未能按需求挑选，已提供全部表名'))
+  // 真实运行里数据源一张目录都没有：这一行下面常显下一步，入口去那个源的目录页
+  const hint = fb.locator('[data-step-next]')
+  check('没有数据目录的大库：常显「还没有数据目录」，不收进展开区', await hint.count() === 1
+    && (await hint.innerText()).includes('这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准'),
+    await hint.count() ? await hint.innerText() : '没有这一句')
+  const go = fb.locator('a[data-fix="catalog"]')
+  check('……附去数据目录页的入口', await go.count() === 1 && await go.getAttribute('href') === '/data/catalog/src-scenic'
+    && (await go.innerText()).includes('去数据目录起草'), await go.count() ? await go.getAttribute('href') : '没有入口')
+  const narrow = await f.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('……不撑破 380px 窄栏', narrow <= 0, `${narrow}px`)
   await fb.locator('button').first().click()
   await f.page.waitForTimeout(150)
   check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))
@@ -911,8 +923,64 @@ await section('审批卡的上下文', async () => {
   check('没署名时提醒并给去处', body.includes('未署名') && await page.locator('a[href="/settings/prefs"]').count() === 1)
   await page.close()
   const s = await open('approval=1&actor=张工', { w: 820, h: 500, name: 'approval-signed' })
-  check('署了名就写明以谁的名义', (await s.page.locator('body').innerText()).includes('将以「张工」签批'))
+  const signed = await s.page.locator('body').innerText()
+  check('署了名就写明以谁的名义', signed.includes('将以「张工」签批'))
+  // 人工审批自己标明运行类别：正式运行从已发布版本发起
+  check('人工审批：正式运行标明类别和批了会怎样', await s.page.locator('[data-approval-run-class="formal"]').count() === 1
+    && signed.includes('从已发布版本发起，批准后继续运行'), signed.replace(/\n/g, ' ').slice(0, 200))
   await s.page.close()
+})
+
+await section('审批卡：审的报告的核对概况', async () => {
+  // 真实运行里审批说明写着「批准后才会正式出具」，那却是一次探索运行；报告里一句结论和证据相矛盾，审批人批准时完全
+  // 不知道。审批卡自己标明运行类别，附上报告的核对概况和查看逐段证据的入口。文档、片段、证据图都用夹具伪造，非 GET 拦掉
+  const { readFileSync } = await import('node:fs')
+  const fx = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-doc.json', import.meta.url), 'utf8'))
+  const page = await browser.newPage({ viewport: { width: 420, height: 900 } })
+  const errors = []
+  page.on('pageerror', (e) => errors.push(e.message))
+  await page.route((u) => new URL(u).pathname.startsWith('/api/'), (r) => {
+    const url = new URL(r.request().url())
+    if (r.request().method() !== 'GET') return r.abort()
+    const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+    if (seg) return r.fulfill({ json: fx.segments[seg[1]] ?? {} })
+    if (url.pathname === `/api/runs/${fx.run_id}/evidence`) return r.fulfill({ json: fx.graph })
+    if (url.pathname === `/api/artifacts/${fx.doc_artifact}`) return r.fulfill({ json: { id: fx.doc_artifact, content: fx.doc } })
+    return r.continue()
+  })
+  await page.goto(`${WEB}/preview.html?approval=report&dense=1&actor=张工`, { waitUntil: 'networkidle' })
+  await page.waitForSelector('[data-approval]', { timeout: 6000 })
+  const card = page.locator('[data-approval]')
+  const text = await card.innerText()
+  check('探索运行：标明类别，写明批准后输出、不是正式出具', await card.locator('[data-approval-run-class="exploratory"]').count() === 1
+    && text.includes('批准后输出，这是探索运行，不是正式出具'), text.replace(/\n/g, ' ').slice(0, 160))
+  const report = card.locator('[data-approval-report="write"]')
+  check('报告的核对概况：标题写哪份报告', (await report.innerText()).includes('报告「写周报」的核对'))
+  check('数字和证据条同一种说法', (await report.locator('[data-approval-report-numbers]').innerText())
+    .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用无法解析'), await report.locator('[data-approval-report-numbers]').innerText())
+  check('探索运行、报告没开裁判：结论句尚未核对，说明运行结束后可逐句判断、开启后会在批准前判完',
+    (await report.locator('[data-approval-report-claims]').innerText()).includes('结论句尚未核对')
+    && (await report.innerText()).includes('没有开启结论句裁判') && (await report.innerText()).includes('交给审批的报告会在批准前判完'))
+  await report.locator('[data-approval-evidence]').click()
+  await page.waitForSelector('[data-approval-evidence-doc] [data-evidence-doc]', { timeout: 6000 })
+  check('查看逐段证据：卡里展开可点的报告文档，自带证据条', await report.locator('[data-evidence-doc] [data-seg]').count() > 0
+    && await report.locator('[data-evidence-tally]').count() === 1)
+  await report.locator('[data-seg="s6"]').click()
+  await page.waitForSelector('[data-approval] [data-evidence-panel]', { timeout: 6000 })
+  check('点数字打开证据面板，在卡内展开', await page.locator('[data-approval] [data-evidence-panel]').getAttribute('data-evidence-panel') === 'inline')
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('展开后不撑破窄栏', overflow <= 0, `${overflow}px`)
+  await report.locator('[data-approval-evidence]').click()
+  check('再点一下收起', await report.locator('[data-approval-evidence-doc]').count() === 0)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+
+  const f = await open('approval=report-formal&dense=1&actor=张工', { w: 420, h: 700, name: 'approval-report-formal' })
+  const formal = await f.page.locator('[data-approval-report="write"]').innerText()
+  check('正式运行：节点里判过的写判了几句、几句证据相矛盾', formal.includes('结论句已裁判 6 句，证据相矛盾 1 句'), formal.replace(/\n/g, ' '))
+  check('正式运行：数字都有出处', formal.includes('12 个数字都有出处'))
+  check('正式运行：卡上标明正式运行', await f.page.locator('[data-approval-run-class="formal"]').count() === 1)
+  await f.page.close()
 })
 
 await section('画布右栏：运行视图', async () => {

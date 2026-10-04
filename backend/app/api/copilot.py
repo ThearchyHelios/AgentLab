@@ -152,6 +152,11 @@ NODE_REFERENCE = """\
   查不到的记空值、不兜底成 0。assign_to 拿到的就是核对过的对象，口径卡直接写 vars.<assign_to>.字段。
   只写 output_schema 不开 cite_fields 不生效。**不要用 transform 解析 agent / llm 的文字**：模型写的 JSON
   常夹着没转义的引号，解析一失败整个节点就失败，也核对不了出处
+  **agent 查库时**，prompt 里写明查询结果列用中文别名（AS 月份、AS 曝光量）：报告用 [[table:]] 生成的表格表头、
+  [[v:]] 引用、口径卡的 cell() 都用这个列名，写成英文缩写的原始列名读的人看不懂。中文别名按数据源的方言
+  加标识符引号：MySQL / MariaDB 用反引号（AS `月份`），PostgreSQL、Oracle、SQLite 用双引号（AS "月份"），不要用
+  单引号（那是字符串）。只给最外层 SELECT 的结果列起别名，WHERE、JOIN、GROUP BY 里照旧写原列名；Oracle 旧版本
+  的标识符最长 30 字节，别名不超过 10 个字
   **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
   步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
   上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
@@ -193,6 +198,10 @@ NODE_REFERENCE = """\
   写进去再也读不回来——真发生过：一轮写进 scope"user"，下一轮没写 scope 落回
   default，于是「我叫张三」存下来了，问「我是谁」却答不上来
 - human：人工审批。config: {mode: approve|input|edit, title, message}
+  title、message 说批了会怎样时写「批准后输出」「批准后继续」，**不要写「正式出具」「批准后才会出具」**：出具只发生在
+  成果节点配了出具契约、并且从已发布版本发起的正式运行里；画布上试运行、问数据都是探索运行，批准后只是输出。
+  这次是探索运行还是正式运行，审批卡会自己标明。审的是报告时把 human 接在 report 后面（message 里可以引用
+  {{ nodes.报告节点id.text }}），审批卡会附上这份报告的核对概况
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
@@ -228,10 +237,15 @@ NODE_REFERENCE = """\
   挂引用，没挂的计入缺口、出具降档）/ judge（在 require_citation 之外，再请另一个模型按每句挂的依据判断支不支持：
   正式运行在节点里判，证据相矛盾的按 judge.on_unsupported 处置——degrade 降档（默认）或 withhold 不予出具，
   证据不足的（摘录里没有判断所需的信息）只降档；
-  探索运行不在节点里花钱，读的人点开哪句再按需判哪句，只标注）。judge 的子配置写在节点的 judge 里：judge.model、
+  探索运行不在节点里花钱，读的人点开哪句再按需判哪句，只标注；要交给人工审批的报告例外，探索运行也在节点里判，
+  审批人批准前就能看到判了几句、几句证据相矛盾）。judge 的子配置写在节点的 judge 里：judge.model、
   judge.provider 指定裁判模型（建议和写作模型不同，同一个模型等于自己审自己；不写就用设置里的「证据裁判模型」）；
   judge.max_cost_usd、judge.max_claims、judge.timeout_s 是每份报告的裁判金额、句数、时长上限，写 null 表示不限，
   不写取设置里的默认；judge.rewrite_once 默认 false，打开后把证据相矛盾、证据不足的句子交回写作者只改一次。
+  **多个来源汇总成的分析报告**（几个 agent 分头查库，或者几次查询的结果合在一起写成的分析、结论）默认写 claims: "judge"，
+  不写 judge 的预算（judge 整个不写，金额、句数、时长上限都取设置里的默认）：正式运行在节点里自动判，探索运行由读的人
+  点开哪句判哪句，不在节点里花钱；报告要交给人工审批的，探索运行也在节点里判。用户明确说不要核对结论句的不加；只回答一个问题、一次查询的不必加。要按受管级别
+  发布的模板不适用这条默认，按下面受管级别的规则写预算
   entities 默认 link
   （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
@@ -241,7 +255,7 @@ NODE_REFERENCE = """\
   （问数据的典型图），契约不写 metrics_from，也不写 required / expected
   要按受管级别发布的模板（发布前检查不过就发不出去）：报告节点写明 numbers: "strict"、on_violation: "fail"、
   claims: "require_citation"（或者更严的 claims: "judge"，这时 judge 里必须写 judge.max_cost_usd——写一个金额，或者
-  写 null 表示不限，预算要用户定，拿不准就问）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
+  写 null 表示不限，预算要用户定，拿不准就问；只有受管级别要这样，普通草稿里默认开的 judge 不写预算、不为预算问人）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
   供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
   否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
 
@@ -351,7 +365,8 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]]（英文名也可以放进反引号，中文名不行："
             "反引号里的中文名不核对），只写 agent 真查过的名字，"
             "编造的会被标出来；要引用知识库原话就在 report 前接 retrieve，用 [[q:K1|原话]] 逐字引用。问数是探索运行，"
-            "report 的 claims 不用写：结论句支不支持，由读答案的人点开时按需请模型判断\n"
+            "report 的 claims 不用写：结论句支不支持，由读答案的人点开时按需请模型判断。节点说明里「多个来源汇总成的"
+            "分析报告默认开结论句裁判」那条在问数里不适用，几个 agent 分头查的也一样\n"
             "- 用户要的是周报、要三档出具时，按搭图规则配口径卡和 report_from 契约\n"
             "- 不要用 transform 解析 agent / llm 的文字：要把 agent 查到的数交给下游，就给它配 output_schema + "
             "cite_fields\n"
@@ -1323,6 +1338,7 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     changed = _changed(spec, baseline)
     out: list[dict[str, Any]] = []
     out += _unsourced_reports(spec, changed)
+    out += _issuance_promises(spec, changed)
     for issue in text_parse_issues(spec):
         if issue.node_id in changed:
             # 模型的文字放在模板引号里的那种，改法是 | json，不是换结构化输出
@@ -1353,6 +1369,36 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
                     "for_model": f"SQL 里的 {'、'.join(unknown[:5])} 在数据源「{source.name}」的结构里查不到（这几张表的列："
                                  f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
                                  "别凭空猜列名"})
+    return out
+
+
+#: 人工审批的标题、说明里不该出现的说法：出具要成果节点配了出具契约、从已发布版本发起的正式运行才谈得上
+_ISSUANCE_PROMISE = "正式出具"
+
+
+def _issuance_promises(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
+    """这一轮写的人工审批节点在标题、说明里许诺「正式出具」（human_formal_issuance）。
+
+    真实运行里一次探索运行的审批写着「批准后才会正式出具」，审批人以为自己在签发正式的东西。画布上试运行、问数据
+    都是探索运行，成果节点也常常没有出具契约；同一张图发布后发起的正式运行才谈得上出具。审批说明写「批准后输出」，
+    这次是哪一类运行由审批卡标明。"""
+    out: list[dict[str, Any]] = []
+    for node in spec.nodes:
+        if node.id not in changed or node.type != NodeType.HUMAN:
+            continue
+        field = next((key for key in ("title", "message")
+                      if _ISSUANCE_PROMISE in str(node.config.get(key) or "")), None)
+        if field is None:
+            continue
+        out.append({
+            "level": "error", "node_id": node.id, "edge_id": None, "field": field, "code": "human_formal_issuance",
+            "message": f"人工审批「{node.title}」的{'标题' if field == 'title' else '说明'}写了「{_ISSUANCE_PROMISE}」。"
+                       "只有成果节点配了出具契约、从已发布版本发起的正式运行才会出具，画布上试运行和问数据都是探索运行，"
+                       "批准后只是输出。请改成「批准后输出」这类说法",
+            "for_model": f"人工审批的 {field} 里不要写「{_ISSUANCE_PROMISE}」：只有成果节点配了出具契约、从已发布版本发起的"
+                         "正式运行才会出具，这张图在画布上试运行、问数据时都是探索运行，批准后只是输出。改成「批准后输出」"
+                         "「批准后继续」这类说法，运行类别由审批卡标明",
+        })
     return out
 
 
@@ -1423,6 +1469,22 @@ _DATEPART_ARG = re.compile(
 _WINDOW_NAME = re.compile(r"(?:\bwindow|,)\s*([A-Za-z_][\w$#]*)\s+as\s*\(", re.I)
 
 
+def _blank_unicode_identifiers(sql: str) -> str:
+    """带引号、名字里有非 ASCII 字符的标识符（中文别名 AS "月份"、AS `曝光量`）连引号一起换成空格。
+
+    这项核对只认 ASCII 的列名，中文名本来就不判；不抹掉的话，SQL 里一出现带引号的标识符就整条放弃核对，照「结果列
+    起中文别名」写的 SQL 会把猜错的英文列名一起放过去。英文的带引号标识符（"StatDate"）大小写、空格都可能，照旧不判。"""
+    from app.data.guard import _GENERIC, _tokens
+
+    out = []
+    for token in _tokens(sql, _GENERIC):
+        if token.kind == "ident" and not token.text.isascii():
+            out.append(" " * len(token.text))
+        else:
+            out.append(token.text)
+    return "".join(out)
+
+
 def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:
     """SQL 里用到、数据源结构里查不到的列：(查不到的列, 这几张表的全部列)。判断不了、或者都查得到时返回 None。"""
     from app.data import introspect as _introspect
@@ -1431,7 +1493,7 @@ def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | 
     cache = getattr(source, "schema_cache", None) or {}
     if not cache.get("tables") or cache.get("failed") or first_verb(sql) != "select":
         return None
-    text = re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S)
+    text = _blank_unicode_identifiers(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S))
     if '"' in text.replace("''", "") and _blank_quoted(text) != _blank_quoted(text, identifiers=False):
         return None                                   # 引号括起来的标识符：大小写、空格都可能，不猜
     text = _blank_quoted(text)

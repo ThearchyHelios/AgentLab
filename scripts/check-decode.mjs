@@ -682,6 +682,28 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
   check('挑表失败：原因和库的规模放在展开区', !!fb?.detail?.includes('原因：挑选数据表超过 20 秒未完成')
     && fb.detail.includes('「scenic」共 51 张表'), fb?.detail)
   check('挑表失败也说等了多久', fb?.ms === 20004, String(fb?.ms))
+  // 真实运行里数据源一张目录都没有，挑表、SQL 检查都用不上目录，用户也不知道该先去起草
+  check('没有数据目录的大库：下一步提示起草目录，入口直达那个源的目录页',
+    fb?.next === '这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准' && fb?.fix === 'catalog'
+    && fb?.fixTo === '/data/catalog/src-scenic', JSON.stringify({ next: fb?.next, fix: fb?.fix, fixTo: fb?.fixTo }))
+  check('有目录的大库、没有目录的小库：不提示', !row?.next && !row?.fix && !row?.fixTo, JSON.stringify({ next: row?.next }))
+  const bare = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 0 },
+    { source: 'b', source_id: 'id-b', tables: ['y'], selected_by: 'all', total: 3, catalog_tables: 0 },
+    { source: 'c', source_id: 'id c', tables: [], selected_by: 'fallback', total: 90, catalog_tables: 0, reason: 'r' }] })
+  check('几个数据源：点名没有目录的大库，入口去第一个', bare?.next === '「a」「c」还没有数据目录，起草后挑表和 SQL 检查会更准'
+    && bare?.fixTo === '/data/catalog/id-a', JSON.stringify({ next: bare?.next, fixTo: bare?.fixTo }))
+  const partly = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 3 }] })
+  check('起草过一部分目录：不再提示', !partly?.next, partly?.next)
+  const old = mod.copilotContext({ op: 'context', sources: [{ source: 'a', tables: ['x'], selected_by: 'model', total: 60 }] })
+  check('老服务端不给目录表数：不猜，不提示', !old?.next && !old?.fixTo, old?.next)
+  const noId = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] })
+  check('没给数据源 id：照样提示，只是不给入口', !!noId?.next && !noId?.fixTo, JSON.stringify(noId))
+  const step = mod.decodeCopilot([{ op: 'context', sources: [
+    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] }]).find((s) => s.code === 'copilot_context')
+  check('没有入口时不带 fix：不画一个点了没处去的按钮', !!step?.next && !step?.fix, JSON.stringify(step))
 
   const seeded = mod.copilotContext({ op: 'context', sources: [
     { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })
@@ -1300,6 +1322,59 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
     `${flagged?.status} ${flagged?.level}`)
   const bare = flatten(mod.decodeRun([E(1, 'report.checked', null, {})])).find((s) => s.code === 'report_checked')
   check('载荷缺字段也不崩，只说核对了报告', bare?.title === '核对报告' && !bare.artifact, bare?.title)
+
+  // 写作目录超出篇幅（2026-10 一次运行：上百次查询只有前二十来次进了写作者的视野，界面上一个字都没说）：
+  // 现在按来源均衡地展开，没展开的列编号和摘要，并发一条警告。界面读结构化字段（queries、omitted、nodes）
+  check('后端发目录有省略的警告，带着结构化字段', reportPy.includes('code="report_catalog_trimmed"')
+    && reportPy.includes('queries=writer.queries, omitted=len(writer.omitted)') && reportPy.includes('"node_id", "title", "total", "omitted"'),
+    '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const TRIMMED = '证据目录超出篇幅（约 51200 字，按写作模型的上下文窗口确定）：164 次查询中 90 次列出了数据，74 次只列编号和摘要'
+    + '（卡券核销省略 52 次、活动内容省略 22 次）。写作模型看不到这些查询的明细，报告不得据此断言没有数据'
+  const trimmed = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: TRIMMED, budget: 51200, window: null, queries: 164,
+      omitted: 74, nodes: [{ node_id: 'a', title: '会员专项', total: 26, omitted: 0 }, { node_id: 'b', title: '卡券核销', total: 79, omitted: 52 },
+        { node_id: 'c', title: '活动内容', total: 42, omitted: 22 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('report_catalog_trimmed：标题说几次查询只列了编号和摘要', trimmed?.title === '证据目录超出篇幅，164 次查询中 74 次只列了编号和摘要', trimmed?.title)
+  check('……副标题按来源列省略了几次（没省略的来源不列）', trimmed?.sub === '卡券核销 省略 52/79 次、活动内容 省略 22/42 次', trimmed?.sub)
+  // 放不下但查询全都列出、只是有的只列前几行：不写「0 次只列了编号和摘要」
+  const rowsOnly = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '证据目录超出篇幅', budget: 51200, window: null,
+      queries: 140, omitted: 0, compact: 38, compact_rows: 3, nodes: [{ node_id: 'a', title: '会员专项', total: 60, omitted: 0, compact: 0 },
+        { node_id: 'b', title: '卡券核销', total: 80, omitted: 0, compact: 38 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('……查询全都列出、有的只列前几行：标题照实说，不写「0 次只列了编号和摘要」',
+    rowsOnly?.title === '证据目录超出篇幅，140 次查询都列出了数据，38 次只列了前几行' && !rowsOnly?.title?.includes('编号和摘要'), rowsOnly?.title)
+  check('……副标题按来源列只列了前几行的次数', rowsOnly?.sub === '卡券核销 38/80 次只列前几行', rowsOnly?.sub)
+  check('……下一步说其余的行仍在台账里', !!rowsOnly?.next?.includes('只看到前几行') && !!rowsOnly?.next?.includes('不得据此断言没有数据'), rowsOnly?.next)
+  const notesOnly = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '证据目录超出篇幅', queries: 12, omitted: 0, compact: 0,
+      nodes: [{ node_id: 'a', title: '会员专项', total: 12, omitted: 0, compact: 0 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('……只省略了表和字段的说明：照实说', notesOnly?.title === '证据目录超出篇幅，12 次查询都列出了数据，表和字段的说明有省略', notesOnly?.title)
+  check('……下一步说被省略的仍在台账里、不得据此断言没有数据，以及怎么看全', !!trimmed?.next?.includes('不得据此断言没有数据')
+    && !!trimmed?.next?.includes('上下文窗口更大') && trimmed?.level === 'warn' && trimmed?.detail === TRIMMED, trimmed?.next)
+  const trimmedBare = flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '目录有省略' })]))
+    .find((s) => s.code === 'report_catalog_trimmed')
+  check('……缺字段时标题照样说人话，不出 undefined', trimmedBare?.title === '证据目录超出篇幅，部分查询只列了编号和摘要'
+    && trimmedBare?.sub === undefined, `${trimmedBare?.title} / ${trimmedBare?.sub}`)
+
+  // 目录有省略时报告写了缺失断言（「没有查到」「数据缺失」），交回重写一次仍在：只标注、不判失败，时间线单独一行说清
+  check('后端发缺失断言的警告，带着 count、texts', reportPy.includes('code="report_absence_claim"')
+    && reportPy.includes('count=len(absent), texts=texts'), '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const ABSENT = '报告在证据目录有省略时写了 2 处缺失断言（「数据缺失」、「没有查到」），已要求模型重写 1 次仍未改掉：'
+    + '被省略的查询仍在证据台账里，这类结论依据不足，应写作本报告未覆盖。报告照常产出，这几处已标注'
+  const absentRun = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_absence_claim', message: ABSENT, count: 2, texts: ['数据缺失', '没有查到'] }),
+    E(3, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 1, ok: false, on_violation: 'fail', failed: false,
+      stats: { numbers: 0, numbers_cited: 0, uncited_numbers: 0, unresolved: 0 },
+      violations: [{ code: 'absence_claim', text: '数据缺失', message: '证据目录有省略时写了缺失断言：写作模型没有看到全部证据，「没有查到」「不存在」「缺失」这类结论依据不足' }] }),
+  ]))
+  const ab = absentRun.find((s) => s.code === 'report_absence_claim')
+  check('report_absence_claim：标题说几处缺失断言、已标注、为什么（目录有省略）', ab?.title === '报告写了 2 处缺失断言，已标注（证据目录有省略）', ab?.title)
+  check('……副标题点名那几处说法', ab?.sub === '「数据缺失」、「没有查到」', ab?.sub)
+  check('……下一步说被省略的仍在台账里、应写「本报告未覆盖」；是提醒（warn），原话留在展开区',
+    !!ab?.next?.includes('本报告未覆盖') && !!ab?.next?.includes('证据台账') && ab?.level === 'warn' && ab?.detail === ABSENT, ab?.next)
+  const rcAbsent = absentRun.find((s) => s.code === 'report_checked')
+  check('……核对那一行照常完成（不判失败），违规清单里写着这条的说明', rcAbsent?.status === 'done'
+    && !!rcAbsent?.detail?.includes('缺失断言') && !!rcAbsent?.detail?.includes('依据不足'), `${rcAbsent?.status} ${rcAbsent?.detail}`)
 })
 
 await section('工具门控 tool.gated（工具信任三档）', async () => {
@@ -1481,6 +1556,47 @@ await section('agent 字段按出处核对（可点击证据第二期）：抽�
   check('「抽取结果格式有误（不是对象）」：同样说「失败，N 个字段记为空值」，原因放副标题，不说「出处不存在」',
     notObject?.title === '按出处抽取字段失败，2 个字段记为空值（未以 0 代替）' && notObject?.sub === '抽取结果格式有误（不是对象）'
     && !notObject?.next?.includes('出处在查询结果中不存在'), `${notObject?.title} / ${notObject?.sub} / ${notObject?.next}`)
+  // 两次抽取都被截断（2026-10 一次运行：推理模型关不掉思考，4096 的额度在推理阶段就用完了）：单独的 code，
+  // 说清是额度问题、给出能做的下一步，不说「稍后重试」「去设置测试该模型」（llm.py TRUNCATED_EXTRACT、TRUNCATED_NEXT）
+  const TRUNCATED = '结构化抽取没有完成：模型的输出额度在推理阶段就用完了（最后一次的额度为 32768 token），结构化结论没能写出来。'
+    + '5 个字段都记为空值（未以 0 代替）。可以为该 Agent 换用非推理模型（抽取沿用 Agent 的模型），或者调大该 Agent 的「最大输出 token」后重新运行'
+  check('后端发截断警告的说法还是夹具里这一种', llmPy.includes('"agent_field_truncated"')
+    && llmPy.includes('结构化抽取没有完成：模型的输出额度在推理阶段就用完了（最后一次的额度为 {budget} token），"')
+    && llmPy.includes('"结构化结论没能写出来"') && llmPy.includes('可以为该 Agent 换用非推理模型（抽取沿用 Agent 的模型），或者调大该 Agent 的"')
+    && llmPy.includes('已把额度加大到 {bigger} token 重试一次'), '改了 llm.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const FIELDS5 = ['members', 'stores', 'coupons', 'redeemed', 'rate']
+  const cut = flatten(mod.decodeRun([
+    E(1, 'node.started', 'fetch', { node_type: 'agent', label: '会员专项' }),
+    E(2, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5, max_tokens: 16384 }),
+    E(3, 'llm.end', 'fetch', { agent: '会员专项', model: 'm1', purpose: 'cite_fields', duration_ms: 40000, output_tokens: 16384,
+      error: '输出被截断：16384 token 的输出额度用完了，结构化结论没有写完，已把额度加大到 32768 token 重试一次' }),
+    E(4, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5, max_tokens: 32768 }),
+    E(5, 'llm.end', 'fetch', { agent: '会员专项', model: 'm1', purpose: 'cite_fields', duration_ms: 80000, output_tokens: 32768,
+      error: '输出被截断：32768 token 的输出额度用完了，结构化结论没有写完' }),
+    E(6, 'log', 'fetch', { level: 'warn', code: 'agent_field_truncated', message: TRUNCATED, fields: FIELDS5, max_tokens: 32768 }),
+    E(7, 'node.finished', 'fetch', { duration_ms: 125000 }),
+  ]))
+  const tr = cut.find((s) => s.code === 'agent_field_truncated')
+  check('agent_field_truncated：标题说额度在推理阶段用完、几个字段记为空值', tr?.title === '模型的输出额度在推理阶段用完，5 个字段记为空值（未以 0 代替）', tr?.title)
+  check('……副标题说抽取时输出被截断、重试到的额度（读 max_tokens 字段）',
+    tr?.sub === '按出处抽取字段时输出被截断（已加大额度重试，最后一次为 32,768 token），结构化结论没能写出来', tr?.sub)
+  check('……下一步：换非推理模型或调大最大输出 token；不说稍后重试，不叫人去测试模型',
+    !!tr?.next?.includes('非推理模型') && !!tr?.next?.includes('「最大输出 token」') && !tr?.next?.includes('稍后重试')
+    && !tr?.next?.includes('测试') && !!tr?.next?.includes('不得据此断言没有数据'), tr?.next)
+  check('……入口打开该 Agent 的设置、落到最大输出 token；是提醒（warn），原话留在展开区',
+    tr?.fix === 'canvas' && tr?.fixField === 'max_tokens' && tr?.level === 'warn' && tr?.detail === TRUNCATED,
+    `${tr?.fix} ${tr?.fixField} ${tr?.level}`)
+  const tries = cut.filter((s) => s.kind === 'llm')
+  check('……两次抽取各成一行，第一次的展开区写明已加大额度重试', tries.length === 2
+    && !!tries[0].detail?.includes('已把额度加大到 32768 token 重试一次') && !!tries[1].detail?.includes('结构化结论没有写完'),
+    tries.map((s) => s.detail).join(' | '))
+  check('……节点本身照样成功', cut.find((s) => s.kind === 'node')?.status === 'done')
+  const bareCut = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'agent' }),
+    E(2, 'log', 'x', { level: 'warn', code: 'agent_field_truncated', message: '结构化抽取没有完成。3 个字段都记为空值（未以 0 代替）' })]))
+    .find((s) => s.code === 'agent_field_truncated')
+  check('……缺 fields、max_tokens 字段时字段数从原话里认，不出 undefined',
+    bareCut?.title === '模型的输出额度在推理阶段用完，3 个字段记为空值（未以 0 代替）'
+    && bareCut?.sub === '按出处抽取字段时输出被截断，结构化结论没能写出来', `${bareCut?.title} / ${bareCut?.sub}`)
   const node = mod.decodeRun([E(1, 'node.started', 'fetch', { node_type: 'agent' }), E(2, 'node.finished', 'fetch', { duration_ms: 1 })])
   check('对照：普通 agent 节点不多出任何行', flatten(node).filter((s) => s.kind !== 'node').length === 0)
   const odd = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'agent' }),

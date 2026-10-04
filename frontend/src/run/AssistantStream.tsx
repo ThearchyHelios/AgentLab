@@ -15,7 +15,9 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import {
+  COPILOT_CONTEXT_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel,
+} from '../lib/terms'
 import { SqlCheckList } from './SqlChecks'
 import {
   ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
@@ -901,6 +903,12 @@ function FixAction({ fix, nodeId, label, to, first, field }: {
   if (fix === 'settings') {
     return <Link to={to ?? '/settings/providers'} className={cls} data-fix="settings"><Settings2 size={10} aria-hidden /> 去模型接入</Link>
   }
+  if (fix === 'catalog' && to) {
+    // 助手参考的大库还没有数据目录：直达那个数据源的目录页去起草
+    return (
+      <Link to={to} className={cls} data-fix="catalog"><Database size={10} aria-hidden /> {COPILOT_CONTEXT_TEXT.toCatalog}</Link>
+    )
+  }
   if (fix === 'tools') {
     // 数据源工具（db_query__ 这类）不在工具库里接入，在数据页
     const data = !!to?.startsWith('/data')
@@ -1170,7 +1178,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
           </span>
           {/* 要改的是另一个节点（指标的问题出在来源查询的 SQL 上）：入口落到那个节点的那一栏 */}
           <FixAction fix={step.fix} nodeId={step.fixNode ?? step.nodeId} field={step.fixField}
-                     label={step.fixNode ? step.fixLabel : undefined} />
+                     label={step.fixNode ? step.fixLabel : undefined} to={step.fixTo} />
         </div>
       )}
 

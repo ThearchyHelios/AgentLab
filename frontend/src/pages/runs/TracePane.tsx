@@ -11,7 +11,7 @@ import { explainRunError } from '../../lib/explain'
 import {
   NONE, formatCost, formatDateTime, formatNumber, formatOffset, formatSpan, formatTokens, shortId,
 } from '../../lib/format'
-import { runClassLabel, nodeTypeLabel } from '../../lib/terms'
+import { COST_TEXT, runClassLabel, nodeTypeLabel, runCostText } from '../../lib/terms'
 import { topology, type GraphLike } from '../../run/derive'
 import {
   isActivePhase, isSettled, liveAt, project, type NodeState, type Projection, type RunPhase, type Trace,
@@ -245,7 +245,9 @@ function Readout({
                 sub={tokens ? `输入 ${formatNumber(proj.tokensIn)} · 输出 ${formatNumber(proj.tokensOut)}` : undefined}>
           {tokens == null ? NONE : formatTokens(tokens, { compact: true })}
         </Metric>
-        <Metric label="成本" data="cost">{!metered || proj.costUsd == null ? NONE : formatCost(proj.costUsd)}</Metric>
+        <Metric label="成本" data="cost" title={trace.unpricedCalls ? COST_TEXT.unpricedTitle(trace.unpricedCalls) : undefined}>
+          {!metered || proj.costUsd == null ? NONE : runCostText(proj.costUsd, trace.unpricedCalls) ?? NONE}
+        </Metric>
       </div>
 
       <div className="runs-trace-cols">

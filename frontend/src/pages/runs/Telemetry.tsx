@@ -10,7 +10,7 @@ import { type StatusCode } from '../../lib/status'
 import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
-import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
+import { COST_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
 import {
   LONG_WAIT_MS, ageMs, cancelReason, runScope, runTiming, type RunTiming,
 } from './model'
@@ -92,6 +92,9 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   const tokens = settled || !streaming ? tokensSettled ?? (liveTokens || undefined) : liveTokens
   const cost = settled || !streaming ? (isNum(usage.cost_usd) ? usage.cost_usd : trace.costUsd || undefined) : trace.costUsd
   const approx = streaming && !settled
+  // 金额估不出来的调用（模型不在价格目录中）：有的话不写 $0
+  const unpriced = (settled || !streaming ? (isNum(usage.unpriced_calls) ? usage.unpriced_calls : undefined) : undefined)
+    ?? trace.unpricedCalls
 
   const running = Object.values(trace.nodes).filter(isExecuting)
   const waitingId = trace.waitingNodeId ?? pending?.[0]?.node_id
@@ -156,7 +159,7 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
         <Value data="tokens">
           {tokens ? <>{approx && '≥ '}{formatTokens(tokens, { compact: true })}</> : NONE}
         </Value>
-        <Sub>{isNum(cost) && cost > 0 ? `${approx ? '≥ ' : ''}${formatCost(cost)}` : isNum(cost) ? formatCost(cost) : ' '}</Sub>
+        <Sub title={unpriced ? COST_TEXT.unpricedTitle(unpriced) : undefined}>{runCostText(cost, unpriced, approx) ?? ' '}</Sub>
       </Cell>
     </div>
   )

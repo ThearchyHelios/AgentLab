@@ -2,7 +2,7 @@ import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, 
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -48,7 +48,8 @@ export const teamVerdictOf = (team: TeamRun | undefined | null): TeamVerdict | u
   (team as TeamRunEx | undefined | null)?.verdict
 
 /** 下一步该去哪儿改。界面据此给一个直达的入口，而不只是一句话 */
-export type FixKind = 'canvas' | 'settings' | 'tools'
+/** catalog：去数据目录页（fixTo 指到哪个数据源），助手参考的大库还没有数据目录时给 */
+export type FixKind = 'canvas' | 'settings' | 'tools' | 'catalog'
 
 /**
  * 事件 → 人能看懂的步骤。
@@ -147,6 +148,8 @@ export interface Step {
   next?: string
   /** 下一步该去的地方 */
   fix?: FixKind
+  /** fix 要去的页面地址（catalog：/data/catalog/:sourceId） */
+  fixTo?: string
   /** 工具的时限（秒，tool.start.timeout_s）。进行中的行超过它就要说破 */
   limitS?: number
   /** 出具那一行的档位（formal / degraded / withheld） */
@@ -756,6 +759,47 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         sub: message.match(/(?:没|未)通过核对（(.+?)）/)?.[1],
       }
     }
+    case 'report_absence_claim': {
+      // 证据目录有省略时报告写了缺失断言，重写后仍在（report.py）：读结构化字段 count、texts，不从原话里认
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const texts = strs(d.texts)
+      return {
+        title: ABSENCE_CLAIM_TEXT.title(n),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
+        next: ABSENCE_CLAIM_TEXT.next,
+      }
+    }
+    case 'report_catalog_trimmed': {
+      // 写作目录超出篇幅（report.py _trimmed_message）。读结构化字段（queries、omitted、nodes），不从原话里认
+      const total = typeof d.queries === 'number' ? d.queries : undefined
+      const omitted = typeof d.omitted === 'number' ? d.omitted : undefined
+      const compact = typeof d.compact === 'number' ? d.compact : undefined
+      const rows: any[] = Array.isArray(d.nodes) ? d.nodes : []
+      const per = rows.filter((r) => typeof r?.omitted === 'number' && r.omitted > 0 && str(r?.title))
+        .map((r) => `${r.title} 省略 ${formatNumber(r.omitted)}/${formatNumber(r.total)} 次`)
+      const all = total != null ? `${formatNumber(total)} 次查询都列出了数据` : '查询都列出了数据'
+      if (omitted === 0) {
+        // 放不下但一次查询都没省略：有的只列了前几行，或者只省略了表和字段的说明。不写「0 次只列了编号和摘要」
+        const rowsPer = rows.filter((r) => typeof r?.compact === 'number' && r.compact > 0 && str(r?.title))
+          .map((r) => `${r.title} ${formatNumber(r.compact)}/${formatNumber(r.total)} 次只列前几行`)
+        return {
+          title: compact ? `证据目录超出篇幅，${all}，${formatNumber(compact)} 次只列了前几行`
+            : compact === 0 ? `证据目录超出篇幅，${all}，表和字段的说明有省略`
+            : `证据目录超出篇幅，${all}，部分明细有省略`,
+          sub: rowsPer.length ? rowsPer.join('、') : undefined,
+          next: '写作模型看到了每次查询，但有的只看到前几行；其余的行仍在证据台账里，报告不得据此断言没有数据。'
+            + '需要完整明细时，请换用上下文窗口更大的写作模型，或让 Agent 在 SQL 中先汇总再交出结果',
+        }
+      }
+      return {
+        title: omitted != null
+          ? `证据目录超出篇幅，${total != null ? `${formatNumber(total)} 次查询中 ` : ''}${formatNumber(omitted)} 次只列了编号和摘要`
+          : '证据目录超出篇幅，部分查询只列了编号和摘要',
+        sub: per.length ? per.join('、') : undefined,
+        next: '写作模型按来源均衡地看到了一部分查询的明细，被省略的查询仍在证据台账里，报告不得据此断言没有数据。'
+          + '需要完整明细时，请换用上下文窗口更大的写作模型，或让 Agent 在 SQL 中先汇总再交出结果',
+      }
+    }
     case 'agent_field_mismatch': {
       // 「有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234」（llm.py _field_warnings）
       const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]
@@ -782,6 +826,22 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         title: `有${n ? ` ${n} 个` : ''}字段无法核对出处，记为空值（未以 0 代替）`,
         sub: message.match(/记为空值（[^）]*）[：:]\s*(.+)$/)?.[1]?.trim() || undefined,
         next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
+      }
+    }
+    case 'agent_field_truncated': {
+      // 结构化抽取两次都被截断（llm.py TRUNCATED_EXTRACT）：「结构化抽取没有完成：模型的输出额度在推理阶段就用完了
+      // （最后一次的额度为 32768 token），结构化结论没能写出来。5 个字段都记为空值（未以 0 代替）。可以……」。
+      // 字段数、额度读结构化字段（fields、max_tokens），不从原话里认；不说「稍后重试」——重试解决不了额度问题
+      const n = strs(d.fields).length || Number(message.match(/(\d+)\s*个字段都?记为空值/)?.[1] ?? 0)
+      const budget = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      return {
+        title: `模型的输出额度在推理阶段用完，${n ? `${n} 个` : ''}字段记为空值（未以 0 代替）`,
+        sub: `按出处抽取字段时输出被截断${budget ? `（已加大额度重试，最后一次为 ${formatNumber(budget)} token）` : ''}，`
+          + '结构化结论没能写出来',
+        next: '这些字段以空值传给下游，口径卡按缺少输入处理，报告不得据此断言没有数据。请为该 Agent 换用非推理模型'
+          + '（抽取沿用 Agent 的模型），或调大它的「最大输出 token」后重新运行',
+        fix: 'canvas',
+        fixField: 'max_tokens',
       }
     }
     case 'metric_incomplete': {
@@ -2649,6 +2709,10 @@ export interface CopilotContextSource {
   explored?: number
   /** 没能挑出来的原因 */
   reason?: string
+  /** 数据源 id：去数据目录页的入口用（老服务端不给） */
+  sourceId?: string
+  /** 有数据目录的表数（老服务端不给：不知道就不提示） */
+  catalogTables?: number
 }
 
 /** 挑表失败时的说法：模型这一轮只看到表名，字段要它自己去查 */
@@ -2668,8 +2732,22 @@ function contextSources(op: CopilotOp): CopilotContextSource[] {
         ...(total != null ? { total } : {}),
         ...(total != null && explored != null && explored < total ? { explored } : {}),
         ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
+        ...(typeof x.source_id === 'string' && x.source_id ? { sourceId: x.source_id } : {}),
+        ...(num(x.catalog_tables) != null ? { catalogTables: num(x.catalog_tables) } : {}),
       }
     })
+}
+
+/**
+ * 没有数据目录的大库（要按需求挑表的那种）：挑表只能照表名猜，SQL 检查也没有目录可对照。真实运行里数据源一张目录
+ * 都没有，用户也不知道该先去起草。只认服务端明说了 0 张的；小库全部表都带字段，不提示
+ */
+function noCatalog(groups: CopilotContextSource[]): { next: string; fixTo?: string } | null {
+  const bare = groups.filter((g) => g.catalogTables === 0 && g.selectedBy !== 'all')
+  if (!bare.length) return null
+  const who = groups.length === 1 ? null : `「${bare.map((g) => g.source).join('」「')}」`
+  const to = bare.find((g) => g.sourceId)?.sourceId
+  return { next: COPILOT_CONTEXT_TEXT.noCatalog(who), ...(to ? { fixTo: `/data/catalog/${encodeURIComponent(to)}` } : {}) }
 }
 
 /**
@@ -2702,7 +2780,8 @@ function contextLine(g: CopilotContextSource): string {
  * 先得知道模型当时看到的是哪几张。标题只说几张（「参考了 8 张表」），展开按数据源分组列表名；挑表失败时
  * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
  */
-export function copilotContext(op: CopilotOp): { title: string; sub?: string; detail: string; ms?: number } | null {
+export function copilotContext(op: CopilotOp):
+  { title: string; sub?: string; detail: string; ms?: number; next?: string; fixTo?: string } | null {
   // 展开区里按需求挑过表的库排在前面：请求里点名的那个库往往就是它，排在一串小库后面得在内层滚动框里翻才看得到
   const order: Record<CopilotContextSource['selectedBy'], number> = { model: 0, all: 1, fallback: 2 }
   const groups = contextSources(op).map((g, i) => ({ g, i }))
@@ -2721,11 +2800,13 @@ export function copilotContext(op: CopilotOp): { title: string; sub?: string; de
   const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
   // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
   const ms = num(op.elapsed_ms)
+  const hint = noCatalog(groups)
   return {
     title: count ? (namesOnly ? COPILOT_CONTEXT_TEXT.withFields(count) : `参考了 ${count} 张表`) : CONTEXT_FALLBACK_TEXT,
     ...(sub ? { sub } : {}),
     detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
     ...(ms != null && ms >= 10 ? { ms } : {}),
+    ...(hint ?? {}),
   }
 }
 
@@ -2848,7 +2929,9 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: 'copilot_context',
               title: ctx.title, detail: ctx.detail,
               ...(ctx.sub ? { sub: ctx.sub } : {}),
-              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}) })
+              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}),
+              // 没有数据目录的大库：下一步去起草目录，入口直达那个数据源的目录页
+              ...(ctx.next ? { next: ctx.next, ...(ctx.fixTo ? { fix: 'catalog' as const, fixTo: ctx.fixTo } : {}) } : {}) })
         break
       }
       case 'catalog_patch': {

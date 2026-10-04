@@ -46,7 +46,7 @@ import type {
   CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
   SqlCheckCode, SqlCheckLevel, ToolTrust,
 } from '../types'
-import { formatNumber } from './format'
+import { formatCost, formatNumber } from './format'
 
 export const TERMS = {
   workflow: '工作流',
@@ -85,6 +85,35 @@ export const RUN_CLASS_LABEL: Record<'formal' | 'exploratory', string> = {
 export function runClassLabel(runClass: 'formal' | 'exploratory' | null | undefined, version?: number | null): string {
   if (runClass === 'formal') return version != null ? `正式运行 v${version}` : '正式运行'
   return '探索运行'
+}
+
+/**
+ * 审批卡上人工审批的运行类别和审的报告的核对概况。出具只发生在成果节点配了出具契约、从已发布版本发起的正式运行里：
+ * 探索运行批准后只是输出，卡上要说破，不能让审批人以为自己在签发正式的东西
+ */
+export const APPROVAL_TEXT = {
+  /** 人工审批批了会怎样，按运行类别说 */
+  outcome: (runClass: 'formal' | 'exploratory' | null | undefined, approve: boolean) => (runClass === 'formal'
+    ? `从已发布版本发起，${approve ? '批准' : '提交'}后继续运行`
+    : `${approve ? '批准后输出' : '提交后继续运行'}，这是探索运行，不是正式出具`),
+  reportHead: (label: string) => `报告「${label}」的核对`,
+  noNumbers: '报告中没有需要核对的数字',
+  /** 节点里当场裁判过（正式运行开了结论句裁判）：判了几句、几句证据相矛盾、几句没判成 */
+  claimsJudged: (judged: number, contradicted: number, unjudged: number) =>
+    `结论句已裁判 ${formatNumber(judged)} 句，证据相矛盾 ${formatNumber(contradicted)} 句`
+    + (unjudged ? `，未裁判 ${formatNumber(unjudged)} 句` : ''),
+  claimsNone: '报告中没有需要裁判的结论句',
+  claimsPending: '结论句尚未核对',
+  /** 探索运行、报告没开结论句裁判：按需裁判要等运行结束封存之后。开了裁判的报告交给审批时会在节点里当场判，不走这句 */
+  claimsLater: '这份报告没有开启结论句裁判，运行结束后可在证据中逐句请模型判断；开启后，交给审批的报告会在批准前判完',
+  /** 开了结论句裁判、却没在节点里判（这条规则之前的探索运行）：按需裁判要等运行结束封存之后 */
+  claimsAfterRun: '这次没有在节点内裁判，运行结束后可在证据中逐句请模型判断',
+  /** 正式运行、报告没开结论句裁判 */
+  claimsOff: '这份报告没有开启结论句裁判',
+  openEvidence: '查看逐段证据',
+  closeEvidence: '收起证据',
+  docLoading: '正在加载报告文档…',
+  docMissing: '无法获取报告文档',
 }
 
 /**
@@ -201,6 +230,19 @@ export function evidenceTally(cited: number, total: number, other = 0): string {
   }
   if (other > 0) parts.push(`${total > 0 ? '另有 ' : ''}${formatNumber(other)} 处引用无法解析`)
   return parts.join(' · ')
+}
+
+/**
+ * 缺失断言：证据目录有省略时，报告写了「没有查到」「不存在」「缺失」这类结论（违规 absence_claim，重写后仍有时
+ * 报告节点另发日志 report_absence_claim）。证据面板的违规清单和运行时间线共用这一套说法
+ */
+export const ABSENCE_CLAIM_TEXT = {
+  label: '缺失断言',
+  hint: '写作模型没有看到全部证据：被省略的查询仍在证据台账里，看不到不等于不存在，这类结论应写作「本报告未覆盖」。'
+    + '报告照常产出，这一处只标注、不判失败',
+  title: (n?: number) => `报告写了${n ? ` ${formatNumber(n)} 处` : ''}缺失断言，已标注（证据目录有省略）`,
+  next: '被省略的查询仍在证据台账里，可在证据面板中查看。请在报告撰写节点的指令中要求未展开的方向写作「本报告未覆盖」，'
+    + '或换用上下文窗口更大的写作模型后重新运行',
 }
 
 /** 证据面板和证据条的文案 */
@@ -609,6 +651,24 @@ export const JUDGE_ON_UNSUPPORTED_LABEL: Record<string, string> = {
 }
 
 /** 设置页「证据裁判」一组（后端 engine/judge.py 的 JUDGE_DEFAULTS） */
+/** 运行的金额。有调用的模型不在价格目录中时金额估不出来，不写「$0」（看着像没花钱） */
+export const COST_TEXT = {
+  unpriced: '金额无法估算',
+  /** 悬停说明，n 是估不出金额的调用次数 */
+  unpricedTitle: (n: number) => `${formatNumber(n)} 次调用的模型不在价格目录中，金额无法估算，未计入`,
+} as const
+
+/**
+ * 运行级金额的写法。unpriced 是估不出金额的调用次数：一分都没估出来写「金额无法估算」，估出了一部分写「≥ $x」；
+ * 运行中（approx）只算已上报的调用，也写「≥」。没有金额返回 null，由调用方写占位
+ */
+export function runCostText(usd: number | null | undefined, unpriced: number, approx = false): string | null {
+  const known = typeof usd === 'number' && Number.isFinite(usd)
+  if (unpriced > 0 && !(known && usd > 0)) return COST_TEXT.unpriced
+  if (!known) return null
+  return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
+}
+
 export const JUDGE_SETTING_TEXT = {
   label: '证据裁判',
   hint: '报告中的结论句（如「增长主要来自新客首单」）由另一个模型按证据逐句判断：正式运行由报告撰写节点当场裁判，探索运行在点击时逐句裁判。判断由模型给出，不是系统核对，界面上一律标注「非确定」。',
@@ -2657,4 +2717,7 @@ export const COPILOT_CONTEXT_TEXT = {
   withFields: (n: number) => `参考了 ${formatNumber(n)} 张表的字段`,
   namesOnly: (n: number) => `另有 ${formatNumber(n)} 张表只提供了表名`,
   notPicked: '未能按需求挑选',
+  /** 没有数据目录的大库：只有一个数据源时说「这个数据源」，几个时点名 */
+  noCatalog: (who: string | null) => `${who ?? '这个数据源'}还没有数据目录，起草后挑表和 SQL 检查会更准`,
+  toCatalog: '去数据目录起草',
 }

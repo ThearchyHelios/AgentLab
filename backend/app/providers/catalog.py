@@ -229,6 +229,22 @@ def find_context(model: str) -> int | None:
     return None
 
 
+def unpriced_call(data: Any) -> bool:
+    """一次模型调用（llm.end 的数据）的金额估不出来：用了 token，模型却不在价格目录里，estimate_cost 只能给 0。
+
+    这时写 $0 像是没花钱（真实运行里上百次调用、上百万 token，运行页写着 $0）。本地模型在目录里标的是 0 价，
+    不算估不出来。事件自己标了 unpriced 的以它为准。"""
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("unpriced"), bool):
+        return data["unpriced"]
+    tokens = sum(v for v in (data.get("input_tokens"), data.get("output_tokens"))
+                 if isinstance(v, (int, float)) and not isinstance(v, bool))
+    model = data.get("model")
+    return tokens > 0 and isinstance(model, str) and bool(model) and not data.get("cost_usd") \
+        and find_pricing(model) is None
+
+
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """按目录价估算一次调用的花费（美元）。"""
     pricing = find_pricing(model)

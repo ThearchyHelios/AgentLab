@@ -98,8 +98,12 @@ MISSING_MAX = 30
 #: 判定的规则版本：新判的判定带着它（rule_version），也进 request_key。报告节点的断点里换了规则的旧判定不复用；
 #: 按需裁判遇到早于当前规则的判定（没有版本、版本更小、旧取值 unsupported）重判一次
 RULES_VERSION = 2
-#: 一次调用最多判几句：再多，4096 个输出令牌装不下每句一条判定加理由
-BATCH_SIZE = 40
+#: 一次调用最多判几句。以前是 40：真实运行里推理模型拿着 40 句的摘录 30 秒没回来，整份报告一句都没判成
+#: （同一个模型 5 句一批 3 秒多就回来了）。批小了，超时最多丢掉没回来的那几批
+BATCH_SIZE = 8
+#: 一波最多几批同时问：几批共用剩下的时长，句数上限内的句子一两波就判完。第一批单独问：接入调不通（鉴权、
+#: 网关挂了）时只撞这一次，不让一整波一起失败
+PARALLEL_BATCHES = 4
 MAX_TOKENS = 4096
 #: 证据摘录：SQL 前几个字、每次查询最多几行几列、每段知识库片段最多几个字、整份引用的检索给几段。
 #: 列数上限只管没被引用的列：句子引用的格子所在的列一律给（遮罩的除外），再用别的列补满到这么多列
@@ -1180,80 +1184,102 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         emit(EventType.LOG, level="warn", code="judge_unpriced", message=note)
 
     spent = 0.0
+    width = 1
     while pending:
         remaining = None if budget.timeout_s is None else budget.timeout_s - (time.monotonic() - started)
         if remaining is not None and remaining <= 0:
             stop(pending, "timeout_s")
             break
-        batch = pending[:BATCH_SIZE]
-        cost = request.cost(model_id, batch) if priced else None
-        if cost is not None:
-            caps = []
-            if budget.max_cost_usd is not None:
-                caps.append((budget.max_cost_usd - spent, "max_cost_usd"))
-            if budget.daily_max_usd is not None:
-                caps.append((budget.daily_max_usd - (await daily_spend())["usd"], "daily_max_usd"))
-            if caps:
-                cap, binding = min(caps, key=lambda x: x[0])
-                trimmed = False
-                while batch and (cost := request.cost(model_id, batch) or 0.0) > cap + 1e-12:
-                    batch, trimmed = batch[:-1], True       # 按优先级从后往前丢：先判挂了依据的
-                if not batch:
-                    stop(pending, binding)
-                    break
-                if trimmed:
-                    # 这一批已经是剩下的钱装得下的最多句子，后面的句子更装不下
-                    stop(pending[len(batch):], binding)
-                    pending = pending[:len(batch)]
-        pending = pending[len(batch):]
-        charged = cost or 0.0
-        day = await _charge(charged, limit=budget.daily_max_usd if priced else None, priced=priced)
-        if day is None:          # 估算之后、记账之前别的裁判先花掉了今天剩下的钱
-            stop([*batch, *pending], "daily_max_usd")
-            break
-        estimated += charged
-        began = time.perf_counter()
-        emit(EventType.LLM_START, model=model_id, structured=True, purpose="judge", message_count=2,
-             units=len(batch))
-        items: list[Any] | None = None
-        raws: list[BaseMessage] = []
-        problem: str | None = None
-        calls = 1
-        try:
-            async with asyncio.timeout(remaining):
-                items, raws, problem, calls = await _ask(model, request.messages(batch))
-        except TimeoutError:
-            problem = "timeout_s"
-        tokens = [_usage_of(r, model_id) for r in raws]
-        inp, out = sum(t["input_tokens"] for t in tokens), sum(t["output_tokens"] for t in tokens)
-        # 回复没带用量（有的网关不给、调用超时）就按估算记：宁可多记，不能让每日上限漏掉
-        actual = (pricing.estimate_cost(model_id, inp, out) if inp or out else charged) if priced else 0.0
-        await _settle(day, actual - charged)
-        spent += actual
-        usage["input_tokens"] += inp
-        usage["output_tokens"] += out
-        usage["calls"] += calls
-        usage["cost_usd"] += actual
-        end = {"model": model_id, "purpose": "judge", "duration_ms": int((time.perf_counter() - began) * 1000),
-               "input_tokens": inp, "output_tokens": out, "total_tokens": inp + out, "cost_usd": round(actual, 6),
-               "calls": calls, "units": len(batch)}
-        if problem is not None and problem != "format":
-            reason = "timeout_s" if problem == "timeout_s" else "error"
-            detail = problem.partition(":")[2]
-            emit(EventType.LLM_END, **end, error=detail or _why_unjudged(reason, label, click=click))
-            if reason == "error":
-                # 调用本身失败（鉴权、网关挂了）：后面几批多半一样，不再一次次去撞
-                details["error"] = detail
-                stop([*batch, *pending], reason, detail)
+        # 一波最多 PARALLEL_BATCHES 批：逐批按金额上限定下来（这一波已经定下的按估算先占着），再一起问
+        wave: list[tuple[list[Candidate], float, Any]] = []
+        reserved = 0.0
+        while pending and len(wave) < width:
+            batch = pending[:BATCH_SIZE]
+            cost = request.cost(model_id, batch) if priced else None
+            if cost is not None:
+                caps = []
+                if budget.max_cost_usd is not None:
+                    caps.append((budget.max_cost_usd - spent - reserved, "max_cost_usd"))
+                if budget.daily_max_usd is not None:
+                    caps.append((budget.daily_max_usd - (await daily_spend())["usd"], "daily_max_usd"))
+                if caps:
+                    cap, binding = min(caps, key=lambda x: x[0])
+                    trimmed = False
+                    while batch and (cost := request.cost(model_id, batch) or 0.0) > cap + 1e-12:
+                        batch, trimmed = batch[:-1], True       # 按优先级从后往前丢：先判挂了依据的
+                    if not batch:
+                        stop(pending, binding)
+                        pending = []
+                        break
+                    if trimmed:
+                        # 这一批已经是剩下的钱装得下的最多句子，后面的句子更装不下
+                        stop(pending[len(batch):], binding)
+                        pending = pending[:len(batch)]
+            pending = pending[len(batch):]
+            charged = cost or 0.0
+            day = await _charge(charged, limit=budget.daily_max_usd if priced else None, priced=priced)
+            if day is None:          # 估算之后、记账之前别的裁判先花掉了今天剩下的钱
+                stop([*batch, *pending], "daily_max_usd")
+                pending = []
                 break
-            stop(batch, reason, detail)
-            continue
-        emit(EventType.LLM_END, **end)
-        if items is None:
-            stop(batch, "format")
-            continue
-        _take(items, batch, request, verdicts, judge=judge, post_seal=post_seal)
-        stop(batch, "missing")
+            estimated += charged
+            reserved += charged
+            wave.append((batch, charged, day))
+        if not wave:
+            break
+
+        began = time.perf_counter()
+        for batch, _, _ in wave:
+            emit(EventType.LLM_START, model=model_id, structured=True, purpose="judge", message_count=2,
+                 units=len(batch))
+        tasks = [asyncio.create_task(_ask(model, request.messages(batch))) for batch, _, _ in wave]
+        done, late = await asyncio.wait(tasks, timeout=remaining)
+        for task in late:
+            task.cancel()
+        if late:
+            await asyncio.gather(*late, return_exceptions=True)
+        failed: str | None = None
+        for (batch, charged, day), task in zip(wave, tasks):
+            items: list[Any] | None = None
+            raws: list[BaseMessage] = []
+            problem: str | None = None
+            calls = 1
+            if task in done:
+                items, raws, problem, calls = task.result()
+            else:
+                problem = "timeout_s"
+            tokens = [_usage_of(r, model_id) for r in raws]
+            inp, out = sum(t["input_tokens"] for t in tokens), sum(t["output_tokens"] for t in tokens)
+            # 回复没带用量（有的网关不给、调用超时）就按估算记：宁可多记，不能让每日上限漏掉
+            actual = (pricing.estimate_cost(model_id, inp, out) if inp or out else charged) if priced else 0.0
+            await _settle(day, actual - charged)
+            spent += actual
+            usage["input_tokens"] += inp
+            usage["output_tokens"] += out
+            usage["calls"] += calls
+            usage["cost_usd"] += actual
+            end = {"model": model_id, "purpose": "judge", "duration_ms": int((time.perf_counter() - began) * 1000),
+                   "input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
+                   "cost_usd": round(actual, 6), "calls": calls, "units": len(batch)}
+            if problem is not None and problem != "format":
+                reason = "timeout_s" if problem == "timeout_s" else "error"
+                detail = problem.partition(":")[2]
+                emit(EventType.LLM_END, **end, error=detail or _why_unjudged(reason, label, click=click))
+                if reason == "error":
+                    # 调用本身失败（鉴权、网关挂了）：后面几批多半一样，不再一次次去撞
+                    details["error"] = failed = detail
+                stop(batch, reason, detail)
+                continue
+            emit(EventType.LLM_END, **end)
+            if items is None:
+                stop(batch, "format")
+                continue
+            _take(items, batch, request, verdicts, judge=judge, post_seal=post_seal)
+            stop(batch, "missing")
+        if failed is not None:
+            stop(pending, "error", failed)
+            break
+        width = PARALLEL_BATCHES
 
     for c in request.cands:              # 兜底：每个候选都有判定
         verdicts.setdefault(c.unit, _unjudged("missing", _why_unjudged("missing", label), judge=judge,

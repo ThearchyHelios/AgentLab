@@ -837,11 +837,15 @@ class RunManager:
             run = await session.get(Run, run_id)
             if run:
                 timing = await _timing(session, run, elapsed_ms, now)
+                events_usage = await _usage_of_events(session, run_id)
                 if status != "succeeded":
                     # 状态里的用量只算跑完了的节点。失败、取消、停在审批上的那个节点已经
                     # 花出去的调用（校验修复、agent 的前几步）只在 llm.end 里——以前这部分
                     # 在运行记录上凭空消失，失败的运行看着像没花钱
-                    usage = _spent(usage, await _usage_of_events(session, run_id))
+                    usage = _spent(usage, events_usage)
+                elif events_usage.get("unpriced_calls"):
+                    # 金额估不出来的调用只有 llm.end 数得出（状态里的用量只有金额，0 分不出是免费还是没价）
+                    usage = {**usage, "unpriced_calls": events_usage["unpriced_calls"]}
                 # duration_ms 是各段执行时长之和（= active_ms）。以前用这一段的耗时
                 # 覆盖它：87 秒、中间等过一次审批的运行，列表上写着 22ms
                 usage.update(duration_ms=timing["active_ms"], **timing)
@@ -1251,13 +1255,20 @@ async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
     rows = await session.execute(
         select(RunEvent.data).where(RunEvent.run_id == run_id, RunEvent.type == EventType.LLM_END)
     )
+    from app.providers.catalog import unpriced_call
+
     total: dict[str, Any] = dict.fromkeys(_USAGE_KEYS, 0)
+    unpriced = 0
     for (data,) in rows:
         for key in _USAGE_KEYS:
             value = (data or {}).get(key, 1 if key == "calls" else 0)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 total[key] += value
+        unpriced += unpriced_call(data)
     total["cost_usd"] = round(total["cost_usd"], 6)
+    if unpriced:
+        # 有几次调用的金额估不出来（模型不在价格目录里）：cost_usd 只是估得出的那部分，界面据此不写 $0
+        total["unpriced_calls"] = unpriced
     return total
 
 
@@ -1269,6 +1280,8 @@ def _spent(state_usage: dict[str, Any], events_usage: dict[str, Any]) -> dict[st
         mine, theirs = out.get(key) or 0, events_usage.get(key) or 0
         if isinstance(mine, (int, float)) and theirs > mine:
             out[key] = theirs
+    if events_usage.get("unpriced_calls"):
+        out["unpriced_calls"] = events_usage["unpriced_calls"]
     if "input_tokens" in out or "output_tokens" in out:
         out["total_tokens"] = int(out.get("input_tokens") or 0) + int(out.get("output_tokens") or 0)
     return out
