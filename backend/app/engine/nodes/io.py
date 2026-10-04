@@ -467,10 +467,10 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     里 ignore 一律当 degrade：没有哪道门禁查契约里的 claims，不能让它把用户要的底线拉低。
 
     报告节点写的是 judge 时，判定在文档里（按哈希取回的那份：判定是模型给的，出口复算不了，只能信封存的
-    文档）。正式运行在节点里判过：证据相矛盾的（contradicted，旧文档里的 unsupported 同样算）按 on_unsupported
+    文档）。节点里判过的（正式运行，以及交给人工审批的探索运行）：证据相矛盾的（contradicted，旧文档里的 unsupported 同样算）按 on_unsupported
     判档（报告节点和契约取更严的）；证据不足的（insufficient）记一条缺口——最多降档，不会不予出具，也不会
     完整出具；没判完的（裁判没跑成、触顶）把裁判摘要里的缺口照抄进来——不能判完整出具，也不当成「矛盾」。
-    探索运行按需裁判，这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
+    其余探索运行按需裁判，这里只标注。契约要 judge、报告节点却没开的，照实记缺口：出口替不了报告节点去裁判。
 
     数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
     包括跨着升级还没跑完的运行）一律不管，契约写了也只记一条缺口：报告生成于升级前，结论句未核对。
@@ -520,7 +520,7 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     inline = summary.get("mode") == "inline"
     flagged: dict[str, list[dict[str, Any]]] = {s: [] for s in ("contradicted", "insufficient", UNSUPPORTED, "partial")}
     if inline:
-        # 探索运行按需裁判的判定不在文档里（在封存之后追加的 evidence.judged 事件里），这里只数正式运行的
+        # 按需裁判的判定不在文档里（在封存之后追加的 evidence.judged 事件里），这里只数节点里判过的
         markdown = str((doc or {}).get("markdown") or "")
         for _, unit in iter_units(doc or {}):
             verdict = unit.get("verdict")

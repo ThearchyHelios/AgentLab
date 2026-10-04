@@ -80,9 +80,35 @@ _VAR_REF = re.compile(r"\bvars\s*\.\s*([\w-]+)")
 _JUDGE_KEYS = ("mode", "counts", "complete", "unjudged", "limits_hit")
 
 
+def reviewed_report_ids(spec: Any, human: Any) -> list[str]:
+    """一个人工审批节点审的是哪几份报告：上游直接连着的报告撰写节点，加上标题、说明里引用了正文的
+    （{{ nodes.<id>.text }}，或者报告的 assign_to 变量）。只看图，不看运行状态。
+
+    审批卡（_reviewed_reports）和报告节点（reviewed_by_human：要交给人审的报告，探索运行也在节点里判）
+    用的是同一套认法，两边说的「这份报告要人审」不会对不上。"""
+    from app.engine.schema import NodeType
+
+    config = human.config or {}
+    text = " ".join(json.dumps(config.get(key), ensure_ascii=False, default=str)
+                    for key in ("title", "message", "context", "draft") if config.get(key))
+    # 报告节点的 assign_to 也能把正文交给下游：{{ vars.<assign_to> }} 和 {{ nodes.<id>.text }} 一样算引用
+    by_var = {str(n.config.get("assign_to")): n.id for n in spec.nodes
+              if n.type == NodeType.REPORT and n.config.get("assign_to")}
+    nodes = spec.node_map()
+    wanted = ([e.source for e in spec.edges if e.target == human.id] + _NODE_REF.findall(text)
+              + [by_var[v] for v in _VAR_REF.findall(text) if v in by_var])
+    return [rid for rid in dict.fromkeys(wanted) if (n := nodes.get(rid)) is not None and n.type == NodeType.REPORT]
+
+
+def reviewed_by_human(spec: Any, report_id: str) -> bool:
+    """这份报告会不会交给人工审批（有审批节点审它，认法同 reviewed_report_ids）。"""
+    from app.engine.schema import NodeType
+
+    return any(report_id in reviewed_report_ids(spec, n) for n in spec.nodes if n.type == NodeType.HUMAN)
+
+
 def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any]]:
-    """这次审批审的报告各自的核对概况：上游直接连着的报告撰写节点，加上标题、说明里引用了正文的
-    （{{ nodes.<id>.text }}，或者报告的 assign_to 变量）。
+    """这次审批审的报告各自的核对概况（审的是哪几份见 reviewed_report_ids）。
 
     真实运行里报告有一句结论和证据相矛盾，审批人批准时完全不知道：审批卡只有正文。这里带上报告节点产出里的
     stats（同 report.checked）、结论句策略、裁判摘要和报告文档的工件 id，审批卡据此写核对概况、给打开证据的入口。
@@ -91,16 +117,9 @@ def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any
 
     spec = ctx.run.spec
     nodes = spec.node_map()
-    text = " ".join(json.dumps(ctx.config.get(key), ensure_ascii=False, default=str)
-                    for key in ("title", "message", "context", "draft") if ctx.config.get(key))
-    # 报告节点的 assign_to 也能把正文交给下游：{{ vars.<assign_to> }} 和 {{ nodes.<id>.text }} 一样算引用
-    by_var = {str(n.config.get("assign_to")): n.id for n in spec.nodes
-              if n.type == NodeType.REPORT and n.config.get("assign_to")}
-    wanted = ([e.source for e in spec.edges if e.target == ctx.node.id] + _NODE_REF.findall(text)
-              + [by_var[v] for v in _VAR_REF.findall(text) if v in by_var])
     outputs = state.get("nodes") or {}
     out: list[dict[str, Any]] = []
-    for rid in dict.fromkeys(wanted):
+    for rid in reviewed_report_ids(spec, ctx.node):
         node = nodes.get(rid)
         result = outputs.get(rid)
         if node is None or node.type != NodeType.REPORT or not isinstance(result, dict) \

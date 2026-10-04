@@ -122,11 +122,22 @@ async def test_formal_run_carries_the_judged_claims_to_the_approval():
     assert requested.data["reports"] == approval.payload["reports"]
 
 
-async def test_exploratory_run_says_claims_are_judged_on_demand():
+async def test_exploratory_report_under_approval_is_judged_in_the_node():
+    """要交给人审批的报告，探索运行也在节点里判：审批人据此拍板，批准前就该知道哪句结论站不住。
+    真实运行里探索运行的报告有一句和证据相矛盾，审批卡只能写「结论句尚未核对」——按需裁判要等封存
+    （运行结束）之后才能判，而封存前放开按需裁判会动证据清单的完整性约束，所以改在节点里当场判。
+    没有审批的探索运行照旧按需判，不在节点里花这笔钱（test_contract_judge.test_explore_runs_only_annotate）。"""
     _, approval = await paused(graph(gate={"title": "审核周报"}, claims="judge"), run_class="exploratory")
     [report] = approval.payload["reports"]
-    assert report["claims"] == "judge" and report["judge"]["mode"] == "on_demand"
-    assert report["judge"]["counts"]["contradicted"] == 0, "探索运行不在节点里判"
+    assert report["claims"] == "judge" and report["judge"]["mode"] == "inline"
+    assert report["judge"]["counts"]["contradicted"] == 1 and report["judge"]["counts"]["unjudged"] == 0
+
+
+async def test_report_quoted_in_the_approval_message_is_judged_in_the_node_too():
+    _, approval = await paused(graph(gate={"title": "审核", "message": "请看：{{ nodes.write.text }}"},
+                                     wire_report_to_gate=False, claims="judge"), run_class="exploratory")
+    [report] = approval.payload["reports"]
+    assert report["judge"]["mode"] == "inline" and report["judge"]["counts"]["contradicted"] == 1
 
 
 async def test_report_without_claims_policy_still_reports_numbers():

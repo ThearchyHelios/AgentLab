@@ -495,16 +495,15 @@ const APPROVAL = {
 
 /**
  * ?approval=report：探索运行里审一份报告。核对概况取 evidence-doc 夹具（7/12 数字有出处、1 处引用解析不了），
- * 结论句没在节点里判；?approval=report-formal：正式运行，节点里判过，1 句证据相矛盾
+ * 报告没开结论句裁判；?approval=report-formal：正式运行，节点里判过，1 句证据相矛盾
  */
 const APPROVAL_REPORT = {
   id: 'ap-2', run_id: evidenceFixture.run_id, node_id: 'review', mode: 'approve' as const,
   title: '本周周报可以发出吗？', status: 'pending', response: {},
   payload: {
     kind: 'human_node', message: '请审核本周周报。',
-    reports: [{ node_id: 'write', label: '写周报', stats: evidenceFixture.doc.stats, claims: 'judge',
-                doc_artifact: evidenceFixture.doc_artifact,
-                judge: { mode: 'on_demand', counts: { unjudged: 4 }, complete: false } }],
+    reports: [{ node_id: 'write', label: '写周报', stats: evidenceFixture.doc.stats, claims: 'off',
+                doc_artifact: evidenceFixture.doc_artifact }],
   },
   created_at: new Date(Date.now() - 120_000).toISOString().replace('Z', ''),
   workflow_name: '周报', node_label: '主管审批', run_class: 'exploratory' as const,
@@ -513,7 +512,7 @@ const APPROVAL_REPORT_FORMAL = {
   ...APPROVAL_REPORT, id: 'ap-3', run_class: 'formal' as const,
   payload: {
     ...APPROVAL_REPORT.payload,
-    reports: [{ ...APPROVAL_REPORT.payload.reports[0], stats: { ...evidenceFixture.doc.stats, numbers_cited: 12, uncited_numbers: 0, unresolved: 0 },
+    reports: [{ ...APPROVAL_REPORT.payload.reports[0], claims: 'judge', stats: { ...evidenceFixture.doc.stats, numbers_cited: 12, uncited_numbers: 0, unresolved: 0 },
                 judge: { mode: 'inline', counts: { supported: 5, contradicted: 1, unjudged: 0 }, complete: true } }],
   },
 }

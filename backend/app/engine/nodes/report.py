@@ -523,9 +523,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     judgement: dict[str, Any] | None = None
     if claims == CLAIMS_JUDGE:
+        from app.engine.nodes.human import reviewed_by_human
+
         judge_cfg = report_judge(spec, ctx.node)
-        if await _run_class(ctx.run.run_id) != "formal":
-            # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱
+        if await _run_class(ctx.run.run_id) != "formal" and not reviewed_by_human(spec, ctx.node.id):
+            # 探索运行默认按需裁判：点开哪句才判哪句，节点里不花这笔钱。要交给人工审批的报告例外：审批人据此
+            # 拍板，批准前就该知道哪句结论站不住；而按需裁判要等运行封存之后才能判，封存前放开会动证据清单的
+            # 完整性约束，所以这种报告探索运行也在节点里当场判（和正式运行同一条路）
             judgement = judging.on_demand(doc, on_unsupported=judge_cfg["on_unsupported"],
                                           rewrite_once=judge_cfg["rewrite_once"], writer_model=model_id)
         elif not (_fatal(blocking) and on_violation == "fail"):

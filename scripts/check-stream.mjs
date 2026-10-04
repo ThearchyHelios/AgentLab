@@ -958,8 +958,9 @@ await section('审批卡：审的报告的核对概况', async () => {
   check('报告的核对概况：标题写哪份报告', (await report.innerText()).includes('报告「写周报」的核对'))
   check('数字和证据条同一种说法', (await report.locator('[data-approval-report-numbers]').innerText())
     .includes('7/12 数字有出处 · 无证据 5 · 另有 1 处引用无法解析'), await report.locator('[data-approval-report-numbers]').innerText())
-  check('探索运行：结论句尚未核对，并说运行结束后才能逐句判断', (await report.locator('[data-approval-report-claims]').innerText())
-    .includes('结论句尚未核对') && (await report.innerText()).includes('运行结束后可在证据中逐句请模型判断'))
+  check('探索运行、报告没开裁判：结论句尚未核对，说明运行结束后可逐句判断、开启后会在批准前判完',
+    (await report.locator('[data-approval-report-claims]').innerText()).includes('结论句尚未核对')
+    && (await report.innerText()).includes('没有开启结论句裁判') && (await report.innerText()).includes('交给审批的报告会在批准前判完'))
   await report.locator('[data-approval-evidence]').click()
   await page.waitForSelector('[data-approval-evidence-doc] [data-evidence-doc]', { timeout: 6000 })
   check('查看逐段证据：卡里展开可点的报告文档，自带证据条', await report.locator('[data-evidence-doc] [data-seg]').count() > 0

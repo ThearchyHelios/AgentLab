@@ -40,7 +40,9 @@ function claimsLine(report: ApprovalReport, runClass: RunClass): { text: string;
   }
   return {
     text: APPROVAL_TEXT.claimsPending,
-    sub: runClass === 'formal' ? (report.claims === 'judge' ? undefined : APPROVAL_TEXT.claimsOff) : APPROVAL_TEXT.claimsLater,
+    sub: runClass === 'formal' ? (report.claims === 'judge' ? undefined : APPROVAL_TEXT.claimsOff)
+      // 开了裁判却没在节点里判的，只会是这条规则之前的探索运行（现在交给审批的报告探索运行也当场判）
+      : report.claims === 'judge' ? APPROVAL_TEXT.claimsAfterRun : APPROVAL_TEXT.claimsLater,
     warn: true,
   }
 }
