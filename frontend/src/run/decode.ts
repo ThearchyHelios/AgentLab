@@ -784,6 +784,22 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
       }
     }
+    case 'agent_field_truncated': {
+      // 结构化抽取两次都被截断（llm.py TRUNCATED_EXTRACT）：「结构化抽取没有完成：模型的输出额度在推理阶段就用完了
+      // （最后一次的额度为 32768 token），结构化结论没能写出来。5 个字段都记为空值（未以 0 代替）。可以……」。
+      // 字段数、额度读结构化字段（fields、max_tokens），不从原话里认；不说「稍后重试」——重试解决不了额度问题
+      const n = strs(d.fields).length || Number(message.match(/(\d+)\s*个字段都?记为空值/)?.[1] ?? 0)
+      const budget = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      return {
+        title: `模型的输出额度在推理阶段用完，${n ? `${n} 个` : ''}字段记为空值（未以 0 代替）`,
+        sub: `按出处抽取字段时输出被截断${budget ? `（已加大额度重试，最后一次为 ${formatNumber(budget)} token）` : ''}，`
+          + '结构化结论没能写出来',
+        next: '这些字段以空值传给下游，口径卡按缺少输入处理，报告不得据此断言没有数据。请为该 Agent 换用非推理模型'
+          + '（抽取沿用 Agent 的模型），或调大它的「最大输出 token」后重新运行',
+        fix: 'canvas',
+        fixField: 'max_tokens',
+      }
+    }
     case 'metric_incomplete': {
       // 结构化字段（metrics.py）：metric_name、reason（「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」）。
       // 老运行的日志没有这两个字段：只给不点名的标题，原话留在展开区，不从中文里解析

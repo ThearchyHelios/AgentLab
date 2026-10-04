@@ -1481,6 +1481,47 @@ await section('agent 字段按出处核对（可点击证据第二期）：抽�
   check('「抽取结果格式有误（不是对象）」：同样说「失败，N 个字段记为空值」，原因放副标题，不说「出处不存在」',
     notObject?.title === '按出处抽取字段失败，2 个字段记为空值（未以 0 代替）' && notObject?.sub === '抽取结果格式有误（不是对象）'
     && !notObject?.next?.includes('出处在查询结果中不存在'), `${notObject?.title} / ${notObject?.sub} / ${notObject?.next}`)
+  // 两次抽取都被截断（2026-10 一次运行：推理模型关不掉思考，4096 的额度在推理阶段就用完了）：单独的 code，
+  // 说清是额度问题、给出能做的下一步，不说「稍后重试」「去设置测试该模型」（llm.py TRUNCATED_EXTRACT、TRUNCATED_NEXT）
+  const TRUNCATED = '结构化抽取没有完成：模型的输出额度在推理阶段就用完了（最后一次的额度为 32768 token），结构化结论没能写出来。'
+    + '5 个字段都记为空值（未以 0 代替）。可以为该 Agent 换用非推理模型（抽取沿用 Agent 的模型），或者调大该 Agent 的「最大输出 token」后重新运行'
+  check('后端发截断警告的说法还是夹具里这一种', llmPy.includes('"agent_field_truncated"')
+    && llmPy.includes('结构化抽取没有完成：模型的输出额度在推理阶段就用完了（最后一次的额度为 {budget} token），"')
+    && llmPy.includes('"结构化结论没能写出来"') && llmPy.includes('可以为该 Agent 换用非推理模型（抽取沿用 Agent 的模型），或者调大该 Agent 的"')
+    && llmPy.includes('已把额度加大到 {bigger} token 重试一次'), '改了 llm.py 的说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const FIELDS5 = ['members', 'stores', 'coupons', 'redeemed', 'rate']
+  const cut = flatten(mod.decodeRun([
+    E(1, 'node.started', 'fetch', { node_type: 'agent', label: '会员专项' }),
+    E(2, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5, max_tokens: 16384 }),
+    E(3, 'llm.end', 'fetch', { agent: '会员专项', model: 'm1', purpose: 'cite_fields', duration_ms: 40000, output_tokens: 16384,
+      error: '输出被截断：16384 token 的输出额度用完了，结构化结论没有写完，已把额度加大到 32768 token 重试一次' }),
+    E(4, 'llm.start', 'fetch', { model: 'm1', structured: true, purpose: 'cite_fields', message_count: 5, max_tokens: 32768 }),
+    E(5, 'llm.end', 'fetch', { agent: '会员专项', model: 'm1', purpose: 'cite_fields', duration_ms: 80000, output_tokens: 32768,
+      error: '输出被截断：32768 token 的输出额度用完了，结构化结论没有写完' }),
+    E(6, 'log', 'fetch', { level: 'warn', code: 'agent_field_truncated', message: TRUNCATED, fields: FIELDS5, max_tokens: 32768 }),
+    E(7, 'node.finished', 'fetch', { duration_ms: 125000 }),
+  ]))
+  const tr = cut.find((s) => s.code === 'agent_field_truncated')
+  check('agent_field_truncated：标题说额度在推理阶段用完、几个字段记为空值', tr?.title === '模型的输出额度在推理阶段用完，5 个字段记为空值（未以 0 代替）', tr?.title)
+  check('……副标题说抽取时输出被截断、重试到的额度（读 max_tokens 字段）',
+    tr?.sub === '按出处抽取字段时输出被截断（已加大额度重试，最后一次为 32,768 token），结构化结论没能写出来', tr?.sub)
+  check('……下一步：换非推理模型或调大最大输出 token；不说稍后重试，不叫人去测试模型',
+    !!tr?.next?.includes('非推理模型') && !!tr?.next?.includes('「最大输出 token」') && !tr?.next?.includes('稍后重试')
+    && !tr?.next?.includes('测试') && !!tr?.next?.includes('不得据此断言没有数据'), tr?.next)
+  check('……入口打开该 Agent 的设置、落到最大输出 token；是提醒（warn），原话留在展开区',
+    tr?.fix === 'canvas' && tr?.fixField === 'max_tokens' && tr?.level === 'warn' && tr?.detail === TRUNCATED,
+    `${tr?.fix} ${tr?.fixField} ${tr?.level}`)
+  const tries = cut.filter((s) => s.kind === 'llm')
+  check('……两次抽取各成一行，第一次的展开区写明已加大额度重试', tries.length === 2
+    && !!tries[0].detail?.includes('已把额度加大到 32768 token 重试一次') && !!tries[1].detail?.includes('结构化结论没有写完'),
+    tries.map((s) => s.detail).join(' | '))
+  check('……节点本身照样成功', cut.find((s) => s.kind === 'node')?.status === 'done')
+  const bareCut = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'agent' }),
+    E(2, 'log', 'x', { level: 'warn', code: 'agent_field_truncated', message: '结构化抽取没有完成。3 个字段都记为空值（未以 0 代替）' })]))
+    .find((s) => s.code === 'agent_field_truncated')
+  check('……缺 fields、max_tokens 字段时字段数从原话里认，不出 undefined',
+    bareCut?.title === '模型的输出额度在推理阶段用完，3 个字段记为空值（未以 0 代替）'
+    && bareCut?.sub === '按出处抽取字段时输出被截断，结构化结论没能写出来', `${bareCut?.title} / ${bareCut?.sub}`)
   const node = mod.decodeRun([E(1, 'node.started', 'fetch', { node_type: 'agent' }), E(2, 'node.finished', 'fetch', { duration_ms: 1 })])
   check('对照：普通 agent 节点不多出任何行', flatten(node).filter((s) => s.kind !== 'node').length === 0)
   const odd = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'agent' }),
