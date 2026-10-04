@@ -152,6 +152,11 @@ NODE_REFERENCE = """\
   查不到的记空值、不兜底成 0。assign_to 拿到的就是核对过的对象，口径卡直接写 vars.<assign_to>.字段。
   只写 output_schema 不开 cite_fields 不生效。**不要用 transform 解析 agent / llm 的文字**：模型写的 JSON
   常夹着没转义的引号，解析一失败整个节点就失败，也核对不了出处
+  **agent 查库时**，prompt 里写明查询结果列用中文别名（AS 月份、AS 曝光量）：报告用 [[table:]] 生成的表格表头、
+  [[v:]] 引用、口径卡的 cell() 都用这个列名，写成英文缩写的原始列名读的人看不懂。中文别名按数据源的方言
+  加标识符引号：MySQL / MariaDB 用反引号（AS `月份`），PostgreSQL、Oracle、SQLite 用双引号（AS "月份"），不要用
+  单引号（那是字符串）。只给最外层 SELECT 的结果列起别名，WHERE、JOIN、GROUP BY 里照旧写原列名；Oracle 旧版本
+  的标识符最长 30 字节，别名不超过 10 个字
   **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
   步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
   上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
@@ -1463,6 +1468,22 @@ _DATEPART_ARG = re.compile(
 _WINDOW_NAME = re.compile(r"(?:\bwindow|,)\s*([A-Za-z_][\w$#]*)\s+as\s*\(", re.I)
 
 
+def _blank_unicode_identifiers(sql: str) -> str:
+    """带引号、名字里有非 ASCII 字符的标识符（中文别名 AS "月份"、AS `曝光量`）连引号一起换成空格。
+
+    这项核对只认 ASCII 的列名，中文名本来就不判；不抹掉的话，SQL 里一出现带引号的标识符就整条放弃核对，照「结果列
+    起中文别名」写的 SQL 会把猜错的英文列名一起放过去。英文的带引号标识符（"StatDate"）大小写、空格都可能，照旧不判。"""
+    from app.data.guard import _GENERIC, _tokens
+
+    out = []
+    for token in _tokens(sql, _GENERIC):
+        if token.kind == "ident" and not token.text.isascii():
+            out.append(" " * len(token.text))
+        else:
+            out.append(token.text)
+    return "".join(out)
+
+
 def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:
     """SQL 里用到、数据源结构里查不到的列：(查不到的列, 这几张表的全部列)。判断不了、或者都查得到时返回 None。"""
     from app.data import introspect as _introspect
@@ -1471,7 +1492,7 @@ def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | 
     cache = getattr(source, "schema_cache", None) or {}
     if not cache.get("tables") or cache.get("failed") or first_verb(sql) != "select":
         return None
-    text = re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S)
+    text = _blank_unicode_identifiers(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S))
     if '"' in text.replace("''", "") and _blank_quoted(text) != _blank_quoted(text, identifiers=False):
         return None                                   # 引号括起来的标识符：大小写、空格都可能，不猜
     text = _blank_quoted(text)
