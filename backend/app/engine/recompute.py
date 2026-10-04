@@ -25,7 +25,10 @@ round（和 metrics.run_metrics 一样只 round 浮点），渲染走 evidence.r
 别的原样交回。排除行时有两种例外，都只能说不知道（unsupported），不能报「无变化」：
 - 指标的某个输入对不上任何快照（完整值找不回来的容器、加工过的结果、按位置从结果里取的一格、由查询结果算出来的数），
   它可能就是从被排除了行的那份结果来的，重算不了。写它的节点在那份快照交回之前就跑完了的，影响不到它，照常不算
-- 决定取哪一格的容器（cell(nodes.q, len(vars.res.rows) - 1, …) 里的 vars.res.rows）少了几行：取到的是哪一格说不准
+- 决定取哪一格的容器（cell(nodes.q, len(vars.res.rows) - 1, …) 里的 vars.res.rows）少了几行：取到的是哪一格说不准。
+  这种容器也就不给可勾的行段（勾了只能说不知道）；决定取哪一格的单格照给，勾掉它确定是排除后无法计算
+给了新值的以新值为准：只嵌在给了新值的引用里的输入（cell(…) 那一格给了新值，它行号里的 vars.res.rows）取到哪一格
+已无关紧要，它那一行排除了、它说不准受不受影响都不碍事（_Plan.moot）。
 """
 from __future__ import annotations
 
@@ -166,6 +169,18 @@ class _Plan:
     tops: list[str] = field(default_factory=list)
     inputs: dict[str, _Input] = field(default_factory=dict)
     problem: str | None = None
+    #: 嵌在别的引用里的输入 → 包着它的最外层引用（_refs）
+    within: dict[str, set[str]] = field(default_factory=dict)
+
+    def settled(self, path: str, changes: Changes) -> bool:
+        """包着这个输入的最外层引用都给了新值：它决定取哪一格已无关紧要，那几个引用以新值为准。"""
+        outer = self.within.get(path)
+        return bool(outer) and all(top in changes.inputs for top in outer)
+
+    def moot(self, path: str, changes: Changes) -> bool:
+        """这个输入这次用不上：只嵌在别的引用里，包着它的又都给了新值。它那一行排除了、它说不准受不受影响，都碍不着
+        重算。它自己也是最外层引用的不算：那一处照常拿它的值。"""
+        return path not in self.tops and self.settled(path, changes)
 
     @property
     def blocked(self) -> tuple[str, str] | None:
@@ -234,50 +249,54 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
         tree, _, _ = parse_expression(expr)
     except ExpressionError as e:
         return _Plan(metric, problem=f"表达式有误（{e}）")
-    tops, nested = _refs(tree)
-    remaining = _remaining(metric.get("substituted"), [*tops, *nested])
+    tops, within = _refs(tree)
+    remaining = _remaining(metric.get("substituted"), [*tops, *within])
     inputs: dict[str, _Input] = {}
     for item in items:
         if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"] not in inputs:
-            inputs[item["path"]] = _restore(item, remaining, nested, store)
-    plan = _Plan(metric, tree, tops, inputs)
+            inputs[item["path"]] = _restore(item, remaining, set(within), store)
+    plan = _Plan(metric, tree, tops, inputs, within=within)
     if lost := [p for p in tops if p not in inputs]:
         plan.problem = f"口径卡缺少输入 {'、'.join(lost[:3])} 的记录，不能推演"
     return plan
 
 
-def _refs(tree: ast.AST) -> tuple[list[str], set[str]]:
-    """表达式引用的值：(最外层的引用, 嵌在别的引用里面的)。和 leaf_refs 按同一套规则认引用，只多分一下里外：
-    vars.rows[vars.i] 里的 vars.i、cell(nodes.q, vars.r, 'gmv') 里的 vars.r 是嵌在里面的，它们决定取哪一格。"""
+def _refs(tree: ast.AST) -> tuple[list[str], dict[str, set[str]]]:
+    """表达式引用的值：(最外层的引用, 嵌在别的引用里面的 → 包着它的最外层引用)。和 leaf_refs 按同一套规则认引用，
+    只多分一下里外：vars.rows[vars.i] 里的 vars.i、cell(nodes.q, vars.r, 'gmv') 里的 vars.r 是嵌在里面的，它们决定
+    取哪一格。嵌了几层的也记最外层那个：重算时只有最外层的引用拿值（_evaluate），给了新值的就是它们。"""
     top: list[str] = []
-    inner: set[str] = set()
+    within: dict[str, set[str]] = {}
 
-    def add(node: ast.AST, nested: bool) -> None:
+    def add(node: ast.AST, outer: str | None) -> str:
+        """记下这个引用，交回它里面的引用归谁：已经嵌在里面的归原来那个最外层引用，最外层的归它自己。"""
         path = ast.unparse(node)
-        if nested:
-            inner.add(path)
-        elif path not in top:
+        if outer is not None:
+            within.setdefault(path, set()).add(outer)
+            return outer
+        if path not in top:
             top.append(path)
+        return path
 
-    def visit(node: ast.AST, nested: bool) -> None:
+    def visit(node: ast.AST, outer: str | None) -> None:
         if _cell_call(node):
-            add(node, nested)
+            owner = add(node, outer)
             for arg in node.args[1:]:
-                visit(arg, True)
+                visit(arg, owner)
             return
         if isinstance(node, (ast.Attribute, ast.Subscript, ast.Name)) and _chain_root(node):
-            add(node, nested)
+            owner = add(node, outer)
             cur: ast.AST = node
             while isinstance(cur, (ast.Attribute, ast.Subscript)):
                 if isinstance(cur, ast.Subscript):
-                    visit(cur.slice, True)
+                    visit(cur.slice, owner)
                 cur = cur.value
             return
         for child in ast.iter_child_nodes(node):
-            visit(child, nested)
+            visit(child, outer)
 
-    visit(tree, False)
-    return top, inner
+    visit(tree, None)
+    return top, within
 
 
 def _remaining(substituted: Any, paths: list[str]) -> set[str]:
@@ -556,13 +575,13 @@ def _doubt(plan: _Plan, changes: Changes, sources: Sources) -> str | None:
     数组字段的完整值找不回来时也知道它用到哪几行，排除了那几行就算碰到了它（指标因它还原不了而推演不了）。
     别的输入——完整值找不回来的容器、对不上任何快照的容器（加工过的结果）、不是直接取自快照的数（按位置从整份结果里
     取的一格、transform 由查询结果算出来的数）——都可能来自被排除了行的那份结果，又重算不了，只能说不知道，不能拿
-    原值算出一个「无变化」或者一个不对应任何一份数据的数。给了新值的以新值为准；写它的节点在那份快照交回之前就跑完了
-    的，影响不到它（_after）。
+    原值算出一个「无变化」或者一个不对应任何一份数据的数。给了新值的以新值为准，只嵌在给了新值的引用里的也就无关紧要
+    （_Plan.moot）；写它的节点在那份快照交回之前就跑完了的，影响不到它（_after）。
     """
     if not changes.exclude:
         return None
     for path, inp in plan.inputs.items():
-        if path in changes.inputs or inp.snapshot is not None:
+        if path in changes.inputs or inp.snapshot is not None or plan.moot(path, changes):
             continue
         if any(_after(snapshot, inp, sources) for snapshot in changes.exclude):
             why = inp.problem or (DOUBT_UNMATCHED if inp.shape == "container" else DOUBT_DERIVED)
@@ -582,14 +601,16 @@ def _after(snapshot: str, inp: _Input, sources: Sources) -> bool:
 def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]], changes: Changes,
              doubt: str | None) -> tuple[str, Any, str | None]:
     """(status, 新值, 原因)。整个推演不了的（_Plan.blocked）到不了这里。排除后缺了的、说不准受不受影响的先说，
-    都没有才求值。"""
-    hit = [(path, inp) for path, inp in plan.inputs.items() if path in notes and path not in changes.inputs]
+    都没有才求值。只嵌在给了新值的引用里的输入（_Plan.moot）不论排除了什么都不碍事：那几个引用以新值为准。"""
+    hit = [(path, inp) for path, inp in plan.inputs.items()
+           if path in notes and path not in changes.inputs and not plan.moot(path, changes)]
     for path, inp in hit:
         if inp.row is not None:
             return "excluded", None, f"{EXCLUDED}：{path} 所在的第 {inp.row + 1} 行已排除"
     for path, inp in hit:
-        if inp.selector:
-            # 嵌在下标、cell() 行列里的容器少了几行：外面那个引用取到的是哪一格跟着变，卡上记的值不再作数
+        if inp.selector and not plan.settled(path, changes):
+            # 嵌在下标、cell() 行列里的容器少了几行：外面那个引用取到的是哪一格跟着变，卡上记的值不再作数。
+            # 包着它的引用都给了新值时，它只剩自己作为最外层引用的那一处（排除了哪几行是确定的），照常算
             return "unsupported", None, DOUBT.format(path=path, why=DOUBT_SELECTOR)
     if doubt:
         return "unsupported", None, doubt
@@ -741,11 +762,14 @@ def _editable(inp: _Input, *, blocked: bool) -> bool:
 def _row_span(inp: _Input) -> tuple[int, int] | None:
     """这个输入实际用到的快照行（含两端）：单格一行、数组字段一段、整份结果全部。排除别的行影响不到它，界面据此只让
     这几行可勾。遮罩的、还原不了的（完整值找不回来、快照读不出来，都记在 problem 里）不给：排除它们的行什么也推演
-    不出来。"""
+    不出来。决定取哪一格的数组字段、整份结果也不给：少了几行，外面那个引用取到哪一格说不准（_compute），勾了只能
+    说不知道，「不支持推演的输入」里又说它不能用。决定取哪一格的单格照给：勾掉它，确定是排除后无法计算。"""
     if inp.snapshot is None or inp.masked or inp.problem is not None:
         return None
     if inp.row is not None:
         return inp.row, inp.row
+    if inp.selector:
+        return None
     if inp.rows is not None:
         return inp.rows
     rows = inp.value.get("rows") if isinstance(inp.value, dict) else inp.value

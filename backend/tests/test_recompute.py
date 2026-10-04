@@ -6,7 +6,7 @@
 - 容器输入的还原：agent 数组字段（按 locator.rows 去掉被排除的行）、nodes.* 从节点产出、vars.* 只认 value_artifact
 - 遮罩列取来的输入既不给值、也不能拿来推演
 - 整个指标推演不了的（遮罩列、还原不了的输入、读不出来的快照、没记输入），不改动也照实说，输入一个都不让动
-- 排除了行却说不准受不受影响的指标，不报「无变化」
+- 排除了行却说不准受不受影响的指标，不报「无变化」，也不给勾了只能说不准的行段；给了新值的以新值为准
 - 不合法的请求抛 WhatIfError（接口回 422），说清哪里不对
 """
 from __future__ import annotations
@@ -484,15 +484,118 @@ def test_only_inputs_written_after_the_snapshot_came_back_are_doubted(finished, 
     assert (mixed["status"], mixed["changed"]) == (("unsupported", None) if doubted else ("unchanged", False))
 
 
+#: cell() 的行号由整份结果算出：取最后一行
+LAST_CELL = "cell(nodes.pull, len(vars.res.rows) - 1, 'amount')"
+LAST = lone("last", LAST_CELL, "40.0", 40.0, [
+    {**cell("pull", 3, "amount", 40.0), "path": LAST_CELL},
+    {**scalar("vars.res.rows", "[4 项]", node="parse"), "value_artifact": RES_ROWS}], decimals=1)
+
+
 def test_a_container_that_picks_the_cell_is_doubted_when_its_rows_are_excluded():
-    """cell() 的行号由整份结果算出（取最后一行）：排除了别的行，行号跟着变，取到的是哪一格说不准，不能报「无变化」。"""
-    path = "cell(nodes.pull, len(vars.res.rows) - 1, 'amount')"
-    card = lone("last", path, "40.0", 40.0, [
-        {**cell("pull", 3, "amount", 40.0), "path": path},
-        {**scalar("vars.res.rows", "[4 项]", node="parse"), "value_artifact": RES_ROWS}], decimals=1)
-    assert recompute(card["metrics"][0], Changes(), sources())["new"] == 40.0
-    [last] = whatif(card, Changes(exclude={S1: frozenset({1})}), sources())["metrics"]
-    assert last["status"] == "unsupported" and last["changed"] is None and "vars.res.rows" in last["reason"]
+    """排除了别的行，行号跟着变，取到的是哪一格说不准，不能报「无变化」。整份结果因此不给行段：勾了也推演不出来，
+    「不支持推演的输入」里又说它不能用。那一格自己那一行照给：勾掉它，确定是排除后无法计算。"""
+    assert recompute(LAST["metrics"][0], Changes(), sources())["new"] == 40.0
+    baseline = whatif(LAST, Changes(), sources())
+    assert [(i["path"], i.get("row_span")) for i in baseline["metrics"][0]["inputs"]] == [
+        (LAST_CELL, [3, 3]), ("vars.res.rows", None)]
+    assert [u["input"] for u in baseline["unsupported"]] == ["vars.res.rows"]
+    assert "取哪" in baseline["unsupported"][0]["reason"]
+    for row in (0, 1, 2):
+        [last] = whatif(LAST, Changes(exclude={S1: frozenset({row})}), sources())["metrics"]
+        assert last["status"] == "unsupported" and last["changed"] is None and "vars.res.rows" in last["reason"]
+    [last] = whatif(LAST, Changes(exclude={S1: frozenset({3})}), sources())["metrics"]
+    assert last["status"] == "excluded" and "第 4 行" in last["reason"]
+
+
+@pytest.mark.parametrize("rows", [{1}, {3}, {0, 1, 2, 3}])
+def test_an_explicit_value_on_the_picked_cell_settles_the_container_that_picks_it(rows):
+    """那一格给了新值：取到的是哪一格已无关紧要，以新值为准。排除整份结果里的行（哪怕连它自己那一行）照常算。"""
+    [last] = whatif(LAST, Changes(inputs={LAST_CELL: 100}, exclude={S1: frozenset(rows)}), sources())["metrics"]
+    assert (last["status"], last["new"], last["changed"]) == ("ok", 100, True), last
+
+
+def test_a_container_that_is_also_counted_keeps_only_the_count_once_the_cell_has_a_new_value():
+    """整份结果既拿来数行数、又决定取哪一格：那一格给了新值，它只剩数行数的那一处，排除了哪几行是确定的，照常算。"""
+    card = lone("both", f"len(vars.res.rows) + {LAST_CELL}", "len(vars.res.rows) + 40.0", 44.0, [
+        {**scalar("vars.res.rows", "[4 项]", node="parse"), "value_artifact": RES_ROWS},
+        {**cell("pull", 3, "amount", 40.0), "path": LAST_CELL}], decimals=1)
+    assert recompute(card["metrics"][0], Changes(), sources())["new"] == 44.0
+    [both] = whatif(card, Changes(exclude={S1: frozenset({1})}), sources())["metrics"]
+    assert both["status"] == "unsupported" and "vars.res.rows" in both["reason"]
+    [both] = whatif(card, Changes(inputs={LAST_CELL: 100}, exclude={S1: frozenset({1})}), sources())["metrics"]
+    assert (both["status"], both["new"]) == ("ok", 3 + 100), both
+
+
+#: 按第 2 行的区域取费率：费率写在查询之前（fetch），区域那一格决定取哪一项
+FEE = "vars.kpi.rates[cell(nodes.pull, 1, 'region')]"
+REGION = "cell(nodes.pull, 1, 'region')"
+
+
+@pytest.mark.parametrize("expression, substituted, value, after", [
+    # 区域那一格只用来取费率：费率给了新值，它就无关紧要
+    (f"{FEE} * 100", "0.05 * 100", 5.0, ("ok", 8.0)),
+    # 区域那一格另外还拿来数字数：那一处照常拿它的值，它那一行排除了照样算不出来
+    (f"len({REGION}) + {FEE} * 100", "len('华南') + 0.05 * 100", 7.0, ("excluded", None)),
+])
+def test_a_cell_that_picks_the_item_is_moot_once_the_item_has_a_new_value(expression, substituted, value, after):
+    """区域那一格所在的行排除了：取哪一项不知道，排除后无法计算。费率给了新值：取哪一项已无关紧要，照常算——
+    那一格另外还直接参与计算的除外。"""
+    card = lone("fee", expression, substituted, value, [scalar(FEE, 0.05), cell("pull", 1, "region", "华南")],
+                decimals=1)
+    timed = sources(returned={S1: 10}, finished={"fetch": 5})
+    assert recompute(card["metrics"][0], Changes(), timed)["new"] == value
+    [fee] = whatif(card, Changes(exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert fee["status"] == "excluded" and "第 2 行" in fee["reason"]
+    [fee] = whatif(card, Changes(inputs={FEE: 0.08}, exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert (fee["status"], fee["new"]) == after, fee
+
+
+@pytest.mark.parametrize("path, middle", [
+    ("vars.kpi.rates[vars.kpi.region]", []),
+    # 嵌了两层：区域名先换成区域代码再取费率，包着它的最外层引用照样是费率
+    ("vars.kpi.rates[vars.kpi.codes[vars.kpi.region]]", [scalar("vars.kpi.codes[vars.kpi.region]", "S")]),
+])
+def test_an_index_that_would_be_doubted_is_moot_once_the_item_has_a_new_value(path, middle):
+    """取哪一项由区域名决定，区域名是查询交回之后才算出来的（对不上快照）：排除行后取到的是哪一项说不准。费率给了
+    新值：区域名受不受影响已无关紧要，按剩下的行照常算。"""
+    card = lone("fee2", f"round({path} * sum(vars.kpi.amounts), 1)", "round(0.05 * sum(vars.kpi.amounts), 1)", 17.0,
+                [scalar(path, 0.05), *middle, scalar("vars.kpi.region", "华南", node="label"), AMOUNTS], decimals=1)
+    timed = sources(returned={S1: 10}, finished={"fetch": 5, "label": 12})
+    assert recompute(card["metrics"][0], Changes(), timed)["new"] == 17.0
+    [fee] = whatif(card, Changes(exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert fee["status"] == "unsupported" and "排除行对 vars.kpi.region 的影响无法确定" in fee["reason"]
+    [fee] = whatif(card, Changes(inputs={path: 0.1}, exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert (fee["status"], fee["new"]) == ("ok", round(0.1 * (340.0 - 80.0), 1)) == ("ok", 26.0), fee
+
+
+def test_an_index_shared_by_two_items_is_moot_only_when_both_have_new_values():
+    """费率和固定费都按区域名取：只给费率新值，固定费取到哪一项照样说不准；两样都给了才无关紧要。"""
+    rate, fixed = "vars.kpi.rates[vars.kpi.region]", "vars.kpi.fixed[vars.kpi.region]"
+    card = lone("fee4", f"round({rate} * sum(vars.kpi.amounts) + {fixed}, 1)",
+                "round(0.05 * sum(vars.kpi.amounts) + 3, 1)", 20.0,
+                [scalar(rate, 0.05), scalar("vars.kpi.region", "华南", node="label"), AMOUNTS, scalar(fixed, 3)],
+                decimals=1)
+    timed = sources(returned={S1: 10}, finished={"fetch": 5, "label": 12})
+    assert recompute(card["metrics"][0], Changes(), timed)["new"] == 20.0
+    [fee] = whatif(card, Changes(inputs={rate: 0.1}, exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert fee["status"] == "unsupported" and "vars.kpi.region" in fee["reason"]
+    [fee] = whatif(card, Changes(inputs={rate: 0.1, fixed: 5}, exclude={S1: frozenset({1})}), timed)["metrics"]
+    assert (fee["status"], fee["new"]) == ("ok", 31.0), fee
+
+
+def test_a_change_that_leaves_the_value_as_it_was_moves_nothing_downstream():
+    """改动碰到了指标，算出来却没变：4 行里排除 1 行，min(行数, 3) 还是 3；填回原值也一样。照实说无变化，下游也不会
+    受影响（maybe_changed 为假）。排除到只剩 2 行才变。"""
+    card = lone("cap", "min(len(vars.res.rows), 3)", "min(len(vars.res.rows), 3)", 3,
+                [{**scalar("vars.res.rows", "[4 项]", node="parse"), "value_artifact": RES_ROWS}])
+    result = whatif(card, Changes(exclude={S1: frozenset({3})}), sources())
+    [cap] = result["metrics"]
+    assert (cap["status"], cap["new"], cap["changed"], cap["inputs"][0]["excluded_rows"]) == ("ok", 3, False, [3])
+    assert result["maybe_changed"] is False
+    same = whatif(CARD, Changes(inputs={"vars.kpi.gmv": 45678.5}), sources(), metric="wow")
+    assert (same["metrics"][0]["status"], same["metrics"][0]["changed"], same["maybe_changed"]) == ("ok", False, False)
+    moved = whatif(card, Changes(exclude={S1: frozenset({0, 3})}), sources())
+    assert moved["metrics"][0]["new"] == 2 and moved["maybe_changed"] is True
 
 
 def test_a_metric_without_lineage_is_unsupported_whatever_changes():
@@ -503,6 +606,8 @@ def test_a_metric_without_lineage_is_unsupported_whatever_changes():
         assert old["status"] == "unsupported" and old["changed"] is None and "没有记录输入" in old["reason"]
 
 
+#: 按遮罩列那一格的长度取第几项
+PHONE_PICK = "vars.kpi.list[len(cell(nodes.crm, 0, 'phone')) - 10]"
 #: 整个指标推演不了的几种：(卡, Sources 的改动, 改点什么, 状态, 原因里该有的字)。每种都另有一个本来能改的输入
 BLOCKED = {
     # 老运行：容器型 vars 输入没存完整值
@@ -513,6 +618,11 @@ BLOCKED = {
     "masked": (lone("mix", "len(cell(nodes.crm, 0, 'phone')) + vars.kpi.k", "len('13800000000') + 2", 13,
                     [cell("crm", 0, "phone", "13800000000", artifact=S2), scalar("vars.kpi.k", 2)]),
                {}, Changes(inputs={"vars.kpi.k": 5}), "masked", ["遮罩"]),
+    # 遮罩列的那一格只嵌在下标里（决定取哪一项）：改了别的输入，取到哪一项照样露出它的长度
+    "masked_index": (lone("pick_m", f"{PHONE_PICK} + vars.kpi.k", "20 + 2", 22,
+                          [scalar(PHONE_PICK, 20), cell("crm", 0, "phone", "13800000000", artifact=S2),
+                           scalar("vars.kpi.k", 2)]),
+                     {}, Changes(inputs={"vars.kpi.k": 5}), "masked", ["遮罩"]),
     # 那一格所在的查询快照读不出来：遮没遮核对不了
     "unreadable": (lone("mix2", "cell(nodes.pull, 0, 'amount') + vars.kpi.k", "120.5 + 2", 122.5,
                         [cell("pull", 0, "amount", 120.5), scalar("vars.kpi.k", 2)], decimals=1),
@@ -638,6 +748,8 @@ def test_a_withheld_cell_inside_another_reference_stays_out_of_the_substituted_e
     [m] = whatif(card, Changes(), sources(load=lambda a: None if a == S1 else store.get(a)))["metrics"]
     assert m["status"] == "unchanged" and m["substituted"] is None
     assert [i.get("withheld") for i in m["inputs"]] == [None, True]
+    # 那一格所在的快照读不出来：它那一行也不给勾（排除读不出来的快照里的行，接口回 422）
+    assert "row_span" not in m["inputs"][1]
 
 
 # --------------------------------------------------------------------------

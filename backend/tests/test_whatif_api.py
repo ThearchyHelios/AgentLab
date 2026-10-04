@@ -811,6 +811,29 @@ async def test_inputs_carry_the_rows_they_use(client, monkeypatch):
     assert cell["row_span"] == [5, 5] and rows["row_span"] == [0, 9]
 
 
+async def test_a_container_that_picks_the_cell_offers_no_rows(client, monkeypatch):
+    """cell() 的行号由整份结果算出：整份结果不给行段（勾了别的行，取到哪一格说不准，什么也推演不出来），那一格
+    自己那一行照常可勾、勾了确定是排除后无法计算。那一格给了新值，取到哪一格已无关紧要，排除别的行照常算。"""
+    pick = "cell(nodes.fetch, len(vars.res.rows) - 5, 'amount')"
+    row = await run_graph(monkeypatch, query_graph(metrics=[
+        {"id": "pick", "name": "倒数第五单金额", "unit": "元", "decimals": 1, "format": "thousands", "expression": pick}]),
+        text="倒数第五单金额 [[m:pick]]。")
+    snapshot = await snapshot_of(row.id)
+    body = await whatif(client, row.id, {"card": "card"})
+    [m] = body["metrics"]
+    assert m["status"] == "unchanged" and m["old"] == 600.5
+    assert [(i["path"], i.get("row_span"), i["editable"]) for i in m["inputs"]] == [
+        (pick, [5, 5], True), ("vars.res.rows", None, False)]
+    assert [(u["input"], "取哪" in u["reason"]) for u in body["unsupported"]] == [("vars.res.rows", True)]
+    [m] = (await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [5]}}}))["metrics"]
+    assert m["status"] == "excluded" and "第 6 行" in m["reason"]
+    body = await whatif(client, row.id, {"card": "card", "report": "write",
+                                         "overrides": {"inputs": {pick: 1000}, "exclude_rows": {snapshot: [0]}}})
+    [m] = body["metrics"]
+    assert (m["status"], m["new"], m["rendered_new"]) == ("ok", 1000, "1,000.0元"), m
+    assert [(s["rendered_old"], s["rendered_new"]) for s in body["segments"]] == [("600.5元", "1,000.0元")]
+
+
 async def test_rows_of_a_sealed_snapshot_can_be_paged_with_masks_applied(client, monkeypatch, shop):
     """推演区里给整份结果勾行：按页取封存范围内快照的行，遮罩列写「已遮罩」。只读。"""
     row = await run_graph(monkeypatch, query_graph())
@@ -861,6 +884,24 @@ async def test_downstream_cards_through_an_intermediate_node_are_flagged(client,
     body = await whatif(client, row.id, {"card": "card", "overrides": {"inputs": {"vars.kpi.gmv": 120}}})
     [flagged] = body["affected_cards"]
     assert (flagged["node_id"], flagged["metrics"], flagged["direct"]) == ("yearly", ["year"], False)
+
+
+async def test_a_change_that_moves_no_metric_flags_no_downstream_card(client, monkeypatch):
+    """改动碰到了指标、算出来却没变（10 单里排除 2 单，min(单数, 3) 还是 3）：下游不会受影响，不标。排除到只剩 2 单
+    才变，这时才标。界面不会提交和原值一样的输入，排除行却常有这种情况（又如 max(…) 勾掉的不是最大值那一行）。"""
+    row = await run_graph(monkeypatch, query_graph(
+        metrics=[{"id": "cap", "name": "封顶单数", "unit": "单", "format": "thousands",
+                  "expression": "min(len(vars.res.rows), 3)"}],
+        between=[node("yearly", "metrics", caliber="年口径", metrics=[
+            {"id": "year", "name": "年化", "expression": "nodes.card.metrics[0].value * 52"}])]),
+        text="封顶单数 [[m:cap]]。")
+    snapshot = await snapshot_of(row.id)
+    body = await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [2, 7]}}})
+    [cap] = body["metrics"]
+    assert (cap["status"], cap["new"], cap["changed"], cap["inputs"][0]["excluded_rows"]) == ("ok", 3, False, [2, 7])
+    assert body["affected_cards"] == []
+    body = await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: list(range(8))}}})
+    assert body["metrics"][0]["new"] == 2 and [c["node_id"] for c in body["affected_cards"]] == ["yearly"]
 
 
 async def test_downstream_cards_are_flagged_when_the_change_cannot_be_followed(client, monkeypatch):
