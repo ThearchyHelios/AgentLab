@@ -95,6 +95,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # （记成空值，不兜底成 0）。答案能用，缺口要说清是哪一种
     "agent_field_mismatch": ("agent_field_mismatch", DEGRADED),
     "agent_field_unverified": ("agent_field_unverified", DEGRADED),
+    # 结构化抽取两次都被截断（输出额度在推理阶段就用完了）：字段都记空值，答案能用，缺口要说清是额度问题
+    "agent_field_truncated": ("agent_field_truncated", DEGRADED),
     # 结论句裁判（claims: judge）：触顶、没跑成的句子记为未裁判，出具不能判完整——是缺口，要说明
     "judge_limit": ("judge_limit", DEGRADED),
     "judge_failed": ("judge_failed", DEGRADED),
