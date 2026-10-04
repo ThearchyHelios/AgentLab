@@ -22,6 +22,7 @@ from app.engine.evidence import (
 from app.engine.expressions import (
     CellError,
     ExpressionError,
+    TruncatedUse,
     cell_parts,
     cell_value,
     eval_expression,
@@ -32,6 +33,7 @@ from app.engine.expressions import (
     substitute,
 )
 from app.engine.labels import field_label
+from app.engine.sql_problems import CHECK_FIELDS, QueryProblem, merge_problems, node_of, query_problems, reason_text
 from app.engine.state import GraphState, template_context
 
 
@@ -45,6 +47,12 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     每个指标还记下它是怎么来的：用到了哪些输入、各取自哪个节点、代入后的算式、
     拿代入式复算是否一致。整张卡落成 metric_set 工件，id 进证据台账——报告里的
     数字点开，一路能追到这里。
+
+    表达式把截断的查询结果当成整组用了（len、sum、max……，见 expressions.TruncatedUse）的指标，
+    值照算，但标 incomplete 并写明原因：它算的只是取回的那一截。出具契约据此降档（issuance.incomplete_gaps）。
+
+    取数的那条 SQL 对照数据目录查出 error 级问题的（查询快照的 checks，见 data/sqlcheck.py：一对多关联后重复计算、
+    存量跨期加总），同样值照算，标 sql_check_failed 并写明原因，出具契约据此降档（issuance.sql_check_gaps）。
     """
     definitions = ctx.cfg("metrics", []) or []
     caliber_raw, caliber_version = ctx.cfg("caliber", "") or ctx.node.title, str(ctx.cfg("caliber_version", "") or "v1")
@@ -67,6 +75,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     metrics: list[dict[str, Any]] = []
     errors: list[str] = []
+    #: 查询快照工件 id → 它（含合并查询的输入）没通过 SQL 检查的那几条查询。一张卡里多个指标常常取自同一次查询，
+    #: 快照只读一次
+    checked: dict[str, list[QueryProblem]] = {}
+    #: 指标 id → 它没通过 SQL 检查的那几条来源查询。运行日志按查询归并（_emit_sql_check_logs）
+    failed_by: dict[str, list[QueryProblem]] = {}
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
@@ -87,8 +100,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         missing = [path for path in paths if values[path] is None]
 
         value: Any = None
+        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
         try:
-            value = eval_expression(expr, tctx)
+            value = eval_expression(expr, tctx, track=use)
         except ExpressionError as e:
             errors.append(f"指标「{metric_id}」：表达式有误（{e}）")
             continue
@@ -117,6 +131,18 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if isinstance(value, float) and decimals is not None:
             value = round(value, decimals)
         substituted = substitute(tree, values)
+        incomplete: dict[str, Any] = {}
+        if use.sources:
+            sources = list(use.sources.values())
+            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(sources),
+                          "truncated_sources": sources}
+        inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
+        sql_check: dict[str, Any] = {}
+        if failed := _failed_queries(inputs, list(use.sources.values()), paths, tctx, checked):
+            sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
+                         "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
+                             code for p in found for code in p.codes))} for artifact, found in failed]}
+            failed_by[metric_id] = [p for _, found in failed for p in found]
         metrics.append(
             {
                 "id": metric_id,
@@ -127,12 +153,16 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "decimals": decimals,
                 "format": display["format"],
                 "rendered": _rendered(value, definition, display),
-                "inputs": [_input_of(path, values[path], state, ctx, tctx) for path in paths],
+                "inputs": inputs,
                 "substituted": substituted,
                 "recompute_ok": _recompute(substituted, tctx, value, decimals),
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
                 # 指标（原式就是 vars.x.y 而 y 不存在）以前也是照常产出一个 None
                 "status": "ok" if value is not None else "missing_input",
+                # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
+                **incomplete,
+                # 只在来源查询没通过 SQL 检查时出现，同上
+                **sql_check,
             }
         )
 
@@ -142,10 +172,20 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
-        f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
-        else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）"
+        (f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
+         else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）")
+        # 不写行数：叙述节点照抄进正文就是一个没有出处的数
+        + ("（不完整：基于被截断的查询结果计算）" if m.get("incomplete") else "")
+        + ("（存疑：所依据的查询未通过 SQL 检查）" if m.get("sql_check_failed") else "")
         for m in metrics
     ]
+    for m in metrics:
+        if m.get("incomplete"):
+            # 结构化字段（metric_name、reason、rows）给界面读，不让它从 message 里解析中文
+            ctx.emit(EventType.LOG, level="warn", code="metric_incomplete", metric=m["id"], metric_name=m["name"],
+                     reason=m["incomplete_reason"], rows=[s.get("rows") for s in m.get("truncated_sources") or []],
+                     message=f"指标「{m['name']}」{m['incomplete_reason']}")
+    _emit_sql_check_logs(metrics, failed_by, state, ctx)
     card = {
         "kind": "metric_set",
         "caliber": caliber,
@@ -305,6 +345,137 @@ def _value_of(path: str, tctx: dict[str, Any]) -> Any:
         return None
 
 
+def _incomplete_reason(sources: list[dict[str, Any]]) -> str:
+    """「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」：出具声明、运行日志、证据面板都用这句。"""
+    fetched = [f"前 {s['rows']} 行" for s in sources]
+    if len(fetched) == 1:
+        return f"基于被截断的查询结果计算（只取回了{fetched[0]}），结果不完整"
+    return f"基于 {len(fetched)} 份被截断的查询结果计算（分别只取回了{'、'.join(fetched)}），结果不完整"
+
+
+#: 取值链的最后一段：.字段 或 [下标]
+_LAST_STEP = re.compile(r"(?:\.[^.\[\]]+|\[[^\[\]]*\])$")
+
+
+def _failed_queries(inputs: list[dict[str, Any]], truncated: list[dict[str, Any]], paths: list[str],
+                    tctx: dict[str, Any], checked: dict[str, list[QueryProblem]],
+                    ) -> list[tuple[str, list[QueryProblem]]]:
+    """这个指标用到的查询里，SQL 检查有 error 的：[(查询快照工件 id, 没通过检查的查询)]。合并查询的快照对应它出问题的
+    那几个输入（sql_problems.query_problems）。
+
+    用到了哪些查询，三处来历合起来认：输入的出处（cell() 取的格、Agent 经 cite_fields 交来的字段都带着快照 id）、
+    截断跟踪记下的整组、取值链上的查询结果本身（数据整形解析过的 vars.res.rows[0][0]，往上找到 vars.res 那份
+    带 artifact 的结果）。检查结果从快照里读，不信内存里那份：快照按哈希寻址，就是查询当时存下的那份。
+    读不出来的快照不算（另有别的检查报快照的问题）。Agent 没开 cite_fields 时说不清数出自哪次查询，不算。
+    """
+    artifacts = [item.get("artifact") for item in inputs] + [s.get("artifact") for s in truncated]
+    artifacts += [_result_artifact(path, tctx) for path in paths if cell_parts(path) is None]
+    out = []
+    for artifact in dict.fromkeys(a for a in artifacts if isinstance(a, str) and a):
+        if artifact not in checked:
+            checked[artifact] = query_problems(artifact)
+        if checked[artifact]:
+            out.append((artifact, checked[artifact]))
+    return out
+
+
+def _result_artifact(path: str, tctx: dict[str, Any]) -> str | None:
+    """顺着取值链往上找（vars.res.rows[0][0] → vars.res.rows[0] → vars.res.rows → vars.res），第一个查询结果的快照 id。
+    数据源工具交回的是 JSON 文本（调用工具节点的输出），解析过的是对象（数据整形之后），两种都认。"""
+    current = path
+    for _ in range(8):
+        value = _value_of(current, tctx)
+        if isinstance(value, str) and value.lstrip().startswith("{") and '"artifact"' in value:
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = None
+        if isinstance(value, dict) and isinstance(value.get("artifact"), str) and isinstance(value.get("rows"), list):
+            return value["artifact"]
+        shorter = _LAST_STEP.sub("", current)
+        if not shorter or shorter == current:
+            return None
+        current = shorter
+    return None
+
+
+def _error_checks(artifact: str) -> list[dict[str, Any]]:
+    """这份查询快照对照数据目录查出的 error 级问题（合并查询顺着 inputs 往下找，见 sql_problems.query_problems）。"""
+    return [c for p in query_problems(artifact) for c in p.checks]
+
+
+def _sql_check_reason(failed: list[tuple[str, list[QueryProblem]]]) -> str:
+    """「所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），
+    结果不可靠」：出具声明、运行日志、证据面板都用这句。只摘问题那半句，改法留在查询步骤里看。"""
+    return reason_text(list(dict.fromkeys(text for _, found in failed for p in found for text in p.problems)))
+
+
+def _emit_sql_check_logs(metrics: list[dict[str, Any]], failed_by: dict[str, list[QueryProblem]],
+                         state: GraphState, ctx: NodeContext) -> None:
+    """没通过 SQL 检查的来源查询，一条一行运行日志（metric_sql_check），列出受它影响的指标。
+
+    以前一个指标一行：同一条查询算出三个指标，时间线上同一句话重复三遍。现在按出问题的那条查询归并。
+    结构化字段给界面读，不让它从 message 里解析中文：metrics / metric_names（受影响的指标）、reason、problems、
+    checks（不带 for_model）、query_artifact（出问题的查询快照）、source_node（跑这条查询的节点）、
+    source_field（要改的那一栏：调用工具节点写死的 SQL 在 args.sql；Agent 自己写的 SQL 没有可定位的栏，不给）。
+    界面据 source_node / source_field 把「打开设置」落到来源查询节点的 SQL 上，而不是口径卡。
+    """
+    names = {m["id"]: m["name"] for m in metrics}
+    groups: dict[str, tuple[QueryProblem, list[str]]] = {}
+    for metric_id, found in failed_by.items():
+        for problem in merge_problems(found):
+            held = groups.setdefault(problem.artifact, (problem, []))
+            if metric_id not in held[1]:
+                held[1].append(metric_id)
+    nodes = ctx.run.spec.node_map()
+    for artifact, (problem, ids) in groups.items():
+        source = problem.node_id or node_of(artifact, state.get("evidence"))
+        producer = nodes.get(source) if source else None
+        sql_in_args = producer is not None and str(producer.type) == "tool" \
+            and isinstance((producer.config.get("args") or {}), dict) and "sql" in (producer.config.get("args") or {})
+        reason = reason_text(problem.problems)
+        ctx.emit(EventType.LOG, level="warn", code="metric_sql_check",
+                 metric=ids[0], metrics=ids, metric_names=[names.get(i, i) for i in ids],
+                 reason=reason, problems=problem.problems,
+                 checks=[{k: c[k] for k in CHECK_FIELDS if k in c} for c in problem.checks],
+                 query_artifact=artifact,
+                 **({"source_node": source} if source else {}),
+                 **({"source_field": "args.sql"} if sql_in_args else {}),
+                 message="指标" + "".join(f"「{names.get(i, i)}」" for i in ids) + reason)
+
+
+def _truncated_field(path: str, state: GraphState, ctx: NodeContext) -> dict[str, Any] | None:
+    """agent 经 cite_fields 交来、被截断切开的数组字段：{rows, artifact}。别的取值链返回 None。
+
+    数组字段的出处是快照里的一段行（data_evidence 的 locator.rows = [a, b]）。cite_fields 核对时，这段行
+    到了截断快照的末行就记 truncated（llm._verify_rows）：快照后面还有没取回的行，可能也属于这个字段，
+    对它求和、计数算的就只是取回的那一截。停在末行之前的不记——引用的每一行都在快照里，截断拿不走其中
+    任何一行。标量字段是一格，不是聚合，也不记。取回的行数就是末行的行号加一。
+
+    路径怎么对到字段和 _input_of 一样：vars.X 找最后写它的节点，nodes.<agent> 下多走一层 data。
+    求值器只对取到列表的取值链问这里，一个指标问不了几次。
+    """
+    head = _REF_HEAD.match(path)
+    if not head or head.group(1) == "input":
+        return None
+    root, name, rest = head.groups()
+    field = rest.lstrip(".")
+    node_id = name if root == "nodes" else _writer_of(name, state, ctx)
+    producer = ctx.run.spec.node_map().get(node_id) if node_id and field else None
+    if producer is None or str(producer.type) != "agent":
+        return None
+    output = (state.get("nodes") or {}).get(producer.id)
+    evidence = output.get("data_evidence") if isinstance(output, dict) else None
+    key = _field_key(field)
+    if root == "nodes":
+        key = key[len("data."):] if key.startswith("data.") else ""
+    cited = evidence.get(key) if isinstance(evidence, dict) and key else None
+    rows = (cited.get("locator") or {}).get("rows") if isinstance(cited, dict) and cited.get("truncated") else None
+    if not (isinstance(rows, list) and len(rows) == 2 and isinstance(rows[1], int)):
+        return None
+    return {"rows": rows[1] + 1, "artifact": cited.get("artifact")}
+
+
 def _missing_reason(missing: list[str]) -> str:
     if not missing:
         return "有输入为空值，无法计算（请检查上游是否产出了这些字段）"
@@ -330,7 +501,7 @@ _REF_HEAD = re.compile(r"^(vars|nodes|input)\.([A-Za-z_一-鿿][\w\-一-鿿]*)(.
 _VIA = {"input": "input", "code": "code", "agent": "agent", "llm": "llm", "tool": "tool",
         "transform": "transform", "metrics": "metric", "retrieve": "retrieval", "loop": "loop",
         "human": "human", "validate": "validate", "supervisor": "team", "subgraph": "subgraph",
-        "memory": "memory"}
+        "memory": "memory", "merge": "merge"}
 
 
 def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
@@ -404,7 +575,7 @@ def _agent_field(state: GraphState, node_id: str, root: str, field: str) -> dict
     if not isinstance(cited, dict):
         return _agent_element(evidence, key)
     out: dict[str, Any] = {"via": "agent_field", "field": key, "status": cited.get("status") or "unresolved"}
-    for k in ("ref", "artifact", "locator", "eid", "model_value", "reason"):
+    for k in ("ref", "artifact", "locator", "eid", "model_value", "reason", "truncated"):
         if k in cited:
             out[k] = cited[k]
     return out

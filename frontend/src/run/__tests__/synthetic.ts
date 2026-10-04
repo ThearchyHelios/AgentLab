@@ -188,6 +188,29 @@ export const CALIBERS_OUTPUT = {
   },
 }
 
+/**
+ * 数字都有出处，却因为算数的查询没通过 SQL 检查而降档（engine/nodes/io.py 的 sql_checks）：横幅单列一块说明，
+ * 那一句不在其余缺口里重复；「都有出处」不画成绿色
+ */
+export const SQL_GAP = `查询「订单金额查询」（Q1）未通过 SQL 检查（${'「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'}），结果不可靠；受影响的引用：指标「订单金额」、Q1 第 1 行「gmv」`
+export const SQL_DEGRADED_OUTPUT = {
+  answer: '上周订单金额 **119,160** 元。',
+  _issuance: {
+    tier: 'degraded',
+    calibers: [{ node: 'k1', caliber: '订单口径', version: 'v2' }],
+    metrics_checked: 1,
+    missing_required: [],
+    missing_expected: [],
+    unmatched_numbers: [],
+    matched_numbers: 1,
+    matched: [{ token: '119,160', metric: 'gmv', caliber: '订单口径 @ v2' }],
+    gaps: [SQL_GAP, '协作团队「分析团队」用完 2 轮仍未完成，交付的是成员最后的回复'],
+    sql_checks: [{ query: '查询「订单金额查询」（Q1）', node_id: 'q_a',
+      problems: ['「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'],
+      refs: ['指标「订单金额」', 'Q1 第 1 行「gmv」'], gap: SQL_GAP }],
+  },
+}
+
 /** 只有一张口径卡、逐个出处都指向它：直说「都来自这张卡」 */
 export const CALIBER_ONE_OUTPUT = {
   answer: '上周订单 **128** 单，已付款 **96** 单。',
@@ -335,6 +358,83 @@ export function markupRun(): RunEvent[] {
   return out
 }
 
+/**
+ * 合并查询：门店库、会员库各查一次，在库外按门店合并（engine/nodes/merge.py 的 merge.end 和随后的警告 log）。
+ * 门店编号一边是文本、一边是数，又只按门店没按日期合并：两道警告都发
+ */
+export const MERGE_SQL = 'SELECT s.门店, s.订单数, v.到店人数 FROM s JOIN v ON s.门店 = v.门店'
+export function mergeRun(): RunEvent[] {
+  const { out, ev } = builder('syn-merge')
+  const query = (node: string, label: string, source: string, sql: string, columns: string[], rows: unknown[][]) => {
+    ev('node.started', node, { node_type: 'tool', label })
+    ev('tool.start', node, { tool: `db_query__${source}`, args: { sql } })
+    ev('tool.end', node, { tool: `db_query__${source}`, duration_ms: 40, artifact: `ts-${node}`, query_artifact: `qs-${node}`,
+      preview: JSON.stringify({ columns, rows, row_count: rows.length, truncated: false, sql, source }) }, 0.04)
+    ev('node.finished', node, { duration_ms: 45, attempt: 1 })
+  }
+  ev('run.started', null, { nodes: 4, resumed: false })
+  query('q_sales', '门店销售', 'stores', 'SELECT order_date AS 日期, substr(store_id, 2) AS 门店, COUNT(*) AS 订单数 FROM orders GROUP BY 1, 2',
+    ['日期', '门店', '订单数'], [['2026-05-01', '01', 3], ['2026-05-01', '02', 2], ['2026-05-02', '01', 2], ['2026-05-02', '02', 1]])
+  query('q_visits', '到店人数', 'members', 'SELECT visit_date AS 日期, CAST(substr(store_code, 2) AS INTEGER) AS 门店, COUNT(*) AS 到店人数 FROM visits GROUP BY 1, 2',
+    ['日期', '门店', '到店人数'], [['2026-05-01', 1, 6], ['2026-05-01', 2, 4], ['2026-05-02', 1, 5], ['2026-05-02', 2, 4]])
+  ev('node.started', 'merge', { node_type: 'merge', label: '按门店合并' })
+  ev('merge.end', 'merge', {
+    inputs: [
+      { alias: 's', node_id: 'q_sales', label: '门店销售', rows: 4, source: 'stores', artifact: 'qs-q_sales' },
+      { alias: 'v', node_id: 'q_visits', label: '到店人数', rows: 4, source: 'members', artifact: 'qs-q_visits' },
+    ],
+    sql: MERGE_SQL, rows: 8, columns: ['门店', '订单数', '到店人数'],
+    preview_rows: [['01', 3, 6], ['01', 3, 5], ['01', 2, 6], ['01', 2, 5], ['02', 2, 4]],
+    truncated: false, duration_ms: 12, query_artifact: 'mq-merge', lineage: true,
+    warnings: [{ code: 'key_type_mismatch', message: '键类型' }, { code: 'rows_grew', message: '行数' }],
+  }, 0.02)
+  // 结构化字段和 engine/merge_query._warnings 一致：界面读字段，不从 message 里解析
+  ev('log', 'merge', { level: 'warn', code: 'merge_key_type', keys: ['s.门店', 'v.门店'],
+    detail: "s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）",
+    message: "合并键类型不一致：s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）。SQLite 比较时会做隐式转换：文本形式的编号（如 '001'、'01'）都会等于数值 1，也可能完全匹配不上。请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换" })
+  ev('log', 'merge', { level: 'warn', code: 'merge_rows_grew', rows: 8, input: 's', input_rows: 4,
+    duplicates: '「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组',
+    message: '合并结果有 8 行，多于行数最多的输入「s」（4 行）：合并键可能不唯一，同一行被重复匹配。「s」中按（门店）有重复的键，例如 01 出现 2 次等 2 组；「v」中按（门店）有重复的键，例如 1 出现 2 次等 2 组。请检查合并条件是否覆盖了全部键（例如同时按日期和门店），或先在源库里聚合到相同粒度' })
+  ev('node.finished', 'merge', { duration_ms: 15, attempt: 1 })
+  ev('run.finished', null, { output: {}, timing: { wall_ms: 400, active_ms: 400, wait_ms: 0 } })
+  return out
+}
+
+/**
+ * 两个查询节点并行、用同一个数据源工具（独立的调用工具节点不带 call_id）：时间线要按节点配对，不能按工具名。
+ * 第一条查询一对多关联后求和，tool.end 带着 SQL 检查结果；口径卡里两个指标取自它，日志按查询归并成一行，
+ * 带着来源查询节点和它的 SQL 那一栏（engine/nodes/metrics._emit_sql_check_logs）
+ */
+export const PARALLEL_SQL_A = 'SELECT SUM(o.total_amount) AS gmv FROM orders o JOIN order_items i ON i.order_id = o.id'
+export const PARALLEL_SQL_B = 'SELECT COUNT(*) AS refunds FROM refunds'
+export const FANOUT_PROBLEM = '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'
+export const FANOUT_CHECK = { code: 'fanout_sum', level: 'error', table: 'orders', column: 'total_amount',
+  relation_id: 'r1a2b3c4d5e6', message: `${FANOUT_PROBLEM}。请先按订单汇总明细再关联` }
+export function parallelQueryRun(): RunEvent[] {
+  const { out, ev } = builder('syn-parallel')
+  ev('run.started', null, { nodes: 4, resumed: false })
+  ev('node.started', 'q_a', { node_type: 'tool', label: '订单金额查询' })
+  ev('node.started', 'q_b', { node_type: 'tool', label: '退款查询' })
+  ev('tool.start', 'q_a', { tool: 'db_query__shop', args: { sql: PARALLEL_SQL_A } })
+  ev('tool.start', 'q_b', { tool: 'db_query__shop', args: { sql: PARALLEL_SQL_B } })
+  // 先开始的那条先结束：按工具名配对时，它会配到后开始的那一行上
+  ev('tool.end', 'q_a', { tool: 'db_query__shop', duration_ms: 40, artifact: 'ts-q_a', query_artifact: 'qs-q_a',
+    preview: JSON.stringify({ columns: ['gmv'], rows: [[119160]], row_count: 1, truncated: false, sql: PARALLEL_SQL_A, source: 'shop' }),
+    checks: [FANOUT_CHECK] }, 0.04)
+  ev('tool.end', 'q_b', { tool: 'db_query__shop', duration_ms: 30, artifact: 'ts-q_b', query_artifact: 'qs-q_b',
+    preview: JSON.stringify({ columns: ['refunds'], rows: [[7]], row_count: 1, truncated: false, sql: PARALLEL_SQL_B, source: 'shop' }) }, 0.03)
+  ev('node.finished', 'q_a', { duration_ms: 45, attempt: 1 })
+  ev('node.finished', 'q_b', { duration_ms: 35, attempt: 1 })
+  ev('node.started', 'card', { node_type: 'metrics', label: '订单口径' })
+  ev('log', 'card', { level: 'warn', code: 'metric_sql_check', metric: 'gmv', metrics: ['gmv', 'aov'],
+    metric_names: ['订单金额', '客单价'], reason: `所依据的查询未通过 SQL 检查（${FANOUT_PROBLEM}），结果不可靠`,
+    problems: [FANOUT_PROBLEM], checks: [FANOUT_CHECK], query_artifact: 'qs-q_a', source_node: 'q_a', source_field: 'args.sql',
+    message: `指标「订单金额」「客单价」所依据的查询未通过 SQL 检查（${FANOUT_PROBLEM}），结果不可靠` })
+  ev('node.finished', 'card', { duration_ms: 3, attempt: 1 })
+  ev('run.finished', null, { output: {}, timing: { wall_ms: 300, active_ms: 300, wait_ms: 0 } })
+  return out
+}
+
 /** 结构化校验：原文里没有数，修复两次都编出了 total_count=0，两次都作废，判失败 */
 export function repairRun(): RunEvent[] {
   const { out, ev } = builder('syn-repair')
@@ -393,6 +493,59 @@ export const COPILOT_TOOLS_DROPPED = [
     { level: 'warning', node_id: 'query', code: 'tools_dropped', field: 'tools',
       message: '「数据查询」的工具从 db_query__shop、db_schema__shop 变为无。本轮要求中没有提到移除工具，请确认是否误删：没有绑定工具时，它无法查询数据库，只能假设调用结果' },
   ] },
+]
+
+/**
+ * 助手按需求挑表（context 操作，copilot_context.DatasourceContext.op）：大库挑了 3 张（含补进来的关联表），
+ * 小库全部表都带字段。挑表用了 3 秒多，先到一拍心跳，再是 context，然后照常思考、起草、自查
+ */
+export const COPILOT_CONTEXT = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
+  { op: 'context', elapsed_ms: 3420, sources: [
+    { source: 'scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51 },
+    { source: 'shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2 },
+  ] },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 6000 },
+  { op: 'thinking', delta: '入园记录不带渠道，要经 channel_visits 连到渠道表，再按渠道汇总上月的入园人次。' },
+  { op: 'plan', summary: '取数 → 出结论' },
+  { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询各渠道入园人次' } },
+  { op: 'add_node', node: { id: 'o', type: 'output', label: '成果' } },
+  { op: 'done', explanation: '两步' },
+  { op: 'check', status: 'passed', repaired: 0 },
+  { op: 'final', graph: { nodes: [{ id: 'q' }, { id: 'o' }] } },
+]
+
+/**
+ * 用户在助手里说了一条数据事实（「status=9 表示作废，统计时要排除」）：服务端核对后转出目录修改提案
+ * （catalog_patch，带版本、改前、改后），只回答、不改图。服务端没写库，要人在卡片上点保存
+ */
+export const COPILOT_CATALOG_PATCH = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'catalog_patch', source: 'scenic', source_id: 'src-scenic', table: 'visits', table_label: '入园记录', version: 3,
+    changes: [
+      { path: 'columns.status.codes', before: { 1: '有效', 0: '作废' }, before_status: 'confirmed',
+        after: { 1: '有效', 0: '作废', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+      { path: 'valid_filter', before: 'status = 1', before_status: 'proposed', after: 'status = 1 AND status <> 9',
+        value: 'status = 1 AND status <> 9', reason: '统计时要排除作废记录', state: 'change' },
+      { path: 'columns.visitor_count.measure', before: 'flow', before_status: 'proposed', after: 'flow', value: 'flow',
+        reason: '', state: 'confirm' },
+    ] },
+  { op: 'reply', text: '好的，已整理成数据目录的修改建议，确认后保存即可。' },
+]
+
+/** 挑表失败（超时）：只给了表名，原因随 context 带来；生成照常进行 */
+export const COPILOT_CONTEXT_FALLBACK = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 18000 },
+  { op: 'context', elapsed_ms: 20004, sources: [
+    { source: 'scenic', tables: [], selected_by: 'fallback', total: 51, reason: '挑选数据表超过 20 秒未完成' },
+  ] },
+  { op: 'plan', summary: '先查表结构，再取数' },
+  { op: 'add_node', node: { id: 's', type: 'tool', label: '查看表结构' } },
+  { op: 'add_node', node: { id: 'o', type: 'output', label: '成果' } },
+  { op: 'done', explanation: '两步' },
+  { op: 'final', graph: { nodes: [{ id: 's' }, { id: 'o' }] } },
 ]
 
 /** Copilot 操作流：思考被心跳打断、自查修一轮没修好、模型写了不存在的节点类型 */

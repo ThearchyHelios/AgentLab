@@ -1,8 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
-  RefreshCw, Search, Table2, Upload, X,
+  AlertTriangle, BookMarked, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
+  RefreshCw, ScanSearch, Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api, uploadDecision } from '../api/client'
@@ -21,9 +21,16 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
+  CATALOG_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT,
+  VERSIONS_TEXT,
 } from '../lib/terms'
 import { useRunClock } from '../run/useRunClock'
+import { focusProfileField, ProfileSettingsDialog, ProfileSettingsSection } from './catalog/ProfileSettings'
+import type { ProfileErrorKey } from './catalog/ProfileSettings'
+import {
+  hasProfileOption, PROFILE_OPTION, profileFieldOfRejection, profileFormOf, profileOptionOf, profileProblems, profileSettingsOf,
+} from './catalog/profile'
+import type { ProfileForm } from './catalog/profile'
 import { ImportWizard } from './import/ImportWizard'
 import type { WizardEntry } from './import/ImportWizard'
 import { VersionsDialog } from './import/VersionsDialog'
@@ -279,14 +286,17 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
   const { record, checkingSince } = useHealth(healthKey, healthFromServer(row))
   const workflows = useCatalog((s) => s.workflows)
+  const navigate = useNavigate()
   const [busy, setBusy] = useState('')
   const uploaded = isUploadedTable(row)
   // 传上来的表通常只有一两张，直接摊开；库动辄几十上百个对象，默认收着
   const [open, setOpen] = useState(() => uploaded && row.table_count > 0 && row.table_count <= 3)
   const [masking, setMasking] = useState(false)
+  const [profiling, setProfiling] = useState(false)
   /** 版本页（当前版本的各期、历史版本、导入记录） */
   const [versions, setVersions] = useState(false)
   const masks = maskList(row.options?.[MASK_KEY])
+  const profile = profileSettingsOf(row.options)
   const clock = useRunClock(!!busy)
   const busySince = useRef(0)
   useTicker(60_000)
@@ -489,6 +499,11 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
               <History size={11} aria-hidden /> {VERSIONS_TEXT.open}
             </button>
           )}
+          {/* 数据目录是独立页面：一个库上百张表、一张表几十列，逐表审阅要整屏的宽度。窄屏只留图标 */}
+          <button className="btn btn-sm btn-ghost" onClick={() => navigate(`/data/catalog/${encodeURIComponent(row.id)}`)}
+                  title={CATALOG_TEXT.openHint} aria-label={CATALOG_TEXT.open} data-catalog-open="">
+            <BookMarked size={11} aria-hidden /> <span className="hidden sm:inline">{CATALOG_TEXT.open}</span>
+          </button>
           {uploaded && row.import_mode === 'recipe' ? (
             // 按配方导入的源：每月按已确认的配方重放，不走简单上传（服务端也会拒绝）
             <>
@@ -519,11 +534,27 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
             {masks.length ? '修改遮罩列' : '设置遮罩列'}
           </button>
         )}
+        {profile.enabled && (
+          <span className="chip" data-profile-on="" title={PROFILE_TEXT.chipHint(profile.max_queries, profile.query_timeout_s)}>
+            <ScanSearch size={10} aria-hidden /> {PROFILE_TEXT.chip}
+          </span>
+        )}
+        {uploaded && (
+          // 数据剖析的设置同理：手工登记的库在编辑框里改
+          <button type="button" className="text-2xs underline decoration-dotted underline-offset-2 hover:text-dim"
+                  onClick={() => setProfiling(true)} data-edit-profile="">
+            {PROFILE_TEXT.open}
+          </button>
+        )}
         {!!row.tools?.length && <span className="mono">{row.tools.join(' · ')}</span>}
       </div>
       {masking && (
         <MaskColumnsDialog row={row} onClose={() => setMasking(false)}
                            onSaved={(next) => { setMasking(false); onChange(next); syncCatalog() }} />
+      )}
+      {profiling && (
+        <ProfileSettingsDialog row={row} onClose={() => setProfiling(false)}
+                               onSaved={(next) => { setProfiling(false); onChange(next); syncCatalog() }} />
       )}
       {versions && (
         // onChange 是父级的「更新这一行并刷新全局目录」：回滚之后表结构可能变了，检查器、问数据读的目录要跟上
@@ -934,11 +965,16 @@ interface SourceForm {
   sid: string
   /** options.mask_columns：证据面板展示查询原始行时遮掉的列 */
   maskColumns: string[]
-  /** options 里除 schema / service_name / sid / mask_columns 之外的键，全部摊开可编辑 */
+  /** options.catalog_profile：数据剖析的开关和预算 */
+  profile: ProfileForm
+  /** 打开时 options 里已经有剖析设置：没开、也没填时也要照写（关掉之后写回 enabled: false） */
+  profileStored: boolean
+  /** options 里除 schema / service_name / sid / mask_columns / catalog_profile 之外的键，全部摊开可编辑 */
   advanced: [string, string][]
 }
 
-const OWN_OPTION_KEYS = new Set(['schema', 'service_name', 'sid', MASK_KEY])
+// 剖析设置是一个对象，不能摊进「高级连接参数」：那里按文字回显，保存时会写成「[object Object]」被服务端拒收
+const OWN_OPTION_KEYS = new Set(['schema', 'service_name', 'sid', MASK_KEY, PROFILE_OPTION])
 
 function toForm(source: any): SourceForm {
   const o = source.options ?? {}
@@ -960,6 +996,8 @@ function toForm(source: any): SourceForm {
     serviceName: o.service_name ?? (oracle ? source.database ?? '' : ''),
     sid: o.sid ?? '',
     maskColumns: maskList(o[MASK_KEY]),
+    profile: profileFormOf(o),
+    profileStored: hasProfileOption(o),
     advanced: Object.entries(o)
       .filter(([k]) => !OWN_OPTION_KEYS.has(k))
       .map(([k, v]) => [k, String(v ?? '')]),
@@ -967,10 +1005,12 @@ function toForm(source: any): SourceForm {
 }
 
 function toBody(form: SourceForm, isNew: boolean, wasOracle = true): any {
-  const options: Record<string, string | string[]> = {}
+  const options: Record<string, unknown> = {}
   for (const [k, v] of form.advanced) if (k.trim() && v.trim()) options[k.trim()] = v.trim()
   if (form.schema.trim()) options.schema = form.schema.trim()
   if (form.maskColumns.length) options[MASK_KEY] = form.maskColumns
+  const profile = profileOptionOf(form.profile, form.profileStored)
+  if (profile) options[PROFILE_OPTION] = profile
   const oracle = form.kind === 'oracle'
   if (oracle) {
     // 只写选中的那一个，另一个不带：两处都有值时引擎听 service_name，
@@ -999,11 +1039,13 @@ function toBody(form: SourceForm, isNew: boolean, wasOracle = true): any {
 }
 
 /**
- * 422 的中文 detail 说的是哪一项。眼下只有查询时限按字段拒（后端 query_timeout_problem），
- * 认不出的交回 toast
+ * 422 说的是哪一项：数据剖析的某一项按机读码和 field 认（profile_settings_rejection，记为 profile.<键>）；
+ * 查询时限（后端 query_timeout_problem）还没有机读码，按 detail 认。认不出的交回 toast
  */
-function fieldOfRejection(message: string): string | null {
-  if (/查询时限/.test(message)) return 'query_timeout_s'
+function fieldOfRejection(e: ApiError): string | null {
+  const profile = profileFieldOfRejection(e)
+  if (profile) return `profile.${profile}`
+  if (/查询时限/.test(e.message)) return 'query_timeout_s'
   return null
 }
 
@@ -1013,10 +1055,11 @@ const FIELD_LABEL: Record<string, string> = {
 
 /**
  * 决定连到哪个库的那几项（提交体里的）。schema 不在内：它只影响探查哪一片，不影响
- * 连不连得上，后端判断测连接结果还作不作数时同样不看它；遮罩列只管面板上怎么显示，也不在内
+ * 连不连得上，后端判断测连接结果还作不作数时同样不看它；遮罩列只管面板上怎么显示，数据剖析的设置只管剖析，
+ * 都不在内（服务端拼连接串时同样摘掉这几项）
  */
 function connectionOf(body: any): string {
-  const { schema: _schema, [MASK_KEY]: _mask, ...options } = body.options ?? {}
+  const { schema: _schema, [MASK_KEY]: _mask, [PROFILE_OPTION]: _profile, ...options } = body.options ?? {}
   return JSON.stringify([
     body.kind, body.host ?? null, body.port ?? null, body.database ?? null, body.username ?? null,
     options, !!body.password,
@@ -1070,6 +1113,12 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   }
   const required = (key: string) => needs.includes(key)
   const blocked = missing.length > 0 || !!nameError
+  // 剖析设置填错只拦保存，不拦测试连接（和连接无关）
+  const profileBad = Object.keys(profileProblems(form.profile)).length
+  const saveBlocked = blocked || profileBad > 0
+  const saveHint = blocked ? `缺少必填项：${missing.join('、') || '标识格式'}` : profileBad ? PROFILE_TEXT.invalid(profileBad) : undefined
+  const profileError = fieldError?.key.startsWith('profile.')
+    ? { key: fieldError.key.slice('profile.'.length) as ProfileErrorKey, message: fieldError.message } : null
   const body = toBody(form, isNew, source.kind === 'oracle')
   const sig = JSON.stringify({ ...body, password: form.password })
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
@@ -1091,7 +1140,7 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
   }
 
   const save = async () => {
-    if (blocked) return
+    if (saveBlocked) return
     setSaving(true)
     setFieldError(null)
     try {
@@ -1102,8 +1151,11 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
       onSaved(row, testFresh ? test.result : undefined, connectionOf(body) !== before)
     } catch (e) {
       const rejected = e instanceof ApiError && e.status === 422 ? e.message : ''
-      const key = rejected ? fieldOfRejection(rejected) : null
-      if (key) {
+      const key = e instanceof ApiError && rejected ? fieldOfRejection(e) : null
+      if (key?.startsWith('profile.')) {
+        setFieldError({ key, message: rejected })
+        focusProfileField('ds-profile', key.slice('profile.'.length) as ProfileErrorKey)
+      } else if (key) {
         setFieldError({ key, message: rejected })
         setAdvOpen(true)
         requestAnimationFrame(() => document.getElementById(`ds-adv-${key}`)?.focus())
@@ -1194,8 +1246,8 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
                   title={blocked ? `缺少必填项：${missing.join('、') || '标识格式'}` : '使用当前配置测试连接，不保存'}>
             {test.since ? <Spinner size={11} /> : <Plug size={12} aria-hidden />} 测试连接
           </button>
-          <button className="btn btn-primary" disabled={saving || blocked} onClick={() => void save()}
-                  title={blocked ? `缺少必填项：${missing.join('、') || '标识格式'}` : undefined}>
+          <button className="btn btn-primary" disabled={saving || saveBlocked} onClick={() => void save()}
+                  title={saveHint} data-source-save="">
             {saving ? <Spinner size={11} /> : null} 保存
           </button>
         </>
@@ -1311,6 +1363,12 @@ function SourceEditor({ source, kinds, onClose, onSaved }: {
 
         <MaskColumnsField sourceId={source.id} synced={!!source.table_count} value={form.maskColumns}
                           onChange={(maskColumns) => set({ maskColumns })} />
+
+        <ProfileSettingsSection idPrefix="ds-profile" form={form.profile} serverError={profileError}
+                                onChange={(profile) => {
+                                  if (profileError) setFieldError(null)
+                                  set({ profile })
+                                }} />
 
         <label className="flex cursor-pointer items-start gap-2 rounded-lg border p-2.5"
                style={form.readonly ? undefined : { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>

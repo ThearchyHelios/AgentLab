@@ -340,6 +340,15 @@ def analyze(spec: GraphSpec) -> VariableReport:
                         node_id=node.id, node_label=label, field=field, expr=m.group(0),
                     ))
 
+        # 合并查询的输入按节点 id 选，不写模板：不认这一条的话，变量表里看不出上游那条查询被谁用了。
+        # 选错的节点（不存在、不在上游、不是查询）由 validate_graph 报，这里只记引用
+        if node.type == "merge" and isinstance(cfg.get("inputs"), dict):
+            for alias, source in cfg["inputs"].items():
+                target = index.get(f"nodes.{source}") if isinstance(source, str) else None
+                if target is not None:
+                    target.refs.append(VarRef(node_id=node.id, node_label=label, field=f"inputs.{alias}",
+                                              expr=f"nodes.{source}"))
+
         for field, text in _iter_strings(cfg):
             for m in _TEMPLATE_RE.finditer(text):
                 expr = m.group(1).strip()

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import graph_error
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
+from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorded_versions
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
@@ -209,6 +210,12 @@ class VersionDetailOut(VersionOut):
     #: 画布上改过入口字段时，拿当前画布的字段去跑已发布版本会传错参数
     input_fields: list[dict[str, Any]] = Field(default_factory=list)
     published: bool = False
+    #: 发布时记下的数据目录版本 {"direct": {源名: {表名: 版本}}, "possible": {源名: {表名: 版本}}}：direct 写死的
+    #: SQL 用到的表，possible Agent 可能查询的表（catalog_impact.recorded_versions，只记了直接引用的旧记录 possible
+    #: 为空）；没发布过、或者记录之前发布的为 null
+    catalog_versions: dict[str, Any] | None = None
+    #: 发布之后目录有变化的表：[{source, source_id, table, label, published, current, impact}]
+    catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @router.get("/{workflow_id}/versions/{version}", response_model=VersionDetailOut)
@@ -243,6 +250,8 @@ async def get_version(
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
         graph_hash=snapshot.graph_hash or graph_hash(graph), input_fields=fields,
         published=workflow.published_version == snapshot.version, level=snapshot.level,
+        catalog_versions=recorded_versions(snapshot.catalog_versions),
+        catalog_changes=await catalog_drift(session, snapshot.catalog_versions),
     )
 
 
@@ -324,7 +333,8 @@ async def publish_workflow(
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
-    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level)]
+    checkers = await _sql_checkers(session, spec)
+    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers)]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
@@ -332,6 +342,8 @@ async def publish_workflow(
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
     snapshot.level = payload.level
+    # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
+    snapshot.catalog_versions = await catalog_versions_for(session, spec)
     workflow.status = payload.level
     workflow.published_version = version
     workflow.published_by = actor_of(x_actor)
@@ -342,6 +354,7 @@ async def publish_workflow(
         "version": version,
         "graph_hash": snapshot.graph_hash,
         "published_by": workflow.published_by,
+        "catalog_versions": recorded_versions(snapshot.catalog_versions),
         "issues": issues,  # 剩下的都是警告
     }
 
@@ -400,6 +413,14 @@ async def _gate_context(session: AsyncSession, spec: GraphSpec) -> tuple[dict[st
     return versions, cards
 
 
+async def _sql_checkers(session: AsyncSession, spec: GraphSpec) -> dict[str, Any]:
+    """图里调用工具节点写死的 SQL 用到的数据源，各建一个基于数据目录的 SQL 检查器。发布、发布前检查、
+    自动修复都传这一份给门禁（governance.lint_for_publish）：门禁本身不查库，三处口径才一致。"""
+    from app.data.sqlcheck import graph_sources, load_checkers_by_name
+
+    return await load_checkers_by_name(session, graph_sources(spec.nodes))
+
+
 def _unreadable(level: str, e: Exception) -> dict[str, Any]:
     return {"level": level, "ok": False, "fixes": [], "issues": [
         {"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None, "fix": None,
@@ -422,7 +443,8 @@ async def publish_check(
     except Exception as e:  # noqa: BLE001
         return _unreadable(payload.level, e)
     versions, cards = await _gate_context(session, spec)
-    return check(spec, level=payload.level, versions=versions, cards=cards)
+    return check(spec, level=payload.level, versions=versions, cards=cards,
+                 checkers=await _sql_checkers(session, spec))
 
 
 @router.post("/{workflow_id}/autofix")
@@ -446,7 +468,9 @@ async def autofix(
             {"fix_id": fid, "reason": "无法解析工作流结构，不能应用修复"} for fid in payload.apply],
             "remaining": bad["issues"], "fixes": [], "handoff": [], "assist": None, "ok": False}
     versions, cards = await _gate_context(session, spec)
-    out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards)
+    checkers = await _sql_checkers(session, spec)
+    out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
+                      checkers=checkers)
     out["assist"] = None
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
@@ -464,7 +488,8 @@ async def autofix(
             out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
-            after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards)
+            after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
+                                checkers=await _sql_checkers(session, GraphSpec.model_validate(fixed)))
             out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})

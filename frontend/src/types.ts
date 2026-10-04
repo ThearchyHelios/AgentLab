@@ -1,5 +1,5 @@
 export type NodeType =
-  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code'
+  | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
   | 'human' | 'validate' | 'metrics' | 'report'
 
@@ -56,6 +56,35 @@ export interface WorkflowVersion {
   input_fields?: { name: string; required?: boolean; [key: string]: any }[]
   /** 是不是当前的已发布版本 */
   published?: boolean
+  /** 发布时记下的数据目录版本，没记过为 null */
+  catalog_versions?: CatalogVersions | null
+  /** 发布之后目录有变化的表 */
+  catalog_changes?: CatalogDriftTable[]
+}
+
+/**
+ * 发布时记下的数据目录版本（服务端 catalog_impact.recorded_versions），两组都是 {源名: {表名: 版本}}：
+ * - direct：SQL 里写着的表，0 表示当时还没有目录
+ * - possible：Agent 绑定了查询工具的数据源中所有有目录的表（SQL 运行时才生成）；源下为空表示当时一张有目录的
+ *   表都没有。只记了直接引用的老版本这一组为空
+ */
+export interface CatalogVersions {
+  direct: Record<string, Record<string, number>>
+  possible: Record<string, Record<string, number>>
+}
+
+/** 发布之后数据目录有变化的一张表（服务端 catalog_impact.catalog_drift；运行里的 catalog.drift 事件同形） */
+export interface CatalogDriftTable {
+  source: string
+  source_id: string
+  table: string
+  /** 表现在的中文名 */
+  label: string | null
+  /** 发布时的版本，0 表示当时还没有目录 */
+  published: number | null
+  current: number
+  /** direct：SQL 里写着这张表；possible：Agent 可能查询的表。老事件没有这一项，按 direct */
+  impact: 'direct' | 'possible'
 }
 
 /**
@@ -1317,6 +1346,11 @@ export interface ValidationIssue {
   code?: string | null
   /** 这条问题对应的修复 id：publish-check 的 fixes 里同 id 的那一项。没有修复时为空 */
   fix?: string | null
+  /**
+   * 发布门禁里的 SQL 检查：这条检查本来的级别。level 说的是拦不拦（已发布档一律 warning），它说的是错误还是提醒。
+   * 别的问题、老服务端不给
+   */
+  sql_level?: 'error' | 'warning' | null
 }
 
 /** 发布等级：发布弹窗、问题面板的发布前检查共用 */
@@ -2036,6 +2070,8 @@ export interface EvidenceInput {
   query?: string | null
   /** 输入落在哪一格，全局编号（Q3.r5.amount） */
   cell?: string
+  /** agent 的数组字段：引用的行段到了截断查询结果的末行，后面还有没取回的行（query 步骤上是快照本身截断了） */
+  truncated?: boolean | null
 }
 
 /** 口径卡钉在另一个已发布工作流某个版本里的口径卡上 */
@@ -2063,6 +2099,66 @@ export interface EvidenceCaliberUpgrade {
  * run_input（报告直接引用的运行输入）、query（查询快照：被引用的行加前后各 2 行）。
  * input 步骤同时带着 EvidenceInput 的字段（via、status、model_value、ref、locator、artifact）
  */
+/** 合并查询的一个输入（证据面板的 merge.inputs） */
+export interface EvidenceMergeInput {
+  /** 合并 SQL 里的表名 */
+  alias: string
+  node_id?: string | null
+  /** 节点在画布上的名字 */
+  label?: string | null
+  /** 这个输入在报告目录里的编号（Q1）；不在这份报告的目录里时为空 */
+  query?: string | null
+  rows?: number | null
+  /** 数据源名；输入本身是合并结果时是「合并查询」 */
+  source?: string | null
+  artifact?: string | null
+  sealed?: boolean
+  /** 这个输入查询对照数据目录查出的问题（形状同查询步骤的 checks）。没查出问题、快照读不出来时没有这个键 */
+  checks?: SqlCheckItem[]
+}
+
+/**
+ * 出具声明（output._issuance、issuance 事件）里的 sql_checks：没通过 SQL 检查的查询，一条一个。报告页、出具横幅据此
+ * 在显眼处说「因为 SQL 检查没通过而降档」。gap 是 gaps 里对应的那一句（单列之后不在其余缺口里重复）
+ */
+export interface IssuanceSqlCheck {
+  /** 「查询「取数」（Q1）」；给不出时没有 */
+  query?: string
+  node_id?: string
+  /** 每条问题那半句 */
+  problems?: string[]
+  /** 受影响的引用：「指标「订单金额」」「Q1 第 1 行「gmv」」 */
+  refs?: string[]
+  gap?: string
+}
+
+/** 查询用到的一张表、查询当时它的数据目录版本 */
+export interface EvidenceCatalogVersion {
+  /** 表结构里的表名 */
+  table: string
+  /** 目录里的中文名 */
+  label?: string
+  version?: number | null
+}
+
+/** 被引用的一格追到了哪个输入的哪一格；追不到时 input 为空，note 说明只有表级来历 */
+export interface EvidenceMergeTrace {
+  /** 合并结果里的 [行, 列]，行号从 0 数 */
+  cell: [number, string]
+  input: string | null
+  query: string | null
+  row: number | null
+  column: string | null
+  note?: string
+}
+
+export interface EvidenceMerge {
+  sql?: string | null
+  inputs: EvidenceMergeInput[]
+  warnings: { code?: string | null; message: string }[]
+  traced: EvidenceMergeTrace[]
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
@@ -2091,6 +2187,20 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   substituted?: string
   recompute_ok?: boolean | null
   status?: string
+  /** metric：表达式把截断的查询结果当成整组用了（计数、求和……），值只算到了取回的那部分 */
+  incomplete?: boolean
+  /** metric：不完整的原因（人话，「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」） */
+  incomplete_reason?: string
+  /** metric：所依据的查询没通过 SQL 检查（有错误级的问题），值照算，出具已按缺口降档 */
+  sql_check_failed?: boolean
+  /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
+  sql_check_reason?: string
+  /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
+  checks?: SqlCheckItem[]
+  /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
+  schema_artifact?: string
+  /** query：这条查询用到的表在表结构快照里冻结的数据目录版本（SQL 检查对照的那一版）。没有目录时没有这个键 */
+  catalog?: EvidenceCatalogVersion[]
   inputs?: EvidenceInput[]
   /** 口径卡钉在哪个工作流的哪一版（metric；方案第 5 节的写法，接口实际给在 source 上） */
   caliber_from?: EvidenceCaliberSource | null
@@ -2127,6 +2237,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
    * 查询快照来自上传的表格时才有，且恒为 true；其余一个键都不加。前端只在 seg.cite?.kind === 'cell' 且它为 true 时请求
    */
   provenance?: boolean
+  /** 合并查询的结果（快照的 source 是「合并查询」）：合并了哪几个输入、合并 SQL、执行时的警告、被引用的格追到哪 */
+  merge?: EvidenceMerge
+  /** 这一步是哪次合并查询的输入（合并结果在目录里的编号）：排在那个合并步骤后面，高亮的是追到的格 */
+  merged_into?: string
   // ---- entity：表或字段（三期）----
   /** entity：table / column */
   kind?: string
@@ -2262,7 +2376,7 @@ export type ProvenanceReasonCode =
   | 'legacy_doc' | 'not_cell' | 'not_sealed' | 'not_upload' | 'simple_upload' | 'manifest_unreadable'
   | 'chain_mismatch' | 'expression' | 'alias' | 'multi_table' | 'unparsed' | 'no_pk' | 'pk_missing' | 'masked'
   | 'null_value' | 'null_pk' | 'snapshot_gone' | 'db_tampered' | 'recheck_missing' | 'recheck_multiple'
-  | 'recheck_mismatch' | 'no_lineage'
+  | 'recheck_mismatch' | 'no_lineage' | 'merge_no_lineage'
 
 /** 标红的提示：出现时 reason.code 与它相同，界面只画提示 */
 export type ProvenanceAlertCode = 'db_tampered' | 'chain_mismatch' | 'manifest_unreadable'
@@ -2470,4 +2584,421 @@ export interface EvidenceProvenance {
   version: ProvenanceVersion | null
   cell_source: ProvenanceCellSource | null
   checks: ProvenanceCheck[]
+  /** 被引用的格在合并查询的结果里时，经过的每一次合并；别的查询为空 */
+  merge: ProvenanceMergeHop[]
+}
+
+/** 经过的一次合并查询：合并结果里被引用的格追到了哪个输入的哪一格；追不到的那一跳后四项为 null */
+export interface ProvenanceMergeHop {
+  /** 合并结果在目录里的编号（Q3） */
+  alias: string
+  node_id: string | null
+  /** 追到的输入别名（合并 SQL 里的表名） */
+  input: string | null
+  /** 那个输入在目录里的编号（Q1） */
+  query: string | null
+  row: number | null
+  column: string | null
+}
+
+// ===========================================================================
+// 业务数据目录（/api/datasources/{id}/catalog，后端 app/data/catalog.py）。
+// 每张表一份业务说明：中文名、粒度、业务主键、列的含义和度量类型、表与表的关联关系……每一项都注明来源和状态。
+// 目录只记数据事实，不放计算公式（公式在口径卡里）。
+// ===========================================================================
+
+/** 项的来源：数据库注释、外键约束、命名推断、数据剖析、模型起草、人工填写 */
+export type CatalogSource = 'comment' | 'fk' | 'name' | 'profile' | 'llm' | 'human'
+/** 项的状态：推断、已验证（外键约束、数据剖析）、已确认（人工）、已驳回（人工） */
+export type CatalogStatus = 'proposed' | 'verified' | 'confirmed' | 'rejected'
+/** 表类型：明细（事实）、维度、快照、日志、配置 */
+export type CatalogTableKind = 'fact' | 'dimension' | 'snapshot' | 'log' | 'config'
+/** 列的度量类型：可累加（流量）、存量、比率、标识、状态、属性 */
+export type CatalogMeasure = 'flow' | 'stock' | 'ratio' | 'identifier' | 'status' | 'attribute'
+/** 关系的基数（从本表看过去） */
+export type CatalogCardinality = 'many_to_one' | 'one_to_one' | 'one_to_many'
+
+/** 目录里的一项：值连同来源、状态 */
+export interface CatalogItem<T = unknown> {
+  value: T
+  source: CatalogSource
+  status: CatalogStatus
+  note?: string
+  updated_at?: string
+}
+
+/** 业务日期：按哪一列算，规则和时区写成文字 */
+export interface CatalogBusinessDate {
+  column: string
+  rule?: string
+  timezone?: string
+}
+
+/** 一列的目录 */
+export interface CatalogColumnNotes {
+  label?: CatalogItem<string>
+  meaning?: CatalogItem<string>
+  unit?: CatalogItem<string>
+  measure?: CatalogItem<CatalogMeasure>
+  /** 码值 → 含义 */
+  codes?: CatalogItem<Record<string, string>>
+}
+
+/** 一条关联关系。编号由两端的表和列算出来，改了指向就是另一条 */
+export interface CatalogRelation {
+  id: string
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+  cardinality: CatalogCardinality | null
+  /** 0 到 1：本表这几列的值在被指向表里找得到的比例（数据剖析给出） */
+  coverage: number | null
+  source: CatalogSource
+  status: CatalogStatus
+  note?: string
+  updated_at?: string
+  /**
+   * 基数是数据剖析用数据核实的（子表一侧数过是否唯一），只由剖析写。外键、命名推断的基数没有这个键。
+   * 一对多关联后重复计算的检查只在它为真、或者关系人工确认过时报「错误」，否则最多是「提醒」
+   */
+  cardinality_checked?: boolean
+}
+
+/** 一张表的目录（notes）。字段固定，服务端不认识的一律拒收 */
+export interface CatalogNotes {
+  label?: CatalogItem<string>
+  description?: CatalogItem<string>
+  grain?: CatalogItem<string>
+  keys?: CatalogItem<string[]>
+  kind?: CatalogItem<CatalogTableKind>
+  business_date?: CatalogItem<CatalogBusinessDate>
+  /** SQL 条件片段 */
+  valid_filter?: CatalogItem<string>
+  dedup?: CatalogItem<string>
+  columns?: Record<string, CatalogColumnNotes>
+  relations?: CatalogRelation[]
+}
+
+/** 各状态的项数（表级项、列级项、关系都算），四种状态都有键 */
+export type CatalogCounts = Record<CatalogStatus, number>
+
+/** 表清单的一行。表结构里的每张表各一行（没有目录的也列）；目录还在、表已不在的 in_schema 为 false，排在最后 */
+export interface CatalogTableRow {
+  table_name: string
+  qualified: string
+  is_view: boolean
+  in_schema: boolean
+  /** 中文名（被驳回的不算） */
+  label: string | null
+  label_status: CatalogStatus | null
+  kind: CatalogTableKind | null
+  counts: CatalogCounts
+  /** 没被驳回的关联关系条数 */
+  relations: number
+  /** 被运行查询过的次数（同一次运行里结果相同的重复查询只算一次） */
+  usage: number
+  /** 这张表还没有目录时为 0 */
+  version: number
+  updated_at: string | null
+  updated_by: string | null
+}
+
+/** GET /datasources/{id}/catalog */
+export interface CatalogList {
+  /** 使用次数多的在前 */
+  tables: CatalogTableRow[]
+  /** 导入表格的源：表和列的说明由系统按核对结果生成，只读 */
+  system_notes: boolean
+  /** 没有表结构时的原因（「尚未探查结构」「结构探查失败：…」）；有表结构时为 null */
+  schema_note: string | null
+  /** 探查结构截断了（每个数据源最多取 200 张表）：没探查到的表不在清单里，助手也看不到。老后端没有这一项 */
+  schema_truncated?: boolean
+  /** 数据库里一共几张表（含视图）；没截断时等于探查到的张数 */
+  schema_total?: number
+}
+
+/** 表结构里的一列 */
+export interface CatalogStructureColumn {
+  name: string
+  type: string
+  pk: boolean
+  not_null: boolean
+  /** 数据库注释；导入表格的源是系统按核对结果生成的说明 */
+  comment: string | null
+}
+
+export interface CatalogForeignKey {
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+}
+
+export interface CatalogStructure {
+  qualified: string | null
+  is_view: boolean
+  /** 表注释；导入表格的源是系统按核对结果生成的说明 */
+  comment: string | null
+  columns: CatalogStructureColumn[]
+  primary_key: string[]
+  /** 升级前探查的缓存里没有：null 表示不知道，空列表表示读过、没有 */
+  foreign_keys: CatalogForeignKey[] | null
+  unique: string[][] | null
+}
+
+/** GET /datasources/{id}/catalog/{table}；PUT、审阅也返回这个形状 */
+export interface CatalogDetail {
+  table_name: string
+  in_schema: boolean
+  notes: CatalogNotes
+  version: number
+  updated_at: string | null
+  updated_by: string | null
+  /** 表结构里已经没有这张表时为 null */
+  structure: CatalogStructure | null
+  system_notes: boolean
+  usage: number
+}
+
+/** 单项审阅：确认、驳回、撤销审阅（回到来源的初始状态；人工填写的项直接删掉） */
+export type CatalogReviewAction = 'confirm' | 'reject' | 'reset'
+
+/** 起草结果里的一张表 */
+export interface CatalogDraftRow {
+  table_name: string
+  added: number
+  updated: number
+  removed: number
+  version: number
+  /** 这张表没有起草（表结构里没有、写入一直冲突） */
+  error: string | null
+  /** 只是模型那部分失败，其余来源照常写入。模型给了这张表、却一项可用内容都没有，也记在这里 */
+  model_error: string | null
+  /**
+   * 模型给了这张表几项可用内容（并入目录之前）。没用模型、模型这部分失败时为 null（老后端没有这个键）。
+   * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
+   */
+  model_items?: number | null
+}
+
+/** POST /datasources/{id}/catalog/draft */
+export interface CatalogDraftOut {
+  tables: CatalogDraftRow[]
+  total: { added: number; updated: number; removed: number }
+  model_used: boolean
+  model: string | null
+  /** 模型整体用不了（没有配置、已停用……）：只按注释、外键和命名起草 */
+  model_error: string | null
+}
+
+/**
+ * 目录修改提案的一项（服务端 catalog.PatchChange）。助手转出的提案和预览接口都是这个形状。
+ * path 是审阅接口的写法；新增关联关系已规范成 relations.<编号>
+ */
+export interface CatalogPatchChange {
+  path: string
+  /** 当前目录里的值；没有（或被驳回）为 null */
+  before: unknown
+  before_status: CatalogStatus | null
+  /** 保存后的值（码值是补充后的完整对照） */
+  after: unknown
+  /** 交回保存的原样取值（码值只有补充的那几个） */
+  value: unknown
+  reason: string
+  /** change 值有变化；confirm 值相同、还不是已确认（保存即确认）；same 已经是这个值且已确认 */
+  state: 'change' | 'confirm' | 'same'
+  /** 服务端对这一项的说明（目前只有：新增的关联关系没写基数、又推算不出来）。没有时不给 */
+  note?: string
+}
+
+/** 保存、预览提案时交回的一项：路径、原样取值、理由 */
+export interface CatalogPatchSubmit {
+  path: string
+  value: unknown
+  reason?: string
+}
+
+/** POST /datasources/{id}/catalog/{table}/patch/preview：对着当前目录重算改前、改后（只读） */
+export interface CatalogPatchPreview {
+  table_name: string
+  version: number
+  changes: CatalogPatchChange[]
+  /** 不合法的项的说明（目录刚被改过、列已删除……） */
+  problems: string[]
+}
+
+/** 影响面里模板的一个节点（服务端 catalog_impact.template_refs） */
+export interface CatalogImpactNode {
+  node_id: string
+  label: string
+  type: string
+  /** direct：SQL 里写着这张表；possible：Agent 运行时自己写 SQL，可能用到 */
+  impact: 'direct' | 'possible'
+  /** 合并查询：经由哪些输入（别名 → 节点） */
+  via?: { node_id: string; label: string; alias: string }[]
+  /** 协作节点：绑定了查询工具的成员 */
+  member?: string
+}
+
+/** 引用这张表的一个已发布或受管模板（按它当前的已发布版本算） */
+export interface CatalogImpactTemplate {
+  workflow_id: string
+  name: string
+  /** 当前的已发布版本 */
+  version: number
+  level: 'published' | 'governed'
+  impact: 'direct' | 'possible'
+  nodes: CatalogImpactNode[]
+}
+
+/** GET /datasources/{id}/catalog/{table}/impact */
+export interface CatalogImpact {
+  table: string
+  /** 直接引用的在前 */
+  templates: CatalogImpactTemplate[]
+}
+
+// ===========================================================================
+// 数据剖析（后端 app/data/catalog_profile.py）：对业务库发少量只读查询，核实推断的关联关系、取码值候选、
+// 提议业务日期。默认关闭，按数据源在 options.catalog_profile 里开启。
+// ===========================================================================
+
+/** 剖析设置里的数值项 */
+export type CatalogProfileNumberKey = 'max_queries' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows' | 'max_total_s'
+
+/** 一个数据源的剖析设置（服务端 ProfileSettings.to_dict） */
+export interface CatalogProfileSettings {
+  enabled: boolean
+  max_queries: number
+  query_timeout_s: number
+  sample_size: number
+  /** 0 表示一律不做整表统计 */
+  max_scan_rows: number
+  max_total_s: number
+}
+
+/** 整次剖析中途停下的原因：查询次数用完、总时长用完、连续多条查询失败 */
+export type CatalogProfileStop = 'budget' | 'deadline' | 'failed'
+
+/** 一张表的行数：stats 数据库的统计信息（估算）；count 数到上限为止；unknown 没能得到 */
+export interface CatalogProfileSize {
+  rows: number | null
+  method: 'stats' | 'count' | 'unknown' | (string & {})
+  /** 数到上限也没数完：至少这么多行 */
+  at_least: number | null
+}
+
+/** 关系的核对结论：覆盖率、基数，升为已验证（verified）或保持推断（proposed）；人工确认过的只补覆盖率和基数 */
+export interface CatalogProfileRelationFinding {
+  kind: 'relation'
+  path: string
+  target: string
+  columns: string[]
+  to_table: string
+  to_columns: string[]
+  status: CatalogStatus
+  confirmed: boolean
+  /** 剖析之前目录里这条关系的状态：报告按它说「升为已验证」还是「仍为已验证」。老服务端不给 */
+  previous_status?: CatalogStatus | null
+  coverage: number
+  cardinality: CatalogCardinality | null
+  /** 基数是不是用数据核实的（子表一侧数过是否唯一）。老服务端不给 */
+  cardinality_checked?: boolean
+  /** 抽了几个不同的键值、在被指向表里对上几个 */
+  sample: number
+  matched: number
+  summary: string
+}
+
+/** 码值候选：观察到的取值和行数，含义留给人填 */
+export interface CatalogProfileCodesFinding {
+  kind: 'codes'
+  path: string
+  column: string
+  values: { value: string; rows: number }[]
+  rows: number
+  status: CatalogStatus
+  /** 写进目录的码值里还有几个含义空着（别的来源写过的含义会沿用）。老服务端不给 */
+  pending?: number
+  summary: string
+}
+
+/** 业务日期提议：表里只有一个日期类列 */
+export interface CatalogProfileDateFinding {
+  kind: 'business_date'
+  path: string
+  column: string
+  min: string
+  max: string
+  status: CatalogStatus
+  summary: string
+}
+
+export type CatalogProfileFinding = CatalogProfileRelationFinding | CatalogProfileCodesFinding | CatalogProfileDateFinding
+
+/** 没做的一项。detail 是可以直接显示的整句 */
+export interface CatalogProfileSkip {
+  /** relation / codes / date / row_estimate / table */
+  kind: string
+  target: string
+  path: string | null
+  /** budget / deadline / failed / timeout / error / rejected / masked / too_large / view / unsupported / no_data / missing / high_cardinality */
+  reason: string
+  detail: string
+}
+
+export interface CatalogProfileTable {
+  table_name: string
+  queries: number
+  row_estimate: CatalogProfileSize | null
+  findings: CatalogProfileFinding[]
+  skipped: CatalogProfileSkip[]
+  /** 日期类列的取值范围 */
+  date_ranges: { column: string; min: string; max: string }[]
+  added: number
+  updated: number
+  removed: number
+  version: number
+  /** 这张表没剖析（表结构里没有）或结果没写进去（写入一直冲突） */
+  error: string | null
+}
+
+/** POST /datasources/{id}/catalog/profile */
+export interface CatalogProfileOut {
+  profiled_at: string
+  actor: string | null
+  settings: CatalogProfileSettings
+  queries_used: number
+  stopped: CatalogProfileStop | null
+  tables: CatalogProfileTable[]
+  total: { added: number; updated: number; removed: number }
+  /**
+   * 不指定表时，挑表途中估过行数、确知是空表而跳过的表（老后端没有这个键；指定了表时是空列表）。
+   * 估行数的查询算在 queries_used 里，不算在各表的 queries 里
+   */
+  empty_tables?: string[]
+  /** 一张表都没有剖析时的说明 */
+  note: string | null
+}
+
+// ===========================================================================
+// 基于数据目录的 SQL 检查（后端 app/data/sqlcheck.py）：七条规则，编号稳定
+// ===========================================================================
+
+export type SqlCheckCode = 'fanout_sum' | 'stock_summed' | 'join_unconfirmed' | 'ratio_aggregated' | 'missing_valid_filter'
+  | 'unknown_code' | 'wrong_date_column'
+
+/** error：依据已核实、结果很可能有误；warning：依据有确证、结果可能有误；info：依据只是推断 */
+export type SqlCheckLevel = 'error' | 'warning' | 'info'
+
+/** 一条检查结果（证据接口查询步骤里的 checks、助手自查和发布前检查的问题）。交回模型改写用的那句不上界面，这里不收 */
+export interface SqlCheckItem {
+  code: SqlCheckCode | (string & {})
+  level: SqlCheckLevel | (string & {})
+  /** 给人看的说明 */
+  message: string
+  /** schema_cache 里的表名 */
+  table: string
+  column?: string
+  relation_id?: string
+  sql_excerpt?: string
 }

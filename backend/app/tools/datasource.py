@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import EventType
+from app.data import catalog as data_catalog
 from app.data import introspect, table_versions
+from app.data.sqlcheck import SqlChecker
 from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run_query
 from app.data.guard import QueryLimits, SqlRejected, is_write
 from app.data.tabular import UNSHAPED_NOTE
@@ -50,6 +53,10 @@ RUN_VERSIONS_KEY = "data_versions"
 DATA_UNAVAILABLE = "查询失败（数据不可用）："
 #: 运行中途补固定一个源时发的那条日志事件的 code（_pin_late）
 LATE_PIN_CODE = "data_version_pinned"
+
+#: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
+#: 查询结果照常交回——检查是附加的，不能拖慢查询
+SQL_CHECK_TIMEOUT_S = 2.0
 
 
 class _QueryArgs(BaseModel):
@@ -154,6 +161,8 @@ RECIPE_QUERY_HINT = " 中文表名和列名请加双引号。查单个值时，�
 #: 封存事件 → schema_snapshot → 快照清单 → 各期导入清单 → 原件或清除记录，每一跳都按内容哈希
 _FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode", "import_manifests",
                        "snapshot_manifest")
+#: 表结构快照里放数据目录的顶层键（_store_schema）。不来自 schema_cache：目录存在 catalog_notes 表里
+CATALOG_SNAPSHOT_KEY = "catalog"
 
 
 def _query_description(source: Any) -> str:
@@ -218,12 +227,29 @@ async def build_datasource_tools(
         except table_versions.SnapshotMissing as e:
             tools.extend(_unavailable_tool(row, prefix, str(e)) for prefix in prefixes)
             continue
+        entries = await _catalog_of(row)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
-                tools.append(_make_query_tool(source, ctx, fixed=fixed))
+                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries))
             else:
-                tools.append(_make_schema_tool(source, fixed=fixed))
+                tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries))
     return tools
+
+
+async def _catalog_of(row: DataSource) -> dict[str, data_catalog.CatalogEntry]:
+    """这个源的数据目录，建工具时读一次：db_schema 给模型看的和查询时冻结进表结构快照的是同一版。
+
+    读不到就当没有目录，工具照常可用——目录是附加说明，不能挡住查询。用单独的会话读：出错要回滚，
+    而回滚会让调用方会话里已经加载的对象（row）全部过期，之后再读属性就是异步环境里的懒加载。
+    """
+    from app.db.base import SessionLocal
+
+    try:
+        async with SessionLocal() as own:
+            return await data_catalog.read_catalog(own, row.id)
+    except Exception:  # noqa: BLE001
+        logger.exception("读取数据源 %s 的数据目录失败，本次不附目录", row.name)
+        return {}
 
 
 # --------------------------------------------------------------------------
@@ -414,14 +440,25 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
 # --------------------------------------------------------------------------
 
 
-def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False) -> StructuredTool:
+def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
+                     catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
     """source 是手工源的 DataSource，或上传源绑定快照的 SourceView（字段同名）。
 
     fixed：上传源的版本是这次运行固定的（找不到时的说法不同）。
+    catalog：建工具时读到的数据目录，随表结构快照冻结（_store_schema）。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
     seconds = query_timeout(source)
+    # 基于数据目录的 SQL 检查器：和冻结进表结构快照的是同一版目录。第一次查询时才建（关系图也是用到才建）
+    checker: list[SqlChecker] = []
+
+    def _checker() -> SqlChecker:
+        if not checker:
+            checker.append(SqlChecker(kind=source.kind, schema_cache=source.schema_cache,
+                                      notes={name: entry.notes for name, entry in (catalog or {}).items()},
+                                      source_name=source.name))
+        return checker[0]
 
     async def _run(sql: str, limit: int | None = None) -> str:
         if gone := _vanished(source, fixed):
@@ -447,9 +484,14 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False) -> S
 
         payload = result.to_payload()
         payload["source"] = source.name
+        # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
+        # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
+        # 快照和以前一字不差
+        if checks := await _sql_checks(_checker(), sql):
+            payload["checks"] = checks
         # 表结构快照：这次查询时数据源的结构冻结下来，报告里写的表名、字段名按它核对。事后数据源
         # 重新探查、改了结构，已经跑完的运行核对的还是当时那一份。上传源冻结的是绑定快照里那份
-        if schema := await _store_schema(source, ctx):
+        if schema := await _store_schema(source, ctx, catalog=catalog):
             payload["schema_artifact"] = schema
         # 查询快照进工件库：出具体系的数字回指要能下钻到"这个数是哪条 SQL 查出来的"
         try:
@@ -465,9 +507,12 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False) -> S
                 extra["mask_columns"] = mask
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
+            # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次
+            # （catalog.table_usage），不用再逐个读工件内容。meta 不进内容哈希，快照本身一字不变
             payload["artifact"] = await put_json(
-                {**payload, **extra} if extra else payload, kind="query_snapshot",
+                {**payload, **extra} if extra else payload, kind=data_catalog.QUERY_SNAPSHOT_KIND,
                 run_id=ctx.run_id or "", node_id=ctx.node_id or "",
+                meta=data_catalog.query_snapshot_meta(source, str(payload.get("sql") or sql)),
             )
         except Exception:  # noqa: BLE001 - 存不下不影响查询本身
             pass
@@ -485,7 +530,22 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False) -> S
     )
 
 
-async def _store_schema(source: Any, ctx: ToolContext) -> str | None:
+async def _sql_checks(checker: SqlChecker, sql: str) -> list[dict[str, Any]]:
+    """一条查询的 SQL 检查结果（as_dict 的形状）。在线程里跑、限时 SQL_CHECK_TIMEOUT_S：解析是纯计算，放在事件循环里
+    会挡住同一进程里别的运行。出错、超时都返回空列表——检查不能让一次成功的查询变成失败。"""
+    if not checker.enabled:
+        return []
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(checker.check_dicts, sql), timeout=SQL_CHECK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("SQL 检查超过 %.1f 秒，本次跳过（数据源 %s）", SQL_CHECK_TIMEOUT_S, checker.source_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("SQL 检查出错，本次跳过（数据源 %s）", checker.source_name)
+    return []
+
+
+async def _store_schema(source: Any, ctx: ToolContext, *,
+                        catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> str | None:
     """把数据源此刻的 schema_cache 存成 schema_snapshot 工件，返回工件 id。
 
     上传源传进来的是绑定快照的视图，schema_cache 就是快照里冻结的那份：查的是哪一版，冻结的
@@ -493,6 +553,10 @@ async def _store_schema(source: Any, ctx: ToolContext) -> str | None:
 
     内容寻址：结构没变的话，同一次运行里查多少次都是同一件，文件只有一份。没探查过结构
     （或者探查失败、一张表都没有）返回 None：没有东西可以冻结，报告也就不核对表名。
+
+    数据目录一起冻结，放在顶层键 catalog 下：{表名: {version, notes（去掉驳回项）}}，只收这份结构里有的、
+    有目录的表（catalog.frozen_catalog）。这次运行的模型看到的是哪一版目录，事后按快照就能回溯。已有字段
+    一个不动；没有目录的源不加这个键，快照和以前一字不差；目录不变（版本和内容都不变）则快照不变。
     """
     cache = source.schema_cache or {}
     tables = cache.get("tables")
@@ -503,15 +567,25 @@ async def _store_schema(source: Any, ctx: ToolContext) -> str | None:
 
     content = {"source": source.name, "tables": tables,
                **{k: cache[k] for k in _FROZEN_SCHEMA_KEYS if k in cache}}
+    meta: dict[str, Any] = {"source": source.name, "tables": len(tables)}
+    if frozen := data_catalog.frozen_catalog(catalog or {}, tables):
+        content[CATALOG_SNAPSHOT_KEY] = frozen
+        meta["catalog_tables"] = len(frozen)
     try:
         return await put_json(content, kind=SCHEMA_SNAPSHOT, run_id=ctx.run_id or "", node_id=ctx.node_id or "",
-                              meta={"source": source.name, "tables": len(tables)})
+                              meta=meta)
     except Exception:  # noqa: BLE001 - 存不下不影响查询本身，只是这次报告不核对表名
         return None
 
 
-def _make_schema_tool(source: Any, *, fixed: bool = False) -> StructuredTool:
-    """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。"""
+def _make_schema_tool(source: Any, *, fixed: bool = False,
+                      catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
+    """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。
+
+    catalog：建工具时读到的数据目录，查单表时附在字段清单后面（introspect.describe_table）。
+    """
+    notes = {name: entry.notes for name, entry in (catalog or {}).items()}
+
     async def _run(table: str | list[str] | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
@@ -520,7 +594,7 @@ def _make_schema_tool(source: Any, *, fixed: bool = False) -> StructuredTool:
         # 而模型两种都会写。为此拒绝一次调用，纯属浪费一步
         wanted = [t.strip() for one in wanted for t in str(one).split(",") if t.strip()]
         if wanted:
-            return "\n\n".join(introspect.describe_table(source, t) for t in wanted)
+            return "\n\n".join(introspect.describe_table(source, t, catalog=notes) for t in wanted)
         tables = introspect.table_names(source)
         if not tables:
             # 把实情交出去，而不是让它去点一个它点不到的按钮

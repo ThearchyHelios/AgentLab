@@ -67,7 +67,8 @@ export function revealField(nodeId: string, field?: FieldRef | string | null, op
     const sheet = document.querySelector('[data-inspector-sheet]') ?? document
     const box = sheet.querySelector<HTMLElement>(`[data-field="${CSS.escape(at.key)}"]`)
     const item = at.index != null ? box?.querySelector<HTMLElement>(`[data-item="${at.index}"]`) : null
-    const part = at.sub ? item?.querySelector<HTMLElement>(`[data-sub="${CSS.escape(at.sub)}"]`) : null
+    // 只有子键没有序号的（合并查询的 inputs.<别名>）：在整个字段里按子键找那一行
+    const part = at.sub ? (item ?? box)?.querySelector<HTMLElement>(`[data-sub="${CSS.escape(at.sub)}"]`) : null
     const target = part ?? item ?? box
     if (!target) return
     const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -76,7 +77,26 @@ export function revealField(nodeId: string, field?: FieldRef | string | null, op
       const to = target.querySelector<HTMLElement>(FILLABLE) ?? target.querySelector<HTMLElement>(PRESSABLE)
       to?.focus({ preventScroll: true })
     }
+    // 子键没有自己的一行、字段是一段 JSON（调用工具的「参数」，问题落在 args.sql 上）：在文字里找到那个键，
+    // 框内滚到那一行，聚焦时光标放在它的值开头
+    if (!part && at.sub) revealJsonKey(target, at.sub, !!opts.focus)
   }))
+}
+
+/** JSON 文字框里的某个键：滚到它那一行；focus 时把光标放在值的开头（不选中，免得一敲键就把整段 SQL 换掉） */
+function revealJsonKey(field: HTMLElement, key: string, focus: boolean): void {
+  const box = field.querySelector<HTMLTextAreaElement>('textarea')
+  if (!box) return
+  const m = new RegExp(`"${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*:\\s*"?`).exec(box.value)
+  if (!m) return
+  const line = box.value.slice(0, m.index).split('\n').length - 1
+  const height = parseFloat(getComputedStyle(box).lineHeight) || 16
+  box.scrollTop = Math.max(0, (line - 1) * height)
+  if (focus) {
+    const at = m.index + m[0].length
+    box.focus({ preventScroll: true })
+    box.setSelectionRange(at, at)
+  }
 }
 
 // 选中 → 面板开不开。放在模块级：选中可能来自别处（问题面板定位、发布弹窗、快捷键），

@@ -1010,6 +1010,90 @@ await section('caliber', '口径卡来源和升版处置', async () => {
   await none.ctx.close()
 })
 
+await section('incomplete', '截断的查询结果整组算出来的指标：标「结果不完整」并写明原因，完整的指标不标', async () => {
+  await openQ(page, '45,678.5元', { wait: '[data-ev-expression]' })
+  check('完整的指标不出不完整标识', await panel(page).locator('[data-ev-incomplete], [data-ev-incomplete-reason]').count() === 0)
+  check('……输入也不标「已截断」', !(await panel(page).locator('[data-ev-input]').allInnerTexts()).some((t) => t.includes('已截断')))
+  await page.keyboard.press('Escape')
+  // 接口的形状：backend/app/api/evidence.py 的指标步骤带 incomplete / incomplete_reason，输入带 Agent 字段证据里的 truncated
+  const REASON = '基于被截断的查询结果计算（只取回了前 1000 行），结果不完整'
+  const cut = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'metric'
+    ? { ...st, incomplete: true, incomplete_reason: REASON } : st.step === 'input' ? { ...st, truncated: true } : st)) }))
+  await openQ(cut.page, '45,678.5元', { wait: '[data-ev-incomplete]' })
+  const p = cut.page.locator('[data-evidence-panel]')
+  const chip = p.locator('[data-ev-incomplete]')
+  check('指标名旁有「结果不完整」标识，悬停看原因', (await chip.innerText().catch(() => '')) === '结果不完整'
+    && await chip.getAttribute('title') === REASON, await chip.innerText().catch(() => ''))
+  const why = await p.locator('[data-ev-incomplete-reason]').innerText().catch(() => '')
+  check('原因写在指标下面', why === REASON, why)
+  const warn = await tokenColor(cut.page, 'color', 'var(--st-waiting)')
+  check('用提醒色（不是失败色：值是真算出来的，只是不全）', await chip.evaluate((el) => getComputedStyle(el).color) === warn)
+  const inputs = await p.locator('[data-ev-input]').allInnerTexts()
+  check('被截断切开的 Agent 字段输入标「已截断」', inputs.some((t) => t.includes('（已截断）')), inputs.join('|'))
+  const source = await p.locator('[data-ev-sources]').innerText().catch(() => '')
+  check('……输入来源写明与快照一致、但只含取回的部分行', source.includes('与快照一致；查询结果已截断，该字段只含取回的部分行'),
+    source.replace(/\s+/g, ' ').slice(0, 160))
+  await cut.ctx.close()
+})
+
+await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤列出级别、规则名、说明、表和列、SQL 片段；指标未通过时标出来并写明原因', async () => {
+  await openQ(page, '1,288')
+  check('没查出问题的查询步骤不出 SQL 检查', await panel(page).locator('[data-ev-sql-checks]').count() === 0)
+  check('没有冻结目录的查询步骤不写数据目录版本', await panel(page).locator('[data-ev-catalog]').count() === 0)
+  await page.keyboard.press('Escape')
+  await openQ(page, '45,678.5元', { wait: '[data-ev-expression]' })
+  check('通过的指标不出「SQL 检查未通过」', await panel(page).locator('[data-ev-sql-check-failed], [data-ev-sql-check-reason]').count() === 0)
+  await page.keyboard.press('Escape')
+  // 接口的形状：backend/app/api/evidence.py 的查询步骤带 checks（去掉了给模型的那句），指标步骤带 sql_check_failed / sql_check_reason
+  const CHECKS = [
+    { code: 'join_unconfirmed', level: 'info', message: '「订单」与「地区」按推断的关系关联（o.region = r.code），这条关系尚未确认。', table: 'orders' },
+    { code: 'fanout_sum', level: 'error', table: 'orders', column: 'amount', sql_excerpt: 'SUM(o.amount)',
+      message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联。' },
+    { code: 'missing_valid_filter', level: 'warning', message: '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选。', table: 'orders' },
+  ]
+  const REASON = '所依据的查询未通过 SQL 检查（「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算），结果不可靠'
+  // 查询步骤带着这次查询对照的数据目录版本（_catalog_of：表结构快照里冻结的那份）
+  const CATALOG = [{ table: 'orders', label: '订单', version: 3 }, { table: 'order_items', version: 1 }]
+  const bad = await probeQ((id, body) => ({ ...body, chain: (body.chain ?? []).map((st) => (st.step === 'query'
+    ? { ...st, checks: CHECKS, schema_artifact: 'c'.repeat(64), catalog: CATALOG }
+    : st.step === 'metric' ? { ...st, sql_check_failed: true, sql_check_reason: REASON } : st)) }))
+  await openQ(bad.page, '1,288', { wait: '[data-ev-sql-checks]' })
+  const p = bad.page.locator('[data-evidence-panel]')
+  const cat = await p.locator('[data-ev-catalog]').innerText().catch(() => '')
+  check('查询步骤写明对照的数据目录版本：有中文名写中文名，没有写表名', cat === '数据目录：订单 第 3 版、order_items 第 1 版', cat)
+  const items = p.locator('[data-ev-sql-checks] [data-sql-check]')
+  const levels = await items.evaluateAll((els) => els.map((e) => e.getAttribute('data-level')))
+  check('三条都列在 SQL 下面，错误在前、提示在后', levels.join(',') === 'error,warning,info', levels.join(','))
+  const first = await items.first().innerText().catch(() => '')
+  check('一条里有级别、中文规则名、说明、涉及的表和列、SQL 片段', first.includes('错误') && first.includes('一对多关联后重复计算')
+    && first.includes('会重复计算') && first.includes('orders.amount') && first.includes('SUM(o.amount)'), first.replace(/\s+/g, ' '))
+  check('级别四通道：图标 + 文字，三档文字各不相同', (await items.locator('[data-sql-level]').allInnerTexts()).map((t) => t.trim()).join(',')
+    === '错误,提醒,提示' && await items.locator('[data-sql-level] svg').count() === 3)
+  const tones = await items.locator('[data-sql-level]').evaluateAll((els) => els.map((e) => getComputedStyle(e).color))
+  const want = [await tokenColor(bad.page, 'color', 'var(--st-failed)'), await tokenColor(bad.page, 'color', 'var(--st-waiting)'),
+    await tokenColor(bad.page, 'color', 'var(--accent)')]
+  check('级别的颜色走令牌：错误 --st-failed、提醒 --st-waiting、提示 --accent', tones.join('|') === want.join('|'), tones.join('|'))
+  check('悬停写明依据的确证程度', (await items.first().locator('[data-sql-level]').getAttribute('title')) === '依据已核实，结果很可能有误，需要修改')
+  check('不露规则编号', !/fanout_sum|missing_valid_filter|join_unconfirmed/.test(await p.innerText()))
+  await bad.page.keyboard.press('Escape')
+  await openQ(bad.page, '45,678.5元', { wait: '[data-ev-sql-check-failed]' })
+  const chip = p.locator('[data-ev-sql-check-failed]')
+  check('指标名旁有「SQL 检查未通过」标识，悬停看原因', (await chip.innerText().catch(() => '')) === 'SQL 检查未通过'
+    && await chip.getAttribute('title') === REASON, await chip.innerText().catch(() => ''))
+  check('原因写在指标下面', (await p.locator('[data-ev-sql-check-reason]').innerText().catch(() => '')) === REASON)
+  check('和「结果不完整」同一种样式（提醒色的标识）', await chip.evaluate((el) => getComputedStyle(el).color)
+    === await tokenColor(bad.page, 'color', 'var(--st-waiting)') && (await chip.getAttribute('class'))?.includes('chip'))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await bad.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await bad.page.waitForTimeout(200)
+      await bad.page.screenshot({ path: `${SHOTS}/evidence-sqlcheck-metric-${theme}.png` })
+    }
+  }
+  check('没有运行时报错', bad.errors.length === 0, bad.errors[0] ?? '')
+  await bad.ctx.close()
+})
+
 await section('q-narrow', '查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
   const overflow = () => page.evaluate((sel) => {
     const el = document.querySelector(sel)
@@ -2963,7 +3047,109 @@ if (SHOTS) {
     await page.keyboard.press('Escape')
   }
 }
-await section('copy-r2', '按后端原文匹配的地方：后端现在的原文、整改前的原文都认得（文案整改第二轮）', async () => {
+// ---------------------------------------------------------------------------
+// 合并查询：片段接口的查询步骤带 merge（表级来历、逐格来历），后面接着追到的输入的查询步骤（merged_into）；
+// 推断来源的答复带 merge（经过的每一次合并）。答复按 backend/app/api/evidence.py 的 _merge_view、_query_steps 的形状改
+// ---------------------------------------------------------------------------
+const MERGE_SQL = 'SELECT o.order_id, o.region, o.amount, t.target FROM o JOIN t ON o.region = t.region ORDER BY o.order_id'
+// 合并输入自己的 SQL 检查（_merge_view 的 inputs[].checks，形状同查询步骤的 checks）
+const INPUT_CHECKS = [{ code: 'fanout_sum', level: 'error', table: 'orders', column: 'amount',
+  message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联。' }]
+function asMerge(body, traced, { withInput = true, inputChecks = false } = {}) {
+  const q = body.chain.find((st) => st.step === 'query')
+  const merged = {
+    ...q, tool: undefined, source: '合并查询', sql: MERGE_SQL,
+    merge: {
+      sql: MERGE_SQL,
+      inputs: [
+        { alias: 'o', node_id: 'fetch', label: '订单明细', query: 'Q1', rows: 12, source: 'shop', artifact: 'a'.repeat(64), sealed: true,
+          ...(inputChecks ? { checks: INPUT_CHECKS } : {}) },
+        { alias: 't', node_id: 'targets', label: '区域目标', query: null, rows: 4, source: 'plan', artifact: 'b'.repeat(64), sealed: true },
+      ],
+      warnings: [{ code: 'rows_grew', message: '合并结果有 14 行，多于行数最多的输入「o」（12 行）：合并键可能不唯一，同一行被重复匹配' }],
+      traced,
+    },
+  }
+  const input = { ...q, alias: 'Q1', merged_into: q.alias }
+  return { ...body, chain: body.chain.flatMap((st) => (st.step === 'query' ? (withInput ? [merged, input] : [merged]) : [st])) }
+}
+
+await section('merge', '合并查询：表级来历（输入、合并 SQL、警告）、逐格来历、输入步骤标明是哪次合并的输入', async () => {
+  const traced = await probeQ((id, body) => (id === qseg('1,288')
+    ? asMerge(body, [{ cell: [5, 'amount'], input: 'o', query: 'Q1', row: 5, column: 'amount' }]) : body))
+  await openQ(traced.page, '1,288')
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await traced.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await traced.page.waitForTimeout(250)
+      await traced.page.screenshot({ path: `${SHOTS}/evidence-merge-${theme}.png`, fullPage: true })
+    }
+    await traced.page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const p = traced.page.locator('[data-evidence-panel]')
+  const parts = p.locator('[data-ev-query]')
+  check('合并步骤和它追到的输入步骤各一块', await parts.count() === 2, String(await parts.count()))
+  const head = await parts.first().locator('[data-ev-query-head]').innerText().catch(() => '')
+  check('合并步骤的标题写「合并查询」，不写工具名', head.includes('Q3') && head.includes('合并查询') && !head.includes('db_query__'), head)
+  const inputs = p.locator('[data-ev-merge]')
+  check('表级来历：合并自 2 个输入', (await inputs.innerText().catch(() => '')).includes('合并自 2 个输入'))
+  const o = await p.locator('[data-ev-merge-input="o"]').innerText().catch(() => '')
+  check('……每个输入写别名、目录编号、节点名、行数、数据源', ['o', '查询 Q1', '订单明细', '12 行', '数据源 shop'].every((t) => o.includes(t)), o)
+  const t = await p.locator('[data-ev-merge-input="t"]').innerText().catch(() => '')
+  check('……不在本报告目录里的输入照实说', t.includes('不在本报告的证据目录中'), t)
+  check('合并 SQL 有标签、带复制', (await parts.first().innerText()).includes('合并 SQL')
+    && await parts.first().locator('button', { hasText: '复制合并 SQL' }).count() === 1)
+  const warn = await p.locator('[data-ev-merge-warnings]').innerText().catch(() => '')
+  check('执行时的警告写出来', warn.includes('执行时的警告') && warn.includes('不唯一'), warn)
+  const line = await p.locator('[data-ev-merge-trace="cell"]').innerText().catch(() => '')
+  check('逐格来历：被引用的格追到输入的哪一格（行号从 1 数）', line.includes('Q3 第 6 行「amount」') && line.includes('Q1 第 6 行「amount」'), line)
+  const into = await parts.nth(1).locator('[data-ev-merged-into]').innerText().catch(() => '')
+  check('输入步骤标明是哪次合并的输入，高亮追到的那一格', into.includes('合并查询 Q3 的输入')
+    && await parts.nth(1).locator('td[data-highlight="cell"]').count() === 1, into)
+  check('合并查询不是数据源：不说它「已不存在」', await p.locator('[data-ev-query-mask-note]').count() === 0)
+  check('输入没查出问题：合并步骤里不出输入的 SQL 检查', await p.locator('[data-ev-merge-input-checks]').count() === 0)
+  await traced.ctx.close()
+
+  const flat = await probeQ((id, body) => (id === qseg('1,288') ? asMerge(body, [{
+    cell: [5, 'amount'], input: null, query: null, row: null, column: null, note: '没有逐格来历',
+  }], { withInput: false, inputChecks: true }) : body))
+  await openQ(flat.page, '1,288')
+  const none = await flat.page.locator('[data-evidence-panel] [data-ev-merge-trace="none"]').innerText().catch(() => '')
+  check('追不到的格：写明没有逐格来历、只有表级来历，不接输入步骤', none.includes('没有逐格来历')
+    && none.includes('表级来历') && await flat.page.locator('[data-evidence-panel] [data-ev-query]').count() === 1, none)
+  // 没有输入步骤时，输入查询的 SQL 检查结果要在合并步骤里看得到（指标正是因为它标了「存疑」）
+  const inChecks = flat.page.locator('[data-evidence-panel] [data-ev-merge-input-checks="o"]')
+  const inText = await inChecks.innerText().catch(() => '')
+  check('追不到逐格来历时，合并步骤的输入下面列出它自己的 SQL 检查（级别、规则名、说明）', inText.includes('输入 o 的 SQL 检查')
+    && inText.includes('错误') && inText.includes('一对多关联后重复计算') && inText.includes('会重复计算')
+    && await inChecks.locator('[data-sql-check="fanout_sum"][data-level="error"]').count() === 1, inText.replace(/\s+/g, ' '))
+  check('……没查出问题的输入不出', await flat.page.locator('[data-evidence-panel] [data-ev-merge-input-checks="t"]').count() === 0)
+  check('……不露规则编号', !/fanout_sum/.test(await flat.page.locator('[data-evidence-panel] [data-ev-merge]').innerText()))
+  await flat.ctx.close()
+
+  const wideId = pseg('wide')
+  const hop = { alias: 'Q3', node_id: 'merge', input: 'f', query: 'Q1', row: 5, column: '全日客流' }
+  const lost = { alias: 'Q3', node_id: 'merge', input: null, query: null, row: null, column: null }
+  const noLineage = {
+    ...fxp.provenance[wideId], status: 'none', version: null, cell_source: null, checks: [], merge: [lost],
+    reason: { code: 'merge_no_lineage', detail: '', text: '这一格来自合并查询，无法确定它对应哪个输入的哪一格' },
+  }
+  const hops = await open('/ui-harness.html?evidence=1', {
+    prov: (run, sid, reply) => (sid === wideId ? { json: { ...reply.json, merge: [hop] } }
+      : sid === pseg('long') ? { json: noLineage } : reply),
+  })
+  await openP(hops.page, 'wide')
+  const said = await textOf(pv(hops.page, '[data-ev-prov-merge]'))
+  check('推断的来源：先说经过的合并、追到的那一格，下面的原表格子照常', said === '经合并查询 Q3 追到 Q1 第 6 行「全日客流」'
+    && await pv(hops.page, '[data-ev-prov-cell]').count() === 1, said)
+  await openP(hops.page, 'long')
+  check('追不到逐格来历：写原因和没追到的那一跳，不画数据版本和格子', (await textOf(pv(hops.page, '[data-ev-prov-reason="merge_no_lineage"]')))
+    .includes('合并查询') && (await textOf(pv(hops.page, '[data-ev-prov-merge-hop="none"]'))).includes('没有逐格来历')
+    && await pv(hops.page, '[data-ev-prov-version], [data-ev-prov-cell]').count() === 0)
+  await hops.ctx.close()
+})
+
+await section('copy-r2','按后端原文匹配的地方：后端现在的原文、整改前的原文都认得（文案整改第二轮）', async () => {
   // 画布问题落到哪一栏（canvas/issues.ts）、检查器的分支标识过滤（Inspector 用 issues.ts 的 isCaseKeyIssue）、
   // 证据面板的裁判触顶（lib/evidence.ts）都按后端原文判断。开发库里历史运行、旧版本存下的文字是整改前的，
   // 新的是整改后的：两种各喂一遍。「新」样本和 backend/app 现在的写法一致（先核对源码片段），

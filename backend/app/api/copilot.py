@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import re
 import time
@@ -13,9 +14,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import copilot_context
 from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
+# 摘要的预算和截断阈值随数据源上下文搬到了 copilot_context，这里留着老名字
+from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
+from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.data.sqlcheck import CHECK_CODES
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
@@ -25,6 +31,7 @@ from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_mod
 from app.tools.registry import all_specs
 
 router = APIRouter(prefix="/api/copilot", tags=["copilot"])
+logger = logging.getLogger(__name__)
 
 
 async def _sources(session: AsyncSession, scope: list[str] | None) -> list[Any]:
@@ -61,12 +68,15 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any]) -> str:
+def _tool_catalog(rows: list[Any], context: copilot_context.DatasourceContext | None = None) -> str:
     """给 Copilot 看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
     （db_query__<源>），不补进来 Copilot 就不知道它们存在，只会退回让用户
     自己写 SQL 的代码节点——接了数据库等于白接。
+
+    「可查」后面列前 12 个对象。给了这一轮的数据源上下文时按它排：大库里按需求挑中的表排在前面
+    （DatasourceContext.listed），不然列出来的是表结构里排在最前的那几张，和需求未必相干。
     """
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
@@ -77,7 +87,7 @@ def _tool_catalog(rows: list[Any]) -> str:
     from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
 
     for row in rows:
-        tables = _introspect.table_names(row)
+        tables = context.listed(row) if context is not None else _introspect.table_names(row)
         listed = "、".join(tables[:12]) + (f" 等 {len(tables)} 个对象" if len(tables) > 12 else "")
         lines.append(
             f"- {QUERY_PREFIX}{row.name}（数据库）：在「{row.name}」上执行 SQL。"
@@ -90,53 +100,45 @@ def _tool_catalog(rows: list[Any]) -> str:
     return "\n".join(lines)
 
 
-# 数据源摘要的字符预算。超了就退成"只列对象名"，字段让 Copilot 用
-# db_schema 工具按需查。实测一个 53 对象的库带字段约 4000 字符，
-# 接三五个库就会把真正的需求淹掉——system prompt 里塞满 schema 而挤掉
-# 用户想要什么，是本末倒置。
-_DATASOURCE_BUDGET_CHARS = 6000
-# detail 模式下每个库最多列这么多对象（与 introspect.summary 的默认值一致）。
-# 超过就说明会截断，那还不如切紧凑模式把对象名列全。
-_DETAIL_TABLE_LIMIT = 40
+#: 带进挑表需求里的前几轮问题：追问常常只说「那上上个月呢」，光看这一句挑不出表
+_PICK_HISTORY_TURNS = 3
 
 
-def _datasource_section(rows: list[Any]) -> str:
-    """数据源与结构摘要。没有数据源时返回空串，不占 prompt。"""
-    from app.data import introspect as _introspect
+async def _pick_need(session: AsyncSession, payload: GenerateIn) -> str:
+    """挑表用的需求：这一轮的原话，问数据追问时再带上这次对话前几轮的问题。"""
+    from app.api.conversations import recent_turns
 
-    if not rows:
-        return ""
+    if not payload.conversation_id:
+        return payload.instruction
+    turns = await recent_turns(session, payload.conversation_id)
+    asked = [t.question for t in turns if t.question][-_PICK_HISTORY_TURNS:]
+    return payload.instruction + (PICK_HISTORY_PROMPT.format(questions="；".join(asked)) if asked else "")
 
-    # detail 模式每个库最多列 40 个对象，多出来的直接看不见。对象一多，
-    # "40 张表带字段"反而不如"全部表只给名字"——Copilot 找不到那张表，
-    # 字段写得再全也没用。所以超出截断阈值就整体切到紧凑模式。
-    detail = all(len(_introspect.table_names(row)) <= _DETAIL_TABLE_LIMIT for row in rows)
-    blocks = [_introspect.summary(row, detail=detail) for row in rows]
-    if detail and sum(len(b) for b in blocks) > _DATASOURCE_BUDGET_CHARS:
-        detail = False
-        blocks = [_introspect.summary(row, detail=False) for row in rows]
-    if not detail:
-        # Copilot 仍然知道有哪些对象可查，要字段时在图里放一个 db_schema 节点，
-        # 或者交给运行期的 agent 自己探
-        blocks.append(
-            "  （对象较多，上面只列了名字。写 SQL 前用 db_schema 工具确认字段，别猜）"
-        )
-    return (
-        "\n\n已接入的数据源（涉及取数时优先用它们，而不是让用户自己写 SQL 的代码节点）：\n"
-        + "\n".join(blocks)
-        + "\n\n写 SQL 的硬性要求：\n"
-        # 这三条都是真实踩过的：Oracle 上漏 schema 前缀直接 ORA-00942，
-        # 写惯 MySQL 的模型会顺手写 LIMIT，而一条没有行数限制的查询能拖垮生产库
-        "- 表名照抄上面的全名（含 schema 前缀），漏掉前缀在 Oracle 上会直接报 ORA-00942\n"
-        "- 认准方言：Oracle 用 FETCH FIRST n ROWS ONLY，不是 LIMIT\n"
-        "- 一次只写一条语句；分号拼接会被拒\n"
-        "- 字段拿不准就在图里先放一个 db_schema 工具节点，别猜字段名\n"
-        # 真实踩过：列名是照着业务说法猜的，跑到查库那一步才「no such column」
-        "- 列名只照上面结构里列出来的写；结构里只列了表名时先用 db_schema 查字段。搭完自查会拿 SQL 里的列名"
-        "去对结构，对不上会打回来让你改\n"
-        "- 比率、增幅、占比这类派生计算进口径卡（metrics 节点）；查询结果里原样的数，报告撰写节点（report）"
-        "可以直接用 [[v:Q1.r0.列名]] 引用。别让 llm 节点直接对数字做算术\n"
-    )
+
+PICK_HISTORY_PROMPT = "\n（这次对话之前问过：{questions}）"
+
+
+async def _picker(session: AsyncSession, payload: GenerateIn,
+                  plan: copilot_context.ContextPlan) -> tuple[Any | None, str | None]:
+    """挑表用的模型：同一个助手模型（copilot_model_spec），思考、额度在 pick_model 里调。不用挑表时不拿。"""
+    if not plan.needs_pick:
+        return None, None
+    spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
+    return await copilot_context.pick_model(session, spec)
+
+
+async def _datasource_context(
+    session: AsyncSession, sources: list[Any], payload: GenerateIn, *, need: str,
+    graph: dict[str, Any] | None,
+) -> copilot_context.DatasourceContext:
+    """这一轮的数据源上下文：读目录、大库按需求挑表、组装（copilot_context）。挑表失败退回只列表名，不抛异常。
+
+    非流式生成、发布前修复、升级都走这里；流式生成把三步拆开，挑表放进流里（期间发心跳、挑完发 context 操作）。
+    graph 是现有工作流：它的 SQL 查过的表一律给全字段。
+    """
+    plan = await copilot_context.plan_context(sources, graph=graph)
+    picker, unavailable = await _picker(session, payload, plan)
+    return await plan.resolve(picker, need=need, unavailable=unavailable)
 
 
 NODE_REFERENCE = """\
@@ -163,6 +165,18 @@ NODE_REFERENCE = """\
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
   成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
+- merge：合并查询，把几次查询的结果在库外按键合并成一张表。config: {inputs: {别名: 上游查询节点id}, sql, assign_to}
+  **只在数据分在不同的库、要按行对齐时用**：先在各自的库里用 SQL 聚合到相同的键和粒度（比如「日期 + 门店」），
+  再由 merge 按键合并。同一个库里的数据写成一条 SQL（JOIN / WITH），不要拆成两次查询再合并；只组合几个单值时
+  用口径卡的 cell()，不用 merge。比率、增幅、占比这类派生计算仍然写在口径卡里，不写进合并 SQL。
+  inputs 的值只能是调用 db_query__ 工具的 tool 节点或另一个 merge 节点，而且要连在 merge 之前；agent 查过的库
+  不能当输入（它可能查了好几次），要合并的那条查询单独放进 tool 节点。别名就是 sql 里的表名，只用英文字母、数字
+  和下划线（例如 s、v）。sql 是一条 SQLite 的 SELECT 或 WITH，例如：SELECT s.日期, s.门店, s.订单数, v.到店人数
+  FROM s JOIN v ON s.日期 = v.日期 AND s.门店 = v.门店。合并读的是每个输入的完整结果：任何一个输入被截断（超过
+  查询的行数上限）merge 就会失败，所以源查询要先聚合、缩小范围；两边的键类型要一致（文本 '001' 对数值 1 会给警告）；
+  结果比行数最多的输入还多，说明合并键不唯一（也会给警告）。结果和查询同形：报告按先后编号引用 [[v:Qn.r0.列名]]，
+  口径卡写 cell(nodes.merge节点id, 行, '列名')。选取项直接写输入的列（可以用 AS 改名）时，报告里的数点得开、能追到
+  输入的那一格；表达式算出来的列只有表级来历
 - code：沙箱里跑代码。config: {language: python|bash|node, code, timeout, network, assign_to}
   evidence_role：source（取数：产出本身就是源数据）/ compute（计算，默认）。负责取数的代码写 source；
   compute 的产出喂给口径卡会被提示「核对不了出处」——业务计算写进口径卡的表达式。
@@ -194,7 +208,7 @@ NODE_REFERENCE = """\
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
   claims, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
-  （tool 节点和 agent 查过的库，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
+  （tool 节点和 agent 查过的库、merge 的合并结果，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
   和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；模型自己写的数字会被打回重写：
   - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用
   - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
@@ -205,7 +219,10 @@ NODE_REFERENCE = """\
     查过的数据源里真实存在的名字，表结构、查询、结果列里都没有的会被标成「可能是编造的名字」（受管模板的正式出具因此降档）
   - [[q:K1|逐字引文]]：知识库检索的原话，必须和命中片段里的字逐字一致（空白不计，至少 4 个字），改一个字就算
     没有出处；只是拿检索当依据时写 [[see:K1]]。要引原话，在 report 前面接 retrieve 节点
-  - 句末的 [[see:m:指标id,Q1,K1]]：这句结论的依据，不显示
+  - 句末的 [[see:m:指标id,Q1,K1]]：这句结论的依据，不显示，所以只能放在句末；instructions 里不要写「以 [[see:…]] 为依据」
+    「根据 [[see:…]]」这样把它当成句子成分的示例，模型照着写会留下「以 为依据」这样的断句
+  - 涉及码值（状态、类型这类用数字编码的取值）时，instructions 里让模型写它的含义（「作废记录」），不要写码值本身：
+    码值是没有出处的数字，会被数字核对打回重写
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
   numbers 默认 strict（裸数字算违规）。claims 是结论句策略：off（默认，不管）/ require_citation（每句结论都要
   挂引用，没挂的计入缺口、出具降档）/ judge（在 require_citation 之外，再请另一个模型按每句挂的依据判断支不支持：
@@ -234,6 +251,8 @@ NODE_REFERENCE = """\
 2. 能用 SUM / COUNT 做的聚合放在 SQL 里，口径卡只做标量运算
 3. 不要用 code 节点做业务计算；code 只做格式转换（负责取数的 code 标 evidence_role: source）
 4. 不要用 transform 解析 agent / llm 的文字：口径卡读 cell(nodes.查库节点id, 行, '列名') 或 vars.<agent 的 assign_to>.字段
+5. 数据在两个库、要按行对齐时：两个 tool 节点各自聚合到相同的键和粒度 → merge 按键合并 → 口径卡算派生指标 → report。
+   同一个库写成一条 SQL；只组合几个单值用口径卡的 cell()；不要用 code 节点合并（出处会断，喂给口径卡时核对不了）
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -662,8 +681,18 @@ async def generate(
     """
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
-    tool_list = _tool_catalog(sources)
-    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
+    # 先拿模型：没配好就直接 400，不白花一次挑表
+    try:
+        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
+    except ProviderNotConfigured as e:
+        raise HTTPException(400, _unconfigured(e)) from e
+    # 和流式生成同一套数据源上下文，只是不发 context 操作（这条接口一次返回整张图）
+    context = await _datasource_context(
+        session, sources, payload, need=await _pick_need(session, payload),
+        graph=payload.base_graph if (payload.base_graph or {}).get("nodes")
+        else await _previous_graph(session, payload.conversation_id))
+    tool_list = _tool_catalog(sources, context)
+    datasources = context.section() + _scope_note(sources, scope is not None)
 
     system = (
         "你是一个 agent 工作流编排专家。根据用户需求产出一张可执行的工作流图。\n\n"
@@ -685,11 +714,6 @@ async def generate(
         )
     else:
         user = _user_message(payload, patch=False)
-
-    try:
-        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
-    except ProviderNotConfigured as e:
-        raise HTTPException(400, _unconfigured(e)) from e
 
     messages = [("system", system),
                 ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
@@ -776,7 +800,22 @@ _STREAM_PROTOCOL = """\
   （"设计一个每天跑的工作流"）时给 false —— 他要的是这张图，不是这一次的结果
 - 如果这句话根本不需要工作流（见下面的路径约定），**第一行也是最后一行**就输出：
   {"op":"reply","text":"直接回答的内容"}
-  这时不要输出任何别的操作"""
+  这时除了下面的 catalog_patch，不要输出任何别的操作
+- 数据目录修改提案（可选）：用户在这句话里**明确陈述了一条数据事实**时，另输出一行
+  {"op":"catalog_patch","source":"数据源名","table":"表名","changes":[{"path":"…","value":…,"reason":"一句话依据"}]}
+  它只是提案，用户确认后才写进数据目录。可以和图操作一起出现（写在 done 之前），也可以只配一行 reply（写在 reply 之前）
+  · path：表级项直接写字段名（label 中文名、description 说明、grain 粒度、keys 业务主键列表、
+    kind 表类型 fact/dimension/snapshot/log/config、business_date {"column","rule","timezone"}、
+    valid_filter 有效记录的 SQL 条件、dedup 去重规则）；列级项写 columns.<列名>.<字段>（label、meaning 含义、
+    unit 单位、measure 度量类型 flow/stock/ratio/identifier/status/attribute、codes 码值 {"码":"含义"}）；
+    已有的关联关系写 relations.<编号>；新增关联关系写 relations.new，value 写
+    {"columns":[本表列],"to_table":"目标表","to_columns":[目标列],"cardinality":"many_to_one/one_to_one/one_to_many"}
+  · codes 只写要补充或更正的码，原有的码会保留；valid_filter 要写成完整的条件（原有条件也要带上）
+  · 例：「在园人数是存量，不能跨天相加」→ columns.<那一列>.measure 写 stock；「status=9 表示作废，统计时要排除」→
+    columns.status.codes 写 {"9":"作废"}，再把 valid_filter 补上排除条件；「channel_visits 是渠道和入园记录的关联表」→
+    description 和两条 relations.new
+  · 只有用户明确说出了数据事实才提，不要从自己的推测、查询结果或提问里提；表名、列名必须是上面数据源里真实存在的
+  · 计算公式不进数据目录：「转化率=下单数/访问数」这类指标怎么算的说法属于口径卡，不要提"""
 
 
 def _parse_op_line(line: str) -> dict[str, Any] | None:
@@ -792,6 +831,56 @@ def _parse_op_line(line: str) -> dict[str, Any] | None:
     if not isinstance(obj, dict) or "op" not in obj:
         return None
     return obj
+
+
+#: 模型只发了目录修改提案、既没回答也没改图时，补的那句回答
+PATCH_ONLY_REPLY = "已按你的说明整理出数据目录的修改建议，确认无误后可保存到数据目录。"
+
+
+async def catalog_patch_op(op: dict[str, Any], sources: list[Any]) -> dict[str, Any] | None:
+    """模型发的 catalog_patch → 转给前端的提案；整条不成立时返回 None。**只读，不写目录。**
+
+    核对数据源（只认这一轮给助手看的源，按名字）、表（按表结构认）、每一项的路径和取值格式（catalog.plan_patch，
+    和保存时同一套），附上当前版本、改前和改后的值。不合法的项丢掉、记一条日志，其余照转；一项都不剩就整条不转。
+    写入只发生在人点「保存到数据目录」之后（/catalog/{table}/patch，带着这里给的版本）。
+
+    开流之后请求的会话不能再用，这里另开一个短会话读目录：版本取提案到达的这一刻，比开流前读的新。
+    """
+    from app.data import catalog, table_versions
+    from app.db.base import SessionLocal
+
+    name = op.get("source")
+    table = op.get("table")
+    row = next((s for s in sources if isinstance(name, str) and s.name == name), None)
+    if row is None:
+        logger.warning("目录修改提案被丢弃：数据源「%s」不在这一轮的范围内", name)
+        return None
+    try:
+        async with SessionLocal() as session:
+            source = await table_versions.resolve_source(session, row)
+            tables = (source.schema_cache or {}).get("tables") or {}
+            key = catalog.resolve_table_name(source.schema_cache, table) if isinstance(table, str) else None
+            if key is None:
+                logger.warning("目录修改提案被丢弃：数据源「%s」中没有表「%s」", name, table)
+                return None
+            entry = await catalog.read_entry(session, row.id, key)
+    except Exception:  # noqa: BLE001 - 提案是附加的，读不到目录就不提，不能让这一轮生成失败
+        logger.exception("目录修改提案被丢弃：读取「%s」的数据目录失败", name)
+        return None
+    plan = catalog.plan_patch(entry.notes if entry else {}, op.get("changes"), table=key, tables=tables)
+    for problem in plan.problems:
+        logger.warning("目录修改提案（%s.%s）有一项被丢弃：%s", name, key, problem)
+    # 已经是这个值、也确认过的项没什么可提的
+    changes = [c.as_dict() for c in plan.changes if c.state != "same"]
+    if not changes:
+        logger.warning("目录修改提案被丢弃：%s.%s 没有需要修改的项", name, key)
+        return None
+    label = (entry.notes.get("label") if entry else None) or {}
+    return {
+        "op": "catalog_patch", "source": row.name, "source_id": row.id, "table": key,
+        "table_label": label.get("value") if label.get("status") != "rejected" else None,
+        "version": entry.version if entry else 0, "changes": changes,
+    }
 
 
 _NODE_TYPES = frozenset(t.value for t in NodeType)
@@ -1034,13 +1123,16 @@ async def _iter_ops(model: Any, messages: list[Any]):
 _HEARTBEAT_SECONDS = 3.0
 
 
-async def _with_heartbeat(source: Any, phase: str = "planning"):
+async def _with_heartbeat(source: Any, phase: str = "planning", *, started: float | None = None):
     """模型沉默时按拍补心跳，让前端能显示阶段和已用时长。
 
     必须在这一层做而不是在 _iter_ops 里判断时间差：模型不吐 chunk 时那个
     async for 的循环体根本不执行，压根轮不到检查。
+
+    started 给了就从那一刻算已用时长：流式生成先挑表、再起草，两段的心跳要接着算，
+    不能起草一开始就跳回 0 秒。
     """
-    started = time.monotonic()
+    started = time.monotonic() if started is None else started
     iterator = source.__aiter__()
     while True:
         pending = asyncio.ensure_future(iterator.__anext__())
@@ -1068,6 +1160,18 @@ async def _with_heartbeat(source: Any, phase: str = "planning"):
             }
 
 
+async def _heartbeat_until(task: asyncio.Future, *, started: float, phase: str = "planning"):
+    """等 task 做完，期间按拍出心跳（同 _with_heartbeat）。结果由调用方取 task.result()。
+
+    流式生成在流里挑表时用：挑表最长要等 copilot_context.PICK_TIMEOUT_S，这段时间不出声，
+    前端就只能干挂着「正在连接模型」。阶段算「理解需求」：挑表正是在读需求。
+    """
+    while not task.done():
+        done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
+        if not done:
+            yield {"op": "heartbeat", "phase": phase, "elapsed_ms": int((time.monotonic() - started) * 1000)}
+
+
 #: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是
 #: 需求本身有歧义，该让人看了，而不是继续替他烧钱
 _SELF_CHECK_ROUNDS = 2
@@ -1081,6 +1185,7 @@ def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
+    checkers: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
@@ -1098,20 +1203,39 @@ def _blocking_issues(
 
     defaults 是全图默认（graph.defaults）：报告撰写节点的 numbers / claims、审批策略都跟随它，不带上的话
     自查看到的问题和真正的门禁对不上。
+
+    checkers 是各数据源基于数据目录的 SQL 检查器（data/sqlcheck.load_checkers）：调用工具节点里写死的 SQL
+    查出 error 级的问题（一对多关联后重复计算、存量跨期求和）也算挡住，交回模型改；warning、info 不挡。
     """
     try:
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges,
                                          **({"defaults": defaults} if isinstance(defaults, dict) else {})})
     except Exception:  # noqa: BLE001 - 结构不合法留给收尾那一步报
         return None
+    # 带发布级别时 SQL 检查交给门禁（查全图、按级别定挡不挡），自查这边就不再查一遍，免得同一处报两条
+    authored = authored_issues(spec, sources or [], baseline, checkers=None if level else checkers)
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
-           + authored_issues(spec, sources or [], baseline))
+           + [i for i in authored if i["level"] == "error"])
     if level:
         from app.engine.governance import lint_for_publish
 
-        out += [i.model_dump() for i in lint_for_publish(spec, level=level).issues if i.level == "error"]
+        gate = [i.model_dump() for i in lint_for_publish(spec, level=level, checkers=checkers).issues
+                if i.level == "error"]
+        out += _sql_model_hints(gate, spec, checkers)
     return out
+
+
+def _sql_model_hints(issues: list[dict[str, Any]], spec: GraphSpec, checkers: dict[str, Any] | None,
+                     ) -> list[dict[str, Any]]:
+    """门禁报的 SQL 问题只有给人看的那句（ValidationIssue 不带 for_model）；交回模型改时补上给模型的改法。"""
+    if not checkers or not any(i.get("code") in CHECK_CODES for i in issues):
+        return issues
+    from app.data.sqlcheck import graph_checks
+
+    hints = {(node.id, c.code, c.message): c.for_model for node, c in graph_checks(spec.nodes, checkers)}
+    return [{**i, "for_model": hints[key]} if (key := (i.get("node_id"), i.get("code"), i.get("message"))) in hints
+            else i for i in issues]
 
 
 def _changed(spec: GraphSpec, baseline: list[dict[str, Any]] | None) -> set[str]:
@@ -1154,7 +1278,8 @@ def _evidence_source(node: Any) -> bool:
     if node.type == NodeType.INPUT:
         fields = node.config.get("fields")
         return isinstance(fields, list) and any(_numeric_input(f) for f in fields)
-    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.RETRIEVE, NodeType.SUBGRAPH, NodeType.SUPERVISOR)
+    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.MERGE, NodeType.RETRIEVE, NodeType.SUBGRAPH,
+                         NodeType.SUPERVISOR)
 
 
 def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
@@ -1181,7 +1306,7 @@ def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any
 
 
 def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str, Any]] | None = None,
-                    ) -> list[dict[str, Any]]:
+                    *, checkers: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """助手搭图时要打回、运行时却不挡的写法，按 error 交回模型改：
 
     - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
@@ -1189,6 +1314,11 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
     - report_no_source：报告撰写节点的上游没有任何证据来源（运行时只给一条警告，报告里的数全没有出处）。
       metrics_from 指向不是口径卡的节点，validate 本来就报 error，自查照样交回去
+
+    另外，给了 checkers（各数据源基于数据目录的 SQL 检查器）时，调用工具节点里写死的 SQL 再对照目录查一遍
+    （code 是 data/sqlcheck.CHECK_CODES 里的规则编号），级别照检查结果：error 交回模型改，warning、info
+    由调用方放进交付的问题清单。列名都对不上的 SQL 先改列名，这一轮不叠加目录检查。Agent 节点的 SQL 要到
+    运行时才写出来，这里拿不到，由数据源查询工具在执行后检查。
     """
     changed = _changed(spec, baseline)
     out: list[dict[str, Any]] = []
@@ -1212,6 +1342,7 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
             continue
         found = sql_unknown_columns(sql, source)
         if not found:
+            out += _catalog_issues(node.id, sql, (checkers or {}).get(source.name))
             continue
         unknown, known = found
         listed = "、".join(known[:20]) + (f" 等 {len(known)} 列" if len(known) > 20 else "")
@@ -1223,6 +1354,14 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
                                  f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
                                  "别凭空猜列名"})
     return out
+
+
+def _catalog_issues(node_id: str, sql: str, checker: Any) -> list[dict[str, Any]]:
+    """一个调用工具节点的 SQL 对照数据目录查出来的问题，形状和别的自查问题一样（node_id、field 都在），
+    另带 table、column、relation_id、sql_excerpt 给界面定位。"""
+    if checker is None:
+        return []
+    return [{**check, "node_id": node_id, "edge_id": None, "field": "args.sql"} for check in checker.check_dicts(sql)]
 
 
 # --------------------------------------------------------------------------
@@ -1578,6 +1717,12 @@ def dropped_tool_warnings(changes: list[dict[str, Any]], instruction: str) -> li
 def _repair_request(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[dict[str, Any]],
 ) -> str:
+    """自查交回修正的请求：只写图和问题。
+
+    数据源上下文（挑中的表、字段、目录、连接条件）在 system 里，修正轮和起草用同一条 system，
+    不重新挑表：两次挑出来的表不一样，模型前后看到的结构就对不上，改着改着换了一张表。
+    猜错的列名由 sql_unknown_column 的 for_model 带回那几张表的真实列。
+    """
     graph = {"nodes": list(nodes.values()), "edges": edges}
     return (
         "这是你刚搭好的工作流：\n"
@@ -1599,21 +1744,26 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     """
     from fastapi.responses import StreamingResponse
 
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
-    tool_list = _tool_catalog(sources)
-    datasources = _datasource_section(sources) + _scope_note(sources, scope is not None)
-    system = (
-        "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
-        "结构要求：\n"
-        "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
-        "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
-        "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
-        "4. 只能用上面列出的工具名\n"
-        "5. 能用 3 个节点解决就别堆 8 个\n\n"
-        f"{_STREAM_PROTOCOL}"
-    )
+    # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
+    checkers = await load_checkers(session, sources)
+
+    def system_for(context: copilot_context.DatasourceContext) -> str:
+        return (
+            "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
+            f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}"
+            f"{context.section()}{_scope_note(sources, scope is not None)}\n\n"
+            "结构要求：\n"
+            "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
+            "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
+            "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
+            "4. 只能用上面列出的工具名\n"
+            "5. 能用 3 个节点解决就别堆 8 个\n\n"
+            f"{_STREAM_PROTOCOL}"
+        )
 
     # 现有图状态：修改场景从 base_graph 起步，新建场景从空图起步
     nodes: dict[str, dict[str, Any]] = {}
@@ -1641,13 +1791,18 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
 
-    messages = [("system", system),
-                ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
+    human = _with_history(user, await _history_section(session, payload.conversation_id))
     # 兜底用：模型只发了改动操作时，把它们重放到这张图上
     prev_graph = await _previous_graph(session, payload.conversation_id)
     # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
     baseline = copy.deepcopy(
         (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
+    # 数据源上下文：读目录、拿挑表模型都要用请求的会话，开流之前做完；挑表本身放进流里，期间照常发心跳。
+    # 现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表一律给全字段
+    plan = await copilot_context.plan_context(
+        sources, graph=payload.base_graph if (payload.base_graph or {}).get("nodes") else prev_graph)
+    picker, unavailable = await _picker(session, payload, plan)
+    need = await _pick_need(session, payload)
 
     async def event_stream():
         explanation = ""
@@ -1656,18 +1811,49 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 建完要不要跑，由模型在 done.run 里表态
         autorun = True
         yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
+        # 大库先按需求挑表。resolve 自己兜住了挑表的所有失败（退回只列表名），这里的 except 只防组装出意外：
+        # 挑表是让模型少猜，不能因为它让这一轮生成失败
+        started = time.monotonic()
+        pending = asyncio.ensure_future(plan.resolve(picker, need=need, unavailable=unavailable))
         try:
-            async for op in _with_heartbeat(_iter_ops(model, messages)):
+            async for beat in _heartbeat_until(pending, started=started):
+                yield _sse(beat)
+            context = pending.result()
+        except Exception as e:  # noqa: BLE001
+            context = plan.fallback(f"组装数据源上下文时出错：{explain_error(e)[0]}")
+        finally:
+            # 用户中途断开时流在上面的 yield 处被关掉，挑表的调用不能留在后台接着等
+            if not pending.done():
+                pending.cancel()
+        # 这一份 system 一直用到最后：自查交回修正时沿用同一份上下文，不重新挑表
+        system = system_for(context)
+        messages = [("system", system), ("human", human)]
+        if (shown := context.op()) is not None:
+            yield _sse(shown)
+        # reply 先压着：模型可能把目录修改提案写在 reply 后面，而前端收到 reply 就收尾（画布那边之后的操作一律不收），
+        # 提案得排在它前面转出。reply 之后只再认 catalog_patch，其余一概不理
+        replied: dict[str, Any] | None = None
+        patches = 0
+        try:
+            async for op in _with_heartbeat(_iter_ops(model, messages), started=started):
                 kind = op.get("op")
                 # 思考和心跳不是图操作，不进 _apply_op，直接转给前端
                 if kind in ("thinking", "heartbeat"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
                     continue
+                if kind == "catalog_patch":
+                    # 目录修改提案：核对后转给前端做成卡片，人点「保存」才写。不进图，也不算这一轮的图操作
+                    if (checked := await catalog_patch_op(op, sources)) is not None:
+                        patches += 1
+                        yield _sse(checked)
+                    continue
+                if replied is not None:
+                    continue
                 if kind == "reply":
-                    # 这句话不需要工作流。原样转给前端，然后收流——后面那套
+                    # 这句话不需要工作流：等模型说完（只收它后面的提案）再转给前端、收流——后面那套
                     # 排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
-                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
-                    return
+                    replied = op
+                    continue
                 if kind == "done":
                     explanation = str(op.get("explanation", ""))
                     # 用户要的是流程本身时（"设计一个每天跑的工作流"），
@@ -1681,6 +1867,14 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                         skipped_types.append(str(bad_type))
                 if changed or kind in ("plan", "done"):
                     yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
+            if replied is not None:
+                yield _sse(replied)
+                return
+            # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
+            # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
+            if patches and all(o.get("op") == "plan" for o in seen_ops):
+                yield _sse({"op": "reply", "text": PATCH_ONLY_REPLY})
+                return
             # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
             # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
             if all(o.get("op") == "plan" for o in seen_ops):
@@ -1721,7 +1915,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         repaired = 0
         for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
-            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
+            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
             if not errors:
                 break
             yield _sse({"op": "check", "status": "repairing", "round": round_no, "issues": errors})
@@ -1739,7 +1933,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                             "message": f"自查修正失败：{explain_error(e)[0]}", "detail": raw_error(e)})
                 break
             repaired = round_no
-        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline)
+        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1763,9 +1957,11 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             issues = [i.model_dump() for i in validate_graph(spec).issues if i.level != "info"]
             issues += _issue_dicts(scope_issues(list(nodes.values()), scope),
                                    "datasource_out_of_scope")
-            # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见
-            issues += [{**i, "level": "warning"} for i in authored_issues(spec, sources, baseline)
-                       if i["code"] == "sql_unknown_column"]
+            # 自查没改好的猜列名留在画布上：运行时不挡（结构缓存可能旧了），但要看得见。
+            # 对照数据目录的 SQL 检查照原级别列出：warning、info 本来就不返工，改不好的 error 也在这里看得见
+            authored = authored_issues(spec, sources, baseline, checkers=checkers)
+            issues += [{**i, "level": "warning"} for i in authored if i["code"] == "sql_unknown_column"]
+            issues += [i for i in authored if i["code"] in CHECK_CODES]
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -1847,6 +2043,12 @@ def _publish_fix_request(graph: dict[str, Any], errors: list[dict[str, Any]], le
     )
 
 
+def _publish_fix_need(errors: list[dict[str, Any]], level: str) -> str:
+    """发布前修复挑表用的需求：要过哪一级的发布前检查、挡着的是哪些问题。"""
+    return (f"让这张工作流通过「{_LEVEL_WORD.get(level, level)}」级别的发布前检查，挡住发布的问题：\n"
+            + "\n".join(f"- {_issue_line(i)}" for i in errors))
+
+
 async def assist_publish_fix(
     session: AsyncSession, graph: dict[str, Any], *, level: str,
     provider: str | None = None, model: str | None = None,
@@ -1862,28 +2064,34 @@ async def assist_publish_fix(
     """
     from app.engine.autofix import forbidden_changes, judge
 
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, None)
+    # 和发布接口同一套 SQL 检查：受管级别里 SQL 的 error 也是挡住发布的问题，一并交给助手改
+    checkers = await load_checkers(session, sources)
     base = copy.deepcopy(graph)
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
     before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
     baseline = list(copy.deepcopy(before_nodes).values())
     errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
-                              defaults=base.get("defaults")) or []
+                              defaults=base.get("defaults"), checkers=checkers) or []
     out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
                            "ops": []}
     if not errors:
         out["summary"] = "没有阻止发布的错误，无需交给助手"
         return out
+    request = GenerateIn(instruction="发布前自动修复", provider=provider, model=model)
     try:
-        chat, _ = await _op_model(
-            session, GenerateIn(instruction="发布前自动修复", provider=provider, model=model))
+        chat, _ = await _op_model(session, request)
     except ProviderNotConfigured as e:
         out["summary"] = _unconfigured(e)
         return out
+    # 和画布上改图同一套数据源上下文：挑表的需求是挡住发布的这些问题，图里查过的表一律给全字段
+    context = await _datasource_context(session, sources, request, need=_publish_fix_need(errors, level), graph=base)
 
     system = (
         "你是一个 agent 工作流编排专家。现在要做的是：让一张工作流过发布前检查，以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
         f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
     )
     nodes = copy.deepcopy(before_nodes)
@@ -1894,7 +2102,8 @@ async def assist_publish_fix(
     try:
         async for op in _iter_ops(chat, [("system", system), ("human", _publish_fix_request(base, errors, level))]):
             kind = op.get("op")
-            if kind in ("thinking", "heartbeat"):
+            # 目录修改提案只在用户亲口陈述数据事实时才有；这里的「用户消息」是系统拼的修复请求，提了也不转
+            if kind in ("thinking", "heartbeat", "catalog_patch"):
                 continue
             if kind == "plan":
                 plan = str(op.get("summary") or "")
@@ -1924,7 +2133,7 @@ async def assist_publish_fix(
     proposed = _proposed_graph(base, nodes, edges)
     reasons = forbidden_changes(base, proposed, tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
-                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
         out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:
@@ -2006,6 +2215,12 @@ def _upgrade_assist_request(graph: dict[str, Any], spec: GraphSpec, feeders: lis
     )
 
 
+def _upgrade_need(feeders: list[Any]) -> str:
+    """升级挑表用的需求：哪几段沙箱代码要改写成口径卡表达式（改写要用到上游查库节点查出的列）。"""
+    return ("把喂给口径卡的纯算术沙箱代码改写成口径卡表达式，表达式直接读上游查库节点查出的列。涉及的代码节点："
+            + "、".join(f"「{code.title}」" for code, _cards in feeders))
+
+
 def _kept_code(spec: GraphSpec) -> list[str]:
     """assist 之后仍然喂着口径卡的计算角色沙箱代码：不是纯算术、或者 Copilot 拿不准的，保留原样并警告。"""
     from app.engine.upgrade import compute_feeders
@@ -2039,26 +2254,33 @@ async def assist_upgrade(
     if not feeders:
         out["summary"] = "口径卡的输入均不来自负责计算的沙箱代码，无需交给助手改写"
         return out
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, None)
+    # 基于数据目录的 SQL 检查器：自查和最终判断都带上，和发布门禁一个口径（受管级别下一对多关联后求和这类 error
+    # 会挡发布）。不带的话，助手改出这种 SQL 照样被采纳，交出去的图要到发布时才被拦
+    checkers = await load_checkers(session, sources)
     before_nodes = {str(n["id"]): n for n in copy.deepcopy(base.get("nodes") or []) if isinstance(n, dict)}
     before_edges = [e for e in copy.deepcopy(base.get("edges") or []) if isinstance(e, dict)]
     baseline = list(copy.deepcopy(before_nodes).values())
     defaults = base.get("defaults")
     base_errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
-                                   defaults=defaults) or []
+                                   defaults=defaults, checkers=checkers) or []
     known = {_sig(e) for e in base_errors}
     out["warnings"] = _kept_code(spec)
+    request = GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model)
     try:
-        chat, _ = await _op_model(
-            session, GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model))
+        chat, _ = await _op_model(session, request)
     except ProviderNotConfigured as e:
         out.update(ok=False, summary=_unconfigured(e))
         return out
+    # 同一套数据源上下文：改写时要用到查库节点查出的列，图里查过的表一律给全字段
+    context = await _datasource_context(session, sources, request, need=_upgrade_need(feeders), graph=base)
 
     system = (
         "你是一个 agent 工作流编排专家。现在要做的是：把一张工作流里喂给口径卡的纯算术沙箱代码改写成口径卡表达式，"
         "以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{_datasource_section(sources)}\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
         f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
     )
     nodes = copy.deepcopy(before_nodes)
@@ -2071,7 +2293,8 @@ async def assist_upgrade(
         nonlocal plan
         async for op in _iter_ops(chat, [("system", system), ("human", request)]):
             kind = op.get("op")
-            if kind in ("thinking", "heartbeat"):
+            # 同发布修复：这里没有用户陈述的数据事实，目录修改提案不收
+            if kind in ("thinking", "heartbeat", "catalog_patch"):
                 continue
             if kind in ("plan", "done"):
                 # 修补轮的开场和收尾不是新方案，不覆盖第一轮的说明
@@ -2094,7 +2317,8 @@ async def assist_upgrade(
         await collect(_upgrade_assist_request(base, spec, feeders), first=True)
         # 自查：和搭图同一套规则，只把这一轮冒出来的 error 交回去改（原来就有的不归这一轮管）
         for _ in range(_SELF_CHECK_ROUNDS):
-            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults)
+            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults,
+                                   checkers=checkers)
             fresh = [e for e in now or [] if _sig(e) not in known]
             if not effective or not fresh:
                 break
@@ -2111,7 +2335,7 @@ async def assist_upgrade(
     proposed = _proposed_graph(base, nodes, edges)
     reasons = forbidden_changes(base, proposed, tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
-                             baseline=baseline, level=level, defaults=proposed.get("defaults"))
+                             baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
         out["reason"] = "助手的修改降低了要求，已作废：" + "；".join(reasons)
     elif after is None:
@@ -2192,7 +2416,11 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
             out["notes"] = [n for n in out["notes"] if n["rule"] != "R5" or n["node_id"] in still]
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
-    issues = publish_issues(GraphSpec.model_validate(out["graph"]), level=payload.level)
+    from app.data.sqlcheck import graph_sources, load_checkers_by_name
+
+    upgraded = GraphSpec.model_validate(out["graph"])
+    checkers = await load_checkers_by_name(session, graph_sources(upgraded.nodes))
+    issues = publish_issues(upgraded, level=payload.level, checkers=checkers)
     out["issues"] = [i.model_dump() for i in issues]
     out["ok"] = not any(i.level == "error" for i in issues)
     return out

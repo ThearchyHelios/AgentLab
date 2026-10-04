@@ -18,17 +18,18 @@ import {
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { EVIDENCE_TEXT, JUDGE_TEXT, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment,
-  EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
+  EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceMerge, EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal,
+  EvidenceSegment, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
+import { SqlCheckList } from './SqlChecks'
 
 /**
  * 证据面板：点开报告里的一个片段，看它从哪来。
@@ -1106,12 +1107,30 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   const dash = rendered === NONE || entry?.rendered === NONE
   const missing = entry?.status === 'missing_input' || (value == null && (dash || !resolved))
   const unshowable = !missing && dash && value != null
+  // 拿截断的查询结果整组算出来的：值是真的算出来的，但只算到了取回的那部分，出具已按缺口降档
+  const incomplete = step?.incomplete === true || entry?.incomplete === true
+  const incompleteReason = step?.incomplete_reason || entry?.incomplete_reason || EVIDENCE_TEXT.incompleteFallback
+  // 所依据的查询对照数据目录查出了错误级的问题：值照算，结果不可靠，出具同样按缺口降档。问题和改法在查询步骤里
+  const sqlFailed = step?.sql_check_failed === true || entry?.sql_check_failed === true
+  const sqlReason = step?.sql_check_reason || entry?.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback
 
   return (
     <Part title={EVIDENCE_TEXT.metric} data-ev-metric="">
       <div className="flex flex-wrap items-baseline gap-x-2">
         <span className="font-medium">{name}</span>
         {resolved && rendered && <span className="mono tnum text-sm" data-ev-value="">{rendered}</span>}
+        {incomplete && (
+          <span className="chip" data-ev-incomplete="" title={incompleteReason}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.incomplete}
+          </span>
+        )}
+        {sqlFailed && (
+          <span className="chip" data-ev-sql-check-failed="" title={sqlReason}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.sqlCheckFailed}
+          </span>
+        )}
       </div>
       {(caliber || version || artifact || from) && (
         <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-2xs text-dim">
@@ -1127,6 +1146,12 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
       )}
       <Integrity step={step} seal={seal} />
       {missing && <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing="">{EVIDENCE_TEXT.missingValue}</p>}
+      {incomplete && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-incomplete-reason="">{incompleteReason}</p>
+      )}
+      {sqlFailed && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-sql-check-reason="">{sqlReason}</p>
+      )}
       {unshowable && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-unshowable="">
           {EVIDENCE_TEXT.unshowable(valueText(value))}
@@ -1201,12 +1226,16 @@ function IntegrityList({ code, items }: { code: string; items: string[] }) {
 function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) {
   const host = useEvidenceHost()
   const missing = input.status === 'missing' || input.value == null
+  // Agent 交来、被截断切开的数组字段：对它计数、求和只算到了取回的那部分
+  const cut = !missing && input.truncated === true
   const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
   const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
-  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`]
-    .filter(Boolean).join('')
-  const style = missing ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
-  const body = <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : ''}</span>
+  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
+    cut && ` · ${EVIDENCE_TEXT.inputTruncated}`].filter(Boolean).join('')
+  const style = missing || cut ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
+  const body = (
+    <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : cut ? '（已截断）' : ''}</span>
+  )
   return (
     <li className="max-w-full">
       {link ? (
@@ -1330,15 +1359,52 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
               className="min-w-0 flex-1 truncate rounded-sm text-2xs font-medium text-faint focus:outline-none focus-visible:outline focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]">
           {EVIDENCE_TEXT.query(alias)}
           {step.tool && <span className="mono ml-1.5 font-normal">{step.tool}</span>}
+          {step.merge && <span className="ml-1.5 font-normal">{NODE_TYPE_LABEL.merge}</span>}
+          {step.merged_into && (
+            <span className="ml-1.5 font-normal" data-ev-merged-into={step.merged_into}>
+              · {MERGE_TEXT.mergedInto(step.merged_into)}
+            </span>
+          )}
         </span>
         {host.onNode && <NodeChip id={step.node_id} />}
-        {step.sql && <CopyChip label={EVIDENCE_TEXT.copySql} text={() => step.sql ?? ''} />}
+        {step.sql && (
+          <CopyChip label={step.merge ? MERGE_TEXT.copySql : EVIDENCE_TEXT.copySql} text={() => step.sql ?? ''} />
+        )}
       </div>
+      {!!step.catalog?.length && (
+        // SQL 检查对照的是哪一版数据目录（查询当时冻结进表结构快照的那份）：事后目录改了、升了版本，看得出这次按的是哪一版
+        <div className="mb-1 text-2xs text-faint [overflow-wrap:anywhere]" data-ev-catalog=""
+             title={RUN_SQL_CHECK_TEXT.catalogHint}>
+          {RUN_SQL_CHECK_TEXT.catalogLine(step.catalog.map((c) => ({ name: c.label || c.table, version: c.version })))}
+        </div>
+      )}
+      {step.merge && <MergeInputs merge={step.merge} />}
+      {step.sql && step.merge && <div className="mb-0.5 text-2xs text-faint">{MERGE_TEXT.sql}</div>}
       {step.sql && (
         <pre className="mono mb-1.5 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-bg px-1.5 py-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]"
              data-ev-sql="">
           {step.sql}
         </pre>
+      )}
+      {!!step.checks?.length && (
+        // 这次查询对照数据目录查出的问题：说明、涉及的表和列、SQL 片段。没查出问题时接口不给这个键
+        <div className="mb-1.5" data-ev-sql-checks="">
+          <div className="mb-0.5 text-2xs text-faint">{SQL_CHECK_TEXT.title}</div>
+          <SqlCheckList checks={step.checks} />
+        </div>
+      )}
+      {!!step.merge?.warnings.length && (
+        <div className="mb-1.5 text-2xs" data-ev-merge-warnings="">
+          <div className="mb-0.5 text-faint">{MERGE_TEXT.executionWarnings}</div>
+          <ul className="space-y-0.5">
+            {step.merge.warnings.map((w, k) => (
+              <li key={k} className="flex items-start gap-1 leading-snug" style={{ color: 'var(--st-waiting)' }}>
+                <AlertTriangle size={10} className="mt-[2px] shrink-0" aria-hidden />
+                <span className="min-w-0 [overflow-wrap:anywhere]">{w.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
       {bad.length > 0 && (
         <IntegrityList code={bad.map((k) => (k === 'hash' ? 'query-hash' : k)).join(' ')}
@@ -1355,6 +1421,7 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
         // 没有行：快照不在封存范围里、哈希对不上、取不回来。接口说了原因就照原话
         <p className="text-2xs text-dim" data-ev-query-note="">{step.note || EVIDENCE_TEXT.queryMissing}</p>
       )}
+      {!!step.merge?.traced.length && <MergeTraces alias={alias} merge={step.merge} />}
       <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-faint">
         {win.windowed && win.total != null && (
           <span data-ev-window="">
@@ -1388,6 +1455,66 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
 
 /** 窗口表格最前面那一列：快照里的行号，从 1 数 */
 const ROW_NO = '#'
+
+/**
+ * 合并查询的表级来历：合并了哪几个输入（合并 SQL 里的别名 → 报告目录里的编号、节点、行数、数据源）。
+ * 输入不在这份报告的证据目录里时照实说：它的那次查询点不开
+ */
+function MergeInputs({ merge }: { merge: EvidenceMerge }) {
+  const host = useEvidenceHost()
+  return (
+    <div className="mb-1.5 text-2xs" data-ev-merge="">
+      <div className="mb-0.5 text-faint">{MERGE_TEXT.inputs(merge.inputs.length)}</div>
+      <ul className="space-y-0.5">
+        {merge.inputs.map((i) => (
+          <li key={i.alias} className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5" data-ev-merge-input={i.alias}>
+            <span className="mono rounded bg-bg px-1">{i.alias}</span>
+            {i.query
+              ? <span className="mono text-dim">{EVIDENCE_TEXT.query(i.query)}</span>
+              : <span style={{ color: 'var(--st-waiting)' }}>{MERGE_TEXT.notInCatalog}</span>}
+            <span className="min-w-0 truncate text-dim" title={i.node_id ?? undefined}>{i.label || i.node_id || NONE}</span>
+            <span className="text-faint">
+              {[typeof i.rows === 'number' ? MERGE_TEXT.rows(i.rows) : '', i.source ? MERGE_TEXT.source(i.source) : '']
+                .filter(Boolean).join(' · ')}
+            </span>
+            {host.onNode && i.node_id && <NodeChip id={i.node_id} />}
+            {!!i.checks?.length && (
+              // 输入查询自己的 SQL 检查：被引用的格追不到逐格来历时，下面没有这个输入的查询步骤，问题只能在这里看到
+              <div className="mt-0.5 w-full" data-ev-merge-input-checks={i.alias}>
+                <div className="mb-0.5 text-faint">{RUN_SQL_CHECK_TEXT.mergeInputChecks(i.alias)}</div>
+                <SqlCheckList checks={i.checks} />
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+/**
+ * 被引用的格追到了哪个输入的哪一格（逐格来历）。追不到的照实说只有表级来历：宁可不指，也不指错。
+ * 追到的那一格在下面那个输入的查询步骤里高亮
+ */
+function MergeTraces({ alias, merge }: { alias: string; merge: EvidenceMerge }) {
+  return (
+    <div className="mt-1.5 text-2xs" data-ev-merge-traced="">
+      <div className="mb-0.5 text-faint">{MERGE_TEXT.traced}</div>
+      <ul className="space-y-0.5">
+        {merge.traced.map((t, k) => (
+          <li key={k} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5"
+              data-ev-merge-trace={t.input ? 'cell' : 'none'}>
+            <span className="mono text-dim">{MERGE_TEXT.cellAt(alias, t.cell[0], t.cell[1])}</span>
+            <span className="text-faint" aria-hidden>←</span>
+            {t.input && t.row != null && t.column
+              ? <span className="mono">{MERGE_TEXT.cellAt(t.query ?? t.input, t.row, t.column)}</span>
+              : <span className="[overflow-wrap:anywhere]" style={{ color: 'var(--st-waiting)' }}>{MERGE_TEXT.noLineage}</span>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
 
 /** 接口没给查询步骤时：文档目录里记着的那次查询（编号、工具、行数），并照实说行没取到 */
 function QueryFallback({ entry, alias, where, pending, failed }: {

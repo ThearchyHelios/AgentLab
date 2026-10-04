@@ -47,6 +47,7 @@ from app.providers.factory import (
     bind_tools_safely,
     get_chat_model,
 )
+from app.engine.sql_problems import event_checks
 from app.tools.datasource import QUERY_PREFIX, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -518,6 +519,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             **({"query_artifact": query["artifact"]} if query else {}),
             # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
             **({"schema_artifact": query["schema_artifact"]} if query and query.get("schema_artifact") else {}),
+            # 这次查询的 SQL 检查结果单独带上：preview 截到前 2000 个字符，checks 通常在截掉的那段里
+            **({"checks": checks} if ok and name.startswith(QUERY_PREFIX) and (checks := event_checks(content)) else {}),
             **extra,
         )
         outcome: dict[str, Any] = {"content": content, "ok": ok, "duration_ms": elapsed}
@@ -1163,6 +1166,10 @@ def _verify_rows(schema: dict[str, Any], told: Any, source: Any, by_alias: dict[
                                **({"columns": names} if fields is not None else {"column": names[""]})}
     cited = {"ref": f"{call}.r{first}-{last}" + ("" if fields is not None else f".{names['']}"), **base,
              "locator": locator, "eid": make_eid("rows", q["artifact"], locator)}
+    if content.get("truncated") is True and last == len(content.get("rows") or []) - 1:
+        # 行段到了截断快照的末行：库里还有没取回的行，可能也属于这个字段。口径卡对它整组求和、计数时
+        # 据此标「不完整」（metrics._truncated_field）。停在末行之前的不标：引用的每一行都在快照里
+        cited["truncated"] = True
     same = isinstance(told, list) and len(told) == len(truth) and all(
         (isinstance(m, dict) and all(same_value(m.get(f), t[f]) for f in t)) if isinstance(t, dict)
         else same_value(m, t)

@@ -694,6 +694,198 @@ await section('长表名、Copilot 结局、问数据的分段', async () => {
   await q.page.close()
 })
 
+await section('合并查询：输入、合并 SQL、结果预览，警告各占一行并给出下一步', async () => {
+  const { page, errors } = await open('syn=merge', { w: 1100, h: 900, name: 'merge' })
+  const row = page.locator('[data-step-code="merge"]').first()
+  const line = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('合并那一行说合并的是哪几个输入，行尾写行数', line.includes('合并 s、v 的查询结果') && line.includes('8 行'), line)
+  check('有警告：这一行标成警告、说有几条、指到下方', line.includes('2 条警告，详见本节点下方'), line)
+  await row.locator('button').first().click()
+  await page.waitForTimeout(200)
+  const merge = row.locator('[data-step-merge]')
+  const inputs = (await merge.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('展开：合并自 2 个输入，每个写别名、节点名、行数、数据源', inputs.includes('合并自 2 个输入')
+    && ['s', '门店销售', 'v', '到店人数', '4 行', '数据源 stores', '数据源 members'].every((t) => inputs.includes(t)), inputs)
+  check('合并 SQL 有标签、带复制', (await row.innerText()).includes('合并 SQL')
+    && await row.getByRole('button', { name: '复制合并 SQL' }).count() === 1)
+  check('结果预览画成表格（列是合并结果的列）', (await row.locator('table th').allInnerTexts()).some((t) => t.includes('到店人数')))
+  // 合并结果 8 行、预览只存了 5 行：说「此处仅为预览」和「显示前 5 / 8 行」，不说「查询已达行数上限」（A3）
+  const foot = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('预览只存了前几行：写「显示前 5 / 8 行」和「仅为预览」，不说查询已达行数上限', foot.includes('显示前 5 / 8 行')
+    && foot.includes('此处仅为预览') && !foot.includes('查询已达行数上限'), foot.slice(-120))
+  check('输入写在合并 SQL 前面：先看合并的是什么，再看怎么合并', await row.evaluate((el) => {
+    const m = el.querySelector('[data-step-merge]')
+    const pre = el.querySelector('pre')
+    return !!m && !!pre && !!(m.compareDocumentPosition(pre) & Node.DOCUMENT_POSITION_FOLLOWING)
+  }))
+  const key = page.locator('[data-step-code="merge_key_type"]').first()
+  check('键类型不一致：标题点名两列，下一步不用展开就看得到', (await key.innerText().catch(() => '')).includes('合并键类型不一致：s.门店 与 v.门店')
+    && (await key.locator('[data-step-next]').innerText().catch(() => '')).includes('CAST'))
+  const grew = page.locator('[data-step-code="merge_rows_grew"]').first()
+  check('行数放大：说合并键可能不唯一，下一步说怎么改', (await grew.innerText().catch(() => '')).includes('合并键可能不唯一')
+    && (await grew.locator('[data-step-next]').innerText().catch(() => '')).includes('聚合到相同粒度'))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+
+  const narrow = await open('syn=merge&dense=1', { w: 380, h: 900 })
+  await narrow.page.locator('[data-step-code="merge"] button').first().click()
+  await narrow.page.waitForTimeout(200)
+  const overflow = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('窄栏展开合并那一行：输入清单、合并 SQL、预览都不撑出横向滚动', overflow <= 0, `${overflow}px`)
+  await narrow.page.close()
+})
+
+await section('并行查询各配各的；查询的 SQL 检查；指标的问题指到来源查询的 SQL（A1、B2）', async () => {
+  const { page, errors } = await open('syn=parallel&link=1', { w: 1100, h: 900, name: 'parallel' })
+  const qa = page.locator('[data-node-id="q_a"]').filter({ hasText: 'SQL 检查：1 处错误' }).last()
+  check('出问题的那条查询：行上就说「SQL 检查：1 处错误」', await qa.count() === 1)
+  await qa.locator('button').first().click()
+  await page.waitForTimeout(200)
+  const list = qa.locator('[data-step-sql-checks] [data-sql-check="fanout_sum"][data-level="error"]')
+  const text = (await qa.locator('[data-step-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('展开：用 SQL 检查清单列出级别、规则名、说明、涉及的表和列', await list.count() === 1 && text.includes('错误')
+    && text.includes('一对多关联后重复计算') && text.includes('orders.total_amount') && !text.includes('fanout_sum'), text)
+  const qb = (await page.locator('[data-node-id="q_b"]').last().innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('另一条查询没有检查结果，也没被配上别人的结果', !qb.includes('SQL 检查') && !qb.includes('119'), qb)
+  const metric = page.locator('[data-step-code="metric_sql_check"]')
+  check('两个指标出自同一条查询：时间线一行', await metric.count() === 1, String(await metric.count()))
+  const fix = metric.locator('[data-fix="canvas"]')
+  check('「打开设置」落到来源查询节点的 SQL：写「打开「订单金额查询」的 SQL」', (await fix.innerText().catch(() => '')).trim()
+    === '打开「订单金额查询」的 SQL' && await fix.getAttribute('data-fix-node') === 'q_a'
+    && await fix.getAttribute('data-fix-field') === 'args.sql', await fix.innerText().catch(() => ''))
+  await fix.click()
+  const opened = await page.evaluate(() => window.__opened ?? [])
+  check('……点了打开的是来源查询节点的 args.sql，不是口径卡', JSON.stringify(opened) === JSON.stringify([['q_a', 'args.sql']]),
+    JSON.stringify(opened))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+})
+
+await section('参考了哪些表：画布右栏和问数据页（context 操作）', async () => {
+  const c = await open('syn=copilot-context&dense=1', { w: 380, h: 800, name: 'copilot-context' })
+  const row = c.page.locator('[data-step-code="copilot_context"]')
+  check('画布右栏：一行说参考了几张表', await row.count() === 1 && (await row.innerText()).includes('参考了 5 张表'),
+    await row.count() ? await row.innerText() : '没有这一行')
+  check('表名收在展开区，不铺满窄栏', !(await row.innerText()).includes('channel_visits'))
+  await row.locator('button').first().click()
+  await c.page.waitForTimeout(150)
+  const expanded = await row.innerText()
+  check('展开看到按数据源分组的表名', expanded.includes('「scenic」按需求从 51 张表中挑出 3 张')
+    && expanded.includes('channel_visits') && expanded.includes('「shop」全部 2 张表'), expanded.slice(0, 160))
+  const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('展开后不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+  check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
+  await c.page.close()
+
+  const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-fallback' })
+  const fb = f.page.locator('[data-step-code="copilot_context"]')
+  check('挑表失败：写明只给了表名', await fb.count() === 1 && (await fb.innerText()).includes('未能按需求挑选，已提供全部表名'))
+  await fb.locator('button').first().click()
+  await f.page.waitForTimeout(150)
+  check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))
+  await f.page.close()
+
+  const q = await open('syn=chat', { w: 1100, h: 800, name: 'chat-context' })
+  check('问数据页：执行开始后这一行随「规划」收起', !(await q.page.locator('body').innerText()).includes('参考了 2 张表'))
+  await q.page.locator('button', { hasText: '规划' }).first().click()
+  await q.page.waitForTimeout(200)
+  const qrow = q.page.locator('[data-step-code="copilot_context"]')
+  check('问数据页：点开「规划」看到参考了几张表', await qrow.count() === 1 && (await qrow.innerText()).includes('参考了 2 张表'))
+  await qrow.locator('button').first().click()
+  await q.page.waitForTimeout(150)
+  check('问数据页：展开看到表名', (await qrow.innerText()).includes('v_device_kpi、dim_device'))
+  check('问数据页：没有运行时报错', q.errors.length === 0, q.errors.join(' | '))
+  await q.page.close()
+})
+
+await section('建议更新数据目录：卡片的保存、忽略和 409（catalog_patch 操作）', async () => {
+  // 保存、预览都在浏览器层答掉：预览页没有真的数据源，检查也不许写库
+  const detail = (version) => ({ table_name: 'visits', in_schema: true, notes: {}, version, updated_at: null, updated_by: '检查脚本',
+    structure: null, system_notes: false, usage: 0 })
+  const c = await open('syn=catalog-patch&dense=1', { w: 380, h: 900, name: 'catalog-patch' })
+  const sent = []
+  let conflictOnce = true
+  await c.page.route('**/api/datasources/src-scenic/catalog/visits/patch**', async (route) => {
+    const req = route.request()
+    const body = req.postDataJSON()
+    sent.push({ url: req.url(), body, actor: req.headers()['x-actor'] })
+    if (req.url().endsWith('/patch/preview')) {
+      // 重新载入：别人刚把码值补了一个 8，改前改后按最新的算
+      return route.fulfill({ json: { table_name: 'visits', version: 4, problems: [], changes: [
+        { path: 'columns.status.codes', before: { 1: '有效', 0: '作废', 8: '退票' }, before_status: 'confirmed',
+          after: { 1: '有效', 0: '作废', 8: '退票', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+        { path: 'valid_filter', before: 'status = 1', before_status: 'proposed', after: 'status = 1 AND status <> 9',
+          value: 'status = 1 AND status <> 9', reason: '统计时要排除作废记录', state: 'change' },
+      ] } })
+    }
+    if (conflictOnce) {
+      conflictOnce = false
+      return route.fulfill({ status: 409, json: { detail: '表「visits」的数据目录刚被修改过，请重新载入后再提交' } })
+    }
+    return route.fulfill({ json: detail(5) })
+  })
+  await c.page.route('**/api/datasources/src-scenic/catalog/visits/impact', (route) =>
+    route.fulfill({ json: { table: 'visits', templates: [
+      { workflow_id: 'wf-daily', name: '入园日报', version: 4, level: 'governed', impact: 'direct',
+        nodes: [{ node_id: 'q', label: '查询入园人数', type: 'tool', impact: 'direct' }] },
+      { workflow_id: 'wf-ask', name: '客流分析', version: 2, level: 'published', impact: 'possible',
+        nodes: [{ node_id: 'ask', label: '分析客流', type: 'agent', impact: 'possible' }] },
+    ] } }))
+  const card = c.page.locator('[data-catalog-patch="visits"]')
+  check('卡片在：标题写「建议更新数据目录」', await card.count() === 1 && (await card.innerText()).includes('建议更新数据目录'))
+  const codes = card.locator('[data-patch-change="columns.status.codes"]')
+  check('逐项写改到哪儿：「列 status 的码值」', (await codes.innerText()).includes('列 status 的码值'))
+  check('改前、改后、理由都在', (await codes.locator('[data-patch-before]').innerText()).includes('0=作废、1=有效')
+    && (await codes.locator('[data-patch-after]').innerText()).includes('9=作废')
+    && (await codes.locator('[data-patch-reason]').innerText()).includes('status=9'))
+  check('新补的码值加重显示', await codes.locator('[data-code-changed="9"]').count() === 1
+    && await codes.locator('[data-code-changed="1"]').count() === 0)
+  check('值不变的项写明保存即确认', (await card.locator('[data-patch-state="confirm"]').innerText()).includes('值不变，保存即确认'))
+  check('改前写状态（推断）', (await card.locator('[data-patch-change="valid_filter"] [data-patch-before]').innerText()).includes('（推断）'))
+  check('过程里也记了一行', (await c.page.locator('[data-step-code="catalog_patch"]').innerText()).includes('建议更新「入园记录」的数据目录（3 项）'))
+  const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('卡片不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+
+  // 第一次保存撞上 409：写明「这张表刚被修改过」，给「重新载入」。署名在设置页填，这里直接写进本机
+  await c.page.evaluate(() => localStorage.setItem('agentlab_actor', '检查脚本'))
+  await card.locator('[data-patch-save]').click()
+  await card.locator('[data-patch-conflict]').waitFor({ timeout: 3000 })
+  check('409：提示这张表刚被修改过', (await card.innerText()).includes('这张表刚被修改过'))
+  check('保存带着提案对照的版本、原样取值和署名', sent[0]?.body?.if_version === 3
+    && JSON.stringify(sent[0]?.body?.changes?.[0]?.value) === '{"9":"作废"}' && !!sent[0]?.actor, JSON.stringify(sent[0]))
+  await card.locator('[data-patch-reload]').click()
+  await c.page.waitForFunction(() => document.querySelector('[data-catalog-patch="visits"]')?.getAttribute('data-patch-version') === '4',
+    null, { timeout: 3000 })
+  check('重新载入交回的是助手原来的提案', sent[1]?.url.endsWith('/patch/preview')
+    && JSON.stringify(sent[1]?.body?.changes?.[0]?.value) === '{"9":"作废"}', JSON.stringify(sent[1]))
+  check('重新载入后改前按最新的目录写', (await codes.locator('[data-patch-before]').innerText()).includes('8=退票'))
+  await card.locator('[data-patch-save]').click()
+  await card.locator('[data-patch-done]').waitFor({ timeout: 3000 })
+  check('再保存带新版本', sent[2]?.body?.if_version === 4, JSON.stringify(sent[2]?.body))
+  check('保存成功：写明第几版，给到数据目录的入口', (await card.locator('[data-patch-done]').innerText()).includes('已保存到数据目录（第 5 版）')
+    && (await card.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-scenic/visits')
+  check('保存后不再有保存按钮', await card.locator('[data-patch-save]').count() === 0)
+  await card.locator('[data-catalog-impact="2"]').waitFor({ timeout: 3000 })
+  const impact = await card.locator('[data-catalog-impact]').innerText()
+  check('保存后列出受影响的模板：直接引用、可能涉及', impact.includes('2 个已发布模板引用这张表') && impact.includes('入园日报')
+    && impact.includes('直接引用') && impact.includes('可能涉及'), impact.replace(/\s+/g, ' '))
+  check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
+  await c.page.close()
+
+  // 忽略：收成一行，可以重新查看；不发任何请求
+  const g = await open('syn=catalog-patch&dense=1', { w: 380, h: 900 })
+  let writes = 0
+  await g.page.route('**/api/datasources/**', (route) => { writes++; return route.abort() })
+  const gc = g.page.locator('[data-catalog-patch="visits"]')
+  await gc.locator('[data-patch-ignore]').click()
+  check('忽略：收成一行说明', (await gc.getAttribute('data-patch-phase')) === 'ignored'
+    && (await gc.innerText()).includes('已忽略这条建议'))
+  await gc.locator('[data-patch-unignore]').click()
+  check('重新查看：卡片回来', await gc.locator('[data-patch-save]').count() === 1)
+  check('忽略不发请求', writes === 0, `${writes}`)
+  await g.page.close()
+})
+
 await section('步骤行和画布联动', async () => {
   const { page } = await open('syn=mixed&link=1', { w: 1100, h: 800 })
   const row = page.locator('[data-node-id="agent"]').first()
@@ -1111,6 +1303,17 @@ await section('放弃、结构化的报错、恢复的轮次、出具横幅（RE
   check('恢复的轮次：头部照样写几次查询', head.includes('3 次查询'), head.replace(/\n/g, ' '))
   await r.page.close()
 
+  // 降档是因为查询没通过 SQL 检查（B5）：横幅单列一块写是哪次查询、什么问题、影响了哪些引用；那一句不在其余缺口里重复
+  const q = await open('syn=issued-sql', { w: 1100, h: 900, name: 'issued-sql' })
+  const banner = q.page.locator('[data-issuance-banner=degraded]')
+  const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('SQL 检查导致的降档单列一块：写降档原因、哪次查询、问题、受影响的引用、下一步', sql.includes('降档原因：所依据的查询未通过 SQL 检查')
+    && sql.includes('查询「订单金额查询」（Q1）') && sql.includes('求和会重复计算') && sql.includes('受影响：指标「订单金额」、Q1 第 1 行「gmv」')
+    && sql.includes('修改来源查询的 SQL'), sql)
+  const rest = (await banner.locator('[data-issuance-gaps]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……那一句不在「校验未全部完成」里重复，其余缺口照列', !rest.includes('未通过 SQL 检查') && rest.includes('协作团队'), rest)
+  await q.page.close()
+
   const i = await open('syn=issued', { w: 1100, h: 900 })
   check('出具横幅带 data-issuance-banner（画布印章据此滚过来）', await i.page.locator('[data-issuance-banner]').count() === 1)
   const live = await i.page.locator('[data-turn] [role="status"][aria-live="polite"]').first().innerText()
@@ -1488,6 +1691,65 @@ await section('画布右栏：去审批、放弃、出具横幅、回执（REQ-1
   check('定位自查问题：光标落进出问题的那一栏', issueFocus.sel === 'query' && issueFocus.field === 'max_steps'
     && issueFocus.tag === 'INPUT', JSON.stringify(issueFocus))
   await page.evaluate(() => window.__studio.getState().select(null))
+  await page.waitForTimeout(200)
+
+  // 对照数据目录的 SQL 检查（数据目录阶段 4B）：自查没修好的错误、不挡运行的提醒各一组，写中文规则名、级别、表和列、
+  // SQL 片段，不露规则编号；「定位」落到调用工具参数里的 SQL，光标放在 sql 的值开头
+  const SQL = 'SELECT o.region, SUM(o.amount) AS amt\nFROM orders o JOIN order_items i ON i.order_id = o.id\nGROUP BY o.region'
+  await page.evaluate((sql) => {
+    const st = window.__studio.getState()
+    window.__studio.setState({ nodes: [...st.nodes, { id: 'fetch', type: 'card', position: { x: 620, y: 200 },
+      data: { nodeType: 'tool', label: '订单汇总', config: { tool: 'db_query__shop', args: { limit: 100, sql } } } }] })
+  }, SQL)
+  const sqlErr = { level: 'error', node_id: 'fetch', edge_id: null, field: 'args.sql', code: 'fanout_sum', table: 'orders', column: 'amount',
+    sql_excerpt: 'SUM(o.amount)', message: '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算。请先按订单汇总明细再关联' }
+  const sqlWarn = { level: 'warning', node_id: 'fetch', edge_id: null, field: 'args.sql', code: 'missing_valid_filter', table: 'orders',
+    message: '「订单」定义了有效记录条件「status <> 9」，查询中没有按它筛选' }
+  await page.evaluate(([err, warn]) => window.__studio.setState({ copilotTurns: [{ explanation: '', error: '', phase: 'done', id: 'u8',
+    instruction: '按地区汇总订单金额', outcome: 'applied', diff: { added: ['fetch'], changed: [], removed: [], total: 1 },
+    ops: [{ op: 'add_node', node: { id: 'fetch', type: 'tool', data: { label: '订单汇总' } } },
+      { op: 'check', status: 'repairing', round: 1, issues: [err] },
+      { op: 'check', status: 'failed', issues: [err] },
+      { op: 'final', graph: { nodes: [{ id: 'in' }, { id: 'fetch' }] }, issues: [err, warn] }] }] }), [sqlErr, sqlWarn])
+  await page.waitForTimeout(400)
+  const blocking = page.locator('[data-issue-list=""] [data-issue-code="fanout_sum"]')
+  const blockingText = await blocking.innerText().catch(() => '')
+  check('自查没修好的 SQL 问题：级别、中文规则名、涉及的表和列、说明、SQL 片段', blockingText.includes('错误') && blockingText.includes('一对多关联后重复计算')
+    && blockingText.includes('orders.amount') && blockingText.includes('会重复计算') && blockingText.includes('SUM(o.amount)')
+    && blockingText.includes('「订单汇总」'), blockingText.replace(/\s+/g, ' '))
+  const notes = page.locator('[data-issue-list="sql"]')
+  const notesText = await notes.innerText().catch(() => '')
+  check('不挡运行的提醒单列一组「SQL 检查」，没修好的错误不重复', notesText.startsWith('SQL 检查') && notesText.includes('提醒')
+    && notesText.includes('未筛选有效记录') && !notesText.includes('一对多关联后重复计算'), notesText.replace(/\s+/g, ' '))
+  const panelText = await page.locator('[data-assistant-panel]').innerText()
+  check('助手面板不露规则编号', !/fanout_sum|missing_valid_filter|args\.sql/.test(panelText))
+  const sqlRow = page.locator('[data-turn="u8"] [data-step-code="sql_check"]')
+  check('过程里有一行「SQL 检查：1 处提醒」', (await sqlRow.innerText().catch(() => '')).includes('SQL 检查：1 处提醒'),
+    await page.locator('[data-turn="u8"]').innerText().then((t) => t.replace(/\s+/g, ' ').slice(0, 240)))
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(200)
+      await page.locator('[data-assistant-panel]').screenshot({ path: `${SHOTS}/stream-panel-sqlcheck-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  await blocking.getByRole('button', { name: /定位/ }).click()
+  await page.waitForTimeout(600)
+  const sqlFocus = await page.evaluate((sql) => {
+    const a = document.activeElement
+    const at = a instanceof HTMLTextAreaElement ? a.selectionStart : -1
+    return { sel: window.__studio.getState().selectedId, tag: a?.tagName ?? null,
+             field: a?.closest('[data-inspector-sheet] [data-field]')?.getAttribute('data-field') ?? null,
+             atSql: at >= 0 && (a.value.slice(at).startsWith(sql.split('\n')[0]) || a.value.slice(at).startsWith(JSON.stringify(sql).slice(1, 30))) }
+  }, SQL)
+  check('定位 SQL 检查的问题：打开调用工具的设置，光标落在「参数」里 sql 的值开头', sqlFocus.sel === 'fetch' && sqlFocus.field === 'args'
+    && sqlFocus.tag === 'TEXTAREA' && sqlFocus.atSql, JSON.stringify(sqlFocus))
+  await page.evaluate(() => {
+    const st = window.__studio.getState()
+    st.select(null)
+    window.__studio.setState({ copilotTurns: [], nodes: st.nodes.filter((n) => n.id !== 'fetch') })
+  })
   await page.waitForTimeout(200)
 
   // 模型把工具调用写成文字、判失败：报错和提醒行给「打开『数据查询』的设置」，点了就是那个节点的属性面板

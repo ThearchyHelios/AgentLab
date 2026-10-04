@@ -25,6 +25,10 @@
  * - 报错、修复选项、说明里写界面上的中文标签（「单元格引用」「报告来自」），不在句子里裸写键名和
  *   枚举值；配置界面里字段自身旁边可以附键名。
  * - 导航里的历史页叫「记录」。
+ * - 「合并查询」是节点名，也指它做的事：把几次查询的结果在库外按键合并成一张表。不写联表、联邦查询、join。
+ *   合并时两边对齐的列（日期、门店）叫「合并键」；合并 SQL 里代表某个输入的表名叫「别名」；被合并的那几次
+ *   查询叫「输入」。合并结果里的一格能指回输入的哪一格时叫「逐格来历」，指不回时只有「表级来历」（合并了
+ *   哪几个输入、用的哪条合并 SQL）。
  *
  * 语体：
  * - 书面、简洁、中性。用「无法 / 未能 / 失败 / 请」，不用「取不到 / 连不上 / 写坏了」这类口语补语；
@@ -38,7 +42,10 @@
  * 枚举值（formal / degraded / withheld 等）不动，只换显示。
  */
 
-import type { NodeType, SnapshotReasonCode, ToolTrust } from '../types'
+import type {
+  CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
+  SqlCheckCode, SqlCheckLevel, ToolTrust,
+} from '../types'
 import { formatNumber } from './format'
 
 export const TERMS = {
@@ -120,6 +127,7 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   supervisor: '多 Agent 协作',
   tool: '调用工具',
   code: '沙箱代码',
+  merge: '合并查询',
   branch: '条件分支',
   loop: '循环',
   subgraph: '子工作流',
@@ -237,6 +245,14 @@ export const EVIDENCE_TEXT = {
   unmatchedPlain: '无法追溯的数字：',
   uncited: '该数字未使用引用标记，系统无法核对其来源',
   missingValue: '缺少输入：口径卡本次未计算出该指标的值',
+  /** 指标拿截断的查询结果整组算出来（计数、求和……）：值只算到了取回的那部分，出具按缺口降档 */
+  incomplete: '结果不完整',
+  incompleteFallback: '基于被截断的查询结果计算，结果不完整',
+  /** 指标所依据的查询对照数据目录查出了错误级的问题：值照算，出具按缺口降档 */
+  sqlCheckFailed: 'SQL 检查未通过',
+  sqlCheckFallback: '所依据的查询未通过 SQL 检查，结果不可靠',
+  /** 输入是 Agent 交来、被截断切开的数组字段 */
+  inputTruncated: '查询结果已截断，该字段只含取回的部分行',
   unshowable: (value: string) => `有值（${value}），但无法按口径卡的格式显示`,
   chainPending: '正在加载算式和输入…',
   /** 证据接口逐项复核出来的问题。正常时不说，出问题才醒目 */
@@ -413,6 +429,41 @@ export const EVIDENCE_TEXT = {
     loading: '正在推断来源…',
     failed: '未能获取推断的来源',
   },
+} as const
+
+/**
+ * 合并查询（merge 节点）在检查器、运行详情、证据面板和推断来源里的说法。用到的术语（输入、别名、合并键、
+ * 逐格来历、表级来历）见文件开头。行号对人一律从 1 数，和证据面板查询表格最前面那一列「#」一致
+ */
+export const MERGE_TEXT = {
+  // ---- 检查器 ----
+  addInput: '添加输入',
+  alias: '别名（表名）',
+  node: '查询节点',
+  pick: '选择上游的查询节点',
+  removeInput: (alias: string) => `删除输入 ${alias || '（未命名）'}`,
+  noUpstream: '上游没有查询节点。请先在本节点之前连接选择了数据库查询工具的「调用工具」节点，或另一个「合并查询」节点',
+  missingNode: (id: string) => `节点「${id}」不在上游或已删除，请重新选择`,
+  inputsHint: '别名就是合并 SQL 中的表名。各输入请先在自己的库中聚合到相同的合并键和粒度（例如日期 + 门店），任何一个输入被截断，合并都会失败',
+  // ---- 运行详情 ----
+  stepTitle: (aliases: string[]) => (aliases.length ? `合并 ${aliases.join('、')} 的查询结果` : '合并查询结果'),
+  sql: '合并 SQL',
+  copySql: '复制合并 SQL',
+  inputs: (n: number) => `合并自 ${formatNumber(n)} 个输入`,
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  source: (name: string) => `数据源 ${name}`,
+  warnings: (n: number) => `${formatNumber(n)} 条警告，详见本节点下方`,
+  // ---- 证据面板 ----
+  mergedInto: (alias: string) => `合并查询 ${alias} 的输入`,
+  traced: '被引用的格来自',
+  cellAt: (alias: string, row: number, column: string) => `${alias} 第 ${formatNumber(row + 1)} 行「${column}」`,
+  noLineage: '没有逐格来历，只有表级来历：见上方的输入和合并 SQL',
+  unsealed: '不在封存范围内',
+  notInCatalog: '不在本报告的证据目录中',
+  executionWarnings: '执行时的警告',
+  // ---- 推断来源 ----
+  hop: (alias: string, to: string) => `经合并查询 ${alias} 追到 ${to}`,
+  hopMissing: (alias: string) => `合并查询 ${alias} 中的这一格没有逐格来历`,
 } as const
 
 /** 结论句按裁判结论分成的几堆（lib/evidence 的 claimCounts 数出来的） */
@@ -1791,4 +1842,819 @@ export const RECIPE_CHOICE_LABEL = {
   colType: { TEXT: '文字', INTEGER: '整数', REAL: '小数', DATE: '日期' } as Record<string, string>,
   colStore: { '': '默认', canonical: '规范写法', raw: '原文' } as Record<string, string>,
   axisChecks: { contiguous: '逐日连续', covers_context: '恰好覆盖统计期' } as Record<string, string>,
+}
+
+// ===========================================================================
+// 业务数据目录（数据源卡片上的「数据目录」）
+//
+// 术语：
+// - 「数据目录」：每张表、每一列的业务说明和表之间的关联关系。只记数据事实，不放计算公式（公式在口径卡里）。
+// - 表级：中文名、说明、粒度（一行代表什么）、业务主键、表类型、业务日期、有效记录条件、去重规则。
+// - 列级：中文名、含义、单位、度量类型、码值。度量类型的 flow 写「可累加」，不写「流量」；表类型的 fact 写「明细表」。
+// - 关联关系：本表字段 → 目标表的字段，带基数（多对一……）和覆盖率。
+// - 状态：推断 / 已验证 / 已确认 / 已驳回。来源：数据库注释 / 外键约束 / 命名推断 / 数据剖析 / 模型起草 / 人工填写。
+// - 动作：起草（批量生成推断项）、确认、驳回、恢复（回到起草时的状态）。直接编辑即确认。
+// ===========================================================================
+
+export const CATALOG_TERMS = {
+  catalog: '数据目录',
+  grain: '粒度',
+  keys: '业务主键',
+  measure: '度量类型',
+  codes: '码值',
+  relation: '关联关系',
+  cardinality: '基数',
+  coverage: '覆盖率',
+  draft: '起草',
+} as const
+
+/** 项的状态。四种状态在界面上用同一套样式（pages/catalog/parts.tsx 的 StatusMark） */
+export const CATALOG_STATUS_LABEL: Record<CatalogStatus, string> = {
+  proposed: '推断',
+  verified: '已验证',
+  confirmed: '已确认',
+  rejected: '已驳回',
+}
+
+export const CATALOG_STATUS_HINT: Record<CatalogStatus, string> = {
+  proposed: '只作提示，确认后才参与 SQL 检查',
+  verified: '有确证（外键约束或数据剖析），参与 SQL 检查',
+  confirmed: '人工确认，参与 SQL 检查',
+  rejected: '人工驳回，不提供给助手，之后起草也不会再提出',
+}
+
+export const CATALOG_SOURCE_LABEL: Record<CatalogSource, string> = {
+  comment: '数据库注释',
+  fk: '外键约束',
+  name: '命名推断',
+  profile: '数据剖析',
+  llm: '模型起草',
+  human: '人工填写',
+}
+
+export const CATALOG_KIND_LABEL: Record<CatalogTableKind, string> = {
+  fact: '明细表',
+  dimension: '维度表',
+  snapshot: '快照表',
+  log: '日志表',
+  config: '配置表',
+}
+
+export const CATALOG_KIND_HINT: Record<CatalogTableKind, string> = {
+  fact: '一行是一笔业务事件，如订单、入园、销售',
+  dimension: '描述业务对象，如门店、票种、渠道',
+  snapshot: '按时点记录的状态，如每日库存',
+  log: '系统操作或变更记录',
+  config: '参数、映射等配置',
+}
+
+export const CATALOG_MEASURE_LABEL: Record<CatalogMeasure, string> = {
+  flow: '可累加',
+  stock: '存量',
+  ratio: '比率',
+  identifier: '标识',
+  status: '状态',
+  attribute: '属性',
+}
+
+export const CATALOG_MEASURE_HINT: Record<CatalogMeasure, string> = {
+  flow: '可以跨期加总，如金额、人数',
+  stock: '时点值，不能跨期加总，如库存、余额',
+  ratio: '不能直接加总，如折扣率、转化率',
+  identifier: '编号或外键，不参与计算',
+  status: '状态码，按码值解释',
+  attribute: '描述性属性，如名称、类别',
+}
+
+export const CATALOG_CARDINALITY_LABEL: Record<CatalogCardinality, string> = {
+  many_to_one: '多对一',
+  one_to_one: '一对一',
+  one_to_many: '一对多',
+}
+
+/** 表级各项，按显示顺序 */
+export const CATALOG_TABLE_FIELD_LABEL = {
+  label: '中文名',
+  description: '说明',
+  grain: '粒度',
+  keys: '业务主键',
+  kind: '表类型',
+  business_date: '业务日期',
+  valid_filter: '有效记录条件',
+  dedup: '去重规则',
+} as const
+
+export const CATALOG_TABLE_FIELD_HINT: Record<keyof typeof CATALOG_TABLE_FIELD_LABEL, string> = {
+  label: '表的业务名称',
+  description: '这张表记录什么、怎么用',
+  grain: '一行代表什么，如「一张门票的一次入园」',
+  keys: '唯一确定一行业务记录的列',
+  kind: '明细、维度、快照、日志或配置',
+  business_date: '按哪一列归属到日期',
+  valid_filter: '有效记录的 SQL 条件，如 status <> 9',
+  dedup: '同一笔业务出现多行时如何取舍',
+}
+
+/** 列级各项，按显示顺序 */
+export const CATALOG_COLUMN_FIELD_LABEL = {
+  label: '中文名',
+  meaning: '含义',
+  unit: '单位',
+  measure: '度量类型',
+  codes: '码值',
+} as const
+
+export const CATALOG_TEXT = {
+  // ---- 入口
+  open: '数据目录',
+  openHint: '记录每张表、每一列的业务含义和表之间的关联关系，助手建图和查询时读取',
+  // ---- 页面
+  title: (name: string) => `「${name}」的数据目录`,
+  subtitle: '先起草，再按使用次数逐表确认。推断的项只作提示，确认后才参与 SQL 检查',
+  back: '返回数据源',
+  sourceMissing: '该数据源不存在',
+  sourceMissingBody: '可能已被删除，请返回数据源列表查看。',
+  noSchemaTitle: '还没有表结构',
+  noSchemaBody: (note: string) => `${note.replace(/[。.]$/, '')}。数据目录按表结构逐表记录，请先回到数据源卡片点击「探查结构」。`,
+  noSchemaUploadBody: '这个表格还没有可用的表结构，请重新上传后再编写数据目录。',
+  emptyTitle: '还没有数据目录',
+  emptyBody: '先起草，再逐表确认。起草按数据库注释、外键约束和列名推断，也可以请助手的模型起草中文名和含义。',
+  // ---- 导入表格的说明
+  systemTitle: '导入时生成的说明',
+  systemBody: '这个数据源由导入表格生成，表和列的说明由系统按核对结果生成，只读，不能在数据目录中改写。',
+  systemCovered: '目录中与说明重复的项（表的粒度和说明、列的含义和单位）确认后才提供给助手。',
+  systemTag: '导入时生成',
+  systemTableNote: '表说明',
+  // ---- 表清单
+  search: '搜索表名或中文名',
+  filterLabel: '按状态筛选',
+  // 「已确认」专指人工确认：只有已验证项（外键约束、数据剖析核实）的表不能说「全部已确认」，按「没有待确认项」说
+  filter: { all: '全部', pending: '有待确认项', done: '没有待确认项', none: '没有目录' },
+  filterHint: {
+    all: '全部表',
+    pending: '还有推断状态的项，需要逐项确认',
+    done: '有目录，没有推断状态的项。已验证的项由外键约束或数据剖析核实，不需要逐项确认',
+    none: '还没有任何目录项',
+  },
+  sortLabel: '排序',
+  sort: { usage: '按使用次数', pending: '按待确认项', name: '按表名' },
+  tableCount: (shown: number, total: number) =>
+    (shown === total ? `${formatNumber(total)} 张表` : `${formatNumber(shown)} / ${formatNumber(total)} 张表`),
+  selectAll: '全选当前结果',
+  selectTable: (name: string) => `选择 ${name}`,
+  selected: (n: number) => `已选 ${formatNumber(n)} 张`,
+  clearSelection: '取消选择',
+  noLabel: '未填写中文名',
+  view: '视图',
+  missing: '表结构中已没有这张表',
+  noCatalog: '没有目录',
+  usage: (n: number) => `使用 ${formatNumber(n)} 次`,
+  usageHint: '被运行查询过的次数，同一次运行中结果相同的重复查询只算一次',
+  relationCount: (n: number) => `${formatNumber(n)} 个关联`,
+  countTitle: (label: string, n: number) => `${label} ${formatNumber(n)} 项`,
+  noMatch: '没有符合条件的表',
+  noMatchBody: '请换个关键词或筛选条件。',
+  // ---- 用到但没确认（页面顶部的摘要）
+  usageLead: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表里，`,
+  usagePending: (n: number) => `有 ${formatNumber(n)} 张还有推断项未确认`,
+  usageNone: (n: number) => `${formatNumber(n)} 张还没有目录`,
+  usageAllDone: (used: number) => `运行中查询过的 ${formatNumber(used)} 张表都没有待确认项`,
+  usageHintPending: '筛选有待确认项的表，按使用次数排序',
+  usageHintNone: '筛选没有目录的表，按使用次数排序',
+  // ---- 概览（没有选中表时）
+  overviewTitle: '选择一张表开始审阅',
+  overviewBody: '按使用次数从高到低逐表确认。推断的项只作提示，确认后才参与 SQL 检查。',
+  overviewStats: (total: number, pending: number, done: number, none: number) =>
+    `共 ${formatNumber(total)} 张表：${formatNumber(pending)} 张有待确认项，${formatNumber(done)} 张没有待确认项，${formatNumber(none)} 张没有目录`,
+  reviewNext: (name: string) => `审阅「${name}」`,
+  reviewNextHint: '使用次数最多、还有待确认项的表',
+  legend: '状态说明',
+  // ---- 起草
+  draft: '起草',
+  draftSelected: (n: number) => `起草所选（${formatNumber(n)}）`,
+  draftTitle: '起草数据目录',
+  draftScope: '起草范围',
+  scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
+  scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
+  scopeTop: (n: number) => `使用次数最多的 ${formatNumber(n)} 张表`,
+  scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
+  draftBase: '按数据库注释、外键约束和列名推断起草。已确认、已驳回的项不会被改动；起草出的项都是推断，需要逐项确认。',
+  useModel: '用模型起草',
+  useModelHint: '请助手的模型按表结构起草中文名、说明、粒度和列的含义。只发送表结构（表名、列名、类型、约束、注释），不发送数据；耗时较长，并产生模型费用。',
+  draftStart: (n: number) => `起草 ${formatNumber(n)} 张表`,
+  drafting: '正在起草…',
+  draftProgress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  draftStop: '停止',
+  draftStopping: '当前这一批完成后停止…',
+  draftDone: '起草完成',
+  draftStopped: (done: number, total: number) => `已停止：完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，其余未起草`,
+  draftFailed: '起草中断',
+  draftSummary: (added: number, updated: number, removed: number) =>
+    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+  // 只在起草确实给出了内容、只是和现有目录一致时用：有表的模型起草失败或没给出可用内容（model_error）时
+  // 不能说「没有变化」，改用 draftNothingWritten
+  draftNoChange: '没有变化：起草出的内容与现有目录一致',
+  draftNothingWritten: '目录没有更新：模型没有给出可用的内容，原因见下方',
+  draftModelSkipped: (reason: string) => `模型未参与起草：${reason.replace(/[。.]$/, '')}。已按注释、外键和命名起草。`,
+  draftModelUsed: (model: string) => `模型：${model}`,
+  draftTableErrors: (n: number) => `${formatNumber(n)} 张表未能起草`,
+  draftModelErrors: (n: number) => `${formatNumber(n)} 张表的模型起草失败，已按注释、外键和命名起草`,
+  draftClose: '完成',
+  moreTables: (n: number) => `…另有 ${formatNumber(n)} 张`,
+  cancel: '取消',
+  draftBackground: '起草仍在进行，当前这一批完成后停止',
+  // ---- 表详情
+  backToList: '返回表清单',
+  prev: '上一张',
+  next: '下一张',
+  updatedBy: (who: string, at: string) => `${who} 于 ${at} 修改`,
+  updatedAt: (at: string) => `${at} 修改`,
+  notStarted: '尚未建立目录',
+  missingBody: '表结构中已没有这张表（可能已删除或改名）。目录仍然保留，可以查看、驳回或删除其中的项。',
+  sectionTable: '表级信息',
+  sectionColumns: '列',
+  sectionRelations: '关联关系',
+  columnCount: (shown: number, total: number) =>
+    (shown === total ? `${formatNumber(total)} 列` : `${formatNumber(shown)} / ${formatNumber(total)} 列`),
+  columnFilter: '筛选列名或中文名',
+  onlyPending: '只看有推断项的列',
+  columnHead: { name: '列名', type: '类型', label: '中文名', meaning: '含义', unit: '单位', measure: '度量类型', codes: '码值' },
+  pk: '主键',
+  columnMissing: '表结构中已没有这一列',
+  noColumns: '没有符合条件的列',
+  empty: '未填写',
+  relationHead: { from: '本表字段', to: '目标表', toColumns: '目标字段', cardinality: '基数', coverage: '覆盖率', source: '来源', status: '状态' },
+  noRelations: '还没有关联关系。起草会按外键约束和列名推断，也可以在编辑时添加。',
+  openTable: (name: string) => `打开「${name}」`,
+  coverageValue: (pct: number) => `${formatNumber(pct)}%`,
+  dateColumn: '日期列',
+  dateRule: '规则',
+  dateTimezone: '时区',
+  // ---- 单项审阅
+  itemTitle: (where: string) => `${where}的来源和状态`,
+  itemSource: (s: string) => `来源：${s}`,
+  itemUpdated: (at: string) => `更新于 ${at}`,
+  confirm: '确认',
+  reject: '驳回',
+  reset: '恢复',
+  resetHint: '回到起草时的状态',
+  remove: '删除',
+  removeHint: '人工填写的项没有起草时的状态，恢复即删除',
+  reviewed: {
+    confirm: (where: string) => `已确认${where}`,
+    reject: (where: string) => `已驳回${where}`,
+    reset: (where: string) => `已恢复${where}`,
+  },
+  removed: (where: string) => `已删除${where}`,
+  reviewWhileEditing: '正在编辑这张表，保存或取消后再逐项审阅',
+  whereTable: (field: string) => `表的${field}`,
+  whereColumn: (col: string, field: string) => `列 ${col} 的${field}`,
+  whereRelation: (to: string) => `指向 ${to} 的关联关系`,
+  // ---- 批量确认
+  confirmAll: (n: number) => `确认本表全部推断（${formatNumber(n)}）`,
+  confirmAllTitle: (n: number, table: string) => `确认「${table}」的 ${formatNumber(n)} 项推断？`,
+  confirmAllConsequences: ['确认后这些项参与 SQL 检查', '来源保持不变，状态改为已确认', '之后仍可逐项恢复'],
+  confirmAllAction: (n: number) => `确认 ${formatNumber(n)} 项`,
+  confirmColumn: '确认本列推断',
+  confirmColumnLabel: (col: string, n: number) => `确认列 ${col} 的 ${formatNumber(n)} 项推断`,
+  confirmedN: (n: number) => `已确认 ${formatNumber(n)} 项`,
+  // ---- 编辑
+  edit: '编辑',
+  editHint: '保存后，改动过的项记为人工填写、已确认',
+  clearHint: '清空一项即删除；不希望起草再次提出的项，请用「驳回」',
+  save: '保存',
+  saving: '正在保存…',
+  cancelEdit: '取消',
+  cancelEditTitle: '放弃对这张表的修改？',
+  cancelEditAction: '放弃修改',
+  changedMark: '已修改',
+  changes: (n: number) => `${formatNumber(n)} 处修改`,
+  noChanges: '尚未修改',
+  saved: '已保存，改动过的项已记为人工确认',
+  invalidCount: (n: number) => `${formatNumber(n)} 处格式不正确`,
+  keysPlaceholder: '列名，用顿号或逗号分隔',
+  keysUnknown: (cols: string) => `表结构中没有这些列：${cols}`,
+  codesPlaceholder: '1=已支付',
+  codesHint: '每行一个，写成「码值=含义」，含义可暂不填写',
+  codesInvalid: (line: number) => `第 ${formatNumber(line)} 行应写成「码值=含义」`,
+  codesDuplicate: (code: string) => `码值 ${code} 重复`,
+  dateColumnRequired: '填写规则或时区时，日期列必填',
+  tooLong: (n: number) => `不超过 ${formatNumber(n)} 字`,
+  kindNone: '未填写',
+  measureNone: '未填写',
+  cardinalityNone: '未知',
+  addRelation: '添加关联关系',
+  removeRelation: '删除这条关联关系',
+  rejectRelation: '驳回',
+  rejectRelationLabel: '驳回这条关联关系',
+  undoRejectRelation: '撤销驳回',
+  rejectingMark: '保存后驳回',
+  relationRemoveHint: '人工添加的关联关系可以删除；外键约束、命名推断、数据剖析得出的只能驳回，驳回后不提供给助手、不参与 SQL 检查，之后起草也不会再提出',
+  relationColumns: '本表字段，用逗号分隔',
+  relationTarget: '目标表',
+  relationToColumns: '目标字段，用逗号分隔',
+  relationIncomplete: '本表字段、目标表和目标字段都要填写',
+  relationMismatch: '两端的字段数不一致',
+  relationDuplicate: '与另一条关联关系重复',
+  rejectedPlaceholder: (value: string) => `已驳回：${value}`,
+  leaveTitle: '数据目录有未保存的修改',
+  leaveConsequences: ['离开后修改将丢失'],
+  leaveConfirm: '放弃修改并离开',
+  // ---- 冲突与错误
+  conflictTitle: '这张表的数据目录刚被其他人修改过',
+  conflictEditing: '你的修改尚未保存。重新载入会放弃你的修改并显示最新内容；如需保留，请先记下要改的地方。',
+  conflictReview: '刚才的操作未生效，请重新载入后再操作。',
+  reload: '重新载入',
+  reloadDiscardTitle: '放弃未保存的修改并重新载入？',
+  reloadDiscardAction: '放弃修改并重新载入',
+}
+
+// ===========================================================================
+// 目录修改提案：用户在助手（画布）或问数据页说出一条数据事实时，助手提出的数据目录修改。
+//
+// 术语：
+// - 卡片标题写「建议更新数据目录」；两个动作是「保存到数据目录」和「忽略」。提案在保存之前不写入目录。
+// - 每一项写「改前 / 改后 / 理由」。保存后改动过的项记为人工填写、已确认（和直接编辑同一条规矩）。
+// - 别人在提案之后改过这张表：写「这张表刚被修改过」，给「重新载入」，按最新内容重算改前和改后再保存。
+// ===========================================================================
+
+export const CATALOG_PATCH_TEXT = {
+  title: '建议更新数据目录',
+  /** 过程里的那一行 */
+  step: (table: string, n: number) => `建议更新「${table}」的数据目录（${formatNumber(n)} 项）`,
+  stepSub: '确认后才写入数据目录',
+  before: '改前',
+  after: '改后',
+  reason: '理由',
+  empty: '未填写',
+  stateConfirm: '值不变，保存即确认',
+  stateSame: '已是这个值',
+  save: '保存到数据目录',
+  saving: '正在保存…',
+  ignore: '忽略',
+  hint: '保存后改动的项记为人工填写、已确认，助手和 SQL 检查随即采用',
+  saved: (version: number) => `已保存到数据目录（第 ${formatNumber(version)} 版）`,
+  savedToast: (table: string) => `已更新「${table}」的数据目录`,
+  ignored: '已忽略这条建议，数据目录未修改',
+  undoIgnore: '重新查看',
+  open: '在数据目录中查看',
+  conflictTitle: '这张表刚被修改过',
+  conflictBody: '其他人在这条建议之后修改了这张表的数据目录。重新载入后按最新内容重算改前和改后，确认后再保存。',
+  reload: '重新载入',
+  reloading: '正在重新载入…',
+  allSame: '数据目录中已是这些值，无需保存',
+  problems: '以下几项已无法按建议保存：',
+  whereRelationNew: (to: string) => `新增指向 ${to} 的关联关系`,
+  sourceOf: (source: string) => `数据源「${source}」`,
+}
+
+/**
+ * 影响面：哪些已发布、受管的模板引用这张表。按每个模板当前的已发布版本统计（正式运行用的是它）。
+ * 「直接引用」：查询的 SQL 里写着这张表；「可能涉及」：Agent 绑定了这个数据源的查询工具，SQL 运行时才生成。
+ */
+export const CATALOG_IMPACT_TEXT = {
+  title: '引用这张表的模板',
+  hint: '按每个模板当前的已发布版本统计',
+  none: '没有已发布或受管的模板引用这张表',
+  count: (n: number) => `${formatNumber(n)} 个模板`,
+  impact: { direct: '直接引用', possible: '可能涉及' } as Record<'direct' | 'possible', string>,
+  impactHint: {
+    direct: '查询的 SQL 中写着这张表',
+    possible: 'Agent 绑定了这个数据源的查询工具，SQL 在运行时生成，可能用到这张表',
+  } as Record<'direct' | 'possible', string>,
+  version: (v: number) => `v${v}`,
+  via: (labels: string) => `经由输入${labels}`,
+  member: (name: string) => `成员「${name}」`,
+  afterSave: (n: number) => `${formatNumber(n)} 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化：`,
+  afterSaveNone: '没有已发布或受管的模板引用这张表',
+  more: (n: number) => `另有 ${formatNumber(n)} 个`,
+  error: '无法统计引用这张表的模板',
+  retry: '重试',
+}
+
+/**
+ * 发布时的目录版本：发布时记下这一版用到的表的数据目录版本；从这一版发起正式运行时目录有变化，提醒而不拦。
+ * 版本号写「第 N 版」，还没有目录的表写「尚无目录」。
+ *
+ * 和影响面（CATALOG_IMPACT_TEXT）同一个分法：SQL 里写着的表是直接引用，说「有变化」；Agent 绑定了数据源的查询工具、
+ * SQL 运行时才写的，记的是这个数据源中所有有目录的表，说「Agent 可能查询的表有变化」——两组分开写，不混成一句。
+ */
+export const CATALOG_DRIFT_TEXT = {
+  /** 运行里的提醒：「自发布以来，数据目录中「入园记录」等 2 张表有变化」 */
+  title: (first: string, n: number) => (n > 1
+    ? `自发布以来，数据目录中「${first}」等 ${formatNumber(n)} 张表有变化`
+    : `自发布以来，数据目录中「${first}」有变化`),
+  /** 只有 Agent 可能查询的表变了：「自发布以来，Agent 可能查询的表有变化：「入园记录」等 3 张」 */
+  possibleTitle: (first: string, n: number) => (n > 1
+    ? `自发布以来，Agent 可能查询的表有变化：「${first}」等 ${formatNumber(n)} 张`
+    : `自发布以来，Agent 可能查询的表有变化：「${first}」`),
+  /** 两组都有：直接引用的标题后面补一句 */
+  alsoPossible: (n: number) => `；另有 ${formatNumber(n)} 张 Agent 可能查询的表有变化`,
+  sub: '运行未被拦截。请核对这些表的目录修改是否影响本次结果',
+  table: (label: string | null, table: string) => (label ? `${label}（${table}）` : table),
+  version: (v: number | null) => (v ? `第 ${formatNumber(v)} 版` : '尚无目录'),
+  line: (source: string, table: string, from: string, to: string) => `「${source}」${table}：发布时${from}，现为${to}`,
+  open: '查看目录',
+  /** 可能涉及那一组的小标题和说明（运行横幅、时间线展开、版本历史共用） */
+  possibleHead: 'Agent 可能查询的表',
+  possibleHint: 'Agent 绑定了这些数据源的查询工具，SQL 在运行时生成：发布时记下了数据源中所有有目录的表，不一定都会用到',
+  // ---- 版本历史里的「发布时的目录版本」
+  section: '发布时的目录版本',
+  sectionHint: '这一版 SQL 用到的表，以及 Agent 可能查询的表，在发布时的数据目录版本',
+  changedSince: (now: string) => `之后有变化，现为${now}`,
+  changedCount: (n: number) => `${formatNumber(n)} 张表在发布之后有变化，下次正式运行时会提醒`,
+  unchanged: '发布之后这些表的目录没有变化',
+  empty: '这一版的 SQL 没有用到数据库表',
+  /** 可能涉及的数据源在发布时一张有目录的表都没有 */
+  possibleNone: (source: string) => `「${source}」发布时还没有目录`,
+}
+
+/**
+ * 表结构只探查了一部分：探查结构时每个数据源最多取 200 张表（服务端 introspect._MAX_TABLES），多出来的表不在
+ * 表结构里，数据目录列不出，助手也看不到它们的字段。数据目录页顶部和助手「参考了哪些表」那一行都要说出来。
+ */
+export const SCHEMA_PARTIAL_TEXT = {
+  /** 数据目录页顶部：「这个数据源共有 205 张表，只探查了前 200 张」 */
+  title: (total: number, explored: number) =>
+    `这个数据源共有 ${formatNumber(total)} 张表，只探查了前 ${formatNumber(explored)} 张`,
+  body: (rest: number) => `探查结构时每个数据源最多取 200 张表（按数据库列出的顺序）：生产库动辄上千张，全部取回既慢也看不完。`
+    + `其余 ${formatNumber(rest)} 张不在数据目录中，助手也看不到它们的字段。`,
+  next: '所需的表不在清单中时，请回到数据源卡片换一个 schema，或改用只能看到所需表的数据库账号缩小范围，然后重新「探查结构」。',
+  /** 助手「参考了哪些表」那一行：「共 205 张，只探查了 200 张」 */
+  context: (total: number, explored: number) => `共 ${formatNumber(total)} 张，只探查了 ${formatNumber(explored)} 张`,
+}
+
+// ===========================================================================
+// 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」）
+//
+// 术语：
+// - 「数据剖析」：对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。
+//   动作写「剖析」，不写扫描、探测。默认关闭，按数据源开启。
+// - 预算五项：查询次数上限、单条查询时限、抽样键值数、整表统计行数上限、总时长上限。标签和服务端校验报错里的叫法
+//   一致（catalog_profile._NUMBER_FIELDS），保存被拒时按它认出是哪一项。
+// ===========================================================================
+
+export const PROFILE_FIELD_LABEL: Record<'enabled' | CatalogProfileNumberKey, string> = {
+  enabled: '开启数据剖析',
+  max_queries: '查询次数上限',
+  query_timeout_s: '单条查询时限',
+  sample_size: '抽样键值数',
+  max_scan_rows: '整表统计行数上限',
+  max_total_s: '总时长上限',
+}
+
+export const PROFILE_FIELD_UNIT: Record<CatalogProfileNumberKey, string> = {
+  max_queries: '条',
+  query_timeout_s: '秒',
+  sample_size: '个',
+  max_scan_rows: '行',
+  max_total_s: '秒',
+}
+
+export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
+  max_queries: '一次剖析最多发出的查询条数，用完即停止',
+  query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限',
+  sample_size: '核对一条关联关系时，从本表抽取的不同键值个数',
+  max_scan_rows: '不超过此行数的表才做去重计数、最小值和最大值等整表统计',
+  max_total_s: '一次剖析的总时长，到时即停止',
+}
+
+export const PROFILE_TEXT = {
+  // ---- 设置
+  section: '数据剖析',
+  enableHint: '默认关闭。开启后可在数据目录中核实推断的关联关系、取状态类列的码值候选',
+  risk: (queries: number, timeout: number, total: number) =>
+    `开启后，每次剖析会对这个数据源发出只读查询：最多 ${formatNumber(queries)} 条，单条不超过 ${formatNumber(timeout)} 秒，`
+    + `总时长不超过 ${formatNumber(total)} 秒。不读取明细行，遮罩的列不取样。`,
+  range: (min: number, max: number, unit: string, def: number) =>
+    `范围 ${formatNumber(min)}–${formatNumber(max)} ${unit}，默认 ${formatNumber(def)}`,
+  scanZero: '填 0 表示一律不做整表统计',
+  placeholder: (def: number) => `默认 ${formatNumber(def)}`,
+  rangeError: (min: number, max: number, integer: boolean) =>
+    `请填写 ${formatNumber(min)} 到 ${formatNumber(max)} 之间的${integer ? '整数' : '数'}`,
+  invalid: (n: number) => `数据剖析有 ${formatNumber(n)} 项设置不正确`,
+  // ---- 数据源卡片
+  chip: '数据剖析已开启',
+  chipHint: (queries: number, timeout: number) =>
+    `数据剖析已开启：每次最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
+  open: '设置数据剖析',
+  dialogTitle: (name: string) => `「${name}」的数据剖析设置`,
+  dialogBody: '设置保存在数据源上，对数据目录中的每次剖析生效。',
+  savedOn: (name: string) => `「${name}」已开启数据剖析`,
+  savedOff: (name: string) => `「${name}」已关闭数据剖析`,
+  saved: (name: string) => `已保存「${name}」的数据剖析设置`,
+  // ---- 数据目录页：范围与确认
+  action: '数据剖析',
+  actionHint: '对业务库发少量只读查询：核实推断的关联关系、取码值候选、提议业务日期',
+  profileSelected: (n: number) => `剖析所选（${formatNumber(n)}）`,
+  title: '数据剖析',
+  intro: '对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。'
+    + '结论写入数据目录；已确认、已驳回的项不会被改动。',
+  scope: '剖析范围',
+  scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
+  scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
+  scopeDefault: '使用次数最多、有待核实关联关系的表',
+  scopeDefaultHint: (n: number) => `由服务端挑选，至多 ${formatNumber(n)} 张`,
+  scopeTooMany: (max: number) => `超过 ${formatNumber(max)} 张，请缩小范围`,
+  budget: '本次预算',
+  budgetQueries: (queries: number, timeout: number) =>
+    `最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
+  budgetTotal: (total: number) => `总时长不超过 ${formatNumber(total)} 秒，到时即停止`,
+  budgetSample: (n: number) => `每条关联关系抽样 ${formatNumber(n)} 个键值`,
+  budgetScan: (n: number) => (n > 0 ? `行数超过 ${formatNumber(n)} 的表不做整表统计` : '不做整表统计'),
+  budgetFrom: (name: string) => `按「${name}」的数据剖析设置`,
+  editSettings: '修改设置',
+  noCancel: '剖析在服务端一次完成，开始后无法中途停止。',
+  start: '开始剖析',
+  again: '重新剖析',
+  disabledTitle: '这个数据源未开启数据剖析',
+  disabledBody: '剖析会对业务库发出只读查询，需要先在数据源设置中开启。',
+  enable: '开启数据剖析',
+  // ---- 进行中
+  running: '正在剖析…',
+  elapsed: (used: string, total: string) => `已用时 ${used}（总时长上限 ${total}）`,
+  runningHint: '剖析在服务端一次完成，无法中途停止。关闭此窗口不影响剖析，完成后会提示结果。',
+  background: '在后台继续',
+  headerRunning: (used: string) => `正在剖析 ${used}`,
+  headerRunningHint: '数据剖析进行中，点击查看',
+  leavePage: '离开本页不会中止剖析，结论仍会写入数据目录，但不再显示本次的报告。',
+  // ---- 报告
+  done: '剖析完成',
+  stoppedTitle: (reason: string) => `剖析已停止：${reason}`,
+  summary: (used: number, max: number, tables: number) =>
+    `用了 ${formatNumber(used)} / ${formatNumber(max)} 条查询，剖析 ${formatNumber(tables)} 张表`,
+  changes: (added: number, updated: number, removed: number) =>
+    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+  noChange: '目录没有变化',
+  toastDone: (summary: string) => `数据剖析完成：${summary}`,
+  toastStopped: (reason: string) => `数据剖析已停止：${reason}`,
+  toastFailed: '数据剖析未能完成',
+  viewReport: '查看报告',
+  close: '完成',
+  tableQueries: (n: number) => `${formatNumber(n)} 条查询`,
+  rowsStats: (n: number) => `约 ${formatNumber(n)} 行`,
+  rowsCount: (n: number) => `${formatNumber(n)} 行`,
+  rowsAtLeast: (n: number) => `超过 ${formatNumber(n - 1)} 行`,
+  rowsHint: { stats: '数据库统计信息中的估算值', count: '计数到整表统计行数上限为止' } as Record<string, string>,
+  openTable: '打开',
+  openTableLabel: (name: string) => `打开「${name}」`,
+  noFindings: '没有新的发现',
+  findingRelations: '关联关系',
+  findingCodes: '码值候选',
+  findingDate: '业务日期',
+  relationVerified: '升为已验证',
+  relationKept: '保持推断',
+  relationConfirmed: '已人工确认，只补充覆盖率和基数',
+  relationLowCoverage: '覆盖率不足，可能不是这条关系',
+  relationNotUnique: '被指向列未核实唯一',
+  coverage: (pct: string) => `覆盖率 ${pct}`,
+  sampled: (sample: number, matched: number) => `抽样 ${formatNumber(sample)} 个键值，对上 ${formatNumber(matched)} 个`,
+  cardinalityUnknown: '基数未核实',
+  codeRows: (n: number) => `${formatNumber(n)} 行`,
+  codesSummary: (values: number, rows: number) => `${formatNumber(values)} 个取值，共 ${formatNumber(rows)} 行`,
+  codesPendingN: (n: number) => `${formatNumber(n)} 个含义待填写`,
+  fillMeanings: '填写含义',
+  fillMeaningsLabel: (col: string) => `填写含义：列 ${col} 的码值`,
+  dateProposal: (col: string) => `提议按 ${col} 作为业务日期`,
+  dateSpan: (min: string, max: string) => `取值从 ${min} 到 ${max}`,
+  dateRanges: '日期列的取值范围',
+  skippedTitle: (n: number) => `跳过 ${formatNumber(n)} 项`,
+  moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
+  tableError: '这张表未能剖析',
+  // ---- 无法开始（409）
+  blocked: {
+    disabled: '未开启数据剖析',
+    inactive: '数据源已停用',
+    noSchema: '还没有表结构',
+    busy: '这个数据源正在剖析',
+    tampered: '数据文件核对未通过',
+    other: '无法开始剖析',
+  } as Record<string, string>,
+  blockedNext: {
+    disabled: '开启后即可在这里剖析。',
+    inactive: '启用后回到这里重试。',
+    noSchema: '探查完成后回到这里重试。',
+    busy: '同一个数据源同一时间只能进行一次剖析。',
+    tampered: '请重新上传表格，或联系管理员核对数据文件。',
+    other: '请稍后重试。',
+  } as Record<string, string>,
+  goSource: '前往数据源',
+  retry: '重试',
+  failedTitle: '剖析未能完成',
+  backToSetup: '返回',
+}
+
+/** 整次剖析中途停下的原因 */
+export const PROFILE_STOP_LABEL: Record<string, string> = {
+  budget: '查询次数已用完',
+  deadline: '总时长已用完',
+  failed: '连续多条查询失败',
+}
+
+/** 停下之后怎么办 */
+export const PROFILE_STOP_NEXT: Record<string, string> = {
+  budget: '其余检查未执行。可在数据剖析设置中调高查询次数上限，或缩小剖析范围后重新剖析。',
+  deadline: '其余检查未执行。可在数据剖析设置中调高总时长上限，或缩小剖析范围后重新剖析。',
+  failed: '其余检查未执行。请先在数据源卡片上测试连接，确认可用后重新剖析。',
+}
+
+/** 跳过一项的原因（skipped.reason）。整句说明在 skipped.detail 里 */
+export const PROFILE_SKIP_REASON_LABEL: Record<string, string> = {
+  budget: '查询次数用完',
+  deadline: '总时长用完',
+  failed: '连续失败',
+  timeout: '查询超时',
+  error: '查询失败',
+  rejected: '未通过安全守卫',
+  masked: '列已遮罩',
+  too_large: '表太大',
+  view: '视图',
+  unsupported: '暂不支持',
+  no_data: '没有数据',
+  missing: '表结构中没有',
+  high_cardinality: '取值太多',
+}
+
+/** 跳过的是哪一类检查（skipped.kind） */
+export const PROFILE_SKIP_KIND_LABEL: Record<string, string> = {
+  relation: '关联关系',
+  codes: '码值',
+  date: '日期列',
+  row_estimate: '行数估算',
+  table: '整张表',
+}
+
+/** 码值候选：剖析只知道出现过哪些取值，含义等人填 */
+export const CODES_TEXT = {
+  pending: '含义待填写',
+  pendingN: (n: number) => `${formatNumber(n)} 个含义待填写`,
+  fill: '填写含义',
+  fillLabel: (col: string) => `填写含义：列 ${col} 的码值`,
+  title: (col: string) => `列 ${col} 的码值含义`,
+  hint: '保存后这一项记为人工填写、已确认。暂不清楚的含义可以留空，之后再填。',
+  head: { code: '码值', meaning: '含义' },
+  note: '来源说明',
+  placeholder: '含义待填写',
+  saved: (n: number) => (n ? `已填写 ${formatNumber(n)} 个码值的含义` : '已保存'),
+  save: '保存',
+  cancel: '取消',
+  // 「已列出全部取值」：只有勾了的码值表，SQL 检查才提醒「码值不在码值表中」；只列了一部分（比如对话里只补了一个码）不勾
+  complete: '已列出全部取值',
+  completeHint: '勾选表示这一列只会出现这些取值，SQL 检查会据此提醒码值表中没有的取值；只列了一部分时不要勾选',
+  completeMark: '已列全',
+  completeMarkHint: '已列出全部取值：SQL 检查会提醒码值表中没有的取值',
+}
+
+// ===========================================================================
+// 数据目录及相关界面的补充文案（2026-10 完整性走查 R2 之后补的：清单的「只看运行中查询过的表」、剖析报告的逐条结论、
+// 码值含义待填写时的确认、保存后的影响面提示、合并查询带出输入……）。新增的都放在这里，上面几组的已有写法不动。
+// ===========================================================================
+
+export const CATALOG_UI_TEXT = {
+  // ---- 表清单：从顶部摘要点进来时只看运行中查询过的表，口径和摘要一致
+  usedOnly: '只看运行中查询过的表',
+  usedOnlyHint: '使用次数大于 0、还在表结构里的表，和顶部摘要的口径一致',
+  usedOnlyClear: '取消「只看运行中查询过的表」',
+  // ---- 剖析报告里的「填写含义」：填完回到报告，接着填下一列
+  codesFilled: '含义已填写',
+  editMeanings: '修改含义',
+  editMeaningsLabel: (col: string) => `修改含义：列 ${col} 的码值`,
+  fillWhileEditing: '正在编辑这张表，保存或取消后再填写码值的含义',
+  // ---- 剖析报告里关系的结论：按这次的实际变化说（原本就是已验证的不说「升为」）
+  relationStillVerified: (coverage: string) => `仍为已验证，覆盖率 ${coverage}`,
+  relationLowered: (reason: string) => `降为推断：${reason}`,
+  // ---- 确认含义还空着的码值：确认的是取值清单，含义照旧待填写
+  codesPendingConfirm: (n: number) => `有 ${formatNumber(n)} 个码值的含义待填写，确认的是取值清单`,
+  codesPendingAfter: '确认后这些码值仍显示「含义待填写」，之后可以再填写',
+  confirmColumnTitle: (col: string, n: number) => `确认列 ${col} 的 ${formatNumber(n)} 项推断？`,
+  confirmCodesTitle: (where: string) => `确认${where}？`,
+  // ---- 在目录页改过之后：和助手卡片保存后同一句，说有几个已发布模板引用这张表
+  savedImpact: (n: number) => `已保存。${formatNumber(n)} 个已发布模板引用这张表，下次正式运行时会提示数据目录有变化`,
+  savedImpactShow: '查看模板',
+  savedImpactDismiss: '收起这条提示',
+  // ---- 助手「建议更新数据目录」卡片：服务端对一项的说明（新增的关联关系推算不出基数）
+  patchNote: '说明',
+  // ---- 合并查询的输入：连线时还没选工具、后来才选上的查询节点，一次带出来
+  mergeAddConnected: (n: number) => `带出连着的 ${formatNumber(n)} 个查询节点`,
+  // ---- 发布前检查里的 SQL 检查问题：级别标识和证据面板一致，并说清两个发布级别下拦不拦
+  publishSqlErrorReminded: 'SQL 检查发现的错误级问题：已发布级别只提醒、不拦发布；受管级别会拦下',
+  publishSqlErrorBlocked: 'SQL 检查发现的错误级问题：受管级别会拦下发布，请先修改 SQL',
+  publishSqlWarning: 'SQL 检查的提醒：两个发布级别都只提醒、不拦发布',
+  publishSqlErrors: (n: number) => `，其中 ${formatNumber(n)} 处是 SQL 检查发现的错误级问题（受管级别会拦下）`,
+  // ---- 剖析的结构化读数：基数用数据核实过没有、挑表时跳过的空表
+  cardinalityChecked: '已用数据核实',
+  cardinalityByStructure: '子表一侧未核实，按表结构推断',
+  cardinalityCheckedShort: '已核实',
+  cardinalityCheckedHint: '基数由数据剖析用数据核实（子表一侧确有重复或确实唯一），一对多关联后重复计算的检查据此报错误',
+  emptyTables: (n: number) => `挑表时跳过 ${formatNumber(n)} 张空表`,
+}
+
+// ===========================================================================
+// 基于数据目录的 SQL 检查（后端 data/sqlcheck.py）
+//
+// 术语：
+// - 「SQL 检查」：对照数据目录找出能执行、数却可能不对的写法。七条规则，界面上写中文规则名，不露规则编号。
+// - 级别：错误（依据已核实，结果很可能有误）、提醒（依据已确认，结果可能有误）、提示（依据只是推断，仅供参考）。
+//   一对多关联后重复计算：只有一对多人工确认过、或数据剖析用数据核实过时才是错误；只凭外键推出的是提醒。
+//   颜色走语义令牌：错误 --st-failed，提醒 --st-waiting，提示 --accent。
+// ===========================================================================
+
+export const SQL_CHECK_RULE_LABEL: Record<SqlCheckCode, string> = {
+  fanout_sum: '一对多关联后重复计算',
+  stock_summed: '存量跨期加总',
+  join_unconfirmed: '关联条件未经确认',
+  ratio_aggregated: '比率直接加总或平均',
+  missing_valid_filter: '未筛选有效记录',
+  unknown_code: '码值不在码值表中',
+  wrong_date_column: '未按业务日期统计',
+}
+
+export const SQL_CHECK_RULE_HINT: Record<SqlCheckCode, string> = {
+  fanout_sum: '沿一对多方向关联后，对「一」那一侧的度量求和或计数，会按明细行数重复计算',
+  stock_summed: '对存量列求和却没有按业务日期分组，不同日期的存量被加在一起',
+  join_unconfirmed: '关联条件对不上数据目录中有确证的关系，可能连错了列',
+  ratio_aggregated: '对比率列直接求和或求平均，得不到正确的比率',
+  missing_valid_filter: '表定义了有效记录条件，查询没有按它筛选',
+  unknown_code: '码值表已列出全部取值，按码值筛选时却用了其中没有的值',
+  wrong_date_column: '表定义了业务日期，查询却按另一个时间列分组或筛选',
+}
+
+export const SQL_CHECK_LEVEL_LABEL: Record<SqlCheckLevel, string> = {
+  error: '错误',
+  warning: '提醒',
+  info: '提示',
+}
+
+export const SQL_CHECK_LEVEL_HINT: Record<SqlCheckLevel, string> = {
+  error: '依据已核实，结果很可能有误，需要修改',
+  warning: '依据已确认，结果可能有误，请核对',
+  info: '依据尚未确认（推断），仅供参考',
+}
+
+export const SQL_CHECK_TEXT = {
+  title: 'SQL 检查',
+  /** 规则编号不认识（服务端新加了规则）时的叫法 */
+  unknownRule: 'SQL 检查',
+  listLabel: (n: number) => `SQL 检查发现 ${formatNumber(n)} 处问题`,
+  where: '涉及',
+  excerpt: 'SQL 片段',
+  catalogHint: '检查依据来自数据目录。依据有误时，请在数据目录中修正对应项。',
+  // ---- 运行时间线：指标所依据的查询没通过 SQL 检查（日志 metric_sql_check）
+  metricTitle: (name: string, n = 1) =>
+    (n > 1 ? `指标「${name}」所依据的查询有 ${formatNumber(n)} 处未通过 SQL 检查` : `指标「${name}」所依据的查询未通过 SQL 检查`),
+  metricTitleAnon: '指标所依据的查询未通过 SQL 检查',
+  metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请在证据面板的查询步骤中查看问题，修改 SQL 后重新运行；'
+    + '检查依据有误时，请在数据目录中修正对应项',
+  // ---- 助手：搭图时查出的问题
+  counts: (errors: number, warnings: number, infos: number) =>
+    [errors ? `${formatNumber(errors)} 处错误` : '', warnings ? `${formatNumber(warnings)} 处提醒` : '',
+      infos ? `${formatNumber(infos)} 处提示` : ''].filter(Boolean).join('、'),
+  assistantTitle: (counts: string) => `SQL 检查：${counts}`,
+  assistantNext: '请打开对应节点，在「参数」中修改 SQL；检查依据有误时，请在数据目录中修正对应项',
+  assistantNextChat: '可在画布中打开此工作流，修改对应节点「参数」中的 SQL；检查依据有误时，请在数据目录中修正对应项',
+  assistantInfoNext: '这些检查的依据尚未确认，仅供参考。在数据目录中确认相关项后，检查结论更可靠',
+}
+
+// ===========================================================================
+// 证据面板、运行时间线里的 SQL 检查和数据目录版本，助手「参考了哪些表」（数据目录完整性修复 F2a）
+//
+// - 证据面板的查询步骤写这次查询对照的是哪一版数据目录（表结构快照里冻结的那份）：「数据目录：入园记录 第 3 版」。
+// - 合并查询的每个输入带着它自己的 SQL 检查结果。
+// - 运行时间线：同一条查询的问题只列一行，写明受影响的指标；「打开设置」落到来源查询节点的 SQL 上。
+// - 助手「参考了哪些表」：带字段的表和只提供了表名的表分开数。
+// ===========================================================================
+
+export const RUN_SQL_CHECK_TEXT = {
+  /** 证据面板查询步骤：SQL 检查对照的数据目录版本 */
+  catalogLine: (items: { name: string; version?: number | null }[]) =>
+    `数据目录：${items.map((i) => (i.version != null ? `${i.name} 第 ${formatNumber(i.version)} 版` : i.name)).join('、')}`,
+  catalogHint: '这次查询时冻结的数据目录版本，SQL 检查对照的就是这一版',
+  /** 合并查询的输入：这个输入查询自己的 SQL 检查 */
+  mergeInputChecks: (alias: string) => `输入 ${alias} 的 SQL 检查`,
+  /** 运行时间线：一条查询的问题影响了几个指标 */
+  metricsTitle: (names: string[], n = 1) => {
+    const who = names.length > 3
+      ? `指标${names.slice(0, 3).map((x) => `「${x}」`).join('')}等 ${formatNumber(names.length)} 个`
+      : `指标${names.map((x) => `「${x}」`).join('')}`
+    return n > 1 ? `${who}所依据的查询有 ${formatNumber(n)} 处未通过 SQL 检查` : `${who}所依据的查询未通过 SQL 检查`
+  },
+  /** 运行时间线：一次查询的 SQL 检查结果（查询那一行展开后） */
+  toolChecks: 'SQL 检查',
+  /** 「打开设置」落到来源查询节点的 SQL 上 */
+  openSql: (label?: string) => (label ? `打开「${label}」的 SQL` : '打开来源查询的 SQL'),
+  metricNext: '指标照常计算，但结果不可靠，出具按缺口降档。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 出具横幅、报告页：SQL 检查导致的降档单列一块 */
+  issuanceTitle: (tier: string) => (tier === 'degraded' ? '降档原因：所依据的查询未通过 SQL 检查' : '所依据的查询未通过 SQL 检查'),
+  issuanceQuery: '所依据的查询',
+  issuanceAffected: (refs: string) => `受影响：${refs}`,
+  issuanceNext: '数字的出处都对得上，但算出这些数的查询本身有问题，结果不可靠。请修改来源查询的 SQL 后重新运行；检查依据有误时，请在数据目录中修正对应项',
+  /** 其余缺口的标题（SQL 检查的那几条单列之后） */
+  otherGaps: '校验未全部完成：',
+}
+
+export const COPILOT_CONTEXT_TEXT = {
+  /** 标题：另有只提供了表名的表时，写明这个数只算带着字段的表 */
+  withFields: (n: number) => `参考了 ${formatNumber(n)} 张表的字段`,
+  namesOnly: (n: number) => `另有 ${formatNumber(n)} 张表只提供了表名`,
+  notPicked: '未能按需求挑选',
 }

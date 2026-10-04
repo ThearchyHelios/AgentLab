@@ -239,6 +239,8 @@ function normalizeIssue(raw: any): ValidationIssue | null {
     field: raw.field ?? null,
     code: typeof raw.code === 'string' ? raw.code : null,
     fix: typeof raw.fix === 'string' && raw.fix ? raw.fix : null,
+    // 门禁里的 SQL 检查带着检查本来的级别（governance._lint_sql），发布前检查据此写「错误 / 提醒」
+    ...(raw.sql_level === 'error' || raw.sql_level === 'warning' ? { sql_level: raw.sql_level } : {}),
   }
 }
 

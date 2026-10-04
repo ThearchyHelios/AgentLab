@@ -1,8 +1,14 @@
-import type { RunEvent, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
+import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
-import { JUDGE_TEXT, TYPE_LABEL, claimTally, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import {
+  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  claimTally,
+  evidenceTally, issuanceLabel, nodeTypeLabel,
+} from '../lib/terms'
+import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
+import { isSqlCheckCode, sortSqlChecks, sqlCheckOf, sqlChecksOf, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
@@ -145,6 +151,32 @@ export interface Step {
   limitS?: number
   /** 出具那一行的档位（formal / degraded / withheld） */
   tier?: string
+  /** 合并查询那一行（merge.end）：合并了哪几个输入、几条警告。SQL 在 detail，预览在 result */
+  merge?: MergeStep
+  /** 对照数据目录的 SQL 检查结果：查询那一行（tool.end.checks）、指标所依据的查询没通过检查那一行（log.checks） */
+  checks?: SqlCheckItem[]
+  /** fix 要去的不是这一行所在的节点（指标的问题出在来源查询节点的 SQL 上）：去哪个节点、落到哪一栏 */
+  fixNode?: string
+  fixField?: string
+  /** fixNode 在画布上的名字（入口写「打开「取数」的 SQL」） */
+  fixLabel?: string
+}
+
+/** 合并查询的一个输入：合并 SQL 里的别名、上游节点、行数、数据源 */
+export interface MergeStepInput {
+  alias: string
+  nodeId?: string
+  label?: string
+  rows?: number
+  source?: string
+}
+
+export interface MergeStep {
+  inputs: MergeStepInput[]
+  /** 执行时的警告条数。警告的原文由同一节点紧接着的 log（merge_key_type…）各占一行，不在这里重复 */
+  warnings: number
+  rows?: number
+  truncated: boolean
 }
 
 // 这两个是流式增量，后端根本不落库（_EPHEMERAL）。单次运行的 delta 量级会
@@ -417,8 +449,10 @@ export interface ResultTable {
   rows: unknown[][]
   /** 查询本身撞了行数上限——数据库里还有更多，是 guard 没让它全取回来 */
   truncated: boolean
-  /** 这份预览被按字符数切断了——取回来的行数比这里显示的多，只是没存下来 */
+  /** 这份预览被按字符数切断了，或者本来就只存了前几行——实际的行数比这里显示的多，只是没存下来 */
   clipped?: boolean
+  /** 实际一共几行（结果里的 row_count）。比 rows 多时，表格脚注写「显示前 5 / 6 行」 */
+  total?: number
 }
 
 /**
@@ -453,7 +487,9 @@ function tryTable(text: string): ResultTable | null {
   try {
     const data = JSON.parse(text)
     if (Array.isArray(data?.columns) && Array.isArray(data?.rows)) {
-      return { columns: data.columns, rows: data.rows, truncated: !!data.truncated }
+      const total = typeof data.row_count === 'number' && data.row_count > data.rows.length ? data.row_count : undefined
+      return { columns: data.columns, rows: data.rows, truncated: !!data.truncated,
+               ...(data.clipped === true || total != null ? { clipped: true } : {}), ...(total != null ? { total } : {}) }
     }
   } catch {
     /* 交给调用方决定要不要修 */
@@ -680,7 +716,10 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
  * 贴出来是一串标记和术语，而且不说该去哪儿改——这里说成人话，并给出下一步。
  * 认不得的 code 返回 null，照原话显示
  */
-function explainLog(code: string | undefined, message: string): Pick<Step, 'title' | 'sub' | 'next' | 'fix'> | null {
+function explainLog(code: string | undefined, message: string, d: Record<string, any> = {},
+): Pick<Step, 'title' | 'sub' | 'next' | 'fix' | 'fixNode' | 'fixField' | 'checks'> | null {
+  const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
+  const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x) : [])
   switch (code) {
     case 'tool_markup_leak': {
       // 「数据查询把工具调用写成了文字（<｜｜DSML｜｜…），没有真正调用工具，已提醒它重试一次」
@@ -745,6 +784,37 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         next: '模型给出的出处在查询结果中不存在。请让模型先查询到这些字段再提交，查询不到的字段记为空值',
       }
     }
+    case 'metric_incomplete': {
+      // 结构化字段（metrics.py）：metric_name、reason（「基于被截断的查询结果计算（只取回了前 1000 行），结果不完整」）。
+      // 老运行的日志没有这两个字段：只给不点名的标题，原话留在展开区，不从中文里解析
+      const name = str(d.metric_name)
+      const reason = str(d.reason)?.replace(/，结果不完整$/, '')
+      return {
+        title: name ? `指标「${name}」结果不完整` : '指标结果不完整',
+        sub: reason,
+        next: '口径卡对截断的查询结果计数、求和，只算到了取回的部分，出具按缺口降档。'
+          + '请在 SQL 中直接聚合（如 COUNT、SUM）或缩小查询范围后重新运行',
+        fix: 'canvas',
+      }
+    }
+    case 'metric_sql_check': {
+      // 一条没通过 SQL 检查的来源查询一行（metrics.py _emit_sql_check_logs），结构化字段：metric_names（受影响的指标）、
+      // problems（问题那半句）、checks（级别、规则、表和列）、source_node / source_field（来源查询节点和它的 SQL 那一栏）。
+      // 「打开设置」落到来源查询节点的 SQL 上：要改的是那条 SQL，不是口径卡。老运行没有这些字段：只给不点名的标题
+      const names = strs(d.metric_names)
+      const problems = strs(d.problems)
+      const checks = sqlChecksOf(d.checks)
+      const source = str(d.source_node)
+      return {
+        title: names.length ? RUN_SQL_CHECK_TEXT.metricsTitle(names, Math.max(1, problems.length)) : SQL_CHECK_TEXT.metricTitleAnon,
+        sub: problems.join('；') || undefined,
+        next: source ? RUN_SQL_CHECK_TEXT.metricNext : SQL_CHECK_TEXT.metricNext,
+        fix: 'canvas',
+        ...(source ? { fixNode: source } : {}),
+        ...(source && str(d.source_field) ? { fixField: str(d.source_field) } : {}),
+        ...(checks.length ? { checks } : {}),
+      }
+    }
     case 'judge_limit': {
       // 「结论句裁判已到上限（这份报告的裁判金额上限 $0.05）：3 句没判，记为未裁判；已判的保留」（judge.py run_request）
       const n = message.match(/[：:]\s*(\d+)\s*句(?:没判|未裁判)/)?.[1]
@@ -752,6 +822,38 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
         title: `结论句裁判已达上限${n ? `，${n} 句未裁判` : ''}（已裁判的结果保留）`,
         sub: message.match(/已[到达]上限（(.+?)）/)?.[1],
         next: '存在未裁判的结论句时不能完整出具。请在报告撰写节点的「结论句裁判」中调高上限（或设为不限），或在「设置 → 偏好设置 → 证据裁判」中修改默认值',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_key_type': {
+      // 结构化字段（engine/merge_query._warnings）：keys（两边的列）、detail（「s.门店 是文本（例如 '01'），v.门店 是数值（例如 1）」）
+      const keys = strs(d.keys)
+      return {
+        title: keys.length === 2 ? `合并键类型不一致：${keys[0]} 与 ${keys[1]}` : '合并键类型不一致',
+        sub: str(d.detail),
+        next: '两边类型不同时，SQLite 按隐式转换比较，可能错配或完全匹配不上。请在源查询中统一类型，或在合并 SQL 中用 CAST 明确转换',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_rows_grew': {
+      // 结构化字段：rows（合并结果行数）、input / input_rows（行数最多的输入）、duplicates（各输入里重复的键）
+      const rows = num(d.rows)
+      const input = str(d.input)
+      const inputRows = num(d.input_rows)
+      return {
+        title: '合并结果行数多于输入，合并键可能不唯一',
+        sub: [rows != null && input && inputRows != null
+          ? `合并结果 ${formatNumber(rows)} 行，行数最多的输入「${input}」${formatNumber(inputRows)} 行` : '',
+        str(d.duplicates) ?? ''].filter(Boolean).join('；') || undefined,
+        next: '请检查合并条件是否覆盖了全部合并键（例如同时按日期和门店），或先在源库里聚合到相同粒度',
+        fix: 'canvas',
+      }
+    }
+    case 'merge_truncated': {
+      const rows = num(d.rows)
+      return {
+        title: `合并结果超过上限，${rows != null ? `只保留了前 ${formatNumber(rows)} 行` : '已截断'}`,
+        next: '下游拿到的不是完整结果。请在合并 SQL 中聚合或加条件缩小范围',
         fix: 'canvas',
       }
     }
@@ -812,6 +914,12 @@ function explainLog(code: string | undefined, message: string): Pick<Step, 'titl
     default:
       return null
   }
+}
+
+/** tool.start / tool.end 的配对键：有 call_id 用它；独立的调用工具节点不带 call_id，用「节点 + 工具名」 */
+function toolKey(nodeId: string | undefined, d: Record<string, any>, seq?: number): string {
+  if (d.call_id) return `call:${String(d.call_id)}`
+  return `${nodeId ?? '_'}:${String(d.tool || (seq ?? ''))}`
 }
 
 function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
@@ -1548,15 +1656,16 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 协作成员调的工具说清是谁调的
         if (d.agent) step.sub = `${d.agent} 调用`
         // call_id 才是可靠的配对键：同一节点并发调同名工具时，按名字配会错位。
-        // 独立 Tool 节点不带 call_id，回退到工具名。
-        pendingTools.set(String(d.call_id || d.tool || seq), step)
+        // 独立 Tool 节点不带 call_id，回退到「节点 + 工具名」：两个并行的查询节点用同一个工具时，
+        // 只按工具名配，后开始的那条会顶掉先开始的，结果配错节点
+        pendingTools.set(toolKey(nodeId, d, seq), step)
         push(step, nodeId)
         break
       }
 
       case 'tool.end':
       case 'tool.error': {
-        const key = String(d.call_id || d.tool || '')
+        const key = toolKey(nodeId, d)
         const step = pendingTools.get(key)
         const preview = String(d.preview ?? d.error ?? '')
         if (step) {
@@ -1581,6 +1690,16 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           step.meta = parts.join(' · ') || undefined
           step.artifact = d.artifact
           if (typeof d.detail === 'string' && d.detail) step.raw = d.detail
+          // 这次查询对照数据目录的 SQL 检查（tool.end.checks）：preview 只是结果的前一截，检查结果通常被截掉，单独带着。
+          // 副标题数一下错误、提醒、提示，展开看每一条
+          const checks = sqlChecksOf(d.checks)
+          if (checks.length && !failed) {
+            step.checks = sortSqlChecks(checks)
+            const n = (lv: string) => checks.filter((c) => c.level === lv).length
+            const counts = SQL_CHECK_TEXT.assistantTitle(SQL_CHECK_TEXT.counts(n('error'), n('warning'), n('info')))
+            step.sub = step.sub ? `${step.sub} · ${counts}` : counts
+            if (n('error') || n('warning')) step.level = 'warn'
+          }
           if (step.kind === 'query' || step.kind === 'schema' || failed) {
             // 查询保留 SQL 作为 detail，结果另挂；失败时结果就是错误原因
             step.detail = failed ? `${step.detail ?? ''}\n\n${preview}`.trim() : step.detail
@@ -1797,6 +1916,17 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         break
       }
 
+      case 'catalog.drift': {
+        // 从发布版本发起的正式运行：发布之后数据目录有变化。只提醒、运行照常，所以是一条警告，不是失败
+        const drift = catalogDrift(d)
+        if (!drift) break
+        out.push({
+          id: `cd-${seq}`, seq, kind: 'note', level: 'warn', status: 'done', code: 'catalog_drift',
+          title: drift.title, sub: CATALOG_DRIFT_TEXT.sub, detail: drift.detail,
+        })
+        break
+      }
+
       case 'caliber.upgrade':
         out.push({
           id: `cu-${seq}`, seq, kind: 'note', level: 'warn', status: 'done',
@@ -1959,7 +2089,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 其余 info 是给排查用的，不进主流程——但 warn/error 用户必须看到
         if (level === 'info' || !message) break
         const code = typeof d.code === 'string' && d.code ? d.code : undefined
-        const said = explainLog(code, message)
+        const said = explainLog(code, message, d)
         if (code === 'repair_invented') {
           // 修复编出了原文没有的值：折进刚才那一行「让模型修复格式」，一件事一行
           const repair = repairs.get(nodeId ?? '_')
@@ -1971,12 +2101,14 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           }
         }
         if (code === 'team_exhausted') trackTeam(event)
+        // 要改的是另一个节点（来源查询）：入口写它的名字，认不出就只写「打开来源查询的 SQL」
+        const fixLabel = said?.fixNode ? nodeSteps.get(said.fixNode)?.title : undefined
         push({
           id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done',
           level: level === 'error' ? 'error' : 'warn',
           ...(code ? { code } : {}),
           ...(said
-            ? { ...said, detail: message }
+            ? { ...said, detail: message, ...(fixLabel ? { fixLabel } : {}) }
             : { title: clip(message, 120), ...(message.length > 120 ? { detail: message } : {}) }),
         }, nodeId)
         break
@@ -2070,6 +2202,41 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           status: count ? 'done' : 'failed',
           level: count ? undefined : 'warn',
           title: count ? `召回 ${count} 条相关记忆` : '未召回相关记忆',
+        }, nodeId)
+        break
+      }
+
+      case 'merge.end': {
+        // 合并查询：几次查询的结果在库外按键合并。和查询同一类（kind query）：detail 是合并 SQL，result 是预览，
+        // 工件是合并结果的查询快照。输入列在 merge 里，展开区单列一块；警告的原文由紧跟着的 log 各占一行
+        const inputs: MergeStepInput[] = (Array.isArray(d.inputs) ? d.inputs : [])
+          .filter((i: any) => i && typeof i === 'object' && typeof i.alias === 'string')
+          .map((i: any) => ({
+            alias: String(i.alias),
+            ...(typeof i.node_id === 'string' ? { nodeId: i.node_id } : {}),
+            ...(typeof i.label === 'string' && i.label ? { label: i.label } : {}),
+            ...(num(i.rows) != null ? { rows: num(i.rows) } : {}),
+            ...(typeof i.source === 'string' && i.source ? { source: i.source } : {}),
+          }))
+        const warnings = Array.isArray(d.warnings) ? d.warnings.filter((w: any) => w && w.message).length : 0
+        const rows = num(d.rows)
+        const ms = num(d.duration_ms)
+        const preview = Array.isArray(d.preview_rows) ? d.preview_rows : []
+        push({
+          id: `mg-${seq}`, seq, kind: 'query', nodeId, status: 'done', code: 'merge',
+          ...(warnings ? { level: 'warn' as const, sub: MERGE_TEXT.warnings(warnings) } : {}),
+          title: MERGE_TEXT.stepTitle(inputs.map((i) => i.alias)),
+          detail: typeof d.sql === 'string' && d.sql ? d.sql : undefined,
+          // 预览只存了前几行：那是「此处仅为预览」（clipped），不是「查询已达行数上限」（truncated）。
+          // 合并结果本身超过上限才是 truncated；row_count 记全部行数，表格脚注写「显示前 5 / 6 行」
+          result: Array.isArray(d.columns)
+            ? JSON.stringify({ columns: d.columns, rows: preview, truncated: !!d.truncated,
+                               clipped: rows != null && rows > preview.length, ...(rows != null ? { row_count: rows } : {}) })
+            : undefined,
+          meta: [rows != null ? MERGE_TEXT.rows(rows) : '', dur(ms) ?? ''].filter(Boolean).join(' · ') || undefined,
+          ms,
+          ...(typeof d.query_artifact === 'string' && d.query_artifact ? { artifact: d.query_artifact } : {}),
+          merge: { inputs, warnings, ...(rows != null ? { rows } : {}), truncated: !!d.truncated },
         }, nodeId)
         break
       }
@@ -2344,8 +2511,12 @@ export interface CopilotIssue {
   label?: string
   /** 落在节点的哪一项配置上（condition、tools、agents[1].tools）：「定位」据此聚焦到检查器里那个输入框 */
   field?: string
-  /** 机读代号：datasource_out_of_scope、tools_dropped…… */
+  /** 机读代号：datasource_out_of_scope、tools_dropped……；SQL 检查是规则编号（fanout_sum……） */
   code?: string
+  /** error / warning / info。老会话、老后端不给 */
+  level?: 'error' | 'warning' | 'info'
+  /** SQL 检查的问题按检查读出来的那一条（lib/sqlcheck 的 sqlCheckOf：级别、规则、表和列、关系编号、SQL 片段） */
+  sql?: SqlCheckItem
 }
 
 /**
@@ -2360,11 +2531,17 @@ function parseIssue(v: unknown, labels?: (id: string) => string | undefined): Co
   }
   if (v && typeof v === 'object') {
     const o = v as Record<string, unknown>
+    const str = (x: unknown) => (typeof x === 'string' && x ? x : undefined)
+    // SQL 检查和证据面板、运行时间线同一个读法（sqlCheckOf，关系编号也留着）。自查交回模型改的问题老后端不给级别，
+    // 那时交回去的都是错误：没给级别的按错误读
+    const sql = isSqlCheckCode(o.code) ? sqlCheckOf({ ...o, level: o.level ?? 'error' }) : null
     return named({
       message: String(o.message ?? ''),
       ...(o.node_id ? { nodeId: String(o.node_id) } : {}),
-      ...(typeof o.field === 'string' && o.field ? { field: o.field } : {}),
-      ...(typeof o.code === 'string' && o.code ? { code: o.code } : {}),
+      ...(str(o.field) ? { field: str(o.field) } : {}),
+      ...(str(o.code) ? { code: str(o.code) } : {}),
+      ...(o.level === 'error' || o.level === 'warning' || o.level === 'info' ? { level: o.level } : {}),
+      ...(sql ? { sql } : {}),
     })
   }
   const text = String(v ?? '')
@@ -2372,9 +2549,33 @@ function parseIssue(v: unknown, labels?: (id: string) => string | undefined): Co
   return named(m ? { nodeId: m[1], message: m[2] || text } : { message: text })
 }
 
-/** 一条自查问题写成一行：带节点名（认得出时），认不出才退到 id */
-export const issueLine = (x: CopilotIssue): string =>
-  x.nodeId ? `「${x.label ?? x.nodeId}」${x.message}` : x.message
+/**
+ * 一条自查问题写成一行：带节点名（认得出时），认不出才退到 id。SQL 检查的问题前面写中文规则名、后面写涉及的表和列，
+ * 不露规则编号
+ */
+export const issueLine = (x: CopilotIssue): string => {
+  const where = x.sql ? sqlCheckWhere(x.sql) : ''
+  const body = x.sql
+    ? `${sqlRuleLabel(x.sql.code)}：${x.message}${where ? `（${SQL_CHECK_TEXT.where} ${where}）` : ''}`
+    : x.message
+  return x.nodeId ? `「${x.label ?? x.nodeId}」${body}` : body
+}
+
+/** 一条自查问题按 SQL 检查读（界面上画级别、规则名、表和列、SQL 片段）；不是 SQL 检查的返回 null */
+export function issueSqlCheck(x: CopilotIssue): SqlCheckItem | null {
+  return x.sql ?? null
+}
+
+/** final.issues 里对照数据目录的 SQL 检查结果（不挡运行的提醒、提示也在里面）；自查没修好、已经列过的错误不再算 */
+function sqlIssuesOf(ops: CopilotOp[], labels: (id: string) => string | undefined): CopilotIssue[] {
+  const final = [...ops].reverse().find((o) => o.op === 'final')
+  const list: unknown[] = final && Array.isArray(final.issues) ? final.issues : []
+  const failed = [...ops].reverse().find((o) => o.op === 'check' && o.status === 'failed')
+  const listed = new Set((failed && Array.isArray(failed.issues) ? failed.issues : [])
+    .map((x: unknown) => parseIssue(x)).map((x: CopilotIssue) => `${x.nodeId ?? ''}|${x.code ?? ''}|${x.message}`))
+  return list.map((x) => parseIssue(x, labels))
+    .filter((x) => isSqlCheckCode(x.code) && !listed.has(`${x.nodeId ?? ''}|${x.code ?? ''}|${x.message}`))
+}
 
 /**
  * 节点 id → 名字。先认这一轮操作流里加过、改过的（问数据页没有画布，只有这一份），
@@ -2391,6 +2592,149 @@ function labelsOf(ops: CopilotOp[], fallback?: (id: string) => string | undefine
     }
   }
   return (id) => map.get(id) ?? fallback?.(id)
+}
+
+/** 一张表的那一行：「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版 */
+export function catalogDriftLine(t: CatalogDriftTable): string {
+  return CATALOG_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table),
+    CATALOG_DRIFT_TEXT.version(t.published), CATALOG_DRIFT_TEXT.version(t.current))
+}
+
+/**
+ * catalog.drift 事件 → 提醒的标题和逐表明细。每张表带 impact：direct 是 SQL 里写着的表，possible 是 Agent 可能
+ * 查询的表（Agent 绑定了数据源的查询工具，SQL 运行时才生成），两组分开说：
+ * - 标题按第一张直接引用的表说（「入园记录」等 2 张表有变化），还有可能涉及的补一句「另有 N 张 Agent 可能查询的表
+ *   有变化」；只有可能涉及的，标题直说「Agent 可能查询的表有变化」
+ * - 明细每张表一行：发布时第几版、现在第几版（0 写「尚无目录」）；可能涉及的放在小标题下面
+ * 老事件的表没有 impact，按直接引用。认不出的形状返回 null
+ */
+export function catalogDrift(d: Record<string, any>): {
+  title: string; detail: string; tables: CatalogDriftTable[]; direct: CatalogDriftTable[]; possible: CatalogDriftTable[]
+} | null {
+  const tables: CatalogDriftTable[] = (Array.isArray(d?.tables) ? d.tables : [])
+    .filter((t: any) => t && typeof t === 'object' && typeof t.table === 'string' && typeof t.source === 'string')
+    .map((t: any) => ({
+      source: t.source, source_id: String(t.source_id ?? ''), table: t.table,
+      label: typeof t.label === 'string' && t.label ? t.label : null,
+      published: num(t.published) ?? null, current: num(t.current) ?? 0,
+      impact: t.impact === 'possible' ? 'possible' : 'direct',
+    }))
+  if (!tables.length) return null
+  const direct = tables.filter((t) => t.impact === 'direct')
+  const possible = tables.filter((t) => t.impact === 'possible')
+  const name = (t: CatalogDriftTable) => t.label ?? t.table
+  const title = direct.length
+    ? CATALOG_DRIFT_TEXT.title(name(direct[0]), direct.length) + (possible.length ? CATALOG_DRIFT_TEXT.alsoPossible(possible.length) : '')
+    : CATALOG_DRIFT_TEXT.possibleTitle(name(possible[0]), possible.length)
+  return {
+    title,
+    detail: [
+      ...direct.map(catalogDriftLine),
+      ...(possible.length ? [`${CATALOG_DRIFT_TEXT.possibleHead}：`, ...possible.map(catalogDriftLine)] : []),
+    ].join('\n'),
+    tables, direct, possible,
+  }
+}
+
+/** context 操作里一个数据源的那一项（服务端 copilot_context.DatasourceContext.op） */
+export interface CopilotContextSource {
+  source: string
+  /** 模型看得到全部字段的表（全名）。只给了表名的不在这里 */
+  tables: string[]
+  /** model：按需求挑的；all：库不大，全部表都带字段；fallback：没能挑出来，只给了表名 */
+  selectedBy: 'model' | 'all' | 'fallback'
+  /** 这个库一共几张表（数据库里的真实总数） */
+  total?: number
+  /** 探查结构截断了时，探查到几张（服务端只在截断时给）：模型只看得到这几张 */
+  explored?: number
+  /** 没能挑出来的原因 */
+  reason?: string
+}
+
+/** 挑表失败时的说法：模型这一轮只看到表名，字段要它自己去查 */
+export const CONTEXT_FALLBACK_TEXT = '未能按需求挑选，已提供全部表名'
+
+function contextSources(op: CopilotOp): CopilotContextSource[] {
+  const list: unknown[] = Array.isArray(op.sources) ? op.sources : []
+  return list
+    .filter((x): x is Record<string, any> => !!x && typeof x === 'object' && typeof (x as any).source === 'string')
+    .map((x) => {
+      const total = num(x.total)
+      const explored = num(x.explored)
+      return {
+        source: x.source,
+        tables: Array.isArray(x.tables) ? x.tables.map(String) : [],
+        selectedBy: x.selected_by === 'model' || x.selected_by === 'fallback' ? x.selected_by : 'all',
+        ...(total != null ? { total } : {}),
+        ...(total != null && explored != null && explored < total ? { explored } : {}),
+        ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
+      }
+    })
+}
+
+/**
+ * 一个库在展开区里的那一行：怎么来的 + 表名。探查结构截断了的库写明「共 205 张，只探查了 200 张」：
+ * 模型只看得到探查到的那些，用户说的表不在里面时，先得知道是没探查到，不是库里没有
+ */
+function contextLine(g: CopilotContextSource): string {
+  const names = g.tables.join('、')
+  const partial = g.total != null && g.explored != null ? SCHEMA_PARTIAL_TEXT.context(g.total, g.explored) : ''
+  const of = partial || (g.total != null ? `共 ${g.total} 张表` : '')
+  switch (g.selectedBy) {
+    case 'all':
+      return `「${g.source}」全部 ${g.tables.length} 张表${partial ? `（${partial}）` : ''}：${names}`
+    case 'model':
+      return g.tables.length
+        ? partial
+          ? `「${g.source}」${partial}，按需求挑出 ${g.tables.length} 张：${names}`
+          : `「${g.source}」按需求${g.total != null ? `从 ${g.total} 张表中` : ''}挑出 ${g.tables.length} 张：${names}`
+        : `「${g.source}」${of ? `${of}，` : ''}未挑中与需求相关的表，已提供全部表名`
+    default:
+      return `「${g.source}」${of ? `${of}，` : ''}${CONTEXT_FALLBACK_TEXT}`
+        + (g.tables.length ? `；现有工作流用到的 ${g.tables.length} 张表附带全部字段：${names}` : '')
+  }
+}
+
+/**
+ * 助手这一轮参考了哪些表（context 操作）→ 过程里的一行。
+ *
+ * 大库放不下全部字段，服务端先按需求挑表，挑中的表给模型全部字段。这件事要看得见：生成的 SQL 用错了表，
+ * 先得知道模型当时看到的是哪几张。标题只说几张（「参考了 8 张表」），展开按数据源分组列表名；挑表失败时
+ * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
+ */
+export function copilotContext(op: CopilotOp): { title: string; sub?: string; detail: string; ms?: number } | null {
+  // 展开区里按需求挑过表的库排在前面：请求里点名的那个库往往就是它，排在一串小库后面得在内层滚动框里翻才看得到
+  const order: Record<CopilotContextSource['selectedBy'], number> = { model: 0, all: 1, fallback: 2 }
+  const groups = contextSources(op).map((g, i) => ({ g, i }))
+    .sort((a, b) => order[a.g.selectedBy] - order[b.g.selectedBy] || a.i - b.i).map((x) => x.g)
+  if (!groups.length) return null
+  // 两个数分开说：带着全部字段的表（count），和只提供了表名的表（namesOnly：没挑成的库、一张没挑中的库）。
+  // 以前标题只写前者，「参考了 26 张表」看不出另有 206 张只给了表名
+  const count = groups.reduce((n, g) => n + g.tables.length, 0)
+  const namesOnly = groups.reduce((n, g) => n + namesOnlyOf(g), 0)
+  const failed = groups.filter((g) => g.selectedBy === 'fallback')
+  // 有表带着字段（小库，或者现有工作流用到的表）时标题仍说几张，没挑成的事放副标题
+  const who = failed.length && failed.length < groups.length ? `「${failed.map((g) => g.source).join('」「')}」` : ''
+  const sub = count && failed.length
+    ? namesOnly ? `${who}${COPILOT_CONTEXT_TEXT.notPicked}，${COPILOT_CONTEXT_TEXT.namesOnly(namesOnly)}` : `${who}${CONTEXT_FALLBACK_TEXT}`
+    : count && namesOnly ? COPILOT_CONTEXT_TEXT.namesOnly(namesOnly) : undefined
+  const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
+  // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
+  const ms = num(op.elapsed_ms)
+  return {
+    title: count ? (namesOnly ? COPILOT_CONTEXT_TEXT.withFields(count) : `参考了 ${count} 张表`) : CONTEXT_FALLBACK_TEXT,
+    ...(sub ? { sub } : {}),
+    detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
+    ...(ms != null && ms >= 10 ? { ms } : {}),
+  }
+}
+
+/** 这个库里只提供了表名、没带字段的表有几张（模型看得到的那些：探查截断了的按探查到的算） */
+function namesOnlyOf(g: CopilotContextSource): number {
+  const seen = g.explored ?? g.total
+  if (seen == null) return 0
+  if (g.selectedBy === 'fallback' || (g.selectedBy === 'model' && !g.tables.length)) return Math.max(0, seen - g.tables.length)
+  return 0
 }
 
 /** 用了限定范围之外的数据源：自查交回模型改也改不掉时，人要知道是范围的事，不是图写错了 */
@@ -2497,6 +2841,27 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
               ...(elapsed ? { ms: elapsed, meta: formatDuration(elapsed) } : {}) })
         break
       }
+      case 'context': {
+        // 这一轮参考了哪些表：标题说几张，展开看按数据源分组的表名
+        const ctx = copilotContext(op)
+        if (!ctx) break
+        add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: 'copilot_context',
+              title: ctx.title, detail: ctx.detail,
+              ...(ctx.sub ? { sub: ctx.sub } : {}),
+              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}) })
+        break
+      }
+      case 'catalog_patch': {
+        // 目录修改提案：过程里记一行（哪张表、几项，展开看改前改后），保存、忽略在轮次里的卡片上做（catalogPatchesOf）
+        const patch = catalogPatchOf(op, String(i - 1))
+        if (!patch) break
+        add({ id: `cpt-${i}`, seq: i, kind: 'schema', status: 'done', code: 'catalog_patch',
+              title: CATALOG_PATCH_TEXT.step(patch.tableLabel ?? patch.table, patch.changes.length),
+              sub: CATALOG_PATCH_TEXT.stepSub,
+              detail: patch.changes.map((c) => `${patchWhere(c)}：${patchValueText(c.path, c.before)} → ${patchValueText(c.path, c.after)}`)
+                .join('\n') })
+        break
+      }
       case 'plan':
         add({ id: `cp-${i}`, seq: i, kind: 'note', status: 'done',
               title: clip(String(op.summary ?? '已完成规划'), 120) })
@@ -2588,6 +2953,23 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         for (const t of skippedTypes(op)) {
           add({ id: `cm-${i}-${t}`, seq: i, kind: 'note', status: 'done', level: 'warn',
                 title: clip(`已跳过一个步骤：节点类型「${t}」不存在`, 80) })
+        }
+        // 对照数据目录的 SQL 检查：错误交回模型改过（没改好的在自查那一行），不挡运行的提醒、提示照样要看得见
+        const sql = sqlIssuesOf(ops.slice(0, i), labels)
+        if (sql.length) {
+          const n = { error: 0, warning: 0, info: 0 }
+          for (const x of sql) n[x.level ?? 'error'] += 1
+          const nodes = [...new Set(sql.map((x) => x.nodeId).filter(Boolean))]
+          add({
+            id: `cs-${i}`, seq: i, kind: 'note', status: 'done', code: 'sql_check',
+            ...(n.error || n.warning ? { level: 'warn' as const } : {}),
+            title: SQL_CHECK_TEXT.assistantTitle(SQL_CHECK_TEXT.counts(n.error, n.warning, n.info)),
+            detail: sortSqlChecks(sql).map(issueLine).join('\n'),
+            // 问数据页没有画布：下一步说去画布里打开这个工作流
+            next: n.error || n.warning ? (canvas ? SQL_CHECK_TEXT.assistantNext : SQL_CHECK_TEXT.assistantNextChat)
+              : SQL_CHECK_TEXT.assistantInfoNext,
+            ...(nodes.length === 1 ? { nodeId: nodes[0], ...(canvas ? { fix: 'canvas' as const } : {}) } : {}),
+          })
         }
         // 工具绑定变化单独成一行：改图回执以前只说「修改 1」，模型改提示词时漏写 tools、
         // 把查库的工具整个抹掉，要到运行结果不对才发现
@@ -2685,6 +3067,8 @@ export interface CopilotOutcome {
   toolChanges: ToolChange[]
   /** 自查的「工具被去掉了」警告（tools_dropped）：这一轮的要求里没提到去掉 */
   dropped: CopilotIssue[]
+  /** 对照数据目录的 SQL 检查结果（final.issues），自查没修好、已经列在 check 里的不重复 */
+  sqlChecks: CopilotIssue[]
 }
 
 export function copilotOutcome(
@@ -2692,7 +3076,7 @@ export function copilotOutcome(
 ): CopilotOutcome {
   const res: CopilotOutcome = {
     kind: running ? 'running' : 'empty', skipped: [], added: 0, updated: 0, removed: 0,
-    toolChanges: [], dropped: [],
+    toolChanges: [], dropped: [], sqlChecks: [],
   }
   const labels = labelsOf(ops, labelOf)
   for (const op of ops) {
@@ -2724,6 +3108,7 @@ export function copilotOutcome(
         res.toolChanges = toolChangesOf(op)
         // 同一批警告 final.issues 里也有一份：自查已经带回来了就不再算一遍
         if (!res.dropped.length) res.dropped = droppedOf(op)
+        res.sqlChecks = sqlIssuesOf(ops, labels)
         if (!running) res.kind = 'built'
         break
       case 'error':

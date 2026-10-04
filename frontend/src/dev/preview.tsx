@@ -6,6 +6,7 @@ import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantS
 import { Markdown } from '../run/Markdown'
 import { ApprovalCard } from '../run/RunPanel'
 import { decodeCopilot, decodeRun } from '../run/decode'
+import { catalogPatchesOf } from '../run/catalogPatch'
 import { ToastHost } from '../components/ui'
 import type { RunEvent } from '../types'
 import fixtures from '../run/__tests__/fixtures.json'
@@ -13,8 +14,8 @@ import mdSamples from '../run/__tests__/markdown-samples.json'
 import evidenceFixture from '../run/__tests__/evidence-doc.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import {
-  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
-  markupRun, mixedRun, pipelineRun, repairRun, teamRun, timeoutRun,
+  CALIBER_ONE_OUTPUT, CALIBERS_OUTPUT, SQL_DEGRADED_OUTPUT, COPILOT_CATALOG_PATCH, COPILOT_CONTEXT, COPILOT_CONTEXT_FALLBACK, COPILOT_STUCK, COPILOT_TOOLS_DROPPED, MIXED_OUTPUT, abandonedRun, cancelledRun, exhaustedTeam, longLoop,
+  markupRun, mergeRun, mixedRun, parallelQueryRun, pipelineRun, repairRun, teamRun, timeoutRun,
 } from '../run/__tests__/synthetic'
 import '../index.css'
 
@@ -301,6 +302,11 @@ function synthetic(name: string): StreamTurn[] {
                 steps: decodeRun(ev, { status: 'succeeded' }), output: MIXED_OUTPUT, runId: 'syn-issued',
                 runClass: 'exploratory', review: REVIEW_DEGRADED_TURN.review }]
     }
+    case 'issued-sql':
+      // 数字都有出处，却因为查询没通过 SQL 检查而降档：横幅单列说明
+      return [{ id: name, question: '上周订单金额', phase: 'done', status: '已完成',
+                steps: decodeRun(parallelQueryRun(), { status: 'succeeded' }), runId: 'syn-issued-sql', runClass: 'formal',
+                output: SQL_DEGRADED_OUTPUT }]
     case 'calibers':
     case 'caliber-one': {
       // 按口径卡清点回指的数字：两张卡各数各的；只有一张卡时直说都来自它
@@ -323,6 +329,8 @@ function synthetic(name: string): StreamTurn[] {
       // 问数据的一轮：先建图、再执行。执行开始后「规划」收成一行
       const plan = decodeCopilot([
         { op: 'heartbeat', phase: 'planning', elapsed_ms: 6400 },
+        { op: 'context', elapsed_ms: 2100, sources: [
+          { source: 'warehouse', tables: ['v_device_kpi', 'dim_device'], selected_by: 'model', total: 53 }] },
         { op: 'thinking', delta: '要先查表结构，再按设备汇总 KPI。' },
         { op: 'plan', summary: '取数 → 汇总 → 出结论' },
         { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询设备 KPI' } },
@@ -337,6 +345,19 @@ function synthetic(name: string): StreamTurn[] {
                 graph: { nodes: [{ id: 'q', type: 'tool', data: { label: '查询设备 KPI' } },
                                  { id: 'o', type: 'output', data: { label: '成果' } }] } }]
     }
+    case 'copilot-context':
+      // 大库按需求挑表：过程里一行「参考了 N 张表」，展开按数据源分组列表名
+      return [{ id: 'copilot-context', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
+                steps: decodeCopilot(COPILOT_CONTEXT, { context: 'canvas' }) }]
+    case 'catalog-patch':
+      // 用户说了一条数据事实：助手只回答、不改图，附一张「建议更新数据目录」卡片
+      return [{ id: 'catalog-patch', question: 'status=9 表示作废，统计时要排除', phase: 'done', status: '已回答（未修改画布）',
+                steps: decodeCopilot(COPILOT_CATALOG_PATCH, { context: 'canvas' }),
+                output: { 回答: '好的，已整理成数据目录的修改建议，确认后保存即可。' },
+                catalogPatches: catalogPatchesOf(COPILOT_CATALOG_PATCH) }]
+    case 'copilot-fallback':
+      return [{ id: 'copilot-fallback', question: '各渠道上月的入园人次', phase: 'done', status: '已应用到画布',
+                steps: decodeCopilot(COPILOT_CONTEXT_FALLBACK, { context: 'canvas' }) }]
     case 'copilot':
       return [{ id: 'copilot', question: '做一个每天的出勤日报', phase: 'done',
                 status: '已应用到画布，仍有 2 处问题待处理',
@@ -348,6 +369,14 @@ function synthetic(name: string): StreamTurn[] {
                   columns: ['factory_code', 'line_name', 'attribute_group', 'output_qty'],
                   rows: [['1063', '一号线', '001', 1520], ['1064', '二号线', '002', 1310], ['1065', '三号线', '001', 980]],
                   row_count: 3 }) } }]
+    case 'parallel':
+      // 两个并行的查询节点用同一个工具；第一条查询没通过 SQL 检查，口径卡的问题指到它的 SQL
+      return [{ id: 'parallel', question: '订单金额和退款数', phase: 'done', status: '已完成',
+                steps: decodeRun(parallelQueryRun(), { status: 'succeeded' }) }]
+    case 'merge':
+      // 合并查询：两个库各查一次、在库外按门店合并，带两道警告（键类型不一致、行数放大）
+      return [{ id: 'merge', question: '按门店合并销售和到店人数', phase: 'done', status: '已完成',
+                steps: decodeRun(mergeRun(), { status: 'succeeded' }) }]
     case 'schema': {
       const ev = mixedRun().slice(0, 10)
       return [{ id: 'schema', question: '看看有哪些人事表', phase: 'done', status: '已完成',
@@ -513,6 +542,9 @@ function Preview() {
         turns={synthetic(syn)}
         onStepHover={params.get('link') === '1' ? (id) => { (window as any).__hovered = id } : undefined}
         onStepFocus={params.get('link') === '1' ? (id) => { linked.push(id) } : undefined}
+        // 「打开设置」：记下要打开哪个节点、落到哪一栏（指标的问题落到来源查询的 SQL）
+        onStepOpen={params.get('link') === '1'
+          ? (id, field) => { ((window as any).__opened ??= []).push([id, field ?? null]) } : undefined}
         renderTurnActions={(t) => (t.phase === 'error'
           ? <button type="button" className="btn btn-xs"><RotateCw size={11} aria-hidden /> 重试本轮</button>
           : null)}

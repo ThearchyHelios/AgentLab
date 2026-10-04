@@ -285,6 +285,144 @@ def table_cell(table: Any, row: Any, column: Any) -> Any:
     return cell_value(raw)
 
 
+# --------------------------------------------------------------------------
+# 截断的结果：按行号取单格照常，当成整组用时记一笔
+#
+# 查询撞了行数或字节上限时，数据层只交回前面一截，标 truncated: true（data/engine.py 的 run_query）。
+# 这一截的前 N 行就是完整结果的前 N 行，所以 cell(x, 0, 'gmv')、rows[0] 取到的那一格是真实的；
+# 可 len(rows) 只是取回的行数，sum / max / sorted / 成员判断 / 倒数第几行，说的都是这一截而不是
+# 完整结果。口径卡拿这种数出具，等于把「前 1000 行的人次」当成「入园人次」。
+#
+# 不按正则猜表达式（写法千变万化，get(x, 'rows')、x['rows']、x.rows 都是同一件事），而是在求值时跟踪：
+# 从截断结果里取 rows 的那一刻包一层 TruncatedRows，它照常当列表用，只在被整组用到时往 TruncatedUse
+# 里记一笔。数据源工具交回的是 JSON 文本，表达式里只有 cell() 读得了它；经数据整形解析成对象之后
+# 才有 .rows 可取，所以这里认的是「带 truncated: true 和 rows 列表的对象」这种形状。
+# --------------------------------------------------------------------------
+
+
+class TruncatedUse:
+    """一次求值里，哪些截断的结果被当成了整组：sources 是 {键: {path, rows, artifact?}}。
+
+    - path：取到这组行的取值链（vars.visits；agent 的数组字段是字段本身 vars.kpi.amounts）
+    - rows：取回了几行——完整结果至少比这多
+    - artifact：查询快照的工件 id，结果里带着的才有
+    同一份结果按工件 id（没有就按 path）只记一次：len(x.rows) + x.row_count 只用了一份结果。
+
+    edge(path) 给调用方认定的截断整组：口径卡用它标出 agent 经 cite_fields 交来、引用的行段到了截断结果
+    末行的数组字段。返回 {rows, artifact?} 或 None。求值器只对取到列表的取值链问它。
+    """
+
+    __slots__ = ("sources", "edge")
+
+    def __init__(self, edge: Any = None) -> None:
+        self.sources: dict[str, dict[str, Any]] = {}
+        self.edge = edge
+
+    def record(self, path: str, rows: int, artifact: Any = None) -> None:
+        key = artifact if isinstance(artifact, str) and artifact else path
+        self.sources.setdefault(key, {"path": path, "rows": rows,
+                                      **({"artifact": artifact} if isinstance(artifact, str) and artifact else {})})
+
+
+class TruncatedRows:
+    """截断结果里的一组行。只活在一次求值里：eval_expression 交出结果前一律换回普通 list。
+
+    整组用到的写法都要经过这里的某个特殊方法：len()、迭代（sum / min / max / sorted / any / all）、
+    in、比较、拼接、转成文本、倒数第几行、取回的行之后的行号。按行号取取回范围之内的一行不记；
+    真假判断也不记——截断的结果至少有一行，「有数据」这件事是真的。
+
+    不继承 list：list 有一批 C 实现按 PyList_Check 直接读底层数组（拼接、比较……），子类得把每个反射方法都
+    补上才不漏记，漏一处就是把截断的数当成完整的出具。独立的类只认这里实现的几样，没实现的写法直接报类型
+    错误，不会悄悄在截断的数据上算出一个数。属性一律带下划线，表达式碰不到（私有属性在静态检查里就拒了）。
+    """
+
+    __slots__ = ("_rows", "_use", "_path", "_count", "_artifact")
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, rows: list[Any], use: TruncatedUse, path: str, count: int, artifact: Any = None) -> None:
+        self._rows, self._use, self._path, self._count, self._artifact = rows, use, path, count, artifact
+
+    def _whole(self) -> list[Any]:
+        self._use.record(self._path, self._count, self._artifact)
+        return self._rows
+
+    def __len__(self) -> int:
+        return len(self._whole())
+
+    def __iter__(self) -> Any:
+        return iter(self._whole())
+
+    def __reversed__(self) -> Any:
+        return reversed(self._whole())
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._whole()
+
+    def __getitem__(self, index: Any) -> Any:
+        # 倒数第几行：完整结果的最后一行不是取回的最后一行；取回范围之外的行号：完整结果里有这一行，
+        # 只是没取回来（照旧抛 IndexError，求值器按取不到处理，原因记在这里）
+        if isinstance(index, int) and not isinstance(index, bool) and not 0 <= index < len(self._rows):
+            self._whole()
+        return self._rows[index]
+
+    def __bool__(self) -> bool:
+        return bool(self._rows)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._whole() == _plain_rows(other)
+
+    def __ne__(self, other: Any) -> bool:
+        return self._whole() != _plain_rows(other)
+
+    def __lt__(self, other: Any) -> bool:
+        return self._whole() < _plain_rows(other)
+
+    def __le__(self, other: Any) -> bool:
+        return self._whole() <= _plain_rows(other)
+
+    def __gt__(self, other: Any) -> bool:
+        return self._whole() > _plain_rows(other)
+
+    def __ge__(self, other: Any) -> bool:
+        return self._whole() >= _plain_rows(other)
+
+    def __add__(self, other: Any) -> Any:
+        return self._whole() + _plain_rows(other)
+
+    def __radd__(self, other: Any) -> Any:
+        return _plain_rows(other) + self._whole()
+
+    def __mul__(self, times: Any) -> Any:
+        return self._whole() * times
+
+    __rmul__ = __mul__
+
+    def __repr__(self) -> str:
+        return repr(self._whole())
+
+
+def _plain_rows(value: Any) -> Any:
+    return value._whole() if isinstance(value, TruncatedRows) else value
+
+
+def _truncated_table(value: Any) -> bool:
+    """查询结果的形状、而且被截断了：数据源工具交回的 JSON 经数据整形解析成对象之后就是这样。"""
+    return isinstance(value, dict) and value.get("truncated") is True and isinstance(value.get("rows"), list)
+
+
+def _settle(value: Any) -> Any:
+    """交出结果前把 TruncatedRows 换回普通 list（整组交出去也是整组用到）。没有包装的原样返回、不复制。"""
+    if isinstance(value, TruncatedRows):
+        return list(value._whole())
+    if type(value) is list:
+        items = [_settle(v) for v in value]
+        return items if any(a is not b for a, b in zip(items, value)) else value
+    if type(value) is dict:
+        pairs = {k: _settle(v) for k, v in value.items()}
+        return pairs if any(pairs[k] is not v for k, v in value.items()) else value
+    return value
+
+
 _SAFE_FUNCS: dict[str, Any] = {
     "len": len,
     "str": str,
@@ -551,16 +689,38 @@ def substitute(tree: ast.AST, values: dict[str, Any]) -> str:
     return ast.unparse(ast.fix_missing_locations(replaced))
 
 
-def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
+def eval_expression(expr: str, ctx: dict[str, Any], *, track: TruncatedUse | None = None) -> Any:
     """求值一个受限的 Python 表达式。
 
     只放行字面量、比较、布尔/算术运算、下标、属性访问和一小撮白名单函数。
     没有 import、没有属性魔法、没有函数定义，所以用户在画布上写条件是安全的。
+
+    track：跟踪截断的结果有没有被当成整组用，记进 track.sources（口径卡用，见 TruncatedUse）。
+    不给就不跟踪：分支条件、数据整形、复算的行为和以前完全一样。
     """
     expr = (expr or "").strip()
     if not expr:
         return None
     tree, _, _ = parse_expression(expr)
+
+    def _tracked(base_src: Any, full_src: Any, base: Any, key: Any, value: Any) -> Any:
+        """取到的值要不要包一层：截断结果的 rows 包成 TruncatedRows，row_count 直接记一笔
+        （它就是取回的行数，读它就是在用整组）；调用方经 edge 认定的截断整组也包起来。
+        base_src / full_src 是取值链的源码（截断结果本身 / 取到的这个值），要用时才拼。"""
+        if track is None or isinstance(value, TruncatedRows):
+            return value
+        if isinstance(key, str) and key in ("rows", "row_count") and _truncated_table(base):
+            rows, artifact = base["rows"], base.get("artifact")
+            if key == "row_count":
+                track.record(base_src(), len(rows), artifact)
+                return value
+            return TruncatedRows(rows, track, base_src(), len(rows), artifact)
+        if isinstance(value, list) and track.edge is not None:
+            path = full_src()
+            info = track.edge(path)
+            if info:
+                return TruncatedRows(value, track, path, int(info.get("rows") or len(value)), info.get("artifact"))
+        return value
 
     def _eval(node: ast.AST) -> Any:
         if isinstance(node, ast.Expression):
@@ -582,7 +742,8 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
         if isinstance(node, ast.Attribute):
             base = _eval(node.value)
             if isinstance(base, dict):
-                return base.get(node.attr)
+                return _tracked(lambda: ast.unparse(node.value), lambda: ast.unparse(node), base, node.attr,
+                                base.get(node.attr))
             if node.attr.startswith("_"):
                 raise ExpressionError("不允许访问私有属性")
             return getattr(base, node.attr, None)
@@ -590,9 +751,10 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
             base = _eval(node.value)
             key = _eval(node.slice)
             try:
-                return base[key]
+                value = base[key]
             except (KeyError, IndexError, TypeError):
                 return None
+            return _tracked(lambda: ast.unparse(node.value), lambda: ast.unparse(node), base, key, value)
         if isinstance(node, ast.BinOp):
             op = _BIN_OPS.get(type(node.op))
             if not op:
@@ -635,7 +797,13 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
                 raise ExpressionError("只能调用允许的函数")
             args = [_eval(a) for a in node.args]
             kwargs = {kw.arg: _eval(kw.value) for kw in node.keywords if kw.arg}
-            return _SAFE_FUNCS[node.func.id](*args, **kwargs)
+            result = _SAFE_FUNCS[node.func.id](*args, **kwargs)
+            if node.func.id == "get" and len(args) >= 2 and isinstance(args[1], str):
+                # get(x, 'rows') 和 x.rows 是同一件事，按 x['rows'] 的写法交给 edge
+                source = node.args[0]
+                result = _tracked(lambda: ast.unparse(source), lambda: f"{ast.unparse(source)}[{args[1]!r}]",
+                                  args[0], args[1], result)
+            return result
         if isinstance(node, (ast.List, ast.Tuple)):
             return [_eval(e) for e in node.elts]
         if isinstance(node, ast.Dict):
@@ -646,7 +814,8 @@ def eval_expression(expr: str, ctx: dict[str, Any]) -> Any:
             }
         raise ExpressionError(_unsupported(type(node).__name__))
 
-    return _eval(tree)
+    result = _eval(tree)
+    return _settle(result) if track is not None else result
 
 
 def eval_condition(expr: str, ctx: dict[str, Any]) -> bool:

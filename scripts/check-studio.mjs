@@ -114,6 +114,23 @@ const EV_GRAPH = {
   edges: [edge('start', 'fetch'), edge('start', 'manual'), edge('fetch', 'write'), edge('manual', 'write'), edge('write', 'done')],
 }
 
+// 合并查询：门店库、会员库各查一次，按日期 + 门店合并。上游另有一个模型调用节点，检查器的输入下拉里不该有它
+const MERGE_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 200, '输入', { fields: [{ name: 'day', required: true }] }),
+    node('q_sales', 'tool', 300, 80, '门店销售', { tool: 'db_query__shop', args: { sql: 'SELECT order_date AS 日期, store_id AS 门店, COUNT(*) AS 订单数 FROM orders GROUP BY 1, 2' } }),
+    node('q_visits', 'tool', 300, 240, '到店人数', { tool: 'db_query__members', args: { sql: 'SELECT visit_date AS 日期, store_code AS 门店, COUNT(*) AS 到店人数 FROM visits GROUP BY 1, 2' } }),
+    node('think', 'llm', 300, 400, '先想一想', { prompt: '{{ input.day }}' }),
+    node('merge', 'merge', 640, 200, '按门店合并', {
+      inputs: { s: 'q_sales', v: 'q_visits' },
+      sql: 'SELECT s.日期, s.门店, s.订单数, v.到店人数 FROM s JOIN v ON s.日期 = v.日期 AND s.门店 = v.门店',
+    }),
+    node('done', 'output', 980, 200, '成果', { fields: [{ name: 'answer', value: '{{ nodes.merge.rows }}' }] }),
+  ],
+  edges: [edge('start', 'q_sales'), edge('start', 'q_visits'), edge('start', 'think'), edge('q_sales', 'merge'),
+    edge('q_visits', 'merge'), edge('think', 'merge'), edge('merge', 'done')],
+}
+
 const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
@@ -128,6 +145,7 @@ const FAKES = {
   'st-team': wf('st-team', { name: '__studio_check_team__', graph: TEAM_BOUND, version: 2, published_version: 2, status: 'published' }),
   'st-lint': wf('st-lint', { name: '__studio_check_lint__', graph: TEAM_GRAPH, version: 1 }),
   'st-ev': wf('st-ev', { name: '__studio_check_ev__', graph: EV_GRAPH, version: 2 }),
+  'st-merge': wf('st-merge', { name: '__studio_check_merge__', graph: MERGE_GRAPH, version: 1 }),
 }
 const VERSIONS = [
   { id: 'v3', version: 3, note: '', created_at: '2026-09-26T02:00:00Z' },
@@ -245,8 +263,17 @@ async function open({ width = 1440, height = 900, path = '/studio/st-main', pref
     if (sub === 'versions' && !v) return json(route, VERSIONS)
     if (sub === 'versions' && v) {
       const n = Number(v)
+      // 已发布的 v2 记着发布时的目录版本：入园记录之后改过（第 3 版 → 第 5 版），景区表没变；
+      // Agent 绑定了 shop 的查询工具，可能查询的表里订单改过、闸机是发布之后才建的目录，另一个源发布时还没有目录
       return json(route, { ...VERSIONS.find((x) => x.version === n), workflow_id: id,
-        graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2 })
+        graph: n === 1 ? V1 : GRAPH, graph_hash: 'x', input_fields: [{ name: 'goal' }], published: n === 2,
+        catalog_versions: n === 2
+          ? { direct: { shop: { parks: 1, visits: 3 } }, possible: { shop: { orders: 2, channels: 1 }, crm: {} } } : null,
+        catalog_changes: n === 2 ? [
+          { source: 'shop', source_id: 'src-shop', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+          { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+          { source: 'shop', source_id: 'src-shop', table: 'gates', label: null, published: 0, current: 1, impact: 'possible' },
+        ] : [] })
     }
     if (method === 'GET' && !sub) return state.deleted.has(id) ? json(route, { detail: '工作流不存在，可能已被删除' }, 404) : json(route, FAKES[id])
     if (method === 'DELETE' && !sub) {
@@ -340,6 +367,13 @@ const waitAnalysis = (page) => page.waitForFunction(() => {
 /** 点画布空白处：让焦点离开输入框（快捷键不抢输入框里的键） */
 const blur = (page) => page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } })
 const count = (page, sel) => page.locator(sel).count()
+/** 轮询到条件成立或超时，返回最后一次的结果 */
+const until = async (fn, ms = 3000, step = 100) => {
+  const end = Date.now() + ms
+  let v = await fn()
+  while (!v && Date.now() < end) { await new Promise((r) => setTimeout(r, step)); v = await fn() }
+  return v
+}
 
 /**
  * 页面里的 navigate(to, opts)：从 React 树里找到 RouterProvider 手里的那个 data router，
@@ -976,14 +1010,55 @@ await section('分析失败不静默', async () => {
 
 // ================================================================ 5
 await section('版本历史：预览、恢复成一次可撤销的改动', async () => {
-  const { ctx, page, state } = await open()
+  const { ctx, page, state, errors } = await open()
+  // 发布时的目录版本按横幅的写法列：「数据源」中文名（表名）。中文名从数据源的目录清单补（只读，这里答掉）
+  const catRow = (table, label) => ({ table_name: table, qualified: table, is_view: false, in_schema: true, label, label_status: label ? 'confirmed' : null,
+    kind: null, counts: { proposed: 0, verified: 0, confirmed: label ? 1 : 0, rejected: 0 }, relations: 0, usage: 0, version: 1, updated_at: null, updated_by: null })
+  await page.route(/\/api\/datasources\/src-shop\/catalog$/, (route) => route.fulfill({ json: { system_notes: false, schema_note: null,
+    schema_truncated: false, schema_total: 5, tables: [catRow('parks', '景区'), catRow('visits', '入园记录'), catRow('orders', '订单'),
+      catRow('channels', '渠道'), catRow('gates', null)] } }))
+  // 记下按版本号取详情的请求：版本历史开着时换工作流，不能拿上一张选中的版本去请求这一张
+  const asked = []
+  page.on('request', (r) => {
+    const m = new URL(r.url()).pathname.match(/^\/api\/workflows\/([^/]+)\/versions\/(\d+)$/)
+    if (m) asked.push(`${m[1]}@${m[2]}`)
+  })
   await blur(page)
   await page.keyboard.press('Alt+KeyH')
   await page.waitForTimeout(500)
   const rows = await count(page, 'ol[aria-label="版本"] > li')
   check('列出全部版本', rows === 3, `${rows} 版`)
   check('标出已发布的那一版', (await page.locator('ol[aria-label="版本"] > li').nth(1).innerText()).includes('已发布'))
+  // 已发布的那一版：看得到发布时的目录版本，之后改过的表标出来
+  await page.locator('ol[aria-label="版本"] > li').nth(1).locator('button').first().click()
+  const cat = page.locator('[data-version-catalog]')
+  await cat.waitFor({ timeout: 3000 }).catch(() => {})
+  const catText = await cat.innerText().catch(() => '')
+  check('已发布的版本写「发布时的目录版本」', catText.includes('发布时的目录版本') && catText.includes('parks') && catText.includes('第 1 版'), catText)
+  check('之后改过的表标出来', (await page.locator('[data-version-catalog-table="visits"]').getAttribute('data-changed')) === 'true'
+    && catText.includes('之后有变化，现为第 5 版') && catText.includes('3 张表在发布之后有变化'), catText.replace(/\s+/g, ' '))
+  check('没改过的表不标', (await page.locator('[data-version-catalog-table="parks"]').getAttribute('data-changed')) === null)
+  // Agent 可能查询的表：另起一组，和 SQL 里写着的表分开
+  const possible = cat.locator('[data-version-catalog-possible]')
+  const possibleText = await possible.innerText().catch(() => '')
+  check('Agent 可能查询的表另起一组', await possible.count() === 1 && possibleText.includes('Agent 可能查询的表')
+    && await possible.locator('[data-version-catalog-table="visits"]').count() === 0, possibleText.replace(/\s+/g, ' '))
+  check('……改过的标出来，没改过的不标', (await possible.locator('[data-version-catalog-table="orders"]').getAttribute('data-changed')) === 'true'
+    && (await possible.locator('[data-version-catalog-table="channels"]').getAttribute('data-changed')) === null
+    && possibleText.includes('之后有变化，现为第 4 版'), possibleText.replace(/\s+/g, ' '))
+  check('……发布之后才建目录的表也列出来，发布时写「尚无目录」',
+    (await possible.locator('[data-version-catalog-table="gates"]').getAttribute('data-changed')) === 'true'
+    && (await possible.locator('[data-version-catalog-table="gates"]').innerText()).includes('尚无目录'))
+  check('……发布时一张有目录的表都没有的源写一句', possibleText.includes('「crm」发布时还没有目录'), possibleText.replace(/\s+/g, ' '))
+  // 和运行横幅同一个写法：「数据源」中文名（表名）；没改过的表也写中文名，没有中文名的只写表名
+  const nameOf = (table) => cat.locator(`[data-version-catalog-table="${table}"] [data-version-catalog-name]`).first().innerText().catch(() => '')
+  check('……每张表写「数据源」中文名（表名），没改过的也写', await until(async () => (await nameOf('parks')) === '「shop」景区（parks）')
+    && (await nameOf('visits')) === '「shop」入园记录（visits）' && (await nameOf('channels')) === '「shop」渠道（channels）',
+    [await nameOf('parks'), await nameOf('visits'), await nameOf('channels')].join(' | '))
+  check('……没有中文名的表只写表名', (await nameOf('gates')) === '「shop」gates', await nameOf('gates'))
   await page.locator('ol[aria-label="版本"] > li').nth(2).locator('button').first().click()
+  await page.waitForTimeout(300)
+  check('没发布过的版本没有目录版本这一栏', await count(page, '[data-version-catalog]') === 0)
   await page.waitForTimeout(500)
   check('选一版给出缩略图预览', await count(page, 'svg[aria-label^="缩略图"]') === 1)
   check('预览列出恢复后将移除的节点', (await page.locator('[role="dialog"][aria-label="版本历史"]').innerText()).includes('将移除'))
@@ -1003,6 +1078,26 @@ await section('版本历史：预览、恢复成一次可撤销的改动', async
   await page.keyboard.press(`${MOD}+s`)
   await page.waitForTimeout(400)
   check('保存带上版本说明', state.patches[0]?.note === '恢复到 v1', JSON.stringify(state.patches[0] ?? {}).slice(0, 60))
+
+  // 版本历史开着、选着 v2 时换到另一张工作流：不能拿 v2 去请求那一张（那一张未必有 v2，会 404、控制台报错）
+  await page.waitForFunction(() => !window.__studio.getState().dirty, null, { timeout: 3000 }).catch(() => {})
+  await blur(page)
+  await page.keyboard.press('Alt+KeyH')
+  await page.waitForTimeout(400)
+  await page.locator('ol[aria-label="版本"] > li').nth(1).locator('button').first().click()
+  await until(async () => asked.includes('st-main@2'), 3000)
+  await page.locator('button[title^="切换、新建"]').click()
+  await page.waitForTimeout(250)
+  await page.locator('li[role="option"]', { has: page.locator('span.truncate', { hasText: /^__studio_check_team__$/ }) }).click()
+  await page.waitForFunction(() => window.__studio.getState().workflow?.id === 'st-team', null, { timeout: 5000 }).catch(() => {})
+  await page.waitForTimeout(600)
+  const sheetOpen = await count(page, '[role="dialog"][aria-label="版本历史"]')
+  check('版本历史开着时换工作流：不拿上一张选中的版本去请求这一张', sheetOpen === 1 && !asked.some((a) => a.startsWith('st-team@')),
+    `${sheetOpen ? '版本历史开着' : '版本历史关了'}；${asked.join(',')}`)
+  check('……换过去之后没有展开的版本，选一版照常能看', await count(page, 'ol[aria-label="版本"] button[aria-expanded="true"]') === 0)
+  await page.locator('ol[aria-label="版本"] > li').nth(0).locator('button').first().click()
+  check('……再选一版：按这一张的 id 取', await until(async () => asked.includes('st-team@3'), 3000), asked.join(','))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await ctx.close()
 })
 
@@ -1025,6 +1120,9 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   }
   state.stream = [
     { op: 'model', model: 'fake-model' },
+    // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
+    { op: 'context', elapsed_ms: 1500, sources: [
+      { source: 'shop', tables: ['orders', 'order_items', 'customers'], selected_by: 'model', total: 48 }] },
     { op: 'plan', summary: '加一步润色' },
     { op: 'update_node', id: 'answer', config: finalGraph.nodes[3].data.config },
     { op: 'add_node', node: { id: 'polish', type: 'llm', label: '润色', config: { prompt: '{{ nodes.answer.text }}' } } },
@@ -1041,6 +1139,12 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   const t1 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
   check('开始了就告诉输入框（runCopilot 返回 true）', began === true, String(began))
   check('收到 final：这一轮是「已应用」', t1.outcome === 'applied', t1.outcome)
+  const ctxRow = page.locator('[data-step-code="copilot_context"]').last()
+  check('助手栏的过程里一行说参考了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await ctxRow.innerText()).includes('参考了 3 张表'))
+  await ctxRow.locator('button').first().click()
+  check('点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 3 张：orders、order_items、customers')
+    .waitFor({ timeout: 3000 }).then(() => true, () => false))
   check('diff 记下新增和改动', t1.diff?.added.includes('polish') && t1.diff?.changed.includes('answer'), JSON.stringify(t1.diff))
   check('final.issues 进了这一轮（少了一步）', t1.issues?.some((i) => i.code === 'unknown_node_type'))
   const pos1 = await S(page, () => Object.fromEntries(window.__studio.getState().nodes.map((n) => [n.id, n.position])))
@@ -1084,6 +1188,45 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   const t2 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
   check('reply：这一轮记下回答', t2.reply?.includes('input.goal') && t2.outcome === 'answered', t2.outcome)
   check('reply：画布没动、不占撤销栈', (await st(page)).nodes.length === b2.nodes.length && (await st(page)).past === b2.past)
+
+  // 2b) 用户说了一条数据事实：助手只回答，附一条目录修改提案。卡片在助手栏这一轮里，点保存才写（这里在浏览器层答掉）
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
+      { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
+        value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
+      // 新增的关联关系没写基数、又推算不出来：服务端（PatchChange.as_dict）带一句说明
+      { path: 'relations.rmember-id-members-id', before: null, before_status: null,
+        after: { columns: ['member_id'], to_table: 'members', to_columns: ['id'], cardinality: null },
+        value: { columns: ['member_id'], to_table: 'members', to_columns: ['id'] }, reason: '用户说明 member_id 对应会员', state: 'change',
+        note: '没有写明基数，表结构里也查不到两端的主键和唯一约束，基数暂时空着；一对多关联后重复计算的检查用不上这条关系' }] },
+    { op: 'reply', text: '已整理成数据目录的修改建议。' },
+  ]
+  const patchSent = []
+  await page.route(/\/api\/datasources\/src-shop\/catalog\/orders\/patch$/, (route) => {
+    patchSent.push(route.request().postDataJSON())
+    return route.fulfill({ json: { table_name: 'orders', in_schema: true, notes: {}, version: 3, updated_at: null, updated_by: null,
+      structure: null, system_notes: false, usage: 0 } })
+  })
+  await page.route(/\/api\/datasources\/src-shop\/catalog\/orders\/impact$/, (route) =>
+    route.fulfill({ json: { table: 'orders', templates: [] } }))
+  const b2b = await st(page)
+  await S(page, () => window.__studio.getState().runCopilot('status=9 表示作废', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const t2b = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('目录修改提案：这一轮照样记下回答', t2b.outcome === 'answered' && t2b.ops.some((o) => o.op === 'catalog_patch'), t2b.outcome)
+  check('目录修改提案：画布没动', (await st(page)).nodes.length === b2b.nodes.length && (await st(page)).past === b2b.past)
+  const patchCard = page.locator('[data-catalog-patch="orders"]').last()
+  check('助手栏里有「建议更新数据目录」卡片', await patchCard.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await patchCard.innerText()).includes('列 status 的码值'))
+  const noteRow = patchCard.locator('[data-patch-change="relations.rmember-id-members-id"]')
+  check('……服务端对一项的说明（新增关系推算不出基数）写在那一项下面', (await noteRow.locator('[data-patch-note]').innerText().catch(() => ''))
+    .includes('没有写明基数') && await patchCard.locator('[data-patch-note]').count() === 1, await noteRow.innerText().catch(() => ''))
+  await patchCard.locator('[data-patch-save]').click()
+  await patchCard.locator('[data-patch-done]').waitFor({ timeout: 3000 })
+  check('保存带版本和原样取值', patchSent[0]?.if_version === 2 && JSON.stringify(patchSent[0]?.changes?.[0]?.value) === '{"9":"作废"}',
+    JSON.stringify(patchSent[0]))
+  check('保存后给到数据目录的入口', (await patchCard.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-shop/orders')
 
   // 3) 从头生成，搭到一半失败：画布退回原样，半成品能 ⇧⌘Z 找回
   state.stream = [
@@ -2351,6 +2494,117 @@ await section('证据路径：点开报告片段时画布高亮、节点名能�
     `${raceHits} 次请求，${await stamp(race.page).innerText().catch(() => '没有章')}`)
   check('没有运行时报错（请求先后颠倒）', race.errors.length === 0, race.errors.slice(0, 2).join(' | '))
   await race.ctx.close()
+})
+
+// ================================================================ 合并查询
+await section('合并查询：节点库认得、卡片摘要、检查器从上游查询节点里选输入、别名重名先不写回、定位落到那一行', async () => {
+  const { ctx, page, errors } = await open({ path: '/studio/st-merge' })
+  const entry = page.locator('[aria-label="节点库"] button[data-node-type="merge"]')
+  check('节点库「执行」一类里有「合并查询」', await entry.count() === 1 && (await entry.innerText()).includes('合并查询'))
+  const card = page.locator('.react-flow__node[data-id="merge"]')
+  check('卡片摘要写合并的是哪几张表（别名）', (await card.innerText().catch(() => '')).includes('合并 s、v'),
+    (await card.innerText().catch(() => '')).replace(/\s+/g, ' ').slice(0, 80))
+  await S(page, () => window.__studio.getState().select('merge'))
+  await page.waitForSelector('[data-inspector-sheet] [data-field="inputs"]', { timeout: 4000 }).catch(() => {})
+  // STUDIO_SHOTS=<目录>：亮暗两套各截一张合并查询的检查器，供人眼复核
+  if (process.env.STUDIO_SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${process.env.STUDIO_SHOTS}/studio-merge-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const box = page.locator('[data-inspector-sheet] [data-field="inputs"]')
+  const aliases = await box.locator('input.mono').evaluateAll((els) => els.map((e) => e.value))
+  check('每个输入一行：别名 s、v，各配一个查询节点', aliases.join(',') === 's,v', aliases.join(','))
+  const options = await box.locator('select').first().locator('option:not([disabled])').evaluateAll((els) => els.map((e) => e.value))
+  check('下拉只列上游的查询节点（调用数据库查询工具的节点），不列模型调用', options.join(',') === 'q_sales,q_visits'
+    || options.join(',') === 'q_visits,q_sales', options.join(','))
+  check('选中的节点下面写着它调用的工具', (await box.innerText()).includes('db_query__shop'))
+  check('合并 SQL 用代码编辑框', await page.locator('[data-inspector-sheet] [data-field="sql"] textarea, [data-inspector-sheet] [data-field="sql"] [contenteditable]').count() >= 1)
+  const config = () => S(page, () => JSON.stringify(window.__studio.getState().nodes.find((n) => n.id === 'merge')?.data.config.inputs))
+
+  await box.locator('input.mono').nth(1).fill('S')
+  await page.waitForTimeout(150)
+  check('别名改成和另一行只差大小写：行内说明重复，先不写回（两行都还在）',
+    (await box.innerText()).includes('重复') && await config() === JSON.stringify({ s: 'q_sales', v: 'q_visits' }), await config())
+  await box.locator('input.mono').nth(1).fill('visits')
+  await page.waitForTimeout(150)
+  check('改成不重名的别名：写回，顺序不变', await config() === JSON.stringify({ s: 'q_sales', visits: 'q_visits' }), await config())
+  await box.locator('input.mono').nth(1).fill('9v')
+  await page.waitForTimeout(150)
+  check('不合法的别名当场说明写法', (await box.innerText()).includes('只能用英文字母、数字和下划线'))
+  await box.locator('input.mono').nth(1).fill('v')
+  await box.getByRole('button', { name: '添加输入' }).click()
+  await page.waitForTimeout(150)
+  const added = JSON.parse(await config())
+  check('添加输入：取一个上游查询节点，别名按查询的主表起（orders），不用节点 id', Object.keys(added).length === 3
+    && Object.keys(added)[2] === 'orders' && added.orders === 'q_sales', JSON.stringify(added))
+  await box.getByRole('button', { name: '删除输入 orders' }).click()
+  await page.waitForTimeout(150)
+  check('删除输入：那一行和配置里的那一项一起去掉', await config() === JSON.stringify({ s: 'q_sales', v: 'q_visits' }), await config())
+
+  // 连好上游就自动带出输入：查询节点连到合并查询时加一行，别名按主表起、重名加序号；不是查询节点的不加；和连线同一步撤销
+  const mid = await S(page, () => {
+    window.__studio.getState().addNode('merge', { x: 640, y: 620 })
+    return window.__studio.getState().selectedId
+  })
+  const connect = (source, target) => S(page, ([a, b]) => window.__studio.getState().onConnect({ source: a, target: b, sourceHandle: 'out', targetHandle: null }), [source, target])
+  const inputsOf = (id) => S(page, (x) => JSON.stringify(window.__studio.getState().nodes.find((n) => n.id === x)?.data.config.inputs ?? {}), id)
+  await connect('q_sales', mid)
+  await connect('q_visits', mid)
+  await connect('think', mid)
+  check('连线即带出输入：两个查询节点各一行，别名按主表起（orders、visits）；模型调用不加', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', visits: 'q_visits' }),
+    await inputsOf(mid))
+  await S(page, () => window.__studio.getState().undo())
+  await S(page, () => window.__studio.getState().undo())
+  check('……撤销连线时这一行一起退回', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales' })
+    && !(await S(page, (x) => window.__studio.getState().edges.some((e) => e.source === 'q_visits' && e.target === x), mid)), await inputsOf(mid))
+  const t1 = await S(page, () => {
+    const st = window.__studio.getState()
+    st.addNode('tool', { x: 300, y: 620 })
+    const id = window.__studio.getState().selectedId
+    window.__studio.getState().updateNode(id, { config: { tool: 'db_query__shop', args: { sql: 'SELECT COUNT(*) AS n FROM shop.orders WHERE status = 1' } } })
+    return id
+  })
+  await connect(t1, mid)
+  check('……主表重名时加序号（orders_2）', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1 }), await inputsOf(mid))
+  // 连线时还没选工具：不加；选上工具后检查器给「带出连着的 1 个查询节点」，一次补齐
+  const t2 = await S(page, () => {
+    window.__studio.getState().addNode('tool', { x: 300, y: 780 })
+    return window.__studio.getState().selectedId
+  })
+  await connect(t2, mid)
+  check('……连线时还没选数据库查询工具：先不加', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1 }))
+  await S(page, (id) => window.__studio.getState().updateNode(id, { config: { tool: 'db_query__members', args: { sql: '-- 会员卡\nSELECT COUNT(*) AS n FROM "member_cards"' } } }), t2)
+  await S(page, (id) => window.__studio.getState().select(id), mid)
+  const bring = page.locator('[data-inspector-sheet] [data-merge-add-connected]')
+  await bring.waitFor({ timeout: 3000 }).catch(() => {})
+  check('……选上工具后，检查器给「带出连着的 1 个查询节点」', (await bring.innerText().catch(() => '')).includes('带出连着的 1 个查询节点'))
+  await bring.click()
+  await page.waitForTimeout(150)
+  check('……一次补齐，别名按主表起（去掉注释和引号）', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', orders_2: t1, member_cards: t2 })
+    && await bring.count() === 0, await inputsOf(mid))
+  const midBox = page.locator('[data-inspector-sheet] [data-field="inputs"]')
+  await midBox.locator('input.mono').nth(1).fill('sales_valid')
+  await page.waitForTimeout(150)
+  check('……自动起的别名照样可以改', await inputsOf(mid) === JSON.stringify({ orders: 'q_sales', sales_valid: t1, member_cards: t2 }), await inputsOf(mid))
+  await S(page, () => window.__studio.getState().select('merge'))
+  await page.waitForSelector('[data-inspector-sheet] [data-field="inputs"]', { timeout: 4000 }).catch(() => {})
+
+  await S(page, () => window.__studio.getState().select(null))
+  await page.waitForTimeout(200)
+  const r = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/canvas/InspectorSheet.tsx')
+    m.revealField('merge', 'inputs.v', { focus: true })
+    await new Promise((res) => setTimeout(res, 600))
+    const a = document.activeElement
+    return { inRow: !!a?.closest('[data-field="inputs"] [data-sub="v"]'), value: (a && 'value' in a) ? a.value : null }
+  }).catch((e) => ({ error: e.message.split('\n')[0] }))
+  check('问题落在 inputs.<别名> 上：定位到那一行，光标落进别名', r.inRow && r.value === 'v', JSON.stringify(r))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  await ctx.close()
 })
 
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)

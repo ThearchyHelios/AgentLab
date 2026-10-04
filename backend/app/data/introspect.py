@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -118,8 +119,58 @@ def _target_schema(source: Any, explicit: str | None) -> str | None:
     return str(configured) if configured else None
 
 
+def _foreign_keys(raw: list[dict[str, Any]], target_schema: str | None,
+                  default_schema: str | None) -> list[dict[str, Any]]:
+    """反射出来的外键 → [{columns, to_table, to_columns}]。
+
+    to_table 和 schema_cache["tables"] 的键同一个口径：指向同一个 schema 的只写表名；跨 schema 的写
+    「schema.表名」（那张表不在这次探查的结果里，关系照记，图里是一个悬空的端点）。to_columns 可能为空
+    （SQLite 的 REFERENCES t 省略了列），由数据目录按被指向表的主键补。
+    """
+    home = {s for s in (target_schema, default_schema) if s}
+    out: list[dict[str, Any]] = []
+    for fk in raw:
+        cols = [c for c in fk.get("constrained_columns") or [] if c]
+        to_table = fk.get("referred_table")
+        if not cols or not to_table:
+            continue
+        ref_schema = fk.get("referred_schema")
+        out.append({
+            "columns": cols,
+            "to_table": to_table if not ref_schema or ref_schema in home else f"{ref_schema}.{to_table}",
+            "to_columns": [c for c in fk.get("referred_columns") or [] if c],
+        })
+    return out
+
+
+def _unique_groups(constraints: list[dict[str, Any]], indexes: list[dict[str, Any]],
+                   pk: list[str]) -> list[list[str]]:
+    """唯一约束和唯一索引的列组，去重，不含和主键相同的那组。
+
+    同一组唯一列在各家可能出现两次：MySQL 的 UNIQUE 约束本身就是唯一索引，PostgreSQL 的唯一约束背后也有
+    一个索引，Oracle 的主键背后还有一个唯一索引。表达式索引（列名里有 None）不算。
+    """
+    seen = {tuple(c.lower() for c in pk)} if pk else set()
+    groups: list[list[str]] = []
+    candidates = [u.get("column_names") for u in constraints]
+    candidates += [ix.get("column_names") for ix in indexes if ix.get("unique")]
+    for cols in candidates:
+        if not cols or any(c is None for c in cols):
+            continue
+        key = tuple(str(c).lower() for c in cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append([str(c) for c in cols])
+    return groups
+
+
 async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any]:
-    """探查整个库的结构，结果直接存进 DataSource.schema_cache。"""
+    """探查整个库的结构，结果直接存进 DataSource.schema_cache。
+
+    每张表：列（名字、类型、可空、注释）、主键、表注释、是不是视图；读得到的话还有外键约束
+    （foreign_keys）和唯一约束 / 唯一索引（unique）——读不到的表不写这两个键，探查照常完成。
+    """
     engine = await engines.get(source)
     target = _target_schema(source, schema)
 
@@ -151,9 +202,14 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         failures: dict[str, str] = {}
 
         def _multi(fn: Any, single: Any, names: list[str], *,
-                   errors: dict[str, str] | None = None) -> dict[Any, Any]:
+                   errors: dict[str, str] | None = None, ok: set[str] | None = None) -> dict[Any, Any]:
+            """批量反射，失败时逐个对象重试。ok 给了的话，记下真正读到了的对象名：批量成功时是全部
+            （没有约束的表批量接口也会给空列表，或者干脆不给），逐个重试时只有没报错的那些。"""
             try:
-                return dict(fn(schema=target_schema, filter_names=names, kind=ObjectKind.ANY))
+                got = dict(fn(schema=target_schema, filter_names=names, kind=ObjectKind.ANY))
+                if ok is not None:
+                    ok.update(names)
+                return got
             except NotImplementedError:
                 return {}          # 表注释这类不是所有方言都支持
             except Exception:  # noqa: BLE001 - 批量取不到，逐个对象再试
@@ -162,6 +218,8 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
             for name in names:
                 try:
                     out[(target_schema, name)] = single(name, schema=target_schema)
+                    if ok is not None:
+                        ok.add(name)
                 except NotImplementedError:
                     break
                 except Exception as e:  # noqa: BLE001 - 只跳过这一个对象
@@ -176,6 +234,20 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
         readable = [n for n in picked if columns_by.get((target_schema, n))]
         pk_by = _multi(inspector.get_multi_pk_constraint, inspector.get_pk_constraint, readable)
         comment_by = _multi(inspector.get_multi_table_comment, inspector.get_table_comment, readable)
+        # 外键和唯一约束给数据目录起草关系用（data/catalog.py）。放在列、主键、注释之后读：PostgreSQL 上一条
+        # 语句报错会让整个事务作废，先读的那几样不能被它连累。读不到的表不写这两个键（ok 集合里没有它），
+        # 下游据此分得清「读过、没有」和「不知道」——升级前探查的缓存里也没有这两个键。
+        fk_ok: set[str] = set()
+        uq_ok: set[str] = set()
+        ix_ok: set[str] = set()
+        fk_by = _multi(inspector.get_multi_foreign_keys, inspector.get_foreign_keys, readable, errors={}, ok=fk_ok)
+        uq_by = _multi(inspector.get_multi_unique_constraints, inspector.get_unique_constraints, readable,
+                       errors={}, ok=uq_ok)
+        ix_by = _multi(inspector.get_multi_indexes, inspector.get_indexes, readable, errors={}, ok=ix_ok)
+        try:
+            default_schema = inspector.default_schema_name
+        except Exception:  # noqa: BLE001 - 只用来判断外键是不是指向别的 schema
+            default_schema = None
 
         tables: dict[str, Any] = {}
         skipped: dict[str, str] = {}
@@ -207,6 +279,11 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
                 "comment": comment,
                 "is_view": name in views,
             }
+            if name in fk_ok:
+                tables[name]["foreign_keys"] = _foreign_keys(fk_by.get(key) or [], target_schema, default_schema)
+            if name in uq_ok:
+                tables[name]["unique"] = _unique_groups(uq_by.get(key) or [],
+                                                        (ix_by.get(key) or []) if name in ix_ok else [], pk)
         payload: dict[str, Any] = {"tables": tables, "truncated": truncated,
                                    "total": len(names) + len(views)}
         if failures and not tables:
@@ -345,8 +422,14 @@ def table_columns(meta: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def describe_table(source: Any, table: str) -> str:
-    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。"""
+def describe_table(source: Any, table: str, *, catalog: Mapping[str, Mapping[str, Any]] | None = None) -> str:
+    """单表的完整字段说明。agent 调 db_schema 工具时返回这个。
+
+    catalog 是这个源的数据目录 {表名: notes}（data/catalog.py），给了且这张表有可给模型看的内容时，在字段
+    清单后面附上目录：中文名、粒度、业务主键、业务日期、有效记录条件、每列的含义 / 单位 / 度量类型 / 码值、
+    关联关系，推断的项标出来。导入表格的源，表和列的说明是系统按核对结果生成的：说明照旧拼在表名和列后面，
+    目录只追加说明没有覆盖的、或人工确认过的项（catalog.render_table_notes）。不给 catalog 时输出和以前一样。
+    """
     cache = source.schema_cache or {}
     tables = cache.get("tables") or {}
     # 模型可能传全名（ANALYTICS.V_TRIP_FACT），也可能只传表名，两种都认
@@ -364,6 +447,15 @@ def describe_table(source: Any, table: str) -> str:
         available = "、".join(
             m.get("qualified", n) for n, m in list(tables.items())[:30]
         )
+        if cache.get("truncated"):
+            # 只探查了一部分表：没探查到不等于没有。以前照样回「中没有 X」，模型据此换了别的表或者编答案
+            total = cache.get("total")
+            of = f"共 {total} 个对象，" if isinstance(total, int) else ""
+            return (
+                f"数据源「{source.name}」{of}只探查了其中 {len(tables)} 个，{table} 不在已探查的范围内，"
+                "无法判断是否存在。请直接查询数据字典（information_schema.tables / columns，SQLite 用 "
+                f"sqlite_master）确认它的结构。已探查的对象包括：{available}"
+            )
         return f"数据源「{source.name}」中没有 {table}。现有的对象：{available}"
 
     head = f"{'视图' if meta.get('is_view') else '表'} {meta.get('qualified', table)}"
@@ -381,6 +473,14 @@ def describe_table(source: Any, table: str) -> str:
             marks.append(col["comment"])
         suffix = f"  {'、'.join(marks)}" if marks else ""
         lines.append(f"  {col['name']}  {col['type']}{suffix}")
+    if catalog:
+        from app.data import catalog as catalog_mod
+
+        key = catalog_mod.resolve_table_name(cache, table)
+        block = catalog_mod.render_table_notes(catalog.get(key) if key else None, meta=meta,
+                                               system_notes=catalog_mod.system_notes_source(source))
+        if block:
+            lines.append(block)
     return "\n".join(lines)
 
 

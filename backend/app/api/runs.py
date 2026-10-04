@@ -17,6 +17,8 @@ from sqlalchemy import select as _select
 from app.api.coded import CodedHTTPException
 from app.core.bus import bus
 from app.core import artifact_store
+from app.core.events import EventType
+from app.data.catalog_impact import catalog_drift
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent, Workflow, WorkflowVersion
 from app.engine.governance import governance_note, unresolved_caliber_upgrades
@@ -141,9 +143,13 @@ async def start_run(
         errors, upgrade_events = await unresolved_caliber_upgrades(session, spec)
         if errors:
             raise HTTPException(409, "；".join(errors))
+        # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
+        # 拦下来等于让一次文字修订卡住正式出具
+        catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
     else:
         graph = payload.graph
         upgrade_events = []
+        catalog_changes = []
         if payload.workflow_id:
             workflow = await session.get(Workflow, payload.workflow_id)
             if not workflow:
@@ -180,6 +186,11 @@ async def start_run(
         # 审批停下再恢复时再去读它，报告节点和出口复核可能各读到不同的值
         await run_manager.note(run.id, "log", **governance_note(
             governed=governed, workflow_name=name, version=version))
+    if catalog_changes:
+        # 落在封存范围内：之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。
+        # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的（界面分开说）
+        await run_manager.note(run.id, EventType.CATALOG_DRIFT, version=version, count=len(catalog_changes),
+                               tables=catalog_changes)
     # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
     for ev in upgrade_events:
         payload_ev = dict(ev)

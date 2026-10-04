@@ -58,11 +58,16 @@ MAX_QUERY_TIMEOUT_S = 600
 #: 完整快照仍能按工件 id 取到，SQL 里给列起个别名也能绕开
 MASK_COLUMNS_OPTION = "mask_columns"
 
+#: 数据源 options 里的数据剖析设置（一个对象：开关、查询次数上限、单条时限……）。取值和校验见
+#: data/catalog_profile.py；放在这里只为让拼连接串时摘掉它
+CATALOG_PROFILE_OPTION = "catalog_profile"
+
 # options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
 # schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
 # query_timeout_s：查询时限，由数据层按语句下发给数据库，见 _server_deadline
 # mask_columns：证据面板遮罩的列，驱动不认识它，拼进连接串会被当成未知参数拒掉
-_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION})
+# catalog_profile：数据剖析设置，同上；它还是个对象，拼进去连 URL 都不成形
+_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION})
 
 _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
@@ -71,7 +76,10 @@ _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 class QueryResult:
     columns: list[str]
     rows: list[list[Any]]
+    #: 取回的行数。截断时只是取回的那一截，不是完整结果的行数
     row_count: int
+    #: 撞了行数或字节上限、而且后面确实还有行：rows 只是完整结果的前 row_count 行。按行号取的单格是真实的，
+    #: 整组拿去计数、求和算出来的数不完整——口径卡据此标 incomplete，出具据此降档。恰好取满、后面没有了的不算
     truncated: bool
     elapsed_ms: int
     sql: str
@@ -275,6 +283,15 @@ def open_checked_sqlite(path: str, *, readonly: bool = True, immutable: bool = F
     extra = "&immutable=1" if immutable else ""
     return sqlite3.connect(f"file:{quote(os.fspath(path))}?mode={mode}{extra}", uri=True,
                            factory=_DqsOffConnection)
+
+
+def open_memory_sqlite() -> sqlite3.Connection:
+    """一个内存 SQLite 连接，DQS 已关（合并查询把几次查询的结果落进来再合并，engine/merge_query.py）。
+
+    合并 SQL 同样是模型写的：双引号里的列名写错一个字，默认连接会把它当成字符串常量，`SUM("销售颔")` 得 0，
+    `ON s."门店" = v."门店 "` 一行都对不上却不报错。所以和连接层共用 _DqsOffConnection，关不掉就不交出连接。
+    """
+    return sqlite3.connect(":memory:", factory=_DqsOffConnection)
 
 
 def _sqlite_extra() -> dict[str, Any]:
@@ -862,6 +879,33 @@ async def _bounded(
         raise
 
 
+class RowCollector:
+    """逐行收结果、边收边判上限（行数 max_rows、字节 max_bytes）。截断的判定只有这一份：查询层（run_query）和
+    合并查询（engine/merge_query._read）都调它，不各写一遍。
+
+    到了上限之后确实还有下一行才记 truncated。以前一到上限就标截断，恰好 1000 行的完整结果也算截断——截断的结果
+    整组拿去算的指标要降档出具、截断的合并结果下游会拒收，误报就是把完整的结果降了档、拒了。字节数按收下的行累加，
+    第一行总是收下：单行就超过字节上限也交回这一行。
+    """
+
+    def __init__(self, limits: QueryLimits) -> None:
+        self.limits = limits
+        self.rows: list[list[Any]] = []
+        self.size = 0
+        self.truncated = False
+        self._full = False
+
+    def take(self, values: list[Any]) -> bool:
+        """收一行（已转成能进 JSON 的值）。已经取满还来一行：记截断、不收，返回 False，调用方就此停止读取。"""
+        if self._full:
+            self.truncated = True
+            return False
+        self.rows.append(values)
+        self.size += len(json.dumps(values, ensure_ascii=False, default=str))
+        self._full = len(self.rows) >= self.limits.max_rows or self.size >= self.limits.max_bytes
+        return True
+
+
 async def run_query(
     source: Any, sql: str, *, limits: QueryLimits | None = None
 ) -> QueryResult:
@@ -886,20 +930,14 @@ async def run_query(
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
         cursor = await conn.stream(text(statement))
         columns = list(cursor.keys())
-        rows: list[list[Any]] = []
+        collected = RowCollector(limits)
         seen = _TypeTally(len(columns))
-        truncated = False
-        size = 0
+        # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
         async for row in cursor:
-            # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
-            seen.add(row)
-            values = [_jsonable(v) for v in row]
-            rows.append(values)
-            size += len(json.dumps(values, ensure_ascii=False, default=str))
-            if len(rows) >= limits.max_rows or size >= limits.max_bytes:
-                truncated = True
+            if not collected.take([_jsonable(v) for v in row]):
                 break
-        return columns, rows, truncated, seen.types(columns)
+            seen.add(row)
+        return columns, collected.rows, collected.truncated, seen.types(columns)
 
     columns, rows, truncated, types = await _bounded(
         engine.connect, kind, limits,
@@ -976,8 +1014,9 @@ async def _run_write(
     async def _write(conn: AsyncConnection) -> tuple[list[str], list[list[Any]]]:
         result = await conn.execute(text(statement))
         if result.returns_rows:          # RETURNING、PG 的数据修改 CTE
+            # 多取一行：取到了才说明确实截断了（和查询的口径一致，恰好取满不算截断）
             return (list(result.keys()),
-                    [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows)])
+                    [[_jsonable(v) for v in row] for row in result.fetchmany(limits.max_rows + 1)])
         return ["affected_rows"], [[result.rowcount]]
 
     # engine.begin()：正常退出提交，出错（包括数据库按时限停下）回滚
@@ -985,11 +1024,13 @@ async def _run_write(
         engine.begin, kind, limits,
         f"写操作超过 {_seconds(limits.timeout_seconds)} 秒被中断，已回滚。", _write,
     )
+    truncated = len(rows) > limits.max_rows
+    rows = rows[:limits.max_rows]
     return QueryResult(
         columns=columns,
         rows=rows,
         row_count=len(rows),
-        truncated=len(rows) >= limits.max_rows,
+        truncated=truncated,
         elapsed_ms=int((time.perf_counter() - started) * 1000),
         sql=statement,
     )

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, History, RotateCcw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -6,11 +6,12 @@ import {
   EDIT_LOCK_TEXT, diffGraphs, toFlow, useEditLock, useStudio, type EditLock, type FlowNode, type GraphDiff,
 } from '../store/studio'
 import { ErrorState, Skeleton, toast } from '../components/ui'
+import { useDatasources } from '../store/catalog'
 import { formatDateTime, formatTime } from '../lib/format'
-import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_DRIFT_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
 import { hintOf } from './shortcuts'
 import type { Edge } from '@xyflow/react'
-import type { GraphSpec, Workflow, WorkflowVersion } from '../types'
+import type { CatalogDriftTable, CatalogVersions as CatalogVersionsRecord, GraphSpec, Workflow, WorkflowVersion } from '../types'
 
 /**
  * 版本历史。盖在右栏上的一层，和属性面板同一种「临时造访」。
@@ -26,8 +27,11 @@ import type { GraphSpec, Workflow, WorkflowVersion } from '../types'
 export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClose: () => void }) {
   const [list, setList] = useState<WorkflowVersion[] | null>(null)
   const [error, setError] = useState<unknown>(null)
-  const [picked, setPicked] = useState<number | null>(null)
-  const [detail, setDetail] = useState<{ v: number; graph: GraphSpec } | { v: number; error: unknown } | null>(null)
+  // 选中的版本记着是哪张工作流的：版本历史开着时换了工作流，上一张选的 v2 不能拿去请求这一张（没有这一版就是 404）
+  const [pickedOf, setPickedOf] = useState<{ wf: string; v: number } | null>(null)
+  const picked = pickedOf?.wf === workflow.id ? pickedOf.v : null
+  const setPicked = (v: number | null) => setPickedOf(v == null ? null : { wf: workflow.id, v })
+  const [detail, setDetail] = useState<{ v: number; graph: GraphSpec; version: WorkflowVersion } | { v: number; error: unknown } | null>(null)
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
   const dirty = useStudio((s) => s.dirty)
@@ -61,7 +65,7 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
     let alive = true
     setDetail(null)
     api.workflows.version(workflow.id, picked)
-      .then((v) => { if (alive) setDetail({ v: picked, graph: v.graph ?? { nodes: [], edges: [] } }) })
+      .then((v) => { if (alive) setDetail({ v: picked, graph: v.graph ?? { nodes: [], edges: [] }, version: v }) })
       .catch((e) => { if (alive) setDetail({ v: picked, error: e }) })
     return () => { alive = false }
   }, [workflow.id, picked])
@@ -137,8 +141,14 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                         {!detail ? <Skeleton rows={3} height={12} />
                           : 'error' in detail ? <ErrorState error={detail.error} compact />
                           : target && diff && (
-                            <VersionPreview version={v.version} target={target} diff={diff}
-                                            lock={lock} onRestore={restore} />
+                            <>
+                              <VersionPreview version={v.version} target={target} diff={diff}
+                                              lock={lock} onRestore={restore} />
+                              {detail.version.catalog_versions && (
+                                <CatalogVersions versions={detail.version.catalog_versions}
+                                                 changes={detail.version.catalog_changes ?? []} />
+                              )}
+                            </>
                           )}
                       </div>
                     )}
@@ -204,6 +214,116 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 }
 
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
+
+/**
+ * 发布时的目录版本：这一版用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式运行时会
+ * 提醒「数据目录有变化」，这里先让人看到是哪几张表。
+ *
+ * 每张表和运行横幅同一个写法：「数据源」中文名（表名）。发布记录里只有数据源名和表名，中文名按数据源的目录清单补
+ * （变了的表服务端带着现在的中文名）；取不到清单时只写表名。
+ *
+ * 两组分开列：SQL 里写着的表在前；Agent 可能查询的表（Agent 绑定了数据源的查询工具，发布时记下数据源中所有有
+ * 目录的表）在小标题下面。可能涉及的数据源里发布之后新建了目录的表，记录里没有它，按变化里给的补进来（发布时
+ * 「尚无目录」）
+ */
+function CatalogVersions({ versions, changes }: { versions: CatalogVersionsRecord; changes: CatalogDriftTable[] }) {
+  const labelOf = useCatalogLabels(versions, changes)
+  // 老后端给的变化没有 impact：按直接引用
+  const impactOf = (c: CatalogDriftTable) => (c.impact === 'possible' ? 'possible' : 'direct')
+  const changed = new Map(changes.map((c) => [`${impactOf(c)}/${c.source}/${c.table}`, c]))
+  const rowsOf = (impact: CatalogDriftTable['impact']) => {
+    const recorded = Object.entries(versions[impact] ?? {}).flatMap(([source, tables]) =>
+      Object.entries(tables).map(([table, v]) => ({ source, table, v: v as number | null })))
+    const known = new Set(recorded.map((r) => `${r.source}/${r.table}`))
+    const added = changes.filter((c) => impactOf(c) === impact && !known.has(`${c.source}/${c.table}`))
+      .map((c) => ({ source: c.source, table: c.table, v: c.published }))
+    return [...recorded, ...added]
+  }
+  const direct = rowsOf('direct')
+  const possible = rowsOf('possible')
+  const bare = Object.entries(versions.possible ?? {})
+    .filter(([source, tables]) => !Object.keys(tables).length && !possible.some((r) => r.source === source))
+    .map(([source]) => source)
+  const list = (impact: CatalogDriftTable['impact'], rows: typeof direct) => (
+    <ul className="mt-1 space-y-0.5 text-2xs">
+      {rows.map(({ source, table, v }) => {
+        const c = changed.get(`${impact}/${source}/${table}`)
+        return (
+          <li key={`${source}/${table}`} className="flex min-w-0 flex-wrap items-baseline gap-x-1.5"
+              data-version-catalog-table={table} data-impact={impact} data-changed={c ? 'true' : undefined}>
+            <span className="min-w-0 break-words" title={`${source} · ${table}`} data-version-catalog-name="">
+              「{source}」{CATALOG_DRIFT_TEXT.table(labelOf(source, table) ?? c?.label ?? null, table)}
+            </span>
+            <span className="shrink-0 text-faint">{CATALOG_DRIFT_TEXT.version(v)}</span>
+            {c && (
+              <span className="shrink-0" style={{ color: 'var(--st-waiting)' }}>
+                {CATALOG_DRIFT_TEXT.changedSince(CATALOG_DRIFT_TEXT.version(c.current))}
+              </span>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+  const empty = !direct.length && !possible.length && !bare.length
+  return (
+    <div className="mt-3 border-t pt-2" data-version-catalog={changes.length}>
+      <div className="text-2xs font-medium text-dim" title={CATALOG_DRIFT_TEXT.sectionHint}>{CATALOG_DRIFT_TEXT.section}</div>
+      {empty ? <div className="mt-1 text-2xs text-faint">{CATALOG_DRIFT_TEXT.empty}</div> : (
+        <>
+          {direct.length > 0 && list('direct', direct)}
+          {(possible.length > 0 || bare.length > 0) && (
+            <div className="mt-1.5" data-version-catalog-possible={possible.length}>
+              <div className="text-2xs text-dim" title={CATALOG_DRIFT_TEXT.possibleHint}>{CATALOG_DRIFT_TEXT.possibleHead}</div>
+              {possible.length > 0 && list('possible', possible)}
+              {bare.map((source) => (
+                <div key={source} className="mt-0.5 text-2xs text-faint">{CATALOG_DRIFT_TEXT.possibleNone(source)}</div>
+              ))}
+            </div>
+          )}
+          <div className="mt-1 text-2xs" style={{ color: changes.length ? 'var(--st-waiting)' : undefined }}>
+            <span className={changes.length ? undefined : 'text-faint'}>
+              {changes.length ? CATALOG_DRIFT_TEXT.changedCount(changes.length) : CATALOG_DRIFT_TEXT.unchanged}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** 数据源 id → 表名 → 中文名。几个版本、几次展开共用，同一个数据源只取一次清单 */
+const labelCache = new Map<string, Promise<Record<string, string | null>>>()
+
+/**
+ * 发布记录里各表现在的中文名：按数据源名找到 id（变化里带着 source_id，否则查数据源列表），取那个数据源的目录清单。
+ * 取不到（数据源删了、没权限、断网）就只写表名，不报错——这一栏是附带的说明
+ */
+function useCatalogLabels(versions: CatalogVersionsRecord, changes: CatalogDriftTable[]): (source: string, table: string) => string | null {
+  const { list: sources } = useDatasources()
+  const [labels, setLabels] = useState<Record<string, Record<string, string | null>>>({})
+  const got = useRef(labels)
+  got.current = labels
+  const names = useMemo(() => [...new Set([...Object.keys(versions.direct ?? {}), ...Object.keys(versions.possible ?? {}),
+    ...changes.map((c) => c.source)])], [versions, changes])
+  useEffect(() => {
+    let alive = true
+    for (const name of names) {
+      const id = changes.find((c) => c.source === name && c.source_id)?.source_id ?? sources.find((x) => x.name === name)?.id
+      if (!id || got.current[name]) continue
+      let pending = labelCache.get(id)
+      if (!pending) {
+        pending = api.dataCatalog.list(id).then((d) => Object.fromEntries(d.tables.map((t) => [t.table_name, t.label])))
+        labelCache.set(id, pending)
+        // 清单会变（有人补了中文名）：只缓存这一阵子，失败的不缓存
+        pending.then(() => setTimeout(() => labelCache.delete(id), 60_000), () => labelCache.delete(id))
+      }
+      pending.then((m) => { if (alive) setLabels((cur) => ({ ...cur, [name]: m })) }, () => {})
+    }
+    return () => { alive = false }
+  }, [names, changes, sources])
+  return (source, table) => labels[source]?.[table] ?? null
+}
 
 /**
  * 缩略图：这一版的节点按真实坐标缩进一个小框，类型色填充；恢复后会被拿掉的

@@ -559,9 +559,13 @@ def annotate(issues: list[Any], fixes: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def check(spec: GraphSpec, *, level: str, versions: dict[str, Any] | None = None,
-          cards: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
-    """发布前检查：和真正发布同一套口径的问题，以及能怎么修。只读。"""
-    issues = publish_issues(spec, level=level)
+          cards: dict[str, list[dict[str, Any]]] | None = None,
+          checkers: dict[str, Any] | None = None) -> dict[str, Any]:
+    """发布前检查：和真正发布同一套口径的问题，以及能怎么修。只读。
+
+    checkers：基于数据目录的 SQL 检查器（data/sqlcheck），和发布接口传的是同一份（governance.lint_for_publish）。
+    """
+    issues = publish_issues(spec, level=level, checkers=checkers)
     fixes = plan_fixes(spec, issues, level=level, versions=versions, cards=cards)
     return {"level": level, "ok": not any(i.level == "error" for i in issues),
             "issues": annotate(issues, fixes), "fixes": [public(f) for f in fixes]}
@@ -702,7 +706,8 @@ def _op(graph: dict[str, Any], node_id: str | None, edits: list[tuple[str | None
 
 def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: dict[str, Any] | None = None, *,
                 level: str, versions: dict[str, Any] | None = None,
-                cards: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+                cards: dict[str, list[dict[str, Any]]] | None = None,
+                checkers: dict[str, Any] | None = None) -> dict[str, Any]:
     """在副本上逐个应用修复，每一个都复核：降低要求、错误没变少或者冒出新错误的，丢弃并写明原因。
 
     返回 {graph, changes, ops, applied, rejected, handoff, remaining, fixes, ok}。graph 只是预览，不落库。
@@ -711,7 +716,7 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
     raw = graph.model_dump(mode="json") if isinstance(graph, GraphSpec) else graph
     current = copy.deepcopy(raw)
     spec = GraphSpec.model_validate(current)
-    issues = publish_issues(spec, level=level)
+    issues = publish_issues(spec, level=level, checkers=checkers)
     plan = plan_fixes(spec, issues, level=level, versions=versions, cards=cards)
     known = {f["id"] for f in plan}
     rank = {code: i for i, code in enumerate(_ORDER)}
@@ -743,7 +748,7 @@ def apply_fixes(graph: dict[str, Any] | GraphSpec, fix_ids: list[str], choices: 
         except Exception:  # noqa: BLE001 - 修复规则把图改坏了：丢弃，不交给人一张存不回去的图
             rejected.append({"fix_id": fid, "reason": "修复后的工作流结构无法解析，已放弃这项修复"})
             continue
-        trial_issues = publish_issues(trial_spec, level=level)
+        trial_issues = publish_issues(trial_spec, level=level, checkers=checkers)
         # choice 里人亲手选的值不算「替人决定」（比如把沙箱代码标成取数）；别的降低要求照样拦
         chosen = {(str(nid), path) for nid, path, _, _ in edits} if fix["kind"] == "choice" else set()
         why = "；".join(forbidden_changes(current, trial, chosen=chosen)) or judge(

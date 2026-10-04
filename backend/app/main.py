@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
-    artifacts, conversations, copilot, datasources, evidence, governance, knowledge, runs,
+    artifacts, catalog, conversations, copilot, datasources, evidence, governance, knowledge, runs,
     sandbox, settings as settings_api, source_versions, table_imports, tools, workflows,
 )
 from app.api.coded import CodedHTTPException, coded_handler
@@ -120,6 +120,7 @@ for router in (
     # 按配方导入的 /api/datasources/imports/… 要在 datasources 的通配 /{source_id} 之前登记
     table_imports.router,
     source_versions.router,
+    catalog.router,
     datasources.router,
 ):
     app.include_router(router)

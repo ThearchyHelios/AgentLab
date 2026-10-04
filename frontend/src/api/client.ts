@@ -1,5 +1,7 @@
 import type {
-  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CommitOut, CurrentRecipe, EditPreview, EditRequest, ImportRecord,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogImpact, CatalogList, CatalogNotes,
+  CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview,
+  EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
@@ -35,6 +37,8 @@ export class ApiError extends Error {
    * detail 是给人看的话，随时可能改写；要按错误种类分支的认这个
    */
   code?: string
+  /** 带机读码的错误里出错的是哪一项（app/api/coded.py 的 field，比如剖析设置的 max_queries）；没有就是 undefined */
+  field?: string
   /**
    * 后端要用户先拍板时随错误一起给的 {kind, details}（比如上传表格的 422：数字列混入非数字、
    * 交叉表）。原样保留，按接口各自校验后再用（上传表格见 uploadDecision）
@@ -44,7 +48,7 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; decision?: unknown },
+    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; field?: string; decision?: unknown },
   ) {
     super(message)
     this.name = 'ApiError'
@@ -53,6 +57,7 @@ export class ApiError extends Error {
     this.raw = opts?.raw
     this.timeoutMs = opts?.timeoutMs
     this.code = opts?.code
+    this.field = opts?.field
     this.decision = opts?.decision
   }
 }
@@ -178,6 +183,12 @@ const codeOf = (body: unknown): string | undefined => {
   return typeof code === 'string' && code ? code : undefined
 }
 
+/** 后端 {detail, code, field} 里出错的那一项；没有就是 undefined */
+const fieldOf = (body: unknown): string | undefined => {
+  const field = body && typeof body === 'object' ? (body as { field?: unknown }).field : undefined
+  return typeof field === 'string' && field ? field : undefined
+}
+
 /** 后端 {detail, decision} 里要用户拍板的内容：是个对象就原样带上，没有就是 undefined */
 const decisionOf = (body: unknown): unknown => {
   const decision = body && typeof body === 'object' ? (body as { decision?: unknown }).decision : undefined
@@ -237,7 +248,7 @@ function failure(status: number, statusText: string, text: string, path?: string
     const detail = body?.detail ?? body
     return new ApiError(status, describeDetail(detail, path), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
-      code: codeOf(body), decision: decisionOf(body),
+      code: codeOf(body), field: fieldOf(body), decision: decisionOf(body),
     })
   }
   const message = status >= 500
@@ -647,6 +658,52 @@ export const api = {
     /** 清除一次导入的原件（同一份内容的其他导入一并清除，引用它的未完成导入一并放弃）。理由必填 */
     purgeRaw: (sourceId: string, importId: string, body: PurgeRawBody) =>
       post<PurgeRawOut>(`/datasources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/purge-raw`, body),
+  },
+
+  /**
+   * 业务数据目录（每个数据源一份，按表存）。写操作都带读到的版本（if_version，这张表还没有目录时为 0）：别人在这期间
+   * 改过时回 409，detail 是给人看的话（「表「x」的数据目录刚被修改过，请重新载入后再提交」）；格式不对回 422；源或表
+   * 不存在回 404。署名走请求头 X-Actor（request 统一带上）
+   */
+  dataCatalog: {
+    /** 表清单：表结构里的每张表各一行，使用次数多的在前；没有表结构时 tables 为空、schema_note 写明原因 */
+    list: (sourceId: string, opts?: RequestOptions) =>
+      get<CatalogList>(`/datasources/${encodeURIComponent(sourceId)}/catalog`, opts),
+    /** 单表目录连同表结构 */
+    get: (sourceId: string, table: string, opts?: RequestOptions) =>
+      get<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}`, opts),
+    /** 整份提交：值改过的项、新填的项记为人工填写、已确认；提交里没有的项删掉 */
+    put: (sourceId: string, table: string, notes: CatalogNotes, ifVersion: number) =>
+      put<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}`,
+        { notes, if_version: ifVersion }),
+    /** 单项审阅。path：表级项写字段名（grain）；列级项 columns.<列名>.<字段>；关系 relations.<编号> */
+    review: (sourceId: string, table: string, body: { path: string; action: CatalogReviewAction; if_version: number }) =>
+      post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/review`, body),
+    /** 影响面：引用这张表的已发布、受管模板（直接引用 / 可能涉及，合并查询按输入追溯） */
+    impact: (sourceId: string, table: string, opts?: RequestOptions) =>
+      get<CatalogImpact>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/impact`, opts),
+    /** 目录修改提案的预览：对着当前目录重算改前、改后，不写库（保存遇到 409 后重新载入用） */
+    patchPreview: (sourceId: string, table: string, changes: CatalogPatchSubmit[]) =>
+      post<CatalogPatchPreview>(
+        `/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/patch/preview`, { changes }),
+    /** 保存目录修改提案：改动过的项记为人工填写、已确认。版本不符 409，有一项不合法 422 */
+    patch: (sourceId: string, table: string, changes: CatalogPatchSubmit[], ifVersion: number) =>
+      post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/patch`,
+        { changes, if_version: ifVersion }),
+    /**
+     * 同步起草（注释、外键、命名推断；use_model 时再请助手的模型起草）。不给 tables 时按使用次数取前 20 张。
+     * 人工确认、驳回过的项不动。没有表结构时回 409
+     */
+    draft: (sourceId: string, body: { tables?: string[]; use_model: boolean }, opts?: RequestOptions) =>
+      request<CatalogDraftOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/draft`,
+        { method: 'POST', body: JSON.stringify(body), ...opts }),
+    /**
+     * 同步剖析：对业务库发少量只读查询，核对关系、取码值候选，结论写进目录。不给 tables 时按使用次数取前 10 张
+     * 有待核实关系的表。没开启、数据源停用、没有表结构、同一个数据源正在剖析、快照被改动时回 409（detail 是一句中文）
+     */
+    profile: (sourceId: string, body: { tables?: string[] }, opts?: RequestOptions) =>
+      request<CatalogProfileOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/profile`,
+        { method: 'POST', body: JSON.stringify(body), ...opts }),
   },
 
   runs: {

@@ -261,6 +261,8 @@ soupsieve==2.9.2
     # via beautifulsoup4
 sqlalchemy==2.0.52
     # via agentlab-backend (pyproject.toml)
+sqlglot==30.21.0
+    # via agentlab-backend (pyproject.toml)
 sqlite-vec==0.1.9
     # via langgraph-checkpoint-sqlite
 sse-starlette==3.4.11

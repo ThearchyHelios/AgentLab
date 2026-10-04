@@ -398,6 +398,10 @@ export type SourceTone = 'ok' | 'warn' | 'alert' | 'muted'
 export function inputSource(input: EvidenceInput): { tone: SourceTone; text: string; reason?: string } {
   const status = input.status ?? ''
   if (input.via === 'agent_field') {
+    // 被截断切开的数组字段：取回的每一格都对得上，但字段只含取回的那部分行
+    if (status === 'verified' && input.truncated === true) {
+      return { tone: 'warn', text: `${EVIDENCE_TEXT.sourceVerified}；${EVIDENCE_TEXT.inputTruncated}` }
+    }
     if (status === 'verified') return { tone: 'ok', text: EVIDENCE_TEXT.sourceVerified }
     if (status === 'mismatch') {
       return { tone: 'warn', text: EVIDENCE_TEXT.sourceMismatch(evidenceValue(input.model_value), evidenceValue(input.value)) }

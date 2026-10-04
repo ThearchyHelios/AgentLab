@@ -690,6 +690,61 @@ await section('提取模板', async () => {
   fakes.delete('GET /api/conversations')
 })
 
+// ------------------------------------------------------------------ 发布之后数据目录有变化（catalog.drift）
+
+await section('正式运行：发布之后数据目录有变化，提醒但不拦', async () => {
+  const id = 'fake0catdrift000000000000000000'
+  const t = Date.now() / 1000 - 30
+  const run = {
+    ...base, id, status: 'succeeded', run_class: 'formal', version: 3, workflow_id: null,
+    created_at: new Date(t * 1000).toISOString(), started_at: new Date(t * 1000).toISOString(),
+    finished_at: new Date((t + 2) * 1000).toISOString(), output: { 结果: '共 128 人次' },
+  }
+  const graph = { nodes: [
+    { id: 'a', type: 'input', position: { x: 0, y: 0 }, data: { label: '输入', config: {} } },
+    { id: 'q', type: 'tool', position: { x: 200, y: 0 }, data: { label: '查询入园人数', config: {} } },
+  ], edges: [{ source: 'a', target: 'q' }] }
+  const events = [
+    { seq: 1, type: 'run.started', node_id: null, ts: t, data: { nodes: 2 } },
+    { seq: 2, type: 'catalog.drift', node_id: null, ts: t + 0.01, data: { version: 3, count: 3, tables: [
+      { source: 'scenic', source_id: 'src-scenic', table: 'visits', label: '入园记录', published: 3, current: 5, impact: 'direct' },
+      { source: 'scenic', source_id: 'src-scenic', table: 'parks', label: null, published: 0, current: 1, impact: 'direct' },
+      // Agent 绑定了这个源的查询工具：SQL 运行时才写，记的是源里有目录的表
+      { source: 'scenic', source_id: 'src-scenic', table: 'orders', label: '订单', published: 2, current: 4, impact: 'possible' },
+    ] } },
+    { seq: 3, type: 'node.started', node_id: 'a', ts: t + 0.1, data: {} },
+    { seq: 4, type: 'node.finished', node_id: 'a', ts: t + 0.2, data: { duration_ms: 100 } },
+    { seq: 5, type: 'node.started', node_id: 'q', ts: t + 0.3, data: {} },
+    { seq: 6, type: 'node.finished', node_id: 'q', ts: t + 0.4, data: { duration_ms: 100 } },
+    { seq: 7, type: 'run.finished', node_id: null, ts: t + 2, data: { output: run.output } },
+  ]
+  fakes.set(`GET /api/runs/${id}`, () => ({ status: 200, json: run }))
+  fakes.set(`GET /api/runs/${id}/events`, () => ({ status: 200, json: events }))
+  fakes.set(`GET /api/runs/${id}/graph`, () => ({ status: 200, json: { graph, workflow_id: null, version: 3 } }))
+  await page.goto(`${WEB}/runs/${id}`, { waitUntil: 'networkidle' })
+  const banner = page.locator('[data-run-banner="catalog-drift"]')
+  check('详情显示目录变化的横幅', await banner.waitFor({ timeout: 5000 }).then(() => true, () => false))
+  const text = await banner.innerText().catch(() => '')
+  check('横幅标题：「入园记录」等 2 张表有变化，另有 1 张 Agent 可能查询的表有变化',
+    text.includes('自发布以来，数据目录中「入园记录」等 2 张表有变化；另有 1 张 Agent 可能查询的表有变化'), text.split('\n')[0])
+  check('写明运行未被拦截', text.includes('运行未被拦截'))
+  check('逐表写发布时和现在的版本，没有目录写「尚无目录」', text.includes('「scenic」入园记录（visits）：发布时第 3 版，现为第 5 版')
+    && text.includes('「scenic」parks：发布时尚无目录，现为第 1 版'), text.replace(/\s+/g, ' '))
+  check('每张表给到数据目录的入口', (await banner.locator('[data-drift-open="visits"]').getAttribute('href')) === '/data/catalog/src-scenic/visits')
+  const possible = banner.locator('[data-drift-possible]')
+  const possibleText = await possible.innerText().catch(() => '')
+  check('Agent 可能查询的表另起一组：小标题、说明、逐表一行', await possible.count() === 1
+    && possibleText.includes('Agent 可能查询的表') && possibleText.includes('SQL 在运行时生成')
+    && possibleText.includes('「scenic」订单（orders）：发布时第 2 版，现为第 4 版'), possibleText.replace(/\s+/g, ' '))
+  check('……直接引用的表不在这一组里', await possible.locator('[data-drift-table="visits"]').count() === 0
+    && (await banner.locator('[data-drift-table="orders"]').getAttribute('data-drift-impact')) === 'possible')
+  check('……也给到数据目录的入口', (await banner.locator('[data-drift-open="orders"]').getAttribute('href')) === '/data/catalog/src-scenic/orders')
+  check('运行照常完成：没有失败横幅', await page.locator('[data-run-banner=failed]').count() === 0)
+  const row = page.locator('[data-step-code="catalog_drift"]')
+  check('时间线里也有一行提醒', await row.count() === 1 && (await row.innerText()).includes('等 2 张表有变化'))
+  for (const k of [`GET /api/runs/${id}`, `GET /api/runs/${id}/events`, `GET /api/runs/${id}/graph`]) fakes.delete(k)
+})
+
 // ------------------------------------------------------------------ 运行中：接流、停止、不能删
 
 const FAKE = 'fake0running0000000000000000000'
@@ -1924,6 +1979,37 @@ await section('证据页签：左边报告、右边常驻面板、下方审计�
     await page.evaluate(() => document.documentElement.removeAttribute('data-theme'))
   }
   await page.keyboard.press('Escape')
+})
+
+await section('证据页签：降档时报告上方写明档位和原因，SQL 检查没通过的单独说，「都有出处」不画成绿色（B5）', async () => {
+  // 成果的 _issuance 带 sql_checks（engine/nodes/io.py）：数字都有出处，降档却是因为算数的查询没通过 SQL 检查
+  const EV_SQL = 'fake0evsqldegrade000000000000'
+  const PROBLEM = '「订单」关联「订单明细」是一对多，对「订单」的「订单金额」求和会重复计算'
+  const GAP = `查询「取订单」（Q1）未通过 SQL 检查（${PROBLEM}），结果不可靠；受影响的引用：Q1 第 1 行「gmv」`
+  const issuance = { tier: 'degraded', calibers: [], metrics_checked: 0, missing_required: [], missing_expected: [],
+    unmatched_numbers: [], matched_numbers: 10, matched: [], gaps: [GAP],
+    sql_checks: [{ query: '查询「取订单」（Q1）', node_id: 'fetch', problems: [PROBLEM], refs: ['Q1 第 1 行「gmv」'], gap: GAP }] }
+  evFakes(EV_SQL, { output: { ...fxe.output, _issuance: issuance }, graph: fxe.graph, audit: fxe.audit, csv: fxe.audit_csv })
+  await page.route(new RegExp(`/api/runs/${EV_SQL}/evidence/segments/`), (r) => r.fulfill({ status: 404, json: { detail: '没有这个片段' } }))
+  try {
+    await openEvidence(EV_SQL)
+    await page.locator('[data-evidence-report=write] [data-evidence-doc]').waitFor({ timeout: 5000 }).catch(() => {})
+    const banner = page.locator('[data-view-pane=evidence] [data-evidence-issuance] [data-issuance-banner=degraded]')
+    check('报告上方写明出具档位', await banner.count() === 1 && (await banner.innerText().catch(() => '')).includes('降档出具'))
+    const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check('……SQL 检查导致的降档在显眼处说明：哪次查询、什么问题、受影响的引用', sql.includes('降档原因：所依据的查询未通过 SQL 检查')
+      && sql.includes('查询「取订单」（Q1）') && sql.includes(PROBLEM) && sql.includes('Q1 第 1 行「gmv」'), sql)
+    check('……那一句不在其余缺口里重复', await banner.locator('[data-issuance-gaps]').count() === 0)
+    const tally = page.locator('[data-evidence-report=write] [data-evidence-tally-numbers]')
+    const [color, done] = await Promise.all([tally.evaluate((el) => getComputedStyle(el).color).catch(() => ''),
+      page.evaluate(() => { const s = document.createElement('span'); s.style.color = 'var(--st-done)'; document.body.append(s)
+        const c = getComputedStyle(s).color; s.remove(); return c })])
+    check('降档时报告上的数字计数不画成绿色', !!color && color !== done, `${color} vs ${done}`)
+  } finally {
+    for (const k of [...fakes.keys()]) if (k.includes(EV_SQL)) fakes.delete(k)
+  }
+  await openEvidence(EV)
+  check('没有出具契约的运行：报告上方不出出具横幅', await page.locator('[data-view-pane=evidence] [data-evidence-issuance]').count() === 0)
 })
 
 await section('证据页签：同一段文字里好几条同样的违规、正文里点不开的行', async () => {

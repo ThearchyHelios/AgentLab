@@ -310,6 +310,7 @@ function ToastCard({ item }: { item: ToastItem }) {
     <div
       className="fade-up pointer-events-auto flex items-start gap-2 rounded-lg border bg-panel px-3 py-2 shadow-elev-2"
       style={{ borderColor: item.kind === 'error' ? 'var(--err)' : item.kind === 'warn' ? 'var(--warn)' : 'var(--border)' }}
+      data-toast={item.kind}
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
       onFocus={() => setPaused(true)}
@@ -1597,8 +1598,9 @@ export function PageHeader({ icon, title, subtitle, actions }: {
       <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border bg-elev text-dim" aria-hidden>
         {icon}
       </span>
-      <h1 className="shrink-0 text-sm font-semibold">{title}</h1>
-      {subtitle && <p className="min-w-0 truncate text-xs text-faint" title={subtitle}>{subtitle}</p>}
+      {/* 放不下时先收说明（shrink 权重大得多），说明收没了标题再截断，不把整行撑出视口 */}
+      <h1 className="min-w-0 truncate text-sm font-semibold" title={title}>{title}</h1>
+      {subtitle && <p className="min-w-0 shrink-[1000] truncate text-xs text-faint" title={subtitle}>{subtitle}</p>}
       <span className="flex-1" />
       {actions}
     </header>

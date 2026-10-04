@@ -27,7 +27,8 @@ from app.engine.toolcalls import (
 )
 from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
-from app.tools.datasource import run_versions
+from app.engine.sql_problems import event_checks
+from app.tools.datasource import QUERY_PREFIX, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolContext,
@@ -419,9 +420,12 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                         except Exception as e:  # noqa: BLE001
                             content = f"工具失败：{describe_exception(e)}"
                             failure = {"error": content, "detail": raw_detail(e)}
+                # 查库的 SQL 检查结果单独带上：preview 截到前 1500 个字符，checks 通常在截掉的那段里
+                checks = event_checks(content) if not failure and tname.startswith(QUERY_PREFIX) else []
                 ctx.emit(EventType.TOOL_ERROR if failure else EventType.TOOL_END, tool=tname,
                          agent=name, call_id=cid, preview=content[:1500],
-                         duration_ms=int((time.perf_counter() - started) * 1000), **failure)
+                         duration_ms=int((time.perf_counter() - started) * 1000), **failure,
+                         **({"checks": checks} if checks else {}))
                 calls.append({"tool": tname, "args": targs, "result": content[:2000]})
                 messages.append(ToolMessage(content=content, tool_call_id=cid))
 

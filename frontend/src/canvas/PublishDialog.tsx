@@ -12,7 +12,9 @@ import {
 import { useCatalog } from '../store/catalog'
 import { Modal, Spinner, toast, useRadioGroup } from '../components/ui'
 import { humanizeError } from '../lib/errors'
-import { PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_UI_TEXT as UT, PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
+import { SqlLevelBadge } from '../run/SqlChecks'
 import { setLocalActor, useLocalActor } from '../lib/actor'
 import {
   autoFixIds, choiceReady, contentSig, fixFieldLabel, fixFor, fixValueLines, fixValueText, isMissingEndpoint, mergeIssues,
@@ -42,7 +44,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   workflow: Workflow
   onClose: () => void
   onDone: () => void
-  onLocate: (nodeId: string) => void
+  /** 定位一条问题：选中节点，能落到具体配置项（调用工具的 SQL）就落到那一项 */
+  onLocate: (issue: ValidationIssue) => void
 }) {
   const load = useStudio((s) => s.load)
   const dirty = useStudio((s) => s.dirty)
@@ -208,7 +211,7 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
       </dl>
 
       <div className="mt-3" data-preflight="dialog">
-        <Preflight pf={pf} gate={gate} onLocate={(issue) => { if (issue.node_id) { onLocate(issue.node_id); onClose() } }} />
+        <Preflight pf={pf} gate={gate} onLocate={(issue) => { if (issue.node_id) { onLocate(issue); onClose() } }} />
       </div>
     </Modal>
   )
@@ -441,6 +444,17 @@ export function usePreflight(workflowId: string | undefined, level: PublishLevel
   }
 }
 
+/**
+ * 发布前检查里一条 SQL 检查问题本来的级别。问题的 level 说的是「拦不拦」（已发布档一律 warning），本来是错误还是提醒
+ * 看服务端给的 sql_level（governance._lint_sql）。老服务端不给时按受管档的 level 认；已发布档就认不出来，按提醒说，
+ * 不把拿不准的说重
+ */
+const publishSqlLevel = (issue: ValidationIssue): 'error' | 'warning' | null => {
+  if (!isSqlCheckCode(issue.code)) return null
+  if (issue.sql_level === 'error' || issue.sql_level === 'warning') return issue.sql_level
+  return issue.level === 'error' ? 'error' : 'warning'
+}
+
 function fixLabelOf(data: PublishCheck | undefined, id: string): string {
   return data?.fixes.find((f) => f.id === id)?.label ?? ''
 }
@@ -465,6 +479,8 @@ export function Preflight({ pf, gate, onLocate, stale }: {
   const rows = useMemo(() => (issues ? mergeIssues(issues) : null), [issues])
   const errors = (rows ?? []).filter((r) => r.issue.level === 'error').length
   const warns = (rows ?? []).length - errors
+  // 已发布档只提醒、不拦的 SQL 检查错误级问题：结论那句话里点出来，别和「没指定模型」这类提示混成一个数
+  const sqlErrors = (rows ?? []).filter((r) => r.issue.level !== 'error' && publishSqlLevel(r.issue) === 'error').length
   const canFix = !lock && check.status !== 'unsupported'
   const autoIds = issues ? autoFixIds(issues, fixes) : []
   const labelOf = (id?: string | null) => (id ? nodeOf(id)?.label || id : '')
@@ -505,6 +521,7 @@ export function Preflight({ pf, gate, onLocate, stale }: {
             <span className="min-w-0">
               {gate ? T.gateBlocked(errors) : errors ? T.blocked(errors) : T.passed}
               {warns > 0 && <span className="font-normal text-faint">{errors || gate ? '，' : '；'}{T.warnings(warns)}</span>}
+              {sqlErrors > 0 && <span className="font-normal" style={{ color: 'var(--st-failed)' }} data-preflight-sql-errors={sqlErrors}>{UT.publishSqlErrors(sqlErrors)}</span>}
             </span>
           </span>
         )}
@@ -549,8 +566,9 @@ function PreflightRow({ issue, others, fix, where, pf, onLocate }: {
 }) {
   const err = issue.level === 'error'
   const Icon = err ? XCircle : AlertTriangle
+  const sqlLevel = publishSqlLevel(issue)
   return (
-    <li data-preflight-issue={issue.code ?? ''} data-fix-kind={fix?.kind}>
+    <li data-preflight-issue={issue.code ?? ''} data-fix-kind={fix?.kind} data-sql-check-level={sqlLevel ?? undefined}>
       <button
         type="button"
         disabled={!issue.node_id}
@@ -564,7 +582,16 @@ function PreflightRow({ issue, others, fix, where, pf, onLocate }: {
               aria-label={err ? '错误' : '提示'} />
         <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
           {where && !String(issue.message).includes(`「${where}」`) && <b className="font-semibold">「{where}」</b>}
+          {/* 对照数据目录的 SQL 检查：级别标识和证据面板同一个（错误 / 提醒），再写中文规则名，不露规则编号 */}
+          {sqlLevel && <SqlLevelBadge level={sqlLevel} className="mr-1 align-[1px]" />}
+          {isSqlCheckCode(issue.code) && <span className="font-medium" data-preflight-rule="">{sqlRuleLabel(issue.code)}：</span>}
           {issue.message}
+          {/* 这一级在两个发布级别下拦不拦：错误级只有受管档拦，已发布档只提醒（设计如此），要说清楚 */}
+          {sqlLevel && (
+            <span className="mt-0.5 block text-faint" data-preflight-sql-gate={sqlLevel === 'error' ? (err ? 'blocked' : 'reminded') : 'warning'}>
+              {sqlLevel === 'error' ? (err ? UT.publishSqlErrorBlocked : UT.publishSqlErrorReminded) : UT.publishSqlWarning}
+            </span>
+          )}
         </span>
         {issue.node_id && <CornerDownRight size={10} className="mt-px shrink-0 text-faint" aria-hidden />}
       </button>

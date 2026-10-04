@@ -5,14 +5,16 @@ import {
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
 import { copilotReceipt, mergeNodeConfig, toolChangesOf } from '../canvas/copilotMerge'
+import { connectMergeInput } from '../canvas/mergeInputs'
 import { contentSig, isMissingEndpoint, normalizeUpgrade } from '../canvas/issues'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
-import { UPGRADE_TEXT } from '../lib/terms'
+import { CATALOG_PATCH_TEXT, UPGRADE_TEXT } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
-import { endingOf, reduceTeam, settleTeam } from '../run/decode'
+import { copilotContext, endingOf, reduceTeam, settleTeam } from '../run/decode'
+import { catalogPatchOf } from '../run/catalogPatch'
 import { activeEdgesOf, applyDerived } from '../run/derive'
 import {
   emptyTrace, finalizeTrace, foldEvent, isActivePhase, isSettled, isTerminal, runStatusOf,
@@ -1407,8 +1409,11 @@ export const useStudio = create<StudioState>((set, get) => ({
   onConnect: (conn) => {
     if (locked(get)) return
     commit(set, get, '连线')
+    // 查询节点连到合并查询：顺手把它加成合并的输入（别名取有意义的短名），和连线同一步撤销
+    const nodes = connectMergeInput(get().nodes, conn.source, conn.target)
     set({
       edges: addEdge({ ...conn, type: 'flow' }, get().edges),
+      ...(nodes ? { nodes } : {}),
       dirty: true,
     })
     void get().validate()
@@ -1888,6 +1893,19 @@ export const useStudio = create<StudioState>((set, get) => ({
               },
             })
             break
+          case 'context': {
+            // 服务端按需求挑了表：浮条和轮次卡上先说参考了几张表，展开的过程里有表名（decodeCopilot）
+            const ctx = copilotContext(op)
+            if (ctx) set({ copilot: { ...s.copilot, lastOp: ctx.title } })
+            break
+          }
+          case 'catalog_patch': {
+            // 助手把用户说的数据事实整理成了目录修改提案：浮条上先说一句，卡片在这一轮的对话里（catalogPatchesOf），
+            // 人点「保存到数据目录」才写入。和画布无关，不动节点、不占撤销栈
+            const patch = catalogPatchOf(op)
+            if (patch) set({ copilot: { ...s.copilot, lastOp: CATALOG_PATCH_TEXT.step(patch.tableLabel ?? patch.table, patch.changes.length) } })
+            break
+          }
           case 'plan':
             set({ copilot: { ...s.copilot, phase: 'planning', lastOp: op.summary ?? '规划中' } })
             break

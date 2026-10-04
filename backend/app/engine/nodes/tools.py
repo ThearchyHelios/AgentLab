@@ -18,6 +18,7 @@ from app.engine.state import GraphState
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
+from app.engine.sql_problems import event_checks
 from app.tools.datasource import DATA_UNAVAILABLE, QUERY_PREFIX, SCHEMA_PREFIX, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -184,10 +185,12 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 只认数据源工具交回的查询：别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的
     query = query_entry_fields(result) if evidence_on and name.startswith(QUERY_PREFIX) else None
     schema = query.get("schema_artifact") if query else None
+    # 这次查询的 SQL 检查结果单独带上：preview 只有前 2000 个字符，checks 排在 rows 后面，通常被截掉
+    checks = event_checks(result) if name.startswith(QUERY_PREFIX) else []
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
              artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}),
-             **({"schema_artifact": schema} if schema else {}))
+             **({"schema_artifact": schema} if schema else {}), **({"checks": checks} if checks else {}))
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     if evidence_on:

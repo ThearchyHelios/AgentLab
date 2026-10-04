@@ -15,7 +15,8 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel } from '../lib/terms'
+import { SqlCheckList } from './SqlChecks'
 import {
   ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
@@ -24,8 +25,10 @@ import {
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
 import { EVIDENCE_STATE, claimProblems, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
-import type { EvidenceDocData } from '../types'
+import type { EvidenceDocData, IssuanceSqlCheck } from '../types'
 import { useRunClock } from './useRunClock'
+import { CatalogPatchCard } from './CatalogPatchCard'
+import type { CatalogPatch } from './catalogPatch'
 import type { ReviewResult } from '../types'
 
 /**
@@ -98,6 +101,11 @@ export interface StreamTurn {
   noQuery?: boolean
   /** 复核结论：这次运行有什么不对，以及对这个答案意味着什么 */
   review?: ReviewResult | null
+  /**
+   * 助手这一轮提出的数据目录修改（catalog_patch）。每条一张「建议更新数据目录」卡片，人点保存才写入；
+   * 从库里恢复的轮次没有操作流，也就没有卡片
+   */
+  catalogPatches?: CatalogPatch[]
   /** 被复核重写之前的答案。改写是有损的，得能对照原件 */
   rawOutput?: Record<string, any> | null
   /**
@@ -128,8 +136,8 @@ interface StreamCtx {
   dense: boolean
   onHover?: (nodeId: string | null) => void
   onFocus?: (nodeId: string) => void
-  /** 打开这个节点的设置去改（编排页）。下一步是「去画布改」的行据此给直达入口 */
-  onOpen?: (nodeId: string) => void
+  /** 打开这个节点的设置去改（编排页）。下一步是「去画布改」的行据此给直达入口；给了 field 就落到那一栏（args.sql） */
+  onOpen?: (nodeId: string, field?: string) => void
   activeNodeId?: string | null
   skewMs: number
   openArtifact: (id: string, title?: string) => void
@@ -189,7 +197,7 @@ export function AssistantStream({
    * 编排页：打开某个节点的设置。节点没绑工具、团队轮数不够这类要去画布上改的，
    * 报错和提醒行据此给「打开设置」；不传就只说该去哪儿改
    */
-  onStepOpen?: (nodeId: string) => void
+  onStepOpen?: (nodeId: string, field?: string) => void
   /** 画布上悬停的节点：对应的步骤行高亮 */
   activeNodeId?: string | null
   /** 贴着底部时，新步骤到来自动滚到底。离开底部就不再拽人 */
@@ -532,6 +540,10 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
             </details>
           )}
 
+          {turn.catalogPatches?.map((p) => (
+            <CatalogPatchCard key={p.key} patch={p} turnId={turn.id} dense={dense} />
+          ))}
+
           {!!turn.graph?.nodes?.length && (
             <GraphPeek graph={turn.graph} note={turn.graphNote}
                        onOpen={onOpenGraph && ((g) => onOpenGraph(g, turn.question))} />
@@ -723,7 +735,10 @@ function findFirst(steps: Step[], pred: (s: Step) => boolean): Step | undefined 
 
 function countKind(steps: Step[], kind: StepKind): number {
   let n = 0
-  for (const s of steps) n += (s.kind === kind ? 1 : 0) + (s.children ? countKind(s.children, kind) : 0)
+  // 合并查询那一行也是 kind query（同样的展开区和下钻），但它没有查数据库：「N 次查询」和落库的查询次数对得上
+  for (const s of steps) {
+    n += (s.kind === kind && !s.merge ? 1 : 0) + (s.children ? countKind(s.children, kind) : 0)
+  }
   return n
 }
 
@@ -863,19 +878,23 @@ function failureOf(turn: StreamTurn): Failure | null {
  * 下一步的直达入口。要去画布上改的，编排页能直接打开那个节点的设置；别处只说该去哪儿，
  * 不装作能点。「接着跑」「重新运行」由页面自己放（renderTurnActions），这里不给
  */
-function FixAction({ fix, nodeId, label, to, first }: {
+function FixAction({ fix, nodeId, label, to, first, field }: {
   fix?: FixKind | 'rerun'; nodeId?: string; label?: string
   /** lib/explain 的 fixTo：直达要改的那一项 */
   to?: string
   /** lib/explain 的 fixFirst：先改好才接得下去，入口写明要改什么 */
   first?: boolean
+  /** 要改的那一栏（args.sql：调用工具节点里写死的 SQL）。给了就落到那一栏，入口写「打开「取数」的 SQL」 */
+  field?: string
 }) {
   const { onOpen } = useContext(Ctx)
   const cls = 'inline-flex shrink-0 items-center gap-1 rounded px-1 text-2xs text-[var(--accent)] underline-offset-2 transition-colors hover:bg-hover hover:underline'
   if (fix === 'canvas' && nodeId && onOpen) {
+    const sql = field === 'args.sql' || field === 'sql'
     return (
-      <button type="button" className={cls} data-fix="canvas" onClick={() => onOpen(nodeId)}>
-        <Settings2 size={10} aria-hidden /> 打开{label ? `「${label}」的` : ''}设置
+      <button type="button" className={cls} data-fix="canvas" data-fix-node={nodeId} data-fix-field={field || undefined}
+              onClick={() => onOpen(nodeId, field || undefined)}>
+        <Settings2 size={10} aria-hidden /> {sql ? RUN_SQL_CHECK_TEXT.openSql(label) : `打开${label ? `「${label}」的` : ''}设置`}
       </button>
     )
   }
@@ -1050,7 +1069,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
   const [open, setOpen] = useState(false)
   const Icon = ICONS[step.kind] ?? CircleDot
   const result = step.result
-  const expandable = !!(step.detail || result || step.raw || step.artifact)
+  const expandable = !!(step.detail || result || step.raw || step.artifact || step.checks?.length)
   const table = result ? parseQueryResult(result) : null
   const status = step.status ?? 'done'
   // 失败的节点：收着的时候就说为什么（和轮次顶上的报错同一份 lib/explain），展开再看原因、
@@ -1149,7 +1168,9 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
             <CornerDownRight size={10} className="mt-[2px] shrink-0" aria-hidden />
             <span className="min-w-0 [overflow-wrap:anywhere]">{step.next}</span>
           </span>
-          <FixAction fix={step.fix} nodeId={step.nodeId} />
+          {/* 要改的是另一个节点（指标的问题出在来源查询的 SQL 上）：入口落到那个节点的那一栏 */}
+          <FixAction fix={step.fix} nodeId={step.fixNode ?? step.nodeId} field={step.fixField}
+                     label={step.fixNode ? step.fixLabel : undefined} />
         </div>
       )}
 
@@ -1471,19 +1492,44 @@ function StepDetail({ step, table, explained }: {
           )}
         </div>
       )}
+      {step.merge && step.merge.inputs.length > 0 && (
+        // 合并查询：先说合并的是哪几个输入（合并 SQL 里的表名 → 上游节点、行数、数据源），再看合并 SQL 和结果
+        <div className="text-2xs text-dim" data-step-merge="">
+          <div className="mb-0.5">{MERGE_TEXT.inputs(step.merge.inputs.length)}</div>
+          <ul className="space-y-0.5">
+            {step.merge.inputs.map((i) => (
+              <li key={i.alias} className="flex min-w-0 items-baseline gap-1.5" data-step-merge-input={i.alias}>
+                <span className="mono shrink-0 rounded bg-bg px-1 text-fg">{i.alias}</span>
+                <span className="min-w-0 truncate" title={i.nodeId}>{i.label || i.nodeId || '—'}</span>
+                <span className="shrink-0 text-faint">
+                  {[i.rows != null ? MERGE_TEXT.rows(i.rows) : '', i.source ? MERGE_TEXT.source(i.source) : '']
+                    .filter(Boolean).join(' · ')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {detail && (
         <div className="group/detail relative">
           {step.kind === 'query' && (
             <div className="mb-0.5 flex items-center gap-2 text-2xs text-dim">
-              <span className="mono">SQL</span>
+              <span className={step.merge ? undefined : 'mono'}>{step.merge ? MERGE_TEXT.sql : 'SQL'}</span>
               {step.source && <span>数据源 {step.source}</span>}
               <span className="flex-1" />
-              <CopyChip label="复制 SQL" text={() => step.detail ?? ''} />
+              <CopyChip label={step.merge ? MERGE_TEXT.copySql : '复制 SQL'} text={() => step.detail ?? ''} />
             </div>
           )}
           <pre className={pre}>
             {detail}
           </pre>
+        </div>
+      )}
+      {!!step.checks?.length && (
+        // 对照数据目录的 SQL 检查：查询那一行是这次查询的检查结果，指标那一行是来源查询没通过的那几条
+        <div className="text-2xs" data-step-sql-checks="">
+          <div className="mb-0.5 text-dim">{RUN_SQL_CHECK_TEXT.toolChecks}</div>
+          <SqlCheckList checks={step.checks} />
         </div>
       )}
       {table
@@ -1822,8 +1868,9 @@ export function ResultTable({ table, artifact, title, full = false, highlight, m
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-t px-1.5 py-1 text-2xs leading-relaxed text-dim">
         <span className="tnum">
           {[
-            rows.length < table.rows.length
-              ? `显示前 ${formatNumber(rows.length)} / ${formatNumber(table.rows.length)} 行`
+            // total：结果一共几行（预览只存了前几行时比 rows 多，比如合并查询 6 行只预览 5 行）
+            rows.length < Math.max(table.total ?? 0, table.rows.length)
+              ? `显示前 ${formatNumber(rows.length)} / ${formatNumber(Math.max(table.total ?? 0, table.rows.length))} 行`
               : `${formatNumber(table.rows.length)} 行`,
             hiddenCols > 0 ? `显示前 ${cols.length} / ${table.columns.length} 列` : null,
           ].filter(Boolean).join(' · ')}
@@ -2215,6 +2262,32 @@ function OutputValue({ value, marks, label }: { value: unknown; marks?: MarkSpec
   )
 }
 
+/**
+ * 出具声明里没通过 SQL 检查的查询（sql_checks）：每条写是哪次查询、什么问题、影响了哪些引用，下一步写改来源查询的 SQL。
+ * 出具横幅和报告页顶部共用。颜色跟着档位：降档用提醒色，不予出具用失败色
+ */
+export function IssuanceSqlChecks({ tier, checks }: { tier: string; checks: IssuanceSqlCheck[] }) {
+  const tone = tier === 'withheld' ? 'var(--st-failed)' : 'var(--st-waiting)'
+  return (
+    <div className="mt-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed" data-issuance-sql-checks={checks.length}
+         style={{ borderColor: `color-mix(in srgb, ${tone} 45%, var(--border))`, background: `color-mix(in srgb, ${tone} 6%, transparent)` }}>
+      <div className="flex items-center gap-1 font-medium" style={{ color: tone }}>
+        <AlertTriangle size={11} aria-hidden /> {RUN_SQL_CHECK_TEXT.issuanceTitle(tier)}
+      </div>
+      <ul className="mt-0.5 space-y-0.5">
+        {checks.map((c, i) => (
+          <li key={`${c.query ?? ''}:${i}`} className="[overflow-wrap:anywhere]" data-issuance-sql-check={c.node_id ?? ''}>
+            <span className="font-medium text-fg">{c.query || RUN_SQL_CHECK_TEXT.issuanceQuery}</span>
+            {!!c.problems?.length && <span className="text-fg">：{c.problems.join('；')}</span>}
+            {!!c.refs?.length && <span className="text-dim">（{RUN_SQL_CHECK_TEXT.issuanceAffected(c.refs.join('、'))}）</span>}
+          </li>
+        ))}
+      </ul>
+      <div className="mt-0.5 text-dim">{RUN_SQL_CHECK_TEXT.issuanceNext}</div>
+    </div>
+  )
+}
+
 const TIER_META: Record<string, { color: string; soft: string; hint: string }> = {
   formal: { color: 'var(--st-done)', soft: 'var(--st-done-soft)', hint: ISSUANCE_HINT.formal },
   degraded: { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: ISSUANCE_HINT.degraded },
@@ -2245,7 +2318,12 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   if (!tier) return null
   const meta = TIER_META[tier] ?? { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: '' }
   const unmatched: any[] = issuance?.unmatched_numbers ?? []
-  const gaps: string[] = Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []
+  // 没通过 SQL 检查的查询（出具声明的 sql_checks）单列一块、写在显眼处：数字都有出处，降档却是因为算数的查询本身有问题。
+  // 单列了的那几句（gap）不在其余缺口里重复
+  const sqlChecks: IssuanceSqlCheck[] = (Array.isArray(issuance?.sql_checks) ? issuance.sql_checks : [])
+    .filter((x: unknown): x is IssuanceSqlCheck => !!x && typeof x === 'object')
+  const sqlGaps = new Set(sqlChecks.map((x) => x.gap).filter(Boolean))
+  const gaps: string[] = (Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []).filter((g: string) => !sqlGaps.has(g))
   const calibers: any[] = issuance?.calibers ?? []
   const matched = Number(issuance?.matched_numbers ?? 0)
   // 逐个数字的出处（matched[].caliber 形如「口径名 @ v2」）：有它就能按卡数清楚，
@@ -2262,6 +2340,8 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   const uncitedClaims = Number(issuance?.claims?.uncited_claims ?? 0) || 0
   const numbers = counts ? evidenceTally(counts.cited, counts.total, counts.other) : ''
   const numbersOk = !counts?.none && !counts?.other
+  // 数字都有出处只在完整出具时用绿色：降档时「10 个数字都有出处」画成绿的，读的人会以为一切正常
+  const numbersColor = !numbersOk ? 'var(--st-waiting)' : tier === 'formal' ? 'var(--st-done)' : 'var(--text-dim)'
   // 四期：结论句有判定（开了裁判，或探索运行里按需判过）时多一段「结论 4 句（支持 3 · 无证据 1）」。
   // 没开裁判的文档里没挂依据的都数在这一段的「无证据」里，不再另起一句；开了裁判的文档里，没挂依据却送了
   // 裁判的句子按判定数、预筛放掉的不数——出具照样按没挂依据计缺口（require_citation、judge 都是），这时
@@ -2293,7 +2373,7 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         // 结论句靠句末徽标定位；只是没挂依据的结论句没有徽标，定位不到
         <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs" data-evidence-line="">
           {numbers && (
-            <span className="tnum" style={{ color: numbersOk ? 'var(--st-done)' : 'var(--st-waiting)' }}>{numbers}</span>
+            <span className="tnum" style={{ color: numbersColor }} data-evidence-line-numbers="">{numbers}</span>
           )}
           {suspect > 0 && (
             <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-evidence-line-suspect="">
@@ -2315,9 +2395,10 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         </div>
       )}
 
+      {!!sqlChecks.length && <IssuanceSqlChecks tier={tier} checks={sqlChecks} />}
       {!!gaps.length && (
-        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
-          <div className="font-medium">校验未全部完成：</div>
+        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-issuance-gaps="">
+          <div className="font-medium">{RUN_SQL_CHECK_TEXT.otherGaps}</div>
           <ul className="mt-0.5 space-y-0.5 pl-2">
             {gaps.map((g) => <li key={g}>· {g}</li>)}
           </ul>

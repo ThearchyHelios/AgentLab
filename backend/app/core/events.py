@@ -48,6 +48,9 @@ class EventType(StrEnum):
     # 记忆读写。以前发的是 info 日志，而解码器丢弃所有 info——于是往长期记忆里
     # 写东西这件事在界面上是隐形的。让 Copilot 主动记之后，这条不可接受
     MEMORY_END = "memory.end"
+    # 合并查询做完了：哪几个输入（别名、节点、行数、数据源）、哪条合并 SQL、得到几行、有哪些警告。
+    # 运行详情据此展示这一步；完整结果在 query_artifact 指向的查询快照里
+    MERGE_END = "merge.end"
     SANDBOX_START = "sandbox.start"
     SANDBOX_END = "sandbox.end"
 
@@ -66,6 +69,10 @@ class EventType(StrEnum):
     # 出具与口径治理
     ISSUANCE = "issuance"  # 出具契约的判定结果（档位 / 缺数据 / 未回指数字）
     CALIBER_UPGRADE = "caliber.upgrade"  # 钉住的方法卡有新版本，按声明的策略处置
+    # 从发布版本发起的正式运行：发布之后这一版用到的表的数据目录有变化（data/catalog_impact.catalog_drift）。
+    # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的。
+    # 只提醒、不拦运行；落在封存范围内，出具物上看得到「当时的目录和发布时不一样」
+    CATALOG_DRIFT = "catalog.drift"
     # 报告撰写节点的自查结果：报告文档工件 id、统计、违规清单。落在封存范围内，
     # 证据接口靠它找到文档——不去翻不受封存保护的 artifacts 表
     REPORT_CHECKED = "report.checked"

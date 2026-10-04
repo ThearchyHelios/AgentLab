@@ -371,12 +371,14 @@ const TABLES = {
 
 const log = {
   patches: [], cancels: [], continues: [], runStarts: [], archived: [], posts: [], approvalGets: [], runGets: [],
-  deleted: [], gens: [], sourceGets: 0,
+  deleted: [], gens: [], sourceGets: 0, catalogPatches: [],
 }
 const ctl = {
   slowMs: 0, failE: true, wsClosed: {}, approvals: [], thinkGo: false, writingGo: false, writingAt: 0,
   /** 列表只给前 8 个：筛选框刚好出现，删一个就不够 8 个了 */
   few: false, run500: true, reviewDelay: {}, launchFail: true, scope400: false,
+  /** 目录修改提案第一次保存回 409（别人刚改过这张表） */
+  patchConflict: false,
   /** 回收站里多摆两个（TRASH_MORE） */
   trashMore: false,
   /** 列表里多摆「护栏」那段的三个会话（GUARD_CONVS） */
@@ -470,8 +472,23 @@ async function fakeApi(route) {
       return route.fulfill({ status: 200, contentType: 'text/event-stream',
         body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
     }
+    if (String(b.instruction ?? '').includes('表示作废')) {
+      // 用户说了一条数据事实：服务端核对后转出目录修改提案，只回答、不建图
+      const ops = [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+        { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
+          { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
+            value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] },
+        { op: 'reply', text: '已整理成数据目录的修改建议，确认后保存即可。' },
+      ]
+      return route.fulfill({ status: 200, contentType: 'text/event-stream',
+        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+    }
     const ops = [
       { op: 'heartbeat', phase: 'planning', elapsed_ms: 800 },
+      // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
+      { op: 'context', elapsed_ms: 1200, sources: [
+        { source: 'shop', tables: ['orders', 'order_items'], selected_by: 'model', total: 48 }] },
       { op: 'plan', summary: '查一下再回答' },
       ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
       { op: 'done', explanation: '一张三步的图' },
@@ -479,6 +496,24 @@ async function fakeApi(route) {
     ]
     return route.fulfill({ status: 200, contentType: 'text/event-stream',
       body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+  }
+  if (path === '/datasources/src-shop/catalog/orders/patch' && method === 'POST') {
+    log.catalogPatches.push(body())
+    if (ctl.patchConflict) {
+      ctl.patchConflict = false
+      return json({ detail: '表「orders」的数据目录刚被修改过，请重新载入后再提交' }, 409)
+    }
+    return json({ table_name: 'orders', in_schema: true, notes: {}, version: 4, updated_at: null, updated_by: null,
+      structure: null, system_notes: false, usage: 0 })
+  }
+  if (path === '/datasources/src-shop/catalog/orders/patch/preview' && method === 'POST') {
+    log.catalogPatches.push({ preview: body() })
+    return json({ table_name: 'orders', version: 3, problems: [], changes: [
+      { path: 'columns.status.codes', before: { 1: '已支付', 2: '已退款' }, before_status: 'confirmed',
+        after: { 1: '已支付', 2: '已退款', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] })
+  }
+  if (path === '/datasources/src-shop/catalog/orders/impact' && method === 'GET') {
+    return json({ table: 'orders', templates: [] })
   }
   if (path === '/copilot/review' && method === 'POST') {
     const wait = ctl.reviewDelay[body().run_id]
@@ -1024,6 +1059,16 @@ for (const theme of THEMES) {
     check('完整答案取到了，meta 里没有「没取全」', !meta?.clipped, JSON.stringify(meta?.clipped))
     await page.getByText('展开全部').first().click().catch(() => {})
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
+    // 建图时服务端说了这一轮参考了哪些表：收在「规划」里，点开是一行，再点开看表名
+    check('建图的 context 操作原样记进这一轮', t.ops.some((o) => o.op === 'context'))
+    const turnCard = page.locator('[data-turn]').last()
+    await turnCard.locator('button', { hasText: '规划' }).first().click()
+    const ctxRow = turnCard.locator('[data-step-code="copilot_context"]')
+    check('点开「规划」看到参考了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
+      && (await ctxRow.innerText()).includes('参考了 2 张表'))
+    await ctxRow.locator('button').first().click()
+    check('再点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 2 张：orders、order_items')
+      .waitFor({ timeout: 3000 }).then(() => true, () => false))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })
@@ -1370,6 +1415,37 @@ for (const theme of THEMES) {
     check('「换个说法」把原问题填回输入框并聚焦', filled === '一个建流程就失败的问题' && focused,
       `${filled} · ${focused ? '已聚焦' : '没聚焦'}`)
     await page.screenshot({ path: `${SHOTS}/build-failed-${theme}.png` })
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('catalogpatch', '说了一条数据事实：「建议更新数据目录」卡片，保存撞上 409 能重新载入', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    ctl.patchConflict = true
+    const before = log.catalogPatches.length
+    await send(page, 'status=9 表示作废，统计时要排除')
+    const card = page.locator('[data-catalog-patch="orders"]')
+    check('回答下面有「建议更新数据目录」卡片', await card.waitFor({ timeout: 6000 }).then(() => true, () => false)
+      && (await card.innerText()).includes('建议更新数据目录'))
+    check('逐项写改前、改后、理由', (await card.locator('[data-patch-before]').innerText()).includes('1=已支付')
+      && (await card.locator('[data-patch-after]').innerText()).includes('9=作废')
+      && (await card.locator('[data-patch-reason]').innerText()).includes('status=9'))
+    const t = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('提案原样记进这一轮的操作流，回答照常交付', t.ops.some((o) => o.op === 'catalog_patch') && t.phase === 'done' && t.noQuery === true)
+    await card.locator('[data-patch-save]').click()
+    await card.locator('[data-patch-conflict]').waitFor({ timeout: 3000 })
+    check('409：提示这张表刚被修改过', (await card.innerText()).includes('这张表刚被修改过'))
+    await card.locator('[data-patch-reload]').click()
+    await card.locator('[data-patch-save]').waitFor({ timeout: 3000 })
+    check('重新载入后改前按最新的目录写', (await card.locator('[data-patch-before]').innerText()).includes('2=已退款'))
+    await card.locator('[data-patch-save]').click()
+    await card.locator('[data-patch-done]').waitFor({ timeout: 3000 })
+    const sent = log.catalogPatches.slice(before)
+    check('先带提案的版本，重新载入后带新版本', sent[0]?.if_version === 2 && !!sent[1]?.preview && sent[2]?.if_version === 3,
+      JSON.stringify(sent))
+    check('保存成功写明第几版、给到数据目录的入口', (await card.locator('[data-patch-done]').innerText()).includes('第 4 版')
+      && (await card.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-shop/orders')
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

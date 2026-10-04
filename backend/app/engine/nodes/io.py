@@ -147,7 +147,7 @@ def _apply_contract(
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    from app.engine.issuance import decide_tier, trace_numbers
+    from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_findings, trace_numbers
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -186,6 +186,11 @@ def _apply_contract(
             unresolved.append(source)
     if unresolved:
         gaps.append(f"指标来源未解析：{'、'.join(unresolved[:5])}")
+    # 拿截断的查询结果整组算出来的指标：数回指得上，但算的只是取回的那一截，不能完整出具
+    gaps.extend(incomplete_gaps(metrics))
+    # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）：口径卡复算得一致，算的却是错数。
+    # 报告直接引用的查询要等引用核对之后才知道，缺口放在这个位置，下面一起算
+    sql_at = len(gaps)
 
     # 引用模式下，缺输入记成空值的指标（口径卡 on_missing=null）就是缺：报告里引用不了它，
     # 也不能因为 id 在清单里就算「齐了」。旧模式照旧只看 id，行为不变
@@ -218,13 +223,37 @@ def _apply_contract(
         )
         unmatched = trace.unmatched if trace else []
 
+    # 同一条查询算出几个指标、报告又引用了它的格，只记一句（按出问题的那条查询归并，列出受影响的引用）
+    titles = {n.id: n.title for n in ctx.run.spec.nodes}
+    aliases: dict[str, str] = cited.get("aliases") or {}
+
+    def query_label(artifact: str, node_id: str | None) -> str:
+        from app.engine.sql_problems import node_of
+
+        title = titles.get(node_id or node_of(artifact, state.get("evidence")) or "")
+        alias = aliases.get(artifact)
+        if title and alias:
+            return f"查询「{title}」（{alias}）"
+        return f"查询「{title}」" if title else (f"查询 {alias}" if alias else "")
+
+    findings = sql_check_findings(metrics, cited.get("queries"), label=query_label)
+    gaps[sql_at:sql_at] = [f["text"] for f in findings]
+    # 出具声明另存一份结构化的：报告页在显眼处说「因为 SQL 检查没通过而降档」，不从缺口的中文里认。没有就不加这个键
+    from app.engine.sql_problems import node_of
+
+    for f in findings:
+        if not f.get("node_id") and f.get("artifact"):
+            f["node_id"] = node_of(f["artifact"], state.get("evidence"))
+    # gap 是 gaps 里对应的那一句：界面单列这几条时，据它不在「其余缺口」里重复
+    sql_checks = [{**{k: f[k] for k in ("query", "node_id", "problems", "refs") if f.get(k)}, "gap": f["text"]}
+                  for f in findings]
+
     # 声明了 metrics_from 却一个指标都没收到，同样是"没查成"
     if sources and not metrics:
         gaps.append("指标集为空，叙述中的数字无法追溯")
 
     # 上游有协作团队用完轮数、按降档交付的：叙述里的话不是调度者认可的结论，
     # 数字全都对得上也不能盖「完整出具」
-    titles = {n.id: n.title for n in ctx.run.spec.nodes}
     for node_id, payload in nodes.items():
         if isinstance(payload, dict) and payload.get("exhausted"):
             gaps.append(f"协作团队「{titles.get(node_id, node_id)}」用完 {payload.get('rounds', '?')} "
@@ -246,7 +275,7 @@ def _apply_contract(
         return _declare_citations(tier, cited, calibers=calibers, metrics=metrics, gaps=gaps,
                                   missing_required=missing_required, missing_expected=missing_expected,
                                   report_from=str(report_from), declared_at=datetime.now(timezone.utc),
-                                  ctx=ctx)
+                                  ctx=ctx, sql_checks=sql_checks)
 
     # 逐个数字的出处。以前只有一个计数，界面标不出「这个数来自哪个指标」
     matched = [
@@ -265,6 +294,7 @@ def _apply_contract(
         # 校验没跑全的原因照实印出来——读的人要能分辨"查过都对"和"根本没查"
         "gaps": gaps,
         "declared_at": datetime.now(timezone.utc).isoformat(),
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     }
     ctx.emit(
         EventType.ISSUANCE,
@@ -279,6 +309,7 @@ def _apply_contract(
         metrics_checked=len(metrics),
         matched_numbers=len(trace.matched) if trace else 0,
         matched=matched,
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     )
     return issuance
 
@@ -314,7 +345,7 @@ def _check_citations(
 
     out: dict[str, Any] = {"matched": [], "unmatched": [], "unresolved": [], "gaps": [],
                            "doc_artifact": None, "stats": None, "claims_policy": None, "uncited": None,
-                           "unsupported": None, "claims": None, "entities": None}
+                           "unsupported": None, "claims": None, "entities": None, "queries": {}, "aliases": {}}
     gaps = out["gaps"]
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
@@ -379,6 +410,8 @@ def _check_citations(
         # 表结构快照不全时核对不了的名字（unverified）在哪个级别都只标注
         out["entities"] = {"unknown": unknown[:_LISTED], "unverified": unverified[:_LISTED],
                            "counted": governed and bool(unknown)}
+
+    out["queries"], out["aliases"] = _cited_queries(doc, catalog)
 
     # 老前端要用的逐个数字出处，从复核通过的数字片段拼出来
     for _, unit in iter_units(doc):
@@ -520,10 +553,50 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     }
 
 
+def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """报告直接引用的查询：({查询快照 id: [引用的写法…]}, {目录里每个查询的快照 id: 编号})。
+
+    单元格（[[v:Q1.r0.gmv]]，[[table:]] 展开后也是一格一格的引用）按查询数：一格写「Q1 第 1 行「gmv」」，
+    几格写「Q1 的 3 格」；只拿它当依据（[[see:Q1]]）的写「Q1（结论依据）」。出具契约据此判这些查询有没有通过
+    SQL 检查（issuance.sql_check_gaps）。
+    """
+    from app.engine.evidence import iter_units
+
+    cells: dict[str, list[tuple[Any, Any]]] = {}
+    support: list[str] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            if cite.get("kind") == "cell" and cite.get("status") == "resolved" and cite.get("alias"):
+                loc = cite.get("locator") or {}
+                cells.setdefault(str(cite["alias"]), [])
+                if (loc.get("row"), loc.get("column")) not in cells[str(cite["alias"])]:
+                    cells[str(cite["alias"])].append((loc.get("row"), loc.get("column")))
+        for cite in unit.get("see") or []:
+            alias = str((cite or {}).get("alias") or "")
+            if (catalog.get(alias) or {}).get("kind") == "query" and alias not in support:
+                support.append(alias)
+    queries: dict[str, list[str]] = {}
+    # 目录里全部查询的编号：合并查询的输入没被直接引用，缺口里也要写得出它是 Q 几
+    aliases = {str(e["artifact"]): str(e["alias"]) for e in catalog.values()
+               if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact") and e.get("alias")}
+    for alias in [*cells, *(a for a in support if a not in cells)]:
+        artifact = (catalog.get(alias) or {}).get("artifact")
+        if not isinstance(artifact, str) or not artifact:
+            continue
+        hit = cells.get(alias) or []
+        if len(hit) == 1 and isinstance(hit[0][0], int):
+            ref = f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」"
+        else:
+            ref = f"{alias} 的 {len(hit)} 格" if hit else f"{alias}（结论依据）"
+        queries.setdefault(artifact, []).append(ref)
+    return queries, aliases
+
+
 def _declare_citations(
     tier: str, cited: dict[str, Any], *, calibers: list[dict[str, str]], metrics: list[dict[str, Any]],
     gaps: list[str], missing_required: list[str], missing_expected: list[str], report_from: str,
-    declared_at: Any, ctx: NodeContext,
+    declared_at: Any, ctx: NodeContext, sql_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """引用模式的 _issuance。旧字段一个不少（老前端照常显示），另加 mode、report、unresolved。"""
     report = {"node_id": report_from, "doc_artifact": cited["doc_artifact"]}
@@ -545,6 +618,8 @@ def _declare_citations(
         # 结论句策略和可疑实体：只在用上时才有这两个键，升级前的运行和没用上的契约形状不变
         **({"claims": cited["claims"]} if cited.get("claims") else {}),
         **({"entities": cited["entities"]} if cited.get("entities") else {}),
+        # 没通过 SQL 检查的查询（结构化）：报告页据此在显眼处说明降档原因。没有就不加这个键
+        **({"sql_checks": sql_checks} if sql_checks else {}),
     }
     entities = cited.get("entities")
     ctx.emit(
@@ -558,6 +633,7 @@ def _declare_citations(
         unresolved=len(cited["unresolved"]),
         calibers=calibers,
         gaps=gaps,
+        **({"sql_checks": sql_checks} if sql_checks else {}),
         metrics_checked=len(metrics),
         matched_numbers=len(cited["matched"]),
         matched=cited["matched"][:50],
