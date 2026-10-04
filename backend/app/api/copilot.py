@@ -236,6 +236,10 @@ NODE_REFERENCE = """\
   judge.provider 指定裁判模型（建议和写作模型不同，同一个模型等于自己审自己；不写就用设置里的「证据裁判模型」）；
   judge.max_cost_usd、judge.max_claims、judge.timeout_s 是每份报告的裁判金额、句数、时长上限，写 null 表示不限，
   不写取设置里的默认；judge.rewrite_once 默认 false，打开后把证据相矛盾、证据不足的句子交回写作者只改一次。
+  **多个来源汇总成的分析报告**（几个 agent 分头查库，或者几次查询的结果合在一起写成的分析、结论）默认写 claims: "judge"，
+  不写 judge 的预算（judge 整个不写，金额、句数、时长上限都取设置里的默认）：正式运行在节点里自动判，探索运行由读的人
+  点开哪句判哪句，不在节点里花钱。用户明确说不要核对结论句的不加；只回答一个问题、一次查询的不必加。要按受管级别
+  发布的模板不适用这条默认，按下面受管级别的规则写预算
   entities 默认 link
   （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
@@ -245,7 +249,7 @@ NODE_REFERENCE = """\
   （问数据的典型图），契约不写 metrics_from，也不写 required / expected
   要按受管级别发布的模板（发布前检查不过就发不出去）：报告节点写明 numbers: "strict"、on_violation: "fail"、
   claims: "require_citation"（或者更严的 claims: "judge"，这时 judge 里必须写 judge.max_cost_usd——写一个金额，或者
-  写 null 表示不限，预算要用户定，拿不准就问）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
+  写 null 表示不限，预算要用户定，拿不准就问；只有受管级别要这样，普通草稿里默认开的 judge 不写预算、不为预算问人）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
   供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
   否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
 
@@ -355,7 +359,8 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]]（英文名也可以放进反引号，中文名不行："
             "反引号里的中文名不核对），只写 agent 真查过的名字，"
             "编造的会被标出来；要引用知识库原话就在 report 前接 retrieve，用 [[q:K1|原话]] 逐字引用。问数是探索运行，"
-            "report 的 claims 不用写：结论句支不支持，由读答案的人点开时按需请模型判断\n"
+            "report 的 claims 不用写：结论句支不支持，由读答案的人点开时按需请模型判断。节点说明里「多个来源汇总成的"
+            "分析报告默认开结论句裁判」那条在问数里不适用，几个 agent 分头查的也一样\n"
             "- 用户要的是周报、要三档出具时，按搭图规则配口径卡和 report_from 契约\n"
             "- 不要用 transform 解析 agent / llm 的文字：要把 agent 查到的数交给下游，就给它配 output_schema + "
             "cite_fields\n"
