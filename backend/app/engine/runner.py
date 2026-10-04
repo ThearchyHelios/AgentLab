@@ -551,7 +551,12 @@ class RunManager:
             closed = await _close_approvals(session, run_id, actor, now)
             run = await session.get(Run, run_id)
             timing = await _timing(session, run, 0, now)
-            run.usage = {**(run.usage or {}), "duration_ms": timing["active_ms"], **timing}
+            usage = dict(run.usage or {})
+            # 停下时记的用量里还没有这次停在审批期间问的质询，这里补上（上次停下时计过的不再计）
+            inquiry = (await _usage_of_events(session, run_id)).get("inquiry")
+            if inquiry or usage.get("inquiry"):
+                usage = _with_inquiry(usage, inquiry)
+            run.usage = {**usage, "duration_ms": timing["active_ms"], **timing}
             run.error = "用户取消：等待审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
             bus.set_seq(run_id, run.last_seq or 0)
             # 和状态同一个事务提交，理由同 _finalize
@@ -857,6 +862,7 @@ class RunManager:
             if run:
                 timing = await _timing(session, run, elapsed_ms, now)
                 events_usage = await _usage_of_events(session, run_id)
+                inquiry = events_usage.pop("inquiry", None)
                 if status != "succeeded":
                     # 状态里的用量只算跑完了的节点。失败、取消、停在审批上的那个节点已经
                     # 花出去的调用（校验修复、agent 的前几步）只在 llm.end 里——以前这部分
@@ -865,6 +871,9 @@ class RunManager:
                 elif events_usage.get("unpriced_calls"):
                     # 金额估不出来的调用只有 llm.end 数得出（状态里的用量只有金额，0 分不出是免费还是没价）
                     usage = {**usage, "unpriced_calls": events_usage["unpriced_calls"]}
+                if inquiry:
+                    # 审批质询不在图里执行，状态和 llm.end 两本账里都没有它：比完再加上
+                    usage = _with_inquiry(usage, inquiry)
                 # duration_ms 是各段执行时长之和（= active_ms）。以前用这一段的耗时
                 # 覆盖它：87 秒、中间等过一次审批的运行，列表上写着 22ms
                 usage.update(duration_ms=timing["active_ms"], **timing)
@@ -1270,18 +1279,35 @@ async def _close_approvals(session: Any, run_id: str, actor: str | None, now: da
 
 
 _USAGE_KEYS = ("input_tokens", "output_tokens", "cost_usd", "calls")
+#: 审批质询的用量里计进运行用量的键：unpriced_calls 是其中金额估不出来的调用次数（模型不在价格目录里）
+_INQUIRY_KEYS = (*_USAGE_KEYS, "unpriced_calls")
 
 
 async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
-    """按 llm.end 事件逐次加总的用量：每次模型调用都有一条，不管节点最后成没成。"""
+    """按事件加总的用量。
+
+    llm.end 逐次加总：每次模型调用都有一条，不管节点最后成没成。审批质询不在图里执行、不发 llm.end，
+    它的用量写在 approval.inquiry 事件数据的 usage 里，单独加总放在 inquiry 下（没有质询就没有这个键）：
+    llm.end 这本账要和状态里的用量比大小（_spent），质询花的两本里都没有，混进去比会被状态那本盖掉。
+    """
     rows = await session.execute(
-        select(RunEvent.data).where(RunEvent.run_id == run_id, RunEvent.type == EventType.LLM_END)
+        select(RunEvent.type, RunEvent.data).where(
+            RunEvent.run_id == run_id, RunEvent.type.in_([EventType.LLM_END, EventType.APPROVAL_INQUIRY]))
     )
     from app.providers.catalog import unpriced_call
 
     total: dict[str, Any] = dict.fromkeys(_USAGE_KEYS, 0)
     unpriced = 0
-    for (data,) in rows:
+    inquiry: dict[str, Any] = {}
+    for kind, data in rows:
+        if kind == EventType.APPROVAL_INQUIRY:
+            spent = (data or {}).get("usage")
+            if isinstance(spent, dict):
+                for key in _INQUIRY_KEYS:
+                    value = spent.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        inquiry[key] = inquiry.get(key, 0) + value
+            continue
         for key in _USAGE_KEYS:
             value = (data or {}).get(key, 1 if key == "calls" else 0)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1291,7 +1317,32 @@ async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
     if unpriced:
         # 有几次调用的金额估不出来（模型不在价格目录里）：cost_usd 只是估得出的那部分，界面据此不写 $0
         total["unpriced_calls"] = unpriced
+    if inquiry:
+        if "cost_usd" in inquiry:
+            inquiry["cost_usd"] = round(inquiry["cost_usd"], 6)
+        total["inquiry"] = inquiry
     return total
+
+
+def _with_inquiry(usage: dict[str, Any], inquiry: dict[str, Any] | None) -> dict[str, Any]:
+    """把审批质询的用量计进运行用量，明细另放在 inquiry 下（界面要说清其中多少是质询花的）。
+
+    usage 里已经计过一回的（上次停下时记下的 inquiry）先减掉再加：停过两次、两次都问过的运行，
+    每次质询只计一遍。
+    """
+    out = dict(usage)
+    counted = out.pop("inquiry", None) or {}
+    for key in _INQUIRY_KEYS:
+        delta = (inquiry or {}).get(key, 0) - counted.get(key, 0)
+        if delta:
+            out[key] = (out.get(key) or 0) + delta
+    if isinstance(out.get("cost_usd"), float):
+        out["cost_usd"] = round(out["cost_usd"], 6)
+    if "input_tokens" in out or "output_tokens" in out:
+        out["total_tokens"] = int(out.get("input_tokens") or 0) + int(out.get("output_tokens") or 0)
+    if inquiry:
+        out["inquiry"] = dict(inquiry)
+    return out
 
 
 def _spent(state_usage: dict[str, Any], events_usage: dict[str, Any]) -> dict[str, Any]:
