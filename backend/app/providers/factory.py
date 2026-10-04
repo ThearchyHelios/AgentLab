@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -13,6 +14,8 @@ from app.core.crypto import decrypt
 from app.db.models import Provider
 from app.providers import catalog
 from app.providers.mock_model import MockChatModel
+
+logger = logging.getLogger(__name__)
 
 
 class ModelSpec(BaseModel):
@@ -221,6 +224,10 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         kwargs["base_url"] = base_url
     if extra.get("headers"):
         kwargs["default_headers"] = extra["headers"]
+    # 流式调用要服务方在流尾补一块用量（stream_options.include_usage）。ChatOpenAI 只在没填 base_url 时默认开，
+    # 兼容接口都填了 base_url，于是一次运行上百次调用记成 0 token、0 美元——llm.end 读的 usage_metadata
+    # 就来自这一块。不认 stream_options 的服务由 ReasoningAwareChatOpenAI 去掉它重发，不让调用失败
+    kwargs["stream_usage"] = True
     return _ReasoningAwareChatOpenAI(**kwargs)
 
 
@@ -260,7 +267,64 @@ def _reasoning_aware_openai() -> type:
                 gen.message.additional_kwargs["reasoning_content"] = text
             return gen
 
+        async def _astream(self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any):
+            """流式调用；服务方不认 stream_options 时去掉它重发一次，之后这个接口不再带它。
+
+            只在还没收到任何一块时重发：拒绝都发生在请求刚发出去的时候，重发不会重复输出。"""
+            usage = not self._use_responses_api({**kwargs, **self.model_kwargs}) \
+                and self._should_stream_usage(kwargs.get("stream_usage"), **kwargs)
+            key = _endpoint_key(self)
+            first: Exception | None = None
+            if usage and key not in _NO_STREAM_USAGE:
+                started = False
+                try:
+                    async for chunk in super()._astream(messages, stop, run_manager, **dict(kwargs)):
+                        started = True
+                        yield chunk
+                    return
+                except Exception as e:  # noqa: BLE001 - 认得出的拒绝才重发，其余原样抛出
+                    if started or not _rejects_stream_options(e):
+                        raise
+                    first = e
+            if usage:
+                kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"} | {"stream_usage": False}
+            try:
+                async for chunk in super()._astream(messages, stop, run_manager, **kwargs):
+                    if first is not None and key not in _NO_STREAM_USAGE:
+                        # 去掉它就成了：记下这个接口不认，之后不再每次先失败一次
+                        _NO_STREAM_USAGE.add(key)
+                        logger.warning("模型接入 %s 不支持流式用量回传（%s），已改为不请求用量", key, str(first)[:200])
+                    yield chunk
+            except Exception as e:
+                if first is None:
+                    raise
+                raise e from first
+
     return ReasoningAwareChatOpenAI
+
+
+#: 认定不支持 stream_options 的接口（base_url）。进程内有效：重启后再试一次，服务方可能已经升级
+_NO_STREAM_USAGE: set[str] = set()
+
+
+def _endpoint_key(model: Any) -> str:
+    return str(getattr(model, "openai_api_base", None) or "https://api.openai.com/v1")
+
+
+def _rejects_stream_options(exc: Exception) -> bool:
+    """这个报错是不是服务方不认 stream_options。
+
+    点名了 stream_options / include_usage 的一定是；只回 400 / 422、说不清哪个参数的（有的网关只回一句
+    Bad Request）也去掉它试一次——重发也失败就说明不是它的事，原样报重发的错。上下文超长同样是 400，
+    重发也没用，不算。"""
+    from langchain_core.exceptions import ContextOverflowError
+
+    if isinstance(exc, ContextOverflowError):
+        return False
+    text = str(exc).lower()
+    if "stream_options" in text or "include_usage" in text:
+        return True
+    return getattr(exc, "status_code", None) in (400, 422)
 
 
 class _LazyReasoningChatOpenAI:
