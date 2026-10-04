@@ -193,6 +193,10 @@ NODE_REFERENCE = """\
   写进去再也读不回来——真发生过：一轮写进 scope"user"，下一轮没写 scope 落回
   default，于是「我叫张三」存下来了，问「我是谁」却答不上来
 - human：人工审批。config: {mode: approve|input|edit, title, message}
+  title、message 说批了会怎样时写「批准后输出」「批准后继续」，**不要写「正式出具」「批准后才会出具」**：出具只发生在
+  成果节点配了出具契约、并且从已发布版本发起的正式运行里；画布上试运行、问数据都是探索运行，批准后只是输出。
+  这次是探索运行还是正式运行，审批卡会自己标明。审的是报告时把 human 接在 report 后面（message 里可以引用
+  {{ nodes.报告节点id.text }}），审批卡会附上这份报告的核对概况
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
 - subgraph：嵌套另一个工作流。config: {workflow_id, input}
@@ -1323,6 +1327,7 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
     changed = _changed(spec, baseline)
     out: list[dict[str, Any]] = []
     out += _unsourced_reports(spec, changed)
+    out += _issuance_promises(spec, changed)
     for issue in text_parse_issues(spec):
         if issue.node_id in changed:
             # 模型的文字放在模板引号里的那种，改法是 | json，不是换结构化输出
@@ -1353,6 +1358,36 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
                     "for_model": f"SQL 里的 {'、'.join(unknown[:5])} 在数据源「{source.name}」的结构里查不到（这几张表的列："
                                  f"{listed}）。照结构里的列名改；拿不准就先用 db_schema__{source.name} 查表结构，"
                                  "别凭空猜列名"})
+    return out
+
+
+#: 人工审批的标题、说明里不该出现的说法：出具要成果节点配了出具契约、从已发布版本发起的正式运行才谈得上
+_ISSUANCE_PROMISE = "正式出具"
+
+
+def _issuance_promises(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
+    """这一轮写的人工审批节点在标题、说明里许诺「正式出具」（human_formal_issuance）。
+
+    真实运行里一次探索运行的审批写着「批准后才会正式出具」，审批人以为自己在签发正式的东西。画布上试运行、问数据
+    都是探索运行，成果节点也常常没有出具契约；同一张图发布后发起的正式运行才谈得上出具。审批说明写「批准后输出」，
+    这次是哪一类运行由审批卡标明。"""
+    out: list[dict[str, Any]] = []
+    for node in spec.nodes:
+        if node.id not in changed or node.type != NodeType.HUMAN:
+            continue
+        field = next((key for key in ("title", "message")
+                      if _ISSUANCE_PROMISE in str(node.config.get(key) or "")), None)
+        if field is None:
+            continue
+        out.append({
+            "level": "error", "node_id": node.id, "edge_id": None, "field": field, "code": "human_formal_issuance",
+            "message": f"人工审批「{node.title}」的{'标题' if field == 'title' else '说明'}写了「{_ISSUANCE_PROMISE}」。"
+                       "只有成果节点配了出具契约、从已发布版本发起的正式运行才会出具，画布上试运行和问数据都是探索运行，"
+                       "批准后只是输出。请改成「批准后输出」这类说法",
+            "for_model": f"人工审批的 {field} 里不要写「{_ISSUANCE_PROMISE}」：只有成果节点配了出具契约、从已发布版本发起的"
+                         "正式运行才会出具，这张图在画布上试运行、问数据时都是探索运行，批准后只是输出。改成「批准后输出」"
+                         "「批准后继续」这类说法，运行类别由审批卡标明",
+        })
     return out
 
 
