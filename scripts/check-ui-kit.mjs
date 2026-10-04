@@ -338,7 +338,7 @@ await section('按后端原文匹配的地方：失败归类认得新旧两种�
   // 只用来证明旧文字仍认得，不要跟着后端改
   const src = (f) => readFileSync(new URL(`../backend/app/${f}`, import.meta.url), 'utf8')
   const SOURCE = [
-    ['api/runs.py', 'f"绑定的工具不存在：{lines}{more}。{fix}"'],
+    ['engine/launch.py', 'f"绑定的工具不存在：{lines}{more}。{fix}"'],
     ['engine/toolcalls.py', '秒没有返回，已停止等待'],
     ['data/engine.py', '秒被中断。请添加 WHERE 条件或 LIMIT 缩小范围。'],
     ['core/errors.py', '"等待超时：服务方未在限定时间内响应"'],
