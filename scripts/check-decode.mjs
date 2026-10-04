@@ -1300,6 +1300,26 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
     `${flagged?.status} ${flagged?.level}`)
   const bare = flatten(mod.decodeRun([E(1, 'report.checked', null, {})])).find((s) => s.code === 'report_checked')
   check('载荷缺字段也不崩，只说核对了报告', bare?.title === '核对报告' && !bare.artifact, bare?.title)
+
+  // 写作目录超出篇幅（2026-10 一次运行：上百次查询只有前二十来次进了写作者的视野，界面上一个字都没说）：
+  // 现在按来源均衡地展开，没展开的列编号和摘要，并发一条警告。界面读结构化字段（queries、omitted、nodes）
+  check('后端发目录有省略的警告，带着结构化字段', reportPy.includes('code="report_catalog_trimmed"')
+    && reportPy.includes('queries=writer.queries, omitted=len(writer.omitted)') && reportPy.includes('"node_id", "title", "total", "omitted"'),
+    '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const TRIMMED = '证据目录超出篇幅（约 51200 字，按写作模型的上下文窗口确定）：164 次查询中 90 次列出了数据，74 次只列编号和摘要'
+    + '（卡券核销省略 52 次、活动内容省略 22 次）。写作模型看不到这些查询的明细，报告不得据此断言没有数据'
+  const trimmed = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: TRIMMED, budget: 51200, window: null, queries: 164,
+      omitted: 74, nodes: [{ node_id: 'a', title: '会员专项', total: 26, omitted: 0 }, { node_id: 'b', title: '卡券核销', total: 79, omitted: 52 },
+        { node_id: 'c', title: '活动内容', total: 42, omitted: 22 }] })])).find((s) => s.code === 'report_catalog_trimmed')
+  check('report_catalog_trimmed：标题说几次查询只列了编号和摘要', trimmed?.title === '证据目录超出篇幅，164 次查询中 74 次只列了编号和摘要', trimmed?.title)
+  check('……副标题按来源列省略了几次（没省略的来源不列）', trimmed?.sub === '卡券核销 省略 52/79 次、活动内容 省略 22/42 次', trimmed?.sub)
+  check('……下一步说被省略的仍在台账里、不得据此断言没有数据，以及怎么看全', !!trimmed?.next?.includes('不得据此断言没有数据')
+    && !!trimmed?.next?.includes('上下文窗口更大') && trimmed?.level === 'warn' && trimmed?.detail === TRIMMED, trimmed?.next)
+  const trimmedBare = flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_catalog_trimmed', message: '目录有省略' })]))
+    .find((s) => s.code === 'report_catalog_trimmed')
+  check('……缺字段时标题照样说人话，不出 undefined', trimmedBare?.title === '证据目录超出篇幅，部分查询只列了编号和摘要'
+    && trimmedBare?.sub === undefined, `${trimmedBare?.title} / ${trimmedBare?.sub}`)
 })
 
 await section('工具门控 tool.gated（工具信任三档）', async () => {

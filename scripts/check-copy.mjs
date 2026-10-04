@@ -230,12 +230,13 @@ const MODEL_ONLY = {
     'NODE_REFERENCE', 'ROLE', 'MARKUP_NUDGE', 'JUDGE_RULES', 'JUDGE_ROLE', 'JUDGE_RULE', 'REVIEW_SYSTEM', 'MARKER_RULES',
     'GATE_SYSTEM', 'TOOL_MARKUP_NUDGE', '_UNKNOWN_ENTITY_FOR_MODEL', 'NODE_FIELD_FIX', '_FIX_TAIL',
     '_STREAM_PROTOCOL', '_RULES_HEAD', '_NO_LOWERING', '_ASK_HUMAN', '_UPGRADE_TASK', 'CELL_RULES', 'ENTITY_RULES',
-    'EXTRACT_SYSTEM', 'GRAPH_SCHEMA', 'REVIEW_SCHEMA', '_CN_N',
+    'EXTRACT_SYSTEM', 'GRAPH_SCHEMA', 'REVIEW_SCHEMA', '_CN_N', 'OMITTED_RULES', 'ABSENCE_RULE',
   ]),
   // 拼提示词的函数：生成 / 修正 / 升级请求、抽取消息、交给抽取模型的输出结构；
   // 助手的数据源上下文（api/copilot_context.py 的各段渲染、挑表请求，copilot.py 里挑表用的需求）
   funcs: new Set(['_user_message', '_repair_request', '_publish_fix_request', '_upgrade_assist_request',
-    '_extract_messages', '_from_rows', 'catalog_prompt',
+    '_extract_messages', '_from_rows', 'catalog_prompt', 'writer_catalog', '_trimmed_catalog', '_metric_prompt',
+    '_fields_prompt', '_field_prompt', '_query_brief',
     '_pick_messages', '_pick_need', '_publish_fix_need', '_upgrade_need',
     '_detail_block', '_selected_block', '_join_lines', '_route_line', '_source_head']),
   // 第二个参数是交回模型改写的指令（第一个是给人看的那句）：engine/evidence.py 的 _Reason(text, fix)、fail(text, fix)

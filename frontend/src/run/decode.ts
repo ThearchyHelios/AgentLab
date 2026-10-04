@@ -756,6 +756,22 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         sub: message.match(/(?:没|未)通过核对（(.+?)）/)?.[1],
       }
     }
+    case 'report_catalog_trimmed': {
+      // 写作目录超出篇幅（report.py _trimmed_message）。读结构化字段（queries、omitted、nodes），不从原话里认
+      const total = typeof d.queries === 'number' ? d.queries : undefined
+      const omitted = typeof d.omitted === 'number' ? d.omitted : undefined
+      const rows: any[] = Array.isArray(d.nodes) ? d.nodes : []
+      const per = rows.filter((r) => typeof r?.omitted === 'number' && r.omitted > 0 && str(r?.title))
+        .map((r) => `${r.title} 省略 ${formatNumber(r.omitted)}/${formatNumber(r.total)} 次`)
+      return {
+        title: omitted != null
+          ? `证据目录超出篇幅，${total != null ? `${formatNumber(total)} 次查询中 ` : ''}${formatNumber(omitted)} 次只列了编号和摘要`
+          : '证据目录超出篇幅，部分查询只列了编号和摘要',
+        sub: per.length ? per.join('、') : undefined,
+        next: '写作模型按来源均衡地看到了一部分查询的明细，被省略的查询仍在证据台账里，报告不得据此断言没有数据。'
+          + '需要完整明细时，请换用上下文窗口更大的写作模型，或让 Agent 在 SQL 中先汇总再交出结果',
+      }
+    }
     case 'agent_field_mismatch': {
       // 「有 1 个字段和查询快照对不上，已按快照取值：order_cnt 模型报 1240，快照是 1234」（llm.py _field_warnings）
       const n = message.match(/有\s*(\d+)\s*个字段/)?.[1]

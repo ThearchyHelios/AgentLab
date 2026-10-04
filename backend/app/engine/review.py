@@ -89,6 +89,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_repair": ("report_repair", DEGRADED),
     # 报告撰写节点的上游没有可引用的口径卡指标：报告里的数都没有出处
     "report_no_evidence": ("report_no_evidence", DEGRADED),
+    # 证据目录超出篇幅，有的查询只列了编号和摘要：写作模型没看全证据，报告的覆盖面有缺口
+    "report_catalog_trimmed": ("report_catalog_trimmed", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),
     # agent 的结构化字段：模型报的值和查询快照对不上（已按快照取值），或者出处核对不了

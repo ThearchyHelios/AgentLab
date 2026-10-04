@@ -50,11 +50,13 @@ from app.engine.evidence import (
     MARKER_RULES,
     SEE_AND_CODE_RULES,
     StreamRenderer,
+    WriterCatalog,
     build_catalog,
-    catalog_prompt,
+    catalog_budget,
     compose_doc,
     describe_violations,
     ledger_enabled,
+    writer_catalog,
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
 from app.engine.schema import (
@@ -70,7 +72,8 @@ from app.engine.schema import (
 )
 from app.engine.state import GraphState, message_text, thinking_text
 from app.engine.toolcalls import leaked_markup, markup_warning
-from app.providers.factory import ProviderNotConfigured, get_chat_model
+from app.providers import catalog as model_catalog
+from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model, resolve_provider
 
 ON_VIOLATION = ("fail", "flag")
 NUMBERS = ("strict", "off")
@@ -138,6 +141,57 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
         # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
         catalog = {alias: e for alias, e in catalog.items() if e.get("kind") not in ENTITY_KINDS}
     return catalog
+
+
+def report_fields(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[dict[str, Any]]:
+    """上游 Agent 经按出处核对交来的结构化字段：[{node_id, title, data, evidence}]，按画布上的顺序。
+
+    范围和 report_catalog 收查询的范围一致：祖先节点，写了 evidence_from 就只收那几个。只进写作目录（第一优先，
+    放不下也列出），不进目录本身：出口复核按目录重建，字段的引用落到的是查询单元格，和以前一样核对。
+    """
+    sources = _setting(spec, node, "evidence_from", "ancestors")
+    if isinstance(sources, str) and sources != "ancestors":
+        sources = [sources]
+    keep = {str(s) for s in sources} if isinstance(sources, list) else None
+    allowed = _ancestors(spec, node.id)
+    outputs = state.get("nodes") or {}
+    found: list[dict[str, Any]] = []
+    for other in spec.nodes:
+        result = outputs.get(other.id)
+        if other.id not in allowed or (keep is not None and other.id not in keep) or not isinstance(result, dict):
+            continue
+        if isinstance(result.get("data_evidence"), dict) and result["data_evidence"]:
+            found.append({"node_id": other.id, "title": other.title or other.id, "data": result.get("data"),
+                          "evidence": result["data_evidence"]})
+    return found
+
+
+async def model_window(session: Any, spec: ModelSpec, model_id: str) -> int | None:
+    """写作模型的上下文窗口（token）：模型接入里给这个模型登记的 context 优先，其次模型目录
+    （providers/catalog.py）；都没有返回 None，由 catalog_budget 取保守值。"""
+    try:
+        provider = await resolve_provider(session, spec.provider, spec.model or model_id)
+    except ProviderNotConfigured:
+        provider = None
+    for entry in (provider.models or []) if provider is not None else []:
+        if isinstance(entry, dict) and entry.get("id") == model_id:
+            raw = entry.get("context")
+            try:
+                value = int(raw) if not isinstance(raw, bool) and raw not in (None, "") else 0
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+    return model_catalog.find_context(model_id)
+
+
+def _trimmed_message(writer: WriterCatalog) -> str:
+    """写作目录有省略时的那条警告（给人看）：各来源省略了几次，写作模型看不到哪些明细。"""
+    per = "、".join(f"{r['title']}省略 {r['omitted']} 次" for r in writer.nodes if r["omitted"])
+    shown = writer.queries - len(writer.omitted)
+    return (f"证据目录超出篇幅（约 {writer.budget} 字，按写作模型的上下文窗口确定）：{writer.queries} 次查询中 "
+            f"{shown} 次列出了数据，{len(writer.omitted)} 次只列编号和摘要（{per}）。写作模型看不到这些查询的明细，"
+            "报告不得据此断言没有数据")
 
 
 def report_entities(spec: GraphSpec, node: GraphNode) -> str:
@@ -351,8 +405,7 @@ def _repair_request(violations: list[dict[str, Any]]) -> str:
     )
 
 
-def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cells: bool = True,
-              claims: str = "off") -> list[BaseMessage]:
+def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off") -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
@@ -363,7 +416,7 @@ def _messages(ctx: NodeContext, state: GraphState, catalog: dict[str, Any], cell
     return [
         SystemMessage(content="\n\n".join(p for p in (system, ROLE) if p)),
         HumanMessage(content=(
-            f"{instructions}\n\n{catalog_prompt(catalog, cells_allowed=cells)}\n\n{rules}\n\n"
+            f"{instructions}\n\n{writer.text}\n\n{rules}\n\n"
             "只输出报告正文（Markdown），不要写撰写说明。"
         )),
     ]
@@ -392,6 +445,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             model, model_id = await get_chat_model(session, _model_spec(ctx))
         except ProviderNotConfigured as e:
             raise NodeError(ctx.node.id, not_configured(e)) from e
+        # 写作目录的篇幅按这个模型的上下文窗口定（evidence.catalog_budget）
+        window = await model_window(session, _model_spec(ctx), model_id)
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
@@ -408,7 +463,14 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if warning := _no_evidence(catalog, cells):
         ctx.emit(EventType.LOG, level="warn", code="report_no_evidence", message=warning)
 
-    messages = _messages(ctx, state, catalog, cells, claims)
+    writer = writer_catalog(catalog, budget=catalog_budget(window), cells_allowed=cells,
+                            fields=report_fields(state, spec, ctx.node),
+                            titles={n.id: n.title or n.id for n in spec.nodes})
+    if writer.trimmed:
+        ctx.emit(EventType.LOG, level="warn", code="report_catalog_trimmed", message=_trimmed_message(writer),
+                 budget=writer.budget, window=window, queries=writer.queries, omitted=len(writer.omitted),
+                 nodes=[{k: r[k] for k in ("node_id", "title", "total", "omitted")} for r in writer.nodes])
+    messages = _messages(ctx, state, writer, claims)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
