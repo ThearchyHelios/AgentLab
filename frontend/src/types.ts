@@ -3020,3 +3020,150 @@ export interface SqlCheckItem {
   relation_id?: string
   sql_excerpt?: string
 }
+
+// ===========================================================================
+// 数字推演（后端 app/api/whatif.py、app/engine/recompute.py）：在一次运行的口径卡上改输入、排除查询快照里的行，
+// 看指标和报告里引用它的地方会变成多少。推演不是出具：不写运行记录、不改报告
+// ===========================================================================
+
+/** 推演的改动：输入路径 → 新值；查询快照的工件 id → 要排除的行号（快照里的行号，从 0 数） */
+export interface WhatIfOverrides {
+  inputs: Record<string, number>
+  exclude_rows: Record<string, number[]>
+}
+
+/** POST /runs/{id}/evidence/whatif 的请求体 */
+export interface WhatIfRequest {
+  /** 报告撰写节点 id：只列这份报告里引用的地方 */
+  report?: string
+  /** 口径卡节点 id */
+  card: string
+  /** 只推演这一个指标 */
+  metric?: string
+  overrides: WhatIfOverrides
+}
+
+/** 一个输入在推演里的样子 */
+export interface WhatIfInput {
+  path: string
+  via?: string | null
+  node_id?: string | null
+  /** 落在哪份查询快照上（cell() 取的格、agent 字段、整份查询结果）：排除这份快照里的行会影响它 */
+  artifact?: string
+  locator?: EvidenceLocator
+  kind: 'number' | 'text' | 'bool' | 'missing' | 'container' | (string & {})
+  /** 数值（或原本缺失）的标量、不是遮罩列、不决定取哪一格、还原得出：可以改。整个指标推演不了时一律为 false */
+  editable: boolean
+  /** 原值、推演用的值。容器写大概（「[12 项]」）；遮罩列的一律是 null */
+  old?: unknown
+  new?: unknown
+  changed?: boolean
+  /** 起了作用的被排除行（快照里的行号，从 0 数） */
+  excluded_rows?: number[]
+  /**
+   * 这个输入实际用到的快照行（含两端，从 0 数）：单格一行、数组字段一段、整份查询结果全部。排除别的行影响不到它，
+   * 界面只让这几行可勾。遮罩的、还原不了的（完整值找不回来、快照读不出来）没有，决定取哪一格的数组字段、整份结果
+   * 也没有（少了几行，取到哪一格说不准），整个指标推演不了时一律没有
+   */
+  row_span?: [number, number]
+  masked?: boolean
+  /** 落在的查询快照读不出来（文件不在、与哈希不一致）：遮没遮核对不了，值不给 */
+  withheld?: boolean
+}
+
+/**
+ * unchanged：没碰到改动，原值原样交回；ok：重算了；excluded：排除行后缺了输入，算不出来；error：新值让计算出错（除以零……）；
+ * unsupported：推演不了（有输入还原不了、口径卡没记输入，或者排除行后说不准受不受影响）；masked：用到了遮罩列，
+ * 不推演。整个指标推演不了的不改动也是 unsupported / masked（unsupported 里另有一条 input 为空的）
+ */
+export type WhatIfStatus = 'unchanged' | 'ok' | 'excluded' | 'error' | 'unsupported' | 'masked'
+
+export interface WhatIfMetric {
+  id: string
+  name: string
+  unit: string
+  decimals?: number | null
+  format?: string
+  old: unknown
+  new: unknown
+  delta: number | null
+  /** 按口径卡的格式渲染（和报告里的字同一套规则） */
+  rendered_old: string
+  /** unsupported、masked 时为 null：不知道会变成什么 */
+  rendered_new: string | null
+  /** 带正负号；比率、百分数写「个百分点」。没变化、不是数时为 null */
+  rendered_delta: string | null
+  changed: boolean | null
+  status: WhatIfStatus | (string & {})
+  reason: string | null
+  /** 推演用的代入式（重算了才有；没碰到改动的是卡上原来的代入式） */
+  substituted: string | null
+  inputs: WhatIfInput[]
+}
+
+/** 报告里引用这个指标的一处，推演之后会写成什么 */
+export interface WhatIfSegment {
+  report: string
+  unit: string
+  sid: string
+  metric: string
+  rendered_old: string
+  rendered_new: string | null
+  changed: boolean | null
+}
+
+export interface WhatIfUnsupported {
+  metric: string
+  /**
+   * null：整个指标都推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了或所在的快照读不出来），reason 和指标上的
+   * 一样。不论改什么都推演不了，不改动也有这一条；界面据此只写原因，不画输入框、勾选框
+   */
+  input: string | null
+  reason: string
+}
+
+/** 引用了这张口径卡的下游口径卡：只标可能受影响，不重算 */
+export interface WhatIfAffectedCard {
+  node_id: string
+  artifact: string
+  caliber: string
+  version: string
+  metrics: string[]
+  /** 直接引用（false 是经别的卡间接引用） */
+  direct: boolean
+}
+
+/**
+ * GET /runs/{id}/evidence/whatif/rows：一页查询快照的行（推演时勾行用），形状和证据面板的查询步骤一致，
+ * 可以直接交给 queryWindow。遮罩列写「已遮罩」；快照读不出来时没有行，note 说明原因
+ */
+export interface WhatIfRowsPage {
+  run_id: string
+  artifact: string
+  node_id?: string | null
+  tool?: string | null
+  source?: string | null
+  columns: string[]
+  rows: unknown[][]
+  row_offset: number
+  row_index: number[]
+  total_rows: number | null
+  truncated: boolean | null
+  masked: string[]
+  hash_ok: boolean | null
+  sealed: boolean
+  note?: string
+}
+
+export interface WhatIfResult {
+  run_id: string
+  card: { node_id: string; artifact: string; caliber: string; version: string }
+  report: string | null
+  /** 运行已封存且封存核对一致：推演依据的数据不会再变 */
+  sealed: boolean
+  seal: { sealed: boolean; ok: boolean | null }
+  metrics: WhatIfMetric[]
+  segments: WhatIfSegment[]
+  unsupported: WhatIfUnsupported[]
+  affected_cards: WhatIfAffectedCard[]
+}

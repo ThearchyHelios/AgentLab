@@ -2773,9 +2773,59 @@ export const INQUIRY_TEXT = {
   title: '审批质询',
 }
 
-/** 数字推演：在一次运行的基础上改动输入，推演指标的变化 */
+/**
+ * 数字推演：在一次运行的基础上改动输入，推演指标的变化（证据面板里口径卡上的数，run/WhatIf.tsx）。
+ * 推演永远不是出具：横幅要说清不会写进运行记录、不会改动报告。行号对人一律从 1 数（和查询结果表格的 # 列一致）
+ */
 export const WHATIF_TEXT = {
   title: '数字推演',
+  open: '推演',
+  openHint: '改动输入或排除查询结果中的行，查看这个数和报告会如何变化',
+  close: '收起推演',
+  banner: '推演，非出具：不会写进运行记录，也不会改动报告',
+  unsealed: '运行未封存，数据可能还会变',
+  sealBroken: '封存核对未通过，推演所依据的数据可能已被改动',
+  loading: '推演中…',
+  failed: '推演失败',
+  result: '推演结果',
+  unchanged: '无变化',
+  delta: (text: string) => `变化 ${text}`,
+  substituted: '推演代入式',
+  inputs: '输入',
+  original: (value: string) => `原值 ${value}`,
+  inputLabel: (path: string) => `${path} 的推演值`,
+  notNumber: '请输入数值',
+  masked: '已遮罩',
+  withheld: '查询快照无法核对，不显示原值',
+  excludedRows: (rows: number[]) => `已排除第 ${rows.map((r) => r + 1).join('、')} 行`,
+  pickRows: (alias: string) => `在查询 ${alias} 中勾选要排除的行`,
+  pickHere: (n: number) => `勾选要排除的行（共 ${n} 行）`,
+  pickHereClose: '收起要排除的行',
+  rowsHint: '勾选的行在推演中视为不存在，这个指标没有用到的行不能勾选',
+  rowUnused: '这个指标没有用到这一行，排除它不影响结果',
+  rowsPending: '推演结果返回后才能勾选',
+  rowsLoading: '正在读取查询结果…',
+  /** 三个数已按千分位写好（formatNumber） */
+  rowsRange: (from: string, to: string, total: string) => `第 ${from}–${to} 行，共 ${total} 行`,
+  rowsMore: (n: number) => `再显示 ${n} 行`,
+  excludeHead: '排除',
+  excludeRow: (row: number) => `排除第 ${row + 1} 行`,
+  excludedCount: (n: number) => `已排除 ${n} 行`,
+  backToResult: '回到推演结果',
+  segments: '报告中会变的地方',
+  segmentsNone: (n: number) => `报告中引用这个指标的 ${n} 处不受影响`,
+  segmentsUnknown: '这个指标无法推演，报告中引用它的地方会如何变化无法确定',
+  locate: '定位',
+  inReport: (node: string) => `另一份报告（${node}）`,
+  unsupported: '不支持推演的输入',
+  wholeMetric: '整个指标',
+  nothingToAdjust: '这个指标没有可以修改的输入，也没有可以排除的查询行',
+  affected: '可能受影响的下游口径卡',
+  affectedHint: '这些口径卡引用了本卡的指标，推演不会重算它们',
+  affectedCard: (caliber: string, version: string) => `口径卡「${caliber || '未命名'}」${version ? ` ${version}` : ''}`,
+  indirect: '间接引用',
+  reset: '恢复原值',
+  empty: '这个指标的计算式没有引用任何输入，无可推演',
 }
 
 /** 双盲复算节点：节点库说明、检查器和运行结果 */

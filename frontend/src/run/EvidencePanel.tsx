@@ -30,6 +30,10 @@ import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
 import { SqlCheckList } from './SqlChecks'
+import {
+  WhatIf, WhatIfRows, WhatIfSummary, WhatIfToggle, focusResult, inSpans, pickMetric, usableRows, useWhatIfDraft,
+  useWhatIfResult, wholeReason,
+} from './WhatIf'
 
 /**
  * 证据面板：点开报告里的一个片段，看它从哪来。
@@ -62,6 +66,10 @@ import { SqlCheckList } from './SqlChecks'
  *
  * Excel 导入期 4：上传表格的单元格多三节——数据版本、推断的来源、相关核对（EvidenceProvenance）。只在片段是单元格
  * 引用、且片段接口的查询步骤带 provenance: true 时请求推断来源接口；推断来源的缓存只在面板开着期间有效。
+ *
+ * 数字推演（WhatIf.tsx）：指标步骤上的「推演」展开推演区，改输入的值、在查询步骤里勾掉几行，看这个数和报告会变成
+ * 多少。推演不是出具，不写运行记录、不改报告。勾选框只在推演时出现在查询步骤的结果窗口里，只有这个指标用到的行能勾，
+ * 表格底下带着推演结果。
  *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
@@ -161,7 +169,7 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, view, 
           ? <ViolationList doc={doc} onLocate={onLocate} />
           : found
             ? <SegmentBody panelId={id} doc={doc} artifact={artifact} runId={runId} runClass={runClass} seg={found.seg}
-                           unit={found.unit} block={found.block} onViolations={onViolations} />
+                           unit={found.unit} block={found.block} onViolations={onViolations} onLocate={onLocate} />
             : claimAt
               ? <ClaimBody doc={doc} artifact={artifact} runId={runId} runClass={runClass} unit={claimAt.unit}
                            block={claimAt.block} />
@@ -205,11 +213,13 @@ function flashOnce(el: HTMLElement) {
   setTimeout(() => { if (el.dataset.flash === 'focus') delete el.dataset.flash }, 1600)
 }
 
-function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block, onViolations }: {
+function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block, onViolations, onLocate }: {
   panelId: string
   doc: EvidenceDocData; artifact?: string; runId?: string; runClass?: string; seg: EvidenceSegment; unit: EvidenceUnit
   block: EvidenceBlock
   onViolations: () => void
+  /** 跳到正文里的某个片段（推演区「报告中会变的地方」的定位） */
+  onLocate: (segId: string) => void
 }) {
   const report = doc.node_id || undefined
   const key = runId ? segmentKey(runId, seg.id, report) : ''
@@ -295,6 +305,31 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
     return i >= 0 ? { index: i, alias: queries[i].alias ?? '', go: () => jumpTo(i) } : undefined
   }
   const violations = (doc.violations ?? []).filter((v) => v.segment === seg.id)
+  // 数字推演：按（运行、报告、口径卡、指标）认一份草稿。同一个指标的几处引用之间来回切，推演不收起（定位到另一处
+  // 引用也是这样）；换了指标、换成别的片段才收起清空。卡和指标先按文档目录认：切片段时证据链还没回来，也认得出是同一个
+  const whatifCard = entry?.kind === 'metric' ? entry.node_id : metricStep?.node_id
+  const whatifMetric = entry?.kind === 'metric' ? entry.locator?.metric : metricStep?.metric
+  const whatif = useWhatIfDraft(runId && isMetric && whatifCard && whatifMetric
+    ? [runId, report ?? '', whatifCard, whatifMetric].join('\u0000') : '')
+  // 证据链回来了、正文就是封存的那一份才给推演：链是别的报告的，推演出来的数也对不上正文
+  const whatifReady = !!runId && !docIssue && !!metricStep && !!whatifCard && !!whatifMetric
+  const whatifOpen = whatif.open && whatifReady
+  const whatifId = `${panelId}-whatif`
+  // 推演的请求和答复也放在这一层：查询步骤里勾行的表格底下要带着推演结果，和推演区是同一份
+  const whatifRequest = useMemo(() => (whatifOpen && whatifCard && whatifMetric
+    ? { ...(report ? { report } : {}), card: whatifCard, metric: whatifMetric, overrides: whatif.overrides } : null),
+  [whatifOpen, report, whatifCard, whatifMetric, whatif.overrides])
+  const whatifView = useWhatIfResult(runId, whatifRequest)
+  // 每份快照里这个指标用得到的行：别的行勾了不影响结果，表格里不让勾
+  const whatifUsable = useMemo(() => usableRows(pickMetric(whatifView.data, whatifMetric)), [whatifView.data, whatifMetric])
+  // 能勾行的查询步骤：指标的输入（单元格取数、Agent 字段）落在它上面。合并查询的输入步骤不给——指标引用的是合并结果。
+  // 整个指标推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了）时一行都不给勾
+  const pickable = new Set(wholeReason(whatifView.data, whatifMetric) ? []
+    : inputs.map((inp) => inp.artifact).filter((a): a is string => !!a))
+  const queryLink = (artifactOf?: string) => {
+    const i = artifactOf ? queries.findIndex((q) => q.artifact === artifactOf && !q.merged_into) : -1
+    return i >= 0 ? { alias: queries[i].alias ?? '', go: () => jumpTo(i) } : undefined
+  }
   const seal: EvidenceSeal | undefined = docIssue ? undefined : detail?.seal ?? graphData?.seal
   const reason = reasonOf(seg) || detail?.note || ''
   const verdict = sealVerdict(seal, {
@@ -369,7 +404,13 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
                     failed={chainFailed}
                     resolved={state === 'deterministic'}
                     linkOf={linkOf}
-                    workflowName={workflowName(pinnedWorkflow(metricStep))} />
+                    workflowName={workflowName(pinnedWorkflow(metricStep))}
+                    whatif={whatifReady ? { open: whatifOpen, onToggle: whatif.toggle, controls: whatifId } : undefined}>
+          {whatifOpen && runId && whatifMetric && (
+            <WhatIf id={whatifId} runId={runId} report={report} metric={whatifMetric} draft={whatif} view={whatifView}
+                    queryOf={queryLink} onLocate={onLocate} />
+          )}
+        </MetricPart>
       )}
 
       {isMetric && inputs.some(notableInput) && (
@@ -396,7 +437,17 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       )}
 
       {queries.map((q, i) => (
-        <QueryPart key={`${q.artifact ?? ''}-${i}`} id={queryId(i)} step={q} seal={seal} masked={masked} />
+        <QueryPart key={`${q.artifact ?? ''}-${i}`} id={queryId(i)} step={q} seal={seal} masked={masked}
+                   pick={whatifOpen && whatifMetric && q.artifact && !q.merged_into && pickable.has(q.artifact)
+                     ? {
+                       excluded: whatif.excluded(q.artifact),
+                       onToggle: (row) => whatif.toggleRow(q.artifact!, row),
+                       usable: whatifUsable ? (row) => inSpans(whatifUsable.get(q.artifact!), row) : undefined,
+                       // 勾了行，新值就在表格底下：推演区在上面，往往已经不在视野里
+                       summary: <WhatIfSummary view={whatifView} metric={whatifMetric} onBack={() => focusResult(whatifId)} />,
+                       busy: whatifView.status === 'loading',
+                     }
+                     : undefined} />
       ))}
 
       {provenanceOn && runId && <EvidenceProvenance runId={runId} segId={seg.id} report={report} />}
@@ -1073,8 +1124,8 @@ function Sentence({ unit, active }: { unit: EvidenceUnit; active: string }) {
   )
 }
 
-/** 指标步骤：名称、值、口径与版本（来源、升版处置）、原式、代入式（输入标签）、复算 */
-function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolved, linkOf, workflowName }: {
+/** 指标步骤：名称、值、口径与版本（来源、升版处置）、原式、代入式（输入标签）、复算；可以展开数字推演 */
+function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolved, linkOf, workflowName, whatif, children }: {
   step?: EvidenceStep
   entry?: Record<string, any>
   inputs: EvidenceInput[]
@@ -1090,6 +1141,10 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   linkOf: (input: EvidenceInput) => InputLink
   /** 钉住的上游工作流在目录里的名字（接口没给名字时用） */
   workflowName?: string
+  /** 「推演」开关：证据链回来了、正文是封存的那一份才有 */
+  whatif?: { open: boolean; onToggle: () => void; controls: string }
+  /** 展开的推演区 */
+  children?: ReactNode
 }) {
   const host = useEvidenceHost()
   const name = step?.name ?? entry?.name ?? step?.metric ?? entry?.locator?.metric ?? NONE
@@ -1131,6 +1186,7 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
             {EVIDENCE_TEXT.sqlCheckFailed}
           </span>
         )}
+        {whatif && <WhatIfToggle open={whatif.open} onToggle={whatif.onToggle} controls={whatif.controls} />}
       </div>
       {(caliber || version || artifact || from) && (
         <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-2xs text-dim">
@@ -1194,6 +1250,7 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
           {pending ? EVIDENCE_TEXT.chainPending : failed || (runId ? EVIDENCE_TEXT.chainMissing : EVIDENCE_TEXT.noRun)}
         </p>
       )}
+      {children}
     </Part>
   )
 }
@@ -1322,7 +1379,16 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
  * 复验哈希），复用工件查看。被遮罩的列在表里写「已遮罩」。查询快照哈希对不上时用失败色写出来：
  * 这时候这些行不能当证据，比「有出处」重要得多
  */
-function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep; seal?: EvidenceSeal; masked: string[] }) {
+function QueryPart({ id, step, seal, masked, pick }: {
+  id: string; step: EvidenceStep; seal?: EvidenceSeal; masked: string[]
+  /**
+   * 推演时：结果窗口每行前面加勾选框，勾掉的行在推演里视为不存在。usable 说哪几行这个指标用得到（别的行不让勾），
+   * summary 是画在表格底下的推演结果
+   */
+  pick?: {
+    excluded: number[]; onToggle: (row: number) => void; usable?: (row: number) => boolean; summary?: ReactNode; busy?: boolean
+  }
+}) {
   const host = useEvidenceHost()
   const win = useMemo(() => queryWindow(step), [step])
   const [open, setOpen] = useState(false)
@@ -1412,9 +1478,14 @@ function QueryPart({ id, step, seal, masked }: { id: string; step: EvidenceStep;
       )}
       {win.columns.length > 0 && win.rows.length > 0 && (
         <div ref={scroller} className={clsx(bad.length > 0 && 'mt-1.5')}>
-          <ResultTable table={table} full title={EVIDENCE_TEXT.query(alias)}
-                       highlight={win.marks.length || win.cells?.length ? { rows: win.marks, cols: win.cols, cells: win.cells } : undefined}
-                       masked={hidden} />
+          {pick && win.index
+            ? <WhatIfRows win={win} hidden={hidden} excluded={pick.excluded} onToggle={pick.onToggle} usable={pick.usable}
+                          summary={pick.summary} busy={pick.busy} />
+            : (
+              <ResultTable table={table} full title={EVIDENCE_TEXT.query(alias)}
+                           highlight={win.marks.length || win.cells?.length ? { rows: win.marks, cols: win.cols, cells: win.cells } : undefined}
+                           masked={hidden} />
+            )}
         </div>
       )}
       {!win.rows.length && (
