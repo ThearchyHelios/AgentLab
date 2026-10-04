@@ -17,10 +17,15 @@ round（和 metrics.run_metrics 一样只 round 浮点），渲染走 evidence.r
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格
 - 落在读不出来（文件不在、与哈希不一致）的查询快照上的输入同样不给值、不推演：那一格遮没遮核对不了，宁可多遮
 
+有的指标不论改什么都推演不了（_Plan.blocked）：卡上没记全输入、用到了遮罩列、最外层的输入还原不了（容器的完整值
+找不回来、所在的快照读不出来）。这种不改动也照实交回 unsupported / masked 和原因，输入一个都不让改、不给行段：
+界面一打开就只写原因，不写「无变化」，也不摆改了、勾了也推演不出来的输入框和勾选框。
+
 同一张口径卡的指标不能互相引用（算这张卡时卡上的值还不存在），所以只有用到了被改的输入、被排除的行的指标需要重算，
-别的原样交回。排除行时有一种例外：指标的某个输入对不上任何快照（完整值找不回来的容器、加工过的结果、按位置从结果里
-取的一格、由查询结果算出来的数），它可能就是从被排除了行的那份结果来的，重算不了，只能说不知道（unsupported），
-不能报「无变化」。写它的节点在那份快照交回之前就跑完了的，影响不到它，照常不算。
+别的原样交回。排除行时有两种例外，都只能说不知道（unsupported），不能报「无变化」：
+- 指标的某个输入对不上任何快照（完整值找不回来的容器、加工过的结果、按位置从结果里取的一格、由查询结果算出来的数），
+  它可能就是从被排除了行的那份结果来的，重算不了。写它的节点在那份快照交回之前就跑完了的，影响不到它，照常不算
+- 决定取哪一格的容器（cell(nodes.q, len(vars.res.rows) - 1, …) 里的 vars.res.rows）少了几行：取到的是哪一格说不准
 """
 from __future__ import annotations
 
@@ -63,6 +68,7 @@ NOT_NUMBER = "不是数值，不能修改"
 DOUBT = "排除行对 {path} 的影响无法确定：{why}"
 DOUBT_UNMATCHED = "它对不上任何查询快照，可能是由查询结果加工而来"
 DOUBT_DERIVED = "它不是直接取自查询结果的格，可能由查询结果算出"
+DOUBT_SELECTOR = "它决定取哪一行、哪一项，排除行后需要重新取数"
 NOT_FINITE = "计算结果不是有限的数值（溢出或非数），无法推演"
 
 #: 卡上给容器记的大概（metrics._brief）：「[12 项]」「{3 个字段}」
@@ -161,6 +167,23 @@ class _Plan:
     inputs: dict[str, _Input] = field(default_factory=dict)
     problem: str | None = None
 
+    @property
+    def blocked(self) -> tuple[str, str] | None:
+        """整个指标推演不了（不论改什么）：(status, 原因)，推演得了的是 None。
+
+        卡上没记全输入、表达式有误；用到了遮罩列（哪怕只是嵌在下标里的一格）；最外层的输入还原不了——容器的完整值
+        找不回来，或者所在的查询快照读不出来。嵌在下标里的输入还原不了不碍事：它取到的那一格的值卡上记着。
+        遮罩排在还原不了前面：同一格既遮着、快照又读不出来时，说遮罩（快照修好了它照样遮着）。
+        """
+        if self.problem:
+            return "unsupported", self.problem
+        if any(inp.masked for inp in self.inputs.values()):
+            return "masked", MASKED_METRIC
+        for path in self.tops:
+            if problem := self.inputs[path].problem:
+                return "unsupported", f"无法推演：{path}（{problem}）"
+        return None
+
 
 # --------------------------------------------------------------------------
 # 入口
@@ -168,11 +191,16 @@ class _Plan:
 
 
 def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: str | None = None) -> dict[str, Any]:
-    """在一张口径卡上推演：{metrics: [每个指标的旧值、新值、输入…], unsupported: [不能用于推演的输入和原因]}。
+    """在一张口径卡上推演：{metrics: [每个指标的旧值、新值、输入…], unsupported: [不能用于推演的输入和原因],
+    maybe_changed: 有没有指标可能因这次改动而变}。
 
     metric 给了就只推演这一个指标。改动不合法时抛 WhatIfError，一个指标都不算。没碰到改动的指标不重算，
-    原值原样交回（status: unchanged）；unsupported 不论有没有改动都列全（遮罩的、还原不了的、不能改也没有行可勾的），
-    界面一打开就能说清哪些输入不能动。
+    原值原样交回（status: unchanged）；整个推演不了的指标（_Plan.blocked）不论有没有改动都交回 unsupported / masked
+    和原因。unsupported 不论有没有改动都列全（遮罩的、还原不了的、不能改也没有行可勾的；整个指标推演不了的另有一条
+    input 为空的），界面一打开就能说清哪些输入不能动。
+
+    maybe_changed 只给调用方决定要不要标下游口径卡：改动碰到了某个指标，它又算出来变了或者说不准（推演不了的指标
+    新值不知道）。推演不了的指标 changed 一律为 None，只看它分不出「什么都没改」。
     """
     store = _Store(sources)
     metrics = [m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") is not None]
@@ -182,12 +210,14 @@ def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: 
             raise WhatIfError(f"口径卡中没有指标「{metric}」")
     plans = [_plan(m, store) for m in metrics]
     _check(changes, plans, store, metric=metric)
-    return {"metrics": [_outcome(p, changes, sources) for p in plans], "unsupported": _unsupported(plans)}
+    outcomes = [_outcome(p, changes, sources) for p in plans]
+    return {"metrics": [result for result, _ in outcomes], "unsupported": _unsupported(plans),
+            "maybe_changed": any(moved for _, moved in outcomes)}
 
 
 def recompute(metric: dict[str, Any], changes: Changes, sources: Sources) -> dict[str, Any]:
     """重算一个指标，不管改动碰没碰到它，也不校验改动。核对还原是否忠实时用：什么都不改，重算出来应当和卡上记的一样。"""
-    return _outcome(_plan(metric, _Store(sources)), changes, sources, force=True)
+    return _outcome(_plan(metric, _Store(sources)), changes, sources, force=True)[0]
 
 
 # --------------------------------------------------------------------------
@@ -472,11 +502,17 @@ def _apply(inp: _Input, changes: Changes) -> tuple[Any, list[int] | None, bool]:
         return inp.value, None, False
     if inp.row is not None:
         return (None, [inp.row], False) if inp.row in excluded else (inp.value, None, False)
-    if inp.rows is not None and isinstance(inp.value, list):
+    if inp.rows is not None:
+        # 数组字段只用到快照里的一段行：段外的行排除了也影响不到它
         first, last = inp.rows
         hit = sorted(r for r in excluded if first <= r <= last)
-        kept = [v for k, v in enumerate(inp.value) if first + k not in excluded]
-        return (kept, hit, False) if hit else (inp.value, None, False)
+        if not hit:
+            return inp.value, None, False
+        if not isinstance(inp.value, list):
+            # 完整值找不回来（inp.problem）：用到的行少了，它一定变了，变成什么不知道。照样算碰到了它，指标因这个
+            # 输入还原不了而推演不了（_Plan.blocked），不会拿原值算出一个「无变化」
+            return None, hit, False
+        return [v for k, v in enumerate(inp.value) if first + k not in excluded], hit, False
     if inp.table:
         rows = inp.value["rows"] if isinstance(inp.value, dict) else inp.value
         hit = sorted(r for r in excluded if r < len(rows))
@@ -487,7 +523,9 @@ def _apply(inp: _Input, changes: Changes) -> tuple[Any, list[int] | None, bool]:
     return inp.value, None, False
 
 
-def _outcome(plan: _Plan, changes: Changes, sources: Sources, *, force: bool = False) -> dict[str, Any]:
+def _outcome(plan: _Plan, changes: Changes, sources: Sources, *,
+             force: bool = False) -> tuple[dict[str, Any], bool]:
+    """(这个指标的推演结果, 它会不会因这次改动而变：碰到了它，又算出来变了或者说不准)。"""
     values: dict[str, Any] = {}
     notes: dict[str, list[int]] = {}
     touched = False
@@ -497,18 +535,25 @@ def _outcome(plan: _Plan, changes: Changes, sources: Sources, *, force: bool = F
             notes[path] = excluded
         touched = touched or overridden or bool(excluded)
     doubt = _doubt(plan, changes, sources)
-    # 卡上没记全输入的指标：不知道它用了什么，有任何改动都说不准它变不变
-    touched = touched or (plan.problem is not None and bool(changes.inputs or changes.exclude))
-    if not touched and doubt is None and not force:
-        return _result(plan, "unchanged", plan.metric.get("value"), None, values, notes)
-    status, new, reason = _compute(plan, values, notes, changes, doubt)
-    return _result(plan, status, new, reason, values, notes)
+    # 说不准受不受影响的也算碰到了；卡上没记全输入的指标不知道它用了什么，有任何改动都说不准它变不变
+    touched = touched or doubt is not None or (plan.problem is not None and bool(changes.inputs or changes.exclude))
+    if blocked := plan.blocked:
+        # 整个推演不了：不改动也照实说，不拿原值报「无变化」。碰没碰到它只决定下游要不要标
+        status, reason = blocked
+        result = _result(plan, status, None, reason, values, notes)
+    elif not touched and not force:
+        result = _result(plan, "unchanged", plan.metric.get("value"), None, values, notes)
+    else:
+        status, new, reason = _compute(plan, values, notes, changes, doubt)
+        result = _result(plan, status, new, reason, values, notes)
+    return result, touched and result["changed"] is not False
 
 
 def _doubt(plan: _Plan, changes: Changes, sources: Sources) -> str | None:
     """排除了行，这个指标却有输入说不准受不受影响：返回原因；没排除行、或者输入都对得上号的返回 None。
 
-    对得上号的输入（cell() 那一格、agent 的单格字段和数组字段、整份查询结果）排除行怎么影响它是确定的，_apply 照办。
+    对得上号的输入（cell() 那一格、agent 的单格字段和数组字段、整份查询结果）排除行怎么影响它是确定的，_apply 照办；
+    数组字段的完整值找不回来时也知道它用到哪几行，排除了那几行就算碰到了它（指标因它还原不了而推演不了）。
     别的输入——完整值找不回来的容器、对不上任何快照的容器（加工过的结果）、不是直接取自快照的数（按位置从整份结果里
     取的一格、transform 由查询结果算出来的数）——都可能来自被排除了行的那份结果，又重算不了，只能说不知道，不能拿
     原值算出一个「无变化」或者一个不对应任何一份数据的数。给了新值的以新值为准；写它的节点在那份快照交回之前就跑完了
@@ -536,17 +581,16 @@ def _after(snapshot: str, inp: _Input, sources: Sources) -> bool:
 
 def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]], changes: Changes,
              doubt: str | None) -> tuple[str, Any, str | None]:
-    """(status, 新值, 原因)。还原不了的、遮罩的、排除后缺了的、说不准受不受影响的先说，都没有才求值。"""
-    if plan.problem:
-        return "unsupported", None, plan.problem
-    for path in plan.tops:
-        if plan.inputs[path].problem:
-            return "unsupported", None, f"无法推演：{path}（{plan.inputs[path].problem}）"
-    if any(inp.masked for inp in plan.inputs.values()):
-        return "masked", None, MASKED_METRIC
-    for path, inp in plan.inputs.items():
-        if inp.row is not None and path in notes and path not in changes.inputs:
+    """(status, 新值, 原因)。整个推演不了的（_Plan.blocked）到不了这里。排除后缺了的、说不准受不受影响的先说，
+    都没有才求值。"""
+    hit = [(path, inp) for path, inp in plan.inputs.items() if path in notes and path not in changes.inputs]
+    for path, inp in hit:
+        if inp.row is not None:
             return "excluded", None, f"{EXCLUDED}：{path} 所在的第 {inp.row + 1} 行已排除"
+    for path, inp in hit:
+        if inp.selector:
+            # 嵌在下标、cell() 行列里的容器少了几行：外面那个引用取到的是哪一格跟着变，卡上记的值不再作数
+            return "unsupported", None, DOUBT.format(path=path, why=DOUBT_SELECTOR)
     if doubt:
         return "unsupported", None, doubt
     value, reason = _evaluate(plan, values)
@@ -617,6 +661,7 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
     metric = plan.metric
     old = metric.get("value")
     known = status in _KNOWN
+    blocked = plan.blocked is not None
     delta, rendered_delta = _delta(metric, old, new) if known else (None, None)
     substituted = metric.get("substituted") if status == "unchanged" \
         else substitute(plan.tree, values) if status == "ok" and plan.tree is not None else None
@@ -630,7 +675,7 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
         "rendered_delta": rendered_delta,
         "changed": (not _same(old, new)) if known else None,
         "status": status, "reason": reason, "substituted": substituted,
-        "inputs": [_input_view(inp, values, notes) for inp in plan.inputs.values()],
+        "inputs": [_input_view(inp, values, notes, blocked=blocked) for inp in plan.inputs.values()],
     }
 
 
@@ -686,15 +731,18 @@ def _kind(inp: _Input) -> str:
         else "number" if is_number(value) else "text"
 
 
-def _editable(inp: _Input) -> bool:
-    return inp.shape == "scalar" and not inp.masked and not inp.selector and inp.problem is None \
+def _editable(inp: _Input, *, blocked: bool) -> bool:
+    """推演里能改的输入：数值（或原本缺失）的标量，不是遮罩列、不决定取哪一格、还原得出。整个指标推演不了时一个都不算：
+    改了也推演不出来。"""
+    return not blocked and inp.shape == "scalar" and not inp.masked and not inp.selector and inp.problem is None \
         and (inp.value is None or _number(inp.value))
 
 
 def _row_span(inp: _Input) -> tuple[int, int] | None:
     """这个输入实际用到的快照行（含两端）：单格一行、数组字段一段、整份结果全部。排除别的行影响不到它，界面据此只让
-    这几行可勾。遮罩的、快照读不出来的不给：排除它们的行什么也推演不出来。"""
-    if inp.snapshot is None or inp.masked or inp.unreadable:
+    这几行可勾。遮罩的、还原不了的（完整值找不回来、快照读不出来，都记在 problem 里）不给：排除它们的行什么也推演
+    不出来。"""
+    if inp.snapshot is None or inp.masked or inp.problem is not None:
         return None
     if inp.row is not None:
         return inp.row, inp.row
@@ -704,16 +752,16 @@ def _row_span(inp: _Input) -> tuple[int, int] | None:
     return (0, len(rows) - 1) if inp.table and isinstance(rows, list) and rows else None
 
 
-def _input_view(inp: _Input, values: dict[str, Any], notes: dict[str, list[int]]) -> dict[str, Any]:
+def _input_view(inp: _Input, values: dict[str, Any], notes: dict[str, list[int]], *, blocked: bool) -> dict[str, Any]:
     """一个输入在推演里的样子：原值、新值、排除了哪几行、用到快照的哪几行（row_span）。遮罩列取来的、落在读不出来的
-    快照上的不给值。容器写大概（「[12 项]」）。"""
+    快照上的不给值。容器写大概（「[12 项]」）。整个指标推演不了时（blocked）一个都不让改、不给行段。"""
     item = inp.item
-    span = _row_span(inp)
+    span = None if blocked else _row_span(inp)
     view: dict[str, Any] = {"path": inp.path, "via": item.get("via"), "node_id": item.get("node_id"),
                             **({"artifact": inp.snapshot} if inp.snapshot else {}),
                             **({"locator": item["locator"]} if isinstance(item.get("locator"), dict) else {}),
                             **({"row_span": list(span)} if span else {}),
-                            "kind": _kind(inp), "editable": _editable(inp)}
+                            "kind": _kind(inp), "editable": _editable(inp, blocked=blocked)}
     if inp.masked:
         return {**view, "old": None, "new": None, "changed": False, "masked": True}
     if inp.unreadable and inp.shape == "scalar":
@@ -721,7 +769,8 @@ def _input_view(inp: _Input, values: dict[str, Any], notes: dict[str, list[int]]
     if inp.shape == "container":
         old = _outline(inp.value, inp.table) if inp.problem is None else item.get("value")
         new = _outline(values.get(inp.path), inp.table) if inp.problem is None else None
-        changed = inp.problem is None and not _same(old, new)
+        # 完整值找不回来的数组排除了它用到的行：少了几项是确定的，只是新的样子不知道（new 为空）
+        changed = not _same(old, new) if inp.problem is None else inp.path in notes
     else:
         old, new = _finite(item.get("value")), _finite(values.get(inp.path))
         changed = not _same(old, new)
@@ -740,14 +789,20 @@ def _outline(value: Any, table: bool) -> Any:
 
 def _unsupported(plans: list[_Plan]) -> list[dict[str, Any]]:
     """不能用于推演的输入和原因：遮罩的、完整值找不回来的（含快照读不出来的）、决定取哪一格的、既不能改也没有行可勾的。
-    卡本身没记输入的，整个指标一条。"""
+
+    整个指标推演不了的（_Plan.blocked）先有一条 input 为空的，原因和指标上的一样：界面据此只写原因，不画输入框、
+    勾选框。之后只列卡住它的输入（遮罩的、还原不了的），别的输入能不能改已无从谈起；卡本身没记输入的只有这一条。
+    """
     out: list[dict[str, Any]] = []
     for plan in plans:
         metric_id = plan.metric.get("id")
+        if blocked := plan.blocked:
+            out.append({"metric": metric_id, "input": None, "reason": blocked[1]})
         if plan.problem:
-            out.append({"metric": metric_id, "input": None, "reason": plan.problem})
             continue
         for inp in plan.inputs.values():
+            if blocked and not (inp.masked or inp.problem):
+                continue
             reason = (MASKED_TABLE if inp.table else MASKED_INPUT) if inp.masked \
                 else f"无法推演：{inp.problem}" if inp.problem \
                 else SELECTOR if inp.selector else _fixed(inp)

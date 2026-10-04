@@ -85,3 +85,6 @@ def test_a_snapshot_counts_as_returned_the_first_time_it_shows_up():
     assert _returned(sealed(LOOP)) == {Q1: 2}
     merged_only = [(3, "node.finished", "merged", {"artifact": OUT1, "evidence": [{"kind": "query", "artifact": Q1}]})]
     assert _returned(sealed(merged_only)) == {Q1: 3}
+    # 同一条查询又跑了一次（结果一样，工件 id 也一样）：仍按第一次交回算，第一次之后算出来的值都可能受影响
+    again = [(2, "tool.end", "fill", {"query_artifact": Q1}), (6, "tool.end", "fill", {"query_artifact": Q1})]
+    assert _returned(sealed(again)) == {Q1: 2}

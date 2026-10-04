@@ -361,13 +361,54 @@ async def test_masked_columns_are_neither_shown_nor_used(client, monkeypatch, sh
     assert metrics["amount5"]["substituted"] is None and metrics["per"]["substituted"] is None
     reasons = {(u["metric"], u["input"]): u["reason"] for u in body["unsupported"]}
     assert "遮罩" in reasons[("amount5", AMOUNT5)] and "遮罩" in reasons[("cnt", "vars.res.rows")]
+    # 三个指标都用到了遮罩列：不改动也照实说推演不了，不报「无变化」；什么都没改，下游不受影响
+    assert {k: (m["status"], m["changed"], m["rendered_new"]) for k, m in metrics.items()} == {
+        k: ("masked", None, None) for k in ("amount5", "cnt", "per")}
+    assert all(reasons[(k, None)] == metrics[k]["reason"] for k in metrics) and body["affected_cards"] == []
 
     resp = await client.post(f"/api/runs/{row.id}/evidence/whatif",
                              json={"card": "card", "overrides": {"inputs": {AMOUNT5: 1}}})
     assert resp.status_code == 422 and "遮罩" in resp.json()["detail"]
     metrics = by_id(await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [1]}}}))
     assert metrics["cnt"]["status"] == "masked" and metrics["cnt"]["new"] is None
-    assert metrics["per"]["status"] == "masked" and metrics["amount5"]["status"] == "unchanged"
+    assert metrics["per"]["status"] == "masked" and metrics["amount5"]["status"] == "masked"
+
+
+async def test_a_metric_using_a_masked_column_offers_nothing_to_adjust(client, monkeypatch, shop):
+    """指标的一个输入取自遮罩列，另一个是能改的格：整个指标推演不了，那一格也不让改、它那一行也不让勾。
+    改了也只回「用到了遮罩列」，不给新值。"""
+    await set_source(shop, {"mask_columns": ["region"]})
+    region = "cell(nodes.fetch, 5, 'region')"
+    metrics = [{"id": "mix", "name": "混合", "decimals": 1, "expression": f"len({region}) + {AMOUNT5}"}]
+    row = await run_graph(monkeypatch, query_graph(metrics=metrics), text="混合 [[m:mix]]。")
+    body = await whatif(client, row.id, {"card": "card", "metric": "mix", "report": "write"})
+    [mix] = body["metrics"]
+    assert (mix["status"], mix["changed"], mix["rendered_new"]) == ("masked", None, None) and "遮罩" in mix["reason"]
+    inputs = {i["path"]: i for i in mix["inputs"]}
+    assert inputs[region]["masked"] is True and inputs[AMOUNT5]["old"] == 600.5
+    assert all(i["editable"] is False and "row_span" not in i for i in inputs.values())
+    assert {"metric": "mix", "input": None, "reason": mix["reason"]} in body["unsupported"]
+    [seg] = body["segments"]
+    assert seg["rendered_new"] is None and seg["changed"] is None and body["affected_cards"] == []
+    [mix] = (await whatif(client, row.id, {"card": "card", "metric": "mix",
+                                           "overrides": {"inputs": {AMOUNT5: 1}}}))["metrics"]
+    assert (mix["status"], mix["new"], mix["changed"]) == ("masked", None, None)
+
+
+async def test_masks_recorded_at_query_time_apply_after_the_source_drops_them(client, monkeypatch, shop):
+    """查询当时设了遮罩、跑完之后数据源去掉了：快照里记下的遮罩照样算，推演和勾行接口都不给那一列。"""
+    await set_source(shop, {"mask_columns": ["amount"]})
+    row = await run_graph(monkeypatch, query_graph())
+    snapshot = await snapshot_of(row.id)
+    await set_source(shop, {})
+    body = await whatif(client, row.id, {"card": "card"})
+    [cell] = by_id(body)["amount5"]["inputs"]
+    assert cell["masked"] is True and cell["old"] is None and cell["editable"] is False
+    assert by_id(body)["amount5"]["status"] == "masked"
+    assert "600.5" not in json.dumps([m["inputs"] for m in body["metrics"]])
+    url = f"/api/runs/{row.id}/evidence/whatif/rows"
+    page = (await client.get(url, params={"artifact": snapshot, "limit": 2})).json()
+    assert page["masked"] == ["amount"] and page["rows"] == [[1, "华南", "已遮罩"], [2, "华北", "已遮罩"]]
 
 
 async def test_a_run_waiting_for_approval_can_be_explored_but_is_not_sealed(client, monkeypatch):
@@ -469,6 +510,35 @@ async def test_agent_array_fields_follow_the_excluded_rows(client, monkeypatch):
         assert metric["status"] == "ok" and metric["new"] == round(weeks["2026-W37"], 1), metric
         [amounts] = metric["inputs"]
         assert amounts["excluded_rows"] == [0] and (amounts["old"], amounts["new"]) == ("[2 项]", "[1 项]")
+
+
+async def test_an_agent_array_whose_node_output_is_gone_is_never_unchanged(client, monkeypatch, damage):
+    """agent 节点封存的产出文件不在了：nodes.bot.data.amounts 的完整值找不回来。排除它用到的一行，它一定少了一项，
+    少的是多少不知道——不能报「无变化」，也不给行段让人勾。vars.kpi.amounts 另存过完整值，照常推演。"""
+    AgentScript(monkeypatch)
+    schema = {"type": "object", "properties": {"amounts": {"type": "array", "items": {"type": "number"}}}}
+    row = await wait((await run_manager.start(graph=chain(
+        node("start", "input"),
+        node("bot", "agent", prompt="按周汇总金额", tools=["db_query__shop"], approval="never",
+             output_schema=schema, cite_fields=True, assign_to="kpi"),
+        node("card", "metrics", caliber="推演口径", metrics=[
+            {"id": "via_node", "name": "合计", "decimals": 1, "expression": "sum(nodes.bot.data.amounts)"},
+            {"id": "via_vars", "name": "合计", "decimals": 1, "expression": "sum(vars.kpi.amounts)"}]),
+        node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.text }}"}])), input_payload={})).id)
+    assert row.status == "succeeded", row.error
+    snapshot = await snapshot_of(row.id, "bot")
+    async with SessionLocal() as session:
+        [finished] = (await session.execute(select(RunEvent).where(
+            RunEvent.run_id == row.id, RunEvent.type == "node.finished", RunEvent.node_id == "bot"))).scalars()
+    damage(finished.data["artifact"])
+
+    baseline = by_id(await whatif(client, row.id, {"card": "card"}))
+    assert baseline["via_node"]["status"] == "unsupported" and "bot" in baseline["via_node"]["reason"]
+    assert all(i["editable"] is False and "row_span" not in i for i in baseline["via_node"]["inputs"])
+    body = await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [0]}}})
+    via_node, via_vars = by_id(body)["via_node"], by_id(body)["via_vars"]
+    assert via_node["status"] == "unsupported" and via_node["changed"] is None and via_node["rendered_new"] is None
+    assert via_vars["status"] == "ok" and via_vars["new"] == round(sum(a for i, _, a in ROWS if i > 3), 1)
 
 
 # --------------------------------------------------------------------------
@@ -806,6 +876,15 @@ async def test_downstream_cards_are_flagged_when_the_change_cannot_be_followed(c
     body = await whatif(client, row.id, {"card": "card", "metric": "per", "overrides": {"inputs": {AMOUNT5: 1000}}})
     assert body["metrics"][0]["status"] == "unsupported"
     assert [c["node_id"] for c in body["affected_cards"]] == ["yearly"]
+    # 什么都不改：平均每单本来就推演不了（vars.res.rows 没存完整值），一打开就照实说；那一格也不让改、它那一行
+    # 也不让勾，报告里引用它的地方不说「不受影响」。什么都没改，下游不会受影响
+    body = await whatif(client, row.id, {"card": "card", "metric": "per", "report": "write"})
+    [per] = body["metrics"]
+    assert (per["status"], per["changed"], per["rendered_new"]) == ("unsupported", None, None)
+    assert "vars.res.rows" in per["reason"] and "完整值" in per["reason"]
+    assert all(i["editable"] is False and "row_span" not in i for i in per["inputs"])
+    assert [(s["metric"], s["rendered_new"], s["changed"]) for s in body["segments"]] == [("per", None, None)]
+    assert body["affected_cards"] == []
 
 
 TRICKY = [(2.675, 2), (0.125, 2), (-1.5, 0), (1234.5, -1), (-1250.0, -2), (0.0005, 3), (99.995, 2), (-0.045, 2)]

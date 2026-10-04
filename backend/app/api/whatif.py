@@ -89,8 +89,9 @@ async def evidence_whatif(run_id: str, payload: Any = Body(None)) -> dict[str, A
         result, segments = await asyncio.to_thread(_compute, card, changes, sources, metric, docs, card_node, artifact)
     except recompute.WhatIfError as e:
         raise CodedHTTPException(422, str(e), BAD_INPUT) from None
-    # 改动可能改变了某个指标——算出来变了，或者碰到了它却推演不了（还原不了、遮罩），新值不知道——下游才可能受影响
-    maybe = any(m.get("changed") is not False for m in result["metrics"])
+    # 改动可能改变了某个指标——算出来变了，或者碰到了它却推演不了（还原不了、遮罩），新值不知道——下游才可能受影响。
+    # 不能只看 changed：整个推演不了的指标 changed 一律为空，什么都没改时也一样（recompute.whatif 的 maybe_changed）
+    maybe = result["maybe_changed"]
     edges = [(e.get("source"), e.get("target")) for e in sealed.graph.get("edges") or [] if isinstance(e, dict)]
     return {
         "run_id": run_id,
