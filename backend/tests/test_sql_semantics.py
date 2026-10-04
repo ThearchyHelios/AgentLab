@@ -116,7 +116,7 @@ def test_tables_are_the_real_tables_without_cte_names():
 def test_joins_carry_kind_both_sides_and_a_normalized_condition():
     f = facets("SELECT o.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id AND r.state = 'done'")
     [join] = f.joins
-    assert join.kind == "left" and join.table.text == "refunds"
+    assert join.kind == "left" and join.table.text == "refunds" and join.other == ("orders",)
     # 别名换成真实表名，两边排好顺序，几个条件按 key 排序后用 AND 连起来
     assert join.on.text == "orders.id = refunds.order_id AND refunds.state = 'done'"
     same = facets("SELECT orders.id FROM orders LEFT OUTER JOIN refunds ON refunds.state = 'done' "
@@ -128,6 +128,9 @@ def test_a_comma_join_is_the_same_as_an_inner_join():
     comma = facets("SELECT a.x FROM orders a, stores b WHERE a.store_id = b.id AND b.city = '虚构市'")
     inner = facets("SELECT orders.x FROM orders JOIN stores ON stores.id = orders.store_id WHERE stores.city = '虚构市'")
     assert comma.joins == inner.joins and comma.joins[0].kind == "inner"
+    assert comma.joins[0].table.text == "stores" and comma.joins[0].other == ("orders",)
+    cross = facets("SELECT 1 FROM orders o CROSS JOIN stores s")
+    assert (cross.joins[0].kind, cross.joins[0].on, cross.joins[0].other) == ("cross", None, ("orders",))
     assert [p.key for p in comma.where] == [p.key for p in inner.where] == ["stores.city = '虚构市'"]
 
 

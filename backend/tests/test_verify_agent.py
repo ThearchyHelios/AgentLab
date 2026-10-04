@@ -212,7 +212,8 @@ async def test_writes_are_refused_on_a_writable_source(monkeypatch, shop):
     script = Script(monkeypatch, [q(name, "DELETE FROM orders WHERE is_deleted = 1", "w1"),
                                   q(name, "WITH k AS (SELECT 1) UPDATE orders SET amount = 0", "w2"),
                                   q(name, VALID_SUM, "c1")],
-                    {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "见 [[see:Q1]]。"})
+                    {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致",
+                     "rationale": "见 [[see:Q1]]。"})
     out = await run(name)
     seen = script.tool_results()
     assert seen["w1"].startswith("SQL 被拒绝：") and seen["w2"].startswith("SQL 被拒绝：")

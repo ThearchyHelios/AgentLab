@@ -217,12 +217,14 @@ class Part:
 
 @dataclass(frozen=True)
 class JoinFacet:
-    """一次连接。kind：inner / left / right / full / cross / semi / anti / natural。on 是关联条件的合取式排好序后
-    用 AND 连起来的写法，没有条件是 None。"""
+    """一次连接。kind：inner / left / right / full / cross / semi / anti / natural。table 是关联进来的那一侧，other
+    是另一侧：关联条件里出现的别的表（给人看的真实表名）；没有条件的（CROSS JOIN）是在它之前出现的各个来源。on 是
+    关联条件的合取式排好序后用 AND 连起来的写法，没有条件是 None。"""
 
     kind: str
     table: Part
     on: Part | None = None
+    other: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -688,7 +690,8 @@ class _Statement:
                 conds = [self.canonical(exp.EQ(this=exp.column(ident.name, table=first_alias),
                                                expression=exp.column(ident.name, table=alias)), sources)
                          for ident in join.args["using"]]
-            drafts.append({"kind": _join_kind(join), "slot": slot, "source": sources.get(slot), "conds": conds})
+            drafts.append({"kind": _join_kind(join), "slot": slot, "source": sources.get(slot), "conds": conds,
+                           "before": [s.name for key, s in list(sources.items())[:i + 1] if key != slot]})
         return drafts
 
     def _joins_on_where(self, cond: Any, sources: dict[str, _Source], drafts: list[dict[str, Any]]) -> bool:
@@ -720,7 +723,10 @@ class _Statement:
         on = Part(key=" AND ".join(t[0] for t in triples), text=" AND ".join(t[2] for t in triples),
                   loose=" AND ".join(sorted(t[1] for t in triples)), full=" AND ".join(t[2] for t in triples)) \
             if triples else None
-        return JoinFacet(kind=draft["kind"], table=table, on=on)
+        mentioned = {table for c in draft["conds"] for table, _ in self.part(c, sources).columns}
+        other = [name for name in dict.fromkeys(t for t in mentioned if t) if name != table.text] if draft["conds"] \
+            else draft["before"]
+        return JoinFacet(kind=draft["kind"], table=table, on=on, other=tuple(sorted(other)))
 
     def _time(self, cond: Any, sources: dict[str, _Source]) -> TimePredicate | None:
         """时间条件：一边恰好一列（可以套着日期函数、CAST），另一边没有列；列名像日期，或者用了日期函数、像日期的字符串。"""

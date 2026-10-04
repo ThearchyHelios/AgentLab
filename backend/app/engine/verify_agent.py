@@ -323,12 +323,13 @@ def _text_of(messages: list[BaseMessage]) -> str:
                      for m in messages)
 
 
-def _final_messages(system: str, task: str, queries: list[dict[str, Any]], said: str, stopped: str | None
+def _final_messages(system: str, task: str, queries: list[dict[str, Any]], said: str, limit_words: str | None
                     ) -> list[BaseMessage]:
-    """收尾那次调用的消息：任务、查到的结果（每次查询列出行号）、模型最后说的话，以及交结果的规则。"""
+    """收尾那次调用的消息：任务、查到的结果（每次查询列出行号）、模型最后说的话，以及交结果的规则。
+    limit_words：触顶时是哪个上限（「最多查询 6 次」），告诉模型为什么不能再查。"""
     parts = [f"任务：\n{task.strip()}"]
-    if stopped:
-        parts.append(f"已达上限（{stopped}），不能再查询，按已经查到的结果交结果。")
+    if limit_words:
+        parts.append(f"已达上限（{limit_words}），不能再查询，按已经查到的结果交结果。")
     parts.append(f"你查到的结果：\n{_digest(queries) if queries else '（没有成功的查询）'}")
     parts.append(f"你最后的说明（只作参考，数以查询结果为准）：\n{said.strip() or '（没有）'}")
     parts.append(VERIFY_FINAL_PROMPT)
@@ -541,7 +542,12 @@ async def run_verify_agent(
         await _announce(emit, EventType.LOG, level="warn", code="verify_limit", limit=stopped,
                         message=f"核查已达上限（{words}），已停止查询，按已有结果收尾")
 
-    # ---- 收尾：按结构交结果
+    # ---- 收尾：按结构交结果。关掉 thinking：结构化输出靠强制工具调用，和思考模式不兼容
+    try:
+        async with SessionLocal() as session:
+            settler, _ = await get_chat_model(session, spec.model_copy(update={"thinking": "off"}))
+    except Exception as e:  # noqa: BLE001
+        return outcome(model=model_id, limit=stopped, answered=answered, error=f"核查模型不可用（{describe_exception(e)}）")
     schema = result_schema(output_schema)
     final = _final_messages(head, task, queries, said, words)
     estimate = budget.estimate(_text_of(final), _OUT_FINAL)
@@ -554,12 +560,6 @@ async def run_verify_agent(
     remaining = left()
     grace = None if remaining is None else max(remaining, SETTLE_GRACE_S)
     finish = None if grace is None else time.monotonic() + grace
-    try:
-        async with SessionLocal() as session:
-            settler, _ = await get_chat_model(session, spec.model_copy(update={"thinking": "off"}))
-    except Exception as e:  # noqa: BLE001
-        await spend.settle(day or "", -estimate)
-        return outcome(model=model_id, limit=stopped, answered=answered, error=f"核查模型不可用（{describe_exception(e)}）")
 
     def until_finish() -> float | None:
         return None if finish is None else finish - time.monotonic()
