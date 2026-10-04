@@ -72,6 +72,15 @@ DOC_SCHEMA = "agentlab.report/1"
 #: 和记下的状态对不上，会被当成文档被改过（state_mismatch）。
 ENTITY_SYNTAX = 2
 ENTITY_SYNTAXES = frozenset({1, 2})
+#: 单元格显示规则的版本（文档顶层 cell_display）：
+#: - 1：照快照里的原样显示，ISO 日期时间带 T（2026-06-30T08:21:39）。没有这个字段的老文档按它复核
+#: - 2：ISO 日期时间显示成「2026-06-30 08:21:39」（小数秒、时区照留）。只改显示：快照里的值、引用记下的 value、
+#:   eid、证据下钻都不变
+#: 新组装的文档里真有日期时间被改写时才记 cell_display: 2（参与内容哈希），没有的文档和以前一字不差。复核必须按
+#: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
+CELL_DISPLAY = 2
+CELL_DISPLAYS = frozenset({1, 2})
+_ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
 # --------------------------------------------------------------------------
@@ -1273,7 +1282,8 @@ class _Snapshots:
     compose / verify / 流式渲染里：出口复核是另一次调用，照样重新取、重新验。
     """
 
-    def __init__(self, loader: Loader | None = None, *, entities: bool = True, syntax: int | None = None) -> None:
+    def __init__(self, loader: Loader | None = None, *, entities: bool = True, syntax: int | None = None,
+                 display: int | None = None) -> None:
         self.loader = loader or load_artifact
         self.memo: dict[str, tuple[Any, str | None]] = {}
         self._index: tuple[dict[str, Any], _EntityIndex] | None = None
@@ -1281,6 +1291,17 @@ class _Snapshots:
         self.entities_on = entities
         #: 这一次解析按哪一版实体语法：组装、流式渲染用当前版，复核按文档记下的版本（verify_doc）
         self.syntax = ENTITY_SYNTAX if syntax is None else syntax
+        #: 单元格按哪一版显示规则渲染（CELL_DISPLAY）：组装、流式渲染用当前版，复核按文档记下的版本
+        self.display = CELL_DISPLAY if display is None else display
+        #: 这一次解析里有没有哪一格因为显示规则改了写法：组装时据此决定文档记不记 cell_display
+        self.reformatted = False
+
+    def shown(self, raw: Any) -> Any:
+        """按显示规则要显示的原值：2 版起 ISO 日期时间的 T 换成空格。没改就是原值本身。"""
+        if self.display >= 2 and isinstance(raw, str) and (m := _ISO_DATETIME.match(raw.strip())):
+            self.reformatted = True
+            return f"{m.group(1)} {m.group(2)}"
+        return raw
 
     def entities(self, catalog: dict[str, Any]) -> _EntityIndex:
         if self._index is None or self._index[0] is not catalog:
@@ -1289,11 +1310,12 @@ class _Snapshots:
             self._index = (catalog, _EntityIndex(shown, syntax=self.syntax))
         return self._index[1]
 
-    def with_syntax(self, syntax: int) -> "_Snapshots":
-        """换一版实体语法的同一次解析。取过的快照共用：快照内容和语法版本无关，不必再取、再验一遍。"""
-        if syntax == self.syntax:
+    def with_syntax(self, syntax: int, display: int | None = None) -> "_Snapshots":
+        """换一版实体语法（和单元格显示规则）的同一次解析。取过的快照共用：快照内容和版本无关，不必再取、再验一遍。"""
+        display = self.display if display is None else display
+        if syntax == self.syntax and display == self.display:
             return self
-        twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax)
+        twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax, display=display)
         twin.memo = self.memo
         return twin
 
@@ -1339,11 +1361,11 @@ class _Snapshots:
 
 
 def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True,
-               syntax: int | None = None) -> _Snapshots:
-    """loader 已经是 _Snapshots 时沿用它（entities 不看）；给了 syntax 就换成那一版。"""
+               syntax: int | None = None, display: int | None = None) -> _Snapshots:
+    """loader 已经是 _Snapshots 时沿用它（entities 不看）；给了 syntax、display 就换成那一版。"""
     if isinstance(loader, _Snapshots):
-        return loader if syntax is None else loader.with_syntax(syntax)
-    return _Snapshots(loader, entities=entities, syntax=syntax)
+        return loader if syntax is None and display is None else loader.with_syntax(syntax or loader.syntax, display)
+    return _Snapshots(loader, entities=entities, syntax=syntax, display=display)
 
 
 _CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
@@ -1393,7 +1415,7 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
     try:
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
-        rendered = render_cell(raw, conv, kind=kind)
+        rendered = render_cell(snaps.shown(raw), conv, kind=kind)
     except CellError as e:
         return _unresolved(marker, alias, "cell", f"{alias} {e}")
     except RenderError as e:
@@ -2630,8 +2652,10 @@ def compose_doc(
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
+    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，复核照它渲染；没有的文档和以前一字不差
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
+        **({"cell_display": snaps.display} if snaps.reformatted and snaps.display != 1 else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
@@ -2785,7 +2809,8 @@ def verify_doc(
     有知识库检索时才有（它们才可能不是 0）：升级前的运行统计的键和以前一模一样。
     """
     entity_syntax = doc_entity_syntax(doc)
-    snaps = _snapshots(loader, entities=entities, syntax=entity_syntax or ENTITY_SYNTAX)
+    display = doc_cell_display(doc)
+    snaps = _snapshots(loader, entities=entities, syntax=entity_syntax or ENTITY_SYNTAX, display=display or CELL_DISPLAY)
     index = snaps.entities(catalog)
     violations: list[dict[str, Any]] = []
     uncited: list[dict[str, Any]] = []
@@ -2803,6 +2828,8 @@ def verify_doc(
     if entity_syntax is None:
         violations.append(_violation("bad_schema",
                                      f"报告文档记录的表名、字段名规则版本「{doc.get('entity_syntax')}」无法识别"))
+    if display is None:
+        violations.append(_violation("bad_schema", f"报告文档记录的单元格显示规则版本「{doc.get('cell_display')}」无法识别"))
 
     markdown = str(doc.get("markdown") or "")
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
@@ -2947,6 +2974,13 @@ def verify_doc(
         stats["unverified_entities"] = sum(1 for v in violations if v["code"] == "unverified_entity")
     stats["violations"] = len(violations)
     return {"ok": not violations, "violations": violations, "stats": stats, "uncited": uncited}
+
+
+def doc_cell_display(doc: Any) -> int | None:
+    """文档按哪一版单元格显示规则组装：没有 cell_display 字段的是 1 版（老文档、没有日期时间被改写的文档），
+    记了认不出的值返回 None。"""
+    raw = doc.get("cell_display", 1) if isinstance(doc, dict) else 1
+    return raw if type(raw) is int and raw in CELL_DISPLAYS else None
 
 
 def doc_entity_syntax(doc: Any) -> int | None:
@@ -3182,7 +3216,7 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
             try:
                 raw, _ = locate_cell(snapshot, r, c)
                 kind = column_kind(snapshot, c)
-                shown, numeric = render_cell(raw, kind=kind), is_number(cell_value(raw, kind))
+                shown, numeric = render_cell(snaps.shown(raw), kind=kind), is_number(cell_value(raw, kind))
             except (CellError, RenderError):
                 shown, numeric = MISSING, False
             cells.append(f"{c}={shown}")
@@ -3327,7 +3361,7 @@ def _field_prompt(path: str, value: Any, ev: dict[str, Any], aliases: dict[str, 
         if why:
             raise CellError(why)
         raw, column = locate_cell(snapshot, row, column)
-        shown = render_cell(raw, kind=column_kind(snapshot, column))
+        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column))
     except (CellError, RenderError):
         try:
             shown = render_cell(value)
