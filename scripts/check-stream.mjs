@@ -774,12 +774,24 @@ await section('参考了哪些表：画布右栏和问数据页（context 操作
     && expanded.includes('channel_visits') && expanded.includes('「shop」全部 2 张表'), expanded.slice(0, 160))
   const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('展开后不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
+  check('有数据目录的大库：不提示起草目录', await row.locator('[data-step-next]').count() === 0
+    && await row.locator('[data-fix="catalog"]').count() === 0)
   check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
   await c.page.close()
 
   const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-fallback' })
   const fb = f.page.locator('[data-step-code="copilot_context"]')
   check('挑表失败：写明只给了表名', await fb.count() === 1 && (await fb.innerText()).includes('未能按需求挑选，已提供全部表名'))
+  // 真实运行里数据源一张目录都没有：这一行下面常显下一步，入口去那个源的目录页
+  const hint = fb.locator('[data-step-next]')
+  check('没有数据目录的大库：常显「还没有数据目录」，不收进展开区', await hint.count() === 1
+    && (await hint.innerText()).includes('这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准'),
+    await hint.count() ? await hint.innerText() : '没有这一句')
+  const go = fb.locator('a[data-fix="catalog"]')
+  check('……附去数据目录页的入口', await go.count() === 1 && await go.getAttribute('href') === '/data/catalog/src-scenic'
+    && (await go.innerText()).includes('去数据目录起草'), await go.count() ? await go.getAttribute('href') : '没有入口')
+  const narrow = await f.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('……不撑破 380px 窄栏', narrow <= 0, `${narrow}px`)
   await fb.locator('button').first().click()
   await f.page.waitForTimeout(150)
   check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))

@@ -487,8 +487,10 @@ async function fakeApi(route) {
     const ops = [
       { op: 'heartbeat', phase: 'planning', elapsed_ms: 800 },
       // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
+      // 这个库还没有数据目录（catalog_tables: 0）：那一行下面提示先去起草目录
       { op: 'context', elapsed_ms: 1200, sources: [
-        { source: 'shop', tables: ['orders', 'order_items'], selected_by: 'model', total: 48 }] },
+        { source: 'shop', source_id: 'src-shop', tables: ['orders', 'order_items'], selected_by: 'model', total: 48,
+          catalog_tables: 0 }] },
       { op: 'plan', summary: '查一下再回答' },
       ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
       { op: 'done', explanation: '一张三步的图' },
@@ -1069,6 +1071,13 @@ for (const theme of THEMES) {
     await ctxRow.locator('button').first().click()
     check('再点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 2 张：orders、order_items')
       .waitFor({ timeout: 3000 }).then(() => true, () => false))
+    // 真实运行里数据源一张目录都没有，挑表和 SQL 检查都用不上目录：这一行下面提示起草，并给去目录页的入口
+    const noCatalog = ctxRow.locator('[data-step-next]')
+    check('没有数据目录的大库：提示先起草目录', await noCatalog.count() === 1
+      && (await noCatalog.innerText()).includes('这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准'),
+      await noCatalog.count() ? await noCatalog.innerText() : '没有这一句')
+    check('……入口直达这个数据源的目录页', await ctxRow.locator('a[data-fix="catalog"]').getAttribute('href').catch(() => null)
+      === '/data/catalog/src-shop')
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

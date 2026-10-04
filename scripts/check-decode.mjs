@@ -682,6 +682,28 @@ await section('Copilot：这一轮参考了哪些表（context 操作）', async
   check('挑表失败：原因和库的规模放在展开区', !!fb?.detail?.includes('原因：挑选数据表超过 20 秒未完成')
     && fb.detail.includes('「scenic」共 51 张表'), fb?.detail)
   check('挑表失败也说等了多久', fb?.ms === 20004, String(fb?.ms))
+  // 真实运行里数据源一张目录都没有，挑表、SQL 检查都用不上目录，用户也不知道该先去起草
+  check('没有数据目录的大库：下一步提示起草目录，入口直达那个源的目录页',
+    fb?.next === '这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准' && fb?.fix === 'catalog'
+    && fb?.fixTo === '/data/catalog/src-scenic', JSON.stringify({ next: fb?.next, fix: fb?.fix, fixTo: fb?.fixTo }))
+  check('有目录的大库、没有目录的小库：不提示', !row?.next && !row?.fix && !row?.fixTo, JSON.stringify({ next: row?.next }))
+  const bare = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 0 },
+    { source: 'b', source_id: 'id-b', tables: ['y'], selected_by: 'all', total: 3, catalog_tables: 0 },
+    { source: 'c', source_id: 'id c', tables: [], selected_by: 'fallback', total: 90, catalog_tables: 0, reason: 'r' }] })
+  check('几个数据源：点名没有目录的大库，入口去第一个', bare?.next === '「a」「c」还没有数据目录，起草后挑表和 SQL 检查会更准'
+    && bare?.fixTo === '/data/catalog/id-a', JSON.stringify({ next: bare?.next, fixTo: bare?.fixTo }))
+  const partly = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 3 }] })
+  check('起草过一部分目录：不再提示', !partly?.next, partly?.next)
+  const old = mod.copilotContext({ op: 'context', sources: [{ source: 'a', tables: ['x'], selected_by: 'model', total: 60 }] })
+  check('老服务端不给目录表数：不猜，不提示', !old?.next && !old?.fixTo, old?.next)
+  const noId = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] })
+  check('没给数据源 id：照样提示，只是不给入口', !!noId?.next && !noId?.fixTo, JSON.stringify(noId))
+  const step = mod.decodeCopilot([{ op: 'context', sources: [
+    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] }]).find((s) => s.code === 'copilot_context')
+  check('没有入口时不带 fix：不画一个点了没处去的按钮', !!step?.next && !step?.fix, JSON.stringify(step))
 
   const seeded = mod.copilotContext({ op: 'context', sources: [
     { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })

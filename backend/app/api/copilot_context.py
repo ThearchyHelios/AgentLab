@@ -214,6 +214,11 @@ class SourcePlan:
         """给模型看的目录：去掉驳回项。"""
         return {t: catalog.visible_notes(n) for t, n in self.raw_notes.items()}
 
+    @property
+    def catalog_tables(self) -> int:
+        """有数据目录的表数：去掉驳回项之后还有内容的。整份被驳回的不算——挑表、SQL 检查都用不上它。"""
+        return sum(1 for n in self.raw_notes.values() if catalog.visible_notes(n))
+
 
 def _modes(sources: list[Any]) -> list[Literal["all", "pick"]]:
     """每个源给详细摘要还是先挑表。
@@ -565,16 +570,20 @@ class DatasourceContext:
     def op(self) -> dict[str, Any] | None:
         """告诉前端这一轮参考了哪些表：{"op": "context", "sources": [...], "elapsed_ms"?}。没有可查的表时为 None。
 
-        每个源一项：source 源名，tables 给了全字段的表（全名），selected_by，total 这个源一共几张表（表结构缓存里
-        记的真实总数）；探查截断了的再带 explored（探查到几张），界面写「共 N 张，只探查了 200 张」；挑表失败的
-        带上 reason。只列了名字的表不进 tables：界面上说的「参考了 N 张表」是模型看得到字段的那些。
+        每个源一项：source 源名，source_id 源的 id（界面据此给去数据目录页的入口），tables 给了全字段的表（全名），
+        selected_by，total 这个源一共几张表（表结构缓存里记的真实总数），catalog_tables 有数据目录的表数（没有目录的
+        大库，界面提示先去起草目录：挑表和 SQL 检查都靠它）；探查截断了的再带 explored（探查到几张），界面写「共 N 张，
+        只探查了 200 张」；挑表失败的带上 reason。只列了名字的表不进 tables：界面上说的「参考了 N 张表」是模型看得到
+        字段的那些。
         """
         rows = []
         for s in self.sources:
             if not s.explored:
                 continue
-            row: dict[str, Any] = {"source": s.source.name, "tables": [s.qualified(t) for t in s.tables],
-                                   "selected_by": s.selected_by, "total": s.total}
+            row: dict[str, Any] = {"source": s.source.name, "source_id": getattr(s.source, "id", None),
+                                   "tables": [s.qualified(t) for t in s.tables],
+                                   "selected_by": s.selected_by, "total": s.total,
+                                   "catalog_tables": s.plan.catalog_tables}
             if s.plan.unexplored:
                 row["explored"] = s.explored
             if s.selected_by == "fallback" and self.reason:

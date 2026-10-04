@@ -2657,4 +2657,7 @@ export const COPILOT_CONTEXT_TEXT = {
   withFields: (n: number) => `参考了 ${formatNumber(n)} 张表的字段`,
   namesOnly: (n: number) => `另有 ${formatNumber(n)} 张表只提供了表名`,
   notPicked: '未能按需求挑选',
+  /** 没有数据目录的大库：只有一个数据源时说「这个数据源」，几个时点名 */
+  noCatalog: (who: string | null) => `${who ?? '这个数据源'}还没有数据目录，起草后挑表和 SQL 检查会更准`,
+  toCatalog: '去数据目录起草',
 }

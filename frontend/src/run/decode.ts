@@ -48,7 +48,8 @@ export const teamVerdictOf = (team: TeamRun | undefined | null): TeamVerdict | u
   (team as TeamRunEx | undefined | null)?.verdict
 
 /** 下一步该去哪儿改。界面据此给一个直达的入口，而不只是一句话 */
-export type FixKind = 'canvas' | 'settings' | 'tools'
+/** catalog：去数据目录页（fixTo 指到哪个数据源），助手参考的大库还没有数据目录时给 */
+export type FixKind = 'canvas' | 'settings' | 'tools' | 'catalog'
 
 /**
  * 事件 → 人能看懂的步骤。
@@ -147,6 +148,8 @@ export interface Step {
   next?: string
   /** 下一步该去的地方 */
   fix?: FixKind
+  /** fix 要去的页面地址（catalog：/data/catalog/:sourceId） */
+  fixTo?: string
   /** 工具的时限（秒，tool.start.timeout_s）。进行中的行超过它就要说破 */
   limitS?: number
   /** 出具那一行的档位（formal / degraded / withheld） */
@@ -2649,6 +2652,10 @@ export interface CopilotContextSource {
   explored?: number
   /** 没能挑出来的原因 */
   reason?: string
+  /** 数据源 id：去数据目录页的入口用（老服务端不给） */
+  sourceId?: string
+  /** 有数据目录的表数（老服务端不给：不知道就不提示） */
+  catalogTables?: number
 }
 
 /** 挑表失败时的说法：模型这一轮只看到表名，字段要它自己去查 */
@@ -2668,8 +2675,22 @@ function contextSources(op: CopilotOp): CopilotContextSource[] {
         ...(total != null ? { total } : {}),
         ...(total != null && explored != null && explored < total ? { explored } : {}),
         ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
+        ...(typeof x.source_id === 'string' && x.source_id ? { sourceId: x.source_id } : {}),
+        ...(num(x.catalog_tables) != null ? { catalogTables: num(x.catalog_tables) } : {}),
       }
     })
+}
+
+/**
+ * 没有数据目录的大库（要按需求挑表的那种）：挑表只能照表名猜，SQL 检查也没有目录可对照。真实运行里数据源一张目录
+ * 都没有，用户也不知道该先去起草。只认服务端明说了 0 张的；小库全部表都带字段，不提示
+ */
+function noCatalog(groups: CopilotContextSource[]): { next: string; fixTo?: string } | null {
+  const bare = groups.filter((g) => g.catalogTables === 0 && g.selectedBy !== 'all')
+  if (!bare.length) return null
+  const who = groups.length === 1 ? null : `「${bare.map((g) => g.source).join('」「')}」`
+  const to = bare.find((g) => g.sourceId)?.sourceId
+  return { next: COPILOT_CONTEXT_TEXT.noCatalog(who), ...(to ? { fixTo: `/data/catalog/${encodeURIComponent(to)}` } : {}) }
 }
 
 /**
@@ -2702,7 +2723,8 @@ function contextLine(g: CopilotContextSource): string {
  * 先得知道模型当时看到的是哪几张。标题只说几张（「参考了 8 张表」），展开按数据源分组列表名；挑表失败时
  * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
  */
-export function copilotContext(op: CopilotOp): { title: string; sub?: string; detail: string; ms?: number } | null {
+export function copilotContext(op: CopilotOp):
+  { title: string; sub?: string; detail: string; ms?: number; next?: string; fixTo?: string } | null {
   // 展开区里按需求挑过表的库排在前面：请求里点名的那个库往往就是它，排在一串小库后面得在内层滚动框里翻才看得到
   const order: Record<CopilotContextSource['selectedBy'], number> = { model: 0, all: 1, fallback: 2 }
   const groups = contextSources(op).map((g, i) => ({ g, i }))
@@ -2721,11 +2743,13 @@ export function copilotContext(op: CopilotOp): { title: string; sub?: string; de
   const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
   // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
   const ms = num(op.elapsed_ms)
+  const hint = noCatalog(groups)
   return {
     title: count ? (namesOnly ? COPILOT_CONTEXT_TEXT.withFields(count) : `参考了 ${count} 张表`) : CONTEXT_FALLBACK_TEXT,
     ...(sub ? { sub } : {}),
     detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
     ...(ms != null && ms >= 10 ? { ms } : {}),
+    ...(hint ?? {}),
   }
 }
 
@@ -2848,7 +2872,9 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: 'copilot_context',
               title: ctx.title, detail: ctx.detail,
               ...(ctx.sub ? { sub: ctx.sub } : {}),
-              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}) })
+              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}),
+              // 没有数据目录的大库：下一步去起草目录，入口直达那个数据源的目录页
+              ...(ctx.next ? { next: ctx.next, ...(ctx.fixTo ? { fix: 'catalog' as const, fixTo: ctx.fixTo } : {}) } : {}) })
         break
       }
       case 'catalog_patch': {
