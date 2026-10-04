@@ -143,7 +143,8 @@ def test_a_baseline_lists_what_cannot_be_used_without_recomputing_anything():
     assert "完整值" in unsupported[("n", "vars.kpi.items")]
     assert "遮罩" in unsupported[("phone_len", "cell(nodes.crm, 0, 'phone')")]
     assert "取哪" in unsupported[("pick", "vars.kpi.i")]
-    assert ("n2", "vars.kpi.items") not in unsupported and ("n3", "nodes.fetch.items") not in unsupported
+    # 还原得出的容器不算「完整值找不回来」，只是不能直接改、也没有行可勾
+    assert "完整值" not in unsupported[("n2", "vars.kpi.items")] and "完整值" not in unsupported[("n3", "nodes.fetch.items")]
     # 遮罩列的值不给
     [phone] = metrics["phone_len"]["inputs"]
     assert phone["masked"] is True and phone["old"] is None and phone["new"] is None and phone["editable"] is False
@@ -173,7 +174,8 @@ def test_changing_an_input_recomputes_only_the_metrics_that_use_it():
 
 
 def test_excluding_rows_drops_them_from_an_agent_array_field():
-    result = whatif(CARD, Changes(exclude={S1: frozenset({1})}), sources())
+    # vars.kpi.k 是 fetch 节点在快照交回之前写的：排除行影响不到它（不知道先后时说不准，见下面几条）
+    result = whatif(CARD, Changes(exclude={S1: frozenset({1})}), sources(returned={S1: 10}, finished={"fetch": 5}))
     metrics = by_id(result)
     total = metrics["total"]
     assert total["new"] == 340.0 - 80.0 and total["rendered_new"] == "260.0元" and total["delta"] == -80.0
@@ -396,3 +398,238 @@ def test_downstream_cards_that_use_this_card_are_flagged_not_recomputed():
         {"node_id": "yearly", "artifact": "B1", "caliber": "年报口径", "version": "v1", "metrics": ["y"], "direct": True},
         {"node_id": "board", "artifact": "C1", "caliber": "看板口径", "version": "v2", "metrics": ["b"], "direct": False},
     ]
+
+
+# --------------------------------------------------------------------------
+# 排除行：说不准受不受影响的指标不能报「无变化」
+# --------------------------------------------------------------------------
+
+
+def lone(mid, expression, substituted, value, inputs, **kw):
+    """只有一个指标的卡（同一套快照、产出）。"""
+    return {**CARD, "metrics": [metric(mid, expression, substituted, value, inputs, **kw)]}
+
+
+#: 老运行：cell() 一格加一个没存完整值的 vars 容器（写它的是 parse 节点）
+OLD_MIX = lone("mix", "round(cell(nodes.pull, 0, 'amount') / len(vars.res.rows), 2)",
+               "round(120.5 / len(vars.res.rows), 2)", 30.13,
+               [cell("pull", 0, "amount", 120.5), scalar("vars.res.rows", "[4 项]", node="parse")], decimals=2)
+
+
+def test_excluding_rows_never_reports_an_unrestorable_metric_as_unchanged():
+    """排除的是 cell 那一格以外的行：容器的完整值找不回来，它会不会少几行说不准，指标不能报「无变化」。"""
+    [mix] = whatif(OLD_MIX, Changes(exclude={S1: frozenset({2})}), sources())["metrics"]
+    assert mix["status"] == "unsupported" and mix["changed"] is None and mix["rendered_new"] is None
+    assert mix["new"] is None and "vars.res.rows" in mix["reason"] and "完整值" in mix["reason"]
+    # 只改输入值、不排除行时照旧：容器没被改，也就不用重算
+    [mix] = whatif(OLD_MIX, Changes(), sources())["metrics"]
+    assert mix["status"] == "unchanged" and mix["changed"] is False
+
+
+def test_a_container_matching_no_snapshot_is_doubted_when_rows_are_excluded():
+    """能还原、却对不上任何快照的容器（加工过的结果）：排除行后它会不会变说不准。"""
+    card = lone("mixed", "cell(nodes.pull, 0, 'amount') + len(vars.kpi.items)", "120.5 + len(vars.kpi.items)", 123.5,
+                [cell("pull", 0, "amount", 120.5),
+                 {**scalar("vars.kpi.items", "[3 项]"), "value_artifact": ITEMS_VALUE}], decimals=1)
+    [mixed] = whatif(card, Changes(exclude={S1: frozenset({3})}), sources())["metrics"]
+    assert mixed["status"] == "unsupported" and mixed["changed"] is None
+    assert "排除行对 vars.kpi.items 的影响无法确定" in mixed["reason"] and "对不上任何查询快照" in mixed["reason"]
+
+
+def test_a_scalar_taken_by_position_from_the_excluded_table_is_doubted():
+    """vars.res.rows[0][1] 按位置取自整份结果：排除第 0 行后，len 变了，分子却还是原来第 0 行的值——不能算出一个
+    不对应任何一份数据的数。"""
+    card = lone("first_share", "round(vars.res.rows[0][1] / len(vars.res.rows), 2)",
+                "round(120.5 / len(vars.res.rows), 2)", 30.12,
+                [scalar("vars.res.rows[0][1]", 120.5, node="parse"),
+                 {**scalar("vars.res.rows", "[4 项]", node="parse"), "value_artifact": RES_ROWS}], decimals=2)
+    assert recompute(card["metrics"][0], Changes(), sources())["new"] == round(120.5 / 4, 2) == 30.12
+    [share] = whatif(card, Changes(exclude={S1: frozenset({0})}), sources())["metrics"]
+    assert share["status"] == "unsupported" and share["new"] is None and share["changed"] is None
+    assert "vars.res.rows[0][1]" in share["reason"]
+
+
+def test_inputs_written_before_the_snapshot_came_back_are_not_doubted():
+    """写这个输入的节点在快照交回之前就跑完了：排除这份快照里的行影响不到它。"""
+    early = sources(returned={S1: 10}, finished={"parse": 5, "fetch": 5})
+    [mix] = whatif(OLD_MIX, Changes(exclude={S1: frozenset({2})}), early)["metrics"]
+    assert mix["status"] == "unchanged" and mix["changed"] is False
+    late = sources(returned={S1: 10}, finished={"parse": 12})
+    [mix] = whatif(OLD_MIX, Changes(exclude={S1: frozenset({2})}), late)["metrics"]
+    assert mix["status"] == "unsupported"
+
+
+def test_a_metric_without_lineage_is_unsupported_once_anything_changes():
+    legacy = {"id": "old", "name": "旧指标", "unit": "", "value": 3, "expression": "vars.x + 1"}
+    card = {**CARD, "metrics": [legacy, CARD["metrics"][0]]}
+    metrics = by_id(whatif(card, Changes(), sources()))
+    assert metrics["old"]["status"] == "unchanged"
+    for changes in (Changes(inputs={"vars.kpi.gmv": 50000}), Changes(exclude={S1: frozenset({1})})):
+        old = by_id(whatif(card, changes, sources()))["old"]
+        assert old["status"] == "unsupported" and old["changed"] is None and "没有记录输入" in old["reason"]
+
+
+# --------------------------------------------------------------------------
+# 查询快照读不出来：值不给、不推演
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("broken, words", [
+    (lambda a: None if a == S1 else load(a), "无法读取"),
+    (lambda a: (_ for _ in ()).throw(ValueError("篡改")) if a == S1 else load(a), "哈希"),
+])
+def test_an_unreadable_snapshot_withholds_its_cells(broken, words):
+    """快照读不出来，遮没遮核对不了：卡上记着的那一格也不给、不能改，用到它的指标推演不了。"""
+    path = "cell(nodes.pull, 0, 'amount')"
+    result = whatif(CARD, Changes(), sources(load=broken), metric="east")
+    [east] = result["metrics"]
+    [inp] = east["inputs"]
+    assert inp["old"] is None and inp["new"] is None and inp["editable"] is False and inp["withheld"] is True
+    assert east["substituted"] is None and "120.5" not in str(east["inputs"]) + str(east["substituted"])
+    [(input_path, reason)] = [(u["input"], u["reason"]) for u in result["unsupported"]]
+    assert input_path == path and words in reason
+    with pytest.raises(WhatIfError, match="快照"):
+        whatif(CARD, Changes(inputs={path: 100}), sources(load=broken), metric="east")
+    # 别的指标照样推演，只是用到这份快照的推演不了
+    total = by_id(whatif(CARD, Changes(inputs={"vars.kpi.gmv": 50000}), sources(load=broken)))["total"]
+    assert total["status"] == "unchanged" and "120.5" not in str(total["inputs"])
+
+
+def test_a_masked_column_stays_masked_when_its_snapshot_is_unreadable():
+    phone = by_id(whatif(CARD, Changes(), sources(load=lambda a: None if a == S2 else load(a))))["phone_len"]
+    [inp] = phone["inputs"]
+    assert inp["masked"] is True and inp["old"] is None and phone["substituted"] is None
+
+
+# --------------------------------------------------------------------------
+# 超大的数、给人看的值
+# --------------------------------------------------------------------------
+
+
+def test_numbers_too_large_to_compute_are_rejected_not_crashed():
+    with pytest.raises(WhatIfError, match="范围"):
+        whatif(CARD, Changes(inputs={"vars.kpi.gmv": 10 ** 400}), sources())
+    # 1e308 本身放得下，乘出来的整数放不下：说清算不出来
+    [n2] = whatif(CARD, Changes(inputs={"vars.kpi.k": 10 ** 308}), sources(), metric="n2")["metrics"]
+    assert n2["status"] == "error" and n2["new"] is None and "有限" in n2["reason"]
+    import json
+    json.dumps(n2, allow_nan=False)
+
+
+@pytest.mark.parametrize("value, shown", [(None, "空值"), ({"a": 1}, '{"a": 1}'), ([1, "两"], '[1, "两"]')])
+def test_invalid_values_are_shown_the_way_a_person_writes_them(value, shown):
+    with pytest.raises(WhatIfError) as caught:
+        whatif(CARD, Changes(inputs={"vars.kpi.gmv": value}), sources())
+    assert shown in str(caught.value) and "None" not in str(caught.value) and "'a'" not in str(caught.value)
+
+
+# --------------------------------------------------------------------------
+# 推演里能动什么：可勾的行、不能动的原因
+# --------------------------------------------------------------------------
+
+
+def test_inputs_say_which_snapshot_rows_they_use():
+    """输入实际落在快照的哪几行（row_span，含两端）：单格一行、数组字段一段、整份结果全部。遮罩的不给。"""
+    result = whatif(CARD, Changes(), sources())
+    spans = {(m["id"], i["path"]): i.get("row_span") for m in result["metrics"] for i in m["inputs"]}
+    assert spans[("east", "cell(nodes.pull, 0, 'amount')")] == [0, 0]
+    assert spans[("total", "vars.kpi.amounts")] == [0, 3]
+    assert spans[("rows", "vars.res.rows")] == [0, 3]
+    assert spans[("phone_len", "cell(nodes.crm, 0, 'phone')")] is None
+    assert spans[("wow", "vars.kpi.gmv")] is None and spans[("n2", "vars.kpi.items")] is None
+
+
+def test_inputs_that_cannot_be_adjusted_say_why():
+    """不能改、也没有行可勾的输入都列进「不支持推演的输入」，不让人对着一个改不了的值干看。"""
+    card = {**CARD, "metrics": [
+        *CARD["metrics"],
+        metric("label", "len(vars.kpi.name) + vars.kpi.k", "len('华东区') + 2", 5,
+               [scalar("vars.kpi.name", "华东区"), scalar("vars.kpi.k", 2)]),
+        metric("flag", "vars.kpi.on * 3", "True * 3", 3, [scalar("vars.kpi.on", True)])]}
+    reasons = {(u["metric"], u["input"]): u["reason"] for u in whatif(card, Changes(), sources())["unsupported"]}
+    assert "列表或对象不能直接修改" in reasons[("n2", "vars.kpi.items")]
+    assert "列表或对象不能直接修改" in reasons[("n3", "nodes.fetch.items")]
+    assert "不是数值" in reasons[("label", "vars.kpi.name")] and "不是数值" in reasons[("flag", "vars.kpi.on")]
+    # 能排除行的容器、能改的数不在其中
+    assert ("total", "vars.kpi.amounts") not in reasons and ("rows", "vars.res.rows") not in reasons
+    assert ("label", "vars.kpi.k") not in reasons and ("wow", "vars.kpi.gmv") not in reasons
+
+
+# --------------------------------------------------------------------------
+# 还原时的几处保护
+# --------------------------------------------------------------------------
+
+
+def test_an_array_whose_length_does_not_match_its_rows_is_not_excluded_by_row():
+    """数组字段 4 行的出处、产出里却只有 3 个元素：元素和行对不上号，不能按行去掉元素（会去错）。"""
+    short = sources(load=lambda a: {**STORE[BOT_OUT], "data": {"amounts": [120.5, 80.0, 99.5]}} if a == BOT_OUT
+                    else load(a))
+    card = lone("total3", "sum(vars.kpi.amounts)", "sum(vars.kpi.amounts)", 300.0, [AMOUNTS], decimals=1, unit="元")
+    assert recompute(card["metrics"][0], Changes(), short)["new"] == 300.0
+    [total] = whatif(card, Changes(exclude={S1: frozenset({1})}), short)["metrics"]
+    assert total["status"] == "unsupported" and total["new"] is None
+    assert "excluded_rows" not in total["inputs"][0] and total["inputs"][0].get("row_span") is None
+
+
+def test_a_node_path_with_a_variable_index_is_not_restored():
+    card = lone("pick2", "len(nodes.fetch.lists[vars.kpi.i])", "len(nodes.fetch.lists[vars.kpi.i])", 2,
+                [{**scalar("nodes.fetch.lists[vars.kpi.i]", "[2 项]"), "field": "lists[vars.kpi.i]"},
+                 scalar("vars.kpi.i", 0)])
+    out = recompute(card["metrics"][0], Changes(), sources())
+    assert out["status"] == "unsupported" and "变量下标" in out["reason"]
+
+
+def test_text_that_merely_looks_like_a_container_summary_is_a_plain_value():
+    """值恰好是「[3 项]」这几个字的文本，代入式里被代成了字面量：它就是当时的值，不是容器。"""
+    card = lone("tag", "len(vars.kpi.tag)", "len('[3 项]')", 5, [scalar("vars.kpi.tag", "[3 项]")])
+    out = recompute(card["metrics"][0], Changes(), sources())
+    assert out["status"] == "ok" and out["new"] == 5 and out["inputs"][0]["kind"] == "text"
+
+
+def test_a_query_result_carrying_its_snapshot_id_is_mapped_by_it():
+    """容器带着封存范围内快照的 artifact（数据源工具交回的结果原样解析）：按它认快照，哪怕行的写法和快照不同。"""
+    parsed = "b8" * 32
+    rows = [["华东", "120.5", "p1"], ["华南", "80.0", "p2"], ["华北", "99.5", "p3"], ["西南", "40.0", "p4"]]
+    store = {**STORE, parsed: {"path": "vars.res", "value": {"columns": ["region", "amount", "phone"], "rows": rows,
+                                                               "artifact": S1}}}
+    card = lone("cnt", "len(get(vars.res, 'rows'))", "len(get(vars.res, 'rows'))", 4,
+                [{**scalar("vars.res", "{3 个字段}", node="parse"), "value_artifact": parsed}])
+    mapped = sources(load=lambda a: store.get(a) if a != BAD else load(a))
+    assert recompute(card["metrics"][0], Changes(), mapped)["new"] == 4
+    [cnt] = whatif(card, Changes(exclude={S1: frozenset({0, 2})}), mapped)["metrics"]
+    assert cnt["status"] == "ok" and cnt["new"] == 2
+    assert cnt["inputs"][0]["artifact"] == S1 and cnt["inputs"][0]["excluded_rows"] == [0, 2]
+
+
+def test_a_segment_whose_metric_had_no_value_is_listed_when_the_whatif_supplies_one():
+    """缺输入、当时显示「—」的引用也列上：推演里补上了值，它会变。"""
+    card = {**CARD, "metrics": [metric("cost", "vars.kpi.cost / vars.kpi.orders", "vars.kpi.cost / 1234", None,
+                                       [scalar("vars.kpi.cost", None), scalar("vars.kpi.orders", 1234)], decimals=2,
+                                       rendered="—")]}
+    result = whatif(card, Changes(inputs={"vars.kpi.cost": 2468}), sources())
+    doc = doc_with({"id": "s7", "text": "—", "kind": "value", "state": "flagged",
+                    "cite": {"alias": "m:cost", "kind": "metric", "status": "unresolved"}})
+    doc["catalog"]["m:cost"] = {"alias": "m:cost", "kind": "metric", "node_id": "card", "artifact": "CARD",
+                                "locator": {"metric": "cost"}, "value": None, "status": "missing_input"}
+    [found] = report_segments([("write", doc)], card_node="card", card_artifact="CARD", results=result["metrics"])
+    assert (found["sid"], found["rendered_old"], found["rendered_new"], found["changed"]) == ("s7", "—", "2.00", True)
+
+
+# --------------------------------------------------------------------------
+# 下游口径卡：经中间节点引用的也标
+# --------------------------------------------------------------------------
+
+
+def test_downstream_cards_reached_through_other_nodes_are_flagged():
+    """card → mid（transform 用了卡上的值）→ yearly：yearly 的输入写的是 vars.t.g，来自 mid，不是卡本身。
+    按画布上的边从这张卡往下找：经别的节点间接用到的也标「可能受影响」。"""
+    upstream = ("card", "A1", CARD)
+    yearly = ("yearly", "B1", {"caliber": "年报口径", "caliber_version": "v1", "metrics": [
+        metric("y", "vars.t.g * 26", "17.4 * 26", 452.4,
+               [{"path": "vars.t.g", "value": 17.4, "node_id": "mid", "via": "transform", "status": "ok"}])]})
+    before = ("before", "C1", {"caliber": "早口径", "caliber_version": "v1", "metrics": [
+        metric("b", "vars.kpi.k", "2", 2, [scalar("vars.kpi.k", 2, node="fetch")])]})
+    edges = [("fetch", "before"), ("before", "card"), ("card", "mid"), ("mid", "yearly")]
+    assert downstream_cards([upstream, yearly, before], "card") == []
+    assert downstream_cards([upstream, yearly, before], "card", edges=edges) == [
+        {"node_id": "yearly", "artifact": "B1", "caliber": "年报口径", "version": "v1", "metrics": ["y"], "direct": False}]

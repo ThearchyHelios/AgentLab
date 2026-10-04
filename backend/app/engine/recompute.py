@@ -15,14 +15,18 @@ round（和 metrics.run_metrics 一样只 round 浮点），渲染走 evidence.r
   - vars.*：有 value_artifact（口径卡当时另存的完整值）才还原得出来；老运行照实说当时没有保存
   - 容器本身是一份查询结果（带 artifact 的 {columns, rows}，或者和某份快照的 rows 一模一样的列表）：排除行就去掉那几行
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格
+- 落在读不出来（文件不在、与哈希不一致）的查询快照上的输入同样不给值、不推演：那一格遮没遮核对不了，宁可多遮
 
 同一张口径卡的指标不能互相引用（算这张卡时卡上的值还不存在），所以只有用到了被改的输入、被排除的行的指标需要重算，
-别的原样交回。
+别的原样交回。排除行时有一种例外：指标的某个输入对不上任何快照（完整值找不回来的容器、加工过的结果、按位置从结果里
+取的一格、由查询结果算出来的数），它可能就是从被排除了行的那份结果来的，重算不了，只能说不知道（unsupported），
+不能报「无变化」。写它的节点在那份快照交回之前就跑完了的，影响不到它，照常不算。
 """
 from __future__ import annotations
 
 import ast
 import copy
+import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -50,6 +54,16 @@ MASKED_TABLE = "这份查询结果里有设置了遮罩的列，不能用于推�
 MASKED_METRIC = "这个指标用到了设置了遮罩的列，不能推演"
 SELECTOR = "这个输入决定取哪一行、哪一项，修改它需要重新取数，不能推演"
 EXCLUDED = "排除后无法计算"
+UNREADABLE = "查询快照无法读取"
+TAMPERED = "查询快照与哈希不一致，疑似被修改"
+#: 不能改、也没有行可勾的输入（_fixed）
+FIXED_CONTAINER = "列表或对象不能直接修改，也没有对应的查询结果可以排除行"
+NOT_NUMBER = "不是数值，不能修改"
+#: 排除了行，却说不准这个输入受不受影响（_doubt）
+DOUBT = "排除行对 {path} 的影响无法确定：{why}"
+DOUBT_UNMATCHED = "它对不上任何查询快照，可能是由查询结果加工而来"
+DOUBT_DERIVED = "它不是直接取自查询结果的格，可能由查询结果算出"
+NOT_FINITE = "计算结果不是有限的数值（溢出或非数），无法推演"
 
 #: 卡上给容器记的大概（metrics._brief）：「[12 项]」「{3 个字段}」
 _BRIEF = re.compile(r"^(?:\[\d+ 项\]|\{\d+ 个字段\})$")
@@ -77,13 +91,18 @@ class Sources:
       （artifact_store.load 的约定）
     - queries：封存范围内的查询快照，按在事件里第一次出现的顺序。排除行只认这些快照；容器按内容对快照时也按这个顺序
     - outputs：节点 id → 口径卡执行之前它最后一次的产出工件（nodes.*、input.* 的容器、agent 的数组字段从这里还原）
-    - masked：查询快照 → 要遮的列（小写）：查询当时记下的加数据源现在设的
+    - masked：查询快照 → 要遮的列（小写）：查询当时记下的加数据源现在设的。只用到 get，调用方可以给一个用到哪份
+      才算哪份的映射（快照读不出来时照样按台账记的数据源算）
+    - returned：查询快照 → 它第一次交回时的事件序号；finished：节点 → 口径卡执行之前它最后一次跑完的事件序号。
+      排除行只可能影响在那份快照交回之后才算出来的值（_doubt）。不知道的一律当可能受影响
     """
 
     load: Callable[[str], Any]
     queries: tuple[str, ...] = ()
     outputs: Mapping[str, str] = field(default_factory=dict)
     masked: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    returned: Mapping[str, int] = field(default_factory=dict)
+    finished: Mapping[str, int] = field(default_factory=dict)
 
 
 class _Store:
@@ -127,6 +146,8 @@ class _Input:
     rows: tuple[int, int] | None = None
     table: bool = False
     masked: bool = False
+    #: 落在的查询快照读不出来（文件不在、与哈希不一致）：遮没遮核对不了，值不给，也不拿来推演
+    unreadable: bool = False
     #: 出现在别的输入的下标、cell() 的行列里：它决定取哪一格，改它要重新取数
     selector: bool = False
 
@@ -150,7 +171,8 @@ def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: 
     """在一张口径卡上推演：{metrics: [每个指标的旧值、新值、输入…], unsupported: [不能用于推演的输入和原因]}。
 
     metric 给了就只推演这一个指标。改动不合法时抛 WhatIfError，一个指标都不算。没碰到改动的指标不重算，
-    原值原样交回（status: unchanged）；unsupported 不论有没有改动都列全，界面一打开就能说清哪些输入不能动。
+    原值原样交回（status: unchanged）；unsupported 不论有没有改动都列全（遮罩的、还原不了的、不能改也没有行可勾的），
+    界面一打开就能说清哪些输入不能动。
     """
     store = _Store(sources)
     metrics = [m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") is not None]
@@ -160,12 +182,12 @@ def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: 
             raise WhatIfError(f"口径卡中没有指标「{metric}」")
     plans = [_plan(m, store) for m in metrics]
     _check(changes, plans, store, metric=metric)
-    return {"metrics": [_outcome(p, changes) for p in plans], "unsupported": _unsupported(plans)}
+    return {"metrics": [_outcome(p, changes, sources) for p in plans], "unsupported": _unsupported(plans)}
 
 
 def recompute(metric: dict[str, Any], changes: Changes, sources: Sources) -> dict[str, Any]:
     """重算一个指标，不管改动碰没碰到它，也不校验改动。核对还原是否忠实时用：什么都不改，重算出来应当和卡上记的一样。"""
-    return _outcome(_plan(metric, _Store(sources)), changes, force=True)
+    return _outcome(_plan(metric, _Store(sources)), changes, sources, force=True)
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +278,13 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
         elif inp.problem is None and inp.snapshot is None:
             inp.snapshot = _table_of(inp.value, store)
             inp.table = inp.snapshot is not None
+    if inp.snapshot is not None:
+        _, trouble = store.get(inp.snapshot)
+        if trouble or store.snapshot(inp.snapshot) is None:
+            # 卡上记着这一格的值，可快照读不出来：这一列遮没遮核对不了（查询当时记下的遮罩在快照里），值不给，
+            # 也不拿来推演。数据源现在设的遮罩照样认（_masked），认出来了就按遮罩说
+            inp.unreadable = True
+            inp.problem = inp.problem or (TAMPERED if trouble == "tampered" else UNREADABLE)
     inp.masked = _masked(inp, locator, store)
     return inp
 
@@ -311,7 +340,7 @@ def _table_of(value: Any, store: _Store) -> str | None:
     if isinstance(value, dict) and isinstance(value.get("rows"), list):
         artifact = value.get("artifact")
         if isinstance(artifact, str) and artifact in store.sources.queries:
-            return artifact
+            return artifact      # 快照读不读得出来由 _restore 核对
         rows = value["rows"]
     elif isinstance(value, list):
         rows = value
@@ -373,7 +402,14 @@ def _span(rows: Any) -> tuple[int, int] | None:
 
 
 def _number(value: Any) -> bool:
-    return is_number(value) and math.isfinite(value)
+    """算得动的数：bool 不算；无穷大、非数不算；浮点放不下的大整数（10 ** 400）也不算——math.isfinite 对它抛
+    OverflowError，JSON 写得出来，界面却只能读成 Infinity。"""
+    if not is_number(value):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _check(changes: Changes, plans: list[_Plan], store: _Store, *, metric: str | None) -> None:
@@ -385,10 +421,14 @@ def _check(changes: Changes, plans: list[_Plan], store: _Store, *, metric: str |
         found = known.get(path)
         if not found:
             raise WhatIfError(f"指标「{metric}」没有输入「{path}」" if metric is not None else f"口径卡里没有输入「{path}」")
+        if not is_number(value):
+            raise WhatIfError(f"输入「{path}」的新值需要是数值，当前为{_shown(value)}")
         if not _number(value):
-            raise WhatIfError(f"输入「{path}」的新值需要是数值，当前为「{_shown(value)}」")
+            raise WhatIfError(f"输入「{path}」的新值超出可计算的范围，需要是有限的数值")
         if any(i.masked for i in found):
             raise WhatIfError(f"输入「{path}」取自设置了遮罩的列，不能用于推演")
+        if unreadable := next((i for i in found if i.unreadable), None):
+            raise WhatIfError(f"输入「{path}」所在的{unreadable.problem}，不能用于推演")
         if any(i.selector for i in found):
             raise WhatIfError(f"输入「{path}」决定取哪一行、哪一项，修改它需要重新取数，不能推演")
         if found[0].shape != "scalar":
@@ -411,8 +451,11 @@ def _check(changes: Changes, plans: list[_Plan], store: _Store, *, metric: str |
 
 
 def _shown(value: Any) -> str:
-    text = str(value)
-    return text if len(text) <= 40 else text[:40] + "…"
+    """不合法的新值写给人看：空值写「空值」，文本照原样，别的按 JSON 的写法——不露出 None、单引号这些 Python 写法。"""
+    if value is None:
+        return "空值"
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return f"「{text if len(text) <= 40 else text[:40] + '…'}」"
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +487,7 @@ def _apply(inp: _Input, changes: Changes) -> tuple[Any, list[int] | None, bool]:
     return inp.value, None, False
 
 
-def _outcome(plan: _Plan, changes: Changes, *, force: bool = False) -> dict[str, Any]:
+def _outcome(plan: _Plan, changes: Changes, sources: Sources, *, force: bool = False) -> dict[str, Any]:
     values: dict[str, Any] = {}
     notes: dict[str, list[int]] = {}
     touched = False
@@ -453,15 +496,47 @@ def _outcome(plan: _Plan, changes: Changes, *, force: bool = False) -> dict[str,
         if excluded:
             notes[path] = excluded
         touched = touched or overridden or bool(excluded)
-    if not touched and not force:
+    doubt = _doubt(plan, changes, sources)
+    # 卡上没记全输入的指标：不知道它用了什么，有任何改动都说不准它变不变
+    touched = touched or (plan.problem is not None and bool(changes.inputs or changes.exclude))
+    if not touched and doubt is None and not force:
         return _result(plan, "unchanged", plan.metric.get("value"), None, values, notes)
-    status, new, reason = _compute(plan, values, notes, changes)
+    status, new, reason = _compute(plan, values, notes, changes, doubt)
     return _result(plan, status, new, reason, values, notes)
 
 
-def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]],
-             changes: Changes) -> tuple[str, Any, str | None]:
-    """(status, 新值, 原因)。还原不了的、遮罩的、排除后缺了的先说，都没有才求值。"""
+def _doubt(plan: _Plan, changes: Changes, sources: Sources) -> str | None:
+    """排除了行，这个指标却有输入说不准受不受影响：返回原因；没排除行、或者输入都对得上号的返回 None。
+
+    对得上号的输入（cell() 那一格、agent 的单格字段和数组字段、整份查询结果）排除行怎么影响它是确定的，_apply 照办。
+    别的输入——完整值找不回来的容器、对不上任何快照的容器（加工过的结果）、不是直接取自快照的数（按位置从整份结果里
+    取的一格、transform 由查询结果算出来的数）——都可能来自被排除了行的那份结果，又重算不了，只能说不知道，不能拿
+    原值算出一个「无变化」或者一个不对应任何一份数据的数。给了新值的以新值为准；写它的节点在那份快照交回之前就跑完了
+    的，影响不到它（_after）。
+    """
+    if not changes.exclude:
+        return None
+    for path, inp in plan.inputs.items():
+        if path in changes.inputs or inp.snapshot is not None:
+            continue
+        if any(_after(snapshot, inp, sources) for snapshot in changes.exclude):
+            why = inp.problem or (DOUBT_UNMATCHED if inp.shape == "container" else DOUBT_DERIVED)
+            return DOUBT.format(path=path, why=why)
+    return None
+
+
+def _after(snapshot: str, inp: _Input, sources: Sources) -> bool:
+    """这个输入可能是在这份快照交回之后才算出来的：写它的节点不早于快照交回跑完（合并查询的快照就记在它自己跑完的
+    那条事件里），或者两样有一样不知道。"""
+    writer = inp.item.get("node_id")
+    returned = sources.returned.get(snapshot)
+    finished = sources.finished.get(str(writer)) if writer else None
+    return returned is None or finished is None or finished >= returned
+
+
+def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]], changes: Changes,
+             doubt: str | None) -> tuple[str, Any, str | None]:
+    """(status, 新值, 原因)。还原不了的、遮罩的、排除后缺了的、说不准受不受影响的先说，都没有才求值。"""
     if plan.problem:
         return "unsupported", None, plan.problem
     for path in plan.tops:
@@ -472,10 +547,12 @@ def _compute(plan: _Plan, values: dict[str, Any], notes: dict[str, list[int]],
     for path, inp in plan.inputs.items():
         if inp.row is not None and path in notes and path not in changes.inputs:
             return "excluded", None, f"{EXCLUDED}：{path} 所在的第 {inp.row + 1} 行已排除"
+    if doubt:
+        return "unsupported", None, doubt
     value, reason = _evaluate(plan, values)
-    if reason is None and isinstance(value, float) and not math.isfinite(value):
-        # 溢出成无穷大、算出非数：口径卡渲染成「—」，这里也说清算不出来（JSON 里也放不下这种值）
-        reason = "计算结果不是有限的数值（溢出或非数），无法推演"
+    if reason is None and is_number(value) and not _number(value):
+        # 溢出成无穷大、算出非数、乘出浮点放不下的整数：口径卡渲染成「—」，这里也说清算不出来（JSON 里也放不下）
+        reason = NOT_FINITE
     return ("ok", value, None) if reason is None else ("error", None, reason)
 
 
@@ -543,8 +620,8 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
     delta, rendered_delta = _delta(metric, old, new) if known else (None, None)
     substituted = metric.get("substituted") if status == "unchanged" \
         else substitute(plan.tree, values) if status == "ok" and plan.tree is not None else None
-    if any(inp.masked for inp in plan.inputs.values()):
-        substituted = None      # 代入式里代进去的就是遮罩列的那一格
+    if any(inp.masked or inp.unreadable for inp in plan.inputs.values()):
+        substituted = None      # 代入式里代进去的就是遮罩列（或者遮没遮核对不了）的那一格
     return {
         "id": metric.get("id"), "name": metric.get("name") or metric.get("id"), "unit": metric.get("unit") or "",
         "decimals": metric.get("decimals"), "format": metric.get("format") or DEFAULT_FORMAT,
@@ -566,8 +643,8 @@ def _render(metric: dict[str, Any], value: Any, conv: str | None = None) -> str:
 
 
 def _finite(value: Any) -> Any:
-    """无穷大、非数换成 None：老卡上可能记着（口径卡渲染成「—」），JSON 里放不下。"""
-    return None if isinstance(value, float) and not math.isfinite(value) else value
+    """无穷大、非数、浮点放不下的整数换成 None：老卡上可能记着（口径卡渲染成「—」），JSON 里放不下或界面读不准。"""
+    return None if is_number(value) and not _number(value) else value
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -610,19 +687,37 @@ def _kind(inp: _Input) -> str:
 
 
 def _editable(inp: _Input) -> bool:
-    return inp.shape == "scalar" and not inp.masked and not inp.selector \
+    return inp.shape == "scalar" and not inp.masked and not inp.selector and inp.problem is None \
         and (inp.value is None or _number(inp.value))
 
 
+def _row_span(inp: _Input) -> tuple[int, int] | None:
+    """这个输入实际用到的快照行（含两端）：单格一行、数组字段一段、整份结果全部。排除别的行影响不到它，界面据此只让
+    这几行可勾。遮罩的、快照读不出来的不给：排除它们的行什么也推演不出来。"""
+    if inp.snapshot is None or inp.masked or inp.unreadable:
+        return None
+    if inp.row is not None:
+        return inp.row, inp.row
+    if inp.rows is not None:
+        return inp.rows
+    rows = inp.value.get("rows") if isinstance(inp.value, dict) else inp.value
+    return (0, len(rows) - 1) if inp.table and isinstance(rows, list) and rows else None
+
+
 def _input_view(inp: _Input, values: dict[str, Any], notes: dict[str, list[int]]) -> dict[str, Any]:
-    """一个输入在推演里的样子：原值、新值、排除了哪几行。遮罩列取来的不给值。容器写大概（「[12 项]」）。"""
+    """一个输入在推演里的样子：原值、新值、排除了哪几行、用到快照的哪几行（row_span）。遮罩列取来的、落在读不出来的
+    快照上的不给值。容器写大概（「[12 项]」）。"""
     item = inp.item
+    span = _row_span(inp)
     view: dict[str, Any] = {"path": inp.path, "via": item.get("via"), "node_id": item.get("node_id"),
                             **({"artifact": inp.snapshot} if inp.snapshot else {}),
                             **({"locator": item["locator"]} if isinstance(item.get("locator"), dict) else {}),
+                            **({"row_span": list(span)} if span else {}),
                             "kind": _kind(inp), "editable": _editable(inp)}
     if inp.masked:
         return {**view, "old": None, "new": None, "changed": False, "masked": True}
+    if inp.unreadable and inp.shape == "scalar":
+        return {**view, "old": None, "new": None, "changed": False, "withheld": True}
     if inp.shape == "container":
         old = _outline(inp.value, inp.table) if inp.problem is None else item.get("value")
         new = _outline(values.get(inp.path), inp.table) if inp.problem is None else None
@@ -644,7 +739,8 @@ def _outline(value: Any, table: bool) -> Any:
 
 
 def _unsupported(plans: list[_Plan]) -> list[dict[str, Any]]:
-    """不能用于推演的输入和原因：遮罩的、完整值找不回来的、决定取哪一格的。卡本身没记输入的，整个指标一条。"""
+    """不能用于推演的输入和原因：遮罩的、完整值找不回来的（含快照读不出来的）、决定取哪一格的、既不能改也没有行可勾的。
+    卡本身没记输入的，整个指标一条。"""
     out: list[dict[str, Any]] = []
     for plan in plans:
         metric_id = plan.metric.get("id")
@@ -654,10 +750,18 @@ def _unsupported(plans: list[_Plan]) -> list[dict[str, Any]]:
         for inp in plan.inputs.values():
             reason = (MASKED_TABLE if inp.table else MASKED_INPUT) if inp.masked \
                 else f"无法推演：{inp.problem}" if inp.problem \
-                else SELECTOR if inp.selector else None
+                else SELECTOR if inp.selector else _fixed(inp)
             if reason:
                 out.append({"metric": metric_id, "input": inp.path, "reason": reason})
     return out
+
+
+def _fixed(inp: _Input) -> str | None:
+    """还原得出、没遮罩，却既不能改值、也没有行可勾的输入：说清为什么，不让人对着一个改不了的值干看。"""
+    if inp.shape == "container":
+        return None if _row_span(inp) is not None else FIXED_CONTAINER
+    value = inp.item.get("value")
+    return None if value is None or is_number(value) else NOT_NUMBER
 
 
 # --------------------------------------------------------------------------
@@ -703,11 +807,15 @@ def _cites(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any]) -> 
     return cite.get("status") == "unresolved" and entry.get("value") is None and entry.get("status") == "missing_input"
 
 
-def downstream_cards(cards: Iterable[tuple[str, str, dict[str, Any]]], node_id: str) -> list[dict[str, Any]]:
-    """引用了这张口径卡的下游口径卡（直接的和经别的卡间接的）：[{node_id, artifact, caliber, version, metrics, direct}]。
+def downstream_cards(cards: Iterable[tuple[str, str, dict[str, Any]]], node_id: str, *,
+                     edges: Iterable[tuple[Any, Any]] = ()) -> list[dict[str, Any]]:
+    """引用了这张口径卡的下游口径卡：[{node_id, artifact, caliber, version, metrics, direct}]。
 
     只标「可能受影响」，不重算：下游卡怎么用这张卡的值（取第几个指标、和别的什么一起算）要整条链重放才说得准。
-    认引用看下游指标的输入从哪个节点来（node_id，或者 nodes.<卡> 这样的路径）。同一张卡执行过几次的按最后一次。
+    认引用看下游指标的输入从哪个节点来（node_id，或者 nodes.<卡> 这样的路径）：直接来自这张卡的标 direct。
+    经别的卡间接用到的也标；给了画布上的边（edges）时，从这张卡顺着边走得到的节点也算上游——下游卡经 transform 之类
+    的中间节点用到卡上的值（输入写的是 vars.t.g，来自中间节点），同样可能受影响。循环的回边会让循环里的节点都走得到，
+    宁可多标。同一张卡执行过几次的按最后一次。
     """
     latest: dict[str, tuple[str, dict[str, Any]]] = {}
     for nid, artifact, card in cards:
@@ -725,15 +833,33 @@ def downstream_cards(cards: Iterable[tuple[str, str, dict[str, Any]]], node_id: 
                     break
         return found
 
+    upstream = {str(node_id)} | _reach(edges, str(node_id))
     flagged: dict[str, dict[str, Any]] = {}
-    frontier, direct = {str(node_id)}, True
-    while frontier:
-        reached: set[str] = set()
+    grew = True
+    while grew:
+        # 标出来的卡本身也成了上游：经它间接用到的再标一轮，直到没有新的
+        grew = False
         for nid, (artifact, card) in latest.items():
-            if nid in flagged or not (metrics := uses(card, frontier)):
+            if nid in flagged or not (metrics := uses(card, upstream)):
                 continue
             flagged[nid] = {"node_id": nid, "artifact": artifact, "caliber": card.get("caliber") or "",
-                            "version": card.get("caliber_version") or "", "metrics": metrics, "direct": direct}
-            reached.add(nid)
-        frontier, direct = reached, False
+                            "version": card.get("caliber_version") or "", "metrics": metrics,
+                            "direct": bool(uses(card, {str(node_id)}))}
+            upstream.add(nid)
+            grew = True
     return [flagged[nid] for nid in latest if nid in flagged]
+
+
+def _reach(edges: Iterable[tuple[Any, Any]], start: str) -> set[str]:
+    """从 start 顺着边走得到的节点（不含 start 自己，除非绕回来）。"""
+    after: dict[str, list[str]] = {}
+    for a, b in edges:
+        after.setdefault(str(a), []).append(str(b))
+    seen: set[str] = set()
+    todo = [start]
+    while todo:
+        for nxt in after.get(todo.pop(), []):
+            if nxt not in seen:
+                seen.add(nxt)
+                todo.append(nxt)
+    return seen

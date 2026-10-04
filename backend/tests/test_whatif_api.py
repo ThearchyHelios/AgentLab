@@ -216,7 +216,7 @@ async def test_changing_an_input_of_one_metric(client, monkeypatch):
 
 async def faithful(run_id: str) -> list[tuple]:
     """真跑出来的每张卡、每个指标，什么都不改、强制重算一遍：(卡, 指标, 状态, 重算值, 卡上的值)。
-    输入的还原（标量、cell()、整份查询结果、agent 数组、nodes.*）是否忠实，在真卡上对一遍。"""
+    输入的还原（标量、cell()、整份查询结果、agent 数组、nodes.*）是否忠实，在真卡上对一遍。和接口一样在工作线程里算。"""
     from app.api import whatif as api_whatif
     from app.api.evidence import _reports, _sealed, _sealed_cards
     from app.engine import recompute
@@ -226,12 +226,9 @@ async def faithful(run_id: str) -> list[tuple]:
     out = []
     for node_id in dict.fromkeys(nid for nid, _, _ in cards):
         _, card, started = api_whatif._card_of(sealed, cards, node_id, _reports(sealed), None)
-        loader = api_whatif._loader(sealed, cards)
-        sources = recompute.Sources(load=loader, queries=tuple(sealed.queries),
-                                    outputs=api_whatif._outputs_before(sealed, started),
-                                    masked=await api_whatif._hidden(sealed, loader))
+        sources = api_whatif._sources(sealed, cards, started, asyncio.get_running_loop())
         for metric in card["metrics"]:
-            again = recompute.recompute(metric, recompute.Changes(), sources)
+            again = await asyncio.to_thread(recompute.recompute, metric, recompute.Changes(), sources)
             out.append((node_id, metric["id"], again["status"], again["new"], metric["value"]))
     return out
 
@@ -496,3 +493,339 @@ async def test_downstream_cards_are_flagged_only_when_something_changes(client, 
     [flagged] = body["affected_cards"]
     assert (flagged["node_id"], flagged["caliber"], flagged["version"], flagged["metrics"], flagged["direct"]) == (
         "yearly", "年口径", "v2", ["year"], True)
+
+
+# --------------------------------------------------------------------------
+# 排除行：说不准受不受影响的指标不报「无变化」
+# --------------------------------------------------------------------------
+
+
+async def test_excluding_rows_of_an_old_run_never_says_unchanged(client, monkeypatch):
+    """老运行的 vars.res.rows 没存完整值：排除 cell 那一格以外的行，平均每单会变（分母少了一行），却算不出来。
+    不能报「60.05元 → 60.05元 无变化」，报告里引用它的地方也不能报「不受影响」。"""
+    from app.engine.nodes import metrics as metrics_node
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(metrics_node, "_store_value", nothing)
+    row = await run_graph(monkeypatch, query_graph())
+    snapshot = await snapshot_of(row.id)
+    body = await whatif(client, row.id, {"card": "card", "metric": "per", "report": "write",
+                                         "overrides": {"exclude_rows": {snapshot: [3]}}})
+    [per] = body["metrics"]
+    assert per["status"] == "unsupported" and per["changed"] is None and per["new"] is None, per
+    assert "vars.res.rows" in per["reason"]
+    [seg] = body["segments"]
+    assert seg["metric"] == "per" and seg["rendered_new"] is None and seg["changed"] is None
+    cnt = by_id(await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [3]}}}))["cnt"]
+    assert cnt["status"] == "unsupported" and cnt["changed"] is None
+
+
+async def test_only_inputs_computed_after_the_snapshot_came_back_are_doubted(client, monkeypatch):
+    """写在查询之前的容器（early）排除行影响不到它；查询之后才算出来、又对不上任何快照的（late）说不准。
+    按位置取自整份结果的一格（vars.res.rows[0][2]）同样说不准：排除第 0 行后它取到的是另一行。"""
+    metrics = [
+        {"id": "m_early", "name": "加早", "decimals": 1, "expression": f"round({AMOUNT5} + sum(vars.early.items), 1)"},
+        {"id": "m_late", "name": "加晚", "decimals": 1, "expression": f"round({AMOUNT5} + sum(vars.late.items), 1)"},
+        {"id": "first", "name": "首单占比", "decimals": 2,
+         "expression": "round(vars.res.rows[0][2] / len(vars.res.rows), 2)"},
+    ]
+    row = await run_graph(monkeypatch, chain(
+        node("start", "input"),
+        node("early_n", "transform", mode="expression", expression="{'items': [1.5, 2.5]}", assign_to="early"),
+        node("fetch", "tool", tool="db_query__shop", args={"sql": SQL}),
+        node("parse", "transform", mode="json", template="{{ nodes.fetch }}", assign_to="res"),
+        node("late_n", "transform", mode="expression", expression="{'items': [1.5, 2.5]}", assign_to="late"),
+        node("card", "metrics", caliber="推演口径", metrics=metrics),
+        node("write", "report", instructions="写周报", on_violation="flag"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}])),
+        text="加早 [[m:m_early]]，加晚 [[m:m_late]]，首单占比 [[m:first]]。")
+    snapshot = await snapshot_of(row.id)
+    assert [(m, s, new == old) for _, m, s, new, old in await faithful(row.id)] == [
+        ("m_early", "ok", True), ("m_late", "ok", True), ("first", "ok", True)]
+    metrics = by_id(await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [0]}}}))
+    assert metrics["m_early"]["status"] == "unchanged" and metrics["m_early"]["changed"] is False
+    assert metrics["m_late"]["status"] == "unsupported" and "vars.late.items" in metrics["m_late"]["reason"]
+    assert "对不上任何查询快照" in metrics["m_late"]["reason"]
+    assert metrics["first"]["status"] == "unsupported" and metrics["first"]["new"] is None
+    assert "vars.res.rows[0][2]" in metrics["first"]["reason"]
+
+
+# --------------------------------------------------------------------------
+# 查询快照读不出来、封存核对没过、事后加的遮罩、被改过的指标集
+# --------------------------------------------------------------------------
+
+
+def artifact_file(artifact: str):
+    return settings.data_dir / "artifacts" / artifact[:2] / f"{artifact}.json"
+
+
+@pytest.fixture
+def damage():
+    """删掉、改坏工件文件，测完放回原样：工件按内容寻址，同样的查询、同样的卡在后面的测试里还是这一份文件，
+    put_json 见文件在就不再写——不放回去，后面的测试拿到的就是坏的。"""
+    saved: list[tuple] = []
+
+    def apply(artifact: str, change=None) -> None:
+        path = artifact_file(artifact)
+        text = path.read_text("utf-8")
+        saved.append((path, text))
+        if change is None:
+            path.unlink()
+            return
+        content = json.loads(text)
+        change(content)
+        path.write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+
+    yield apply
+    for path, text in reversed(saved):
+        path.write_text(text, encoding="utf-8")
+
+
+def tamper_cell(content):
+    content["rows"][5][2] = 1.0
+
+
+@pytest.mark.parametrize("change, words", [(None, "无法读取"), (tamper_cell, "哈希")])
+async def test_an_unreadable_snapshot_withholds_the_cells_on_it(client, monkeypatch, damage, change, words):
+    """快照文件不在了、被改过：那一格遮没遮核对不了，卡上记着的值也不给、不能改，代入式也不给。"""
+    row = await run_graph(monkeypatch, query_graph())
+    damage(await snapshot_of(row.id), change)
+    body = await whatif(client, row.id, {"card": "card"})
+    metrics = by_id(body)
+    [cell] = metrics["amount5"]["inputs"]
+    assert cell["old"] is None and cell["new"] is None and cell["editable"] is False and cell.get("withheld") is True
+    assert metrics["amount5"]["substituted"] is None and metrics["per"]["substituted"] is None
+    assert "600.5" not in json.dumps([m["inputs"] for m in body["metrics"]])
+    reasons = {(u["metric"], u["input"]): u["reason"] for u in body["unsupported"]}
+    assert words in reasons[("amount5", AMOUNT5)]
+    resp = await client.post(f"/api/runs/{row.id}/evidence/whatif",
+                             json={"card": "card", "overrides": {"inputs": {AMOUNT5: 1}}})
+    assert resp.status_code == 422 and "快照" in resp.json()["detail"], resp.text
+
+
+async def test_a_mask_set_after_the_run_applies_even_if_the_snapshot_is_gone(client, monkeypatch, shop, damage):
+    row = await run_graph(monkeypatch, query_graph())
+    damage(await snapshot_of(row.id))
+    await set_source(shop, {"mask_columns": ["amount"]})
+    [cell] = by_id(await whatif(client, row.id, {"card": "card"}))["amount5"]["inputs"]
+    assert cell["masked"] is True and cell["old"] is None
+
+
+async def test_masks_added_after_the_run_still_apply(client, monkeypatch, shop):
+    """遮罩是查询当时记下的加数据源现在设的：跑完之后才给 amount 加的遮罩照样生效。"""
+    row = await run_graph(monkeypatch, query_graph())
+    snapshot = await snapshot_of(row.id)
+    await set_source(shop, {"mask_columns": ["amount"]})
+    body = await whatif(client, row.id, {"card": "card"})
+    metrics = by_id(body)
+    [cell] = metrics["amount5"]["inputs"]
+    assert cell["masked"] is True and cell["old"] is None and cell["editable"] is False
+    assert metrics["amount5"]["substituted"] is None and "row_span" not in cell
+    resp = await client.post(f"/api/runs/{row.id}/evidence/whatif",
+                             json={"card": "card", "overrides": {"inputs": {AMOUNT5: 1}}})
+    assert resp.status_code == 422 and "遮罩" in resp.json()["detail"]
+    cnt = by_id(await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [1]}}}))["cnt"]
+    assert cnt["status"] == "masked" and cnt["new"] is None
+
+
+async def test_a_broken_seal_is_not_called_sealed(client, monkeypatch):
+    """封存范围里随便一条事件被改过：照样能推演，但 sealed 为假，界面据此说「封存核对未通过」。"""
+    row = await run_graph(monkeypatch, query_graph())
+    async with SessionLocal() as session:
+        started = (await session.execute(select(RunEvent).where(
+            RunEvent.run_id == row.id, RunEvent.type == "node.started", RunEvent.node_id == "start"))).scalar_one()
+        started.data = {**(started.data or {}), "note": "事后改过"}
+        await session.commit()
+    body = await whatif(client, row.id, {"card": "card", "overrides": {"inputs": {AMOUNT5: 1000}}})
+    assert body["sealed"] is False and body["seal"] == {"sealed": True, "ok": False}
+    assert by_id(body)["amount5"]["new"] == 1000
+    page = (await client.get(f"/api/runs/{row.id}/evidence/whatif/rows",
+                             params={"artifact": await snapshot_of(row.id), "limit": 1})).json()
+    assert page["sealed"] is False and len(page["rows"]) == 1
+
+
+async def test_a_tampered_metric_set_is_refused(client, monkeypatch, damage):
+    row = await run_graph(monkeypatch, query_graph())
+    card = (await whatif(client, row.id, {"card": "card"}))["card"]["artifact"]
+    damage(card, lambda content: content["metrics"][0].update(value=1.5))
+    resp = await client.post(f"/api/runs/{row.id}/evidence/whatif", json={"card": "card"})
+    assert resp.status_code == 409 and resp.json()["code"] == "whatif_card_tampered", resp.text
+
+
+# --------------------------------------------------------------------------
+# 多份报告、合并查询、循环
+# --------------------------------------------------------------------------
+
+
+async def test_two_reports_are_kept_apart(client, monkeypatch):
+    """两个报告节点都引用了这张卡：指定 report 时只列那一份里的地方，不指定时两份都列。"""
+    row = await run_graph(monkeypatch, chain(
+        *query_graph()["nodes"][:4],
+        node("write", "report", instructions="写周报", on_violation="flag"),
+        node("brief", "report", instructions="写简报", on_violation="flag"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"},
+                                      {"name": "简报", "value": "{{ nodes.brief.text }}"}])))
+    changes = {"overrides": {"inputs": {AMOUNT5: 1000}}}
+    both = await whatif(client, row.id, {"card": "card", **changes})
+    assert sorted({s["report"] for s in both["segments"]}) == ["brief", "write"]
+    one = await whatif(client, row.id, {"card": "card", "report": "brief", **changes})
+    assert one["report"] == "brief" and one["segments"] and {s["report"] for s in one["segments"]} == {"brief"}
+    assert len(one["segments"]) == len([s for s in both["segments"] if s["report"] == "brief"])
+
+
+async def test_a_merged_query_with_a_masked_column(client, monkeypatch, shop):
+    """合并查询不是数据源：遮罩按它合并的那几个数据源算，跑完之后才加的遮罩也一样。遮着的列不给值、不能推演。"""
+    merged = "cell(nodes.merged, 5, 'amount')"
+    row = await run_graph(monkeypatch, chain(
+        node("start", "input"),
+        node("q_amount", "tool", tool="db_query__shop", args={"sql": "SELECT id, amount FROM orders ORDER BY id"}),
+        node("q_region", "tool", tool="db_query__shop", args={"sql": "SELECT id, region FROM orders ORDER BY id"}),
+        node("merged", "merge", inputs={"a": "q_amount", "r": "q_region"},
+             sql="SELECT a.id, r.region, a.amount FROM a JOIN r ON a.id = r.id ORDER BY a.id"),
+        node("card", "metrics", caliber="推演口径", metrics=[
+            {"id": "m5", "name": "第六单", "decimals": 1, "expression": merged}]),
+        node("write", "report", instructions="写周报", on_violation="flag"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}])),
+        text="第六单 [[m:m5]]。")
+    [cell] = by_id(await whatif(client, row.id, {"card": "card"}))["m5"]["inputs"]
+    assert cell["editable"] is True and cell["old"] == 600.5
+    await set_source(shop, {"mask_columns": ["amount"]})
+    body = await whatif(client, row.id, {"card": "card"})
+    [cell] = by_id(body)["m5"]["inputs"]
+    assert cell["masked"] is True and cell["old"] is None and by_id(body)["m5"]["substituted"] is None
+    resp = await client.post(f"/api/runs/{row.id}/evidence/whatif",
+                             json={"card": "card", "overrides": {"inputs": {merged: 1}}})
+    assert resp.status_code == 422 and "遮罩" in resp.json()["detail"]
+
+
+async def test_a_card_inside_a_loop_uses_the_node_outputs_from_before_that_execution(client, monkeypatch):
+    """循环体里口径卡先算、fill 后算：第二轮的卡读到的是第一轮 fill 的产出（[1, 10]），不是循环结束时的（[2, 20]）。
+    推演按那次执行开始之前的产出还原。"""
+    row = await run_graph(monkeypatch, {
+        "nodes": [
+            node("start", "input"),
+            node("lp", "loop", mode="foreach", items="[1, 2]", max_iterations=5),
+            node("card", "metrics", caliber="循环口径", on_missing="null", metrics=[
+                {"id": "s", "name": "合计", "expression": "sum(nodes.fill.items)"}]),
+            node("fill", "transform", mode="expression", expression="{'items': [vars.item, vars.item * 10]}"),
+            node("write", "report", instructions="写周报", on_violation="flag"),
+            node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+        ],
+        "edges": [
+            {"source": "start", "target": "lp"},
+            {"source": "lp", "target": "card", "sourceHandle": "body"},
+            {"source": "card", "target": "fill"},
+            {"source": "fill", "target": "lp"},
+            {"source": "lp", "target": "write", "sourceHandle": "done"},
+            {"source": "write", "target": "out"},
+        ],
+    }, text="合计 [[m:s]]。")
+    body = await whatif(client, row.id, {"card": "card", "report": "write"})
+    [s] = body["metrics"]
+    assert s["old"] == 11 and s["inputs"][0]["old"] == "[2 项]"
+    assert [(m, st, new == old) for _, m, st, new, old in await faithful(row.id)] == [("s", "ok", True)]
+
+
+# --------------------------------------------------------------------------
+# 推演里能勾的行
+# --------------------------------------------------------------------------
+
+
+async def test_inputs_carry_the_rows_they_use(client, monkeypatch):
+    row = await run_graph(monkeypatch, query_graph())
+    metrics = by_id(await whatif(client, row.id, {"card": "card"}))
+    [cell] = metrics["amount5"]["inputs"]
+    [rows] = metrics["cnt"]["inputs"]
+    assert cell["row_span"] == [5, 5] and rows["row_span"] == [0, 9]
+
+
+async def test_rows_of_a_sealed_snapshot_can_be_paged_with_masks_applied(client, monkeypatch, shop):
+    """推演区里给整份结果勾行：按页取封存范围内快照的行，遮罩列写「已遮罩」。只读。"""
+    row = await run_graph(monkeypatch, query_graph())
+    snapshot = await snapshot_of(row.id)
+    url = f"/api/runs/{row.id}/evidence/whatif/rows"
+    before = await footprint(row.id)
+    page = (await client.get(url, params={"artifact": snapshot, "offset": 4, "limit": 3})).json()
+    assert page["artifact"] == snapshot and page["columns"] == ["id", "region", "amount"]
+    assert page["row_index"] == [4, 5, 6] and page["row_offset"] == 4 and page["total_rows"] == 10
+    assert page["rows"] == [[5, "华东", 500.5], [6, "华南", 600.5], [7, "华北", 700.5]] and page["masked"] == []
+    assert page["sealed"] is True and page["hash_ok"] is True
+    await set_source(shop, {"mask_columns": ["amount"]})
+    page = (await client.get(url, params={"artifact": snapshot, "limit": 2})).json()
+    assert page["rows"] == [[1, "华南", "已遮罩"], [2, "华北", "已遮罩"]] and page["masked"] == ["amount"]
+    assert await footprint(row.id) == before
+    # 越过末行的页是空的；不属于这次运行的快照、写错的参数说清楚
+    assert (await client.get(url, params={"artifact": snapshot, "offset": 10})).json()["rows"] == []
+    other = await run_graph(monkeypatch, query_graph(sql="SELECT id, region, amount FROM orders ORDER BY id DESC"))
+    for params, words in [({"artifact": await snapshot_of(other.id)}, "封存范围"), ({}, "artifact"),
+                          ({"artifact": snapshot, "limit": "很多"}, "limit"), ({"artifact": snapshot, "offset": -1}, "offset")]:
+        resp = await client.get(url, params=params)
+        assert resp.status_code == 422 and words in resp.json()["detail"], (params, resp.text)
+
+
+async def test_rows_of_an_unreadable_snapshot_are_not_served(client, monkeypatch, damage):
+    row = await run_graph(monkeypatch, query_graph())
+    snapshot = await snapshot_of(row.id)
+    damage(snapshot)
+    page = (await client.get(f"/api/runs/{row.id}/evidence/whatif/rows", params={"artifact": snapshot})).json()
+    assert page["rows"] == [] and page["hash_ok"] is None and "无法读取" in page["note"]
+
+
+# --------------------------------------------------------------------------
+# 下游口径卡、取整
+# --------------------------------------------------------------------------
+
+
+async def test_downstream_cards_through_an_intermediate_node_are_flagged(client, monkeypatch):
+    row = await run_graph(monkeypatch, chain(
+        node("start", "input"),
+        node("fetch", "transform", mode="expression", expression="{'gmv': 100.0}", assign_to="kpi"),
+        node("card", "metrics", caliber="周口径", caliber_version="v1", metrics=[
+            {"id": "gmv", "name": "销售额", "decimals": 1, "expression": "vars.kpi.gmv"}]),
+        node("mid", "transform", mode="expression", expression="{'g': nodes.card.metrics[0].value * 2}", assign_to="t"),
+        node("yearly", "metrics", caliber="年口径", caliber_version="v2", metrics=[
+            {"id": "year", "name": "年化", "decimals": 1, "expression": "vars.t.g * 26"}]),
+        node("out", "output", fields=[{"name": "r", "value": "{{ nodes.yearly.text }}"}])))
+    body = await whatif(client, row.id, {"card": "card", "overrides": {"inputs": {"vars.kpi.gmv": 120}}})
+    [flagged] = body["affected_cards"]
+    assert (flagged["node_id"], flagged["metrics"], flagged["direct"]) == ("yearly", ["year"], False)
+
+
+async def test_downstream_cards_are_flagged_when_the_change_cannot_be_followed(client, monkeypatch):
+    """改动碰到了指标、它却推演不了（还原不了、遮罩）：新值不知道，下游同样可能受影响。"""
+    from app.engine.nodes import metrics as metrics_node
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(metrics_node, "_store_value", nothing)
+    row = await run_graph(monkeypatch, query_graph(between=[node("yearly", "metrics", caliber="年口径", metrics=[
+        {"id": "year", "name": "年化", "decimals": 1, "expression": "nodes.card.metrics[2].value * 52"}])]))
+    body = await whatif(client, row.id, {"card": "card", "metric": "per", "overrides": {"inputs": {AMOUNT5: 1000}}})
+    assert body["metrics"][0]["status"] == "unsupported"
+    assert [c["node_id"] for c in body["affected_cards"]] == ["yearly"]
+
+
+TRICKY = [(2.675, 2), (0.125, 2), (-1.5, 0), (1234.5, -1), (-1250.0, -2), (0.0005, 3), (99.995, 2), (-0.045, 2)]
+
+
+async def test_rounding_matches_the_card_for_tricky_values(monkeypatch):
+    """取整和口径卡逐个对上：二进制里落在半中间的数、负数、负的小数位（取整到十位、百位）。run_metrics 的取整规则哪天
+    改了（比如换成四舍五入），这里会对不上。"""
+    import random
+
+    rng = random.Random(20261005)
+    pairs = TRICKY + [(round(rng.uniform(-1e6, 1e6), rng.randint(0, 6)), rng.randint(-3, 6)) for _ in range(24)]
+    kpi = "{" + ", ".join(f"'v{i}': {v!r}" for i, (v, _) in enumerate(pairs)) + "}"
+    row = await run_graph(monkeypatch, chain(
+        node("start", "input"),
+        node("fetch", "transform", mode="expression", expression=kpi, assign_to="kpi"),
+        node("card", "metrics", caliber="取整口径", metrics=[
+            {"id": f"m{i}", "name": f"m{i}", "format": "plain", "decimals": d, "expression": f"vars.kpi.v{i} * 1.0"}
+            for i, (_, d) in enumerate(pairs)]),
+        node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.text }}"}])))
+    again = await faithful(row.id)
+    assert len(again) == len(pairs)
+    assert [(m, s) for _, m, s, new, old in again if s != "ok" or new != old] == []
