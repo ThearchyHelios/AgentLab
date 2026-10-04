@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -462,6 +463,37 @@ async def test_cost_truncation_follows_priority(monkeypatch, stored):
     outcome = await judge_doc(doc, catalog, spec=SPEC, budget=budget)
     assert {status_of(outcome, doc, t)["reason"] for t in (CAUSAL, NUMBER)} == {"max_cost_usd"}
     assert {status_of(outcome, doc, t)["status"] for t in (CITED, CITED2)} == {"supported"}
+
+
+async def test_a_slow_batch_times_out_alone_and_the_others_keep_their_verdicts(monkeypatch, stored):
+    """真实运行里推理模型拿着 40 句一批，30 秒没回来，整份报告一句都没判成（同一个模型 5 句一批 3 秒多就回来）。
+    现在小批：第一批单独问，之后几批同时问、共用剩下的时长；超时只丢没回来的那一批，回来的判定照样留下。"""
+    Judge(monkeypatch)
+    catalog = make_catalog(stored)
+    raw = "".join(f"第 {i} 个区域的销售额增长来自新客。[[see:m:gmv]]" for i in range(BATCH_SIZE * 3))
+    doc = compose_doc(raw, catalog)
+    real_ask = judge_mod._ask
+    asked: list[int] = []
+    running = peak = 0
+
+    async def ask(model, messages):
+        nonlocal running, peak
+        asked.append(len(re.findall(r"^\[(u\d+)\]", str(messages[-1].content), re.M)))
+        running += 1
+        peak = max(peak, running)
+        try:
+            await asyncio.sleep(5 if len(asked) == 3 else 0.05)     # 第三批卡住
+            return await real_ask(model, messages)
+        finally:
+            running -= 1
+
+    monkeypatch.setattr(judge_mod, "_ask", ask)
+    outcome = await judge_doc(doc, catalog, spec=SPEC,
+                              budget=Budget(max_claims=None, max_cost_usd=None, timeout_s=1, daily_max_usd=None))
+    assert asked == [BATCH_SIZE] * 3
+    assert peak == 2, "第一批单独问，后两批同时问"
+    assert outcome["counts"]["supported"] == BATCH_SIZE * 2
+    assert outcome["unjudged"] == {"timeout_s": BATCH_SIZE} and outcome["limits_hit"] == ["timeout_s"]
 
 
 async def test_unlimited_never_truncates(monkeypatch, stored):
