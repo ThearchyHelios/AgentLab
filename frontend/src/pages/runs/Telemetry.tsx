@@ -1,8 +1,8 @@
-import { useState, type ReactNode } from 'react'
-import { ChevronDown, Shield, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { useId, useState, type ReactNode } from 'react'
+import { ChevronDown, Download, Shield, ShieldAlert, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
-import { StatusPill, toast, useTicker } from '../../components/ui'
+import { Spinner, StatusPill, toast, useTicker } from '../../components/ui'
 import {
   NONE, formatClock, formatCost, formatDateTime, formatNumber, formatSpan, formatTime, formatTokens, shortId,
 } from '../../lib/format'
@@ -10,7 +10,7 @@ import { type StatusCode } from '../../lib/status'
 import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
-import { COST_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
+import { BUNDLE_TEXT, COST_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
 import {
   LONG_WAIT_MS, ageMs, cancelReason, runScope, runTiming, type RunTiming,
 } from './model'
@@ -257,6 +257,8 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
   const [verifying, setVerifying] = useState(false)
   const [fresh, setFresh] = useState(false)
   const [open, setOpen] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const blockedId = useId()
   const sealed = !!run.manifest_hash
 
   const doVerify = async () => {
@@ -280,6 +282,28 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
     : phase === 'waiting'
       ? '等待审批中，运行结束后封存'
       : '本次运行没有封存清单'
+
+  // 可验证报告只给结束了、封存了的运行：没封存的事件还会变；失败后接着跑的运行留着上一次的封存，跑完会换掉清单
+  // 哈希，导出去的文件就和系统对不上了（规则同服务端 api/bundle.py）。封存核对不一致由服务端回 409，提示里照实说
+  const finished = phase === 'succeeded' || phase === 'failed' || phase === 'cancelled'
+  const exportBlocked = sealed && finished ? null
+    : phase === 'waiting' ? BUNDLE_TEXT.blockedWaiting
+    : !finished ? BUNDLE_TEXT.blockedRunning
+    : BUNDLE_TEXT.blockedUnsealed
+
+  const doExport = async () => {
+    setExporting(true)
+    try {
+      const { blob, name } = await api.bundle.download(run.id)
+      const file = name ?? BUNDLE_TEXT.fileName(runName(run))
+      saveFile(file, blob)
+      toast.ok(BUNDLE_TEXT.exported(file))
+    } catch (e) {
+      toast.error(e, { key: `bundle:${run.id}` })
+    } finally {
+      setExporting(false)
+    }
+  }
 
   // 扫描线的时长按事件条数估：重算的就是这些事件
   const scanMs = Math.min(2400, Math.max(600, eventCount * 0.8))
@@ -321,6 +345,15 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
             {verify ? '重新核对' : '核对'}
           </button>
         )}
+        {/* 禁用的按钮收不到指针事件，悬停提示挂在外面那层上；读屏经 aria-describedby 读到原因 */}
+        <span className="inline-flex" title={exportBlocked ?? BUNDLE_TEXT.hint}>
+          <button type="button" className="btn btn-xs btn-ghost" disabled={!!exportBlocked || exporting}
+                  onClick={() => void doExport()} aria-describedby={exportBlocked ? blockedId : undefined}
+                  data-bundle-export={exportBlocked ? 'blocked' : exporting ? 'busy' : 'ready'}>
+            {exporting ? <Spinner size={10} /> : <Download size={11} aria-hidden />} {BUNDLE_TEXT.export}
+          </button>
+        </span>
+        {exportBlocked && <span id={blockedId} className="sr-only" data-bundle-blocked="">{exportBlocked}</span>}
         <button
           type="button"
           className="btn btn-xs btn-ghost"
@@ -337,6 +370,16 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
       {open && <ProvenanceDetail id={`prov-${run.id}`} run={run} verify={verify} eventCount={eventCount} />}
     </div>
   )
+}
+
+/** 存成文件：同 EvidencePane 的下载写法（对象 URL 交给一个临时的链接点一下，稍后回收） */
+function saveFile(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 function VerifyState({ verify, verifying, fresh }: { verify: VerifyResult | null; verifying: boolean; fresh: boolean }) {
