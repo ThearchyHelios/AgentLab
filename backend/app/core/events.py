@@ -65,6 +65,10 @@ class EventType(StrEnum):
     # 人工介入
     HUMAN_REQUESTED = "human.requested"
     HUMAN_RESOLVED = "human.resolved"
+    # 审批质询：运行停在审批时，审批人就待审的报告问的一个问题和得到的回答（engine/run_append.py 追加，
+    # node_id 为空）。这次问答的用量写在事件数据的 usage 里，计进运行用量（runner._usage_of_events）。
+    # 停在审批时追加的随运行结束一起封存；封存之后追加的带 post_seal: true，是批注不是证据
+    APPROVAL_INQUIRY = "approval.inquiry"
 
     # 出具与口径治理
     ISSUANCE = "issuance"  # 出具契约的判定结果（档位 / 缺数据 / 未回指数字）
