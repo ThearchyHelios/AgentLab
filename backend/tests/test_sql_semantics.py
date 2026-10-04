@@ -4,11 +4,12 @@
   不同，不能算模板变了）；关键字大小写、空白、注释也不算不同；解析不了的退回逐词规范化，照样认得出只改了字面量
 - facets：表、连接（类型 / 关联进来的表 / ON 条件）、WHERE 合取式、时间条件（列 / 运算符 / 取值）、分组、聚合
   （函数 / 参数 / 去重）、HAVING、取哪几行（各段的 LIMIT / OFFSET / 排序）。别名换成真实表名（条件里套着的子查询、
-  HAVING 里的别名也是），CTE、子查询按位置编号、不按起的名字比，条件里的子查询选出来的列名不算；比较的两边排好
-  顺序；解析不了带 parse_error，不抛
+  HAVING 里的别名也是），CTE、子查询不按起的名字比（单看一条按位置编号），条件里的子查询选出来的列名不算；比较的
+  两边排好顺序；解析不了带 parse_error，不抛
 - diff_facets：每处不同一句中文：「A 按支付时间 paid_at 筛时间，B 按下单时间 created_at」「A 排除了
-  is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报，一边多出一个排在
-  前面的 CTE、编号错开了也不报
+  is_deleted = 1 的行，B 没有」「A 对 order_id 去重计数，B 没去重」……写法不同、口径相同的不报。两边的派生来源先按
+  结构（读的表、各列的定义、名字）配好对再比：一边多出一个排在前面的 CTE、内连接换了先后不报，两个 CTE 算出同名
+  的列时外层用的是哪一个照报
 
 夹具全是虚构的表：订单 orders、退款 refunds、门店 stores、用户 users、付款 payments，以及一张中文表「订单」。
 """
@@ -273,6 +274,7 @@ def test_facets_are_json_ready():
     f = facets("SELECT COUNT(DISTINCT order_id) FROM orders WHERE paid_at >= '2026-09-01' GROUP BY region")
     data = json.loads(json.dumps(f.as_dict(), ensure_ascii=False))
     assert data["aggregates"][0]["distinct"] is True and data["time"][0]["op"] == ">="
+    assert not [k for k in data if k.startswith("_")], "拿来重新分析的原文不进 as_dict"
 
 
 # --------------------------------------------------------------------------
@@ -552,8 +554,9 @@ SHIFTED_B = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
 
 
 def test_a_shifted_derived_number_does_not_split_one_condition_in_two():
-    """编号只看位置：一边多出一个排在前面的 CTE（筛 VIP 用户），后面那个 CTE 的编号就错开了。按编号比不上的再按
-    不写编号的写法一对一地配，同一个条件不会被说成两边各有一个；真正的不同（VIP 用 IN 筛还是关联进来）照报。"""
+    """位置编号只看先后：一边多出一个排在前面的 CTE（筛 VIP 用户），后面那个 CTE 的位置编号就错开了。两边的派生
+    来源先按结构配好对（t 配 t，vip 配不上），按共同的编号比，同一个条件不会被说成两边各有一个；真正的不同（VIP
+    用 IN 筛还是关联进来）照报。"""
     found = diff_facets(facets(SHIFTED_A), facets(SHIFTED_B), labels=("原流程", "盲算"))
     filters = [d.text for d in found if d.aspect == "filter"]
     assert filters == ["原流程只保留 user_id IN (SELECT id FROM users WHERE vip = 1) 的行，盲算没有这个条件"]
@@ -605,7 +608,8 @@ def test_a_shifted_derived_number_is_no_difference_in_any_aspect(aspect, a, b):
 
 
 def test_a_shifted_number_inside_a_condition_subquery_is_no_difference():
-    """条件里的子查询用到的 CTE 编号错开了：子查询整个写进外层条件的那一份，按不写编号的写法也写「@」，照样配得上。"""
+    """条件里的子查询用到的 CTE 位置编号错开了：两边的 t 按结构配成一对、写同一个编号，子查询整个写进外层条件的
+    那一份照样对得上。"""
     a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
          "SELECT COUNT(*) FROM users u WHERE u.vip = 1 AND u.id IN (SELECT user_id FROM t WHERE total > 100)")
     b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
@@ -615,8 +619,8 @@ def test_a_shifted_number_inside_a_condition_subquery_is_no_difference():
 
 
 def test_a_shifted_derived_join_is_paired_with_its_counterpart():
-    """关联进来的 CTE 编号错开了（盲算多关联了一个排在前面的 CTE）：先把完全一样的关联配掉，再按关联的是哪张表配，
-    不会把原流程的 t 和盲算的 vip 当成同一处关联、说成「关联条件不同」。"""
+    """关联进来的 CTE 位置编号错开了（盲算多关联了一个排在前面的 CTE）：两边的派生来源先按结构配好对，原流程的 t
+    配盲算的 t，不会和盲算的 vip 当成同一处关联、说成「关联条件不同」。"""
     a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
          "SELECT COUNT(*) FROM users u JOIN t ON t.user_id = u.id WHERE t.total > 100")
     b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
@@ -627,8 +631,8 @@ def test_a_shifted_derived_join_is_paired_with_its_counterpart():
 
 
 def test_swapped_join_order_of_two_derived_tables_is_no_difference():
-    """两个 CTE 关联的先后对调，编号也跟着对调：拿它们的列互相比的条件，两边先按不写编号的写法排好两边的先后，
-    才配得上（只按编号排，同一个比较会排成两个方向）。"""
+    """两个 CTE 关联的先后对调，位置编号也跟着对调：两边按结构配好对、写同一个编号之后，拿它们的列互相比的条件
+    排成同一个方向（只按位置编号排，同一个比较会排成两个方向），关联按涉及的两边比，不按哪一侧是关联进来的。"""
     ctes = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
             "u AS (SELECT user_id, COUNT(*) AS cnt FROM refunds GROUP BY user_id) ")
     assert texts(ctes + "SELECT COUNT(*) FROM t JOIN u ON u.user_id = t.user_id WHERE t.total > u.cnt",
@@ -636,8 +640,8 @@ def test_swapped_join_order_of_two_derived_tables_is_no_difference():
 
 
 def test_a_reversed_comparison_between_two_derived_tables_is_still_reported():
-    """两个 CTE 算出了同名的列：编号对得上时照样分得清是哪个 CTE 的，比较的方向反了要报出来（不写编号的写法只在
-    按编号比不上时才拿来配，不会把它吞掉）。"""
+    """两个 CTE 算出了同名的列：按结构配好对之后照样分得清是哪个 CTE 的，比较的方向反了要报出来（只按配好的编号
+    比，不拿不写编号的写法补配，不会把它吞掉）。"""
     a = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
          "refunded AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
          "SELECT COUNT(*) FROM paid p JOIN refunded r ON r.user_id = p.user_id WHERE p.total > r.total")
@@ -658,6 +662,209 @@ def test_a_real_difference_next_to_renamed_derived_tables_is_reported_once():
     outer = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
              "SELECT COUNT(*) FROM t WHERE total > 200")
     assert texts(a, outer, labels=("原流程", "盲算")) == ["原流程按 total > 100 筛选，盲算按 total > 200 筛选"]
+
+
+# --------------------------------------------------------------------------
+# diff_facets：两边的派生来源按结构配对
+# --------------------------------------------------------------------------
+
+#: 两个 CTE 算出了同名的列 total：一个是付款合计，一个是退款合计
+PAID_REFUNDED = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+                 "refunded AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) ")
+PR_JOIN = "FROM paid p JOIN refunded r ON r.user_id = p.user_id"
+#: 同样两段写成 FROM 里的子查询
+PR_SUBQUERIES = ("FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p "
+                 "JOIN (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r "
+                 "ON r.user_id = p.user_id")
+
+
+@pytest.mark.parametrize("form", ["cte", "subquery"])
+@pytest.mark.parametrize("a,b,expected", [
+    ("SELECT SUM(p.total) {j}", "SELECT SUM(r.total) {j}",
+     ["原流程对 paid.total 求和，盲算对 refunded.total 求和"]),
+    ("SELECT SUM(p.total - r.total) {j}", "SELECT SUM(r.total - p.total) {j}",
+     ["原流程对 paid.total - refunded.total 求和，盲算对 refunded.total - paid.total 求和"]),
+    ("SELECT COUNT(*) {j} WHERE p.total > 100", "SELECT COUNT(*) {j} WHERE r.total > 100",
+     ["原流程按 paid.total > 100 筛选，盲算按 refunded.total > 100 筛选"]),
+    ("SELECT p.user_id {j} ORDER BY p.total DESC LIMIT 10", "SELECT p.user_id {j} ORDER BY r.total DESC LIMIT 10",
+     ["原流程取行前按 paid.total 降序排，盲算按 refunded.total 降序排"]),
+    ("SELECT p.user_id {j} GROUP BY p.user_id HAVING MAX(p.total) > 10",
+     "SELECT p.user_id {j} GROUP BY p.user_id HAVING MAX(r.total) > 10",
+     ["原流程对 paid.total 取最大值，盲算对 refunded.total 取最大值",
+      "原流程分组后只保留 MAX(paid.total) > 10 的组，盲算只保留 MAX(refunded.total) > 10 的组"]),
+    ("SELECT COUNT(*) {j} WHERE p.total - r.total > 100", "SELECT COUNT(*) {j} WHERE r.total - p.total > 100",
+     ["原流程只保留 paid.total - refunded.total > 100 的行，盲算没有这个条件",
+      "盲算只保留 refunded.total - paid.total > 100 的行，原流程没有这个条件"]),
+], ids=["sum", "sum-of-difference", "where", "order-by", "having", "where-difference"])
+def test_which_derived_table_a_column_comes_from_is_reported(form, a, b, expected):
+    """两个派生来源算出了同名的列（付款合计、退款合计都叫 total），编号也对得上：外层用的是哪一个的 total 不同，
+    聚合、条件、排序、HAVING 里都得照报，不能因为都是「某个 CTE 的 total」就当成一样。只读得出列名的写法两边
+    一样时，改用带来源名字的写法说。"""
+    if form == "cte":
+        head, j = PAID_REFUNDED, PR_JOIN
+    else:
+        head, j = "", PR_SUBQUERIES
+        expected = [t.replace("paid.", "p.").replace("refunded.", "r.") for t in expected]
+    assert texts(head + a.format(j=j), head + b.format(j=j), labels=("原流程", "盲算")) == expected
+
+
+def test_renamed_and_reordered_derived_tables_still_tell_their_columns_apart():
+    """盲算给两个 CTE 另起了名字、定义和关联的先后也反过来：按里面读的表和各列的定义认出谁对谁，外层用的是
+    哪一个的列照样分得清；同一列只是名字、先后不同的不报。"""
+    b_head = ("WITH ref_sum AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id), "
+              "pay_sum AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) ")
+    b_join = "FROM ref_sum r JOIN pay_sum p ON p.user_id = r.user_id"
+    labels = ("原流程", "盲算")
+    assert texts(PAID_REFUNDED + f"SELECT SUM(p.total) {PR_JOIN}",
+                 b_head + f"SELECT SUM(r.total) {b_join}", labels=labels) == \
+        ["原流程对 paid.total 求和，盲算对 ref_sum.total 求和"]
+    assert texts(PAID_REFUNDED + f"SELECT COUNT(*) {PR_JOIN} WHERE p.total > 100",
+                 b_head + f"SELECT COUNT(*) {b_join} WHERE r.total > 100", labels=labels) == \
+        ["原流程按 paid.total > 100 筛选，盲算按 ref_sum.total > 100 筛选"]
+    assert texts(PAID_REFUNDED + f"SELECT SUM(p.total) {PR_JOIN} WHERE p.total > r.total",
+                 b_head + f"SELECT SUM(p.total) {b_join} WHERE r.total < p.total") == []
+
+
+def test_an_extra_derived_table_on_one_side_is_not_paired_with_another():
+    """盲算多一个排在前面的 CTE（vip），位置编号就错开了：原流程的 t 要和盲算的 t 配成一对（里面读的表、各列的
+    定义都一样），不能按编号配给 vip。"""
+    a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN t ON t.user_id = u.id")
+    b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+         "t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN vip ON vip.id = u.id JOIN t ON t.user_id = u.referrer_id")
+    assert texts(a, b, labels=("原流程", "盲算")) == [
+        "盲算只保留 vip = 1 的行，原流程没有这个条件",
+        "原流程关联 t 表的条件是 orders.user_id = users.id，盲算是 orders.user_id = users.referrer_id",
+        "盲算关联了 vip 表，原流程没有"]
+    # 两边各一个、结构毫不相干的派生来源也不配成一对：各说各的
+    other = ("WITH vip AS (SELECT id FROM users WHERE vip = 1) "
+             "SELECT COUNT(*) FROM users u JOIN vip ON vip.id = u.id")
+    joins = [d.text for d in diff_facets(facets(a), facets(other), labels=("原流程", "盲算")) if d.aspect == "join"]
+    assert joins == ["原流程关联了 t 表，盲算没有", "盲算关联了 vip 表，原流程没有"]
+
+
+def test_unused_ctes_take_part_in_pairing():
+    """两边都定义了付款、退款两个 CTE，原流程关联付款的、盲算关联退款的：没用到的那个也参加配对，付款配付款、退款
+    配退款，不会把两边各自用到的那个只凭列名都叫 user_id、total 凑成一对，说成「关联条件不同」。"""
+    a = PAID_REFUNDED + "SELECT COUNT(*) FROM users u JOIN paid p ON p.user_id = u.id"
+    b = PAID_REFUNDED + "SELECT COUNT(*) FROM users u JOIN refunded r ON r.user_id = u.id"
+    assert texts(a, b, labels=("原流程", "盲算")) == ["原流程关联了 paid 表，盲算没有", "盲算关联了 refunded 表，原流程没有"]
+
+
+@pytest.mark.parametrize("a,b,expected", [
+    ("SELECT SUM(o.amount) FROM orders o WHERE o.status = 'paid'",
+     "SELECT SUM(o.amount) FROM stores s JOIN orders o ON o.store_id = s.id WHERE o.status = 'paid'",
+     ["盲算关联了 stores 表，原流程没有"]),
+    ("SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
+     "SELECT SUM(o.amount) FROM users u JOIN refunds r ON r.user_id = u.id JOIN orders o ON o.id = r.order_id",
+     ["盲算关联了 users 表，原流程没有"]),
+    (PAID_REFUNDED + f"SELECT COUNT(*) {PR_JOIN} WHERE p.total > r.total",
+     "WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+     "paid AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), "
+     "refunded AS (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) "
+     "SELECT COUNT(*) FROM vip v JOIN refunded r ON r.user_id = v.id JOIN paid p ON p.user_id = r.user_id "
+     "WHERE p.total > r.total",
+     ["盲算只保留 vip = 1 的行，原流程没有这个条件", "盲算关联了 vip 表，原流程没有", "盲算用到了 users 表，原流程没有"]),
+    # 原流程只在条件的子查询里用到 users：那不是连接的一头，盲算多关联的还是 users
+    ("SELECT SUM(o.amount) FROM orders o WHERE o.user_id IN (SELECT id FROM users WHERE vip = 1)",
+     "SELECT SUM(o.amount) FROM users u JOIN orders o ON o.user_id = u.id WHERE u.vip = 1",
+     ["原流程只保留 user_id IN (SELECT id FROM users WHERE vip = 1) 的行，盲算没有这个条件",
+      "盲算关联了 users 表，原流程没有"]),
+], ids=["real-table", "real-table-chain", "derived-shifted-and-swapped", "in-subquery-is-not-a-join"])
+def test_an_extra_source_written_in_from_is_named_correctly(a, b, expected):
+    """盲算多出来的来源写在 FROM 里、靠内连接接上原流程也有的表（FROM stores JOIN orders）：多出来的是 stores，
+    不能说成「盲算关联了 orders 表」（原流程查的就是 orders）；已经说了「关联了 stores 表」的，不再另说一遍「用到了
+    stores 表」。"""
+    assert texts(a, b, labels=("原流程", "盲算")) == expected
+
+
+def test_a_lateral_subquery_is_named_by_its_alias():
+    """LATERAL 子查询的别名挂在 LATERAL 上：取哪几行的说明里照写它，不写「子查询」。"""
+    a = ("SELECT o.id FROM orders o, LATERAL (SELECT amount FROM refunds r WHERE r.order_id = o.id "
+         "ORDER BY amount DESC LIMIT 1) l")
+    b = ("SELECT o.id FROM orders o CROSS JOIN LATERAL (SELECT amount FROM refunds r WHERE r.order_id = o.id "
+         "ORDER BY amount DESC LIMIT 2) AS x")
+    assert texts(a, b, "postgres") == ["A 在 l 里只取前 1 行，B 在 x 里只取前 2 行"]
+
+
+def test_a_paired_derived_join_with_another_name_says_both_names():
+    """配成一对的派生来源两边名字不同（原流程叫 t、盲算叫 totals）：关联条件不同时两个名字都说出来。"""
+    a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN t ON t.user_id = u.id")
+    b = ("WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM users u JOIN totals ON totals.user_id = u.referrer_id")
+    assert texts(a, b, labels=("原流程", "盲算")) == [
+        "原流程关联 t 表的条件是 orders.user_id = users.id，盲算关联 totals 表的条件是 orders.user_id = users.referrer_id"]
+    left = b.replace("JOIN totals ON totals.user_id = u.referrer_id", "LEFT JOIN totals ON totals.user_id = u.id")
+    assert texts(a, left, labels=("原流程", "盲算")) == ["原流程用 INNER JOIN 关联 t 表，盲算用 LEFT JOIN 关联 totals 表"]
+
+
+@pytest.mark.parametrize("a,b", [
+    (PAID_REFUNDED + f"SELECT COUNT(*) {PR_JOIN} WHERE p.total > r.total",
+     PAID_REFUNDED + "SELECT COUNT(*) FROM refunded r JOIN paid p ON p.user_id = r.user_id WHERE p.total > r.total"),
+    (f"SELECT COUNT(*) {PR_SUBQUERIES} WHERE p.total > r.total",
+     "SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r "
+     "JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p ON p.user_id = r.user_id "
+     "WHERE p.total > r.total"),
+    # 两个 CTE 读同一张表、各列的定义也一样，只差筛选条件：按整段的写法认得出谁是谁
+    ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id), "
+     "open AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' GROUP BY user_id) "
+     "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE p.total > o.total",
+     "WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id), "
+     "open AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' GROUP BY user_id) "
+     "SELECT COUNT(*) FROM open o JOIN paid p ON p.user_id = o.user_id WHERE o.total < p.total"),
+    # 实表也一样：内连接换个先后写，意思不变
+    ("SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.amount > r.amount",
+     "SELECT SUM(o.amount) FROM refunds r JOIN orders o ON o.id = r.order_id WHERE o.amount > r.amount"),
+    ("SELECT SUM(o.amount) FROM orders o, refunds r WHERE r.order_id = o.id",
+     "SELECT SUM(o.amount) FROM refunds r, orders o WHERE r.order_id = o.id"),
+], ids=["cte", "subquery", "same-shape-ctes", "real-tables", "comma-join"])
+def test_swapping_the_order_of_an_inner_join_is_no_difference(a, b):
+    """内连接两边换个先后（FROM paid JOIN refunded 换成 FROM refunded JOIN paid）意思不变：派生来源按结构配对，
+    比较的两边按配好的编号排，不会排成两个方向、报出两条自相矛盾的话；连接按涉及的两边和条件比，不按哪一侧是
+    关联进来的。"""
+    assert texts(a, b) == []
+
+
+def test_two_same_shape_derived_tables_are_paired_by_their_conditions():
+    """两个 CTE 读同一张表、各列定义也一样（付款的、未付的），盲算两个都另起了名字、都多加了 is_deleted = 0、关联的
+    先后也反过来：结构上只剩里面的条件分得开，按条件的重合配（status = 'paid' 配 status = 'paid'），只报多出来的那个
+    条件，外层拿两者比的条件不跟着报。"""
+    a = ("WITH paid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY user_id), "
+         "open AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' GROUP BY user_id) "
+         "SELECT COUNT(*) FROM paid p JOIN open o ON o.user_id = p.user_id WHERE p.total > o.total")
+    b = ("WITH unpaid AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'open' AND is_deleted = 0 "
+         "GROUP BY user_id), "
+         "settled AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE status = 'paid' AND is_deleted = 0 "
+         "GROUP BY user_id) "
+         "SELECT COUNT(*) FROM unpaid u JOIN settled s ON s.user_id = u.user_id WHERE u.total < s.total")
+    assert texts(a, b, labels=("原流程", "盲算")) == ["盲算只保留 is_deleted = 0 的行，原流程没有这个条件"]
+
+
+def test_limits_inside_derived_tables_are_paired_by_structure():
+    """CTE 里取哪几行按配好对的派生来源比，不按出现的先后：盲算多一个排在前面、也限了行数的 CTE，不能拿它和
+    原流程的 top 比。"""
+    a = ("WITH top AS (SELECT user_id, amount FROM orders ORDER BY amount DESC LIMIT 10) "
+         "SELECT SUM(amount) FROM top")
+    b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1 LIMIT 5), "
+         "top AS (SELECT user_id, amount FROM orders ORDER BY amount DESC LIMIT 10) "
+         "SELECT SUM(top.amount) FROM top JOIN vip ON vip.id = top.user_id")
+    found = [d.text for d in diff_facets(facets(a), facets(b), labels=("原流程", "盲算")) if d.aspect == "limit"]
+    assert found == ["原流程不限行数，盲算在 vip 里只取前 5 行"]
+
+
+def test_a_changed_column_inside_a_renamed_derived_table_is_said_once():
+    """CTE 里一列的算法变了（对 amount 求和换成对 paid_amount 求和），名字也另起了：按读的表和选出来的列名仍配成
+    一对，只报里面那处不同，外层按这一列写的条件不跟着报成两边各有一个。"""
+    a = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM t WHERE total > 100")
+    b = ("WITH vip AS (SELECT id FROM users WHERE vip = 1), "
+         "x AS (SELECT user_id, SUM(paid_amount) AS total FROM orders GROUP BY user_id) "
+         "SELECT COUNT(*) FROM vip JOIN x ON x.user_id = vip.id WHERE total > 100")
+    found = diff_facets(facets(a), facets(b), labels=("原流程", "盲算"))
+    assert "原流程对 amount 求和，盲算对 paid_amount 求和" in [d.text for d in found]
+    assert not [d for d in found if d.aspect == "filter" and "total" in d.text]
 
 
 @pytest.mark.parametrize("a,b,text", [
