@@ -83,6 +83,12 @@ function whatifReply(body) {
     segments: [{ report: 'write', unit: 'u4', sid: 's22', metric: 'adj', rendered_old: '44,000.0元', rendered_new: '44,000.0元', changed: false }],
     unsupported: [{ metric: 'adj', input: 'vars.adjust.items', reason: '无法推演：当时没有保存这个输入的完整值' }] }
   }
+  if (body?.metric === 'fx') {
+    // 空态：原式里没有引用任何输入（写死的常数）
+    return { ...base, metrics: [{ id: 'fx', name: '汇率', unit: '', old: 7.12, new: 7.12, delta: 0, rendered_old: '7.12',
+      rendered_new: '7.12', rendered_delta: null, changed: false, status: 'unchanged', reason: null, substituted: '7.12', inputs: [] }],
+    segments: [], unsupported: [] }
+  }
   const def = METRICS[body?.metric]
   const step = chainOf(def.sid)[0]
   const views = inputsOf(def.sid).map((inp) => {
@@ -298,6 +304,16 @@ await section('不支持的输入', async () => {
     .includes('无法推演：当时没有保存这个输入的完整值'))
   check('容器输入不给输入框', await page.locator('[data-whatif-field]').count() === 0
     && (await text(page, '[data-whatif-input="vars.adjust.items"] [data-whatif-value]')).includes('[4 项]'))
+  await ctx.close()
+})
+
+await section('空态', async () => {
+  const { ctx, page } = await open('whatif')
+  await openMetric(page, 's24')
+  await openWhatIf(page)
+  check('原式没有引用输入：说清无可推演，不画空列表', (await text(page, '[data-whatif-empty]')).includes('无可推演')
+    && await page.locator('[data-whatif-input]').count() === 0)
+  check('没有报告引用时不画「报告中会变的地方」', await page.locator('[data-whatif-segments]').count() === 0)
   await ctx.close()
 })
 
