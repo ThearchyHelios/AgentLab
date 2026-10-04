@@ -1320,6 +1320,26 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
     .find((s) => s.code === 'report_catalog_trimmed')
   check('……缺字段时标题照样说人话，不出 undefined', trimmedBare?.title === '证据目录超出篇幅，部分查询只列了编号和摘要'
     && trimmedBare?.sub === undefined, `${trimmedBare?.title} / ${trimmedBare?.sub}`)
+
+  // 目录有省略时报告写了缺失断言（「没有查到」「数据缺失」），交回重写一次仍在：只标注、不判失败，时间线单独一行说清
+  check('后端发缺失断言的警告，带着 count、texts', reportPy.includes('code="report_absence_claim"')
+    && reportPy.includes('count=len(absent), texts=texts'), '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const ABSENT = '报告在证据目录有省略时写了 2 处缺失断言（「数据缺失」、「没有查到」），已要求模型重写 1 次仍未改掉：'
+    + '被省略的查询仍在证据台账里，这类结论依据不足，应写作本报告未覆盖。报告照常产出，这几处已标注'
+  const absentRun = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_absence_claim', message: ABSENT, count: 2, texts: ['数据缺失', '没有查到'] }),
+    E(3, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 1, ok: false, on_violation: 'fail', failed: false,
+      stats: { numbers: 0, numbers_cited: 0, uncited_numbers: 0, unresolved: 0 },
+      violations: [{ code: 'absence_claim', text: '数据缺失', message: '证据目录有省略时写了缺失断言：写作模型没有看到全部证据，「没有查到」「不存在」「缺失」这类结论依据不足' }] }),
+  ]))
+  const ab = absentRun.find((s) => s.code === 'report_absence_claim')
+  check('report_absence_claim：标题说几处缺失断言、已标注、为什么（目录有省略）', ab?.title === '报告写了 2 处缺失断言，已标注（证据目录有省略）', ab?.title)
+  check('……副标题点名那几处说法', ab?.sub === '「数据缺失」、「没有查到」', ab?.sub)
+  check('……下一步说被省略的仍在台账里、应写「本报告未覆盖」；是提醒（warn），原话留在展开区',
+    !!ab?.next?.includes('本报告未覆盖') && !!ab?.next?.includes('证据台账') && ab?.level === 'warn' && ab?.detail === ABSENT, ab?.next)
+  const rcAbsent = absentRun.find((s) => s.code === 'report_checked')
+  check('……核对那一行照常完成（不判失败），违规清单里写着这条的说明', rcAbsent?.status === 'done'
+    && !!rcAbsent?.detail?.includes('缺失断言') && !!rcAbsent?.detail?.includes('依据不足'), `${rcAbsent?.status} ${rcAbsent?.detail}`)
 })
 
 await section('工具门控 tool.gated（工具信任三档）', async () => {

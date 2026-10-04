@@ -2474,11 +2474,13 @@ def compose_doc(
     cells_allowed: bool = True,
     loader: Loader | None = None,
     entities: bool = True,
+    absence: bool = False,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
+    absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
@@ -2634,8 +2636,10 @@ def compose_doc(
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
-    # 句中的 [[see:]] 只在组装时查（交回写作者重写）：出口复核看的是数字和出处，句子通不通不影响出具
-    doc["stats"], doc["violations"] = checked["stats"], checked["violations"] + inline_see(source)
+    # 句中的 [[see:]]、目录有省略时的缺失断言只在组装时查（交回写作者重写）：出口复核看的是数字和出处，
+    # 句子通不通、结论有没有越过证据不影响出具
+    doc["stats"], doc["violations"] = checked["stats"], \
+        checked["violations"] + inline_see(source) + (absence_claims(doc) if absence else [])
     return doc
 
 
@@ -3035,6 +3039,58 @@ def inline_see(source: str) -> list[dict[str, Any]]:
     return [_violation("inline_see", INLINE_SEE_MESSAGE, text=m.group(0)) for m in _INLINE_SEE.finditer(source or "")]
 
 
+#: 写作目录有省略、或者有来源的结构化结论为空时，拼在写作规则后面（给模型看）
+ABSENCE_RULE = (
+    "这次你看不到全部证据（证据目录有省略，或者有来源的结构化结论为空）：不得断言「没有查到」「未查到」「不存在」"
+    "「缺失」「没有数据」「无数据」这类结论。某个方向的证据没有展开或为空时，只能写「本报告未覆盖……」，并说明依据不足"
+    "（比如「目录有省略，相关查询未展开」），句末可以挂 [[see:Qn]] 指向相关查询。"
+)
+
+#: 缺失断言：断言「没有数据」的几种说法。只认拿得准的，不泛化：「不存在明显差异」「缺少口径说明」这类说的是看到的
+#: 数据里的情况，不算；「不存在」「为空」「缺失」只认跟在数据、记录、结果后面（或者前面）的
+_ABSENCE = re.compile(
+    r"(?:没有|没|未|未能|没能)(?:查询|查)到|查不到|查无"
+    r"|(?:没有|暂无|并无)(?:任何)?(?:相关的?)?(?:数据|记录|结果)"
+    r"|无(?:任何)?(?:相关的?)?(?:数据|记录)(?![库源集表权字项列])"
+    r"|不存在(?:任何)?(?:相关的?)?(?:数据|记录|结果)|(?:数据|记录|结果)(?:均|都|全部)?(?:不存在|为空|缺失|空缺)"
+)
+#: 前面是这些词的不算：「不代表没有数据」「并非查不到」说的恰恰是不能下这个结论
+_ABSENCE_NEGATED = re.compile(r"(?:不代表|并不代表|不等于|不意味着|并非|不是|不能说明|不能断言|不得断言|不应断言)[^。！？\n]{0,6}$")
+ABSENCE_MESSAGE = _Reason(
+    "证据目录有省略时写了缺失断言：写作模型没有看到全部证据，「没有查到」「不存在」「缺失」这类结论依据不足",
+    "证据目录有省略（没展开的查询只列了编号和摘要），这一句却断言了没有数据。看不到的证据不能当成不存在："
+    "改成「本报告未覆盖……」，并说明依据不足（目录有省略、相关查询未展开），不要写「没有查到」「不存在」「缺失」「没有数据」",
+)
+
+
+def absence_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """正文里的缺失断言（_ABSENCE），每处一条违规 absence_claim。只在写作目录有省略时由报告节点要求查（compose_doc 的
+    absence）：目录全给了的时候，「本周没有退款记录」可能就是看了数据说的。
+
+    在渲染后的正文里找（标记已经换成了字），代码块不查。带着 span、所在片段和句子：证据面板能定位、能显示原句。
+    """
+    markdown = str(doc.get("markdown") or "")
+    found: list[dict[str, Any]] = []
+    for block in doc.get("blocks") or []:
+        if block.get("type") == "code":
+            continue
+        for unit in block.get("units") or []:
+            span = unit.get("span")
+            if not (isinstance(span, list) and len(span) == 2):
+                continue
+            sentence = markdown[span[0]:span[1]]
+            for m in _ABSENCE.finditer(sentence):
+                if _ABSENCE_NEGATED.search(sentence[:m.start()]):
+                    continue
+                at = span[0] + m.start()
+                seg = next((g for g in unit.get("segments") or [] if g.get("kind") != "structural"
+                            and isinstance(g.get("span"), list) and g["span"][0] <= at < g["span"][1]), None)
+                found.append(_violation("absence_claim", ABSENCE_MESSAGE, text=m.group(0),
+                                        span=[at, span[0] + m.end()], context=sentence.strip()[:120],
+                                        segment=seg.get("id") if seg else None, unit=unit.get("id")))
+    return found
+
+
 #: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
 #: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
 CELL_RULES = (
@@ -3320,8 +3376,16 @@ def _fields_prompt(sources: list[dict[str, Any]], catalog: dict[str, Any], snaps
             empty, list(dict.fromkeys(cited)))
 
 
-def _query_brief(entry: dict[str, Any], tables: list[str]) -> str:
-    """没展开的查询在目录里的一行摘要：编号、查的表（没有表结构时写工具名）、行数。"""
+def _query_brief(entry: dict[str, Any], tables: list[str], snaps: _Snapshots) -> str:
+    """没展开的查询在目录里的一行摘要：编号、查的表、行数。
+
+    表先看目录里的表条目（带表结构快照的查询才有），没有就从查询快照里存的 SQL 认（sql_tables），
+    再没有写工具名。
+    """
+    if not tables:
+        snapshot, why = snaps.get(entry["alias"], entry.get("artifact"))
+        if not why and isinstance(snapshot.get("sql"), str):
+            tables = sql_tables(snapshot["sql"])
     rows = entry.get("rows")
     what = ("、".join(tables[:3]) + (f" 等 {len(tables)} 张表" if len(tables) > 3 else "")) if tables \
         else str(entry.get("tool") or entry.get("source") or "查询")
@@ -3401,7 +3465,7 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
     for e in queries:
         groups.setdefault(str(e.get("node_id") or ""), []).append(e)
     compact = {e["alias"]: _query_prompt(e, snaps, cells_allowed, _PROMPT_COMPACT_ROWS) for e in queries}
-    brief = {e["alias"]: [_query_brief(e, tables.get(e["alias"], []))] for e in queries}
+    brief = {e["alias"]: [_query_brief(e, tables.get(e["alias"], []), snaps)] for e in queries}
     shapes = {"brief": brief, "compact": compact, "full": full}
     tier = {e["alias"]: "brief" for e in queries}
 

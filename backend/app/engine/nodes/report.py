@@ -44,6 +44,7 @@ from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
 from app.engine.labels import field_label, option_label
 from app.engine.evidence import (
+    ABSENCE_RULE,
     CELLS_REASON,
     CLAIMS_RULE,
     ENTITY_KINDS,
@@ -84,8 +85,10 @@ CLAIMS = CLAIMS_VALUES
 #: 只标注、不让写作者重写也不判失败的违规：可疑实体（受管的正式出具按缺口降档）、表结构快照不全时
 #: 核对不了的名字（出口只标注）
 SOFT = frozenset({"unknown_entity", "unverified_entity"})
-#: 交回写作者重写、重写不好也不判失败的违规：句中的 [[see:]]（渲染后留下断句，数字和出处都没问题）
-REWRITE_ONLY = frozenset({"inline_see"})
+#: 交回写作者重写一次、重写不好也不判失败的违规：句中的 [[see:]]（渲染后留下断句，数字和出处都没问题）；
+#: 写作目录有省略时的缺失断言（「没有查到」「数据缺失」：写作者没看全证据，结论依据不足，但数字和出处都核对过）。
+#: 只剩这几类时不按 max_repairs 反复重写：重写一次没改掉，再写也多半一样，留在核对结果里标注
+REWRITE_ONLY = frozenset({"inline_see", "absence_claim"})
 #: 重写一次就是多一次整篇的模型调用，写不对的模型多给几次也大多写不对
 MAX_REPAIRS = 3
 
@@ -410,6 +413,9 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
     rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}"
+    if writer.guarded:
+        # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
+        rules = f"{rules}\n{ABSENCE_RULE}"
     if claims in ("require_citation", CLAIMS_JUDGE):
         # 裁判只看写作者挂的依据：要判，就更得每句都挂上
         rules = f"{rules}\n{CLAIMS_RULE}" + (f"\n{judging.JUDGE_RULE}" if claims == CLAIMS_JUDGE else "")
@@ -500,12 +506,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     def compose(raw: str) -> dict[str, Any]:
         return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
-                           cells_allowed=cells, entities=entities)
+                           cells_allowed=cells, entities=entities, absence=writer.trimmed)
 
     response, raw = await draft(messages)
     doc = compose(raw)
     repairs = 0
-    while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs:
+    while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
+            and not (repairs and not _fatal(blocking)):
         repairs += 1
         ctx.emit(EventType.LOG, level="warn", code="report_repair",
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
@@ -528,6 +535,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 draft=draft, compose=compose, numbers=numbers, blocking=blocking)
             spent.extend(usages)
 
+    if absent := [v for v in doc["violations"] if v.get("code") == "absence_claim"]:
+        # 重写之后还在（或者没让重写）：报告照常产出，这几处标注出来，时间线上单独说清为什么依据不足
+        texts = list(dict.fromkeys(str(v.get("text") or "") for v in absent))
+        tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
+        ctx.emit(EventType.LOG, level="warn", code="report_absence_claim", count=len(absent), texts=texts,
+                 message=f"报告在证据目录有省略时写了 {len(absent)} 处缺失断言（{_named(absent)}），{tried}："
+                         "被省略的查询仍在证据台账里，这类结论依据不足，应写作本报告未覆盖。报告照常产出，这几处已标注")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,

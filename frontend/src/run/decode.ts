@@ -2,7 +2,7 @@ import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, 
 import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -754,6 +754,16 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       return {
         title: `报告${n ? `有 ${n} 处` : ''}未通过核对，已要求模型按清单重写${round ? `（第 ${round} 次）` : ''}`,
         sub: message.match(/(?:没|未)通过核对（(.+?)）/)?.[1],
+      }
+    }
+    case 'report_absence_claim': {
+      // 证据目录有省略时报告写了缺失断言，重写后仍在（report.py）：读结构化字段 count、texts，不从原话里认
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const texts = strs(d.texts)
+      return {
+        title: ABSENCE_CLAIM_TEXT.title(n),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
+        next: ABSENCE_CLAIM_TEXT.next,
       }
     }
     case 'report_catalog_trimmed': {

@@ -1094,7 +1094,34 @@ await section('sqlcheck', 'SQL 检查（数据目录阶段 4B）：查询步骤�
   await bad.ctx.close()
 })
 
-await section('q-narrow', '查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
+await section('absence', '缺失断言：证据目录有省略时写了「没有查到」，违规清单写明是什么、为什么依据不足，带着原句', async () => {
+  // 违规的形状：backend/app/engine/evidence.py 的 absence_claims（code、message、text、span、segment、unit、context）
+  const MESSAGE = '证据目录有省略时写了缺失断言：写作模型没有看到全部证据，「没有查到」「不存在」「缺失」这类结论依据不足'
+  const r = await probeQ((id, body) => body, {
+    patchQuery: (f) => {
+      const units = f.doc.blocks.flatMap((b) => b.units ?? [])
+      const unit = units.find((u) => (u.segments ?? []).some((s) => s.kind === 'text' && s.text.trim().length > 2))
+      const seg = unit.segments.find((s) => s.kind === 'text' && s.text.trim().length > 2)
+      f.doc.violations = [...(f.doc.violations ?? []), { code: 'absence_claim', message: MESSAGE, text: '没有查到',
+        span: [seg.span[0], seg.span[0] + 1], segment: seg.id, unit: unit.id, context: '核销数据缺失：本轮没有查到任何结果。' }]
+      return f
+    },
+  })
+  await openQ(r.page, '1,288')
+  await r.page.locator('[data-evidence-panel] [data-ev-open-violations]').click()
+  await r.page.waitForSelector('[data-ev-violations]')
+  const item = r.page.locator('[data-ev-violation="absence_claim"]')
+  const text = await item.innerText().catch(() => '')
+  check('违规清单里有这一条，标「缺失断言」，不是笼统的「文档核对未通过」', text.includes('缺失断言') && !text.includes('文档核对未通过'), text)
+  check('……写明为什么依据不足、该怎么写（文案在 terms.ts）', text.includes(MESSAGE)
+    && (await item.locator('[data-ev-absence-hint]').innerText().catch(() => '')).includes('本报告未覆盖'), text.replace(/\s+/g, ' '))
+  check('……带着原句；说的是一整句，不给「定位」，也不说「正文里没有对应文本」', text.includes('本轮没有查到任何结果')
+    && await item.getByRole('button', { name: '定位' }).count() === 0 && !text.includes('没有对应文本'), text.replace(/\s+/g, ' '))
+  check('没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
+})
+
+await section('q-narrow','查询步骤在 360px：栏内展开、底部抽屉都不横向滚动；减少动效', async () => {
   const overflow = () => page.evaluate((sel) => {
     const el = document.querySelector(sel)
     return { sw: el.scrollWidth, cw: el.clientWidth }

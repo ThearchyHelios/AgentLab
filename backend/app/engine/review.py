@@ -91,6 +91,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_no_evidence": ("report_no_evidence", DEGRADED),
     # 证据目录超出篇幅，有的查询只列了编号和摘要：写作模型没看全证据，报告的覆盖面有缺口
     "report_catalog_trimmed": ("report_catalog_trimmed", DEGRADED),
+    # 目录有省略时写了「没有查到」这类缺失断言、重写后仍在：报告照常产出并标注，这几句结论依据不足
+    "report_absence_claim": ("report_absence_claim", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),
     # agent 的结构化字段：模型报的值和查询快照对不上（已按快照取值），或者出处核对不了
