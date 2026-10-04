@@ -37,7 +37,8 @@
 //   不碰原目录；
 // - CHECK_PYTHON：后端解释器，默认 ~/miniforge3/envs/agentlab/bin/python；
 // - 端口由系统分配空闲的，避开 5273 / 8000 / 5373 / 8100；后端去掉模型密钥的环境变量，
-//   seed 不会拿会话里的密钥去种 provider；后端、vite 的输出也在 CHECK_LOGS 里。
+//   seed 不会拿会话里的密钥去种 provider；后端、vite 的输出也在 CHECK_LOGS 里；
+// - 后端带 AGENTLAB_SCHEDULER=0：拷贝里的定时任务不到点发起运行、不发 webhook。
 // 带 --stacks 时 AGENTLAB_WEB / AGENTLAB_API 不用。
 //
 // 各检查自己的段过滤（CHECK_ONLY、ONLY、THEMES……）不往下传：整套检查就是整套，只跑某几段
@@ -80,6 +81,13 @@ const ORDER = [
   'manage',          // 数据、工具、知识、设置
   'versions',        // 上传表格的版本：回滚、清单、移除一期、清除原件
   'catalog',         // 数据目录：表清单、起草、单项审阅、批量确认、编辑即确认、409
+  // 下面几项还是占位（只打一行通过），各自的工作包换成真检查
+  'schedules',       // 定时任务
+  'compare',         // 运行对比
+  'verify',          // 双盲复算、反方审稿
+  'inquiry',         // 审批质询
+  'bundle',          // 可验证报告
+  'whatif',          // 数字推演
   'ui',              // 各页面端到端，连真数据
 ]
 // 各项的耗时（秒）。只决定排队顺序：长的先开跑，短的填空，结果不受影响。新加的检查不在表里就按 60 秒算；
@@ -87,6 +95,8 @@ const ORDER = [
 const ESTIMATE = {
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
   evidence: 91, versions: 60, catalog: 45, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
+  // 占位，换成真检查时按实测改
+  schedules: 1, compare: 1, verify: 1, inquiry: 1, bundle: 1, whatif: 1,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。
@@ -330,6 +340,8 @@ async function startStack(i, dataSrc, python) {
     env: {
       ...env, PYTHONUNBUFFERED: '1', AGENTLAB_DATA_DIR: join(dir, 'data'), AGENTLAB_HOST: '127.0.0.1', AGENTLAB_PORT: String(apiPort),
       AGENTLAB_CORS_ORIGINS: JSON.stringify([WEB, `http://localhost:${webPort}`]),
+      // 拷来的库里有定时任务：调度一开，就会替原库到点发起运行、发出 webhook
+      AGENTLAB_SCHEDULER: '0',
     },
   })
   await waitUntil(`第 ${i} 套后端`, `${API}/health`, '"agentlab"', backend, backendLog, 90_000)
