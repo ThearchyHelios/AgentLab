@@ -1,7 +1,7 @@
 export type NodeType =
   | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
-  | 'human' | 'validate' | 'metrics' | 'report'
+  | 'human' | 'validate' | 'metrics' | 'report' | 'dual_check' | 'challenge'
 
 export interface GraphNode {
   id: string

@@ -12,11 +12,13 @@ import { useConversations } from './store/conversations'
 import { ChatPage } from './pages/ChatPage'
 import { StudioPage } from './pages/StudioPage'
 import { RunsPage } from './pages/RunsPage'
+import { ComparePage } from './pages/runs/ComparePage'
 import { DataPage } from './pages/DataPage'
 import { CatalogPage } from './pages/catalog/CatalogPage'
 import { ToolsPage } from './pages/ToolsPage'
 import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage } from './pages/SettingsPage'
+import { SchedulesPage } from './pages/schedules/SchedulesPage'
 import { NotFound } from './pages/NotFound'
 import { Logo } from './components/Logo'
 import {
@@ -35,7 +37,7 @@ import {
 import type { Attention, FaviconDot } from './lib/notify'
 import { useLeaveBlocker } from './lib/leave'
 import { useLocalActor } from './lib/actor'
-import { runName } from './lib/terms'
+import { RUN_COMPARE_TEXT, runName } from './lib/terms'
 
 export default function App() {
   const loaded = useCatalog((s) => s.loaded)
@@ -103,6 +105,8 @@ export default function App() {
               <Route path="/studio" element={<StudioPage />} />
               <Route path="/studio/:workflowId" element={<StudioPage />} />
               <Route path="/runs" element={<RunsPage />} />
+              {/* 固定路径写在 /runs/:runId 前面：读的人一眼看出 compare 不是运行 id */}
+              <Route path="/runs/compare" element={<ComparePage />} />
               <Route path="/runs/:runId" element={<RunsPage />} />
               <Route path="/data" element={<DataPage />} />
               <Route path="/data/:tab" element={<DataPage />} />
@@ -115,6 +119,8 @@ export default function App() {
               <Route path="/knowledge" element={<KnowledgePage />} />
               <Route path="/knowledge/:tab" element={<KnowledgePage />} />
               <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
+              <Route path="/schedules" element={<SchedulesPage />} />
+              <Route path="/schedules/:id" element={<SchedulesPage />} />
               {/* 数据源搬到了顶级「数据」页；旧书签和各处「去设置 → 数据源」的链接还在 */}
               <Route path="/settings/datasources" element={<Navigate to="/data" replace />} />
               <Route path="/settings" element={<SettingsPage />} />
@@ -241,9 +247,10 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
   const chat = useChatActivity()
   const live = studio.startsWith('run') || chat === 'run'
 
-  // 整条导航约 520px 高，窗口再矮，最底下的遥测点和署名就被切掉、够不着。矮窗口
-  // （≤600px）按高度收紧到 450px 左右，而不是让导航滚动：导航一旦 overflow，
-  // 挂在右侧的悬停提示和遥测浮层也会被一起裁掉
+  // 整条导航约 580px 高（八个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
+  // 矮窗口（≤600px）按高度收紧到 455px 左右（导航项 36px），而不是让导航滚动：导航一旦
+  // overflow，挂在右侧的悬停提示和遥测浮层也会被一起裁掉。加导航项时在 480px 高的窗口里
+  // 量一遍（check-shell 的「窗口高 480px」）
   return (
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
@@ -267,7 +274,7 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
               aria-keyshortcuts={ariaShortcut(p.shortcut)}
               className={({ isActive }) => clsx(
                 'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
-                '[@media(max-height:600px)]:h-10',
+                '[@media(max-height:600px)]:h-9',
                 'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
                 isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
               )}
@@ -868,6 +875,7 @@ function describePath(
   if (seg === 'studio' && id) return [page, ctx.workflowName]
   if (seg === 'chat' && id) return [page, ctx.conversationTitle || null]
   if (seg === 'runs') {
+    if (id === 'compare') return [page, RUN_COMPARE_TEXT.title]
     if (id) return [page, `运行 ${shortId(id)}`]
     return [page, new URLSearchParams(search).get('tab') === 'approvals' ? '待审批' : null]
   }

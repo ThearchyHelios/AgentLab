@@ -5,7 +5,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import { create } from 'zustand'
 import clsx from 'clsx'
 import {
-  Bell, BellOff, BookOpen, Database, FlaskConical, History, Hourglass, Keyboard, MessageSquare,
+  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, History, Hourglass, Keyboard, MessageSquare,
   MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
@@ -19,7 +19,7 @@ import type { ThemePref } from '../lib/theme'
 import { isMac } from '../lib/keys'
 import { formatDateTime, formatTime, parseServerTime, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
+import { SCHEDULE_TEXT, WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
 import { errorMessage } from '../lib/errors'
 import { disableNotify, enableNotify, notifySupported, useSignals } from '../lib/notify'
 import { canLeave, leavePass } from '../lib/leave'
@@ -57,6 +57,8 @@ export const PAGES: PageDef[] = [
   { to: '/data', label: '数据', hint: '接入数据库和表格，供问数据和工作流查询', icon: Database, shortcut: 'Alt+4', keywords: 'data datasource 数据源 数据库 表格 excel csv' },
   { to: '/tools', label: '工具', hint: '工具库、沙箱试验台、自定义工具、MCP', icon: Wrench, shortcut: 'Alt+5', keywords: 'tools mcp sandbox 沙箱 函数' },
   { to: '/knowledge', label: '知识', hint: '知识库、长期记忆、方法论 Skill', icon: BookOpen, shortcut: 'Alt+6', keywords: 'knowledge kb memory skill 知识库 记忆 文档' },
+  // 后加的页排在设置前面，设置留在最底下、快捷键也不动：⌥7 按了好几个版本，改了等于让人重新记
+  { to: '/schedules', label: SCHEDULE_TEXT.title, hint: SCHEDULE_TEXT.hint, icon: CalendarClock, shortcut: 'Alt+8', keywords: 'schedules schedule cron 定时 计划 周期 自动运行' },
   { to: '/settings', label: '设置', hint: '模型接入、偏好、运行环境', icon: Settings, shortcut: 'Alt+7', keywords: 'settings provider 模型 署名 主题 偏好' },
 ]
 

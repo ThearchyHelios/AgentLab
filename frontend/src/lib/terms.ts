@@ -167,6 +167,8 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   validate: '结构校验',
   metrics: '口径卡',
   report: '报告撰写',
+  dual_check: '双盲复算',
+  challenge: '反方审稿',
 }
 
 /** 与 decode.ts 里旧名字同名的出口，第二波改成从这里导入时不用改调用处 */
@@ -2721,3 +2723,57 @@ export const COPILOT_CONTEXT_TEXT = {
   noCatalog: (who: string | null) => `${who ?? '这个数据源'}还没有数据目录，起草后挑表和 SQL 检查会更准`,
   toCatalog: '去数据目录起草',
 }
+
+// ---------------------------------------------------------------------------
+// 下面几块是复核套件各工作包的文案位：名字先占好，各包只往自己那块里加，不去改同一处。
+// 还没做出来的功能，界面上统一写 PENDING_TEXT 那一句
+// ---------------------------------------------------------------------------
+
+/** 尚未完成的功能在界面上的统一说法 */
+const PENDING_TEXT = '功能开发中'
+
+/** 定时任务：导航、命令面板和定时任务页 */
+export const SCHEDULE_TEXT = {
+  title: '定时任务',
+  hint: '按设定的周期自动发起工作流运行',
+  pending: PENDING_TEXT,
+  pendingHint: '定时任务尚未开放，完成后可在此处管理',
+}
+
+/** 运行对比：记录页里两次运行的对照。配方前后对照另有 COMPARE_TEXT，别混用 */
+export const RUN_COMPARE_TEXT = {
+  title: '运行对比',
+  hint: '对照两次运行的结论与数据',
+  pending: PENDING_TEXT,
+  pendingHint: '运行对比尚未开放，完成后可从记录页选择两次运行进行对照',
+}
+
+/** 可验证报告：导出可独立核对的报告 */
+export const BUNDLE_TEXT = {
+  title: '可验证报告',
+}
+
+/** 审批质询：审批人在批准前就待审的报告提出质询 */
+export const INQUIRY_TEXT = {
+  title: '审批质询',
+}
+
+/** 数字推演：在一次运行的基础上改动输入，推演指标的变化 */
+export const WHATIF_TEXT = {
+  title: '数字推演',
+}
+
+/** 双盲复算节点：节点库说明、检查器和运行结果 */
+export const DUAL_CHECK_TEXT = {
+  description: '另起一路独立计算，与原结果逐项比对',
+  pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
+}
+
+/** 反方审稿节点：节点库说明、检查器和运行结果 */
+export const CHALLENGE_TEXT = {
+  description: '从反方立场审阅上游报告，逐条提出质疑',
+  pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
+}
+
+/** 设置页里复核套件（双盲复算、反方审稿等）的默认值一栏 */
+export const VERIFY_SETTING_TEXT = {}

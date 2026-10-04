@@ -11,189 +11,22 @@ import type {
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
-import { localActor } from '../lib/actor'
-import { VALIDATION_TITLE, describeValidation } from '../lib/validation'
+import {
+  ApiError, BASE, NETWORK_MESSAGE, actorHeader, codeOf, del, describeDetail, failure, get, isGatewayFailure, parseBody,
+  patch, post, put, qs, report, request, upload, type RequestOptions, type UploadOptions,
+} from './http'
+import { bundle } from './bundle'
+import { compare } from './compare'
+import { inquiry } from './inquiry'
+import { schedules } from './schedules'
+import { whatif } from './whatif'
 
-const BASE = '/api'
-
-/**
- * network：请求根本没到后端（没起、在重启、代理断了、超时没回）。
- * http：后端回了错误状态码，message 是后端的 detail。
- */
-export type ApiErrorKind = 'network' | 'http'
-
-export const NETWORK_MESSAGE = '无法连接服务（服务端可能未启动或正在重启），请稍后重试'
-
-export class ApiError extends Error {
-  kind: ApiErrorKind
-  /** 后端 detail 的原样（字符串、校验错误数组都可能） */
-  detail?: unknown
-  /** 原始报错文本，给「技术细节」和复制用 */
-  raw?: string
-  /** 超时断开时等了多久 */
-  timeoutMs?: number
-  /**
-   * 后端的机读码（app/api/coded.py 的 {detail, code}，比如 datasource_scope_empty）。
-   * detail 是给人看的话，随时可能改写；要按错误种类分支的认这个
-   */
-  code?: string
-  /** 带机读码的错误里出错的是哪一项（app/api/coded.py 的 field，比如剖析设置的 max_queries）；没有就是 undefined */
-  field?: string
-  /**
-   * 后端要用户先拍板时随错误一起给的 {kind, details}（比如上传表格的 422：数字列混入非数字、
-   * 交叉表）。原样保留，按接口各自校验后再用（上传表格见 uploadDecision）
-   */
-  decision?: unknown
-
-  constructor(
-    public status: number,
-    message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; field?: string; decision?: unknown },
-  ) {
-    super(message)
-    this.name = 'ApiError'
-    this.kind = opts?.kind ?? (status === 0 ? 'network' : 'http')
-    this.detail = opts?.detail
-    this.raw = opts?.raw
-    this.timeoutMs = opts?.timeoutMs
-    this.code = opts?.code
-    this.field = opts?.field
-    this.decision = opts?.decision
-  }
-}
-
-/**
- * 连接状态的旁听者：任何一次请求够着了后端（不管状态码）就报 true，网络层失败
- * 报 false。catalog 靠它维护全站的「后端连没连上」，不用另起一路轮询去猜。
- */
-type ConnectivityListener = (reachable: boolean, error?: ApiError) => void
-const connectivity = new Set<ConnectivityListener>()
-
-export function onConnectivity(listener: ConnectivityListener): () => void {
-  connectivity.add(listener)
-  return () => { connectivity.delete(listener) }
-}
-
-function report(reachable: boolean, error?: ApiError) {
-  for (const l of connectivity) {
-    try { l(reachable, error) } catch { /* 旁听者出错不能拖垮请求本身 */ }
-  }
-}
-
-function actorHeader(): Record<string, string> {
-  const actor = localActor()
-  // 请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求发不出去。
-  // 后端 runs.actor_of 解码，纯 ASCII 的老署名编码前后一样
-  return actor ? { 'X-Actor': encodeURIComponent(actor) } : {}
-}
-
-/**
- * FastAPI 的 422 是 [{loc, msg, type}] 数组：直接 String() 是 [object Object]，照拼 msg
- * 又是 pydantic 的英文原文。按 type 翻成中文（lib/validation），path 用来查表单上的叫法
- */
-function describeDetail(detail: unknown, path?: string): string {
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) return `${VALIDATION_TITLE}：${describeValidation(detail, path).join('；')}`
-  // 对象形态的 detail 原样 JSON 化只会把一串花括号摆到提示里：界面只说无法识别，原文在调用方的 raw 里
-  return '请求失败，服务端返回了无法识别的错误信息'
-}
-
-/**
- * 网关类失败（代理够不着后端）也算网络失败：vite 代理连不上后端时回 500 且响应体
- * 为空，nginx 回 502/503/504 的 HTML。后端自己抛的 HTTPException 一定带 JSON detail。
- */
-function isGatewayFailure(status: number, bodyText: string, isJson: boolean): boolean {
-  if (isJson) return false
-  if (status === 502 || status === 503 || status === 504) return true
-  return status === 500 && !bodyText.trim()
-}
-
-/**
- * 后端交回模型用的改写指令：报告核对的 violations、助手自查的问题条目里带着 for_model。那是写给模型的
- * 原话（「单元格要写成 Q<编号>.r<行>.<列>」这类），界面只显示给人看的 message。前端没有任何地方读它，
- * 就在数据进来的地方去掉——原始事件、工件原文、展开详情这些直接显示 JSON 的地方也就不会露出来。
- */
-const MODEL_NOTE = 'for_model'
-
-function dropModelNotes(v: unknown): void {
-  if (Array.isArray(v)) {
-    for (const x of v) dropModelNotes(x)
-  } else if (v && typeof v === 'object') {
-    delete (v as Record<string, unknown>)[MODEL_NOTE]
-    for (const x of Object.values(v)) dropModelNotes(x)
-  }
-}
-
-/** 解析响应体；带 for_model 的（先按原文粗筛，不带的不走一遍）去掉它 */
-export function parseBody(text: string): any {
-  const body = JSON.parse(text)
-  if (text.includes(`"${MODEL_NOTE}"`)) dropModelNotes(body)
-  return body
-}
-
-async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
-  const { timeoutMs, ...rest } = init ?? {}
-  // 自己的超时和调用方的取消要分开：调用方取消照旧抛 AbortError（没人想看到
-  // 「连不上后端」），只有我们自己掐断的才算网络失败
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let timedOut = false
-  let signal = rest.signal
-  if (timeoutMs) {
-    const ctrl = new AbortController()
-    timer = setTimeout(() => { timedOut = true; ctrl.abort() }, timeoutMs)
-    rest.signal?.addEventListener('abort', () => ctrl.abort())
-    signal = ctrl.signal
-  }
-  let res: Response
-  try {
-    res = await fetch(BASE + path, {
-      ...rest,
-      signal,
-      headers: {
-        ...(rest.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
-        ...actorHeader(),
-        ...rest.headers,
-      },
-    })
-  } catch (e: any) {
-    if (timedOut) {
-      const err = new ApiError(0, `服务端 ${Math.round(timeoutMs! / 1000)} 秒未响应，请稍后重试`,
-        { kind: 'network', raw: `timeout after ${timeoutMs}ms: ${path}`, timeoutMs })
-      report(false, err)
-      throw err
-    }
-    if (e?.name === 'AbortError') throw e
-    // fetch 的网络失败是 TypeError（Chrome「Failed to fetch」、Safari「Load failed」），
-    // 原文对用户毫无意义，收进 raw
-    const err = new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: `${e?.name ?? 'Error'}: ${e?.message ?? e}` })
-    report(false, err)
-    throw err
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-  if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''), path)
-  report(true)
-  if (res.status === 204) return undefined as T
-  return parseBody(await res.text())
-}
-
-/** 后端 {detail, code} 里的机读码；没有就是 undefined */
-const codeOf = (body: unknown): string | undefined => {
-  const code = body && typeof body === 'object' ? (body as { code?: unknown }).code : undefined
-  return typeof code === 'string' && code ? code : undefined
-}
-
-/** 后端 {detail, code, field} 里出错的那一项；没有就是 undefined */
-const fieldOf = (body: unknown): string | undefined => {
-  const field = body && typeof body === 'object' ? (body as { field?: unknown }).field : undefined
-  return typeof field === 'string' && field ? field : undefined
-}
-
-/** 后端 {detail, decision} 里要用户拍板的内容：是个对象就原样带上，没有就是 undefined */
-const decisionOf = (body: unknown): unknown => {
-  const decision = body && typeof body === 'object' ? (body as { decision?: unknown }).decision : undefined
-  return decision && typeof decision === 'object' ? decision : undefined
-}
+// 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
+// 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
+export {
+  ApiError, NETWORK_MESSAGE, del, get, onConnectivity, parseBody, patch, post, put, qs, request, upload,
+} from './http'
+export type { ApiErrorKind, RequestOptions, UploadOptions, UploadProgress } from './http'
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
@@ -230,102 +63,6 @@ export function uploadDecision(e: unknown): UploadDecision | null {
 /** 混合列清单的形状对不对：非空数组，每项有列名和取值数组 */
 const mixedColumns = (v: unknown): boolean => Array.isArray(v) && v.length > 0
   && v.every((c) => isObj(c) && typeof c.column === 'string' && Array.isArray(c.values))
-
-/** 非 2xx 的响应 → ApiError，顺带报告连接状态。fetch 和 XHR 两条路共用 */
-function failure(status: number, statusText: string, text: string, path?: string): ApiError {
-  let body: any
-  let isJson = false
-  try { body = JSON.parse(text); isJson = true } catch { /* 响应体不是 JSON */ }
-  if (isGatewayFailure(status, text, isJson)) {
-    const err = new ApiError(status, NETWORK_MESSAGE, {
-      kind: 'network', raw: `${status} ${statusText}${text ? `\n${text.slice(0, 500)}` : ''}`,
-    })
-    report(false, err)
-    return err
-  }
-  report(true)
-  if (isJson) {
-    const detail = body?.detail ?? body
-    return new ApiError(status, describeDetail(detail, path), {
-      detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
-      code: codeOf(body), field: fieldOf(body), decision: decisionOf(body),
-    })
-  }
-  const message = status >= 500
-    ? `服务端错误（${status}），详情请查看服务日志`
-    : `请求失败（HTTP ${status}）`
-  return new ApiError(status, message, { raw: `${status} ${statusText}\n${text.slice(0, 2000)}` })
-}
-
-/** 上传进度。字节发完（sent）之后还要等后端解析、切块，那段没有进度可报 */
-export interface UploadProgress {
-  /** 已经发出去的字节 */
-  loaded: number
-  /** 总字节；浏览器算不出来时为 null，这时只能画已发多少，不画百分比 */
-  total: number | null
-  /** 字节已经全部发完，在等后端处理 */
-  sent: boolean
-}
-
-export interface UploadOptions {
-  onProgress?: (p: UploadProgress) => void
-  signal?: AbortSignal
-}
-
-/**
- * 带字节进度的上传。fetch 拿不到上传进度，只能用 XHR；报错、连接状态、署名头和
- * request 走同一套，调用方看到的 ApiError 没有区别。取消照旧抛 AbortError。
- */
-function upload<T>(path: string, form: FormData, opts?: UploadOptions): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', BASE + path)
-    for (const [k, v] of Object.entries(actorHeader())) xhr.setRequestHeader(k, v)
-    const onProgress = opts?.onProgress
-    if (onProgress) {
-      // 进度事件里的字节数含 multipart 的边界和表头，比文件本身略大；发完那一下
-      // 沿用它的总数，前后两个数才对得上
-      let total: number | null = null
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) total = e.total
-        onProgress({ loaded: e.loaded, total, sent: false })
-      }
-      xhr.upload.onload = () => {
-        const bytes = total ?? [...form.values()].reduce((n, v) => n + (v instanceof Blob ? v.size : 0), 0)
-        onProgress({ loaded: bytes, total: bytes || null, sent: true })
-      }
-    }
-    const abort = () => xhr.abort()
-    opts?.signal?.addEventListener('abort', abort)
-    const cleanup = () => opts?.signal?.removeEventListener('abort', abort)
-    xhr.onload = () => {
-      cleanup()
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(failure(xhr.status, xhr.statusText, xhr.responseText ?? '', path))
-        return
-      }
-      report(true)
-      if (xhr.status === 204 || !xhr.responseText) { resolve(undefined as T); return }
-      try {
-        resolve(parseBody(xhr.responseText))
-      } catch {
-        reject(new ApiError(xhr.status, '无法解析服务端返回的内容', { raw: xhr.responseText.slice(0, 2000) }))
-      }
-    }
-    xhr.onerror = () => {
-      cleanup()
-      const err = new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: `XMLHttpRequest error: POST ${path}` })
-      report(false, err)
-      reject(err)
-    }
-    xhr.onabort = () => {
-      cleanup()
-      reject(new DOMException('上传已取消', 'AbortError'))
-    }
-    if (opts?.signal?.aborted) { xhr.abort(); return }
-    xhr.send(form)
-  })
-}
 
 /**
  * 数据源测连接的结果。ok=false 时 error 是一句人话、hint 是怎么办、detail 是
@@ -449,41 +186,6 @@ export interface ReindexJob {
 
 /** runs.list 的 workflow_id 传它：只看没保存成工作流的那些运行（问数据页、画布上的临时图） */
 export const UNSAVED_WORKFLOW_ID = '__none__'
-
-/** 拼查询串：null / undefined / 空串跳过，数组用逗号连起来 */
-function qs(params?: Record<string, unknown>): string {
-  if (!params) return ''
-  const q = new URLSearchParams()
-  for (const [k, v] of Object.entries(params)) {
-    if (v == null || v === '') continue
-    if (Array.isArray(v)) {
-      if (v.length) q.set(k, v.join(','))
-    } else {
-      q.set(k, String(v))
-    }
-  }
-  const s = q.toString()
-  return s ? `?${s}` : ''
-}
-
-/**
- * 单次请求的选项。timeoutMs 到点就掐断并按网络失败抛出（带 timeoutMs）：连得上但
- * 卡着不回的接口（MCP 服务不应答时的 /tools）不能让调用方永远等下去，也不该一直
- * 占着浏览器对同一主机的那几条连接
- */
-export interface RequestOptions {
-  timeoutMs?: number
-  signal?: AbortSignal
-}
-
-const get = <T>(p: string, opts?: RequestOptions) => request<T>(p, opts)
-const post = <T>(p: string, body?: unknown) =>
-  request<T>(p, { method: 'POST', body: JSON.stringify(body ?? {}) })
-const patch = <T>(p: string, body: unknown) =>
-  request<T>(p, { method: 'PATCH', body: JSON.stringify(body) })
-const put = <T>(p: string, body: unknown) =>
-  request<T>(p, { method: 'PUT', body: JSON.stringify(body) })
-const del = (p: string) => request<void>(p, { method: 'DELETE' })
 
 export const api = {
   /** 心跳。带超时：后端卡死（连得上但不回）时也要能判成断开，而不是永远等下去 */
@@ -1033,6 +735,13 @@ export const api = {
     upgradeEvidence: (body: { graph: GraphSpec; assist?: boolean; level?: PublishLevel }, opts?: RequestOptions) =>
       request<UpgradeResult>('/copilot/upgrade-evidence', { method: 'POST', body: JSON.stringify(body), ...opts }),
   },
+
+  // ---- 复核套件：各功能的接口在自己的文件里（api/<名字>.ts），这里只挂上去 ----
+  schedules,
+  compare,
+  bundle,
+  inquiry,
+  whatif,
 }
 
 /**

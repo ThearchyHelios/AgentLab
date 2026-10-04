@@ -12,6 +12,8 @@ import { runClassLabel, runName, TOOL_TRUST_TEXT } from '../lib/terms'
 import { useRunClock } from './useRunClock'
 import { Markdown } from './Markdown'
 import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
+import { ChallengeSummary } from './ChallengeSummary'
+import { DualCheckApproval } from './DualCheckApproval'
 import type { Approval, ApprovalReport } from '../types'
 
 // 发起运行的表单搬去了 run/RunControl.tsx 的工具栏控件里。它原先常驻在
@@ -144,7 +146,11 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         </div>
       )}
 
+      {/* 双盲复算对不上、交给人裁决的审批，卡上画两路结果的对照 */}
+      {payload.kind === 'dual_check' && <DualCheckApproval approval={approval} />}
+
       <ApprovalReports reports={reports} runId={approval.run_id} runClass={approval.run_class} />
+      <ChallengeSummary reports={reports} runId={approval.run_id} />
 
       {payload.tool && (
         <div className="mb-2 rounded border bg-bg p-2">

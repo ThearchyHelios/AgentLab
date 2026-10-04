@@ -1,8 +1,10 @@
 import {
   Bot, Braces, Brain, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
-  Gauge, GitBranch, Hand, Repeat, Search, Shuffle, Users, Wrench,
+  Gauge, GitBranch, GitCompareArrows, Hand, Repeat, Search, ShieldAlert, Shuffle, Users, Wrench,
 } from 'lucide-react'
-import { APPROVAL_POLICY_LABEL, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
+import {
+  APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL,
+} from '../lib/terms'
 import type { NodeType } from '../types'
 
 export type FieldType =
@@ -655,6 +657,22 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       caliber: '', caliber_version: 'v1',
       metrics: [{ id: 'total', name: '', unit: '', expression: '' }],
     },
+  },
+  // 下面两种还是占位：服务端的执行器原样跳过（engine/nodes/dual_check.py、challenge.py），没有可配的字段。
+  // 说明里写明尚未生效，检查器顶上就是这一句；各自的工作包补上字段时把这句去掉
+  dual_check: {
+    type: 'dual_check', label: NODE_TYPE_LABEL.dual_check, category: '把关', icon: GitCompareArrows,
+    description: `${DUAL_CHECK_TEXT.description}。${DUAL_CHECK_TEXT.pending}`,
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    fields: [],
+    defaults: {},
+  },
+  challenge: {
+    type: 'challenge', label: NODE_TYPE_LABEL.challenge, category: '把关', icon: ShieldAlert,
+    description: `${CHALLENGE_TEXT.description}。${CHALLENGE_TEXT.pending}`,
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    fields: [],
+    defaults: {},
   },
 }
 

@@ -17,7 +17,9 @@ import { claimCountsOf, matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { claimTally, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
+import {
+  CHALLENGE_TEXT, claimTally, DUAL_CHECK_TEXT, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL,
+} from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
@@ -92,6 +94,11 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return first(config.expression, config.template) || '未配置'
     case 'subgraph':
       return config.workflow_id ? '嵌套工作流' : '未选择工作流'
+    // 还是占位的两种：卡片上直接说尚未生效，免得以为放上去就会执行
+    case 'dual_check':
+      return DUAL_CHECK_TEXT.pending
+    case 'challenge':
+      return CHALLENGE_TEXT.pending
     default:
       return ''
   }
