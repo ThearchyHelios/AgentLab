@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -14,9 +15,11 @@ from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
 from app.db.models import Provider, Setting
-from app.engine.judge import JUDGE_DEFAULTS, SETTING_GROUP as JUDGE_GROUP, SPEND_KEY as JUDGE_SPEND
-from app.engine.judge import daily_spend, judge_settings
+from app.engine.judge import JUDGE_DEFAULTS, MAX_TOKENS as JUDGE_MAX_TOKENS
+from app.engine.judge import SETTING_GROUP as JUDGE_GROUP, SPEND_KEY as JUDGE_SPEND
+from app.engine.judge import daily_spend, judge_model_spec, judge_settings
 from app.engine.judge import sanitize_settings as judge_values, settings_problem as judge_problem
+from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
 from app.providers import catalog
 from app.providers.factory import ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model
 
@@ -413,6 +416,153 @@ async def probe_provider_models(
 
 
 # --------------------------------------------------------------------------
+# 核查：双盲复算、反方审稿、审批质询共用的一组设置
+# --------------------------------------------------------------------------
+
+#: 设置里 verify 这一组。三项都是让一个只读 agent 查库核对（engine/verify_agent.py），共用核查模型和每日金额上限；
+#: 各自的开关和上限分开放。上限写 null 表示不限（和裁判一组的约定一样）
+VERIFY_GROUP = "verify"
+VERIFY_DEFAULTS: dict[str, Any] = {
+    "provider": None,             # 核查模型：空着沿用证据裁判模型的取值链（verify_model_spec）
+    "model": None,
+    # 双盲复算：tolerance 是允许的相对误差，两边的值差在这个比例以内算一致
+    "dual_check": {"enabled": True, "tolerance": 1e-6, "max_queries": 6, "timeout_s": 120},
+    # 反方审稿：max_claims 是每份报告最多挑几句关键结论来审，查询次数、时长按每句算
+    "challenge": {"enabled": True, "max_claims": 5, "max_queries": 4, "timeout_s": 90},
+    # 审批质询：查询次数、时长按每次提问算
+    "inquiry": {"enabled": True, "max_queries": 6, "timeout_s": 120},
+    "daily_max_usd": 2.0,         # 全局每日核查金额上限（按本地日期），和裁判的每日上限分开记账（engine/spend.py）
+}
+#: 三项各自那一组的键
+_VERIFY_PARTS = ("dual_check", "challenge", "inquiry")
+_VERIFY_COUNTS = frozenset({"max_queries", "max_claims"})
+
+#: 设置页「核查」一节各项的叫法：报错时写它，不写键名。嵌套的项写成「组.项」
+VERIFY_SETTING_LABEL = {
+    "provider": "核查模型 · 接入", "model": "核查模型 · 模型",
+    "daily_max_usd": "核查每日金额上限（美元）",
+    "dual_check": "双盲复算", "dual_check.enabled": "双盲复算 · 启用",
+    "dual_check.tolerance": "双盲复算 · 允许的相对误差", "dual_check.max_queries": "双盲复算 · 每项最多查询次数",
+    "dual_check.timeout_s": "双盲复算 · 每项时长上限（秒）",
+    "challenge": "反方审稿", "challenge.enabled": "反方审稿 · 启用",
+    "challenge.max_claims": "反方审稿 · 每份报告最多审几句", "challenge.max_queries": "反方审稿 · 每句最多查询次数",
+    "challenge.timeout_s": "反方审稿 · 每句时长上限（秒）",
+    "inquiry": "审批质询", "inquiry.enabled": "审批质询 · 启用",
+    "inquiry.max_queries": "审批质询 · 每次最多查询次数", "inquiry.timeout_s": "审批质询 · 每次时长上限（秒）",
+}
+
+
+def _positive(value: Any, *, whole: bool) -> bool:
+    """上限：null（不限），或大于 0 的有限数；whole 时还得是整数（次数、句数）。True / False 不算数。"""
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return False
+    return not (whole and int(value) != value)
+
+
+def _tolerance_ok(value: Any) -> bool:
+    """允许的相对误差：不小于 0 的有限数（0 表示必须完全一致）。不能是 null：没有「不限」的说法。"""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+
+
+def _verify_item_ok(key: str, value: Any) -> bool:
+    if key == "enabled":
+        return isinstance(value, bool)
+    if key == "tolerance":
+        return _tolerance_ok(value)
+    return _positive(value, whole=key in _VERIFY_COUNTS)
+
+
+def _verify_item_problem(part: str, key: str, value: Any) -> str | None:
+    label = VERIFY_SETTING_LABEL[f"{part}.{key}"]
+    if _verify_item_ok(key, value):
+        return None
+    if key == "enabled":
+        return f"「{label}」需要选择开启或关闭，当前为「{value}」"
+    if key == "tolerance":
+        return f"「{label}」需要填写不小于 0 的数（例如 0.000001 表示百万分之一），当前为「{value}」"
+    words = "正整数（次数）" if key == "max_queries" else "正整数（句数）" if key == "max_claims" else "大于 0 的秒数"
+    return f"「{label}」需要填写{words}，留空表示不限，当前为「{value}」"
+
+
+def verify_problem(value: Any) -> str | None:
+    """设置页写进来的 verify 这一组有什么问题，没问题返回 None。说明写设置页上的叫法。"""
+    if not isinstance(value, dict):
+        return f"「核查」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in VERIFY_DEFAULTS:
+            return (f"「核查」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{VERIFY_SETTING_LABEL[k]}」" for k in VERIFY_DEFAULTS))
+        label = VERIFY_SETTING_LABEL[key]
+        if key in ("provider", "model"):
+            if item is not None and not isinstance(item, str):
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示沿用证据裁判模型，当前为「{item}」"
+        elif key == "daily_max_usd":
+            if not _positive(item, whole=False):
+                return f"「{label}」需要填写大于 0 的金额（美元），留空表示不限，当前为「{item}」"
+        elif not isinstance(item, dict):
+            return f"「{label}」设置格式有误，需要是一个对象，当前为「{item}」"
+        else:
+            allowed = VERIFY_DEFAULTS[key]
+            for sub, sub_value in item.items():
+                if sub not in allowed:
+                    return (f"「{label}」设置中不支持「{sub}」，可设置的项："
+                            + "、".join(f"「{VERIFY_SETTING_LABEL[f'{key}.{k}']}」" for k in allowed))
+                if problem := _verify_item_problem(key, sub, sub_value):
+                    return problem
+    return None
+
+
+def verify_values(stored: Any) -> dict[str, Any]:
+    """库里存的 verify 一组 → 补齐默认的完整设置。存坏了的项（旧版本、手改）按默认，存了 null 的上限就是不限；
+    三项各自那一组逐项补，只存了一项的其余照默认。"""
+    stored = stored if isinstance(stored, dict) else {}
+    out: dict[str, Any] = {k: dict(v) if isinstance(v, dict) else v for k, v in VERIFY_DEFAULTS.items()}
+    for key in ("provider", "model"):
+        value = stored.get(key)
+        out[key] = value.strip() or None if isinstance(value, str) else None
+    if "daily_max_usd" in stored and _positive(stored["daily_max_usd"], whole=False):
+        out["daily_max_usd"] = stored["daily_max_usd"]
+    for part in _VERIFY_PARTS:
+        saved = stored.get(part)
+        if not isinstance(saved, dict):
+            continue
+        for key in VERIFY_DEFAULTS[part]:
+            if key in saved and _verify_item_ok(key, saved[key]):
+                out[part][key] = saved[key]
+    return out
+
+
+async def verify_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 verify 一组，没存过的键补默认（读法同 judge_settings）。节点、质询接口都从这里读。"""
+    row = await session.get(Setting, VERIFY_GROUP)
+    return verify_values(row.value if row else None)
+
+
+def _model_text(value: Any) -> str | None:
+    return value.strip() or None if isinstance(value, str) else None
+
+
+async def verify_model_spec(session: AsyncSession, node_config: dict[str, Any] | None = None, *,
+                            settings: dict[str, Any] | None = None) -> ModelSpec:
+    """核查用哪个模型：节点配置里的 provider / model > 设置里的核查模型 > 证据裁判模型的取值链（裁判设置 >
+    助手模型 > 默认接入，见 judge.judge_model_spec）。哪一级写了就整组用哪一级，不跨级拼接入和模型。
+
+    和裁判一样关掉 thinking、max_tokens 4096：核查最后要按结构交结果（强制工具调用），和思考模式不兼容。
+    建议和被核查的模型不同，否则等于自己核自己；比较、提醒由调用方做（它知道被核查的是哪个模型）。
+    """
+    node = node_config if isinstance(node_config, dict) else {}
+    provider, model = _model_text(node.get("provider")), _model_text(node.get("model"))
+    if not (provider or model):
+        chosen = settings if settings is not None else await verify_settings(session)
+        provider, model = _model_text(chosen.get("provider")), _model_text(chosen.get("model"))
+    if not (provider or model):
+        return await judge_model_spec(session, None)
+    return ModelSpec(provider=provider, model=model, max_tokens=JUDGE_MAX_TOKENS, thinking="off")
+
+
+# --------------------------------------------------------------------------
 # 用户设置
 # --------------------------------------------------------------------------
 
@@ -440,6 +590,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 结论句裁判（engine/judge.py）：证据裁判模型和各项上限，上限存 null 表示不限。不放进 limits：
     # 那一组是环境变量定的、只读，这一组是用户自己定的
     JUDGE_GROUP: dict(JUDGE_DEFAULTS),
+    # 核查（双盲复算、反方审稿、审批质询）：核查模型、三项的开关和上限、每日金额上限。和裁判一组一样由用户定
+    VERIFY_GROUP: verify_values(None),
 }
 
 
@@ -488,11 +640,13 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # limits 是服务端配置（环境变量），只读：库里可能存着旧版设置页写进去的一份
     #（见过 max_agent_steps: 25），它从来不生效，却会盖住真实的上限，界面照着错的数许诺
     stored.pop("limits", None)
-    # 裁判的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
+    # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
+    stored.pop(VERIFY_SPEND, None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
-    # 裁判设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
+    # 裁判、核查设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
+    merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -508,14 +662,16 @@ async def put_settings(
 ) -> dict[str, Any]:
     from app.tools.trust import SETTING_KEY as TRUST_KEY
 
+    # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
     if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
-        # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
+        raise HTTPException(422, problem)
+    if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):
         raise HTTPException(422, problem)
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", JUDGE_SPEND):
+        if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
             # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效。
-            # 裁判的每日计数是引擎记的账，只有裁判自己写
+            # 裁判、核查的每日计数是引擎记的账，只有引擎自己写
             continue
         row = await session.get(Setting, key)
         if row:
@@ -534,6 +690,15 @@ async def get_judge_spend(session: AsyncSession = Depends(get_session)) -> dict[
     这些调用估不出金额、没有算进 usd。daily_max_usd 为 null 表示不限。
     """
     return {**await daily_spend(), "daily_max_usd": (await judge_settings(session))["daily_max_usd"]}
+
+
+@router.get("/settings/verify/spend")
+async def get_verify_spend(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """今天（本地日期）核查（双盲复算、反方审稿、审批质询）花了多少，设置页放在核查的每日上限旁边。只读。
+
+    形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}，daily_max_usd 为 null 表示不限。
+    """
+    return {**await verify_daily_spend(), "daily_max_usd": (await verify_settings(session))["daily_max_usd"]}
 
 
 @router.get("/system")
