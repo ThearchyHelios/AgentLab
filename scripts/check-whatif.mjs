@@ -4,7 +4,8 @@
 // 输入路径和行号不对（行号对人从 1 数，对接口从 0 数）、勾选框在不推演时也冒出来、恢复原值之后还留着一行没勾回去、
 // 不支持的输入一声不吭、窄屏（390px）被推演区撑出横向滚动、浅色主题下横幅看不清。还有复核第 1 轮查出来的：整份
 // 结果作输入时无行可勾、窗口里勾了不起作用的行也给勾、勾完行结果不在视野里、加载中和失败后还摆着上一次的答复、
-// 封存核对没过不说、整个指标推演不了时又写「无可推演」又写「无变化」。
+// 封存核对没过不说、整个指标推演不了时又写「无可推演」又写「无变化」。复核第 2 轮：用到了遮罩列、有输入还原不了的
+// 指标一打开仍写「无变化」，还给可改的输入框和可勾的行（改了、勾了才说推演不了）。
 //
 // 跑在预览页上：/preview.html?syn=whatif（宽屏右侧弹出、窄屏底部抽出）和 ?syn=whatif-rail（360px 画布右栏）。
 // 文档是 frontend/src/run/__tests__/evidence-query.json 里后端 compose_doc 真跑出来的（只用通用名）；片段接口
@@ -42,15 +43,35 @@ async function section(name, fn) {
 // ---------------------------------------------------------------- 夹具
 
 /**
- * 片段接口的答复：夹具里的原样。s22 改成老运行的容器输入（推演不了的那种）；s18 改成整份查询结果作输入
- * （len(vars.orders.rows)）：证据链里没有它的查询步骤，和后端真跑出来的一样
+ * 片段接口的答复：夹具里的原样，几处改成推演要用到的样子（推演接口的假答复和这里对得上）：
+ * - s22：老运行的容器输入（没存完整值）乘一个本来能改的数，整个指标推演不了
+ * - s10：Q1 的 gmv 列设了遮罩，整个指标推演不了
+ * - s8：订单数按文本条件取（文本输入不能改），订单数本身能改
+ * - s6：销售额是一个加工过的列表求和（对不上任何快照），没有能改的输入、也没有能勾的行
+ * - s18：整份查询结果作输入（len(vars.orders.rows)）：证据链里没有它的查询步骤，和后端真跑出来的一样
  */
 function segmentReply(sid) {
   const body = structuredClone(fx.segments[sid])
   if (sid === 's22') {
-    body.chain[0] = { ...body.chain[0], expression: 'sum(vars.adjust.items)', substituted: 'sum(vars.adjust.items)' }
+    body.chain[0] = { ...body.chain[0], expression: 'sum(vars.adjust.items) * vars.adjust.k',
+      substituted: 'sum(vars.adjust.items) * 1' }
     body.chain[1] = { step: 'input', path: 'vars.adjust.items', value: '[4 项]', node_id: 'adjust', via: 'code',
       field: 'items', role: 'compute', status: 'ok' }
+    body.chain.push({ step: 'input', path: 'vars.adjust.k', value: 1, node_id: 'adjust', via: 'code', field: 'k',
+      role: 'compute', status: 'ok' })
+  }
+  if (sid === 's10') body.chain = body.chain.map((s) => (s.step === 'query' ? { ...s, masked: ['gmv'] } : s))
+  if (sid === 's8') {
+    body.chain[0] = { ...body.chain[0], expression: "vars.kpi.order_cnt if vars.kpi.region == '华东' else 0",
+      substituted: "1234 if '华东' == '华东' else 0" }
+    body.chain.splice(2, 0, { step: 'input', path: 'vars.kpi.region', value: '华东', node_id: 'parse', via: 'transform',
+      field: 'region', status: 'ok' })
+  }
+  if (sid === 's6') {
+    body.chain = [
+      { ...body.chain[0], expression: 'sum(vars.kpi.daily)', substituted: 'sum(vars.kpi.daily)' },
+      { step: 'input', path: 'vars.kpi.daily', value: '[7 项]', node_id: 'daily', via: 'transform', field: 'daily', status: 'ok' },
+    ]
   }
   if (sid === 's18') {
     body.chain = [
@@ -70,6 +91,11 @@ const Q3 = inputsOf('s70')[0].artifact
 const SNAP = fx.snapshots.Q3.content
 const thousands1 = (v) => v.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
 const NO_LINEAGE = '这个指标生成于系统升级前，口径卡没有记录输入，不能推演'
+const MASKED_METRIC = '这个指标用到了设置了遮罩的列，不能推演'
+const LOST = '无法推演：vars.adjust.items（当时没有保存这个输入的完整值）'
+/** 整个指标推演不了时后端给的样子：不改动也是 unsupported / masked，新值、变化一概为空 */
+const blocked = (status, reason) => ({ new: null, delta: null, rendered_new: null, rendered_delta: null, changed: null,
+  status, reason, substituted: null })
 const AFFECTED = [{ node_id: 'yearly', artifact: 'b1'.repeat(32), caliber: '年报口径', version: 'v1', metrics: ['y'], direct: false }]
 
 /** 推演接口在这里按后端的规则算：给了新值的用新值；cell / agent 字段那一格所在的行被排除了，指标排除后无法计算 */
@@ -109,21 +135,58 @@ function whatifReply(body) {
   }
   if (body?.metric === 'refund_rate') {
     // 升级前的口径卡：没记输入，整个指标推演不了
-    return { ...base, metrics: [{ id: 'refund_rate', name: '退款率', unit: '', old: 0.0235, new: 0.0235, delta: 0,
-      rendered_old: '2.35%', rendered_new: '2.35%', rendered_delta: null, changed: false, status: 'unchanged', reason: null,
-      substituted: null, inputs: [] }],
+    return { ...base, metrics: [{ id: 'refund_rate', name: '退款率', unit: '', old: 0.0235, rendered_old: '2.35%',
+      ...blocked('unsupported', NO_LINEAGE), inputs: [] }],
     segments: [{ report: 'write', unit: fx.segments.s16.unit.id, sid: 's16', metric: 'refund_rate', rendered_old: '2.35%',
-      rendered_new: '2.35%', changed: false }],
+      rendered_new: null, changed: null }],
     unsupported: [{ metric: 'refund_rate', input: null, reason: NO_LINEAGE }] }
   }
   if (body?.metric === 'adj') {
-    return { ...base, metrics: [{ id: 'adj', name: '调整后销售额', unit: '元', old: 44000, new: 44000, delta: 0,
-      rendered_old: '44,000.0元', rendered_new: '44,000.0元', rendered_delta: null, changed: false, status: 'unchanged',
-      reason: null, substituted: 'sum(vars.adjust.items)',
+    // 老运行：容器没存完整值。乘的那个数本来能改，指标整个推演不了，也就不让改
+    return { ...base, metrics: [{ id: 'adj', name: '调整后销售额', unit: '元', old: 44000, rendered_old: '44,000.0元',
+      ...blocked('unsupported', LOST),
       inputs: [{ path: 'vars.adjust.items', via: 'code', node_id: 'adjust', kind: 'container', editable: false,
-        old: '[4 项]', new: '[4 项]', changed: false }] }],
-    segments: [{ report: 'write', unit: 'u4', sid: 's22', metric: 'adj', rendered_old: '44,000.0元', rendered_new: '44,000.0元', changed: false }],
-    unsupported: [{ metric: 'adj', input: 'vars.adjust.items', reason: '无法推演：当时没有保存这个输入的完整值' }] }
+        old: '[4 项]', new: null, changed: false },
+      { path: 'vars.adjust.k', via: 'code', node_id: 'adjust', kind: 'number', editable: false, old: 1, new: 1, changed: false }] }],
+    segments: [{ report: 'write', unit: fx.segments.s22.unit.id, sid: 's22', metric: 'adj', rendered_old: '44,000.0元',
+      rendered_new: null, changed: null }],
+    unsupported: [{ metric: 'adj', input: null, reason: LOST },
+      { metric: 'adj', input: 'vars.adjust.items', reason: '无法推演：当时没有保存这个输入的完整值' }] }
+  }
+  if (body?.metric === 'aov') {
+    // gmv 列设了遮罩：那一格不给值；订单数本来能改、它那一行本来能勾，指标整个推演不了，一样不让动
+    const cell = (path, column) => ({ path, via: 'agent_field', node_id: 'fetch', artifact: Q1, locator: { row: 0, column } })
+    return { ...base, metrics: [{ id: 'aov', name: '客单价', unit: '元', old: 37.0, rendered_old: '37.0元',
+      ...blocked('masked', MASKED_METRIC),
+      inputs: [{ ...cell('vars.kpi.gmv', 'gmv'), kind: 'number', editable: false, old: null, new: null, changed: false, masked: true },
+        { ...cell('vars.kpi.order_cnt', 'order_cnt'), kind: 'number', editable: false, old: 1234, new: 1234, changed: false }] }],
+    segments: [{ report: 'write', unit: fx.segments.s10.unit.id, sid: 's10', metric: 'aov', rendered_old: '37.0元',
+      rendered_new: null, changed: null }],
+    unsupported: [{ metric: 'aov', input: null, reason: MASKED_METRIC },
+      { metric: 'aov', input: 'vars.kpi.gmv', reason: '这一列在数据源中设置了遮罩，不能用于推演' }] }
+  }
+  if (body?.metric === 'orders') {
+    // 推演得了的指标里有一个文本输入：照实显示、列出原因，订单数照常能改
+    return { ...base, metrics: [{ id: 'orders', name: '订单数', unit: '单', old: 1234, new: 1234, delta: 0,
+      rendered_old: '1,234单', rendered_new: '1,234单', rendered_delta: null, changed: false, status: 'unchanged', reason: null,
+      substituted: "1234 if '华东' == '华东' else 0",
+      inputs: [{ path: 'vars.kpi.order_cnt', via: 'agent_field', node_id: 'fetch', artifact: Q1,
+        locator: { row: 0, column: 'order_cnt' }, row_span: [0, 0], kind: 'number', editable: true, old: 1234, new: 1234, changed: false },
+      { path: 'vars.kpi.region', via: 'transform', node_id: 'parse', kind: 'text', editable: false, old: '华东', new: '华东', changed: false }] }],
+    segments: [{ report: 'write', unit: fx.segments.s8.unit.id, sid: 's8', metric: 'orders', rendered_old: '1,234单',
+      rendered_new: '1,234单', changed: false }],
+    unsupported: [{ metric: 'orders', input: 'vars.kpi.region', reason: '不是数值，不能修改' }] }
+  }
+  if (body?.metric === 'gmv') {
+    // 加工过的列表（对不上任何快照）：不能改、也没有行可勾，推演得了却没什么可动
+    return { ...base, metrics: [{ id: 'gmv', name: '销售额', unit: '元', old: 45678.5, new: 45678.5, delta: 0,
+      rendered_old: '45,678.5元', rendered_new: '45,678.5元', rendered_delta: null, changed: false, status: 'unchanged',
+      reason: null, substituted: 'sum(vars.kpi.daily)',
+      inputs: [{ path: 'vars.kpi.daily', via: 'transform', node_id: 'daily', kind: 'container', editable: false,
+        old: '[7 项]', new: '[7 项]', changed: false }] }],
+    segments: [{ report: 'write', unit: fx.segments.s6.unit.id, sid: 's6', metric: 'gmv', rendered_old: '45,678.5元',
+      rendered_new: '45,678.5元', changed: false }],
+    unsupported: [{ metric: 'gmv', input: 'vars.kpi.daily', reason: '列表或对象不能直接修改，也没有对应的查询结果可以排除行' }] }
   }
   if (body?.metric === 'fx') {
     // 空态：原式里没有引用任何输入（写死的常数）
@@ -436,22 +499,69 @@ await section('勾行后结果就在手边', async () => {
 
 await section('不支持的输入', async () => {
   const { ctx, page } = await open('whatif')
-  await openMetric(page, 's22')
+  await openMetric(page, 's8')
   await openWhatIf(page)
-  check('不支持推演的输入列出原因', (await text(page, '[data-whatif-unsupported-input="vars.adjust.items"]'))
-    .includes('无法推演：当时没有保存这个输入的完整值'))
-  check('容器输入不给输入框', await page.locator('[data-whatif-field]').count() === 0
-    && (await text(page, '[data-whatif-input="vars.adjust.items"] [data-whatif-value]')).includes('[4 项]'))
-  check('没有能改的输入、也没有能勾的行：说一句为什么', (await text(page, '[data-whatif-nothing]')).includes('没有可以修改的输入'))
+  check('不支持推演的输入列出原因', (await text(page, '[data-whatif-unsupported-input="vars.kpi.region"]'))
+    .includes('不是数值，不能修改'))
+  check('文本输入照实显示、不给输入框；数值输入照常能改', await page.locator('[data-whatif-field]').count() === 1
+    && (await text(page, '[data-whatif-input="vars.kpi.region"] [data-whatif-value]')).includes('华东')
+    && await page.locator('[data-whatif-input="vars.kpi.order_cnt"] [data-whatif-field]').count() === 1)
+  check('指标照常推演：原值 → 原值，标「无变化」', (await text(page, '[data-whatif-new]')) === '1,234单'
+    && (await text(page, '[data-whatif-delta]')) === '无变化')
+  check('能改的那一格所在的查询步骤里出现勾选框', await page.locator(`[data-ev-query="${Q1}"] [data-whatif-row="0"] input:not(:disabled)`).count() === 1)
+  await ctx.close()
+
+  const bare = await open('whatif')
+  await openMetric(bare.page, 's6')
+  await openWhatIf(bare.page)
+  check('加工过的列表：列出原因、不给输入框', (await text(bare.page, '[data-whatif-unsupported-input="vars.kpi.daily"]'))
+    .includes('列表或对象不能直接修改') && await bare.page.locator('[data-whatif-field]').count() === 0
+    && (await text(bare.page, '[data-whatif-input="vars.kpi.daily"] [data-whatif-value]')).includes('[7 项]'))
+  check('没有能改的输入、也没有能勾的行：说一句为什么', (await text(bare.page, '[data-whatif-nothing]')).includes('没有可以修改的输入'))
+  await bare.ctx.close()
+})
+
+/** 整个指标推演不了：展开推演，等结果区写出原因。交回结果区的字（压成一行，好写进检查项的说明） */
+async function openWhole(page) {
+  await page.click('[data-whatif-toggle]')
+  await page.waitForSelector('[data-whatif-result="whole"]')
+  return (await text(page, '[data-whatif-result]')).replace(/\s+/g, ' ').trim()
+}
+
+await section('整个指标推演不了：输入还原不了', async () => {
+  const { ctx, page, sent, errors } = await open('whatif')
+  await openMetric(page, 's22')
+  const result = await openWhole(page)
+  check('一打开就写明哪个输入还原不了、为什么', result.includes(LOST), result)
+  check('不写「无变化」，也不画「→」', !result.includes('无变化') && !result.includes('→'), result)
+  check('本来能改的数也不给输入框，不列输入、不支持的输入、报告中会变的地方',
+    await page.locator('[data-whatif-field], [data-whatif-inputs], [data-whatif-unsupported], [data-whatif-segments]').count() === 0)
+  check('「恢复原值」不可点，只发过一次不带改动的请求', await page.locator('[data-whatif-reset]').isDisabled() && sent.length === 1
+    && JSON.stringify(sent[0].body.overrides) === JSON.stringify({ inputs: {}, exclude_rows: {} }))
+  check('横幅照旧在', (await text(page, '[data-whatif-banner]')).trim() === BANNER)
+  await shot(page, 'whole-lost-dark')
+  check('页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
 })
 
-await section('整个指标推演不了', async () => {
+await section('整个指标推演不了：用到了遮罩列', async () => {
+  const { ctx, page } = await open('whatif')
+  await openMetric(page, 's10')
+  const result = await openWhole(page)
+  check('一打开就写明用到了遮罩列', result.includes(MASKED_METRIC), result)
+  check('不写「无变化」，也不画「→」', !result.includes('无变化') && !result.includes('→'), result)
+  check('本来能改的订单数也不给输入框', await page.locator('[data-whatif-field], [data-whatif-inputs]').count() === 0)
+  check('查询步骤里不出勾选框，结果窗口照常显示（遮罩列写「已遮罩」）', await page.locator('[data-whatif-rows], [data-whatif-row]').count() === 0
+    && await page.locator(`[data-ev-query="${Q1}"] table`).count() === 1
+    && (await text(page, `[data-ev-query="${Q1}"] table`)).includes('已遮罩'))
+  check('不说报告里引用它的地方「不受影响」', await page.locator('[data-whatif-segments], [data-whatif-segments-none]').count() === 0)
+  await ctx.close()
+})
+
+await section('整个指标推演不了：口径卡没记输入', async () => {
   const { ctx, page } = await open('whatif')
   await openMetric(page, 's16')
-  await page.click('[data-whatif-toggle]')
-  await page.waitForSelector('[data-whatif-result="whole"]')
-  const result = await text(page, '[data-whatif-result]')
+  const result = await openWhole(page)
   check('只说原因：口径卡没有记录输入', result.includes('口径卡没有记录输入，不能推演'), result)
   check('不写「无变化」，也不说「没有引用任何输入」', !result.includes('无变化') && !result.includes('→')
     && await page.locator('[data-whatif-empty], [data-whatif-inputs], [data-whatif-unsupported]').count() === 0)
@@ -572,6 +682,13 @@ await section('窄屏', async () => {
     await page.waitForSelector('[data-whatif-snapshot] [data-whatif-row]')
     const t = await overflow(page)
     check(`390px（${theme}）：推演区里的勾行表格不横向溢出`, t.page <= 0 && t.body <= 1 && t.whatif <= 1, JSON.stringify(t))
+    // 整个指标推演不了：结果区只有原值和原因，原因里的输入路径长也要折行
+    await page.locator('[data-evidence-panel] button[aria-label="关闭证据"]').click()
+    await openMetric(page, 's22')
+    await openWhole(page)
+    const w = await overflow(page)
+    check(`390px（${theme}）：整个指标推演不了时不横向溢出`, w.page <= 0 && w.body <= 1 && w.whatif <= 1, JSON.stringify(w))
+    await shot(page, `narrow-whole-${theme}`)
     check(`390px（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
     await ctx.close()
   }
@@ -626,6 +743,20 @@ await section('深浅色可读', async () => {
     check(`${theme}：横幅加粗`, c.weight >= 500, String(c.weight))
     await shot(page, `open-${theme}`)
     await ctx.close()
+
+    // 整个指标推演不了时，结果区里只剩一句原因：它就是要人读的那句
+    const whole = await open('whatif', { theme })
+    await openMetric(whole.page, 's10')
+    await openWhole(whole.page)
+    const r = await whole.page.evaluate(() => {
+      const reason = document.querySelector('[data-whatif-reason]')
+      const panel = document.querySelector('[data-evidence-panel]')
+      return { fg: getComputedStyle(reason).color, base: getComputedStyle(panel).backgroundColor }
+    })
+    const reasonRatio = contrast(r.fg, r.base, r.base)
+    check(`${theme}：整个指标推演不了的原因对比度 ≥ 4.5`, reasonRatio >= 4.5, `${reasonRatio.toFixed(2)}（${r.fg} on ${r.base}）`)
+    await shot(whole.page, `whole-masked-${theme}`)
+    await whole.ctx.close()
   }
 })
 

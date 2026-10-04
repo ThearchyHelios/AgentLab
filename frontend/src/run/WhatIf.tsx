@@ -25,6 +25,8 @@ import type { EvidenceStep, WhatIfInput, WhatIfMetric, WhatIfOverrides, WhatIfRe
  *   整份快照的（SnapshotRows）。只有这个指标的输入实际用到的行可勾（row_span），别的行勾了也不影响结果
  *
  * 不能改的输入（文本、对不上快照的列表、遮罩列、决定取哪一格的下标）照实显示，原因列在「不支持推演的输入」里。
+ * 整个指标推演不了的（口径卡没记输入、用到了遮罩列、有输入还原不了或所在的快照读不出来，见 wholeReason）只写原因：
+ * 不写「无变化」，不画输入框、勾选框，也不列报告里引用它的地方——改了、勾了也推演不出来。
  */
 
 /** 输入框停顿多久提交一次：边打字边请求，结果跟着抖 */
@@ -197,7 +199,11 @@ export function pickMetric(data: WhatIfResult | undefined, metric: string | unde
   return data?.metrics.find((x) => String(x.id) === metric) ?? data?.metrics[0]
 }
 
-/** 整个指标推演不了（口径卡没记输入）：unsupported 里 input 为空的那一条 */
+/**
+ * 整个指标推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了或所在的快照读不出来）：unsupported 里 input 为空的
+ * 那一条。不论改什么都推演不了，后端不改动也照实给；排除行后才说不准的（只在这次改动下推演不了）没有这一条，照常画
+ * 输入和勾选框，好让人把行勾回去
+ */
 export const wholeReason = (data: WhatIfResult | undefined, metric: string | undefined) =>
   data?.unsupported.find((u) => String(u.metric) === metric && u.input == null)?.reason
 
@@ -307,7 +313,7 @@ export function WhatIf({ id, runId, report, metric, draft, view, queryOf, onLoca
   const failed = status === 'error'
   const m = pickMetric(data, metric)
   const unsupported = (data?.unsupported ?? []).filter((u) => String(u.metric) === metric)
-  // 整个指标推演不了（口径卡没记输入）：只说原因，不画输入、不写「无变化」
+  // 整个指标推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了）：只说原因，不画输入、不写「无变化」
   const whole = wholeReason(data, metric)
   const unknown = !!m && m.rendered_new == null
   const changedSegs = (data?.segments ?? []).filter((s) => s.changed)
@@ -344,12 +350,14 @@ export function WhatIf({ id, runId, report, metric, draft, view, queryOf, onLoca
           {whole ? (
             <>
               <span className="mono tnum text-dim" data-whatif-old="">{m.rendered_old}</span>
-              <p className="mt-0.5" style={{ color: 'var(--st-waiting)' }} data-whatif-reason="">{whole}</p>
+              <p className="mt-0.5 [overflow-wrap:anywhere]" style={{ color: 'var(--st-waiting)' }} data-whatif-reason="">{whole}</p>
             </>
           ) : (
             <>
               <Outcome m={m} loading={loading} big tag="whatif" />
-              {m.reason && <p className="mt-0.5" style={{ color: 'var(--st-waiting)' }} data-whatif-reason="">{m.reason}</p>}
+              {m.reason && (
+                <p className="mt-0.5 [overflow-wrap:anywhere]" style={{ color: 'var(--st-waiting)' }} data-whatif-reason="">{m.reason}</p>
+              )}
               {m.status === 'ok' && m.changed && m.substituted && (
                 <div className="mt-1">
                   <div className="text-2xs text-faint">{WHATIF_TEXT.substituted}</div>

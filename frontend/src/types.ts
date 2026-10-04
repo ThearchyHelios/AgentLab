@@ -3052,7 +3052,7 @@ export interface WhatIfInput {
   artifact?: string
   locator?: EvidenceLocator
   kind: 'number' | 'text' | 'bool' | 'missing' | 'container' | (string & {})
-  /** 数值（或原本缺失）的标量、不是遮罩列、不决定取哪一格：可以改 */
+  /** 数值（或原本缺失）的标量、不是遮罩列、不决定取哪一格、还原得出：可以改。整个指标推演不了时一律为 false */
   editable: boolean
   /** 原值、推演用的值。容器写大概（「[12 项]」）；遮罩列的一律是 null */
   old?: unknown
@@ -3062,7 +3062,7 @@ export interface WhatIfInput {
   excluded_rows?: number[]
   /**
    * 这个输入实际用到的快照行（含两端，从 0 数）：单格一行、数组字段一段、整份查询结果全部。排除别的行影响不到它，
-   * 界面只让这几行可勾。遮罩的、快照读不出来的没有
+   * 界面只让这几行可勾。遮罩的、还原不了的（完整值找不回来、快照读不出来）没有，整个指标推演不了时一律没有
    */
   row_span?: [number, number]
   masked?: boolean
@@ -3072,7 +3072,8 @@ export interface WhatIfInput {
 
 /**
  * unchanged：没碰到改动，原值原样交回；ok：重算了；excluded：排除行后缺了输入，算不出来；error：新值让计算出错（除以零……）；
- * unsupported：有输入的完整值找不回来，推演不了；masked：用到了遮罩列，不推演
+ * unsupported：推演不了（有输入还原不了、口径卡没记输入，或者排除行后说不准受不受影响）；masked：用到了遮罩列，
+ * 不推演。整个指标推演不了的不改动也是 unsupported / masked（unsupported 里另有一条 input 为空的）
  */
 export type WhatIfStatus = 'unchanged' | 'ok' | 'excluded' | 'error' | 'unsupported' | 'masked'
 
@@ -3112,7 +3113,10 @@ export interface WhatIfSegment {
 
 export interface WhatIfUnsupported {
   metric: string
-  /** null：整个指标都推演不了（口径卡没记输入） */
+  /**
+   * null：整个指标都推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了或所在的快照读不出来），reason 和指标上的
+   * 一样。不论改什么都推演不了，不改动也有这一条；界面据此只写原因，不画输入框、勾选框
+   */
   input: string | null
   reason: string
 }

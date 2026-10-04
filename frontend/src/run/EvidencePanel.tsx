@@ -323,7 +323,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   // 每份快照里这个指标用得到的行：别的行勾了不影响结果，表格里不让勾
   const whatifUsable = useMemo(() => usableRows(pickMetric(whatifView.data, whatifMetric)), [whatifView.data, whatifMetric])
   // 能勾行的查询步骤：指标的输入（单元格取数、Agent 字段）落在它上面。合并查询的输入步骤不给——指标引用的是合并结果。
-  // 整个指标推演不了（口径卡没记输入）时一行都不给勾
+  // 整个指标推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了）时一行都不给勾
   const pickable = new Set(wholeReason(whatifView.data, whatifMetric) ? []
     : inputs.map((inp) => inp.artifact).filter((a): a is string => !!a))
   const queryLink = (artifactOf?: string) => {
