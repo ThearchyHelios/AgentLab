@@ -34,7 +34,8 @@ BUNDLE_SEAL_BROKEN = "bundle_seal_broken"
 #: 运行结束的状态：封存是最后一次的，之后不会再换（除非失败的运行又被接着跑，那是另一次封存）
 _FINISHED = frozenset({"succeeded", "failed", "cancelled"})
 UNSEALED = "运行尚未结束封存，结束后才能导出"
-SEAL_BROKEN = "封存核对不一致：{why}。不能导出可验证报告，请先在记录页核对这次运行"
+#: 原样出现在记录页的错误提示里，导出按钮旁边就是「核对」。不拼封存核对的结论原句：那句自带冒号和「不一致」
+SEAL_BROKEN = "封存核对不一致：封存后有事件被修改、删除或插入，不能导出可验证报告。点「核对」可查看核对结果"
 
 
 @router.get("/{run_id}/bundle.html")
@@ -44,8 +45,7 @@ async def export_bundle(run_id: str) -> Response:
     if not sealed.sealed or sealed.status not in _FINISHED:
         raise CodedHTTPException(409, UNSEALED, BUNDLE_UNSEALED)
     if not sealed.trusted:
-        why = str(sealed.verdict.get("message") or "封存后有事件被修改、删除或插入").rstrip("。")
-        raise CodedHTTPException(409, SEAL_BROKEN.format(why=why), BUNDLE_SEAL_BROKEN)
+        raise CodedHTTPException(409, SEAL_BROKEN, BUNDLE_SEAL_BROKEN)
     bound = sealed.seal["manifest_seq"]
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)

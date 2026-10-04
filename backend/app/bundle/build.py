@@ -32,9 +32,10 @@ from urllib.parse import quote
 
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
-from app.engine.evidence import iter_units
+from app.engine.evidence import iter_units, query_entry_fields
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.schema import NodeType
+from app.engine.toolcalls import QUERY_PREFIX
 
 SCHEMA = "agentlab.bundle/1"
 
@@ -128,6 +129,71 @@ def _query_artifacts(events: Iterable[tuple[int, str, str | None, Any]]) -> list
             out += [str(e["artifact"]) for e in data.get("evidence") or []
                     if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")]
     return list(dict.fromkeys(a for a in out if a))
+
+
+_UNSEEN = object()
+
+
+def _query_returned(data: Mapping[str, Any], store: _Store) -> tuple[str, str | None]:
+    """一次数据源查询（db_query__ 工具的 tool.end）交回了什么：("snapshot", 查询快照 id)；("none", None) 没交回数据
+    （查询失败、SQL 被拒的那句原话）；认不出来是 ("unknown", None)。
+
+    新运行在 query_artifact 里直接记了快照 id。没记的有三种：查询没成功；升级前的运行（证据台账之前，tool.end 只有
+    工具快照，查询快照的 id 嵌在工具快照记下的返回里，照证据接口 _legacy_pool 的办法认）；协作团队成员的查询（连工具
+    快照都不落，只能看事件里的预览，长一点的返回被截断，解析不了）。"""
+    artifact = data.get("query_artifact")
+    if isinstance(artifact, str) and artifact:
+        return "snapshot", artifact
+    returned: Any = _UNSEEN
+    snapshot = data.get("artifact")
+    # 工具快照要哈希对得上、记的是同一个工具：被改过的不能拿来说这次查询没有遮罩
+    if isinstance(snapshot, str) and snapshot and store.intact(snapshot):
+        content = store.content(snapshot)
+        if isinstance(content, dict) and content.get("tool") == data.get("tool") and "result" in content:
+            returned = content["result"]
+    if returned is _UNSEEN:
+        preview = data.get("preview")
+        if not isinstance(preview, str):
+            return "unknown", None
+        returned = preview
+        if preview.startswith('"'):
+            # 调用工具节点的预览是把返回值再 json.dumps 一遍（文本外面套了一层引号），截断了就剥不开
+            try:
+                returned = json.loads(preview)
+            except ValueError:
+                return "unknown", None
+    fields = query_entry_fields(returned)
+    if fields:
+        return "snapshot", str(fields["artifact"])
+    # 数据源工具成功时交回的是 JSON 对象；不是对象的是一句原话，对象里没有 rows 的是报错
+    if isinstance(returned, str) and not returned.lstrip().startswith("{"):
+        return "none", None
+    if isinstance(returned, dict) and "rows" not in returned:
+        return "none", None
+    return "unknown", None
+
+
+def _masked_run(events: Sequence[tuple[int, str, str | None, Any]], store: _Store, cited: Iterable[str],
+                source_masks: Mapping[str, Any]) -> bool:
+    """运行里有没有哪次查询的结果可能带着遮罩列。有的话，成果节点和运行结束事件的预览可能直接带出查询结果，只给哈希。
+
+    宁严勿宽：封存范围内每一次数据源查询都要对得上一份没有遮罩的查询快照，或者确实没交回数据，才算没有。数据源
+    现在设了遮罩的，按工具名就知道，不必去认快照；认不出查了什么的，按带遮罩算。"""
+    known = [*_query_artifacts(events), *cited]
+    for _, etype, _, data in events:
+        if etype != EventType.TOOL_END or not isinstance(data, dict):
+            continue
+        tool = str(data.get("tool") or "")
+        if not tool.startswith(QUERY_PREFIX):
+            continue
+        if source_masks.get(tool[len(QUERY_PREFIX):]):
+            return True
+        kind, artifact = _query_returned(data, store)
+        if kind == "unknown":
+            return True
+        if artifact:
+            known.append(artifact)
+    return any(store.masked(a) for a in dict.fromkeys(known))
 
 
 # --------------------------------------------------------------------------
@@ -330,8 +396,7 @@ def build_bundle(
             if kind == "query":
                 cited_queries.append(artifact)
 
-    # 运行里有没有带遮罩的查询：有的话，成果节点和运行结束事件的预览可能直接带出查询结果，只给哈希
-    masked_run = any(store.masked(a) for a in dict.fromkeys([*_query_artifacts(sealed), *cited_queries]))
+    masked_run = _masked_run(sealed, store, cited_queries, source_masks or {})
     shown_events = []
     for seq, etype, node_id, data in sealed:
         text = canonical_json(data)
@@ -367,7 +432,7 @@ def build_bundle(
 #: U+2028 / U+2029 在老的 JS 解析器里是换行，一并转义。这几个字只会出现在 JSON 的字符串里，转义后 JSON 不变
 _JSON_ESCAPES = str.maketrans({"<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
                                "\u2028": "\\u2028", "\u2029": "\\u2029"})
-_PLACEHOLDER = re.compile(r"__BUNDLE_(TITLE|CSP|DATA|SCRIPT)__")
+_PLACEHOLDER = re.compile(r"__BUNDLE_(TITLE|NAME|SEAL|RUN|FAILED|CSP|DATA|SCRIPT)__")
 
 
 @lru_cache(maxsize=1)
@@ -385,10 +450,16 @@ def render_html(bundle: Mapping[str, Any]) -> str:
     """把数据和核对脚本填进模板：样式、脚本都内联，零外链。
 
     内容安全策略按哈希只放行这一段核对脚本，默认什么都不许连：页面打开后不会、也不能向任何地方发请求。
+    工作流名、封存哈希、运行 ID 直接写进页面：邮件、即时通讯的附件预览和系统的快速查看常常不执行脚本，也要看得到
+    该拿什么去系统里对照。脚本执行后拿数据里的封存哈希核对，再核一遍这里写出的和它一致。失败结束的运行另写一句：
+    之后在系统中继续运行会重新封存，这个文件就再也对不上了。
     占位符一次替换完，填进去的内容不会再被当成占位符。"""
     template, script = _assets()
     digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
-    title = f"{(bundle.get('meta') or {}).get('workflow_name') or UNSAVED_NAME} · 可验证报告"
-    values = {"TITLE": html.escape(title), "CSP": f"'sha256-{digest}'", "DATA": bundle_json(bundle),
-              "SCRIPT": script}
+    meta = bundle.get("meta") or {}
+    name = str(meta.get("workflow_name") or UNSAVED_NAME)
+    values = {"TITLE": html.escape(f"{name} · 可验证报告"), "NAME": html.escape(name),
+              "SEAL": html.escape(str(meta.get("manifest_hash") or "")), "RUN": html.escape(str(meta.get("run_id") or "")),
+              "FAILED": "" if meta.get("status") == "failed" else " hidden",
+              "CSP": f"'sha256-{digest}'", "DATA": bundle_json(bundle), "SCRIPT": script}
     return _PLACEHOLDER.sub(lambda m: values[m.group(1)], template)

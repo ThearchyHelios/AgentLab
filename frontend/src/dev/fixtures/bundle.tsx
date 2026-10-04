@@ -10,7 +10,9 @@ import type { Run } from '../../types'
  * - bundle-provenance-sealed：已封存，可以导出
  * - bundle-provenance-running / -waiting：还在运行、等待审批，按钮不可用并说明原因
  * - bundle-provenance-unsealed：结束了却没有封存清单（加封存之前的老运行）
- * - bundle-provenance-again：失败后接着跑，留着上一次的封存，正在运行：同样不可用（跑完会换掉清单哈希）
+ * - bundle-provenance-again：失败后接着跑，留着上一次的封存，正在运行：同样不可用（跑完会换掉清单哈希），左边写着
+ *   「已封存」，原因写在屏幕上
+ * - bundle-provenance-failed：失败结束、已封存：可以导出，提示里说明之后继续运行会重新封存
  */
 const SEALED: Run = {
   id: 'f4b0f4b0f4b0f4b0f4b0f4b0f4b0f4b0',
@@ -50,4 +52,5 @@ export const cases: Record<string, () => JSX.Element> = {
   'bundle-provenance-waiting': () => <Frame run={unsealed('interrupted')} phase="waiting" />,
   'bundle-provenance-unsealed': () => <Frame run={{ ...unsealed('succeeded'), finished_at: SEALED.finished_at }} phase="succeeded" />,
   'bundle-provenance-again': () => <Frame run={{ ...SEALED, status: 'running', finished_at: null }} phase="running" />,
+  'bundle-provenance-failed': () => <Frame run={{ ...SEALED, status: 'failed' }} phase="failed" />,
 }

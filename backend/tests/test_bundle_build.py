@@ -5,10 +5,12 @@
 - 每条封存范围内的事件都带 data_sha256，按浏览器的拼法（seq|type|node_id|data_sha256 按 seq 排、换行连接）
   重算出来的清单哈希等于 runner 记下的那个；
 - 只有白名单里的事件带 canonical（逐字等于 canonical_json(data)），其余只给哈希；运行里有带遮罩的快照时，
-  成果节点和运行结束事件的预览可能带出查询结果，也只给哈希；
+  成果节点和运行结束事件的预览可能带出查询结果，也只给哈希。认不出快照的查询（升级前的运行从工具快照里认，
+  协作团队成员的查询认不出）按带遮罩算，查询失败的原话不算；
 - 报告文档、它引用到的口径卡和查询快照按原字节嵌入；带遮罩的快照只给 id；没被引用的工件不嵌；
 - 封存之后追加的事件单列，不进清单；
-- 页面零外链，数据里的 </script> 截不断数据块。
+- 页面零外链，数据里的 </script> 截不断数据块；封存哈希、运行 ID、工作流名不执行脚本也写在页面上；
+- scripts/check-bundle.mjs 在浏览器里打开的样本页（tests/bundle_samples.py）封存哈希是真算的、形状如预期。
 """
 from __future__ import annotations
 
@@ -198,6 +200,75 @@ def test_an_unreadable_snapshot_counts_as_masked():
     assert entry["missing"] is True and "b64" not in entry
 
 
+# 没有遮罩的报告、口径卡：成果和运行结束事件本该带规范字符串，下面几种查询让它们只给哈希
+PLAIN_DOC = {**doc_of(), "catalog": {k: v for k, v in doc_of()["catalog"].items() if k != "Q2"}}
+PLAIN_DOC_ID, PLAIN_DOC_RAW = stored(PLAIN_DOC)
+TOOL_SNAP_CRM = {"tool": "db_query__crm", "args": {"sql": SNAP_MASKED["sql"]},
+                 "result": json.dumps({**{k: v for k, v in SNAP_MASKED.items() if k != "mask_columns"},
+                                       "artifact": MASKED_ID}, ensure_ascii=False)}
+TOOL_SNAP_CRM_ID, TOOL_SNAP_CRM_RAW = stored(TOOL_SNAP_CRM)
+
+
+def plain_events(members_end):
+    """报告只引用门店流水（没有遮罩）的运行；第 6 条是会员库那次查询，形状由调用方给。"""
+    events = []
+    for seq, etype, node_id, data in sample_events(PLAIN_DOC_ID):
+        if seq == 6:
+            data = members_end
+        events.append((seq, etype, node_id, data))
+    return events
+
+
+def shown_seqs(bundle) -> set[int]:
+    return {e["seq"] for e in bundle["events"] if "canonical" in e}
+
+
+def test_a_run_without_masked_queries_shows_its_output():
+    """对照组：会员库那次查询有快照、没有遮罩，成果节点（14）和运行结束事件（15）带规范字符串。"""
+    unmasked = {k: v for k, v in SNAP_MASKED.items() if k != "mask_columns"}
+    plain_id, plain_raw = stored(unmasked)
+    events = plain_events({"tool": "db_query__crm", "preview": "[[\"林一\"]]", "query_artifact": plain_id})
+    bundle = build(events, {**STORE, PLAIN_DOC_ID: PLAIN_DOC_RAW, plain_id: plain_raw})
+    assert {14, 15} <= shown_seqs(bundle)
+
+
+def test_a_pre_ledger_query_is_traced_through_its_tool_snapshot():
+    """升级前的运行：tool.end 只有工具快照（artifact），查询快照的 id 嵌在工具快照的返回里。照证据接口
+    （_legacy_pool）的办法从工具快照认出查询快照：它带遮罩，成果和运行结束事件只给哈希。"""
+    events = plain_events({"tool": "db_query__crm", "preview": "{\"rows\": [[\"林一\", \"000-0001\"…",
+                           "artifact": TOOL_SNAP_CRM_ID})
+    bundle = build(events, {**STORE, PLAIN_DOC_ID: PLAIN_DOC_RAW, TOOL_SNAP_CRM_ID: TOOL_SNAP_CRM_RAW})
+    assert not {6, 14, 15} & shown_seqs(bundle)
+    assert "000-0001" not in json.dumps(bundle, ensure_ascii=False)
+
+
+def test_a_query_that_cannot_be_traced_counts_as_masked():
+    """协作团队成员的查询：tool.end 既没有查询快照也没有工具快照，预览是截断的返回，认不出查的是什么。
+    宁可多挡：按带遮罩算，成果和运行结束事件只给哈希。"""
+    events = plain_events({"tool": "db_query__crm", "agent": "分析员", "call_id": "c1",
+                           "preview": "{\"columns\": [\"name\", \"phone\"], \"rows\": [[\"林一\", \"000-0001\"]"})
+    events[13] = (14, "node.finished", "out", {"preview": {"明细": "林一 000-0001"}})
+    events[14] = (15, "run.finished", None, {"output": {"明细": "林一 000-0001"}})
+    bundle = build(events, {**STORE, PLAIN_DOC_ID: PLAIN_DOC_RAW})
+    assert not {6, 14, 15} & shown_seqs(bundle)
+    assert "000-0001" not in json.dumps(bundle, ensure_ascii=False)
+
+
+def test_a_failed_query_returned_no_data():
+    """查询失败、SQL 被拒：返回的是一句原话，没有数据，不因此挡住成果。"""
+    events = plain_events({"tool": "db_query__crm", "preview": "查询失败：no such table: members_x",
+                           "call_id": "c2"})
+    bundle = build(events, {**STORE, PLAIN_DOC_ID: PLAIN_DOC_RAW})
+    assert {14, 15} <= shown_seqs(bundle)
+
+
+def test_a_source_masked_now_hides_queries_without_a_snapshot():
+    """数据源现在设了遮罩：不必认出快照，按工具名就知道这次查询可能带着遮罩列。"""
+    events = plain_events({"tool": "db_query__crm", "preview": "查询失败：timeout"})
+    bundle = build(events, {**STORE, PLAIN_DOC_ID: PLAIN_DOC_RAW}, source_masks={"crm": ["phone"]})
+    assert not {14, 15} & shown_seqs(bundle)
+
+
 # --------------------------------------------------------------------------
 # 工件：只嵌报告文档和它引用到的口径卡、查询快照
 # --------------------------------------------------------------------------
@@ -343,9 +414,85 @@ def test_the_verifier_script_is_inline_and_cannot_close_early():
     html = render_html(build())
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     assert "</script" not in script.lower() and "<!--" not in script
+    # 脚本在 <head> 里、排在数据块前面：它的注释里也不能出现「<script」，按标签找数据块的人才不会先找到它
+    assert "<script" not in script.lower()
+    assert html.index("<script>") < html.index('<script type="application/json" id="bundle-data">')
     assert "bundle-data" in script and "crypto.subtle" in script.replace("window.", "")
+
+
+def text_of(html: str, element_id: str) -> str:
+    m = re.search(rf'<(\w+)[^>]*\sid="{element_id}"[^>]*>(.*?)</\1>', html, re.S)
+    assert m, f"页面里没有 #{element_id}"
+    return re.sub(r"<[^>]+>", "", m.group(2))
+
+
+def test_the_seal_and_run_are_written_without_script():
+    """附件预览、快速查看常常不执行脚本：封存哈希、运行 ID、工作流名直接写在页面上，状态说清还没核对。"""
+    nasty = {**RUN, "id": "r1<b>", "workflow_name": "门店<i>周报</i>"}
+    bundle = build_bundle(nasty, sample_events(), manifest_seq=15, manifest_hash="ab" * 32, graph=GRAPH,
+                          read=STORE.get, exported_at="2026-10-05T08:00:00+00:00")
+    html = render_html(bundle)
+    assert text_of(html, "seal-hash") == "ab" * 32
+    assert "r1&lt;b&gt;" in text_of(html, "seal-note") and "<b>" not in text_of(html, "seal-note")
+    assert text_of(html, "title") == "门店&lt;i&gt;周报&lt;/i&gt;"
+    # 没执行脚本时总览写的是「尚未核对」，不是一直转着的「正在核对」（那句只在脚本开始执行后才显示）
+    assert re.search(r'class="no-js">尚未核对：[^<]*需要在浏览器中打开本文件', html)
+    assert re.search(r'class="js-only">正在核对', html)
+    # 成功结束的运行没有「继续运行会重新封存」那一句；失败的有
+    assert re.search(r'id="seal-failed"[^>]*\shidden', html)
+    failed = render_html(build_bundle({**RUN, "status": "failed"}, sample_events(), manifest_seq=15,
+                                      manifest_hash="ab" * 32, graph=GRAPH, read=STORE.get, exported_at="x"))
+    assert not re.search(r'id="seal-failed"[^>]*\shidden', failed)
+    assert "重新封存" in text_of(failed, "seal-failed")
 
 
 @pytest.mark.parametrize("legacy", [True, False])
 def test_legacy_seals_are_flagged(legacy):
     assert build(legacy=legacy)["meta"]["legacy"] is legacy
+
+
+# --------------------------------------------------------------------------
+# 浏览器检查用的样本页（tests/bundle_samples.py）
+# --------------------------------------------------------------------------
+
+
+def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
+    """scripts/check-bundle.mjs 断网打开这些样本页，断言核对结果、再做篡改。pytest 不执行页面上的脚本，这里守住样本
+    本身：封存哈希是对事件真算的（浏览器的拼法重算得出），各页的形状是 check-bundle 的断言预期的那样。"""
+    from tests.bundle_samples import pages
+
+    got = {name: json.loads(data_block(page)) for name, page in pages().items()}
+    assert set(got) == {"base", "two-reports", "legacy", "failed", "degraded", "missing-doc", "missing-card", "nan",
+                        "stray"}
+    for name, bundle in got.items():
+        assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
+
+    def segments(bundle, node_id="write"):
+        doc_id = next(r["doc_artifact"] for r in bundle["reports"] if r["node_id"] == node_id)
+        doc = json.loads(base64.b64decode(next(a["b64"] for a in bundle["artifacts"] if a["id"] == doc_id)))
+        return [s for b in doc["blocks"] for u in b["units"] for s in u["segments"] if s["kind"] in ("number", "value")]
+
+    base = got["base"]
+    shapes = {(a["kind"], a.get("node_id")): {k for k in a if k in ("b64", "masked", "missing")} for a in base["artifacts"]}
+    assert shapes == {("report_doc", "write"): {"b64"}, ("metric_set", "card"): {"b64"}, ("query", "fetch"): {"b64"},
+                      ("query", "members"): {"masked"}}
+    cited = segments(base)
+    # 数字与取值超过折叠的条数（20）；没有出处的一个、引用遮罩快照的一个
+    assert len(cited) == 21
+    assert sum(1 for s in cited if not s.get("cite")) == 1 and sum(1 for s in cited if s["kind"] == "value") == 8
+    assert [a["type"] for a in base["appended"]] == ["evidence.judged"]
+    assert base["meta"]["tier"]["value"] == "formal" and base["meta"]["run_class"] == "formal"
+
+    assert [(a["kind"], a.get("missing")) for a in got["missing-doc"]["artifacts"]] == [("report_doc", True)]
+    assert next(a for a in got["missing-card"]["artifacts"] if a["kind"] == "metric_set").get("missing") is True
+    assert got["legacy"]["meta"]["legacy"] is True and "run.finished" in [a["type"] for a in got["legacy"]["appended"]]
+    assert [r["node_id"] for r in got["two-reports"]["reports"]] == ["write", "monthly"] and segments(got["two-reports"], "monthly")
+    failed = got["failed"]
+    assert failed["meta"]["status"] == "failed" and failed["meta"]["tier"] is None
+    assert max(failed["events"], key=lambda e: e["seq"])["type"] == "run.failed"
+    issuances = [e["seq"] for e in got["degraded"]["events"] if e["type"] == "issuance"]
+    assert len(issuances) == 2 and got["degraded"]["meta"]["tier"] == {"value": "degraded", "seq": issuances[-1]}
+    assert [a["kind"] for a in got["stray"]["artifacts"]] == ["report_doc"]
+    nan = got["nan"]
+    assert "NaN" in next(e["canonical"] for e in nan["events"] if e["type"] == "run.started")
+    assert b"NaN" in base64.b64decode(next(a["b64"] for a in nan["artifacts"] if a.get("node_id") == "fetch"))

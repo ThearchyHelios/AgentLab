@@ -1,0 +1,200 @@
+"""可验证报告的虚构样本页：给 scripts/check-bundle.mjs 在浏览器里核对（pytest 不执行页面上的核对脚本）。
+
+    python -m tests.bundle_samples <目录>
+
+在目录里写下几份页面（<名字>.html）。每份都是 build_bundle + render_html 真实生成的，封存哈希按 runner 的算法
+（artifact_store.manifest_hash）对事件真实算出，报告文档用 compose_doc 按证据目录真实组装（标题、段落、列表、
+表格、粗体、斜体，数字和取值的引用都和真实运行一样）。check-bundle 断网打开它们，逐项断言核对结果和原因，再在
+这几份上做篡改。这样遮罩快照、多份报告、早期运行、服务端缺文件这些分支，不论真数据里有没有，都有人在浏览器里核过。
+
+数据全是虚构的：门店、会员、金额都是编的。
+
+- base：一份报告，引用口径卡、门店流水（没有遮罩）、会员消费（有遮罩）各一处，一个没有出处的数，一张门店流水整表
+  （数字列右对齐，数字与取值共 21 个，超过折叠的条数）；一条封存之后追加的按需裁判
+- two-reports：另有一份月报，两份报告各自的引用链
+- legacy：早期运行，封存范围按结束事件推算（运行结束事件在范围外，运行结果无法核对）
+- failed：失败结束的运行（没有出具判定），封存说明多一句「继续运行会重新封存」
+- degraded：两条出具判定，先完整出具、后降档出具，认最后一条
+- missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
+- nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
+- stray：报告自查记下的文档是另一次运行写的
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from app.bundle.build import build_bundle, render_html
+from app.core.artifact_store import canonical_json, content_hash, manifest_hash
+from app.engine.evidence import build_catalog, compose_doc
+
+RUN_ID = "5a3c0f4b9d2e4e1f8b7a6c5d4e3f2a1b"
+RUN = {"id": RUN_ID, "workflow_id": "wf-sample-weekly", "workflow_name": "门店周报", "version": 3,
+       "version_hash": "ab" * 32, "run_class": "formal", "status": "succeeded",
+       "started_at": "2026-09-07T01:00:00+00:00", "finished_at": "2026-09-07T01:02:03+00:00"}
+GRAPH = {"nodes": [{"id": n, "type": t, "data": {"label": label}} for n, t, label in [
+    ("start", "input", "开始"), ("fetch", "tool", "门店流水"), ("members", "tool", "会员消费"),
+    ("card", "metrics", "周报口径"), ("write", "report", "写周报"), ("monthly", "report", "写月报"),
+    ("out", "output", "成果")]]}
+EXPORTED_AT = "2026-10-05T08:00:00+00:00"
+
+STORES = [["青石店", 1280.5], ["白沙店", "960.00"], ["临川店", 732], ["望江店", 1105.25], ["枫桥店", 418],
+          ["云岭店", 2210], ["石桥店", 655.5], ["柳湾店", 980]]
+CRM = {"columns": ["name", "phone", "spend"], "column_types": {"name": "text", "phone": "text", "spend": "number"},
+       "rows": [["林一", "000-0001", 320.0], ["周二", "000-0002", 188.5]], "source": "crm",
+       "sql": "SELECT name, phone, spend FROM members ORDER BY id", "truncated": False, "mask_columns": ["phone"]}
+CARD = {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v2",
+        "metrics": [{"id": "gmv", "name": "销售额", "value": 8381.25, "unit": "元", "decimals": 2, "format": "thousands"}]}
+
+WEEKLY = ("## 门店周报\n\n本周销售额 [[m:gmv]]，*按发生周统计*。青石店流水 [[v:Q1.r0.amount]]，白沙店 [[v:Q1.r1.amount]]，"
+          "**会员消费** [[v:Q2.r0.spend]]，另有 42 笔退款待入账。[[see:Q1]]\n\n- 云岭店流水最高\n- 枫桥店流水最低\n\n"
+          "[[table:Q1 cols=store,amount rows=0-7]]")
+MONTHLY = "## 门店月报\n\n本月销售额 [[m:gmv]]，青石店流水 [[v:Q1.r0.amount]]。[[see:Q1]]"
+
+
+def stored(obj: Any) -> tuple[str, bytes]:
+    """照工件库的样子落一份：规范 JSON 的字节，id 是它的 sha256。"""
+    raw = canonical_json(obj).encode()
+    return content_hash(raw), raw
+
+
+def shop(nan: bool = False) -> dict[str, Any]:
+    """门店流水的查询快照。ratio 那一列报告不引用；nan=True 时第一行是浮点 NaN（json.dumps 写成裸的 NaN）。"""
+    rows = [[name, amount, float("nan") if nan and i == 0 else round(0.05 * (i + 1), 2)]
+            for i, (name, amount) in enumerate(STORES)]
+    return {"columns": ["store", "amount", "ratio"],
+            "column_types": {"store": "text", "amount": "number", "ratio": "number"}, "rows": rows, "source": "shop",
+            "sql": "SELECT store, amount, ratio FROM orders ORDER BY id", "truncated": False}
+
+
+class Sample:
+    """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。"""
+
+    def __init__(self, *, nan: bool = False) -> None:
+        self.files: dict[str, bytes] = {}
+        self.shop_id = self.put(shop(nan))
+        self.crm_id = self.put(CRM)
+        self.card_id = self.put(CARD)
+        self.ledger = [
+            {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id, "tool": "db_query__shop",
+             "source": "shop", "columns": ["store", "amount", "ratio"], "rows": len(STORES), "truncated": False},
+            {"kind": "query", "node_id": "members", "exec": 1, "artifact": self.crm_id, "tool": "db_query__crm",
+             "source": "crm", "columns": CRM["columns"], "rows": len(CRM["rows"]), "truncated": False},
+            {"kind": "metric_set", "node_id": "card", "artifact": self.card_id},
+        ]
+        self.catalog = build_catalog(nodes={"card": CARD}, ledger=self.ledger)
+
+    def put(self, obj: Any) -> str:
+        artifact, raw = stored(obj)
+        self.files[artifact] = raw
+        return artifact
+
+    def load(self, artifact: str) -> Any:
+        raw = self.files.get(artifact)
+        return json.loads(raw) if raw is not None else None
+
+    def doc(self, text: str, node_id: str, run_id: str = RUN_ID) -> str:
+        return self.put(compose_doc(text, self.catalog, node_id=node_id, run_id=run_id, loader=self.load))
+
+    def events(self, reports: dict[str, str], *, ending: str = "finished", tiers: tuple[str, ...] = ("formal",),
+               nan: bool = False) -> tuple[list[tuple[int, str, str | None, Any]], int]:
+        """(全部事件, 封存范围)。封存范围到结束事件为止，后面再追加一条按需裁判。"""
+        rows: list[tuple[int, str, str | None, Any]] = []
+
+        def add(etype: str, node_id: str | None, data: dict[str, Any]) -> None:
+            rows.append((len(rows) + 1, etype, node_id, data))
+
+        add("run.started", None, {"nodes": len(GRAPH["nodes"]), "resumed": False, "memory_scope": "default",
+                                  "collection": "default", "approval_default": None, "tool_trust": "formal",
+                                  "agent_limits": None, "data_versions": None, "replay_protocol": 2,
+                                  **({"sample_rate": float("nan")} if nan else {})})
+        add("node.started", "start", {"node_type": "input", "label": "开始"})
+        add("node.finished", "start", {"duration_ms": 1, "attempt": 1, "preview": {"week": "2026-W37"}})
+        add("node.started", "fetch", {"node_type": "tool", "label": "门店流水"})
+        add("tool.end", "fetch", {"tool": "db_query__shop", "duration_ms": 12, "query_artifact": self.shop_id,
+                                  "preview": json.dumps({"columns": ["store", "amount"], "rows": STORES[:2]},
+                                                        ensure_ascii=False)})
+        add("node.finished", "fetch", {"duration_ms": 14, "attempt": 1, "preview": "{\"rows\": …}",
+                                       "evidence": [self.ledger[0]]})
+        add("tool.end", "members", {"tool": "db_query__crm", "duration_ms": 9, "query_artifact": self.crm_id,
+                                    "preview": json.dumps(CRM["rows"][:1], ensure_ascii=False)})
+        add("node.finished", "members", {"duration_ms": 10, "attempt": 1, "evidence": [self.ledger[1]]})
+        add("node.finished", "card", {"duration_ms": 3, "attempt": 1, "preview": {"kind": "metric_set"},
+                                      "evidence": [self.ledger[2]]})
+        for node_id, doc_id in reports.items():
+            add("llm.end", node_id, {"model": "mock", "output": "（写作草稿）"})
+            add("report.checked", node_id, {"doc_artifact": doc_id, "ok": True})
+            add("node.finished", node_id, {"duration_ms": 20, "attempt": 1,
+                                           "preview": {"text": "（报告正文）", "doc_artifact": doc_id}})
+        if ending == "finished":
+            for tier in tiers:
+                add("issuance", "out", {"tier": tier, "mode": "citations"})
+            add("node.finished", "out", {"duration_ms": 2, "attempt": 1, "preview": {"周报": "（报告正文）"}})
+            add("run.finished", None, {"output": {"周报": "（报告正文）"}})
+        else:
+            add("node.failed", "out", {"error": "出口复核没有通过"})
+            add("run.failed", None, {"error": "出口复核没有通过"})
+        bound = len(rows)
+        add("evidence.judged", next(iter(reports), None),
+            {"verdicts": {"u1": {"verdict": "supported"}}, "model": "judge-x", "post_seal": True})
+        return rows, bound
+
+
+def render(sample: Sample, events: list[tuple[int, str, str | None, Any]], bound: int, *, run: dict[str, Any] | None = None,
+           legacy: bool = False, drop: tuple[str, ...] = ()) -> str:
+    """真实封存哈希的页面。drop：导出时服务端已没有文件的工件。"""
+    sealed = [e for e in events if e[0] <= bound]
+    files = {k: v for k, v in sample.files.items() if k not in drop}
+    bundle = build_bundle(run or RUN, events, manifest_seq=bound, manifest_hash=manifest_hash(sealed), read=files.get,
+                          exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks={})
+    return render_html(bundle)
+
+
+def pages() -> dict[str, str]:
+    """{页面名: HTML}"""
+    out: dict[str, str] = {}
+    s = Sample()
+    weekly = s.doc(WEEKLY, "write")
+    events, bound = s.events({"write": weekly})
+    out["base"] = render(s, events, bound)
+    out["missing-doc"] = render(s, events, bound, drop=(weekly,))
+    out["missing-card"] = render(s, events, bound, drop=(s.card_id,))
+    # 早期运行：运行结束事件落库之前封存，范围到它前一条为止（runner.verify_manifest 的老口径）
+    finished = next(seq for seq, etype, _, _ in events if etype == "run.finished")
+    out["legacy"] = render(s, events, finished - 1, legacy=True)
+
+    monthly = s.doc(MONTHLY, "monthly")
+    events, bound = s.events({"write": weekly, "monthly": monthly})
+    out["two-reports"] = render(s, events, bound)
+
+    events, bound = s.events({"write": weekly}, ending="failed")
+    out["failed"] = render(s, events, bound, run={**RUN, "status": "failed"})
+
+    events, bound = s.events({"write": weekly}, tiers=("formal", "degraded"))
+    out["degraded"] = render(s, events, bound)
+
+    stray = s.doc(WEEKLY, "write", run_id="another-run-0000")
+    events, bound = s.events({"write": stray})
+    out["stray"] = render(s, events, bound)
+
+    n = Sample(nan=True)
+    events, bound = n.events({"write": n.doc(WEEKLY, "write")}, nan=True)
+    out["nan"] = render(n, events, bound)
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("用法：python -m tests.bundle_samples <目录>", file=sys.stderr)
+        return 2
+    target = Path(argv[1])
+    target.mkdir(parents=True, exist_ok=True)
+    for name, page in pages().items():
+        (target / f"{name}.html").write_text(page, encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

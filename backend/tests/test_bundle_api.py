@@ -5,7 +5,7 @@
 
 - 只给已封存且封存核对一致的运行：没封存、封存后被改过都回 409；
 - 导出的数据里，事件行按浏览器的拼法重算等于运行记下的 manifest_hash；
-- 遮罩库的快照只有 id 没有内容，它的查询事件只有哈希；
+- 遮罩库的快照只有 id 没有内容，它的查询事件只有哈希；运行之后才设的遮罩同样生效；
 - 附件名是「<运行名>-可验证报告.html」，中文名按 RFC 5987 编码；
 - 只读：导出前后运行记录、事件一条不多一条不少。
 
@@ -213,6 +213,39 @@ async def test_the_page_is_named_after_the_run(client, monkeypatch):
     assert f"filename*=UTF-8''{quote('门店周报-可验证报告.html', safe='')}" in header
 
 
+async def set_masks(name: str, columns: list[str]) -> None:
+    """只改数据源的遮罩列（options.mask_columns），别的不动。"""
+    async with SessionLocal() as session:
+        row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one()
+        row.options = {**(row.options or {}), "mask_columns": columns}
+        await session.commit()
+        source_id = row.id
+    await engines.invalidate(source_id)
+
+
+async def test_a_mask_set_after_the_run_still_applies(client, monkeypatch):
+    """运行之后才给数据源设遮罩：快照里没记 mask_columns，导出时照样按数据源现在的遮罩挡（和证据面板一个道理）。"""
+    await set_masks("bundle_crm", [])
+    row = await sealed_run(monkeypatch)
+    shop = await query_artifact(row.id, "fetch")
+
+    def shown(bundle) -> dict[str, bool]:
+        events = {(e["type"], e["node_id"]): "canonical" in e for e in bundle["events"]}
+        return {"fetch": events[("tool.end", "fetch")], "members": events[("tool.end", "members")],
+                "out": events[("node.finished", "out")], "finished": events[("run.finished", None)]}
+
+    # 对照：查询时、导出时都没有遮罩，快照随文件附带，成果和运行结束事件带规范字符串
+    before = data_of((await client.get(f"/api/runs/{row.id}/bundle.html")).text)
+    assert all("b64" in a for a in before["artifacts"])
+    assert shown(before) == {"fetch": True, "members": True, "out": True, "finished": True}
+
+    await set_masks("bundle_shop", ["amount"])
+    after = data_of((await client.get(f"/api/runs/{row.id}/bundle.html")).text)
+    assert next(a for a in after["artifacts"] if a["id"] == shop) == {
+        "id": shop, "kind": "query", "node_id": "fetch", "masked": True}
+    assert shown(after) == {"fetch": False, "members": True, "out": False, "finished": False}
+
+
 async def test_report_text_cannot_close_the_data_block(client, monkeypatch):
     row = await sealed_run(monkeypatch, text="结论见下：</script><script>alert(1)</script> 流水 [[v:Q1.r0.amount]]。")
     html = (await client.get(f"/api/runs/{row.id}/bundle.html")).text
@@ -289,8 +322,9 @@ async def test_a_broken_seal_is_refused(client, monkeypatch):
         await session.commit()
     resp = await client.get(f"/api/runs/{row.id}/bundle.html")
     assert resp.status_code == 409
-    body = resp.json()
-    assert body["code"] == "bundle_seal_broken" and "封存核对不一致" in body["detail"], body
+    # 原样出现在记录页的错误提示里：一句说清，不叠冒号、不把封存核对的整句结论再拼进来
+    assert resp.json() == {"detail": "封存核对不一致：封存后有事件被修改、删除或插入，不能导出可验证报告。"
+                                     "点「核对」可查看核对结果", "code": "bundle_seal_broken"}
 
 
 async def test_an_unknown_run_is_404(client):

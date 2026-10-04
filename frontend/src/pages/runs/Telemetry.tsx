@@ -291,13 +291,16 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
     : !finished ? BUNDLE_TEXT.blockedRunning
     : BUNDLE_TEXT.blockedUnsealed
 
+  // 失败结束的运行可以「继续运行」：接着跑完会重新封存、换掉清单哈希，导出的文件从此对不上系统，导出前后都说一句
+  const failedRun = phase === 'failed'
+
   const doExport = async () => {
     setExporting(true)
     try {
       const { blob, name } = await api.bundle.download(run.id)
       const file = name ?? BUNDLE_TEXT.fileName(runName(run))
       saveFile(file, blob)
-      toast.ok(BUNDLE_TEXT.exported(file))
+      toast.ok(failedRun ? BUNDLE_TEXT.exportedFailed(file) : BUNDLE_TEXT.exported(file))
     } catch (e) {
       toast.error(e, { key: `bundle:${run.id}` })
     } finally {
@@ -346,14 +349,20 @@ export function ProvenanceBar({ run, eventCount, phase }: { run: Run; eventCount
           </button>
         )}
         {/* 禁用的按钮收不到指针事件，悬停提示挂在外面那层上；读屏经 aria-describedby 读到原因 */}
-        <span className="inline-flex" title={exportBlocked ?? BUNDLE_TEXT.hint}>
+        <span className="inline-flex" title={exportBlocked ?? (failedRun ? BUNDLE_TEXT.hintFailed : BUNDLE_TEXT.hint)}>
           <button type="button" className="btn btn-xs btn-ghost" disabled={!!exportBlocked || exporting}
                   onClick={() => void doExport()} aria-describedby={exportBlocked ? blockedId : undefined}
                   data-bundle-export={exportBlocked ? 'blocked' : exporting ? 'busy' : 'ready'}>
             {exporting ? <Spinner size={10} /> : <Download size={11} aria-hidden />} {BUNDLE_TEXT.export}
           </button>
         </span>
-        {exportBlocked && <span id={blockedId} className="sr-only" data-bundle-blocked="">{exportBlocked}</span>}
+        {/* 没封存时左边写着「未封存 · …」，原因只给读屏和悬停；留着旧封存又在运行（失败后接着跑）时左边写着
+            「已封存」，按钮却不能点，原因得写在屏幕上，触屏上看不到悬停提示 */}
+        {exportBlocked && (
+          <span id={blockedId} className={sealed ? 'text-faint' : 'sr-only'} data-bundle-blocked={sealed ? 'shown' : ''}>
+            {exportBlocked}
+          </span>
+        )}
         <button
           type="button"
           className="btn btn-xs btn-ghost"
