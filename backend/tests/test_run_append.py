@@ -3,8 +3,10 @@
 - 停在审批时追加：事件接在最后一条后面、落进以后的封存范围。批准、运行结束封存之后 verify 照旧一致，
   改动追加的事件 verify 就对不上——它们确实在封存范围里
 - 追加途中运行被恢复（条件更新落空）：什么都不写，返回 None，last_seq 不动
+- 质询指明问的是哪张审批卡（approval_id）时，那张卡仍待审批才写；返回的事件和落库的 id、序号一样
+- 先落库再广播，没写入的一条都不广播
 - 已封存的运行追加：带 post_seal、落在 manifest_seq 之后，verify 照旧一致；封存不是这次结束之后封的、
-  封存和调用方开始时看到的不同，都不追加
+  封存和调用方开始时看到的不同、没有终态事件的老封存，都不追加
 - 连续追加、并发追加，序号严格递增，整条事件流没有重复的序号
 - last_seq 落后于库里实际的最后一条（按需裁判的追加和封存后追加交错提交时会这样）：进程重启后恢复、
   继续运行、放弃、按需裁判都接在实际的最后一条后面，不撞号；runner 记事件不把 last_seq 写小
@@ -26,7 +28,7 @@ from app.core.bus import bus
 from app.core.config import settings
 from app.core.events import EventType
 from app.db.base import SessionLocal
-from app.db.models import Run, RunEvent
+from app.db.models import Approval, Run, RunEvent
 from app.engine import compiler
 from app.engine.context import NodeError
 from app.engine.runner import RunManager, run_manager, verify_manifest
@@ -68,6 +70,10 @@ GATED = chain(node("start", "input"),
               node("gate", "human", mode="approve", title="这份周报可以出具吗"),
               node("out", "output", fields=[{"name": "r", "value": "{{ nodes.work }}"}]))
 SIMPLE = chain(node("start", "input"), node("out", "output", fields=[{"name": "r", "value": "完成"}]))
+TWO_GATES = chain(node("start", "input"),
+                  node("g1", "human", mode="approve", title="第一道：口径对吗"),
+                  node("g2", "human", mode="approve", title="第二道：可以出具吗"),
+                  node("out", "output", fields=[{"name": "r", "value": "完成"}]))
 #: 「boom」节点按 flaky 的开关失败：先让运行失败、封存，再关掉开关继续运行
 FLAKY = chain(node("start", "input"), node("boom", "transform", mode="template", template="门店 17 家"),
               node("out", "output", fields=[{"name": "r", "value": "{{ nodes.boom }}"}]))
@@ -146,6 +152,12 @@ def _strictly_increasing(seqs: list[int]) -> bool:
 async def _no_repeated_seq(run_id: str) -> None:
     seqs = [e.seq for e in await _events(run_id)]
     assert len(seqs) == len(set(seqs)), f"事件流里有重复的序号：{seqs}"
+
+
+async def _pending(run_id: str) -> list[Approval]:
+    async with SessionLocal() as session:
+        return list((await session.execute(
+            select(Approval).where(Approval.run_id == run_id, Approval.status == "pending"))).scalars())
 
 
 def _sql(statement: str, *params) -> None:
@@ -285,6 +297,89 @@ async def test_a_run_that_already_moved_on_gets_nothing(executed):
     assert await _events(paused.id, "approval.inquiry") == []
 
 
+async def test_an_inquiry_about_an_approval_needs_that_approval_still_pending(monkeypatch):
+    """质询问的是某一张审批卡：开始问模型时那张卡还在等，问完时运行可能已经批过它、停到了下一张上。只看
+    「运行停在审批」的话，关于第一张的问答会写进第二次停下里。传 approval_id 时那张卡仍待审批才写，
+    和其余条件在同一次条件更新里核对。"""
+    from app.engine.run_append import append_events
+
+    paused = await _paused(TWO_GATES)
+    [first] = await _pending(paused.id)
+    await run_manager.resume(paused.id, {"approved": True}, approval_id=first.id)
+    await asyncio.sleep(0.05)
+    later = await _until(paused.id, ("interrupted",))
+    [second] = await _pending(paused.id)
+    assert (first.node_id, second.node_id) == ("g1", "g2")
+
+    assert await append_events(paused.id, [inquiry("第一道的口径")], require="interrupted",
+                               approval_id=first.id) is None
+    assert await append_events(paused.id, [inquiry("不存在的卡")], require="interrupted",
+                               approval_id="no-such-approval") is None
+    assert (await _row(paused.id)).last_seq == later.last_seq
+    assert await _events(paused.id, "approval.inquiry") == []
+
+    written = await append_events(paused.id, [inquiry("出具前再确认一次")], require="interrupted",
+                                  approval_id=second.id)
+    assert written is not None
+    # 返回的就是落了库的那几条：调用方按 id 或序号回头找，两边对得上
+    stored = await _events(paused.id, "approval.inquiry")
+    assert [(e.id, e.seq) for e in stored] == [(e.id, e.seq) for e in written]
+
+    # 读完运行、写入之前那张卡被人批了（并行的审批还没凑齐，运行仍停着）：不写
+    set_seq = bus.set_seq
+
+    def answered_in_between(run_id, value):
+        if run_id == paused.id:
+            _sql("UPDATE approvals SET status = 'answered' WHERE id = ?", second.id)
+        set_seq(run_id, value)
+
+    monkeypatch.setattr(bus, "set_seq", answered_in_between)
+    assert await append_events(paused.id, [inquiry("批完才问到的")], require="interrupted",
+                               approval_id=second.id) is None
+    assert (await _row(paused.id)).last_seq == written[-1].seq
+    assert len(await _events(paused.id, "approval.inquiry")) == 1
+    with pytest.raises(ValueError):
+        await append_events(paused.id, [inquiry("封存后的卡")], require="sealed", approval_id=second.id)
+
+
+async def test_published_only_once_stored_and_never_when_not_written(monkeypatch):
+    """先落库再广播：在线的客户端收到的每一条库里都已经有了（订阅者靠「先读历史、再接实时」拼完整，见
+    RunManager._emit）。没写进运行记录的一条都不广播，否则界面上会多出一条运行记录里没有的问答。"""
+    from app.engine.run_append import append_events
+
+    published: list[tuple[int, int]] = []
+    publish = bus.publish
+
+    async def stored_when_published(event):
+        if event.type == EventType.APPROVAL_INQUIRY:
+            db = sqlite3.connect(settings.db_path, timeout=5)
+            try:
+                (count,) = db.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND seq = ?",
+                                      (event.run_id, event.seq)).fetchone()
+            finally:
+                db.close()
+            published.append((event.seq, count))
+        await publish(event)
+
+    monkeypatch.setattr(bus, "publish", stored_when_published)
+    paused = await _paused()
+    written = await append_events(paused.id, [inquiry("客单价怎么算的"), inquiry("含不含退款")],
+                                  require="interrupted")
+    assert published == [(e.seq, 1) for e in written]
+
+    published.clear()
+    set_seq = bus.set_seq
+
+    def resumed_in_between(run_id, value):
+        if run_id == paused.id:
+            _sql("UPDATE runs SET status = 'running' WHERE id = ?", paused.id)
+        set_seq(run_id, value)
+
+    monkeypatch.setattr(bus, "set_seq", resumed_in_between)
+    assert await append_events(paused.id, [inquiry("恢复之后才到的")], require="interrupted") is None
+    assert published == []
+
+
 # --------------------------------------------------------------------------
 # 封存之后追加
 # --------------------------------------------------------------------------
@@ -391,6 +486,46 @@ async def test_a_seal_left_from_an_earlier_ending_is_not_the_seal(monkeypatch):
     written = await append_events(first.id, [inquiry("为什么又失败了")], require="sealed")
     assert written is not None and written[0].seq > resealed.manifest_seq
     assert (await verify_manifest(first.id))["ok"] is True
+
+
+async def _legacy_sealed(ending: str | None) -> Run:
+    """加 manifest_seq 这一列之前封存的老运行：只记了清单哈希，封到哪一条要由 verify_manifest 按事件类型推。"""
+    from app.core.artifact_store import manifest_hash
+
+    rows = [(1, "run.started", None, {"nodes": 2}), (2, "node.started", "out", {}),
+            (3, "node.finished", "out", {"output": {"r": "完成"}})]
+    if ending:
+        rows.append((4, ending, None, {}))
+    # 老口径：run.finished 在算哈希之后才落库，不在清单里；run.failed / run.cancelled 在
+    covered = rows[:-1] if ending == "run.finished" else rows
+    async with SessionLocal() as session:
+        run = Run(workflow_name="老运行·月报", status="failed" if ending == "run.failed" else "succeeded",
+                  graph={}, input={}, last_seq=rows[-1][0], manifest_hash=manifest_hash(covered), manifest_seq=None)
+        session.add(run)
+        await session.flush()
+        for seq, kind, node_id, data in rows:
+            session.add(RunEvent(run_id=run.id, seq=seq, type=kind, node_id=node_id, ts=float(seq), data=data))
+        await session.commit()
+        return run
+
+
+@pytest.mark.parametrize("ending", [None, "run.finished", "run.failed"], ids=["no-ending", "finished", "failed"])
+async def test_a_legacy_seal_takes_appends_only_when_its_range_does_not_move(ending):
+    """老封存的范围是推出来的：有终态事件的，封到最后一条终态事件为止，追加在后面不进范围；没有终态事件的，
+    封到最后一行——追加一条，范围就跟着挪到它身上，我们自己写的批注被当成篡改。这种不追加。"""
+    from app.engine.run_append import append_events
+
+    legacy = await _legacy_sealed(ending)
+    before = await verify_manifest(legacy.id)
+    assert before["ok"] is True and before["legacy"] is True
+    written = await append_events(legacy.id, [inquiry("这期为什么少了一家店")], require="sealed")
+    if ending is None:
+        assert written is None
+        assert (await _row(legacy.id)).last_seq == legacy.last_seq
+    else:
+        assert written is not None and written[0].data["post_seal"] is True
+    after = await verify_manifest(legacy.id)
+    assert after["ok"] is True and (after["sealed_at"], after["events"]) == (before["sealed_at"], before["events"])
 
 
 async def test_the_wrong_kind_of_run_gets_nothing():

@@ -7,6 +7,7 @@
 - 运行结束（成功、失败）时：图的用量照旧（成功取状态、其余两本账取大），再加上质询的；明细另放在 inquiry 下
 - 停在审批时被放弃：停下时记的用量里还没有这次停下期间的质询，放弃时补上
 - 停过两次、两次都问过：每次质询只计一遍
+- 封存之后追加的质询（post_seal）不计进运行用量，继续运行、重新封存之后也不计
 - 没有质询的运行，用量和以前逐字相同
 """
 from __future__ import annotations
@@ -211,6 +212,36 @@ async def test_each_inquiry_counts_once_across_two_pauses():
     assert row.usage["cost_usd"] == pytest.approx(0.0163)
     assert row.usage["inquiry"] == {"input_tokens": 2000, "output_tokens": 400, "cost_usd": pytest.approx(0.0163),
                                     "calls": 3, "unpriced_calls": 1}
+
+
+async def test_post_seal_inquiries_stay_out_of_the_run_usage(monkeypatch):
+    """运行用量是这次运行自己花的，结束时就定下了、写进了封存范围里的终态事件。封存之后追加的质询是事后的批注，
+    和按需裁判的判定一样另有自己的账，不计进来。以前平时不计，继续运行、重新算用量时又被计了进去：同一条质询
+    计不计，全看之后有没有继续运行。"""
+    from app.engine.run_append import append_events
+
+    original = compiler.RUNNERS[NodeType.TRANSFORM]
+    state = {"fail": True}
+
+    async def flaky(st, ctx):
+        if ctx.node.id == "boom" and state["fail"]:
+            raise NodeError(ctx.node.id, "数据源暂时不可用")
+        return await original(st, ctx)
+
+    monkeypatch.setitem(compiler.RUNNERS, NodeType.TRANSFORM, flaky)
+    graph = chain(node("start", "input"), node("boom", "transform", mode="template", template="x"),
+                  node("out", "output", fields=[{"name": "r", "value": "x"}]))
+    run = await run_manager.start(graph=graph, input_payload={})
+    failed = await _until(run.id, ("failed",))
+    written = await append_events(run.id, [ask("这次为什么失败", A)], require="sealed")
+    assert written and written[0].data["post_seal"] is True
+    assert set(failed.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
+
+    state["fail"] = False
+    await run_manager.continue_failed(run.id)
+    row = await _until(run.id, ("succeeded",))
+    assert row.manifest_seq > written[0].seq, "继续运行之后重新封存，这条质询落进了新的封存范围"
+    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
 
 
 @pytest.mark.parametrize("asked_before", [False, True], ids=["first-pause", "second-pause"])

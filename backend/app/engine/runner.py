@@ -1263,8 +1263,11 @@ async def _claim(
 
 
 async def _stage(session: Any, event: RunEventModel, run: Run | None = None) -> None:
-    """把一条事件写进这个 session，随它一起提交。run 已经在 session 里时直接改它的 last_seq。"""
-    session.add(RunEvent(run_id=event.run_id, seq=event.seq, type=str(event.type),
+    """把一条事件写进这个 session，随它一起提交。run 已经在 session 里时直接改它的 last_seq。
+
+    落库的 id 用事件自己的：广播出去的、交回给调用方的和库里的是同一个 id，回头按 id 找得到。
+    """
+    session.add(RunEvent(id=event.id, run_id=event.run_id, seq=event.seq, type=str(event.type),
                          node_id=event.node_id, ts=event.ts, data=event.data))
     if run is not None:
         run.last_seq = event.seq
@@ -1314,6 +1317,10 @@ async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
     llm.end 逐次加总：每次模型调用都有一条，不管节点最后成没成。审批质询不在图里执行、不发 llm.end，
     它的用量写在 approval.inquiry 事件数据的 usage 里，单独加总放在 inquiry 下（没有质询就没有这个键）：
     llm.end 这本账要和状态里的用量比大小（_spent），质询花的两本里都没有，混进去比会被状态那本盖掉。
+
+    封存之后追加的质询（数据带 post_seal）不算：运行用量是这次运行自己花的，结束时就定下了、写进了终态事件；
+    事后的批注另有自己的账，同按需裁判的判定。继续运行之后它落进新的封存范围，照样不算——不然同一条质询
+    计不计，全看之后有没有继续运行。
     """
     rows = await session.execute(
         select(RunEvent.type, RunEvent.data).where(
@@ -1327,7 +1334,7 @@ async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
     for kind, data in rows:
         if kind == EventType.APPROVAL_INQUIRY:
             spent = (data or {}).get("usage")
-            if isinstance(spent, dict):
+            if isinstance(spent, dict) and not (data or {}).get("post_seal"):
                 for key in _INQUIRY_KEYS:
                     value = spent.get(key)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
