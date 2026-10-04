@@ -491,6 +491,11 @@ class Run(Base, TimestampMixin):
     # 发起时钉住的上传表格版本：{source_id: {"snapshot": 快照 id, "name": 源名}}。续跑、恢复沿用，
     # 回收（table_versions.gc）不删任何运行引用的快照。None 是升级前发起的运行
     data_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 发起时定下、整次运行沿用的运行选项（比如核查设置的快照）。审批停下期间改了设置，恢复和重放
+    # 仍按发起时的这份——同 approval_default 的道理。非空时写进 run.started，进封存范围。存量运行是 {}
+    options: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 发起它的定时任务，手动发起的为空。不设外键：定时任务删掉之后，运行记录照旧是追溯凭证，来源 id 留着
+    schedule_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
 
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
