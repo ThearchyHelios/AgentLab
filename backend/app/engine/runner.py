@@ -13,7 +13,7 @@ from typing import Any
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 
 from app.core.bus import bus
 from app.core.config import settings
@@ -66,6 +66,15 @@ class RunManager:
         # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
         # 还丢掉 run.input——那不是恢复，是伪造一份结果。
         async with SessionLocal() as session:
+            # 先把落后于库里实际最后一条的 last_seq 改正（为什么会落后见 _seq_floor）。内存里的序号计数刚清零，
+            # 接下来各处都按 last_seq 接号：本模块的几处另外兜了底，按需裁判记判定（api/evidence.py 的
+            # _append_judged）没有，不改正的话它重启后第一次追加就撞上已有的序号。有 (run_id, seq) 索引，
+            # 每次运行一次索引查找。updated_at 不动：这是补记录，不是运行有了变化
+            latest = select(func.max(RunEvent.seq)).where(RunEvent.run_id == Run.id).scalar_subquery()
+            await session.execute(
+                update(Run).where(func.coalesce(Run.last_seq, 0) < latest)
+                .values(last_seq=latest, updated_at=Run.updated_at)
+                .execution_options(synchronize_session=False))
             stranded = list((await session.execute(
                 select(Run.id, Run.last_seq).where(Run.status == "running")
             )).all())
@@ -392,7 +401,7 @@ class RunManager:
                 .values(status="resolved")
             )
             run = await session.get(Run, run_id)
-            bus.set_seq(run_id, run.last_seq)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
 
@@ -492,7 +501,7 @@ class RunManager:
                               **({"graph": spec.model_dump(mode="json")} if graph is not None else {}),
                               **({"started_by": actor} if actor else {}))
             run = await session.get(Run, run_id)
-            bus.set_seq(run_id, run.last_seq)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
 
@@ -558,7 +567,7 @@ class RunManager:
                 usage = _with_inquiry(usage, inquiry)
             run.usage = {**usage, "duration_ms": timing["active_ms"], **timing}
             run.error = "用户取消：等待审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
-            bus.set_seq(run_id, run.last_seq or 0)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             # 和状态同一个事务提交，理由同 _finalize
             event = self._event(run_id, EventType.RUN_CANCELLED, data={
                 "timing": timing, "actor": actor,
@@ -1260,9 +1269,25 @@ async def _stage(session: Any, event: RunEventModel, run: Run | None = None) -> 
     if run is not None:
         run.last_seq = event.seq
     else:
+        # 只往大里改：另开会话记的事件（note）和执行任务同时在写时，取号和提交的先后可以不一样，号小的后提交，
+        # 无条件写会把 last_seq 写小（后果见 _seq_floor）
         await session.execute(
-            update(Run).where(Run.id == event.run_id).values(last_seq=event.seq)
+            update(Run).where(Run.id == event.run_id)
+            .values(last_seq=case((Run.last_seq > event.seq, Run.last_seq), else_=event.seq))
+            .execution_options(synchronize_session=False)
         )
+
+
+async def _seq_floor(session: Any, run_id: str, last_seq: int | None) -> int:
+    """接着一次运行往下编号的起点：last_seq 和库里实际最大的序号取大的。
+
+    last_seq 按说就是最后一条，但有的写入会把它写小：按需裁判记判定（api/evidence.py 的 _append_judged）
+    的条件更新不带 last_seq 条件，它取了号还没写、封存后追加（engine/run_append.py）抢先提交了，它再提交时
+    把 last_seq 写回自己那个更小的号。同一进程里序号计数只增不减，不碍事；进程重启后计数从 0 起，只按
+    last_seq 接号就会撞上已有的序号。清单按序号排序算哈希，撞了号封存核对就时对时不对。
+    """
+    stored = await session.scalar(select(func.max(RunEvent.seq)).where(RunEvent.run_id == run_id))
+    return max(last_seq or 0, stored or 0)
 
 
 async def _close_approvals(session: Any, run_id: str, actor: str | None, now: datetime) -> int:

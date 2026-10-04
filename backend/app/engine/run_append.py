@@ -25,7 +25,7 @@ from app.core.bus import bus
 from app.core.events import EventType, RunEventModel
 from app.db.base import SessionLocal
 from app.db.models import Run, RunEvent
-from app.engine.runner import _stage, run_manager
+from app.engine.runner import _seq_floor, _stage, run_manager
 
 #: 运行的终态。封存过的运行只会停在这几种上
 _TERMINAL = ("succeeded", "failed", "cancelled")
@@ -104,10 +104,9 @@ async def append_events(
                     return None
                 guard = (Run.status == "interrupted",)
             last = run.last_seq
-            # 进程重启过的话内存里的序号从 0 起：接在库里最后一条后面。last_seq 按说就是最后一条，另取一次
-            # 实际的最大序号兜底——别处的追加把 last_seq 写小了，也不至于在这里撞号
-            stored = await session.scalar(select(func.max(RunEvent.seq)).where(RunEvent.run_id == run_id))
-            bus.set_seq(run_id, max(last or 0, stored or 0))
+            # 进程重启过的话内存里的序号从 0 起：接在库里最后一条后面。last_seq 按说就是最后一条，_seq_floor
+            # 另取一次实际的最大序号兜底——别处的追加把 last_seq 写小了，也不至于在这里撞号
+            bus.set_seq(run_id, await _seq_floor(session, run_id, last))
             events = [run_manager._event(run_id, kind, node_id=node_id, data=data)
                       for kind, node_id, data in entries]
             # 核对和写入是同一行上的条件更新，和恢复、放弃、继续运行（runner._claim / _abandon）抢的是同一行

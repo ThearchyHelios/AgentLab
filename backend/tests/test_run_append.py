@@ -6,6 +6,8 @@
 - 已封存的运行追加：带 post_seal、落在 manifest_seq 之后，verify 照旧一致；封存不是这次结束之后封的、
   封存和调用方开始时看到的不同，都不追加
 - 连续追加、并发追加，序号严格递增，整条事件流没有重复的序号
+- last_seq 落后于库里实际的最后一条（按需裁判的追加和封存后追加交错提交时会这样）：进程重启后恢复、
+  继续运行、放弃、按需裁判都接在实际的最后一条后面，不撞号；runner 记事件不把 last_seq 写小
 - 恢复后的重放不受影响：前面的节点不重复执行，Agent 里批过的工具不重复执行（含升级前写下的断点）
 """
 from __future__ import annotations
@@ -66,6 +68,9 @@ GATED = chain(node("start", "input"),
               node("gate", "human", mode="approve", title="这份周报可以出具吗"),
               node("out", "output", fields=[{"name": "r", "value": "{{ nodes.work }}"}]))
 SIMPLE = chain(node("start", "input"), node("out", "output", fields=[{"name": "r", "value": "完成"}]))
+#: 「boom」节点按 flaky 的开关失败：先让运行失败、封存，再关掉开关继续运行
+FLAKY = chain(node("start", "input"), node("boom", "transform", mode="template", template="门店 17 家"),
+              node("out", "output", fields=[{"name": "r", "value": "{{ nodes.boom }}"}]))
 
 
 def inquiry(question: str) -> tuple:
@@ -84,6 +89,21 @@ def executed(monkeypatch) -> Counter:
 
     monkeypatch.setitem(compiler.RUNNERS, NodeType.TRANSFORM, counting)
     return seen
+
+
+@pytest.fixture
+def flaky(monkeypatch) -> dict:
+    """FLAKY 里的「boom」在 fail 为真时失败。"""
+    state = {"fail": True}
+    original = compiler.RUNNERS[NodeType.TRANSFORM]
+
+    async def boom(st, ctx):
+        if ctx.node.id == "boom" and state["fail"]:
+            raise NodeError(ctx.node.id, "数据源暂时不可用")
+        return await original(st, ctx)
+
+    monkeypatch.setitem(compiler.RUNNERS, NodeType.TRANSFORM, boom)
+    return state
 
 
 async def _row(run_id: str) -> Run:
@@ -126,6 +146,16 @@ def _strictly_increasing(seqs: list[int]) -> bool:
 async def _no_repeated_seq(run_id: str) -> None:
     seqs = [e.seq for e in await _events(run_id)]
     assert len(seqs) == len(set(seqs)), f"事件流里有重复的序号：{seqs}"
+
+
+def _sql(statement: str, *params) -> None:
+    """另开一条连接改库：模拟别处（恢复、继续运行、另一个写入者）抢在中间提交。"""
+    db = sqlite3.connect(settings.db_path, timeout=5)
+    try:
+        db.execute(statement, params)
+        db.commit()
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------
@@ -419,6 +449,134 @@ async def test_a_restarted_process_continues_after_the_stored_events():
     written = await append_events(paused.id, [inquiry("重启之后的问题")], require="interrupted")
     assert written[0].seq == paused.last_seq + 1
     await _no_repeated_seq(paused.id)
+
+
+@pytest.mark.parametrize("action", ["continue", "resume", "abandon"])
+async def test_the_runner_numbers_after_the_stored_events_when_last_seq_lags(flaky, action):
+    """last_seq 比库里实际的最后一条小（怎么来的见下一条），本进程又没有这次运行的序号计数（重启过）：继续运行、
+    恢复、放弃都接在实际的最后一条后面。只按 last_seq 接，写出的 run.resumed / run.cancelled 撞上已有的序号，
+    重新封存时两条同号的事件一起进了清单。"""
+    if action == "continue":
+        run = await _finished(FLAKY)
+        assert run.status == "failed"
+    else:
+        run = await _paused()
+    stored = (await _events(run.id))[-1].seq
+    _sql("UPDATE runs SET last_seq = last_seq - 3 WHERE id = ?", run.id)
+    bus._seq.pop(run.id, None)
+
+    if action == "continue":
+        flaky["fail"] = False
+        await run_manager.continue_failed(run.id)
+        first_new = "run.resumed"
+    elif action == "resume":
+        await run_manager.resume(run.id, {"approved": True})
+        first_new = "run.resumed"
+    else:
+        assert await run_manager.cancel(run.id) == "cancelled"
+        first_new = "run.cancelled"
+    final = await _until(run.id, ("succeeded", "cancelled"), sealed=True)
+    assert final.status == ("cancelled" if action == "abandon" else "succeeded"), final.error
+    assert [e.seq for e in await _events(run.id, first_new)][-1] == stored + 1
+    await _no_repeated_seq(run.id)
+    assert (await verify_manifest(run.id))["ok"] is True
+
+
+async def test_runner_event_writes_never_lower_last_seq():
+    """runner 记事件时 last_seq 只往大里改。取号和提交的先后可以不一样：别处另开会话记的事件（run_manager.note）
+    和执行任务同时在写，号大的先提交、号小的后提交，以前后提交的那条把 last_seq 写回小的。"""
+    from app.engine.runner import _stage
+
+    paused = await _paused()
+    early = run_manager._event(paused.id, EventType.LOG, data={"level": "info", "message": "先取号"})
+    late = run_manager._event(paused.id, EventType.LOG, data={"level": "info", "message": "后取号"})
+    for event in (late, early):
+        async with SessionLocal() as session:
+            await _stage(session, event)
+            await session.commit()
+    assert (await _row(paused.id)).last_seq == late.seq
+
+
+def _judged_args(run: Run) -> tuple:
+    """直接调按需裁判记判定的那一步（api/evidence.py 的 _append_judged）要的参数：问过一次模型、什么都没判成。"""
+    from app.api import evidence
+
+    sealed = evidence._Sealed(run_id=run.id, graph={}, seal={"sealed": True, "ok": True}, events=[],
+                              manifest_hash=run.manifest_hash, run_manifest_seq=run.manifest_seq)
+    report = evidence._Report(node_id="out", doc_artifact="doc-1", ok=None, repairs=None, stats=None, doc=None,
+                              hash_ok=None, fields=[])
+    outcome = {key: {} for key in ("verdicts", "keys", "unjudged", "skipped", "budget")}
+    outcome.update(model="judge-model", priced=True, same_model=False, writer_model=None, cost_usd=0.0021,
+                   calls=1, duration_ms=1200, limits_hit=[], gaps=[], notes=[])
+    return sealed, report, ["u1"], outcome
+
+
+async def test_a_judge_interleaved_with_a_post_seal_append_survives_a_restart(flaky, monkeypatch):
+    """按需裁判记判定（_append_judged）的条件更新不带 last_seq 条件：它取了号、还没写，封存后追加抢先提交了，
+    它再提交时把 last_seq 写回自己那个更小的号。同一进程里序号计数只增不减，不会撞号；进程重启后计数从 0 起，
+    各处又按 last_seq 接号——裁判自己也是。所以启动时按库里实际的最后一条改正 last_seq：之后再裁判、继续运行，
+    都接在实际的最后一条后面。"""
+    from app.api import evidence
+    from app.engine.run_append import append_events
+
+    first = await _finished(FLAKY)
+    assert first.status == "failed"
+    held, opened = asyncio.Event(), evidence.SessionLocal
+
+    class HeldBeforeUpdate:
+        """裁判的会话：执行条件更新之前停住，等封存后追加先提交。"""
+
+        def __init__(self):
+            self._cm = opened()
+
+        async def __aenter__(self):
+            session = await self._cm.__aenter__()
+            execute = session.execute
+
+            async def held_execute(statement, *args, **kwargs):
+                if getattr(statement, "is_update", False):
+                    await held.wait()
+                return await execute(statement, *args, **kwargs)
+
+            session.execute = held_execute
+            return session
+
+        async def __aexit__(self, *exc):
+            return await self._cm.__aexit__(*exc)
+
+    monkeypatch.setattr(evidence, "SessionLocal", HeldBeforeUpdate)
+    judging = asyncio.create_task(evidence._append_judged(*_judged_args(first)))
+    for _ in range(200):                       # 裁判取到号了
+        if bus._seq.get(first.id, 0) > first.last_seq:
+            break
+        await asyncio.sleep(0.01)
+    written = await append_events(first.id, [inquiry("这次为什么失败")], require="sealed")
+    held.set()
+    assert await judging == {"seq": first.last_seq + 1}
+    assert written is not None and written[0].seq == first.last_seq + 2
+    assert (await _row(first.id)).last_seq == first.last_seq + 1, "裁判后提交，last_seq 被写回了小的号"
+    monkeypatch.setattr(evidence, "SessionLocal", opened)
+
+    # 进程重启：内存里的序号计数没了，启动时 setup 照常执行一遍。只改落后的那条，别的运行原样不动
+    lagging = await _row(first.id)
+    others = [await _finished(), await _paused()]
+    await run_manager.shutdown()
+    bus._seq.pop(first.id, None)
+    await run_manager.setup()
+    repaired = await _row(first.id)
+    assert (repaired.last_seq, repaired.updated_at) == (written[-1].seq, lagging.updated_at)
+    for other in others:
+        now = await _row(other.id)
+        assert (now.last_seq, now.updated_at) == (other.last_seq, other.updated_at)
+    assert await evidence._append_judged(*_judged_args(first)) == {"seq": written[-1].seq + 1}
+    await _no_repeated_seq(first.id)
+
+    flaky["fail"] = False
+    await run_manager.continue_failed(first.id)
+    final = await _until(first.id, ("succeeded",), sealed=True)
+    assert final.manifest_seq > written[-1].seq + 1
+    await _no_repeated_seq(first.id)
+    assert (await verify_manifest(first.id))["ok"] is True
 
 
 # --------------------------------------------------------------------------
