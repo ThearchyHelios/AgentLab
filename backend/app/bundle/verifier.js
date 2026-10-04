@@ -30,6 +30,7 @@
   const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照' }
   const TIER_LABEL = { formal: '完整出具', degraded: '降档出具', withheld: '不予出具' }
   const CLASS_LABEL = { formal: '正式运行', exploratory: '探索运行' }
+  const STATUS_LABEL = { succeeded: '已完成', failed: '已失败', cancelled: '已取消' }
   const EVENT_LABEL = {
     'run.started': '运行开始', 'run.finished': '运行结束', 'run.failed': '运行失败', 'run.cancelled': '运行取消',
     'run.interrupted': '等待人工介入', 'run.resumed': '恢复运行', 'node.started': '节点开始', 'node.finished': '节点完成',
@@ -53,7 +54,8 @@
       + '它不能单独证明这些记录出自系统、未被整体替换。核对真伪：在系统中打开这次运行（运行 ID '
       + `${id}），确认「凭证详情」里的清单哈希与上面一致，并点「核对」确认事件记录与封存时一致`
       + `（接口 GET /api/runs/${id}/verify）。`,
-    metaRun: '运行 ID', metaWorkflow: '工作流', metaClass: '运行类别', metaVersionHash: '版本哈希', metaStarted: '开始',
+    metaRun: '运行 ID', metaWorkflow: '工作流', metaClass: '运行类别', metaStatus: '运行结果', metaVersionHash: '版本哈希',
+    metaStarted: '开始',
     metaFinished: '结束', metaRange: '封存范围', metaTier: '出具档位', metaExported: '导出时间',
     // 序号不连续（模型的流式输出占序号、不落库），后面注明范围内实际有几条。说法同记录页的封存凭证
     range: (seq, count) => `第 1–${seq} 条事件（范围内 ${count} 条）`,
@@ -76,6 +78,7 @@
     eventMismatch: '内容与记录的哈希不一致',
     eventNotJson: '内容不是有效的 JSON',
     manifestComputed: '重算结果',
+    manifestLines: (n) => `查看参与清单核对的 ${n} 行（每行 序号|类型|节点|内容哈希，可复制后用任意 SHA-256 工具自行计算）`,
     manifestOk: '与封存清单哈希一致',
     manifestMismatch: '与封存清单哈希不一致：事件被增删、改动或换了顺序',
     beyondSeal: (seq) => `第 ${seq} 条事件的序号超出封存范围`,
@@ -344,7 +347,7 @@
     const computed = await digest(utf8(lines.join('\n')))
     const beyond = order.find((ev) => !(ev.seq <= meta.manifest_seq))
     out.manifest = {
-      computed, count: lines.length,
+      computed, count: lines.length, lines,
       result: computed === meta.manifest_hash && !beyond ? PASS : FAIL,
       reason: computed !== meta.manifest_hash ? T.manifestMismatch : beyond ? T.beyondSeal(beyond.seq) : T.manifestOk,
     }
@@ -814,6 +817,7 @@
       [T.metaRun, h('code', {}, String(meta.run_id || ''))],
       [T.metaWorkflow, String(meta.workflow_name || '—')],
       [T.metaClass, meta.version != null ? `${runClass} v${meta.version}` : runClass],
+      meta.status ? [T.metaStatus, STATUS_LABEL[meta.status] || String(meta.status)] : null,
       meta.version_hash ? [T.metaVersionHash, h('code', {}, String(meta.version_hash))] : null,
       [T.metaStarted, when(meta.started_at)],
       [T.metaFinished, when(meta.finished_at)],
@@ -868,8 +872,12 @@
     root.append(checkBlock('events', T.checkEvents, T.sumEvents(out.events.length), out.events,
       (i) => `${T.chainByEvent(i.ev.seq, eventWhat(i.ev))}`))
     const m = out.manifest
-    root.append(checkBlock('manifest', T.checkManifest, T.sumManifest(m.count), [m],
-      () => [T.manifestComputed, ' ', h('code', {}, m.computed)]))
+    const manifest = checkBlock('manifest', T.checkManifest, T.sumManifest(m.count), [m],
+      () => [T.manifestComputed, ' ', h('code', {}, m.computed)])
+    // 参与核对的原文照拼法列出来：读的人不信这一页的脚本，也能复制出去用别的工具算一遍
+    manifest.append(h('details', {}, h('summary', {}, T.manifestLines(m.count)),
+      h('pre', { class: 'sql', 'data-manifest-lines': '' }, m.lines.join('\n'))))
+    root.append(manifest)
     root.append(checkBlock('artifacts', T.checkArtifacts, T.sumCount(out.artifacts.length, '份'), out.artifacts,
       (i) => [KIND_LABEL[i.a.kind] || i.a.kind, i.a.node_id ? ` · ${nodeLabel(i.a.node_id)}` : '', ' · ',
         h('code', {}, short(i.a.id))]))

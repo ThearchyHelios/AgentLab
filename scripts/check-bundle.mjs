@@ -171,9 +171,11 @@ await section('导出', async () => {
     `运行 ${run.id.slice(0, 8)}，${picked.reports} 份报告、${picked.cited} 个带出处的数字`)
   const before = await getJson(`/runs/${run.id}/events`).catch(() => null)
   const resp = await fetch(`${API}/runs/${run.id}/bundle.html`)
-  html = await resp.text()
-  check('导出接口返回 200 和 text/html', resp.status === 200 && /^text\/html/.test(resp.headers.get('content-type') ?? ''),
-    `HTTP ${resp.status}，${Math.round(Buffer.byteLength(html) / 1024)} KB`)
+  const body = await resp.text()
+  const ok = resp.status === 200 && /^text\/html/.test(resp.headers.get('content-type') ?? '')
+  check('导出接口返回 200 和 text/html', ok, `HTTP ${resp.status}，${Math.round(Buffer.byteLength(body) / 1024)} KB`)
+  // 只有真拿到了页面，后面几节才有东西可查；没拿到的原因上面已经报了，后面几节跳过，不重复报
+  html = ok && DATA_RE.test(body) ? body : ''
   const disposition = resp.headers.get('content-disposition') ?? ''
   const star = /filename\*=UTF-8''([^;]+)/.exec(disposition)?.[1]
   let name = ''
@@ -206,8 +208,14 @@ await section('导出', async () => {
 
 let tamperable = null   // 篡改要用：原始数据
 
+const skipped = () => {
+  if (html) return false
+  note('没有拿到导出的页面（原因见上一节），这一节跳过')
+  return true
+}
+
 await section('断网打开', async () => {
-  if (!html) throw new Error('上一节没有拿到导出的页面')
+  if (skipped()) return
   tamperable = dataOf(html)
   const { ctx, page, requests, errors } = await openFile(writePage('bundle.html', html))
   try {
@@ -222,6 +230,10 @@ await section('断网打开', async () => {
     check('页面没有报错', errors.length === 0, errors.slice(0, 2).join(' | '))
     check('用的是浏览器内置的 SHA-256', s.sha === 'subtle', String(s.sha))
     check('封存哈希醒目地写在页面上', await page.locator('#seal-hash').innerText() === tamperable.meta.manifest_hash)
+    // 页面列出的清单原文：拿出去用别的工具（这里是 node 的 crypto）算，等于封存哈希——读的人可以不信页面上的脚本
+    const lines = await page.locator('[data-manifest-lines]').textContent()
+    check('页面列出的清单原文在页面之外重算，等于封存哈希',
+      createHash('sha256').update(lines ?? '', 'utf8').digest('hex') === tamperable.meta.manifest_hash)
     check('页面写明只证明内部一致、真伪要去系统里对照', /内部一致/.test(await page.locator('#seal-note').innerText())
       && /\/api\/runs\/[^/]+\/verify/.test(await page.locator('#seal-note').innerText()))
     if (s.numbers) {
@@ -244,7 +256,7 @@ await section('断网打开', async () => {
 })
 
 await section('去掉 crypto.subtle', async () => {
-  if (!html) throw new Error('没有导出的页面')
+  if (skipped()) return
   const { ctx, page, requests, errors } = await openFile(join(TMP, 'bundle.html'), { noSubtle: true })
   try {
     const s = await stateOf(page)
@@ -278,7 +290,7 @@ async function tampered(label, mutate, expectFail, keepPass = []) {
 }
 
 await section('篡改', async () => {
-  if (!tamperable) throw new Error('没有导出的页面')
+  if (skipped() || !tamperable) return
   // ① 改一条带规范字符串的事件内容（不动它记的哈希）：只有 ① 变红，清单照样对得上
   await tampered('一条事件的内容', (data) => {
     const ev = data.events.find((e) => e.type === 'run.started' && typeof e.canonical === 'string')
@@ -351,7 +363,7 @@ const luminance = (rgb) => {
 }
 
 await section('深浅色与窄屏', async () => {
-  if (!html) throw new Error('没有导出的页面')
+  if (skipped()) return
   for (const colorScheme of ['light', 'dark']) {
     const { ctx, page } = await openFile(join(TMP, 'bundle.html'), { colorScheme, width: 390 })
     try {
