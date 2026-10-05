@@ -158,3 +158,52 @@ async def test_unknown_metric_ids_fail_the_node(shop):
     ctx = context(graph)
     with pytest.raises(NodeError, match="「复算的指标」中的「refund」不是口径卡上的指标 ID"):
         await run_dual_check({"nodes": {"card": card_of(metric(art))}, "evidence": [], "trail": []}, ctx)
+
+
+async def test_constant_columns_of_the_original_query_are_not_shown(monkeypatch, shop):
+    """原 SQL 里写死的文字列（'下单日' AS basis）是原流程的取舍，不是分组：不交给盲算。"""
+    sql = "SELECT '下单日' AS basis, '华东' AS region, SUM(amount) AS gmv FROM orders WHERE region = '华东'"
+    art = await snapshot(shop, columns=("basis", "region", "gmv"), rows=(("下单日", "华东", 330.0),), sql=sql)
+    blind = Blind(monkeypatch, shop, {"销售额": (RIGHT, "gmv")})
+    ctx = context(AGENT_GRAPH)
+    item = metric(art, path="cell(nodes.fetch, 0, 'gmv')", via="tool_cell", node_id="fetch",
+                  locator={"row": 0, "column": "gmv"})
+    state = {"nodes": {"agent": {"model": "other"}, "card": card_of(item)}, "evidence": [], "trail": []}
+    await run_dual_check(state, ctx)
+    [task] = blind.tasks
+    assert "下单日" not in task and "basis" not in task and "华东" not in task
+
+
+async def test_blind_checks_run_side_by_side_after_the_first(monkeypatch, shop):
+    """几个盲算同时进行（有上限），先单独试第一个：核查模型用不了时不必个个去试。结果按格子对回各自的指标。"""
+    import asyncio
+
+    from app.engine import verify_agent
+    from app.engine.nodes import dual_check
+
+    art = await snapshot(shop, columns=("gmv",), rows=tuple((float(100 + i),) for i in range(5)))
+    running = {"now": 0, "peak": 0, "order": []}
+
+    async def fake(**kwargs):
+        running["now"] += 1
+        running["peak"] = max(running["peak"], running["now"])
+        running["order"].append(kwargs["task"])
+        await asyncio.sleep(0.05)
+        running["now"] -= 1
+        return verify_agent.VerifyOutcome(result=None, cells=[], queries=[], rationale=None,
+                                          usage={"calls": 1, "cost_usd": 0.01}, error="没有交结果", model="mock-fast")
+
+    monkeypatch.setattr(verify_agent, "run_verify_agent", fake)
+    metrics = []
+    for i in range(5):
+        item = metric(art, locator={"row": i, "column": "gmv"}, value=float(100 + i))
+        metrics.append({**item, "id": f"m{i}", "name": f"第 {i} 组销售额", "value": float(100 + i),
+                        "rendered": f"{100 + i}.0元", "substituted": f"{100 + i}.0"})
+    ctx = context(AGENT_GRAPH)
+    state = {"nodes": {"agent": {"model": "other"}, "card": card_of(*metrics)}, "evidence": [], "trail": []}
+    updates = await run_dual_check(state, ctx)
+    out = updates["nodes"]["dual"]
+    assert [m["status"] for m in out["metrics"]] == ["unchecked"] * 5
+    assert 1 < running["peak"] <= dual_check.BLIND_CONCURRENCY
+    assert "第 0 组销售额" in running["order"][0]
+    assert updates["usage"]["calls"] == 5 and updates["usage"]["cost_usd"] == 0.05

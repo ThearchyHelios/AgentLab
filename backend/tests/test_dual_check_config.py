@@ -1,9 +1,9 @@
 """双盲复算的配置、发起时的设置快照、助手的节点说明。
 
 - 画布校验（engine/schema.py）：口径卡必须是上游的口径卡（没写时上游只能有一张），复算的指标、口径说明的键必须是
-  那张卡上的指标 ID，开关、误差、处置的取值；报错写检查器上的中文叫法
-- 发起（engine/launch.py）：图里有双盲复算或反方审稿节点时把核查设置快照进 options["verify"]，没有时 options 不变、
-  run.started 和以前逐字相同；调用方给了的照它的
+  那张卡上的指标 ID，开关（只认 true / false，0、1 不算）、误差、处置的取值，不能配失败重试；报错写检查器上的中文叫法
+- 发起（engine/launch.py）：图里（含子工作流）有双盲复算或反方审稿节点时把核查设置快照进 options["verify"]，没有时
+  options 不变、run.started 和以前逐字相同；调用方给了的照它的
 - 助手的节点说明（api/copilot.py 的 NODE_REFERENCE）有 dual_check 一条：什么时候加、各配置项
 
 表名、数字都是虚构的。
@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.db.base import SessionLocal
-from app.db.models import Run, RunEvent, Setting
+from app.db.models import Run, RunEvent, Setting, Workflow, WorkflowVersion
 from app.engine.runner import run_manager
 from app.engine.schema import GraphSpec, validate_graph
 
@@ -97,6 +97,20 @@ def test_option_values_are_checked():
     assert "「允许的相对误差」需要填写不小于 0 的数" in found["tolerance"]
 
 
+@pytest.mark.parametrize("value", [0, 1, 0.0])
+def test_zero_and_one_are_not_a_switch(value):
+    """0 == False、1 == True：用 in 比会放过去，执行时却按「跟随设置」走（执行器认的是 True / False 本身）。"""
+    [(where, text)] = problems(spec(CARD, dual={"enabled": value}))
+    assert where == "enabled" and "「启用双盲复算」" in text
+
+
+def test_retries_are_refused():
+    """双盲复算失败都是确定的（审核人没采用原流程、口径卡不对）：重试只会把盲算再做一遍、再问审核人一次。"""
+    [(where, text)] = problems(spec(CARD, dual={"retries": 1}))
+    assert where == "retries" and "「失败重试次数」" in text and "双盲复算" in text
+    assert problems(spec(CARD, dual={"retries": 0})) == []
+
+
 # --------------------------------------------------------------------------
 # 发起：设置快照
 # --------------------------------------------------------------------------
@@ -162,6 +176,33 @@ async def test_a_challenge_node_also_snapshots_the_settings(engine):
     async with SessionLocal() as session:
         out = await _with_verify_snapshot(session, graph, None)
     assert set(out) == {"verify"} and out["verify"]["challenge"]["enabled"] is True
+
+
+async def test_a_verify_node_inside_a_sub_workflow_also_snapshots_the_settings(engine):
+    """子工作流里的双盲复算同样在运行中途读设置：按运行时的取法找子工作流（固定了版本的读那一版），任何一层有就快照。"""
+    from app.engine.launch import _with_verify_snapshot
+
+    inner_v1 = {"nodes": [node("start", "input"), node("out", "output", fields=[])], "edges": []}
+    inner_v2 = {"nodes": [node("start", "input"), node("review", "dual_check")], "edges": []}
+    async with SessionLocal() as session:
+        wf = Workflow(name="子流程-复核", graph=inner_v1, version=2)
+        session.add(wf)
+        await session.flush()
+        session.add_all([WorkflowVersion(workflow_id=wf.id, version=1, graph=inner_v1),
+                         WorkflowVersion(workflow_id=wf.id, version=2, graph=inner_v2)])
+        await session.commit()
+        wid = wf.id
+
+    def outer(**config) -> dict:
+        return {"nodes": [node("start", "input"), node("sub", "subgraph", workflow_id=wid, **config)], "edges": []}
+
+    async with SessionLocal() as session:
+        pinned = await _with_verify_snapshot(session, outer(workflow_version=2), None)
+        old_pin = await _with_verify_snapshot(session, outer(workflow_version=1), None)
+        current = await _with_verify_snapshot(session, outer(), None)
+    assert set(pinned) == {"verify"} and pinned["verify"]["dual_check"]["enabled"] is True
+    # 固定在没有核查节点的那一版、或者读工作流现在的图（也没有）：options 原样不动
+    assert old_pin is None and current is None
 
 
 async def test_without_verify_nodes_options_and_run_started_are_unchanged(engine):

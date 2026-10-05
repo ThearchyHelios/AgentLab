@@ -224,7 +224,8 @@ NODE_REFERENCE = """\
   全部指标）；definitions 是 {指标 id: 口径说明}，写清业务定义（按哪个日期归属、排除哪些行、是否去重），盲算 agent
   只看得到它和数据目录，所以要按业务写，不要抄原 SQL；provider / model 指定盲算模型（**默认不写**，取设置里的核查
   模型；建议和取数的 agent 不同）；tolerance 是允许的相对误差（不写取设置）；on_reject：degrade（默认，计入缺口、
-  出具降档）/ fail（审核人没采用原流程的结果就判为失败）；enabled 不写跟随设置里的开关，true / false 强制开关
+  出具降档）/ fail（审核人没采用原流程的结果就判为失败）；enabled 不写跟随设置里的开关，true / false 强制开关。
+  不要给它配 retries：它的失败是确定的，重试只会把盲算再做一遍、再请审核人选一次（画布校验会报错）
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
   claims, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果

@@ -2,15 +2,21 @@
 （tests/fixtures/dual_check_shop.py），盲算模型是 MockChatModel 剧本。
 
 - 一致：不挂起，产出 agreed，日志 dual_check_agreed；盲算的查询发 tool.end（role: verify），台账只有一条 dual_check，
-  用量计入运行；盲算 agent 的任务里没有原 SQL
-- 不一致：挂起，审批 payload 和对照工件按约定；a / b / neither 三种选择的产出和缺口，on_reject 为 fail 时失败
-- 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖
+  用量计入运行；盲算 agent 的任务里没有原 SQL，也没有原流程结果的列名
+- 一个都没核成是 unchecked、只核成一部分是 partial，日志 dual_check_unchecked 说清哪几个、为什么
+- 不一致：挂起，审批 payload 和对照工件按约定；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject
+  为 fail 时失败
+- 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比）
+- 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖，指标自己的
+  筛选范围不写，两条 SQL 规范化后一致的不写
 - 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
-- 触顶、分组结果的维度、两个指标用到同一格只盲算一次
+- 触顶、分组结果的维度（只给取值、遮罩列不给）、两个指标用到同一格只盲算一次、遮罩列上的盲算结果不采用
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -26,6 +32,7 @@ from app.engine.runner import run_manager
 from app.main import app
 from tests.fixtures.dual_check_shop import (
     BOTH_WRONG,
+    BUYERS,
     BY_ORDER_DATE,
     BY_REGION,
     DEFINITION,
@@ -66,6 +73,14 @@ async def clean_settings():
 @pytest.fixture
 async def shop(tmp_path):
     name, source_id = await add_source(build(tmp_path / "shop.db"))
+    yield name, source_id
+    await drop_source(source_id)
+
+
+@pytest.fixture
+async def masked_shop(tmp_path):
+    """遮了 region、secret_gmv 两列的同一个库。"""
+    name, source_id = await add_source(build(tmp_path / "masked.db"), options={"mask_columns": "region, secret_gmv"})
     yield name, source_id
     await drop_source(source_id)
 
@@ -159,6 +174,7 @@ async def test_agreeing_check_passes_without_asking(monkeypatch, shop):
     evs = await events(run.id)
     out = dual_output(run, evs)
     assert out["status"] == "agreed" and "issuance_gaps" not in out
+    assert out["counts"] == {"agreed": 1, "disagreed": 0, "unchecked": 0}
     [metric] = out["metrics"]
     assert metric["metric_id"] == "gmv" and metric["status"] == "agreed" and metric["delta_pct"] == 0.0
     assert metric["original_rendered"] == metric["blind_rendered"]
@@ -174,18 +190,21 @@ async def test_agreeing_check_passes_without_asking(monkeypatch, shop):
     assert kinds == ["dual_check"]
     entry = finished.data["evidence"][0]
     assert entry["card"] == "card" and entry["status"] == "agreed"
-    assert entry["metrics"] == [{"id": "gmv", "status": "agreed"}]
+    assert entry["metrics"] == [{"id": "gmv", "status": "agreed"}] and entry["counts"] == out["counts"]
+    assert not logs(evs, "dual_check_unchecked")
     # 用量计入运行：图里只有盲算调用了模型
     assert blind.calls and run.usage["calls"] == len(blind.calls)
     assert run.output["_issuance"]["tier"] == "formal" and run.output["_issuance"]["gaps"] == []
-    # 盲算 agent 只看得到指标名、口径说明、计算式里是哪一项：看不到原 SQL、取数节点
+    # 盲算 agent 只看得到指标名、口径说明、计算式里是哪一项：看不到原 SQL、取数节点、原流程结果的列名
     [task] = blind.tasks
     assert "指标：销售额" in task and DEFINITION in task and "输入1" in task
     assert "status <> 'refunded'" not in task and "nodes.fetch" not in task and "SUM(" not in task
+    assert "gmv" not in task
 
 
 async def test_grouped_rows_tell_the_blind_agent_which_group(monkeypatch, shop):
-    """结果分了组：盲算 agent 要知道算的是哪一组（同一行的维度列），但看不到同一行别的数；统计期这类参数在运行输入里。"""
+    """结果分了组：盲算 agent 要知道算的是哪一组（同一行维度列的取值），但看不到同一行别的数、原流程是按哪一列分的组；
+    统计期这类参数在运行输入里。"""
     name, _ = shop
     metric = {**GMV, "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
     blind = Blind(monkeypatch, name, {"华东销售额": (BY_REGION, "gmv")})
@@ -194,10 +213,25 @@ async def test_grouped_rows_tell_the_blind_agent_which_group(monkeypatch, shop):
     run = await start(spec, {"week_start": "2026-09-01", "week_end": "2026-09-07"})
     assert run.status == "succeeded", run.error
     [task] = blind.tasks
-    assert "region 为「华东」" in task and "（未提供" in task and "300" not in task
+    assert "「华东」" in task and "（未提供" in task and "300" not in task
+    assert "region" not in task and "gmv" not in task
     assert "week_start = 2026-09-01" in task and "week_end = 2026-09-07" in task
     out = dual_output(run, await events(run.id))
     assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed"
+
+
+async def test_the_blind_agent_is_not_told_which_date_column_the_original_grouped_by(monkeypatch, shop):
+    """原流程按下单日分组、口径卡取其中一天：盲算只知道是哪一天，按哪一列归属要它自己按口径说明判断。告诉它
+    「order_date 为 2026-09-02」，它照着算出同一个数，下单日和支付日的陷阱就漏过去了。"""
+    name, _ = shop
+    by_day = (f"SELECT order_date, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' AND order_date {WEEK} "
+              "GROUP BY order_date ORDER BY order_date")
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, by_day))
+    assert run.status in ("succeeded", "interrupted"), run.error
+    [task] = blind.tasks
+    assert "2026-09-02 这一天" in task
+    assert "order_date" not in task and "gmv" not in task
 
 
 async def test_two_metrics_using_one_cell_are_checked_once(monkeypatch, shop):
@@ -213,18 +247,70 @@ async def test_two_metrics_using_one_cell_are_checked_once(monkeypatch, shop):
 
 
 async def test_hitting_a_limit_counts_as_unchecked(monkeypatch, shop):
+    """查询次数用完了还没查到要交的那一格：按无法复算计入缺口；一个指标都没核成，产出是 unchecked，不是 agreed。"""
     name, _ = shop
-    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    Blind(monkeypatch, name, {"销售额": ([BLIND_TOTAL, RIGHT], "gmv")})
     run = await start(graph(name, RIGHT), options={"verify": {"dual_check": {"max_queries": 1}}})
     assert run.status == "succeeded", run.error
     evs = await events(run.id)
     assert [(d["limit"], d["metric"]) for d in logs(evs, "dual_check_limit")] == [("max_queries", "gmv")]
     out = dual_output(run, evs)
-    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "unchecked"
+    assert out["status"] == "unchecked" and out["metrics"][0]["status"] == "unchecked"
+    assert out["counts"] == {"agreed": 0, "disagreed": 0, "unchecked": 1}
     assert out["issuance_gaps"] == ["指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+    [said] = logs(evs, "dual_check_unchecked")
+    assert said["metrics"] == [{"id": "gmv", "name": "销售额", "reason": "盲算已达每项最多查询次数（1 次）"}]
+    assert not logs(evs, "dual_check_agreed")
     assert not [e for e in evs if e.type == "human.requested"]
+    [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    assert finished.data["evidence"][0]["status"] == "unchecked"
     assert run.output["_issuance"]["tier"] == "degraded"
     assert run.output["_issuance"]["gaps"] == ["双盲复算「复核销售额」：指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+
+
+async def test_an_answer_on_the_last_allowed_query_still_counts(monkeypatch, shop):
+    """查询次数刚好用完，交回的那一格是真查出来的：照常比对，不按触顶算无法复算。"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, RIGHT), options={"verify": {"dual_check": {"max_queries": 1}}})
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed" and "issuance_gaps" not in out
+    assert not logs(evs, "dual_check_limit") and not logs(evs, "dual_check_unchecked")
+    assert run.output["_issuance"]["tier"] == "formal"
+
+
+async def test_every_metric_sharing_a_cell_reports_the_limit(monkeypatch, shop):
+    name, _ = shop
+    share = {"id": "gmv_k", "name": "销售额（千元）", "unit": "千元", "decimals": 2, "format": "thousands",
+             "expression": "round(cell(nodes.fetch, 0, 'gmv') / 1000, 2)"}
+    blind = Blind(monkeypatch, name, {"销售额": ([BLIND_TOTAL, RIGHT], "gmv")})
+    run = await start(graph(name, RIGHT, metrics=[GMV, share]), options={"verify": {"dual_check": {"max_queries": 1}}})
+    assert run.status == "succeeded", run.error
+    assert blind.runs == 1
+    evs = await events(run.id)
+    assert [(d["limit"], d["metric"]) for d in logs(evs, "dual_check_limit")] == [
+        ("max_queries", "gmv"), ("max_queries", "gmv_k")]
+    [said] = logs(evs, "dual_check_unchecked")
+    assert [m["id"] for m in said["metrics"]] == ["gmv", "gmv_k"]
+
+
+async def test_some_unchecked_metrics_make_a_partial_result(monkeypatch, shop):
+    name, _ = shop
+    east = {**GMV, "id": "east", "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    north = {**GMV, "id": "north", "name": "华北销售额", "expression": "cell(nodes.fetch, 1, 'gmv')"}
+    Blind(monkeypatch, name, {"华东销售额": (BY_REGION, "gmv")})
+    run = await start(graph(name, BY_REGION, metrics=[east, north], dual={"definitions": {}}))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    assert out["status"] == "partial" and [m["status"] for m in out["metrics"]] == ["agreed", "unchecked"]
+    assert out["counts"] == {"agreed": 1, "disagreed": 0, "unchecked": 1}
+    assert [d["metrics"] for d in logs(evs, "dual_check_agreed")] == [1]
+    [said] = logs(evs, "dual_check_unchecked")
+    assert [(m["id"], m["name"]) for m in said["metrics"]] == [("north", "华北销售额")] and said["metrics"][0]["reason"]
+    assert out["issuance_gaps"] == [f"指标「华北销售额」无法复算：{said['metrics'][0]['reason']}"]
 
 
 async def test_an_unusable_verify_model_is_tried_once(monkeypatch, shop):
@@ -244,10 +330,13 @@ async def test_an_unusable_verify_model_is_tried_once(monkeypatch, shop):
     north = {**GMV, "id": "north", "name": "华北销售额", "expression": "cell(nodes.fetch, 1, 'gmv')"}
     run = await start(graph(name, BY_REGION, metrics=[east, north], dual={"definitions": {}}))
     assert run.status == "succeeded", run.error
-    out = dual_output(run, await events(run.id))
-    assert [m["status"] for m in out["metrics"]] == ["unchecked", "unchecked"]
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    assert out["status"] == "unchecked" and [m["status"] for m in out["metrics"]] == ["unchecked", "unchecked"]
     assert all("核查模型不可用" in m["reason"] and "已停用" in m["reason"] for m in out["metrics"])
     assert len(out["issuance_gaps"]) == 2 and len(tried) == 1
+    [said] = logs(evs, "dual_check_unchecked")
+    assert [m["id"] for m in said["metrics"]] == ["east", "north"] and "核查模型不可用" in said["metrics"][0]["reason"]
 
 
 # --------------------------------------------------------------------------
@@ -348,14 +437,33 @@ async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
     assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
 
 
-async def test_a_missing_choice_counts_as_neither(monkeypatch, shop, client):
-    name, _ = shop
+async def test_a_missing_choice_is_recorded_as_no_choice(monkeypatch, shop, client):
+    """没选、选了认不出的：照实记「没有作出选择」，不替审核人说「两边都不对」；没采用原流程，照样降档。"""
+    name, source_id = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
     run = await start(graph(name, BY_ORDER_DATE))
     done = await decide(client, run.id, {"gmv": "maybe"})
-    out = dual_output(done, await events(run.id))
-    assert out["choices"] == {"gmv": "neither"}
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人判断两边都不对"]
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    out = dual_output(done, evs)
+    assert out["choices"] == {} and "choice" not in out["metrics"][0]
+    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人没有作出选择"]
+    [resolved] = logs(evs, "dual_check_resolved")
+    assert resolved["choices"] == {} and resolved["gaps"] == out["issuance_gaps"]
+    assert "没有作出选择" in resolved["message"] and "两边都不对" not in resolved["message"]
+    assert done.output["_issuance"]["tier"] == "degraded"
+    assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
+
+
+async def test_rejecting_the_approval_fails_the_node(monkeypatch, shop, client):
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    approval = await pending(run.id)
+    res = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "口径要重新对"})
+    assert res.status_code == 200, res.text
+    done = await wait(run.id, ("succeeded", "failed"))
+    assert done.status == "failed" and "人工驳回" in (done.error or "") and "口径要重新对" in done.error
 
 
 async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
@@ -444,6 +552,185 @@ async def test_a_confirmed_catalog_entry_is_not_overwritten(monkeypatch, shop, c
     assert "已有人工确认过的说法「order_date」" in wrote["skipped"][0]["reason"] and "paid_date" in wrote["skipped"][0]["reason"]
     entry = await notes_of(source_id)
     assert entry.version == 1 and entry.notes["business_date"]["value"] == {"column": "order_date"}
+
+
+async def test_a_metric_scope_filter_is_not_written_as_a_valid_filter(monkeypatch, shop, client):
+    """「华东销售额」原流程按指标名只看华东，盲算漏了地区：审核人选原流程，但 region = '华东' 是这个指标自己的筛选
+    范围，写成表的有效记录条件，以后所有查订单表的工作流（包括下一次盲算）都会只看华东。"""
+    name, source_id = shop
+    east = {**GMV, "id": "east", "name": "华东销售额"}
+    Blind(monkeypatch, name, {"华东销售额": (RIGHT, "gmv")})
+    original = RIGHT.replace("WHERE ", "WHERE region = '华东' AND ")
+    run = await start(graph(name, original, metrics=[east], dual={"definitions": {"east": "华东地区已支付订单的金额"}}))
+    [item] = (await pending(run.id)).payload["summary"]
+    assert len(item["diff"]) == 1 and "region = '华东'" in item["diff"][0]
+    done = await decide(client, run.id, {"east": "a"})
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "可能是指标自己的筛选范围" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_equivalent_sql_with_different_values_points_at_the_data(monkeypatch, shop, client, tmp_path):
+    """原流程查完之后库里多了一单：两条 SQL 规范化后一致、值却不同，差异说明写「差在数据」，不写数据目录。"""
+    from app.engine.nodes.dual_check import SAME_SQL
+
+    name, source_id = shop
+
+    def late_order() -> None:
+        db = sqlite3.connect(tmp_path / "shop.db")
+        db.execute("INSERT INTO orders VALUES (6, '华东', 104, 70.0, 'paid', '2026-09-04', '2026-09-04', 'online', 0)")
+        db.commit()
+        db.close()
+
+    Blind(monkeypatch, name, {"销售额": (BLIND_TOTAL, "blind_total")}, on_query=late_order)
+    run = await start(graph(name, RIGHT))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    [item] = payload["summary"]
+    assert item["diff"] == [SAME_SQL] and item["fallback"] is False
+    assert item["original_rendered"].startswith("330") and item["blind_rendered"].startswith("400")
+    [metric] = artifact_store.load(payload["card_artifact"])["metrics"]
+    assert metric["diff"]["equivalent"] is True and metric["diff"]["items"] == [{"aspect": "data", "text": SAME_SQL}]
+    done = await decide(client, run.id, {"gmv": "b"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "规范化后一致" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_a_multi_column_query_is_compared_on_its_own_column(monkeypatch, shop, client):
+    """原流程一条查询算了好几列，口径卡取其中一列：差异只比这一列是怎么算的，不混进「选出的列」这类差别。"""
+    name, source_id = shop
+    wide = f"SELECT SUM(amount) AS gmv, COUNT(*) AS n FROM orders WHERE status <> 'refunded' AND order_date {WEEK}"
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, wide))
+    payload = (await pending(run.id)).payload
+    [item] = payload["summary"]
+    assert len(item["diff"]) == 1 and "order_date" in item["diff"][0] and "paid_date" in item["diff"][0]
+    [metric] = artifact_store.load(payload["card_artifact"])["metrics"]
+    assert [i["aspect"] for i in metric["diff"]["items"]] == ["time"]
+    # 对照里的原 SQL 还是原流程整条查询：给人看的是原文
+    assert metric["original"]["inputs"][0]["sql"] == wide
+    await decide(client, run.id, {"gmv": "b"})
+    assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_a_grouped_query_is_compared_on_the_row_it_was_taken_from(monkeypatch, shop, client):
+    """原流程按地区分组、取华东那一行：收窄成「华东这一组」再比，差异里不出现分组、地区条件这类和这一格无关的差别。"""
+    name, source_id = shop
+    by_region = (f"SELECT region, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' AND order_date {WEEK} "
+                 "GROUP BY region ORDER BY region")
+    east_paid = RIGHT.replace("WHERE ", "WHERE region = '华东' AND ")
+    east = {**GMV, "id": "east", "name": "华东销售额"}
+    Blind(monkeypatch, name, {"华东销售额": (east_paid, "gmv")})
+    run = await start(graph(name, by_region, metrics=[east], dual={"definitions": {}}))
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["original_rendered"].startswith("200") and item["blind_rendered"].startswith("300")
+    assert len(item["diff"]) == 1 and "order_date" in item["diff"][0] and "paid_date" in item["diff"][0]
+    await decide(client, run.id, {"east": "b"})
+    assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_two_differing_inputs_do_not_write_the_catalog(monkeypatch, shop, client):
+    """一个指标的两个输入都对不上：审核人选的是整个指标哪边对，拆不出是哪一处，不写目录。"""
+    name, source_id = shop
+    share = (f"SELECT SUM(CASE WHEN region = '华东' THEN amount ELSE 0 END) AS east, SUM(amount) AS total FROM orders "
+             f"WHERE status <> 'refunded' AND order_date {WEEK}")
+    east_paid = (f"SELECT SUM(CASE WHEN region = '华东' THEN amount ELSE 0 END) AS east FROM orders "
+                 f"WHERE status <> 'refunded' AND paid_date {WEEK}")
+    ratio = {"id": "east_share", "name": "华东占比", "unit": "", "decimals": 3, "format": "plain",
+             "expression": "cell(nodes.fetch, 0, 'east') / cell(nodes.fetch, 0, 'total')"}
+    blind = Blind(monkeypatch, name, {"华东占比|输入1": (east_paid, "east"), "华东占比|输入2": (RIGHT, "gmv")})
+    run = await start(graph(name, share, metrics=[ratio], dual={"definitions": {}}))
+    assert blind.runs == 2
+    [item] = (await pending(run.id)).payload["summary"]
+    assert len(item["diff"]) == 2 and all("输入「" in d for d in item["diff"])
+    done = await decide(client, run.id, {"east_share": "b"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "不止差一个方面" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_only_the_configured_metrics_are_checked(monkeypatch, shop):
+    name, _ = shop
+    wide = f"SELECT SUM(amount) AS gmv, COUNT(*) AS n FROM orders WHERE status <> 'refunded' AND paid_date {WEEK}"
+    count = {"id": "orders", "name": "订单数", "unit": "单", "decimals": 0, "expression": "cell(nodes.fetch, 0, 'n')"}
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv"), "订单数": (BUYERS, "buyers")})
+    run = await start(graph(name, wide, metrics=[GMV, count], dual={"metrics": ["gmv"]}))
+    assert run.status == "succeeded", run.error
+    out = dual_output(run, await events(run.id))
+    assert [m["metric_id"] for m in out["metrics"]] == ["gmv"] and out["status"] == "agreed"
+    assert blind.runs == 1 and all("指标：订单数" not in t for t in blind.tasks)
+
+
+async def test_a_zero_original_compares_by_absolute_error_and_has_no_delta_pct(monkeypatch, shop):
+    name, _ = shop
+    voids = {"id": "voids", "name": "作废单数", "unit": "单", "decimals": 0, "expression": "cell(nodes.fetch, 0, 'n')"}
+    none_void = f"SELECT COUNT(*) AS n FROM orders WHERE status = 'void' AND paid_date {WEEK}"
+    refunded = f"SELECT COUNT(*) AS n FROM orders WHERE status = 'refunded' AND paid_date {WEEK}"
+    Blind(monkeypatch, name, {"作废单数": (refunded, "n")})
+    run = await start(graph(name, none_void, metrics=[voids], dual={"definitions": {}}))
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["original_rendered"].startswith("0") and item["blind_rendered"].startswith("1")
+    assert item["delta_pct"] is None
+
+
+def test_zero_originals_use_absolute_error():
+    from app.engine.nodes.dual_check import _agree, _delta_pct
+
+    assert _agree(0, 1e-7, 1e-6) and not _agree(0, 0.5, 1e-6)
+    assert _agree(100.0, 100.00005, 1e-6) and not _agree(100.0, 100.01, 1e-6)
+    assert _delta_pct(0, 5) is None and _delta_pct(310.0, 330.0) == 6.45 and _delta_pct(-10, -5) == 50.0
+
+
+async def test_the_summary_lists_at_most_three_differences(monkeypatch, shop):
+    name, _ = shop
+    blind_sql = RIGHT + " AND region <> '华北' AND customer_id <> 999"
+    Blind(monkeypatch, name, {"销售额": (blind_sql, "gmv")})
+    run = await start(graph(name, BOTH_WRONG))
+    payload = (await pending(run.id)).payload
+    [item] = payload["summary"]
+    [metric] = artifact_store.load(payload["card_artifact"])["metrics"]
+    assert len(metric["diff"]["items"]) == 4 and len(item["diff"]) == 3
+    assert item["diff"] == [i["text"] for i in metric["diff"]["items"][:3]]
+
+
+# --------------------------------------------------------------------------
+# 遮罩
+# --------------------------------------------------------------------------
+
+
+async def test_a_blind_cell_on_a_masked_column_is_not_used(monkeypatch, masked_shop, client):
+    """盲算交的那一格在遮罩列上：值不采用（不进审批卡、对照工件、产出），这个指标按无法复算记。"""
+    name, _ = masked_shop
+    east = {**GMV, "id": "east", "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    north = {**GMV, "id": "north", "name": "华北销售额", "expression": "cell(nodes.fetch, 1, 'gmv')"}
+    east_by_order = BY_ORDER_DATE.replace("WHERE ", "WHERE region = '华东' AND ")
+    north_masked = (f"SELECT SUM(amount) + 0.25 AS secret_gmv FROM orders WHERE status <> 'refunded' "
+                    f"AND paid_date {WEEK} AND region = '华北'")
+    Blind(monkeypatch, name, {"华东销售额": (east_by_order, "gmv"), "华北销售额": (north_masked, "secret_gmv")})
+    run = await start(graph(name, BY_REGION, metrics=[east, north], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    card = artifact_store.load(payload["card_artifact"])
+    assert [m["metric_id"] for m in payload["summary"]] == ["east"]
+    assert [m["metric_id"] for m in card["metrics"]] == ["east"]
+    assert "30.25" not in json.dumps(payload, ensure_ascii=False)
+    assert "30.25" not in json.dumps(card, ensure_ascii=False)
+    done = await decide(client, run.id, {"east": "a"})
+    out = dual_output(done, await events(run.id))
+    [_, row] = out["metrics"]
+    assert row["status"] == "unchecked" and "遮罩" in row["reason"] and row["blind_rendered"] is None
+    assert "30.25" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_masked_group_columns_are_not_shown_to_the_blind_agent(monkeypatch, masked_shop):
+    name, _ = masked_shop
+    first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    blind = Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    await start(graph(name, BY_REGION, metrics=[first], dual={"definitions": {}}))
+    [task] = blind.tasks
+    assert "华东" not in task and "region" not in task
 
 
 # --------------------------------------------------------------------------

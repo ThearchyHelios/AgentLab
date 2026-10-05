@@ -455,16 +455,29 @@ def dual_check_card(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str |
 
 def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
     """双盲复算的配置：口径卡必须是它上游的口径卡；复算的指标、口径说明的键必须是那张卡上的指标 ID；开关、
-    误差、处置的取值。指标定义从别的工作流引用来的口径卡（caliber_from），画图时不知道有哪些指标，不查指标 ID。"""
+    误差、处置的取值；不能配失败重试。指标定义从别的工作流引用来的口径卡（caliber_from），画图时不知道有哪些指标，
+    不查指标 ID。"""
     cfg = node.config
     label = DUAL_CHECK_FIELD_LABEL
 
     def add(message: str, field: str, code: str) -> None:
         result.add(message, node_id=node.id, field=field, code=code)
 
-    if cfg.get("enabled") not in (None, True, False):
-        add(f"「{label['enabled']}」只能选跟随设置、开启或关闭，当前为「{cfg.get('enabled')}」", "enabled",
+    switch = cfg.get("enabled")
+    # 用 is 比：0 == False、1 == True，用 in 比会放过去，执行时却按「跟随设置」走（执行器认的是 True / False 本身）
+    if not (switch is None or switch is True or switch is False):
+        add(f"「{label['enabled']}」只能选跟随设置、开启或关闭，当前为「{switch}」", "enabled",
             "dual_check.option_invalid")
+    try:
+        retries = int(cfg.get("retries", 0) or 0)       # 和 compiler 取重试次数的写法一样
+    except (TypeError, ValueError):
+        retries = 0
+    if retries > 0:
+        # 失败都是确定的（审核人没采用原流程、口径卡配错）：重试时 @task 的调用序号往后走、对不上缓存，盲算整轮
+        # 再做一遍、再花一次钱，还要审核人再选一次
+        add(f"「双盲复算」节点不支持「{field_label('retries')}」：它的失败是确定的（审核人没有采用原流程的结果、"
+            "口径卡配置有误），重试只会把盲算再做一遍并再次请审核人选择。请把失败重试次数设为 0", "retries",
+            "dual_check.retries")
     if cfg.get("on_reject") not in (None, "", *DUAL_CHECK_ON_REJECT):
         allowed = "或".join(f"「{v}」" for v in DUAL_CHECK_ON_REJECT_LABEL.values())
         add(f"「{label['on_reject']}」只能选{allowed}，当前为「{cfg.get('on_reject')}」", "on_reject",

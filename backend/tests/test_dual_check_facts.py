@@ -1,10 +1,13 @@
 """双盲复算的选择写进数据目录（engine/dual_check_facts.py）。
 
-- 只差一个方面、又对得上目录事实时才写：时间列 → 业务日期，一边多一个只涉及一张表的筛选条件 → 有效记录条件，
-  聚合只差去不去重 → 去重规则；按被采纳那一边的写法记
-- 差了不止一处、有兜底说明、两条 SQL 规范化后一致、差在别的方面、被采纳的一边没有可记的写法：不写，照实说原因
-- 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖，
-  推断的不同说法照改
+- 只差一个方面、又对得上目录事实时才写：两边按不同的时间列筛 → 业务日期，一边多一个排除无效记录的条件 → 有效记录
+  条件，聚合只差去不去重、被采纳的一边去重 → 去重规则；按被采纳那一边的写法记
+- 差了不止一处、有兜底说明、两条 SQL 规范化后一致、差在别的方面、被采纳的一边没有可记的写法、只有一边按时间筛：不写，
+  照实说原因
+- 指标自己的筛选范围（只看华东、只看线上）不是有效记录条件：取值出现在指标名称、口径说明、所在分组、运行输入里的，
+  条件用到分组的列的，不是在排除退款、作废、测试这类无效记录的，都不写
+- 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖；
+  目录里已有的有效记录条件被采纳的一边也用着的，合起来写，没用着的不动；同一次裁决里互相矛盾的选择都不写
 
 差异条目一律由 sql_semantics.explain_sql_diff 真算出来，和节点交给审核人看的是同一份。表名、数字都是虚构的。
 """
@@ -22,22 +25,43 @@ from tests.fixtures.dual_check_shop import (
     BUYERS_DISTINCT,
     BY_ORDER_DATE,
     RIGHT,
+    WEEK,
     WITH_REFUNDS,
     add_source,
     build,
 )
 from tests.fixtures.sources import drop_source
 
-SCHEMA = {"tables": {"orders": {"name": "orders", "columns": [
-    {"name": "id", "type": "INTEGER"}, {"name": "region", "type": "TEXT"}, {"name": "customer_id", "type": "INTEGER"},
-    {"name": "amount", "type": "REAL"}, {"name": "status", "type": "TEXT"}, {"name": "order_date", "type": "TEXT"},
-    {"name": "paid_date", "type": "TEXT"}], "primary_key": ["id"]}}}
+SCHEMA = {"tables": {
+    "orders": {"name": "orders", "columns": [
+        {"name": "id", "type": "INTEGER"}, {"name": "region", "type": "TEXT"},
+        {"name": "customer_id", "type": "INTEGER"}, {"name": "amount", "type": "REAL"},
+        {"name": "status", "type": "TEXT"}, {"name": "order_date", "type": "TEXT"},
+        {"name": "paid_date", "type": "TEXT"}, {"name": "channel", "type": "TEXT"},
+        {"name": "is_test", "type": "INTEGER"}], "primary_key": ["id"]},
+    "customers": {"name": "customers", "columns": [
+        {"name": "id", "type": "INTEGER"}, {"name": "level", "type": "TEXT"}, {"name": "status", "type": "TEXT"}],
+        "primary_key": ["id"]},
+}}
+#: 不带时间条件、只排除退款：和 RIGHT 只差「按不按时间筛」
+NO_TIME = "SELECT SUM(amount) AS gmv FROM orders WHERE status <> 'refunded'"
+COUNT_WEEK = f"SELECT COUNT(*) AS n FROM orders WHERE paid_date {WEEK}"
+SUM_WEEK = f"SELECT SUM(amount) AS gmv FROM orders WHERE paid_date {WEEK}"
 
 
-def candidate(original: str, blind: str, choice: str, *, metric: str = "销售额", source: str = "shop") -> dict:
+def candidate(original: str, blind: str, choice: str, *, metric: str = "销售额", source: str = "shop",
+              scope: dict | None = None) -> dict:
     diff = explain_sql_diff(original, blind, "sqlite", schema=SCHEMA, labels=("原流程", "盲算")).as_dict()
-    return {"metric": metric, "choice": choice, "source": source, "dialect": "sqlite",
-            "sql": {"a": original, "b": blind}, "diff": diff}
+    out = {"metric": metric, "choice": choice, "source": source, "dialect": "sqlite",
+           "sql": {"a": original, "b": blind}, "diff": diff}
+    if scope is not None:
+        out["scope"] = scope
+    return out
+
+
+def extra(condition: str, base: str = SUM_WEEK) -> str:
+    """base 多一个条件。"""
+    return base.replace(" WHERE ", f" WHERE {condition} AND ", 1)
 
 
 # --------------------------------------------------------------------------
@@ -52,17 +76,86 @@ def test_a_different_time_column_becomes_the_business_date(choice, column):
     assert (fact.table, fact.item, fact.value, fact.choice) == ("orders", "business_date", {"column": column}, choice)
 
 
+def test_a_time_filter_on_one_side_only_is_not_a_business_date():
+    """一边按支付日筛、另一边根本没按时间筛：审核人判断的是要不要限定时间，没在两列之间选过。"""
+    picked = candidate(RIGHT, NO_TIME, "a")
+    assert [i["aspect"] for i in picked["diff"]["items"]] == ["time"]
+    fact, why = derive(picked, SCHEMA)
+    assert fact is None and "只有被采纳的原流程按时间筛选" in why and "不是按哪一列归属" in why
+    fact, why = derive(candidate(RIGHT, NO_TIME, "b"), SCHEMA)
+    assert fact is None and "被采纳的盲算没有按时间筛选" in why
+
+
 def test_an_extra_filter_on_the_adopted_side_becomes_the_valid_filter():
     fact, why = derive(candidate(WITH_REFUNDS, RIGHT, "b"), SCHEMA)
     assert why is None and (fact.item, fact.value) == ("valid_filter", "status <> 'refunded'")
     # 原流程多出这个条件、审核人采纳原流程：同样记这个条件
     fact, why = derive(candidate(RIGHT, WITH_REFUNDS, "a"), SCHEMA)
     assert why is None and (fact.item, fact.value) == ("valid_filter", "status <> 'refunded'")
+    # 被采纳那一边的写法跟着记下来，有效记录条件合并时要看它还用了哪些条件
+    assert fact.sql == RIGHT and fact.dialect == "sqlite"
 
 
 def test_the_adopted_side_without_the_extra_filter_has_nothing_to_record():
     fact, why = derive(candidate(RIGHT, WITH_REFUNDS, "b"), SCHEMA)
     assert fact is None and "被采纳的盲算没有这个条件" in why and "销售额" in why
+
+
+@pytest.mark.parametrize("original, blind, choice, metric", [
+    # 原流程按指标名只看华东，盲算漏了：审核人自然选原流程
+    (extra("region = '华东'", RIGHT), RIGHT, "a", "华东销售额"),
+    # 盲算按指标名只数线上的单
+    (COUNT_WEEK, extra("channel = 'online'", COUNT_WEEK), "b", "线上订单数"),
+    # 只保留一部分取值的写法，状态列上也一样
+    (COUNT_WEEK, extra("status IN ('paid')", COUNT_WEEK), "b", "已支付订单数"),
+    (SUM_WEEK, extra("(region = '华东' OR region = '华南')"), "b", "南方销售额"),
+    # 排除的写法，排除的却不是无效记录
+    (COUNT_WEEK, extra("channel <> 'offline'", COUNT_WEEK), "b", "线上订单数"),
+    (SUM_WEEK, extra("region <> '华东'"), "b", "非华东销售额"),
+    (SUM_WEEK, extra("status <> 'paid'"), "b", "未支付订单金额"),
+    (SUM_WEEK, extra("customer_id IS NOT NULL"), "b", "会员销售额"),
+])
+def test_a_metric_scope_filter_is_not_a_valid_filter(original, blind, choice, metric):
+    picked = candidate(original, blind, choice, metric=metric)
+    assert [i["aspect"] for i in picked["diff"]["items"]] == ["filter"]
+    fact, why = derive(picked, SCHEMA)
+    assert fact is None and "可能是指标自己的筛选范围" in why and metric in why
+
+
+def test_the_metric_scope_is_read_from_the_names_groups_and_inputs():
+    """排除的写法、排除的也像无效记录，但取值出现在口径说明、所在分组、运行输入里，或者用的是分组的列：拿不准，不写。"""
+    blind = extra("channel <> 'test'")
+    assert derive(candidate(SUM_WEEK, blind, "b"), SCHEMA)[0] is not None
+    for scope in ({"texts": ["只看正式渠道：不含 test 渠道的订单"]}, {"texts": ["channel = test"]},
+                  {"columns": ["channel"]}):
+        fact, why = derive(candidate(SUM_WEEK, blind, "b", scope=scope), SCHEMA)
+        assert fact is None and "可能是指标自己的筛选范围" in why, scope
+
+
+@pytest.mark.parametrize("condition, written", [
+    ("is_test = 0", "is_test = 0"),
+    ("is_test <> 1", "is_test <> 1"),
+    ("status NOT IN ('refunded', 'void')", "NOT status IN ('refunded', 'void')"),
+    ("status <> '已作废'", "status <> '已作废'"),
+])
+def test_conditions_that_drop_invalid_rows_are_valid_filters(condition, written):
+    fact, why = derive(candidate(SUM_WEEK, extra(condition), "b"), SCHEMA)
+    assert why is None and (fact.item, fact.value) == ("valid_filter", written)
+
+
+@pytest.mark.parametrize("condition", ["is_test = 1", "is_test <> 0", "status <> 9"])
+def test_conditions_that_keep_invalid_rows_or_unknown_codes_are_not(condition):
+    fact, why = derive(candidate(SUM_WEEK, extra(condition), "b"), SCHEMA)
+    assert fact is None and "可能是指标自己的筛选范围" in why
+
+
+def test_a_code_the_catalog_calls_void_counts_as_an_invalid_row():
+    notes = {"orders": {"columns": {"status": {"codes": catalog.make_item({"9": "作废", "1": "已支付"}, "human")}}}}
+    fact, why = derive(candidate(SUM_WEEK, extra("status <> 9"), "b"), SCHEMA, notes)
+    assert why is None and fact.value == "status <> 9"
+    # 码值表里写的是正常的状态：排除它就是指标自己的范围
+    fact, why = derive(candidate(SUM_WEEK, extra("status <> 1"), "b"), SCHEMA, notes)
+    assert fact is None and "可能是指标自己的筛选范围" in why
 
 
 def test_table_names_are_dropped_from_the_recorded_filter():
@@ -72,10 +165,24 @@ def test_table_names_are_dropped_from_the_recorded_filter():
     assert why is None and fact.value == "status <> 'refunded'"
 
 
-@pytest.mark.parametrize("choice, text", [("b", "对 customer_id 计数时去重"), ("a", "对 customer_id 计数时不去重")])
-def test_counting_with_or_without_distinct_becomes_the_dedup_rule(choice, text):
-    fact, why = derive(candidate(BUYERS, BUYERS_DISTINCT, choice, metric="付款客户数"), SCHEMA)
-    assert why is None and (fact.table, fact.item, fact.value) == ("orders", "dedup", text)
+def test_a_condition_across_two_tables_is_not_recorded():
+    joined = (f"SELECT SUM(o.amount) AS gmv FROM orders o JOIN customers c ON o.customer_id = c.id "
+              f"WHERE o.paid_date {WEEK}")
+    picked = candidate(joined, f"{joined} AND o.status <> c.status", "b")
+    assert [i["aspect"] for i in picked["diff"]["items"]] == ["filter"]
+    fact, why = derive(picked, SCHEMA)
+    assert fact is None and "不是只涉及一张表的列" in why
+
+
+def test_counting_distinct_becomes_the_dedup_rule():
+    fact, why = derive(candidate(BUYERS, BUYERS_DISTINCT, "b", metric="付款客户数"), SCHEMA)
+    assert why is None and (fact.table, fact.item, fact.value) == ("orders", "dedup", "对 customer_id 计数时去重")
+
+
+def test_counting_without_distinct_is_not_a_dedup_rule():
+    """采纳了不去重的一边：那是这个指标自己的算法（数行），写成表的「不去重」会把别的指标带偏。"""
+    fact, why = derive(candidate(BUYERS, BUYERS_DISTINCT, "a", metric="付款笔数"), SCHEMA)
+    assert fact is None and "被采纳的原流程没有去重" in why
 
 
 def test_more_than_one_difference_is_not_recorded():
@@ -165,14 +272,62 @@ async def test_a_confirmed_different_item_is_kept(shop):
     assert entry.version == 1 and entry.notes["business_date"]["value"]["column"] == "order_date"
 
 
-async def test_an_inferred_different_item_is_replaced(shop):
+async def test_an_inferred_condition_both_sides_use_is_extended(shop):
+    """目录里推断的「is_test = 0」两边都按它筛了，盲算另外排除了退款：合起来写，原有的条件不丢。"""
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("is_test = 0", "llm")})
+    base = f"SELECT SUM(amount) AS gmv FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
+    out = await record_choices([candidate(base, extra("status <> 'refunded'", base), "b", source=name)],
+                               run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    item = (await entry_of(source_id)).notes["valid_filter"]
+    assert item["value"] == "is_test = 0 AND status <> 'refunded'"
+    assert (item["source"], item["status"]) == ("human", "confirmed")
+
+
+async def test_a_confirmed_condition_is_not_extended(shop):
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("is_test = 0", "human", "confirmed")})
+    base = f"SELECT SUM(amount) AS gmv FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
+    out = await record_choices([candidate(base, extra("status <> 'refunded'", base), "b", source=name)],
+                               run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == []
+    reason = out["skipped"][0]["reason"]
+    assert "已有人工确认过的说法「is_test = 0」" in reason and "status <> 'refunded'" in reason and "未改动" in reason
+    entry = await entry_of(source_id)
+    assert entry.version == 1 and entry.notes["valid_filter"]["value"] == "is_test = 0"
+
+
+async def test_an_inferred_condition_the_adopted_side_does_not_use_is_kept(shop):
+    """目录里推断的「status = 'paid'」两边都没用：审核人的选择说明不了它对不对，不静默替换。"""
     name, source_id = shop
     await seed(source_id, {"valid_filter": catalog.make_item("status = 'paid'", "llm")})
+    out = await record_choices([candidate(WITH_REFUNDS, RIGHT, "b", source=name)], run_id="run-1",
+                               node_title="复核", actor=None)
+    assert out["written"] == []
+    reason = out["skipped"][0]["reason"]
+    assert "「status = 'paid'」" in reason and "被采纳的盲算没有按它筛选" in reason and "未改动" in reason
+    entry = await entry_of(source_id)
+    assert entry.version == 1 and entry.notes["valid_filter"]["value"] == "status = 'paid'"
+
+
+async def test_an_inferred_same_condition_is_confirmed(shop):
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("status <> 'refunded'", "llm")})
     out = await record_choices([candidate(WITH_REFUNDS, RIGHT, "b", source=name)], run_id="run-1",
                                node_title="复核", actor=None)
     assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}]
     item = (await entry_of(source_id)).notes["valid_filter"]
     assert item["value"] == "status <> 'refunded'" and (item["source"], item["status"]) == ("human", "confirmed")
+
+
+async def test_an_inferred_different_dedup_rule_is_kept(shop):
+    name, source_id = shop
+    await seed(source_id, {"dedup": catalog.make_item("同一订单可能有多行，按 id 去重", "llm")})
+    out = await record_choices([candidate(BUYERS, BUYERS_DISTINCT, "b", metric="付款客户数", source=name)],
+                               run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == [] and "按 id 去重" in out["skipped"][0]["reason"]
+    assert (await entry_of(source_id)).notes["dedup"]["value"] == "同一订单可能有多行，按 id 去重"
 
 
 async def test_the_same_column_inferred_is_confirmed_and_keeps_its_rule(shop):
@@ -201,6 +356,19 @@ async def test_a_rejected_item_is_not_brought_back_but_a_rejected_other_value_do
                                node_title="复核", actor=None)
     assert out["written"] == [{"source": name, "table": "orders", "item": "business_date"}]
     assert (await entry_of(source_id)).notes["business_date"]["value"] == {"column": "order_date"}
+
+
+async def test_contradictory_choices_in_one_decision_write_nothing(shop):
+    """同一次裁决里，一个指标采纳了按下单日、另一个采纳了按支付日：写哪个都是替人拿主意，都不写。"""
+    name, source_id = shop
+    out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "a", metric="销售额", source=name),
+                                candidate(BY_ORDER_DATE, RIGHT, "b", metric="复核销售额", source=name)],
+                               run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == []
+    [skipped] = out["skipped"]
+    assert "「销售额」" in skipped["reason"] and "「复核销售额」" in skipped["reason"]
+    assert "order_date" in skipped["reason"] and "paid_date" in skipped["reason"] and "互相矛盾" in skipped["reason"]
+    assert await entry_of(source_id) is None
 
 
 async def test_a_missing_source_or_an_unrecordable_choice_is_reported(shop):

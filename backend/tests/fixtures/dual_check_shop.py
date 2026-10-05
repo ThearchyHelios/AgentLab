@@ -7,6 +7,8 @@
 - 按支付日、不排除退款：1、2、3、5 号单，380.0
 - 按下单日、不排除退款：2、3、4、5 号单，360.0
 - 付款客户数（按支付日、排除退款）：按行计数 3，去重计数 2
+
+另有渠道（channel）和测试单标记（is_test，都是 0）两列：写数据目录的测试拿它们凑「指标自己的筛选范围」和标记列。
 """
 from __future__ import annotations
 
@@ -23,11 +25,11 @@ from app.db.base import SessionLocal
 from app.db.models import DataSource
 
 ROWS = [
-    (1, "华东", 101, 100.0, "paid", "2026-08-31", "2026-09-01"),
-    (2, "华东", 102, 200.0, "paid", "2026-09-02", "2026-09-02"),
-    (3, "华南", 101, 50.0, "refunded", "2026-09-03", "2026-09-03"),
-    (4, "华南", 103, 80.0, "paid", "2026-09-07", "2026-09-08"),
-    (5, "华北", 102, 30.0, "paid", "2026-09-05", "2026-09-05"),
+    (1, "华东", 101, 100.0, "paid", "2026-08-31", "2026-09-01", "online", 0),
+    (2, "华东", 102, 200.0, "paid", "2026-09-02", "2026-09-02", "offline", 0),
+    (3, "华南", 101, 50.0, "refunded", "2026-09-03", "2026-09-03", "online", 0),
+    (4, "华南", 103, 80.0, "paid", "2026-09-07", "2026-09-08", "online", 0),
+    (5, "华北", 102, 30.0, "paid", "2026-09-05", "2026-09-05", "offline", 0),
 ]
 WEEK = "BETWEEN '2026-09-01' AND '2026-09-07'"
 #: 口径说明要的写法：按支付日、排除退款
@@ -52,8 +54,8 @@ def build(path: Path) -> Path:
     db = sqlite3.connect(path)
     db.executescript(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT, customer_id INTEGER, amount REAL, status TEXT, "
-        "order_date TEXT, paid_date TEXT);")
-    db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?)", ROWS)
+        "order_date TEXT, paid_date TEXT, channel TEXT, is_test INTEGER);")
+    db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ROWS)
     db.commit()
     db.close()
     return path
@@ -80,18 +82,22 @@ def _text(messages) -> str:
 class Blind:
     """盲算模型的剧本，也管图里别的模型调用。
 
-    plans：{任务里出现的指标名: (SQL, 要交的列) 或 [SQL, …]、列}。盲算循环里依次查这几条 SQL，收尾时交最后一条查询的
-    第 0 行那一列（row 可改）。没对上指标名的盲算交 null。不是盲算的调用（报告撰写）返回 writer 的正文并记下收到的消息。
-    calls 记下每次盲算调用（step / final），tasks 记下盲算收到的任务原文。
+    plans：{任务里出现的指标名: (SQL, 要交的列) 或 [SQL, …]、列}。键写成「指标名|输入2」时只认计算式里那一项的盲算
+    （一个指标有几个输入来自查询时用）。盲算循环里依次查这几条 SQL，收尾时交最后一条查询的第 0 行那一列（row 可改）。
+    没对上指标名的盲算交 null。不是盲算的调用（报告撰写）返回 writer 的正文并记下收到的消息。
+    calls 记下每次盲算调用（step / final），tasks 记下盲算收到的任务原文（几个盲算同时进行时也是每个任务一条）。
+    on_query：盲算第一次查库之前调用一次（比如往库里插一行，造出「两次取数之间数据变了」）。
     """
 
-    def __init__(self, monkeypatch, source: str, plans: dict, *, writer: str = "本周销售额见口径卡。", row: int = 0):
+    def __init__(self, monkeypatch, source: str, plans: dict, *, writer: str = "本周销售额见口径卡。", row: int = 0,
+                 on_query=None):
         from app.providers import mock_model
 
         self.source = source
         self.plans = plans
         self.writer = writer
         self.row = row
+        self.on_query = on_query
         self.calls: list[str] = []
         self.tasks: list[str] = []
         self.writer_prompts: list[str] = []
@@ -114,11 +120,14 @@ class Blind:
                 blind.calls.append("step")
                 # 盲算的任务是第一条用户消息；同一次盲算的几轮收到的是同一条，只记一次
                 task_text = next((str(m.content) for m in messages if m.type == "human"), "")
-                if not blind.tasks or blind.tasks[-1] != task_text:
+                if task_text not in blind.tasks:
                     blind.tasks.append(task_text)
                 done = sum(isinstance(m, ToolMessage) for m in messages)
                 sqls = blind.sqls(plan) if plan is not None else []
                 if done < len(sqls):
+                    if blind.on_query is not None:
+                        hook, blind.on_query = blind.on_query, None
+                        hook()
                     call = {"name": f"db_query__{blind.source}", "args": {"sql": sqls[done]},
                             "id": f"blind-{uuid.uuid4().hex[:6]}"}
                     return AIMessage(content="查一下。", tool_calls=[call])
@@ -129,8 +138,9 @@ class Blind:
         monkeypatch.setattr(mock_model.MockChatModel, "_decide", decide)
 
     def plan_of(self, text: str):
-        for name, plan in self.plans.items():
-            if f"指标：{name}" in text:
+        for key, plan in self.plans.items():
+            name, _, label = key.partition("|")
+            if f"指标：{name}" in text and (not label or f"计算式里的 {label}" in text):
                 return plan
         return None
 
