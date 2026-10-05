@@ -9,8 +9,8 @@ Webhook 地址本身就是凭证（企业微信的 key、钉钉的 access_token 
 一个过滤器把推送期间的那几行换成主机名。
 
 通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
-另写失败节点的名字。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook 推去的群
-不一定有权看。
+另写失败节点的名字和去哪里查看（不许诺能继续运行）。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着
+查询到的数据，Webhook 推去的群不一定有权看。
 
 三个平台出错时都回 HTTP 200、错误码放在响应体里，所以送没送达要看响应体：按地址的主机认平台，不看选的格式——
 格式选错了（飞书的地址选了通用格式）正是最需要认出来的情形。群机器人的地址只认自己平台的格式，保存时就拦下
@@ -52,7 +52,8 @@ EVENT_LABEL = {"finished": "运行结束", "failed": "运行失败", "awaiting_a
 TIMEOUT_S = 10.0
 #: 失败后再试 3 次，每次之前等这么久（秒）。4xx（429 除外）不重试：地址或参数错了，重试也一样
 RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
-#: 只看这么多天内的触发：更早的运行状态不会再变，不用每一拍都扫
+#: 只看这么多天内的触发：更早结束的运行状态不会再变，不用每一拍都扫。例外见 notify_due：停在审批上、有待审批的不受
+#: 这个限制，运行记录这些天内有过变化的也照扫——审批可以等上一个多月，批完接着执行、停到下一个审批点或跑完都要推
 SCAN_DAYS = 30
 #: 运行结束后等封存（清单哈希）最多等多久。runner 先写终态再封存，两步之间被这一拍撞上就等下一拍
 SEAL_WAIT_S = 60
@@ -65,6 +66,14 @@ _STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "cancelled": "已
 #: 挂起的运行要人去处理：不处理，这个任务之后的触发都按「上一次还没结束」跳过
 SUSPENDED_REASON = "运行停在断点上、没有待审批，通常是服务重启所致"
 SUSPENDED_ACTION = "请在 AgentLab 的「记录」中继续运行或放弃这次运行；它结束之前，这个定时任务之后的触发都会跳过"
+#: 失败的运行怎么处理：不许诺「修正后可继续运行」。没开始执行的没有断点；开始执行过的也可能没有（执行第一个节点前就
+#: 失败）或已不兼容（系统升级），能不能继续以记录页的提示为准
+FAILED_ACTION = "请在 AgentLab 的运行记录中查看原因"
+#: 从没开始执行就失败的（服务重启时还在排队，被改成失败、没有开始时间）：没有可继续的进度。不照抄运行记录上的报错——
+#: 通知一律不放原始报错，这一句是按「没有开始时间」认出来的，自己写
+NOT_STARTED_REASON = "运行在开始执行前就已中止（通常是服务重启时仍在排队），没有可继续的进度"
+#: 失败的运行不挡之后的触发（挂起的才挡）：任务还在排期上时补这一句，免得人以为这个定时任务就此停了
+NEXT_AS_USUAL = "下一次触发会照常发起"
 
 
 # --------------------------------------------------------------------------
@@ -217,6 +226,7 @@ class Notice:
     failed_to_start。没有的项为 None。
 
     suspended：运行停在断点上、没有待审批（通常是服务重启挂起的），按 failed 事件推。error_node：失败节点的名字。
+    next_fire：任务启用着、往后还会触发（失败通知据此补「下一次触发会照常发起」）。
     fmt、signed 只给测试消息用：说明里只说这条消息证明得了的事。"""
 
     event: str
@@ -238,8 +248,14 @@ class Notice:
     pending_approvals: int | None = None
     suspended: bool = False
     error_node: str | None = None
+    next_fire: bool = False
     fmt: str | None = None
     signed: bool = False
+
+    @property
+    def never_started(self) -> bool:
+        """失败的运行从没开始执行（没有开始时间）：服务重启时还在排队、被改成失败的就是这种，没有断点可续。"""
+        return self.status == "failed" and self.run_id is not None and self.started_at is None
 
 
 def _local(moment: datetime | None, tz: str, *, seconds: bool = True) -> str | None:
@@ -282,7 +298,9 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         # 不写原始报错（可能带着查询到的数据），写失败节点的名字和去哪里处理
         if notice.error_node:
             lines.append(("失败节点", f"「{notice.error_node}」"))
-        lines.append(("处理", "请在 AgentLab 的运行记录中查看报错，修正后可继续运行"))
+        if notice.never_started:
+            lines.append(("原因", NOT_STARTED_REASON))
+        lines.append(("处理", f"{FAILED_ACTION}；{NEXT_AS_USUAL}" if notice.next_fire else FAILED_ACTION))
     if notice.fire_at is not None:
         when = f"{_local(notice.fire_at, notice.timezone, seconds=False)}（{notice.timezone}）"
         # 立即运行不写「计划触发」：群里的人会以为报告按时出了
@@ -375,7 +393,8 @@ def _generic(notice: Notice, now: datetime) -> dict[str, Any]:
         "started_at": _iso(notice.started_at),
         "finished_at": _iso(notice.finished_at),
         "reason": (notice.reason if notice.status == "failed_to_start"
-                   else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended else None),
+                   else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended
+                   else NOT_STARTED_REASON if notice.never_started else None),
         "error_node": notice.error_node,
         "sent_at": _iso(now),
     }
@@ -566,13 +585,18 @@ async def notify_due(now: datetime | None = None) -> int:
     """
     now = now or utcnow()
     jobs: list[_Job] = []
+    cutoff = now - timedelta(days=SCAN_DAYS)
+    # 扫描窗口按触发记录的创建时间算，两种例外：运行记录窗口内有过变化（运行状态一变 updated_at 就跟着变），以及
+    # 停在审批上、有待审批的——以前只看触发记录，创建 30 天以后才停到审批上的运行收不到「等待审批」
+    waiting = select(Approval.id).where(Approval.run_id == Run.id, Approval.status == "pending").exists()
     # 和发起共用一把锁：发起时先记一条「未能发起」再发起运行、成功了才改成 started，扫描不能撞在这中间
     async with service.launch_lock():
         async with SessionLocal() as session:
             rows = (await session.execute(
                 select(ScheduleFire, Run)
                 .outerjoin(Run, Run.id == ScheduleFire.run_id)
-                .where(ScheduleFire.created_at >= now - timedelta(days=SCAN_DAYS), or_(
+                .where(or_(ScheduleFire.created_at >= cutoff, Run.updated_at >= cutoff,
+                           and_(Run.status == "interrupted", waiting)), or_(
                     and_(ScheduleFire.status == "failed_to_start", ScheduleFire.notified_status.is_(None)),
                     and_(ScheduleFire.status == "started", Run.status.in_(_WATCHED),
                          or_(ScheduleFire.notified_status.is_(None), ScheduleFire.notified_status != Run.status)),
@@ -664,6 +688,7 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         pending_approvals=pending or None,
         suspended=run is not None and run.status == "interrupted" and not pending,
         error_node=_failed_node(run) if run is not None and run.status == "failed" else None,
+        next_fire=bool(schedule.enabled and schedule.next_run_at is not None),
     )
 
 
