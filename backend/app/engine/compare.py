@@ -22,12 +22,13 @@
   - cell() 那一格、Agent 按出处交来的字段落在哪份快照上就是哪条查询，两边各自的快照直接比 SQL；快照是合并查询的
     结果时，再按别名一路追到喂它的每一份上游快照。只差字面量时还要看图里的 SQL：图里的 SQL 改过（改了写死的筛选值、
     系数）是模板变化，图里一字未改的才是运行时代入的参数
-  - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了）：取哪一列、哪几行是 Agent 每次
-    运行时定的，换了就不是同一个数
+  - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了；行段相同、一边是整份结果一边
+    不是的算换了）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是同一个数
   - 不落在快照上的：模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）没有出处，值变了说不清是数据还是它
-    本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游，上游的查询结果两次
-    一模一样、值却变了的同样说不清
-  - 图级的变化落到节点上：连线有增删的，终点节点算改了；默认设置改了的，没有自行设置这几项的模型类节点算改了
+    本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游。上游的查询结果两次
+    一模一样、值却变了的同样说不清；上游有模型、人交出值的节点、两次交出的不同的也说不清
+  - 图级的变化落到节点上：连线有增删的，终点节点算改了；默认设置改了的，运行时会读这几项（_CFG_KEYS）、又没有自行
+    设置的节点算改了
 - 严格拆分（只对口径变了的）：旧表达式的每个叶子路径都能在这次的口径卡输入里取得值时，
   口径效应 = f_new(x_new) − f_old(x_new)，数据效应 = f_old(x_new) − f_old(x_old)。f_old(x_new) 用推演重算
   （engine/recompute.py）的还原和求值算，取整按旧口径卡的小数位；三个数按十进制精确相减，两效应之和逐位等于
@@ -88,12 +89,49 @@ _RATIO = "percent_of_ratio"
 #: 图里写 SQL 的配置项：调用工具节点的参数、合并查询的合并 SQL
 _SQL_KEY = {"tool": "args.sql", "merge": "sql"}
 #: 交出的值由模型或人给出的节点（类型、口径卡记的来历）：同样的输入、同样的配置，交出的值也可能不同
-_GENERATED = frozenset({"agent", "llm", "supervisor", "human", "memory", "retrieve", "subgraph"})
-_GENERATED_VIA = frozenset({"agent", "agent_field", "llm", "team", "human", "memory", "retrieval", "subgraph"})
-#: 图级默认设置只有模型类节点在读（节点没配 provider、model 时回退到它，GraphSpec.defaults）
-_MODEL_TYPES = frozenset({"llm", "agent", "supervisor"})
+_GENERATED = frozenset({"agent", "llm", "supervisor", "human", "memory", "retrieve", "subgraph", "report"})
+_GENERATED_VIA = frozenset({"agent", "agent_field", "llm", "team", "human", "memory", "retrieval", "subgraph",
+                            "report"})
+#: 调模型时读的配置项（nodes/llm._model_spec）
+_MODEL_KEYS = frozenset({"provider", "model", "temperature", "max_tokens", "thinking", "effort"})
+#: 各类节点运行时按 NodeContext.cfg 读的配置项：节点上没写这一项就回退到图级默认设置（GraphSpec.defaults），默认
+#: 设置改了这一项，没自行设置它的这类节点交出的值可能跟着变；不读它的不受影响（结论句裁判只有报告节点读）。读了也
+#: 不影响交出的值的见 _QUIET_DEFAULTS。合并查询、双盲复算、反方审稿不经 cfg 读配置。执行器新读了一项要在这里登记，
+#: tests/test_compare_engine.py 按源码核对
+_CFG_KEYS: dict[str, frozenset[str]] = {
+    "input": frozenset({"fields"}),
+    "output": frozenset({"fields", "contract"}),
+    "transform": frozenset({"mode", "expression", "template", "assign_to"}),
+    "llm": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "emit_message", "assign_to"},
+    "agent": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "cite_fields", "tools",
+                            "memory_scope", "collection", "parallel_tools", "max_steps", "budget_tokens",
+                            "budget_usd", "approval", "emit_message", "assign_to"},
+    "supervisor": frozenset({"agents", "max_rounds", "on_exhausted", "goal", "provider", "model", "max_tokens",
+                             "max_parallel", "approval", "emit_message", "assign_to"}),
+    "subgraph": frozenset({"workflow_id", "workflow_version", "input", "assign_to"}),
+    "tool": frozenset({"tool", "args", "fail_fast", "memory_scope", "collection", "approval", "assign_to"}),
+    "code": frozenset({"code", "evidence_role", "language", "timeout", "memory_mb", "network", "isolation", "files",
+                       "fail_fast", "approval", "assign_to"}),
+    "branch": frozenset({"cases", "mode"}),
+    "loop": frozenset({"mode", "max_iterations", "item_var", "items", "condition"}),
+    "human": frozenset({"mode", "title", "message", "schema", "context", "draft", "stop_on_reject", "assign_to"}),
+    "validate": frozenset({"schema", "source", "max_retries", "repair_with_llm", "fail_fast", "assign_to"}),
+    "memory": frozenset({"action", "scope", "query", "limit", "kind", "content", "importance", "assign_to"}),
+    "retrieve": frozenset({"query", "collection", "limit", "alpha", "rerank", "min_score", "assign_to"}),
+    "metrics": frozenset({"metrics", "caliber", "caliber_version", "on_missing", "assign_to"}),
+    "report": _MODEL_KEYS | {"numbers", "claims", "judge", "entities", "max_repairs", "system", "instructions",
+                             "on_violation", "evidence_from", "metrics_from", "emit_message", "assign_to"},
+}
+#: 只在调模型时才读的（_calls_model）：条件分支让模型分类、结构校验让模型修复（默认开着）、知识检索用模型重排
+_CFG_KEYS_IF: dict[str, frozenset[str]] = {
+    "branch": frozenset({"input", "instruction", "provider", "model"}),
+    "validate": frozenset({"provider", "model"}),
+    "retrieve": _MODEL_KEYS,
+}
 #: 改了也不影响交出的值的默认设置：审批策略只管调用工具前问不问人
 _QUIET_DEFAULTS = frozenset({"approval"})
+#: 配置键的叫法，engine/labels 里没有的这两个：节点类型；模型服务叫「模型接入」（lib/terms.ts），不写 provider
+_KEY_LABEL = {"type": "节点类型", "provider": "模型接入"}
 #: 浮点能原样写回的十进制有效数字位数（DBL_DIG）
 _FLOAT_DIGITS = 15
 
@@ -265,6 +303,16 @@ def _queries(side: Side) -> list[_Query]:
                 add(node_id, artifact, entry.get("tool"), entry.get("call_id"), merged.get(node_id),
                     entry.get("source"))
     return out
+
+
+def _outputs(side: Side) -> dict[str, tuple[Any, ...]]:
+    """每个节点在封存范围内交出的产出工件（node.finished 的 artifact），按执行的先后。工件按内容寻址：两次运行的同一个
+    节点交出的一模一样，工件 id 就一样。产出没落成工件的记 None，核对不了。"""
+    out: dict[str, list[Any]] = {}
+    for _, etype, node_id, data in side.events:
+        if etype == EventType.NODE_FINISHED and node_id and isinstance(data, dict):
+            out.setdefault(node_id, []).append(data.get("artifact"))
+    return {node_id: tuple(found) for node_id, found in out.items()}
 
 
 def _pair(base: list[_Query], target: list[_Query],
@@ -563,12 +611,35 @@ def _config_keys(was: dict[str, Any], now: dict[str, Any]) -> tuple[list[str], b
 
 
 def _key_label(key: str, node_type: Any) -> str:
-    return "节点类型" if key == "type" else field_label(key, node_type)
+    return _KEY_LABEL.get(key) or field_label(key, node_type)
 
 
 def _unset(value: Any) -> bool:
     """节点上没写这一项：运行时回退到图级默认设置（NodeContext.cfg 同一个规则）。"""
     return value in (None, "")
+
+
+def _reads(node: dict[str, Any], defaults: dict[str, Any]) -> frozenset[str]:
+    """这个节点运行时按 NodeContext.cfg 读的配置项（_CFG_KEYS）。条件分支、结构校验、知识检索调不调模型看它那次的
+    设置，调模型的才读模型那几项。"""
+    kind = str(node.get("type"))
+    keys = _CFG_KEYS.get(kind, frozenset())
+    if kind in _CFG_KEYS_IF and _calls_model(kind, node, defaults):
+        keys = keys | _CFG_KEYS_IF[kind]
+    return keys
+
+
+def _calls_model(kind: str, node: dict[str, Any], defaults: dict[str, Any]) -> bool:
+    """条件分支是让模型分类、结构校验让模型修复（默认开着）、知识检索用模型重排：和执行器同一个判断、同一个缺省。"""
+    def cfg(key: str, default: Any) -> Any:
+        value = _config(node).get(key)
+        return defaults.get(key, default) if _unset(value) else value
+
+    if kind == "branch":
+        return cfg("mode", "expression") == "llm"
+    if kind == "validate":
+        return bool(cfg("repair_with_llm", True))
+    return (cfg("rerank", "off") or "off") == "model"
 
 
 def _graph_sql(node: dict[str, Any] | None) -> tuple[str, str | None] | None:
@@ -641,9 +712,12 @@ class _Compare:
         self.base_nodes, self.target_nodes = _nodes(base.graph), _nodes(target.graph)
         self.base_queries, self.target_queries = _queries(base), _queries(target)
         self.pairs = _pair(self.base_queries, self.target_queries, self._norm_of)
-        self.template, self.changed = self._template()
+        self.template, self.changed, self.inherited = self._template()
         self.titles = {**{k: self._title_of(n) for k, n in self.base_nodes.items()},
                        **{k: self._title_of(n) for k, n in self.target_nodes.items()}}
+        #: 画布上的先后（这次运行的图在前）：说明里点名上游节点时按它挑第一个
+        self.order = {n: i for i, n in enumerate(dict.fromkeys([*self.target_nodes, *self.base_nodes]))}
+        self.base_outputs, self.target_outputs = _outputs(base), _outputs(target)
         self.parents: dict[str, set[str]] = {}
         for source, target_id, _ in _edges(base.graph) | _edges(target.graph):
             self.parents.setdefault(target_id, set()).add(source)
@@ -865,9 +939,25 @@ class _Compare:
     def _moved(self, node_id: str) -> str:
         """一个影响取值的节点变化（self.changed）写成一句话。"""
         name = f"上游节点「{self.title(node_id)}」"
-        return {"added": f"{name}是这次新增的", "removed": f"{name}这次被删除了", "edges": f"{name}的连线有变化",
-                "defaults": f"工作流默认设置有变化，{name}没有单独设置这些项，随之改变"
-                }.get(self.changed.get(node_id, ""), f"{name}的配置有变化")
+        change = self.changed.get(node_id, "")
+        if change == "defaults":
+            keys = self.inherited.get(node_id, [])
+            shown = "、".join(_key_label(k, self._type_of(node_id)) for k in keys[:3])
+            more = f"等 {len(keys)} 项" if len(keys) > 3 else ""
+            return f"{name}跟随的工作流默认设置（{shown}{more}）有变化"
+        return {"added": f"{name}是这次新增的", "removed": f"{name}这次被删除了",
+                "edges": f"{name}的连线有变化"}.get(change, f"{name}的配置有变化")
+
+    def _ordered(self, nodes: Iterable[str]) -> list[str]:
+        """按画布上的先后排（这次运行的图在前）。"""
+        return sorted(nodes, key=lambda n: self.order.get(n, len(self.order)))
+
+    def _regenerated(self, node_id: str) -> bool:
+        """模型、人交出值的节点（_GENERATED）两次交出的产出不同，或者核对不了。一模一样的没带进它本身的差异。"""
+        if self._type_of(node_id) not in _GENERATED:
+            return False
+        before, after = self.base_outputs.get(node_id, ()), self.target_outputs.get(node_id, ())
+        return before != after or None in before or None in after
 
     def provenance(self, path: str, b: Any, t: Any, *, moved: bool = True) -> _Change:
         """一个输入的出处在两次运行之间变没变（b、t 是推演重算还原出来的输入）。moved 是这个指标的值变没变：输入是
@@ -904,11 +994,19 @@ class _Compare:
             return _Change("template", self._moved(writer))
         # 写它的节点不查库（代码、数据整形……）：看画布上它的全部上游；写它的节点不知道就看整张图
         scope = self._upstream(writer) if writer else set(self.titles)
-        moved_nodes = [n for n in scope if n in self.changed]
+        moved_nodes = self._ordered(n for n in scope if n in self.changed)
         worst = _worst(self._query_change(b2, t2) for b2, t2 in self.pairs if (t2 or b2).node_id in scope)
         where = f"来自「{self.title(writer)}」" if writer else "不知道由哪个节点写入"
-        if moved_nodes or worst.kind in ("sql", "template", "unknown"):
+        if moved_nodes:
+            return _Change("unknown", f"输入「{path}」{where}，{self._moved(moved_nodes[0])}，无法判断变化来源")
+        if worst.kind in ("sql", "template", "unknown"):
             return _Change("unknown", f"输入「{path}」{where}，对不上具体的查询；它的上游有变化，无法判断变化来源")
+        if not same and (spoken := self._ordered(n for n in scope if self._regenerated(n))):
+            # 上游有模型、人交出的值，两次不同：它交的数变了，可能是数据变了，也可能是模型本身的差异（它可能用的
+            # 正是 Agent 没按出处交的数）。上游的查询结果变没变都一样说不清
+            kind = TYPE_LABEL.get(self._type_of(spoken[0]) or "", "节点")
+            return _Change("unknown", f"输入「{path}」{where}，它的上游节点「{self.title(spoken[0])}」（{kind}）两次"
+                                      "交出的结果不同，无法判断变化是否来自数据")
         if worst.kind == "same" and not same and not self._data_moved(scope):
             # 上游查到的数据两次一模一样，它交的值却变了：不是数据变的。上游只有运行输入变了的，算参数
             if (self.base.inputs or {}) != (self.target.inputs or {}) \
@@ -939,16 +1037,35 @@ class _Compare:
         return change
 
     def _citation(self, agent: Any, b: Any, t: Any, qb: _Query, qt: _Query) -> _Change | None:
-        """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。行段不同、但
-        两边引用的都是整份结果（这次多了几行）的算同一处。不是同一处返回说明。"""
+        """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。两边引用的都是
+        整份结果的算同一处（这次多了几行也是）；行段相同、一边是整份结果一边不是的不算——没引用的那几行还在这次的快照
+        里，按维度配对会把它们算成「数据没了」。不是同一处、核对不了是不是同一处的，返回说明。"""
         name = f"Agent「{self.title(agent)}」" if agent else "Agent"
         lb, lt = _locator(b), _locator(t)
         cb, ct = lb.get("column") or lb.get("columns"), lt.get("column") or lt.get("columns")
         if cb != ct:
             return _Change("unknown", f"{name}引用的列由{_columns_text(cb)}改为{_columns_text(ct)}，取的不是同一个数")
-        if (b.row, b.rows) == (t.row, t.rows) or (b.row is None and t.row is None and _whole(b, qb) and _whole(t, qt)):
+        what = "同一个数" if b.row is not None and t.row is not None else "同一组数"
+        changed = _Change("unknown", f"{name}引用的行由{_rows_text(b)}改为{_rows_text(t)}，取的不是{what}")
+        if b.row is not None or t.row is not None:
+            # 单格（数组字段里的一个元素、按出处交的一格）：取哪一行由口径卡的下标和 Agent 交的行段一起定，同一行才是
+            # 同一处
+            return None if (b.row, b.rows) == (t.row, t.rows) else changed
+        wb, wt = _whole(b, qb), _whole(t, qt)
+        same_span = b.rows == t.rows
+        if (wb and wt) or (same_span and wb is False and wt is False):
             return None
-        return _Change("unknown", f"{name}引用的行由{_rows_text(b)}改为{_rows_text(t)}，取的不是同一组数")
+        if (wb is None or wt is None) and (same_span or (wb is not False and wt is not False)):
+            # 快照读不出来，核对不了是不是整份结果：行段相同的可能一边整份一边不是，行段不同的也可能两边都是整份
+            side = "基准运行" if wb is None else "这次运行"
+            return _Change("unknown", f"{side}的查询快照无法读取，无法核对 {name}引用的是不是整份结果")
+        if not same_span:
+            return changed
+        if wb:
+            return _Change("unknown", f"{name}在基准运行中引用了整份结果，这次只引用了{_rows_text(t)}"
+                                      f"（结果共 {len(qt.snap['rows'])} 行），取的不是同一组数")
+        return _Change("unknown", f"{name}在基准运行中只引用了{_rows_text(b)}（结果共 {len(qb.snap['rows'])} 行），"
+                                  "这次引用了整份结果，取的不是同一组数")
 
     def _generated(self, path: str, writer: str, same: bool) -> _Change:
         """模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）：没有出处，值变了说不清是数据变了还是它本身的
@@ -982,15 +1099,17 @@ class _Compare:
 
     # ---------------------------------------------------------------- 模板
 
-    def _template(self) -> tuple[dict[str, Any], dict[str, str]]:
+    def _template(self) -> tuple[dict[str, Any], dict[str, str], dict[str, list[str]]]:
         """两次运行的图快照比较：新增、删除的节点，配置有变化的节点和配置项名（不展示值）。
 
         changed 是影响取值的变化，判断输入的出处时用：节点 → added / removed / config / edges / defaults。只改名称的
         不算；图里的 SQL 只改了空白、大小写的不算（规范化以后一模一样）。图级的变化也落到节点上：连线有增删的，终点
-        节点交出的值可能变了（接进来的东西、执行的条件变了）；默认设置改了的，没有自行设置这几项的模型类节点跟着变。"""
+        节点交出的值可能变了（接进来的东西、执行的条件变了）；默认设置改了的，运行时会读这几项（_reads）、又没有自行
+        设置的节点跟着变，inherited 记着各自跟着变的是哪几项。"""
         before, after = self.base_nodes, self.target_nodes
         nodes: list[dict[str, Any]] = []
         changed: dict[str, str] = {}
+        inherited: dict[str, list[str]] = {}
 
         def entry(node_id: str, node: dict[str, Any], change: str, keys: list[str]) -> dict[str, Any]:
             return {"node_id": node_id, "title": self._title_of(node), "change": change, "keys": keys,
@@ -1023,9 +1142,14 @@ class _Compare:
                      if defaults_before.get(k) != defaults_after.get(k) and k not in _QUIET_DEFAULTS]
         for node_id, node in after.items():
             was = before.get(node_id)
-            if differing and was is not None and str(node.get("type")) in _MODEL_TYPES and any(
-                    _unset(_config(node).get(k)) and _unset(_config(was).get(k)) for k in differing):
+            if not differing or was is None:
+                continue
+            reads = _reads(was, defaults_before) | _reads(node, defaults_after)
+            hit = [k for k in differing
+                   if k in reads and _unset(_config(node).get(k)) and _unset(_config(was).get(k))]
+            if hit:
                 changed.setdefault(node_id, "defaults")
+                inherited[node_id] = hit
         same_edges = edges_before == edges_after
         same_defaults = defaults_before == defaults_after
         if not same_edges:
@@ -1033,7 +1157,7 @@ class _Compare:
         if not same_defaults:
             self.notes.append(DEFAULTS_CHANGED)
         return {"base_version": self.base.run.get("version"), "target_version": self.target.run.get("version"),
-                "same_graph": not nodes and same_edges and same_defaults, "nodes": nodes}, changed
+                "same_graph": not nodes and same_edges and same_defaults, "nodes": nodes}, changed, inherited
 
     # ---------------------------------------------------------------- 指标
 
@@ -1422,11 +1546,14 @@ def _same_input(b: Any, t: Any) -> bool | None:
     return recompute._same(b.item.get("value"), t.item.get("value"))
 
 
-def _whole(inp: Any, q: _Query) -> bool:
-    """这个输入引用的是整份查询结果：数组字段的行段从第一行到最后一行，或者容器本身就是整份结果。"""
+def _whole(inp: Any, q: _Query) -> bool | None:
+    """这个输入引用的是不是整份查询结果：容器本身就是整份结果，或者数组字段的行段从第一行到最后一行。快照读不出来、
+    不知道结果共几行的返回 None。"""
     if inp.table:
         return True
-    return inp.rows is not None and q.snap is not None and inp.rows == (0, len(q.snap["rows"]) - 1)
+    if q.snap is None:
+        return None
+    return inp.rows is not None and inp.rows == (0, len(q.snap["rows"]) - 1)
 
 
 def _rows_text(inp: Any) -> str:

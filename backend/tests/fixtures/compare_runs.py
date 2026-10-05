@@ -38,10 +38,13 @@ def chain(*nodes):
     return {"nodes": list(nodes), "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
 
 
-def weekly_graph(sql=None, *, between=(), card_label="周报口径卡"):
+def weekly_graph(sql=None, *, between=(), after_fetch=(), card_label="周报口径卡"):
+    """一条链：开始 → 取数 → [after_fetch] → Agent → [between] → 口径卡 → 写周报 → 成果。after_fetch 里的节点不在
+    Agent 的下游（它的上游只有取数节点），between 里的在。"""
     return chain(
         node("start", "input", "开始"),
         node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": sql or region_sql()}),
+        *after_fetch,
         node("bot", "agent", "区域分析", prompt="按区域列出金额", tools=[TOOL], cite_fields=True),
         *between,
         node("card", "metrics", card_label, caliber="周报口径", caliber_version="v1"),
