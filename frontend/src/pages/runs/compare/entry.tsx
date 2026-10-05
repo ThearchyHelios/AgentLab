@@ -23,7 +23,8 @@ const NOTE_DELAY_MS = 300
  * 里没保存就运行的，和工作流删掉之后 workflow_id 被置空的（服务端找不到同一工作流的运行，手动选也是 422）。
  *
  * 菜单点完就收起：查找慢于一眨眼时挂一条提示，接口慢的时候不至于像没反应。离开运行详情（组件卸载）时取消请求、
- * 收起提示，晚到的答复不再把人带去对比页。
+ * 收起提示，晚到的答复不再把人带去对比页。卸载取消不了全部：地址已经换了、新页面还没画出来（路由按过渡渲染）的那一下
+ * 答复回来，组件还在，请求也没取消。所以答复回来时再看一眼地址：人已经不在点菜单时的那个运行详情上，就不跳、也不提示。
  *
  * 写成 hook（返回造菜单项的函数）：运行详情里有提前返回，菜单项本身只能在拿到运行之后造，查找中的状态得在那之前就挂上
  */
@@ -49,6 +50,9 @@ export function useCompareEntry(): (run: Run, live: boolean) => MenuItem {
       hint: orphan ? T.menuNoWorkflow : unsealed ? T.menuSealedOnly : busy ? T.menuFinding : undefined,
       onSelect: () => {
         const ctrl = new AbortController()
+        // 点菜单时所在的运行详情。只比路径：同一页里换视图、改列表筛选（改查询串）不算离开
+        const from = window.location.pathname
+        const left = () => ctrl.signal.aborted || window.location.pathname !== from
         let note: number | null = null
         const timer = setTimeout(() => {
           note = toast.info(T.menuFinding, { sticky: true, key: `compare-finding:${run.id}` })
@@ -60,11 +64,11 @@ export function useCompareEntry(): (run: Run, live: boolean) => MenuItem {
         pending.current = { ctrl, stop }
         setBusy(true)
         api.compare.base(run.id, { signal: ctrl.signal }).then((found) => {
-          if (ctrl.signal.aborted) return
+          if (left()) return
           const via: CompareVia = { base: found.base_run_id, reason: found.reason }
           navigate(comparePath(run.id, found.base_run_id), { state: via })
         }, (e: unknown) => {
-          if (ctrl.signal.aborted) return
+          if (left()) return
           if (e instanceof ApiError && e.kind === 'http' && e.status === 404) {
             toast.info(e.message, { action: { label: T.pickManually, onClick: () => navigate(comparePath(run.id)) } })
           } else {

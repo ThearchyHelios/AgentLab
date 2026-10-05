@@ -68,7 +68,9 @@ export function ComparePage() {
     targetUnsealed: targetRun.state === 'ok' && !targetRun.data?.manifest_hash,
     targetGone: targetRun.state === 'error' && isGone(targetRun.error),
     baseGone: baseRun.state === 'error' && isGone(baseRun.error),
-    pickable: candidates.state === 'ok' ? (candidates.data ?? []).some((r) => r.id !== target && !!r.manifest_hash) : null,
+    // 能换的：已封存、不是本次、也不是当前的基准（409 时出问题的可能正是它）
+    pickable: candidates.state === 'ok'
+      ? (candidates.data ?? []).some((r) => r.id !== target && r.id !== base && !!r.manifest_hash) : null,
   }
 
   return (

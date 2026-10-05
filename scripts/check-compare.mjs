@@ -7,10 +7,12 @@
 // 404（找不到基准）只弹一句通用报错；窄屏（390px）被表格撑出横向滚动；浅色下分类标签、差异高亮看不清。
 // 还有几处照服务端（engine/compare.py、api/compare.py）的实际输出才看得出来的：无法比较的指标原因只在 reasons 里；
 // 同一节点两条查询的 (node_id, ordinal) 相同；一边的 SQL 是 null；基准运行读不到；本次的记录读不到；不属于已保存
-// 工作流的运行；查找基准期间离开运行详情。下一步的提示要和页面上真能做的事对得上。
+// 工作流的运行；查找基准期间离开运行详情（新页面画好之后、或者地址刚换新页面还没画出来时答复才回来，走过的地址里
+// 都不能出现对比页）。下一步的提示要和页面上真能做的事对得上：下拉里没有能换的运行就不叫人去上方换，本次的记录
+// 不存在时不给注定失败的「重试」。
 //
 // 全部用 page.route 假接口：虚构的「区域销售周报」三次已封存的正式运行和一次没封存的，运行详情、运行列表、
-// compare/base、compare 都在浏览器层答掉，别的 GET 放行（外壳要的工作流、待审批），非 GET 一律拦掉。
+// compare/base、compare、定时任务列表都在浏览器层答掉，别的 GET 放行（外壳要的工作流、待审批），非 GET 一律拦掉。
 // 运行对比的两个接口只读，这里的假答复严格照接口约定的字段名和形状。
 //
 //   node scripts/check-compare.mjs
@@ -181,6 +183,8 @@ const LABEL = { unchanged: '未变', data_only: '只数据变', caliber_and_data
 const ORDER = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed', 'incomparable', 'unchanged']
 const REASON = '默认基准：同一定时任务的上一次运行'
 const FINDING = '正在查找上一次运行'
+/** 409、422、缺基准的 404 时下拉里没有能换的运行：不叫人去上方换，照实说 */
+const NO_OTHER = '同一工作流没有其他可换作基准的已封存运行'
 
 // ---------------------------------------------------------------- 假接口
 
@@ -243,6 +247,8 @@ function defaults(opts) {
       if (m[2] === '/artifacts') return { json: [] }
     }
     if (p === '/api/approvals' && url.searchParams.get('run_id')) return { json: [] }
+    // 查找基准期间离开运行详情去的那一页（定时任务列表）：给空的列表，页面落定不靠服务端里有什么
+    if (p === '/api/schedules') return { json: { items: [] } }
     return null
   }
 }
@@ -356,35 +362,83 @@ await section('从运行详情进入', async () => {
   check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
-await section('查找基准期间：看得见在做事，离开之后不再跳走', async () => {
+/** 查找基准期间离开去的那一页：定时任务列表。进去之后不再自己换地址（/data 会再换成 /data/databases），晚到的跳转盖不住 */
+const AWAY = '/schedules'
+/** 那一页落定：列表读回来了（假接口给的空列表） */
+const awaySettled = (page) => page.locator('[data-schedules-page="list"] [data-schedules-empty]').waitFor({ timeout: 8000 })
+const NO_BASE = '同一工作流没有其他已封存的正式运行'
+
+/**
+ * 在运行详情里点「与上一次对比」，compare/base 的答复（answer，默认找到 B）先压住不放。交回页面、放行的函数、这一请求
+ * 了结的 Promise（答完或者被取消，交回那个请求）、点了之后有没有挂出「正在查找」的提示，和点了之后走过的路径
+ * （framenavigated 连 pushState、replaceState 都算）：晚到的答复哪怕只让页面在对比页一闪而过、又被别的跳转盖掉，
+ * 走过的路径里也留着
+ */
+async function findingBase(answer = { json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) } }) {
   let release
   const gate = new Promise((r) => { release = r })
-  const { page, log, errors } = await open(`/runs/${T}`,
-    { base: () => ({ json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) }, wait: gate }) })
-  // compare/base 这一请求了结（答完，或者被取消）
+  const opened_ = await open(`/runs/${T}`, { base: () => ({ ...answer, wait: gate }) })
+  const { page, log } = opened_
   const ended = new Promise((resolve) => {
-    const done = (req) => { if (new URL(req.url()).pathname.endsWith('/compare/base')) resolve() }
+    const done = (req) => { if (new URL(req.url()).pathname.endsWith('/compare/base')) resolve(req) }
     page.on('requestfinished', done)
     page.on('requestfailed', done)
   })
   await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  const visited = []
+  page.on('framenavigated', (f) => { if (f === page.mainFrame()) visited.push(new URL(f.url()).pathname) })
   await page.getByRole('button', { name: '更多操作' }).click()
   await page.locator('[data-menu=compare]').click()
   // 菜单点完就收起了：查找期间要有一条看得见的提示，接口慢的时候不像点了没反应
-  check('点了之后有「正在查找上一次运行」的提示', await until(async () =>
-    await page.locator('[data-toast]', { hasText: FINDING }).count() === 1, 3000))
+  const noted = await until(async () => await page.locator('[data-toast]', { hasText: FINDING }).count() === 1, 3000)
   await until(async () => log.includes(`GET /api/runs/${T}/compare/base`), 3000)
-  // 改主意去了别的页面：答复晚到也不能把人拽回对比页
-  await page.evaluate(() => { history.pushState({}, '', '/data'); dispatchEvent(new PopStateEvent('popstate')) })
-  await page.waitForURL((u) => u.pathname.startsWith('/data'), { timeout: 5000 })
+  return { ...opened_, release, ended, noted, visited }
+}
+
+await section('查找基准期间：看得见在做事，离开之后不再跳走', async () => {
+  const { page, release, ended, noted, visited, errors } = await findingBase()
+  check('点了之后有「正在查找上一次运行」的提示', noted)
+  // 改主意去了别的页面。等那一页画好、运行详情卸下之后再放行：答复晚到也不能把人拽回对比页
+  await page.evaluate((to) => { history.pushState({}, '', to); dispatchEvent(new PopStateEvent('popstate')) }, AWAY)
+  await awaySettled(page)
+  const unmounted = await until(async () => await page.locator('[data-run-detail]').count() === 0, 3000)
   release()
-  // 等请求了结，再给跳转留足时间：第一次进 /data 要现编那一页，主线程忙的时候晚到的跳转会落在固定的等待之后
+  // 等请求了结，再给跳转留足时间：主线程忙的时候晚到的跳转会落在固定的等待之后
   await Promise.race([ended, new Promise((r) => setTimeout(r, 4000))])
-  const jumped = await until(async () => new URL(page.url()).pathname === '/runs/compare', 2500)
+  const jumped = await until(async () => visited.includes('/runs/compare'), 2500)
   const at = new URL(page.url())
-  check('离开运行详情之后答复才回来：留在原地，不跳到对比页', !jumped && at.pathname.startsWith('/data'), at.pathname + at.search)
+  check('新页面画好之后答复才回来：一直留在新页面，走过的地址里从没有对比页', unmounted && !jumped && at.pathname === AWAY,
+    `${visited.join(' → ')}；现在 ${at.pathname}${at.search}`)
   check('离开之后「正在查找」的提示也收起', await page.locator('[data-toast]', { hasText: FINDING }).count() === 0)
   check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('查找基准期间离开、立刻放行：地址已换，新页面还没画出来', async () => {
+  // React Router 按过渡（startTransition）渲染换页：地址先换，新页面画好、运行详情卸下（这才取消请求）在后。这里只换
+  // 地址、先不通知路由，把这段空当撑住，答复就在这时放行——检查不靠时机碰运气。找到了基准的不跳，找不到的不弹提示
+  for (const [what, answer] of [['找到了基准', undefined], ['找不到基准', { status: 404, json: { detail: NO_BASE } }]]) {
+    const { page, release, ended, noted, visited, errors } = await findingBase(answer)
+    await page.evaluate((to) => { history.pushState({}, '', to) }, AWAY)
+    release()
+    const req = await Promise.race([ended, new Promise((r) => setTimeout(() => r(null), 4000))])
+    // 答复处理完的标志：菜单收尾时收起「正在查找」的提示
+    const handled = noted && await until(async () => await page.locator('[data-toast]', { hasText: FINDING }).count() === 0, 3000)
+    const held = !!req && !req.failure() && handled && await page.locator(`[data-run-detail="${T}"]`).count() === 1
+    const jumped = await until(async () => visited.includes('/runs/compare'), 1000)
+    const told = await page.locator('[data-toast]', { hasText: NO_BASE }).count()
+    // 空当结束：通知路由，新页面画出来
+    await page.evaluate(() => { dispatchEvent(new PopStateEvent('popstate')) })
+    await awaySettled(page).catch(() => {})
+    const at = new URL(page.url())
+    check(`${what}：答复回来时运行详情还在、请求没被取消（撑住了空当）`, held,
+      `请求${req ? (req.failure() ? '被取消' : '已答完') : '没有了结'}，提示${handled ? '已收起' : '没收起'}`)
+    check(`${what}：不跳到对比页，走过的地址里从没有对比页，留在新页面`, !jumped && at.pathname === AWAY,
+      `${visited.join(' → ')}；现在 ${at.pathname}${at.search}`)
+    check(`${what}：不弹找不到基准的提示`, told === 0)
+    check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
 })
 
 await section('不属于已保存工作流的运行：入口不可点并说明原因', async () => {
@@ -765,6 +819,8 @@ await section('出错与找不到基准', async () => {
   const sealed = await open(comparePath(T, B), { compare: () => ({ status: 409, json: { detail: broken, code: 'compare_seal_broken' } }) })
   await settled(sealed.page, 'error')
   const e409 = sealed.page.locator('[data-compare-error="409"]')
+  // 叫人去上方换基准的那句下一步，要等下拉读到同一工作流的运行、知道有没有能换的才写
+  await until(() => has(sealed.page, '[data-compare-error="409"] [data-compare-error-hint]'), 3000)
   const t409 = (await e409.innerText().catch(() => '')).replace(/\s+/g, ' ')
   check('409 封存核对不一致：标题照实写，带上服务端的原因', (await e409.locator('[data-compare-error-title]').innerText()) === '无法对比：封存核对不一致'
     && t409.includes(broken), t409)
@@ -790,12 +846,26 @@ await section('出错与找不到基准', async () => {
     RUNS[T] = savedT
   }
 
-  const other = await open(comparePath(T, B), { compare: () => ({ status: 422,
-    json: { detail: '两次运行不属于同一个工作流（「区域销售周报」与「门店日报」），不能对比', code: 'compare_mismatch' } }) })
+  const mismatch = '两次运行不属于同一个工作流（「区域销售周报」与「门店日报」），不能对比'
+  const other = await open(comparePath(T, B), { compare: () => ({ status: 422, json: { detail: mismatch, code: 'compare_mismatch' } }) })
   await settled(other.page, 'error')
   const e422 = other.page.locator('[data-compare-error="422"]')
+  await until(() => has(other.page, '[data-compare-error="422"] [data-compare-error-hint]'), 3000)
   check('422：写明无法对比，带上原因和下一步', (await e422.innerText()).includes('两次运行不属于同一个工作流')
     && (await e422.innerText()).includes('同一工作流的另一次运行'), (await e422.innerText().catch(() => '')).replace(/\s+/g, ' '))
+
+  // 下拉里除了本次和当前的基准，没有别的已封存的运行：换基准这条路走不通，409、422 都不再叫人去上方换，照实说没有。
+  // 409 的基准和本次同属一个工作流（下拉里有它，可它正是出问题的那一次），另一次没封存；422 的基准属于别的工作流
+  for (const [code, answer, list] of [
+    ['409', { status: 409, json: { detail: broken, code: 'compare_seal_broken' } }, [RUNS[T], RUNS[B], RUNS[U]]],
+    ['422', { status: 422, json: { detail: mismatch, code: 'compare_mismatch' } }, [RUNS[T], RUNS[U]]],
+  ]) {
+    const only = await open(comparePath(T, B), { compare: () => answer, list: () => ({ json: list }) })
+    await settled(only.page, 'error')
+    const said = await until(async () => (await maybeText(only.page.locator(`[data-compare-error="${code}"] [data-compare-error-hint]`))).trim(), 3000)
+    const box = (await only.page.locator(`[data-compare-error="${code}"]`).innerText()).replace(/\s+/g, ' ')
+    check(`${code}、下拉里没有能换的：不叫人去上方换基准，写明没有其他可换作基准的已封存运行`, said === NO_OTHER && !box.includes('上方'), box)
+  }
 
   const gone = await open(comparePath(T, B), { compare: () => RUN_GONE })
   await settled(gone.page, 'error')
@@ -836,6 +906,17 @@ await section('出错与找不到基准', async () => {
     && (await missing.page.locator('[data-compare-error-title]').innerText()) === '运行记录不存在'
     && (await gone404.innerText()).includes('链接可能已失效') && await gone404.locator('a[href="/runs"]').count() === 1,
     (await gone404.innerText().catch(() => '')).replace(/\s+/g, ' '))
+  // 本次的记录不存在：不知道是哪个工作流、列不出候选，重试几次都一样。换基准的位置照实说，不给「重试」；地址里带了
+  // 基准的（对比回 404）也一样，整页都没有注定失败的「重试」
+  const goneWithBase = await open(comparePath(T, B), { compare: () => RUN_GONE, run: (id) => (id === T ? RECORD_GONE : null) })
+  await settled(goneWithBase.page, 'error')
+  for (const [what, p] of [['只带本次', missing.page], ['带着基准', goneWithBase.page]]) {
+    const area = p.locator('[data-compare-run="base"]')
+    const noted = await until(() => has(p, '[data-compare-run="base"] [data-compare-pick-note="target-gone"]'), 3000)
+    check(`本次不存在（${what}）：换基准的位置写明列不出同一工作流的运行，整页不给「重试」`,
+      noted && (await area.innerText()).includes('本次运行的记录不存在') && await p.getByRole('button', { name: '重试' }).count() === 0,
+      (await area.innerText()).replace(/\s+/g, ' '))
+  }
 
   // 只带本次、找得到：自己补上基准，写明怎么选的
   const auto = await open(comparePath(T))
@@ -877,6 +958,14 @@ await section('基准运行读不到（删了、链接过期）', async () => {
   await settled(page)
   check('另选一次之后照常对比', new URL(page.url()).searchParams.get('base') === B && compareHits(log, T, B) === 1)
   check('页面没有报错', errors.length === 0, errors.join('；'))
+
+  // 同一工作流只剩本次和一次没封存的：下拉里没有能换的，缺基准时同样不叫人去上方另选
+  const bare = await open(comparePath(T, GONE), { compare: () => ({ status: 404,
+    json: { detail: '作为对比基准的运行记录不存在', code: 'run_not_found' } }), list: () => ({ json: [RUNS[T], RUNS[U]] }) })
+  await settled(bare.page, 'error')
+  const said = await until(async () => (await maybeText(bare.page.locator('[data-compare-error="404"] [data-compare-error-hint]'))).trim(), 3000)
+  const bareBox = (await bare.page.locator('[data-compare-error="404"]').innerText()).replace(/\s+/g, ' ')
+  check('缺的是基准、下拉里没有能换的：不叫人去上方另选，写明没有其他可换作基准的已封存运行', said === NO_OTHER && !bareBox.includes('上方'), bareBox)
 })
 
 await section('本次的运行记录读不到：换基准不一直停在「正在读取」', async () => {

@@ -3115,6 +3115,8 @@ export const RUN_COMPARE_TEXT = {
   pickLoading: '正在读取同一工作流的运行…',
   pickFailed: '无法读取同一工作流的运行',
   pickNone: '同一工作流没有其他运行',
+  /** 本次的运行记录不存在：不知道是哪个工作流，列不出候选，重试也是一样 */
+  pickTargetGone: '本次运行的记录不存在，无法列出同一工作流的运行',
   pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
   pickPlaceholder: '选择一次运行作为基准',
   /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
@@ -3146,6 +3148,8 @@ export const RUN_COMPARE_TEXT = {
   errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
   /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
   errNoBaseNone: '同一工作流还没有其他已封存的运行',
+  /** 409、422、404 时下拉里除了本次和当前的基准，没有别的已封存的运行：换基准这条路走不通，照实说 */
+  errNoOtherBase: '同一工作流没有其他可换作基准的已封存运行',
   viewBase: '查看基准运行',
   viewTarget: '查看本次运行',
   // 摘要

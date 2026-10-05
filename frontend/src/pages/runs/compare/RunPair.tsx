@@ -120,7 +120,7 @@ function RetryButton({ onClick }: { onClick: () => void }) {
  * 写短 id 加原因，下拉如实反映当前选的是哪一次，其余每一项都能触发 change。
  *
  * 列不出候选时说清楚、给重试，不停在「正在读取」：同一工作流的运行没取到；或者本次的记录没读到，不知道是哪个工作流
- * （候选的键是空的，不会自己去取）
+ * （候选的键是空的，不会自己去取）。本次的记录根本不存在（404）时重试也是一样，只说不存在、不给重试
  */
 function BasePicker({ target, base, baseRun, targetRun, candidates, unsaved, onPick }: {
   target: string; base: string | null; baseRun: Loaded<RunWithSchedule>; targetRun: Loaded<RunWithSchedule>
@@ -129,6 +129,9 @@ function BasePicker({ target, base, baseRun, targetRun, candidates, unsaved, onP
   const id = useId()
   const now = useTicker(60_000)
   if (unsaved) return <p className="mt-2 text-2xs text-faint" data-compare-pick-note="unsaved">{T.pickUnsaved}</p>
+  if (candidates.state === 'idle' && targetRun.state === 'error' && isGone(targetRun.error)) {
+    return <p className="mt-2 text-2xs text-faint" data-compare-pick-note="target-gone">{T.pickTargetGone}</p>
+  }
   const failed = candidates.state === 'error' ? candidates.reload
     : candidates.state === 'idle' && targetRun.state === 'error' ? targetRun.reload : null
   if (failed) {
