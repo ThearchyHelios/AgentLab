@@ -3,9 +3,10 @@
 - normalize_sql：字面量换成占位符后的规范文本 + 字面量。只有字面量不同的两条 SQL 规范文本相同（定时运行每期的日期
   不同，不能算模板变了）；关键字大小写、空白、注释也不算不同；结构变了的一定不同；解析不了的退回逐词规范化
 - facets：把一条查询拆成表、连接、WHERE 合取式、时间条件、分组、聚合、HAVING、取哪几行（给调用方取结构用）
-- explain_sql_diff：两边规范化后的形式一字不差才算等价（规范化的每一步都只做保持语义的变换）；不等价时只把有把握
-  的不同写成具体的中文句子（时间列、筛选条件、聚合与去重、关联、分组、HAVING、取行、UNION），说不准的给兜底说明，
-  并给出规范化后不同的行。等价的结论另有执行比对守门：见 test_sql_equivalence.py
+- explain_sql_diff：两边规范化后的形式一字不差才算等价（规范化的每一步都只做保持语义的变换）；不等价时只在两边都是
+  简单形状（一段 SELECT、实表、普通的连接）时把有把握的四类不同写成具体的中文句子（按哪一列筛时间、一边多出来的
+  筛选条件、顶层的聚合函数和去重、关联的表和关联类型），别的都给兜底说明，并给出规范化后不同的行；原文里有 sqlglot
+  会读错的写法时只给兜底和原文的逐行对照。等价的结论另有执行比对守门：见 test_sql_equivalence.py
 - diff_facets：照旧收两份 facets，交给 explain_sql_diff 比原文，返回它的条目（含兜底条目）
 
 夹具全是虚构的表：订单 orders、退款 refunds、门店 stores、用户 users、付款 payments，以及一张中文表「订单」。
@@ -567,89 +568,44 @@ def test_time_column_differs_with_catalog_names():
 
 
 @pytest.mark.parametrize("a,b,expected", [
-    # 时间
+    # 时间：按哪一列筛不同、一边按时间筛了另一边没有
     (BASE, "SELECT SUM(amount) FROM orders", [("time", "A 按 paid_at 筛时间，B 没有按时间筛选")]),
     ("SELECT SUM(amount) FROM orders", BASE, [("time", "A 没有按时间筛选，B 按 paid_at 筛时间")]),
-    (BASE, "SELECT SUM(amount) FROM orders WHERE paid_at BETWEEN '2026-09-01' AND '2026-09-30'",
-     [("time_range", "A 的时间范围是 paid_at >= '2026-09-01' AND paid_at < '2026-10-01'，"
-                     "B 是 paid_at >= '2026-09-01' AND paid_at <= '2026-09-30'")]),
     ("WITH t AS (SELECT user_id, amount, DATE(paid_at) AS d FROM orders) SELECT SUM(amount) FROM t WHERE d >= '2026-09-01'",
      "WITH t AS (SELECT user_id, amount, DATE(created_at) AS d FROM orders) SELECT SUM(amount) FROM t "
      "WHERE d >= '2026-09-01'",
      [("time", "A 按 paid_at 筛时间，B 按 created_at")]),
-    # 筛选
+    # 一边多出来的筛选条件
     ("SELECT SUM(amount) FROM orders WHERE is_deleted <> 1", "SELECT SUM(amount) FROM orders",
      [("filter", "A 排除了 is_deleted = 1 的行和 is_deleted 为空的行，B 没有")]),
     ("SELECT SUM(amount) FROM orders", "SELECT SUM(amount) FROM orders WHERE refund_id IS NOT NULL",
      [("filter", "B 排除了 refund_id 为空的行，A 没有")]),
     ("SELECT SUM(amount) FROM orders", "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
      [("filter", "B 只保留 status = 'paid' 的行，A 没有这个条件")]),
-    ("SELECT SUM(amount) FROM orders WHERE status = 'paid'",
-     "SELECT SUM(amount) FROM orders WHERE status IN ('paid', 'shipped')",
-     [("filter", "A 按 status = 'paid' 筛选，B 按 status IN ('paid', 'shipped') 筛选")]),
     ("WITH paid AS (SELECT * FROM orders WHERE status = 'paid') SELECT SUM(amount) FROM paid",
      "WITH paid AS (SELECT * FROM orders WHERE status = 'paid') SELECT SUM(amount) FROM orders",
      [("filter", "A 只保留 status = 'paid' 的行，B 没有这个条件")]),
-    # 聚合、去重
+    # 顶层的聚合函数、去重
     ("SELECT COUNT(DISTINCT order_id) FROM orders", "SELECT COUNT(order_id) FROM orders",
      [("aggregate", "A 对 order_id 去重计数，B 没去重")]),
     ("SELECT COUNT(order_id) FROM orders", "SELECT COUNT(DISTINCT order_id) FROM orders",
      [("aggregate", "A 对 order_id 计数时没去重，B 去重计数")]),
     ("SELECT SUM(amount) FROM orders", "SELECT AVG(amount) FROM orders", [("aggregate", "A 对 amount 求和，B 求平均")]),
-    ("SELECT SUM(paid_amount) FROM orders", "SELECT SUM(amount) FROM orders",
-     [("aggregate", "A 对 paid_amount 求和，B 对 amount 求和")]),
     ("SELECT COUNT(*) FROM orders", "SELECT COUNT(DISTINCT order_id) FROM orders",
      [("aggregate", "A 数的是行数，B 对 order_id 去重计数")]),
-    ("SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
-     "SELECT SUM(r.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
-     [("aggregate", "A 对 orders.amount 求和，B 对 refunds.amount 求和")]),
+    ("SELECT COUNT(*) FROM orders", "SELECT SUM(amount) FROM orders", [("aggregate", "A 数的是行数，B 对 amount 求和")]),
     ("SELECT DISTINCT region FROM orders", "SELECT region FROM orders", [("group_by", "A 对 region 去重，B 没有去重")]),
-    ("SELECT user_id, SUM(amount) FROM orders GROUP BY user_id", "SELECT SUM(amount), user_id FROM orders GROUP BY user_id",
-     [("expression", "两边选出来的列一样，先后不同：A 是 user_id、SUM(amount)，B 是 SUM(amount)、user_id")]),
-    # 分组、HAVING、取行
-    ("SELECT region, SUM(amount) FROM orders GROUP BY region",
-     "SELECT region, city, SUM(amount) FROM orders GROUP BY region, city",
-     [("group_by", "A 按 region 分组，B 按 city、region 分组")]),
-    ("SELECT SUM(amount) FROM orders", "SELECT region, SUM(amount) FROM orders GROUP BY region",
-     [("group_by", "A 没有分组，B 按 region 分组")]),
-    ("SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 100",
-     "SELECT region, SUM(amount) FROM orders GROUP BY region",
-     [("having", "A 分组后只保留 SUM(amount) > 100 的组，B 没有这个条件")]),
-    ("SELECT amount FROM orders LIMIT 10", "SELECT amount FROM orders", [("limit", "A 只取前 10 行，B 不限行数")]),
-    ("SELECT amount FROM orders LIMIT 10", "SELECT amount FROM orders LIMIT 100",
-     [("limit", "A 只取前 10 行，B 只取前 100 行")]),
-    ("SELECT amount FROM orders LIMIT 10 OFFSET 0", "SELECT amount FROM orders LIMIT 10 OFFSET 10",
-     [("limit", "A 不跳过行，B 跳过前 10 行")]),
-    ("SELECT amount FROM orders ORDER BY 1 DESC LIMIT 10", "SELECT amount FROM orders ORDER BY 1 ASC LIMIT 10",
-     [("limit", "A 取行前按 amount 降序排，B 按 amount 升序排")]),
-    ("SELECT id, amount FROM orders ORDER BY amount DESC", "SELECT id, amount FROM orders",
-     [("order", "A 按 amount 降序排，B 没有排序")]),
-    # 连接、表
+    ("SELECT DISTINCT region FROM orders ORDER BY region LIMIT 5", "SELECT region FROM orders ORDER BY region LIMIT 5",
+     [("group_by", "A 用 SELECT DISTINCT 去掉了重复的行，B 没有")]),
+    # 关联的表、关联类型
     ("SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
      "SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
      [("join", "A 用 LEFT JOIN 关联 refunds 表，B 用 INNER JOIN")]),
-    ("SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
-     "SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.user_id = o.user_id",
-     [("join", "A 关联 refunds 表的条件是 orders.id = refunds.order_id，B 是 orders.user_id = refunds.user_id")]),
     ("SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id", "SELECT SUM(amount) FROM orders",
      [("join", "A 用 LEFT JOIN 关联 refunds 表，B 没有")]),
     ("SELECT SUM(o.amount) FROM orders o WHERE o.status = 'paid'",
      "SELECT SUM(o.amount) FROM stores s JOIN orders o ON o.store_id = s.id WHERE o.status = 'paid'",
      [("join", "B 关联了 stores 表（关联的条件是 orders.store_id = stores.id），A 没有")]),
-    ("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
-     "SELECT COUNT(*) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id",
-     [("join", "A 以 orders 为主表外连接 refunds，B 以 refunds 为主表外连接 orders")]),
-    ("SELECT SUM(amount) FROM orders WHERE is_deleted = 0 AND paid_at >= '2026-09-01'",
-     "SELECT SUM(amount) FROM orders_archive WHERE is_deleted = 1 AND paid_at >= '2026-09-01'",
-     [("tables", "A 查的是 orders 表，B 查的是 orders_archive 表"),
-      ("filter", "A 按 is_deleted = 0 筛选，B 按 is_deleted = 1 筛选")]),
-    # UNION
-    ("SELECT user_id FROM orders UNION SELECT user_id FROM refunds",
-     "SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds",
-     [("set_op", "A 用 UNION 合并（去掉重复的行），B 用 UNION ALL（重复的行都留着）")]),
-    ("SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders WHERE status = 'paid'",
-     "SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders",
-     [("filter", "A 在合并的一支里只保留 status = 'paid' 的行，B 在合并的一支里没有这个条件")]),
 ], ids=lambda v: None)
 def test_specific_differences_are_said_in_one_sentence_each(a, b, expected):
     diff = explain_sql_diff(a, b, "sqlite")
@@ -657,46 +613,83 @@ def test_specific_differences_are_said_in_one_sentence_each(a, b, expected):
     assert not diff.fallback and [(d.aspect, d.text) for d in diff.items] == expected
 
 
-def test_a_difference_inside_a_cte_used_only_in_a_condition_subquery_is_reported():
-    """第 5 轮回退的例子：只在 IN 子查询里用到的 CTE 里的条件不同，以前整个漏报（返回空列表）。现在 CTE 并进了 IN
-    子查询，往里比，说得出是哪个条件，位置带上 IN 左边的列（两个 IN 子查询时才分得清）。EXISTS、标量子查询一样。"""
+@pytest.mark.parametrize("a,b", [
+    # 同一列上的时间范围不同、同一列上换了筛选的值：不在能说的四类里
+    (BASE, "SELECT SUM(amount) FROM orders WHERE paid_at BETWEEN '2026-09-01' AND '2026-09-30'"),
+    ("SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+     "SELECT SUM(amount) FROM orders WHERE status IN ('paid', 'shipped')"),
+    # 聚合的参数不同、选出来的列换了先后
+    ("SELECT SUM(paid_amount) FROM orders", "SELECT SUM(amount) FROM orders"),
+    ("SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
+     "SELECT SUM(r.amount) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT user_id, SUM(amount) FROM orders GROUP BY user_id", "SELECT SUM(amount), user_id FROM orders GROUP BY user_id"),
+    # COUNT(x) 对 COUNT(*)：只差在 x 为空的行，不算聚合函数不同
+    ("SELECT COUNT(order_id) FROM orders", "SELECT COUNT(*) FROM orders"),
+    # 分组、HAVING、取行、排序
+    ("SELECT region, SUM(amount) FROM orders GROUP BY region",
+     "SELECT region, city, SUM(amount) FROM orders GROUP BY region, city"),
+    ("SELECT SUM(amount) FROM orders", "SELECT region, SUM(amount) FROM orders GROUP BY region"),
+    ("SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 100",
+     "SELECT region, SUM(amount) FROM orders GROUP BY region"),
+    ("SELECT amount FROM orders LIMIT 10", "SELECT amount FROM orders"),
+    ("SELECT amount FROM orders LIMIT 10", "SELECT amount FROM orders LIMIT 100"),
+    ("SELECT amount FROM orders LIMIT 10 OFFSET 0", "SELECT amount FROM orders LIMIT 10 OFFSET 10"),
+    ("SELECT amount FROM orders ORDER BY 1 DESC LIMIT 10", "SELECT amount FROM orders ORDER BY 1 ASC LIMIT 10"),
+    ("SELECT id, amount FROM orders ORDER BY amount DESC", "SELECT id, amount FROM orders"),
+    # 关联条件不同、外连接的主表对调
+    ("SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.user_id = o.user_id"),
+    ("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id"),
+    # UNION、合并的一支里的条件、CTE 和子查询里的不同：不是简单形状
+    ("SELECT user_id FROM orders UNION SELECT user_id FROM refunds",
+     "SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds"),
+    ("SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders WHERE status = 'paid'",
+     "SELECT user_id FROM orders WHERE status = 'paid' UNION SELECT referrer_id FROM orders"),
+    ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM t WHERE total > 100",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT COUNT(*) FROM t WHERE total > 100"),
+], ids=lambda v: None)
+def test_differences_outside_the_four_kinds_get_only_the_fallback(a, b):
+    """具体说法只说四类（按哪一列筛时间、一边多出来的筛选条件、顶层的聚合函数和去重、关联的表和关联类型），而且只在
+    两边都是简单形状时说。别的不同（同一列上的范围、换了筛选的值、聚合的参数、分组、HAVING、取行、排序、关联条件、
+    UNION、CTE 和子查询里的不同）以前说得出具体的，复验在这些地方一再抓到不存在的差异（被 WHERE 定死的排序键、恒为真的
+    HAVING、外层不在乎的子查询差异……），现在一律只给兜底说明，附规范化后不同的行。"""
+    for dialect in DIALECTS:
+        diff = explain_sql_diff(a, b, dialect)
+        check_shape(diff)
+        assert not diff.equivalent and diff.items == [FacetDiff("other", None, None, FALLBACK)], (dialect, diff.items)
+
+
+def test_a_difference_inside_a_cte_used_only_in_a_condition_subquery_is_never_missed():
+    """第 5 轮回退的例子：只在 IN 子查询里用到的 CTE 里的条件不同，以前整个漏报（返回空列表）。现在条件里有子查询的不是
+    简单形状，不说具体的，但一定不判等价、给兜底说明和规范化后不同的行。EXISTS、标量子查询一样。"""
     head = "WITH p AS (SELECT * FROM orders WHERE status = '{}') SELECT COUNT(*) FROM users u WHERE "
-    for tail, place in (("u.id IN (SELECT user_id FROM p)", "在 id IN 的子查询里"),
-                        ("EXISTS (SELECT 1 FROM p WHERE p.user_id = u.id)", "在 EXISTS 子查询里"),
-                        ("(SELECT COUNT(*) FROM p WHERE p.user_id = u.id) > 0", "在条件的子查询里")):
+    for tail in ("u.id IN (SELECT user_id FROM p)", "EXISTS (SELECT 1 FROM p WHERE p.user_id = u.id)",
+                 "(SELECT COUNT(*) FROM p WHERE p.user_id = u.id) > 0"):
         a, b = head.format("paid") + tail, head.format("open") + tail
         for schema in (None, sql_pairs.schema_cache()):
             diff = explain_sql_diff(a, b, "sqlite", schema=schema, labels=LABELS)
             check_shape(diff)
-            assert [(d.aspect, d.text) for d in diff.items] == [
-                ("filter", f"原流程{place}按 status = 'paid' 筛选，盲算{place}按 status = 'open' 筛选")]
+            assert not diff.equivalent and diff.items == [FacetDiff("other", None, None, FALLBACK)]
+            assert any("open" in line for line in diff.text_diff)
         assert diff_facets(facets(a), facets(b), labels=LABELS) == diff.items
 
 
-def test_a_difference_inside_an_aggregating_cte_names_the_cte_on_each_side():
-    a = ("WITH user_totals AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE is_deleted = 0 GROUP BY user_id) "
-         "SELECT COUNT(*) FROM user_totals WHERE total > 100")
-    b = ("WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) "
-         "SELECT COUNT(*) FROM t WHERE total > 100")
-    diff = explain_sql_diff(a, b, labels=LABELS)
-    check_shape(diff)
-    assert [d.text for d in diff.items] == ["原流程在 user_totals 里只保留 is_deleted = 0 的行，盲算在 t 里没有这个条件"]
-
-
-def test_an_outer_join_turned_inner_by_where_says_what_was_written():
-    """原文写的是 LEFT / RIGHT JOIN、WHERE 里的条件把没关联上的行筛掉了：按内连接比，说法照实写「写的是 LEFT JOIN，
-    实际是 INNER JOIN」，不说成「用 INNER JOIN」。从 RIGHT JOIN 改写来的外连接说以哪一侧为主表，不说 LEFT JOIN。"""
-    # 用 COUNT：PostgreSQL 里对不知道是不是精确数的值求和，结果看行出来的先后（见 _Sensitivity），这样的一段不按 WHERE
-    # 把外连接改成内连接（SQLite 上降成内连接之后扫描的先后真的变了），说不出这一句
+def test_an_outer_join_turned_inner_by_where_is_not_called_inner_join():
+    """原文写的是 LEFT / RIGHT JOIN、WHERE 里的条件把没关联上的行筛掉了（按内连接比）：说「B 用 INNER JOIN」和原文
+    对不上，从 RIGHT JOIN 改写来的说「用 LEFT JOIN」也对不上，关联类型这一处不说，交给兜底；说得准的筛选条件照说。"""
     a = "SELECT COUNT(o.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'"
     b = "SELECT COUNT(o.id) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id WHERE o.status = 'paid'"
-    assert texts(a, b, "postgres") == [
-        "A 用 LEFT JOIN 关联 refunds 表，B 写的是 LEFT JOIN，但 WHERE 里的条件把关联不上 orders 的行筛掉了，实际是 INNER JOIN"]
+    diff = explain_sql_diff(a, b, "postgres")
+    check_shape(diff)
+    assert diff.fallback and not any(d.aspect == "join" for d in diff.items), diff.items
     a = "SELECT COUNT(*) FROM orders o RIGHT JOIN refunds r ON r.order_id = o.id"
     b = a + " WHERE o.status = 'paid'"
-    assert texts(a, b, "postgres") == [
-        "A 以 refunds 为主表外连接 orders 表，B 写的是 RIGHT JOIN，但 WHERE 里的条件把关联不上 orders 的行筛掉了，"
-        "实际是 INNER JOIN", "B 只保留 orders.status = 'paid' 的行，A 没有这个条件"]
+    diff = explain_sql_diff(a, b, "postgres")
+    check_shape(diff)
+    assert [(d.aspect, d.text) for d in diff.items] == [
+        ("filter", "B 只保留 orders.status = 'paid' 的行，A 没有这个条件"), ("other", FALLBACK_REST)]
     # 本来就是内连接、和被 WHERE 变成内连接的 LEFT JOIN 是同一个意思
     assert explain_sql_diff("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.amount > 10",
                             "SELECT COUNT(*) FROM refunds r JOIN orders o ON o.id = r.order_id WHERE r.amount > 10"
@@ -731,9 +724,10 @@ def test_filters_on_real_columns_carry_the_columns_for_the_catalog():
 def test_a_displayed_condition_means_what_the_sql_means():
     """给人看的条件按方言生成；方言生成的写法读回来不是同一个意思时（SQLite 把 CAST(x AS DATE) 生成 DATE(x)）改用
     通用写法，不拿 DATE(paid_at) 冒充原文。几个条件连起来时 OR 带上括号。"""
-    [item] = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE CAST(paid_at AS DATE) >= '2026-09-01'",
-                              "SELECT COUNT(*) FROM orders WHERE CAST(paid_at AS DATE) >= '2026-10-01'", "sqlite").items
-    assert item.aspect == "time_range" and "CAST(paid_at AS DATE)" in item.text and "DATE(paid_at)" not in item.text
+    [item] = explain_sql_diff("SELECT COUNT(*) FROM orders o",
+                              "SELECT COUNT(*) FROM orders o JOIN payments p ON p.order_id = o.id "
+                              "AND CAST(p.paid_at AS DATE) >= '2026-09-01'", "sqlite").items
+    assert item.aspect == "join" and "CAST(payments.paid_at AS DATE)" in item.text and "DATE(payments" not in item.text
     a = "SELECT SUM(amount) FROM orders"
     b = "SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id AND (s.city = 'SH' OR s.city = 'BJ')"
     [item] = explain_sql_diff(a, b).items
@@ -758,15 +752,16 @@ def test_nothing_specific_gives_one_fallback_item_and_the_lines_that_differ():
 
 
 def test_specific_items_that_cover_only_part_end_with_the_rest_note():
-    """一边多关联了 refunds（会把订单行按退款数复制），另一边只在 EXISTS 里用它：关联那一句说得准，EXISTS 那处说不准，
-    补一句「另有未能归纳的差异」。"""
-    a = "SELECT SUM(o.amount) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"
-    b = "SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id"
+    """按哪一列筛时间说得准，同一列 status 上换了筛选的值说不了：说时间那一句，补一句「另有未能归纳的差异」。"""
+    a = "SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01' AND status = 'paid'"
+    b = "SELECT SUM(amount) FROM orders WHERE created_at >= '2026-09-01' AND status IN ('paid', 'done')"
     diff = explain_sql_diff(a, b, labels=LABELS)
     check_shape(diff)
-    assert diff.fallback and [d.text for d in diff.items] == [
-        "盲算关联了 refunds 表（关联的条件是 orders.id = refunds.order_id），原流程没有关联它（只在子查询里用到了 refunds）",
-        FALLBACK_REST]
+    assert diff.fallback and [d.text for d in diff.items] == ["原流程按 paid_at 筛时间，盲算按 created_at", FALLBACK_REST]
+    # 一边只在 EXISTS 里用到 refunds：条件里有子查询，不是简单形状，整条只给兜底
+    a = "SELECT SUM(o.amount) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"
+    b = "SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id"
+    assert explain_sql_diff(a, b, labels=LABELS).items == [FacetDiff("other", None, None, FALLBACK)]
 
 
 def test_columns_inside_a_cte_are_not_compared_because_canonical_forms_prune_them():
@@ -982,25 +977,17 @@ def test_subqueries_swapped_between_in_and_not_in_are_not_explained_both_ways(a,
         assert all(d.aspect == "other" for d in diff.items), diff.items
 
 
-def test_a_difference_inside_a_not_in_subquery_says_not_in():
-    """NOT IN 子查询里的条件不同，说的是「NOT IN 的子查询」（以前说成「IN 子查询」，读的人会以为是保留这些用户）。子查询
-    里不带表名的列，没给表结构时分不清是子查询里的表的还是外层的（users 也可能有 status），不说具体的；给了表结构、
-    或者写了表名，就说得出。"""
+def test_a_difference_inside_a_not_in_subquery_gets_only_the_fallback():
+    """NOT IN 子查询里的条件不同：以前说成「在 id NOT IN 的子查询里按 … 筛选」（再往前还错说成「IN 子查询」）。条件里有
+    子查询的不是简单形状，现在给不给表结构都只给兜底，不会把 NOT IN 说成 IN。"""
     a = ("SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'void' "
          "AND user_id IS NOT NULL)")
     b = a.replace("'void'", "'open'")
-    expected = [("filter", "原流程在 id NOT IN 的子查询里按 status = 'void' 筛选，盲算在 id NOT IN 的子查询里按 "
-                           "status = 'open' 筛选")]
-    diff = explain_sql_diff(a, b, "sqlite", labels=LABELS, schema=sql_pairs.schema_cache())
-    check_shape(diff)
-    assert [(d.aspect, d.text) for d in diff.items] == expected
-    assert explain_sql_diff(a, b, "sqlite", labels=LABELS).items == [FacetDiff("other", None, None, FALLBACK)]
-    qa, qb = a.replace("FROM orders WHERE status", "FROM orders o WHERE o.status"), \
-        b.replace("FROM orders WHERE status", "FROM orders o WHERE o.status")
-    assert [(d.aspect, d.text) for d in explain_sql_diff(qa, qb, "sqlite", labels=LABELS).items] == expected
-    diff = explain_sql_diff(a.replace("NOT IN", "IN"), b.replace("NOT IN", "IN"), "sqlite", labels=LABELS,
-                            schema=sql_pairs.schema_cache())
-    assert "id IN 的子查询" in diff.items[0].text and "NOT IN" not in diff.items[0].text
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (a.replace("NOT IN", "IN"), b.replace("NOT IN", "IN"))):
+            diff = explain_sql_diff(x, y, "sqlite", labels=LABELS, schema=schema)
+            check_shape(diff)
+            assert diff.items == [FacetDiff("other", None, None, FALLBACK)]
 
 
 def test_a_swapped_table_keeps_each_sides_own_columns():
@@ -1016,13 +1003,19 @@ def test_a_swapped_table_keeps_each_sides_own_columns():
         ("time", "原流程按支付时间 paid_at 筛时间，盲算按注册时间 created_at")]
     assert diff.items[1].detail == {"a": [{"table": "orders", "column": "paid_at"}],
                                     "b": [{"table": "users", "column": "created_at"}]}
+    # 换了关联的表，关联条件也跟着不同：关联条件不在能说的四类里，补一句兜底
     diff = explain_sql_diff("SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.city = 'SH'",
                             "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.city = 'SH'",
                             "sqlite")
     check_shape(diff)
-    assert [d.text for d in diff.items] == [
-        "A 查的是 stores 表，B 查的是 users 表",
-        "A 关联的条件是 orders.store_id = stores.id，B 是 orders.user_id = users.id"]
+    assert [d.text for d in diff.items] == ["A 查的是 stores 表，B 查的是 users 表", FALLBACK_REST]
+    # 换了一张表，同一个意思的列在两边各属各的表：A 的 is_deleted = 0 对 B 的 is_deleted = 1 是换了值，不能说成
+    # 「A 只保留 is_deleted = 0 的行，B 没有这个条件」
+    diff = explain_sql_diff("SELECT SUM(amount) FROM orders WHERE is_deleted = 0 AND paid_at >= '2026-09-01'",
+                            "SELECT SUM(amount) FROM orders_archive WHERE is_deleted = 1 AND paid_at >= '2026-09-01'",
+                            "sqlite")
+    check_shape(diff)
+    assert [d.text for d in diff.items] == ["A 查的是 orders 表，B 查的是 orders_archive 表", FALLBACK_REST]
 
 
 def test_ordering_that_decides_which_row_distinct_on_keeps_is_not_just_ordering():
@@ -1269,17 +1262,15 @@ def test_only_literals_changed_is_still_the_same_template_in_round_three(dialect
     assert na.same_shape(nb) and na.literals != nb.literals
 
 
-def test_a_join_on_a_primary_key_against_an_in_subquery_is_not_described_with_the_schema():
-    """按主键关联 users（每张订单最多关联上一个用户）和 user_id IN (SELECT id FROM users) 是一回事：给了表结构（知道
-    users.id 是主键）就不说「A 关联了 users 表，B 没有关联它」；没给表结构时关联可能把行复制，这句话是对的。"""
+def test_a_join_against_an_in_subquery_gets_only_the_fallback():
+    """按主键关联 users 和 user_id IN (SELECT id FROM users) 是一回事（每张订单最多关联上一个用户）：以前没给表结构时
+    说「A 关联了 users 表，B 没有关联它」。条件里有子查询的不是简单形状，给不给表结构都只给兜底。"""
     a = "SELECT o.id, o.amount FROM orders o JOIN users u ON u.id = o.user_id"
     b = "SELECT o.id, o.amount FROM orders o WHERE o.user_id IN (SELECT id FROM users)"
-    diff = explain_sql_diff(a, b, "sqlite", schema=sql_pairs.schema_cache())
-    check_shape(diff)
-    assert all(d.aspect == "other" for d in diff.items), diff.items
-    diff = explain_sql_diff(a, b, "sqlite")
-    check_shape(diff)
-    assert diff.fallback and diff.items[0].text.startswith("A 关联了 users 表")
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(a, b, "sqlite", schema=schema)
+        check_shape(diff)
+        assert diff.items == [FacetDiff("other", None, None, FALLBACK)], diff.items
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
@@ -1299,3 +1290,166 @@ def test_a_join_rewritten_on_one_side_only_is_not_described_as_missing(dialect, 
             diff = explain_sql_diff(x, y, dialect, schema=schema)
             check_shape(diff)
             assert not any(d.aspect == "join" for d in diff.items), (dialect, diff.items)
+
+
+# --------------------------------------------------------------------------
+# 第 4 轮：解析保真守卫、具体说法只说真会影响结果的不同
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE status = 'paid' IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE status = ('paid' IS NULL)"),
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE amount < 100 IN (0, 1)",
+     "SELECT COUNT(*) FROM orders WHERE amount < (100 IN (0, 1))"),
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE amount = 1 BETWEEN 0 AND 1",
+     "SELECT COUNT(*) FROM orders WHERE amount = (1 BETWEEN 0 AND 1)"),
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE status = region NOT NULL",
+     "SELECT COUNT(*) FROM orders WHERE status = (region NOT NULL)"),
+    ("postgres", "SELECT COUNT(*) FROM orders WHERE amount > ALL (SELECT amount FROM refunds) IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE amount > ALL ((SELECT amount FROM refunds) IS NULL)"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE amount = CASE WHEN tax > 0 THEN 1 END IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE amount = (CASE WHEN tax > 0 THEN 1 END IS NULL)"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE status = 'paid' LIKE 'p%'",
+     "SELECT COUNT(*) FROM orders WHERE status = ('paid' LIKE 'p%')"),
+    ("mysql", "SELECT id, id | 1 ^ 2 FROM orders", "SELECT id, (id | 1) ^ 2 FROM orders"),
+    ("mysql", "SELECT 'pa' 'id' FROM orders", "SELECT 'pa' FROM orders"),
+    ("sqlite", "SELECT id, amount * 2_0 FROM orders", "SELECT id, amount * 2 FROM orders"),
+    (None, "SELECT id FROM orders WHERE status = 'a\\Z'", "SELECT id FROM orders WHERE status = 'a\\\\Z'"),
+    (None, "SELECT id FROM orders WHERE status || 'x' = 'paidx'", "SELECT id FROM orders WHERE status = 'paid'"),
+], ids=["is-after-eq", "in-after-lt", "between-after-eq", "postfix-not-null", "all-then-is", "case-then-is",
+        "like-after-eq", "mysql-or-xor-bits", "adjacent-strings", "digit-separator", "unknown-backslash",
+        "unknown-pipes"])
+def test_sql_the_parser_would_read_wrongly_gets_only_the_fallback_and_the_original_lines(dialect, a, b):
+    """原文里有 sqlglot 会读错的写法（各方言的结合顺序和 sqlglot 不一样、字符串里的反斜杠、数字写法、挨着写的字符串常量、
+    方言不知道时的 ||）：不在语法树上判等价，也不给具体说法，只给兜底，text_diff 是原文的逐行对照。"""
+    for x, y in ((a, b), (b, a)):
+        diff = explain_sql_diff(x, y, dialect)
+        check_shape(diff)
+        assert not diff.equivalent and diff.items == [FacetDiff("other", None, None, FALLBACK)], diff.items
+        assert diff.text_diff == (f"- {x}", f"+ {y}")
+    # 一字不差照样算等价
+    assert explain_sql_diff(a, "  " + a + "\n", dialect).equivalent
+
+
+def test_the_original_lines_are_compared_line_by_line():
+    """原文有好几行时，原文的逐行对照只列不同的行。"""
+    a = "SELECT COUNT(*)\nFROM orders\nWHERE status = 'paid' IS NULL"
+    b = "SELECT COUNT(*)\nFROM orders\nWHERE status = ('paid' IS NULL)"
+    diff = explain_sql_diff(a, b, "sqlite")
+    check_shape(diff)
+    assert diff.text_diff == ("- WHERE status = 'paid' IS NULL", "+ WHERE status = ('paid' IS NULL)")
+
+
+@pytest.mark.parametrize("dialect,sql", [
+    ("sqlite", "SELECT o.id, SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id AND u.city IS NOT NULL "
+               "WHERE o.amount BETWEEN 1 AND 10 AND o.status NOT IN ('void') AND o.paid_at IS NOT NULL "
+               "GROUP BY o.id HAVING COUNT(*) > 1 ORDER BY 2 DESC LIMIT 5"),
+    ("postgres", "SELECT CASE WHEN status = 'paid' THEN amount ELSE 0 END, status IS DISTINCT FROM region "
+                 "FROM orders WHERE amount > ALL (SELECT amount FROM refunds) AND flags & 4 = 4"),
+    ("mysql", "SELECT id FROM orders WHERE LEFT(status, 1) = 'p' AND status = 'pa''id' || amount > 3 && tax < 1"),
+    ("sqlite", "SELECT LEFT(status, 2) = 'pa', amount << 2, 'a' || status FROM orders WHERE x NOT NULL"),
+], ids=["ordinary-sqlite", "ordinary-postgres", "ordinary-mysql", "ordinary-functions"])
+def test_ordinary_sql_is_not_held_back_by_the_parser_guard(dialect, sql):
+    """常见的写法（AND 分开的几个比较、BETWEEN 自己的 AND、IS DISTINCT FROM、> ALL (…)、flags & 4 = 4、MySQL 的
+    ISNULL(x) 函数和 || / &&、LEFT(…) 函数、单独的 <<、拼接）不算会读错的写法：照常规范化，加个空格照样认得出等价。"""
+    from app.data.sql_semantics import _lost_in_parsing, _misread, _parse, _read, _tokens
+
+    read = _read(dialect)
+    tree, error = _parse(sql, read)
+    assert error is None and not _lost_in_parsing(sql, read, tree)
+    assert explain_sql_diff(sql, sql.replace(" FROM ", "  FROM "), dialect).equivalent
+    # MySQL 的 ISNULL(x) 是函数，不算和 = 混用的谓词
+    text = "SELECT id FROM orders WHERE ISNULL(status) = 1"
+    assert _misread(_tokens(text, "mysql"), text, "mysql") is None
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("sqlite", "SELECT id, amount * 1_000 FROM orders", "SELECT id, amount * 2_000 FROM orders"),
+    ("postgres", "SELECT id, amount + 0o17 FROM orders", "SELECT id, amount + 0o20 FROM orders"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE status = 'pa\\Zid'", "SELECT COUNT(*) FROM orders WHERE status = 'pa\\\\Zid'"),
+], ids=["digit-separator", "octal", "backslash"])
+def test_only_literals_changed_in_misread_sql_is_still_the_same_template(dialect, a, b):
+    """sqlglot 会读错的写法改按原文逐词规范化：1_000、0o17 这类数字和后面紧跟着的名字算一个字面量，只改了字面量的照旧
+    是同一个模板，字面量照原文列出（'pa\\Zid' 和 'pa\\\\Zid' 是两个不同的值）。"""
+    na, nb = normalize_sql(a, dialect), normalize_sql(b, dialect)
+    assert na.same_shape(nb) and na.literals != nb.literals
+    assert not normalize_sql(a, dialect).same_shape(normalize_sql(a.replace(" FROM", ", 1 FROM", 1), dialect))
+
+
+@pytest.mark.parametrize("a,b", [
+    # 只筛掉空值的条件，另一边的聚合本来就跳过空值
+    ("SELECT SUM(amount) FROM orders WHERE amount > 0 OR amount <= 0", "SELECT SUM(amount) FROM orders"),
+    ("SELECT MIN(amount) FROM orders WHERE amount > 5 OR amount <= 5", "SELECT MIN(amount) FROM orders"),
+    ("SELECT COUNT(*) FROM orders WHERE amount > 0 OR amount <= 0 OR amount IS NULL", "SELECT COUNT(*) FROM orders"),
+    # 结果只有一行、值又和行无关：多一个条件、少一张表都看不出来
+    ("SELECT COUNT(*) > -1 FROM orders WHERE status = 'paid'", "SELECT COUNT(*) > -1 FROM orders"),
+    ("SELECT CASE WHEN COUNT(*) >= 0 THEN 1 END FROM orders WHERE status = 'paid'",
+     "SELECT CASE WHEN COUNT(*) >= 0 THEN 1 END FROM orders"),
+    ("SELECT COUNT(*) > -1 FROM orders", "SELECT COUNT(*) > -1 FROM orders_archive"),
+    ("SELECT MAX(o.amount), COUNT(*) > -1 FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT MAX(o.amount), COUNT(*) > -1 FROM orders o"),
+    # 多 LEFT JOIN 一张表只会让行重复：只取第一行时重复出来的和原来那行一样
+    ("SELECT o.id, o.amount FROM orders o LEFT JOIN refunds r ON r.order_id = o.id ORDER BY o.id LIMIT 1",
+     "SELECT o.id, o.amount FROM orders o ORDER BY o.id LIMIT 1"),
+    # 聚合的参数在组里是定死的：被 WHERE 定成常量、等于分组键、本身是常量
+    ("SELECT MIN(amount) FROM orders WHERE amount = 5", "SELECT MAX(amount) FROM orders WHERE amount = 5"),
+    ("SELECT user_id, MIN(user_id) FROM orders GROUP BY user_id", "SELECT user_id, MAX(user_id) FROM orders GROUP BY user_id"),
+    ("SELECT user_id, AVG(DISTINCT user_id) FROM orders GROUP BY user_id",
+     "SELECT user_id, AVG(user_id) FROM orders GROUP BY user_id"),
+    ("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id", "SELECT user_id, SUM(1) FROM orders GROUP BY user_id"),
+    ("SELECT MIN(5) FROM orders", "SELECT MAX(5) FROM orders"),
+    # 去重不起作用：只出一行、只取一行
+    ("SELECT DISTINCT COUNT(*) FROM orders", "SELECT COUNT(*) FROM orders"),
+    ("SELECT DISTINCT amount FROM orders ORDER BY amount LIMIT 1", "SELECT amount FROM orders ORDER BY amount LIMIT 1"),
+    # 条件恒为假：两边都没有行
+    ("SELECT COUNT(*) FROM orders WHERE amount > 5 AND amount < 3 AND status = 'paid'",
+     "SELECT COUNT(*) FROM orders WHERE amount > 5 AND amount < 3"),
+    ("SELECT SUM(amount) FROM orders WHERE 1 = 0 AND status = 'paid'", "SELECT AVG(amount) FROM orders WHERE 1 = 0"),
+    # LEFT JOIN 对内连接：结果只取可空一侧跳过空值的聚合、FILTER，或者后面的内连接引用了可空一侧
+    ("SELECT COUNT(*) FILTER (WHERE r.amount > 0) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(*) FILTER (WHERE r.amount > 0) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT MAX(r.amount), COUNT(*) > -1 FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT MAX(r.amount), COUNT(*) > -1 FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id JOIN payments p ON p.order_id = r.order_id",
+     "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id JOIN payments p ON p.order_id = r.order_id"),
+], ids=lambda v: None)
+def test_differences_that_cannot_change_the_result_are_not_described(a, b):
+    """第 4 轮之后自己压测的反例：两条结果一样（这几组数据上执行也一样），以前会说出不存在的不同——只筛掉空值的条件对
+    跳过空值的聚合、只出一行又和行无关的结果、在组里定死的聚合参数、只出一行的去重、恒为假的条件、看不见没关联上的行的
+    LEFT JOIN。给不给表结构都只许给兜底（或者认出等价）。"""
+    databases = sql_pairs.build_databases()
+    try:
+        assert all(sql_pairs.run(c, a) == sql_pairs.run(c, b) for c in databases), "反例没造好：结果不一样"
+    finally:
+        for c in databases:
+            c.close()
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, "sqlite", schema=schema)
+            check_shape(diff)
+            assert diff.equivalent or all(d.aspect == "other" for d in diff.items), (x, y, diff.items)
+
+
+@pytest.mark.parametrize("a,b", [
+    ("SELECT COUNT(*) FROM orders WHERE id IS NOT NULL", "SELECT COUNT(*) FROM orders"),
+    ("SELECT id, SUM(amount) FROM orders GROUP BY id", "SELECT id, AVG(amount) FROM orders GROUP BY id"),
+    ("SELECT DISTINCT id, status FROM orders", "SELECT id, status FROM orders"),
+    ("SELECT DISTINCT status FROM orders WHERE id = 5", "SELECT status FROM orders WHERE id = 5"),
+    ("SELECT COUNT(DISTINCT status) FROM orders WHERE id = 5", "SELECT COUNT(status) FROM orders WHERE id = 5"),
+    ("SELECT o.id FROM orders o LEFT JOIN users u ON u.id = o.user_id", "SELECT o.id FROM orders o"),
+    ("SELECT COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id", "SELECT COUNT(*) FROM orders o"),
+], ids=lambda v: None)
+def test_constraints_only_make_the_explanation_say_less(a, b):
+    """表结构里的约束不拿来判等价，只拿来少说：主键不为空（id IS NOT NULL 恒为真）、主键定下来每组只有一行（SUM 和
+    AVG 一样）、选出来的列含主键或者 WHERE 把主键定死（去重不起作用）、按主键关联（不会重复）、有外键指过去又按它的
+    键关联（每行都关联得上）——给了表结构时都只给兜底；没给表结构时不知道有这些约束，说得出具体的不同。"""
+    schema = sql_pairs.schema_cache()
+    schema["tables"]["orders"]["foreign_keys"] = [{"columns": ["user_id"], "to_table": "users", "to_columns": ["id"]}]
+    for x, y in ((a, b), (b, a)):
+        diff = explain_sql_diff(x, y, "sqlite", schema=schema)
+        check_shape(diff)
+        assert not diff.equivalent and all(d.aspect == "other" for d in diff.items), (x, y, diff.items)
+        diff = explain_sql_diff(x, y, "sqlite")
+        check_shape(diff)
+        assert any(d.aspect != "other" for d in diff.items), (x, y, diff.items)

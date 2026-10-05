@@ -15,7 +15,9 @@ OR 里的标量子查询改成 CROSS JOIN，都是复验时真踩到的），所
 某个方言、某种排序规则下才等价的）。第 2 轮复验的反例在 _SAME_HARD、_SAME_R2、_DIFF_R2（执行）和 REGRESSIONS_R2、
 DIALECT_SAME_R2、KNOWN_UNRECOGNIZED（各方言，只查结论）里；第 3 轮的在 _DIFF_R3、_SAME_R3、_SAME_TYPED_R3（要给表结构才认得出，Pair.typed）、_SAME_SCHEMA_R3（要靠
 表结构里的主键才看得出等价，Pair.needs_schema）、_SAME_HARD_R3（执行）和 REGRESSIONS_R3、DIALECT_SAME_R3（只查
-结论）里。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料（EXISTS 里的 LIMIT 1 OFFSET 1 只看有没有
+结论）里；第 4 轮的在 _DIFF_R4、_SAME_HARD_R4、_SAME_SCHEMA_R4（执行）和 REGRESSIONS_R4、DIALECT_SAME_R4、
+CONSTRAINT_TRAPS_R4（只查结论，靠约束改写的陷阱另造一个小库执行）里。规范化不再靠约束改写，needs_schema 的对一律
+不判等价，给了表结构时只许给兜底。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料（EXISTS 里的 LIMIT 1 OFFSET 1 只看有没有
 第二行，不看先后）。过去复验报过的反例都收进来了：第 5 轮回退的「只在 IN 子查询里用到的 CTE」在 PAIRS 里；复验者留在 /private/tmp 的脚本里、在这几组数据上
 结果不同的对是 VALIDATOR_DIFF（也进 PAIRS 执行）；旧测试（五轮复核修正按复验报告补的用例，各方言，用到的列这个库里
 不全有）里报过不同的对是 REGRESSIONS、意思一样的对是 DIALECT_SAME，这两份不执行，只查判没判等价。
@@ -2651,6 +2653,368 @@ DIALECT_SAME_R3: list[tuple[str, str, str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------- 第 4 轮复验的反例
+# 第 3 轮补充之后的复验（漏报、错报、执行比对三位复验者）报的全部 blocker / major。复验者的借阅库改写成这里的表：
+# loans → orders（lid → id，mid → user_id，fee → amount，state → status），fines → refunds（lid → order_id，
+# fid → id），members → users（mid → id，inviter_id → referrer_id，level → grade），books → stores，payments 照旧
+# （lid → order_id）；复验者的 customers / coupons 改写成 users / 下面 CONSTRAINT_TRAPS_R4 里现造的表。只在
+# PostgreSQL / MySQL 才有的写法在 REGRESSIONS_R4，要专门的表结构（TEXT 主键、部分唯一索引）才出错的在
+# CONSTRAINT_TRAPS_R4。
+
+#: 不许判等价的（SQLite 上执行）。blocker：sqlglot 读错了结合顺序（SQLite 里 IS、IN、LIKE、BETWEEN 和 = 同级、从左往右，
+#: < > 比它们紧；sqlglot 一律让 IS / IN 先结合）、数字写法（1_000 是一千，sqlglot 切成 1 和别名 _000）；另有两对
+#: 真不同、以前却说出了不存在的差异的（多说一句排序、两边都 DISTINCT 却说「一边没去重」）。执行比对复验者在副本上把
+#: 判定改松、没有任何测试变红的 9 个反例也收在这里（每一对都不许判等价）。
+_DIFF_R4 = [
+    ("r4-eq-then-is-null", "SELECT COUNT(*) FROM orders WHERE status = 'paid' IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE status = ('paid' IS NULL)"),
+    ("r4-gt-then-is-not-null-in-cte", "WITH k AS (SELECT user_id FROM orders WHERE amount > 50 IS NOT NULL) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM k)",
+     "WITH k AS (SELECT user_id FROM orders WHERE amount > (50 IS NOT NULL)) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM k)"),
+    ("r4-lt-then-in", "SELECT COUNT(*) FROM orders WHERE amount < 100 IN (0, 1)",
+     "SELECT COUNT(*) FROM orders WHERE amount < (100 IN (0, 1))"),
+    ("r4-eq-then-in", "SELECT COUNT(*) FROM orders WHERE amount = 100 IN (0, 1)",
+     "SELECT COUNT(*) FROM orders WHERE amount = (100 IN (0, 1))"),
+    ("r4-compared-booleans-then-is-null", "SELECT COUNT(*) FROM orders WHERE (amount > 0) = (amount > 10) IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE (amount > 0) = ((amount > 10) IS NULL)"),
+    ("r4-digit-separator", "SELECT id, amount * 1_000 FROM orders", "SELECT id, amount * 1_500 FROM orders"),
+    ("r4-digit-separator-vs-one", "SELECT user_id, SUM(amount) * 1_000 FROM orders GROUP BY user_id",
+     "SELECT user_id, SUM(amount) * 1 FROM orders GROUP BY user_id"),
+    # 真不同，但以前多说了一句不存在的排序差异（user_id 被 WHERE 定死了）
+    ("r4-limit-differs-order-key-pinned", "SELECT id FROM orders WHERE user_id = 3 ORDER BY user_id, id LIMIT 2",
+     "SELECT id FROM orders WHERE user_id = 3 ORDER BY id LIMIT 3"),
+    # 两边都 DISTINCT，真正的不同是第 2 列取不取日期：以前说「A 没有去重」「B 没有」，自相矛盾
+    ("r4-distinct-date-vs-time", "SELECT DISTINCT user_id, date(paid_at) FROM orders",
+     "SELECT DISTINCT user_id, paid_at FROM orders"),
+    ("r4-distinct-lower-vs-plain", "SELECT DISTINCT lower(status) FROM orders", "SELECT DISTINCT status FROM orders"),
+    ("r4-distinct-date-vs-time-in-derived", "SELECT COUNT(*) FROM (SELECT DISTINCT user_id, date(paid_at) FROM orders) t",
+     "SELECT COUNT(*) FROM (SELECT DISTINCT user_id, paid_at FROM orders) t"),
+    # LEFT JOIN 之后的内连接引用的是保留的一侧（o），这次 LEFT JOIN 确实留下了没有退款的订单
+    ("r4-left-then-inner-on-preserved", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "JOIN payments p ON p.order_id = o.id",
+     "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id JOIN payments p ON p.order_id = o.id"),
+    # 执行比对复验者改松判定后没有任何测试变红的反例
+    ("r4-null-blind-with-count-star", "SELECT COUNT(r.amount), COUNT(*) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id",
+     "SELECT COUNT(r.amount), COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("r4-exists-limit-zero", "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id "
+     "LIMIT 0)",
+     "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)"),
+    ("r4-in-group-by-other-key", "SELECT COUNT(*) FROM users WHERE id IN (SELECT r.user_id FROM refunds r "
+     "GROUP BY r.order_id)",
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT r.user_id FROM refunds r)"),
+    ("r4-false-literal-equality", "SELECT COUNT(*) FROM orders WHERE status = 'paid' AND 1 = 0",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+    ("r4-count-null-literal", "SELECT COUNT(NULL) FROM orders", "SELECT COUNT(*) FROM orders"),
+    ("r4-not-not-value", "SELECT NOT NOT amount FROM orders", "SELECT amount FROM orders"),
+    ("r4-and-of-same-value", "SELECT amount AND amount FROM orders", "SELECT amount FROM orders"),
+    ("r4-left-join-on-key-or-other", "SELECT o.id, o.amount FROM orders o LEFT JOIN users u "
+     "ON u.id = o.user_id OR u.id = o.referrer_id",
+     "SELECT o.id, o.amount FROM orders o"),
+    ("r4-equal-columns-of-different-types", "SELECT o.status FROM orders o JOIN users u ON u.id = o.status",
+     "SELECT u.id FROM orders o JOIN users u ON u.id = o.status"),
+]
+
+#: 意思一样、要按语义推理才看得出（规范化不保证认得出）的：认不出时只许给兜底说明。以前都说出了具体的不同——ON 里多余的
+#: IS NOT NULL（看行出来先后的一段）、UNION 对 UNION ALL（使用方是 IN、COUNT(DISTINCT)、DISTINCT、MAX）、被 WHERE
+#: 定成常量的排序键 / 分组键 / 选出来的列、LEFT JOIN 之后引用可空一侧的内连接、恒为真的 HAVING、FROM 里的子查询有外层
+#: 不在乎的不同、条件挪出 CTE、内连接的条件写在 ON 还是 WHERE（排在 LEFT JOIN 后面）、WHERE 里用列别名、TOTAL 和
+#: FILTER 只取可空一侧
+_SAME_HARD_R4 = [
+    ("r4-left-then-inner-on-nullable", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "JOIN payments p ON p.order_id = r.order_id",
+     "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id JOIN payments p ON p.order_id = r.order_id"),
+    ("r4-left-then-inner-on-nullable-where", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "JOIN users u ON u.id = r.user_id WHERE o.status = 'open'",
+     "SELECT COUNT(*) FROM orders o JOIN refunds r ON r.order_id = o.id JOIN users u ON u.id = r.user_id "
+     "WHERE o.status = 'open'"),
+    ("r4-left-then-inner-on-nullable-sum", "SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id JOIN payments p ON p.order_id = r.order_id",
+     "SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id JOIN payments p ON p.order_id = r.order_id"),
+    ("r4-left-on-redundant-not-null-limit", "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "AND r.order_id IS NOT NULL ORDER BY o.id, r.id LIMIT 7",
+     "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id ORDER BY o.id, r.id LIMIT 7"),
+    ("r4-left-on-redundant-not-null-window", "SELECT o.id, r.id, ROW_NUMBER() OVER (PARTITION BY o.id ORDER BY r.id) "
+     "AS rn FROM orders o LEFT JOIN refunds r ON r.order_id = o.id AND r.order_id IS NOT NULL",
+     "SELECT o.id, r.id, ROW_NUMBER() OVER (PARTITION BY o.id ORDER BY r.id) AS rn FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id"),
+    ("r4-left-on-not-null-implied-by-comparison-limit", "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id AND r.amount > o.amount AND r.amount IS NOT NULL ORDER BY o.id, r.id LIMIT 8",
+     "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id AND r.amount > o.amount "
+     "ORDER BY o.id, r.id LIMIT 8"),
+    ("r4-union-in-cte-used-by-in", "WITH u AS (SELECT user_id FROM orders UNION SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM u)",
+     "WITH u AS (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM u)"),
+    ("r4-union-in-derived-count-distinct", "SELECT COUNT(DISTINCT user_id) FROM (SELECT user_id FROM orders UNION "
+     "SELECT user_id FROM refunds) t",
+     "SELECT COUNT(DISTINCT user_id) FROM (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) t"),
+    ("r4-union-in-derived-distinct", "SELECT DISTINCT t.user_id FROM (SELECT user_id FROM orders UNION "
+     "SELECT user_id FROM refunds) t",
+     "SELECT DISTINCT t.user_id FROM (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) t"),
+    ("r4-union-in-derived-max", "SELECT MAX(t.amount) FROM (SELECT amount FROM orders UNION SELECT amount FROM refunds) t",
+     "SELECT MAX(t.amount) FROM (SELECT amount FROM orders UNION ALL SELECT amount FROM refunds) t"),
+    ("r4-union-in-cte-count-distinct", "WITH t AS (SELECT user_id FROM orders UNION SELECT user_id FROM refunds) "
+     "SELECT COUNT(DISTINCT user_id) FROM t",
+     "WITH t AS (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) SELECT COUNT(DISTINCT user_id) FROM t"),
+    ("r4-union-in-cte-used-by-two-ins", "WITH u AS (SELECT user_id FROM orders UNION SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM u) OR referrer_id IN (SELECT user_id FROM u)",
+     "WITH u AS (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM u) OR referrer_id IN (SELECT user_id FROM u)"),
+    ("r4-union-in-cte-used-by-two-exists", "WITH u AS (SELECT user_id FROM orders UNION SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users s WHERE EXISTS (SELECT 1 FROM u WHERE u.user_id = s.id) "
+     "OR EXISTS (SELECT 1 FROM u WHERE u.user_id = s.referrer_id)",
+     "WITH u AS (SELECT user_id FROM orders UNION ALL SELECT user_id FROM refunds) "
+     "SELECT COUNT(*) FROM users s WHERE EXISTS (SELECT 1 FROM u WHERE u.user_id = s.id) "
+     "OR EXISTS (SELECT 1 FROM u WHERE u.user_id = s.referrer_id)"),
+    ("r4-order-key-pinned-limit", "SELECT id, amount FROM orders WHERE status = 'paid' ORDER BY status, id LIMIT 5",
+     "SELECT id, amount FROM orders WHERE status = 'paid' ORDER BY id LIMIT 5"),
+    ("r4-order-key-pinned-by-number-limit", "SELECT id, amount FROM orders WHERE user_id = 3 ORDER BY user_id, id LIMIT 5",
+     "SELECT id, amount FROM orders WHERE user_id = 3 ORDER BY id LIMIT 5"),
+    ("r4-order-key-pinned-by-in-limit", "SELECT id, amount FROM orders WHERE user_id IN (3) ORDER BY user_id, id LIMIT 5",
+     "SELECT id, amount FROM orders WHERE user_id IN (3) ORDER BY id LIMIT 5"),
+    ("r4-order-key-pinned", "SELECT id, amount FROM orders WHERE user_id = 3 ORDER BY user_id DESC, id",
+     "SELECT id, amount FROM orders WHERE user_id = 3 ORDER BY id"),
+    ("r4-group-key-pinned", "SELECT status, COUNT(*) FROM orders WHERE user_id = 3 GROUP BY user_id, status",
+     "SELECT status, COUNT(*) FROM orders WHERE user_id = 3 GROUP BY status"),
+    ("r4-group-keys-pinned", "SELECT status, COUNT(*) FROM orders WHERE user_id = 2 AND is_deleted = 0 "
+     "GROUP BY user_id, status, is_deleted",
+     "SELECT status, COUNT(*) FROM orders WHERE user_id = 2 AND is_deleted = 0 GROUP BY status"),
+    ("r4-order-key-pinned-through-join", "SELECT o.id, r.id FROM orders o JOIN refunds r ON r.order_id = o.id "
+     "WHERE o.id = 4 ORDER BY r.order_id, r.id",
+     "SELECT o.id, r.id FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.id = 4 ORDER BY r.id"),
+    ("r4-having-count-not-zero", "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) <> 0",
+     "SELECT user_id FROM orders GROUP BY user_id"),
+    ("r4-having-not-count-zero", "SELECT user_id FROM orders GROUP BY user_id HAVING NOT COUNT(*) = 0",
+     "SELECT user_id FROM orders GROUP BY user_id"),
+    ("r4-having-sum-one", "SELECT user_id FROM orders GROUP BY user_id HAVING SUM(1) > 0",
+     "SELECT user_id FROM orders GROUP BY user_id"),
+    ("r4-having-count-not-zero-with-sum", "SELECT user_id, SUM(amount) FROM orders GROUP BY user_id HAVING COUNT(*) <> 0",
+     "SELECT user_id, SUM(amount) FROM orders GROUP BY user_id"),
+    ("r4-exists-group-having-not-zero", "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r "
+     "WHERE r.order_id = o.id GROUP BY r.order_id HAVING COUNT(*) <> 0)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"),
+    ("r4-in-group-having-not-zero", "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM refunds "
+     "GROUP BY user_id HAVING COUNT(*) <> 0)",
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM refunds)"),
+    ("r4-outputs-pinned-to-same-constant", "SELECT o.id, o.user_id FROM orders o JOIN refunds r ON r.order_id = o.id "
+     "WHERE o.user_id = 3 AND r.user_id = 3",
+     "SELECT o.id, r.user_id FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.user_id = 3 AND r.user_id = 3"),
+    ("r4-max-of-columns-pinned-to-same-constant", "SELECT MAX(o.user_id) FROM orders o JOIN refunds r "
+     "ON r.order_id = o.id WHERE o.user_id = 3 AND r.user_id = 3",
+     "SELECT MAX(r.user_id) FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.user_id = 3 AND r.user_id = 3"),
+    ("r4-derived-limit-under-max", "SELECT MAX(t.amount) FROM (SELECT amount FROM orders ORDER BY amount DESC, id "
+     "LIMIT 3) t",
+     "SELECT MAX(t.amount) FROM (SELECT amount FROM orders ORDER BY amount DESC, id LIMIT 5) t"),
+    ("r4-derived-group-under-count-distinct", "SELECT COUNT(DISTINCT t.user_id) FROM (SELECT user_id, SUM(amount) AS s "
+     "FROM orders GROUP BY user_id) t",
+     "SELECT COUNT(DISTINCT t.user_id) FROM (SELECT user_id, SUM(amount) AS s FROM orders GROUP BY user_id, status) t"),
+    ("r4-filter-moved-out-of-cte", "WITH t AS (SELECT user_id, COUNT(*) AS n FROM orders WHERE status = 'paid' "
+     "GROUP BY user_id) SELECT COUNT(*) FROM t WHERE n >= 2",
+     "WITH t AS (SELECT user_id, status, COUNT(*) AS n FROM orders GROUP BY user_id, status) "
+     "SELECT COUNT(*) FROM t WHERE n >= 2 AND status = 'paid'"),
+    ("r4-inner-on-vs-where-after-left", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "JOIN stores s ON s.id = o.store_id AND s.city = 'SH'",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id JOIN stores s ON s.id = o.store_id "
+     "WHERE s.city = 'SH'"),
+    ("r4-inner-on-vs-where-after-rejected-left", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id JOIN stores s ON s.id = o.store_id AND s.region = 'east' WHERE r.amount > 0",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id JOIN stores s ON s.id = o.store_id "
+     "WHERE r.amount > 0 AND s.region = 'east'"),
+    ("r4-preserved-side-condition-in-later-on", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id JOIN users u ON u.id = o.user_id AND o.status = 'paid'",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id JOIN users u ON u.id = o.user_id "
+     "WHERE o.status = 'paid'"),
+    ("r4-where-uses-time-alias", "SELECT id, date(paid_at) AS d FROM orders WHERE d >= '2026-09-01' AND d < '2026-10-01'",
+     "SELECT id, date(paid_at) AS d FROM orders WHERE date(paid_at) >= '2026-09-01' AND date(paid_at) < '2026-10-01'"),
+    ("r4-where-uses-computed-alias", "SELECT id, amount - discount AS net FROM orders WHERE net > 50",
+     "SELECT id, amount - discount AS net FROM orders WHERE amount - discount > 50"),
+    ("r4-double-quoted-column-case", "SELECT COUNT(*) FROM orders WHERE \"STATUS\" = 'paid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+    ("r4-left-total-vs-inner", "SELECT TOTAL(r.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT TOTAL(r.amount) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("r4-left-count-filter-vs-inner", "SELECT COUNT(*) FILTER (WHERE r.amount > 0) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id",
+     "SELECT COUNT(*) FILTER (WHERE r.amount > 0) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+]
+
+#: 意思一样、要靠表结构里的约束（主键唯一、不为空）才看得出的。约束不可靠（SQLite 的类型亲和、COLLATE、部分唯一
+#: 索引、MySQL 的隐式转换都能让「唯一」不成立），规范化不再靠约束改写，这些一律不判等价；给了表结构时也不许说出约束
+#: 已经排除了的不同（只给兜底），没给表结构时说得出具体的不同不算错（那时确实不知道有约束）
+_SAME_SCHEMA_R4 = [
+    ("r4-not-null-primary-key-limit", "SELECT id, amount FROM orders WHERE id IS NOT NULL ORDER BY id LIMIT 3",
+     "SELECT id, amount FROM orders ORDER BY id LIMIT 3"),
+    ("r4-count-primary-key-limit", "SELECT user_id, COUNT(id) AS n FROM orders GROUP BY user_id ORDER BY n DESC, user_id "
+     "LIMIT 3",
+     "SELECT user_id, COUNT(*) AS n FROM orders GROUP BY user_id ORDER BY n DESC, user_id LIMIT 3"),
+    ("r4-count-primary-key-window", "SELECT user_id, COUNT(id), RANK() OVER (ORDER BY user_id) FROM orders "
+     "GROUP BY user_id",
+     "SELECT user_id, COUNT(*), RANK() OVER (ORDER BY user_id) FROM orders GROUP BY user_id"),
+    ("r4-distinct-with-key-through-key-join", "SELECT DISTINCT o.id, s.name FROM orders o JOIN stores s "
+     "ON s.id = o.store_id",
+     "SELECT o.id, s.name FROM orders o JOIN stores s ON s.id = o.store_id"),
+    ("r4-distinct-with-key-through-left-key-join", "SELECT DISTINCT o.id, u.name FROM orders o LEFT JOIN users u "
+     "ON u.id = o.user_id",
+     "SELECT o.id, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id"),
+    ("r4-count-distinct-primary-key", "SELECT COUNT(DISTINCT id) FROM orders", "SELECT COUNT(*) FROM orders"),
+    ("r4-count-distinct-primary-key-vs-count", "SELECT COUNT(DISTINCT id) FROM orders", "SELECT COUNT(id) FROM orders"),
+    ("r4-order-after-primary-key-limit", "SELECT id, amount FROM orders ORDER BY id, amount LIMIT 5",
+     "SELECT id, amount FROM orders ORDER BY id LIMIT 5"),
+    ("r4-group-by-key-and-dependent", "SELECT u.id, u.name, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id "
+     "GROUP BY u.id, u.name",
+     "SELECT u.id, u.name, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.id"),
+    ("r4-union-of-disjoint-keys", "SELECT id FROM users WHERE grade = 1 UNION SELECT id FROM users WHERE grade = 2",
+     "SELECT id FROM users WHERE grade = 1 UNION ALL SELECT id FROM users WHERE grade = 2"),
+    ("r4-left-join-count-vs-scalar-count", "SELECT o.id, COUNT(r.id) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id GROUP BY o.id",
+     "SELECT o.id, (SELECT COUNT(*) FROM refunds r WHERE r.order_id = o.id) FROM orders o"),
+]
+
+#: 只在 PostgreSQL / MySQL 才有的写法（不执行，只查不判等价、只给兜底）：复验者在真实的 PostgreSQL 18.6、MySQL 8.0.46
+#: 上跑出结果不同。MySQL 字符串里的 \Z 是 Ctrl+Z、\0 是 NUL，sqlglot 原样留着反斜杠，和写成 \\Z 的撞成同一个值；
+#: PostgreSQL 的 IS 比 = 结合得松，0o17 是八进制的 15、1_000 是一千；MySQL 的比较运算同级从左往右，& 比 | 紧、<< 比
+#: & 紧、^ 比 * 紧，AND 比 XOR 紧
+REGRESSIONS_R4: list[tuple[str, str, str, str]] = [
+    ("mysql_backslash_z", "mysql", "SELECT COUNT(*) FROM orders WHERE status = 'pa\\Zid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'pa\\\\Zid'"),
+    ("mysql_backslash_z_in_cte_used_by_in", "mysql",
+     "WITH p AS (SELECT user_id FROM orders WHERE status <> 'x\\Z') SELECT COUNT(*) FROM users "
+     "WHERE id IN (SELECT user_id FROM p)",
+     "WITH p AS (SELECT user_id FROM orders WHERE status <> 'x\\\\Z') SELECT COUNT(*) FROM users "
+     "WHERE id IN (SELECT user_id FROM p)"),
+    ("mysql_backslash_zero", "mysql", "SELECT COUNT(*) FROM orders WHERE status IN ('a\\0', 'paid')",
+     "SELECT COUNT(*) FROM orders WHERE status IN ('a\\\\0', 'paid')"),
+    ("mariadb_backslash_z", "mariadb", "SELECT COUNT(*) FROM orders WHERE status = 'pa\\Zid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'pa\\\\Zid'"),
+    ("unknown_dialect_backslash_z", "", "SELECT COUNT(*) FROM orders WHERE status = 'pa\\Zid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'pa\\\\Zid'"),
+    ("pg_compared_booleans_then_is_null", "postgres",
+     "SELECT COUNT(*) FROM orders WHERE (amount > 0) = (amount > 10) IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE (amount > 0) = ((amount > 10) IS NULL)"),
+    ("pg_is_distinct_from_then_eq", "postgres", "SELECT COUNT(*) FROM orders WHERE status IS DISTINCT FROM region = 'x'",
+     "SELECT COUNT(*) FROM orders WHERE (status IS DISTINCT FROM region) = 'x'"),
+    ("mysql_comparisons_left_to_right", "mysql", "SELECT COUNT(*) FROM orders WHERE amount = 100 < 200",
+     "SELECT COUNT(*) FROM orders WHERE amount = (100 < 200)"),
+    ("mysql_and_binds_tighter_than_or_bits", "mysql", "SELECT id, 4 | id & 2 FROM orders",
+     "SELECT id, (4 | id) & 2 FROM orders"),
+    ("mysql_caret_binds_tighter_than_times", "mysql", "SELECT id, 2 ^ id * 3 FROM orders",
+     "SELECT id, 2 ^ (id * 3) FROM orders"),
+    ("mysql_shift_binds_tighter_than_and_bits", "mysql", "SELECT id, 3 & id << 2 FROM orders",
+     "SELECT id, (3 & id) << 2 FROM orders"),
+    ("mysql_and_binds_tighter_than_xor", "mysql",
+     "SELECT COUNT(*) FROM orders WHERE amount > 0 XOR amount > 10 AND amount > 50",
+     "SELECT COUNT(*) FROM orders WHERE (amount > 0 XOR amount > 10) AND amount > 50"),
+    ("mysql_eq_then_is_null", "mysql", "SELECT COUNT(*) FROM orders WHERE status = 'paid' IS NULL",
+     "SELECT COUNT(*) FROM orders WHERE status = ('paid' IS NULL)"),
+    ("pg_digit_separator", "postgres", "SELECT user_id, SUM(amount) * 1_000 FROM orders GROUP BY user_id",
+     "SELECT user_id, SUM(amount) * 1 FROM orders GROUP BY user_id"),
+    ("pg_octal_literal", "postgres", "SELECT id, amount + 0o17 FROM orders", "SELECT id, amount + 0 FROM orders"),
+    ("pg_tilde_binds_looser_than_plus", "postgres", "SELECT id, ~ id + 1 FROM orders", "SELECT id, (~ id) + 1 FROM orders"),
+]
+
+#: 第 4 轮：意思一样、只在 PostgreSQL / MySQL 才报的（不执行）：认不出时只许给兜底说明。每一项 (编号, 方言, A, B, 要不要
+#: 表结构)：给了表结构（主键）时 COUNT(DISTINCT id) 和 COUNT(id) 一样，不许说「A 对 id 去重计数，B 没去重」；没给表结构
+#: 时这么说不算错（那时不知道 id 不重复）
+DIALECT_SAME_R4: list[tuple[str, str, str, str, bool]] = [
+    ("count_distinct_primary_key_vs_count", "postgres", "SELECT COUNT(DISTINCT id) FROM orders",
+     "SELECT COUNT(id) FROM orders", True),
+    ("left_on_implied_not_null_group_concat", "mysql",
+     "SELECT o.id, GROUP_CONCAT(r.state ORDER BY r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "AND r.amount > o.amount AND r.amount IS NOT NULL GROUP BY o.id",
+     "SELECT o.id, GROUP_CONCAT(r.state ORDER BY r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "AND r.amount > o.amount GROUP BY o.id", False),
+]
+
+#: 第 4 轮：靠约束改写的陷阱（要专门的表结构）。唯一键并不保证「最多关联一行」：SQLite 里 TEXT 主键和 INTEGER 列比较
+#: 时按数值比（'1' 和 '01' 都等于 1）、比较写了 COLLATE NOCASE（'paid' 和 'Paid' 都对得上）、部分唯一索引（WHERE
+#: deleted_at IS NULL，探查结果照样记成了 unique）；MySQL 拿字符串键和数值比时都转成数值。下面现造一个小库（SQLite 的
+#: 几对在上面执行，结果确实不同）和对应的 schema_cache（coupon_schema）；每一项 (编号, 方言, A, B)
+_COUPON_ROWS = {
+    "coupons": [("1",), ("01",), ("2",), ("paid",), ("Paid",)],
+    "shop_orders": [(1, 1, "paid", 100.0, 1), (2, 2, "Paid", 250.0, 1), (3, None, "open", 50.0, 2),
+                    (4, 1, "void", 200.0, 3)],
+    "customers": [(1,), (2,), (3,)],
+    "coupons2": [("SPRING", None), ("SPRING", "2026-01-01"), ("FALL", None)],
+    "orders2": [(1, "SPRING", 10.0), (2, "FALL", 20.0), (3, None, 30.0)],
+    "coupons3": [("SPRING", None), ("SPRING", "2026-01-01"), ("FALL", None)],
+}
+_COUPON_DDL = {
+    "coupons": "code TEXT PRIMARY KEY",
+    "shop_orders": "id INTEGER PRIMARY KEY, coupon INTEGER, status TEXT, amount REAL, customer_id INTEGER",
+    "customers": "id INTEGER PRIMARY KEY",
+    "coupons2": "code TEXT, deleted_at TEXT",
+    "orders2": "id INTEGER PRIMARY KEY, coupon_code TEXT, amount REAL",
+    "coupons3": "code TEXT NOT NULL, deleted_at TEXT",
+}
+_COUPON_INDEXES = ["CREATE UNIQUE INDEX ux_coupons2 ON coupons2(code) WHERE deleted_at IS NULL",
+                   "CREATE UNIQUE INDEX ux_coupons3 ON coupons3(code) WHERE deleted_at IS NULL"]
+
+
+def _coupon_schema(*, mysql: bool = False) -> dict:
+    """上面几张表的 schema_cache（和 data/introspect.py 探查出来的形状一样：部分唯一索引也记进了 unique）。"""
+    text = "VARCHAR(20)" if mysql else "TEXT"
+    integer = "INT" if mysql else "INTEGER"
+    return {"tables": {
+        "coupons": {"columns": [{"name": "code", "type": text, "nullable": False}], "primary_key": ["code"]},
+        "shop_orders": {"columns": [{"name": "id", "type": integer, "nullable": False},
+                                    {"name": "coupon", "type": integer, "nullable": True},
+                                    {"name": "status", "type": text, "nullable": True},
+                                    {"name": "amount", "type": "REAL", "nullable": True},
+                                    {"name": "customer_id", "type": integer, "nullable": True}],
+                        "primary_key": ["id"]},
+        "customers": {"columns": [{"name": "id", "type": integer, "nullable": False}], "primary_key": ["id"]},
+        "coupons2": {"columns": [{"name": "code", "type": text, "nullable": True},
+                                 {"name": "deleted_at", "type": text, "nullable": True}],
+                     "primary_key": [], "unique": [["code"]]},
+        "orders2": {"columns": [{"name": "id", "type": integer, "nullable": False},
+                                {"name": "coupon_code", "type": text, "nullable": True},
+                                {"name": "amount", "type": "REAL", "nullable": True}], "primary_key": ["id"]},
+        "coupons3": {"columns": [{"name": "code", "type": text, "nullable": False},
+                                 {"name": "deleted_at", "type": text, "nullable": True}],
+                     "primary_key": [], "unique": [["code"]]},
+    }}
+
+
+CONSTRAINT_TRAPS_R4: list[tuple[str, str, str, str]] = [
+    ("text_key_vs_integer_column", "sqlite",
+     "SELECT COUNT(*) FROM shop_orders o LEFT JOIN coupons c ON c.code = o.coupon",
+     "SELECT COUNT(*) FROM shop_orders o"),
+    ("text_key_vs_integer_column_in_scalar_subquery", "sqlite",
+     "SELECT c.id, (SELECT SUM(o.amount) FROM shop_orders o LEFT JOIN coupons cp ON cp.code = o.coupon "
+     "WHERE o.customer_id = c.id) FROM customers c",
+     "SELECT c.id, (SELECT SUM(o.amount) FROM shop_orders o WHERE o.customer_id = c.id) FROM customers c"),
+    ("key_compared_with_nocase", "sqlite",
+     "SELECT COUNT(*) FROM shop_orders o LEFT JOIN coupons c ON c.code = o.status COLLATE NOCASE",
+     "SELECT COUNT(*) FROM shop_orders o"),
+    ("partial_unique_index_left_join", "sqlite",
+     "SELECT COUNT(*) FROM orders2 o LEFT JOIN coupons2 c ON c.code = o.coupon_code", "SELECT COUNT(*) FROM orders2 o"),
+    ("partial_unique_index_left_join_sum", "sqlite",
+     "SELECT SUM(o.amount) FROM orders2 o LEFT JOIN coupons2 c ON c.code = o.coupon_code",
+     "SELECT SUM(o.amount) FROM orders2 o"),
+    ("partial_unique_index_distinct", "sqlite", "SELECT DISTINCT code FROM coupons3", "SELECT code FROM coupons3"),
+    ("mysql_string_key_vs_number", "mysql",
+     "SELECT COUNT(*) FROM shop_orders o LEFT JOIN coupons c ON c.code = o.coupon", "SELECT COUNT(*) FROM shop_orders o"),
+]
+
+
+def coupon_schema(dialect: str) -> dict:
+    return _coupon_schema(mysql=dialect == "mysql")
+
+
+def build_coupon_database() -> sqlite3.Connection:
+    """CONSTRAINT_TRAPS_R4 的小库（SQLite，内存）：TEXT 主键里同时有 '1' 和 '01'、'paid' 和 'Paid'，部分唯一索引下同一个
+    code 有一行已删、一行未删。"""
+    conn = sqlite3.connect(":memory:")
+    for name, ddl in _COUPON_DDL.items():
+        conn.execute(f"CREATE TABLE {name} ({ddl})")
+        rows = _COUPON_ROWS[name]
+        conn.executemany(f"INSERT INTO {name} VALUES ({', '.join('?' * len(rows[0]))})", rows)
+    for ddl in _COUPON_INDEXES:
+        conn.execute(ddl)
+    return conn
+
+
 PAIRS: list[Pair] = [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME] + \
     [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF] + \
     [Pair(f"validator:{n}:{k}", a, b, "diff") for k, (n, a, b) in enumerate(VALIDATOR_DIFF)] + \
@@ -2661,7 +3025,14 @@ PAIRS: list[Pair] = [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME] + \
     [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME_R3] + \
     [Pair(f"same:{i}", a, b, "same", typed=True) for i, a, b in _SAME_TYPED_R3] + \
     [Pair(f"same:{i}", a, b, "same", needs_schema=True) for i, a, b in _SAME_SCHEMA_R3] + \
-    [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R3]
+    [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R3] + \
+    [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF_R4] + \
+    [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R4] + \
+    [Pair(f"hard:{i}", a, b, "same", needs_schema=True) for i, a, b in _SAME_SCHEMA_R4]
+
+#: 第 4 轮复验报的、在 SQLite 上执行的那几对的编号（测试里按类别引用）
+ROUND_FOUR_DIFF = tuple(f"diff:{i}" for i, _, _ in _DIFF_R4)
+ROUND_FOUR_SAME = tuple(f"hard:{i}" for i, _, _ in _SAME_HARD_R4 + _SAME_SCHEMA_R4)
 
 #: 按编号找语料里的一对（测试里引用第 2 轮的反例用）
 PAIRS_BY_ID: dict[str, Pair] = {p.id: p for p in PAIRS}
