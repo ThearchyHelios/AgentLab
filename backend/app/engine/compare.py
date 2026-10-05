@@ -7,9 +7,10 @@
 怎么对：
 
 - 查询：两次运行各自封存范围内交回过的查询快照，按「节点 + 该节点里第几次查询 + 工具」配对，配不上的再按规范化
-  SQL（data/sql_semantics.normalize_sql）配。结构：规范文本和字面量都相同是 same；规范文本相同、只有字面量不同是
-  params_only（定时运行每次的日期不同，属于参数变化不是模板变化）；否则 changed（数据源换了也算）。核查类的查询
-  （双盲复算、反方审稿发的 role: verify）不进报告，不参与对比。
+  SQL（data/sql_semantics.normalize_sql）配；同一节点、同一工具里规范化 SQL 相同的先配上（Agent 每次查询的先后
+  可能不同，见 _pair）。结构：规范文本和字面量都相同是 same；规范文本相同、只有字面量不同是 params_only（定时运行
+  每次的日期不同，属于参数变化不是模板变化）；否则 changed（数据源换了也算）。核查类的查询（双盲复算、反方审稿发的
+  role: verify）不进报告，不参与对比。
 - 口径卡：同一个口径卡节点按指标 id 配对；循环里执行了几次的取最后一次。表达式、口径版本、小数位、单位、显示格式
   有一样不同就是口径变了：小数位改变取整，单位、比率与否改变数值的含义，都不只是换个写法。
 - 每个指标一个分类，按这个次序判：一边有一边没有（added / removed）；口径变了（caliber_and_data，可能连同数据）；
@@ -214,22 +215,31 @@ def _queries(side: Side) -> list[_Query]:
 
 def _pair(base: list[_Query], target: list[_Query],
           text: Callable[[_Query], str | None]) -> list[tuple[_Query | None, _Query | None]]:
-    """先按「节点 + 第几次 + 工具」配，配不上的再按规范化 SQL 配（节点换了 ID、同一个模板只有日期不同的也配得上）。
+    """配对，一轮比一轮宽：
+    1. 同一节点、同一工具、规范化 SQL 相同（只有字面量不同也算）：Agent 每次查询的先后可能不同，按「第几次」硬配
+       会把换了先后的两条都配成「结构变了」；循环里同一个模板查几次的，按先后一一配上，和按第几次配一样
+    2. 剩下的按「节点 + 第几次 + 工具」配：同一个位置上的查询换了写法，就是这条查询的结构变了
+    3. 再剩下的跨节点按规范化 SQL 配：节点换了 ID，查的还是同一个模板
     结果按这次运行的先后排，基准运行多出来的接在后面。"""
-    slots = {(q.node_id, q.ordinal, q.tool): i for i, q in enumerate(base)}
     matched: dict[int, int] = {}
-    for j, q in enumerate(target):
-        i = slots.get((q.node_id, q.ordinal, q.tool))
-        if i is not None:
-            matched[j] = i
-    taken = set(matched.values())
-    for j, q in enumerate(target):
-        if j in matched or (key := text(q)) is None:
-            continue
-        i = next((i for i, b in enumerate(base) if i not in taken and text(b) == key), None)
-        if i is not None:
-            matched[j] = i
-            taken.add(i)
+    taken: set[int] = set()
+
+    def link(same: Callable[[_Query, _Query], bool]) -> None:
+        for j, q in enumerate(target):
+            if j in matched:
+                continue
+            i = next((i for i, b in enumerate(base) if i not in taken and same(b, q)), None)
+            if i is not None:
+                matched[j] = i
+                taken.add(i)
+
+    def same_sql(b: _Query, q: _Query) -> bool:
+        key = text(q)
+        return key is not None and text(b) == key
+
+    link(lambda b, q: b.node_id == q.node_id and b.tool == q.tool and same_sql(b, q))
+    link(lambda b, q: (b.node_id, b.ordinal, b.tool) == (q.node_id, q.ordinal, q.tool))
+    link(same_sql)
     pairs: list[tuple[_Query | None, _Query | None]] = [
         (base[matched[j]] if j in matched else None, q) for j, q in enumerate(target)]
     return pairs + [(b, None) for i, b in enumerate(base) if i not in taken]
@@ -654,7 +664,14 @@ class _Compare:
             qb, qt = self._side_query(self.base_queries, b), self._side_query(self.target_queries, t)
             if qb is None or qt is None:
                 return _Change("unknown", f"输入「{path}」落在的查询快照不在封存范围内的查询里，无法比较取数")
-            return self._query_change(qb, qt)
+            change = self._query_change(qb, qt)
+            agent = t.item.get("node_id")
+            if t.item.get("via") == "agent_field" and agent and self.changed.get(str(agent)) \
+                    and change.kind in ("same", "params"):
+                # Agent 按出处交来的字段：SQL 没变，Agent 自己改了配置（提示词、工具……）也可能换了取哪一格。
+                # 调用工具节点的格子由口径卡的 cell() 定，节点配置变了要么是 SQL 变了（上面已经比过），要么不影响取值
+                return _Change("template", f"Agent「{self.title(agent)}」的配置有变化，它按出处交来的字段可能换了取法")
+            return change
         nb, nt = b.item.get("node_id"), t.item.get("node_id")
         if nb != nt:
             return _Change("template", f"输入「{path}」的来源节点由「{self.title(nb)}」换成了「{self.title(nt)}」")

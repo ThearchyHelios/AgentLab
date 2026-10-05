@@ -497,6 +497,39 @@ def test_queries_fall_back_to_normalized_sql_pairing():
     assert len(result["queries"]) == 2
 
 
+def test_an_agent_asking_in_another_order_is_paired_by_sql():
+    """Agent 这次换了查询的先后：同一节点里先按规范化 SQL 配，不按第几次硬配成两条「结构变了」。"""
+    by_region = region_sql()
+    by_day = "SELECT day, SUM(amount) AS gmv FROM orders WHERE day >= '2026-08-31' GROUP BY day"
+
+    def make(run_id, sqls):
+        run = Fake(run_id)
+        run.add("node.started", "bot", {"node_type": "agent"})
+        for i, sql in enumerate(sqls):
+            artifact = run.snapshot(sql, ["k", "gmv"], [["甲", 1.0]])
+            run.add("tool.start", "bot", {"tool": "db_query__shop", "args": {"sql": sql}, "call_id": f"c{i}"})
+            run.add("tool.end", "bot", {"tool": "db_query__shop", "call_id": f"c{i}", "query_artifact": artifact})
+        run.add("node.finished", "bot", {"duration_ms": 1, "attempt": 1})
+        return run
+
+    result = run_compare(make("r1", [by_region, by_day]),
+                         make("r2", [by_day.replace("2026-08-31", "2026-09-07"), region_sql(WEEK37)]))
+    pairs = [(q["structure"], q["base_sql"][:20]) for q in result["queries"]]
+    assert pairs == [("params_only", by_day[:20]), ("params_only", by_region[:20])]
+
+
+def test_an_agent_reconfigured_with_the_same_sql_is_a_template_change():
+    """Agent 改了提示词、SQL 一字不差：它按出处交来的字段可能换了取法，不能报成数据变化。"""
+    graph = weekly_graph()
+    graph["nodes"][2]["data"]["config"]["prompt"] = "按区域列出金额，从大到小"
+    result = run_compare(week("r1"), week("r2", NEXT_ROWS, graph=graph))
+    metrics = by_id(result)
+    assert metrics["total"]["classification"] == "sql_changed"
+    assert any("区域分析" in r for r in metrics["total"]["reasons"])
+    # 取数节点的格子不经过这个 Agent：照旧是数据变化
+    assert metrics["east"]["classification"] == "data_only"
+
+
 def test_unpaired_queries_are_added_or_removed():
     base = week("r1")
     target = week("r2")
