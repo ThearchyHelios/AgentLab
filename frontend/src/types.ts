@@ -3480,3 +3480,75 @@ export interface RunComparison {
 
 /** 运行接口回的运行带着发起它的定时任务（RunOut.schedule_id）；Run 上没写这一项，对比页的运行卡要用 */
 export type RunWithSchedule = Run & { schedule_id?: string | null }
+
+// ---------------------------------------------------------------------------
+// 反方审稿（challenge 节点）：审批卡上的概况、challenge_artifact 工件的内容。形状照前后端共用的接口约定，字段名一个不改；
+// 判断由反方模型给出，界面只排版，理由正文、行数这些都是服务端给的
+// ---------------------------------------------------------------------------
+
+/** 一句结论经受住反方的复核没有：经受住 / 被削弱 / 被推翻 / 无法判断 */
+export type ChallengeVerdict = 'stands' | 'weakened' | 'refuted' | 'inconclusive'
+
+/** 各种判断的句数 */
+export type ChallengeCounts = Record<ChallengeVerdict, number>
+
+/** 审批卡、节点产出里列的一句：unit 是报告文档里这一句的 id，text 是结论原文 */
+export interface ChallengeItem {
+  unit: string
+  text: string
+  verdict: ChallengeVerdict | (string & {})
+}
+
+/**
+ * 审批卡上的反方审稿概况（human 节点 payload.reports[i].challenge）。items 最多 10 条，完整内容在 artifact 指的工件里。
+ * on_refuted 是实际生效的处理方式：degrade 被推翻的结论计入出具缺口；flag 只标注。报错（fail）时节点已经失败，到不了审批。
+ * 老服务端不给时按 degrade
+ */
+export interface ApprovalChallenge {
+  counts: ChallengeCounts
+  items: ChallengeItem[]
+  artifact: string
+  on_refuted?: 'degrade' | 'flag' | (string & {})
+}
+
+/**
+ * 审批审的报告经过反方审稿时多一个 challenge。和上面的 ApprovalReport 是同一个接口（声明合并）：反方审稿的类型集中在
+ * 这一段，这一项也就近写在这里
+ */
+export interface ApprovalReport {
+  challenge?: ApprovalChallenge
+}
+
+/** 反方为复核一句结论执行的一次只读查询：编号是它自己的（Q1、Q2…），和报告里的查询编号无关 */
+export interface ChallengeQuery {
+  alias: string
+  /** 查询快照工件 */
+  artifact: string
+  sql: string
+  row_count: number | null
+  truncated: boolean
+  /** 数据源名 */
+  source: string | null
+}
+
+/** 工件里的一句：判断、理由、查询 */
+export interface ChallengeClaim extends ChallengeItem {
+  /** 理由渲染后的正文（数字已换成查询结果里的值） */
+  rationale: string
+  /**
+   * 理由组装成的文档（和报告文档同一种形状，数字带出处、裸数字被标出）。约定没说是工件 id 还是文档本身，两种都认；
+   * 没有时只显示 rationale
+   */
+  rationale_doc?: string | EvidenceDocData | null
+  queries: ChallengeQuery[]
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; cost_usd?: number | null; calls?: number }
+}
+
+/** challenge_artifact 工件的内容：审的哪份报告、每句的复核，以及反方用的模型 */
+export interface ChallengeArtifact {
+  /** 被审的报告撰写节点 */
+  report: string
+  doc_artifact: string
+  claims: ChallengeClaim[]
+  model: string | null
+}
