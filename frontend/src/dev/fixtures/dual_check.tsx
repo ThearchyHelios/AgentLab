@@ -20,13 +20,41 @@ import data from './dual_check.json'
  *
  * 完整对照的工件（GET /api/artifacts/{id}）、这次运行的图快照（GET /api/runs/{id}/graph，卡上按它说节点的
  * 「未采用原流程时」）、审批回复、设置、校验都由检查脚本用 page.route 伪造，直接打开时卡上照实说无法加载完整对照、
- * 有条件地说后果。提交后 onResolved 只把运行 id 记到 window.__dualResolved，不去接事件流
+ * 有条件地说后果。提交后 onResolved 只把运行 id 记到 window.__dualResolved，不去接事件流。
+ *
+ * ?syn=dual-check-approval 另认地址上的几个参数（检查脚本用；不带时 payload 只有约定里的几项，同老服务端）：
+ * - variant=<名字>：「销售额」的摘要换成 variants 里那一对 SQL 的（前 3 条差异的原话、是否只有兜底，同节点的写法），
+ *   工件由检查脚本按同一个变体伪造
+ * - catalog=1：摘要里每个指标带上服务端预告的「采用哪一边会往数据目录里写什么」（catalog_preview；换了变体的
+ *   「销售额」用变体的 catalog）。catalog=bad：「销售额」带一份认不出的预告
+ * - on_reject=<值>：payload 带上节点实际生效的「未采用原流程时」
  */
 const approval = (patch: Partial<Approval> = {}): Approval => ({
   ...(data.approval as unknown as Approval),
   created_at: new Date(Date.now() - 180_000).toISOString().replace('Z', ''),
   ...patch,
 })
+
+interface Variant { diff: { items: { aspect: string; text: string }[] }; catalog: unknown }
+
+function approvalOf(search: string): Approval {
+  const q = new URLSearchParams(search)
+  const variant = (data.variants as unknown as Record<string, Variant>)[q.get('variant') ?? '']
+  const catalog = q.get('catalog')
+  const onReject = q.get('on_reject')
+  const previews = data.catalog_preview as unknown as Record<string, unknown>
+  const summary = data.approval.payload.summary.map((s) => {
+    const swapped = s.metric_id === 'gmv' && variant ? variant : null
+    const items = swapped?.diff.items
+    return {
+      ...s,
+      ...(items ? { diff: items.slice(0, 3).map((i) => i.text), fallback: !items.some((i) => i.aspect !== 'other' && i.aspect !== 'parse') } : {}),
+      ...(catalog === '1' ? { catalog: swapped ? swapped.catalog : previews[s.metric_id] } : {}),
+      ...(catalog === 'bad' && s.metric_id === 'gmv' ? { catalog: { a: { write: true, table: 'orders' }, b: { write: false } } } : {}),
+    }
+  })
+  return approval({ payload: { ...data.approval.payload, summary, ...(onReject ? { on_reject: onReject } : {}) } })
+}
 
 function Card({ value }: { value: Approval }) {
   return (
@@ -68,7 +96,7 @@ function InspectorCase() {
 
 export const cases: Record<string, () => JSX.Element> = {
   'dual-check-approval': () => (
-    <div className="mx-auto max-w-3xl p-4 text-sm" data-fixture="dual-check-approval"><Card value={approval()} /></div>
+    <div className="mx-auto max-w-3xl p-4 text-sm" data-fixture="dual-check-approval"><Card value={approvalOf(location.search)} /></div>
   ),
   'dual-check-approval-rail': () => (
     <div className="h-full w-[360px] max-w-full overflow-y-auto border-r bg-panel" data-fixture="dual-check-approval-rail">

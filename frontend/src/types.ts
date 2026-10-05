@@ -3501,7 +3501,21 @@ export interface DualCheckSummaryItem {
   diff: string[]
   /** 只有兜底说明：两条 SQL 的写法不同，未能归纳成具体差异 */
   fallback: boolean
+  /**
+   * 约定之外、服务端另带的：采用原流程（a）、采用盲算（b）各会往数据目录里写什么。老服务端没有这一项，卡上按差异的
+   * 形状有条件地说
+   */
+  catalog?: { a: DualCheckCatalogSide; b: DualCheckCatalogSide }
 }
+
+/**
+ * 采用一边的结果会往数据目录里写什么：服务端按发起审批时的数据目录预告（dual_check_facts.preview，和裁决后真写的
+ * 是同一套判断）。write 为真时 table 的 item（business_date / valid_filter / dedup）会记为 value（有效记录条件是和
+ * 目录里已有的条件合起来之后的整句）；为假时 reason 说明为什么不写
+ */
+export type DualCheckCatalogSide =
+  | { write: true; source?: string | null; table: string; item: string; value: unknown }
+  | { write: false; reason?: string | null }
 
 /** payload.kind 为 dual_check 的审批 payload（审批的 mode 是 input） */
 export interface DualCheckPayload {
@@ -3511,6 +3525,8 @@ export interface DualCheckPayload {
   /** 完整对照放在这个工件里（GET /api/artifacts/{id}），内容见 DualCheckCard */
   card_artifact: string
   summary: DualCheckSummaryItem[]
+  /** 约定之外、服务端另带的：节点实际生效的「未采用原流程时」。没有时卡上从运行的图快照里读 */
+  on_reject?: 'degrade' | 'fail'
 }
 
 /** 审核人的回复：POST /approvals/{id}/decide 的 value */

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from 'react'
+import { Fragment, useEffect, useId, useMemo, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { AlertTriangle, Ban, Check, ChevronRight } from 'lucide-react'
 import clsx from 'clsx'
@@ -7,7 +7,8 @@ import { useCatalog } from '../store/catalog'
 import { useStudio } from '../store/studio'
 import { Spinner, useToast } from '../components/ui'
 import { NONE } from '../lib/format'
-import { DUAL_CHECK_TEXT } from '../lib/terms'
+import { CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT } from '../lib/terms'
+import { patchValueText } from './catalogPatch'
 import type {
   Approval, DualCheckBlindInput, DualCheckCard, DualCheckChoice, DualCheckInput, DualCheckMetric, DualCheckReply,
   DualCheckSummaryItem,
@@ -51,10 +52,18 @@ interface MetricView {
   rest: string | null
   /** 两条 SQL 等价，差在取用的结果上 */
   equivalent: boolean
-  /** 两边只差一处、又可能对得上数据目录的一项事实：审核人的选择可能被记进数据目录（见 catalogOf） */
+  /** 服务端没有预告时用：两边只差一处、又可能对得上数据目录的一项事实，审核人的选择可能被记进数据目录（见 catalogOf） */
   catalog: CatalogAspect | null
+  /** 服务端预告的采用哪一边会往数据目录里写什么（见 previewOf）；有它就照它说，不再按 catalog 有条件地说 */
+  preview: CatalogPreview | null
   full: DualCheckMetric | null
 }
+
+/** 服务端预告的一边：写的话写到哪（where 是 「orders」（shop）的业务日期 这样的说法）、写成什么 */
+type PreviewSide =
+  | { write: true; table: string; source: string | null; item: string; where: string; value: string }
+  | { write: false }
+interface CatalogPreview { a: PreviewSide; b: PreviewSide }
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
@@ -85,14 +94,44 @@ function notesOf(texts: string[]): { standard: boolean; notes: string[] } {
 }
 
 /**
- * 审核人的选择会不会被记进数据目录：照服务端写目录的门槛（dual_check_facts.derive）——两条 SQL 不等价、没用兜底、
- * 差异恰好一条，而且是时间列、筛选条件或聚合。几个输入都对不上时节点把各自的差异合成一份（每个输入至少一条），
- * 所以「恰好一条」也就是只有一个输入对不上。后面还有只有服务端查得了的条件（一边多出条件、只差去不去重、目录里
- * 已有人工确认的说法），卡上有条件地说
+ * 服务端没有预告时（老服务端），审核人的选择可能被记进数据目录的形状：照服务端写目录的门槛（dual_check_facts.derive）
+ * ——两条 SQL 不等价、没用兜底、差异恰好一条，而且是时间列、筛选条件或聚合。几个输入都对不上时节点把各自的差异合成
+ * 一份（每个输入至少一条），所以「恰好一条」也就是只有一个输入对不上。过了这道门槛也不一定写：只有一边按时间筛、
+ * 多出的条件是指标自己的范围、采用了不去重的一边都不写，这些卡上看不出来（差异条目只有方面和原话），所以只说必要
+ * 条件，并把不写的几种照实说出来（DUAL_CHECK_TEXT.approval.catalog）
  */
 function catalogOf(metric: DualCheckMetric, items: { aspect: string; text: string }[]): CatalogAspect | null {
   if (metric.diff?.equivalent === true || metric.diff?.fallback === true || items.length !== 1) return null
   return CATALOG_ASPECTS.has(items[0].aspect) ? items[0].aspect as CatalogAspect : null
+}
+
+/** 预告的一边：写的得有表、认得出的目录项和取值；认不出返回 undefined */
+function previewSideOf(raw: unknown): PreviewSide | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const s = raw as Record<string, unknown>
+  if (s.write === false) return { write: false }
+  const table = str(s.table)
+  const item = str(s.item)
+  if (s.write !== true || !table || !item || !Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, item) || s.value == null || s.value === '') {
+    return undefined
+  }
+  const source = str(s.source) ?? null
+  const label = CATALOG_TABLE_FIELD_LABEL[item as keyof typeof CATALOG_TABLE_FIELD_LABEL]
+  return {
+    write: true, table, source, item,
+    where: DUAL_CHECK_TEXT.log.catalogItem(table, source ?? undefined, label), value: patchValueText(item, s.value),
+  }
+}
+
+/**
+ * payload.summary[].catalog（约定之外、服务端另带的预告）：采用原流程、采用盲算各会往数据目录里写什么，和裁决后真写的
+ * 是同一套判断。两边有一边认不出就整份不认，卡上回到按差异形状有条件地说（catalogOf）——宁可少说，不替服务端编
+ */
+function previewOf(raw: unknown): CatalogPreview | null {
+  if (!raw || typeof raw !== 'object') return null
+  const a = previewSideOf((raw as Record<string, unknown>).a)
+  const b = previewSideOf((raw as Record<string, unknown>).b)
+  return a && b ? { a, b } : null
 }
 
 function viewsOf(summary: DualCheckSummaryItem[], card: DualCheckCard | null): MetricView[] {
@@ -108,6 +147,8 @@ function viewsOf(summary: DualCheckSummaryItem[], card: DualCheckCard | null): M
       original: str(s?.original_rendered) ?? str(f?.original?.rendered) ?? null,
       blind: str(s?.blind_rendered) ?? str(f?.blind?.rendered) ?? null,
       deltaPct: s && 'delta_pct' in s ? num(s.delta_pct) ?? null : f?.delta_pct === null ? null : num(f?.delta_pct),
+      // 预告跟着摘要来：完整对照还没到、或者取不到时也照它说
+      preview: previewOf(s?.catalog),
     }
     if (f) {
       const items = (Array.isArray(f.diff?.items) ? f.diff.items : [])
@@ -158,16 +199,17 @@ function deltaText(pct: number | null | undefined): string | null {
 }
 
 /**
- * 这次运行里节点的「未采用原流程时」：审批 payload 不带它，从运行的图快照（GET /runs/{id}/graph）里按节点 id 读。
- * 没写、写了认不出的按缺省的 degrade（节点执行时同样这么认）；图里找不到这个节点（子工作流里的）、图快照取不到
- * 时是 unknown，卡上有条件地说
+ * 这次运行里节点的「未采用原流程时」。服务端在 payload 里带了实际生效的处置（given，约定之外另带的）就照它说；
+ * 老服务端不带，从运行的图快照（GET /runs/{id}/graph）里按节点 id 读：没写、写了认不出的按缺省的 degrade（节点执行时
+ * 同样这么认）；图里找不到这个节点（子工作流里的）、图快照取不到时是 unknown，卡上有条件地说
  */
 type OnReject = 'degrade' | 'fail' | 'unknown' | 'loading'
-function useOnReject(runId: string, nodeId: string | undefined): OnReject {
+function useOnReject(runId: string, nodeId: string | undefined, given: unknown): OnReject {
+  const known = given === 'fail' || given === 'degrade' ? given : null
   const key = `${runId}\n${nodeId ?? ''}`
   const [got, setGot] = useState<{ key: string; value: OnReject } | null>(null)
   useEffect(() => {
-    if (!runId || !nodeId) return
+    if (known || !runId || !nodeId) return
     let alive = true
     api.runs.graph(runId).then(
       (res) => {
@@ -178,7 +220,8 @@ function useOnReject(runId: string, nodeId: string | undefined): OnReject {
       () => { if (alive) setGot({ key, value: 'unknown' }) },
     )
     return () => { alive = false }
-  }, [runId, nodeId, key])
+  }, [known, runId, nodeId, key])
+  if (known) return known
   if (!runId || !nodeId) return 'unknown'
   return got?.key === key ? got.value : 'loading'
 }
@@ -200,7 +243,7 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const payload = approval.payload ?? {}
   const summary = useMemo(() => summaryOf(payload.summary), [payload.summary])
   const cardId = str(payload.card_artifact) ?? ''
-  const onReject = useOnReject(approval.run_id, str(payload.node_id) ?? str(approval.node_id))
+  const onReject = useOnReject(approval.run_id, str(payload.node_id) ?? str(approval.node_id), payload.on_reject)
 
   const [card, setCard] = useState<{ id: string; data?: DualCheckCard | null } | null>(null)
   useEffect(() => {
@@ -380,7 +423,10 @@ function MetricBlock({ view, name, choice, onChoose }: {
         </button>
       )}
       {expanded && view.full && <Compare id={`${uid}-cmp`} metric={view.full} />}
-      {view.catalog && (
+      {view.preview ? (
+        // 服务端预告了：两边都不写就不提数据目录
+        (view.preview.a.write || view.preview.b.write) && <CatalogPreviewNote preview={view.preview} choice={choice} />
+      ) : view.catalog && (
         <p className="mt-1.5 text-2xs leading-relaxed text-dim" data-dual-catalog={view.catalog}>{T.catalog[view.catalog]}{T.catalog.tail}</p>
       )}
 
@@ -401,6 +447,40 @@ function MetricBlock({ view, name, choice, onChoose }: {
         </div>
       </fieldset>
     </div>
+  )
+}
+
+const sameTarget = (a: PreviewSide, b: PreviewSide): boolean =>
+  a.write && b.write && a.table === b.table && a.source === b.source && a.item === b.item
+
+/**
+ * 服务端预告的「记入数据目录」：三个选择各一句，审核人当前选的那一句加重——选之前三句都看得到，选了之后一眼看出这一选
+ * 会往目录里写什么。两边写的是同一项（只差取值，比如业务日期按哪一列）时，后一句省掉「哪张表的哪一项」
+ */
+function CatalogPreviewNote({ preview, choice }: { preview: CatalogPreview; choice?: DualCheckChoice }) {
+  const P = T.catalogPreview
+  const said = (side: 'a' | 'b'): string => {
+    const s = preview[side]
+    if (!s.write) return P.skip(T.choices[side])
+    return side === 'b' && sameTarget(preview.a, s) ? P.writeSame(T.choices.b, s.value) : P.write(T.choices[side], s.where, s.value)
+  }
+  const clauses: [DualCheckChoice, string, boolean][] = [
+    ['a', said('a'), preview.a.write], ['b', said('b'), preview.b.write], ['neither', P.skip(T.choices.neither), false],
+  ]
+  return (
+    <p className="mt-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-catalog="preview">
+      {P.head}
+      {clauses.map(([side, text, write], i) => (
+        <Fragment key={side}>
+          {i > 0 && '；'}
+          <span className={clsx(choice === side && 'font-medium')} style={choice === side ? { color: 'var(--text)' } : undefined}
+                data-dual-catalog-side={side} data-write={write ? '' : undefined} data-current={choice === side ? '' : undefined}>
+            {text}
+          </span>
+        </Fragment>
+      ))}
+      {P.tail}
+    </p>
   )
 }
 

@@ -1,5 +1,5 @@
 {
-  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说",
+  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），catalog_preview 和 variants 里的 catalog（采用哪一边会往数据目录里写什么）是服务端写目录预告的真实输出，都由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说",
   "approval": {
     "id": "ap-dc-0001",
     "run_id": "run-dc-0001",
@@ -162,6 +162,38 @@
         }
       }
     ]
+  },
+  "catalog_preview": {
+    "gmv": {
+      "a": {
+        "write": true,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "paid_at"
+        }
+      },
+      "b": {
+        "write": true,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "created_at"
+        }
+      }
+    },
+    "refund_rate": {
+      "a": {
+        "write": false,
+        "reason": "指标「退款率」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+      },
+      "b": {
+        "write": false,
+        "reason": "指标「退款率」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+      }
+    }
   },
   "graph": {
     "nodes": [
@@ -394,6 +426,46 @@
           "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
           "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-09'"
         ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边差在时间范围，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边差在时间范围，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
+      }
+    },
+    "time_one_side": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time",
+            "text": "原流程按 paid_at 筛时间，盲算没有按时间筛选"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」只有被采纳的原流程按时间筛选，盲算没有：审核人判断的是要不要限定时间，不是按哪一列归属，没有可记的业务日期，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」被采纳的盲算没有按时间筛选，没有可记的业务日期，不写入数据目录"
+        }
       }
     },
     "filter_extra": {
@@ -414,6 +486,49 @@
           "- WHERE",
           "-   orders.status <> 'test'"
         ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'test'"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
+      }
+    },
+    "filter_scope": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE channel = 'web'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程只保留 channel = 'web' 的行，盲算没有这个条件"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.channel = 'web'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」多出的条件「channel = 'web'」不是在排除退款、作废、测试这类无效记录，可能是指标自己的筛选范围（例如只看某个地区、某个渠道），不是整张表的有效记录条件，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
       }
     },
     "two_filters": {
@@ -438,6 +553,16 @@
           "- WHERE",
           "-   orders.channel = 'web' AND orders.status <> 'refunded'"
         ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        }
       }
     },
     "join": {
@@ -462,6 +587,16 @@
           "-   ON orders.id = refunds.order_id",
           "+   orders.id = refunds.order_id"
         ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边差在关联，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边差在关联，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
       }
     },
     "dedup": {
@@ -482,6 +617,19 @@
           "-   COUNT(DISTINCT orders.user_id)",
           "+   COUNT(orders.user_id)"
         ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "dedup",
+          "value": "对 user_id 计数时去重"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+        }
       }
     },
     "parse": {
@@ -499,6 +647,16 @@
         ],
         "fallback": false,
         "text_diff": []
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边差在能否解析，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边差在能否解析，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
       }
     }
   }
