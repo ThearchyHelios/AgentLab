@@ -8,7 +8,7 @@ import { ApiError, api } from '../api/client'
 import { Spinner, isComposing, useTicker } from '../components/ui'
 import { EVIDENCE_STATE, segmentLabel, segmentState, sourceOf, unitText, type EvidenceStateCode } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
-import { formatCost, formatDateTime, formatNumber, formatTime } from '../lib/format'
+import { formatCost, formatDateTime, formatTime, parseServerTime } from '../lib/format'
 import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT } from '../lib/terms'
 import { useEvidence } from '../store/evidence'
 import type {
@@ -294,11 +294,7 @@ function entriesOf(thread: Thread | undefined): InquiryEntry[] {
   }))
   const seen = new Set(thread.listed.map((x) => x.seq).filter((s) => s != null))
   const local = thread.local.filter((e) => e.inquiry.seq == null || !seen.has(e.inquiry.seq))
-  const at = (e: InquiryEntry) => {
-    const t = typeof e.inquiry.at === 'number' ? e.inquiry.at * (e.inquiry.at < 1e12 ? 1000 : 1)
-      : e.inquiry.at ? Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(e.inquiry.at) ? e.inquiry.at : `${e.inquiry.at}Z`) : NaN
-    return Number.isFinite(t) ? t : Infinity
-  }
+  const at = (e: InquiryEntry) => parseServerTime(e.inquiry.at)?.getTime() ?? Infinity
   // 稳定排序：时间相同、没有时间的保持原来的先后（列表在前，刚问的在后）
   return [...listed, ...local].map((e, i) => ({ e, i, t: at(e) }))
     .sort((a, b) => (a.t === b.t ? a.i - b.i : a.t - b.t)).map((x) => x.e)
@@ -348,10 +344,11 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
   const entries = useMemo(() => entriesOf(thread), [thread])
   const mine = pending?.key === key ? pending : undefined
 
-  // 句子的原文从报告文档取（审批卡上逐段证据没展开时也要取：问答串得写出问的是哪一句）
+  // 句子的原文从报告文档取（审批卡上逐段证据没展开时也要取：问答串得写出问的是哪一句；回答引用了报告已有的出处时，
+  // 也要靠它在报告里找到那一处）。文档按工件 id 缓存，同一份只取一次
   const docSlot = useEvidence((s) => (docArtifact ? s.docs[docArtifact] : undefined))
   const loadDoc = useEvidence((s) => s.loadDoc)
-  const needDoc = !!docArtifact && (entries.some((e) => e.inquiry.unit) || !!draft?.target.unit || !!mine?.target.unit)
+  const needDoc = !!docArtifact && (entries.length > 0 || !!draft || !!mine)
   useEffect(() => { if (needDoc && docArtifact) void loadDoc(docArtifact) }, [needDoc, docArtifact, loadDoc])
   const units = useMemo(() => {
     const map = new Map<string, string>()
@@ -374,24 +371,28 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
     return [...out.values()]
   }, [entries, mine, draft])
 
-  // 提交之后提问框拿掉了，焦点接到「正在回答」那一条上；回答回来那一条换掉了，再接到回答上
+  // 提交之后提问框拿掉了，焦点接到「正在回答」那一条上；回答回来那一条换掉了，再接到回答上。焦点已经去了别处的不抢；
+  // 没问成（提问框带着报错重新打开）时焦点由提问框自己接
   const pendingRef = useRef<HTMLElement | null>(null)
   const lastRef = useRef<HTMLElement | null>(null)
-  const held = useRef(false)
-  useLayoutEffect(() => {
-    if (mine && focusLost()) { pendingRef.current?.focus({ preventScroll: true }); held.current = true }
-  }, [mine])
   const count = entries.length
   const [heard, setHeard] = useState('')
-  const seen = useRef(count)
+  const asking = useRef<{ count: number; held: boolean } | null>(null)
   useLayoutEffect(() => {
-    if (count > seen.current) {
-      setHeard(INQUIRY_TEXT.arrived)
-      if (held.current && focusLost()) lastRef.current?.focus({ preventScroll: true })
+    if (mine) {
+      if (!asking.current) {
+        const held = focusLost()
+        if (held) pendingRef.current?.focus({ preventScroll: true })
+        asking.current = { count, held }
+      }
+      return
     }
-    held.current = false
-    seen.current = count
-  }, [count])
+    const was = asking.current
+    asking.current = null
+    if (!was || count <= was.count) return
+    setHeard(INQUIRY_TEXT.arrived)
+    if (was.held && focusLost()) lastRef.current?.focus({ preventScroll: true })
+  }, [mine, count])
 
   const reportBtn = useRef<HTMLButtonElement>(null)
   if (!access && !entries.length && thread?.status !== 'error') return null
