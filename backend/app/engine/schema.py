@@ -613,6 +613,111 @@ def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
                    node_id=node.id, field=field, code=code)
 
 
+# --------------------------------------------------------------------------
+# 反方审稿节点（engine/nodes/challenge.py）：审哪份报告、各项配置
+# --------------------------------------------------------------------------
+
+#: 反方审稿节点各项配置在界面上的叫法：报错写叫法，不写键名
+CHALLENGE_LABEL = {
+    "report": "要审的报告", "max_claims": "最多审几句", "max_queries": "每句最多查询次数",
+    "timeout_s": "每句时长上限（秒）", "provider": "反方模型 · 接入", "model": "反方模型",
+    "on_refuted": "结论被推翻时", "enabled": "启用",
+}
+#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只记录 / fail 判节点失败
+CHALLENGE_ON_REFUTED = ("degrade", "flag", "fail")
+CHALLENGE_ON_REFUTED_LABEL = {"degrade": "出具降档", "flag": "仅记录", "fail": "判为失败"}
+
+
+def _challenge_field(key: str) -> str:
+    return f"「{type_label(NodeType.CHALLENGE)}」的「{CHALLENGE_LABEL[key]}」"
+
+
+def challenge_problems(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """反方审稿各项配置有什么问题（要审的报告另见 challenge_report）：[(字段, 人话)]，没问题返回 []。
+    校验和节点执行时报的是同一句话。
+
+    三个上限留空（不写或写 null）就是沿用设置里「核查」一节的值，和「启用」留空一个意思。节点上没有「不限」的写法：
+    要放开上限去设置里改，免得一个节点悄悄把核查的花费放开了。
+    """
+    out: list[tuple[str, str]] = []
+    for key, words in (("max_claims", "每份报告最多反查的句数"), ("max_queries", "每句最多执行的查询次数")):
+        value = config.get(key)
+        if value not in (None, "") and not _positive(value, integer=True):
+            out.append((key, f"{_challenge_field(key)}需要填写正整数（{words}），留空表示沿用设置，当前为「{value}」"))
+    value = config.get("timeout_s")
+    if value not in (None, "") and not _positive(value):
+        out.append(("timeout_s", f"{_challenge_field('timeout_s')}需要填写大于 0 的秒数，留空表示沿用设置，"
+                                 f"当前为「{value}」"))
+    for key, what in (("provider", "模型接入的名称"), ("model", "模型 ID")):
+        value = config.get(key)
+        if value is not None and not isinstance(value, str):
+            out.append((key, f"{_challenge_field(key)}需要填写{what}，留空表示使用设置中的核查模型，当前为「{value}」"))
+    value = config.get("on_refuted")
+    if value not in (None, "") and value not in CHALLENGE_ON_REFUTED:
+        names = [f"「{CHALLENGE_ON_REFUTED_LABEL[v]}」" for v in CHALLENGE_ON_REFUTED]
+        out.append(("on_refuted", f"{_challenge_field('on_refuted')}只能选{'、'.join(names[:-1])}或{names[-1]}，"
+                                  f"当前为「{value}」"))
+    value = config.get("enabled")
+    if value is not None and not isinstance(value, bool):
+        out.append(("enabled", f"{_challenge_field('enabled')}只能是开启、关闭或留空（沿用设置），当前为「{value}」"))
+    return out
+
+
+def challenge_report(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str | None]:
+    """反方审稿审的是哪份报告：(报告撰写节点 id, None)；定不下来时 (None, 为什么)。校验、执行器、审批卡都按它认。
+
+    写了「要审的报告」就按写的，必须是它上游的报告撰写节点。没写就从上游找：直接连着的报告撰写节点只有一个，
+    就是它（「初稿 → 终稿 → 反方审稿」审终稿）；否则整个上游里只有一个报告撰写节点才取它。两份以上说不准审哪一份，
+    宁可让人选，也不能悄悄审错一份。
+    """
+    who, label = f"「{type_label(NodeType.CHALLENGE)}」", CHALLENGE_LABEL["report"]
+    nodes = spec.node_map()
+    upstream = _ancestors(spec, node.id)
+    chosen = node.config.get("report")
+    if chosen in (None, ""):
+        direct = list(dict.fromkeys(e.source for e in spec.incoming(node.id)
+                                    if (n := nodes.get(e.source)) is not None and n.type == NodeType.REPORT))
+        if len(direct) == 1:
+            return direct[0], None
+        found = [n for n in spec.nodes if n.id in upstream and n.type == NodeType.REPORT]
+        if len(found) == 1:
+            return found[0].id, None
+        if not found:
+            return None, (f"{who}的上游没有「报告撰写」节点：反方审稿只审报告撰写节点写出的报告。"
+                          f"请把它接在报告撰写节点之后，或在「{label}」中选择一个")
+        names = "、".join(f"「{n.title}」" for n in found[:5]) + ("等" if len(found) > 5 else "")
+        return None, f"{who}的上游有多个「报告撰写」节点（{names}），请在「{label}」中选择要审的那一份"
+    if not isinstance(chosen, str):
+        return None, f"{who}的「{label}」需要选择一个「报告撰写」节点，当前为「{chosen}」"
+    target = nodes.get(chosen)
+    if target is None:
+        return None, f"{who}的「{label}」选择了「{chosen}」，但工作流中不存在这个节点"
+    if target.type != NodeType.REPORT:
+        return None, (f"{who}的「{label}」选择了「{target.title}」，它是「{type_label(target.type)}」节点，"
+                      "不是「报告撰写」节点：反方审稿只审报告撰写节点写出的报告")
+    if chosen not in upstream:
+        return None, (f"{who}的「{label}」选择的「{target.title}」不在它的上游：审稿时这份报告还没有写出。"
+                      "请把报告撰写节点连到反方审稿之前")
+    return chosen, None
+
+
+def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """反方审稿的配置写错了挡住运行：执行时节点照样会报这一句，与其取数、写完报告才死在审稿这一步，不如在画图时说破。
+    反方模型和要审的报告的写作模型写成同一个的给警告：等于自己审自己。"""
+    for field, message in challenge_problems(node.config):
+        result.add(message, node_id=node.id, field=field, code="challenge.config_invalid")
+    report, problem = challenge_report(spec, node)
+    if problem or report is None:
+        result.add(problem or "", node_id=node.id, field="report", code="challenge.report_invalid")
+        return
+    writer = spec.node_map()[report]
+    model = node.config.get("model")
+    if isinstance(model, str) and model and model == (writer.config.get("model") or spec.defaults.get("model")):
+        result.add(f"反方模型与报告「{writer.title}」的写作模型相同（「{model}」），等于自己审自己，难以发现写作模型自身"
+                   f"的错误。请在「{CHALLENGE_LABEL['model']}」中选择另一个模型", level="warning", node_id=node.id,
+                   field="model", code="challenge.same_model")
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -679,6 +784,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             _check_report_claims(node, spec, result)
         elif node.type == NodeType.MERGE:
             _check_merge(node, spec, result)
+        elif node.type == NodeType.CHALLENGE:
+            _check_challenge(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not isinstance(contract, dict):

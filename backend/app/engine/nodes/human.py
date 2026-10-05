@@ -112,7 +112,9 @@ def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any
 
     真实运行里报告有一句结论和证据相矛盾，审批人批准时完全不知道：审批卡只有正文。这里带上报告节点产出里的
     stats（同 report.checked）、结论句策略、裁判摘要和报告文档的工件 id，审批卡据此写核对概况、给打开证据的入口。
-    只认已经跑完、带着核对统计的报告；重放时 state 一样，算出来的也一样。"""
+    审这份报告的反方审稿已经审完的，再带上它的概况（challenge：几句被推翻、被削弱，打开审稿记录的入口）；没有就
+    不加这个键。只认已经跑完、带着核对统计的报告；重放时 state 一样，算出来的也一样。"""
+    from app.engine.nodes.challenge import challenge_summary
     from app.engine.schema import NodeType
 
     spec = ctx.run.spec
@@ -134,6 +136,8 @@ def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any
             item["doc_artifact"] = result["doc_artifact"]
         if isinstance(result.get("judge"), dict):
             item["judge"] = {k: result["judge"][k] for k in _JUDGE_KEYS if k in result["judge"]}
+        if (challenge := challenge_summary(spec, outputs, rid)) is not None:
+            item["challenge"] = challenge
         out.append(item)
     return out
 
