@@ -604,8 +604,6 @@ def test_time_column_differs_with_catalog_names():
      "SELECT SUM(r.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
      [("aggregate", "A 对 orders.amount 求和，B 对 refunds.amount 求和")]),
     ("SELECT DISTINCT region FROM orders", "SELECT region FROM orders", [("group_by", "A 对 region 去重，B 没有去重")]),
-    ("SELECT SUM(amount) FROM orders", "SELECT ROUND(SUM(amount), 2) FROM orders",
-     [("expression", "A 算的是 SUM(amount)，B 算的是 ROUND(SUM(amount), 2)")]),
     ("SELECT user_id, SUM(amount) FROM orders GROUP BY user_id", "SELECT SUM(amount), user_id FROM orders GROUP BY user_id",
      [("expression", "两边选出来的列一样，先后不同：A 是 user_id、SUM(amount)，B 是 SUM(amount)、user_id")]),
     # 分组、HAVING、取行
@@ -661,9 +659,9 @@ def test_specific_differences_are_said_in_one_sentence_each(a, b, expected):
 
 def test_a_difference_inside_a_cte_used_only_in_a_condition_subquery_is_reported():
     """第 5 轮回退的例子：只在 IN 子查询里用到的 CTE 里的条件不同，以前整个漏报（返回空列表）。现在 CTE 并进了 IN
-    子查询，往里比，说得出是哪个条件。EXISTS、标量子查询一样。"""
+    子查询，往里比，说得出是哪个条件，位置带上 IN 左边的列（两个 IN 子查询时才分得清）。EXISTS、标量子查询一样。"""
     head = "WITH p AS (SELECT * FROM orders WHERE status = '{}') SELECT COUNT(*) FROM users u WHERE "
-    for tail, place in (("u.id IN (SELECT user_id FROM p)", "在 IN 子查询里"),
+    for tail, place in (("u.id IN (SELECT user_id FROM p)", "在 id IN 的子查询里"),
                         ("EXISTS (SELECT 1 FROM p WHERE p.user_id = u.id)", "在 EXISTS 子查询里"),
                         ("(SELECT COUNT(*) FROM p WHERE p.user_id = u.id) > 0", "在条件的子查询里")):
         a, b = head.format("paid") + tail, head.format("open") + tail
@@ -728,10 +726,10 @@ def test_filters_on_real_columns_carry_the_columns_for_the_catalog():
 
 def test_a_displayed_condition_means_what_the_sql_means():
     """给人看的条件按方言生成；方言生成的写法读回来不是同一个意思时（SQLite 把 CAST(x AS DATE) 生成 DATE(x)）改用
-    通用写法，不拿 DATE('2026-09-01') 冒充原文。几个条件连起来时 OR 带上括号。"""
-    [item] = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'",
-                              "SELECT COUNT(*) FROM orders WHERE paid_at >= CAST('2026-09-01' AS DATE)").items
-    assert "CAST('2026-09-01' AS DATE)" in item.text and "DATE('2026-09-01')" not in item.text
+    通用写法，不拿 DATE(paid_at) 冒充原文。几个条件连起来时 OR 带上括号。"""
+    [item] = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE CAST(paid_at AS DATE) >= '2026-09-01'",
+                              "SELECT COUNT(*) FROM orders WHERE CAST(paid_at AS DATE) >= '2026-10-01'", "sqlite").items
+    assert item.aspect == "time_range" and "CAST(paid_at AS DATE)" in item.text and "DATE(paid_at)" not in item.text
     a = "SELECT SUM(amount) FROM orders"
     b = "SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id AND (s.city = 'SH' OR s.city = 'BJ')"
     [item] = explain_sql_diff(a, b).items
@@ -777,6 +775,19 @@ def test_columns_inside_a_cte_are_not_compared_because_canonical_forms_prune_the
     diff = explain_sql_diff(a, b)
     check_shape(diff)
     assert diff.fallback and not [d for d in diff.items if "选出" in d.text]
+
+
+def test_differences_that_cannot_be_checked_get_only_the_fallback():
+    """两边算法不同、又判断不了是不是真的不同的（ROUND 包了一层、CASE 和 COALESCE、两种写法的时间常量），不说具体的：
+    「A 算的是 X，B 算的是 Y」读起来就是两边不同，说错了比不说更糟。"""
+    for a, b in (("SELECT SUM(amount) FROM orders", "SELECT ROUND(SUM(amount), 2) FROM orders"),
+                 ("SELECT SUM(COALESCE(discount, 0)) FROM orders",
+                  "SELECT SUM(CASE WHEN discount IS NULL THEN 0 ELSE discount END) FROM orders"),
+                 ("SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'",
+                  "SELECT COUNT(*) FROM orders WHERE paid_at >= DATE('2026-09-01')")):
+        diff = explain_sql_diff(a, b, "sqlite")
+        check_shape(diff)
+        assert diff.fallback and diff.items == [FacetDiff("other", None, None, FALLBACK)], (a, b, diff.items)
 
 
 def test_text_diff_lists_at_most_forty_lines():
@@ -857,3 +868,234 @@ def test_catalog_labels_come_from_visible_catalog_items():
 def test_a_facets_object_compares_with_itself_cleanly():
     f = facets("WITH v AS (SELECT * FROM orders WHERE is_deleted = 0) SELECT COUNT(DISTINCT order_id) FROM v")
     assert isinstance(f, Facets) and diff_facets(f, f) == []
+
+
+# --------------------------------------------------------------------------
+# 第 2 轮复验的反例：等价的结论、具体说法的可靠性
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name,dialect,a,b", sql_pairs.REGRESSIONS_R2,
+                         ids=[f"{n}-{d}" for n, d, _, _ in sql_pairs.REGRESSIONS_R2])
+def test_round_two_counterexamples_are_never_equivalent(name, dialect, a, b):
+    """第 2 轮复验在 PostgreSQL / MySQL 上跑出结果不同的对：常量折叠（Decimal 和浮点数）、取两次负、HAVING 挪进 WHERE
+    （不分大小写的排序规则下同组的值各不一样）、ORDER BY 里有聚合的 EXISTS / IN、列名表、合并的各支调换、BETWEEN
+    SYMMETRIC、有并列的取行、DISTINCT ON。不管给不给表结构、谁先谁后，一律不判等价。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, dialect, schema=schema)
+            check_shape(diff)
+            assert not diff.equivalent, name
+
+
+@pytest.mark.parametrize("name,dialect,a,b", sql_pairs.DIALECT_SAME_R2,
+                         ids=[f"{n}-{d}" for n, d, _, _ in sql_pairs.DIALECT_SAME_R2])
+def test_round_two_rewrites_are_recognized(name, dialect, a, b):
+    """FETCH FIRST 和 LIMIT、MySQL 列名的大小写、各方言 IS NOT NULL / NOT LIKE 的不同解析形状、MySQL 的 IF 和 CASE：
+    认得出是一回事（以前把 FETCH 读成「不限行数」）。"""
+    diff = explain_sql_diff(a, b, dialect)
+    check_shape(diff)
+    assert diff.equivalent, (name, diff.items)
+
+
+@pytest.mark.parametrize("name,dialect,a,b", sql_pairs.KNOWN_UNRECOGNIZED,
+                         ids=[f"{n}-{d}" for n, d, _, _ in sql_pairs.KNOWN_UNRECOGNIZED])
+def test_equivalences_left_unrecognized_on_purpose_get_only_the_fallback(name, dialect, a, b):
+    """意思一样、规范化故意不认的（要假设「相等就是一样」才认得出）：只给兜底说明，不说具体的不同。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(a, b, dialect, schema=schema)
+        check_shape(diff)
+        assert diff.equivalent or all(d.aspect == "other" for d in diff.items), (name, diff.items)
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b", [
+    ("SELECT COUNT(*) FROM orders o WHERE o.paid_at >= '2026-09-01' AND EXISTS "
+     "(SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id "
+     "AND o.paid_at >= '2026-09-01')"),
+    ("SELECT COUNT(*) FROM orders o WHERE o.status = 'paid' AND EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id AND o.status = 'paid')"),
+    ("SELECT COUNT(*) FROM orders WHERE status = 'paid' AND id IN (SELECT order_id FROM refunds)",
+     "SELECT COUNT(*) FROM orders WHERE id IN (SELECT order_id FROM refunds WHERE status = 'paid')"),
+    ("SELECT COUNT(*) FROM users u WHERE u.city = 'BJ' AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)",
+     "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND u.city = 'BJ')"),
+], ids=["exists-time", "exists-status", "in-outer-column", "exists-city"])
+def test_a_condition_moved_into_a_correlated_subquery_is_not_called_missing(dialect, a, b):
+    """条件挪进了相关子查询（引用的还是外层那一行）：两条意思一样，B 是有这个条件的。以前说「B 没有按时间筛选」
+    「B 没有这个条件」，现在说不清就只给兜底说明。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, dialect, schema=schema)
+            check_shape(diff)
+            assert all(d.aspect == "other" for d in diff.items), diff.items
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_time_filters_written_another_way_are_never_called_no_time_filter(dialect):
+    """时间条件换了写法（拆成两段、IN 和 OR、多一个下界、LIKE 和区间）：另一边是按时间筛了的，不能说「没有按时间筛选」，
+    也不能说成两个范围不同。"""
+    base = "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01'"
+    for other in ("SELECT COUNT(*) FROM orders WHERE (paid_at >= '2026-09-01' AND paid_at < '2026-09-16') OR "
+                  "(paid_at >= '2026-09-16' AND paid_at < '2026-10-01')",
+                  "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01' "
+                  "AND paid_at > '2026-08-01'",
+                  "SELECT COUNT(*) FROM orders WHERE paid_at LIKE '2026-09%'"):
+        diff = explain_sql_diff(base, other, dialect)
+        check_shape(diff)
+        assert not any("没有按时间筛选" in d.text or d.aspect == "time_range" for d in diff.items), diff.items
+    diff = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE paid_at IN ('2026-09-01', '2026-09-30')",
+                            "SELECT COUNT(*) FROM orders WHERE paid_at = '2026-09-01' OR paid_at = '2026-09-30'", dialect)
+    assert all(d.aspect == "other" for d in diff.items)
+
+
+def test_except_with_its_sides_swapped_is_not_one_time_difference():
+    """EXCEPT 两边对调，外加一边换了时间列：以前只说时间列不同、还说全了（会写进数据目录）。EXCEPT 按先后逐支比，对不上
+    就只给兜底说明；子查询、CTE、IN 子查询里套着的也一样。"""
+    a = "SELECT user_id FROM orders WHERE paid_at >= '2026-09-01' EXCEPT SELECT user_id FROM refunds"
+    b = "SELECT user_id FROM refunds EXCEPT SELECT user_id FROM orders WHERE created_at >= '2026-09-01'"
+    for x, y in ((a, b), (f"SELECT COUNT(*) FROM ({a}) t", f"SELECT COUNT(*) FROM ({b}) t"),
+                 (f"WITH e AS ({a}) SELECT COUNT(*) FROM e", f"WITH e AS ({b}) SELECT COUNT(*) FROM e"),
+                 (f"SELECT COUNT(*) FROM users WHERE id IN ({a})", f"SELECT COUNT(*) FROM users WHERE id IN ({b})")):
+        for dialect in ("sqlite", "postgres"):
+            diff = explain_sql_diff(x, y, dialect)
+            check_shape(diff)
+            assert diff.fallback and all(d.aspect == "other" for d in diff.items), (x, diff.items)
+
+
+@pytest.mark.parametrize("a,b", [
+    (sql_pairs.PAIRS_BY_ID["diff:r2-in-not-in-swapped"].a, sql_pairs.PAIRS_BY_ID["diff:r2-in-not-in-swapped"].b),
+    (sql_pairs.PAIRS_BY_ID["diff:r2-exists-not-exists-swapped"].a,
+     sql_pairs.PAIRS_BY_ID["diff:r2-exists-not-exists-swapped"].b),
+    (sql_pairs.PAIRS_BY_ID["diff:r2-in-left-column-swapped"].a, sql_pairs.PAIRS_BY_ID["diff:r2-in-left-column-swapped"].b),
+], ids=["in-not-in", "exists-not-exists", "left-column"])
+def test_subqueries_swapped_between_in_and_not_in_are_not_explained_both_ways(a, b):
+    """IN 和 NOT IN（EXISTS 和 NOT EXISTS、id IN 和 referrer_id IN）两个子查询对调：以前配错了对，说出一对互相矛盾的话、
+    还把 NOT IN 说成「IN 子查询」。子查询要外面的写法（含 NOT、IN 左边的列）一模一样才配对，配不上就只给兜底。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(a, b, "sqlite", schema=schema, labels=LABELS)
+        check_shape(diff)
+        assert all(d.aspect == "other" for d in diff.items), diff.items
+
+
+def test_a_difference_inside_a_not_in_subquery_says_not_in():
+    """NOT IN 子查询里的条件不同，说的是「NOT IN 的子查询」（以前说成「IN 子查询」，读的人会以为是保留这些用户）。子查询
+    里不带表名的列，没给表结构时分不清是子查询里的表的还是外层的（users 也可能有 status），不说具体的；给了表结构、
+    或者写了表名，就说得出。"""
+    a = ("SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'void' "
+         "AND user_id IS NOT NULL)")
+    b = a.replace("'void'", "'open'")
+    expected = [("filter", "原流程在 id NOT IN 的子查询里按 status = 'void' 筛选，盲算在 id NOT IN 的子查询里按 "
+                           "status = 'open' 筛选")]
+    diff = explain_sql_diff(a, b, "sqlite", labels=LABELS, schema=sql_pairs.schema_cache())
+    check_shape(diff)
+    assert [(d.aspect, d.text) for d in diff.items] == expected
+    assert explain_sql_diff(a, b, "sqlite", labels=LABELS).items == [FacetDiff("other", None, None, FALLBACK)]
+    qa, qb = a.replace("FROM orders WHERE status", "FROM orders o WHERE o.status"), \
+        b.replace("FROM orders WHERE status", "FROM orders o WHERE o.status")
+    assert [(d.aspect, d.text) for d in explain_sql_diff(qa, qb, "sqlite", labels=LABELS).items] == expected
+    diff = explain_sql_diff(a.replace("NOT IN", "IN"), b.replace("NOT IN", "IN"), "sqlite", labels=LABELS,
+                            schema=sql_pairs.schema_cache())
+    assert "id IN 的子查询" in diff.items[0].text and "NOT IN" not in diff.items[0].text
+
+
+def test_a_swapped_table_keeps_each_sides_own_columns():
+    """换了一张表：盲算的 created_at 是 users 的（注册时间），以前把 B 的表改名成 A 的表再比，中文名和 detail 都归到了
+    orders。现在两边各用各的表说。"""
+    names = {"orders.created_at": "下单时间", "users.created_at": "注册时间", "orders.paid_at": "支付时间"}
+    diff = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'",
+                            "SELECT COUNT(*) FROM users WHERE created_at >= '2026-09-01'", "sqlite", names=names,
+                            labels=LABELS)
+    check_shape(diff)
+    assert [(d.aspect, d.text) for d in diff.items] == [
+        ("tables", "原流程查的是 orders 表，盲算查的是 users 表"),
+        ("time", "原流程按支付时间 paid_at 筛时间，盲算按注册时间 created_at")]
+    assert diff.items[1].detail == {"a": [{"table": "orders", "column": "paid_at"}],
+                                    "b": [{"table": "users", "column": "created_at"}]}
+    diff = explain_sql_diff("SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.city = 'SH'",
+                            "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.city = 'SH'",
+                            "sqlite")
+    check_shape(diff)
+    assert [d.text for d in diff.items] == [
+        "A 查的是 stores 表，B 查的是 users 表",
+        "A 关联的条件是 orders.store_id = stores.id，B 是 orders.user_id = users.id"]
+
+
+def test_ordering_that_decides_which_row_distinct_on_keeps_is_not_just_ordering():
+    """DISTINCT ON 留哪一行由 ORDER BY 决定：排序不同就是留下的行不同，不能说成「只是排序不同」（aspect=order）。"""
+    a = "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, created_at DESC NULLS LAST, id"
+    b = "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, paid_at DESC NULLS LAST, id"
+    diff = explain_sql_diff(a, b, "postgres")
+    check_shape(diff)
+    assert not diff.equivalent and all(d.aspect != "order" for d in diff.items)
+
+
+def test_a_table_name_differing_only_in_case_is_not_called_another_table_in_mysql():
+    """MySQL 的表名在 Linux 上分大小写、在 macOS / Windows 上不分：BILLS 和 bills 不判等价，也不说「查的是另一张表」。"""
+    diff = explain_sql_diff("SELECT store_id, SUM(amount) AS s FROM orders WHERE is_deleted = 0 GROUP BY store_id",
+                            "select STORE_ID, sum( AMOUNT ) as s from ORDERS where IS_DELETED = 0 group by store_id",
+                            "mysql")
+    check_shape(diff)
+    assert all(d.aspect == "other" for d in diff.items)
+
+
+def test_redundant_or_constant_conditions_are_not_claimed():
+    """多写一个本来就成立的条件（1 = 1、已经被 > 筛掉的空值、关联键上的 IS NOT NULL、分组后 COUNT(*) > 0）：两条意思一样，
+    不说「A 只保留 … 的行，B 没有这个条件」。1 = 1 直接认成等价。"""
+    assert explain_sql_diff("SELECT COUNT(*) FROM orders WHERE 1 = 1 AND status = 'paid'",
+                            "SELECT COUNT(*) FROM orders WHERE status = 'paid'", "sqlite").equivalent
+    for dialect in DIALECTS:
+        for a, b in (("SELECT SUM(tax) FROM orders WHERE tax > 1 AND tax IS NOT NULL", "SELECT SUM(tax) FROM orders WHERE tax > 1"),
+                     ("SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id WHERE o.user_id IS NOT NULL",
+                      "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id"),
+                     ("SELECT store_id, SUM(amount) FROM orders GROUP BY store_id HAVING COUNT(*) > 0",
+                      "SELECT store_id, SUM(amount) FROM orders GROUP BY store_id"),
+                     ("SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1",
+                      "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) >= 2"),
+                     ("SELECT COUNT(tax) FROM orders", "SELECT COUNT(*) FROM orders WHERE tax IS NOT NULL"),
+                     ("SELECT COUNT(r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+                      "SELECT COUNT(r.id) FROM orders o JOIN refunds r ON r.order_id = o.id")):
+            diff = explain_sql_diff(a, b, dialect)
+            check_shape(diff)
+            assert all(d.aspect == "other" for d in diff.items), (dialect, a, diff.items)
+
+
+def test_single_item_in_list_becomes_equality_only_for_a_constant():
+    """IN 列表只有一项：是常量才写成 =；是一列的话 SQLite 里 a IN (b) 是 a = +b（右边不带类型亲和），和 a = b 不同。"""
+    assert explain_sql_diff("SELECT COUNT(*) FROM orders WHERE status IN ('paid')",
+                            "SELECT COUNT(*) FROM orders WHERE status = 'paid'", "sqlite").equivalent
+    assert not explain_sql_diff("SELECT id FROM t WHERE a IN (b)", "SELECT id FROM t WHERE a = b", "sqlite").equivalent
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b", [
+    ("SELECT id FROM orders ORDER BY amount DESC LIMIT 5 OFFSET 10", "SELECT id FROM orders ORDER BY amount DESC LIMIT 20 OFFSET 0"),
+    ("WITH p(uid, total) AS (SELECT user_id, SUM(amount) FROM orders WHERE amount > 10 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM p WHERE total > 100",
+     "WITH p(uid, total) AS (SELECT user_id, SUM(amount) FROM orders WHERE amount > 50 GROUP BY user_id) "
+     "SELECT COUNT(*) FROM p WHERE total > 999"),
+    ("SELECT COUNT(*) FROM orders WHERE amount = 0.1 + 0.2 AND status IN ('paid', 'done')",
+     "SELECT COUNT(*) FROM orders WHERE amount = 0.5 + 0.25 AND status IN ('open', 'void')"),
+    ("SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE created_at >= '2026-09-01')",
+     "SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE created_at >= '2026-10-01')"),
+], ids=["limit-offset", "cte-column-list", "arith-and-in-list", "not-in"])
+def test_only_literals_changed_stays_the_same_template_after_the_rewrite(dialect, a, b):
+    """normalize_sql「只改了参数」的判断不受这次改动影响：只改字面量的照旧同一个模板（等价判定照样说不等价）。"""
+    na, nb = normalize_sql(a, dialect), normalize_sql(b, dialect)
+    assert na.parse_error is None and na.same_shape(nb) and na.literals != nb.literals
+    assert not explain_sql_diff(a, b, dialect).equivalent
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b", [
+    ("WITH p(uid, total) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) SELECT COUNT(*) FROM p WHERE total > 1",
+     "WITH p(total, uid) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) SELECT COUNT(*) FROM p WHERE total > 1"),
+    ("SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM orders)",
+     "SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM orders)"),
+    ("SELECT COUNT(*) FROM orders WHERE amount = 0.1 + 0.2", "SELECT COUNT(*) FROM orders WHERE amount = 0.3"),
+    ("SELECT u.city, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.city",
+     "SELECT u.city, COUNT(*) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.city"),
+], ids=["cte-column-list-order", "in-vs-not-in", "folded-constant", "join-kind"])
+def test_a_structural_change_is_still_a_different_template(dialect, a, b):
+    """结构变了的（列名表的先后、IN 和 NOT IN、常量写成一个数、连接类型）照旧不是同一个模板。"""
+    assert not normalize_sql(a, dialect).same_shape(normalize_sql(b, dialect))

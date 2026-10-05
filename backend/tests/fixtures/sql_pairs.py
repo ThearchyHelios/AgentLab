@@ -10,8 +10,10 @@ OR 里的标量子查询改成 CROSS JOIN，都是复验时真踩到的），所
 2 的负幂次的倍数，不同的求和先后得到的浮点数一样；比较结果时浮点数另按 6 位小数取整（乘 0.9 这类每行都有舍入）。
 
 语料（PAIRS，SQLite，拿去执行）每一项 (编号, A, B, 预期)：same 是已知等价的改写（别名、CTE 改名、关联先后、条件
-左右、子查询和 CTE 互换……），diff 是不许判等价的（换时间列、少一个条件、去重与否、外连接与内连接，以及只在某个方言、
-某种排序规则下才等价的）。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料。过去复验报过的反例都
+左右、子查询和 CTE 互换……），编号以 hard: 开头的是要按语义推理才看得出等价的（条件挪进相关子查询、冗余条件），规范化
+不保证认得出、认不出时只许给兜底说明；diff 是不许判等价的（换时间列、少一个条件、去重与否、外连接与内连接，以及只在
+某个方言、某种排序规则下才等价的）。第 2 轮复验的反例在 _SAME_HARD、_SAME_R2、_DIFF_R2（执行）和 REGRESSIONS_R2、
+DIALECT_SAME_R2、KNOWN_UNRECOGNIZED（各方言，只查结论）里。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料。过去复验报过的反例都
 收进来了：第 5 轮回退的「只在 IN 子查询里用到的 CTE」在 PAIRS 里；复验者留在 /private/tmp 的脚本里、在这几组数据上
 结果不同的对是 VALIDATOR_DIFF（也进 PAIRS 执行）；旧测试（五轮复核修正按复验报告补的用例，各方言，用到的列这个库里
 不全有）里报过不同的对是 REGRESSIONS、意思一样的对是 DIALECT_SAME，这两份不执行，只查判没判等价。
@@ -36,6 +38,9 @@ DDL = {
     "refunds": "id INTEGER PRIMARY KEY, order_id INTEGER, user_id INTEGER, amount REAL, state TEXT, refunded_at TEXT",
     "payments": "id INTEGER PRIMARY KEY, order_id INTEGER, user_id INTEGER, amount REAL, method TEXT, paid_at TEXT",
     "shipments": "id INTEGER PRIMARY KEY, order_id INTEGER, carrier TEXT, shipped_at TEXT",
+    # 一张叫 nums 的实表：SQLite 里不写 RECURSIVE 的递归 CTE（WITH nums(n) AS (… FROM nums …)）引用的是它自己，换个名字
+    # 引用的就是这张表了
+    "nums": "n INTEGER",
 }
 
 
@@ -95,8 +100,9 @@ def _rows(seed: int) -> dict[str, list[tuple]]:
     # 关联不上订单的退款、付款
     refunds.append((len(refunds) + 1, pick([None, 999]), pick(user_ids), pick(AMOUNTS), "done", pick(DATES)))
     payments.append((len(payments) + 1, None, pick(user_ids), pick(AMOUNTS), "cash", pick(DATES)))
+    nums = [(n,) for n in rng.sample([1, 2, 3, 4, 10, 20], rng.randint(1, 4))]
     return {"users": users, "stores": stores, "orders": orders, "orders_archive": archive, "order_items": items,
-            "refunds": refunds, "payments": payments, "shipments": shipments}
+            "refunds": refunds, "payments": payments, "shipments": shipments, "nums": nums}
 
 
 def _edge_rows() -> dict[str, list[tuple]]:
@@ -107,17 +113,41 @@ def _edge_rows() -> dict[str, list[tuple]]:
               (2, 1, None, 1, 2, None, 0, 0, "paid", "east", None, None, 0),
               (3, None, 1, None, None, 100, 0, 1, "paid", None, "2026-09-30 23:59:59", "2026-09-01", 1)]
     return {"users": users, "stores": stores, "orders": orders, "orders_archive": [], "order_items": [],
-            "refunds": [], "payments": [], "shipments": []}
+            "refunds": [], "payments": [], "shipments": [], "nums": []}
 
 
-#: 生成数据用的种子（每个种子一组），外加一组极端数据
+def _tricky_rows() -> dict[str, list[tuple]]:
+    """一组专挑写法差异的数据（第 2 轮复验的反例在这上面现形）：金额 0.1、0.2、0.3（浮点数 0.1 + 0.2 ≠ 0.3）、
+    100 * 0.07；状态里有像数字的文本（'3.0'、'12'）和大小写不同的 'PAID'；用户名是像数字的文本（'0100' 取两次负是
+    100）；城市 'SH'、'sh'；id 16 的订单（0x10）；nums 表有几行。"""
+    users = [(1, "0100", "SH", 1, 3, None, "2026-09-01", 0), (2, "5", "sh", 0, 1, 1, "2026-09-02", 0),
+             (3, "alice", "Sh", None, None, 2, None, 1), (4, "Bob", None, 1, 5, None, "2026-08-31 23:59:59", None)]
+    stores = [(1, "s1", "SH", "east", 1), (2, "s2", "sh", None, None), (3, "3.0", "12", "west", 2)]
+    amounts = [0.1, 0.2, 0.3, 0.3, 0.30000000000000004, 7.0, 100 * 0.07, 12.5, None, 100.0, 0, 0.5]
+    statuses = ["paid", "PAID", "3.0", "12", None, "open", "void", "paid"]
+    orders = []
+    for i in range(1, 21):
+        orders.append((i, (i % 4) + 1 if i % 7 else None, (i % 3) + 1, i - 1 if i % 5 == 0 else None, (i % 2) + 1,
+                       amounts[i % len(amounts)], [0, 0.5, None][i % 3], [0, 1, None][i % 3],
+                       statuses[i % len(statuses)], ["east", "west", None][i % 3], DATES[i % len(DATES)],
+                       DATES[(i * 3) % len(DATES)], [0, 1, None][i % 3]))
+    refunds = [(1, 1, 2, 0.1, "done", "2026-09-05"), (2, 16, 1, 0.2, None, None), (3, 3, None, 0.3, "done", "2026-09-30"),
+               (4, 99, 3, 7.0, "pending", "2026-10-01")]
+    payments = [(1, 1, 2, 0.3, "card", "2026-09-02"), (2, 16, 1, 0.1, "cash", None)]
+    items = [(1, 1, 1, 2, 0.1), (2, 16, 2, None, 0.2), (3, 3, 1, 1, None)]
+    shipments = [(1, 1, "sf", "2026-09-03"), (2, 16, None, None)]
+    return {"users": users, "stores": stores, "orders": orders, "orders_archive": orders[:5], "order_items": items,
+            "refunds": refunds, "payments": payments, "shipments": shipments, "nums": [(1,), (2,), (10,)]}
+
+
+#: 生成数据用的种子（每个种子一组），外加一组极端数据、一组专挑写法差异的数据
 SEEDS = (7, 11, 23, 42, 2026)
 
 
 def build_databases() -> list[sqlite3.Connection]:
     """每组数据一个内存库。"""
     out = []
-    for rows in [_rows(seed) for seed in SEEDS] + [_edge_rows()]:
+    for rows in [_rows(seed) for seed in SEEDS] + [_edge_rows(), _tricky_rows()]:
         conn = sqlite3.connect(":memory:")
         for name, ddl in DDL.items():
             conn.execute(f"CREATE TABLE {name} ({ddl})")
@@ -847,9 +877,6 @@ DIALECT_SAME: list[tuple[str, str, str, str]] = [
     ("swapped_join_order_of_two_derived_tables_is_no_difference", "sqlite",
      "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), u AS (SELECT user_id, COUNT(*) AS cnt FROM refunds GROUP BY user_id) SELECT COUNT(*) FROM t JOIN u ON u.user_id = t.user_id WHERE t.total > u.cnt",
      "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id), u AS (SELECT user_id, COUNT(*) AS cnt FROM refunds GROUP BY user_id) SELECT COUNT(*) FROM u JOIN t ON t.user_id = u.user_id WHERE t.total > u.cnt"),
-    ("the_same_item_on_equivalent_layers_is_no_difference", "sqlite",
-     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE user_id > 100 GROUP BY user_id) SELECT SUM(total) FROM t",
-     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT SUM(total) FROM t WHERE user_id > 100"),
     ("derived_columns_renamed_on_one_side_are_paired", "sqlite",
      "WITH t AS (SELECT user_id, SUM(amount) AS total, COUNT(*) AS n FROM orders GROUP BY user_id) SELECT COUNT(*) FROM t WHERE total > 100 AND n > 1",
      "WITH t AS (SELECT user_id, SUM(amount) AS s, COUNT(*) AS c FROM orders GROUP BY user_id) SELECT COUNT(*) FROM t WHERE s > 100 AND c > 1"),
@@ -1860,6 +1887,308 @@ VALIDATOR_DIFF: list[tuple[str, str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------- 第 2 轮复验的反例
+# 第 2 轮复验（重做之后的第一版）报的 blocker / major 和几位复验者留在 /private/tmp 的脚本里的对，改写到这个库的
+# 表上（列名换成这里有的），SQLite 能执行的进执行比对；只在 PostgreSQL / MySQL 才有的写法进 REGRESSIONS_R2 只查结论。
+
+#: 意思一样、但要按语义推理才看得出的（条件挪进相关子查询、冗余条件、写法不同的等价条件……）：规范化不保证认得出，
+#: 认不出时只许给兜底说明，不许给具体说法（复验专挑这类对查「说出不存在的差异」）
+_SAME_HARD = [
+    # 条件挪进相关子查询（EXISTS 里引用外层的列）：B 是有这个条件的，不能说「B 没有」
+    ("r2-exists-moved-time", "SELECT COUNT(*) FROM orders o WHERE o.paid_at >= '2026-09-01' AND EXISTS "
+     "(SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id "
+     "AND o.paid_at >= '2026-09-01')"),
+    ("r2-exists-moved-filter", "SELECT COUNT(*) FROM orders o WHERE o.status = 'paid' AND EXISTS "
+     "(SELECT 1 FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id AND o.status = 'paid')"),
+    ("r2-scalar-moved-filter", "SELECT COUNT(*) FROM orders o WHERE o.status = 'paid' AND o.amount > "
+     "(SELECT AVG(r.amount) FROM refunds r WHERE r.order_id = o.id)",
+     "SELECT COUNT(*) FROM orders o WHERE o.amount > (SELECT AVG(r.amount) FROM refunds r WHERE r.order_id = o.id "
+     "AND o.status = 'paid')"),
+    # refunds 没有 status 列：子查询里的 status 是外层 orders 的
+    ("r2-in-moved-outer-column", "SELECT COUNT(*) FROM orders WHERE status = 'paid' AND id IN (SELECT order_id FROM refunds)",
+     "SELECT COUNT(*) FROM orders WHERE id IN (SELECT order_id FROM refunds WHERE status = 'paid')"),
+    # 一段时间拆成两段、IN 和 OR、多写一个下界：留下的行一样
+    ("r2-time-split-range", "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01'",
+     "SELECT COUNT(*) FROM orders WHERE (paid_at >= '2026-09-01' AND paid_at < '2026-09-16') OR "
+     "(paid_at >= '2026-09-16' AND paid_at < '2026-10-01')"),
+    ("r2-time-in-vs-or", "SELECT COUNT(*) FROM orders WHERE paid_at IN ('2026-09-01', '2026-09-30')",
+     "SELECT COUNT(*) FROM orders WHERE paid_at = '2026-09-01' OR paid_at = '2026-09-30'"),
+    ("r2-time-redundant-lower", "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01'",
+     "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01' AND paid_at > '2026-08-01'"),
+    ("r2-in-vs-or", "SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'done')",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid' OR status = 'done'"),
+    ("r2-redundant-not-null", "SELECT SUM(tax) FROM orders WHERE tax > 1 AND tax IS NOT NULL",
+     "SELECT SUM(tax) FROM orders WHERE tax > 1"),
+    ("r2-redundant-not-null-join", "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id "
+     "WHERE o.user_id IS NOT NULL",
+     "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id"),
+    ("r2-redundant-not-null-in", "SELECT COUNT(*) FROM orders WHERE store_id IN (SELECT id FROM stores "
+     "WHERE region = 'east') AND store_id IS NOT NULL",
+     "SELECT COUNT(*) FROM orders WHERE store_id IN (SELECT id FROM stores WHERE region = 'east')"),
+    ("r2-count-col-vs-not-null-filter", "SELECT COUNT(tax) FROM orders", "SELECT COUNT(*) FROM orders WHERE tax IS NOT NULL"),
+    ("r2-count-distinct-not-null", "SELECT COUNT(DISTINCT user_id) FROM orders WHERE user_id IS NOT NULL",
+     "SELECT COUNT(DISTINCT user_id) FROM orders"),
+    ("r2-coalesce-gt", "SELECT COUNT(*) FROM orders WHERE COALESCE(amount, 0) > 10",
+     "SELECT COUNT(*) FROM orders WHERE amount > 10"),
+    ("r2-left-coalesce-reject", "SELECT o.id FROM orders o LEFT JOIN users u ON u.id = o.user_id "
+     "WHERE COALESCE(u.grade, 0) > 1",
+     "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE COALESCE(u.grade, 0) > 1"),
+    ("r2-left-count-nullable-side", "SELECT COUNT(r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT COUNT(r.id) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+    ("r2-having-count-gt-1-vs-ge-2", "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1",
+     "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) >= 2"),
+    ("r2-having-noop", "SELECT store_id, SUM(amount) FROM orders GROUP BY store_id HAVING COUNT(*) > 0",
+     "SELECT store_id, SUM(amount) FROM orders GROUP BY store_id"),
+    ("r2-scalar-max-commute", "SELECT max(amount, tax) FROM orders", "SELECT max(tax, amount) FROM orders"),
+    ("r2-case-vs-coalesce", "SELECT SUM(CASE WHEN discount IS NULL THEN 0 ELSE discount END) FROM orders",
+     "SELECT SUM(COALESCE(discount, 0)) FROM orders"),
+]
+
+#: 意思一样、规范化认得出的改写（第 2 轮新增的几步）
+_SAME_R2 = [
+    ("r2-one-eq-one", "SELECT COUNT(*) FROM orders WHERE 1 = 1 AND status = 'paid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+    ("r2-not-is-not-null", "SELECT COUNT(*) FROM orders WHERE NOT (paid_at IS NOT NULL)",
+     "SELECT COUNT(*) FROM orders WHERE paid_at IS NULL"),
+    ("r2-not-like", "SELECT COUNT(*) FROM orders WHERE status NOT LIKE 'p%'",
+     "SELECT COUNT(*) FROM orders WHERE NOT status LIKE 'p%'"),
+    ("r2-iif-vs-case", "SELECT SUM(IIF(status = 'paid', amount, 0)) FROM orders",
+     "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) FROM orders"),
+    ("r2-case-else-null", "SELECT SUM(CASE WHEN status = 'paid' THEN amount END) FROM orders",
+     "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE NULL END) FROM orders"),
+    ("r2-min-distinct", "SELECT MIN(DISTINCT amount), MAX(DISTINCT tax) FROM orders",
+     "SELECT MIN(amount), MAX(tax) FROM orders"),
+    ("r2-exists-limit-1", "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id LIMIT 1)",
+     "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)"),
+    ("r2-in-subquery-distinct", "SELECT COUNT(*) FROM orders WHERE user_id IN (SELECT DISTINCT user_id FROM refunds)",
+     "SELECT COUNT(*) FROM orders WHERE user_id IN (SELECT user_id FROM refunds)"),
+    ("r2-using-vs-on-select", "SELECT user_id FROM orders o LEFT JOIN refunds r USING (user_id)",
+     "SELECT o.user_id FROM orders o LEFT JOIN refunds r ON o.user_id = r.user_id"),
+    ("r2-multi-use-cte-correlated", "WITH p AS (SELECT * FROM orders WHERE status = 'paid') SELECT COUNT(*) FROM p "
+     "WHERE EXISTS (SELECT 1 FROM p AS p2 WHERE p2.parent_id = p.id)",
+     "SELECT COUNT(*) FROM orders o WHERE o.status = 'paid' AND EXISTS (SELECT 1 FROM orders c "
+     "WHERE c.parent_id = o.id AND c.status = 'paid')"),
+    ("r2-outer-where-into-having", "WITH t AS (SELECT user_id, SUM(amount) AS s FROM orders GROUP BY user_id "
+     "HAVING SUM(amount) > 100) SELECT COUNT(*) FROM t",
+     "SELECT COUNT(*) FROM (SELECT user_id, SUM(amount) AS s FROM orders GROUP BY user_id) t WHERE t.s > 100"),
+]
+
+#: 不许判等价的（第 2 轮复验报的 blocker 改写到这个库上；在这几组数据上大多结果不同）
+_DIFF_R2 = [
+    # 数字常量不折叠：SQLite 按浮点数算，0.1 + 0.2 ≠ 0.3；三项以上的加乘不换结合
+    ("r2-float-fold", "SELECT COUNT(*) FROM orders WHERE amount = 0.1 + 0.2", "SELECT COUNT(*) FROM orders WHERE amount = 0.3"),
+    ("r2-float-fold-chain", "SELECT COUNT(*) FROM orders WHERE amount + 0.1 + 0.2 = 0.3",
+     "SELECT COUNT(*) FROM orders WHERE amount + 0.3 = 0.3"),
+    ("r2-float-fold-mul", "SELECT id, amount * 0.1 * 3 FROM orders", "SELECT id, amount * 0.3 FROM orders"),
+    ("r2-float-fold-compare", "SELECT COUNT(*) FROM orders WHERE amount < 3 * 0.1",
+     "SELECT COUNT(*) FROM orders WHERE amount < 0.3"),
+    ("r2-float-fold-007", "SELECT COUNT(*) FROM orders WHERE amount >= 100 * 0.07",
+     "SELECT COUNT(*) FROM orders WHERE amount >= 7.00"),
+    # 取两次负会把文本转成数
+    ("r2-double-negation", "SELECT id, -(-name) FROM users", "SELECT id, name FROM users"),
+    ("r2-double-negation-compare", "SELECT COUNT(*) FROM users WHERE -(-name) = 100",
+     "SELECT COUNT(*) FROM users WHERE name = 100"),
+    # 列名表：CTE 自己写的列名决定了外面的名字指哪一列
+    ("r2-cte-column-list-swap", "WITH p(uid, total) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM p WHERE total > 100",
+     "WITH p(total, uid) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) "
+     "SELECT COUNT(*) FROM p WHERE total > 100"),
+    ("r2-cte-column-list-swap-2", "WITH t(user_id, amount) AS (SELECT amount, user_id FROM orders) SELECT SUM(amount) FROM t",
+     "WITH t(amount, user_id) AS (SELECT amount, user_id FROM orders) SELECT SUM(amount) FROM t"),
+    # SQLite 不写 RECURSIVE 也是递归：A 引用的是自己，B 引用的是实表 nums
+    ("r2-recursive-without-keyword", "WITH nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) "
+     "SELECT COUNT(*) FROM nums",
+     "WITH seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT COUNT(*) FROM seq"),
+    # ORDER BY 有并列再取行、拼串、窗口函数：结果看行出来的先后，调换来源、DISTINCT 改 GROUP BY 都会变
+    ("r2-distinct-group-limit-ties", "SELECT DISTINCT user_id, status FROM orders ORDER BY user_id LIMIT 4",
+     "SELECT user_id, status FROM orders GROUP BY user_id, status ORDER BY user_id LIMIT 4"),
+    ("r2-group-key-order-limit-ties", "SELECT user_id, store_id, COUNT(*) FROM orders GROUP BY user_id, store_id "
+     "ORDER BY COUNT(*) DESC LIMIT 2",
+     "SELECT user_id, store_id, COUNT(*) FROM orders GROUP BY store_id, user_id ORDER BY COUNT(*) DESC LIMIT 2"),
+    ("r2-cross-join-swap-limit-ties", "SELECT o.id, u.id FROM orders o CROSS JOIN users u WHERE u.id = o.user_id "
+     "ORDER BY o.amount LIMIT 3",
+     "SELECT o.id, u.id FROM users u CROSS JOIN orders o WHERE u.id = o.user_id ORDER BY o.amount LIMIT 3"),
+    ("r2-group-concat-join-order", "SELECT u.city, GROUP_CONCAT(o.id) FROM users u CROSS JOIN orders o "
+     "WHERE o.user_id = u.id GROUP BY u.city",
+     "SELECT u.city, GROUP_CONCAT(o.id) FROM orders o CROSS JOIN users u WHERE o.user_id = u.id GROUP BY u.city"),
+    ("r2-group-concat-cross-vs-comma", "SELECT u.city, GROUP_CONCAT(o.id) FROM users u CROSS JOIN orders o "
+     "WHERE o.user_id = u.id GROUP BY u.city",
+     "SELECT u.city, GROUP_CONCAT(o.id) FROM users u, orders o WHERE o.user_id = u.id GROUP BY u.city"),
+    ("r2-row-number-join-order", "SELECT o.id, ROW_NUMBER() OVER () AS rn FROM users u CROSS JOIN orders o "
+     "WHERE o.user_id = u.id",
+     "SELECT o.id, ROW_NUMBER() OVER () AS rn FROM orders o CROSS JOIN users u WHERE o.user_id = u.id"),
+    ("r2-row-number-ties-join-order", "SELECT o.id, ROW_NUMBER() OVER (ORDER BY o.status) AS rn FROM users u "
+     "JOIN orders o ON o.user_id = u.id",
+     "SELECT o.id, ROW_NUMBER() OVER (ORDER BY o.status) AS rn FROM orders o JOIN users u ON o.user_id = u.id"),
+    ("r2-group-concat-subquery-order", "SELECT GROUP_CONCAT(id) FROM (SELECT id FROM orders ORDER BY amount DESC, id) t",
+     "SELECT GROUP_CONCAT(id) FROM (SELECT id FROM orders) t"),
+    # SQLite 里 a IN (b) 是 a = +b：右边那一列不带类型亲和
+    ("r2-in-single-column", "SELECT COUNT(*) FROM orders WHERE status IN (store_id)",
+     "SELECT COUNT(*) FROM orders WHERE status = store_id"),
+    ("r2-not-in-single-column", "SELECT COUNT(*) FROM orders WHERE status NOT IN (store_id)",
+     "SELECT COUNT(*) FROM orders WHERE status <> store_id"),
+    # 解析时丢了写法的：类型名（STRING 是数值亲和）、0x10 和 x'10'
+    ("r2-cast-string", "SELECT store_id, CAST(store_id AS STRING) FROM orders",
+     "SELECT store_id, CAST(store_id AS TEXT) FROM orders"),
+    ("r2-cast-bytea", "SELECT id, CAST(status AS BLOB) FROM orders", "SELECT id, CAST(status AS BYTEA) FROM orders"),
+    ("r2-hex-literal", "SELECT COUNT(*) FROM orders WHERE id = 0x10", "SELECT COUNT(*) FROM orders WHERE id = x'10'"),
+    # SELECT * 的列先后
+    ("r2-star-cte-column-order", "WITH c AS (SELECT user_id, amount FROM orders) SELECT * FROM c JOIN users "
+     "ON users.id = c.user_id",
+     "WITH c AS (SELECT amount, user_id FROM orders) SELECT * FROM c JOIN users ON users.id = c.user_id"),
+    ("r2-star-join-reorder", "SELECT * FROM orders o LEFT JOIN refunds r ON r.order_id = o.id JOIN users u ON u.id = o.user_id",
+     "SELECT * FROM orders o JOIN users u ON u.id = o.user_id LEFT JOIN refunds r ON r.order_id = o.id"),
+    # EXISTS 里：ORDER BY 有聚合就是聚合查询（总出一行）；DISTINCT 在 OFFSET 之前算（SQLite 恰好不管这个 DISTINCT）
+    ("r2-exists-order-by-aggregate", "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r "
+     "WHERE r.order_id = o.id ORDER BY COUNT(*))",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"),
+    ("r2-exists-distinct-offset", "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT DISTINCT r.state FROM refunds r "
+     "WHERE r.amount > 0 LIMIT 1 OFFSET 1)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT r.state FROM refunds r WHERE r.amount > 0 LIMIT 1 OFFSET 1)"),
+    # HAVING 不往 WHERE 挪：不分大小写的排序规则下同一组里的值各不一样
+    ("r2-having-key-vs-where", "SELECT city, COUNT(*) FROM users GROUP BY city HAVING city = 'SH'",
+     "SELECT city, COUNT(*) FROM users WHERE city = 'SH' GROUP BY city"),
+    # 两边对调、子查询配错位置（复验说成自相矛盾的话的几对）
+    ("r2-except-sides-swapped", "SELECT user_id FROM orders WHERE paid_at >= '2026-09-01' EXCEPT SELECT user_id FROM refunds",
+     "SELECT user_id FROM refunds EXCEPT SELECT user_id FROM orders WHERE created_at >= '2026-09-01'"),
+    ("r2-in-not-in-swapped", "WITH p AS (SELECT user_id FROM orders WHERE status = 'paid' AND user_id IS NOT NULL), "
+     "v AS (SELECT user_id FROM orders WHERE status = 'void' AND user_id IS NOT NULL) SELECT COUNT(*) FROM users "
+     "WHERE id IN (SELECT user_id FROM p) AND id NOT IN (SELECT user_id FROM v)",
+     "WITH p AS (SELECT user_id FROM orders WHERE status = 'paid' AND user_id IS NOT NULL), "
+     "v AS (SELECT user_id FROM orders WHERE status = 'void' AND user_id IS NOT NULL) SELECT COUNT(*) FROM users "
+     "WHERE id IN (SELECT user_id FROM v) AND id NOT IN (SELECT user_id FROM p)"),
+    ("r2-not-in-filter", "WITH p AS (SELECT user_id FROM orders WHERE status = 'paid'), v AS (SELECT user_id FROM orders "
+     "WHERE status = 'void' AND user_id IS NOT NULL) SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM p) "
+     "AND id NOT IN (SELECT user_id FROM v)",
+     "WITH p AS (SELECT user_id FROM orders WHERE status = 'paid'), v AS (SELECT user_id FROM orders "
+     "WHERE status = 'open' AND user_id IS NOT NULL) SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM p) "
+     "AND id NOT IN (SELECT user_id FROM v)"),
+    ("r2-exists-not-exists-swapped", "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r "
+     "WHERE r.order_id = o.id AND r.state = 'done') AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id "
+     "AND r.state = 'pending')",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id AND r.state = 'pending') "
+     "AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id AND r.state = 'done')"),
+    ("r2-in-left-column-swapped", "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'paid') "
+     "AND referrer_id IN (SELECT user_id FROM orders WHERE status = 'void')",
+     "SELECT COUNT(*) FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'void') "
+     "AND referrer_id IN (SELECT user_id FROM orders WHERE status = 'paid')"),
+    # 换了表：各自的列是各自表的（复验报的 detail 归错了表）
+    ("r2-table-swap-time", "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'",
+     "SELECT COUNT(*) FROM users WHERE created_at >= '2026-09-01'"),
+    ("r2-table-swap-join", "SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.city = 'SH'",
+     "SELECT SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.city = 'SH'"),
+    ("r2-table-swap-time-2", "SELECT SUM(amount) FROM refunds WHERE refunded_at >= '2026-09-01'",
+     "SELECT SUM(amount) FROM payments WHERE paid_at >= '2026-09-01'"),
+]
+
+#: 只在 PostgreSQL / MySQL 才有的写法（不执行，只查不判等价）：第 2 轮复验在真实的库上跑出结果不同的
+REGRESSIONS_R2: list[tuple[str, str, str, str]] = [
+    ("having_binary_is_not_where", "mysql",
+     "SELECT city, COUNT(*) FROM users GROUP BY city HAVING BINARY city = 'SH'",
+     "SELECT city, COUNT(*) FROM users WHERE BINARY city = 'SH' GROUP BY city"),
+    ("having_like_binary_is_not_where", "mysql",
+     "SELECT city, COUNT(*) FROM users GROUP BY city HAVING city LIKE BINARY 'S%'",
+     "SELECT city, COUNT(*) FROM users WHERE city LIKE BINARY 'S%' GROUP BY city"),
+    ("having_collate_is_not_where", "mysql",
+     "SELECT city, COUNT(*) FROM users GROUP BY city HAVING city COLLATE utf8mb4_bin = 'SH'",
+     "SELECT city, COUNT(*) FROM users WHERE city COLLATE utf8mb4_bin = 'SH' GROUP BY city"),
+    ("distinct_city_join_order_ci", "mysql",
+     "SELECT DISTINCT u.city FROM users u JOIN orders o ON o.user_id = u.id",
+     "SELECT DISTINCT u.city FROM orders o JOIN users u ON o.user_id = u.id"),
+    ("group_city_join_order_ci", "mysql",
+     "SELECT u.city, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.city",
+     "SELECT u.city, COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id GROUP BY u.city"),
+    ("order_by_aggregate_in_exists", "postgres",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id ORDER BY COUNT(*))",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id)"),
+    ("order_by_aggregate_in_in", "postgres",
+     "SELECT COUNT(*) FROM users WHERE vip IN (SELECT 1 FROM refunds WHERE amount > 1000 ORDER BY COUNT(*))",
+     "SELECT COUNT(*) FROM users WHERE vip IN (SELECT 1 FROM refunds WHERE amount > 1000)"),
+    ("cte_column_list_swap", "postgres",
+     "WITH p(uid, total) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) SELECT COUNT(*) FROM p WHERE total > 100",
+     "WITH p(total, uid) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id) SELECT COUNT(*) FROM p WHERE total > 100"),
+    ("cte_column_list_swap", "mysql",
+     "WITH t(user_id, amount) AS (SELECT amount, user_id FROM orders) SELECT SUM(amount) FROM t",
+     "WITH t(amount, user_id) AS (SELECT amount, user_id FROM orders) SELECT SUM(amount) FROM t"),
+    ("derived_column_list_swap", "postgres",
+     "SELECT SUM(t.x) FROM (SELECT amount, tax FROM orders) AS t(x, y)",
+     "SELECT SUM(t.x) FROM (SELECT amount, tax FROM orders) AS t(y, x)"),
+    ("derived_column_list_swap", "mysql",
+     "SELECT t.b FROM (SELECT user_id, amount FROM orders) AS t(a, b) WHERE t.a > 3",
+     "SELECT t.b FROM (SELECT user_id, amount FROM orders) AS t(b, a) WHERE t.a > 3"),
+    ("derived_column_list_renames", "postgres",
+     "SELECT amount, user_id FROM (SELECT amount, user_id FROM orders) AS t(user_id, amount)",
+     "SELECT amount, user_id FROM orders"),
+    ("table_alias_column_list", "postgres",
+     "SELECT COUNT(*) FROM orders AS o(user_id, id) WHERE o.user_id > 5",
+     "SELECT COUNT(*) FROM orders AS o WHERE o.user_id > 5"),
+    ("union_all_in_cte_alias_order", "postgres",
+     "WITH u AS (SELECT user_id AS a, amount AS b FROM orders UNION ALL SELECT amount AS b, user_id AS a FROM refunds) "
+     "SELECT SUM(b), SUM(a) FROM u",
+     "WITH u AS (SELECT amount AS b, user_id AS a FROM refunds UNION ALL SELECT user_id AS a, amount AS b FROM orders) "
+     "SELECT SUM(b), SUM(a) FROM u"),
+    ("union_all_in_cte_alias_order", "mysql",
+     "WITH u AS (SELECT user_id AS a, amount AS b FROM orders UNION ALL SELECT amount AS b, user_id AS a FROM refunds) "
+     "SELECT SUM(b), SUM(a) FROM u",
+     "WITH u AS (SELECT amount AS b, user_id AS a FROM refunds UNION ALL SELECT user_id AS a, amount AS b FROM orders) "
+     "SELECT SUM(b), SUM(a) FROM u"),
+    ("between_symmetric", "postgres",
+     "SELECT COUNT(*) FROM orders WHERE amount BETWEEN SYMMETRIC 100 AND 10",
+     "SELECT COUNT(*) FROM orders WHERE amount BETWEEN 100 AND 10"),
+    ("group_key_order_with_limit", "postgres",
+     "SELECT user_id, store_id, COUNT(*) FROM orders GROUP BY user_id, store_id ORDER BY COUNT(*) DESC LIMIT 2",
+     "SELECT user_id, store_id, COUNT(*) FROM orders GROUP BY store_id, user_id ORDER BY COUNT(*) DESC LIMIT 2"),
+    ("exists_distinct_offset", "postgres",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT DISTINCT r.state FROM refunds r WHERE r.amount > 0 LIMIT 1 OFFSET 1)",
+     "SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT r.state FROM refunds r WHERE r.amount > 0 LIMIT 1 OFFSET 1)"),
+    ("distinct_on_keeps_a_different_row", "postgres",
+     "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, created_at DESC NULLS LAST, id",
+     "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, paid_at DESC NULLS LAST, id"),
+    ("float_folding", "postgres",
+     "SELECT COUNT(*) FROM orders WHERE amount = 0.1 + 0.2", "SELECT COUNT(*) FROM orders WHERE amount = 0.3"),
+    ("double_negation", "mysql", "SELECT id, -(-name) FROM users", "SELECT id, name FROM users"),
+]
+
+#: 意思一样、规范化认得出的（PostgreSQL / MySQL 的写法）
+DIALECT_SAME_R2: list[tuple[str, str, str, str]] = [
+    ("fetch_first_is_limit", "postgres", "SELECT id FROM orders ORDER BY id FETCH FIRST 4 ROWS ONLY",
+     "SELECT id FROM orders ORDER BY id LIMIT 4"),
+    ("offset_fetch_is_limit_offset", "postgres", "SELECT id FROM orders ORDER BY id OFFSET 2 ROWS FETCH NEXT 4 ROWS ONLY",
+     "SELECT id FROM orders ORDER BY id LIMIT 4 OFFSET 2"),
+    ("mysql_column_names_ignore_case", "mysql", "SELECT SUM(amount) FROM orders WHERE is_deleted = 0",
+     "SELECT SUM(AMOUNT) FROM orders WHERE IS_DELETED = 0"),
+    ("is_not_null_forms", "postgres", "SELECT COUNT(*) FROM orders WHERE NOT (paid_at IS NOT NULL)",
+     "SELECT COUNT(*) FROM orders WHERE paid_at IS NULL"),
+    ("not_like_forms", "postgres", "SELECT COUNT(*) FROM orders WHERE status NOT LIKE 'p%'",
+     "SELECT COUNT(*) FROM orders WHERE NOT status LIKE 'p%'"),
+    ("if_vs_case", "mysql", "SELECT SUM(IF(status = 'paid', amount, 0)) FROM orders",
+     "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) FROM orders"),
+]
+
+#: 意思一样、规范化故意不认的（认了就要假设「相等就是一样」，见模块说明）：只给兜底说明，不给具体说法
+KNOWN_UNRECOGNIZED: list[tuple[str, str, str, str]] = [
+    ("having_on_group_key_vs_where", "sqlite",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE user_id > 100 GROUP BY user_id) SELECT SUM(total) FROM t",
+     "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT SUM(total) FROM t WHERE user_id > 100"),
+    ("union_dedup_branch_order", "sqlite",
+     "SELECT id, amount FROM orders UNION SELECT id, amount FROM orders_archive",
+     "SELECT id, amount FROM orders_archive UNION SELECT id, amount FROM orders"),
+    ("window_partition_key_order", "sqlite",
+     "SELECT id, SUM(amount) OVER (PARTITION BY user_id, store_id) AS s FROM orders",
+     "SELECT id, SUM(amount) OVER (PARTITION BY store_id, user_id) AS s FROM orders"),
+    ("distinct_vs_group_mysql_strings", "mysql",
+     "SELECT DISTINCT city FROM users", "SELECT city FROM users GROUP BY city"),
+]
+
+
 PAIRS: list[Pair] = [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME] + \
     [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF] + \
-    [Pair(f"validator:{n}:{k}", a, b, "diff") for k, (n, a, b) in enumerate(VALIDATOR_DIFF)]
+    [Pair(f"validator:{n}:{k}", a, b, "diff") for k, (n, a, b) in enumerate(VALIDATOR_DIFF)] + \
+    [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME_R2] + \
+    [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD] + \
+    [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF_R2]
+
+#: 按编号找语料里的一对（测试里引用第 2 轮的反例用）
+PAIRS_BY_ID: dict[str, Pair] = {p.id: p for p in PAIRS}
