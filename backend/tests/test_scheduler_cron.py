@@ -84,6 +84,8 @@ def test_expression_is_normalized():
     ("0 9 * * L", ["「周」", "L"]),
     ("0 9 1,,2 * *", ["「日」"]),
     ("@daily", ["5 个字段"]),
+    ("² * * * *", ["「分」", "²"]),
+    ("*/² * * * *", ["「分」", "步长"]),
 ])
 def test_invalid_expressions_explain_in_chinese(expr, fragments):
     with pytest.raises(cron.CronError) as caught:

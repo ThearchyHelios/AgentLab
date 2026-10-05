@@ -436,6 +436,8 @@ async def test_fire_history_pages_and_last_fire(client):
     assert last["reason"] == "第 4 次" and set(last) == FIRE_KEYS
     bad = await client.get(f"/api/schedules/{sid}/fires", params={"limit": "many"})
     assert bad.status_code == 422 and bad.json()["field"] == "limit"
+    bad = await client.get(f"/api/schedules/{sid}/fires", params={"limit": "²"})
+    assert bad.status_code == 422 and bad.json()["field"] == "limit"
     bad = await client.get(f"/api/schedules/{sid}/fires", params={"before": "昨天"})
     assert bad.status_code == 422 and bad.json()["field"] == "before"
 

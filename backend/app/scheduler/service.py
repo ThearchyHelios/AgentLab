@@ -240,7 +240,8 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
         try:
             inputs = render_inputs(check_template(template), template_values(fire_at, tz, cron_expr))
         except (TemplateError, cron.CronError, cron.TimezoneError) as e:
-            return await _record(schedule_id, fire_at, kind, "failed_to_start", f"输入模板无法渲染：{e}", {})
+            # 存进库之后才坏掉的（手改过库、时区库升级删了时区）：照实说是哪一项，不发起
+            return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", {})
         busy = await _active_run(schedule_id)
         if busy is not None:
             reason = f"上一次运行（{busy[:8]}）还没有结束，按设置跳过这次触发"

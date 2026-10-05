@@ -494,7 +494,7 @@ async def list_fires(schedule_id: str, limit: str | None = None, before: str | N
     await _get(session, schedule_id)
     size = 20
     if limit is not None:
-        if not limit.strip().isdigit() or not 1 <= int(limit) <= 100:
+        if not limit.strip().isdecimal() or not 1 <= int(limit) <= 100:
             raise _invalid(f"每页条数需要是 1 到 100 之间的整数，当前为「{limit}」", "limit")
         size = int(limit)
     stmt = select(ScheduleFire).where(ScheduleFire.schedule_id == schedule_id)

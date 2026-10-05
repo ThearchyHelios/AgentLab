@@ -128,7 +128,8 @@ def _parse_item(item: str, key: str, label: str, low: int, high: int) -> set[int
     base, slash, step_text = item.partition("/")
     step = 1
     if slash:
-        if not step_text.isdigit() or int(step_text) == 0:
+        # isdecimal 而不是 isdigit：「²」算 digit，int() 却认不得它
+        if not step_text.isdecimal() or int(step_text) == 0:
             raise CronError(f"「{label}」字段「{item}」的步长需要是正整数，现在是「{step_text}」", key)
         step = int(step_text)
     if base == "*":
@@ -150,7 +151,7 @@ def _parse_item(item: str, key: str, label: str, low: int, high: int) -> set[int
 
 def _value(token: str, item: str, key: str, label: str, low: int, high: int, *, range_end: bool = False) -> int:
     word = token.strip().upper()
-    if word.isdigit():
+    if word.isdecimal():
         number = int(word)
         if not low <= number <= high:
             raise CronError(f"「{label}」字段的 {number} 超出范围，允许 {_ALLOWED[key]}", key)
