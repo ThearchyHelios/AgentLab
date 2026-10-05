@@ -1280,3 +1280,22 @@ def test_a_join_on_a_primary_key_against_an_in_subquery_is_not_described_with_th
     diff = explain_sql_diff(a, b, "sqlite")
     check_shape(diff)
     assert diff.fallback and diff.items[0].text.startswith("A 关联了 users 表")
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+@pytest.mark.parametrize("a,b", [
+    ("SELECT DISTINCT o.user_id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT o.user_id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT SUM(r.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id",
+     "SELECT SUM(IFNULL(r.amount, NULL)) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT SUM(o.amount), COUNT(*) FROM orders o LEFT JOIN stores s ON s.id = o.store_id",
+     "SELECT SUM(o.amount), COUNT(*) FROM orders o LEFT JOIN stores s ON s.id IN (o.store_id)"),
+], ids=["dropped-left-join", "null-blind-left-join", "primary-key-spelled-otherwise"])
+def test_a_join_rewritten_on_one_side_only_is_not_described_as_missing(dialect, a, b):
+    """一边的 LEFT JOIN 被规范化去掉了（DISTINCT 之后不怕重复、按主键关联）或者按内连接比（只取可空一侧的聚合），另一边
+    写法不同没认出来：原文两边都关联了这张表、都写的 LEFT JOIN，不能说「A 没有关联 refunds 表」「A 用 INNER JOIN」。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, dialect, schema=schema)
+            check_shape(diff)
+            assert not any(d.aspect == "join" for d in diff.items), (dialect, diff.items)

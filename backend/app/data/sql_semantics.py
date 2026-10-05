@@ -99,8 +99,10 @@ MySQL 的表名按 Linux 上分大小写算。主键、NOT NULL 只认 schema_ca
 - 只是排序不同（order）只在整条语句最外层、没有取行、DISTINCT ON、窗口函数、不是只出一行（不分组的聚合、分组键都被
   WHERE 里的「键 = 常量」定死）时说；取行前的排序算 limit。
 - LEFT JOIN 对 INNER JOIN、「A 用 LEFT JOIN 关联了 X、B 没有」只在整条语句最外层、WHERE 里没用到可空一侧的列、
-  有没有这次 LEFT JOIN 结果可能不同（不是只取可空一侧跳过空值的聚合；不是没用到 X、又不怕重复的行）时说；「A 关联了
-  X、B 没有关联它（只在子查询里用到了 X）」在 A 不怕重复的行（可能只是 IN / EXISTS 改写成了关联）时不说。
+  有没有这次 LEFT JOIN 结果可能不同（不是只取可空一侧跳过空值的聚合；不是没用到 X、又不怕重复的行；表结构里 X 有唯一
+  键、又没用到它时也不说）时说；规范化只在一边去掉了这次 LEFT JOIN、或者只在一边按内连接比的（另一边写法不同没认出来，
+  原文两边都写着 LEFT JOIN），不说「另一边没有」「用 INNER JOIN」。「A 关联了 X、B 没有关联它（只在子查询里用到了
+  X）」在 A 不怕重复的行、或者按 X 的唯一键关联（可能只是 IN / EXISTS 改写成了关联）时不说。
 - UNION 对 UNION ALL 在 UNION ALL 那边的各支自己都已经去重（有没有重复要看各支相不相交）时不说。
 - 自己关联自己、几个来源同名的，关联条件写出来分不清谁是谁，不说。
 - 说的都是「这一段的这一项两边各写的是什么」；两边给人看的写法一样、和已经说过的一句正好反过来的不说。
@@ -2310,6 +2312,12 @@ _ORIGINAL = "sql_semantics_name"
 #: 写的是 LEFT / RIGHT JOIN、WHERE 把没关联上的行筛掉了、按内连接比的来源（记在那张表上，值是原来写的连接）：差异
 #: 说明里照实说「写的是 LEFT JOIN，实际是 INNER JOIN」
 _REJECTED = "sql_semantics_rejected"
+#: 原文写的是 LEFT JOIN、因为结果只是可空一侧跳过空值的聚合而按内连接比的来源（记在那张表上，见
+#: _null_blind_left_joins）：差异说明不拿它说「A 用 INNER JOIN」（原文写的是 LEFT JOIN，两种写法结果又一样）
+_NULL_BLIND = "sql_semantics_null_blind"
+#: 去掉了的 LEFT JOIN 关联的表（记在那一段 SELECT 上，值是表名的列表，见 _drop_unused_left_joins）：差异说明不拿
+#: 「另一边没有关联这张表」说事（原文是关联了的，只是有没有这次关联结果一样）
+_DROPPED_JOINS = "sql_semantics_dropped_joins"
 #: 从 RIGHT JOIN 改写成的 LEFT JOIN（记在 JOIN 上）：差异说明里不说「用 LEFT JOIN」，说以哪一侧为主表
 _FLIPPED = "sql_semantics_flipped"
 #: GROUP BY 是从 SELECT DISTINCT 改写来的：差异说明里说「去重」
@@ -4200,6 +4208,7 @@ def _null_blind_left_joins(tree: Any, read: str | None, sens: _Sensitivity) -> N
             if alias and all(_null_propagating(arg, alias, read) for arg in args):
                 join.set("side", None)
                 join.set("kind", None)
+                join.this.meta[_NULL_BLIND] = True
 
 
 def _membership_context(select: Any) -> bool:
@@ -4295,6 +4304,8 @@ def _drop_unused_left_joins(tree: Any, sens: _Sensitivity, info: _Schema, read: 
                 if alias and not any(c.table == alias and id(c) not in on for c in columns) and \
                         (insensitive or _unique_key_bound(join.this, _conjuncts(join.args["on"]), info, read)):
                     select.set("joins", [j for j in joins if j is not join] or None)
+                    dropped = select.meta.setdefault(_DROPPED_JOINS, [])
+                    dropped += [t.name for t in join.this.find_all(exp.Table)] or [alias]
                     changed = True
                     break
             if changed:
@@ -6477,7 +6488,8 @@ class _Explainer:
         from sqlglot import exp
 
         [rel] = [r for r in big.rels if r.alias not in {s.alias for s in small.rels}]
-        if not rel.table or big.names().count(rel.name) != 1:
+        if not rel.table or big.names().count(rel.name) != 1 or \
+                rel.name in (small.select.meta.get(_DROPPED_JOINS) or []):
             return None
         conds = [c for c in big.where if rel.alias in {col.table for col in c.find_all(exp.Column)}]
         what = self.what(rel)
@@ -6531,9 +6543,15 @@ class _Explainer:
                 any(isinstance(p, exp.Star) for p in select.expressions):
             return False
         join = next((j for j in joins if j.this.alias_or_name == alias), None)
-        return _dup_insensitive(select) or (join is not None and join.args.get("on") is not None and
-                                            _unique_key_bound(join.this, _conjuncts(join.args["on"]), self.info,
-                                                              self.read))
+        if join is None or join.args.get("on") is None:
+            return _dup_insensitive(select)
+        item = join.this
+        keyed = isinstance(item, exp.Table) and bool(
+            self.info.pk.get(item.name.translate(_ASCII_LOWER)) or self.info.unique.get(item.name.translate(_ASCII_LOWER)))
+        # 表结构里这张表有唯一键、ON 又写得认不出是不是按它关联（s.id IN (o.store_id) 这类写法）时也不说：按唯一键关联的
+        # 话左边每一行正好一行，有没有这次关联结果一样
+        return _dup_insensitive(select) or keyed or \
+            _unique_key_bound(item, _conjuncts(join.args["on"]), self.info, self.read)
 
     def _outer(self, A: _Block, B: _Block, where: tuple[str, str]
                ) -> tuple[bool, dict[str, str], set[str], set[str]] | None:
@@ -6606,7 +6624,10 @@ class _Explainer:
             if join is None or kind(join) != "left" or not _plain_join(join):
                 return None
             block, me, other = (A, la, lb) if x is not None else (B, lb, la)
-            if self._nullable_used(block, alias) or self._unused_left(block, alias):
+            other_block = B if x is not None else A
+            rel_here = block.rel(alias)
+            if self._nullable_used(block, alias) or self._unused_left(block, alias) or (
+                    rel_here is not None and rel_here.name in (other_block.select.meta.get(_DROPPED_JOINS) or [])):
                 return None
             rel = block.rel(alias)
             text = _say(me, *self._outer_words(join, block), self.what(rel), "，", other, "没有")
@@ -6620,6 +6641,10 @@ class _Explainer:
         的列的聚合（两种写法结果一样）时不说。照原文说：left 那边原来写的是 RIGHT JOIN 的说以哪一侧为主表；inner
         那边写的是 LEFT / RIGHT JOIN、被 WHERE 里的条件变成了内连接的，说写的是什么、实际是什么。"""
         if not _plain_join(join) or self._nullable_used(left, alias) or self._null_blind(left, alias):
+            return None
+        inner_rel = inner.rel(alias)
+        if inner_rel is not None and inner_rel.node.meta.get(_NULL_BLIND):
+            # inner 那边原文写的也是 LEFT JOIN，按内连接比只因为它的结果和内连接一样：不能说「用 INNER JOIN」
             return None
         on = join.args.get("on")
         conds = [self.fp(c) for c in _conjuncts(on)] if on is not None else []
