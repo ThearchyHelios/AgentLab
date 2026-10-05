@@ -3480,3 +3480,124 @@ export interface RunComparison {
 
 /** 运行接口回的运行带着发起它的定时任务（RunOut.schedule_id）；Run 上没写这一项，对比页的运行卡要用 */
 export type RunWithSchedule = Run & { schedule_id?: string | null }
+
+// ---------------------------------------------------------------------------
+// 双盲复算：审批 payload、完整对照工件、节点配置，以及设置里「核查」一组（期 3 前后端共用的约定）
+// ---------------------------------------------------------------------------
+
+/** 审核人对一个指标的裁决：a 采用原流程的结果，b 采用盲算的结果，neither 两边都不对 */
+export type DualCheckChoice = 'a' | 'b' | 'neither'
+
+/** 双盲复算挂起时 payload.summary 的一项：审批卡先用它画，完整对照另从 card_artifact 取 */
+export interface DualCheckSummaryItem {
+  metric_id: string
+  name: string
+  unit?: string | null
+  original_rendered: string | null
+  blind_rendered: string | null
+  /** (盲算值 − 原流程值) ÷ |原流程值| × 100，保留两位小数（12.5 表示相差 12.5%）；原流程值为 0 时为 null */
+  delta_pct: number | null
+  /** 具体差异，一条一句中文，最多 3 条 */
+  diff: string[]
+  /** 只有兜底说明：两条 SQL 的写法不同，未能归纳成具体差异 */
+  fallback: boolean
+}
+
+/** payload.kind 为 dual_check 的审批 payload（审批的 mode 是 input） */
+export interface DualCheckPayload {
+  kind: 'dual_check'
+  node_id: string
+  title: string
+  /** 完整对照放在这个工件里（GET /api/artifacts/{id}），内容见 DualCheckCard */
+  card_artifact: string
+  summary: DualCheckSummaryItem[]
+}
+
+/** 审核人的回复：POST /approvals/{id}/decide 的 value */
+export interface DualCheckReply {
+  choices: Record<string, DualCheckChoice>
+  note: string
+}
+
+/** 指标的一个输入：取自哪条查询的哪一格（alias 是查询快照的编号） */
+export interface DualCheckInput {
+  path: string
+  value: unknown
+  sql?: string | null
+  source?: string | null
+  alias?: string | null
+}
+
+/** 盲算那一边的输入多一段盲算模型自己的说明 */
+export interface DualCheckBlindInput extends DualCheckInput {
+  rationale?: string | null
+}
+
+export interface DualCheckSide<I extends DualCheckInput = DualCheckInput> {
+  value: number | null
+  rendered: string | null
+  inputs: I[]
+}
+
+/** 两条 SQL 差在哪（服务端 sql_semantics.explain_sql_diff）。aspect 为 other 的是兜底说明，parse 是解析不了 */
+export interface DualCheckDiff {
+  equivalent: boolean
+  items: { aspect: string; text: string }[]
+  /** 用了兜底说明（一条具体说法都没有，或者具体说法只覆盖了一部分） */
+  fallback: boolean
+  /** 规范化之后两条 SQL 不同的行：「- 」开头是原流程的，「+ 」开头是盲算的 */
+  text_diff: string[]
+}
+
+export interface DualCheckMetric {
+  metric_id: string
+  name: string
+  unit?: string | null
+  decimals?: number | null
+  original: DualCheckSide
+  blind: DualCheckSide<DualCheckBlindInput>
+  diff: DualCheckDiff
+  /** 相差比例，口径同 DualCheckSummaryItem.delta_pct（有的话） */
+  delta_pct?: number | null
+}
+
+/** card_artifact 工件的内容 */
+export interface DualCheckCard {
+  metrics: DualCheckMetric[]
+  /** 盲算用的模型 */
+  model?: string | null
+  /** 盲算模型和原流程的模型相同 */
+  same_model?: boolean
+}
+
+/** 双盲复算节点的配置。留空的项：card 取上游的口径卡，metrics 取输入来自查询的全部指标，其余跟随设置 */
+export interface DualCheckConfig {
+  card?: string
+  metrics?: string[]
+  definitions?: Record<string, string>
+  provider?: string
+  model?: string
+  tolerance?: number
+  on_reject?: 'degrade' | 'fail'
+  /** null 或不写：跟随设置 */
+  enabled?: boolean | null
+}
+
+/** 设置里的 verify 一组（GET /settings 给的是补齐默认之后的完整一组；上限为 null 表示不限） */
+export interface VerifySettings {
+  provider: string | null
+  model: string | null
+  dual_check: { enabled: boolean; tolerance: number; max_queries: number | null; timeout_s: number | null }
+  challenge: { enabled: boolean; max_claims: number | null; max_queries: number | null; timeout_s: number | null }
+  inquiry: { enabled: boolean; max_queries: number | null; timeout_s: number | null }
+  daily_max_usd: number | null
+}
+
+/** GET /settings/verify/spend：今天（本地日期）核查花了多少。unpriced_calls 是估不出金额、没算进 usd 的调用次数 */
+export interface VerifySpend {
+  date?: string
+  usd?: number
+  calls?: number
+  unpriced_calls?: number
+  daily_max_usd?: number | null
+}

@@ -95,8 +95,6 @@ function summarize(type: NodeType, config: Record<string, any>): string {
     case 'subgraph':
       return config.workflow_id ? '嵌套工作流' : '未选择工作流'
     // 还是占位的两种：卡片上直接说尚未生效，免得以为放上去就会执行
-    case 'dual_check':
-      return DUAL_CHECK_TEXT.pending
     case 'challenge':
       return CHALLENGE_TEXT.pending
     default:

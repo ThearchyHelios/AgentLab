@@ -662,7 +662,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   // 说明里写明尚未生效，检查器顶上就是这一句；各自的工作包补上字段时把这句去掉
   dual_check: {
     type: 'dual_check', label: NODE_TYPE_LABEL.dual_check, category: '把关', icon: GitCompareArrows,
-    description: `${DUAL_CHECK_TEXT.description}。${DUAL_CHECK_TEXT.pending}`,
+    description: DUAL_CHECK_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     fields: [],
     defaults: {},
