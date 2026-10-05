@@ -1,4 +1,4 @@
-"""定时任务：按周期自动发起工作流运行，结束、失败、停在审批时推送 Webhook。
+"""定时任务：按周期自动发起工作流运行，结束、失败、停在审批时推送 Webhook，运行结束后和同一任务的上一次自动对比。
 
 形状按前后端约定（Schedule、Fire 两种对象，见 _schedule_out、_fire_outs）。Webhook 地址和签名密钥加密存放，接口
 只给主机和末 4 位（url_hint）、有没有密钥（has_secret）。请求体自己解析、自己校验：错误一律回中文 detail，表单
@@ -18,7 +18,7 @@ from app.api.runs import actor_of
 from app.core.crypto import decrypt, encrypt
 from app.db.base import get_session, utcnow
 from app.db.models import Run, Schedule, ScheduleFire, WebhookDelivery, Workflow, WorkflowVersion
-from app.scheduler import cron, service, webhook
+from app.scheduler import auto_compare, cron, service, webhook
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
@@ -278,7 +278,11 @@ def _webhook_out(row: Schedule) -> dict[str, Any] | None:
 
 
 async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[dict[str, Any]]:
-    """Fire 对象：run_status 是运行现在的状态，notified 是这次触发的推送记录 [{event, status, at}]（按时间先后）。"""
+    """Fire 对象：run_status 是运行现在的状态，notified 是这次触发的推送记录 [{event, status, at}]（按时间先后），
+    compare 是运行结束后和同一任务上一次的自动对比 {base_run_id, summary}（summary 同对比接口的计数），没有为 null。
+
+    运行又被继续执行、现在不在终态时 compare 也给 null：对比页只认结束并封存的运行，链过去只会被拒；再结束时
+    通知扫描会按新的封存重新比。工件读不出来、被改过的同样给 null。"""
     run_ids = [f.run_id for f in fires if f.run_id]
     statuses = dict((await session.execute(select(Run.id, Run.status).where(Run.id.in_(run_ids)))).all()) \
         if run_ids else {}
@@ -292,6 +296,9 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
     # 正在发起的触发：库里是占位的「未能发起」（为了进程被强杀时照实说），进程还在、只是还没发起完，按已发起给
     launching = {f.id for f in fires if service.launching(f.id)}
+    compared = {f.id: f.compare_artifact for f in fires
+                if f.compare_artifact and statuses.get(f.run_id) in auto_compare.TERMINAL}
+    compares = await auto_compare.briefs(list(compared.values()))
     return [{
         "id": f.id,
         "fire_at": _iso(f.fire_at),
@@ -301,6 +308,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         "run_status": statuses.get(f.run_id) if f.run_id else None,
         "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
+        "compare": compares.get(compared[f.id]) if f.id in compared else None,
         "created_at": _iso(f.created_at),
     } for f in fires]
 

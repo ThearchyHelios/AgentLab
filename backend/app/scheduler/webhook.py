@@ -9,8 +9,9 @@ Webhook 地址本身就是凭证（企业微信的 key、钉钉的 access_token 
 一个过滤器把推送期间的那几行换成主机名。
 
 通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
-另写失败节点的名字和去哪里查看（不许诺能继续运行）。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着
-查询到的数据，Webhook 推去的群不一定有权看。
+另写失败节点的名字和去哪里查看（不许诺能继续运行）；运行结束后和同一任务上一次的对比（auto_compare）只写各类
+指标的个数和对比页链接。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook
+推去的群不一定有权看。
 
 三个平台出错时都回 HTTP 200、错误码放在响应体里，所以送没送达要看响应体：按地址的主机认平台，不看选的格式——
 格式选错了（飞书的地址选了通用格式）正是最需要认出来的情形。群机器人的地址只认自己平台的格式，保存时就拦下
@@ -39,7 +40,7 @@ from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
 from app.db.models import Approval, Run, RunEvent, Schedule, ScheduleFire, WebhookDelivery
 from app.engine.labels import ISSUANCE_LABEL
-from app.scheduler import service
+from app.scheduler import auto_compare, service
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,7 @@ class Notice:
 
     suspended：运行停在断点上、没有待审批（通常是服务重启挂起的），按 failed 事件推。error_node：失败节点的名字。
     next_fire：任务启用着、往后还会触发（失败通知据此补「下一次触发会照常发起」）。
+    compare：和同一定时任务上一次的对比摘要 {base_run_id, summary}（只有个数），compare_url：对比页的链接。
     fmt、signed 只给测试消息用：说明里只说这条消息证明得了的事。"""
 
     event: str
@@ -249,6 +251,8 @@ class Notice:
     suspended: bool = False
     error_node: str | None = None
     next_fire: bool = False
+    compare: dict[str, Any] | None = None
+    compare_url: str | None = None
     fmt: str | None = None
     signed: bool = False
 
@@ -287,6 +291,9 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
     if notice.tier:
         gaps = f"（缺口 {notice.gaps} 条）" if notice.gaps is not None else ""
         lines.append(("出具档位", f"{ISSUANCE_LABEL.get(notice.tier, notice.tier)}{gaps}"))
+    if notice.compare:
+        # 只给各类指标的个数：具体的数在对比页上，跟着运行的权限走，不随消息推进群里
+        lines.append(("与上一次相比", auto_compare.summary_text(notice.compare.get("summary") or {})))
     if notice.pending_approvals:
         lines.append(("待审批", f"{notice.pending_approvals} 项，请到 AgentLab 处理；运行结束之前，"
                                 "这个定时任务之后的触发都会跳过"))
@@ -338,31 +345,34 @@ def _test_text(notice: Notice) -> str:
     return "这是一条测试消息。收到即表示 Webhook 地址配置正确"
 
 
+def _links(notice: Notice) -> list[tuple[str, str]]:
+    """消息末尾的链接：运行，有对比时再加对比页。没设对外访问地址时都没有。"""
+    return [(label, url) for label, url in (("查看运行", notice.run_url), ("查看对比", notice.compare_url)) if url]
+
+
 def _text(notice: Notice) -> str:
-    title, lines, link = message(notice)
+    title, lines, _ = message(notice)
     out = [f"【AgentLab】{title}", *(f"{k}：{v}" for k, v in lines)]
-    if link:
-        out.append(f"查看运行：{link}")
+    out += [f"{label}：{url}" for label, url in _links(notice)]
     return "\n".join(out)
 
 
 def _wecom_markdown(notice: Notice) -> str:
-    title, lines, link = message(notice)
+    title, lines, _ = message(notice)
     color = "info" if notice.event in ("finished", "test") else "warning"
     out = [f"**【AgentLab】{title}**"]
     for key, value in lines:
         shown = f'<font color="{color}">{value}</font>' if key == "状态" else value
         out.append(f"> {key}：{shown}")
-    if link:
-        out.append(f"[查看运行]({link})")
+    out += [f"[{label}]({url})" for label, url in _links(notice)]
     return "\n".join(out)
 
 
 def _dingtalk_markdown(notice: Notice) -> tuple[str, str]:
-    title, lines, link = message(notice)
+    title, lines, _ = message(notice)
     out = [f"#### 【AgentLab】{title}", "", *(f"- {k}：{v}" for k, v in lines)]
-    if link:
-        out += ["", f"[查看运行]({link})"]
+    for label, url in _links(notice):
+        out += ["", f"[{label}]({url})"]
     return title, "\n".join(out)
 
 
@@ -396,6 +406,10 @@ def _generic(notice: Notice, now: datetime) -> dict[str, Any]:
                    else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended
                    else NOT_STARTED_REASON if notice.never_started else None),
         "error_node": notice.error_node,
+        # 对比只给基准是哪一次、各类指标的个数和对比页链接
+        "compare": ({"base_run_id": notice.compare.get("base_run_id"),
+                     "summary": dict(notice.compare.get("summary") or {}), "url": notice.compare_url}
+                    if notice.compare else None),
         "sent_at": _iso(now),
     }
 
@@ -576,15 +590,29 @@ class _Job:
     notice: Notice
 
 
+@dataclass
+class _Due:
+    """认领到的一次状态变化接下来要做的事：运行进入终态时和上一次比一次（compare_run），订阅了这个事件时推一条
+    （job）。两样都在锁外做：对比要读快照、重算，推送要等接收端，都不能挡着发起。"""
+
+    fire_id: str
+    compare_run: str | None
+    job: _Job | None
+
+
 async def notify_due(now: datetime | None = None) -> int:
     """查已发起的触发，运行状态有变化的按订阅推送一次。返回这一拍推送了几条（含失败的）。
 
     处理过的状态记在 notified_status 上，用条件 UPDATE 认领（WHERE notified_status = 旧值）：两拍撞在一起也只
     推一次。没订阅这个事件、任务没配 Webhook 的也记下已处理——之后再配上 Webhook，不会把旧的补推一遍。
     停在断点上的运行每一拍都要重新看（见 _state_of）：它的已处理状态带着第几段执行，和运行状态本身对不上。
+
+    运行进入终态的那一次，推送之前先和同一定时任务的上一次比一次（auto_compare），结束、失败的通知带上计数摘要和
+    对比页链接。没配 Webhook 的也比：触发历史里要用。比不了、出错不影响推送。
     """
     now = now or utcnow()
-    jobs: list[_Job] = []
+    dues: list[_Due] = []
+    base_url: str | None = None
     cutoff = now - timedelta(days=SCAN_DAYS)
     # 扫描窗口按触发记录的创建时间算，两种例外：运行记录窗口内有过变化（运行状态一变 updated_at 就跟着变），以及
     # 停在审批上、有待审批的——以前只看触发记录，创建 30 天以后才停到审批上的运行收不到「等待审批」
@@ -603,7 +631,6 @@ async def notify_due(now: datetime | None = None) -> int:
                 ))
                 .order_by(ScheduleFire.created_at)
             )).all()
-            base_url: str | None = None
             if rows:
                 from app.api.settings import notify_settings
 
@@ -613,16 +640,30 @@ async def notify_due(now: datetime | None = None) -> int:
                 if state is None or state == fire.notified_status \
                         or not await _mark(fire.id, fire.notified_status, state):
                     continue
+                compare_run = run.id if run is not None and run.status in auto_compare.TERMINAL else None
                 schedule = await session.get(Schedule, fire.schedule_id)
                 url = decrypt(schedule.webhook_url) if schedule and schedule.webhook_url else None
-                if not (event and url and schedule.webhook_format in FORMATS
-                        and event in (schedule.webhook_events or [])):
-                    continue
-                notice = await _notice(session, schedule, fire, run, event, base_url, pending)
-                jobs.append(_Job(schedule.webhook_format, url, decrypt(schedule.webhook_secret), notice))
-    if jobs:
-        await asyncio.gather(*(_deliver(job) for job in jobs))
-    return len(jobs)
+                job = None
+                if event and url and schedule.webhook_format in FORMATS and event in (schedule.webhook_events or []):
+                    notice = await _notice(session, schedule, fire, run, event, base_url, pending)
+                    job = _Job(schedule.webhook_format, url, decrypt(schedule.webhook_secret), notice)
+                if compare_run or job:
+                    dues.append(_Due(fire.id, compare_run, job))
+    if dues:
+        await asyncio.gather(*(_follow_up(due, base_url) for due in dues))
+    return sum(1 for due in dues if due.job is not None)
+
+
+async def _follow_up(due: _Due, base_url: str | None) -> None:
+    """先比（需要的话），再推：对比摘要要写进这条通知。对比自己兜住了异常，出什么事都不挡推送。"""
+    if due.compare_run:
+        brief = await auto_compare.compare_fire(due.fire_id, due.compare_run)
+        if brief is not None and due.job is not None:
+            due.job.notice.compare = brief
+            if base_url:
+                due.job.notice.compare_url = auto_compare.page_url(base_url, due.compare_run, brief["base_run_id"])
+    if due.job is not None:
+        await _deliver(due.job)
 
 
 async def _state_of(session: Any, fire: ScheduleFire, run: Run | None,
