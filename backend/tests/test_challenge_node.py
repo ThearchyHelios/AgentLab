@@ -5,7 +5,8 @@
   （judge.prepare，遮罩照旧）；理由里的数字只能引用它自己的查询格子，裸数字被标出来
 - 结论四选一：经受住 / 被削弱 / 被推翻 / 无法判断；完整记录写进 challenge_artifact，随运行封存；台账只记 kind challenge，
   它的查询不进任何报告的写作目录
-- 结论要有出处：零查询的判什么都记为无法判断，推翻还得引用到自己的查询结果；没有可查的源、模型用不了时不派 agent
+- 结论要有出处：零查询的判什么都记为无法判断，推翻还得引用到自己的查询结果，照录反方的理由时不露出内部标记、
+  裸数字注明无出处；没有可查的源、模型用不了时不派 agent，只停用了一部分源的照常反查，理由和时间线写明哪几个没查
 - 被推翻的：on_refuted 为 degrade（默认）时写 issuance_gaps，出具降档；fail 判节点失败；flag 只记录。产出和审批卡里
   的 on_refuted 写实际生效的那一种
 - 上限：句数、每句查询数、每句时长、全局每日金额（都按发起时的设置快照）；全局关闭、报告没有可审的结论句时直通
@@ -330,6 +331,7 @@ async def test_flag_only_records_and_fail_stops_the_run(monkeypatch, shop):
     assert failed.status == "failed"
     assert failed.error_node_id == "chal"
     assert "反方审稿推翻了 1 句结论" in failed.error and SOUTH in failed.error
+    assert "请核对这句结论" in failed.error, "只推翻了一句，不说「这几句」"
     assert "「结论被推翻时」改为「只标注」" in failed.error, "报错里点的选项名和检查器下拉里的一致"
     # 判失败之前审稿记录已经存下、时间线照常有完成那一条
     [done] = await logs(failed.id, "challenge_done")
@@ -412,6 +414,26 @@ async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypa
     assert await logs(row.id, "challenge_unreviewed") == [], "查过了，不算没能反查"
 
 
+@pytest.mark.parametrize("queries, said, quoted", [
+    ([NET], "扣除退款后华南为 [[v:Q1.r99.净销售额]]。", "扣除退款后华南为（引用无效）。"),
+    ([NET], "扣除退款后华南为 [[v:Q2.r1.净销售额]] 元。", "扣除退款后华南为（引用无效）元。"),
+    ([], "华南为 [[v:Q1.r1.净销售额]]，不成立。", "华南为（引用无效），不成立。"),
+    ([NET], "扣除退款后华南为 900，低于华东 1200。", "扣除退款后华南为 900（无出处），低于华东 1200（无出处）。"),
+])
+async def test_an_unfounded_rationale_is_quoted_in_plain_words(monkeypatch, shop, queries, said, quoted):
+    """不采信时照录反方的理由，界面按纯文字显示（没有理由文档）：解析不了的引用不能把内部的占位标记露出来，换成
+    「（引用无效）」；裸数字逐个注明「（无出处）」——文档里它们会被标出来，照录成文字时也得标。"""
+    plays = {"华南销售额超过华东": Play(queries, "refuted", said),
+             "居各区域之首": Play([REFUNDS], "stands", "没有找到反例。")}
+    Models(monkeypatch, shop, plays=plays)
+    row = await finish(graph(shop), run_class="exploratory")
+    assert row.status == "succeeded", row.error
+    south = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])["claims"][1]
+    assert south["verdict"] == "inconclusive" and south["rationale_doc"] is None
+    assert south["rationale"].endswith(f"「被推翻」不予采信，记为无法判断。反方的理由：{quoted}"), south["rationale"]
+    assert "⟦" not in south["rationale"] and "[[" not in south["rationale"]
+
+
 async def test_claims_whose_sources_are_gone_are_not_sent_out(monkeypatch, shop):
     """报告写完、审稿开始之前数据源被停用：这句没有可查的源，不建模型、不花钱，照实记无法判断并点出是哪个源。"""
     real = report_mod._store
@@ -435,6 +457,87 @@ async def test_claims_whose_sources_are_gone_are_not_sent_out(monkeypatch, shop)
     assert all(f"「{shop}」" in c["rationale"] and "不存在或已停用" in c["rationale"] for c in claims)
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == 2 and f"「{shop}」" in warn["reason"]
+
+
+async def test_a_claim_with_part_of_its_sources_gone_says_so(monkeypatch, tmp_path, shop):
+    """两个数据源的报告，审稿开始前停用了其中一个：引用两个源的那句、没挂依据的那句都只能在剩下的源里查。判断照常
+    采信，但理由末尾由系统写明哪个源没查（理由文档里也有：界面按文档画），时间线上另记一条——不然「经受住」看着像
+    两个源都查过了。"""
+    other, other_id = await _source(tmp_path)
+    try:
+        text = ("华东销售额 [[v:Q1.r0.销售额]]，退款只有 [[v:Q2.r0.退款笔数]] 笔。[[see:Q1]][[see:Q2]]"
+                "增长主要来自华东。")
+        plays = {"退款只有": Play([NET], "stands", "没有找到反例。"),
+                 "增长主要来自": Play([NET], "weakened", "华东净销售额为 [[v:Q1.r0.净销售额]]，增长说过了头。")}
+        real = report_mod._store
+
+        async def store_then_disable(doc, ctx):
+            out = await real(doc, ctx)
+            async with SessionLocal() as session:
+                row = await session.get(DataSource, other_id)
+                row.enabled = False
+                await session.commit()
+            return out
+
+        monkeypatch.setattr(report_mod, "_store", store_then_disable)
+        models = Models(monkeypatch, shop, writer=(text,), plays=plays)
+        spec = chain(
+            node("start", "input"),
+            node("fetch", "tool", tool=f"db_query__{shop}", args={"sql": QUERY}),
+            node("fetch2", "tool", tool=f"db_query__{other}", args={"sql": REFUNDS}),
+            node("write", "report", "写周报", instructions="写周报"),
+            node("chal", "challenge", "审稿"),
+            node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+        )
+        row = await finish(spec, run_class="exploratory")
+        assert row.status == "succeeded", row.error
+        assert models.reviewed() == ["退款只有", "增长主要来自"]
+        assert models.tools["退款只有"] == {f"db_schema__{shop}", f"db_query__{shop}"}, "停用的源不给工具"
+        task = models.tasks()["退款只有"]
+        assert f"「{other}」" in task and "已不存在或已停用" in task, "给 agent 的任务里也说了，免得它把查不到当成没有反例"
+        assert "这份报告还用到了" in models.tasks()["增长主要来自"], "没挂依据的那句不说「这句引用了」"
+
+        record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
+        both, grow = record["claims"]
+        assert (both["verdict"], grow["verdict"]) == ("stands", "weakened"), "查过、有出处的判断照常采信"
+        assert both["rationale"] == (f"没有找到反例。\n\n注：这句引用的数据源「{other}」已不存在或已停用，未能查询，"
+                                     "以上判断不含其中的数据。")
+        assert grow["rationale"] == (f"华东净销售额为 1,200，增长说过了头。\n\n注：这份报告用到的数据源「{other}」"
+                                     "已不存在或已停用，未能查询，以上判断不含其中的数据。")
+        for claim in (both, grow):
+            doc = claim["rationale_doc"]
+            assert doc["markdown"] == claim["rationale"], "界面按文档画：说明要在文档里"
+            segments = [s for _, u in iter_units(doc) for s in u["segments"]]
+            assert "".join(s["text"] for s in segments) == doc["markdown"]
+            assert [s["id"] for s in segments] == [f"s{i}" for i in range(len(segments))]
+            *_, note = iter_units(doc)
+            assert note[1]["kind"] == "connective" and note[1]["cites"] == [], "说明不是反方的结论，也不挂出处"
+        cited = [s for _, u in iter_units(grow["rationale_doc"]) for s in u["segments"] if s.get("cite")]
+        assert [s["text"] for s in cited] == ["1,200"], "反方自己的引用照旧解析"
+
+        [lost] = await logs(row.id, "challenge_sources_lost")
+        assert lost["level"] == "warn" and lost["claims"] == 2 and lost["sources"] == [other]
+        assert f"「{other}」" in lost["message"] and "2 句" in lost["message"]
+        assert await logs(row.id, "challenge_unreviewed") == [], "两句都查过了，不算没能反查"
+    finally:
+        await engines.invalidate(other_id)
+
+
+def test_the_note_reads_like_one_more_paragraph_of_the_rationale():
+    """理由末尾的系统说明照 compose_doc 的样子接上：和把说明写进原文再组装出来的块、句、片段、统计一模一样（片段的
+    偏移连着、编号接着往下数），只是反方的原文（source）不动、传进来的那份文档不改。"""
+    from app.engine.evidence import compose_doc
+
+    said = "华南只有 900，低于华东。\n\n- 华北为 [[v:Q1.r2.销售额]]"
+    note = "注：这句引用的数据源「仓库」已不存在或已停用，未能查询，以上判断不含其中的数据。"
+    doc = compose_doc(said, {}, node_id="chal")
+    before = json.dumps(doc, ensure_ascii=False, sort_keys=True)
+    noted = challenge_mod.with_note(doc, note)
+    again = compose_doc(f"{said}\n\n{note}", {}, node_id="chal")
+    assert noted["markdown"] == again["markdown"] and noted["blocks"] == again["blocks"]
+    assert noted["stats"] == again["stats"]
+    assert noted["source"] == doc["source"] == said
+    assert json.dumps(doc, ensure_ascii=False, sort_keys=True) == before
 
 
 # --------------------------------------------------------------------------
@@ -563,7 +666,9 @@ async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
     out = await output_of(row.id, "chal")
     assert out["counts"] == {"stands": 0, "weakened": 0, "refuted": 0, "inconclusive": 2}
     record = artifact_store.load(out["challenge_artifact"])
-    assert all("$2.00" in c["rationale"] for c in record["claims"])
+    words = "已达上限（全局每日核查金额上限 $2.00），这句未反查"
+    assert [c["rationale"] for c in record["claims"]] == [words, words], \
+        "第一句派出去就撞上上限、一次模型都没调用，和后面不再派出的句子是同一回事，同一种说法"
     [limit] = await logs(row.id, "challenge_limit")
     assert limit["limit"] == "daily_max_usd" and limit["claims_skipped"] == 2
     assert len(await logs(row.id, "verify_limit")) == 1, "第一句撞上每日上限之后，后面的句子不再派 agent 去试"

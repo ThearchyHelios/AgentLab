@@ -11,12 +11,15 @@
    的 Q1 分开），要它先想清楚「如果这句不成立，数据里会看到什么」，写只读查询去找，最后交结论（经受住 / 被削弱 /
    被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的格子，裸数字由 compose_doc 标出来
 3. 出处：一条查询都没执行成功的，判什么都记为无法判断；判「被推翻」的，理由里还得引用到自己的查询结果——它要让
-   正式出具降档，审稿记录里得查得到凭什么。不采信时系统写明原因，反方原本的结论和理由照录在后面。这句引用的数据源
-   都不存在或已停用、核查模型本身用不了时不派 agent（模型用不了的，后面的句子照同一个原因记，不再逐句去建模型）
+   正式出具降档，审稿记录里得查得到凭什么。不采信时系统写明原因，反方原本的结论和理由照录在后面（纯文字：解析
+   不了的引用写成「（引用无效）」，裸数字注明「（无出处）」）。这句该查的数据源都不存在或已停用、核查模型本身用
+   不了时不派 agent（模型用不了的，后面的句子照同一个原因记，不再逐句去建模型）；只停用了一部分的照常派，理由
+   末尾由系统注明哪几个没查（写进理由文档，见 with_note）
 4. 记录：每句的结论、理由（渲染后的正文和组装好的文档）、查询快照、用量写进审稿记录（challenge_artifact），随运行
    封存。查询照常发 tool.end（role: verify，带查询快照，可下钻）；台账只记 kind challenge，绝不记 query——核查的
-   查询进了写作目录，下游的写作者会把它们当成可以引用的证据。有句子没能反查的另记一条 challenge_unreviewed，
-   不然时间线上只有一句「审了 N 句」，看不出根本没审成
+   查询进了写作目录，下游的写作者会把它们当成可以引用的证据。有句子没能反查的另记一条 challenge_unreviewed、
+   只查了部分数据源的另记一条 challenge_sources_lost，不然时间线上只有一句「审了 N 句」，看不出根本没审成、
+   没审全（这两个代码还不在期 3 约定的日志代码表里，界面认不得时照原话显示）
 5. 处置：被推翻的按 on_refuted 处置。degrade（默认）在产出里写 issuance_gaps，成果节点的出具契约照单收进缺口、
    出具降档（nodes/io.py 的 _upstream_issuance_gaps，所以反方审稿要接在成果节点上游，画布校验会提醒）；fail 判节点
    失败；flag 只记录。产出和审批卡里的 on_refuted 是实际生效的那一种（只有 degrade / flag，见 _finish）。审批卡
@@ -74,6 +77,11 @@ _CLAIM_LIMITS = ("max_queries", "timeout_s", "daily_max_usd")
 _RANK = {"refuted": 0, "weakened": 1, "inconclusive": 2, "stands": 3}
 #: 系统改判时照录反方原本的结论用的叫法（界面的叫法见 lib/terms.ts 的 CHALLENGE_TEXT.verdict）
 _VERDICT_LABEL = {"stands": "经受住", "weakened": "被削弱", "refuted": "被推翻", "inconclusive": "无法判断"}
+#: 照录反方的理由时：解析不了的引用换成的字、裸数字后面加的注（见 _said）
+_INVALID_REF = "（引用无效）"
+_UNSOURCED = "（无出处）"
+#: 解析不了的引用在渲染后的正文里的占位（evidence.placeholder），连同两边隔开它的一个空格
+_PLACEHOLDER = re.compile(r" ?⟦\?[^⟧]*⟧ ?")
 #: 接着跑时 checkpoint 里缓存的审稿最多翻几条去找这一份配置的（每条都是按先前某一份配置审的，对不上就往后翻）
 _STALE_LIMIT = 16
 #: 同一次执行里审完的结果放在 RunContext.extra 的这个键下：{(节点, 第几次执行, 输入指纹): 审稿结果}。重试沿用它
@@ -343,9 +351,9 @@ def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> tuple[dict[str
     rationale = str(outcome.result.get(RATIONALE) or "")
     if not outcome.queries:
         why = "反查没有执行成功任何查询"
-        return _unfounded(cand, outcome, verdict, rationale, why), why
+        return _unfounded(cand, outcome, verdict, why), why
     if verdict == "refuted" and not _cites(outcome.rationale):
-        return _unfounded(cand, outcome, verdict, rationale, "理由没有引用任何查询结果"), None
+        return _unfounded(cand, outcome, verdict, "理由没有引用到任何查询结果"), None
     return _claim(cand, verdict, rationale, doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage), None
 
 
@@ -354,13 +362,73 @@ def _cites(doc: dict[str, Any] | None) -> bool:
     return isinstance(doc, dict) and any(unit.get("cites") for _, unit in iter_units(doc))
 
 
-def _unfounded(cand: judging.Candidate, outcome: VerifyOutcome, verdict: str, rationale: str,
-               why: str) -> dict[str, Any]:
-    """没有出处的结论：记为无法判断，系统写明原因，反方原本的结论和理由照录在后面。rationale_doc 为 None：这段话是
-    系统说的，界面照 rationale 显示，不拿反方那份文档冒充理由。查过的照记。"""
+def _unfounded(cand: judging.Candidate, outcome: VerifyOutcome, verdict: str, why: str) -> dict[str, Any]:
+    """没有出处的结论：记为无法判断，系统写明原因，反方原本的结论和理由照录在后面（照录的写法见 _said）。
+    rationale_doc 为 None：这段话是系统说的，界面照 rationale 显示，不拿反方那份文档冒充理由。查过的照记。"""
     taken = f"反方给出的「{_VERDICT_LABEL[verdict]}」不予采信，记为无法判断" if verdict != "inconclusive" else "记为无法判断"
-    said = f"反方的理由：{rationale.strip()}" if rationale.strip() else "反方没有给出理由"
+    rationale = _said(outcome.rationale, str((outcome.result or {}).get(RATIONALE) or "")).strip()
+    said = f"反方的理由：{rationale}" if rationale else "反方没有给出理由"
     return _claim(cand, "inconclusive", f"{why}，{taken}。{said}", queries=outcome.queries, usage=outcome.usage)
+
+
+def _said(doc: dict[str, Any] | None, rendered: str) -> str:
+    """反方的理由照录成纯文字。界面没有文档可画、按文字显示，文档里标出来的东西得写成字：解析不了的引用渲染成内部
+    的占位（⟦?v:Q1.r9.列⟧），换成「（引用无效）」，连同两边隔开它的空格；裸数字后面注明「（无出处）」。按片段在正文
+    里的偏移改（片段互不重叠，从后往前改偏移不乱）；文档和正文对不上时只换占位。"""
+    if not isinstance(doc, dict) or doc.get("markdown") != rendered:
+        return _PLACEHOLDER.sub(_INVALID_REF, rendered)
+    edits: list[tuple[int, int, str]] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            span = seg.get("span")
+            if not (isinstance(span, list) and len(span) == 2 and all(isinstance(x, int) for x in span)):
+                continue
+            if seg.get("issue") == "uncited_number":
+                edits.append((span[1], span[1], _UNSOURCED))
+            elif seg.get("issue") == "unresolved_ref" and str(seg.get("text") or "").startswith("⟦?"):
+                edits.append((span[0], span[1], _INVALID_REF))
+    text = rendered
+    for start, end, new in sorted(edits, reverse=True):
+        text = text[:start] + new + text[end:]
+    return text.replace(f" {_INVALID_REF}", _INVALID_REF).replace(f"{_INVALID_REF} ", _INVALID_REF)
+
+
+def with_note(doc: dict[str, Any], note: str) -> dict[str, Any]:
+    """理由文档末尾另起一段，写系统的说明（界面按文档画理由，说明只写进 rationale 正文的话看不到）。
+
+    照 compose_doc 的样子接：段与段之间的空行是这一句开头的结构片段，说明是一句连接性的话，块、句、片段的编号接着
+    往下数，统计跟着加——和把说明写进原文再组装出来的一模一样。只是说明不挂出处、不查裸数字（是系统的话，数据源的
+    名字里也可能有数字），source（反方的原文）不动。传进来的文档不改，返回新的一份。"""
+    markdown = str(doc.get("markdown") or "")
+    blocks = list(doc.get("blocks") or [])
+    units = [u for b in blocks if isinstance(b, dict) for u in b.get("units") or []]
+    first = sum(len(u.get("segments") or []) for u in units if isinstance(u, dict))
+    gap = "\n\n" if markdown else ""
+    start = len(markdown) + len(gap)
+    pieces = [("structural", gap, len(markdown))] if gap else []
+    pieces.append(("text", note, start))
+    segments = [{"kind": kind, "text": text, "state": "neutral", "span": [at, at + len(text)], "id": f"s{first + i}"}
+                for i, (kind, text, at) in enumerate(pieces)]
+    unit = {"id": f"u{len(units)}", "kind": "connective", "span": [start, start + len(note)], "cites": [], "see": [],
+            "segments": segments}
+    out = {**doc, "markdown": markdown + gap + note,
+           "blocks": [*blocks, {"type": "paragraph", "units": [unit], "id": f"b{len(blocks)}"}]}
+    if isinstance(doc.get("stats"), dict):
+        out["stats"] = stats = dict(doc["stats"])
+        for key, more in (("units", 1), ("segments", len(segments)), ("connective", 1)):
+            if isinstance(stats.get(key), int):
+                stats[key] += more
+    return out
+
+
+def _noted(claim: dict[str, Any], note: str) -> dict[str, Any]:
+    """审稿记录里的一句，理由末尾加上系统的说明：有理由文档的写进文档（with_note），正文照文档；没有的接在正文后面。"""
+    doc = claim.get("rationale_doc")
+    if isinstance(doc, dict):
+        doc = with_note(doc, note)
+        return {**claim, "rationale": doc["markdown"], "rationale_doc": doc}
+    said = str(claim.get("rationale") or "").rstrip()
+    return {**claim, "rationale": f"{said}\n\n{note}" if said else note}
 
 
 async def _usable_sources(names: Iterable[str]) -> set[str]:
@@ -446,13 +514,19 @@ class _Review:
             return f"每句时长上限 {self.timeout_s:g} 秒"
         return f"全局每日核查金额上限 {_usd(self.daily_max_usd)}"
 
-    def _task(self, cand: judging.Candidate, sources: list[str], lost: list[str]) -> str:
+    def _capped(self) -> str:
+        """当天的核查金额用完、这句一次模型都没调用时的理由：派出去就撞上的和后面不再派出的，是同一回事。"""
+        return f"已达上限（{self._limit_words('daily_max_usd')}），这句未反查"
+
+    def _task(self, cand: judging.Candidate, sources: list[str], lost: list[str], *, own: bool) -> str:
         """交给核查 agent 的任务：这句结论、它挂的证据摘录（遮罩照旧，原报告的编号标明，见 mark_original）、可以查的
-        数据源；这句引用的源有停用了的，也告诉它查不了哪几个，免得它把查不到当成没有反例。"""
+        数据源；该查的源有停用了的，也告诉它查不了哪几个，免得它把查不到当成没有反例。own：源是这句自己引用的，
+        不是没挂依据、按整份报告用到的源查的。"""
         request = judging.prepare(self.doc, self.catalog, units=[cand.unit], loader=self.fetch, masked=self.masks)
         aliases = dict.fromkeys(a for c in request.cands for a in c.aliases if a in request.excerpts)
         evidence = "\n\n".join(mark_original(request.excerpts[a], a, self.queries) for a in aliases)
-        gone = f"（这句还引用了{_quoted(lost)}，已不存在或已停用，无法查询）" if lost else ""
+        gone = f"（{'这句还引用了' if own else '这份报告还用到了'}{_quoted(lost)}，已不存在或已停用，无法查询）" \
+            if lost else ""
         return CHALLENGE_TASK_PROMPT.format(
             report=self.title, section=f"，所在小节「{cand.section}」" if cand.section else "", claim=cand.text,
             evidence=evidence or "（这句没有挂依据）", sources="、".join(sources) + gone)
@@ -475,6 +549,7 @@ class _Review:
         broke = False                        # 全局每日金额用完了：后面的句子不再派 agent
         broken: str | None = None            # 核查模型本身用不了：后面的句子照这个原因记，不再逐句去建模型
         unreviewed: list[str] = []           # 没能反查的句子各自的原因（触顶的由 challenge_limit 说，不在这里）
+        partial: list[list[str]] = []        # 反查了、但该查的源有停用了的句子：各自没查成的源
 
         def unreached(cand: judging.Candidate, rationale: str, why: str) -> None:
             claims.append(_claim(cand, "inconclusive", rationale))
@@ -483,26 +558,30 @@ class _Review:
         for cand in self.picked:
             if broke:
                 hit["daily_max_usd"][1] += 1
-                claims.append(_claim(cand, "inconclusive", f"已达上限（{self._limit_words('daily_max_usd')}），这句未反查"))
+                claims.append(_claim(cand, "inconclusive", self._capped()))
                 continue
             if broken is not None:
                 unreached(cand, f"反查未完成：{broken}", broken)
                 continue
             try:
-                sources = claim_sources(cand.aliases, self.catalog, self.fetch) or everywhere
+                own = claim_sources(cand.aliases, self.catalog, self.fetch)
+                sources = own or everywhere
                 live = [s for s in sources if s in usable]
-                task_text = self._task(cand, live, [s for s in sources if s not in usable]) if live else ""
+                lost = [s for s in sources if s not in usable]
+                task_text = self._task(cand, live, lost, own=bool(own)) if live else ""
             except Exception as e:  # noqa: BLE001 - 一句的摘录出了意外（坏形状的工件），只让这一句没审成
                 why = f"整理证据摘录时出错（{describe_exception(e)}）"
                 unreached(cand, f"反查未完成：{why}", why)
                 continue
+            # 没挂依据的句子查的是整份报告用到的源，不是「这句引用的」
+            where = "这句引用的" if own else "这份报告用到的"
             if not sources:
                 why = "这份报告引用的证据中没有数据库查询，没有可以反查的数据源"
                 unreached(cand, f"{why}，这句未反查", why)
                 continue
             if not live:
-                why = f"数据源{_quoted(sources)}不存在或已停用"
-                unreached(cand, f"这句引用的{why}，没有可以反查的数据源，这句未反查", why)
+                why = f"数据源{_quoted(sources)}已不存在或已停用"
+                unreached(cand, f"{where}{why}，没有可以反查的数据源，这句未反查", why)
                 continue
             outcome = await run_verify_agent(
                 spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
@@ -518,6 +597,14 @@ class _Review:
                          message=f"反方模型与报告的写作模型相同（「{outcome.model}」），难以发现写作模型自身的错误。"
                                  f"请在设置的「核查」一节选择另一个模型，或在节点的「{CHALLENGE_LABEL['model']}」中指定")
             claim, why = _claim_of(cand, outcome)
+            if outcome.limit == "daily_max_usd" and outcome.result is None and not outcome.usage.get("calls"):
+                # 派出去就撞上每日金额上限、一次模型都没调用：和后面不再派出的句子是同一回事，同一种说法
+                claim = _claim(cand, "inconclusive", self._capped(), queries=outcome.queries, usage=outcome.usage)
+            elif lost and why is None:
+                # 反查了，可该查的源有停用了的：判断照常采信，理由末尾写明哪几个没查（只写在任务里的话，审稿记录和
+                # 审批卡上的「经受住」看着就像每个源都查过了）
+                claim = _noted(claim, f"注：{where}数据源{_quoted(lost)}已不存在或已停用，未能查询，以上判断不含其中的数据。")
+                partial.append(lost)
             claims.append(claim)
             usage = _add_usage(usage, outcome.usage)
             if outcome.limit in _CLAIM_LIMITS:
@@ -543,6 +630,11 @@ class _Review:
             ctx.emit(EventType.LOG, level="warn", code="challenge_unreviewed", claims_skipped=len(unreviewed),
                      reason=unreviewed[0],
                      message=f"反方审稿有 {len(unreviewed)} 句结论未能反查，已记为无法判断：{unreviewed[0]}{more}")
+        if partial:
+            names = list(dict.fromkeys(s for gone in partial for s in gone))
+            ctx.emit(EventType.LOG, level="warn", code="challenge_sources_lost", claims=len(partial), sources=names,
+                     message=f"反方审稿有 {len(partial)} 句结论只查了部分数据源：{_quoted(names)}已不存在或已停用，"
+                             f"未能查询，{'这句' if len(partial) == 1 else '这几句'}的判断不含其中的数据")
         # 真正查过的和没查成的分开说：「无法判断 2 句」可能是数据不够，也可能是一条查询都没执行成功
         idle = sum(1 for c in claims if not c["queries"])
         ctx.emit(EventType.LOG, level="info", code="challenge_done", counts=counts, artifact=artifact,
@@ -577,7 +669,8 @@ def _finish(ctx: NodeContext, state: GraphState, outcome: dict[str, Any], *, on_
     refuted = [c for c in claims if c.get("verdict") == "refuted"]
     if on_refuted == "fail":
         if refuted and ctx.node.config.get("on_error") != "continue":
-            raise NodeError(ctx.node.id, f"{_refuted_words(refuted)}。请核对这几句结论；如只需记录，可将"
+            which = "这句" if len(refuted) == 1 else "这几句"
+            raise NodeError(ctx.node.id, f"{_refuted_words(refuted)}。请核对{which}结论；如只需记录，可将"
                                          f"「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」")
         on_refuted = "degrade" if refuted else "flag"
     result: dict[str, Any] = {"challenge_artifact": outcome.get("artifact"), "counts": outcome.get("counts") or {},
@@ -618,4 +711,4 @@ def challenge_summary(spec: GraphSpec, outputs: dict[str, Any], report_id: str) 
 
 
 __all__ = ["CHALLENGE_SYSTEM", "ITEMS_MAX", "VERDICTS", "challenge_summary", "claim_sources", "mark_original",
-           "pick_claims", "pick_items", "run_challenge"]
+           "pick_claims", "pick_items", "run_challenge", "with_note"]
