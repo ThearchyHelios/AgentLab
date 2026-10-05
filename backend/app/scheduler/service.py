@@ -13,11 +13,11 @@ import weakref
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db.base import SessionLocal, utcnow
-from app.db.models import Run, Schedule, ScheduleFire
+from app.db.models import Approval, Run, Schedule, ScheduleFire
 from app.engine.expressions import _FILTERS, render_template
 from app.scheduler import cron
 
@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 #: 变量清单的示例按这个时区算（GET /api/schedules/variables 没带时区时）
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 RUN_CLASSES = ("formal", "exploratory")
-#: 这几个状态的运行算「还没结束」：停在审批上、服务重启挂起的（interrupted）也算，它们随时会接着执行
+#: 这几个状态的运行算「还没结束」，挡住这个任务之后的触发。interrupted 也算（规格如此）：停在审批上的，批完会
+#: 接着执行；服务重启挂起的却不会自己接着执行，要有人去继续或放弃——所以跳过的原因分开写（见 overlap_reason），
+#: 挂起的另外按失败推一次通知（webhook._state_of），不然任务就此静默停摆
 ACTIVE_RUN = ("queued", "running", "interrupted")
 
 #: 模板里能用的变量：(变量名, 说明)。说明写在变量清单接口里，和示例一起给界面
@@ -45,7 +47,8 @@ VARIABLES: tuple[tuple[str, str], ...] = (
 _NAMES = tuple(f"schedule.{key}" for key, _ in VARIABLES)
 _TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
 
-#: 触发记下来、运行还没发起时先写成这样：发起成功再改成 started。进程在这中间被强杀，留下的记录照实说没有发起
+#: 触发记下来、运行还没发起时先写成这样：发起成功再改成 started。进程在这中间被强杀，留下的记录照实说没有发起。
+#: 进程还在、只是还没发起完的，接口按「已发起」给（见 launching）
 INTERRUPTED_REASON = "服务在发起运行前停止，这次触发没有发起运行"
 #: launch_run 抛了 LaunchRefused 以外的异常（库出错之类）。详细信息只进日志
 GENERIC_REASON = "发起运行时出错，详细信息见服务日志"
@@ -53,6 +56,18 @@ GENERIC_REASON = "发起运行时出错，详细信息见服务日志"
 
 class TemplateError(ValueError):
     """输入模板写错了。str() 是给人看的中文说明，指出是哪个输入。"""
+
+
+def current_value(value: Any) -> str:
+    """报错末尾回显当前值的那半句：没填写说「当前未填写」，文本、数字照原样，true / false 按 JSON 的写法；列表、对象
+    不回显——给人看的说明里不出现 Python 的写法（None、['a', 'b']）。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "，当前未填写"
+    if isinstance(value, bool):
+        return f"，当前为「{'true' if value else 'false'}」"
+    if isinstance(value, (str, int, float)):
+        return f"，当前为「{value}」"
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -116,7 +131,8 @@ def check_template(template: Any) -> dict[str, str]:
         if name in out:
             raise TemplateError(f"输入模板里字段「{name}」写了两次，请只保留一个")
         if not isinstance(text, str):
-            raise TemplateError(f"输入「{name}」的值需要是文本（可以带 {{{{ schedule.yesterday }}}} 这样的变量），当前为「{text}」")
+            raise TemplateError(f"输入「{name}」的值需要是文本（可以带 {{{{ schedule.yesterday }}}} 这样的变量）"
+                                f"{current_value(text)}")
         _check_text(name, text)
         out[name] = text
     return out
@@ -210,6 +226,15 @@ def launch_lock() -> asyncio.Lock:
     return lock
 
 
+#: 正在发起的触发：占位记录已写进库、launch_run 还没返回。通知扫描有 launch_lock 挡着，接口的读（任务列表的
+#: last_fire、触发历史）没有：它们据此按「已发起」给，不把还在发起的说成「未能发起」（单进程部署，进程内的集合就够）
+_LAUNCHING: set[str] = set()
+
+
+def launching(fire_id: str) -> bool:
+    return fire_id in _LAUNCHING
+
+
 def actor_label(name: str) -> str:
     """定时任务发起的运行记在谁名下。"""
     return f"定时任务：{name}"[:100]
@@ -244,23 +269,27 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
             return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", {})
         busy = await _active_run(schedule_id)
         if busy is not None:
-            reason = f"上一次运行（{busy[:8]}）还没有结束，按设置跳过这次触发"
-            return await _record(schedule_id, fire_at, kind, "skipped_overlap", reason, inputs)
+            return await _record(schedule_id, fire_at, kind, "skipped_overlap", overlap_reason(*busy), inputs)
         fire = await _record(schedule_id, fire_at, kind, "failed_to_start", INTERRUPTED_REASON, inputs, fresh=True)
         if fire is None:
             return await _existing(schedule_id, fire_at, kind)
         from app.engine.launch import LaunchRefused, launch_run
 
+        _LAUNCHING.add(fire.id)
         try:
-            async with SessionLocal() as session:
-                run = await launch_run(session, workflow_id=workflow_id, run_class=run_class, input_payload=inputs,
-                                       actor=actor or actor_label(name), schedule_id=schedule_id)
-        except LaunchRefused as e:
-            return await _finish(fire.id, status="failed_to_start", reason=e.message)
-        except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
-            logger.exception("定时任务「%s」（%s）发起运行失败", name, schedule_id)
-            return await _finish(fire.id, status="failed_to_start", reason=GENERIC_REASON)
-        return await _finish(fire.id, status="started", reason=None, run_id=run.id)
+            try:
+                async with SessionLocal() as session:
+                    run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
+                                           input_payload=inputs, actor=actor or actor_label(name),
+                                           schedule_id=schedule_id)
+            except LaunchRefused as e:
+                return await _finish(fire.id, status="failed_to_start", reason=e.message)
+            except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
+                logger.exception("定时任务「%s」（%s）发起运行失败", name, schedule_id)
+                return await _finish(fire.id, status="failed_to_start", reason=GENERIC_REASON)
+            return await _finish(fire.id, status="started", reason=None, run_id=run.id)
+        finally:
+            _LAUNCHING.discard(fire.id)
 
 
 async def record_skip(schedule_id: str, fire_at: datetime, reason: str) -> ScheduleFire | None:
@@ -268,12 +297,32 @@ async def record_skip(schedule_id: str, fire_at: datetime, reason: str) -> Sched
     return await _record(schedule_id, fire_at, "misfire", "skipped_misfire", reason, {})
 
 
-async def _active_run(schedule_id: str) -> str | None:
-    """这个任务发起的、还没结束的运行 id（最近的那一个），没有返回 None。"""
+async def _active_run(schedule_id: str) -> tuple[str, str, bool] | None:
+    """这个任务发起的、还没结束的运行（最近的那一个）：(运行 id, 状态, 是否停在审批)，没有返回 None。
+
+    停在审批：有 pending 的审批，或者刚批完（answered）、还没接着执行。interrupted 而两样都没有的是挂起的。"""
     async with SessionLocal() as session:
-        return await session.scalar(
-            select(Run.id).where(Run.schedule_id == schedule_id, Run.status.in_(ACTIVE_RUN))
-            .order_by(Run.created_at.desc()).limit(1))
+        row = (await session.execute(
+            select(Run.id, Run.status).where(Run.schedule_id == schedule_id, Run.status.in_(ACTIVE_RUN))
+            .order_by(Run.created_at.desc()).limit(1))).first()
+        if row is None:
+            return None
+        run_id, status = row
+        waiting = status == "interrupted" and bool(await session.scalar(
+            select(func.count()).select_from(Approval).where(
+                Approval.run_id == run_id, Approval.status.in_(("pending", "answered")))))
+        return run_id, status, waiting
+
+
+def overlap_reason(run_id: str, status: str, waiting: bool) -> str:
+    """跳过的原因按挡路的那次运行说清楚该等还是该处理。运行编号和界面上的短编号一样写（#前 6 位）。"""
+    tag = f"#{run_id[:6]}"
+    if status != "interrupted":
+        return f"上一次运行 {tag} 仍在进行中，本次触发已跳过"
+    if waiting:
+        return f"上一次运行 {tag} 正在等待审批，处理审批、运行结束后才会按时发起新的运行；本次触发已跳过"
+    return (f"上一次运行 {tag} 已挂起（通常是服务重启所致），请在「记录」中继续运行或放弃这次运行，"
+            "它结束后才会按时发起新的运行；本次触发已跳过")
 
 
 async def _record(schedule_id: str, fire_at: datetime, kind: str, status: str, reason: str | None,

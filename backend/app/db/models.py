@@ -815,8 +815,9 @@ class ScheduleFire(Base):
     reason: Mapped[str | None] = mapped_column(Text, default=None)
     # 渲染后的输入，就是交给运行的那一份
     inputs: Mapped[dict[str, Any]] = mapped_column(default=dict)
-    # 已经按哪个运行状态处理过通知（succeeded / failed / cancelled / interrupted / failed_to_start）。
-    # 运行状态变了、和它不同才再看要不要推送，同一状态只处理一次
+    # 已经按哪个运行状态处理过通知：succeeded / failed / cancelled / failed_to_start；停在断点上的另带第几段执行，
+    # 停在审批是 interrupted:approval:<段>、挂起是 interrupted:held:<段>（见 scheduler/webhook.py 的 _state_of）。
+    # 和现在算出来的不同才再看要不要推送，同一状态只处理一次
     notified_status: Mapped[str | None] = mapped_column(String(30), default=None)
     # 和同一任务上一次运行的比较结果（工件 id），后续的运行对比工作包写
     compare_artifact: Mapped[str | None] = mapped_column(String(64), default=None)

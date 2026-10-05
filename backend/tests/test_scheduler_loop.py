@@ -4,29 +4,35 @@
   触发记录 (任务, fire_at, kind) 唯一，撞上约束的不再发起
 - 发起走 engine/launch.py 的 launch_run：记在「定时任务：<名字>」名下、带 schedule_id，输入按 fire_at 渲染；
   正式运行用当前发布版本，没有发布版本被拒，拒绝的原话记成 failed_to_start；别的异常记通用说明、详情进日志
-- 上一次的运行还没结束（排队、运行中、停在审批 / 挂起都算）记 skipped_overlap
+- 上一次的运行还没结束（排队、运行中、停在审批 / 挂起都算）记 skipped_overlap，原因按挡路的运行写清楚：仍在
+  进行中、正在等待审批、已挂起（要去「记录」里继续运行或放弃）；挂起的那次按失败推一次通知，不是每次触发都推
 - 错过的触发：最近一次在宽限内补一次（kind=misfire），更早的积压只记一条跳过；最近一次也超出宽限就记一条
   skipped_misfire，推进到未来的下一次，不补积压
-- start / stop：起一个 asyncio 任务按拍执行，stop 干净地停下；AGENTLAB_SCHEDULER 关着时 start 不起循环
+- start / stop：起一个 asyncio 任务按拍执行，stop 干净地停下（不落下新起的通知扫描，接收端挂住时宽限一过就取消）；
+  AGENTLAB_SCHEDULER 关着时 start 不起循环
 
 工作流、字段、任务名都是虚构的。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from sqlalchemy import delete, func, select
 
 from app import scheduler
 from app.core.config import Settings
+from app.core.crypto import encrypt
 from app.db.base import SessionLocal
-from app.db.models import Run, Schedule, ScheduleFire, Workflow, WorkflowVersion
+from app.db.models import Approval, Run, Schedule, ScheduleFire, Workflow, WorkflowVersion
 from app.engine.runner import run_manager
-from app.scheduler import loop, service
+from app.scheduler import cron, loop, service, webhook
 
 UTC = timezone.utc
 #: 上海 2026-10-05（周一）09:00
@@ -171,20 +177,77 @@ async def test_disabled_schedule_is_not_fired():
     assert await fires(sid) == [] and await runs_of(sid) == []
 
 
-@pytest.mark.parametrize("status", ["queued", "running", "interrupted"])
-async def test_previous_run_still_going_means_skip(status):
+@pytest.mark.parametrize("status, approval, says", [
+    ("queued", None, "仍在进行中"),
+    ("running", None, "仍在进行中"),
+    ("interrupted", "pending", "正在等待审批"),
+    # 批了、还没接着执行（审批记成 answered 到运行改回 running 之间）：仍是停在审批，不是挂起
+    ("interrupted", "answered", "正在等待审批"),
+    # 服务重启挂起的：没有待审批，也不会自己接着执行，原因要说清楚该去做什么
+    ("interrupted", None, "已挂起（通常是服务重启所致），请在「记录」中继续运行或放弃这次运行"),
+])
+async def test_previous_run_still_going_means_skip(status, approval, says):
     wf = await workflow()
     sid = await schedule(wf)
     async with SessionLocal() as session:
         busy = Run(workflow_id=wf, workflow_name="门店周报", status=status, schedule_id=sid, run_class="formal")
         session.add(busy)
+        await session.flush()
+        if approval:
+            session.add(Approval(run_id=busy.id, node_id="gate", title="审核周报", status=approval))
         await session.commit()
     await loop.fire_due(NINE + timedelta(seconds=5))
     [fire] = await fires(sid)
     assert (fire.status, fire.run_id) == ("skipped_overlap", None)
-    assert busy.id[:8] in fire.reason and "跳过" in fire.reason
+    # 运行编号和界面一样写成 #前 6 位；不再说「按设置」——重叠处理只有跳过一档，用户没选过什么
+    assert f"上一次运行 #{busy.id[:6]} " in fire.reason and says in fire.reason, fire.reason
+    assert fire.reason.endswith("本次触发已跳过") and "按设置" not in fire.reason
     assert [r.id for r in await runs_of(sid)] == [busy.id]
     assert await next_of(sid) == NINE + timedelta(days=1)
+
+
+async def test_suspended_run_is_reported_once_and_later_fires_say_what_to_do(monkeypatch):
+    """上一次运行在服务重启时被挂起：它不会自己接着执行，按规则之后的触发都跳过。跳过的原因写明要去继续或放弃，
+    订阅了失败通知的推一次（不是每次触发都推）；有人放弃了它之后，下一次照常发起"""
+    requests: list[httpx.Request] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(webhook, "_transport", httpx.MockTransport(receive))
+    wf = await workflow()
+    sid = await schedule(wf)
+    async with SessionLocal() as session:
+        await session.execute(Schedule.__table__.update().where(Schedule.id == sid).values(
+            webhook_format="generic", webhook_url=encrypt("https://hooks.example.com/agentlab/inbox-5c1d"),
+            webhook_events=["finished", "failed", "awaiting_approval"]))
+        held = Run(workflow_id=wf, workflow_name="门店周报", status="interrupted", schedule_id=sid, run_class="formal",
+                   error="服务重启，运行已挂起，可从断点继续运行")
+        session.add(held)
+        await session.flush()
+        session.add(ScheduleFire(schedule_id=sid, fire_at=NINE - timedelta(days=1), kind="scheduled",
+                                 status="started", run_id=held.id))
+        await session.commit()
+    for day in range(3):
+        now = NINE + timedelta(days=day, seconds=5)
+        await loop.fire_due(now)
+        await webhook.notify_due(now)
+    skipped = [f for f in await fires(sid) if f.status == "skipped_overlap"]
+    assert len(skipped) == 3
+    assert all(f"#{held.id[:6]} 已挂起" in f.reason and "继续运行" in f.reason for f in skipped)
+    [pushed] = requests
+    body = json.loads(pushed.content)
+    assert (body["event"], body["status"], body["run_id"]) == ("failed", "interrupted", held.id)
+    assert "挂起" in body["title"] and "继续运行" in body["text"]
+    # 放弃之后，下一次按时发起
+    async with SessionLocal() as session:
+        await session.execute(Run.__table__.update().where(Run.id == held.id).values(status="cancelled"))
+        await session.commit()
+    await loop.fire_due(NINE + timedelta(days=3, seconds=5))
+    newest = (await fires(sid))[-1]
+    assert (newest.status, newest.fire_at) == ("started", NINE + timedelta(days=3))
+    await settle(newest.run_id)
 
 
 # --------------------------------------------------------------------------
@@ -307,18 +370,20 @@ async def test_start_does_nothing_when_switched_off():
 
 
 async def test_loop_ticks_until_stopped():
-    sid = await schedule(await workflow(), next_run_at=datetime.now(UTC) - timedelta(seconds=1), cron="* * * * *")
+    # 下一次放在整分上（和 cron 对齐）：放在「现在 - 1 秒」的话，这一秒里恰好跨过整分时会多记一条错过的跳过
+    due = cron.last_due("* * * * *", "UTC", datetime.now(UTC))
+    sid = await schedule(await workflow(), next_run_at=due, cron="* * * * *")
     on = Settings(_env_file=None, scheduler=True)
     assert await scheduler.start(interval=0.05, config=on) is True
     assert scheduler.running()
     for _ in range(200):
-        if await fires(sid):
+        if any(f.status == "started" for f in await fires(sid)):
             break
         await asyncio.sleep(0.02)
     await scheduler.stop()
     assert scheduler.running() is False
-    [fire] = await fires(sid)
-    assert fire.status == "started"
+    # 只认发起的那一条：建任务和第一拍之间跨过整分时，前面还会有一条错过的跳过，那不是这里要测的
+    [fire] = [f for f in await fires(sid) if f.status == "started"]
     await settle(fire.run_id)
     # 停下之后不再有拍：把下一次拨回过去也不会再发起
     async with SessionLocal() as session:
@@ -339,3 +404,61 @@ async def test_start_twice_keeps_one_loop():
     assert loop.runner.task is first
     await scheduler.stop()
     assert first.done()
+
+
+def _notify_tasks() -> list[asyncio.Task]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == "agentlab-scheduler-notify" and not t.done()]
+
+
+async def test_stop_in_the_middle_of_a_tick_leaves_no_notify_task_behind(monkeypatch):
+    """stop 撞在一拍的发起当中：这一拍收尾时不再新起通知扫描。以前 stop 先把手上的通知任务清掉再等，循环收尾时
+    看见没有就又起了一个，它不在 stop 等的名单里，日志说「已停止」之后还在推送"""
+    started = asyncio.Event()
+
+    async def slow_fire_due(now=None):
+        started.set()
+        await asyncio.sleep(0.2)
+        return []
+
+    async def notify_due(now=None):
+        await asyncio.sleep(5)
+        return 0
+
+    monkeypatch.setattr(loop, "fire_due", slow_fire_due)
+    monkeypatch.setattr(webhook, "notify_due", notify_due)
+    runner = loop._Runner()
+    await runner.start(interval=0.05)
+    await started.wait()
+    await runner.stop()
+    assert runner.task is None and runner.notify is None
+    assert _notify_tasks() == []
+
+
+async def test_stop_does_not_wait_out_a_hanging_webhook(monkeypatch):
+    """接收端挂住、通知扫描还在重试：stop 不等满超时加重试，宽限一过就取消。关停时后面还有 run_manager 要平稳挂起
+    运行，docker stop 默认只给 10 秒"""
+    hanging = asyncio.Event()
+
+    async def fire_due(now=None):
+        return []
+
+    async def notify_due(now=None):
+        hanging.set()
+        await asyncio.sleep(30)
+        return 0
+
+    monkeypatch.setattr(loop, "fire_due", fire_due)
+    monkeypatch.setattr(webhook, "notify_due", notify_due)
+    monkeypatch.setattr(loop, "NOTIFY_GRACE_S", 0.1)
+    runner = loop._Runner()
+    await runner.start(interval=0.05)
+    await asyncio.wait_for(hanging.wait(), timeout=5)
+    began = time.monotonic()
+    await runner.stop()
+    assert time.monotonic() - began < 2
+    assert _notify_tasks() == []
+
+
+def test_stop_fits_in_the_shutdown_budget():
+    """两件事并行等，最坏也就是较长的那个宽限：给关停时的 run_manager.shutdown 留出大半的 docker stop 时间"""
+    assert max(loop.STOP_GRACE_S, loop.NOTIFY_GRACE_S) <= 3

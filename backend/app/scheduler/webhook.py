@@ -1,4 +1,4 @@
-"""定时任务的通知：运行结束、失败、停在审批时按任务的设置推送 Webhook。
+"""定时任务的通知：运行结束、失败、停在审批（或因服务重启挂起）时按任务的设置推送 Webhook。
 
 四种格式：通用 JSON、飞书（文本消息）、企业微信（markdown）、钉钉（markdown）。配了签名密钥时：通用格式在请求头
 里带 HMAC-SHA256 签名，飞书、钉钉按各自平台的算法签（飞书放在请求体，钉钉放在地址上）；企业微信的 key 本来就在
@@ -8,8 +8,13 @@ Webhook 地址本身就是凭证（企业微信的 key、钉钉的 access_token 
 加密落库，日志、推送记录、接口返回里只出现主机名。httpx 每发一个请求都会在 INFO 级别记一行完整地址，这里装了
 一个过滤器把推送期间的那几行换成主机名。
 
-通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希前 12 位和起止时间，不放报告里的具体数字，也不放
-失败时的原始报错——报错里可能带着查询到的数据，Webhook 推去的群不一定有权看。
+通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
+另写失败节点的名字。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook 推去的群
+不一定有权看。
+
+三个平台出错时都回 HTTP 200、错误码放在响应体里，所以送没送达要看响应体：按地址的主机认平台，不看选的格式——
+格式选错了（飞书的地址选了通用格式）正是最需要认出来的情形。群机器人的地址只认自己平台的格式，保存时就拦下
+对不上的（见 bot_format）。
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import hashlib
 import hmac
 import json
 import logging
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -29,6 +35,7 @@ import httpx
 from sqlalchemy import and_, func, or_, select, update
 
 from app.core.crypto import decrypt
+from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
 from app.db.models import Approval, Run, RunEvent, Schedule, ScheduleFire, WebhookDelivery
 from app.engine.labels import ISSUANCE_LABEL
@@ -38,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 FORMATS = ("generic", "feishu", "wecom", "dingtalk")
 EVENTS = ("finished", "failed", "awaiting_approval")
+#: 格式、事件在报错里的叫法，和界面上的选项一致
+FORMAT_LABEL = {"generic": "通用", "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉"}
+EVENT_LABEL = {"finished": "运行结束", "failed": "运行失败", "awaiting_approval": "等待审批"}
 #: 单次请求的超时（秒）
 TIMEOUT_S = 10.0
 #: 失败后再试 3 次，每次之前等这么久（秒）。4xx（429 除外）不重试：地址或参数错了，重试也一样
@@ -49,10 +59,12 @@ SEAL_WAIT_S = 60
 #: 测试用：换成 httpx.MockTransport 接住请求
 _transport: httpx.AsyncBaseTransport | None = None
 
-_HEADLINE = {"finished": "运行完成", "failed": "运行失败", "awaiting_approval": "等待审批", "test": "Webhook 测试"}
-#: 运行状态在通知里的叫法
-_STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "interrupted": "停在人工审批", "cancelled": "已取消",
-                 "failed_to_start": "未能发起"}
+_HEADLINE = {"finished": "运行完成", "failed": "运行失败", "awaiting_approval": "等待审批"}
+#: 运行状态在通知里的叫法，和界面一致。interrupted 分两种，见 _status_label
+_STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "cancelled": "已取消", "failed_to_start": "未能发起"}
+#: 挂起的运行要人去处理：不处理，这个任务之后的触发都按「上一次还没结束」跳过
+SUSPENDED_REASON = "运行停在断点上、没有待审批，通常是服务重启所致"
+SUSPENDED_ACTION = "请在 AgentLab 的「记录」中继续运行或放弃这次运行；它结束之前，这个定时任务之后的触发都会跳过"
 
 
 # --------------------------------------------------------------------------
@@ -60,30 +72,86 @@ _STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "interrupted": "�
 # --------------------------------------------------------------------------
 
 
+_URL_FORMAT = ("Webhook 地址需要是 http:// 或 https:// 开头的完整地址，例如飞书机器人的 "
+               "https://open.feishu.cn/open-apis/bot/v2/hook/…")
+
+
 def check_url(url: Any) -> str:
-    """校验 Webhook 地址，返回去掉首尾空白的地址。不对抛 ValueError（中文说明，不回显地址）。"""
+    """校验 Webhook 地址，返回去掉首尾空白的地址。不对抛 ValueError（中文说明，不回显地址）。
+
+    除了 http(s)、有主机名，还要 httpx 真发得出去：端口写错、夹着不可见的字符（从聊天软件复制时常带上零宽空格）、
+    主机名不合 IDNA 规则的，保存时就拦下。以前这些照样存进去，到「测试 Webhook」才在 httpx 里抛出 500 或英文报错。
+    """
     text = url.strip() if isinstance(url, str) else ""
+    if not text:
+        raise ValueError(_URL_FORMAT)
+    if any(c.isspace() or unicodedata.category(c) in ("Cc", "Cf") for c in text):
+        raise ValueError("Webhook 地址中有空格或不可见的字符（从聊天软件复制时常会带上），请删除后重新填写")
+    if len(text) > 2000:
+        raise ValueError("Webhook 地址过长（超过 2000 个字符），请检查是否粘贴了多余的内容")
     try:
         parts = urlsplit(text)
     except ValueError:
-        parts = None
-    if (not text or parts is None or parts.scheme not in ("http", "https") or not parts.hostname
-            or any(c.isspace() for c in text)):
-        raise ValueError("Webhook 地址需要是 http:// 或 https:// 开头的完整地址，例如飞书机器人的 "
-                         "https://open.feishu.cn/open-apis/bot/v2/hook/…")
-    if len(text) > 2000:
-        raise ValueError("Webhook 地址过长（超过 2000 个字符），请检查是否粘贴了多余的内容")
+        raise ValueError(_URL_FORMAT) from None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(_URL_FORMAT)
+    try:
+        port = parts.port
+    except ValueError:   # 不是数字，或者超出 65535
+        port = -1
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Webhook 地址中的端口需要是 1 到 65535 之间的数字")
+    try:
+        # 照发送时的样子建一个请求（不发出去）：httpx 到这一步才按 IDNA 解码主机名
+        httpx.Request("POST", text)
+    except (httpx.InvalidURL, ValueError):   # IDNA 的错误是 UnicodeError，也是 ValueError
+        raise ValueError("Webhook 地址的主机名不符合规范，无法发送，请检查后重新填写") from None
     return text
 
 
+#: 群机器人的地址（主机，路径前缀）→ 格式。这些地址只认自己平台的消息格式：格式选错了，平台回错误码，群里收不到
+_BOTS = (
+    ("open.feishu.cn", "/open-apis/bot/", "feishu"),
+    ("open.larksuite.com", "/open-apis/bot/", "feishu"),
+    ("qyapi.weixin.qq.com", "/cgi-bin/webhook/", "wecom"),
+    ("oapi.dingtalk.com", "/robot/", "dingtalk"),
+)
+#: 平台的主机 → 按哪个平台读 HTTP 200 里的错误码。同一主机上不是群机器人的接口（飞书集成平台的 Webhook 触发器
+#: 收任意 JSON）也是同一套错误码约定
+_PLATFORM_HOSTS = {host: fmt for host, _, fmt in _BOTS}
+
+
+def bot_format(url: str) -> str | None:
+    """这条地址是哪个平台的群机器人（feishu / wecom / dingtalk），不是群机器人的返回 None。"""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    return next((fmt for bot_host, prefix, fmt in _BOTS if host == bot_host and parts.path.startswith(prefix)), None)
+
+
+def format_problem(fmt: str, url: str) -> str | None:
+    """格式和地址对不上时的说明（群机器人的地址选了别的格式），对得上返回 None。"""
+    expected = bot_format(url)
+    if expected is None or expected == fmt:
+        return None
+    label = FORMAT_LABEL[expected]
+    return f"这是{label}群机器人的地址，只接收{label}的消息格式，Webhook 格式请选择「{label}」"
+
+
 def host_of(url: str) -> str:
-    """主机名（带非默认端口）。日志、报错里只写它。"""
+    """主机名（带非默认端口）。日志、报错里只写它。端口写错的地址也照样给出主机名。"""
     try:
         parts = urlsplit(url)
         host = parts.hostname or "?"
-        return f"{host}:{parts.port}" if parts.port else host
     except ValueError:
         return "?"
+    try:
+        port = parts.port
+    except ValueError:
+        return host
+    return f"{host}:{port}" if port else host
 
 
 def url_hint(url: str) -> str:
@@ -146,7 +214,10 @@ _install_filter()
 @dataclass
 class Notice:
     """一条通知要说的事。event 是 finished / failed / awaiting_approval / test；status 是运行状态，没能发起的是
-    failed_to_start。没有的项为 None。"""
+    failed_to_start。没有的项为 None。
+
+    suspended：运行停在断点上、没有待审批（通常是服务重启挂起的），按 failed 事件推。error_node：失败节点的名字。
+    fmt、signed 只给测试消息用：说明里只说这条消息证明得了的事。"""
 
     event: str
     schedule_id: str
@@ -165,6 +236,10 @@ class Notice:
     finished_at: datetime | None = None
     reason: str | None = None
     pending_approvals: int | None = None
+    suspended: bool = False
+    error_node: str | None = None
+    fmt: str | None = None
+    signed: bool = False
 
 
 def _local(moment: datetime | None, tz: str, *, seconds: bool = True) -> str | None:
@@ -181,37 +256,68 @@ def _local(moment: datetime | None, tz: str, *, seconds: bool = True) -> str | N
 
 def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
     """(标题, [(项, 内容)…], 运行链接)。三种文本格式都从这一份排出来。"""
-    if notice.event == "failed" and notice.status == "failed_to_start":
+    if notice.event == "test":
+        return f"定时任务「{notice.schedule_name}」Webhook 测试", [("说明", _test_text(notice))], None
+    if notice.status == "failed_to_start":
         headline = "未能发起运行"
+    elif notice.suspended:
+        headline = "运行已挂起"
     else:
         headline = _HEADLINE.get(notice.event, notice.event)
     title = f"定时任务「{notice.schedule_name}」{headline}"
     lines: list[tuple[str, str]] = []
-    if notice.event == "test":
-        lines.append(("说明", "这是一条测试消息，收到说明 Webhook 地址和签名配置正确"))
-        return title, lines, None
     if notice.status:
-        lines.append(("状态", _STATUS_LABEL.get(notice.status, notice.status)))
+        lines.append(("状态", _status_label(notice)))
     if notice.tier:
         gaps = f"（缺口 {notice.gaps} 条）" if notice.gaps is not None else ""
         lines.append(("出具档位", f"{ISSUANCE_LABEL.get(notice.tier, notice.tier)}{gaps}"))
     if notice.pending_approvals:
-        lines.append(("待审批", f"{notice.pending_approvals} 项，请到 AgentLab 处理"))
+        lines.append(("待审批", f"{notice.pending_approvals} 项，请到 AgentLab 处理；运行结束之前，"
+                                "这个定时任务之后的触发都会跳过"))
     if notice.status == "failed_to_start" and notice.reason:
         lines.append(("原因", notice.reason))
+    elif notice.suspended:
+        lines += [("原因", SUSPENDED_REASON), ("处理", SUSPENDED_ACTION)]
     elif notice.status == "failed":
-        lines.append(("原因", "运行失败，详情请查看运行记录"))
+        # 不写原始报错（可能带着查询到的数据），写失败节点的名字和去哪里处理
+        if notice.error_node:
+            lines.append(("失败节点", f"「{notice.error_node}」"))
+        lines.append(("处理", "请在 AgentLab 的运行记录中查看报错，修正后可继续运行"))
     if notice.fire_at is not None:
-        lines.append(("计划触发", f"{_local(notice.fire_at, notice.timezone, seconds=False)}（{notice.timezone}）"))
+        when = f"{_local(notice.fire_at, notice.timezone, seconds=False)}（{notice.timezone}）"
+        # 立即运行不写「计划触发」：群里的人会以为报告按时出了
+        if notice.fire_kind == "manual":
+            lines.append(("手动触发", when))
+        elif notice.fire_kind == "misfire":
+            lines.append(("计划触发", f"{when}，错过后补发"))
+        else:
+            lines.append(("计划触发", when))
     if notice.started_at is not None:
         lines.append(("开始", _local(notice.started_at, notice.timezone) or ""))
     if notice.finished_at is not None:
         lines.append(("结束", _local(notice.finished_at, notice.timezone) or ""))
     if notice.manifest_hash:
-        lines.append(("封存哈希", notice.manifest_hash[:12]))
+        lines.append(("清单哈希", notice.manifest_hash[:12]))
     if notice.run_id:
-        lines.append(("运行编号", notice.run_id))
+        # 和界面上的短编号一样写（#前 6 位）；完整 id 在运行链接里
+        lines.append(("运行", f"#{notice.run_id[:6]}"))
     return title, lines, notice.run_url
+
+
+def _status_label(notice: Notice) -> str:
+    if notice.status == "interrupted":
+        return "等待审批" if notice.pending_approvals else "已挂起，可继续运行"
+    return _STATUS_LABEL.get(notice.status or "", notice.status or "")
+
+
+def _test_text(notice: Notice) -> str:
+    """测试消息的说明只说收到它证明得了的事：飞书、钉钉的机器人开了签名校验时，验签不过就不收；通用格式的接收端验没
+    验签这边不知道；企业微信不签名，填了密钥也不提。"""
+    if notice.signed and notice.fmt in ("feishu", "dingtalk"):
+        return "这是一条测试消息。收到即表示 Webhook 地址可用；机器人开启了签名校验的，签名密钥也配置正确"
+    if notice.signed:
+        return "这是一条测试消息。收到即表示 Webhook 地址可用；请求头带有签名，接收端可据此核对签名密钥"
+    return "这是一条测试消息。收到即表示 Webhook 地址配置正确"
 
 
 def _text(notice: Notice) -> str:
@@ -268,7 +374,9 @@ def _generic(notice: Notice, now: datetime) -> dict[str, Any]:
         "manifest_hash": notice.manifest_hash[:12] if notice.manifest_hash else None,
         "started_at": _iso(notice.started_at),
         "finished_at": _iso(notice.finished_at),
-        "reason": notice.reason if notice.status == "failed_to_start" else None,
+        "reason": (notice.reason if notice.status == "failed_to_start"
+                   else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended else None),
+        "error_node": notice.error_node,
         "sent_at": _iso(now),
     }
 
@@ -367,6 +475,11 @@ async def _post_once(client: httpx.AsyncClient, fmt: str, target: str, headers: 
         return Outcome(False, None, 1, f"无法连接 {host}", retryable=True)
     except httpx.HTTPError as e:
         return Outcome(False, None, 1, f"请求 {host} 失败（{type(e).__name__}）", retryable=True)
+    except httpx.InvalidURL:
+        # 保存时的地址校验加严之前存进库的地址：httpx 抛的不是 HTTPError。重试也一样，请人改地址
+        return Outcome(False, None, 1, f"发往 {host} 的 Webhook 地址无效，请重新填写地址")
+    except Exception as e:  # noqa: BLE001 - 端口越界之类在传输层才抛（不是 HTTPError），不能让测试接口回 500
+        return Outcome(False, None, 1, f"无法向 {host} 发送请求（{type(e).__name__}），请检查 Webhook 地址")
     finally:
         _SENDING.reset(token)
     status = response.status_code
@@ -375,7 +488,7 @@ async def _post_once(client: httpx.AsyncClient, fmt: str, target: str, headers: 
         detail = _platform_message(reply)
         text = f"{host} 返回 HTTP {status}" + (f"：{detail}" if detail else "")
         return Outcome(False, status, 1, _scrub(text, url, secret)[:300], retryable=status == 429 or status >= 500)
-    if problem := _platform_error(fmt, reply):
+    if problem := _platform_error(fmt, url, reply):
         return Outcome(False, status, 1, _scrub(f"{host} {problem}", url, secret)[:300], retryable=True)
     return Outcome(True, status, 1)
 
@@ -395,13 +508,20 @@ def _platform_message(reply: dict[str, Any] | None) -> str:
     return str(text)[:200]
 
 
-def _platform_error(fmt: str, reply: dict[str, Any] | None) -> str | None:
+def _platform_error(fmt: str, url: str, reply: dict[str, Any] | None) -> str | None:
     """HTTP 200 里的平台错误码：飞书 code（老接口 StatusCode），企业微信、钉钉 errcode。0 是成功。
 
-    说明里写主机名（调用方拼在前面），不写平台名：主机名已经说明是哪个平台，配错了格式时也不会张冠李戴。"""
-    if not reply or fmt == "generic":
+    按地址的主机认平台，不看选的格式：以前只看所选格式自己的字段（通用格式完全不看），飞书的地址选了通用格式、
+    平台回 code 19002，照样记「已送达」。主机不是这几个平台的（自建接收端、代理转发）才按所选格式读，通用格式
+    不解读——自建接收端的 code 字段是什么意思由它自己定。说明里写主机名（调用方拼在前面），不写平台名。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    platform = _PLATFORM_HOSTS.get(host) or (fmt if fmt != "generic" else None)
+    if not reply or platform is None:
         return None
-    code = reply.get("code", reply.get("StatusCode")) if fmt == "feishu" else reply.get("errcode")
+    code = reply.get("code", reply.get("StatusCode")) if platform == "feishu" else reply.get("errcode")
     if code in (None, 0, "0"):
         return None
     detail = _platform_message(reply)
@@ -425,8 +545,8 @@ async def _record(schedule_id: str, fire_id: str | None, run_id: str | None, eve
 
 #: 运行到了这些状态才可能要推送
 _WATCHED = ("succeeded", "failed", "cancelled", "interrupted")
-#: 运行状态 → 事件。cancelled 是有人手动停的，不推
-_EVENT_OF = {"succeeded": "finished", "failed": "failed", "cancelled": None, "interrupted": "awaiting_approval"}
+#: 结束的运行 → 事件。cancelled 是有人手动停的，不推。interrupted 分停在审批和挂起两种，见 _state_of
+_EVENT_OF = {"succeeded": "finished", "failed": "failed", "cancelled": None}
 
 
 @dataclass
@@ -442,6 +562,7 @@ async def notify_due(now: datetime | None = None) -> int:
 
     处理过的状态记在 notified_status 上，用条件 UPDATE 认领（WHERE notified_status = 旧值）：两拍撞在一起也只
     推一次。没订阅这个事件、任务没配 Webhook 的也记下已处理——之后再配上 Webhook，不会把旧的补推一遍。
+    停在断点上的运行每一拍都要重新看（见 _state_of）：它的已处理状态带着第几段执行，和运行状态本身对不上。
     """
     now = now or utcnow()
     jobs: list[_Job] = []
@@ -465,7 +586,8 @@ async def notify_due(now: datetime | None = None) -> int:
                 base_url = (await notify_settings(session))["public_base_url"]
             for fire, run in rows:
                 state, event, pending = await _state_of(session, fire, run, now)
-                if state is None or not await _mark(fire.id, fire.notified_status, state):
+                if state is None or state == fire.notified_status \
+                        or not await _mark(fire.id, fire.notified_status, state):
                     continue
                 schedule = await session.get(Schedule, fire.schedule_id)
                 url = decrypt(schedule.webhook_url) if schedule and schedule.webhook_url else None
@@ -481,22 +603,39 @@ async def notify_due(now: datetime | None = None) -> int:
 
 async def _state_of(session: Any, fire: ScheduleFire, run: Run | None,
                     now: datetime) -> tuple[str | None, str | None, int]:
-    """(要记下的已处理状态, 要推送的事件, 待审批数)。还不能下结论（没封存、挂起但没有待审批）时状态为 None。"""
+    """(要记下的已处理状态, 要推送的事件, 待审批数)。还不能下结论（没封存、审批刚批完还没接着执行）时状态为 None。
+
+    停在断点上（interrupted）的分两种，各推一次：
+    - 有待审批：停在审批，推 awaiting_approval。批完接着执行、又停在下一个审批点时要再推，所以已处理状态里带着这是
+      第几段执行（每段执行从一条 run.started 开始），同一个审批点不重复推。
+    - 没有待审批：通常是服务重启挂起的。它不会自己接着执行，这个任务之后的触发都会按「上一次还没结束」跳过，
+      不说一声任务就此静默停摆——按 failed 推一次，写明要去继续运行或放弃。
+    审批批完到运行改回 running 之间，审批是 answered、还没有 resolved：那不是挂起，等下一拍。
+    """
     if fire.status == "failed_to_start":
         return "failed_to_start", "failed", 0
     if run is None:
         return None, None, 0
     if run.status in ("succeeded", "failed", "cancelled"):
-        finished = run.finished_at or now
-        if not run.manifest_hash and (now - service.as_utc(finished)).total_seconds() < SEAL_WAIT_S:
+        # runner 先写终态和结束时间、再封存，两步之间被这一拍撞上就等。没有结束时间的（服务重启时还在排队、被改成
+        # failed 的）永远不会封存：按它最后一次更新的时间等，以前按「现在」等，每一拍都等、永远不推
+        since = run.finished_at or run.updated_at or fire.created_at
+        if not run.manifest_hash and (now - service.as_utc(since)).total_seconds() < SEAL_WAIT_S:
             return None, None, 0
         return run.status, _EVENT_OF[run.status], 0
-    if run.status == "interrupted":
-        # 服务重启挂起的运行也是 interrupted，但没人要审批：确有待审批才算停在审批
-        pending = await session.scalar(select(func.count()).select_from(Approval).where(
-            Approval.run_id == run.id, Approval.status == "pending")) or 0
-        return ("interrupted", "awaiting_approval", pending) if pending else (None, None, 0)
-    return None, None, 0
+    if run.status != "interrupted":
+        return None, None, 0
+    counts = dict((await session.execute(
+        select(Approval.status, func.count()).where(
+            Approval.run_id == run.id, Approval.status.in_(("pending", "answered")))
+        .group_by(Approval.status))).all())
+    segment = await session.scalar(select(func.count()).select_from(RunEvent).where(
+        RunEvent.run_id == run.id, RunEvent.type == EventType.RUN_STARTED.value)) or 0
+    if counts.get("pending"):
+        return f"interrupted:approval:{segment}", "awaiting_approval", counts["pending"]
+    if counts.get("answered"):
+        return None, None, 0
+    return f"interrupted:held:{segment}", "failed", 0
 
 
 async def _mark(fire_id: str, old: str | None, state: str) -> bool:
@@ -523,7 +662,20 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         finished_at=run.finished_at if run else None,
         reason=fire.reason if fire.status == "failed_to_start" else None,
         pending_approvals=pending or None,
+        suspended=run is not None and run.status == "interrupted" and not pending,
+        error_node=_failed_node(run) if run is not None and run.status == "failed" else None,
     )
+
+
+def _failed_node(run: Run) -> str | None:
+    """失败节点在图上的名字（没有名字的给节点 id）。节点名是搭图时起的，不带查询到的数据。"""
+    if not run.error_node_id:
+        return None
+    for node in (run.graph or {}).get("nodes") or []:
+        if isinstance(node, dict) and node.get("id") == run.error_node_id:
+            label = (node.get("data") or {}).get("label") if isinstance(node.get("data"), dict) else None
+            return str(label or run.error_node_id)[:80]
+    return None
 
 
 async def _issuance_of(session: Any, run: Run) -> tuple[str | None, int | None]:
@@ -549,19 +701,24 @@ async def _deliver(job: _Job) -> None:
 
 async def send_test(schedule_id: str) -> dict[str, Any]:
     """按任务存的 Webhook 发一条测试消息（不重试），记一条 event=test 的推送记录。任务不存在抛 KeyError，
-    没配 Webhook 抛 ValueError。返回 {ok, http_status, message}。"""
+    没配 Webhook、地址解不开抛 ValueError。
+
+    返回 {ok, http_status, message}。message 是 ok、http_status 之外的补充说明：失败时是原因（只有主机名），送达时
+    提醒去接收端看一眼。界面在「测试消息已送达（HTTP 200）」「测试消息发送失败」后面接它，这里不再重复那半句。"""
     async with SessionLocal() as session:
         schedule = await session.get(Schedule, schedule_id)
         if schedule is None:
             raise KeyError(schedule_id)
-        url = decrypt(schedule.webhook_url) if schedule.webhook_url else None
-        if not url or schedule.webhook_format not in FORMATS:
+        if not schedule.webhook_url or schedule.webhook_format not in FORMATS:
             raise ValueError("这个定时任务没有配置 Webhook，请先填写地址并保存")
+        url = decrypt(schedule.webhook_url)
+        if not url:
+            raise ValueError("Webhook 地址无法解密（加密密钥可能已更换），请重新填写地址并保存")
         fmt, secret = schedule.webhook_format, decrypt(schedule.webhook_secret)
         notice = Notice(event="test", schedule_id=schedule.id, schedule_name=schedule.name,
-                        timezone=schedule.timezone)
+                        timezone=schedule.timezone, fmt=fmt, signed=bool(secret) and fmt != "wecom")
     outcome = await send(fmt, url, secret, notice, retry=False)
     await _record(schedule_id, None, None, "test", outcome)
     if outcome.ok:
-        return {"ok": True, "http_status": outcome.http_status, "message": f"测试消息已送达（HTTP {outcome.http_status}）"}
-    return {"ok": False, "http_status": outcome.http_status, "message": f"推送失败：{outcome.error}"}
+        return {"ok": True, "http_status": outcome.http_status, "message": "请到接收端确认已收到"}
+    return {"ok": False, "http_status": outcome.http_status, "message": outcome.error or "发送失败"}

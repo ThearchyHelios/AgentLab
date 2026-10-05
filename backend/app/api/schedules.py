@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
@@ -87,7 +87,7 @@ def _timezone(value: Any) -> str:
 
 def _run_class(value: Any) -> str:
     if value not in service.RUN_CLASSES:
-        raise _invalid(f"运行类别需要是 formal（正式运行）或 exploratory（探索运行），当前为「{value}」", "run_class")
+        raise _invalid(f"运行类别需要选择正式运行或探索运行{_current(value)}", "run_class")
     return value
 
 
@@ -98,35 +98,45 @@ def _template(value: Any) -> dict[str, str]:
         raise _invalid(str(e), "input_template") from e
 
 
+def _current(value: Any) -> str:
+    return service.current_value(value)
+
+
 def _enabled(value: Any) -> bool:
     if not isinstance(value, bool):
-        raise _invalid(f"启用状态需要是 true 或 false，当前为「{value}」", "enabled")
+        raise _invalid(f"启用状态需要是 true 或 false{_current(value)}", "enabled")
     return value
 
 
 def _overlap(value: Any) -> str:
     if value != "skip":
-        raise _invalid(f"重叠处理目前只支持 skip（上一次运行还没结束时跳过这次触发），当前为「{value}」", "overlap")
+        raise _invalid(f"重叠处理目前只支持「跳过」：上一次运行还没结束时跳过这次触发{_current(value)}", "overlap")
     return value
 
 
 def _grace(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_GRACE_S:
-        raise _invalid(f"补发宽限需要是 0 到 {MAX_GRACE_S} 之间的整数秒数（最长 7 天），当前为「{value}」",
+        raise _invalid(f"补发宽限需要是 0 到 {MAX_GRACE_S} 之间的整数秒数（最长 7 天）{_current(value)}",
                        "misfire_grace_s")
     return value
 
 
 def _format(value: Any) -> str:
     if value not in webhook.FORMATS:
-        raise _invalid(f"不支持的 Webhook 格式「{value}」，可选的格式：{'、'.join(webhook.FORMATS)}", "webhook")
+        labels = "、".join(webhook.FORMAT_LABEL[f] for f in webhook.FORMATS)
+        raise _invalid(f"Webhook 格式需要是{labels}之一{_current(value)}", "webhook")
     return value
 
 
 def _events(value: Any) -> list[str]:
-    if not isinstance(value, list) or any(e not in webhook.EVENTS for e in value):
-        raise _invalid("Webhook 的通知事件只能从 finished（运行完成）、failed（运行失败）、awaiting_approval（等待审批）"
-                       f"中选择，当前为「{value}」", "webhook")
+    labels = "、".join(webhook.EVENT_LABEL[e] for e in webhook.EVENTS)
+    if not isinstance(value, list):
+        raise _invalid(f"Webhook 的通知事件需要从{labels}中选择", "webhook")
+    unknown = [e for e in value if e not in webhook.EVENTS]
+    if unknown:
+        first = unknown[0]
+        named = f"「{first}」" if isinstance(first, str) and first.strip() else "中有一项"
+        raise _invalid(f"Webhook 的通知事件{named}不可选，只能从{labels}中选择", "webhook")
     return [e for e in webhook.EVENTS if e in value]
 
 
@@ -149,16 +159,28 @@ def _blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _matched_format(value: Any, url: str) -> str:
+    """校验格式，并要求和地址对得上：群机器人的地址只认自己平台的格式（见 webhook.bot_format）。"""
+    fmt = _format(value)
+    if problem := webhook.format_problem(fmt, url):
+        raise _invalid(problem, "webhook")
+    return fmt
+
+
 def _new_webhook(value: Any) -> dict[str, Any] | None:
-    """创建时的 webhook：null 或 url 为空表示不配；否则校验格式、地址、密钥、事件（事件省略表示三种都要）。"""
+    """创建时的 webhook：null 或 url 为空表示不配；否则校验格式、地址、密钥、事件（事件省略表示三种都要）。
+    格式省略时按地址认：群机器人的地址用它平台的格式，别的用通用格式。"""
     if value is None:
         return None
     if not isinstance(value, dict):
         raise _invalid("Webhook 设置需要是一个对象，或者为空表示不推送", "webhook")
     if _blank(value.get("url")):
         return None
-    return {"format": _format(value.get("format", "generic")), "url": _url(value.get("url")),
-            "secret": _secret(value.get("secret")), "events": _events(value.get("events", list(webhook.EVENTS)))}
+    url = _url(value.get("url"))
+    given = value.get("format")
+    fmt = _matched_format(given, url) if given is not None else webhook.bot_format(url) or "generic"
+    return {"format": fmt, "url": url, "secret": _secret(value.get("secret")),
+            "events": _events(value.get("events", list(webhook.EVENTS)))}
 
 
 def _webhook_columns(hook: dict[str, Any] | None) -> dict[str, Any]:
@@ -170,7 +192,10 @@ def _webhook_columns(hook: dict[str, Any] | None) -> dict[str, Any]:
 
 def _patched_webhook(row: Schedule, value: Any) -> dict[str, Any]:
     """PATCH 的 webhook → 要写的列。null 或 url 写空串：删除整个 Webhook；url 省略：地址不变；secret 省略：密钥不变、
-    写空串：去掉密钥。"""
+    写空串：去掉密钥。format 省略：换了地址的按新地址认（群机器人用它平台的格式），没换的不变。
+
+    地址或格式真的变了才查两者对不对得上：库里已有对不上的设置（这条校验之前存的）时，整份表单回写只为停用、
+    改名，不能因为 Webhook 被拦下。"""
     if value is None:
         return _webhook_columns(None)
     if not isinstance(value, dict):
@@ -180,13 +205,24 @@ def _patched_webhook(row: Schedule, value: Any) -> dict[str, Any]:
     has_url = bool(row.webhook_url)
     if "url" not in value and not has_url:
         raise _invalid("请填写 Webhook 地址", "webhook")
+    url = _url(value.get("url")) if "url" in value else None
+    if value.get("format") is not None:
+        fmt = _format(value["format"])
+    elif url is not None:
+        fmt = webhook.bot_format(url) or (row.webhook_format if has_url else "generic")
+    else:
+        fmt = row.webhook_format
+    if url is not None or fmt != row.webhook_format:
+        target = url or decrypt(row.webhook_url)
+        if target and (problem := webhook.format_problem(fmt, target)):
+            raise _invalid(problem, "webhook")
     out: dict[str, Any] = {
-        "webhook_format": _format(value.get("format", row.webhook_format if has_url else "generic")),
+        "webhook_format": _format(fmt),
         "webhook_events": _events(value.get("events", list(row.webhook_events or []) if has_url
                                             else list(webhook.EVENTS))),
     }
-    if "url" in value:
-        out["webhook_url"] = encrypt(_url(value.get("url")))
+    if url is not None:
+        out["webhook_url"] = encrypt(url)
     if "secret" in value:
         secret = _secret(value.get("secret"))
         out["webhook_secret"] = encrypt(secret) if secret else None
@@ -254,14 +290,16 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         )).scalars()
         for d in rows:
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
+    # 正在发起的触发：库里是占位的「未能发起」（为了进程被强杀时照实说），进程还在、只是还没发起完，按已发起给
+    launching = {f.id for f in fires if service.launching(f.id)}
     return [{
         "id": f.id,
         "fire_at": _iso(f.fire_at),
         "kind": f.kind,
-        "status": f.status,
+        "status": "started" if f.id in launching else f.status,
         "run_id": f.run_id,
         "run_status": statuses.get(f.run_id) if f.run_id else None,
-        "reason": f.reason,
+        "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
         "created_at": _iso(f.created_at),
     } for f in fires]
@@ -403,8 +441,11 @@ async def update_schedule(schedule_id: str, request: Request,
                           session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """改任意可改的项，带上读到的 version；对不上回 409。只读的项（id、next_run_at、last_fire……）带了也不理。
 
-    改了 cron、时区或启用状态就重算下一次触发（从现在算，不补停用期间错过的）。改了工作流、运行类别或输入模板
-    就按改后的组合重新校验；只停用、改名不查工作流——工作流后来撤了发布，也要能先把任务停下来。
+    看的是值变没变，不是键在不在：编辑表单把整份字段带回来是正常用法。
+    - 工作流、运行类别、输入模板真改了才按改后的组合重新校验。只停用、改名不查工作流——工作流删了、撤了发布，
+      也要能先把任务停下来。
+    - cron、时区、启用状态真改了才重算下一次触发（见 _next_after_edit）。没改的不动它：到点了、这一拍还没来时
+      保存一次，这一次照常发起，不会被推到下一次、连记录都没有就丢了。
     """
     body = await _body(request)
     row = await _get(session, schedule_id)
@@ -439,11 +480,18 @@ async def update_schedule(schedule_id: str, request: Request,
     def merged(key: str) -> Any:
         return values.get(key, getattr(row, key))
 
-    if {"workflow_id", "run_class", "input_template"} & values.keys():
+    def changed(key: str) -> bool:
+        if key not in values:
+            return False
+        stored = getattr(row, key)
+        return values[key] != (dict(stored or {}) if key == "input_template" else stored)
+
+    if changed("workflow_id") or changed("run_class") or changed("input_template"):
         workflow = await _check_workflow(session, merged("workflow_id"), merged("run_class"), merged("input_template"))
         values["workflow_name"] = workflow.name
-    if {"cron", "timezone", "enabled"} & values.keys():
-        values["next_run_at"] = service.next_run(merged("cron"), merged("timezone"), merged("enabled"))
+    # cron、时区在上面已经规范化（字段之间一个空格、时区的标准写法），和库里存的同一种写法，直接比
+    if changed("cron") or changed("timezone") or changed("enabled"):
+        values["next_run_at"] = _next_after_edit(row, merged("cron"), merged("timezone"), merged("enabled"))
     # 条件 UPDATE 才是真的乐观锁：两个人同时读到第 3 版、同时保存，只有先到的那个改得动
     result = await session.execute(
         update(Schedule).where(Schedule.id == schedule_id, Schedule.version == version)
@@ -454,6 +502,21 @@ async def update_schedule(schedule_id: str, request: Request,
     await session.commit()
     session.expire_all()
     return await _schedule_out(session, await _get(session, schedule_id))
+
+
+def _next_after_edit(row: Schedule, cron_expr: str, tz: str, enabled: bool) -> datetime | None:
+    """改了 cron、时区或启用状态之后的下一次触发。
+
+    停用：没有下一次。刚启用：从现在算，不补停用期间错过的。启用着改了 cron、时区：原来那一次已经到点、这一拍还没来
+    的，从那一刻接着按新的表达式算——新表达式也覆盖那一刻（每天 → 工作日）就还发起这一次，只属于旧表达式的不再发起。
+    """
+    if not enabled:
+        return None
+    now = utcnow()
+    due = service.as_utc(row.next_run_at) if row.enabled and row.next_run_at is not None else None
+    if due is not None and due <= now:
+        return cron.next_fire(cron_expr, tz, due - timedelta(microseconds=1))
+    return service.next_run(cron_expr, tz, True, now)
 
 
 @router.delete("/{schedule_id}", status_code=204)

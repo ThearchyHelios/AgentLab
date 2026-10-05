@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 TICK_SECONDS = 15.0
 #: 晚了这么多秒以内都算准点（kind=scheduled），和补发宽限无关：拍与拍之间的十几秒不该算错过
 ON_TIME_S = 60
-#: stop 等手上那一拍收尾最多等多久，超过就取消
-STOP_GRACE_S = 10.0
+#: stop 等手上那一拍的发起收尾最多等多久，超过就取消。关停时 main.py 先停调度、再让 run_manager 平稳挂起在执行
+#: 的运行，docker stop 默认只给 10 秒：这里要留出大半
+STOP_GRACE_S = 3.0
+#: stop 等正在推送的通知多久。通知本来就是至多一次，接收端挂住时等满超时加重试（几十秒）换不来什么，宽限一过就取消
+NOTIFY_GRACE_S = 1.5
 
 
 async def fire_due(now: datetime | None = None) -> list[ScheduleFire]:
@@ -149,7 +152,8 @@ class _Runner:
         while not stopping.is_set():
             try:
                 await fire_due()
-                if self.notify is None or self.notify.done():
+                # stop 撞在这一拍的发起当中时，收尾不再新起通知扫描：stop 只等它动手时手上的那一份
+                if not stopping.is_set() and (self.notify is None or self.notify.done()):
                     self.notify = asyncio.create_task(_notify(webhook), name="agentlab-scheduler-notify")
             except asyncio.CancelledError:
                 raise
@@ -159,24 +163,34 @@ class _Runner:
                 await asyncio.wait_for(stopping.wait(), timeout=interval)
 
     async def stop(self) -> None:
-        """让循环收完手上这一拍再停；等不到（STOP_GRACE_S）就取消。没 start 过直接返回。"""
-        tasks = [t for t in (self.task, self.notify) if t is not None]
-        self.task = self.notify = None
+        """让循环收完手上这一拍再停、正在推送的通知推完；各等一个宽限（STOP_GRACE_S、NOTIFY_GRACE_S），两件事并行
+        等，过了就取消。没 start 过直接返回。
+
+        先置停止标志、再取两个任务：标志置上之后循环不会再起新的通知扫描，取到的就是最后一份。"""
         if self._stopping is not None:
             self._stopping.set()
-        for task in tasks:
-            if task.done():
-                continue
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=STOP_GRACE_S)
-            except TimeoutError:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            except Exception:  # noqa: BLE001 - 停的时候不再追究这一拍的错
-                pass
-        if tasks:
+        tick, notify = self.task, self.notify
+        await asyncio.gather(_settle(tick, STOP_GRACE_S), _settle(notify, NOTIFY_GRACE_S))
+        if self.notify is not None and self.notify is not notify:
+            # 兜底：万一还是落下了一份（以后改循环时漏掉上面的条件），不让它在关停期间接着推
+            await _settle(self.notify, 0)
+        self.task = self.notify = None
+        if tick is not None or notify is not None:
             logger.info("定时任务调度已停止")
+
+
+async def _settle(task: asyncio.Task[None] | None, grace: float) -> None:
+    """等 task 结束，最多等 grace 秒，过了就取消。task 自己的异常不再追究：停的时候只管它停下。"""
+    if task is None or task.done():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+    except TimeoutError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    except Exception:  # noqa: BLE001
+        pass
 
 
 runner = _Runner()
