@@ -707,8 +707,9 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
     for field, message in challenge_problems(node.config):
         result.add(message, node_id=node.id, field=field, code="challenge.config_invalid")
     report, problem = challenge_report(spec, node)
-    if problem or report is None:
-        result.add(problem or "", node_id=node.id, field="report", code="challenge.report_invalid")
+    if report is None:
+        result.add(problem or f"「{type_label(NodeType.CHALLENGE)}」找不到要审的报告", node_id=node.id, field="report",
+                   code="challenge.report_invalid")
         return
     writer = spec.node_map()[report]
     model = node.config.get("model")
