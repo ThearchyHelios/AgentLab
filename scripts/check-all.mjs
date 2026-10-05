@@ -96,7 +96,7 @@ const ESTIMATE = {
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
   evidence: 91, versions: 60, catalog: 45, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
-  schedules: 60, compare: 45, verify: 25, inquiry: 1, bundle: 16, whatif: 33,
+  schedules: 60, compare: 45, verify: 45, inquiry: 1, bundle: 16, whatif: 33,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。

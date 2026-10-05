@@ -2,10 +2,16 @@
 //
 // 双盲复算这一半守的是这些「看着没坏、其实用不了」的地方：
 // - 审批卡：两路对不上时，卡上要先按摘要画出来（完整对照还在路上时不能一片空白），再按工件补全；具体差异逐条列，
-//   只有兜底说明时写明「未能归纳成具体差异」并默认展开对照；对照两条 SQL 时左右并排（窄栏上下排），规范化后不同的
-//   行高亮；三个选择缺一个都不能提交，提交的回复是 {choices, note}；卡上不能再冒出通用的输入框和「提交 / 驳回并终止」
-//   （mode 是 input，通用那套会把一个字符串当 value 发出去）；后果按运行类别说，探索运行不提出具；
-// - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、不采用原流程时、启用，每一项都真的写进节点配置；
+//   只有兜底说明（或只有解析失败）时写明「未能归纳成具体差异」并默认展开对照；对照两条 SQL 时左右并排（窄栏上下排），
+//   原文按行比出的不同行高亮，规范化后不同的行（text_diff）分两栏高亮——夹具里的差异说明是服务端的真实输出
+//   （backend/tests/test_dual_check_fixture.py 核对），规范化的行和原文对不上，高亮不能指望两边逐行相等；
+//   「只差一个方面、会记入数据目录」只在服务端真会写目录的形状下说（恰好一条具体差异，且是时间列、筛选条件或聚合）；
+//   三个选择缺一个都不能提交，提交的回复是 {choices, note}；卡上不能再冒出通用的输入框和「提交 / 驳回并终止」
+//   （mode 是 input，通用那套会把一个字符串当 value 发出去），认不出指标时另给「驳回并终止」；后果按运行类别和节点的
+//   「未采用原流程时」说（从运行的图快照里读），探索运行不提出具，读不到节点设置时有条件地说；
+// - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
+//   叫法和服务端校验报错里的（schema.py 的 DUAL_CHECK_FIELD_LABEL，合入后）一字不差；盲算模型不藏在高级选项里
+//   （时间线「模型相同」那一行要能定位过来）；上游有好几张口径卡时写明必须选；「跟随设置」的当前值每次打开都重取；
 //   节点卡片的摘要写出复算哪张口径卡、几个指标；
 // - 设置页「核查」一节：读回各项，改了之后整组写 verify（不限存 null），叫法和服务端 VERIFY_SETTING_LABEL 一字不差；
 // - 390px 窄屏不横向溢出，深浅色都读得清，键盘能操作。
@@ -113,15 +119,42 @@ await section('核查设置的叫法和服务端一字不差', async () => {
   check('……这一节其余的文案放在 section 里', !!T.section?.title && typeof T.section.spend === 'function')
 })
 
+await section('双盲复算检查器的叫法和服务端校验报错一致', async () => {
+  // 校验问题挂在字段下方、出现在问题面板里时，报错引用的是 schema.py 的 DUAL_CHECK_FIELD_LABEL：检查器上得是同一个名字，
+  // 人才找得到是哪一项。处置的取值：报错里用短说法，下拉的选项以它开头、后面可以带一句用途（labels.py 的约定）
+  const { DUAL_CHECK_TEXT: D } = await import(await load('/src/lib/terms.ts'))
+  const KEYS = ['card', 'metrics', 'definitions', 'provider', 'model', 'tolerance', 'on_reject', 'enabled']
+  check('检查器的字段名按配置键放在 DUAL_CHECK_TEXT.field', KEYS.every((k) => typeof D.field?.[k] === 'string' && D.field[k]),
+    KEYS.filter((k) => !D.field?.[k]).join('、'))
+  check('……模型的两项照「裁判模型 · 接入」「裁判模型」的叫法', D.field.provider === '盲算模型 · 接入' && D.field.model === '盲算模型',
+    `${D.field.provider} / ${D.field.model}`)
+  const py = readFileSync(`${root}backend/app/engine/schema.py`, 'utf8')
+  const block = py.match(/^DUAL_CHECK_FIELD_LABEL = \{([\s\S]*?)^\}/m)?.[1]
+  if (block == null) {
+    // 双盲复算的服务端在另一个工作包里，合入之前 schema.py 还没有这一组：合入后这一节就逐项比对
+    check('schema.py 还没有 DUAL_CHECK_FIELD_LABEL（双盲复算服务端合入后逐项比对）', true)
+    return
+  }
+  const labels = Object.fromEntries([...block.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const wrong = KEYS.filter((k) => labels[k] !== D.field[k])
+  check('每个字段的叫法和 DUAL_CHECK_FIELD_LABEL 一字不差', !wrong.length && Object.keys(labels).length === KEYS.length,
+    wrong.map((k) => `${k}：${D.field[k]} ≠ ${labels[k]}`).join('；'))
+  const opts = py.match(/^DUAL_CHECK_ON_REJECT_LABEL = \{([^}]*)\}/m)?.[1] ?? ''
+  const short = Object.fromEntries([...opts.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  check('「未采用原流程时」的选项以服务端的短说法开头', Object.keys(short).length === 2
+    && Object.entries(short).every(([k, v]) => D.onReject?.[k]?.startsWith(v)), JSON.stringify(short))
+})
+
 // ---------------------------------------------------------------- 页面
 
 const browser = await chromium.launch({ executablePath: CHROME })
 
 /**
- * 开一个预览用例。完整对照的工件按 artifact 答（默认夹具里的那份；给函数可以延迟、出错），审批回复记下请求体、
- * 回一个伪造的运行；审批列表回空；别的非 GET 一律拦掉，别的 GET 放行
+ * 开一个预览用例。完整对照的工件按 artifact 答（默认夹具里的那份；给函数可以延迟、出错），这次运行的图快照按 graph
+ * 答（默认夹具里的图：双盲复算节点没写「未采用原流程时」，按缺省的计入缺口），审批回复记下请求体、回一个伪造的运行；
+ * 审批列表回空；别的非 GET 一律拦掉，别的 GET 放行
  */
-async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifact = null, extra = null } = {}) {
+async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifact = null, graph = null, extra = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
   opened.add(ctx)
   ctx.setDefaultTimeout(6000)
@@ -149,6 +182,10 @@ async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifa
       const out = artifact ? await artifact() : { json: { id: CARD_ID, content: fx.card } }
       return route.fulfill({ status: out.status ?? 200, json: out.json })
     }
+    if (url.pathname === `/api/runs/${AP.run_id}/graph`) {
+      const out = graph ? await graph() : { json: { graph: fx.graph, workflow_id: null, version: null } }
+      return route.fulfill({ status: out.status ?? 200, json: out.json })
+    }
     if (url.pathname === '/api/approvals') return route.fulfill({ json: [] })
     return route.continue()
   })
@@ -158,6 +195,8 @@ async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifa
 }
 
 const metric = (page, id) => page.locator(`[data-dual-metric="${id}"]`)
+/** 弹出的提示（toast 的播报区）里的文字：卡上的后果说明里也有「运行继续」，不能拿整页的文字比 */
+const toastOf = (page) => text(page.locator('[role="status"][aria-live="polite"]'))
 
 await section('审批卡：先按摘要画，再取完整对照', async () => {
   // 完整对照晚一点到：这段时间里卡上照样有两个值、相差多少、摘要里的差异，选择也能先做
@@ -196,17 +235,36 @@ await section('审批卡：先按摘要画，再取完整对照', async () => {
   const rr = metric(page, 'refund_rate')
   check('……只有兜底的那个指标默认展开对照', (await rr.locator('[data-dual-compare-toggle]').getAttribute('aria-expanded')) === 'true'
     && await rr.locator('[data-dual-compare]').count() === 1)
-  check('……兜底的原话不再列成一条「具体差异」', await rr.locator('[data-dual-diff-item]').count() === 0)
-  check('只差一个方面的指标：说明选择会记入数据目录', (await text(gmv.locator('[data-dual-catalog]'))).includes('记入数据目录')
-    && await rr.locator('[data-dual-catalog]').count() === 0)
+  check('……兜底的原话不再列成一条「具体差异」，也不另附一遍', await rr.locator('[data-dual-diff-item]').count() === 0
+    && await rr.locator('[data-dual-fallback-note]').count() === 0)
+  // 销售额只差按哪一列筛时间（一条 time）：服务端会把采用的一边记成该表的业务日期，卡上有条件地说
+  const note = await text(gmv.locator('[data-dual-catalog]'))
+  check('只差在时间列的指标：说明采用一边后会记成该表的业务日期，有条件地说', note.includes('业务日期') && note.includes('记入数据目录')
+    && note.includes('两边都不对') && note.includes('不覆盖') && await rr.locator('[data-dual-catalog]').count() === 0, note)
+  await page.waitForSelector('[data-dual-consequence][data-on-reject="degrade"]')
   const after = await text(page.locator('[data-dual-consequence]'))
   check('正式运行：后果写明报告里的数仍取自原流程、采用盲算或都不对会让出具降档', after.includes('报告中的数仍取自原流程') && after.includes('出具降档'), after)
+  check('……节点按缺省（计入缺口）处置：不再挂「判为失败会终止」那句', !after.includes('判为失败') && !after.includes('终止'), after)
   check('没有发出任何写请求', sent.length === 0, JSON.stringify(sent))
   check('页面没有报错', errors.length === 0, errors.join('；'))
   await shot(page, 'approval-dark')
 })
 
-await section('审批卡：并排对照与高亮', async () => {
+/** 一块里高亮的行：原文两栏（data-dual-sql）和规范化后的两栏（data-dual-norm）各自的 <mark> 文字 */
+const marksIn = (loc) => loc.evaluate((el) => {
+  const pick = (sel) => [...el.querySelectorAll(sel)].map((m) => m.textContent.trim())
+  return {
+    del: pick('[data-dual-sql="original"] [data-diff-line="del"]'), add: pick('[data-dual-sql="blind"] [data-diff-line="add"]'),
+    normDel: pick('[data-dual-norm="original"] [data-diff-line="del"]'), normAdd: pick('[data-dual-norm="blind"] [data-diff-line="add"]'),
+  }
+})
+/** text_diff 里两边各有哪几行（去掉「- 」「+ 」和首尾空白） */
+const sidesOf = (diff) => ({
+  del: diff.text_diff.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).trim()),
+  add: diff.text_diff.filter((l) => l.startsWith('+ ')).map((l) => l.slice(2).trim()),
+})
+
+await section('审批卡：并排对照与高亮（服务端真实的差异输出）', async () => {
   const { page, errors } = await preview('dual-check-approval')
   await page.waitForSelector('[data-dual-check][data-state="ready"]')
   const gmv = metric(page, 'gmv')
@@ -221,33 +279,202 @@ await section('审批卡：并排对照与高亮', async () => {
   const blind = gmv.locator('[data-dual-sql="blind"]')
   check('两条 SQL 都在，各标是哪一边', (await text(orig)).includes('paid_at') && (await text(blind)).includes('created_at')
     && (await text(gmv.locator('[data-dual-pair]'))).includes('原流程的 SQL') && (await text(gmv.locator('[data-dual-pair]'))).includes('盲算的 SQL'))
-  const marks = await gmv.evaluate((el) => ({
-    del: [...el.querySelectorAll('[data-dual-sql="original"] [data-diff-line="del"]')].map((m) => m.textContent.trim()),
-    add: [...el.querySelectorAll('[data-dual-sql="blind"] [data-diff-line="add"]')].map((m) => m.textContent.trim()),
-  }))
-  check('text_diff 的行在原流程那边高亮', marks.del.join('|') === "WHERE paid_at >= '2026-09-01'|AND paid_at < '2026-09-08'", marks.del.join('|'))
+  // 夹具的 text_diff 是 explain_sql_diff 的真实输出：规范化后列名带表名、两个条件并成一行，和原文的任何一行都对不上
+  const real = sidesOf(fx.card.metrics[0].diff)
+  const rawLines = new Set(fx.card.metrics[0].original.inputs[0].sql.split('\n').map((l) => l.trim()))
+  check('（夹具）text_diff 是规范化后的行，和原文逐行对不上', real.del.length > 0 && !real.del.some((l) => rawLines.has(l)), real.del.join(' | '))
+  const marks = await marksIn(gmv)
+  check('原文按行比：不同的行在原流程那边高亮', marks.del.join('|') === "WHERE paid_at >= '2026-09-01'|AND paid_at < '2026-09-08'", marks.del.join('|'))
   check('……在盲算那边也高亮', marks.add.join('|') === "WHERE created_at >= '2026-09-01'|AND created_at < '2026-09-08'", marks.add.join('|'))
   check('……相同的行不高亮', !(await orig.locator('[data-diff-line]').allInnerTexts()).some((t) => t.includes('FROM orders')))
+  check('text_diff 的行分两栏高亮：原流程一栏是「- 」行', marks.normDel.join('|') === real.del.join('|'), marks.normDel.join('|'))
+  check('……盲算一栏是「+ 」行', marks.normAdd.join('|') === real.add.join('|'), marks.normAdd.join('|'))
+  const hl = await gmv.locator('[data-dual-norm] [data-diff-line]').first().evaluate((el) => getComputedStyle(el).backgroundColor)
+  check('……高亮行有底色', !!hl && hl !== 'rgba(0, 0, 0, 0)' && hl !== 'transparent', hl)
   const o = await orig.boundingBox()
   const b = await blind.boundingBox()
   check('宽栏里左右并排：同一行、盲算在右边', !!o && !!b && Math.abs(o.y - b.y) < 2 && b.x >= o.x + o.width - 1, JSON.stringify({ o, b }))
+  const no = await gmv.locator('[data-dual-norm="original"]').boundingBox()
+  const nb = await gmv.locator('[data-dual-norm="blind"]').boundingBox()
+  check('……规范化后的两栏也左右并排', !!no && !!nb && Math.abs(no.y - nb.y) < 2 && nb.x >= no.x + no.width - 1, JSON.stringify({ no, nb }))
   check('盲算的说明', (await text(gmv.locator('[data-dual-rationale]'))).includes('销售额按下单时间统计本周全部订单金额之和'))
   check('输入取值：路径、两边的值', (await text(gmv.locator('[data-dual-input="vars.kpi.gmv"]'))).includes('45,678.5')
     && (await text(gmv.locator('[data-dual-input="vars.kpi.gmv"]'))).includes('51,388.3'))
-  const lines = await gmv.locator('[data-dual-text-diff] [data-diff-side]').evaluateAll((els) => els.map((e) => e.dataset.diffSide))
-  check('规范化后不同的行另列一份，每行标是哪一边', lines.join(',') === 'original,original,blind,blind', lines.join(','))
   const rr = metric(page, 'refund_rate')
   check('两个输入、只有一个不同：只对照不同的那一个', (await rr.locator('[data-dual-pair]').evaluateAll((els) => els.map((e) => e.dataset.dualPair))).join(',')
     === 'vars.kpi.refunds')
   check('……输入取值两项都列，不同的那项标出来', await rr.locator('[data-dual-input]').count() === 2
     && await rr.locator('[data-dual-input="vars.kpi.refunds"][data-differs]').count() === 1
     && await rr.locator('[data-dual-input="vars.kpi.orders"][data-differs]').count() === 0)
-  // 原流程那条规范化后多了 AS，和原文对不上：不乱标；盲算那条规范化后和原文一字不差：照样高亮
-  check('……一行写完的 SQL：规范化后对不上原文的不乱标，对得上的照样高亮', await rr.locator('[data-dual-sql="original"] [data-diff-line]').count() === 0
-    && await rr.locator('[data-dual-sql="blind"] [data-diff-line="add"]').count() === 1)
-  check('……规范化后不同的行照样另列', await rr.locator('[data-dual-text-diff] [data-diff-side]').count() === 2)
+  // 退款这一项两边写法差得多（EXISTS 对 IN）：原文只有前两行相同，其余各自高亮；规范化后的行照样分两栏
+  const rm = await marksIn(rr)
+  const rreal = sidesOf(fx.card.metrics[1].diff)
+  check('……原文按行比：相同的前两行不标，其余各自高亮', rm.del.length === 4 && rm.add.join('|') === 'WHERE r.order_id IN (SELECT id FROM orders)'
+    && !rm.del.concat(rm.add).some((t) => t.startsWith('SELECT COUNT') || t.startsWith('FROM refunds')), `${rm.del.join('|')} ‖ ${rm.add.join('|')}`)
+  check('……规范化后的行两栏各自高亮（「- 」「+ 」交错给的也分得开）', rm.normDel.join('|') === rreal.del.join('|') && rm.normAdd.join('|') === rreal.add.join('|'),
+    `${rm.normDel.join('|')} ‖ ${rm.normAdd.join('|')}`)
   await page.keyboard.press('Enter')
   check('再按一次回车收起', (await toggle.getAttribute('aria-expanded')) === 'false' && await gmv.locator('[data-dual-compare]').count() === 0)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+/**
+ * 把「销售额」换成 variants 里的一对 SQL 及其真实的差异说明（取值照旧不同），别的指标原样；diff 给了就用给的
+ * （拼几个输入的、兜底的原话）
+ */
+function cardWith(name, patch = {}) {
+  const v = fx.variants[name]
+  const card = JSON.parse(JSON.stringify(fx.card))
+  const gmv = card.metrics[0]
+  gmv.original.inputs[0].sql = v?.sql[0] ?? gmv.original.inputs[0].sql
+  gmv.blind.inputs[0].sql = v?.sql[1] ?? gmv.blind.inputs[0].sql
+  gmv.diff = JSON.parse(JSON.stringify(v?.diff ?? gmv.diff))
+  Object.assign(gmv, patch.metric ?? {})
+  if (patch.diff) gmv.diff = patch.diff
+  return async () => ({ json: { id: CARD_ID, content: card } })
+}
+
+await section('审批卡：「记入数据目录」只在服务端真会写的形状下说', async () => {
+  // dual_check_facts.derive 的门槛：只有一个输入对不上、恰好一条具体差异、没有兜底，而且这一条是时间列、筛选条件或聚合
+  const cases = [
+    ['time_range', null, '只差时间范围（不是换了时间列）'],
+    ['two_filters', null, '差两个筛选条件'],
+    ['join', null, '差在关联方式'],
+    ['parse', null, '一边解析失败'],
+    ['filter_extra', '有效记录条件', '只差一个筛选条件'],
+    ['dedup', '去重规则', '只差去不去重'],
+  ]
+  for (const [name, want, what] of cases) {
+    const { page, errors } = await preview('dual-check-approval', { artifact: cardWith(name) })
+    await page.waitForSelector('[data-dual-check][data-state="ready"]')
+    const gmv = metric(page, 'gmv')
+    const note = await text(gmv.locator('[data-dual-catalog]'))
+    check(want ? `${what}：说明会记成该表的${want}` : `${what}：不说会记入数据目录`, want ? note.includes(want) && note.includes('记入数据目录') : !note,
+      note || '（无）')
+    if (name === 'filter_extra') check('……筛选条件只在条件只有一边有、且采用了有它的一边时才记，照实说', note.includes('只有一边有') && note.includes('采用有它的一边'), note)
+    if (name === 'two_filters') {
+      check('……两条差异都列出来', await gmv.locator('[data-dual-diff-item]').count() === 2)
+    }
+    const diff = fx.variants[name].diff
+    if (diff.text_diff.length) {
+      await gmv.locator('[data-dual-compare-toggle]').click()
+      const m = await marksIn(gmv)
+      const real = sidesOf(diff)
+      check(`……规范化后的行按真实输出分两栏高亮（${real.del.length} + ${real.add.length} 行）`,
+        m.normDel.join('|') === real.del.join('|') && m.normAdd.join('|') === real.add.join('|'), `${m.normDel.join('|')} ‖ ${m.normAdd.join('|')}`)
+      if (!real.add.length) {
+        check('……一边没有不同的行时照实说', (await text(gmv.locator('[data-dual-norm="blind"]'))).includes('没有不同的行'))
+      }
+    }
+    check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
+
+  // 几个输入都差在时间列：节点把两处的差异合成一份（每条前面写明是哪个输入），不止一条，不写目录
+  const t = fx.variants.time_range.diff.items[0]
+  const merged = {
+    equivalent: false, fallback: false, text_diff: fx.card.metrics[0].diff.text_diff,
+    items: [{ aspect: 'time', text: `输入「gmv_web」：${fx.card.metrics[0].diff.items[0].text}` }, { aspect: 'time', text: `输入「gmv_app」：${t.text}` }],
+  }
+  const two = await preview('dual-check-approval', { artifact: cardWith(null, { diff: merged }) })
+  await two.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  check('几个输入都差在同一方面（合并后两条）：不说会记入数据目录', await metric(two.page, 'gmv').locator('[data-dual-catalog]').count() === 0)
+})
+
+await section('审批卡：只有解析失败、兜底原话另有原因时', async () => {
+  // 只有解析失败：和摘要阶段（服务端把它算作兜底）说法一致，默认展开对照，解析的原话附在下面
+  const { page } = await preview('dual-check-approval', { artifact: cardWith('parse') })
+  await page.waitForSelector('[data-dual-check][data-state="ready"]')
+  const gmv = metric(page, 'gmv')
+  check('只有解析失败：写那句固定的兜底说明，不当成一条具体差异', (await text(gmv.locator('[data-dual-fallback]'))) === '两条 SQL 的写法不同，未能归纳成具体差异'
+    && await gmv.locator('[data-dual-diff-item]').count() === 0)
+  check('……解析的原话附在下面', (await text(gmv.locator('[data-dual-fallback-note]'))).includes('盲算：SQL 无法解析'))
+  check('……默认展开对照', (await gmv.locator('[data-dual-compare-toggle]').getAttribute('aria-expanded')) === 'true')
+
+  // 有一边没有 SQL（节点的原话「有一边没有可比较的 SQL」）：不能再说「两条 SQL 的写法不同」
+  const noSql = { equivalent: false, fallback: true, text_diff: [], items: [{ aspect: 'other', text: '有一边没有可比较的 SQL，请对照原文' }] }
+  const card = cardWith(null, { diff: noSql })
+  const lone = await preview('dual-check-approval', {
+    artifact: async () => {
+      const out = await card()
+      out.json.content.metrics[0].blind.inputs[0].sql = null
+      return out
+    },
+  })
+  await lone.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  const g2 = metric(lone.page, 'gmv')
+  const said = await text(g2.locator('[data-dual-fallback]'))
+  check('一边没有 SQL：照节点的原话说，不写「两条 SQL 的写法不同」', said === '有一边没有可比较的 SQL' && !(await text(g2)).includes('写法不同'), said)
+  check('……盲算那一栏写没有记录 SQL', (await text(g2.locator('[data-dual-sql="blind"]'))) === '没有记录 SQL')
+
+  // 比较超时：固定那句之外附上原因
+  const slow = { equivalent: false, fallback: true, text_diff: fx.card.metrics[0].diff.text_diff,
+    items: [{ aspect: 'other', text: '两条 SQL 比较超时，未能归纳成具体差异，请对照原文' }] }
+  const late = await preview('dual-check-approval', { artifact: cardWith(null, { diff: slow }) })
+  await late.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  const g3 = metric(late.page, 'gmv')
+  check('比较超时：固定那句之外附上原因（去掉「请对照原文」）', (await text(g3.locator('[data-dual-fallback]'))) === '两条 SQL 的写法不同，未能归纳成具体差异'
+    && (await text(g3.locator('[data-dual-fallback-note]'))) === '两条 SQL 比较超时，未能归纳成具体差异', await text(g3.locator('[data-dual-fallback-note]')))
+})
+
+/** 运行的图快照里双盲复算节点的「未采用原流程时」写成 value（undefined 是没写） */
+const graphWith = (value) => async () => {
+  const graph = JSON.parse(JSON.stringify(fx.graph))
+  const dc = graph.nodes.find((n) => n.id === 'dc')
+  dc.data.config = { ...dc.data.config, ...(value === undefined ? {} : { on_reject: value }) }
+  return { json: { graph, workflow_id: null, version: null } }
+}
+
+await section('审批卡：后果和提交后的提示按节点的「未采用原流程时」说', async () => {
+  // 判为失败：采用盲算或都不对会让运行终止，卡上只说这一种，提交后的提示也照实说
+  const fail = await preview('dual-check-approval', { graph: graphWith('fail') })
+  await fail.page.waitForSelector('[data-dual-consequence][data-on-reject="fail"]')
+  const said = await text(fail.page.locator('[data-dual-consequence]'))
+  check('判为失败：后果写明采用盲算或都不对时运行将终止，不再说出具降档', said.includes('运行将终止') && !said.includes('降档') && !said.includes('如节点'), said)
+  for (const id of ['gmv', 'refund_rate']) await metric(fail.page, id).locator('label', { hasText: '采用原流程的结果' }).click()
+  await metric(fail.page, 'gmv').locator('label', { hasText: '采用盲算的结果' }).click()
+  await fail.page.locator('[data-dual-submit]').click()
+  await fail.page.waitForFunction(() => window.__dualResolved != null)
+  await fail.page.waitForFunction(() => document.querySelector('[role="status"][aria-live="polite"]')?.textContent?.includes('已提交裁决'))
+  const failToast = await toastOf(fail.page)
+  check('……提交后的提示：运行将终止，不说「运行继续」', failToast.includes('已提交裁决，运行将按节点设置终止') && !failToast.includes('运行继续'), failToast)
+
+  // 判为失败但全选原流程：照常继续
+  const ok = await preview('dual-check-approval', { graph: graphWith('fail') })
+  await ok.page.waitForSelector('[data-dual-consequence][data-on-reject="fail"]')
+  for (const id of ['gmv', 'refund_rate']) await metric(ok.page, id).locator('label', { hasText: '采用原流程的结果' }).click()
+  await ok.page.locator('[data-dual-submit]').click()
+  await ok.page.waitForFunction(() => window.__dualResolved != null)
+  await ok.page.waitForFunction(() => document.querySelector('[role="status"][aria-live="polite"]')?.textContent?.includes('已提交裁决'))
+  check('……全部采用原流程：提示运行继续', (await toastOf(ok.page)) === '已提交裁决，运行继续', await toastOf(ok.page))
+
+  // 图快照取不到（老运行、接口出错）：两种处置都可能，有条件地说；提交后的提示不说继续还是终止
+  const lost = await preview('dual-check-approval', { graph: async () => ({ status: 404, json: { detail: '运行不存在' } }) })
+  await lost.page.waitForSelector('[data-dual-consequence][data-on-reject="unknown"]')
+  const maybe = await text(lost.page.locator('[data-dual-consequence]'))
+  check('取不到节点设置：降档那句之外，有条件地说判为失败会终止', maybe.includes('出具降档') && maybe.includes('如节点的「未采用原流程时」设为「判为失败」'), maybe)
+  for (const id of ['gmv', 'refund_rate']) await metric(lost.page, id).locator('label', { hasText: '两边都不对' }).click()
+  await lost.page.locator('[data-dual-submit]').click()
+  await lost.page.waitForFunction(() => window.__dualResolved != null)
+  await lost.page.waitForFunction(() => document.querySelector('[role="status"][aria-live="polite"]')?.textContent?.includes('已提交裁决'))
+  const toast = await toastOf(lost.page)
+  check('……提交后的提示不替节点下结论', toast === '已提交裁决', toast)
+})
+
+await section('审批卡：认不出任何指标时留一个出口', async () => {
+  const { page, sent, errors } = await preview('dual-check-approval-empty', {
+    artifact: async () => ({ json: { id: CARD_ID, content: { metrics: [], model: null, same_model: false } } }),
+  })
+  await page.waitForSelector('[data-dual-check][data-state="ready"]')
+  check('写明没有可以裁决的指标', (await text(page.locator('[data-dual-empty]'))).includes('没有可以裁决的指标'))
+  check('……没有提交裁决的按钮', await page.locator('[data-dual-submit]').count() === 0)
+  const reject = page.locator('[data-dual-reject]')
+  check('……给一个「驳回并终止」，说清后果', (await text(reject)) === '驳回并终止' && (await text(page.locator('[data-dual-check]'))).includes('运行终止'))
+  await page.locator('[data-dual-note]').fill('审批内容缺失，重新运行')
+  await reject.click()
+  await page.waitForFunction(() => window.__dualResolved != null)
+  const body = sent.find((s) => s.path === `/api/approvals/${AP.id}/decide`)?.body
+  check('……驳回：approved 为假、带上备注，不带 value', body?.approved === false && body.note === '审批内容缺失，重新运行' && !('value' in body), JSON.stringify(body))
+  check('……提示已驳回、运行终止', (await text(page.locator('body'))).includes('已驳回，本次运行终止'))
   check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
@@ -367,11 +594,11 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
  * 检查器用例：设置（相对误差、启用的「跟随设置」要写出眼下的值）按夹具答，改配置触发的校验、变量分析回空，
  * 节点配置直接从 studio store 读（window.__studio，开发服务器才挂）
  */
-async function inspector(opts = {}) {
+async function inspector({ verify = () => fx.verify, ...opts } = {}) {
   const out = await preview('dual-check-inspector', {
     ...opts,
     extra: (req, url) => {
-      if (req.method() === 'GET' && url.pathname === '/api/settings') return { json: { run: {}, verify: fx.verify } }
+      if (req.method() === 'GET' && url.pathname === '/api/settings') return { json: { run: {}, verify: verify() } }
       if (req.method() === 'POST' && url.pathname === '/api/workflows/validate') return { json: { issues: [] } }
       if (req.method() === 'POST' && url.pathname === '/api/workflows/variables') return { json: { variables: [], issues: [] } }
       return null
@@ -396,6 +623,14 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   const panel = page.locator('[data-dual-inspector]')
   check('说明里不再写「功能开发中」', !(await text(panel)).includes('功能开发中') && (await text(panel)).includes('另起一路独立计算'))
   check('节点卡片的摘要：复算哪张口径卡、全部几个指标', await summaryOf(page) === '复算「周报口径卡」 · 全部 3 个指标', await summaryOf(page))
+  // 字段名就是服务端校验报错里写的叫法（上面「叫法」一节和 schema.py 比过）
+  const { DUAL_CHECK_TEXT: D } = await import(await load('/src/lib/terms.ts'))
+  const shown = {}
+  for (const k of ['card', 'metrics', 'definitions', 'provider', 'model', 'on_reject', 'enabled']) {
+    shown[k] = (await page.locator(`[data-field="${k}"] label`).first().innerText()).trim()
+  }
+  const misnamed = Object.entries(shown).filter(([k, v]) => v !== D.field[k])
+  check('检查器上的字段名用 DUAL_CHECK_TEXT.field 的叫法', !misnamed.length, misnamed.map(([k, v]) => `${k}：${v} ≠ ${D.field[k]}`).join('；'))
 
   // 口径卡：下拉选画布上的口径卡，上游的一组、其余的一组；留空取上游的那张
   const card = page.locator('[data-field="card"] select')
@@ -459,13 +694,16 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   await enabled.locator('[data-value="follow"]').click()
   check('跟随设置：enabled 去掉，不留 null', (await config(page)).enabled === undefined, JSON.stringify(await config(page)))
 
-  // 不采用原流程时
+  // 未采用原流程时
   const reject = page.locator('[data-field="on_reject"] select')
-  check('不采用原流程时：默认落在「记为出具缺口」上', (await reject.locator('option:checked').innerText()) === '记为出具缺口，出具降档（默认）')
+  check('未采用原流程时：默认落在「计入缺口、出具降档」上', (await reject.locator('option:checked').innerText()) === '计入缺口、出具降档（默认）')
   await reject.selectOption('fail')
   check('……选判为失败：on_reject 为 fail', (await config(page)).on_reject === 'fail')
 
-  // 高级：盲算模型、相对误差
+  // 盲算模型不在高级选项里：时间线「模型相同」那一行的「打开设置」要能直接定位到它（高级选项收着时定位不到）
+  check('盲算模型的接入和模型不用展开高级选项就能看到', await page.locator('[data-field="provider"] select').isVisible()
+    && await page.locator('[data-field="model"] input').isVisible() && await page.locator('[data-field="tolerance"]').count() === 0)
+  // 高级：相对误差
   await page.locator('button', { hasText: '高级选项' }).click()
   const provider = page.locator('[data-field="provider"] select')
   check('盲算模型 · 接入：留空跟随设置，停用的接入照实标出', (await provider.locator('option').allInnerTexts()).join('|') === '跟随设置|云端接入|备用接入（已停用）',
@@ -493,6 +731,39 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   check('没有写库的请求', !sent.some((s) => s.blocked), JSON.stringify(sent.filter((s) => s.blocked)))
   check('页面没有报错', errors.length === 0, errors.join('；'))
   await shot(page, 'inspector-dark')
+})
+
+await section('检查器：上游有几张口径卡时必须选；「跟随设置」的当前值每次打开都重取', async () => {
+  let verifyNow = fx.verify
+  const { page, errors } = await inspector({ verify: () => verifyNow })
+  // 月报口径卡也接到双盲复算上游：服务端校验要求选一张（不选会挡住发起运行），不是「建议」
+  await page.evaluate(() => window.__studio.setState((s) => ({
+    edges: [...s.edges, { ...s.edges.find((e) => e.id === 'e4'), id: 'e-card2', source: 'card2' }],
+  })))
+  const card = page.locator('[data-field="card"] select')
+  await page.waitForFunction(() => document.querySelector('[data-field="card"] select option')?.textContent?.includes('2 张'))
+  check('上游两张：留空那一项写明要选，不说「建议」', (await card.locator('option').first().innerText()) === '请选择要复算的口径卡（上游有 2 张）'
+    && !(await text(page.locator('[data-field="card"]'))).includes('建议'), await card.locator('option').first().innerText())
+  check('……下面用提醒色写明必须选一张', (await text(page.locator('[data-dual-card-warn]'))) === '上游有 2 张口径卡，请选择要复算的那一张')
+  const many = await summaryBecomes(page, '复算上游的口径卡 · 上游有 2 张，请指定')
+  check('……节点卡片的摘要也这么说', many.ok, many.seen)
+  await card.selectOption('card')
+  check('……选了一张：提醒收起', await page.locator('[data-dual-card-warn]').count() === 0 && (await config(page)).card === 'card')
+
+  // 去设置里关掉双盲复算、改了相对误差，再回到画布打开这个节点：「跟随设置」写的是新的值
+  const enabled = page.locator('[data-field="enabled"] [role="radio"][data-value="follow"]')
+  check('打开时：跟随设置（当前开启）', (await text(enabled)) === '跟随设置（当前开启）', await text(enabled))
+  verifyNow = { ...fx.verify, dual_check: { ...fx.verify.dual_check, enabled: false, tolerance: 0.01 } }
+  await page.evaluate(() => window.__studio.setState({ selectedId: null }))
+  await page.waitForSelector('[data-field="enabled"]', { state: 'detached' })
+  await page.evaluate(() => window.__studio.setState({ selectedId: 'dc' }))
+  await page.waitForFunction(() => document.querySelector('[data-field="enabled"] [data-value="follow"]')?.textContent === '跟随设置（当前关闭）', null, { timeout: 3000 })
+    .catch(() => {})
+  check('再打开：重取设置，写当前关闭', (await text(enabled)) === '跟随设置（当前关闭）', await text(enabled))
+  await page.locator('button', { hasText: '高级选项' }).click()
+  check('……相对误差的占位也是新值', await page.locator('[data-field="tolerance"] input').getAttribute('placeholder') === '跟随设置（0.01）',
+    await page.locator('[data-field="tolerance"] input').getAttribute('placeholder'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
 await section('检查器：360px 栏、390px 窄屏不横向溢出，深浅色可读', async () => {

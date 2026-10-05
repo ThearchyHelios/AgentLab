@@ -95,24 +95,27 @@ export function dualCheckSummary({ id, config, nodes, edges }: NodeSummaryContex
 // ---------------------------------------------------------------- 设置里的默认值
 
 /**
- * 设置里核查一组的值：相对误差、启用的「跟随设置」要写出眼下是多少。整个会话取一次（同检查器的运行默认值），
- * 取不到就不写，不挡编辑
+ * 设置里核查一组的值：相对误差、启用的「跟随设置」要写出现在是多少。每次打开检查器都重取一次——去设置页关掉双盲
+ * 复算、改了误差再回到画布，这里得是新值（不同于检查器的运行默认值，核查开关是常改的）。先用上次取到的画，免得
+ * 闪一下；同一次打开里的几个字段共用一个请求；取不到就沿用上次的（没有就不写），不挡编辑
  */
 let verifyPending: Promise<VerifySettings | null> | null = null
 let verifyValue: VerifySettings | null | undefined
+function fetchVerify(): Promise<VerifySettings | null> {
+  verifyPending ??= api.settings.get().then(
+    (s) => (verifyValue = isRecord(s?.verify) ? s.verify as VerifySettings : null),
+    () => verifyValue ?? null,
+  ).finally(() => { verifyPending = null })
+  return verifyPending
+}
 function useVerifyDefaults(): VerifySettings | null {
   const [value, setValue] = useState<VerifySettings | null>(verifyValue ?? null)
   useEffect(() => {
-    if (verifyValue !== undefined) return
-    verifyPending ??= api.settings.get().then(
-      (s) => (verifyValue = isRecord(s?.verify) ? s.verify as VerifySettings : null),
-      () => { verifyPending = null; return null },   // 这次没取到，下次打开再试
-    )
     let alive = true
-    void verifyPending.then((v) => { if (alive) setValue(v) })
+    void fetchVerify().then((v) => { if (alive) setValue(v) })
     return () => { alive = false }
   }, [])
-  return verifyValue ?? value
+  return value
 }
 
 /** 字段下面的一行提醒（所选口径卡不在上游之类），提醒色 */
@@ -144,6 +147,8 @@ function CardField({ id, nodeId, value, invalid, describedBy, onChange }: FieldR
         {/* 写着的卡已经不在画布上：照实列出来（不让它看着像「默认」），下面再说一句 */}
         {current && !known && <option value={current}>{T.cardGone(current)}</option>}
       </select>
+      {/* 上游有好几张又没选：服务端校验会挡住发起运行，用提醒色写明要选 */}
+      {!current && upstream.length > 1 && <Warn attr="data-dual-card-warn">{T.cardChoose(upstream.length)}</Warn>}
       {current && known && !upstream.some((n) => n.id === current) && <Warn attr="data-dual-card-warn">{T.cardNotUpstream}</Warn>}
       {current && !known && <Warn attr="data-dual-card-warn">{T.cardMissing(current)}</Warn>}
     </>
@@ -163,7 +168,7 @@ function MetricsField({ id, nodeId, value, config, describedBy, onChange }: Fiel
   if (!target.node || metrics === undefined) {
     return (
       <div id={id} className="text-2xs leading-snug text-faint" aria-describedby={describedBy} data-dual-metrics="none">
-        {target.upstream.length > 1 && !target.card ? T.summary.many(target.upstream.length) : T.metricsNoCard}
+        {target.upstream.length > 1 && !target.card ? T.cardChoose(target.upstream.length) : T.metricsNoCard}
       </div>
     )
   }

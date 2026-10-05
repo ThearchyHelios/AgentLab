@@ -3347,15 +3347,20 @@ export const DUAL_CHECK_TEXT = {
   blind: '盲算',
 
   // ---- 检查器（nodeDefs 的 dual_check、canvas/DualCheckFields.tsx）
+  /**
+   * 字段名，键就是配置键。服务端校验和报错引用的是同一套叫法（schema.py 的 DUAL_CHECK_FIELD_LABEL，check-verify 在
+   * 服务端合入后逐项比对）：问题挂在字段下面、出现在问题面板里时，人才找得到是哪一项。模型两项照「裁判模型 · 接入」
+   * 「裁判模型」的写法
+   */
   field: {
-    card: '要复算的口径卡',
+    card: '口径卡',
     metrics: '复算的指标',
     definitions: '口径说明',
     provider: '盲算模型 · 接入',
-    model: '盲算模型 · 模型',
+    model: '盲算模型',
     tolerance: '允许的相对误差',
-    onReject: '审核人不采用原流程的结果时',
-    enabled: '启用',
+    on_reject: '未采用原流程时',
+    enabled: '启用双盲复算',
   },
   help: {
     card: '留空则复算上游的口径卡。只能复算本节点上游的口径卡：运行到本节点时，它的结果已经算出',
@@ -3365,12 +3370,16 @@ export const DUAL_CHECK_TEXT = {
     model: '接入和模型均未填写时，使用「设置 → 偏好设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，'
       + '不与设置合并。建议与原流程使用的模型不同，同一模型不易发现自身的错误',
     tolerance: '两边的值相差不超过这个比例时算一致，例如 0.001 表示千分之一，0 表示必须完全相同。留空则使用设置中的值',
-    onReject: '盲算与原流程不一致时运行暂停，由审核人逐个指标选择采用哪一边。选择「采用盲算的结果」或「两边都不对」时按这里处理',
+    on_reject: '盲算与原流程不一致时运行暂停，由审核人逐个指标选择采用哪一边。选择「采用盲算的结果」或「两边都不对」时按这里处理',
     enabled: '关闭时本节点不复算，直接放行，并在时间线上记录一条说明',
   },
-  /** 口径卡下拉留空那一项：上游没有、只有一张、有好几张 */
+  /**
+   * 口径卡下拉留空那一项：上游没有、只有一张、有好几张。好几张时服务端校验要求选一张（不选会挡住发起运行），
+   * 写成要选，不写「建议」
+   */
   cardDefault: (name: string | null, upstream: number) => (upstream === 0 ? '默认：上游的口径卡（上游没有口径卡）'
-    : upstream === 1 && name ? `默认：上游的口径卡「${name}」` : `默认：上游的口径卡（共 ${upstream} 张，建议指定）`),
+    : upstream === 1 && name ? `默认：上游的口径卡「${name}」` : `请选择要复算的口径卡（上游有 ${upstream} 张）`),
+  cardChoose: (n: number) => `上游有 ${n} 张口径卡，请选择要复算的那一张`,
   cardUpstream: '上游的口径卡',
   cardOther: '其他口径卡（需连接到本节点上游）',
   /** 画布上一张口径卡的叫法：节点名，口径名不同时附在后面 */
@@ -3411,10 +3420,11 @@ export const DUAL_CHECK_TEXT = {
   },
   tolerancePlaceholder: (v: number | null | undefined) => (v == null ? '跟随设置' : `跟随设置（${v}）`),
   toleranceInvalid: '请填写不小于 0 的数',
-  onReject: { degrade: '记为出具缺口，出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
+  /** 选项以服务端报错里的短说法（schema.py 的 DUAL_CHECK_ON_REJECT_LABEL）开头，后面可以带一句用途 */
+  onReject: { degrade: '计入缺口、出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
   onRejectUnknown: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
   enabled: { follow: '跟随设置', on: '开启', off: '关闭' },
-  /** 「跟随设置」那一项附上设置里眼下是开是关（设置还没取回来就不附） */
+  /** 「跟随设置」那一项附上设置里现在是开是关（设置还没取到就不附） */
   enabledFollow: (on: boolean | null | undefined) => (on == null ? '跟随设置' : `跟随设置（当前${on ? '开启' : '关闭'}）`),
 
   // ---- 节点卡片的摘要：复算哪张卡、几个指标
@@ -3436,6 +3446,7 @@ export const DUAL_CHECK_TEXT = {
     deltaZero: '原流程值为 0，无法计算相差比例',
     deltaHint: '相差比例 =（盲算值 − 原流程值）÷ |原流程值|',
     diffHead: '差异说明',
+    /** 一条具体差异都没有时的固定说法（服务端兜底说明的前半句）；兜底的原话另有原因（比较超时、解析失败）时附在下面 */
     fallbackOnly: '两条 SQL 的写法不同，未能归纳成具体差异',
     equivalent: '两条 SQL 的写法等价，差异出在取用的结果上，请对照两边取用的值',
     loading: '正在加载完整对照…',
@@ -3448,8 +3459,19 @@ export const DUAL_CHECK_TEXT = {
     source: (s: string) => `数据源 ${s}`,
     inputs: '输入取值',
     textDiff: '规范化后不同的行',
+    textDiffNone: '这一边没有不同的行',
     rationale: '盲算的说明',
-    catalog: '两边只差一个方面：选择任一边的结果后，这项口径会作为已确认的事实记入数据目录',
+    /**
+     * 两边只差一处、又可能对得上数据目录里的一项事实时，提交前说清选择会被记下来（门槛同服务端的 dual_check_facts：
+     * 只有一个输入对不上、恰好一条差异、没有兜底，而且是时间列、筛选条件或聚合）。一边多出条件、只差去不去重、目录里
+     * 已有人工确认的说法这几条只有服务端查得了，所以有条件地说，以时间线上的记录为准。卡上是「方面那句 + tail」
+     */
+    catalog: {
+      time: '两边只差在按哪一列筛时间：采用一边的结果后，这一边筛时间所用的列会作为该表的业务日期',
+      filter: '两边只差一个筛选条件：若这个条件只有一边有，采用有它的一边时，它会作为该表的有效记录条件',
+      aggregate: '两边只差在聚合方式：若只差是否去重，采用一边的结果后，它的做法会作为该表的去重规则',
+      tail: '，以人工确认的事实记入数据目录。选「两边都不对」时不记，数据目录中已有人工确认的不同说法时不覆盖，以时间线上的记录为准',
+    },
     choices: { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' } as Record<'a' | 'b' | 'neither', string>,
     choiceGroup: (name: string) => `「${name}」采用哪一边的结果`,
     /** 三个选择的后果，按运行类别说：探索运行不出具，不提出具；老服务端没给类别的照实说「正式运行」 */
@@ -3458,13 +3480,27 @@ export const DUAL_CHECK_TEXT = {
       : runClass === 'exploratory'
         ? '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口'
         : '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口，正式运行的出具随之降档'),
-    consequenceFail: '节点设为「判为失败」时，选择后两项会终止运行',
+    /**
+     * 节点的「未采用原流程时」设为判为失败（从这次运行的图快照里读到的）：采用盲算或都不对时节点失败、运行终止，
+     * 不再说出具降档
+     */
+    consequenceFail: '采用原流程的结果：沿用原流程的值，运行继续。采用盲算的结果或两边都不对：节点的「未采用原流程时」'
+      + '设为「判为失败」，提交后运行将终止',
+    /** 读不到节点怎么设的（图快照取不到、节点在子工作流里）：降档那句后面有条件地补一句 */
+    consequenceMaybeFail: '如节点的「未采用原流程时」设为「判为失败」，选择后两项会终止运行',
     note: '备注（可选）',
     notePlaceholder: '说明裁决的依据，会随裁决记入运行记录',
     submit: '提交裁决',
     pending: (n: number) => `还有 ${n} 个指标未选择`,
+    /** 提交后的提示：全采用原流程、或节点按缺省处置时运行继续；判为失败时运行终止；读不到节点设置时不下结论 */
     done: '已提交裁决，运行继续',
+    doneFail: '已提交裁决，运行将按节点设置终止',
+    doneUnknown: '已提交裁决',
     empty: '审批内容不完整，没有可以裁决的指标',
+    /** 认不出任何指标时留的出口：驳回后节点按人工驳回失败 */
+    reject: '驳回并终止',
+    emptyReject: '驳回后节点失败，本次运行终止。可以在备注中说明原因',
+    rejected: '已驳回，本次运行终止',
   },
 
   // ---- 时间线（run/decode.ts explainLog）：按日志的 code 和结构化字段说，不从原话里认
@@ -3476,7 +3512,7 @@ export const DUAL_CHECK_TEXT = {
   limitDailyNext: '今日核查费用已达上限。请在「设置 → 偏好设置 → 核查」中调高每日金额上限，或等到次日再运行',
   log: {
     skippedDisabled: '双盲复算未启用，已跳过',
-    skippedDisabledNext: '如需复算，请在节点的「启用」中选择「开启」，或在「设置 → 偏好设置 → 核查」中启用双盲复算',
+    skippedDisabledNext: '如需复算，请在节点的「启用双盲复算」中选择「开启」，或在「设置 → 偏好设置 → 核查」中启用双盲复算',
     skippedNoInputs: '没有输入来自查询的指标，已跳过复算',
     skippedNoInputsNext: '双盲复算只复算输入来自查询结果的指标。请检查节点的「复算的指标」，或确认口径卡的输入取自查询',
     skipped: '双盲复算已跳过',
@@ -3491,19 +3527,30 @@ export const DUAL_CHECK_TEXT = {
     resolvedB: (n: number) => `采用盲算 ${formatNumber(n)} 个`,
     resolvedNeither: (n: number) => `两边都不对 ${formatNumber(n)} 个`,
     gaps: (n: number) => (n ? `${formatNumber(n)} 项记为缺口` : '没有缺口'),
-    catalog: (n: number) => `已将 ${formatNumber(n)} 项裁决记入数据目录`,
-    catalogNone: '裁决未记入数据目录',
+    catalog: (n: number) => `已将 ${formatNumber(n)} 项人工确认的事实记入数据目录`,
+    catalogNone: '本次裁决未写入数据目录',
+    /**
+     * 写进数据目录的一项：「orders」（shop）的业务日期。item 是目录项的中文叫法（认不出的键不传，只写表）；
+     * 老版本给的一句中文也从这里过
+     */
+    catalogItem: (table?: string, source?: string, item?: string) => {
+      const where = table ? `「${table}」${source ? `（${source}）` : ''}` : ''
+      return where && item ? `${where}的${item}` : where || item || ''
+    },
     catalogSkipped: (n: number) => `${formatNumber(n)} 项未写入`,
     catalogNext: '可在「数据 → 数据目录」中查看或修改',
-    limit: (label: string, metric?: string) => (metric ? `复算指标「${metric}」时已达${label}，该指标未完成盲算` : `双盲复算已达${label}`),
+    /** metric 是指标 ID（服务端日志只带 ID，中文名在原话里），不当名字加引号 */
+    limit: (label: string, metric?: string) => (metric ? `指标 ${metric} 的盲算已达${label}，按无法复算处理` : `双盲复算已达${label}`),
     limitNext: '请在「设置 → 偏好设置 → 核查」中调高双盲复算的上限',
   },
   /** 反方审稿日志的时间线说法：时间线解读统一在这里做，反方审稿的工作包不另写一份 */
   challengeLog: {
     skippedDisabled: '反方审稿未启用，已跳过',
     skippedDisabledNext: '如需审稿，请在节点中开启，或在「设置 → 偏好设置 → 核查」中启用反方审稿',
-    skippedNoReport: '没有找到要审的报告，已跳过反方审稿',
-    skippedNoReportNext: '请在反方审稿节点的上游连接报告撰写节点，或在节点中指定要审的报告',
+    // no_report：要审的报告节点找得到（找不到时节点直接报错，到不了这里），但它的报告文档读不出来——没有写出、
+    // 保存失败，或者它在这次没有执行到的分支上
+    skippedNoReport: '要审的报告没有可读取的报告文档，已跳过反方审稿',
+    skippedNoReportNext: '请确认报告撰写节点是否执行成功、是否写出了报告；它位于条件分支上时，确认本次运行执行到了它',
     skippedNoClaims: '报告中没有需要审的关键结论，已跳过反方审稿',
     skipped: '反方审稿已跳过',
     sameModel: (model?: string) => (model ? `反方审稿模型与报告撰写模型同为「${model}」，审稿缺乏独立性`

@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useState } from 'react'
 import type { CSSProperties } from 'react'
-import { AlertTriangle, Check, ChevronRight } from 'lucide-react'
+import { AlertTriangle, Ban, Check, ChevronRight } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
@@ -15,6 +15,11 @@ import type {
 
 const T = DUAL_CHECK_TEXT.approval
 const CHOICES: DualCheckChoice[] = ['a', 'b', 'neither']
+/** 不算具体差异的两种：兜底说明（other）和解析失败（parse）。服务端摘要的 fallback 也是这么算的 */
+const NOT_CONCRETE = new Set(['other', 'parse'])
+/** 能对上数据目录里一项事实的三种差异：时间列 → 业务日期，筛选条件 → 有效记录条件，聚合 → 去重规则 */
+type CatalogAspect = 'time' | 'filter' | 'aggregate'
+const CATALOG_ASPECTS = new Set<string>(['time', 'filter', 'aggregate'])
 
 export interface DualCheckApprovalProps {
   /** payload.kind 为 'dual_check' 的审批：双盲复算两路对不上、交给人裁决 */
@@ -34,21 +39,26 @@ interface MetricView {
   blind: string | null
   /** 已乘过 100；null 是原流程值为 0（约定），undefined 是没给 */
   deltaPct: number | null | undefined
-  /** 具体差异，一条一句（兜底说明不算） */
+  /** 具体差异，一条一句（兜底说明、解析失败不算） */
   items: string[]
-  /** 只有兜底说明：两条 SQL 的写法不同，未能归纳成具体差异 */
+  /** 一条具体差异都没有：卡上不列条目，默认展开对照，审核人只能对照原文判断 */
   fallbackOnly: boolean
+  /** fallbackOnly 时写不写那句固定的「两条 SQL 的写法不同，未能归纳成具体差异」（一边没有 SQL 时不写，只写原因） */
+  fallbackHead: boolean
+  /** 兜底、解析失败的原话里固定那句以外的说法（比较超时、解析出错的位置……），附在下面 */
+  notes: string[]
   /** 具体差异之外还有未能归纳的部分（服务端那句「另有未能归纳的差异」） */
   rest: string | null
   /** 两条 SQL 等价，差在取用的结果上 */
   equivalent: boolean
-  /** 只差一个方面：审核人的选择会记入数据目录 */
-  single: boolean
+  /** 两边只差一处、又可能对得上数据目录的一项事实：审核人的选择可能被记进数据目录（见 catalogOf） */
+  catalog: CatalogAspect | null
   full: DualCheckMetric | null
 }
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+const hasSql = (v: unknown): boolean => typeof v === 'string' && !!v.trim()
 
 /** payload.summary 里认得出的项（老服务端、写坏了的项跳过，不让整张卡崩掉） */
 function summaryOf(raw: unknown): DualCheckSummaryItem[] {
@@ -62,6 +72,27 @@ function cardOf(content: unknown): DualCheckCard | null {
   if (!content || typeof content !== 'object' || !Array.isArray((content as DualCheckCard).metrics)) return null
   const card = content as DualCheckCard
   return { ...card, metrics: card.metrics.filter((m) => !!m && typeof m === 'object' && typeof m.metric_id === 'string') }
+}
+
+/**
+ * 兜底、解析失败的原话 → standard：其中有那句固定的兜底说明（几个输入合并时前面带「输入「…」：」）；notes：其余的
+ * 说法，去掉句末的「请对照原文」（对照就在下面），去重
+ */
+function notesOf(texts: string[]): { standard: boolean; notes: string[] } {
+  const plain = [...new Set(texts.map((t) => t.replace(/，?请对照原文。?$/, '').trim()).filter(Boolean))]
+  const isStandard = (t: string) => t.replace(/^输入「[^」]*」：/, '') === T.fallbackOnly
+  return { standard: plain.some(isStandard), notes: plain.filter((t) => !isStandard(t)) }
+}
+
+/**
+ * 审核人的选择会不会被记进数据目录：照服务端写目录的门槛（dual_check_facts.derive）——两条 SQL 不等价、没用兜底、
+ * 差异恰好一条，而且是时间列、筛选条件或聚合。几个输入都对不上时节点把各自的差异合成一份（每个输入至少一条），
+ * 所以「恰好一条」也就是只有一个输入对不上。后面还有只有服务端查得了的条件（一边多出条件、只差去不去重、目录里
+ * 已有人工确认的说法），卡上有条件地说
+ */
+function catalogOf(metric: DualCheckMetric, items: { aspect: string; text: string }[]): CatalogAspect | null {
+  if (metric.diff?.equivalent === true || metric.diff?.fallback === true || items.length !== 1) return null
+  return CATALOG_ASPECTS.has(items[0].aspect) ? items[0].aspect as CatalogAspect : null
 }
 
 function viewsOf(summary: DualCheckSummaryItem[], card: DualCheckCard | null): MetricView[] {
@@ -79,30 +110,39 @@ function viewsOf(summary: DualCheckSummaryItem[], card: DualCheckCard | null): M
       deltaPct: s && 'delta_pct' in s ? num(s.delta_pct) ?? null : f?.delta_pct === null ? null : num(f?.delta_pct),
     }
     if (f) {
-      const items = (Array.isArray(f.diff?.items) ? f.diff.items : []).filter((i) => !!i && typeof i.text === 'string' && !!i.text)
-      // aspect 为 other 的是兜底说明，不算具体差异；只有它的时候卡上写那句固定的说法、默认展开对照
-      const concrete = items.filter((i) => i.aspect !== 'other')
+      const items = (Array.isArray(f.diff?.items) ? f.diff.items : [])
+        .filter((i) => !!i && typeof i.text === 'string' && !!i.text && typeof i.aspect === 'string')
+      const concrete = items.filter((i) => !NOT_CONCRETE.has(i.aspect))
       const other = items.filter((i) => i.aspect === 'other')
       const equivalent = f.diff?.equivalent === true
-      const aspects = new Set(concrete.map((i) => i.aspect))
+      const fallbackOnly = !equivalent && !concrete.length
+      const { standard, notes } = notesOf(items.filter((i) => NOT_CONCRETE.has(i.aspect)).map((i) => i.text))
+      // 对不上的输入里没有一个两边都有 SQL 的（节点的原话「有一边没有可比较的 SQL」）：不说「两条 SQL 的写法不同」
+      const comparable = pairsOf(f).some((p) => p.differs && hasSql(p.original?.sql) && hasSql(p.blind?.sql))
       return {
         ...base,
         items: concrete.map((i) => i.text),
-        fallbackOnly: !equivalent && !concrete.length,
+        fallbackOnly,
+        fallbackHead: !notes.length || standard || comparable,
+        notes: fallbackOnly ? notes : [],
         rest: concrete.length && other.length ? other.map((i) => i.text).join('；') : null,
         equivalent,
-        // 「只差一个方面」以服务端为准（它决定写不写数据目录），这里只在没用兜底、具体差异都落在同一方面时提示
-        single: !equivalent && f.diff?.fallback !== true && aspects.size === 1 && !aspects.has('parse'),
+        catalog: catalogOf(f, items),
         full: f,
       }
     }
+    // 只有摘要：服务端把兜底和解析失败都算作 fallback，diff 里是前几条差异的原话
+    const texts = Array.isArray(s?.diff) ? s.diff.filter((t): t is string => typeof t === 'string' && !!t) : []
+    const fallbackOnly = s?.fallback === true
     return {
       ...base,
-      items: Array.isArray(s?.diff) ? s.diff.filter((t): t is string => typeof t === 'string' && !!t) : [],
-      fallbackOnly: s?.fallback === true,
+      items: fallbackOnly ? [] : texts,
+      fallbackOnly,
+      fallbackHead: true,
+      notes: fallbackOnly ? notesOf(texts).notes : [],
       rest: null,
       equivalent: false,
-      single: false,
+      catalog: null,
       full: null,
     }
   })
@@ -118,12 +158,39 @@ function deltaText(pct: number | null | undefined): string | null {
 }
 
 /**
+ * 这次运行里节点的「未采用原流程时」：审批 payload 不带它，从运行的图快照（GET /runs/{id}/graph）里按节点 id 读。
+ * 没写、写了认不出的按缺省的 degrade（节点执行时同样这么认）；图里找不到这个节点（子工作流里的）、图快照取不到
+ * 时是 unknown，卡上有条件地说
+ */
+type OnReject = 'degrade' | 'fail' | 'unknown' | 'loading'
+function useOnReject(runId: string, nodeId: string | undefined): OnReject {
+  const key = `${runId}\n${nodeId ?? ''}`
+  const [got, setGot] = useState<{ key: string; value: OnReject } | null>(null)
+  useEffect(() => {
+    if (!runId || !nodeId) return
+    let alive = true
+    api.runs.graph(runId).then(
+      (res) => {
+        const node = Array.isArray(res?.graph?.nodes) ? res.graph.nodes.find((n) => n?.id === nodeId) : undefined
+        const value: OnReject = !node ? 'unknown' : node.data?.config?.on_reject === 'fail' ? 'fail' : 'degrade'
+        if (alive) setGot({ key, value })
+      },
+      () => { if (alive) setGot({ key, value: 'unknown' }) },
+    )
+    return () => { alive = false }
+  }, [runId, nodeId, key])
+  if (!runId || !nodeId) return 'unknown'
+  return got?.key === key ? got.value : 'loading'
+}
+
+/**
  * 审批卡里双盲复算那一块（RunPanel 的 ApprovalCard 在 payload.kind === 'dual_check' 时渲染它，通用的输入框、备注和
  * 「提交 / 驳回并终止」不画——mode 是 input，通用那套会把一个字符串当 value 发出去）。
  *
  * 先按 payload.summary 画：两个值、相差多少、摘要里的差异，选择也能先做；完整对照（card_artifact）到了再补上盲算模型、
  * 全部具体差异和「对照两条 SQL」。取不到完整对照时照实说，按摘要照样能裁决。每个指标三选一、缺一个都不能提交，
- * 回复走审批接口：value 为 {choices, note}
+ * 回复走审批接口：value 为 {choices, note}。摘要和工件里都认不出指标时没法裁决，只留「驳回并终止」（approved 为假，
+ * 节点按人工驳回失败），免得运行一直挂着
  */
 export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalProps) {
   const toast = useToast()
@@ -133,6 +200,7 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const payload = approval.payload ?? {}
   const summary = useMemo(() => summaryOf(payload.summary), [payload.summary])
   const cardId = str(payload.card_artifact) ?? ''
+  const onReject = useOnReject(approval.run_id, str(payload.node_id) ?? str(approval.node_id))
 
   const [card, setCard] = useState<{ id: string; data?: DualCheckCard | null } | null>(null)
   useEffect(() => {
@@ -157,8 +225,9 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const [busy, setBusy] = useState(false)
   const pending = views.filter((v) => !choices[v.id]).length
 
-  const submit = async () => {
-    if (busy || pending || !views.length) return
+  /** 提交裁决（approved 为真，value 是 {choices, note}）或驳回（认不出指标时的出口） */
+  const send = async (approved: boolean) => {
+    if (busy || (approved && (pending || !views.length))) return
     setBusy(true)
     try {
       const value: DualCheckReply = {
@@ -166,17 +235,27 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
         note: note.trim(),
       }
       // 照 ApprovalCard 里 mode 为 input 时的写法：备注外层也放一份，节点拿到的是 {approved, note, value}
-      await api.approvals.decide(approval.id, { approved: true, note: value.note, value })
+      await api.approvals.decide(approval.id, approved ? { approved: true, note: value.note, value } : { approved: false, note: value.note })
       await refreshApprovals()
       if (onResolved) await onResolved(approval.run_id)
       else await attachRun(approval.run_id)
-      toast(T.done, 'ok')
+      // 采用盲算、两边都不对时，节点设为「判为失败」就会让运行终止：提示照节点的设置说，读不到设置时不替它下结论
+      const rejected = Object.values(value.choices).some((c) => c !== 'a')
+      toast(!approved ? T.rejected : !rejected || onReject === 'degrade' ? T.done : onReject === 'fail' ? T.doneFail : T.doneUnknown, 'ok')
     } catch (e) {
       toast.error(e)
     } finally {
       setBusy(false)
     }
   }
+
+  const noteField = (
+    <div>
+      <label className="label" htmlFor={`${uid}-note`}>{T.note}</label>
+      <textarea id={`${uid}-note`} className="field" rows={2} value={note} placeholder={T.notePlaceholder}
+                data-dual-note="" onChange={(e) => setNote(e.target.value)} />
+    </div>
+  )
 
   return (
     <div className="@container mb-2 space-y-2" data-dual-check="" data-state={loading ? 'loading' : lost ? 'summary' : 'ready'}>
@@ -201,7 +280,18 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
       )}
 
       {!views.length ? (
-        <p className="text-2xs leading-relaxed text-dim" data-dual-empty="">{T.empty}</p>
+        !loading && (
+          // 认不出任何指标：没法裁决，留一个驳回的出口（RunPanel 在双盲复算的审批上不画通用的按钮行）
+          <>
+            <p className="text-2xs leading-relaxed text-dim" data-dual-empty="">{T.empty}</p>
+            {noteField}
+            <button type="button" className="btn btn-danger w-full justify-center" disabled={busy} aria-describedby={`${uid}-reject`}
+                    data-dual-reject="" onClick={() => void send(false)}>
+              {busy ? <Spinner size={11} /> : <Ban size={12} aria-hidden />} {T.reject}
+            </button>
+            <div id={`${uid}-reject`} className="text-2xs leading-relaxed text-dim">{T.emptyReject}</div>
+          </>
+        )
       ) : (
         <>
           {views.map((v) => (
@@ -209,23 +299,19 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
                          onChoose={(c) => setChoices((cur) => ({ ...cur, [v.id]: c }))} />
           ))}
 
-          {/* 选了会怎样，常显在提交按钮上面：审核人得在提交之前知道「采用盲算」并不替换报告里的数 */}
-          <div className="text-2xs leading-relaxed text-dim" data-dual-consequence="">
-            {T.consequence(approval.run_class)}
-            <span className="mt-0.5 block">{T.consequenceFail}</span>
+          {/* 选了会怎样，常显在提交按钮上面：审核人得在提交之前知道「采用盲算」并不替换报告里的数，以及运行会不会终止 */}
+          <div className="text-2xs leading-relaxed text-dim" data-dual-consequence="" data-on-reject={onReject}>
+            {onReject === 'fail' ? T.consequenceFail : T.consequence(approval.run_class)}
+            {(onReject === 'unknown' || onReject === 'loading') && <span className="mt-0.5 block">{T.consequenceMaybeFail}</span>}
           </div>
-          <div>
-            <label className="label" htmlFor={`${uid}-note`}>{T.note}</label>
-            <textarea id={`${uid}-note`} className="field" rows={2} value={note} placeholder={T.notePlaceholder}
-                      data-dual-note="" onChange={(e) => setNote(e.target.value)} />
-          </div>
+          {noteField}
           {pending > 0 && (
             <div id={`${uid}-pending`} className="text-2xs" style={{ color: 'var(--st-waiting)' }} data-dual-pending="">
               {T.pending(pending)}
             </div>
           )}
           <button type="button" className="btn btn-primary w-full justify-center" disabled={busy || pending > 0}
-                  aria-describedby={pending > 0 ? `${uid}-pending` : undefined} data-dual-submit="" onClick={() => void submit()}>
+                  aria-describedby={pending > 0 ? `${uid}-pending` : undefined} data-dual-submit="" onClick={() => void send(true)}>
             {busy ? <Spinner size={11} /> : <Check size={12} aria-hidden />} {T.submit}
           </button>
         </>
@@ -239,10 +325,12 @@ function MetricBlock({ view, name, choice, onChoose }: {
   view: MetricView; name: string; choice?: DualCheckChoice; onChoose: (c: DualCheckChoice) => void
 }) {
   const uid = useId()
-  // 只有兜底说明时默认展开：一条具体说法都没有，审核人只能对照原文判断
+  // 只有兜底说明（或只有解析失败）时默认展开：一条具体说法都没有，审核人只能对照原文判断
   const [open, setOpen] = useState<boolean | null>(null)
   const expanded = !!view.full && (open ?? view.fallbackOnly)
   const delta = deltaText(view.deltaPct)
+  // 一边没有 SQL 时不写固定那句，原因顶上来用提醒色
+  const [lead, ...more] = view.fallbackHead ? [T.fallbackOnly, ...view.notes] : view.notes
   return (
     <div className="rounded border bg-bg p-2" role="group" aria-labelledby={`${uid}-name`} data-dual-metric={view.id}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
@@ -268,7 +356,14 @@ function MetricBlock({ view, name, choice, onChoose }: {
         {view.equivalent ? (
           <p className="text-2xs leading-relaxed text-dim" data-dual-equivalent="">{T.equivalent}</p>
         ) : view.fallbackOnly ? (
-          <p className="text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-dual-fallback="">{T.fallbackOnly}</p>
+          <>
+            {lead && (
+              <p className="text-2xs leading-relaxed [overflow-wrap:anywhere]" style={{ color: 'var(--st-waiting)' }} data-dual-fallback="">{lead}</p>
+            )}
+            {more.map((t, i) => (
+              <p key={i} className="mt-0.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-fallback-note="">{t}</p>
+            ))}
+          </>
         ) : view.items.length > 0 && (
           <ul className="list-disc space-y-0.5 pl-4 text-2xs leading-relaxed [overflow-wrap:anywhere]">
             {view.items.map((t, i) => <li key={i} data-dual-diff-item="">{t}</li>)}
@@ -285,7 +380,9 @@ function MetricBlock({ view, name, choice, onChoose }: {
         </button>
       )}
       {expanded && view.full && <Compare id={`${uid}-cmp`} metric={view.full} />}
-      {view.single && <p className="mt-1.5 text-2xs leading-relaxed text-dim" data-dual-catalog="">{T.catalog}</p>}
+      {view.catalog && (
+        <p className="mt-1.5 text-2xs leading-relaxed text-dim" data-dual-catalog={view.catalog}>{T.catalog[view.catalog]}{T.catalog.tail}</p>
+      )}
 
       {/* 原生单选：Tab 进组、方向键换选项，读屏念得出是哪个指标的哪一项 */}
       <fieldset className="mt-2 min-w-0 border-0 p-0" data-dual-choice={view.id}>
@@ -319,7 +416,7 @@ interface Pair {
 
 /** 比 SQL 时不看空白和大小写：原样写成一行和换了行的是同一条 */
 const normSql = (sql: unknown): string => (typeof sql === 'string' ? sql.replace(/\s+/g, ' ').trim().toLowerCase() : '')
-/** 比一行时再去掉行尾的逗号、分号：规范化的写法逗号在行尾，原文不一定 */
+/** 比一行时再去掉行尾的逗号、分号：只是换了个地方断行的两行算同一行 */
 const normLine = (line: string): string => line.replace(/\s+/g, ' ').trim().replace(/[,;]+$/, '').trim().toLowerCase()
 const sameValue = (a: unknown, b: unknown): boolean => {
   if (typeof a === 'number' && typeof b === 'number') return a === b
@@ -342,19 +439,42 @@ function pairsOf(metric: DualCheckMetric): Pair[] {
   }))
 }
 
-/** text_diff（「- 」原流程、「+ 」盲算）→ 两边各自要高亮的行（按 normLine 比） */
-function marksOf(textDiff: unknown): { original: Set<string>; blind: Set<string> } {
-  const original = new Set<string>()
-  const blind = new Set<string>()
-  for (const line of Array.isArray(textDiff) ? textDiff : []) {
-    if (typeof line !== 'string') continue
-    if (line.startsWith('- ')) original.add(normLine(line.slice(2)))
-    else if (line.startsWith('+ ')) blind.add(normLine(line.slice(2)))
+/** 按行数算 LCS 的上限：再长的 SQL 不在浏览器里逐行比，原文不标（规范化后不同的行照样列） */
+const MAX_LCS_CELLS = 250_000
+
+/**
+ * 两段原文按行比（不看空白、大小写和行尾的逗号分号），返回两边各自不在最长公共子序列里的行号。
+ *
+ * 不拿 text_diff 去对原文：服务端的 text_diff 是规范化之后的行（列名带表名、条件并成一行），和原文的行几乎从来
+ * 对不上。一行都对不上（写法完全不同、各写成一行）时返回 null：整段都标出来没有信息量，差在哪看规范化后的行
+ */
+function lineDiff(a: string[], b: string[]): { a: Set<number>; b: Set<number> } | null {
+  const na = a.map(normLine)
+  const nb = b.map(normLine)
+  const n = na.length
+  const m = nb.length
+  if (!n || !m || n * m > MAX_LCS_CELLS) return null
+  // lcs[i][j]：na[i..] 和 nb[j..] 的最长公共子序列有几行
+  const lcs = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) lcs[i][j] = na[i] === nb[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1])
   }
-  original.delete('')
-  blind.delete('')
-  return { original, blind }
+  if (!lcs[0][0]) return null
+  const da = new Set<number>()
+  const db = new Set<number>()
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (na[i] === nb[j]) { i++; j++ } else if (lcs[i + 1][j] >= lcs[i][j + 1]) da.add(i++)
+    else db.add(j++)
+  }
+  while (i < n) da.add(i++)
+  while (j < m) db.add(j++)
+  return { a: da, b: db }
 }
+
+/** SQL 原文按行切（去掉末尾的空白行） */
+const linesOf = (sql: unknown): string[] | null => (hasSql(sql) ? (sql as string).replace(/\s+$/, '').split('\n') : null)
 
 function valueText(v: unknown): string {
   if (v == null) return NONE
@@ -372,18 +492,24 @@ function valueText(v: unknown): string {
 const MARK: CSSProperties = {
   background: 'color-mix(in srgb, var(--warn) 16%, transparent)', color: 'var(--text)', boxShadow: 'inset 2px 0 0 var(--warn)',
 }
+/** 代码框：折行显示、不横向撑开，太长时框里纵向滚动，框能用键盘聚焦 */
+const CODE_BOX = 'overflow-y-auto whitespace-pre-wrap rounded border bg-panel px-1 py-1.5 text-2xs leading-relaxed [overflow-wrap:anywhere] '
+  + 'focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]'
 
 /**
- * 对照两条 SQL：先列每个输入两边各取到多少，再把不同的输入的两条 SQL 左右并排（卡片窄于 32rem 时上下排，按卡片
- * 自己的宽度算，画布右栏里也是上下排），规范化后不同的行在原文里高亮；规范化的写法和原文对不上（模型常把 SQL 写成
- * 一行）时原文不乱标，规范化后不同的行另列一份，每行标是哪一边
+ * 对照两条 SQL：先列每个输入两边各取到多少；再把不同的输入的两条 SQL 原文左右并排（卡片窄于 32rem 时上下排，按卡片
+ * 自己的宽度算，画布右栏里也是上下排），两段原文按行比出的不同行高亮；最后是规范化后不同的行（服务端的 text_diff），
+ * 同样分原流程、盲算两栏，每行高亮——原文格式差得太远、按行比不出东西时，差在哪就看这一段
  */
 function Compare({ id, metric }: { id: string; metric: DualCheckMetric }) {
   const pairs = useMemo(() => pairsOf(metric), [metric])
-  const marks = useMemo(() => marksOf(metric.diff?.text_diff), [metric])
-  const lines = useMemo(() => (Array.isArray(metric.diff?.text_diff) ? metric.diff.text_diff : [])
-    .filter((l): l is string => typeof l === 'string' && (l.startsWith('- ') || l.startsWith('+ ')))
-    .map((l) => ({ side: l.startsWith('- ') ? 'original' as const : 'blind' as const, text: l.slice(2) })), [metric])
+  const norm = useMemo(() => {
+    const lines = (Array.isArray(metric.diff?.text_diff) ? metric.diff.text_diff : []).filter((l): l is string => typeof l === 'string')
+    return {
+      original: lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2)),
+      blind: lines.filter((l) => l.startsWith('+ ')).map((l) => l.slice(2)),
+    }
+  }, [metric])
   const differing = pairs.filter((p) => p.differs)
   return (
     <div id={id} className="mt-1.5 min-w-0 space-y-2" data-dual-compare="">
@@ -404,34 +530,13 @@ function Compare({ id, metric }: { id: string; metric: DualCheckMetric }) {
           </ul>
         </div>
       )}
-      {(differing.length ? differing : pairs).map((p) => (
-        <div key={p.path} className="min-w-0" data-dual-pair={p.path}>
-          <div className="mb-0.5 text-2xs text-faint [overflow-wrap:anywhere]">
-            <code className="mono">{p.path}</code>{p.source ? ` · ${T.source(p.source)}` : ''}
-          </div>
-          <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2">
-            <SqlPane side="original" label={T.sqlOriginal} sql={p.original?.sql} marks={marks.original} />
-            <SqlPane side="blind" label={T.sqlBlind} sql={p.blind?.sql} marks={marks.blind} />
-          </div>
-          {str(p.blind?.rationale) && (
-            <p className="mt-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-rationale="">
-              <span className="text-faint">{T.rationale}：</span>{p.blind!.rationale}
-            </p>
-          )}
-        </div>
-      ))}
-      {lines.length > 0 && (
+      {(differing.length ? differing : pairs).map((p) => <PairSql key={p.path} pair={p} />)}
+      {(norm.original.length > 0 || norm.blind.length > 0) && (
         <div data-dual-text-diff="">
           <div className="mb-0.5 text-2xs text-faint">{T.textDiff}</div>
-          <div className="mono max-h-48 overflow-y-auto rounded border bg-panel px-2 py-1.5 text-2xs leading-relaxed focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]"
-               tabIndex={0} role="group" aria-label={T.textDiff}>
-            {lines.map((l, i) => (
-              <div key={i} className="flex min-w-0 gap-2" data-diff-side={l.side}>
-                {/* 标签列等宽：两边的行首对齐，一眼看出是同一处的两种写法 */}
-                <span className="w-[3em] shrink-0 font-sans text-faint">{l.side === 'original' ? DUAL_CHECK_TEXT.original : DUAL_CHECK_TEXT.blind}</span>
-                <span className="min-w-0 whitespace-pre-wrap text-dim [overflow-wrap:anywhere]">{l.text}</span>
-              </div>
-            ))}
+          <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2">
+            <NormPane side="original" lines={norm.original} />
+            <NormPane side="blind" lines={norm.blind} />
           </div>
         </div>
       )}
@@ -439,21 +544,61 @@ function Compare({ id, metric }: { id: string; metric: DualCheckMetric }) {
   )
 }
 
-/** 一条 SQL：逐行画，text_diff 里有的行高亮。折行显示、不横向撑开，太长时框里纵向滚动，框能用键盘聚焦 */
-function SqlPane({ side, label, sql, marks }: { side: 'original' | 'blind'; label: string; sql?: string | null; marks: Set<string> }) {
-  const lines = typeof sql === 'string' && sql.trim() ? sql.replace(/\s+$/, '').split('\n') : null
+/** 一个对不上的输入：两条 SQL 原文并排，按行比出的不同行高亮，盲算的说明跟在下面 */
+function PairSql({ pair }: { pair: Pair }) {
+  const a = useMemo(() => linesOf(pair.original?.sql), [pair.original?.sql])
+  const b = useMemo(() => linesOf(pair.blind?.sql), [pair.blind?.sql])
+  const diff = useMemo(() => (a && b ? lineDiff(a, b) : null), [a, b])
+  return (
+    <div className="min-w-0" data-dual-pair={pair.path}>
+      <div className="mb-0.5 text-2xs text-faint [overflow-wrap:anywhere]">
+        <code className="mono">{pair.path}</code>{pair.source ? ` · ${T.source(pair.source)}` : ''}
+      </div>
+      <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2">
+        <SqlPane side="original" label={T.sqlOriginal} lines={a} marks={diff?.a} />
+        <SqlPane side="blind" label={T.sqlBlind} lines={b} marks={diff?.b} />
+      </div>
+      {str(pair.blind?.rationale) && (
+        <p className="mt-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-rationale="">
+          <span className="text-faint">{T.rationale}：</span>{pair.blind!.rationale}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** 一条 SQL 原文：逐行画，marks 里的行（按行比出的不同行）高亮；空白行不标 */
+function SqlPane({ side, label, lines, marks }: { side: 'original' | 'blind'; label: string; lines: string[] | null; marks?: Set<number> }) {
   return (
     <figure className="m-0 min-w-0">
       <figcaption className="mb-0.5 text-2xs text-faint">{label}</figcaption>
-      <pre className={clsx('max-h-56 overflow-y-auto whitespace-pre-wrap rounded border bg-panel px-1 py-1.5 text-2xs leading-relaxed [overflow-wrap:anywhere] focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]',
-             lines ? 'mono text-dim' : 'font-sans text-faint')}
-           tabIndex={0} aria-label={label} data-dual-sql={side}>
+      <pre className={clsx('max-h-56', CODE_BOX, lines ? 'mono text-dim' : 'font-sans text-faint')} tabIndex={0} aria-label={label} data-dual-sql={side}>
         {lines
-          ? lines.map((line, i) => (marks.has(normLine(line))
-            ? <mark key={i} className="block rounded-sm px-1" style={MARK} data-diff-line={side === 'original' ? 'del' : 'add'}>{line || ' '}</mark>
+          ? lines.map((line, i) => (marks?.has(i) && line.trim()
+            ? <mark key={i} className="block rounded-sm px-1" style={MARK} data-diff-line={side === 'original' ? 'del' : 'add'}>{line}</mark>
             : <span key={i} className="block px-1">{line || ' '}</span>))
           : <span className="px-1">{T.sqlMissing}</span>}
       </pre>
+    </figure>
+  )
+}
+
+/** 规范化后不同的行的一栏：这一边的「- 」（原流程）或「+ 」（盲算）行，每行高亮；这一边一行都没有时照实说 */
+function NormPane({ side, lines }: { side: 'original' | 'blind'; lines: string[] }) {
+  const label = side === 'original' ? DUAL_CHECK_TEXT.original : DUAL_CHECK_TEXT.blind
+  return (
+    <figure className="m-0 min-w-0" data-dual-norm={side}>
+      <figcaption className="mb-0.5 text-2xs text-faint">{label}</figcaption>
+      <div className={clsx('max-h-48', CODE_BOX, lines.length ? 'mono' : 'font-sans text-faint')} tabIndex={0} role="group"
+           aria-label={`${T.textDiff} · ${label}`}>
+        {lines.length
+          ? lines.map((line, i) => (
+            <mark key={i} className="mb-px block rounded-sm px-1 last:mb-0" style={MARK} data-diff-line={side === 'original' ? 'del' : 'add'}>
+              {line || ' '}
+            </mark>
+          ))
+          : <span className="px-1">{T.textDiffNone}</span>}
+      </div>
     </figure>
   )
 }

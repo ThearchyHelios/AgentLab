@@ -695,7 +695,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     description: DUAL_CHECK_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
     // 配置的键和缺省见 types.ts 的 DualCheckConfig（期 3 约定）。口径卡、指标、口径说明要看画布上别的节点，
-    // 盲算模型是接入加模型，启用是三态，都交给 DualCheckFields 画；type 只管默认值和校验时当什么看
+    // 盲算模型是接入加模型，启用是三态，都交给 DualCheckFields 画；type 只管默认值和校验时当什么看。
+    // 盲算模型不放进高级选项：时间线上「模型相同」那一行的「打开设置」要定位到它，高级选项收着时定位不到
     fields: [
       { key: 'card', label: DUAL_CHECK_TEXT.field.card, type: 'select', help: DUAL_CHECK_TEXT.help.card, render: dualCheckFields.card },
       {
@@ -712,16 +713,16 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       },
       {
         // 没写和写 degrade 是一回事：选项从 degrade 排起，没写时下拉框落在它上面，正好是缺省
-        key: 'on_reject', label: DUAL_CHECK_TEXT.field.onReject, type: 'select', help: DUAL_CHECK_TEXT.help.onReject,
+        key: 'on_reject', label: DUAL_CHECK_TEXT.field.on_reject, type: 'select', help: DUAL_CHECK_TEXT.help.on_reject,
         options: [
           { value: 'degrade', label: DUAL_CHECK_TEXT.onReject.degrade },
           { value: 'fail', label: DUAL_CHECK_TEXT.onReject.fail },
         ],
         unknownLabel: DUAL_CHECK_TEXT.onRejectUnknown,
       },
-      { key: 'provider', label: DUAL_CHECK_TEXT.field.provider, type: 'select', advanced: true, render: dualCheckFields.provider },
+      { key: 'provider', label: DUAL_CHECK_TEXT.field.provider, type: 'select', render: dualCheckFields.provider },
       {
-        key: 'model', label: DUAL_CHECK_TEXT.field.model, type: 'text', advanced: true, help: DUAL_CHECK_TEXT.help.model,
+        key: 'model', label: DUAL_CHECK_TEXT.field.model, type: 'text', help: DUAL_CHECK_TEXT.help.model,
         render: dualCheckFields.model,
       },
       {

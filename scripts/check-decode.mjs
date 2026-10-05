@@ -2031,10 +2031,13 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
     E(4, 'log', 'dc', { level: 'info', code: 'dual_check_agreed', metrics: 2, message: '2 个指标与盲算一致' }),
     E(5, 'log', 'dc', { level: 'warn', code: 'dual_check_disagreed', metrics: [{ id: 'gmv', name: '销售额' }, { id: 'aov', name: '' }],
       card_artifact: CARD, message: '2 个指标与盲算不一致，已暂停等待审核' }),
-    E(6, 'log', 'dc', { level: 'warn', code: 'dual_check_limit', limit: 'max_queries', metric: '客单价', message: '已达查询次数上限' }),
+    // metric 是指标 ID（F1a 发的是 job["metric_id"]），中文名只在原话里
+    E(6, 'log', 'dc', { level: 'warn', code: 'dual_check_limit', limit: 'max_queries', metric: 'aov',
+      message: '指标「客单价」的盲算已达每项最多查询次数（6 次），按无法复算处理' }),
     E(7, 'log', 'dc', { level: 'info', code: 'dual_check_resolved', choices: { gmv: 'a', aov: 'neither' }, gaps: 1, message: '审核人已裁决' }),
-    E(8, 'log', 'dc', { level: 'info', code: 'dual_check_catalog', message: '裁决已记入数据目录',
-      written: [{ source: 'shop', table: 'orders', item: '业务日期：支付时间 paid_at' }],
+    // written 的 item 是数据目录表级项的键（F1a 的 dual_check_facts.FACT_ITEMS），界面上要写成中文叫法
+    E(8, 'log', 'dc', { level: 'info', code: 'dual_check_catalog', message: '已写入数据目录：「orders」的业务日期',
+      written: [{ source: 'shop', table: 'orders', item: 'business_date' }, { source: 'shop', table: 'refunds', item: 'valid_filter' }],
       skipped: [{ reason: '已有已确认的有效行过滤，未覆盖' }] }),
     E(9, 'node.finished', 'dc', { duration_ms: 3000 }),
     // 没有原话的老日志（只有 code 和结构化字段）照样解读
@@ -2079,15 +2082,16 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
     && dis.sub === '「销售额」「aov」' && dis.level === 'warn', `${dis?.title} / ${dis?.sub}`)
   check('……下一步说去审批卡上逐个选，完整对照的工件可下钻', !!dis?.next?.includes('审批卡') && dis.artifact === CARD, `${dis?.next} / ${dis?.artifact}`)
   const lim = by('dual_check_limit')
-  check('dual_check_limit：哪个指标、哪个上限、去哪儿调', lim?.title === '复算指标「客单价」时已达查询次数上限，该指标未完成盲算'
+  check('dual_check_limit：哪个指标（给的是 ID，不当名字加引号）、哪个上限、去哪儿调', lim?.title === '指标 aov 的盲算已达查询次数上限，按无法复算处理'
     && lim.level === 'warn' && !!lim.next?.includes('核查'), `${lim?.title} / ${lim?.next}`)
   const res = by('dual_check_resolved')
   check('dual_check_resolved：按选择计数（为 0 的不写），缺口放副标题', res?.title === '审核人已裁决：采用原流程 1 个，两边都不对 1 个'
     && res.sub === '1 项记为缺口' && res.level === 'warn', `${res?.title} / ${res?.sub} / ${res?.level}`)
   const cat = by('dual_check_catalog')
-  check('dual_check_catalog：记入几项、写的是什么、没写入的照实说', cat?.title === '已将 1 项裁决记入数据目录'
-    && !!cat.sub?.includes('orders') && cat.sub.includes('业务日期：支付时间 paid_at') && cat.sub.includes('1 项未写入')
+  check('dual_check_catalog：记入几项、写的是哪张表的哪一项（中文叫法）、没写入的照实说', cat?.title === '已将 2 项人工确认的事实记入数据目录'
+    && !!cat.sub?.includes('「orders」（shop）的业务日期') && cat.sub.includes('「refunds」（shop）的有效记录条件') && cat.sub.includes('1 项未写入')
     && cat.sub.includes('已有已确认的有效行过滤，未覆盖') && !!cat.next?.includes('数据目录') && cat.level === 'info', `${cat?.title} / ${cat?.sub}`)
+  check('……副标题里没有目录项的键名（business_date、valid_filter 之类）', !/business_date|valid_filter|\bdedup\b|[a-z]+_[a-z_]+/.test(cat?.sub ?? ''), cat?.sub)
   const off = by('dual_check_skipped', 'dc2')
   check('dual_check_skipped（disabled，没有原话）：照样上时间线，说怎么开启', off?.title === '双盲复算未启用，已跳过'
     && !!off.next?.includes('启用') && off.level === 'info' && off.detail === undefined, `${off?.title} / ${off?.next} / ${off?.detail}`)
@@ -2118,12 +2122,17 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
     E(3, 'log', 'dc', { level: 'info', code: 'dual_check_resolved', choices: { gmv: 'a', aov: 'a' }, gaps: [], message: '审核人已裁决' }),
     E(4, 'log', 'dc', { level: 'info', code: 'dual_check_resolved', choices: { gmv: 'b' }, gaps: ['指标「销售额」采用了盲算的结果'], message: '审核人已裁决' }),
     E(5, 'log', 'dc', { level: 'info', code: 'dual_check_catalog', written: [], skipped: [{ reason: '差异不止一个方面' }], message: '未写入' }),
-    E(6, 'node.finished', 'dc', {}),
-    E(7, 'node.started', 'ch', { node_type: 'challenge' }),
-    E(8, 'log', 'ch', { level: 'info', code: 'challenge_done', counts: { stands: 4, weakened: 0, refuted: 0, inconclusive: 1 }, message: '完成' }),
-    E(9, 'log', 'ch', { level: 'info', code: 'challenge_skipped', reason: '报告节点没有产出文档', message: '跳过' }),
-    E(10, 'log', 'ch', { level: 'info', code: 'challenge_skipped', reason: 'no_claims', message: '跳过' }),
-    E(11, 'node.finished', 'ch', {}),
+    // 认不出的目录项键不往界面上放，只写表；老版本给的是一句中文的照写
+    E(6, 'log', 'dc', { level: 'info', code: 'dual_check_catalog', message: '已写入',
+      written: [{ source: 'shop', table: 'stores', item: 'grain_x' }, { table: 'orders', item: '业务日期：支付时间 paid_at' }], skipped: [] }),
+    E(7, 'node.finished', 'dc', {}),
+    E(8, 'node.started', 'ch', { node_type: 'challenge' }),
+    E(9, 'log', 'ch', { level: 'info', code: 'challenge_done', counts: { stands: 4, weakened: 0, refuted: 0, inconclusive: 1 }, message: '完成' }),
+    E(10, 'log', 'ch', { level: 'info', code: 'challenge_skipped', reason: '报告节点没有产出文档', message: '跳过' }),
+    E(11, 'log', 'ch', { level: 'info', code: 'challenge_skipped', reason: 'no_claims', message: '跳过' }),
+    // no_report：上游的报告节点找得到（找不到时节点直接报错），但它的报告文档读不出来（没写出、保存失败、所在分支没执行）
+    E(12, 'log', 'ch', { level: 'info', code: 'challenge_skipped', reason: 'no_report', message: '报告「周报」的报告文档无法读取，本节点已跳过' }),
+    E(13, 'node.finished', 'ch', {}),
   ]))
   const daily = alt.find((s) => s.code === 'dual_check_limit')
   check('每日金额上限：不点名指标，下一步说今日费用已达上限', daily?.title === '双盲复算已达每日金额上限' && !!daily.next?.includes('今日核查费用'),
@@ -2133,15 +2142,20 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
     `${allA?.title} / ${allA?.sub} / ${allA?.level}`)
   check('缺口给的是一份清单：照样数出几项', oneB?.title === '审核人已裁决：采用盲算 1 个' && oneB.sub === '1 项记为缺口' && oneB.level === 'warn',
     `${oneB?.title} / ${oneB?.sub}`)
-  const cat0 = alt.find((s) => s.code === 'dual_check_catalog')
-  check('一项都没写入数据目录：标题照实说，原因放副标题', cat0?.title === '裁决未记入数据目录' && !!cat0.sub?.includes('差异不止一个方面'),
+  const [cat0, catOdd] = alt.filter((s) => s.code === 'dual_check_catalog')
+  check('一项都没写入数据目录：标题照实说，原因放副标题', cat0?.title === '本次裁决未写入数据目录' && !!cat0.sub?.includes('差异不止一个方面'),
     `${cat0?.title} / ${cat0?.sub}`)
+  check('认不出的目录项键不显示（只写表），一句中文的照写', catOdd?.sub === '「stores」（shop）；「orders」的业务日期：支付时间 paid_at',
+    catOdd?.sub)
   const calm = alt.find((s) => s.code === 'challenge_done')
   check('没有推翻：不用提醒色，0 句的不写', calm?.title === '反方审稿完成：审阅了 5 句结论' && calm.sub === '经受住 4 · 无法判断 1'
     && calm.level === 'info', `${calm?.title} / ${calm?.sub} / ${calm?.level}`)
-  const [said, noClaims] = alt.filter((s) => s.code === 'challenge_skipped')
+  const [said, noClaims, noDoc] = alt.filter((s) => s.code === 'challenge_skipped')
   check('跳过原因是一句中文：照写在副标题；认得的原因说人话', said?.title === '反方审稿已跳过' && said.sub === '报告节点没有产出文档'
     && noClaims?.title === '报告中没有需要审的关键结论，已跳过反方审稿', `${said?.title} / ${said?.sub} / ${noClaims?.title}`)
+  check('no_report：说的是报告文档读不出来（不是没找到报告节点），下一步指向报告节点有没有执行成功、在不在执行到的分支上',
+    noDoc?.title === '要审的报告没有可读取的报告文档，已跳过反方审稿' && !!noDoc.next?.includes('报告撰写节点是否执行成功')
+    && !!noDoc.next?.includes('分支') && !noDoc.next?.includes('连接'), `${noDoc?.title} / ${noDoc?.next}`)
 
   // 老日志缺字段、字段类型不对：不崩，标题照样说人话，不出 undefined、NaN、[object Object]，不瞎填数
   const odd = [

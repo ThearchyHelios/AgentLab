@@ -1,5 +1,5 @@
 {
-  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。",
+  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说",
   "approval": {
     "id": "ap-dc-0001",
     "run_id": "run-dc-0001",
@@ -25,7 +25,7 @@
           "blind_rendered": "51,388.3元",
           "delta_pct": 12.5,
           "diff": [
-            "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"
+            "原流程按 paid_at 筛时间，盲算按 created_at"
           ],
           "fallback": false
         },
@@ -36,7 +36,9 @@
           "original_rendered": "2.35%",
           "blind_rendered": "3.10%",
           "delta_pct": 31.91,
-          "diff": [],
+          "diff": [
+            "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          ],
           "fallback": true
         }
       ]
@@ -83,15 +85,13 @@
           "items": [
             {
               "aspect": "time",
-              "text": "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"
+              "text": "原流程按 paid_at 筛时间，盲算按 created_at"
             }
           ],
           "fallback": false,
           "text_diff": [
-            "- WHERE paid_at >= '2026-09-01'",
-            "-   AND paid_at < '2026-09-08'",
-            "+ WHERE created_at >= '2026-09-01'",
-            "+   AND created_at < '2026-09-08'"
+            "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
+            "+   orders.created_at >= '2026-09-01' AND orders.created_at < '2026-09-08'"
           ]
         }
       },
@@ -107,7 +107,7 @@
             {
               "path": "vars.kpi.refunds",
               "value": 47,
-              "sql": "SELECT COUNT(*) AS refunds FROM refunds r JOIN orders o ON o.id = r.order_id WHERE o.status <> 'test'",
+              "sql": "SELECT COUNT(*) AS refunds\nFROM refunds r\nWHERE EXISTS (\n  SELECT 1 FROM orders o\n  WHERE o.id = r.order_id AND o.status <> 'test'\n)",
               "source": "shop",
               "alias": "Q2"
             },
@@ -127,10 +127,10 @@
             {
               "path": "vars.kpi.refunds",
               "value": 62,
-              "sql": "SELECT COUNT(DISTINCT order_id) AS refunds FROM refunds WHERE order_id IN (SELECT id FROM orders)",
+              "sql": "SELECT COUNT(*) AS refunds\nFROM refunds r\nWHERE r.order_id IN (SELECT id FROM orders)",
               "source": "shop",
               "alias": "B2",
-              "rationale": "退款笔数按有退款记录的订单去重计数"
+              "rationale": "退款笔数：订单表中能找到对应订单的退款记录数"
             },
             {
               "path": "vars.kpi.orders",
@@ -152,8 +152,12 @@
           ],
           "fallback": true,
           "text_diff": [
-            "- SELECT COUNT(*) AS refunds FROM refunds AS r JOIN orders AS o ON o.id = r.order_id WHERE o.status <> 'test'",
-            "+ SELECT COUNT(DISTINCT order_id) AS refunds FROM refunds WHERE order_id IN (SELECT id FROM orders)"
+            "-   EXISTS(",
+            "+   refunds.order_id IN (",
+            "-       1",
+            "+       \"orders@1\".id",
+            "-     WHERE",
+            "-       \"orders@1\".id = refunds.order_id AND \"orders@1\".status <> 'test'"
           ]
         }
       }
@@ -370,5 +374,132 @@
       "timeout_s": 120
     },
     "daily_max_usd": 2.0
+  },
+  "variants": {
+    "time_range": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-09'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time_range",
+            "text": "原流程的时间范围是 paid_at >= '2026-09-01' AND paid_at < '2026-09-08'，盲算是 paid_at >= '2026-09-01' AND paid_at < '2026-09-09'"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
+          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-09'"
+        ]
+      }
+    },
+    "filter_extra": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE status <> 'test'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 status = 'test' 的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.status <> 'test'"
+        ]
+      }
+    },
+    "two_filters": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE channel = 'web'\n  AND status <> 'refunded'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程只保留 channel = 'web' 的行，盲算没有这个条件"
+          },
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 status = 'refunded' 的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.channel = 'web' AND orders.status <> 'refunded'"
+        ]
+      }
+    },
+    "join": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id",
+        "SELECT COUNT(*) AS orders\nFROM orders o\nJOIN refunds r ON r.order_id = o.id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "join",
+            "text": "原流程用 LEFT JOIN 关联 refunds 表，盲算用 INNER JOIN"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- FROM orders AS orders",
+          "- LEFT JOIN refunds AS refunds",
+          "+ FROM orders AS orders, refunds AS refunds",
+          "+ WHERE",
+          "-   ON orders.id = refunds.order_id",
+          "+   orders.id = refunds.order_id"
+        ]
+      }
+    },
+    "dedup": {
+      "sql": [
+        "SELECT COUNT(DISTINCT user_id) AS buyers\nFROM orders",
+        "SELECT COUNT(user_id) AS buyers\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "aggregate",
+            "text": "原流程对 user_id 去重计数，盲算没去重"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "-   COUNT(DISTINCT orders.user_id)",
+          "+   COUNT(orders.user_id)"
+        ]
+      }
+    },
+    "parse": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders",
+        "SELEC SUM(amount) AS gmv\nFROM orders WHERE"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "parse",
+            "text": "盲算：SQL 无法解析（第 1 行第 10 列附近），没有逐项比较"
+          }
+        ],
+        "fallback": false,
+        "text_diff": []
+      }
+    }
   }
 }

@@ -14,11 +14,13 @@ import data from './dual_check.json'
  * - ?syn=dual-check-approval：正式运行里两路对不上的审批卡，宽栏（两条 SQL 左右并排）
  * - ?syn=dual-check-approval-rail：同一张卡摆在 360px 的画布右栏里（两条 SQL 上下排）
  * - ?syn=dual-check-approval-exploratory：探索运行，后果里不提出具
+ * - ?syn=dual-check-approval-empty：摘要里一个指标都没有（老服务端、写坏了的 payload），只能驳回
  * - ?syn=dual-check-inspector：一张小画布（真的节点卡片）加 360px 的检查器，选中双盲复算节点；检查器改的是
  *   studio store 里的节点配置，卡片上的摘要跟着变
  *
- * 完整对照的工件（GET /api/artifacts/{id}）、审批回复、设置、校验都由检查脚本用 page.route 伪造，直接打开时卡上照实说
- * 无法加载完整对照。提交后 onResolved 只把运行 id 记到 window.__dualResolved，不去接事件流
+ * 完整对照的工件（GET /api/artifacts/{id}）、这次运行的图快照（GET /api/runs/{id}/graph，卡上按它说节点的
+ * 「未采用原流程时」）、审批回复、设置、校验都由检查脚本用 page.route 伪造，直接打开时卡上照实说无法加载完整对照、
+ * 有条件地说后果。提交后 onResolved 只把运行 id 记到 window.__dualResolved，不去接事件流
  */
 const approval = (patch: Partial<Approval> = {}): Approval => ({
   ...(data.approval as unknown as Approval),
@@ -76,6 +78,11 @@ export const cases: Record<string, () => JSX.Element> = {
   'dual-check-approval-exploratory': () => (
     <div className="mx-auto max-w-3xl p-4 text-sm" data-fixture="dual-check-approval-exploratory">
       <Card value={approval({ run_class: 'exploratory' })} />
+    </div>
+  ),
+  'dual-check-approval-empty': () => (
+    <div className="mx-auto max-w-3xl p-4 text-sm" data-fixture="dual-check-approval-empty">
+      <Card value={approval({ payload: { ...data.approval.payload, summary: [] } })} />
     </div>
   ),
   'dual-check-inspector': () => <InspectorCase />,

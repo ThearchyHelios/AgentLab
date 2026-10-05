@@ -3,7 +3,7 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  DUAL_CHECK_TEXT,
+  CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -1034,13 +1034,16 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       return { title: DC.log.resolved(parts), sub: gaps != null ? DC.log.gaps(gaps) : undefined, level: warn ? 'warn' : 'info' }
     }
     case 'dual_check_catalog': {
-      // written：[{source, table, item}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）
+      // written：[{source, table, item}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）。
+      // item 是表级目录项的键（business_date / valid_filter / dedup），按数据目录页的叫法写；认不出的键不往界面上放，
+      // 只写表；老版本给的一句中文照写
       const written = Array.isArray(d.written) ? d.written.filter(isRecord) : []
       const skipped = Array.isArray(d.skipped) ? d.skipped.filter(isRecord) : []
       const what = written.map((w) => {
-        const table = str(w.table)
-        const where = table ? `${table}${str(w.source) ? `（${str(w.source)}）` : ''}` : ''
-        return [where, str(w.item)].filter(Boolean).join(' · ')
+        const key = str(w.item)
+        const item = key && Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, key)
+          ? CATALOG_TABLE_FIELD_LABEL[key as keyof typeof CATALOG_TABLE_FIELD_LABEL] : cjkText(key)
+        return DC.log.catalogItem(str(w.table), str(w.source), item)
       }).filter(Boolean)
       const why = skipped.map((s) => str(s.reason)).filter((r): r is string => !!r)
       const rest = skipped.length ? `${DC.log.catalogSkipped(skipped.length)}${why.length ? `：${why.join('；')}` : ''}` : ''
