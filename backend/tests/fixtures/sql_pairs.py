@@ -2207,6 +2207,12 @@ _DIFF_R3 = [
      "WHERE r.id IS NOT NULL",
      "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
     ("r3-limit-negative-vs-zero", "SELECT id FROM orders ORDER BY id LIMIT -1", "SELECT id FROM orders ORDER BY id LIMIT 0"),
+    # 按不唯一的列关联（users.referrer_id、refunds.order_id）：LEFT JOIN 会把左边的行复制，去不掉
+    ("r3-left-join-on-non-unique-unused", "SELECT o.id, o.amount FROM orders o LEFT JOIN users u ON u.referrer_id = o.user_id",
+     "SELECT o.id, o.amount FROM orders o"),
+    ("r3-left-join-on-key-plus-other-table", "SELECT SUM(o.amount) FROM orders o LEFT JOIN users u ON u.id = o.user_id "
+     "LEFT JOIN refunds r ON r.user_id = u.id",
+     "SELECT SUM(o.amount) FROM orders o LEFT JOIN users u ON u.id = o.user_id"),
     ("r3-order-dup-key-direction", "SELECT id, user_id FROM orders ORDER BY user_id, id DESC LIMIT 5",
      "SELECT id, user_id FROM orders ORDER BY user_id, id LIMIT 5"),
 ]
@@ -2327,6 +2333,12 @@ _SAME_SCHEMA_R3 = [
      "SELECT o.id, r.amount FROM orders o JOIN refunds r ON r.order_id = o.id"),
     ("r3-where-not-null-primary-key", "SELECT COUNT(*) FROM orders WHERE id IS NOT NULL AND status = 'paid'",
      "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+    # 按主键关联、关联进来的表又没用到：左边每一行正好一行，这次 LEFT JOIN 去掉结果一样（不知道是主键时它可能把行复制）
+    ("r3-left-join-on-primary-key-unused", "SELECT o.id, o.amount FROM orders o LEFT JOIN users u ON u.id = o.user_id",
+     "SELECT o.id, o.amount FROM orders o"),
+    ("r3-left-join-on-primary-key-sum", "SELECT SUM(o.amount), COUNT(*) FROM orders o LEFT JOIN stores s "
+     "ON s.id = o.store_id AND s.region = 'east'",
+     "SELECT SUM(o.amount), COUNT(*) FROM orders o"),
 ]
 
 #: 意思一样、要按语义推理才看得出的：认不出时只许给兜底说明（复验专挑这类对查「说出不存在的差异」）
@@ -2553,6 +2565,10 @@ REGRESSIONS_R3: list[tuple[str, str, str, str]] = [
     # 解析时换成同一个节点、方言里却不是一回事的写法
     ("log10_vs_log_base", "postgres", "SELECT LOG10(amount) FROM orders", "SELECT LOG(10, amount) FROM orders"),
     ("char_length_is_not_sqlite", "sqlite", "SELECT CHAR_LENGTH(name) FROM users", "SELECT LENGTH(name) FROM users"),
+    # PostgreSQL 的 date_part 返回浮点数、EXTRACT 返回 numeric（秒数 12.5 和 12.500000），sqlglot 解析成同一个节点、
+    # 还不留函数名的位置：这样的不在语法树上判等价
+    ("date_part_vs_extract", "postgres", "SELECT DATE_PART('second', paid_at::timestamp) FROM orders",
+     "SELECT EXTRACT(SECOND FROM paid_at::timestamp) FROM orders"),
     # PostgreSQL 的 LIMIT NULL 是不限行数，SQLite 里 LIMIT NULL 报错；MySQL 里 LIMIT 不能写算式
     ("limit_null_is_an_error", "sqlite", "SELECT id FROM orders ORDER BY id LIMIT NULL", "SELECT id FROM orders ORDER BY id"),
     ("limit_arithmetic_is_an_error", "mysql", "SELECT id FROM orders ORDER BY id LIMIT 1 + 2",

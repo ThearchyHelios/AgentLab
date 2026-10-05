@@ -2460,14 +2460,18 @@ def _call_names(tokens: list[Any]) -> list[str]:
 _SURFACE = "sql_semantics_surface"
 
 
-def _mark_surfaces(tree: Any, text: str, read: str | None) -> None:
+def _mark_surfaces(tree: Any, text: str, read: str | None) -> bool:
     """函数节点上记下原文写的名字（换算成规范的同义写法，见 _SAFE_RESPELLINGS）——只在它和 sqlglot 重新生成的名字
     不一样时记：sqlglot 把方言里意思不同的写法解析成同一个节点时（SQLite 的 MOD(a, 2) 和 a % 2 都是 Mod；PostgreSQL 的
     LOG10(x) 和 LOG(10, x) 都是 Log），两边的语法树就因为这一项而不同，不会判等价。解析器在函数节点的 meta 里留着
-    函数名在原文里的位置（start / end），按位置取原文。"""
+    函数名在原文里的位置（start / end），按位置取原文。
+
+    返回能不能记全：原文写的某个函数名在重新生成的写法里不见了（又不是同义写法），却没有哪个节点记下了它（解析器
+    换了写法、没留位置，PostgreSQL 的 DATE_PART(…) 解析成 EXTRACT 就是这样）时返回 False，调用方就不在语法树上判等价。"""
     from sqlglot import exp
 
     mapping = _SAFE_RESPELLINGS.get(read or "", {})
+    attached: set[str] = set()
     leaves = (exp.Column, exp.Identifier, exp.Literal, exp.Star, exp.Null, exp.Boolean, exp.Var, exp.Placeholder,
               exp.Parameter, exp.DataType)
     for node in tree.walk():
@@ -2488,6 +2492,16 @@ def _mark_surfaces(tree: Any, text: str, read: str | None) -> None:
         found = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", generated)
         if written and (found is None or found.group(1).upper() != written):
             node.meta[_SURFACE] = written
+            attached.add(text[start:end + 1].upper())
+    try:
+        tokens = _tokens(text, read)
+        present = {t.text.upper() for t in _tokens(tree.sql(dialect=read, comments=False), read)}
+    except Exception:  # noqa: BLE001 - 切词、重新生成不了：当成记不全
+        return False
+    # CAST 一类（解析成 Cast 节点、不留位置）换写法也是同一个意思（CAST(x AS INT) 和 x::INT、MySQL 的 CONVERT(x, CHAR)），
+    # 也不会和别的函数撞成同一个节点（SQLite 的 CAST(x AS DATE) 重新生成成 DATE(x)，可 DATE(x) 解析出来是 Date 节点）
+    return all(name in present or name in mapping or name in attached or name in ("CAST", "TRY_CAST", "CONVERT")
+               for name in _call_names(tokens))
 
 
 def _respelled(text: str, read: str | None, tree: Any) -> bool:
@@ -2648,6 +2662,7 @@ class _Schema:
     columns: set[str] = field(default_factory=set)
     not_null: dict[str, set[str]] = field(default_factory=dict)
     pk: dict[str, list[str]] = field(default_factory=dict)
+    unique: dict[str, list[list[str]]] = field(default_factory=dict)
 
 
 def _schema_info(schema: Mapping[str, Any] | None) -> _Schema:
@@ -2661,6 +2676,7 @@ def _schema_info(schema: Mapping[str, Any] | None) -> _Schema:
     types: dict[str, dict[str, str]] = {}
     not_null: dict[str, set[str]] = {}
     pk: dict[str, list[str]] = {}
+    unique: dict[str, list[list[str]]] = {}
     for name, meta in tables.items():
         columns = meta.get("columns") if isinstance(meta, Mapping) else None
         cols = [c for c in columns or [] if isinstance(c, Mapping) and isinstance(c.get("name"), str) and c["name"]]
@@ -2672,7 +2688,11 @@ def _schema_info(schema: Mapping[str, Any] | None) -> _Schema:
             keys = meta.get("primary_key") if isinstance(meta, Mapping) else None
             if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
                 pk[key] = [k.translate(_ASCII_LOWER) for k in keys]
-    return _Schema(mapping or None, types, {c for cols in types.values() for c in cols}, not_null, pk)
+            groups = meta.get("unique") if isinstance(meta, Mapping) else None
+            if isinstance(groups, list):
+                unique[key] = [[c.translate(_ASCII_LOWER) for c in g] for g in groups
+                               if isinstance(g, list) and g and all(isinstance(c, str) for c in g)]
+    return _Schema(mapping or None, types, {c for cols in types.values() for c in cols}, not_null, pk, unique)
 
 
 def _not_null_column(info: _Schema, table: str, column: str, read: str | None) -> bool:
@@ -2790,17 +2810,22 @@ def _light(root: Any, read: str | None, info: _Schema) -> _Form:
 
 
 def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified: bool) -> _Form:
-    """两级共用的几步，都只做保持语义的变换（为什么保持语义见各函数的说明）：
+    """两级共用的几步，都只做保持语义的变换（为什么保持语义见各函数的说明），按这个先后：
 
-    1. 动来源的：两个来源的 RIGHT JOIN 写成 LEFT JOIN；WHERE 把外连接可空一侧没关联上的行筛掉了的写成内连接；开头那组
-       内连接的条件挪进 WHERE、写成逗号连接。结果看行出来的先后的一段（见 _Sensitivity）都不做。
-    0. 原样选出 FROM 里一个子查询全部列、什么别的都不做的一段换成那个子查询（见 _unwrap_passthrough）。
-    1.5 去重的：SELECT DISTINCT 写成按选出来的列 GROUP BY、已经按选出来的列分组的 DISTINCT 去掉、IN 子查询里的
-       DISTINCT 和 ORDER BY 去掉（见各函数：只在「相等」就是「一样」、不看行出来的先后时做）。
-    2. 和来源无关的：COUNT(1) 写成 COUNT(*)、MIN / MAX 里的 DISTINCT 去掉；EXISTS 子查询写成 SELECT 1；IN 列表去重
-       排序、只有一个常量的写成 =；BETWEEN 写成两个比较；NOT 套比较写成反过来的比较、NOT NOT 去掉；不影响结合的括号、
-       ORDER BY 的 ASC、OFFSET 0 去掉；最外层 ORDER BY 引用的别名换成表达式，最外层和条件里的子查询选出来的列名去掉。
-    3. 起规范的名字、排好交换律成立的地方（见 _named）。
+    0. 原样选出 FROM 里一个子查询全部列、什么别的都不做的一段换成那个子查询（_unwrap_passthrough）。
+    1. 动来源的：两个来源的 RIGHT JOIN 写成 LEFT JOIN；WHERE 把外连接可空一侧没关联上的行筛掉了的写成内连接；只取可空
+       一侧跳过空值的聚合时 LEFT JOIN 写成内连接；开头那组内连接的条件挪进 WHERE、写成逗号连接；恒为真的条件、已经
+       保证不为空的 IS NOT NULL 去掉；没用到、又不怕重复（或者按唯一键关联）的 LEFT JOIN 去掉；（认列之后）按关联条件
+       相等、类型一样的两列换成同一列。结果看行出来的先后的一段（见 _Sensitivity）这些都不做——只有挪内连接的 ON
+       条件、去掉 1 = 1 这类常量条件照做（库里一视同仁，扫描的先后不变）。
+    2. 只看有没有、在不在的子查询：EXISTS 写成 SELECT 1，IN 子查询里不影响取值集合的去重、分组、排序、UNION 去掉。
+    3. 去重的：SELECT DISTINCT 写成按选出来的列 GROUP BY、已经按选出来的列分组的 DISTINCT 去掉（只在「相等」就是
+       「一样」、不看行出来的先后时做）。
+    4. 和来源无关的：COUNT(1) 写成 COUNT(*)、MIN / MAX 里的 DISTINCT 去掉、IIF / IF 写成 CASE；IN 列表去重排序、只有一个
+       常量的写成 =；BETWEEN 写成两个比较；NOT 套比较写成反过来的比较、NOT NOT 去掉；LIMIT 的同义写法；不影响结合的
+       括号、ORDER BY 的 ASC、OFFSET 0、重复的排序键去掉；最外层 ORDER BY 引用的别名换成表达式，最外层和条件里的子查询
+       选出来的列名去掉。
+    5. 起规范的名字、排好交换律成立的地方（见 _named）。
     """
     tree = _unwrap_passthrough(tree, read)
     sens = _Sensitivity(tree, read, info)
@@ -2811,7 +2836,7 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     _flatten_prefix(tree, sens, read)
     _drop_true_conjuncts(tree)
     _drop_implied_not_null(tree, read, info, sens)
-    _drop_unused_left_joins(tree, sens)
+    _drop_unused_left_joins(tree, sens, info, read)
     if qualified:
         _substitute_equal_columns(tree, read, info, sens)
     _exists_subqueries(tree)
@@ -4204,12 +4229,43 @@ def _dup_insensitive(select: Any) -> bool:
     return distinct is not None or _membership_context(select)
 
 
-def _drop_unused_left_joins(tree: Any, sens: _Sensitivity) -> None:
-    """LEFT JOIN 进来的表除了它自己的 ON 之外哪儿都没用到（本段、相关子查询、后面的连接都不引用它），结果又不怕重复
-    的行（SELECT DISTINCT；聚合都是 MIN、MAX、COUNT(DISTINCT …) 这类去重的；整段是 IN / EXISTS 子查询）：这次
-    LEFT JOIN 去掉结果一样。LEFT JOIN 不会让左边的行变少，只会让关联上好几行的左边的行重复出现，别的列的取值不变。
-    不去的：有 COUNT(*)、SUM 这类怕重复的聚合，有 RIGHT / FULL JOIN、窗口函数、SELECT *，有不带表名的列（分不清是不是
-    这张表的），结果看行出来先后的一段（DISTINCT 留下先扫到的那个值、取行，见 _Sensitivity）。"""
+def _unique_key_bound(item: Any, conds: list[Any], info: _Schema, read: str | None) -> bool:
+    """关联进来的实表 item 的某个唯一键（主键、唯一约束，见 schema_cache 的 primary_key / unique）的每一列，都被 conds
+    里的「这一列 = 不涉及这张表的表达式」定住了：左边每一行最多关联上它一行（相等的条件匹配不上空值）。SQLite 里只认
+    整数、文本亲和的键列（没有类型亲和的列能同时存 1 和 '1'，比较时按数值转换就能匹配上两行）。"""
+    from sqlglot import exp
+
+    if not isinstance(item, exp.Table) or item.args.get("db") or \
+            item.name.translate(_ASCII_LOWER) in _visible_ctes(item):
+        return False
+    alias, table = item.alias_or_name, item.name.translate(_ASCII_LOWER)
+    bound: set[str] = set()
+    for cond in conds:
+        cond = _unparen(cond)
+        if not isinstance(cond, exp.EQ):
+            continue
+        for x, y in ((cond.this, cond.expression), (cond.expression, cond.this)):
+            x = _unparen(x)
+            if isinstance(x, exp.Column) and x.table == alias and y.find(exp.Query, exp.Subquery) is None and \
+                    not any(c.table == alias or not c.table for c in y.find_all(exp.Column)) and not _volatile(y):
+                bound.add(x.name.translate(_ASCII_LOWER))
+    keys = ([info.pk[table]] if info.pk.get(table) else []) + info.unique.get(table, [])
+    types = info.types.get(table, {})
+    for key in keys:
+        if key and all(k in bound for k in key) and \
+                (read != "sqlite" or all(_identity_type(types.get(k, ""), read, None) for k in key)):
+            return True
+    return False
+
+
+def _drop_unused_left_joins(tree: Any, sens: _Sensitivity, info: _Schema, read: str | None) -> None:
+    """LEFT JOIN 进来的表除了它自己的 ON 之外哪儿都没用到（本段、相关子查询、后面的连接都不引用它），而且下面两种情况
+    之一：结果不怕重复的行（SELECT DISTINCT；聚合都是 MIN、MAX、COUNT(DISTINCT …) 这类去重的；整段是 IN / EXISTS
+    子查询）；或者 ON 用它的唯一键（主键、唯一约束）把它定死了、左边每一行最多关联上一行（见 _unique_key_bound）。
+    这次 LEFT JOIN 去掉结果一样：LEFT JOIN 不会让左边的行变少，只会让关联上好几行的左边的行重复出现（唯一键定死时
+    连重复都没有），别的列的取值不变。不去的：有 COUNT(*)、SUM 这类怕重复的聚合又没有唯一键，有 RIGHT / FULL JOIN、
+    窗口函数、SELECT *，有不带表名的列（分不清是不是这张表的），结果看行出来先后的一段（DISTINCT 留下先扫到的那个值、
+    取行，见 _Sensitivity）。"""
     from sqlglot import exp
 
     changed = True
@@ -4218,8 +4274,9 @@ def _drop_unused_left_joins(tree: Any, sens: _Sensitivity) -> None:
         for select in list(tree.find_all(exp.Select)):
             joins = select.args.get("joins") or []
             if not joins or any(str(j.side or "").upper() in ("RIGHT", "FULL") for j in joins) or sens.of(select) or \
-                    any(isinstance(p, exp.Star) for p in select.expressions) or not _dup_insensitive(select):
+                    any(isinstance(p, exp.Star) for p in select.expressions):
                 continue
+            insensitive = _dup_insensitive(select)
             own = list(_block_nodes(select))
             nested = [c for sub in _nested_queries(select) for c in sub.find_all(exp.Column)]
             columns = [n for n in own if isinstance(n, exp.Column)] + nested
@@ -4230,7 +4287,8 @@ def _drop_unused_left_joins(tree: Any, sens: _Sensitivity) -> None:
                     continue
                 alias = join.this.alias_or_name
                 on = {id(n) for n in join.args["on"].walk()}
-                if alias and not any(c.table == alias and id(c) not in on for c in columns):
+                if alias and not any(c.table == alias and id(c) not in on for c in columns) and \
+                        (insensitive or _unique_key_bound(join.this, _conjuncts(join.args["on"]), info, read)):
                     select.set("joins", [j for j in joins if j is not join] or None)
                     changed = True
                     break
@@ -4297,6 +4355,11 @@ def _drop_implied_not_null(tree: Any, read: str | None, info: _Schema, sens: _Se
                 holder.set(key, exp.true())
             else:
                 select.set(holder.arg_key, None)
+
+
+#: 换成同一组相等的列之后，原文写的那一列（实表名、列名）记在新列的 meta 里：比等价时不算（见 _fingerprint），差异
+#: 说明给人看时照原文写（见 _Explainer.show）
+_WRITTEN_COLUMN = "sql_semantics_written_column"
 
 
 def _substitute_equal_columns(tree: Any, read: str | None, info: _Schema, sens: _Sensitivity) -> None:
@@ -4370,18 +4433,19 @@ def _substitute_equal_columns(tree: Any, read: str | None, info: _Schema, sens: 
                     continue
                 table, name = replace[(col.table, col.name)]
                 new = exp.column(name, table=table)
+                new.meta[_WRITTEN_COLUMN] = bases[(col.table, col.name)][:2]
                 if col.parent is select and col.arg_key == "expressions":
                     new = exp.alias_(new, col.alias_or_name, copy=False)
                 col.replace(new)
 
 
-def _identity_type(declared: str, read: str | None, sens: _Sensitivity) -> bool:
+def _identity_type(declared: str, read: str | None, sens: _Sensitivity | None) -> bool:
     """声明的类型下「相等就是一样」、可以拿同一组相等的列互换：SQLite 里整数、文本亲和的列（实数亲和的 0.0 和 -0.0
     相等却不一样，数值亲和、没有亲和的列能同时存 1 和 1.0）；PostgreSQL、MySQL 按 _Sensitivity._safe_type。"""
     upper = declared.upper()
     if read == "sqlite":
         return "INT" in upper or any(w in upper for w in ("CHAR", "CLOB", "TEXT"))
-    return sens._safe_type(declared)
+    return sens is not None and sens._safe_type(declared)
 
 
 def _int_value(node: Any) -> int | None:
@@ -6191,6 +6255,12 @@ class _Explainer:
         copy = node.unalias().copy() if isinstance(node, exp.Alias) else node.copy()
         single = len(block.all_rels()) == 1 and not full
         for col in copy.find_all(exp.Column):
+            written = col.meta.get(_WRITTEN_COLUMN)
+            if written is not None:
+                # 规范化按关联条件换成了同一组里的另一列（见 _substitute_equal_columns）：给人看原文写的那一列
+                col.set("this", exp.to_identifier(written[1]))
+                col.set("table", None if single else exp.to_identifier(written[0]))
+                continue
             rel = block.rel(col.table) if col.table else None
             if rel is not None:
                 col.set("table", None if single else exp.to_identifier(rel.shown))
@@ -6323,7 +6393,9 @@ class _Explainer:
             all(self.base_columns(c, big) is not None for c in conds) else ""
         used = any(t.name == rel.name and id(t) not in {id(i) for i in _items_of(small.select)}
                    for t in small.select.find_all(exp.Table))
-        if used and _dup_insensitive(big.select):
+        item = next((i for i in _items_of(big.select) if i.alias_or_name == rel.alias), None)
+        if used and (_dup_insensitive(big.select) or
+                     (item is not None and _unique_key_bound(item, conds, self.info, self.read))):
             # 另一边在子查询里用到了这张表、这一边又不怕重复的行：可能只是把 IN / EXISTS 改写成了关联（去重之后一样），
             # 说不准是不是真的不同。怕重复的（SUM、COUNT(*)）关联会把行按关联上的条数复制，那才说
             return None
@@ -6366,7 +6438,10 @@ class _Explainer:
         if any(c.table == alias and id(c) not in on for c in columns) or any(not c.table for c in columns) or \
                 any(isinstance(p, exp.Star) for p in select.expressions):
             return False
-        return _dup_insensitive(select)
+        join = next((j for j in joins if j.this.alias_or_name == alias), None)
+        return _dup_insensitive(select) or (join is not None and join.args.get("on") is not None and
+                                            _unique_key_bound(join.this, _conjuncts(join.args["on"]), self.info,
+                                                              self.read))
 
     def _outer(self, A: _Block, B: _Block, where: tuple[str, str]
                ) -> tuple[bool, dict[str, str], set[str], set[str]] | None:
@@ -6976,10 +7051,16 @@ class _Explainer:
     def having(self, A: _Block, B: _Block, mapping: Mapping[str, str], where: tuple[str, str]) -> bool:
         """HAVING：同一个对象（聚合）只和常量比的，两边合起来逐段算，留下的组一样的不说（COUNT(*) > 1 和 >= 2、分组
         之后 COUNT(*) > 0）；只有一边有、另一边 HAVING 里没有别的条件的，说「分组后只保留」。"""
+        from sqlglot import exp
+
         la, lb = self.sides(where)
         only_a, only_b = self._unmatched(A.having, B.having, mapping)
         if not only_a and not only_b:
             return True
+        if any(isinstance(_unparen(c), exp.Boolean) for c in only_a + only_b):
+            # 留着的 HAVING TRUE 只说明「没有 GROUP BY 时它让语句成了只出一行的聚合」（见 _drop_true_conjuncts），说
+            # 「分组后只保留 TRUE 的组」读不懂，也没说到真正的不同
+            return False
         grouped = bool(A.group) and bool(B.group)
         if any(self.base_columns(c, A) is None for c in only_a) or any(self.base_columns(c, B) is None for c in only_b):
             return False
@@ -7341,13 +7422,13 @@ def explain_sql_diff(a: str, b: str, dialect: str | None = None, *, schema: Mapp
     forms_a: dict[str, _Form] = {}
     forms_b: dict[str, _Form] = {}
     try:
-        _mark_surfaces(ra, a.strip(), read)
-        _mark_surfaces(rb, b.strip(), read)
+        marked_a = _mark_surfaces(ra, a.strip(), read)
+        marked_b = _mark_surfaces(rb, b.strip(), read)
         if read == "sqlite":
             _mark_comma_joins(ra, a.strip(), read)
             _mark_comma_joins(rb, b.strip(), read)
-        forms_a = {} if _lost_in_parsing(a.strip(), read, ra) else _canonical_forms(ra, read, info)
-        forms_b = {} if _lost_in_parsing(b.strip(), read, rb) else _canonical_forms(rb, read, info)
+        forms_a = {} if not marked_a or _lost_in_parsing(a.strip(), read, ra) else _canonical_forms(ra, read, info)
+        forms_b = {} if not marked_b or _lost_in_parsing(b.strip(), read, rb) else _canonical_forms(rb, read, info)
     except Exception:  # noqa: BLE001 - 规范化本身的缺陷不能连累调用方：当作说不清，记下来修
         logger.warning("SQL 规范化失败", exc_info=True)
         forms_a, forms_b = {}, {}

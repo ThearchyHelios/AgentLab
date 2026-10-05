@@ -1266,3 +1266,16 @@ def test_only_literals_changed_is_still_the_same_template_in_round_three(dialect
     同一个模板，字面量各是各的。"""
     na, nb = normalize_sql(a, dialect), normalize_sql(b, dialect)
     assert na.same_shape(nb) and na.literals != nb.literals
+
+
+def test_a_join_on_a_primary_key_against_an_in_subquery_is_not_described_with_the_schema():
+    """按主键关联 users（每张订单最多关联上一个用户）和 user_id IN (SELECT id FROM users) 是一回事：给了表结构（知道
+    users.id 是主键）就不说「A 关联了 users 表，B 没有关联它」；没给表结构时关联可能把行复制，这句话是对的。"""
+    a = "SELECT o.id, o.amount FROM orders o JOIN users u ON u.id = o.user_id"
+    b = "SELECT o.id, o.amount FROM orders o WHERE o.user_id IN (SELECT id FROM users)"
+    diff = explain_sql_diff(a, b, "sqlite", schema=sql_pairs.schema_cache())
+    check_shape(diff)
+    assert all(d.aspect == "other" for d in diff.items), diff.items
+    diff = explain_sql_diff(a, b, "sqlite")
+    check_shape(diff)
+    assert diff.fallback and diff.items[0].text.startswith("A 关联了 users 表")
