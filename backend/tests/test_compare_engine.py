@@ -1229,6 +1229,9 @@ def test_an_agent_citing_other_rows_is_not_a_data_change():
 
 
 #: 按区域排序的结果这次多了北区，排在南区前面，西区挪到第 4 行
+#: 区域列设了遮罩、西区挪出引用的第 1 至 3 行时的说明：只写行号，不写是哪个区域
+MASKED_MOVED = ("Agent「区域分析」两次都引用第 1 至 3 行，其中一个维度值这次仍在查询结果第 4 行，不在引用的行里，"
+                "取的不是同一组数（维度列设了遮罩，不写出是哪个值）")
 WITH_NORTH = [["东区", 1200.5, 100.0], ["北区", 90.0, 0.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0]]
 
 
@@ -1292,12 +1295,15 @@ def test_the_same_rows_are_not_the_same_citation_when_a_cited_region_moved_out_o
         (["东区"], 1200.0, 1300.0, 2.0), (["南区"], 800.0, 700.0, -2.0), (["西区"], 600.0, 650.0, 1.0)]
     assert sum(exact(r["share"]) for r in rows) == 1
 
-    # 区域列设了遮罩：不拿它认是哪一区，只能按行号认，遮住的区域名不出现在结果里
+    # 区域列设了遮罩：遮住的区域名不进说明，但照样拿它核对（它是唯一认得出行的那一列，不核对就和真的没有了分不出来）——
+    # 说明只写行号
     def masked(run):
         run.masked = {a: frozenset({"region"}) for a in run.queries}
         return run
     result = run_compare(masked(cited("r1", with_middle, span=(0, 2))), masked(cited("r2", WITH_NORTH, span=(0, 2))))
-    assert by_id(result)["total"]["classification"] == "data_only"
+    total = by_id(result)["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == [MASKED_MOVED]
     text = json.dumps(result, ensure_ascii=False)
     assert all(region not in text for region in ("东区", "南区", "西区", "北区", "中区"))
 
@@ -1323,8 +1329,8 @@ def test_a_mask_on_one_side_only_still_hides_the_column():
             text = json.dumps(part, ensure_ascii=False)
             leaked = [r for r in ("东区", "南区", "西区", "北区", "中区") if r in text]
             assert not leaked, (label, where, leaked)
-        # 区域认不出，只能按行号认（同 test_the_same_rows_are_not_the_same_citation_when_a_cited_region_moved_out_of_them）
-        assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES]), label
+        # 照样拿遮住的区域列核对出西区挪出了引用的行，说明只写行号（同上一条用例的遮罩那一段）
+        assert (total["classification"], total["reasons"]) == ("incomparable", [MASKED_MOVED]), label
         # 整体说明照样提一句有列设了遮罩：归因少了区域这一列，看的人要知道是遮掉了，不是没有
         assert compare.MASKED_NOTE in result["notes"], label
 

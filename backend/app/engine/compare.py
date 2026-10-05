@@ -1146,8 +1146,9 @@ class _Compare:
         归因说的南区就不是同一组数——归因按哪组维度说，就要按哪组维度核对。只按归因用的那组也不够：只引用了一行的，
         引用的行里每列都只有一个值，认不出维度；整份结果里分得清的维度（区域, 渠道）也要切在同一处。
 
-        遮罩列只用没遮的列认，说明里写的也只有没遮的列的值和行号，遮住的值不进说明；两组都分不出维度（没有不是数值的
-        列、维度列都设了遮罩）的，只能按行号认，返回 None。快照读不出来的说不清：只有单格会走到这里（行段在 _citation
+        先只用没遮的列认，说明里写的是没遮的列的值和行号；有列设了遮罩的，再连遮住的列一起核对一遍（区域设了遮罩时它
+        往往正是唯一认得出行的那一列，只用没遮的列等于对它不核对），这一遍的说明只写行号、不写是哪个值。两遍都分不出
+        维度（没有不是数值的列）的，只能按行号认，返回 None。快照读不出来的说不清：只有单格会走到这里（行段在 _citation
         里先核对整份结果，读不出来的已经说不清），那一行两次是不是同一个维度值核对不了，和行段一样不按行号当成同一处。
         快照里有的行和列对不上（格数不对、不是一行）的，认不出各行是哪个维度值，同样说不清。"""
         if qb.snap is None or qt.snap is None:
@@ -1167,12 +1168,29 @@ class _Compare:
         for dims in dict.fromkeys(tuple(d) for d in (whole, used) if d):
             if (found := self._cut(name, what, b, t, rb, rt, list(dims))) is not None:
                 return found
+        if hidden and any(str(c).lower() in hidden for snap in (qb.snap, qt.snap) for c in snap.get("columns") or []):
+            # 拿遮住的列核对过（哪怕最后没核对出不同）：整体说明照样提一句有列设了遮罩
+            self.masked_seen = True
+        if hidden:
+            # 遮罩列不当维度，是为了值不进说明；可它往往正是认得出行的那一列（区域设了遮罩），只拿没遮的列核对，等于对它
+            # 不核对，挤出引用的行就和真的没有了分不出来。连遮住的列一起再核对一遍，说明里只写行号、不写值
+            whole, _ = _dimensions(qb.snap, qt.snap, rb, rt, measure, frozenset())
+            used, _ = _dimensions(qb.snap, qt.snap, _attributed_rows(qb.snap, b) or [],
+                                  _attributed_rows(qt.snap, t) or [], measure, frozenset())
+            for dims in dict.fromkeys(tuple(d) for d in (whole, used) if d):
+                if (found := self._cut(name, what, b, t, rb, rt, list(dims), redact=True)) is not None:
+                    return found
         return None
 
     def _cut(self, name: str, what: str, b: Any, t: Any, rb: list[tuple[int, dict[str, Any]]],
-             rt: list[tuple[int, dict[str, Any]]], dims: list[str]) -> _Change | None:
+             rt: list[tuple[int, dict[str, Any]]], dims: list[str], *, redact: bool = False) -> _Change | None:
         """按 dims 这组维度核对两边引用的是不是同一批维度值（规则见 _left_out）：是返回 None，不是返回说明。rb、rt 是
-        两边整份结果的行。"""
+        两边整份结果的行。redact：dims 里有设了遮罩的列，说明里不写是哪个维度值，只写行号。"""
+
+        def named(key: tuple[Any, ...]) -> str:
+            return "其中一个维度值" if redact else _key_text(key)
+
+        masked_note = "（维度列设了遮罩，不写出是哪个值）" if redact else ""
 
         def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, list[int]]]:
             """{维度键: 引用的行里有几行}，{维度键: [引用的行外面的行号]}。一个键可能占几行（去掉日期这类每期都不同的
@@ -1209,9 +1227,9 @@ class _Compare:
                     # 那一行两次都是它（单格只有一行，nb、nt 都是 1）：还要是它同样的那一行，排在前面的行数一样
                     if ahead(ob) == ahead(ot):
                         continue
-                    return _Change("unknown", f"{name}两次都引用{cited}，两次都是{_key_text(key)}，可不是它同样的那一行"
+                    return _Change("unknown", f"{name}两次都引用{cited}，两次都是{named(key)}，可不是它同样的那一行"
                                               f"（它排在这一行前面的，基准运行有 {ahead(ob)} 行，这次有 {ahead(ot)} 行），"
-                                              f"取的不是{what}")
+                                              f"取的不是{what}{masked_note}")
                 # 不是同一个维度值：看只在一边被引用的它在另一边的快照里还有没有——有（只是不在这一行）是换了一个数，
                 # 没有是真的没有了、这次才有
                 if not (ot if nb > nt else ob):
@@ -1222,9 +1240,9 @@ class _Compare:
                     continue
                 if cb is not None and ct is not None and nb == nt:
                     # 都只引用了它的一部分、行数也一样，可排在引用的行前面的行数不同：引用的不是它同样的那几行
-                    return _Change("unknown", f"{name}两次都引用{cited}，两次都引用了{_key_text(key)}的 {nb} 行，可不是"
+                    return _Change("unknown", f"{name}两次都引用{cited}，两次都引用了{named(key)}的 {nb} 行，可不是"
                                               f"它同样的那几行（它排在引用的行前面的，基准运行有 {cb[0]} 行，这次有 "
-                                              f"{ct[0]} 行），取的不是{what}")
+                                              f"{ct[0]} 行），取的不是{what}{masked_note}")
             # 说引用的行外面有它的那一边；两边都有的，说引用得少的那一边
             if ot and (not ob or nt < nb):
                 where = (f"这次有 {len(ot)} 行在查询结果{_row_numbers(ot)}" if nt
@@ -1232,8 +1250,8 @@ class _Compare:
             else:
                 where = (f"在基准运行中有 {len(ob)} 行位于查询结果{_row_numbers(ob)}" if nb
                          else f"在基准运行中位于查询结果{_row_numbers(ob)}")
-            return _Change("unknown", f"{name}两次都引用{cited}，{_key_text(key)}{where}，不在引用的行里，"
-                                      f"取的不是{what}")
+            return _Change("unknown", f"{name}两次都引用{cited}，{named(key)}{where}，不在引用的行里，"
+                                      f"取的不是{what}{masked_note}")
         return None
 
     def _hidden(self, b: Any, t: Any) -> frozenset[str]:
