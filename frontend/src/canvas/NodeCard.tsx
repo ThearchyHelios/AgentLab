@@ -96,7 +96,7 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return config.workflow_id ? '嵌套工作流' : '未选择工作流'
     // 还是占位的两种：卡片上直接说尚未生效，免得以为放上去就会执行
     case 'challenge':
-      return CHALLENGE_TEXT.pending
+      return CHALLENGE_TEXT.summary(config)
     default:
       return ''
   }

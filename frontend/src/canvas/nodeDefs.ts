@@ -8,6 +8,7 @@ import {
 } from '../lib/terms'
 import type { NodeType } from '../types'
 import { dualCheckFields, dualCheckSummary } from './DualCheckFields'
+import { nodePickField, triStateField, upstreamModel, verifyModelFields } from './verifyFields'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
@@ -735,9 +736,44 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   challenge: {
     type: 'challenge', label: NODE_TYPE_LABEL.challenge, category: '把关', icon: ShieldAlert,
-    description: `${CHALLENGE_TEXT.description}。${CHALLENGE_TEXT.pending}`,
+    description: CHALLENGE_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
-    fields: [],
+    // 上限、模型、开关都可以不写：服务端按「设置 → 偏好设置 → 核查」里反方审稿那一组取（verify_settings）。
+    // 没写的项不往配置里落默认值，设置改了，没单独配过的节点跟着变
+    fields: [
+      // 留空时先认直接连着的报告（「初稿 → 终稿 → 反方审稿」审终稿），同服务端 schema.challenge_report
+      nodePickField({
+        key: 'report', label: CHALLENGE_TEXT.field.report, nodeType: 'report', rule: 'direct', text: CHALLENGE_TEXT.reportPick,
+      }),
+      {
+        key: 'max_claims', label: CHALLENGE_TEXT.field.max_claims, type: 'number', min: 1,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.max_claims,
+      },
+      // 和撰写报告的模型相同时提醒：同一个模型审自己写的结论，较难发现错误
+      ...verifyModelFields({
+        labels: { provider: CHALLENGE_TEXT.field.provider, model: CHALLENGE_TEXT.field.model },
+        text: CHALLENGE_TEXT.model, subject: upstreamModel('report', 'report', 'direct'),
+      }),
+      {
+        // 没写等于 degrade：降档放第一项，没写时下拉框正好落在它上面
+        key: 'on_refuted', label: CHALLENGE_TEXT.field.on_refuted, type: 'select',
+        options: [
+          { value: 'degrade', label: CHALLENGE_TEXT.onRefuted.degrade },
+          { value: 'flag', label: CHALLENGE_TEXT.onRefuted.flag },
+          { value: 'fail', label: CHALLENGE_TEXT.onRefuted.fail },
+        ],
+        help: CHALLENGE_TEXT.help.on_refuted, unknownLabel: CHALLENGE_TEXT.unknownValue,
+      },
+      triStateField({ key: 'enabled', label: CHALLENGE_TEXT.field.enabled, text: CHALLENGE_TEXT.enabled }),
+      {
+        key: 'max_queries', label: CHALLENGE_TEXT.field.max_queries, type: 'number', min: 1, advanced: true,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.max_queries,
+      },
+      {
+        key: 'timeout_s', label: CHALLENGE_TEXT.field.timeout_s, type: 'number', min: 1, advanced: true,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.timeout_s,
+      },
+    ],
     defaults: {},
   },
 }

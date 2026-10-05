@@ -1,0 +1,1080 @@
+{
+ "//": "反方审稿预览用例与 check-challenge 共用的夹具。理由文档由后端 run_verify_agent + compose_doc 真跑出来（虚构的 SQLite 库），表名、地名、数字都是虚构的",
+ "runs": {
+  "formal": "run-chal-formal",
+  "flag": "run-chal-flag",
+  "explore": "run-chal-explore",
+  "none": "run-chal-none",
+  "many": "run-chal-many",
+  "broken": "run-chal-broken",
+  "clear": "run-chal-clear",
+  "clearFlag": "run-chal-clear-flag",
+  "exploreFlag": "run-chal-explore-flag",
+  "runfail": "run-chal-runfail",
+  "dup": "run-chal-dup",
+  "norecord": "run-chal-norecord"
+ },
+ "report": {
+  "node_id": "write",
+  "label": "写月报",
+  "claims": "off",
+  "stats": {
+   "numbers": 6,
+   "numbers_cited": 6,
+   "uncited_numbers": 0,
+   "unresolved": 0
+  }
+ },
+ "challenge": {
+  "counts": {
+   "stands": 1,
+   "weakened": 1,
+   "refuted": 1,
+   "inconclusive": 1
+  },
+  "items": [
+   {
+    "unit": "u3",
+    "text": "9 月销售额环比增长 12.4%，增长主要来自新客。",
+    "verdict": "refuted"
+   },
+   {
+    "unit": "u5",
+    "text": "青岚区贡献了一半以上的增长。",
+    "verdict": "weakened"
+   },
+   {
+    "unit": "u8",
+    "text": "9 月退款率保持在 2% 以下。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u11",
+    "text": "线上渠道的客单价高于门店。",
+    "verdict": "inconclusive"
+   }
+  ],
+  "artifact": "43381f302615492cab9a2d28acfbc251afb2c2a6a4f35f6e8b6543827b5f7845"
+ },
+ "many": {
+  "counts": {
+   "stands": 7,
+   "weakened": 2,
+   "refuted": 2,
+   "inconclusive": 1
+  },
+  "items": [
+   {
+    "unit": "u20",
+    "text": "白汀区 9 月订单量高于 8 月。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u21",
+    "text": "云屿区仍是销售额最高的区。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u22",
+    "text": "老客复购率明显上升。",
+    "verdict": "weakened"
+   },
+   {
+    "unit": "u23",
+    "text": "退款集中在云屿区。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u24",
+    "text": "青岚区新客数量翻了一番。",
+    "verdict": "refuted"
+   },
+   {
+    "unit": "u25",
+    "text": "三个区的销售额都在增长。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u26",
+    "text": "周末订单占比有所提高。",
+    "verdict": "inconclusive"
+   },
+   {
+    "unit": "u27",
+    "text": "大额订单数量与上月持平。",
+    "verdict": "stands"
+   },
+   {
+    "unit": "u28",
+    "text": "客单价的提升主要来自青岚区。",
+    "verdict": "weakened"
+   },
+   {
+    "unit": "u29",
+    "text": "9 月没有出现单日销售额为零的门店。",
+    "verdict": "stands"
+   }
+  ],
+  "artifact": "dad9224ddaed549de56eac6e96902cf448291e8aaabb1699d09f25b87fc3541d",
+  "on_refuted": "degrade"
+ },
+ "doc_u8": "8da1c00e7a24b0eabe6f33efc13ec5d2e6578fddd8aaf67de5fb9d303cb12b90",
+ "artifacts": {
+  "43381f302615492cab9a2d28acfbc251afb2c2a6a4f35f6e8b6543827b5f7845": {
+   "report": "write",
+   "doc_artifact": "1b03b7ae4cdda13ae128a29e85ac985a3b1d66041318f4a53166c970e99fdf81",
+   "claims": [
+    {
+     "unit": "u3",
+     "text": "9 月销售额环比增长 12.4%，增长主要来自新客。",
+     "verdict": "refuted",
+     "rationale": "按客户类型拆分：9 月新客销售额 151,000 元，低于 8 月的 182,000 元；老客从 962,000 元增至 1,135,000 元。增长来自老客，新客反而下降。",
+     "rationale_doc": {
+      "schema": "agentlab.report/1",
+      "entity_syntax": 2,
+      "provenance": 1,
+      "run_id": "run-chal-formal",
+      "node_id": "critic",
+      "markdown": "按客户类型拆分：9 月新客销售额 151,000 元，低于 8 月的 182,000 元；老客从 962,000 元增至 1,135,000 元。增长来自老客，新客反而下降。",
+      "source": "按客户类型拆分：9 月新客销售额 [[v:Q1.r0.amount]] 元，低于 8 月的 [[v:Q2.r0.amount]] 元；老客从 [[v:Q2.r1.amount]] 元增至 [[v:Q1.r1.amount]] 元。增长来自老客，新客反而下降。",
+      "catalog": {
+       "Q1": {
+        "alias": "Q1",
+        "kind": "query",
+        "eid": "ev:query:1db67c3eb22cd18c",
+        "locator": {},
+        "node_id": "critic",
+        "exec": 1,
+        "artifact": "4a1da399f511fabb37b962da2749e34406f67c56014550a7630f5bb4d98fc163",
+        "call_id": "u3-c0",
+        "tool": "db_query__lanshan_retail",
+        "source": "lanshan_retail",
+        "columns": [
+         "customer_type",
+         "amount"
+        ],
+        "rows": 2,
+        "truncated": false,
+        "label": "db_query__lanshan_retail · 2 行"
+       },
+       "Q2": {
+        "alias": "Q2",
+        "kind": "query",
+        "eid": "ev:query:79f93ddf166ebee9",
+        "locator": {},
+        "node_id": "critic",
+        "exec": 1,
+        "artifact": "b13138a32f067d0d5b330fe15955029a4ed953c64ccc9636dfa9f443f67f7a0d",
+        "call_id": "u3-c1",
+        "tool": "db_query__lanshan_retail",
+        "source": "lanshan_retail",
+        "columns": [
+         "customer_type",
+         "amount"
+        ],
+        "rows": 2,
+        "truncated": false,
+        "label": "db_query__lanshan_retail · 2 行"
+       }
+      },
+      "blocks": [
+       {
+        "type": "paragraph",
+        "units": [
+         {
+          "id": "u0",
+          "kind": "claim",
+          "span": [
+           0,
+           73
+          ],
+          "cites": [
+           "Q1",
+           "Q2"
+          ],
+          "see": [],
+          "segments": [
+           {
+            "kind": "text",
+            "text": "按客户类型拆分：9 月新客销售额 ",
+            "state": "neutral",
+            "span": [
+             0,
+             17
+            ],
+            "id": "s0"
+           },
+           {
+            "kind": "number",
+            "text": "151,000",
+            "ref": "v:Q1.r0.amount",
+            "cite": {
+             "ref": "Q1.r0.amount",
+             "alias": "Q1",
+             "locator": {
+              "row": 0,
+              "column": "amount"
+             },
+             "eid": "ev:cell:0a0f13bc23a46da7",
+             "kind": "cell",
+             "role": "value",
+             "status": "resolved",
+             "value": 151000.0,
+             "rendered": "151,000"
+            },
+            "state": "deterministic",
+            "span": [
+             17,
+             24
+            ],
+            "id": "s1"
+           },
+           {
+            "kind": "text",
+            "text": " 元，低于 8 月的 ",
+            "state": "neutral",
+            "span": [
+             24,
+             35
+            ],
+            "id": "s2"
+           },
+           {
+            "kind": "number",
+            "text": "182,000",
+            "ref": "v:Q2.r0.amount",
+            "cite": {
+             "ref": "Q2.r0.amount",
+             "alias": "Q2",
+             "locator": {
+              "row": 0,
+              "column": "amount"
+             },
+             "eid": "ev:cell:ba5847ac3ea0a7a4",
+             "kind": "cell",
+             "role": "value",
+             "status": "resolved",
+             "value": 182000.0,
+             "rendered": "182,000"
+            },
+            "state": "deterministic",
+            "span": [
+             35,
+             42
+            ],
+            "id": "s3"
+           },
+           {
+            "kind": "text",
+            "text": " 元；老客从 ",
+            "state": "neutral",
+            "span": [
+             42,
+             49
+            ],
+            "id": "s4"
+           },
+           {
+            "kind": "number",
+            "text": "962,000",
+            "ref": "v:Q2.r1.amount",
+            "cite": {
+             "ref": "Q2.r1.amount",
+             "alias": "Q2",
+             "locator": {
+              "row": 1,
+              "column": "amount"
+             },
+             "eid": "ev:cell:d71b3885da80963a",
+             "kind": "cell",
+             "role": "value",
+             "status": "resolved",
+             "value": 962000.0,
+             "rendered": "962,000"
+            },
+            "state": "deterministic",
+            "span": [
+             49,
+             56
+            ],
+            "id": "s5"
+           },
+           {
+            "kind": "text",
+            "text": " 元增至 ",
+            "state": "neutral",
+            "span": [
+             56,
+             61
+            ],
+            "id": "s6"
+           },
+           {
+            "kind": "number",
+            "text": "1,135,000",
+            "ref": "v:Q1.r1.amount",
+            "cite": {
+             "ref": "Q1.r1.amount",
+             "alias": "Q1",
+             "locator": {
+              "row": 1,
+              "column": "amount"
+             },
+             "eid": "ev:cell:dc6888990b89154a",
+             "kind": "cell",
+             "role": "value",
+             "status": "resolved",
+             "value": 1135000.0,
+             "rendered": "1,135,000"
+            },
+            "state": "deterministic",
+            "span": [
+             61,
+             70
+            ],
+            "id": "s7"
+           },
+           {
+            "kind": "text",
+            "text": " 元。",
+            "state": "neutral",
+            "span": [
+             70,
+             73
+            ],
+            "id": "s8"
+           }
+          ]
+         },
+         {
+          "id": "u1",
+          "kind": "claim",
+          "span": [
+           73,
+           87
+          ],
+          "cites": [],
+          "see": [],
+          "segments": [
+           {
+            "kind": "text",
+            "text": "增长来自老客，新客反而下降。",
+            "state": "neutral",
+            "span": [
+             73,
+             87
+            ],
+            "id": "s9"
+           }
+          ]
+         }
+        ],
+        "id": "b0"
+       }
+      ],
+      "stats": {
+       "units": 2,
+       "segments": 10,
+       "claims": 2,
+       "connective": 0,
+       "headings": 0,
+       "numbers": 4,
+       "numbers_cited": 4,
+       "values": 0,
+       "entities": 0,
+       "quotes": 0,
+       "uncited_numbers": 0,
+       "unresolved": 0,
+       "unknown_entities": 0,
+       "unverified_entities": 0,
+       "see": 0,
+       "uncited_claims": 1,
+       "violations": 0
+      },
+      "violations": []
+     },
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "4a1da399f511fabb37b962da2749e34406f67c56014550a7630f5bb4d98fc163",
+       "sql": "SELECT customer_type, SUM(amount) AS amount FROM orders WHERE is_refund = 0 AND month = '2026-09' GROUP BY customer_type ORDER BY customer_type",
+       "row_count": 2,
+       "truncated": false,
+       "source": "lanshan_retail"
+      },
+      {
+       "alias": "Q2",
+       "artifact": "b13138a32f067d0d5b330fe15955029a4ed953c64ccc9636dfa9f443f67f7a0d",
+       "sql": "SELECT customer_type, SUM(amount) AS amount FROM orders WHERE is_refund = 0 AND month = '2026-08' GROUP BY customer_type ORDER BY customer_type",
+       "row_count": 2,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ],
+     "usage": {
+      "input_tokens": 581,
+      "output_tokens": 3,
+      "total_tokens": 584,
+      "cost_usd": 0.0,
+      "calls": 4
+     }
+    },
+    {
+     "unit": "u5",
+     "text": "青岚区贡献了一半以上的增长。",
+     "verdict": "weakened",
+     "rationale": "青岚区增量 72,000 元，是三个区中最多的；但白汀区、云屿区合计增量也有 70000 元，青岚区的占比不到一半。",
+     "rationale_doc": {
+      "schema": "agentlab.report/1",
+      "entity_syntax": 2,
+      "provenance": 1,
+      "run_id": "run-chal-formal",
+      "node_id": "critic",
+      "markdown": "青岚区增量 72,000 元，是三个区中最多的；但白汀区、云屿区合计增量也有 70000 元，青岚区的占比不到一半。",
+      "source": "青岚区增量 [[v:Q1.r0.delta]] 元，是三个区中最多的；但白汀区、云屿区合计增量也有 70000 元，青岚区的占比不到一半。",
+      "catalog": {
+       "Q1": {
+        "alias": "Q1",
+        "kind": "query",
+        "eid": "ev:query:b1668f44771fbb87",
+        "locator": {},
+        "node_id": "critic",
+        "exec": 1,
+        "artifact": "5aae93c426f3710e06d98f0ada1afcc84387a422cf5739802ae6f6ce9069d4bb",
+        "call_id": "u5-c0",
+        "tool": "db_query__lanshan_retail",
+        "source": "lanshan_retail",
+        "columns": [
+         "district",
+         "delta"
+        ],
+        "rows": 3,
+        "truncated": false,
+        "label": "db_query__lanshan_retail · 3 行"
+       }
+      },
+      "blocks": [
+       {
+        "type": "paragraph",
+        "units": [
+         {
+          "id": "u0",
+          "kind": "claim",
+          "span": [
+           0,
+           58
+          ],
+          "cites": [
+           "Q1"
+          ],
+          "see": [],
+          "segments": [
+           {
+            "kind": "text",
+            "text": "青岚区增量 ",
+            "state": "neutral",
+            "span": [
+             0,
+             6
+            ],
+            "id": "s0"
+           },
+           {
+            "kind": "number",
+            "text": "72,000",
+            "ref": "v:Q1.r0.delta",
+            "cite": {
+             "ref": "Q1.r0.delta",
+             "alias": "Q1",
+             "locator": {
+              "row": 0,
+              "column": "delta"
+             },
+             "eid": "ev:cell:e6298c09825e45b9",
+             "kind": "cell",
+             "role": "value",
+             "status": "resolved",
+             "value": 72000.0,
+             "rendered": "72,000"
+            },
+            "state": "deterministic",
+            "span": [
+             6,
+             12
+            ],
+            "id": "s1"
+           },
+           {
+            "kind": "text",
+            "text": " 元，是",
+            "span": [
+             12,
+             16
+            ],
+            "state": "neutral",
+            "id": "s2"
+           },
+           {
+            "kind": "number",
+            "text": "三",
+            "span": [
+             16,
+             17
+            ],
+            "state": "none",
+            "issue": "uncited_number",
+            "id": "s3"
+           },
+           {
+            "kind": "text",
+            "text": "个区中最多的；但白汀区、云屿区合计增量也有 ",
+            "span": [
+             17,
+             39
+            ],
+            "state": "neutral",
+            "id": "s4"
+           },
+           {
+            "kind": "number",
+            "text": "70000",
+            "span": [
+             39,
+             44
+            ],
+            "state": "none",
+            "issue": "uncited_number",
+            "id": "s5"
+           },
+           {
+            "kind": "text",
+            "text": " 元，青岚区的占比不到",
+            "span": [
+             44,
+             55
+            ],
+            "state": "neutral",
+            "id": "s6"
+           },
+           {
+            "kind": "number",
+            "text": "一半",
+            "span": [
+             55,
+             57
+            ],
+            "state": "none",
+            "issue": "uncited_number",
+            "id": "s7"
+           },
+           {
+            "kind": "text",
+            "text": "。",
+            "span": [
+             57,
+             58
+            ],
+            "state": "neutral",
+            "id": "s8"
+           }
+          ]
+         }
+        ],
+        "id": "b0"
+       }
+      ],
+      "stats": {
+       "units": 1,
+       "segments": 9,
+       "claims": 1,
+       "connective": 0,
+       "headings": 0,
+       "numbers": 4,
+       "numbers_cited": 1,
+       "values": 0,
+       "entities": 0,
+       "quotes": 0,
+       "uncited_numbers": 3,
+       "unresolved": 0,
+       "unknown_entities": 0,
+       "unverified_entities": 0,
+       "see": 0,
+       "uncited_claims": 0,
+       "violations": 3
+      },
+      "violations": [
+       {
+        "code": "uncited_number",
+        "message": "数字「三」没有出处：报告中直接写出了数字，系统无法核对",
+        "for_model": "数字「三」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+        "span": [
+         16,
+         17
+        ],
+        "text": "三",
+        "context": "青岚区增量 72,000 元，是三个区中最多的；但白汀区、云屿区合计增",
+        "segment": "s3",
+        "unit": "u0"
+       },
+       {
+        "code": "uncited_number",
+        "message": "数字「70000」没有出处：报告中直接写出了数字，系统无法核对",
+        "for_model": "数字「70000」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+        "span": [
+         39,
+         44
+        ],
+        "text": "70000",
+        "context": "多的；但白汀区、云屿区合计增量也有 70000 元，青岚区的占比不到一半。",
+        "segment": "s5",
+        "unit": "u0"
+       },
+       {
+        "code": "uncited_number",
+        "message": "数字「一半」没有出处：报告中直接写出了数字，系统无法核对",
+        "for_model": "数字「一半」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+        "span": [
+         55,
+         57
+        ],
+        "text": "一半",
+        "context": "有 70000 元，青岚区的占比不到一半。",
+        "segment": "s7",
+        "unit": "u0"
+       }
+      ]
+     },
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "5aae93c426f3710e06d98f0ada1afcc84387a422cf5739802ae6f6ce9069d4bb",
+       "sql": "SELECT district, SUM(CASE WHEN month = '2026-09' THEN amount ELSE 0 END) - SUM(CASE WHEN month = '2026-08' THEN amount ELSE 0 END) AS delta FROM orders WHERE is_refund = 0 GROUP BY district ORDER BY delta DESC",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ],
+     "usage": {
+      "input_tokens": 264,
+      "output_tokens": 2,
+      "total_tokens": 266,
+      "cost_usd": 0.0,
+      "calls": 3
+     }
+    },
+    {
+     "unit": "u8",
+     "text": "9 月退款率保持在 2% 以下。",
+     "verdict": "stands",
+     "rationale": "9 月退款金额 21,500 元，占当月订单金额的比例为 0.0164，结论成立。",
+     "rationale_doc": "8da1c00e7a24b0eabe6f33efc13ec5d2e6578fddd8aaf67de5fb9d303cb12b90",
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "8a0a49da574589f1108757ac8c7bc72eba7d48bb905627a201134764c55beef9",
+       "sql": "SELECT SUM(CASE WHEN is_refund = 1 THEN amount ELSE 0 END) AS refund, ROUND(SUM(CASE WHEN is_refund = 1 THEN amount ELSE 0 END) * 1.0 / SUM(amount), 4) AS rate FROM orders WHERE month = '2026-09'",
+       "row_count": 1,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ],
+     "usage": {
+      "input_tokens": 251,
+      "output_tokens": 2,
+      "total_tokens": 253,
+      "cost_usd": 0.0,
+      "calls": 3
+     }
+    },
+    {
+     "unit": "u11",
+     "text": "线上渠道的客单价高于门店。",
+     "verdict": "inconclusive",
+     "rationale": "数据源中没有区分线上与门店的字段，无法判断这句结论。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "62217061d25cfac1db2b8dd81892066d9b4971a29e4637f1ef14f26eeee3d386",
+       "sql": "SELECT * FROM orders LIMIT 50",
+       "row_count": 50,
+       "truncated": true,
+       "source": "lanshan_retail"
+      }
+     ],
+     "usage": {
+      "input_tokens": 233,
+      "output_tokens": 41,
+      "total_tokens": 274,
+      "cost_usd": 0.0012,
+      "calls": 2
+     }
+    }
+   ],
+   "model": "critic-large"
+  },
+  "8da1c00e7a24b0eabe6f33efc13ec5d2e6578fddd8aaf67de5fb9d303cb12b90": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-chal-formal",
+   "node_id": "critic",
+   "markdown": "9 月退款金额 21,500 元，占当月订单金额的比例为 0.0164，结论成立。",
+   "source": "9 月退款金额 [[v:Q1.r0.refund]] 元，占当月订单金额的比例为 [[v:Q1.r0.rate]]，结论成立。",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:054504d0cb205b77",
+     "locator": {},
+     "node_id": "critic",
+     "exec": 1,
+     "artifact": "8a0a49da574589f1108757ac8c7bc72eba7d48bb905627a201134764c55beef9",
+     "call_id": "u8-c0",
+     "tool": "db_query__lanshan_retail",
+     "source": "lanshan_retail",
+     "columns": [
+      "refund",
+      "rate"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__lanshan_retail · 1 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u0",
+       "kind": "claim",
+       "span": [
+        0,
+        41
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "9 月退款金额 ",
+         "state": "neutral",
+         "span": [
+          0,
+          8
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "number",
+         "text": "21,500",
+         "ref": "v:Q1.r0.refund",
+         "cite": {
+          "ref": "Q1.r0.refund",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "refund"
+          },
+          "eid": "ev:cell:d1776657622dc7a2",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500.0,
+          "rendered": "21,500"
+         },
+         "state": "deterministic",
+         "span": [
+          8,
+          14
+         ],
+         "id": "s1"
+        },
+        {
+         "kind": "text",
+         "text": " 元，占当月订单金额的比例为 ",
+         "state": "neutral",
+         "span": [
+          14,
+          29
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "number",
+         "text": "0.0164",
+         "ref": "v:Q1.r0.rate",
+         "cite": {
+          "ref": "Q1.r0.rate",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "rate"
+          },
+          "eid": "ev:cell:0a01eeda467fe3ce",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0164,
+          "rendered": "0.0164"
+         },
+         "state": "deterministic",
+         "span": [
+          29,
+          35
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "text",
+         "text": "，结论成立。",
+         "state": "neutral",
+         "span": [
+          35,
+          41
+         ],
+         "id": "s4"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    }
+   ],
+   "stats": {
+    "units": 1,
+    "segments": 5,
+    "claims": 1,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "values": 0,
+    "entities": 0,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 0,
+    "uncited_claims": 0,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "dad9224ddaed549de56eac6e96902cf448291e8aaabb1699d09f25b87fc3541d": {
+   "report": "write",
+   "doc_artifact": "1b03b7ae4cdda13ae128a29e85ac985a3b1d66041318f4a53166c970e99fdf81",
+   "claims": [
+    {
+     "unit": "u20",
+     "text": "白汀区 9 月订单量高于 8 月。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：白汀区 9 月订单量高于 8 月这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "cc2aa1d637a2ac89c00a5307661e7ff4f3bac699db375a703bfdcf38201d06dd",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u21",
+     "text": "云屿区仍是销售额最高的区。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：云屿区仍是销售额最高的区这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "edf596cc32996af36b5e78fbcc6e60946841e8d6704f494b83a7e9606475a68d",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u22",
+     "text": "老客复购率明显上升。",
+     "verdict": "weakened",
+     "rationale": "按 orders 表复核：老客复购率明显上升这一说法只部分成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "8a66366737b3140d307236b8fce3f0297a3c093b60529e0d3d15a50e13382004",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u23",
+     "text": "退款集中在云屿区。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：退款集中在云屿区这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "b6c81578dfbab675d02554e5a5524da25174e636344cfed90131367b0d5e193b",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u24",
+     "text": "青岚区新客数量翻了一番。",
+     "verdict": "refuted",
+     "rationale": "按 orders 表复核：青岚区新客数量翻了一番这一说法与查询结果不符。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "752364b7b25e4de0bee322582d7a205ecab5476ba1f62290b842486883fcbf53",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u25",
+     "text": "三个区的销售额都在增长。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：三个区的销售额都在增长这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "fa96ed5ded14063346879e23109aa7200e87ce7ecd0631643ef6512a024f0ea2",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u26",
+     "text": "周末订单占比有所提高。",
+     "verdict": "inconclusive",
+     "rationale": "按 orders 表复核：周末订单占比有所提高这一说法无法从现有数据判断。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "c890124d6e3357b415f1e7a51235ce76657b4519e6013d440855d12a4e9ff6aa",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u27",
+     "text": "大额订单数量与上月持平。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：大额订单数量与上月持平这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "2ca8f43235a32539d4f65cacd6d3de6d5f28c618a2ffde74fa2eae0f110d6d5e",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u28",
+     "text": "客单价的提升主要来自青岚区。",
+     "verdict": "weakened",
+     "rationale": "按 orders 表复核：客单价的提升主要来自青岚区这一说法只部分成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "bf09144566e4263917ea89ae2d52f5e23ebab1889c516088c3cd5d0eb4e194bd",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u29",
+     "text": "9 月没有出现单日销售额为零的门店。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：9 月没有出现单日销售额为零的门店这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "4ecf3bf8b99e3770a4fbe68dacae228d8b4a71e87e5659a3da2c0bc6c24b9212",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u30",
+     "text": "白汀区的退款金额高于云屿区。",
+     "verdict": "refuted",
+     "rationale": "按 orders 表复核：白汀区的退款金额高于云屿区这一说法与查询结果不符。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "a5c007cfee1b26ede1cb1361d33e007c49f563dc2c8d584660a316ee66089d75",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    },
+    {
+     "unit": "u31",
+     "text": "9 月销售额创年内新高。",
+     "verdict": "stands",
+     "rationale": "按 orders 表复核：9 月销售额创年内新高这一说法成立。",
+     "rationale_doc": null,
+     "queries": [
+      {
+       "alias": "Q1",
+       "artifact": "f5619f980c194fbe53fc1beedc18bbd8448e3352b19440a4a435000527d85ad3",
+       "sql": "SELECT district, SUM(amount) AS amount FROM orders WHERE month = '2026-09' GROUP BY district",
+       "row_count": 3,
+       "truncated": false,
+       "source": "lanshan_retail"
+      }
+     ]
+    }
+   ],
+   "model": "critic-large"
+  }
+ }
+}
