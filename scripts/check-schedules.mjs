@@ -6,7 +6,7 @@
 // 记录页看不出哪些运行来自定时任务、390px 窄屏被表单撑出横向滚动。
 // 还有几处时序和口径：晚到的刷新把刚切换的开关盖回去、先开触发历史再开设置时带着旧版本撞假的 409、保存途中又改了
 // 别的字段时替换过的地址明文留在框里、服务端会拒的组合（未发布 + 正式运行、必填没填、已发布版本里没有的字段）
-// 照样放行、测试消息的结果把服务端的整句又套一层。
+// 照样放行、测试消息的结果把服务端的整句又套一层、错过已跳过的那条悬停另说一个原因（和本条记的原因对不上）。
 //
 // 浏览器的本机时区故意设成 America/Los_Angeles，和定时任务的时区（Asia/Shanghai、America/New_York）都不同：
 // 两者相同时「按定时任务时区写」和「按本机写」在页面上看不出区别，时间相关的断言一律比对按定时任务时区写出的原文。
@@ -371,18 +371,28 @@ const S2 = {
 
 /**
  * 触发历史：25 条，新的在前，按 20 条一页给。计划时间都是北京时间周一 09:00（往前数第 i+1 周）。
- * 几种类型、结局、通知结果各放一条；错过且超出宽限的照服务端的记法是 kind=misfire、status=skipped_misfire
+ * 几种类型、结局、通知结果各放一条。错过、没有补发的，服务端一律记成 kind=misfire、status=skipped_misfire，
+ * 原因却有两种，各放一条、原因照服务端的原话写：f03 是停机一周多、在宽限内恢复时积压的那一次（最近一次就是补发的
+ * f02），f05 是超出补发宽限的。f06、f07 没有记原因（约定里 reason 可以是 null），看兜底的说明
  */
 function makeFires() {
   const out = []
+  const local = (at) => {
+    const w = wall(Date.parse(at), 'Asia/Shanghai')
+    return `${w.y}-${pad2(w.mo)}-${pad2(w.d)} ${pad2(w.h)}:${pad2(w.mi)}`
+  }
+  const missed = { kind: 'misfire', status: 'skipped_misfire', run_id: null, run_status: null }
   for (let i = 0; i < 25; i++) {
     const at = iso(nextMonday9(-(i + 1)))
     let f = fire(`f${String(i).padStart(2, '0')}`, { fire_at: at, created_at: at })
     if (i === 0) f = { ...f, kind: 'manual', notified: [{ event: 'finished', status: 'ok', at }, { event: 'failed', status: 'failed', at }] }
     if (i === 1) f = { ...f, status: 'skipped_overlap', run_id: null, run_status: null, reason: '上一次运行（#9f8e7d）尚未结束' }
     if (i === 2) f = { ...f, kind: 'misfire', run_status: 'failed' }
-    if (i === 3) f = { ...f, kind: 'misfire', status: 'skipped_misfire', run_id: null, run_status: null, reason: '服务停机，错过触发时间 3 小时，超出补发宽限 1 小时' }
+    if (i === 3) f = { ...f, ...missed, reason: `服务未运行，错过了 ${local(at)} 的触发；积压的触发不补，只发起最近一次` }
     if (i === 4) f = { ...f, status: 'failed_to_start', run_id: null, run_status: null, reason: '工作流「门店周报」还没有发布：正式运行需要已发布的版本' }
+    if (i === 5) f = { ...f, ...missed, reason: `服务未运行，错过了 ${local(at)} 的触发，超出补发宽限（1 小时），没有发起` }
+    if (i === 6) f = { ...f, ...missed, reason: null }
+    if (i === 7) f = { ...f, status: 'failed_to_start', run_id: null, run_status: null, reason: null }
     out.push(f)
   }
   return out
@@ -1270,11 +1280,28 @@ await section('详情：触发历史分页', async () => {
   check('上次未结束已跳过：写原因，没有运行链接', t1.includes('上次未结束已跳过') && t1.includes('#9f8e7d') && await row('f01').locator('a[href^="/runs/"]').count() === 0,
     t1.replace(/\s+/g, ' '))
   check('补发写「补发」，运行状态照实写', (await row('f02').innerText()).includes('补发') && (await row('f02').innerText()).includes('失败'))
-  check('错过已跳过写原因', (await row('f03').innerText()).includes('错过已跳过') && (await row('f03').innerText()).includes('超出补发宽限'))
-  const k3 = row('f03').locator('[data-fire-kind-chip]')
-  const k3title = (await k3.getAttribute('title')) ?? ''
-  check('错过且超出宽限、没有补发的：类型不写「补发」，悬停也不说补发了一次', (await k3.innerText()).trim() === '定时'
-    && !k3title.includes('补发的一次') && k3title.includes('没有补发'), `${await k3.innerText()} ｜ ${k3title}`)
+  // 一行里给人看的字：正文连同各处悬停。错过、没有补发的原因只能是本条记的那一种，页面不能另替它认定一种
+  const said = async (id) => [await row(id).innerText(),
+    ...await row(id).locator('[title]').evaluateAll((els) => els.map((e) => e.getAttribute('title')))].join(' ｜ ').replace(/\s+/g, ' ')
+  for (const [id, label, own, other] of [['f03', '宽限内积压的', '积压的触发不补', '超出补发宽限'], ['f05', '超出宽限的', '超出补发宽限', '积压']]) {
+    const k = row(id).locator('[data-fire-kind-chip]')
+    const kt = (await k.getAttribute('title')) ?? ''
+    const t = await row(id).innerText()
+    check(`错过已跳过（${label}）：写本条的原因`, t.includes('错过已跳过') && t.includes(own), t.replace(/\s+/g, ' '))
+    check(`错过已跳过（${label}）：类型写「定时」，悬停说没有补发、指向本条的原因，不说补发了一次`, (await k.innerText()).trim() === '定时'
+      && !kt.includes('补发的一次') && kt.includes('没有补发') && kt.includes('原因见本条记录'), `${await k.innerText()} ｜ ${kt}`)
+    const all = await said(id)
+    check(`错过已跳过（${label}）：整行连同悬停都不说另一种原因（${other}）`, !all.includes(other), all)
+  }
+  const s6 = await said('f06')
+  check('错过已跳过、没有记原因：不写原因行，悬停不替它认定原因、不指向不存在的原因', s6.includes('错过已跳过')
+    && !s6.includes('原因：') && !s6.includes('超出补发宽限') && !s6.includes('积压') && !s6.includes('原因见'), s6)
+  const st6 = (await row('f06').locator('[data-fire-status-chip]').getAttribute('title')) ?? ''
+  check('……结局的悬停写这种结局的一般说明', st6.includes('错过') && st6.includes('没有发起'), st6)
+  const s7 = await said('f07')
+  const st7 = (await row('f07').locator('[data-fire-status-chip]').getAttribute('title')) ?? ''
+  check('发起失败、没有记原因：悬停说清没有原因，不指向不存在的原因', s7.includes('发起失败') && !s7.includes('原因：')
+    && !s7.includes('原因见') && st7.includes('未能发起运行') && st7.includes('未提供原因'), s7)
   check('发起失败写原因', (await row('f04').innerText()).includes('发起失败') && (await row('f04').innerText()).includes('还没有发布'))
   const when = row('f05').locator('time')
   check('计划时间悬停看时区', ((await when.getAttribute('title')) ?? '').includes('Asia/Shanghai'), (await when.getAttribute('title')) ?? '')

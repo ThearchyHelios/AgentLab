@@ -111,14 +111,15 @@ export function FireStatusChip({ fire }: { fire: ScheduleFire }) {
 }
 
 /**
- * 触发类型：定时 / 手动 / 补发。服务端把错过的触发都记成 kind=misfire，宽限内补发了的是 started，超出宽限没补发的
- * 是 skipped_misfire：后者没有「补发」这回事，按「定时」写，结局由旁边的「错过已跳过」说
+ * 触发类型：定时 / 手动 / 补发。服务端把错过的触发都记成 kind=misfire：宽限内补发的那一次照常有结局，没有补发的
+ * 是 skipped_misfire。后者没有「补发」这回事，按「定时」写，结局由旁边的「错过已跳过」说。没有补发有两种原因（超出
+ * 补发宽限；宽限内恢复时积压的那几次不补），悬停不替服务端认定是哪一种，否则会和本条记的原因自相矛盾
  */
 export function FireKindChip({ fire }: { fire: ScheduleFire }) {
   const missed = fire.kind === 'misfire' && fire.status === 'skipped_misfire'
   const kind = missed ? 'scheduled' : fire.kind
   return (
-    <span className="chip shrink-0" title={missed ? T.fireKindMissedHint : T.fireKindHint[kind]} data-fire-kind-chip={fire.kind}>
+    <span className="chip shrink-0" title={missed ? T.fireKindMissedHint(!!fire.reason) : T.fireKindHint[kind]} data-fire-kind-chip={fire.kind}>
       {T.fireKind[kind] ?? kind}
     </span>
   )

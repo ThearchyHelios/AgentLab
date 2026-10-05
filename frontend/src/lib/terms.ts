@@ -2792,19 +2792,26 @@ export const SCHEDULE_TEXT = {
     manual: '手动「立即运行」',
     misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
   } as Record<import('../types').ScheduleFireKind, string>,
-  /** 错过且超出补发宽限、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写 */
-  fireKindMissedHint: '按计划应在此时触发，错过后已超出补发宽限，没有补发',
+  /**
+   * 错过、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写。没有补发的原因有两种（超出
+   * 补发宽限；宽限内恢复时积压的触发不补，只发起最近一次），这里不替服务端认定是哪一种，本条记了原因时指向它
+   */
+  fireKindMissedHint: (hasReason: boolean) => `按计划应在此时触发，错过后没有补发${hasReason ? '，原因见本条记录' : ''}`,
   fireStatus: {
     started: '已发起',
     skipped_overlap: '上次未结束已跳过',
     skipped_misfire: '错过已跳过',
     failed_to_start: '发起失败',
   } as Record<import('../types').ScheduleFireStatus, string>,
+  /**
+   * 结局的一般说明，本条没有记原因时悬停用：只说这种结局是什么，不指向不存在的原因。错过已跳过的两种原因都适用，
+   * 发起失败也可能是手动立即运行，不写「到点」
+   */
   fireStatusHint: {
     started: '已发起运行',
     skipped_overlap: '上一次运行还没有结束，按重叠策略跳过了这一次',
-    skipped_misfire: '服务停机等原因错过了触发时间，且超出补发宽限，这一次没有发起',
-    failed_to_start: '到点发起时被拒绝，原因见本条记录',
+    skipped_misfire: '服务停机等原因错过了触发时间，这一次没有发起',
+    failed_to_start: '未能发起运行，服务端未提供原因',
   } as Record<import('../types').ScheduleFireStatus, string>,
   event: { finished: '运行结束', failed: '运行失败', awaiting_approval: '等待审批' } as Record<import('../types').ScheduleEvent, string>,
   noticeStatus: { ok: '已发送', failed: '发送失败' } as Record<'ok' | 'failed', string>,
