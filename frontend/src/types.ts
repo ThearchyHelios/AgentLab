@@ -3211,6 +3211,8 @@ export interface RunCompareTemplateNode {
   change: 'added' | 'removed' | 'config' | (string & {})
   /** 改了的配置项（节点配置里的键） */
   keys: string[]
+  /** 约定之外、服务端顺带给的：各配置项在界面上的叫法，和 keys 一一对应。没给（或对不上）时照写键名 */
+  labels?: string[]
 }
 
 export interface RunCompareTemplate {
@@ -3237,6 +3239,8 @@ export interface RunCompareInput {
   path: string
   base: unknown
   target: unknown
+  /** 约定之外、服务端顺带给的：取自设置了遮罩的列，两边的值都不给 */
+  masked?: boolean
 }
 
 export interface RunCompareAttributionRow {
@@ -3272,7 +3276,7 @@ export interface RunCompareMetric {
   delta: number | null
   /** 带正负号；比率、百分数写「个百分点」。没变化、不是数时可能为 null */
   delta_rendered: string | null
-  /** 相对基准的变化比例（小数，0.125 是 +12.5%）；基准为 0、缺值时为 null */
+  /** 相对基准变化了百分之几（已乘 100，保留两位：12.5 是 +12.5%，和占比的小数写法不同）；基准为 0、缺值时为 null */
   delta_pct: number | null
   classification: RunCompareClass | (string & {})
   reasons: string[]
@@ -3300,6 +3304,10 @@ export interface RunCompareQuery {
   target_rows: number | null
   base_truncated: boolean | null
   target_truncated: boolean | null
+  /** 约定之外、服务端顺带给的：结构变了时差在哪，一处一句中文（按对结果的影响从大到小） */
+  differences?: string[]
+  /** 约定之外、服务端顺带给的：快照读不出来、与哈希不一致时的一句说明 */
+  problem?: string
 }
 
 /** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */

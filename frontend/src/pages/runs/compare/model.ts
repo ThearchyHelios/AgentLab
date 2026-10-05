@@ -65,16 +65,21 @@ export function signedNumber(v: number | null | undefined): string {
   return `${v > 0 ? '+' : '-'}${plainNumber(Math.abs(v))}`
 }
 
-/**
- * 小数写成百分比（一位小数）。signed 时带正负号：变化比例 0.125 →「+12.5%」；占比 0.4 →「40.0%」。
- * 不是零、却小到一位小数写不出来的写「<0.1%」，不写成看着像没变的「0.0%」
- */
-export function percent(v: number | null | undefined, signed = false): string {
+/** 百分数（已经乘过 100）写成一位小数；不是零、却小到一位小数写不出来的写「<0.1%」，不写成看着像没变的「0.0%」 */
+function pct(abs: number, sign: string): string {
+  return abs !== 0 && abs < 0.05 ? `${sign}<0.1%` : `${sign}${abs.toFixed(1)}%`
+}
+
+/** 变化百分比：服务端给的 delta_pct 已经乘过 100（12.5 是涨了 12.5%），带正负号：「+12.5%」「-3.0%」 */
+export function changeText(v: number | null | undefined): string {
   if (!isNum(v)) return NONE
-  const pct = Math.abs(v) * 100
-  const sign = signed && v !== 0 ? (v > 0 ? '+' : '-') : v < 0 ? '-' : ''
-  if (v !== 0 && pct < 0.05) return `${sign}<0.1%`
-  return `${sign}${pct.toFixed(1)}%`
+  return pct(Math.abs(v), v > 0 ? '+' : v < 0 ? '-' : '')
+}
+
+/** 归因的占比：服务端给的是小数（0.4 是 40%）。和总变化反向的一项占比是负的：「-5.0%」 */
+export function shareText(v: number | null | undefined): string {
+  if (!isNum(v)) return NONE
+  return pct(Math.abs(v) * 100, v < 0 ? '-' : '')
 }
 
 /** 两个值算不算一样（输入对比里标「变了」用）：数按值比，别的按 JSON 比 */
@@ -108,9 +113,14 @@ export function queryNumbers(queries: RunCompareQuery[]): Map<string, number | n
  */
 export type CompareErrorKind = '409' | '422' | '404' | 'no-base' | 'other'
 
+/** 服务端「运行记录不存在」的机读码（api/evidence.py 的 RUN_NOT_FOUND，运行对比的接口沿用） */
+const RUN_NOT_FOUND = 'run_not_found'
+
 export function compareErrorKind(e: unknown, finding: boolean): CompareErrorKind {
   if (!(e instanceof ApiError) || e.kind !== 'http') return 'other'
-  if (finding) return e.status === 404 ? 'no-base' : 'other'
+  // 找基准时的 404 有两种：本次这条运行就不存在（机读码 run_not_found），和找不到可比的上一次
+  if (finding && e.status === 404) return e.code === RUN_NOT_FOUND ? '404' : 'no-base'
+  if (finding) return 'other'
   if (e.status === 409) return '409'
   if (e.status === 422) return '422'
   if (e.status === 404) return '404'

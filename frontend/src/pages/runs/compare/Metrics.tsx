@@ -5,7 +5,7 @@ import { NONE } from '../../../lib/format'
 import { RUN_COMPARE_TEXT as T } from '../../../lib/terms'
 import type { RunCompareAttribution, RunCompareDecomposition, RunCompareMetric } from '../../../types'
 import { Block, ClassChip } from './parts'
-import { metricKey, percent, sameValue, signedNumber, valueText } from './model'
+import { changeText, metricKey, sameValue, shareText, signedNumber, valueText } from './model'
 
 /** 维度归因列前几项：后端按变化从大到小排好，多的只写还有几项 */
 const ATTR_TOP = 10
@@ -103,7 +103,7 @@ export function Metrics({ metrics, filter, onClearFilter }: {
 function MetricRows({ m, k, detailId, open, onToggle }: {
   m: RunCompareMetric; k: string; detailId: string; open: boolean; onToggle: () => void
 }) {
-  const pct = m.delta_pct != null && m.delta_pct !== 0 ? percent(m.delta_pct, true) : null
+  const pct = m.delta_pct != null && m.delta_pct !== 0 ? changeText(m.delta_pct) : null
   return (
     <Fragment>
       <tr className={clsx('border-b align-top last:border-0', open && 'bg-hover')} data-compare-metric={k} data-class={m.classification}>
@@ -235,14 +235,17 @@ function Inputs({ m }: { m: RunCompareMetric }) {
             </thead>
             <tbody>
               {m.inputs.map((inp) => {
-                const changed = !sameValue(inp.base, inp.target)
+                // 遮罩列：两边的值服务端都不给，写「已遮罩」，也不说变没变
+                const changed = !inp.masked && !sameValue(inp.base, inp.target)
+                const shown = (v: unknown) => (inp.masked ? T.masked : valueText(v))
                 return (
-                  <tr key={inp.path} className="border-b last:border-0" data-compare-input={inp.path} data-changed={changed ? '' : undefined}>
+                  <tr key={inp.path} className="border-b last:border-0" data-compare-input={inp.path} data-changed={changed ? '' : undefined}
+                      data-masked={inp.masked ? '' : undefined}>
                     <th scope="row" className="mono py-1 pr-2 text-left font-normal text-dim [overflow-wrap:anywhere]">{inp.path}</th>
-                    <td className="tnum px-2 py-1 text-right text-dim [overflow-wrap:anywhere]">{valueText(inp.base)}</td>
+                    <td className="tnum px-2 py-1 text-right text-dim [overflow-wrap:anywhere]">{shown(inp.base)}</td>
                     <td className={clsx('tnum py-1 pl-2 text-right [overflow-wrap:anywhere]', changed ? 'font-medium text-fg' : 'text-dim')}>
                       {changed && <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: DATA_COLOR }} aria-hidden />}
-                      {valueText(inp.target)}
+                      {shown(inp.target)}
                     </td>
                   </tr>
                 )
@@ -257,7 +260,8 @@ function Inputs({ m }: { m: RunCompareMetric }) {
 
 /**
  * 维度归因：按键对齐两边查询结果的行，列前 10 项的键、两边的值、变化和占比。占比只在度量列之和等于指标的输入时才有，
- * 没有时那一栏写「—」，下面照服务端的说明写原因（没给说明时写一句通用的）
+ * 没有时那一栏写「—」，下面照服务端的说明写原因（没给说明时写一句通用的）。归不了因的（查询结果截断、度量列遮罩、
+ * 快照读不出来）服务端给空的 rows 和一句说明：不画空表，只写这句话
  */
 function Attribution({ a }: { a: RunCompareAttribution | null }) {
   if (!a) {
@@ -270,14 +274,14 @@ function Attribution({ a }: { a: RunCompareAttribution | null }) {
   }
   const rows = a.rows.slice(0, ATTR_TOP)
   const more = a.rows.length - rows.length
-  const note = a.note || (a.rows.some((r) => r.share == null) ? T.attrNoShare : null)
+  const note = a.note || (!rows.length ? T.attrNone : a.rows.some((r) => r.share == null) ? T.attrNoShare : null)
   return (
     <div data-compare-attr="">
       <h3 className="mb-1 flex flex-wrap items-baseline gap-x-2 text-2xs">
         <span className="font-medium text-faint">{T.attribution}</span>
         <span className="text-faint [overflow-wrap:anywhere]">{T.attrBy(a.measure)}{more > 0 ? ` · ${T.attrTop(ATTR_TOP)}` : ''}</span>
       </h3>
-      <div className="overflow-x-auto">
+      {!!rows.length && <div className="overflow-x-auto">
         <table className="w-full border-collapse text-2xs">
           <thead>
             <tr className="border-b text-left text-faint">
@@ -298,16 +302,18 @@ function Attribution({ a }: { a: RunCompareAttribution | null }) {
                 <td className="tnum px-2 py-1 text-right text-dim">{valueText(r.target)}</td>
                 <td className="tnum px-2 py-1 text-right text-fg">{signedNumber(r.delta)}</td>
                 <td className="tnum py-1 pl-2 text-right text-dim" data-compare-share="" title={r.share == null ? note ?? undefined : undefined}>
-                  {r.share == null ? NONE : percent(r.share)}
+                  {r.share == null ? NONE : shareText(r.share)}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
+      </div>}
       <div className="mt-1 space-y-0.5 text-2xs text-faint">
         {more > 0 && <p data-compare-attr-more="">{T.attrMore(more)}</p>}
-        {a.total_delta != null && <p className="tnum" data-compare-attr-total="">{T.attrTotal(signedNumber(a.total_delta))}</p>}
+        {!!rows.length && a.total_delta != null && (
+          <p className="tnum" data-compare-attr-total="">{T.attrTotal(signedNumber(a.total_delta))}</p>
+        )}
         {note && <p className="leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-attr-note="">{note}</p>}
       </div>
     </div>

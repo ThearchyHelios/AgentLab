@@ -2841,6 +2841,8 @@ export const RUN_COMPARE_TEXT = {
   reasons: '变化说明',
   inputs: '输入对比',
   inputsNone: '口径卡没有记录这个指标的输入',
+  /** 取自设置了遮罩的列：两边的值都不显示 */
+  masked: '已遮罩',
   colInput: '输入',
   attribution: '维度归因',
   attrBy: (measure: string) => `按「${measure}」的变化，从大到小`,

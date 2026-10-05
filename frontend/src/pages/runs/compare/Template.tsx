@@ -6,8 +6,9 @@ import { Block } from './parts'
 const CHANGE_COLOR: Record<string, string> = { added: 'var(--accent)', removed: 'var(--text-dim)', config: 'var(--warn)' }
 
 /**
- * 模板区：两次运行各用的版本，执行图变了的话列出变化的节点（新增、移除、配置变更）和改了的配置项。配置项写的是节点
- * 配置里的键：同一个键在不同类型的节点里叫法不同，接口又不给节点类型，照原样写比猜一个中文名可靠
+ * 模板区：两次运行各用的版本，执行图变了的话列出变化的节点（新增、移除、配置变更）和改了的配置项。配置项的叫法用
+ * 服务端按节点类型翻好的 labels（同一个键在不同类型的节点里叫法不同，界面没有节点类型猜不准）；没给、或者和键对不上
+ * 时照写键名，宁可露键名也不编一个界面上没有的名字。键名放在悬停提示里
  */
 export function TemplateSection({ template }: { template: RunCompareTemplate }) {
   const id = useId()
@@ -35,9 +36,14 @@ export function TemplateSection({ template }: { template: RunCompareTemplate }) 
                 {!!n.keys.length && (
                   <span className="flex min-w-0 flex-wrap items-center gap-1 text-2xs text-faint">
                     <span>{T.keys}</span>
-                    {n.keys.map((k) => (
-                      <code key={k} className="mono rounded bg-bg px-1 text-dim [overflow-wrap:anywhere]" data-compare-key="">{k}</code>
-                    ))}
+                    {n.keys.map((k, i) => {
+                      const label = n.labels?.length === n.keys.length ? n.labels[i] : undefined
+                      return label && label !== k ? (
+                        <span key={k} className="rounded bg-bg px-1 text-dim [overflow-wrap:anywhere]" title={k} data-compare-key={k}>{label}</span>
+                      ) : (
+                        <code key={k} className="mono rounded bg-bg px-1 text-dim [overflow-wrap:anywhere]" data-compare-key={k}>{k}</code>
+                      )
+                    })}
                   </span>
                 )}
               </li>

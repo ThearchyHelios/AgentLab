@@ -70,12 +70,14 @@ const refOf = (id) => {
 }
 
 const REGIONS = ['青禾区', '白石区', '云杉区', '赤松区', '蓝湾区', '金穗区', '银杏区', '翠竹区', '月湖区', '星港区', '石桥区', '柳岸区']
-// 各区的变化之和正好是总变化 2,531.5；占比按服务端的约定给小数（0.4 是 40%）
+// 各区的变化之和正好是总变化 2,531.5；占比照服务端给小数（0.4 是 40%）。服务端按变化的绝对值只给前 10 项，
+// 另有几项写在 note 里（ALL_ROWS 给「服务端多给了」那一节用）
 const DELTAS = [1012.6, 506.3, 379.7, 253.2, 126.6, 101.3, 63.3, 38.0, 25.3, 12.6, 7.6, 5.0]
-const ATTR_ROWS = REGIONS.map((name, i) => ({
+const ALL_ROWS = REGIONS.map((name, i) => ({
   key: [name], base: 3000 + i * 100, target: 3000 + i * 100 + DELTAS[i], delta: DELTAS[i],
   share: Math.round(DELTAS[i] / 2531.5 * 10000) / 10000,
 }))
+const MORE_KEYS = '共 12 个维度值，列出变化最大的 10 个'
 
 const metric = (over) => ({
   card_id: 'caliber', card_title: '周报口径', unit: '', decimals: 1, reasons: [], decomposition: null,
@@ -83,34 +85,39 @@ const metric = (over) => ({
 })
 const METRICS = [
   metric({ metric_id: 'gmv', name: '销售额', unit: '元', base: 45678.5, target: 48210, base_rendered: '45,678.5元',
-    target_rendered: '48,210.0元', delta: 2531.5, delta_rendered: '+2,531.5元', delta_pct: 0.0554, classification: 'data_only',
-    reasons: ['口径与 SQL 均未改动，变化来自数据'],
+    target_rendered: '48,210.0元', delta: 2531.5, delta_rendered: '+2,531.5元', delta_pct: 5.54, classification: 'data_only',
+    reasons: ['取数的 SQL 没有变化，查询结果有变化'],
     inputs: [{ path: 'vars.kpi.gmv', base: 45678.5, target: 48210 }],
-    attribution: { columns: ['区域'], measure: 'amount', rows: ATTR_ROWS, total_delta: 2531.5, note: null } }),
+    attribution: { columns: ['区域'], measure: 'amount', rows: ALL_ROWS.slice(0, 10), total_delta: 2531.5, note: MORE_KEYS } }),
   metric({ metric_id: 'orders', name: '订单数', unit: '单', decimals: 0, base: 1234, target: 1301, base_rendered: '1,234单',
-    target_rendered: '1,301单', delta: 67, delta_rendered: '+67单', delta_pct: 0.0543, classification: 'data_only' }),
+    target_rendered: '1,301单', delta: 67, delta_rendered: '+67单', delta_pct: 5.43, classification: 'data_only' }),
   metric({ metric_id: 'aov', name: '客单价', unit: '元', base: 37.0, target: 41.5, base_rendered: '37.0元', target_rendered: '41.5元',
-    delta: 4.5, delta_rendered: '+4.5元', delta_pct: 0.1216, classification: 'caliber_and_data',
-    reasons: ['口径卡「周报口径」中客单价的计算式有改动'],
+    delta: 4.5, delta_rendered: '+4.5元', delta_pct: 12.16, classification: 'caliber_and_data',
+    reasons: ['表达式由「vars.kpi.gmv / vars.kpi.order_cnt」改为「vars.kpi.gmv / vars.kpi.paid_cnt」'],
     decomposition: { caliber_effect: 5.8, data_effect: -1.3, caliber_rendered: '+5.8元', data_rendered: '-1.3元' },
-    inputs: [{ path: 'vars.kpi.gmv', base: 45678.5, target: 48210 }, { path: 'vars.kpi.order_cnt', base: 1234, target: 1234 }],
+    // 遮罩列的输入：服务端两边都不给值，另带 masked
+    inputs: [{ path: 'vars.kpi.gmv', base: 45678.5, target: 48210 }, { path: 'vars.kpi.order_cnt', base: 1234, target: 1234 },
+      { path: 'vars.kpi.cost', base: null, target: null, masked: true }],
     attribution: { columns: ['区域', '渠道'], measure: 'order_cnt', total_delta: 67,
       note: '各区域订单数之和与指标的输入对不上，不给占比',
       rows: [{ key: ['青禾区', '门店'], base: 400, target: 440, delta: 40, share: null },
         { key: ['白石区', '线上'], base: 300, target: 327, delta: 27, share: null }] } }),
   metric({ metric_id: 'refund_rate', name: '退货率', unit: '%', decimals: 2, base: 0.0235, target: 0.0198, base_rendered: '2.35%',
-    target_rendered: '1.98%', delta: -0.0037, delta_rendered: '-0.37 个百分点', delta_pct: -0.1574, classification: 'sql_changed',
+    target_rendered: '1.98%', delta: -0.0037, delta_rendered: '-0.37 个百分点', delta_pct: -15.74, classification: 'sql_changed',
     reasons: ['所依据的查询「退货明细」的筛选条件有改动'],
     decomposition_note: '所依据的查询「退货明细」SQL 结构有改动，口径不同，不做拆分' }),
   metric({ metric_id: 'visitors', name: '日均访客', unit: '人', decimals: 0, base: 5200, target: 5480, base_rendered: '5,200人',
-    target_rendered: '5,480人', delta: 280, delta_rendered: '+280人', delta_pct: 0.0538, classification: 'params_only',
-    reasons: ['「拉取销量」只有日期参数不同'] }),
+    target_rendered: '5,480人', delta: 280, delta_rendered: '+280人', delta_pct: 5.38, classification: 'params_only',
+    reasons: ['「拉取销量」只有日期参数不同'],
+    // 归不了因：服务端给空的 rows 和一句说明
+    attribution: { columns: [], measure: 'visits', rows: [], total_delta: null,
+      note: '查询结果被截断（基准运行只取回了前 500 行），不做维度归因' } }),
   metric({ metric_id: 'new_users', name: '新客数', unit: '人', decimals: 0, base: null, target: 320, base_rendered: '—',
     target_rendered: '320人', delta: null, delta_rendered: null, classification: 'added', reasons: ['本次新增的指标'] }),
   metric({ metric_id: 'members', name: '会员数', unit: '人', decimals: 0, base: 8800, target: null, base_rendered: '8,800人',
     target_rendered: '—', delta: null, delta_rendered: null, classification: 'removed', reasons: ['本次没有这个指标'] }),
   metric({ metric_id: 'margin', name: '毛利率', unit: '%', decimals: 1, base: 0.31, target: 0.33, base_rendered: '31.0%',
-    target_rendered: '33.0%', delta: 0.02, delta_rendered: '+2.0 个百分点', delta_pct: 0.0645, classification: 'incomparable',
+    target_rendered: '33.0%', delta: 0.02, delta_rendered: '+2.0 个百分点', delta_pct: 6.45, classification: 'incomparable',
     reasons: ['基准运行的口径卡没有记录输入'], decomposition_note: '基准运行的口径卡没有记录输入，无法拆分' }),
   ...[['stores', '门店数', '家', 56], ['complaints', '客诉数', '件', 12], ['sku', 'SKU 数', '个', 1500]].map(([id, name, unit, v]) =>
     metric({ metric_id: id, name, unit, decimals: 0, base: v, target: v, base_rendered: `${v.toLocaleString('en-US')}${unit}`,
@@ -126,7 +133,8 @@ const QUERIES = [
   { node_id: 'refund', node_title: '退货明细', ordinal: 0, structure: 'changed',
     base_sql: "SELECT COUNT(*) AS n\nFROM refunds r\nWHERE r.created_at >= '2026-09-21'",
     target_sql: "SELECT COUNT(*) AS n\nFROM refunds r\nWHERE r.paid_at >= '2026-09-28' AND r.status = 'done'",
-    literals: [], base_rows: 500, target_rows: 488, base_truncated: true, target_truncated: false },
+    literals: [], base_rows: 500, target_rows: 488, base_truncated: true, target_truncated: false,
+    differences: ['时间条件的列不同：基准按 refunds.created_at，这次按 refunds.paid_at', "这次多了筛选条件 refunds.status = 'done'"] },
   { node_id: 'stores', node_title: '门店清单', ordinal: 0, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM stores',
     target_sql: 'SELECT COUNT(*) AS n FROM stores', literals: [], base_rows: 1, target_rows: 1, base_truncated: false, target_truncated: false },
   { node_id: 'pull', node_title: '拉取销量', ordinal: 1, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM visits',
@@ -135,11 +143,12 @@ const QUERIES = [
     target_sql: "SELECT COUNT(*) AS n FROM users WHERE first_order_on >= '2026-09-28'", literals: [], base_rows: null, target_rows: 1,
     base_truncated: null, target_truncated: false },
   { node_id: 'member', node_title: '会员查询', ordinal: 0, structure: 'removed', base_sql: 'SELECT COUNT(*) AS n FROM members',
-    target_sql: null, literals: [], base_rows: 1, target_rows: null, base_truncated: false, target_truncated: null },
+    target_sql: null, literals: [], base_rows: 1, target_rows: null, base_truncated: false, target_truncated: null,
+    problem: '基准运行的查询快照无法读取' },
 ]
 const TEMPLATE = { base_version: 3, target_version: 4, same_graph: false, nodes: [
   { node_id: 'caliber', title: '周报口径', change: 'config', keys: ['metrics'] },
-  { node_id: 'refund', title: '退货明细', change: 'config', keys: ['sql', 'timeout'] },
+  { node_id: 'refund', title: '退货明细', change: 'config', keys: ['sql', 'timeout'], labels: ['SQL', '超时（秒）'] },
   { node_id: 'newbie', title: '新客查询', change: 'added', keys: [] },
   { node_id: 'member', title: '会员查询', change: 'removed', keys: [] },
 ] }
@@ -285,6 +294,9 @@ const shot = async (page, name) => {
 await section('从运行详情进入', async () => {
   const { page, log, blocked, errors } = await open(`/runs/${T}`)
   await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  // 走过的地址（含 pushState / replaceState）：菜单要先问到基准再跳，不能先跳到只带本次的地址、再让对比页去找
+  const visited = []
+  page.on('framenavigated', (f) => { if (f === page.mainFrame()) visited.push(f.url()) })
   await page.getByRole('button', { name: '更多操作' }).click()
   const item = page.locator('[data-menu=compare]')
   check('「更多」菜单里有「与上一次对比」，可点', await item.count() === 1 && (await item.innerText()).includes('与上一次对比')
@@ -298,6 +310,9 @@ await section('从运行详情进入', async () => {
   const iCmp = log.indexOf(`GET /api/runs/${T}/compare?base=${B}`)
   check('先请求 compare/base，再请求 compare', iBase >= 0 && iCmp > iBase, `${iBase} → ${iCmp}`)
   check('compare/base 只请求一次（页面不再自己找一遍）', log.filter((k) => k.startsWith(`GET /api/runs/${T}/compare/base`)).length === 1)
+  const compareUrls = visited.map((u) => new URL(u)).filter((u) => u.pathname === '/runs/compare')
+  check('菜单问到基准之后才跳，一步到带基准的地址', compareUrls.length >= 1 && compareUrls.every((u) => u.searchParams.get('base') === B),
+    compareUrls.map((u) => u.search).join(' → '))
   check('写明基准是怎么选的', (await text(page, '[data-compare-reason]')).trim() === REASON, await text(page, '[data-compare-reason]').catch(() => ''))
   check('没有发出写请求', blocked.length === 0, blocked.join('；'))
   check('页面没有报错', errors.length === 0, errors.join('；'))
@@ -352,7 +367,7 @@ await section('指标表', async () => {
   check('基准 → 本次、变化量用服务端渲染的写法', (await gmv.locator('[data-compare-base]').innerText()) === '45,678.5元'
     && (await gmv.locator('[data-compare-target]').innerText()) === '48,210.0元'
     && (await gmv.locator('[data-compare-delta]').innerText()) === '+2,531.5元')
-  check('变化百分比带正负号（0.0554 → +5.5%）', (await gmv.locator('[data-compare-pct]').innerText()) === '+5.5%',
+  check('变化百分比照服务端的百分数写、带正负号（5.54 → +5.5%）', (await gmv.locator('[data-compare-pct]').innerText()) === '+5.5%',
     await gmv.locator('[data-compare-pct]').innerText().catch(() => ''))
   const refund = page.locator('tr[data-compare-metric="caliber:refund_rate"]')
   check('下降的百分比写负号', (await refund.locator('[data-compare-pct]').innerText()) === '-15.7%')
@@ -382,18 +397,20 @@ await section('展开：输入对比与维度归因', async () => {
   await detail.waitFor()
   check('展开后标为展开、指向明细', (await gmvBtn.getAttribute('aria-expanded')) === 'true'
     && (await gmvBtn.getAttribute('aria-controls')) === await detail.getAttribute('id'))
-  check('列出变化说明', (await detail.locator('[data-compare-reasons]').innerText()).includes('变化来自数据'))
+  check('列出变化说明', (await detail.locator('[data-compare-reasons]').innerText()).includes('查询结果有变化'))
   const input = detail.locator('[data-compare-inputs] tr[data-compare-input="vars.kpi.gmv"]')
   check('输入对比：路径、两边的值，变了的标出来', (await input.innerText()).includes('45,678.5') && (await input.innerText()).includes('48,210')
     && (await input.getAttribute('data-changed')) !== null, (await input.innerText().catch(() => '')).replace(/\s+/g, ' '))
   const attrRows = detail.locator('[data-compare-attr] tr[data-compare-attr-row]')
   check('维度归因只列前 10 项', await attrRows.count() === 10, String(await attrRows.count()))
-  check('写明另有几项没列', (await detail.locator('[data-compare-attr-more]').innerText()).includes('2'))
+  check('服务端说另有几项没列：照写', (await detail.locator('[data-compare-attr-note]').innerText()) === MORE_KEYS
+    && await detail.locator('[data-compare-attr-more]').count() === 0)
   const first = attrRows.first()
   check('归因一行：键、两边的值、变化、占比', (await first.innerText()).includes('青禾区') && (await first.innerText()).includes('+1,012.6')
     && (await first.locator('[data-compare-share]').innerText()) === '40.0%', (await first.innerText()).replace(/\s+/g, ' '))
   check('写明按哪一列归因', (await detail.locator('[data-compare-attr]').innerText()).includes('amount'))
-  check('有占比时不写缺占比的原因', await detail.locator('[data-compare-attr-note]').count() === 0)
+  check('有占比时不写缺占比的原因', !(await detail.locator('[data-compare-attr-note]').innerText()).includes('占比'))
+  check('写出合计变化', (await detail.locator('[data-compare-attr-total]').innerText()).includes('+2,531.5'))
 
   // 键盘：Tab 到客单价的展开按钮，回车展开
   const aovBtn = page.locator('tr[data-compare-metric="caliber:aov"] button[data-compare-expand]')
@@ -406,6 +423,9 @@ await section('展开：输入对比与维度归因', async () => {
     (await aov.locator('[data-compare-decomp-sum]').innerText()).trim() === '口径效应 +5.8元，数据效应 -1.3元，两者之和等于总变化 +4.5元',
     await aov.locator('[data-compare-decomp-sum]').innerText().catch(() => ''))
   check('没有变的输入不标', (await aov.locator('tr[data-compare-input="vars.kpi.order_cnt"]').getAttribute('data-changed')) === null)
+  const masked = aov.locator('tr[data-compare-input="vars.kpi.cost"]')
+  check('遮罩列的输入：两边都写「已遮罩」，不标变了', (await masked.locator('td').allInnerTexts()).every((t) => t.trim() === '已遮罩')
+    && (await masked.getAttribute('data-changed')) === null, (await masked.innerText().catch(() => '')).replace(/\s+/g, ' '))
   const shares = await aov.locator('[data-compare-attr] [data-compare-share]').allInnerTexts()
   check('没有占比：占比一栏写「—」', shares.length === 2 && shares.every((s) => s.trim() === '—'), shares.join(','))
   check('没有占比：写出原因', (await aov.locator('[data-compare-attr-note]').innerText()).includes('各区域订单数之和与指标的输入对不上'))
@@ -420,7 +440,25 @@ await section('展开：输入对比与维度归因', async () => {
   const orders = page.locator('tr[data-compare-detail="caliber:orders"]')
   check('没有维度归因、没有输入时照实说', (await orders.locator('[data-compare-attr-none]').count()) === 1
     && (await orders.locator('[data-compare-inputs-none]').count()) === 1)
+  // 归不了因（查询结果截断）：服务端给空的 rows 和一句说明，只写说明，不画空表
+  await page.locator('tr[data-compare-metric="caliber:visitors"] button[data-compare-expand]').click()
+  const visitors = page.locator('tr[data-compare-detail="caliber:visitors"]')
+  check('归不了因：写服务端的说明，不画空表', (await visitors.locator('[data-compare-attr-note]').innerText()).includes('被截断')
+    && await visitors.locator('[data-compare-attr] table').count() === 0 && await visitors.locator('[data-compare-attr-total]').count() === 0)
   check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('归因超过 10 项时只列前 10 项', async () => {
+  const { page } = await open(comparePath(T, B), { compare: (t, b) => {
+    const data = comparison(t, b)
+    return { json: { ...data, metrics: data.metrics.map((m) => (m.metric_id === 'gmv'
+      ? { ...m, attribution: { ...m.attribution, rows: ALL_ROWS, note: null } } : m)) } }
+  } })
+  await settled(page)
+  await page.locator('tr[data-compare-metric="caliber:gmv"] button[data-compare-expand]').click()
+  const detail = page.locator('tr[data-compare-detail="caliber:gmv"]')
+  check('只列 10 项', await detail.locator('[data-compare-attr] tr[data-compare-attr-row]').count() === 10)
+  check('写明另有几项没列', (await detail.locator('[data-compare-attr-more]').innerText()).includes('另有 2 项'))
 })
 
 await section('摘要筛选', async () => {
@@ -460,6 +498,10 @@ await section('查询', async () => {
   check('高亮本次独有的部分', add.includes('paid_at') && add.includes("r.status = 'done'") && !add.includes('FROM'), add)
   check('相同的部分不高亮', !(await baseSql.locator('mark').allInnerTexts()).join(' ').includes('refunds'))
   check('截断照实标', (await refund.locator('[data-compare-rows]').innerText()).includes('已截断'))
+  check('结构变：列出服务端说的差在哪', JSON.stringify(await refund.locator('[data-compare-differences] li').allInnerTexts())
+    === JSON.stringify(QUERIES[1].differences))
+  check('快照读不出来：照服务端的说明写在那一条上', (await page.locator('[data-compare-query="member:0"] [data-compare-query-problem]').innerText())
+    === '基准运行的查询快照无法读取')
   const pull = page.locator('[data-compare-query="pull:0"]')
   const lits = await pull.locator('[data-compare-literals] li').allInnerTexts()
   check('只参数变：列出变化的参数', lits.length === 2 && lits[0].includes("'2026-09-21'") && lits[0].includes("'2026-09-28'")
@@ -486,9 +528,13 @@ await section('模板与说明', async () => {
   await settled(page)
   check('模板：版本 v3 → v4', (await text(page, '[data-compare-versions]')).includes('v3') && (await text(page, '[data-compare-versions]')).includes('v4'))
   const node = page.locator('[data-compare-node="refund"]')
-  check('变化的节点：名字、变化类型、配置项', (await node.getAttribute('data-change')) === 'config' && (await node.innerText()).includes('退货明细')
-    && (await node.innerText()).includes('配置变更')
-    && JSON.stringify(await node.locator('[data-compare-key]').allInnerTexts()) === JSON.stringify(['sql', 'timeout']))
+  check('变化的节点：名字、变化类型、配置项（用服务端给的叫法，键名在悬停提示里）', (await node.getAttribute('data-change')) === 'config'
+    && (await node.innerText()).includes('退货明细') && (await node.innerText()).includes('配置变更')
+    && JSON.stringify(await node.locator('[data-compare-key]').allInnerTexts()) === JSON.stringify(['SQL', '超时（秒）'])
+    && JSON.stringify(await node.locator('[data-compare-key]').evaluateAll((els) => els.map((e) => e.getAttribute('title'))))
+      === JSON.stringify(['sql', 'timeout']))
+  check('没给叫法的配置项照写键名', JSON.stringify(await page.locator('[data-compare-node="caliber"] [data-compare-key]').allInnerTexts())
+    === JSON.stringify(['metrics']))
   check('新增、移除的节点写明', (await text(page, '[data-compare-node="newbie"]')).includes('新增节点')
     && (await text(page, '[data-compare-node="member"]')).includes('移除节点'))
   check('说明照实列出', JSON.stringify(await texts(page, '[data-compare-notes] li')) === JSON.stringify([NOTE]))
@@ -583,6 +629,11 @@ await section('出错与找不到基准', async () => {
   await lone.page.locator('select[data-compare-base-picker]').selectOption(B2)
   await settled(lone.page)
   check('手动选了之后照常对比', new URL(lone.page.url()).searchParams.get('base') === B2 && compareHits(lone.log, T, B2) === 1)
+
+  const missing = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: '运行记录不存在', code: 'run_not_found' } }) })
+  await settled(missing.page, 'error')
+  check('找基准时本次就不存在：写运行记录不存在', await missing.page.locator('[data-compare-error="404"]').count() === 1
+    && (await missing.page.locator('[data-compare-error-title]').innerText()) === '运行记录不存在')
 
   // 只带本次、找得到：自己补上基准，写明怎么选的
   const auto = await open(comparePath(T))

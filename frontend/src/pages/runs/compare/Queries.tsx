@@ -20,8 +20,9 @@ const MARK = {
 } as const
 
 /**
- * 查询区：每条查询的结构状态和行数。只参数变的列出变化的字面量；结构变的并排两条 SQL（窄屏上下排），逐词标出各自独有的
- * 部分；新增、移除的只有一边。相同、只参数变的 SQL 默认收着，点开再看
+ * 查询区：每条查询的结构状态和行数。只参数变的列出变化的字面量；结构变的先写服务端说的差在哪（有的话），再并排两条
+ * SQL（窄屏上下排），逐词标出各自独有的部分；新增、移除的只有一边。相同、只参数变的 SQL 默认收着，点开再看。
+ * 快照读不出来、与哈希不一致的，照服务端的说明写在这一条上
  */
 export function Queries({ queries }: { queries: RunCompareQuery[] }) {
   const id = useId()
@@ -64,6 +65,16 @@ function QueryItem({ q, k, nth }: { q: RunCompareQuery; k: string; nth: number |
           </button>
         )}
       </div>
+      {q.problem && (
+        <p className="mt-1 text-2xs leading-relaxed [overflow-wrap:anywhere]" style={{ color: 'var(--warn)' }} data-compare-query-problem="">
+          {q.problem}
+        </p>
+      )}
+      {q.structure === 'changed' && !!q.differences?.length && (
+        <ul className="mt-1.5 list-disc space-y-0.5 pl-4 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-differences="">
+          {q.differences.map((d, i) => <li key={i}>{d}</li>)}
+        </ul>
+      )}
       {q.structure === 'params_only' && !!q.literals.length && (
         <div className="mt-1.5">
           <div className="mb-0.5 text-2xs text-faint">{T.literals}</div>
