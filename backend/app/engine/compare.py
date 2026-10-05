@@ -125,8 +125,25 @@ class Side:
 
 
 def compare(base: Side, target: Side) -> dict[str, Any]:
-    """对比两次运行（base 是基准，target 是这次）：{target, base, summary, template, metrics, queries, notes}，
-    形状见接口约定（api/compare.py）。只读，不碰两次运行的任何东西。"""
+    """对比两次运行（base 是基准，target 是这次），只读，不碰两次运行的任何东西。返回：
+
+    - target / base：两次运行的概要（Side.run 原样）
+    - summary：各类指标的个数，键是 CLASSES 里的八类
+    - template：{base_version, target_version, same_graph, nodes: [{node_id, title, change: added | removed | config,
+      keys: [配置键名，值是字典的往下一层写 args.sql], labels: [同序的中文叫法]}]}。只列键名，不展示配置的值
+    - metrics：每个指标一项 {card_id, card_title, metric_id, name, unit, decimals, base, target（有限的数，否则
+      None）, base_rendered, target_rendered（卡上记的写法）, delta, delta_rendered（为 0、不能相减时为 None）,
+      delta_pct（相对基准的百分比，两位小数；基准为 0 时为 None）, classification, reasons: [说明], decomposition:
+      {caliber_effect, data_effect, caliber_rendered, data_rendered} 或 None, decomposition_note（为什么没拆）,
+      inputs: [{path, base, target, masked?, base_artifact?, target_artifact?}], attribution}
+    - attribution：{columns, measure, rows: [{key: [维度值…], base, target, delta, share}], total_delta, note} 或
+      None。归不了因的（快照截断、度量列遮罩、快照读不出来、维度列每期都不同）rows 为空、total_delta 为 None，原因
+      写在 note；一边没有的维度值那一边写 None
+    - queries：每对查询一项 {node_id, node_title, ordinal, structure, base_sql, target_sql, literals: [{base,
+      target}]（只列不同的字面量）, base_rows, target_rows, base_truncated, target_truncated, base_artifact,
+      target_artifact, differences: [结构上差在哪], problem?（快照读不出来、被改过）}
+    - notes：整体的说明：连线、默认设置、运行输入的变化，口径卡执行了几次、读不出来，遮罩
+    """
     return _Compare(base, target).result()
 
 
